@@ -33,6 +33,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass
@@ -435,6 +436,7 @@ def inject_into_overlay(
     dropbear_key_path: str | None = None,
     hostname: str | None = None,
     netdevs_content: str | None = None,
+    log=print,
 ) -> bool:
     """Inject per-node files directly into a mountfs overlay's XFS rootfs.
 
@@ -443,7 +445,7 @@ def inject_into_overlay(
     """
     abs_overlay = os.path.abspath(overlay_path)
     if not os.path.exists(abs_overlay):
-        print(f"  WARNING: {abs_overlay} not found, skipping overlay injection")
+        log(f"  WARNING: {abs_overlay} not found, skipping overlay injection")
         return False
 
     gf_cmds = "run\nmount /dev/sda1 /\n"
@@ -484,7 +486,7 @@ def inject_into_overlay(
         os.unlink(f)
 
     if result.returncode != 0:
-        print(f"  WARNING: guestfish failed: {result.stderr}")
+        log(f"  WARNING: guestfish failed: {result.stderr}")
         return False
 
     return True
@@ -1553,7 +1555,11 @@ TCG_LOG_LEVELS = {
 
 
 def build_qemu_args(
-    node_id: int, node_info: dict, config: dict, tcg_level: str | None = None
+    node_id: int,
+    node_info: dict,
+    config: dict,
+    tcg_level: str | None = None,
+    log=print,
 ) -> list:
     """Build QEMU command line for a single node.
 
@@ -1594,7 +1600,7 @@ def build_qemu_args(
         text=True,
     )
     if result.returncode != 0:
-        print(f"  ERROR creating overlay {overlay0}: {result.stderr.strip()}")
+        log(f"  ERROR creating overlay {overlay0}: {result.stderr.strip()}")
 
     result = subprocess.run(
         f"qemu-img create -f qcow2 -b {abs_disk1} -F qcow2 {overlay1}",
@@ -1603,7 +1609,7 @@ def build_qemu_args(
         text=True,
     )
     if result.returncode != 0:
-        print(f"  ERROR creating overlay {overlay1}: {result.stderr.strip()}")
+        log(f"  ERROR creating overlay {overlay1}: {result.stderr.strip()}")
 
     serial_log = f"serial-vm{node_id}.log"
     qemu_log = f"qemu-vm{node_id}.log"
@@ -1624,7 +1630,7 @@ def build_qemu_args(
         accel_args = ["-accel", "tcg,thread=multi", "-cpu", "max"]
         log_flags = TCG_LOG_LEVELS.get(tcg_level, TCG_LOG_LEVELS[""])
         qemu_log = f"qemu-vm{node_id}-cpu%d.log"
-        print(
+        log(
             f"  [VM{node_id}] Using TCG (software emulation) — level: {tcg_level or 'default'}"
         )
     else:
@@ -1736,43 +1742,64 @@ def build_qemu_args(
         )
         args.extend(["-monitor", f"tcp:0.0.0.0:{monitor_port},server,nowait"])
 
-        print(
+        log(
             f"  [VM{node_id}] DEBUG: gdb=127.0.0.1:{gdb_port} debugcon={debugcon_port} monitor={monitor_port}"
         )
 
     return args
 
 
-def launch(config: dict, tcg_level: str | None = None):
-    """Setup topology, then launch VMs."""
-    setup(config)
-    print()
+@dataclass
+class LaunchError(RuntimeError):
+    node_id: int
+    lines: list[str]
+    cause: BaseException
 
-    nodes = collect_unique_nodes(config)
-    pids = []
+    def __str__(self) -> str:
+        return f"VM{self.node_id} launch failed: {self.cause}"
 
-    print("=== Launching VMs ===\n")
 
-    for node_id in sorted(nodes.keys()):
-        node_info = nodes[node_id]
-        args = build_qemu_args(node_id, node_info, config, tcg_level=tcg_level)
+@dataclass
+class LaunchResult:
+    node_id: int
+    process: subprocess.Popen
+    lines: list[str]
+
+
+def launch_one_vm(
+    node_id: int,
+    node_info: dict,
+    config: dict,
+    tcg_level: str | None,
+    processes: list,
+    processes_lock: threading.Lock,
+    stopping: threading.Event,
+) -> LaunchResult:
+    lines = []
+
+    try:
+        args = build_qemu_args(
+            node_id, node_info, config, tcg_level=tcg_level, log=lines.append
+        )
 
         zone_names = [zone_name(z) for z in node_info["zones"]]
         is_debug = node_info["effective"].get("debug", False)
 
-        print(f"  [VM{node_id}] zones={zone_names} debug={is_debug}")
-        print(f"    cmd: {' '.join(args)}")
+        lines.append(f"  [VM{node_id}] zones={zone_names} debug={is_debug}")
+        lines.append(f"    cmd: {' '.join(args)}")
 
-        # Inject per-node files (SSH host key, hostname, netdevs) into the mountfs overlay
-        mountfs_overlay = os.path.join("cluster-overlays", f"mountfs-vm{node_id}.qcow2")
+        # Inject per-node files into the mountfs overlay.
+        mountfs_overlay = os.path.join(
+            "cluster-overlays", f"mountfs-vm{node_id}.qcow2"
+        )
         dropbear_key = os.path.join(
             SSH_KEYS_DIR, f"vm{node_id}", "dropbear_rsa_host_key"
         )
         node_hostname = f"wos-{node_id}"
         key_path = dropbear_key if os.path.exists(dropbear_key) else None
 
-        # Build /etc/netdevs from zone order (matches NIC enumeration: eth0, eth1, ...)
-        _global_cfg = find_global(config["zones"])
+        # Build /etc/netdevs from zone order, matching NIC enumeration.
+        global_cfg = find_global(config["zones"])
         netdevs_lines = [
             "# /etc/netdevs - generated by cluster_setup.py",
             "# Format: <ifname> <driver>",
@@ -1781,7 +1808,7 @@ def launch(config: dict, tcg_level: str | None = None):
         ]
         for nic_idx, zone_cfg in enumerate(node_info["zones"]):
             node_override = get_node_config(zone_cfg, node_id)
-            zone_eff = resolve_config(_global_cfg, zone_cfg, node_override)
+            zone_eff = resolve_config(global_cfg, zone_cfg, node_override)
             driver = zone_eff.get("netdev_driver", "unmanaged")
             netdevs_lines.append(f"eth{nic_idx} {driver}")
         netdevs_content = "\n".join(netdevs_lines) + "\n"
@@ -1792,24 +1819,45 @@ def launch(config: dict, tcg_level: str | None = None):
                 dropbear_key_path=key_path,
                 hostname=node_hostname,
                 netdevs_content=netdevs_content,
+                log=lines.append,
             ):
-                print(f"    Injected per-node overlay (hostname={node_hostname})")
+                lines.append(
+                    f"    Injected per-node overlay (hostname={node_hostname})"
+                )
             else:
-                print(f"    WARNING: Failed to inject SSH host key")
+                lines.append("    WARNING: Failed to inject SSH host key")
 
-        proc = subprocess.Popen(args)
-        pids.append(proc)
-        print(f"    PID: {proc.pid}")
+        with processes_lock:
+            if stopping.is_set():
+                raise RuntimeError("launch cancelled")
+            proc = subprocess.Popen(args)
+            processes.append(proc)
+        lines.append(f"    PID: {proc.pid}")
 
-        # Brief delay between launches to avoid races on shared ivshmem files
-        if node_id < max(nodes.keys()):
-            time.sleep(0.5)
+        return LaunchResult(node_id=node_id, process=proc, lines=lines)
+    except Exception as exc:
+        raise LaunchError(node_id=node_id, lines=lines, cause=exc) from exc
 
-    print(f"\n=== {len(pids)} VMs launched ===")
-    print("Press Ctrl+C to stop all VMs.\n")
 
-    def stop_all_vms(processes: list, grace_seconds: float = 0.15):
+def launch(config: dict, tcg_level: str | None = None):
+    """Setup topology, then launch VMs."""
+    setup(config)
+    print()
+
+    nodes = collect_unique_nodes(config)
+    pids = []
+    pids_lock = threading.Lock()
+    stopping = threading.Event()
+
+    print("=== Launching VMs ===\n")
+    if not nodes:
+        print("No WOS nodes found in cluster config.")
+        return
+
+    def stop_all_vms(grace_seconds: float = 0.15):
         """Stop all VMs with a short grace period, then force-kill survivors."""
+        with pids_lock:
+            processes = list(pids)
         running = [p for p in processes if p.poll() is None]
         for p in running:
             try:
@@ -1832,16 +1880,59 @@ def launch(config: dict, tcg_level: str | None = None):
                     pass
 
     def shutdown(signum, frame):
+        stopping.set()
         print("\n=== Shutting down cluster ===")
-        stop_all_vms(pids)
+        stop_all_vms()
         print("=== Cluster stopped ===")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
+    max_workers = len(nodes)
+    futures = {}
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    launch_one_vm,
+                    node_id,
+                    nodes[node_id],
+                    config,
+                    tcg_level,
+                    pids,
+                    pids_lock,
+                    stopping,
+                ): node_id
+                for node_id in sorted(nodes.keys())
+            }
+
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    result = future.result()
+                    for line in result.lines:
+                        print(line)
+            except LaunchError as exc:
+                stopping.set()
+                for line in exc.lines:
+                    print(line)
+                print(f"ERROR: {exc}", file=sys.stderr)
+                for future in futures:
+                    future.cancel()
+                stop_all_vms()
+                sys.exit(1)
+            except KeyboardInterrupt:
+                shutdown(None, None)
+    except KeyboardInterrupt:
+        shutdown(None, None)
+
+    print(f"\n=== {len(pids)} VMs launched ===")
+    print("Press Ctrl+C to stop all VMs.\n")
+
     # Wait for all VMs
-    for p in pids:
+    with pids_lock:
+        launched = list(pids)
+    for p in launched:
         try:
             p.wait()
         except KeyboardInterrupt:
