@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <dev/block_device.hpp>
+#include <net/address.hpp>
 #include <net/wki/remotable.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -14,7 +16,7 @@ struct PacketBuffer;
 namespace ker::net::wki {
 
 // -----------------------------------------------------------------------------
-// DevServerBinding — one per active remote consumer attachment
+// DevServerBinding - one per active remote consumer attachment
 // -----------------------------------------------------------------------------
 
 // D12: RX packet filter for remote NIC consumers
@@ -30,10 +32,21 @@ struct DevServerBinding {
     uint16_t assigned_channel = 0;
     ResourceType resource_type = ResourceType::BLOCK;
     uint32_t resource_id = 0;
-    ker::dev::BlockDevice* block_dev = nullptr;
-    char vfs_export_path[256] = {};  // NOLINT(modernize-avoid-c-arrays)
-    ker::net::NetDevice* net_dev = nullptr;
+    dev::BlockDevice* block_dev = nullptr;
+    char vfs_export_path[256] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    char vfs_export_name[256] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    net::NetDevice* net_dev = nullptr;
     NetRxFilter net_rx_filter;  // D12: per-binding RX filter
+
+    // V2: RX backpressure credit tracking [V2 A5.6]
+    uint16_t net_rx_credits = 0;  // credits granted by consumer for RX forwarding
+    bool net_nic_opened = false;  // V2: true after OP_NET_OPEN received from consumer
+    bool net_state_valid = false;
+    uint32_t net_last_ipv4_addr = 0;
+    uint32_t net_last_ipv4_mask = 0;
+    proto::MacAddress net_last_real_mac;
+    uint16_t net_last_link_state = 0;
+    uint32_t net_last_mtu = 1500;
 
     // RDMA block ring state (Phase 2: shared memory SQ/CQ for block I/O)
     uint32_t blk_zone_id = 0;
@@ -42,9 +55,112 @@ struct DevServerBinding {
     bool blk_zone_pending = false;               // deferred zone creation (runs outside RX handler)
     bool blk_roce = false;                       // true if zone is RoCE-backed (needs explicit sync)
     bool blk_sq_notified = false;                // set by post_handler, cleared after poll
-    volatile bool blk_poll_active = false;       // guard against concurrent blk_ring_server_poll
+    std::atomic<bool> blk_poll_active{false};    // guard against concurrent blk_ring_server_poll
     uint32_t blk_remote_rkey = 0;                // peer's RDMA key for their zone copy
     WkiTransport* blk_rdma_transport = nullptr;  // RoCE transport for rdma_write/read
+
+    // VFS RDMA: pre-registered server-side receive buffer the consumer can rdma_write into.
+    // Allocated at DEV_ATTACH time when the peer has an RDMA-capable transport.
+    uint8_t* vfs_rdma_write_buf = nullptr;  // server-side receive region for RDMA-backed writes
+    uint32_t vfs_rdma_write_rkey = 0;       // rkey identifying this region to the remote consumer
+
+    // VFS read staging (RoCE pull mode): server reads file data here; client rdma_reads to pull.
+    // Only allocated for transports where client-pull is safe (wki-roce).
+    uint8_t* vfs_rdma_read_staging_buf = nullptr;
+    uint32_t vfs_rdma_read_staging_rkey = 0;
+
+    // VFS bulk staging (RoCE pull mode): 2 MB staging region for OP_VFS_READ_BULK pull mode.
+    uint8_t* vfs_rdma_bulk_staging_buf = nullptr;
+    uint32_t vfs_rdma_bulk_staging_rkey = 0;
+
+    // V2 I-4: custom move ops required because std::atomic<bool> is non-movable
+    DevServerBinding() = default;
+    DevServerBinding(const DevServerBinding&) = delete;
+    auto operator=(const DevServerBinding&) -> DevServerBinding& = delete;
+    DevServerBinding(DevServerBinding&& o) noexcept
+        : active(o.active),
+          consumer_node(o.consumer_node),
+          assigned_channel(o.assigned_channel),
+          resource_type(o.resource_type),
+          resource_id(o.resource_id),
+          block_dev(o.block_dev),
+          net_dev(o.net_dev),
+          net_rx_filter(o.net_rx_filter),
+          net_rx_credits(o.net_rx_credits),
+          net_nic_opened(o.net_nic_opened),
+          net_state_valid(o.net_state_valid),
+          net_last_ipv4_addr(o.net_last_ipv4_addr),
+          net_last_ipv4_mask(o.net_last_ipv4_mask),
+          net_last_real_mac(o.net_last_real_mac),
+          net_last_link_state(o.net_last_link_state),
+          net_last_mtu(o.net_last_mtu),
+          blk_zone_id(o.blk_zone_id),
+          blk_zone_ptr(o.blk_zone_ptr),
+          blk_rdma_active(o.blk_rdma_active),
+          blk_zone_pending(o.blk_zone_pending),
+          blk_roce(o.blk_roce),
+          blk_sq_notified(o.blk_sq_notified),
+          blk_poll_active(o.blk_poll_active.load(std::memory_order_relaxed)),
+          blk_remote_rkey(o.blk_remote_rkey),
+          blk_rdma_transport(o.blk_rdma_transport),
+          vfs_rdma_write_buf(o.vfs_rdma_write_buf),
+          vfs_rdma_write_rkey(o.vfs_rdma_write_rkey),
+          vfs_rdma_read_staging_buf(o.vfs_rdma_read_staging_buf),
+          vfs_rdma_read_staging_rkey(o.vfs_rdma_read_staging_rkey),
+          vfs_rdma_bulk_staging_buf(o.vfs_rdma_bulk_staging_buf),
+          vfs_rdma_bulk_staging_rkey(o.vfs_rdma_bulk_staging_rkey) {
+        // Copy the ABI-facing arrays manually.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+        __builtin_memcpy(vfs_export_path, o.vfs_export_path, sizeof(vfs_export_path));
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+        __builtin_memcpy(vfs_export_name, o.vfs_export_name, sizeof(vfs_export_name));
+        o.vfs_rdma_write_buf = nullptr;  // ownership transfer
+        o.vfs_rdma_read_staging_buf = nullptr;
+        o.vfs_rdma_bulk_staging_buf = nullptr;
+    }
+    auto operator=(DevServerBinding&& o) noexcept -> DevServerBinding& {
+        if (this != &o) {
+            active = o.active;
+            consumer_node = o.consumer_node;
+            assigned_channel = o.assigned_channel;
+            resource_type = o.resource_type;
+            resource_id = o.resource_id;
+            block_dev = o.block_dev;
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+            __builtin_memcpy(vfs_export_path, o.vfs_export_path, sizeof(vfs_export_path));
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+            __builtin_memcpy(vfs_export_name, o.vfs_export_name, sizeof(vfs_export_name));
+            net_dev = o.net_dev;
+            net_rx_filter = o.net_rx_filter;
+            net_rx_credits = o.net_rx_credits;
+            net_nic_opened = o.net_nic_opened;
+            net_state_valid = o.net_state_valid;
+            net_last_ipv4_addr = o.net_last_ipv4_addr;
+            net_last_ipv4_mask = o.net_last_ipv4_mask;
+            net_last_real_mac = o.net_last_real_mac;
+            net_last_link_state = o.net_last_link_state;
+            net_last_mtu = o.net_last_mtu;
+            blk_zone_id = o.blk_zone_id;
+            blk_zone_ptr = o.blk_zone_ptr;
+            blk_rdma_active = o.blk_rdma_active;
+            blk_zone_pending = o.blk_zone_pending;
+            blk_roce = o.blk_roce;
+            blk_sq_notified = o.blk_sq_notified;
+            blk_poll_active.store(o.blk_poll_active.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            blk_remote_rkey = o.blk_remote_rkey;
+            blk_rdma_transport = o.blk_rdma_transport;
+            vfs_rdma_write_buf = o.vfs_rdma_write_buf;
+            vfs_rdma_write_rkey = o.vfs_rdma_write_rkey;
+            vfs_rdma_read_staging_buf = o.vfs_rdma_read_staging_buf;
+            vfs_rdma_read_staging_rkey = o.vfs_rdma_read_staging_rkey;
+            vfs_rdma_bulk_staging_buf = o.vfs_rdma_bulk_staging_buf;
+            vfs_rdma_bulk_staging_rkey = o.vfs_rdma_bulk_staging_rkey;
+            o.vfs_rdma_write_buf = nullptr;  // ownership transfer
+            o.vfs_rdma_read_staging_buf = nullptr;
+            o.vfs_rdma_bulk_staging_buf = nullptr;
+        }
+        return *this;
+    }
 };
 
 // -----------------------------------------------------------------------------
@@ -61,17 +177,38 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id);
 // Called from wki_timer_tick() as a periodic fallback.
 void wki_dev_server_poll_rings();
 
+// Look up the pre-registered VFS write-receive buffer for a given binding.
+// Returns nullptr if the binding has no RDMA write buffer (msg-only path).
+auto wki_dev_server_get_vfs_write_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t*;
+
+// Look up the server-side VFS read staging buffer (RoCE pull mode).
+// Returns nullptr if pull mode is not active for this binding.
+auto wki_dev_server_get_vfs_read_staging_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t*;
+
+// Look up the server-side VFS bulk staging buffer (RoCE bulk pull mode).
+// Returns nullptr if bulk pull mode is not active for this binding.
+auto wki_dev_server_get_vfs_bulk_staging_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t*;
+
 // Process deferred zone creations. Called from wki_timer_tick().
 // Zone creation is deferred from the RX handler because wki_zone_create()
 // blocks on a spin-wait that cannot make progress inside the NAPI poll handler.
 void wki_dev_server_process_pending_zones();
 
-// D11: RX forward callback — installed on NetDevice when remote consumer is attached.
+// D11: RX forward callback - installed on NetDevice when remote consumer is attached.
 // Forwards received packets to all NET bindings for this device.
-void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt);
+void wki_dev_server_forward_net_rx(net::NetDevice* dev, net::PacketBuffer* pkt);
+
+// Push the current owner NIC state (IPv4/link/MAC/MTU) to attached remote
+// proxies when a real NIC changes locally.
+void wki_dev_server_notify_net_changed(net::NetDevice* dev);
+
+// Refresh cached VFS export path/name for active bindings attached to a
+// resource whose advertised backing path changed (for example after
+// pivot_root() rebuilds the export table).
+void wki_dev_server_refresh_vfs_binding(uint32_t resource_id, const char* export_path, const char* export_name);
 
 // -----------------------------------------------------------------------------
-// Internal — RX message handlers (called from wki.cpp dispatch)
+// Internal - RX message handlers (called from wki.cpp dispatch)
 // -----------------------------------------------------------------------------
 
 namespace detail {

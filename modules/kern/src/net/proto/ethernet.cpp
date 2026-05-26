@@ -1,19 +1,23 @@
 #include "ethernet.hpp"
 
-#include <cstring>
+#include <cstdint>
+#include <net/address.hpp>
 #include <net/endian.hpp>
+#include <net/net_trace.hpp>
 #include <net/proto/arp.hpp>
 #include <net/proto/ipv4.hpp>
 #include <net/proto/ipv6.hpp>
 #include <net/wki/transport_eth.hpp>
 #include <net/wki/transport_roce.hpp>
-#include <platform/dbg/dbg.hpp>
+
+#include "net/packet.hpp"
 
 namespace ker::net::proto {
 
-const std::array<uint8_t, ETH_ALEN> ETH_BROADCAST = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+const MacAddress ETH_BROADCAST = MacAddress::broadcast();
 
 void eth_rx(NetDevice* dev, PacketBuffer* pkt) {
+    NET_TRACE_SPAN(SPAN_ETH_RX);
     if (pkt->len < ETH_HLEN) {
         pkt_free(pkt);
         return;
@@ -22,25 +26,28 @@ void eth_rx(NetDevice* dev, PacketBuffer* pkt) {
     const auto* hdr = reinterpret_cast<const EthernetHeader*>(pkt->data);
 
     // MAC filtering: accept only packets destined to us, broadcast, or multicast
-    bool is_our_mac = std::memcmp(hdr->dst.data(), dev->mac.data(), ETH_ALEN) == 0;
-    bool is_broadcast = std::memcmp(hdr->dst.data(), ETH_BROADCAST.data(), ETH_ALEN) == 0;
-    bool is_multicast = (hdr->dst[0] & 0x01) != 0;  // LSB of first byte set = multicast
+    MacAddress const DST = hdr->dst;
+    MacAddress const SRC = hdr->src;
 
-    if (!is_our_mac && !is_broadcast && !is_multicast) {
+    bool const IS_OUR_MAC = DST == dev->mac;
+    bool const IS_BROADCAST = DST.is_broadcast();
+    bool const IS_MULTICAST = DST.is_multicast();
+
+    if (!IS_OUR_MAC && !IS_BROADCAST && !IS_MULTICAST) {
         pkt_free(pkt);
         return;
     }
 
-    uint16_t ethertype = ntohs(hdr->ethertype);
-    pkt->protocol = ethertype;
+    uint16_t const ETHERTYPE = ntohs(hdr->ethertype);
+    pkt->protocol = ETHERTYPE;
 
     // Preserve source MAC for reply use
-    std::memcpy(pkt->src_mac.data(), hdr->src.data(), ETH_ALEN);
+    pkt->src_mac = SRC;
 
     // Strip ethernet header
     pkt->pull(ETH_HLEN);
 
-    switch (ethertype) {
+    switch (ETHERTYPE) {
         case ETH_TYPE_ARP:
             arp_rx(dev, pkt);
             break;
@@ -62,7 +69,7 @@ void eth_rx(NetDevice* dev, PacketBuffer* pkt) {
     }
 }
 
-auto eth_tx(NetDevice* dev, PacketBuffer* pkt, const std::array<uint8_t, 6>& dst_mac, uint16_t ethertype) -> int {
+auto eth_tx(NetDevice* dev, PacketBuffer* pkt, const MacAddress& dst_mac, uint16_t ethertype) -> int {
     if (dev == nullptr || pkt == nullptr || dev->ops == nullptr || dev->ops->start_xmit == nullptr) {
         pkt_free(pkt);
         return -1;
@@ -70,8 +77,8 @@ auto eth_tx(NetDevice* dev, PacketBuffer* pkt, const std::array<uint8_t, 6>& dst
 
     // Prepend ethernet header
     auto* hdr = reinterpret_cast<EthernetHeader*>(pkt->push(ETH_HLEN));
-    std::memcpy(hdr->dst.data(), dst_mac.data(), ETH_ALEN);
-    std::memcpy(hdr->src.data(), dev->mac.data(), ETH_ALEN);
+    hdr->dst = dst_mac;
+    hdr->src = dev->mac;
     hdr->ethertype = htons(ethertype);
 
     dev->tx_packets++;

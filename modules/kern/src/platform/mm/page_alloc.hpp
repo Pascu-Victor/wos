@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 namespace ker::mod::mm {
@@ -34,31 +35,37 @@ struct PageAllocator {
     static constexpr uint8_t FLAG_ALLOC_CONT = 0xC0;
     static constexpr uint8_t FLAG_RESERVED = 0xFF;
 
-    FreeBlock* freeList[MAX_ORDER + 1];  // one singly-linked list per order
-    uint8_t* pageFlags;                  // 1 byte per page
-    uint32_t* pageRefcounts;             // 1 refcount per page (for COW fork)
-    uint64_t base;                       // HHDM start of the managed region
-    uint32_t totalPages;                 // total pages in the region (incl. metadata)
-    uint32_t usablePages;                // pages available for allocation
-    uint32_t freeCount;                  // current free page count
-    uint32_t metadataPages;              // pages consumed by metadata
+    std::array<FreeBlock*, MAX_ORDER + 1> free_list{};  // one singly-linked list per order
+    uint8_t* page_flags = nullptr;                      // 1 byte per page
+    uint32_t* page_refcounts = nullptr;                 // 1 refcount per page (for COW fork)
+    uint64_t base = 0;                                  // HHDM start of the managed region
+    uint32_t total_pages = 0;                           // total pages in the region (incl. metadata)
+    uint32_t usable_pages = 0;                          // pages available for allocation
+    uint32_t free_count = 0;                            // current free page count
+    uint32_t metadata_pages = 0;                        // pages consumed by metadata
 
     // Initialise this allocator over the zone starting at `zoneBase`
     // (HHDM address) with `sizeBytes` total bytes.  Metadata is placed at
     // the beginning; the rest becomes allocatable.
-    void init(uint64_t zoneBase, uint64_t sizeBytes);
+    void init(uint64_t zone_base, uint64_t size_bytes);
 
     // Allocate >= sizeBytes of contiguous physical pages (rounded up to the
     // next power-of-two page count).  Returns an HHDM pointer or nullptr on
     // failure.
-    void* alloc(uint64_t sizeBytes);
+    void* alloc(uint64_t size_bytes);
 
     // Free a previous allocation.  The allocation order is recovered from the
-    // per-page flags — callers do not need to supply the size.
+    // per-page flags - callers do not need to supply the size.
     void free(void* ptr);
 
-    uint32_t getFreePages() const { return freeCount; }
-    uint32_t getUsablePages() const { return usablePages; }
+    // Re-tag a contiguous allocated block as a run of independently freeable
+    // order-0 pages while preserving the existing per-page refcounts.
+    // Use this when a multi-page allocation will be mapped/freed as separate
+    // 4 KiB leaves.
+    auto split_allocated_block_to_order0(void* ptr) const -> bool;
+
+    [[nodiscard]] __attribute__((no_sanitize("address"))) uint32_t get_free_pages() const { return free_count; }
+    [[nodiscard]] __attribute__((no_sanitize("address"))) uint32_t get_usable_pages() const { return usable_pages; }
 };
 
 }  // namespace ker::mod::mm

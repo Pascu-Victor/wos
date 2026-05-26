@@ -11,22 +11,40 @@ struct BlockDevice;
 
 namespace ker::vfs {
 
-constexpr size_t MAX_MOUNTS = 32;
-
 // Mount point structure
 struct MountPoint {
-    const char* path;               // Mount path (e.g., "/mnt/disk0")
-    const char* fstype;             // Filesystem type (e.g., "fat32", "tmpfs")
-    FSType fs_type;                 // Filesystem type enum
-    ker::dev::BlockDevice* device;  // Associated block device
-    FileOperations* fops;           // Filesystem operations
-    void* private_data;             // Filesystem-specific data
+    const char* path{};               // Mount path (e.g., "/mnt/disk0")
+    const char* fstype{};             // Filesystem type (e.g., "fat32", "tmpfs")
+    FSType fs_type{};                 // Filesystem type enum
+    ker::dev::BlockDevice* device{};  // Associated block device
+    FileOperations* fops{};           // Filesystem operations
+    void* private_data{};             // Filesystem-specific data
+    uint32_t dev_id{};                // Unique synthetic st_dev for this mount
 };
+
+constexpr size_t MOUNT_PATH_MAX = 512;
+
+struct MountSnapshot {
+    char path[MOUNT_PATH_MAX]{};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    FSType fs_type{};
+    uint32_t dev_id{};
+};
+
+static_assert(offsetof(MountSnapshot, path) == 0, "MountSnapshot path buffer must stay first");
+static_assert(offsetof(MountSnapshot, fs_type) == MOUNT_PATH_MAX, "MountSnapshot fs_type offset changed");
 
 // Mount point management
 auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device) -> int;
 auto unmount_filesystem(const char* path) -> int;
 auto find_mount_point(const char* path) -> MountPoint*;
+auto configure_mount_point_exact(const char* path, FSType expected_type, void* private_data, FileOperations* fops) -> bool;
+auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int;
+void rebase_wki_mounts_for_new_root(const char* new_root);
+
+// Resolve path through the current task's root prefix (same as mount_filesystem
+// stores internally).  Callers that need to find_mount_point a raw path AFTER
+// mount_filesystem should resolve first.
+auto resolve_mount_path(const char* path, char* out, size_t outsize) -> int;
 
 // Helper to convert fstype string to FSType enum
 auto fstype_to_enum(const char* fstype) -> FSType;
@@ -34,5 +52,6 @@ auto fstype_to_enum(const char* fstype) -> FSType;
 // D9: Iteration API for auto-discovery of exportable mount points
 auto get_mount_count() -> size_t;
 auto get_mount_at(size_t index) -> MountPoint*;
+auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool;
 
 }  // namespace ker::vfs

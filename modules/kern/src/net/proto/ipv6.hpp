@@ -1,7 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <net/address.hpp>
 #include <net/netdevice.hpp>
 #include <net/packet.hpp>
 
@@ -9,15 +12,16 @@ namespace ker::net::proto {
 
 // IPv6 header (40 bytes, fixed)
 struct IPv6Header {
-    uint32_t version_tc_flow;  // 4-bit version, 8-bit traffic class, 20-bit flow label
-    uint16_t payload_length;   // network order
-    uint8_t next_header;       // protocol (same as IPv4 protocol field)
-    uint8_t hop_limit;
-    std::array<uint8_t, 16> src;
-    std::array<uint8_t, 16> dst;
+    uint32_t version_tc_flow{};  // 4-bit version, 8-bit traffic class, 20-bit flow label
+    uint16_t payload_length{};   // network order
+    uint8_t next_header{};       // protocol (same as IPv4 protocol field)
+    uint8_t hop_limit{};
+    IPv6Address src;
+    IPv6Address dst;
 } __attribute__((packed));
 
 constexpr size_t IPV6_HLEN = 40;
+static_assert(sizeof(IPv6Header) == IPV6_HLEN);
 
 // IPv6 next-header / protocol numbers
 constexpr uint8_t IPV6_PROTO_ICMPV6 = 58;
@@ -29,10 +33,10 @@ constexpr uint8_t IPV6_PROTO_UDP = 17;
 extern const std::array<uint8_t, 13> IPV6_SOLICITED_NODE_PREFIX;
 
 // All-nodes multicast: ff02::1
-extern const std::array<uint8_t, 16> IPV6_ALL_NODES_MULTICAST;
+extern const IPv6Address IPV6_ALL_NODES_MULTICAST;
 
 // Unspecified address: ::
-extern const std::array<uint8_t, 16> IPV6_UNSPECIFIED;
+extern const IPv6Address IPV6_UNSPECIFIED;
 
 // Link-local prefix: fe80::/10
 extern const std::array<uint8_t, 2> IPV6_LINK_LOCAL_PREFIX;
@@ -42,16 +46,15 @@ void ipv6_rx(NetDevice* dev, PacketBuffer* pkt);
 
 // TX: send an IPv6 packet
 // next_header: protocol (TCP=6, UDP=17, ICMPv6=58)
-void ipv6_tx(PacketBuffer* pkt, const std::array<uint8_t, 16>& src, const std::array<uint8_t, 16>& dst, uint8_t next_header,
-             uint8_t hop_limit, NetDevice* dev);
+void ipv6_tx(PacketBuffer* pkt, const IPv6Address& src, const IPv6Address& dst, uint8_t next_header, uint8_t hop_limit, NetDevice* dev);
 
 // Generate link-local address from MAC (EUI-64)
-void ipv6_make_link_local(std::array<uint8_t, 16>& out, const std::array<uint8_t, 6>& mac);
+auto ipv6_make_link_local(const MacAddress& mac) -> IPv6Address;
 
 // Generate solicited-node multicast address from unicast address
-void ipv6_make_solicited_node(std::array<uint8_t, 16>& out, const std::array<uint8_t, 16>& addr);
+auto ipv6_make_solicited_node(const IPv6Address& addr) -> IPv6Address;
 
 // Convert IPv6 multicast address to Ethernet multicast MAC
-void ipv6_multicast_to_mac(std::array<uint8_t, 6>& out_mac, const std::array<uint8_t, 16>& ipv6_mcast);
+auto ipv6_multicast_to_mac(const IPv6Address& ipv6_mcast) -> MacAddress;
 
 }  // namespace ker::net::proto

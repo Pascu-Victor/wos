@@ -7,7 +7,7 @@
 namespace ker::net::wki {
 
 // -----------------------------------------------------------------------------
-// IRQ Forwarding Binding — one per registered remote interrupt
+// IRQ Forwarding Binding - one per registered remote interrupt
 // -----------------------------------------------------------------------------
 
 using IrqFwdHandlerFn = void (*)(uint8_t vector, void* data);
@@ -52,7 +52,7 @@ void wki_irq_fwd_cleanup_for_peer(uint16_t node_id);
 void wki_irq_fwd_doorbell_rx(uint16_t src_node, uint16_t device_id, uint16_t irq_vector, uint32_t irq_status);
 
 // -----------------------------------------------------------------------------
-// Internal — RX message handler (called from wki.cpp dispatch)
+// Internal - RX message handler (called from wki.cpp dispatch)
 // -----------------------------------------------------------------------------
 
 namespace detail {

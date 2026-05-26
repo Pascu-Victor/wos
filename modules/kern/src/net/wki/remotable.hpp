@@ -1,8 +1,13 @@
 #pragma once
 
 #include <cstdint>
+#include <net/address.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
+
+namespace ker::net {
+struct NetDevice;
+}
 
 namespace ker::net::wki {
 
@@ -14,7 +19,7 @@ namespace ker::net::wki {
 constexpr uint16_t OP_BLOCK_INFO = 0x0103;
 
 // -----------------------------------------------------------------------------
-// Remotable Trait — attached to BlockDevice / NetDevice via .remotable field
+// Remotable Trait - attached to BlockDevice / NetDevice via .remotable field
 // -----------------------------------------------------------------------------
 
 struct RemotableOps {
@@ -27,7 +32,7 @@ struct RemotableOps {
 };
 
 // -----------------------------------------------------------------------------
-// Discovered Resource — advertised by remote peers
+// Discovered Resource - advertised by remote peers
 // -----------------------------------------------------------------------------
 
 constexpr size_t DISCOVERED_RESOURCE_NAME_LEN = 64;
@@ -37,7 +42,12 @@ struct DiscoveredResource {
     ResourceType resource_type = ResourceType::BLOCK;
     uint32_t resource_id = 0;
     uint8_t flags = 0;
-    char name[DISCOVERED_RESOURCE_NAME_LEN] = {};  // NOLINT(modernize-avoid-c-arrays)
+    uint32_t net_ipv4_addr = 0;
+    uint32_t net_ipv4_mask = 0;
+    proto::MacAddress net_real_mac;
+    uint16_t net_link_state = 0;
+    uint32_t net_mtu = 1500;
+    char name[DISCOVERED_RESOURCE_NAME_LEN] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     bool valid = false;
 };
 
@@ -50,6 +60,9 @@ void wki_remotable_init();
 
 // Advertise all local remotable block devices to all CONNECTED peers.
 void wki_resource_advertise_all();
+
+// Advertise all local remotable resources to one connected peer.
+void wki_resource_advertise_to_peer(uint16_t peer_node);
 
 // Look up a discovered (remote) resource by node, type, and ID.
 auto wki_resource_find(uint16_t node_id, ResourceType type, uint32_t resource_id) -> DiscoveredResource*;
@@ -64,8 +77,20 @@ void wki_resources_invalidate_for_peer(uint16_t node_id);
 using ResourceVisitor = void (*)(const DiscoveredResource& res, void* ctx);
 void wki_resource_foreach(ResourceVisitor visitor, void* ctx);
 
+// Process deferred VFS auto-mounts. Called from timer tick (outside NAPI context)
+// because wki_remote_vfs_mount() spin-waits for an attach ACK, and inline NAPI
+// draining cannot re-enter the current NAPI poll handler.
+void wki_remotable_process_pending_mounts();
+
+// V2: Process deferred NET auto-attaches. Called from timer tick (outside NAPI context).
+// Same NAPI re-entrance issue as VFS mounts.  [V2 A5]
+void wki_remotable_process_pending_net_attaches();
+
+// Push a changed local NET resource advert to all connected peers.
+void wki_remotable_notify_net_changed(net::NetDevice* dev);
+
 // -----------------------------------------------------------------------------
-// Internal — RX message handlers (called from wki.cpp dispatch)
+// Internal - RX message handlers (called from wki.cpp dispatch)
 // -----------------------------------------------------------------------------
 
 namespace detail {

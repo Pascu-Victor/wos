@@ -1,10 +1,21 @@
 #include "console.hpp"
 
+#include <bits/ssize_t.h>
+
+#include <cerrno>
+#include <cstdint>
 #include <cstring>
+#include <dev/pty.hpp>
 #include <mod/io/serial/serial.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <vfs/file.hpp>
 
+#include "dev/device.hpp"
+#include "platform/dbg/dbg.hpp"
+
 namespace ker::dev::console {
+
+using log = ker::mod::dbg::logger<"console">;
 
 // Forward declarations of device operations
 namespace {
@@ -44,6 +55,9 @@ CharDeviceOps serial_ops = {
     .read = serial_read,
     .write = serial_write,
     .isatty = serial_isatty,
+    .ioctl = nullptr,
+    .poll_check = nullptr,
+    .poll_register_waiter = nullptr,
 };
 
 // VGA console operations
@@ -77,6 +91,9 @@ CharDeviceOps vga_ops = {
     .read = vga_read,
     .write = vga_write,
     .isatty = vga_isatty,
+    .ioctl = nullptr,
+    .poll_check = nullptr,
+    .poll_register_waiter = nullptr,
 };
 
 // Device instances
@@ -107,10 +124,76 @@ Device console_device = {
     .char_ops = &serial_ops,  // Point to serial for now
 };
 
+// /dev/tty - controlling terminal (major 5, minor 0)
+// Opens the calling process's controlling PTY slave, or fails with ENXIO if none.
+
+int tty_open(ker::vfs::File* file) {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr || task->controlling_tty < 0) {
+#ifdef CONSOLE_DEBUG
+        log::debug("tty_open: no controlling terminal");
+#endif
+        return -ENXIO;  // No controlling terminal
+    }
+
+    auto* pair = ker::dev::pty::pty_get(task->controlling_tty);
+    if (pair == nullptr) {
+#ifdef CONSOLE_DEBUG
+        log::debug("tty_open: invalid controlling_tty index");
+#endif
+        task->controlling_tty = -1;
+        return -ENXIO;
+    }
+
+#ifdef CONSOLE_DEBUG
+    log::debug("tty_open: redirecting to PTY slave");
+#endif
+    // Redirect the DevFSFile to the PTY slave device, so subsequent
+    // read/write/ioctl use slave_ops instead of tty_ops.
+    struct DevFSFileHack {
+        void* node;
+        ker::dev::Device* device;
+        uint32_t magic;
+    };
+    if (file == nullptr || file->private_data == nullptr) {
+        ker::dev::pty::pty_put(pair);
+        return -ENOMEM;
+    }
+    auto* dff = static_cast<DevFSFileHack*>(file->private_data);
+    dff->device = &pair->slave_dev;
+
+    // Increment slave open refcount so the matching close is balanced
+    uint64_t const IRQF = pair->lock.lock_irqsave();
+    pair->slave_opened++;
+    pair->lock.unlock_irqrestore(IRQF);
+
+    return 0;
+}
+
+CharDeviceOps tty_ops = {
+    .open = tty_open,
+    .close = nullptr,  // After redirect, slave_ops.close is used
+    .read = nullptr,
+    .write = nullptr,
+    .isatty = serial_isatty,  // /dev/tty is always a tty
+    .ioctl = nullptr,
+    .poll_check = nullptr,
+    .poll_register_waiter = nullptr,
+};
+
+Device tty_device = {
+    .major = 5,
+    .minor = 0,
+    .name = "tty",
+    .type = DeviceType::CHAR,
+    .private_data = nullptr,
+    .char_ops = &tty_ops,
+};
+
 }  // anonymous namespace
 
 void console_init() {
-    ker::mod::io::serial::write("console: initializing console devices\n");
+    log::info("Initializing console devices");
 
     // Register serial console
     dev_register(&serial_device);
@@ -120,6 +203,9 @@ void console_init() {
 
     // Register main console (points to serial)
     dev_register(&console_device);
+
+    // Register /dev/tty (controlling terminal)
+    dev_register(&tty_device);
 }
 
 Device* get_serial_console() { return &serial_device; }

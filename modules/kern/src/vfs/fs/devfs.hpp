@@ -54,6 +54,10 @@ auto devfs_create_symlink(const char* path, const char* target) -> DevFSNode*;
 
 // Add a device node to the devfs root
 auto devfs_add_device_node(const char* name, ker::dev::Device* dev) -> DevFSNode*;
+auto devfs_add_device_node(const std::array<char, DEVFS_NAME_MAX>& name, ker::dev::Device* dev) -> DevFSNode*;
+
+// Remove a node at path (relative to /dev root). Returns true if removed.
+auto devfs_remove_node(const char* path) -> bool;
 
 // Walk a path and return the DevFSNode (for stat operations)
 auto devfs_walk_path(const char* path) -> DevFSNode*;
@@ -83,9 +87,24 @@ void devfs_wki_remove_resource(uint16_t node_id, uint16_t resource_type, uint32_
 // Called from wki_resources_invalidate_for_peer().
 void devfs_wki_remove_peer_resources(uint16_t node_id);
 
+// V2: Create /dev/nodes/ hierarchy for node identity [V2 A2]
+void devfs_nodes_init();
+
+// V2: Add a node entry under /dev/nodes/<hostname>/ with id, state, load files
+void devfs_nodes_add_peer(const char* hostname, uint16_t node_id);
+
+// V2: Update peer state in /dev/nodes/<hostname>/state
+void devfs_nodes_update_state(const char* hostname, const char* state_str);
+
+// V2: Remove a stale peer entry from /dev/nodes/<hostname>/
+void devfs_nodes_remove_peer(const char* hostname);
+
 // Resolve a devfs-relative path to a BlockDevice*.
 // For WKI block resources, triggers proxy attach if needed.
 // Returns nullptr if the path doesn't refer to a block device.
 auto devfs_resolve_block_device(const char* path) -> ker::dev::BlockDevice*;
+
+// Dispatch ioctl to the underlying character device
+auto devfs_ioctl(File* f, unsigned long cmd, unsigned long arg) -> int;
 
 }  // namespace ker::vfs::devfs

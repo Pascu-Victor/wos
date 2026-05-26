@@ -25,9 +25,18 @@ set(SOURCES
 # Create executable
 add_executable(httpd ${SOURCES})
 
-# Linker settings
+# Build as dynamic PIE (override parent's -static)
 set_target_properties(httpd PROPERTIES
-    LINK_FLAGS "-Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/linker.ld -static -Wl,-z,now"
+    POSITION_INDEPENDENT_CODE ON
+    INTERPROCEDURAL_OPTIMIZATION ON
+)
+set_target_properties(httpd PROPERTIES LINK_OPTIONS "")
+
+target_link_options(httpd PRIVATE
+    "--sysroot=${CMAKE_SYSROOT}"
+    "-fuse-ld=lld"
+    "-L${CMAKE_SYSROOT}/lib"
+    "-Wl,-z,now"
 )
 
-target_link_libraries(httpd c++abi c++ c unwind)
+target_link_libraries(httpd PRIVATE journal_lib c++abi c++ c unwind)

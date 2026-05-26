@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <net/packet.hpp>
@@ -43,11 +44,48 @@ constexpr uint8_t VIRTIO_STATUS_FEATURES_OK = 8;
 constexpr uint8_t VIRTIO_STATUS_FAILED = 128;
 
 // Feature bits
-constexpr uint32_t VIRTIO_NET_F_MAC = (1u << 5);
-constexpr uint32_t VIRTIO_NET_F_STATUS = (1u << 16);
-constexpr uint32_t VIRTIO_NET_F_MRG_RXBUF = (1u << 15);
-constexpr uint32_t VIRTIO_NET_F_CSUM = (1u << 0);
-constexpr uint32_t VIRTIO_NET_F_GUEST_CSUM = (1u << 1);
+constexpr uint32_t VIRTIO_NET_F_MAC = (1U << 5);
+constexpr uint32_t VIRTIO_NET_F_STATUS = (1U << 16);
+constexpr uint32_t VIRTIO_NET_F_CTRL_VQ = (1U << 17);  // Control queue present
+constexpr uint32_t VIRTIO_NET_F_MRG_RXBUF = (1U << 15);
+constexpr uint32_t VIRTIO_NET_F_CSUM = (1U << 0);
+constexpr uint32_t VIRTIO_NET_F_GUEST_CSUM = (1U << 1);
+constexpr uint32_t VIRTIO_NET_F_MQ = (1U << 22);  // Multi-queue (requires CTRL_VQ)
+
+// Modern virtio PCI capabilities (virtio 1.0  4.1.4)
+constexpr uint8_t VIRTIO_PCI_CAP_VNDR = 0x09;  // PCI vendor cap ID
+constexpr uint8_t VIRTIO_PCI_CAP_COMMON_CFG = 1;
+constexpr uint8_t VIRTIO_PCI_CAP_NOTIFY_CFG = 2;
+constexpr uint8_t VIRTIO_PCI_CAP_DEVICE_CFG = 4;
+constexpr uint32_t VIRTIO_F_VERSION_1 = (1U << 0);  // bit 0 of upper features word
+
+// Modern virtio common configuration MMIO layout (virtio 1.0  4.1.4.3)
+struct VirtioModernCfg {
+    volatile uint32_t device_feature_select;  // 0
+    volatile uint32_t device_feature;         // 4
+    volatile uint32_t driver_feature_select;  // 8
+    volatile uint32_t driver_feature;         // 12
+    volatile uint16_t config_msix_vector;     // 16
+    volatile uint16_t num_queues;             // 18
+    volatile uint8_t device_status;           // 20
+    volatile uint8_t config_generation;       // 21
+    volatile uint16_t queue_select;           // 22
+    volatile uint16_t queue_size;             // 24
+    volatile uint16_t queue_msix_vector;      // 26
+    volatile uint16_t queue_enable;           // 28
+    volatile uint16_t queue_notify_off;       // 30
+    volatile uint64_t queue_desc;             // 32
+    volatile uint64_t queue_avail;            // 40
+    volatile uint64_t queue_used;             // 48
+};
+static_assert(offsetof(VirtioModernCfg, queue_desc) == 32);
+static_assert(offsetof(VirtioModernCfg, queue_avail) == 40);
+static_assert(offsetof(VirtioModernCfg, queue_used) == 48);
+
+// Control queue class/command for activating multi-queue pairs
+constexpr uint8_t VIRTIO_NET_CTRL_CLASS_MQ = 4;
+constexpr uint8_t VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET = 0;
+constexpr uint8_t VIRTIO_NET_OK = 0;
 
 // Virtqueue descriptor flags
 constexpr uint16_t VRING_DESC_F_NEXT = 1;
@@ -63,8 +101,10 @@ struct VirtIONetHeader {
     uint16_t csum_start;
     uint16_t csum_offset;
 } __attribute__((packed));
+static_assert(sizeof(VirtIONetHeader) == 10);
 
-constexpr size_t VIRTIO_NET_HDR_SIZE = sizeof(VirtIONetHeader);
+constexpr size_t VIRTIO_NET_HDR_SIZE = sizeof(VirtIONetHeader);  // 10 bytes (legacy / no VERSION_1)
+constexpr size_t VIRTIO_NET_HDR_SIZE_MODERN = 12;                // virtio 1.0: num_buffers field always present
 
 // Virtqueue structures (packed to match hardware layout)
 struct VirtqDesc {
@@ -73,23 +113,27 @@ struct VirtqDesc {
     uint16_t flags;  // VRING_DESC_F_* flags
     uint16_t next;   // Index of next descriptor (if VRING_DESC_F_NEXT)
 } __attribute__((packed));
+static_assert(sizeof(VirtqDesc) == 16);
 
 struct VirtqAvail {
     uint16_t flags;
     uint16_t idx;
-    uint16_t ring[];  // Flexible array member
+    uint16_t ring[];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): virtqueue flexible array ABI.
 } __attribute__((packed));
+static_assert(sizeof(VirtqAvail) == 4);
 
 struct VirtqUsedElem {
     uint32_t id;   // Index of start of used descriptor chain
     uint32_t len;  // Total bytes written to buffer
 } __attribute__((packed));
+static_assert(sizeof(VirtqUsedElem) == 8);
 
 struct VirtqUsed {
     uint16_t flags;
     uint16_t idx;
-    VirtqUsedElem ring[];
+    VirtqUsedElem ring[];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): virtqueue flexible array ABI.
 } __attribute__((packed));
+static_assert(sizeof(VirtqUsed) == 4);
 
 // Maximum virtqueue size
 constexpr uint16_t VIRTQ_MAX_SIZE = 256;
@@ -105,10 +149,11 @@ struct Virtqueue {
     VirtqUsed* used;    // Used ring
 
     // Map descriptor index -> PacketBuffer for RX completion
-    ker::net::PacketBuffer* pkt_map[VIRTQ_MAX_SIZE];
+    std::array<ker::net::PacketBuffer*, VIRTQ_MAX_SIZE> pkt_map{};
 
-    uint16_t io_base;      // BAR0 for legacy notify
-    uint16_t queue_index;  // Which queue (0=RX, 1=TX)
+    uint16_t io_base;                  // BAR0 for legacy notify (unused in modern mode)
+    uint16_t queue_index;              // Which queue (0=RX, 1=TX, ...)
+    volatile uint16_t* notify_addr{};  // Modern MMIO notify addr; nullptr = legacy I/O
 
     ker::mod::sys::Spinlock lock;
 };
@@ -125,6 +170,11 @@ void virtq_kick(Virtqueue* vq);
 inline bool virtq_has_pending(const Virtqueue* vq) {
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     return vq->last_used_idx != vq->used->idx;
+}
+
+inline uint16_t virtq_pending_count(const Virtqueue* vq) {
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return static_cast<uint16_t>(vq->used->idx - vq->last_used_idx);
 }
 
 // Calculate virtqueue memory layout sizes

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <limine.h>
+#include <extern/limine.h>
 
 #include <defines/defines.hpp>
 #include <platform/acpi/madt/madt.hpp>
@@ -16,5 +16,5 @@ struct ACPIResult {
 
 void init();
 
-ACPIResult parseAcpiTables(const char* ident);
+ACPIResult parse_acpi_tables(const char* ident);
 }  // namespace ker::mod::acpi

@@ -5,6 +5,25 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "type": "lldb-dap",
+            "request": "attach",
+            "name": "Attach httpd",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/httpd/httpd"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+                "settings set target.require-hardware-breakpoint true",
+                "command alias b breakpoint set --hardware",
+                "command alias hbreak breakpoint set --hardware",
+            ],
+            "attachCommands": [
+                "gdb-remote 10.10.0.235:4321"
+            ],
+        },
+        {
             "name": "Debug WOS Kernel",
             "type": "lldb-dap",
             "request": "attach",
@@ -51,6 +70,198 @@
             "preLaunchTask": "Build and Start Cluster Debug"
         },
         {
+            "name": "Attach Cluster VM0",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
+                "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libm.a"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+            ],
+            "terminateCommands": [
+                "process kill"
+            ],
+            "attachCommands": [
+                "gdb-remote 127.0.0.1:1234"
+            ]
+        },
+        {
+            "name": "Attach Cluster VM1",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
+                "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libm.a"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+            ],
+            "terminateCommands": [
+                "process kill"
+            ],
+            "attachCommands": [
+                "gdb-remote 127.0.0.1:1235"
+            ]
+        },
+        {
+            "name": "Attach Cluster VM2",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
+                "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libm.a"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+            ],
+            "terminateCommands": [
+                "process kill"
+            ],
+            "attachCommands": [
+                "gdb-remote 127.0.0.1:1236"
+            ]
+        },
+        {
+            "name": "Attach Cluster VM3",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
+                "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libm.a"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+            ],
+            "terminateCommands": [
+                "process kill"
+            ],
+            "attachCommands": [
+                "gdb-remote 127.0.0.1:1237"
+            ]
+        },
+        {
+            "name": "Attach Cluster VM4",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
+                "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libm.a"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+            ],
+            "terminateCommands": [
+                "process kill"
+            ],
+            "attachCommands": [
+                "gdb-remote 127.0.0.1:1238"
+            ]
+        },
+        {
+            "name": "Attach Cluster VM5",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
+                "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libm.a"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+            ],
+            "terminateCommands": [
+                "process kill"
+            ],
+            "attachCommands": [
+                "gdb-remote 127.0.0.1:1239"
+            ]
+        },
+        {
+            "name": "Attach Cluster VM6",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
+                "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libm.a"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+            ],
+            "terminateCommands": [
+                "process kill"
+            ],
+            "attachCommands": [
+                "gdb-remote 127.0.0.1:1240"
+            ]
+        },
+        {
+            "name": "Attach Cluster VM7",
+            "type": "lldb-dap",
+            "request": "attach",
+            "preRunCommands": [
+                "target create ${workspaceFolder}/build/modules/kern/wos",
+                "target modules add ${workspaceFolder}/build/modules/init/init",
+                "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
+                "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libm.a"
+            ],
+            "initCommands": [
+                "settings set target.x86-disassembly-flavor intel",
+                "settings set target.load-script-from-symbol-file false",
+                "settings set target.process.thread.step-in-avoid-nodebug false",
+            ],
+            "terminateCommands": [
+                "process kill"
+            ],
+            "attachCommands": [
+                "gdb-remote 127.0.0.1:1241"
+            ]
+        },
+        {
             "name": "Debug WOS Userspace (Init Process)",
             "type": "lldb-dap",
             "request": "attach",
@@ -62,20 +273,31 @@
                 "target modules add ${workspaceFolder}/build/modules/init/init",
                 "target modules add ${workspaceFolder}/build/modules/testprog/testprog",
                 "target modules add ${workspaceFolder}/build/modules/httpd/httpd",
-                "target modules add ${workspaceFolder}/toolchain/target1/lib/libc.a",
-                "target modules add ${workspaceFolder}/toolchain/target1/lib/libm.a"
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libc.a",
+                "target modules add ${workspaceFolder}/toolchain/sysroot/lib/libm.a"
             ],
             "initCommands": [
                 "settings set target.x86-disassembly-flavor intel",
                 "settings set target.load-script-from-symbol-file true",
                 "settings set target.process.thread.step-in-avoid-nodebug false",
-                "settings set target.process.thread.step-avoid-regexp ''",
                 "settings set target.skip-prologue false",
                 "settings set target.require-hardware-breakpoint true",
                 "command alias b breakpoint set --hardware",
                 "command alias hbreak breakpoint set --hardware"
             ],
             "preLaunchTask": "Build and Start QEMU"
+        }
+    ],
+    "compounds": [
+        {
+            "name": "Attach All Cluster VMs",
+            "configurations": [
+                "Attach Cluster VM0",
+                "Attach Cluster VM1",
+                "Attach Cluster VM2",
+                "Attach Cluster VM3",
+            ],
+            "stopAll": true
         }
     ]
 }

@@ -1,0 +1,55 @@
+# WOS network syscall descriptions for Syzkaller.
+#
+# WOS syscall ABI:
+#   RAX = 6 (callnums::net)
+#   RDI = net::ops enum (sub-operation)
+#   RSI..R10 = arguments a1..a5
+
+include <abi/callnums/net.h>
+
+# --- Socket lifecycle ---
+
+wos_net$socket(op const[0], domain flags[socket_domain], type flags[socket_type], protocol int32) fd
+wos_net$bind(op const[1], fd fd, addr ptr[in, sockaddr], addrlen len[addr]) int64
+wos_net$listen(op const[2], fd fd, backlog int32) int64
+wos_net$accept(op const[3], fd fd, addr ptr[out, array[int8, 128]], addrlen ptr[inout, int32]) fd
+wos_net$connect(op const[4], fd fd, addr ptr[in, sockaddr], addrlen len[addr]) int64
+wos_net$close(op const[7], fd fd) int64
+wos_net$shutdown(op const[12], fd fd, how flags[shutdown_how]) int64
+
+# --- Data transfer ---
+
+wos_net$send(op const[5], fd fd, buf ptr[in, array[int8]], len len[buf], flags flags[msg_flags]) int64
+wos_net$recv(op const[6], fd fd, buf ptr[out, array[int8]], len len[buf], flags flags[msg_flags]) int64
+wos_net$sendto(op const[8], fd fd, buf ptr[in, array[int8]], len len[buf], flags flags[msg_flags], addr ptr[in, sockaddr]) int64
+wos_net$recvfrom(op const[9], fd fd, buf ptr[out, array[int8]], len len[buf], flags flags[msg_flags], addr ptr[out, array[int8, 128]]) int64
+
+# --- Socket options ---
+
+wos_net$setsockopt(op const[10], fd fd, level int32, optname int32, optval ptr[in, array[int8]], optlen len[optval]) int64
+wos_net$getsockopt(op const[11], fd fd, level int32, optname int32, optval ptr[out, array[int8, 128]], optlen ptr[inout, int32]) int64
+
+# --- Address queries ---
+
+wos_net$getpeername(op const[13], fd fd, addr ptr[out, array[int8, 128]], addrlen ptr[inout, int32]) int64
+wos_net$getsockname(op const[14], fd fd, addr ptr[out, array[int8, 128]], addrlen ptr[inout, int32]) int64
+
+# --- Multiplexing ---
+
+wos_net$select(op const[15], nfds int32, readfds ptr[inout, array[int8, 128]], writefds ptr[inout, array[int8, 128]], exceptfds ptr[inout, array[int8, 128]], timeout ptr[in, array[int8, 16]]) int64
+wos_net$poll(op const[16], fds ptr[inout, array[int8, 128]], nfds int32, timeout int32) int64
+wos_net$ioctl(op const[17], fd fd, request int32, arg int64) int64
+
+# --- Sockaddr ---
+
+sockaddr {
+    family  int16
+    data    array[int8, 14]
+}
+
+# --- Flags ---
+
+socket_domain = 2, 10
+socket_type = 1, 2, 3
+shutdown_how = 0, 1, 2
+msg_flags = 0, 0x40, 0x100

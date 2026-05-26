@@ -83,7 +83,7 @@ class VirtualTableModel : public QAbstractTableModel {
     /**
      * Initialize model with total row count and column headers
      */
-    VirtualTableModel(int totalRows, const QStringList& headers, QObject* parent = nullptr);
+    VirtualTableModel(int totalRows, QStringList headers, QObject* parent = nullptr);
 
     int rowCount(const QModelIndex& parent = QModelIndex()) const override;
     int columnCount(const QModelIndex& parent = QModelIndex()) const override;

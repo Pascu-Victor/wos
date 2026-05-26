@@ -1,3 +1,8 @@
+#include <qcontainerfwd.h>
+#include <qdir.h>
+#include <qlogging.h>
+#include <qtypes.h>
+
 #include <QApplication>
 #include <QCommandLineOption>
 #include <QCommandLineParser>
@@ -13,16 +18,16 @@
 
 int main(int argc, char* argv[]) {
     // Check for server mode to decide whether to instantiate QApplication or QCoreApplication
-    bool isServer = false;
+    bool is_server = false;
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]).startsWith("--server")) {
-            isServer = true;
+            is_server = true;
             break;
         }
     }
 
     std::unique_ptr<QCoreApplication> app;
-    if (isServer) {
+    if (is_server) {
         app = std::make_unique<QCoreApplication>(argc, argv);
     } else {
         app = std::make_unique<QApplication>(argc, argv);
@@ -37,32 +42,43 @@ int main(int argc, char* argv[]) {
     parser.addHelpOption();
     parser.addVersionOption();
 
-    QCommandLineOption serverOption("server", "Run in server mode", "host:port");
-    parser.addOption(serverOption);
+    QCommandLineOption server_option("server", "Run in server mode", "host:port");
+    parser.addOption(server_option);
 
-    QCommandLineOption remoteOption("remote", "Run in remote client mode", "host:port");
-    parser.addOption(remoteOption);
+    QCommandLineOption remote_option("remote", "Run in remote client mode", "host:port");
+    parser.addOption(remote_option);
+
+    QCommandLineOption mcp_option("mcp", "Start the MCP server with the wosdbg backend");
+    parser.addOption(mcp_option);
+
+    QCommandLineOption mcp_host_option("mcp-host", "MCP bind address", "host");
+    parser.addOption(mcp_host_option);
+
+    QCommandLineOption mcp_port_option("mcp-port", "MCP port", "port");
+    parser.addOption(mcp_port_option);
 
     parser.process(*app);
 
-    // Initialize config service — search CWD and upward for wosdbg.json
+    // Initialize config service - search CWD and upward for wosdbg.json
     {
-        QString configPath = "wosdbg.json";
+        QString config_path = "wosdbg.json";
         QDir dir = QDir::current();
         for (int i = 0; i < 5; ++i) {
             if (QFile::exists(dir.filePath("wosdbg.json"))) {
-                configPath = dir.absoluteFilePath("wosdbg.json");
+                config_path = dir.absoluteFilePath("wosdbg.json");
                 break;
             }
-            if (!dir.cdUp()) break;
+            if (!dir.cdUp()) {
+                break;
+            }
         }
-        ConfigService::instance().initialize(configPath);
+        ConfigService::instance().initialize(config_path);
     }
 
-    if (parser.isSet(serverOption)) {
+    if (parser.isSet(server_option)) {
         // Server Mode
-        QString hostPort = parser.value(serverOption);
-        QStringList parts = hostPort.split(":");
+        QString host_port = parser.value(server_option);
+        QStringList parts = host_port.split(":");
         QString host = "127.0.0.1";
         int port = 12345;
 
@@ -72,24 +88,35 @@ int main(int argc, char* argv[]) {
         } else if (parts.size() == 1 && !parts[0].isEmpty()) {
             // Handle case where only port is provided or only host?
             // Assuming strict host:port as per instruction, but let's be flexible
-            if (parts[0].contains("."))
+            if (parts[0].contains(".")) {
                 host = parts[0];
-            else
+            } else {
                 port = parts[0].toInt();
+            }
         }
 
         LogServer server(port);
-        if (!server.isListening()) {
+        if (!server.is_listening()) {
             qCritical() << "Failed to start server on" << host << ":" << port;
             return 1;
         }
 
+        if (parser.isSet(mcp_option)) {
+            QString mcp_host = parser.value(mcp_host_option);
+            quint16 mcp_port = static_cast<quint16>(parser.value(mcp_port_option).toUInt());
+            if (!server.start_mcp_server(mcp_host, mcp_port)) {
+                return 1;
+            }
+        }
+
         qInfo() << "Server started on" << host << ":" << port;
-        return app->exec();
-    } else if (parser.isSet(remoteOption)) {
+        return QCoreApplication::exec();
+    }
+
+    if (parser.isSet(remote_option)) {
         // Remote Client Mode
-        QString hostPort = parser.value(remoteOption);
-        QStringList parts = hostPort.split(":");
+        QString host_port = parser.value(remote_option);
+        QStringList parts = host_port.split(":");
         QString host = "127.0.0.1";
         int port = 12345;
 
@@ -97,37 +124,38 @@ int main(int argc, char* argv[]) {
             host = parts[0];
             port = parts[1].toInt();
         } else if (parts.size() == 1 && !parts[0].isEmpty()) {
-            if (parts[0].contains("."))
+            if (parts[0].contains(".")) {
                 host = parts[0];
-            else
+            } else {
                 port = parts[0].toInt();
+            }
         }
 
-        LogClient* client = new LogClient(app.get());
-        client->connectToHost(host, port);
+        auto* client = new LogClient(app.get());
+        client->connect_to_host(host, port);
 
         QemuLogViewer viewer(client);
         viewer.show();
 
-        return app->exec();
-    } else {
-        // Standalone Mode (Local Pair)
-        // Start server on localhost with ephemeral port
-        LogServer* server = new LogServer(0, app.get());
-        if (!server->isListening()) {  // 0 = ephemeral port
-            qCritical() << "Failed to start internal server";
-            return 1;
-        }
-
-        quint16 port = server->serverPort();
-        qInfo() << "Internal server started on port" << port;
-
-        LogClient* client = new LogClient(app.get());
-        client->connectToHost("127.0.0.1", port);
-
-        QemuLogViewer viewer(client);
-        viewer.show();
-
-        return app->exec();
+        return QCoreApplication::exec();
     }
+
+    // Standalone Mode (Local Pair)
+    // Start server on localhost with ephemeral port
+    auto* server = new LogServer(0, app.get());
+    if (!server->is_listening()) {  // 0 = ephemeral port
+        qCritical() << "Failed to start internal server";
+        return 1;
+    }
+
+    quint16 port = server->server_port();
+    qInfo() << "Internal server started on port" << port;
+
+    auto* client = new LogClient(app.get());
+    client->connect_to_host("127.0.0.1", port);
+
+    QemuLogViewer viewer(client);
+    viewer.show();
+
+    return QCoreApplication::exec();
 }

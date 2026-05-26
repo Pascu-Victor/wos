@@ -1,16 +1,13 @@
 #pragma once
+
 /**
  * AHCI Driver Structures
  * Reference: https://wiki.osdev.org/AHCI
  */
 
-#pragma once
-
 #include <cstddef>
 #include <cstdint>
-
-// Include BlockDevice from common header
-#include <mod/io/serial/serial.hpp>
+#include <platform/dbg/dbg.hpp>
 
 #include "block_device.hpp"
 
@@ -20,7 +17,7 @@ namespace ker::dev::ahci {
 // Helper inline functions for logging (optimizes away when AHCI_DEBUG is not defined)
 inline void ahci_log(const char* msg) {
 #ifdef AHCI_DEBUG
-    ker::mod::io::serial::write(msg);
+    ker::mod::dbg::logger<"ahci">::debug("%s", msg);
 #else
     (void)msg;
 #endif
@@ -28,26 +25,24 @@ inline void ahci_log(const char* msg) {
 
 inline void ahci_log_hex(uint64_t value) {
 #ifdef AHCI_DEBUG
-    ker::mod::io::serial::writeHex(value);
+    ker::mod::dbg::logger<"ahci">::debug("0x%lx", value);
 #else
     (void)value;
 #endif
 }
 
 // FIS Types
-enum FIS_TYPE {
-    FIS_TYPE_REG_H2D = 0x27,    // Register FIS - host to device
-    FIS_TYPE_REG_D2H = 0x34,    // Register FIS - device to host
-    FIS_TYPE_DMA_ACT = 0x39,    // DMA activate FIS - device to host
-    FIS_TYPE_DMA_SETUP = 0x41,  // DMA setup FIS - bidirectional
-    FIS_TYPE_DATA = 0x46,       // Data FIS - bidirectional
-    FIS_TYPE_BIST = 0x58,       // BIST activate FIS - bidirectional
-    FIS_TYPE_PIO_SETUP = 0x5F,  // PIO setup FIS - device to host
-    FIS_TYPE_DEV_BITS = 0xA1,   // Set device bits FIS - device to host
-};
+constexpr uint8_t FIS_TYPE_REG_H2D = 0x27;    // Register FIS - host to device
+constexpr uint8_t FIS_TYPE_REG_D2H = 0x34;    // Register FIS - device to host
+constexpr uint8_t FIS_TYPE_DMA_ACT = 0x39;    // DMA activate FIS - device to host
+constexpr uint8_t FIS_TYPE_DMA_SETUP = 0x41;  // DMA setup FIS - bidirectional
+constexpr uint8_t FIS_TYPE_DATA = 0x46;       // Data FIS - bidirectional
+constexpr uint8_t FIS_TYPE_BIST = 0x58;       // BIST activate FIS - bidirectional
+constexpr uint8_t FIS_TYPE_PIO_SETUP = 0x5F;  // PIO setup FIS - device to host
+constexpr uint8_t FIS_TYPE_DEV_BITS = 0xA1;   // Set device bits FIS - device to host
 
 // Register FIS – Host to Device
-struct FIS_REG_H2D {
+struct FisRegH2D {
     // DWORD 0
     uint8_t fis_type;  // FIS_TYPE_REG_H2D
 
@@ -79,9 +74,10 @@ struct FIS_REG_H2D {
     // DWORD 4
     uint8_t rsv1[4];  // Reserved NOLINT
 } __attribute__((packed));
+static_assert(sizeof(FisRegH2D) == 20);
 
 // Register FIS – Device to Host
-struct FIS_REG_D2H {
+struct FisRegD2H {
     // DWORD 0
     uint8_t fis_type;  // FIS_TYPE_REG_D2H
 
@@ -113,9 +109,10 @@ struct FIS_REG_D2H {
     // DWORD 4
     uint8_t rsv4[4];  // Reserved NOLINT
 } __attribute__((packed));
+static_assert(sizeof(FisRegD2H) == 20);
 
 // Data FIS – Bidirectional
-struct FIS_DATA {
+struct FisData {
     // DWORD 0
     uint8_t fis_type;  // FIS_TYPE_DATA
 
@@ -127,9 +124,10 @@ struct FIS_DATA {
     // DWORD 1 ~ N
     uint32_t data[1];  // Payload NOLINT
 } __attribute__((packed));
+static_assert(sizeof(FisData) == 8);
 
 // PIO Setup – Device to Host
-struct FIS_PIO_SETUP {
+struct FisPioSetup {
     // DWORD 0
     uint8_t fis_type;  // FIS_TYPE_PIO_SETUP
 
@@ -164,9 +162,10 @@ struct FIS_PIO_SETUP {
     uint16_t tc;      // Transfer count
     uint8_t rsv4[2];  // Reserved NOLINT
 } __attribute__((packed));
+static_assert(sizeof(FisPioSetup) == 20);
 
 // DMA Setup – Device to Host
-struct FIS_DMA_SETUP {
+struct FisDmaSetup {
     // DWORD 0
     uint8_t fis_type;  // FIS_TYPE_DMA_SETUP
 
@@ -179,24 +178,25 @@ struct FIS_DMA_SETUP {
     uint8_t rsved[2];  // Reserved NOLINT
 
     // DWORD 1&2
-    uint64_t DMAbufferID;  // DMA Buffer Identifier. Used to Identify DMA buffer in host memory.
-                           // SATA Spec says host specific and not in Spec. Trying AHCI spec might work.
+    uint64_t dm_abuffer_id;  // DMA Buffer Identifier. Used to Identify DMA buffer in host memory.
+                             // SATA Spec says host specific and not in Spec. Trying AHCI spec might work.
 
     // DWORD 3
     uint32_t rsvd;  // More reserved
 
     // DWORD 4
-    uint32_t DMAbufOffset;  // Byte offset into buffer. First 2 bits must be 0
+    uint32_t dm_abuf_offset;  // Byte offset into buffer. First 2 bits must be 0
 
     // DWORD 5
-    uint32_t TransferCount;  // Number of bytes to transfer. Bit 0 must be 0
+    uint32_t transfer_count;  // Number of bytes to transfer. Bit 0 must be 0
 
     // DWORD 6
     uint32_t resvd;  // Reserved
 } __attribute__((packed));
+static_assert(sizeof(FisDmaSetup) == 28);
 
 // HBA Memory Registers
-struct HBA_PORT {
+struct HbaPort {
     uint32_t clb;        // 0x00, command list base address, 1K-byte aligned
     uint32_t clbu;       // 0x04, command list base address upper 32 bits
     uint32_t fb;         // 0x08, FIS base address, 256-byte aligned
@@ -217,8 +217,9 @@ struct HBA_PORT {
     uint32_t rsv1[11];   // 0x44 ~ 0x6F, Reserved NOLINT
     uint32_t vendor[4];  // 0x70 ~ 0x7F, vendor specific NOLINT
 } __attribute__((packed));
+static_assert(sizeof(HbaPort) == 128);
 
-struct HBA_MEM {
+struct HbaMem {
     // 0x00 - 0x2B, Generic Host Control
     uint32_t cap;      // 0x00, Host capability
     uint32_t ghc;      // 0x04, Global host control
@@ -239,11 +240,12 @@ struct HBA_MEM {
     uint8_t vendor[0x100 - 0xA0];  // NOLINT
 
     // 0x100 - 0x10FF, Port control registers
-    HBA_PORT ports[1];  // 1 ~ 32 NOLINT
+    HbaPort ports[1];  // 1 ~ 32 NOLINT
 } __attribute__((packed));
+static_assert(sizeof(HbaMem) == 384);
 
 // Command header structure
-struct HBA_CMD_HEADER {
+struct HbaCmdHeader {
     // DW0
     uint8_t cfl : 5;  // Command FIS length in DWORDS, 2 ~ 16
     uint8_t a : 1;    // ATAPI
@@ -268,9 +270,10 @@ struct HBA_CMD_HEADER {
     // DW4 - 7
     uint32_t rsv1[4];  // Reserved NOLINT
 } __attribute__((packed));
+static_assert(sizeof(HbaCmdHeader) == 32);
 
 // Physical region descriptor table entry
-struct HBA_PRDT_ENTRY {
+struct HbaPrdtEntry {
     uint32_t dba;   // Data base address
     uint32_t dbau;  // Data base address upper 32 bits
     uint32_t rsv0;  // Reserved
@@ -280,51 +283,55 @@ struct HBA_PRDT_ENTRY {
     uint32_t rsv1 : 9;  // Reserved
     uint32_t i : 1;     // Interrupt on completion
 } __attribute__((packed));
+static_assert(sizeof(HbaPrdtEntry) == 16);
 
 // Command table structure
-struct HBA_CMD_TBL {
+struct HbaCmdTbl {
     // 0x00
     uint8_t cfis[64];  // Command FIS NOLINT
 
     // 0x40
-    uint8_t acmd[16];  // ATAPI command, 12 or 16 bytes
+    uint8_t acmd[16];  // ATAPI command, 12 or 16 bytes NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): AHCI
+                       // command-table ABI.
 
     // 0x50
     uint8_t rsv[48];  // Reserved NOLINT
 
     // 0x80
-    HBA_PRDT_ENTRY prdt_entry[1];  // Physical region descriptor table entries, 0 ~ 65535  NOLINT
+    HbaPrdtEntry prdt_entry[1];  // Physical region descriptor table entries, 0 ~ 65535  NOLINT
 } __attribute__((packed));
+static_assert(sizeof(HbaCmdTbl) == 144);
 
 // Received FIS structure
-struct HBA_FIS {
+struct HbaFis {
     // 0x00
-    FIS_DMA_SETUP dsfis;  // DMA Setup FIS
-    uint8_t pad0[4];
+    FisDmaSetup dsfis;  // DMA Setup FIS
+    uint8_t pad0[4];    // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): AHCI received-FIS ABI padding.
 
     // 0x20
-    FIS_PIO_SETUP psfis;  // PIO Setup FIS
-    uint8_t pad1[12];
+    FisPioSetup psfis;  // PIO Setup FIS
+    uint8_t pad1[12];   // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): AHCI received-FIS ABI padding.
 
     // 0x40
-    FIS_REG_D2H rfis;  // Register – Device to Host FIS
-    uint8_t pad2[4];
+    FisRegD2H rfis;   // Register – Device to Host FIS
+    uint8_t pad2[4];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): AHCI received-FIS ABI padding.
 
     // 0x58
-    uint8_t sdbfis[8];  // Set Device Bit FIS
+    uint8_t sdbfis[8];  // Set Device Bit FIS NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): AHCI received-FIS ABI.
 
     // 0x60
-    uint8_t ufis[64];
+    uint8_t ufis[64];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): AHCI received-FIS ABI.
 
     // 0xA0
-    uint8_t rsv[0x100 - 0xA0];
+    uint8_t rsv[0x100 - 0xA0];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): AHCI received-FIS ABI padding.
 } __attribute__((packed));
+static_assert(sizeof(HbaFis) == 256);
 
 // AHCI Device structure
 struct AHCIDevice {
     ker::dev::BlockDevice bdev;
-    uint8_t port_num;
-    uint64_t total_sectors;
+    uint8_t port_num{};
+    uint64_t total_sectors{};
 };
 
 // Function declarations

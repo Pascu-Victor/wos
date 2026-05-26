@@ -17,21 +17,21 @@ class CoredumpSegmentPanel : public QDockWidget {
     explicit CoredumpSegmentPanel(QWidget* parent = nullptr);
 
     // Load segment data from a parsed coredump
-    void loadCoreDump(const wosdbg::CoreDump& dump);
+    void load_core_dump(const wosdbg::CoreDump& dump);
 
     void clear();
 
    signals:
-    // Emitted when a segment is double-clicked — requests memory dump
-    void dumpSegmentRequested(int segmentIndex, uint64_t vaStart, uint64_t vaEnd);
+    // Emitted when a segment is double-clicked - requests memory dump
+    void dump_segment_requested(int segment_index, uint64_t vaStart, uint64_t vaEnd);
 
    private slots:
-    void onSegmentActivated(int row, int column);
+    void on_segment_activated(int row, int column);
 
    private:
-    void setupUI();
+    void setup_ui();
 
-    QTableWidget* table_;
+    QTableWidget* table;
 
     // Store segment info for click handling
     struct SegInfo {
@@ -40,5 +40,5 @@ class CoredumpSegmentPanel : public QDockWidget {
         uint64_t vaEnd;
         bool present;
     };
-    std::vector<SegInfo> segInfos_;
+    std::vector<SegInfo> seg_infos;
 };

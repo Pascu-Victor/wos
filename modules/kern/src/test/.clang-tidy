@@ -1,0 +1,11 @@
+---
+# Clang-Tidy configuration for kernel tests.
+
+InheritParentConfig: true
+Checks: >
+  -cppcoreguidelines-avoid-c-arrays,
+  -misc-use-anonymous-namespace,
+  -misc-use-internal-linkage,
+  -modernize-avoid-c-arrays,
+  -modernize-loop-convert
+...

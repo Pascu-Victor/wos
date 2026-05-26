@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <net/address.hpp>
 
 namespace ker::net::wki {
 
@@ -118,7 +119,7 @@ inline bool seq_after(uint32_t a, uint32_t b) { return seq_before(b, a); }
 inline bool seq_between(uint32_t seq, uint32_t low, uint32_t high) { return !seq_before(seq, low) && seq_before(seq, high); }
 
 // -----------------------------------------------------------------------------
-// WKI Header — 32 bytes, fixed size, RDMA-aligned
+// WKI Header - 32 bytes, fixed size, RDMA-aligned
 // -----------------------------------------------------------------------------
 
 struct WkiHeader {
@@ -141,28 +142,34 @@ struct WkiHeader {
 static_assert(sizeof(WkiHeader) == 32, "WkiHeader must be 32 bytes");
 
 // -----------------------------------------------------------------------------
-// HELLO / HELLO_ACK Payload — 32 bytes
+// HELLO / HELLO_ACK Payload - 32 bytes
 // -----------------------------------------------------------------------------
 
 constexpr uint16_t WKI_CAP_RDMA_SUPPORT = 0x0001;
 constexpr uint16_t WKI_CAP_ZONE_SUPPORT = 0x0002;
 
+// Hostname constants
+constexpr size_t WKI_HOSTNAME_MAX = 64;  // Matches Linux HOST_NAME_MAX (including NUL)
+
 struct HelloPayload {
-    uint32_t magic;  // WKI_HELLO_MAGIC
-    uint16_t protocol_version;
-    uint16_t node_id;                 // sender's claimed node ID
-    std::array<uint8_t, 6> mac_addr;  // sender's MAC (for Ethernet transport)
-    uint16_t capabilities;            // bitmask: WKI_CAP_*
-    uint16_t heartbeat_interval_ms;   // proposed heartbeat interval (milliseconds)
-    uint16_t max_channels;
-    uint32_t rdma_zone_bitmap;  // RDMA zone membership (32 zones max)
-    std::array<uint8_t, 8> reserved;
+    uint32_t magic{};  // WKI_HELLO_MAGIC
+    uint16_t protocol_version{};
+    uint16_t node_id{};                // sender's claimed node ID
+    proto::MacAddress mac_addr;        // sender's MAC (for Ethernet transport)
+    uint16_t capabilities{};           // bitmask: WKI_CAP_*
+    uint16_t heartbeat_interval_ms{};  // proposed heartbeat interval (milliseconds)
+    uint16_t max_channels{};
+    uint32_t rdma_zone_bitmap{};  // RDMA zone membership (32 zones max)
+    std::array<uint8_t, 8> reserved{};
+    // --- V2 extension (offset 32) ---
+    std::array<char, WKI_HOSTNAME_MAX> hostname;  // sender's hostname, UTF-8, NUL-terminated if shorter than WKI_HOSTNAME_MAX
 } __attribute__((packed));
 
-static_assert(sizeof(HelloPayload) == 32, "HelloPayload must be 32 bytes");
+static_assert(sizeof(HelloPayload) == 96, "HelloPayload must be 96 bytes");
+static_assert(offsetof(HelloPayload, hostname) == 32, "HelloPayload hostname offset must stay wire-compatible");
 
 // -----------------------------------------------------------------------------
-// HEARTBEAT Payload — 16 bytes
+// HEARTBEAT Payload - 16 bytes
 // -----------------------------------------------------------------------------
 
 struct HeartbeatPayload {
@@ -177,7 +184,7 @@ static_assert(sizeof(HeartbeatPayload) == 16, "HeartbeatPayload must be 16 bytes
 // HEARTBEAT_ACK echoes the same format (send_timestamp echoed for RTT calc)
 
 // -----------------------------------------------------------------------------
-// LSA (Link-State Advertisement) Payload — variable length
+// LSA (Link-State Advertisement) Payload - variable length
 // -----------------------------------------------------------------------------
 
 struct LsaNeighborEntry {
@@ -206,7 +213,7 @@ inline auto lsa_neighbors(const LsaPayload* lsa) -> const LsaNeighborEntry* {
 inline size_t lsa_total_size(const LsaPayload* lsa) { return sizeof(LsaPayload) + (lsa->num_neighbors * sizeof(LsaNeighborEntry)); }
 
 // -----------------------------------------------------------------------------
-// FENCE_NOTIFY Payload — 8 bytes
+// FENCE_NOTIFY Payload - 8 bytes
 // -----------------------------------------------------------------------------
 
 struct FenceNotifyPayload {
@@ -216,7 +223,7 @@ struct FenceNotifyPayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// RECONCILE_REQ / RECONCILE_ACK Payload — 8 bytes
+// RECONCILE_REQ / RECONCILE_ACK Payload - 8 bytes
 // -----------------------------------------------------------------------------
 
 struct ReconcilePayload {
@@ -226,7 +233,7 @@ struct ReconcilePayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// RESOURCE_ADVERT / RESOURCE_WITHDRAW Payload — variable length
+// RESOURCE_ADVERT / RESOURCE_WITHDRAW Payload - variable length
 // -----------------------------------------------------------------------------
 
 enum class ResourceType : uint16_t {  // NOLINT(performance-enum-size)
@@ -236,6 +243,12 @@ enum class ResourceType : uint16_t {  // NOLINT(performance-enum-size)
     VFS = 4,
     COMPUTE = 5,
     CUSTOM = 6,
+    IPC_PIPE = 7,
+    IPC_EVENTFD = 8,
+    IPC_PTY = 9,
+    IPC_FUTEX = 10,
+    IPC_EPOLL = 11,
+    IPC_SOCKET = 12,
 };
 
 constexpr uint8_t RESOURCE_FLAG_SHAREABLE = 0x01;
@@ -250,6 +263,23 @@ struct ResourceAdvertPayload {
     // Followed by name_len bytes of name (e.g., "sda", "eth0")
 } __attribute__((packed));
 
+struct ResourceAdvertNetPayload {
+    uint16_t node_id{};        // owner node
+    uint16_t resource_type{};  // ResourceType::NET
+    uint32_t resource_id{};    // unique on owning node
+    uint8_t flags{};           // RESOURCE_FLAG_*
+    uint8_t name_len{};
+    uint16_t reserved{};
+    uint32_t ipv4_addr{};        // owner NIC IPv4 address (host byte order)
+    uint32_t ipv4_mask{};        // owner NIC IPv4 mask (host byte order)
+    proto::MacAddress real_mac;  // owner NIC real MAC
+    uint16_t link_state{};       // 0=DOWN, 1=UP
+    uint32_t mtu{};              // owner NIC MTU
+    // Followed by name_len bytes of name (e.g., "eth0")
+} __attribute__((packed));
+
+static_assert(sizeof(ResourceAdvertNetPayload) == 32, "ResourceAdvertNetPayload must be 32 bytes");
+
 inline auto resource_advert_name(ResourceAdvertPayload* p) -> char* {
     return reinterpret_cast<char*>(reinterpret_cast<uint8_t*>(p) + sizeof(ResourceAdvertPayload));
 }
@@ -258,8 +288,16 @@ inline auto resource_advert_name(const ResourceAdvertPayload* p) -> const char* 
     return reinterpret_cast<const char*>(reinterpret_cast<const uint8_t*>(p) + sizeof(ResourceAdvertPayload));
 }
 
+inline auto resource_advert_name(ResourceAdvertNetPayload* p) -> char* {
+    return reinterpret_cast<char*>(reinterpret_cast<uint8_t*>(p) + sizeof(ResourceAdvertNetPayload));
+}
+
+inline auto resource_advert_name(const ResourceAdvertNetPayload* p) -> const char* {
+    return reinterpret_cast<const char*>(reinterpret_cast<const uint8_t*>(p) + sizeof(ResourceAdvertNetPayload));
+}
+
 // -----------------------------------------------------------------------------
-// ZONE_CREATE_REQ Payload — 16 bytes
+// ZONE_CREATE_REQ Payload - 16 bytes
 // -----------------------------------------------------------------------------
 
 // Access policy bits
@@ -297,7 +335,7 @@ struct ZoneCreateReqPayload {
 static_assert(sizeof(ZoneCreateReqPayload) == 16, "ZoneCreateReqPayload must be 16 bytes");
 
 // -----------------------------------------------------------------------------
-// ZONE_CREATE_ACK Payload — 24 bytes
+// ZONE_CREATE_ACK Payload - 24 bytes
 // -----------------------------------------------------------------------------
 
 enum class ZoneCreateStatus : uint8_t {
@@ -318,7 +356,7 @@ struct ZoneCreateAckPayload {
 static_assert(sizeof(ZoneCreateAckPayload) == 24, "ZoneCreateAckPayload must be 24 bytes");
 
 // -----------------------------------------------------------------------------
-// ZONE_DESTROY Payload — 8 bytes
+// ZONE_DESTROY Payload - 8 bytes
 // -----------------------------------------------------------------------------
 
 struct ZoneDestroyPayload {
@@ -327,7 +365,7 @@ struct ZoneDestroyPayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// ZONE_NOTIFY_PRE / ZONE_NOTIFY_POST Payload — 16 bytes
+// ZONE_NOTIFY_PRE / ZONE_NOTIFY_POST Payload - 16 bytes
 // -----------------------------------------------------------------------------
 
 struct ZoneNotifyPayload {
@@ -340,7 +378,7 @@ struct ZoneNotifyPayload {
 
 static_assert(sizeof(ZoneNotifyPayload) == 16, "ZoneNotifyPayload must be 16 bytes");
 
-// ZONE_NOTIFY_PRE_ACK / ZONE_NOTIFY_POST_ACK Payload — 4 bytes
+// ZONE_NOTIFY_PRE_ACK / ZONE_NOTIFY_POST_ACK Payload - 4 bytes
 struct ZoneNotifyAckPayload {
     uint32_t zone_id;
 } __attribute__((packed));
@@ -348,7 +386,7 @@ struct ZoneNotifyAckPayload {
 static_assert(sizeof(ZoneNotifyAckPayload) == 4, "ZoneNotifyAckPayload must be 4 bytes");
 
 // -----------------------------------------------------------------------------
-// ZONE_READ_REQ Payload — 12 bytes
+// ZONE_READ_REQ Payload - 12 bytes
 // -----------------------------------------------------------------------------
 
 struct ZoneReadReqPayload {
@@ -358,7 +396,7 @@ struct ZoneReadReqPayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// ZONE_READ_RESP / ZONE_WRITE_REQ — variable length
+// ZONE_READ_RESP / ZONE_WRITE_REQ - variable length
 // Data follows immediately after the fixed portion
 // -----------------------------------------------------------------------------
 
@@ -383,7 +421,7 @@ struct ZoneWriteAckPayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// EVENT_SUBSCRIBE / EVENT_UNSUBSCRIBE Payload — 8 bytes
+// EVENT_SUBSCRIBE / EVENT_UNSUBSCRIBE Payload - 8 bytes
 // -----------------------------------------------------------------------------
 
 constexpr uint8_t EVENT_DELIVERY_RELIABLE = 0;
@@ -399,7 +437,7 @@ struct EventSubscribePayload {
 static_assert(sizeof(EventSubscribePayload) == 8, "EventSubscribePayload must be 8 bytes");
 
 // -----------------------------------------------------------------------------
-// EVENT_PUBLISH Payload — variable length
+// EVENT_PUBLISH Payload - variable length
 // -----------------------------------------------------------------------------
 
 // Well-known event classes
@@ -421,7 +459,7 @@ struct EventPublishPayload {
 
 static_assert(sizeof(EventPublishPayload) == 8, "EventPublishPayload must be 8 bytes");
 
-// EVENT_ACK — just echoes the event identity
+// EVENT_ACK - just echoes the event identity
 struct EventAckPayload {
     uint16_t event_class;
     uint16_t event_id;
@@ -430,7 +468,7 @@ struct EventAckPayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// DEV_ATTACH_REQ Payload — 12 bytes
+// DEV_ATTACH_REQ Payload - 12 bytes
 // -----------------------------------------------------------------------------
 
 enum class AttachMode : uint8_t {
@@ -450,7 +488,7 @@ struct DevAttachReqPayload {
 static_assert(sizeof(DevAttachReqPayload) == 12, "DevAttachReqPayload must be 12 bytes");
 
 // -----------------------------------------------------------------------------
-// DEV_ATTACH_ACK Payload — 8 bytes
+// DEV_ATTACH_ACK Payload - 16 bytes
 // -----------------------------------------------------------------------------
 
 enum class DevAttachStatus : uint8_t {
@@ -465,18 +503,55 @@ struct DevAttachAckPayload {
     uint8_t status;  // DevAttachStatus
     uint8_t reserved;
     uint16_t assigned_channel;
-    uint16_t max_op_size;       // max payload size for DEV_OP_REQ
-    uint16_t rdma_flags;        // bit 0: RDMA block ring zone available
-    uint32_t blk_zone_id;       // RDMA zone ID for block ring (0 = not available)
+    uint32_t resource_id;             // echoed from DEV_ATTACH_REQ for consumer-side matching
+    uint16_t max_op_size;             // max payload size for DEV_OP_REQ
+    uint16_t rdma_flags;              // bit 0: RDMA block ring zone available
+    uint32_t blk_zone_id;             // RDMA zone ID for block ring; for VFS: server write-recv rkey
+    uint32_t rdma_read_staging_rkey;  // DEV_ATTACH_RDMA_VFS_READ: server-side read staging rkey (RoCE pull mode)
+    uint32_t rdma_bulk_staging_rkey;  // DEV_ATTACH_RDMA_BULK_PULL: server-side bulk staging rkey (RoCE pull mode)
 } __attribute__((packed));
 
-static_assert(sizeof(DevAttachAckPayload) == 12, "DevAttachAckPayload must be 12 bytes");
+static_assert(sizeof(DevAttachAckPayload) == 24, "DevAttachAckPayload must be 24 bytes");
+
+// V2: Extended attach ACK for NET resources - includes owner NIC info [V2 A5.3]
+struct DevAttachAckNetPayload {
+    // V1 base fields (identical layout to DevAttachAckPayload)
+    uint8_t status{};
+    uint8_t reserved{};
+    uint16_t assigned_channel{};
+    uint32_t resource_id{};
+    uint16_t max_op_size{};
+    uint16_t rdma_flags{};
+    uint32_t blk_zone_id{};  // unused for NET, kept for layout compatibility
+    // V2 NET extension fields
+    uint32_t ipv4_addr{};        // Owner NIC's IPv4 address (network byte order)
+    uint32_t ipv4_mask{};        // Owner NIC's IPv4 subnet mask
+    proto::MacAddress real_mac;  // Owner NIC's real MAC address
+    uint16_t link_state{};       // 0=DOWN, 1=UP
+    uint32_t mtu{};              // Owner NIC MTU
+} __attribute__((packed));
+
+static_assert(sizeof(DevAttachAckNetPayload) == 36, "DevAttachAckNetPayload must be 36 bytes");
+
+struct NetStateNotifyPayload {
+    uint32_t ipv4_addr{};        // Owner NIC's IPv4 address (network byte order)
+    uint32_t ipv4_mask{};        // Owner NIC's IPv4 subnet mask
+    proto::MacAddress real_mac;  // Owner NIC's real MAC address
+    uint16_t link_state{};       // 0=DOWN, 1=UP
+    uint32_t mtu{};              // Owner NIC MTU
+} __attribute__((packed));
+
+static_assert(sizeof(NetStateNotifyPayload) == 20, "NetStateNotifyPayload must be 20 bytes");
 
 // RDMA flags for DevAttachAckPayload
-constexpr uint16_t DEV_ATTACH_RDMA_BLK_RING = 0x0001;  // block ring RDMA zone available
+constexpr uint16_t DEV_ATTACH_RDMA_BLK_RING = 0x0001;   // block ring RDMA zone available
+constexpr uint16_t DEV_ATTACH_RDMA_VFS = 0x0002;        // VFS RDMA available; blk_zone_id carries server write-recv rkey
+constexpr uint16_t DEV_ATTACH_RDMA_BULK = 0x0004;       // bulk RDMA transfer supported (large sequential I/O)
+constexpr uint16_t DEV_ATTACH_RDMA_VFS_READ = 0x0008;   // VFS read staging buf available (pull mode); rdma_read_staging_rkey valid
+constexpr uint16_t DEV_ATTACH_RDMA_BULK_PULL = 0x0010;  // VFS bulk staging buf available (pull mode); rdma_bulk_staging_rkey valid
 
 // -----------------------------------------------------------------------------
-// DEV_DETACH Payload — 8 bytes
+// DEV_DETACH Payload - 8 bytes
 // -----------------------------------------------------------------------------
 
 struct DevDetachPayload {
@@ -486,7 +561,7 @@ struct DevDetachPayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// DEV_OP_REQ / DEV_OP_RESP Payload — variable length
+// DEV_OP_REQ / DEV_OP_RESP Payload - variable length
 // -----------------------------------------------------------------------------
 
 struct DevOpReqPayload {
@@ -507,6 +582,8 @@ struct DevOpRespPayload {
 constexpr uint16_t OP_BLOCK_READ = 0x0100;
 constexpr uint16_t OP_BLOCK_WRITE = 0x0101;
 constexpr uint16_t OP_BLOCK_FLUSH = 0x0102;
+constexpr uint16_t OP_BLOCK_BULK_READ = 0x0104;   // Streaming bulk transfer: server RDMA-writes entire range to consumer buffer
+constexpr uint16_t OP_BLOCK_BULK_WRITE = 0x0105;  // Streaming bulk transfer: server RDMA-reads entire range from consumer buffer
 
 constexpr uint16_t OP_CHAR_OPEN = 0x0200;
 constexpr uint16_t OP_CHAR_CLOSE = 0x0201;
@@ -517,6 +594,10 @@ constexpr uint16_t OP_NET_XMIT = 0x0300;
 constexpr uint16_t OP_NET_SET_MAC = 0x0301;
 constexpr uint16_t OP_NET_RX_NOTIFY = 0x0302;
 constexpr uint16_t OP_NET_GET_STATS = 0x0303;
+constexpr uint16_t OP_NET_OPEN = 0x0304;          // V2: bring up remote NIC [V2 A5.5]
+constexpr uint16_t OP_NET_CLOSE = 0x0305;         // V2: shut down remote NIC [V2 A5.5]
+constexpr uint16_t OP_NET_RX_CREDIT = 0x0306;     // V2: replenish RX credits [V2 A5.6]
+constexpr uint16_t OP_NET_STATE_NOTIFY = 0x0307;  // V3: owner-pushed NIC state update
 
 constexpr uint16_t OP_VFS_OPEN = 0x0400;
 constexpr uint16_t OP_VFS_READ = 0x0401;
@@ -527,9 +608,51 @@ constexpr uint16_t OP_VFS_STAT = 0x0405;
 constexpr uint16_t OP_VFS_MKDIR = 0x0406;
 constexpr uint16_t OP_VFS_READLINK = 0x0407;  // D8: symlink target resolution
 constexpr uint16_t OP_VFS_SYMLINK = 0x0408;   // D8: symlink creation
+constexpr uint16_t OP_VFS_UNLINK = 0x0409;    // V2: file deletion [V2 A9.1]
+constexpr uint16_t OP_VFS_RMDIR = 0x040A;     // V2: directory removal [V2 A9.1]
+constexpr uint16_t OP_VFS_RENAME = 0x040B;    // V2: rename/move [V2 A9.1]
+constexpr uint16_t OP_VFS_FSYNC = 0x040C;     // V2: flush to disk [V2 A9.1]
+constexpr uint16_t OP_VFS_TRUNCATE = 0x040D;  // V2: truncate file [V2 A9.1]
+constexpr uint16_t OP_VFS_SEEK_END = 0x040E;  // V2: seek from end [V2 A9.1]
+constexpr uint16_t OP_VFS_READ_RDMA =
+    0x0410;  // RDMA read:  req={fd:i32,len:u32,off:i64,rkey:u32}(20B) resp={bytes:u32}(4B), data pushed via rdma_write
+constexpr uint16_t OP_VFS_WRITE_RDMA =
+    0x0411;  // RDMA write: consumer rdma_write to server buf first, req={fd:i32,off:i64,len:u32}(16B) resp={bytes:u32}(4B)
+constexpr uint16_t OP_VFS_READDIR_BATCH =
+    0x0412;  // Batch readdir: req={fd:i32,start:u32,max:u32}(12B) resp={count:u32,entries:DirEntry[count]}
+constexpr uint16_t OP_VFS_READ_BULK =
+    0x0413;  // Bulk RDMA read: req={fd:i32,len:u32,off:i64,bulk_rkey:u32}(20B) resp={bytes:u32}(4B), up to 2 MB via rdma_write
+
+// IPC Pipe (0x0700–0x070F) — data moves via wire messages
+constexpr uint16_t OP_PIPE_CLOSE_READ = 0x0700;
+constexpr uint16_t OP_PIPE_CLOSE_WRITE = 0x0701;
+constexpr uint16_t OP_PIPE_DATA = 0x0702;  // req={resource_id:u32, data[]}
+constexpr uint16_t OP_PIPE_POLL_STATE = 0x0703;
+
+// IPC Eventfd (0x0710–0x071F)
+constexpr uint16_t OP_EVENTFD_CLOSE = 0x0710;
+
+// IPC PTY (0x0720–0x072F) — control only; data via RDMA
+constexpr uint16_t OP_PTY_IOCTL = 0x0720;
+constexpr uint16_t OP_PTY_CLOSE = 0x0721;
+
+// IPC Futex (0x0730–0x073F)
+constexpr uint16_t OP_FUTEX_WAKE = 0x0730;
+
+// IPC Epoll (0x0740–0x074F)
+constexpr uint16_t OP_EPOLL_CTL = 0x0740;
+constexpr uint16_t OP_EPOLL_READY_NOTIFY = 0x0741;
+
+// IPC Socket (0x0750–0x075F)
+constexpr uint16_t OP_SOCK_ACCEPT = 0x0750;
+constexpr uint16_t OP_SOCK_CLOSE = 0x0751;
+constexpr uint16_t OP_SOCK_SHUTDOWN = 0x0752;
+constexpr uint16_t OP_SOCK_GETPEERNAME = 0x0753;
+constexpr uint16_t OP_SOCK_GETSOCKOPT = 0x0754;
+constexpr uint16_t OP_SOCK_SETSOCKOPT = 0x0755;
 
 // -----------------------------------------------------------------------------
-// DEV_IRQ_FWD Payload — 8 bytes
+// DEV_IRQ_FWD Payload - 8 bytes
 // -----------------------------------------------------------------------------
 
 struct DevIrqFwdPayload {
@@ -573,7 +696,7 @@ struct ChannelClosePayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// TASK_SUBMIT Payload — variable length
+// TASK_SUBMIT Payload - variable length
 // -----------------------------------------------------------------------------
 
 enum class TaskDeliveryMode : uint8_t {
@@ -582,20 +705,45 @@ enum class TaskDeliveryMode : uint8_t {
     RESOURCE_REF = 2,
 };
 
+// IPC fd entry for cross-node task submission — appended to TASK_SUBMIT payload
+struct WkiIpcFdEntry {
+    uint16_t local_fd;
+    uint16_t res_type;  // ResourceType enum
+    uint32_t resource_id;
+    uint16_t home_node;
+    uint16_t reserved1;    // submitter-side access mode / open_flags low bits
+    uint32_t rdma_rkey;    // home node's RDMA rkey for shared region
+    uint64_t rdma_offset;  // offset within RDMA space
+} __attribute__((packed));
+
+static_assert(sizeof(WkiIpcFdEntry) == 24, "WkiIpcFdEntry must be 24 bytes");
+
 struct TaskSubmitPayload {
     uint32_t task_id;
     uint8_t delivery_mode;  // TaskDeliveryMode
-    uint8_t reserved;
+    uint8_t prefer_inline;  // V2: 0=prefer VFS_REF, 1=prefer INLINE
     uint16_t args_len;
-    // Variable portion depends on delivery_mode:
-    //   INLINE:       uint32_t binary_len, binary[binary_len], args[args_len]
-    //   VFS_REF:      uint16_t path_len, path[path_len], args[args_len]
+    // --- V2 extended environment (offset 8) ---
+    uint16_t argc;          // Number of NUL-separated argument strings
+    uint16_t envc;          // Number of NUL-separated env strings (KEY=VALUE)
+    uint16_t cwd_len;       // Length of CWD string (0 = use default "/")
+    uint16_t identity_len;  // Length of task identity block after argv/envp/cwd
+    uint16_t ipc_fd_count;  // Number of WkiIpcFdEntry following context/policy data
+    uint16_t reserved;
+    // Variable portion follows at offset 20, depends on delivery_mode:
+    //   INLINE:       uint32_t binary_len, binary[binary_len]
+    //   VFS_REF:      uint16_t path_len, path[path_len]
     //   RESOURCE_REF: uint16_t ref_node_id, uint32_t ref_resource_id,
-    //                 uint16_t path_len, path[path_len], args[args_len]
+    //                 uint16_t path_len, path[path_len]
+    // Then: argc NUL-terminated arg strings, envc NUL-terminated env strings,
+    //       cwd string (cwd_len bytes including NUL), identity block, VFS policy,
+    //       IPC fd entries.
 } __attribute__((packed));
 
+static_assert(sizeof(TaskSubmitPayload) == 20, "TaskSubmitPayload V3 must be 20 bytes");
+
 // -----------------------------------------------------------------------------
-// TASK_ACCEPT / TASK_REJECT Payload — 16 bytes
+// TASK_ACCEPT / TASK_REJECT Payload - 16 bytes
 // -----------------------------------------------------------------------------
 
 enum class TaskRejectReason : uint8_t {
@@ -616,7 +764,7 @@ struct TaskResponsePayload {
 static_assert(sizeof(TaskResponsePayload) == 16, "TaskResponsePayload must be 16 bytes");
 
 // -----------------------------------------------------------------------------
-// TASK_COMPLETE Payload — variable length
+// TASK_COMPLETE Payload - variable length
 // -----------------------------------------------------------------------------
 
 struct TaskCompletePayload {
@@ -628,15 +776,18 @@ struct TaskCompletePayload {
 } __attribute__((packed));
 
 // -----------------------------------------------------------------------------
-// TASK_CANCEL Payload — 4 bytes
+// TASK_CANCEL Payload - 8 bytes
 // -----------------------------------------------------------------------------
 
 struct TaskCancelPayload {
     uint32_t task_id;
+    int32_t signum;
 } __attribute__((packed));
 
+static_assert(sizeof(TaskCancelPayload) == 8, "TaskCancelPayload must be 8 bytes");
+
 // -----------------------------------------------------------------------------
-// LOAD_REPORT Payload — variable length
+// LOAD_REPORT Payload - variable length
 // -----------------------------------------------------------------------------
 
 struct LoadReportPayload {

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <net/address.hpp>
 #include <net/netdevice.hpp>
 #include <net/packet.hpp>
 
@@ -17,18 +18,19 @@ constexpr size_t ETH_HLEN = 14;
 constexpr size_t ETH_ALEN = 6;
 
 struct EthernetHeader {
-    std::array<uint8_t, ETH_ALEN> dst;
-    std::array<uint8_t, ETH_ALEN> src;
-    uint16_t ethertype;  // network byte order
+    MacAddress dst;
+    MacAddress src;
+    uint16_t ethertype{};  // network byte order
 } __attribute__((packed));
+static_assert(sizeof(EthernetHeader) == ETH_HLEN);
 
 // RX entry point: demux by ethertype
 void eth_rx(NetDevice* dev, PacketBuffer* pkt);
 
 // TX: prepend ethernet header and transmit
-auto eth_tx(NetDevice* dev, PacketBuffer* pkt, const std::array<uint8_t, ETH_ALEN>& dst_mac, uint16_t ethertype) -> int;
+auto eth_tx(NetDevice* dev, PacketBuffer* pkt, const MacAddress& dst_mac, uint16_t ethertype) -> int;
 
 // Broadcast MAC address
-extern const std::array<uint8_t, ETH_ALEN> ETH_BROADCAST;
+extern const MacAddress ETH_BROADCAST;
 
 }  // namespace ker::net::proto

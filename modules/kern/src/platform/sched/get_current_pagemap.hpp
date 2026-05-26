@@ -2,4 +2,4 @@
 
 #include <platform/mm/paging.hpp>
 
-extern "C" auto _wOS_getCurrentPagemap() -> ker::mod::mm::paging::PageTable*;
+extern "C" auto wos_get_current_pagemap() -> ker::mod::mm::paging::PageTable*;

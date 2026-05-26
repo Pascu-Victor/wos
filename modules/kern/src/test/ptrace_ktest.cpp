@@ -1,0 +1,34 @@
+#include <abi/ptrace.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <test/ktest.hpp>
+
+KTEST(PtraceAbi, RequestNumbers) {
+    KEXPECT_EQ(static_cast<uint64_t>(ker::abi::ptrace::request::TRACEME), static_cast<uint64_t>(0));
+    KEXPECT_EQ(static_cast<uint64_t>(ker::abi::ptrace::request::PEEKDATA), static_cast<uint64_t>(2));
+    KEXPECT_EQ(static_cast<uint64_t>(ker::abi::ptrace::request::POKEDATA), static_cast<uint64_t>(5));
+    KEXPECT_EQ(static_cast<uint64_t>(ker::abi::ptrace::request::GETREGSET), static_cast<uint64_t>(12));
+    KEXPECT_EQ(static_cast<uint64_t>(ker::abi::ptrace::request::ATTACH), static_cast<uint64_t>(16));
+    KEXPECT_EQ(static_cast<uint64_t>(ker::abi::ptrace::request::GET_REMOTE_INFO), static_cast<uint64_t>(0x5705));
+}
+
+KTEST(PtraceAbi, StructSizes) {
+    KEXPECT_EQ(sizeof(ker::abi::ptrace::X86_64GprState), static_cast<size_t>(176));
+    KEXPECT_EQ(sizeof(ker::abi::ptrace::RegsetIo), static_cast<size_t>(24));
+    KEXPECT_EQ(sizeof(ker::abi::ptrace::MemIo), static_cast<size_t>(32));
+    KEXPECT_EQ(sizeof(ker::abi::ptrace::ThreadList), static_cast<size_t>(24));
+    KEXPECT_EQ(sizeof(ker::abi::ptrace::ImageRecord), static_cast<size_t>(296));
+    KEXPECT_EQ(sizeof(ker::abi::ptrace::ImageList), static_cast<size_t>(24));
+    KEXPECT_EQ(sizeof(ker::abi::ptrace::Event), static_cast<size_t>(40));
+    KEXPECT_EQ(sizeof(ker::abi::ptrace::RemoteInfo), static_cast<size_t>(104));
+    KEXPECT_EQ(sizeof(ker::abi::ptrace::HwBreak), static_cast<size_t>(32));
+}
+
+KTEST(PtraceAbi, RemoteInfoOffsets) {
+    KEXPECT_EQ(offsetof(ker::abi::ptrace::RemoteInfo, is_proxy), static_cast<size_t>(0));
+    KEXPECT_EQ(offsetof(ker::abi::ptrace::RemoteInfo, proxy_pid), static_cast<size_t>(8));
+    KEXPECT_EQ(offsetof(ker::abi::ptrace::RemoteInfo, task_id), static_cast<size_t>(16));
+    KEXPECT_EQ(offsetof(ker::abi::ptrace::RemoteInfo, target_node), static_cast<size_t>(24));
+    KEXPECT_EQ(offsetof(ker::abi::ptrace::RemoteInfo, remote_pid), static_cast<size_t>(32));
+    KEXPECT_EQ(offsetof(ker::abi::ptrace::RemoteInfo, target_hostname), static_cast<size_t>(40));
+}

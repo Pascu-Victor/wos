@@ -1,0 +1,328 @@
+#!/bin/bash
+# Shared rootfs staging helpers for create_mountfs_disk.sh and sync_rootfs.sh.
+
+ROOTFS_REPO=""
+ROOTFS_STAGING=""
+ROOTFS_MANAGED_TMP=""
+ROOTFS_CHANGED=0
+
+rootfs_record_managed_path() {
+    printf '%s\n' "$1" >> "$ROOTFS_MANAGED_TMP"
+}
+
+rootfs_resolve_source() {
+    local source="$1"
+    if [[ "$source" = /* ]]; then
+        printf '%s\n' "$source"
+    else
+        printf '%s/%s\n' "$ROOTFS_REPO" "$source"
+    fi
+}
+
+rootfs_copy_entry() {
+    local source="$1"
+    local target="$2"
+    local mode="${3:-}"
+    local resolved
+
+    resolved=$(rootfs_resolve_source "$source")
+    if [ ! -e "$resolved" ]; then
+        return 0
+    fi
+
+    mkdir -p "$ROOTFS_STAGING$(dirname "$target")"
+    cp -a "$resolved" "$ROOTFS_STAGING$target"
+    if [ -n "$mode" ]; then
+        chmod "$mode" "$ROOTFS_STAGING$target"
+    fi
+    rootfs_record_managed_path "$target"
+    ROOTFS_CHANGED=1
+}
+
+rootfs_symlink_entry() {
+    local source="$1"
+    local target="$2"
+
+    mkdir -p "$ROOTFS_STAGING$(dirname "$target")"
+    ln -sfn "$source" "$ROOTFS_STAGING$target"
+    rootfs_record_managed_path "$target"
+    ROOTFS_CHANGED=1
+}
+
+rootfs_stage_sysroot_libs() {
+    local sysroot_lib
+    local file
+
+    sysroot_lib="$ROOTFS_REPO/toolchain/sysroot/lib"
+    if [ ! -d "$sysroot_lib" ]; then
+        return 0
+    fi
+
+    mkdir -p "$ROOTFS_STAGING/usr/lib"
+    for file in "$sysroot_lib"/*.so "$sysroot_lib"/*.so.* "$sysroot_lib"/crt*.o "$sysroot_lib"/ld.so; do
+        [ -e "$file" ] || continue
+        rootfs_copy_entry "$file" "/usr/lib/$(basename "$file")"
+    done
+}
+
+rootfs_stage_sysroot_headers() {
+    local sysroot_include
+
+    sysroot_include="$ROOTFS_REPO/toolchain/sysroot/include"
+    if [ ! -d "$sysroot_include" ]; then
+        return 0
+    fi
+
+    rootfs_copy_entry "$sysroot_include" "/usr/include"
+}
+
+rootfs_stage_busybox_install() {
+    local bb_install
+    local source_dir
+    local target_dir
+    local entry
+
+    bb_install="$ROOTFS_REPO/toolchain/busybox-install"
+    if [ ! -d "$bb_install" ]; then
+        return 0
+    fi
+
+    mkdir -p "$ROOTFS_STAGING/usr/bin" "$ROOTFS_STAGING/usr/sbin" "$ROOTFS_STAGING/usr/lib"
+
+    if [ -d "$bb_install/lib" ]; then
+        for entry in "$bb_install"/lib/*; do
+            [ -e "$entry" ] || continue
+            rootfs_copy_entry "$entry" "/usr/lib/$(basename "$entry")"
+        done
+    fi
+
+    for source_dir in bin sbin usr/bin usr/sbin; do
+        case "$source_dir" in
+            bin|usr/bin)
+                target_dir="/usr/bin"
+                ;;
+            sbin|usr/sbin)
+                target_dir="/usr/sbin"
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        if [ ! -d "$bb_install/$source_dir" ]; then
+            continue
+        fi
+
+        for entry in "$bb_install/$source_dir"/*; do
+            [ -e "$entry" ] || continue
+            rootfs_copy_entry "$entry" "$target_dir/$(basename "$entry")"
+        done
+    done
+}
+
+rootfs_stage_manifest() {
+    local manifest
+    local action
+    local source
+    local target
+    local mode
+    local extra
+
+    manifest="$ROOTFS_REPO/configs/rootfs/aliases.tsv"
+    if [ ! -f "$manifest" ]; then
+        return 0
+    fi
+
+    while IFS=$'\t' read -r action source target mode extra; do
+        case "$action" in
+            ""|\#*)
+                continue
+                ;;
+            copy)
+                rootfs_copy_entry "$source" "$target"
+                ;;
+            copy-mode)
+                if [ -z "$mode" ] || [ -n "$extra" ]; then
+                    echo "Invalid copy-mode rootfs manifest entry in $manifest" >&2
+                    return 1
+                fi
+                rootfs_copy_entry "$source" "$target" "$mode"
+                ;;
+            symlink)
+                rootfs_symlink_entry "$source" "$target"
+                ;;
+            *)
+                echo "Unknown rootfs manifest action '$action' in $manifest" >&2
+                return 1
+                ;;
+        esac
+    done < "$manifest"
+}
+
+rootfs_stage_etc() {
+    local tz_source=""
+
+    mkdir -p "$ROOTFS_STAGING/etc/dropbear"
+
+    cat > "$ROOTFS_STAGING/etc/passwd" <<'EOF'
+root:x:0:0:root:/root:/bin/sh
+EOF
+
+    cat > "$ROOTFS_STAGING/etc/group" <<'EOF'
+root:x:0:root
+EOF
+
+    cat > "$ROOTFS_STAGING/etc/profile" <<'EOF'
+export USER="${USER:-root}"
+export HOSTNAME="${HOSTNAME:-wos}"
+export HOME="${HOME:-/root}"
+export PS1="$USER@$HOSTNAME:\w\$ "
+export ENV="/etc/profile"
+EOF
+
+    cat > "$ROOTFS_STAGING/etc/filesystems" <<'EOF'
+fat32
+vfat
+tmpfs
+EOF
+
+    if [ -f "$ROOTFS_REPO/configs/system.conf" ]; then
+        # shellcheck disable=SC1091
+        source "$ROOTFS_REPO/configs/system.conf"
+        printf '%s' "${WOS_HOSTNAME:-wos}" > "$ROOTFS_STAGING/etc/hostname"
+    else
+        printf '%s' "wos" > "$ROOTFS_STAGING/etc/hostname"
+    fi
+
+    if [ -f "/usr/share/zoneinfo/Etc/UTC" ]; then
+        tz_source="/usr/share/zoneinfo/Etc/UTC"
+    elif [ -f "/usr/share/zoneinfo/UTC" ]; then
+        tz_source="/usr/share/zoneinfo/UTC"
+    fi
+
+    if [ -n "$tz_source" ]; then
+        rootfs_copy_entry "$tz_source" "/etc/localtime"
+    fi
+}
+
+rootfs_stage_root_home() {
+    local keyfile
+    local ssh_pubkey
+
+    mkdir -p "$ROOTFS_STAGING/root/.ssh"
+    chmod 700 "$ROOTFS_STAGING/root/.ssh"
+
+    ssh_pubkey=""
+    for keyfile in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub ~/.ssh/id_ecdsa.pub; do
+        if [ -f "$keyfile" ]; then
+            ssh_pubkey="$keyfile"
+            break
+        fi
+    done
+
+    if [ -n "$ssh_pubkey" ]; then
+        cp "$ssh_pubkey" "$ROOTFS_STAGING/root/.ssh/authorized_keys"
+        chmod 600 "$ROOTFS_STAGING/root/.ssh/authorized_keys"
+    fi
+}
+
+rootfs_stage_srv() {
+    mkdir -p "$ROOTFS_STAGING/srv"
+    if [ -d "$ROOTFS_REPO/configs/drive/srv" ]; then
+        cp -r "$ROOTFS_REPO/configs/drive/srv/." "$ROOTFS_STAGING/srv/" 2>/dev/null || true
+    fi
+
+    printf '%s\n' "Hello from XFS filesystem!" > "$ROOTFS_STAGING/srv/hello.txt"
+    printf '%s' "Binary test data 1234567890ABCDEF" > "$ROOTFS_STAGING/srv/test.bin"
+
+    rootfs_record_managed_path "/srv/hello.txt"
+    rootfs_record_managed_path "/srv/test.bin"
+}
+
+rootfs_stage_misc_dirs() {
+    mkdir -p "$ROOTFS_STAGING/home"
+    mkdir -p "$ROOTFS_STAGING/dev/pts"
+    mkdir -p "$ROOTFS_STAGING/tmp"
+    mkdir -p "$ROOTFS_STAGING/run"
+    mkdir -p "$ROOTFS_STAGING/var/log/journal"
+    mkdir -p "$ROOTFS_STAGING/oldroot"
+}
+
+rootfs_finalize_usr_merge() {
+    ln -sfn usr/lib "$ROOTFS_STAGING/lib"
+    ln -sfn usr/bin "$ROOTFS_STAGING/bin"
+    ln -sfn usr/sbin "$ROOTFS_STAGING/sbin"
+}
+
+rootfs_write_managed_paths() {
+    local managed_out
+
+    managed_out="$ROOTFS_STAGING/etc/wos-managed-paths"
+    mkdir -p "$(dirname "$managed_out")"
+    sort -u "$ROOTFS_MANAGED_TMP" > "$managed_out"
+}
+
+rootfs_stage_tree() {
+    ROOTFS_REPO="$1"
+    ROOTFS_STAGING="$2"
+    ROOTFS_MANAGED_TMP="$ROOTFS_STAGING/.wos-managed-paths.tmp"
+    ROOTFS_CHANGED=1
+
+    mkdir -p "$ROOTFS_STAGING"
+    : > "$ROOTFS_MANAGED_TMP"
+
+    rootfs_stage_sysroot_libs
+    rootfs_stage_sysroot_headers
+    rootfs_stage_busybox_install
+    rootfs_stage_manifest
+    rootfs_stage_etc
+    rootfs_stage_root_home
+    rootfs_stage_srv
+    rootfs_stage_misc_dirs
+    rootfs_finalize_usr_merge
+    rootfs_record_managed_path "/etc/wos-managed-paths"
+    rootfs_write_managed_paths
+
+    rm -f "$ROOTFS_MANAGED_TMP"
+}
+
+rootfs_remove_old_managed_paths() {
+    local disk="$1"
+    local managed_tmp
+    local cmd_tmp
+    local path_count
+
+    managed_tmp=$(mktemp)
+    cmd_tmp=$(mktemp)
+
+    if guestfish --ro -a "$disk" > /dev/null 2>&1 <<EOF
+run
+mount /dev/sda1 /
+download /etc/wos-managed-paths $managed_tmp
+EOF
+    then
+        path_count=$(grep -cve '^[[:space:]]*$' "$managed_tmp" || true)
+        if [ "$path_count" -gt 0 ]; then
+            {
+                echo "run"
+                echo "mount /dev/sda1 /"
+                # Clean up legacy usr-merge artifacts from older image creation
+                # flows that could leave recursive links like /bin/bin.
+                echo "rm-f /usr/bin/bin"
+                echo "rm-f /usr/sbin/sbin"
+                echo "rm-f /usr/lib/lib"
+                echo "rm-f /bin/bin"
+                echo "rm-f /sbin/sbin"
+                echo "rm-f /lib/lib"
+                while IFS= read -r path; do
+                    [ -n "$path" ] || continue
+                    printf 'glob rm-rf %s\n' "$path"
+                done < "$managed_tmp"
+                echo "sync"
+            } > "$cmd_tmp"
+            guestfish --rw -a "$disk" < "$cmd_tmp"
+        fi
+    fi
+
+    rm -f "$managed_tmp" "$cmd_tmp"
+}

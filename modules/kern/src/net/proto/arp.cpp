@@ -1,20 +1,28 @@
 #include "arp.hpp"
 
 #include <array>
+#include <cstdint>
 #include <cstring>
+#include <net/address.hpp>
 #include <net/endian.hpp>
 #include <net/netif.hpp>
 #include <net/proto/ethernet.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <platform/sys/spinlock.hpp>
 
+#include "net/netdevice.hpp"
+#include "net/packet.hpp"
+
 namespace ker::net::proto {
+
+using log = ker::mod::dbg::logger<"arp">;
 
 namespace {
 std::array<ArpEntry, ARP_CACHE_SIZE> cache = {};
 ker::mod::sys::Spinlock arp_lock;
 
-auto cache_lookup(uint32_t ip) -> ArpEntry* {
+auto cache_lookup(IPv4Address ip) -> ArpEntry* {
     for (auto& e : cache) {
         if (e.state != ArpState::FREE && e.ip == ip) {
             return &e;
@@ -23,7 +31,7 @@ auto cache_lookup(uint32_t ip) -> ArpEntry* {
     return nullptr;
 }
 
-auto cache_alloc(uint32_t ip) -> ArpEntry* {
+auto cache_alloc(IPv4Address ip) -> ArpEntry* {
     auto* existing = cache_lookup(ip);
     if (existing != nullptr) {
         return existing;
@@ -44,8 +52,8 @@ auto cache_alloc(uint32_t ip) -> ArpEntry* {
     return nullptr;
 }
 
-void send_arp_request(NetDevice* dev, uint32_t target_ip, uint32_t sender_ip) {
-    auto* pkt = pkt_alloc();
+void send_arp_request(NetDevice* dev, IPv4Address target_ip, IPv4Address sender_ip) {
+    auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return;
     }
@@ -57,15 +65,15 @@ void send_arp_request(NetDevice* dev, uint32_t target_ip, uint32_t sender_ip) {
     arp->proto_len = 4;
     arp->opcode = htons(ARP_OP_REQUEST);
     arp->sender_mac = dev->mac;
-    arp->sender_ip = htonl(sender_ip);
-    arp->target_mac = {0, 0, 0, 0, 0, 0};
-    arp->target_ip = htonl(target_ip);
+    arp->sender_ip = sender_ip.to_network_order();
+    arp->target_mac = MacAddress::zero();
+    arp->target_ip = target_ip.to_network_order();
 
     eth_tx(dev, pkt, ETH_BROADCAST, ETH_TYPE_ARP);
 }
 
-void send_arp_reply(NetDevice* dev, const std::array<uint8_t, 6>& dst_mac, uint32_t dst_ip, uint32_t src_ip) {
-    auto* pkt = pkt_alloc();
+void send_arp_reply(NetDevice* dev, const MacAddress& dst_mac, IPv4Address dst_ip, IPv4Address src_ip) {
+    auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return;
     }
@@ -77,18 +85,18 @@ void send_arp_reply(NetDevice* dev, const std::array<uint8_t, 6>& dst_mac, uint3
     arp->proto_len = 4;
     arp->opcode = htons(ARP_OP_REPLY);
     arp->sender_mac = dev->mac;
-    arp->sender_ip = htonl(src_ip);
+    arp->sender_ip = src_ip.to_network_order();
     arp->target_mac = dst_mac;
-    arp->target_ip = htonl(dst_ip);
+    arp->target_ip = dst_ip.to_network_order();
 
     eth_tx(dev, pkt, dst_mac, ETH_TYPE_ARP);
 }
 
 void flush_pending(ArpEntry* entry, NetDevice* dev) {
     for (uint8_t i = 0; i < entry->pending_count; i++) {
-        if (entry->pending[i] != nullptr) {
-            eth_tx(dev, entry->pending[i], entry->mac, ETH_TYPE_IPV4);
-            entry->pending[i] = nullptr;
+        if (auto* pending = entry->pending.at(i); pending != nullptr) {
+            eth_tx(dev, pending, entry->mac, ETH_TYPE_IPV4);
+            entry->pending.at(i) = nullptr;
         }
     }
     entry->pending_count = 0;
@@ -96,9 +104,9 @@ void flush_pending(ArpEntry* entry, NetDevice* dev) {
 
 void free_pending(ArpEntry* entry) {
     for (uint8_t i = 0; i < entry->pending_count; i++) {
-        if (entry->pending[i] != nullptr) {
-            pkt_free(entry->pending[i]);
-            entry->pending[i] = nullptr;
+        if (auto* pending = entry->pending.at(i); pending != nullptr) {
+            pkt_free(pending);
+            entry->pending.at(i) = nullptr;
         }
     }
     entry->pending_count = 0;
@@ -126,67 +134,89 @@ void arp_rx(NetDevice* dev, PacketBuffer* pkt) {
         return;
     }
 
-    uint32_t sender_ip = ntohl(arp->sender_ip);
-    uint32_t target_ip = ntohl(arp->target_ip);
+    IPv4Address const SENDER_IP = IPv4Address::from_network_order(arp->sender_ip);
+    IPv4Address const TARGET_IP = IPv4Address::from_network_order(arp->target_ip);
 
-    arp_lock.lock();
+    // arp_lock must be irqsave: arp_resolve is called from the inline IRQ
+    // path (tcp_send_ack -> ipv4_tx -> arp_resolve).  If a non-irqsave holder
+    // is preempted on the same CPU by the NIC MSI-X interrupt, the IRQ handler
+    // spins with IF=0, the holder can never resume, and the CPU freezes.
+    uint64_t const FLAGS = arp_lock.lock_irqsave();
 
-    auto* entry = cache_alloc(sender_ip);
+    auto* entry = cache_alloc(SENDER_IP);
     if (entry != nullptr) {
         entry->mac = arp->sender_mac;
-        bool was_incomplete = (entry->state == ArpState::INCOMPLETE);
+        bool const WAS_INCOMPLETE = (entry->state == ArpState::INCOMPLETE);
         entry->state = ArpState::REACHABLE;
+        entry->request_time_ms = 0;
 
-        if (was_incomplete) {
+        if (WAS_INCOMPLETE) {
             flush_pending(entry, dev);
         }
     }
 
-    arp_lock.unlock();
+    arp_lock.unlock_irqrestore(FLAGS);
 
-    uint16_t opcode = ntohs(arp->opcode);
-    if (opcode == ARP_OP_REQUEST) {
-        auto* nif = netif_find_by_ipv4(target_ip);
+    uint16_t const OPCODE = ntohs(arp->opcode);
+    if (OPCODE == ARP_OP_REQUEST) {
+        auto* nif = netif_find_by_ipv4(TARGET_IP);
         if (nif != nullptr && nif->dev == dev) {
-            send_arp_reply(dev, arp->sender_mac, sender_ip, target_ip);
+            send_arp_reply(dev, arp->sender_mac, SENDER_IP, TARGET_IP);
         }
     }
 
     pkt_free(pkt);
 }
 
-auto arp_resolve(NetDevice* dev, uint32_t ip, std::array<uint8_t, 6>& dst_mac, PacketBuffer* pending_pkt) -> int {
+auto arp_resolve(NetDevice* dev, IPv4Address ip, MacAddress& dst_mac, PacketBuffer* pending_pkt) -> int {
 #ifdef DEBUG_ARP
-    ker::mod::dbg::log("arp_resolve: ip=%u.%u.%u.%u\n", (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+    log::debug("arp_resolve: ip=%u.%u.%u.%u", (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
 #endif
 
-    if (ip == 0xFFFFFFFF) {
+    if (ip.is_broadcast()) {
         dst_mac = ETH_BROADCAST;
         return 0;
     }
 
-    arp_lock.lock();
+    // If the target IP is one of our own addresses, return our own MAC directly.
+    // This avoids sending gratuitous ARP announcements (sender_ip == target_ip).
+    {
+        auto* nif = netif_get(dev);
+        if (nif != nullptr) {
+            for (size_t i = 0; i < nif->ipv4_addr_count; i++) {
+                if (nif->ipv4_addrs.at(i).addr == ip) {
+                    dst_mac = dev->mac;
+                    if (pending_pkt != nullptr) {
+                        pkt_free(pending_pkt);
+                    }
+                    return 0;
+                }
+            }
+        }
+    }
+
+    uint64_t const FLAGS = arp_lock.lock_irqsave();
 
     auto* entry = cache_lookup(ip);
     if (entry != nullptr && entry->state == ArpState::REACHABLE) {
 #ifdef DEBUG_ARP
-        ker::mod::dbg::log("arp_resolve: found in cache, returning MAC\n");
+        log::debug("arp_resolve: found in cache, returning MAC");
 #endif
         dst_mac = entry->mac;
-        arp_lock.unlock();
+        arp_lock.unlock_irqrestore(FLAGS);
         return 0;
     }
 
     if (entry == nullptr) {
 #ifdef DEBUG_ARP
-        ker::mod::dbg::log("arp_resolve: no entry, allocating new\n");
+        log::debug("arp_resolve: no entry, allocating new");
 #endif
         entry = cache_alloc(ip);
         if (entry == nullptr) {
 #ifdef DEBUG_ARP
-            ker::mod::dbg::log("arp_resolve: cache_alloc failed\n");
+            log::debug("arp_resolve: cache_alloc failed");
 #endif
-            arp_lock.unlock();
+            arp_lock.unlock_irqrestore(FLAGS);
             return -1;
         }
         entry->state = ArpState::INCOMPLETE;
@@ -194,17 +224,16 @@ auto arp_resolve(NetDevice* dev, uint32_t ip, std::array<uint8_t, 6>& dst_mac, P
         entry->request_time_ms = 0;
     }
 
-    extern uint64_t tcp_now_ms();
-    uint64_t now = tcp_now_ms();
+    uint64_t const NOW = ker::mod::time::get_us() / 1000ULL;
     constexpr uint64_t ARP_TIMEOUT_MS = 5000;
 
-    if (entry->request_time_ms != 0 && (now - entry->request_time_ms) > ARP_TIMEOUT_MS) {
+    if (entry->request_time_ms != 0 && (NOW - entry->request_time_ms) > ARP_TIMEOUT_MS) {
 #ifdef DEBUG_ARP
-        ker::mod::dbg::log("arp_resolve: TIMEOUT, freeing %u pending packets\n", entry->pending_count);
+        log::debug("arp_resolve: TIMEOUT, freeing %u pending packets", entry->pending_count);
 #endif
         free_pending(entry);
         entry->state = ArpState::FREE;
-        arp_lock.unlock();
+        arp_lock.unlock_irqrestore(FLAGS);
         if (pending_pkt != nullptr) {
             pkt_free(pending_pkt);
         }
@@ -213,43 +242,44 @@ auto arp_resolve(NetDevice* dev, uint32_t ip, std::array<uint8_t, 6>& dst_mac, P
 
     if (pending_pkt != nullptr && entry->pending_count < 64) {
 #ifdef DEBUG_ARP
-        ker::mod::dbg::log("arp_resolve: queueing packet, pending_count now=%u\n", entry->pending_count + 1);
+        log::debug("arp_resolve: queueing packet, pending_count now=%u", entry->pending_count + 1);
 #endif
-        entry->pending[entry->pending_count++] = pending_pkt;
+        entry->pending.at(entry->pending_count++) = pending_pkt;
     } else if (pending_pkt != nullptr) {
 #ifdef DEBUG_ARP
-        ker::mod::dbg::log("arp_resolve: queue FULL, dropping packet\n");
+        log::debug("arp_resolve: queue FULL, dropping packet");
 #endif
         pkt_free(pending_pkt);
     }
 
     if (entry->request_time_ms == 0) {
-        entry->request_time_ms = now;
+        entry->request_time_ms = NOW;
     }
 
-    arp_lock.unlock();
+    arp_lock.unlock_irqrestore(FLAGS);
 
     auto* nif = netif_get(dev);
     if (nif != nullptr && nif->ipv4_addr_count > 0) {
-        send_arp_request(dev, ip, nif->ipv4_addrs[0].addr);
+        send_arp_request(dev, ip, nif->ipv4_addrs.front().addr);
     }
 
     return -1;
 }
 
-void arp_learn(uint32_t ip, const std::array<uint8_t, 6>& mac) {
-    arp_lock.lock();
+void arp_learn(IPv4Address ip, const MacAddress& mac) {
+    uint64_t const FLAGS = arp_lock.lock_irqsave();
 
     auto* entry = cache_alloc(ip);
     if (entry != nullptr) {
         entry->mac = mac;
         entry->state = ArpState::REACHABLE;
+        entry->request_time_ms = 0;
 #ifdef DEBUG_ARP
-        ker::mod::dbg::log("arp_learn: learned IP=%u.%u.%u.%u\n", (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+        log::debug("arp_learn: learned IP=%u.%u.%u.%u", (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
 #endif
     }
 
-    arp_lock.unlock();
+    arp_lock.unlock_irqrestore(FLAGS);
 }
 
 }  // namespace ker::net::proto

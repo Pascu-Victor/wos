@@ -25,7 +25,7 @@ inline constexpr size_t MAX_MODULES = 64;
 inline constexpr size_t MAX_DEPS_PER_MODULE = 16;
 
 // Compile-time string hash (djb2)
-constexpr size_t constexpr_hash(const char* str) {
+[[nodiscard]] constexpr size_t constexpr_hash(const char* str) {
     size_t h = 5381;
     while (*str != '\0') {
         h = ((h << 5) + h) + static_cast<size_t>(*str++);
@@ -34,7 +34,7 @@ constexpr size_t constexpr_hash(const char* str) {
 }
 
 // Compile-time string comparison
-constexpr bool constexpr_streq(const char* a, const char* b) {
+[[nodiscard]] constexpr bool constexpr_streq(const char* a, const char* b) {
     while (*a != '\0' && *b != '\0') {
         if (*a != *b) {
             return false;
@@ -56,7 +56,7 @@ struct ModuleId {
     constexpr bool operator==(const ModuleId& other) const {
         // Use hash for fast rejection, then string comparison for confirmation
         // Note: Cannot compare pointers in constexpr context (unspecified behavior)
-        return hash == other.hash && constexpr_streq(name, other.name);
+        return hash == other.hash && name != nullptr && other.name != nullptr && constexpr_streq(name, other.name);
     }
 
     constexpr bool operator!=(const ModuleId& other) const { return !(*this == other); }
@@ -96,8 +96,9 @@ struct ModuleMeta {
     template <size_t N>
     constexpr ModuleMeta(const char* name, BootPhase p, const std::array<Dependency, N>& dependencies)
         : id(name), phase(p), dep_count(N), deps{} {
-        for (size_t i = 0; i < N && i < MAX_DEPS_PER_MODULE; ++i) {
-            deps[i] = dependencies[i];
+        static_assert(N <= MAX_DEPS_PER_MODULE, "too many init module dependencies");
+        for (size_t i = 0; i < N; ++i) {
+            deps.at(i) = dependencies.at(i);
         }
     }
 };
@@ -108,8 +109,8 @@ constexpr auto make_meta(const char* name, BootPhase phase) { return ModuleMeta{
 // Helper for creating module metadata with dependencies (variadic)
 template <typename... Deps>
 constexpr auto make_meta(const char* name, BootPhase phase, Deps... deps) {
-    std::array<Dependency, sizeof...(Deps)> dep_array{deps...};
-    return ModuleMeta{name, phase, dep_array};
+    std::array<Dependency, sizeof...(Deps)> const DEP_ARRAY{deps...};
+    return ModuleMeta{name, phase, DEP_ARRAY};
 }
 
 // Runtime module descriptor (includes function pointer)

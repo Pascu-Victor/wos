@@ -1,8 +1,8 @@
 bits 64
 
-global loadGdt
+global load_gdt
 
-loadGdt:
+load_gdt:
     lgdt [rdi]
     push 0x08
     lea rax, [rel .flush]

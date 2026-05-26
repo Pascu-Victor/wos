@@ -6,9 +6,11 @@
 
 namespace ker::net {
 
+using log = ker::mod::dbg::logger<"net">;
+
 void init() {
 #ifdef DEBUG_NET
-    ker::mod::dbg::log("net: Initializing networking subsystem");
+    log::debug("Initializing networking subsystem");
 #endif
 
     // Initialize packet buffer pool
@@ -18,7 +20,7 @@ void init() {
     loopback_init();
 
 #ifdef DEBUG_NET
-    ker::mod::dbg::log("net: Networking subsystem ready");
+    log::debug("Networking subsystem ready");
 #endif
 }
 

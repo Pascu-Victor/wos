@@ -1,27 +1,35 @@
 #pragma once
-#include <string.h>
-
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <defines/defines.hpp>
-#include <util/mem.hpp>
 namespace ker::mod::gfx::fb {
 class FbFont {
    public:
-    void loadFont();
-    char name[256];
+    static constexpr std::size_t NAME_SIZE = 256;
+    static constexpr std::size_t GLYPH_COUNT = 256;
+    static constexpr std::size_t GLYPH_HEIGHT_MAX = 64;
+
+    using Name = std::array<char, NAME_SIZE>;
+    using GlyphData = std::array<uint64_t, GLYPH_HEIGHT_MAX>;
+    using FontData = std::array<GlyphData, GLYPH_COUNT>;
+
+    void load_font();
+    Name name{};
     uint8_t height;  // max 64
     uint8_t width;   // max 64
-    uint64_t data[256][64];
+    FontData data{};
 
-   public:
-    FbFont(const char* name, uint8_t height, uint8_t width, const uint64_t data[256][64]);
+    FbFont(const char* name, uint8_t height, uint8_t width, const FontData* data);
     FbFont();
     FbFont(const FbFont& other);
-    FbFont& operator=(const FbFont& other);
+    auto operator=(const FbFont& other) -> FbFont&;
 
-    uint8_t getHeight() const;
+    [[nodiscard]] auto get_height() const -> uint8_t;
 
-    uint8_t getWidth() const;
+    [[nodiscard]] auto get_width() const -> uint8_t;
 
-    const uint64_t* getData(char c) const;
+    [[nodiscard]] auto get_data(char c) const -> const uint64_t*;
 };
 }  // namespace ker::mod::gfx::fb

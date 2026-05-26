@@ -30,6 +30,10 @@ constexpr uint8_t DT_FIFO = 5;  // FIFO
 constexpr uint8_t DT_SOCK = 6;  // Socket
 constexpr uint8_t DT_LNK = 7;   // Symbolic link
 
+// WOS extension: WOSLINK flag - OR'd with DT_DIR to mark transparent VFS
+// directories that tools should not recurse into (recursion prevention).
+constexpr uint8_t DT_WOSLINK = 0x80;
+
 // Function pointer types for filesystem operations
 using vfs_open_fn = int (*)(std::string_view, int, int);
 using vfs_close_fn = int (*)(struct File*);
@@ -40,7 +44,9 @@ using vfs_isatty_fn = bool (*)(struct File*);                                 //
 using vfs_readdir_fn = int (*)(struct File*, DirEntry*, size_t);              // f, entry, index
 using vfs_readlink_fn = ssize_t (*)(struct File*, char*, size_t);             // f, buf, bufsize
 using vfs_truncate_fn = int (*)(struct File*, off_t);                         // f, length
-using vfs_poll_check_fn = int (*)(struct File*, int);                         // f, events → ready events
+using vfs_poll_check_fn = int (*)(struct File*, int);                         // f, events -> ready events
+using vfs_poll_register_waiter_fn = bool (*)(struct File*, uint64_t);         // f, pid
+using vfs_ioctl_fn = int (*)(struct File*, unsigned long, unsigned long);     // f, cmd, arg
 
 struct FileOperations {
     vfs_open_fn vfs_open;
@@ -49,10 +55,12 @@ struct FileOperations {
     vfs_write_fn vfs_write;
     vfs_lseek_fn vfs_lseek;
     vfs_isatty_fn vfs_isatty;
-    vfs_readdir_fn vfs_readdir;        // For reading directory entries
-    vfs_readlink_fn vfs_readlink;      // For reading symlink targets
-    vfs_truncate_fn vfs_truncate;      // For truncating file to given length
-    vfs_poll_check_fn vfs_poll_check;  // For checking poll readiness (nullptr = always ready)
+    vfs_readdir_fn vfs_readdir;                            // For reading directory entries
+    vfs_readlink_fn vfs_readlink;                          // For reading symlink targets
+    vfs_truncate_fn vfs_truncate;                          // For truncating file to given length
+    vfs_poll_check_fn vfs_poll_check;                      // For checking poll readiness (nullptr = always ready)
+    vfs_poll_register_waiter_fn vfs_poll_register_waiter;  // Register a task to be woken when readiness changes
+    vfs_ioctl_fn vfs_ioctl;                                // For device-specific ioctl (nullptr = -ENOTTY)
 };
 
 }  // namespace ker::vfs

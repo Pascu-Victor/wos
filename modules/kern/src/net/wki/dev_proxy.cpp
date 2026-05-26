@@ -1,10 +1,14 @@
 #include "dev_proxy.hpp"
 
 #include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <dev/block_device.hpp>
 #include <memory>
+#include <net/backlog.hpp>
 #include <net/netpoll.hpp>
 #include <net/wki/blk_ring.hpp>
 #include <net/wki/remotable.hpp>
@@ -12,13 +16,11 @@
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <net/wki/zone.hpp>
-#include <platform/asm/cpu.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
-#include <platform/ktime/ktime.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/sched/scheduler.hpp>
 
-#define DEBUG_WKI_TRANSPORT
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::net::wki {
 
@@ -29,7 +31,17 @@ namespace ker::net::wki {
 namespace {
 std::deque<std::unique_ptr<ProxyBlockState>> g_proxies;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_dev_proxy_initialized = false;                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_proxy_lock;                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+constexpr size_t MAX_PROXY_SCRATCH = 64;
+
+auto tag_completion(ProxyBlockState* state, uint32_t tag) -> ProxyBlockState::TagCompletion& { return state->tag_completions.at(tag); }
+
+auto tag_in_use(ProxyBlockState const* state, uint32_t tag) -> bool {
+    return tag < ProxyBlockState::TAG_POOL_SIZE && (state->tag_bitmap & (1ULL << tag)) != 0;
+}
+
+// Caller must hold s_proxy_lock.
 auto find_proxy_by_bdev(ker::dev::BlockDevice* bdev) -> ProxyBlockState* {
     for (auto& p : g_proxies) {
         if (p->active && &p->bdev == bdev) {
@@ -39,6 +51,7 @@ auto find_proxy_by_bdev(ker::dev::BlockDevice* bdev) -> ProxyBlockState* {
     return nullptr;
 }
 
+// Caller must hold s_proxy_lock.
 auto find_proxy_by_channel(uint16_t owner_node, uint16_t channel_id) -> ProxyBlockState* {
     for (auto& p : g_proxies) {
         if ((p->active || p->op_pending) && p->owner_node == owner_node && p->assigned_channel == channel_id) {
@@ -48,9 +61,10 @@ auto find_proxy_by_channel(uint16_t owner_node, uint16_t channel_id) -> ProxyBlo
     return nullptr;
 }
 
-auto find_proxy_by_attach(uint16_t owner_node) -> ProxyBlockState* {
+// Caller must hold s_proxy_lock.
+auto find_proxy_by_attach(uint16_t owner_node, uint32_t resource_id) -> ProxyBlockState* {
     for (auto& p : g_proxies) {
-        if (p->attach_pending && p->owner_node == owner_node) {
+        if (p->attach_pending && p->owner_node == owner_node && p->resource_id == resource_id) {
             return p.get();
         }
     }
@@ -63,8 +77,8 @@ auto find_proxy_by_attach(uint16_t owner_node) -> ProxyBlockState* {
 
 // Allocate a data slot from the bitmap. Returns slot index or -1 if none free.
 auto rdma_alloc_slot(ProxyBlockState* state) -> int {
-    uint32_t max_slots = BLK_RING_DEFAULT_DATA_SLOTS < 64 ? BLK_RING_DEFAULT_DATA_SLOTS : 64;
-    for (uint32_t i = 0; i < max_slots; i++) {
+    uint32_t const MAX_SLOTS = BLK_RING_DEFAULT_DATA_SLOTS < 64 ? BLK_RING_DEFAULT_DATA_SLOTS : 64;
+    for (uint32_t i = 0; i < MAX_SLOTS; i++) {
         if ((state->data_slot_bitmap & (1ULL << i)) == 0) {
             state->data_slot_bitmap |= (1ULL << i);
             return static_cast<int>(i);
@@ -75,6 +89,29 @@ auto rdma_alloc_slot(ProxyBlockState* state) -> int {
 
 void rdma_free_slot(ProxyBlockState* state, uint32_t slot) { state->data_slot_bitmap &= ~(1ULL << slot); }
 
+// Allocate a tag from the bitmap pool. Returns tag index (0..63) or -1 if none free.
+auto rdma_alloc_tag(ProxyBlockState* state) -> int {
+    for (uint32_t i = 0; i < ProxyBlockState::TAG_POOL_SIZE; i++) {
+        if ((state->tag_bitmap & (1ULL << i)) == 0) {
+            state->tag_bitmap |= (1ULL << i);
+            auto& completion = tag_completion(state, i);
+            completion.pending = true;
+            completion.completed = false;
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+void rdma_free_tag(ProxyBlockState* state, uint32_t tag) {
+    if (tag < ProxyBlockState::TAG_POOL_SIZE) {
+        state->tag_bitmap &= ~(1ULL << tag);
+        auto& completion = tag_completion(state, tag);
+        completion.pending = false;
+        completion.completed = false;
+    }
+}
+
 // RoCE helper: push SQ region (header + SQ entries) to server so it can see new SQEs.
 void roce_push_sq(ProxyBlockState* state) {
     if (!state->rdma_roce || state->rdma_transport == nullptr) {
@@ -82,19 +119,19 @@ void roce_push_sq(ProxyBlockState* state) {
     }
     auto* hdr = blk_ring_header(state->rdma_zone_ptr);
     // Push header (contains sq_head) + entire SQ ring
-    uint32_t sq_region_size = BLK_RING_HEADER_SIZE + blk_ring_sq_size(hdr->sq_depth);
+    uint32_t const SQ_REGION_SIZE = BLK_RING_HEADER_SIZE + blk_ring_sq_size(hdr->sq_depth);
     state->rdma_transport->rdma_write(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, 0, state->rdma_zone_ptr,
-                                      sq_region_size);
+                                      SQ_REGION_SIZE);
 }
 
-// RoCE helper: push a data slot to the server (for WRITE ops — data must be visible before SQE).
+// RoCE helper: push a data slot to the server (for WRITE ops - data must be visible before SQE).
 void roce_push_data_slot(ProxyBlockState* state, uint32_t slot, uint32_t bytes) {
     if (!state->rdma_roce || state->rdma_transport == nullptr || bytes == 0) {
         return;
     }
     auto* hdr = blk_ring_header(state->rdma_zone_ptr);
-    uint32_t slot_offset = blk_ring_data_offset(hdr->sq_depth, hdr->cq_depth) + (slot * hdr->data_slot_size);
-    state->rdma_transport->rdma_write(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, slot_offset,
+    uint32_t const SLOT_OFFSET = blk_ring_data_offset(hdr->sq_depth, hdr->cq_depth) + (slot * hdr->data_slot_size);
+    state->rdma_transport->rdma_write(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, SLOT_OFFSET,
                                       blk_data_slot(state->rdma_zone_ptr, hdr, slot), bytes);
 }
 
@@ -108,32 +145,32 @@ void roce_pull_cq(ProxyBlockState* state) {
     auto* hdr = blk_ring_header(state->rdma_zone_ptr);
 
     // Save consumer-owned fields before the pull overwrites them
-    uint32_t saved_sq_head = hdr->sq_head;
-    uint32_t saved_cq_tail = hdr->cq_tail;
+    uint32_t const SAVED_SQ_HEAD = hdr->sq_head;
+    uint32_t const SAVED_CQ_TAIL = hdr->cq_tail;
 
     // Pull CQ entries
-    uint32_t cq_off = blk_ring_cq_offset(hdr->sq_depth);
-    uint32_t cq_total = blk_ring_cq_size(hdr->cq_depth);
-    state->rdma_transport->rdma_read(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, cq_off,
-                                     static_cast<uint8_t*>(state->rdma_zone_ptr) + cq_off, cq_total);
+    uint32_t const CQ_OFF = blk_ring_cq_offset(hdr->sq_depth);
+    uint32_t const CQ_TOTAL = blk_ring_cq_size(hdr->cq_depth);
+    state->rdma_transport->rdma_read(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, CQ_OFF,
+                                     static_cast<uint8_t*>(state->rdma_zone_ptr) + CQ_OFF, CQ_TOTAL);
     // Pull updated header (cq_head changed by server)
     state->rdma_transport->rdma_read(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, 0, state->rdma_zone_ptr,
                                      BLK_RING_HEADER_SIZE);
 
-    // Restore consumer-owned fields — the server's copy of sq_head/cq_tail may
+    // Restore consumer-owned fields - the server's copy of sq_head/cq_tail may
     // be stale (lagging behind the consumer's latest values)
-    hdr->sq_head = saved_sq_head;
-    hdr->cq_tail = saved_cq_tail;
+    hdr->sq_head = SAVED_SQ_HEAD;
+    hdr->cq_tail = SAVED_CQ_TAIL;
 }
 
-// RoCE helper: pull a data slot from server (for READ ops — data filled by server).
+// RoCE helper: pull a data slot from server (for READ ops - data filled by server).
 void roce_pull_data_slot(ProxyBlockState* state, uint32_t slot, uint32_t bytes) {
     if (!state->rdma_roce || state->rdma_transport == nullptr || bytes == 0) {
         return;
     }
     auto* hdr = blk_ring_header(state->rdma_zone_ptr);
-    uint32_t slot_offset = blk_ring_data_offset(hdr->sq_depth, hdr->cq_depth) + (slot * hdr->data_slot_size);
-    state->rdma_transport->rdma_read(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, slot_offset,
+    uint32_t const SLOT_OFFSET = blk_ring_data_offset(hdr->sq_depth, hdr->cq_depth) + (slot * hdr->data_slot_size);
+    state->rdma_transport->rdma_read(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, SLOT_OFFSET,
                                      blk_data_slot(state->rdma_zone_ptr, hdr, slot), bytes);
 }
 
@@ -153,33 +190,52 @@ auto ra_cache_hit(ProxyBlockState* state, uint64_t lba, uint32_t count) -> bool 
     return lba >= state->ra_base_lba && (lba + count) <= (state->ra_base_lba + state->ra_block_count);
 }
 
-// Spin-wait for a CQE by checking local zone memory only (server-push mode).
-// The server has already pushed data + CQ + header via rdma_write; the consumer's
-// napi_poll_inline (called by wki_spin_yield_channel) delivers those frames into
-// the local zone.  No rdma_read round-trips needed.
+// Server-push CQ drain: reads all available CQEs into per-tag completion array.
+// In multi-outstanding mode, multiple CQEs may arrive for different tags.
 auto rdma_wait_cqe_push(ProxyBlockState* state, uint32_t tag, BlkCqEntry* out_cqe) -> bool {
+    // Check if already completed in a previous drain
+    if (tag < ProxyBlockState::TAG_POOL_SIZE) {
+        auto& completion = tag_completion(state, tag);
+        if (completion.completed) {
+            *out_cqe = completion.cqe;
+            completion.completed = false;
+            return true;
+        }
+    }
+
     auto* hdr = blk_ring_header(state->rdma_zone_ptr);
     auto* cq = blk_cq_entries(state->rdma_zone_ptr, hdr);
 
     asm volatile("" ::: "memory");  // read barrier
 
-    if (blk_cq_empty(hdr)) {
-        return false;
-    }
-
-    // In single-outstanding mode the next CQE is always at cq_tail
-    uint32_t idx = hdr->cq_tail % hdr->cq_depth;
-    if (cq[idx].tag == tag) {
-        *out_cqe = cq[idx];
+    // Drain all available CQEs into per-tag tracking (multi-outstanding mode)
+    while (!blk_cq_empty(hdr)) {
+        uint32_t const IDX = hdr->cq_tail % hdr->cq_depth;
+        uint32_t const CTAG = cq[IDX].tag;
+        if (tag_in_use(state, CTAG)) {
+            auto& completion = tag_completion(state, CTAG);
+            completion.cqe = cq[IDX];
+            completion.completed = true;
+            completion.pending = false;
+        }
         asm volatile("" ::: "memory");
         hdr->cq_tail = (hdr->cq_tail + 1) % hdr->cq_depth;
-        return true;
+    }
+
+    // Check if our target tag completed
+    if (tag < ProxyBlockState::TAG_POOL_SIZE) {
+        auto& completion = tag_completion(state, tag);
+        if (completion.completed) {
+            *out_cqe = completion.cqe;
+            completion.completed = false;
+            return true;
+        }
     }
 
     return false;
 }
 
-// Drain all available CQ entries into the pending completion cache.
+// Drain all available CQ entries into the per-tag completion tracking array.
 void rdma_drain_cq(ProxyBlockState* state) {
     // For RoCE zones: pull CQ + header from server before checking for completions
     roce_pull_cq(state);
@@ -189,25 +245,18 @@ void rdma_drain_cq(ProxyBlockState* state) {
 
     while (!blk_cq_empty(hdr)) {
         asm volatile("" ::: "memory");  // read barrier
-        uint32_t idx = hdr->cq_tail % hdr->cq_depth;
-        const auto& cqe = cq[idx];
+        uint32_t const IDX = hdr->cq_tail % hdr->cq_depth;
+        const auto& cqe = cq[IDX];
 
-        // Store in pending cache (find first free slot)
-        bool cached = false;
-        for (auto& pc : state->pending_cq) {
-            if (!pc.valid) {
-                pc.cqe = cqe;
-                pc.valid = true;
-                cached = true;
-                break;
-            }
+        // Store completion in per-tag tracking array (O(1) lookup by tag)
+        uint32_t const TAG = cqe.tag;
+        if (tag_in_use(state, TAG)) {
+            auto& completion = tag_completion(state, TAG);
+            completion.cqe = cqe;
+            completion.completed = true;
+            completion.pending = false;
         }
-
-        if (!cached) {
-            // Pending cache full — stop draining to avoid losing this CQE.
-            // The caller will retry after consuming entries from the cache.
-            break;
-        }
+        // Tags not in the bitmap are stale/orphaned - safe to drop
 
         asm volatile("" ::: "memory");  // write barrier before advancing tail
         hdr->cq_tail = (hdr->cq_tail + 1) % hdr->cq_depth;
@@ -216,11 +265,12 @@ void rdma_drain_cq(ProxyBlockState* state) {
 
 // Drain CQ and look for a specific tag. Returns true if found and fills out_cqe.
 auto rdma_drain_cq_for_tag(ProxyBlockState* state, uint32_t tag, BlkCqEntry* out_cqe) -> bool {
-    // First check pending cache
-    for (auto& pc : state->pending_cq) {
-        if (pc.valid && pc.cqe.tag == tag) {
-            *out_cqe = pc.cqe;
-            pc.valid = false;
+    // Check per-tag completion array (O(1) lookup)
+    if (tag < ProxyBlockState::TAG_POOL_SIZE) {
+        auto& completion = tag_completion(state, tag);
+        if (completion.completed) {
+            *out_cqe = completion.cqe;
+            completion.completed = false;
             return true;
         }
     }
@@ -229,10 +279,11 @@ auto rdma_drain_cq_for_tag(ProxyBlockState* state, uint32_t tag, BlkCqEntry* out
     rdma_drain_cq(state);
 
     // Check again
-    for (auto& pc : state->pending_cq) {
-        if (pc.valid && pc.cqe.tag == tag) {
-            *out_cqe = pc.cqe;
-            pc.valid = false;
+    if (tag < ProxyBlockState::TAG_POOL_SIZE) {
+        auto& completion = tag_completion(state, tag);
+        if (completion.completed) {
+            *out_cqe = completion.cqe;
+            completion.completed = false;
             return true;
         }
     }
@@ -249,7 +300,7 @@ void rdma_signal_server(ProxyBlockState* state) {
 
     // Tier 1: ivshmem doorbell (near-zero latency)
     if (peer->transport != nullptr && peer->transport->rdma_capable) {
-        // ivshmem transport has native doorbell — zone post handler will fire
+        // ivshmem transport has native doorbell - zone post handler will fire
         ZoneNotifyPayload notify = {};
         notify.zone_id = state->rdma_zone_id;
         notify.op_type = 1;  // WRITE (new SQ entries available)
@@ -298,13 +349,13 @@ auto remote_block_read_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, u
 
     // Calculate max blocks per chunk based on response payload capacity
     auto max_resp_data = static_cast<uint32_t>(WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload));
-    uint32_t blocks_per_chunk = max_resp_data / static_cast<uint32_t>(dev->block_size);
-    if (blocks_per_chunk == 0) {
+    uint32_t const BLOCKS_PER_CHUNK = max_resp_data / static_cast<uint32_t>(dev->block_size);
+    if (BLOCKS_PER_CHUNK == 0) {
         return -1;
     }
 
     while (remaining > 0) {
-        uint32_t chunk = (remaining > blocks_per_chunk) ? blocks_per_chunk : remaining;
+        uint32_t chunk = (remaining > BLOCKS_PER_CHUNK) ? BLOCKS_PER_CHUNK : remaining;
         auto chunk_bytes = static_cast<uint16_t>(chunk * static_cast<uint32_t>(dev->block_size));
 
         // Build request: DevOpReqPayload + {lba:u64, count:u32}
@@ -320,8 +371,10 @@ auto remote_block_read_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, u
         memcpy(req_data + sizeof(uint64_t), &chunk, sizeof(uint32_t));
 
         // Set up blocking state
+        WkiWaitEntry wait = {};
         state->lock.lock();
-        state->op_pending = true;
+        state->op_wait_entry = &wait;
+        state->op_pending.store(true, std::memory_order_release);
         state->op_status = 0;
         state->op_resp_buf = dest;
         state->op_resp_max = chunk_bytes;
@@ -329,26 +382,20 @@ auto remote_block_read_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, u
         state->lock.unlock();
 
         // Send request
-        int send_ret = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf.data(),
-                                static_cast<uint16_t>(sizeof(DevOpReqPayload) + REQ_DATA_LEN));
-        if (send_ret != WKI_OK) {
-            state->op_pending = false;
+        int const SEND_RET = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf.data(),
+                                      static_cast<uint16_t>(sizeof(DevOpReqPayload) + REQ_DATA_LEN));
+        if (SEND_RET != WKI_OK) {
+            state->op_wait_entry = nullptr;
+            state->op_pending.store(false, std::memory_order_relaxed);
             return -1;
         }
 
-        // Spin-wait for response — targeted single-channel tick
-        WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-        uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-        while (state->op_pending) {
-            asm volatile("pause" ::: "memory");
-            if (!state->op_pending) {
-                break;
-            }
-            if (wki_now_us() >= deadline) {
-                state->op_pending = false;
-                return -1;
-            }
-            wki_spin_yield_channel(ch);
+        // Async wait for response
+        int const WAIT_RC = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+        state->op_wait_entry = nullptr;
+        if (WAIT_RC == WKI_ERR_TIMEOUT) {
+            state->op_pending.store(false, std::memory_order_relaxed);
+            return -1;
         }
 
         if (state->op_status != 0) {
@@ -363,7 +410,7 @@ auto remote_block_read_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, u
     return 0;
 }
 
-// RDMA ring-based block read — with read-ahead cache and server-push optimisation.
+// RDMA ring-based block read - with read-ahead cache and server-push optimisation.
 //
 // Prefetches a full data-slot worth of blocks (typically 64 KB) on each RDMA
 // round-trip and caches the excess for subsequent reads.  For RoCE zones the
@@ -376,29 +423,29 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
     auto* ring_hdr = blk_ring_header(state->rdma_zone_ptr);
     auto* sq = blk_sq_entries(state->rdma_zone_ptr);
 
-    uint32_t blk_sz = ring_hdr->block_size;
-    uint32_t blocks_per_slot = ring_hdr->data_slot_size / blk_sz;
-    if (blocks_per_slot == 0) {
+    uint32_t const BLK_SZ = ring_hdr->block_size;
+    uint32_t const BLOCKS_PER_SLOT = ring_hdr->data_slot_size / BLK_SZ;
+    if (BLOCKS_PER_SLOT == 0) {
         return -1;
     }
 
-    // ── 1. Serve from read-ahead cache if the request is fully covered ──────
+    // -- 1. Serve from read-ahead cache if the request is fully covered ------
     if (ra_cache_hit(state, block, count)) {
-        uint64_t off = (block - state->ra_base_lba) * blk_sz;
-        memcpy(buffer, state->ra_buffer + off, static_cast<size_t>(count) * blk_sz);
+        uint64_t const OFF = (block - state->ra_base_lba) * BLK_SZ;
+        memcpy(buffer, state->ra_buffer + OFF, static_cast<size_t>(count) * BLK_SZ);
         return 0;
     }
 
-    // ── 2. Cache miss — fetch a full slot starting at the requested LBA ─────
+    // -- 2. Cache miss - fetch a full slot starting at the requested LBA -----
     //    Cap at device boundary.
-    uint32_t fetch_count = blocks_per_slot;
+    uint32_t fetch_count = BLOCKS_PER_SLOT;
     if (block + fetch_count > ring_hdr->total_blocks) {
         fetch_count = static_cast<uint32_t>(ring_hdr->total_blocks - block);
     }
     if (fetch_count == 0) {
         return -1;
     }
-    auto fetch_bytes = fetch_count * blk_sz;
+    auto fetch_bytes = fetch_count * BLK_SZ;
 
     // Allocate a data slot
     int slot = rdma_alloc_slot(state);
@@ -416,11 +463,16 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
         rdma_drain_cq(state);
     }
 
-    // Post SQE — request the full prefetch range
-    uint32_t tag = state->next_tag++;
-    uint32_t sq_idx = ring_hdr->sq_head % ring_hdr->sq_depth;
-    auto& sqe = sq[sq_idx];
-    sqe.tag = tag;
+    // Post SQE - request the full prefetch range
+    int const TAG_ID = rdma_alloc_tag(state);
+    if (TAG_ID < 0) {
+        rdma_free_slot(state, static_cast<uint32_t>(slot));
+        return -1;
+    }
+    auto const TAG = static_cast<uint32_t>(TAG_ID);
+    uint32_t const SQ_IDX = ring_hdr->sq_head % ring_hdr->sq_depth;
+    auto& sqe = sq[SQ_IDX];
+    sqe.tag = TAG;
     sqe.opcode = static_cast<uint8_t>(BlkOpcode::READ);
     sqe.lba = block;
     sqe.block_count = fetch_count;
@@ -435,9 +487,9 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
     // Signal server
     rdma_signal_server(state);
 
-    // ── 3. Wait for completion ──────────────────────────────────────────────
+    // -- 3. Wait for completion ----------------------------------------------
     WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-    uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+    uint64_t const DEADLINE = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
     BlkCqEntry cqe = {};
     bool got_cqe = false;
 
@@ -446,12 +498,13 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
         // local zone via rdma_write.  wki_spin_yield_channel drives NIC RX so
         // those frames land in local memory.  No rdma_read needed.
         while (!got_cqe) {
-            got_cqe = rdma_wait_cqe_push(state, tag, &cqe);
+            got_cqe = rdma_wait_cqe_push(state, TAG, &cqe);
             if (got_cqe) {
                 break;
             }
-            if (wki_now_us() >= deadline) {
+            if (wki_now_us() >= DEADLINE) {
                 rdma_free_slot(state, static_cast<uint32_t>(slot));
+                rdma_free_tag(state, TAG);
                 return -1;
             }
             asm volatile("pause" ::: "memory");
@@ -460,12 +513,13 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
     } else {
         // ivshmem path: shared memory is coherent, use existing drain logic
         while (!got_cqe) {
-            got_cqe = rdma_drain_cq_for_tag(state, tag, &cqe);
+            got_cqe = rdma_drain_cq_for_tag(state, TAG, &cqe);
             if (got_cqe) {
                 break;
             }
-            if (wki_now_us() >= deadline) {
+            if (wki_now_us() >= DEADLINE) {
                 rdma_free_slot(state, static_cast<uint32_t>(slot));
+                rdma_free_tag(state, TAG);
                 return -1;
             }
             asm volatile("pause" ::: "memory");
@@ -475,12 +529,13 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
 
     if (cqe.status != 0) {
         rdma_free_slot(state, static_cast<uint32_t>(slot));
+        rdma_free_tag(state, TAG);
         ra_invalidate(state);
         return cqe.status;
     }
 
-    // ── 4. Populate read-ahead cache from the data slot ─────────────────────
-    // For RoCE the server already pushed data into our local zone — no pull needed.
+    // -- 4. Populate read-ahead cache from the data slot ---------------------
+    // For RoCE the server already pushed data into our local zone - no pull needed.
     if (!state->rdma_roce) {
         roce_pull_data_slot(state, static_cast<uint32_t>(slot), fetch_bytes);
     }
@@ -495,16 +550,19 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
     }
 
     rdma_free_slot(state, static_cast<uint32_t>(slot));
+    rdma_free_tag(state, TAG);
 
-    // ── 5. Copy the originally-requested data to the caller's buffer ────────
-    memcpy(buffer, state->ra_buffer != nullptr ? state->ra_buffer : slot_data, static_cast<size_t>(count) * blk_sz);
+    // -- 5. Copy the originally-requested data to the caller's buffer --------
+    memcpy(buffer, state->ra_buffer != nullptr ? state->ra_buffer : slot_data, static_cast<size_t>(count) * BLK_SZ);
 
     return 0;
 }
 
 // Dispatcher: uses RDMA ring if available, falls back to message-based
 auto remote_block_read(ker::dev::BlockDevice* dev, uint64_t block, size_t count, void* buffer) -> int {
+    s_proxy_lock.lock();
     auto* state = find_proxy_by_bdev(dev);
+    s_proxy_lock.unlock();
     if (state == nullptr || !state->active) {
         return -1;
     }
@@ -537,18 +595,18 @@ auto remote_block_write_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, 
     // Request: DevOpReqPayload(4) + lba(8) + count(4) + data
     constexpr uint32_t WRITE_HDR_OVERHEAD = sizeof(DevOpReqPayload) + 12;
     auto max_req_data = static_cast<uint32_t>(WKI_ETH_MAX_PAYLOAD - WRITE_HDR_OVERHEAD);
-    uint32_t blocks_per_chunk = max_req_data / static_cast<uint32_t>(dev->block_size);
-    if (blocks_per_chunk == 0) {
+    uint32_t const BLOCKS_PER_CHUNK = max_req_data / static_cast<uint32_t>(dev->block_size);
+    if (BLOCKS_PER_CHUNK == 0) {
         return -1;
     }
 
     while (remaining > 0) {
-        uint32_t chunk = (remaining > blocks_per_chunk) ? blocks_per_chunk : remaining;
+        uint32_t chunk = (remaining > BLOCKS_PER_CHUNK) ? BLOCKS_PER_CHUNK : remaining;
         auto chunk_bytes = (chunk * static_cast<uint32_t>(dev->block_size));
 
         // Build request: DevOpReqPayload + {lba:u64, count:u32} + data
         auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + 12 + chunk_bytes);
-        auto* req_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(req_total));
+        auto* req_buf = new (std::nothrow) uint8_t[req_total];
         if (req_buf == nullptr) {
             return -1;
         }
@@ -563,8 +621,10 @@ auto remote_block_write_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, 
         memcpy(req_data + 12, src, chunk_bytes);
 
         // Set up blocking state
+        WkiWaitEntry wait = {};
         state->lock.lock();
-        state->op_pending = true;
+        state->op_wait_entry = &wait;
+        state->op_pending.store(true, std::memory_order_release);
         state->op_status = 0;
         state->op_resp_buf = nullptr;
         state->op_resp_max = 0;
@@ -572,27 +632,21 @@ auto remote_block_write_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, 
         state->lock.unlock();
 
         // Send request
-        int send_ret = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
-        ker::mod::mm::dyn::kmalloc::free(req_buf);
+        int const SEND_RET = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
+        delete[] req_buf;
 
-        if (send_ret != WKI_OK) {
-            state->op_pending = false;
+        if (SEND_RET != WKI_OK) {
+            state->op_wait_entry = nullptr;
+            state->op_pending.store(false, std::memory_order_relaxed);
             return -1;
         }
 
-        // Spin-wait for response — targeted single-channel tick
-        WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-        uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-        while (state->op_pending) {
-            asm volatile("pause" ::: "memory");
-            if (!state->op_pending) {
-                break;
-            }
-            if (wki_now_us() >= deadline) {
-                state->op_pending = false;
-                return -1;
-            }
-            wki_spin_yield_channel(ch);
+        // Async wait for response
+        int const WAIT_RC = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+        state->op_wait_entry = nullptr;
+        if (WAIT_RC == WKI_ERR_TIMEOUT) {
+            state->op_pending.store(false, std::memory_order_relaxed);
+            return -1;
         }
 
         if (state->op_status != 0) {
@@ -607,12 +661,12 @@ auto remote_block_write_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, 
     return 0;
 }
 
-// RDMA ring-based block write — consumer copies data into slot, server reads from it
+// RDMA ring-based block write - consumer copies data into slot, server reads from it
 auto remote_block_write_rdma(ProxyBlockState* state, uint64_t block, uint32_t count, const void* buffer) -> int {
     if (!state->active || state->rdma_zone_ptr == nullptr) {
         return -1;
     }
-    // Invalidate read-ahead cache — written data may overlap cached range
+    // Invalidate read-ahead cache - written data may overlap cached range
     ra_invalidate(state);
 
     auto* ring_hdr = blk_ring_header(state->rdma_zone_ptr);
@@ -622,14 +676,14 @@ auto remote_block_write_rdma(ProxyBlockState* state, uint64_t block, uint32_t co
     uint64_t lba = block;
     uint32_t remaining = count;
 
-    uint32_t blocks_per_slot = ring_hdr->data_slot_size / ring_hdr->block_size;
-    if (blocks_per_slot == 0) {
+    uint32_t const BLOCKS_PER_SLOT = ring_hdr->data_slot_size / ring_hdr->block_size;
+    if (BLOCKS_PER_SLOT == 0) {
         return -1;
     }
 
     while (remaining > 0) {
-        uint32_t chunk = (remaining > blocks_per_slot) ? blocks_per_slot : remaining;
-        auto chunk_bytes = chunk * ring_hdr->block_size;
+        uint32_t const CHUNK = (remaining > BLOCKS_PER_SLOT) ? BLOCKS_PER_SLOT : remaining;
+        auto chunk_bytes = CHUNK * ring_hdr->block_size;
 
         // Allocate a data slot
         int slot = rdma_alloc_slot(state);
@@ -655,13 +709,18 @@ auto remote_block_write_rdma(ProxyBlockState* state, uint64_t block, uint32_t co
         }
 
         // Post SQE
-        uint32_t tag = state->next_tag++;
-        uint32_t sq_idx = ring_hdr->sq_head % ring_hdr->sq_depth;
-        auto& sqe = sq[sq_idx];
-        sqe.tag = tag;
+        int const TAG_ID = rdma_alloc_tag(state);
+        if (TAG_ID < 0) {
+            rdma_free_slot(state, static_cast<uint32_t>(slot));
+            return -1;
+        }
+        auto const TAG = static_cast<uint32_t>(TAG_ID);
+        uint32_t const SQ_IDX = ring_hdr->sq_head % ring_hdr->sq_depth;
+        auto& sqe = sq[SQ_IDX];
+        sqe.tag = TAG;
         sqe.opcode = static_cast<uint8_t>(BlkOpcode::WRITE);
         sqe.lba = lba;
-        sqe.block_count = chunk;
+        sqe.block_count = CHUNK;
         sqe.data_slot = static_cast<uint32_t>(slot);
 
         asm volatile("" ::: "memory");
@@ -675,17 +734,18 @@ auto remote_block_write_rdma(ProxyBlockState* state, uint64_t block, uint32_t co
 
         // Spin-wait for CQE with matching tag
         WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-        uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+        uint64_t const DEADLINE = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
         BlkCqEntry cqe = {};
         bool got_cqe = false;
 
         while (!got_cqe) {
-            got_cqe = rdma_drain_cq_for_tag(state, tag, &cqe);
+            got_cqe = rdma_drain_cq_for_tag(state, TAG, &cqe);
             if (got_cqe) {
                 break;
             }
-            if (wki_now_us() >= deadline) {
+            if (wki_now_us() >= DEADLINE) {
                 rdma_free_slot(state, static_cast<uint32_t>(slot));
+                rdma_free_tag(state, TAG);
                 return -1;
             }
             asm volatile("pause" ::: "memory");
@@ -693,14 +753,15 @@ auto remote_block_write_rdma(ProxyBlockState* state, uint64_t block, uint32_t co
         }
 
         rdma_free_slot(state, static_cast<uint32_t>(slot));
+        rdma_free_tag(state, TAG);
 
         if (cqe.status != 0) {
             return cqe.status;
         }
 
         src += chunk_bytes;
-        lba += chunk;
-        remaining -= chunk;
+        lba += CHUNK;
+        remaining -= CHUNK;
     }
 
     return 0;
@@ -708,7 +769,9 @@ auto remote_block_write_rdma(ProxyBlockState* state, uint64_t block, uint32_t co
 
 // Dispatcher: uses RDMA ring if available, falls back to message-based
 auto remote_block_write(ker::dev::BlockDevice* dev, uint64_t block, size_t count, const void* buffer) -> int {
+    s_proxy_lock.lock();
     auto* state = find_proxy_by_bdev(dev);
+    s_proxy_lock.unlock();
     if (state == nullptr || !state->active) {
         return -1;
     }
@@ -737,32 +800,28 @@ auto remote_block_flush_msg(ProxyBlockState* state) -> int {
     req.op_id = OP_BLOCK_FLUSH;
     req.data_len = 0;
 
+    WkiWaitEntry wait = {};
     state->lock.lock();
-    state->op_pending = true;
+    state->op_wait_entry = &wait;
+    state->op_pending.store(true, std::memory_order_release);
     state->op_status = 0;
     state->op_resp_buf = nullptr;
     state->op_resp_max = 0;
     state->op_resp_len = 0;
     state->lock.unlock();
 
-    int send_ret = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, &req, sizeof(req));
-    if (send_ret != WKI_OK) {
-        state->op_pending = false;
+    int const SEND_RET = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, &req, sizeof(req));
+    if (SEND_RET != WKI_OK) {
+        state->op_wait_entry = nullptr;
+        state->op_pending.store(false, std::memory_order_relaxed);
         return -1;
     }
 
-    WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-    uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-    while (state->op_pending) {
-        asm volatile("pause" ::: "memory");
-        if (!state->op_pending) {
-            break;
-        }
-        if (wki_now_us() >= deadline) {
-            state->op_pending = false;
-            return -1;
-        }
-        wki_spin_yield_channel(ch);
+    int const WAIT_RC = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+    state->op_wait_entry = nullptr;
+    if (WAIT_RC == WKI_ERR_TIMEOUT) {
+        state->op_pending.store(false, std::memory_order_relaxed);
+        return -1;
     }
 
     return static_cast<int>(state->op_status);
@@ -782,11 +841,15 @@ auto remote_block_flush_rdma(ProxyBlockState* state) -> int {
         rdma_drain_cq(state);
     }
 
-    // Post SQE — flush uses no data slot
-    uint32_t tag = state->next_tag++;
-    uint32_t sq_idx = ring_hdr->sq_head % ring_hdr->sq_depth;
-    auto& sqe = sq[sq_idx];
-    sqe.tag = tag;
+    // Post SQE - flush uses no data slot
+    int const TAG_ID = rdma_alloc_tag(state);
+    if (TAG_ID < 0) {
+        return -1;
+    }
+    auto const TAG = static_cast<uint32_t>(TAG_ID);
+    uint32_t const SQ_IDX = ring_hdr->sq_head % ring_hdr->sq_depth;
+    auto& sqe = sq[SQ_IDX];
+    sqe.tag = TAG;
     sqe.opcode = static_cast<uint8_t>(BlkOpcode::FLUSH);
     sqe.lba = 0;
     sqe.block_count = 0;
@@ -802,28 +865,32 @@ auto remote_block_flush_rdma(ProxyBlockState* state) -> int {
 
     // Spin-wait for CQE
     WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-    uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+    uint64_t const DEADLINE = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
     BlkCqEntry cqe = {};
     bool got_cqe = false;
 
     while (!got_cqe) {
-        got_cqe = rdma_drain_cq_for_tag(state, tag, &cqe);
+        got_cqe = rdma_drain_cq_for_tag(state, TAG, &cqe);
         if (got_cqe) {
             break;
         }
-        if (wki_now_us() >= deadline) {
+        if (wki_now_us() >= DEADLINE) {
+            rdma_free_tag(state, TAG);
             return -1;
         }
         asm volatile("pause" ::: "memory");
         wki_spin_yield_channel(ch);
     }
 
+    rdma_free_tag(state, TAG);
     return cqe.status;
 }
 
 // Dispatcher
 auto remote_block_flush(ker::dev::BlockDevice* dev) -> int {
+    s_proxy_lock.lock();
     auto* state = find_proxy_by_bdev(dev);
+    s_proxy_lock.unlock();
     if (state == nullptr || !state->active) {
         return -1;
     }
@@ -843,6 +910,615 @@ auto remote_block_flush(ker::dev::BlockDevice* dev) -> int {
         return remote_block_flush_rdma(state);
     }
     return remote_block_flush_msg(state);
+}
+
+// -----------------------------------------------------------------------------
+// Batch I/O - async SQ pipeline (submits multiple SQEs, single doorbell)
+// -----------------------------------------------------------------------------
+
+// Per-batch tracking entry (tag + data slot allocated for one SQE)
+struct BatchEntry {
+    uint32_t tag;
+    uint32_t slot;
+};
+
+// Post up to `count` SQEs into the SQ ring without signaling the server.
+// Allocates tags and data slots for each entry.  Returns number actually posted.
+auto rdma_batch_submit(ProxyBlockState* state, BlkOpcode opcode, const BlockRange* ranges, uint32_t count,
+                       std::array<BatchEntry, WKI_DEV_PROXY_MAX_BATCH>& entries_out) -> int {
+    if (!state->active || state->rdma_zone_ptr == nullptr || count == 0) {
+        return -1;
+    }
+
+    auto* ring_hdr = blk_ring_header(state->rdma_zone_ptr);
+    auto* sq = blk_sq_entries(state->rdma_zone_ptr);
+
+    uint32_t posted = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        // Allocate tag
+        int tag = rdma_alloc_tag(state);
+        if (tag < 0) {
+            rdma_drain_cq(state);
+            tag = rdma_alloc_tag(state);
+            if (tag < 0) {
+                break;
+            }
+        }
+
+        // Allocate data slot (not needed for FLUSH)
+        int slot = -1;
+        if (opcode != BlkOpcode::FLUSH) {
+            slot = rdma_alloc_slot(state);
+            if (slot < 0) {
+                rdma_drain_cq(state);
+                slot = rdma_alloc_slot(state);
+                if (slot < 0) {
+                    rdma_free_tag(state, static_cast<uint32_t>(tag));
+                    break;
+                }
+            }
+        }
+
+        // For writes: copy data to slot before posting
+        if (opcode == BlkOpcode::WRITE && slot >= 0 && ranges[i].buffer != nullptr) {
+            uint32_t const BYTES = ranges[i].block_count * ring_hdr->block_size;
+            auto* slot_data = blk_data_slot(state->rdma_zone_ptr, ring_hdr, static_cast<uint32_t>(slot));
+            memcpy(slot_data, ranges[i].buffer, BYTES);
+            roce_push_data_slot(state, static_cast<uint32_t>(slot), BYTES);
+        }
+
+        // Wait for SQ space
+        while (blk_sq_full(ring_hdr)) {
+            asm volatile("pause" ::: "memory");
+            rdma_drain_cq(state);
+        }
+
+        // Post SQE
+        uint32_t const SQ_IDX = ring_hdr->sq_head % ring_hdr->sq_depth;
+        auto& sqe = sq[SQ_IDX];
+        sqe.tag = static_cast<uint32_t>(tag);
+        sqe.opcode = static_cast<uint8_t>(opcode);
+        sqe.lba = ranges[i].lba;
+        sqe.block_count = ranges[i].block_count;
+        sqe.data_slot = (slot >= 0) ? static_cast<uint32_t>(slot) : 0;
+
+        asm volatile("" ::: "memory");  // write barrier before advancing head
+        ring_hdr->sq_head = (ring_hdr->sq_head + 1) % ring_hdr->sq_depth;
+
+        auto& entry = entries_out.at(posted);
+        entry.tag = static_cast<uint32_t>(tag);
+        entry.slot = (slot >= 0) ? static_cast<uint32_t>(slot) : 0;
+        posted++;
+    }
+
+    return static_cast<int>(posted);
+}
+
+// Send a single doorbell/notification after all SQEs are posted.
+void rdma_batch_signal(ProxyBlockState* state) {
+    roce_push_sq(state);
+    rdma_signal_server(state);
+}
+
+// Poll CQ for completions matching the given batch entries.
+// In blocking mode, spins until all `count` entries complete or timeout.
+// Returns the number of completed entries.
+auto rdma_batch_collect(ProxyBlockState* state, const std::array<BatchEntry, WKI_DEV_PROXY_MAX_BATCH>& entries, uint32_t count,
+                        bool blocking) -> int {
+    WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
+    uint64_t const DEADLINE = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+
+    for (;;) {
+        // Count completed entries
+        uint32_t completed = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t const TAG = entries.at(i).tag;
+            if (TAG < ProxyBlockState::TAG_POOL_SIZE && tag_completion(state, TAG).completed) {
+                completed++;
+            }
+        }
+        if (completed == count) {
+            return static_cast<int>(completed);
+        }
+
+        // Drain CQ entries into per-tag array
+        if (state->rdma_roce) {
+            // Server-push mode: CQEs arrive via RDMA writes into local zone memory;
+            // drive NIC RX to receive those frames, then scan CQ ring locally.
+            auto* hdr = blk_ring_header(state->rdma_zone_ptr);
+            auto* cq = blk_cq_entries(state->rdma_zone_ptr, hdr);
+            asm volatile("" ::: "memory");
+            while (!blk_cq_empty(hdr)) {
+                uint32_t const IDX = hdr->cq_tail % hdr->cq_depth;
+                uint32_t const CTAG = cq[IDX].tag;
+                if (tag_in_use(state, CTAG)) {
+                    auto& completion = tag_completion(state, CTAG);
+                    completion.cqe = cq[IDX];
+                    completion.completed = true;
+                    completion.pending = false;
+                }
+                asm volatile("" ::: "memory");
+                hdr->cq_tail = (hdr->cq_tail + 1) % hdr->cq_depth;
+            }
+        } else {
+            rdma_drain_cq(state);
+        }
+
+        if (!blocking) {
+            // Non-blocking: count what we got and return
+            uint32_t got = 0;
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t const TAG = entries.at(i).tag;
+                if (TAG < ProxyBlockState::TAG_POOL_SIZE && tag_completion(state, TAG).completed) {
+                    got++;
+                }
+            }
+            return static_cast<int>(got);
+        }
+
+        if (wki_now_us() >= DEADLINE) {
+            return -1;  // timeout
+        }
+
+        asm volatile("pause" ::: "memory");
+        wki_spin_yield_channel(ch);
+    }
+}
+
+// Batch RDMA read: submits multiple read SQEs, single doorbell, collects all CQEs.
+auto remote_block_read_batch_rdma(ProxyBlockState* state, const BlockRange* ranges, uint32_t count) -> int {
+    if (!state->active || state->rdma_zone_ptr == nullptr || count == 0) {
+        return -1;
+    }
+
+    auto* ring_hdr = blk_ring_header(state->rdma_zone_ptr);
+
+    // Invalidate RA cache - batch reads bypass the single-block read-ahead
+    ra_invalidate(state);
+
+    // Clamp batch to max depth
+    uint32_t const BATCH_COUNT = (count > WKI_DEV_PROXY_MAX_BATCH) ? WKI_DEV_PROXY_MAX_BATCH : count;
+
+    std::array<BatchEntry, WKI_DEV_PROXY_MAX_BATCH> entries = {};
+
+    int const POSTED = rdma_batch_submit(state, BlkOpcode::READ, ranges, BATCH_COUNT, entries);
+    if (POSTED <= 0) {
+        return -1;
+    }
+
+    rdma_batch_signal(state);
+
+    int const COLLECTED = rdma_batch_collect(state, entries, static_cast<uint32_t>(POSTED), true);
+    if (COLLECTED != POSTED) {
+        // Timeout - free resources for all posted entries
+        for (int i = 0; i < POSTED; i++) {
+            auto const& entry = entries.at(static_cast<size_t>(i));
+            rdma_free_slot(state, entry.slot);
+            rdma_free_tag(state, entry.tag);
+        }
+        return -1;
+    }
+
+    // Collect results: copy data from slots to caller buffers
+    int result = 0;
+    for (int i = 0; i < POSTED; i++) {
+        auto const& entry = entries.at(static_cast<size_t>(i));
+        uint32_t const TAG = entry.tag;
+        auto& tc = tag_completion(state, TAG);
+
+        if (tc.cqe.status != 0) {
+            result = tc.cqe.status;
+        } else {
+            // For non-RoCE ivshmem: data is already in local shared memory.
+            // roce_pull_data_slot is a no-op for both paths (server-push for
+            // RoCE, coherent shared mem for ivshmem).
+            auto* slot_data = blk_data_slot(state->rdma_zone_ptr, ring_hdr, entry.slot);
+            uint32_t const COPY_BYTES = ranges[i].block_count * ring_hdr->block_size;
+            memcpy(ranges[i].buffer, slot_data, COPY_BYTES);
+        }
+
+        tc.completed = false;
+        rdma_free_slot(state, entry.slot);
+        rdma_free_tag(state, entry.tag);
+    }
+
+    // Handle remaining ranges (if count > MAX_BATCH) via recursive call
+    if (count > BATCH_COUNT && result == 0) {
+        return remote_block_read_batch_rdma(state, ranges + BATCH_COUNT, count - BATCH_COUNT);
+    }
+
+    return result;
+}
+
+// Batch RDMA write: submits multiple write SQEs, single doorbell, collects all CQEs.
+auto remote_block_write_batch_rdma(ProxyBlockState* state, const BlockRange* ranges, uint32_t count) -> int {
+    if (!state->active || state->rdma_zone_ptr == nullptr || count == 0) {
+        return -1;
+    }
+
+    // Invalidate read-ahead cache - written data may overlap cached range
+    ra_invalidate(state);
+
+    // Clamp batch to max depth
+    uint32_t const BATCH_COUNT = (count > WKI_DEV_PROXY_MAX_BATCH) ? WKI_DEV_PROXY_MAX_BATCH : count;
+
+    std::array<BatchEntry, WKI_DEV_PROXY_MAX_BATCH> entries = {};
+
+    int const POSTED = rdma_batch_submit(state, BlkOpcode::WRITE, ranges, BATCH_COUNT, entries);
+    if (POSTED <= 0) {
+        return -1;
+    }
+
+    rdma_batch_signal(state);
+
+    int const COLLECTED = rdma_batch_collect(state, entries, static_cast<uint32_t>(POSTED), true);
+    if (COLLECTED != POSTED) {
+        // Timeout - free resources
+        for (int i = 0; i < POSTED; i++) {
+            auto const& entry = entries.at(static_cast<size_t>(i));
+            rdma_free_slot(state, entry.slot);
+            rdma_free_tag(state, entry.tag);
+        }
+        return -1;
+    }
+
+    // Collect results
+    int result = 0;
+    for (int i = 0; i < POSTED; i++) {
+        auto const& entry = entries.at(static_cast<size_t>(i));
+        uint32_t const TAG = entry.tag;
+        auto& tc = tag_completion(state, TAG);
+
+        if (tc.cqe.status != 0) {
+            result = tc.cqe.status;
+        }
+
+        tc.completed = false;
+        rdma_free_slot(state, entry.slot);
+        rdma_free_tag(state, entry.tag);
+    }
+
+    // Handle remaining ranges (if count > MAX_BATCH)
+    if (count > BATCH_COUNT && result == 0) {
+        return remote_block_write_batch_rdma(state, ranges + BATCH_COUNT, count - BATCH_COUNT);
+    }
+
+    return result;
+}
+
+// Dispatcher for batch read: RDMA batch if available, fallback to sequential single reads
+auto remote_block_read_batch(ker::dev::BlockDevice* dev, const BlockRange* ranges, uint32_t count) -> int {
+    s_proxy_lock.lock();
+    auto* state = find_proxy_by_bdev(dev);
+    s_proxy_lock.unlock();
+    if (state == nullptr || !state->active) {
+        return -1;
+    }
+
+    if (state->fenced) {
+        if (!wait_for_fence_lift(state)) {
+            return -1;
+        }
+    }
+    if (!state->active) {
+        return -1;
+    }
+
+    if (state->rdma_attached) {
+        return remote_block_read_batch_rdma(state, ranges, count);
+    }
+
+    // Fallback: sequential single reads via message path
+    for (uint32_t i = 0; i < count; i++) {
+        int const RET = remote_block_read_msg(state, dev, ranges[i].lba, ranges[i].block_count, ranges[i].buffer);
+        if (RET != 0) {
+            return RET;
+        }
+    }
+    return 0;
+}
+
+// Dispatcher for batch write: RDMA batch if available, fallback to sequential single writes
+auto remote_block_write_batch(ker::dev::BlockDevice* dev, const BlockRange* ranges, uint32_t count) -> int {
+    s_proxy_lock.lock();
+    auto* state = find_proxy_by_bdev(dev);
+    s_proxy_lock.unlock();
+    if (state == nullptr || !state->active) {
+        return -1;
+    }
+
+    if (state->fenced) {
+        if (!wait_for_fence_lift(state)) {
+            return -1;
+        }
+    }
+    if (!state->active) {
+        return -1;
+    }
+
+    if (state->rdma_attached) {
+        return remote_block_write_batch_rdma(state, ranges, count);
+    }
+
+    // Fallback: sequential single writes via message path
+    for (uint32_t i = 0; i < count; i++) {
+        int const RET = remote_block_write_msg(state, dev, ranges[i].lba, ranges[i].block_count, ranges[i].buffer);
+        if (RET != 0) {
+            return RET;
+        }
+    }
+    return 0;
+}
+
+}  // namespace
+
+// -----------------------------------------------------------------------------
+// Streaming Bulk Transfer - large contiguous I/O via direct RDMA to/from
+// a pre-registered consumer staging buffer.  Bypasses the normal per-slot
+// SQ/CQ pipeline for transfers exceeding BLK_RING_BULK_THRESHOLD bytes.
+// -----------------------------------------------------------------------------
+
+namespace {
+
+// Bulk RDMA read: post a BULK_READ SQE, server RDMA-writes entire range into
+// consumer's staging buffer, single CQE covers the whole transfer.
+auto remote_block_bulk_read_rdma(ProxyBlockState* state, uint64_t lba, uint32_t block_count, void* buffer) -> int {
+    if (!state->active || state->rdma_zone_ptr == nullptr || !state->bulk_capable) {
+        return -1;
+    }
+    if (state->bulk_staging_buf == nullptr || state->bulk_staging_rkey == 0) {
+        return -1;
+    }
+
+    auto* ring_hdr = blk_ring_header(state->rdma_zone_ptr);
+    auto* sq = blk_sq_entries(state->rdma_zone_ptr);
+    uint32_t const BLK_SZ = ring_hdr->block_size;
+
+    // Clamp to staging buffer size; if larger, split into chunks
+    auto* dest = static_cast<uint8_t*>(buffer);
+    uint64_t remaining_lba = lba;
+    uint32_t remaining_blocks = block_count;
+
+    while (remaining_blocks > 0) {
+        uint32_t chunk_blocks = remaining_blocks;
+        uint64_t chunk_bytes = static_cast<uint64_t>(chunk_blocks) * BLK_SZ;
+        if (chunk_bytes > state->bulk_staging_size) {
+            chunk_blocks = state->bulk_staging_size / BLK_SZ;
+            chunk_bytes = static_cast<uint64_t>(chunk_blocks) * BLK_SZ;
+        }
+        if (chunk_blocks == 0) {
+            return -1;
+        }
+
+        // Invalidate RA cache (bulk bypasses it)
+        ra_invalidate(state);
+
+        // Wait for SQ space
+        while (blk_sq_full(ring_hdr)) {
+            asm volatile("pause" ::: "memory");
+            rdma_drain_cq(state);
+        }
+
+        // Allocate tag
+        int tag_id = rdma_alloc_tag(state);
+        if (tag_id < 0) {
+            rdma_drain_cq(state);
+            tag_id = rdma_alloc_tag(state);
+            if (tag_id < 0) {
+                return -1;
+            }
+        }
+        auto tag = static_cast<uint32_t>(tag_id);
+
+        // Post Bulk SQE (same binary layout as BlkSqEntry, data_slot = roce_rkey)
+        uint32_t const SQ_IDX = ring_hdr->sq_head % ring_hdr->sq_depth;
+        auto& sqe = sq[SQ_IDX];
+        sqe.tag = tag;
+        sqe.opcode = static_cast<uint8_t>(BlkOpcode::BULK_READ);
+        sqe.lba = remaining_lba;
+        sqe.block_count = chunk_blocks;
+        sqe.data_slot = state->bulk_staging_rkey;  // consumer's rkey for staging buffer
+
+        asm volatile("" ::: "memory");
+        ring_hdr->sq_head = (ring_hdr->sq_head + 1) % ring_hdr->sq_depth;
+
+        // Push SQ to server and signal
+        roce_push_sq(state);
+        rdma_signal_server(state);
+
+        // Wait for completion - server RDMA-writes data into our staging buffer
+        WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
+        uint64_t const DEADLINE = wki_now_us() + (WKI_DEV_PROXY_TIMEOUT_US * 4);  // larger timeout for bulk
+        BlkCqEntry cqe = {};
+        bool got_cqe = false;
+
+        if (state->rdma_roce) {
+            while (!got_cqe) {
+                got_cqe = rdma_wait_cqe_push(state, tag, &cqe);
+                if (got_cqe) {
+                    break;
+                }
+                if (wki_now_us() >= DEADLINE) {
+                    rdma_free_tag(state, tag);
+                    return -1;
+                }
+                asm volatile("pause" ::: "memory");
+                wki_spin_yield_channel(ch);
+            }
+        } else {
+            while (!got_cqe) {
+                got_cqe = rdma_drain_cq_for_tag(state, tag, &cqe);
+                if (got_cqe) {
+                    break;
+                }
+                if (wki_now_us() >= DEADLINE) {
+                    rdma_free_tag(state, tag);
+                    return -1;
+                }
+                asm volatile("pause" ::: "memory");
+                wki_spin_yield_channel(ch);
+            }
+        }
+
+        rdma_free_tag(state, tag);
+
+        if (cqe.status != 0) {
+            return cqe.status;
+        }
+
+        // Copy from staging buffer to caller's buffer
+        memcpy(dest, state->bulk_staging_buf, static_cast<size_t>(chunk_bytes));
+
+        dest += chunk_bytes;
+        remaining_lba += chunk_blocks;
+        remaining_blocks -= chunk_blocks;
+    }
+
+    return 0;
+}
+
+// Bulk RDMA write: copy data into staging buffer, post a BULK_WRITE SQE,
+// server RDMA-reads from staging buffer and writes to disk.
+auto remote_block_bulk_write_rdma(ProxyBlockState* state, uint64_t lba, uint32_t block_count, const void* buffer) -> int {
+    if (!state->active || state->rdma_zone_ptr == nullptr || !state->bulk_capable) {
+        return -1;
+    }
+    if (state->bulk_staging_buf == nullptr || state->bulk_staging_rkey == 0) {
+        return -1;
+    }
+
+    auto* ring_hdr = blk_ring_header(state->rdma_zone_ptr);
+    auto* sq = blk_sq_entries(state->rdma_zone_ptr);
+    uint32_t const BLK_SZ = ring_hdr->block_size;
+
+    // Invalidate RA cache - written data may overlap cached range
+    ra_invalidate(state);
+
+    const auto* src = static_cast<const uint8_t*>(buffer);
+    uint64_t remaining_lba = lba;
+    uint32_t remaining_blocks = block_count;
+
+    while (remaining_blocks > 0) {
+        uint32_t chunk_blocks = remaining_blocks;
+        uint64_t chunk_bytes = static_cast<uint64_t>(chunk_blocks) * BLK_SZ;
+        if (chunk_bytes > state->bulk_staging_size) {
+            chunk_blocks = state->bulk_staging_size / BLK_SZ;
+            chunk_bytes = static_cast<uint64_t>(chunk_blocks) * BLK_SZ;
+        }
+        if (chunk_blocks == 0) {
+            return -1;
+        }
+
+        // Copy caller data into staging buffer
+        memcpy(state->bulk_staging_buf, src, static_cast<size_t>(chunk_bytes));
+
+        // For RoCE: push staging buffer to server so it can read the data
+        if (state->rdma_roce && state->rdma_transport != nullptr) {
+            state->rdma_transport->rdma_write(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, 0, state->bulk_staging_buf,
+                                              static_cast<uint32_t>(chunk_bytes));
+        }
+
+        // Wait for SQ space
+        while (blk_sq_full(ring_hdr)) {
+            asm volatile("pause" ::: "memory");
+            rdma_drain_cq(state);
+        }
+
+        // Allocate tag
+        int tag_id = rdma_alloc_tag(state);
+        if (tag_id < 0) {
+            rdma_drain_cq(state);
+            tag_id = rdma_alloc_tag(state);
+            if (tag_id < 0) {
+                return -1;
+            }
+        }
+        auto const TAG = static_cast<uint32_t>(tag_id);
+
+        // Post Bulk SQE
+        uint32_t const SQ_IDX = ring_hdr->sq_head % ring_hdr->sq_depth;
+        auto& sqe = sq[SQ_IDX];
+        sqe.tag = TAG;
+        sqe.opcode = static_cast<uint8_t>(BlkOpcode::BULK_WRITE);
+        sqe.lba = remaining_lba;
+        sqe.block_count = chunk_blocks;
+        sqe.data_slot = state->bulk_staging_rkey;  // consumer's rkey for staging buffer
+
+        asm volatile("" ::: "memory");
+        ring_hdr->sq_head = (ring_hdr->sq_head + 1) % ring_hdr->sq_depth;
+
+        roce_push_sq(state);
+        rdma_signal_server(state);
+
+        // Wait for completion
+        WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
+        uint64_t const DEADLINE = wki_now_us() + (WKI_DEV_PROXY_TIMEOUT_US * 4);
+        BlkCqEntry cqe = {};
+        bool got_cqe = false;
+
+        while (!got_cqe) {
+            got_cqe = rdma_drain_cq_for_tag(state, TAG, &cqe);
+            if (got_cqe) {
+                break;
+            }
+            if (wki_now_us() >= DEADLINE) {
+                rdma_free_tag(state, TAG);
+                return -1;
+            }
+            asm volatile("pause" ::: "memory");
+            wki_spin_yield_channel(ch);
+        }
+
+        rdma_free_tag(state, TAG);
+
+        if (cqe.status != 0) {
+            return cqe.status;
+        }
+
+        src += chunk_bytes;
+        remaining_lba += chunk_blocks;
+        remaining_blocks -= chunk_blocks;
+    }
+
+    return 0;
+}
+
+// Dispatcher: bulk read (called from public API)
+auto remote_block_bulk_read(ker::dev::BlockDevice* dev, uint64_t lba, uint32_t block_count, void* buffer) -> int {
+    s_proxy_lock.lock();
+    auto* state = find_proxy_by_bdev(dev);
+    s_proxy_lock.unlock();
+    if (state == nullptr || !state->active) {
+        return -1;
+    }
+    if (state->fenced) {
+        if (!wait_for_fence_lift(state)) {
+            return -1;
+        }
+    }
+    if (!state->active || !state->rdma_attached || !state->bulk_capable) {
+        return -1;
+    }
+    return remote_block_bulk_read_rdma(state, lba, block_count, buffer);
+}
+
+// Dispatcher: bulk write (called from public API)
+auto remote_block_bulk_write(ker::dev::BlockDevice* dev, uint64_t lba, uint32_t block_count, const void* buffer) -> int {
+    s_proxy_lock.lock();
+    auto* state = find_proxy_by_bdev(dev);
+    s_proxy_lock.unlock();
+    if (state == nullptr || !state->active) {
+        return -1;
+    }
+    if (state->fenced) {
+        if (!wait_for_fence_lift(state)) {
+            return -1;
+        }
+    }
+    if (!state->active || !state->rdma_attached || !state->bulk_capable) {
+        return -1;
+    }
+    return remote_block_bulk_write_rdma(state, lba, block_count, buffer);
 }
 
 }  // namespace
@@ -865,8 +1541,11 @@ void wki_dev_proxy_init() {
 
 auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const char* local_name) -> ker::dev::BlockDevice* {
     // Allocate a new proxy state via unique_ptr (deque stores pointers, not objects)
+    s_proxy_lock.lock();
     g_proxies.push_back(std::make_unique<ProxyBlockState>());
     auto* state = g_proxies.back().get();
+    s_proxy_lock.unlock();
+    // Proxy pointer is stable (std::deque + unique_ptr); safe to use after unlock.
 
     state->owner_node = owner_node;
     state->resource_id = resource_id;
@@ -877,45 +1556,54 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
     attach_req.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
     attach_req.resource_id = resource_id;
     attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY);
-    attach_req.requested_channel = 0;  // auto-assign
 
-    state->attach_pending = true;
+    WkiChannel* reserved_channel = nullptr;
+    if (wki_requester_controls_dynamic_channel(g_wki.my_node_id, owner_node)) {
+        reserved_channel = wki_channel_alloc(owner_node, PriorityClass::THROUGHPUT);
+        if (reserved_channel == nullptr) {
+            s_proxy_lock.lock();
+            g_proxies.pop_back();
+            s_proxy_lock.unlock();
+            return nullptr;
+        }
+        attach_req.requested_channel = reserved_channel->channel_id;
+    } else {
+        attach_req.requested_channel = 0;
+    }
+
+    state->attach_pending.store(true, std::memory_order_release);
     state->attach_status = 0;
     state->attach_channel = 0;
 
 #ifdef DEBUG_WKI_TRANSPORT
     ker::mod::dbg::log("[WKI-DBG] attach_block: starting attach to node=0x%04x res_id=%u cpu=%u proxies=%u", owner_node, resource_id,
-                       static_cast<unsigned>(ker::mod::cpu::currentCpu()), static_cast<unsigned>(g_proxies.size()));
+                       static_cast<unsigned>(ker::mod::cpu::current_cpu()), static_cast<unsigned>(g_proxies.size()));
 #endif
 
     constexpr int MAX_ATTACH_RETRIES = 3;
     for (int retry = 0; retry < MAX_ATTACH_RETRIES; retry++) {
+        WkiWaitEntry wait = {};
+        state->attach_wait_entry = &wait;
         if (retry > 0) {
             ker::mod::dbg::log("[WKI] Dev proxy attach retry %d: node=0x%04x res_id=%u pending=%d", retry, owner_node, resource_id,
-                               state->attach_pending ? 1 : 0);
-            state->attach_pending = true;
+                               state->attach_pending.load(std::memory_order_relaxed) ? 1 : 0);
+            state->attach_pending.store(true, std::memory_order_release);
         }
 
-        int send_ret = wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_REQ, &attach_req, sizeof(attach_req));
-        if (send_ret != WKI_OK) {
+        int const SEND_RET = wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_REQ, &attach_req, sizeof(attach_req));
+        if (SEND_RET != WKI_OK) {
 #ifdef DEBUG_WKI_TRANSPORT
             ker::mod::dbg::log("[WKI-DBG] attach_block: send failed err=%d retry=%d", send_ret, retry);
 #endif
+            state->attach_wait_entry = nullptr;
             continue;  // Retry on send failure
         }
 
-        // Spin-wait for attach ACK — targeted single-channel tick
-        WkiChannel* res_ch = wki_channel_get(owner_node, WKI_CHAN_RESOURCE);
-        uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-        while (state->attach_pending) {
-            asm volatile("pause" ::: "memory");
-            if (!state->attach_pending) {
-                break;
-            }
-            if (wki_now_us() >= deadline) {
-                break;  // Timeout, try again
-            }
-            wki_spin_yield_channel(res_ch);
+        // Async wait for attach ACK
+        int const WAIT_RC = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+        state->attach_wait_entry = nullptr;
+        if (WAIT_RC == WKI_ERR_TIMEOUT) {
+            continue;  // Timeout, try again
         }
 
         if (!state->attach_pending) {
@@ -930,8 +1618,13 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
 #ifdef DEBUG_WKI_TRANSPORT
         ker::mod::dbg::log("[WKI-DBG] attach_block: TIMEOUT - setting attach_pending=false, popping proxy");
 #endif
-        state->attach_pending = false;
+        state->attach_pending.store(false, std::memory_order_relaxed);
+        if (reserved_channel != nullptr) {
+            wki_channel_close(reserved_channel);
+        }
+        s_proxy_lock.lock();
         g_proxies.pop_back();
+        s_proxy_lock.unlock();
         ker::mod::dbg::log("[WKI] Dev proxy attach timeout after %d retries: node=0x%04x res_id=%u proxies_left=%u", MAX_ATTACH_RETRIES,
                            owner_node, resource_id, static_cast<unsigned>(g_proxies.size()));
         return nullptr;
@@ -941,11 +1634,48 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
     if (state->attach_status != static_cast<uint8_t>(DevAttachStatus::OK)) {
         ker::mod::dbg::log("[WKI] Dev proxy attach rejected: node=0x%04x res_id=%u status=%u", owner_node, resource_id,
                            state->attach_status);
+        if (reserved_channel != nullptr) {
+            wki_channel_close(reserved_channel);
+        }
+        s_proxy_lock.lock();
         g_proxies.pop_back();
+        s_proxy_lock.unlock();
         return nullptr;
     }
 
-    state->assigned_channel = state->attach_channel;
+    if (reserved_channel != nullptr) {
+        if (state->attach_channel != reserved_channel->channel_id) {
+            ker::mod::dbg::log("[WKI] Dev proxy attach channel mismatch: node=0x%04x res_id=%u requested=%u assigned=%u", owner_node,
+                               resource_id, reserved_channel->channel_id, state->attach_channel);
+            DevDetachPayload det = {};
+            det.target_node = owner_node;
+            det.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
+            det.resource_id = resource_id;
+            wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+            wki_channel_close(reserved_channel);
+            s_proxy_lock.lock();
+            g_proxies.pop_back();
+            s_proxy_lock.unlock();
+            return nullptr;
+        }
+    } else {
+        reserved_channel = wki_channel_reserve(owner_node, state->attach_channel, PriorityClass::THROUGHPUT);
+        if (reserved_channel == nullptr) {
+            ker::mod::dbg::log("[WKI] Dev proxy attach local reserve failed: node=0x%04x res_id=%u ch=%u", owner_node, resource_id,
+                               state->attach_channel);
+            DevDetachPayload det = {};
+            det.target_node = owner_node;
+            det.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
+            det.resource_id = resource_id;
+            wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+            s_proxy_lock.lock();
+            g_proxies.pop_back();
+            s_proxy_lock.unlock();
+            return nullptr;
+        }
+    }
+
+    state->assigned_channel = reserved_channel->channel_id;
     state->max_op_size = state->attach_max_op_size;
 
     uint64_t block_size = 0;
@@ -955,11 +1685,11 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
     if (state->rdma_zone_id != 0) {
         mod::dbg::log("[WKI] Dev proxy attach ACK received, waiting for RDMA zone: node=0x%04x res_id=%u zone_id=0x%08x", owner_node,
                       resource_id, state->rdma_zone_id);
-        uint64_t zone_deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-        WkiZone* zone = nullptr;
+        uint64_t const ZONE_DEADLINE = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+        WkiZone const* zone = nullptr;
 
         // Wait for the RDMA zone to appear (server creates it, zone negotiation completes)
-        while (wki_now_us() < zone_deadline) {
+        while (wki_now_us() < ZONE_DEADLINE) {
             zone = wki_zone_find(state->rdma_zone_id);
             if (zone != nullptr && zone->state == ZoneState::ACTIVE) {
                 break;
@@ -983,13 +1713,14 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
             // wait for zone->remote_rkey to become non-zero before we can do any
             // RDMA operations targeting the server's zone memory.
             if (state->rdma_roce) {
-                uint64_t rkey_deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-                while (zone->remote_rkey == 0 && wki_now_us() < rkey_deadline) {
+                uint64_t const RKEY_DEADLINE = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+                while (zone->remote_rkey == 0 && wki_now_us() < RKEY_DEADLINE) {
                     asm volatile("pause" ::: "memory");
                     // Drive NIC + WKI RX so the rkey-exchange notification can be processed
                     net::NetDevice* net_dev = wki_eth_get_netdev();
                     if (net_dev != nullptr) {
-                        net::napi_poll_inline(net_dev);
+                        net::napi_poll_all_pending();
+                        net::backlog_drain_all_pending_inline();
                     }
                 }
             }
@@ -1007,8 +1738,8 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
 
             // Wait for server_ready flag in ring header
             auto* ring_hdr = blk_ring_header(state->rdma_zone_ptr);
-            uint64_t ready_deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-            while (ring_hdr->server_ready == 0 && wki_now_us() < ready_deadline) {
+            uint64_t const READY_DEADLINE = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+            while (ring_hdr->server_ready == 0 && wki_now_us() < READY_DEADLINE) {
                 asm volatile("pause" ::: "memory");
 
                 // Always poll NIC: the server pushes the ring header via
@@ -1017,10 +1748,11 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
                 // ring_hdr->server_ready is never updated locally.
                 net::NetDevice* net_dev = wki_eth_get_netdev();
                 if (net_dev != nullptr) {
-                    net::napi_poll_inline(net_dev);
+                    net::napi_poll_all_pending();
+                    net::backlog_drain_all_pending_inline();
                 }
 
-                // Also re-check rkey — the 0xFE notification may arrive
+                // Also re-check rkey - the 0xFE notification may arrive
                 // during the NIC poll above.
                 if (state->rdma_remote_rkey == 0 && zone->remote_rkey != 0) {
                     state->rdma_remote_rkey = zone->remote_rkey;
@@ -1034,18 +1766,18 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
             }
 
             if (ring_hdr->server_ready != 0) {
-                // Read device info directly from the ring header — no OP_BLOCK_INFO needed
+                // Read device info directly from the ring header - no OP_BLOCK_INFO needed
                 block_size = ring_hdr->block_size;
                 total_blocks = ring_hdr->total_blocks;
                 state->rdma_attached = true;
                 state->data_slot_bitmap = 0;
-                state->next_tag = 1;
-                for (auto& pc : state->pending_cq) {
-                    pc.valid = false;
+                state->tag_bitmap = 0;
+                for (auto& tc : state->tag_completions) {
+                    tc = {};
                 }
 
                 // Allocate read-ahead cache buffer (one data-slot's worth)
-                state->ra_buffer = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(ring_hdr->data_slot_size));
+                state->ra_buffer = new (std::nothrow) uint8_t[ring_hdr->data_slot_size];
                 if (state->ra_buffer != nullptr) {
                     state->ra_capacity = ring_hdr->data_slot_size / ring_hdr->block_size;
                 } else {
@@ -1058,7 +1790,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
                                    state->rdma_zone_id, ring_hdr->block_size, ring_hdr->total_blocks, ring_hdr->data_slot_count,
                                    state->rdma_roce ? 1 : 0, state->ra_buffer != nullptr ? "yes" : "no");
             } else {
-                ker::mod::dbg::log("[WKI] Dev proxy RDMA ring server_ready timeout — falling back to msg path");
+                ker::mod::dbg::log("[WKI] Dev proxy RDMA ring server_ready timeout - falling back to msg path");
                 state->rdma_zone_id = 0;
                 state->rdma_zone_ptr = nullptr;
                 state->rdma_roce = false;
@@ -1066,7 +1798,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
                 state->rdma_remote_rkey = 0;
             }
         } else {
-            ker::mod::dbg::log("[WKI] Dev proxy RDMA zone not found (0x%08x) — falling back to msg path", state->rdma_zone_id);
+            ker::mod::dbg::log("[WKI] Dev proxy RDMA zone not found (0x%08x) - falling back to msg path", state->rdma_zone_id);
             state->rdma_zone_id = 0;
             state->rdma_roce = false;
             state->rdma_transport = nullptr;
@@ -1081,45 +1813,48 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
         info_req.data_len = 0;
 
         std::array<uint8_t, 16> info_buf = {};
+        WkiWaitEntry wait = {};
         state->lock.lock();
-        state->op_pending = true;
+        state->op_wait_entry = &wait;
+        state->op_pending.store(true, std::memory_order_release);
         state->op_status = 0;
         state->op_resp_buf = static_cast<void*>(info_buf.data());
         state->op_resp_max = info_buf.size();
         state->op_resp_len = 0;
         state->lock.unlock();
 
-        int send_ret = wki_send(owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, &info_req, sizeof(info_req));
-        if (send_ret != WKI_OK) {
+        int const SEND_RET = wki_send(owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, &info_req, sizeof(info_req));
+        if (SEND_RET != WKI_OK) {
+            state->op_wait_entry = nullptr;
+            state->op_pending.store(false, std::memory_order_relaxed);
             mod::dbg::log("[WKI] Dev proxy block info request send failed: node=0x%04x res_id=%u err=%d", owner_node, resource_id,
-                          send_ret);
+                          SEND_RET);
             DevDetachPayload det = {};
             det.target_node = owner_node;
             det.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
             det.resource_id = resource_id;
             wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+            s_proxy_lock.lock();
             g_proxies.pop_back();
+            s_proxy_lock.unlock();
             return nullptr;
         }
 
-        WkiChannel* info_ch = wki_channel_get(owner_node, state->assigned_channel);
-        uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-        while (state->op_pending) {
-            asm volatile("pause" ::: "memory");
-            if (!state->op_pending) {
-                break;
-            }
-            if (wki_now_us() >= deadline) {
-                mod::dbg::log("[WKI] Dev proxy block info request timeout: node=0x%04x res_id=%u", owner_node, resource_id);
-                state->op_pending = false;
-                g_proxies.pop_back();
-                return nullptr;
-            }
-            wki_spin_yield_channel(info_ch);
+        int const WAIT_RC = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+        state->op_wait_entry = nullptr;
+        if (WAIT_RC == WKI_ERR_TIMEOUT) {
+            state->op_pending.store(false, std::memory_order_relaxed);
+            mod::dbg::log("[WKI] Dev proxy block info request timeout: node=0x%04x res_id=%u", owner_node, resource_id);
+            s_proxy_lock.lock();
+            g_proxies.pop_back();
+            s_proxy_lock.unlock();
+            return nullptr;
         }
 
         if (state->op_status != 0 || state->op_resp_len < 16) {
+            s_proxy_lock.lock();
             g_proxies.pop_back();
+            s_proxy_lock.unlock();
             return nullptr;
         }
 
@@ -1136,7 +1871,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
             name_len = ker::dev::BLOCK_NAME_SIZE - 1;
         }
         memcpy(state->bdev.name.data(), local_name, name_len);
-        state->bdev.name[name_len] = '\0';
+        state->bdev.name.at(name_len) = '\0';
     }
     state->bdev.block_size = static_cast<size_t>(block_size);
     state->bdev.total_blocks = total_blocks;
@@ -1144,6 +1879,36 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
     state->bdev.write_blocks = remote_block_write;
     state->bdev.flush = remote_block_flush;
     state->bdev.private_data = state;
+
+    // Set up streaming bulk transfer if server advertised support
+    if (state->rdma_attached && state->bulk_capable && state->rdma_transport != nullptr &&
+        state->rdma_transport->rdma_register_region != nullptr) {
+        // Default bulk staging buffer: 2 MB (clamped to advertised max)
+        constexpr uint32_t DEFAULT_BULK_STAGING = 2 * 1024 * 1024;
+        uint32_t const STAGING_SZ = (state->bulk_max_transfer > 0 && state->bulk_max_transfer < DEFAULT_BULK_STAGING)
+                                        ? state->bulk_max_transfer
+                                        : DEFAULT_BULK_STAGING;
+        state->bulk_staging_buf = new (std::nothrow) uint8_t[STAGING_SZ];
+        if (state->bulk_staging_buf != nullptr) {
+            uint32_t rkey = 0;
+            int const REG_RET = state->rdma_transport->rdma_register_region(
+                state->rdma_transport, reinterpret_cast<uint64_t>(state->bulk_staging_buf), STAGING_SZ, &rkey);
+            if (REG_RET == 0) {
+                state->bulk_staging_size = STAGING_SZ;
+                state->bulk_staging_rkey = rkey;
+                state->bdev.capabilities |= ker::dev::BDEV_CAP_BULK_RDMA;
+                ker::mod::dbg::log("[WKI] Dev proxy bulk staging registered: size=%uKB rkey=0x%08x", STAGING_SZ / 1024, rkey);
+            } else {
+                delete[] state->bulk_staging_buf;
+                state->bulk_staging_buf = nullptr;
+                state->bulk_capable = false;
+                ker::mod::dbg::log("[WKI] Dev proxy bulk staging register failed: err=%d", REG_RET);
+            }
+        } else {
+            state->bulk_capable = false;
+        }
+    }
+
     state->active = true;
 
     // Check for naming collision before registering
@@ -1155,7 +1920,9 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
         det.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
         det.resource_id = resource_id;
         wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+        s_proxy_lock.lock();
         g_proxies.pop_back();
+        s_proxy_lock.unlock();
         return nullptr;
     }
 
@@ -1169,21 +1936,33 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
 }
 
 void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev) {
+    // Lock to find proxy and copy info needed for cleanup outside the lock.
+    s_proxy_lock.lock();
     auto* state = find_proxy_by_bdev(proxy_bdev);
     if (state == nullptr) {
+        s_proxy_lock.unlock();
         return;
     }
 
-    // Free read-ahead cache
-    if (state->ra_buffer != nullptr) {
-        ker::mod::mm::dyn::kmalloc::free(state->ra_buffer);
-        state->ra_buffer = nullptr;
-    }
-    ra_invalidate(state);
+    // Copy info for cleanup outside the lock
+    uint16_t const OWNER_NODE = state->owner_node;
+    uint32_t const RESOURCE_ID = state->resource_id;
+    uint16_t const ASSIGNED_CHANNEL = state->assigned_channel;
+    bool const HAD_RDMA = state->rdma_attached;
+    uint32_t const RDMA_ZONE_ID = state->rdma_zone_id;
+    uint8_t const* ra_buf = state->ra_buffer;
+    uint8_t const* bulk_buf = state->bulk_staging_buf;
 
-    // Destroy RDMA zone before sending detach
-    if (state->rdma_attached && state->rdma_zone_id != 0) {
-        wki_zone_destroy(state->rdma_zone_id);
+    // Neutralise proxy under lock so no other thread picks it up
+    state->ra_buffer = nullptr;
+    state->bulk_staging_buf = nullptr;
+    state->bulk_capable = false;
+    state->bulk_staging_rkey = 0;
+    state->bulk_staging_size = 0;
+    state->bulk_max_transfer = 0;
+    ra_invalidate(state);
+    state->active = false;
+    if (HAD_RDMA) {
         state->rdma_attached = false;
         state->rdma_zone_ptr = nullptr;
         state->rdma_zone_id = 0;
@@ -1191,28 +1970,43 @@ void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev) {
         state->rdma_transport = nullptr;
         state->rdma_remote_rkey = 0;
     }
+    s_proxy_lock.unlock();
+
+    // --- Cleanup outside lock (no blocking operations while holding spinlock) ---
+
+    // Free read-ahead cache
+
+    delete[] ra_buf;
+
+    // Free bulk staging buffer
+
+    delete[] bulk_buf;
+
+    // Destroy RDMA zone before sending detach
+    if (HAD_RDMA && RDMA_ZONE_ID != 0) {
+        wki_zone_destroy(RDMA_ZONE_ID);
+    }
 
     // Unregister from block device subsystem
-    ker::dev::block_device_unregister(&state->bdev);
+    ker::dev::block_device_unregister(proxy_bdev);
 
     // Send DEV_DETACH to owner
     DevDetachPayload det = {};
-    det.target_node = state->owner_node;
+    det.target_node = OWNER_NODE;
     det.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
-    det.resource_id = state->resource_id;
-    wki_send(state->owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+    det.resource_id = RESOURCE_ID;
+    wki_send(OWNER_NODE, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
 
     // Close the dynamic channel
-    WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
+    WkiChannel* ch = wki_channel_get(OWNER_NODE, ASSIGNED_CHANNEL);
     if (ch != nullptr) {
         wki_channel_close(ch);
     }
 
-    ker::mod::dbg::log("[WKI] Dev proxy detached: %s", state->bdev.name.data());
+    ker::mod::dbg::log("[WKI] Dev proxy detached: node=0x%04x res=%u ch=%u", OWNER_NODE, RESOURCE_ID, ASSIGNED_CHANNEL);
 
-    state->active = false;
-
-    // Remove inactive entries
+    // Remove inactive entries under lock
+    s_proxy_lock.lock();
     for (auto it = g_proxies.begin(); it != g_proxies.end();) {
         if (!(*it)->active) {
             it = g_proxies.erase(it);
@@ -1220,35 +2014,58 @@ void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev) {
             ++it;
         }
     }
+    s_proxy_lock.unlock();
 }
 
 // -----------------------------------------------------------------------------
-// Fencing — suspend / resume / hard teardown
+// Fencing - suspend / resume / hard teardown
 // -----------------------------------------------------------------------------
 
 void wki_dev_proxy_suspend_for_peer(uint16_t node_id) {
-    uint64_t now = wki_now_us();
+    uint64_t const NOW = wki_now_us();
+
+    // Info collected under lock for cleanup outside
+    struct PendingCleanup {
+        uint16_t owner_node;
+        uint16_t channel;
+        uint8_t* ra_buf;
+    };
+    std::array<PendingCleanup, MAX_PROXY_SCRATCH> cleanup = {};
+    size_t cleanup_count = 0;
+
+    s_proxy_lock.lock();
     for (auto& p : g_proxies) {
         if (!p->active || p->owner_node != node_id) {
             continue;
         }
 
-        // Fail any in-flight operation so the spin-wait unblocks,
-        // but keep the proxy registered — callers will see fenced==true
+        // Fail any in-flight operation so the waiter unblocks,
+        // but keep the proxy registered - callers will see fenced==true
         // on retry and block in wait_for_fence_lift().
         if (p->op_pending) {
             p->op_status = -1;
-            p->op_pending = false;
+            p->op_pending.store(false, std::memory_order_release);
+            if (p->op_wait_entry != nullptr) {
+                wki_wake_op(p->op_wait_entry, -1);
+            }
+            if (p->attach_wait_entry != nullptr) {
+                wki_wake_op(p->attach_wait_entry, -1);
+            }
         }
 
-        // Free read-ahead cache
-        if (p->ra_buffer != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(p->ra_buffer);
-            p->ra_buffer = nullptr;
+        // Save RA buffer + channel info for cleanup outside lock
+        if (cleanup_count < cleanup.size()) {
+            auto& entry = cleanup.at(cleanup_count);
+            entry.owner_node = p->owner_node;
+            entry.channel = p->assigned_channel;
+            entry.ra_buf = p->ra_buffer;
+            cleanup_count++;
         }
+
+        p->ra_buffer = nullptr;
         ra_invalidate(p.get());
 
-        // Clear RDMA state — zone will be destroyed by wki_zones_destroy_for_peer()
+        // Clear RDMA state - zone will be destroyed by wki_zones_destroy_for_peer()
         if (p->rdma_attached) {
             p->rdma_attached = false;
             p->rdma_zone_ptr = nullptr;
@@ -1259,23 +2076,46 @@ void wki_dev_proxy_suspend_for_peer(uint16_t node_id) {
             p->rdma_remote_rkey = 0;
         }
 
-        // Close the dynamic channel (stale seq/ack state)
-        WkiChannel* ch = wki_channel_get(p->owner_node, p->assigned_channel);
+        p->fenced = true;
+        p->fence_time_us = NOW;
+
+        ker::mod::dbg::log("[WKI] Dev proxy suspended (fenced): %s node=0x%04x - I/O will block until reconnect or %llu s timeout",
+                           p->bdev.name.data(), node_id, WKI_DEV_PROXY_FENCE_WAIT_US / 1000000ULL);
+    }
+    s_proxy_lock.unlock();
+
+    // Free RA buffers and close channels outside lock
+    for (size_t i = 0; i < cleanup_count; i++) {
+        auto const& entry = cleanup.at(i);
+        delete[] entry.ra_buf;
+
+        WkiChannel* ch = wki_channel_get(entry.owner_node, entry.channel);
         if (ch != nullptr) {
             wki_channel_close(ch);
         }
-
-        p->fenced = true;
-        p->fence_time_us = now;
-
-        ker::mod::dbg::log("[WKI] Dev proxy suspended (fenced): %s node=0x%04x — I/O will block until reconnect or %llu s timeout",
-                           p->bdev.name.data(), node_id, WKI_DEV_PROXY_FENCE_WAIT_US / 1000000ULL);
     }
 }
 
 void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
+    // Collect matching proxies under lock (deque pointer stability guarantees
+    // the raw pointers remain valid after unlock as long as no erase occurs;
+    // erases only happen in detach/cleanup paths which mark active=false first).
+    std::array<ProxyBlockState*, MAX_PROXY_SCRATCH> to_resume = {};
+    size_t resume_count = 0;
+
+    s_proxy_lock.lock();
     for (auto& p : g_proxies) {
-        if (!p->active || !p->fenced || p->owner_node != node_id) {
+        if (p->active && p->fenced && p->owner_node == node_id && resume_count < to_resume.size()) {
+            to_resume.at(resume_count++) = p.get();
+        }
+    }
+    s_proxy_lock.unlock();
+
+    for (size_t ri = 0; ri < resume_count; ri++) {
+        auto* p = to_resume.at(ri);
+
+        // Re-check validity (another thread may have detached this proxy)
+        if (!p->active || !p->fenced) {
             continue;
         }
 
@@ -1287,33 +2127,29 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
         attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY);
         attach_req.requested_channel = 0;  // auto-assign
 
-        p->attach_pending = true;
+        p->attach_pending.store(true, std::memory_order_release);
         p->attach_status = 0;
         p->attach_channel = 0;
 
         constexpr int MAX_RESUME_RETRIES = 5;
         bool attached = false;
         for (int retry = 0; retry < MAX_RESUME_RETRIES; retry++) {
+            WkiWaitEntry wait = {};
+            p->attach_wait_entry = &wait;
             if (retry > 0) {
-                p->attach_pending = true;
+                p->attach_pending.store(true, std::memory_order_release);
             }
 
-            int send_ret = wki_send(node_id, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_REQ, &attach_req, sizeof(attach_req));
-            if (send_ret != WKI_OK) {
+            int const SEND_RET = wki_send(node_id, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_REQ, &attach_req, sizeof(attach_req));
+            if (SEND_RET != WKI_OK) {
+                p->attach_wait_entry = nullptr;
                 continue;
             }
 
-            WkiChannel* res_ch = wki_channel_get(node_id, WKI_CHAN_RESOURCE);
-            uint64_t deadline = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
-            while (p->attach_pending) {
-                asm volatile("pause" ::: "memory");
-                if (!p->attach_pending) {
-                    break;
-                }
-                if (wki_now_us() >= deadline) {
-                    break;
-                }
-                wki_spin_yield_channel(res_ch);
+            int const WAIT_RC = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+            p->attach_wait_entry = nullptr;
+            if (WAIT_RC == WKI_ERR_TIMEOUT) {
+                continue;
             }
 
             if (!p->attach_pending && p->attach_status == static_cast<uint8_t>(DevAttachStatus::OK)) {
@@ -1323,19 +2159,22 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
         }
 
         if (!attached) {
-            ker::mod::dbg::log("[WKI] Dev proxy resume FAILED (re-attach): %s node=0x%04x — will hard-detach", p->bdev.name.data(),
+            ker::mod::dbg::log("[WKI] Dev proxy resume FAILED (re-attach): %s node=0x%04x - will hard-detach", p->bdev.name.data(),
                                node_id);
-            p->attach_pending = false;
+            p->attach_pending.store(false, std::memory_order_relaxed);
             // Leave fenced=true; the fence_timeout_tick will clean it up
             continue;
         }
 
+        // Lock briefly to set channel / fenced fields
+        s_proxy_lock.lock();
         p->assigned_channel = p->attach_channel;
         p->max_op_size = p->attach_max_op_size;
+        s_proxy_lock.unlock();
 
-        // Re-attach RDMA zone if the new attach ACK provided one
+        // Re-attach RDMA zone if the new attach ACK provided one (RDMA ops outside lock)
         if (p->rdma_zone_id != 0 && !p->rdma_attached) {
-            WkiZone* zone = wki_zone_find(p->rdma_zone_id);
+            WkiZone const* zone = wki_zone_find(p->rdma_zone_id);
             if (zone != nullptr && zone->state == ZoneState::ACTIVE) {
                 p->rdma_zone_ptr = zone->local_vaddr;
                 p->rdma_roce = zone->is_roce;
@@ -1352,19 +2191,19 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
                 if (ring_hdr->server_ready != 0) {
                     p->rdma_attached = true;
                     p->data_slot_bitmap = 0;
-                    p->next_tag = 1;
-                    for (auto& pc : p->pending_cq) {
-                        pc.valid = false;
+                    p->tag_bitmap = 0;
+                    for (auto& tc : p->tag_completions) {
+                        tc = {};
                     }
 
                     // Re-allocate read-ahead cache if needed
                     if (p->ra_buffer == nullptr) {
-                        p->ra_buffer = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(ring_hdr->data_slot_size));
+                        p->ra_buffer = new (std::nothrow) uint8_t[ring_hdr->data_slot_size];
                         if (p->ra_buffer != nullptr) {
                             p->ra_capacity = ring_hdr->data_slot_size / ring_hdr->block_size;
                         }
                     }
-                    ra_invalidate(p.get());
+                    ra_invalidate(p);
 
                     ker::mod::dbg::log("[WKI] Dev proxy RDMA ring re-attached on resume: zone=0x%08x roce=%d", p->rdma_zone_id,
                                        p->rdma_roce ? 1 : 0);
@@ -1372,15 +2211,30 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
             }
         }
 
+        s_proxy_lock.lock();
         p->fenced = false;
         p->fence_time_us = 0;
+        s_proxy_lock.unlock();
 
-        ker::mod::dbg::log("[WKI] Dev proxy resumed: %s node=0x%04x ch=%u — blocked I/O will now proceed", p->bdev.name.data(), node_id,
+        ker::mod::dbg::log("[WKI] Dev proxy resumed: %s node=0x%04x ch=%u - blocked I/O will now proceed", p->bdev.name.data(), node_id,
                            p->assigned_channel);
     }
 }
 
 void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
+    // Info collected under lock for cleanup outside
+    struct DetachInfo {
+        uint8_t* ra_buf;
+        uint32_t rdma_zone_id;
+        uint16_t owner_node;
+        uint16_t channel;
+        ker::dev::BlockDevice* bdev;
+    };
+    std::array<DetachInfo, MAX_PROXY_SCRATCH> info = {};
+    size_t info_count = 0;
+
+    // Lock to iterate, collect info, and mark inactive
+    s_proxy_lock.lock();
     for (auto& p : g_proxies) {
         if (!p->active || p->owner_node != node_id) {
             continue;
@@ -1389,19 +2243,30 @@ void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
         // Fail any pending operation
         if (p->op_pending) {
             p->op_status = -1;
-            p->op_pending = false;
+            p->op_pending.store(false, std::memory_order_release);
+            if (p->op_wait_entry != nullptr) {
+                wki_wake_op(p->op_wait_entry, -1);
+            }
+            if (p->attach_wait_entry != nullptr) {
+                wki_wake_op(p->attach_wait_entry, -1);
+            }
         }
 
-        // Free read-ahead cache
-        if (p->ra_buffer != nullptr) {
-            ker::mod::mm::dyn::kmalloc::free(p->ra_buffer);
-            p->ra_buffer = nullptr;
+        // Collect info for cleanup outside lock
+        if (info_count < info.size()) {
+            auto& entry = info.at(info_count);
+            entry.ra_buf = p->ra_buffer;
+            entry.rdma_zone_id = p->rdma_zone_id;
+            entry.owner_node = p->owner_node;
+            entry.channel = p->assigned_channel;
+            entry.bdev = &p->bdev;
+            info_count++;
         }
+
+        // Neutralise fields under lock
+        p->ra_buffer = nullptr;
         ra_invalidate(p.get());
-
-        // Destroy RDMA zone
         if (p->rdma_zone_id != 0) {
-            wki_zone_destroy(p->rdma_zone_id);
             p->rdma_attached = false;
             p->rdma_zone_ptr = nullptr;
             p->rdma_zone_id = 0;
@@ -1410,22 +2275,29 @@ void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
             p->rdma_remote_rkey = 0;
         }
 
-        // Close the dynamic channel
-        WkiChannel* ch = wki_channel_get(p->owner_node, p->assigned_channel);
-        if (ch != nullptr) {
-            wki_channel_close(ch);
-        }
-
-        // Unregister from block device subsystem
-        ker::dev::block_device_unregister(&p->bdev);
-
-        ker::mod::dbg::log("[WKI] Dev proxy hard-detached: %s node=0x%04x", p->bdev.name.data(), node_id);
-
         p->fenced = false;
         p->active = false;
     }
+    s_proxy_lock.unlock();
 
-    // Remove inactive entries
+    // Cleanup outside lock: unregister + close channels + free RA + destroy zones
+    for (size_t i = 0; i < info_count; i++) {
+        auto const& entry = info.at(i);
+        delete[] entry.ra_buf;
+
+        if (entry.rdma_zone_id != 0) {
+            wki_zone_destroy(entry.rdma_zone_id);
+        }
+        WkiChannel* ch = wki_channel_get(entry.owner_node, entry.channel);
+        if (ch != nullptr) {
+            wki_channel_close(ch);
+        }
+        ker::dev::block_device_unregister(entry.bdev);
+        ker::mod::dbg::log("[WKI] Dev proxy hard-detached: node=0x%04x ch=%u", entry.owner_node, entry.channel);
+    }
+
+    // Remove inactive entries under lock
+    s_proxy_lock.lock();
     for (auto it = g_proxies.begin(); it != g_proxies.end();) {
         if (!(*it)->active) {
             it = g_proxies.erase(it);
@@ -1433,45 +2305,101 @@ void wki_dev_proxy_detach_all_for_peer(uint16_t node_id) {
             ++it;
         }
     }
+    s_proxy_lock.unlock();
 }
 
 void wki_dev_proxy_fence_timeout_tick(uint64_t now_us) {
+    // Collect timed-out proxies under lock, mark inactive, then unregister outside.
+    struct TimedOutInfo {
+        ProxyBlockState* state;
+        uint64_t elapsed;
+    };
+    std::array<TimedOutInfo, MAX_PROXY_SCRATCH> timed_out = {};
+    size_t to_count = 0;
+
+    s_proxy_lock.lock();
     for (auto& p : g_proxies) {
         if (!p->active || !p->fenced) {
             continue;
         }
 
-        // Guard against unsigned underflow from TSC skew between CPUs —
+        // Guard against unsigned underflow from TSC skew between CPUs -
         // fence_time_us may have been stamped on a different core whose
         // TSC is slightly ahead of ours.
         if (p->fence_time_us == 0 || now_us < p->fence_time_us) {
             continue;
         }
 
-        uint64_t elapsed = now_us - p->fence_time_us;
-        if (elapsed >= WKI_DEV_PROXY_FENCE_WAIT_US) {
-            ker::mod::dbg::log("[WKI] Dev proxy fence timeout (%llu s): %s node=0x%04x — tearing down", elapsed / 1000000ULL,
-                               p->bdev.name.data(), p->owner_node);
-
-            // 1. Unregister from block device subsystem — prevents new I/O
-            ker::dev::block_device_unregister(&p->bdev);
-
-            // 2. Mark inactive FIRST so that wait_for_fence_lift() returns
-            //    false.  Leave fenced=true so spinning I/O threads stay in
-            //    the wait loop until they check active and bail out.
-            //    Memory barrier ensures the active=false store is visible to
-            //    other CPUs before we continue.
+        uint64_t const ELAPSED = now_us - p->fence_time_us;
+        if (ELAPSED >= WKI_DEV_PROXY_FENCE_WAIT_US) {
+            // Mark inactive FIRST so that wait_for_fence_lift() returns
+            // false.  Leave fenced=true so spinning I/O threads stay in
+            // the wait loop until they check active and bail out.
+            // Memory barrier ensures the active=false store is visible to
+            // other CPUs before we continue.
             p->active = false;
             asm volatile("mfence" ::: "memory");
 
-            // Do NOT erase the proxy from g_proxies here — I/O threads on
-            // other CPUs may still hold a raw ProxyBlockState* pointer from
-            // find_proxy_by_bdev().  Freeing the memory would cause a
-            // use-after-free.  The dead entry is harmless: find_proxy_by_bdev
-            // checks active, and all other g_proxies iterators skip inactive
-            // entries.
+            if (to_count < timed_out.size()) {
+                auto& entry = timed_out.at(to_count);
+                entry.state = p.get();
+                entry.elapsed = ELAPSED;
+                to_count++;
+            }
         }
     }
+    s_proxy_lock.unlock();
+
+    // Unregister block devices outside lock (pointer still valid - no erase).
+    // Do NOT erase the proxy from g_proxies here - I/O threads on
+    // other CPUs may still hold a raw ProxyBlockState* pointer from
+    // find_proxy_by_bdev().  Freeing the memory would cause a
+    // use-after-free.  The dead entry is harmless: find_proxy_by_bdev
+    // checks active, and all other g_proxies iterators skip inactive
+    // entries.
+    for (size_t i = 0; i < to_count; i++) {
+        auto const& entry = timed_out.at(i);
+        auto* st = entry.state;
+        ker::mod::dbg::log("[WKI] Dev proxy fence timeout (%llu s): %s node=0x%04x - tearing down", entry.elapsed / 1000000ULL,
+                           st->bdev.name.data(), st->owner_node);
+        ker::dev::block_device_unregister(&st->bdev);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Batch I/O - public API
+// -----------------------------------------------------------------------------
+
+auto wki_dev_proxy_batch_read(ker::dev::BlockDevice* bdev, const BlockRange* ranges, uint32_t count) -> int {
+    if (bdev == nullptr || ranges == nullptr || count == 0) {
+        return -1;
+    }
+    return remote_block_read_batch(bdev, ranges, count);
+}
+
+auto wki_dev_proxy_batch_write(ker::dev::BlockDevice* bdev, const BlockRange* ranges, uint32_t count) -> int {
+    if (bdev == nullptr || ranges == nullptr || count == 0) {
+        return -1;
+    }
+    return remote_block_write_batch(bdev, ranges, count);
+}
+
+// -----------------------------------------------------------------------------
+// Streaming Bulk Transfer - public API
+// -----------------------------------------------------------------------------
+
+auto wki_dev_proxy_bulk_read(ker::dev::BlockDevice* bdev, uint64_t lba, uint32_t block_count, void* buffer) -> int {
+    if (bdev == nullptr || buffer == nullptr || block_count == 0) {
+        return -1;
+    }
+    return remote_block_bulk_read(bdev, lba, block_count, buffer);
+}
+
+auto wki_dev_proxy_bulk_write(ker::dev::BlockDevice* bdev, uint64_t lba, uint32_t block_count, const void* buffer) -> int {
+    if (bdev == nullptr || buffer == nullptr || block_count == 0) {
+        return -1;
+    }
+    return remote_block_bulk_write(bdev, lba, block_count, buffer);
 }
 
 // -----------------------------------------------------------------------------
@@ -1501,17 +2429,17 @@ void handle_dev_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
 
     // Find the pending attach for this owner node
     ker::mod::dbg::log("[WKI-DBG] handle_dev_attach_ack: searching %u proxies for node 0x%04x (cpu=%u)",
-                       static_cast<unsigned>(g_proxies.size()), hdr->src_node, static_cast<unsigned>(ker::mod::cpu::currentCpu()));
+                       static_cast<unsigned>(g_proxies.size()), hdr->src_node, static_cast<unsigned>(ker::mod::cpu::current_cpu()));
     for (size_t i = 0; i < g_proxies.size(); i++) {
         auto& p = g_proxies[i];
         ker::mod::dbg::log("[WKI-DBG]   proxy[%u]: owner=0x%04x attach_pending=%d active=%d", static_cast<unsigned>(i), p->owner_node,
                            p->attach_pending ? 1 : 0, p->active ? 1 : 0);
     }
 #endif
-    ProxyBlockState* state = find_proxy_by_attach(hdr->src_node);
+    ProxyBlockState* state = find_proxy_by_attach(hdr->src_node, ack->resource_id);
     if (state == nullptr) {
 #ifdef DEBUG_WKI_TRANSPORT
-        ker::mod::dbg::log("[WKI-DBG] handle_dev_attach_ack: NO proxy found for node 0x%04x", hdr->src_node);
+        ker::mod::dbg::log("[WKI-DBG] handle_dev_attach_ack: NO proxy found for node 0x%04x res_id=%u", hdr->src_node, ack->resource_id);
 #endif
         return;
     }
@@ -1532,9 +2460,21 @@ void handle_dev_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
 #endif
     }
 
-    // Release the spin-wait
-    asm volatile("" ::: "memory");
-    state->attach_pending = false;
+    // Check for bulk RDMA transfer support
+    if (payload_len >= sizeof(DevAttachAckPayload) && (ack->rdma_flags & DEV_ATTACH_RDMA_BULK) != 0) {
+        state->bulk_capable = true;
+        // Default max transfer size if not explicitly negotiated (2 MB)
+        state->bulk_max_transfer = 2 * 1024 * 1024;
+#ifdef DEBUG_WKI_TRANSPORT
+        ker::mod::dbg::log("[WKI-DBG] handle_dev_attach_ack: bulk transfer supported, max=%u", state->bulk_max_transfer);
+#endif
+    }
+
+    // Release the waiter
+    state->attach_pending.store(false, std::memory_order_release);
+    if (state->attach_wait_entry != nullptr) {
+        wki_wake_op(state->attach_wait_entry, 0);
+    }
 }
 
 void handle_dev_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
@@ -1544,10 +2484,10 @@ void handle_dev_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 
     const auto* resp = reinterpret_cast<const DevOpRespPayload*>(payload);
     const uint8_t* resp_data = payload + sizeof(DevOpRespPayload);
-    uint16_t resp_data_len = resp->data_len;
+    uint16_t const RESP_DATA_LEN = resp->data_len;
 
     // Verify data fits
-    if (sizeof(DevOpRespPayload) + resp_data_len > payload_len) {
+    if (sizeof(DevOpRespPayload) + RESP_DATA_LEN > payload_len) {
         return;
     }
 
@@ -1561,19 +2501,21 @@ void handle_dev_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     state->op_status = resp->status;
 
     // Copy response data if there's a destination buffer
-    if (resp_data_len > 0 && state->op_resp_buf != nullptr) {
-        uint16_t copy_len = (resp_data_len > state->op_resp_max) ? state->op_resp_max : resp_data_len;
-        memcpy(state->op_resp_buf, resp_data, copy_len);
-        state->op_resp_len = copy_len;
+    if (RESP_DATA_LEN > 0 && state->op_resp_buf != nullptr) {
+        uint16_t const COPY_LEN = (RESP_DATA_LEN > state->op_resp_max) ? state->op_resp_max : RESP_DATA_LEN;
+        memcpy(state->op_resp_buf, resp_data, COPY_LEN);
+        state->op_resp_len = COPY_LEN;
     } else {
         state->op_resp_len = 0;
     }
 
     state->lock.unlock();
 
-    // Release the spin-wait
-    asm volatile("" ::: "memory");
-    state->op_pending = false;
+    // Release the waiter
+    state->op_pending.store(false, std::memory_order_release);
+    if (state->op_wait_entry != nullptr) {
+        wki_wake_op(state->op_wait_entry, 0);
+    }
 }
 
 }  // namespace detail

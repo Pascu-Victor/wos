@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <net/address.hpp>
 
 namespace ker::net {
 
@@ -15,15 +16,37 @@ constexpr size_t PKT_HEADROOM = 128;    // room for VirtIO + Ethernet + headroom
 constexpr size_t PKT_POOL_MIN_SIZE = 1024;
 // Buffers to allocate per NIC (RX ring + TX ring + headroom)
 constexpr size_t PKT_POOL_PER_NIC = 1024;
+// Runtime expansion granularity. Rounded to keep slab counts close to ring sizes.
+constexpr size_t PKT_POOL_GROW_CHUNK = 256;
+
+struct PacketPoolSnapshot {
+    size_t capacity = 0;
+    size_t free = 0;
+    size_t used = 0;
+    size_t rx_reserve = 0;
+    size_t grow_chunk = 0;
+    size_t buffer_size = 0;
+    size_t headroom = 0;
+    uint32_t tx_refused = 0;
+    bool expand_in_progress = false;
+};
 
 struct PacketBuffer {
-    std::array<uint8_t, PKT_BUF_SIZE> storage;
-    uint8_t* data;                   // current data pointer
-    size_t len;                      // current data length
-    PacketBuffer* next;              // freelist / queue linkage
-    NetDevice* dev;                  // source/dest device
-    uint16_t protocol;               // EtherType (host byte order)
-    std::array<uint8_t, 6> src_mac;  // incoming source MAC (for reply use)
+    std::array<uint8_t, PKT_BUF_SIZE> storage{};
+    uint8_t* data{};            // current data pointer
+    size_t len{};               // current data length
+    PacketBuffer* next{};       // freelist / queue linkage
+    NetDevice* dev{};           // source/dest device
+    uint16_t protocol{};        // EtherType (host byte order)
+    proto::MacAddress src_mac;  // incoming source MAC (for reply use)
+#ifdef WOS_NET_PACKET_DEBUG
+    bool debug_in_use = false;
+    uint16_t debug_alloc_cpu = 0;
+    uint16_t debug_free_cpu = 0;
+    uint32_t debug_alloc_seq = 0;
+    uintptr_t debug_alloc_site = 0;
+    uintptr_t debug_free_site = 0;
+#endif
 
     // Prepend: move data pointer back by n bytes, increase length
     auto push(size_t n) -> uint8_t* {
@@ -55,6 +78,8 @@ void pkt_pool_init();
 void pkt_pool_expand_for_nics();       // Call after NIC drivers have registered
 auto pkt_pool_size() -> size_t;        // Get current pool size
 auto pkt_pool_free_count() -> size_t;  // Approximate free buffers available
+auto pkt_pool_snapshot() -> PacketPoolSnapshot;
+void pkt_pool_ensure_free(size_t min_free);
 auto pkt_alloc() -> PacketBuffer*;
 auto pkt_alloc_tx() -> PacketBuffer*;  // TX-only: fails if pool is low (reserves for RX)
 void pkt_free(PacketBuffer* pkt);

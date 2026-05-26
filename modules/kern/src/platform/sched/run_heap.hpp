@@ -1,21 +1,24 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 namespace ker::mod::sched {
 
 namespace task {
-struct Task;  // Forward declaration — full definition in task.hpp
+struct Task;  // Forward declaration - full definition in task.hpp
 }
 
 // Fixed-capacity binary min-heap of Task*, keyed on Task::vdeadline.
-// Zero allocations — the array is inline in the struct.
+// Zero allocations - the array is inline in the struct.
 // Each Task stores its heapIndex for O(log n) removal without scanning.
 static constexpr uint32_t PER_CPU_HEAP_CAP = 8192;
 
 struct RunHeap {
-    task::Task* entries[PER_CPU_HEAP_CAP];
-    uint32_t size;
+    using EntryStorage = std::array<task::Task*, PER_CPU_HEAP_CAP>;
+
+    EntryStorage entries{};
+    uint32_t size{};
 
     void init();
 
@@ -27,7 +30,7 @@ struct RunHeap {
     // Eligible = (avgVruntime - task.vruntime) >= 0.
     // Does NOT remove it from the heap.
     // Returns nullptr if heap is empty.
-    task::Task* pickBestEligible(int64_t avgVruntime);
+    auto pick_best_eligible(int64_t avg_vruntime) -> task::Task*;
 
     // Remove a specific task using its heapIndex. O(log n).
     // Returns false if task is not in this heap.
@@ -37,23 +40,25 @@ struct RunHeap {
     void update(task::Task* t);
 
     // Peek at the task with the smallest vdeadline. O(1).
-    task::Task* peekMin() const;
+    [[nodiscard]] task::Task* peek_min() const;
 
     // Check if task is in this heap.
     bool contains(task::Task* t) const;
 
    private:
-    void siftUp(uint32_t idx);
-    void siftDown(uint32_t idx);
-    void swapEntries(uint32_t i, uint32_t j);
+    void sift_up(uint32_t idx);
+    void sift_down(uint32_t idx);
+    void swap_entries(uint32_t i, uint32_t j);
 };
 
+static_assert(sizeof(RunHeap::EntryStorage) == sizeof(task::Task*) * PER_CPU_HEAP_CAP, "RunHeap storage must stay pointer-dense");
+
 // Intrusive singly-linked list for wait queue and dead list.
-// Uses Task::schedNext pointer — zero allocations.
+// Uses Task::schedNext pointer - zero allocations.
 // No ordering, just a bag of parked tasks.
 struct IntrusiveTaskList {
-    task::Task* head;
-    uint32_t count;
+    task::Task* head{};
+    uint32_t count{};
 
     void init();
 
@@ -66,7 +71,7 @@ struct IntrusiveTaskList {
 
     // Find task by PID. O(n) scan.
     // Returns nullptr if not found.
-    task::Task* findByPid(uint64_t pid);
+    [[nodiscard]] task::Task* find_by_pid(uint64_t pid) const;
 
     // Pop the head task. O(1).
     // Returns nullptr if empty.

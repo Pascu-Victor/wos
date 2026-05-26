@@ -1,19 +1,27 @@
 // Work around BFD config.h requirement
+#include <qcontainerfwd.h>
 #include <qcoreapplication.h>
+#include <qlogging.h>
+#include <qobject.h>
 #include <qoverload.h>
 #include <qprocess.h>
 #include <qthread.h>
 #include <qtmetamacros.h>
 #include <qtypes.h>
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <utility>
 #include <vector>
+
+#include "log_entry.h"
 #define PACKAGE "wosdbg"
 #define PACKAGE_VERSION "1.0"
 extern "C" {
 #include <bfd.h>
 }
-#include <capstone/capstone.h>
-#include <cxxabi.h>
 
 #include <QtCore/QDebug>
 #include <QtCore/QFile>
@@ -31,61 +39,60 @@ extern "C" {
 #include "wosdbg.h"
 
 // LogProcessor implementation
-LogProcessor::LogProcessor(const QString& filename, QObject* parent)
-    : QObject(parent), filename(filename), completedWorkers(0), totalWorkers(0) {
-    if (!tempDir.isValid()) {
+LogProcessor::LogProcessor(QString filename, QObject* parent) : QObject(parent), filename(std::move(filename)) {
+    if (!temp_dir.isValid()) {
         qDebug() << "Failed to create temporary directory";
     }
 }
 
-void LogProcessor::startProcessing() {
-    emit progressUpdate(0);
+void LogProcessor::start_processing() {
+    emit progress_update(0);
 
-    splitFileIntoChunks();
+    split_file_into_chunks();
 
-    startWorkerProcesses();
+    start_worker_processes();
 }
 
-void LogProcessor::splitFileIntoChunks() {
+void LogProcessor::split_file_into_chunks() {
     QFile file(filename);
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        emit errorOccurred(QString("Cannot open file: %1").arg(filename));
+        emit error_occurred(QString("Cannot open file: %1").arg(filename));
         return;
     }
 
     // Determine number of worker processes
-    totalWorkers = std::max(4, QThread::idealThreadCount());
+    total_workers = std::max(4, QThread::idealThreadCount());
 
     // Get file size for better chunk estimation
-    qint64 fileSize = file.size();
-    qint64 targetChunkSize = fileSize / totalWorkers;
+    qint64 file_size = file.size();
+    qint64 target_chunk_size = file_size / total_workers;
 
     // Pre-allocate chunk files
-    std::vector<QFile*> chunkFiles;
-    std::vector<QTextStream*> chunkStreams;
-    chunkFiles.reserve(totalWorkers);
-    chunkStreams.reserve(totalWorkers);
+    std::vector<QFile*> chunk_files;
+    std::vector<QTextStream*> chunk_streams;
+    chunk_files.reserve(total_workers);
+    chunk_streams.reserve(total_workers);
 
-    for (int i = 0; i < totalWorkers; ++i) {
-        QString chunkFile = tempDir.filePath(QString("chunk_%1.txt").arg(i));
-        QFile* outFile = new QFile(chunkFile);
-        if (outFile->open(QIODevice::WriteOnly | QIODevice::Text)) {
-            chunkFiles.push_back(outFile);
-            chunkStreams.push_back(new QTextStream(outFile));
+    for (int i = 0; i < total_workers; ++i) {
+        QString chunk_file = temp_dir.filePath(QString("chunk_%1.txt").arg(i));
+        auto* out_file = new QFile(chunk_file);
+        if (out_file->open(QIODevice::WriteOnly | QIODevice::Text)) {
+            chunk_files.push_back(out_file);
+            chunk_streams.push_back(new QTextStream(out_file));
         }
     }
 
     // Stream-based chunk distribution with smart boundary detection
     QTextStream in(&file);
     QString line;
-    int currentChunk = 0;
-    qint64 currentChunkBytes = 0;
-    bool inInterruptBlock = false;
+    int current_chunk = 0;
+    qint64 current_chunk_bytes = 0;
+    bool in_interrupt_block = false;
 
     // Pre-compile regex patterns for better performance
-    static const QRegularExpression instructionPattern(R"(^0x[0-9a-fA-F]+:\s+)");
-    static const QRegularExpression interruptPattern(R"(^(Servicing hardware INT=|check_exception))");
-    static const QRegularExpression cpuStatePattern(
+    static const QRegularExpression INSTRUCTION_PATTERN(R"(^0x[0-9a-fA-F]+:\s+)");
+    static const QRegularExpression INTERRUPT_PATTERN(R"(^(Servicing hardware INT=|check_exception))");
+    static const QRegularExpression CPU_STATE_PATTERN(
         R"(RAX=|RBX=|RCX=|RDX=|RSI=|RDI=|RBP=|RSP=|R\d+=|RIP=|RFL=|[CEDFGS]S =|LDT=|TR =|[GI]DT=|CR[0234]=|DR[0-7]=|CC[CDs]=|EFER=|^\s*\d+:\s+v=)");
 
     while (!in.atEnd()) {
@@ -95,41 +102,41 @@ void LogProcessor::splitFileIntoChunks() {
         }
 
         QString trimmed = line.trimmed();
-        qint64 lineBytes = line.length() + 1;  // +1 for newline
+        qint64 line_bytes = line.length() + 1;  // +1 for newline
 
         // Detect interrupt/exception blocks
-        if (interruptPattern.match(trimmed).hasMatch()) {
-            inInterruptBlock = true;
+        if (INTERRUPT_PATTERN.match(trimmed).hasMatch()) {
+            in_interrupt_block = true;
         }
 
         // End interrupt block detection
-        if (inInterruptBlock && !trimmed.isEmpty()) {
-            if (!cpuStatePattern.match(trimmed).hasMatch() && !interruptPattern.match(trimmed).hasMatch() && !trimmed.startsWith("IN:") &&
-                !trimmed.startsWith("----")) {
-                inInterruptBlock = false;
+        if (in_interrupt_block && !trimmed.isEmpty()) {
+            if (!CPU_STATE_PATTERN.match(trimmed).hasMatch() && !INTERRUPT_PATTERN.match(trimmed).hasMatch() &&
+                !trimmed.startsWith("IN:") && !trimmed.startsWith("----")) {
+                in_interrupt_block = false;
             }
         }
 
         // Smart chunk boundary: complete instruction boundary
-        bool isInstructionStart = instructionPattern.match(trimmed).hasMatch();
-        bool shouldSwitchChunk =
-            (currentChunk < totalWorkers - 1 && currentChunkBytes >= targetChunkSize && !inInterruptBlock && isInstructionStart);
+        bool is_instruction_start = INSTRUCTION_PATTERN.match(trimmed).hasMatch();
+        bool should_switch_chunk =
+            (current_chunk < total_workers - 1 && current_chunk_bytes >= target_chunk_size && !in_interrupt_block && is_instruction_start);
 
-        if (shouldSwitchChunk) {
-            currentChunk++;
-            currentChunkBytes = 0;
+        if (should_switch_chunk) {
+            current_chunk++;
+            current_chunk_bytes = 0;
         }
 
         // Write to current chunk
-        *chunkStreams[currentChunk] << line << "\n";
-        currentChunkBytes += lineBytes;
+        *chunk_streams[current_chunk] << line << "\n";
+        current_chunk_bytes += line_bytes;
     }
 
     // Cleanup
-    for (auto* stream : chunkStreams) {
+    for (auto* stream : chunk_streams) {
         delete stream;
     }
-    for (auto* file : chunkFiles) {
+    for (auto* file : chunk_files) {
         file->close();
         delete file;
     }
@@ -137,19 +144,19 @@ void LogProcessor::splitFileIntoChunks() {
     file.close();
 }
 
-void LogProcessor::startWorkerProcesses() {
+void LogProcessor::start_worker_processes() {
     workers.clear();
-    completedWorkers = 0;
+    completed_workers = 0;
 
-    for (int i = 0; i < totalWorkers; ++i) {
-        QString chunkFile = tempDir.filePath(QString("chunk_%1.txt").arg(i));
-        QString resultFile = tempDir.filePath(QString("result_%1.json").arg(i));
+    for (int i = 0; i < total_workers; ++i) {
+        QString chunk_file = temp_dir.filePath(QString("chunk_%1.txt").arg(i));
+        QString result_file = temp_dir.filePath(QString("result_%1.json").arg(i));
 
         auto* worker = new QProcess(this);
         workers.push_back(worker);
 
-        connect(worker, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, &LogProcessor::onWorkerFinished);
-        connect(worker, &QProcess::errorOccurred, this, &LogProcessor::onWorkerError);
+        connect(worker, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, &LogProcessor::on_worker_finished);
+        connect(worker, &QProcess::errorOccurred, this, &LogProcessor::on_worker_error);
 
         // Forward worker output to debug console
         connect(worker, &QProcess::readyReadStandardOutput, [worker]() {
@@ -162,48 +169,48 @@ void LogProcessor::startWorkerProcesses() {
         });
 
         // Start the worker process
-        QString workerPath = QCoreApplication::applicationDirPath() + "/wosdbg_worker";
-        QStringList args = {chunkFile, resultFile};
+        QString worker_path = QCoreApplication::applicationDirPath() + "/wosdbg_worker";
+        QStringList args = {chunk_file, result_file};
 
         // Pass config path to worker if available
-        if (!configPath.isEmpty()) {
-            args << configPath;
+        if (!config_path.isEmpty()) {
+            args << config_path;
         }
 
-        worker->start(workerPath, args);
+        worker->start(worker_path, args);
     }
 }
 
-void LogProcessor::onWorkerFinished(int exitCode, QProcess::ExitStatus exitStatus) {
-    (void)exitCode;
-    (void)exitStatus;
-    completedWorkers++;
+void LogProcessor::on_worker_finished(int exit_code, QProcess::ExitStatus exit_status) {
+    (void)exit_code;
+    (void)exit_status;
+    completed_workers++;
 
     // Update progress
-    int progress = (completedWorkers * 90) / totalWorkers;  // Reserve 10% for merging
-    emit progressUpdate(progress);
+    int progress = (completed_workers * 90) / total_workers;  // Reserve 10% for merging
+    emit progress_update(progress);
 
-    if (completedWorkers == totalWorkers) {
+    if (completed_workers == total_workers) {
         // All workers finished, merge results
         qDebug() << "All workers finished. Merging results...";
-        mergeResults();
+        merge_results();
     }
 }
 
-void LogProcessor::onWorkerError(QProcess::ProcessError error) {
-    emit errorOccurred(QString("Worker process error: %1").arg(static_cast<int>(error)));
+void LogProcessor::on_worker_error(QProcess::ProcessError error) {
+    emit error_occurred(QString("Worker process error: %1").arg(static_cast<int>(error)));
 }
 
-void LogProcessor::mergeResults() {
+void LogProcessor::merge_results() {
     entries.clear();
     entries.reserve(100000);  // Pre-allocate for typical log sizes
 
     // Process chunks in order with efficient line renumbering
-    int globalLineNumber = 1;
+    int global_line_number = 1;
 
-    for (int i = 0; i < totalWorkers; ++i) {
-        QString resultFile = tempDir.filePath(QString("result_%1.json").arg(i));
-        QFile file(resultFile);
+    for (int i = 0; i < total_workers; ++i) {
+        QString result_file = temp_dir.filePath(QString("result_%1.json").arg(i));
+        QFile file(result_file);
 
         if (!file.open(QIODevice::ReadOnly)) {
             continue;
@@ -218,36 +225,36 @@ void LogProcessor::mergeResults() {
         file.close();
 
         // Process entries from this chunk
-        std::vector<LogEntry> chunkEntries;
-        chunkEntries.reserve(array.size());
+        std::vector<LogEntry> chunk_entries;
+        chunk_entries.reserve(array.size());
 
-        for (const QJsonValue& value : array) {
-            chunkEntries.push_back(parseLogEntryFromJson(value.toObject()));
+        for (const auto& value : array) {
+            chunk_entries.push_back(parse_log_entry_from_json(value.toObject()));
         }
 
         // Sort by worker-local line numbers only if needed (optimization: typically already ordered)
-        if (!chunkEntries.empty() && chunkEntries.size() > 1) {
-            bool needsSort = false;
-            for (size_t j = 1; j < chunkEntries.size(); ++j) {
-                if (chunkEntries[j].lineNumber < chunkEntries[j - 1].lineNumber) {
-                    needsSort = true;
+        if (!chunk_entries.empty() && chunk_entries.size() > 1) {
+            bool needs_sort = false;
+            for (size_t j = 1; j < chunk_entries.size(); ++j) {
+                if (chunk_entries[j].line_number < chunk_entries[j - 1].line_number) {
+                    needs_sort = true;
                     break;
                 }
             }
 
-            if (needsSort) {
-                std::sort(chunkEntries.begin(), chunkEntries.end(),
-                          [](const LogEntry& a, const LogEntry& b) { return a.lineNumber < b.lineNumber; });
+            if (needs_sort) {
+                std::ranges::sort(chunk_entries,
+                                  [](const LogEntry& a, const LogEntry& b) -> bool { return a.line_number < b.line_number; });
             }
         }
 
         // Renumber with global line numbers (move semantics to avoid copying)
-        for (auto& entry : chunkEntries) {
-            entry.lineNumber = globalLineNumber++;
+        for (auto& entry : chunk_entries) {
+            entry.line_number = global_line_number++;
 
             // Renumber child entries
-            for (auto& child : entry.childEntries) {
-                child.lineNumber = globalLineNumber++;
+            for (auto& child : entry.child_entries) {
+                child.line_number = global_line_number++;
             }
 
             entries.push_back(std::move(entry));
@@ -255,69 +262,69 @@ void LogProcessor::mergeResults() {
     }
 
     // Initialize visible entries (default: show all)
-    visibleEntries.clear();
-    visibleEntries.reserve(entries.size());
+    visible_entries.clear();
+    visible_entries.reserve(entries.size());
     for (const auto& entry : entries) {
-        visibleEntries.push_back(&entry);
+        visible_entries.push_back(&entry);
     }
 
-    emit progressUpdate(100);
+    emit progress_update(100);
     qDebug() << "Processing complete. Total entries:" << entries.size();
-    emit processingComplete();
+    emit processing_complete();
 }
 
-void LogProcessor::setFilter(bool hideStructural, const QString& interruptFilter) {
-    visibleEntries.clear();
-    visibleEntries.reserve(entries.size());
+void LogProcessor::set_filter(bool hide_structural, const QString& interrupt_filter) {
+    visible_entries.clear();
+    visible_entries.reserve(entries.size());
 
-    std::string interruptFilterStd = interruptFilter.toStdString();
-    bool filterInterrupts = !interruptFilter.isEmpty();
+    std::string interrupt_filter_std = interrupt_filter.toStdString();
+    bool filter_interrupts = !interrupt_filter.isEmpty();
 
     for (const auto& entry : entries) {
         // Structural filtering
-        if (hideStructural) {
+        if (hide_structural) {
             if (entry.type == EntryType::SEPARATOR || entry.type == EntryType::BLOCK || entry.type == EntryType::OTHER) {
                 continue;
             }
         }
 
         // Interrupt filtering (if enabled)
-        if (filterInterrupts) {
+        if (filter_interrupts) {
             // If filtering by interrupt, we only show entries that match the interrupt
             // Note: This changes behavior from original viewer which only navigated.
             // But for a remote viewer, filtering is more bandwidth efficient.
-            if (entry.type != EntryType::INTERRUPT || entry.interruptNumber != interruptFilterStd) {
+            if (entry.type != EntryType::INTERRUPT || entry.interrupt_number != interrupt_filter_std) {
                 continue;
             }
         }
 
-        visibleEntries.push_back(&entry);
+        visible_entries.push_back(&entry);
     }
 }
 
-auto LogProcessor::parseLogEntryFromJson(const QJsonObject& json) -> LogEntry {
+auto LogProcessor::parse_log_entry_from_json(const QJsonObject& json) -> LogEntry {
     LogEntry entry;
 
-    entry.lineNumber = json["lineNumber"].toInt();
+    entry.line_number = json["lineNumber"].toInt();
     entry.type = static_cast<EntryType>(json["type"].toInt());
     entry.address = json["address"].toString().toStdString();
     entry.function = json["function"].toString().toStdString();
-    entry.hexBytes = json["hexBytes"].toString().toStdString();
+    entry.hex_bytes = json["hexBytes"].toString().toStdString();
     entry.assembly = json["assembly"].toString().toStdString();
-    entry.originalLine = json["originalLine"].toString().toStdString();
-    entry.sourceFile = json["sourceFile"].toString().toStdString();
-    entry.sourceLine = json["sourceLine"].toInt();
-    entry.addressValue = static_cast<uint64_t>(json["addressValue"].toVariant().toULongLong());
-    entry.isExpanded = json["isExpanded"].toBool();
-    entry.isChild = json["isChild"].toBool();
-    entry.interruptNumber = json["interruptNumber"].toString().toStdString();
-    entry.cpuStateInfo = json["cpuStateInfo"].toString().toStdString();
+    entry.original_line = json["originalLine"].toString().toStdString();
+    entry.source_file = json["sourceFile"].toString().toStdString();
+    entry.source_line = json["sourceLine"].toInt();
+    entry.address_value = static_cast<uint64_t>(json["addressValue"].toVariant().toULongLong());
+    entry.is_expanded = json["isExpanded"].toBool();
+    entry.is_child = json["isChild"].toBool();
+    entry.interrupt_number = json["interruptNumber"].toString().toStdString();
+    entry.cpu_state_info = json["cpuStateInfo"].toString().toStdString();
 
     // Parse child entries
-    QJsonArray childArray = json["childEntries"].toArray();
-    for (const auto& childValue : childArray) {
-        LogEntry child = parseLogEntryFromJson(childValue.toObject());
-        entry.childEntries.push_back(child);
+    QJsonArray child_array = json["childEntries"].toArray();
+    for (const auto& child_value : child_array) {
+        LogEntry child = parse_log_entry_from_json(child_value.toObject());
+        entry.child_entries.push_back(child);
     }
 
     return entry;

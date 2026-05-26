@@ -1,53 +1,92 @@
 #include "netpoll.hpp"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <net/netdevice.hpp>
+#include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sys/context_switch.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <string_view>
+#include <util/smallvec.hpp>
 
 namespace ker::net {
 
+using log = ker::mod::dbg::logger<"netpoll">;
+
+extern "C" char __kernel_text_start[];  // NOLINT(readability-identifier-naming)
+extern "C" char __kernel_text_end[];    // NOLINT(readability-identifier-naming)
+
 namespace {
 
+constexpr uint32_t NET_LATENCY_DAEMON_SLICE_NS = 10'000'000;
+constexpr int NET_LATENCY_DAEMON_NICE = 0;
+constexpr size_t NAPI_INLINE_REGISTRY_CAPACITY = 64;
+constexpr size_t NAPI_POLL_SNAPSHOT_CAPACITY = 64;
+
 // Registry of all NAPI structures for worker thread lookup
-constexpr size_t MAX_NAPI_DEVICES = 16;
-NapiStruct* g_napi_registry[MAX_NAPI_DEVICES] = {};
-size_t g_napi_count = 0;
+ker::util::SmallVec<NapiStruct*, NAPI_INLINE_REGISTRY_CAPACITY> g_napi_registry;
 ker::mod::sys::Spinlock g_registry_lock;
+
+void promote_latency_sensitive_daemon(ker::mod::sched::task::Task* task) {
+    if (task == nullptr || task->type != ker::mod::sched::task::TaskType::DAEMON) {
+        return;
+    }
+
+    task->slice_ns = NET_LATENCY_DAEMON_SLICE_NS;
+    ker::mod::sched::set_task_nice(task, NET_LATENCY_DAEMON_NICE);
+}
+
+auto poll_fn_is_valid(NapiPollFn poll) -> bool {
+    auto const ADDR = reinterpret_cast<uintptr_t>(poll);
+    auto const TEXT_START = reinterpret_cast<uintptr_t>(__kernel_text_start);
+    auto const TEXT_END = reinterpret_cast<uintptr_t>(__kernel_text_end);
+    return ADDR >= TEXT_START && ADDR < TEXT_END;
+}
 
 // Find NapiStruct by matching worker task pointer
 auto find_napi_for_current_task() -> NapiStruct* {
     auto* current = ker::mod::sched::get_current_task();
-    for (size_t i = 0; i < g_napi_count; ++i) {
-        if (g_napi_registry[i] != nullptr && g_napi_registry[i]->worker == current) {
-            return g_napi_registry[i];
+    for (auto* napi : g_napi_registry) {
+        if (napi != nullptr && napi->worker == current) {
+            return napi;
         }
     }
     return nullptr;
 }
 
 // Register a NapiStruct in the global registry
-void register_napi(NapiStruct* napi) {
+auto register_napi(NapiStruct* napi) -> bool {
     g_registry_lock.lock();
-    if (g_napi_count < MAX_NAPI_DEVICES) {
-        g_napi_registry[g_napi_count++] = napi;
-    }
+    bool const INSERTED = g_napi_registry.push_back(napi);
     g_registry_lock.unlock();
+    if (!INSERTED) {
+        log::critical("failed to register NAPI context for %s", napi->dev != nullptr ? napi->dev->name.data() : "?");
+        return false;
+    }
+    ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::NAPI_REG, 0, ker::mod::perf::PERF_FLAG_CT_INSERT,
+                                          static_cast<int64_t>(g_napi_registry.size()), 0, 0);
+    return true;
 }
 
 // Unregister a NapiStruct from the global registry
 void unregister_napi(NapiStruct* napi) {
     g_registry_lock.lock();
-    for (size_t i = 0; i < g_napi_count; ++i) {
-        if (g_napi_registry[i] == napi) {
-            // Shift remaining entries down
-            for (size_t j = i; j < g_napi_count - 1; ++j) {
-                g_napi_registry[j] = g_napi_registry[j + 1];
-            }
-            g_napi_registry[--g_napi_count] = nullptr;
-            break;
+    for (size_t i = 0; i < g_napi_registry.size(); ++i) {
+        if (g_napi_registry.at(i) == napi) {
+            g_napi_registry.remove_at(i);
+            g_registry_lock.unlock();
+            ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::NAPI_REG, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
+                                                  static_cast<int64_t>(g_napi_registry.size()), 0, 0);
+            return;
         }
     }
     g_registry_lock.unlock();
@@ -56,28 +95,23 @@ void unregister_napi(NapiStruct* napi) {
 // Worker thread main loop
 [[noreturn]] void napi_worker_loop(NapiStruct* napi) {
     for (;;) {
-        // Disable interrupts BEFORE checking the work flag so that no
-        // IRQ can sneak in between the check and the sti;hlt below.
-        // The sti;hlt pair is architecturally atomic on x86: if an
-        // interrupt is already pending when sti executes, the CPU
-        // enters hlt and immediately wakes, so no wakeup is lost.
+        // Disable interrupts before checking work flag.
         asm volatile("cli" ::: "memory");
 
         if (!napi->has_work.load(std::memory_order_acquire)) {
-            // No work - atomically enable interrupts and halt
-            ker::mod::sched::kern_yield();
+            // No work: block until napi_schedule() explicitly wakes us.
+            ker::mod::sched::kern_block();
             continue;
         }
 
-        // Work available - re-enable interrupts before polling
+        // Work available: re-enable interrupts before polling.
         asm volatile("sti" ::: "memory");
 
-        // Transition SCHEDULED -> POLLING
+        // SCHEDULED -> POLLING
         NapiState expected = NapiState::SCHEDULED;
         if (!napi->state.compare_exchange_strong(expected, NapiState::POLLING, std::memory_order_acq_rel, std::memory_order_acquire)) {
-            // State changed unexpectedly (disabled?), retry
             if (expected == NapiState::DISABLED) {
-                // Device going down, halt
+                // Device down: halt.
                 for (;;) {
                     asm volatile("hlt");
                 }
@@ -85,24 +119,30 @@ void unregister_napi(NapiStruct* napi) {
             continue;
         }
 
-        // Inner polling loop - stay here while processing full budget
+        // Poll while work remains.
         for (;;) {
-            int processed = napi->poll(napi, napi->weight);
+            if (!poll_fn_is_valid(napi->poll)) {
+                log::critical("invalid NAPI poll function for %s: poll=0x%lx napi=%p", napi->dev != nullptr ? napi->dev->name.data() : "?",
+                              reinterpret_cast<uintptr_t>(napi->poll), napi);
+                napi->state.store(NapiState::DISABLED, std::memory_order_release);
+                napi->has_work.store(false, std::memory_order_release);
+                for (;;) {
+                    asm volatile("hlt");
+                }
+            }
+            int const PROCESSED = napi->poll(napi, napi->weight);
             napi->poll_count++;
 
-            if (processed < napi->weight) {
-                // Processed less than budget - driver called napi_complete()
+            if (PROCESSED < napi->weight) {
+                // Driver called napi_complete().
                 break;
             }
-            // processed >= weight: more work available, continue polling
         }
 
-        // Clear the work flag so we sleep on next iteration
+        // Clear work flag.
         napi->has_work.store(false, std::memory_order_release);
 
-        // Check for race: if an IRQ arrived between napi_complete() and clearing
-        // has_work, state will be SCHEDULED but has_work is now false.
-        // Re-set has_work to prevent deadlock.
+        // If IRQ arrived during poll, re-arm work flag.
         if (napi->state.load(std::memory_order_acquire) == NapiState::SCHEDULED) {
             napi->has_work.store(true, std::memory_order_release);
         }
@@ -115,13 +155,13 @@ void unregister_napi(NapiStruct* napi) {
     NapiStruct* my_napi = find_napi_for_current_task();
 
     if (my_napi == nullptr) {
-        ker::mod::dbg::log("netpoll: FATAL - worker thread could not find its NapiStruct");
+        log::critical("worker thread could not find its NapiStruct");
         for (;;) {
             asm volatile("hlt");
         }
     }
 
-    ker::mod::dbg::log("netpoll: worker for %s started", my_napi->dev->name.data());
+    log::debug("worker for %s started", my_napi->dev->name.data());
 
     // Run the worker loop
     napi_worker_loop(my_napi);
@@ -140,37 +180,53 @@ void napi_init(NapiStruct* napi, NetDevice* dev, NapiPollFn poll, int weight) {
     napi->complete_count = 0;
 }
 
-void napi_enable(NapiStruct* napi) {
-    // Set direct pointer for lock-free inline poll lookup
-    napi->dev->napi = napi;
-
+void napi_enable(NapiStruct* napi, uint64_t cpu_affinity) {
     // Register in global registry first (so worker can find it)
-    register_napi(napi);
+    if (!register_napi(napi)) {
+        return;
+    }
 
     // Build thread name: "netpoll_eth0"
-    char name[32] = "netpoll_";
+    std::array<char, 32> name{};
     const char* dev_name = napi->dev->name.data();
-    size_t name_len = 8;  // strlen("netpoll_")
-    for (size_t i = 0; dev_name[i] != '\0' && name_len < 31; ++i) {
-        name[name_len++] = dev_name[i];
-    }
-    name[name_len] = '\0';
+    std::string_view const DEV_NAME = dev_name;
+    std::string_view const PREFIX = "netpoll_";
+    size_t name_len = PREFIX.size();
+    std::ranges::copy(PREFIX, name.begin());
+    size_t const COPY_LEN = std::min(DEV_NAME.size(), name.size() - name_len - 1);
+    std::ranges::copy(DEV_NAME.substr(0, COPY_LEN), std::next(name.begin(), static_cast<ptrdiff_t>(name_len)));
+    name_len += COPY_LEN;
+    name.at(name_len) = '\0';
 
     // Create dedicated worker thread
-    napi->worker = ker::mod::sched::task::Task::createKernelThread(name, napi_worker_entry);
+    napi->worker = ker::mod::sched::task::Task::create_kernel_thread(name.data(), napi_worker_entry);
     if (napi->worker == nullptr) {
-        ker::mod::dbg::log("netpoll: failed to create worker thread for %s", dev_name);
+        log::warn("failed to create worker thread for %s", dev_name);
         unregister_napi(napi);
         return;
     }
 
-    // Schedule the worker thread
-    ker::mod::sched::post_task_balanced(napi->worker);
+    promote_latency_sensitive_daemon(napi->worker);
+
+    // Schedule the worker thread - place on the preferred CPU
+    if (cpu_affinity != UINT64_MAX) {
+        ker::mod::sched::post_task_for_cpu(cpu_affinity, napi->worker);
+    } else {
+        ker::mod::sched::post_task_balanced(napi->worker);
+    }
 
     // Transition to IDLE state (ready to receive IRQs)
     napi->state.store(NapiState::IDLE, std::memory_order_release);
 
-    ker::mod::dbg::log("netpoll: enabled for %s (worker PID %lx)", dev_name, napi->worker->pid);
+    log::debug("enabled for %s (worker PID %lx)", dev_name, napi->worker->pid);
+}
+
+void napi_set_worker_cpu(NapiStruct* napi, uint64_t cpu) {
+    if (napi == nullptr || napi->worker == nullptr) {
+        return;
+    }
+    napi->worker->cpu_pinned = true;
+    ker::mod::sched::reschedule_task_for_cpu(cpu, napi->worker);
 }
 
 void napi_disable(NapiStruct* napi) {
@@ -194,13 +250,10 @@ void napi_disable(NapiStruct* napi) {
     // Unregister from global registry
     unregister_napi(napi);
 
-    // Clear direct pointer
-    napi->dev->napi = nullptr;
-
-    ker::mod::dbg::log("netpoll: disabled for %s", napi->dev->name.data());
+    log::debug("disabled for %s", napi->dev->name.data());
 }
 
-bool napi_schedule(NapiStruct* napi) {
+auto napi_schedule(NapiStruct* napi) -> bool {
     // Try to transition from IDLE to SCHEDULED (atomic, no lock)
     NapiState expected = NapiState::IDLE;
     if (!napi->state.compare_exchange_strong(expected, NapiState::SCHEDULED, std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -211,14 +264,17 @@ bool napi_schedule(NapiStruct* napi) {
     // Set work flag for interface worker thread
     napi->has_work.store(true, std::memory_order_release);
 
-    // Wake the worker thread if it is sleeping (via sti;hlt) on another CPU.
-    // The NIC IRQ may have been delivered to a different CPU than the one
-    // the worker is halted on.  We send a lightweight IPI to break it out
-    // of hlt.  Note: rescheduleTaskForCpu does NOT work here because the
-    // worker is the currentTask on its CPU (just halted), so the scheduler
-    // sees it as "already running" and aborts.
+    // Wake the worker thread.
     if (napi->worker != nullptr) {
-        ker::mod::sched::wake_cpu(napi->worker->cpu);
+        ker::mod::sched::kern_wake(napi->worker);
+        if (napi->worker->cpu == ker::mod::cpu::current_cpu()) {
+            // Same-CPU: wake_cpu() is a no-op, so arm the APIC timer for an
+            // immediate scheduling pass instead of waiting up to 1ms for the
+            // next quantum tick.
+            ker::mod::sys::context_switch::request_reschedule();
+        } else {
+            ker::mod::sched::wake_cpu(napi->worker->cpu);
+        }
     }
 
     return true;
@@ -234,13 +290,9 @@ void napi_complete(NapiStruct* napi) {
     // Driver should re-enable device interrupts after calling this
 }
 
-int napi_poll_inline(NetDevice* dev) {
-    if (dev == nullptr) {
-        return 0;
-    }
+namespace {
 
-    // Lock-free lookup via direct dev->napi pointer (set by napi_enable)
-    NapiStruct* napi = dev->napi;
+auto napi_poll_struct_inline_budget(NapiStruct* napi, int budget) -> int {
     if (napi == nullptr) {
         return 0;
     }
@@ -259,14 +311,22 @@ int napi_poll_inline(NetDevice* dev) {
     // NOTE: The driver's poll function (e.g. virtio_net_poll) calls
     // napi_complete() + re-enables IRQs internally when processed < budget.
     // We must NOT call napi_complete() again in that case, or we corrupt
-    // the NAPI state machine — an IRQ arriving between the driver's
-    // napi_complete() and ours could schedule the worker (IDLE→SCHEDULED→
+    // the NAPI state machine - an IRQ arriving between the driver's
+    // napi_complete() and ours could schedule the worker (IDLE->SCHEDULED->
     // POLLING), and our stale napi_complete() would yank it back to IDLE,
     // losing packets.
-    int processed = napi->poll(napi, napi->weight);
+    int const EFFECTIVE_BUDGET = budget > 0 ? budget : napi->weight;
+    if (!poll_fn_is_valid(napi->poll)) {
+        log::critical("invalid inline NAPI poll function for %s: poll=0x%lx napi=%p", napi->dev != nullptr ? napi->dev->name.data() : "?",
+                      reinterpret_cast<uintptr_t>(napi->poll), napi);
+        napi->state.store(NapiState::DISABLED, std::memory_order_release);
+        napi->has_work.store(false, std::memory_order_release);
+        return 0;
+    }
+    int const PROCESSED = napi->poll(napi, EFFECTIVE_BUDGET);
     napi->poll_count++;
 
-    if (processed >= napi->weight) {
+    if (PROCESSED >= EFFECTIVE_BUDGET) {
         // Driver did NOT call napi_complete() (more work pending).
         // Transition back to SCHEDULED so the worker can pick up the
         // remaining work and re-enable IRQs when it's done.
@@ -287,7 +347,30 @@ int napi_poll_inline(NetDevice* dev) {
         }
     }
 
-    return processed;
+    return PROCESSED;
+}
+
+}  // namespace
+
+auto napi_poll_all_pending() -> int {
+    int total = 0;
+    // Snapshot count under lock to avoid tearing, then poll without the lock
+    // (per-NAPI inline polling is safe to call without the registry lock).
+    g_registry_lock.lock();
+    size_t count = g_napi_registry.size();
+    std::array<NapiStruct*, NAPI_POLL_SNAPSHOT_CAPACITY> snapshot{};
+    count = std::min<size_t>(count, snapshot.size());
+    for (size_t i = 0; i < count; ++i) {
+        snapshot.at(i) = g_napi_registry.at(i);
+    }
+    g_registry_lock.unlock();
+
+    for (size_t i = 0; i < count; ++i) {
+        if (auto* napi = snapshot.at(i); napi != nullptr && napi->dev != nullptr) {
+            total += napi_poll_struct_inline_budget(napi, NAPI_DEFAULT_WEIGHT);
+        }
+    }
+    return total;
 }
 
 }  // namespace ker::net

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 
@@ -22,7 +24,7 @@ constexpr uint32_t WKI_LSDB_AGE_FACTOR = 3;
 constexpr uint32_t WKI_LSA_MIN_INTERVAL_MS = 1000;  // 1s minimum between LSAs
 
 // -----------------------------------------------------------------------------
-// Link-State Database Entry — one per known origin node
+// Link-State Database Entry - one per known origin node
 // -----------------------------------------------------------------------------
 
 struct LsdbEntry {
@@ -36,7 +38,7 @@ struct LsdbEntry {
 };
 
 // -----------------------------------------------------------------------------
-// Routing Table Entry — one per reachable destination
+// Routing Table Entry - one per reachable destination
 // -----------------------------------------------------------------------------
 
 struct RoutingEntry {
@@ -67,7 +69,7 @@ void wki_routing_recompute();
 auto wki_routing_lookup(uint16_t dst_node) -> const RoutingEntry*;
 
 // Invalidate the LSDB entry for a node (used after fencing).
-// Does NOT recompute routes — caller should call wki_routing_recompute() after.
+// Does NOT recompute routes - caller should call wki_routing_recompute() after.
 void wki_routing_invalidate_node(uint16_t node_id);
 
 // Periodic timer: LSA refresh, LSDB aging.

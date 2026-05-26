@@ -1,19 +1,24 @@
 // Init wrapper functions for the kernel initialization dependency system
 // Each wrapper calls the actual init function from the appropriate module
-#include <defines/defines.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <dev/ahci.hpp>
 #include <dev/block_device.hpp>
 #include <dev/console.hpp>
 #include <dev/device.hpp>
 #include <dev/e1000e/e1000e.hpp>
 #include <dev/ivshmem/ivshmem_net.hpp>
+#include <dev/null_device.hpp>
 #include <dev/pci.hpp>
+#include <dev/pty.hpp>
+#include <dev/random_device.hpp>
 #include <dev/usb/cdc_ether.hpp>
 #include <dev/usb/xhci.hpp>
 #include <dev/virtio/virtio_net.hpp>
 #include <mod/gfx/fb.hpp>
 #include <mod/io/serial/serial.hpp>
-#include <net/loopback.hpp>
+#include <net/address.hpp>
+#include <net/backlog.hpp>
 #include <net/net.hpp>
 #include <net/netdevice.hpp>
 #include <net/netif.hpp>
@@ -29,23 +34,38 @@
 #include <platform/acpi/ioapic/ioapic.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/boot/handover.hpp>
+#include <platform/dbg/coredump.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/interrupt/idt.hpp>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/mm.hpp>
+#include <platform/mm/phys.hpp>
+
+#include "platform/mm/dyn/kmalloc.hpp"
+#include "util/hcf.hpp"
+#ifdef WOS_KASAN
+#include <sanitizer/kasan.hpp>
+#endif
+#include <platform/ntp/ntp.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/pic/pic.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
 #include <platform/sys/syscall.hpp>
+#include <util/hostname.hpp>
+#include <util/netdevconf.hpp>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/initramfs.hpp>
 #include <vfs/vfs.hpp>
 
 #include "init_registry.hpp"
 #include "limine_requests.hpp"
+#ifdef WOS_SELFTEST
+#include <cstring>
+#include <test/ktest.hpp>
+#endif
 
 namespace ker::init::fns {
 
@@ -68,19 +88,29 @@ void mm_init() { mod::mm::init(); }
 
 void fsgsbase_init() {
     // Enable FSGSBASE instructions
-    mod::cpu::enableFSGSBASE();
+    mod::cpu::enable_fsgsbase();
 }
 
 void gdt_init() {
-    // Initialize GDT with the captured stack pointer
-    uint64_t rsp = get_kernel_rsp();
-    auto* stack = reinterpret_cast<uint8_t*>(rsp);
-    mod::desc::gdt::initDescriptors(reinterpret_cast<uint64_t*>(stack) + KERNEL_STACK_SIZE, 0);  // BSP is CPU 0
+    // User->kernel interrupts load RSP0 from the TSS. Give the BSP a real
+    // interrupt stack; the captured boot RSP is just the current stack pointer.
+    static uint64_t bsp_rsp0 = 0;
+    if (bsp_rsp0 == 0) {
+        auto const STACK_BASE = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc(mod::mm::KERNEL_STACK_SIZE));
+        if (STACK_BASE == 0) {
+            hcf();
+        }
+        bsp_rsp0 = STACK_BASE + mod::mm::KERNEL_STACK_SIZE;
+    }
+    mod::desc::gdt::init_descriptors(reinterpret_cast<uint64_t*>(bsp_rsp0), 0);  // BSP is CPU 0
 }
 
 void kmalloc_init() {
     mod::mm::dyn::kmalloc::init();
-    mod::dbg::enableKmalloc();
+    mod::dbg::enable_kmalloc();
+#ifdef WOS_KASAN
+    ker::mod::kasan::init();
+#endif
 }
 
 void pic_remap() { mod::pic::remap(); }
@@ -89,14 +119,20 @@ void acpi_init() { mod::acpi::init(); }
 
 void apic_init() { mod::apic::init(); }
 
-void apic_mp_init() { mod::apic::initApicMP(); }
+void apic_mp_init() { mod::apic::init_apic_mp(); }
 
 void time_init() {
     mod::time::init();
-    mod::dbg::enableTime();
+    mod::dbg::enable_time();
 }
 
-void idt_init() { mod::desc::idt::idtInit(); }
+void idt_init() {
+    mod::desc::idt::idt_init();
+#ifdef WOS_KASAN
+    // IDT is live — shadow demand-faulting now works.
+    ker::mod::kasan::enable();
+#endif
+}
 
 void sys_init() { mod::sys::init(); }
 
@@ -107,6 +143,12 @@ void dev_init() { dev::dev_init(); }
 void pci_enumerate() { dev::pci::pci_enumerate_all(); }
 
 void console_init() { dev::console::console_init(); }
+
+void null_device_init() { dev::null_device::null_device_init(); }
+
+void random_device_init() { dev::random_device::random_device_init(); }
+
+void pty_init() { dev::pty::pty_init(); }
 
 void ahci_init() { dev::ahci::ahci_controller_init(); }
 
@@ -133,19 +175,26 @@ void ivshmem_init() { dev::ivshmem::ivshmem_net_init(); }
 
 void pkt_pool_expand() { net::pkt_pool_expand_for_nics(); }
 
+void backlog_init() { net::backlog_init(); }
+
 void ndp_init() { net::proto::ndp_init(); }
 
 void wki_init() { net::wki::wki_init(); }
 
 void devfs_populate_net() { vfs::devfs::devfs_populate_net_nodes(); }
 
+void coredump_init() { mod::dbg::coredump::init(); }
+
 void smt_init() { mod::smt::init(); }
 
 void epoch_manager_init() { mod::sched::EpochManager::init(); }
 
 void wki_eth_transport_init() {
-    // Search for eth1, fall back to eth0
-    auto* wki_dev = net::netdev_find_by_name("eth1");
+    // Prefer config-assigned NIC; fall back to eth1 then eth0
+    auto* wki_dev = ker::util::netdevconf::find_device("wki");
+    if (wki_dev == nullptr) {
+        wki_dev = net::netdev_find_by_name("eth1");
+    }
     if (wki_dev == nullptr) {
         wki_dev = net::netdev_find_by_name("eth0");
     }
@@ -158,27 +207,24 @@ void wki_eth_transport_init() {
 void wki_ivshmem_transport_init() { net::wki::wki_ivshmem_transport_init(); }
 
 void ipv6_linklocal_init() {
-    // Configure IPv6 link-local addresses on eth0 and eth1
-    auto* eth0 = net::netdev_find_by_name("eth0");
-    if (eth0 != nullptr) {
-        std::array<uint8_t, 16> ll_addr{};
-        net::proto::ipv6_make_link_local(ll_addr, eth0->mac);
-        net::netif_add_ipv6(eth0, ll_addr, 64);
-    }
-
-    auto* eth1 = net::netdev_find_by_name("eth1");
-    if (eth1 != nullptr) {
-        std::array<uint8_t, 16> ll_addr{};
-        net::proto::ipv6_make_link_local(ll_addr, eth1->mac);
-        net::netif_add_ipv6(eth1, ll_addr, 64);
+    // Assign IPv6 link-local addresses to all registered NICs that are not
+    // claimed as WKI transport (WKI manages its own transport NIC).
+    for (size_t i = 0; i < net::netdev_count(); i++) {
+        auto* dev = net::netdev_at(i);
+        if (dev == nullptr || dev->wki_transport) {
+            continue;
+        }
+        net::proto::IPv6Address const LL_ADDR = net::proto::ipv6_make_link_local(dev->mac);
+        net::netif_add_ipv6(dev, LL_ADDR, 64);
     }
 }
 
 void sse_init() {
-    // Enable SSE instructions and mark CPU ID available for serial output
-    mod::cpu::enableSSE();
-    mod::io::serial::markCpuIdAvailable();
+    mod::cpu::enable_sse();
+    mod::cpu::enable_xsave();
 }
+
+void ntp_init() { mod::ntp::init(); }
 
 void initramfs_init() {
     // Unpack CPIO initramfs from Limine modules into tmpfs root
@@ -189,18 +235,31 @@ void initramfs_init() {
 
     for (size_t i = 0; i < module_request.response->module_count; i++) {
         auto* mod_data = static_cast<uint8_t*>(module_request.response->modules[i]->address);
-        size_t mod_size = module_request.response->modules[i]->size;
+        size_t const MOD_SIZE = module_request.response->modules[i]->size;
         // Check for CPIO newc magic "070701"
-        if (mod_size >= 6 && mod_data[0] == '0' && mod_data[1] == '7' && mod_data[2] == '0' && mod_data[3] == '7' && mod_data[4] == '0' &&
+        if (MOD_SIZE >= 6 && mod_data[0] == '0' && mod_data[1] == '7' && mod_data[2] == '0' && mod_data[3] == '7' && mod_data[4] == '0' &&
             mod_data[5] == '1') {
-            mod::dbg::log("Found CPIO initramfs module at index %u (%u bytes)", static_cast<unsigned>(i), static_cast<unsigned>(mod_size));
-            vfs::initramfs::unpack_initramfs(mod_data, mod_size);
+            mod::dbg::log("Found CPIO initramfs module at index %u (%u bytes)", static_cast<unsigned>(i), static_cast<unsigned>(MOD_SIZE));
+            vfs::initramfs::unpack_initramfs(mod_data, MOD_SIZE);
         }
     }
 }
 
+void hostname_init() { ker::util::hostname::init(); }
+
 void sched_init() {
+    // Initialise kernel performance ring buffers before the scheduler starts
+    // recording events.
+    ker::mod::perf::init();
+
     mod::sched::setup_queues();
+#ifdef WOS_SELFTEST
+    if (strcmp(get_kernel_cmdline(), "--selftest") == 0) {
+        mod::smt::park_secondary_cpus_for_selftest();
+        ker::test::run_all();
+        hcf();
+    }
+#endif
 
     // Build HandoverModules from limine module request
     mod::boot::HandoverModules modules{};

@@ -16,61 +16,65 @@ class LogClient : public QObject {
     explicit LogClient(QObject* parent = nullptr);
     ~LogClient();
 
-    void connectToHost(const QString& host, quint16 port);
-    void selectFile(const QString& filename);
+    void connect_to_host(const QString& host, quint16 port);
+    void select_file(const QString& filename);
 
     // Returns pointer to entry if available, nullptr otherwise.
     // If nullptr, it triggers a fetch for a chunk around this line.
-    const LogEntry* getEntry(int lineIndex);
+    const LogEntry* get_entry(int line_index);
 
-    const QStringList& getFileList() const { return fileList; }
-    const Config& getConfig() const { return config; }
-    int getTotalLines() const { return totalLines; }
-    bool isConnected() const { return socket->state() == QAbstractSocket::ConnectedState; }
+    [[nodiscard]] const QStringList& get_file_list() const { return file_list; }
+    [[nodiscard]] const Config& get_config() const { return config; }
+    [[nodiscard]] int get_total_lines() const { return total_lines; }
+    [[nodiscard]] bool is_connected() const { return socket->state() == QAbstractSocket::ConnectedState; }
 
-    void search(const QString& text, bool isRegex);
-    void requestInterrupts();
-    void setFilter(bool hideStructural, const QString& interruptFilter);
-    void requestRowForLine(int lineNumber);
-    void requestOpenSourceFile(const QString& file, int line);
-    void requestFileList();
+    void search(const QString& text, bool is_regex);
+    void request_interrupts();
+    void set_filter(bool hide_structural, const QString& interrupt_filter);
+    void request_row_for_line(int line_number);
+    void request_open_source_file(const QString& file, int line);
+    void request_file_list();
+    void start_mcp_server(const QString& bind_address = QString(), quint16 port = 0);
+    void stop_mcp_server();
+    void request_mcp_server_status();
 
    signals:
-    void searchResults(const std::vector<int>& matches);
-    void interruptsReceived(const std::vector<LogEntry>& interrupts);
-    void filterApplied(int totalLines);
-    void rowForLineReceived(int row);
+    void search_results(const std::vector<int>& matches);
+    void interrupts_received(const std::vector<LogEntry>& interrupts);
+    void filter_applied(int total_lines);
+    void row_for_line_received(int row);
     void connected();
     void disconnected();
-    void connectionError(const QString& error);
-    void fileListReceived(const QStringList& files);
-    void configReceived();
-    void fileReady(int totalLines);
+    void connection_error(const QString& error);
+    void file_list_received(const QStringList& files);
+    void config_received();
+    void file_ready(int total_lines);
     void progress(int percentage);
-    void errorOccurred(const QString& error);
-    void dataReceived(int startLine, int count);  // Signal to repaint
+    void error_occurred(const QString& error);
+    void data_received(int start_line, int count);  // Signal to repaint
+    void mcp_server_status(bool running, const QString& endpoint, const QString& message);
 
    private slots:
-    void onConnected();
-    void onReadyRead();
-    void onSocketError(QAbstractSocket::SocketError socketError);
-    void processPendingRequests();
+    void on_connected();
+    void on_ready_read();
+    void on_socket_error(QAbstractSocket::SocketError socket_error);
+    void process_pending_requests();
 
    private:
     QTcpSocket* socket;
     Config config;
-    QStringList fileList;
-    int totalLines;
+    QStringList file_list;
+    int total_lines{0};
 
     // Cache: lineIndex -> LogEntry
     std::map<int, LogEntry> cache;
 
     // Request management
-    std::vector<std::pair<int, int>> pendingRequests;  // start, count
-    QTimer requestTimer;
-    bool initialLoadPending;
+    std::vector<std::pair<int, int>> pending_requests;  // start, count
+    QTimer request_timer;
+    bool initial_load_pending{false};
 
-    void processMessage(MessageType type, QDataStream& in);
-    void requestData(int startLine, int count);
-    void sendSelectFile(const QString& filename);
+    void process_message(MessageType type, QDataStream& in);
+    void request_data(int start_line, int count);
+    void send_select_file(const QString& filename);
 };

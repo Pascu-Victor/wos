@@ -24,17 +24,17 @@ class VirtualTableIntegration : public QObject {
      * @param client The LogClient instance
      * @return The created VirtualTableView
      */
-    static auto initializeVirtualTable(QemuLogViewer* viewer, LogClient* client) -> VirtualTableView*;
+    static auto initialize_virtual_table(QemuLogViewer* viewer, LogClient* client) -> VirtualTableView*;
 
     /**
      * Create a data provider function for loading rows
      */
-    static std::function<void(int, std::vector<QString>&, QColor&)> createDataProvider(LogClient* client);
+    static std::function<void(int, std::vector<QString>&, QColor&)> create_data_provider(LogClient* client);
 
     /**
      * Get formatted cell data for a row
      */
-    static void formatRowData(const LogEntry* entry, std::vector<QString>& outCells, QColor& outBgColor);
+    static void format_row_data(const LogEntry* entry, std::vector<QString>& out_cells, QColor& out_bg_color);
 
    private:
     VirtualTableIntegration() = default;

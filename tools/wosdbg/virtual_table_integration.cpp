@@ -2,133 +2,136 @@
 
 #include <qcontainerfwd.h>
 #include <qfont.h>
+#include <qlogging.h>
 #include <qnamespace.h>
 #include <qobject.h>
-#include <qtpreprocessorsupport.h>
 
 #include <QtGui/QColor>
 #include <functional>
 #include <vector>
 
+#include "log_entry.h"
 #include "virtual_table.h"
 #include "wosdbg.h"
 
-auto VirtualTableIntegration::initializeVirtualTable(QemuLogViewer* viewer, LogClient* client) -> VirtualTableView* {
+auto VirtualTableIntegration::initialize_virtual_table(QemuLogViewer* viewer, LogClient* client) -> VirtualTableView* {
     // Create virtual view
-    auto virtualView = new VirtualTableView(viewer);
+    auto* virtual_view = new VirtualTableView(viewer);
 
     // Create model with appropriate row count (initially 0)
     QStringList headers = {"Line", "Type", "Address", "Function", "Hex Bytes", "Assembly"};
-    auto model = new VirtualTableModel(0, headers, virtualView);
+    auto* model = new VirtualTableModel(0, headers, virtual_view);
 
     // Set data provider
-    auto dataProvider = createDataProvider(client);
-    model->setDataProvider(dataProvider);
+    auto data_provider = create_data_provider(client);
+    model->setDataProvider(data_provider);
 
     // Set model
-    virtualView->setVirtualModel(model);
+    virtual_view->setVirtualModel(model);
 
     // Configure appearance
-    virtualView->horizontalHeader()->resizeSection(0, 60);         // Line
-    virtualView->horizontalHeader()->resizeSection(1, 80);         // Type
-    virtualView->horizontalHeader()->resizeSection(2, 120);        // Address
-    virtualView->horizontalHeader()->resizeSection(3, 200);        // Function
-    virtualView->horizontalHeader()->resizeSection(4, 140);        // Hex Bytes
-    virtualView->horizontalHeader()->setStretchLastSection(true);  // Assembly
+    virtual_view->horizontalHeader()->resizeSection(0, 60);         // Line
+    virtual_view->horizontalHeader()->resizeSection(1, 80);         // Type
+    virtual_view->horizontalHeader()->resizeSection(2, 120);        // Address
+    virtual_view->horizontalHeader()->resizeSection(3, 200);        // Function
+    virtual_view->horizontalHeader()->resizeSection(4, 140);        // Hex Bytes
+    virtual_view->horizontalHeader()->setStretchLastSection(true);  // Assembly
 
-    virtualView->setFont(QFont("Consolas", 11));
-    virtualView->verticalHeader()->setDefaultSectionSize(24);
-    virtualView->verticalHeader()->hide();
+    virtual_view->setFont(QFont("Consolas", 11));
+    virtual_view->verticalHeader()->setDefaultSectionSize(24);
+    virtual_view->verticalHeader()->hide();
 
-    return virtualView;
+    return virtual_view;
 }
 
-auto VirtualTableIntegration::createDataProvider(LogClient* client) -> std::function<void(int, std::vector<QString>&, QColor&)> {
-    return [client](int row, std::vector<QString>& outCells, QColor& outBgColor) {
-        if (row < 0 || row >= client->getTotalLines()) {
-            outCells.clear();
-            outBgColor = Qt::darkGray;
+auto VirtualTableIntegration::create_data_provider(LogClient* client) -> std::function<void(int, std::vector<QString>&, QColor&)> {
+    return [client](int row, std::vector<QString>& out_cells, QColor& out_bg_color) {
+        if (row < 0 || row >= client->get_total_lines()) {
+            out_cells.clear();
+            out_bg_color = Qt::darkGray;
             return;
         }
 
-        const LogEntry* entry = client->getEntry(row);
+        const LogEntry* entry = client->get_entry(row);
         if (!entry) {
             // Data not available yet (loading)
-            if (row < 5) qDebug() << "VirtualTableIntegration: Entry not found for row" << row;
-            outCells.clear();
-            outCells.push_back(QString::number(row + 1));  // Line number
-            outCells.push_back("Loading...");
-            outBgColor = Qt::black;
+            if (row < 5) {
+                qDebug() << "VirtualTableIntegration: Entry not found for row" << row;
+            }
+            out_cells.clear();
+            out_cells.push_back(QString::number(row + 1));  // Line number
+            out_cells.emplace_back("Loading...");
+            out_bg_color = Qt::black;
             return;
         }
 
-        formatRowData(entry, outCells, outBgColor);
+        format_row_data(entry, out_cells, out_bg_color);
     };
 }
 
-void VirtualTableIntegration::formatRowData(const LogEntry* entry, std::vector<QString>& outCells, QColor& outBgColor) {
-    outCells.clear();
-    outCells.reserve(6);
+void VirtualTableIntegration::format_row_data(const LogEntry* entry, std::vector<QString>& out_cells, QColor& out_bg_color) {
+    out_cells.clear();
+    out_cells.reserve(6);
 
     // Line number
-    outCells.push_back(QString::number(entry->lineNumber));
+    out_cells.push_back(QString::number(entry->line_number));
 
     // Type
-    QString typeStr;
+    QString type_str;
     switch (entry->type) {
         case EntryType::INSTRUCTION:
-            typeStr = "INSTRUCTION";
+            type_str = "INSTRUCTION";
             break;
         case EntryType::INTERRUPT:
-            typeStr = "INTERRUPT";
+            type_str = "INTERRUPT";
             break;
         case EntryType::REGISTER:
-            typeStr = "REGISTER";
+            type_str = "REGISTER";
             break;
         case EntryType::BLOCK:
-            typeStr = "BLOCK";
+            type_str = "BLOCK";
             break;
         case EntryType::SEPARATOR:
-            typeStr = "SEPARATOR";
+            type_str = "SEPARATOR";
             break;
         case EntryType::OTHER:
-            typeStr = "OTHER";
+            type_str = "OTHER";
             break;
     }
-    outCells.push_back(typeStr);
+    out_cells.push_back(type_str);
 
     // Address
-    outCells.push_back(QString::fromStdString(entry->address));
+    out_cells.push_back(QString::fromStdString(entry->address));
 
     // Function
-    outCells.push_back(QString::fromStdString(entry->function));
+    out_cells.push_back(QString::fromStdString(entry->function));
 
     // Hex Bytes
-    outCells.push_back(QString::fromStdString(entry->hexBytes));
+    out_cells.push_back(QString::fromStdString(entry->hex_bytes));
 
     // Assembly
-    outCells.push_back(QString::fromStdString(entry->assembly));
+    out_cells.push_back(QString::fromStdString(entry->assembly));
 
     // Background color based on type
     switch (entry->type) {
         case EntryType::INSTRUCTION:
-            outBgColor = QColor(9, 19, 9);  // Dark green
+            out_bg_color = QColor(9, 19, 9);  // Dark green
             break;
         case EntryType::INTERRUPT:
-            outBgColor = QColor(19, 9, 9);  // Dark red
+            out_bg_color = QColor(19, 9, 9);  // Dark red
             break;
         case EntryType::REGISTER:
-            outBgColor = QColor(9, 9, 19);  // Dark blue
+            out_bg_color = QColor(9, 9, 19);  // Dark blue
             break;
         case EntryType::BLOCK:
-            outBgColor = QColor(19, 19, 9);  // Dark yellow
+            out_bg_color = QColor(19, 19, 9);  // Dark yellow
             break;
         case EntryType::SEPARATOR:
-            outBgColor = QColor(13, 13, 13);  // Dark gray
+            out_bg_color = QColor(13, 13, 13);  // Dark gray
             break;
         case EntryType::OTHER:
         default:
-            outBgColor = QColor(8, 8, 8);  // Darker gray
+            out_bg_color = QColor(8, 8, 8);  // Darker gray
             break;
     }
 }

@@ -1,18 +1,18 @@
 #pragma once
-#include <limine.h>
-#include <math.h>
+#include <extern/limine.h>
 
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <mod/gfx/fb_font.hpp>
 #include <util/hcf.hpp>
-#include <util/mem.hpp>
 
-namespace ker::mod::gfx {
-namespace fb {
+namespace ker::mod::gfx::fb {
 constexpr bool WOS_HAS_GFX_FB = false;
 
-enum class OffsetMode { OFFSET_PIXEL, OFFSET_CHAR };
+enum class OffsetMode : uint8_t { OFFSET_PIXEL, OFFSET_CHAR };
 
-enum TermColors : uint32_t {
+enum class TermColors : uint32_t {
     BLACK = 0x00000000,
     RED = 0x00AA0000,
     ORANGE = 0x00FFAA00,
@@ -33,49 +33,48 @@ enum TermColors : uint32_t {
     BRIGHT_WHITE = 0x00FFFFFF
 };
 
-enum class FillMode { FILL, NO_FILL };
+enum class FillMode : uint8_t { FILL, NO_FILL };
 
 const static uint32_t TERM_BG_COLOR = static_cast<uint32_t>(TermColors::BLACK);
 const static uint32_t TERM_FG_COLOR = static_cast<uint32_t>(TermColors::WHITE);
 
-void init(void);
+void init();
 
-inline void writePixel(uint16_t x, uint16_t y, uint32_t color);
+inline void write_pixel(uint16_t x, uint16_t y, uint32_t color);
 
 void clear(uint32_t color = static_cast<uint32_t>(TermColors::BLACK));
 
-void drawRect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color = static_cast<uint32_t>(TermColors::WHITE),
-              FillMode fill = FillMode::NO_FILL);
+void draw_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color = static_cast<uint32_t>(TermColors::WHITE),
+               FillMode fill = FillMode::NO_FILL);
 
-void drawChar(uint16_t x, uint16_t y, char c, uint32_t color = static_cast<uint32_t>(TermColors::WHITE),
-              uint32_t bg_color = static_cast<uint32_t>(TermColors::BLACK), OffsetMode mode = OffsetMode::OFFSET_CHAR);
+void draw_char(uint16_t x, uint16_t y, char c, uint32_t color = static_cast<uint32_t>(TermColors::WHITE),
+               uint32_t bg_color = static_cast<uint32_t>(TermColors::BLACK), OffsetMode mode = OffsetMode::OFFSET_CHAR);
 
 // returns number of extra lines drawn (due to newlines)
-uint64_t drawString(uint16_t x, uint16_t y, const char* str, uint32_t color = static_cast<uint32_t>(TermColors::WHITE),
-                    uint32_t bg_color = static_cast<uint32_t>(TermColors::BLACK), OffsetMode mode = OffsetMode::OFFSET_CHAR);
+auto draw_string(uint16_t x, uint16_t y, const char* str, uint32_t color = static_cast<uint32_t>(TermColors::WHITE),
+                 uint32_t bg_color = static_cast<uint32_t>(TermColors::BLACK), OffsetMode mode = OffsetMode::OFFSET_CHAR) -> uint64_t;
 
-void drawLine(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t color = static_cast<uint32_t>(TermColors::WHITE));
+void draw_line(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint32_t color = static_cast<uint32_t>(TermColors::WHITE));
 
-void drawCircle(uint16_t x, uint16_t y, uint16_t radius, uint32_t color = static_cast<uint32_t>(TermColors::WHITE),
-                FillMode fill = FillMode::NO_FILL);
+void draw_circle(uint16_t x, uint16_t y, uint16_t radius, uint32_t color = static_cast<uint32_t>(TermColors::WHITE),
+                 FillMode fill = FillMode::NO_FILL);
 
 // viewport width in current font characters
-uint64_t viewportWidthChars(void);
+auto viewport_width_chars() -> uint64_t;
 
 // viewport height in current font characters
-uint64_t viewportHeightChars(void);
+auto viewport_height_chars() -> uint64_t;
 
 // viewport width in pixels
-uint64_t viewportWidth(void);
+auto viewport_width() -> uint64_t;
 
 // viewport height in pixels
-uint64_t viewportHeight(void);
+auto viewport_height() -> uint64_t;
 
 // scrolls the viewport up by one line
-void scroll(void);
+void scroll();
 
-void mapFramebuffer(void);
+void map_framebuffer();
 
 // TODO: int  setFont(const FbFont* font);
-}  // namespace fb
-}  // namespace ker::mod::gfx
+}  // namespace ker::mod::gfx::fb

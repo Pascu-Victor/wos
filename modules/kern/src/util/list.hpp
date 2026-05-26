@@ -2,9 +2,9 @@
 
 #include <defines/defines.hpp>
 
-namespace std {
+namespace ker::util {
 template <typename T>
-class list {
+class List {
    public:
     struct Node {
         T data;
@@ -12,10 +12,31 @@ class list {
         Node* prev;
     };
 
-    list() {
-        head = nullptr;
-        tail = nullptr;
-        m_size = 0;
+    List() : head(nullptr), tail(nullptr) {}
+
+    ~List() { clear(); }
+
+    List(const List&) = delete;
+    auto operator=(const List&) -> List& = delete;
+
+    List(List&& other) noexcept : head(other.head), tail(other.tail), m_size(other.m_size) {
+        other.head = nullptr;
+        other.tail = nullptr;
+        other.m_size = 0;
+    }
+
+    auto operator=(List&& other) noexcept -> List& {
+        if (this == &other) {
+            return *this;
+        }
+        clear();
+        head = other.head;
+        tail = other.tail;
+        m_size = other.m_size;
+        other.head = nullptr;
+        other.tail = nullptr;
+        other.m_size = 0;
+        return *this;
     }
 
     void push_back(T data) {
@@ -30,7 +51,7 @@ class list {
 
         tail = node;
 
-        if (!head) {
+        if (head == nullptr) {
             head = node;
         }
 
@@ -49,7 +70,7 @@ class list {
 
         head = node;
 
-        if (!tail) {
+        if (tail == nullptr) {
             tail = node;
         }
 
@@ -57,7 +78,7 @@ class list {
     }
 
     auto pop_back() -> T {
-        if (!tail) {
+        if (tail == nullptr) {
             return T();
         }
 
@@ -71,7 +92,7 @@ class list {
         delete tail;
         tail = prev;
 
-        if (!tail) {
+        if (tail == nullptr) {
             head = nullptr;
         }
 
@@ -81,7 +102,7 @@ class list {
     }
 
     auto pop_front() -> T {
-        if (!head) {
+        if (head == nullptr) {
             return T();
         }
 
@@ -95,7 +116,7 @@ class list {
         delete head;
         head = next;
 
-        if (!head) {
+        if (head == nullptr) {
             tail = nullptr;
         }
 
@@ -113,9 +134,9 @@ class list {
     T* end() { return tail ? &tail->data : nullptr; }
 
     void remove(const T& data) {
-        Node* current = head;
+        Node const* current = head;
         while (current) {
-            Node* nextNode = current->next;  // Save next before potentially deleting current
+            Node const* next_node = current->next;  // Save next before potentially deleting current
             if (current->data == data) {
                 if (current->prev) {
                     current->prev->next = current->next;
@@ -133,18 +154,28 @@ class list {
                 m_size--;
                 // Continue to remove ALL occurrences, not just the first
             }
-            current = nextNode;
+            current = next_node;
         }
     }
 
     auto size() -> uint64_t { return this->m_size; }
 
-    Node* getHead() const { return head; }
-    Node* getTail() const { return tail; }
+    void clear() {
+        while (head) {
+            Node* next = head->next;
+            delete head;
+            head = next;
+        }
+        tail = nullptr;
+        m_size = 0;
+    }
+
+    [[nodiscard]] Node* get_head() const { return head; }
+    [[nodiscard]] Node* get_tail() const { return tail; }
 
    private:
     Node* head;
     Node* tail;
-    uint64_t m_size;
+    uint64_t m_size{0};
 };
-}  // namespace std
+}  // namespace ker::util

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -17,20 +18,30 @@ namespace ker::net::wki {
 
 constexpr size_t VFS_EXPORT_PATH_LEN = 256;
 constexpr size_t VFS_EXPORT_NAME_LEN = 64;
+constexpr size_t VFS_READLINK_CACHE_ENTRIES = 32;
+constexpr size_t VFS_READLINK_CACHE_TEXT_MAX = 512;
+
+// Bounce buffer size for RDMA-backed VFS I/O (reads and writes)
+constexpr uint32_t VFS_RDMA_BOUNCE_SIZE = 65536;
+
+// Bulk RDMA transfer buffer - used for large sequential reads to reduce round-trips.
+// Reads > VFS_RDMA_BOUNCE_SIZE are serviced through a single RDMA write into this
+// larger buffer instead of looping in 64 KB chunks.
+constexpr uint32_t VFS_RDMA_BULK_SIZE = 2097152;  // 2 MB
 
 // -----------------------------------------------------------------------------
-// VfsExport (server side) — explicitly registered export paths
+// VfsExport (server side) - explicitly registered export paths
 // -----------------------------------------------------------------------------
 
 struct VfsExport {
     bool active = false;
     uint32_t resource_id = 0;
-    char export_path[VFS_EXPORT_PATH_LEN] = {};  // NOLINT(modernize-avoid-c-arrays)
-    char name[VFS_EXPORT_NAME_LEN] = {};         // NOLINT(modernize-avoid-c-arrays)
+    char export_path[VFS_EXPORT_PATH_LEN] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    char name[VFS_EXPORT_NAME_LEN] = {};         // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 };
 
 // -----------------------------------------------------------------------------
-// RemoteVfsFd (server side) — files opened on behalf of remote consumers
+// RemoteVfsFd (server side) - files opened on behalf of remote consumers
 // -----------------------------------------------------------------------------
 
 struct RemoteVfsFd {
@@ -43,28 +54,63 @@ struct RemoteVfsFd {
 };
 
 // -----------------------------------------------------------------------------
-// ProxyVfsState (consumer side) — per-mount proxy state
+// ProxyVfsState (consumer side) - per-mount proxy state
 // -----------------------------------------------------------------------------
 
 struct ProxyVfsState {
+    struct ReadlinkCacheEntry {
+        bool valid = false;
+        int16_t status = 0;
+        uint16_t target_len = 0;
+        uint64_t cached_at_us = 0;
+        std::array<char, VFS_READLINK_CACHE_TEXT_MAX> path = {};
+        std::array<char, VFS_READLINK_CACHE_TEXT_MAX> target = {};
+    };
+
     bool active = false;
     uint16_t owner_node = WKI_NODE_INVALID;
     uint16_t assigned_channel = 0;
     uint32_t resource_id = 0;
     uint16_t max_op_size = 0;
+    std::atomic<bool> readlink_unsupported{false};
 
-    volatile bool op_pending = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+    std::atomic<bool> op_pending{false};
+    uint16_t op_expected_id = 0;
+    uint16_t op_expected_seq = 0;
     int16_t op_status = 0;
     void* op_resp_buf = nullptr;
     uint16_t op_resp_len = 0;
     uint16_t op_resp_max = 0;
+    WkiWaitEntry* op_wait_entry = nullptr;  // V2 I-4: async wait for DEV_OP_RESP
 
-    volatile bool attach_pending = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+    std::atomic<bool> attach_pending{false};
     uint8_t attach_status = 0;
     uint16_t attach_channel = 0;
     uint16_t attach_max_op_size = 0;
+    WkiWaitEntry* attach_wait_entry = nullptr;  // V2 I-4: async wait for DEV_ATTACH_ACK
 
-    char local_mount_path[VFS_EXPORT_PATH_LEN] = {};  // NOLINT(modernize-avoid-c-arrays)
+    std::array<char, VFS_EXPORT_PATH_LEN> local_mount_path = {};
+    std::array<ReadlinkCacheEntry, VFS_READLINK_CACHE_ENTRIES> readlink_cache = {};
+
+    // RDMA-backed I/O - populated at mount time when peer has RDMA transport.
+    // Consumer registers rdma_bounce_buf for reads (server rdma_writes here).
+    // For writes, consumer rdma_writes into server's pre-registered receive region.
+    bool rdma_capable = false;
+    WkiTransport* rdma_transport = nullptr;
+    uint32_t rdma_read_rkey = 0;                 // our bounce buffer's rkey (server writes file data here)
+    uint8_t* rdma_bounce_buf = nullptr;          // 64 KB bounce buffer for reads and write staging
+    uint32_t rdma_server_write_rkey = 0;         // server's receive region rkey (consumer writes here for writes)
+    uint32_t rdma_server_read_staging_rkey = 0;  // server's read staging rkey (RoCE pull mode: client rdma_reads from here)
+    uint32_t rdma_server_bulk_staging_rkey = 0;  // server's bulk staging rkey (RoCE bulk pull mode)
+
+    // Bulk RDMA I/O - larger registered buffer for sequential reads > 64 KB.
+    // Reduces round-trips from N (64 KB chunks) to 1 (up to 2 MB).
+    bool bulk_rdma_capable = false;
+    uint32_t rdma_bulk_rkey = 0;       // our bulk buffer's rkey (server writes large file data here)
+    uint8_t* rdma_bulk_buf = nullptr;  // 2 MB bulk buffer for large reads
+    uint32_t rdma_bulk_size = 0;       // actual allocated size
+    int32_t bulk_owner_fd = -1;        // remote_fd of file that last prefetched into bulk buffer
+    std::atomic<bool> shared_io_in_use{false};
 
     ker::mod::sys::Spinlock lock;
 };
@@ -73,7 +119,7 @@ struct ProxyVfsState {
 // D6: Read-ahead cache and write-behind buffer (consumer side)
 // -----------------------------------------------------------------------------
 
-constexpr size_t VFS_CACHE_SIZE = 4096;
+constexpr size_t VFS_CACHE_SIZE = 8192;
 
 struct ReadAheadCache {
     int64_t cached_offset = -1;  // Start offset of cached region (-1 = empty)
@@ -88,16 +134,41 @@ struct WriteBehindBuffer {
 };
 
 // -----------------------------------------------------------------------------
-// RemoteFileContext (consumer side) — stored in File::private_data
+// RemoteFileContext (consumer side) - stored in File::private_data
 // -----------------------------------------------------------------------------
 
 struct RemoteFileContext {
     ProxyVfsState* proxy = nullptr;
     int32_t remote_fd = -1;
 
+    // When browsing a remote host's /wki directory through its root export,
+    // suppress entries that would recurse back into that same exported root.
+    bool hide_recursive_wki_entries = false;
+    std::array<char, WKI_HOSTNAME_MAX> recursive_wki_hostname = {};
+
     // D6: Read-ahead and write-behind (lazily allocated on first use)
     ReadAheadCache* read_cache = nullptr;
     WriteBehindBuffer* write_buf = nullptr;
+
+    // Bulk prefetch cache state - tracks which region of the shared
+    // proxy->rdma_bulk_buf belongs to this file.  Valid only when
+    // proxy->bulk_owner_fd == remote_fd.
+    int64_t bulk_cached_offset = -1;
+    uint32_t bulk_cached_len = 0;
+};
+
+constexpr size_t WKI_REMOTE_VFS_PROXY_DIAG_MAX = 128;
+
+struct WkiRemoteVfsProxyDiag {
+    uint16_t owner_node = WKI_NODE_INVALID;
+    uint16_t assigned_channel = 0;
+    uint32_t resource_id = 0;
+    bool active = false;
+    bool op_pending = false;
+    uint16_t op_expected_id = 0;
+    uint16_t op_expected_seq = 0;
+    bool attach_pending = false;
+    std::array<char, VFS_EXPORT_PATH_LEN> local_mount_path = {};
 };
 
 // -----------------------------------------------------------------------------
@@ -116,20 +187,41 @@ auto wki_remote_vfs_find_export(uint32_t resource_id) -> VfsExport*;
 // Server side: advertise all VFS exports to all connected peers
 void wki_remote_vfs_advertise_exports();
 
+// Server side: advertise all VFS exports to one connected peer.
+void wki_remote_vfs_advertise_exports_to_peer(uint16_t peer_node);
+
 // Consumer side: mount a remote VFS at local_mount_path
 auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path) -> int;
 
+// Consumer side: best-effort diagnostic snapshot for /proc/wki/netdiag.
+auto wki_remote_vfs_proxy_diag_snapshot(WkiRemoteVfsProxyDiag* out, size_t max) -> size_t;
+
 // Consumer side: unmount a remote VFS
 void wki_remote_vfs_unmount(const char* local_mount_path);
+
+// Consumer side: find the current mount path for a mounted remote VFS resource.
+auto wki_remote_vfs_find_mount_for_resource(uint16_t owner_node, uint32_t resource_id, char* out, size_t out_size) -> bool;
 
 // Consumer side: called from vfs_open() for FSType::REMOTE mounts
 auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode, void* mount_private_data) -> ker::vfs::File*;
 
 // Consumer side: called from vfs_stat() for FSType::REMOTE mounts
-auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path, ker::vfs::stat* statbuf) -> int;
+auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path, ker::vfs::Stat* statbuf) -> int;
 
 // Consumer side: called from vfs_mkdir() for FSType::REMOTE mounts
 auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path, int mode) -> int;
+
+// Consumer side: called from vfs_unlink() for FSType::REMOTE mounts [V2 A9]
+auto wki_remote_vfs_unlink(void* mount_private_data, const char* fs_relative_path) -> int;
+
+// Consumer side: called from vfs_rmdir() for FSType::REMOTE mounts [V2 A9]
+auto wki_remote_vfs_rmdir(void* mount_private_data, const char* fs_relative_path) -> int;
+
+// Consumer side: called from vfs_rename() for FSType::REMOTE mounts [V2 A9]
+auto wki_remote_vfs_rename(void* mount_private_data, const char* old_fs_path, const char* new_fs_path) -> int;
+
+// Consumer side: readlink on a remote path (for vfs_readlink / resolve_symlinks)
+auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relative_path, char* buf, size_t bufsize) -> ssize_t;
 
 // Consumer side: get the FileOperations for remote VFS files
 auto wki_remote_vfs_get_fops() -> ker::vfs::FileOperations*;
@@ -137,7 +229,14 @@ auto wki_remote_vfs_get_fops() -> ker::vfs::FileOperations*;
 // D9: Auto-discover and advertise exportable local mount points as VFS resources
 void wki_remote_vfs_auto_discover();
 
-// Fencing cleanup — remove all state for a fenced peer
+// Refresh the local export table without sending adverts.
+void wki_remote_vfs_refresh_exports();
+
+// Rebuild and re-advertise VFS exports after mount topology changes such as
+// pivot_root(). Sends withdraws for stale exports before advertising the new set.
+void wki_remote_vfs_rebuild_exports();
+
+// Fencing cleanup - remove all state for a fenced peer
 void wki_remote_vfs_cleanup_for_peer(uint16_t node_id);
 
 // D10: Garbage-collect server-side remote FDs that have been idle for too long
@@ -145,14 +244,14 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id);
 void wki_remote_vfs_gc_stale_fds();
 
 // -----------------------------------------------------------------------------
-// Internal — RX message handlers (called from wki.cpp / dev_server.cpp)
+// Internal - RX message handlers (called from wki.cpp / dev_server.cpp)
 // -----------------------------------------------------------------------------
 
 namespace detail {
 
 // Server side: handle VFS operations (called from dev_server handle_dev_op_req)
-void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export_path, uint16_t op_id, const uint8_t* data,
-                   uint16_t data_len);
+void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export_path, const char* export_name, uint16_t op_id,
+                   const uint8_t* data, uint16_t data_len);
 
 // Consumer side: handle DEV_OP_RESP for VFS proxy
 void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);

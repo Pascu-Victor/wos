@@ -17,22 +17,22 @@ class CoredumpElfPanel : public QDockWidget {
    public:
     explicit CoredumpElfPanel(QWidget* parent = nullptr);
 
-    void setCoreDump(const wosdbg::CoreDump* dump);
-    void setSymbolInfo(const QString& binaryName, const QString& elfPath, const wosdbg::SymbolTable* symtab,
-                       const wosdbg::SectionMap* sections);
-    void addSymbolSource(const QString& label, const wosdbg::SymbolTable* symtab, const wosdbg::SectionMap* sections);
+    void set_core_dump(const wosdbg::CoreDump* dump);
+    void set_symbol_info(const QString& binary_name, const QString& elf_path, const wosdbg::SymbolTable* symtab,
+                         const wosdbg::SectionMap* sections);
+    void add_symbol_source(const QString& label, const wosdbg::SymbolTable* symtab, const wosdbg::SectionMap* sections);
     void clear();
 
    signals:
-    void addressClicked(uint64_t addr);
+    void address_clicked(uint64_t addr);
 
    private:
-    void setupUI();
+    void setup_ui();
 
-    QLabel* binaryLabel_ = nullptr;
-    QLabel* elfPathLabel_ = nullptr;
-    QLabel* embeddedElfLabel_ = nullptr;
+    QLabel* binary_label = nullptr;
+    QLabel* elf_path_label = nullptr;
+    QLabel* embedded_elf_label = nullptr;
 
-    QTreeWidget* sourceTree_ = nullptr;     // Symbol sources tree
-    QTableWidget* sectionTable_ = nullptr;  // Sections of the main ELF
+    QTreeWidget* source_tree = nullptr;     // Symbol sources tree
+    QTableWidget* section_table = nullptr;  // Sections of the main ELF
 };

@@ -1,11 +1,13 @@
 #include "transport_eth.hpp"
 
 #include <array>
+#include <cstdint>
 #include <cstring>
-#include <net/endian.hpp>
+#include <net/address.hpp>
 #include <net/netdevice.hpp>
 #include <net/packet.hpp>
 #include <net/proto/ethernet.hpp>
+#include <net/wki/peer.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -13,27 +15,58 @@
 
 namespace ker::net::wki {
 
+namespace {
+
 // -----------------------------------------------------------------------------
-// Neighbor MAC table — maps node_id to MAC address for Ethernet TX
+// Neighbor MAC table - maps node_id to MAC address for Ethernet TX
 // -----------------------------------------------------------------------------
 
 constexpr size_t ETH_NEIGHBOR_TABLE_SIZE = WKI_MAX_PEERS;
 
 struct EthNeighborEntry {
-    uint16_t node_id;
-    std::array<uint8_t, 6> mac;
-    bool valid;
+    uint16_t node_id = WKI_NODE_INVALID;
+    proto::MacAddress mac;
+    bool valid = false;
 };
 
-static std::array<EthNeighborEntry, ETH_NEIGHBOR_TABLE_SIZE> s_eth_neighbors;
-static ker::mod::sys::Spinlock s_eth_neighbor_lock;
+std::array<EthNeighborEntry, ETH_NEIGHBOR_TABLE_SIZE> s_eth_neighbors;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_eth_neighbor_lock;                            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
-void wki_eth_neighbor_add(uint16_t node_id, const std::array<uint8_t, 6>& mac) {
+struct EthTransportPrivate {
+    net::NetDevice* netdev = nullptr;
+    WkiRxHandler rx_handler = nullptr;
+};
+
+WkiTransport s_eth_transport;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+EthTransportPrivate s_eth_priv;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+bool s_eth_initialized = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+using log = ker::mod::dbg::logger<"wki">;
+
+// -----------------------------------------------------------------------------
+// Secondary transport pool - auto-registered for non-primary NICs that
+// receive WKI frames (e.g. a debug VM whose only NIC is the data bridge).
+// -----------------------------------------------------------------------------
+
+constexpr size_t MAX_SECONDARY_ETH_TRANSPORTS = 4;
+
+struct EthTransportSlot {
+    WkiTransport transport{};
+    EthTransportPrivate priv{};
+    bool active = false;
+};
+
+std::array<EthTransportSlot, MAX_SECONDARY_ETH_TRANSPORTS>
+    s_secondary_transports;                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_secondary_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+}  // namespace
+
+void wki_eth_neighbor_add(uint16_t node_id, const proto::MacAddress& mac) {
     s_eth_neighbor_lock.lock();
     for (auto& s_eth_neighbor : s_eth_neighbors) {
         if (s_eth_neighbor.valid && s_eth_neighbor.node_id == node_id) {
             // Update existing
-            memcpy(s_eth_neighbor.mac.data(), mac.data(), 6);
+            s_eth_neighbor.mac = mac;
             s_eth_neighbor_lock.unlock();
             return;
         }
@@ -42,7 +75,7 @@ void wki_eth_neighbor_add(uint16_t node_id, const std::array<uint8_t, 6>& mac) {
     for (auto& s_eth_neighbor : s_eth_neighbors) {
         if (!s_eth_neighbor.valid) {
             s_eth_neighbor.node_id = node_id;
-            memcpy(s_eth_neighbor.mac.data(), mac.data(), 6);
+            s_eth_neighbor.mac = mac;
             s_eth_neighbor.valid = true;
             s_eth_neighbor_lock.unlock();
             return;
@@ -62,11 +95,11 @@ void wki_eth_neighbor_remove(uint16_t node_id) {
     s_eth_neighbor_lock.unlock();
 }
 
-auto eth_neighbor_find_mac(uint16_t node_id, std::array<uint8_t, 6>& mac_out) -> bool {
+auto eth_neighbor_find_mac(uint16_t node_id, proto::MacAddress& mac_out) -> bool {
     s_eth_neighbor_lock.lock();
     for (auto& s_eth_neighbor : s_eth_neighbors) {
         if (s_eth_neighbor.valid && s_eth_neighbor.node_id == node_id) {
-            memcpy(mac_out.data(), s_eth_neighbor.mac.data(), 6);
+            mac_out = s_eth_neighbor.mac;
             s_eth_neighbor_lock.unlock();
             return true;
         }
@@ -74,36 +107,12 @@ auto eth_neighbor_find_mac(uint16_t node_id, std::array<uint8_t, 6>& mac_out) ->
     s_eth_neighbor_lock.unlock();
     return false;
 }
+
+namespace {
+
 // -----------------------------------------------------------------------------
 // Ethernet WKI Transport
 // -----------------------------------------------------------------------------
-
-struct EthTransportPrivate {
-    net::NetDevice* netdev;
-    WkiRxHandler rx_handler;
-};
-
-static WkiTransport s_eth_transport;
-static EthTransportPrivate s_eth_priv;
-static bool s_eth_initialized = false;
-
-// -----------------------------------------------------------------------------
-// Secondary transport pool — auto-registered for non-primary NICs that
-// receive WKI frames (e.g. a debug VM whose only NIC is the data bridge).
-// -----------------------------------------------------------------------------
-
-constexpr size_t MAX_SECONDARY_ETH_TRANSPORTS = 4;
-
-struct EthTransportSlot {
-    WkiTransport transport{};
-    EthTransportPrivate priv{};
-    bool active = false;
-};
-
-static std::array<EthTransportSlot, MAX_SECONDARY_ETH_TRANSPORTS> s_secondary_transports;
-static ker::mod::sys::Spinlock s_secondary_lock;
-
-namespace {
 
 // TX: send a WKI frame over Ethernet
 int eth_wki_tx(WkiTransport* self, uint16_t neighbor_id, const void* data, uint16_t len) {
@@ -112,23 +121,22 @@ int eth_wki_tx(WkiTransport* self, uint16_t neighbor_id, const void* data, uint1
         return -1;
     }
 
-    std::array<uint8_t, 6> dst_mac{};
+    proto::MacAddress dst_mac;
 
     if (neighbor_id == WKI_NODE_BROADCAST) {
         dst_mac = proto::ETH_BROADCAST;
     } else {
         // Fast path: peer->mac is already in L1 cache from the send path's
         // earlier wki_peer_find() lookup. Avoids separate neighbor table lock.
-        WkiPeer* peer = wki_peer_find(neighbor_id);
+        WkiPeer const* peer = wki_peer_find(neighbor_id);
         if (peer != nullptr) {
-            memcpy(dst_mac.data(), peer->mac.data(), 6);
+            dst_mac = peer->mac;
         } else if (!eth_neighbor_find_mac(neighbor_id, dst_mac)) {
             return -1;  // unknown neighbor MAC
         }
     }
 
-    // Allocate a PacketBuffer
-    PacketBuffer* pkt = pkt_alloc();
+    PacketBuffer* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return -1;
     }
@@ -156,14 +164,14 @@ int eth_wki_tx_pkt(WkiTransport* self, uint16_t neighbor_id, net::PacketBuffer* 
         return -1;
     }
 
-    std::array<uint8_t, 6> dst_mac{};
+    proto::MacAddress dst_mac;
 
     if (neighbor_id == WKI_NODE_BROADCAST) {
         dst_mac = proto::ETH_BROADCAST;
     } else {
-        WkiPeer* peer = wki_peer_find(neighbor_id);
+        WkiPeer const* peer = wki_peer_find(neighbor_id);
         if (peer != nullptr) {
-            memcpy(dst_mac.data(), peer->mac.data(), 6);
+            dst_mac = peer->mac;
         } else if (!eth_neighbor_find_mac(neighbor_id, dst_mac)) {
             pkt_free(pkt);
             return -1;
@@ -179,20 +187,17 @@ void eth_wki_set_rx_handler(WkiTransport* self, WkiRxHandler handler) {
     auto* priv = static_cast<EthTransportPrivate*>(self->private_data);
     priv->rx_handler = handler;
 }
-}  // namespace
 
 // -----------------------------------------------------------------------------
-// RX entry point — called from ethernet.cpp's eth_rx() switch
+// RX entry point - called from ethernet.cpp's eth_rx() switch
 // -----------------------------------------------------------------------------
-
-namespace {
 
 // Resolve (or auto-create) the WkiTransport for the actual ingress NIC.
 // If the frame arrived on the primary WKI NIC we return &s_eth_transport.
 // Otherwise we allocate a lightweight secondary transport so that the
 // peer record stores the correct NIC for TX replies.
 auto get_or_create_eth_transport(net::NetDevice* dev) -> WkiTransport* {
-    // Primary NIC — fast path
+    // Primary NIC - fast path
     if (dev == s_eth_priv.netdev) {
         return &s_eth_transport;
     }
@@ -229,16 +234,16 @@ auto get_or_create_eth_transport(net::NetDevice* dev) -> WkiTransport* {
 
             s_secondary_lock.unlock();
 
-            // Register with WKI core — sets the RX handler on this transport
+            // Register with WKI core - sets the RX handler on this transport
             wki_transport_register(&slot.transport);
 
-            ker::mod::dbg::log("[WKI] Secondary Ethernet transport auto-registered on %s", dev->name.data());
+            log::info("Secondary Ethernet transport auto-registered on %s", dev->name.data());
             return &slot.transport;
         }
     }
 
     s_secondary_lock.unlock();
-    // Pool exhausted — fall back to primary (best effort)
+    // Pool exhausted - fall back to primary (best effort)
     return &s_eth_transport;
 }
 
@@ -258,12 +263,17 @@ void wki_eth_rx(net::NetDevice* dev, net::PacketBuffer* pkt) {
         return;
     }
 
-    // Resolve the transport for the ingress NIC — auto-creates a secondary
+    // Resolve the transport for the ingress NIC - auto-creates a secondary
     // transport when the frame arrived on a NIC other than the primary WKI NIC.
     // This ensures that handle_hello() records the correct transport for the
     // peer, so HELLO_ACK and resource adverts go back on the right interface.
     WkiTransport* transport = get_or_create_eth_transport(dev);
     auto* priv = static_cast<EthTransportPrivate*>(transport->private_data);
+    const auto* hdr = reinterpret_cast<const WkiHeader*>(pkt->data);
+
+    if (hdr->src_node != WKI_NODE_INVALID && hdr->src_node != WKI_NODE_BROADCAST && hdr->src_node != g_wki.my_node_id) {
+        wki_peer_note_rx_contact(transport, hdr->src_node, pkt->src_mac);
+    }
 
     if (priv->rx_handler != nullptr) {
         priv->rx_handler(transport, pkt->data, static_cast<uint16_t>(pkt->len));
@@ -305,13 +315,18 @@ void wki_eth_transport_init(net::NetDevice* netdev) {
     s_eth_transport.next = nullptr;
 
     // Copy our MAC into global state
-    memcpy(g_wki.my_mac.data(), netdev->mac.data(), 6);
+    g_wki.my_mac = netdev->mac;
+
+    // Mark this NIC as WKI-owned so it is not advertised to peers as a
+    // remotable NET resource and not eligible for remote-attach.
+    netdev->remotable = nullptr;
+    netdev->wki_transport = true;
 
     // Register with WKI core
     wki_transport_register(&s_eth_transport);
 
     s_eth_initialized = true;
-    ker::mod::dbg::log("[WKI] Ethernet transport initialized on %s", netdev->name.data());
+    ker::mod::dbg::log("[WKI] Ethernet transport initialized on %s (marked non-remotable)", netdev->name.data());
 }
 
 auto wki_eth_get_netdev() -> net::NetDevice* { return s_eth_priv.netdev; }

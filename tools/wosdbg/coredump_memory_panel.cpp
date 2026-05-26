@@ -1,19 +1,35 @@
 #include "coredump_memory_panel.h"
 
+#include <qabstractitemview.h>
+#include <qcolor.h>
+#include <qdockwidget.h>
+#include <qlineedit.h>
+#include <qnamespace.h>
+#include <qobject.h>
+#include <qpushbutton.h>
+#include <qtablewidget.h>
+#include <qtextedit.h>
+#include <qtmetamacros.h>
+#include <qwidget.h>
+
 #include <QFont>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
 #include <QSplitter>
 #include <QVBoxLayout>
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+#include <vector>
 
 #include "coredump_memory.h"
 #include "coredump_parser.h"
 #include "elf_symbol_resolver.h"
 
-CoredumpMemoryPanel::CoredumpMemoryPanel(QWidget* parent) : QDockWidget("Memory", parent) { setupUI(); }
+CoredumpMemoryPanel::CoredumpMemoryPanel(QWidget* parent) : QDockWidget("Memory", parent) { setup_ui(); }
 
-void CoredumpMemoryPanel::setupUI() {
+void CoredumpMemoryPanel::setup_ui() {
     auto* container = new QWidget(this);
     auto* main_layout = new QVBoxLayout(container);
     main_layout->setContentsMargins(4, 4, 4, 4);
@@ -22,27 +38,27 @@ void CoredumpMemoryPanel::setupUI() {
     // Address range toolbar
     auto* toolbar = new QHBoxLayout();
     toolbar->addWidget(new QLabel("From:"));
-    fromEdit_ = new QLineEdit(container);
-    fromEdit_->setPlaceholderText("0x...");
-    fromEdit_->setMaximumWidth(180);
+    from_edit = new QLineEdit(container);
+    from_edit->setPlaceholderText("0x...");
+    from_edit->setMaximumWidth(180);
     QFont mono("Monospace", 9);
     mono.setStyleHint(QFont::Monospace);
-    fromEdit_->setFont(mono);
-    toolbar->addWidget(fromEdit_);
+    from_edit->setFont(mono);
+    toolbar->addWidget(from_edit);
 
     toolbar->addWidget(new QLabel("To:"));
-    toEdit_ = new QLineEdit(container);
-    toEdit_->setPlaceholderText("0x...");
-    toEdit_->setMaximumWidth(180);
-    toEdit_->setFont(mono);
-    toolbar->addWidget(toEdit_);
+    to_edit = new QLineEdit(container);
+    to_edit->setPlaceholderText("0x...");
+    to_edit->setMaximumWidth(180);
+    to_edit->setFont(mono);
+    toolbar->addWidget(to_edit);
 
-    dumpButton_ = new QPushButton("Dump", container);
-    connect(dumpButton_, &QPushButton::clicked, this, &CoredumpMemoryPanel::onDumpButtonClicked);
-    toolbar->addWidget(dumpButton_);
+    dump_button = new QPushButton("Dump", container);
+    connect(dump_button, &QPushButton::clicked, this, &CoredumpMemoryPanel::on_dump_button_clicked);
+    toolbar->addWidget(dump_button);
 
     auto* rsp_button = new QPushButton("Stack @ RSP", container);
-    connect(rsp_button, &QPushButton::clicked, this, &CoredumpMemoryPanel::dumpStackAroundRsp);
+    connect(rsp_button, &QPushButton::clicked, this, &CoredumpMemoryPanel::dump_stack_around_rsp);
     toolbar->addWidget(rsp_button);
 
     toolbar->addStretch();
@@ -52,35 +68,35 @@ void CoredumpMemoryPanel::setupUI() {
     auto* splitter = new QSplitter(Qt::Vertical, container);
 
     // Annotated qword table
-    qwordTable_ = new QTableWidget(splitter);
-    qwordTable_->setColumnCount(5);
-    qwordTable_->setHorizontalHeaderLabels({"", "Virtual Address", "Value", "Symbol", "Notes"});
-    qwordTable_->verticalHeader()->setVisible(false);
-    qwordTable_->horizontalHeader()->setStretchLastSection(true);
-    qwordTable_->setAlternatingRowColors(true);
-    qwordTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
-    qwordTable_->setColumnWidth(0, 30);  // Gutter
+    qword_table = new QTableWidget(splitter);
+    qword_table->setColumnCount(5);
+    qword_table->setHorizontalHeaderLabels({"", "Virtual Address", "Value", "Symbol", "Notes"});
+    qword_table->verticalHeader()->setVisible(false);
+    qword_table->horizontalHeader()->setStretchLastSection(true);
+    qword_table->setAlternatingRowColors(true);
+    qword_table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    qword_table->setColumnWidth(0, 30);  // Gutter
 
-    connect(qwordTable_, &QTableWidget::cellClicked, [this](int row, int col) {
+    connect(qword_table, &QTableWidget::cellClicked, [this](int row, int col) {
         if (col == 2) {  // Value column
-            QTableWidgetItem* item = qwordTable_->item(row, col);
+            QTableWidgetItem* item = qword_table->item(row, col);
             if (item) {
                 QVariant v = item->data(Qt::UserRole);
                 if (v.isValid()) {
-                    emit addressClicked(v.toULongLong());
+                    emit address_clicked(v.toULongLong());
                 }
             }
         }
     });
 
-    splitter->addWidget(qwordTable_);
+    splitter->addWidget(qword_table);
 
     // Raw hex view
-    hexView_ = new QTextEdit(splitter);
-    hexView_->setReadOnly(true);
-    hexView_->setFont(mono);
-    hexView_->setMaximumHeight(200);
-    splitter->addWidget(hexView_);
+    hex_view = new QTextEdit(splitter);
+    hex_view->setReadOnly(true);
+    hex_view->setFont(mono);
+    hex_view->setMaximumHeight(200);
+    splitter->addWidget(hex_view);
 
     splitter->setSizes({400, 200});
     main_layout->addWidget(splitter);
@@ -97,27 +113,27 @@ static QTableWidgetItem* make_mono_item(const QString& text) {
     return item;
 }
 
-void CoredumpMemoryPanel::setCoreDump(const wosdbg::CoreDump* dump, const std::vector<wosdbg::SymbolTable*>& sym_tables,
-                                      const std::vector<wosdbg::SectionMap*>& section_maps) {
-    currentDump_ = dump;
-    symTables_ = sym_tables;
-    sectionMaps_ = section_maps;
+void CoredumpMemoryPanel::set_core_dump(const wosdbg::CoreDump* dump, const std::vector<wosdbg::SymbolTable*>& sym_tables,
+                                        const std::vector<wosdbg::SectionMap*>& section_maps) {
+    this->current_dump = dump;
+    this->sym_tables = sym_tables;
+    this->section_maps = section_maps;
 }
 
-void CoredumpMemoryPanel::dumpRange(uint64_t va_start, uint64_t va_end) {
-    if (!currentDump_) {
+void CoredumpMemoryPanel::dump_range(uint64_t va_start, uint64_t va_end) {
+    if (!current_dump) {
         return;
     }
 
     // Update address fields
-    fromEdit_->setText(wosdbg::formatU64(va_start));
-    toEdit_->setText(wosdbg::formatU64(va_end));
+    from_edit->setText(wosdbg::format_u64(va_start));
+    to_edit->setText(wosdbg::format_u64(va_end));
 
     // Populate qword table
-    auto qwords = wosdbg::dumpRange(*currentDump_, va_start, va_end, symTables_, sectionMaps_);
-    qwordTable_->setRowCount(static_cast<int>(qwords.size()));
+    auto qwords = wosdbg::dump_range(*current_dump, va_start, va_end, sym_tables, section_maps);
+    qword_table->setRowCount(static_cast<int>(qwords.size()));
 
-    for (int i = 0; i < static_cast<int>(qwords.size()); ++i) {
+    for (int i = 0; std::cmp_less(i, qwords.size()); ++i) {
         const auto& q = qwords[static_cast<size_t>(i)];
 
         // Gutter (direction indicator)
@@ -125,30 +141,30 @@ void CoredumpMemoryPanel::dumpRange(uint64_t va_start, uint64_t va_end) {
         if (q.gutter == ">>>") {
             gutter_item->setBackground(QColor(80, 80, 40));  // Highlight RSP row
         }
-        qwordTable_->setItem(i, 0, gutter_item);
+        qword_table->setItem(i, 0, gutter_item);
 
         // Virtual address
-        qwordTable_->setItem(i, 1, make_mono_item(wosdbg::formatU64(q.va)));
+        qword_table->setItem(i, 1, make_mono_item(wosdbg::format_u64(q.va)));
 
         // Value
-        auto* val_item = make_mono_item(wosdbg::formatU64(q.value));
+        auto* val_item = make_mono_item(wosdbg::format_u64(q.value));
         val_item->setData(Qt::UserRole, QVariant::fromValue(q.value));
-        qwordTable_->setItem(i, 2, val_item);
+        qword_table->setItem(i, 2, val_item);
 
         // Symbol
         auto* sym_item = make_mono_item(q.symbol);
         if (!q.symbol.isEmpty()) {
             sym_item->setForeground(QColor(100, 149, 237));  // Blue for symbols
         }
-        qwordTable_->setItem(i, 3, sym_item);
+        qword_table->setItem(i, 3, sym_item);
 
         // Notes
-        qwordTable_->setItem(i, 4, make_mono_item(q.notes));
+        qword_table->setItem(i, 4, make_mono_item(q.notes));
 
         // Highlight the RSP row
         if (q.gutter == ">>>") {
             for (int c = 0; c < 5; ++c) {
-                auto* item = qwordTable_->item(i, c);
+                auto* item = qword_table->item(i, c);
                 if (item) {
                     item->setBackground(QColor(80, 80, 40));
                 }
@@ -156,50 +172,50 @@ void CoredumpMemoryPanel::dumpRange(uint64_t va_start, uint64_t va_end) {
         }
     }
 
-    qwordTable_->resizeColumnsToContents();
+    qword_table->resizeColumnsToContents();
 
     // Populate hex view
-    auto rows = wosdbg::dumpRangeHex(*currentDump_, va_start, va_end);
+    auto rows = wosdbg::dump_range_hex(*current_dump, va_start, va_end);
     QString hex_text;
     for (const auto& row : rows) {
-        hex_text += QString("%1:  %2  |%3|\n").arg(wosdbg::formatU64(row.va)).arg(row.hexString, -48).arg(row.asciiString);
+        hex_text += QString("%1:  %2  |%3|\n").arg(wosdbg::format_u64(row.va)).arg(row.hex_string, -48).arg(row.ascii_string);
     }
-    hexView_->setPlainText(hex_text);
+    hex_view->setPlainText(hex_text);
 }
 
-void CoredumpMemoryPanel::dumpStackAroundRsp() {
-    if (!currentDump_) {
+void CoredumpMemoryPanel::dump_stack_around_rsp() {
+    if (!current_dump) {
         return;
     }
 
-    uint64_t rsp = currentDump_->trapFrame.rsp;
+    uint64_t rsp = current_dump->trap_frame.rsp;
     // Dump 256 bytes before and 256 bytes after RSP
     uint64_t start = (rsp >= 0x100) ? rsp - 0x100 : 0;
     uint64_t end = rsp + 0x100;
-    dumpRange(start, end);
+    dump_range(start, end);
 }
 
-void CoredumpMemoryPanel::onDumpButtonClicked() {
-    if (!currentDump_) {
+void CoredumpMemoryPanel::on_dump_button_clicked() {
+    if (!current_dump) {
         return;
     }
 
     bool ok_from;
     bool ok_to;
-    uint64_t va_start = fromEdit_->text().toULongLong(&ok_from, 16);
-    uint64_t va_end = toEdit_->text().toULongLong(&ok_to, 16);
+    uint64_t va_start = from_edit->text().toULongLong(&ok_from, 16);
+    uint64_t va_end = to_edit->text().toULongLong(&ok_to, 16);
 
     if (!ok_from || !ok_to || va_end <= va_start) {
         return;
     }
 
-    dumpRange(va_start, va_end);
+    dump_range(va_start, va_end);
 }
 
 void CoredumpMemoryPanel::clear() {
-    qwordTable_->setRowCount(0);
-    hexView_->clear();
-    fromEdit_->clear();
-    toEdit_->clear();
-    currentDump_ = nullptr;
+    qword_table->setRowCount(0);
+    hex_view->clear();
+    from_edit->clear();
+    to_edit->clear();
+    current_dump = nullptr;
 }

@@ -1,7 +1,10 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
+#include <platform/sys/mutex.hpp>
 
 #include "../file_operations.hpp"
 #include "../vfs.hpp"
@@ -29,12 +32,28 @@ struct TmpNode {
     uint32_t mode = 0;  // Permission bits (e.g. 0644 for files, 0755 for dirs)
     uint32_t uid = 0;   // Owner user ID
     uint32_t gid = 0;   // Owner group ID
+
+    // Serializes file data/size updates for regular file I/O.
+    ker::mod::sys::Mutex io_lock;
+
+    // Reference counting for POSIX unlink semantics
+    std::atomic<uint32_t> open_count{0};
+    bool unlinked = false;  // true once removed from parent directory
 };
+
+// Free a TmpNode and its owned buffers. Call only when open_count == 0.
+void tmpfs_free_node(TmpNode* node);
+
+// Serialization — must be held when checking/modifying open_count + unlinked
+// together with tree mutations (unlink, rmdir, rename).
+void tmpfs_lock_tree();
+void tmpfs_unlock_tree();
 
 // Initialization
 void register_tmpfs();
 
 // Root node access (used by initramfs unpacker)
+auto create_root_node() -> TmpNode*;
 auto get_root_node() -> TmpNode*;
 
 // Node operations
@@ -46,13 +65,17 @@ auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target)
 // Walk a multi-component path relative to root.
 // If create_intermediate is true, missing directory components are created.
 // The path should NOT have a leading "/" (it's relative to tmpfs root).
+auto tmpfs_walk_path(TmpNode* root, const char* path, bool create_intermediate) -> TmpNode*;
 auto tmpfs_walk_path(const char* path, bool create_intermediate) -> TmpNode*;
 
 // File-level operations
+auto create_root_file(TmpNode* root) -> ker::vfs::File*;
 auto create_root_file() -> ker::vfs::File*;
+auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ker::vfs::File*;
 auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File*;
 auto tmpfs_read(ker::vfs::File* f, void* buf, std::size_t count, std::size_t offset) -> ssize_t;
 auto tmpfs_write(ker::vfs::File* f, const void* buf, std::size_t count, std::size_t offset) -> ssize_t;
+auto tmpfs_write_append(ker::vfs::File* f, const void* buf, std::size_t count, std::size_t* offset_out) -> ssize_t;
 auto tmpfs_get_size(ker::vfs::File* f) -> std::size_t;
 
 // FileOperations callback wrappers

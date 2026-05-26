@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TraceBench</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #101215;
+      color: #ece7df;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #101215;
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(260px, 340px) 1fr;
+      gap: 24px;
+      min-height: 100vh;
+      padding: 24px;
+      box-sizing: border-box;
+    }
+    aside {
+      border-right: 1px solid #34383f;
+      padding-right: 24px;
+    }
+    h1 {
+      margin: 0 0 18px;
+      font-size: 28px;
+      font-weight: 720;
+      letter-spacing: 0;
+    }
+    dl {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px 18px;
+      margin: 0;
+      font-size: 14px;
+    }
+    dt {
+      color: #aeb7c2;
+    }
+    dd {
+      margin: 0;
+      font-variant-numeric: tabular-nums;
+    }
+    .bar {
+      height: 12px;
+      background: #272b31;
+      border: 1px solid #3d434c;
+      border-radius: 6px;
+      overflow: hidden;
+      margin: 22px 0;
+    }
+    .fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #49b38f, #d8c36a);
+      transition: width 180ms ease;
+    }
+    .viewport {
+      display: grid;
+      place-items: center;
+      min-width: 0;
+    }
+    img {
+      max-width: 100%;
+      max-height: calc(100vh - 48px);
+      background: #050608;
+      image-rendering: auto;
+      border: 1px solid #34383f;
+    }
+    .muted {
+      color: #aeb7c2;
+      font-size: 13px;
+      margin-top: 18px;
+    }
+    @media (max-width: 760px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+      aside {
+        border-right: 0;
+        border-bottom: 1px solid #34383f;
+        padding: 0 0 20px;
+      }
+      img {
+        max-height: 70vh;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <aside>
+      <h1>TraceBench</h1>
+      <div class="bar"><div class="fill" id="fill"></div></div>
+      <dl>
+        <dt>Run</dt><dd id="run">-</dd>
+        <dt>Backend</dt><dd id="backend">-</dd>
+        <dt>Placement</dt><dd id="placement">-</dd>
+        <dt>Resolution</dt><dd id="resolution">-</dd>
+        <dt>Tiles</dt><dd id="tiles">-</dd>
+        <dt>Samples</dt><dd id="samples">-</dd>
+        <dt>Elapsed</dt><dd id="elapsed">-</dd>
+      </dl>
+      <p class="muted" id="state">Waiting for a render.</p>
+    </aside>
+    <section class="viewport">
+      <img id="preview" alt="TraceBench preview">
+    </section>
+  </main>
+  <script>
+    const ids = ["run", "backend", "placement", "resolution", "tiles", "samples", "elapsed", "state"];
+    const el = Object.fromEntries(ids.map((id) => [id, document.getElementById(id)]));
+    const fill = document.getElementById("fill");
+    const preview = document.getElementById("preview");
+    let activeRun = "";
+
+    async function json(path) {
+      const response = await fetch(`${path}?t=${Date.now()}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(path);
+      return response.json();
+    }
+
+    async function tick() {
+      try {
+        const latest = await json("/srv/tracebench/runs/latest.json");
+        activeRun = latest.run_id || activeRun;
+        if (!activeRun) return;
+        const status = await json(`/srv/tracebench/runs/${activeRun}/status.json`);
+        const percent = status.total_tiles ? (status.tiles_done / status.total_tiles) * 100 : 0;
+        fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+        el.run.textContent = status.run_id || activeRun;
+        el.backend.textContent = status.backend || "-";
+        el.placement.textContent = status.placement || "-";
+        el.resolution.textContent = `${status.width} x ${status.height}`;
+        el.tiles.textContent = `${status.tiles_done} / ${status.total_tiles}`;
+        el.samples.textContent = `${status.samples_done} / ${status.total_samples}`;
+        el.elapsed.textContent = `${Number(status.elapsed_seconds || 0).toFixed(2)}s`;
+        el.state.textContent = status.done ? "Frame complete." : "Rendering.";
+        preview.src = `/srv/tracebench/runs/${activeRun}/${status.done ? "frame_000.png" : "preview.png"}?t=${Date.now()}`;
+      } catch {
+        el.state.textContent = "Waiting for a render.";
+      }
+    }
+
+    tick();
+    setInterval(tick, 1000);
+  </script>
+</body>
+</html>

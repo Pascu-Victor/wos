@@ -1,0 +1,61 @@
+# WOS process management syscall descriptions for Syzkaller.
+#
+# WOS syscall ABI:
+#   RAX = 3 (callnums::process)
+#   RDI = process::procmgmt_ops enum (sub-operation)
+#   RSI..R10 = arguments a1..a4
+
+include <abi/callnums/process.h>
+
+# --- Process lifecycle ---
+
+wos_proc$exit(op const[0], status int32)
+wos_proc$exec(op const[1], path ptr[in, filename], argv ptr[in, array[ptr[in, filename]]], envp ptr[in, array[ptr[in, filename]]]) int64
+wos_proc$execve(op const[24], path ptr[in, filename], argv ptr[in, array[ptr[in, filename]]], envp ptr[in, array[ptr[in, filename]]]) int64
+wos_proc$waitpid(op const[2], pid int32, status ptr[out, int32], options int32) int64
+wos_proc$fork(op const[5]) int64
+wos_proc$getpid(op const[3]) int64
+wos_proc$getppid(op const[4]) int64
+
+# --- Signals ---
+
+wos_proc$sigaction(op const[6], signum int32, act ptr[in, array[int8, 32]], oldact ptr[out, array[int8, 32]]) int64
+wos_proc$sigprocmask(op const[7], how int32, set ptr[in, int64], oldset ptr[out, int64]) int64
+wos_proc$kill(op const[8], pid int32, sig int32) int64
+wos_proc$sigreturn(op const[9]) int64
+
+# --- Identity ---
+
+wos_proc$getuid(op const[10]) int64
+wos_proc$geteuid(op const[11]) int64
+wos_proc$getgid(op const[12]) int64
+wos_proc$getegid(op const[13]) int64
+wos_proc$getgroups(op const[31], size len[list], list ptr[out, array[int32]]) int64
+wos_proc$setuid(op const[14], uid int32) int64
+wos_proc$setgid(op const[15], gid int32) int64
+wos_proc$seteuid(op const[16], euid int32) int64
+wos_proc$setegid(op const[17], egid int32) int64
+wos_proc$setgroups(op const[32], size len[list], list ptr[in, array[int32]]) int64
+wos_proc$getumask(op const[18]) int64
+wos_proc$setumask(op const[19], mask int32) int64
+
+# --- Session / process group ---
+
+wos_proc$setsid(op const[20]) int64
+wos_proc$getsid(op const[21], pid int32) int64
+wos_proc$setpgid(op const[22], pid int32, pgid int32) int64
+wos_proc$getpgid(op const[23], pid int32) int64
+
+# --- Hostname ---
+
+wos_proc$gethostname(op const[25], buf ptr[out, array[int8, 256]], len const[256]) int64
+wos_proc$sethostname(op const[26], name ptr[in, string], len bytesize[name]) int64
+
+# --- Scheduler priority ---
+
+wos_proc$setpriority(op const[27], which int32, who int32, prio int32) int64
+
+# --- WKI target (distributed compute) ---
+
+wos_proc$setwkitarget(op const[28], target int32) int64
+wos_proc$getwkitarget(op const[29]) int64

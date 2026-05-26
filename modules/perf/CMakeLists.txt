@@ -1,0 +1,33 @@
+cmake_minimum_required(VERSION 3.28)
+
+project(perf LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Compiler flags
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Werror -fno-sanitize=safe-stack")
+
+# Include paths
+include_directories(
+    ${CMAKE_SOURCE_DIR}/modules/defines
+    ${CMAKE_SOURCE_DIR}/modules/kern/src
+    ${CMAKE_SOURCE_DIR}/modules/kern/src/abi
+    ${CMAKE_SOURCE_DIR}/modules/stdlib/src
+)
+
+# Source files
+set(SOURCES
+    src/main.cpp
+)
+
+# Create executable
+add_executable(perf ${SOURCES})
+
+# Linker settings
+set_target_properties(perf PROPERTIES
+    LINK_FLAGS "-Wl,-z,now -Wl,--no-dynamic-linker"
+)
+
+target_link_libraries(perf c++abi c++ c unwind)

@@ -26,15 +26,24 @@ SECTIONS
     /* base load address. */
     . = 0xffffffff80000000 + SIZEOF_HEADERS;
 
+    __kernel_text_start = .;
     .text : {
         *(.text .text.*)
     } :text
+    __kernel_text_end = .;
 
     /* Move to the next memory page for .rodata */
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
     .rodata : {
         *(.rodata .rodata.*)
+    } :rodata
+
+    /* In-kernel self-test registry (populated by KTEST() macro, iterated by run_all()) */
+    .ktests : {
+        __start_ktests = .;
+        KEEP(*(.ktests))
+        __stop_ktests = .;
     } :rodata
 
     /* Move to the next memory page for .data */
@@ -77,6 +86,10 @@ SECTIONS
         *(.bss .bss.*)
         *(COMMON)
     } :data
+
+    /* End of kernel image — page-aligned so MMIO regions can be mapped right after. */
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    PROVIDE(__kernel_end = .);
 
     /* Discard .note.* and .eh_frame* since they may cause issues on some hosts. */
     /* Also discard the program interpreter section since we do not need one. This is */

@@ -2,12 +2,16 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
-#include <platform/ktime/ktime.hpp>
+#include <platform/perf/perf_events.hpp>
+#include <platform/sched/scheduler.hpp>
+
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::net::wki {
 
@@ -21,6 +25,31 @@ std::deque<WkiEventSubscription> g_subscriptions;  // NOLINT(cppcoreguidelines-a
 std::deque<WkiEventHandler> g_local_handlers;      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_event_initialized = false;                  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+auto perf_current_pid() -> uint64_t {
+    auto* task = ker::mod::sched::get_current_task();
+    return task != nullptr ? task->pid : 0;
+}
+
+auto perf_current_cpu() -> uint32_t {
+    auto* task = ker::mod::sched::get_current_task();
+    return task != nullptr ? static_cast<uint32_t>(task->cpu) : 0U;
+}
+
+void perf_record_event_point(ker::mod::perf::WkiPerfEventOp op, uint16_t peer, int32_t status, uint32_t aux, uint32_t correlation,
+                             uint64_t callsite) {
+    if (!ker::mod::perf::is_wki_recording_enabled()) {
+        return;
+    }
+
+    ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::EVENT_BUS,
+                                     static_cast<uint8_t>(op), ker::mod::perf::WkiPerfPhase::POINT, peer, WKI_CHAN_EVENT_BUS, correlation,
+                                     status, aux, callsite);
+    uint32_t const LATENCY_US = (op == ker::mod::perf::WkiPerfEventOp::REPLAY) ? aux : 0U;
+    ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::EVENT_BUS, static_cast<uint8_t>(op), peer, WKI_CHAN_EVENT_BUS, status,
+                                       LATENCY_US, op == ker::mod::perf::WkiPerfEventOp::REPLAY,
+                                       op == ker::mod::perf::WkiPerfEventOp::RETRY ? 1U : 0U, 0);
+}
+
 bool event_matches(uint16_t sub_class, uint16_t sub_id, uint16_t pub_class, uint16_t pub_id) {
     if (sub_class != EVENT_WILDCARD && sub_class != pub_class) {
         return false;
@@ -32,7 +61,7 @@ bool event_matches(uint16_t sub_class, uint16_t sub_id, uint16_t pub_class, uint
 }
 
 // -----------------------------------------------------------------------------
-// D1: Pending reliable events — awaiting ACK from remote subscribers
+// D1: Pending reliable events - awaiting ACK from remote subscribers
 // -----------------------------------------------------------------------------
 
 constexpr uint8_t RELIABLE_MAX_RETRIES = 5;
@@ -44,6 +73,7 @@ struct PendingReliableEvent {
     uint16_t event_id = 0;
     uint16_t origin_node = 0;
     uint64_t send_time_us = 0;
+    uint32_t correlation = 0;
     uint8_t retries = 0;
     uint16_t payload_len = 0;
     std::array<uint8_t, sizeof(EventPublishPayload) + 256> payload = {};
@@ -51,19 +81,22 @@ struct PendingReliableEvent {
 
 std::deque<PendingReliableEvent> g_pending_reliable;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+ker::mod::sys::Spinlock s_event_lock;
+
 // -----------------------------------------------------------------------------
-// D2: Event log ring buffer — replay matching events to new subscribers
+// D2: Event log ring buffer - replay matching events to new subscribers
 // -----------------------------------------------------------------------------
 
 constexpr size_t EVENT_LOG_MAX = 128;
 
 struct EventLogEntry {
+    static constexpr size_t DATA_MAX = 256;
     uint16_t event_class = 0;
     uint16_t event_id = 0;
     uint16_t origin_node = 0;
     uint16_t data_len = 0;
     uint64_t timestamp_us = 0;
-    std::array<uint8_t, 256> data = {};
+    std::array<uint8_t, DATA_MAX> data = {};
 };
 
 std::array<EventLogEntry, EVENT_LOG_MAX> g_event_log;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -71,7 +104,7 @@ uint32_t g_event_log_head = 0;                         // NOLINT(cppcoreguidelin
 uint32_t g_event_log_count = 0;                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 void event_log_push(uint16_t event_class, uint16_t event_id, uint16_t origin_node, const void* data, uint16_t data_len) {
-    auto& entry = g_event_log[g_event_log_head];
+    auto& entry = g_event_log.at(g_event_log_head);
     entry.event_class = event_class;
     entry.event_id = event_id;
     entry.origin_node = origin_node;
@@ -92,6 +125,8 @@ void event_log_replay_to(uint16_t subscriber_node, uint16_t sub_class, uint16_t 
         return;
     }
 
+    uint64_t const REPLAY_START_US = wki_now_us();
+
     // Determine the start index in the ring buffer
     uint32_t start = 0;
     if (g_event_log_count >= EVENT_LOG_MAX) {
@@ -99,8 +134,8 @@ void event_log_replay_to(uint16_t subscriber_node, uint16_t sub_class, uint16_t 
     }
 
     for (uint32_t i = 0; i < g_event_log_count; i++) {
-        uint32_t idx = (start + i) % EVENT_LOG_MAX;
-        const auto& entry = g_event_log[idx];
+        uint32_t const IDX = (start + i) % EVENT_LOG_MAX;
+        const auto& entry = g_event_log.at(IDX);
 
         if (!event_matches(sub_class, sub_id, entry.event_class, entry.event_id)) {
             continue;
@@ -108,7 +143,7 @@ void event_log_replay_to(uint16_t subscriber_node, uint16_t sub_class, uint16_t 
 
         // Build publish payload and send to subscriber
         auto total_len = static_cast<uint16_t>(sizeof(EventPublishPayload) + entry.data_len);
-        std::array<uint8_t, sizeof(EventPublishPayload) + 256> buf = {};
+        std::array<uint8_t, sizeof(EventPublishPayload) + EventLogEntry::DATA_MAX> buf = {};
 
         auto* pub = reinterpret_cast<EventPublishPayload*>(buf.data());
         pub->event_class = entry.event_class;
@@ -122,6 +157,9 @@ void event_log_replay_to(uint16_t subscriber_node, uint16_t sub_class, uint16_t 
 
         wki_send(subscriber_node, WKI_CHAN_EVENT_BUS, MsgType::EVENT_PUBLISH, buf.data(), total_len);
     }
+
+    perf_record_event_point(ker::mod::perf::WkiPerfEventOp::REPLAY, subscriber_node, 0,
+                            static_cast<uint32_t>(wki_now_us() - REPLAY_START_US), 0, WOS_PERF_CALLSITE());
 }
 
 }  // namespace
@@ -139,7 +177,7 @@ void wki_event_init() {
 }
 
 // -----------------------------------------------------------------------------
-// Subscribe / Unsubscribe — outgoing requests to a remote node
+// Subscribe / Unsubscribe - outgoing requests to a remote node
 // -----------------------------------------------------------------------------
 
 void wki_event_subscribe(uint16_t peer_node, uint16_t event_class, uint16_t event_id, uint8_t delivery_mode) {
@@ -153,6 +191,8 @@ void wki_event_subscribe(uint16_t peer_node, uint16_t event_class, uint16_t even
     sub.delivery_mode = delivery_mode;
 
     wki_send(peer_node, WKI_CHAN_EVENT_BUS, MsgType::EVENT_SUBSCRIBE, &sub, sizeof(sub));
+    perf_record_event_point(ker::mod::perf::WkiPerfEventOp::SUBSCRIBE, peer_node, 0, delivery_mode,
+                            ker::mod::perf::next_wki_trace_correlation(), WOS_PERF_CALLSITE());
 }
 
 void wki_event_unsubscribe(uint16_t peer_node, uint16_t event_class, uint16_t event_id) {
@@ -165,10 +205,12 @@ void wki_event_unsubscribe(uint16_t peer_node, uint16_t event_class, uint16_t ev
     unsub.event_id = event_id;
 
     wki_send(peer_node, WKI_CHAN_EVENT_BUS, MsgType::EVENT_UNSUBSCRIBE, &unsub, sizeof(unsub));
+    perf_record_event_point(ker::mod::perf::WkiPerfEventOp::UNSUBSCRIBE, peer_node, 0, 0, ker::mod::perf::next_wki_trace_correlation(),
+                            WOS_PERF_CALLSITE());
 }
 
 // -----------------------------------------------------------------------------
-// Publish — send event to matching remote subscribers + invoke local handlers
+// Publish - send event to matching remote subscribers + invoke local handlers
 // -----------------------------------------------------------------------------
 
 void wki_event_publish(uint16_t event_class, uint16_t event_id, const void* data, uint16_t data_len) {
@@ -178,7 +220,7 @@ void wki_event_publish(uint16_t event_class, uint16_t event_id, const void* data
 
     // Build the publish payload: EventPublishPayload + data
     auto total_len = static_cast<uint16_t>(sizeof(EventPublishPayload) + data_len);
-    std::array<uint8_t, sizeof(EventPublishPayload) + 256> buf = {};
+    std::array<uint8_t, sizeof(EventPublishPayload) + EventLogEntry::DATA_MAX> buf = {};
 
     // Clamp data to fit in stack buffer
     if (total_len > sizeof(buf)) {
@@ -195,6 +237,8 @@ void wki_event_publish(uint16_t event_class, uint16_t event_id, const void* data
     if (data != nullptr && data_len > 0) {
         memcpy(buf.data() + sizeof(EventPublishPayload), data, data_len);
     }
+
+    s_event_lock.lock();
 
     // D2: Store in event log ring buffer for future replay
     event_log_push(event_class, event_id, g_wki.my_node_id, data, data_len);
@@ -218,11 +262,20 @@ void wki_event_publish(uint16_t event_class, uint16_t event_id, const void* data
             pending.event_id = event_id;
             pending.origin_node = g_wki.my_node_id;
             pending.send_time_us = wki_now_us();
+            pending.correlation = ker::mod::perf::next_wki_trace_correlation();
             pending.retries = 0;
             pending.payload_len = total_len;
             memcpy(pending.payload.data(), buf.data(), total_len);
 
+            ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::EVENT_BUS,
+                                             static_cast<uint8_t>(ker::mod::perf::WkiPerfEventOp::PUBLISH),
+                                             ker::mod::perf::WkiPerfPhase::BEGIN, sub.subscriber_node, WKI_CHAN_EVENT_BUS,
+                                             pending.correlation, 0, total_len, WOS_PERF_CALLSITE());
+
             g_pending_reliable.push_back(pending);
+        } else {
+            perf_record_event_point(ker::mod::perf::WkiPerfEventOp::PUBLISH, sub.subscriber_node, 0, total_len,
+                                    ker::mod::perf::next_wki_trace_correlation(), WOS_PERF_CALLSITE());
         }
     }
 
@@ -237,6 +290,8 @@ void wki_event_publish(uint16_t event_class, uint16_t event_id, const void* data
 
         h.handler(g_wki.my_node_id, event_class, event_id, data, data_len);
     }
+
+    s_event_lock.unlock();
 }
 
 // -----------------------------------------------------------------------------
@@ -254,19 +309,30 @@ void wki_event_register_handler(uint16_t event_class, uint16_t event_id, EventHa
     h.event_id = event_id;
     h.handler = handler;
 
+    s_event_lock.lock();
     g_local_handlers.push_back(h);
+    s_event_lock.unlock();
 }
 
 void wki_event_unregister_handler(EventHandlerFn handler) {
+    s_event_lock.lock();
     std::erase_if(g_local_handlers, [handler](const WkiEventHandler& h) { return h.handler == handler; });
+    s_event_lock.unlock();
 }
 
 // -----------------------------------------------------------------------------
-// D1: Timer tick — retransmit reliable events that haven't been ACKed
+// D1: Timer tick - retransmit reliable events that haven't been ACKed
 // -----------------------------------------------------------------------------
 
 void wki_event_timer_tick(uint64_t now_us) {
-    if (!g_event_initialized || g_pending_reliable.empty()) {
+    if (!g_event_initialized) {
+        return;
+    }
+
+    s_event_lock.lock();
+
+    if (g_pending_reliable.empty()) {
+        s_event_lock.unlock();
         return;
     }
 
@@ -278,7 +344,7 @@ void wki_event_timer_tick(uint64_t now_us) {
         }
 
         if (pending.retries >= RELIABLE_MAX_RETRIES) {
-            // Give up — mark for removal
+            // Give up - mark for removal
             pending.subscriber_node = WKI_NODE_INVALID;
             any_removed = true;
             continue;
@@ -288,20 +354,26 @@ void wki_event_timer_tick(uint64_t now_us) {
         wki_send(pending.subscriber_node, WKI_CHAN_EVENT_BUS, MsgType::EVENT_PUBLISH, pending.payload.data(), pending.payload_len);
         pending.send_time_us = now_us;
         pending.retries++;
+        perf_record_event_point(ker::mod::perf::WkiPerfEventOp::RETRY, pending.subscriber_node, 0, pending.retries, pending.correlation,
+                                WOS_PERF_CALLSITE());
     }
 
     if (any_removed) {
         std::erase_if(g_pending_reliable, [](const PendingReliableEvent& p) { return p.subscriber_node == WKI_NODE_INVALID; });
     }
+
+    s_event_lock.unlock();
 }
 
 // -----------------------------------------------------------------------------
-// Fencing cleanup — remove all subscriptions and pending events for a fenced peer
+// Fencing cleanup - remove all subscriptions and pending events for a fenced peer
 // -----------------------------------------------------------------------------
 
 void wki_event_cleanup_for_peer(uint16_t node_id) {
+    s_event_lock.lock();
     std::erase_if(g_subscriptions, [node_id](const WkiEventSubscription& sub) { return sub.subscriber_node == node_id; });
     std::erase_if(g_pending_reliable, [node_id](const PendingReliableEvent& p) { return p.subscriber_node == node_id; });
+    s_event_lock.unlock();
 }
 
 // -----------------------------------------------------------------------------
@@ -317,12 +389,15 @@ void handle_event_subscribe(const WkiHeader* hdr, const uint8_t* payload, uint16
 
     const auto* sub = reinterpret_cast<const EventSubscribePayload*>(payload);
 
+    s_event_lock.lock();
+
     // Check if this subscription already exists (upsert)
     for (auto& existing : g_subscriptions) {
         if (existing.active && existing.subscriber_node == hdr->src_node && existing.event_class == sub->event_class &&
             existing.event_id == sub->event_id) {
             // Update delivery mode
             existing.delivery_mode = sub->delivery_mode;
+            s_event_lock.unlock();
             return;
         }
     }
@@ -337,11 +412,16 @@ void handle_event_subscribe(const WkiHeader* hdr, const uint8_t* payload, uint16
 
     g_subscriptions.push_back(entry);
 
-    ker::mod::dbg::log("[WKI] Event subscription: node=0x%04x class=0x%04x id=0x%04x mode=%s", hdr->src_node, sub->event_class,
-                       sub->event_id, (sub->delivery_mode == EVENT_DELIVERY_RELIABLE) ? "reliable" : "best-effort");
-
     // D2: Replay matching events from log to the new subscriber
     event_log_replay_to(hdr->src_node, sub->event_class, sub->event_id);
+
+    s_event_lock.unlock();
+
+    perf_record_event_point(ker::mod::perf::WkiPerfEventOp::SUBSCRIBE, hdr->src_node, 0, sub->delivery_mode,
+                            ker::mod::perf::next_wki_trace_correlation(), WOS_PERF_CALLSITE());
+
+    ker::mod::dbg::log("[WKI] Event subscription: node=0x%04x class=0x%04x id=0x%04x mode=%s", hdr->src_node, sub->event_class,
+                       sub->event_id, (sub->delivery_mode == EVENT_DELIVERY_RELIABLE) ? "reliable" : "best-effort");
 }
 
 void handle_event_unsubscribe(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
@@ -351,9 +431,14 @@ void handle_event_unsubscribe(const WkiHeader* hdr, const uint8_t* payload, uint
 
     const auto* unsub = reinterpret_cast<const EventSubscribePayload*>(payload);
 
+    s_event_lock.lock();
     std::erase_if(g_subscriptions, [&](const WkiEventSubscription& s) {
         return s.subscriber_node == hdr->src_node && s.event_class == unsub->event_class && s.event_id == unsub->event_id;
     });
+    s_event_lock.unlock();
+
+    perf_record_event_point(ker::mod::perf::WkiPerfEventOp::UNSUBSCRIBE, hdr->src_node, 0, 0, ker::mod::perf::next_wki_trace_correlation(),
+                            WOS_PERF_CALLSITE());
 
     ker::mod::dbg::log("[WKI] Event unsubscription: node=0x%04x class=0x%04x id=0x%04x", hdr->src_node, unsub->event_class,
                        unsub->event_id);
@@ -376,6 +461,8 @@ void handle_event_publish(const WkiHeader* hdr, const uint8_t* payload, uint16_t
         event_data = payload + sizeof(EventPublishPayload);
     }
 
+    s_event_lock.lock();
+
     // Invoke matching local handlers
     for (const auto& h : g_local_handlers) {
         if (!h.active || h.handler == nullptr) {
@@ -387,6 +474,8 @@ void handle_event_publish(const WkiHeader* hdr, const uint8_t* payload, uint16_t
 
         h.handler(pub->origin_node, pub->event_class, pub->event_id, event_data, pub->data_len);
     }
+
+    s_event_lock.unlock();
 
     // D1: Always send an ACK back to the publisher. We don't track our own
     // outgoing subscriptions locally, so we can't check delivery mode here.
@@ -408,11 +497,30 @@ void handle_event_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t pay
 
     const auto* ack = reinterpret_cast<const EventAckPayload*>(payload);
 
+    uint32_t correlation = 0;
+    uint32_t latency_us = 0;
+
     // D1: Remove the matching pending reliable event for this subscriber
+    s_event_lock.lock();
     std::erase_if(g_pending_reliable, [&](const PendingReliableEvent& p) {
-        return p.subscriber_node == hdr->src_node && p.event_class == ack->event_class && p.event_id == ack->event_id &&
-               p.origin_node == ack->origin_node;
+        bool const MATCH = p.subscriber_node == hdr->src_node && p.event_class == ack->event_class && p.event_id == ack->event_id &&
+                           p.origin_node == ack->origin_node;
+        if (MATCH) {
+            correlation = p.correlation;
+            latency_us = static_cast<uint32_t>(wki_now_us() - p.send_time_us);
+        }
+        return MATCH;
     });
+    s_event_lock.unlock();
+
+    if (correlation != 0) {
+        ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::EVENT_BUS,
+                                         static_cast<uint8_t>(ker::mod::perf::WkiPerfEventOp::ACK), ker::mod::perf::WkiPerfPhase::END,
+                                         hdr->src_node, WKI_CHAN_EVENT_BUS, correlation, 0, latency_us, WOS_PERF_CALLSITE());
+        ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::EVENT_BUS,
+                                           static_cast<uint8_t>(ker::mod::perf::WkiPerfEventOp::ACK), hdr->src_node, WKI_CHAN_EVENT_BUS, 0,
+                                           latency_us, true, 0, 0);
+    }
 }
 
 }  // namespace detail

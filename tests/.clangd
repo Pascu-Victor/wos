@@ -1,0 +1,15 @@
+# clangd configuration for WOS test suite.
+#
+# Points the language server at the test build's compile_commands.json and
+# ensures it can resolve GoogleTest, LibFuzzer, kernel shim, and real kernel
+# headers correctly.
+#
+# The test build uses a host-Linux clang (not the WOS cross-compiler).
+
+CompileFlags:
+    CompilationDatabase: ../build_tests
+    Add:
+        - --target=x86_64-pc-linux-gnu
+
+Diagnostics:
+    UnusedIncludes: Strict

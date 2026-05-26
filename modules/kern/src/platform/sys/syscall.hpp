@@ -11,10 +11,10 @@
 
 namespace ker::mod::sys {
 
-extern "C" void _wOS_asm_syscallHandler(void);
+extern "C" void wos_asm_syscall_handler(void);
 
 void init();
 
-extern "C" auto syscallHandler(cpu::GPRegs regs) -> uint64_t;
+extern "C" auto syscall_handler(cpu::GPRegs regs) -> uint64_t;
 
 }  // namespace ker::mod::sys

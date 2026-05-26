@@ -1,58 +1,85 @@
 #include "acpi.hpp"
 
-__attribute__((used, section(".requests")))
-static volatile limine_rsdp_request rsdpRequest = {
-    .id = LIMINE_RSDP_REQUEST,
+#include <cstddef>
+#include <cstdint>
+
+#include "extern/limine.h"
+#include "platform/acpi/tables/rdst.hpp"
+#include "platform/acpi/tables/rsdp.hpp"
+#include "platform/acpi/tables/sdt.hpp"
+#include "platform/mm/addr.hpp"
+#include "util/hcf.hpp"
+
+namespace {
+
+__attribute__((used, section(".requests"))) volatile limine_rsdp_request rsdp_request = {
+    // NOLINT
+    .id = LIMINE_RSDP_REQUEST_ID,
     .revision = 0,
     .response = nullptr,
 };
 
+}  // namespace
+
 namespace ker::mod::acpi {
-    void init() {
-        ker::mod::acpi::rsdp::init((uint64_t)rsdpRequest.response->address);
+
+namespace {
+
+auto validate_checksum(const Sdt* sdt) -> bool {
+    uint8_t sum = 0;
+    for (size_t i = 0; i < sdt->length; i++) {
+        sum += reinterpret_cast<const uint8_t*>(sdt)[i];
     }
-
-    bool validateChecksum(Sdt *sdt) {
-        uint8_t sum = 0;
-        for(size_t i = 0; i < sdt->length; i++) {
-            sum += ((uint8_t*)sdt)[i];
-        }
-        return sum == 0;
-    }
-
-    ACPIResult parseAcpiTables(const char* ident) {
-        rsdp::Rsdp rsdp = rsdp::get();
-        
-        Rsdt *rsdt = (Rsdt*)mm::addr::getVirtPointer(rsdp.xsdt_addr);
-        Xsdt *xsdt = nullptr;
-        Sdt header;
-
-        if(rsdp::useXsdt()) {
-            xsdt = (Xsdt*)mm::addr::getVirtPointer(rsdp.xsdt_addr);
-            header = xsdt->header;
-        } else {
-            rsdt = (Rsdt*)mm::addr::getVirtPointer((uint64_t)rsdp.rsdt_addr);
-            header = rsdt->header;
-        }
-
-        size_t entries = (header.length - sizeof(Sdt)) / (rsdp::useXsdt() ? sizeof(uint64_t) : sizeof(uint32_t));
-        if(xsdt == nullptr) {
-            hcf(); // no xsdt entries???
-        }
-        for(size_t i = 0; i < entries; i++) {
-            Sdt *sdt =(Sdt*) mm::addr::getVirtPointer((rsdp::useXsdt() ? xsdt->next[i] : (uint64_t)rsdt->next[i]));
-            if(memcmp(sdt->signature, ident, 4) == 0 && validateChecksum(sdt)) {
-                ACPIResult result;
-                result.success = true;
-                result.data = sdt;
-                return result;
-            }
-        }
-
-        ACPIResult result;
-        result.success = false;
-        result.data = nullptr;
-        return result;
-    }
-
+    return sum == 0;
 }
+
+auto signature_matches(const Sdt& sdt, const char* ident) -> bool {
+    for (size_t i = 0; i < 4; ++i) {
+        if (sdt.signature[i] != ident[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+void init() { ker::mod::acpi::rsdp::init(reinterpret_cast<uint64_t>(rsdp_request.response->address)); }
+
+ACPIResult parse_acpi_tables(const char* ident) {
+    rsdp::Rsdp const RSDP = rsdp::get();
+
+    Rsdt const* rsdt = reinterpret_cast<Rsdt*>(mm::addr::get_virt_pointer(RSDP.xsdt_addr));
+    Xsdt const* xsdt = nullptr;
+    Sdt header{};
+
+    if (rsdp::use_xsdt()) {
+        xsdt = reinterpret_cast<Xsdt*>(mm::addr::get_virt_pointer(RSDP.xsdt_addr));
+        header = xsdt->header;
+    } else {
+        rsdt = reinterpret_cast<Rsdt*>(mm::addr::get_virt_pointer(static_cast<uint64_t>(RSDP.rsdt_addr)));
+        header = rsdt->header;
+    }
+
+    size_t const ENTRIES = (header.length - sizeof(Sdt)) / (rsdp::use_xsdt() ? sizeof(uint64_t) : sizeof(uint32_t));
+    if (xsdt == nullptr) {
+        hcf();  // no xsdt entries???
+    }
+    for (size_t i = 0; i < ENTRIES; i++) {
+        auto const TABLE_PHYS = rsdp::use_xsdt() ? xsdt->next[i] : static_cast<uint64_t>(rsdt->next[i]);
+        auto* sdt = reinterpret_cast<Sdt*>(mm::addr::get_virt_pointer(TABLE_PHYS));
+        if (signature_matches(*sdt, ident) && validate_checksum(sdt)) {
+            ACPIResult result{};
+            result.success = true;
+            result.data = sdt;
+            return result;
+        }
+    }
+
+    ACPIResult result{};
+    result.success = false;
+    result.data = nullptr;
+    return result;
+}
+
+}  // namespace ker::mod::acpi

@@ -27,3 +27,15 @@ build
 
 #core dumps
 coredumps
+
+#cluster data (persistent SSH keys, etc.)
+cluster-data
+
+
+reference/
+
+benchmarks/
+test-results/
+
+WKI-REF
+build_tests

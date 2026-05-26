@@ -1,25 +1,33 @@
 #include "coredump_memory.h"
 
+#include <qcontainerfwd.h>
+#include <qlogging.h>
+#include <qtypes.h>
+
 #include <QDebug>
+#include <algorithm>
+#include <cstdint>
 #include <cstring>
+#include <utility>
+#include <vector>
 
 #include "coredump_parser.h"
 #include "elf_symbol_resolver.h"
 
 namespace wosdbg {
 
-const CoreDumpSegment* findSegmentForVa(const CoreDump& dump, uint64_t va) {
-    size_t count = std::min(static_cast<size_t>(dump.segmentCount), dump.segments.size());
+const CoreDumpSegment* find_segment_for_va(const CoreDump& dump, uint64_t va) {
+    size_t count = std::min(static_cast<size_t>(dump.segment_count), dump.segments.size());
     for (size_t i = 0; i < count; ++i) {
         const auto& seg = dump.segments[i];
-        if (seg.isPresent() && seg.vaddr <= va && va < seg.vaddrEnd()) {
+        if (seg.is_present() && seg.vaddr <= va && va < seg.vaddr_end()) {
             return &seg;
         }
     }
     return nullptr;
 }
 
-QByteArray readVaBytes(const CoreDump& dump, uint64_t vaStart, size_t length) {
+QByteArray read_va_bytes(const CoreDump& dump, uint64_t vaStart, size_t length) {
     QByteArray result;
     result.reserve(static_cast<qsizetype>(length));
 
@@ -27,7 +35,7 @@ QByteArray readVaBytes(const CoreDump& dump, uint64_t vaStart, size_t length) {
     size_t remaining = length;
 
     while (remaining > 0) {
-        const auto* seg = findSegmentForVa(dump, va);
+        const auto* seg = find_segment_for_va(dump, va);
         if (!seg) {
             return {};
         }
@@ -35,7 +43,7 @@ QByteArray readVaBytes(const CoreDump& dump, uint64_t vaStart, size_t length) {
         uint64_t seg_offset = va - seg->vaddr;
         uint64_t avail = seg->size - seg_offset;
         size_t to_read = std::min(avail, static_cast<uint64_t>(remaining));
-        uint64_t file_off = seg->fileOffset + seg_offset;
+        uint64_t file_off = seg->file_offset + seg_offset;
 
         if (static_cast<int64_t>(file_off + to_read) > dump.raw.size()) {
             return {};
@@ -49,13 +57,13 @@ QByteArray readVaBytes(const CoreDump& dump, uint64_t vaStart, size_t length) {
     return result;
 }
 
-QString annotateQword(uint64_t va, uint64_t value, const CoreDump& dump, const std::vector<SymbolTable*>& sym_tables,
-                      const std::vector<SectionMap*>& section_maps) {
+QString annotate_qword(uint64_t va, uint64_t value, const CoreDump& dump, const std::vector<SymbolTable*>& sym_tables,
+                       const std::vector<SectionMap*>& section_maps) {
     QStringList notes;
-    uint64_t trap_rsp = dump.trapFrame.rsp;
-    uint64_t trap_rbp = dump.trapRegs.rbp;
-    uint64_t saved_rsp = dump.savedFrame.rsp;
-    uint64_t saved_rbp = dump.savedRegs.rbp;
+    uint64_t trap_rsp = dump.trap_frame.rsp;
+    uint64_t trap_rbp = dump.trap_regs.rbp;
+    uint64_t saved_rsp = dump.saved_frame.rsp;
+    uint64_t saved_rbp = dump.saved_regs.rbp;
 
     // RSP/RBP markers
     if (va == trap_rsp) {
@@ -83,7 +91,7 @@ QString annotateQword(uint64_t va, uint64_t value, const CoreDump& dump, const s
     } else if (value > 0 && value < 0x1000) {
         notes << QString("[small: %1]").arg(value);
     } else if (value >= 0x400000 && value <= 0xFFFFFF) {
-        auto sym = resolveAddress(value, sym_tables, section_maps);
+        auto sym = resolve_address(value, sym_tables, section_maps);
         if (sym) {
             notes << QString("[code: %1]").arg(QString::fromStdString(*sym));
         } else {
@@ -91,14 +99,14 @@ QString annotateQword(uint64_t va, uint64_t value, const CoreDump& dump, const s
         }
     } else if ((value >> 40) == 0x7ffe || (value >> 40) == 0x7fff) {
         notes << "[stack ptr?]";
-    } else if (value == dump.trapFrame.rip) {
+    } else if (value == dump.trap_frame.rip) {
         notes << "[== trap RIP]";
-    } else if (value == dump.savedFrame.rip) {
+    } else if (value == dump.saved_frame.rip) {
         notes << "[== saved RIP]";
     }
     // Also resolve kernel-range addresses
     else if (value >= 0xffffffff80000000ULL) {
-        auto sym = resolveAddress(value, sym_tables, section_maps);
+        auto sym = resolve_address(value, sym_tables, section_maps);
         if (sym) {
             notes << QString("[kernel: %1]").arg(QString::fromStdString(*sym));
         }
@@ -107,8 +115,8 @@ QString annotateQword(uint64_t va, uint64_t value, const CoreDump& dump, const s
     return notes.join("  ");
 }
 
-std::vector<AnnotatedQword> dumpRange(const CoreDump& dump, uint64_t va_start, uint64_t va_end, const std::vector<SymbolTable*>& sym_tables,
-                                      const std::vector<SectionMap*>& section_maps) {
+std::vector<AnnotatedQword> dump_range(const CoreDump& dump, uint64_t va_start, uint64_t va_end,
+                                       const std::vector<SymbolTable*>& sym_tables, const std::vector<SectionMap*>& section_maps) {
     // Align start down to 8-byte boundary
     uint64_t va_start_aligned = va_start & ~7ULL;
     if (va_end <= va_start_aligned) {
@@ -121,12 +129,12 @@ std::vector<AnnotatedQword> dumpRange(const CoreDump& dump, uint64_t va_start, u
         return {};
     }
 
-    QByteArray data = readVaBytes(dump, va_start_aligned, static_cast<size_t>(length));
+    QByteArray data = read_va_bytes(dump, va_start_aligned, static_cast<size_t>(length));
     if (data.isEmpty()) {
         return {};
     }
 
-    uint64_t trap_rsp = dump.trapFrame.rsp;
+    uint64_t trap_rsp = dump.trap_frame.rsp;
 
     std::vector<AnnotatedQword> result;
     result.reserve(static_cast<size_t>(length / 8));
@@ -139,21 +147,21 @@ std::vector<AnnotatedQword> dumpRange(const CoreDump& dump, uint64_t va_start, u
         AnnotatedQword aq;
         aq.va = va;
         aq.value = qword;
-        aq.notes = annotateQword(va, qword, dump, sym_tables, section_maps);
+        aq.notes = annotate_qword(va, qword, dump, sym_tables, section_maps);
 
         // Resolve value as symbol if it looks like a code address
-        auto sym = resolveAddress(qword, sym_tables, section_maps);
+        auto sym = resolve_address(qword, sym_tables, section_maps);
         if (sym) {
             aq.symbol = QString::fromStdString(*sym);
         }
 
         // Stack direction gutter
         if (va < trap_rsp) {
-            aq.gutter = " v ";  // below RSP — stack growth direction
+            aq.gutter = " v ";  // below RSP - stack growth direction
         } else if (va == trap_rsp) {
             aq.gutter = ">>>";  // current stack pointer
         } else {
-            aq.gutter = " ^ ";  // above RSP — toward caller frames
+            aq.gutter = " ^ ";  // above RSP - toward caller frames
         }
 
         result.push_back(std::move(aq));
@@ -162,7 +170,7 @@ std::vector<AnnotatedQword> dumpRange(const CoreDump& dump, uint64_t va_start, u
     return result;
 }
 
-std::vector<HexDumpRow> dumpRangeHex(const CoreDump& dump, uint64_t vaStart, uint64_t vaEnd) {
+std::vector<HexDumpRow> dump_range_hex(const CoreDump& dump, uint64_t vaStart, uint64_t vaEnd) {
     uint64_t va_start_aligned = vaStart & ~0xFULL;  // Align to 16 bytes
     if (vaEnd <= va_start_aligned) {
         return {};
@@ -173,7 +181,7 @@ std::vector<HexDumpRow> dumpRangeHex(const CoreDump& dump, uint64_t vaStart, uin
         return {};
     }
 
-    QByteArray data = readVaBytes(dump, va_start_aligned, static_cast<size_t>(length));
+    QByteArray data = read_va_bytes(dump, va_start_aligned, static_cast<size_t>(length));
     if (data.isEmpty()) {
         return {};
     }
@@ -190,7 +198,7 @@ std::vector<HexDumpRow> dumpRangeHex(const CoreDump& dump, uint64_t vaStart, uin
         for (int i = 0; i < count; ++i) {
             hex_parts << QString("%1").arg(static_cast<uint8_t>(row.bytes[i]), 2, 16, QChar('0'));
         }
-        row.hexString = hex_parts.join(' ');
+        row.hex_string = hex_parts.join(' ');
 
         // Format ASCII
         QString ascii;
@@ -198,7 +206,7 @@ std::vector<HexDumpRow> dumpRangeHex(const CoreDump& dump, uint64_t vaStart, uin
             auto b = static_cast<uint8_t>(row.bytes[i]);
             ascii += (b >= 32 && b < 127) ? QChar(b) : QChar('.');
         }
-        row.asciiString = ascii;
+        row.ascii_string = ascii;
 
         rows.push_back(std::move(row));
     }

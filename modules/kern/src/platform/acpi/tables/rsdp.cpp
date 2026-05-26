@@ -1,12 +1,21 @@
 #include "rsdp.hpp"
 
-namespace ker::mod::acpi::rsdp {
-static bool hasXsdt = false;
-static Rsdp rsdp;
+#include <cstddef>
+#include <cstdint>
 
-void validateChecksum(const Rsdp *rsdp) {
+#include "mod/io/serial/serial.hpp"
+#include "util/hcf.hpp"
+
+namespace ker::mod::acpi::rsdp {
+
+namespace {
+
+bool has_xsdt = false;
+Rsdp rsdp;
+
+void validate_checksum(const Rsdp* rsdp) {
     uint8_t sum = 0;
-    uint8_t *ptr = (uint8_t *)rsdp;
+    const auto* ptr = reinterpret_cast<const uint8_t*>(rsdp);
 
     for (size_t i = 0; i < 20; i++) {
         sum += *ptr++;
@@ -18,18 +27,20 @@ void validateChecksum(const Rsdp *rsdp) {
     }
 }
 
-bool useXsdt(void) { return hasXsdt; }
+}  // namespace
 
-void init(uint64_t rsdpAddr) {
-    validateChecksum(&rsdp);
-    rsdp = *(Rsdp *)mm::addr::getVirtPointer(rsdpAddr);
+auto use_xsdt() -> bool { return has_xsdt; }
+
+void init(uint64_t rsdp_addr) {
+    rsdp = *reinterpret_cast<const Rsdp*>(rsdp_addr);
+    validate_checksum(&rsdp);
     rsdp.oem_id[5] = 0;
     // TODO: log stuff
 
     if (rsdp.revision >= 2) {
-        hasXsdt = true;
+        has_xsdt = true;
     }
 }
 
-Rsdp get(void) { return rsdp; }
+auto get() -> Rsdp { return rsdp; }
 }  // namespace ker::mod::acpi::rsdp

@@ -1,9 +1,10 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <dev/block_device.hpp>
-#include <mod/io/serial/serial.hpp>
+#include <platform/dbg/dbg.hpp>
 
 namespace ker::dev::gpt {
 
@@ -11,7 +12,7 @@ namespace ker::dev::gpt {
 // Helper inline functions for logging (optimizes away when GPT_DEBUG is not defined)
 inline void gpt_log(const char* msg) {
 #ifdef GPT_DEBUG
-    ker::mod::io::serial::write(msg);
+    ker::mod::dbg::logger<"gpt">::debug("%s", msg);
 #else
     (void)msg;
 #endif
@@ -19,26 +20,29 @@ inline void gpt_log(const char* msg) {
 
 inline void gpt_log_hex(uint64_t value) {
 #ifdef GPT_DEBUG
-    ker::mod::io::serial::writeHex(value);
+    ker::mod::dbg::logger<"gpt">::debug("0x%lx", value);
 #else
     (void)value;
 #endif
 }
 
-// GPT Partition Type GUIDs (C-style arrays required for packed struct compatibility)
-constexpr uint8_t EFI_SYSTEM_PARTITION_GUID[16] = {0xC1, 0x2A, 0x73, 0x28, 0xF8, 0x1F, 0x11, 0xD2,  // NOLINT
-                                                   0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B};
+constexpr size_t GUID_SIZE = 16;
+constexpr size_t GUID_STRING_SIZE = 37;  // "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" + NUL
 
-constexpr uint8_t FAT32_PARTITION_GUID[16] = {0xEB, 0x3B, 0xA1, 0x3D, 0xB6, 0x10, 0xA7, 0x46,  // NOLINT
-                                              0xBB, 0x38, 0x25, 0x25, 0x83, 0x13, 0xB5, 0x78};
+// GPT Partition Type GUIDs.
+constexpr std::array<uint8_t, GUID_SIZE> EFI_SYSTEM_PARTITION_GUID = {0xC1, 0x2A, 0x73, 0x28, 0xF8, 0x1F, 0x11, 0xD2,
+                                                                      0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B};
+
+constexpr std::array<uint8_t, GUID_SIZE> FAT32_PARTITION_GUID = {0xEB, 0x3B, 0xA1, 0x3D, 0xB6, 0x10, 0xA7, 0x46,
+                                                                 0xBB, 0x38, 0x25, 0x25, 0x83, 0x13, 0xB5, 0x78};
 
 // Microsoft Basic Data Partition (commonly used for FAT32)
-constexpr uint8_t BASIC_DATA_PARTITION_GUID[16] = {0xEB, 0xD0, 0xA0, 0xA2, 0xB9, 0xE5, 0x44, 0x33,  // NOLINT
-                                                   0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7};
+constexpr std::array<uint8_t, GUID_SIZE> BASIC_DATA_PARTITION_GUID = {0xEB, 0xD0, 0xA0, 0xA2, 0xB9, 0xE5, 0x44, 0x33,
+                                                                      0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7};
 
 // Linux filesystem data partition (used by guestfish)
-constexpr uint8_t LINUX_DATA_PARTITION_GUID[16] = {0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47,  // NOLINT
-                                                   0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4};
+constexpr std::array<uint8_t, GUID_SIZE> LINUX_DATA_PARTITION_GUID = {0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47,
+                                                                      0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4};
 
 // GPT Header structure (simplified, only essential fields)
 struct GPTHeader {
@@ -57,6 +61,7 @@ struct GPTHeader {
     uint32_t partition_entry_size;     // Size of each partition entry (usually 128)
     uint32_t partition_entries_crc32;  // CRC32 of partition entries
 } __attribute__((packed));
+static_assert(sizeof(GPTHeader) == 92);
 
 // GPT Partition Entry structure
 struct GPTPartitionEntry {
@@ -67,12 +72,11 @@ struct GPTPartitionEntry {
     uint64_t attributes;                // Partition attributes
     uint16_t partition_name[36];        // Partition name (UTF-16LE)  NOLINT
 } __attribute__((packed));
+static_assert(sizeof(GPTPartitionEntry) == 128);
 
 // --- Partition enumeration ---
 
 constexpr size_t MAX_GPT_PARTITIONS = 128;
-constexpr size_t GUID_SIZE = 16;
-constexpr size_t GUID_STRING_SIZE = 37;  // "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" + NUL
 
 struct GPTPartitionInfo {
     std::array<uint8_t, GUID_SIZE> partition_type_guid{};
@@ -90,7 +94,7 @@ struct GPTDiskInfo {
 
 // Convert a 16-byte mixed-endian GPT GUID to a lowercase string
 // Output format: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" (36 chars + NUL)
-void guid_to_string(const uint8_t* guid, char* out);
+auto guid_to_string(const uint8_t* guid, char* out) -> void;
 
 // Enumerate all partitions on a GPT-partitioned disk.
 // Populates disk_info with disk GUID and per-partition info.
@@ -99,6 +103,6 @@ auto gpt_enumerate_partitions(BlockDevice* device, GPTDiskInfo* disk_info) -> in
 
 // Find FAT32 partition on a GPT-partitioned disk
 // Returns the starting LBA of the FAT32 partition, or 0 if not found
-uint64_t gpt_find_fat32_partition(BlockDevice* device);
+auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t;
 
 }  // namespace ker::dev::gpt

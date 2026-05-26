@@ -2,36 +2,19 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <mod/io/serial/serial.hpp>
+#include <platform/dbg/dbg.hpp>
 #include <platform/sys/spinlock.hpp>
 
 #include "../file_operations.hpp"
 #include "../vfs.hpp"
 #include "bits/ssize_t.h"
+#include "vfs/stat.hpp"
 
 namespace ker::dev {
 struct BlockDevice;
 }
 
 namespace ker::vfs::fat32 {
-
-// FAT32 logging control - define FAT32_DISABLE_LOGGING to disable all logging
-// Helper inline functions for logging (optimizes away when FAT32_DISABLE_LOGGING is defined)
-inline void fat32_log(const char* msg) {
-#ifdef FAT32_DEBUG
-    ker::mod::io::serial::writeHex(msg);
-#else
-    (void)msg;
-#endif
-}
-
-inline void fat32_log_hex(uint64_t value) {
-#ifdef FAT32_DEBUG
-    ker::mod::io::serial::writeHex(value);
-#else
-    (void)value;
-#endif
-}
 
 // FAT32 Mount Context - stores per-mount filesystem information
 struct FAT32MountContext {
@@ -50,6 +33,7 @@ struct FAT32MountContext {
 };
 
 // FAT32 Boot Sector Structure (simplified)
+// NOLINTBEGIN(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): fixed FAT32 on-disk layout.
 struct __attribute__((packed)) FAT32BootSector {
     uint8_t jump_boot[3];
     char oem_name[8];
@@ -79,8 +63,11 @@ struct __attribute__((packed)) FAT32BootSector {
     char volume_label[11];
     char file_system_type[8];
 };
+// NOLINTEND(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+static_assert(sizeof(FAT32BootSector) == 90);
 
 // FAT32 Directory Entry (32 bytes)
+// NOLINTBEGIN(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): fixed FAT32 on-disk layout.
 struct __attribute__((packed)) FAT32DirectoryEntry {
     char name[11];
     uint8_t attributes;
@@ -95,6 +82,8 @@ struct __attribute__((packed)) FAT32DirectoryEntry {
     uint16_t cluster_low;
     uint32_t file_size;
 };
+// NOLINTEND(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+static_assert(sizeof(FAT32DirectoryEntry) == 32);
 
 // Fs limits
 constexpr uint64_t FAT32_NAME_PART_LEN = 9;
@@ -111,6 +100,8 @@ constexpr uint8_t FAT32_ATTR_DEVICE = 0x40;
 constexpr uint8_t FAT32_ATTR_LONG_NAME = 0x0F;
 
 // FAT32 specific end-of-chain marker
+constexpr uint32_t FAT32_CLUSTER_MASK = 0x0FFFFFFF;
+constexpr uint32_t FAT32_EOC_MIN = 0x0FFFFFF8;
 constexpr uint32_t FAT32_EOC = 0x0FFFFFFF;
 constexpr uint32_t FAT32_BAD_CLUSTER = 0x0FFFFFF7;
 
@@ -131,13 +122,17 @@ auto fat32_close(File* f) -> int;
 constexpr auto fat32_isatty(ker::vfs::File* f) -> bool;
 
 // FAT32 stat operations
-auto fat32_stat(const char* path, ker::vfs::stat* statbuf, FAT32MountContext* ctx) -> int;
-auto fat32_fstat(File* f, ker::vfs::stat* statbuf) -> int;
+auto fat32_stat(const char* path, ker::vfs::Stat* statbuf, FAT32MountContext* ctx) -> int;
+auto fat32_fstat(File* f, ker::vfs::Stat* statbuf) -> int;
+auto fat32_statvfs(FAT32MountContext* ctx, ker::vfs::Statvfs* buf) -> int;
 
 // FAT32 directory modification operations
 auto fat32_unlink_path(FAT32MountContext* ctx, const char* path) -> int;
 auto fat32_rmdir_path(FAT32MountContext* ctx, const char* path) -> int;
 auto fat32_rename_path(FAT32MountContext* ctx, const char* oldpath, const char* newpath) -> int;
+
+// FAT32 fsync - flush FAT table and block device
+auto fat32_fsync(File* f) -> int;
 
 // Get FAT32 FileOperations structure
 auto get_fat32_fops() -> FileOperations*;

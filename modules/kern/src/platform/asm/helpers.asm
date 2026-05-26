@@ -33,3 +33,9 @@
     pop rbx
     pop rax
 %endmacro
+
+%macro clear_live_tf 0
+    pushfq
+    and qword [rsp], ~0x100
+    popfq
+%endmacro

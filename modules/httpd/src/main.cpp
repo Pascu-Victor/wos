@@ -1,5 +1,11 @@
-#define _DEFAULT_SOURCE 1
+#include <abi-bits/fcntl.h>
+#include <abi-bits/in.h>
+#include <abi-bits/socket.h>
+#include <abi-bits/socklen_t.h>
+#include <abi-bits/stat.h>
 #include <arpa/inet.h>
+#include <bits/posix/stat.h>
+#include <bits/ssize_t.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <sched.h>
@@ -16,33 +22,29 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <format>
-#include <iostream>
-#include <print>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
 
 constexpr uint16_t HTTP_PORT = 80;
-// constexpr const char* LOG_FILE = "/mnt/disk/httpd.log";
 constexpr const char* SERVE_ROOT = "/";
+
+using httpd_log = wos::journal<"httpd">;
 
 // Logging utility
 template <typename... Args>
 void log_message(std::format_string<Args...> fmt, Args&&... args) {
-    std::cout << std::format(fmt, std::forward<Args>(args)...) << '\n';
-
-    // std::ofstream log_stream(LOG_FILE, std::ios::app | std::ios::out);
-    // if (log_stream.is_open()) {
-    //     log_stream << std::format(fmt, std::forward<Args>(args)...) << '\n';
-    //     log_stream.close();
-    // }
+    std::string const MSG = std::format(fmt, std::forward<Args>(args)...);
+    httpd_log::info("%s", MSG.c_str());
 }
-constexpr size_t BUFFER_SIZE = 4096;
-constexpr size_t MAX_FILE_SIZE = static_cast<const size_t>(1024 * 1024);  // 1MB max file size
+constexpr size_t REQUEST_BUFFER_SIZE = 4096;
+constexpr size_t FILE_STREAM_BUFFER_SIZE = static_cast<size_t>(4096) * 1024;
 constexpr int MAX_PENDING_CONNECTIONS = 128;
 
 // MIME type lookup based on file extension
@@ -80,7 +82,6 @@ auto get_mime_type(std::string_view path) -> const char* {
     }
     // Images
     if (ext == ".png") {
-        return "image/png";
         return "image/png";
     }
     if (ext == ".jpg" || ext == ".jpeg") {
@@ -147,26 +148,27 @@ auto get_mime_type(std::string_view path) -> const char* {
     return "application/octet-stream";
 }
 
-// URL decode a path (handle %XX encoding)
-auto url_decode(std::string_view encoded) -> std::string {
+// URL decode a path or form component (handle %XX encoding)
+auto url_decode(std::string_view encoded, bool plus_as_space = false) -> std::string {
     std::string result;
     result.reserve(encoded.size());
 
     for (size_t i = 0; i < encoded.size(); ++i) {
-        if (encoded[i] == '%' && i + 2 < encoded.size()) {
-            std::array<char, 3> hex = {encoded[i + 1], encoded[i + 2], '\0'};
+        char const CURRENT = encoded.at(i);
+        if (CURRENT == '%' && i + 2 < encoded.size()) {
+            std::array<char, 3> hex = {encoded.at(i + 1), encoded.at(i + 2), '\0'};
             char* end = nullptr;
-            long val = strtol(hex.data(), &end, 16);
+            long const VAL = strtol(hex.data(), &end, 16);
             if (end == hex.data() + 2) {
-                result += static_cast<char>(val);
+                result += static_cast<char>(VAL);
                 i += 2;
                 continue;
             }
-        } else if (encoded[i] == '+') {
+        } else if (CURRENT == '+' && plus_as_space) {
             result += ' ';
             continue;
         }
-        result += encoded[i];
+        result += CURRENT;
     }
     return result;
 }
@@ -174,7 +176,7 @@ auto url_decode(std::string_view encoded) -> std::string {
 // Check if path is safe (no directory traversal)
 auto is_safe_path(std::string_view path) -> bool {
     // Reject paths with ..
-    return path.find("..") == std::string_view::npos;
+    return !path.contains("..");
 }
 
 // Format file size for display
@@ -182,10 +184,19 @@ auto format_size(size_t size) -> std::string {
     if (size < 1024) {
         return std::format("{} B", size);
     }
-    if (size < static_cast<size_t>(1024 * 1024)) {
-        return std::format("{:.1f} KB", static_cast<double>(size) / 1024.0);
+
+    auto format_tenths = [](size_t value, size_t unit, const char* suffix) -> std::string {
+        size_t whole = value / unit;
+        size_t tenth = ((value % unit) * 10) / unit;
+        return std::format("{}.{} {}", whole, tenth, suffix);
+    };
+
+    constexpr size_t KIB = 1024;
+    constexpr size_t MIB = KIB * 1024;
+    if (size < MIB) {
+        return format_tenths(size, 1024, "KB");
     }
-    return std::format("{:.1f} MB", static_cast<double>(size) / (1024.0 * 1024.0));
+    return format_tenths(size, MIB, "MB");
 }
 
 // Simple HTTP response templates
@@ -250,7 +261,7 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
     html += "</h1>\r\n";
 
     html += "<table>\r\n";
-    html += "<tr><th>Name</th><th>Size</th><th>Type</th><th></th></tr>\r\n";
+    html += "<tr><th>Name</th><th>Mode</th><th>Owner</th><th>Size</th><th>Type</th><th></th></tr>\r\n";
 
     // Parent directory link (if not root)
     if (url_path != "/" && url_path.size() > 1) {
@@ -266,7 +277,7 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
         }
         html += "<tr><td><span class='icon'>📁</span><a href=\"";
         html += parent;
-        html += "\">..</a></td><td class='size'>-</td><td class='type'>Parent Directory</td><td></td></tr>\r\n";
+        html += "\">..</a></td><td>-</td><td>-</td><td class='size'>-</td><td class='type'>Parent Directory</td><td></td></tr>\r\n";
     }
 
     // Read directory entries
@@ -278,13 +289,16 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
             std::string name;
             bool is_dir;
             bool is_blk;
+            uint32_t mode;
+            uint32_t uid;
+            uint32_t gid;
         };
         std::vector<DirEntry> entries;
 
         struct dirent* entry = nullptr;
         while ((entry = readdir(dir)) != nullptr) {
-            std::string name{static_cast<const char*>(entry->d_name)};
-            if (name == "." || name == "..") {
+            std::string const NAME{static_cast<const char*>(entry->d_name)};
+            if (NAME == "." || NAME == "..") {
                 continue;
             }
 
@@ -293,7 +307,7 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
             if (full_path.back() != '/') {
                 full_path += '/';
             }
-            full_path += name;
+            full_path += NAME;
 
             struct stat st{};
             bool is_dir = false;
@@ -303,7 +317,12 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
                 is_blk = S_ISBLK(st.st_mode);
             }
 
-            entries.push_back({name, is_dir, is_blk});
+            entries.push_back({.name = NAME,
+                               .is_dir = is_dir,
+                               .is_blk = is_blk,
+                               .mode = static_cast<uint32_t>(st.st_mode),
+                               .uid = static_cast<uint32_t>(st.st_uid),
+                               .gid = static_cast<uint32_t>(st.st_gid)});
         }
         closedir(dir);
 
@@ -352,7 +371,28 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
             if (ent.is_dir) {
                 html += "/";
             }
-            html += "</a></td><td class='size'>";
+            html += "</a></td><td>";
+            // Format mode as octal
+            {
+                // rwx string
+                constexpr std::string_view RWX = "rwxrwxrwx";
+                std::array<char, 11> perms{};
+                char type_char = '-';
+                if (ent.is_dir) {
+                    type_char = 'd';
+                } else if (ent.is_blk) {
+                    type_char = 'b';
+                }
+                perms.at(0) = type_char;
+                for (int b = 0; b < 9; b++) {
+                    perms.at(1 + static_cast<size_t>(b)) = ((ent.mode & (1 << (8 - b))) != 0U) ? RWX.at(static_cast<size_t>(b)) : '-';
+                }
+                perms.at(10) = '\0';
+                html += std::format("{} ({:04o})", std::string_view(perms.data(), 10), ent.mode & 07777);
+            }
+            html += "</td><td>";
+            html += std::format("{}:{}", ent.uid, ent.gid);
+            html += "</td><td class='size'>";
             html += ent.is_dir ? "-" : format_size(size);
             html += "</td><td class='type'>";
             if (ent.is_blk) {
@@ -395,10 +435,10 @@ auto send_all(int fd, const void* data, size_t len) -> ssize_t {
     constexpr int MAX_SEND_RETRIES = 10000;
 
     while (remaining > 0) {
-        ssize_t sent = send(fd, ptr, remaining, 0);
-        if (sent < 0) {
-            // EAGAIN (-11): window full or buffer exhaustion — retry
-            if (sent == -11 && retries < MAX_SEND_RETRIES) {
+        ssize_t const SENT = send(fd, ptr, remaining, 0);
+        if (SENT < 0) {
+            // EAGAIN (-11): window full or buffer exhaustion - retry
+            if (SENT == -11 && retries < MAX_SEND_RETRIES) {
                 retries++;
                 sched_yield();
                 continue;
@@ -407,15 +447,15 @@ auto send_all(int fd, const void* data, size_t len) -> ssize_t {
             if (total_sent > 0) {
                 return static_cast<ssize_t>(total_sent);
             }
-            return sent;
+            return SENT;
         }
-        if (sent == 0) {
+        if (SENT == 0) {
             // Connection closed
             break;
         }
-        ptr += sent;
-        remaining -= sent;
-        total_sent += sent;
+        ptr += SENT;
+        remaining -= SENT;
+        total_sent += SENT;
         retries = 0;  // Reset retry counter on progress
     }
 
@@ -425,19 +465,17 @@ auto send_all(int fd, const void* data, size_t len) -> ssize_t {
 // Send an HTTP response with custom headers
 auto send_response(int client_fd, int status_code, const char* status_text, const char* content_type, const void* body, size_t body_len)
     -> ssize_t {
-    // Build header
-    std::array<char, 512> header{};
-    int header_len = snprintf(header.data(), header.size(),
-                              "HTTP/1.1 %d %s\r\n"
-                              "Content-Type: %s\r\n"
-                              "Content-Length: %zu\r\n"
-                              "Connection: close\r\n"
-                              "Server: WOS-httpd/1.0\r\n"
-                              "\r\n",
-                              status_code, status_text, content_type, body_len);
+    std::string const HEADER = std::format(
+        "HTTP/1.1 {} {}\r\n"
+        "Content-Type: {}\r\n"
+        "Content-Length: {}\r\n"
+        "Connection: close\r\n"
+        "Server: WOS-httpd/1.0\r\n"
+        "\r\n",
+        status_code, status_text, content_type, body_len);
 
     // Send header (using send_all to handle partial sends)
-    ssize_t sent = send_all(client_fd, header.data(), header_len);
+    ssize_t sent = send_all(client_fd, HEADER.data(), HEADER.size());
     if (sent < 0) {
         return sent;
     }
@@ -487,35 +525,46 @@ auto serve_file(int client_fd, const std::string& fs_path, std::string_view url_
         return false;
     }
 
-    // Check file size
-    if (static_cast<size_t>(st.st_size) > MAX_FILE_SIZE) {
-        log_message("httpd[t:{},p:{}]: File too large: {} ({} bytes)", tid, pid, fs_path, st.st_size);
-        send(client_fd, HTTP_500_RESPONSE.data(), HTTP_500_RESPONSE.size(), 0);
-        return false;
-    }
-
     // Read file
-    int fd = open(fs_path.c_str(), O_RDONLY);
-    if (fd < 0) {
+    int const FD = open(fs_path.c_str(), O_RDONLY);
+    if (FD < 0) {
         log_message("httpd[t:{},p:{}]: Failed to open file: {}", tid, pid, fs_path);
         send(client_fd, HTTP_500_RESPONSE.data(), HTTP_500_RESPONSE.size(), 0);
         return false;
     }
 
-    std::vector<char> file_buf(st.st_size);
-    ssize_t bytes_read = read(fd, file_buf.data(), st.st_size);
-    close(fd);
-
-    if (bytes_read < 0) {
-        log_message("httpd[t:{},p:{}]: Failed to read file: {}", tid, pid, fs_path);
-        send(client_fd, HTTP_500_RESPONSE.data(), HTTP_500_RESPONSE.size(), 0);
+    // Send response header first, then stream file body in chunks.
+    const char* mime_type = get_mime_type(fs_path);
+    ssize_t const HEADER_SENT = send_response(client_fd, 200, "OK", mime_type, nullptr, static_cast<size_t>(st.st_size));
+    if (HEADER_SENT < 0) {
+        close(FD);
         return false;
     }
 
-    // Get MIME type and send response
-    const char* mime_type = get_mime_type(fs_path);
-    send_response(client_fd, 200, "OK", mime_type, file_buf.data(), bytes_read);
-    log_message("httpd[t:{},p:{}]: Served file: {} ({} bytes, {})", tid, pid, fs_path, bytes_read, mime_type);
+    std::vector<char> io_buf(FILE_STREAM_BUFFER_SIZE);
+    ssize_t total_sent = 0;
+    for (;;) {
+        ssize_t const BYTES_READ = read(FD, io_buf.data(), io_buf.size());
+        if (BYTES_READ < 0) {
+            log_message("httpd[t:{},p:{}]: Failed to read file: {}", tid, pid, fs_path);
+            close(FD);
+            return false;
+        }
+        if (BYTES_READ == 0) {
+            break;
+        }
+
+        ssize_t const BYTES_SENT = send_all(client_fd, io_buf.data(), static_cast<size_t>(BYTES_READ));
+        if (BYTES_SENT < 0) {
+            close(FD);
+            return false;
+        }
+        total_sent += BYTES_SENT;
+    }
+
+    close(FD);
+
+    log_message("httpd[t:{},p:{}]: Served file: {} ({} bytes, {})", tid, pid, fs_path, total_sent, mime_type);
     return true;
 }
 
@@ -528,7 +577,7 @@ auto parse_request_method(std::string_view request) -> std::string_view {
     return request.substr(0, first_space);
 }
 
-// Parse HTTP request to extract the path
+// Parse HTTP request to extract the path without query parameters
 auto parse_request_path(std::string_view request) -> std::string_view {
     // Find the first line (GET /path HTTP/1.1)
     auto line_end = request.find("\r\n");
@@ -548,7 +597,12 @@ auto parse_request_path(std::string_view request) -> std::string_view {
         return "/";
     }
 
-    return first_line.substr(first_space + 1, second_space - first_space - 1);
+    auto target = first_line.substr(first_space + 1, second_space - first_space - 1);
+    auto query_start = target.find('?');
+    if (query_start != std::string_view::npos) {
+        return target.substr(0, query_start);
+    }
+    return target;
 }
 
 // Extract POST body from HTTP request (content after \r\n\r\n)
@@ -574,7 +628,7 @@ auto get_form_field(std::string_view body, std::string_view key) -> std::string 
             if (end == std::string_view::npos) {
                 end = body.size();
             }
-            return url_decode(body.substr(pos, end - pos));
+            return url_decode(body.substr(pos, end - pos), true);
         }
         // Skip to next field
         auto amp = body.find('&', pos);
@@ -652,7 +706,7 @@ auto handle_request(int client_fd, std::string_view request) -> void {
 
         // Parent: wait for mount to complete
         int32_t exit_code = 0;
-        ker::process::waitpid(exec_res, &exit_code, 0);
+        ker::process::waitpid(static_cast<int64_t>(exec_res), &exit_code, 0, nullptr);
 
         if (exit_code == 0) {
             log_message("httpd[t:{},p:{}]: Mounted {} at {} ({})", tid, pid, device, mount_path, fstype);
@@ -696,20 +750,19 @@ auto handle_request(int client_fd, std::string_view request) -> void {
     }
 
     if (decoded_path == "/info") {
-        std::array<char, 1024> info_body{};
-        int body_len = snprintf(info_body.data(), info_body.size(),
-                                "<html><head><title>Server Info</title></head><body>"
-                                "<h1>Server Information</h1>"
-                                "<ul>"
-                                "<li><strong>Process ID:</strong> %lu</li>"
-                                "<li><strong>Thread ID:</strong> %lu</li>"
-                                "<li><strong>Server:</strong> WOS-httpd/1.0</li>"
-                                "<li><strong>Port:</strong> %d</li>"
-                                "<li><strong>Document Root:</strong> %s</li>"
-                                "</ul>"
-                                "<hr><p><em>WOS-httpd/1.0</em></p></body></html>\r\n",
-                                pid, tid, HTTP_PORT, SERVE_ROOT);
-        send_response(client_fd, 200, "OK", "text/html; charset=utf-8", info_body.data(), body_len);
+        std::string const INFO_BODY = std::format(
+            "<html><head><title>Server Info</title></head><body>"
+            "<h1>Server Information</h1>"
+            "<ul>"
+            "<li><strong>Process ID:</strong> {}</li>"
+            "<li><strong>Thread ID:</strong> {}</li>"
+            "<li><strong>Server:</strong> WOS-httpd/1.0</li>"
+            "<li><strong>Port:</strong> {}</li>"
+            "<li><strong>Document Root:</strong> {}</li>"
+            "</ul>"
+            "<hr><p><em>WOS-httpd/1.0</em></p></body></html>\r\n",
+            pid, tid, HTTP_PORT, SERVE_ROOT);
+        send_response(client_fd, 200, "OK", "text/html; charset=utf-8", INFO_BODY.data(), INFO_BODY.size());
         log_message("httpd[t:{},p:{}]: Served /info", tid, pid);
         return;
     }
@@ -719,21 +772,21 @@ auto handle_request(int client_fd, std::string_view request) -> void {
     if (decoded_path.empty() || decoded_path == "/") {
         // Root - serve from SERVE_ROOT
     } else {
-        if (decoded_path[0] != '/') {
+        if (decoded_path.front() != '/') {
             fs_path += '/';
         }
         fs_path += decoded_path;
     }
 
     // Remove trailing slash for stat (but keep track for directory handling)
-    bool had_trailing_slash = !fs_path.empty() && fs_path.back() == '/';
+    bool const HAD_TRAILING_SLASH = !fs_path.empty() && fs_path.back() == '/';
     while (fs_path.size() > 1 && fs_path.back() == '/') {
         fs_path.pop_back();
     }
 
     // Ensure URL path for directory listing has trailing slash
     std::string url_for_listing = decoded_path;
-    if (had_trailing_slash && !url_for_listing.empty() && url_for_listing.back() != '/') {
+    if (HAD_TRAILING_SLASH && !url_for_listing.empty() && url_for_listing.back() != '/') {
         url_for_listing += '/';
     }
 
@@ -743,6 +796,8 @@ auto handle_request(int client_fd, std::string_view request) -> void {
 
 }  // namespace
 
+// std::format can theoretically throw, but WOS service entry points use the normal process boundary for fatal failures.
+// NOLINTNEXTLINE(bugprone-exception-escape)
 auto main(int argc, char** argv) -> int {
     (void)argc;
     (void)argv;
@@ -751,7 +806,6 @@ auto main(int argc, char** argv) -> int {
     auto tid = ker::multiproc::currentThreadId();
 
     log_message("httpd[t:{},p:{}]: Starting HTTP server on 0.0.0.0:{}", tid, pid, HTTP_PORT);
-    std::println("httpd[t:{},p:{}]: Starting HTTP server on 0.0.0.0:{}", tid, pid, HTTP_PORT);
 
     // Create socket
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -790,7 +844,7 @@ auto main(int argc, char** argv) -> int {
     log_message("httpd[t:{},p:{}]: Listening for connections (backlog={})", tid, pid, MAX_PENDING_CONNECTIONS);
 
     // Main server loop
-    std::array<char, BUFFER_SIZE> buffer{};
+    std::array<char, REQUEST_BUFFER_SIZE> buffer{};
 
     for (;;) {
         struct sockaddr_in client_addr{};
@@ -806,12 +860,12 @@ auto main(int argc, char** argv) -> int {
         // Get client IP
         std::array<char, INET_ADDRSTRLEN> client_ip{};
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip.data(), client_ip.size());
-        uint16_t client_port = ntohs(client_addr.sin_port);
+        uint16_t const CLIENT_PORT = ntohs(client_addr.sin_port);
 
-        log_message("httpd[t:{},p:{}]: Accepted connection from {}:{}", tid, pid, std::string_view(client_ip.data()), client_port);
+        log_message("httpd[t:{},p:{}]: Accepted connection from {}:{}", tid, pid, std::string_view(client_ip.data()), CLIENT_PORT);
 
         // Read request
-        ssize_t received = recv(client_fd, buffer.data(), BUFFER_SIZE - 1, 0);
+        ssize_t received = recv(client_fd, buffer.data(), REQUEST_BUFFER_SIZE - 1, 0);
         if (received < 0) {
             log_message("httpd[t:{},p:{}]: Failed to read request: {}", tid, pid, received);
             close(client_fd);
@@ -824,13 +878,13 @@ auto main(int argc, char** argv) -> int {
             continue;
         }
 
-        buffer[received] = '\0';
-        std::string_view request(buffer.data(), received);
+        buffer.at(static_cast<size_t>(received)) = '\0';
+        std::string_view const REQUEST(buffer.data(), static_cast<size_t>(received));
 
-        log_message("httpd[t:{},p:{}]: Received {} bytes from {}:{}", tid, pid, received, std::string_view(client_ip.data()), client_port);
+        log_message("httpd[t:{},p:{}]: Received {} bytes from {}:{}", tid, pid, received, std::string_view(client_ip.data()), CLIENT_PORT);
 
         // Handle request and send response
-        handle_request(client_fd, request);
+        handle_request(client_fd, REQUEST);
 
         // Graceful close: shut down the write side first so the client
         // receives FIN, then drain any unread data the client may have

@@ -1,32 +1,14 @@
+If:
+    PathExclude: "toolchain/src/llvm-project/.*"
 Diagnostics:
-    ClangTidy:
-        Add:
-            - "bugprone-*"
-            - "clang-analyzer-*"
-            - "readability-*"
-            - "performance-*"
-            - "misc-*"
-            - "modernize-*"
-            - "cppcoreguidelines-*"
-        Remove:
-            - readability-identifier-length
-            - cppcoreguidelines-pro-type-reinterpret-cast
-            - cppcoreguidelines-owning-memory
-            - cppcoreguidelines-pro-bounds-pointer-arithmetic
-            - cppcoreguidelines-avoid-non-const-global-variables
-            - cppcoreguidelines-pro-type-cstyle-cast
-            - bugprone-easily-swappable-parameters
-            - bugprone-reserved-identifier
-            - misc-non-private-member-variables-in-classes
-
     Includes:
-        IgnoreHeader: ".*toolchain/target1/.*"
+        IgnoreHeader: ".*toolchain/sysroot/.*"
     UnusedIncludes: Strict
     MissingIncludes: Strict
 
 CompileFlags:
     Add:
-        - -std=c++23
+        - -D_GLIBCXX_HOSTED
     Remove:
         - -w-reloc-rel-dword
         - -w-reloc-abs-qword
@@ -36,6 +18,10 @@ CompileFlags:
         - -fPIE
         - -pie
         - -resource-dir=/usr/lib/clang/20
+        - -std=c++*
+        - -std=c1*
+        - -std=c2*
+        - -fsanitize=kernel-address
 
 Index:
     Background: Build
@@ -48,11 +34,49 @@ InlayHints:
 Hover:
     ShowAKA: true
 
-# Ignore .log files completely (no diagnostics, no background indexing)
+---
+# C-only third-party trees: no compile_commands.json so clangd defaults to
+# clang++, which rejects -std=c11. Force the C driver explicitly.
 If:
-    PathMatch: ".*\\.log$"
-    Then:
-        Index:
-            Background: false
-        Diagnostics:
-            Suppress: true
+    PathMatch: ".*/busybox/.*\\.c$"
+CompileFlags:
+    Compiler: clang
+    Add:
+        - -std=c11
+        - -Itoolchain/src/busybox/include
+        - -Itoolchain/src/busybox/libbb
+    Remove:
+        - -std=c++*
+
+---
+If:
+    PathMatch: ".*/dropbear/.*\\.c$"
+CompileFlags:
+    Compiler: clang
+    Add:
+        - -std=c11
+    Remove:
+        - -std=c++*
+
+---
+If:
+    PathMatch: ".*\\.(cpp|cxx|cc|hpp|hxx|hh)$"
+    PathExclude:
+        - "toolchain/src/llvm-project/.*"
+        - "tools/.*"
+CompileFlags:
+    Add:
+        - -std=c++23
+        - -D_DEFAULT_SOURCE
+        - -D__WOS__=1
+        - -D_GNU_SOURCE=1
+
+---
+If:
+    PathMatch: ".*\\.c$"
+    PathExclude:
+        - ".*/(busybox|dropbear)/.*"
+        - "toolchain/src/llvm-project/.*"
+CompileFlags:
+    Add:
+        - -std=c11

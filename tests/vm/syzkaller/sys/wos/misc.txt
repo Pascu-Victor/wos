@@ -1,0 +1,45 @@
+# WOS miscellaneous syscall descriptions for Syzkaller.
+#
+# Covers: futex, threading, time, sys_log
+
+include <abi/callnums/futex.h>
+include <abi/callnums/multiproc.h>
+include <abi/callnums/time.h>
+include <abi/callnums/sys_log.h>
+
+# --- Futex (RAX=1) ---
+
+wos_futex$wait(op const[0], addr ptr[in, int32], expected int32, timeout int64) int64
+wos_futex$wake(op const[1], addr ptr[in, int32], count int32) int64
+
+# --- Threading info (RAX=2, ops < 0x100) ---
+
+wos_thread_info$currentThreadId(op const[0]) int64
+wos_thread_info$nativeThreadCount(op const[1]) int64
+wos_thread_info$currentCpu(op const[2]) int64
+
+# --- Threading control (RAX=2, ops >= 0x100) ---
+
+wos_thread_ctl$setTCB(op const[0x100], addr ptr[in, int64]) int64
+wos_thread_ctl$yield(op const[0x101]) int64
+wos_thread_ctl$threadCreate(op const[0x102], entry ptr[in, int64], stack ptr[in, int64], arg ptr[in, int64]) int64
+wos_thread_ctl$threadExit(op const[0x103]) int64
+wos_thread_ctl$setAffinity(op const[0x104], tid int32, mask ptr[in, int64]) int64
+wos_thread_ctl$getAffinity(op const[0x105], tid int32, mask ptr[out, int64]) int64
+wos_thread_ctl$createDomain(op const[0x106], name ptr[in, string], cpu_mask int64) int64
+wos_thread_ctl$setDomain(op const[0x107], tid int32, domain_id int32) int64
+wos_thread_ctl$queryDomain(op const[0x108], domain_id int32, info ptr[out, array[int8, 64]]) int64
+
+# --- Time (RAX=4) ---
+
+wos_time$gettimeofday(op const[0], tv ptr[out, array[int8, 16]]) int64
+wos_time$clock_gettime(op const[1], clk_id int32, tp ptr[out, array[int8, 16]]) int64
+wos_time$nanosleep(op const[2], req ptr[in, array[int8, 16]], rem ptr[out, array[int8, 16]]) int64
+wos_time$times(op const[3], buf ptr[out, array[int8, 32]]) int64
+wos_time$setitimer(op const[4], which int32, new_val ptr[in, array[int8, 32]], old_val ptr[out, array[int8, 32]]) int64
+wos_time$getitimer(op const[5], which int32, curr_val ptr[out, array[int8, 32]]) int64
+
+# --- Sys log (RAX=0) ---
+
+wos_syslog$log(op const[0], buf ptr[in, string], len bytesize[buf], device const[0]) int64
+wos_syslog$logLine(op const[1], buf ptr[in, string], len bytesize[buf], device const[0]) int64

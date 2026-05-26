@@ -1,0 +1,119 @@
+#include "null_device.hpp"
+
+#include <bits/off_t.h>
+#include <bits/ssize_t.h>
+
+#include <cerrno>
+#include <cstring>
+#include <vfs/file.hpp>
+
+#include "dev/device.hpp"
+#include "platform/dbg/dbg.hpp"
+
+namespace ker::dev::null_device {
+
+namespace {
+
+// --- /dev/null operations ---
+
+int null_open(ker::vfs::File* /*file*/) { return 0; }
+int null_close(ker::vfs::File* /*file*/) { return 0; }
+
+ssize_t null_read(ker::vfs::File* /*file*/, void* /*buf*/, size_t /*count*/) {
+    return 0;  // EOF - always returns 0 bytes
+}
+
+ssize_t null_write(ker::vfs::File* /*file*/, const void* /*buf*/, size_t count) {
+    return static_cast<ssize_t>(count);  // Discard all data
+}
+
+off_t null_lseek(ker::vfs::File* /*file*/, off_t /*offset*/, int whence) {
+    if (whence != 0 && whence != 1 && whence != 2) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+bool null_isatty(ker::vfs::File* /*file*/) { return false; }
+
+CharDeviceOps null_ops = {
+    .open = null_open,
+    .close = null_close,
+    .read = null_read,
+    .write = null_write,
+    .isatty = null_isatty,
+    .ioctl = nullptr,
+    .poll_check = nullptr,
+    .poll_register_waiter = nullptr,
+    .lseek = null_lseek,
+};
+
+// --- /dev/zero operations ---
+
+int zero_open(ker::vfs::File* /*file*/) { return 0; }
+int zero_close(ker::vfs::File* /*file*/) { return 0; }
+
+ssize_t zero_read(ker::vfs::File* /*file*/, void* buf, size_t count) {
+    if (buf == nullptr) {
+        return -1;
+    }
+    std::memset(buf, 0, count);
+    return static_cast<ssize_t>(count);
+}
+
+ssize_t zero_write(ker::vfs::File* /*file*/, const void* /*buf*/, size_t count) {
+    return static_cast<ssize_t>(count);  // Discard all data
+}
+
+off_t zero_lseek(ker::vfs::File* /*file*/, off_t /*offset*/, int whence) {
+    if (whence != 0 && whence != 1 && whence != 2) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+bool zero_isatty(ker::vfs::File* /*file*/) { return false; }
+
+CharDeviceOps zero_ops = {
+    .open = zero_open,
+    .close = zero_close,
+    .read = zero_read,
+    .write = zero_write,
+    .isatty = zero_isatty,
+    .ioctl = nullptr,
+    .poll_check = nullptr,
+    .poll_register_waiter = nullptr,
+    .lseek = zero_lseek,
+};
+
+// Device instances
+Device null_dev = {
+    .major = 1,
+    .minor = 3,
+    .name = "null",
+    .type = DeviceType::CHAR,
+    .private_data = nullptr,
+    .char_ops = &null_ops,
+};
+
+Device zero_dev = {
+    .major = 1,
+    .minor = 5,
+    .name = "zero",
+    .type = DeviceType::CHAR,
+    .private_data = nullptr,
+    .char_ops = &zero_ops,
+};
+
+}  // anonymous namespace
+
+void null_device_init() {
+    ker::mod::dbg::logger<"null_device">::info("Initializing /dev/null and /dev/zero");
+    dev_register(&null_dev);
+    dev_register(&zero_dev);
+}
+
+auto get_null_device() -> Device* { return &null_dev; }
+auto get_zero_device() -> Device* { return &zero_dev; }
+
+}  // namespace ker::dev::null_device

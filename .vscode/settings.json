@@ -99,10 +99,6 @@
     "terminal.integrated.profiles.linux": {
         "WOS Development": {
             "path": "bash",
-            "args": [
-                "-c",
-                "source ~/.bashrc 2>/dev/null || true; source '${workspaceFolder}/.vscode/wos-env.sh'; exec bash"
-            ],
             "icon": "tools"
         },
         "WOS Development (Clean)": {
@@ -115,13 +111,13 @@
         }
     },
     "terminal.integrated.defaultProfile.linux": "WOS Development",
-    "C_Cpp.default.compilerPath": "${workspaceFolder}/toolchain/target1/bin/clang",
+    "C_Cpp.default.compilerPath": "${workspaceFolder}/toolchain/host/bin/clang",
     "C_Cpp.default.cStandard": "c17",
     "C_Cpp.default.cppStandard": "c++20",
     "C_Cpp.default.includePath": [
-        "${workspaceFolder}/toolchain/target1/include",
-        "${workspaceFolder}/toolchain/target1/include/c++/v1",
-        "${workspaceFolder}/toolchain/target1/lib/clang/21/include",
+        "${workspaceFolder}/toolchain/sysroot/include",
+        "${workspaceFolder}/toolchain/sysroot/include/c++/v1",
+        "${workspaceFolder}/toolchain/host/lib/clang/22/include",
         "${workspaceFolder}/modules/defines",
         "${workspaceFolder}/modules/extern"
     ],
@@ -131,29 +127,23 @@
     ],
     "C_Cpp.default.compilerArgs": [
         "--target=x86_64-pc-wos",
-        "--sysroot=${workspaceFolder}/toolchain/target1"
+        "--sysroot=${workspaceFolder}/toolchain/sysroot"
     ],
-
-    // ===== Clangd Configuration (Static Analysis) =====
-    // Disable MS IntelliSense in favor of clangd
-    "C_Cpp.intelliSenseEngine": "disabled",
-
     // Clangd settings
     "clangd.path": "/usr/bin/clangd",
     "clangd.arguments": [
-        "--compile-commands-dir=${workspaceFolder}/build",
+        "--resource-dir=${workspaceFolder}/toolchain/host/lib/clang/22",
         "--background-index",
         "--clang-tidy",
         "--header-insertion=iwyu",
         "--completion-style=detailed",
         "--function-arg-placeholders",
         "--fallback-style=llvm",
-        "--query-driver=${workspaceFolder}/toolchain/target1/bin/clang,${workspaceFolder}/toolchain/target1/bin/clang++",
+        "--query-driver=${workspaceFolder}/toolchain/host/bin/clang,${workspaceFolder}/toolchain/host/bin/clang++",
         "--log=error"
     ],
     "clangd.onConfigChanged": "restart",
     "clangd.checkUpdates": false,
-
     // Editor integration
     "editor.semanticHighlighting.enabled": true,
     "[cpp]": {

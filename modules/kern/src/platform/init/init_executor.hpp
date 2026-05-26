@@ -1,5 +1,8 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
+
 #include "init_registry.hpp"
 
 namespace ker::init {
@@ -12,64 +15,41 @@ namespace ker::init {
 // Compile-time validation is performed in init_validation.cpp via static_assert.
 
 struct InitExecutor {
+    template <size_t N>
+    static void run_modules(const std::array<ModuleDesc, N>& modules) {
+        for (const auto& mod : modules) {
+            if (mod.init_fn != nullptr) {
+                mod.init_fn();
+            }
+        }
+    }
+
     // Execute all modules in a specific phase
     static void run_phase(BootPhase phase) {
         switch (phase) {
             case BootPhase::PHASE_0_EARLY_BOOT:
-                for (const auto& mod : PHASE_0_MODULES) {
-                    if (mod.init_fn != nullptr) {
-                        mod.init_fn();
-                    }
-                }
+                run_modules(PHASE_0_MODULES);
                 break;
             case BootPhase::PHASE_1_POST_MM:
-                for (const auto& mod : PHASE_1_MODULES) {
-                    if (mod.init_fn != nullptr) {
-                        mod.init_fn();
-                    }
-                }
+                run_modules(PHASE_1_MODULES);
                 break;
             case BootPhase::PHASE_2_POST_INTERRUPT:
-                for (const auto& mod : PHASE_2_MODULES) {
-                    if (mod.init_fn != nullptr) {
-                        mod.init_fn();
-                    }
-                }
+                run_modules(PHASE_2_MODULES);
                 break;
             case BootPhase::PHASE_3_SUBSYSTEMS:
-                for (const auto& mod : PHASE_3_MODULES) {
-                    if (mod.init_fn != nullptr) {
-                        mod.init_fn();
-                    }
-                }
+                run_modules(PHASE_3_MODULES);
                 break;
             case BootPhase::PHASE_4_SCHEDULER_SETUP:
-                for (const auto& mod : PHASE_4_MODULES) {
-                    if (mod.init_fn != nullptr) {
-                        mod.init_fn();
-                    }
-                }
+                run_modules(PHASE_4_MODULES);
                 break;
             case BootPhase::PHASE_5_DRIVERS:
-                for (const auto& mod : PHASE_5_MODULES) {
-                    if (mod.init_fn != nullptr) {
-                        mod.init_fn();
-                    }
-                }
+                run_modules(PHASE_5_MODULES);
                 break;
             case BootPhase::PHASE_6_POST_SCHEDULER:
-                for (const auto& mod : PHASE_6_MODULES) {
-                    if (mod.init_fn != nullptr) {
-                        mod.init_fn();
-                    }
-                }
+                run_modules(PHASE_6_MODULES);
                 break;
             case BootPhase::PHASE_7_KERNEL_START:
-                for (const auto& mod : PHASE_7_MODULES) {
-                    if (mod.init_fn != nullptr) {
-                        mod.init_fn();
-                    }
-                }
+                run_modules(PHASE_7_MODULES);
                 break;
         }
     }

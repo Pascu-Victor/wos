@@ -2,12 +2,14 @@ cmake_minimum_required(VERSION 3.28)
 
 project(testprog LANGUAGES CXX)
 
+option(WOS_MANDELBENCH_DEBUG "Enable verbose mandelbench CPU instrumentation" OFF)
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Compiler flags
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Werror -fno-sanitize=safe-stack")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -flto -Wall -Wextra -Werror -fno-sanitize=safe-stack")
 
 # Include paths
 include_directories(
@@ -19,15 +21,29 @@ include_directories(
 
 # Source files
 set(SOURCES
+    src/fsbench.cpp
     src/main.cpp
+    src/netbench.cpp
+    src/perfbench.cpp
+    src/mandelbench/lodepng.cpp
+    src/mandelbench/mandelbench.cpp
+    src/mandelbench/mandelbench_wki.cpp
+    src/mandelbench/util.cpp
+    src/mandelbench/tinycthread.cpp
 )
 
 # Create executable
 add_executable(testprog ${SOURCES})
 
+if(WOS_MANDELBENCH_DEBUG)
+    target_compile_definitions(testprog PRIVATE MANDELBENCH_DEBUG=1)
+else()
+    target_compile_definitions(testprog PRIVATE MANDELBENCH_DEBUG=0)
+endif()
+
 # Linker settings
 set_target_properties(testprog PROPERTIES
-    LINK_FLAGS "-Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/linker.ld -static -Wl,-z,now"
+    LINK_FLAGS "-Wl,-z,now -Wl,--no-dynamic-linker"
 )
 
 target_link_libraries(testprog c++abi c++ c unwind)

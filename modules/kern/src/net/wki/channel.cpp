@@ -1,9 +1,9 @@
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <net/wki/channel.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 
 namespace ker::net::wki {
 
@@ -31,17 +31,17 @@ void wki_channel_send_ack(WkiChannel* ch) {
     ack.reserved = 0;
 
     // Find transport and send
-    WkiPeer* peer = wki_peer_find(ch->peer_node_id);
+    WkiPeer const* peer = wki_peer_find(ch->peer_node_id);
     if ((peer == nullptr) || (peer->transport == nullptr)) {
         return;
     }
 
-    uint16_t next_hop = peer->is_direct ? peer->node_id : peer->next_hop;
-    if (next_hop == WKI_NODE_INVALID) {
+    uint16_t const NEXT_HOP = peer->is_direct ? peer->node_id : peer->next_hop;
+    if (NEXT_HOP == WKI_NODE_INVALID) {
         return;
     }
 
-    peer->transport->tx(peer->transport, next_hop, &ack, WKI_HEADER_SIZE);
+    peer->transport->tx(peer->transport, NEXT_HOP, &ack, WKI_HEADER_SIZE);
     ch->ack_pending = false;
     ch->dup_ack_count = 0;
 }
@@ -56,10 +56,10 @@ void wki_channel_update_rtt(WkiChannel* ch, uint32_t sample_us) {
         ch->srtt_us = sample_us;
         ch->rttvar_us = sample_us / 2;
     } else {
-        int32_t err = static_cast<int32_t>(sample_us) - static_cast<int32_t>(ch->srtt_us);
-        ch->srtt_us = static_cast<uint32_t>(static_cast<int32_t>(ch->srtt_us) + (err / 8));
-        int32_t abs_err = err < 0 ? -err : err;
-        ch->rttvar_us = static_cast<uint32_t>(static_cast<int32_t>(ch->rttvar_us) + ((abs_err - static_cast<int32_t>(ch->rttvar_us)) / 4));
+        int32_t const ERR = static_cast<int32_t>(sample_us) - static_cast<int32_t>(ch->srtt_us);
+        ch->srtt_us = static_cast<uint32_t>(static_cast<int32_t>(ch->srtt_us) + (ERR / 8));
+        int32_t const ABS_ERR = ERR < 0 ? -ERR : ERR;
+        ch->rttvar_us = static_cast<uint32_t>(static_cast<int32_t>(ch->rttvar_us) + ((ABS_ERR - static_cast<int32_t>(ch->rttvar_us)) / 4));
     }
 
     ch->rto_us = ch->srtt_us + (4 * ch->rttvar_us);
@@ -78,18 +78,18 @@ auto wki_channel_retransmit(WkiChannel* ch) -> int {
 
     WkiRetransmitEntry* rt = ch->retransmit_head;
 
-    WkiPeer* peer = wki_peer_find(ch->peer_node_id);
+    WkiPeer const* peer = wki_peer_find(ch->peer_node_id);
     if ((peer == nullptr) || (peer->transport == nullptr)) {
         return WKI_ERR_NO_ROUTE;
     }
 
-    uint16_t next_hop = peer->is_direct ? peer->node_id : peer->next_hop;
-    if (next_hop == WKI_NODE_INVALID) {
+    uint16_t const NEXT_HOP = peer->is_direct ? peer->node_id : peer->next_hop;
+    if (NEXT_HOP == WKI_NODE_INVALID) {
         return WKI_ERR_NO_ROUTE;
     }
 
-    int ret = peer->transport->tx(peer->transport, next_hop, rt->data, rt->len);
-    if (ret < 0) {
+    int const RET = peer->transport->tx(peer->transport, NEXT_HOP, rt->data, rt->len);
+    if (RET < 0) {
         return WKI_ERR_TX_FAILED;
     }
 
@@ -116,20 +116,20 @@ void wki_channel_reset(WkiChannel* ch) {
     }
 
     // Free retransmit queue
-    WkiRetransmitEntry* rt = ch->retransmit_head;
+    WkiRetransmitEntry const* rt = ch->retransmit_head;
     while (rt != nullptr) {
-        WkiRetransmitEntry* next = rt->next;
-        ker::mod::mm::dyn::kmalloc::free(rt->data);
-        ker::mod::mm::dyn::kmalloc::free(rt);
+        WkiRetransmitEntry const* next = rt->next;
+        delete[] rt->data;
+        delete rt;
         rt = next;
     }
 
     // Free reorder buffer
-    WkiReorderEntry* ro = ch->reorder_head;
+    WkiReorderEntry const* ro = ch->reorder_head;
     while (ro != nullptr) {
-        WkiReorderEntry* next = ro->next;
-        ker::mod::mm::dyn::kmalloc::free(ro->data);
-        ker::mod::mm::dyn::kmalloc::free(ro);
+        WkiReorderEntry const* next = ro->next;
+        delete[] ro->data;
+        delete ro;
         ro = next;
     }
 
@@ -152,6 +152,8 @@ void wki_channel_reset(WkiChannel* ch) {
     ch->bytes_sent = 0;
     ch->bytes_received = 0;
     ch->retransmits = 0;
+    ch->perf_last_stall_report_us = 0;
+    ch->perf_last_stall_status = 0;
 
     // Restore default credits
     ch->tx_credits = wki_channel_default_credits(ch->channel_id);

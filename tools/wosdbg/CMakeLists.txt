@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.16)
 project(wosdbg VERSION 2.0.0 LANGUAGES C CXX)
 
 # Set C++ standard
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Set default build type to Release if not specified
@@ -61,6 +61,10 @@ add_executable(wosdbg
     log_processor.cpp
     log_server.cpp
     log_client.cpp
+    debug_analysis_service.h
+    debug_analysis_service.cpp
+    mcp_http_server.h
+    mcp_http_server.cpp
     config.h
     config.cpp
     virtual_table.h
@@ -83,6 +87,8 @@ add_executable(wosdbg
     coredump_memory_panel.cpp
     coredump_elf_panel.h
     coredump_elf_panel.cpp
+    coredump_disasm_panel.h
+    coredump_disasm_panel.cpp
     capstone_disasm.h
     capstone_disasm.cpp
 )

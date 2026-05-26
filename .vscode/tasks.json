@@ -2,154 +2,43 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Check Headers",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && sh scripts/check_headers.sh modules/kern && sh scripts/check_headers.sh modules/init",
-            "type": "shell",
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "bash",
-                    "args": [
-                        "-c"
-                    ]
-                }
-            },
-            "isBackground": false,
-            "group": "build",
-            "presentation": {
-                "reveal": "silent"
-            }
-        },
-        {
-            "label": "Build mlibc",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ninja -C ${workspaceFolder}/toolchain/mlibc-build && ninja -C ${workspaceFolder}/toolchain/mlibc-build install",
-            "type": "shell",
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "bash",
-                    "args": [
-                        "-c"
-                    ]
-                }
-            },
-            "isBackground": false,
-            "group": "build",
-            "presentation": {
-                "reveal": "always"
-            }
-        },
-        {
-            "label": "Build libcxx",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ninja -C ${workspaceFolder}/toolchain/libcxx-build-full && ninja -C ${workspaceFolder}/toolchain/libcxx-build-full install",
-            "type": "shell",
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "bash",
-                    "args": [
-                        "-c"
-                    ]
-                }
-            },
-            "isBackground": false,
-            "group": "build",
-            "presentation": {
-                "reveal": "always"
-            }
-        },
-        {
-            "label": "Build busybox",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/build_busybox.sh",
-            "type": "shell",
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "bash",
-                    "args": [
-                        "-c"
-                    ]
-                }
-            },
-            "isBackground": false,
-            "group": "build",
-            "presentation": {
-                "reveal": "always"
-            }
-        },
-        {
-            "label": "CMake Build",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && cmake -B build -GNinja . && cmake --build build",
-            "type": "shell",
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "bash",
-                    "args": [
-                        "-c"
-                    ]
-                }
-            },
-            "isBackground": false,
-            "group": "build",
-            "presentation": {
-                "reveal": "always"
-            }
-        },
-        {
-            "label": "Create Test Disk",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/create_fat32_test_disk.sh",
-            "type": "shell",
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "bash",
-                    "args": [
-                        "-c"
-                    ]
-                }
-            },
-            "isBackground": false,
-            "group": "build",
-            "presentation": {
-                "reveal": "always"
-            }
-        },
-        {
-            "label": "Make Boot Image",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/make_image.sh",
-            "type": "shell",
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "bash",
-                    "args": [
-                        "-c"
-                    ]
-                }
-            },
-            "isBackground": false,
-            "group": "build",
-            "presentation": {
-                "reveal": "always"
-            }
-        },
-        {
             "label": "Build WOS",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "Check Headers",
-                "Build mlibc",
-                "Build libcxx",
-                "Build busybox",
-                "CMake Build",
-                "Create Test Disk",
-                "Make Boot Image"
-            ],
+            "command": "cmake -B build -GNinja . && cmake --build build --target wos_full",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "bash",
+                    "args": [
+                        "-c"
+                    ]
+                },
+                "env": {
+                    "WOS_ENV_LOADED": "1",
+                    "WOS_WORKSPACE_ROOT": "${workspaceFolder}",
+                    "WOS_TOOLCHAIN_ROOT": "${workspaceFolder}/toolchain",
+                    "WOS_TARGET_ARCH": "x86_64-pc-wos",
+                    "WOS_SYSROOT": "${workspaceFolder}/toolchain/sysroot",
+                    "WOS_CLANG_VERSION": "22",
+                    "CC": "${workspaceFolder}/toolchain/host/bin/clang",
+                    "CXX": "${workspaceFolder}/toolchain/host/bin/clang++",
+                    "LD": "${workspaceFolder}/toolchain/host/bin/ld.lld",
+                    "CFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot -std=c23",
+                    "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot -std=c++23",
+                    "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot",
+                    "NINJA_STATUS": "[%f/%t %e] ",
+                    "PATH": "${workspaceFolder}/toolchain/host/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/host/lib"
+                }
+            },
+            "isBackground": false,
             "problemMatcher": [],
             "group": {
                 "kind": "build",
                 "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always"
             }
         },
         {
@@ -203,7 +92,7 @@
         },
         {
             "label": "Start QEMU Debug",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/run_kern.sh --debug",
+            "command": "${workspaceFolder}/scripts/run_kern.sh --debug",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -212,6 +101,23 @@
                     "args": [
                         "-c"
                     ]
+                },
+                "env": {
+                    "WOS_ENV_LOADED": "1",
+                    "WOS_WORKSPACE_ROOT": "${workspaceFolder}",
+                    "WOS_TOOLCHAIN_ROOT": "${workspaceFolder}/toolchain",
+                    "WOS_TARGET_ARCH": "x86_64-pc-wos",
+                    "WOS_SYSROOT": "${workspaceFolder}/toolchain/sysroot",
+                    "WOS_CLANG_VERSION": "22",
+                    "CC": "${workspaceFolder}/toolchain/host/bin/clang",
+                    "CXX": "${workspaceFolder}/toolchain/host/bin/clang++",
+                    "LD": "${workspaceFolder}/toolchain/host/bin/ld.lld",
+                    "CFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot -std=c23",
+                    "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot -std=c++23",
+                    "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot",
+                    "NINJA_STATUS": "[%f/%t %e] ",
+                    "PATH": "${workspaceFolder}/toolchain/host/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/host/lib"
                 }
             },
             "isBackground": true,
@@ -239,7 +145,7 @@
         },
         {
             "label": "Start Cluster Background",
-            "command": "WOS_QUIET=1 source ${workspaceFolder}/.vscode/wos-env.sh && ${workspaceFolder}/scripts/run_cluster.sh 3 --skip 1",
+            "command": "${workspaceFolder}/scripts/run_cluster.sh 3 --skip 1",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -248,6 +154,23 @@
                     "args": [
                         "-c"
                     ]
+                },
+                "env": {
+                    "WOS_ENV_LOADED": "1",
+                    "WOS_WORKSPACE_ROOT": "${workspaceFolder}",
+                    "WOS_TOOLCHAIN_ROOT": "${workspaceFolder}/toolchain",
+                    "WOS_TARGET_ARCH": "x86_64-pc-wos",
+                    "WOS_SYSROOT": "${workspaceFolder}/toolchain/sysroot",
+                    "WOS_CLANG_VERSION": "22",
+                    "CC": "${workspaceFolder}/toolchain/host/bin/clang",
+                    "CXX": "${workspaceFolder}/toolchain/host/bin/clang++",
+                    "LD": "${workspaceFolder}/toolchain/host/bin/ld.lld",
+                    "CFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot -std=c23",
+                    "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot -std=c++23",
+                    "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot",
+                    "NINJA_STATUS": "[%f/%t %e] ",
+                    "PATH": "${workspaceFolder}/toolchain/host/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/host/lib"
                 }
             },
             "isBackground": true,

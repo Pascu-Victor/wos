@@ -2,24 +2,27 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <cstring>
-#include <net/netpoll.hpp>
 #include <net/wki/event.hpp>
-#include <net/wki/transport_eth.hpp>
 #include <net/wki/transport_ivshmem.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
-#include <platform/ktime/ktime.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
-#include <platform/mm/mm.hpp>
-#include <platform/sched/scheduler.hpp>
 #include <vector>
+
+#include "platform/mm/addr.hpp"
+#include "platform/mm/phys.hpp"
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::net::wki {
 
+using log = ker::mod::dbg::logger<"wki">;
+
 // -----------------------------------------------------------------------------
-// Zone table — static storage for all zones on this node
+// Zone table - static storage for all zones on this node
 // -----------------------------------------------------------------------------
 
 namespace {
@@ -54,7 +57,7 @@ void free_zone_backing(WkiZone* zone) {
             wki_ivshmem_rdma_free(offset, zone->size);
         } else {
             // RoCE-backed or non-RDMA: regular kernel pages
-            ker::mod::mm::phys::pageFree(zone->local_vaddr);
+            ker::mod::mm::phys::page_free(zone->local_vaddr);
         }
     }
     zone->local_vaddr = nullptr;
@@ -65,12 +68,12 @@ void free_zone_backing(WkiZone* zone) {
 
 auto allocate_zone_backing(uint32_t size) -> void* {
     // Allocate physically contiguous pages from buddy allocator
-    return ker::mod::mm::phys::pageAlloc(size);
+    return ker::mod::mm::phys::page_alloc(size);
 }
 
 // Check if a peer has any RDMA-capable transport (ivshmem or RoCE)
 auto peer_has_rdma(uint16_t node_id) -> bool {
-    WkiPeer* peer = wki_peer_find(node_id);
+    WkiPeer const* peer = wki_peer_find(node_id);
     if (peer == nullptr) {
         return false;
     }
@@ -87,7 +90,7 @@ auto peer_has_rdma(uint16_t node_id) -> bool {
 
 // Get the RDMA transport for a peer (prefers rdma_transport, falls back to transport)
 auto peer_rdma_transport(uint16_t node_id) -> WkiTransport* {
-    WkiPeer* peer = wki_peer_find(node_id);
+    WkiPeer const* peer = wki_peer_find(node_id);
     if (peer == nullptr) {
         return nullptr;
     }
@@ -101,8 +104,9 @@ auto peer_rdma_transport(uint16_t node_id) -> WkiTransport* {
 }
 
 // Check if the peer's RDMA transport is RoCE (not ivshmem shared memory)
+[[maybe_unused]]
 auto peer_rdma_is_roce(uint16_t node_id) -> bool {
-    WkiPeer* peer = wki_peer_find(node_id);
+    WkiPeer const* peer = wki_peer_find(node_id);
     if (peer == nullptr) {
         return false;
     }
@@ -110,10 +114,7 @@ auto peer_rdma_is_roce(uint16_t node_id) -> bool {
     // it's the RoCE overlay. Also check if the primary transport is not rdma_capable.
     if (peer->rdma_transport != nullptr && peer->rdma_transport->rdma_capable) {
         // If the primary transport is also rdma_capable, it's ivshmem (preferred)
-        if (peer->transport != nullptr && peer->transport->rdma_capable) {
-            return false;  // ivshmem
-        }
-        return true;  // RoCE
+        return peer->transport == nullptr || !peer->transport->rdma_capable;
     }
     return false;
 }
@@ -122,12 +123,12 @@ auto peer_rdma_is_roce(uint16_t node_id) -> bool {
 // Returns the local virtual pointer and sets out_offset to the RDMA offset (used as rkey).
 // Returns nullptr if RDMA allocation fails.
 auto allocate_rdma_zone_backing(uint32_t size, int64_t& out_offset) -> void* {
-    int64_t offset = wki_ivshmem_rdma_alloc(size);
-    if (offset < 0) {
+    int64_t const OFFSET = wki_ivshmem_rdma_alloc(size);
+    if (OFFSET < 0) {
         return nullptr;
     }
-    out_offset = offset;
-    return wki_ivshmem_rdma_ptr(offset);
+    out_offset = OFFSET;
+    return wki_ivshmem_rdma_ptr(OFFSET);
 }
 
 // Allocate RoCE-backed zone memory: kernel pages registered with the RoCE transport.
@@ -137,14 +138,14 @@ auto allocate_roce_zone_backing(WkiTransport* transport, uint32_t size, uint32_t
     if (transport == nullptr || transport->rdma_register_region == nullptr) {
         return nullptr;
     }
-    void* backing = ker::mod::mm::phys::pageAlloc(size);
+    void* backing = ker::mod::mm::phys::page_alloc(size);
     if (backing == nullptr) {
         return nullptr;
     }
     uint32_t rkey = 0;
-    int ret = transport->rdma_register_region(transport, reinterpret_cast<uint64_t>(backing), size, &rkey);
-    if (ret != 0) {
-        ker::mod::mm::phys::pageFree(backing);
+    int const RET = transport->rdma_register_region(transport, reinterpret_cast<uint64_t>(backing), size, &rkey);
+    if (RET != 0) {
+        ker::mod::mm::phys::page_free(backing);
         return nullptr;
     }
     out_rkey = rkey;
@@ -168,11 +169,11 @@ void wki_zone_init() {
     }
 
     s_zone_initialized = true;
-    ker::mod::dbg::log("[WKI] Zone subsystem initialized");
+    log::info("Zone subsystem initialized");
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Zone creation
+// Public API - Zone creation
 // -----------------------------------------------------------------------------
 
 auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t access_policy, ZoneNotifyMode notify, ZoneTypeHint hint)
@@ -187,7 +188,7 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
     }
 
     // Check peer is connected
-    WkiPeer* p = wki_peer_find(peer);
+    WkiPeer const* p = wki_peer_find(peer);
     if (p == nullptr || p->state != PeerState::CONNECTED) {
         return WKI_ERR_PEER_FENCED;
     }
@@ -237,55 +238,44 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
     req.notify_mode = static_cast<uint8_t>(notify);
     req.zone_type_hint = static_cast<uint8_t>(hint);
 
-    int ret = wki_send(peer, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_REQ, &req, sizeof(req));
-    if (ret != WKI_OK) {
+    // Set up wait entry before send (temporarily use read_wait_entry;
+    // zone is NEGOTIATING so no reads are possible)
+    WkiWaitEntry create_wait = {};
+    zone->read_wait_entry = &create_wait;
+
+    int const RET = wki_send(peer, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_REQ, &req, sizeof(req));
+    if (RET != WKI_OK) {
         // Clean up on send failure
+        zone->read_wait_entry = nullptr;
         s_zone_table_lock.lock();
         zone->state = ZoneState::NONE;
         zone->zone_id = 0;
         s_zone_table_lock.unlock();
-        return ret;
+        return RET;
     }
 
-    // Spin-wait for ACK (zone transitions to ACTIVE or back to NONE)
-    // Poll the NIC and yield during the spin-wait so incoming packets (including
-    // the ZONE_CREATE_ACK) can be processed.  napi_poll_inline() will harmlessly
-    // return 0 if we are already inside the NAPI poll handler (re-entrancy safe).
-    uint64_t deadline = wki_now_us() + WKI_ZONE_TIMEOUT_US;
-    while (zone->state == ZoneState::NEGOTIATING) {
-        asm volatile("pause" ::: "memory");
-        if (zone->state != ZoneState::NEGOTIATING) {
-            break;
-        }
-        if (wki_now_us() >= deadline) {
-            // Timeout — clean up
-            s_zone_table_lock.lock();
-            zone->state = ZoneState::NONE;
-            zone->zone_id = 0;
-            s_zone_table_lock.unlock();
-            return WKI_ERR_ZONE_TIMEOUT;
-        }
-        // Drive NIC polling + yield so the zone create ACK can be received.
-        // When called from the timer thread (the deferred zone creation path),
-        // this allows the ACK to be processed.  When called from inside the
-        // NAPI poll handler, napi_poll_inline returns 0 (harmless).
-        net::NetDevice* net_dev = wki_eth_get_netdev();
-        if (net_dev != nullptr) {
-            net::napi_poll_inline(net_dev);
-        }
-        ker::mod::sched::kern_yield();
+    // Wait for ACK via async wait queue
+    int const WAIT_RC = wki_wait_for_op(&create_wait, WKI_OP_TIMEOUT_US);
+    zone->read_wait_entry = nullptr;
+    if (WAIT_RC == WKI_ERR_TIMEOUT) {
+        // Timeout - clean up
+        s_zone_table_lock.lock();
+        zone->state = ZoneState::NONE;
+        zone->zone_id = 0;
+        s_zone_table_lock.unlock();
+        return WKI_ERR_ZONE_TIMEOUT;
     }
 
     if (zone->state == ZoneState::ACTIVE) {
         return WKI_OK;
     }
 
-    // Zone was rejected — slot already cleaned up by ACK handler
+    // Zone was rejected - slot already cleaned up by ACK handler
     return WKI_ERR_ZONE_REJECTED;
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Zone destruction
+// Public API - Zone destruction
 // -----------------------------------------------------------------------------
 
 auto wki_zone_destroy(uint32_t zone_id) -> int {
@@ -297,7 +287,7 @@ auto wki_zone_destroy(uint32_t zone_id) -> int {
         return WKI_ERR_ZONE_NOT_FOUND;
     }
 
-    uint16_t peer = zone->peer_node_id;
+    uint16_t const PEER = zone->peer_node_id;
 
     // Free backing memory
     free_zone_backing(zone);
@@ -311,15 +301,15 @@ auto wki_zone_destroy(uint32_t zone_id) -> int {
     // Notify peer
     ZoneDestroyPayload destroy = {};
     destroy.zone_id = zone_id;
-    wki_send(peer, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_DESTROY, &destroy, sizeof(destroy));
+    wki_send(PEER, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_DESTROY, &destroy, sizeof(destroy));
 
-    ker::mod::dbg::log("[WKI] Zone 0x%08x destroyed", zone_id);
+    log::info("Zone 0x%08x destroyed", zone_id);
     wki_event_publish(EVENT_CLASS_ZONE, EVENT_ZONE_DESTROYED, &zone_id, sizeof(zone_id));
     return WKI_OK;
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Zone lookup
+// Public API - Zone lookup
 // -----------------------------------------------------------------------------
 
 auto wki_zone_find(uint32_t zone_id) -> WkiZone* {
@@ -330,7 +320,7 @@ auto wki_zone_find(uint32_t zone_id) -> WkiZone* {
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Zone read (message-based, blocking)
+// Public API - Zone read (message-based, blocking)
 // -----------------------------------------------------------------------------
 
 auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -> int {
@@ -342,7 +332,7 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
         return WKI_ERR_ZONE_INACTIVE;
     }
 
-    // Check access policy — we need REMOTE_READ on the peer's zone
+    // Check access policy - we need REMOTE_READ on the peer's zone
     // (The remote side validates this too, but checking early avoids network round-trip)
     if ((zone->access_policy & ZONE_ACCESS_REMOTE_READ) == 0) {
         return WKI_ERR_ZONE_ACCESS;
@@ -370,8 +360,10 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
         chunk = std::min<size_t>(chunk, WKI_ZONE_MAX_MSG_DATA);
 
         // Set up pending read state
+        WkiWaitEntry read_wait = {};
         zone->lock.lock();
-        zone->read_pending = true;
+        zone->read_wait_entry = &read_wait;
+        zone->read_pending.store(true, std::memory_order_release);
         zone->read_dest_buf = dest;
         zone->read_result_len = 0;
         zone->read_status = 0;
@@ -383,23 +375,19 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
         req.offset = cur_offset;
         req.length = chunk;
 
-        int ret = wki_send(zone->peer_node_id, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_READ_REQ, &req, sizeof(req));
-        if (ret != WKI_OK) {
-            zone->read_pending = false;
-            return ret;
+        int const RET = wki_send(zone->peer_node_id, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_READ_REQ, &req, sizeof(req));
+        if (RET != WKI_OK) {
+            zone->read_wait_entry = nullptr;
+            zone->read_pending.store(false, std::memory_order_relaxed);
+            return RET;
         }
 
-        // Spin-wait for response with memory fence
-        uint64_t deadline = wki_now_us() + WKI_ZONE_TIMEOUT_US;
-        while (zone->read_pending) {
-            asm volatile("pause" ::: "memory");
-            if (!zone->read_pending) {
-                break;
-            }
-            if (wki_now_us() >= deadline) {
-                zone->read_pending = false;
-                return WKI_ERR_ZONE_TIMEOUT;
-            }
+        // Wait for response via async wait queue
+        int const WAIT_RC = wki_wait_for_op(&read_wait, WKI_OP_TIMEOUT_US);
+        zone->read_wait_entry = nullptr;
+        if (WAIT_RC == WKI_ERR_TIMEOUT) {
+            zone->read_pending.store(false, std::memory_order_relaxed);
+            return WKI_ERR_ZONE_TIMEOUT;
         }
 
         if (zone->read_status != 0) {
@@ -415,7 +403,7 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Zone write (message-based, blocking)
+// Public API - Zone write (message-based, blocking)
 // -----------------------------------------------------------------------------
 
 auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t len) -> int {
@@ -454,7 +442,7 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
 
         // Build variable-length ZONE_WRITE_REQ: header + data
         auto msg_len = static_cast<uint16_t>(sizeof(ZoneWriteReqPayload) + chunk);
-        auto* msg_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(msg_len));
+        auto* msg_buf = new (std::nothrow) uint8_t[msg_len];
         if (msg_buf == nullptr) {
             return WKI_ERR_ZONE_NO_MEM;
         }
@@ -466,30 +454,28 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
         memcpy(msg_buf + sizeof(ZoneWriteReqPayload), src, chunk);
 
         // Set up pending write state
+        WkiWaitEntry write_wait = {};
         zone->lock.lock();
-        zone->write_pending = true;
+        zone->write_wait_entry = &write_wait;
+        zone->write_pending.store(true, std::memory_order_release);
         zone->write_status = 0;
         zone->lock.unlock();
 
-        int ret = wki_send(zone->peer_node_id, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_WRITE_REQ, msg_buf, msg_len);
-        ker::mod::mm::dyn::kmalloc::free(msg_buf);
+        int const RET = wki_send(zone->peer_node_id, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_WRITE_REQ, msg_buf, msg_len);
+        delete[] msg_buf;
 
-        if (ret != WKI_OK) {
-            zone->write_pending = false;
-            return ret;
+        if (RET != WKI_OK) {
+            zone->write_wait_entry = nullptr;
+            zone->write_pending.store(false, std::memory_order_relaxed);
+            return RET;
         }
 
-        // Spin-wait for ACK with memory fence
-        uint64_t deadline = wki_now_us() + WKI_ZONE_TIMEOUT_US;
-        while (zone->write_pending) {
-            asm volatile("pause" ::: "memory");
-            if (!zone->write_pending) {
-                break;
-            }
-            if (wki_now_us() >= deadline) {
-                zone->write_pending = false;
-                return WKI_ERR_ZONE_TIMEOUT;
-            }
+        // Wait for ACK via async wait queue
+        int const WAIT_RC = wki_wait_for_op(&write_wait, WKI_OP_TIMEOUT_US);
+        zone->write_wait_entry = nullptr;
+        if (WAIT_RC == WKI_ERR_TIMEOUT) {
+            zone->write_pending.store(false, std::memory_order_relaxed);
+            return WKI_ERR_ZONE_TIMEOUT;
         }
 
         if (zone->write_status != 0) {
@@ -505,16 +491,16 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
 }
 
 // -----------------------------------------------------------------------------
-// Public API — RDMA direct access
+// Public API - RDMA direct access
 // -----------------------------------------------------------------------------
 
 // Returns a raw pointer to the zone's local backing memory for RDMA direct access.
 // The caller is responsible for respecting the zone's access_policy bits
 // (ZONE_ACCESS_LOCAL_READ/WRITE, ZONE_ACCESS_REMOTE_READ/WRITE from wire.hpp).
-// No enforcement is done here — policy checks are performed at the message-based
+// No enforcement is done here - policy checks are performed at the message-based
 // read/write paths (wki_zone_read / wki_zone_write).
 auto wki_zone_get_ptr(uint32_t zone_id) -> void* {
-    WkiZone* zone = wki_zone_find(zone_id);
+    WkiZone const* zone = wki_zone_find(zone_id);
     if (zone == nullptr || zone->state != ZoneState::ACTIVE) {
         return nullptr;
     }
@@ -522,7 +508,7 @@ auto wki_zone_get_ptr(uint32_t zone_id) -> void* {
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Notification handlers
+// Public API - Notification handlers
 // -----------------------------------------------------------------------------
 
 void wki_zone_set_handlers(uint32_t zone_id, ZoneNotifyHandler pre, ZoneNotifyHandler post) {
@@ -537,7 +523,7 @@ void wki_zone_set_handlers(uint32_t zone_id, ZoneNotifyHandler pre, ZoneNotifyHa
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Fencing cleanup
+// Public API - Fencing cleanup
 // -----------------------------------------------------------------------------
 
 void wki_zones_destroy_for_peer(uint16_t node_id) {
@@ -551,7 +537,15 @@ void wki_zones_destroy_for_peer(uint16_t node_id) {
             continue;
         }
 
-        ker::mod::dbg::log("[WKI] Destroying zone 0x%08x (peer 0x%04x fenced)", zone.zone_id, node_id);
+        log::info("Destroying zone 0x%08x (peer 0x%04x fenced)", zone.zone_id, node_id);
+
+        // Wake any pending waiters with error
+        if (zone.read_wait_entry != nullptr) {
+            wki_wake_op(zone.read_wait_entry, -1);
+        }
+        if (zone.write_wait_entry != nullptr) {
+            wki_wake_op(zone.write_wait_entry, -1);
+        }
 
         free_zone_backing(&zone);
         zone.state = ZoneState::NONE;
@@ -562,7 +556,7 @@ void wki_zones_destroy_for_peer(uint16_t node_id) {
 }
 
 // -----------------------------------------------------------------------------
-// Public API — Zone listing
+// Public API - Zone listing
 // -----------------------------------------------------------------------------
 
 auto wki_zones_list() -> auto {
@@ -578,7 +572,7 @@ auto wki_zones_list() -> auto {
 }
 
 // -----------------------------------------------------------------------------
-// RX Handlers — Zone negotiation
+// RX Handlers - Zone negotiation
 // -----------------------------------------------------------------------------
 
 namespace detail {
@@ -589,14 +583,14 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
     }
 
     const auto* req = reinterpret_cast<const ZoneCreateReqPayload*>(payload);
-    uint16_t src_node = hdr->src_node;
+    uint16_t const SRC_NODE = hdr->src_node;
 
     // Validate size is page-aligned and non-zero
     if (req->size == 0 || (req->size & 0xFFF) != 0) {
         ZoneCreateAckPayload ack = {};
         ack.zone_id = req->zone_id;
         ack.status = static_cast<uint8_t>(ZoneCreateStatus::REJECTED_POLICY);
-        wki_send(src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack));
+        wki_send(SRC_NODE, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack));
         return;
     }
 
@@ -608,7 +602,7 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
         ZoneCreateAckPayload ack = {};
         ack.zone_id = req->zone_id;
         ack.status = static_cast<uint8_t>(ZoneCreateStatus::REJECTED_POLICY);
-        wki_send(src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack));
+        wki_send(SRC_NODE, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack));
         return;
     }
 
@@ -619,7 +613,7 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
         ZoneCreateAckPayload ack = {};
         ack.zone_id = req->zone_id;
         ack.status = static_cast<uint8_t>(ZoneCreateStatus::REJECTED_NO_MEM);
-        wki_send(src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack));
+        wki_send(SRC_NODE, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack));
         return;
     }
 
@@ -632,7 +626,7 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
     uint32_t rkey = 0;
     WkiTransport* zone_rdma_transport = nullptr;
 
-    if (peer_has_rdma(src_node)) {
+    if (peer_has_rdma(SRC_NODE)) {
         // Try ivshmem shared memory first (zero-copy, lowest latency)
         backing = allocate_rdma_zone_backing(req->size, rdma_offset);
         if (backing != nullptr) {
@@ -644,7 +638,7 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
 
         // Try RoCE RDMA if ivshmem unavailable
         if (backing == nullptr) {
-            WkiTransport* roce = peer_rdma_transport(src_node);
+            WkiTransport* roce = peer_rdma_transport(SRC_NODE);
             if (roce != nullptr) {
                 uint32_t roce_rkey = 0;
                 backing = allocate_roce_zone_backing(roce, req->size, roce_rkey);
@@ -652,7 +646,7 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
                     use_rdma = true;
                     use_roce = true;
                     rkey = roce_rkey;
-                    phys_addr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::getPhysPointer(reinterpret_cast<uint64_t>(backing)));
+                    phys_addr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(backing)));
                     zone_rdma_transport = roce;
                     memset(backing, 0, req->size);
                 }
@@ -668,16 +662,16 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
             ZoneCreateAckPayload ack = {};
             ack.zone_id = req->zone_id;
             ack.status = static_cast<uint8_t>(ZoneCreateStatus::REJECTED_NO_MEM);
-            wki_send(src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack));
+            wki_send(SRC_NODE, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack));
             return;
         }
         memset(backing, 0, req->size);
-        phys_addr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::getPhysPointer(reinterpret_cast<uint64_t>(backing)));
+        phys_addr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(backing)));
     }
 
     // Populate zone entry
     zone->zone_id = req->zone_id;
-    zone->peer_node_id = src_node;
+    zone->peer_node_id = SRC_NODE;
     zone->state = ZoneState::ACTIVE;
     zone->local_vaddr = backing;
     zone->local_phys_addr = phys_addr;
@@ -706,10 +700,10 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
     ack.phys_addr = phys_addr;
     ack.rkey = rkey;
 
-    wki_send(src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack));
+    wki_send(SRC_NODE, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack));
 
-    ker::mod::dbg::log("[WKI] Zone 0x%08x created (responder, peer 0x%04x, %u bytes, rdma=%d, roce=%d)", req->zone_id, src_node, req->size,
-                       use_rdma ? 1 : 0, use_roce ? 1 : 0);
+    log::info("Zone 0x%08x created (responder, peer 0x%04x, %u bytes, rdma=%d, roce=%d)", req->zone_id, SRC_NODE, req->size,
+              use_rdma ? 1 : 0, use_roce ? 1 : 0);
 
     wki_event_publish(EVENT_CLASS_ZONE, EVENT_ZONE_CREATED, &req->zone_id, sizeof(req->zone_id));
 }
@@ -795,7 +789,7 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
         if (use_rdma && !use_roce) {
             zone->local_phys_addr = static_cast<uint64_t>(rdma_offset);
         } else {
-            zone->local_phys_addr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::getPhysPointer(reinterpret_cast<uint64_t>(backing)));
+            zone->local_phys_addr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(backing)));
         }
         zone->remote_phys_addr = ack->phys_addr;
         zone->remote_rkey = ack->rkey;
@@ -805,7 +799,7 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
 
         // For RoCE zones: tell the responder our local_rkey so it can RDMA
         // write/read our zone memory.  The ACK only carries the responder's
-        // rkey (responder → initiator); we send ours back via a ZONE_NOTIFY_POST
+        // rkey (responder -> initiator); we send ours back via a ZONE_NOTIFY_POST
         // with op_type=0xFE (rkey-exchange).  The rkey is encoded in the offset field.
         if (use_roce && local_rkey != 0) {
             ZoneNotifyPayload rkey_notify = {};
@@ -816,17 +810,28 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
             wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_NOTIFY_POST, &rkey_notify, sizeof(rkey_notify));
         }
 
-        ker::mod::dbg::log("[WKI] Zone 0x%08x active (initiator, peer 0x%04x, %u bytes, rdma=%d, roce=%d)", ack->zone_id, hdr->src_node,
-                           zone->size, use_rdma ? 1 : 0, use_roce ? 1 : 0);
+        log::info("Zone 0x%08x active (initiator, peer 0x%04x, %u bytes, rdma=%d, roce=%d)", ack->zone_id, hdr->src_node, zone->size,
+                  use_rdma ? 1 : 0, use_roce ? 1 : 0);
 
         wki_event_publish(EVENT_CLASS_ZONE, EVENT_ZONE_CREATED, &ack->zone_id, sizeof(ack->zone_id));
+
+        // Wake the creator waiting in wki_zone_create()
+        if (zone->read_wait_entry != nullptr) {
+            wki_wake_op(zone->read_wait_entry, 0);
+        }
     } else {
         // Rejected
-        ker::mod::dbg::log("[WKI] Zone 0x%08x rejected by peer 0x%04x (status=%u)", ack->zone_id, hdr->src_node, ack->status);
+        log::warn("Zone 0x%08x rejected by peer 0x%04x (status=%u)", ack->zone_id, hdr->src_node, ack->status);
 
+        WkiWaitEntry* waiter = zone->read_wait_entry;
         zone->state = ZoneState::NONE;
         zone->zone_id = 0;
         s_zone_table_lock.unlock();
+
+        // Wake the creator waiting in wki_zone_create()
+        if (waiter != nullptr) {
+            wki_wake_op(waiter, 0);
+        }
     }
 }
 
@@ -851,7 +856,15 @@ void handle_zone_destroy(const WkiHeader* hdr, const uint8_t* payload, uint16_t 
         return;
     }
 
-    ker::mod::dbg::log("[WKI] Zone 0x%08x destroyed by peer 0x%04x", destroy->zone_id, hdr->src_node);
+    log::info("Zone 0x%08x destroyed by peer 0x%04x", destroy->zone_id, hdr->src_node);
+
+    // Wake any pending waiters with error
+    if (zone->read_wait_entry != nullptr) {
+        wki_wake_op(zone->read_wait_entry, -1);
+    }
+    if (zone->write_wait_entry != nullptr) {
+        wki_wake_op(zone->write_wait_entry, -1);
+    }
 
     free_zone_backing(zone);
     zone->state = ZoneState::NONE;
@@ -861,7 +874,7 @@ void handle_zone_destroy(const WkiHeader* hdr, const uint8_t* payload, uint16_t 
 }
 
 // -----------------------------------------------------------------------------
-// RX Handlers — Zone notifications
+// RX Handlers - Zone notifications
 // -----------------------------------------------------------------------------
 
 void handle_zone_notify_pre(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
@@ -871,7 +884,7 @@ void handle_zone_notify_pre(const WkiHeader* hdr, const uint8_t* payload, uint16
 
     const auto* notify = reinterpret_cast<const ZoneNotifyPayload*>(payload);
 
-    WkiZone* zone = wki_zone_find(notify->zone_id);
+    WkiZone const* zone = wki_zone_find(notify->zone_id);
     if (zone == nullptr || zone->state != ZoneState::ACTIVE) {
         return;
     }
@@ -905,11 +918,11 @@ void handle_zone_notify_post(const WkiHeader* hdr, const uint8_t* payload, uint1
         return;
     }
 
-    // op_type=0xFE: rkey-exchange — the initiator is telling us its RDMA rkey
+    // op_type=0xFE: rkey-exchange - the initiator is telling us its RDMA rkey
     // so we can write/read its zone memory.  Store it in remote_rkey.
     if (notify->op_type == 0xFE) {
         zone->remote_rkey = notify->offset;  // rkey encoded in offset field
-        // No ACK needed for rkey-exchange — the initiator doesn't wait.
+        // No ACK needed for rkey-exchange - the initiator doesn't wait.
         return;
     }
 
@@ -925,7 +938,7 @@ void handle_zone_notify_post(const WkiHeader* hdr, const uint8_t* payload, uint1
 }
 
 // -----------------------------------------------------------------------------
-// RX Handlers — Zone read (message-based)
+// RX Handlers - Zone read (message-based)
 // -----------------------------------------------------------------------------
 
 void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
@@ -936,7 +949,7 @@ void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     const auto* req = reinterpret_cast<const ZoneReadReqPayload*>(payload);
 
     s_zone_table_lock.lock();
-    WkiZone* zone = find_zone_slot(req->zone_id);
+    WkiZone const* zone = find_zone_slot(req->zone_id);
     s_zone_table_lock.unlock();
 
     if (zone == nullptr || zone->state != ZoneState::ACTIVE) {
@@ -946,7 +959,7 @@ void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t
         return;
     }
 
-    // Check access policy — peer wants to read our local data
+    // Check access policy - peer wants to read our local data
     if ((zone->access_policy & ZONE_ACCESS_REMOTE_READ) == 0) {
         return;
     }
@@ -957,9 +970,9 @@ void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     }
 
     // Build response: ZoneReadRespPayload + data
-    uint32_t data_len = req->length;
-    auto resp_len = static_cast<uint16_t>(sizeof(ZoneReadRespPayload) + data_len);
-    auto* resp_buf = static_cast<uint8_t*>(ker::mod::mm::dyn::kmalloc::malloc(resp_len));
+    uint32_t const DATA_LEN = req->length;
+    auto resp_len = static_cast<uint16_t>(sizeof(ZoneReadRespPayload) + DATA_LEN);
+    auto* resp_buf = new (std::nothrow) uint8_t[resp_len];
     if (resp_buf == nullptr) {
         return;
     }
@@ -967,13 +980,13 @@ void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     auto* resp = reinterpret_cast<ZoneReadRespPayload*>(resp_buf);
     resp->zone_id = req->zone_id;
     resp->offset = req->offset;
-    resp->length = data_len;
+    resp->length = DATA_LEN;
 
     // Copy data from local zone backing
-    memcpy(resp_buf + sizeof(ZoneReadRespPayload), static_cast<uint8_t*>(zone->local_vaddr) + req->offset, data_len);
+    memcpy(resp_buf + sizeof(ZoneReadRespPayload), static_cast<uint8_t*>(zone->local_vaddr) + req->offset, DATA_LEN);
 
     wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_READ_RESP, resp_buf, resp_len);
-    ker::mod::mm::dyn::kmalloc::free(resp_buf);
+    delete[] resp_buf;
 }
 
 void handle_zone_read_resp(const WkiHeader* /*hdr*/, const uint8_t* payload, uint16_t payload_len) {
@@ -987,14 +1000,17 @@ void handle_zone_read_resp(const WkiHeader* /*hdr*/, const uint8_t* payload, uin
     WkiZone* zone = find_zone_slot(resp->zone_id);
     s_zone_table_lock.unlock();
 
-    if (zone == nullptr || !zone->read_pending) {
+    if (zone == nullptr || !zone->read_pending.load(std::memory_order_acquire)) {
         return;
     }
 
     // Validate data fits
     if (sizeof(ZoneReadRespPayload) + resp->length > payload_len) {
         zone->read_status = WKI_ERR_INVALID;
-        zone->read_pending = false;
+        zone->read_pending.store(false, std::memory_order_release);
+        if (zone->read_wait_entry != nullptr) {
+            wki_wake_op(zone->read_wait_entry, 0);
+        }
         return;
     }
 
@@ -1005,11 +1021,14 @@ void handle_zone_read_resp(const WkiHeader* /*hdr*/, const uint8_t* payload, uin
 
     zone->read_result_len = resp->length;
     zone->read_status = 0;
-    zone->read_pending = false;  // Unblock the waiting caller
+    zone->read_pending.store(false, std::memory_order_release);
+    if (zone->read_wait_entry != nullptr) {
+        wki_wake_op(zone->read_wait_entry, 0);
+    }
 }
 
 // -----------------------------------------------------------------------------
-// RX Handlers — Zone write (message-based)
+// RX Handlers - Zone write (message-based)
 // -----------------------------------------------------------------------------
 
 void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
@@ -1020,7 +1039,7 @@ void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
     const auto* req = reinterpret_cast<const ZoneWriteReqPayload*>(payload);
 
     s_zone_table_lock.lock();
-    WkiZone* zone = find_zone_slot(req->zone_id);
+    WkiZone const* zone = find_zone_slot(req->zone_id);
     s_zone_table_lock.unlock();
 
     if (zone == nullptr || zone->state != ZoneState::ACTIVE) {
@@ -1030,7 +1049,7 @@ void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         return;
     }
 
-    // Check access policy — peer wants to write to our local data
+    // Check access policy - peer wants to write to our local data
     if ((zone->access_policy & ZONE_ACCESS_REMOTE_WRITE) == 0) {
         ZoneWriteAckPayload ack = {};
         ack.zone_id = req->zone_id;
@@ -1068,12 +1087,15 @@ void handle_zone_write_ack(const WkiHeader* /*hdr*/, const uint8_t* payload, uin
     WkiZone* zone = find_zone_slot(ack->zone_id);
     s_zone_table_lock.unlock();
 
-    if (zone == nullptr || !zone->write_pending) {
+    if (zone == nullptr || !zone->write_pending.load(std::memory_order_acquire)) {
         return;
     }
 
     zone->write_status = ack->status;
-    zone->write_pending = false;  // Unblock the waiting caller
+    zone->write_pending.store(false, std::memory_order_release);
+    if (zone->write_wait_entry != nullptr) {
+        wki_wake_op(zone->write_wait_entry, 0);
+    }
 }
 
 }  // namespace detail

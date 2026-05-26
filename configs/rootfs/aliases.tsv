@@ -1,0 +1,26 @@
+# action<TAB>source<TAB>target[<TAB>mode for copy-mode]
+copy	configs/rootfs/etc/services	/etc/services
+copy	build/modules/testprog/testprog	/usr/bin/testprog
+copy	build/modules/testd/testd	/usr/bin/testd
+copy	build/modules/perf/perf	/usr/bin/perf
+copy	build/modules/renderbench/renderbench	/usr/bin/renderbench
+copy-mode	configs/drive/srv/wos_userland_suite.sh	/usr/bin/wos-userland-suite	755
+copy	build/modules/debugserver/debugserver	/usr/bin/debugserver
+copy	build/modules/strace/strace	/usr/bin/strace
+copy-mode	build/modules/sftpserver/sftp-server	/usr/libexec/sftp-server	755
+copy	build/modules/journal/journal	/usr/bin/journalctl
+copy	build/modules/wkictl/wkictl	/usr/bin/wkictl
+symlink	/usr/bin/wkictl	/usr/bin/locally
+symlink	/usr/bin/wkictl	/usr/bin/remotely
+symlink	/usr/bin/wkictl	/usr/bin/homeward
+symlink	/usr/bin/wkictl	/usr/bin/on
+symlink	/usr/bin/wkictl	/usr/bin/forward
+symlink	/usr/bin/wkictl	/usr/bin/wosid
+copy	toolchain/sysroot/bin/dropbearmulti	/usr/bin/dropbearmulti
+symlink	/usr/bin/dropbearmulti	/usr/bin/dropbear
+symlink	/usr/bin/dropbearmulti	/usr/bin/dbclient
+symlink	/usr/bin/dropbearmulti	/usr/bin/dropbearkey
+symlink	/usr/bin/dropbearmulti	/usr/bin/scp
+copy	build/modules/httpd/httpd	/usr/sbin/httpd
+copy	build/modules/netd/netd	/usr/sbin/netd
+copy	build/modules/journal/journal	/usr/sbin/journald

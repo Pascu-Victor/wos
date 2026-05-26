@@ -1,25 +1,38 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <defines/defines.hpp>
 
 namespace ker::mod::mm {
 struct PageAllocator;
 }  // namespace ker::mod::mm
+namespace ker::mod::mm::paging {
+constexpr uint64_t PAGE_SHIFT = 12;
+constexpr uint64_t PAGE_SIZE = 0x1000;
+constexpr size_t PAGE_TABLE_ENTRIES = 512;
+}  // namespace ker::mod::mm::paging
 
-#define PAGE_ALIGN_UP(addr) (((addr) + ker::mod::mm::paging::PAGE_SIZE - 1) & (~(ker::mod::mm::paging::PAGE_SIZE - 1)))
-#define PAGE_ALIGN_DOWN(addr) ((addr) & ~(ker::mod::mm::paging::PAGE_SIZE - 1))
+template <typename T>
+constexpr auto page_align_down(T addr) -> T {
+    return static_cast<T>((addr & ~(ker::mod::mm::paging::PAGE_SIZE - 1)));
+}
+
+template <typename T>
+constexpr auto page_align_up(T addr) -> T {
+    return static_cast<T>((addr + ker::mod::mm::paging::PAGE_SIZE - 1) & ~(ker::mod::mm::paging::PAGE_SIZE - 1));
+}
 
 namespace ker::mod::mm::paging {
-const static uint64_t PAGE_SHIFT = 12;
-const static uint64_t PAGE_SIZE = 0x1000;
 struct PageZone {
+    constexpr static uint64_t ZONE_HUGE_PAGES = 9999;  // Special zone number for huge pages
     PageZone* next;
     mm::PageAllocator* allocator;
     uint64_t start;
     uint64_t len;
-    size_t pageCount;
-    uint64_t zoneNum;
+    size_t page_count;
+    uint64_t zone_num;
     const char* name;
 };
 
@@ -27,8 +40,8 @@ struct PageTableEntry {
     uint8_t present : 1;
     uint8_t writable : 1;
     uint8_t user : 1;
-    uint8_t writeThrough : 1;
-    uint8_t cacheDisabled : 1;
+    uint8_t write_through : 1;
+    uint8_t cache_disabled : 1;
     uint8_t accessed : 1;
     uint8_t dirty : 1;
     uint8_t pagesize : 1;
@@ -36,12 +49,19 @@ struct PageTableEntry {
     uint8_t available : 3;
     uint64_t frame : 40;
     uint64_t reserved : 11;
-    uint64_t noExecute : 1;  // NX bit (if EFER.NXE enabled)
+    uint64_t no_execute : 1;  // NX bit (if EFER.NXE enabled)
 } __attribute__((packed));
 
+static_assert(sizeof(PageTableEntry) == sizeof(uint64_t));
+static_assert(alignof(PageTableEntry) == alignof(uint8_t));
+
 struct PageTable {
-    PageTableEntry entries[512];
+    std::array<PageTableEntry, PAGE_TABLE_ENTRIES> entries;
 } __attribute__((packed));
+
+static_assert(sizeof(PageTable) == PAGE_SIZE);
+static_assert(alignof(PageTable) == alignof(uint8_t));
+static_assert(offsetof(PageTable, entries) == 0);
 
 struct PageFault {
     uint8_t present;
@@ -49,39 +69,53 @@ struct PageFault {
     uint8_t user;
     uint8_t reserved;
     uint8_t fetch;
-    uint8_t protectionKey;
-    uint8_t shadowStack;
-    uint8_t criticalHandling;  // 1 = Panic if unhandled
+    uint8_t protection_key;
+    uint8_t shadow_stack;
+    uint8_t critical_handling;  // 1 = Panic if unhandled
     uint64_t flags;
 } __attribute__((packed));
 
 const static uint64_t PAGE_PRESENT = 0x1;
 const static uint64_t PAGE_WRITE = 0x2;
 const static uint64_t PAGE_USER = 0x4;
+const static uint64_t PAGE_PWT = 0x8;   // Page Write-Through
+const static uint64_t PAGE_PCD = 0x10;  // Page Cache Disable (uncacheable)
 const static uint64_t PAGE_NX = (1ULL << 63);
 
 // COW (Copy-on-Write) flag: stored in PTE bit 9 (first "available" OS bit).
 // When set, the page is shared and read-only; a write fault triggers a copy.
 const static uint64_t PAGE_COW = (1ULL << 9);
 
-namespace pageTypes {
+// Shared user mapping flag: stored in PTE bit 10. Fork preserves writable
+// shared mappings instead of converting them to COW.
+const static uint64_t PAGE_SHARED = (1ULL << 10);
+
+// Non-present software marker for reserved user VA ranges (e.g. PROT_NONE
+// anonymous mmap). This occupies address space without backing physical pages.
+const static uint64_t PAGE_RESERVED = (1ULL << 11);
+
+namespace page_types {
 const static uint64_t READONLY = PAGE_PRESENT;
 const static uint64_t KERNEL = PAGE_PRESENT | PAGE_WRITE;
 const static uint64_t USER = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
 const static uint64_t USER_READONLY = PAGE_PRESENT | PAGE_USER;
-}  // namespace pageTypes
+// Uncacheable MMIO mapping: PWT+PCD force strong uncacheable ordering so
+// KVM/EPT handles accesses natively instead of routing through the software
+// emulator (which cannot decode VEX/BMI2 instructions).
+const static uint64_t MMIO = PAGE_PRESENT | PAGE_WRITE | PAGE_PWT | PAGE_PCD;
+}  // namespace page_types
 
-namespace errorFlags {
+namespace error_flags {
 const static uint64_t WRITE = 1;
 const static uint64_t USER = 2;
 const static uint64_t FETCH = 4;
 const static uint64_t PROTECTION_KEY = 5;
 const static uint64_t SHADOW_STACK = 6;
-}  // namespace errorFlags
+}  // namespace error_flags
 
-PageTableEntry createPageTableEntry(uint64_t frame, uint64_t flags);
-PageTableEntry purgePageTableEntry(void);
-PageFault createPageFault(uint64_t flags, bool isCritical = false);
+PageTableEntry create_page_table_entry(uint64_t frame, uint64_t flags);
+PageTableEntry purge_page_table_entry();
+PageFault create_page_fault(uint64_t flags, bool is_critical = false);
 
 inline uint64_t align(uint64_t size, uint64_t align) { return (size + align - 1) & ~(align - 1); }
 

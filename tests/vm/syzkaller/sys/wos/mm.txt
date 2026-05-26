@@ -1,0 +1,25 @@
+# WOS virtual memory syscall descriptions for Syzkaller.
+#
+# WOS syscall ABI:
+#   RAX = 7 (callnums::vmem) — anon_allocate, anon_free, protect
+#   RAX = 8 (callnums::vmem_map) — mmap-style mapping
+#   RDI = vmem::ops enum (sub-operation)
+#   RSI..R10 = arguments a1..a4
+
+include <abi/callnums/vmem.h>
+
+# --- Anonymous memory ---
+
+wos_vmem$anon_allocate(op const[0], addr vma, size len[addr], prot flags[mmap_prot], flags flags[mmap_flags]) vma
+wos_vmem$anon_free(op const[1], addr vma, size len[addr]) int64
+wos_vmem$protect(op const[2], addr vma, size len[addr], prot flags[mmap_prot]) int64
+
+# --- mmap-style mapping (RAX=8, vmem_map) ---
+# This uses a separate callnum entry for 6-argument mmap
+
+wos_vmem_map(addr vma, size len[addr], prot flags[mmap_prot], flags flags[mmap_flags], fd fd, offset int64) vma
+
+# --- Flags ---
+
+mmap_prot = 0, 1, 2, 4, 3, 5, 7
+mmap_flags = 0x02, 0x22, 0x12, 0x01, 0x20

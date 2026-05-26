@@ -1,9 +1,9 @@
 #pragma once
 
+#include <cstdint>
 #include <defines/defines.hpp>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/asm/msr.hpp>
-#include <platform/mm/dyn/kmalloc.hpp>
 
 namespace ker::mod::cpu {
 struct CpuidContext {
@@ -15,8 +15,16 @@ struct CpuidContext {
 };
 
 void cpuid(struct CpuidContext* cpuid_context);
-uint64_t currentCpu(void);
-void setCurrentCpuid(uint64_t id);
+auto current_cpu() -> uint64_t;
+void set_current_cpuid(uint64_t id);
+
+constexpr uint64_t GATE_IF_MASK = 0x200;
+
+// Safe CPU ID getter - falls back to APIC ID during early boot before per-CPU
+// structures are initialized. Call notifyPerCpuReady() to enable the fast path.
+auto get_current_cpu_id_safe() -> uint64_t;
+auto is_per_cpu_ready() -> bool;
+void notify_per_cpu_ready();
 
 struct GPRegs {
     uint64_t r15;
@@ -34,46 +42,61 @@ struct GPRegs {
     uint64_t rcx;
     uint64_t rbx;
     uint64_t rax;
-} __attribute__((packed));
+} __attribute__((packed));  // NOLINT(cppcoreguidelines-pro-type-member-init): interrupt frame ABI layout.
+static_assert(sizeof(GPRegs) == 120, "GPRegs interrupt frame ABI size changed");  // NOLINT
 
 struct PerCpu {
-    uint64_t syscallStack;     // 0x00
-    uint64_t userRsp;          // 0x08 - saved user RSP at syscall entry
-    uint64_t cpuId;            // 0x10
-    uint64_t savedDs;          // 0x18 - saved DS segment
-    uint64_t savedEs;          // 0x20 - saved ES segment
-    uint64_t syscallRetRip;    // 0x28 - RCX at syscall entry (return RIP)
-    uint64_t syscallRetFlags;  // 0x30 - R11 at syscall entry (RFLAGS)
-} __attribute__((packed));
+    uint64_t syscall_stack;      // 0x00
+    uint64_t user_rsp;           // 0x08 - saved user RSP at syscall entry
+    uint64_t cpu_id;             // 0x10
+    uint64_t saved_ds;           // 0x18 - saved DS segment
+    uint64_t saved_es;           // 0x20 - saved ES segment
+    uint64_t syscall_ret_rip;    // 0x28 - RCX at syscall entry (return RIP)
+    uint64_t syscall_ret_flags;  // 0x30 - R11 at syscall entry (RFLAGS)
+    uint64_t syscall_entry_tmp;  // 0x38 - scratch before syscall stack switch
+} __attribute__((packed));       // NOLINT(cppcoreguidelines-pro-type-member-init): accessed by fixed GS offsets in asm.
+static_assert(sizeof(PerCpu) == 64, "PerCpu syscall/interrupt ABI size changed");  // NOLINT
 
-static __always_inline uint64_t rdfsbase(void) {
-    uint64_t fsbase;
+static ALWAYS_INLINE auto rdfsbase() -> uint64_t {
+    // Written by inline asm output constraints.
+    // NOLINTNEXTLINE(misc-const-correctness)
+    uint64_t fsbase = 0;
 
     asm volatile("rdfsbase %0" : "=r"(fsbase)::"memory");
 
     return fsbase;
 }
 
-static __always_inline uint64_t rdgsbase(void) {
-    uint64_t gsbase;
+static ALWAYS_INLINE auto rdgsbase() -> uint64_t {
+    // Written by inline asm output constraints.
+    // NOLINTNEXTLINE(misc-const-correctness)
+    uint64_t gsbase = 0;
 
     asm volatile("rdgsbase %0" : "=r"(gsbase)::"memory");
 
     return gsbase;
 }
 
-static __always_inline void wrfsbase(uint64_t fsbase) { asm volatile("wrfsbase %0" ::"r"(fsbase) : "memory"); }
+static ALWAYS_INLINE void wrfsbase(uint64_t fsbase) { asm volatile("wrfsbase %0" ::"r"(fsbase) : "memory"); }
 
-static __always_inline void wrgsbase(uint64_t gsbase) { asm volatile("wrgsbase %0" ::"r"(gsbase) : "memory"); }
+static ALWAYS_INLINE void wrgsbase(uint64_t gsbase) { asm volatile("wrgsbase %0" ::"r"(gsbase) : "memory"); }
 
-static __always_inline void wrcr4(uint64_t val) { asm volatile("mov %0, %%cr4\n" ::"r"(val) : "memory"); }
+static ALWAYS_INLINE void wrcr4(uint64_t val) { asm volatile("mov %0, %%cr4\n" ::"r"(val) : "memory"); }
+// NOLINTNEXTLINE(readability-non-const-parameter)
+static ALWAYS_INLINE void rdcr4(uint64_t* val) { asm volatile("mov %%cr4, %0" : "=r"(*val) : : "memory"); }
 
-static __always_inline void rdcr4(uint64_t* val) { asm volatile("mov %%cr4, %0" : "=r"(*val) : : "memory"); }
+void enable_pae();
+void enable_pse();
+void enable_sse();
+void enable_fsgsbase();
 
-void enablePAE(void);
-void enablePSE(void);
-void enableSSE(void);
-void enableFSGSBASE(void);
+// Enable XSAVE/XRSTOR and configure XCR0 for x87+SSE+AVX.
+// Must be called after enableSSE(). Called on each CPU.
+void enable_xsave();
 
-#define savesegment(seg, value) asm("movq %%" #seg ",%0" : "=r"(value) : : "memory")
+// Size in bytes of the xsave area (set after enableXSave). 0 = XSAVE not supported, use fxsave.
+extern uint64_t xsave_area_size;
+
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage): segment register name must be stringified into inline asm.
+#define SAVESEGMENT(seg, value) asm("movq %%" #seg ",%0" : "=r"(value) : : "memory")
 }  // namespace ker::mod::cpu

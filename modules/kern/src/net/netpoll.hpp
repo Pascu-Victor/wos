@@ -12,7 +12,7 @@ namespace ker::net {
 struct NetDevice;
 
 // NAPI states - managed atomically for lock-free IRQ/worker coordination
-enum class NapiState : uint32_t {
+enum class NapiState : uint8_t {
     IDLE = 0,       // No pending work, device interrupts enabled
     SCHEDULED = 1,  // Work pending, worker thread will poll
     POLLING = 2,    // Worker actively polling device
@@ -27,18 +27,18 @@ using NapiPollFn = int (*)(NapiStruct* napi, int budget);
 
 // Per-device NAPI context - embedded in driver device struct
 struct NapiStruct {
-    NetDevice* dev;                       // Parent network device
-    NapiPollFn poll;                      // Driver poll function
-    std::atomic<NapiState> state;         // Current NAPI state (lock-free)
-    int weight;                           // Max packets per poll (default: 64)
+    NetDevice* dev;                // Parent network device
+    NapiPollFn poll;               // Driver poll function
+    std::atomic<NapiState> state;  // Current NAPI state (lock-free)
+    int weight;                    // Max packets per poll (default: 64)
 
     // Per-device worker thread
     ker::mod::sched::task::Task* worker;  // Dedicated kernel thread
     std::atomic<bool> has_work;           // Signal to wake worker (set by IRQ)
 
     // Statistics
-    uint64_t poll_count;                  // Number of poll calls
-    uint64_t complete_count;              // Number of napi_complete calls
+    uint64_t poll_count;      // Number of poll calls
+    uint64_t complete_count;  // Number of napi_complete calls
 };
 
 constexpr int NAPI_DEFAULT_WEIGHT = 64;
@@ -46,8 +46,10 @@ constexpr int NAPI_DEFAULT_WEIGHT = 64;
 // Initialize NAPI structure (called during driver init, before napi_enable)
 void napi_init(NapiStruct* napi, NetDevice* dev, NapiPollFn poll, int weight);
 
-// Enable NAPI - creates and starts the per-device worker thread
-void napi_enable(NapiStruct* napi);
+// Enable NAPI - creates and starts the per-device worker thread.
+// If cpu_affinity is not UINT64_MAX the worker is pinned to that CPU
+// (same CPU that services the corresponding MSI-X vector).
+void napi_enable(NapiStruct* napi, uint64_t cpu_affinity = UINT64_MAX);
 
 // Disable NAPI - stops the worker thread (call before device shutdown)
 void napi_disable(NapiStruct* napi);
@@ -62,9 +64,14 @@ bool napi_schedule(NapiStruct* napi);
 // Driver should re-enable device interrupts after calling this
 void napi_complete(NapiStruct* napi);
 
-// Inline poll — called from spin-wait context to drain pending packets without
-// relying on the NAPI worker thread.  Returns number of packets processed (0 if
-// the device was already being polled or no work was pending).
-int napi_poll_inline(NetDevice* dev);
+// Drain all registered NAPI devices inline.  Call this after kern_yield() in
+// blocking kernel paths (tcp_send, tcp_recv) so incoming ACKs/data are
+// processed immediately instead of waiting for the next timer tick.
+// Returns total number of packets processed across all devices.
+int napi_poll_all_pending();
+
+// Migrate the NAPI worker for this struct to `cpu` and pin it there.
+// Safe to call while the device is active; uses reschedule_task_for_cpu.
+void napi_set_worker_cpu(NapiStruct* napi, uint64_t cpu);
 
 }  // namespace ker::net

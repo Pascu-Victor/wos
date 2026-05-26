@@ -1,5 +1,6 @@
 #pragma once
 
+#include <net/address.hpp>
 #include <net/wki/wki.hpp>
 
 namespace ker::net::wki {
@@ -17,18 +18,25 @@ void wki_peer_send_hello(WkiTransport* transport, uint16_t dst_node);
 // Send HELLO_ACK to a specific peer
 void wki_peer_send_hello_ack(WkiPeer* peer);
 
+// Learn a direct peer from any received Ethernet WKI frame so later control
+// traffic is not dropped if HELLO/HELLO_ACK delivery was asymmetric.
+void wki_peer_note_rx_contact(WkiTransport* transport, uint16_t peer_node, const proto::MacAddress& mac);
+
 // Send a heartbeat to all CONNECTED peers
 void wki_peer_send_heartbeats();
 
-// Periodic timer — check heartbeat timeouts, resend HELLOs, fence dead peers
+// Periodic timer - check heartbeat timeouts, resend HELLOs, fence dead peers
 void wki_peer_timer_tick(uint64_t now_us);
 
-// Fence a peer (immediate) — fails in-flight ops, notifies resource layers
+// Fence a peer (immediate) - fails in-flight ops, notifies resource layers
 void wki_peer_fence(WkiPeer* peer);
 
-// WKI timer kernel thread — calls wki_peer_timer_tick() in a loop (~10ms cadence).
+// WKI timer kernel thread - calls wki_peer_timer_tick() in a loop (~10ms cadence).
 // Must be started after scheduler is running (from smt.cpp, like tcp_timer_thread).
 [[noreturn]] void wki_timer_thread();
 void wki_timer_thread_start();
+
+// Wake the timer thread after arming earlier retransmit/ACK/timeout work.
+void wki_timer_notify();
 
 }  // namespace ker::net::wki

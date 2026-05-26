@@ -1,0 +1,7 @@
+---
+# Clang-Tidy configuration for platform/mm.
+
+InheritParentConfig: true
+Checks: >
+    -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+...

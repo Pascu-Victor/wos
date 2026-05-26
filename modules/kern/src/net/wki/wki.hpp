@@ -1,10 +1,14 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <net/address.hpp>
 #include <net/wki/wire.hpp>
 #include <platform/sys/spinlock.hpp>
+
+#include "platform/sched/task.hpp"
 
 namespace ker::net::wki {
 
@@ -37,10 +41,11 @@ constexpr size_t WKI_MAX_CHANNELS = 256;  // per-peer
 constexpr uint16_t WKI_DEFAULT_HEARTBEAT_INTERVAL_MS = 1000;  // 1 second
 constexpr uint16_t WKI_MIN_HEARTBEAT_INTERVAL_MS = 300;       // 300 ms
 constexpr uint16_t WKI_MAX_HEARTBEAT_INTERVAL_MS = 5000;      // 5 seconds
-constexpr uint8_t WKI_DEFAULT_MISS_THRESHOLD = 5;             // 5 misses = 5 second timeout
+constexpr uint8_t WKI_DEFAULT_MISS_THRESHOLD = 10;            // 10 misses = 10 second timeout
+constexpr uint32_t WKI_PEER_FENCE_CONFIRM_GRACE_MS = 30000;   // second chance before destructive fence cleanup
 
 // Grace period for newly connected peers
-constexpr uint32_t WKI_PEER_GRACE_PERIOD_MS = 5000;  // 5 seconds after connection
+constexpr uint32_t WKI_PEER_GRACE_PERIOD_MS = static_cast<uint32_t>(WKI_DEFAULT_MISS_THRESHOLD) * WKI_DEFAULT_HEARTBEAT_INTERVAL_MS;
 
 // Jitter range for heartbeat timing (percentage of interval)
 constexpr uint8_t WKI_HEARTBEAT_JITTER_PERCENT = 25;  // +/- 25% jitter
@@ -49,7 +54,7 @@ constexpr uint8_t WKI_HEARTBEAT_JITTER_PERCENT = 25;  // +/- 25% jitter
 constexpr uint32_t WKI_INITIAL_RTO_US = 500;       // 500 us (Jacobson/Karels adapts to actual RTT)
 constexpr uint32_t WKI_MIN_RTO_US = 100;           // 100 us (floor: 5-10x single-hop RTT)
 constexpr uint32_t WKI_MAX_RTO_US = 50000;         // 50 ms (cap for pathological cases)
-constexpr uint32_t WKI_ACK_DELAY_US = 0;           // 0: immediate ACK on LATENCY channels
+constexpr uint32_t WKI_ACK_DELAY_US = 2000;        // 2 ms: window for piggybacking on BULK channels (LATENCY channels ack inline)
 constexpr uint8_t WKI_FAST_RETRANSMIT_THRESH = 3;  // 3 dup ACKs
 
 // Credit defaults
@@ -58,6 +63,17 @@ constexpr uint16_t WKI_CREDITS_ZONE_MGMT = 32;
 constexpr uint16_t WKI_CREDITS_EVENT_BUS = 128;
 constexpr uint16_t WKI_CREDITS_RESOURCE = 32;
 constexpr uint16_t WKI_CREDITS_DYNAMIC = 256;
+
+// Reorder-buffer limits are intentionally separate from advertised credits.
+// Credits bound what the peer should send concurrently; reorder limits bound
+// how much future traffic we can retain while one missing sequence is being
+// retransmitted. Resource channels fan in pipe/device traffic and can arrive
+// much farther ahead than their nominal credit window under load.
+constexpr uint16_t WKI_REORDER_CONTROL = WKI_CREDITS_CONTROL;
+constexpr uint16_t WKI_REORDER_ZONE_MGMT = WKI_CREDITS_ZONE_MGMT;
+constexpr uint16_t WKI_REORDER_EVENT_BUS = WKI_CREDITS_EVENT_BUS;
+constexpr uint16_t WKI_REORDER_RESOURCE = 1024;
+constexpr uint16_t WKI_REORDER_DYNAMIC = WKI_CREDITS_DYNAMIC;
 
 // LSA
 constexpr uint32_t WKI_LSA_REFRESH_MS = 5000;  // 5 seconds
@@ -78,7 +94,7 @@ constexpr int WKI_ERR_BUSY = -8;
 constexpr int WKI_ERR_TX_FAILED = -9;
 
 // -----------------------------------------------------------------------------
-// Locality tag — attached to all remote resources
+// Locality tag - attached to all remote resources
 // -----------------------------------------------------------------------------
 
 enum class Locality : uint8_t {
@@ -86,6 +102,16 @@ enum class Locality : uint8_t {
     RDMA_LOCAL = 1,  // same RDMA zone, direct peer
     REMOTE = 2,      // multi-hop, routed
 };
+
+// V2: NIC attachment policy [V2 A5.1]
+enum class WkiNicPolicy : uint8_t {
+    ATTACH_ALL = 0,     // Auto-attach every discovered remote NIC
+    ATTACH_SPARSE = 1,  // Auto-attach only if no local NIC covers that subnet (default)
+    MANUAL = 2,         // Never auto-attach; require explicit kernel API call
+};
+
+// V2: RX backpressure credits for forwarded NET packets [V2 A5.6]
+constexpr uint16_t WKI_NET_RX_CREDITS = 64;
 
 // -----------------------------------------------------------------------------
 // Transport Abstraction (Layer 1)
@@ -135,20 +161,25 @@ enum class PeerState : uint8_t {
 
 struct WkiPeer {
     uint16_t node_id = WKI_NODE_INVALID;
-    std::array<uint8_t, 6> mac = {};
+    proto::MacAddress mac;
     WkiTransport* transport = nullptr;
     WkiTransport* rdma_transport = nullptr;  // RDMA-capable overlay (ivshmem or RoCE)
     PeerState state = PeerState::UNKNOWN;
-    uint64_t last_heartbeat = 0;                                         // timestamp of last recv'd heartbeat (microseconds)
-    uint64_t connected_time = 0;                                         // timestamp when peer transitioned to CONNECTED
-    uint32_t rtt_us = 0;                                                 // smoothed RTT (microseconds)
-    uint32_t rtt_var_us = 0;                                             // RTT variance
+    uint64_t last_heartbeat = 0;    // timestamp of last recv'd heartbeat (microseconds)
+    uint64_t last_rx_activity = 0;  // timestamp of last received packet (any type) from this peer
+    uint64_t last_tx_activity = 0;  // timestamp of last packet sent to this peer (any type); used to suppress redundant heartbeats
+    uint64_t connected_time = 0;    // timestamp when peer transitioned to CONNECTED
+    uint32_t rtt_us = 0;            // smoothed RTT (microseconds)
+    uint32_t rtt_var_us = 0;        // RTT variance
     uint16_t heartbeat_interval_ms = WKI_DEFAULT_HEARTBEAT_INTERVAL_MS;  // in milliseconds
     uint8_t miss_threshold = WKI_DEFAULT_MISS_THRESHOLD;
     uint8_t missed_beats = 0;       // consecutive missed heartbeats
     bool is_direct = false;         // direct neighbor?
     uint16_t rdma_zone_id = 0;      // RDMA zone (0 = none)
     uint32_t rdma_zone_bitmap = 0;  // peer's zone membership
+
+    // V2: Hostname identity [V2 A1.5]
+    std::array<char, WKI_HOSTNAME_MAX> hostname;  // UTF-8, NUL-terminated if shorter than WKI_HOSTNAME_MAX
 
     // Routing (for non-direct peers)
     uint16_t next_hop = WKI_NODE_INVALID;
@@ -163,11 +194,18 @@ struct WkiPeer {
     uint16_t capabilities = 0;
     uint16_t max_channels = 0;
 
+    // Channel reset epochs advertised through HELLO reserved bytes.  When a
+    // peer observes our local epoch change, it drops stale channel seq state
+    // for this node so a post-fence seq=0 stream is not mistaken for an old
+    // duplicate.
+    uint32_t local_channel_epoch = 0;
+    uint32_t remote_channel_epoch = 0;
+
     // HELLO retry
     uint64_t hello_sent_time = 0;
     uint8_t hello_retries = 0;
 
-    // Per-peer channel index — O(1) lookup by channel_id
+    // Per-peer channel index - O(1) lookup by channel_id
     // Pointers into the global channel pool; nullptr = not allocated.
     std::array<WkiChannel*, WKI_MAX_CHANNELS> channels = {};
 
@@ -199,15 +237,16 @@ struct WkiRetransmitEntry {
 // -----------------------------------------------------------------------------
 
 struct WkiReorderEntry {
-    uint8_t* data;  // payload only
-    uint16_t len;
-    uint8_t msg_type;
-    uint32_t seq;
-    WkiReorderEntry* next;
+    WkiHeader hdr = {};
+    uint8_t* data = nullptr;  // payload only
+    uint16_t len = 0;
+    uint8_t msg_type = 0;
+    uint32_t seq = 0;
+    WkiReorderEntry* next = nullptr;
 };
 
 // -----------------------------------------------------------------------------
-// Channel — per-peer, per-channel reliability and flow control
+// Channel - per-peer, per-channel reliability and flow control
 // -----------------------------------------------------------------------------
 
 // Max frame size: WKI header + max Ethernet payload
@@ -225,6 +264,7 @@ struct WkiChannel {
     uint32_t rx_seq = 0;          // next expected seq from peer
     uint32_t rx_ack_pending = 0;  // highest seq received, not yet ACKed
     bool ack_pending = false;
+    uint64_t ack_pending_since_us = 0;  // time when ack_pending was last set (for delay enforcement)
 
     // Flow control (credits)
     uint16_t tx_credits = 0;  // credits available for sending
@@ -251,8 +291,10 @@ struct WkiChannel {
     uint64_t bytes_sent = 0;
     uint64_t bytes_received = 0;
     uint32_t retransmits = 0;
+    uint64_t perf_last_stall_report_us = 0;
+    uint32_t perf_last_stall_status = 0;
 
-    // Pre-allocated inline retransmit buffers — eliminates kmalloc for
+    // Pre-allocated inline retransmit buffers - eliminates kmalloc for
     // typical small messages (control, ACKs, small payloads).  Frames
     // larger than WKI_RT_INLINE_SIZE fall back to kmalloc.
     // With zero-copy TX, outgoing frames are built directly in PacketBuffer
@@ -265,11 +307,36 @@ struct WkiChannel {
     ker::mod::sys::Spinlock lock;
 };
 
+constexpr size_t WKI_CHANNEL_DIAG_MAX = 256;
+
+struct WkiChannelDiag {
+    uint16_t peer_node = WKI_NODE_INVALID;
+    PeerState peer_state = PeerState::UNKNOWN;
+    bool peer_direct = false;
+    uint16_t next_hop = WKI_NODE_INVALID;
+    uint8_t hop_count = 0;
+    uint16_t channel_id = 0;
+    uint8_t priority = 0;
+    bool active = false;
+    uint32_t tx_seq = 0;
+    uint32_t tx_ack = 0;
+    uint32_t rx_seq = 0;
+    uint32_t rx_ack_pending = 0;
+    bool ack_pending = false;
+    uint16_t tx_credits = 0;
+    uint16_t rx_credits = 0;
+    uint32_t retransmit_count = 0;
+    uint32_t reorder_count = 0;
+    uint32_t retransmits = 0;
+    uint64_t bytes_sent = 0;
+    uint64_t bytes_received = 0;
+};
+
 // -----------------------------------------------------------------------------
 // Global WKI State
 // -----------------------------------------------------------------------------
 
-// Peer hash table entry — compact open-addressing index for O(1) peer lookup.
+// Peer hash table entry - compact open-addressing index for O(1) peer lookup.
 // The entire table fits in ~1KB (~16 cache lines).
 struct PeerHashEntry {
     uint16_t node_id = WKI_NODE_INVALID;
@@ -280,15 +347,18 @@ constexpr size_t WKI_PEER_HASH_SIZE = 256;
 
 struct WkiState {
     uint16_t my_node_id = WKI_NODE_INVALID;
-    std::array<uint8_t, 6> my_mac = {};
+    proto::MacAddress my_mac;
     bool initialized = false;
+
+    // V2: Local hostname identity [V2 A1.6]
+    std::array<char, WKI_HOSTNAME_MAX> local_hostname = {};
 
     // Peer table
     std::array<WkiPeer, WKI_MAX_PEERS> peers;
     uint16_t peer_count = 0;
     ker::mod::sys::Spinlock peer_lock;
 
-    // Peer hash index — multiplicative hash with linear probing
+    // Peer hash index - multiplicative hash with linear probing
     std::array<PeerHashEntry, WKI_PEER_HASH_SIZE> peer_hash = {};
 
     // Transport registry (linked list)
@@ -303,13 +373,25 @@ struct WkiState {
 
     // LSA state
     uint32_t my_lsa_seq = 0;
+
+    // V2: NIC attachment policy [V2 A5.1]
+    WkiNicPolicy nic_policy = WkiNicPolicy::ATTACH_SPARSE;
+
+    // V2: Sequential index for proxy NIC MAC generation [V2 A5.4]
+    uint8_t proxy_nic_index = 0;
 };
 
 // Global WKI state singleton
 extern WkiState g_wki;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+constexpr auto wki_channel_allocator_node(uint16_t node_a, uint16_t node_b) -> uint16_t { return (node_a < node_b) ? node_a : node_b; }
+
+constexpr auto wki_requester_controls_dynamic_channel(uint16_t requester_node, uint16_t owner_node) -> bool {
+    return requester_node == wki_channel_allocator_node(requester_node, owner_node);
+}
+
 // -----------------------------------------------------------------------------
-// Public API — Core
+// Public API - Core
 // -----------------------------------------------------------------------------
 
 // Initialize WKI subsystem. Called from main.cpp during boot.
@@ -319,14 +401,14 @@ void wki_init();
 void wki_shutdown();
 
 // -----------------------------------------------------------------------------
-// Public API — Transport
+// Public API - Transport
 // -----------------------------------------------------------------------------
 
 void wki_transport_register(WkiTransport* transport);
 void wki_transport_unregister(WkiTransport* transport);
 
 // -----------------------------------------------------------------------------
-// Public API — Peer Management
+// Public API - Peer Management
 // -----------------------------------------------------------------------------
 
 // Find peer by node ID (returns nullptr if not found)
@@ -342,24 +424,24 @@ auto wki_peer_alloc(uint16_t node_id) -> WkiPeer*;
 auto wki_peer_count() -> uint16_t;
 
 // -----------------------------------------------------------------------------
-// Public API — Sending
+// Public API - Sending
 // -----------------------------------------------------------------------------
 
 // Send a message on a specific channel (handles reliability, credits, routing)
 auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const void* payload, uint16_t payload_len) -> int;
 
-// Send a raw frame (bypasses reliability — used for HELLO, HEARTBEAT)
+// Send a raw frame (bypasses reliability - used for HELLO, HEARTBEAT)
 auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint16_t payload_len, uint8_t flags = 0) -> int;
 
 // -----------------------------------------------------------------------------
-// Public API — RX Dispatch (called by transport layer)
+// Public API - RX Dispatch (called by transport layer)
 // -----------------------------------------------------------------------------
 
-// Main RX entry point — called when a WKI frame arrives from any transport
+// Main RX entry point - called when a WKI frame arrives from any transport
 void wki_rx(WkiTransport* transport, const void* data, uint16_t len);
 
 // -----------------------------------------------------------------------------
-// Public API — Channel Management
+// Public API - Channel Management
 // -----------------------------------------------------------------------------
 
 // Find or create a well-known channel to a peer
@@ -368,21 +450,36 @@ auto wki_channel_get(uint16_t peer_node, uint16_t channel_id) -> WkiChannel*;
 // Allocate a dynamic channel to a peer
 auto wki_channel_alloc(uint16_t peer_node, PriorityClass priority) -> WkiChannel*;
 
+// Reserve a specific dynamic channel ID to a peer. Returns nullptr if the
+// requested channel is already in use.
+auto wki_channel_reserve(uint16_t peer_node, uint16_t channel_id, PriorityClass priority) -> WkiChannel*;
+
 // Close and free a channel
 void wki_channel_close(WkiChannel* ch);
 
 // Close all channels to a specific peer (used during fencing)
 void wki_channels_close_for_peer(uint16_t node_id);
 
+// Snapshot active channels for diagnostics. Values are approximate but bounded.
+auto wki_channel_diag_snapshot(WkiChannelDiag* out, size_t max) -> size_t;
+
 // -----------------------------------------------------------------------------
-// Public API — Timer Tick (called from timer interrupt / periodic thread)
+// Public API - Timer Tick (called from timer interrupt / periodic thread)
 // -----------------------------------------------------------------------------
 
 // Process heartbeats, retransmit timers, ACK delays
 void wki_timer_tick(uint64_t now_us);
 
+// Returns true when channel retransmits/ACKs or async wait deadlines require
+// the WKI timer thread to stay on its fast cadence.
+auto wki_has_fast_timer_work() -> bool;
+
+// Earliest fast-path deadline from channel retransmits/ACKs and timed waits.
+// Returns UINT64_MAX when no fast timer work is armed.
+auto wki_next_fast_timer_deadline_us(uint64_t now_us) -> uint64_t;
+
 // -----------------------------------------------------------------------------
-// Public API — Time source (must be provided by platform)
+// Public API - Time source (must be provided by platform)
 // -----------------------------------------------------------------------------
 
 auto wki_now_us() -> uint64_t;
@@ -402,7 +499,48 @@ auto wki_crc32(const void* data, size_t len) -> uint32_t;
 auto wki_crc32_continue(uint32_t crc, const void* data, size_t len) -> uint32_t;
 
 // -----------------------------------------------------------------------------
-// Internal — RX message handlers (implemented in peer.cpp, channel.cpp, etc.)
+// V2: Hostname Lookup API [V2 A1.7]
+// -----------------------------------------------------------------------------
+
+// Resolve hostname to node_id. Returns WKI_NODE_INVALID on failure.
+auto wki_peer_find_by_hostname(const char* hostname) -> uint16_t;
+
+// Get hostname for a node_id. Returns nullptr if unknown.
+auto wki_peer_get_hostname(uint16_t node_id) -> const char*;
+
+// -----------------------------------------------------------------------------
+// V2: Async Wait Queue API [V2 A8]
+// -----------------------------------------------------------------------------
+
+// Forward declaration for Task -  avoiding circular header inclusion
+struct WkiWaitEntry {
+    ker::mod::sched::task::Task* task = nullptr;  // The task that is waiting
+    std::atomic<bool> completed{false};           // Set to true by wki_wake_op()
+    int result = 0;                               // Operation result code
+    uint64_t deadline_us = 0;                     // Timeout deadline (0 = no timeout)
+    WkiWaitEntry* next = nullptr;                 // Intrusive linked list
+    WkiWaitEntry* prev = nullptr;
+};
+
+// Default operation timeout: 15 seconds (allows for CPU-loaded VFS servers)
+constexpr uint64_t WKI_OP_TIMEOUT_US = 15'000'000;
+
+// Put the calling task to sleep until woken or timeout.
+// Returns: 0 on success, WKI_ERR_TIMEOUT on timeout, WKI_ERR_PEER_FENCED on fencing.
+// Caller allocates WkiWaitEntry on kernel stack (no heap allocation needed).
+auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int;
+
+// Wake a waiting task. Called from RX handler context.
+void wki_wake_op(WkiWaitEntry* entry, int result);
+
+// Scan pending waits for timeouts. Called from timer thread.
+void wki_wait_timeout_scan(uint64_t now_us);
+
+// Unlink all pending wait entries belonging to task. Called on task exit.
+void wki_wait_cleanup_for_task(ker::mod::sched::task::Task* task);
+
+// -----------------------------------------------------------------------------
+// Internal - RX message handlers (implemented in peer.cpp, channel.cpp, etc.)
 // -----------------------------------------------------------------------------
 
 namespace detail {

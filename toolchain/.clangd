@@ -1,4 +1,0 @@
-Diagnostics:
-    ClangTidy:
-        Remove:
-            - bugprone-reserved-identifier

@@ -13,11 +13,15 @@ namespace ker::dev {
 
 // Character device operations
 struct CharDeviceOps {
-    int (*open)(ker::vfs::File* file);
-    int (*close)(ker::vfs::File* file);
-    ssize_t (*read)(ker::vfs::File* file, void* buf, size_t count);
-    ssize_t (*write)(ker::vfs::File* file, const void* buf, size_t count);
-    bool (*isatty)(ker::vfs::File* file);
+    int (*open)(ker::vfs::File* file) = nullptr;
+    int (*close)(ker::vfs::File* file) = nullptr;
+    ssize_t (*read)(ker::vfs::File* file, void* buf, size_t count) = nullptr;
+    ssize_t (*write)(ker::vfs::File* file, const void* buf, size_t count) = nullptr;
+    bool (*isatty)(ker::vfs::File* file) = nullptr;
+    int (*ioctl)(ker::vfs::File* file, unsigned long cmd, unsigned long arg) = nullptr;  // nullptr = not supported
+    int (*poll_check)(ker::vfs::File* file, int events) = nullptr;                       // nullptr = always ready
+    bool (*poll_register_waiter)(ker::vfs::File* file, uint64_t pid) = nullptr;          // nullptr = no explicit wake registration
+    off_t (*lseek)(ker::vfs::File* file, off_t offset, int whence) = nullptr;            // nullptr = not seekable
 };
 
 enum class DeviceType : uint8_t {
@@ -26,23 +30,23 @@ enum class DeviceType : uint8_t {
 };
 
 struct Device {
-    unsigned major;
-    unsigned minor;
-    const char* name;
-    DeviceType type;
-    void* private_data;
-    CharDeviceOps* char_ops;  // For character devices
+    unsigned major = 0;
+    unsigned minor = 0;
+    const char* name = nullptr;
+    DeviceType type = DeviceType::CHAR;
+    void* private_data = nullptr;
+    CharDeviceOps* char_ops = nullptr;  // For character devices
 };
 
 // Device registration and management
-int dev_register(Device* device);
-int dev_unregister(Device* device);
-Device* dev_find(unsigned major, unsigned minor);
-Device* dev_find_by_name(const char* name);
-Device* dev_get_at_index(size_t index);
-size_t dev_get_count();
+auto dev_register(Device* device) -> int;
+auto dev_unregister(Device* device) -> int;
+auto dev_find(unsigned major, unsigned minor) -> Device*;
+auto dev_find_by_name(const char* name) -> Device*;
+auto dev_get_at_index(size_t index) -> Device*;
+auto dev_get_count() -> size_t;
 
 // Initialize device subsystem
-void dev_init();
+auto dev_init() -> void;
 
 }  // namespace ker::dev

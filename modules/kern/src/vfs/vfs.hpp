@@ -2,7 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <mod/io/serial/serial.hpp>
+#include <platform/dbg/dbg.hpp>
 #include <string_view>
 #include <vfs/stat.hpp>
 
@@ -19,7 +19,7 @@ namespace ker::vfs {
 // Helper inline functions for logging (optimizes away when VFS_DEBUG is not defined)
 inline void vfs_debug_log(const char* msg) {
 #ifdef VFS_DEBUG
-    ker::mod::io::serial::write(msg);
+    ker::mod::dbg::logger<"vfs">::debug("%s", msg);
 #else
     (void)msg;
 #endif
@@ -27,20 +27,20 @@ inline void vfs_debug_log(const char* msg) {
 
 inline void vfs_debug_log_hex(uint64_t value) {
 #ifdef VFS_DEBUG
-    ker::mod::io::serial::writeHex(value);
+    ker::mod::dbg::logger<"vfs">::debug("0x%llx", static_cast<unsigned long long>(value));
 #else
     (void)value;
 #endif
 }
 
-enum class vfs_node_type : uint8_t { file, directory, device, socket, symlink };
+enum class vfs_node_type : uint8_t { FILE, DIRECTORY, DEVICE, SOCKET, SYMLINK };
 
 struct File;
 
 struct VNode {
-    const char* name;
-    vfs_node_type type;
-    void* private_data;
+    const char* name{};
+    vfs_node_type type{};
+    void* private_data{};
 };
 
 // Open a path and return a file descriptor-like opaque pointer
@@ -50,6 +50,9 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int;
 // Used by server-side subsystems (e.g. WKI remote VFS) that operate on files
 // outside of any userspace task context.
 auto vfs_open_file(const char* path, int flags, int mode) -> File*;
+// Open an already resolved absolute backing path without consulting the current
+// task's root or WKI routing policy.
+auto vfs_open_file_resolved(const char* path, int flags, int mode) -> File*;
 auto vfs_close(int fd) -> int;
 auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
 auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
@@ -61,10 +64,16 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t;
 // Symlink operations
 auto vfs_symlink(const char* target, const char* linkpath) -> int;
 auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t;
+auto vfs_readlink_resolved(const char* path, char* buf, size_t bufsize) -> ssize_t;
 
 // Stat operations
-auto vfs_stat(const char* path, stat* statbuf) -> int;
-auto vfs_fstat(int fd, stat* statbuf) -> int;
+auto vfs_stat(const char* path, Stat* statbuf) -> int;
+auto vfs_stat_resolved(const char* path, Stat* statbuf) -> int;
+auto vfs_fstat(int fd, Stat* statbuf) -> int;
+
+// Filesystem statistics
+auto vfs_statvfs(const char* path, Statvfs* buf) -> int;
+auto vfs_fstatvfs(int fd, Statvfs* buf) -> int;
 
 // Directory operations
 auto vfs_mkdir(const char* path, int mode) -> int;
@@ -72,6 +81,7 @@ auto vfs_mkdir(const char* path, int mode) -> int;
 // Mount operations (called from userspace via syscall)
 auto vfs_mount(const char* source, const char* target, const char* fstype) -> int;
 auto vfs_umount(const char* target) -> int;
+auto vfs_pivot_root(const char* new_root, const char* put_old) -> int;
 
 // FD duplication
 auto vfs_dup(int oldfd) -> int;
@@ -108,14 +118,53 @@ auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int;
 auto vfs_ftruncate(int fd, off_t length) -> int;
 
 // Pipe
-auto vfs_pipe(int pipefd[2]) -> int;
+auto vfs_pipe(int pipefd[2]) -> int;  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+
+struct LocalPipePerfSnapshot {
+    uint64_t active_pipes{};
+    uint64_t created_since_reset{};
+    uint64_t peak_pipes{};
+    uint64_t capacity_bytes{};
+    uint64_t peak_capacity_bytes{};
+    uint64_t buffered_bytes{};
+    uint64_t reader_waiters{};
+    uint64_t writer_waiters{};
+    uint64_t poll_waiters{};
+    uint64_t direct_writes{};
+    uint64_t read_closed{};
+    uint64_t write_closed{};
+    uint64_t approx_alloc_bytes{};
+};
+
+void vfs_get_local_pipe_perf_snapshot(LocalPipePerfSnapshot& out);
+void vfs_reset_local_pipe_perf_counters();
+
+// Sync
+auto vfs_fsync(int fd) -> int;
+
+// Hard link
+auto vfs_link(const char* oldpath, const char* newpath) -> int;
+
+// WKI task-local VFS policy
+auto vfs_wki_rule_add(const char* prefix, uint32_t route) -> int;
+auto vfs_wki_rule_get(uint32_t index, char* prefix_buf, size_t prefix_buf_size, uint32_t* route_out) -> int;
+auto vfs_wki_default_rule_get(uint32_t index, char* prefix_buf, size_t prefix_buf_size, uint32_t* route_out) -> int;
+auto vfs_wki_rule_clear() -> int;
+void vfs_wki_load_default_rules();
 
 // File control
 auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int;
 
+// IPC file identity helpers (used by WKI remote IPC proxy)
+auto vfs_is_pipe_file(const File* f) -> bool;
+auto vfs_is_epoll_file(const File* f) -> bool;
+auto vfs_is_socket_file(const File* f) -> bool;
+
 // FD helpers used by Task
 auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int;
 auto vfs_get_file(ker::mod::sched::task::Task* task, int fd) -> struct File*;
+auto vfs_get_file_retain(ker::mod::sched::task::Task* task, int fd) -> struct File*;
+void vfs_put_file(struct File* f);
 auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int;
 
 // Resolve a dirfd-relative pathname to an absolute path.
@@ -126,5 +175,8 @@ auto vfs_resolve_dirfd(ker::mod::sched::task::Task* task, int dirfd, const char*
 
 // Initialize VFS (register tmpfs, devfs, etc.)
 void init();
+
+// Stream-cache teardown helper for REMOTE mounts.
+void vfs_stream_cache_invalidate_remote_scope(const void* remote_scope);
 
 }  // namespace ker::vfs

@@ -23,33 +23,33 @@ class CoredumpMemoryPanel : public QDockWidget {
     explicit CoredumpMemoryPanel(QWidget* parent = nullptr);
 
     // Set the current coredump context (must be called before dump requests)
-    void setCoreDump(const wosdbg::CoreDump* dump, const std::vector<wosdbg::SymbolTable*>& symTables = {},
-                     const std::vector<wosdbg::SectionMap*>& sectionMaps = {});
+    void set_core_dump(const wosdbg::CoreDump* dump, const std::vector<wosdbg::SymbolTable*>& sym_tables = {},
+                       const std::vector<wosdbg::SectionMap*>& section_maps = {});
 
     // Dump a virtual address range
-    void dumpRange(uint64_t vaStart, uint64_t vaEnd);
+    void dump_range(uint64_t vaStart, uint64_t vaEnd);
 
     // Auto-dump the stack around trap RSP
-    void dumpStackAroundRsp();
+    void dump_stack_around_rsp();
 
     void clear();
 
    signals:
-    void addressClicked(uint64_t addr);
+    void address_clicked(uint64_t addr);
 
    private slots:
-    void onDumpButtonClicked();
+    void on_dump_button_clicked();
 
    private:
-    void setupUI();
+    void setup_ui();
 
-    QLineEdit* fromEdit_;
-    QLineEdit* toEdit_;
-    QPushButton* dumpButton_;
-    QTableWidget* qwordTable_;  // Annotated qword view
-    QTextEdit* hexView_;        // Raw hex dump
+    QLineEdit* from_edit;
+    QLineEdit* to_edit;
+    QPushButton* dump_button;
+    QTableWidget* qword_table;  // Annotated qword view
+    QTextEdit* hex_view;        // Raw hex dump
 
-    const wosdbg::CoreDump* currentDump_ = nullptr;
-    std::vector<wosdbg::SymbolTable*> symTables_;
-    std::vector<wosdbg::SectionMap*> sectionMaps_;
+    const wosdbg::CoreDump* current_dump = nullptr;
+    std::vector<wosdbg::SymbolTable*> sym_tables;
+    std::vector<wosdbg::SectionMap*> section_maps;
 };

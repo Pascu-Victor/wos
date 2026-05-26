@@ -1,5 +1,11 @@
 #include "config.h"
 
+#include <qcborvalue.h>
+#include <qjsonparseerror.h>
+#include <qlogging.h>
+#include <qnamespace.h>
+#include <qtypes.h>
+
 #include <QDebug>
 #include <QDir>
 #include <QFile>
@@ -8,58 +14,63 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <stdexcept>
 
-Config::Config() { loadDefaults(); }
+Config::Config() { load_defaults(); }
 
-bool Config::loadFromFile(const QString& filePath) {
-    QFile file(filePath);
+bool Config::load_from_file(const QString& file_path) {
+    QFile file(file_path);
 
     // Store the base directory for relative path resolution
-    configBaseDir = QFileInfo(filePath).absolutePath();
+    config_base_dir = QFileInfo(file_path).absolutePath();
 
     if (!file.exists()) {
-        qDebug() << "Config file" << filePath << "does not exist, using defaults";
-        loadDefaults();
+        qDebug() << "Config file" << file_path << "does not exist, using defaults";
+        load_defaults();
         return false;
     }
 
     if (!file.open(QIODevice::ReadOnly)) {
-        qWarning() << "Could not open config file" << filePath << "for reading";
-        loadDefaults();
+        qWarning() << "Could not open config file" << file_path << "for reading";
+        load_defaults();
         return false;
     }
 
     QByteArray data = file.readAll();
-    QJsonParseError parseError;
-    QJsonDocument doc = QJsonDocument::fromJson(data, &parseError);
+    QJsonParseError parse_error;
+    QJsonDocument doc = QJsonDocument::fromJson(data, &parse_error);
 
-    if (parseError.error != QJsonParseError::NoError) {
-        qWarning() << "JSON parse error in config file:" << parseError.errorString();
-        loadDefaults();
+    if (parse_error.error != QJsonParseError::NoError) {
+        qWarning() << "JSON parse error in config file:" << parse_error.errorString();
+        load_defaults();
         return false;
     }
 
     if (!doc.isObject()) {
         qWarning() << "Config file root must be a JSON object";
-        loadDefaults();
+        load_defaults();
         return false;
     }
 
     QJsonObject root = doc.object();
 
     // Clear existing lookups
-    addressLookups.clear();
+    address_lookups.clear();
 
     // Parse address lookups
     if (root.contains("lookups") && root["lookups"].isArray()) {
-        QJsonArray lookupsArray = root["lookups"].toArray();
+        QJsonArray lookups_array = root["lookups"].toArray();
 
-        for (const QJsonValue& value : lookupsArray) {
+        for (const auto& value : lookups_array) {
             if (value.isObject()) {
                 try {
-                    AddressLookup lookup = parseAddressLookup(value.toObject());
-                    if (lookup.fromAddress <= lookup.toAddress && !lookup.symbolFilePath.isEmpty()) {
-                        addressLookups.push_back(lookup);
+                    AddressLookup lookup = parse_address_lookup(value.toObject());
+                    if (lookup.from_address <= lookup.to_address && !lookup.symbol_file_path.isEmpty()) {
+                        address_lookups.push_back(lookup);
                     } else {
                         qWarning() << "Invalid address lookup entry - skipping";
                     }
@@ -70,143 +81,158 @@ bool Config::loadFromFile(const QString& filePath) {
         }
     }
 
-    qDebug() << "Loaded" << addressLookups.size() << "address lookups from config file";
+    qDebug() << "Loaded" << address_lookups.size() << "address lookups from config file";
 
     // Parse coredump directory
     if (root.contains("coredumpDirectory") && root["coredumpDirectory"].isString()) {
-        coredumpDirectory = root["coredumpDirectory"].toString();
+        coredump_directory = root["coredumpDirectory"].toString();
     }
 
     // Parse binary mappings
-    binaryMappings.clear();
+    binary_mappings.clear();
     if (root.contains("binaries") && root["binaries"].isArray()) {
-        QJsonArray binariesArray = root["binaries"].toArray();
-        for (const QJsonValue& value : binariesArray) {
+        QJsonArray binaries_array = root["binaries"].toArray();
+        for (const auto& value : binaries_array) {
             if (value.isObject()) {
                 QJsonObject obj = value.toObject();
                 if (obj.contains("name") && obj.contains("path")) {
-                    binaryMappings.emplace_back(obj["name"].toString(), obj["path"].toString());
+                    binary_mappings.emplace_back(obj["name"].toString(), obj["path"].toString());
                 }
             }
         }
     }
-    qDebug() << "Loaded" << binaryMappings.size() << "binary mappings,"
-             << "coredump directory:" << coredumpDirectory;
+    qDebug() << "Loaded" << binary_mappings.size() << "binary mappings,"
+             << "coredump directory:" << coredump_directory;
+
+    if (root.contains("mcp") && root["mcp"].isObject()) {
+        mcp_settings = parse_mcp_settings(root["mcp"].toObject());
+    } else {
+        mcp_settings = McpSettings{};
+    }
 
     return true;
 }
 
-bool Config::saveToFile(const QString& filePath) const {
+bool Config::save_to_file(const QString& file_path) const {
     QJsonObject root;
-    QJsonArray lookupsArray;
+    QJsonArray lookups_array;
 
     // Serialize address lookups
-    for (const auto& lookup : addressLookups) {
-        lookupsArray.append(serializeAddressLookup(lookup));
+    for (const auto& lookup : address_lookups) {
+        lookups_array.append(serialize_address_lookup(lookup));
     }
 
-    root["lookups"] = lookupsArray;
+    root["lookups"] = lookups_array;
 
     // Serialize coredump directory
-    root["coredumpDirectory"] = coredumpDirectory;
+    root["coredumpDirectory"] = coredump_directory;
 
     // Serialize binary mappings
-    QJsonArray binariesArray;
-    for (const auto& mapping : binaryMappings) {
+    QJsonArray binaries_array;
+    for (const auto& mapping : binary_mappings) {
         QJsonObject obj;
         obj["name"] = mapping.name;
-        obj["path"] = mapping.elfPath;
-        binariesArray.append(obj);
+        obj["path"] = mapping.elf_path;
+        binaries_array.append(obj);
     }
-    root["binaries"] = binariesArray;
+    root["binaries"] = binaries_array;
+
+    root["mcp"] = serialize_mcp_settings(mcp_settings);
 
     QJsonDocument doc(root);
 
-    QFile file(filePath);
+    QFile file(file_path);
     if (!file.open(QIODevice::WriteOnly)) {
-        qWarning() << "Could not open config file" << filePath << "for writing";
+        qWarning() << "Could not open config file" << file_path << "for writing";
         return false;
     }
 
     file.write(doc.toJson());
-    qDebug() << "Saved configuration to" << filePath;
+    qDebug() << "Saved configuration to" << file_path;
     return true;
 }
 
-QString Config::findSymbolFileForAddress(uint64_t address) const {
-    for (const auto& lookup : addressLookups) {
-        if (lookup.containsAddress(address)) {
-            return resolvePath(lookup.symbolFilePath);
+QString Config::find_symbol_file_for_address(uint64_t address) const {
+    for (const auto& lookup : address_lookups) {
+        if (lookup.contains_address(address)) {
+            return resolve_path(lookup.symbol_file_path);
         }
     }
-    return QString();  // No matching lookup found
+    return {};  // No matching lookup found
 }
 
-void Config::addAddressLookup(const AddressLookup& lookup) { addressLookups.push_back(lookup); }
+void Config::add_address_lookup(const AddressLookup& lookup) { address_lookups.push_back(lookup); }
 
-void Config::removeAddressLookup(size_t index) {
-    if (index < addressLookups.size()) {
-        addressLookups.erase(addressLookups.begin() + index);
+void Config::remove_address_lookup(size_t index) {
+    if (index < address_lookups.size()) {
+        address_lookups.erase(address_lookups.begin() + static_cast<std::ptrdiff_t>(index));
     }
 }
 
-void Config::clearAddressLookups() { addressLookups.clear(); }
+void Config::clear_address_lookups() { address_lookups.clear(); }
 
-void Config::addBinaryMapping(const BinaryMapping& mapping) { binaryMappings.push_back(mapping); }
+void Config::add_binary_mapping(const BinaryMapping& mapping) { binary_mappings.push_back(mapping); }
 
-void Config::clearBinaryMappings() { binaryMappings.clear(); }
+void Config::clear_binary_mappings() { binary_mappings.clear(); }
 
-QString Config::findElfPathForBinary(const QString& binaryName) const {
-    for (const auto& mapping : binaryMappings) {
-        if (mapping.name == binaryName) {
-            return resolvePath(mapping.elfPath);
+QString Config::find_elf_path_for_binary(const QString& binary_name) const {
+    for (const auto& mapping : binary_mappings) {
+        if (mapping.name == binary_name) {
+            return resolve_path(mapping.elf_path);
         }
     }
-    return QString();
+    return {};
 }
 
-QString Config::resolvePath(const QString& path) const {
-    if (path.isEmpty()) return path;
+QString Config::resolve_path(const QString& path) const {
+    if (path.isEmpty()) {
+        return path;
+    }
     QFileInfo fi(path);
-    if (fi.isAbsolute()) return path;
-    if (configBaseDir.isEmpty()) return path;
-    return QDir(configBaseDir).absoluteFilePath(path);
+    if (fi.isAbsolute()) {
+        return path;
+    }
+    if (config_base_dir.isEmpty()) {
+        return path;
+    }
+    return QDir(config_base_dir).absoluteFilePath(path);
 }
 
-void Config::loadDefaults() {
-    addressLookups.clear();
+void Config::load_defaults() {
+    address_lookups.clear();
+    mcp_settings = McpSettings{};
 
     // Add some common default lookups that might be useful
     // These are examples and can be customized based on typical use cases
 
     // Example: User space applications (typical range)
-    // addressLookups.emplace_back(0x400000, 0x800000, "./build/modules/init/init");
+    // address_lookups.emplace_back(0x400000, 0x800000, "./build/modules/init/init");
 
     // Example: Kernel space (x86_64 typical kernel range)
-    addressLookups.emplace_back(0xffffffff80000000ULL, 0xffffffffffffffffULL, "./build/modules/kern/wos");
+    address_lookups.emplace_back(0xffffffff80000000ULL, 0xffffffffffffffffULL, "./build/modules/kern/wos");
 
     // Example: Shared libraries (typical range)
-    addressLookups.emplace_back(0x7f0000000000ULL, 0x7fffffffULL, "./build/lib/libc.so");
+    address_lookups.emplace_back(0x7f0000000000ULL, 0x7fffffffULL, "./build/lib/libc.so");
 
-    qDebug() << "Loaded default configuration with" << addressLookups.size() << "address lookups";
+    qDebug() << "Loaded default configuration with" << address_lookups.size() << "address lookups";
 }
 
-bool Config::isValid() const {
+bool Config::is_valid() const {
     // Check for overlapping ranges
-    for (size_t i = 0; i < addressLookups.size(); ++i) {
-        const auto& lookup1 = addressLookups[i];
+    for (size_t i = 0; i < address_lookups.size(); ++i) {
+        const auto& lookup1 = address_lookups[i];
 
         // Check if range is valid
-        if (lookup1.fromAddress > lookup1.toAddress) {
+        if (lookup1.from_address > lookup1.to_address) {
             return false;
         }
 
         // Check for overlaps with other ranges
-        for (size_t j = i + 1; j < addressLookups.size(); ++j) {
-            const auto& lookup2 = addressLookups[j];
+        for (size_t j = i + 1; j < address_lookups.size(); ++j) {
+            const auto& lookup2 = address_lookups[j];
 
             // Check if ranges overlap
-            if (!(lookup1.toAddress < lookup2.fromAddress || lookup2.toAddress < lookup1.fromAddress)) {
+            if (lookup1.to_address >= lookup2.from_address && lookup2.to_address >= lookup1.from_address) {
                 qWarning() << "Overlapping address ranges detected in configuration";
                 return false;
             }
@@ -216,8 +242,8 @@ bool Config::isValid() const {
     return true;
 }
 
-uint64_t Config::parseAddress(const QString& addressStr) const {
-    QString trimmed = addressStr.trimmed();
+uint64_t Config::parse_address(const QString& address_str) {
+    QString trimmed = address_str.trimmed();
     bool ok = false;
     uint64_t address = 0;
 
@@ -228,48 +254,105 @@ uint64_t Config::parseAddress(const QString& addressStr) const {
     }
 
     if (!ok) {
-        throw std::runtime_error(QString("Invalid address format: %1").arg(addressStr).toStdString());
+        throw std::runtime_error(QString("Invalid address format: %1").arg(address_str).toStdString());
     }
 
     return address;
 }
 
-QString Config::formatAddress(uint64_t address) const { return QString("0x%1").arg(address, 0, 16); }
+auto Config::format_address(uint64_t address) -> QString { return QString("0x%1").arg(address, 0, 16); }
 
-AddressLookup Config::parseAddressLookup(const QJsonObject& obj) const {
+auto Config::parse_address_lookup(const QJsonObject& obj) -> AddressLookup {
     AddressLookup lookup;
 
     if (!obj.contains("from") || !obj.contains("to") || !obj.contains("path")) {
         throw std::runtime_error("Address lookup must contain 'from', 'to', and 'path' fields");
     }
 
-    lookup.fromAddress = parseAddress(obj["from"].toString());
-    lookup.toAddress = parseAddress(obj["to"].toString());
-    lookup.symbolFilePath = obj["path"].toString();
+    lookup.from_address = parse_address(obj["from"].toString());
+    lookup.to_address = parse_address(obj["to"].toString());
+    lookup.symbol_file_path = obj["path"].toString();
 
     // Load offset is optional - defaults to 0 (no offset, addresses match file)
     if (obj.contains("offset")) {
-        lookup.loadOffset = parseAddress(obj["offset"].toString());
+        lookup.load_offset = parse_address(obj["offset"].toString());
     } else {
-        lookup.loadOffset = 0;
+        lookup.load_offset = 0;
     }
 
     // Validate the path is not empty
-    if (lookup.symbolFilePath.isEmpty()) {
+    if (lookup.symbol_file_path.isEmpty()) {
         throw std::runtime_error("Symbol file path cannot be empty");
     }
 
     return lookup;
 }
 
-QJsonObject Config::serializeAddressLookup(const AddressLookup& lookup) const {
+auto Config::serialize_address_lookup(const AddressLookup& lookup) -> QJsonObject {
     QJsonObject obj;
-    obj["from"] = formatAddress(lookup.fromAddress);
-    obj["to"] = formatAddress(lookup.toAddress);
-    obj["path"] = lookup.symbolFilePath;
-    if (lookup.loadOffset != 0) {
-        obj["offset"] = formatAddress(lookup.loadOffset);
+    obj["from"] = format_address(lookup.from_address);
+    obj["to"] = format_address(lookup.to_address);
+    obj["path"] = lookup.symbol_file_path;
+    if (lookup.load_offset != 0) {
+        obj["offset"] = format_address(lookup.load_offset);
     }
+    return obj;
+}
+
+McpSettings Config::parse_mcp_settings(const QJsonObject& obj) const {
+    McpSettings settings;
+    if (obj.contains("bindAddress")) {
+        settings.bind_address = obj["bindAddress"].toString(settings.bind_address);
+    }
+    if (obj.contains("port")) {
+        settings.port = static_cast<quint16>(std::clamp(obj["port"].toInt(settings.port), 1, 65535));
+    }
+    if (obj.contains("allowedCidrs") && obj["allowedCidrs"].isArray()) {
+        settings.allowed_cidrs.clear();
+        for (const auto& value : obj["allowedCidrs"].toArray()) {
+            if (value.isString()) {
+                settings.allowed_cidrs << value.toString();
+            }
+        }
+    }
+    if (obj.contains("allowedRoots") && obj["allowedRoots"].isArray()) {
+        settings.allowed_roots.clear();
+        for (const auto& value : obj["allowedRoots"].toArray()) {
+            if (value.isString()) {
+                settings.allowed_roots << resolve_path(value.toString());
+            }
+        }
+    }
+    settings.max_entries = std::clamp(obj["maxEntries"].toInt(settings.max_entries), 1, 5000);
+    settings.max_memory_bytes = std::clamp(obj["maxMemoryBytes"].toInt(settings.max_memory_bytes), 256, 1024 * 1024);
+    settings.max_hits = std::clamp(obj["maxHits"].toInt(settings.max_hits), 1, 10000);
+    settings.max_string_length = std::clamp(obj["maxStringLength"].toInt(settings.max_string_length), 16, 4096);
+    settings.source_window_lines = std::clamp(obj["sourceWindowLines"].toInt(settings.source_window_lines), 0, 200);
+    settings.max_disassembly_instructions =
+        std::clamp(obj["maxDisassemblyInstructions"].toInt(settings.max_disassembly_instructions), 1, 512);
+    return settings;
+}
+
+QJsonObject Config::serialize_mcp_settings(const McpSettings& settings) {
+    QJsonObject obj;
+    obj["bindAddress"] = settings.bind_address;
+    obj["port"] = static_cast<int>(settings.port);
+    QJsonArray allowed_cidrs;
+    for (const auto& cidr : settings.allowed_cidrs) {
+        allowed_cidrs.append(cidr);
+    }
+    obj["allowedCidrs"] = allowed_cidrs;
+    QJsonArray allowed_roots;
+    for (const auto& root : settings.allowed_roots) {
+        allowed_roots.append(root);
+    }
+    obj["allowedRoots"] = allowed_roots;
+    obj["maxEntries"] = settings.max_entries;
+    obj["maxMemoryBytes"] = settings.max_memory_bytes;
+    obj["maxHits"] = settings.max_hits;
+    obj["maxStringLength"] = settings.max_string_length;
+    obj["sourceWindowLines"] = settings.source_window_lines;
+    obj["maxDisassemblyInstructions"] = settings.max_disassembly_instructions;
     return obj;
 }
 
@@ -279,13 +362,13 @@ ConfigService& ConfigService::instance() {
     return instance;
 }
 
-void ConfigService::initialize(const QString& configPath) {
-    configFilePath = configPath;
-    config.loadFromFile(configFilePath);
+void ConfigService::initialize(const QString& config_path) {
+    config_file_path = config_path;
+    config.load_from_file(config_file_path);
 }
 
-bool ConfigService::reload() { return config.loadFromFile(configFilePath); }
+bool ConfigService::reload() { return config.load_from_file(config_file_path); }
 
-bool ConfigService::save() { return config.saveToFile(configFilePath); }
+bool ConfigService::save() { return config.save_to_file(config_file_path); }
 
-bool ConfigService::configFileExists() const { return QFile::exists(configFilePath); }
+bool ConfigService::config_file_exists() const { return QFile::exists(config_file_path); }

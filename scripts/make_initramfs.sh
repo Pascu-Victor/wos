@@ -1,5 +1,6 @@
 #!/bin/bash
-# Build CPIO newc initramfs archive containing /sbin/init and /etc/fstab.
+# Build CPIO newc initramfs archive containing only /sbin/init and boot config.
+# Everything else lives on the rootfs (mountfs.qcow2).
 # PARTUUIDs are auto-extracted from disk images defined in configs/disks.conf.
 set -e
 
@@ -21,31 +22,22 @@ trap 'rm -rf "$INITRAMFS_DIR"' EXIT
 mkdir -p "$INITRAMFS_DIR/sbin"
 mkdir -p "$INITRAMFS_DIR/etc"
 
-# Copy init binary
+# Copy init binary (statically linked — the only binary in initramfs)
 cp "$INIT_BINARY" "$INITRAMFS_DIR/sbin/init"
 echo "  initramfs: added /sbin/init ($(du -h "$INIT_BINARY" | cut -f1))"
 
-# Copy netd binary (DHCP network daemon)
-NETD_BINARY="build/modules/netd/netd"
-if [ -f "$NETD_BINARY" ]; then
-    cp "$NETD_BINARY" "$INITRAMFS_DIR/sbin/netd"
-    echo "  initramfs: added /sbin/netd ($(du -h "$NETD_BINARY" | cut -f1))"
+# Generate /etc/hostname from system configuration
+if [ -f "configs/system.conf" ]; then
+    source "configs/system.conf"
+    echo -n "${WOS_HOSTNAME:-wos}" > "$INITRAMFS_DIR/etc/hostname"
+    echo "  initramfs: added /etc/hostname (${WOS_HOSTNAME:-wos})"
 else
-    echo "WARNING: netd binary not found at $NETD_BINARY, skipping"
-fi
-
-# Copy httpd binary (HTTP server)
-HTTPD_BINARY="build/modules/httpd/httpd"
-if [ -f "$HTTPD_BINARY" ]; then
-    cp "$HTTPD_BINARY" "$INITRAMFS_DIR/sbin/httpd"
-    echo "  initramfs: added /sbin/httpd ($(du -h "$HTTPD_BINARY" | cut -f1))"
-else
-    echo "WARNING: httpd binary not found at $HTTPD_BINARY, skipping"
+    echo -n "wos" > "$INITRAMFS_DIR/etc/hostname"
+    echo "  initramfs: added /etc/hostname (wos) [default, no system.conf]"
 fi
 
 # Generate /etc/fstab from disk configuration
 if [ -f "configs/disks.conf" ]; then
-    # shellcheck source=configs/disks.conf
     source "configs/disks.conf"
     echo "  initramfs: generating /etc/fstab from configs/disks.conf"
     generate_fstab "$INITRAMFS_DIR/etc/fstab"
@@ -56,30 +48,27 @@ else
     echo "# /etc/fstab - empty (no disks.conf found)" > "$INITRAMFS_DIR/etc/fstab"
 fi
 
-# Create /etc/filesystems for busybox mount auto-detection
-cat > "$INITRAMFS_DIR/etc/filesystems" <<'EOF'
-fat32
-vfat
-tmpfs
-EOF
-echo "  initramfs: added /etc/filesystems"
-
-# Copy busybox binary and create applet symlinks
-BUSYBOX_BINARY="toolchain/target1/bin/busybox"
-if [ -f "$BUSYBOX_BINARY" ]; then
-    mkdir -p "$INITRAMFS_DIR/bin"
-    cp "$BUSYBOX_BINARY" "$INITRAMFS_DIR/bin/busybox"
-    chmod +x "$INITRAMFS_DIR/bin/busybox"
-    echo "  initramfs: added /bin/busybox ($(du -h "$BUSYBOX_BINARY" | cut -f1))"
-
-    # Create symlinks for enabled applets
-    BUSYBOX_APPLETS="mount umount ls cat echo mkdir cp mv rm grep find ps df ifconfig sh"
-    for applet in $BUSYBOX_APPLETS; do
-        ln -sf busybox "$INITRAMFS_DIR/bin/$applet"
-        echo "  initramfs: symlinked /bin/$applet -> busybox"
-    done
+if [ -f "configs/netdevs.conf" ]; then
+    cp "configs/netdevs.conf" "$INITRAMFS_DIR/etc/netdevs"
+    echo "  initramfs: added /etc/netdevs from configs/netdevs.conf"
 else
-    echo "WARNING: busybox binary not found at $BUSYBOX_BINARY, skipping"
+    echo "WARNING: configs/netdevs.conf not found, network device assignment will use hardcoded defaults"
+fi
+
+if [ -f "configs/vfstab" ]; then
+    cp "configs/vfstab" "$INITRAMFS_DIR/etc/vfstab"
+    echo "  initramfs: added /etc/vfstab from configs/vfstab"
+else
+    cat > "$INITRAMFS_DIR/etc/vfstab" <<'EOF'
+# prefix route
+/wki local
+/proc local
+/dev local
+/tmp local
+/run local
+/ host
+EOF
+    echo "  initramfs: added default /etc/vfstab"
 fi
 
 # Create CPIO newc archive
