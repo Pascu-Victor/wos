@@ -785,6 +785,22 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
 
 }  // anonymous namespace
 
+auto file_mmap_cache_stats() -> FileMmapCacheStats {
+    FileMmapCacheStats stats{};
+    stats.capacity_pages = FILE_MMAP_CACHE_PAGES;
+
+    g_file_mmap_cache_lock.lock();
+    for (const auto& entry : g_file_mmap_cache) {
+        if (entry.page != nullptr) {
+            stats.pages++;
+        }
+    }
+    g_file_mmap_cache_lock.unlock();
+
+    stats.bytes = stats.pages * ker::mod::mm::paging::PAGE_SIZE;
+    return stats;
+}
+
 // Main syscall handler
 auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -> uint64_t {
     switch (static_cast<ker::abi::vmem::ops>(op)) {

@@ -9,7 +9,6 @@ namespace ker::net {
 
 // Forward declaration
 struct NetDevice;
-
 constexpr size_t PKT_BUF_SIZE = 10240;  // supports jumbo frames (9000 MTU + headers)
 constexpr size_t PKT_HEADROOM = 128;    // room for VirtIO + Ethernet + headroom
 // Minimum pool size (used before NIC count is known)
@@ -26,9 +25,30 @@ struct PacketPoolSnapshot {
     size_t rx_reserve = 0;
     size_t grow_chunk = 0;
     size_t buffer_size = 0;
+    size_t object_size = 0;
     size_t headroom = 0;
+    size_t baseline_capacity = 0;
+    size_t active_capacity = 0;
+    size_t draining_buffers = 0;
+    size_t draining_free = 0;
     uint32_t tx_refused = 0;
     bool expand_in_progress = false;
+};
+
+struct PacketPoolReclaimStats {
+    size_t before_capacity = 0;
+    size_t after_capacity = 0;
+    size_t before_free = 0;
+    size_t after_free = 0;
+    size_t before_draining_buffers = 0;
+    size_t after_draining_buffers = 0;
+    size_t before_draining_free = 0;
+    size_t after_draining_free = 0;
+    size_t freed_chunks = 0;
+    size_t freed_buffers = 0;
+    size_t marked_draining_chunks = 0;
+    size_t marked_draining_buffers = 0;
+    size_t deactivated_free_buffers = 0;
 };
 
 struct PacketBuffer {
@@ -79,6 +99,7 @@ void pkt_pool_expand_for_nics();       // Call after NIC drivers have registered
 auto pkt_pool_size() -> size_t;        // Get current pool size
 auto pkt_pool_free_count() -> size_t;  // Approximate free buffers available
 auto pkt_pool_snapshot() -> PacketPoolSnapshot;
+auto pkt_pool_reclaim_free(size_t target_capacity) -> PacketPoolReclaimStats;
 void pkt_pool_ensure_free(size_t min_free);
 auto pkt_alloc() -> PacketBuffer*;
 auto pkt_alloc_tx() -> PacketBuffer*;  // TX-only: fails if pool is low (reserves for RX)

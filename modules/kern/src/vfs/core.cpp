@@ -1592,7 +1592,7 @@ auto dir_contains_name(ker::vfs::File* file, bool has_fs_readdir, size_t fs_coun
 
     DirEntry probe = {};
     size_t const NAME_LEN = std::strlen(name);
-    for (size_t index = 0; index < fs_count; ++index) {
+    for (size_t index = 0; index < fs_count;) {
         if (file->fops->vfs_readdir(file, &probe, index) != 0) {
             break;
         }
@@ -1601,6 +1601,11 @@ auto dir_contains_name(ker::vfs::File* file, bool has_fs_readdir, size_t fs_coun
         if (PROBE_LEN == NAME_LEN && std::memcmp(probe.d_name.data(), name, NAME_LEN) == 0) {
             return true;
         }
+        size_t next_index = index + 1;
+        if (probe.d_off > static_cast<uint64_t>(index) && probe.d_off <= static_cast<uint64_t>(~size_t{0})) {
+            next_index = static_cast<size_t>(probe.d_off);
+        }
+        index = next_index;
     }
 
     return false;
@@ -1696,7 +1701,7 @@ auto splice_symlink_target(const char* original_path, size_t prefix_len, const c
     return canonicalize_path(out, out_size);
 }
 
-auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_policy) -> int {
+auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_policy, bool follow_final_symlink) -> int {
     if (path == nullptr || bufsize == 0) {
         return -EINVAL;
     }
@@ -1711,6 +1716,9 @@ auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_pol
                 break;
             }
             continue;
+        }
+        if (!follow_final_symlink && CH == '\0') {
+            break;
         }
 
         std::array<char, MAX_PATH_LEN> prefix{};
@@ -2176,7 +2184,8 @@ auto canonicalize_path(char* path, size_t bufsize) -> int {
 
 // Resolve symlinks in a path. The resolved path is written to resolved_buf.
 // Returns 0 on success, -ELOOP on too many symlinks, or another negative errno.
-auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool apply_task_policy = false) -> int {
+auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool apply_task_policy = false,
+                      bool follow_final_symlink = true) -> int {
     if (path == nullptr || resolved_buf == nullptr || bufsize == 0) {
         return -EINVAL;
     }
@@ -2197,12 +2206,15 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
     }
 
     for (int depth = 0; depth < MAX_SYMLINK_DEPTH; ++depth) {
-        int const PREFIX_RESULT = resolve_prefix_symlink_once(resolved_buf, bufsize, apply_task_policy);
+        int const PREFIX_RESULT = resolve_prefix_symlink_once(resolved_buf, bufsize, apply_task_policy, follow_final_symlink);
         if (PREFIX_RESULT < 0) {
             return PREFIX_RESULT;
         }
         if (PREFIX_RESULT > 0) {
             continue;
+        }
+        if (!follow_final_symlink) {
+            return 0;
         }
 
         MountPoint const* mount = find_mount_point(resolved_buf);
@@ -3001,17 +3013,28 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
     size_t const MAX_ENTRIES = max_size / sizeof(DirEntry);
     size_t entries_read = 0;
 
-    // Read directory entries using the current position as index
-    auto const START_INDEX = static_cast<size_t>(f->pos);
+    // Read directory entries using the current position as an opaque-ish index.
+    // Filesystems that need sparse/stable cookies can return d_off greater
+    // than the requested index; older backends that leave d_off at the current
+    // index still advance by one.
+    auto next_index = static_cast<size_t>(f->pos);
+    auto advance_after_entry = [&](size_t actual_index) {
+        uint64_t const ENTRY_OFF = entries[entries_read].d_off;
+        next_index = actual_index + 1;
+        if (ENTRY_OFF > static_cast<uint64_t>(actual_index) && ENTRY_OFF <= static_cast<uint64_t>(~size_t{0})) {
+            next_index = static_cast<size_t>(ENTRY_OFF);
+        }
+        entries_read++;
+    };
 
     for (size_t i = 0; i < MAX_ENTRIES; ++i) {
-        size_t const ACTUAL_INDEX = START_INDEX + i;
+        size_t const ACTUAL_INDEX = next_index;
 
         // Phase 1: try filesystem readdir
         if (HAS_FS_READDIR && (std::cmp_equal(f->dir_fs_count, -1) || ACTUAL_INDEX < f->dir_fs_count)) {
             int const RET = f->fops->vfs_readdir(f, &entries[entries_read], ACTUAL_INDEX);
             if (RET == 0) {
-                entries_read++;
+                advance_after_entry(ACTUAL_INDEX);
                 continue;
             }
             // FS entries exhausted at this index
@@ -3049,7 +3072,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                     entries[entries_read].d_type = DT_DIR | DT_WOSLINK;
                     std::memcpy(entries[entries_read].d_name.data(), "wki", 4);
                     entries[entries_read].d_name[3] = '\0';
-                    entries_read++;
+                    advance_after_entry(ACTUAL_INDEX);
                     continue;
                 }
                 synthetic_index--;
@@ -3062,7 +3085,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                     entries[entries_read].d_reclen = sizeof(DirEntry);
                     entries[entries_read].d_type = DT_DIR | DT_WOSLINK;
                     std::memcpy(entries[entries_read].d_name.data(), "host", 5);
-                    entries_read++;
+                    advance_after_entry(ACTUAL_INDEX);
                     continue;
                 }
                 synthetic_index--;
@@ -3080,7 +3103,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                     }
                     std::memcpy(entries[entries_read].d_name.data(), local_hostname, copy_len);
                     entries[entries_read].d_name[copy_len] = '\0';
-                    entries_read++;
+                    advance_after_entry(ACTUAL_INDEX);
                     continue;
                 }
                 synthetic_index--;
@@ -3182,7 +3205,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                 if (HAS_FS_READDIR && FS_COUNT > 0) {
                     bool already_in_fs = false;
                     DirEntry probe = {};
-                    for (size_t pi = 0; pi < FS_COUNT; ++pi) {
+                    for (size_t pi = 0; pi < FS_COUNT;) {
                         int const PRET = f->fops->vfs_readdir(f, &probe, pi);
                         if (PRET != 0) {
                             break;
@@ -3192,6 +3215,11 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                             already_in_fs = true;
                             break;
                         }
+                        size_t next_pi = pi + 1;
+                        if (probe.d_off > static_cast<uint64_t>(pi) && probe.d_off <= static_cast<uint64_t>(~size_t{0})) {
+                            next_pi = static_cast<size_t>(probe.d_off);
+                        }
+                        pi = next_pi;
                     }
                     if (already_in_fs) {
                         continue;
@@ -3218,7 +3246,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                     std::memcpy(entries[entries_read].d_name.data(), child_start, COPY_LEN);
                     entries[entries_read].d_name[COPY_LEN] = '\0';
 
-                    entries_read++;
+                    advance_after_entry(ACTUAL_INDEX);
                     found_mount_child = true;
                     break;
                 }
@@ -3235,7 +3263,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
     }
 
     // Update file position
-    f->pos += static_cast<off_t>(entries_read);
+    f->pos = static_cast<off_t>(next_index);
 
     auto result = static_cast<ssize_t>(entries_read * sizeof(DirEntry));
     vfs_put_file(f);
@@ -3473,7 +3501,8 @@ auto vfs_mkdir(const char* path, int mode) -> int {
     return -ENOSYS;
 }
 
-static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolve_task_path, bool apply_task_policy) -> int {
+static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolve_task_path, bool apply_task_policy,
+                          bool follow_final_symlink) -> int {
     if (path == nullptr || statbuf == nullptr) {
         return -EINVAL;
     }
@@ -3531,7 +3560,7 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
 
     if (!REMOTE_MOUNT) {
         char resolved[MAX_PATH_LEN];  // NOLINT
-        int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy);
+        int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy, follow_final_symlink);
         if (RESOLVE_RET == -ELOOP) {
             return -ELOOP;
         }
@@ -3697,9 +3726,11 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     return result;
 }
 
-auto vfs_stat(const char* path, Stat* statbuf) -> int { return vfs_stat_impl(path, statbuf, true, true); }
+auto vfs_stat(const char* path, Stat* statbuf) -> int { return vfs_stat_impl(path, statbuf, true, true, true); }
 
-auto vfs_stat_resolved(const char* path, Stat* statbuf) -> int { return vfs_stat_impl(path, statbuf, false, false); }
+auto vfs_lstat(const char* path, Stat* statbuf) -> int { return vfs_stat_impl(path, statbuf, true, true, false); }
+
+auto vfs_stat_resolved(const char* path, Stat* statbuf) -> int { return vfs_stat_impl(path, statbuf, false, false, true); }
 
 auto vfs_fstat(int fd, Stat* statbuf) -> int {
     if (statbuf == nullptr) {
@@ -4353,35 +4384,26 @@ auto vfs_unlink(const char* path) -> int {
         return -ENOENT;
     }
 
+    // Hold tmpfs tree lock to serialize with open_count increment in tmpfs_open_path
+    ker::vfs::tmpfs::tmpfs_lock_tree();
     auto* child = ker::vfs::tmpfs::tmpfs_lookup(parent, name);
     if (child == nullptr) {
+        ker::vfs::tmpfs::tmpfs_unlock_tree();
         return -ENOENT;
     }
     if (child->type == ker::vfs::tmpfs::TmpNodeType::DIRECTORY) {
+        ker::vfs::tmpfs::tmpfs_unlock_tree();
         return -EISDIR;
     }
-
-    // Hold tmpfs tree lock to serialize with open_count increment in tmpfs_open_path
-    ker::vfs::tmpfs::tmpfs_lock_tree();
-    // Remove child from parent's children array
-    for (size_t i = 0; i < parent->children_count; ++i) {
-        if (parent->children[i] == child) {
-            // Shift remaining children down
-            for (size_t j = i; j + 1 < parent->children_count; ++j) {
-                parent->children[j] = parent->children[j + 1];
-            }
-            parent->children_count--;
-            parent->children[parent->children_count] = nullptr;
-            child->parent = nullptr;
-            // POSIX: defer freeing if file handles are still open
-            if (child->open_count.load(std::memory_order_acquire) > 0) {
-                child->unlinked = true;
-            } else {
-                ker::vfs::tmpfs::tmpfs_free_node(child);
-            }
-            ker::vfs::tmpfs::tmpfs_unlock_tree();
-            return 0;
+    if (ker::vfs::tmpfs::tmpfs_detach_child(parent, child)) {
+        // POSIX: defer freeing if file handles are still open
+        if (child->open_count.load(std::memory_order_acquire) > 0) {
+            child->unlinked = true;
+        } else {
+            ker::vfs::tmpfs::tmpfs_free_node(child);
         }
+        ker::vfs::tmpfs::tmpfs_unlock_tree();
+        return 0;
     }
     ker::vfs::tmpfs::tmpfs_unlock_tree();
     return -ENOENT;
@@ -4453,34 +4475,29 @@ auto vfs_rmdir(const char* path) -> int {
         return -ENOENT;
     }
 
+    ker::vfs::tmpfs::tmpfs_lock_tree();
     auto* child = ker::vfs::tmpfs::tmpfs_lookup(parent, name);
     if (child == nullptr) {
+        ker::vfs::tmpfs::tmpfs_unlock_tree();
         return -ENOENT;
     }
     if (child->type != ker::vfs::tmpfs::TmpNodeType::DIRECTORY) {
+        ker::vfs::tmpfs::tmpfs_unlock_tree();
         return -ENOTDIR;
     }
-    if (child->children_count > 0) {
+    if (!ker::vfs::tmpfs::tmpfs_directory_is_empty(child)) {
+        ker::vfs::tmpfs::tmpfs_unlock_tree();
         return -ENOTEMPTY;
     }
 
-    ker::vfs::tmpfs::tmpfs_lock_tree();
-    for (size_t i = 0; i < parent->children_count; ++i) {
-        if (parent->children[i] == child) {
-            for (size_t j = i; j + 1 < parent->children_count; ++j) {
-                parent->children[j] = parent->children[j + 1];
-            }
-            parent->children_count--;
-            parent->children[parent->children_count] = nullptr;
-            child->parent = nullptr;
-            if (child->open_count.load(std::memory_order_acquire) > 0) {
-                child->unlinked = true;
-            } else {
-                ker::vfs::tmpfs::tmpfs_free_node(child);
-            }
-            ker::vfs::tmpfs::tmpfs_unlock_tree();
-            return 0;
+    if (ker::vfs::tmpfs::tmpfs_detach_child(parent, child)) {
+        if (child->open_count.load(std::memory_order_acquire) > 0) {
+            child->unlinked = true;
+        } else {
+            ker::vfs::tmpfs::tmpfs_free_node(child);
         }
+        ker::vfs::tmpfs::tmpfs_unlock_tree();
+        return 0;
     }
     ker::vfs::tmpfs::tmpfs_unlock_tree();
     return -ENOENT;
@@ -4628,35 +4645,24 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
         return 0;
     }
     if (existing != nullptr) {
-        // Remove existing from parent
-        for (size_t i = 0; i < new_parent->children_count; ++i) {
-            if (new_parent->children[i] == existing) {
-                for (size_t j = i; j + 1 < new_parent->children_count; ++j) {
-                    new_parent->children[j] = new_parent->children[j + 1];
-                }
-                new_parent->children_count--;
-                new_parent->children[new_parent->children_count] = nullptr;
-                existing->parent = nullptr;
-                if (existing->open_count.load(std::memory_order_acquire) > 0) {
-                    existing->unlinked = true;
-                } else {
-                    ker::vfs::tmpfs::tmpfs_free_node(existing);
-                }
-                break;
-            }
+        if (existing->type == ker::vfs::tmpfs::TmpNodeType::DIRECTORY && !ker::vfs::tmpfs::tmpfs_directory_is_empty(existing)) {
+            ker::vfs::tmpfs::tmpfs_unlock_tree();
+            return -ENOTEMPTY;
+        }
+        if (!ker::vfs::tmpfs::tmpfs_detach_child(new_parent, existing)) {
+            ker::vfs::tmpfs::tmpfs_unlock_tree();
+            return -ENOENT;
+        }
+        if (existing->open_count.load(std::memory_order_acquire) > 0) {
+            existing->unlinked = true;
+        } else {
+            ker::vfs::tmpfs::tmpfs_free_node(existing);
         }
     }
 
-    // Remove old node from old parent
-    for (size_t i = 0; i < old_parent->children_count; ++i) {
-        if (old_parent->children[i] == old_node) {
-            for (size_t j = i; j + 1 < old_parent->children_count; ++j) {
-                old_parent->children[j] = old_parent->children[j + 1];
-            }
-            old_parent->children_count--;
-            old_parent->children[old_parent->children_count] = nullptr;
-            break;
-        }
+    if (!ker::vfs::tmpfs::tmpfs_detach_child(old_parent, old_node)) {
+        ker::vfs::tmpfs::tmpfs_unlock_tree();
+        return -ENOENT;
     }
 
     // Rename and reparent
@@ -4665,23 +4671,10 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
     std::memcpy(old_node->name.data(), new_name, COPY_LEN);
     old_node->name[COPY_LEN] = '\0';
 
-    // Add to new parent (inline - avoid circular include of tmpfs internal helpers)
-    // Grow children array if needed
-    if (new_parent->children_count >= new_parent->children_capacity) {
-        size_t const NEW_CAP = (new_parent->children_capacity == 0) ? 8 : new_parent->children_capacity * 2;
-        auto** new_arr = new ker::vfs::tmpfs::TmpNode*[NEW_CAP];
-        for (size_t i = 0; i < new_parent->children_count; ++i) {
-            new_arr[i] = new_parent->children[i];
-        }
-        for (size_t i = new_parent->children_count; i < NEW_CAP; ++i) {
-            new_arr[i] = nullptr;
-        }
-        delete[] new_parent->children;
-        new_parent->children = new_arr;
-        new_parent->children_capacity = NEW_CAP;
+    if (!ker::vfs::tmpfs::tmpfs_attach_child(new_parent, old_node)) {
+        ker::vfs::tmpfs::tmpfs_unlock_tree();
+        return -EIO;
     }
-    new_parent->children[new_parent->children_count++] = old_node;
-    old_node->parent = new_parent;
 
     ker::vfs::tmpfs::tmpfs_unlock_tree();
     return 0;

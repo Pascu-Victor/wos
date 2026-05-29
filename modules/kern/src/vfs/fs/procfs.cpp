@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <dev/virtio/virtio_net.hpp>
+#include <minimalist_malloc/mini_malloc.hpp>
 #include <net/backlog.hpp>
 #include <net/netdevice.hpp>
 #include <net/netpoll.hpp>
@@ -18,10 +19,16 @@
 #include <net/proto/tcp.hpp>
 #include <new>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/mm/memacc.hpp>
+#include <platform/mm/phys.hpp>
+#include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
+#include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <utility>
+#include <vfs/buffer_cache.hpp>
 #include <vfs/file.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/stat.hpp>
@@ -32,6 +39,7 @@
 #include "net/wki/remote_vfs.hpp"
 #include "net/wki/wire.hpp"
 #include "net/wki/wki.hpp"
+#include "platform/mm/paging.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "release.hpp"
 #include "vfs/file_operations.hpp"
@@ -42,6 +50,9 @@ namespace {
 
 constexpr uint64_t NS_PER_SEC = 1000000000ULL;
 constexpr uint64_t NS_PER_US = 1000ULL;
+constexpr uint64_t PROC_CLK_TCK = 100ULL;
+constexpr uint64_t US_PER_PROC_TICK = 1000000ULL / PROC_CLK_TCK;
+constexpr uint64_t KIB = 1024ULL;
 
 uint64_t g_procfs_creation_epoch_ns = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
@@ -97,7 +108,8 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
 
     if (pfd->node.type == ProcNodeType::ROOT_DIR) {
         // /proc root: fixed entries then PID directories
-        // index 2 = "self", 3 = "mounts", 4+ = active task PIDs
+        // index 2 = "self", 3 = "mounts", 4 = "uptime", 5 = "version",
+        // 6 = "stat", 7 = "loadavg", 8 = "meminfo", 9 = "wki", 10 = "memacc", 11+ = active task PIDs
         if (count == 2) {
             buf->d_ino = 2;
             buf->d_off = 3;
@@ -134,31 +146,65 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             buf->d_ino = 6;
             buf->d_off = 7;
             buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "stat", 5);
+            return 0;
+        }
+        if (count == 7) {
+            buf->d_ino = 7;
+            buf->d_off = 8;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "loadavg", 8);
+            return 0;
+        }
+        if (count == 8) {
+            buf->d_ino = 8;
+            buf->d_off = 9;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "meminfo", 8);
+            return 0;
+        }
+        if (count == 9) {
+            buf->d_ino = 9;
+            buf->d_off = 10;
+            buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_DIR;
             std::memcpy(buf->d_name.data(), "wki", 4);
             return 0;
         }
+        if (count == 10) {
+            buf->d_ino = 22;
+            buf->d_off = 11;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_DIR;
+            std::memcpy(buf->d_name.data(), "memacc", 7);
+            return 0;
+        }
         // PID directories from active task list
-        size_t const PID_INDEX = count - 7;
+        size_t const PID_INDEX = count - 11;
         uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
         if (PID_INDEX >= TASK_COUNT) {
             return -ENOENT;  // No more entries
         }
-        auto* task = ker::mod::sched::get_active_task_at(static_cast<uint32_t>(PID_INDEX));
+        auto* task = ker::mod::sched::get_active_task_at_safe(static_cast<uint32_t>(PID_INDEX));
         if (task == nullptr) {
             return -ENOENT;
         }
-        buf->d_ino = task->pid + 100;
+        uint64_t const PID = task->pid;
+        task->release();
+        buf->d_ino = PID + 100;
         buf->d_off = count + 1;
         buf->d_reclen = sizeof(DirEntry);
         buf->d_type = DT_DIR;
-        int_to_str(task->pid, buf->d_name.data(), buf->d_name.size());
+        int_to_str(PID, buf->d_name.data(), buf->d_name.size());
         return 0;
     }
 
     if (pfd->node.type == ProcNodeType::PID_DIR) {
-        // /proc/<pid>: index 2 = "stat", 3 = "status", 4 = "cmdline",
-        // 5 = "exe", 6 = "wki_launcher", 7 = "wki_runner", 8 = "wki_remote_pid"
+        // /proc/<pid>: index 2 = "stat", 3 = "status", 4 = "statm",
+        // 5 = "cmdline", 6 = "exe", 7 = "wki_launcher", 8 = "wki_runner", 9 = "wki_remote_pid"
         if (count == 2) {
             buf->d_ino = 10;
             buf->d_off = 3;
@@ -180,23 +226,23 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             buf->d_off = 5;
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
-            std::memcpy(buf->d_name.data(), "cmdline", 8);
+            std::memcpy(buf->d_name.data(), "statm", 6);
             return 0;
         }
         if (count == 5) {
             buf->d_ino = 13;
             buf->d_off = 6;
             buf->d_reclen = sizeof(DirEntry);
-            buf->d_type = DT_LNK;
-            std::memcpy(buf->d_name.data(), "exe", 4);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "cmdline", 8);
             return 0;
         }
         if (count == 6) {
             buf->d_ino = 14;
             buf->d_off = 7;
             buf->d_reclen = sizeof(DirEntry);
-            buf->d_type = DT_REG;
-            std::memcpy(buf->d_name.data(), "wki_launcher", 13);
+            buf->d_type = DT_LNK;
+            std::memcpy(buf->d_name.data(), "exe", 4);
             return 0;
         }
         if (count == 7) {
@@ -204,12 +250,20 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             buf->d_off = 8;
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
-            std::memcpy(buf->d_name.data(), "wki_runner", 11);
+            std::memcpy(buf->d_name.data(), "wki_launcher", 13);
             return 0;
         }
         if (count == 8) {
             buf->d_ino = 16;
             buf->d_off = 9;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "wki_runner", 11);
+            return 0;
+        }
+        if (count == 9) {
+            buf->d_ino = 17;
+            buf->d_off = 10;
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "wki_remote_pid", 15);
@@ -238,6 +292,78 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
         return -ENOENT;
     }
 
+    if (pfd->node.type == ProcNodeType::MEMACC_DIR) {
+        struct Entry {
+            const char* name;
+            uint8_t type;
+        };
+        constexpr std::array<Entry, 12> ENTRIES{{
+            {.name = "summary", .type = DT_REG},
+            {.name = "zones", .type = DT_REG},
+            {.name = "procs", .type = DT_REG},
+            {.name = "dead", .type = DT_REG},
+            {.name = "alloc_totals", .type = DT_REG},
+            {.name = "slabs", .type = DT_REG},
+            {.name = "kmalloc_live", .type = DT_REG},
+            {.name = "kmalloc_callers", .type = DT_REG},
+            {.name = "page_callers", .type = DT_REG},
+            {.name = "features", .type = DT_REG},
+            {.name = "track", .type = DT_DIR},
+            {.name = "reclaim", .type = DT_DIR},
+        }};
+        size_t const INDEX = count - 2;
+        if (INDEX >= ENTRIES.size()) {
+            return -ENOENT;
+        }
+        buf->d_ino = 30 + INDEX;
+        buf->d_off = count + 1;
+        buf->d_reclen = sizeof(DirEntry);
+        buf->d_type = ENTRIES.at(INDEX).type;
+        std::strncpy(buf->d_name.data(), ENTRIES.at(INDEX).name, buf->d_name.size() - 1);
+        buf->d_name[buf->d_name.size() - 1] = '\0';
+        return 0;
+    }
+
+    if (pfd->node.type == ProcNodeType::MEMACC_TRACK_DIR) {
+        if (count == 2) {
+            buf->d_ino = 40;
+            buf->d_off = 3;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "page_callers", 13);
+            return 0;
+        }
+        if (count == 3) {
+            buf->d_ino = 41;
+            buf->d_off = 4;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "kmalloc_debug", 14);
+            return 0;
+        }
+        return -ENOENT;
+    }
+
+    if (pfd->node.type == ProcNodeType::MEMACC_RECLAIM_DIR) {
+        if (count == 2) {
+            buf->d_ino = 42;
+            buf->d_off = 3;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "buffer_cache", 13);
+            return 0;
+        }
+        if (count == 3) {
+            buf->d_ino = 43;
+            buf->d_off = 4;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "packet_pool", 12);
+            return 0;
+        }
+        return -ENOENT;
+    }
+
     return -ENOENT;
 }
 
@@ -258,10 +384,11 @@ auto parse_pid(const char* s) -> int64_t {
 
 // Generate content for /proc/<pid>/status
 auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
-    auto* task = ker::mod::sched::find_task_by_pid(pid);
+    auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
     if (task == nullptr) {
         return 0;
     }
+    auto const MEM = ker::mod::mm::virt::collect_user_memory_stats(task->pagemap);
 
     size_t off = 0;
     auto append = [&](const char* s) {
@@ -297,6 +424,18 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     append_int(task->sgid);
     append("\t");
     append_int(task->gid);
+    append("\nVmSize:\t");
+    append_int(MEM.virtual_pages * (ker::mod::mm::paging::PAGE_SIZE / KIB));
+    append(" kB");
+    append("\nVmRSS:\t");
+    append_int(MEM.resident_pages * (ker::mod::mm::paging::PAGE_SIZE / KIB));
+    append(" kB");
+    append("\nRssShmem:\t");
+    append_int(MEM.shared_pages * (ker::mod::mm::paging::PAGE_SIZE / KIB));
+    append(" kB");
+    append("\nVmPTE:\t");
+    append_int(MEM.page_table_pages * (ker::mod::mm::paging::PAGE_SIZE / KIB));
+    append(" kB");
 
     // State
     append("\nState:\t");
@@ -380,6 +519,7 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     append("\n");
 
     buf[off] = '\0';
+    task->release();
     return off;
 }
 
@@ -387,10 +527,11 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
 // Format: pid (comm) state ppid pgid sid tty tpgid flags minflt cminflt majflt cmajflt
 //         utime stime cutime cstime priority nice nthreads itrealvalue starttime vsize rss ...
 auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
-    auto* task = ker::mod::sched::find_task_by_pid(pid);
+    auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
     if (task == nullptr) {
         return 0;
     }
+    auto const MEM = ker::mod::mm::virt::collect_user_memory_stats(task->pagemap);
 
     size_t off = 0;
     auto append = [&](const char* s) {
@@ -465,16 +606,25 @@ auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     append("0 ");  // cstime (children)
 
     // priority nice num_threads itrealvalue starttime
-    append("20 ");                            // priority
-    append("0 ");                             // nice
+    append_int(static_cast<uint64_t>(20 + task->sched_nice));  // priority
+    append(" ");
+    if (task->sched_nice < 0) {
+        append("-");
+        append_int(static_cast<uint64_t>(-task->sched_nice));
+    } else {
+        append_int(static_cast<uint64_t>(task->sched_nice));
+    }
+    append(" ");
     append("1 ");                             // num_threads
     append("0 ");                             // itrealvalue
     append_int(task->start_time_us / 10000);  // starttime (in ticks since boot)
     append(" ");
 
     // vsize rss
-    append("0 ");  // vsize
-    append("0 ");  // rss
+    append_int(MEM.virtual_pages * ker::mod::mm::paging::PAGE_SIZE);  // vsize
+    append(" ");
+    append_int(MEM.resident_pages);  // rss
+    append(" ");
 
     // rlim signal blocked sigignore sigcatch wchan nswap cnswap exit_signal processor
     append("0 ");                   // rlim
@@ -498,12 +648,45 @@ auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
 
     append("\n");
     buf[off] = '\0';
+    task->release();
+    return off;
+}
+
+// Generate content for /proc/<pid>/statm.
+// Format: size resident shared text lib data dt (all in pages).
+auto generate_statm(uint64_t pid, char* buf, size_t bufsz) -> size_t {
+    auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
+    if (task == nullptr) {
+        return 0;
+    }
+    auto const MEM = ker::mod::mm::virt::collect_user_memory_stats(task->pagemap);
+    task->release();
+
+    size_t off = 0;
+    auto append = [&](const char* s) {
+        while (*s && off < bufsz - 1) {
+            buf[off++] = *s++;
+        }
+    };
+    auto append_int = [&](uint64_t v) {
+        std::array<char, 24> tmp{};
+        int_to_str(v, tmp.data(), tmp.size());
+        append(tmp.data());
+    };
+
+    append_int(MEM.virtual_pages);
+    append(" ");
+    append_int(MEM.resident_pages);
+    append(" ");
+    append_int(MEM.shared_pages);
+    append(" 0 0 0 0\n");
+    buf[off] = '\0';
     return off;
 }
 
 // Generate content for /proc/<pid>/cmdline (NUL-separated argv)
 auto generate_cmdline(uint64_t pid, char* buf, size_t bufsz) -> size_t {
-    auto* task = ker::mod::sched::find_task_by_pid(pid);
+    auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
     if (task == nullptr) {
         return 0;
     }
@@ -519,7 +702,8 @@ auto generate_cmdline(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     }
     memcpy(buf, path, len);
     buf[len] = '\0';  // NUL terminator (cmdline ends with NUL)
-    return len + 1;   // Include the trailing NUL as part of content length
+    task->release();
+    return len + 1;  // Include the trailing NUL as part of content length
 }
 
 // Generate content for /proc/mounts
@@ -601,9 +785,196 @@ auto generate_uptime(char* buf, size_t bufsz) -> size_t {
     }
     append_int(UPTIME_FRAC);
 
-    // Idle time: sum idle across all CPUs, divide by CPU count for average
-    // For now, report 0.00 as idle tracking is not yet implemented
-    append(" 0.00\n");
+    uint64_t cpu_count = ker::mod::smt::get_core_count();
+    if (cpu_count == 0) {
+        cpu_count = 1;
+    }
+    uint64_t idle_us = 0;
+    for (uint64_t cpu = 0; cpu < cpu_count; ++cpu) {
+        idle_us += ker::mod::sched::get_cpu_accounting_snapshot(cpu).idle_us;
+    }
+    uint64_t const IDLE_AVG_US = idle_us / cpu_count;
+    uint64_t const IDLE_SEC = IDLE_AVG_US / 1000000ULL;
+    uint64_t const IDLE_FRAC = (IDLE_AVG_US % 1000000ULL) / 10000ULL;
+
+    append(" ");
+    append_int(IDLE_SEC);
+    append(".");
+    if (IDLE_FRAC < 10) {
+        append("0");
+    }
+    append_int(IDLE_FRAC);
+    append("\n");
+
+    buf[off] = '\0';
+    return off;
+}
+
+auto generate_cpu_stat(char* buf, size_t bufsz) -> size_t {
+    size_t off = 0;
+    auto append = [&](const char* s) {
+        while (*s && off < bufsz - 1) {
+            buf[off++] = *s++;
+        }
+    };
+    auto append_int = [&](uint64_t v) {
+        std::array<char, 24> tmp{};
+        int_to_str(v, tmp.data(), tmp.size());
+        append(tmp.data());
+    };
+    auto append_ticks = [&](uint64_t us) { append_int(us / US_PER_PROC_TICK); };
+
+    uint64_t cpu_count = ker::mod::smt::get_core_count();
+    if (cpu_count == 0) {
+        cpu_count = 1;
+    }
+
+    ker::mod::sched::CpuAccountingSnapshot total{};
+    for (uint64_t cpu = 0; cpu < cpu_count; ++cpu) {
+        auto const SNAP = ker::mod::sched::get_cpu_accounting_snapshot(cpu);
+        total.user_us += SNAP.user_us;
+        total.nice_us += SNAP.nice_us;
+        total.system_us += SNAP.system_us;
+        total.idle_us += SNAP.idle_us;
+        total.iowait_us += SNAP.iowait_us;
+        total.irq_us += SNAP.irq_us;
+        total.softirq_us += SNAP.softirq_us;
+        total.steal_us += SNAP.steal_us;
+    }
+
+    auto append_cpu_row = [&](const char* prefix, uint64_t cpu_no, const ker::mod::sched::CpuAccountingSnapshot& snap, bool numbered) {
+        append(prefix);
+        if (numbered) {
+            append_int(cpu_no);
+        }
+        append("  ");
+        append_ticks(snap.user_us);
+        append(" ");
+        append_ticks(snap.nice_us);
+        append(" ");
+        append_ticks(snap.system_us);
+        append(" ");
+        append_ticks(snap.idle_us);
+        append(" ");
+        append_ticks(snap.iowait_us);
+        append(" ");
+        append_ticks(snap.irq_us);
+        append(" ");
+        append_ticks(snap.softirq_us);
+        append(" ");
+        append_ticks(snap.steal_us);
+        append(" 0 0\n");
+    };
+
+    append_cpu_row("cpu", 0, total, false);
+    for (uint64_t cpu = 0; cpu < cpu_count; ++cpu) {
+        append_cpu_row("cpu", cpu, ker::mod::sched::get_cpu_accounting_snapshot(cpu), true);
+    }
+
+    auto const LOAD = ker::mod::sched::get_load_average_snapshot();
+    append("procs_running ");
+    append_int(LOAD.runnable_tasks);
+    append("\nprocs_blocked ");
+    append_int(LOAD.uninterruptible_tasks);
+    append("\n");
+
+    buf[off] = '\0';
+    return off;
+}
+
+auto generate_loadavg(char* buf, size_t bufsz) -> size_t {
+    size_t off = 0;
+    auto append = [&](const char* s) {
+        while (*s && off < bufsz - 1) {
+            buf[off++] = *s++;
+        }
+    };
+    auto append_int = [&](uint64_t v) {
+        std::array<char, 24> tmp{};
+        int_to_str(v, tmp.data(), tmp.size());
+        append(tmp.data());
+    };
+    auto append_load = [&](uint64_t milli) {
+        append_int(milli / 1000ULL);
+        append(".");
+        uint64_t const FRAC = (milli % 1000ULL) / 10ULL;
+        if (FRAC < 10) {
+            append("0");
+        }
+        append_int(FRAC);
+    };
+
+    auto const LOAD = ker::mod::sched::get_load_average_snapshot();
+    append_load(LOAD.load1_milli);
+    append(" ");
+    append_load(LOAD.load5_milli);
+    append(" ");
+    append_load(LOAD.load15_milli);
+    append(" ");
+    append_int(LOAD.runnable_tasks);
+    append("/");
+    append_int(LOAD.total_tasks);
+    append(" ");
+    append_int(LOAD.last_pid);
+    append("\n");
+
+    buf[off] = '\0';
+    return off;
+}
+
+auto generate_meminfo(char* buf, size_t bufsz) -> size_t {
+    size_t off = 0;
+    auto append = [&](const char* s) {
+        while (*s && off < bufsz - 1) {
+            buf[off++] = *s++;
+        }
+    };
+    auto append_int = [&](uint64_t v) {
+        std::array<char, 24> tmp{};
+        int_to_str(v, tmp.data(), tmp.size());
+        append(tmp.data());
+    };
+    auto append_kb_line = [&](const char* name, uint64_t bytes) {
+        append(name);
+        append(":\t");
+        append_int(bytes / KIB);
+        append(" kB\n");
+    };
+
+    uint64_t const TOTAL = ker::mod::mm::phys::get_total_mem_bytes();
+    uint64_t const FREE = ker::mod::mm::phys::get_free_mem_bytes();
+    auto const BCACHE = ker::vfs::buffer_cache_stats();
+    auto const FILE_CACHE = ker::syscall::vmem::file_mmap_cache_stats();
+    auto const ELF_CACHE = ker::net::wki::wki_shared_elf_cache_stats();
+    uint64_t const BUFFERS = BCACHE.total_bytes;
+    uint64_t const CACHED = FILE_CACHE.bytes + ELF_CACHE.bytes;
+    uint64_t const AVAILABLE = std::min<uint64_t>(TOTAL, FREE + BCACHE.clean_bytes + CACHED);
+
+    uint64_t page_table_bytes = 0;
+    uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < TASK_COUNT; ++i) {
+        auto* task = ker::mod::sched::get_active_task_at_safe(i);
+        if (task == nullptr) {
+            continue;
+        }
+        if (!task->is_thread) {
+            auto const MEM = ker::mod::mm::virt::collect_user_memory_stats(task->pagemap);
+            page_table_bytes += MEM.page_table_pages * ker::mod::mm::paging::PAGE_SIZE;
+        }
+        task->release();
+    }
+
+    append_kb_line("MemTotal", TOTAL);
+    append_kb_line("MemFree", FREE);
+    append_kb_line("MemAvailable", AVAILABLE);
+    append_kb_line("Buffers", BUFFERS);
+    append_kb_line("Cached", CACHED);
+    append_kb_line("SwapCached", 0);
+    append_kb_line("Dirty", BCACHE.dirty_bytes);
+    append_kb_line("Writeback", 0);
+    append_kb_line("PageTables", page_table_bytes);
+    append_kb_line("SwapTotal", 0);
+    append_kb_line("SwapFree", 0);
 
     buf[off] = '\0';
     return off;
@@ -1075,6 +1446,732 @@ void append_netdev_name(char*& p, const char* end, const std::array<char, ker::n
     }
 }
 
+void append_memacc_key(char*& p, const char* end, const char* key) {
+    append_char(p, end, ' ');
+    append_sconst(p, end, key);
+    append_char(p, end, '=');
+}
+
+void append_memacc_dec(char*& p, const char* end, const char* key, uint64_t value) {
+    append_memacc_key(p, end, key);
+    append_dec64(p, end, value);
+}
+
+void append_memacc_hex(char*& p, const char* end, const char* key, uint64_t value) {
+    append_memacc_key(p, end, key);
+    append_hex64(p, end, value);
+}
+
+void append_memacc_bool(char*& p, const char* end, const char* key, bool value) { append_memacc_dec(p, end, key, value ? 1U : 0U); }
+
+void append_percent_byte(char*& p, const char* end, uint8_t value) {
+    constexpr std::array<char, 16> HEX_DIGITS{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
+    if (p + 3 >= end) {
+        return;
+    }
+    *p++ = '%';
+    *p++ = HEX_DIGITS.at((value >> 4U) & 0xfU);
+    *p++ = HEX_DIGITS.at(value & 0xfU);
+}
+
+void append_memacc_str(char*& p, const char* end, const char* key, const char* value) {
+    append_memacc_key(p, end, key);
+    if (value == nullptr || value[0] == '\0') {
+        append_sconst(p, end, "-");
+        return;
+    }
+    while (*value != '\0' && p + 1 < end) {
+        auto const CH = static_cast<uint8_t>(*value);
+        if (CH <= static_cast<uint8_t>(' ') || CH == static_cast<uint8_t>('%') || CH == static_cast<uint8_t>('=')) {
+            append_percent_byte(p, end, CH);
+        } else {
+            append_char(p, end, *value);
+        }
+        value++;
+    }
+}
+
+void append_memacc_feature_row(char*& p, const char* end, const char* name, bool available, bool enabled, bool default_enabled,
+                               uint64_t generation) {
+    append_sconst(p, end, "feature");
+    append_memacc_str(p, end, "name", name);
+    append_memacc_bool(p, end, "available", available);
+    append_memacc_bool(p, end, "default", default_enabled);
+    append_memacc_bool(p, end, "enabled", enabled);
+    append_memacc_dec(p, end, "generation", generation);
+    append_char(p, end, '\n');
+}
+
+auto task_type_name(ker::mod::sched::task::TaskType type) -> const char* {
+    switch (type) {
+        case ker::mod::sched::task::TaskType::DAEMON:
+            return "daemon";
+        case ker::mod::sched::task::TaskType::PROCESS:
+            return "process";
+        case ker::mod::sched::task::TaskType::IDLE:
+            return "idle";
+    }
+    return "unknown";
+}
+
+auto task_queue_name(enum ker::mod::sched::task::Task::sched_queue queue) -> const char* {
+    switch (queue) {
+        case ker::mod::sched::task::Task::sched_queue::NONE:
+            return "none";
+        case ker::mod::sched::task::Task::sched_queue::RUNNABLE:
+            return "runnable";
+        case ker::mod::sched::task::Task::sched_queue::WAITING:
+            return "waiting";
+        case ker::mod::sched::task::Task::sched_queue::DEAD_GC:
+            return "dead_gc";
+    }
+    return "unknown";
+}
+
+auto task_state_name(const ker::mod::sched::task::Task* task) -> const char* {
+    if (task == nullptr) {
+        return "unknown";
+    }
+    auto const STATE = task->state.load(std::memory_order_acquire);
+    if (STATE == ker::mod::sched::task::TaskState::DEAD || task->has_exited) {
+        return "dead";
+    }
+    if (STATE == ker::mod::sched::task::TaskState::EXITING) {
+        return "exiting";
+    }
+    if (task->sched_queue == ker::mod::sched::task::Task::sched_queue::RUNNABLE) {
+        return "running";
+    }
+    if (task->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING) {
+        return task->wait_channel != nullptr ? "blocked" : "sleeping";
+    }
+    return "sleeping";
+}
+
+auto task_short_name(const ker::mod::sched::task::Task* task) -> const char* {
+    if (task == nullptr) {
+        return "unknown";
+    }
+    if (task->name != nullptr && task->name[0] != '\0') {
+        return task->name;
+    }
+    const char* comm = task->exe_path.data();
+    if (comm[0] != '\0') {
+        for (const char* p = comm; *p != '\0'; ++p) {
+            if (*p == '/') {
+                comm = p + 1;
+            }
+        }
+        if (comm[0] != '\0') {
+            return comm;
+        }
+    }
+    return "unknown";
+}
+
+auto task_command_name(const ker::mod::sched::task::Task* task) -> const char* {
+    if (task == nullptr) {
+        return "unknown";
+    }
+    if (task->exe_path[0] != '\0') {
+        return task->exe_path.data();
+    }
+    return task_short_name(task);
+}
+
+constexpr uint64_t MEMACC_PAGE_BYTES = ker::mod::mm::paging::PAGE_SIZE;
+
+auto pages_to_bytes(uint64_t pages) -> uint64_t { return pages * MEMACC_PAGE_BYTES; }
+
+struct MemaccProcessTotals {
+    uint64_t task_count;
+    uint64_t process_count;
+    uint64_t kernel_task_count;
+    uint64_t virtual_bytes;
+    uint64_t resident_bytes;
+    uint64_t shared_bytes;
+    uint64_t pte_bytes;
+    uint64_t code_bytes;
+    uint64_t heap_bytes;
+    uint64_t mmap_bytes;
+    uint64_t stack_bytes;
+    uint64_t other_bytes;
+    uint64_t rw_bytes;
+    uint64_t rx_bytes;
+    uint64_t ro_bytes;
+};
+
+void add_process_totals(MemaccProcessTotals& totals, const ker::mod::mm::memacc::UserMemoryBreakdown& mem) {
+    totals.virtual_bytes += pages_to_bytes(mem.virtual_pages);
+    totals.resident_bytes += pages_to_bytes(mem.resident_pages);
+    totals.shared_bytes += pages_to_bytes(mem.shared_pages);
+    totals.pte_bytes += pages_to_bytes(mem.page_table_pages);
+    totals.code_bytes += pages_to_bytes(mem.code_pages);
+    totals.heap_bytes += pages_to_bytes(mem.heap_pages);
+    totals.mmap_bytes += pages_to_bytes(mem.mmap_pages);
+    totals.stack_bytes += pages_to_bytes(mem.stack_pages);
+    totals.other_bytes += pages_to_bytes(mem.other_pages);
+    totals.rw_bytes += pages_to_bytes(mem.rw_pages);
+    totals.rx_bytes += pages_to_bytes(mem.rx_pages);
+    totals.ro_bytes += pages_to_bytes(mem.ro_pages);
+}
+
+auto collect_memacc_process_totals() -> MemaccProcessTotals {
+    MemaccProcessTotals totals{};
+    uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < TASK_COUNT; ++i) {
+        auto* task = ker::mod::sched::get_active_task_at_safe(i);
+        if (task == nullptr) {
+            continue;
+        }
+        totals.task_count++;
+        if (task->type != ker::mod::sched::task::TaskType::PROCESS) {
+            totals.kernel_task_count++;
+        }
+        if (!task->is_thread) {
+            totals.process_count++;
+            add_process_totals(totals, ker::mod::mm::memacc::collect_user_memory_breakdown(task->pagemap));
+        }
+        task->release();
+    }
+    return totals;
+}
+
+auto generate_memacc_summary(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+
+    ker::mod::mm::phys::AllocStatsSnapshot phys{};
+    ker::mod::mm::phys::get_alloc_stats_snapshot(phys);
+    auto const PROC = collect_memacc_process_totals();
+    auto const BCACHE = ker::vfs::buffer_cache_stats();
+    auto const FILE_CACHE = ker::syscall::vmem::file_mmap_cache_stats();
+    auto const ELF_CACHE = ker::net::wki::wki_shared_elf_cache_stats();
+    ker::net::wki::WkiIpcPerfSnapshot ipc{};
+    ker::net::wki::wki_ipc_get_perf_snapshot(ipc);
+    ker::vfs::LocalPipePerfSnapshot local_pipe{};
+    ker::vfs::vfs_get_local_pipe_perf_snapshot(local_pipe);
+    ker::mod::mm::dyn::kmalloc::KmallocTrackedTotals kmalloc{};
+    ker::mod::mm::dyn::kmalloc::get_tracked_alloc_breakdown(kmalloc);
+    auto const KMALLOC_DEBUG = ker::mod::mm::dyn::kmalloc::debug_info_stats();
+
+    uint64_t const USED_BYTES = phys.total_mem_bytes >= phys.free_mem_bytes ? phys.total_mem_bytes - phys.free_mem_bytes : 0;
+    uint64_t const KMALLOC_BYTES = kmalloc.medium_bytes + kmalloc.large_bytes;
+    uint64_t const KMALLOC_DEBUG_BYTES = KMALLOC_DEBUG.block_bytes;
+    uint64_t const MINI_BYTES = ker::mod::mm::mini_malloc::mini_get_total_slab_bytes();
+    uint64_t const ALLOCATOR_BYTES = KMALLOC_BYTES + MINI_BYTES + KMALLOC_DEBUG_BYTES;
+    uint64_t const CACHE_BYTES = static_cast<uint64_t>(BCACHE.total_bytes) + FILE_CACHE.bytes + ELF_CACHE.bytes + ipc.approx_alloc_bytes +
+                                 local_pipe.approx_alloc_bytes;
+    uint64_t const USER_UNIQUE_ESTIMATE =
+        PROC.resident_bytes >= PROC.shared_bytes ? PROC.resident_bytes - PROC.shared_bytes : PROC.resident_bytes;
+    uint64_t accounted = USER_UNIQUE_ESTIMATE + PROC.pte_bytes + ALLOCATOR_BYTES + CACHE_BYTES;
+    uint64_t const UNACCOUNTED = USED_BYTES > accounted ? USED_BYTES - accounted : 0;
+
+    append_sconst(p, end, "summary");
+    append_memacc_dec(p, end, "total_bytes", phys.total_mem_bytes);
+    append_memacc_dec(p, end, "free_bytes", phys.free_mem_bytes);
+    append_memacc_dec(p, end, "used_bytes", USED_BYTES);
+    append_memacc_dec(p, end, "processes", PROC.process_count);
+    append_memacc_dec(p, end, "tasks", PROC.task_count);
+    append_memacc_dec(p, end, "kernel_tasks", PROC.kernel_task_count);
+    append_memacc_dec(p, end, "process_virtual_bytes", PROC.virtual_bytes);
+    append_memacc_dec(p, end, "process_rss_bytes", PROC.resident_bytes);
+    append_memacc_dec(p, end, "process_shared_bytes", PROC.shared_bytes);
+    append_memacc_dec(p, end, "process_pte_bytes", PROC.pte_bytes);
+    append_memacc_dec(p, end, "process_code_bytes", PROC.code_bytes);
+    append_memacc_dec(p, end, "process_heap_bytes", PROC.heap_bytes);
+    append_memacc_dec(p, end, "process_mmap_bytes", PROC.mmap_bytes);
+    append_memacc_dec(p, end, "process_stack_bytes", PROC.stack_bytes);
+    append_memacc_dec(p, end, "process_other_bytes", PROC.other_bytes);
+    append_memacc_dec(p, end, "process_rw_bytes", PROC.rw_bytes);
+    append_memacc_dec(p, end, "process_rx_bytes", PROC.rx_bytes);
+    append_memacc_dec(p, end, "process_ro_bytes", PROC.ro_bytes);
+    append_memacc_dec(p, end, "allocator_bytes", ALLOCATOR_BYTES);
+    append_memacc_dec(p, end, "kmalloc_bytes", KMALLOC_BYTES);
+    append_memacc_dec(p, end, "kmalloc_debug_pool_bytes", KMALLOC_DEBUG_BYTES);
+    append_memacc_dec(p, end, "mini_slab_bytes", MINI_BYTES);
+    append_memacc_dec(p, end, "cache_bytes", CACHE_BYTES);
+    append_memacc_dec(p, end, "unaccounted_estimate_bytes", UNACCOUNTED);
+    append_char(p, end, '\n');
+
+    append_memacc_feature_row(p, end, "page_callers", ker::mod::mm::phys::page_caller_stats_available(),
+                              ker::mod::mm::phys::page_caller_stats_enabled(), ker::mod::mm::phys::page_caller_stats_default_enabled(),
+                              ker::mod::mm::phys::page_caller_stats_generation());
+    append_memacc_feature_row(p, end, "kmalloc_debug", ker::mod::mm::dyn::kmalloc::debug_info_available(),
+                              ker::mod::mm::dyn::kmalloc::debug_info_enabled(), ker::mod::mm::dyn::kmalloc::debug_info_default_enabled(),
+                              ker::mod::mm::dyn::kmalloc::debug_info_generation());
+
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+auto generate_memacc_zones(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+
+    constexpr size_t MAX_ZONES = 32;
+    std::array<ker::mod::mm::phys::ZoneSnapshot, MAX_ZONES> zones{};
+    size_t const ROWS = ker::mod::mm::phys::snapshot_zones(zones.data(), zones.size());
+    for (size_t i = 0; i < ROWS; ++i) {
+        const auto& zone = zones.at(i);
+        append_sconst(p, end, "zone");
+        append_memacc_dec(p, end, "id", zone.zone_num);
+        append_memacc_str(p, end, "name", zone.name);
+        append_memacc_hex(p, end, "start", zone.start);
+        append_memacc_dec(p, end, "len_bytes", zone.len);
+        append_memacc_dec(p, end, "page_count", zone.page_count);
+        append_memacc_dec(p, end, "total_pages", zone.total_pages);
+        append_memacc_dec(p, end, "usable_pages", zone.usable_pages);
+        append_memacc_dec(p, end, "free_pages", zone.free_pages);
+        append_memacc_dec(p, end, "metadata_pages", zone.metadata_pages);
+        append_memacc_dec(p, end, "scanned_free_pages", zone.scanned_free_pages);
+        append_memacc_bool(p, end, "has_allocator", zone.has_allocator);
+        append_memacc_bool(p, end, "invalid_allocator", zone.invalid_allocator);
+        append_memacc_bool(p, end, "bad_order", zone.bad_order);
+        append_memacc_bool(p, end, "free_count_mismatch", zone.free_count_mismatch);
+        append_char(p, end, '\n');
+
+        for (size_t order = 0; order < zone.buddy_order_counts.size(); ++order) {
+            uint64_t const BLOCKS = zone.buddy_order_counts.at(order);
+            if (BLOCKS == 0) {
+                continue;
+            }
+            uint64_t const PAGES = BLOCKS * (uint64_t{1} << order);
+            append_sconst(p, end, "buddy");
+            append_memacc_dec(p, end, "zone", zone.zone_num);
+            append_memacc_dec(p, end, "order", order);
+            append_memacc_dec(p, end, "free_blocks", BLOCKS);
+            append_memacc_dec(p, end, "free_pages", PAGES);
+            append_memacc_dec(p, end, "free_bytes", pages_to_bytes(PAGES));
+            append_char(p, end, '\n');
+        }
+    }
+    if (ROWS == MAX_ZONES) {
+        append_sconst(p, end, "truncated file=zones");
+        append_memacc_dec(p, end, "max_rows", MAX_ZONES);
+        append_char(p, end, '\n');
+    }
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+auto generate_memacc_procs(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+
+    uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < TASK_COUNT; ++i) {
+        auto* task = ker::mod::sched::get_active_task_at_safe(i);
+        if (task == nullptr) {
+            continue;
+        }
+        if (task->is_thread) {
+            task->release();
+            continue;
+        }
+
+        auto const MEM = ker::mod::mm::memacc::collect_user_memory_breakdown(task->pagemap);
+        append_sconst(p, end, "proc");
+        append_memacc_dec(p, end, "pid", task->pid);
+        append_memacc_dec(p, end, "ppid", task->parent_pid);
+        append_memacc_dec(p, end, "uid", task->uid);
+        append_memacc_dec(p, end, "gid", task->gid);
+        append_memacc_str(p, end, "state", task_state_name(task));
+        append_memacc_str(p, end, "queue", task_queue_name(task->sched_queue));
+        append_memacc_dec(p, end, "cpu", task->cpu);
+        append_memacc_str(p, end, "type", task_type_name(task->type));
+        append_memacc_str(p, end, "name", task_short_name(task));
+        append_memacc_str(p, end, "cmd", task_command_name(task));
+        append_memacc_dec(p, end, "virt_bytes", pages_to_bytes(MEM.virtual_pages));
+        append_memacc_dec(p, end, "rss_bytes", pages_to_bytes(MEM.resident_pages));
+        append_memacc_dec(p, end, "shr_bytes", pages_to_bytes(MEM.shared_pages));
+        append_memacc_dec(p, end, "pte_bytes", pages_to_bytes(MEM.page_table_pages));
+        append_memacc_dec(p, end, "code_bytes", pages_to_bytes(MEM.code_pages));
+        append_memacc_dec(p, end, "heap_bytes", pages_to_bytes(MEM.heap_pages));
+        append_memacc_dec(p, end, "mmap_bytes", pages_to_bytes(MEM.mmap_pages));
+        append_memacc_dec(p, end, "stack_bytes", pages_to_bytes(MEM.stack_pages));
+        append_memacc_dec(p, end, "other_bytes", pages_to_bytes(MEM.other_pages));
+        append_memacc_dec(p, end, "rw_bytes", pages_to_bytes(MEM.rw_pages));
+        append_memacc_dec(p, end, "rx_bytes", pages_to_bytes(MEM.rx_pages));
+        append_memacc_dec(p, end, "ro_bytes", pages_to_bytes(MEM.ro_pages));
+        append_memacc_hex(p, end, "pagemap", reinterpret_cast<uint64_t>(task->pagemap));
+        append_char(p, end, '\n');
+        task->release();
+    }
+
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+auto generate_memacc_dead(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+    uint64_t cpu_count = ker::mod::smt::get_core_count();
+    if (cpu_count == 0) {
+        cpu_count = 1;
+    }
+
+    constexpr size_t BATCH = 64;
+    std::array<uint64_t, BATCH> pids{};
+    std::array<uint32_t, BATCH> refcounts{};
+    for (uint64_t cpu = 0; cpu < cpu_count; ++cpu) {
+        auto const STATS = ker::mod::sched::get_run_queue_stats(cpu);
+        append_sconst(p, end, "queue");
+        append_memacc_dec(p, end, "cpu", cpu);
+        append_memacc_dec(p, end, "run", STATS.active_task_count);
+        append_memacc_dec(p, end, "wait", STATS.wait_queue_count);
+        append_memacc_dec(p, end, "dead", STATS.expired_task_count);
+        append_char(p, end, '\n');
+
+        size_t const DEAD_COUNT = ker::mod::sched::get_dead_task_count(cpu);
+        for (size_t start = 0; start < DEAD_COUNT; start += BATCH) {
+            size_t const ROWS = ker::mod::sched::get_expired_task_refcounts(cpu, pids.data(), refcounts.data(), pids.size(), start);
+            for (size_t i = 0; i < ROWS; ++i) {
+                append_sconst(p, end, "dead_task");
+                append_memacc_dec(p, end, "cpu", cpu);
+                append_memacc_dec(p, end, "pid", pids.at(i));
+                append_memacc_dec(p, end, "refcount", refcounts.at(i));
+                append_char(p, end, '\n');
+            }
+            if (ROWS == 0) {
+                break;
+            }
+        }
+    }
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+auto generate_memacc_alloc_totals(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+
+    ker::mod::mm::phys::AllocStatsSnapshot phys{};
+    ker::mod::mm::phys::get_alloc_stats_snapshot(phys);
+    append_sconst(p, end, "phys");
+    append_memacc_dec(p, end, "total_allocated_bytes", phys.total_allocated_bytes);
+    append_memacc_dec(p, end, "total_freed_bytes", phys.total_freed_bytes);
+    append_memacc_dec(p, end, "live_allocated_bytes", phys.live_allocated_bytes);
+    append_memacc_dec(p, end, "alloc_count", phys.alloc_count);
+    append_memacc_dec(p, end, "free_count", phys.free_count);
+    append_memacc_dec(p, end, "total_mem_bytes", phys.total_mem_bytes);
+    append_memacc_dec(p, end, "free_mem_bytes", phys.free_mem_bytes);
+    append_char(p, end, '\n');
+
+    ker::mod::mm::dyn::kmalloc::KmallocTrackedTotals kmalloc{};
+    ker::mod::mm::dyn::kmalloc::get_tracked_alloc_breakdown(kmalloc);
+    auto const KMALLOC_DEBUG = ker::mod::mm::dyn::kmalloc::debug_info_stats();
+    append_sconst(p, end, "kmalloc");
+    append_memacc_dec(p, end, "medium_count", kmalloc.medium_count);
+    append_memacc_dec(p, end, "medium_bytes", kmalloc.medium_bytes);
+    append_memacc_dec(p, end, "large_count", kmalloc.large_count);
+    append_memacc_dec(p, end, "large_bytes", kmalloc.large_bytes);
+    append_memacc_dec(p, end, "debug_pool_blocks", KMALLOC_DEBUG.block_count);
+    append_memacc_dec(p, end, "debug_pool_bytes", KMALLOC_DEBUG.block_bytes);
+    append_memacc_dec(p, end, "debug_capacity", KMALLOC_DEBUG.capacity);
+    append_memacc_dec(p, end, "debug_active", KMALLOC_DEBUG.active);
+    append_memacc_dec(p, end, "debug_high_water", KMALLOC_DEBUG.high_water);
+    append_memacc_dec(p, end, "debug_dropped", KMALLOC_DEBUG.dropped);
+    append_memacc_dec(p, end, "total_count", kmalloc.medium_count + kmalloc.large_count);
+    append_memacc_dec(p, end, "total_bytes", kmalloc.medium_bytes + kmalloc.large_bytes);
+    append_memacc_dec(p, end, "accounted_bytes", kmalloc.medium_bytes + kmalloc.large_bytes + KMALLOC_DEBUG.block_bytes);
+    append_char(p, end, '\n');
+
+    append_sconst(p, end, "mini_slab");
+    append_memacc_dec(p, end, "total_bytes", ker::mod::mm::mini_malloc::mini_get_total_slab_bytes());
+    append_char(p, end, '\n');
+
+    auto const BCACHE = ker::vfs::buffer_cache_stats();
+    append_sconst(p, end, "buffer_cache");
+    append_memacc_dec(p, end, "buffers", BCACHE.total_buffers);
+    append_memacc_dec(p, end, "dirty_buffers", BCACHE.dirty_buffers);
+    append_memacc_dec(p, end, "total_bytes", BCACHE.total_bytes);
+    append_memacc_dec(p, end, "clean_bytes", BCACHE.clean_bytes);
+    append_memacc_dec(p, end, "dirty_bytes", BCACHE.dirty_bytes);
+    append_memacc_dec(p, end, "max_bytes", BCACHE.max_bytes);
+    append_memacc_dec(p, end, "hits", BCACHE.hits);
+    append_memacc_dec(p, end, "misses", BCACHE.misses);
+    append_char(p, end, '\n');
+
+    auto const FILE_CACHE = ker::syscall::vmem::file_mmap_cache_stats();
+    append_sconst(p, end, "file_cache");
+    append_memacc_dec(p, end, "pages", FILE_CACHE.pages);
+    append_memacc_dec(p, end, "bytes", FILE_CACHE.bytes);
+    append_memacc_dec(p, end, "capacity_pages", FILE_CACHE.capacity_pages);
+    append_char(p, end, '\n');
+
+    auto const ELF_CACHE = ker::net::wki::wki_shared_elf_cache_stats();
+    append_sconst(p, end, "wki_elf_cache");
+    append_memacc_dec(p, end, "entries", ELF_CACHE.entries);
+    append_memacc_dec(p, end, "bytes", ELF_CACHE.bytes);
+    append_memacc_dec(p, end, "max_entries", ELF_CACHE.max_entries);
+    append_memacc_dec(p, end, "max_bytes", ELF_CACHE.max_bytes);
+    append_char(p, end, '\n');
+
+    ker::net::wki::WkiIpcPerfSnapshot ipc{};
+    ker::net::wki::wki_ipc_get_perf_snapshot(ipc);
+    append_sconst(p, end, "wki_ipc");
+    append_memacc_dec(p, end, "exports", ipc.exports);
+    append_memacc_dec(p, end, "proxies", ipc.proxies);
+    append_memacc_dec(p, end, "pump_tasks", ipc.pump_tasks);
+    append_memacc_dec(p, end, "ring_bytes", ipc.proxy_ring_bytes);
+    append_memacc_dec(p, end, "ring_used_bytes", ipc.proxy_ring_used_bytes);
+    append_memacc_dec(p, end, "pending_chunks", ipc.pending_chunks);
+    append_memacc_dec(p, end, "pending_bytes", ipc.pending_bytes);
+    append_memacc_dec(p, end, "export_backlog_bytes", ipc.export_backlog_bytes);
+    append_memacc_dec(p, end, "dev_op_payload_bytes", ipc.dev_op_payload_bytes);
+    append_memacc_dec(p, end, "approx_alloc_bytes", ipc.approx_alloc_bytes);
+    append_char(p, end, '\n');
+
+    ker::vfs::LocalPipePerfSnapshot local_pipe{};
+    ker::vfs::vfs_get_local_pipe_perf_snapshot(local_pipe);
+    append_sconst(p, end, "local_pipe");
+    append_memacc_dec(p, end, "active_pipes", local_pipe.active_pipes);
+    append_memacc_dec(p, end, "created", local_pipe.created_since_reset);
+    append_memacc_dec(p, end, "peak_pipes", local_pipe.peak_pipes);
+    append_memacc_dec(p, end, "capacity_bytes", local_pipe.capacity_bytes);
+    append_memacc_dec(p, end, "buffered_bytes", local_pipe.buffered_bytes);
+    append_memacc_dec(p, end, "reader_waiters", local_pipe.reader_waiters);
+    append_memacc_dec(p, end, "writer_waiters", local_pipe.writer_waiters);
+    append_memacc_dec(p, end, "poll_waiters", local_pipe.poll_waiters);
+    append_memacc_dec(p, end, "approx_alloc_bytes", local_pipe.approx_alloc_bytes);
+    append_char(p, end, '\n');
+
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+auto generate_memacc_slabs(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+
+    constexpr size_t MAX_SLABS = 16;
+    std::array<ker::mod::mm::mini_malloc::MiniSlabStats, MAX_SLABS> slabs{};
+    size_t const ROWS = ker::mod::mm::mini_malloc::mini_collect_slab_stats(slabs.data(), slabs.size());
+    for (size_t i = 0; i < ROWS; ++i) {
+        const auto& slab = slabs.at(i);
+        append_sconst(p, end, "slab");
+        append_memacc_str(p, end, "class", slab.name);
+        append_memacc_dec(p, end, "object_size", slab.object_size);
+        append_memacc_dec(p, end, "slabs", slab.slab_count);
+        append_memacc_dec(p, end, "total_blocks", slab.total_blocks);
+        append_memacc_dec(p, end, "free_blocks", slab.free_blocks);
+        append_memacc_dec(p, end, "used_blocks", slab.total_blocks >= slab.free_blocks ? slab.total_blocks - slab.free_blocks : 0);
+        append_memacc_dec(p, end, "page_bytes", slab.page_bytes);
+        append_memacc_dec(p, end, "used_object_bytes",
+                          (slab.total_blocks >= slab.free_blocks ? slab.total_blocks - slab.free_blocks : 0) * slab.object_size);
+        append_char(p, end, '\n');
+    }
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+auto generate_memacc_kmalloc_live(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+
+    constexpr size_t MAX_ROWS = 2048;
+    auto* rows = new (std::nothrow) ker::mod::mm::dyn::kmalloc::KmallocLiveAlloc[MAX_ROWS];
+    if (rows == nullptr) {
+        append_sconst(p, end, "error file=kmalloc_live reason=oom\n");
+        *p = '\0';
+        return static_cast<size_t>(p - buf);
+    }
+    size_t total_rows = 0;
+    size_t const ROWS = ker::mod::mm::dyn::kmalloc::snapshot_live_allocs(rows, MAX_ROWS, total_rows);
+    for (size_t i = 0; i < ROWS; ++i) {
+        const auto& row = rows[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        append_sconst(p, end, "kmalloc_live");
+        append_memacc_str(p, end, "tier", row.tier);
+        append_memacc_hex(p, end, "addr", row.addr);
+        append_memacc_dec(p, end, "size", row.size);
+        append_memacc_bool(p, end, "has_debug", row.has_debug);
+        if (row.has_debug) {
+            append_memacc_hex(p, end, "caller", row.caller);
+            append_memacc_str(p, end, "tag", row.tag);
+        }
+        append_char(p, end, '\n');
+    }
+    if (ROWS < total_rows) {
+        append_sconst(p, end, "truncated file=kmalloc_live");
+        append_memacc_dec(p, end, "rows", ROWS);
+        append_memacc_dec(p, end, "total_rows", total_rows);
+        append_char(p, end, '\n');
+    }
+    delete[] rows;
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+auto generate_memacc_kmalloc_callers(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+
+    constexpr size_t MAX_ROWS = 512;
+    auto* rows = new (std::nothrow) ker::mod::mm::dyn::kmalloc::KmallocCallerStat[MAX_ROWS];
+    if (rows == nullptr) {
+        append_sconst(p, end, "error file=kmalloc_callers reason=oom\n");
+        *p = '\0';
+        return static_cast<size_t>(p - buf);
+    }
+
+    size_t total_rows = 0;
+    size_t const ROWS = ker::mod::mm::dyn::kmalloc::snapshot_caller_stats(rows, MAX_ROWS, total_rows);
+    for (size_t i = 0; i < ROWS; ++i) {
+        const auto& row = rows[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        append_sconst(p, end, "kmalloc_caller");
+        append_memacc_str(p, end, "tier", row.tier);
+        append_memacc_dec(p, end, "count", row.count);
+        append_memacc_dec(p, end, "bytes", row.bytes);
+        append_memacc_bool(p, end, "has_debug", row.has_debug);
+        if (row.has_debug) {
+            append_memacc_hex(p, end, "caller", row.caller);
+            append_memacc_str(p, end, "tag", row.tag);
+        }
+        append_char(p, end, '\n');
+    }
+    if (ROWS < total_rows) {
+        append_sconst(p, end, "truncated file=kmalloc_callers");
+        append_memacc_dec(p, end, "rows", ROWS);
+        append_memacc_dec(p, end, "total_rows", total_rows);
+        append_char(p, end, '\n');
+    }
+
+    delete[] rows;
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+auto generate_memacc_page_callers(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+
+    append_sconst(p, end, "page_callers_status");
+    append_memacc_bool(p, end, "available", ker::mod::mm::phys::page_caller_stats_available());
+    append_memacc_bool(p, end, "enabled", ker::mod::mm::phys::page_caller_stats_enabled());
+    append_memacc_dec(p, end, "generation", ker::mod::mm::phys::page_caller_stats_generation());
+    append_memacc_str(p, end, "mode", "live");
+    append_char(p, end, '\n');
+
+    constexpr size_t MAX_ROWS = 64;
+    std::array<ker::mod::mm::phys::CallerPageStat, MAX_ROWS> rows{};
+    size_t total_rows = 0;
+    if (ker::mod::mm::phys::snapshot_page_caller_stats(rows.data(), rows.size(), total_rows)) {
+        size_t const ROWS = std::min(total_rows, rows.size());
+        for (size_t i = 0; i < ROWS; ++i) {
+            const auto& row = rows.at(i);
+            append_sconst(p, end, "page_caller");
+            append_memacc_hex(p, end, "caller", row.caller);
+            append_memacc_dec(p, end, "pages", row.pages);
+            append_memacc_dec(p, end, "bytes", pages_to_bytes(row.pages));
+            append_char(p, end, '\n');
+        }
+        if (ROWS < total_rows) {
+            append_sconst(p, end, "truncated file=page_callers");
+            append_memacc_dec(p, end, "rows", ROWS);
+            append_memacc_dec(p, end, "total_rows", total_rows);
+            append_char(p, end, '\n');
+        }
+    }
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+auto generate_memacc_features(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+
+    append_memacc_feature_row(p, end, "page_callers", ker::mod::mm::phys::page_caller_stats_available(),
+                              ker::mod::mm::phys::page_caller_stats_enabled(), ker::mod::mm::phys::page_caller_stats_default_enabled(),
+                              ker::mod::mm::phys::page_caller_stats_generation());
+    append_memacc_feature_row(p, end, "kmalloc_debug", ker::mod::mm::dyn::kmalloc::debug_info_available(),
+                              ker::mod::mm::dyn::kmalloc::debug_info_enabled(), ker::mod::mm::dyn::kmalloc::debug_info_default_enabled(),
+                              ker::mod::mm::dyn::kmalloc::debug_info_generation());
+    auto const KMALLOC_DEBUG = ker::mod::mm::dyn::kmalloc::debug_info_stats();
+    append_sconst(p, end, "kmalloc_debug_pool");
+    append_memacc_dec(p, end, "blocks", KMALLOC_DEBUG.block_count);
+    append_memacc_dec(p, end, "bytes", KMALLOC_DEBUG.block_bytes);
+    append_memacc_dec(p, end, "capacity", KMALLOC_DEBUG.capacity);
+    append_memacc_dec(p, end, "active", KMALLOC_DEBUG.active);
+    append_memacc_dec(p, end, "high_water", KMALLOC_DEBUG.high_water);
+    append_memacc_dec(p, end, "dropped", KMALLOC_DEBUG.dropped);
+    append_char(p, end, '\n');
+
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+auto generate_memacc_track_state(ProcNodeType type, char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+    if (type == ProcNodeType::MEMACC_TRACK_PAGE_CALLERS_FILE) {
+        append_memacc_feature_row(p, end, "page_callers", ker::mod::mm::phys::page_caller_stats_available(),
+                                  ker::mod::mm::phys::page_caller_stats_enabled(), ker::mod::mm::phys::page_caller_stats_default_enabled(),
+                                  ker::mod::mm::phys::page_caller_stats_generation());
+    } else {
+        append_memacc_feature_row(
+            p, end, "kmalloc_debug", ker::mod::mm::dyn::kmalloc::debug_info_available(), ker::mod::mm::dyn::kmalloc::debug_info_enabled(),
+            ker::mod::mm::dyn::kmalloc::debug_info_default_enabled(), ker::mod::mm::dyn::kmalloc::debug_info_generation());
+        auto const KMALLOC_DEBUG = ker::mod::mm::dyn::kmalloc::debug_info_stats();
+        append_sconst(p, end, "kmalloc_debug_pool");
+        append_memacc_dec(p, end, "blocks", KMALLOC_DEBUG.block_count);
+        append_memacc_dec(p, end, "bytes", KMALLOC_DEBUG.block_bytes);
+        append_memacc_dec(p, end, "capacity", KMALLOC_DEBUG.capacity);
+        append_memacc_dec(p, end, "active", KMALLOC_DEBUG.active);
+        append_memacc_dec(p, end, "high_water", KMALLOC_DEBUG.high_water);
+        append_memacc_dec(p, end, "dropped", KMALLOC_DEBUG.dropped);
+        append_char(p, end, '\n');
+    }
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+auto generate_memacc_reclaim_buffer_cache(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+    auto const BCACHE = ker::vfs::buffer_cache_stats();
+    append_sconst(p, end, "reclaim");
+    append_memacc_str(p, end, "name", "buffer_cache");
+    append_memacc_dec(p, end, "total_bytes", BCACHE.total_bytes);
+    append_memacc_dec(p, end, "clean_bytes", BCACHE.clean_bytes);
+    append_memacc_dec(p, end, "dirty_bytes", BCACHE.dirty_bytes);
+    append_memacc_dec(p, end, "buffers", BCACHE.total_buffers);
+    append_memacc_dec(p, end, "dirty_buffers", BCACHE.dirty_buffers);
+    append_memacc_dec(p, end, "default_target_bytes", 0);
+    append_char(p, end, '\n');
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+auto generate_memacc_reclaim_packet_pool(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+    auto const POOL = ker::net::pkt_pool_snapshot();
+    append_sconst(p, end, "reclaim");
+    append_memacc_str(p, end, "name", "packet_pool");
+    append_memacc_dec(p, end, "capacity", POOL.capacity);
+    append_memacc_dec(p, end, "baseline_capacity", POOL.baseline_capacity);
+    append_memacc_dec(p, end, "active_capacity", POOL.active_capacity);
+    append_memacc_dec(p, end, "free", POOL.free);
+    append_memacc_dec(p, end, "used", POOL.used);
+    append_memacc_dec(p, end, "draining_buffers", POOL.draining_buffers);
+    append_memacc_dec(p, end, "draining_free", POOL.draining_free);
+    append_memacc_dec(p, end, "buffer_size", POOL.buffer_size);
+    append_memacc_dec(p, end, "object_size", POOL.object_size);
+    append_memacc_dec(p, end, "total_bytes", POOL.capacity * POOL.object_size);
+    append_memacc_dec(p, end, "active_bytes", POOL.active_capacity * POOL.object_size);
+    append_memacc_dec(p, end, "free_bytes", POOL.free * POOL.object_size);
+    append_memacc_dec(p, end, "used_bytes", POOL.used * POOL.object_size);
+    append_memacc_dec(p, end, "draining_bytes", POOL.draining_buffers * POOL.object_size);
+    append_memacc_dec(p, end, "draining_free_bytes", POOL.draining_free * POOL.object_size);
+    append_memacc_dec(p, end, "rx_reserve", POOL.rx_reserve);
+    append_memacc_dec(p, end, "grow_chunk", POOL.grow_chunk);
+    append_memacc_dec(p, end, "default_target_capacity", std::max(POOL.baseline_capacity, POOL.used + POOL.rx_reserve + POOL.grow_chunk));
+    append_char(p, end, '\n');
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
 void append_virtqueue_diag(char*& p, const char* end, const char* prefix, const ker::dev::virtio::VirtqueueDiagSnapshot& q) {
     append_char(p, end, ' ');
     append_sconst(p, end, prefix);
@@ -1121,10 +2218,18 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
     auto pool = ker::net::pkt_pool_snapshot();
     append_sconst(p, end, "packet_pool capacity=");
     append_dec64(p, end, pool.capacity);
+    append_sconst(p, end, " baseline=");
+    append_dec64(p, end, pool.baseline_capacity);
+    append_sconst(p, end, " active_capacity=");
+    append_dec64(p, end, pool.active_capacity);
     append_sconst(p, end, " free=");
     append_dec64(p, end, pool.free);
     append_sconst(p, end, " used=");
     append_dec64(p, end, pool.used);
+    append_sconst(p, end, " draining=");
+    append_dec64(p, end, pool.draining_buffers);
+    append_sconst(p, end, " draining_free=");
+    append_dec64(p, end, pool.draining_free);
     append_sconst(p, end, " rx_reserve=");
     append_dec64(p, end, pool.rx_reserve);
     append_sconst(p, end, " grow_chunk=");
@@ -1416,9 +2521,9 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
     char* p = buf;
     char* end = buf + bufsz - 1;
 
-    ker::mod::perf::PerfEvent batch[64];
+    std::array<ker::mod::perf::PerfEvent, 64> batch{};
     size_t n = 0;
-    while ((n = ker::mod::perf::drain_events(batch, 64, UINT32_MAX)) > 0) {
+    while ((n = ker::mod::perf::drain_events(batch.data(), 64, UINT32_MAX)) > 0) {
         for (size_t i = 0; i < n; ++i) {
             const auto& ev = batch[i];
             // Determine event letter
@@ -1634,10 +2739,20 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     if (pfd->content == nullptr) {
         constexpr size_t MAX_PROCFS_BUF = 4096;
         constexpr size_t MAX_KPERF_BUF = 65536;  // 64 KiB for event streams
+        constexpr size_t MAX_MEMACC_BUF = 262144;
         bool const IS_KPERF = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KWKISTAT_FILE ||
                                pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCONTSTAT_FILE ||
-                               pfd->node.type == ProcNodeType::KIPCSTAT_FILE || pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE);
-        size_t const ALLOC_SZ = IS_KPERF ? MAX_KPERF_BUF : MAX_PROCFS_BUF;
+                               pfd->node.type == ProcNodeType::KIPCSTAT_FILE || pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE ||
+                               pfd->node.type == ProcNodeType::CPU_STAT_FILE);
+        bool const IS_MEMACC =
+            (pfd->node.type == ProcNodeType::MEMACC_SUMMARY_FILE || pfd->node.type == ProcNodeType::MEMACC_ZONES_FILE ||
+             pfd->node.type == ProcNodeType::MEMACC_PROCS_FILE || pfd->node.type == ProcNodeType::MEMACC_DEAD_FILE ||
+             pfd->node.type == ProcNodeType::MEMACC_ALLOC_TOTALS_FILE || pfd->node.type == ProcNodeType::MEMACC_SLABS_FILE ||
+             pfd->node.type == ProcNodeType::MEMACC_KMALLOC_LIVE_FILE || pfd->node.type == ProcNodeType::MEMACC_KMALLOC_CALLERS_FILE ||
+             pfd->node.type == ProcNodeType::MEMACC_PAGE_CALLERS_FILE || pfd->node.type == ProcNodeType::MEMACC_FEATURES_FILE ||
+             pfd->node.type == ProcNodeType::MEMACC_RECLAIM_BUFFER_CACHE_FILE ||
+             pfd->node.type == ProcNodeType::MEMACC_RECLAIM_PACKET_POOL_FILE);
+        size_t const ALLOC_SZ = IS_MEMACC ? MAX_MEMACC_BUF : (IS_KPERF ? MAX_KPERF_BUF : MAX_PROCFS_BUF);
         pfd->content = new (std::nothrow) char[ALLOC_SZ];
         if (pfd->content == nullptr) {
             return -ENOMEM;
@@ -1650,6 +2765,9 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             case ProcNodeType::STAT_FILE:
                 pfd->content_len = generate_stat(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
                 break;
+            case ProcNodeType::STATM_FILE:
+                pfd->content_len = generate_statm(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
+                break;
             case ProcNodeType::CMDLINE_FILE:
                 pfd->content_len = generate_cmdline(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
                 break;
@@ -1658,6 +2776,15 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 break;
             case ProcNodeType::UPTIME_FILE:
                 pfd->content_len = generate_uptime(pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::CPU_STAT_FILE:
+                pfd->content_len = generate_cpu_stat(pfd->content, MAX_KPERF_BUF);
+                break;
+            case ProcNodeType::LOADAVG_FILE:
+                pfd->content_len = generate_loadavg(pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::MEMINFO_FILE:
+                pfd->content_len = generate_meminfo(pfd->content, MAX_PROCFS_BUF);
                 break;
             case ProcNodeType::VERSION_FILE:
                 pfd->content_len = generate_version(pfd->content, MAX_PROCFS_BUF);
@@ -1695,8 +2822,48 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             case ProcNodeType::WKI_NETDIAG_FILE:
                 pfd->content_len = generate_wki_netdiag(pfd->content, MAX_KPERF_BUF);
                 break;
+            case ProcNodeType::MEMACC_SUMMARY_FILE:
+                pfd->content_len = generate_memacc_summary(pfd->content, MAX_MEMACC_BUF);
+                break;
+            case ProcNodeType::MEMACC_ZONES_FILE:
+                pfd->content_len = generate_memacc_zones(pfd->content, MAX_MEMACC_BUF);
+                break;
+            case ProcNodeType::MEMACC_PROCS_FILE:
+                pfd->content_len = generate_memacc_procs(pfd->content, MAX_MEMACC_BUF);
+                break;
+            case ProcNodeType::MEMACC_DEAD_FILE:
+                pfd->content_len = generate_memacc_dead(pfd->content, MAX_MEMACC_BUF);
+                break;
+            case ProcNodeType::MEMACC_ALLOC_TOTALS_FILE:
+                pfd->content_len = generate_memacc_alloc_totals(pfd->content, MAX_MEMACC_BUF);
+                break;
+            case ProcNodeType::MEMACC_SLABS_FILE:
+                pfd->content_len = generate_memacc_slabs(pfd->content, MAX_MEMACC_BUF);
+                break;
+            case ProcNodeType::MEMACC_KMALLOC_LIVE_FILE:
+                pfd->content_len = generate_memacc_kmalloc_live(pfd->content, MAX_MEMACC_BUF);
+                break;
+            case ProcNodeType::MEMACC_KMALLOC_CALLERS_FILE:
+                pfd->content_len = generate_memacc_kmalloc_callers(pfd->content, MAX_MEMACC_BUF);
+                break;
+            case ProcNodeType::MEMACC_PAGE_CALLERS_FILE:
+                pfd->content_len = generate_memacc_page_callers(pfd->content, MAX_MEMACC_BUF);
+                break;
+            case ProcNodeType::MEMACC_FEATURES_FILE:
+                pfd->content_len = generate_memacc_features(pfd->content, MAX_MEMACC_BUF);
+                break;
+            case ProcNodeType::MEMACC_TRACK_PAGE_CALLERS_FILE:
+            case ProcNodeType::MEMACC_TRACK_KMALLOC_DEBUG_FILE:
+                pfd->content_len = generate_memacc_track_state(pfd->node.type, pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::MEMACC_RECLAIM_BUFFER_CACHE_FILE:
+                pfd->content_len = generate_memacc_reclaim_buffer_cache(pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::MEMACC_RECLAIM_PACKET_POOL_FILE:
+                pfd->content_len = generate_memacc_reclaim_packet_pool(pfd->content, MAX_PROCFS_BUF);
+                break;
             case ProcNodeType::EXE_LINK: {
-                auto* task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
+                auto* task = ker::mod::sched::find_task_by_pid_safe(pfd->node.pid);
                 if (task != nullptr && task->exe_path[0] != '\0') {
                     size_t const LEN = strlen(task->exe_path.data());
                     memcpy(pfd->content, task->exe_path.data(), LEN);
@@ -1706,6 +2873,9 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                     pfd->content[0] = '\0';
                     pfd->content_len = 0;
                 }
+                if (task != nullptr) {
+                    task->release();
+                }
                 break;
             }
             default:
@@ -1713,6 +2883,22 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 pfd->content_len = 0;
                 break;
         }
+    }
+
+    auto requires_live_task_content = [](ProcNodeType type) -> bool {
+        switch (type) {
+            case ProcNodeType::STATUS_FILE:
+            case ProcNodeType::STAT_FILE:
+            case ProcNodeType::STATM_FILE:
+                return true;
+            default:
+                return false;
+        }
+    };
+    if (pfd->content_len == 0 && requires_live_task_content(pfd->node.type)) {
+        delete[] pfd->content;
+        pfd->content = nullptr;
+        return -ESRCH;
     }
 
     if (offset >= pfd->content_len) {
@@ -1724,11 +2910,161 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     return static_cast<ssize_t>(count);
 }
 
+auto procfs_ascii_space(char c) -> bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+
+auto procfs_command_equals(const char* s, size_t count, const char* expected) -> bool {
+    while (count > 0 && procfs_ascii_space(*s)) {
+        s++;
+        count--;
+    }
+    while (count > 0 && procfs_ascii_space(s[count - 1])) {
+        count--;
+    }
+
+    size_t expected_len = 0;
+    while (expected[expected_len] != '\0') {
+        expected_len++;
+    }
+    if (count != expected_len) {
+        return false;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        char lhs = s[i];
+        char rhs = expected[i];
+        if (lhs >= 'A' && lhs <= 'Z') {
+            lhs = static_cast<char>(lhs - 'A' + 'a');
+        }
+        if (rhs >= 'A' && rhs <= 'Z') {
+            rhs = static_cast<char>(rhs - 'A' + 'a');
+        }
+        if (lhs != rhs) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto procfs_parse_u64_trimmed(const char* s, size_t count, uint64_t& out) -> bool {
+    while (count > 0 && procfs_ascii_space(*s)) {
+        s++;
+        count--;
+    }
+    while (count > 0 && procfs_ascii_space(s[count - 1])) {
+        count--;
+    }
+    if (count == 0) {
+        return false;
+    }
+
+    uint64_t value = 0;
+    for (size_t i = 0; i < count; ++i) {
+        char const CH = s[i];
+        if (CH < '0' || CH > '9') {
+            return false;
+        }
+        auto const DIGIT = static_cast<uint64_t>(CH - '0');
+        if (value > (UINT64_MAX - DIGIT) / 10) {
+            return false;
+        }
+        value = (value * 10) + DIGIT;
+    }
+    out = value;
+    return true;
+}
+
+auto procfs_write_memacc_track(ProcNodeType type, const char* s, size_t count) -> ssize_t {
+    bool const PAGE_CALLERS = type == ProcNodeType::MEMACC_TRACK_PAGE_CALLERS_FILE;
+    bool const AVAILABLE =
+        PAGE_CALLERS ? ker::mod::mm::phys::page_caller_stats_available() : ker::mod::mm::dyn::kmalloc::debug_info_available();
+    if (!AVAILABLE) {
+        return -ENOTSUP;
+    }
+
+    if (procfs_command_equals(s, count, "on") || procfs_command_equals(s, count, "1")) {
+        if (PAGE_CALLERS) {
+            ker::mod::mm::phys::page_caller_stats_reset();
+            ker::mod::mm::phys::page_caller_stats_set_enabled(true);
+        } else {
+            ker::mod::mm::dyn::kmalloc::debug_info_reset();
+            ker::mod::mm::dyn::kmalloc::debug_info_set_enabled(true);
+        }
+    } else if (procfs_command_equals(s, count, "off") || procfs_command_equals(s, count, "0")) {
+        if (PAGE_CALLERS) {
+            ker::mod::mm::phys::page_caller_stats_set_enabled(false);
+        } else {
+            ker::mod::mm::dyn::kmalloc::debug_info_set_enabled(false);
+        }
+    } else if (procfs_command_equals(s, count, "reset")) {
+        if (PAGE_CALLERS) {
+            ker::mod::mm::phys::page_caller_stats_reset();
+        } else {
+            ker::mod::mm::dyn::kmalloc::debug_info_reset();
+        }
+    } else if (procfs_command_equals(s, count, "status")) {
+        // No-op convenience for scripts that use one path for reads and writes.
+    } else {
+        return -EINVAL;
+    }
+
+    return static_cast<ssize_t>(count);
+}
+
+auto procfs_write_memacc_reclaim_buffer_cache(const char* s, size_t count) -> ssize_t {
+    if (count == 0) {
+        return 0;
+    }
+
+    uint64_t target_bytes = 0;
+    if (procfs_command_equals(s, count, "drop") || procfs_command_equals(s, count, "all") || procfs_command_equals(s, count, "reset")) {
+        target_bytes = 0;
+    } else if (procfs_command_equals(s, count, "status")) {
+        return static_cast<ssize_t>(count);
+    } else if (!procfs_parse_u64_trimmed(s, count, target_bytes)) {
+        return -EINVAL;
+    }
+
+    if (target_bytes > static_cast<uint64_t>(SIZE_MAX)) {
+        return -EOVERFLOW;
+    }
+    ker::vfs::reclaim_clean_buffer_cache(static_cast<size_t>(target_bytes));
+    return static_cast<ssize_t>(count);
+}
+
+auto procfs_write_memacc_reclaim_packet_pool(const char* s, size_t count) -> ssize_t {
+    if (count == 0) {
+        return 0;
+    }
+
+    uint64_t target_capacity = 0;
+    if (procfs_command_equals(s, count, "drop") || procfs_command_equals(s, count, "all") || procfs_command_equals(s, count, "reset")) {
+        target_capacity = 0;
+    } else if (procfs_command_equals(s, count, "status")) {
+        return static_cast<ssize_t>(count);
+    } else if (!procfs_parse_u64_trimmed(s, count, target_capacity)) {
+        return -EINVAL;
+    }
+
+    if (target_capacity > static_cast<uint64_t>(SIZE_MAX)) {
+        return -EOVERFLOW;
+    }
+    ker::net::pkt_pool_reclaim_free(static_cast<size_t>(target_capacity));
+    return static_cast<ssize_t>(count);
+}
+
 auto procfs_write(File* f, const void* buf, size_t count, size_t /*offset*/) -> ssize_t {
     if (f == nullptr || f->private_data == nullptr || buf == nullptr) {
         return -EINVAL;
     }
     auto* pfd = static_cast<ProcFileData*>(f->private_data);
+    if (pfd->node.type == ProcNodeType::MEMACC_TRACK_PAGE_CALLERS_FILE || pfd->node.type == ProcNodeType::MEMACC_TRACK_KMALLOC_DEBUG_FILE) {
+        return procfs_write_memacc_track(pfd->node.type, static_cast<const char*>(buf), count);
+    }
+    if (pfd->node.type == ProcNodeType::MEMACC_RECLAIM_BUFFER_CACHE_FILE) {
+        return procfs_write_memacc_reclaim_buffer_cache(static_cast<const char*>(buf), count);
+    }
+    if (pfd->node.type == ProcNodeType::MEMACC_RECLAIM_PACKET_POOL_FILE) {
+        return procfs_write_memacc_reclaim_packet_pool(static_cast<const char*>(buf), count);
+    }
     if (pfd->node.type != ProcNodeType::KPERFCTL_FILE) {
         return -EPERM;
     }
@@ -1925,9 +3261,9 @@ auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id) -> int {
     }
 
     auto* pfd = static_cast<ProcFileData*>(f->private_data);
-    const ker::mod::sched::task::Task* owner_task = nullptr;
+    auto* owner_task = static_cast<ker::mod::sched::task::Task*>(nullptr);
     if (pfd->node.pid != 0) {
-        owner_task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
+        owner_task = ker::mod::sched::find_task_by_pid_safe(pfd->node.pid);
     }
 
     std::memset(statbuf, 0, sizeof(Stat));
@@ -1945,11 +3281,19 @@ auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id) -> int {
         statbuf->st_mode = S_IFDIR | 0555;
     } else if (pfd->node.type == ProcNodeType::EXE_LINK || pfd->node.type == ProcNodeType::SELF_LINK) {
         statbuf->st_mode = S_IFLNK | 0777;
+    } else if (pfd->node.type == ProcNodeType::KPERFCTL_FILE || pfd->node.type == ProcNodeType::MEMACC_TRACK_PAGE_CALLERS_FILE ||
+               pfd->node.type == ProcNodeType::MEMACC_TRACK_KMALLOC_DEBUG_FILE ||
+               pfd->node.type == ProcNodeType::MEMACC_RECLAIM_BUFFER_CACHE_FILE ||
+               pfd->node.type == ProcNodeType::MEMACC_RECLAIM_PACKET_POOL_FILE) {
+        statbuf->st_mode = S_IFREG | 0644;
     } else {
         statbuf->st_mode = S_IFREG | 0444;
     }
 
     set_stat_timestamps(statbuf, procfs_node_creation_epoch_ns(owner_task));
+    if (owner_task != nullptr) {
+        owner_task->release();
+    }
     return 0;
 }
 
@@ -1988,6 +3332,14 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
         f->fops = nullptr;  // set by caller
         return f;
     };
+    auto pid_exists = [](uint64_t pid) -> bool {
+        auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
+        if (task == nullptr) {
+            return false;
+        }
+        task->release();
+        return true;
+    };
 
     // /proc (root)
     if (*path == '\0') {
@@ -2002,6 +3354,21 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     // /proc/uptime
     if (strcmp(path, "uptime") == 0) {
         return make_file(ProcNodeType::UPTIME_FILE, 0, false);
+    }
+
+    // /proc/stat
+    if (strcmp(path, "stat") == 0) {
+        return make_file(ProcNodeType::CPU_STAT_FILE, 0, false);
+    }
+
+    // /proc/loadavg
+    if (strcmp(path, "loadavg") == 0) {
+        return make_file(ProcNodeType::LOADAVG_FILE, 0, false);
+    }
+
+    // /proc/meminfo
+    if (strcmp(path, "meminfo") == 0) {
+        return make_file(ProcNodeType::MEMINFO_FILE, 0, false);
     }
 
     // /proc/version
@@ -2054,6 +3421,59 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
         return make_file(ProcNodeType::WKI_NETDIAG_FILE, 0, false);
     }
 
+    // /proc/memacc structured memory accounting diagnostics
+    if (strcmp(path, "memacc") == 0) {
+        return make_file(ProcNodeType::MEMACC_DIR, 0, true);
+    }
+    if (strcmp(path, "memacc/summary") == 0) {
+        return make_file(ProcNodeType::MEMACC_SUMMARY_FILE, 0, false);
+    }
+    if (strcmp(path, "memacc/zones") == 0) {
+        return make_file(ProcNodeType::MEMACC_ZONES_FILE, 0, false);
+    }
+    if (strcmp(path, "memacc/procs") == 0) {
+        return make_file(ProcNodeType::MEMACC_PROCS_FILE, 0, false);
+    }
+    if (strcmp(path, "memacc/dead") == 0) {
+        return make_file(ProcNodeType::MEMACC_DEAD_FILE, 0, false);
+    }
+    if (strcmp(path, "memacc/alloc_totals") == 0) {
+        return make_file(ProcNodeType::MEMACC_ALLOC_TOTALS_FILE, 0, false);
+    }
+    if (strcmp(path, "memacc/slabs") == 0) {
+        return make_file(ProcNodeType::MEMACC_SLABS_FILE, 0, false);
+    }
+    if (strcmp(path, "memacc/kmalloc_live") == 0) {
+        return make_file(ProcNodeType::MEMACC_KMALLOC_LIVE_FILE, 0, false);
+    }
+    if (strcmp(path, "memacc/kmalloc_callers") == 0) {
+        return make_file(ProcNodeType::MEMACC_KMALLOC_CALLERS_FILE, 0, false);
+    }
+    if (strcmp(path, "memacc/page_callers") == 0) {
+        return make_file(ProcNodeType::MEMACC_PAGE_CALLERS_FILE, 0, false);
+    }
+    if (strcmp(path, "memacc/features") == 0) {
+        return make_file(ProcNodeType::MEMACC_FEATURES_FILE, 0, false);
+    }
+    if (strcmp(path, "memacc/track") == 0) {
+        return make_file(ProcNodeType::MEMACC_TRACK_DIR, 0, true);
+    }
+    if (strcmp(path, "memacc/reclaim") == 0) {
+        return make_file(ProcNodeType::MEMACC_RECLAIM_DIR, 0, true);
+    }
+    if (strcmp(path, "memacc/track/page_callers") == 0) {
+        return make_file(ProcNodeType::MEMACC_TRACK_PAGE_CALLERS_FILE, 0, false);
+    }
+    if (strcmp(path, "memacc/track/kmalloc_debug") == 0) {
+        return make_file(ProcNodeType::MEMACC_TRACK_KMALLOC_DEBUG_FILE, 0, false);
+    }
+    if (strcmp(path, "memacc/reclaim/buffer_cache") == 0) {
+        return make_file(ProcNodeType::MEMACC_RECLAIM_BUFFER_CACHE_FILE, 0, false);
+    }
+    if (strcmp(path, "memacc/reclaim/packet_pool") == 0) {
+        return make_file(ProcNodeType::MEMACC_RECLAIM_PACKET_POOL_FILE, 0, false);
+    }
+
     // /proc/self -> symlink to /proc/<pid>
     if (strcmp(path, "self") == 0) {
         return make_file(ProcNodeType::SELF_LINK, SELF_PID, false);
@@ -2069,6 +3489,10 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     // /proc/self/stat
     if (strcmp(path, "self/stat") == 0) {
         return make_file(ProcNodeType::STAT_FILE, SELF_PID, false);
+    }
+    // /proc/self/statm
+    if (strcmp(path, "self/statm") == 0) {
+        return make_file(ProcNodeType::STATM_FILE, SELF_PID, false);
     }
     // /proc/self/cmdline
     if (strcmp(path, "self/cmdline") == 0) {
@@ -2104,7 +3528,7 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
             return nullptr;
         }
         // Check if task exists
-        if (ker::mod::sched::find_task_by_pid(static_cast<uint64_t>(PID)) == nullptr) {
+        if (!pid_exists(static_cast<uint64_t>(PID))) {
             return nullptr;
         }
         return make_file(ProcNodeType::PID_DIR, static_cast<uint64_t>(PID), true);
@@ -2122,7 +3546,7 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     if (PID < 0) {
         return nullptr;
     }
-    if (ker::mod::sched::find_task_by_pid(static_cast<uint64_t>(PID)) == nullptr) {
+    if (!pid_exists(static_cast<uint64_t>(PID))) {
         return nullptr;
     }
 
@@ -2135,6 +3559,9 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     }
     if (strcmp(sub, "stat") == 0) {
         return make_file(ProcNodeType::STAT_FILE, static_cast<uint64_t>(PID), false);
+    }
+    if (strcmp(sub, "statm") == 0) {
+        return make_file(ProcNodeType::STATM_FILE, static_cast<uint64_t>(PID), false);
     }
     if (strcmp(sub, "cmdline") == 0) {
         return make_file(ProcNodeType::CMDLINE_FILE, static_cast<uint64_t>(PID), false);

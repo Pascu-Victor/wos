@@ -1,5 +1,6 @@
 #include "kmalloc.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -64,14 +65,17 @@ inline auto get_current_cpu_id() -> uint64_t {
 constexpr uint64_t SLAB_MAX_SIZE = 0x800;     // 2KB - maximum size mini_malloc handles
 constexpr uint64_t MEDIUM_MAX_SIZE = 0xFFFF;  // ~64KB - maximum size for medium allocations
 
+#ifdef WOS_KMALLOC_DEBUG_INFO
+struct AllocDebugInfo;
+#endif
+
 // Medium allocation header for sizes 0x801 - 0xFFFF
 struct alignas(MEMORY_ALIGNMENT) MediumAllocationHeader {
     MediumAllocationHeader* next;
     uint64_t size;   // Total allocation size including header
     uint64_t magic;  // For validation
 #ifdef WOS_KMALLOC_DEBUG_INFO
-    uint32_t debug_idx;  // Index into s_alloc_debug (0 = none)
-    uint32_t pad;
+    AllocDebugInfo* debug_info;
 #else
     uint64_t pad;  // Pad to 32 bytes so (header + 1) is 16-byte aligned
 #endif
@@ -86,8 +90,7 @@ struct alignas(MEMORY_ALIGNMENT) LargeAllocationHeader {
     uint64_t size;
     uint64_t magic;  // For validation
 #ifdef WOS_KMALLOC_DEBUG_INFO
-    uint32_t debug_idx;  // Index into s_alloc_debug (0 = none)
-    uint32_t pad;
+    AllocDebugInfo* debug_info;
 #else
     uint64_t pad;  // Pad to 32 bytes so (header + 1) is 16-byte aligned
 #endif
@@ -107,25 +110,145 @@ LargeAllocationHeader* large_alloc_list = nullptr;
 sys::Spinlock large_alloc_lock;
 
 #ifdef WOS_KMALLOC_DEBUG_INFO
-// Per-allocation debug side-table.  Stored in .bss so it is always available during OOM.
-// Index 0 is a sentinel meaning "no info".  The counter never wraps back — once full,
-// new allocations silently get index 0.  64 KB total when explicitly enabled.
 struct AllocDebugInfo {
     uintptr_t caller;  // return address captured at the kmalloc call site
     const char* tag;   // compile-time string (type name or "::new"), may be null
+    uint32_t generation;
+    AllocDebugInfo* next_free;
 };
-constexpr uint32_t ALLOC_DEBUG_NONE = 0;
-constexpr size_t ALLOC_DEBUG_MAX = 4096;
-__attribute__((section(".bss"))) std::array<AllocDebugInfo, ALLOC_DEBUG_MAX> s_alloc_debug{};
-std::atomic<uint32_t> s_alloc_debug_next{1};
 
-auto register_alloc_debug(uintptr_t caller, const char* tag) -> uint32_t {
-    uint32_t const SLOT = s_alloc_debug_next.fetch_add(1, std::memory_order_relaxed);
-    if (SLOT >= ALLOC_DEBUG_MAX) {
-        return ALLOC_DEBUG_NONE;
+struct AllocDebugBlock {
+    AllocDebugBlock* next;
+    uint32_t capacity;
+};
+
+constexpr size_t ALLOC_DEBUG_BLOCK_BYTES = ker::mod::mm::paging::PAGE_SIZE;
+constexpr uint32_t ALLOC_DEBUG_BLOCK_ENTRIES =
+    static_cast<uint32_t>((ALLOC_DEBUG_BLOCK_BYTES - sizeof(AllocDebugBlock)) / sizeof(AllocDebugInfo));
+static_assert(ALLOC_DEBUG_BLOCK_ENTRIES > 0, "kmalloc debug block must fit at least one entry");
+
+sys::Spinlock s_alloc_debug_lock;
+AllocDebugBlock* s_alloc_debug_blocks = nullptr;
+AllocDebugInfo* s_alloc_debug_free_list = nullptr;
+std::atomic<uint32_t> s_alloc_debug_generation{1};
+std::atomic<bool> s_alloc_debug_enabled{true};
+std::atomic<uint64_t> s_alloc_debug_block_count{0};
+std::atomic<uint64_t> s_alloc_debug_capacity{0};
+std::atomic<uint64_t> s_alloc_debug_active{0};
+std::atomic<uint64_t> s_alloc_debug_high_water{0};
+std::atomic<uint64_t> s_alloc_debug_dropped{0};
+
+auto current_debug_generation() -> uint32_t { return s_alloc_debug_generation.load(std::memory_order_acquire); }
+
+auto debug_block_entries(AllocDebugBlock* block) -> AllocDebugInfo* { return reinterpret_cast<AllocDebugInfo*>(block + 1); }
+
+void update_debug_high_water(uint64_t active) {
+    uint64_t observed = s_alloc_debug_high_water.load(std::memory_order_relaxed);
+    while (active > observed && !s_alloc_debug_high_water.compare_exchange_weak(observed, active, std::memory_order_relaxed)) {
     }
-    s_alloc_debug[SLOT] = {.caller = caller, .tag = tag};
-    return SLOT;
+}
+
+void push_debug_block_locked(AllocDebugBlock* block) {
+    block->capacity = ALLOC_DEBUG_BLOCK_ENTRIES;
+    block->next = s_alloc_debug_blocks;
+    s_alloc_debug_blocks = block;
+
+    auto* entries = debug_block_entries(block);
+    for (uint32_t i = 0; i < ALLOC_DEBUG_BLOCK_ENTRIES; ++i) {
+        entries[i] = AllocDebugInfo{.caller = 0, .tag = nullptr, .generation = 0, .next_free = s_alloc_debug_free_list};
+        s_alloc_debug_free_list = &entries[i];
+    }
+
+    s_alloc_debug_block_count.fetch_add(1, std::memory_order_relaxed);
+    s_alloc_debug_capacity.fetch_add(ALLOC_DEBUG_BLOCK_ENTRIES, std::memory_order_relaxed);
+}
+
+auto pop_debug_slot_locked() -> AllocDebugInfo* {
+    AllocDebugInfo* info = s_alloc_debug_free_list;
+    if (info != nullptr) {
+        s_alloc_debug_free_list = info->next_free;
+        info->next_free = nullptr;
+    }
+    return info;
+}
+
+auto allocate_debug_block() -> AllocDebugBlock* { return static_cast<AllocDebugBlock*>(phys::page_alloc(ALLOC_DEBUG_BLOCK_BYTES)); }
+
+auto register_alloc_debug(uintptr_t caller, const char* tag) -> AllocDebugInfo* {
+    if (!s_alloc_debug_enabled.load(std::memory_order_relaxed)) {
+        return nullptr;
+    }
+
+    AllocDebugInfo* info = nullptr;
+    uint64_t flags = s_alloc_debug_lock.lock_irqsave();
+    info = pop_debug_slot_locked();
+    s_alloc_debug_lock.unlock_irqrestore(flags);
+
+    if (info == nullptr) {
+        AllocDebugBlock* block = allocate_debug_block();
+        if (block == nullptr) {
+            s_alloc_debug_dropped.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
+        }
+
+        flags = s_alloc_debug_lock.lock_irqsave();
+        push_debug_block_locked(block);
+        info = pop_debug_slot_locked();
+        s_alloc_debug_lock.unlock_irqrestore(flags);
+    }
+
+    if (info == nullptr) {
+        s_alloc_debug_dropped.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+
+    info->caller = caller;
+    info->tag = tag;
+    info->generation = current_debug_generation();
+    uint64_t const ACTIVE = s_alloc_debug_active.fetch_add(1, std::memory_order_relaxed) + 1;
+    update_debug_high_water(ACTIVE);
+    return info;
+}
+
+void release_alloc_debug(AllocDebugInfo* info) {
+    if (info == nullptr) {
+        return;
+    }
+
+    uint64_t const FLAGS = s_alloc_debug_lock.lock_irqsave();
+    info->caller = 0;
+    info->tag = nullptr;
+    info->generation = 0;
+    info->next_free = s_alloc_debug_free_list;
+    s_alloc_debug_free_list = info;
+    s_alloc_debug_lock.unlock_irqrestore(FLAGS);
+
+    uint64_t active = s_alloc_debug_active.load(std::memory_order_relaxed);
+    while (active != 0 &&
+           !s_alloc_debug_active.compare_exchange_weak(active, active - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+auto debug_ref_has_current_generation(const AllocDebugInfo* info, uint64_t& caller, const char*& tag) -> bool {
+    if (info == nullptr || info->caller == 0 || info->generation != current_debug_generation()) {
+        return false;
+    }
+    caller = info->caller;
+    tag = info->tag;
+    return true;
+}
+
+auto debug_ref_has_any_generation(const AllocDebugInfo* info, uint64_t& caller, const char*& tag) -> bool {
+    if (info == nullptr || info->caller == 0) {
+        return false;
+    }
+    caller = info->caller;
+    tag = info->tag;
+    return true;
+}
+
+auto slab_debug_slot(void* ptr) -> AllocDebugInfo** {
+    return reinterpret_cast<AllocDebugInfo**>(static_cast<uint8_t*>(ptr) - sizeof(uintptr_t));
 }
 #endif
 }  // namespace
@@ -163,15 +286,14 @@ void dump_tracked_allocations() {
             ker::mod::io::serial::write(" size=0x");
             ker::mod::io::serial::write_hex(curr->size);
 #ifdef WOS_KMALLOC_DEBUG_INFO
-            if (curr->debug_idx != ALLOC_DEBUG_NONE && curr->debug_idx < ALLOC_DEBUG_MAX) {
-                const auto& d = s_alloc_debug[curr->debug_idx];
-                if (d.caller != 0) {
-                    ker::mod::io::serial::write(" caller=0x");
-                    ker::mod::io::serial::write_hex(d.caller);
-                }
-                if (d.tag != nullptr) {
+            uint64_t caller = 0;
+            const char* tag = nullptr;
+            if (debug_ref_has_any_generation(curr->debug_info, caller, tag)) {
+                ker::mod::io::serial::write(" caller=0x");
+                ker::mod::io::serial::write_hex(caller);
+                if (tag != nullptr) {
                     ker::mod::io::serial::write(" tag=");
-                    ker::mod::io::serial::write(d.tag);
+                    ker::mod::io::serial::write(tag);
                 }
             }
 #endif
@@ -200,15 +322,14 @@ void dump_tracked_allocations() {
             ker::mod::io::serial::write(" size=0x");
             ker::mod::io::serial::write_hex(curr->size);
 #ifdef WOS_KMALLOC_DEBUG_INFO
-            if (curr->debug_idx != ALLOC_DEBUG_NONE && curr->debug_idx < ALLOC_DEBUG_MAX) {
-                const auto& d = s_alloc_debug[curr->debug_idx];
-                if (d.caller != 0) {
-                    ker::mod::io::serial::write(" caller=0x");
-                    ker::mod::io::serial::write_hex(d.caller);
-                }
-                if (d.tag != nullptr) {
+            uint64_t caller = 0;
+            const char* tag = nullptr;
+            if (debug_ref_has_any_generation(curr->debug_info, caller, tag)) {
+                ker::mod::io::serial::write(" caller=0x");
+                ker::mod::io::serial::write_hex(caller);
+                if (tag != nullptr) {
                     ker::mod::io::serial::write(" tag=");
-                    ker::mod::io::serial::write(d.tag);
+                    ker::mod::io::serial::write(tag);
                 }
             }
 #endif
@@ -225,12 +346,10 @@ void dump_tracked_allocations() {
 
 #ifdef WOS_KMALLOC_DEBUG_INFO
     ker::mod::io::serial::write("kmalloc: Slab live allocations with debug info:\n");
-    mini_malloc::mini_iter_live_debug_slots(nullptr, [](void* /*ud*/, const void* ptr, size_t sz, uint32_t dbg_idx) -> void {
-        if (dbg_idx == ALLOC_DEBUG_NONE || dbg_idx >= ALLOC_DEBUG_MAX) {
-            return;
-        }
-        const auto& d = s_alloc_debug[dbg_idx];
-        if (d.caller == 0) {
+    mini_malloc::mini_iter_live_debug_slots(nullptr, [](void* /*ud*/, const void* ptr, size_t sz, uintptr_t debug_ref) -> void {
+        uint64_t caller = 0;
+        const char* tag = nullptr;
+        if (!debug_ref_has_any_generation(reinterpret_cast<const AllocDebugInfo*>(debug_ref), caller, tag)) {
             return;
         }
         ker::mod::io::serial::write("  addr=0x");
@@ -238,10 +357,10 @@ void dump_tracked_allocations() {
         ker::mod::io::serial::write(" sz=0x");
         ker::mod::io::serial::write_hex(sz);
         ker::mod::io::serial::write(" caller=0x");
-        ker::mod::io::serial::write_hex(d.caller);
-        if (d.tag != nullptr) {
+        ker::mod::io::serial::write_hex(caller);
+        if (tag != nullptr) {
             ker::mod::io::serial::write(" tag=");
-            ker::mod::io::serial::write(d.tag);
+            ker::mod::io::serial::write(tag);
         }
         ker::mod::io::serial::write("\n");
     });
@@ -270,6 +389,232 @@ void get_tracked_alloc_totals(uint64_t& out_count, uint64_t& out_bytes) {
     }
     large_alloc_lock.unlock_irqrestore(LARGE_LOCK_FLAGS);
 }
+
+void get_tracked_alloc_breakdown(KmallocTrackedTotals& out) {
+    out = {};
+
+    uint64_t const MEDIUM_LOCK_FLAGS = medium_alloc_lock.lock_irqsave();
+    for (MediumAllocationHeader const* curr = medium_alloc_list; curr != nullptr; curr = curr->next) {
+        if (curr->magic == MEDIUM_ALLOC_MAGIC) {
+            out.medium_count++;
+            out.medium_bytes += curr->size;
+        }
+    }
+    medium_alloc_lock.unlock_irqrestore(MEDIUM_LOCK_FLAGS);
+
+    uint64_t const LARGE_LOCK_FLAGS = large_alloc_lock.lock_irqsave();
+    for (LargeAllocationHeader const* curr = large_alloc_list; curr != nullptr; curr = curr->next) {
+        if (curr->magic == LARGE_ALLOC_MAGIC) {
+            out.large_count++;
+            out.large_bytes += curr->size;
+        }
+    }
+    large_alloc_lock.unlock_irqrestore(LARGE_LOCK_FLAGS);
+}
+
+auto snapshot_live_allocs(KmallocLiveAlloc* out, size_t max_rows, size_t& total_rows) -> size_t {
+    total_rows = 0;
+    size_t rows = 0;
+
+    uint64_t const LARGE_LOCK_FLAGS = large_alloc_lock.lock_irqsave();
+    for (LargeAllocationHeader const* curr = large_alloc_list; curr != nullptr; curr = curr->next) {
+        if (curr->magic != LARGE_ALLOC_MAGIC) {
+            continue;
+        }
+        if (out != nullptr && rows < max_rows) {
+            uint64_t caller = 0;
+            const char* tag = nullptr;
+#ifdef WOS_KMALLOC_DEBUG_INFO
+            bool const HAS_DEBUG = debug_ref_has_current_generation(curr->debug_info, caller, tag);
+#else
+            bool const HAS_DEBUG = false;
+#endif
+            out[rows++] = KmallocLiveAlloc{.tier = "large",
+                                           .addr = reinterpret_cast<uint64_t>(curr + 1),
+                                           .size = curr->size,
+                                           .caller = caller,
+                                           .tag = tag,
+                                           .has_debug = HAS_DEBUG};
+        }
+        total_rows++;
+    }
+    large_alloc_lock.unlock_irqrestore(LARGE_LOCK_FLAGS);
+
+    uint64_t const MEDIUM_LOCK_FLAGS = medium_alloc_lock.lock_irqsave();
+    for (MediumAllocationHeader const* curr = medium_alloc_list; curr != nullptr; curr = curr->next) {
+        if (curr->magic != MEDIUM_ALLOC_MAGIC) {
+            continue;
+        }
+        if (out != nullptr && rows < max_rows) {
+            uint64_t caller = 0;
+            const char* tag = nullptr;
+#ifdef WOS_KMALLOC_DEBUG_INFO
+            bool const HAS_DEBUG = debug_ref_has_current_generation(curr->debug_info, caller, tag);
+#else
+            bool const HAS_DEBUG = false;
+#endif
+            out[rows++] = KmallocLiveAlloc{.tier = "medium",
+                                           .addr = reinterpret_cast<uint64_t>(curr + 1),
+                                           .size = curr->size,
+                                           .caller = caller,
+                                           .tag = tag,
+                                           .has_debug = HAS_DEBUG};
+        }
+        total_rows++;
+    }
+    medium_alloc_lock.unlock_irqrestore(MEDIUM_LOCK_FLAGS);
+    return rows;
+}
+
+namespace {
+
+auto tag_equals(const char* lhs, const char* rhs) -> bool {
+    if (lhs == rhs) {
+        return true;
+    }
+    if (lhs == nullptr || rhs == nullptr) {
+        return false;
+    }
+    return std::strcmp(lhs, rhs) == 0;
+}
+
+void add_caller_stat(KmallocCallerStat* out, size_t max_rows, size_t& rows, size_t& overflow_rows, const char* tier, uint64_t size,
+                     bool has_debug, uint64_t caller, const char* tag) {
+    if (!has_debug) {
+        caller = 0;
+        tag = nullptr;
+    }
+
+    for (size_t i = 0; i < rows; ++i) {
+        auto& row = out[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        if (row.has_debug == has_debug && row.caller == caller && row.tier == tier && tag_equals(row.tag, tag)) {
+            row.count++;
+            row.bytes += size;
+            return;
+        }
+    }
+
+    if (rows < max_rows) {
+        out[rows++] = KmallocCallerStat{.tier = tier, .caller = caller, .tag = tag, .count = 1, .bytes = size, .has_debug = has_debug};
+        return;
+    }
+    overflow_rows++;
+}
+
+}  // namespace
+
+auto snapshot_caller_stats(KmallocCallerStat* out, size_t max_rows, size_t& total_rows) -> size_t {
+    total_rows = 0;
+    if (out == nullptr || max_rows == 0) {
+        uint64_t count = 0;
+        uint64_t bytes = 0;
+        get_tracked_alloc_totals(count, bytes);
+        total_rows = static_cast<size_t>(count);
+        return 0;
+    }
+
+    size_t rows = 0;
+    size_t overflow_rows = 0;
+
+    uint64_t const LARGE_LOCK_FLAGS = large_alloc_lock.lock_irqsave();
+    for (LargeAllocationHeader const* curr = large_alloc_list; curr != nullptr; curr = curr->next) {
+        if (curr->magic != LARGE_ALLOC_MAGIC) {
+            continue;
+        }
+        uint64_t caller = 0;
+        const char* tag = nullptr;
+#ifdef WOS_KMALLOC_DEBUG_INFO
+        bool const HAS_DEBUG = debug_ref_has_current_generation(curr->debug_info, caller, tag);
+#else
+        bool const HAS_DEBUG = false;
+#endif
+        add_caller_stat(out, max_rows, rows, overflow_rows, "large", curr->size, HAS_DEBUG, caller, tag);
+    }
+    large_alloc_lock.unlock_irqrestore(LARGE_LOCK_FLAGS);
+
+    uint64_t const MEDIUM_LOCK_FLAGS = medium_alloc_lock.lock_irqsave();
+    for (MediumAllocationHeader const* curr = medium_alloc_list; curr != nullptr; curr = curr->next) {
+        if (curr->magic != MEDIUM_ALLOC_MAGIC) {
+            continue;
+        }
+        uint64_t caller = 0;
+        const char* tag = nullptr;
+#ifdef WOS_KMALLOC_DEBUG_INFO
+        bool const HAS_DEBUG = debug_ref_has_current_generation(curr->debug_info, caller, tag);
+#else
+        bool const HAS_DEBUG = false;
+#endif
+        add_caller_stat(out, max_rows, rows, overflow_rows, "medium", curr->size, HAS_DEBUG, caller, tag);
+    }
+    medium_alloc_lock.unlock_irqrestore(MEDIUM_LOCK_FLAGS);
+
+    std::sort(out, out + rows, [](const KmallocCallerStat& lhs, const KmallocCallerStat& rhs) { return lhs.bytes > rhs.bytes; });
+    total_rows = rows + overflow_rows;
+    return rows;
+}
+
+auto debug_info_available() -> bool {
+#ifdef WOS_KMALLOC_DEBUG_INFO
+    return true;
+#else
+    return false;
+#endif
+}
+
+auto debug_info_enabled() -> bool {
+#ifdef WOS_KMALLOC_DEBUG_INFO
+    return s_alloc_debug_enabled.load(std::memory_order_acquire);
+#else
+    return false;
+#endif
+}
+
+void debug_info_set_enabled(bool enabled) {
+#ifdef WOS_KMALLOC_DEBUG_INFO
+    s_alloc_debug_enabled.store(enabled, std::memory_order_release);
+#else
+    (void)enabled;
+#endif
+}
+
+void debug_info_reset() {
+#ifdef WOS_KMALLOC_DEBUG_INFO
+    s_alloc_debug_generation.fetch_add(1, std::memory_order_acq_rel);
+#endif
+}
+
+auto debug_info_generation() -> uint64_t {
+#ifdef WOS_KMALLOC_DEBUG_INFO
+    return s_alloc_debug_generation.load(std::memory_order_acquire);
+#else
+    return 0;
+#endif
+}
+
+auto debug_info_default_enabled() -> bool {
+#ifdef WOS_KMALLOC_DEBUG_INFO
+    return true;
+#else
+    return false;
+#endif
+}
+
+auto debug_info_stats() -> KmallocDebugStats {
+#ifdef WOS_KMALLOC_DEBUG_INFO
+    uint64_t const BLOCKS = s_alloc_debug_block_count.load(std::memory_order_acquire);
+    uint64_t const CAPACITY = s_alloc_debug_capacity.load(std::memory_order_acquire);
+    uint64_t const ACTIVE = s_alloc_debug_active.load(std::memory_order_acquire);
+    return KmallocDebugStats{.block_count = BLOCKS,
+                             .block_bytes = BLOCKS * ALLOC_DEBUG_BLOCK_BYTES,
+                             .capacity = CAPACITY,
+                             .active = ACTIVE,
+                             .high_water = s_alloc_debug_high_water.load(std::memory_order_acquire),
+                             .dropped = s_alloc_debug_dropped.load(std::memory_order_acquire)};
+#else
+    return {};
+#endif
+}
+
 namespace {
 enum class SlabClass : int8_t {
     SLAB_0X10 = 0,
@@ -381,8 +726,9 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
 #endif
 #ifdef WOS_KMALLOC_DEBUG_INFO
         if (ptr != nullptr) {
-            // Store debug_idx in the lower 32 bits of _align_pad (the 8 bytes before user data).
-            *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(ptr) - sizeof(uintptr_t)) = register_alloc_debug(caller, tag);
+            auto** debug_slot = slab_debug_slot(ptr);
+            *debug_slot = nullptr;
+            *debug_slot = register_alloc_debug(caller, tag);
         }
 #endif
         return ptr;
@@ -413,6 +759,9 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
         // Set up header with tracking info
         auto* header = static_cast<MediumAllocationHeader*>(alloc_ptr);
         header->size = ALLOC_SIZE;
+#ifdef WOS_KMALLOC_DEBUG_INFO
+        header->debug_info = register_alloc_debug(caller, tag);
+#endif
 
         // Add to linked list and set magic under the same lock.
         // Magic must be set while holding the lock so that any concurrent free() that
@@ -431,9 +780,6 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
         // Mark the header as poisoned (internal), user data as accessible.
         kasan::poison_range(static_cast<void*>(header), sizeof(MediumAllocationHeader), kasan::SHADOW_HEAP_LREDZONE);
         kasan::unpoison_range(data, size);
-#endif
-#ifdef WOS_KMALLOC_DEBUG_INFO
-        header->debug_idx = register_alloc_debug(caller, tag);
 #endif
         return data;
     }
@@ -467,6 +813,9 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
     // Set up header with tracking info
     auto* header = static_cast<LargeAllocationHeader*>(alloc_ptr);
     header->size = ALLOC_SIZE;
+#ifdef WOS_KMALLOC_DEBUG_INFO
+    header->debug_info = register_alloc_debug(caller, tag);
+#endif
 
     // Add to linked list and set magic under the same lock.
     // Magic must be set while holding the lock so that any concurrent free() that
@@ -483,9 +832,6 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
 #ifdef WOS_KASAN
     kasan::poison_range(static_cast<void*>(header), sizeof(LargeAllocationHeader), kasan::SHADOW_HEAP_LREDZONE);
     kasan::unpoison_range(data, size);
-#endif
-#ifdef WOS_KMALLOC_DEBUG_INFO
-    header->debug_idx = register_alloc_debug(caller, tag);
 #endif
     return data;
 }
@@ -516,6 +862,10 @@ auto try_free_medium_alloc(void* data_ptr, uint64_t& out_size) -> TrackedFreeRes
         if (curr == header) {
             *prev = curr->next;
             out_size = curr->size;
+#ifdef WOS_KMALLOC_DEBUG_INFO
+            release_alloc_debug(header->debug_info);
+            header->debug_info = nullptr;
+#endif
             // Clear magic while still holding the lock so a concurrent free()
             // observes either (magic set AND in list) or (magic clear). The
             // (magic set AND not in list) state is no longer reachable except
@@ -529,18 +879,17 @@ auto try_free_medium_alloc(void* data_ptr, uint64_t& out_size) -> TrackedFreeRes
     // Still holding the lock — dump diagnostic info before unlocking.
     // Keeping the lock ensures the list is stable during the dump.
 
-    // Helper lambda to print debug_idx info for a node.
+    // Helper lambda to print debug info for a node.
     auto print_debug_info = [](const MediumAllocationHeader* node) {
 #ifdef WOS_KMALLOC_DEBUG_INFO
-        if (node->debug_idx != ALLOC_DEBUG_NONE && node->debug_idx < ALLOC_DEBUG_MAX) {
-            const auto& d = s_alloc_debug[node->debug_idx];
-            if (d.caller != 0) {
-                ker::mod::io::serial::write(" caller=0x");
-                ker::mod::io::serial::write_hex(d.caller);
-            }
-            if (d.tag != nullptr) {
+        uint64_t caller = 0;
+        const char* tag = nullptr;
+        if (debug_ref_has_any_generation(node->debug_info, caller, tag)) {
+            ker::mod::io::serial::write(" caller=0x");
+            ker::mod::io::serial::write_hex(caller);
+            if (tag != nullptr) {
                 ker::mod::io::serial::write(" tag=");
-                ker::mod::io::serial::write(d.tag);
+                ker::mod::io::serial::write(tag);
             }
         }
 #else
@@ -648,6 +997,10 @@ auto try_free_large_alloc(void* data_ptr, uint64_t& out_size) -> TrackedFreeResu
         if (curr == header) {
             *prev = curr->next;
             out_size = curr->size;
+#ifdef WOS_KMALLOC_DEBUG_INFO
+            release_alloc_debug(header->debug_info);
+            header->debug_info = nullptr;
+#endif
             header->magic = 0;
             large_alloc_lock.unlock_irqrestore(FLAGS);
             return TrackedFreeResult::FREED;
@@ -712,6 +1065,9 @@ auto realloc(void* ptr, size_t size) -> void* {
 
             auto* new_header = static_cast<LargeAllocationHeader*>(new_alloc);
             new_header->size = NEW_ALLOC_SIZE;
+#ifdef WOS_KMALLOC_DEBUG_INFO
+            new_header->debug_info = nullptr;
+#endif
 
             uint64_t const COPY_SIZE = (OLD_SIZE < NEW_SIZE) ? OLD_SIZE : NEW_SIZE;
             memcpy(new_header + 1, ptr, COPY_SIZE);
@@ -731,11 +1087,12 @@ auto realloc(void* ptr, size_t size) -> void* {
             }
             new_header->next = large_alloc_list;
             large_alloc_list = new_header;
+#ifdef WOS_KMALLOC_DEBUG_INFO
+            release_alloc_debug(potential_large_header->debug_info);
+            potential_large_header->debug_info = nullptr;
+#endif
             potential_large_header->magic = 0;
             large_alloc_lock.unlock_irqrestore(LOCK_FLAGS);
-#ifdef WOS_KMALLOC_DEBUG_INFO
-            new_header->debug_idx = ALLOC_DEBUG_NONE;
-#endif
             phys::page_free(potential_large_header);
             return static_cast<void*>(new_header + 1);
         }
@@ -772,6 +1129,9 @@ auto realloc(void* ptr, size_t size) -> void* {
 
             auto* new_header = static_cast<MediumAllocationHeader*>(new_alloc);
             new_header->size = NEW_ALLOC_SIZE;
+#ifdef WOS_KMALLOC_DEBUG_INFO
+            new_header->debug_info = nullptr;
+#endif
 
             uint64_t const COPY_SIZE = (OLD_SIZE < NEW_SIZE) ? OLD_SIZE : NEW_SIZE;
             memcpy(new_header + 1, ptr, COPY_SIZE);
@@ -791,11 +1151,12 @@ auto realloc(void* ptr, size_t size) -> void* {
             }
             new_header->next = medium_alloc_list;
             medium_alloc_list = new_header;
+#ifdef WOS_KMALLOC_DEBUG_INFO
+            release_alloc_debug(potential_medium_header->debug_info);
+            potential_medium_header->debug_info = nullptr;
+#endif
             potential_medium_header->magic = 0;
             medium_alloc_lock.unlock_irqrestore(LOCK_FLAGS);
-#ifdef WOS_KMALLOC_DEBUG_INFO
-            new_header->debug_idx = ALLOC_DEBUG_NONE;
-#endif
             phys::page_free(potential_medium_header);
             return static_cast<void*>(new_header + 1);
         }
@@ -922,6 +1283,14 @@ void free(void* ptr) {
     // Otherwise, it's a small allocation (<= 0x800) - magazine fast path, slab slow path
     size_t const SLAB_SZ = mini_malloc::mini_get_slab_size(ptr);
     int const IDX = (SLAB_SZ > 0) ? static_cast<int>(slab_size_to_idx(SLAB_SZ)) : -1;
+
+#ifdef WOS_KMALLOC_DEBUG_INFO
+    if (SLAB_SZ > 0) {
+        auto** debug_slot = slab_debug_slot(ptr);
+        release_alloc_debug(*debug_slot);
+        *debug_slot = nullptr;
+    }
+#endif
 
 #ifdef WOS_KASAN
     // Poison the slab chunk as freed before returning it to the magazine/slab.

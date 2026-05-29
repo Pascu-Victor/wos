@@ -110,7 +110,41 @@ uint64_t mini_get_total_slab_bytes() {
     return total_slab_bytes;
 }
 
-void mini_iter_live_debug_slots(void* userdata, void (*fn)(void* ud, const void* user_ptr, size_t block_size, uint32_t debug_idx)) {
+auto mini_collect_slab_stats(MiniSlabStats* out, size_t max_rows) -> size_t {
+    if (out == nullptr || max_rows == 0) {
+        return 0;
+    }
+
+    size_t rows = 0;
+    auto add_slab = [&](const char* name, uint64_t object_size, auto& slab_instance) {
+        if (rows >= max_rows) {
+            return;
+        }
+        uint64_t slab_count = 0;
+        uint64_t total_blocks = 0;
+        uint64_t free_blocks = 0;
+        slab_instance.collect_stats(slab_count, total_blocks, free_blocks);
+        out[rows++] = MiniSlabStats{.name = name,
+                                    .object_size = object_size,
+                                    .slab_count = slab_count,
+                                    .total_blocks = total_blocks,
+                                    .free_blocks = free_blocks,
+                                    .page_bytes = slab_count * PAGE_SIZE};
+    };
+
+    add_slab("0x10", SLAB_SIZE10, slab_0x10);
+    add_slab("0x20", SLAB_SIZE20, slab_0x20);
+    add_slab("0x40", SLAB_SIZE40, slab_0x40);
+    add_slab("0x80", SLAB_SIZE80, slab_0x80);
+    add_slab("0x100", SLAB_SIZE100, slab_0x100);
+    add_slab("0x200", SLAB_SIZE200, slab_0x200);
+    add_slab("0x300", SLAB_SIZE300, slab_0x300);
+    add_slab("0x400", SLAB_SIZE400, slab_0x400);
+    add_slab("0x800", SLAB_SIZE800, slab_0x800);
+    return rows;
+}
+
+void mini_iter_live_debug_slots(void* userdata, void (*fn)(void* ud, const void* user_ptr, size_t block_size, uintptr_t debug_ref)) {
     slab_0x10.iter_live_blocks_unlocked(userdata, fn);
     slab_0x20.iter_live_blocks_unlocked(userdata, fn);
     slab_0x40.iter_live_blocks_unlocked(userdata, fn);

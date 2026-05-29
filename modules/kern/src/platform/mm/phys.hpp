@@ -2,6 +2,8 @@
 
 #include <extern/limine.h>
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <defines/defines.hpp>
 #include <mod/io/serial/serial.hpp>
@@ -12,6 +14,41 @@
 #include <util/hcf.hpp>
 
 namespace ker::mod::mm::phys {
+constexpr size_t MEMACC_BUDDY_ORDER_COUNT = 21;
+
+struct AllocStatsSnapshot {
+    uint64_t total_allocated_bytes;
+    uint64_t total_freed_bytes;
+    uint64_t live_allocated_bytes;
+    uint64_t alloc_count;
+    uint64_t free_count;
+    uint64_t total_mem_bytes;
+    uint64_t free_mem_bytes;
+};
+
+struct ZoneSnapshot {
+    uint64_t zone_num;
+    uint64_t start;
+    uint64_t len;
+    uint64_t page_count;
+    uint64_t total_pages;
+    uint64_t usable_pages;
+    uint64_t free_pages;
+    uint64_t metadata_pages;
+    uint64_t scanned_free_pages;
+    std::array<uint32_t, MEMACC_BUDDY_ORDER_COUNT> buddy_order_counts;
+    const char* name;
+    bool has_allocator;
+    bool invalid_allocator;
+    bool bad_order;
+    bool free_count_mismatch;
+};
+
+struct CallerPageStat {
+    uint64_t caller;
+    uint64_t pages;
+};
+
 void init(limine_memmap_response* memmap_response);
 void set_kernel_cr3(uint64_t cr3);    // Call after initPagemap to set kernel CR3 for safe memset
 void init_huge_page_zone_deferred();  // Call after initPagemap to initialize huge page zone
@@ -49,6 +86,17 @@ void enable_stack_overlap_check();
 
 auto get_free_mem_bytes() -> uint64_t;
 auto get_total_mem_bytes() -> uint64_t;
+
+void get_alloc_stats_snapshot(AllocStatsSnapshot& out);
+auto snapshot_zones(ZoneSnapshot* out, size_t max_rows) -> size_t;
+
+auto page_caller_stats_available() -> bool;
+auto page_caller_stats_enabled() -> bool;
+void page_caller_stats_set_enabled(bool enabled);
+void page_caller_stats_reset();
+auto page_caller_stats_generation() -> uint64_t;
+auto page_caller_stats_default_enabled() -> bool;
+auto snapshot_page_caller_stats(CallerPageStat* out, size_t max_rows, size_t& total_rows) -> bool;
 
 template <typename T>
 inline static void page_free(T* page) {

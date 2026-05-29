@@ -13,10 +13,11 @@
 namespace ker::vfs {
 
 // Buffer flags
-constexpr uint32_t BH_DIRTY = (1U << 0);      // Buffer has been modified
-constexpr uint32_t BH_VALID = (1U << 1);      // Buffer contains valid data from disk
-constexpr uint32_t BH_LOCKED = (1U << 2);     // Buffer is locked for I/O
-constexpr uint32_t BH_WRITEBACK = (1U << 3);  // Buffer is being written back
+constexpr uint32_t BH_DIRTY = (1U << 0);            // Buffer has been modified
+constexpr uint32_t BH_VALID = (1U << 1);            // Buffer contains valid data from disk
+constexpr uint32_t BH_LOCKED = (1U << 2);           // Buffer is locked for I/O
+constexpr uint32_t BH_WRITEBACK = (1U << 3);        // Buffer is being written back
+constexpr uint32_t BH_DATA_PAGE_ALLOC = (1U << 4);  // Buffer data was allocated through the page allocator
 
 // Buffer head - represents a single cached block from a block device.
 // Analogous to Linux struct buffer_head / simplified xfs_buf.
@@ -100,10 +101,23 @@ struct BufferCacheStats {
     size_t total_buffers;
     size_t dirty_buffers;
     size_t total_bytes;
+    size_t clean_bytes;
+    size_t dirty_bytes;
     size_t max_bytes;
     uint64_t hits;
     uint64_t misses;
 };
 auto buffer_cache_stats() -> BufferCacheStats;
+
+struct BufferCacheReclaimStats {
+    size_t before_bytes;
+    size_t after_bytes;
+    size_t freed_buffers;
+    size_t freed_bytes;
+};
+
+// Drop clean, unreferenced buffers until the logical cache is at or below
+// target_bytes. Dirty or referenced buffers are never written or discarded.
+auto reclaim_clean_buffer_cache(size_t target_bytes) -> BufferCacheReclaimStats;
 
 }  // namespace ker::vfs

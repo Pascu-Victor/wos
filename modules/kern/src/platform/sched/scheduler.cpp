@@ -254,6 +254,16 @@ constexpr std::array<uint32_t, 40> K_NICE_TO_WEIGHT = {
 
 constexpr int SCHED_NICE_MIN = -20;
 constexpr int SCHED_NICE_MAX = 19;
+constexpr uint64_t LOADAVG_SCALE = 1000000;
+constexpr uint64_t LOADAVG_EXP_1MIN = 983471;
+constexpr uint64_t LOADAVG_EXP_5MIN = 996672;
+constexpr uint64_t LOADAVG_EXP_15MIN = 998889;
+
+ker::mod::sys::Spinlock load_average_lock;
+uint64_t load1_milli = 0;
+uint64_t load5_milli = 0;
+uint64_t load15_milli = 0;
+uint64_t load_average_last_update_us = 0;
 
 inline auto clamp_nice(int nice) -> int {
     if (nice < SCHED_NICE_MIN) {
@@ -1100,6 +1110,52 @@ auto consume_precharged_syscall_time(task::Task* task, uint64_t delta_us) -> uin
     return CONSUMED_US;
 }
 
+auto consume_irq_time_for_runtime(RunQueue* rq, uint64_t delta_us) -> uint64_t {
+    if (rq == nullptr || delta_us == 0) {
+        return 0;
+    }
+
+    uint64_t const IRQ_US = rq->irq_uncharged_us.exchange(0, std::memory_order_acq_rel);
+    uint64_t const CONSUMED_US = std::min(IRQ_US, delta_us);
+    if (IRQ_US > CONSUMED_US) {
+        rq->irq_uncharged_us.fetch_add(IRQ_US - CONSUMED_US, std::memory_order_release);
+    }
+    return CONSUMED_US;
+}
+
+void account_cpu_runtime_delta(RunQueue* rq, task::Task* task, uint64_t delta_us, bool in_kernel_mode, bool charge_running_time) {
+    if (rq == nullptr || delta_us == 0) {
+        return;
+    }
+
+    if (task == nullptr || task->type == task::TaskType::IDLE || !charge_running_time) {
+        rq->cpu_idle_us.fetch_add(delta_us, std::memory_order_relaxed);
+        return;
+    }
+
+    if (in_kernel_mode) {
+        rq->cpu_system_us.fetch_add(delta_us, std::memory_order_relaxed);
+        return;
+    }
+
+    if (task->sched_nice > 0) {
+        rq->cpu_nice_us.fetch_add(delta_us, std::memory_order_relaxed);
+    } else {
+        rq->cpu_user_us.fetch_add(delta_us, std::memory_order_relaxed);
+    }
+}
+
+void account_task_runtime_delta(task::Task* task, uint64_t now_us, uint64_t delta_us, bool in_kernel_mode, bool charge_running_time);
+
+auto account_runtime_slice(RunQueue* rq, task::Task* task, uint64_t now_us, uint64_t delta_us, bool in_kernel_mode,
+                           bool charge_running_time) -> uint64_t {
+    uint64_t const IRQ_US = consume_irq_time_for_runtime(rq, delta_us);
+    uint64_t const CHARGEABLE_US = delta_us - IRQ_US;
+    account_cpu_runtime_delta(rq, task, CHARGEABLE_US, in_kernel_mode, charge_running_time);
+    account_task_runtime_delta(task, now_us, CHARGEABLE_US, in_kernel_mode, charge_running_time);
+    return CHARGEABLE_US;
+}
+
 auto charge_syscall_time_until(task::Task* task, uint64_t now_us, bool finish) -> bool {
     if (task == nullptr || task->type != task::TaskType::PROCESS || task->syscall_account_start_us == 0) {
         return false;
@@ -1694,6 +1750,16 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
 
     // ---- Idle path: no running task, check heap for work ----
     if (current_task == nullptr || current_task->type == task::TaskType::IDLE) {
+        {
+            uint64_t const NOW_US = time::get_us();
+            auto delta_us = static_cast<int64_t>(NOW_US - rq->last_tick_us);
+            rq->last_tick_us = NOW_US;
+            if (delta_us <= 0) {
+                delta_us = 1;
+            }
+            (void)account_runtime_slice(rq, current_task, NOW_US, static_cast<uint64_t>(delta_us), true, false);
+        }
+
         task::Task* next_task = run_queues->this_cpu_locked([](RunQueue* rq) -> task::Task* {
             if (rq->runnable_heap.size == 0) {
                 // Phase 2: attempt work stealing from a peer CPU before going idle.
@@ -1803,14 +1869,14 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
         if (delta_us <= 0) {
             delta_us = 1;
         }
-        int64_t const DELTA_NS = delta_us * 1000;
 
         // Process time accounting: attribute delta to user or system time.
         // voluntary_block means the task executed sti;hlt and the tick is
         // arriving out of a halted wait point, not from CPU it consumed.
+        auto chargeable_us = static_cast<uint64_t>(delta_us);
         if (current_task->type != task::TaskType::IDLE) {
-            account_task_runtime_delta(current_task, NOW_US, static_cast<uint64_t>(delta_us), IN_KERNEL_MODE,
-                                       !current_task->voluntary_block);
+            chargeable_us = account_runtime_slice(rq, current_task, NOW_US, static_cast<uint64_t>(delta_us), IN_KERNEL_MODE,
+                                                  !current_task->voluntary_block);
 
             // kern_yield() sleepers stay on the runnable heap, so record a
             // pseudo-sleep interval here. That lets the preemption guard treat
@@ -1831,6 +1897,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             // first scheduling window after a sleep->wake transition.
             current_task->just_woke = false;
         }
+        int64_t const DELTA_NS = static_cast<int64_t>(chargeable_us) * 1000;
 
         // Perf: periodic CPU sample (~100 Hz sub-sampled from 1 kHz timer)
         if (!current_task->voluntary_block) {
@@ -2651,11 +2718,12 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             if (delta_us <= 0) {
                 delta_us = 1;
             }
-            int64_t const DELTA_NS = delta_us * 1000;
 
+            auto chargeable_us = static_cast<uint64_t>(delta_us);
             if (current_task->type != task::TaskType::IDLE) {
-                account_task_runtime_delta(current_task, NOW_US, static_cast<uint64_t>(delta_us), false, true);
+                chargeable_us = account_runtime_slice(rq, current_task, NOW_US, static_cast<uint64_t>(delta_us), false, true);
             }
+            int64_t const DELTA_NS = static_cast<int64_t>(chargeable_us) * 1000;
 
             if (rq->runnable_heap.contains(current_task)) {
                 int64_t const VRUNTIME_DELTA = (DELTA_NS * 1024) / static_cast<int64_t>(current_task->sched_weight);
@@ -3720,6 +3788,120 @@ void note_scheduler_timer_interrupt() {
     if (current == nullptr || current->type == task::TaskType::IDLE) {
         rq->idle_timer_wakeups.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+void account_irq_time_us(uint64_t elapsed_us) {
+    if (run_queues == nullptr || elapsed_us == 0) {
+        return;
+    }
+
+    auto* rq = run_queues->this_cpu();
+    if (rq == nullptr) {
+        return;
+    }
+
+    rq->cpu_irq_us.fetch_add(elapsed_us, std::memory_order_relaxed);
+    rq->irq_uncharged_us.fetch_add(elapsed_us, std::memory_order_release);
+}
+
+auto get_cpu_accounting_snapshot(uint64_t cpu_no) -> CpuAccountingSnapshot {
+    CpuAccountingSnapshot snapshot{};
+    if (run_queues == nullptr) {
+        return snapshot;
+    }
+
+    return run_queues->with_lock(cpu_no, [](RunQueue* rq) -> CpuAccountingSnapshot {
+        if (rq == nullptr) {
+            return CpuAccountingSnapshot{};
+        }
+
+        return CpuAccountingSnapshot{
+            .user_us = rq->cpu_user_us.load(std::memory_order_relaxed),
+            .nice_us = rq->cpu_nice_us.load(std::memory_order_relaxed),
+            .system_us = rq->cpu_system_us.load(std::memory_order_relaxed),
+            .idle_us = rq->cpu_idle_us.load(std::memory_order_relaxed),
+            .iowait_us = rq->cpu_iowait_us.load(std::memory_order_relaxed),
+            .irq_us = rq->cpu_irq_us.load(std::memory_order_relaxed),
+            .softirq_us = rq->cpu_softirq_us.load(std::memory_order_relaxed),
+            .steal_us = rq->cpu_steal_us.load(std::memory_order_relaxed),
+        };
+    });
+}
+
+namespace {
+auto decay_load_milli(uint64_t previous, uint64_t active_milli, uint64_t exp_scaled) -> uint64_t {
+    return ((previous * exp_scaled) + (active_milli * (LOADAVG_SCALE - exp_scaled))) / LOADAVG_SCALE;
+}
+}  // namespace
+
+auto get_load_average_snapshot() -> LoadAverageSnapshot {
+    LoadAverageSnapshot snapshot{};
+    uint32_t total = 0;
+    uint32_t runnable = 0;
+    uint32_t uninterruptible = 0;
+    uint32_t active_for_load = 0;
+    uint64_t last_pid = 0;
+
+    {
+        uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+        total = active_task_count;
+        for (uint32_t i = 0; i < active_task_count; ++i) {
+            auto* task = active_task_slot(i);
+            if (task == nullptr) {
+                continue;
+            }
+            last_pid = std::max<uint64_t>(last_pid, task->pid);
+            auto const TASK_STATE = task->state.load(std::memory_order_acquire);
+            bool const DEAD = TASK_STATE == task::TaskState::DEAD || TASK_STATE == task::TaskState::EXITING || task->has_exited;
+            if (DEAD || task->ptrace_stopped) {
+                continue;
+            }
+            bool const IS_RUNNABLE = task->sched_queue == task::Task::sched_queue::RUNNABLE && !task->voluntary_block;
+            bool const IS_UNINTERRUPTIBLE =
+                task->sched_queue == task::Task::sched_queue::WAITING && task->wait_channel != nullptr && !task->ptrace_stopped;
+            if (IS_RUNNABLE) {
+                runnable++;
+            }
+            if (IS_UNINTERRUPTIBLE) {
+                uninterruptible++;
+            }
+            if (IS_RUNNABLE || IS_UNINTERRUPTIBLE) {
+                active_for_load++;
+            }
+        }
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+    }
+
+    uint64_t const NOW_US = time::get_us();
+    uint64_t const FLAGS = load_average_lock.lock_irqsave();
+    if (load_average_last_update_us == 0) {
+        load1_milli = static_cast<uint64_t>(active_for_load) * 1000ULL;
+        load5_milli = load1_milli;
+        load15_milli = load1_milli;
+        load_average_last_update_us = NOW_US;
+    } else if (NOW_US > load_average_last_update_us) {
+        uint64_t elapsed_s = (NOW_US - load_average_last_update_us) / 1000000ULL;
+        elapsed_s = std::min<uint64_t>(elapsed_s, 60);
+        uint64_t const ACTIVE_MILLI = static_cast<uint64_t>(active_for_load) * 1000ULL;
+        for (uint64_t i = 0; i < elapsed_s; ++i) {
+            load1_milli = decay_load_milli(load1_milli, ACTIVE_MILLI, LOADAVG_EXP_1MIN);
+            load5_milli = decay_load_milli(load5_milli, ACTIVE_MILLI, LOADAVG_EXP_5MIN);
+            load15_milli = decay_load_milli(load15_milli, ACTIVE_MILLI, LOADAVG_EXP_15MIN);
+        }
+        if (elapsed_s != 0) {
+            load_average_last_update_us += elapsed_s * 1000000ULL;
+        }
+    }
+
+    snapshot.load1_milli = load1_milli;
+    snapshot.load5_milli = load5_milli;
+    snapshot.load15_milli = load15_milli;
+    snapshot.runnable_tasks = runnable;
+    snapshot.uninterruptible_tasks = uninterruptible;
+    snapshot.total_tasks = total;
+    snapshot.last_pid = last_pid;
+    load_average_lock.unlock_irqrestore(FLAGS);
+    return snapshot;
 }
 
 auto get_scheduler_trace_stats(uint64_t cpu_no) -> SchedulerTraceStats {

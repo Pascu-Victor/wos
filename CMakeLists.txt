@@ -27,7 +27,7 @@ add_custom_target(wos_tools_build_always ALL
 
 project(wos NONE)
 
-# WOS modules (kernel, init, testprog, netd, httpd, perf, journal, wkictl, renderbench)
+# WOS modules (kernel, init, testprog, netd, httpd, perf, top, memacc, journal, wkictl, renderbench)
 add_subdirectory(modules)
 
 # ---------------------------------------------------------------------------
@@ -124,7 +124,7 @@ add_custom_target(boot_image
 )
 add_dependencies(boot_image wos_modules mountfs_disk)
 
-foreach(mod wos init testprog testd netd httpd perf journal wkictl renderbench sftpserver)
+foreach(mod wos init testprog testd netd httpd perf top memacc journal wkictl renderbench sftpserver)
     add_dependencies(${mod} mlibc libcxx)
 endforeach()
 # busybox and dropbear are only needed for image creation, not compilation.

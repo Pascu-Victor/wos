@@ -415,6 +415,84 @@ paddr_t translate(PageTable* page_table, vaddr_t vaddr) {
     uint64_t const PHYS = (pte.frame << paging::PAGE_SHIFT) + (vaddr & (paging::PAGE_SIZE - 1));
     return PHYS;  // Return physical address only
 }
+
+auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats {
+    UserMemoryStats stats{};
+    if (page_table == nullptr) {
+        return stats;
+    }
+
+    stats.page_table_pages = 1;  // Count the user address space root.
+    constexpr size_t USER_PML4_ENTRIES = 256;
+    constexpr uint64_t PAGES_PER_2M = 512;
+    constexpr uint64_t PAGES_PER_1G = 512 * PAGES_PER_2M;
+
+    auto count_present_leaf = [&](const PageTableEntry& entry, uint64_t page_count) {
+        if (entry.user == 0) {
+            return;
+        }
+
+        stats.virtual_pages += page_count;
+        stats.resident_pages += page_count;
+
+        uint64_t const RAW = pte_raw(entry);
+        bool shared = (RAW & paging::PAGE_SHARED) != 0U;
+        if (!shared && entry.frame != 0) {
+            uint64_t const PHYS = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
+            auto* virt_page = reinterpret_cast<void*>(addr::get_virt_pointer(PHYS));
+            shared = phys::page_ref_get(virt_page) > 1;
+        }
+        if (shared) {
+            stats.shared_pages += page_count;
+        }
+    };
+
+    for (size_t i4 = 0; i4 < USER_PML4_ENTRIES; ++i4) {
+        const auto& pml4e = entry_at(page_table, i4);
+        if (!pml4e.present) {
+            continue;
+        }
+
+        stats.page_table_pages++;
+        auto* pml3 = reinterpret_cast<PageTable*>(addr::get_virt_pointer(static_cast<uint64_t>(pml4e.frame) << paging::PAGE_SHIFT));
+        for (const auto& pml3e : pml3->entries) {
+            if (!pml3e.present) {
+                continue;
+            }
+            if (pml3e.pagesize) {
+                count_present_leaf(pml3e, PAGES_PER_1G);
+                continue;
+            }
+
+            stats.page_table_pages++;
+            auto* pml2 = reinterpret_cast<PageTable*>(addr::get_virt_pointer(static_cast<uint64_t>(pml3e.frame) << paging::PAGE_SHIFT));
+            for (const auto& pml2e : pml2->entries) {
+                if (!pml2e.present) {
+                    continue;
+                }
+                if (pml2e.pagesize) {
+                    count_present_leaf(pml2e, PAGES_PER_2M);
+                    continue;
+                }
+
+                stats.page_table_pages++;
+                auto* pml1 = reinterpret_cast<PageTable*>(addr::get_virt_pointer(static_cast<uint64_t>(pml2e.frame) << paging::PAGE_SHIFT));
+                for (const auto& pte : pml1->entries) {
+                    if (pte.present) {
+                        count_present_leaf(pte, 1);
+                        continue;
+                    }
+                    if (is_reserved_leaf(pte)) {
+                        stats.virtual_pages++;
+                    }
+                }
+            }
+        }
+    }
+
+    return stats;
+}
+
 void init_pagemap() {
     cpu::enable_pae();
     cpu::enable_pse();

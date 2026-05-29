@@ -214,6 +214,12 @@ auto perf_vfs_server_op(uint16_t op_id) -> uint8_t {
 }
 
 constexpr int VFS_PROXY_WKI_ERR_BASE = -1000;
+// Bulk VFS still moves one large RDMA window, but fill the server buffer through
+// modest backing-FS reads so one remote request cannot force a giant local direct read.
+constexpr size_t VFS_BACKING_READ_CHUNK = size_t{32} * 1024;
+// RoCE read responses are fragmented into Ethernet frames. Keep each pull burst
+// comfortably below the virtio TX ring depth; larger logical reads loop here.
+constexpr uint32_t VFS_ROCE_BULK_FETCH_SIZE = 128U * 1024U;
 
 auto encode_proxy_wki_status(int status) -> int {
     if (status >= 0) {
@@ -482,6 +488,25 @@ auto read_local_file_with_retry(ker::vfs::File* local_file, void* buf, size_t le
     }
 
     return -EIO;
+}
+
+auto read_local_file_windowed(ker::vfs::File* local_file, void* buf, size_t len, size_t offset) -> ssize_t {
+    auto* dst = static_cast<uint8_t*>(buf);
+    size_t total_read = 0;
+
+    while (total_read < len) {
+        size_t const CHUNK = std::min(VFS_BACKING_READ_CHUNK, len - total_read);
+        ssize_t const RC = read_local_file_with_retry(local_file, dst + total_read, CHUNK, offset + total_read);
+        if (RC < 0) {
+            return total_read > 0 ? static_cast<ssize_t>(total_read) : RC;
+        }
+        if (RC == 0) {
+            break;
+        }
+        total_read += static_cast<size_t>(RC);
+    }
+
+    return static_cast<ssize_t>(total_read);
 }
 
 // Check if the resolved server-side path would cross into a REMOTE (WKI proxy) mount.
@@ -1454,11 +1479,12 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     bool const POSITIONAL_READ = f->positional_read_depth.load(std::memory_order_acquire) != 0;
     // -- Bulk RDMA path ----------------------------------------------------
     // Two modes:
-    //  (a) Direct bulk - request > 64 KB: issue OP_VFS_READ_BULK for each chunk.
-    //  (b) Prefetch   - request ≤ 64 KB (typical cp/cat): on the first small read
-    //      (or cache miss), pre-fetch up to 2 MB from the server into the bulk
-    //      buffer and serve subsequent sequential reads from it.  This turns
-    //      hundreds of 4 KB RPCs into one bulk RDMA write.
+    //  (a) Direct bulk - positional reads and request > 64 KB: issue
+    //      OP_VFS_READ_BULK for each exact offset/range chunk.
+    //  (b) Prefetch   - non-positional request <= 64 KB (typical cp/cat): on
+    //      the first small read (or cache miss), pre-fetch up to 2 MB from the
+    //      server into the bulk buffer and serve subsequent sequential reads
+    //      from it. This turns hundreds of 4 KB RPCs into one bulk RDMA write.
     //
     // The bulk buffer is per-mount; `bulk_owner_fd` tracks which open file last
     // filled it.  When ownership changes the old prefetch is implicitly stale.
@@ -1471,18 +1497,24 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     const bool BULK_PUSH_CAPABLE = !BULK_PULL_CAPABLE && transport_supports_vfs_read_push_rdma(ctx->proxy->rdma_transport) &&
                                    ctx->proxy->bulk_rdma_capable && ctx->proxy->rdma_transport != nullptr &&
                                    ctx->proxy->rdma_bulk_rkey != 0 && ctx->proxy->rdma_bulk_buf != nullptr;
-    if ((BULK_PULL_CAPABLE || BULK_PUSH_CAPABLE) && !POSITIONAL_READ) {
+    if (BULK_PULL_CAPABLE || BULK_PUSH_CAPABLE) {
         SharedIoSlotGuard const SHARED_IO_GUARD(ctx->proxy);
         int bulk_error = 0;
 #ifdef WKI_DEBUG
         if (cur_offset == 0) {
-            ker::mod::dbg::log("[WKI] remote_vfs_read: BULK RDMA %s ch=%u rd=%d count=%u", bulk_pull_capable ? "pull" : "push",
+            ker::mod::dbg::log("[WKI] remote_vfs_read: BULK RDMA %s ch=%u rd=%d count=%u", BULK_PULL_CAPABLE ? "pull" : "push",
                                ctx->proxy->assigned_channel, ctx->remote_fd, remaining);
         }
 #endif
+        if (POSITIONAL_READ) {
+            ctx->bulk_cached_len = 0;
+            ctx->proxy->bulk_owner_fd = -1;
+        }
+
         // -- (b) Prefetch path: try to satisfy from the existing bulk cache --
-        if (remaining <= VFS_RDMA_BOUNCE_SIZE && ctx->proxy->bulk_owner_fd == ctx->remote_fd && ctx->bulk_cached_len > 0 &&
-            cur_offset >= ctx->bulk_cached_offset && cur_offset < ctx->bulk_cached_offset + static_cast<int64_t>(ctx->bulk_cached_len)) {
+        if (!POSITIONAL_READ && remaining <= VFS_RDMA_BOUNCE_SIZE && ctx->proxy->bulk_owner_fd == ctx->remote_fd &&
+            ctx->bulk_cached_len > 0 && cur_offset >= ctx->bulk_cached_offset &&
+            cur_offset < ctx->bulk_cached_offset + static_cast<int64_t>(ctx->bulk_cached_len)) {
             auto off_in_buf = static_cast<uint32_t>(cur_offset - ctx->bulk_cached_offset);
             auto available = ctx->bulk_cached_len - off_in_buf;
             auto to_copy = std::min(remaining, available);
@@ -1501,10 +1533,16 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
 
         // -- Bulk fetch: either (a) direct or (b) prefetch refill ----------
         while (remaining > 0) {
-            // For small reads, prefetch the full bulk buffer size; for large
-            // reads, transfer exactly what is needed.
-            uint32_t fetch_size =
-                (remaining <= VFS_RDMA_BOUNCE_SIZE) ? ctx->proxy->rdma_bulk_size : std::min(remaining, ctx->proxy->rdma_bulk_size);
+            uint32_t fetch_limit = ctx->proxy->rdma_bulk_size;
+            if (BULK_PULL_CAPABLE) {
+                fetch_limit = std::min(fetch_limit, VFS_ROCE_BULK_FETCH_SIZE);
+            }
+            // For small reads, prefetch the full safe bulk window; for large
+            // reads and all positional reads, transfer exactly what is needed.
+            uint32_t fetch_size = std::min(remaining, fetch_limit);
+            if (!POSITIONAL_READ && remaining <= VFS_RDMA_BOUNCE_SIZE) {
+                fetch_size = fetch_limit;
+            }
 
             // Pull mode sends rkey=0 (server ignores it; data goes to staging buf).
             // Push mode sends the client's bulk buf rkey.
@@ -1553,10 +1591,15 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
                 }
             }
 
-            // Update prefetch cache metadata
-            ctx->proxy->bulk_owner_fd = ctx->remote_fd;
-            ctx->bulk_cached_offset = cur_offset;
-            ctx->bulk_cached_len = bytes_read;
+            if (POSITIONAL_READ) {
+                ctx->bulk_cached_len = 0;
+                ctx->proxy->bulk_owner_fd = -1;
+            } else {
+                // Update prefetch cache metadata
+                ctx->proxy->bulk_owner_fd = ctx->remote_fd;
+                ctx->bulk_cached_offset = cur_offset;
+                ctx->bulk_cached_len = bytes_read;
+            }
 
             auto to_copy = std::min(bytes_read, remaining);
             memcpy(dest, ctx->proxy->rdma_bulk_buf, to_copy);
@@ -1572,7 +1615,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
 
             // For prefetch path, one fetch is enough - subsequent small reads
             // will hit the cache at the top of this function.
-            if (remaining <= VFS_RDMA_BOUNCE_SIZE) {
+            if (!POSITIONAL_READ && remaining <= VFS_RDMA_BOUNCE_SIZE) {
                 break;
             }
         }
@@ -1591,9 +1634,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     const bool RDMA_PUSH_CAPABLE = !RDMA_PULL_CAPABLE && transport_supports_vfs_read_push_rdma(ctx->proxy->rdma_transport) &&
                                    ctx->proxy->rdma_capable && ctx->proxy->rdma_transport != nullptr && ctx->proxy->rdma_read_rkey != 0 &&
                                    ctx->proxy->rdma_bounce_buf != nullptr;
-    // Positional reads are used by exec/image loading and must preserve a strict
-    // offset-to-payload pairing, so keep them on the in-band message path.
-    if ((RDMA_PULL_CAPABLE || RDMA_PUSH_CAPABLE) && !POSITIONAL_READ) {
+    if (RDMA_PULL_CAPABLE || RDMA_PUSH_CAPABLE) {
         SharedIoSlotGuard const SHARED_IO_GUARD(ctx->proxy);
         int rdma_error = 0;
         while (remaining > 0) {
@@ -2457,7 +2498,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 
             perf_record_vfs_server_begin(SERVER_OP, hdr->src_node, channel_id, CORRELATION, CALLSITE);
             uint64_t const LOCAL_STARTED_US = wki_now_us();
-            ssize_t const BYTES_READ = read_local_file_with_retry(local_file, read_buf, len, static_cast<size_t>(offset));
+            ssize_t const BYTES_READ = read_local_file_windowed(local_file, read_buf, len, static_cast<size_t>(offset));
             perf_record_vfs_server_end(
                 SERVER_OP, hdr->src_node, channel_id, CORRELATION, (BYTES_READ >= 0) ? 0 : static_cast<int32_t>(BYTES_READ),
                 static_cast<uint32_t>(wki_now_us() - LOCAL_STARTED_US), (BYTES_READ > 0) ? static_cast<uint64_t>(BYTES_READ) : 0, CALLSITE);
@@ -3302,9 +3343,11 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             s_vfs_lock.unlock();
 
             if (local_file != nullptr) {
+                off_t const OLD_POS = local_file->pos;
                 off_t const POS = local_file->fops->vfs_lseek(local_file, static_cast<off_t>(offset), 2 /* SEEK_END */);
+                local_file->pos = OLD_POS;
 #ifdef DEBUG_WKI_VFS
-                ker::mod::dbg::log("[WKI-SRV] SEEK_END: fd=%d underlying_lseek returned %ld", fd_id, (long)pos);
+                ker::mod::dbg::log("[WKI-SRV] SEEK_END: fd=%d underlying_lseek returned %ld", fd_id, (long)POS);
 #endif
                 if (POS >= 0) {
                     new_pos = POS;
@@ -3384,7 +3427,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 break;
             }
 
-            ssize_t const BYTES_READ = read_local_file_with_retry(local_file, read_buf, len, static_cast<size_t>(offset));
+            ssize_t const BYTES_READ = read_local_file_windowed(local_file, read_buf, len, static_cast<size_t>(offset));
             if (BYTES_READ > 0) {
                 if (read_staging != nullptr) {
                     // Pull mode: copy into server staging buf; client will rdma_read from it.
@@ -3470,7 +3513,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 break;
             }
 
-            ssize_t const BYTES_READ = read_local_file_with_retry(local_file, read_buf, len, static_cast<size_t>(offset));
+            ssize_t const BYTES_READ = read_local_file_windowed(local_file, read_buf, len, static_cast<size_t>(offset));
             if (BYTES_READ > 0) {
                 if (bulk_staging != nullptr) {
                     // Pull mode: copy into server staging buf; client will rdma_read from it.

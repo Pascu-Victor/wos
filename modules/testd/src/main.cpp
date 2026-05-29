@@ -441,6 +441,51 @@ TESTD_RUN(test_vfs_unlink_rename) {
 }
 TESTD_RUN_END(test_vfs_unlink_rename)
 
+TESTD_RUN(test_vfs_lstat_symlink) {
+    const char* target = "/tmp/testd_lstat_target";
+    const char* link = "/tmp/testd_lstat_link";
+
+    unlink(link);
+    rmdir(target);
+    if (mkdir(target, MODE_0755) != 0) {
+        fail("vfs_lstat_mkdir", "mkdir target failed");
+        return;
+    }
+    if (symlink(target, link) != 0) {
+        rmdir(target);
+        fail("vfs_lstat_symlink_create", "symlink failed");
+        return;
+    }
+
+    struct stat st{};
+    if (lstat(link, &st) != 0 || !S_ISLNK(st.st_mode)) {
+        unlink(link);
+        rmdir(target);
+        fail("vfs_lstat_symlink", "lstat did not report symlink");
+        return;
+    }
+    if (stat(link, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        unlink(link);
+        rmdir(target);
+        fail("vfs_lstat_stat_follow", "stat did not follow symlink");
+        return;
+    }
+    if (rmdir(target) != 0) {
+        unlink(link);
+        fail("vfs_lstat_target_remove", "rmdir target failed");
+        return;
+    }
+    if (lstat(link, &st) != 0 || !S_ISLNK(st.st_mode)) {
+        unlink(link);
+        fail("vfs_lstat_dangling", "lstat failed on dangling symlink");
+        return;
+    }
+
+    unlink(link);
+    TESTD_PASS("vfs_lstat_symlink");
+}
+TESTD_RUN_END(test_vfs_lstat_symlink)
+
 TESTD_RUN(test_vfs_shell_fsops_shape) {
     const char* base = "/tmp/testd_fsops_shape";
     const char* d1 = "/tmp/testd_fsops_shape/d1";
@@ -604,6 +649,59 @@ TESTD_RUN(test_vfs_readdir) {
     TESTD_PASS("vfs_readdir");
 }
 TESTD_RUN_END(test_vfs_readdir)
+
+TESTD_RUN(test_vfs_readdir_unlink_progress) {
+    const char* dir_path = "/tmp/testd_readdir_unlink";
+    for (int i = 0; i < 8; ++i) {
+        std::array<char, 64> path{};
+        std::snprintf(path.data(), path.size(), "%s/f%d", dir_path, i);
+        unlink(path.data());
+    }
+    rmdir(dir_path);
+    if (mkdir(dir_path, MODE_0755) != 0) {
+        fail("vfs_readdir_unlink_mkdir", "mkdir failed");
+        return;
+    }
+
+    for (int i = 0; i < 8; ++i) {
+        std::array<char, 64> path{};
+        std::snprintf(path.data(), path.size(), "%s/f%d", dir_path, i);
+        int fd = open(path.data(), O_CREAT | O_WRONLY | O_TRUNC, MODE_0644);
+        if (fd < 0) {
+            fail("vfs_readdir_unlink_seed", "open seed failed");
+            return;
+        }
+        close(fd);
+    }
+
+    DIR* dir = opendir(dir_path);
+    if (dir == nullptr) {
+        fail("vfs_readdir_unlink_open", "opendir failed");
+        return;
+    }
+
+    struct dirent* ent = nullptr;
+    while ((ent = readdir(dir)) != nullptr) {
+        if (std::strcmp(ent->d_name, ".") == 0 || std::strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        std::array<char, 64> path{};
+        std::snprintf(path.data(), path.size(), "%s/%s", dir_path, ent->d_name);
+        if (unlink(path.data()) != 0) {
+            closedir(dir);
+            fail("vfs_readdir_unlink_remove", "unlink during readdir failed");
+            return;
+        }
+    }
+    closedir(dir);
+
+    if (rmdir(dir_path) != 0) {
+        fail("vfs_readdir_unlink_rmdir", "directory not empty after streamed unlink");
+        return;
+    }
+    TESTD_PASS("vfs_readdir_unlink_progress");
+}
+TESTD_RUN_END(test_vfs_readdir_unlink_progress)
 
 TESTD_RUN(test_vfs_directory_requirements) {
     const char* file = "/tmp/testd_not_dir.txt";
@@ -2181,10 +2279,12 @@ TESTD_RUN_END(test_remote_ipc_epoll_ctl_add)
     X(test_vfs_lseek)                           \
     X(test_vfs_mkdir_rmdir)                     \
     X(test_vfs_unlink_rename)                   \
+    X(test_vfs_lstat_symlink)                   \
     X(test_vfs_shell_fsops_shape)               \
     X(test_vfs_dup)                             \
     X(test_vfs_dup2)                            \
     X(test_vfs_readdir)                         \
+    X(test_vfs_readdir_unlink_progress)         \
     X(test_vfs_directory_requirements)          \
     X(test_vfs_rename_file_parent_enotdir)      \
     X(test_vfs_access)                          \

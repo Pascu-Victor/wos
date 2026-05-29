@@ -789,7 +789,10 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                         }
                     }
 
-                    // Bulk staging buffer (RoCE bulk pull mode): 2 MB staging for OP_VFS_READ_BULK.
+                    // Bulk staging buffer (RoCE bulk pull mode): server reads
+                    // large VFS chunks here, then the consumer pulls them via
+                    // RDMA. This keeps renderbench/file-transfer paths on the
+                    // 2 MiB bulk protocol instead of the 64 KiB fallback.
                     auto* bbuf = new (std::nothrow) uint8_t[VFS_RDMA_BULK_SIZE];
                     if (bbuf != nullptr) {
                         uint32_t brkey = 0;

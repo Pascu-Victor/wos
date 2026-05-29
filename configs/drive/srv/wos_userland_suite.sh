@@ -10,6 +10,7 @@
 #   WOS_SUITE_RUN_TESTPROG_PERF=0
 #   WOS_SUITE_RUN_STRACE=0
 #   WOS_SUITE_RUN_PERF_TRACE=0
+#   WOS_SUITE_KEEP_LARGE_WORK=1       # keep generated large *.bin files after successful runs
 #   WOS_SUITE_CASE_TIMEOUT_SECONDS=N   # override per-test timeout (0 disables)
 #   WOS_SUITE_TIMEOUT_KILL_GRACE_SECONDS=5
 
@@ -87,7 +88,13 @@ SUMMARY_FILE="$ARTIFACT_ROOT/summary.tsv"
 
 BEE_ITERATIONS="${WOS_SUITE_BEE_ITERATIONS:-$DEFAULT_BEE_ITERATIONS}"
 DATA_MIB="${WOS_SUITE_DATA_MIB:-$DEFAULT_DATA_MIB}"
-DATA_FILE="${WOS_SUITE_DATA_FILE:-$WORK_DIR/large-input.bin}"
+if [ "${WOS_SUITE_DATA_FILE+x}" = x ]; then
+    DATA_FILE="$WOS_SUITE_DATA_FILE"
+    DATA_FILE_OWNED=0
+else
+    DATA_FILE="$WORK_DIR/large-input.bin"
+    DATA_FILE_OWNED=1
+fi
 VFS_READ_SIZE="${WOS_SUITE_VFS_READ_SIZE:-65536}"
 VFS_READ_ITERATIONS="${WOS_SUITE_VFS_READ_ITERATIONS:-4}"
 VFS_STAT_ITERATIONS="${WOS_SUITE_VFS_STAT_ITERATIONS:-10000}"
@@ -116,6 +123,7 @@ RUN_TESTD="${WOS_SUITE_RUN_TESTD:-1}"
 RUN_TESTPROG_PERF="${WOS_SUITE_RUN_TESTPROG_PERF:-$DEFAULT_RUN_TESTPROG_PERF}"
 RUN_STRACE="${WOS_SUITE_RUN_STRACE:-1}"
 RUN_PERF_TRACE="${WOS_SUITE_RUN_PERF_TRACE:-1}"
+KEEP_LARGE_WORK="${WOS_SUITE_KEEP_LARGE_WORK:-0}"
 CASE_TIMEOUT_SECONDS="${WOS_SUITE_CASE_TIMEOUT_SECONDS:-$DEFAULT_CASE_TIMEOUT_SECONDS}"
 TIMEOUT_KILL_GRACE_SECONDS="${WOS_SUITE_TIMEOUT_KILL_GRACE_SECONDS:-5}"
 
@@ -270,6 +278,19 @@ skip_case() {
     SKIP=$((SKIP + 1))
     printf '\n=== SKIP %s ===\n%s\n' "$name" "$reason"
     record_summary "$name" "SKIP" "$reason"
+}
+
+cleanup_large_work() {
+    if [ "$KEEP_LARGE_WORK" = "1" ]; then
+        printf 'keeping large work files in %s\n' "$WORK_DIR"
+        return
+    fi
+
+    rm -f "$WORK_DIR/cp-output.bin" "$WORK_DIR/dd-output.bin"
+    if [ "$DATA_FILE_OWNED" = "1" ]; then
+        rm -f "$DATA_FILE"
+    fi
+    printf 'removed large work files from %s\n' "$WORK_DIR"
 }
 
 have_exe() {
@@ -548,6 +569,12 @@ if require_exe perf_stat /usr/bin/perf; then
     else
         skip_case perf_trace_vfs "disabled by WOS_SUITE_RUN_PERF_TRACE=$RUN_PERF_TRACE"
     fi
+fi
+
+if [ "$FAIL" -eq 0 ]; then
+    cleanup_large_work
+elif [ "$KEEP_LARGE_WORK" != "1" ]; then
+    printf 'keeping large work files after failed run for debugging: %s\n' "$WORK_DIR"
 fi
 
 printf '\n=== WOS USERLAND SUITE SUMMARY ===\n'

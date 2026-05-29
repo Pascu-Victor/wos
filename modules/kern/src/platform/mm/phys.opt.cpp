@@ -2,6 +2,7 @@
 
 #include <extern/limine.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -134,6 +135,8 @@ struct CallerStat {
 constexpr size_t CALLER_STAT_SLOTS = 64;
 __attribute__((section(".bss"))) std::array<CallerStat, CALLER_STAT_SLOTS> caller_stats{};
 std::atomic<bool> caller_stat_lock{false};
+std::atomic<bool> caller_stats_runtime_enabled{true};
+std::atomic<uint64_t> caller_stats_generation_value{1};
 #endif
 
 struct PhysRange {
@@ -223,6 +226,9 @@ void record_page_alloc_caller(void* caller_addr, uint64_t num_pages) {
     if (caller_addr == nullptr) {
         return;
     }
+    if (!caller_stats_runtime_enabled.load(std::memory_order_relaxed)) {
+        return;
+    }
     bool expected = false;
     while (!caller_stat_lock.compare_exchange_weak(expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
         expected = false;
@@ -251,6 +257,127 @@ void record_page_alloc_caller(void* caller_addr, uint64_t num_pages) {
 
 }  // namespace
 
+namespace {
+constexpr uint8_t FLAG_KIND_MASK = 0xC0U;
+constexpr uint8_t FLAG_ORDER_MASK = 0x1FU;
+
+[[maybe_unused]] void copy_cumulative_page_caller_stats_sorted(CallerPageStat* out, size_t max_rows, size_t& total_rows) {
+    total_rows = 0;
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    std::array<CallerStat, CALLER_STAT_SLOTS> snapshot{};
+    bool expected = false;
+    while (!caller_stat_lock.compare_exchange_weak(expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+        expected = false;
+        asm volatile("pause");
+    }
+    for (size_t i = 0; i < CALLER_STAT_SLOTS; i++) {
+        snapshot.at(i) = caller_stats.at(i);
+    }
+    caller_stat_lock.store(false, std::memory_order_release);
+
+    for (size_t i = 0; i < CALLER_STAT_SLOTS - 1; i++) {
+        size_t max_idx = i;
+        for (size_t j = i + 1; j < CALLER_STAT_SLOTS; j++) {
+            if (snapshot.at(j).pages > snapshot.at(max_idx).pages) {
+                max_idx = j;
+            }
+        }
+        if (max_idx != i) {
+            CallerStat const TMP = snapshot.at(i);
+            snapshot.at(i) = snapshot.at(max_idx);
+            snapshot.at(max_idx) = TMP;
+        }
+    }
+
+    for (const auto& row : snapshot) {
+        if (row.caller == 0 || row.pages == 0) {
+            continue;
+        }
+        if (out != nullptr && total_rows < max_rows) {
+            out[total_rows] = CallerPageStat{.caller = row.caller, .pages = row.pages};
+        }
+        total_rows++;
+    }
+#else
+    (void)out;
+    (void)max_rows;
+#endif
+}
+
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+void add_live_page_caller_stat(std::array<CallerPageStat, 128>& rows, size_t& row_count, uint64_t caller, uint64_t pages) {
+    if (pages == 0) {
+        return;
+    }
+    for (size_t i = 0; i < row_count; ++i) {
+        if (rows.at(i).caller == caller) {
+            rows.at(i).pages += pages;
+            return;
+        }
+    }
+    if (row_count < rows.size()) {
+        rows.at(row_count++) = CallerPageStat{.caller = caller, .pages = pages};
+    }
+}
+
+void copy_live_page_caller_stats_sorted(CallerPageStat* out, size_t max_rows, size_t& total_rows) {
+    std::array<CallerPageStat, 128> rows{};
+    size_t row_count = 0;
+
+    uint64_t const FLAGS = memlock.lock_irq();
+    auto scan_allocator = [&](const PageAllocator* alloc) {
+        if (alloc == nullptr || alloc->page_callers == nullptr || alloc->page_flags == nullptr) {
+            return;
+        }
+        uint32_t page = 0;
+        while (page < alloc->total_pages) {
+            uint8_t const PAGE_FLAGS = alloc->page_flags[page];
+            if ((PAGE_FLAGS & FLAG_KIND_MASK) != PageAllocator::FLAG_ALLOC_HEAD) {
+                page++;
+                continue;
+            }
+            int const ORDER = PAGE_FLAGS & FLAG_ORDER_MASK;
+            uint64_t const PAGES = (ORDER <= PageAllocator::MAX_ORDER) ? (1ULL << ORDER) : 1ULL;
+            uint64_t const CALLER = alloc->page_callers[page];
+            add_live_page_caller_stat(rows, row_count, CALLER, PAGES);
+            uint64_t const NEXT_PAGE = static_cast<uint64_t>(page) + PAGES;
+            page = NEXT_PAGE > alloc->total_pages ? alloc->total_pages : static_cast<uint32_t>(NEXT_PAGE);
+        }
+    };
+    for (paging::PageZone const* zone = zones; zone != nullptr; zone = zone->next) {
+        scan_allocator(zone->allocator);
+    }
+    if (huge_page_zone != nullptr) {
+        scan_allocator(huge_page_zone->allocator);
+    }
+    memlock.unlock_irq(FLAGS);
+
+    for (size_t i = 0; i < row_count; ++i) {
+        size_t max_idx = i;
+        for (size_t j = i + 1; j < row_count; ++j) {
+            if (rows.at(j).pages > rows.at(max_idx).pages) {
+                max_idx = j;
+            }
+        }
+        if (max_idx != i) {
+            CallerPageStat const TMP = rows.at(i);
+            rows.at(i) = rows.at(max_idx);
+            rows.at(max_idx) = TMP;
+        }
+    }
+
+    total_rows = row_count;
+    if (out == nullptr) {
+        return;
+    }
+    size_t const COPY_ROWS = std::min(max_rows, row_count);
+    for (size_t i = 0; i < COPY_ROWS; ++i) {
+        out[i] = rows.at(i);
+    }
+}
+#endif
+}  // namespace
+
 void dump_alloc_stats() {
     io::serial::write("Physical alloc stats: allocated=");
     io::serial::write_hex(total_allocated_bytes.load());
@@ -268,6 +395,138 @@ void dump_alloc_stats() {
 auto get_free_mem_bytes() -> uint64_t { return main_heap_size - (total_allocated_bytes.load() - total_freed_bytes.load()); }
 
 auto get_total_mem_bytes() -> uint64_t { return main_heap_size; }
+
+void get_alloc_stats_snapshot(AllocStatsSnapshot& out) {
+    uint64_t const ALLOCATED = total_allocated_bytes.load(std::memory_order_relaxed);
+    uint64_t const FREED = total_freed_bytes.load(std::memory_order_relaxed);
+    out = AllocStatsSnapshot{.total_allocated_bytes = ALLOCATED,
+                             .total_freed_bytes = FREED,
+                             .live_allocated_bytes = ALLOCATED >= FREED ? ALLOCATED - FREED : 0,
+                             .alloc_count = alloc_count.load(std::memory_order_relaxed),
+                             .free_count = free_count.load(std::memory_order_relaxed),
+                             .total_mem_bytes = get_total_mem_bytes(),
+                             .free_mem_bytes = get_free_mem_bytes()};
+}
+
+auto snapshot_zones(ZoneSnapshot* out, size_t max_rows) -> size_t {
+    if (out == nullptr || max_rows == 0) {
+        return 0;
+    }
+
+    static_assert(MEMACC_BUDDY_ORDER_COUNT == static_cast<size_t>(PageAllocator::MAX_ORDER + 1));
+
+    size_t rows = 0;
+    uint64_t const FLAGS = memlock.lock_irq();
+    for (paging::PageZone const* zone = zones; zone != nullptr && rows < max_rows; zone = zone->next) {
+        ZoneSnapshot snap{};
+        snap.zone_num = zone->zone_num;
+        snap.start = zone->start;
+        snap.len = zone->len;
+        snap.page_count = zone->page_count;
+        snap.name = zone->name;
+
+        if (zone->allocator != nullptr) {
+            snap.has_allocator = true;
+            const auto* alloc = zone->allocator;
+            snap.total_pages = alloc->total_pages;
+            snap.usable_pages = alloc->usable_pages;
+            snap.free_pages = alloc->free_count;
+            snap.metadata_pages = alloc->metadata_pages;
+
+            const auto* expected_flags = reinterpret_cast<const uint8_t*>(alloc->base + sizeof(PageAllocator));
+            snap.invalid_allocator = alloc->base == 0 || (alloc->base & (paging::PAGE_SIZE - 1)) != 0 ||
+                                     alloc->page_flags != expected_flags || alloc->total_pages == 0 ||
+                                     alloc->metadata_pages >= alloc->total_pages;
+            if (!snap.invalid_allocator) {
+                for (uint32_t i = 0; i < alloc->total_pages; i++) {
+                    uint8_t const FLAG = alloc->page_flags[i];
+                    if ((FLAG & FLAG_KIND_MASK) != PageAllocator::FLAG_FREE_HEAD) {
+                        continue;
+                    }
+                    uint8_t const ORD = FLAG & FLAG_ORDER_MASK;
+                    if (ORD > PageAllocator::MAX_ORDER) {
+                        snap.bad_order = true;
+                        continue;
+                    }
+                    snap.buddy_order_counts.at(ORD) += 1;
+                    snap.scanned_free_pages += (1U << ORD);
+                }
+                snap.free_count_mismatch = snap.scanned_free_pages != alloc->free_count;
+            }
+        }
+
+        out[rows++] = snap;
+    }
+    memlock.unlock_irq(FLAGS);
+    return rows;
+}
+
+auto page_caller_stats_available() -> bool {
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    return true;
+#else
+    return false;
+#endif
+}
+
+auto page_caller_stats_enabled() -> bool {
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    return caller_stats_runtime_enabled.load(std::memory_order_acquire);
+#else
+    return false;
+#endif
+}
+
+void page_caller_stats_set_enabled(bool enabled) {
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    caller_stats_runtime_enabled.store(enabled, std::memory_order_release);
+#else
+    (void)enabled;
+#endif
+}
+
+void page_caller_stats_reset() {
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    bool expected = false;
+    while (!caller_stat_lock.compare_exchange_weak(expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+        expected = false;
+        asm volatile("pause");
+    }
+    for (auto& row : caller_stats) {
+        row = {};
+    }
+    caller_stats_generation_value.fetch_add(1, std::memory_order_acq_rel);
+    caller_stat_lock.store(false, std::memory_order_release);
+#endif
+}
+
+auto page_caller_stats_generation() -> uint64_t {
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    return caller_stats_generation_value.load(std::memory_order_acquire);
+#else
+    return 0;
+#endif
+}
+
+auto page_caller_stats_default_enabled() -> bool {
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    return true;
+#else
+    return false;
+#endif
+}
+
+auto snapshot_page_caller_stats(CallerPageStat* out, size_t max_rows, size_t& total_rows) -> bool {
+    total_rows = 0;
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    copy_live_page_caller_stats_sorted(out, max_rows, total_rows);
+    return true;
+#else
+    (void)out;
+    (void)max_rows;
+    return false;
+#endif
+}
 
 void dump_caller_page_stats() {
 #ifndef WOS_PHYS_ALLOC_CALLER_STATS
@@ -323,7 +582,20 @@ auto get_zones() -> paging::PageZone* { return zones; }
 
 namespace {
 // Forward declaration
-auto find_free_block(uint64_t size) -> void*;
+auto find_free_block(uint64_t size, uint64_t caller = 0) -> void*;
+
+auto buddy_accounting_size(uint64_t size) -> uint64_t {
+    if (size == 0) {
+        return 0;
+    }
+
+    uint64_t pages = (size + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
+    uint64_t rounded_pages = 1;
+    while (rounded_pages < pages && rounded_pages < (uint64_t{1} << PageAllocator::MAX_ORDER)) {
+        rounded_pages <<= 1;
+    }
+    return rounded_pages * paging::PAGE_SIZE;
+}
 
 auto init_page_zone(uint64_t base, uint64_t len, uint64_t zone_num) -> paging::PageZone* {
     auto* zone = reinterpret_cast<paging::PageZone*>(base);
@@ -376,13 +648,13 @@ auto init_huge_page_zone(uint64_t base, uint64_t len) -> paging::PageZone* {
     return zone;
 }
 
-auto find_free_block(uint64_t size) -> void* {
+auto find_free_block(uint64_t size, uint64_t caller) -> void* {
     for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
         if (zone->len < size) {
             continue;
         }
 
-        void* const BLOCK = zone->allocator->alloc(size);
+        void* const BLOCK = zone->allocator->alloc(size, caller);
         if (BLOCK == nullptr) {
             [[unlikely]] continue;
         }
@@ -392,12 +664,12 @@ auto find_free_block(uint64_t size) -> void* {
     return nullptr;
 }
 
-auto find_free_block_huge(uint64_t size) -> void* {
+auto find_free_block_huge(uint64_t size, uint64_t caller = 0) -> void* {
     if (huge_page_zone == nullptr || huge_page_zone->len < size) {
         return nullptr;
     }
 
-    return huge_page_zone->allocator->alloc(size);
+    return huge_page_zone->allocator->alloc(size, caller);
 }
 
 }  // namespace
@@ -614,7 +886,12 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
 
     // Slow path: allocate from zones
     uint64_t const FLAGS = memlock.lock_irq();
-    void* block = find_free_block(size);
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    uint64_t const CALLER_TAG = caller_stats_runtime_enabled.load(std::memory_order_relaxed) ? reinterpret_cast<uint64_t>(caller_addr) : 0;
+#else
+    uint64_t const CALLER_TAG = 0;
+#endif
+    void* block = find_free_block(size, CALLER_TAG);
     memlock.unlock_irq(FLAGS);
 
     if (block == nullptr) {
@@ -636,7 +913,7 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
         return nullptr;
     }
 
-    total_allocated_bytes.fetch_add(size, std::memory_order_relaxed);
+    total_allocated_bytes.fetch_add(buddy_accounting_size(size), std::memory_order_relaxed);
     alloc_count.fetch_add(1, std::memory_order_relaxed);
 
     // Validate the returned address is in a reasonable HHDM range
@@ -698,14 +975,19 @@ auto page_alloc_huge(uint64_t size) -> void* {
 
     // Allocate from dedicated huge page zone
     uint64_t const FLAGS = memlock.lock_irq();
-    void* block = find_free_block_huge(size);
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    uint64_t const CALLER_TAG = caller_stats_runtime_enabled.load(std::memory_order_relaxed) ? reinterpret_cast<uint64_t>(caller_addr) : 0;
+#else
+    uint64_t const CALLER_TAG = 0;
+#endif
+    void* block = find_free_block_huge(size, CALLER_TAG);
     memlock.unlock_irq(FLAGS);
 
     if (block == nullptr) {
         return nullptr;
     }
 
-    total_allocated_bytes.fetch_add(size, std::memory_order_relaxed);
+    total_allocated_bytes.fetch_add(buddy_accounting_size(size), std::memory_order_relaxed);
     alloc_count.fetch_add(1, std::memory_order_relaxed);
 
     // Zero outside the lock - the block is exclusively ours now
@@ -764,9 +1046,9 @@ void page_free(void* page) {
         auto const PAGE_ADDR = reinterpret_cast<uint64_t>(page);
         if (PAGE_ADDR >= huge_page_zone->start && PAGE_ADDR < huge_page_zone->start + huge_page_zone->len) {
             if (huge_page_zone->allocator != nullptr) {
-                huge_page_zone->allocator->free(page);
+                uint64_t const FREED_BYTES = huge_page_zone->allocator->free(page);
                 free_count.fetch_add(1, std::memory_order_relaxed);
-                total_freed_bytes.fetch_add(paging::PAGE_SIZE, std::memory_order_relaxed);
+                total_freed_bytes.fetch_add(FREED_BYTES, std::memory_order_relaxed);
             }
             memlock.unlock_irq(FLAGS);
             return;
@@ -781,9 +1063,9 @@ void page_free(void* page) {
         }
 
         if (zone->allocator != nullptr) {
-            zone->allocator->free(page);
+            uint64_t const FREED_BYTES = zone->allocator->free(page);
             free_count.fetch_add(1, std::memory_order_relaxed);
-            total_freed_bytes.fetch_add(paging::PAGE_SIZE, std::memory_order_relaxed);
+            total_freed_bytes.fetch_add(FREED_BYTES, std::memory_order_relaxed);
         }
         break;
     }
@@ -905,9 +1187,9 @@ auto page_ref_dec(void* page) -> uint32_t {
                 }
 
                 // Refcount reached zero - free the page
-                alloc->free(page);
+                uint64_t const FREED_BYTES = alloc->free(page);
                 free_count.fetch_add(1, std::memory_order_relaxed);
-                total_freed_bytes.fetch_add(paging::PAGE_SIZE, std::memory_order_relaxed);
+                total_freed_bytes.fetch_add(FREED_BYTES, std::memory_order_relaxed);
             }
         }
         // If new_ref was already 0 (page already freed), do NOT call alloc->free again.

@@ -34,6 +34,13 @@ struct PageMapBatch {
     bool dirty{};
 };
 
+struct UserMemoryStats {
+    uint64_t virtual_pages;
+    uint64_t resident_pages;
+    uint64_t shared_pages;
+    uint64_t page_table_pages;
+};
+
 void init(limine_memmap_response* memmap_response, limine_executable_file_response* kernel_file_response,
           limine_executable_address_response* kernel_address_response);
 
@@ -68,6 +75,7 @@ void map_range_to_kernel_page_table(Range range, uint64_t flags);
 static constexpr paddr_t PADDR_INVALID = static_cast<paddr_t>(-1);
 
 paddr_t translate(PageTable* page_table, vaddr_t vaddr);
+auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats;
 
 // Free all user-space pages and page tables in a pagemap
 // Only frees the lower half (user space), keeps kernel mappings intact

@@ -65,28 +65,55 @@ ker::mod::sys::Spinlock tmpfs_lock;  // NOLINT(cppcoreguidelines-avoid-non-const
 // --- Internal helpers ---
 
 namespace {
-// Grow the children array of a directory node if needed
-void ensure_children_capacity(TmpNode* dir) {
-    if (dir->children_count < dir->children_capacity) {
+auto tmpfs_capacity_for_size(size_t size) -> size_t {
+    if (size == 0) {
+        return 0;
+    }
+    size_t cap = DEFAULT_TMPFS_BLOCK_SIZE;
+    while (cap < size) {
+        cap *= 2;
+    }
+    return cap;
+}
+
+// Grow the children slot array of a directory node if needed.
+void ensure_children_capacity(TmpNode* dir, size_t slot) {
+    if (slot < dir->children_capacity) {
         return;
     }
-    size_t const NEW_CAP = (dir->children_capacity == 0) ? INITIAL_CHILDREN_CAPACITY : dir->children_capacity * 2;
-    auto** new_arr = new TmpNode*[NEW_CAP];
+    size_t new_cap = (dir->children_capacity == 0) ? INITIAL_CHILDREN_CAPACITY : dir->children_capacity * 2;
+    while (slot >= new_cap) {
+        new_cap *= 2;
+    }
+    auto** new_arr = new TmpNode*[new_cap];
     for (size_t i = 0; i < dir->children_count; ++i) {
         new_arr[i] = dir->children[i];
     }
-    for (size_t i = dir->children_count; i < NEW_CAP; ++i) {
+    for (size_t i = dir->children_count; i < new_cap; ++i) {
         new_arr[i] = nullptr;
     }
     delete[] dir->children;
     dir->children = new_arr;
-    dir->children_capacity = NEW_CAP;
+    dir->children_capacity = new_cap;
 }
 
 void add_child(TmpNode* parent, TmpNode* child) {
-    ensure_children_capacity(parent);
-    parent->children[parent->children_count] = child;
-    parent->children_count++;
+    size_t slot = parent->children_count;
+    if (parent->open_count.load(std::memory_order_acquire) == 0) {
+        for (size_t i = 0; i < parent->children_count; ++i) {
+            if (parent->children[i] == nullptr) {
+                slot = i;
+                break;
+            }
+        }
+    }
+
+    ensure_children_capacity(parent, slot);
+    parent->children[slot] = child;
+    if (slot == parent->children_count) {
+        parent->children_count++;
+    }
+    parent->children_live_count++;
     child->parent = parent;
 }
 
@@ -96,17 +123,14 @@ auto tmpfs_write_locked(TmpNode* n, const void* buf, size_t count, size_t offset
     }
     size_t const NEED = offset + count;
     if (NEED > n->capacity) {
-        size_t newcap = (n->capacity == 0) ? DEFAULT_TMPFS_BLOCK_SIZE : n->capacity;
-        while (newcap < NEED) {
-            newcap *= 2;
-        }
-        char* nd = new char[newcap];
+        size_t const NEWCAP = tmpfs_capacity_for_size(NEED);
+        char* nd = new char[NEWCAP];
         if (n->data != nullptr) {
             std::memcpy(nd, n->data, n->size);
         }
         delete[] n->data;
         n->data = nd;
-        n->capacity = newcap;
+        n->capacity = NEWCAP;
     }
     std::memcpy(n->data + offset, buf, count);
     n->size = std::max(NEED, n->size);
@@ -114,18 +138,22 @@ auto tmpfs_write_locked(TmpNode* n, const void* buf, size_t count, size_t offset
 }
 
 auto tmpfs_resize_locked(TmpNode* n, size_t new_size) -> int {
-    if (new_size > n->capacity) {
-        size_t newcap = (n->capacity == 0) ? DEFAULT_TMPFS_BLOCK_SIZE : n->capacity;
-        while (newcap < new_size) {
-            newcap *= 2;
+    size_t const NEWCAP = tmpfs_capacity_for_size(new_size);
+    if (NEWCAP != n->capacity) {
+        if (NEWCAP == 0) {
+            delete[] n->data;
+            n->data = nullptr;
+            n->capacity = 0;
+            n->size = 0;
+            return 0;
         }
-        char* nd = new char[newcap];
+        char* nd = new char[NEWCAP];
         if (n->data != nullptr) {
-            std::memcpy(nd, n->data, n->size);
+            std::memcpy(nd, n->data, std::min(n->size, new_size));
         }
         delete[] n->data;
         n->data = nd;
-        n->capacity = newcap;
+        n->capacity = NEWCAP;
     }
     if (new_size > n->size) {
         std::memset(n->data + n->size, 0, new_size - n->size);
@@ -230,6 +258,45 @@ auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target)
     std::memcpy(node->symlink_target, target, target_len + 1);
     add_child(parent, node);
     return node;
+}
+
+auto tmpfs_attach_child(TmpNode* parent, TmpNode* child) -> bool {
+    if (parent == nullptr || child == nullptr || parent->type != TmpNodeType::DIRECTORY) {
+        return false;
+    }
+    add_child(parent, child);
+    return true;
+}
+
+auto tmpfs_detach_child(TmpNode* parent, TmpNode* child) -> bool {
+    if (parent == nullptr || child == nullptr || parent->type != TmpNodeType::DIRECTORY) {
+        return false;
+    }
+
+    for (size_t i = 0; i < parent->children_count; ++i) {
+        if (parent->children[i] != child) {
+            continue;
+        }
+
+        parent->children[i] = nullptr;
+        if (parent->children_live_count > 0) {
+            parent->children_live_count--;
+        }
+        child->parent = nullptr;
+
+        if (parent->open_count.load(std::memory_order_acquire) == 0) {
+            while (parent->children_count > 0 && parent->children[parent->children_count - 1] == nullptr) {
+                parent->children_count--;
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+auto tmpfs_directory_is_empty(const TmpNode* dir) -> bool {
+    return dir != nullptr && dir->type == TmpNodeType::DIRECTORY && dir->children_live_count == 0;
 }
 
 namespace {
@@ -602,20 +669,21 @@ auto tmpfs_fops_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int
         return 0;
     }
 
-    // Real children start at index 2
-    size_t const CHILD_INDEX = index - 2;
+    // Real children start at index 2.  The child array is sparse so open
+    // directory streams keep stable offsets while entries are removed.
+    size_t child_index = index - 2;
 
-    if (CHILD_INDEX >= n->children_count) {
+    while (child_index < n->children_count && n->children[child_index] == nullptr) {
+        child_index++;
+    }
+
+    if (child_index >= n->children_count) {
         return -ENOENT;
     }
 
-    TmpNode* child = n->children[CHILD_INDEX];
-    if (child == nullptr) {
-        return -ENOENT;
-    }
-
+    TmpNode* child = n->children[child_index];
     entry->d_ino = reinterpret_cast<uint64_t>(child);
-    entry->d_off = index + 1;
+    entry->d_off = child_index + 3;
     entry->d_reclen = sizeof(DirEntry);
 
     switch (child->type) {

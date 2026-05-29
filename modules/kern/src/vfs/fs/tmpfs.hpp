@@ -23,8 +23,9 @@ struct TmpNode {
     std::array<char, TMPFS_NAME_MAX> name{};  // Owned name copy
     TmpNodeType type = TmpNodeType::FILE;
     TmpNode* parent = nullptr;     // Back-pointer for ".." navigation
-    TmpNode** children = nullptr;  // Child node array (directories only)
-    size_t children_count = 0;
+    TmpNode** children = nullptr;  // Child node slots (directories only)
+    size_t children_count = 0;     // High-water slot count; may include null tombstones
+    size_t children_live_count = 0;
     size_t children_capacity = 0;
     char* symlink_target = nullptr;  // Target path (symlinks only)
 
@@ -61,6 +62,9 @@ auto tmpfs_lookup(TmpNode* dir, const char* name) -> TmpNode*;
 auto tmpfs_mkdir(TmpNode* parent, const char* name) -> TmpNode*;
 auto tmpfs_create_file(TmpNode* parent, const char* name, uint32_t create_mode = 0644) -> TmpNode*;
 auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target) -> TmpNode*;
+auto tmpfs_attach_child(TmpNode* parent, TmpNode* child) -> bool;
+auto tmpfs_detach_child(TmpNode* parent, TmpNode* child) -> bool;
+auto tmpfs_directory_is_empty(const TmpNode* dir) -> bool;
 
 // Walk a multi-component path relative to root.
 // If create_intermediate is true, missing directory components are created.

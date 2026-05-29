@@ -53,6 +53,7 @@ enum class ops : uint64_t {
     WKI_RULE_GET_DEFAULT,  // 45
     STATVFS,               // 46
     FSTATVFS,              // 47
+    LSTAT,                 // 48
 };
 
 }  // namespace ker::abi::vfs

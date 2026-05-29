@@ -18,6 +18,8 @@
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/paging.hpp>
+#include <platform/mm/phys.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 
@@ -192,6 +194,7 @@ size_t cache_total_bytes = 0;
 size_t cache_max_bytes = BUFFER_CACHE_DEFAULT_SIZE;
 size_t cache_total_buffers = 0;
 size_t cache_dirty_buffers = 0;
+size_t cache_dirty_bytes = 0;
 
 uint64_t stat_hits = 0;
 uint64_t stat_misses = 0;
@@ -226,58 +229,88 @@ void perf_record_xfs_count(ker::mod::perf::WkiPerfLocalXfsOp op, uint64_t bytes 
     ker::mod::perf::record_local_xfs_summary(op, status, 0, false, bytes);
 }
 
+auto allocate_buffer_data(size_t size, uint32_t& flags) -> uint8_t* {
+    flags &= ~BH_DATA_PAGE_ALLOC;
+    if (size >= ker::mod::mm::paging::PAGE_SIZE && (size % ker::mod::mm::paging::PAGE_SIZE) == 0) {
+        auto* page_data = ker::mod::mm::phys::page_alloc(size, "buffer_cache");
+        if (page_data == nullptr) {
+            return nullptr;
+        }
+        flags |= BH_DATA_PAGE_ALLOC;
+        return static_cast<uint8_t*>(page_data);
+    }
+    return new uint8_t[size];
+}
+
+void free_buffer_data(BufHead* bh) {
+    if (bh == nullptr || bh->data == nullptr) {
+        return;
+    }
+    if ((bh->flags & BH_DATA_PAGE_ALLOC) != 0) {
+        ker::mod::mm::phys::page_free(bh->data);
+    } else {
+        delete[] bh->data;
+    }
+    bh->data = nullptr;
+    bh->flags &= ~BH_DATA_PAGE_ALLOC;
+}
+
+void free_unlinked_buffer(BufHead* bh) {
+    if ((bh->flags & BH_DIRTY) != 0) {
+        cache_dirty_buffers--;
+        cache_dirty_bytes -= bh->size;
+    }
+    cache_total_bytes -= bh->size;
+    cache_total_buffers--;
+
+    free_buffer_data(bh);
+    delete bh;
+}
+
 // Free a buffer's resources completely (removes from hash + LRU).
 void free_buffer(BufHead* bh) {
     hash_remove(bh);
     lru_remove(bh);
 
-    if ((bh->flags & BH_DIRTY) != 0) {
-        cache_dirty_buffers--;
-    }
-    cache_total_bytes -= bh->size;
-    cache_total_buffers--;
+    free_unlinked_buffer(bh);
+}
 
-    delete[] bh->data;
-    delete bh;
+auto is_reclaimable_clean_buffer(const BufHead* bh) -> bool {
+    if (bh == nullptr || bh == &lru_sentinel) {
+        return false;
+    }
+    uint32_t constexpr BLOCKING_FLAGS = BH_DIRTY | BH_LOCKED | BH_WRITEBACK;
+    return bh->refcount.load(std::memory_order_relaxed) == 0 && (bh->flags & BLOCKING_FLAGS) == 0;
+}
+
+auto find_reclaimable_lru_buffer() -> BufHead* {
+    for (BufHead* cur = lru_tail(); cur != nullptr && cur != &lru_sentinel; cur = cur->lru_prev) {
+        if (is_reclaimable_clean_buffer(cur)) {  // NOLINT(clang-analyzer-cplusplus.NewDelete): victims are unlinked before delete.
+            return cur;
+        }
+    }
+    return nullptr;
 }
 
 // Try to evict unreferenced clean buffers until we are below the max cache size.
 void evict_lru() {
     while (cache_total_bytes > cache_max_bytes) {
-        BufHead* victim = lru_tail();
+        BufHead* victim = find_reclaimable_lru_buffer();
         if (victim == nullptr) {
             break;  // Nothing to evict
-        }
-        // Skip buffers that are still referenced or dirty
-        if (victim->refcount.load(std::memory_order_relaxed) > 0 || (victim->flags & BH_DIRTY) != 0) {
-            // Walk backwards looking for an evictable buffer
-            BufHead* cur = victim;
-            bool found = false;
-            while (cur != &lru_sentinel) {
-                if (cur->refcount.load(std::memory_order_relaxed) == 0 && (cur->flags & BH_DIRTY) == 0) {
-                    victim = cur;
-                    found = true;
-                    break;
-                }
-                cur = cur->lru_prev;
-            }
-            if (!found) {
-                break;  // All buffers are referenced or dirty - cannot evict
-            }
         }
         free_buffer(victim);
     }
 }
 
-// Allocate a new BufHead with backing data buffer.
-auto alloc_buffer(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
+auto alloc_buffer_with_size(dev::BlockDevice* bdev, uint64_t block_no, size_t size, uint32_t initial_flags) -> BufHead* {
     auto* bh = new BufHead{};
     if (bh == nullptr) {
         return nullptr;
     }
 
-    size_t const BLK_SIZE = bdev->block_size;
-    auto* data = new uint8_t[BLK_SIZE];
+    uint32_t data_flags = 0;
+    auto* data = allocate_buffer_data(size, data_flags);
     if (data == nullptr) {
         delete bh;
         return nullptr;
@@ -287,16 +320,21 @@ auto alloc_buffer(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     bh->block_no = block_no;
     bh->bdev = bdev;
     bh->refcount.store(1, std::memory_order_relaxed);
-    bh->flags = 0;
-    bh->size = BLK_SIZE;
+    bh->flags = initial_flags | data_flags;
+    bh->size = size;
     bh->lru_prev = nullptr;
     bh->lru_next = nullptr;
     bh->hash_next = nullptr;
 
-    cache_total_bytes += BLK_SIZE;
+    cache_total_bytes += size;
     cache_total_buffers++;
 
     return bh;
+}
+
+// Allocate a new BufHead with backing data buffer.
+auto alloc_buffer(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
+    return alloc_buffer_with_size(bdev, block_no, bdev->block_size, 0);
 }
 
 auto read_blocks_with_retry(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* data) -> int {
@@ -376,6 +414,7 @@ void buffer_cache_init() {
     cache_total_bytes = 0;
     cache_total_buffers = 0;
     cache_dirty_buffers = 0;
+    cache_dirty_bytes = 0;
     stat_hits = 0;
     stat_misses = 0;
     cache_initialized = true;
@@ -493,35 +532,14 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
     evict_lru();
 
     uint64_t const PERF_ALLOC_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC);
-    bh = new BufHead{};
+    bh = alloc_buffer_with_size(bdev, block_no, TOTAL_SIZE, 0);
     if (bh == nullptr) {
         cache_lock.unlock_irqrestore(irqflags);
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC, PERF_ALLOC_STARTED_US, -ENOMEM, 0);
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_MISS, PERF_STARTED_US, -ENOMEM, 0);
         return nullptr;
     }
-    auto* data = new uint8_t[TOTAL_SIZE];
-    if (data == nullptr) {
-        delete bh;
-        cache_lock.unlock_irqrestore(irqflags);
-        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC, PERF_ALLOC_STARTED_US, -ENOMEM, 0);
-        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_MISS, PERF_STARTED_US, -ENOMEM, 0);
-        return nullptr;
-    }
     uint32_t const PERF_ALLOC_US = PERF_ALLOC_STARTED_US != 0 ? perf_elapsed_since_us(PERF_ALLOC_STARTED_US) : 0;
-
-    bh->data = data;
-    bh->block_no = block_no;
-    bh->bdev = bdev;
-    bh->refcount.store(1, std::memory_order_relaxed);
-    bh->flags = 0;
-    bh->size = TOTAL_SIZE;
-    bh->lru_prev = nullptr;
-    bh->lru_next = nullptr;
-    bh->hash_next = nullptr;
-
-    cache_total_bytes += TOTAL_SIZE;
-    cache_total_buffers++;
 
     cache_lock.unlock_irqrestore(irqflags);
     if (PERF_ALLOC_STARTED_US != 0) {
@@ -530,7 +548,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
     perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_MISS, PERF_STARTED_US, 0, TOTAL_SIZE);
 
     // Read from disk outside the lock
-    int const RC = read_blocks_with_retry(bdev, block_no, count, data);
+    int const RC = read_blocks_with_retry(bdev, block_no, count, bh->data);
     if (RC != 0) {
         irqflags = cache_lock.lock_irqsave();
         free_buffer(bh);
@@ -579,6 +597,7 @@ auto bwrite(BufHead* bh) -> int {
         if ((bh->flags & BH_DIRTY) != 0) {
             bh->flags &= ~BH_DIRTY;
             cache_dirty_buffers--;
+            cache_dirty_bytes -= bh->size;
         }
         cache_lock.unlock_irqrestore(IRQFLAGS);
     }
@@ -596,6 +615,7 @@ void bdirty(BufHead* bh) {
     if ((bh->flags & BH_DIRTY) == 0) {
         bh->flags |= BH_DIRTY;
         cache_dirty_buffers++;
+        cache_dirty_bytes += bh->size;
         became_dirty = true;
     }
     cache_lock.unlock_irqrestore(IRQFLAGS);
@@ -635,7 +655,7 @@ auto bget(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_GET_MISS, PERF_STARTED_US, -ENOMEM, 0);
         return nullptr;
     }
-    bh->flags = BH_VALID;  // Mark valid without disk read
+    bh->flags |= BH_VALID;  // Mark valid without disk read
     hash_insert(bh);
     lru_touch(bh);
     cache_lock.unlock_irqrestore(IRQFLAGS);
@@ -673,35 +693,14 @@ auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufH
     evict_lru();
 
     uint64_t const PERF_ALLOC_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC);
-    bh = new BufHead{};
+    bh = alloc_buffer_with_size(bdev, block_no, TOTAL_SIZE, BH_VALID);
     if (bh == nullptr) {
         cache_lock.unlock_irqrestore(IRQFLAGS);
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC, PERF_ALLOC_STARTED_US, -ENOMEM, 0);
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_GET_MISS, PERF_STARTED_US, -ENOMEM, 0);
         return nullptr;
     }
-    auto* data = new uint8_t[TOTAL_SIZE];
-    if (data == nullptr) {
-        delete bh;
-        cache_lock.unlock_irqrestore(IRQFLAGS);
-        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC, PERF_ALLOC_STARTED_US, -ENOMEM, 0);
-        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_GET_MISS, PERF_STARTED_US, -ENOMEM, 0);
-        return nullptr;
-    }
     uint32_t const PERF_ALLOC_US = PERF_ALLOC_STARTED_US != 0 ? perf_elapsed_since_us(PERF_ALLOC_STARTED_US) : 0;
-
-    bh->data = data;
-    bh->block_no = block_no;
-    bh->bdev = bdev;
-    bh->refcount.store(1, std::memory_order_relaxed);
-    bh->flags = BH_VALID;
-    bh->size = TOTAL_SIZE;
-    bh->lru_prev = nullptr;
-    bh->lru_next = nullptr;
-    bh->hash_next = nullptr;
-
-    cache_total_bytes += TOTAL_SIZE;
-    cache_total_buffers++;
 
     hash_insert(bh);
     lru_touch(bh);
@@ -902,14 +901,7 @@ void invalidate_bdev(dev::BlockDevice* bdev) {
                 bh->hash_next = nullptr;
                 lru_remove(bh);
 
-                if ((bh->flags & BH_DIRTY) != 0) {
-                    cache_dirty_buffers--;
-                }
-                cache_total_bytes -= bh->size;
-                cache_total_buffers--;
-
-                delete[] bh->data;
-                delete bh;
+                free_unlinked_buffer(bh);
             } else {
                 pp = &bh->hash_next;
             }
@@ -945,15 +937,8 @@ void discard_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count)
             bh->hash_next = nullptr;
             lru_remove(bh);
 
-            if ((bh->flags & BH_DIRTY) != 0) {
-                cache_dirty_buffers--;
-            }
             discarded_bytes += bh->size;
-            cache_total_bytes -= bh->size;
-            cache_total_buffers--;
-
-            delete[] bh->data;
-            delete bh;
+            free_unlinked_buffer(bh);
         }
     }
 
@@ -969,11 +954,35 @@ auto buffer_cache_stats() -> BufferCacheStats {
     s.total_buffers = cache_total_buffers;
     s.dirty_buffers = cache_dirty_buffers;
     s.total_bytes = cache_total_bytes;
+    s.dirty_bytes = cache_dirty_bytes;
+    s.clean_bytes = cache_total_bytes >= cache_dirty_bytes ? cache_total_bytes - cache_dirty_bytes : 0;
     s.max_bytes = cache_max_bytes;
     s.hits = stat_hits;
     s.misses = stat_misses;
     cache_lock.unlock_irqrestore(IRQFLAGS);
     return s;
+}
+
+auto reclaim_clean_buffer_cache(size_t target_bytes) -> BufferCacheReclaimStats {
+    BufferCacheReclaimStats stats{};
+    if (!cache_initialized) {
+        return stats;
+    }
+
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    stats.before_bytes = cache_total_bytes;
+    while (cache_total_bytes > target_bytes) {
+        BufHead* victim = find_reclaimable_lru_buffer();
+        if (victim == nullptr) {
+            break;
+        }
+        stats.freed_buffers++;
+        stats.freed_bytes += victim->size;
+        free_buffer(victim);
+    }
+    stats.after_bytes = cache_total_bytes;
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    return stats;
 }
 
 }  // namespace ker::vfs

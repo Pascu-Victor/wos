@@ -3,6 +3,12 @@
 #include <cstdint>
 
 namespace ker::syscall::vmem {
+struct FileMmapCacheStats {
+    uint64_t pages;
+    uint64_t bytes;
+    uint64_t capacity_pages;
+};
+
 // Virtual memory syscall handler
 // op: operation code (anon_allocate, anon_free)
 // a1: hint address (for allocate) or address to free
@@ -19,5 +25,6 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
 // offset: offset in file (for file-backed mappings)
 // addr: address to map (for MAP_FIXED) or 0
 auto sys_vmem_map(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) -> uint64_t;
+auto file_mmap_cache_stats() -> FileMmapCacheStats;
 
 }  // namespace ker::syscall::vmem

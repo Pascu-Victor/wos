@@ -38,11 +38,14 @@ struct PageAllocator {
     std::array<FreeBlock*, MAX_ORDER + 1> free_list{};  // one singly-linked list per order
     uint8_t* page_flags = nullptr;                      // 1 byte per page
     uint32_t* page_refcounts = nullptr;                 // 1 refcount per page (for COW fork)
-    uint64_t base = 0;                                  // HHDM start of the managed region
-    uint32_t total_pages = 0;                           // total pages in the region (incl. metadata)
-    uint32_t usable_pages = 0;                          // pages available for allocation
-    uint32_t free_count = 0;                            // current free page count
-    uint32_t metadata_pages = 0;                        // pages consumed by metadata
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    uint64_t* page_callers = nullptr;  // allocation return address for each live page
+#endif
+    uint64_t base = 0;            // HHDM start of the managed region
+    uint32_t total_pages = 0;     // total pages in the region (incl. metadata)
+    uint32_t usable_pages = 0;    // pages available for allocation
+    uint32_t free_count = 0;      // current free page count
+    uint32_t metadata_pages = 0;  // pages consumed by metadata
 
     // Initialise this allocator over the zone starting at `zoneBase`
     // (HHDM address) with `sizeBytes` total bytes.  Metadata is placed at
@@ -52,11 +55,12 @@ struct PageAllocator {
     // Allocate >= sizeBytes of contiguous physical pages (rounded up to the
     // next power-of-two page count).  Returns an HHDM pointer or nullptr on
     // failure.
-    void* alloc(uint64_t size_bytes);
+    void* alloc(uint64_t size_bytes, uint64_t caller = 0);
 
     // Free a previous allocation.  The allocation order is recovered from the
-    // per-page flags - callers do not need to supply the size.
-    void free(void* ptr);
+    // per-page flags - callers do not need to supply the size. Returns the
+    // number of bytes released, or 0 if the pointer was not a live allocation.
+    uint64_t free(void* ptr);
 
     // Re-tag a contiguous allocated block as a run of independently freeable
     // order-0 pages while preserving the existing per-page refcounts.

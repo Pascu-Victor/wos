@@ -136,6 +136,13 @@ struct WkiRemoteSpawnSpec {
     const char* cwd = nullptr;
 };
 
+struct WkiSharedElfCacheStats {
+    uint64_t entries;
+    uint64_t bytes;
+    uint64_t max_entries;
+    uint64_t max_bytes;
+};
+
 // -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
@@ -193,6 +200,7 @@ void wki_remote_compute_cleanup_for_peer(uint16_t node_id);
 // Returns true when the buffer was owned by the shared cache and must not be
 // deleted by the caller.
 auto wki_remote_compute_release_elf_buffer(uint8_t* buffer) -> bool;
+auto wki_shared_elf_cache_stats() -> WkiSharedElfCacheStats;
 
 // V2 A7.4: Forward an interrupt/termination signal to a remote task if the
 // target is a WKI proxy. Called from kill()/process-group signal delivery.

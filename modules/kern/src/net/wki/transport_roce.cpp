@@ -59,6 +59,8 @@ struct RoceRegion {
     void* vaddr = nullptr;
     uint32_t size = 0;
     bool temporary = false;
+    uint32_t received_bytes = 0;
+    bool receive_gap = false;
     RoceRegion* next = nullptr;
 };
 
@@ -143,6 +145,8 @@ auto region_register(uint64_t vaddr, uint32_t size, bool temporary, uint32_t* rk
     region->vaddr = reinterpret_cast<void*>(vaddr);
     region->size = size;
     region->temporary = temporary;
+    region->received_bytes = 0;
+    region->receive_gap = false;
 
     RoceRegion*& bucket = region_bucket(NEW_RKEY);
     region->next = bucket;
@@ -171,13 +175,13 @@ auto region_unregister(uint32_t rkey) -> bool {
     return removed != nullptr;
 }
 
-auto region_unregister_temporary(uint32_t rkey) -> bool {
+auto region_unregister_completed_temporary(uint32_t rkey) -> bool {
     RoceRegion* removed = nullptr;
     uint64_t const FLAGS = s_region_lock.lock_irqsave();
     RoceRegion** link = &region_bucket(rkey);
     while (*link != nullptr) {
         if ((*link)->rkey == rkey) {
-            if (!(*link)->temporary) {
+            if (!(*link)->temporary || (*link)->receive_gap || (*link)->received_bytes < (*link)->size) {
                 break;
             }
             removed = *link;
@@ -227,6 +231,14 @@ auto region_write(uint32_t rkey, uint64_t offset, const uint8_t* payload, uint32
     }
 
     memcpy(static_cast<uint8_t*>(region->vaddr) + offset, payload, length);
+    if (region->temporary) {
+        auto const WRITE_OFFSET = static_cast<uint32_t>(offset);
+        if (!region->receive_gap && WRITE_OFFSET == region->received_bytes) {
+            region->received_bytes += length;
+        } else if (WRITE_OFFSET + length > region->received_bytes) {
+            region->receive_gap = true;
+        }
+    }
     s_region_lock.unlock_irqrestore(FLAGS);
     return true;
 }
@@ -421,6 +433,7 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
             const auto* src_data = static_cast<const uint8_t*>(region.vaddr) + hdr->offset;
             uint32_t remaining = hdr->length;
             uint64_t write_offset = 0;
+            bool send_ok = true;
 
             while (remaining > 0) {
                 uint32_t const CHUNK = (remaining > ROCE_MAX_PAYLOAD) ? ROCE_MAX_PAYLOAD : remaining;
@@ -434,11 +447,18 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
                 resp_hdr.length = CHUNK;
                 resp_hdr.doorbell_val = 0;
 
-                roce_eth_tx(hdr->src_node, resp_hdr, src_data, CHUNK);
+                if (roce_eth_tx(hdr->src_node, resp_hdr, src_data, CHUNK) != 0) {
+                    send_ok = false;
+                    break;
+                }
 
                 src_data += CHUNK;
                 write_offset += CHUNK;
                 remaining -= CHUNK;
+            }
+
+            if (!send_ok) {
+                break;
             }
 
             // Send a DOORBELL to signal read completion - deregister the temp region
@@ -469,7 +489,7 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
             // (always >= 0x00010001).
             uint32_t const VAL = hdr->doorbell_val;
 
-            if (region_unregister_temporary(VAL)) {
+            if (region_unregister_completed_temporary(VAL)) {
                 // Read-completion doorbell - deregister temporary region to
                 // unblock the roce_rdma_read spin-wait.
                 break;

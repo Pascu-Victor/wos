@@ -176,6 +176,7 @@ EOF
 export USER="${USER:-root}"
 export HOSTNAME="${HOSTNAME:-wos}"
 export HOME="${HOME:-/root}"
+export TERM="${TERM:-xterm-256color}"
 export PS1="$USER@$HOSTNAME:\w\$ "
 export ENV="/etc/profile"
 EOF

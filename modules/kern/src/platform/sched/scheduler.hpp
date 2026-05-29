@@ -35,6 +35,18 @@ struct RunQueue {
     // Last timer timestamp (microseconds from HPET) for computing delta
     uint64_t last_tick_us{0};
 
+    // Linux-style CPU accounting buckets, stored in microseconds. These are
+    // updated from timer/IRQ paths, so keep them allocation-free and lock-free.
+    std::atomic<uint64_t> cpu_user_us;
+    std::atomic<uint64_t> cpu_nice_us;
+    std::atomic<uint64_t> cpu_system_us;
+    std::atomic<uint64_t> cpu_idle_us;
+    std::atomic<uint64_t> cpu_iowait_us;
+    std::atomic<uint64_t> cpu_irq_us;
+    std::atomic<uint64_t> cpu_softirq_us;
+    std::atomic<uint64_t> cpu_steal_us;
+    std::atomic<uint64_t> irq_uncharged_us;
+
     // Timestamp (µs) when currentTask most recently started running on this CPU.
     // Used by the wakeup min-granularity guard in process_tasks: a justWoke task
     // cannot preempt the running task until it has been running for at least
@@ -60,7 +72,15 @@ struct RunQueue {
 
     RunQueue()
         : is_idle(false),
-
+          cpu_user_us(0),
+          cpu_nice_us(0),
+          cpu_system_us(0),
+          cpu_idle_us(0),
+          cpu_iowait_us(0),
+          cpu_irq_us(0),
+          cpu_softirq_us(0),
+          cpu_steal_us(0),
+          irq_uncharged_us(0),
           idle_timer_arms(0),
           idle_timer_disarms(0),
           idle_timer_wakeups(0),
@@ -99,6 +119,27 @@ struct SchedulerCpuState {
     bool is_idle;
     uint64_t runnable_count;
     uint64_t wait_queue_count;
+};
+
+struct CpuAccountingSnapshot {
+    uint64_t user_us;
+    uint64_t nice_us;
+    uint64_t system_us;
+    uint64_t idle_us;
+    uint64_t iowait_us;
+    uint64_t irq_us;
+    uint64_t softirq_us;
+    uint64_t steal_us;
+};
+
+struct LoadAverageSnapshot {
+    uint64_t load1_milli;
+    uint64_t load5_milli;
+    uint64_t load15_milli;
+    uint32_t runnable_tasks;
+    uint32_t uninterruptible_tasks;
+    uint32_t total_tasks;
+    uint64_t last_pid;
 };
 
 void init();
@@ -161,6 +202,9 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
 void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame);
 void arm_idle_timer_for_this_cpu();
 void note_scheduler_timer_interrupt();
+void account_irq_time_us(uint64_t elapsed_us);
+auto get_cpu_accounting_snapshot(uint64_t cpu_no) -> CpuAccountingSnapshot;
+auto get_load_average_snapshot() -> LoadAverageSnapshot;
 bool has_run_queues();
 void begin_syscall_accounting();
 void finish_syscall_accounting();

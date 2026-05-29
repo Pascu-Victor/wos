@@ -68,6 +68,7 @@ auto vfs_readlink_resolved(const char* path, char* buf, size_t bufsize) -> ssize
 
 // Stat operations
 auto vfs_stat(const char* path, Stat* statbuf) -> int;
+auto vfs_lstat(const char* path, Stat* statbuf) -> int;
 auto vfs_stat_resolved(const char* path, Stat* statbuf) -> int;
 auto vfs_fstat(int fd, Stat* statbuf) -> int;
 

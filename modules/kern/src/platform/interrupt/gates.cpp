@@ -667,11 +667,15 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, InterruptFrame frame) {
     }
     const auto VECTOR = static_cast<size_t>(frame.int_num);
     bool const TRACE_IRQ = perf::is_local_irq_recording_enabled();
-    uint64_t const IRQ_STARTED_US = TRACE_IRQ ? time::get_us() : 0;
+    uint64_t const IRQ_ACCOUNT_STARTED_US = time::get_us();
+    uint64_t const IRQ_STARTED_US = TRACE_IRQ ? IRQ_ACCOUNT_STARTED_US : 0;
 
     if (irq_contexts.at(VECTOR).handler != nullptr) {
         irq_contexts.at(VECTOR).handler(static_cast<uint8_t>(frame.int_num), irq_contexts.at(VECTOR).data);
         ker::mod::apic::eoi();
+        uint64_t const IRQ_ACCOUNT_FINISHED_US = time::get_us();
+        sched::account_irq_time_us(IRQ_ACCOUNT_FINISHED_US >= IRQ_ACCOUNT_STARTED_US ? IRQ_ACCOUNT_FINISHED_US - IRQ_ACCOUNT_STARTED_US
+                                                                                     : 0);
         record_irq_perf(static_cast<uint8_t>(frame.int_num), IRQ_KIND_CONTEXT, 0, IRQ_STARTED_US);
         return;
     }
@@ -692,6 +696,8 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, InterruptFrame frame) {
         return;
     }
     ker::mod::apic::eoi();
+    uint64_t const IRQ_ACCOUNT_FINISHED_US = time::get_us();
+    sched::account_irq_time_us(IRQ_ACCOUNT_FINISHED_US >= IRQ_ACCOUNT_STARTED_US ? IRQ_ACCOUNT_FINISHED_US - IRQ_ACCOUNT_STARTED_US : 0);
     record_irq_perf(static_cast<uint8_t>(frame.int_num), irq_kind, irq_status, IRQ_STARTED_US);
 }
 

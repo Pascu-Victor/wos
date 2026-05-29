@@ -168,6 +168,12 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             int const RET = ker::vfs::vfs_stat(path, statbuf);
             return static_cast<int64_t>(RET);
         }
+        case ops::LSTAT: {
+            const auto* path = reinterpret_cast<const char*>(a1);
+            auto* statbuf = reinterpret_cast<ker::vfs::Stat*>(a2);
+            int const RET = ker::vfs::vfs_lstat(path, statbuf);
+            return static_cast<int64_t>(RET);
+        }
         case ops::FSTAT: {
             int const FD = static_cast<int>(a1);
             auto* statbuf = reinterpret_cast<ker::vfs::Stat*>(a2);

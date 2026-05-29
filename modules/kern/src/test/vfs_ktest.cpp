@@ -5,6 +5,7 @@
 #include <cstring>
 #include <test/ktest.hpp>
 #include <vfs/file.hpp>
+#include <vfs/file_operations.hpp>
 #include <vfs/fs/tmpfs.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/stat.hpp>
@@ -117,6 +118,72 @@ KTEST(VFS, Unlink) {
     // After unlink the file is gone from the directory
     ker::vfs::File* f2 = ker::vfs::vfs_open_file("/tmp/ktest_unlink", 0, 0);
     KEXPECT_EQ(f2, nullptr);
+}
+
+KTEST(VFS, TmpfsReaddirKeepsStableOffsetsAcrossDeletes) {
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR = "/tmp/ktest_readdir_delete";
+    constexpr const char* FILES[] = {
+        "/tmp/ktest_readdir_delete/f0", "/tmp/ktest_readdir_delete/f1", "/tmp/ktest_readdir_delete/f2", "/tmp/ktest_readdir_delete/f3",
+        "/tmp/ktest_readdir_delete/f4", "/tmp/ktest_readdir_delete/f5", "/tmp/ktest_readdir_delete/f6", "/tmp/ktest_readdir_delete/f7",
+    };
+
+    for (const char* path : FILES) {
+        ker::vfs::vfs_unlink(path);
+    }
+    ker::vfs::vfs_rmdir(DIR);
+    KEXPECT_EQ(ker::vfs::vfs_mkdir(DIR, 0755), 0);
+
+    for (const char* path : FILES) {
+        ker::vfs::File* f = ker::vfs::vfs_open_file(path, ker::vfs::O_CREAT | 1, 0644);
+        KREQUIRE_NE(f, nullptr);
+        ker::vfs::vfs_put_file(f);
+    }
+
+    ker::vfs::File* dir = ker::vfs::vfs_open_file(DIR, 0, 0);
+    KREQUIRE_NE(dir, nullptr);
+    KREQUIRE_NE(dir->fops, nullptr);
+    KREQUIRE_NE(dir->fops->vfs_readdir, nullptr);
+
+    for (size_t i = 0; i < 5; ++i) {
+        KEXPECT_EQ(ker::vfs::vfs_unlink(FILES[i]), 0);
+    }
+
+    ker::vfs::DirEntry entry{};
+    KEXPECT_EQ(dir->fops->vfs_readdir(dir, &entry, 7), 0);
+    KEXPECT_TRUE(std::strcmp(entry.d_name.data(), "f5") == 0);
+    ker::vfs::vfs_put_file(dir);
+
+    for (size_t i = 5; i < 8; ++i) {
+        ker::vfs::vfs_unlink(FILES[i]);
+    }
+    KEXPECT_EQ(ker::vfs::vfs_rmdir(DIR), 0);
+}
+
+KTEST(VFS, LstatDoesNotFollowFinalTmpfsSymlink) {
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* TARGET = "/tmp/ktest_lstat_target";
+    constexpr const char* LINK = "/tmp/ktest_lstat_link";
+
+    ker::vfs::vfs_unlink(LINK);
+    ker::vfs::vfs_rmdir(TARGET);
+    KEXPECT_EQ(ker::vfs::vfs_mkdir(TARGET, 0755), 0);
+    KEXPECT_EQ(ker::vfs::vfs_symlink(TARGET, LINK), 0);
+
+    ker::vfs::Stat st{};
+    KEXPECT_EQ(ker::vfs::vfs_lstat(LINK, &st), 0);
+    KEXPECT_TRUE((st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFLNK);
+    KEXPECT_EQ(ker::vfs::vfs_stat(LINK, &st), 0);
+    KEXPECT_TRUE((st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFDIR);
+
+    KEXPECT_EQ(ker::vfs::vfs_rmdir(TARGET), 0);
+    KEXPECT_EQ(ker::vfs::vfs_lstat(LINK, &st), 0);
+    KEXPECT_TRUE((st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFLNK);
+    KEXPECT_NE(ker::vfs::vfs_stat(LINK, &st), 0);
+
+    KEXPECT_EQ(ker::vfs::vfs_unlink(LINK), 0);
 }
 
 KTEST(VFS, Mkdir) {

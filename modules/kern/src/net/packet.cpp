@@ -73,6 +73,11 @@ auto round_up_growth(size_t count) -> size_t {
     return count + (PKT_POOL_GROW_CHUNK - REM);
 }
 
+auto baseline_pool_capacity() -> size_t {
+    size_t const NIC_COUNT = netdev_count();
+    return std::max(NIC_COUNT * PKT_POOL_PER_NIC, PKT_POOL_MIN_SIZE);
+}
+
 #ifdef WOS_NET_PACKET_DEBUG
 void pkt_debug_dump_in_use(size_t avail) {
     std::array<SiteSummary, DEBUG_SITE_TRACK_SLOTS> site_counts{};
@@ -161,11 +166,12 @@ void add_buffers_to_pool(size_t count) {
         free_list = &new_buffers[i];
     }
     pool_capacity += count;
+    size_t const TOTAL = pool_capacity;
     pool_lock.unlock();
 
     free_count.fetch_add(count, std::memory_order_relaxed);
 
-    log::debug("Added %zu packet buffers (total: %zu)", count, pool_capacity);
+    log::debug("Added %zu packet buffers (total: %zu)", count, TOTAL);
 }
 
 auto pkt_pool_try_grow(size_t min_free, const char* reason) -> bool {
@@ -227,13 +233,11 @@ void pkt_pool_init() {
 
 void pkt_pool_expand_for_nics() {
     // Calculate required size: 1024 buffers per NIC, minimum 1024 total
-    size_t const NIC_COUNT = netdev_count();
-    size_t required = NIC_COUNT * PKT_POOL_PER_NIC;
-    required = std::max(required, PKT_POOL_MIN_SIZE);
+    size_t const REQUIRED = baseline_pool_capacity();
 
     // Add more buffers if needed
-    if (required > pool_capacity) {
-        size_t const TO_ADD = required - pool_capacity;
+    if (REQUIRED > pool_capacity) {
+        size_t const TO_ADD = REQUIRED - pool_capacity;
         add_buffers_to_pool(TO_ADD);
     }
 }
@@ -244,19 +248,34 @@ auto pkt_pool_free_count() -> size_t { return free_count.load(std::memory_order_
 
 auto pkt_pool_snapshot() -> PacketPoolSnapshot {
     PacketPoolSnapshot snapshot{};
+    snapshot.baseline_capacity = baseline_pool_capacity();
     uint64_t const FLAGS = pool_lock.lock_irqsave();
     snapshot.capacity = pool_capacity;
     pool_lock.unlock_irqrestore(FLAGS);
 
     snapshot.free = free_count.load(std::memory_order_relaxed);
     snapshot.used = snapshot.capacity > snapshot.free ? snapshot.capacity - snapshot.free : 0;
+    snapshot.active_capacity = snapshot.capacity;
     snapshot.rx_reserve = RX_RESERVE;
     snapshot.grow_chunk = PKT_POOL_GROW_CHUNK;
     snapshot.buffer_size = PKT_BUF_SIZE;
+    snapshot.object_size = sizeof(PacketBuffer);
     snapshot.headroom = PKT_HEADROOM;
     snapshot.tx_refused = refuse_count.load(std::memory_order_relaxed);
     snapshot.expand_in_progress = expand_in_progress.load(std::memory_order_acquire);
     return snapshot;
+}
+
+auto pkt_pool_reclaim_free(size_t target_capacity) -> PacketPoolReclaimStats {
+    PacketPoolReclaimStats stats{};
+    static_cast<void>(target_capacity);
+    uint64_t const FLAGS = pool_lock.lock_irqsave();
+    stats.before_capacity = pool_capacity;
+    stats.before_free = free_count.load(std::memory_order_relaxed);
+    stats.after_capacity = pool_capacity;
+    stats.after_free = stats.before_free;
+    pool_lock.unlock_irqrestore(FLAGS);
+    return stats;
 }
 
 void pkt_pool_ensure_free(size_t min_free) { static_cast<void>(pkt_pool_try_grow(min_free, "runtime")); }

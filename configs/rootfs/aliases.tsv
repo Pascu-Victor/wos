@@ -3,6 +3,8 @@ copy	configs/rootfs/etc/services	/etc/services
 copy	build/modules/testprog/testprog	/usr/bin/testprog
 copy	build/modules/testd/testd	/usr/bin/testd
 copy	build/modules/perf/perf	/usr/bin/perf
+copy	build/modules/top/top	/usr/bin/top
+copy	build/modules/memacc/memacc	/usr/bin/memacc
 copy	build/modules/renderbench/renderbench	/usr/bin/renderbench
 copy-mode	configs/drive/srv/wos_userland_suite.sh	/usr/bin/wos-userland-suite	755
 copy	build/modules/debugserver/debugserver	/usr/bin/debugserver

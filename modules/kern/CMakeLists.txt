@@ -15,9 +15,15 @@ option(WOS_KCOV_PANIC_TRACE        "Record a recent-PC ring for panic dumps usin
 option(WOS_SELFTEST                "Enable kernel self-test mode (--selftest cmdline flag)"             ON)
 option(WOS_NET_TRACE               "Enable network hot-path cycle-count trace spans"                    OFF)
 option(WOS_NET_PACKET_DEBUG        "Track packet buffer allocation provenance and TX-refusal snapshots" OFF)
-option(WOS_PHYS_ALLOC_CALLER_STATS "Track physical page allocation call sites for OOM reports"          OFF)
-option(WOS_PHYS_LOCK_DEBUG         "Track physical allocator memlock holder CR3/CPU/RIP"                OFF)
-option(WOS_KMALLOC_DEBUG_INFO      "Track kmalloc allocation call sites/tags for OOM/corruption dumps"  OFF)
+option(WOS_PHYS_ALLOC_CALLER_STATS "Track physical page allocation call sites for OOM reports"          ON)
+option(WOS_PHYS_LOCK_DEBUG         "Track physical allocator memlock holder CR3/CPU/RIP"                ON)
+option(WOS_KMALLOC_DEBUG_INFO      "Track kmalloc allocation call sites/tags for OOM/corruption dumps"  ON)
+option(WOS_MEMACC_FULL_DEFAULT     "Compile and default-enable full memacc allocation provenance"       ON)
+
+if(WOS_MEMACC_FULL_DEFAULT)
+    set(WOS_PHYS_ALLOC_CALLER_STATS ON CACHE BOOL "Track physical page allocation call sites for OOM reports" FORCE)
+    set(WOS_KMALLOC_DEBUG_INFO ON CACHE BOOL "Track kmalloc allocation call sites/tags for OOM/corruption dumps" FORCE)
+endif()
 
 if(WOS_KCOV_PANIC_TRACE AND NOT WOS_KCOV)
     message(FATAL_ERROR "WOS_KCOV_PANIC_TRACE requires WOS_KCOV=ON")
@@ -171,6 +177,11 @@ if(WOS_SELFTEST)
     message(STATUS "[WOS] Self-test mode enabled (boot with --selftest to run)")
 endif()
 
+if(WOS_MEMACC_FULL_DEFAULT)
+    target_compile_definitions(${KERNEL} PRIVATE WOS_MEMACC_FULL_DEFAULT=1)
+    message(STATUS "[WOS] memacc full provenance default enabled")
+endif()
+
 if(WOS_NET_TRACE)
     target_compile_definitions(${KERNEL} PRIVATE NET_TRACE=1)
     message(STATUS "[WOS] Network hot-path trace spans enabled")
@@ -224,4 +235,3 @@ target_compile_definitions(${KERNEL} PRIVATE "WOS_BUILDER=\"${_WOS_USER}@${_WOS_
 target_link_options(${KERNEL} PRIVATE ${CMAKE_LINK_FLAGS})
 
 # target_link_libraries(${KERNEL} stdkern)
-

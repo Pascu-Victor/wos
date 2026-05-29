@@ -433,6 +433,8 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "statvfs";
                 case ker::abi::vfs::ops::FSTATVFS:
                     return "fstatvfs";
+                case ker::abi::vfs::ops::LSTAT:
+                    return "lstat";
             }
             break;
         case ker::abi::callnums::net:

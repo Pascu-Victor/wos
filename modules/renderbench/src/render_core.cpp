@@ -514,37 +514,48 @@ auto read_file_bytes(const std::string& path) -> std::vector<uint8_t> {
     if (path.empty()) {
         return {};
     }
+
     std::ifstream file(path, std::ios::binary);
     if (!file) {
         return {};
     }
 
-    file.seekg(0, std::ios::end);
-    if (!file) {
-        return {};
-    }
-
-    auto const END = file.tellg();
-    if (END == std::streampos(-1)) {
-        return {};
-    }
-
-    auto const SIZE = static_cast<size_t>(static_cast<std::streamoff>(END));
-    if (SIZE == 0) {
-        return {};
-    }
-
-    file.seekg(0, std::ios::beg);
-    if (!file) {
-        return {};
-    }
-
-    std::vector<uint8_t> bytes(SIZE);
-    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    if (!file || static_cast<size_t>(file.gcount()) != bytes.size()) {
-        return {};
+    std::array<char, 64 * 1024> buffer{};
+    std::vector<uint8_t> bytes;
+    while (true) {
+        file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        auto const GOT = file.gcount();
+        if (GOT > 0) {
+            auto const* BEGIN = reinterpret_cast<const uint8_t*>(buffer.data());
+            bytes.insert(bytes.end(), BEGIN, BEGIN + GOT);
+        }
+        if (file.bad()) {
+            return {};
+        }
+        if (file.eof()) {
+            break;
+        }
+        if (!file && GOT == 0) {
+            return {};
+        }
     }
     return bytes;
+}
+
+auto read_file_bytes_retry(const std::string& path) -> std::vector<uint8_t> {
+    constexpr int MAX_ATTEMPTS = 12;
+    constexpr useconds_t RETRY_DELAY_US = 100000;
+
+    for (int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
+        auto bytes = read_file_bytes(path);
+        if (!bytes.empty()) {
+            return bytes;
+        }
+        if (attempt + 1 < MAX_ATTEMPTS) {
+            ::usleep(RETRY_DELAY_US);
+        }
+    }
+    return {};
 }
 
 auto read_u32_le(std::span<const uint8_t> bytes, size_t offset) -> uint32_t {
@@ -2200,7 +2211,12 @@ auto parse_options(int argc, char* const* argv, Backend default_backend, Options
             if (!parse_required_int(0, ignored)) {
                 return ParseStatus::Error;
             }
-        } else if (ARG == "--worker-count" || ARG == "--worker-threads") {
+        } else if (ARG == "--worker-first-slot") {
+            int ignored = 0;
+            if (!parse_required_int(0, ignored)) {
+                return ParseStatus::Error;
+            }
+        } else if (ARG == "--worker-count" || ARG == "--worker-threads" || ARG == "--worker-slots" || ARG == "--worker-total-slots") {
             int ignored = 0;
             if (!parse_required_int(1, ignored)) {
                 return ParseStatus::Error;
@@ -2219,14 +2235,57 @@ auto parse_options(int argc, char* const* argv, Backend default_backend, Options
     return ParseStatus::Ok;
 }
 
+static auto spread_morton_bits(uint32_t value) -> uint64_t {
+    uint64_t bits = value;
+    bits = (bits | (bits << 16U)) & 0x0000FFFF0000FFFFULL;
+    bits = (bits | (bits << 8U)) & 0x00FF00FF00FF00FFULL;
+    bits = (bits | (bits << 4U)) & 0x0F0F0F0F0F0F0F0FULL;
+    bits = (bits | (bits << 2U)) & 0x3333333333333333ULL;
+    bits = (bits | (bits << 1U)) & 0x5555555555555555ULL;
+    return bits;
+}
+
+static auto morton_tile_key(int tile_x, int tile_y) -> uint64_t {
+    return spread_morton_bits(static_cast<uint32_t>(tile_x)) | (spread_morton_bits(static_cast<uint32_t>(tile_y)) << 1U);
+}
+
 auto make_tiles(int width, int height, int tile_size) -> std::vector<Tile> {
-    std::vector<Tile> tiles;
+    struct OrderedTile {
+        Tile tile;
+        uint64_t order_key = 0;
+        int grid_y = 0;
+        int grid_x = 0;
+    };
+
+    std::vector<OrderedTile> ordered_tiles;
     int index = 0;
-    for (int y = 0; y < height; y += tile_size) {
-        for (int x = 0; x < width; x += tile_size) {
-            tiles.push_back(
-                {.x0 = x, .y0 = y, .x1 = std::min(x + tile_size, width), .y1 = std::min(y + tile_size, height), .index = index++});
+    int grid_y = 0;
+    for (int y = 0; y < height; y += tile_size, ++grid_y) {
+        int grid_x = 0;
+        for (int x = 0; x < width; x += tile_size, ++grid_x) {
+            ordered_tiles.push_back({
+                .tile = {.x0 = x, .y0 = y, .x1 = std::min(x + tile_size, width), .y1 = std::min(y + tile_size, height), .index = index++},
+                .order_key = morton_tile_key(grid_x, grid_y),
+                .grid_y = grid_y,
+                .grid_x = grid_x,
+            });
         }
+    }
+
+    std::ranges::sort(ordered_tiles, [](const OrderedTile& left, const OrderedTile& right) {
+        if (left.order_key != right.order_key) {
+            return left.order_key < right.order_key;
+        }
+        if (left.grid_y != right.grid_y) {
+            return left.grid_y < right.grid_y;
+        }
+        return left.grid_x < right.grid_x;
+    });
+
+    std::vector<Tile> tiles;
+    tiles.reserve(ordered_tiles.size());
+    for (const auto& tile : ordered_tiles) {
+        tiles.push_back(tile.tile);
     }
     return tiles;
 }
@@ -2240,7 +2299,7 @@ auto load_scene(const std::string& path) -> std::shared_ptr<Scene> {
         return std::make_shared<Scene>(default_scene());
     }
 
-    auto bytes = read_file_bytes(path);
+    auto bytes = read_file_bytes_retry(path);
     if (bytes.empty()) {
         std::fprintf(stderr, "renderbench: unable to read scene '%s'\n", path.c_str());
         return nullptr;

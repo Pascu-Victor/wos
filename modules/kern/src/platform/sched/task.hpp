@@ -441,7 +441,7 @@ struct Task {
     bool transition_state(TaskState from, TaskState to) {
         return state.compare_exchange_strong(from, to, std::memory_order_acq_rel, std::memory_order_acquire);
     }
-};  // Removed __attribute__((packed)) - was causing misalignment of atomic fields and potential corruption
+};
 
 auto get_next_pid() -> uint64_t;
 }  // namespace ker::mod::sched::task

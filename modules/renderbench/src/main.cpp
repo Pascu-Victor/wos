@@ -6,6 +6,7 @@
 #include <mpi.h>
 #else
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/process.h>
 #include <sys/wait.h>
@@ -57,12 +58,18 @@ struct WorkerInvocation {
     int worker_id = 0;
     int worker_count = 1;
     int worker_threads = 1;
+    int first_slot = 0;
+    int slot_count = 1;
+    int total_slots = 1;
 };
 
 struct IpcWorkerSpec {
     int worker_id = 0;
     int worker_count = 1;
     int worker_threads = 1;
+    int first_slot = 0;
+    int slot_count = 1;
+    int total_slots = 1;
     std::string hostname;
 };
 
@@ -174,13 +181,13 @@ auto read_wki_peers() -> std::vector<WkiPeerInfo> {
         uint64_t last_update = 0;
         int local = 0;
         while (peers >> hostname >> node >> connected >> cpus >> load >> last_update >> local) {
-            if (local == 0 && connected == 0) {
+            if (local == 0 && (connected == 0 || cpus <= 0)) {
                 continue;
             }
             peers_out.push_back({
                 .hostname = hostname,
                 .node_id = node,
-                .cpus = std::max(1, cpus),
+                .cpus = local != 0 ? std::max(1, cpus) : cpus,
                 .local = local != 0,
             });
         }
@@ -589,7 +596,7 @@ void note_worker_done_packet(ChildWorker& worker, const WorkerDonePacket& packet
 }
 
 auto note_worker_tile_packet(ChildWorker& worker, const TilePacketHeader& header, std::vector<unsigned char>& tile_seen,
-                             uint64_t& tiles_done) -> bool {
+                             std::span<const int> tile_owner, uint64_t& tiles_done) -> bool {
     if (header.tile_index >= tile_seen.size()) {
         std::println(stderr, "renderbench: tile index {} from {} outside total {}", header.tile_index, worker.hostname, tile_seen.size());
         return false;
@@ -597,10 +604,11 @@ auto note_worker_tile_packet(ChildWorker& worker, const TilePacketHeader& header
 
     ++worker.received_packets;
     worker.last_tile_index = header.tile_index;
-    if (worker.worker_count > 0 && static_cast<int>(header.tile_index % static_cast<uint32_t>(worker.worker_count)) != worker.worker_id) {
+    int const OWNER = tile_owner[static_cast<size_t>(header.tile_index)];
+    if (OWNER >= 0 && OWNER != worker.worker_id) {
         ++worker.foreign_tiles;
         std::println(stderr, "renderbench: tile {} arrived from {} worker {} but belongs to worker {}", header.tile_index, worker.hostname,
-                     worker.worker_id, header.tile_index % static_cast<uint32_t>(worker.worker_count));
+                     worker.worker_id, OWNER);
     }
 
     auto& seen = tile_seen.at(static_cast<size_t>(header.tile_index));
@@ -615,8 +623,8 @@ auto note_worker_tile_packet(ChildWorker& worker, const TilePacketHeader& header
     return true;
 }
 
-auto parse_worker_packets(ChildWorker& worker, tracebench::FilmView film, std::vector<unsigned char>& tile_seen, uint64_t& tiles_done)
-    -> bool {
+auto parse_worker_packets(ChildWorker& worker, tracebench::FilmView film, std::vector<unsigned char>& tile_seen,
+                          std::span<const int> tile_owner, uint64_t& tiles_done) -> bool {
     size_t consumed = 0;
     while (worker.buffer.size() - consumed >= sizeof(TilePacketHeader)) {
         WorkerPacketKind const KIND = packet_kind_at(worker.buffer, consumed);
@@ -676,7 +684,7 @@ auto parse_worker_packets(ChildWorker& worker, tracebench::FilmView film, std::v
             std::println(stderr, "renderbench: invalid tile packet from {}", worker.hostname);
             return false;
         }
-        if (!note_worker_tile_packet(worker, header, tile_seen, tiles_done)) {
+        if (!note_worker_tile_packet(worker, header, tile_seen, tile_owner, tiles_done)) {
             return false;
         }
         consumed += PACKET_BYTES;
@@ -688,8 +696,8 @@ auto parse_worker_packets(ChildWorker& worker, tracebench::FilmView film, std::v
     return true;
 }
 
-auto drain_worker_pipe(ChildWorker& worker, tracebench::FilmView film, std::vector<unsigned char>& tile_seen, uint64_t& tiles_done)
-    -> bool {
+auto drain_worker_pipe(ChildWorker& worker, tracebench::FilmView film, std::vector<unsigned char>& tile_seen,
+                       std::span<const int> tile_owner, uint64_t& tiles_done) -> bool {
     std::array<unsigned char, 16384> chunk = {};
     for (;;) {
         ssize_t const READ = ::read(worker.read_fd, chunk.data(), chunk.size());
@@ -712,7 +720,7 @@ auto drain_worker_pipe(ChildWorker& worker, tracebench::FilmView film, std::vect
         std::perror("renderbench: read worker pipe");
         return false;
     }
-    return parse_worker_packets(worker, film, tile_seen, tiles_done);
+    return parse_worker_packets(worker, film, tile_seen, tile_owner, tiles_done);
 }
 
 void print_partial_worker_packet(const ChildWorker& worker) {
@@ -756,6 +764,12 @@ auto make_worker_args(const std::string& program_path, const tracebench::Options
         std::to_string(spec.worker_count),
         "--worker-threads",
         std::to_string(spec.worker_threads),
+        "--worker-first-slot",
+        std::to_string(spec.first_slot),
+        "--worker-slots",
+        std::to_string(spec.slot_count),
+        "--worker-total-slots",
+        std::to_string(spec.total_slots),
         "--scene",
         options.scene_path,
         "--backend",
@@ -858,15 +872,39 @@ auto launch_worker(const std::string& program_path, const tracebench::Options& o
     return true;
 }
 
-auto expected_tile_count_for_worker(size_t total_tiles, int worker_id, int worker_count) -> uint64_t {
-    if (worker_count <= 0 || worker_id < 0 || worker_id >= worker_count) {
-        return 0;
+auto owns_tile_slot(size_t tile_position, int first_slot, int slot_count, int total_slots) -> bool {
+    if (total_slots <= 0 || slot_count <= 0 || first_slot < 0 || first_slot >= total_slots) {
+        return false;
     }
-    size_t const FIRST = static_cast<size_t>(worker_id);
-    if (FIRST >= total_tiles) {
-        return 0;
+    int const SLOT = static_cast<int>(tile_position % static_cast<size_t>(total_slots));
+    return SLOT >= first_slot && SLOT < first_slot + slot_count;
+}
+
+auto expected_tile_count_for_slots(size_t total_tiles, int first_slot, int slot_count, int total_slots) -> uint64_t {
+    uint64_t count = 0;
+    for (size_t position = 0; position < total_tiles; ++position) {
+        if (owns_tile_slot(position, first_slot, slot_count, total_slots)) {
+            ++count;
+        }
     }
-    return static_cast<uint64_t>(((total_tiles - 1U - FIRST) / static_cast<size_t>(worker_count)) + 1U);
+    return count;
+}
+
+auto make_tile_owner_map(std::span<const tracebench::Tile> tiles, std::span<const IpcWorkerSpec> specs) -> std::vector<int> {
+    std::vector<int> owner(tiles.size(), -1);
+    for (const auto& spec : specs) {
+        for (size_t position = 0; position < tiles.size(); ++position) {
+            if (!owns_tile_slot(position, spec.first_slot, spec.slot_count, spec.total_slots)) {
+                continue;
+            }
+            int const TILE_INDEX = tiles[position].index;
+            if (TILE_INDEX < 0 || static_cast<size_t>(TILE_INDEX) >= owner.size()) {
+                continue;
+            }
+            owner[static_cast<size_t>(TILE_INDEX)] = spec.worker_id;
+        }
+    }
+    return owner;
 }
 
 void print_missing_tile_summary(std::span<const unsigned char> tile_seen) {
@@ -918,18 +956,70 @@ void close_worker_pipes(std::span<ChildWorker> workers) {
     }
 }
 
+void wait_for_worker_pipe_activity(std::span<const ChildWorker> workers) {
+    std::vector<pollfd> fds;
+    fds.reserve(workers.size());
+    for (const auto& worker : workers) {
+        if (worker.pipe_open && worker.read_fd >= 0) {
+            fds.push_back({
+                .fd = worker.read_fd,
+                .events = POLLIN | POLLHUP | POLLERR,
+                .revents = 0,
+            });
+        }
+    }
+    if (fds.empty()) {
+        return;
+    }
+
+    int const READY = ::poll(fds.data(), fds.size(), 50);
+    if (READY < 0 && errno != EINTR) {
+        ::usleep(1000);
+    }
+}
+
 auto make_node_thread_specs(const tracebench::Options& options, const std::vector<WkiPeerInfo>& peers) -> std::vector<IpcWorkerSpec> {
+    struct PendingSpec {
+        const WkiPeerInfo* peer = nullptr;
+        int worker_threads = 1;
+        int slot_count = 1;
+    };
+
+    std::vector<PendingSpec> pending;
+    pending.reserve(peers.size());
+    int total_slots = 0;
+    bool const RESERVE_LOCAL_COORDINATOR = options.threads <= 0 && peers.size() > 1U;
+    for (const auto& peer : peers) {
+        int worker_threads = std::max(1, options.threads > 0 ? options.threads : peer.cpus);
+        if (RESERVE_LOCAL_COORDINATOR && peer.local && worker_threads > 1) {
+            --worker_threads;
+        }
+        int const SLOT_COUNT = worker_threads;
+        pending.push_back({
+            .peer = &peer,
+            .worker_threads = worker_threads,
+            .slot_count = SLOT_COUNT,
+        });
+        total_slots += SLOT_COUNT;
+    }
+
     std::vector<IpcWorkerSpec> specs;
-    specs.reserve(peers.size());
-    int const WORKER_COUNT = static_cast<int>(peers.size());
+    specs.reserve(pending.size());
+    int const WORKER_COUNT = static_cast<int>(pending.size());
+    int next_slot = 0;
     for (int id = 0; id < WORKER_COUNT; ++id) {
-        const auto& peer = peers.at(static_cast<size_t>(id));
+        const auto& item = pending.at(static_cast<size_t>(id));
+        const auto& peer = *item.peer;
         specs.push_back({
             .worker_id = id,
             .worker_count = WORKER_COUNT,
-            .worker_threads = std::max(1, options.threads > 0 ? options.threads : peer.cpus),
+            .worker_threads = item.worker_threads,
+            .first_slot = next_slot,
+            .slot_count = item.slot_count,
+            .total_slots = total_slots,
             .hostname = peer.hostname,
         });
+        next_slot += item.slot_count;
     }
     return specs;
 }
@@ -960,6 +1050,9 @@ auto make_process_specs(const tracebench::Options& options, const std::vector<Wk
             .worker_id = id,
             .worker_count = WORKER_COUNT,
             .worker_threads = 1,
+            .first_slot = id,
+            .slot_count = 1,
+            .total_slots = WORKER_COUNT,
             .hostname = worker_hosts.at(static_cast<size_t>(id)),
         });
     }
@@ -1037,9 +1130,10 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
     }
     auto all_tiles = tracebench::make_tiles(options.width, options.height, options.tile_size);
     std::vector<tracebench::Tile> assigned_tiles;
-    for (size_t index = static_cast<size_t>(worker.worker_id); index < all_tiles.size();
-         index += static_cast<size_t>(worker.worker_count)) {
-        assigned_tiles.push_back(all_tiles[index]);
+    for (size_t index = 0; index < all_tiles.size(); ++index) {
+        if (owns_tile_slot(index, worker.first_slot, worker.slot_count, worker.total_slots)) {
+            assigned_tiles.push_back(all_tiles[index]);
+        }
     }
 
     auto storage = tracebench::make_film_storage(options.width, options.height);
@@ -1130,6 +1224,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
     tracebench::FilmView film{.width = options.width, .height = options.height, .rgb = std::span<float>(storage.data(), storage.size())};
     std::vector<ChildWorker> workers(specs.size());
     std::vector<unsigned char> tile_seen(tiles.size(), 0);
+    auto tile_owner = make_tile_owner_map(tiles, specs);
     std::string const PROGRAM_PATH = renderbench_program_path(argv0);
 
     double const STARTED = tracebench::monotonic_seconds();
@@ -1143,7 +1238,8 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
             (void)wait_for_children(std::span<ChildWorker>(workers.data(), i), true);
             return 2;
         }
-        workers[i].expected_tiles = expected_tile_count_for_worker(tiles.size(), specs[i].worker_id, specs[i].worker_count);
+        workers[i].expected_tiles =
+            expected_tile_count_for_slots(tiles.size(), specs[i].first_slot, specs[i].slot_count, specs[i].total_slots);
         if (cancel_requested()) {
             signal_workers(std::span<ChildWorker>(workers.data(), i + 1U), static_cast<int>(g_cancel_signal));
             (void)wait_for_children(std::span<ChildWorker>(workers.data(), i + 1U), true);
@@ -1168,7 +1264,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
             if (!worker.pipe_open) {
                 continue;
             }
-            if (!drain_worker_pipe(worker, film, tile_seen, tiles_done)) {
+            if (!drain_worker_pipe(worker, film, tile_seen, tile_owner, tiles_done)) {
                 ok = false;
                 worker.pipe_open = false;
             }
@@ -1208,7 +1304,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
             next_update = NOW + 0.75;
         }
         if (open_pipes != 0) {
-            ::usleep(50000);
+            wait_for_worker_pipe_activity(std::span<const ChildWorker>(workers.data(), workers.size()));
         }
     }
 
@@ -1235,6 +1331,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
 
 auto parse_worker_invocation(int argc, char** argv) -> WorkerInvocation {
     WorkerInvocation worker;
+    bool explicit_slots = false;
     for (int i = 1; i < argc; ++i) {
         std::string_view const ARG = argv[i];
         auto positive_value = [&](int& out) {
@@ -1255,10 +1352,28 @@ auto parse_worker_invocation(int argc, char** argv) -> WorkerInvocation {
             positive_value(worker.worker_count);
         } else if (ARG == "--worker-threads") {
             positive_value(worker.worker_threads);
+        } else if (ARG == "--worker-first-slot") {
+            explicit_slots = true;
+            nonnegative_value(worker.first_slot);
+        } else if (ARG == "--worker-slots") {
+            explicit_slots = true;
+            positive_value(worker.slot_count);
+        } else if (ARG == "--worker-total-slots") {
+            explicit_slots = true;
+            positive_value(worker.total_slots);
         }
     }
     if (worker.worker_id >= worker.worker_count) {
         worker.worker_id = worker.worker_count - 1;
+    }
+    if (!explicit_slots) {
+        worker.first_slot = worker.worker_id;
+        worker.slot_count = 1;
+        worker.total_slots = worker.worker_count;
+    } else {
+        worker.total_slots = std::max(worker.total_slots, worker.worker_count);
+        worker.first_slot = std::min(worker.first_slot, worker.total_slots - 1);
+        worker.slot_count = std::clamp(worker.slot_count, 1, worker.total_slots - worker.first_slot);
     }
     return worker;
 }

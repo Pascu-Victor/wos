@@ -11,7 +11,6 @@
 //   perf local-report         Local pipe/process summary statistics
 //   perf vmem-report          Local mmap/cache/COW summary statistics
 //   perf all-report           Combined WKI and local summary statistics
-//   perf top      [ms=1000]   Continuous stat snapshots (Ctrl-C to stop)
 //   perf run      [--time=boot|unix-ns|iso] <cmd> [args] Trace cmd+descendants, save to perf.data
 //   perf show-map             Show PID->name/cmdline map from perf.data
 
@@ -3766,17 +3765,6 @@ void cmd_show_map() {
     }
 }
 
-void cmd_top(int ms) {
-    if (ms < 1) {
-        ms = DEFAULT_SAMPLE_MS;
-    }
-
-    for (;;) {
-        cmd_stat(ms);
-        std::println("");
-    }
-}
-
 using CommandHandler = int (*)(int argc, char** argv);
 
 struct CommandSpec {
@@ -3805,12 +3793,11 @@ int run_wki_trace_command(int argc, char** argv);
 int run_local_trace_command(int argc, char** argv);
 int run_all_trace_command(int argc, char** argv);
 int run_vmem_trace_command(int argc, char** argv);
-int run_top_command(int argc, char** argv);
 int run_run_command(int argc, char** argv);
 int run_show_map_command(int argc, char** argv);
 int run_help_command(int argc, char** argv);
 
-constexpr std::array<CommandSpec, 24> COMMANDS = {{
+constexpr std::array<CommandSpec, 23> COMMANDS = {{
     {.name = "stat", .args = "[ms=1000]", .summary = "CPU% per process over a sampling window", .handler = run_stat_command},
     {.name = "record",
      .args = "[ms=1000] [--filter=<filters>]",
@@ -3861,7 +3848,6 @@ constexpr std::array<CommandSpec, 24> COMMANDS = {{
      .summary = "Raw combined WKI and local trace events",
      .handler = run_all_trace_command},
     {.name = "vmem-trace", .args = "[n=200] [filters]", .summary = "Raw local vmem trace events", .handler = run_vmem_trace_command},
-    {.name = "top", .args = "[ms=1000]", .summary = "Continuous CPU% snapshots", .handler = run_top_command},
     {.name = "run",
      .args = "[--filter=<filters>] [--time=FMT] <cmd> [args]",
      .summary = "Trace a command and descendants",
@@ -4161,12 +4147,6 @@ int run_vmem_trace_command(int argc, char** argv) {
         filter.scope = "local_vmem";
     }
     cmd_wki_trace(max_events, filter, display_options, WkiDataView::VMEM);
-    return 0;
-}
-
-int run_top_command(int argc, char** argv) {
-    int const MS = argc >= 3 ? static_cast<int>(strtol(argv[2], nullptr, PARSE_BASE_DECIMAL)) : DEFAULT_SAMPLE_MS;
-    cmd_top(MS);
     return 0;
 }
 

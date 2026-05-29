@@ -10,6 +10,7 @@
 
 #include "platform/asm/cpu.hpp"
 #include "platform/mm/addr.hpp"
+#include "platform/mm/page_alloc.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
 
@@ -29,6 +30,19 @@ constexpr uint64_t STACK_GROW_RSP_FAR_BYTES = 512ULL * 1024ULL;
 auto min_u64(uint64_t a, uint64_t b) -> uint64_t { return a < b ? a : b; }
 
 auto max_u64(uint64_t a, uint64_t b) -> uint64_t { return a > b ? a : b; }
+
+auto buddy_backing_size(uint64_t size) -> uint64_t {
+    if (size == 0) {
+        return 0;
+    }
+
+    uint64_t const PAGES = (size + mm::paging::PAGE_SIZE - 1) / mm::paging::PAGE_SIZE;
+    uint64_t rounded_pages = 1;
+    while (rounded_pages < PAGES && rounded_pages < (uint64_t{1} << mm::PageAllocator::MAX_ORDER)) {
+        rounded_pages <<= 1;
+    }
+    return rounded_pages * mm::paging::PAGE_SIZE;
+}
 
 auto stack_top(const Thread* thread) -> uint64_t {
     if (thread == nullptr || thread->stack_size == 0) {
@@ -168,6 +182,14 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
         mm::phys::page_free(tls);
         delete thread;
         return nullptr;
+    }
+    // page_alloc() returns buddy-sized backing; only the mapped TLS range is
+    // later reclaimed through destroy_user_space(), so return the tail now.
+    uint64_t const TLS_BACKING_SIZE = buddy_backing_size(ALIGNED_TOTAL_SIZE);
+    for (uint64_t offset = ALIGNED_TOTAL_SIZE; offset < TLS_BACKING_SIZE; offset += mm::paging::PAGE_SIZE) {
+        auto* tail_page = reinterpret_cast<uint8_t*>(tls) + offset;
+        std::memset(tail_page, 0, mm::paging::PAGE_SIZE);
+        mm::phys::page_free(tail_page);
     }
 
     // CRITICAL FIX: Use page-aligned size for virtual address calculation too

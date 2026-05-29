@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <platform/asm/msr.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <util/hcf.hpp>
@@ -484,6 +485,7 @@ void dump_irq_stats() {
 #endif  // SCHED_DEBUG
 
 extern "C" void wos_sched_timer(void* stack_ptr) {
+    uint64_t const IRQ_ACCOUNT_STARTED_US = ker::mod::time::get_us();
     apic::eoi();
 
     // Advance epoch and run garbage collection periodically on CPU 0 only.
@@ -518,6 +520,9 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
     apic::one_shot_timer(timer_quantum);
 
     if (is_kernel_thread_trampoline_frame(*frame_ptr, *gpr_ptr, current_task)) {
+        uint64_t const IRQ_ACCOUNT_FINISHED_US = ker::mod::time::get_us();
+        sched::account_irq_time_us(IRQ_ACCOUNT_FINISHED_US >= IRQ_ACCOUNT_STARTED_US ? IRQ_ACCOUNT_FINISHED_US - IRQ_ACCOUNT_STARTED_US
+                                                                                     : 0);
         uint64_t stack = frame_ptr->rsp;
         if (!valid_kernel_stack(stack) && current_task != nullptr && valid_kernel_stack(current_task->context.syscall_kernel_stack)) {
             dbg::logger<"ctxswitch">::warn("direct daemon start repaired rsp: pid=%lu name=%s frame_rsp=0x%llx stack=0x%llx",
@@ -563,6 +568,10 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
                              static_cast<unsigned long>(stats.active_task_count), static_cast<unsigned long>(stats.wait_queue_count),
                              static_cast<unsigned>(frame_ptr->cs));
                 }
+
+                uint64_t const IRQ_ACCOUNT_FINISHED_US = ker::mod::time::get_us();
+                sched::account_irq_time_us(
+                    IRQ_ACCOUNT_FINISHED_US >= IRQ_ACCOUNT_STARTED_US ? IRQ_ACCOUNT_FINISHED_US - IRQ_ACCOUNT_STARTED_US : 0);
             }
         }
 
