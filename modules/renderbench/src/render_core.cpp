@@ -41,6 +41,7 @@ constexpr float DEBUG_GRAZING_VIEW_DOT = 0.08F;
 constexpr float DEBUG_DARK_BASE_LUMINANCE = 0.08F;
 constexpr float DEBUG_DARK_RESULT_LUMINANCE = 0.025F;
 constexpr float MIN_GEOMETRIC_OUTGOING_DOT = 0.05F;
+constexpr int PREVIEW_MAX_DIMENSION = 1024;
 
 struct Vec3 {
     float x = 0.0F;
@@ -540,22 +541,6 @@ auto read_file_bytes(const std::string& path) -> std::vector<uint8_t> {
         }
     }
     return bytes;
-}
-
-auto read_file_bytes_retry(const std::string& path) -> std::vector<uint8_t> {
-    constexpr int MAX_ATTEMPTS = 12;
-    constexpr useconds_t RETRY_DELAY_US = 100000;
-
-    for (int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
-        auto bytes = read_file_bytes(path);
-        if (!bytes.empty()) {
-            return bytes;
-        }
-        if (attempt + 1 < MAX_ATTEMPTS) {
-            ::usleep(RETRY_DELAY_US);
-        }
-    }
-    return {};
 }
 
 auto read_u32_le(std::span<const uint8_t> bytes, size_t offset) -> uint32_t {
@@ -1418,6 +1403,39 @@ auto write_png_atomic(const std::string& path, FilmView film) -> bool {
     return std::rename(TMP.c_str(), path.c_str()) == 0;
 }
 
+auto downsample_preview(FilmView film, int target_width, int target_height) -> std::vector<float> {
+    std::vector<float> storage(static_cast<size_t>(target_width) * static_cast<size_t>(target_height) * 3U);
+    for (int y = 0; y < target_height; ++y) {
+        int const SOURCE_Y = std::min(film.height - 1, static_cast<int>((static_cast<int64_t>(y) * film.height) / target_height));
+        for (int x = 0; x < target_width; ++x) {
+            int const SOURCE_X = std::min(film.width - 1, static_cast<int>((static_cast<int64_t>(x) * film.width) / target_width));
+            size_t const SOURCE = ((static_cast<size_t>(SOURCE_Y) * static_cast<size_t>(film.width)) + static_cast<size_t>(SOURCE_X)) * 3U;
+            size_t const TARGET = ((static_cast<size_t>(y) * static_cast<size_t>(target_width)) + static_cast<size_t>(x)) * 3U;
+            storage[TARGET] = film.rgb[SOURCE];
+            storage[TARGET + 1U] = film.rgb[SOURCE + 1U];
+            storage[TARGET + 2U] = film.rgb[SOURCE + 2U];
+        }
+    }
+    return storage;
+}
+
+auto write_preview_png_atomic(const std::string& path, FilmView film) -> bool {
+    int const MAX_DIMENSION = std::max(film.width, film.height);
+    if (MAX_DIMENSION <= PREVIEW_MAX_DIMENSION) {
+        return write_png_atomic(path, film);
+    }
+
+    int const PREVIEW_WIDTH = std::max(1, static_cast<int>((static_cast<int64_t>(film.width) * PREVIEW_MAX_DIMENSION) / MAX_DIMENSION));
+    int const PREVIEW_HEIGHT = std::max(1, static_cast<int>((static_cast<int64_t>(film.height) * PREVIEW_MAX_DIMENSION) / MAX_DIMENSION));
+    auto preview_storage = downsample_preview(film, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    FilmView preview{
+        .width = PREVIEW_WIDTH,
+        .height = PREVIEW_HEIGHT,
+        .rgb = std::span<float>(preview_storage.data(), preview_storage.size()),
+    };
+    return write_png_atomic(path, preview);
+}
+
 }  // namespace
 
 struct Scene {
@@ -2216,6 +2234,16 @@ auto parse_options(int argc, char* const* argv, Backend default_backend, Options
             if (!parse_required_int(0, ignored)) {
                 return ParseStatus::Error;
             }
+        } else if (ARG == "--worker-batch-start") {
+            int ignored = 0;
+            if (!parse_required_int(0, ignored)) {
+                return ParseStatus::Error;
+            }
+        } else if (ARG == "--worker-batch-count") {
+            int ignored = 0;
+            if (!parse_required_int(1, ignored)) {
+                return ParseStatus::Error;
+            }
         } else if (ARG == "--worker-count" || ARG == "--worker-threads" || ARG == "--worker-slots" || ARG == "--worker-total-slots") {
             int ignored = 0;
             if (!parse_required_int(1, ignored)) {
@@ -2299,18 +2327,33 @@ auto load_scene(const std::string& path) -> std::shared_ptr<Scene> {
         return std::make_shared<Scene>(default_scene());
     }
 
-    auto bytes = read_file_bytes_retry(path);
-    if (bytes.empty()) {
-        std::fprintf(stderr, "renderbench: unable to read scene '%s'\n", path.c_str());
-        return nullptr;
+    constexpr int MAX_ATTEMPTS = 12;
+    constexpr useconds_t RETRY_DELAY_US = 100000;
+    size_t last_size = 0;
+    bool saw_bytes = false;
+
+    for (int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
+        auto bytes = read_file_bytes(path);
+        last_size = bytes.size();
+        saw_bytes = saw_bytes || !bytes.empty();
+        if (!bytes.empty()) {
+            auto glb_scene = load_glb_scene(bytes);
+            if (glb_scene.has_value()) {
+                return std::make_shared<Scene>(std::move(*glb_scene));
+            }
+        }
+        if (attempt + 1 < MAX_ATTEMPTS) {
+            ::usleep(RETRY_DELAY_US);
+        }
     }
 
-    auto glb_scene = load_glb_scene(bytes);
-    if (!glb_scene.has_value()) {
-        std::fprintf(stderr, "renderbench: invalid or unsupported GLB scene '%s'\n", path.c_str());
-        return nullptr;
+    if (!saw_bytes) {
+        std::fprintf(stderr, "renderbench: unable to read scene '%s'\n", path.c_str());
+    } else {
+        std::fprintf(stderr, "renderbench: invalid or unsupported GLB scene '%s' after retries (last_read=%zu bytes)\n", path.c_str(),
+                     last_size);
     }
-    return std::make_shared<Scene>(std::move(*glb_scene));
+    return nullptr;
 }
 
 void render_tile(const Scene& scene, FilmView film, const Options& options, const Tile& tile, uint64_t seed) {
@@ -2391,7 +2434,9 @@ auto write_metrics(const Options& options, const Progress& progress, double rays
     return atomic_write_text(run_dir(options) + "/metrics.json", out.str());
 }
 
-auto write_preview_png(const Options& options, FilmView film) -> bool { return write_png_atomic(run_dir(options) + "/preview.png", film); }
+auto write_preview_png(const Options& options, FilmView film) -> bool {
+    return write_preview_png_atomic(run_dir(options) + "/preview.png", film);
+}
 
 auto write_final_png(const Options& options, FilmView film) -> bool { return write_png_atomic(run_dir(options) + "/frame_000.png", film); }
 

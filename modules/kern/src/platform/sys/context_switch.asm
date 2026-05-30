@@ -51,6 +51,56 @@ bits 64
     iretq
 %endmacro
 
+%macro build_user_return_from_ptrs 0
+    ; rdi = GPRegs*, rsi = InterruptFrame*
+    ;
+    ; The timer path may enter from either an outer-privilege hardware frame or
+    ; a same-CPL kernel frame that we normalized in isr32. Always build the
+    ; outgoing userspace iret frame from the normalized InterruptFrame instead
+    ; of depending on which physical stack shape reached task_switch_handler.
+    push qword [rsi + 48]    ; SS
+    push qword [rsi + 40]    ; RSP
+    push qword [rsi + 32]    ; RFLAGS
+    push qword [rsi + 24]    ; CS
+    push qword [rsi + 16]    ; RIP
+
+    ; Returning to userspace - set up data segment selectors.  The base values
+    ; were installed by switch_to(); preserve them across selector loads.
+    mov ax, 0x1b
+    mov ds, ax
+    mov es, ax
+    rdfsbase r8
+    rdgsbase r9
+    mov fs, ax
+    mov gs, ax
+    wrfsbase r8
+    wrgsbase r9
+
+    ; Swap from kernel GS base to the user's GS base prepared by switch_to().
+    swapgs
+
+    ; Restore GP registers from the normalized snapshot.  Keep the pointer in
+    ; r11 until every other register has been restored, then restore r11 last.
+    mov r11, rdi
+    mov r15, [r11 + 0]
+    mov r14, [r11 + 8]
+    mov r13, [r11 + 16]
+    mov r12, [r11 + 24]
+    mov r10, [r11 + 40]
+    mov r9,  [r11 + 48]
+    mov r8,  [r11 + 56]
+    mov rbp, [r11 + 64]
+    mov rdi, [r11 + 72]
+    mov rsi, [r11 + 80]
+    mov rdx, [r11 + 88]
+    mov rcx, [r11 + 96]
+    mov rbx, [r11 + 104]
+    mov rax, [r11 + 112]
+    mov r11, [r11 + 32]
+
+    iretq
+%endmacro
+
 %macro isr_swapgs 1
     cmp [rsp + 24], dword 8 ; Check if we're in userspace
     je .%1
@@ -170,39 +220,15 @@ task_switch_handler:
     cli
 
 .return_frame_ready:
-    ; Same-CPL iretq does not pop SS:RSP, so kernel-mode task switches
-    ; must explicitly move to the target kernel stack first.
-    cmp qword [rsp + GPREGS_SIZE + 24], qword 0x23
+    lea rsi, [rsp + GPREGS_SIZE]
+    mov rdi, rsp
+    cmp qword [rsi + 24], qword 0x23
     jne .kernel_return
 
-    popq
-    ; Check if returning to userspace (CS at offset 24 == 0x23)
-    cmp qword [rsp + 24], qword 0x23
-    jne .no_swapgs_exit
+    build_user_return_from_ptrs
 
-    ; Returning to userspace - set up data segment selectors
-    push rax
-    push r8
-    push r9
-    mov ax, 0x1b        ; User data segment selector
-    mov ds, ax
-    mov es, ax
-    rdfsbase r8
-    rdgsbase r9
-    mov fs, ax
-    mov gs, ax
-    wrfsbase r8
-    wrgsbase r9
-    pop r9
-    pop r8
-    pop rax
-
-    swapgs
-    .no_swapgs_exit:
-    add rsp, 16  ; Skip int_num and err_code
-    iretq
-    .kernel_return:
-    build_kernel_return_from_stack
+.kernel_return:
+    build_kernel_return_from_ptrs
 
 ; Jump to next task without saving current task state
 ; Used when a task is exiting and doesn't need its context preserved

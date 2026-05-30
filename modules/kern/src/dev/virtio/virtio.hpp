@@ -103,8 +103,14 @@ struct VirtIONetHeader {
 } __attribute__((packed));
 static_assert(sizeof(VirtIONetHeader) == 10);
 
-constexpr size_t VIRTIO_NET_HDR_SIZE = sizeof(VirtIONetHeader);  // 10 bytes (legacy / no VERSION_1)
-constexpr size_t VIRTIO_NET_HDR_SIZE_MODERN = 12;                // virtio 1.0: num_buffers field always present
+struct VirtIONetHeaderMergeableRx {
+    VirtIONetHeader header;
+    uint16_t num_buffers;
+} __attribute__((packed));
+static_assert(sizeof(VirtIONetHeaderMergeableRx) == 12);
+
+constexpr size_t VIRTIO_NET_HDR_SIZE = sizeof(VirtIONetHeader);
+constexpr size_t VIRTIO_NET_HDR_SIZE_MRG_RXBUF = sizeof(VirtIONetHeaderMergeableRx);
 
 // Virtqueue structures (packed to match hardware layout)
 struct VirtqDesc {
@@ -137,6 +143,8 @@ static_assert(sizeof(VirtqUsed) == 4);
 
 // Maximum virtqueue size
 constexpr uint16_t VIRTQ_MAX_SIZE = 256;
+constexpr uint16_t VIRTQ_NO_BUF = 0xFFFF;
+constexpr uint16_t VIRTQ_BAD_BUF = 0xFFFE;
 
 struct Virtqueue {
     uint16_t size;           // Number of descriptors
@@ -161,7 +169,7 @@ struct Virtqueue {
 // Virtqueue management
 auto virtq_alloc(uint16_t size) -> Virtqueue*;
 auto virtq_add_buf(Virtqueue* vq, uint64_t phys, uint32_t len, uint16_t flags, ker::net::PacketBuffer* pkt) -> int;
-auto virtq_get_buf(Virtqueue* vq, uint32_t* out_len) -> uint16_t;  // returns desc idx, 0xFFFF if empty
+auto virtq_get_buf(Virtqueue* vq, uint32_t* out_len) -> uint16_t;  // returns desc idx, VIRTQ_NO_BUF, or VIRTQ_BAD_BUF
 void virtq_kick(Virtqueue* vq);
 
 // Check if device has added buffers to the used ring that the driver

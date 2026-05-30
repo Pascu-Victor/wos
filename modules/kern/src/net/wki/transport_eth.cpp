@@ -1,6 +1,7 @@
 #include "transport_eth.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <net/address.hpp>
@@ -16,6 +17,34 @@
 namespace ker::net::wki {
 
 namespace {
+
+auto is_wki_control_reserve_frame(const void* data, uint16_t len) -> bool {
+    if (data == nullptr || len < WKI_HEADER_SIZE) {
+        return false;
+    }
+
+    const auto* hdr = static_cast<const WkiHeader*>(data);
+    if (wki_version(hdr->version_flags) != WKI_VERSION) {
+        return false;
+    }
+    if (WKI_HEADER_SIZE + hdr->payload_len > len) {
+        return false;
+    }
+
+    auto const TYPE = static_cast<MsgType>(hdr->msg_type);
+    switch (TYPE) {
+        case MsgType::HELLO:
+        case MsgType::HELLO_ACK:
+            return hdr->channel_id == WKI_CHAN_CONTROL && hdr->payload_len <= sizeof(HelloPayload);
+        case MsgType::HEARTBEAT:
+        case MsgType::HEARTBEAT_ACK:
+            return hdr->payload_len <= sizeof(HeartbeatPayload);
+        case MsgType::FENCE_NOTIFY:
+            return hdr->channel_id == WKI_CHAN_CONTROL && hdr->payload_len <= sizeof(FenceNotifyPayload);
+        default:
+            return false;
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Neighbor MAC table - maps node_id to MAC address for Ethernet TX
@@ -41,6 +70,27 @@ WkiTransport s_eth_transport;    // NOLINT(cppcoreguidelines-avoid-non-const-glo
 EthTransportPrivate s_eth_priv;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool s_eth_initialized = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 using log = ker::mod::dbg::logger<"wki">;
+
+constexpr uint64_t WKI_TX_PRESSURE_FENCE_GRACE_US = static_cast<uint64_t>(WKI_PEER_FENCE_CONFIRM_GRACE_MS) * 1000;
+
+std::atomic<uint64_t> s_last_control_tx_failure_us{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> s_last_bulk_tx_failure_us{0};     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+void note_wki_tx_failure(bool control_frame) {
+    uint64_t const NOW_US = wki_now_us();
+    auto& last_failure = control_frame ? s_last_control_tx_failure_us : s_last_bulk_tx_failure_us;
+    last_failure.store(NOW_US, std::memory_order_relaxed);
+}
+
+auto timestamp_recent(uint64_t timestamp_us, uint64_t now_us, uint64_t window_us) -> bool {
+    if (timestamp_us == 0) {
+        return false;
+    }
+    if (timestamp_us > now_us) {
+        return true;
+    }
+    return now_us - timestamp_us <= window_us;
+}
 
 // -----------------------------------------------------------------------------
 // Secondary transport pool - auto-registered for non-primary NICs that
@@ -136,8 +186,13 @@ int eth_wki_tx(WkiTransport* self, uint16_t neighbor_id, const void* data, uint1
         }
     }
 
-    PacketBuffer* pkt = pkt_alloc_tx();
+    // Heartbeats and ACK-only control frames are what keep peers from being
+    // falsely fenced under bulk IPC pressure. Let only these bounded WKI
+    // control frames use the reserve; user/bulk WKI data still uses pkt_alloc_tx().
+    bool const CONTROL_FRAME = is_wki_control_reserve_frame(data, len);
+    PacketBuffer* pkt = CONTROL_FRAME ? pkt_alloc() : pkt_alloc_tx();
     if (pkt == nullptr) {
+        note_wki_tx_failure(CONTROL_FRAME);
         return -1;
     }
 
@@ -152,15 +207,24 @@ int eth_wki_tx(WkiTransport* self, uint16_t neighbor_id, const void* data, uint1
     pkt->dev = priv->netdev;
 
     // eth_tx will prepend the Ethernet header
-    return proto::eth_tx(priv->netdev, pkt, dst_mac, WKI_ETHERTYPE);
+    int const RET = proto::eth_tx(priv->netdev, pkt, dst_mac, WKI_ETHERTYPE);
+    if (RET < 0) {
+        note_wki_tx_failure(CONTROL_FRAME);
+    }
+    return RET;
 }
 
 // Zero-copy TX: caller pre-built the WKI frame directly in pkt->data.
 // We just resolve the MAC, set the device, and hand to eth_tx.
 int eth_wki_tx_pkt(WkiTransport* self, uint16_t neighbor_id, net::PacketBuffer* pkt) {
+    if (pkt == nullptr) {
+        return -1;
+    }
+    bool const CONTROL_FRAME = is_wki_control_reserve_frame(pkt->data, static_cast<uint16_t>(pkt->len));
     auto* priv = static_cast<EthTransportPrivate*>(self->private_data);
     if ((priv == nullptr) || (priv->netdev == nullptr)) {
         pkt_free(pkt);
+        note_wki_tx_failure(CONTROL_FRAME);
         return -1;
     }
 
@@ -179,7 +243,11 @@ int eth_wki_tx_pkt(WkiTransport* self, uint16_t neighbor_id, net::PacketBuffer* 
     }
 
     pkt->dev = priv->netdev;
-    return proto::eth_tx(priv->netdev, pkt, dst_mac, WKI_ETHERTYPE);
+    int const RET = proto::eth_tx(priv->netdev, pkt, dst_mac, WKI_ETHERTYPE);
+    if (RET < 0) {
+        note_wki_tx_failure(CONTROL_FRAME);
+    }
+    return RET;
 }
 
 // Set RX handler
@@ -330,5 +398,12 @@ void wki_eth_transport_init(net::NetDevice* netdev) {
 }
 
 auto wki_eth_get_netdev() -> net::NetDevice* { return s_eth_priv.netdev; }
+
+auto wki_eth_recent_tx_pressure(uint64_t now_us) -> bool {
+    uint64_t const LAST_CONTROL_TX_FAILURE_US = s_last_control_tx_failure_us.load(std::memory_order_relaxed);
+    uint64_t const LAST_BULK_TX_FAILURE_US = s_last_bulk_tx_failure_us.load(std::memory_order_relaxed);
+    return timestamp_recent(LAST_CONTROL_TX_FAILURE_US, now_us, WKI_TX_PRESSURE_FENCE_GRACE_US) ||
+           timestamp_recent(LAST_BULK_TX_FAILURE_US, now_us, WKI_TX_PRESSURE_FENCE_GRACE_US);
+}
 
 }  // namespace ker::net::wki

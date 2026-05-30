@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <dev/pci.hpp>
@@ -63,8 +64,9 @@ struct VirtIONetDevice {
     uint16_t io_base{};          // BAR0 I/O port base (legacy path)
     uint8_t num_queue_pairs{1};  // Active queue pairs after MQ negotiation
     uint8_t configured_queue_pairs{1};
-    uint8_t hdr_size{};  // sizeof virtio-net header: 10 (legacy) or 12 (modern/VERSION_1)
+    uint8_t hdr_size{};  // sizeof negotiated virtio-net header
     uint32_t negotiated_features{};
+    std::atomic<uint32_t> tx_rr{0};
     bool msix_enabled{};
 
     // Modern virtio (non-null when using virtio 1.0 MMIO interface)

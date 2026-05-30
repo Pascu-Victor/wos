@@ -77,7 +77,7 @@ auto virtq_alloc(uint16_t size) -> Virtqueue* {
     for (uint16_t i = 0; i < size - 1; i++) {
         vq->desc[i].next = i + 1;
     }
-    vq->desc[size - 1].next = 0xFFFF;  // End of free list
+    vq->desc[size - 1].next = VIRTQ_NO_BUF;  // End of free list
 
     // Clear packet map
     for (auto*& pkt : vq->pkt_map) {
@@ -88,12 +88,42 @@ auto virtq_alloc(uint16_t size) -> Virtqueue* {
 }
 
 auto virtq_add_buf(Virtqueue* vq, uint64_t phys, uint32_t len, uint16_t flags, ker::net::PacketBuffer* pkt) -> int {
+    if (vq == nullptr || vq->size == 0 || vq->size > VIRTQ_MAX_SIZE) {
+        return -1;
+    }
     if (vq->num_free == 0) {
+        return -1;
+    }
+    if (vq->num_free > vq->size) {
+        log::error("virtq_add_buf: corrupt free count q=%u free=%u size=%u", vq->queue_index, vq->num_free, vq->size);
+        vq->num_free = 0;
+        vq->free_head = VIRTQ_NO_BUF;
         return -1;
     }
 
     uint16_t const IDX = vq->free_head;
-    vq->free_head = vq->desc[IDX].next;
+    if (IDX >= vq->size) {
+        log::error("virtq_add_buf: corrupt free_head q=%u head=%u size=%u free=%u", vq->queue_index, IDX, vq->size, vq->num_free);
+        vq->num_free = 0;
+        vq->free_head = VIRTQ_NO_BUF;
+        return -1;
+    }
+    uint16_t const NEXT = vq->desc[IDX].next;
+    if (vq->num_free > 1 && (NEXT >= vq->size || NEXT == IDX)) {
+        log::error("virtq_add_buf: corrupt free next q=%u head=%u next=%u size=%u free=%u", vq->queue_index, IDX, NEXT, vq->size,
+                   vq->num_free);
+        vq->num_free = 0;
+        vq->free_head = VIRTQ_NO_BUF;
+        return -1;
+    }
+    if (vq->pkt_map.at(IDX) != nullptr) {
+        log::error("virtq_add_buf: free descriptor still mapped q=%u idx=%u", vq->queue_index, IDX);
+        vq->num_free = 0;
+        vq->free_head = VIRTQ_NO_BUF;
+        return -1;
+    }
+
+    vq->free_head = (vq->num_free == 1) ? VIRTQ_NO_BUF : NEXT;
     vq->num_free--;
 
     vq->desc[IDX].addr = phys;
@@ -114,9 +144,12 @@ auto virtq_add_buf(Virtqueue* vq, uint64_t phys, uint32_t len, uint16_t flags, k
 }
 
 auto virtq_get_buf(Virtqueue* vq, uint32_t* out_len) -> uint16_t {
+    if (vq == nullptr || vq->size == 0 || vq->size > VIRTQ_MAX_SIZE) {
+        return VIRTQ_NO_BUF;
+    }
     // Check if there are consumed buffers
     if (vq->last_used_idx == vq->used->idx) {
-        return 0xFFFF;  // No buffers
+        return VIRTQ_NO_BUF;
     }
 
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -124,9 +157,26 @@ auto virtq_get_buf(Virtqueue* vq, uint32_t* out_len) -> uint16_t {
     uint16_t const USED_IDX = vq->last_used_idx % vq->size;
     auto& elem = vq->used->ring[USED_IDX];
 
-    auto desc_idx = static_cast<uint16_t>(elem.id);
+    uint32_t const DESC_ID = elem.id;
     if (out_len != nullptr) {
         *out_len = elem.len;
+    }
+
+    vq->last_used_idx++;
+
+    if (DESC_ID >= vq->size) {
+        log::error("virtq_get_buf: invalid used descriptor q=%u idx=%u size=%u len=%u", vq->queue_index, DESC_ID, vq->size, elem.len);
+        return VIRTQ_BAD_BUF;
+    }
+
+    auto desc_idx = static_cast<uint16_t>(DESC_ID);
+    if (vq->num_free >= vq->size) {
+        log::error("virtq_get_buf: free list overflow q=%u idx=%u free=%u size=%u", vq->queue_index, desc_idx, vq->num_free, vq->size);
+        return VIRTQ_BAD_BUF;
+    }
+    if (vq->pkt_map.at(desc_idx) == nullptr) {
+        log::error("virtq_get_buf: used descriptor not mapped q=%u idx=%u", vq->queue_index, desc_idx);
+        return VIRTQ_BAD_BUF;
     }
 
     // Return descriptor to free list
@@ -134,7 +184,6 @@ auto virtq_get_buf(Virtqueue* vq, uint32_t* out_len) -> uint16_t {
     vq->free_head = desc_idx;
     vq->num_free++;
 
-    vq->last_used_idx++;
     return desc_idx;
 }
 

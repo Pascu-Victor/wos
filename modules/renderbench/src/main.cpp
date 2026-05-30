@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/process.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -61,6 +62,8 @@ struct WorkerInvocation {
     int first_slot = 0;
     int slot_count = 1;
     int total_slots = 1;
+    int batch_start = 0;
+    int batch_count = 0;
 };
 
 struct IpcWorkerSpec {
@@ -70,6 +73,8 @@ struct IpcWorkerSpec {
     int first_slot = 0;
     int slot_count = 1;
     int total_slots = 1;
+    int batch_start = 0;
+    int batch_count = 0;
     std::string hostname;
 };
 
@@ -100,6 +105,7 @@ struct ChildWorker {
     int read_fd = -1;
     int worker_id = 0;
     int worker_count = 1;
+    int worker_threads = 1;
     uint64_t expected_tiles = 0;
     uint64_t received_packets = 0;
     uint64_t unique_tiles = 0;
@@ -753,6 +759,23 @@ auto renderbench_program_path(const char* argv0) -> std::string {
     return "/usr/bin/renderbench";
 }
 
+auto path_matches_prefix(std::string_view path, std::string_view prefix) -> bool {
+    return path == prefix || (path.size() > prefix.size() && path.starts_with(prefix) && path.substr(prefix.size(), 1) == "/");
+}
+
+void install_worker_scene_vfs_policy(const tracebench::Options& options, const IpcWorkerSpec& spec) {
+    if (!path_matches_prefix(options.scene_path, "/srv")) {
+        return;
+    }
+
+    int const RC = ker::abi::vfs::wki_rule_add_vfs("/srv", ker::abi::vfs::WKI_VFS_ROUTE_LOCAL);
+    if (RC < 0) {
+        std::println(stderr,
+                     "renderbench: worker {} on {} failed to keep /srv local for scene reads (rc={}); continuing with inherited VFS policy",
+                     spec.worker_id, spec.hostname, RC);
+    }
+}
+
 auto make_worker_args(const std::string& program_path, const tracebench::Options& options, const IpcWorkerSpec& spec)
     -> std::vector<std::string> {
     std::vector<std::string> args{
@@ -791,6 +814,12 @@ auto make_worker_args(const std::string& program_path, const tracebench::Options
         "--run-id",
         options.run_id,
     };
+    if (spec.batch_count > 0) {
+        args.emplace_back("--worker-batch-start");
+        args.emplace_back(std::to_string(spec.batch_start));
+        args.emplace_back("--worker-batch-count");
+        args.emplace_back(std::to_string(spec.batch_count));
+    }
     if (options.debug_edge_colors) {
         args.emplace_back("--debug-edge-colors");
     }
@@ -806,6 +835,8 @@ auto make_worker_args(const std::string& program_path, const tracebench::Options
     if (write_fd != WORKER_STDOUT_FD) {
         ::close(write_fd);
     }
+
+    install_worker_scene_vfs_policy(options, spec);
 
     int64_t const TARGET_RC = ker::process::setwkitarget(spec.hostname.c_str(), spec.hostname.size(), ker::process::WKI_TARGET_FLAG_STRICT);
     if (TARGET_RC < 0) {
@@ -865,6 +896,8 @@ auto launch_worker(const std::string& program_path, const tracebench::Options& o
         .read_fd = pipe_fds[0],
         .worker_id = spec.worker_id,
         .worker_count = spec.worker_count,
+        .worker_threads = spec.worker_threads,
+        .expected_tiles = static_cast<uint64_t>(std::max(0, spec.batch_count)),
         .hostname = spec.hostname,
         .buffer = {},
         .pipe_open = true,
@@ -898,10 +931,9 @@ auto make_tile_owner_map(std::span<const tracebench::Tile> tiles, std::span<cons
                 continue;
             }
             int const TILE_INDEX = tiles[position].index;
-            if (TILE_INDEX < 0 || static_cast<size_t>(TILE_INDEX) >= owner.size()) {
-                continue;
+            if (TILE_INDEX >= 0 && static_cast<size_t>(TILE_INDEX) < owner.size()) {
+                owner[static_cast<size_t>(TILE_INDEX)] = spec.worker_id;
             }
-            owner[static_cast<size_t>(TILE_INDEX)] = spec.worker_id;
         }
     }
     return owner;
@@ -954,6 +986,71 @@ void close_worker_pipes(std::span<ChildWorker> workers) {
         }
         worker.pipe_open = false;
     }
+}
+
+auto wait_for_child(ChildWorker& worker, bool cancellation_expected) -> bool {
+    if (worker.pid <= 0) {
+        return true;
+    }
+
+    bool ok = true;
+    int status = 0;
+    while (::waitpid(worker.pid, &status, 0) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        std::perror("renderbench: waitpid");
+        ok = false;
+        break;
+    }
+    if (!cancellation_expected && (!WIFEXITED(status) || WEXITSTATUS(status) != 0)) {
+        std::println(stderr, "renderbench: worker on {} exited with status {}", worker.hostname, status);
+        ok = false;
+    }
+    worker.pid = -1;
+    return ok;
+}
+
+auto dynamic_batch_size(size_t total_tiles, size_t worker_count, int worker_threads) -> int {
+    size_t const WORKERS = std::max<size_t>(1, worker_count);
+    size_t const THREADS = static_cast<size_t>(std::max(1, worker_threads));
+    size_t target = (total_tiles + ((WORKERS * 8U) - 1U)) / (WORKERS * 8U);
+    size_t const MIN_BATCH = THREADS * 16U;
+    size_t const MAX_BATCH = std::max(MIN_BATCH, THREADS * 128U);
+    if (total_tiles >= WORKERS * MIN_BATCH) {
+        target = std::max(target, MIN_BATCH);
+    }
+    target = std::min(target, MAX_BATCH);
+    return static_cast<int>(std::max<size_t>(1, target));
+}
+
+auto launch_next_worker_batch(const std::string& program_path, const tracebench::Options& options,
+                              std::span<const IpcWorkerSpec> base_specs, std::span<const tracebench::Tile> tiles,
+                              std::vector<int>& tile_owner, size_t& next_tile_position, size_t worker_index, ChildWorker& worker) -> int {
+    if (next_tile_position >= tiles.size()) {
+        return 0;
+    }
+
+    IpcWorkerSpec spec = base_specs[worker_index];
+    int const BATCH_SIZE = dynamic_batch_size(tiles.size(), base_specs.size(), spec.worker_threads);
+    size_t const START = next_tile_position;
+    size_t const COUNT = std::min(static_cast<size_t>(BATCH_SIZE), tiles.size() - START);
+    spec.batch_start = static_cast<int>(START);
+    spec.batch_count = static_cast<int>(COUNT);
+    next_tile_position += COUNT;
+
+    for (size_t position = START; position < START + COUNT; ++position) {
+        int const TILE_INDEX = tiles[position].index;
+        if (TILE_INDEX >= 0 && static_cast<size_t>(TILE_INDEX) < tile_owner.size()) {
+            tile_owner[static_cast<size_t>(TILE_INDEX)] = spec.worker_id;
+        }
+    }
+
+    if (!launch_worker(program_path, options, spec, worker)) {
+        return -1;
+    }
+    worker.expected_tiles = COUNT;
+    return 1;
 }
 
 void wait_for_worker_pipe_activity(std::span<const ChildWorker> workers) {
@@ -1130,9 +1227,17 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
     }
     auto all_tiles = tracebench::make_tiles(options.width, options.height, options.tile_size);
     std::vector<tracebench::Tile> assigned_tiles;
-    for (size_t index = 0; index < all_tiles.size(); ++index) {
-        if (owns_tile_slot(index, worker.first_slot, worker.slot_count, worker.total_slots)) {
-            assigned_tiles.push_back(all_tiles[index]);
+    if (worker.batch_count > 0) {
+        size_t const START = std::min(static_cast<size_t>(worker.batch_start), all_tiles.size());
+        size_t const COUNT = static_cast<size_t>(worker.batch_count);
+        size_t const END = std::min(START + COUNT, all_tiles.size());
+        assigned_tiles.insert(assigned_tiles.end(), all_tiles.begin() + static_cast<ptrdiff_t>(START),
+                              all_tiles.begin() + static_cast<ptrdiff_t>(END));
+    } else {
+        for (size_t index = 0; index < all_tiles.size(); ++index) {
+            if (owns_tile_slot(index, worker.first_slot, worker.slot_count, worker.total_slots)) {
+                assigned_tiles.push_back(all_tiles[index]);
+            }
         }
     }
 
@@ -1192,22 +1297,7 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
 auto wait_for_children(std::span<ChildWorker> workers, bool cancellation_expected) -> bool {
     bool ok = true;
     for (auto& worker : workers) {
-        int status = 0;
-        while (::waitpid(worker.pid, &status, 0) < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            std::perror("renderbench: waitpid");
-            ok = false;
-            break;
-        }
-        if (cancellation_expected) {
-            continue;
-        }
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            std::println(stderr, "renderbench: worker on {} exited with status {}", worker.hostname, status);
-            ok = false;
-        }
+        ok = wait_for_child(worker, cancellation_expected) && ok;
     }
     return ok;
 }
@@ -1224,37 +1314,56 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
     tracebench::FilmView film{.width = options.width, .height = options.height, .rgb = std::span<float>(storage.data(), storage.size())};
     std::vector<ChildWorker> workers(specs.size());
     std::vector<unsigned char> tile_seen(tiles.size(), 0);
-    auto tile_owner = make_tile_owner_map(tiles, specs);
+    bool const USE_DYNAMIC_BATCHES = options.placement == tracebench::Placement::NodeThreads;
+    std::vector<int> tile_owner = USE_DYNAMIC_BATCHES ? std::vector<int>(tiles.size(), -1)
+                                                      : make_tile_owner_map(std::span<const tracebench::Tile>(tiles.data(), tiles.size()),
+                                                                            std::span<const IpcWorkerSpec>(specs.data(), specs.size()));
     std::string const PROGRAM_PATH = renderbench_program_path(argv0);
 
     double const STARTED = tracebench::monotonic_seconds();
     double next_update = STARTED;
     uint64_t tiles_done = 0;
+    size_t next_tile_position = USE_DYNAMIC_BATCHES ? 0 : tiles.size();
     (void)tracebench::write_status(options, make_progress(options, 0, tiles.size(), STARTED, false));
 
+    bool ok = true;
+    size_t open_pipes = 0;
     for (size_t i = 0; i < specs.size(); ++i) {
-        if (!launch_worker(PROGRAM_PATH, options, specs[i], workers[i])) {
-            signal_workers(std::span<ChildWorker>(workers.data(), i), SIGTERM);
-            (void)wait_for_children(std::span<ChildWorker>(workers.data(), i), true);
-            return 2;
+        if (USE_DYNAMIC_BATCHES) {
+            int const LAUNCHED = launch_next_worker_batch(PROGRAM_PATH, options, std::span<const IpcWorkerSpec>(specs.data(), specs.size()),
+                                                          std::span<const tracebench::Tile>(tiles.data(), tiles.size()), tile_owner,
+                                                          next_tile_position, i, workers[i]);
+            if (LAUNCHED < 0) {
+                ok = false;
+                break;
+            }
+            if (LAUNCHED == 0) {
+                continue;
+            }
+        } else {
+            if (!launch_worker(PROGRAM_PATH, options, specs[i], workers[i])) {
+                ok = false;
+                break;
+            }
+            workers[i].expected_tiles =
+                expected_tile_count_for_slots(tiles.size(), specs[i].first_slot, specs[i].slot_count, specs[i].total_slots);
         }
-        workers[i].expected_tiles =
-            expected_tile_count_for_slots(tiles.size(), specs[i].first_slot, specs[i].slot_count, specs[i].total_slots);
+        ++open_pipes;
         if (cancel_requested()) {
-            signal_workers(std::span<ChildWorker>(workers.data(), i + 1U), static_cast<int>(g_cancel_signal));
-            (void)wait_for_children(std::span<ChildWorker>(workers.data(), i + 1U), true);
+            signal_workers(std::span<ChildWorker>(workers.data(), workers.size()), static_cast<int>(g_cancel_signal));
+            (void)wait_for_children(std::span<ChildWorker>(workers.data(), workers.size()), true);
             return cancel_exit_code();
         }
     }
 
-    bool ok = true;
     bool cancellation_sent = false;
+    bool worker_termination_expected = false;
     bool kill_escalated = false;
     double cancel_started = 0.0;
-    size_t open_pipes = workers.size();
-    while (open_pipes != 0) {
+    while (ok && open_pipes != 0) {
         if (cancel_requested() && !cancellation_sent) {
             cancellation_sent = true;
+            worker_termination_expected = true;
             cancel_started = tracebench::monotonic_seconds();
             ok = false;
             signal_workers(std::span<ChildWorker>(workers.data(), workers.size()), static_cast<int>(g_cancel_signal));
@@ -1279,6 +1388,10 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
                 if (worker.done_failed) {
                     ok = false;
                 }
+                if (!worker.done_seen) {
+                    std::println(stderr, "renderbench: worker {} on {} closed without done packet", worker.worker_id, worker.hostname);
+                    ok = false;
+                }
                 if (worker.unique_tiles != worker.expected_tiles) {
                     std::println(stderr,
                                  "renderbench: worker {} on {} delivered {}/{} unique tiles packets={} duplicates={} foreign={} done={}"
@@ -1287,6 +1400,19 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
                                  worker.duplicate_tiles, worker.foreign_tiles, worker.done_seen ? 1 : 0, worker.done_sent_tiles,
                                  worker.done_expected_tiles);
                     ok = false;
+                }
+                ok = wait_for_child(worker, worker_termination_expected) && ok;
+                if (ok && USE_DYNAMIC_BATCHES && !worker_termination_expected) {
+                    size_t const WORKER_INDEX = static_cast<size_t>(&worker - workers.data());
+                    int const LAUNCHED =
+                        launch_next_worker_batch(PROGRAM_PATH, options, std::span<const IpcWorkerSpec>(specs.data(), specs.size()),
+                                                 std::span<const tracebench::Tile>(tiles.data(), tiles.size()), tile_owner,
+                                                 next_tile_position, WORKER_INDEX, worker);
+                    if (LAUNCHED < 0) {
+                        ok = false;
+                    } else if (LAUNCHED > 0) {
+                        ++open_pipes;
+                    }
                 }
             }
         }
@@ -1308,7 +1434,13 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
         }
     }
 
-    ok = wait_for_children(std::span<ChildWorker>(workers.data(), workers.size()), cancellation_sent) && ok;
+    if (!ok && !cancellation_sent) {
+        std::println(stderr, "renderbench: worker failure detected; canceling remaining workers");
+        signal_workers(std::span<ChildWorker>(workers.data(), workers.size()), SIGTERM);
+        close_worker_pipes(std::span<ChildWorker>(workers.data(), workers.size()));
+    }
+
+    ok = wait_for_children(std::span<ChildWorker>(workers.data(), workers.size()), worker_termination_expected) && ok;
     if (tiles_done != tiles.size()) {
         std::println(stderr, "renderbench: completed {} of {} tiles", tiles_done, tiles.size());
         print_missing_tile_summary(tile_seen);
@@ -1361,6 +1493,10 @@ auto parse_worker_invocation(int argc, char** argv) -> WorkerInvocation {
         } else if (ARG == "--worker-total-slots") {
             explicit_slots = true;
             positive_value(worker.total_slots);
+        } else if (ARG == "--worker-batch-start") {
+            nonnegative_value(worker.batch_start);
+        } else if (ARG == "--worker-batch-count") {
+            positive_value(worker.batch_count);
         }
     }
     if (worker.worker_id >= worker.worker_count) {

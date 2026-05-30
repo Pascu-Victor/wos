@@ -97,6 +97,19 @@ void mark_peer_rx_progress(uint16_t src_node) {
     WkiPeer* peer = wki_peer_find(src_node);
     if (peer != nullptr && peer->state == PeerState::CONNECTED) {
         peer->last_rx_activity = wki_now_us();
+        peer->missed_beats = 0;
+        peer->fence_defer_until_us = 0;
+    }
+}
+
+void mark_peer_tx_progress(uint16_t dst_node) {
+    if (dst_node == WKI_NODE_INVALID || dst_node == WKI_NODE_BROADCAST || dst_node == g_wki.my_node_id) {
+        return;
+    }
+
+    WkiPeer* peer = wki_peer_find(dst_node);
+    if (peer != nullptr && peer->state == PeerState::CONNECTED) {
+        peer->last_tx_activity = wki_now_us();
     }
 }
 
@@ -913,7 +926,11 @@ auto transmit_ack_snapshot(const AckSnapshot& ack) -> int {
         return WKI_ERR_NO_ROUTE;
     }
 
-    return transport->tx(transport, NEXT_HOP, &ack.hdr, WKI_HEADER_SIZE);
+    int const RET = transport->tx(transport, NEXT_HOP, &ack.hdr, WKI_HEADER_SIZE);
+    if (RET >= 0) {
+        mark_peer_tx_progress(ack.peer);
+    }
+    return RET;
 }
 
 }  // namespace
@@ -1260,9 +1277,15 @@ auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint
         return WKI_ERR_NO_ROUTE;
     }
 
-    // Build frame: WkiHeader + payload
     uint16_t const FRAME_LEN = WKI_HEADER_SIZE + payload_len;
-    auto* frame = new uint8_t[FRAME_LEN];
+    constexpr size_t INLINE_RAW_FRAME_SIZE = WKI_HEADER_SIZE + sizeof(HelloPayload);
+    std::array<uint8_t, INLINE_RAW_FRAME_SIZE> inline_frame{};
+    uint8_t* heap_frame = nullptr;
+    uint8_t* frame = inline_frame.data();
+    if (FRAME_LEN > inline_frame.size()) {
+        heap_frame = new (std::nothrow) uint8_t[FRAME_LEN];
+        frame = heap_frame;
+    }
     if (frame == nullptr) {
         return WKI_ERR_NO_MEM;
     }
@@ -1321,7 +1344,11 @@ auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint
         }
     }
 
-    delete[] frame;
+    if (ret == WKI_OK && dst_node != WKI_NODE_BROADCAST) {
+        mark_peer_tx_progress(dst_node);
+    }
+
+    delete[] heap_frame;
 
     return ret;
 }
@@ -2014,6 +2041,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     if (ch->active && ch->ack_pending && ch->rx_ack_pending == imm_ack_num) {
                         if (tx_ret >= 0) {
                             ch->ack_pending = false;
+                            mark_peer_tx_progress(imm_ack_peer);
                         } else {
                             ch->ack_pending_since_us = wki_now_us();
                             notify_timer = true;
@@ -2216,6 +2244,7 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
         if (ch->active && ch->ack_pending && ch->rx_ack_pending == ack_num) {
             if (tx_ret >= 0) {
                 ch->ack_pending = false;
+                mark_peer_tx_progress(ack_peer);
             } else {
                 ch->ack_pending_since_us = now_us;
             }
@@ -2354,6 +2383,7 @@ void wki_timer_tick(uint64_t now_us) {
             if (ch->active && ch->ack_pending && ch->rx_ack_pending == ack_num) {
                 if (tx_ret >= 0) {
                     ch->ack_pending = false;
+                    mark_peer_tx_progress(ack_peer);
                 } else {
                     ch->ack_pending_since_us = now_us;
                 }

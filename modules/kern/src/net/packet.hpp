@@ -17,6 +17,9 @@ constexpr size_t PKT_POOL_MIN_SIZE = 1024;
 constexpr size_t PKT_POOL_PER_NIC = 1024;
 // Runtime expansion granularity. Rounded to keep slab counts close to ring sizes.
 constexpr size_t PKT_POOL_GROW_CHUNK = 256;
+// Emergency free-buffer floor preserved by RX refill so TX/control traffic can
+// still allocate packets under receive bursts.
+constexpr size_t PKT_POOL_TX_RESERVE = 256;
 
 struct PacketPoolSnapshot {
     size_t capacity = 0;

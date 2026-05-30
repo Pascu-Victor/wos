@@ -16,10 +16,19 @@ namespace ker::net::proto {
 
 const MacAddress ETH_BROADCAST = MacAddress::broadcast();
 
+namespace {
+void drop_rx(NetDevice* dev, PacketBuffer* pkt) {
+    if (dev != nullptr) {
+        dev->rx_dropped++;
+    }
+    pkt_free(pkt);
+}
+}  // namespace
+
 void eth_rx(NetDevice* dev, PacketBuffer* pkt) {
     NET_TRACE_SPAN(SPAN_ETH_RX);
     if (pkt->len < ETH_HLEN) {
-        pkt_free(pkt);
+        drop_rx(dev, pkt);
         return;
     }
 
@@ -34,7 +43,7 @@ void eth_rx(NetDevice* dev, PacketBuffer* pkt) {
     bool const IS_MULTICAST = DST.is_multicast();
 
     if (!IS_OUR_MAC && !IS_BROADCAST && !IS_MULTICAST) {
-        pkt_free(pkt);
+        drop_rx(dev, pkt);
         return;
     }
 
@@ -64,7 +73,7 @@ void eth_rx(NetDevice* dev, PacketBuffer* pkt) {
             ker::net::wki::roce_rx(dev, pkt);
             break;
         default:
-            pkt_free(pkt);
+            drop_rx(dev, pkt);
             break;
     }
 }

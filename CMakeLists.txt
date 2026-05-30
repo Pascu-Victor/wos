@@ -37,11 +37,12 @@ add_subdirectory(modules)
 set(SYSROOT ${CMAKE_SOURCE_DIR}/toolchain/sysroot)
 set(MLIBC_BUILD_DIR ${CMAKE_SOURCE_DIR}/toolchain/mlibc-build)
 set(LIBCXX_BUILD_DIR ${CMAKE_SOURCE_DIR}/toolchain/libcxx-build)
+set(WOS_BUILD_SCRIPTS_DIR ${CMAKE_SOURCE_DIR}/scripts/build)
 
 # --- check_headers: validate #pragma once in kern and init headers ----------
 add_custom_target(check_headers
-    COMMAND sh ${CMAKE_SOURCE_DIR}/scripts/check_headers.sh ${CMAKE_SOURCE_DIR}/modules/kern
-    COMMAND sh ${CMAKE_SOURCE_DIR}/scripts/check_headers.sh ${CMAKE_SOURCE_DIR}/modules/init
+    COMMAND sh ${WOS_BUILD_SCRIPTS_DIR}/check_headers.sh ${CMAKE_SOURCE_DIR}/modules/kern
+    COMMAND sh ${WOS_BUILD_SCRIPTS_DIR}/check_headers.sh ${CMAKE_SOURCE_DIR}/modules/init
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Checking #pragma once in kernel/init headers..."
     USES_TERMINAL
@@ -62,11 +63,11 @@ file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/stamps)
 set(MLIBC_STAMP ${CMAKE_BINARY_DIR}/stamps/mlibc.stamp)
 add_custom_command(
     OUTPUT ${MLIBC_STAMP}
-    COMMAND ${CMAKE_SOURCE_DIR}/scripts/build_mlibc.sh ${CMAKE_BUILD_TYPE}
+    COMMAND ${WOS_BUILD_SCRIPTS_DIR}/build_mlibc.sh ${CMAKE_BUILD_TYPE}
     COMMAND ${CMAKE_COMMAND} -E touch ${MLIBC_STAMP}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Building mlibc..."
-    DEPENDS ${CMAKE_SOURCE_DIR}/scripts/build_mlibc.sh ${MLIBC_SOURCES}
+    DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/build_mlibc.sh ${MLIBC_SOURCES}
     USES_TERMINAL
 )
 add_custom_target(mlibc DEPENDS ${MLIBC_STAMP})
@@ -87,7 +88,7 @@ add_custom_target(libcxx DEPENDS ${LIBCXX_STAMP})
 
 # --- busybox: cross-compile busybox for WOS ---------------------------------
 add_custom_target(busybox
-    COMMAND ${CMAKE_SOURCE_DIR}/scripts/build_busybox.sh
+    COMMAND ${WOS_BUILD_SCRIPTS_DIR}/build_busybox.sh
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Building busybox..."
     USES_TERMINAL
@@ -96,7 +97,7 @@ add_dependencies(busybox mlibc libcxx)
 
 # --- dropbear: cross-compile dropbear SSH for WOS ---------------------------
 add_custom_target(dropbear
-    COMMAND ${CMAKE_SOURCE_DIR}/scripts/build_dropbear.sh
+    COMMAND ${WOS_BUILD_SCRIPTS_DIR}/build_dropbear.sh
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Building dropbear..."
     USES_TERMINAL
@@ -107,7 +108,7 @@ add_dependencies(dropbear mlibc libcxx)
 # If mountfs.qcow2 doesn't exist, create it from scratch.
 # If it already exists, delta-sync changed binaries and libraries.
 add_custom_target(mountfs_disk
-    COMMAND bash -c "if [ -f '${CMAKE_SOURCE_DIR}/mountfs.qcow2' ]\; then '${CMAKE_SOURCE_DIR}/scripts/sync_rootfs.sh'\; else '${CMAKE_SOURCE_DIR}/scripts/create_mountfs_disk.sh'\; fi"
+    COMMAND bash -c "if [ -f '${CMAKE_SOURCE_DIR}/mountfs.qcow2' ]\; then '${WOS_BUILD_SCRIPTS_DIR}/sync_rootfs.sh'\; else '${WOS_BUILD_SCRIPTS_DIR}/create_mountfs_disk.sh'\; fi"
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Syncing rootfs disk..."
     USES_TERMINAL
@@ -117,7 +118,7 @@ add_dependencies(mountfs_disk wos_modules)
 
 # --- boot_image: create the boot disk + initramfs --------------------------
 add_custom_target(boot_image
-    COMMAND ${CMAKE_SOURCE_DIR}/scripts/make_image.sh
+    COMMAND ${WOS_BUILD_SCRIPTS_DIR}/make_image.sh
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Creating boot image..."
     USES_TERMINAL

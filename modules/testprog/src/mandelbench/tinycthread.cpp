@@ -520,14 +520,13 @@ auto thrd_create(thrd_t* thr, thrd_start_t func, void* arg) -> int {
     /* Create the thread */
 #if defined(_TTHREAD_WIN32_)
     *thr = CreateThread(nullptr, 0, thrd_wrapper_function, static_cast<LPVOID>(ti), 0, nullptr);
+    bool const CREATED = (*thr) != nullptr;
 #elif defined(_TTHREAD_POSIX_)
-    if (pthread_create(thr, nullptr, thrd_wrapper_function, static_cast<void*>(ti)) != 0) {
-        *thr = nullptr;
-    }
+    bool const CREATED = pthread_create(thr, nullptr, thrd_wrapper_function, static_cast<void*>(ti)) == 0;
 #endif
 
     /* Did we fail to create the thread? */
-    if ((*thr) == nullptr) {
+    if (!CREATED) {
         delete ti;
         return THRD_ERROR;
     }

@@ -203,6 +203,8 @@ void wki_peer_note_rx_contact(WkiTransport* transport, uint16_t peer_node, const
     if (peer->last_heartbeat == 0) {
         peer->last_heartbeat = NOW_US;
     }
+    peer->missed_beats = 0;
+    peer->fence_defer_until_us = 0;
     if (peer->hostname[0] == '\0') {
         set_fallback_hostname(peer->hostname, peer_node);
     }
@@ -285,6 +287,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
         peer->last_heartbeat = NOW_US;
         peer->last_rx_activity = NOW_US;
         peer->missed_beats = 0;
+        peer->fence_defer_until_us = 0;
         g_wki.peer_lock.unlock();
 
         wki_eth_neighbor_add(peer_node, hello->mac_addr);
@@ -317,6 +320,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
     peer->last_heartbeat = wki_now_us();
     peer->last_rx_activity = peer->last_heartbeat;
     peer->missed_beats = 0;
+    peer->fence_defer_until_us = 0;
     remote_channel_epoch_changed = peer_note_remote_channel_epoch_locked(peer, REMOTE_CHANNEL_EPOCH);
 
     // V2: Copy hostname from HELLO payload
@@ -499,6 +503,7 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
     peer->last_heartbeat = wki_now_us();
     peer->last_rx_activity = peer->last_heartbeat;
     peer->missed_beats = 0;
+    peer->fence_defer_until_us = 0;
     remote_channel_epoch_changed = peer_note_remote_channel_epoch_locked(peer, REMOTE_CHANNEL_EPOCH);
 
     // Negotiate heartbeat interval
@@ -621,7 +626,9 @@ void handle_heartbeat(const WkiHeader* hdr, const uint8_t* payload, uint16_t pay
 
     peer->lock.lock();
     peer->last_heartbeat = wki_now_us();
+    peer->last_rx_activity = peer->last_heartbeat;
     peer->missed_beats = 0;
+    peer->fence_defer_until_us = 0;
     peer->lock.unlock();
 
     // Send HEARTBEAT_ACK echoing the timestamp for RTT calculation
@@ -657,7 +664,9 @@ void handle_heartbeat_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t
 
     peer->lock.lock();
     peer->last_heartbeat = wki_now_us();
+    peer->last_rx_activity = peer->last_heartbeat;
     peer->missed_beats = 0;
+    peer->fence_defer_until_us = 0;
 
     // RTT calculation from echoed timestamp
     uint64_t const NOW_NS = wki_now_us() * 1000;
@@ -701,6 +710,8 @@ mod::sys::Spinlock s_pending_fence_lock;                                   // NO
 std::array<PendingFenceNotify, WKI_MAX_PEERS> s_pending_fence_notifies{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 size_t s_pending_fence_notify_count = 0;                                   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint32_t> s_pending_fence_notify_drops{0};                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+auto local_observation_confirms_fence(const WkiPeer* peer, uint64_t now_us) -> bool;
 
 auto queue_pending_fence_notify(const FenceNotifyPayload& fn) -> bool {
     if (fn.fenced_node == WKI_NODE_INVALID || fn.fenced_node == WKI_NODE_BROADCAST || fn.fenced_node == g_wki.my_node_id) {
@@ -822,6 +833,7 @@ void wki_peer_fence_impl(WkiPeer* peer, bool notify_connected_peers) {
 
 void drain_pending_fence_notifies() {
     std::array<PendingFenceNotify, WKI_MAX_PEERS> pending_notifies{};
+    uint64_t const NOW_US = wki_now_us();
 
     s_pending_fence_lock.lock();
     size_t const PENDING_COUNT = s_pending_fence_notify_count;
@@ -839,6 +851,11 @@ void drain_pending_fence_notifies() {
 
         WkiPeer* fenced_peer = wki_peer_find(pending.fenced_node);
         if (fenced_peer == nullptr || fenced_peer->state == PeerState::FENCED) {
+            continue;
+        }
+        if (!local_observation_confirms_fence(fenced_peer, NOW_US)) {
+            log::warn("Ignoring FENCE_NOTIFY for node 0x%04x from 0x%04x; local heartbeat confirmation is still pending",
+                      pending.fenced_node, pending.fencing_node);
             continue;
         }
 
@@ -898,6 +915,7 @@ uint64_t s_jitter_state = 0;                               // NOLINT(cppcoreguid
 uint64_t s_next_heartbeat_send_deadline = 0;               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 constexpr uint64_t HELLO_BROADCAST_INTERVAL_US = 1000000;  // 1 second
 constexpr uint64_t VFS_FD_GC_INTERVAL_US = 10000000;       // 10 seconds
+constexpr uint8_t WKI_PEER_FENCE_PROBE_ROUNDS = 4;
 
 // Simple xorshift64 for jitter generation (not cryptographic, just for timing variance)
 auto wki_jitter_rand() -> uint64_t {
@@ -967,22 +985,32 @@ auto wki_peer_confirm_grace_us(const WkiPeer* peer) -> uint64_t {
     return std::max<uint64_t>(INTERVAL_US, CONFIRM_GRACE_US);
 }
 
+auto wki_peer_timeout_us(const WkiPeer* peer) -> uint64_t {
+    if (peer == nullptr) {
+        return 0;
+    }
+    return static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000 * peer->miss_threshold;
+}
+
 auto wki_peer_timeout_deadline_us(const WkiPeer* peer, uint64_t now_us) -> uint64_t {
     if (peer == nullptr) {
         return UINT64_MAX;
     }
 
-    uint64_t const TIMEOUT_US = static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000 * peer->miss_threshold;
+    uint64_t const TIMEOUT_US = wki_peer_timeout_us(peer);
     uint64_t next_deadline = wki_peer_observed_liveness_us(peer) + TIMEOUT_US;
     if (peer->missed_beats != 0) {
         next_deadline += wki_peer_confirm_grace_us(peer);
     }
+    if (peer->fence_defer_until_us > now_us) {
+        next_deadline = std::max(next_deadline, peer->fence_defer_until_us);
+    }
     return next_deadline > now_us ? next_deadline : now_us + 1;
 }
 
-void wki_send_heartbeat_probe(WkiPeer* peer) {
+auto wki_send_heartbeat_probe(WkiPeer* peer) -> int {
     if (peer == nullptr || peer->node_id == WKI_NODE_INVALID || peer->state != PeerState::CONNECTED || !peer->is_direct) {
-        return;
+        return WKI_ERR_INVALID;
     }
 
     HeartbeatPayload probe = {};
@@ -990,7 +1018,39 @@ void wki_send_heartbeat_probe(WkiPeer* peer) {
     probe.sender_load = 0;
     probe.sender_mem_free = 0;
     probe.reserved = 0;
-    wki_send_raw(peer->node_id, MsgType::HEARTBEAT, &probe, sizeof(probe), WKI_FLAG_PRIORITY);
+    return wki_send_raw(peer->node_id, MsgType::HEARTBEAT, &probe, sizeof(probe), WKI_FLAG_PRIORITY);
+}
+
+auto local_observation_confirms_fence(const WkiPeer* peer, uint64_t now_us) -> bool {
+    if (peer == nullptr) {
+        return true;
+    }
+    if (peer->state == PeerState::FENCED) {
+        return true;
+    }
+    if (peer->state != PeerState::CONNECTED || !peer->is_direct) {
+        return true;
+    }
+    if (peer->fence_defer_until_us > now_us) {
+        return false;
+    }
+    if (wki_eth_recent_tx_pressure(now_us)) {
+        return false;
+    }
+    if (now_us >= peer->connected_time) {
+        uint64_t const GRACE_PERIOD_US = static_cast<uint64_t>(WKI_PEER_GRACE_PERIOD_MS) * 1000;
+        if (now_us - peer->connected_time < GRACE_PERIOD_US) {
+            return false;
+        }
+    }
+
+    uint64_t const LAST_SEEN = wki_peer_observed_liveness_us(peer);
+    if (LAST_SEEN >= now_us) {
+        return false;
+    }
+
+    uint64_t const ELAPSED = now_us - LAST_SEEN;
+    return ELAPSED >= wki_peer_timeout_us(peer) + wki_peer_confirm_grace_us(peer);
 }
 
 }  // namespace
@@ -1037,6 +1097,10 @@ void wki_peer_timer_tick(uint64_t now_us) {
             continue;
         }
 
+        if (peer.fence_defer_until_us > now_us) {
+            continue;
+        }
+
         // Skip timeout check during grace period after initial connection
         uint64_t const SINCE_CONNECTED = now_us - peer.connected_time;
         if (SINCE_CONNECTED < GRACE_PERIOD_US) {
@@ -1065,6 +1129,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
 
         if (ELAPSED < TIMEOUT_US) {
             peer.missed_beats = 0;
+            peer.fence_defer_until_us = 0;
             continue;
         }
 
@@ -1072,14 +1137,39 @@ void wki_peer_timer_tick(uint64_t now_us) {
         // This avoids false fencing when elapsed hovers around the exact threshold.
         uint64_t const CONFIRM_GRACE_US = wki_peer_confirm_grace_us(&peer);
         if (peer.missed_beats == 0) {
-            peer.missed_beats = 1;
             log::warn("Heartbeat timeout candidate for peer 0x%04x (%llu us elapsed, timeout %llu us); probing before fence", peer.node_id,
                       ELAPSED, TIMEOUT_US);
-            wki_send_heartbeat_probe(&peer);
+            int const PROBE_RET = wki_send_heartbeat_probe(&peer);
+            if (PROBE_RET < 0) {
+                log::warn("Heartbeat probe TX failed for peer 0x%04x (rc=%d); deferring fence confirmation", peer.node_id, PROBE_RET);
+                peer.fence_defer_until_us = now_us + CONFIRM_GRACE_US;
+                continue;
+            }
+            peer.missed_beats = 1;
+            peer.fence_defer_until_us = now_us + CONFIRM_GRACE_US;
             continue;
         }
 
         if (ELAPSED >= TIMEOUT_US + CONFIRM_GRACE_US) {
+            if (wki_eth_recent_tx_pressure(now_us)) {
+                log::warn("Heartbeat fence deferred for peer 0x%04x under local WKI TX pressure (%llu us elapsed)", peer.node_id, ELAPSED);
+                (void)wki_send_heartbeat_probe(&peer);
+                peer.fence_defer_until_us = now_us + CONFIRM_GRACE_US;
+                continue;
+            }
+            if (peer.missed_beats < WKI_PEER_FENCE_PROBE_ROUNDS) {
+                uint8_t const NEXT_ROUND = peer.missed_beats + 1;
+                log::warn("Heartbeat still missing for peer 0x%04x (%llu us elapsed); probe round %u/%u before fence", peer.node_id,
+                          ELAPSED, NEXT_ROUND, WKI_PEER_FENCE_PROBE_ROUNDS);
+                int const PROBE_RET = wki_send_heartbeat_probe(&peer);
+                if (PROBE_RET < 0) {
+                    log::warn("Heartbeat re-probe TX failed for peer 0x%04x (rc=%d); deferring fence confirmation", peer.node_id,
+                              PROBE_RET);
+                }
+                peer.missed_beats = NEXT_ROUND;
+                peer.fence_defer_until_us = now_us + CONFIRM_GRACE_US;
+                continue;
+            }
             log::warn("Heartbeat timeout for peer 0x%04x (%llu us elapsed, timeout %llu us)", peer.node_id, ELAPSED, TIMEOUT_US);
             wki_peer_fence(&peer);
         }

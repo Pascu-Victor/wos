@@ -1,7 +1,5 @@
 #include "mandelbench.hpp"
 
-#include <bits/timeval.h>
-
 #include <algorithm>
 #include <string>
 #if MANDELBENCH_DEBUG

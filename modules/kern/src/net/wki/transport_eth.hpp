@@ -23,4 +23,10 @@ auto eth_neighbor_find_mac(uint16_t node_id, proto::MacAddress& mac_out) -> bool
 // Used by wki_spin_yield() to drive inline NAPI polling.
 auto wki_eth_get_netdev() -> net::NetDevice*;
 
+// Returns true when this node recently failed to enqueue WKI Ethernet traffic.
+// Heartbeat fencing treats this as an unsafe local observation window: if our
+// own control/bulk frames may not be leaving the NIC, a missing heartbeat is not
+// strong enough evidence to tear down a peer.
+auto wki_eth_recent_tx_pressure(uint64_t now_us) -> bool;
+
 }  // namespace ker::net::wki

@@ -3,7 +3,6 @@
 #include <abi-bits/fcntl.h>
 #include <abi-bits/wait.h>
 #include <bits/ssize_t.h>
-#include <bits/timeval.h>
 #include <fcntl.h>
 #include <sys/process.h>
 #include <sys/time.h>

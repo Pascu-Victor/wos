@@ -68,6 +68,17 @@ auto current_task_has_deliverable_signal() -> bool {
     return (task->sig_pending & ~task->sig_mask) != 0;
 }
 
+constexpr int WKI_SIGPIPE_NUM = 13;
+
+void clear_current_daemon_sigpipe() {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr || task->type != ker::mod::sched::task::TaskType::DAEMON) {
+        return;
+    }
+
+    task->sig_pending &= ~(1ULL << (WKI_SIGPIPE_NUM - 1));
+}
+
 void perf_record_ipc_event(uint8_t op, ker::mod::perf::WkiPerfPhase phase, uint16_t peer, uint16_t channel, uint32_t correlation,
                            int32_t status, uint32_t aux, uint64_t callsite) {
     if (!ker::mod::perf::is_wki_recording_enabled()) {
@@ -520,7 +531,9 @@ auto mark_export_pipe_write_closed(WkiIpcExport* exp, uint64_t expected_bytes = 
 
         ssize_t write_ret = -EIO;
         if (file->fops != nullptr && file->fops->vfs_write != nullptr) {
+            clear_current_daemon_sigpipe();
             write_ret = file->fops->vfs_write(file, data_ptr, remaining, static_cast<size_t>(file->pos));
+            clear_current_daemon_sigpipe();
         }
 
         irqf = s_ipc_lock.lock_irqsave();
@@ -556,9 +569,14 @@ auto mark_export_pipe_write_closed(WkiIpcExport* exp, uint64_t expected_bytes = 
             continue;
         }
 
-        if (write_ret == -EAGAIN) {
+        if (write_ret == -EAGAIN || write_ret == -EINTR) {
             queue_export_pipe_write_flush_locked(backlog);
             s_ipc_lock.unlock_irqrestore(irqf);
+            if (write_ret == -EINTR) {
+                ipc_release_file_ref(file);
+                ker::mod::sched::kern_yield();
+                continue;
+            }
             bool ready_now = false;
             bool const POLL_REGISTERED = register_poll_write_waiter(file, &ready_now);
             ipc_release_file_ref(file);
@@ -2759,13 +2777,15 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             return;
         }
         if (export_file->fops != nullptr && export_file->fops->vfs_write != nullptr) {
+            clear_current_daemon_sigpipe();
             ssize_t const WRITE_RET =
                 export_file->fops->vfs_write(export_file, op_data, OP_DATA_LEN, static_cast<size_t>(export_file->pos));
+            clear_current_daemon_sigpipe();
             if (std::cmp_not_equal(WRITE_RET, OP_DATA_LEN)) {
                 uint16_t written = 0;
                 if (WRITE_RET > 0) {
                     written = static_cast<uint16_t>(std::cmp_less(WRITE_RET, OP_DATA_LEN) ? WRITE_RET : OP_DATA_LEN);
-                } else if (WRITE_RET != -EAGAIN) {
+                } else if (WRITE_RET != -EAGAIN && WRITE_RET != -EINTR) {
                     ker::mod::dbg::log("[WKI] IPC export pipe immediate write failed: resource_id=%u ret=%ld len=%u", resource_id,
                                        WRITE_RET, OP_DATA_LEN);
                 }

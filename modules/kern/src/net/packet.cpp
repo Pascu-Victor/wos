@@ -20,7 +20,6 @@ using log = ker::mod::dbg::logger<"net">;
 
 namespace {
 
-constexpr size_t RX_RESERVE = 256;
 #ifdef WOS_NET_PACKET_DEBUG
 constexpr size_t DEBUG_TOP_SITES = 8;
 constexpr uint32_t REFUSE_DUMP_STRIDE = 64;
@@ -126,7 +125,8 @@ void pkt_debug_dump_in_use(size_t avail) {
 
     std::ranges::sort(site_counts, [](const SiteSummary& a, const SiteSummary& b) -> bool { return a.count > b.count; });
 
-    log::debug("pkt pool snapshot: free=%zu reserve=%zu outstanding=%zu capacity=%zu", avail, RX_RESERVE, outstanding, pool_capacity);
+    log::debug("pkt pool snapshot: free=%zu reserve=%zu outstanding=%zu capacity=%zu", avail, PKT_POOL_TX_RESERVE, outstanding,
+               pool_capacity);
     for (size_t i = 0; i < DEBUG_TOP_SITES; i++) {
         const auto& entry = site_counts.at(i);
         if (entry.count == 0 || entry.oldest_pkt == nullptr) {
@@ -256,7 +256,7 @@ auto pkt_pool_snapshot() -> PacketPoolSnapshot {
     snapshot.free = free_count.load(std::memory_order_relaxed);
     snapshot.used = snapshot.capacity > snapshot.free ? snapshot.capacity - snapshot.free : 0;
     snapshot.active_capacity = snapshot.capacity;
-    snapshot.rx_reserve = RX_RESERVE;
+    snapshot.rx_reserve = PKT_POOL_TX_RESERVE;
     snapshot.grow_chunk = PKT_POOL_GROW_CHUNK;
     snapshot.buffer_size = PKT_BUF_SIZE;
     snapshot.object_size = sizeof(PacketBuffer);
@@ -308,13 +308,13 @@ auto pkt_alloc() -> PacketBuffer* {
 
 auto pkt_alloc_tx() -> PacketBuffer* {
     size_t avail = free_count.load(std::memory_order_relaxed);
-    if (avail <= RX_RESERVE) {
-        static_cast<void>(pkt_pool_try_grow(RX_RESERVE + PKT_POOL_GROW_CHUNK, "tx reserve"));
+    if (avail <= PKT_POOL_TX_RESERVE) {
+        static_cast<void>(pkt_pool_try_grow(PKT_POOL_TX_RESERVE + PKT_POOL_GROW_CHUNK, "tx reserve"));
         avail = free_count.load(std::memory_order_relaxed);
     }
-    if (avail <= RX_RESERVE) {
+    if (avail <= PKT_POOL_TX_RESERVE) {
         uint32_t const COUNT = refuse_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        log::error("pkt_alloc_tx: REFUSED (free=%zu reserve=%zu refused=%u)", avail, RX_RESERVE, COUNT);
+        log::error("pkt_alloc_tx: REFUSED (free=%zu reserve=%zu refused=%u)", avail, PKT_POOL_TX_RESERVE, COUNT);
 #ifdef WOS_NET_PACKET_DEBUG
         if ((COUNT % REFUSE_DUMP_STRIDE) == 1) {
             pkt_debug_dump_in_use(avail);

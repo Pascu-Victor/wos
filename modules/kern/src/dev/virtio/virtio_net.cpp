@@ -7,11 +7,14 @@
 #include <cstdint>
 #include <cstring>
 #include <mod/io/port/port.hpp>
+#include <net/endian.hpp>
 #include <net/net_trace.hpp>
 #include <net/netdevice.hpp>
 #include <net/netpoll.hpp>
 #include <net/packet.hpp>
+#include <net/proto/ethernet.hpp>
 #include <net/wki/remotable.hpp>
+#include <net/wki/wire.hpp>
 #include <new>
 #include <platform/acpi/ioapic/ioapic.hpp>
 #include <platform/interrupt/gates.hpp>
@@ -57,6 +60,7 @@ size_t device_count = 0;
 
 constexpr uint8_t SINGLE_QUEUE_PAIRS = 1;
 constexpr uint8_t MIN_MQ_QUEUE_PAIRS = 2;
+constexpr uint8_t WKI_CONTROL_TX_RETRY_POLLS = 8;
 
 void init_queue_pair_contexts(VirtIONetDevice* dev) {
     for (uint8_t i = 0; i < VIRTIO_NET_MAX_QUEUE_PAIRS; i++) {
@@ -96,6 +100,69 @@ auto queue_pair_for_napi(VirtIONetDevice* dev, ker::net::NapiStruct* napi) -> Vi
     return nullptr;
 }
 
+auto active_tx_pair_count(const VirtIONetDevice* dev) -> uint8_t {
+    if (dev == nullptr) {
+        return 0;
+    }
+    return std::min<uint8_t>(std::max<uint8_t>(dev->num_queue_pairs, SINGLE_QUEUE_PAIRS), VIRTIO_NET_MAX_QUEUE_PAIRS);
+}
+
+auto virtio_net_hdr_size_for_features(uint32_t features) -> uint8_t {
+    return static_cast<uint8_t>((features & VIRTIO_NET_F_MRG_RXBUF) != 0 ? VIRTIO_NET_HDR_SIZE_MRG_RXBUF : VIRTIO_NET_HDR_SIZE);
+}
+
+auto virtio_net_rx_buffer_count(const VirtIONetDevice* dev, const ker::net::PacketBuffer* pkt) -> uint16_t {
+    if (dev == nullptr || pkt == nullptr || (dev->negotiated_features & VIRTIO_NET_F_MRG_RXBUF) == 0) {
+        return 1;
+    }
+
+    const auto* hdr = reinterpret_cast<const VirtIONetHeaderMergeableRx*>(pkt->storage.data());
+    return hdr->num_buffers;
+}
+
+void virtio_net_drop_rx_buffer(VirtIONetDevice* dev, Virtqueue* rxq, uint16_t desc_idx) {
+    auto* pkt = rxq->pkt_map.at(desc_idx);
+    rxq->pkt_map.at(desc_idx) = nullptr;
+    if (pkt != nullptr) {
+        ker::net::pkt_free(pkt);
+    }
+    dev->netdev.rx_dropped++;
+}
+
+auto is_wki_control_liveness_frame(const ker::net::PacketBuffer* pkt) -> bool {
+    if (pkt == nullptr || pkt->data == nullptr || pkt->len < ker::net::proto::ETH_HLEN + ker::net::wki::WKI_HEADER_SIZE) {
+        return false;
+    }
+
+    const auto* eth = reinterpret_cast<const ker::net::proto::EthernetHeader*>(pkt->data);
+    if (ker::net::ntohs(eth->ethertype) != ker::net::proto::ETH_TYPE_WKI) {
+        return false;
+    }
+
+    const auto* hdr = reinterpret_cast<const ker::net::wki::WkiHeader*>(pkt->data + ker::net::proto::ETH_HLEN);
+    if (ker::net::wki::wki_version(hdr->version_flags) != ker::net::wki::WKI_VERSION) {
+        return false;
+    }
+    if (ker::net::proto::ETH_HLEN + ker::net::wki::WKI_HEADER_SIZE + hdr->payload_len > pkt->len) {
+        return false;
+    }
+
+    auto const TYPE = static_cast<ker::net::wki::MsgType>(hdr->msg_type);
+    switch (TYPE) {
+        case ker::net::wki::MsgType::HELLO:
+        case ker::net::wki::MsgType::HELLO_ACK:
+            return hdr->channel_id == ker::net::wki::WKI_CHAN_CONTROL && hdr->payload_len <= sizeof(ker::net::wki::HelloPayload);
+        case ker::net::wki::MsgType::HEARTBEAT:
+        case ker::net::wki::MsgType::HEARTBEAT_ACK:
+            return hdr->payload_len <= sizeof(ker::net::wki::HeartbeatPayload);
+        case ker::net::wki::MsgType::FENCE_NOTIFY:
+            return hdr->channel_id == ker::net::wki::WKI_CHAN_CONTROL && hdr->payload_len <= sizeof(ker::net::wki::FenceNotifyPayload);
+        default:
+            return (ker::net::wki::wki_flags(hdr->version_flags) & ker::net::wki::WKI_FLAG_PRIORITY) != 0 &&
+                   hdr->payload_len <= sizeof(ker::net::wki::HeartbeatPayload);
+    }
+}
+
 // Handle both kernel static and HHDM mappings.
 auto virt_to_phys(void* vaddr) -> uint64_t {
     auto addr = reinterpret_cast<uint64_t>(vaddr);
@@ -110,16 +177,28 @@ auto virt_to_phys(void* vaddr) -> uint64_t {
     return reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(addr));
 }
 
-void fill_rx_queue_for(Virtqueue* rxq) {
+void fill_rx_queue_for(VirtIONetDevice* dev, Virtqueue* rxq) {
+    const char* const DEV_NAME = dev != nullptr ? dev->netdev.name.data() : "?";
+    if (rxq->num_free > rxq->size) {
+        net_log::error("virtio rx refill: dev=%s q=%u corrupt free count free=%u size=%u", DEV_NAME, rxq->queue_index, rxq->num_free,
+                       rxq->size);
+        rxq->num_free = 0;
+        rxq->free_head = VIRTQ_NO_BUF;
+        return;
+    }
+
     size_t target_free = ker::net::pkt_pool_free_count();
     if (rxq->num_free > 0) {
-        target_free = std::max(target_free, static_cast<size_t>(rxq->num_free) + ker::net::PKT_POOL_GROW_CHUNK);
+        target_free = std::max(target_free, static_cast<size_t>(rxq->num_free) + ker::net::PKT_POOL_TX_RESERVE);
         ker::net::pkt_pool_ensure_free(target_free);
     }
 
     size_t const BEFORE_FREE = ker::net::pkt_pool_free_count();
-    uint16_t const BEFORE_SLOTS = rxq->num_free;
+    uint16_t filled = 0;
     while (rxq->num_free > 0) {
+        if (ker::net::pkt_pool_free_count() <= ker::net::PKT_POOL_TX_RESERVE) {
+            break;
+        }
         auto* pkt = ker::net::pkt_alloc();
         if (pkt == nullptr) {
             break;
@@ -130,16 +209,19 @@ void fill_rx_queue_for(Virtqueue* rxq) {
         uint64_t const PHYS = virt_to_phys(pkt->storage.data());
         uint32_t const BUF_LEN = ker::net::PKT_BUF_SIZE;
 
-        virtq_add_buf(rxq, PHYS, BUF_LEN, VRING_DESC_F_WRITE, pkt);
+        if (virtq_add_buf(rxq, PHYS, BUF_LEN, VRING_DESC_F_WRITE, pkt) < 0) {
+            ker::net::pkt_free(pkt);
+            break;
+        }
+        filled++;
     }
 
-    auto const FILLED = static_cast<uint16_t>(BEFORE_SLOTS - rxq->num_free);
     if (rxq->num_free != 0) {
-        net_log::warn("virtio rx refill short: q=%u filled=%u remaining_slots=%u pool_free_before=%zu pool_free=%zu", rxq->queue_index,
-                      FILLED, rxq->num_free, BEFORE_FREE, ker::net::pkt_pool_free_count());
-    } else if (FILLED != 0 && BEFORE_FREE <= (ker::net::PKT_POOL_GROW_CHUNK + ker::net::PKT_POOL_GROW_CHUNK)) {
-        net_log::trace("virtio rx refill: q=%u filled=%u pool_free_before=%zu pool_free=%zu", rxq->queue_index, FILLED, BEFORE_FREE,
-                       ker::net::pkt_pool_free_count());
+        net_log::warn("virtio rx refill short: dev=%s q=%u filled=%u remaining_slots=%u pool_free_before=%zu pool_free=%zu", DEV_NAME,
+                      rxq->queue_index, filled, rxq->num_free, BEFORE_FREE, ker::net::pkt_pool_free_count());
+    } else if (filled >= (rxq->size / 2U)) {
+        net_log::trace("virtio rx refill: dev=%s q=%u filled=%u pool_free_before=%zu pool_free=%zu", DEV_NAME, rxq->queue_index, filled,
+                       BEFORE_FREE, ker::net::pkt_pool_free_count());
     }
     virtq_kick(rxq);
 }
@@ -149,13 +231,48 @@ auto process_rx_budget_for(VirtIONetDevice* dev, Virtqueue* rxq, int budget) -> 
     uint32_t len = 0;
     uint16_t desc_idx = 0;
 
-    while (processed < budget && (desc_idx = virtq_get_buf(rxq, &len)) != 0xFFFF) {
+    while (processed < budget) {
+        desc_idx = virtq_get_buf(rxq, &len);
+        if (desc_idx == VIRTQ_NO_BUF) {
+            break;
+        }
+        processed++;
+        if (desc_idx == VIRTQ_BAD_BUF) {
+            dev->netdev.rx_dropped++;
+            continue;
+        }
+
         auto* pkt = rxq->pkt_map.at(desc_idx);
         rxq->pkt_map.at(desc_idx) = nullptr;
 
-        if (pkt == nullptr || len <= static_cast<uint32_t>(dev->hdr_size)) {
+        if (pkt == nullptr || len <= static_cast<uint32_t>(dev->hdr_size) || len > ker::net::PKT_BUF_SIZE) {
             if (pkt != nullptr) {
                 ker::net::pkt_free(pkt);
+            }
+            dev->netdev.rx_dropped++;
+            continue;
+        }
+
+        uint16_t const RX_BUFFERS = virtio_net_rx_buffer_count(dev, pkt);
+        if (RX_BUFFERS == 0 || RX_BUFFERS > 1) {
+            ker::net::pkt_free(pkt);
+            dev->netdev.rx_dropped++;
+
+            // We provide jumbo-sized receive buffers, so normal packets should
+            // fit in one buffer.  If the device still returns a merged packet,
+            // drain the remaining fragments so they are not misdelivered as
+            // independent Ethernet frames.
+            for (uint16_t consumed = 1; consumed < RX_BUFFERS; consumed++) {
+                uint16_t const EXTRA_DESC = virtq_get_buf(rxq, nullptr);
+                if (EXTRA_DESC == VIRTQ_NO_BUF) {
+                    break;
+                }
+                processed++;
+                if (EXTRA_DESC == VIRTQ_BAD_BUF) {
+                    dev->netdev.rx_dropped++;
+                    continue;
+                }
+                virtio_net_drop_rx_buffer(dev, rxq, EXTRA_DESC);
             }
             continue;
         }
@@ -165,10 +282,9 @@ auto process_rx_budget_for(VirtIONetDevice* dev, Virtqueue* rxq, int budget) -> 
         pkt->dev = &dev->netdev;
 
         ker::net::netdev_rx(&dev->netdev, pkt);
-        processed++;
     }
 
-    fill_rx_queue_for(rxq);
+    fill_rx_queue_for(dev, rxq);
 
     return processed;
 }
@@ -179,7 +295,11 @@ auto collect_tx_for(Virtqueue* txq) -> ker::net::PacketBuffer* {
     uint32_t len = 0;
     uint16_t desc_idx = 0;
 
-    while ((desc_idx = virtq_get_buf(txq, &len)) != 0xFFFF) {
+    while ((desc_idx = virtq_get_buf(txq, &len)) != VIRTQ_NO_BUF) {
+        if (desc_idx == VIRTQ_BAD_BUF) {
+            continue;
+        }
+
         auto* pkt = txq->pkt_map.at(desc_idx);
         txq->pkt_map.at(desc_idx) = nullptr;
         if (pkt != nullptr) {
@@ -189,8 +309,6 @@ auto collect_tx_for(Virtqueue* txq) -> ker::net::PacketBuffer* {
     }
     return head;
 }
-
-auto collect_tx(VirtIONetDevice* dev) -> ker::net::PacketBuffer* { return collect_tx_for(dev->queue_pairs.at(0).txq); }
 
 void free_pkt_list(ker::net::PacketBuffer* head) {
     while (head != nullptr) {
@@ -418,33 +536,29 @@ auto virtio_net_open(ker::net::NetDevice* netdev) -> int {
 
 void virtio_net_close(ker::net::NetDevice* netdev) { netdev->state = 0; }
 
-auto virtio_net_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* pkt) -> int {
-    NET_TRACE_SPAN(SPAN_START_XMIT);
-    auto* dev = static_cast<VirtIONetDevice*>(netdev->private_data);
-    if (dev == nullptr || pkt == nullptr) {
-        return -1;
-    }
-    auto* txq = dev->queue_pairs.at(0).txq;
+enum class TxAttemptResult : uint8_t {
+    SENT,
+    FULL,
+    FAILED,
+};
+
+auto virtio_net_try_xmit_pair(ker::net::NetDevice* netdev, VirtIONetDevice* dev, ker::net::PacketBuffer* pkt, uint8_t pair_idx)
+    -> TxAttemptResult {
+    auto* txq = dev->queue_pairs.at(pair_idx).txq;
     if (txq == nullptr) {
-        ker::net::pkt_free(pkt);
-        return -1;
+        return TxAttemptResult::FULL;
     }
 
-    // Prevent preemption while holding txq->lock.
     uint64_t const TXFLAGS = txq->lock.lock_irqsave();
 
     // Reap completed TX buffers opportunistically on every send. This keeps
-    // the packet pool healthy even if TX completion interrupts are delayed or
-    // absent for a while, instead of waiting until the ring is already full.
-    ker::net::PacketBuffer* reclaimed = collect_tx(dev);
+    // TX descriptors available even if completion interrupts are delayed.
+    ker::net::PacketBuffer* reclaimed = collect_tx_for(txq);
     if (txq->num_free == 0) {
+        virtq_kick(txq);
         txq->lock.unlock_irqrestore(TXFLAGS);
         free_pkt_list(reclaimed);
-        netdev->tx_dropped++;
-        net_log::warn("TX ring full: drop #%lu pool_free=%zu", static_cast<unsigned long>(netdev->tx_dropped),
-                      ker::net::pkt_pool_free_count());
-        ker::net::pkt_free(pkt);
-        return -1;
+        return TxAttemptResult::FULL;
     }
 
     auto* hdr = reinterpret_cast<VirtIONetHeader*>(pkt->push(dev->hdr_size));
@@ -457,9 +571,7 @@ auto virtio_net_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* 
     if (RET < 0) {
         txq->lock.unlock_irqrestore(TXFLAGS);
         free_pkt_list(reclaimed);
-        netdev->tx_dropped++;
-        ker::net::pkt_free(pkt);
-        return -1;
+        return TxAttemptResult::FAILED;
     }
 
     virtq_kick(txq);
@@ -468,7 +580,81 @@ auto virtio_net_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* 
 
     txq->lock.unlock_irqrestore(TXFLAGS);
     free_pkt_list(reclaimed);
-    return 0;
+    return TxAttemptResult::SENT;
+}
+
+auto virtio_net_try_xmit_active_pairs(ker::net::NetDevice* netdev, VirtIONetDevice* dev, ker::net::PacketBuffer* pkt, uint8_t start_pair)
+    -> TxAttemptResult {
+    uint8_t const PAIR_COUNT = active_tx_pair_count(dev);
+    if (PAIR_COUNT == 0) {
+        return TxAttemptResult::FAILED;
+    }
+
+    for (uint8_t offset = 0; offset < PAIR_COUNT; offset++) {
+        auto const PAIR = static_cast<uint8_t>((start_pair + offset) % PAIR_COUNT);
+        TxAttemptResult const RESULT = virtio_net_try_xmit_pair(netdev, dev, pkt, PAIR);
+        if (RESULT != TxAttemptResult::FULL) {
+            return RESULT;
+        }
+    }
+
+    return TxAttemptResult::FULL;
+}
+
+auto virtio_net_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* pkt) -> int {
+    NET_TRACE_SPAN(SPAN_START_XMIT);
+    if (pkt == nullptr) {
+        return -1;
+    }
+    if (netdev == nullptr) {
+        ker::net::pkt_free(pkt);
+        return -1;
+    }
+    auto* dev = static_cast<VirtIONetDevice*>(netdev->private_data);
+    if (dev == nullptr) {
+        ker::net::pkt_free(pkt);
+        return -1;
+    }
+    uint8_t const PAIR_COUNT = active_tx_pair_count(dev);
+    if (PAIR_COUNT == 0) {
+        ker::net::pkt_free(pkt);
+        return -1;
+    }
+
+    bool const WKI_CONTROL = is_wki_control_liveness_frame(pkt);
+    auto start_pair = static_cast<uint8_t>(dev->tx_rr.fetch_add(1, std::memory_order_relaxed) % PAIR_COUNT);
+    TxAttemptResult result = virtio_net_try_xmit_active_pairs(netdev, dev, pkt, start_pair);
+    if (result == TxAttemptResult::SENT) {
+        return 0;
+    }
+    if (result == TxAttemptResult::FAILED) {
+        netdev->tx_dropped++;
+        ker::net::pkt_free(pkt);
+        return -1;
+    }
+
+    if (WKI_CONTROL) {
+        for (uint8_t retry = 0; retry < WKI_CONTROL_TX_RETRY_POLLS; retry++) {
+            ker::net::napi_poll_all_pending();
+            start_pair = static_cast<uint8_t>(dev->tx_rr.fetch_add(1, std::memory_order_relaxed) % PAIR_COUNT);
+            result = virtio_net_try_xmit_active_pairs(netdev, dev, pkt, start_pair);
+            if (result == TxAttemptResult::SENT) {
+                return 0;
+            }
+            if (result == TxAttemptResult::FAILED) {
+                netdev->tx_dropped++;
+                ker::net::pkt_free(pkt);
+                return -1;
+            }
+            asm volatile("pause" ::: "memory");
+        }
+    }
+
+    netdev->tx_dropped++;
+    net_log::warn("TX ring full: dev=%s drop #%lu pool_free=%zu pairs=%u wki_ctrl=%u", netdev->name.data(),
+                  static_cast<unsigned long>(netdev->tx_dropped), ker::net::pkt_pool_free_count(), PAIR_COUNT, WKI_CONTROL ? 1U : 0U);
+    ker::net::pkt_free(pkt);
+    return -1;
 }
 
 auto virtio_net_set_queue_cpu(ker::net::NetDevice* net, uint32_t pair_idx, uint64_t cpu) -> int {
@@ -580,7 +766,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     dev->pci = pci_dev;
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access): PCI BAR0 is fixed config-space layout.
     dev->io_base = static_cast<uint16_t>(pci_dev->bar[0] & ~0x3U);
-    dev->hdr_size = static_cast<uint8_t>(VIRTIO_NET_HDR_SIZE_MODERN);
+    dev->hdr_size = static_cast<uint8_t>(VIRTIO_NET_HDR_SIZE);
     dev->modern_cfg = cfg;
     dev->notify_base = notify_va;
     dev->notify_off_multiplier = notify_off_mult;
@@ -607,6 +793,9 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     if ((FEAT_LO & VIRTIO_NET_F_STATUS) != 0) {
         our_lo |= VIRTIO_NET_F_STATUS;
     }
+    if ((FEAT_LO & VIRTIO_NET_F_MRG_RXBUF) != 0) {
+        our_lo |= VIRTIO_NET_F_MRG_RXBUF;
+    }
     bool want_mq = (CORE_COUNT >= 2) && ((FEAT_LO & VIRTIO_NET_F_CTRL_VQ) != 0) && ((FEAT_LO & VIRTIO_NET_F_MQ) != 0);
     if (want_mq) {
         our_lo |= VIRTIO_NET_F_CTRL_VQ | VIRTIO_NET_F_MQ;
@@ -626,6 +815,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
         return -1;
     }
     dev->negotiated_features = our_lo;
+    dev->hdr_size = virtio_net_hdr_size_for_features(our_lo);
 
     // Set up one queue: select, size, alloc, assign addresses, notify addr, enable.
     auto setup_queue = [&](uint16_t q_idx, uint16_t max_size) -> Virtqueue* {
@@ -824,11 +1014,11 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     cfg->device_status =
         static_cast<uint8_t>(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
 
-    fill_rx_queue_for(pair0.rxq);
+    fill_rx_queue_for(dev, pair0.rxq);
     for (uint8_t pair_idx = 1; pair_idx < dev->configured_queue_pairs; pair_idx++) {
         auto* rxq = dev->queue_pairs.at(pair_idx).rxq;
         if (rxq != nullptr) {
-            fill_rx_queue_for(rxq);
+            fill_rx_queue_for(dev, rxq);
         }
     }
     if (dev->num_queue_pairs >= MIN_MQ_QUEUE_PAIRS) {
@@ -863,9 +1053,10 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     devices.at(device_count++) = dev;
 
-    net_log::info("%s MAC=%02x:%02x:%02x:%02x:%02x:%02x vec=0x%02x%s pairs=%u napi ready", dev->netdev.name.data(), dev->netdev.mac.at(0),
-                  dev->netdev.mac.at(1), dev->netdev.mac.at(2), dev->netdev.mac.at(3), dev->netdev.mac.at(4), dev->netdev.mac.at(5), vector,
-                  dev->msix_enabled ? " modern msix" : " modern msi/intx", dev->num_queue_pairs);
+    net_log::info("%s MAC=%02x:%02x:%02x:%02x:%02x:%02x vec=0x%02x%s pairs=%u hdr=%u mrg=%u napi ready", dev->netdev.name.data(),
+                  dev->netdev.mac.at(0), dev->netdev.mac.at(1), dev->netdev.mac.at(2), dev->netdev.mac.at(3), dev->netdev.mac.at(4),
+                  dev->netdev.mac.at(5), vector, dev->msix_enabled ? " modern msix" : " modern msi/intx", dev->num_queue_pairs,
+                  dev->hdr_size, (dev->negotiated_features & VIRTIO_NET_F_MRG_RXBUF) != 0 ? 1U : 0U);
 
     return 0;
 }
@@ -900,13 +1091,16 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     uint32_t const DEV_FEATURES = ::inl(io_base + VIRTIO_REG_DEVICE_FEATURES);
     uint64_t const CORE_COUNT = ker::mod::smt::get_core_count();
 
-    // Negotiate features: MAC, status, and multi-queue (MQ requires CTRL_VQ).
+    // Negotiate features: MAC, status, and mergeable RX header support.
     uint32_t our_features = 0;
     if ((DEV_FEATURES & VIRTIO_NET_F_MAC) != 0) {
         our_features |= VIRTIO_NET_F_MAC;
     }
     if ((DEV_FEATURES & VIRTIO_NET_F_STATUS) != 0) {
         our_features |= VIRTIO_NET_F_STATUS;
+    }
+    if ((DEV_FEATURES & VIRTIO_NET_F_MRG_RXBUF) != 0) {
+        our_features |= VIRTIO_NET_F_MRG_RXBUF;
     }
     ::outl(io_base + VIRTIO_REG_GUEST_FEATURES, our_features);
 
@@ -918,7 +1112,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     init_queue_pair_contexts(dev);
     dev->pci = pci_dev;
     dev->io_base = io_base;
-    dev->hdr_size = static_cast<uint8_t>(VIRTIO_NET_HDR_SIZE);
+    dev->hdr_size = virtio_net_hdr_size_for_features(our_features);
     dev->negotiated_features = our_features;
     auto& pair0 = dev->queue_pairs.at(0);
 
@@ -1032,7 +1226,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     write_status(io_base, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK);
 
-    fill_rx_queue_for(pair0.rxq);
+    fill_rx_queue_for(dev, pair0.rxq);
 
     dev->netdev.ops = &virtio_net_ops;
     dev->netdev.mtu = 9000;
@@ -1052,9 +1246,10 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     devices.at(device_count++) = dev;
 
-    net_log::info("%s MAC=%02x:%02x:%02x:%02x:%02x:%02x rxq=%u txq=%u vec=0x%02x%s pairs=%u napi ready", dev->netdev.name.data(),
-                  dev->netdev.mac.at(0), dev->netdev.mac.at(1), dev->netdev.mac.at(2), dev->netdev.mac.at(3), dev->netdev.mac.at(4),
-                  dev->netdev.mac.at(5), rxq_size, txq_size, vector, dev->msix_enabled ? " msix" : " legacy", dev->num_queue_pairs);
+    net_log::info("%s MAC=%02x:%02x:%02x:%02x:%02x:%02x rxq=%u txq=%u vec=0x%02x%s pairs=%u hdr=%u mrg=%u napi ready",
+                  dev->netdev.name.data(), dev->netdev.mac.at(0), dev->netdev.mac.at(1), dev->netdev.mac.at(2), dev->netdev.mac.at(3),
+                  dev->netdev.mac.at(4), dev->netdev.mac.at(5), rxq_size, txq_size, vector, dev->msix_enabled ? " msix" : " legacy",
+                  dev->num_queue_pairs, dev->hdr_size, (dev->negotiated_features & VIRTIO_NET_F_MRG_RXBUF) != 0 ? 1U : 0U);
 
     return 0;
 }
