@@ -44,7 +44,7 @@
             "attachCommands": [
                 "gdb-remote 127.0.0.1:1234"
             ],
-            "preLaunchTask": "Build and Start QEMU"
+            "preLaunchTask": "Build and Start Cluster Debug"
         },
         {
             "name": "Debug WOS Cluster (VM0)",
@@ -285,7 +285,7 @@
                 "command alias b breakpoint set --hardware",
                 "command alias hbreak breakpoint set --hardware"
             ],
-            "preLaunchTask": "Build and Start QEMU"
+            "preLaunchTask": "Build and Start Cluster Debug"
         }
     ],
     "compounds": [

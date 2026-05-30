@@ -27,7 +27,7 @@
                     "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot -std=c++23",
                     "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot",
                     "NINJA_STATUS": "[%f/%t %e] ",
-                    "PATH": "${workspaceFolder}/toolchain/host/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "PATH": "${workspaceFolder}/bin:${workspaceFolder}/toolchain/host/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
                     "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/host/lib"
                 }
             },
@@ -42,57 +42,8 @@
             }
         },
         {
-            "label": "runWosKern",
-            "command": "${workspaceFolder}/scripts/run_kern.sh",
-            "type": "shell",
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "bash",
-                    "args": [
-                        "--init-file",
-                        "${workspaceFolder}/.vscode/wos-env.sh"
-                    ]
-                }
-            },
-            "args": [],
-            "isBackground": true,
-            "problemMatcher": [
-                "$tsc",
-                {
-                    "pattern": [
-                        {
-                            "regexp": ".",
-                            "file": 1,
-                            "location": 2,
-                            "message": 3
-                        }
-                    ],
-                    "background": {
-                        "activeOnStart": true,
-                        "beginsPattern": ".",
-                        "endsPattern": "."
-                    }
-                }
-            ],
-            "presentation": {
-                "reveal": "always"
-            },
-            "group": "build"
-        },
-        {
-            "label": "Build and Start QEMU",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "Build WOS",
-                "Start QEMU Debug"
-            ],
-            "problemMatcher": [],
-            "group": "build"
-        },
-        {
-            "label": "Start QEMU Debug",
-            "command": "${workspaceFolder}/scripts/run_kern.sh --debug",
+            "label": "Start WOS Cluster",
+            "command": "${workspaceFolder}/bin/wos-cluster --launch",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -116,7 +67,7 @@
                     "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot -std=c++23",
                     "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot",
                     "NINJA_STATUS": "[%f/%t %e] ",
-                    "PATH": "${workspaceFolder}/toolchain/host/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "PATH": "${workspaceFolder}/bin:${workspaceFolder}/toolchain/host/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
                     "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/host/lib"
                 }
             },
@@ -133,60 +84,7 @@
                     ],
                     "background": {
                         "activeOnStart": true,
-                        "beginsPattern": "STARTING BOOT:",
-                        "endsPattern": "QEMU .* monitor - type 'help' for more information"
-                    }
-                }
-            ],
-            "presentation": {
-                "reveal": "always"
-            },
-            "group": "build"
-        },
-        {
-            "label": "Start Cluster Background",
-            "command": "${workspaceFolder}/scripts/run_cluster.sh 3 --skip 1",
-            "type": "shell",
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "bash",
-                    "args": [
-                        "-c"
-                    ]
-                },
-                "env": {
-                    "WOS_ENV_LOADED": "1",
-                    "WOS_WORKSPACE_ROOT": "${workspaceFolder}",
-                    "WOS_TOOLCHAIN_ROOT": "${workspaceFolder}/toolchain",
-                    "WOS_TARGET_ARCH": "x86_64-pc-wos",
-                    "WOS_SYSROOT": "${workspaceFolder}/toolchain/sysroot",
-                    "WOS_CLANG_VERSION": "22",
-                    "CC": "${workspaceFolder}/toolchain/host/bin/clang",
-                    "CXX": "${workspaceFolder}/toolchain/host/bin/clang++",
-                    "LD": "${workspaceFolder}/toolchain/host/bin/ld.lld",
-                    "CFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot -std=c23",
-                    "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot -std=c++23",
-                    "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot",
-                    "NINJA_STATUS": "[%f/%t %e] ",
-                    "PATH": "${workspaceFolder}/toolchain/host/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
-                    "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/host/lib"
-                }
-            },
-            "isBackground": true,
-            "problemMatcher": [
-                {
-                    "pattern": [
-                        {
-                            "regexp": "^([^\\s].*):(\\d+): (.*)$",
-                            "file": 1,
-                            "line": 2,
-                            "message": 3
-                        }
-                    ],
-                    "background": {
-                        "activeOnStart": true,
-                        "beginsPattern": "=== WKI Cluster:",
+                        "beginsPattern": "=== Launching VMs ===",
                         "endsPattern": "Press Ctrl\\+C to stop all VMs"
                     }
                 }
@@ -197,13 +95,56 @@
             "group": "build"
         },
         {
-            "label": "Start Cluster and Debug VM",
-            "dependsOrder": "parallel",
-            "dependsOn": [
-                "Start Cluster Background",
-                "Start QEMU Debug"
+            "label": "Start WOS Cluster Debug",
+            "command": "${workspaceFolder}/bin/wos-cluster --launch --debug-node 0",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "bash",
+                    "args": [
+                        "-c"
+                    ]
+                },
+                "env": {
+                    "WOS_ENV_LOADED": "1",
+                    "WOS_WORKSPACE_ROOT": "${workspaceFolder}",
+                    "WOS_TOOLCHAIN_ROOT": "${workspaceFolder}/toolchain",
+                    "WOS_TARGET_ARCH": "x86_64-pc-wos",
+                    "WOS_SYSROOT": "${workspaceFolder}/toolchain/sysroot",
+                    "WOS_CLANG_VERSION": "22",
+                    "CC": "${workspaceFolder}/toolchain/host/bin/clang",
+                    "CXX": "${workspaceFolder}/toolchain/host/bin/clang++",
+                    "LD": "${workspaceFolder}/toolchain/host/bin/ld.lld",
+                    "CFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot -std=c23",
+                    "CXXFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot -std=c++23",
+                    "LDFLAGS": "--sysroot=${workspaceFolder}/toolchain/sysroot",
+                    "NINJA_STATUS": "[%f/%t %e] ",
+                    "PATH": "${workspaceFolder}/bin:${workspaceFolder}/toolchain/host/bin:${workspaceFolder}/tools/build/bin:${env:PATH}",
+                    "LD_LIBRARY_PATH": "${workspaceFolder}/toolchain/host/lib"
+                }
+            },
+            "isBackground": true,
+            "problemMatcher": [
+                {
+                    "pattern": [
+                        {
+                            "regexp": "^([^\\s].*):(\\d+): (.*)$",
+                            "file": 1,
+                            "line": 2,
+                            "message": 3
+                        }
+                    ],
+                    "background": {
+                        "activeOnStart": true,
+                        "beginsPattern": "=== Launching VMs ===",
+                        "endsPattern": "Press Ctrl\\+C to stop all VMs"
+                    }
+                }
             ],
-            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always"
+            },
             "group": "build"
         },
         {
@@ -211,7 +152,7 @@
             "dependsOrder": "sequence",
             "dependsOn": [
                 "Build WOS",
-                "Start Cluster and Debug VM"
+                "Start WOS Cluster Debug"
             ],
             "problemMatcher": [],
             "group": "build"

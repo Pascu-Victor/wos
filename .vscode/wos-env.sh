@@ -17,6 +17,7 @@ WOS_WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WOS_TOOLCHAIN_ROOT="$WOS_WORKSPACE_ROOT/toolchain"
 WOS_TARGET_ARCH="x86_64-pc-wos"
 WOS_HOST_TOOLS="$WOS_WORKSPACE_ROOT/tools/build/bin"
+WOS_BIN="$WOS_WORKSPACE_ROOT/bin"
 
 # Remove a single path entry from a colon-separated PATH-like variable.
 wos_strip_path_entry() {
@@ -50,6 +51,7 @@ fi
 if [ -z "$WOS_ORIGINAL_PATH" ]; then
     _wos_clean_path="$(wos_strip_path_entry "$PATH" "$WOS_TOOLCHAIN_ROOT/host/bin")"
     _wos_clean_path="$(wos_strip_path_entry "$_wos_clean_path" "$WOS_HOST_TOOLS")"
+    _wos_clean_path="$(wos_strip_path_entry "$_wos_clean_path" "$WOS_BIN")"
     export WOS_ORIGINAL_PATH="$_wos_clean_path"
     unset _wos_clean_path
 fi
@@ -63,6 +65,7 @@ fi
 export WOS_WORKSPACE_ROOT
 export WOS_TOOLCHAIN_ROOT
 export WOS_TARGET_ARCH
+export WOS_BIN
 
 # Ninja status formatting
 export NINJA_STATUS="[%f/%t %e] "
@@ -72,8 +75,8 @@ export CC="$WOS_TOOLCHAIN_ROOT/host/bin/clang"
 export CXX="$WOS_TOOLCHAIN_ROOT/host/bin/clang++"
 export LD="$WOS_TOOLCHAIN_ROOT/host/bin/ld.lld"
 
-# Update PATH so host tools and build tools are first, but preserve a clean host path tail.
-export PATH="$WOS_TOOLCHAIN_ROOT/host/bin:$WOS_HOST_TOOLS:$WOS_ORIGINAL_PATH"
+# Update PATH so WOS commands, host tools, and build tools are first, but preserve a clean host path tail.
+export PATH="$WOS_BIN:$WOS_TOOLCHAIN_ROOT/host/bin:$WOS_HOST_TOOLS:$WOS_ORIGINAL_PATH"
 
 # Library paths (overlay on existing LD_LIBRARY_PATH)
 if [ -n "$WOS_ORIGINAL_LD_LIBRARY_PATH" ]; then
@@ -121,6 +124,7 @@ wos_env_reset() {
     unset WOS_WORKSPACE_ROOT
     unset WOS_TOOLCHAIN_ROOT
     unset WOS_TARGET_ARCH
+    unset WOS_BIN
     unset WOS_SYSROOT
     unset WOS_CLANG_VERSION
     unset WOS_CLANG_LIB_DIR
@@ -140,6 +144,7 @@ wos_env_show() {
     echo "WOS Environment Variables:"
     echo "  WOS_WORKSPACE_ROOT=$WOS_WORKSPACE_ROOT"
     echo "  WOS_TOOLCHAIN_ROOT=$WOS_TOOLCHAIN_ROOT"
+    echo "  WOS_BIN=$WOS_BIN"
     echo "  WOS_TARGET_ARCH=$WOS_TARGET_ARCH"
     echo "  WOS_SYSROOT=$WOS_SYSROOT"
     echo "  CC=$CC"
