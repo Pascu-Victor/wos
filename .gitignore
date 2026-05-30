@@ -1,5 +1,7 @@
 # build artifacts
 **/bin
+!/bin/
+!/bin/**
 **/obj
 **/CMakeFiles
 #qcow images
