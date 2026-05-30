@@ -1047,8 +1047,10 @@ auto DebugAnalysisService::get_log_context(const QJsonObject& args) const -> QJs
 
 auto DebugAnalysisService::extract_coredumps(const QJsonObject& args) -> QJsonObject {
     QString script_path;
-    const QStringList CANDIDATES = {QDir::current().absoluteFilePath("scripts/extract_coredumps.sh"),
-                                    QDir::current().absoluteFilePath("../scripts/extract_coredumps.sh")};
+    const QStringList CANDIDATES = {QDir::current().absoluteFilePath("bin/wos-extract-coredumps"),
+                                    QDir::current().absoluteFilePath("../bin/wos-extract-coredumps"),
+                                    QDir::current().absoluteFilePath("scripts/debug/extract_coredumps.sh"),
+                                    QDir::current().absoluteFilePath("../scripts/debug/extract_coredumps.sh")};
     for (const auto& candidate : CANDIDATES) {
         if (QFileInfo::exists(candidate)) {
             script_path = candidate;
@@ -1056,7 +1058,7 @@ auto DebugAnalysisService::extract_coredumps(const QJsonObject& args) -> QJsonOb
         }
     }
     if (script_path.isEmpty()) {
-        return tool_error("scripts/extract_coredumps.sh not found");
+        return tool_error("wos-extract-coredumps not found");
     }
     if (!is_path_allowed(QFileInfo(script_path).absolutePath())) {
         return tool_error("Extraction script is outside allowed roots");

@@ -201,11 +201,13 @@ void CoredumpBrowser::extract_coredumps(bool cluster_mode) {
         return;
     }
 
-    // Find the script relative to the binary location or CWD
+    // Find the extraction command relative to the repository root or CWD.
     QString script_path;
     QStringList search_paths = {
-        QDir::currentPath() + "/scripts/extract_coredumps.sh",
-        QDir::currentPath() + "/../scripts/extract_coredumps.sh",
+        QDir::currentPath() + "/bin/wos-extract-coredumps",
+        QDir::currentPath() + "/../bin/wos-extract-coredumps",
+        QDir::currentPath() + "/scripts/debug/extract_coredumps.sh",
+        QDir::currentPath() + "/../scripts/debug/extract_coredumps.sh",
     };
     for (const auto& p : search_paths) {
         if (QFile::exists(p)) {
@@ -215,7 +217,7 @@ void CoredumpBrowser::extract_coredumps(bool cluster_mode) {
     }
 
     if (script_path.isEmpty()) {
-        emit extraction_finished(false, "extract_coredumps.sh not found");
+        emit extraction_finished(false, "wos-extract-coredumps not found");
         return;
     }
 
