@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "wiremcp-wki": {
+      "command": "/home/womywomwoo/git/wos/tools/wireshark/wiremcp-wki/scripts/start-wiremcp-wki"
+    }
+  }
+}

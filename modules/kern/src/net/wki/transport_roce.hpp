@@ -22,4 +22,19 @@ void roce_rx(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt);
 // Get the singleton RoCE transport (nullptr if not initialized).
 auto wki_roce_transport_get() -> WkiTransport*;
 
+// Reset/read the receive-progress counter for a registered RoCE region.
+// Used by control-first protocols where the receiver already knows the exact
+// byte count and does not need a separate doorbell to define completion.
+auto wki_roce_region_reset_received(uint32_t rkey) -> bool;
+auto wki_roce_region_wait_received(uint32_t rkey, uint32_t len, uint64_t timeout_us) -> bool;
+
+// Cookie-tagged writes are used by protocols that reuse one receive rkey at
+// offset 0. Tagged accounting lets data that overtakes the control message
+// remain associated with the eventual request instead of being cleared by the
+// receiver's prepare step.
+auto wki_roce_region_prepare_tagged_write(uint32_t rkey, uint16_t cookie) -> bool;
+auto wki_roce_region_wait_tagged_write(uint32_t rkey, uint16_t cookie, uint32_t len, uint64_t timeout_us) -> bool;
+auto wki_roce_rdma_write_tagged(uint16_t neighbor_id, uint32_t rkey, uint64_t remote_offset, const void* local_buf, uint32_t len,
+                                uint16_t cookie) -> int;
+
 }  // namespace ker::net::wki

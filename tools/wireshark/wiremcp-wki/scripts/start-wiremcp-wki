@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+plugin_dir="$(cd -- "${script_dir}/.." && pwd)"
+wireshark_dir="$(cd -- "${plugin_dir}/.." && pwd)"
+runtime_dir="${WIREMCP_WKI_RUNTIME:-/tmp/wiremcp-wki}"
+
+export PATH="${script_dir}:/usr/local/bin:/usr/bin:/bin${PATH:+:${PATH}}"
+export WIREMCP_WKI_LUA_SOURCE="${WIREMCP_WKI_LUA_SOURCE:-${wireshark_dir}/wki.lua}"
+export WIREMCP_WKI_RUNTIME="${runtime_dir}"
+export WIREMCP_DEFAULT_INTERFACE="${WIREMCP_DEFAULT_INTERFACE:-wos-wki-br}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${runtime_dir}/config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-${runtime_dir}/data}"
+
+mkdir -p "${runtime_dir}" "${XDG_CONFIG_HOME}" "${XDG_DATA_HOME}"
+cd "${runtime_dir}"
+
+exec node "${wireshark_dir}/WireMCP/index.js"

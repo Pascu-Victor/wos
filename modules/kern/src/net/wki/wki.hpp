@@ -36,6 +36,8 @@ namespace ker::net::wki {
 constexpr size_t WKI_MAX_PEERS = 256;
 constexpr size_t WKI_MAX_TRANSPORTS = 8;
 constexpr size_t WKI_MAX_CHANNELS = 256;  // per-peer
+static_assert(WKI_CHAN_DYNAMIC_BASE < WKI_CHAN_DYNAMIC_RESERVED_BASE, "dynamic channel allocation range must not be empty");
+static_assert(WKI_CHAN_DYNAMIC_RESERVED_BASE < WKI_MAX_CHANNELS, "reserved WKI channels must fit in the per-peer channel table");
 
 // Heartbeat defaults (in milliseconds to fit in uint16_t for wire format)
 constexpr uint16_t WKI_DEFAULT_HEARTBEAT_INTERVAL_MS = 1000;  // 1 second
@@ -63,6 +65,9 @@ constexpr uint16_t WKI_CREDITS_ZONE_MGMT = 32;
 constexpr uint16_t WKI_CREDITS_EVENT_BUS = 128;
 constexpr uint16_t WKI_CREDITS_RESOURCE = 32;
 constexpr uint16_t WKI_CREDITS_DYNAMIC = 256;
+// IPC pipe/socket data is bulkier than latency control traffic. Use the
+// largest window representable by the 8-bit wire credit advertisement.
+constexpr uint16_t WKI_CREDITS_IPC_DATA = 255;
 
 // Reorder-buffer limits are intentionally separate from advertised credits.
 // Credits bound what the peer should send concurrently; reorder limits bound
@@ -74,6 +79,7 @@ constexpr uint16_t WKI_REORDER_ZONE_MGMT = WKI_CREDITS_ZONE_MGMT;
 constexpr uint16_t WKI_REORDER_EVENT_BUS = WKI_CREDITS_EVENT_BUS;
 constexpr uint16_t WKI_REORDER_RESOURCE = 1024;
 constexpr uint16_t WKI_REORDER_DYNAMIC = WKI_CREDITS_DYNAMIC;
+constexpr uint16_t WKI_REORDER_IPC_DATA = WKI_CREDITS_IPC_DATA;
 
 // LSA
 constexpr uint32_t WKI_LSA_REFRESH_MS = 5000;  // 5 seconds

@@ -66,7 +66,7 @@ struct RunQueue {
     // CPU domain fields (Phase 1)
     // domain_id: which CpuDomain this RunQueue belongs to (0 = root)
     // daemon_load_penalty: added to reported load when incoming task is PROCESS type.
-    // Set to 56 for soft-exclusive daemon CPUs (makes compute load appear as 64=full).
+    // Positive values make soft-exclusive daemon CPUs less attractive to PROCESS placement.
     uint32_t domain_id = 0;
     uint32_t daemon_load_penalty = 0;
 
@@ -157,6 +157,8 @@ void set_cpu_daemon_penalty(uint64_t cpu_no, uint32_t penalty);  // Set daemon_l
 void set_cpu_domain_id(uint64_t cpu_no, uint32_t domain_id);     // Set domain_id on a CPU's RunQueue (Phase 8)
 auto get_cpu_load(uint64_t cpu_no) -> uint32_t;                  // Raw load for a CPU (for queryDomain)
 auto get_current_task() -> task::Task*;
+auto current_cpu_for_task(task::Task* task) -> uint64_t;
+auto owner_cpu_for_task(task::Task* task) -> uint64_t;
 bool can_query_current_task();
 void remove_current_task();                                   // Remove current task from runqueue (for exit)
 auto find_task_by_pid(uint64_t pid) -> task::Task*;           // Find a task by PID (O(1) via PID registry)

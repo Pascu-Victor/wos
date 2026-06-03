@@ -20,6 +20,10 @@ constexpr size_t PKT_POOL_GROW_CHUNK = 256;
 // Emergency free-buffer floor preserved by RX refill so TX/control traffic can
 // still allocate packets under receive bursts.
 constexpr size_t PKT_POOL_TX_RESERVE = 256;
+// RX refill should stop above the TX reserve. This leaves one growth chunk for
+// bulk TX before it has to grow the pool again, while pkt_alloc() can still use
+// the hard reserve for bounded control/liveness frames.
+constexpr size_t PKT_POOL_RX_REFILL_RESERVE = PKT_POOL_TX_RESERVE + PKT_POOL_GROW_CHUNK;
 
 struct PacketPoolSnapshot {
     size_t capacity = 0;

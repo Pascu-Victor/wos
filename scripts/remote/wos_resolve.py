@@ -55,9 +55,13 @@ def resolve_target(spec: str) -> str:
         return spec
 
     for node in collect_nodes():
-        if spec == node.get("vm"):
+        vm_name = node.get("vm")
+        hostname = node.get("hostname")
+        hostname_fqdn = f"{hostname}.wos" if hostname else None
+
+        if spec == vm_name:
             return node.get("ip", spec)
-        if spec == node.get("hostname"):
+        if spec == hostname or spec == hostname_fqdn:
             return node.get("ip", spec)
 
     return spec

@@ -256,7 +256,7 @@ auto pkt_pool_snapshot() -> PacketPoolSnapshot {
     snapshot.free = free_count.load(std::memory_order_relaxed);
     snapshot.used = snapshot.capacity > snapshot.free ? snapshot.capacity - snapshot.free : 0;
     snapshot.active_capacity = snapshot.capacity;
-    snapshot.rx_reserve = PKT_POOL_TX_RESERVE;
+    snapshot.rx_reserve = PKT_POOL_RX_REFILL_RESERVE;
     snapshot.grow_chunk = PKT_POOL_GROW_CHUNK;
     snapshot.buffer_size = PKT_BUF_SIZE;
     snapshot.object_size = sizeof(PacketBuffer);
@@ -309,7 +309,7 @@ auto pkt_alloc() -> PacketBuffer* {
 auto pkt_alloc_tx() -> PacketBuffer* {
     size_t avail = free_count.load(std::memory_order_relaxed);
     if (avail <= PKT_POOL_TX_RESERVE) {
-        static_cast<void>(pkt_pool_try_grow(PKT_POOL_TX_RESERVE + PKT_POOL_GROW_CHUNK, "tx reserve"));
+        static_cast<void>(pkt_pool_try_grow(PKT_POOL_RX_REFILL_RESERVE, "tx reserve"));
         avail = free_count.load(std::memory_order_relaxed);
     }
     if (avail <= PKT_POOL_TX_RESERVE) {

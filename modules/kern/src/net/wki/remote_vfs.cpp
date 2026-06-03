@@ -16,6 +16,7 @@
 #include <iterator>
 #include <memory>
 #include <net/wki/dev_server.hpp>
+#include <net/wki/transport_roce.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <new>
@@ -58,10 +59,13 @@ auto transport_supports_vfs_write_push_rdma(const WkiTransport* transport) -> bo
     // ivshmem: rdma_write is a local memcpy — payload is visible before the control
     // response is even enqueued.
     //
-    // RoCE: rdma_write and wki_send both use the same netdev TX queue, so RDMA_WRITE
-    // frames are enqueued before the WKI control message. Write-push is therefore
-    // safe for RoCE.
+    // RoCE: the control request is sent first and the server waits for the
+    // receive region to fill before writing into VFS.
     return std::strcmp(transport->name, "wki-ivshmem") == 0 || std::strcmp(transport->name, "wki-roce") == 0;
+}
+
+auto transport_is_roce(const WkiTransport* transport) -> bool {
+    return transport != nullptr && transport->name != nullptr && std::strcmp(transport->name, "wki-roce") == 0;
 }
 
 auto transport_supports_vfs_read_push_rdma(const WkiTransport* transport) -> bool {
@@ -935,7 +939,7 @@ void proxy_release_shared_io_slot(ProxyVfsState* state) {
 }
 
 struct SharedIoSlotGuard {
-    explicit SharedIoSlotGuard(ProxyVfsState* state_) : state(state_) { proxy_acquire_shared_io_slot(state); }
+    explicit SharedIoSlotGuard(ProxyVfsState* state_ref) : state(state_ref) { proxy_acquire_shared_io_slot(state); }
     ~SharedIoSlotGuard() { proxy_release_shared_io_slot(state); }
 
     SharedIoSlotGuard(const SharedIoSlotGuard&) = delete;
@@ -1104,7 +1108,7 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
 auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int64_t offset, const uint8_t* src, uint32_t chunk,
                                    uint32_t* written_out) -> int {
     if (state == nullptr || src == nullptr || written_out == nullptr || state->rdma_transport == nullptr ||
-        state->rdma_bounce_buf == nullptr || state->rdma_server_write_rkey == 0) {
+        state->rdma_server_write_rkey == 0) {
         return -EINVAL;
     }
 
@@ -1158,29 +1162,6 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
                                      perf_vfs_op(OP_VFS_WRITE_RDMA), ker::mod::perf::WkiPerfPhase::BEGIN, state->owner_node,
                                      state->assigned_channel, CORRELATION, 0, chunk, CALLSITE);
 
-    memcpy(state->rdma_bounce_buf, src, chunk);
-    int const RDMA_RET = state->rdma_transport->rdma_write(state->rdma_transport, state->owner_node, state->rdma_server_write_rkey, 0,
-                                                           state->rdma_bounce_buf, chunk);
-    if (RDMA_RET != 0) {
-        state->lock.lock();
-        state->op_wait_entry = nullptr;
-        state->op_expected_id = 0;
-        state->op_expected_seq = 0;
-        state->op_resp_buf = nullptr;
-        state->op_resp_max = 0;
-        state->op_resp_len = 0;
-        state->op_pending.store(false, std::memory_order_relaxed);
-        state->lock.unlock();
-
-        auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
-        ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS,
-                                         perf_vfs_op(OP_VFS_WRITE_RDMA), ker::mod::perf::WkiPerfPhase::END, state->owner_node,
-                                         state->assigned_channel, CORRELATION, RDMA_RET, ELAPSED_US, CALLSITE);
-        ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(OP_VFS_WRITE_RDMA), state->owner_node,
-                                           state->assigned_channel, RDMA_RET, ELAPSED_US, true, 0, chunk);
-        return -EIO;
-    }
-
     std::array<uint8_t, 16> ctrl{};
     memcpy(ctrl.data(), &remote_fd, sizeof(int32_t));
     memcpy(ctrl.data() + 4, &offset, sizeof(int64_t));
@@ -1198,6 +1179,13 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
         state->op_resp_len = 0;
         state->op_pending.store(false, std::memory_order_relaxed);
         state->lock.unlock();
+
+        auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+        ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS,
+                                         perf_vfs_op(OP_VFS_WRITE_RDMA), ker::mod::perf::WkiPerfPhase::END, state->owner_node,
+                                         state->assigned_channel, CORRELATION, -ENOMEM, ELAPSED_US, CALLSITE);
+        ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(OP_VFS_WRITE_RDMA), state->owner_node,
+                                           state->assigned_channel, -ENOMEM, ELAPSED_US, true, 0, 0);
         return -ENOMEM;
     }
 
@@ -1205,6 +1193,32 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
     req->op_id = OP_VFS_WRITE_RDMA;
     req->data_len = static_cast<uint16_t>(ctrl.size());
     memcpy(req_buf + sizeof(DevOpReqPayload), ctrl.data(), ctrl.size());
+
+    bool const CONTROL_FIRST = transport_is_roce(state->rdma_transport);
+    if (!CONTROL_FIRST) {
+        int const RDMA_RET =
+            state->rdma_transport->rdma_write(state->rdma_transport, state->owner_node, state->rdma_server_write_rkey, 0, src, chunk);
+        if (RDMA_RET != 0) {
+            delete[] req_buf;
+            state->lock.lock();
+            state->op_wait_entry = nullptr;
+            state->op_expected_id = 0;
+            state->op_expected_seq = 0;
+            state->op_resp_buf = nullptr;
+            state->op_resp_max = 0;
+            state->op_resp_len = 0;
+            state->op_pending.store(false, std::memory_order_relaxed);
+            state->lock.unlock();
+
+            auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+            ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS,
+                                             perf_vfs_op(OP_VFS_WRITE_RDMA), ker::mod::perf::WkiPerfPhase::END, state->owner_node,
+                                             state->assigned_channel, CORRELATION, RDMA_RET, ELAPSED_US, CALLSITE);
+            ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(OP_VFS_WRITE_RDMA), state->owner_node,
+                                               state->assigned_channel, RDMA_RET, ELAPSED_US, true, 0, chunk);
+            return -EIO;
+        }
+    }
 
     int const SEND_RET = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
     delete[] req_buf;
@@ -1226,6 +1240,30 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
         ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(OP_VFS_WRITE_RDMA), state->owner_node,
                                            state->assigned_channel, SEND_RET, ELAPSED_US, true, 0, chunk);
         return normalize_proxy_status_for_errno(encode_proxy_wki_status(SEND_RET));
+    }
+
+    if (CONTROL_FIRST) {
+        int const RDMA_RET =
+            wki_roce_rdma_write_tagged(state->owner_node, state->rdma_server_write_rkey, 0, src, chunk, static_cast<uint16_t>(CORRELATION));
+        if (RDMA_RET != 0) {
+            state->lock.lock();
+            state->op_wait_entry = nullptr;
+            state->op_expected_id = 0;
+            state->op_expected_seq = 0;
+            state->op_resp_buf = nullptr;
+            state->op_resp_max = 0;
+            state->op_resp_len = 0;
+            state->op_pending.store(false, std::memory_order_relaxed);
+            state->lock.unlock();
+
+            auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+            ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS,
+                                             perf_vfs_op(OP_VFS_WRITE_RDMA), ker::mod::perf::WkiPerfPhase::END, state->owner_node,
+                                             state->assigned_channel, CORRELATION, RDMA_RET, ELAPSED_US, CALLSITE);
+            ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(OP_VFS_WRITE_RDMA), state->owner_node,
+                                               state->assigned_channel, RDMA_RET, ELAPSED_US, true, 0, chunk);
+            return -EIO;
+        }
     }
 
     int const WAIT_RC = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
@@ -1275,7 +1313,7 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
 }
 
 constexpr uint32_t VFS_READ_RETRIES = 2;
-constexpr uint32_t VFS_DIRECT_READ_STACK_SIZE = 4096;
+constexpr uint32_t VFS_DIRECT_READ_STACK_SIZE = 8192;
 static_assert(VFS_DIRECT_READ_STACK_SIZE <= WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload));
 
 // Remote readlink sits on an interactive hot path (`ls -l`, path resolution,
@@ -1337,7 +1375,7 @@ auto flush_write_behind(RemoteFileContext* ctx) -> int {
 
     auto* wb = ctx->write_buf;
     auto* src = wb->data.data();
-    auto remaining = static_cast<uint32_t>(wb->pending_len);
+    auto remaining = wb->pending_len;
     auto cur_offset = wb->pending_offset;
     auto keep_pending_tail = [&](const uint8_t* tail_src, uint32_t tail_len, int64_t tail_offset) {
         if (tail_len == 0) {
@@ -1350,15 +1388,15 @@ auto flush_write_behind(RemoteFileContext* ctx) -> int {
             memmove(wb->data.data(), tail_src, tail_len);
         }
         wb->pending_offset = tail_offset;
-        wb->pending_len = static_cast<uint16_t>(tail_len);
+        wb->pending_len = tail_len;
     };
 
-    // RDMA path: push pending data to server's pre-registered receive buffer,
-    // then send a tiny control message. Avoids embedding data in WKI packets.
+    // RDMA path: use the server's pre-registered receive buffer and send only
+    // a tiny control message over WKI. Avoids embedding file data in WKI packets.
     if (transport_supports_vfs_write_push_rdma(ctx->proxy->rdma_transport) && ctx->proxy->rdma_capable &&
-        ctx->proxy->rdma_transport != nullptr && ctx->proxy->rdma_server_write_rkey != 0 && ctx->proxy->rdma_bounce_buf != nullptr) {
+        ctx->proxy->rdma_transport != nullptr && ctx->proxy->rdma_server_write_rkey != 0) {
         while (remaining > 0) {
-            uint32_t const CHUNK = std::min(remaining, VFS_RDMA_BOUNCE_SIZE);
+            uint32_t const CHUNK = std::min(remaining, VFS_RDMA_WRITE_SIZE);
 
             uint32_t written = 0;
             int const STATUS = vfs_proxy_write_rdma_and_wait(ctx->proxy, ctx->remote_fd, cur_offset, src, CHUNK, &written);
@@ -1838,27 +1876,28 @@ auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t o
 
         // Check if this write is sequential and fits in the buffer
         bool const IS_SEQUENTIAL = (wb->pending_len == 0) || (wb->pending_offset + wb->pending_len == cur_offset);
-        auto space = static_cast<uint16_t>(VFS_CACHE_SIZE - wb->pending_len);
+        auto space = static_cast<uint32_t>(VFS_WRITE_BEHIND_SIZE - wb->pending_len);
 
         if (IS_SEQUENTIAL && space > 0) {
             // Buffer this write
-            auto to_buffer = static_cast<uint16_t>(std::min(static_cast<uint32_t>(space), remaining));
-            memcpy(wb->data.data() + wb->pending_len, src, to_buffer);
+            uint32_t const TO_BUFFER = std::min(space, remaining);
+            ssize_t const WRITTEN_BEFORE_BUFFER = total_written;
+            memcpy(wb->data.data() + wb->pending_len, src, TO_BUFFER);
             if (wb->pending_len == 0) {
                 wb->pending_offset = cur_offset;
             }
-            wb->pending_len += to_buffer;
+            wb->pending_len += TO_BUFFER;
 
-            src += to_buffer;
-            cur_offset += to_buffer;
-            remaining -= to_buffer;
-            total_written += to_buffer;
+            src += TO_BUFFER;
+            cur_offset += TO_BUFFER;
+            remaining -= TO_BUFFER;
+            total_written += TO_BUFFER;
 
             // If buffer is full, flush it
-            if (wb->pending_len >= VFS_CACHE_SIZE) {
+            if (wb->pending_len >= VFS_WRITE_BEHIND_SIZE) {
                 int const FLUSH_STATUS = flush_write_behind(ctx);
                 if (FLUSH_STATUS != 0) {
-                    return (total_written > 0) ? total_written : FLUSH_STATUS;
+                    return (WRITTEN_BEFORE_BUFFER > 0) ? WRITTEN_BEFORE_BUFFER : FLUSH_STATUS;
                 }
             }
             continue;
@@ -1871,7 +1910,7 @@ auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t o
         }
 
         // If the data exceeds the buffer size, send directly (bypass buffering)
-        if (remaining >= VFS_CACHE_SIZE) {
+        if (remaining >= VFS_WRITE_BEHIND_SIZE) {
             uint32_t const CHUNK = (remaining > max_data) ? max_data : remaining;
 
             auto req_data_len = static_cast<uint16_t>(12 + CHUNK);
@@ -3017,7 +3056,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_SYMLINK;
                 resp.status = -1;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3029,7 +3068,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_SYMLINK;
                 resp.status = -1;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3041,7 +3080,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_SYMLINK;
                 resp.status = -1;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3060,7 +3099,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_SYMLINK;
                 resp.status = -EPERM;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3070,7 +3109,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             resp.op_id = OP_VFS_SYMLINK;
             resp.status = static_cast<int16_t>(RET);
             resp.data_len = 0;
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+            send_simple_resp(resp);
             break;
         }
 
@@ -3085,7 +3124,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_UNLINK;
                 resp.status = -1;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3096,7 +3135,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_UNLINK;
                 resp.status = -1;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3111,7 +3150,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_UNLINK;
                 resp.status = -EPERM;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3121,7 +3160,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             resp.op_id = OP_VFS_UNLINK;
             resp.status = static_cast<int16_t>(RET);
             resp.data_len = 0;
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+            send_simple_resp(resp);
             break;
         }
 
@@ -3132,7 +3171,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_RMDIR;
                 resp.status = -1;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3143,7 +3182,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_RMDIR;
                 resp.status = -1;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3158,7 +3197,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_RMDIR;
                 resp.status = -EPERM;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3168,7 +3207,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             resp.op_id = OP_VFS_RMDIR;
             resp.status = static_cast<int16_t>(RET);
             resp.data_len = 0;
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+            send_simple_resp(resp);
             break;
         }
 
@@ -3179,7 +3218,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_RENAME;
                 resp.status = -1;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3190,7 +3229,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_RENAME;
                 resp.status = -1;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3201,7 +3240,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_RENAME;
                 resp.status = -1;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3216,7 +3255,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_RENAME;
                 resp.status = -EPERM;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3226,7 +3265,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             resp.op_id = OP_VFS_RENAME;
             resp.status = static_cast<int16_t>(RET);
             resp.data_len = 0;
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+            send_simple_resp(resp);
             break;
         }
 
@@ -3237,7 +3276,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_FSYNC;
                 resp.status = -1;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3260,7 +3299,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             resp.op_id = OP_VFS_FSYNC;
             resp.status = static_cast<int16_t>(ret);
             resp.data_len = 0;
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+            send_simple_resp(resp);
             break;
         }
 
@@ -3271,7 +3310,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_TRUNCATE;
                 resp.status = -1;
                 resp.data_len = 0;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -3298,7 +3337,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             resp.op_id = OP_VFS_TRUNCATE;
             resp.status = static_cast<int16_t>(ret);
             resp.data_len = 0;
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+            send_simple_resp(resp);
             break;
         }
 
@@ -3540,18 +3579,19 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 
         case OP_VFS_WRITE_RDMA: {
             // Request: {fd:i32, off:i64, len:u32} = 16 bytes
-            // Consumer already rdma_wrote the data into our pre-registered write buffer
-            // before sending this control message.
-            auto send_rdma_write_err = [&]() {
+            // Consumer sends this control message first, then rdma_writes the
+            // data into our pre-registered write buffer.
+            auto send_rdma_write_err = [&](int16_t status) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_WRITE_RDMA;
-                resp.status = -1;
+                resp.status = status;
                 resp.data_len = 0;
+                wki_dev_server_complete_vfs_write(hdr->src_node, channel_id, REQ_COOKIE, status, 0);
                 send_simple_resp(resp);
             };
 
             if (data_len < 16) {
-                send_rdma_write_err();
+                send_rdma_write_err(-EINVAL);
                 break;
             }
 
@@ -3562,11 +3602,19 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             memcpy(&offset, data + 4, sizeof(int64_t));
             memcpy(&len, data + 12, sizeof(uint32_t));
 
-            len = std::min<uint32_t>(len, VFS_RDMA_BOUNCE_SIZE);
+            len = std::min<uint32_t>(len, VFS_RDMA_WRITE_SIZE);
 
-            uint8_t const* write_src = wki_dev_server_get_vfs_write_buf(hdr->src_node, channel_id);
+            VfsWriteRegionInfo const WRITE_REGION = wki_dev_server_get_vfs_write_region(hdr->src_node, channel_id);
+            uint8_t const* write_src = WRITE_REGION.buf;
             if (write_src == nullptr) {
-                send_rdma_write_err();
+                send_rdma_write_err(-EIO);
+                break;
+            }
+
+            if (WRITE_REGION.transport != nullptr && WRITE_REGION.transport->name != nullptr &&
+                std::strcmp(WRITE_REGION.transport->name, "wki-roce") == 0 &&
+                !wki_roce_region_wait_tagged_write(WRITE_REGION.rkey, REQ_COOKIE, len, WKI_OP_TIMEOUT_US)) {
+                send_rdma_write_err(-ETIMEDOUT);
                 break;
             }
 
@@ -3574,7 +3622,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
             if (rfd == nullptr || rfd->file == nullptr || rfd->file->fops == nullptr || rfd->file->fops->vfs_write == nullptr) {
                 s_vfs_lock.unlock();
-                send_rdma_write_err();
+                send_rdma_write_err(-EBADF);
                 break;
             }
             touch_remote_fd(rfd);
@@ -3591,6 +3639,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             resp->status = (BYTES_WRITTEN >= 0) ? 0 : static_cast<int16_t>(BYTES_WRITTEN);
             resp->data_len = 4;
             memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &bw, sizeof(uint32_t));
+            wki_dev_server_complete_vfs_write(hdr->src_node, channel_id, REQ_COOKIE, resp->status, bw);
             send_buffered_resp(resp_buf.data(), static_cast<uint16_t>(resp_buf.size()));
             break;
         }
@@ -3648,9 +3697,8 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
 
     WkiChannel* reserved_channel = nullptr;
     if (wki_requester_controls_dynamic_channel(g_wki.my_node_id, owner_node)) {
-        // Remote VFS proxies mostly carry latency-sensitive metadata ops and
-        // small control messages.  Use a latency-class channel so ACKs are not
-        // artificially delayed behind piggyback windows intended for bulk data.
+        // Remote VFS RPCs are stop-and-wait. Use latency ACKs so a long server
+        // write does not look like a lost control frame to the sender.
         reserved_channel = wki_channel_alloc(owner_node, PriorityClass::LATENCY);
         if (reserved_channel == nullptr) {
             state->attach_wait_entry = nullptr;
@@ -3748,7 +3796,7 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     state->active = true;
     s_vfs_lock.unlock();
 
-    // RDMA setup: if the server advertised a write-recv rkey, register a local
+    // RDMA setup: if the server advertised VFS RDMA, register a local read
     // bounce buffer so the server can rdma_write file data directly into it.
     if (state->rdma_server_write_rkey != 0) {
         WkiPeer const* peer = wki_peer_find(owner_node);

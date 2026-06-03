@@ -3,14 +3,20 @@ bits 64
 %include "platform/asm/helpers.asm"
 
 %assign GPREGS_SIZE 120
+%assign INTERRUPT_FRAME_SIZE 56
 %assign IRETQ_KERNEL_FRAME_SIZE 24
+%assign IRETQ_KERNEL_FRAME_OFFSET GPREGS_SIZE + INTERRUPT_FRAME_SIZE
+%assign KERNEL_RETURN_BLOCK_SIZE GPREGS_SIZE + INTERRUPT_FRAME_SIZE + IRETQ_KERNEL_FRAME_SIZE
 
+; Same-CPL iretq consumes only RIP/CS/RFLAGS, but the scheduler and panic
+; diagnostics treat the memory below the saved RSP as GPRegs + InterruptFrame.
+; Keep that normalized shadow intact, then skip it immediately before iretq.
 %macro build_kernel_return_from_stack 0
     mov r10, [rsp + GPREGS_SIZE + 40]  ; saved kernel RSP
     mov r12, [rsp + GPREGS_SIZE + 16]  ; RIP
     mov r13, [rsp + GPREGS_SIZE + 24]  ; CS
     mov r14, [rsp + GPREGS_SIZE + 32]  ; RFLAGS
-    sub r10, GPREGS_SIZE + IRETQ_KERNEL_FRAME_SIZE
+    sub r10, KERNEL_RETURN_BLOCK_SIZE
 
     %assign i 14
     %rep 15
@@ -19,12 +25,20 @@ bits 64
         %assign i i - 1
     %endrep
 
-    mov [r10 + GPREGS_SIZE], r12
-    mov [r10 + GPREGS_SIZE + 8], r13
-    mov [r10 + GPREGS_SIZE + 16], r14
+    %assign j 6
+    %rep 7
+        mov r11, [rsp + GPREGS_SIZE + j * 8]
+        mov [r10 + GPREGS_SIZE + j * 8], r11
+        %assign j j - 1
+    %endrep
+
+    mov [r10 + IRETQ_KERNEL_FRAME_OFFSET], r12
+    mov [r10 + IRETQ_KERNEL_FRAME_OFFSET + 8], r13
+    mov [r10 + IRETQ_KERNEL_FRAME_OFFSET + 16], r14
 
     mov rsp, r10
     popq
+    add rsp, INTERRUPT_FRAME_SIZE
     iretq
 %endmacro
 
@@ -33,7 +47,7 @@ bits 64
     mov r12, [rsi + 16]  ; RIP
     mov r13, [rsi + 24]  ; CS
     mov r14, [rsi + 32]  ; RFLAGS
-    sub r10, GPREGS_SIZE + IRETQ_KERNEL_FRAME_SIZE
+    sub r10, KERNEL_RETURN_BLOCK_SIZE
 
     %assign i 14
     %rep 15
@@ -42,12 +56,20 @@ bits 64
         %assign i i - 1
     %endrep
 
-    mov [r10 + GPREGS_SIZE], r12
-    mov [r10 + GPREGS_SIZE + 8], r13
-    mov [r10 + GPREGS_SIZE + 16], r14
+    %assign j 6
+    %rep 7
+        mov r11, [rsi + j * 8]
+        mov [r10 + GPREGS_SIZE + j * 8], r11
+        %assign j j - 1
+    %endrep
+
+    mov [r10 + IRETQ_KERNEL_FRAME_OFFSET], r12
+    mov [r10 + IRETQ_KERNEL_FRAME_OFFSET + 8], r13
+    mov [r10 + IRETQ_KERNEL_FRAME_OFFSET + 16], r14
 
     mov rsp, r10
     popq
+    add rsp, INTERRUPT_FRAME_SIZE
     iretq
 %endmacro
 

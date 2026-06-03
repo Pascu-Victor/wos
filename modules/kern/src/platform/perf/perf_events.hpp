@@ -112,6 +112,7 @@ enum class WkiPerfTransportOp : uint8_t {
     NO_CREDITS = 5,
     WAIT = 6,
     STALL = 7,
+    RDMA_WRITE = 8,
 };
 
 enum class WkiPerfVfsOp : uint8_t {

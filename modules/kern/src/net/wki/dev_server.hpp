@@ -63,6 +63,13 @@ struct DevServerBinding {
     // Allocated at DEV_ATTACH time when the peer has an RDMA-capable transport.
     uint8_t* vfs_rdma_write_buf = nullptr;  // server-side receive region for RDMA-backed writes
     uint32_t vfs_rdma_write_rkey = 0;       // rkey identifying this region to the remote consumer
+    WkiTransport* vfs_rdma_write_transport = nullptr;
+    bool vfs_rdma_write_active = false;
+    uint16_t vfs_rdma_write_active_cookie = 0;
+    bool vfs_rdma_write_resp_valid = false;
+    uint16_t vfs_rdma_write_resp_cookie = 0;
+    int16_t vfs_rdma_write_resp_status = 0;
+    uint32_t vfs_rdma_write_resp_bytes = 0;
 
     // VFS read staging (RoCE pull mode): server reads file data here; client rdma_reads to pull.
     // Only allocated for transports where client-pull is safe (wki-roce).
@@ -105,6 +112,13 @@ struct DevServerBinding {
           blk_rdma_transport(o.blk_rdma_transport),
           vfs_rdma_write_buf(o.vfs_rdma_write_buf),
           vfs_rdma_write_rkey(o.vfs_rdma_write_rkey),
+          vfs_rdma_write_transport(o.vfs_rdma_write_transport),
+          vfs_rdma_write_active(o.vfs_rdma_write_active),
+          vfs_rdma_write_active_cookie(o.vfs_rdma_write_active_cookie),
+          vfs_rdma_write_resp_valid(o.vfs_rdma_write_resp_valid),
+          vfs_rdma_write_resp_cookie(o.vfs_rdma_write_resp_cookie),
+          vfs_rdma_write_resp_status(o.vfs_rdma_write_resp_status),
+          vfs_rdma_write_resp_bytes(o.vfs_rdma_write_resp_bytes),
           vfs_rdma_read_staging_buf(o.vfs_rdma_read_staging_buf),
           vfs_rdma_read_staging_rkey(o.vfs_rdma_read_staging_rkey),
           vfs_rdma_bulk_staging_buf(o.vfs_rdma_bulk_staging_buf),
@@ -115,6 +129,7 @@ struct DevServerBinding {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
         __builtin_memcpy(vfs_export_name, o.vfs_export_name, sizeof(vfs_export_name));
         o.vfs_rdma_write_buf = nullptr;  // ownership transfer
+        o.vfs_rdma_write_transport = nullptr;
         o.vfs_rdma_read_staging_buf = nullptr;
         o.vfs_rdma_bulk_staging_buf = nullptr;
     }
@@ -151,16 +166,30 @@ struct DevServerBinding {
             blk_rdma_transport = o.blk_rdma_transport;
             vfs_rdma_write_buf = o.vfs_rdma_write_buf;
             vfs_rdma_write_rkey = o.vfs_rdma_write_rkey;
+            vfs_rdma_write_transport = o.vfs_rdma_write_transport;
+            vfs_rdma_write_active = o.vfs_rdma_write_active;
+            vfs_rdma_write_active_cookie = o.vfs_rdma_write_active_cookie;
+            vfs_rdma_write_resp_valid = o.vfs_rdma_write_resp_valid;
+            vfs_rdma_write_resp_cookie = o.vfs_rdma_write_resp_cookie;
+            vfs_rdma_write_resp_status = o.vfs_rdma_write_resp_status;
+            vfs_rdma_write_resp_bytes = o.vfs_rdma_write_resp_bytes;
             vfs_rdma_read_staging_buf = o.vfs_rdma_read_staging_buf;
             vfs_rdma_read_staging_rkey = o.vfs_rdma_read_staging_rkey;
             vfs_rdma_bulk_staging_buf = o.vfs_rdma_bulk_staging_buf;
             vfs_rdma_bulk_staging_rkey = o.vfs_rdma_bulk_staging_rkey;
             o.vfs_rdma_write_buf = nullptr;  // ownership transfer
+            o.vfs_rdma_write_transport = nullptr;
             o.vfs_rdma_read_staging_buf = nullptr;
             o.vfs_rdma_bulk_staging_buf = nullptr;
         }
         return *this;
     }
+};
+
+struct VfsWriteRegionInfo {
+    uint8_t* buf = nullptr;
+    uint32_t rkey = 0;
+    WkiTransport* transport = nullptr;
 };
 
 // -----------------------------------------------------------------------------
@@ -180,6 +209,14 @@ void wki_dev_server_poll_rings();
 // Look up the pre-registered VFS write-receive buffer for a given binding.
 // Returns nullptr if the binding has no RDMA write buffer (msg-only path).
 auto wki_dev_server_get_vfs_write_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t*;
+
+// Look up the full server-side VFS write RDMA receive region.
+auto wki_dev_server_get_vfs_write_region(uint16_t consumer_node, uint16_t channel_id) -> VfsWriteRegionInfo;
+
+// Mark an RDMA-backed VFS write request complete and cache the response for
+// duplicate control retransmits carrying the same request cookie.
+void wki_dev_server_complete_vfs_write(uint16_t consumer_node, uint16_t channel_id, uint16_t req_cookie, int16_t status,
+                                       uint32_t bytes_written);
 
 // Look up the server-side VFS read staging buffer (RoCE pull mode).
 // Returns nullptr if pull mode is not active for this binding.

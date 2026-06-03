@@ -1,5 +1,6 @@
 #include "transport_roce.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -15,6 +16,8 @@
 #include <net/wki/zone.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
+#include <platform/perf/perf_events.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <platform/sys/spinlock.hpp>
 
 namespace ker::net::wki {
@@ -46,6 +49,14 @@ static_assert(sizeof(RoceHeader) == 24, "RoceHeader must be 24 bytes");
 
 constexpr uint8_t ROCE_VERSION = 1;
 constexpr uint32_t ROCE_MAX_PAYLOAD = 9000 - proto::ETH_HLEN - sizeof(RoceHeader);  // ~8962 bytes
+constexpr uint32_t ROCE_WRITE_TAG_VALID = 0x80000000U;
+constexpr uint32_t ROCE_WRITE_TAG_COOKIE_MASK = 0x0000FFFFU;
+
+auto roce_write_tag(uint16_t cookie) -> uint32_t { return ROCE_WRITE_TAG_VALID | cookie; }
+
+auto roce_write_tag_valid(uint32_t tag) -> bool { return (tag & ROCE_WRITE_TAG_VALID) != 0; }
+
+auto roce_write_tag_cookie(uint32_t tag) -> uint16_t { return static_cast<uint16_t>(tag & ROCE_WRITE_TAG_COOKIE_MASK); }
 
 // -----------------------------------------------------------------------------
 // Memory region registry - maps rkey -> (vaddr, size)
@@ -61,6 +72,9 @@ struct RoceRegion {
     bool temporary = false;
     uint32_t received_bytes = 0;
     bool receive_gap = false;
+    bool write_complete = false;
+    bool tagged_receive = false;
+    uint16_t received_cookie = 0;
     RoceRegion* next = nullptr;
 };
 
@@ -147,6 +161,9 @@ auto region_register(uint64_t vaddr, uint32_t size, bool temporary, uint32_t* rk
     region->temporary = temporary;
     region->received_bytes = 0;
     region->receive_gap = false;
+    region->write_complete = false;
+    region->tagged_receive = false;
+    region->received_cookie = 0;
 
     RoceRegion*& bucket = region_bucket(NEW_RKEY);
     region->next = bucket;
@@ -204,6 +221,72 @@ auto region_is_registered(uint32_t rkey) -> bool {
     return FOUND;
 }
 
+auto region_reset_received(uint32_t rkey) -> bool {
+    uint64_t const FLAGS = s_region_lock.lock_irqsave();
+    RoceRegion* region = region_find_locked(rkey);
+    if (region == nullptr) {
+        s_region_lock.unlock_irqrestore(FLAGS);
+        return false;
+    }
+
+    region->received_bytes = 0;
+    region->receive_gap = false;
+    region->write_complete = false;
+    region->tagged_receive = false;
+    region->received_cookie = 0;
+    s_region_lock.unlock_irqrestore(FLAGS);
+    return true;
+}
+
+auto region_prepare_tagged_write(uint32_t rkey, uint16_t cookie) -> bool {
+    uint64_t const FLAGS = s_region_lock.lock_irqsave();
+    RoceRegion* region = region_find_locked(rkey);
+    if (region == nullptr) {
+        s_region_lock.unlock_irqrestore(FLAGS);
+        return false;
+    }
+
+    if (!region->tagged_receive || region->received_cookie != cookie) {
+        region->received_bytes = 0;
+        region->receive_gap = false;
+    }
+    region->tagged_receive = true;
+    region->received_cookie = cookie;
+    region->write_complete = false;
+    s_region_lock.unlock_irqrestore(FLAGS);
+    return true;
+}
+
+auto region_received_at_least(uint32_t rkey, uint32_t len) -> bool {
+    uint64_t const FLAGS = s_region_lock.lock_irqsave();
+    RoceRegion* region = region_find_locked(rkey);
+    bool const RECEIVED = region != nullptr && len <= region->size && !region->receive_gap && region->received_bytes >= len;
+    s_region_lock.unlock_irqrestore(FLAGS);
+    return RECEIVED;
+}
+
+auto region_tagged_write_received_at_least(uint32_t rkey, uint16_t cookie, uint32_t len) -> bool {
+    uint64_t const FLAGS = s_region_lock.lock_irqsave();
+    RoceRegion* region = region_find_locked(rkey);
+    bool const RECEIVED = region != nullptr && len <= region->size && region->tagged_receive && region->received_cookie == cookie &&
+                          !region->receive_gap && region->received_bytes >= len;
+    s_region_lock.unlock_irqrestore(FLAGS);
+    return RECEIVED;
+}
+
+auto region_mark_write_complete(uint32_t rkey) -> bool {
+    uint64_t const FLAGS = s_region_lock.lock_irqsave();
+    RoceRegion* region = region_find_locked(rkey);
+    if (region == nullptr || region->temporary) {
+        s_region_lock.unlock_irqrestore(FLAGS);
+        return false;
+    }
+
+    region->write_complete = true;
+    s_region_lock.unlock_irqrestore(FLAGS);
+    return true;
+}
+
 auto region_snapshot(uint32_t rkey, RoceRegionSnapshot& out) -> bool {
     uint64_t const FLAGS = s_region_lock.lock_irqsave();
     RoceRegion* region = region_find_locked(rkey);
@@ -218,7 +301,8 @@ auto region_snapshot(uint32_t rkey, RoceRegionSnapshot& out) -> bool {
     return true;
 }
 
-auto region_write(uint32_t rkey, uint64_t offset, const uint8_t* payload, uint32_t length, uint32_t payload_len) -> bool {
+auto region_write(uint32_t rkey, uint64_t offset, const uint8_t* payload, uint32_t length, uint32_t payload_len, uint32_t write_tag)
+    -> bool {
     if (payload == nullptr || length > payload_len) {
         return false;
     }
@@ -230,15 +314,19 @@ auto region_write(uint32_t rkey, uint64_t offset, const uint8_t* payload, uint32
         return false;
     }
 
-    memcpy(static_cast<uint8_t*>(region->vaddr) + offset, payload, length);
-    if (region->temporary) {
-        auto const WRITE_OFFSET = static_cast<uint32_t>(offset);
-        if (!region->receive_gap && WRITE_OFFSET == region->received_bytes) {
-            region->received_bytes += length;
-        } else if (WRITE_OFFSET + length > region->received_bytes) {
-            region->receive_gap = true;
+    if (roce_write_tag_valid(write_tag)) {
+        uint16_t const COOKIE = roce_write_tag_cookie(write_tag);
+        if (!region->tagged_receive || region->received_cookie != COOKIE) {
+            region->received_bytes = 0;
+            region->receive_gap = false;
         }
+        region->tagged_receive = true;
+        region->received_cookie = COOKIE;
+        region->write_complete = false;
     }
+
+    memcpy(static_cast<uint8_t*>(region->vaddr) + offset, payload, length);
+    region->received_bytes = std::min(region->size, region->received_bytes + length);
     s_region_lock.unlock_irqrestore(FLAGS);
     return true;
 }
@@ -247,21 +335,8 @@ auto region_write(uint32_t rkey, uint64_t offset, const uint8_t* payload, uint32
 // Raw Ethernet TX helper - sends a RoCE frame (EtherType 0x88B8)
 // -----------------------------------------------------------------------------
 
-auto roce_eth_tx(uint16_t neighbor_id, const RoceHeader& hdr, const void* payload, uint32_t payload_len) -> int {
-    auto* netdev = wki_eth_get_netdev();
-    if (netdev == nullptr) {
-        return WKI_ERR_NO_ROUTE;
-    }
-
-    // Resolve destination MAC from peer
-    proto::MacAddress dst_mac;
-    WkiPeer const* peer = wki_peer_find(neighbor_id);
-    if (peer != nullptr) {
-        dst_mac = peer->mac;
-    } else {
-        return WKI_ERR_NO_ROUTE;  // unknown peer MAC
-    }
-
+auto roce_eth_tx_resolved(NetDevice* netdev, const proto::MacAddress& dst_mac, const RoceHeader& hdr, const void* payload,
+                          uint32_t payload_len) -> int {
     PacketBuffer* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
         return WKI_ERR_NO_MEM;
@@ -284,6 +359,20 @@ auto roce_eth_tx(uint16_t neighbor_id, const RoceHeader& hdr, const void* payloa
     return (RET == 0) ? WKI_OK : WKI_ERR_TX_FAILED;
 }
 
+auto roce_eth_tx(uint16_t neighbor_id, const RoceHeader& hdr, const void* payload, uint32_t payload_len) -> int {
+    auto* netdev = wki_eth_get_netdev();
+    if (netdev == nullptr) {
+        return WKI_ERR_NO_ROUTE;
+    }
+
+    WkiPeer const* peer = wki_peer_find(neighbor_id);
+    if (peer == nullptr) {
+        return WKI_ERR_NO_ROUTE;
+    }
+
+    return roce_eth_tx_resolved(netdev, peer->mac, hdr, payload, payload_len);
+}
+
 // -----------------------------------------------------------------------------
 // RDMA operations - WkiTransport function pointers
 // -----------------------------------------------------------------------------
@@ -292,11 +381,24 @@ int roce_rdma_register_region(WkiTransport* /*self*/, uint64_t phys_addr, uint32
     return region_register(phys_addr, size, false, rkey);
 }
 
-int roce_rdma_write(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, uint64_t remote_offset, const void* local_buf,
-                    uint32_t len) {
+auto roce_rdma_write_impl(uint16_t neighbor_id, uint32_t rkey, uint64_t remote_offset, const void* local_buf, uint32_t len,
+                          uint32_t write_tag) -> int {
+    uint64_t const START_US = wki_now_us();
     const auto* src = static_cast<const uint8_t*>(local_buf);
     uint64_t offset = remote_offset;
     uint32_t remaining = len;
+    int status = WKI_OK;
+    auto* netdev = wki_eth_get_netdev();
+    WkiPeer const* peer = wki_peer_find(neighbor_id);
+    if (netdev == nullptr || peer == nullptr) {
+        status = WKI_ERR_NO_ROUTE;
+        ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::TRANSPORT,
+                                           static_cast<uint8_t>(ker::mod::perf::WkiPerfTransportOp::RDMA_WRITE), neighbor_id, 0, status,
+                                           static_cast<uint32_t>(wki_now_us() - START_US), true, 0, 0);
+        return status;
+    }
+
+    proto::MacAddress const DST_MAC = peer->mac;
 
     // Fragment into multiple frames if needed
     while (remaining > 0) {
@@ -309,11 +411,12 @@ int roce_rdma_write(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey,
         hdr.rkey = rkey;
         hdr.offset = offset;
         hdr.length = CHUNK;
-        hdr.doorbell_val = 0;
+        hdr.doorbell_val = write_tag;
 
-        int const RET = roce_eth_tx(neighbor_id, hdr, src, CHUNK);
+        int const RET = roce_eth_tx_resolved(netdev, DST_MAC, hdr, src, CHUNK);
         if (RET != 0) {
-            return RET;
+            status = RET;
+            break;
         }
 
         src += CHUNK;
@@ -321,7 +424,15 @@ int roce_rdma_write(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey,
         remaining -= CHUNK;
     }
 
-    return 0;
+    ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::TRANSPORT,
+                                       static_cast<uint8_t>(ker::mod::perf::WkiPerfTransportOp::RDMA_WRITE), neighbor_id, 0, status,
+                                       static_cast<uint32_t>(wki_now_us() - START_US), true, 0, len - remaining);
+    return status;
+}
+
+int roce_rdma_write(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, uint64_t remote_offset, const void* local_buf,
+                    uint32_t len) {
+    return roce_rdma_write_impl(neighbor_id, rkey, remote_offset, local_buf, len, 0);
 }
 
 int roce_rdma_read(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, uint64_t remote_offset, void* local_buf, uint32_t len) {
@@ -391,6 +502,68 @@ int roce_doorbell(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t value) 
 
 }  // namespace
 
+auto wki_roce_region_reset_received(uint32_t rkey) -> bool { return region_reset_received(rkey); }
+
+auto wki_roce_region_prepare_tagged_write(uint32_t rkey, uint16_t cookie) -> bool { return region_prepare_tagged_write(rkey, cookie); }
+
+auto wki_roce_region_wait_received(uint32_t rkey, uint32_t len, uint64_t timeout_us) -> bool {
+    if (len == 0) {
+        return region_is_registered(rkey);
+    }
+
+    uint64_t const DEADLINE = wki_now_us() + timeout_us;
+    uint32_t spins = 0;
+    while (wki_now_us() < DEADLINE) {
+        if (region_received_at_least(rkey, len)) {
+            return true;
+        }
+
+        // This wait can run on a VFS worker while the peer is streaming a large
+        // RDMA_WRITE burst. Drive RX inline like roce_rdma_read() so queued
+        // RoCE frames do not depend on unrelated scheduler progress.
+        napi_poll_all_pending();
+        backlog_drain_all_pending_inline();
+
+        if ((++spins & 0x3FU) == 0) {
+            ker::mod::sched::kern_yield();
+        } else {
+            asm volatile("pause" ::: "memory");
+        }
+    }
+
+    return region_received_at_least(rkey, len);
+}
+
+auto wki_roce_region_wait_tagged_write(uint32_t rkey, uint16_t cookie, uint32_t len, uint64_t timeout_us) -> bool {
+    if (len == 0) {
+        return region_is_registered(rkey);
+    }
+
+    uint64_t const DEADLINE = wki_now_us() + timeout_us;
+    uint32_t spins = 0;
+    while (wki_now_us() < DEADLINE) {
+        if (region_tagged_write_received_at_least(rkey, cookie, len)) {
+            return true;
+        }
+
+        napi_poll_all_pending();
+        backlog_drain_all_pending_inline();
+
+        if ((++spins & 0x3FU) == 0) {
+            ker::mod::sched::kern_yield();
+        } else {
+            asm volatile("pause" ::: "memory");
+        }
+    }
+
+    return region_tagged_write_received_at_least(rkey, cookie, len);
+}
+
+auto wki_roce_rdma_write_tagged(uint16_t neighbor_id, uint32_t rkey, uint64_t remote_offset, const void* local_buf, uint32_t len,
+                                uint16_t cookie) -> int {
+    return roce_rdma_write_impl(neighbor_id, rkey, remote_offset, local_buf, len, roce_write_tag(cookie));
+}
+
 // -----------------------------------------------------------------------------
 // RX entry point - called from ethernet.cpp for EtherType 0x88B8
 // -----------------------------------------------------------------------------
@@ -413,7 +586,7 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
 
     switch (static_cast<RoceOpcode>(hdr->opcode)) {
         case RoceOpcode::RDMA_WRITE: {
-            region_write(hdr->rkey, hdr->offset, payload, hdr->length, PAYLOAD_LEN);
+            region_write(hdr->rkey, hdr->offset, payload, hdr->length, PAYLOAD_LEN, hdr->doorbell_val);
             break;
         }
 
@@ -492,6 +665,10 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
             if (region_unregister_completed_temporary(VAL)) {
                 // Read-completion doorbell - deregister temporary region to
                 // unblock the roce_rdma_read spin-wait.
+                break;
+            }
+
+            if (region_mark_write_complete(VAL)) {
                 break;
             }
 

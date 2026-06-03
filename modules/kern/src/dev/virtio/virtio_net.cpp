@@ -60,6 +60,7 @@ size_t device_count = 0;
 
 constexpr uint8_t SINGLE_QUEUE_PAIRS = 1;
 constexpr uint8_t MIN_MQ_QUEUE_PAIRS = 2;
+constexpr uint8_t DEFAULT_MQ_QUEUE_PAIR_LIMIT = 4;
 constexpr uint8_t WKI_CONTROL_TX_RETRY_POLLS = 8;
 
 void init_queue_pair_contexts(VirtIONetDevice* dev) {
@@ -82,7 +83,8 @@ auto net_cpu_for_pair(uint64_t core_count, uint8_t pair) -> uint64_t {
 
 auto desired_queue_pairs(uint16_t device_max_pairs, uint64_t core_count) -> uint8_t {
     uint16_t const CPU_LIMIT = static_cast<uint16_t>(std::max<uint64_t>(core_count, 1U));
-    uint16_t const CAPPED = std::min({device_max_pairs, CPU_LIMIT, static_cast<uint16_t>(VIRTIO_NET_MAX_QUEUE_PAIRS)});
+    uint16_t const DEFAULT_LIMIT = std::min<uint16_t>(DEFAULT_MQ_QUEUE_PAIR_LIMIT, VIRTIO_NET_MAX_QUEUE_PAIRS);
+    uint16_t const CAPPED = std::min({device_max_pairs, CPU_LIMIT, DEFAULT_LIMIT});
     if (CAPPED < MIN_MQ_QUEUE_PAIRS) {
         return SINGLE_QUEUE_PAIRS;
     }
@@ -189,14 +191,14 @@ void fill_rx_queue_for(VirtIONetDevice* dev, Virtqueue* rxq) {
 
     size_t target_free = ker::net::pkt_pool_free_count();
     if (rxq->num_free > 0) {
-        target_free = std::max(target_free, static_cast<size_t>(rxq->num_free) + ker::net::PKT_POOL_TX_RESERVE);
+        target_free = std::max(target_free, static_cast<size_t>(rxq->num_free) + ker::net::PKT_POOL_RX_REFILL_RESERVE);
         ker::net::pkt_pool_ensure_free(target_free);
     }
 
     size_t const BEFORE_FREE = ker::net::pkt_pool_free_count();
     uint16_t filled = 0;
     while (rxq->num_free > 0) {
-        if (ker::net::pkt_pool_free_count() <= ker::net::PKT_POOL_TX_RESERVE) {
+        if (ker::net::pkt_pool_free_count() <= ker::net::PKT_POOL_RX_REFILL_RESERVE) {
             break;
         }
         auto* pkt = ker::net::pkt_alloc();
@@ -663,7 +665,9 @@ auto virtio_net_set_queue_cpu(ker::net::NetDevice* net, uint32_t pair_idx, uint6
         return -EINVAL;
     }
     auto& pair = dev->queue_pairs.at(pair_idx);
-    ker::net::napi_set_worker_cpu(&pair.napi, cpu);
+    if (!ker::net::napi_set_worker_cpu(&pair.napi, cpu)) {
+        return -EBUSY;
+    }
     if (dev->msix_enabled && pair.irq_vector != 0) {
         ker::dev::pci::pci_configure_msix_entry(dev->pci, pair_idx, pair.irq_vector, cpu);
     }

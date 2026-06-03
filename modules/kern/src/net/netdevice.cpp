@@ -14,7 +14,6 @@
 #include <string_view>
 
 #include "net/packet.hpp"
-#include "platform/asm/cpu.hpp"
 #include "platform/sys/spinlock.hpp"
 
 namespace ker::net {
@@ -225,15 +224,13 @@ void netdev_rx(NetDevice* dev, PacketBuffer* pkt) {
         return;
     }
 
-    // Steer to per-CPU handler thread for parallel protocol processing.
-    // Loopback is already handled above; only real NICs go through backlog.
+    // Steer real NIC packets to per-CPU handler threads for protocol processing.
+    // Keep NAPI workers focused on RX-ring draining; WKI/protocol handlers can
+    // transmit, allocate, or wake tasks, and should not run on the netpoll stack.
     if (backlog_ready()) {
         uint64_t const TARGET = backlog_flow_hash(pkt, ker::mod::smt::get_core_count());
-        // If the flow hashes to THIS CPU, process inline to avoid expensive reschedule
-        if (TARGET != ker::mod::cpu::current_cpu()) {
-            backlog_enqueue(TARGET, pkt);
-            return;
-        }
+        backlog_enqueue(TARGET, pkt);
+        return;
     }
 
     // Inline processing: same-CPU fast path, early boot, or single CPU.

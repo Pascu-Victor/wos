@@ -174,6 +174,8 @@ auto wki_channel_default_credits(uint16_t channel_id) -> uint16_t {
             return WKI_CREDITS_EVENT_BUS;
         case WKI_CHAN_RESOURCE:
             return WKI_CREDITS_RESOURCE;
+        case WKI_CHAN_IPC_DATA:
+            return WKI_CREDITS_IPC_DATA;
         default:
             return WKI_CREDITS_DYNAMIC;
     }

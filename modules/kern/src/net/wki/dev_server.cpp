@@ -19,6 +19,7 @@
 #include <net/wki/remote_ipc.hpp>
 #include <net/wki/remote_net.hpp>
 #include <net/wki/remote_vfs.hpp>
+#include <net/wki/transport_roce.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <net/wki/zone.hpp>
@@ -47,6 +48,13 @@ struct DeferredVfsOp {
     uint16_t op_id = 0;
     uint16_t req_data_len = 0;
     uint8_t* req_data = nullptr;
+};
+
+struct CachedVfsWriteResponse {
+    bool found = false;
+    uint16_t cookie = 0;
+    int16_t status = 0;
+    uint32_t bytes_written = 0;
 };
 
 // s_server_lock must be held by caller
@@ -103,6 +111,10 @@ auto find_net_device_by_resource_id(uint32_t resource_id) -> ker::net::NetDevice
 
 auto is_vfs_op(uint16_t op_id) -> bool { return op_id >= OP_VFS_OPEN && op_id <= OP_VFS_READ_BULK; }
 
+auto transport_is_roce(const WkiTransport* transport) -> bool {
+    return transport != nullptr && transport->name != nullptr && std::strcmp(transport->name, "wki-roce") == 0;
+}
+
 auto req_cookie_from_header(const WkiHeader* hdr) -> uint16_t {
     return hdr != nullptr ? static_cast<uint16_t>(hdr->seq_num & UINT16_MAX) : 0;
 }
@@ -114,6 +126,33 @@ void send_vfs_error_response(uint16_t dst_node, uint16_t channel_id, uint16_t op
     resp.data_len = 0;
     resp.reserved = req_cookie;
     wki_send(dst_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+}
+
+void send_cached_vfs_write_response(uint16_t dst_node, uint16_t channel_id, const CachedVfsWriteResponse& cached) {
+    std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(uint32_t)> resp_buf{};
+    auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf.data());
+    resp->op_id = OP_VFS_WRITE_RDMA;
+    resp->status = cached.status;
+    resp->reserved = cached.cookie;
+    if (cached.status >= 0) {
+        resp->data_len = sizeof(uint32_t);
+        std::memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &cached.bytes_written, sizeof(uint32_t));
+        wki_send(dst_node, channel_id, MsgType::DEV_OP_RESP, resp_buf.data(), static_cast<uint16_t>(resp_buf.size()));
+        return;
+    }
+
+    resp->data_len = 0;
+    wki_send(dst_node, channel_id, MsgType::DEV_OP_RESP, resp, sizeof(*resp));
+}
+
+void clear_vfs_write_active(uint16_t consumer_node, uint16_t channel_id, uint16_t req_cookie) {
+    uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+    DevServerBinding* binding = find_binding_by_channel(consumer_node, channel_id);
+    if (binding != nullptr && binding->resource_type == ResourceType::VFS && binding->vfs_rdma_write_active &&
+        binding->vfs_rdma_write_active_cookie == req_cookie) {
+        binding->vfs_rdma_write_active = false;
+    }
+    s_server_lock.unlock_irqrestore(SRV_FLAGS);
 }
 
 void run_deferred_vfs_op(void* arg) {
@@ -725,11 +764,10 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
             return;
         }
 
-        // The lower node ID is the channel allocator for the peer pair.
-        // VFS proxy traffic is metadata-heavy and latency-sensitive. Keep it on
-        // a low-latency channel; large data transfers still use the dedicated
-        // RDMA paths behind the proxy rather than relying on delayed-ACK
-        // throughput lanes.
+        // The lower node ID is the channel allocator for the peer pair. VFS
+        // write RPCs can spend milliseconds in the server after the control
+        // frame is received, so ACK them immediately instead of waiting for a
+        // response piggyback and tripping the sender retransmit timer.
         WkiChannel const* ch = reserve_attach_channel(hdr->src_node, req->requested_channel, PriorityClass::LATENCY);
         if (ch == nullptr) {
             ack.status = static_cast<uint8_t>(DevAttachStatus::BUSY);
@@ -753,7 +791,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
             WkiPeer const* peer = wki_peer_find(hdr->src_node);
             if (peer != nullptr && peer->rdma_transport != nullptr && peer->rdma_transport->rdma_register_region != nullptr) {
                 // Write receive buffer: consumer rdma_writes file data here.
-                constexpr uint32_t VFS_WRITE_BUF = 65536;
+                constexpr uint32_t VFS_WRITE_BUF = VFS_RDMA_WRITE_SIZE;
                 auto* wbuf = new (std::nothrow) uint8_t[VFS_WRITE_BUF];
                 if (wbuf != nullptr) {
                     uint32_t rkey = 0;
@@ -762,6 +800,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                     if (REG_RET == 0 && rkey != 0) {
                         binding.vfs_rdma_write_buf = wbuf;
                         binding.vfs_rdma_write_rkey = rkey;
+                        binding.vfs_rdma_write_transport = peer->rdma_transport;
                         ack.rdma_flags |= DEV_ATTACH_RDMA_VFS;
                         ack.blk_zone_id = rkey;  // carry server write-recv rkey to consumer
                     } else {
@@ -1020,9 +1059,13 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
 
     // Find binding by (src_node, channel_id) - pointer is stable (std::deque reference stability)
     DevServerBinding* binding = nullptr;
+    uint32_t vfs_write_rkey = 0;
     {
         uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
         binding = find_binding_by_channel(hdr->src_node, hdr->channel_id);
+        if (binding != nullptr && binding->resource_type == ResourceType::VFS) {
+            vfs_write_rkey = binding->vfs_rdma_write_rkey;
+        }
         s_server_lock.unlock_irqrestore(SRV_FLAGS);
     }
 
@@ -1068,7 +1111,49 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     // OP_VFS_READDIR_BATCH (0x0412), and OP_VFS_READ_BULK (0x0413) all
     // sit above OP_VFS_SEEK_END (0x040E).
     if (IS_VFS_OP) {
+        if (req->op_id == OP_VFS_WRITE_RDMA) {
+            uint16_t const REQ_COOKIE = req_cookie_from_header(hdr);
+            CachedVfsWriteResponse cached = {};
+            bool duplicate_active = false;
+            bool prepare_region = false;
+            {
+                uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+                DevServerBinding* vfs_binding = find_binding_by_channel(hdr->src_node, hdr->channel_id);
+                if (vfs_binding != nullptr && vfs_binding->resource_type == ResourceType::VFS) {
+                    if (vfs_binding->vfs_rdma_write_resp_valid && vfs_binding->vfs_rdma_write_resp_cookie == REQ_COOKIE) {
+                        cached.found = true;
+                        cached.cookie = vfs_binding->vfs_rdma_write_resp_cookie;
+                        cached.status = vfs_binding->vfs_rdma_write_resp_status;
+                        cached.bytes_written = vfs_binding->vfs_rdma_write_resp_bytes;
+                    } else if (vfs_binding->vfs_rdma_write_active && vfs_binding->vfs_rdma_write_active_cookie == REQ_COOKIE) {
+                        duplicate_active = true;
+                    } else {
+                        vfs_binding->vfs_rdma_write_active = true;
+                        vfs_binding->vfs_rdma_write_active_cookie = REQ_COOKIE;
+                        prepare_region = transport_is_roce(vfs_binding->vfs_rdma_write_transport);
+                        vfs_write_rkey = vfs_binding->vfs_rdma_write_rkey;
+                    }
+                }
+                s_server_lock.unlock_irqrestore(SRV_FLAGS);
+            }
+
+            if (cached.found) {
+                send_cached_vfs_write_response(hdr->src_node, hdr->channel_id, cached);
+                return;
+            }
+            if (duplicate_active) {
+                return;
+            }
+            if (prepare_region && !wki_roce_region_prepare_tagged_write(vfs_write_rkey, REQ_COOKIE)) {
+                clear_vfs_write_active(hdr->src_node, hdr->channel_id, REQ_COOKIE);
+                send_vfs_error_response(hdr->src_node, hdr->channel_id, req->op_id, -EIO, REQ_COOKIE);
+                return;
+            }
+        }
         if (!queue_vfs_op(hdr, req->op_id, req_data, REQ_DATA_LEN)) {
+            if (req->op_id == OP_VFS_WRITE_RDMA) {
+                clear_vfs_write_active(hdr->src_node, hdr->channel_id, req_cookie_from_header(hdr));
+            }
             send_vfs_error_response(hdr->src_node, hdr->channel_id, req->op_id, -ENOMEM, req_cookie_from_header(hdr));
         }
         return;
@@ -1664,16 +1749,39 @@ void wki_dev_server_process_pending_zones() {
 // -----------------------------------------------------------------------------
 
 auto wki_dev_server_get_vfs_write_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t* {
+    return wki_dev_server_get_vfs_write_region(consumer_node, channel_id).buf;
+}
+
+auto wki_dev_server_get_vfs_write_region(uint16_t consumer_node, uint16_t channel_id) -> VfsWriteRegionInfo {
     uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
     for (auto& b : g_bindings) {
         if (b.active && b.resource_type == ResourceType::VFS && b.consumer_node == consumer_node && b.assigned_channel == channel_id) {
-            uint8_t* buf = b.vfs_rdma_write_buf;
+            VfsWriteRegionInfo info = {};
+            info.buf = b.vfs_rdma_write_buf;
+            info.rkey = b.vfs_rdma_write_rkey;
+            info.transport = b.vfs_rdma_write_transport;
             s_server_lock.unlock_irqrestore(SRV_FLAGS);
-            return buf;
+            return info;
         }
     }
     s_server_lock.unlock_irqrestore(SRV_FLAGS);
-    return nullptr;
+    return {};
+}
+
+void wki_dev_server_complete_vfs_write(uint16_t consumer_node, uint16_t channel_id, uint16_t req_cookie, int16_t status,
+                                       uint32_t bytes_written) {
+    uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+    DevServerBinding* binding = find_binding_by_channel(consumer_node, channel_id);
+    if (binding != nullptr && binding->resource_type == ResourceType::VFS) {
+        if (binding->vfs_rdma_write_active && binding->vfs_rdma_write_active_cookie == req_cookie) {
+            binding->vfs_rdma_write_active = false;
+        }
+        binding->vfs_rdma_write_resp_valid = true;
+        binding->vfs_rdma_write_resp_cookie = req_cookie;
+        binding->vfs_rdma_write_resp_status = status;
+        binding->vfs_rdma_write_resp_bytes = bytes_written;
+    }
+    s_server_lock.unlock_irqrestore(SRV_FLAGS);
 }
 
 auto wki_dev_server_get_vfs_read_staging_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t* {

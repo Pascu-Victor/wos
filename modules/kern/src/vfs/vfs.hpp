@@ -120,6 +120,7 @@ auto vfs_ftruncate(int fd, off_t length) -> int;
 
 // Pipe
 auto vfs_pipe(int pipefd[2]) -> int;  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+auto vfs_pipe_reserve_capacity(File* file, size_t capacity) -> bool;
 
 struct LocalPipePerfSnapshot {
     uint64_t active_pipes{};
@@ -150,6 +151,7 @@ auto vfs_link(const char* oldpath, const char* newpath) -> int;
 auto vfs_wki_rule_add(const char* prefix, uint32_t route) -> int;
 auto vfs_wki_rule_get(uint32_t index, char* prefix_buf, size_t prefix_buf_size, uint32_t* route_out) -> int;
 auto vfs_wki_default_rule_get(uint32_t index, char* prefix_buf, size_t prefix_buf_size, uint32_t* route_out) -> int;
+auto vfs_wki_effective_route_for_path(const ker::mod::sched::task::Task* task, const char* path, uint32_t* route_out) -> int;
 auto vfs_wki_rule_clear() -> int;
 void vfs_wki_load_default_rules();
 

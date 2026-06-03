@@ -21,8 +21,9 @@ constexpr size_t VFS_EXPORT_NAME_LEN = 64;
 constexpr size_t VFS_READLINK_CACHE_ENTRIES = 32;
 constexpr size_t VFS_READLINK_CACHE_TEXT_MAX = 512;
 
-// Bounce buffer size for RDMA-backed VFS I/O (reads and writes)
+// Bounce buffer sizes for RDMA-backed VFS I/O.
 constexpr uint32_t VFS_RDMA_BOUNCE_SIZE = 65536;
+constexpr uint32_t VFS_RDMA_WRITE_SIZE = 1024 * 1024;
 
 // Bulk RDMA transfer buffer - used for large sequential reads to reduce round-trips.
 // Reads > VFS_RDMA_BOUNCE_SIZE are serviced through a single RDMA write into this
@@ -94,11 +95,12 @@ struct ProxyVfsState {
 
     // RDMA-backed I/O - populated at mount time when peer has RDMA transport.
     // Consumer registers rdma_bounce_buf for reads (server rdma_writes here).
-    // For writes, consumer rdma_writes into server's pre-registered receive region.
+    // For writes, consumer rdma_writes directly from caller/write-behind memory
+    // into the server's pre-registered receive region.
     bool rdma_capable = false;
     WkiTransport* rdma_transport = nullptr;
     uint32_t rdma_read_rkey = 0;                 // our bounce buffer's rkey (server writes file data here)
-    uint8_t* rdma_bounce_buf = nullptr;          // 64 KB bounce buffer for reads and write staging
+    uint8_t* rdma_bounce_buf = nullptr;          // 64 KB bounce buffer for reads
     uint32_t rdma_server_write_rkey = 0;         // server's receive region rkey (consumer writes here for writes)
     uint32_t rdma_server_read_staging_rkey = 0;  // server's read staging rkey (RoCE pull mode: client rdma_reads from here)
     uint32_t rdma_server_bulk_staging_rkey = 0;  // server's bulk staging rkey (RoCE bulk pull mode)
@@ -120,6 +122,7 @@ struct ProxyVfsState {
 // -----------------------------------------------------------------------------
 
 constexpr size_t VFS_CACHE_SIZE = 8192;
+constexpr size_t VFS_WRITE_BEHIND_SIZE = VFS_RDMA_WRITE_SIZE;
 
 struct ReadAheadCache {
     int64_t cached_offset = -1;  // Start offset of cached region (-1 = empty)
@@ -129,8 +132,8 @@ struct ReadAheadCache {
 
 struct WriteBehindBuffer {
     int64_t pending_offset = -1;  // Start offset of buffered writes (-1 = empty)
-    uint16_t pending_len = 0;     // Bytes pending in buffer
-    std::array<uint8_t, VFS_CACHE_SIZE> data = {};
+    uint32_t pending_len = 0;     // Bytes pending in buffer
+    std::array<uint8_t, VFS_WRITE_BEHIND_SIZE> data = {};
 };
 
 // -----------------------------------------------------------------------------

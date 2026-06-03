@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -32,15 +33,31 @@ def run_command(
     *,
     cwd: Path = ROOT,
     input_text: str | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        args,
-        cwd=cwd,
-        check=False,
-        text=True,
-        capture_output=True,
-        input=input_text,
-    )
+    try:
+        result = subprocess.run(
+            args,
+            cwd=cwd,
+            check=False,
+            text=True,
+            capture_output=True,
+            input=input_text,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        message = [f"command timed out after {timeout:.1f}s: {shlex.join(args)}"]
+        if exc.stdout:
+            message.append("stdout:")
+            message.append(str(exc.stdout).strip())
+        else:
+            message.append("stdout: (empty)")
+        if exc.stderr:
+            message.append("stderr:")
+            message.append(str(exc.stderr).strip())
+        else:
+            message.append("stderr: (empty)")
+        raise RuntimeError("\n".join(message)) from exc
     if result.returncode != 0:
         message = [f"command failed with exit code {result.returncode}: {shlex.join(args)}"]
         if result.stdout.strip():
@@ -55,6 +72,65 @@ def run_command(
             message.append("stderr: (empty)")
         raise RuntimeError("\n".join(message))
     return result
+
+
+def wos_remote_command(host: str, command: str, *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+    return run_command([str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, command], timeout=timeout)
+
+
+def wos_benchmark_pids(host: str, *, timeout: float) -> list[int]:
+    result = wos_remote_command(host, "ps aux 2>/dev/null || ps", timeout=timeout)
+    pids: list[int] = []
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("PID "):
+            continue
+        fields = stripped.split(maxsplit=4)
+        if len(fields) < 5 or not fields[0].isdigit():
+            continue
+        command = fields[4].split("\0", 1)[0].split()[0]
+        basename = os.path.basename(command)
+        if basename in {"renderbench", "testprog"}:
+            pids.append(int(fields[0]))
+    return pids
+
+
+def kill_wos_pids(host: str, pids: list[int], signal: str, *, timeout: float) -> None:
+    if not pids:
+        return
+    command = "kill -" + signal + " " + " ".join(str(pid) for pid in pids) + " 2>/dev/null || true"
+    wos_remote_command(host, command, timeout=timeout)
+
+
+def prepare_wos_hosts(args: argparse.Namespace, hosts: list[str]) -> None:
+    if args.skip_wos_cleanup:
+        return
+
+    failures: list[str] = []
+    for host in hosts:
+        try:
+            wos_remote_command(host, "hostname >/dev/null", timeout=args.wos_preflight_timeout)
+        except RuntimeError as exc:
+            failures.append(f"{host}: unreachable ({exc})")
+            continue
+
+        pids = wos_benchmark_pids(host, timeout=args.wos_preflight_timeout)
+        if not pids:
+            continue
+
+        print(f"[suite] cleanup {host}: stale benchmark pids {','.join(str(pid) for pid in pids)}")
+        kill_wos_pids(host, pids, "TERM", timeout=args.wos_preflight_timeout)
+        remaining = wos_benchmark_pids(host, timeout=args.wos_preflight_timeout)
+        remaining = [pid for pid in remaining if pid in pids]
+        if remaining:
+            kill_wos_pids(host, remaining, "KILL", timeout=args.wos_preflight_timeout)
+            remaining = wos_benchmark_pids(host, timeout=args.wos_preflight_timeout)
+            remaining = [pid for pid in remaining if pid in pids]
+        if remaining:
+            failures.append(f"{host}: stale benchmark pids did not exit: {','.join(str(pid) for pid in remaining)}")
+
+    if failures:
+        raise RuntimeError("WOS preflight failed:\n" + "\n".join(failures))
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -153,11 +229,15 @@ def run_wos_mandelbench(
     suite_dir: Path,
     suite_remote_root: str,
     host: str,
+    wos_hosts: list[str],
 ) -> dict[str, Any]:
+    prepare_wos_hosts(args, wos_hosts)
+
     step_name = "wos-mandelbench"
     step_dir = suite_dir / step_name
     step_dir.mkdir(parents=True, exist_ok=True)
     remote_work_dir = f"{suite_remote_root}/{step_name}"
+    total_workers = args.mandel_threads * args.num_vms
     remote_command = " ".join(
         [
             "mkdir -p",
@@ -172,9 +252,11 @@ def run_wos_mandelbench(
             "--max-iter",
             shlex.quote(str(args.mandel_max_iter)),
             "--threads",
-            shlex.quote(str(args.mandel_threads)),
+            shlex.quote(str(total_workers)),
             "--repeat",
             shlex.quote(str(args.mandel_repeat)),
+            "--nodes",
+            shlex.quote(",".join(wos_hosts)),
         ]
     )
     result = run_command([str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, remote_command])
@@ -193,10 +275,12 @@ def run_wos_mandelbench(
             "benchmark": "mandelbench",
             "os": "wos",
             "host": host,
+            "hosts": wos_hosts,
             "width": args.mandel_width,
             "height": args.mandel_height,
             "max_iteration": args.mandel_max_iter,
-            "threads": args.mandel_threads,
+            "threads": total_workers,
+            "threads_per_node": args.mandel_threads,
             "repeat": args.mandel_repeat,
         }
     )
@@ -219,6 +303,7 @@ def run_wos_mandelbench(
         "ok": True,
         "os": "wos",
         "host": host,
+        "hosts": wos_hosts,
         "command": [str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, remote_command],
         "result_file": relpath(step_dir / "result.json"),
         "artifacts": artifacts,
@@ -229,89 +314,55 @@ def run_linux_mandelbench(
     args: argparse.Namespace,
     suite_dir: Path,
     suite_remote_root: str,
-    host: str,
+    linux_hosts: list[str],
+    launcher: str,
 ) -> dict[str, Any]:
     step_name = "linux-mandelbench"
     step_dir = suite_dir / step_name
     step_dir.mkdir(parents=True, exist_ok=True)
+    output_path = step_dir / "result.json"
     remote_work_dir = f"{suite_remote_root}/{step_name}"
-    remote_src_dir = f"{remote_work_dir}/src/mandelbench"
+    total_workers = args.mandel_threads * len(linux_hosts)
 
-    source_files = [
-        "modules/testprog/src/mandelbench/config.hpp",
-        "modules/testprog/src/mandelbench/mandelbench.cpp",
-        "modules/testprog/src/mandelbench/mandelbench.hpp",
-        "modules/testprog/src/mandelbench/util.cpp",
-        "modules/testprog/src/mandelbench/util.hpp",
-        "modules/testprog/src/mandelbench/lodepng.cpp",
-        "modules/testprog/src/mandelbench/lodepng.hpp",
-        "modules/testprog/src/mandelbench/tinycthread.cpp",
-        "modules/testprog/src/mandelbench/tinycthread.hpp",
+    command = [
+        str(BENCH_SCRIPTS / "run_linux_mpi_benchmark.sh"),
+        "--launcher",
+        launcher,
+        "--hosts",
+        ",".join(linux_hosts),
+        "--benchmark",
+        "mandel",
+        "--router-ip",
+        args.router_ip,
+        "--host-ip",
+        args.host_ip,
+        "--width",
+        str(args.mandel_width),
+        "--height",
+        str(args.mandel_height),
+        "--max-iter",
+        str(args.mandel_max_iter),
+        "--repeat",
+        str(args.mandel_repeat),
+        "--threads",
+        str(args.mandel_threads),
+        "--np",
+        str(total_workers),
+        "--mandel-output-root",
+        remote_work_dir,
+        "--output",
+        str(output_path),
     ]
+    if args.linux_use_host_binary:
+        command += ["--use-host-binary"]
 
-    run_command(
-        [str(REMOTE_SCRIPTS / "linux_ssh.sh"), host, "mkdir", "-p", remote_src_dir]
-    )
-    for source in source_files:
-        run_command(
-            [
-                str(REMOTE_SCRIPTS / "linux_scp.sh"),
-                source,
-                f"{args.linux_user}@{host}:{remote_src_dir}/{Path(source).name}",
-            ]
-        )
-
-    build_script = f"""\
-set -euo pipefail
-work_dir={shlex.quote(remote_work_dir)}
-src_dir={shlex.quote(remote_src_dir)}
-mkdir -p "$work_dir"
-cat > "$work_dir/main_linux.cpp" <<'EOF'
-#include <vector>
-
-#include "mandelbench/mandelbench.hpp"
-#include "mandelbench/util.hpp"
-
-int main() {{
-    int const width = {args.mandel_width};
-    int const height = {args.mandel_height};
-    int const max_iteration = {args.mandel_max_iter};
-    int const threads = {args.mandel_threads};
-    int const repeat = {args.mandel_repeat};
-    std::vector<unsigned char> image(static_cast<size_t>(width) * static_cast<size_t>(height) * 4U);
-    std::vector<unsigned char> colormap(static_cast<size_t>(max_iteration + 1) * 3U);
-    init_colormap(max_iteration + 1, colormap.data());
-    mandelbench(width, height, max_iteration, threads, repeat, image.data(), colormap.data());
-    return 0;
-}}
-EOF
-if command -v clang++ >/dev/null 2>&1; then
-  CXX=clang++
-else
-  CXX=g++
-fi
-"$CXX" -O3 -march=native -flto -std=c++23 -Wall -Wextra -pipe -fno-omit-frame-pointer \\
-  -I"$work_dir/src" \\
-  "$src_dir/mandelbench.cpp" \\
-  "$src_dir/util.cpp" \\
-  "$src_dir/lodepng.cpp" \\
-  "$src_dir/tinycthread.cpp" \\
-  "$work_dir/main_linux.cpp" \\
-  -lpthread \\
-  -o "$work_dir/mandelbench_linux"
-cd "$work_dir"
-./mandelbench_linux
-"""
-    result = run_command(
-        [str(REMOTE_SCRIPTS / "linux_ssh.sh"), host, "bash", "-s", "--"],
-        input_text=build_script,
-    )
+    result = run_command(command)
     write_text(step_dir / "command.log", step_log_text(result))
 
     report_local = step_dir / "report.txt"
     fetch_remote_file(
         REMOTE_SCRIPTS / "linux_sftp_get.sh",
-        host,
+        launcher,
         f"{remote_work_dir}/report.txt",
         report_local,
     )
@@ -320,11 +371,13 @@ cd "$work_dir"
         {
             "benchmark": "mandelbench",
             "os": "linux",
-            "host": host,
+            "host": launcher,
+            "hosts": linux_hosts,
             "width": args.mandel_width,
             "height": args.mandel_height,
             "max_iteration": args.mandel_max_iter,
-            "threads": args.mandel_threads,
+            "threads": total_workers,
+            "threads_per_node": args.mandel_threads,
             "repeat": args.mandel_repeat,
         }
     )
@@ -332,11 +385,11 @@ cd "$work_dir"
 
     artifacts: list[str] = [relpath(report_local), relpath(step_dir / "result.json")]
     for index in range(args.mandel_repeat):
-        image_name = f"cpu_{index:02d}.png"
+        image_name = f"process_{index:02d}.png"
         local_image = step_dir / image_name
         fetch_remote_file(
             REMOTE_SCRIPTS / "linux_sftp_get.sh",
-            host,
+            launcher,
             f"{remote_work_dir}/{image_name}",
             local_image,
         )
@@ -346,8 +399,9 @@ cd "$work_dir"
         "name": step_name,
         "ok": True,
         "os": "linux",
-        "host": host,
-        "command": [str(REMOTE_SCRIPTS / "linux_ssh.sh"), host, "bash", "-s", "--"],
+        "host": launcher,
+        "hosts": linux_hosts,
+        "command": command,
         "result_file": relpath(step_dir / "result.json"),
         "artifacts": artifacts,
     }
@@ -358,9 +412,12 @@ def run_wos_renderbench(
     suite_dir: Path,
     suite_remote_root: str,
     host: str,
+    wos_hosts: list[str],
     case: RenderCase,
     placement: str,
 ) -> dict[str, Any]:
+    prepare_wos_hosts(args, wos_hosts)
+
     step_name = f"wos-render-{case.name}-{placement}"
     step_dir = suite_dir / step_name
     step_dir.mkdir(parents=True, exist_ok=True)
@@ -392,6 +449,8 @@ def run_wos_renderbench(
         command += ["--scene", case.wos_scene]
     if args.wos_render_threads is not None:
         command += ["--threads", str(args.wos_render_threads)]
+    if args.render_debug_constant_tile_us > 0:
+        command += ["--debug-constant-tile-us", str(args.render_debug_constant_tile_us)]
 
     result = run_command([str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, *command])
     write_text(step_dir / "command.log", step_log_text(result))
@@ -499,6 +558,8 @@ def run_linux_renderbench(
         command += ["--scene", case.linux_scene]
     if args.linux_render_threads is not None:
         command += ["--threads", str(args.linux_render_threads)]
+    if args.render_debug_constant_tile_us > 0:
+        command += ["--debug-constant-tile-us", str(args.render_debug_constant_tile_us)]
     if args.linux_use_host_binary:
         command += ["--use-host-binary"]
 
@@ -543,7 +604,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mandel-width", type=int, default=2000)
     parser.add_argument("--mandel-height", type=int, default=2000)
     parser.add_argument("--mandel-max-iter", type=int, default=5000)
-    parser.add_argument("--mandel-threads", type=int, default=8)
+    parser.add_argument("--mandel-threads", type=int, default=8, help="Mandelbench worker processes/ranks per node.")
     parser.add_argument("--mandel-repeat", type=int, default=5)
     parser.add_argument(
         "--render-placements",
@@ -558,11 +619,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duck-render-spp", type=int, default=1600)
     parser.add_argument("--render-max-depth", type=int, default=6)
     parser.add_argument("--render-tile-size", type=int, default=32)
+    parser.add_argument(
+        "--render-debug-constant-tile-us",
+        type=int,
+        default=0,
+        help="Use renderbench's constant-rate synthetic tile mode with this per-tile delay in microseconds.",
+    )
     parser.add_argument("--wos-duck-scene", default="/srv/Duck.glb")
     parser.add_argument("--linux-duck-scene", default="configs/drive/srv/Duck.glb")
     parser.add_argument("--wos-render-threads", type=int)
     parser.add_argument("--linux-render-threads", type=int)
     parser.add_argument("--linux-use-host-binary", action="store_true")
+    parser.add_argument(
+        "--skip-wos-cleanup",
+        action="store_true",
+        help="Do not preflight WOS hosts or kill stale WOS benchmark processes before WOS steps.",
+    )
+    parser.add_argument(
+        "--wos-preflight-timeout",
+        type=float,
+        default=8.0,
+        help="Seconds to wait for each WOS preflight or cleanup SSH command.",
+    )
     parser.add_argument("--skip-mandelbench", action="store_true")
     parser.add_argument("--skip-renderbench", action="store_true")
     return parser
@@ -578,6 +656,8 @@ def main() -> int:
         parser.error("--wos-launcher-index must be within the VM count")
     if not 0 <= args.linux_launcher_index < args.num_vms:
         parser.error("--linux-launcher-index must be within the VM count")
+    if args.render_debug_constant_tile_us < 0:
+        parser.error("--render-debug-constant-tile-us must be nonnegative")
 
     try:
         placements = render_placements(args.render_placements)
@@ -646,12 +726,12 @@ def main() -> int:
         if run_wos:
             run_step(
                 "wos-mandelbench",
-                lambda: run_wos_mandelbench(args, suite_dir, suite_remote_root, wos_launcher),
+                lambda: run_wos_mandelbench(args, suite_dir, suite_remote_root, wos_launcher, wos_hosts),
             )
         if run_linux:
             run_step(
                 "linux-mandelbench",
-                lambda: run_linux_mandelbench(args, suite_dir, suite_remote_root, linux_launcher),
+                lambda: run_linux_mandelbench(args, suite_dir, suite_remote_root, linux_hosts, linux_launcher),
             )
 
     if not args.skip_renderbench:
@@ -665,6 +745,7 @@ def main() -> int:
                             suite_dir,
                             suite_remote_root,
                             wos_launcher,
+                            wos_hosts,
                             case,
                             placement,
                         ),

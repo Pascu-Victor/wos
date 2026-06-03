@@ -76,6 +76,25 @@ struct DeferredGuard {
     }
 };
 
+void process_deferred_blocking_work() {
+    DeferredGuard deferred;
+    if (!deferred.try_enter()) {
+        return;
+    }
+
+    // Process deferred RDMA zone creations (must run outside NAPI poll context)
+    wki_dev_server_process_pending_zones();
+
+    // Process deferred VFS auto-mounts (must run outside NAPI poll context)
+    wki_remotable_process_pending_mounts();
+
+    // V2: Process deferred NET auto-attaches (must run outside NAPI poll context)
+    wki_remotable_process_pending_net_attaches();
+
+    // Poll RDMA block ring SQ entries on server bindings
+    wki_dev_server_poll_rings();
+}
+
 auto find_transport_for_peer(uint16_t dst_node) -> WkiTransport*;
 auto resolve_next_hop(uint16_t dst_node) -> uint16_t;
 
@@ -856,6 +875,8 @@ auto default_credits_for_channel(uint16_t channel_id) -> uint16_t {
             return WKI_CREDITS_EVENT_BUS;
         case WKI_CHAN_RESOURCE:
             return WKI_CREDITS_RESOURCE;
+        case WKI_CHAN_IPC_DATA:
+            return WKI_CREDITS_IPC_DATA;
         default:
             return WKI_CREDITS_DYNAMIC;
     }
@@ -871,19 +892,52 @@ auto reorder_limit_for_channel(uint16_t channel_id) -> uint16_t {
             return WKI_REORDER_EVENT_BUS;
         case WKI_CHAN_RESOURCE:
             return WKI_REORDER_RESOURCE;
+        case WKI_CHAN_IPC_DATA:
+            return WKI_REORDER_IPC_DATA;
         default:
             return WKI_REORDER_DYNAMIC;
     }
 }
 
 auto default_priority_for_channel(uint16_t channel_id) -> PriorityClass {
+    // IPC_DATA carries jumbo pipe/socket payloads. Keep it on the throughput
+    // ACK policy so bulk receive streams coalesce ACKs instead of emitting an
+    // immediate pure ACK for every data frame.
     return (channel_id <= WKI_CHAN_RESOURCE) ? PriorityClass::LATENCY : PriorityClass::THROUGHPUT;
 }
+
+auto channel_allows_initial_resync(uint16_t channel_id) -> bool { return channel_id != WKI_CHAN_IPC_DATA; }
 
 void refresh_rx_credits(WkiChannel* ch) {
     uint16_t const MAX_CREDITS = default_credits_for_channel(ch->channel_id);
     uint32_t const USED = std::min<uint32_t>(ch->reorder_count, MAX_CREDITS);
     ch->rx_credits = static_cast<uint16_t>(MAX_CREDITS - USED);
+}
+
+auto drop_stale_reorder_entries_locked(WkiChannel* ch) -> bool {
+    bool dropped = false;
+    while (ch->reorder_head != nullptr && seq_before(ch->reorder_head->seq, ch->rx_seq)) {
+        WkiReorderEntry* stale = ch->reorder_head;
+        ch->reorder_head = stale->next;
+        if (ch->reorder_count != 0) {
+            ch->reorder_count--;
+        }
+        delete[] stale->data;
+        delete stale;
+        dropped = true;
+    }
+
+    if (dropped) {
+        refresh_rx_credits(ch);
+    }
+    return dropped;
+}
+
+void refresh_tx_credits_from_advertisement_locked(WkiChannel* ch, uint8_t advertised_credits) {
+    uint16_t const MAX_CREDITS = default_credits_for_channel(ch->channel_id);
+    uint32_t const ADVERTISED = std::min<uint32_t>(advertised_credits, MAX_CREDITS);
+    uint32_t const IN_FLIGHT = seq_after(ch->tx_seq, ch->tx_ack) ? ch->tx_seq - ch->tx_ack : 0;
+    ch->tx_credits = static_cast<uint16_t>(ADVERTISED > IN_FLIGHT ? ADVERTISED - IN_FLIGHT : 0);
 }
 
 struct AckSnapshot {
@@ -931,6 +985,36 @@ auto transmit_ack_snapshot(const AckSnapshot& ack) -> int {
         mark_peer_tx_progress(ack.peer);
     }
     return RET;
+}
+
+void complete_ack_transmit_locked(WkiChannel* ch, uint32_t ack_num, int tx_ret, bool& notify_timer) {
+    if (ch == nullptr || !ch->active || !ch->ack_pending || ch->rx_ack_pending != ack_num) {
+        return;
+    }
+
+    uint64_t const NOW_US = wki_now_us();
+    if (tx_ret >= 0) {
+        if (ch->reorder_count == 0) {
+            ch->ack_pending = false;
+        } else {
+            // A reorder gap means the peer may be waiting for our latest
+            // cumulative ACK to advance its retransmit head. Pure ACKs are not
+            // themselves reliable, so keep repeating the ACK until the buffered
+            // future packets drain.
+            ch->ack_pending = true;
+            ch->ack_pending_since_us = NOW_US;
+            notify_timer = true;
+        }
+    } else {
+        ch->ack_pending_since_us = NOW_US;
+        notify_timer = true;
+    }
+}
+
+void apply_ack_transmit_result(WkiChannel* ch, const AckSnapshot& ack, int tx_ret, bool& notify_timer) {
+    ch->lock.lock();
+    complete_ack_transmit_locked(ch, ack.ack_num, tx_ret, notify_timer);
+    ch->lock.unlock();
 }
 
 }  // namespace
@@ -1021,7 +1105,7 @@ auto wki_channel_alloc(uint16_t peer_node, PriorityClass priority) -> WkiChannel
 
     // Find the first free dynamic channel ID for this peer via per-peer array.
     uint16_t next_id = WKI_MAX_CHANNELS;
-    for (uint16_t i = WKI_CHAN_DYNAMIC_BASE; i < WKI_MAX_CHANNELS; i++) {
+    for (uint16_t i = WKI_CHAN_DYNAMIC_BASE; i < WKI_CHAN_DYNAMIC_RESERVED_BASE; i++) {
         WkiChannel const* existing = peer->channels.at(i);
         if (existing == nullptr || !existing->active) {
             if (existing != nullptr && !existing->active) {
@@ -1045,7 +1129,7 @@ auto wki_channel_alloc(uint16_t peer_node, PriorityClass priority) -> WkiChannel
 auto wki_channel_reserve(uint16_t peer_node, uint16_t channel_id, PriorityClass priority) -> WkiChannel* {
     channel_pool_init();
 
-    if (channel_id < WKI_CHAN_DYNAMIC_BASE || channel_id >= WKI_MAX_CHANNELS) {
+    if (channel_id < WKI_CHAN_DYNAMIC_BASE || channel_id >= WKI_CHAN_DYNAMIC_RESERVED_BASE) {
         return nullptr;
     }
 
@@ -1414,11 +1498,15 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
 
     perf_record_transport_begin(dst_node, channel_id, TRACE_CORRELATION, payload_len, TRACE_CALLSITE);
 
+    // A prior pure ACK may have been dropped; carry the latest cumulative ACK
+    // on every later reliable data frame once this channel has received data.
+    bool const HAS_CUMULATIVE_ACK = ch->rx_seq != 0;
+
     uint8_t flags = 0;
     if (ch->priority == PriorityClass::LATENCY) {
         flags |= WKI_FLAG_PRIORITY;
     }
-    if (ch->ack_pending) {
+    if (ch->ack_pending || HAS_CUMULATIVE_ACK) {
         flags |= WKI_FLAG_ACK_PRESENT;
     }
 
@@ -1429,7 +1517,7 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
     hdr->dst_node = dst_node;
     hdr->channel_id = channel_id;
     hdr->seq_num = ch->tx_seq;
-    hdr->ack_num = ch->ack_pending ? ch->rx_ack_pending : 0;
+    hdr->ack_num = ((flags & WKI_FLAG_ACK_PRESENT) != 0) ? ch->rx_ack_pending : 0;
     hdr->payload_len = payload_len;
     hdr->credits = static_cast<uint8_t>(ch->rx_credits > 255 ? 255 : ch->rx_credits);
     hdr->hop_ttl = WKI_DEFAULT_TTL;
@@ -1682,6 +1770,13 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
         return;
     }
 
+    uint16_t const PAYLOAD_LEN = hdr->payload_len;
+
+    // Sanity: payload_len must fit in the frame before checksum reads it.
+    if (WKI_HEADER_SIZE + PAYLOAD_LEN > len) {
+        return;
+    }
+
     // Checksum verification (if non-zero)
     if (hdr->checksum != 0) {
         // Compute CRC32 over header with checksum field zeroed, then payload
@@ -1697,12 +1792,6 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
     }
 
     const auto* payload = static_cast<const uint8_t*>(data) + WKI_HEADER_SIZE;
-    uint16_t const PAYLOAD_LEN = hdr->payload_len;
-
-    // Sanity: payload_len must fit in the frame
-    if (WKI_HEADER_SIZE + PAYLOAD_LEN > len) {
-        return;
-    }
 
     // Any validated inbound WKI frame proves peer liveness. Do this before
     // channel ordering so out-of-order data during heavy load cannot be
@@ -1756,9 +1845,10 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
             ch->lock.lock();
 
             // Advance tx_ack - release ACKed retransmit entries
-            if (seq_after(hdr->ack_num + 1, ch->tx_ack)) {
+            uint32_t const ACK_NEXT = hdr->ack_num + 1;
+            if (seq_after(ACK_NEXT, ch->tx_ack)) {
                 ack_progress = true;
-                ch->tx_ack = hdr->ack_num + 1;
+                ch->tx_ack = seq_after(ACK_NEXT, ch->tx_seq) ? ch->tx_seq : ACK_NEXT;
                 ch->last_dup_ack = hdr->ack_num;
                 ch->dup_ack_count = 0;
 
@@ -1825,10 +1915,11 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 ch->dup_ack_count = 0;
             }
 
-            // The wire field advertises the peer's current receive budget for
-            // this channel. Treat it as an absolute window, not a delta.
-            uint16_t const MAX_CREDITS = default_credits_for_channel(ch->channel_id);
-            ch->tx_credits = static_cast<uint16_t>(std::min<uint16_t>(hdr->credits, MAX_CREDITS));
+            // The wire field advertises the peer's current receive window.
+            // Keep our send allowance to the advertised free slots minus the
+            // packets still in flight; otherwise each ACK can reset the window
+            // to full and overflow the peer's reorder buffer after one loss.
+            refresh_tx_credits_from_advertisement_locked(ch, hdr->credits);
 
             ch->lock.unlock();
 
@@ -1951,7 +2042,8 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
             // Reconnect resync: if this channel was just recreated locally (all-zero RX state)
             // but the peer continued its sequence space, adopt the peer's current seq baseline.
             // This avoids getting stuck buffering every frame as permanently out-of-order.
-            if (ch->rx_seq == 0 && ch->bytes_received == 0 && ch->reorder_head == nullptr && hdr->seq_num != 0) {
+            if (channel_allows_initial_resync(hdr->channel_id) && ch->rx_seq == 0 && ch->bytes_received == 0 &&
+                ch->reorder_head == nullptr && hdr->seq_num != 0) {
                 ker::mod::dbg::log("[WKI] Resyncing channel seq: src=0x%04x ch=%u local_rx_seq=0 remote_seq=%u", hdr->src_node,
                                    hdr->channel_id, hdr->seq_num);
                 ch->rx_seq = hdr->seq_num;
@@ -1965,14 +2057,30 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 ch->ack_pending_since_us = wki_now_us();
                 ch->bytes_received += PAYLOAD_LEN;
 
+                bool notify_timer = false;
+                AckSnapshot early_ack = {};
+                bool const EARLY_ACK = ch->priority == PriorityClass::LATENCY;
+                if (EARLY_ACK) {
+                    early_ack = capture_ack_snapshot_locked(ch);
+                }
+
                 ch->lock.unlock();
                 mark_peer_rx_progress(hdr->src_node);
+
+                if (EARLY_ACK) {
+                    int const ACK_RET = transmit_ack_snapshot(early_ack);
+                    apply_ack_transmit_result(ch, early_ack, ACK_RET, notify_timer);
+                }
 
                 // Dispatch to handler via shared helper
                 wki_dispatch_reliable_msg(msg, hdr, payload, PAYLOAD_LEN);
 
                 // Deliver any buffered reorder entries that are now in-order
                 ch->lock.lock();
+                if (drop_stale_reorder_entries_locked(ch)) {
+                    ch->ack_pending = true;
+                    ch->ack_pending_since_us = 0;
+                }
                 while ((ch->reorder_head != nullptr) && ch->reorder_head->seq == ch->rx_seq) {
                     WkiReorderEntry* ro = ch->reorder_head;
                     ch->reorder_head = ro->next;
@@ -1980,6 +2088,8 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     refresh_rx_credits(ch);
                     ch->rx_seq++;
                     ch->rx_ack_pending = ro->seq;
+                    ch->ack_pending = true;
+                    ch->ack_pending_since_us = wki_now_us();
                     ch->bytes_received += ro->len;
 
                     WkiHeader const RO_HDR = ro->hdr;
@@ -1987,7 +2097,18 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     uint8_t* ro_data = ro->data;
                     uint16_t const RO_LEN = ro->len;
 
+                    AckSnapshot ro_early_ack = {};
+                    bool const RO_EARLY_ACK = ch->priority == PriorityClass::LATENCY;
+                    if (RO_EARLY_ACK) {
+                        ro_early_ack = capture_ack_snapshot_locked(ch);
+                    }
+
                     ch->lock.unlock();
+
+                    if (RO_EARLY_ACK) {
+                        int const ACK_RET = transmit_ack_snapshot(ro_early_ack);
+                        apply_ack_transmit_result(ch, ro_early_ack, ACK_RET, notify_timer);
+                    }
 
                     // Re-dispatch reordered message through the same handler switch
                     wki_dispatch_reliable_msg(RO_MSG, &RO_HDR, ro_data, RO_LEN);
@@ -2001,7 +2122,6 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 // piggybacks an ACK, but the ACK of the *response itself* has
                 // no piggyback vehicle and would otherwise stall up to 10ms.
                 bool const IMM_ACK = (ch->priority == PriorityClass::LATENCY && ch->ack_pending);
-                bool notify_timer = false;
                 WkiHeader imm_ack_hdr = {};
                 uint16_t imm_ack_peer = 0;
                 uint32_t imm_ack_num = 0;
@@ -2038,14 +2158,9 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     }
 
                     ch->lock.lock();
-                    if (ch->active && ch->ack_pending && ch->rx_ack_pending == imm_ack_num) {
-                        if (tx_ret >= 0) {
-                            ch->ack_pending = false;
-                            mark_peer_tx_progress(imm_ack_peer);
-                        } else {
-                            ch->ack_pending_since_us = wki_now_us();
-                            notify_timer = true;
-                        }
+                    complete_ack_transmit_locked(ch, imm_ack_num, tx_ret, notify_timer);
+                    if (tx_ret >= 0) {
+                        mark_peer_tx_progress(imm_ack_peer);
                     }
                     ch->lock.unlock();
                 }
@@ -2057,6 +2172,10 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
             } else if (seq_after(hdr->seq_num, ch->rx_seq)) {
                 // Out-of-order: buffer in reorder queue, send dup ACK
                 AckSnapshot dup_ack = {};
+                if (drop_stale_reorder_entries_locked(ch)) {
+                    ch->ack_pending = true;
+                    ch->ack_pending_since_us = 0;
+                }
                 bool already_buffered = false;
                 for (WkiReorderEntry const* cur = ch->reorder_head; cur != nullptr; cur = cur->next) {
                     if (cur->seq == hdr->seq_num) {
@@ -2112,10 +2231,12 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 int const ACK_RET = transmit_ack_snapshot(dup_ack);
                 if (ACK_RET >= 0) {
                     ch->lock.lock();
-                    if (ch->active && ch->ack_pending && ch->rx_ack_pending == dup_ack.ack_num) {
-                        ch->ack_pending = false;
-                    }
+                    bool notify_timer = false;
+                    complete_ack_transmit_locked(ch, dup_ack.ack_num, ACK_RET, notify_timer);
                     ch->lock.unlock();
+                    if (notify_timer) {
+                        wki_timer_notify();
+                    }
                 } else {
                     wki_timer_notify();
                 }
@@ -2124,6 +2245,10 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 // queue gets drained.  Without this the sender never receives the
                 // ACK and keeps retransmitting the same stale packet.
                 AckSnapshot dup_ack = {};
+                if (drop_stale_reorder_entries_locked(ch)) {
+                    ch->ack_pending = true;
+                    ch->ack_pending_since_us = 0;
+                }
                 ch->ack_pending = true;
                 ch->ack_pending_since_us = 0;  // duplicate: ACK immediately
                 dup_ack = capture_ack_snapshot_locked(ch);
@@ -2131,10 +2256,12 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 int const ACK_RET = transmit_ack_snapshot(dup_ack);
                 if (ACK_RET >= 0) {
                     ch->lock.lock();
-                    if (ch->active && ch->ack_pending && ch->rx_ack_pending == dup_ack.ack_num) {
-                        ch->ack_pending = false;
-                    }
+                    bool notify_timer = false;
+                    complete_ack_transmit_locked(ch, dup_ack.ack_num, ACK_RET, notify_timer);
                     ch->lock.unlock();
+                    if (notify_timer) {
+                        wki_timer_notify();
+                    }
                 } else {
                     wki_timer_notify();
                 }
@@ -2167,6 +2294,10 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
     bool do_ack = false;
 
     ch->lock.lock();
+    if (drop_stale_reorder_entries_locked(ch)) {
+        ch->ack_pending = true;
+        ch->ack_pending_since_us = 0;
+    }
 
     if ((ch->retransmit_head != nullptr) && now_us >= ch->retransmit_deadline) {
         WkiRetransmitEntry const* rt = ch->retransmit_head;
@@ -2241,15 +2372,15 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
             }
         }
         ch->lock.lock();
-        if (ch->active && ch->ack_pending && ch->rx_ack_pending == ack_num) {
-            if (tx_ret >= 0) {
-                ch->ack_pending = false;
-                mark_peer_tx_progress(ack_peer);
-            } else {
-                ch->ack_pending_since_us = now_us;
-            }
+        bool notify_timer = false;
+        complete_ack_transmit_locked(ch, ack_num, tx_ret, notify_timer);
+        if (tx_ret >= 0) {
+            mark_peer_tx_progress(ack_peer);
         }
         ch->lock.unlock();
+        if (notify_timer) {
+            wki_timer_notify();
+        }
     }
 }
 
@@ -2295,6 +2426,10 @@ void wki_timer_tick(uint64_t now_us) {
         bool do_ack = false;
 
         ch->lock.lock();
+        if (drop_stale_reorder_entries_locked(ch)) {
+            ch->ack_pending = true;
+            ch->ack_pending_since_us = 0;
+        }
 
         // Retransmit timeout
         if ((ch->retransmit_head != nullptr) && now_us >= ch->retransmit_deadline) {
@@ -2380,39 +2515,21 @@ void wki_timer_tick(uint64_t now_us) {
             }
 
             ch->lock.lock();
-            if (ch->active && ch->ack_pending && ch->rx_ack_pending == ack_num) {
-                if (tx_ret >= 0) {
-                    ch->ack_pending = false;
-                    mark_peer_tx_progress(ack_peer);
-                } else {
-                    ch->ack_pending_since_us = now_us;
-                }
+            bool notify_timer = false;
+            complete_ack_transmit_locked(ch, ack_num, tx_ret, notify_timer);
+            if (tx_ret >= 0) {
+                mark_peer_tx_progress(ack_peer);
             }
             ch->lock.unlock();
+            if (notify_timer) {
+                wki_timer_notify();
+            }
         }
     }
 
-    // Heartbeat checks are done in peer.cpp's wki_peer_timer_tick()
+    // Heartbeat checks are done in peer.cpp's wki_peer_timer_tick().
 
-    // Process deferred blocking work (mounts, attaches, zone creates).
-    // These operations can call wki_wait_for_op() which re-enters
-    // wki_spin_yield() -> wki_timer_tick().  The RAII guard prevents the
-    // deferred work section from running recursively and ensures the flag
-    // is reset even if a deferred function crashes.
-    DeferredGuard deferred;
-    if (deferred.try_enter()) {
-        // Process deferred RDMA zone creations (must run outside NAPI poll context)
-        wki_dev_server_process_pending_zones();
-
-        // Process deferred VFS auto-mounts (must run outside NAPI poll context)
-        wki_remotable_process_pending_mounts();
-
-        // V2: Process deferred NET auto-attaches (must run outside NAPI poll context)
-        wki_remotable_process_pending_net_attaches();
-
-        // Poll RDMA block ring SQ entries on server bindings
-        wki_dev_server_poll_rings();
-    }
+    process_deferred_blocking_work();
 }
 
 }  // namespace ker::net::wki

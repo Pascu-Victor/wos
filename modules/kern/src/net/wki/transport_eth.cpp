@@ -223,8 +223,8 @@ int eth_wki_tx_pkt(WkiTransport* self, uint16_t neighbor_id, net::PacketBuffer* 
     bool const CONTROL_FRAME = is_wki_control_reserve_frame(pkt->data, static_cast<uint16_t>(pkt->len));
     auto* priv = static_cast<EthTransportPrivate*>(self->private_data);
     if ((priv == nullptr) || (priv->netdev == nullptr)) {
-        pkt_free(pkt);
         note_wki_tx_failure(CONTROL_FRAME);
+        pkt_free(pkt);
         return -1;
     }
 
@@ -315,6 +315,36 @@ auto get_or_create_eth_transport(net::NetDevice* dev) -> WkiTransport* {
     return &s_eth_transport;
 }
 
+auto eth_rx_needs_peer_contact_update(WkiTransport* transport, const WkiHeader* hdr, const proto::MacAddress& src_mac) -> bool {
+    if (transport == nullptr || hdr == nullptr) {
+        return false;
+    }
+    if (hdr->src_node == WKI_NODE_INVALID || hdr->src_node == WKI_NODE_BROADCAST || hdr->src_node == g_wki.my_node_id) {
+        return false;
+    }
+    if (wki_version(hdr->version_flags) != WKI_VERSION) {
+        return false;
+    }
+
+    auto const MSG = static_cast<MsgType>(hdr->msg_type);
+    if (MSG == MsgType::HELLO || MSG == MsgType::HELLO_ACK) {
+        return false;
+    }
+
+    WkiPeer const* peer = wki_peer_find(hdr->src_node);
+    if (peer == nullptr || peer->state != PeerState::CONNECTED || !peer->is_direct) {
+        return true;
+    }
+    if (peer->mac != src_mac || peer->transport == nullptr || peer->rdma_transport == nullptr) {
+        return true;
+    }
+
+    // Preserve the existing transport preference rule from wki_peer_note_rx_contact():
+    // RDMA-capable transports upgrade; otherwise refresh when both old and new
+    // transports are non-RDMA so replies follow the actual ingress NIC.
+    return peer->transport != transport && (transport->rdma_capable || !peer->transport->rdma_capable);
+}
+
 }  // namespace
 
 void wki_eth_rx(net::NetDevice* dev, net::PacketBuffer* pkt) {
@@ -339,7 +369,7 @@ void wki_eth_rx(net::NetDevice* dev, net::PacketBuffer* pkt) {
     auto* priv = static_cast<EthTransportPrivate*>(transport->private_data);
     const auto* hdr = reinterpret_cast<const WkiHeader*>(pkt->data);
 
-    if (hdr->src_node != WKI_NODE_INVALID && hdr->src_node != WKI_NODE_BROADCAST && hdr->src_node != g_wki.my_node_id) {
+    if (eth_rx_needs_peer_contact_update(transport, hdr, pkt->src_mac)) {
         wki_peer_note_rx_contact(transport, hdr->src_node, pkt->src_mac);
     }
 

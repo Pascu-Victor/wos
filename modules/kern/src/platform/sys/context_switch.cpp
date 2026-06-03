@@ -315,13 +315,16 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
         next_task->context.frame.rsp = next_task->context.syscall_kernel_stack;
     }
 
+    // The live GPRegs block sits immediately before the live InterruptFrame on
+    // the timer stack. Copy registers first so the return frame is the last
+    // thing written before validation and return assembly consumes it.
+    gpr = next_task->context.regs;
+
     frame.rip = next_task->context.frame.rip;
     frame.rsp = next_task->context.frame.rsp;
     frame.cs = next_task->context.frame.cs;
     frame.ss = next_task->context.frame.ss;
     frame.flags = next_task->context.frame.flags;
-
-    gpr = next_task->context.regs;
     validate_kernel_frame(frame, next_task, "switchTo");
 
     // Validate context before restoring - catch corruption before it causes a crash

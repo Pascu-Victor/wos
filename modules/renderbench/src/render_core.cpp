@@ -1,6 +1,7 @@
 #include "render_core.hpp"
 
 #include <sys/stat.h>
+#include <time.h>  // NOLINT(modernize-deprecated-headers): POSIX nanosleep is declared here.
 #include <unistd.h>
 
 #include <algorithm>
@@ -2097,6 +2098,10 @@ auto placement_name(Placement placement) -> const char* {
     return placement == Placement::NodeThreads ? "node-threads" : "process-per-core";
 }
 
+auto debug_render_mode_name(const Options& options) -> const char* {
+    return options.debug_constant_tile_us > 0 ? "constant-tile" : "pathtraced";
+}
+
 namespace {
 
 auto is_option_token(const char* value) -> bool { return value != nullptr && std::string_view(value).starts_with("--"); }
@@ -2137,7 +2142,7 @@ void print_usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --scene scene.glb --backend ipc|mpi --placement node-threads|process-per-core "
                  "--width N --height N --spp N --max-depth N --tile-size N --output-root PATH [--threads N] "
-                 "[--debug-edge-colors]\n",
+                 "[--debug-edge-colors] [--debug-constant-tile-us N]\n",
                  argv0 != nullptr ? argv0 : "renderbench");
 }
 
@@ -2222,7 +2227,11 @@ auto parse_options(int argc, char* const* argv, Backend default_backend, Options
             options.run_id = VALUE;
         } else if (ARG == "--debug-edge-colors") {
             options.debug_edge_colors = true;
-        } else if (ARG == "--tracebench-worker") {
+        } else if (ARG == "--debug-constant-tile-us") {
+            if (!parse_required_int(0, options.debug_constant_tile_us)) {
+                return ParseStatus::Error;
+            }
+        } else if (ARG == "--tracebench-worker" || ARG == "--worker-command-stream") {
             continue;
         } else if (ARG == "--worker-id") {
             int ignored = 0;
@@ -2356,7 +2365,16 @@ auto load_scene(const std::string& path) -> std::shared_ptr<Scene> {
     return nullptr;
 }
 
-void render_tile(const Scene& scene, FilmView film, const Options& options, const Tile& tile, uint64_t seed) {
+namespace {
+
+auto tile_payload_float_count(const Tile& tile) -> size_t {
+    int const WIDTH = std::max(0, tile.x1 - tile.x0);
+    int const HEIGHT = std::max(0, tile.y1 - tile.y0);
+    return static_cast<size_t>(WIDTH) * static_cast<size_t>(HEIGHT) * 3U;
+}
+
+template <typename StorePixel>
+void render_tile_pixels(const Scene& scene, const Options& options, const Tile& tile, uint64_t seed, StorePixel store_pixel) {
     float const ASPECT = static_cast<float>(options.width) / static_cast<float>(options.height);
     float const SCALE = std::tan((scene.camera.vfov_degrees * PI / 180.0F) * 0.5F);
     for (int y = tile.y0; y < tile.y1; ++y) {
@@ -2372,9 +2390,75 @@ void render_tile(const Scene& scene, FilmView film, const Options& options, cons
                 color += trace_ray(scene, ray, options, rng);
             }
             color = color / static_cast<float>(options.spp);
-            film.set_pixel(x, y, color.x, color.y, color.z);
+            store_pixel(x, y, color);
         }
     }
+}
+
+void sleep_debug_constant_tile(int delay_us) {
+    if (delay_us <= 0) {
+        return;
+    }
+
+    timespec remaining{
+        .tv_sec = delay_us / 1'000'000,
+        .tv_nsec = static_cast<long>(delay_us % 1'000'000) * 1000L,
+    };
+    while (::nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {
+    }
+}
+
+auto debug_constant_tile_color(const Tile& tile) -> Vec3 {
+    uint32_t hash = static_cast<uint32_t>(tile.index) * 0x9E3779B1U;
+    hash ^= hash >> 16U;
+    return {
+        .x = 0.15F + (static_cast<float>((hash >> 0U) & 0x7FU) / 255.0F),
+        .y = 0.18F + (static_cast<float>((hash >> 8U) & 0x7FU) / 255.0F),
+        .z = 0.20F + (static_cast<float>((hash >> 16U) & 0x7FU) / 255.0F),
+    };
+}
+
+template <typename StorePixel>
+void render_debug_constant_tile_pixels(const Options& options, const Tile& tile, StorePixel store_pixel) {
+    sleep_debug_constant_tile(options.debug_constant_tile_us);
+    Vec3 const COLOR = debug_constant_tile_color(tile);
+    for (int y = tile.y0; y < tile.y1; ++y) {
+        for (int x = tile.x0; x < tile.x1; ++x) {
+            store_pixel(x, y, COLOR);
+        }
+    }
+}
+
+}  // namespace
+
+void render_tile(const Scene& scene, FilmView film, const Options& options, const Tile& tile, uint64_t seed) {
+    auto store_pixel = [&](int x, int y, Vec3 color) { film.set_pixel(x, y, color.x, color.y, color.z); };
+    if (options.debug_constant_tile_us > 0) {
+        render_debug_constant_tile_pixels(options, tile, store_pixel);
+    } else {
+        render_tile_pixels(scene, options, tile, seed, store_pixel);
+    }
+}
+
+auto render_tile_payload(const Scene& scene, std::span<float> payload, const Options& options, const Tile& tile, uint64_t seed) -> bool {
+    size_t const REQUIRED_FLOATS = tile_payload_float_count(tile);
+    if (payload.size() < REQUIRED_FLOATS) {
+        return false;
+    }
+
+    auto* out = payload.data();
+    auto const* const OUT_END = out + REQUIRED_FLOATS;
+    auto store_pixel = [&](int, int, Vec3 color) {
+        *out++ = color.x;
+        *out++ = color.y;
+        *out++ = color.z;
+    };
+    if (options.debug_constant_tile_us > 0) {
+        render_debug_constant_tile_pixels(options, tile, store_pixel);
+    } else {
+        render_tile_pixels(scene, options, tile, seed, store_pixel);
+    }
+    return out == OUT_END;
 }
 
 auto monotonic_seconds() -> double {
@@ -2406,6 +2490,8 @@ auto write_status(const Options& options, const Progress& progress) -> bool {
         << "  \"max_depth\": " << options.max_depth << ",\n"
         << "  \"tile_size\": " << options.tile_size << ",\n"
         << "  \"debug_edge_colors\": " << (options.debug_edge_colors ? "true" : "false") << ",\n"
+        << R"(  "debug_render_mode": ")" << debug_render_mode_name(options) << "\",\n"
+        << "  \"debug_constant_tile_us\": " << options.debug_constant_tile_us << ",\n"
         << "  \"tiles_done\": " << progress.tiles_done << ",\n"
         << "  \"total_tiles\": " << progress.total_tiles << ",\n"
         << "  \"samples_done\": " << progress.samples_done << ",\n"
@@ -2427,6 +2513,8 @@ auto write_metrics(const Options& options, const Progress& progress, double rays
         << "  \"backend\": \"" << backend_name(options.backend) << "\",\n"
         << "  \"placement\": \"" << placement_name(options.placement) << "\",\n"
         << "  \"debug_edge_colors\": " << (options.debug_edge_colors ? "true" : "false") << ",\n"
+        << "  \"debug_render_mode\": \"" << debug_render_mode_name(options) << "\",\n"
+        << "  \"debug_constant_tile_us\": " << options.debug_constant_tile_us << ",\n"
         << "  \"elapsed_seconds\": " << progress.elapsed_seconds << ",\n"
         << "  \"primary_samples\": " << progress.total_samples << ",\n"
         << "  \"rays_per_second_estimate\": " << rays_per_second << "\n"

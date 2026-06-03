@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+real_tshark="${WIREMCP_REAL_TSHARK:-/usr/bin/tshark}"
+runtime_dir="${WIREMCP_WKI_RUNTIME:-/tmp/wiremcp-wki}"
+lua_source="${WIREMCP_WKI_LUA_SOURCE:-}"
+
+if [[ -z "${lua_source}" ]]; then
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  lua_source="$(cd -- "${script_dir}/../.." && pwd)/wki.lua"
+fi
+
+lua_script="${runtime_dir}/wki.lua"
+default_interface="${WIREMCP_DEFAULT_INTERFACE:-wos-wki-br}"
+args=("$@")
+
+if [[ -n "${default_interface}" ]]; then
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    if [[ "${args[$i]}" == "-i" || "${args[$i]}" == "--interface" ]]; then
+      next=$((i + 1))
+      if [[ ${next} -lt ${#args[@]} && "${args[$next]}" == "en0" ]]; then
+        args[$next]="${default_interface}"
+      fi
+    elif [[ "${args[$i]}" == "-ien0" ]]; then
+      args[$i]="-i${default_interface}"
+    fi
+  done
+fi
+
+requested_interface=""
+for ((i = 0; i < ${#args[@]}; i++)); do
+  if [[ "${args[$i]}" == "-i" || "${args[$i]}" == "--interface" ]]; then
+    next=$((i + 1))
+    if [[ ${next} -lt ${#args[@]} ]]; then
+      requested_interface="${args[$next]}"
+    fi
+  elif [[ "${args[$i]}" == -i?* ]]; then
+    requested_interface="${args[$i]#-i}"
+  elif [[ "${args[$i]}" == --interface=* ]]; then
+    requested_interface="${args[$i]#--interface=}"
+  fi
+done
+
+mkdir -p "${runtime_dir}" "${runtime_dir}/config" "${runtime_dir}/data"
+install -m 0644 "${lua_source}" "${lua_script}"
+
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${runtime_dir}/config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-${runtime_dir}/data}"
+
+stderr_file="$(mktemp "${runtime_dir}/tshark.stderr.XXXXXX")"
+trap 'rm -f "${stderr_file}"' EXIT
+
+set +e
+"${real_tshark}" -X "lua_script:${lua_script}" "${args[@]}" 2> >(tee "${stderr_file}" >&2)
+status=$?
+set -e
+
+if [[ ${status} -ne 0 && -n "${default_interface}" && "${requested_interface}" == "${default_interface}" ]]; then
+  if grep -Eiq "(no (such )?(device|interface)|there is no (device|interface)|interface .* (not found|does not exist|doesn't exist)|could not find interface)" "${stderr_file}"; then
+    echo "the VMs are not yet set up ask the user to set them up" >&2
+  fi
+fi
+
+exit "${status}"

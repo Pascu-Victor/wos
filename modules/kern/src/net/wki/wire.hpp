@@ -107,6 +107,8 @@ constexpr uint16_t WKI_CHAN_ZONE_MGMT = 1;
 constexpr uint16_t WKI_CHAN_EVENT_BUS = 2;
 constexpr uint16_t WKI_CHAN_RESOURCE = 3;
 constexpr uint16_t WKI_CHAN_DYNAMIC_BASE = 16;
+constexpr uint16_t WKI_CHAN_DYNAMIC_RESERVED_BASE = 240;
+constexpr uint16_t WKI_CHAN_IPC_DATA = WKI_CHAN_DYNAMIC_RESERVED_BASE;
 
 // -----------------------------------------------------------------------------
 // Sequence Number Arithmetic (RFC 1982)

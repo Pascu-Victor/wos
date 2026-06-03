@@ -42,6 +42,7 @@ struct SubmittedTask {
     bool active = false;
     uint32_t task_id = 0;
     uint16_t target_node = WKI_NODE_INVALID;
+    uint64_t local_pid = 0;
 
     std::atomic<bool> response_pending{false};
     uint8_t accept_status = 0;                    // TaskRejectReason
@@ -67,6 +68,7 @@ struct SubmittedTask {
         : active(o.active),
           task_id(o.task_id),
           target_node(o.target_node),
+          local_pid(o.local_pid),
           response_pending(o.response_pending.load(std::memory_order_relaxed)),
           accept_status(o.accept_status),
           response_wait_entry(o.response_wait_entry),
@@ -84,6 +86,7 @@ struct SubmittedTask {
             active = o.active;
             task_id = o.task_id;
             target_node = o.target_node;
+            local_pid = o.local_pid;
             response_pending.store(o.response_pending.load(std::memory_order_relaxed), std::memory_order_relaxed);
             accept_status = o.accept_status;
             response_wait_entry = o.response_wait_entry;
@@ -122,6 +125,42 @@ struct RunningRemoteTask {
 
     // D19: stdout/stderr capture
     TaskOutputCapture* output = nullptr;
+};
+
+constexpr size_t WKI_REMOTE_COMPUTE_DIAG_MAX = 96;
+
+enum class WkiRemoteComputeDiagKind : uint8_t {
+    UNKNOWN = 0,
+    SUBMITTED = 1,
+    RUNNING = 2,
+    PENDING_COMPLETE = 3,
+};
+
+struct WkiRemoteComputeDiagCounts {
+    size_t submitted_total = 0;
+    size_t submitted_active = 0;
+    size_t running_total = 0;
+    size_t running_active = 0;
+    size_t pending_completions = 0;
+    size_t truncated = 0;
+};
+
+struct WkiRemoteComputeDiagRow {
+    WkiRemoteComputeDiagKind kind = WkiRemoteComputeDiagKind::SUBMITTED;
+    uint32_t task_id = 0;
+    uint16_t peer_node = WKI_NODE_INVALID;
+    uint64_t local_pid = 0;
+    uint64_t local_task_ptr = 0;
+    bool active = false;
+    bool response_pending = false;
+    bool complete_pending = false;
+    bool proxy_ready = false;
+    bool has_local_task = false;
+    int32_t exit_status = 0;
+    uint64_t accepted_age_us = 0;
+    uint64_t complete_age_us = 0;
+    uint16_t ipc_fd_count = 0;
+    uint16_t output_len = 0;
 };
 
 enum class WkiRemoteSpawnResult : uint8_t {
@@ -207,9 +246,14 @@ auto wki_shared_elf_cache_stats() -> WkiSharedElfCacheStats;
 // Returns true if signal was handled (forwarded).
 auto wki_proxy_task_forward_signal(ker::mod::sched::task::Task* task, int signum) -> bool;
 
+// Submitter side: resolve a remote execution PID back to the local proxy task.
+// Returns a refcounted task pointer on an unambiguous match; caller must release.
+auto wki_proxy_task_find_by_remote_pid_safe(uint64_t remote_pid) -> ker::mod::sched::task::Task*;
+
 // Submitter side: read the runner node for a proxy task.
 auto wki_proxy_task_remote_info(const ker::mod::sched::task::Task* task, uint16_t* target_node, char* hostname, size_t hostname_size)
     -> bool;
+auto wki_remote_compute_diag_snapshot(WkiRemoteComputeDiagRow* rows, size_t capacity, WkiRemoteComputeDiagCounts* counts) -> size_t;
 
 // Check running remote tasks for completion (called from timer tick).
 // When a task exits, sends TASK_COMPLETE back to the submitter.

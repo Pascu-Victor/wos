@@ -1,0 +1,24 @@
+{
+  "name": "wiremcp-wki",
+  "version": "0.1.0",
+  "description": "WireMCP with the WOS WKI tshark Lua dissector.",
+  "author": {
+    "name": "0xKoda / WOS"
+  },
+  "homepage": "https://github.com/0xKoda/WireMCP",
+  "repository": "https://github.com/0xKoda/WireMCP",
+  "license": "MIT",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "WireMCP WKI",
+    "shortDescription": "Network traffic MCP with the WOS WKI dissector.",
+    "longDescription": "Runs 0xKoda WireMCP through a repo-local tshark wrapper that loads tools/wireshark/wki.lua and keeps Wireshark runtime config under /tmp for Codex-compatible permissions.",
+    "developerName": "0xKoda / WOS",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": "Use WireMCP WKI to inspect WOS network traffic or analyze a PCAP."
+  }
+}

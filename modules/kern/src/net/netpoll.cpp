@@ -27,8 +27,8 @@ extern "C" char __kernel_text_end[];    // NOLINT(readability-identifier-naming)
 
 namespace {
 
-constexpr uint32_t NET_LATENCY_DAEMON_SLICE_NS = 10'000'000;
-constexpr int NET_LATENCY_DAEMON_NICE = 0;
+constexpr uint32_t NET_LATENCY_DAEMON_SLICE_NS = 2'000'000;
+constexpr int NET_LATENCY_DAEMON_NICE = -5;
 constexpr size_t NAPI_INLINE_REGISTRY_CAPACITY = 64;
 constexpr size_t NAPI_POLL_SNAPSHOT_CAPACITY = 64;
 
@@ -100,6 +100,13 @@ void unregister_napi(NapiStruct* napi) {
 
         if (!napi->has_work.load(std::memory_order_acquire)) {
             // No work: block until napi_schedule() explicitly wakes us.
+            //
+            // The CLI above only protects the work check.  Entering kern_block()
+            // with IF clear resumes through the scheduler's sti/hlt/cli path,
+            // which is a fragile same-CPL timer-return point for high-rate
+            // netpoll workers.  Re-enable first; a racing IRQ wake is preserved
+            // by the task's wakeup_pending check inside kern_block().
+            asm volatile("sti" ::: "memory");
             ker::mod::sched::kern_block();
             continue;
         }
@@ -221,12 +228,29 @@ void napi_enable(NapiStruct* napi, uint64_t cpu_affinity) {
     log::debug("enabled for %s (worker PID %lx)", dev_name, napi->worker->pid);
 }
 
-void napi_set_worker_cpu(NapiStruct* napi, uint64_t cpu) {
+auto napi_set_worker_cpu(NapiStruct* napi, uint64_t cpu) -> bool {
     if (napi == nullptr || napi->worker == nullptr) {
-        return;
+        return false;
     }
-    napi->worker->cpu_pinned = true;
-    ker::mod::sched::reschedule_task_for_cpu(cpu, napi->worker);
+    auto* worker = napi->worker;
+    uint64_t const RUNNING_CPU = ker::mod::sched::current_cpu_for_task(worker);
+    if (RUNNING_CPU != UINT64_MAX) {
+        if (RUNNING_CPU != cpu) {
+            return false;
+        }
+        worker->cpu_pinned = true;
+        return true;
+    }
+
+    bool const WAS_PINNED = worker->cpu_pinned;
+    worker->cpu_pinned = false;
+    ker::mod::sched::reschedule_task_for_cpu(cpu, worker);
+    if (worker->cpu != cpu) {
+        worker->cpu_pinned = WAS_PINNED;
+        return false;
+    }
+    worker->cpu_pinned = true;
+    return true;
 }
 
 void napi_disable(NapiStruct* napi) {

@@ -89,6 +89,7 @@ local channel_names = {
     [1] = "ZONE_MGMT",
     [2] = "EVENT_BUS",
     [3] = "RESOURCE",
+    [240] = "IPC_DATA",
 }
 
 -- Resource types
@@ -299,6 +300,12 @@ local pf_msg_type = ProtoField.uint8("wki.msg_type", "Message Type", base.HEX, m
 local pf_msg_type_name = ProtoField.string("wki.msg_type_name", "Message Type Name")
 local pf_src_node = ProtoField.uint16("wki.src_node", "Source Node", base.HEX)
 local pf_dst_node = ProtoField.uint16("wki.dst_node", "Destination Node", base.HEX)
+local pf_hostname = {
+    src = ProtoField.string("wki.src_hostname", "Source Hostname"),
+    dst = ProtoField.string("wki.dst_hostname", "Destination Hostname"),
+    id_route = ProtoField.string("wki.route.ids", "WKI ID Route"),
+    hostname_route = ProtoField.string("wki.route.hostnames", "Hostname Route"),
+}
 local pf_channel_id = ProtoField.uint16("wki.channel", "Channel ID", base.DEC)
 local pf_channel_name = ProtoField.string("wki.channel_name", "Channel Name")
 local pf_seq_num = ProtoField.uint32("wki.seq", "Sequence Number", base.DEC)
@@ -491,7 +498,8 @@ wki_proto.fields = {
     -- Header
     pf_version_flags, pf_version, pf_flags,
     pf_flag_ack, pf_flag_priority, pf_flag_fragment, pf_flag_reserved,
-    pf_msg_type, pf_msg_type_name, pf_src_node, pf_dst_node, pf_channel_id, pf_channel_name,
+    pf_msg_type, pf_msg_type_name, pf_src_node, pf_dst_node, pf_hostname.src, pf_hostname.dst,
+    pf_hostname.id_route, pf_hostname.hostname_route, pf_channel_id, pf_channel_name,
     pf_seq_num, pf_ack_num, pf_payload_len, pf_credits, pf_hop_ttl,
     pf_src_port, pf_dst_port, pf_checksum, pf_reserved,
     -- HELLO
@@ -571,6 +579,56 @@ local channel_stats = {} -- [stream_key] = { msg_counts={}, total_frames, credit
 -- Per-operation latency tracking
 local op_latencies = {}  -- [op_name] = { values={}, count, sum, min, max }
 
+-- Hostname identity learned from HELLO / HELLO_ACK frames.
+local hostname_identity = {
+    node_hostnames = {}, -- [node_id] = hostname
+    hostname_nodes = {}, -- [hostname] = node_id
+}
+
+function hostname_identity.reset()
+    hostname_identity.node_hostnames = {}
+    hostname_identity.hostname_nodes = {}
+end
+
+function hostname_identity.remember(node_id, hostname)
+    if hostname == nil or hostname == "" or node_id == 0x0000 or node_id == 0xFFFF then
+        return
+    end
+
+    local previous = hostname_identity.node_hostnames[node_id]
+    if previous ~= nil and previous ~= hostname and hostname_identity.hostname_nodes[previous] == node_id then
+        hostname_identity.hostname_nodes[previous] = nil
+    end
+
+    local previous_node = hostname_identity.hostname_nodes[hostname]
+    if previous_node ~= nil and previous_node ~= node_id and hostname_identity.node_hostnames[previous_node] == hostname then
+        hostname_identity.node_hostnames[previous_node] = nil
+    end
+
+    hostname_identity.node_hostnames[node_id] = hostname
+    hostname_identity.hostname_nodes[hostname] = node_id
+end
+
+function hostname_identity.node_name(node_id)
+    if node_id == 0x0000 then return "INVALID" end
+    if node_id == 0xFFFF then return "BROADCAST" end
+    return hostname_identity.node_hostnames[node_id] or string.format("unknown-0x%04X", node_id)
+end
+
+function hostname_identity.node_id_short(node_id)
+    if node_id == 0x0000 then return "INVALID" end
+    if node_id == 0xFFFF then return "BROADCAST" end
+    return string.format("0x%04X", node_id)
+end
+
+function hostname_identity.id_route(src_node, dst_node)
+    return string.format("%s -> %s", hostname_identity.node_id_short(src_node), hostname_identity.node_id_short(dst_node))
+end
+
+function hostname_identity.hostname_route(src_node, dst_node)
+    return string.format("%s -> %s", hostname_identity.node_name(src_node), hostname_identity.node_name(dst_node))
+end
+
 -- REQ/RESP message type pairs for correlation
 local req_resp_pairs = {
     [0x43] = 0x44, -- DEV_OP_REQ -> DEV_OP_RESP
@@ -600,6 +658,7 @@ local function reset_analysis_state()
     peer_stats = {}
     channel_stats = {}
     op_latencies = {}
+    hostname_identity.reset()
 end
 
 local function ensure_peer_stats(node_id)
@@ -1037,6 +1096,18 @@ function wki_proto.dissector(buffer, pinfo, tree)
     local ack_present = bit.band(flags, 0x08) ~= 0
     local is_ack_carrier = msg_type == 0x04 and ack_present and payload_len == 0
 
+    if (msg_type == 0x01 or msg_type == 0x02) and payload_captured_len >= 96 then
+        local hello_magic = buffer(WKI_HEADER_SIZE, 4):le_uint()
+        if hello_magic == WKI_HELLO_MAGIC then
+            local hello_node_id = buffer(WKI_HEADER_SIZE + 6, 2):le_uint()
+            local hello_hostname = buffer(WKI_HEADER_SIZE + 32, 64):stringz()
+            hostname_identity.remember(hello_node_id, hello_hostname)
+        end
+    end
+
+    local id_route = hostname_identity.id_route(src_node, dst_node)
+    local hostname_route = hostname_identity.hostname_route(src_node, dst_node)
+
     -- Build info column
     local msg_name = get_msg_type_name(msg_type)
     local display_msg_name = is_ack_carrier and "ACK" or msg_name
@@ -1066,10 +1137,10 @@ function wki_proto.dissector(buffer, pinfo, tree)
             end
         end
     end
-    pinfo.cols.info = string.format("%s %s->%s ch=%s seq=%d",
+    pinfo.cols.info = string.format("%s ids=%s hosts=%s ch=%s seq=%d",
         display_msg_name,
-        format_node_id(src_node),
-        format_node_id(dst_node),
+        id_route,
+        hostname_route,
         channel_name,
         seq_num)
     if ack_present then
@@ -1266,6 +1337,10 @@ function wki_proto.dissector(buffer, pinfo, tree)
     end
     hdr_tree:add_le(pf_src_node, buffer(2, 2)):append_text(" (" .. format_node_id(src_node) .. ")")
     hdr_tree:add_le(pf_dst_node, buffer(4, 2)):append_text(" (" .. format_node_id(dst_node) .. ")")
+    add_generated_string(hdr_tree, pf_hostname.src, hostname_identity.node_name(src_node))
+    add_generated_string(hdr_tree, pf_hostname.dst, hostname_identity.node_name(dst_node))
+    add_generated_string(hdr_tree, pf_hostname.id_route, id_route)
+    add_generated_string(hdr_tree, pf_hostname.hostname_route, hostname_route)
     hdr_tree:add_le(pf_channel_id, buffer(6, 2)):append_text(" (" .. channel_name .. ")")
     local channel_name_item = hdr_tree:add(pf_channel_name, channel_name)
     channel_name_item:set_generated(true)
@@ -1713,6 +1788,25 @@ local function show_wki_statistics()
     table.insert(lines, "=" .. string.rep("=", 78))
     table.insert(lines, "  WKI Protocol Statistics")
     table.insert(lines, "=" .. string.rep("=", 78))
+
+    -- Hostname Map
+    table.insert(lines, "")
+    table.insert(lines, "--- Hostname Map ---")
+    local sorted_hostnames = {}
+    for hostname, _ in pairs(hostname_identity.hostname_nodes) do
+        table.insert(sorted_hostnames, hostname)
+    end
+    table.sort(sorted_hostnames)
+
+    if #sorted_hostnames == 0 then
+        table.insert(lines, "  No HELLO hostnames observed.")
+    else
+        table.insert(lines, string.format("  %-32s %-12s", "Hostname", "Node"))
+        table.insert(lines, "  " .. string.rep("-", 46))
+        for _, hostname in ipairs(sorted_hostnames) do
+            table.insert(lines, string.format("  %-32s %-12s", hostname, format_node_id(hostname_identity.hostname_nodes[hostname])))
+        end
+    end
 
     -- Per-Peer Statistics
     table.insert(lines, "")

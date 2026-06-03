@@ -27,8 +27,8 @@ BacklogQueue* queues = nullptr;
 std::atomic<bool> ready{false};
 uint64_t num_cpus = 0;
 
-constexpr uint32_t NET_LATENCY_DAEMON_SLICE_NS = 10'000'000;
-constexpr int NET_LATENCY_DAEMON_NICE = 0;
+constexpr uint32_t NET_LATENCY_DAEMON_SLICE_NS = 2'000'000;
+constexpr int NET_LATENCY_DAEMON_NICE = -5;
 
 auto is_loopback_dev(const NetDevice* dev) -> bool { return dev != nullptr && std::strncmp(dev->name.data(), "lo", dev->name.size()) == 0; }
 

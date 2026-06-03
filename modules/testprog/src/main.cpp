@@ -507,6 +507,7 @@ auto main(int argc, char** argv, char** envp) -> int {
         int max_iter = MAX_ITERATION;
         int threads = THREADS;
         int repeat = REPEAT;
+        const char* nodes = nullptr;
 
         for (int i = 2; i < argc; i++) {
             if (std::strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
@@ -534,14 +535,16 @@ auto main(int argc, char** argv, char** envp) -> int {
                     std::println("mandelbench: invalid --repeat '{}'", argv[i]);
                     return 1;
                 }
+            } else if (std::strcmp(argv[i], "--nodes") == 0 && i + 1 < argc) {
+                nodes = argv[++i];
             }
         }
         if (MANDELBENCH_DEBUG_ENABLED) {
-            std::println("testprog[t:{},p:{}]: Running mandelbench with width={}, height={}, max_iter={}, threads={}, repeat={}", tid, pid,
-                         width, height, max_iter, threads, repeat);
+            std::println("testprog[t:{},p:{}]: Running mandelbench with width={}, height={}, max_iter={}, threads={}, repeat={}, nodes={}",
+                         tid, pid, width, height, max_iter, threads, repeat, nodes != nullptr ? nodes : "auto");
         }
 
-        return mandelbench_wki(width, height, max_iter, threads, repeat, nullptr);
+        return mandelbench_wki(width, height, max_iter, threads, repeat, nodes);
     }
 
     if (command != nullptr && std::strcmp(command, "mandelbench-worker") == 0) {

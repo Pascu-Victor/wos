@@ -696,7 +696,7 @@ auto trace_loop(uint64_t pid) -> int {
         } else if (event.reason == ker::abi::ptrace::stop_reason::SYSCALL_EXIT) {
             ker::abi::ptrace::X86_64GprState regs{};
             if (read_regs(pid, regs)) {
-                int64_t const RESULT = static_cast<int64_t>(regs.rax);
+                auto const RESULT = static_cast<int64_t>(regs.rax);
                 auto it = pending.find(event.tid);
                 if (it != pending.end()) {
                     std::println("{} = {}", format_entry(pid, it->second), format_result(RESULT));

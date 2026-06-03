@@ -71,7 +71,7 @@ void napi_complete(NapiStruct* napi);
 int napi_poll_all_pending();
 
 // Migrate the NAPI worker for this struct to `cpu` and pin it there.
-// Safe to call while the device is active; uses reschedule_task_for_cpu.
-void napi_set_worker_cpu(NapiStruct* napi, uint64_t cpu);
+// Returns false if the active worker is currently running on another CPU.
+bool napi_set_worker_cpu(NapiStruct* napi, uint64_t cpu);
 
 }  // namespace ker::net

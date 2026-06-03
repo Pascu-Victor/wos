@@ -104,6 +104,21 @@ auto vfs_destroy_file(File* f) -> int {
     return close_result;
 }
 
+auto apply_open_truncation(File* f, int flags) -> int {
+    if ((flags & ker::vfs::O_TRUNC) == 0 || f == nullptr || f->is_directory) {
+        return 0;
+    }
+    if (f->fops == nullptr || f->fops->vfs_truncate == nullptr) {
+        return 0;
+    }
+
+    int const RET = f->fops->vfs_truncate(f, 0);
+    if (RET == 0) {
+        stream_invalidate_file(f);
+    }
+    return RET;
+}
+
 auto vfs_take_fd_locked(ker::mod::sched::task::Task* task, int fd) -> File* {
     if (task == nullptr || fd < 0) {
         return nullptr;
@@ -2702,6 +2717,12 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
         }
     }
 
+    int const TRUNCATE_RET = apply_open_truncation(f, backend_flags);
+    if (TRUNCATE_RET < 0) {
+        vfs_destroy_file(f);
+        return TRUNCATE_RET;
+    }
+
     int const FD = vfs_alloc_fd(current, f);
     if (FD < 0) {
         return FD;
@@ -2842,18 +2863,21 @@ auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int {
         return -EINVAL;
     }
     uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-    uint64_t const SLOT = task->fd_table.find_first_unset(0);
-    bool const INSERTED = SLOT != UINT64_MAX && task->fd_table.insert(SLOT, file);
+    uint64_t slot = task->fd_table.find_first_unset(0);
+    if (slot == UINT64_MAX) {
+        slot = task->fd_table.current_capacity();
+    }
+    bool const INSERTED = slot != UINT64_MAX && task->fd_table.insert(slot, file);
     size_t const FD_COUNT = task->fd_table.size();
     task->fd_table_lock.unlock_irqrestore(IRQF);
 
     if (!INSERTED) {
         return -EMFILE;  // fd_table cannot currently distinguish OOM from exhaustion
     }
-    file->fd = static_cast<int>(SLOT);
+    file->fd = static_cast<int>(slot);
     ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_INSERT,
                                           static_cast<int64_t>(FD_COUNT), 0, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-    return static_cast<int>(SLOT);
+    return static_cast<int>(slot);
 }
 
 auto vfs_get_file(ker::mod::sched::task::Task* task, int fd) -> struct File* {
@@ -5845,6 +5869,45 @@ auto vfs_pipe(int pipefd[2]) -> int {  // NOLINT(cppcoreguidelines-avoid-c-array
     return 0;
 }
 
+auto vfs_pipe_reserve_capacity(File* file, size_t capacity) -> bool {
+    if (!vfs_is_pipe_file(file) || file->private_data == nullptr || capacity <= PIPE_DEFAULT_CAPACITY) {
+        return false;
+    }
+
+    auto* st = static_cast<PipeState*>(file->private_data);
+    uint64_t irqf = st->lock.lock_irqsave();
+    bool const ALREADY_LARGE_ENOUGH = capacity <= st->capacity;
+    bool const RESIZE_BLOCKED = st->direct_write_active;
+    st->lock.unlock_irqrestore(irqf);
+    if (ALREADY_LARGE_ENOUGH) {
+        return true;
+    }
+    if (RESIZE_BLOCKED) {
+        return false;
+    }
+
+    auto* new_buf = new char[capacity];
+    if (new_buf == nullptr) {
+        return false;
+    }
+
+    char* old_buf = nullptr;
+    size_t old_capacity = 0;
+    irqf = st->lock.lock_irqsave();
+    old_capacity = st->capacity;
+    old_buf = pipe_install_buffer_locked(st, new_buf, capacity);
+    st->lock.unlock_irqrestore(irqf);
+
+    if (old_buf == nullptr) {
+        delete[] new_buf;
+        return false;
+    }
+
+    pipe_note_capacity_delta(capacity, old_capacity);
+    delete[] old_buf;
+    return true;
+}
+
 void vfs_get_local_pipe_perf_snapshot(LocalPipePerfSnapshot& out) {
     LocalPipePerfSnapshot snapshot{
         .created_since_reset = g_pipe_created_since_reset.load(std::memory_order_acquire),
@@ -6179,6 +6242,16 @@ auto vfs_wki_default_rule_get(uint32_t index, char* prefix_buf, size_t prefix_bu
     return static_cast<int>(rule.prefix_len);
 }
 
+auto vfs_wki_effective_route_for_path(const ker::mod::sched::task::Task* task, const char* path, uint32_t* route_out) -> int {
+    if (path == nullptr || route_out == nullptr) {
+        return -EINVAL;
+    }
+
+    VfsRouteDecision const DECISION = choose_task_route(task, path);
+    *route_out = DECISION.route;
+    return static_cast<int>(DECISION.prefix_len);
+}
+
 auto vfs_wki_rule_clear() -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
@@ -6297,6 +6370,14 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
     if (f != nullptr && (PATH_REQUIRES_DIRECTORY || FLAGS_REQUIRE_DIRECTORY) && !f->is_directory) {
         vfs_destroy_file(f);
         return nullptr;
+    }
+
+    if (f != nullptr) {
+        int const TRUNCATE_RET = apply_open_truncation(f, backend_flags);
+        if (TRUNCATE_RET < 0) {
+            vfs_destroy_file(f);
+            return nullptr;
+        }
     }
 
     // Store the absolute VFS path for mount-overlay directory listing

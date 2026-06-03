@@ -305,6 +305,8 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "wait";
                 case WkiPerfTransportOp::STALL:
                     return "stall";
+                case WkiPerfTransportOp::RDMA_WRITE:
+                    return "rdma_write";
                 default:
                     return "unknown";
             }

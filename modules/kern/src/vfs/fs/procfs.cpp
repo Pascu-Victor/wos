@@ -1126,6 +1126,7 @@ auto generate_kperfctl(char* buf, size_t bufsz) -> size_t {
 // Forward declarations for helpers defined below
 static void append_dec64(char*& p, const char* end, uint64_t v);
 static void append_sconst(char*& p, const char* end, const char* s);
+static void append_char(char*& p, const char* end, char c);
 
 // Generate content for /proc/kcontstat
 // Shows per-subsystem container aggregate statistics (non-destructive).
@@ -1339,6 +1340,15 @@ void append_dec64(char*& p, const char* end, uint64_t v) {
     }
 }
 
+void append_sdec64(char*& p, const char* end, int64_t v) {
+    if (v < 0) {
+        append_char(p, end, '-');
+        append_dec64(p, end, static_cast<uint64_t>(-v));
+        return;
+    }
+    append_dec64(p, end, static_cast<uint64_t>(v));
+}
+
 void append_sconst(char*& p, const char* end, const char* s) {
     while (((*s) != 0) && p + 1 < end) {
         *p++ = *s++;
@@ -1363,6 +1373,20 @@ void append_hex16(char*& p, const char* end, uint16_t v) {
     for (int i = 12; i >= 0; i -= 4) {
         *p++ = HEX_DIGITS[static_cast<size_t>((v >> i) & 0xf)];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     }
+}
+
+auto remote_compute_diag_kind_name(ker::net::wki::WkiRemoteComputeDiagKind kind) -> const char* {
+    switch (kind) {
+        case ker::net::wki::WkiRemoteComputeDiagKind::UNKNOWN:
+            return "unknown";
+        case ker::net::wki::WkiRemoteComputeDiagKind::SUBMITTED:
+            return "submitted";
+        case ker::net::wki::WkiRemoteComputeDiagKind::RUNNING:
+            return "running";
+        case ker::net::wki::WkiRemoteComputeDiagKind::PENDING_COMPLETE:
+            return "pending_complete";
+    }
+    return "unknown";
 }
 
 void append_ipv4(char*& p, const char* end, uint32_t ip) {
@@ -2395,6 +2419,58 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
     append_sconst(p, end, " dev_op_queue=");
     append_dec64(p, end, ipc.dev_op_queue);
     append_char(p, end, '\n');
+
+    ker::net::wki::WkiRemoteComputeDiagCounts compute_counts{};
+    std::array<ker::net::wki::WkiRemoteComputeDiagRow, ker::net::wki::WKI_REMOTE_COMPUTE_DIAG_MAX> compute_rows{};
+    size_t const COMPUTE_ROW_COUNT =
+        ker::net::wki::wki_remote_compute_diag_snapshot(compute_rows.data(), compute_rows.size(), &compute_counts);
+    append_sconst(p, end, "wki_compute submitted=");
+    append_dec64(p, end, compute_counts.submitted_total);
+    append_sconst(p, end, " submitted_active=");
+    append_dec64(p, end, compute_counts.submitted_active);
+    append_sconst(p, end, " running=");
+    append_dec64(p, end, compute_counts.running_total);
+    append_sconst(p, end, " running_active=");
+    append_dec64(p, end, compute_counts.running_active);
+    append_sconst(p, end, " pending_complete=");
+    append_dec64(p, end, compute_counts.pending_completions);
+    append_sconst(p, end, " truncated=");
+    append_dec64(p, end, compute_counts.truncated);
+    append_char(p, end, '\n');
+    for (size_t i = 0; i < COMPUTE_ROW_COUNT; ++i) {
+        const auto& row = compute_rows.at(i);
+        append_sconst(p, end, "wki_compute_task kind=");
+        append_sconst(p, end, remote_compute_diag_kind_name(row.kind));
+        append_sconst(p, end, " task=");
+        append_dec64(p, end, row.task_id);
+        append_sconst(p, end, " peer=");
+        append_hex16(p, end, row.peer_node);
+        append_sconst(p, end, " local_pid=");
+        append_dec64(p, end, row.local_pid);
+        append_sconst(p, end, " local_task=");
+        append_hex64(p, end, row.local_task_ptr);
+        append_sconst(p, end, " active=");
+        append_bool01(p, end, row.active);
+        append_sconst(p, end, " response_pending=");
+        append_bool01(p, end, row.response_pending);
+        append_sconst(p, end, " complete_pending=");
+        append_bool01(p, end, row.complete_pending);
+        append_sconst(p, end, " proxy_ready=");
+        append_bool01(p, end, row.proxy_ready);
+        append_sconst(p, end, " has_local_task=");
+        append_bool01(p, end, row.has_local_task);
+        append_sconst(p, end, " exit=");
+        append_sdec64(p, end, row.exit_status);
+        append_sconst(p, end, " accepted_age_us=");
+        append_dec64(p, end, row.accepted_age_us);
+        append_sconst(p, end, " complete_age_us=");
+        append_dec64(p, end, row.complete_age_us);
+        append_sconst(p, end, " ipc_fds=");
+        append_dec64(p, end, row.ipc_fd_count);
+        append_sconst(p, end, " output_len=");
+        append_dec64(p, end, row.output_len);
+        append_char(p, end, '\n');
+    }
 
     std::array<ker::net::wki::WkiRemoteVfsProxyDiag, ker::net::wki::WKI_REMOTE_VFS_PROXY_DIAG_MAX> vfs_proxies{};
     size_t const VFS_PROXY_COUNT = ker::net::wki::wki_remote_vfs_proxy_diag_snapshot(vfs_proxies.data(), vfs_proxies.size());

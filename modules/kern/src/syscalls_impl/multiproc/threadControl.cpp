@@ -18,6 +18,8 @@
 
 namespace ker::syscall::multiproc {
 namespace {
+constexpr uint32_t SOFT_EXCLUSIVE_DAEMON_PENALTY = 7;
+
 auto online_cpu_mask() -> uint64_t {
     uint64_t const CPU_COUNT = mod::smt::get_core_count();
     if (CPU_COUNT == 0) {
@@ -27,6 +29,13 @@ auto online_cpu_mask() -> uint64_t {
         return UINT64_MAX;
     }
     return (1ULL << CPU_COUNT) - 1ULL;
+}
+
+auto cpu_mask_bit(uint64_t cpu) -> uint64_t {
+    if (cpu >= 64) {
+        return 0;
+    }
+    return 1ULL << cpu;
 }
 
 void release_thread_fd_refs(mod::sched::task::Task* task) {
@@ -170,14 +179,28 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
                 return static_cast<uint64_t>(-EINVAL);
             }
 
+            uint64_t const RUNNING_CPU = mod::sched::current_cpu_for_task(task);
+            bool const IS_RUNNING = RUNNING_CPU != UINT64_MAX;
+            uint64_t const OWNER_CPU = IS_RUNNING ? RUNNING_CPU : mod::sched::owner_cpu_for_task(task);
+            bool const IS_WAITING = task->sched_queue == mod::sched::task::Task::sched_queue::WAITING;
+            if (IS_RUNNING && (MASK & cpu_mask_bit(RUNNING_CPU)) == 0) {
+                task->release();
+                return static_cast<uint64_t>(-EBUSY);
+            }
+            if (IS_WAITING && OWNER_CPU != UINT64_MAX && (MASK & cpu_mask_bit(OWNER_CPU)) == 0) {
+                task->release();
+                return static_cast<uint64_t>(-EBUSY);
+            }
             if (std::has_single_bit(MASK)) {
                 // Single-CPU pin
                 uint64_t const TARGET_CPU = std::countr_zero(MASK);
                 task->domain_mask = MASK;
                 task->domain_hard = false;
                 task->cpu_pinned = true;
-                task->cpu = TARGET_CPU;
-                if (task->sched_queue != mod::sched::task::Task::sched_queue::WAITING) {
+                if (!IS_RUNNING && !IS_WAITING) {
+                    task->cpu = TARGET_CPU;
+                }
+                if (!IS_RUNNING && !IS_WAITING) {
                     mod::sched::reschedule_task_for_cpu(TARGET_CPU, task);
                 }
             } else if (MASK == VALID_MASK) {
@@ -191,7 +214,7 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
                 task->domain_hard = false;
                 task->cpu_pinned = false;
                 uint64_t const TARGET_CPU = mod::sched::get_least_loaded_cpu_in_mask(MASK);
-                if (task->sched_queue != mod::sched::task::Task::sched_queue::WAITING) {
+                if (!IS_RUNNING && !IS_WAITING) {
                     mod::sched::reschedule_task_for_cpu(TARGET_CPU, task);
                 }
             }
@@ -253,7 +276,7 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
                 uint64_t const CPU_COUNT = mod::smt::get_core_count();
                 for (uint64_t cpu = 0; cpu < CPU_COUNT && cpu < 64; ++cpu) {
                     if ((cpu_mask & (1ULL << cpu)) != 0U) {
-                        mod::sched::set_cpu_daemon_penalty(cpu, 56);
+                        mod::sched::set_cpu_daemon_penalty(cpu, SOFT_EXCLUSIVE_DAEMON_PENALTY);
                     }
                 }
             }
@@ -283,12 +306,24 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
+            uint64_t const RUNNING_CPU = mod::sched::current_cpu_for_task(task);
+            bool const IS_RUNNING = RUNNING_CPU != UINT64_MAX;
+            uint64_t const OWNER_CPU = IS_RUNNING ? RUNNING_CPU : mod::sched::owner_cpu_for_task(task);
+            bool const IS_WAITING = task->sched_queue == mod::sched::task::Task::sched_queue::WAITING;
+            if (IS_RUNNING && (dom->cpu_mask & cpu_mask_bit(RUNNING_CPU)) == 0) {
+                task->release();
+                return static_cast<uint64_t>(-EBUSY);
+            }
+            if (IS_WAITING && OWNER_CPU != UINT64_MAX && (dom->cpu_mask & cpu_mask_bit(OWNER_CPU)) == 0) {
+                task->release();
+                return static_cast<uint64_t>(-EBUSY);
+            }
             task->domain_id = DOMAIN_ID;
             task->domain_mask = dom->cpu_mask;
             task->domain_hard = HARD || dom->hard;
             task->cpu_pinned = false;
             uint64_t const TARGET = mod::sched::get_least_loaded_cpu_in_mask(dom->cpu_mask);
-            if (task->sched_queue != mod::sched::task::Task::sched_queue::WAITING) {
+            if (!IS_RUNNING && !IS_WAITING) {
                 mod::sched::reschedule_task_for_cpu(TARGET, task);
             }
             task->release();

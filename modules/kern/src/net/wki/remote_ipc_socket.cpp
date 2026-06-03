@@ -75,7 +75,7 @@ auto socket_proxy_from_file(ker::vfs::File* file) -> ProxyIpcState* {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Fire-and-forget control op (no response needed, e.g. OP_SOCK_CLOSE).
+// Fire-and-forget stream op (no response needed, e.g. OP_SOCK_CLOSE).
 auto send_socket_op(ProxyIpcState* proxy, uint16_t op_id) -> int {
     if (proxy == nullptr || !proxy->active.load(std::memory_order_acquire)) {
         return -EBADF;
@@ -91,7 +91,7 @@ auto send_socket_op(ProxyIpcState* proxy, uint16_t op_id) -> int {
     req->data_len = sizeof(uint32_t);
     std::memcpy(msg.data() + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
 
-    int const TX = wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size()));
+    int const TX = wki_send(proxy->home_node, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size()));
     return TX == WKI_OK ? 0 : -EIO;
 }
 
@@ -292,20 +292,20 @@ auto proxy_socket_write(ker::vfs::File* f, const void* buf, size_t count, size_t
         auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
         int32_t const STATUS = rc >= 0 ? 0 : static_cast<int32_t>(rc);
         perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PROXY_WRITE), ker::mod::perf::WkiPerfPhase::END,
-                              proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, STATUS, ELAPSED_US,
+                              proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_IPC_DATA, CORRELATION, STATUS, ELAPSED_US,
                               CALLSITE);
         perf_record_ipc_summary(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PROXY_WRITE),
-                                proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, STATUS, ELAPSED_US, bytes);
+                                proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_IPC_DATA, STATUS, ELAPSED_US, bytes);
         return rc;
     };
     perf_record_ipc_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfIpcOp::PROXY_WRITE), ker::mod::perf::WkiPerfPhase::BEGIN,
-                          proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_RESOURCE, CORRELATION, 0, 0, CALLSITE);
+                          proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_IPC_DATA, CORRELATION, 0, 0, CALLSITE);
     if (proxy == nullptr || !proxy->active.load(std::memory_order_acquire)) {
         return finish(-EBADF);
     }
 
     // Forward data to home node via OP_PIPE_DATA (home writes it into socket send path)
-    constexpr size_t MAX_CHUNK = 4096;
+    constexpr size_t MAX_CHUNK = 8192;
     constexpr size_t HEADER_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t);
     size_t const TO_SEND = (count < MAX_CHUNK) ? count : MAX_CHUNK;
     size_t const MSG_SIZE = HEADER_SIZE + TO_SEND;
@@ -321,7 +321,7 @@ auto proxy_socket_write(ker::vfs::File* f, const void* buf, size_t count, size_t
     std::memcpy(msg + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
     std::memcpy(msg + HEADER_SIZE, buf, TO_SEND);
 
-    int const RET = wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(MSG_SIZE));
+    int const RET = wki_send(proxy->home_node, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(MSG_SIZE));
     delete[] msg;
 
     if (RET != WKI_OK) {

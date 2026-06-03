@@ -33,6 +33,11 @@ RENDER_PLACEMENT="node-threads"
 RENDER_THREADS=""
 RENDER_RUN_ID=""
 RENDER_OUTPUT_ROOT="/var/lib/wos-bench/results/tracebench"
+RENDER_DEBUG_CONSTANT_TILE_US="0"
+MANDEL_RANKS_PER_NODE=""
+MANDEL_MAX_ITER="5000"
+MANDEL_REPEAT="5"
+MANDEL_OUTPUT_ROOT=""
 NP=""
 OUTPUT=""
 
@@ -110,6 +115,10 @@ while [[ $# -gt 0 ]]; do
       RENDER_MAX_DEPTH="$2"
       shift 2
       ;;
+    --max-iter)
+      MANDEL_MAX_ITER="$2"
+      shift 2
+      ;;
     --tile-size)
       RENDER_TILE_SIZE="$2"
       shift 2
@@ -120,14 +129,27 @@ while [[ $# -gt 0 ]]; do
       ;;
     --threads)
       RENDER_THREADS="$2"
+      MANDEL_RANKS_PER_NODE="$2"
       shift 2
       ;;
     --run-id)
       RENDER_RUN_ID="$2"
       shift 2
       ;;
+    --repeat)
+      MANDEL_REPEAT="$2"
+      shift 2
+      ;;
     --render-output-root)
       RENDER_OUTPUT_ROOT="$2"
+      shift 2
+      ;;
+    --debug-constant-tile-us)
+      RENDER_DEBUG_CONSTANT_TILE_US="$2"
+      shift 2
+      ;;
+    --mandel-output-root)
+      MANDEL_OUTPUT_ROOT="$2"
       shift 2
       ;;
     --np)
@@ -158,32 +180,33 @@ if [[ -z "$REMOTE_BUILD_ROOT" ]]; then
 fi
 
 if [[ -z "$LAUNCHER" || -z "$HOSTS_CSV" ]]; then
-  echo "Usage: $0 --launcher <host> --hosts host1,host2[,hostN] [--benchmark net|file|render] [...]" >&2
+  echo "Usage: $0 --launcher <host> --hosts host1,host2[,hostN] [--benchmark net|file|mandel|render] [...]" >&2
   exit 1
 fi
 
-if [[ "$BENCHMARK" != "net" && "$BENCHMARK" != "file" && "$BENCHMARK" != "render" ]]; then
-  echo "ERROR: --benchmark must be 'net', 'file', or 'render'" >&2
+if [[ "$BENCHMARK" != "net" && "$BENCHMARK" != "file" && "$BENCHMARK" != "mandel" && "$BENCHMARK" != "render" ]]; then
+  echo "ERROR: --benchmark must be 'net', 'file', 'mandel', or 'render'" >&2
   exit 1
 fi
 
 IFS=',' read -r -a HOSTS <<< "$HOSTS_CSV"
-if [[ "$BENCHMARK" == "render" && ${#HOSTS[@]} -lt 1 ]]; then
-  echo "ERROR: provide at least one Linux host in --hosts" >&2
-  exit 1
-fi
-if [[ "$BENCHMARK" != "render" && ${#HOSTS[@]} -lt 2 ]]; then
+if [[ "$BENCHMARK" == "render" || "$BENCHMARK" == "mandel" ]]; then
+  if [[ ${#HOSTS[@]} -lt 1 ]]; then
+    echo "ERROR: provide at least one Linux host in --hosts" >&2
+    exit 1
+  fi
+elif [[ ${#HOSTS[@]} -lt 2 ]]; then
   echo "ERROR: provide at least two Linux hosts in --hosts" >&2
   exit 1
 fi
 
-if [[ -z "$NP" ]]; then
+if [[ -z "$NP" && "$BENCHMARK" != "mandel" ]]; then
   NP="${#HOSTS[@]}"
 fi
 
 declare -a HOST_CPUS=()
 TOTAL_HOST_CPUS=0
-if [[ "$BENCHMARK" == "render" ]]; then
+if [[ "$BENCHMARK" == "render" || "$BENCHMARK" == "mandel" ]]; then
   for host in "${HOSTS[@]}"; do
     host_cpus_raw="$(${REMOTE_SCRIPTS}/linux_ssh.sh "$host" getconf _NPROCESSORS_ONLN | tr -d '\r')"
     if [[ ! "$host_cpus_raw" =~ ^[0-9]+$ || "$host_cpus_raw" -le 0 ]]; then
@@ -193,7 +216,9 @@ if [[ "$BENCHMARK" == "render" ]]; then
     HOST_CPUS+=("$host_cpus_raw")
     TOTAL_HOST_CPUS=$((TOTAL_HOST_CPUS + host_cpus_raw))
   done
+fi
 
+if [[ "$BENCHMARK" == "render" ]]; then
   if [[ -z "$RENDER_THREADS" && "$RENDER_PLACEMENT" == "node-threads" ]]; then
     lowest_host_cpus="${HOST_CPUS[0]}"
     for host_cpus in "${HOST_CPUS[@]}"; do
@@ -211,6 +236,32 @@ if [[ "$BENCHMARK" == "render" ]]; then
       NP="${#HOSTS[@]}"
     fi
   fi
+elif [[ "$BENCHMARK" == "mandel" ]]; then
+  if [[ -n "$MANDEL_RANKS_PER_NODE" && ! "$MANDEL_RANKS_PER_NODE" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: mandel --threads must be a positive integer rank count per node" >&2
+    exit 1
+  fi
+  if [[ -n "$MANDEL_RANKS_PER_NODE" && "$MANDEL_RANKS_PER_NODE" -le 0 ]]; then
+    echo "ERROR: mandel --threads must be a positive integer rank count per node" >&2
+    exit 1
+  fi
+  if [[ -z "$NP" ]]; then
+    if [[ -n "$MANDEL_RANKS_PER_NODE" ]]; then
+      NP=$((MANDEL_RANKS_PER_NODE * ${#HOSTS[@]}))
+    else
+      NP="$TOTAL_HOST_CPUS"
+    fi
+  fi
+  if [[ -n "$MANDEL_RANKS_PER_NODE" ]]; then
+    EXPECTED_NP=$((MANDEL_RANKS_PER_NODE * ${#HOSTS[@]}))
+    if [[ "$NP" != "$EXPECTED_NP" ]]; then
+      echo "ERROR: mandel --np must equal --threads * host_count when per-node mapping is used (expected $EXPECTED_NP)" >&2
+      exit 1
+    fi
+  fi
+  if [[ -z "$MANDEL_OUTPUT_ROOT" ]]; then
+    MANDEL_OUTPUT_ROOT="${REMOTE_DIR}/mandelbench-output"
+  fi
 fi
 
 if ! ping -c 1 -W 1 "$ROUTER_IP" >/dev/null 2>&1; then
@@ -225,6 +276,9 @@ if [[ "$BENCHMARK" == "file" ]]; then
 elif [[ "$BENCHMARK" == "render" ]]; then
   LOCAL_BINARY="tools/build/bin/wos_mpi_renderbench"
   REMOTE_BINARY="${REMOTE_DIR}/wos_mpi_renderbench"
+elif [[ "$BENCHMARK" == "mandel" ]]; then
+  LOCAL_BINARY="tools/build/bin/wos_mpi_mandelbench"
+  REMOTE_BINARY="${REMOTE_DIR}/wos_mpi_mandelbench"
 fi
 
 for host in "${HOSTS[@]}"; do
@@ -257,6 +311,20 @@ else
       "${REMOTE_SCRIPTS}/linux_scp.sh" "tools/benchmarks/src/mpi_filebench.cpp" \
         "${REMOTE_USER}@${LAUNCHER}:${REMOTE_BUILD_ROOT}/benchmarks/mpi_filebench.cpp"
       ;;
+    mandel)
+      "${REMOTE_SCRIPTS}/linux_scp.sh" "tools/benchmarks/src/mpi_mandelbench.cpp" \
+        "${REMOTE_USER}@${LAUNCHER}:${REMOTE_BUILD_ROOT}/benchmarks/mpi_mandelbench.cpp"
+      "${REMOTE_SCRIPTS}/linux_scp.sh" "modules/testprog/src/mandelbench/config.hpp" \
+        "${REMOTE_USER}@${LAUNCHER}:${REMOTE_BUILD_ROOT}/testprog/mandelbench/config.hpp"
+      "${REMOTE_SCRIPTS}/linux_scp.sh" "modules/testprog/src/mandelbench/util.cpp" \
+        "${REMOTE_USER}@${LAUNCHER}:${REMOTE_BUILD_ROOT}/testprog/mandelbench/util.cpp"
+      "${REMOTE_SCRIPTS}/linux_scp.sh" "modules/testprog/src/mandelbench/util.hpp" \
+        "${REMOTE_USER}@${LAUNCHER}:${REMOTE_BUILD_ROOT}/testprog/mandelbench/util.hpp"
+      "${REMOTE_SCRIPTS}/linux_scp.sh" "modules/testprog/src/mandelbench/lodepng.cpp" \
+        "${REMOTE_USER}@${LAUNCHER}:${REMOTE_BUILD_ROOT}/testprog/mandelbench/lodepng.cpp"
+      "${REMOTE_SCRIPTS}/linux_scp.sh" "modules/testprog/src/mandelbench/lodepng.hpp" \
+        "${REMOTE_USER}@${LAUNCHER}:${REMOTE_BUILD_ROOT}/testprog/mandelbench/lodepng.hpp"
+      ;;
     render)
       "${REMOTE_SCRIPTS}/linux_scp.sh" "modules/renderbench/src/main.cpp" \
         "${REMOTE_USER}@${LAUNCHER}:${REMOTE_BUILD_ROOT}/renderbench/main.cpp"
@@ -285,6 +353,14 @@ case "$benchmark" in
   file)
     mpicxx -O3 -std=c++20 -Wall -Wextra -o "$output_binary" \
       "$source_root/benchmarks/mpi_filebench.cpp"
+    ;;
+  mandel)
+    mpicxx -O3 -std=c++23 -Wall -Wextra \
+      -I "$source_root/testprog" \
+      -o "$output_binary" \
+      "$source_root/benchmarks/mpi_mandelbench.cpp" \
+      "$source_root/testprog/mandelbench/util.cpp" \
+      "$source_root/testprog/mandelbench/lodepng.cpp"
     ;;
   render)
     mpicxx -O3 -std=c++23 -Wall -Wextra -DTRACEBENCH_ENABLE_MPI=1 \
@@ -349,6 +425,10 @@ EOF
   if [[ -z "$RENDER_RUN_ID" ]]; then
     RENDER_RUN_ID="mpi-render-$(date +%Y%m%d-%H%M%S)"
   fi
+elif [[ "$BENCHMARK" == "mandel" ]]; then
+  for host in "${HOSTS[@]}"; do
+    "${REMOTE_SCRIPTS}/linux_ssh.sh" "$host" mkdir -p "$MANDEL_OUTPUT_ROOT"
+  done
 fi
 
 declare -a DNS_HOSTS=()
@@ -363,7 +443,7 @@ done
 
 DNS_HOSTS_CSV="$(IFS=,; printf '%s' "${DNS_HOSTS[*]}")"
 DNS_HOST_SLOTS_CSV=""
-if [[ "$BENCHMARK" == "render" ]]; then
+if [[ "$BENCHMARK" == "render" || "$BENCHMARK" == "mandel" ]]; then
   declare -a DNS_HOST_SLOTS=()
   for index in "${!DNS_HOSTS[@]}"; do
     DNS_HOST_SLOTS+=("${DNS_HOSTS[index]}:${HOST_CPUS[index]}")
@@ -414,6 +494,20 @@ elif [[ "$BENCHMARK" == "render" && "$RENDER_PLACEMENT" == "node-threads" ]]; th
     --map-by ppr:1:node
     --bind-to none
   )
+elif [[ "$BENCHMARK" == "mandel" ]]; then
+  if [[ -n "$MANDEL_RANKS_PER_NODE" ]]; then
+    REMOTE_ARGS+=(
+      --host "$DNS_HOST_SLOTS_CSV"
+      --map-by "ppr:${MANDEL_RANKS_PER_NODE}:node"
+      --bind-to core
+    )
+  else
+    REMOTE_ARGS+=(
+      --host "$DNS_HOST_SLOTS_CSV"
+      --map-by slot
+      --bind-to core
+    )
+  fi
 else
   REMOTE_ARGS+=(--host "$DNS_HOSTS_CSV")
 fi
@@ -429,6 +523,14 @@ if [[ "$BENCHMARK" == "net" ]]; then
   fi
 elif [[ "$BENCHMARK" == "file" ]]; then
   REMOTE_ARGS+=(--path "$FILE_PATH" --chunk-size "$CHUNK_SIZE")
+elif [[ "$BENCHMARK" == "mandel" ]]; then
+  REMOTE_ARGS+=(
+    --width "$RENDER_WIDTH"
+    --height "$RENDER_HEIGHT"
+    --max-iter "$MANDEL_MAX_ITER"
+    --repeat "$MANDEL_REPEAT"
+    --output-root "$MANDEL_OUTPUT_ROOT"
+  )
 else
   REMOTE_ARGS+=(--backend mpi)
   if [[ -n "$REMOTE_RENDER_SCENE" ]]; then
@@ -446,6 +548,9 @@ else
   )
   if [[ -n "$RENDER_THREADS" ]]; then
     REMOTE_ARGS+=(--threads "$RENDER_THREADS")
+  fi
+  if [[ "$RENDER_DEBUG_CONSTANT_TILE_US" != "0" ]]; then
+    REMOTE_ARGS+=(--debug-constant-tile-us "$RENDER_DEBUG_CONSTANT_TILE_US")
   fi
 fi
 

@@ -116,7 +116,7 @@ static_assert(sizeof(WkiIpcSharedRegion) == sizeof(WkiEpollSharedRegion), "WkiIp
 // Uses a local ring buffer filled by incoming wire messages from the home node.
 // -----------------------------------------------------------------------------
 
-constexpr uint32_t WKI_PROXY_PIPE_RING_SIZE = 65536;  // 64 KB local ring buffer
+constexpr uint32_t WKI_PROXY_PIPE_RING_SIZE = 262144;  // 256 KB local ring buffer
 
 struct ProxyIpcState {
     std::atomic<bool> active{false};
@@ -177,6 +177,8 @@ struct WkiIpcExport {
     // Server-side pump state
     std::atomic<bool> pump_running{false};
     ker::mod::sched::task::Task* pump_task = nullptr;
+    bool pump_queued = false;
+    WkiIpcExport* pump_next = nullptr;
 };
 
 struct WkiIpcPerfSnapshot {

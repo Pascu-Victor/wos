@@ -627,6 +627,9 @@ auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
 
     auto* target = sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));
     if (target == nullptr) {
+        target = ker::net::wki::wki_proxy_task_find_by_remote_pid_safe(static_cast<uint64_t>(pid));
+    }
+    if (target == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
     if (!is_live_signal_target(*target)) {

@@ -1258,8 +1258,8 @@ constexpr uint64_t WKI_TIMER_OVERDUE_BACKOFF_US = 1000;
 
 namespace {
 
-constexpr uint32_t WKI_LATENCY_DAEMON_SLICE_NS = 10'000'000;
-constexpr int WKI_LATENCY_DAEMON_NICE = 0;
+constexpr uint32_t WKI_LATENCY_DAEMON_SLICE_NS = 2'000'000;
+constexpr int WKI_LATENCY_DAEMON_NICE = -5;
 
 void promote_latency_sensitive_daemon(mod::sched::task::Task* task) {
     if (task == nullptr || task->type != mod::sched::task::TaskType::DAEMON) {
@@ -1280,11 +1280,26 @@ auto wki_has_connected_peers() -> bool {
         g_wki.peers, [](const WkiPeer& peer) -> bool { return peer.node_id != WKI_NODE_INVALID && peer.state == PeerState::CONNECTED; });
 }
 
+void wki_timer_wait_until(uint64_t deadline_us, uint32_t notify_seq_before_wait) {
+    for (;;) {
+        if (s_wki_timer_notify_seq.load(std::memory_order_acquire) != notify_seq_before_wait) {
+            return;
+        }
+
+        uint64_t const NOW_US = mod::time::get_us();
+        if (NOW_US >= deadline_us) {
+            return;
+        }
+
+        mod::sched::kern_yield();
+    }
+}
+
 }  // namespace
 
 void wki_timer_notify() {
     s_wki_timer_notify_seq.fetch_add(1, std::memory_order_release);
-    if (s_wki_timer_task != nullptr && s_wki_timer_sleep_armed.load(std::memory_order_acquire)) {
+    if (s_wki_timer_task != nullptr && s_wki_timer_sleep_armed.exchange(false, std::memory_order_acq_rel)) {
         mod::sched::kern_wake(s_wki_timer_task);
     }
 }
@@ -1347,7 +1362,8 @@ auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
             continue;
         }
 
-        mod::sched::kern_sleep_us(std::max<uint64_t>(sleep_us, 1));
+        uint64_t const WAIT_UNTIL_US = mod::time::get_us() + std::max<uint64_t>(sleep_us, 1);
+        wki_timer_wait_until(WAIT_UNTIL_US, NOTIFY_SEQ_BEFORE_SLEEP);
         s_wki_timer_sleep_armed.store(false, std::memory_order_release);
     }
 }

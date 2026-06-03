@@ -37,6 +37,7 @@ struct Options {
     int threads = 0;
     std::string run_id;
     bool debug_edge_colors = false;
+    int debug_constant_tile_us = 0;
 };
 
 struct Tile {
@@ -69,10 +70,12 @@ struct Scene;
 auto parse_options(int argc, char* const* argv, Backend default_backend, Options& options) -> ParseStatus;
 auto backend_name(Backend backend) -> const char*;
 auto placement_name(Placement placement) -> const char*;
+auto debug_render_mode_name(const Options& options) -> const char*;
 auto make_tiles(int width, int height, int tile_size) -> std::vector<Tile>;
 auto make_film_storage(int width, int height) -> std::vector<float>;
 auto load_scene(const std::string& path) -> std::shared_ptr<Scene>;
 void render_tile(const Scene& scene, FilmView film, const Options& options, const Tile& tile, uint64_t seed);
+auto render_tile_payload(const Scene& scene, std::span<float> payload, const Options& options, const Tile& tile, uint64_t seed) -> bool;
 
 auto monotonic_seconds() -> double;
 auto make_run_id() -> std::string;

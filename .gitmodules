@@ -13,3 +13,6 @@
 [submodule "toolchain/src/busybox"]
 	path = toolchain/src/busybox
 	url = https://github.com/Pascu-Victor/busybox.git
+[submodule "tools/wireshark/WireMCP"]
+	path = tools/wireshark/WireMCP
+	url = https://github.com/0xKoda/WireMCP.git
