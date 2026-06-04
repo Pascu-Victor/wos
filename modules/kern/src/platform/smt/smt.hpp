@@ -79,10 +79,17 @@ class PerCpuVar {
 template <typename T>
 class PerCpuCrossAccess {
    private:
+    struct alignas(64) PerCpuLock {
+        std::atomic<bool> locked{false};
+    };
+
+    static_assert(sizeof(PerCpuLock) == 64, "PerCpuCrossAccess locks must not share cache lines");
+    static_assert(alignof(PerCpuLock) == 64, "PerCpuCrossAccess locks must stay cache-line aligned");
+
     T* data;
 
     // Per-element spinlocks for fine-grained locking
-    std::atomic<bool>* locks;
+    PerCpuLock* locks;
 
     // IRQ-safe lock: saves RFLAGS and disables interrupts before acquiring.
     // This prevents the timer interrupt (which calls process_tasks ->
@@ -94,7 +101,7 @@ class PerCpuCrossAccess {
         // NOLINTNEXTLINE(misc-const-correctness)
         uint64_t flags = 0;
         asm volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");
-        while (locks[cpu].exchange(true, std::memory_order_acquire)) {
+        while (locks[cpu].locked.exchange(true, std::memory_order_acquire)) {
             // Spin with pause hint
             asm volatile("pause");
         }
@@ -102,16 +109,23 @@ class PerCpuCrossAccess {
     }
 
     void unlock_cpu(uint64_t cpu, uint64_t flags) {
-        locks[cpu].store(false, std::memory_order_release);
+        locks[cpu].locked.store(false, std::memory_order_release);
         // Restore interrupt state (re-enables interrupts if they were enabled before lock)
         asm volatile("push %0; popfq" ::"r"(flags) : "memory", "cc");
     }
 
    public:
-    PerCpuCrossAccess() : data(new T[get_core_count()]), locks(new std::atomic<bool>[get_core_count()]) {
-        for (uint64_t i = 0; i < get_core_count(); ++i) {
+    PerCpuCrossAccess() : data(new T[get_core_count()]), locks(nullptr) {
+        uint64_t const CORE_COUNT = get_core_count();
+        auto* raw_locks = new uint8_t[(CORE_COUNT * sizeof(PerCpuLock)) + 63];
+        auto const RAW_ADDR = reinterpret_cast<uintptr_t>(raw_locks);
+        auto const ALIGNED_ADDR = (RAW_ADDR + 63) & ~static_cast<uintptr_t>(63);
+        locks = reinterpret_cast<PerCpuLock*>(ALIGNED_ADDR);
+
+        for (uint64_t i = 0; i < CORE_COUNT; ++i) {
             new (&data[i]) T();  // Default construct each element (supports non-copyable types like std::atomic)
-            locks[i].store(false, std::memory_order_relaxed);
+            new (&locks[i]) PerCpuLock();
+            locks[i].locked.store(false, std::memory_order_relaxed);
         }
     }
 
@@ -165,7 +179,7 @@ class PerCpuCrossAccess {
         // NOLINTNEXTLINE(misc-const-correctness)
         uint64_t flags = 0;
         asm volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");
-        bool const ACQUIRED = !locks[cpu].exchange(true, std::memory_order_acquire);
+        bool const ACQUIRED = !locks[cpu].locked.exchange(true, std::memory_order_acquire);
         if (!ACQUIRED) {
             asm volatile("push %0; popfq" ::"r"(flags) : "memory", "cc");
             return false;

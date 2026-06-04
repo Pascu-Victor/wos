@@ -2120,8 +2120,13 @@ void cmd_cpustat() {
     }
 
     std::println("=== perf cpustat ===================================================");
-    std::println("{:>4}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}", "CPU", "ctx", "preempt", "yield", "sleep", "wake", "sample");
-    std::println("{:->4}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}", "", "", "", "", "", "", "");
+    std::println("{:>4}  {:>10}  {:>8}  {:>10}  {:>10}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}  {:>10}",
+                 "CPU", "ctx", "preempt", "sleep", "wake", "sample", "fast_skip", "ring_write", "timer_irq", "sched_arm", "sched_disarm",
+                 "local_poke", "slow_scan", "wait_scan", "timer_wake");
+    std::println(
+        "{:->4}  {:->10}  {:->8}  {:->10}  {:->10}  {:->8}  {:->10}  {:->10}  {:->10}  {:->10}  {:->12}  {:->10}  {:->10}  "
+        "{:->10}  {:->10}",
+        "", "", "", "", "", "", "", "", "", "", "", "", "", "", "");
 
     std::size_t pos = 0;
     while (pos < buffer->size()) {
@@ -2140,8 +2145,64 @@ void cmd_cpustat() {
             return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
         };
 
-        std::println("{:>4}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}", get_val("cpu="), get_val("ctx="), get_val("preempt="),
-                     get_val("yield="), get_val("sleep="), get_val("wake="), get_val("sample="));
+        std::println("{:>4}  {:>10}  {:>8}  {:>10}  {:>10}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}  {:>10}",
+                     get_val("cpu="), get_val("ctx="), get_val("preempt="), get_val("sleep="), get_val("wake="), get_val("sample="),
+                     get_val("fast_skip="), get_val("ring_write="), get_val("timer_irq="), get_val("sched_arm="), get_val("sched_disarm="),
+                     get_val("local_poke="), get_val("slow_scan="), get_val("wait_scan="), get_val("timer_wake="));
+    }
+
+    std::println("");
+    std::println("{:>4}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}", "CPU", "idle_arm", "idle_disarm",
+                 "idle_wake", "wake_ipi", "gc_pass", "gc_reclaim", "gc_us", "gc_max_us", "lb_push");
+    std::println("{:->4}  {:->10}  {:->12}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->8}", "", "", "", "", "", "", "", "",
+                 "", "");
+
+    pos = 0;
+    while (pos < buffer->size()) {
+        std::string_view line = next_line(*buffer, pos);
+        if (line.empty()) {
+            continue;
+        }
+
+        auto get_val = [&](std::string_view key) {
+            std::size_t key_pos = line.find(key);
+            if (key_pos == std::string_view::npos) {
+                return uint64_t{0};
+            }
+            key_pos += key.size();
+            std::size_t const END = line.find(' ', key_pos);
+            return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
+        };
+
+        std::println("{:>4}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}", get_val("cpu="), get_val("idle_arm="),
+                     get_val("idle_disarm="), get_val("idle_wake="), get_val("wake_ipi="), get_val("gc_pass="), get_val("gc_reclaim="),
+                     get_val("gc_us="), get_val("gc_max_us="), get_val("lb_push="));
+    }
+
+    std::println("");
+    std::println("{:>4}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}  {:>10}", "CPU", "arm_wait", "arm_itimer", "arm_vol", "arm_idlework",
+                 "arm_runq", "arm_comp");
+    std::println("{:->4}  {:->10}  {:->10}  {:->10}  {:->12}  {:->10}  {:->10}", "", "", "", "", "", "", "");
+
+    pos = 0;
+    while (pos < buffer->size()) {
+        std::string_view line = next_line(*buffer, pos);
+        if (line.empty()) {
+            continue;
+        }
+
+        auto get_val = [&](std::string_view key) {
+            std::size_t key_pos = line.find(key);
+            if (key_pos == std::string_view::npos) {
+                return uint64_t{0};
+            }
+            key_pos += key.size();
+            std::size_t const END = line.find(' ', key_pos);
+            return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
+        };
+
+        std::println("{:>4}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}  {:>10}", get_val("cpu="), get_val("arm_wait="), get_val("arm_itimer="),
+                     get_val("arm_vol="), get_val("arm_idlework="), get_val("arm_runq="), get_val("arm_comp="));
     }
 }
 

@@ -394,6 +394,8 @@ void dump_alloc_stats() {
 
 auto get_free_mem_bytes() -> uint64_t { return main_heap_size - (total_allocated_bytes.load() - total_freed_bytes.load()); }
 
+auto get_free_mem_pages() -> uint64_t { return free_count.load(std::memory_order_relaxed); }
+
 auto get_total_mem_bytes() -> uint64_t { return main_heap_size; }
 
 void get_alloc_stats_snapshot(AllocStatsSnapshot& out) {

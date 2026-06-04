@@ -30,6 +30,7 @@
 
 #include "platform/mm/phys.hpp"
 #include "platform/sched/task.hpp"
+#include "platform/sys/spinlock.hpp"
 
 namespace ker::net::wki {
 
@@ -89,6 +90,13 @@ template <size_t N>
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 auto hostname_equals(const std::array<char, N>& hostname, const char* other) -> bool {
     return std::strcmp(hostname.data(), other) == 0;
+}
+
+auto free_mem_wire_units() -> uint16_t {
+    constexpr uint64_t PAGES_PER_UNIT = 256;
+    uint64_t const FREE_PAGES = mod::mm::phys::get_free_mem_pages();
+    uint64_t const UNITS = FREE_PAGES / PAGES_PER_UNIT;
+    return static_cast<uint16_t>(std::min<uint64_t>(UNITS, 0xFFFFULL));
 }
 
 }  // namespace
@@ -576,7 +584,7 @@ void wki_peer_send_heartbeats() {
     HeartbeatPayload hb = {};
     hb.send_timestamp = mod::time::get_us() * 1000;  // convert to nanoseconds
     hb.sender_load = total_runnable;
-    hb.sender_mem_free = mod::mm::phys::get_free_mem_bytes();
+    hb.sender_mem_free = free_mem_wire_units();
     hb.reserved = 0;
 
     for (auto const& peer : g_wki.peers) {
@@ -642,7 +650,7 @@ void handle_heartbeat(const WkiHeader* hdr, const uint8_t* payload, uint16_t pay
     HeartbeatPayload ack = {};
     ack.send_timestamp = hb->send_timestamp;  // echo back
     ack.sender_load = ack_runnable;
-    ack.sender_mem_free = 0;  // TODO: buddy allocator free page count when API available
+    ack.sender_mem_free = free_mem_wire_units();
 
     wki_send_raw(peer->node_id, MsgType::HEARTBEAT_ACK, &ack, sizeof(ack), WKI_FLAG_PRIORITY);
 }
@@ -1016,7 +1024,7 @@ auto wki_send_heartbeat_probe(WkiPeer* peer) -> int {
     HeartbeatPayload probe = {};
     probe.send_timestamp = mod::time::get_us() * 1000;
     probe.sender_load = 0;
-    probe.sender_mem_free = 0;
+    probe.sender_mem_free = free_mem_wire_units();
     probe.reserved = 0;
     return wki_send_raw(peer->node_id, MsgType::HEARTBEAT, &probe, sizeof(probe), WKI_FLAG_PRIORITY);
 }
@@ -1249,10 +1257,11 @@ auto wki_peer_get_hostname(uint16_t node_id) -> const char* {
 // WKI timer kernel thread - runs wki_peer_timer_tick() with deadline-driven sleeps
 // -----------------------------------------------------------------------------
 
-// Keep the fallback poll interval close to the latency target so that any
-// missed timer wake edge is repaired in a couple of milliseconds instead of
-// tens of milliseconds.
-constexpr uint64_t WKI_TIMER_CONNECTED_POLL_US = 2000;
+// Exact WKI retransmit, ACK, event retry, wait, heartbeat, and peer-liveness
+// deadlines drive the timer thread now. Keep only a coarse connected-peer
+// maintenance cadence for legacy deferred work and RDMA block-ring polling that
+// still piggyback here.
+constexpr uint64_t WKI_TIMER_CONNECTED_MAINTENANCE_US = 500000;
 constexpr uint64_t WKI_TIMER_IDLE_SLEEP_US = 1000000;
 constexpr uint64_t WKI_TIMER_OVERDUE_BACKOFF_US = 1000;
 
@@ -1339,7 +1348,8 @@ auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
         wki_peer_timer_tick(now_us);
 
         now_us = mod::time::get_us();
-        uint64_t const NEXT_DEADLINE = std::min(wki_next_fast_timer_deadline_us(now_us), wki_next_periodic_deadline_us(now_us));
+        uint64_t const NEXT_DEADLINE = std::min(
+            {wki_next_fast_timer_deadline_us(now_us), wki_event_next_timer_deadline_us(now_us), wki_next_periodic_deadline_us(now_us)});
         uint64_t sleep_us = WKI_TIMER_IDLE_SLEEP_US;
         if (NEXT_DEADLINE != UINT64_MAX) {
             if (NEXT_DEADLINE <= now_us) {
@@ -1350,7 +1360,7 @@ auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
         }
 
         if (wki_has_connected_peers()) {
-            sleep_us = std::min(sleep_us, WKI_TIMER_CONNECTED_POLL_US);
+            sleep_us = std::min(sleep_us, WKI_TIMER_CONNECTED_MAINTENANCE_US);
         }
 
         // Detect a notify that races with the sleep transition without turning

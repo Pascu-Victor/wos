@@ -581,6 +581,11 @@ uint8_t wake_ipi_vector = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global
 
 // Cached APIC timer tick count for the idle timer.
 uint32_t idle_timer_ticks = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+constexpr uint64_t IDLE_TIMER_CALIBRATION_US = 10'000;
+constexpr uint32_t SCHED_GC_RECLAIM_BUDGET = 32;
+std::atomic<bool> scheduler_gc_requested{false};       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> scheduler_gc_worker_started{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<task::Task*> scheduler_gc_task{nullptr};   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 constexpr uint8_t PERF_TIMER_VECTOR = 32;
 constexpr uint16_t PERF_IRQ_KIND_TIMER = 4;
 constexpr uint32_t PERF_IRQ_SLOW_TRACE_US = 30;
@@ -684,13 +689,75 @@ inline void finish_wait_metadata_for_runqueue(task::Task* t) {
     t->wait_channel = nullptr;
 }
 
+inline auto min_nonzero_deadline(uint64_t lhs, uint64_t rhs) -> uint64_t {
+    if (lhs == 0) {
+        return rhs;
+    }
+    if (rhs == 0) {
+        return lhs;
+    }
+    return std::min(lhs, rhs);
+}
+
+inline auto task_wait_deadline_us(task::Task const* t) -> uint64_t {
+    if (t == nullptr) {
+        return 0;
+    }
+    return min_nonzero_deadline(t->wake_at_us, t->itimer_real_expire_us);
+}
+
+inline void note_wait_deadline_locked(RunQueue* rq, task::Task const* t) {
+    uint64_t const DEADLINE_US = task_wait_deadline_us(t);
+    if (rq == nullptr || DEADLINE_US == 0) {
+        return;
+    }
+    if (rq->next_wait_deadline_us == 0 || DEADLINE_US < rq->next_wait_deadline_us) {
+        rq->next_wait_deadline_us = DEADLINE_US;
+    }
+}
+
+inline void recompute_wait_deadline_locked(RunQueue* rq) {
+    if (rq == nullptr) {
+        return;
+    }
+    uint64_t next_deadline = 0;
+    for (task::Task const* cur = rq->wait_list.head; cur != nullptr; cur = cur->sched_next) {
+        next_deadline = min_nonzero_deadline(next_deadline, task_wait_deadline_us(cur));
+    }
+    rq->next_wait_deadline_us = next_deadline;
+}
+
+inline void wait_list_push_locked(RunQueue* rq, task::Task* t) {
+    if (rq == nullptr || t == nullptr) {
+        return;
+    }
+    rq->wait_list.push(t);
+    note_wait_deadline_locked(rq, t);
+}
+
+inline auto wait_list_remove_locked(RunQueue* rq, task::Task* t) -> bool {
+    if (rq == nullptr || t == nullptr) {
+        return false;
+    }
+    uint64_t const OLD_DEADLINE_US = task_wait_deadline_us(t);
+    bool const REMOVED = rq->wait_list.remove(t);
+    if (REMOVED && OLD_DEADLINE_US != 0 && OLD_DEADLINE_US <= rq->next_wait_deadline_us) {
+        recompute_wait_deadline_locked(rq);
+    }
+    return REMOVED;
+}
+
+inline void wait_list_remove_all_locked(RunQueue* rq, task::Task* t) {
+    while (wait_list_remove_locked(rq, t)) {
+    }
+}
+
 inline void repair_stale_wait_membership_locked(RunQueue* rq, task::Task* t) {
     if (rq == nullptr || t == nullptr || !rq->runnable_heap.contains(t)) {
         return;
     }
 
-    while (rq->wait_list.remove(t)) {
-    }
+    wait_list_remove_all_locked(rq, t);
     t->sched_queue = task::Task::sched_queue::RUNNABLE;
     t->wants_block = false;
     t->wake_at_us = 0;
@@ -721,8 +788,7 @@ void requeue_woken_outgoing_task_locked(RunQueue* rq, task::Task* outgoing, uint
     }
 
     char const* const WAIT_CHANNEL = outgoing->wait_channel;
-    while (rq->wait_list.remove(outgoing)) {
-    }
+    wait_list_remove_all_locked(rq, outgoing);
     outgoing->wants_block = false;
     outgoing->wake_at_us = 0;
     finish_wait_metadata_for_runqueue(outgoing);
@@ -1185,16 +1251,36 @@ void request_local_reschedule() {
     auto* rq = run_queues->this_cpu();
     if (rq != nullptr) {
         rq->local_reschedule_requests.fetch_add(1, std::memory_order_relaxed);
+        if (rq->resched_timer_pending.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
     }
-    sys::context_switch::request_reschedule();
+    if (!sys::context_switch::request_reschedule() && rq != nullptr) {
+        rq->resched_timer_pending.store(false, std::memory_order_release);
+    }
 }
 
 void arm_idle_timer_locked(RunQueue* rq) {
-    rq->idle_timer_arms.fetch_add(1, std::memory_order_relaxed);
-    if (idle_timer_ticks == 0) {
-        idle_timer_ticks = apic::calibrate_timer(10000);
+    uint64_t const DEADLINE_US = rq->next_wait_deadline_us;
+    if (DEADLINE_US == 0) {
+        rq->idle_timer_disarms.fetch_add(1, std::memory_order_relaxed);
+        return;
     }
-    apic::one_shot_timer(idle_timer_ticks);
+
+    if (idle_timer_ticks == 0) {
+        idle_timer_ticks = apic::calibrate_timer(IDLE_TIMER_CALIBRATION_US);
+    }
+
+    uint64_t const NOW_US = time::get_us();
+    uint64_t delta_us = DEADLINE_US > NOW_US ? DEADLINE_US - NOW_US : 1;
+    delta_us = std::min<uint64_t>(delta_us, IDLE_TIMER_CALIBRATION_US);
+    uint64_t ticks = (static_cast<uint64_t>(idle_timer_ticks) * delta_us) / IDLE_TIMER_CALIBRATION_US;
+    if (ticks == 0) {
+        ticks = 1;
+    }
+
+    rq->idle_timer_arms.fetch_add(1, std::memory_order_relaxed);
+    apic::one_shot_timer(ticks);
 }
 
 // Enter the kernel idle loop on the idle task's stack. Does NOT return.
@@ -1224,8 +1310,15 @@ void scheduler_wake_handler([[maybe_unused]] cpu::GPRegs gpr, [[maybe_unused]] g
     auto* rq = run_queues->this_cpu();
     if (rq->runnable_heap.size > 0) {
         rq->is_idle.store(false, std::memory_order_release);
-        // Trigger an immediate scheduling pass via the timer path.
-        request_local_reschedule();
+        // Wake IPIs are the rescue path for CPUs halted in the idle loop.  The
+        // idle loop does not inspect the runqueue after an interrupt returns;
+        // it immediately executes hlt again.  Program the local APIC timer
+        // directly here instead of going through the coalesced same-CPU poke
+        // path, because a stale pending bit would otherwise strand runnable
+        // work on a tickless idle CPU.
+        rq->resched_timer_pending.store(true, std::memory_order_release);
+        note_local_reschedule_timer_poke();
+        apic::one_shot_timer(1);
     }
 }
 
@@ -1335,6 +1428,8 @@ void account_task_runtime_delta(task::Task* task, uint64_t now_us, uint64_t delt
 }
 
 }  // namespace
+
+void request_local_timer_recheck() { request_local_reschedule(); }
 
 void set_task_nice(task::Task* task, int nice) { set_task_nice_impl(task, nice); }
 
@@ -1466,7 +1561,7 @@ auto post_task_waiting(task::Task* task) -> bool {
         if (task->sched_queue == task::Task::sched_queue::NONE) {
             task->last_sleep_start_us = NOW_US;
             task->sched_queue = task::Task::sched_queue::WAITING;
-            rq->wait_list.push(task);
+            wait_list_push_locked(rq, task);
             parked = true;
             return;
         }
@@ -1486,7 +1581,7 @@ auto post_task_waiting(task::Task* task) -> bool {
         remove_from_sums(rq, task);
         rq->runnable_heap.remove(task);
         task->sched_queue = task::Task::sched_queue::WAITING;
-        rq->wait_list.push(task);
+        wait_list_push_locked(rq, task);
         perf::record_sleep(static_cast<uint32_t>(target_cpu), task->pid, WAKE_AT_US, perf_sleep_flags(WAKE_AT_US), task->last_run_us,
                            perf_wait_callsite(task), task->wait_channel);
         parked = true;
@@ -1832,14 +1927,14 @@ auto debug_stop_task(task::Task* task) -> bool {
                 task->last_sleep_start_us = time::get_us();
                 task->sched_queue = task::Task::sched_queue::WAITING;
                 task->wait_channel = "ptrace";
-                rq->wait_list.push(task);
+                wait_list_push_locked(rq, task);
                 found = true;
                 return;
             }
-            if (rq->wait_list.remove(task)) {
+            if (wait_list_remove_locked(rq, task)) {
                 task->sched_queue = task::Task::sched_queue::WAITING;
                 task->wait_channel = "ptrace";
-                rq->wait_list.push(task);
+                wait_list_push_locked(rq, task);
                 found = true;
             }
         });
@@ -1881,11 +1976,17 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
     {
         uint64_t const NOW_US = time::get_us();
         run_queues->this_cpu_locked_void([NOW_US, &signal_wake, &signal_wake_count](RunQueue* rq) {
+            if (rq->next_wait_deadline_us == 0 || NOW_US < rq->next_wait_deadline_us) {
+                return;
+            }
+
             // Collect tasks to wake (can't modify list while iterating)
             PendingWakeList to_wake{};
             uint32_t wake_count = 0;
+            uint64_t scan_iterations = 0;
             task::Task* t = rq->wait_list.head;
             while (t != nullptr && wake_count < PENDING_WAKE_LIMIT) {
+                scan_iterations++;
                 if (t->wake_at_us != 0 && NOW_US >= t->wake_at_us) {
                     pending_wake_slot(to_wake, wake_count++) = t;
                 } else if (t->itimer_real_expire_us != 0 && NOW_US >= t->itimer_real_expire_us && signal_wake_count < PENDING_WAKE_LIMIT) {
@@ -1899,9 +2000,10 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                 }
                 t = t->sched_next;
             }
+            rq->wait_list_scan_iterations.fetch_add(scan_iterations, std::memory_order_relaxed);
             for (uint32_t i = 0; i < wake_count; i++) {
                 task::Task* w = pending_wake_slot(to_wake, i);
-                rq->wait_list.remove(w);
+                wait_list_remove_locked(rq, w);
                 // Mark freshly woken: inhibits immediate wakeup-preemption (see process_tasks guard).
                 bool const LOW_LATENCY_HANDOFF = is_low_latency_handoff_wait_channel(w->wait_channel);
                 w->just_woke = !LOW_LATENCY_HANDOFF;
@@ -1925,6 +2027,10 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                     add_to_sums(rq, w);
                 }
             }
+            if (wake_count != 0) {
+                rq->timer_expired_wakeups.fetch_add(wake_count, std::memory_order_relaxed);
+            }
+            recompute_wait_deadline_locked(rq);
         });
     }
     for (uint32_t i = 0; i < signal_wake_count; ++i) {
@@ -1970,7 +2076,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                 rq->runnable_heap.remove(t);
                 t->sched_queue = task::Task::sched_queue::WAITING;
                 t->wait_channel = "ptrace";
-                rq->wait_list.push(t);
+                wait_list_push_locked(rq, t);
                 return nullptr;
             }
             if (t->type == task::TaskType::PROCESS && (t->thread == nullptr || t->pagemap == nullptr)) {
@@ -2154,10 +2260,9 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                 remove_from_sums(rq, current_task);
                 rq->runnable_heap.remove(current_task);
             }
-            while (rq->wait_list.remove(current_task)) {
-            }
+            wait_list_remove_all_locked(rq, current_task);
             current_task->sched_queue = task::Task::sched_queue::WAITING;
-            rq->wait_list.push(current_task);
+            wait_list_push_locked(rq, current_task);
             // Perf: task going to sleep (wants_block)
             perf::record_sleep(static_cast<uint32_t>(cpu::current_cpu()), current_task->pid, WAKE_AT_US, perf_sleep_flags(WAKE_AT_US),
                                current_task->last_run_us, perf_wait_callsite(current_task), current_task->wait_channel);
@@ -2172,7 +2277,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             rq->runnable_heap.remove(current_task);
             current_task->sched_queue = task::Task::sched_queue::WAITING;
             current_task->wait_channel = "ptrace";
-            rq->wait_list.push(current_task);
+            wait_list_push_locked(rq, current_task);
             blocked_current_task = true;
         }
 
@@ -2189,7 +2294,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             rq->runnable_heap.remove(next);
             next->sched_queue = task::Task::sched_queue::WAITING;
             next->wait_channel = "ptrace";
-            rq->wait_list.push(next);
+            wait_list_push_locked(rq, next);
             return nullptr;
         }
 
@@ -2351,7 +2456,7 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
             }
             // The intrusive wait list owns schedNext, so detach by actual
             // membership rather than trusting sched_queue to still be accurate.
-            rq->wait_list.remove(exiting_task);
+            wait_list_remove_locked(rq, exiting_task);
             exiting_task->sched_queue = task::Task::sched_queue::NONE;
         }
 
@@ -2965,7 +3070,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                 current_task->last_sleep_start_us = NOW_US;
                 uint64_t const WAKE_AT_US = current_task->wake_at_us;
                 current_task->sched_queue = task::Task::sched_queue::WAITING;
-                rq->wait_list.push(current_task);
+                wait_list_push_locked(rq, current_task);
                 perf::record_sleep(static_cast<uint32_t>(cpu::current_cpu()), current_task->pid, WAKE_AT_US, perf_sleep_flags(WAKE_AT_US),
                                    current_task->last_run_us, perf_wait_callsite(current_task), current_task->wait_channel);
                 notify_wki_proxy_blocked = current_task->wki_proxy_task_id != 0;
@@ -3008,7 +3113,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
 
                 if (woke && current_task->sched_queue == task::Task::sched_queue::WAITING) {
                     char const* const WAIT_CHANNEL = current_task->wait_channel;
-                    rq->wait_list.remove(current_task);
+                    wait_list_remove_locked(rq, current_task);
                     current_task->wants_block = false;
                     current_task->wake_at_us = 0;
                     finish_wait_metadata_for_runqueue(current_task);
@@ -3196,7 +3301,7 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Inter
         current_task->perf_wait_callsite = current_task->context.frame.rip;
         current_task->last_sleep_start_us = NOW_US;
         current_task->sched_queue = task::Task::sched_queue::WAITING;
-        rq->wait_list.push(current_task);
+        wait_list_push_locked(rq, current_task);
 
         // Pick next
         if (rq->runnable_heap.size == 0) {
@@ -3296,7 +3401,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
                                            found_and_removed = true;
                                            return;
                                        }
-                                       if (rq->wait_list.remove(task)) {
+                                       if (wait_list_remove_locked(rq, task)) {
                                            found_and_removed = true;
                                        }
                                        if (rq->runnable_heap.contains(task)) {
@@ -3328,7 +3433,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
 #endif
                         return;
                     }
-                    if (rq->wait_list.remove(task)) {
+                    if (wait_list_remove_locked(rq, task)) {
                         found_and_removed = true;
 #ifdef SCHED_DEBUG
                         dbg::log("RESCHED: PID %x removed from CPU %d wait_list", task->pid, static_cast<int>(search_cpu));
@@ -3679,8 +3784,7 @@ void insert_into_dead_list(task::Task* task) {
         if (runqueue_task_is_reserved_locked(rq, task)) {
             found_current = true;
         }
-        while (rq->wait_list.remove(task)) {
-        }
+        wait_list_remove_all_locked(rq, task);
         while (rq->runnable_heap.contains(task)) {
             remove_from_sums(rq, task);
             rq->runnable_heap.remove(task);
@@ -3711,17 +3815,22 @@ void insert_into_dead_list(task::Task* task) {
     run_queues->with_lock_void(0, [task](RunQueue* rq) { rq->dead_list.push(task); });
 }
 
-void gc_expired_tasks() {
-    for (uint64_t cpu_no = 0; cpu_no < smt::get_core_count(); ++cpu_no) {
-        run_queues->with_lock_void(cpu_no, [cpu_no](RunQueue* rq) -> void {
+auto gc_expired_tasks_budgeted(uint32_t max_tasks) -> uint32_t {
+    if (max_tasks == 0 || run_queues == nullptr) {
+        return 0;
+    }
+
+    uint32_t reclaimed = 0;
+    for (uint64_t cpu_no = 0; cpu_no < smt::get_core_count() && reclaimed < max_tasks; ++cpu_no) {
+        run_queues->with_lock_void(cpu_no, [cpu_no, max_tasks, &reclaimed](RunQueue* rq) -> void {
 #ifndef SCHED_DEBUG
             (void)cpu_no;
 #endif
             bool made_progress = true;
-            while (made_progress) {
+            while (made_progress && reclaimed < max_tasks) {
                 made_progress = false;
                 task::Task* cur = rq->dead_list.head;
-                while (cur != nullptr) {
+                while (cur != nullptr && reclaimed < max_tasks) {
                     task::Task* next = cur->sched_next;
 
                     if (cur->state.load(std::memory_order_acquire) != task::TaskState::DEAD) {
@@ -3817,6 +3926,7 @@ void gc_expired_tasks() {
                         while (rq->dead_list.remove(cur)) {
                         }
                         dbg::log("GC: Leaking corrupted task %p to avoid crash", cur);
+                        reclaimed++;
                         made_progress = true;
                         break;
                     }
@@ -3948,12 +4058,90 @@ void gc_expired_tasks() {
 
                     delete cur;
 
+                    reclaimed++;
                     made_progress = true;
                     break;  // Restart from head after removal
                 }
             }
         });
     }
+    return reclaimed;
+}
+
+void gc_expired_tasks() { (void)gc_expired_tasks_budgeted(UINT32_MAX); }
+
+namespace {
+
+void note_gc_pass_result(uint32_t reclaimed, uint64_t elapsed_us) {
+    if (run_queues == nullptr) {
+        return;
+    }
+
+    auto* rq = run_queues->this_cpu();
+    if (rq == nullptr) {
+        return;
+    }
+
+    rq->gc_passes_triggered.fetch_add(1, std::memory_order_relaxed);
+    rq->gc_tasks_reclaimed.fetch_add(reclaimed, std::memory_order_relaxed);
+    rq->gc_work_us_total.fetch_add(elapsed_us, std::memory_order_relaxed);
+
+    uint64_t observed = rq->gc_work_us_max.load(std::memory_order_relaxed);
+    while (elapsed_us > observed &&
+           !rq->gc_work_us_max.compare_exchange_weak(observed, elapsed_us, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+void scheduler_gc_thread_main() {
+    for (;;) {
+        if (!scheduler_gc_requested.exchange(false, std::memory_order_acq_rel)) {
+            kern_block();
+            continue;
+        }
+
+        uint64_t const START_US = time::get_us();
+        uint32_t const RECLAIMED = gc_expired_tasks_budgeted(SCHED_GC_RECLAIM_BUDGET);
+        uint64_t const END_US = time::get_us();
+        note_gc_pass_result(RECLAIMED, END_US >= START_US ? END_US - START_US : 0);
+
+        if (RECLAIMED >= SCHED_GC_RECLAIM_BUDGET) {
+            scheduler_gc_requested.store(true, std::memory_order_release);
+            kern_yield();
+        }
+    }
+}
+
+}  // namespace
+
+void request_gc() {
+    scheduler_gc_requested.store(true, std::memory_order_release);
+
+    auto* task = scheduler_gc_task.load(std::memory_order_acquire);
+    if (task == nullptr) {
+        return;
+    }
+
+    uint64_t target_cpu = task->cpu;
+    if (target_cpu >= smt::get_core_count()) {
+        target_cpu = 0;
+    }
+    wake_task_from_event_on_cpu(task, target_cpu, EventWakeDeferredSwitch::PRESERVE);
+}
+
+void start_gc_worker() {
+    bool expected = false;
+    if (!scheduler_gc_worker_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+
+    auto* gc_task = task::Task::create_kernel_thread("sched_gc", scheduler_gc_thread_main);
+    if (gc_task == nullptr) {
+        scheduler_gc_worker_started.store(false, std::memory_order_release);
+        return;
+    }
+
+    scheduler_gc_task.store(gc_task, std::memory_order_release);
+    (void)post_task_for_cpu(0, gc_task);
 }
 
 // ============================================================================
@@ -3990,10 +4178,160 @@ void note_scheduler_timer_interrupt() {
     if (rq == nullptr) {
         return;
     }
+    rq->scheduler_timer_interrupts.fetch_add(1, std::memory_order_relaxed);
+    rq->resched_timer_pending.store(false, std::memory_order_release);
     auto* current = rq->current_task;
     if (current == nullptr || current->type == task::TaskType::IDLE) {
         rq->idle_timer_wakeups.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+void note_scheduler_timer_arm() {
+    if (run_queues == nullptr) {
+        return;
+    }
+    auto* rq = run_queues->this_cpu();
+    if (rq == nullptr) {
+        return;
+    }
+    rq->scheduler_timer_arms.fetch_add(1, std::memory_order_relaxed);
+}
+
+void note_scheduler_timer_disarm() {
+    if (run_queues == nullptr) {
+        return;
+    }
+    auto* rq = run_queues->this_cpu();
+    if (rq == nullptr) {
+        return;
+    }
+    rq->scheduler_timer_disarms.fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace {
+
+enum class SchedulerTimerArmReason : uint8_t {
+    WAIT_DEADLINE,
+    ITIMER,
+    VOLUNTARY_BLOCK,
+    IDLE_WORK,
+    RUNQUEUE,
+    COMPETITOR,
+};
+
+void note_scheduler_timer_arm_reason_locked(RunQueue* rq, SchedulerTimerArmReason reason) {
+    if (rq == nullptr) {
+        return;
+    }
+
+    switch (reason) {
+        case SchedulerTimerArmReason::WAIT_DEADLINE:
+            rq->scheduler_timer_arm_wait_deadline.fetch_add(1, std::memory_order_relaxed);
+            return;
+        case SchedulerTimerArmReason::ITIMER:
+            rq->scheduler_timer_arm_itimer.fetch_add(1, std::memory_order_relaxed);
+            return;
+        case SchedulerTimerArmReason::VOLUNTARY_BLOCK:
+            rq->scheduler_timer_arm_voluntary.fetch_add(1, std::memory_order_relaxed);
+            return;
+        case SchedulerTimerArmReason::IDLE_WORK:
+            rq->scheduler_timer_arm_idle_work.fetch_add(1, std::memory_order_relaxed);
+            return;
+        case SchedulerTimerArmReason::RUNQUEUE:
+            rq->scheduler_timer_arm_runqueue.fetch_add(1, std::memory_order_relaxed);
+            return;
+        case SchedulerTimerArmReason::COMPETITOR:
+            rq->scheduler_timer_arm_competitor.fetch_add(1, std::memory_order_relaxed);
+            return;
+    }
+}
+
+}  // namespace
+
+auto get_scheduler_timer_decision_for_this_cpu(uint64_t now_us) -> SchedulerTimerDecision {
+    SchedulerTimerDecision const FIXED_QUANTUM{
+        .arm = true,
+        .use_deadline_delta = false,
+        .deadline_delta_us = 0,
+    };
+    SchedulerTimerDecision const DISARM{
+        .arm = false,
+        .use_deadline_delta = false,
+        .deadline_delta_us = 0,
+    };
+
+    if (run_queues == nullptr) {
+        return FIXED_QUANTUM;
+    }
+
+    return run_queues->this_cpu_locked([now_us, FIXED_QUANTUM, DISARM](RunQueue* rq) -> SchedulerTimerDecision {
+        if (rq == nullptr) {
+            return FIXED_QUANTUM;
+        }
+
+        // current_task tracks the live stack until the assembly return boundary
+        // commits a switch.  Timer programming cares about the task we will
+        // return to, so treat a reserved handoff as the effective running task.
+        auto* const CURRENT = rq->handoff_task != nullptr ? rq->handoff_task : rq->current_task;
+        bool const CURRENT_IS_IDLE = CURRENT == nullptr || CURRENT->type == task::TaskType::IDLE;
+
+        // kern_yield-style wait loops remain runnable and halt voluntarily.
+        // Keep a tick for those so condition polling cannot sleep forever.
+        if (CURRENT != nullptr && CURRENT->voluntary_block) {
+            note_scheduler_timer_arm_reason_locked(rq, SchedulerTimerArmReason::VOLUNTARY_BLOCK);
+            return FIXED_QUANTUM;
+        }
+
+        if (rq->runnable_heap.size != 0 && CURRENT_IS_IDLE) {
+            note_scheduler_timer_arm_reason_locked(rq, SchedulerTimerArmReason::IDLE_WORK);
+            return FIXED_QUANTUM;
+        }
+
+        if (rq->runnable_heap.size > 1) {
+            note_scheduler_timer_arm_reason_locked(rq, SchedulerTimerArmReason::RUNQUEUE);
+            return FIXED_QUANTUM;
+        }
+
+        if (rq->runnable_heap.size == 1 && !CURRENT_IS_IDLE && !rq->runnable_heap.contains(CURRENT)) {
+            note_scheduler_timer_arm_reason_locked(rq, SchedulerTimerArmReason::COMPETITOR);
+            return FIXED_QUANTUM;
+        }
+
+        uint64_t next_deadline_us = 0;
+        SchedulerTimerArmReason deadline_reason = SchedulerTimerArmReason::WAIT_DEADLINE;
+        if (rq->next_wait_deadline_us != 0) {
+            next_deadline_us = rq->next_wait_deadline_us;
+            deadline_reason = SchedulerTimerArmReason::WAIT_DEADLINE;
+        }
+
+        if (CURRENT != nullptr && CURRENT->itimer_real_expire_us != 0 &&
+            (next_deadline_us == 0 || CURRENT->itimer_real_expire_us < next_deadline_us)) {
+            next_deadline_us = CURRENT->itimer_real_expire_us;
+            deadline_reason = SchedulerTimerArmReason::ITIMER;
+        }
+
+        if (next_deadline_us == 0) {
+            return DISARM;
+        }
+
+        note_scheduler_timer_arm_reason_locked(rq, deadline_reason);
+        return SchedulerTimerDecision{
+            .arm = true,
+            .use_deadline_delta = true,
+            .deadline_delta_us = next_deadline_us > now_us ? next_deadline_us - now_us : 1,
+        };
+    });
+}
+
+void note_local_reschedule_timer_poke() {
+    if (run_queues == nullptr) {
+        return;
+    }
+    auto* rq = run_queues->this_cpu();
+    if (rq == nullptr) {
+        return;
+    }
+    rq->local_reschedule_timer_pokes.fetch_add(1, std::memory_order_relaxed);
 }
 
 void account_irq_time_us(uint64_t elapsed_us) {
@@ -4124,9 +4462,25 @@ auto get_scheduler_trace_stats(uint64_t cpu_no) -> SchedulerTraceStats {
             .idle_timer_arms = rq->idle_timer_arms.load(std::memory_order_relaxed),
             .idle_timer_disarms = rq->idle_timer_disarms.load(std::memory_order_relaxed),
             .idle_timer_wakeups = rq->idle_timer_wakeups.load(std::memory_order_relaxed),
+            .scheduler_timer_interrupts = rq->scheduler_timer_interrupts.load(std::memory_order_relaxed),
+            .scheduler_timer_arms = rq->scheduler_timer_arms.load(std::memory_order_relaxed),
+            .scheduler_timer_disarms = rq->scheduler_timer_disarms.load(std::memory_order_relaxed),
+            .scheduler_timer_arm_wait_deadline = rq->scheduler_timer_arm_wait_deadline.load(std::memory_order_relaxed),
+            .scheduler_timer_arm_itimer = rq->scheduler_timer_arm_itimer.load(std::memory_order_relaxed),
+            .scheduler_timer_arm_voluntary = rq->scheduler_timer_arm_voluntary.load(std::memory_order_relaxed),
+            .scheduler_timer_arm_idle_work = rq->scheduler_timer_arm_idle_work.load(std::memory_order_relaxed),
+            .scheduler_timer_arm_runqueue = rq->scheduler_timer_arm_runqueue.load(std::memory_order_relaxed),
+            .scheduler_timer_arm_competitor = rq->scheduler_timer_arm_competitor.load(std::memory_order_relaxed),
             .wake_ipis_sent = rq->wake_ipis_sent.load(std::memory_order_relaxed),
             .local_reschedule_requests = rq->local_reschedule_requests.load(std::memory_order_relaxed),
+            .local_reschedule_timer_pokes = rq->local_reschedule_timer_pokes.load(std::memory_order_relaxed),
             .slow_reschedule_scans = rq->slow_reschedule_scans.load(std::memory_order_relaxed),
+            .wait_list_scan_iterations = rq->wait_list_scan_iterations.load(std::memory_order_relaxed),
+            .timer_expired_wakeups = rq->timer_expired_wakeups.load(std::memory_order_relaxed),
+            .gc_passes_triggered = rq->gc_passes_triggered.load(std::memory_order_relaxed),
+            .gc_tasks_reclaimed = rq->gc_tasks_reclaimed.load(std::memory_order_relaxed),
+            .gc_work_us_total = rq->gc_work_us_total.load(std::memory_order_relaxed),
+            .gc_work_us_max = rq->gc_work_us_max.load(std::memory_order_relaxed),
             .load_balance_pushes = rq->load_balance_pushes.load(std::memory_order_relaxed),
         };
     });
@@ -4180,15 +4534,26 @@ void dump_scheduler_trace_stats() {
     for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
         auto stats = get_scheduler_trace_stats(cpu_no);
         if (stats.idle_timer_arms == 0 && stats.idle_timer_disarms == 0 && stats.idle_timer_wakeups == 0 && stats.wake_ipis_sent == 0 &&
-            stats.local_reschedule_requests == 0 && stats.slow_reschedule_scans == 0 && stats.load_balance_pushes == 0) {
+            stats.local_reschedule_requests == 0 && stats.slow_reschedule_scans == 0 && stats.load_balance_pushes == 0 &&
+            stats.scheduler_timer_interrupts == 0 && stats.scheduler_timer_arms == 0 && stats.scheduler_timer_disarms == 0 &&
+            stats.local_reschedule_timer_pokes == 0 && stats.wait_list_scan_iterations == 0 && stats.timer_expired_wakeups == 0 &&
+            stats.gc_passes_triggered == 0 && stats.gc_tasks_reclaimed == 0) {
             continue;
         }
 
-        dbg::log("schedstats: cpu%lu idle_arm=%lu idle_disarm=%lu idle_wake=%lu wake_ipi=%lu local_resched=%lu slow_scan=%lu lb_push=%lu",
-                 static_cast<unsigned long>(cpu_no), static_cast<unsigned long>(stats.idle_timer_arms),
-                 static_cast<unsigned long>(stats.idle_timer_disarms), static_cast<unsigned long>(stats.idle_timer_wakeups),
-                 static_cast<unsigned long>(stats.wake_ipis_sent), static_cast<unsigned long>(stats.local_reschedule_requests),
-                 static_cast<unsigned long>(stats.slow_reschedule_scans), static_cast<unsigned long>(stats.load_balance_pushes));
+        dbg::log(
+            "schedstats: cpu%lu timer_irq=%lu sched_arm=%lu sched_disarm=%lu idle_arm=%lu idle_disarm=%lu idle_wake=%lu wake_ipi=%lu "
+            "local_resched=%lu local_poke=%lu slow_scan=%lu wait_scan=%lu timer_wake=%lu gc_pass=%lu gc_reclaim=%lu gc_us=%lu "
+            "gc_max_us=%lu lb_push=%lu",
+            static_cast<unsigned long>(cpu_no), static_cast<unsigned long>(stats.scheduler_timer_interrupts),
+            static_cast<unsigned long>(stats.scheduler_timer_arms), static_cast<unsigned long>(stats.scheduler_timer_disarms),
+            static_cast<unsigned long>(stats.idle_timer_arms), static_cast<unsigned long>(stats.idle_timer_disarms),
+            static_cast<unsigned long>(stats.idle_timer_wakeups), static_cast<unsigned long>(stats.wake_ipis_sent),
+            static_cast<unsigned long>(stats.local_reschedule_requests), static_cast<unsigned long>(stats.local_reschedule_timer_pokes),
+            static_cast<unsigned long>(stats.slow_reschedule_scans), static_cast<unsigned long>(stats.wait_list_scan_iterations),
+            static_cast<unsigned long>(stats.timer_expired_wakeups), static_cast<unsigned long>(stats.gc_passes_triggered),
+            static_cast<unsigned long>(stats.gc_tasks_reclaimed), static_cast<unsigned long>(stats.gc_work_us_total),
+            static_cast<unsigned long>(stats.gc_work_us_max), static_cast<unsigned long>(stats.load_balance_pushes));
     }
 }
 

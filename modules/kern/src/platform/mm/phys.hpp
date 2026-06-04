@@ -86,6 +86,7 @@ void dump_caller_page_stats();  // Dump per-call-site histogram when WOS_PHYS_AL
 void enable_stack_overlap_check();
 
 auto get_free_mem_bytes() -> uint64_t;
+auto get_free_mem_pages() -> uint64_t;
 auto get_total_mem_bytes() -> uint64_t;
 
 void get_alloc_stats_snapshot(AllocStatsSnapshot& out);

@@ -176,6 +176,7 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
             } else {
                 task->itimer_real_expire_us = ker::mod::time::get_us() + NEW_VAL_US;
                 task->itimer_real_interval_us = NEW_INTERVAL_US;
+                ker::mod::sched::request_local_timer_recheck();
             }
             return 0;
         }

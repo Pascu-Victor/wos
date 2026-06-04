@@ -10,7 +10,7 @@ namespace ker::mod::sys::context_switch {
 // and caller should fall back to idle loop
 auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task* next_task) -> bool;
 void start_sched_timer();
-void request_reschedule();
+auto request_reschedule() -> bool;
 auto can_request_local_reschedule() -> bool;
 
 // Save/restore FPU/SSE/AVX state for a task (xsave if available, fxsave otherwise)

@@ -742,6 +742,7 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     sched::percpu_init();
     dbg::log("Creating init task(s) from handover modules");
     create_init_tasks(modules, kernel_rsp);
+    sched::start_gc_worker();
 
     // Start the TCP timer as a kernel thread (DAEMON) instead of running it in interrupt context
     ker::net::proto::tcp_timer_thread_start();

@@ -84,6 +84,10 @@ void wki_event_cleanup_for_peer(uint16_t node_id);
 // D1: Timer tick for reliable event retransmission. Called from wki_peer_timer_tick().
 void wki_event_timer_tick(uint64_t now_us);
 
+// Earliest retry deadline for reliable events, or UINT64_MAX when no reliable
+// event retry is pending.
+auto wki_event_next_timer_deadline_us(uint64_t now_us) -> uint64_t;
+
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers (called from wki.cpp dispatch)
 // -----------------------------------------------------------------------------

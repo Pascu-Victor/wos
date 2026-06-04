@@ -35,6 +35,7 @@ struct RunQueue {
 
     // Last timer timestamp (microseconds from HPET) for computing delta
     uint64_t last_tick_us{0};
+    uint64_t next_wait_deadline_us{0};
 
     // Linux-style CPU accounting buckets, stored in microseconds. These are
     // updated from timer/IRQ paths, so keep them allocation-free and lock-free.
@@ -58,11 +59,28 @@ struct RunQueue {
     std::atomic<uint64_t> idle_timer_arms;
     std::atomic<uint64_t> idle_timer_disarms;
     std::atomic<uint64_t> idle_timer_wakeups;
+    std::atomic<uint64_t> scheduler_timer_interrupts;
+    std::atomic<uint64_t> scheduler_timer_arms;
+    std::atomic<uint64_t> scheduler_timer_disarms;
+    std::atomic<uint64_t> scheduler_timer_arm_wait_deadline;
+    std::atomic<uint64_t> scheduler_timer_arm_itimer;
+    std::atomic<uint64_t> scheduler_timer_arm_voluntary;
+    std::atomic<uint64_t> scheduler_timer_arm_idle_work;
+    std::atomic<uint64_t> scheduler_timer_arm_runqueue;
+    std::atomic<uint64_t> scheduler_timer_arm_competitor;
     std::atomic<uint64_t> wake_ipis_sent;
     std::atomic<uint64_t> local_reschedule_requests;
+    std::atomic<uint64_t> local_reschedule_timer_pokes;
     std::atomic<uint64_t> slow_reschedule_scans;
+    std::atomic<uint64_t> wait_list_scan_iterations;
+    std::atomic<uint64_t> timer_expired_wakeups;
+    std::atomic<uint64_t> gc_passes_triggered;
+    std::atomic<uint64_t> gc_tasks_reclaimed;
+    std::atomic<uint64_t> gc_work_us_total;
+    std::atomic<uint64_t> gc_work_us_max;
     std::atomic<uint64_t> load_balance_pushes;
     std::atomic<uint32_t> placement_reservations;
+    std::atomic<bool> resched_timer_pending;
 
     // CPU domain fields (Phase 1)
     // domain_id: which CpuDomain this RunQueue belongs to (0 = root)
@@ -85,11 +103,28 @@ struct RunQueue {
           idle_timer_arms(0),
           idle_timer_disarms(0),
           idle_timer_wakeups(0),
+          scheduler_timer_interrupts(0),
+          scheduler_timer_arms(0),
+          scheduler_timer_disarms(0),
+          scheduler_timer_arm_wait_deadline(0),
+          scheduler_timer_arm_itimer(0),
+          scheduler_timer_arm_voluntary(0),
+          scheduler_timer_arm_idle_work(0),
+          scheduler_timer_arm_runqueue(0),
+          scheduler_timer_arm_competitor(0),
           wake_ipis_sent(0),
           local_reschedule_requests(0),
+          local_reschedule_timer_pokes(0),
           slow_reschedule_scans(0),
+          wait_list_scan_iterations(0),
+          timer_expired_wakeups(0),
+          gc_passes_triggered(0),
+          gc_tasks_reclaimed(0),
+          gc_work_us_total(0),
+          gc_work_us_max(0),
           load_balance_pushes(0),
-          placement_reservations(0) {
+          placement_reservations(0),
+          resched_timer_pending(false) {
         runnable_heap.init();
         wait_list.init();
         dead_list.init();
@@ -100,10 +135,32 @@ struct SchedulerTraceStats {
     uint64_t idle_timer_arms;
     uint64_t idle_timer_disarms;
     uint64_t idle_timer_wakeups;
+    uint64_t scheduler_timer_interrupts;
+    uint64_t scheduler_timer_arms;
+    uint64_t scheduler_timer_disarms;
+    uint64_t scheduler_timer_arm_wait_deadline;
+    uint64_t scheduler_timer_arm_itimer;
+    uint64_t scheduler_timer_arm_voluntary;
+    uint64_t scheduler_timer_arm_idle_work;
+    uint64_t scheduler_timer_arm_runqueue;
+    uint64_t scheduler_timer_arm_competitor;
     uint64_t wake_ipis_sent;
     uint64_t local_reschedule_requests;
+    uint64_t local_reschedule_timer_pokes;
     uint64_t slow_reschedule_scans;
+    uint64_t wait_list_scan_iterations;
+    uint64_t timer_expired_wakeups;
+    uint64_t gc_passes_triggered;
+    uint64_t gc_tasks_reclaimed;
+    uint64_t gc_work_us_total;
+    uint64_t gc_work_us_max;
     uint64_t load_balance_pushes;
+};
+
+struct SchedulerTimerDecision {
+    bool arm;
+    bool use_deadline_delta;
+    uint64_t deadline_delta_us;
 };
 
 struct SchedulerCpuState {
@@ -196,6 +253,10 @@ auto debug_stop_task(task::Task* task) -> bool;                   // Move a trac
 void wake_cpu(uint64_t cpu_no);                                   // Send wake IPI to a CPU (unconditional, for hlt wakeup)
 void insert_into_dead_list(task::Task* task);                     // Place a task into CPU 0's dead list for GC
 void gc_expired_tasks();                                          // Garbage collect dead tasks from dead lists
+auto gc_expired_tasks_budgeted(uint32_t max_tasks) -> uint32_t;   // Budgeted task GC for scheduler GC daemon
+void request_gc();                                                // Request deferred scheduler GC from IRQ-safe paths
+void start_gc_worker();                                           // Start scheduler GC daemon after init task creation
+void request_local_timer_recheck();                               // Arm a local timer tick after a new current-task deadline
 void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr,
                               ker::mod::gates::InterruptFrame& frame);  // Move current task to wait queue with context saved
 extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr,
@@ -206,6 +267,10 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
 void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame);
 void arm_idle_timer_for_this_cpu();
 void note_scheduler_timer_interrupt();
+void note_scheduler_timer_arm();
+void note_scheduler_timer_disarm();
+void note_local_reschedule_timer_poke();
+auto get_scheduler_timer_decision_for_this_cpu(uint64_t now_us) -> SchedulerTimerDecision;
 void account_irq_time_us(uint64_t elapsed_us);
 auto get_cpu_accounting_snapshot(uint64_t cpu_no) -> CpuAccountingSnapshot;
 auto get_load_average_snapshot() -> LoadAverageSnapshot;

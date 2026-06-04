@@ -1,5 +1,6 @@
 #include "context_switch.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -221,14 +222,54 @@ void restore_fpu_state(sched::task::Task* task) {
     }
 }
 
-__attribute__((noinline, no_sanitize("address", "undefined", "coverage"))) static void restore_debug_registers(sched::task::Task* task) {
-    uint64_t const DR7_CLEAR = 0x400;
-    uint64_t const DR6_CLEAR = 0xFFFF0FF0;
+namespace {
+struct DebugRegisterCpuState {
+    bool initialized{false};
+    bool armed{false};
+};
+
+std::array<DebugRegisterCpuState, desc::gdt::MAX_CPUS> debug_register_state{};
+
+inline void clear_debug_registers() {
+    uint64_t constexpr DR7_CLEAR = 0x400;
+    uint64_t constexpr DR6_CLEAR = 0xFFFF0FF0;
     asm volatile("mov %0, %%dr7" ::"r"(DR7_CLEAR) : "memory");
     asm volatile("mov %0, %%dr6" ::"r"(DR6_CLEAR) : "memory");
+}
 
-    if (task == nullptr || !task->ptrace_traced || task->ptrace_dr7 == 0) {
-        return;
+inline auto task_has_hardware_debug_state(const sched::task::Task* task) -> bool {
+    return task != nullptr && task->ptrace_traced && task->ptrace_dr7 != 0;
+}
+
+__attribute__((noinline, no_sanitize("address", "undefined", "coverage"))) void restore_debug_registers(sched::task::Task* task) {
+    bool const NEEDS_DEBUG_REGISTERS = task_has_hardware_debug_state(task);
+    uint64_t const CPU_ID = cpu::current_cpu();
+
+    if (CPU_ID >= debug_register_state.size()) {
+        clear_debug_registers();
+        if (!NEEDS_DEBUG_REGISTERS) {
+            return;
+        }
+    } else {
+        auto& state = debug_register_state[static_cast<size_t>(CPU_ID)];
+        if (!state.initialized) {
+            clear_debug_registers();
+            state.initialized = true;
+            state.armed = false;
+        }
+
+        if (!NEEDS_DEBUG_REGISTERS) {
+            if (state.armed) {
+                clear_debug_registers();
+                state.armed = false;
+            }
+            return;
+        }
+
+        // Disable breakpoints while rewriting DR0-DR3 so stale slots cannot
+        // fire for the incoming traced task during partial register restore.
+        clear_debug_registers();
+        state.armed = true;
     }
 
     asm volatile("mov %0, %%dr0" ::"r"(task->ptrace_dr_addr.at(0)) : "memory");
@@ -237,6 +278,7 @@ __attribute__((noinline, no_sanitize("address", "undefined", "coverage"))) stati
     asm volatile("mov %0, %%dr3" ::"r"(task->ptrace_dr_addr.at(3)) : "memory");
     asm volatile("mov %0, %%dr7" ::"r"(task->ptrace_dr7) : "memory");
 }
+}  // namespace
 
 auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task* next_task) -> bool {
     // CRITICAL: We must do ALL validation BEFORE modifying any state.
@@ -391,6 +433,8 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
 
 namespace {
 long timer_quantum;
+constexpr uint64_t SCHED_TIMER_QUANTUM_US = 4000;
+constexpr uint64_t APIC_TIMER_MAX_COUNT = 0xFFFFFFFFULL;
 
 // Tick counter for periodic epoch advancement and garbage collection
 std::atomic<uint64_t> timer_tick_count{0};
@@ -419,6 +463,24 @@ inline auto hot_task_tracker_slot(uint64_t cpu_no) -> HotTaskTracker& {
     // CPU_NO is checked against hot_task_trackers.size() before access.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     return hot_task_trackers[static_cast<size_t>(cpu_no)];
+}
+
+auto scheduler_timer_ticks_for_delta_us(uint64_t delta_us) -> uint64_t {
+    if (delta_us == 0 || timer_quantum <= 0) {
+        return 1;
+    }
+
+    auto const QUANTUM_TICKS = static_cast<uint64_t>(timer_quantum);
+    uint64_t const MAX_DELTA_US = (APIC_TIMER_MAX_COUNT / QUANTUM_TICKS) * SCHED_TIMER_QUANTUM_US;
+    if (MAX_DELTA_US == 0) {
+        return APIC_TIMER_MAX_COUNT;
+    }
+    uint64_t const CLAMPED_DELTA_US = (MAX_DELTA_US != 0 && delta_us > MAX_DELTA_US) ? MAX_DELTA_US : delta_us;
+    uint64_t ticks = ((QUANTUM_TICKS * CLAMPED_DELTA_US) + (SCHED_TIMER_QUANTUM_US - 1)) / SCHED_TIMER_QUANTUM_US;
+    if (ticks == 0) {
+        ticks = 1;
+    }
+    return std::min(ticks, APIC_TIMER_MAX_COUNT);
 }
 }  // namespace
 
@@ -490,12 +552,14 @@ void dump_irq_stats() {
 extern "C" void wos_sched_timer(void* stack_ptr) {
     uint64_t const IRQ_ACCOUNT_STARTED_US = ker::mod::time::get_us();
     apic::eoi();
+    sched::note_scheduler_timer_interrupt();
 
-    // Advance epoch and run garbage collection periodically on CPU 0 only.
+    // Advance epoch and request garbage collection periodically on CPU 0 only.
+    // Task reclamation itself runs in the scheduler GC daemon, never in IRQ.
     uint64_t const TICKS = timer_tick_count.fetch_add(1, std::memory_order_relaxed);
     if (cpu::current_cpu() == 0 && (TICKS % 10) == 0) {
         sched::EpochManager::advance_epoch();
-        sched::gc_expired_tasks();
+        sched::request_gc();
     }
 
     kasan_unpoison_irq_save_area(stack_ptr);
@@ -522,7 +586,15 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
         enter_idle_from_timer(return_task, *frame_ptr);
     }
 
-    apic::one_shot_timer(timer_quantum);
+    auto const TIMER_DECISION = sched::get_scheduler_timer_decision_for_this_cpu(ker::mod::time::get_us());
+    if (TIMER_DECISION.arm) {
+        sched::note_scheduler_timer_arm();
+        uint64_t const TICKS = TIMER_DECISION.use_deadline_delta ? scheduler_timer_ticks_for_delta_us(TIMER_DECISION.deadline_delta_us)
+                                                                 : static_cast<uint64_t>(timer_quantum);
+        apic::one_shot_timer(TICKS);
+    } else {
+        sched::note_scheduler_timer_disarm();
+    }
 
     if (is_kernel_thread_trampoline_frame(*frame_ptr, *gpr_ptr, return_task)) {
         uint64_t const IRQ_ACCOUNT_FINISHED_US = ker::mod::time::get_us();
@@ -633,14 +705,15 @@ extern "C" void wos_jump_to_next_task_no_save(void* stack_ptr) {
 }
 
 void start_sched_timer() {
-    timer_quantum = apic::calibrate_timer(4000);  // 4ms (matches Linux CFS typical quantum)
+    timer_quantum = apic::calibrate_timer(SCHED_TIMER_QUANTUM_US);  // 4ms (matches Linux CFS typical quantum)
+    sched::note_scheduler_timer_arm();
     apic::one_shot_timer(timer_quantum);
 }
 
-void request_reschedule() {
+auto request_reschedule() -> bool {
     if (!current_stack_allows_local_reschedule()) {
         if (!sched::interrupts_enabled()) {
-            return;
+            return false;
         }
         static std::atomic<uint64_t> skipped_mismatch_logs{0};
         uint64_t const N = skipped_mismatch_logs.fetch_add(1, std::memory_order_relaxed);
@@ -658,10 +731,14 @@ void request_reschedule() {
                 task != nullptr ? static_cast<unsigned long long>(task->context.syscall_kernel_stack) : 0ULL);
         }
         if (timer_quantum != 0) {
+            sched::note_scheduler_timer_arm();
             apic::one_shot_timer(timer_quantum);
+            return true;
         }
-        return;
+        return false;
     }
+    sched::note_local_reschedule_timer_poke();
     apic::one_shot_timer(1);
+    return true;
 }
 }  // namespace ker::mod::sys::context_switch

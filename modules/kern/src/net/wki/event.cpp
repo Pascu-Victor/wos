@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <net/wki/peer.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -238,6 +239,8 @@ void wki_event_publish(uint16_t event_class, uint16_t event_id, const void* data
         memcpy(buf.data() + sizeof(EventPublishPayload), data, data_len);
     }
 
+    bool notify_timer = false;
+
     s_event_lock.lock();
 
     // D2: Store in event log ring buffer for future replay
@@ -273,6 +276,7 @@ void wki_event_publish(uint16_t event_class, uint16_t event_id, const void* data
                                              pending.correlation, 0, total_len, WOS_PERF_CALLSITE());
 
             g_pending_reliable.push_back(pending);
+            notify_timer = true;
         } else {
             perf_record_event_point(ker::mod::perf::WkiPerfEventOp::PUBLISH, sub.subscriber_node, 0, total_len,
                                     ker::mod::perf::next_wki_trace_correlation(), WOS_PERF_CALLSITE());
@@ -292,6 +296,10 @@ void wki_event_publish(uint16_t event_class, uint16_t event_id, const void* data
     }
 
     s_event_lock.unlock();
+
+    if (notify_timer) {
+        wki_timer_notify();
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -363,6 +371,27 @@ void wki_event_timer_tick(uint64_t now_us) {
     }
 
     s_event_lock.unlock();
+}
+
+auto wki_event_next_timer_deadline_us(uint64_t now_us) -> uint64_t {
+    if (!g_event_initialized) {
+        return UINT64_MAX;
+    }
+
+    uint64_t next_deadline = UINT64_MAX;
+
+    s_event_lock.lock();
+    for (auto const& pending : g_pending_reliable) {
+        if (pending.subscriber_node == WKI_NODE_INVALID) {
+            continue;
+        }
+
+        uint64_t const FIRE_AT = pending.send_time_us + RELIABLE_RETRY_US;
+        next_deadline = std::min(next_deadline, FIRE_AT > now_us ? FIRE_AT : now_us + 1);
+    }
+    s_event_lock.unlock();
+
+    return next_deadline;
 }
 
 // -----------------------------------------------------------------------------

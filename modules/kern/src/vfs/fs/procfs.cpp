@@ -2935,6 +2935,7 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
 
     for (uint64_t c = 0; c < cpu_count; ++c) {
         auto s = ker::mod::perf::get_cpu_stats(static_cast<uint32_t>(c));
+        auto sched = ker::mod::sched::get_scheduler_trace_stats(c);
         append_sconst(p, end, "cpu=");
         append_dec64(p, end, c);
         append_sconst(p, end, " ctx=");
@@ -2949,6 +2950,56 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, s.wakes);
         append_sconst(p, end, " sample=");
         append_dec64(p, end, s.samples);
+        append_sconst(p, end, " fast_skip=");
+        append_dec64(p, end, s.fastpath_skips);
+        append_sconst(p, end, " ring_write=");
+        append_dec64(p, end, s.ring_writes);
+        append_sconst(p, end, " timer_irq=");
+        append_dec64(p, end, sched.scheduler_timer_interrupts);
+        append_sconst(p, end, " sched_arm=");
+        append_dec64(p, end, sched.scheduler_timer_arms);
+        append_sconst(p, end, " sched_disarm=");
+        append_dec64(p, end, sched.scheduler_timer_disarms);
+        append_sconst(p, end, " arm_wait=");
+        append_dec64(p, end, sched.scheduler_timer_arm_wait_deadline);
+        append_sconst(p, end, " arm_itimer=");
+        append_dec64(p, end, sched.scheduler_timer_arm_itimer);
+        append_sconst(p, end, " arm_vol=");
+        append_dec64(p, end, sched.scheduler_timer_arm_voluntary);
+        append_sconst(p, end, " arm_idlework=");
+        append_dec64(p, end, sched.scheduler_timer_arm_idle_work);
+        append_sconst(p, end, " arm_runq=");
+        append_dec64(p, end, sched.scheduler_timer_arm_runqueue);
+        append_sconst(p, end, " arm_comp=");
+        append_dec64(p, end, sched.scheduler_timer_arm_competitor);
+        append_sconst(p, end, " idle_arm=");
+        append_dec64(p, end, sched.idle_timer_arms);
+        append_sconst(p, end, " idle_disarm=");
+        append_dec64(p, end, sched.idle_timer_disarms);
+        append_sconst(p, end, " idle_wake=");
+        append_dec64(p, end, sched.idle_timer_wakeups);
+        append_sconst(p, end, " wake_ipi=");
+        append_dec64(p, end, sched.wake_ipis_sent);
+        append_sconst(p, end, " local_resched=");
+        append_dec64(p, end, sched.local_reschedule_requests);
+        append_sconst(p, end, " local_poke=");
+        append_dec64(p, end, sched.local_reschedule_timer_pokes);
+        append_sconst(p, end, " slow_scan=");
+        append_dec64(p, end, sched.slow_reschedule_scans);
+        append_sconst(p, end, " wait_scan=");
+        append_dec64(p, end, sched.wait_list_scan_iterations);
+        append_sconst(p, end, " timer_wake=");
+        append_dec64(p, end, sched.timer_expired_wakeups);
+        append_sconst(p, end, " gc_pass=");
+        append_dec64(p, end, sched.gc_passes_triggered);
+        append_sconst(p, end, " gc_reclaim=");
+        append_dec64(p, end, sched.gc_tasks_reclaimed);
+        append_sconst(p, end, " gc_us=");
+        append_dec64(p, end, sched.gc_work_us_total);
+        append_sconst(p, end, " gc_max_us=");
+        append_dec64(p, end, sched.gc_work_us_max);
+        append_sconst(p, end, " lb_push=");
+        append_dec64(p, end, sched.load_balance_pushes);
         if (p + 1 < end) {
             *p++ = '\n';
         }

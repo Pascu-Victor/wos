@@ -60,6 +60,7 @@ void perf_push_event(PerfCpuRing& ring, const PerfEvent& evt) {
     uint64_t const SLOT = ring.head & PERF_RING_MASK;
     ring.events[SLOT] = evt;
     ring.head++;
+    ring.stats.ring_writes.fetch_add(1, std::memory_order_relaxed);
     if ((ring.head - ring.drain) > PERF_RING_ENTRIES) {
         ring.drain = ring.head - PERF_RING_ENTRIES;
     }
@@ -649,7 +650,7 @@ void init() {
         g_rings[i].head = 0;
         g_rings[i].drain = 0;
         g_tick_count[i] = 0;
-        g_rings[i].stats = {};
+        g_rings[i].stats.reset();
     }
     g_enabled.store(false, std::memory_order_release);  // Off by default; enabled via perf record
     g_event_mask.store(PERF_MASK_ALL, std::memory_order_release);
@@ -726,24 +727,30 @@ void record_sample(uint32_t cpu, uint64_t pid, uint64_t rip, bool user_mode, int
 
     // Sub-sample to ~100 Hz (tick count advances even when recording is off
     // so the phase is stable when recording is enabled mid-run).
-    auto mask = g_event_mask.load(std::memory_order_relaxed);
-    bool const DO_RECORD =
-        g_enabled.load(std::memory_order_acquire) && ((mask & PERF_MASK_SAMPLE) != 0) && ((++g_tick_count[cpu] % 10) == 0);
-
     auto& ring = g_rings[cpu];
-    auto saved = ring.lock.lock_irqsave();
-    ring.stats.samples++;  // always counted
-    if (DO_RECORD) {
-        PerfEvent evt{};
-        evt.ts_ns = ker::mod::time::get_monotonic_ns();
-        evt.pid = pid;
-        evt.data = rip;
-        evt.lag_v = lag_v;
-        evt.cpu = static_cast<uint16_t>(cpu);
-        evt.type = static_cast<uint8_t>(PerfEventType::SAMPLE);
-        evt.flags = user_mode ? PERF_FLAG_USER_MODE : 0U;
-        perf_push_event(ring, evt);
+    ring.stats.samples.fetch_add(1, std::memory_order_relaxed);
+    uint64_t const TICK = ++g_tick_count[cpu];
+    if (!g_enabled.load(std::memory_order_acquire)) {
+        ring.stats.fastpath_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
     }
+
+    auto mask = g_event_mask.load(std::memory_order_relaxed);
+    if (((mask & PERF_MASK_SAMPLE) == 0) || ((TICK % 10) != 0)) {
+        ring.stats.fastpath_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    auto saved = ring.lock.lock_irqsave();
+    PerfEvent evt{};
+    evt.ts_ns = ker::mod::time::get_monotonic_ns();
+    evt.pid = pid;
+    evt.data = rip;
+    evt.lag_v = lag_v;
+    evt.cpu = static_cast<uint16_t>(cpu);
+    evt.type = static_cast<uint8_t>(PerfEventType::SAMPLE);
+    evt.flags = user_mode ? PERF_FLAG_USER_MODE : 0U;
+    perf_push_event(ring, evt);
     ring.lock.unlock_irqrestore(saved);
 }
 
@@ -755,35 +762,42 @@ void record_switch(uint32_t cpu, uint64_t prev_pid, uint64_t next_pid, uint8_t f
         return;
     }
 
-    auto mask = g_event_mask.load(std::memory_order_relaxed);
-    bool const DO_RECORD = g_enabled.load(std::memory_order_acquire) && ((mask & PERF_MASK_SWITCH) != 0);
-
     auto& ring = g_rings[cpu];
-    auto saved = ring.lock.lock_irqsave();
     auto& s = ring.stats;
-    s.ctx_switches++;  // always counted
+    s.ctx_switches.fetch_add(1, std::memory_order_relaxed);
     if ((flags & PERF_FLAG_PREEMPT) != 0) {
-        s.preemptions++;
+        s.preemptions.fetch_add(1, std::memory_order_relaxed);
     }
     if ((flags & PERF_FLAG_YIELD) != 0) {
-        s.yields++;
+        s.yields.fetch_add(1, std::memory_order_relaxed);
     }
     if ((flags & PERF_FLAG_BLOCK) != 0) {
-        s.sleeps++;
+        s.sleeps.fetch_add(1, std::memory_order_relaxed);
     }
-    if (DO_RECORD) {
-        PerfEvent evt{};
-        evt.ts_ns = ker::mod::time::get_monotonic_ns();
-        evt.pid = prev_pid;
-        evt.data = next_pid;
-        evt.callsite = callsite;
-        evt.lag_v = lag_v;
-        evt.cpu = static_cast<uint16_t>(cpu);
-        evt.type = static_cast<uint8_t>(PerfEventType::SWITCH);
-        evt.flags = flags;
-        evt.aux = run_us;
-        perf_push_event(ring, evt);
+
+    if (!g_enabled.load(std::memory_order_acquire)) {
+        s.fastpath_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
     }
+
+    auto mask = g_event_mask.load(std::memory_order_relaxed);
+    if ((mask & PERF_MASK_SWITCH) == 0) {
+        s.fastpath_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    auto saved = ring.lock.lock_irqsave();
+    PerfEvent evt{};
+    evt.ts_ns = ker::mod::time::get_monotonic_ns();
+    evt.pid = prev_pid;
+    evt.data = next_pid;
+    evt.callsite = callsite;
+    evt.lag_v = lag_v;
+    evt.cpu = static_cast<uint16_t>(cpu);
+    evt.type = static_cast<uint8_t>(PerfEventType::SWITCH);
+    evt.flags = flags;
+    evt.aux = run_us;
+    perf_push_event(ring, evt);
     ring.lock.unlock_irqrestore(saved);
 }
 
@@ -796,25 +810,31 @@ void record_wake(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags,
         return;
     }
 
-    auto mask = g_event_mask.load(std::memory_order_relaxed);
-    bool const DO_RECORD = g_enabled.load(std::memory_order_acquire) && ((mask & PERF_MASK_WAKE) != 0);
-
     auto& ring = g_rings[cpu];
-    auto saved = ring.lock.lock_irqsave();
-    ring.stats.wakes++;  // always counted
-    if (DO_RECORD) {
-        PerfEvent evt{};
-        evt.ts_ns = ker::mod::time::get_monotonic_ns();
-        evt.pid = pid;
-        evt.data = wake_at_us;
-        evt.callsite = callsite;
-        evt.lag_v = static_cast<int64_t>(reinterpret_cast<uint64_t>(wait_channel));
-        evt.cpu = static_cast<uint16_t>(cpu);
-        evt.type = static_cast<uint8_t>(PerfEventType::WAKE);
-        evt.flags = flags;
-        evt.aux = sleep_us;
-        perf_push_event(ring, evt);
+    ring.stats.wakes.fetch_add(1, std::memory_order_relaxed);
+    if (!g_enabled.load(std::memory_order_acquire)) {
+        ring.stats.fastpath_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
     }
+
+    auto mask = g_event_mask.load(std::memory_order_relaxed);
+    if ((mask & PERF_MASK_WAKE) == 0) {
+        ring.stats.fastpath_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    auto saved = ring.lock.lock_irqsave();
+    PerfEvent evt{};
+    evt.ts_ns = ker::mod::time::get_monotonic_ns();
+    evt.pid = pid;
+    evt.data = wake_at_us;
+    evt.callsite = callsite;
+    evt.lag_v = static_cast<int64_t>(reinterpret_cast<uint64_t>(wait_channel));
+    evt.cpu = static_cast<uint16_t>(cpu);
+    evt.type = static_cast<uint8_t>(PerfEventType::WAKE);
+    evt.flags = flags;
+    evt.aux = sleep_us;
+    perf_push_event(ring, evt);
     ring.lock.unlock_irqrestore(saved);
 }
 
@@ -827,25 +847,31 @@ void record_sleep(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags
         return;
     }
 
-    auto mask = g_event_mask.load(std::memory_order_relaxed);
-    bool const DO_RECORD = g_enabled.load(std::memory_order_acquire) && ((mask & PERF_MASK_SLEEP) != 0);
-
     auto& ring = g_rings[cpu];
-    auto saved = ring.lock.lock_irqsave();
-    ring.stats.sleeps++;  // always counted
-    if (DO_RECORD) {
-        PerfEvent evt{};
-        evt.ts_ns = ker::mod::time::get_monotonic_ns();
-        evt.pid = pid;
-        evt.data = wake_at_us;
-        evt.callsite = callsite;
-        evt.lag_v = static_cast<int64_t>(reinterpret_cast<uint64_t>(wait_channel));
-        evt.cpu = static_cast<uint16_t>(cpu);
-        evt.type = static_cast<uint8_t>(PerfEventType::SLEEP);
-        evt.flags = flags;
-        evt.aux = run_us;
-        perf_push_event(ring, evt);
+    ring.stats.sleeps.fetch_add(1, std::memory_order_relaxed);
+    if (!g_enabled.load(std::memory_order_acquire)) {
+        ring.stats.fastpath_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
     }
+
+    auto mask = g_event_mask.load(std::memory_order_relaxed);
+    if ((mask & PERF_MASK_SLEEP) == 0) {
+        ring.stats.fastpath_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    auto saved = ring.lock.lock_irqsave();
+    PerfEvent evt{};
+    evt.ts_ns = ker::mod::time::get_monotonic_ns();
+    evt.pid = pid;
+    evt.data = wake_at_us;
+    evt.callsite = callsite;
+    evt.lag_v = static_cast<int64_t>(reinterpret_cast<uint64_t>(wait_channel));
+    evt.cpu = static_cast<uint16_t>(cpu);
+    evt.type = static_cast<uint8_t>(PerfEventType::SLEEP);
+    evt.flags = flags;
+    evt.aux = run_us;
+    perf_push_event(ring, evt);
     ring.lock.unlock_irqrestore(saved);
 }
 
@@ -877,11 +903,7 @@ PerfCpuStats get_cpu_stats(uint32_t cpu) {
     if (cpu >= g_num_cpus) {
         return {};
     }
-    auto& ring = g_rings[cpu];
-    auto saved = ring.lock.lock_irqsave();
-    auto s = ring.stats;
-    ring.lock.unlock_irqrestore(saved);
-    return s;
+    return g_rings[cpu].stats.snapshot();
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 #include "run_heap.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/task.hpp>
@@ -10,7 +11,19 @@ namespace ker::mod::sched {
 
 namespace {
 using log = ker::mod::dbg::logger<"runheap">;
+
+inline auto heap_entry(RunHeap& heap, uint32_t index) -> task::Task*& {
+    // Callers bound index by heap.size or PER_CPU_HEAP_CAP before access.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    return heap.entries[static_cast<size_t>(index)];
 }
+
+inline auto heap_entry(RunHeap const& heap, uint32_t index) -> task::Task* {
+    // Callers bound index by heap.size or PER_CPU_HEAP_CAP before access.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    return heap.entries[static_cast<size_t>(index)];
+}
+}  // namespace
 
 // ============================================================================
 // RunHeap - array-backed binary min-heap keyed on Task::vdeadline
@@ -23,11 +36,11 @@ void RunHeap::swap_entries(uint32_t i, uint32_t j) {
         log::error("swap_entries: OOB i=%u j=%u cap=%u size=%u", i, j, PER_CPU_HEAP_CAP, size);
         dbg::panic_handler("RunHeap: swap_entries index out of bounds (size field corrupted?)");
     }
-    task::Task* tmp = entries.at(i);
-    entries.at(i) = entries.at(j);
-    entries.at(j) = tmp;
-    entries.at(i)->heap_index = static_cast<int32_t>(i);
-    entries.at(j)->heap_index = static_cast<int32_t>(j);
+    task::Task* tmp = heap_entry(*this, i);
+    heap_entry(*this, i) = heap_entry(*this, j);
+    heap_entry(*this, j) = tmp;
+    heap_entry(*this, i)->heap_index = static_cast<int32_t>(i);
+    heap_entry(*this, j)->heap_index = static_cast<int32_t>(j);
 }
 
 void RunHeap::sift_up(uint32_t idx) {
@@ -37,7 +50,7 @@ void RunHeap::sift_up(uint32_t idx) {
     }
     while (idx > 0) {
         uint32_t const PARENT = (idx - 1) / 2;
-        if (entries.at(idx)->vdeadline < entries.at(PARENT)->vdeadline) {
+        if (heap_entry(*this, idx)->vdeadline < heap_entry(*this, PARENT)->vdeadline) {
             swap_entries(idx, PARENT);
             idx = PARENT;
         } else {
@@ -61,7 +74,7 @@ void RunHeap::sift_down(uint32_t idx) {
                 log::error("sift_down: left=%u >= cap=%u, size=%u corrupted", LEFT, PER_CPU_HEAP_CAP, size);
                 dbg::panic_handler("RunHeap: sift_down OOB (size corrupted)");
             }
-            if (entries.at(LEFT)->vdeadline < entries.at(smallest)->vdeadline) {
+            if (heap_entry(*this, LEFT)->vdeadline < heap_entry(*this, smallest)->vdeadline) {
                 smallest = LEFT;
             }
         }
@@ -70,7 +83,7 @@ void RunHeap::sift_down(uint32_t idx) {
                 log::error("sift_down: right=%u >= cap=%u, size=%u corrupted", RIGHT, PER_CPU_HEAP_CAP, size);
                 dbg::panic_handler("RunHeap: sift_down OOB (size corrupted)");
             }
-            if (entries.at(RIGHT)->vdeadline < entries.at(smallest)->vdeadline) {
+            if (heap_entry(*this, RIGHT)->vdeadline < heap_entry(*this, smallest)->vdeadline) {
                 smallest = RIGHT;
             }
         }
@@ -94,14 +107,14 @@ bool RunHeap::insert(task::Task* t) {
                    static_cast<int>(t->cpu));
         // Scan our own entries to see if WE already have this task
         for (uint32_t i = 0; i < size; i++) {
-            if (entries.at(i) == t) {
+            if (heap_entry(*this, i) == t) {
                 log::error("task is in this heap at index %d", i);
             }
         }
         return false;
     }
     uint32_t const IDX = size;
-    entries.at(IDX) = t;
+    heap_entry(*this, IDX) = t;
     t->heap_index = static_cast<int32_t>(IDX);
     size++;
     sift_up(IDX);
@@ -113,7 +126,7 @@ bool RunHeap::remove(task::Task* t) {
         return false;
     }
     auto const IDX = static_cast<uint32_t>(t->heap_index);
-    if (entries.at(IDX) != t) {
+    if (heap_entry(*this, IDX) != t) {
         return false;  // heap_index stale / wrong heap
     }
 
@@ -126,8 +139,8 @@ bool RunHeap::remove(task::Task* t) {
     }
 
     // Move the last element into the gap
-    entries.at(IDX) = entries.at(size);
-    entries.at(IDX)->heap_index = static_cast<int32_t>(IDX);
+    heap_entry(*this, IDX) = heap_entry(*this, size);
+    heap_entry(*this, IDX)->heap_index = static_cast<int32_t>(IDX);
 
     // Re-sift: could go up or down depending on relative vdeadline
     sift_up(IDX);
@@ -155,7 +168,7 @@ bool RunHeap::contains(task::Task* t) const {
     if (t->heap_index < 0 || std::cmp_greater_equal(t->heap_index, size)) {
         return false;
     }
-    return entries.at(static_cast<uint32_t>(t->heap_index)) == t;
+    return heap_entry(*this, static_cast<uint32_t>(t->heap_index)) == t;
 }
 
 task::Task* RunHeap::pick_best_eligible(int64_t avg_vruntime) {
@@ -180,15 +193,17 @@ task::Task* RunHeap::pick_best_eligible(int64_t avg_vruntime) {
     std::array<uint32_t, 32> stack{};
     uint32_t stack_size = 0;
 
-    stack.at(stack_size++) = 0;  // Start at root
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    stack[static_cast<size_t>(stack_size++)] = 0;  // Start at root
 
     while (stack_size > 0) {
-        uint32_t const IDX = stack.at(--stack_size);
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+        uint32_t const IDX = stack[static_cast<size_t>(--stack_size)];
         if (IDX >= size) {
             continue;
         }
 
-        task::Task* t = entries.at(IDX);
+        task::Task* t = heap_entry(*this, IDX);
         int64_t const LAG = avg_vruntime - t->vruntime;
 
         if (LAG >= 0) {
@@ -209,10 +224,12 @@ task::Task* RunHeap::pick_best_eligible(int64_t avg_vruntime) {
                 uint32_t const LEFT = (2 * IDX) + 1;
                 uint32_t const RIGHT = (2 * IDX) + 2;
                 if (LEFT < size) {
-                    stack.at(stack_size++) = LEFT;
+                    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+                    stack[static_cast<size_t>(stack_size++)] = LEFT;
                 }
                 if (RIGHT < size) {
-                    stack.at(stack_size++) = RIGHT;
+                    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+                    stack[static_cast<size_t>(stack_size++)] = RIGHT;
                 }
             }
         }
@@ -241,11 +258,14 @@ void IntrusiveTaskList::push(task::Task* t) {
         return;
     }
 
+#ifdef SCHED_DEBUG
     for (task::Task const* cur = head; cur != nullptr; cur = cur->sched_next) {
         if (cur == t) {
+            log::error("intrusive list duplicate push: pid=%lu", t->pid);
             return;
         }
     }
+#endif
 
     t->sched_next = head;
     head = t;

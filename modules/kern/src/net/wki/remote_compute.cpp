@@ -2176,8 +2176,7 @@ void wki_load_report_send() {
     } else {
         report.avg_load_pct = 0;
     }
-    report.free_mem_pages =
-        static_cast<uint16_t>(std::min(ker::mod::mm::phys::get_free_mem_bytes() / (256ULL * ker::mod::mm::paging::PAGE_SIZE), 0xFFFFULL));
+    report.free_mem_pages = static_cast<uint16_t>(std::min(ker::mod::mm::phys::get_free_mem_pages() / 256ULL, 0xFFFFULL));
 
     auto total_len = static_cast<uint16_t>(sizeof(LoadReportPayload) + (REPORT_CPUS * sizeof(uint16_t)));
     memcpy(buf.data(), &report, sizeof(LoadReportPayload));

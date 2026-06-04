@@ -391,6 +391,43 @@ struct PerfCpuStats {
     uint64_t sleeps;        // Transitions into blocking wait
     uint64_t wakes;         // Timer-expiry wakeups
     uint64_t samples;       // SAMPLE events recorded (sub-sampled ~100 Hz)
+    uint64_t fastpath_skips;
+    uint64_t ring_writes;
+};
+
+struct PerfCpuStatsAtomic {
+    std::atomic<uint64_t> ctx_switches{0};
+    std::atomic<uint64_t> preemptions{0};
+    std::atomic<uint64_t> yields{0};
+    std::atomic<uint64_t> sleeps{0};
+    std::atomic<uint64_t> wakes{0};
+    std::atomic<uint64_t> samples{0};
+    std::atomic<uint64_t> fastpath_skips{0};
+    std::atomic<uint64_t> ring_writes{0};
+
+    void reset() {
+        ctx_switches.store(0, std::memory_order_relaxed);
+        preemptions.store(0, std::memory_order_relaxed);
+        yields.store(0, std::memory_order_relaxed);
+        sleeps.store(0, std::memory_order_relaxed);
+        wakes.store(0, std::memory_order_relaxed);
+        samples.store(0, std::memory_order_relaxed);
+        fastpath_skips.store(0, std::memory_order_relaxed);
+        ring_writes.store(0, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] auto snapshot() const -> PerfCpuStats {
+        return {
+            .ctx_switches = ctx_switches.load(std::memory_order_relaxed),
+            .preemptions = preemptions.load(std::memory_order_relaxed),
+            .yields = yields.load(std::memory_order_relaxed),
+            .sleeps = sleeps.load(std::memory_order_relaxed),
+            .wakes = wakes.load(std::memory_order_relaxed),
+            .samples = samples.load(std::memory_order_relaxed),
+            .fastpath_skips = fastpath_skips.load(std::memory_order_relaxed),
+            .ring_writes = ring_writes.load(std::memory_order_relaxed),
+        };
+    }
 };
 
 // ===========================================================================
@@ -403,7 +440,7 @@ constexpr size_t PERF_RING_MASK = PERF_RING_ENTRIES - 1;
 constexpr size_t PERF_MAX_CPUS = 16;
 
 struct PerfCpuRing {
-    PerfCpuStats stats;
+    PerfCpuStatsAtomic stats;
     uint64_t head;                        // Monotonically-increasing write index
     uint64_t drain;                       // Consumer read index (advances on drain_events)
     ker::mod::sys::Spinlock lock;         // IRQ-safe spinlock protecting head/drain/events
