@@ -10,6 +10,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <platform/mm/paging.hpp>
+#include <platform/mm/phys.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <vfs/file.hpp>
@@ -56,6 +58,9 @@ namespace ker::vfs::tmpfs {
 constexpr size_t DEFAULT_TMPFS_BLOCK_SIZE = 4096;
 constexpr size_t INITIAL_CHILDREN_CAPACITY = 8;
 constexpr int O_CREAT = 0100;  // octal = 64 decimal = 0x40 hex
+constexpr uint64_t TMPFS_MIN_FREE_RESERVE_BYTES = 16ULL * 1024ULL * 1024ULL;
+constexpr uint64_t TMPFS_MAX_FREE_RESERVE_BYTES = 256ULL * 1024ULL * 1024ULL;
+constexpr uint64_t TMPFS_FREE_RESERVE_DIVISOR = 8;
 
 namespace {
 TmpNode* root_node = nullptr;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -65,15 +70,103 @@ ker::mod::sys::Spinlock tmpfs_lock;  // NOLINT(cppcoreguidelines-avoid-non-const
 // --- Internal helpers ---
 
 namespace {
-auto tmpfs_capacity_for_size(size_t size) -> size_t {
+auto tmpfs_capacity_for_size(size_t size, size_t& out_capacity) -> bool {
     if (size == 0) {
-        return 0;
+        out_capacity = 0;
+        return true;
     }
     size_t cap = DEFAULT_TMPFS_BLOCK_SIZE;
     while (cap < size) {
+        if (cap > static_cast<size_t>(-1) / 2) {
+            return false;
+        }
         cap *= 2;
     }
-    return cap;
+    out_capacity = cap;
+    return true;
+}
+
+auto tmpfs_free_reserve_bytes() -> uint64_t {
+    uint64_t const TOTAL = ker::mod::mm::phys::get_total_mem_bytes();
+    if (TOTAL == 0) {
+        return 0;
+    }
+
+    uint64_t reserve = TOTAL / TMPFS_FREE_RESERVE_DIVISOR;
+    reserve = std::max(reserve, TMPFS_MIN_FREE_RESERVE_BYTES);
+    reserve = std::min(reserve, TMPFS_MAX_FREE_RESERVE_BYTES);
+    reserve = std::min(reserve, TOTAL / 2);
+    return reserve;
+}
+
+auto tmpfs_allocator_request_bytes(size_t capacity, uint64_t& out_request) -> bool {
+    constexpr uint64_t PAGE_SIZE = ker::mod::mm::paging::PAGE_SIZE;
+    auto const CAP = static_cast<uint64_t>(capacity);
+    if (CAP > static_cast<uint64_t>(-1) - PAGE_SIZE) {
+        return false;
+    }
+    out_request = CAP + PAGE_SIZE;
+    return true;
+}
+
+auto tmpfs_can_grow_capacity(size_t capacity) -> bool {
+    if (ker::mod::mm::phys::get_total_mem_bytes() == 0) {
+        return true;
+    }
+
+    uint64_t request_bytes = 0;
+    if (!tmpfs_allocator_request_bytes(capacity, request_bytes)) {
+        return false;
+    }
+    return ker::mod::mm::phys::page_alloc_can_satisfy(request_bytes, tmpfs_free_reserve_bytes());
+}
+
+auto tmpfs_write_count_fits(const TmpNode* n, size_t offset, size_t count) -> bool {
+    if (count == 0) {
+        return true;
+    }
+    if (offset > static_cast<size_t>(-1) - count) {
+        return false;
+    }
+
+    size_t const NEED = offset + count;
+    if (NEED <= n->capacity) {
+        return true;
+    }
+
+    size_t new_cap = 0;
+    if (!tmpfs_capacity_for_size(NEED, new_cap)) {
+        return false;
+    }
+    return tmpfs_can_grow_capacity(new_cap);
+}
+
+auto tmpfs_largest_write_count(const TmpNode* n, size_t offset, size_t count, size_t& out_count, size_t& out_capacity) -> bool {
+    size_t low = 0;
+    size_t high = count;
+
+    while (low < high) {
+        size_t const MID = low + ((high - low + 1) / 2);
+        if (tmpfs_write_count_fits(n, offset, MID)) {
+            low = MID;
+        } else {
+            high = MID - 1;
+        }
+    }
+
+    if (low == 0) {
+        out_count = 0;
+        out_capacity = n->capacity;
+        return false;
+    }
+
+    out_count = low;
+    size_t const NEED = offset + low;
+    if (NEED <= n->capacity) {
+        out_capacity = n->capacity;
+        return true;
+    }
+    return tmpfs_capacity_for_size(NEED, out_capacity);
 }
 
 // Grow the children slot array of a directory node if needed.
@@ -121,39 +214,77 @@ auto tmpfs_write_locked(TmpNode* n, const void* buf, size_t count, size_t offset
     if (count == 0) {
         return 0;
     }
-    size_t const NEED = offset + count;
-    if (NEED > n->capacity) {
-        size_t const NEWCAP = tmpfs_capacity_for_size(NEED);
-        char* nd = new char[NEWCAP];
-        if (n->data != nullptr) {
-            std::memcpy(nd, n->data, n->size);
+    size_t write_count = count;
+    size_t need = 0;
+    if (offset > static_cast<size_t>(-1) - write_count) {
+        size_t new_cap = 0;
+        if (!tmpfs_largest_write_count(n, offset, write_count, write_count, new_cap)) {
+            return -EFBIG;
         }
-        delete[] n->data;
-        n->data = nd;
-        n->capacity = NEWCAP;
     }
-    std::memcpy(n->data + offset, buf, count);
-    n->size = std::max(NEED, n->size);
-    return static_cast<ssize_t>(count);
+    need = offset + write_count;
+    if (need > n->capacity) {
+        size_t new_cap = 0;
+        if (!tmpfs_capacity_for_size(need, new_cap)) {
+            return -EFBIG;
+        }
+        if (!tmpfs_can_grow_capacity(new_cap)) {
+            // A too-large write should still commit the prefix that can fit.
+            if (!tmpfs_largest_write_count(n, offset, write_count, write_count, new_cap)) {
+                return -ENOSPC;
+            }
+            need = offset + write_count;
+        }
+
+        if (need > n->capacity) {
+            char* nd = new char[new_cap];
+            if (nd == nullptr) {
+                if (offset >= n->capacity) {
+                    return -ENOSPC;
+                }
+                write_count = std::min(write_count, n->capacity - offset);
+                need = offset + write_count;
+            } else {
+                if (n->data != nullptr) {
+                    std::memcpy(nd, n->data, n->size);
+                }
+                delete[] n->data;
+                n->data = nd;
+                n->capacity = new_cap;
+            }
+        }
+    }
+    std::memcpy(n->data + offset, buf, write_count);
+    n->size = std::max(need, n->size);
+    return static_cast<ssize_t>(write_count);
 }
 
 auto tmpfs_resize_locked(TmpNode* n, size_t new_size) -> int {
-    size_t const NEWCAP = tmpfs_capacity_for_size(new_size);
-    if (NEWCAP != n->capacity) {
-        if (NEWCAP == 0) {
+    size_t new_cap = 0;
+    if (!tmpfs_capacity_for_size(new_size, new_cap)) {
+        return -EFBIG;
+    }
+    if (new_cap != n->capacity) {
+        if (new_cap == 0) {
             delete[] n->data;
             n->data = nullptr;
             n->capacity = 0;
             n->size = 0;
             return 0;
         }
-        char* nd = new char[NEWCAP];
+        if (new_cap > n->capacity && !tmpfs_can_grow_capacity(new_cap)) {
+            return -ENOSPC;
+        }
+        char* nd = new char[new_cap];
+        if (nd == nullptr) {
+            return -ENOSPC;
+        }
         if (n->data != nullptr) {
             std::memcpy(nd, n->data, std::min(n->size, new_size));
         }
         delete[] n->data;
         n->data = nd;
-        n->capacity = NEWCAP;
+        n->capacity = new_cap;
     }
     if (new_size > n->size) {
         std::memset(n->data + n->size, 0, new_size - n->size);

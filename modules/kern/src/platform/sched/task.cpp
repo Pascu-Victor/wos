@@ -324,11 +324,12 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     }
 
     // Identity
+    uint64_t const OWNER_PID = sched::task::process_pid(*parent);
     t->pid = sched::task::get_next_pid();
-    t->parent_pid = (parent->parent_pid != 0U) ? parent->parent_pid : parent->pid;
+    t->parent_pid = (parent->parent_pid != 0U) ? parent->parent_pid : OWNER_PID;
     t->type = TaskType::PROCESS;
     t->is_thread = true;
-    t->owner_pid = parent->pid;
+    t->owner_pid = OWNER_PID;
     t->cpu = cpu::current_cpu();
 
     // Share the parent's pagemap - do NOT create a new one

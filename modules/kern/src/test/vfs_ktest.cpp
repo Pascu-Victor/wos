@@ -1,5 +1,6 @@
 #include <bits/ssize_t.h>
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -65,6 +66,32 @@ KTEST(VFS, WriteRead) {
     KEXPECT_TRUE(match);
 
     ker::vfs::vfs_unlink("/tmp/ktest_wr");
+}
+
+KTEST(VFS, TmpfsRejectedWritePreservesExistingData) {
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_rejected_write";
+    constexpr char DATA[] = "stable";
+    constexpr size_t DATA_LEN = sizeof(DATA) - 1;
+
+    ker::vfs::File* f = ker::vfs::vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(f, nullptr);
+
+    ssize_t const FIRST_WRITE = ker::vfs::tmpfs::tmpfs_write(f, static_cast<const void*>(DATA), DATA_LEN, 0);
+    KEXPECT_EQ(FIRST_WRITE, static_cast<ssize_t>(DATA_LEN));
+
+    char other = 'x';
+    ssize_t const REJECTED_WRITE = ker::vfs::tmpfs::tmpfs_write(f, static_cast<const void*>(&other), 1, static_cast<size_t>(-1));
+    KEXPECT_EQ(REJECTED_WRITE, static_cast<ssize_t>(-EFBIG));
+
+    char rbuf[sizeof(DATA)] = {};
+    ssize_t const READ = ker::vfs::tmpfs::tmpfs_read(f, static_cast<void*>(rbuf), DATA_LEN, 0);
+    KEXPECT_EQ(READ, static_cast<ssize_t>(DATA_LEN));
+    KEXPECT_TRUE(memcmp(static_cast<const void*>(rbuf), static_cast<const void*>(DATA), DATA_LEN) == 0);
+
+    ker::vfs::tmpfs::tmpfs_fops_close(f);
+    ker::vfs::vfs_unlink(PATH);
 }
 
 KTEST(VFS, TmpfsOpenTruncatesExistingFile) {

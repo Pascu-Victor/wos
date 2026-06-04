@@ -225,7 +225,9 @@ void fill_rx_queue_for(VirtIONetDevice* dev, Virtqueue* rxq) {
         net_log::trace("virtio rx refill: dev=%s q=%u filled=%u pool_free_before=%zu pool_free=%zu", DEV_NAME, rxq->queue_index, filled,
                        BEFORE_FREE, ker::net::pkt_pool_free_count());
     }
-    virtq_kick(rxq);
+    if (filled != 0) {
+        virtq_kick(rxq);
+    }
 }
 
 auto process_rx_budget_for(VirtIONetDevice* dev, Virtqueue* rxq, int budget) -> int {

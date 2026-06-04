@@ -23,7 +23,7 @@ constexpr size_t VFS_READLINK_CACHE_TEXT_MAX = 512;
 
 // Bounce buffer sizes for RDMA-backed VFS I/O.
 constexpr uint32_t VFS_RDMA_BOUNCE_SIZE = 65536;
-constexpr uint32_t VFS_RDMA_WRITE_SIZE = 1024 * 1024;
+constexpr uint32_t VFS_RDMA_WRITE_SIZE = 4 * 1024 * 1024;
 
 // Bulk RDMA transfer buffer - used for large sequential reads to reduce round-trips.
 // Reads > VFS_RDMA_BOUNCE_SIZE are serviced through a single RDMA write into this

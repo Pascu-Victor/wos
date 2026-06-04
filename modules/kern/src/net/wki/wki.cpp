@@ -56,7 +56,10 @@ namespace {
 // wki_timer_tick() recursively.  The guard prevents the deferred mount/
 // attach processing from re-entering itself while the outer call is
 // still blocked inside wki_wait_for_op().
-std::atomic<bool> s_timer_deferred_running{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> s_timer_deferred_running{false};
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<mod::sched::task::Task*> s_timer_deferred_task{nullptr};
 
 // RAII guard: ensures s_timer_deferred_running is reset even if a deferred
 // work function panics or asserts.  Without this, a crash inside the
@@ -67,14 +70,22 @@ struct DeferredGuard {
     bool try_enter() {
         bool expected = false;
         entered = s_timer_deferred_running.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+        if (entered) {
+            s_timer_deferred_task.store(mod::sched::get_current_task(), std::memory_order_release);
+        }
         return entered;
     }
     ~DeferredGuard() {
         if (entered) {
+            s_timer_deferred_task.store(nullptr, std::memory_order_release);
             s_timer_deferred_running.store(false, std::memory_order_release);
         }
     }
 };
+
+auto is_timer_deferred_waiter(const mod::sched::task::Task* task) -> bool {
+    return task != nullptr && s_timer_deferred_task.load(std::memory_order_acquire) == task;
+}
 
 void process_deferred_blocking_work() {
     DeferredGuard deferred;
@@ -188,6 +199,15 @@ constexpr uint32_t WKI_PERF_STALL_FLAG_RETRANSMIT_DUE = 1U << 4;
 constexpr uint32_t WKI_PERF_STALL_FLAG_FAST_RETRANSMIT = 1U << 5;
 constexpr uint32_t WKI_PERF_STALL_FLAG_ACK_DELAY_DUE = 1U << 6;
 
+constexpr uint32_t WKI_IPC_DATA_ACK_DELAY_US = 500;
+
+auto ack_delay_for_channel(uint16_t channel_id) -> uint32_t {
+    if (channel_id == WKI_CHAN_IPC_DATA) {
+        return WKI_IPC_DATA_ACK_DELAY_US;
+    }
+    return WKI_ACK_DELAY_US;
+}
+
 auto pack_transport_stall_status(WkiChannel const* ch, uint64_t now_us) -> uint32_t {
     uint32_t flags = 0;
     if (ch->tx_seq != ch->tx_ack) {
@@ -198,7 +218,7 @@ auto pack_transport_stall_status(WkiChannel const* ch, uint64_t now_us) -> uint3
     }
     if (ch->ack_pending) {
         flags |= WKI_PERF_STALL_FLAG_ACK_PENDING;
-        if (now_us >= ch->ack_pending_since_us + WKI_ACK_DELAY_US) {
+        if (now_us >= ch->ack_pending_since_us + ack_delay_for_channel(ch->channel_id)) {
             flags |= WKI_PERF_STALL_FLAG_ACK_DELAY_DUE;
         }
     }
@@ -317,8 +337,9 @@ auto wki_crc32_continue(uint32_t prev_crc, const void* data, size_t len) -> uint
 // -----------------------------------------------------------------------------
 // V2: Async Wait Queue
 // Lock-free polling via kern_yield() - matches existing WKI blocking patterns.
-// The pending list is protected by a spinlock for link/unlink only; the hot
-// path (completed flag check) is a plain volatile read with no lock.
+// The pending list is protected by a spinlock for link/unlink only. Result
+// writes are serialized by WkiWaitEntry::state so stale responses cannot write
+// into a stack waiter after the owner has timed out and unwound.
 // -----------------------------------------------------------------------------
 
 namespace {
@@ -352,17 +373,31 @@ void wait_list_unlink(WkiWaitEntry* entry) {
     s_wait_lock.unlock();
 }
 
+[[nodiscard]] auto wait_state(WkiWaitEntry const* entry) -> uint8_t { return entry->state.load(std::memory_order_acquire); }
+
+[[nodiscard]] auto wait_done(WkiWaitEntry const* entry) -> bool { return wait_state(entry) == WkiWaitEntry::DONE; }
+
+[[nodiscard]] auto claim_wait_entry(WkiWaitEntry* entry) -> bool {
+    uint8_t expected = WkiWaitEntry::PENDING;
+    return entry->state.compare_exchange_strong(expected, WkiWaitEntry::CLAIMED, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+void publish_claimed_wait_entry(WkiWaitEntry* entry, int result) {
+    entry->result = result;
+    entry->state.store(WkiWaitEntry::DONE, std::memory_order_release);
+}
+
 }  // namespace
 
 auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
     // Record the calling task so wake_op can send an IPI. Do not reset
-    // completed/result here: many callers publish the stack wait entry before
+    // state/result here: many callers publish the stack wait entry before
     // sending, and a fast response may complete it before we enter this helper.
     entry->task = mod::sched::get_current_task();
     entry->deadline_us = (timeout_us > 0) ? (wki_now_us() + timeout_us) : 0;
 
     bool linked = false;
-    if (!entry->completed.load(std::memory_order_acquire)) {
+    if (!wait_done(entry)) {
         // Link into pending list (for timeout scan)
         wait_list_link(entry);
         linked = true;
@@ -380,31 +415,36 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
     // until an unrelated signal arrives. The tighter WKI timer cadence and the
     // broader inline RX draining still reduce the latency floor for process
     // callers without taking that scheduler risk.
-    while (!entry->completed.load(std::memory_order_acquire)) {
+    while (!wait_done(entry)) {
         if (entry->deadline_us != 0 && wki_now_us() >= entry->deadline_us) {
             // Timed out locally. Claim completion before returning so a late
             // response cannot still complete the same stack waiter after the
             // caller has started timeout cleanup/retry handling.
-            bool expected = false;
-            if (entry->completed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-                entry->result = WKI_ERR_TIMEOUT;
+            if (claim_wait_entry(entry)) {
+                publish_claimed_wait_entry(entry, WKI_ERR_TIMEOUT);
             }
             if (linked) {
                 wait_list_unlink(entry);
+            }
+            while (!wait_done(entry)) {
+                mod::sched::kern_yield();
             }
             return entry->result;
         }
         if (entry->task != nullptr) {
             entry->task->wait_channel = "wki_wait";
-            if (entry->task->type == mod::sched::task::TaskType::DAEMON) {
+            if (entry->task->type == mod::sched::task::TaskType::DAEMON && !is_timer_deferred_waiter(entry->task)) {
                 mod::sched::kern_block();
             } else {
+                if (is_timer_deferred_waiter(entry->task)) {
+                    wki_spin_yield();
+                }
                 mod::sched::kern_yield();
             }
         } else {
             mod::sched::kern_yield();
         }
-        if (entry->completed.load(std::memory_order_acquire)) {
+        if (wait_done(entry)) {
             break;
         }
     }
@@ -417,12 +457,24 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
 }
 
 void wki_wake_op(WkiWaitEntry* entry, int result) {
-    entry->result = result;
-    bool expected = false;
-    if (!entry->completed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    if (!wki_claim_op(entry)) {
         return;  // already completed - stale wake
     }
+    wki_finish_claimed_op(entry, result);
+}
 
+auto wki_claim_op(WkiWaitEntry* entry) -> bool {
+    if (entry == nullptr) {
+        return false;
+    }
+    return claim_wait_entry(entry);
+}
+
+void wki_finish_claimed_op(WkiWaitEntry* entry, int result) {
+    if (entry == nullptr) {
+        return;
+    }
+    publish_claimed_wait_entry(entry, result);
     // Wake the waiter whether it has already moved to WAITING or is still at
     // the current-task voluntary block point.
     if (entry->task != nullptr) {
@@ -450,9 +502,8 @@ void wki_wait_timeout_scan(uint64_t now_us) {
 
         // Check for timeout
         if (cur->deadline_us != 0 && now_us >= cur->deadline_us) {
-            cur->result = WKI_ERR_TIMEOUT;
-            bool expected = false;
-            if (cur->completed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            if (claim_wait_entry(cur)) {
+                publish_claimed_wait_entry(cur, WKI_ERR_TIMEOUT);
                 should_unlink = true;
                 if (cur->task != nullptr) {
                     ker::mod::sched::kern_wake(cur->task);
@@ -462,7 +513,7 @@ void wki_wait_timeout_scan(uint64_t now_us) {
 
         // Also reap entries that were already completed (e.g. by wki_wake_op
         // or peer cleanup) but whose owning task died before it could unlink.
-        if (!should_unlink && cur->completed.load(std::memory_order_acquire)) {
+        if (!should_unlink && wait_done(cur)) {
             should_unlink = true;
         }
 
@@ -502,7 +553,12 @@ void wki_wait_cleanup_for_task(ker::mod::sched::task::Task* task) {
             cur->next = nullptr;
             cur->prev = nullptr;
             // Mark completed so any stale pointer holders won't re-link it.
-            cur->completed.store(true, std::memory_order_release);
+            uint8_t expected = WkiWaitEntry::PENDING;
+            if (cur->state.compare_exchange_strong(expected, WkiWaitEntry::CLAIMED, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                publish_claimed_wait_entry(cur, WKI_ERR_PEER_FENCED);
+            } else {
+                cur->state.store(WkiWaitEntry::DONE, std::memory_order_release);
+            }
         }
         cur = next;
     }
@@ -829,6 +885,7 @@ void channel_init(WkiChannel* ch, uint16_t peer_node, uint16_t chan_id, Priority
     ch->tx_seq = 0;
     ch->tx_ack = 0;
     ch->rx_seq = 0;
+    ch->rx_dispatch_seq = 0;
     ch->rx_ack_pending = 0;
     ch->ack_pending = false;
     ch->ack_pending_since_us = 0;
@@ -1031,7 +1088,7 @@ auto wki_next_fast_timer_deadline_us(uint64_t now_us) -> uint64_t {
             continue;
         }
         if (ch->ack_pending) {
-            uint64_t const FIRE_AT = ch->ack_pending_since_us + WKI_ACK_DELAY_US;
+            uint64_t const FIRE_AT = ch->ack_pending_since_us + ack_delay_for_channel(ch->channel_id);
             next_deadline = std::min(next_deadline, FIRE_AT > now_us ? FIRE_AT : now_us + 1);
         }
         if (ch->retransmit_head != nullptr && ch->retransmit_deadline != 0) {
@@ -1042,7 +1099,7 @@ auto wki_next_fast_timer_deadline_us(uint64_t now_us) -> uint64_t {
 
     s_wait_lock.lock();
     for (WkiWaitEntry const* cur = s_wait_head; cur != nullptr; cur = cur->next) {
-        if (cur->deadline_us != 0 && !cur->completed.load(std::memory_order_acquire)) {
+        if (cur->deadline_us != 0 && wait_state(cur) == WkiWaitEntry::PENDING) {
             next_deadline = std::min(next_deadline, cur->deadline_us);
         }
     }
@@ -1756,6 +1813,52 @@ void wki_dispatch_reliable_msg(MsgType type, const WkiHeader* hdr, const uint8_t
     }
 }
 
+auto reliable_dispatch_needs_serial_order(const WkiChannel* ch) -> bool { return ch != nullptr && ch->channel_id == WKI_CHAN_IPC_DATA; }
+
+auto wait_for_reliable_dispatch_turn(WkiChannel* ch, uint32_t seq) -> bool {
+    if (!reliable_dispatch_needs_serial_order(ch)) {
+        return true;
+    }
+
+    for (;;) {
+        ch->lock.lock();
+        bool const ACTIVE = ch->active;
+        uint32_t const NEXT_DISPATCH = ch->rx_dispatch_seq;
+        if (!ACTIVE || seq_before(seq, NEXT_DISPATCH)) {
+            ch->lock.unlock();
+            return false;
+        }
+        if (seq == NEXT_DISPATCH) {
+            ch->lock.unlock();
+            return true;
+        }
+        ch->lock.unlock();
+        ker::mod::sched::kern_yield();
+    }
+}
+
+void finish_reliable_dispatch_turn(WkiChannel* ch, uint32_t seq) {
+    if (!reliable_dispatch_needs_serial_order(ch)) {
+        return;
+    }
+
+    ch->lock.lock();
+    if (ch->active && ch->rx_dispatch_seq == seq) {
+        ch->rx_dispatch_seq++;
+    }
+    ch->lock.unlock();
+}
+
+void wki_dispatch_reliable_msg_ordered(WkiChannel* ch, MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+    uint32_t const SEQ = hdr != nullptr ? hdr->seq_num : 0U;
+    if (!wait_for_reliable_dispatch_turn(ch, SEQ)) {
+        return;
+    }
+
+    wki_dispatch_reliable_msg(type, hdr, payload, payload_len);
+    finish_reliable_dispatch_turn(ch, SEQ);
+}
+
 }  // namespace
 
 void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
@@ -2047,14 +2150,17 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 ker::mod::dbg::log("[WKI] Resyncing channel seq: src=0x%04x ch=%u local_rx_seq=0 remote_seq=%u", hdr->src_node,
                                    hdr->channel_id, hdr->seq_num);
                 ch->rx_seq = hdr->seq_num;
+                ch->rx_dispatch_seq = hdr->seq_num;
             }
 
             if (hdr->seq_num == ch->rx_seq) {
                 // In-order: advance rx_seq, mark ACK pending
                 ch->rx_seq++;
                 ch->rx_ack_pending = hdr->seq_num;
+                if (!ch->ack_pending) {
+                    ch->ack_pending_since_us = wki_now_us();
+                }
                 ch->ack_pending = true;
-                ch->ack_pending_since_us = wki_now_us();
                 ch->bytes_received += PAYLOAD_LEN;
 
                 bool notify_timer = false;
@@ -2073,7 +2179,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 }
 
                 // Dispatch to handler via shared helper
-                wki_dispatch_reliable_msg(msg, hdr, payload, PAYLOAD_LEN);
+                wki_dispatch_reliable_msg_ordered(ch, msg, hdr, payload, PAYLOAD_LEN);
 
                 // Deliver any buffered reorder entries that are now in-order
                 ch->lock.lock();
@@ -2088,8 +2194,10 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     refresh_rx_credits(ch);
                     ch->rx_seq++;
                     ch->rx_ack_pending = ro->seq;
+                    if (!ch->ack_pending) {
+                        ch->ack_pending_since_us = wki_now_us();
+                    }
                     ch->ack_pending = true;
-                    ch->ack_pending_since_us = wki_now_us();
                     ch->bytes_received += ro->len;
 
                     WkiHeader const RO_HDR = ro->hdr;
@@ -2111,7 +2219,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     }
 
                     // Re-dispatch reordered message through the same handler switch
-                    wki_dispatch_reliable_msg(RO_MSG, &RO_HDR, ro_data, RO_LEN);
+                    wki_dispatch_reliable_msg_ordered(ch, RO_MSG, &RO_HDR, ro_data, RO_LEN);
 
                     delete[] ro_data;
                     delete ro;
@@ -2314,7 +2422,7 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
         }
     }
 
-    if (ch->ack_pending && now_us >= ch->ack_pending_since_us + WKI_ACK_DELAY_US) {
+    if (ch->ack_pending && now_us >= ch->ack_pending_since_us + ack_delay_for_channel(ch->channel_id)) {
         ack_hdr.version_flags = wki_version_flags(WKI_VERSION, WKI_FLAG_ACK_PRESENT);
         ack_hdr.msg_type = static_cast<uint8_t>(MsgType::HEARTBEAT_ACK);
         ack_hdr.src_node = g_wki.my_node_id;
@@ -2449,9 +2557,9 @@ void wki_timer_tick(uint64_t now_us) {
         }
 
         // Delayed ACK - send standalone ACK if pending.
-        // wki_next_fast_timer_deadline_us() schedules the timer WKI_ACK_DELAY_US after
-        // ack_pending is set, giving outgoing messages time to piggyback the ACK first.
-        if (ch->ack_pending && now_us >= ch->ack_pending_since_us + WKI_ACK_DELAY_US) {
+        // wki_next_fast_timer_deadline_us() schedules the timer after the
+        // channel ACK delay, giving outgoing messages time to piggyback first.
+        if (ch->ack_pending && now_us >= ch->ack_pending_since_us + ack_delay_for_channel(ch->channel_id)) {
             // Build ACK header for TX outside lock
             ack_hdr.version_flags = wki_version_flags(WKI_VERSION, WKI_FLAG_ACK_PRESENT);
             ack_hdr.msg_type = static_cast<uint8_t>(MsgType::HEARTBEAT_ACK);  // reuse as ACK carrier

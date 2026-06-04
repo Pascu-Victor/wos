@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -200,6 +201,7 @@ struct ExportPipeWriteBacklog {
     bool close_has_expected_bytes = false;
     uint64_t close_expected_bytes = 0;
     bool queued = false;
+    bool persistent_for_rdma = false;
 };
 
 std::deque<ExportPipeWriteBacklog*> g_export_pipe_write_backlogs;
@@ -236,6 +238,18 @@ constexpr size_t WKI_IPC_EXPORT_PIPE_CAPACITY = 4UL * 1024UL * 1024UL;
 static_assert(WKI_IPC_PIPE_DATA_HEADER_SIZE < WKI_ETH_MAX_PAYLOAD);
 static_assert(WKI_IPC_PIPE_DATA_MAX_CHUNK <= UINT16_MAX);
 
+#ifndef WKI_IPC_PIPE_RDMA_DOORBELL
+#define WKI_IPC_PIPE_RDMA_DOORBELL 0  // NOLINT(cppcoreguidelines-macro-usage)
+#endif
+
+constexpr bool WKI_IPC_PIPE_RDMA_DOORBELL_ENABLED = WKI_IPC_PIPE_RDMA_DOORBELL != 0;
+constexpr uint32_t WKI_IPC_PIPE_RDMA_CAPACITY = WKI_IPC_PIPE_REGION_SIZE;
+constexpr uint32_t WKI_IPC_PIPE_RDMA_TOTAL_SIZE = static_cast<uint32_t>(sizeof(WkiPipeSharedRegion) + WKI_IPC_PIPE_RDMA_CAPACITY);
+constexpr uint32_t WKI_IPC_PIPE_RDMA_NOTIFY_RETRIES = 8;
+constexpr uint32_t WKI_IPC_PIPE_RDMA_NOTIFY_BURST = 3;
+constexpr uint64_t WKI_IPC_PIPE_RDMA_WATCH_US = 1000;
+static_assert(WKI_IPC_PIPE_RDMA_CAPACITY != 0);
+
 struct PendingProxyPipeClose {
     uint16_t home_node = WKI_NODE_INVALID;
     uint16_t msg_size = 0;
@@ -254,6 +268,9 @@ auto stop_pipe_pump_locked(WkiIpcExport* exp) -> ker::mod::sched::task::Task*;
 void wake_pipe_pump(ker::mod::sched::task::Task* task);
 auto send_proxy_pipe_close(ProxyIpcState* proxy, const uint8_t* msg, uint16_t msg_size, uint32_t resource_id, uint16_t op_id) -> void;
 auto enqueue_proxy_pipe_close_tx(uint16_t home_node, const uint8_t* msg, uint16_t msg_size, uint32_t resource_id, uint16_t op_id) -> bool;
+auto export_pipe_rdma_header(WkiIpcExport* exp) -> WkiPipeSharedRegion*;
+auto export_pipe_rdma_front_locked(WkiIpcExport* exp, uint32_t* tail_out, uint16_t* len_out, uint8_t** data_out) -> bool;
+auto queue_export_pipe_rdma_flush(uint16_t src_node, uint32_t resource_id) -> bool;
 
 auto should_proxy_tty_like_file(ker::vfs::File* file) -> bool {
     if (file == nullptr || file->fs_type != ker::vfs::FSType::DEVFS) {
@@ -681,6 +698,9 @@ auto mark_export_pipe_write_closed(WkiIpcExport* exp, uint64_t expected_bytes = 
         uint32_t resource_id = 0;
         uint16_t remaining = 0;
         uint8_t const* data_ptr = nullptr;
+        uint8_t* rdma_data_ptr = nullptr;
+        uint32_t rdma_tail = 0;
+        bool rdma_chunk = false;
         bool close_pending = false;
         bool close_ready = false;
 
@@ -703,6 +723,10 @@ auto mark_export_pipe_write_closed(WkiIpcExport* exp, uint64_t expected_bytes = 
             auto& chunk = backlog->chunks.front();
             remaining = static_cast<uint16_t>(chunk.len - chunk.offset);
             data_ptr = chunk.data + chunk.offset;
+        } else if (export_pipe_rdma_front_locked(exp, &rdma_tail, &remaining, &rdma_data_ptr)) {
+            file->refcount.fetch_add(1, std::memory_order_acq_rel);
+            data_ptr = rdma_data_ptr;
+            rdma_chunk = true;
         } else if (close_pending) {
             if (!close_ready) {
                 s_ipc_lock.unlock_irqrestore(irqf);
@@ -719,9 +743,17 @@ auto mark_export_pipe_write_closed(WkiIpcExport* exp, uint64_t expected_bytes = 
             free_export_pipe_write_backlog(backlog);
             continue;
         } else {
-            erase_export_pipe_write_backlog_locked(backlog);
+            if (!backlog->persistent_for_rdma) {
+                erase_export_pipe_write_backlog_locked(backlog);
+            } else {
+                queue_export_pipe_write_flush_locked(backlog);
+            }
             s_ipc_lock.unlock_irqrestore(irqf);
-            free_export_pipe_write_backlog(backlog);
+            if (!backlog->persistent_for_rdma) {
+                free_export_pipe_write_backlog(backlog);
+            } else {
+                ker::mod::sched::kern_sleep_us(WKI_IPC_PIPE_RDMA_WATCH_US);
+            }
             continue;
         }
         s_ipc_lock.unlock_irqrestore(irqf);
@@ -739,23 +771,40 @@ auto mark_export_pipe_write_closed(WkiIpcExport* exp, uint64_t expected_bytes = 
         }
 
         if (WRITE_RET > 0) {
-            auto& chunk = backlog->chunks.front();
             auto const ADVANCED = static_cast<uint16_t>(std::cmp_less(WRITE_RET, remaining) ? WRITE_RET : remaining);
-            chunk.offset = static_cast<uint16_t>(chunk.offset + ADVANCED);
-            backlog->buffered_bytes -= ADVANCED;
-            if (chunk.offset == chunk.len) {
-                delete[] chunk.data;
-                backlog->chunks.pop_front();
+            if (rdma_chunk) {
+                auto* header = export_pipe_rdma_header(exp);
+                if (header != nullptr) {
+                    uint32_t const NEW_TAIL = rdma_tail + ADVANCED;
+                    header->tail.store(NEW_TAIL, std::memory_order_release);
+                    uint32_t const HEAD = header->head.load(std::memory_order_acquire);
+                    uint32_t const USED = HEAD - NEW_TAIL;
+                    uint32_t const CREDITS = USED < exp->pipe_rdma_capacity ? exp->pipe_rdma_capacity - USED : 0;
+                    header->credits.store(CREDITS, std::memory_order_release);
+                    exp->pipe_bytes_received += ADVANCED;
+                }
+            } else {
+                auto& chunk = backlog->chunks.front();
+                chunk.offset = static_cast<uint16_t>(chunk.offset + ADVANCED);
+                backlog->buffered_bytes -= ADVANCED;
+                if (chunk.offset == chunk.len) {
+                    delete[] chunk.data;
+                    backlog->chunks.pop_front();
+                }
             }
 
-            if (!backlog->chunks.empty() || backlog->close_pending) {
+            uint32_t next_tail = 0;
+            uint16_t next_len = 0;
+            uint8_t* next_data = nullptr;
+            bool const HAS_RDMA = export_pipe_rdma_front_locked(exp, &next_tail, &next_len, &next_data);
+            if (!backlog->chunks.empty() || HAS_RDMA || backlog->close_pending) {
                 queue_export_pipe_write_flush_locked(backlog);
-            } else {
+            } else if (!backlog->persistent_for_rdma) {
                 erase_export_pipe_write_backlog_locked(backlog);
             }
             s_ipc_lock.unlock_irqrestore(irqf);
             ipc_release_file_ref(file);
-            if (backlog->chunks.empty() && !backlog->close_pending) {
+            if (!backlog->persistent_for_rdma && backlog->chunks.empty() && !backlog->close_pending) {
                 free_export_pipe_write_backlog(backlog);
             }
             continue;
@@ -1048,6 +1097,159 @@ auto proxy_pipe_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offset
     }
 }
 
+auto ipc_pipe_rdma_transport_for_peer(uint16_t peer_node) -> WkiTransport* {
+    if (!WKI_IPC_PIPE_RDMA_DOORBELL_ENABLED) {
+        return nullptr;
+    }
+
+    WkiPeer const* peer = wki_peer_find(peer_node);
+    WkiTransport* transport = peer != nullptr ? peer->rdma_transport : nullptr;
+    if (transport == nullptr || transport->name == nullptr) {
+        return nullptr;
+    }
+    if (std::strcmp(transport->name, "wki-roce") != 0) {
+        return nullptr;
+    }
+    if (!transport->rdma_capable || transport->rdma_register_region == nullptr || transport->rdma_read == nullptr ||
+        transport->rdma_write == nullptr || transport->doorbell == nullptr) {
+        return nullptr;
+    }
+    return transport;
+}
+
+auto acquire_proxy_pipe_rdma_writer(ProxyIpcState* proxy) -> bool {
+    if (proxy == nullptr) {
+        return false;
+    }
+
+    uint32_t spins = 0;
+    while (proxy->active.load(std::memory_order_acquire)) {
+        bool expected = false;
+        if (proxy->pipe_rdma_writer_active.compare_exchange_weak(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return true;
+        }
+        if (current_task_has_deliverable_signal()) {
+            return false;
+        }
+        if ((++spins & 0x3FU) == 0) {
+            ker::mod::sched::kern_yield();
+        } else {
+            asm volatile("pause" ::: "memory");
+        }
+    }
+    return false;
+}
+
+void release_proxy_pipe_rdma_writer(ProxyIpcState* proxy) {
+    if (proxy != nullptr) {
+        proxy->pipe_rdma_writer_active.store(false, std::memory_order_release);
+    }
+}
+
+auto notify_proxy_pipe_rdma_data(ProxyIpcState* proxy) -> int {
+    if (proxy == nullptr || proxy->pipe_rdma_transport == nullptr || proxy->pipe_rdma_transport->doorbell == nullptr) {
+        return WKI_ERR_INVALID;
+    }
+
+    uint32_t const DOORBELL = WKI_DOORBELL_IPC_BASE | (proxy->resource_id & WKI_IPC_RESOURCE_MASK);
+    int last_ret = WKI_ERR_TX_FAILED;
+    bool any_ok = false;
+    for (uint32_t attempt = 0; attempt < WKI_IPC_PIPE_RDMA_NOTIFY_BURST; ++attempt) {
+        last_ret = proxy->pipe_rdma_transport->doorbell(proxy->pipe_rdma_transport, proxy->home_node, DOORBELL);
+        if (last_ret != WKI_OK) {
+            break;
+        }
+        any_ok = true;
+    }
+    return any_ok ? WKI_OK : last_ret;
+}
+
+auto proxy_pipe_write_rdma(ProxyIpcState* proxy, const uint8_t* src, size_t count, uint64_t callsite) -> ssize_t {
+    if (proxy == nullptr || src == nullptr || count == 0 || !proxy->pipe_rdma_enabled || proxy->pipe_rdma_transport == nullptr ||
+        proxy->pipe_rdma_rkey == 0 || proxy->pipe_rdma_capacity == 0) {
+        return -EOPNOTSUPP;
+    }
+
+    if (!acquire_proxy_pipe_rdma_writer(proxy)) {
+        return -EINTR;
+    }
+
+    auto release = [&]() { release_proxy_pipe_rdma_writer(proxy); };
+    size_t sent = 0;
+    uint32_t attempts = 0;
+
+    while (sent < count && proxy->active.load(std::memory_order_acquire)) {
+        uint32_t used = proxy->pipe_rdma_head - proxy->pipe_rdma_tail_cache;
+        if (used >= proxy->pipe_rdma_capacity) {
+            std::array<uint8_t, sizeof(WkiPipeSharedRegion)> header = {};
+            int const READ_RET = proxy->pipe_rdma_transport->rdma_read(proxy->pipe_rdma_transport, proxy->home_node, proxy->pipe_rdma_rkey,
+                                                                       0, header.data(), static_cast<uint32_t>(header.size()));
+            if (READ_RET != WKI_OK) {
+                release();
+                return sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EIO);
+            }
+
+            uint32_t remote_tail = 0;
+            uint32_t remote_flags = 0;
+            std::memcpy(&remote_tail, header.data() + offsetof(WkiPipeSharedRegion, tail), sizeof(remote_tail));
+            std::memcpy(&remote_flags, header.data() + offsetof(WkiPipeSharedRegion, flags), sizeof(remote_flags));
+            if ((remote_flags & WKI_PIPE_FLAG_READ_CLOSED) != 0U) {
+                release();
+                return sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EPIPE);
+            }
+            proxy->pipe_rdma_tail_cache = remote_tail;
+            used = proxy->pipe_rdma_head - proxy->pipe_rdma_tail_cache;
+        }
+
+        if (used >= proxy->pipe_rdma_capacity) {
+            if (current_task_has_deliverable_signal()) {
+                release();
+                return sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EINTR);
+            }
+            if (attempts < WKI_IPC_PIPE_RDMA_NOTIFY_RETRIES) {
+                static_cast<void>(notify_proxy_pipe_rdma_data(proxy));
+            }
+            attempts++;
+            ker::mod::sched::kern_sleep_us(ipc_pipe_send_retry_sleep_us(WKI_ERR_NO_CREDITS, attempts));
+            continue;
+        }
+
+        attempts = 0;
+        uint32_t const FREE = proxy->pipe_rdma_capacity - used;
+        uint32_t const RING_HEAD = proxy->pipe_rdma_head % proxy->pipe_rdma_capacity;
+        uint32_t const CONTIG = std::min(proxy->pipe_rdma_capacity - RING_HEAD, FREE);
+        uint32_t const TO_SEND = static_cast<uint32_t>(std::min<size_t>(count - sent, CONTIG));
+        uint64_t const DATA_OFFSET = sizeof(WkiPipeSharedRegion) + RING_HEAD;
+
+        int const DATA_RET = proxy->pipe_rdma_transport->rdma_write(proxy->pipe_rdma_transport, proxy->home_node, proxy->pipe_rdma_rkey,
+                                                                    DATA_OFFSET, src + sent, TO_SEND);
+        if (DATA_RET != WKI_OK) {
+            release();
+            return sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EIO);
+        }
+
+        uint32_t const NEW_HEAD = proxy->pipe_rdma_head + TO_SEND;
+        int const HEAD_RET = proxy->pipe_rdma_transport->rdma_write(proxy->pipe_rdma_transport, proxy->home_node, proxy->pipe_rdma_rkey,
+                                                                    offsetof(WkiPipeSharedRegion, head), &NEW_HEAD, sizeof(NEW_HEAD));
+        if (HEAD_RET != WKI_OK) {
+            release();
+            return sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EIO);
+        }
+
+        proxy->pipe_rdma_head = NEW_HEAD;
+        sent += TO_SEND;
+        proxy->bytes_written.fetch_add(TO_SEND, std::memory_order_acq_rel);
+        perf_record_ipc_point(ker::mod::perf::WkiPerfIpcOp::PROXY_WRITE, proxy->home_node, WKI_CHAN_IPC_DATA, 0, 0, TO_SEND, callsite);
+        static_cast<void>(notify_proxy_pipe_rdma_data(proxy));
+    }
+
+    release();
+    if (sent == 0 && !proxy->active.load(std::memory_order_acquire)) {
+        return -EIO;
+    }
+    return static_cast<ssize_t>(sent);
+}
+
 auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /*offset*/) -> ssize_t {
     auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
     IpcPerfTrace trace(ker::mod::perf::WkiPerfIpcOp::PROXY_WRITE, proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID, WKI_CHAN_IPC_DATA,
@@ -1065,6 +1267,13 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
     }
     if (count == 0) {
         return finish(0);
+    }
+
+    if (proxy->pipe_rdma_enabled && proxy->pipe_rdma_transport != nullptr) {
+        auto const RDMA_RET = proxy_pipe_write_rdma(proxy, static_cast<const uint8_t*>(buf), count, WOS_PERF_CALLSITE());
+        if (RDMA_RET != -EOPNOTSUPP) {
+            return finish(RDMA_RET, RDMA_RET > 0 ? static_cast<uint64_t>(RDMA_RET) : 0);
+        }
     }
 
     // Send data via wire message to home node
@@ -1461,6 +1670,126 @@ auto find_export_by_resource_id(uint32_t resource_id) -> WkiIpcExport* {
 auto find_proxy_by_resource_id(uint32_t resource_id) -> ProxyIpcState* { return find_proxy_by_resource_id_locked(resource_id); }
 
 auto allocate_ipc_resource_id() -> uint32_t { return g_next_ipc_resource_id++; }
+
+auto export_pipe_rdma_header(WkiIpcExport* exp) -> WkiPipeSharedRegion* {
+    if (exp == nullptr || !exp->pipe_rdma_enabled || exp->pipe_rdma_region == nullptr) {
+        return nullptr;
+    }
+    return reinterpret_cast<WkiPipeSharedRegion*>(exp->pipe_rdma_region);
+}
+
+auto export_pipe_rdma_front_locked(WkiIpcExport* exp, uint32_t* tail_out, uint16_t* len_out, uint8_t** data_out) -> bool {
+    if (tail_out == nullptr || len_out == nullptr || data_out == nullptr) {
+        return false;
+    }
+
+    auto* header = export_pipe_rdma_header(exp);
+    if (header == nullptr || exp->pipe_rdma_capacity == 0) {
+        return false;
+    }
+
+    uint32_t const HEAD = header->head.load(std::memory_order_acquire);
+    uint32_t const TAIL = header->tail.load(std::memory_order_relaxed);
+    uint32_t used = HEAD - TAIL;
+    if (used == 0) {
+        return false;
+    }
+    used = std::min(used, exp->pipe_rdma_capacity);
+
+    uint32_t const RING_TAIL = TAIL % exp->pipe_rdma_capacity;
+    uint32_t const CONTIG = std::min(exp->pipe_rdma_capacity - RING_TAIL, used);
+    *tail_out = TAIL;
+    *len_out = static_cast<uint16_t>(std::min<uint32_t>(CONTIG, UINT16_MAX));
+    *data_out = exp->pipe_rdma_region + sizeof(WkiPipeSharedRegion) + RING_TAIL;
+    return *len_out != 0;
+}
+
+auto queue_export_pipe_rdma_flush(uint16_t src_node, uint32_t resource_id) -> bool {
+    size_t shard = 0;
+    bool wake = false;
+    uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+    auto* exp = find_export_by_resource_id(resource_id);
+    if (exp != nullptr && exp->active && exp->consumer_node == src_node && exp->pipe_rdma_enabled) {
+        auto* backlog = find_export_pipe_write_backlog_locked(exp);
+        if (backlog != nullptr) {
+            queue_export_pipe_write_flush_locked(backlog);
+            shard = export_pipe_write_backlog_shard(backlog);
+            wake = true;
+        }
+    }
+    s_ipc_lock.unlock_irqrestore(IRQF);
+
+    if (wake) {
+        wake_export_pipe_write_flush_worker(shard);
+    }
+    return wake;
+}
+
+void setup_export_pipe_rdma(WkiIpcExport* exp, uint16_t target_node, WkiIpcFdEntry& entry) {
+    if (!WKI_IPC_PIPE_RDMA_DOORBELL_ENABLED || exp == nullptr || exp->res_type != ResourceType::IPC_PIPE ||
+        exp->resource_id > WKI_IPC_RESOURCE_MASK) {
+        return;
+    }
+
+    auto* transport = ipc_pipe_rdma_transport_for_peer(target_node);
+    if (transport == nullptr) {
+        return;
+    }
+
+    uint64_t irqf = s_ipc_lock.lock_irqsave();
+    auto* backlog = ensure_export_pipe_write_backlog_locked(exp);
+    if (backlog == nullptr) {
+        s_ipc_lock.unlock_irqrestore(irqf);
+        return;
+    }
+    s_ipc_lock.unlock_irqrestore(irqf);
+
+    auto* region = new (std::nothrow) uint8_t[WKI_IPC_PIPE_RDMA_TOTAL_SIZE];
+    if (region == nullptr) {
+        irqf = s_ipc_lock.lock_irqsave();
+        erase_export_pipe_write_backlog_locked(backlog);
+        s_ipc_lock.unlock_irqrestore(irqf);
+        free_export_pipe_write_backlog(backlog);
+        return;
+    }
+    std::fill_n(region, WKI_IPC_PIPE_RDMA_TOTAL_SIZE, uint8_t{0});
+
+    auto* header = reinterpret_cast<WkiPipeSharedRegion*>(region);
+    header->head.store(0, std::memory_order_relaxed);
+    header->tail.store(0, std::memory_order_relaxed);
+    header->credits.store(WKI_IPC_PIPE_RDMA_CAPACITY, std::memory_order_relaxed);
+    header->capacity = WKI_IPC_PIPE_RDMA_CAPACITY;
+    header->flags = 0;
+
+    uint32_t rkey = 0;
+    int const REG_RET = transport->rdma_register_region(transport, reinterpret_cast<uint64_t>(region), WKI_IPC_PIPE_RDMA_TOTAL_SIZE, &rkey);
+    if (REG_RET != WKI_OK || rkey == 0) {
+        irqf = s_ipc_lock.lock_irqsave();
+        erase_export_pipe_write_backlog_locked(backlog);
+        s_ipc_lock.unlock_irqrestore(irqf);
+        free_export_pipe_write_backlog(backlog);
+        delete[] region;
+        return;
+    }
+
+    size_t shard = 0;
+    irqf = s_ipc_lock.lock_irqsave();
+    exp->pipe_rdma_enabled = true;
+    exp->pipe_rdma_region = region;
+    exp->pipe_rdma_region_size = WKI_IPC_PIPE_RDMA_TOTAL_SIZE;
+    exp->pipe_rdma_capacity = WKI_IPC_PIPE_RDMA_CAPACITY;
+    exp->pipe_rdma_rkey = rkey;
+    exp->pipe_rdma_transport = transport;
+
+    backlog->persistent_for_rdma = true;
+    queue_export_pipe_write_flush_locked(backlog);
+    shard = export_pipe_write_backlog_shard(backlog);
+    s_ipc_lock.unlock_irqrestore(irqf);
+
+    wake_export_pipe_write_flush_worker(shard);
+    entry.rdma_rkey = rkey;
+    entry.rdma_offset = WKI_IPC_PIPE_RDMA_CAPACITY;
+}
 
 auto proxy_ring_used_bytes(const ProxyIpcState* proxy) -> uint64_t {
     if (proxy == nullptr || proxy->ring_buf == nullptr || proxy->ring_capacity == 0) {
@@ -2422,6 +2751,9 @@ auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_
         entry.reserved1 = static_cast<uint16_t>(file->open_flags) & WKI_IPC_FD_ACCESS_MASK;
         entry.rdma_rkey = 0;
         entry.rdma_offset = 0;
+        if (res_type == ResourceType::IPC_PIPE && file->open_flags != 0) {
+            setup_export_pipe_rdma(exp, target_node, entry);
+        }
         count++;
     });
 
@@ -2547,6 +2879,18 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
         if (proxy->res_type == ResourceType::IPC_PIPE) {
             int const OPEN_FLAGS = static_cast<int>(entry.reserved1 & WKI_IPC_FD_ACCESS_MASK);
             proxy_file->open_flags = OPEN_FLAGS;
+            if (OPEN_FLAGS != 0 && entry.rdma_rkey != 0 && entry.rdma_offset != 0 && WKI_IPC_PIPE_RDMA_DOORBELL_ENABLED) {
+                auto* transport = ipc_pipe_rdma_transport_for_peer(entry.home_node);
+                if (transport != nullptr) {
+                    proxy->pipe_rdma_enabled = true;
+                    proxy->pipe_rdma_rkey = entry.rdma_rkey;
+                    proxy->pipe_rdma_capacity = static_cast<uint32_t>(std::min<uint64_t>(entry.rdma_offset, UINT32_MAX));
+                    proxy->pipe_rdma_head = 0;
+                    proxy->pipe_rdma_tail_cache = 0;
+                    proxy->pipe_rdma_transport = transport;
+                    proxy->pipe_rdma_writer_active.store(false, std::memory_order_relaxed);
+                }
+            }
             if (OPEN_FLAGS == 0) {
                 proxy_file->fops = &g_proxy_pipe_read_fops;
             } else {
@@ -2611,8 +2955,13 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
 // Doorbell RX handler — called from ISR when IPC doorbell arrives
 // =============================================================================
 
-void wki_ipc_doorbell_rx(uint16_t /*src_node*/, uint32_t /*doorbell_value*/) {
-    // No longer used — pipe data flows via wire messages, not RDMA doorbells
+auto wki_ipc_doorbell_rx(uint16_t src_node, uint32_t doorbell_value) -> bool {
+    if ((doorbell_value & WKI_DOORBELL_IPC_MASK) != WKI_DOORBELL_IPC_BASE) {
+        return false;
+    }
+
+    uint32_t const RESOURCE_ID = doorbell_value & WKI_IPC_RESOURCE_MASK;
+    return queue_export_pipe_rdma_flush(src_node, RESOURCE_ID);
 }
 
 auto wki_ipc_epoll_ctl_forward(ker::vfs::File* epfile, int op, int fd, uint32_t events, uint64_t data) -> int {
@@ -2732,6 +3081,23 @@ auto wki_ipc_epoll_ctl_forward(ker::vfs::File* epfile, int op, int fd, uint32_t 
 // DEV_OP response handler for IPC control ops
 // =============================================================================
 
+namespace {
+
+auto claim_proxy_pending_wait_locked(ProxyIpcState* proxy, int status) -> WkiWaitEntry* {
+    if (proxy == nullptr || proxy->pending_wait == nullptr) {
+        return nullptr;
+    }
+    auto* wait = proxy->pending_wait;
+    if (!wki_claim_op(wait)) {
+        return nullptr;
+    }
+    proxy->pending_wait_status = status;
+    proxy->pending_wait_resp_len = 0;
+    return wait;
+}
+
+}  // namespace
+
 void wki_ipc_handle_dev_op_resp(uint16_t src_node, uint16_t channel, const uint8_t* payload, uint16_t len) {
     (void)src_node;
     (void)channel;
@@ -2825,7 +3191,7 @@ void wki_ipc_socket_handle_dev_op_resp(uint16_t /*src_node*/, uint16_t /*channel
     {
         uint64_t const PROXY_IRQF = target_proxy->lock.lock_irqsave();
         wait = target_proxy->pending_wait;
-        if (wait != nullptr && target_proxy->pending_wait_op == resp.op_id) {
+        if (wait != nullptr && target_proxy->pending_wait_op == resp.op_id && wki_claim_op(wait)) {
             target_proxy->pending_wait_status = static_cast<int>(resp.status);
             if (EXTRA_LEN > 0) {
                 uint16_t const COPY_LEN =
@@ -2842,7 +3208,7 @@ void wki_ipc_socket_handle_dev_op_resp(uint16_t /*src_node*/, uint16_t /*channel
     }
 
     if (wait != nullptr) {
-        wki_wake_op(wait, 0);
+        wki_finish_claimed_op(wait, 0);
     }
 
     if (target_proxy->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -2872,6 +3238,15 @@ void wki_ipc_detach_proxy_file(ker::vfs::File* f, ProxyIpcState* proxy) {
     auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
     wake_blocked_ipc_reader(reader);
     wki_ipc_proxy_wake_poll_waiters(proxy);
+    WkiWaitEntry* pending_wait = nullptr;
+    {
+        uint64_t const PROXY_IRQF = proxy->lock.lock_irqsave();
+        pending_wait = claim_proxy_pending_wait_locked(proxy, -EIO);
+        proxy->lock.unlock_irqrestore(PROXY_IRQF);
+    }
+    if (pending_wait != nullptr) {
+        wki_finish_claimed_op(pending_wait, 0);
+    }
 
     if (f != nullptr) {
         f->private_data = nullptr;
@@ -2992,9 +3367,18 @@ void wki_ipc_cleanup_for_peer(uint16_t node_id) {
     }
 
     for (auto* proxy : std::span(detached_proxies.data(), detached_proxy_count)) {
+        WkiWaitEntry* pending_wait = nullptr;
+        {
+            uint64_t const PROXY_IRQF = proxy->lock.lock_irqsave();
+            pending_wait = claim_proxy_pending_wait_locked(proxy, -EIO);
+            proxy->lock.unlock_irqrestore(PROXY_IRQF);
+        }
         auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
         wake_blocked_ipc_reader(reader);
         wki_ipc_proxy_wake_poll_waiters(proxy);
+        if (pending_wait != nullptr) {
+            wki_finish_claimed_op(pending_wait, 0);
+        }
         proxy_release(proxy);
     }
 
@@ -3052,6 +3436,11 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
     if (OP_ID == OP_PIPE_DATA) {
         IpcPerfTrace pipe_trace(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA, hdr->src_node, hdr->channel_id, IPC_CALLSITE, OP_DATA_LEN,
                                 IPC_CORRELATION);
+        if (OP_DATA_LEN == 0 && queue_export_pipe_rdma_flush(hdr->src_node, resource_id)) {
+            pipe_trace.finish(0);
+            return;
+        }
+
         // Consumer receives pipe data — write into the local proxy ring if
         // present, otherwise route it to the exported home-side pipe.
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();

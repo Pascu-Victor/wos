@@ -288,7 +288,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         dbg::log("wos_proc_exec: No current task");
         return 0;
     }
-    uint64_t const PARENT_PID = parent_task->pid;
+    uint64_t const PARENT_PID = sched::task::process_pid(*parent_task);
 
 #ifdef EXEC_DEBUG
     dbg::log("wos_proc_exec: Loading '%.*s'", static_cast<int>(STR.size()), STR.data());
@@ -451,7 +451,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     new_task->umask = parent_task->umask;
     [[maybe_unused]] bool const CLONED_GROUPS = new_task->supplementary_groups.clone_from(parent_task->supplementary_groups);
     new_task->session_id = parent_task->session_id;
-    new_task->pgid = (parent_task->pgid != 0) ? parent_task->pgid : parent_task->pid;
+    new_task->pgid = (parent_task->pgid != 0) ? parent_task->pgid : PARENT_PID;
     new_task->controlling_tty = parent_task->controlling_tty;
     new_task->wki_prefer_inline = parent_task->wki_prefer_inline;
     new_task->wki_target_hostname = parent_task->wki_target_hostname;

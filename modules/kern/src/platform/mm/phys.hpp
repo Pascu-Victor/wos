@@ -57,6 +57,7 @@ auto page_alloc(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_vie
 auto page_alloc_huge(uint64_t size) -> void*;  // Try the optional huge page zone, if enabled.
 void page_free(void* page);
 auto page_split_to_order0(void* page) -> bool;
+auto page_alloc_can_satisfy(uint64_t size, uint64_t reserve_bytes = 0) -> bool;
 
 // --- Frame reference counting (for COW fork) ---
 // Increment the refcount for a physical page (HHDM pointer).

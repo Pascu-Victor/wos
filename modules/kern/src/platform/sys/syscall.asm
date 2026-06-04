@@ -54,9 +54,7 @@ wos_asm_syscall_handler:
     ; Get current task from scheduler
     extern wos_get_current_task
     extern WOS_DEFERRED_TASK_SWITCH_OFFSET
-    sub rsp, 8  ; Align stack for call
     call wos_get_current_task
-    add rsp, 8  ; Restore stack
     cli
 
     ; rax now contains current task pointer
@@ -70,20 +68,16 @@ wos_asm_syscall_handler:
     extern deferred_task_switch
     lea rdi, [rsp+8]       ; GPRegs pointer
     lea rsi, [rsp+136]     ; Frame pointer (after GPRegs)
-    sub rsp, 8  ; Align stack for call
     call deferred_task_switch
     ; deferred_task_switch returns only if it decided to resume this task via
     ; the normal syscall exit path.
-    add rsp, 8
     cli
 
 .no_deferred_switch:
     ; Check for pending signals before returning to userspace
     extern check_pending_signals
     mov rdi, rsp            ; raw stack pointer (bottom of pushed GPRegs)
-    sub rsp, 8              ; align stack for call
     call check_pending_signals
-    add rsp, 8
     cli
     test rax, rax
     jne .signal_iret_return

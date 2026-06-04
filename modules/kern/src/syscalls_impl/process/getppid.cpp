@@ -13,7 +13,7 @@ auto wos_proc_getppid() -> uint64_t {
     // Some user tasks, including WKI receiver-side remote tasks, are parentless
     // for lifecycle purposes. Expose them to userspace as init-adopted.
     const bool PARENTLESS_PROCESS = current_task->parent_pid == 0 && current_task->type == mod::sched::task::TaskType::PROCESS;
-    if (PARENTLESS_PROCESS && current_task->pid != 1) {
+    if (PARENTLESS_PROCESS && mod::sched::task::process_pid(*current_task) != 1) {
         return 1;
     }
     return current_task->parent_pid;

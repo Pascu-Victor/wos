@@ -54,7 +54,7 @@ auto stop_signal(const Task& task) -> uint32_t {
     return signal;
 }
 
-auto process_id(const Task& task) -> uint64_t { return task.owner_pid != 0 ? task.owner_pid : task.pid; }
+auto process_id(const Task& task) -> uint64_t { return ker::mod::sched::task::process_pid(task); }
 
 auto can_trace(const Task& tracer, const Task& target) -> bool {
     if (target.type != ker::mod::sched::task::TaskType::PROCESS) {
@@ -474,7 +474,7 @@ auto remote_info(Task& target, uint64_t data) -> uint64_t {
         return as_error(EFAULT);
     }
     std::memset(out, 0, sizeof(*out));
-    out->is_proxy = target.wki_proxy_task_id != 0 ? 1U : 0U;
+    out->is_proxy = target.wki_proxy_task || target.wki_proxy_task_id != 0 ? 1U : 0U;
     if (target.has_exited) {
         out->state = 2U;
     } else {

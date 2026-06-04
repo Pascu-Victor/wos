@@ -141,6 +141,17 @@ struct ProxyIpcState {
 
     ker::mod::sys::Spinlock lock;
 
+    // Optional proxy-write RDMA pipe fast path.  The home/export side owns the
+    // receive ring; proxy writers serialize reservations with writer_active so
+    // byte order remains identical to the message path.
+    bool pipe_rdma_enabled = false;
+    uint32_t pipe_rdma_rkey = 0;
+    uint32_t pipe_rdma_capacity = 0;
+    uint32_t pipe_rdma_head = 0;
+    uint32_t pipe_rdma_tail_cache = 0;
+    WkiTransport* pipe_rdma_transport = nullptr;
+    std::atomic<bool> pipe_rdma_writer_active{false};
+
     // Synchronous control-op wait state (socket control ops: SHUTDOWN, GETPEERNAME, etc.)
     // Protected by lock; only one in-flight control op per proxy at a time.
     WkiWaitEntry* pending_wait = nullptr;
@@ -173,6 +184,16 @@ struct WkiIpcExport {
     uint16_t assigned_channel = 0;
     uint16_t consumer_node = WKI_NODE_INVALID;
     uint64_t pipe_bytes_received = 0;
+
+    // Optional proxy-write RDMA receive ring.  This is intentionally separate
+    // from the local pipe backlog so bulk bytes can arrive without consuming
+    // WKI_CHAN_IPC_DATA payload credits.
+    bool pipe_rdma_enabled = false;
+    uint8_t* pipe_rdma_region = nullptr;
+    uint32_t pipe_rdma_region_size = 0;
+    uint32_t pipe_rdma_capacity = 0;
+    uint32_t pipe_rdma_rkey = 0;
+    WkiTransport* pipe_rdma_transport = nullptr;
 
     // Server-side pump state
     std::atomic<bool> pump_running{false};
@@ -229,8 +250,9 @@ auto wki_ipc_find_pipe_affinity_node(const ker::mod::sched::task::Task* task, ui
 // Replaces File::fops with proxy fops for each IPC fd.
 void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEntry* map, uint16_t count);
 
-// Doorbell RX handler — called from ISR when IPC doorbell arrives
-void wki_ipc_doorbell_rx(uint16_t src_node, uint32_t doorbell_value);
+// Doorbell RX handler — called from ISR when IPC doorbell arrives.
+// Returns true when the doorbell matched a live IPC RDMA pipe export.
+auto wki_ipc_doorbell_rx(uint16_t src_node, uint32_t doorbell_value) -> bool;
 
 // Handle incoming DEV_OP_REQ for IPC (pipe data, close, etc.)
 void wki_ipc_handle_dev_op_req(uint16_t src_node, uint16_t channel, const uint8_t* payload, uint16_t len);

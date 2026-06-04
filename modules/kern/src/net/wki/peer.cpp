@@ -1291,7 +1291,7 @@ void wki_timer_wait_until(uint64_t deadline_us, uint32_t notify_seq_before_wait)
             return;
         }
 
-        mod::sched::kern_yield();
+        mod::sched::kern_sleep_us(deadline_us - NOW_US);
     }
 }
 

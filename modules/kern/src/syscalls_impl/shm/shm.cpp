@@ -64,7 +64,7 @@ auto process_pid_for_task(const ker::mod::sched::task::Task* task) -> uint64_t {
     if (task == nullptr) {
         return 0;
     }
-    return task->owner_pid != 0 ? task->owner_pid : task->pid;
+    return ker::mod::sched::task::process_pid(*task);
 }
 
 auto backing_page(const ShmSegment& segment, uint64_t index) -> void* {
@@ -179,6 +179,7 @@ auto create_segment(int key, uint64_t size, int shmflg, ker::mod::sched::task::T
     }
 
     int const ID = g_next_id++;
+    uint64_t const PROCESS_PID = process_pid_for_task(task);
     *slot = {
         .active = true,
         .id = ID,
@@ -187,9 +188,9 @@ auto create_segment(int key, uint64_t size, int shmflg, ker::mod::sched::task::T
         .size = size,
         .page_count = size / ker::mod::mm::paging::PAGE_SIZE,
         .mode = static_cast<uint32_t>(shmflg & static_cast<int>(std::filesystem::perms::mask)),
-        .creator_pid = task != nullptr ? task->pid : 0,
-        .owner_pid = task != nullptr ? task->pid : 0,
-        .last_pid = task != nullptr ? task->pid : 0,
+        .creator_pid = PROCESS_PID,
+        .owner_pid = PROCESS_PID,
+        .last_pid = PROCESS_PID,
         .attach_count = 0,
         .marked_destroy = false,
     };
@@ -277,7 +278,7 @@ auto shmat_impl(int shmid, uint64_t shmaddr, int shmflg) -> uint64_t {
         .size = SIZE,
     };
     segment->attach_count++;
-    segment->last_pid = task->pid;
+    segment->last_pid = process_pid_for_task(task);
 
     g_lock.unlock_irqrestore(FLAGS);
     return ADDR;
@@ -297,7 +298,7 @@ void detach_attachment(ShmAttachment& attachment, ker::mod::sched::task::Task* t
         if (segment->attach_count > 0) {
             segment->attach_count--;
         }
-        segment->last_pid = task != nullptr ? task->pid : attachment.pid;
+        segment->last_pid = task != nullptr ? process_pid_for_task(task) : attachment.pid;
         maybe_release_destroyed_segment(*segment);
     }
 

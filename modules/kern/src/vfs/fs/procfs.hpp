@@ -12,6 +12,8 @@ namespace ker::vfs::procfs {
 enum class ProcNodeType : uint8_t {
     ROOT_DIR,             // /proc
     PID_DIR,              // /proc/<pid>
+    TASK_DIR,             // /proc/<pid>/task
+    TASK_TID_DIR,         // /proc/<pid>/task/<tid>
     SELF_LINK,            // /proc/self -> /proc/<pid>
     EXE_LINK,             // /proc/<pid>/exe -> exe_path
     STATUS_FILE,          // /proc/<pid>/status
@@ -57,7 +59,8 @@ enum class ProcNodeType : uint8_t {
 
 struct ProcNode {
     ProcNodeType type;
-    uint64_t pid;  // relevant for PID_DIR, EXE_LINK, STATUS_FILE
+    uint64_t pid;  // process ID, task ID, or thread-group ID depending on node type
+    bool thread_view;
 };
 
 struct ProcFileData {

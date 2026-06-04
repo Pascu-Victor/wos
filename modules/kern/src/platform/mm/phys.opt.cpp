@@ -597,6 +597,42 @@ auto buddy_accounting_size(uint64_t size) -> uint64_t {
     return rounded_pages * paging::PAGE_SIZE;
 }
 
+auto page_alloc_order_for_size(uint64_t size, int& out_order, uint64_t& out_pages) -> bool {
+    if (size == 0) {
+        out_order = 0;
+        out_pages = 0;
+        return true;
+    }
+
+    uint64_t const PAGES = (size / paging::PAGE_SIZE) + ((size % paging::PAGE_SIZE) != 0 ? 1 : 0);
+    uint64_t rounded_pages = 1;
+    int order = 0;
+    while (rounded_pages < PAGES) {
+        if (order >= PageAllocator::MAX_ORDER) {
+            return false;
+        }
+        rounded_pages <<= 1;
+        order++;
+    }
+
+    out_order = order;
+    out_pages = rounded_pages;
+    return true;
+}
+
+auto allocator_has_free_block_for_order(const PageAllocator* allocator, int order) -> bool {
+    if (allocator == nullptr || order < 0 || order > PageAllocator::MAX_ORDER) {
+        return false;
+    }
+
+    for (int idx = order; idx <= PageAllocator::MAX_ORDER; ++idx) {
+        if (allocator->free_list.at(static_cast<size_t>(idx)) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
 auto init_page_zone(uint64_t base, uint64_t len, uint64_t zone_num) -> paging::PageZone* {
     auto* zone = reinterpret_cast<paging::PageZone*>(base);
 
@@ -673,6 +709,39 @@ auto find_free_block_huge(uint64_t size, uint64_t caller = 0) -> void* {
 }
 
 }  // namespace
+
+auto page_alloc_can_satisfy(uint64_t size, uint64_t reserve_bytes) -> bool {
+    int order = 0;
+    uint64_t requested_pages = 0;
+    if (!page_alloc_order_for_size(size, order, requested_pages)) {
+        return false;
+    }
+    if (requested_pages == 0) {
+        return true;
+    }
+
+    uint64_t const RESERVE_PAGES = (reserve_bytes / paging::PAGE_SIZE) + ((reserve_bytes % paging::PAGE_SIZE) != 0 ? 1 : 0);
+
+    uint64_t total_free_pages = 0;
+    bool has_block = false;
+
+    uint64_t const FLAGS = memlock.lock_irq();
+    for (paging::PageZone const* zone = zones; zone != nullptr; zone = zone->next) {
+        if (zone->allocator == nullptr) {
+            continue;
+        }
+        total_free_pages += zone->allocator->get_free_pages();
+        if (allocator_has_free_block_for_order(zone->allocator, order)) {
+            has_block = true;
+        }
+    }
+    memlock.unlock_irq(FLAGS);
+
+    if (!has_block || total_free_pages < requested_pages) {
+        return false;
+    }
+    return total_free_pages - requested_pages >= RESERVE_PAGES;
+}
 
 void init(limine_memmap_response* memmap_response) {
     if (memmap_response == nullptr) {

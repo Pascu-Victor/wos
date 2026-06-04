@@ -511,38 +511,39 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
 
     sched::process_tasks(*gpr_ptr, *frame_ptr);
 
-    sys::signal::check_pending_signals_interrupt(*gpr_ptr, *frame_ptr);
-    validate_kernel_frame(*frame_ptr, sched::get_current_task(), "timer-return");
+    auto* return_task = sched::get_return_task();
+    if (return_task == sched::get_current_task()) {
+        sys::signal::check_pending_signals_interrupt(*gpr_ptr, *frame_ptr);
+    }
+    validate_kernel_frame(*frame_ptr, return_task, "timer-return");
 
-    auto* current_task = sched::get_current_task();
-    if (is_idle_return_frame(*frame_ptr, current_task)) {
+    if (is_idle_return_frame(*frame_ptr, return_task)) {
         sched::arm_idle_timer_for_this_cpu();
-        enter_idle_from_timer(current_task, *frame_ptr);
+        enter_idle_from_timer(return_task, *frame_ptr);
     }
 
     apic::one_shot_timer(timer_quantum);
 
-    if (is_kernel_thread_trampoline_frame(*frame_ptr, *gpr_ptr, current_task)) {
+    if (is_kernel_thread_trampoline_frame(*frame_ptr, *gpr_ptr, return_task)) {
         uint64_t const IRQ_ACCOUNT_FINISHED_US = ker::mod::time::get_us();
         sched::account_irq_time_us(IRQ_ACCOUNT_FINISHED_US >= IRQ_ACCOUNT_STARTED_US ? IRQ_ACCOUNT_FINISHED_US - IRQ_ACCOUNT_STARTED_US
                                                                                      : 0);
         uint64_t stack = frame_ptr->rsp;
-        if (!valid_kernel_stack(stack) && current_task != nullptr && valid_kernel_stack(current_task->context.syscall_kernel_stack)) {
+        if (!valid_kernel_stack(stack) && return_task != nullptr && valid_kernel_stack(return_task->context.syscall_kernel_stack)) {
             dbg::logger<"ctxswitch">::warn("direct daemon start repaired rsp: pid=%lu name=%s frame_rsp=0x%llx stack=0x%llx",
-                                           current_task->pid, current_task->name != nullptr ? current_task->name : "?",
+                                           return_task->pid, return_task->name != nullptr ? return_task->name : "?",
                                            (unsigned long long)frame_ptr->rsp,
-                                           (unsigned long long)current_task->context.syscall_kernel_stack);
-            stack = current_task->context.syscall_kernel_stack;
+                                           (unsigned long long)return_task->context.syscall_kernel_stack);
+            stack = return_task->context.syscall_kernel_stack;
         }
         if (!valid_kernel_stack(stack)) {
             dbg::logger<"ctxswitch">::error(
-                "direct daemon start bad rsp: pid=%lu name=%s frame_rsp=0x%llx stack=0x%llx",
-                current_task != nullptr ? current_task->pid : 0,
-                (current_task != nullptr && current_task->name != nullptr) ? current_task->name : "?", (unsigned long long)frame_ptr->rsp,
-                current_task != nullptr ? (unsigned long long)current_task->context.syscall_kernel_stack : 0ULL);
+                "direct daemon start bad rsp: pid=%lu name=%s frame_rsp=0x%llx stack=0x%llx", return_task != nullptr ? return_task->pid : 0,
+                (return_task != nullptr && return_task->name != nullptr) ? return_task->name : "?", (unsigned long long)frame_ptr->rsp,
+                return_task != nullptr ? (unsigned long long)return_task->context.syscall_kernel_stack : 0ULL);
             hcf();
         }
-        wos_start_kernel_thread(stack, current_task->kthread_entry);
+        wos_start_kernel_thread(stack, return_task->kthread_entry);
         __builtin_unreachable();
     }
 
@@ -551,7 +552,7 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
         if constexpr (K_ENABLE_SCHED_HOT_LOGGING) {
             if (CPU_NO < hot_task_trackers.size()) {
                 auto& tracker = hot_task_tracker_slot(CPU_NO);
-                uint64_t const CURRENT_PID = current_task != nullptr ? current_task->pid : 0;
+                uint64_t const CURRENT_PID = return_task != nullptr ? return_task->pid : 0;
 
                 if (CURRENT_PID != 0 && CURRENT_PID == tracker.last_pid) {
                     tracker.streak++;
@@ -560,14 +561,14 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
                     tracker.streak = CURRENT_PID != 0 ? 1 : 0;
                 }
 
-                if (current_task != nullptr && current_task->type != sched::task::TaskType::IDLE && tracker.streak != 0 &&
+                if (return_task != nullptr && return_task->type != sched::task::TaskType::IDLE && tracker.streak != 0 &&
                     (tracker.streak % HOT_TASK_STREAK_TICKS) == 0) {
                     auto stats = sched::get_run_queue_stats(CPU_NO);
                     dbg::log("schedhot: cpu%lu pid=%lu(%s) streak=%lu type=%u vblk=%u wblk=%u pinned=%u runq=%lu waitq=%lu cs=0x%x",
-                             static_cast<unsigned long>(CPU_NO), static_cast<unsigned long>(current_task->pid),
-                             current_task->name != nullptr ? current_task->name : "?", static_cast<unsigned long>(tracker.streak),
-                             static_cast<unsigned>(current_task->type), current_task->voluntary_block ? 1U : 0U,
-                             current_task->wants_block ? 1U : 0U, current_task->cpu_pinned ? 1U : 0U,
+                             static_cast<unsigned long>(CPU_NO), static_cast<unsigned long>(return_task->pid),
+                             return_task->name != nullptr ? return_task->name : "?", static_cast<unsigned long>(tracker.streak),
+                             static_cast<unsigned>(return_task->type), return_task->voluntary_block ? 1U : 0U,
+                             return_task->wants_block ? 1U : 0U, return_task->cpu_pinned ? 1U : 0U,
                              static_cast<unsigned long>(stats.active_task_count), static_cast<unsigned long>(stats.wait_queue_count),
                              static_cast<unsigned>(frame_ptr->cs));
                 }
@@ -624,8 +625,11 @@ extern "C" void wos_jump_to_next_task_no_save(void* stack_ptr) {
     auto* frame_ptr = reinterpret_cast<gates::InterruptFrame*>(reinterpret_cast<uint8_t*>(stack_ptr) + sizeof(cpu::GPRegs));
 
     sched::jump_to_next_task(*gpr_ptr, *frame_ptr);
-    sys::signal::check_pending_signals_interrupt(*gpr_ptr, *frame_ptr);
-    validate_kernel_frame(*frame_ptr, sched::get_current_task(), "exit-return");
+    auto* return_task = sched::get_return_task();
+    if (return_task == sched::get_current_task()) {
+        sys::signal::check_pending_signals_interrupt(*gpr_ptr, *frame_ptr);
+    }
+    validate_kernel_frame(*frame_ptr, return_task, "exit-return");
 }
 
 void start_sched_timer() {

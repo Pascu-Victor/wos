@@ -8,6 +8,8 @@ bits 64
 %assign IRETQ_KERNEL_FRAME_OFFSET GPREGS_SIZE + INTERRUPT_FRAME_SIZE
 %assign KERNEL_RETURN_BLOCK_SIZE GPREGS_SIZE + INTERRUPT_FRAME_SIZE + IRETQ_KERNEL_FRAME_SIZE
 
+extern wos_commit_handoff_task
+
 ; Same-CPL iretq consumes only RIP/CS/RFLAGS, but the scheduler and panic
 ; diagnostics treat the memory below the saved RSP as GPRegs + InterruptFrame.
 ; Keep that normalized shadow intact, then skip it immediately before iretq.
@@ -37,6 +39,9 @@ bits 64
     mov [r10 + IRETQ_KERNEL_FRAME_OFFSET + 16], r14
 
     mov rsp, r10
+    sub rsp, 8
+    call wos_commit_handoff_task
+    add rsp, 8
     popq
     add rsp, INTERRUPT_FRAME_SIZE
     iretq
@@ -68,6 +73,9 @@ bits 64
     mov [r10 + IRETQ_KERNEL_FRAME_OFFSET + 16], r14
 
     mov rsp, r10
+    sub rsp, 8
+    call wos_commit_handoff_task
+    add rsp, 8
     popq
     add rsp, INTERRUPT_FRAME_SIZE
     iretq
@@ -80,6 +88,15 @@ bits 64
     ; a same-CPL kernel frame that we normalized in isr32. Always build the
     ; outgoing userspace iret frame from the normalized InterruptFrame instead
     ; of depending on which physical stack shape reached task_switch_handler.
+    mov r12, rdi
+    mov r13, rsi
+    mov r14, rsp
+    and rsp, -16
+    call wos_commit_handoff_task
+    mov rsp, r14
+    mov rdi, r12
+    mov rsi, r13
+
     push qword [rsi + 48]    ; SS
     push qword [rsi + 40]    ; RSP
     push qword [rsi + 32]    ; RFLAGS
@@ -88,6 +105,9 @@ bits 64
 
     ; Returning to userspace - set up data segment selectors.  The base values
     ; were installed by switch_to(); preserve them across selector loads.
+    push rax
+    push r8
+    push r9
     mov ax, 0x1b
     mov ds, ax
     mov es, ax
@@ -97,6 +117,9 @@ bits 64
     mov gs, ax
     wrfsbase r8
     wrgsbase r9
+    pop r9
+    pop r8
+    pop rax
 
     ; Swap from kernel GS base to the user's GS base prepared by switch_to().
     swapgs
@@ -159,8 +182,10 @@ wos_start_kernel_thread:
     ; Brand-new kernel threads do not have a previously interrupted kernel
     ; frame to resume. Start them by installing the stack directly, then jump
     ; into the normal trampoline with the entry function in rdi.
+    mov r12, rsi
     mov rsp, rdi
-    mov rdi, rsi
+    call wos_commit_handoff_task
+    mov rdi, r12
     sti
     jmp wos_kernel_thread_trampoline
 
@@ -171,6 +196,7 @@ wos_enterIdleStack:
     ; Idle has no meaningful continuation. Re-entering it directly avoids
     ; constructing a same-CPL iret frame at the very top of the idle stack.
     mov rsp, rdi
+    call wos_commit_handoff_task
     sti
     jmp wos_kernel_idle_loop
 
@@ -290,36 +316,14 @@ jump_to_next_task_no_save:
 
     ; Same-CPL iretq does not restore RSP; kernel targets need a frame on
     ; their own stack.
-    cmp qword [rsp + GPREGS_SIZE + 24], qword 0x23
+    lea rsi, [rsp + GPREGS_SIZE]
+    mov rdi, rsp
+    cmp qword [rsi + 24], qword 0x23
     jne .kernel_return_jump
 
-    popq
-    ; Check if returning to userspace (CS at offset 24 == 0x23)
-    cmp qword [rsp + 24], qword 0x23
-    jne .no_swapgs_exit_jump
+    build_user_return_from_ptrs
 
-    ; Returning to userspace - set up data segment selectors
-    push rax
-    push r8
-    push r9
-    mov ax, 0x1b        ; User data segment selector
-    mov ds, ax
-    mov es, ax
-    rdfsbase r8
-    rdgsbase r9
-    mov fs, ax
-    mov gs, ax
-    wrfsbase r8
-    wrgsbase r9
-    pop r9
-    pop r8
-    pop rax
-
-    swapgs
-    .no_swapgs_exit_jump:
-    add rsp, 16  ; Skip int_num and err_code
-    iretq
-    .kernel_return_jump:
+.kernel_return_jump:
     build_kernel_return_from_stack
 
 ; Return from deferred task switch
@@ -344,71 +348,7 @@ wos_deferred_task_switch_return:
     cmp qword [rsi + 24], qword 0x23
     jne .kernel_return_deferred
 
-    ; First, build the interrupt frame on the stack for iretq
-    ; iretq expects (from bottom to top): ss, rsp, flags, cs, rip
-    ; We push in reverse order
-    push qword [rsi + 48]    ; ss
-    push qword [rsi + 40]    ; rsp
-    push qword [rsi + 32]    ; flags
-    push qword [rsi + 24]    ; cs
-    push qword [rsi + 16]    ; rip
+    build_user_return_from_ptrs
 
-    ; Save cs value for swapgs check later (use stack space)
-    mov rax, [rsi + 24]
-    push rax                 ; save cs for later check
-
-    ; Now restore all GPRegs from memory
-    ; We need to be careful about order - restore rdi last since we need it
-    mov r15, [rdi + 0]
-    mov r14, [rdi + 8]
-    mov r13, [rdi + 16]
-    mov r12, [rdi + 24]
-    mov r11, [rdi + 32]
-    mov r10, [rdi + 40]
-    mov r9,  [rdi + 48]
-    mov r8,  [rdi + 56]
-    mov rbp, [rdi + 64]
-    ; skip rdi (offset 72) for now
-    mov rsi, [rdi + 80]
-    mov rdx, [rdi + 88]
-    mov rcx, [rdi + 96]
-    mov rbx, [rdi + 104]
-    mov rax, [rdi + 112]
-
-    ; Now restore rdi
-    mov rdi, [rdi + 72]
-
-    ; Check if we need swapgs (cs == 0x23 means userspace)
-    cmp qword [rsp], 0x23
-    jne .no_swapgs_deferred
-
-    ; Returning to userspace - set up data segment selectors
-    ; Must do this BEFORE swapgs since we need scratch registers
-    push rax
-    push r8
-    push r9
-    mov ax, 0x1b        ; User data segment selector
-    mov ds, ax
-    mov es, ax
-    ; FS and GS bases are already set via MSRs, but we need the selectors too
-    ; Save FS/GS bases, set selectors, restore bases
-    rdfsbase r8
-    rdgsbase r9
-    mov fs, ax
-    mov gs, ax
-    wrfsbase r8
-    wrgsbase r9
-    pop r9
-    pop r8
-    pop rax
-
-    swapgs
-.no_swapgs_deferred:
-    ; Remove the saved cs from stack
-    add rsp, 8
-
-    ; Return with the interrupt state from the saved frame.  Do not force STI
-    ; here: synthetic kernel frames must preserve their original IF state.
-    iretq
-    .kernel_return_deferred:
+.kernel_return_deferred:
     build_kernel_return_from_ptrs

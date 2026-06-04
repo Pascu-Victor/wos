@@ -31,6 +31,7 @@ constexpr uint64_t KIB_PER_PAGE = PAGE_SIZE / 1024;
 constexpr uint64_t PROC_CLK_TCK = 100;
 constexpr int HEADER_LINES = 7;
 constexpr int USER_WIDTH = 8;
+constexpr int HOST_WIDTH = 12;
 constexpr int COMMAND_WIDTH_FALLBACK = 32;
 
 struct TerminalSize {
@@ -200,6 +201,7 @@ struct ProcRow {
     double mem_pct = 0.0;
     uint64_t total_ticks = 0;
     std::string user;
+    std::string host;
     std::string comm;
     std::string command;
 };
@@ -529,6 +531,20 @@ auto read_cmdline(uint64_t pid, std::string_view fallback) -> std::string {
     return text->empty() ? std::string(fallback) : *text;
 }
 
+auto read_trimmed_proc_file(uint64_t pid, std::string_view name, std::string_view fallback) -> std::string {
+    std::array<char, 96> path{};
+    std::snprintf(path.data(), path.size(), "/proc/%llu/%.*s", static_cast<unsigned long long>(pid), static_cast<int>(name.size()),
+                  name.data());
+    auto text = read_file(path.data(), 256);
+    if (!text.has_value()) {
+        return std::string(fallback);
+    }
+    while (!text->empty() && (text->back() == '\n' || text->back() == '\r' || text->back() == '\0')) {
+        text->pop_back();
+    }
+    return text->empty() ? std::string(fallback) : *text;
+}
+
 auto parse_stat(uint64_t pid, ProcRow& row) -> bool {
     std::array<char, 64> path{};
     std::snprintf(path.data(), path.size(), "/proc/%llu/stat", static_cast<unsigned long long>(pid));
@@ -626,6 +642,7 @@ auto read_processes(const std::unordered_map<uint32_t, std::string>& users, cons
         } else {
             row.user = std::to_string(row.uid);
         }
+        row.host = read_trimmed_proc_file(pid, "wki_runner", "-");
         row.command = read_cmdline(pid, row.comm);
 
         if (previous != nullptr) {
@@ -687,6 +704,15 @@ auto format_user(std::string_view user) -> std::string {
         return std::string(user);
     }
     std::string out(user.substr(0, USER_WIDTH - 1));
+    out.push_back('+');
+    return out;
+}
+
+auto format_host(std::string_view host) -> std::string {
+    if (host.size() <= HOST_WIDTH) {
+        return std::string(host);
+    }
+    std::string out(host.substr(0, HOST_WIDTH - 1));
     out.push_back('+');
     return out;
 }
@@ -831,7 +857,7 @@ auto render(const Snapshot& snap, const Snapshot* previous, int row_offset, int 
                   static_cast<double>(SWAP_USED) / 1024.0, static_cast<double>(snap.mem.available_kib) / 1024.0);
     append_screen_line(line.data());
     append_screen_line("");
-    append_screen_line("    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND");
+    append_screen_line("    PID USER     HOST          PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND");
 
     int const VISIBLE_ROWS = std::max(0, TERM.rows - rendered_lines);
     int const START = std::max(0, row_offset);
@@ -839,13 +865,14 @@ auto render(const Snapshot& snap, const Snapshot* previous, int row_offset, int 
     for (int i = START; i < END; ++i) {
         const auto& row = snap.rows[static_cast<size_t>(i)];
         std::string const USER = format_user(row.user);
+        std::string const HOST = format_host(row.host);
         std::string const VIRT = format_mem(row.virt_kib);
         std::string const RES = format_mem(row.resident_kib);
         std::string const SHR = format_mem(row.shared_kib);
         std::string const TIME = format_time_ticks(row.total_ticks);
-        int const COMMAND_WIDTH = std::max(COMMAND_WIDTH_FALLBACK, TERM.cols - 80);
-        std::snprintf(line.data(), line.size(), "%7llu %-8s %3lld %3lld %7s %6s %6s %c %5.1f %5.1f %9s %-*.*s",
-                      static_cast<unsigned long long>(row.pid), USER.c_str(), static_cast<long long>(row.priority),
+        int const COMMAND_WIDTH = std::max(COMMAND_WIDTH_FALLBACK, TERM.cols - 93);
+        std::snprintf(line.data(), line.size(), "%7llu %-8s %-12s %3lld %3lld %7s %6s %6s %c %5.1f %5.1f %9s %-*.*s",
+                      static_cast<unsigned long long>(row.pid), USER.c_str(), HOST.c_str(), static_cast<long long>(row.priority),
                       static_cast<long long>(row.nice), VIRT.c_str(), RES.c_str(), SHR.c_str(), row.state, row.cpu_pct, row.mem_pct,
                       TIME.c_str(), COMMAND_WIDTH, COMMAND_WIDTH, row.command.c_str());
         if (!append_screen_line(line.data())) {

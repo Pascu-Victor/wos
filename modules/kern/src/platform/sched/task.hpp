@@ -335,6 +335,11 @@ struct Task {
     // The legacy scheduler hook must skip those tasks to avoid losing exec context.
     bool wki_skip_legacy_placement = false;
 
+    // WKI: this task is a local wait/forwarding proxy for a remotely executed task.
+    // It keeps its task PID for waitpid, signals, ptrace, and WKI routing, but is
+    // not a user-visible process row in /proc root.
+    bool wki_proxy_task = false;
+
     bool has_exited{};
     // Set after exit cleanup finishes; waitpid may reap only after this.
     std::atomic<bool> exit_notify_ready{false};
@@ -442,6 +447,16 @@ struct Task {
         return state.compare_exchange_strong(from, to, std::memory_order_acq_rel, std::memory_order_acquire);
     }
 };
+
+[[nodiscard]] inline auto process_pid(const Task& task) -> uint64_t { return task.owner_pid != 0 ? task.owner_pid : task.pid; }
+
+[[nodiscard]] inline auto same_thread_group(const Task& lhs, const Task& rhs) -> bool { return process_pid(lhs) == process_pid(rhs); }
+
+[[nodiscard]] inline auto same_thread_group(const Task& task, uint64_t process_pid_value) -> bool {
+    return process_pid(task) == process_pid_value;
+}
+
+[[nodiscard]] inline auto process_visible(const Task& task) -> bool { return !task.is_thread && !task.wki_proxy_task; }
 
 auto get_next_pid() -> uint64_t;
 }  // namespace ker::mod::sched::task

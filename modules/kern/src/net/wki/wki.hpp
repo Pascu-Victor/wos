@@ -266,10 +266,11 @@ struct WkiChannel {
     bool active = false;
 
     // Reliability (seq/ack)
-    uint32_t tx_seq = 0;          // next seq to send
-    uint32_t tx_ack = 0;          // last ACK received from peer
-    uint32_t rx_seq = 0;          // next expected seq from peer
-    uint32_t rx_ack_pending = 0;  // highest seq received, not yet ACKed
+    uint32_t tx_seq = 0;           // next seq to send
+    uint32_t tx_ack = 0;           // last ACK received from peer
+    uint32_t rx_seq = 0;           // next expected seq from peer
+    uint32_t rx_dispatch_seq = 0;  // next received seq allowed to enter handlers
+    uint32_t rx_ack_pending = 0;   // highest seq received, not yet ACKed
     bool ack_pending = false;
     uint64_t ack_pending_since_us = 0;  // time when ack_pending was last set (for delay enforcement)
 
@@ -521,8 +522,14 @@ auto wki_peer_get_hostname(uint16_t node_id) -> const char*;
 
 // Forward declaration for Task -  avoiding circular header inclusion
 struct WkiWaitEntry {
+    enum State : uint8_t {
+        PENDING = 0,
+        CLAIMED = 1,
+        DONE = 2,
+    };
+
     ker::mod::sched::task::Task* task = nullptr;  // The task that is waiting
-    std::atomic<bool> completed{false};           // Set to true by wki_wake_op()
+    std::atomic<uint8_t> state{PENDING};          // Result writer ownership/state
     int result = 0;                               // Operation result code
     uint64_t deadline_us = 0;                     // Timeout deadline (0 = no timeout)
     WkiWaitEntry* next = nullptr;                 // Intrusive linked list
@@ -539,6 +546,11 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int;
 
 // Wake a waiting task. Called from RX handler context.
 void wki_wake_op(WkiWaitEntry* entry, int result);
+
+// Split wake for code that must claim a stack wait entry while holding an
+// owning object lock, publish side-band response data, then wake outside.
+auto wki_claim_op(WkiWaitEntry* entry) -> bool;
+void wki_finish_claimed_op(WkiWaitEntry* entry, int result);
 
 // Scan pending waits for timeouts. Called from timer thread.
 void wki_wait_timeout_scan(uint64_t now_us);

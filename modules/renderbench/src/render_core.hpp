@@ -38,6 +38,9 @@ struct Options {
     std::string run_id;
     bool debug_edge_colors = false;
     int debug_constant_tile_us = 0;
+    int debug_node_thread_batch_size = 0;
+    int coordinator_reserve_cpus = -1;
+    bool coordinator_skip_local_worker = false;
 };
 
 struct Tile {

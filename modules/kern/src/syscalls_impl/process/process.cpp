@@ -68,6 +68,43 @@ inline auto is_live_signal_target(const ker::mod::sched::task::Task& task) -> bo
     return task.state.load(std::memory_order_acquire) == ker::mod::sched::task::TaskState::ACTIVE && !task.has_exited;
 }
 
+auto process_pid_for_task(const ker::mod::sched::task::Task& task) -> uint64_t { return ker::mod::sched::task::process_pid(task); }
+
+auto find_process_leader_safe(uint64_t pid) -> ker::mod::sched::task::Task* {
+    auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
+    if (task == nullptr) {
+        return nullptr;
+    }
+
+    uint64_t const PROCESS_PID = process_pid_for_task(*task);
+    if (PROCESS_PID == task->pid) {
+        return task;
+    }
+
+    task->release();
+    return ker::mod::sched::find_task_by_pid_safe(PROCESS_PID);
+}
+
+void update_thread_group_job_control(uint64_t process_pid, uint64_t session_id, uint64_t pgid, bool detach_tty) {
+    uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < TASK_COUNT; ++i) {
+        auto* task = ker::mod::sched::get_active_task_at_safe(i);
+        if (task == nullptr) {
+            continue;
+        }
+        if (!ker::mod::sched::task::same_thread_group(*task, process_pid)) {
+            task->release();
+            continue;
+        }
+        task->session_id = session_id;
+        task->pgid = pgid;
+        if (detach_tty) {
+            task->controlling_tty = -1;
+        }
+        task->release();
+    }
+}
+
 auto wos_proc_getgroups(size_t size, uint32_t* list) -> uint64_t {
     constexpr size_t GETGROUPS_SIZE_MAX = 0x7FFFFFFFU;
 
@@ -894,14 +931,13 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
+            uint64_t const PROCESS_PID = process_pid_for_task(*task);
             // POSIX: setsid fails if the caller is already a process group leader
-            if (task->pgid == task->pid && task->session_id != 0) {
+            if (task->pgid == PROCESS_PID && task->session_id != 0) {
                 return static_cast<uint64_t>(-EPERM);
             }
-            task->session_id = task->pid;
-            task->pgid = task->pid;
-            task->controlling_tty = -1;  // POSIX: setsid detaches from controlling terminal
-            return task->pid;
+            update_thread_group_job_control(PROCESS_PID, PROCESS_PID, PROCESS_PID, true);
+            return PROCESS_PID;
         }
         case abi::process::procmgmt_ops::GETSID: {
             auto pid = static_cast<int64_t>(a2);
@@ -910,14 +946,14 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
                 if (task == nullptr) {
                     return static_cast<uint64_t>(-ESRCH);
                 }
-                return task->session_id;
+                uint64_t const PROCESS_PID = process_pid_for_task(*task);
+                return task->session_id != 0 ? task->session_id : PROCESS_PID;
             }
-            // Look up another task by pid
-            auto* target = ker::mod::sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));
+            auto* target = find_process_leader_safe(static_cast<uint64_t>(pid));
             if (target == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
-            auto sid = target->session_id;
+            auto sid = target->session_id != 0 ? target->session_id : process_pid_for_task(*target);
             target->release();
             return sid;
         }
@@ -926,30 +962,33 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
+            uint64_t const CALLER_PID = process_pid_for_task(*task);
             auto pid = a2;
             auto new_pgid = a3;
             // pid==0 means current process
             if (pid == 0) {
-                pid = task->pid;
+                pid = CALLER_PID;
             }
             // pgid==0 means use pid as pgid
             if (new_pgid == 0) {
                 new_pgid = pid;
             }
-            if (pid == task->pid) {
-                task->pgid = new_pgid;
-                return 0;
-            }
-            // Setting pgid for another process (must be a child, same session)
-            auto* target = ker::mod::sched::find_task_by_pid_safe(pid);
+            auto* target = find_process_leader_safe(pid);
             if (target == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
-            if (target->parent_pid != task->pid || target->session_id != task->session_id) {
+            uint64_t const TARGET_PID = process_pid_for_task(*target);
+            if (TARGET_PID == CALLER_PID) {
+                update_thread_group_job_control(TARGET_PID, target->session_id, new_pgid, false);
+                target->release();
+                return 0;
+            }
+            // Setting pgid for another process (must be a child, same session)
+            if (target->parent_pid != CALLER_PID || target->session_id != task->session_id) {
                 target->release();
                 return static_cast<uint64_t>(-EPERM);
             }
-            target->pgid = new_pgid;
+            update_thread_group_job_control(TARGET_PID, target->session_id, new_pgid, false);
             target->release();
             return 0;
         }
@@ -960,13 +999,15 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
                 if (task == nullptr) {
                     return static_cast<uint64_t>(-ESRCH);
                 }
-                return task->pgid;
+                uint64_t const PROCESS_PID = process_pid_for_task(*task);
+                return task->pgid != 0 ? task->pgid : PROCESS_PID;
             }
-            auto* target = ker::mod::sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));
+            auto* target = find_process_leader_safe(static_cast<uint64_t>(pid));
             if (target == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
-            auto pgid = target->pgid;
+            uint64_t const PROCESS_PID = process_pid_for_task(*target);
+            auto pgid = target->pgid != 0 ? target->pgid : PROCESS_PID;
             target->release();
             return pgid;
         }

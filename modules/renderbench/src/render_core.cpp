@@ -2142,7 +2142,8 @@ void print_usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --scene scene.glb --backend ipc|mpi --placement node-threads|process-per-core "
                  "--width N --height N --spp N --max-depth N --tile-size N --output-root PATH [--threads N] "
-                 "[--debug-edge-colors] [--debug-constant-tile-us N]\n",
+                 "[--debug-edge-colors] [--debug-constant-tile-us N] [--debug-node-thread-batch-size N] "
+                 "[--coordinator-reserve-cpus N] [--coordinator-skip-local-worker]\n",
                  argv0 != nullptr ? argv0 : "renderbench");
 }
 
@@ -2231,6 +2232,16 @@ auto parse_options(int argc, char* const* argv, Backend default_backend, Options
             if (!parse_required_int(0, options.debug_constant_tile_us)) {
                 return ParseStatus::Error;
             }
+        } else if (ARG == "--debug-node-thread-batch-size") {
+            if (!parse_required_int(0, options.debug_node_thread_batch_size)) {
+                return ParseStatus::Error;
+            }
+        } else if (ARG == "--coordinator-reserve-cpus") {
+            if (!parse_required_int(0, options.coordinator_reserve_cpus)) {
+                return ParseStatus::Error;
+            }
+        } else if (ARG == "--coordinator-skip-local-worker") {
+            options.coordinator_skip_local_worker = true;
         } else if (ARG == "--tracebench-worker" || ARG == "--worker-command-stream") {
             continue;
         } else if (ARG == "--worker-id") {
@@ -2492,6 +2503,9 @@ auto write_status(const Options& options, const Progress& progress) -> bool {
         << "  \"debug_edge_colors\": " << (options.debug_edge_colors ? "true" : "false") << ",\n"
         << R"(  "debug_render_mode": ")" << debug_render_mode_name(options) << "\",\n"
         << "  \"debug_constant_tile_us\": " << options.debug_constant_tile_us << ",\n"
+        << "  \"debug_node_thread_batch_size\": " << options.debug_node_thread_batch_size << ",\n"
+        << "  \"coordinator_reserve_cpus\": " << options.coordinator_reserve_cpus << ",\n"
+        << "  \"coordinator_skip_local_worker\": " << (options.coordinator_skip_local_worker ? "true" : "false") << ",\n"
         << "  \"tiles_done\": " << progress.tiles_done << ",\n"
         << "  \"total_tiles\": " << progress.total_tiles << ",\n"
         << "  \"samples_done\": " << progress.samples_done << ",\n"
@@ -2515,6 +2529,9 @@ auto write_metrics(const Options& options, const Progress& progress, double rays
         << "  \"debug_edge_colors\": " << (options.debug_edge_colors ? "true" : "false") << ",\n"
         << "  \"debug_render_mode\": \"" << debug_render_mode_name(options) << "\",\n"
         << "  \"debug_constant_tile_us\": " << options.debug_constant_tile_us << ",\n"
+        << "  \"debug_node_thread_batch_size\": " << options.debug_node_thread_batch_size << ",\n"
+        << "  \"coordinator_reserve_cpus\": " << options.coordinator_reserve_cpus << ",\n"
+        << "  \"coordinator_skip_local_worker\": " << (options.coordinator_skip_local_worker ? "true" : "false") << ",\n"
         << "  \"elapsed_seconds\": " << progress.elapsed_seconds << ",\n"
         << "  \"primary_samples\": " << progress.total_samples << ",\n"
         << "  \"rays_per_second_estimate\": " << rays_per_second << "\n"

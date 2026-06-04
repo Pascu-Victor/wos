@@ -215,9 +215,11 @@ void napi_enable(NapiStruct* napi, uint64_t cpu_affinity) {
 
     promote_latency_sensitive_daemon(napi->worker);
 
-    // Schedule the worker thread - place on the preferred CPU
+    // Schedule the worker thread on the same CPU as its IRQ vector.  Keeping
+    // this pinned preserves NAPI/IRQ locality; otherwise event wakes can drift
+    // the worker away from the CPU programmed into MSI-X.
     if (cpu_affinity != UINT64_MAX) {
-        ker::mod::sched::post_task_for_cpu(cpu_affinity, napi->worker);
+        ker::mod::sched::post_task_pinned_cpu(cpu_affinity, napi->worker);
     } else {
         ker::mod::sched::post_task_balanced(napi->worker);
     }

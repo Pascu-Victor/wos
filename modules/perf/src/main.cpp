@@ -94,6 +94,7 @@ constexpr std::string_view PERF_DATA_FILE = "perf.data";
 constexpr std::string_view PROC_ROOT = "/proc/";
 constexpr std::string_view PROC_STAT_SUFFIX = "/stat";
 constexpr std::string_view PROC_CMDLINE_SUFFIX = "/cmdline";
+constexpr std::string_view PROC_TASK_SUFFIX = "/task";
 constexpr std::string_view KPERF_PATH = "/proc/kperf";
 constexpr std::string_view KPERFCTL_PATH = "/proc/kperfctl";
 constexpr std::string_view KWKISTAT_PATH = "/proc/kwkistat";
@@ -622,6 +623,16 @@ auto build_proc_path(std::string_view pid, std::string_view suffix) -> std::stri
 
 auto build_proc_path(uint64_t pid, std::string_view suffix) -> std::string { return build_proc_path(std::to_string(pid), suffix); }
 
+auto build_proc_task_path(std::string_view pid, std::string_view tid, std::string_view suffix) -> std::string {
+    std::string path(PROC_ROOT);
+    path += pid;
+    path += PROC_TASK_SUFFIX;
+    path += '/';
+    path += tid;
+    path += suffix;
+    return path;
+}
+
 auto build_dev_nodes_path(std::string_view hostname, std::string_view suffix = {}) -> std::string {
     std::string path(DEV_NODES_ROOT);
     if (!hostname.empty()) {
@@ -786,6 +797,22 @@ auto parse_stat(std::string_view buf, StatInfo& out) -> bool {
 }
 
 template <typename Func>
+auto emit_proc_stat(Func& func, std::string_view name, std::string_view path) -> bool {
+    auto stat_text = read_file(path, PROC_READ_CAPACITY);
+    if (!stat_text.has_value()) {
+        return false;
+    }
+
+    StatInfo info{};
+    if (!parse_stat(*stat_text, info)) {
+        return false;
+    }
+
+    func(info, name);
+    return true;
+}
+
+template <typename Func>
 void for_each_process_stat(Func func) {
     ScopedDir const DIR(opendir("/proc"));
     if (!DIR.valid()) {
@@ -799,17 +826,23 @@ void for_each_process_stat(Func func) {
             continue;
         }
 
-        auto stat_text = read_file(build_proc_path(NAME, PROC_STAT_SUFFIX), PROC_READ_CAPACITY);
-        if (!stat_text.has_value()) {
-            continue;
+        bool emitted_task = false;
+        ScopedDir const TASK_DIR(opendir(build_proc_path(NAME, PROC_TASK_SUFFIX).c_str()));
+        if (TASK_DIR.valid()) {
+            dirent const* task_entry = nullptr;
+            while ((task_entry = readdir(TASK_DIR.get())) != nullptr) {
+                std::string_view const TID{&task_entry->d_name[0]};
+                if (!is_all_digits(TID)) {
+                    continue;
+                }
+                emitted_task = emit_proc_stat(func, TID, build_proc_task_path(NAME, TID, PROC_STAT_SUFFIX)) || emitted_task;
+            }
         }
 
-        StatInfo info{};
-        if (!parse_stat(*stat_text, info)) {
+        if (emitted_task) {
             continue;
         }
-
-        func(info, NAME);
+        (void)emit_proc_stat(func, NAME, build_proc_path(NAME, PROC_STAT_SUFFIX));
     }
 }
 

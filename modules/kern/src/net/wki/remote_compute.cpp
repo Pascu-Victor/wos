@@ -1461,6 +1461,7 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     task->elf_buffer = nullptr;
     task->elf_buffer_size = 0;
     task->wki_proxy_task_id = tid;
+    task->wki_proxy_task = true;
 
     bool proxy_ready = false;
     if (task->sched_queue == ker::mod::sched::task::Task::sched_queue::NONE && task != ker::mod::sched::get_current_task()) {
@@ -2008,14 +2009,16 @@ void wki_task_cancel(uint32_t task_id, int signum) {
 //  Signal Forwarding for Proxy Tasks
 // ===============================================================================
 
-static auto task_process_owner_pid(const ker::mod::sched::task::Task* task) -> uint64_t {
+namespace {
+
+auto task_process_owner_pid(const ker::mod::sched::task::Task* task) -> uint64_t {
     if (task == nullptr) {
         return 0;
     }
-    return task->is_thread && task->owner_pid != 0 ? task->owner_pid : task->pid;
+    return ker::mod::sched::task::process_pid(*task);
 }
 
-static auto queue_signal_for_process_tasks(uint64_t owner_pid, int signum) -> size_t {
+auto queue_signal_for_process_tasks(uint64_t owner_pid, int signum) -> size_t {
     if (owner_pid == 0 || signum <= 0 || std::cmp_greater(signum, ker::mod::sched::task::Task::MAX_SIGNALS)) {
         return 0;
     }
@@ -2037,6 +2040,8 @@ static auto queue_signal_for_process_tasks(uint64_t owner_pid, int signum) -> si
     }
     return signaled;
 }
+
+}  // namespace
 
 auto wki_proxy_task_forward_signal(ker::mod::sched::task::Task* task, int signum) -> bool {
     if (task == nullptr || task->wki_proxy_task_id == 0) {

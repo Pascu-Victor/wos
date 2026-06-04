@@ -403,6 +403,9 @@ void print_mpi_metrics_json(const tracebench::Options& options, const tracebench
     std::printf("\"debug_edge_colors\":%s,", options.debug_edge_colors ? "true" : "false");
     std::printf("\"debug_render_mode\":\"%s\",", tracebench::debug_render_mode_name(options));
     std::printf("\"debug_constant_tile_us\":%d,", options.debug_constant_tile_us);
+    std::printf("\"debug_node_thread_batch_size\":%d,", options.debug_node_thread_batch_size);
+    std::printf("\"coordinator_reserve_cpus\":%d,", options.coordinator_reserve_cpus);
+    std::printf("\"coordinator_skip_local_worker\":%s,", options.coordinator_skip_local_worker ? "true" : "false");
     std::printf("\"world_size\":%d,", world_size);
     std::printf("\"threads_per_rank\":%d,", threads_per_rank);
     std::printf("\"width\":%d,", options.width);
@@ -1472,6 +1475,10 @@ auto dynamic_batch_size(const tracebench::Options& options, size_t total_tiles, 
         return static_cast<int>(std::max<size_t>(1, target));
     }
 
+    if (options.debug_node_thread_batch_size > 0) {
+        return options.debug_node_thread_batch_size;
+    }
+
     size_t const MIN_BATCH = THREADS * 16U;
     size_t const TARGET_WAVES = total_tiles >= WORKERS * MIN_BATCH * 4U ? 64U : 8U;
     size_t target = (total_tiles + ((WORKERS * TARGET_WAVES) - 1U)) / (WORKERS * TARGET_WAVES);
@@ -1481,6 +1488,16 @@ auto dynamic_batch_size(const tracebench::Options& options, size_t total_tiles, 
     }
     target = std::min(target, MAX_BATCH);
     return static_cast<int>(std::max<size_t>(1, target));
+}
+
+auto local_coordinator_reserve_cpus(const tracebench::Options& options, size_t peer_count) -> int {
+    if (peer_count <= 1U) {
+        return 0;
+    }
+    if (options.coordinator_reserve_cpus >= 0) {
+        return options.coordinator_reserve_cpus;
+    }
+    return options.threads <= 0 ? 1 : 0;
 }
 
 auto assign_worker_batch(ChildWorker& worker, std::span<const tracebench::Tile> tiles, std::vector<int>& tile_owner,
@@ -1712,11 +1729,18 @@ auto make_node_thread_specs(const tracebench::Options& options, const std::vecto
     std::vector<PendingSpec> pending;
     pending.reserve(peers.size());
     int total_slots = 0;
-    bool const RESERVE_LOCAL_COORDINATOR = options.threads <= 0 && peers.size() > 1U;
+    int const LOCAL_COORDINATOR_RESERVE_CPUS = local_coordinator_reserve_cpus(options, peers.size());
+    bool const SKIP_LOCAL_WORKER = options.coordinator_skip_local_worker && peers.size() > 1U;
     for (const auto& peer : peers) {
+        if (SKIP_LOCAL_WORKER && peer.local) {
+            continue;
+        }
         int worker_threads = std::max(1, options.threads > 0 ? options.threads : peer.cpus);
-        if (RESERVE_LOCAL_COORDINATOR && peer.local && worker_threads > 1) {
-            --worker_threads;
+        if (peer.local && LOCAL_COORDINATOR_RESERVE_CPUS > 0) {
+            worker_threads = std::max(0, worker_threads - LOCAL_COORDINATOR_RESERVE_CPUS);
+        }
+        if (worker_threads <= 0) {
+            continue;
         }
         int const SLOT_COUNT = worker_threads;
         pending.push_back({
@@ -2183,6 +2207,14 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
     std::string const PROGRAM_PATH = renderbench_program_path(argv0);
     int const PERSISTENT_BATCH_SIZE =
         USE_PERSISTENT_PROCESS_BATCHES ? dynamic_batch_size(options, tiles.size(), specs.size(), specs.front().worker_threads, false) : 0;
+    if (USE_PERSISTENT_PROCESS_BATCHES) {
+        int const EFFECTIVE_LOCAL_RESERVE_CPUS = local_coordinator_reserve_cpus(options, peers.size());
+        std::println(stderr,
+                     "renderbench: node-thread ipc config workers={} batch_size={} coordinator_reserve_cpus={} effective_reserve_cpus={} "
+                     "coordinator_skip_local_worker={}",
+                     specs.size(), PERSISTENT_BATCH_SIZE, options.coordinator_reserve_cpus, EFFECTIVE_LOCAL_RESERVE_CPUS,
+                     options.coordinator_skip_local_worker ? 1 : 0);
+    }
 
     double const STARTED = tracebench::monotonic_seconds();
     double next_update = STARTED;

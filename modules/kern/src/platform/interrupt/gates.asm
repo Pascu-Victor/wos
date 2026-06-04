@@ -8,8 +8,8 @@ extern iterrupt_handler
 %assign INTERRUPT_FRAME_SIZE 56
 
 %macro isr_swapgs 1
-    cmp [rsp + 24], dword 8 ; Check if we're in userspace
-    je .%1
+    test qword [rsp + 24], 0x3 ; swap only when the interrupted frame came from user CPL
+    jz .%1
     swapgs
     .%1:
 %endmacro
@@ -21,8 +21,8 @@ __idt_isr_handler:
     ; Same-CPL kernel interrupts/exceptions only provide RIP, CS, and RFLAGS
     ; after our int/error-code shim. Build a by-value copy with synthetic
     ; RSP/SS for C++ handlers, then return through the original hardware frame.
-    cmp qword [rsp + 24], qword 0x08
-    jne .outer_entry
+    test qword [rsp + 24], 0x3
+    jnz .outer_entry
 
     pushq
     mov r10, rsp
@@ -147,8 +147,8 @@ isr32:
     ; consumes a uniform InterruptFrame with RSP and SS as well, so build that
     ; full frame explicitly below the hardware frame instead of letting C++
     ; write synthetic RSP/SS into stack slots that do not exist.
-    cmp qword [rsp + 8], qword 0x08
-    jne .user_or_outer
+    test qword [rsp + 8], 0x3
+    jnz .user_or_outer
 
     sub rsp, GPREGS_SIZE + INTERRUPT_FRAME_SIZE
 

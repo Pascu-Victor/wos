@@ -19,6 +19,7 @@
 namespace ker::syscall::multiproc {
 namespace {
 constexpr uint32_t SOFT_EXCLUSIVE_DAEMON_PENALTY = 7;
+std::atomic<uint64_t> next_thread_cpu{0};
 
 auto online_cpu_mask() -> uint64_t {
     uint64_t const CPU_COUNT = mod::smt::get_core_count();
@@ -105,17 +106,15 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
                 return static_cast<uint64_t>(-ENOMEM);
             }
 
-            bool posted = false;
             uint64_t const CPU_COUNT = mod::smt::get_core_count();
-            if (CPU_COUNT > 0) {
-                static std::atomic<uint64_t> next_thread_cpu{0};
-                uint64_t const TARGET_CPU = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % CPU_COUNT;
-                posted = mod::sched::post_task_for_cpu(TARGET_CPU, t);
+            if (CPU_COUNT == 0) {
+                return static_cast<uint64_t>(-ENOMEM);
             }
-            if (!posted) {
-                posted = mod::sched::post_task_balanced(t);
-            }
-            if (!posted) {
+            uint64_t const TARGET_CPU = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % CPU_COUNT;
+            t->cpu = TARGET_CPU;
+
+            bool const POSTED = mod::sched::post_task_for_cpu(TARGET_CPU, t);
+            if (!POSTED) {
                 return static_cast<uint64_t>(-ENOMEM);
             }
 

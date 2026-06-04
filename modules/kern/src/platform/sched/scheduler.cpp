@@ -44,10 +44,11 @@
 extern "C" const uint64_t WOS_DEFERRED_TASK_SWITCH_OFFSET = offsetof(ker::mod::sched::task::Task, deferred_task_switch);
 
 // Kernel idle loop - defined in context_switch.asm
-extern "C" void wos_kernel_idle_loop();          // NOLINT(readability-identifier-naming)
-extern "C" void wos_kernel_thread_trampoline();  // NOLINT(readability-identifier-naming)
-extern "C" char __kernel_text_start[];           // NOLINT(readability-identifier-naming)
-extern "C" char __kernel_text_end[];             // NOLINT(readability-identifier-naming)
+extern "C" void wos_kernel_idle_loop();                               // NOLINT(readability-identifier-naming)
+extern "C" void wos_kernel_thread_trampoline();                       // NOLINT(readability-identifier-naming)
+extern "C" [[noreturn]] void wos_enterIdleStack(uint64_t stack_top);  // NOLINT(readability-identifier-naming)
+extern "C" char __kernel_text_start[];                                // NOLINT(readability-identifier-naming)
+extern "C" char __kernel_text_end[];                                  // NOLINT(readability-identifier-naming)
 
 extern "C" [[noreturn]] void wos_kernel_thread_returned() {  // NOLINT(readability-identifier-naming)
     auto* task = ker::mod::sched::get_current_task();
@@ -696,6 +697,92 @@ inline void repair_stale_wait_membership_locked(RunQueue* rq, task::Task* t) {
     finish_wait_metadata_for_runqueue(t);
 }
 
+inline auto runqueue_task_is_reserved_locked(RunQueue* rq, task::Task const* task) -> bool {
+    return rq != nullptr && task != nullptr && (rq->current_task == task || rq->handoff_task == task);
+}
+
+inline void reserve_handoff_task_locked(RunQueue* rq, task::Task* task, uint64_t start_us) {
+    task->cpu = cpu::current_cpu();
+    rq->handoff_task = task;
+    rq->current_task_start_us = start_us;
+}
+
+inline auto compute_wakeup_floor_vruntime(RunQueue* rq, task::Task* t, uint64_t now_us, const char* wait_channel) -> int64_t;
+
+void requeue_woken_outgoing_task_locked(RunQueue* rq, task::Task* outgoing, uint64_t now_us) {
+    if (rq == nullptr || outgoing == nullptr || outgoing->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
+        return;
+    }
+    if (!outgoing->wakeup_pending.exchange(false, std::memory_order_acquire)) {
+        return;
+    }
+    if (outgoing->sched_queue != task::Task::sched_queue::WAITING) {
+        return;
+    }
+
+    char const* const WAIT_CHANNEL = outgoing->wait_channel;
+    while (rq->wait_list.remove(outgoing)) {
+    }
+    outgoing->wants_block = false;
+    outgoing->wake_at_us = 0;
+    finish_wait_metadata_for_runqueue(outgoing);
+    outgoing->sched_queue = task::Task::sched_queue::RUNNABLE;
+    outgoing->just_woke = !is_low_latency_handoff_wait_channel(WAIT_CHANNEL);
+
+    if (rq->runnable_heap.contains(outgoing)) {
+        repair_stale_wait_membership_locked(rq, outgoing);
+        return;
+    }
+
+    outgoing->vruntime = std::max(outgoing->vruntime, compute_wakeup_floor_vruntime(rq, outgoing, now_us, WAIT_CHANNEL));
+    outgoing->vdeadline =
+        outgoing->vruntime + ((static_cast<int64_t>(outgoing->slice_ns) * 1024) / static_cast<int64_t>(outgoing->sched_weight));
+    outgoing->slice_used_ns = 0;
+    if (rq->runnable_heap.insert(outgoing)) {
+        add_to_sums(rq, outgoing);
+    }
+}
+
+void commit_handoff_task_at_return_boundary() {
+    if (run_queues == nullptr) {
+        return;
+    }
+
+    task::Task* outgoing = nullptr;
+    task::Task* task = nullptr;
+    uint64_t const NOW_US = time::get_us();
+    run_queues->this_cpu_locked_void([&](RunQueue* rq) {
+        task = rq->handoff_task;
+        if (task == nullptr) {
+            return;
+        }
+
+        outgoing = rq->current_task;
+        task->cpu = cpu::current_cpu();
+        rq->current_task = task;
+        debug_task_slot(cpu::current_cpu()) = task;
+        rq->handoff_task = nullptr;
+        requeue_woken_outgoing_task_locked(rq, outgoing, NOW_US);
+    });
+
+    if (task == nullptr) {
+        return;
+    }
+
+    if (outgoing != nullptr && outgoing != task && outgoing->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE &&
+        !outgoing->gc_queued.load(std::memory_order_acquire)) {
+        insert_into_dead_list(outgoing);
+    }
+}
+
+void clear_handoff_task(task::Task* task) {
+    run_queues->this_cpu_locked_void([task](RunQueue* rq) {
+        if (rq->handoff_task == task) {
+            rq->handoff_task = nullptr;
+        }
+    });
+}
+
 void set_task_nice_impl(task::Task* task, int nice) {
     if (task == nullptr || run_queues == nullptr) {
         return;
@@ -711,7 +798,8 @@ void set_task_nice_impl(task::Task* task, int nice) {
 
     bool updated = false;
     run_queues->with_lock_void(cpu_no, [task, CLAMPED_NICE, NEW_WEIGHT, &updated](RunQueue* rq) {
-        if (rq->current_task != task && !rq->runnable_heap.contains(task) && task->sched_queue != task::Task::sched_queue::WAITING) {
+        if (!runqueue_task_is_reserved_locked(rq, task) && !rq->runnable_heap.contains(task) &&
+            task->sched_queue != task::Task::sched_queue::WAITING) {
             return;
         }
 
@@ -854,6 +942,7 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
 
             // Never steal the task currently executing on the victim CPU.
             task::Task const* victim_current = victim_rq->current_task;
+            task::Task const* victim_handoff = victim_rq->handoff_task;
 
             // Scan for highest-vdeadline stealable task (least urgent)
             task::Task* best = nullptr;
@@ -865,8 +954,8 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
                 if (t == nullptr) {
                     continue;
                 }
-                if (t == victim_current) {
-                    continue;  // Never steal currently-executing task
+                if (t == victim_current || t == victim_handoff) {
+                    continue;  // Never steal currently-executing or reserved-for-handoff task
                 }
                 if (t->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
                     continue;
@@ -1125,14 +1214,7 @@ void arm_idle_timer_locked(RunQueue* rq) {
 
     restore_kernel_gs_for_idle();
 
-    asm volatile(
-        "mov %0, %%rsp\n"
-        "sti\n"
-        "jmp wos_kernel_idle_loop"
-        :
-        : "r"(IDLE_STACK)
-        : "memory");
-    __builtin_unreachable();
+    wos_enterIdleStack(IDLE_STACK);
 }
 
 // IPI handler for scheduler wake-up.
@@ -1393,7 +1475,7 @@ auto post_task_waiting(task::Task* task) -> bool {
         // but has not actually run its deferred wait path yet. Parking that
         // task here avoids waiting for it to get a full timeslice just to
         // enter wki_execve_proxy.
-        if (!rq->runnable_heap.contains(task) || rq->current_task == task) {
+        if (!rq->runnable_heap.contains(task) || runqueue_task_is_reserved_locked(rq, task)) {
             return;
         }
 
@@ -1432,6 +1514,11 @@ auto post_task_balanced(task::Task* task) -> bool {
 
 auto get_current_task() -> task::Task* { return run_queues->this_cpu()->current_task; }
 
+auto get_return_task() -> task::Task* {
+    auto* rq = run_queues->this_cpu();
+    return rq->handoff_task != nullptr ? rq->handoff_task : rq->current_task;
+}
+
 auto current_cpu_for_task(task::Task* task) -> uint64_t {
     if (task == nullptr || run_queues == nullptr) {
         return UINT64_MAX;
@@ -1441,7 +1528,7 @@ auto current_cpu_for_task(task::Task* task) -> uint64_t {
     for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
         bool found = false;
         run_queues->with_lock_void(cpu_no, [task, cpu_no, &found](RunQueue* rq) {
-            if (rq->current_task == task) {
+            if (runqueue_task_is_reserved_locked(rq, task)) {
                 task->cpu = cpu_no;
                 found = true;
             }
@@ -1462,7 +1549,7 @@ auto owner_cpu_for_task(task::Task* task) -> uint64_t {
     for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
         bool found = false;
         run_queues->with_lock_void(cpu_no, [task, cpu_no, &found](RunQueue* rq) {
-            if (rq->current_task == task || rq->runnable_heap.contains(task)) {
+            if (runqueue_task_is_reserved_locked(rq, task) || rq->runnable_heap.contains(task)) {
                 task->cpu = cpu_no;
                 found = true;
                 return;
@@ -1624,11 +1711,9 @@ void remove_current_task() {
             rq->runnable_heap.remove(task);
         }
 
-        // Route all dead-task insertion through insert_into_dead_list() so the
-        // task is detached from any stale dead-list membership before relinking
-        // schedNext into the canonical GC list.
+        // Keep current_task pointing at the live stack owner until the final
+        // return boundary moves the CPU away from this task's stack.
         task->sched_queue = task::Task::sched_queue::NONE;
-        rq->current_task = nullptr;
         return task;
     });
 
@@ -1736,7 +1821,7 @@ auto debug_stop_task(task::Task* task) -> bool {
             if (found || current_on_cpu) {
                 return;
             }
-            if (rq->current_task == task) {
+            if (runqueue_task_is_reserved_locked(rq, task)) {
                 current_on_cpu = true;
                 current_cpu_of_task = cpu_no;
                 return;
@@ -1894,14 +1979,10 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             if (t->type == task::TaskType::IDLE) {
                 return nullptr;  // Don't switch idle->idle
             }
-            // CRITICAL: Set currentTask inside lock to prevent double-scheduling.
-            // rescheduleTaskForCpu checks currentTask under this same lock;
-            // without this, there's a window where the task can be moved to
-            // another CPU's heap between pickBestEligible and the assignment.
-            t->cpu = cpu::current_cpu();
-            rq->current_task = t;
-            // Record start time for the wakeup-preemption guard.
-            rq->current_task_start_us = time::get_us();
+            // Reserve the picked task without publishing it as current yet.
+            // current_task must continue to match the live stack until
+            // switch_to() has patched the return frame for this timer tick.
+            reserve_handoff_task_locked(rq, t, time::get_us());
             // (runnable_heap.size already decremented by remove above)
             return t;
         });
@@ -1914,7 +1995,6 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                  next_task->heap_index);
 #endif
         rq->is_idle.store(false, std::memory_order_release);
-        debug_task_slot(cpu::current_cpu()) = next_task;
         prepare_first_run_daemon(next_task, "idle-switch");
         rq->last_tick_us = time::get_us();
 
@@ -1922,8 +2002,10 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
 #ifdef SCHED_DEBUG
             dbg::log("PICK-IDLE: CPU %d switchTo FAILED for PID %x", static_cast<int>(cpu::current_cpu()), next_task->pid);
 #endif
-            rq->current_task = rq->idle_task;
-            debug_task_slot(cpu::current_cpu()) = rq->idle_task;
+            clear_handoff_task(next_task);
+            if (rq->idle_task != nullptr) {
+                run_queues->this_cpu_locked_void([](RunQueue* rq) { reserve_handoff_task_locked(rq, rq->idle_task, time::get_us()); });
+            }
             rq->is_idle.store(true, std::memory_order_release);
             arm_idle_timer_for_this_cpu();
         } else {
@@ -2056,20 +2138,26 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             return nullptr;
         }
 
-        // kern_block(): if the current task requested a true block (wants_block),
-        // move it from the runnable heap to the wait list now, under the lock.
-        // This is safe because we're in the timer interrupt with interrupts disabled.
-        if (current_task->wants_block && rq->runnable_heap.contains(current_task)) {
+        // kern_block()/preemptible_syscall_park(): if the current task requested
+        // a true block, move it to the wait list now, under the lock.  The
+        // normal case has the current task in the runnable heap.  If a
+        // handoff/current-task repair path left the live task current but not
+        // heap-contained, it still must be parked; otherwise it can keep
+        // halting with wants_block set until an unrelated wake happens.
+        if (current_task->wants_block) {
             current_task->wants_block = false;
             current_task->last_run_us = current_task->slice_used_ns / 1000U;
             note_perf_wait_callsite(current_task, current_task->context.frame.rip);
             current_task->last_sleep_start_us = NOW_US;
             uint64_t const WAKE_AT_US = current_task->wake_at_us;
-            remove_from_sums(rq, current_task);
-            rq->runnable_heap.remove(current_task);
+            if (rq->runnable_heap.contains(current_task)) {
+                remove_from_sums(rq, current_task);
+                rq->runnable_heap.remove(current_task);
+            }
+            while (rq->wait_list.remove(current_task)) {
+            }
             current_task->sched_queue = task::Task::sched_queue::WAITING;
             rq->wait_list.push(current_task);
-            rq->current_task = nullptr;
             // Perf: task going to sleep (wants_block)
             perf::record_sleep(static_cast<uint32_t>(cpu::current_cpu()), current_task->pid, WAKE_AT_US, perf_sleep_flags(WAKE_AT_US),
                                current_task->last_run_us, perf_wait_callsite(current_task), current_task->wait_channel);
@@ -2085,7 +2173,6 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             current_task->sched_queue = task::Task::sched_queue::WAITING;
             current_task->wait_channel = "ptrace";
             rq->wait_list.push(current_task);
-            rq->current_task = nullptr;
             blocked_current_task = true;
         }
 
@@ -2172,13 +2259,10 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             return nullptr;
         }
 
-        // CRITICAL: Set currentTask inside lock to prevent double-scheduling.
-        // rescheduleTaskForCpu checks currentTask under this same lock;
-        // without this, there's a window where the picked task can be
-        // moved to another CPU between pickBestEligible and the assignment.
-        rq->current_task_start_us = NOW_US;  // Track start for wakeup-preemption guard
-        next->cpu = cpu::current_cpu();
-        rq->current_task = next;
+        // Reserve the picked task without publishing it as current yet.
+        // current_task must continue to match the live interrupted stack until
+        // switch_to() has patched the timer return frame.
+        reserve_handoff_task_locked(rq, next, NOW_US);
         // Capture lag for the perf SWITCH event recorded outside the lock.
         perf_lag_out = AVG - current_task->vruntime;
         return next;
@@ -2188,9 +2272,12 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
     if (next_task == nullptr) {
         if (blocked_current_task) {
             auto* idle_rq = run_queues->this_cpu();
-            idle_rq->current_task = idle_rq->idle_task;
+            run_queues->this_cpu_locked_void([](RunQueue* rq) {
+                if (rq->idle_task != nullptr) {
+                    reserve_handoff_task_locked(rq, rq->idle_task, time::get_us());
+                }
+            });
             idle_rq->is_idle.store(true, std::memory_order_release);
-            debug_task_slot(cpu::current_cpu()) = idle_rq->idle_task;
             mm::virt::switch_to_kernel_pagemap();
             restore_kernel_gs_for_idle();
 
@@ -2214,7 +2301,8 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
         perf::record_switch(static_cast<uint32_t>(cpu::current_cpu()), current_task->pid, next_task->pid, SW_FLAGS, perf_lag_out,
                             current_task->slice_used_ns / 1000U, current_task->voluntary_block ? perf_wait_callsite(current_task) : 0);
     }
-    // Perform context switch - currentTask already set inside lock
+    // Perform context switch. The next task is only reserved under the lock;
+    // publish it as current after the live timer frame has been changed.
     // Save FPU state now that we know a switch is needed. This avoids the
     // expensive xsave on every timer tick when the same task continues.
     if (current_task->type == task::TaskType::PROCESS) {
@@ -2222,11 +2310,11 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
     }
 
     task::Task* original_task = current_task;
-    debug_task_slot(cpu::current_cpu()) = next_task;
     rq->is_idle.store(false, std::memory_order_release);
     prepare_first_run_daemon(next_task, "timer-switch");
 
     if (!sys::context_switch::switch_to(gpr, frame, next_task)) {
+        clear_handoff_task(next_task);
         rq->current_task = original_task;
         debug_task_slot(cpu::current_cpu()) = original_task;
     } else {
@@ -2269,15 +2357,11 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
 
         // Pick next task from heap
         if (rq->runnable_heap.size == 0) {
-            rq->current_task = nullptr;
             return nullptr;
         }
         int64_t const AVG = compute_avg_vruntime(rq);
         auto* next = rq->runnable_heap.pick_best_eligible(AVG);
-        // CRITICAL: Set currentTask inside lock to prevent double-scheduling.
-        // rescheduleTaskForCpu checks currentTask under this same lock.
-        next->cpu = cpu::current_cpu();
-        rq->current_task = next;
+        reserve_handoff_task_locked(rq, next, time::get_us());
         return next;
     });
 
@@ -2291,8 +2375,9 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
         dbg::log("jumpToNextTask: CPU %d: No ready tasks, entering idle", cpu::current_cpu());
 #endif
         auto* rq = run_queues->this_cpu();
-        rq->current_task = rq->idle_task;
-        debug_task_slot(cpu::current_cpu()) = rq->idle_task;
+        if (rq->idle_task != nullptr) {
+            run_queues->this_cpu_locked_void([](RunQueue* rq) { reserve_handoff_task_locked(rq, rq->idle_task, time::get_us()); });
+        }
         EpochManager::exit_critical_for_cpu(EPOCH_CPU);
         enter_idle_loop(rq);
     }
@@ -2300,8 +2385,10 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
     // Validate task
     if (next_task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
         auto* rq = run_queues->this_cpu();
-        rq->current_task = rq->idle_task;
-        debug_task_slot(cpu::current_cpu()) = rq->idle_task;
+        clear_handoff_task(next_task);
+        if (rq->idle_task != nullptr) {
+            run_queues->this_cpu_locked_void([](RunQueue* rq) { reserve_handoff_task_locked(rq, rq->idle_task, time::get_us()); });
+        }
         EpochManager::exit_critical_for_cpu(EPOCH_CPU);
         enter_idle_loop(rq);
     }
@@ -2311,8 +2398,10 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
         dbg::log("jumpToNextTask: PID %x missing resources, entering idle", next_task->pid);
 #endif
         auto* rq = run_queues->this_cpu();
-        rq->current_task = rq->idle_task;
-        debug_task_slot(cpu::current_cpu()) = rq->idle_task;
+        clear_handoff_task(next_task);
+        if (rq->idle_task != nullptr) {
+            run_queues->this_cpu_locked_void([](RunQueue* rq) { reserve_handoff_task_locked(rq, rq->idle_task, time::get_us()); });
+        }
         EpochManager::exit_critical_for_cpu(EPOCH_CPU);
         enter_idle_loop(rq);
     }
@@ -2320,9 +2409,7 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
     // If idle task: enter idle loop directly
     if (next_task->type == task::TaskType::IDLE) {
         auto* rq = run_queues->this_cpu();
-        next_task->cpu = cpu::current_cpu();
-        rq->current_task = next_task;
-        debug_task_slot(cpu::current_cpu()) = next_task;
+        run_queues->this_cpu_locked_void([next_task](RunQueue* rq) { reserve_handoff_task_locked(rq, next_task, time::get_us()); });
         rq->is_idle.store(true, std::memory_order_release);
         EpochManager::exit_critical_for_cpu(EPOCH_CPU);
         enter_idle_loop(rq);
@@ -2331,18 +2418,17 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
     // Switch to real task
     auto* rq = run_queues->this_cpu();
     rq->is_idle.store(false, std::memory_order_release);
-    next_task->cpu = cpu::current_cpu();
-    rq->current_task = next_task;
-    debug_task_slot(cpu::current_cpu()) = next_task;
     prepare_first_run_daemon(next_task, "exit-switch");
 
     if (!sys::context_switch::switch_to(gpr, frame, next_task)) {
 #ifdef SCHED_DEBUG
         dbg::log("jumpToNextTask: switchTo FAILED for PID %x", next_task->pid);
 #endif
-        rq->current_task = rq->idle_task;
+        clear_handoff_task(next_task);
+        if (rq->idle_task != nullptr) {
+            run_queues->this_cpu_locked_void([](RunQueue* rq) { reserve_handoff_task_locked(rq, rq->idle_task, time::get_us()); });
+        }
         rq->is_idle.store(true, std::memory_order_release);
-        debug_task_slot(cpu::current_cpu()) = rq->idle_task;
         mm::virt::switch_to_kernel_pagemap();
         restore_kernel_gs_for_idle();
 
@@ -2902,13 +2988,10 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
 
             // Pick next task
             if (rq->runnable_heap.size == 0) {
-                rq->current_task = nullptr;
                 return nullptr;
             }
             task::Task* next = rq->runnable_heap.pick_best_eligible(AVG);
-            next->cpu = cpu::current_cpu();
-            rq->current_task = next;
-            rq->current_task_start_us = time::get_us();  // Track for wakeup-preemption guard
+            reserve_handoff_task_locked(rq, next, time::get_us());
             return next;
         });
 
@@ -2947,7 +3030,6 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             }
 
             if (rq->runnable_heap.size == 0) {
-                rq->current_task = nullptr;
                 return nullptr;
             }
 
@@ -2962,13 +3044,10 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             if (next == nullptr || next->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE ||
                 (next->type == task::TaskType::PROCESS && (next->thread == nullptr || next->pagemap == nullptr)) ||
                 next->type == task::TaskType::IDLE) {
-                rq->current_task = nullptr;
                 return nullptr;
             }
 
-            next->cpu = cpu::current_cpu();
-            rq->current_task = next;
-            rq->current_task_start_us = time::get_us();
+            reserve_handoff_task_locked(rq, next, time::get_us());
             return next;
         });
 
@@ -2996,6 +3075,11 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     }
 
     if (next_task == current_task) {
+        // We are returning through syscall.asm's normal epilogue, not through
+        // wos_deferred_task_switch_return(), so publish deferred wait results
+        // back to the live syscall stack as well as Task::context.
+        *stack_regs = current_task->context.regs;
+        *return_value_slot = current_task->context.regs.rax;
         record_local_proc_first_run(current_task, WOS_PERF_CALLSITE());
         current_task->has_run = true;
         debug_task_slot(cpu::current_cpu()) = current_task;
@@ -3004,9 +3088,13 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
 
     if (next_task == nullptr || next_task->type == task::TaskType::IDLE) {
         // Enter idle loop
+        asm volatile("cli" ::: "memory");
         auto* rq = run_queues->this_cpu();
-        rq->current_task = rq->idle_task;
-        debug_task_slot(cpu::current_cpu()) = rq->idle_task;
+        run_queues->this_cpu_locked_void([](RunQueue* rq) {
+            if (rq->idle_task != nullptr) {
+                reserve_handoff_task_locked(rq, rq->idle_task, time::get_us());
+            }
+        });
         rq->is_idle.store(true, std::memory_order_release);
         arm_idle_timer_for_this_cpu();
 
@@ -3016,14 +3104,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         mm::virt::switch_to_kernel_pagemap();
         restore_kernel_gs_for_idle();
 
-        asm volatile(
-            "mov %0, %%rsp\n"
-            "sti\n"
-            "jmp wos_kernel_idle_loop"
-            :
-            : "r"(IDLE_STACK)
-            : "memory");
-        __builtin_unreachable();
+        wos_enterIdleStack(IDLE_STACK);
     }
 
     prepare_first_run_daemon(next_task, "deferred-switch");
@@ -3070,10 +3151,12 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     }
     validate_user_resume_target(next_task, "deferred-resume-next");
 
-    debug_task_slot(cpu::current_cpu()) = next_task;
+    asm volatile("cli" ::: "memory");
 
     validate_kernel_resume_target(next_task, "deferred-resume-next");
-    check_pending_signals_deferred(next_task);
+    if (next_task == get_current_task()) {
+        check_pending_signals_deferred(next_task);
+    }
 
     // Restore incoming task's FPU/SSE/AVX state (PROCESS tasks only).
     if (next_task->type == task::TaskType::PROCESS && next_task->fx_state.saved) {
@@ -3117,13 +3200,11 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Inter
 
         // Pick next
         if (rq->runnable_heap.size == 0) {
-            rq->current_task = nullptr;
             return nullptr;
         }
         int64_t const AVG = compute_avg_vruntime(rq);
         task::Task* next = rq->runnable_heap.pick_best_eligible(AVG);
-        next->cpu = cpu::current_cpu();
-        rq->current_task = next;
+        reserve_handoff_task_locked(rq, next, NOW_US);
         return next;
     });
 #ifdef SCHED_DEBUG
@@ -3134,9 +3215,11 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Inter
         if (!sys::context_switch::switch_to(gpr, frame, next_task)) {
             dbg::log("placeTaskInWaitQueue: switchTo failed, entering idle");
             auto* rq = run_queues->this_cpu();
-            rq->current_task = rq->idle_task;
+            clear_handoff_task(next_task);
+            if (rq->idle_task != nullptr) {
+                run_queues->this_cpu_locked_void([](RunQueue* rq) { reserve_handoff_task_locked(rq, rq->idle_task, time::get_us()); });
+            }
             rq->is_idle.store(true, std::memory_order_release);
-            debug_task_slot(cpu::current_cpu()) = rq->idle_task;
             mm::virt::switch_to_kernel_pagemap();
             restore_kernel_gs_for_idle();
 
@@ -3154,9 +3237,10 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Inter
     } else {
         // Only idle or no tasks - enter idle via iretq
         auto* rq = run_queues->this_cpu();
-        rq->current_task = rq->idle_task;
+        if (rq->idle_task != nullptr) {
+            run_queues->this_cpu_locked_void([](RunQueue* rq) { reserve_handoff_task_locked(rq, rq->idle_task, time::get_us()); });
+        }
         rq->is_idle.store(true, std::memory_order_release);
-        debug_task_slot(cpu::current_cpu()) = rq->idle_task;
         arm_idle_timer_for_this_cpu();
         mm::virt::switch_to_kernel_pagemap();
         restore_kernel_gs_for_idle();
@@ -3205,7 +3289,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
     if (LAST_CPU < NCPUS_RESCHED) {
         run_queues->with_lock_void(LAST_CPU,
                                    [task, &is_current_on_some_cpu, &current_cpu_of_task, &found_and_removed, LAST_CPU](RunQueue* rq) {
-                                       if (rq->current_task == task) {
+                                       if (runqueue_task_is_reserved_locked(rq, task)) {
                                            is_current_on_some_cpu = true;
                                            current_cpu_of_task = LAST_CPU;
                                            task->cpu = LAST_CPU;
@@ -3235,7 +3319,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
                     if (found_and_removed || is_current_on_some_cpu) {
                         return;
                     }
-                    if (rq->current_task == task) {
+                    if (runqueue_task_is_reserved_locked(rq, task)) {
                         is_current_on_some_cpu = true;
                         current_cpu_of_task = search_cpu;
                         task->cpu = search_cpu;
@@ -3592,7 +3676,7 @@ void insert_into_dead_list(task::Task* task) {
     uint64_t const CORE_COUNT = smt::get_core_count();
 
     auto detach_from_cpu = [task, &found_current](RunQueue* rq) {
-        if (rq->current_task == task) {
+        if (runqueue_task_is_reserved_locked(rq, task)) {
             found_current = true;
         }
         while (rq->wait_list.remove(task)) {
@@ -4247,6 +4331,8 @@ auto get_expired_task_refcounts(uint64_t cpu_no, uint64_t* pids, uint32_t* refco
 // ============================================================================
 
 extern "C" auto wos_get_current_task() -> ker::mod::sched::task::Task* { return ker::mod::sched::get_current_task(); }
+
+extern "C" void wos_commit_handoff_task() { ker::mod::sched::commit_handoff_task_at_return_boundary(); }
 
 extern "C" auto wos_get_current_pagemap() -> ker::mod::mm::paging::PageTable* {  // NOLINT
     auto* t = ker::mod::sched::get_current_task();

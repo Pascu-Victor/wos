@@ -23,7 +23,8 @@ struct RunQueue {
     IntrusiveTaskList wait_list{};  // Tasks blocked on I/O or events (waitpid, socket recv)
     IntrusiveTaskList dead_list{};  // Dead tasks awaiting epoch-based GC
 
-    task::Task* current_task{nullptr};  // Currently executing task on this CPU
+    task::Task* current_task{nullptr};  // Task whose stack is currently executing on this CPU
+    task::Task* handoff_task{nullptr};  // Picked next task reserved for an in-progress stack/frame handoff
     task::Task* idle_task{nullptr};     // Idle task for this CPU (never in heap)
     std::atomic<bool> is_idle;          // True when CPU is halted waiting for work
 
@@ -157,6 +158,7 @@ void set_cpu_daemon_penalty(uint64_t cpu_no, uint32_t penalty);  // Set daemon_l
 void set_cpu_domain_id(uint64_t cpu_no, uint32_t domain_id);     // Set domain_id on a CPU's RunQueue (Phase 8)
 auto get_cpu_load(uint64_t cpu_no) -> uint32_t;                  // Raw load for a CPU (for queryDomain)
 auto get_current_task() -> task::Task*;
+auto get_return_task() -> task::Task*;
 auto current_cpu_for_task(task::Task* task) -> uint64_t;
 auto owner_cpu_for_task(task::Task* task) -> uint64_t;
 bool can_query_current_task();
@@ -501,6 +503,7 @@ constexpr auto preemptible_syscall_park(const char* wait_channel, uint64_t deadl
 // NOLINTEND(cppcoreguidelines-macro-usage, readability-identifier-naming)
 
 extern "C" auto wos_get_current_task() -> ker::mod::sched::task::Task*;
+extern "C" void wos_commit_handoff_task();
 extern "C" const uint64_t WOS_DEFERRED_TASK_SWITCH_OFFSET;
 extern "C" void wos_deferred_task_switch_return(ker::mod::cpu::GPRegs* gpr_ptr, ker::mod::gates::InterruptFrame* frame_ptr);
 extern "C" [[noreturn]] void wos_start_kernel_thread(uint64_t stack_top, void (*entry)());

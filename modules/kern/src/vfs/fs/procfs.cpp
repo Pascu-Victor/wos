@@ -79,6 +79,176 @@ void int_to_str(uint64_t val, char* buf, size_t bufsz) {
     buf[std::cmp_less(LEN, bufsz) ? LEN : static_cast<int>(bufsz - 1)] = '\0';
 }
 
+using ProcTask = ker::mod::sched::task::Task;
+
+auto proc_task_state_char(const ProcTask& task) -> char {
+    auto const TASK_STATE = task.state.load(std::memory_order_acquire);
+    if (TASK_STATE == ker::mod::sched::task::TaskState::DEAD || TASK_STATE == ker::mod::sched::task::TaskState::EXITING ||
+        task.has_exited) {
+        return 'Z';
+    }
+    if (task.sched_queue == ProcTask::sched_queue::RUNNABLE) {
+        return 'R';
+    }
+    if (task.sched_queue == ProcTask::sched_queue::WAITING) {
+        return task.wait_channel != nullptr ? 'D' : 'S';
+    }
+    return 'S';
+}
+
+auto proc_task_state_label(char state) -> const char* {
+    switch (state) {
+        case 'Z':
+            return "Z (zombie)";
+        case 'R':
+            return "R (running)";
+        case 'D':
+            return "D (blocked)";
+        default:
+            return "S (sleeping)";
+    }
+}
+
+struct ProcTaskStats {
+    uint64_t user_time_us{};
+    uint64_t system_time_us{};
+    uint64_t thread_count{1};
+    char state{'S'};
+};
+
+auto collect_proc_task_stats(const ProcTask& task, bool thread_view) -> ProcTaskStats {
+    ProcTaskStats stats{
+        .user_time_us = task.user_time_us,
+        .system_time_us = task.system_time_us,
+        .thread_count = 1,
+        .state = proc_task_state_char(task),
+    };
+    if (thread_view || task.is_thread || task.type != ker::mod::sched::task::TaskType::PROCESS) {
+        return stats;
+    }
+
+    uint64_t const GROUP_PID = ker::mod::sched::task::process_pid(task);
+    uint64_t thread_count = 0;
+    uint64_t user_time_us = 0;
+    uint64_t system_time_us = 0;
+    bool any_running = false;
+    bool any_blocked = false;
+    bool any_sleeping = false;
+    bool any_zombie = false;
+
+    uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < TASK_COUNT; ++i) {
+        auto* candidate = ker::mod::sched::get_active_task_at_safe(i);
+        if (candidate == nullptr) {
+            continue;
+        }
+        if (!ker::mod::sched::task::same_thread_group(*candidate, GROUP_PID)) {
+            candidate->release();
+            continue;
+        }
+
+        thread_count++;
+        user_time_us += candidate->user_time_us;
+        system_time_us += candidate->system_time_us;
+        char const STATE = proc_task_state_char(*candidate);
+        any_running = any_running || STATE == 'R';
+        any_blocked = any_blocked || STATE == 'D';
+        any_sleeping = any_sleeping || STATE == 'S';
+        any_zombie = any_zombie || STATE == 'Z';
+        candidate->release();
+    }
+
+    if (thread_count == 0) {
+        return stats;
+    }
+
+    stats.user_time_us = user_time_us;
+    stats.system_time_us = system_time_us;
+    stats.thread_count = thread_count;
+    if (any_running) {
+        stats.state = 'R';
+    } else if (any_blocked) {
+        stats.state = 'D';
+    } else if (any_sleeping) {
+        stats.state = 'S';
+    } else if (any_zombie) {
+        stats.state = 'Z';
+    }
+    return stats;
+}
+
+auto process_visible_task_at(size_t index) -> ProcTask* {
+    size_t seen = 0;
+    uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < TASK_COUNT; ++i) {
+        auto* task = ker::mod::sched::get_active_task_at_safe(i);
+        if (task == nullptr) {
+            continue;
+        }
+        if (!ker::mod::sched::task::process_visible(*task)) {
+            task->release();
+            continue;
+        }
+        if (seen == index) {
+            return task;
+        }
+        seen++;
+        task->release();
+    }
+    return nullptr;
+}
+
+auto thread_group_task_at(uint64_t group_pid, size_t index) -> ProcTask* {
+    size_t seen = 0;
+    uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < TASK_COUNT; ++i) {
+        auto* task = ker::mod::sched::get_active_task_at_safe(i);
+        if (task == nullptr) {
+            continue;
+        }
+        if (!ker::mod::sched::task::same_thread_group(*task, group_pid)) {
+            task->release();
+            continue;
+        }
+        if (seen == index) {
+            return task;
+        }
+        seen++;
+        task->release();
+    }
+    return nullptr;
+}
+
+auto task_group_pid_for(uint64_t pid, uint64_t& group_pid) -> bool {
+    auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
+    if (task == nullptr) {
+        return false;
+    }
+    group_pid = ker::mod::sched::task::process_pid(*task);
+    task->release();
+    return true;
+}
+
+auto find_task_in_group_safe(uint64_t group_pid, uint64_t tid) -> ProcTask* {
+    auto* task = ker::mod::sched::find_task_by_pid_safe(tid);
+    if (task == nullptr) {
+        return nullptr;
+    }
+    if (!ker::mod::sched::task::same_thread_group(*task, group_pid)) {
+        task->release();
+        return nullptr;
+    }
+    return task;
+}
+
+void fill_numeric_dirent(DirEntry* buf, size_t count, uint64_t pid) {
+    buf->d_ino = pid + 100;
+    buf->d_off = count + 1;
+    buf->d_reclen = sizeof(DirEntry);
+    buf->d_type = DT_DIR;
+    int_to_str(pid, buf->d_name.data(), buf->d_name.size());
+}
+
 auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
     if (f == nullptr || f->private_data == nullptr) {
         return -EBADF;
@@ -182,29 +352,23 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             std::memcpy(buf->d_name.data(), "memacc", 7);
             return 0;
         }
-        // PID directories from active task list
+        // PID directories from active task list. Threads and WKI proxy tasks
+        // stay hidden here; real threads are exposed under /proc/<pid>/task/<tid>.
         size_t const PID_INDEX = count - 11;
-        uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
-        if (PID_INDEX >= TASK_COUNT) {
-            return -ENOENT;  // No more entries
-        }
-        auto* task = ker::mod::sched::get_active_task_at_safe(static_cast<uint32_t>(PID_INDEX));
+        auto* task = process_visible_task_at(PID_INDEX);
         if (task == nullptr) {
             return -ENOENT;
         }
         uint64_t const PID = task->pid;
         task->release();
-        buf->d_ino = PID + 100;
-        buf->d_off = count + 1;
-        buf->d_reclen = sizeof(DirEntry);
-        buf->d_type = DT_DIR;
-        int_to_str(PID, buf->d_name.data(), buf->d_name.size());
+        fill_numeric_dirent(buf, count, PID);
         return 0;
     }
 
-    if (pfd->node.type == ProcNodeType::PID_DIR) {
-        // /proc/<pid>: index 2 = "stat", 3 = "status", 4 = "statm",
-        // 5 = "cmdline", 6 = "exe", 7 = "wki_launcher", 8 = "wki_runner", 9 = "wki_remote_pid"
+    if (pfd->node.type == ProcNodeType::PID_DIR || pfd->node.type == ProcNodeType::TASK_TID_DIR) {
+        // /proc/<pid> and /proc/<pid>/task/<tid>: index 2 = "stat", 3 = "status", 4 = "statm",
+        // 5 = "cmdline", 6 = "exe", 7 = "wki_launcher", 8 = "wki_runner", 9 = "wki_remote_pid".
+        // Top-level process dirs additionally expose "task" at index 10.
         if (count == 2) {
             buf->d_ino = 10;
             buf->d_off = 3;
@@ -269,7 +433,26 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             std::memcpy(buf->d_name.data(), "wki_remote_pid", 15);
             return 0;
         }
+        if (pfd->node.type == ProcNodeType::PID_DIR && count == 10) {
+            buf->d_ino = 18;
+            buf->d_off = 11;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_DIR;
+            std::memcpy(buf->d_name.data(), "task", 5);
+            return 0;
+        }
         return -ENOENT;  // No more entries
+    }
+
+    if (pfd->node.type == ProcNodeType::TASK_DIR) {
+        auto* task = thread_group_task_at(pfd->node.pid, count - 2);
+        if (task == nullptr) {
+            return -ENOENT;
+        }
+        uint64_t const TID = task->pid;
+        task->release();
+        fill_numeric_dirent(buf, count, TID);
+        return 0;
     }
 
     if (pfd->node.type == ProcNodeType::WKI_DIR) {
@@ -383,12 +566,14 @@ auto parse_pid(const char* s) -> int64_t {
 }
 
 // Generate content for /proc/<pid>/status
-auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
+auto generate_status(uint64_t pid, char* buf, size_t bufsz, bool thread_view) -> size_t {
     auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
     if (task == nullptr) {
         return 0;
     }
     auto const MEM = ker::mod::mm::virt::collect_user_memory_stats(task->pagemap);
+    auto const STATS = collect_proc_task_stats(*task, thread_view);
+    uint64_t const PROCESS_PID = ker::mod::sched::task::process_pid(*task);
 
     size_t off = 0;
     auto append = [&](const char* s) {
@@ -404,6 +589,8 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
 
     append("Name:\t");
     append((task->exe_path[0] != 0) ? task->exe_path.data() : "(unknown)");
+    append("\nTgid:\t");
+    append_int(PROCESS_PID);
     append("\nPid:\t");
     append_int(task->pid);
     append("\nPPid:\t");
@@ -424,6 +611,8 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     append_int(task->sgid);
     append("\t");
     append_int(task->gid);
+    append("\nThreads:\t");
+    append_int(STATS.thread_count);
     append("\nVmSize:\t");
     append_int(MEM.virtual_pages * (ker::mod::mm::paging::PAGE_SIZE / KIB));
     append(" kB");
@@ -439,16 +628,7 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
 
     // State
     append("\nState:\t");
-    auto ts_st = task->state.load(std::memory_order_acquire);
-    if (ts_st == ker::mod::sched::task::TaskState::DEAD || ts_st == ker::mod::sched::task::TaskState::EXITING || task->has_exited) {
-        append("Z (zombie)");
-    } else if (task->sched_queue == ker::mod::sched::task::Task::sched_queue::RUNNABLE) {
-        append("R (running)");
-    } else if (task->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING) {
-        append(task->wait_channel != nullptr ? "D (blocked)" : "S (sleeping)");
-    } else {
-        append("S (sleeping)");
-    }
+    append(proc_task_state_label(STATS.state));
 
     // Scheduling info
     append("\nCpu:\t");
@@ -507,10 +687,10 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
 
     // Time accounting
     append("\nUserTime:\t");
-    append_int(task->user_time_us);
+    append_int(STATS.user_time_us);
     append(" us");
     append("\nSysTime:\t");
-    append_int(task->system_time_us);
+    append_int(STATS.system_time_us);
     append(" us");
     append("\nStartTime:\t");
     append_int(task->start_time_us);
@@ -526,12 +706,13 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz) -> size_t {
 // Generate content for /proc/<pid>/stat (Linux-compatible format)
 // Format: pid (comm) state ppid pgid sid tty tpgid flags minflt cminflt majflt cmajflt
 //         utime stime cutime cstime priority nice nthreads itrealvalue starttime vsize rss ...
-auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
+auto generate_stat(uint64_t pid, char* buf, size_t bufsz, bool thread_view) -> size_t {
     auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
     if (task == nullptr) {
         return 0;
     }
     auto const MEM = ker::mod::mm::virt::collect_user_memory_stats(task->pagemap);
+    auto const STATS = collect_proc_task_stats(*task, thread_view);
 
     size_t off = 0;
     auto append = [&](const char* s) {
@@ -560,23 +741,12 @@ auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
         comm = (task->name != nullptr) ? task->name : "unknown";
     }
 
-    // Determine state character
-    char state = 'S';  // Default sleeping
-    auto ts = task->state.load(std::memory_order_acquire);
-    if (ts == ker::mod::sched::task::TaskState::DEAD || ts == ker::mod::sched::task::TaskState::EXITING || task->has_exited) {
-        state = 'Z';
-    } else if (task->sched_queue == ker::mod::sched::task::Task::sched_queue::RUNNABLE) {
-        state = 'R';
-    } else if (task->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING) {
-        state = task->wait_channel != nullptr ? 'D' : 'S';
-    }
-
     // pid (comm) state ppid pgid sid tty_nr tpgid flags
     append_int(task->pid);
     append(" (");
     append(comm);
     append(") ");
-    buf[off++] = state;
+    buf[off++] = STATS.state;
     append(" ");
     append_int(task->parent_pid);  // ppid
     append(" ");
@@ -598,9 +768,9 @@ auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     append("0 ");  // cmajflt
 
     // utime stime cutime cstime (in clock ticks, CLK_TCK=100, so 1 tick=10000us)
-    append_int(task->user_time_us / 10000);  // utime
+    append_int(STATS.user_time_us / 10000);  // utime
     append(" ");
-    append_int(task->system_time_us / 10000);  // stime
+    append_int(STATS.system_time_us / 10000);  // stime
     append(" ");
     append("0 ");  // cutime (children)
     append("0 ");  // cstime (children)
@@ -615,7 +785,8 @@ auto generate_stat(uint64_t pid, char* buf, size_t bufsz) -> size_t {
         append_int(static_cast<uint64_t>(task->sched_nice));
     }
     append(" ");
-    append("1 ");                             // num_threads
+    append_int(STATS.thread_count);  // num_threads
+    append(" ");
     append("0 ");                             // itrealvalue
     append_int(task->start_time_us / 10000);  // starttime (in ticks since boot)
     append(" ");
@@ -1006,8 +1177,17 @@ auto generate_wki_launcher(uint64_t pid, char* buf, size_t bufsz) -> size_t {
 
 // Generate content for /proc/<pid>/wki_runner
 // Returns the hostname of the node currently executing this process.
-auto generate_wki_runner(char* buf, size_t bufsz) -> size_t {
+auto generate_wki_runner(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     const char* hostname = ker::net::wki::g_wki.local_hostname.data();
+    std::array<char, ker::net::wki::WKI_HOSTNAME_MAX> proxy_hostname{};
+    auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
+    if (task != nullptr && ker::net::wki::wki_proxy_task_remote_info(task, nullptr, proxy_hostname.data(), proxy_hostname.size()) &&
+        proxy_hostname.front() != '\0') {
+        hostname = proxy_hostname.data();
+    }
+    if (task != nullptr) {
+        task->release();
+    }
     if (hostname == nullptr || hostname[0] == '\0') {
         hostname = "local";
     }
@@ -1652,7 +1832,7 @@ auto collect_memacc_process_totals() -> MemaccProcessTotals {
         if (task->type != ker::mod::sched::task::TaskType::PROCESS) {
             totals.kernel_task_count++;
         }
-        if (!task->is_thread) {
+        if (ker::mod::sched::task::process_visible(*task)) {
             totals.process_count++;
             add_process_totals(totals, ker::mod::mm::memacc::collect_user_memory_breakdown(task->pagemap));
         }
@@ -1789,7 +1969,7 @@ auto generate_memacc_procs(char* buf, size_t bufsz) -> size_t {
         if (task == nullptr) {
             continue;
         }
-        if (task->is_thread) {
+        if (!ker::mod::sched::task::process_visible(*task)) {
             task->release();
             continue;
         }
@@ -2836,10 +3016,10 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
 
         switch (pfd->node.type) {
             case ProcNodeType::STATUS_FILE:
-                pfd->content_len = generate_status(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
+                pfd->content_len = generate_status(pfd->node.pid, pfd->content, MAX_PROCFS_BUF, pfd->node.thread_view);
                 break;
             case ProcNodeType::STAT_FILE:
-                pfd->content_len = generate_stat(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
+                pfd->content_len = generate_stat(pfd->node.pid, pfd->content, MAX_PROCFS_BUF, pfd->node.thread_view);
                 break;
             case ProcNodeType::STATM_FILE:
                 pfd->content_len = generate_statm(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
@@ -2887,7 +3067,7 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 pfd->content_len = generate_wki_launcher(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
                 break;
             case ProcNodeType::WKI_RUNNER_FILE:
-                pfd->content_len = generate_wki_runner(pfd->content, MAX_PROCFS_BUF);
+                pfd->content_len = generate_wki_runner(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
                 break;
             case ProcNodeType::WKI_REMOTE_PID_FILE:
                 pfd->content_len = generate_wki_remote_pid(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
@@ -3241,7 +3421,7 @@ auto procfs_readlink(File* f, char* buf, size_t bufsz) -> ssize_t {
             return -ESRCH;
         }
         std::array<char, 24> tmp{};
-        int_to_str(task->pid, tmp.data(), tmp.size());
+        int_to_str(ker::mod::sched::task::process_pid(*task), tmp.data(), tmp.size());
         std::array<char, 64> link{};
         memcpy(link.data(), "/proc/", 6);
         size_t off = 6;
@@ -3389,12 +3569,13 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     }
 
     auto* task = ker::mod::sched::get_current_task();
-    uint64_t const SELF_PID = (task != nullptr) ? task->pid : 0;
+    uint64_t const SELF_PID = (task != nullptr) ? ker::mod::sched::task::process_pid(*task) : 0;
 
-    auto make_file = [](ProcNodeType type, uint64_t pid, bool is_dir) -> File* {
+    auto make_file = [](ProcNodeType type, uint64_t pid, bool is_dir, bool thread_view = false) -> File* {
         auto* pfd = new ProcFileData;
         pfd->node.type = type;
         pfd->node.pid = pid;
+        pfd->node.thread_view = thread_view;
         pfd->content = nullptr;
         pfd->content_len = 0;
 
@@ -3415,6 +3596,69 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
         }
         task->release();
         return true;
+    };
+    auto open_task_subpath = [&](uint64_t group_pid, const char* subpath) -> File* {
+        if (subpath == nullptr || *subpath == '\0') {
+            return make_file(ProcNodeType::TASK_DIR, group_pid, true);
+        }
+
+        const char* slash = nullptr;
+        for (const char* p = subpath; *p != 0; ++p) {
+            if (*p == '/') {
+                slash = p;
+                break;
+            }
+        }
+
+        std::array<char, 24> tid_str{};
+        size_t const TID_LEN = (slash == nullptr) ? std::strlen(subpath) : static_cast<size_t>(slash - subpath);
+        if (TID_LEN == 0 || TID_LEN >= tid_str.size()) {
+            return nullptr;
+        }
+        memcpy(tid_str.data(), subpath, TID_LEN);
+        tid_str[TID_LEN] = '\0';
+        int64_t const TID = parse_pid(tid_str.data());
+        if (TID < 0) {
+            return nullptr;
+        }
+
+        auto const TID_VALUE = static_cast<uint64_t>(TID);
+        auto* target = find_task_in_group_safe(group_pid, TID_VALUE);
+        if (target == nullptr) {
+            return nullptr;
+        }
+        target->release();
+
+        if (slash == nullptr) {
+            return make_file(ProcNodeType::TASK_TID_DIR, TID_VALUE, true);
+        }
+
+        const char* task_sub = slash + 1;
+        if (strcmp(task_sub, "exe") == 0) {
+            return make_file(ProcNodeType::EXE_LINK, TID_VALUE, false);
+        }
+        if (strcmp(task_sub, "status") == 0) {
+            return make_file(ProcNodeType::STATUS_FILE, TID_VALUE, false, true);
+        }
+        if (strcmp(task_sub, "stat") == 0) {
+            return make_file(ProcNodeType::STAT_FILE, TID_VALUE, false, true);
+        }
+        if (strcmp(task_sub, "statm") == 0) {
+            return make_file(ProcNodeType::STATM_FILE, TID_VALUE, false);
+        }
+        if (strcmp(task_sub, "cmdline") == 0) {
+            return make_file(ProcNodeType::CMDLINE_FILE, TID_VALUE, false);
+        }
+        if (strcmp(task_sub, "wki_launcher") == 0) {
+            return make_file(ProcNodeType::WKI_LAUNCHER_FILE, TID_VALUE, false);
+        }
+        if (strcmp(task_sub, "wki_runner") == 0) {
+            return make_file(ProcNodeType::WKI_RUNNER_FILE, TID_VALUE, false);
+        }
+        if (strcmp(task_sub, "wki_remote_pid") == 0) {
+            return make_file(ProcNodeType::WKI_REMOTE_PID_FILE, TID_VALUE, false);
+        }
+        return nullptr;
     };
 
     // /proc (root)
@@ -3586,6 +3830,13 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     if (strcmp(path, "self/wki_remote_pid") == 0) {
         return make_file(ProcNodeType::WKI_REMOTE_PID_FILE, SELF_PID, false);
     }
+    // /proc/self/task[/<tid>/...]
+    if (strcmp(path, "self/task") == 0) {
+        return open_task_subpath(SELF_PID, "");
+    }
+    if (strncmp(path, "self/task/", 10) == 0) {
+        return open_task_subpath(SELF_PID, path + 10);
+    }
 
     // /proc/<pid>
     // Find first / in path
@@ -3627,6 +3878,16 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     }
 
     const char* sub = slash + 1;
+    uint64_t group_pid = 0;
+    if (!task_group_pid_for(static_cast<uint64_t>(PID), group_pid)) {
+        return nullptr;
+    }
+    if (strcmp(sub, "task") == 0) {
+        return open_task_subpath(group_pid, "");
+    }
+    if (strncmp(sub, "task/", 5) == 0) {
+        return open_task_subpath(group_pid, sub + 5);
+    }
     if (strcmp(sub, "exe") == 0) {
         return make_file(ProcNodeType::EXE_LINK, static_cast<uint64_t>(PID), false);
     }

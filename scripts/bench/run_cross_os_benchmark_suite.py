@@ -4,9 +4,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import shlex
+import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +29,32 @@ class RenderCase:
     spp: int
     wos_scene: str | None
     linux_scene: str | None
+
+
+@dataclass
+class HostKvmTraceRun:
+    tool: str
+    step_name: str
+    command: list[str]
+    data_path: Path
+    stdout_path: Path
+    stderr_path: Path
+    metadata_path: Path
+    process: subprocess.Popen[str] | None = None
+    stdout_handle: Any | None = None
+    stderr_handle: Any | None = None
+    start_monotonic: float = 0.0
+    status: str = "created"
+    error: str | None = None
+    returncode: int | None = None
+    stopped_by: str | None = None
+
+
+@dataclass
+class HostKvmTraceSession:
+    step_name: str
+    runs: list[HostKvmTraceRun]
+    completed: list[dict[str, Any]]
 
 
 def run_command(
@@ -219,9 +248,362 @@ def render_placements(raw: str) -> list[str]:
     return placements
 
 
+def parse_schedstat_qemu_pid(raw: str) -> str:
+    if ":" not in raw:
+        raise argparse.ArgumentTypeError("expected VM:PID, for example vm0:12345 or 0:12345")
+    raw_label, raw_pid = raw.split(":", 1)
+    if not raw_label:
+        raise argparse.ArgumentTypeError("VM label cannot be empty")
+    if not raw_pid.isdigit() or int(raw_pid) <= 0:
+        raise argparse.ArgumentTypeError("PID must be a positive integer")
+    return raw
+
+
+def parse_host_kvm_trace_modes(raw: str) -> list[str]:
+    normalized = raw.strip().lower()
+    if normalized in {"", "none", "off", "false", "0"}:
+        return []
+    if normalized == "both":
+        return ["perf", "trace-cmd"]
+
+    modes: list[str] = []
+    aliases = {"trace": "trace-cmd", "tracecmd": "trace-cmd"}
+    valid = {"perf", "trace-cmd"}
+    for item in normalized.split(","):
+        mode = aliases.get(item.strip(), item.strip())
+        if not mode:
+            continue
+        if mode not in valid:
+            raise ValueError(f"invalid host KVM trace mode: {item}")
+        if mode not in modes:
+            modes.append(mode)
+    return modes
+
+
+def split_host_tool_command(raw: str) -> list[str]:
+    command = shlex.split(raw)
+    if not command:
+        raise ValueError("host trace command must not be empty")
+    return command
+
+
+def command_exists(command: list[str]) -> bool:
+    executable = command[0]
+    if os.sep in executable:
+        return os.access(executable, os.X_OK)
+    return shutil.which(executable) is not None
+
+
+def repeated_trace_event_args(raw: str) -> list[str]:
+    args: list[str] = []
+    for event in raw.split(","):
+        event = event.strip()
+        if event:
+            args += ["-e", event]
+    return args
+
+
+class HostKvmTracer:
+    def __init__(self, args: argparse.Namespace, suite_dir: Path) -> None:
+        self.modes: list[str] = args.host_kvm_trace_modes
+        self.trace_dir = suite_dir / "host-kvm-tracing"
+        self.perf_command = split_host_tool_command(args.host_kvm_perf_cmd)
+        self.trace_command = split_host_tool_command(args.host_kvm_trace_cmd)
+        self.perf_events = args.host_kvm_perf_events
+        self.trace_events = args.host_kvm_trace_events
+        self.trace_buffer_kb = args.host_kvm_trace_buffer_kb
+        self.startup_grace_seconds = args.host_kvm_trace_startup_grace
+        self.stop_timeout_seconds = args.host_kvm_trace_stop_timeout
+        self.max_seconds = args.host_kvm_trace_max_seconds
+        self.records: list[dict[str, Any]] = []
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.modes)
+
+    def config_summary(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "modes": self.modes,
+            "perf_command": self.perf_command,
+            "perf_events": self.perf_events,
+            "trace_command": self.trace_command,
+            "trace_events": self.trace_events,
+            "trace_buffer_kb": self.trace_buffer_kb,
+            "max_seconds": self.max_seconds,
+        }
+
+    def start(self, step_name: str) -> HostKvmTraceSession | None:
+        if not self.enabled:
+            return None
+
+        step_dir = self.trace_dir / step_name
+        step_dir.mkdir(parents=True, exist_ok=True)
+        session = HostKvmTraceSession(step_name=step_name, runs=[], completed=[])
+        for mode in self.modes:
+            run = self._create_run(mode, step_name, step_dir)
+            if not command_exists(self._tool_command(mode)):
+                run.status = "skipped"
+                run.error = f"tool not found or not executable: {self._tool_command(mode)[0]}"
+                session.completed.append(self._finalize(run))
+                continue
+
+            self._start_run(run)
+            if run.process is None:
+                session.completed.append(self._finalize(run))
+            else:
+                session.runs.append(run)
+        return session
+
+    def stop(self, session: HostKvmTraceSession | None) -> list[dict[str, Any]]:
+        if session is None:
+            return []
+
+        entries = list(session.completed)
+        for run in session.runs:
+            self._stop_run(run)
+            entries.append(self._finalize(run))
+        return entries
+
+    def summary_step(self) -> dict[str, Any]:
+        return {
+            "name": "host-kvm-tracing",
+            "ok": True,
+            "host": "localhost",
+            "config": self.config_summary(),
+            "records": self.records,
+            "artifacts": [
+                artifact
+                for record in self.records
+                for artifact in record.get("artifacts", [])
+            ],
+        }
+
+    def _tool_command(self, mode: str) -> list[str]:
+        if mode == "perf":
+            return self.perf_command
+        if mode == "trace-cmd":
+            return self.trace_command
+        raise ValueError(f"unknown host KVM trace mode: {mode}")
+
+    def _create_run(self, mode: str, step_name: str, step_dir: Path) -> HostKvmTraceRun:
+        if mode == "perf":
+            data_path = step_dir / "perf-kvm.data"
+            command = [
+                *self.perf_command,
+                "record",
+                "-a",
+                "-g",
+                "-e",
+                self.perf_events,
+                "-o",
+                str(data_path),
+                "--",
+                "sleep",
+                str(self.max_seconds),
+            ]
+        elif mode == "trace-cmd":
+            data_path = step_dir / "trace-kvm.dat"
+            command = [
+                *self.trace_command,
+                "record",
+                "-b",
+                str(self.trace_buffer_kb),
+                *repeated_trace_event_args(self.trace_events),
+                "-o",
+                str(data_path),
+            ]
+        else:
+            raise ValueError(f"unknown host KVM trace mode: {mode}")
+
+        return HostKvmTraceRun(
+            tool=mode,
+            step_name=step_name,
+            command=command,
+            data_path=data_path,
+            stdout_path=step_dir / f"{mode}.stdout.log",
+            stderr_path=step_dir / f"{mode}.stderr.log",
+            metadata_path=step_dir / f"{mode}.json",
+        )
+
+    def _start_run(self, run: HostKvmTraceRun) -> None:
+        run.stdout_handle = run.stdout_path.open("w", encoding="utf-8")
+        run.stderr_handle = run.stderr_path.open("w", encoding="utf-8")
+        run.start_monotonic = time.monotonic()
+        try:
+            run.process = subprocess.Popen(
+                run.command,
+                cwd=ROOT,
+                stdout=run.stdout_handle,
+                stderr=run.stderr_handle,
+                text=True,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            run.status = "skipped"
+            run.error = str(exc)
+            self._close_handles(run)
+            return
+
+        time.sleep(self.startup_grace_seconds)
+        run.returncode = run.process.poll()
+        if run.returncode is not None:
+            run.status = "unavailable"
+            run.error = (
+                "recorder exited during startup; check stderr for permissions, "
+                "missing tracepoints, or tracefs/perf_event restrictions"
+            )
+            self._close_handles(run)
+            run.process = None
+            return
+
+        run.status = "recording"
+
+    def _stop_run(self, run: HostKvmTraceRun) -> None:
+        if run.process is None:
+            return
+
+        try:
+            if run.process.poll() is None:
+                os.killpg(run.process.pid, signal.SIGINT)
+                run.returncode = run.process.wait(timeout=self.stop_timeout_seconds)
+                run.stopped_by = "SIGINT"
+            else:
+                run.returncode = run.process.returncode
+                run.stopped_by = "already-exited"
+        except ProcessLookupError:
+            run.returncode = run.process.poll()
+            run.stopped_by = "already-exited"
+        except subprocess.TimeoutExpired:
+            os.killpg(run.process.pid, signal.SIGTERM)
+            try:
+                run.returncode = run.process.wait(timeout=self.stop_timeout_seconds)
+                run.stopped_by = "SIGTERM"
+            except subprocess.TimeoutExpired:
+                os.killpg(run.process.pid, signal.SIGKILL)
+                run.returncode = run.process.wait(timeout=self.stop_timeout_seconds)
+                run.stopped_by = "SIGKILL"
+        finally:
+            self._close_handles(run)
+
+        if run.data_path.exists() and run.data_path.stat().st_size > 0:
+            run.status = "recorded"
+        else:
+            run.status = "no-data"
+            if run.error is None:
+                run.error = "recorder stopped without producing a non-empty data file"
+
+    def _close_handles(self, run: HostKvmTraceRun) -> None:
+        for handle_name in ("stdout_handle", "stderr_handle"):
+            handle = getattr(run, handle_name)
+            if handle is not None:
+                handle.close()
+                setattr(run, handle_name, None)
+
+    def _finalize(self, run: HostKvmTraceRun) -> dict[str, Any]:
+        duration = None
+        if run.start_monotonic > 0.0:
+            duration = time.monotonic() - run.start_monotonic
+
+        for log_path in (run.stdout_path, run.stderr_path):
+            if not log_path.exists():
+                write_text(log_path, "")
+
+        artifacts = [
+            relpath(run.metadata_path),
+            relpath(run.stdout_path),
+            relpath(run.stderr_path),
+        ]
+        data_size = 0
+        if run.data_path.exists():
+            data_size = run.data_path.stat().st_size
+            artifacts.append(relpath(run.data_path))
+
+        entry: dict[str, Any] = {
+            "tool": run.tool,
+            "step": run.step_name,
+            "status": run.status,
+            "command": run.command,
+            "data_file": relpath(run.data_path),
+            "data_bytes": data_size,
+            "stdout_file": relpath(run.stdout_path),
+            "stderr_file": relpath(run.stderr_path),
+            "metadata_file": relpath(run.metadata_path),
+            "returncode": run.returncode,
+            "stopped_by": run.stopped_by,
+            "duration_seconds": duration,
+            "artifacts": artifacts,
+        }
+        if run.error:
+            entry["error"] = run.error
+        write_json(run.metadata_path, entry)
+        self.records.append(entry)
+        return entry
+
+
 def append_step(manifest: dict[str, Any], suite_dir: Path, step: dict[str, Any]) -> None:
     manifest["steps"].append(step)
     write_json(suite_dir / "manifest.json", manifest)
+
+
+def run_host_schedstat_probe(
+    args: argparse.Namespace,
+    suite_dir: Path,
+    wos_launcher: str,
+) -> dict[str, Any]:
+    step_name = "host-schedstat-wos-perf"
+    step_dir = suite_dir / step_name
+    step_dir.mkdir(parents=True, exist_ok=True)
+    result_path = step_dir / "result.json"
+    report_path = step_dir / "report.txt"
+
+    command = [
+        sys.executable,
+        str(BENCH_SCRIPTS / "schedstat_probe.py"),
+        "--output-json",
+        str(result_path),
+        "--output-text",
+        str(report_path),
+    ]
+    for qemu_pid in args.schedstat_qemu_pid:
+        command += ["--qemu-vm", qemu_pid]
+    if args.schedstat_auto_discover_qemu:
+        for vm_index in range(args.num_vms):
+            command += ["--auto-discover-vm", str(vm_index)]
+
+    if args.schedstat_duration > 0:
+        command += ["--duration", str(args.schedstat_duration)]
+    elif args.schedstat_command:
+        command += ["--", *shlex.split(args.schedstat_command)]
+    else:
+        command += [
+            "--",
+            str(REMOTE_SCRIPTS / "wos_ssh.sh"),
+            wos_launcher,
+            "/usr/bin/testprog",
+            "perf",
+            "--verbose",
+        ]
+
+    result = run_command(command)
+    write_text(step_dir / "command.log", step_log_text(result))
+
+    summary = json.loads(result_path.read_text(encoding="utf-8"))
+    return {
+        "name": step_name,
+        "ok": True,
+        "kind": "host-schedstat",
+        "os": "host",
+        "target_os": "wos",
+        "command": command,
+        "result_file": relpath(result_path),
+        "artifacts": [
+            relpath(result_path),
+            relpath(report_path),
+            relpath(step_dir / "command.log"),
+        ],
+        "summary": summary.get("summary", {}),
+    }
 
 
 def run_wos_mandelbench(
@@ -451,6 +833,12 @@ def run_wos_renderbench(
         command += ["--threads", str(args.wos_render_threads)]
     if args.render_debug_constant_tile_us > 0:
         command += ["--debug-constant-tile-us", str(args.render_debug_constant_tile_us)]
+    if args.render_debug_node_thread_batch_size > 0:
+        command += ["--debug-node-thread-batch-size", str(args.render_debug_node_thread_batch_size)]
+    if args.wos_coordinator_reserve_cpus is not None:
+        command += ["--coordinator-reserve-cpus", str(args.wos_coordinator_reserve_cpus)]
+    if args.wos_coordinator_skip_local_worker:
+        command += ["--coordinator-skip-local-worker"]
 
     result = run_command([str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, *command])
     write_text(step_dir / "command.log", step_log_text(result))
@@ -625,11 +1013,114 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Use renderbench's constant-rate synthetic tile mode with this per-tile delay in microseconds.",
     )
+    parser.add_argument(
+        "--render-debug-node-thread-batch-size",
+        type=int,
+        default=0,
+        help="Override renderbench's persistent node-thread batch size on WOS; 0 keeps auto sizing.",
+    )
     parser.add_argument("--wos-duck-scene", default="/srv/Duck.glb")
     parser.add_argument("--linux-duck-scene", default="configs/drive/srv/Duck.glb")
     parser.add_argument("--wos-render-threads", type=int)
+    parser.add_argument(
+        "--wos-coordinator-reserve-cpus",
+        type=int,
+        help="Reserve this many local launcher CPUs from WOS node-thread render workers; omit for renderbench default.",
+    )
+    parser.add_argument(
+        "--wos-coordinator-skip-local-worker",
+        action="store_true",
+        help="Do not run a WOS node-thread render worker on the local launcher host when remote workers exist.",
+    )
     parser.add_argument("--linux-render-threads", type=int)
     parser.add_argument("--linux-use-host-binary", action="store_true")
+    parser.add_argument(
+        "--host-kvm-trace",
+        default="none",
+        metavar="{none,perf,trace-cmd,both}",
+        help=(
+            "Opt-in host-side KVM tracing around each benchmark step. "
+            "Use 'perf', 'trace-cmd', 'both', or a comma-separated list."
+        ),
+    )
+    parser.add_argument(
+        "--host-kvm-perf-cmd",
+        default="perf",
+        help="Host perf command or wrapper used for --host-kvm-trace=perf.",
+    )
+    parser.add_argument(
+        "--host-kvm-perf-events",
+        default="kvm:*",
+        help="Host perf event selector for KVM tracing.",
+    )
+    parser.add_argument(
+        "--host-kvm-trace-cmd",
+        default="trace-cmd",
+        help="Host trace-cmd command or wrapper used for --host-kvm-trace=trace-cmd.",
+    )
+    parser.add_argument(
+        "--host-kvm-trace-events",
+        default="kvm",
+        help="Comma-separated trace-cmd event systems/events; default matches 'trace-cmd record -e kvm'.",
+    )
+    parser.add_argument(
+        "--host-kvm-trace-buffer-kb",
+        type=int,
+        default=20000,
+        help="trace-cmd per-CPU buffer size in KiB; default matches '-b 20000'.",
+    )
+    parser.add_argument(
+        "--host-kvm-trace-startup-grace",
+        type=float,
+        default=0.5,
+        help="Seconds to wait for host recorders to fail fast before running a benchmark step.",
+    )
+    parser.add_argument(
+        "--host-kvm-trace-stop-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds to wait for host recorders to flush after each benchmark step.",
+    )
+    parser.add_argument(
+        "--host-kvm-trace-max-seconds",
+        type=int,
+        default=86400,
+        help="Safety duration for perf's traced sleep command.",
+    )
+    parser.add_argument(
+        "--schedstat-probe",
+        action="store_true",
+        help=(
+            "Add an opt-in host-side schedstat diagnostic step for QEMU KVM vCPU threads. "
+            "Requires --schedstat-qemu-pid or --schedstat-auto-discover-qemu."
+        ),
+    )
+    parser.add_argument(
+        "--schedstat-qemu-pid",
+        action="append",
+        type=parse_schedstat_qemu_pid,
+        default=[],
+        metavar="VM:PID",
+        help="QEMU process to sample for --schedstat-probe, for example vm0:12345 or 0:12345. Repeat per VM.",
+    )
+    parser.add_argument(
+        "--schedstat-auto-discover-qemu",
+        action="store_true",
+        help="Explicitly discover WOS QEMU PIDs for vm0..vmN from host /proc command lines.",
+    )
+    parser.add_argument(
+        "--schedstat-command",
+        help=(
+            "Host command to run inside the schedstat step. Defaults to running "
+            "'/usr/bin/testprog perf --verbose' on the WOS launcher."
+        ),
+    )
+    parser.add_argument(
+        "--schedstat-duration",
+        type=float,
+        default=0.0,
+        help="Instead of running a command, sample QEMU vCPU schedstat for this many seconds.",
+    )
     parser.add_argument(
         "--skip-wos-cleanup",
         action="store_true",
@@ -658,9 +1149,36 @@ def main() -> int:
         parser.error("--linux-launcher-index must be within the VM count")
     if args.render_debug_constant_tile_us < 0:
         parser.error("--render-debug-constant-tile-us must be nonnegative")
+    if args.render_debug_node_thread_batch_size < 0:
+        parser.error("--render-debug-node-thread-batch-size must be nonnegative")
+    if args.wos_coordinator_reserve_cpus is not None and args.wos_coordinator_reserve_cpus < 0:
+        parser.error("--wos-coordinator-reserve-cpus must be nonnegative")
+    if args.host_kvm_trace_buffer_kb <= 0:
+        parser.error("--host-kvm-trace-buffer-kb must be greater than zero")
+    if args.host_kvm_trace_startup_grace < 0:
+        parser.error("--host-kvm-trace-startup-grace must be nonnegative")
+    if args.host_kvm_trace_stop_timeout <= 0:
+        parser.error("--host-kvm-trace-stop-timeout must be greater than zero")
+    if args.host_kvm_trace_max_seconds <= 0:
+        parser.error("--host-kvm-trace-max-seconds must be greater than zero")
+    if args.schedstat_duration < 0:
+        parser.error("--schedstat-duration must be nonnegative")
+    if args.schedstat_probe:
+        if not args.schedstat_qemu_pid and not args.schedstat_auto_discover_qemu:
+            parser.error("--schedstat-probe requires --schedstat-qemu-pid or --schedstat-auto-discover-qemu")
+        if args.schedstat_command and args.schedstat_duration > 0:
+            parser.error("--schedstat-command and --schedstat-duration are mutually exclusive")
+        if args.os == "linux" and not args.schedstat_command and args.schedstat_duration <= 0:
+            parser.error("--schedstat-probe with --os linux requires --schedstat-command or --schedstat-duration")
 
     try:
         placements = render_placements(args.render_placements)
+    except ValueError as exc:
+        parser.error(str(exc))
+    try:
+        args.host_kvm_trace_modes = parse_host_kvm_trace_modes(args.host_kvm_trace)
+        split_host_tool_command(args.host_kvm_perf_cmd)
+        split_host_tool_command(args.host_kvm_trace_cmd)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -690,37 +1208,60 @@ def main() -> int:
         "linux_launcher": linux_launcher,
         "steps": [],
     }
+    host_kvm_tracer = HostKvmTracer(args, suite_dir)
+    manifest["host_kvm_trace"] = host_kvm_tracer.config_summary()
     write_json(suite_dir / "manifest.json", manifest)
 
     failures = 0
 
-    def run_step(name: str, func: Any) -> None:
+    def attach_host_kvm_trace(step: dict[str, Any], trace_entries: list[dict[str, Any]]) -> None:
+        if not trace_entries:
+            return
+        step["host_kvm_trace"] = trace_entries
+        artifacts = step.setdefault("artifacts", [])
+        for entry in trace_entries:
+            artifacts.extend(entry.get("artifacts", []))
+
+    def run_step(name: str, func: Any, *, host_kvm_trace: bool = True) -> None:
         nonlocal failures
         print(f"[suite] {name}")
+        trace_session = host_kvm_tracer.start(name) if host_kvm_trace else None
         try:
             step = func()
         except Exception as exc:  # noqa: BLE001
             failures += 1
+            trace_entries = host_kvm_tracer.stop(trace_session)
             error_path = suite_dir / name / "error.txt"
             write_text(error_path, f"{exc}\n")
+            failed_step = {
+                "name": name,
+                "ok": False,
+                "error": str(exc),
+                "error_file": relpath(error_path),
+            }
+            attach_host_kvm_trace(failed_step, trace_entries)
             append_step(
                 manifest,
                 suite_dir,
-                {
-                    "name": name,
-                    "ok": False,
-                    "error": str(exc),
-                    "error_file": relpath(error_path),
-                },
+                failed_step,
             )
             print(f"[suite] {name} failed")
             return
 
+        trace_entries = host_kvm_tracer.stop(trace_session)
+        attach_host_kvm_trace(step, trace_entries)
         append_step(manifest, suite_dir, step)
         print(f"[suite] {name} complete")
 
     run_wos = args.os in {"both", "wos"}
     run_linux = args.os in {"both", "linux"}
+
+    if args.schedstat_probe:
+        run_step(
+            "host-schedstat-wos-perf",
+            lambda: run_host_schedstat_probe(args, suite_dir, wos_launcher),
+            host_kvm_trace=False,
+        )
 
     if not args.skip_mandelbench:
         if run_wos:
@@ -762,6 +1303,9 @@ def main() -> int:
                             placement,
                         ),
                     )
+
+    if host_kvm_tracer.enabled:
+        append_step(manifest, suite_dir, host_kvm_tracer.summary_step())
 
     print(str(suite_dir / "manifest.json"))
     return 0 if failures == 0 else 1

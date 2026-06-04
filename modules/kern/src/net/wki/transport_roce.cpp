@@ -10,6 +10,7 @@
 #include <net/netpoll.hpp>
 #include <net/packet.hpp>
 #include <net/proto/ethernet.hpp>
+#include <net/wki/remote_ipc.hpp>
 #include <net/wki/transport_eth.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -670,6 +671,12 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
 
             if (region_mark_write_complete(VAL)) {
                 break;
+            }
+
+            if ((VAL & WKI_DOORBELL_IPC_MASK) == WKI_DOORBELL_IPC_BASE) {
+                if (wki_ipc_doorbell_rx(hdr->src_node, VAL)) {
+                    break;
+                }
             }
 
             // Zone doorbell - dispatch to zone post handler

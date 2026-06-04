@@ -1,6 +1,10 @@
 #include "perfbench.hpp"
 
+#include <callnums/futex.h>
 #include <sys/multiproc.h>
+#include <sys/process.h>
+#include <sys/syscall.h>
+#include <time.h>
 
 #include <algorithm>
 #include <array>
@@ -112,6 +116,21 @@ auto spawn_thread(void* param) -> int {
 }
 
 constexpr uint64_t COUNTER_WAIT_TIMEOUT_NS = 5000000000ULL;
+constexpr long COUNTER_WAIT_SLEEP_NS = 100'000;
+
+auto atomic_int_addr(std::atomic<int>& value) -> int* { return reinterpret_cast<int*>(&value); }
+
+auto atomic_int_addr(std::atomic<int>* value) -> int* { return reinterpret_cast<int*>(value); }
+
+void futex_wait(std::atomic<int>* value, int expected) {
+    static_cast<void>(syscall(ker::abi::callnums::futex, static_cast<uint64_t>(ker::abi::futex::futex_ops::FUTEX_WAIT),
+                              reinterpret_cast<uint64_t>(atomic_int_addr(value)), static_cast<uint64_t>(expected), 0));
+}
+
+void futex_wake(std::atomic<int>& value) {
+    static_cast<void>(syscall(ker::abi::callnums::futex, static_cast<uint64_t>(ker::abi::futex::futex_ops::FUTEX_WAKE),
+                              reinterpret_cast<uint64_t>(atomic_int_addr(value))));
+}
 
 auto wait_for_counter(std::atomic<int>& counter, int expected, uint64_t timeout_ns) -> bool {
     uint64_t const START_NS = now_ns();
@@ -119,7 +138,8 @@ auto wait_for_counter(std::atomic<int>& counter, int expected, uint64_t timeout_
         if (now_ns() - START_NS > timeout_ns) {
             return false;
         }
-        thrd_yield();
+        timespec const REQ{.tv_sec = 0, .tv_nsec = COUNTER_WAIT_SLEEP_NS};
+        nanosleep(&REQ, nullptr);
     }
     return true;
 }
@@ -325,6 +345,8 @@ struct ParEffArg {
     int id;
     int threads;
     int iters;
+    int pid;
+    int tid;
     volatile uint64_t result;
     uint64_t start_ns;
     uint64_t end_ns;
@@ -335,7 +357,7 @@ struct ParEffArg {
     uint32_t cpu_changes;
     std::atomic<int>* ready_count;
     std::atomic<int>* done_count;
-    std::atomic<bool>* go;
+    std::atomic<int>* go;
 };
 
 auto cpu_bit(int cpu_id) -> uint64_t {
@@ -357,9 +379,11 @@ void note_cpu_sample(ParEffArg* arg, int current_cpu) {
 
 auto par_eff_thread(void* param) -> int {
     auto* a = static_cast<ParEffArg*>(param);
+    a->pid = static_cast<int>(ker::process::getpid());
+    a->tid = static_cast<int>(ker::multiproc::currentThreadId());
     a->ready_count->fetch_add(1, std::memory_order_release);
-    while (!a->go->load(std::memory_order_acquire)) {
-        thrd_yield();
+    while (a->go->load(std::memory_order_acquire) == 0) {
+        futex_wait(a->go, 0);
     }
     a->cpu_id = static_cast<int>(ker::multiproc::getcurrent_cpu());
     a->cpu_end_id = a->cpu_id;
@@ -426,10 +450,15 @@ void print_parallel_outliers(int n, const std::vector<ParEffArg>& args) {
         }
     }
 
-    std::println(stderr, "[perf]   parallel_workers[{}]: best=t{} c{} dur={:.2f}ms same_cpu={}  worst=t{} c{} dur={:.2f}ms same_cpu={}", n,
-                 min_idx, best_arg.cpu_id, min_dur_ms, best_same_cpu, max_idx, worst_arg.cpu_id, max_dur_ms, worst_same_cpu);
-    std::println(stderr, "[perf]   parallel_span[{}]:    start_skew={:.2f}ms total_span={:.2f}ms best_res={:#x} worst_res={:#x}", n,
-                 static_cast<double>(latest_start_ns - earliest_start_ns) / 1e6,
+    std::println(stderr,
+                 "[perf]   parallel_workers[{}]: best=t{} tid={} c{} dur={:.2f}ms same_cpu={}  "
+                 "worst=t{} tid={} c{} dur={:.2f}ms same_cpu={}",
+                 n, min_idx, best_arg.tid, best_arg.cpu_id, min_dur_ms, best_same_cpu, max_idx, worst_arg.tid, worst_arg.cpu_id, max_dur_ms,
+                 worst_same_cpu);
+    std::println(stderr,
+                 "[perf]   parallel_span[{}]:    start_ns={} end_ns={} start_skew={:.2f}ms total_span={:.2f}ms best_res={:#x} "
+                 "worst_res={:#x}",
+                 n, earliest_start_ns, latest_end_ns, static_cast<double>(latest_start_ns - earliest_start_ns) / 1e6,
                  static_cast<double>(latest_end_ns - earliest_start_ns) / 1e6, static_cast<unsigned long long>(best_arg.result),
                  static_cast<unsigned long long>(worst_arg.result));
     std::println(
@@ -437,6 +466,13 @@ void print_parallel_outliers(int n, const std::vector<ParEffArg>& args) {
         "[perf]   parallel_migrate[{}]: best=t{} cpus={} first=c{} last=c{} changes={}  worst=t{} cpus={} first=c{} last=c{} changes={}", n,
         min_idx, std::popcount(best_arg.cpu_mask), best_arg.cpu_id, best_arg.cpu_end_id, best_arg.cpu_changes, max_idx,
         std::popcount(worst_arg.cpu_mask), worst_arg.cpu_id, worst_arg.cpu_end_id, worst_arg.cpu_changes);
+    for (const auto& arg : args) {
+        double const DUR_MS = static_cast<double>(arg.end_ns - arg.start_ns) / 1e6;
+        std::println(stderr,
+                     "[perf]   parallel_worker[{}]: t{} pid={} tid={} c{}->c{} dur={:.2f}ms start_ns={} end_ns={} changes={} cpus={}", n,
+                     arg.id, arg.pid, arg.tid, arg.cpu_id, arg.cpu_end_id, DUR_MS, arg.start_ns, arg.end_ns, arg.cpu_changes,
+                     std::popcount(arg.cpu_mask));
+    }
 }
 
 struct PhaseProbeArg {
@@ -495,6 +531,73 @@ auto choose_spread_targets(int cpu_count, int worker_count) -> std::vector<int> 
     return targets;
 }
 
+struct CpuScanArg {
+    int iters = 0;
+    int cpu_start = -1;
+    int cpu_end = -1;
+    uint64_t start_ns = 0;
+    uint64_t end_ns = 0;
+    volatile uint64_t result = 0;
+};
+
+auto cpu_scan_thread(void* param) -> int {
+    auto* arg = static_cast<CpuScanArg*>(param);
+    arg->cpu_start = static_cast<int>(ker::multiproc::getcurrent_cpu());
+    arg->start_ns = now_ns();
+    uint64_t sum = 0x123456789abcdef0ULL ^ static_cast<uint64_t>(arg->cpu_start);
+    for (int i = 0; i < arg->iters; ++i) {
+        sum = scramble_work(sum, static_cast<uint64_t>(i));
+    }
+    arg->cpu_end = static_cast<int>(ker::multiproc::getcurrent_cpu());
+    arg->end_ns = now_ns();
+    arg->result = sum;
+    return 0;
+}
+
+auto create_thread_for_cpu(int cpu_total, int target_cpu, thrd_t& thread, CpuScanArg& arg) -> bool {
+    align_thread_create_phase(cpu_total);
+    int next_cpu = 0;
+    while (next_cpu != target_cpu) {
+        PhaseProbeArg dummy{.cpu_id = -1};
+        thrd_t dummy_thread{};
+        if (thrd_create(&dummy_thread, phase_probe_thread, &dummy) != THRD_SUCCESS) {
+            return false;
+        }
+        thrd_join(dummy_thread, nullptr);
+        next_cpu = (next_cpu + 1) % cpu_total;
+    }
+
+    return thrd_create(&thread, cpu_scan_thread, &arg) == THRD_SUCCESS;
+}
+
+void test_per_cpu_compute_scan(int iters) {
+    int const CPU_TOTAL = static_cast<int>(ker::multiproc::nativeThreadCount());
+    if (CPU_TOTAL <= 0) {
+        std::println(stderr, "[perf] cpu_scan:          unavailable (no CPUs reported)");
+        return;
+    }
+
+    int const PER_CPU_ITERS = std::max(1, iters / CPU_TOTAL);
+    std::print(stderr, "[perf] cpu_scan:          iters={} ", PER_CPU_ITERS);
+    for (int cpu = 0; cpu < CPU_TOTAL; ++cpu) {
+        CpuScanArg arg{.iters = PER_CPU_ITERS};
+        thrd_t thread{};
+        if (!create_thread_for_cpu(CPU_TOTAL, cpu, thread, arg)) {
+            std::print(stderr, "c{}=create-failed ", cpu);
+            continue;
+        }
+        thrd_join(thread, nullptr);
+
+        double const DUR_MS = static_cast<double>(arg.end_ns - arg.start_ns) / 1e6;
+        std::print(stderr, "c{}={:.2f}ms", cpu, DUR_MS);
+        if (arg.cpu_start != cpu || arg.cpu_end != cpu) {
+            std::print(stderr, "(ran c{}->c{})", arg.cpu_start, arg.cpu_end);
+        }
+        std::print(stderr, " ");
+    }
+    std::println(stderr);
+}
+
 constexpr uint64_t PARALLEL_READY_TIMEOUT_NS = 5000000000ULL;
 constexpr uint64_t PARALLEL_DONE_TIMEOUT_NS = 10000000000ULL;
 
@@ -522,7 +625,7 @@ auto test_parallel_efficiency(int iters, int repeats, bool verbose) -> bool {
         for (int repeat = 0; repeat < repeats; ++repeat) {
             std::atomic<int> ready_count{0};
             std::atomic<int> done_count{0};
-            std::atomic<bool> go{false};
+            std::atomic<int> go{0};
             auto target_cpus = choose_spread_targets(CPU_TOTAL, n);
             std::ranges::fill(threads, nullptr);
             int arg_id = 0;
@@ -530,6 +633,8 @@ auto test_parallel_efficiency(int iters, int repeats, bool verbose) -> bool {
                 arg = {.id = arg_id,
                        .threads = n,
                        .iters = iters,
+                       .pid = -1,
+                       .tid = -1,
                        .result = 0,
                        .start_ns = 0,
                        .end_ns = 0,
@@ -579,12 +684,14 @@ auto test_parallel_efficiency(int iters, int repeats, bool verbose) -> bool {
             }
             if (!wait_for_counter(ready_count, n, PARALLEL_READY_TIMEOUT_NS)) {
                 int const READY = ready_count.load(std::memory_order_acquire);
-                go.store(true, std::memory_order_release);
+                go.store(1, std::memory_order_release);
+                futex_wake(go);
                 std::println(stderr, "[perf] parallel_eff[{}]: FAILED (ready timeout repeat={} ready={}/{})", n, repeat + 1, READY, n);
                 return false;
             }
             uint64_t const T0 = now_ns();
-            go.store(true, std::memory_order_release);
+            go.store(1, std::memory_order_release);
+            futex_wake(go);
             if (!wait_for_counter(done_count, n, PARALLEL_DONE_TIMEOUT_NS)) {
                 int const DONE = done_count.load(std::memory_order_acquire);
                 std::println(stderr, "[perf] parallel_eff[{}]: FAILED (done timeout repeat={} done={}/{})", n, repeat + 1, DONE, n);
@@ -825,6 +932,11 @@ auto run_perf(int argc, char** argv) -> int {
 
     std::println(stderr, "[perf] --- context switch cost ---");
     test_context_switch();
+
+    if (options.verbose) {
+        std::println(stderr, "[perf] --- per-CPU compute scan ---");
+        test_per_cpu_compute_scan(options.parallel_iters);
+    }
 
     std::println(stderr, "[perf] --- parallel efficiency ---");
     if (!test_parallel_efficiency(options.parallel_iters, options.parallel_repeats, options.verbose)) {
