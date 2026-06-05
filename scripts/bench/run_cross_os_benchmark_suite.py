@@ -549,7 +549,8 @@ def append_step(manifest: dict[str, Any], suite_dir: Path, step: dict[str, Any])
 def attach_wos_cpustat(step: dict[str, Any], cpustat_entries: list[dict[str, Any]]) -> None:
     if not cpustat_entries:
         return
-    step["wos_perf_cpustat"] = cpustat_entries
+    existing = step.setdefault("wos_perf_cpustat", [])
+    existing.extend(cpustat_entries)
     artifacts = step.setdefault("artifacts", [])
     for entry in cpustat_entries:
         artifacts.extend(entry.get("artifacts", []))
@@ -559,11 +560,12 @@ def collect_wos_cpustat(
     args: argparse.Namespace,
     step_dir: Path,
     hosts: list[str],
+    phase: str,
 ) -> list[dict[str, Any]]:
     if not hosts:
         return []
 
-    cpustat_dir = step_dir / "perf-cpustat"
+    cpustat_dir = step_dir / "perf-cpustat" / phase
     cpustat_dir.mkdir(parents=True, exist_ok=True)
     captures: list[dict[str, Any]] = []
 
@@ -575,6 +577,7 @@ def collect_wos_cpustat(
         started = time.monotonic()
         entry: dict[str, Any] = {
             "host": host,
+            "phase": phase,
             "command": command,
             "stdout_file": relpath(stdout_path),
             "stderr_file": relpath(stderr_path),
@@ -1295,14 +1298,15 @@ def main() -> int:
     def run_step(name: str, func: Any, *, host_kvm_trace: bool = True) -> None:
         nonlocal failures
         print(f"[suite] {name}")
-        trace_session = host_kvm_tracer.start(name) if host_kvm_trace else None
         cpustat_hosts = wos_hosts if name.startswith("wos-") else []
+        pre_cpustat_entries = collect_wos_cpustat(args, suite_dir / name, cpustat_hosts, "before")
+        trace_session = host_kvm_tracer.start(name) if host_kvm_trace else None
         try:
             step = func()
         except Exception as exc:  # noqa: BLE001
             failures += 1
             trace_entries = host_kvm_tracer.stop(trace_session)
-            cpustat_entries = collect_wos_cpustat(args, suite_dir / name, cpustat_hosts)
+            post_cpustat_entries = collect_wos_cpustat(args, suite_dir / name, cpustat_hosts, "after")
             error_path = suite_dir / name / "error.txt"
             write_text(error_path, f"{exc}\n")
             failed_step = {
@@ -1312,7 +1316,8 @@ def main() -> int:
                 "error_file": relpath(error_path),
             }
             attach_host_kvm_trace(failed_step, trace_entries)
-            attach_wos_cpustat(failed_step, cpustat_entries)
+            attach_wos_cpustat(failed_step, pre_cpustat_entries)
+            attach_wos_cpustat(failed_step, post_cpustat_entries)
             append_step(
                 manifest,
                 suite_dir,
@@ -1322,13 +1327,15 @@ def main() -> int:
             return
 
         trace_entries = host_kvm_tracer.stop(trace_session)
-        cpustat_entries = collect_wos_cpustat(
+        post_cpustat_entries = collect_wos_cpustat(
             args,
             suite_dir / name,
             step.get("hosts", cpustat_hosts) if step.get("os") == "wos" else [],
+            "after",
         )
         attach_host_kvm_trace(step, trace_entries)
-        attach_wos_cpustat(step, cpustat_entries)
+        attach_wos_cpustat(step, pre_cpustat_entries)
+        attach_wos_cpustat(step, post_cpustat_entries)
         append_step(manifest, suite_dir, step)
         print(f"[suite] {name} complete")
 

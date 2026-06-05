@@ -83,10 +83,11 @@ QEMU discovery is ambiguous.
 ## Cross-OS WOS cpustat snapshots
 
 `scripts/bench/run_cross_os_benchmark_suite.py` now also captures WOS
-`/usr/bin/perf cpustat` output after each WOS benchmark step. The suite runs
-the probe against the WOS benchmark hosts, stores the outputs under the step's
-`perf-cpustat/` directory, and records the artifacts in that step's manifest
-entry under `wos_perf_cpustat`.
+`/usr/bin/perf cpustat` output before and after each WOS benchmark step. The
+suite runs the probe against the WOS benchmark hosts, stores the outputs under
+the step's `perf-cpustat/before/` and `perf-cpustat/after/` directories, and
+records the artifacts in that step's manifest entry under `wos_perf_cpustat`.
 
-These cpustat snapshots are diagnostic data and do not turn a completed WOS
-benchmark step into a failure if `perf cpustat` is unavailable or times out.
+Each cpustat record includes a `phase` field (`before` or `after`). These
+snapshots are diagnostic data and do not turn a completed WOS benchmark step
+into a failure if `perf cpustat` is unavailable or times out.
