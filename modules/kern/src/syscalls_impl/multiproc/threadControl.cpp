@@ -111,7 +111,6 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
                 return static_cast<uint64_t>(-ENOMEM);
             }
             uint64_t const TARGET_CPU = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % CPU_COUNT;
-            t->cpu = TARGET_CPU;
 
             bool const POSTED = mod::sched::post_task_for_cpu(TARGET_CPU, t);
             if (!POSTED) {

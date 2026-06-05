@@ -1629,7 +1629,6 @@ auto post_task_balanced(task::Task* task) -> bool {
     }
 
     uint64_t const TARGET_CPU = reserve_least_loaded_cpu(task);
-    task->cpu = TARGET_CPU;
     return post_task_for_cpu_impl(TARGET_CPU, task, true);
 }
 
@@ -1649,12 +1648,13 @@ auto current_cpu_for_task(task::Task* task) -> uint64_t {
         return UINT64_MAX;
     }
 
+    // Query-only helper: do not repair task->cpu here.  Owner repairs must stay
+    // explicit in migration/wakeup paths so stale-owner bugs remain visible.
     uint64_t const CORE_COUNT = smt::get_core_count();
     for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
         bool found = false;
-        run_queues->with_lock_void(cpu_no, [task, cpu_no, &found](RunQueue* rq) {
+        run_queues->with_lock_void(cpu_no, [task, &found](RunQueue* rq) {
             if (runqueue_task_is_reserved_locked(rq, task)) {
-                task->cpu = cpu_no;
                 found = true;
             }
         });
@@ -1670,18 +1670,18 @@ auto owner_cpu_for_task(task::Task* task) -> uint64_t {
         return UINT64_MAX;
     }
 
+    // Query-only helper: callers may use this for diagnostics or policy
+    // decisions, but it must not silently rewrite scheduler ownership.
     uint64_t const CORE_COUNT = smt::get_core_count();
     for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
         bool found = false;
-        run_queues->with_lock_void(cpu_no, [task, cpu_no, &found](RunQueue* rq) {
+        run_queues->with_lock_void(cpu_no, [task, &found](RunQueue* rq) {
             if (runqueue_task_is_reserved_locked(rq, task) || rq->runnable_heap.contains(task)) {
-                task->cpu = cpu_no;
                 found = true;
                 return;
             }
             for (task::Task* cur = rq->wait_list.head; cur != nullptr; cur = cur->sched_next) {
                 if (cur == task) {
-                    task->cpu = cpu_no;
                     found = true;
                     return;
                 }
