@@ -2239,6 +2239,60 @@ void cmd_cpustat() {
                      get_val("gc_pm_us="), get_val("gc_pm_max="), get_val("gc_thr_us="), get_val("gc_thr_max="), get_val("gc_misc_us="),
                      get_val("gc_misc_max="), get_val("gc_dbg_us="), get_val("gc_dbg_max="));
     }
+
+    std::println("");
+    std::println("{:>4}  {:>9}  {:>11}  {:>12}  {:>11}  {:>12}  {:>9}  {:>10}  {:>10}  {:>11}", "CPU", "dus_calls", "collect_us",
+                 "collect_max", "data_us", "data_max", "pt_us", "pt_max", "tlb_us", "tlb_max");
+    std::println("{:->4}  {:->9}  {:->11}  {:->12}  {:->11}  {:->12}  {:->9}  {:->10}  {:->10}  {:->11}", "", "", "", "", "", "", "", "",
+                 "", "");
+
+    pos = 0;
+    while (pos < buffer->size()) {
+        std::string_view line = next_line(*buffer, pos);
+        if (line.empty()) {
+            continue;
+        }
+
+        auto get_val = [&](std::string_view key) {
+            std::size_t key_pos = line.find(key);
+            if (key_pos == std::string_view::npos) {
+                return uint64_t{0};
+            }
+            key_pos += key.size();
+            std::size_t const END = line.find(' ', key_pos);
+            return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
+        };
+
+        std::println("{:>4}  {:>9}  {:>11}  {:>12}  {:>11}  {:>12}  {:>9}  {:>10}  {:>10}  {:>11}", get_val("cpu="), get_val("dus_calls="),
+                     get_val("dus_collect_us="), get_val("dus_collect_max="), get_val("dus_data_us="), get_val("dus_data_max="),
+                     get_val("dus_pt_us="), get_val("dus_pt_max="), get_val("dus_tlb_us="), get_val("dus_tlb_max="));
+    }
+
+    std::println("");
+    std::println("{:>4}  {:>10}  {:>10}  {:>10}  {:>11}  {:>15}  {:>11}", "CPU", "dus_leaf", "dus_refdec", "dus_ptfree", "huge_skip",
+                 "medium_skip", "dus_corrupt");
+    std::println("{:->4}  {:->10}  {:->10}  {:->10}  {:->11}  {:->15}  {:->11}", "", "", "", "", "", "", "");
+
+    pos = 0;
+    while (pos < buffer->size()) {
+        std::string_view line = next_line(*buffer, pos);
+        if (line.empty()) {
+            continue;
+        }
+
+        auto get_val = [&](std::string_view key) {
+            std::size_t key_pos = line.find(key);
+            if (key_pos == std::string_view::npos) {
+                return uint64_t{0};
+            }
+            key_pos += key.size();
+            std::size_t const END = line.find(' ', key_pos);
+            return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
+        };
+
+        std::println("{:>4}  {:>10}  {:>10}  {:>10}  {:>11}  {:>15}  {:>11}", get_val("cpu="), get_val("dus_leaf="), get_val("dus_refdec="),
+                     get_val("dus_ptfree="), get_val("dus_huge_skip="), get_val("dus_medium_skip="), get_val("dus_corrupt="));
+    }
 }
 
 void cmd_contstat() {

@@ -3,9 +3,11 @@
 #include <extern/limine.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
+#include <platform/interrupt/gdt.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -155,6 +157,114 @@ auto promote_user_write_path(PageTableEntry& pml4e, PageTableEntry& pml3e, PageT
 
 constexpr size_t KERNEL_PML4_START = 256;
 constexpr size_t KERNEL_PML4_END = 512;
+
+namespace {
+
+struct DestroyUserSpaceStatsAtomic {
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> collect_frames_us_total{0};
+    std::atomic<uint64_t> collect_frames_us_max{0};
+    std::atomic<uint64_t> free_data_us_total{0};
+    std::atomic<uint64_t> free_data_us_max{0};
+    std::atomic<uint64_t> free_pt_us_total{0};
+    std::atomic<uint64_t> free_pt_us_max{0};
+    std::atomic<uint64_t> tlb_flush_us_total{0};
+    std::atomic<uint64_t> tlb_flush_us_max{0};
+    std::atomic<uint64_t> data_leaf_entries_visited{0};
+    std::atomic<uint64_t> data_pages_ref_decremented{0};
+    std::atomic<uint64_t> page_table_pages_freed{0};
+    std::atomic<uint64_t> skipped_huge_pages{0};
+    std::atomic<uint64_t> skipped_medium_alloc_frames{0};
+    std::atomic<uint64_t> skipped_corrupt_entries{0};
+};
+
+struct DestroyUserSpaceCallStats {
+    uint64_t collect_frames_us = 0;
+    uint64_t free_data_us = 0;
+    uint64_t free_pt_us = 0;
+    uint64_t tlb_flush_us = 0;
+    uint64_t data_leaf_entries_visited = 0;
+    uint64_t data_pages_ref_decremented = 0;
+    uint64_t page_table_pages_freed = 0;
+    uint64_t skipped_huge_pages = 0;
+    uint64_t skipped_medium_alloc_frames = 0;
+    uint64_t skipped_corrupt_entries = 0;
+};
+
+enum class DestroyUserSpacePhase : uint8_t {
+    COLLECT_FRAMES = 0,
+    FREE_DATA = 1,
+    FREE_PAGE_TABLES = 2,
+    TLB_FLUSH = 3,
+    DONE = 4,
+};
+
+struct DestroyWalkFrame {
+    PageTable* table = nullptr;
+    uint64_t vaddr_base = 0;
+    uint64_t phys_addr = 0;
+    uint16_t next_index = 0;
+    int8_t level = 0;
+};
+
+std::array<DestroyUserSpaceStatsAtomic, desc::gdt::MAX_CPUS>
+    g_destroy_user_space_stats{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+inline void update_relaxed_max(std::atomic<uint64_t>& slot, uint64_t value) {
+    uint64_t current = slot.load(std::memory_order_relaxed);
+    while (value > current && !slot.compare_exchange_weak(current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+inline auto elapsed_us_since(uint64_t start_us, uint64_t end_us) -> uint64_t { return end_us >= start_us ? end_us - start_us : 0; }
+
+void note_destroy_user_space_stats(DestroyUserSpaceCallStats const& sample) {
+    uint64_t cpu_no = 0;
+    if (smt::has_cpu_data()) {
+        cpu_no = cpu::current_cpu();
+    }
+    if (cpu_no >= g_destroy_user_space_stats.size()) {
+        return;
+    }
+
+    auto& stats = g_destroy_user_space_stats.at(static_cast<size_t>(cpu_no));
+    stats.calls.fetch_add(1, std::memory_order_relaxed);
+    stats.collect_frames_us_total.fetch_add(sample.collect_frames_us, std::memory_order_relaxed);
+    update_relaxed_max(stats.collect_frames_us_max, sample.collect_frames_us);
+    stats.free_data_us_total.fetch_add(sample.free_data_us, std::memory_order_relaxed);
+    update_relaxed_max(stats.free_data_us_max, sample.free_data_us);
+    stats.free_pt_us_total.fetch_add(sample.free_pt_us, std::memory_order_relaxed);
+    update_relaxed_max(stats.free_pt_us_max, sample.free_pt_us);
+    stats.tlb_flush_us_total.fetch_add(sample.tlb_flush_us, std::memory_order_relaxed);
+    update_relaxed_max(stats.tlb_flush_us_max, sample.tlb_flush_us);
+    stats.data_leaf_entries_visited.fetch_add(sample.data_leaf_entries_visited, std::memory_order_relaxed);
+    stats.data_pages_ref_decremented.fetch_add(sample.data_pages_ref_decremented, std::memory_order_relaxed);
+    stats.page_table_pages_freed.fetch_add(sample.page_table_pages_freed, std::memory_order_relaxed);
+    stats.skipped_huge_pages.fetch_add(sample.skipped_huge_pages, std::memory_order_relaxed);
+    stats.skipped_medium_alloc_frames.fetch_add(sample.skipped_medium_alloc_frames, std::memory_order_relaxed);
+    stats.skipped_corrupt_entries.fetch_add(sample.skipped_corrupt_entries, std::memory_order_relaxed);
+}
+
+void note_destroy_user_space_phase_time(DestroyUserSpaceCallStats& sample, DestroyUserSpacePhase phase, uint64_t elapsed_us) {
+    switch (phase) {
+        case DestroyUserSpacePhase::COLLECT_FRAMES:
+            sample.collect_frames_us += elapsed_us;
+            break;
+        case DestroyUserSpacePhase::FREE_DATA:
+            sample.free_data_us += elapsed_us;
+            break;
+        case DestroyUserSpacePhase::FREE_PAGE_TABLES:
+            sample.free_pt_us += elapsed_us;
+            break;
+        case DestroyUserSpacePhase::TLB_FLUSH:
+            sample.tlb_flush_us += elapsed_us;
+            break;
+        case DestroyUserSpacePhase::DONE:
+            break;
+    }
+}
+
+}  // namespace
 
 namespace {
 void refresh_kernel_mappings(PageTable* page_table) {
@@ -1093,7 +1203,61 @@ struct PageTableFrameSet {
     }
 };
 
-void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& frames) {
+}  // namespace
+
+struct DestroyUserSpaceBudgetState {
+    PageTable* pagemap = nullptr;
+    uint64_t owner_pid = 0;
+    const char* owner_name = nullptr;
+    const char* reason = nullptr;
+    DestroyUserSpacePhase phase = DestroyUserSpacePhase::DONE;
+    PageTableFrameSet page_table_frames{};
+    std::array<DestroyWalkFrame, 4> stack{};
+    size_t stack_size = 0;
+};
+
+namespace {
+
+void destroy_state_reset_walk(DestroyUserSpaceBudgetState& state, DestroyUserSpacePhase next_phase) {
+    state.phase = next_phase;
+    state.stack_size = 0;
+    if (next_phase == DestroyUserSpacePhase::DONE || next_phase == DestroyUserSpacePhase::TLB_FLUSH || state.pagemap == nullptr) {
+        return;
+    }
+
+    state.stack.at(0) = DestroyWalkFrame{
+        .table = state.pagemap,
+        .vaddr_base = 0,
+        .phys_addr = 0,
+        .next_index = 0,
+        .level = 4,
+    };
+    state.stack_size = 1;
+}
+
+auto destroy_state_push(DestroyUserSpaceBudgetState& state, PageTable* table, int level, uint64_t vaddr_base, uint64_t phys_addr) -> bool {
+    if (state.stack_size >= state.stack.size()) {
+        return false;
+    }
+    state.stack.at(state.stack_size++) = DestroyWalkFrame{
+        .table = table,
+        .vaddr_base = vaddr_base,
+        .phys_addr = phys_addr,
+        .next_index = 0,
+        .level = static_cast<int8_t>(level),
+    };
+    return true;
+}
+
+auto destroy_state_top(DestroyUserSpaceBudgetState& state) -> DestroyWalkFrame& { return state.stack.at(state.stack_size - 1); }
+
+void destroy_state_pop(DestroyUserSpaceBudgetState& state) {
+    if (state.stack_size > 0) {
+        state.stack_size--;
+    }
+}
+
+void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& frames, DestroyUserSpaceCallStats* stats) {
     if (table == nullptr || level < 1) {
         return;
     }
@@ -1108,16 +1272,225 @@ void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& f
         }
 
         uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
-        if (PHYS_ADDR == 0 || level <= 1 || entry.pagesize != 0 || frame_is_live_medium_alloc(PHYS_ADDR)) {
+        if (PHYS_ADDR == 0 || level <= 1) {
+            continue;
+        }
+        if (entry.pagesize != 0) {
+            if (stats != nullptr) {
+                stats->skipped_huge_pages++;
+            }
+            continue;
+        }
+        if (frame_is_live_medium_alloc(PHYS_ADDR)) {
+            if (stats != nullptr) {
+                stats->skipped_medium_alloc_frames++;
+            }
             continue;
         }
 
         frames.add(PHYS_ADDR);
         auto* next_level = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(PHYS_ADDR));
         if (next_level != nullptr) {
-            collect_page_table_frames(next_level, level - 1, frames);
+            collect_page_table_frames(next_level, level - 1, frames, stats);
         }
     }
+}
+
+auto advance_collect_frames_budgeted(DestroyUserSpaceBudgetState& state, DestroyUserSpaceCallStats& stats) -> bool {
+    while (state.stack_size > 0) {
+        auto& frame = destroy_state_top(state);
+        size_t const MAX_ENTRY = frame.level == 4 ? 256 : 512;
+        if (frame.next_index >= MAX_ENTRY) {
+            destroy_state_pop(state);
+            continue;
+        }
+
+        size_t const INDEX = frame.next_index++;
+        auto const& entry = entry_at(frame.table, INDEX);
+        if (entry.present == 0) {
+            continue;
+        }
+
+        uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
+        if (PHYS_ADDR == 0 || frame.level <= 1) {
+            return true;
+        }
+        if (entry.pagesize != 0) {
+            stats.skipped_huge_pages++;
+            return true;
+        }
+        if (frame_is_live_medium_alloc(PHYS_ADDR)) {
+            stats.skipped_medium_alloc_frames++;
+            return true;
+        }
+
+        state.page_table_frames.add(PHYS_ADDR);
+        auto* next_level = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(PHYS_ADDR));
+        if (next_level != nullptr) {
+            (void)destroy_state_push(state, next_level, frame.level - 1, 0, PHYS_ADDR);
+        }
+        return true;
+    }
+
+    destroy_state_reset_walk(state, DestroyUserSpacePhase::FREE_DATA);
+    return false;
+}
+
+auto advance_free_data_budgeted(DestroyUserSpaceBudgetState& state, DestroyUserSpaceCallStats& stats) -> bool {
+    while (state.stack_size > 0) {
+        auto& frame = destroy_state_top(state);
+        size_t const MAX_ENTRY = frame.level == 4 ? 256 : 512;
+        if (frame.next_index >= MAX_ENTRY) {
+            destroy_state_pop(state);
+            continue;
+        }
+
+        size_t const INDEX = frame.next_index++;
+        auto& entry = entry_at(frame.table, INDEX);
+        if (entry.present == 0) {
+            continue;
+        }
+
+        uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
+        if (PHYS_ADDR == 0) {
+            continue;
+        }
+
+        int const LEVEL_SHIFT = 12 + (9 * (frame.level - 1));
+        uint64_t const ENTRY_VADDR = frame.vaddr_base | (static_cast<uint64_t>(INDEX) << LEVEL_SHIFT);
+
+        if (frame.level > 1) {
+            if (entry.pagesize != 0) {
+                stats.skipped_huge_pages++;
+                entry = paging::purge_page_table_entry();
+                return true;
+            }
+            if (frame_is_live_medium_alloc(PHYS_ADDR)) {
+                stats.skipped_medium_alloc_frames++;
+                entry = paging::purge_page_table_entry();
+                return true;
+            }
+
+            uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
+            if ((VIRT_RAW >> CANONICAL_SIGN_BIT) != CANONICAL_KERNEL_UPPER) {
+                stats.skipped_corrupt_entries++;
+                log::warn(
+                    "free_user_data_pages: pid=%lu name=%s reason=%s pagemap=%p level=%d i=%zu vaddr=0x%llx frame=0x%llx phys=0x%llx "
+                    "virt=0x%llx corrupt non-canonical next-level pointer",
+                    state.owner_pid, state.owner_name != nullptr ? state.owner_name : "?", state.reason != nullptr ? state.reason : "?",
+                    static_cast<void*>(state.pagemap), frame.level, INDEX, static_cast<unsigned long long>(ENTRY_VADDR),
+                    static_cast<unsigned long long>(entry.frame), static_cast<unsigned long long>(PHYS_ADDR),
+                    static_cast<unsigned long long>(VIRT_RAW));
+                entry = paging::purge_page_table_entry();
+                return true;
+            }
+
+            auto* next_level = reinterpret_cast<PageTable*>(VIRT_RAW);
+            (void)destroy_state_push(state, next_level, frame.level - 1, ENTRY_VADDR, PHYS_ADDR);
+            return true;
+        }
+
+        stats.data_leaf_entries_visited++;
+        if (!state.page_table_frames.contains(state.pagemap, PHYS_ADDR) && !frame_is_live_medium_alloc(PHYS_ADDR)) {
+            uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
+            if ((VIRT_RAW >> CANONICAL_SIGN_BIT) == CANONICAL_KERNEL_UPPER) {
+                void* page_virt = reinterpret_cast<void*>(VIRT_RAW);
+                constexpr uint32_t SLAB_MAGIC = 0x8CBEEFC8;
+                if (*reinterpret_cast<const uint32_t*>(VIRT_RAW) == SLAB_MAGIC) {
+                    stats.skipped_corrupt_entries++;
+                    log::warn(
+                        "free_user_data_pages: pid=%lu name=%s reason=%s pagemap=%p level=%d i=%zu vaddr=0x%llx frame=0x%llx "
+                        "phys=0x%llx hits live slab; skipping refDec",
+                        state.owner_pid, state.owner_name != nullptr ? state.owner_name : "?", state.reason != nullptr ? state.reason : "?",
+                        static_cast<void*>(state.pagemap), frame.level, INDEX, static_cast<unsigned long long>(ENTRY_VADDR),
+                        static_cast<unsigned long long>(entry.frame), static_cast<unsigned long long>(PHYS_ADDR));
+                    debug_log_user_phys_mappings(PHYS_ADDR, state.reason, state.owner_pid, state.owner_name, true);
+                    entry = paging::purge_page_table_entry();
+                    return true;
+                }
+                phys::page_ref_dec(page_virt);
+                stats.data_pages_ref_decremented++;
+            } else {
+                stats.skipped_corrupt_entries++;
+                log::warn(
+                    "free_user_data_pages: pid=%lu name=%s reason=%s pagemap=%p level=%d i=%zu vaddr=0x%llx frame=0x%llx phys=0x%llx "
+                    "virt=0x%llx non-canonical leaf frame; skipping refDec",
+                    state.owner_pid, state.owner_name != nullptr ? state.owner_name : "?", state.reason != nullptr ? state.reason : "?",
+                    static_cast<void*>(state.pagemap), frame.level, INDEX, static_cast<unsigned long long>(ENTRY_VADDR),
+                    static_cast<unsigned long long>(entry.frame), static_cast<unsigned long long>(PHYS_ADDR),
+                    static_cast<unsigned long long>(VIRT_RAW));
+            }
+        } else if (frame_is_live_medium_alloc(PHYS_ADDR)) {
+            stats.skipped_medium_alloc_frames++;
+        }
+        entry = paging::purge_page_table_entry();
+        return true;
+    }
+
+    destroy_state_reset_walk(state, DestroyUserSpacePhase::FREE_PAGE_TABLES);
+    return false;
+}
+
+auto advance_free_page_tables_budgeted(DestroyUserSpaceBudgetState& state, DestroyUserSpaceCallStats& stats) -> bool {
+    while (state.stack_size > 0) {
+        auto& frame = destroy_state_top(state);
+        size_t const MAX_ENTRY = frame.level == 4 ? 256 : 512;
+        if (frame.next_index >= MAX_ENTRY) {
+            PageTable* table = frame.table;
+            uint64_t const PHYS_ADDR = frame.phys_addr;
+            int const LEVEL = frame.level;
+            destroy_state_pop(state);
+            if (LEVEL < 4 && PHYS_ADDR != 0) {
+                phys::page_ref_dec(table);
+                stats.page_table_pages_freed++;
+                return true;
+            }
+            continue;
+        }
+
+        size_t const INDEX = frame.next_index++;
+        auto& entry = entry_at(frame.table, INDEX);
+        if (entry.present == 0) {
+            continue;
+        }
+
+        uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
+        if (PHYS_ADDR == 0) {
+            continue;
+        }
+
+        int const LEVEL_SHIFT = 12 + (9 * (frame.level - 1));
+        uint64_t const ENTRY_VADDR = frame.vaddr_base | (static_cast<uint64_t>(INDEX) << LEVEL_SHIFT);
+
+        if (frame.level > 1 && entry.pagesize == 0 && !frame_is_live_medium_alloc(PHYS_ADDR)) {
+            uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
+            if ((VIRT_RAW >> CANONICAL_SIGN_BIT) != CANONICAL_KERNEL_UPPER) {
+                stats.skipped_corrupt_entries++;
+                log::warn(
+                    "corrupt PTE in free_page_table_pages: level=%d i=%zu vaddr=0x%llx frame=0x%llx phys=0x%llx virt=0x%llx, clearing",
+                    frame.level, INDEX, static_cast<unsigned long long>(ENTRY_VADDR), static_cast<unsigned long long>(entry.frame),
+                    static_cast<unsigned long long>(PHYS_ADDR), static_cast<unsigned long long>(VIRT_RAW));
+                entry = paging::purge_page_table_entry();
+                return true;
+            }
+
+            auto* next_level = reinterpret_cast<PageTable*>(VIRT_RAW);
+            entry = paging::purge_page_table_entry();
+            (void)destroy_state_push(state, next_level, frame.level - 1, ENTRY_VADDR, PHYS_ADDR);
+            return true;
+        }
+
+        if (frame.level > 1 && entry.pagesize != 0) {
+            stats.skipped_huge_pages++;
+        } else if (frame.level > 1 && frame_is_live_medium_alloc(PHYS_ADDR)) {
+            stats.skipped_medium_alloc_frames++;
+        }
+        entry = paging::purge_page_table_entry();
+        return true;
+    }
+
+    state.phase = DestroyUserSpacePhase::TLB_FLUSH;
+    return false;
 }
 
 constexpr bool ENABLE_WATCHED_MMAP_LOGS = false;
@@ -1281,8 +1654,9 @@ bool debug_log_user_phys_mappings(uint64_t target_phys, const char* trigger, uin
 
 namespace {
 
-void free_user_data_pages(PageTable* table, int level, PageTable* root, const PageTableFrameSet& page_table_frames, uint64_t vaddr_base = 0,
-                          uint64_t owner_pid = 0, const char* owner_name = nullptr, const char* reason = nullptr) {
+void free_user_data_pages(PageTable* table, int level, PageTable* root, const PageTableFrameSet& page_table_frames,
+                          DestroyUserSpaceCallStats* stats, uint64_t vaddr_base = 0, uint64_t owner_pid = 0,
+                          const char* owner_name = nullptr, const char* reason = nullptr) {
     if (table == nullptr || level < 1) {
         return;
     }
@@ -1311,11 +1685,20 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
             // Check for huge pages (2MB at level 2, 1GB at level 3)
             if (entry.pagesize != 0) {
                 // Preserve existing behavior: huge user mappings are not currently reclaimed here.
+                if (stats != nullptr) {
+                    stats->skipped_huge_pages++;
+                }
             } else if (frame_is_live_medium_alloc(PHYS_ADDR)) {
+                if (stats != nullptr) {
+                    stats->skipped_medium_alloc_frames++;
+                }
                 entry = paging::purge_page_table_entry();
             } else {
                 uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
                 if ((VIRT_RAW >> CANONICAL_SIGN_BIT) != CANONICAL_KERNEL_UPPER) {
+                    if (stats != nullptr) {
+                        stats->skipped_corrupt_entries++;
+                    }
                     log::warn(
                         "free_user_data_pages: pid=%lu name=%s reason=%s pagemap=%p level=%d i=%zu vaddr=0x%llx frame=0x%llx phys=0x%llx "
                         "virt=0x%llx "
@@ -1327,10 +1710,13 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
                     continue;
                 }
                 auto* next_level = reinterpret_cast<PageTable*>(VIRT_RAW);
-                free_user_data_pages(next_level, level - 1, root, page_table_frames, ENTRY_VADDR, owner_pid, owner_name, reason);
+                free_user_data_pages(next_level, level - 1, root, page_table_frames, stats, ENTRY_VADDR, owner_pid, owner_name, reason);
             }
         } else {
             // Level 1 (PML1) - entries point to actual data pages
+            if (stats != nullptr) {
+                stats->data_leaf_entries_visited++;
+            }
             //
             // Some corrupted/recursive user mappings can point back at this
             // address space's own page-table frames. Freeing such a frame as
@@ -1347,6 +1733,9 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
                     // the refDec here so the slab page is never freed out from under the chain.
                     constexpr uint32_t SLAB_MAGIC = 0x8CBEEFC8;
                     if (*reinterpret_cast<const uint32_t*>(VIRT_RAW) == SLAB_MAGIC) {
+                        if (stats != nullptr) {
+                            stats->skipped_corrupt_entries++;
+                        }
                         log::warn(
                             "free_user_data_pages: pid=%lu name=%s reason=%s pagemap=%p level=%d i=%zu vaddr=0x%llx frame=0x%llx "
                             "phys=0x%llx hits live slab; "
@@ -1359,7 +1748,13 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
                         continue;
                     }
                     phys::page_ref_dec(page_virt);
+                    if (stats != nullptr) {
+                        stats->data_pages_ref_decremented++;
+                    }
                 } else {
+                    if (stats != nullptr) {
+                        stats->skipped_corrupt_entries++;
+                    }
                     log::warn(
                         "free_user_data_pages: pid=%lu name=%s reason=%s pagemap=%p level=%d i=%zu vaddr=0x%llx frame=0x%llx phys=0x%llx "
                         "virt=0x%llx "
@@ -1368,6 +1763,8 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
                         level, i, static_cast<unsigned long long>(ENTRY_VADDR), static_cast<unsigned long long>(entry.frame),
                         static_cast<unsigned long long>(PHYS_ADDR), static_cast<unsigned long long>(VIRT_RAW));
                 }
+            } else if (frame_is_live_medium_alloc(PHYS_ADDR) && stats != nullptr) {
+                stats->skipped_medium_alloc_frames++;
             }
             entry = paging::purge_page_table_entry();
         }
@@ -1377,7 +1774,7 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
 // Helper to free a page table level recursively after user data pages are gone.
 // level: 4=PML4, 3=PML3, 2=PML2, 1=PML1
 // vaddr_base: accumulated virtual address bits from outer levels (for diagnostics)
-void free_page_table_pages(PageTable* table, int level, uint64_t vaddr_base = 0) {
+void free_page_table_pages(PageTable* table, int level, DestroyUserSpaceCallStats* stats, uint64_t vaddr_base = 0) {
     if (table == nullptr || level < 1) {
         return;
     }
@@ -1405,6 +1802,9 @@ void free_page_table_pages(PageTable* table, int level, uint64_t vaddr_base = 0)
         if (level > 1 && entry.pagesize == 0 && !frame_is_live_medium_alloc(PHYS_ADDR)) {
             uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
             if ((VIRT_RAW >> CANONICAL_SIGN_BIT) != CANONICAL_KERNEL_UPPER) {
+                if (stats != nullptr) {
+                    stats->skipped_corrupt_entries++;
+                }
                 log::warn(
                     "corrupt PTE in free_page_table_pages: level=%d i=%zu vaddr=0x%llx frame=0x%llx phys=0x%llx virt=0x%llx, "
                     "clearing",
@@ -1414,8 +1814,17 @@ void free_page_table_pages(PageTable* table, int level, uint64_t vaddr_base = 0)
                 continue;
             }
             auto* next_level = reinterpret_cast<PageTable*>(VIRT_RAW);
-            free_page_table_pages(next_level, level - 1, ENTRY_VADDR);
+            free_page_table_pages(next_level, level - 1, stats, ENTRY_VADDR);
             phys::page_ref_dec(next_level);
+            if (stats != nullptr) {
+                stats->page_table_pages_freed++;
+            }
+        } else if (level > 1 && entry.pagesize != 0) {
+            if (stats != nullptr) {
+                stats->skipped_huge_pages++;
+            }
+        } else if (level > 1 && frame_is_live_medium_alloc(PHYS_ADDR) && stats != nullptr) {
+            stats->skipped_medium_alloc_frames++;
         }
 
         entry = paging::purge_page_table_entry();
@@ -1424,10 +1833,88 @@ void free_page_table_pages(PageTable* table, int level, uint64_t vaddr_base = 0)
 
 }  // namespace
 
+auto create_destroy_user_space_budget_state(PageTable* pagemap, uint64_t owner_pid, const char* owner_name, const char* reason)
+    -> DestroyUserSpaceBudgetState* {
+    if (pagemap == nullptr) {
+        return nullptr;
+    }
+
+    auto* state = new DestroyUserSpaceBudgetState{};
+    if (state == nullptr) {
+        return nullptr;
+    }
+
+    state->pagemap = pagemap;
+    state->owner_pid = owner_pid;
+    state->owner_name = owner_name;
+    state->reason = reason;
+    state->phase = DestroyUserSpacePhase::COLLECT_FRAMES;
+    state->page_table_frames.add(reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(pagemap))));
+    destroy_state_reset_walk(*state, DestroyUserSpacePhase::COLLECT_FRAMES);
+    return state;
+}
+
+auto destroy_user_space_budgeted(DestroyUserSpaceBudgetState* state, uint32_t max_steps) -> bool {
+    if (state == nullptr) {
+        return true;
+    }
+    if (state->phase == DestroyUserSpacePhase::DONE) {
+        return true;
+    }
+    if (max_steps == 0) {
+        return false;
+    }
+
+    DestroyUserSpaceCallStats stats{};
+    DestroyUserSpacePhase phase = state->phase;
+    uint64_t phase_started_us = time::get_us();
+    uint32_t steps = 0;
+
+    while (steps < max_steps && state->phase != DestroyUserSpacePhase::DONE) {
+        if (state->phase != phase) {
+            uint64_t const NOW_US = time::get_us();
+            note_destroy_user_space_phase_time(stats, phase, elapsed_us_since(phase_started_us, NOW_US));
+            phase = state->phase;
+            phase_started_us = NOW_US;
+        }
+
+        bool consumed_step = false;
+        switch (state->phase) {
+            case DestroyUserSpacePhase::COLLECT_FRAMES:
+                consumed_step = advance_collect_frames_budgeted(*state, stats);
+                break;
+            case DestroyUserSpacePhase::FREE_DATA:
+                consumed_step = advance_free_data_budgeted(*state, stats);
+                break;
+            case DestroyUserSpacePhase::FREE_PAGE_TABLES:
+                consumed_step = advance_free_page_tables_budgeted(*state, stats);
+                break;
+            case DestroyUserSpacePhase::TLB_FLUSH:
+                wrcr3(rdcr3());
+                state->phase = DestroyUserSpacePhase::DONE;
+                consumed_step = true;
+                break;
+            case DestroyUserSpacePhase::DONE:
+                break;
+        }
+
+        if (consumed_step) {
+            steps++;
+        }
+    }
+
+    note_destroy_user_space_phase_time(stats, phase, elapsed_us_since(phase_started_us, time::get_us()));
+    note_destroy_user_space_stats(stats);
+    return state->phase == DestroyUserSpacePhase::DONE;
+}
+
+void destroy_user_space_budget_state_destroy(DestroyUserSpaceBudgetState* state) { delete state; }
+
 void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owner_name, const char* reason) {
     if (pagemap == nullptr) {
         return;
     }
+    DestroyUserSpaceCallStats stats{};
 #ifdef ELF_DEBUG
     if (owner_pid != 0) {
         log::trace("destroyUserSpace: begin pid=%lu name=%s reason=%s pagemap=%p", owner_pid, owner_name != nullptr ? owner_name : "?",
@@ -1439,18 +1926,54 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owne
     // aliases a page-table frame cannot free that frame before the page-table
     // walk reaches it.
     PageTableFrameSet page_table_frames{};
-    collect_page_table_frames(pagemap, 4, page_table_frames);
-    free_user_data_pages(pagemap, 4, pagemap, page_table_frames, 0, owner_pid, owner_name, reason);
-    free_page_table_pages(pagemap, 4);
+    uint64_t phase_start_us = time::get_us();
+    collect_page_table_frames(pagemap, 4, page_table_frames, &stats);
+    stats.collect_frames_us = elapsed_us_since(phase_start_us, time::get_us());
+
+    phase_start_us = time::get_us();
+    free_user_data_pages(pagemap, 4, pagemap, page_table_frames, &stats, 0, owner_pid, owner_name, reason);
+    stats.free_data_us = elapsed_us_since(phase_start_us, time::get_us());
+
+    phase_start_us = time::get_us();
+    free_page_table_pages(pagemap, 4, &stats);
+    stats.free_pt_us = elapsed_us_since(phase_start_us, time::get_us());
 
     // Invalidate TLB for this address space
+    phase_start_us = time::get_us();
     wrcr3(rdcr3());
+    stats.tlb_flush_us = elapsed_us_since(phase_start_us, time::get_us());
+    note_destroy_user_space_stats(stats);
 #ifdef ELF_DEBUG
     if (owner_pid != 0) {
         log::trace("destroyUserSpace: end pid=%lu reason=%s pagemap=%p", owner_pid, reason != nullptr ? reason : "?",
                    static_cast<void*>(pagemap));
     }
 #endif
+}
+
+auto get_destroy_user_space_stats(uint64_t cpu_no) -> DestroyUserSpaceStats {
+    if (cpu_no >= g_destroy_user_space_stats.size()) {
+        return {};
+    }
+
+    auto const& stats = g_destroy_user_space_stats.at(static_cast<size_t>(cpu_no));
+    return {
+        .calls = stats.calls.load(std::memory_order_relaxed),
+        .collect_frames_us_total = stats.collect_frames_us_total.load(std::memory_order_relaxed),
+        .collect_frames_us_max = stats.collect_frames_us_max.load(std::memory_order_relaxed),
+        .free_data_us_total = stats.free_data_us_total.load(std::memory_order_relaxed),
+        .free_data_us_max = stats.free_data_us_max.load(std::memory_order_relaxed),
+        .free_pt_us_total = stats.free_pt_us_total.load(std::memory_order_relaxed),
+        .free_pt_us_max = stats.free_pt_us_max.load(std::memory_order_relaxed),
+        .tlb_flush_us_total = stats.tlb_flush_us_total.load(std::memory_order_relaxed),
+        .tlb_flush_us_max = stats.tlb_flush_us_max.load(std::memory_order_relaxed),
+        .data_leaf_entries_visited = stats.data_leaf_entries_visited.load(std::memory_order_relaxed),
+        .data_pages_ref_decremented = stats.data_pages_ref_decremented.load(std::memory_order_relaxed),
+        .page_table_pages_freed = stats.page_table_pages_freed.load(std::memory_order_relaxed),
+        .skipped_huge_pages = stats.skipped_huge_pages.load(std::memory_order_relaxed),
+        .skipped_medium_alloc_frames = stats.skipped_medium_alloc_frames.load(std::memory_order_relaxed),
+        .skipped_corrupt_entries = stats.skipped_corrupt_entries.load(std::memory_order_relaxed),
+    };
 }
 
 auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {

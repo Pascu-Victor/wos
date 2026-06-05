@@ -41,6 +41,26 @@ struct UserMemoryStats {
     uint64_t page_table_pages;
 };
 
+struct DestroyUserSpaceStats {
+    uint64_t calls;
+    uint64_t collect_frames_us_total;
+    uint64_t collect_frames_us_max;
+    uint64_t free_data_us_total;
+    uint64_t free_data_us_max;
+    uint64_t free_pt_us_total;
+    uint64_t free_pt_us_max;
+    uint64_t tlb_flush_us_total;
+    uint64_t tlb_flush_us_max;
+    uint64_t data_leaf_entries_visited;
+    uint64_t data_pages_ref_decremented;
+    uint64_t page_table_pages_freed;
+    uint64_t skipped_huge_pages;
+    uint64_t skipped_medium_alloc_frames;
+    uint64_t skipped_corrupt_entries;
+};
+
+struct DestroyUserSpaceBudgetState;
+
 void init(limine_memmap_response* memmap_response, limine_executable_file_response* kernel_file_response,
           limine_executable_address_response* kernel_address_response);
 
@@ -76,6 +96,11 @@ static constexpr paddr_t PADDR_INVALID = static_cast<paddr_t>(-1);
 
 paddr_t translate(PageTable* page_table, vaddr_t vaddr);
 auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats;
+auto get_destroy_user_space_stats(uint64_t cpu_no) -> DestroyUserSpaceStats;
+auto create_destroy_user_space_budget_state(PageTable* pagemap, uint64_t owner_pid = 0, const char* owner_name = nullptr,
+                                            const char* reason = nullptr) -> DestroyUserSpaceBudgetState*;
+auto destroy_user_space_budgeted(DestroyUserSpaceBudgetState* state, uint32_t max_steps) -> bool;
+void destroy_user_space_budget_state_destroy(DestroyUserSpaceBudgetState* state);
 
 // Free all user-space pages and page tables in a pagemap
 // Only frees the lower half (user space), keeps kernel mappings intact

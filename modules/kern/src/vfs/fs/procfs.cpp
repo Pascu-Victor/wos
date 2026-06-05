@@ -2936,6 +2936,7 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
     for (uint64_t c = 0; c < cpu_count; ++c) {
         auto s = ker::mod::perf::get_cpu_stats(static_cast<uint32_t>(c));
         auto sched = ker::mod::sched::get_scheduler_trace_stats(c);
+        auto mm_destroy = ker::mod::mm::virt::get_destroy_user_space_stats(c);
         append_sconst(p, end, "cpu=");
         append_dec64(p, end, c);
         append_sconst(p, end, " ctx=");
@@ -3028,6 +3029,36 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, sched.gc_debug_us_total);
         append_sconst(p, end, " gc_dbg_max=");
         append_dec64(p, end, sched.gc_debug_us_max);
+        append_sconst(p, end, " dus_calls=");
+        append_dec64(p, end, mm_destroy.calls);
+        append_sconst(p, end, " dus_collect_us=");
+        append_dec64(p, end, mm_destroy.collect_frames_us_total);
+        append_sconst(p, end, " dus_collect_max=");
+        append_dec64(p, end, mm_destroy.collect_frames_us_max);
+        append_sconst(p, end, " dus_data_us=");
+        append_dec64(p, end, mm_destroy.free_data_us_total);
+        append_sconst(p, end, " dus_data_max=");
+        append_dec64(p, end, mm_destroy.free_data_us_max);
+        append_sconst(p, end, " dus_pt_us=");
+        append_dec64(p, end, mm_destroy.free_pt_us_total);
+        append_sconst(p, end, " dus_pt_max=");
+        append_dec64(p, end, mm_destroy.free_pt_us_max);
+        append_sconst(p, end, " dus_tlb_us=");
+        append_dec64(p, end, mm_destroy.tlb_flush_us_total);
+        append_sconst(p, end, " dus_tlb_max=");
+        append_dec64(p, end, mm_destroy.tlb_flush_us_max);
+        append_sconst(p, end, " dus_leaf=");
+        append_dec64(p, end, mm_destroy.data_leaf_entries_visited);
+        append_sconst(p, end, " dus_refdec=");
+        append_dec64(p, end, mm_destroy.data_pages_ref_decremented);
+        append_sconst(p, end, " dus_ptfree=");
+        append_dec64(p, end, mm_destroy.page_table_pages_freed);
+        append_sconst(p, end, " dus_huge_skip=");
+        append_dec64(p, end, mm_destroy.skipped_huge_pages);
+        append_sconst(p, end, " dus_medium_skip=");
+        append_dec64(p, end, mm_destroy.skipped_medium_alloc_frames);
+        append_sconst(p, end, " dus_corrupt=");
+        append_dec64(p, end, mm_destroy.skipped_corrupt_entries);
         append_sconst(p, end, " lb_push=");
         append_dec64(p, end, sched.load_balance_pushes);
         if (p + 1 < end) {

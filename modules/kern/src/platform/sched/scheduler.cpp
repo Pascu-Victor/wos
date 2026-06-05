@@ -584,6 +584,10 @@ uint32_t idle_timer_ticks = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-glob
 constexpr uint64_t IDLE_TIMER_CALIBRATION_US = 10'000;
 constexpr uint32_t SCHED_GC_RECLAIM_BUDGET = 32;
 constexpr uint64_t SCHED_GC_WORK_BUDGET_US = 500;
+// Keep each deferred pagemap reclaim slice small enough that scheduler GC does
+// not monopolize a CPU while process-per-core workloads are launching bursts of
+// short-lived helpers. Throughput still comes from repeated self-wake passes.
+constexpr uint32_t SCHED_GC_PAGEMAP_STEP_BUDGET = 64;
 std::atomic<bool> scheduler_gc_requested{false};       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<bool> scheduler_gc_worker_started{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<task::Task*> scheduler_gc_task{nullptr};   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -4039,6 +4043,44 @@ struct GcTaskTiming {
     uint64_t debug_us = 0;
 };
 
+struct GcDeferredCleanupItem {
+    task::Task* task = nullptr;
+    bool should_free_pagemap = false;
+    mm::virt::DestroyUserSpaceBudgetState* pagemap_state = nullptr;
+    uint64_t detach_us = 0;
+    GcDeferredCleanupItem* next = nullptr;
+};
+
+GcDeferredCleanupItem* gc_deferred_cleanup_head = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+GcDeferredCleanupItem* gc_deferred_cleanup_tail = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+auto gc_deferred_cleanup_has_work() -> bool { return gc_deferred_cleanup_head != nullptr; }
+
+void gc_deferred_cleanup_push(GcDeferredCleanupItem* item) {
+    if (item == nullptr) {
+        return;
+    }
+    item->next = nullptr;
+    if (gc_deferred_cleanup_tail != nullptr) {
+        gc_deferred_cleanup_tail->next = item;
+    } else {
+        gc_deferred_cleanup_head = item;
+    }
+    gc_deferred_cleanup_tail = item;
+}
+
+auto gc_deferred_cleanup_front() -> GcDeferredCleanupItem* { return gc_deferred_cleanup_head; }
+
+void gc_deferred_cleanup_pop() {
+    if (gc_deferred_cleanup_head == nullptr) {
+        return;
+    }
+    gc_deferred_cleanup_head = gc_deferred_cleanup_head->next;
+    if (gc_deferred_cleanup_head == nullptr) {
+        gc_deferred_cleanup_tail = nullptr;
+    }
+}
+
 inline void add_gc_phase_sample(std::atomic<uint64_t>& total, std::atomic<uint64_t>& max, uint64_t elapsed_us) {
     total.fetch_add(elapsed_us, std::memory_order_relaxed);
     update_relaxed_max(max, elapsed_us);
@@ -4218,27 +4260,9 @@ auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no) -> GcDet
     return {};
 }
 
-void cleanup_detached_gc_task(GcDetachedTask const& detached, GcTaskTiming& timing) {
-    auto* cur = detached.task;
+void cleanup_task_after_pagemap(task::Task* cur, GcTaskTiming& timing, uint64_t cleanup_start_us) {
     if (cur == nullptr) {
         return;
-    }
-
-    uint64_t const CLEANUP_START_US = time::get_us();
-
-    // Free pagemap.
-    // - DAEMON tasks use the kernel pagemap - must NOT free it.
-    // - Thread tasks share the owner process's pagemap - must NOT free it here.
-    // - Process tasks free only after detach confirmed no alive/dead sibling still
-    //   references the same pagemap.
-    if (cur->pagemap != nullptr) {
-        uint64_t const START_US = time::get_us();
-        if (detached.should_free_pagemap) {
-            mm::virt::destroy_user_space(cur->pagemap, cur->pid, cur->name, "task-exit-gc");
-            mm::phys::page_free(cur->pagemap);
-        }
-        cur->pagemap = nullptr;
-        timing.pagemap_us = elapsed_us_since(START_US, time::get_us());
     }
 
     // Free thread
@@ -4323,11 +4347,101 @@ void cleanup_detached_gc_task(GcDetachedTask const& detached, GcTaskTiming& timi
     misc_start_us = time::get_us();
     delete cur;
     timing.misc_us += elapsed_us_since(misc_start_us, time::get_us());
-    timing.total_us = timing.detach_us + elapsed_us_since(CLEANUP_START_US, time::get_us());
+    timing.total_us = timing.detach_us + elapsed_us_since(cleanup_start_us, time::get_us());
 }
 
-auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, bool* time_budget_exhausted) -> uint32_t {
+auto queue_detached_gc_task_cleanup(GcDetachedTask const& detached, uint64_t detach_us) -> bool {
+    auto* cur = detached.task;
+    if (cur == nullptr || cur->pagemap == nullptr || !detached.should_free_pagemap) {
+        return false;
+    }
+
+    auto* pagemap_state = mm::virt::create_destroy_user_space_budget_state(cur->pagemap, cur->pid, cur->name, "task-exit-gc");
+    if (pagemap_state == nullptr) {
+        return false;
+    }
+
+    auto* item = new GcDeferredCleanupItem{
+        .task = cur,
+        .should_free_pagemap = detached.should_free_pagemap,
+        .pagemap_state = pagemap_state,
+        .detach_us = detach_us,
+        .next = nullptr,
+    };
+    if (item == nullptr) {
+        mm::virt::destroy_user_space_budget_state_destroy(pagemap_state);
+        return false;
+    }
+
+    gc_deferred_cleanup_push(item);
+    return true;
+}
+
+auto process_deferred_gc_cleanup_slice(GcTaskTiming& timing) -> bool {
+    auto* item = gc_deferred_cleanup_front();
+    if (item == nullptr || item->task == nullptr) {
+        return false;
+    }
+
+    auto* cur = item->task;
+    timing.detach_us = item->detach_us;
+    item->detach_us = 0;
+    uint64_t const CLEANUP_START_US = time::get_us();
+    if (cur->pagemap != nullptr && item->should_free_pagemap && item->pagemap_state != nullptr) {
+        uint64_t const START_US = time::get_us();
+        if (!mm::virt::destroy_user_space_budgeted(item->pagemap_state, SCHED_GC_PAGEMAP_STEP_BUDGET)) {
+            timing.pagemap_us = elapsed_us_since(START_US, time::get_us());
+            timing.total_us = timing.detach_us + timing.pagemap_us;
+            return false;
+        }
+
+        mm::virt::destroy_user_space_budget_state_destroy(item->pagemap_state);
+        item->pagemap_state = nullptr;
+        mm::phys::page_free(cur->pagemap);
+        cur->pagemap = nullptr;
+        timing.pagemap_us = elapsed_us_since(START_US, time::get_us());
+    } else {
+        cur->pagemap = nullptr;
+    }
+
+    cleanup_task_after_pagemap(cur, timing, CLEANUP_START_US);
+    gc_deferred_cleanup_pop();
+    delete item;
+    return true;
+}
+
+void cleanup_detached_gc_task(GcDetachedTask const& detached, GcTaskTiming& timing) {
+    auto* cur = detached.task;
+    if (cur == nullptr) {
+        return;
+    }
+
+    uint64_t const CLEANUP_START_US = time::get_us();
+
+    // Free pagemap.
+    // - DAEMON tasks use the kernel pagemap - must NOT free it.
+    // - Thread tasks share the owner process's pagemap - must NOT free it here.
+    // - Process tasks free only after detach confirmed no alive/dead sibling still
+    //   references the same pagemap.
+    if (cur->pagemap != nullptr) {
+        uint64_t const START_US = time::get_us();
+        if (detached.should_free_pagemap) {
+            mm::virt::destroy_user_space(cur->pagemap, cur->pid, cur->name, "task-exit-gc");
+            mm::phys::page_free(cur->pagemap);
+        }
+        cur->pagemap = nullptr;
+        timing.pagemap_us = elapsed_us_since(START_US, time::get_us());
+    }
+
+    cleanup_task_after_pagemap(cur, timing, CLEANUP_START_US);
+}
+
+auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, bool* time_budget_exhausted, bool* has_pending_work)
+    -> uint32_t {
     if (max_tasks == 0 || run_queues == nullptr) {
+        if (has_pending_work != nullptr) {
+            *has_pending_work = gc_deferred_cleanup_has_work();
+        }
         return 0;
     }
 
@@ -4339,6 +4453,19 @@ auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, bo
             if (gc_time_budget_expired(START_US, max_work_us)) {
                 hit_time_budget = true;
                 break;
+            }
+
+            if (gc_deferred_cleanup_has_work()) {
+                GcTaskTiming timing{};
+                bool const COMPLETED = process_deferred_gc_cleanup_slice(timing);
+                note_gc_task_timing(timing);
+                if (COMPLETED) {
+                    reclaimed++;
+                }
+                hit_time_budget = gc_time_budget_expired(START_US, max_work_us);
+                if (hit_time_budget || gc_deferred_cleanup_has_work()) {
+                    continue;
+                }
             }
 
             GcDetachedTask detached{};
@@ -4358,6 +4485,11 @@ auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, bo
                 break;
             }
 
+            if (queue_detached_gc_task_cleanup(detached, timing.detach_us)) {
+                hit_time_budget = gc_time_budget_expired(START_US, max_work_us);
+                continue;
+            }
+
             cleanup_detached_gc_task(detached, timing);
             note_gc_task_timing(timing);
             reclaimed++;
@@ -4367,12 +4499,15 @@ auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, bo
     if (time_budget_exhausted != nullptr) {
         *time_budget_exhausted = hit_time_budget;
     }
+    if (has_pending_work != nullptr) {
+        *has_pending_work = gc_deferred_cleanup_has_work();
+    }
     return reclaimed;
 }
 
 }  // namespace
 
-auto gc_expired_tasks_budgeted(uint32_t max_tasks) -> uint32_t { return gc_expired_tasks_budgeted_impl(max_tasks, 0, nullptr); }
+auto gc_expired_tasks_budgeted(uint32_t max_tasks) -> uint32_t { return gc_expired_tasks_budgeted_impl(max_tasks, 0, nullptr, nullptr); }
 
 void gc_expired_tasks() { (void)gc_expired_tasks_budgeted(UINT32_MAX); }
 
@@ -4407,11 +4542,13 @@ void scheduler_gc_thread_main() {
 
         uint64_t const START_US = time::get_us();
         bool time_budget_exhausted = false;
-        uint32_t const RECLAIMED = gc_expired_tasks_budgeted_impl(SCHED_GC_RECLAIM_BUDGET, SCHED_GC_WORK_BUDGET_US, &time_budget_exhausted);
+        bool has_pending_work = false;
+        uint32_t const RECLAIMED =
+            gc_expired_tasks_budgeted_impl(SCHED_GC_RECLAIM_BUDGET, SCHED_GC_WORK_BUDGET_US, &time_budget_exhausted, &has_pending_work);
         uint64_t const END_US = time::get_us();
         note_gc_pass_result(RECLAIMED, END_US >= START_US ? END_US - START_US : 0);
 
-        if (RECLAIMED >= SCHED_GC_RECLAIM_BUDGET || (time_budget_exhausted && RECLAIMED != 0)) {
+        if (has_pending_work || RECLAIMED >= SCHED_GC_RECLAIM_BUDGET || (time_budget_exhausted && RECLAIMED != 0)) {
             scheduler_gc_requested.store(true, std::memory_order_release);
             kern_yield();
         }
