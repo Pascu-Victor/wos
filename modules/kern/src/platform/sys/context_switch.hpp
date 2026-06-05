@@ -2,6 +2,7 @@
 
 extern "C" void jump_to_next_task_no_save();
 
+#include <cstdint>
 #include <platform/asm/cpu.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/sched/task.hpp>
@@ -16,4 +17,6 @@ auto can_request_local_reschedule() -> bool;
 // Save/restore FPU/SSE/AVX state for a task (xsave if available, fxsave otherwise)
 void save_fpu_state(sched::task::Task* task);
 void restore_fpu_state(sched::task::Task* task);
+void restore_debug_registers_for_task(sched::task::Task* task);
+void install_task_cpu_bases(sched::task::Task* next_task, uint64_t cpu_id);
 }  // namespace ker::mod::sys::context_switch

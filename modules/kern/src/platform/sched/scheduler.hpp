@@ -79,6 +79,8 @@ struct RunQueue {
     std::atomic<uint64_t> gc_work_us_total;
     std::atomic<uint64_t> gc_work_us_max;
     std::atomic<uint64_t> load_balance_pushes;
+    std::atomic<uint32_t> cached_load_default;
+    std::atomic<uint32_t> cached_load_process;
     std::atomic<uint32_t> placement_reservations;
     std::atomic<bool> resched_timer_pending;
 
@@ -87,7 +89,7 @@ struct RunQueue {
     // daemon_load_penalty: added to reported load when incoming task is PROCESS type.
     // Positive values make soft-exclusive daemon CPUs less attractive to PROCESS placement.
     uint32_t domain_id = 0;
-    uint32_t daemon_load_penalty = 0;
+    std::atomic<uint32_t> daemon_load_penalty;
 
     RunQueue()
         : is_idle(false),
@@ -123,8 +125,11 @@ struct RunQueue {
           gc_work_us_total(0),
           gc_work_us_max(0),
           load_balance_pushes(0),
+          cached_load_default(0),
+          cached_load_process(0),
           placement_reservations(0),
-          resched_timer_pending(false) {
+          resched_timer_pending(false),
+          daemon_load_penalty(0) {
         runnable_heap.init();
         wait_list.init();
         dead_list.init();
@@ -368,9 +373,9 @@ inline void kern_yield_impl(uint64_t perf_callsite) {
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
         task->wait_channel = "kern_yield";
-        task->voluntary_block = true;
+        task->set_voluntary_blocked(true);
         if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
-            task->voluntary_block = false;
+            task->set_voluntary_blocked(false);
             task->wait_channel = nullptr;
             return;
         }
@@ -379,7 +384,7 @@ inline void kern_yield_impl(uint64_t perf_callsite) {
     halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED);
     if (task != nullptr) {
         (void)task->wakeup_pending.exchange(false, std::memory_order_acquire);
-        task->voluntary_block = false;
+        task->set_voluntary_blocked(false);
         task->wait_channel = nullptr;
     }
     if (PAUSED_SYSCALL_ACCOUNTING) {
@@ -403,10 +408,10 @@ inline void kern_block_impl(uint64_t perf_callsite) {
         task->perf_wait_callsite = perf_callsite;
         task->wait_channel = "kern_block";
         task->wants_block = true;
-        task->voluntary_block = true;
+        task->set_voluntary_blocked(true);
         if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
             task->wants_block = false;
-            task->voluntary_block = false;
+            task->set_voluntary_blocked(false);
             task->wait_channel = nullptr;
             return;
         }
@@ -429,7 +434,7 @@ inline void kern_block_impl(uint64_t perf_callsite) {
     if (task != nullptr) {
         task->wake_at_us = 0;
         task->wants_block = false;
-        task->voluntary_block = false;
+        task->set_voluntary_blocked(false);
         task->wait_channel = nullptr;
     }
     if (PAUSED_SYSCALL_ACCOUNTING) {
@@ -456,11 +461,11 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
         task->wait_channel = "kern_sleep";
         task->wake_at_us = ker::mod::time::get_us() + sleep_us;
         task->wants_block = true;
-        task->voluntary_block = true;
+        task->set_voluntary_blocked(true);
         if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
             task->wake_at_us = 0;
             task->wants_block = false;
-            task->voluntary_block = false;
+            task->set_voluntary_blocked(false);
             task->wait_channel = nullptr;
             return;
         }
@@ -483,7 +488,7 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
     if (task != nullptr) {
         task->wake_at_us = 0;
         task->wants_block = false;
-        task->voluntary_block = false;
+        task->set_voluntary_blocked(false);
         task->wait_channel = nullptr;
     }
     if (PAUSED_SYSCALL_ACCOUNTING) {
@@ -506,11 +511,11 @@ inline void preemptible_syscall_park_impl(const char* wait_channel, uint64_t dea
         task->wait_channel = wait_channel;
         task->wake_at_us = deadline_us;
         task->wants_block = true;
-        task->voluntary_block = true;
+        task->set_voluntary_blocked(true);
         if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
             task->wake_at_us = 0;
             task->wants_block = false;
-            task->voluntary_block = false;
+            task->set_voluntary_blocked(false);
             task->wait_channel = nullptr;
             return;
         }
@@ -533,7 +538,7 @@ inline void preemptible_syscall_park_impl(const char* wait_channel, uint64_t dea
     if (task != nullptr) {
         task->wake_at_us = 0;
         task->wants_block = false;
-        task->voluntary_block = false;
+        task->set_voluntary_blocked(false);
         task->wait_channel = nullptr;
     }
     if (PAUSED_SYSCALL_ACCOUNTING) {

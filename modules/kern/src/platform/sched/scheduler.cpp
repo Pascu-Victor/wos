@@ -185,7 +185,7 @@ inline void record_local_proc_first_run(task::Task* task, uint64_t callsite) {
 }
 
 inline void validate_user_resume_target(task::Task* task, const char* path) {
-    if (task == nullptr || task->pagemap == nullptr || task->type != task::TaskType::PROCESS || task->voluntary_block) {
+    if (task == nullptr || task->pagemap == nullptr || task->type != task::TaskType::PROCESS || task->is_voluntary_blocked()) {
         return;
     }
 
@@ -364,7 +364,7 @@ inline bool is_bursty_wakeup_contender(const task::Task* task, uint64_t now_us) 
 }
 
 inline bool is_bursty_voluntary_block_contender(const task::Task* task, uint64_t now_us) {
-    return task->voluntary_block && has_short_burst_history(task) && has_recent_sleep_window(task, now_us);
+    return task->is_voluntary_blocked() && has_short_burst_history(task) && has_recent_sleep_window(task, now_us);
 }
 
 inline bool is_lower_weight_contender(const task::Task* current, const task::Task* contender) {
@@ -589,6 +589,7 @@ std::atomic<task::Task*> scheduler_gc_task{nullptr};   // NOLINT(cppcoreguidelin
 constexpr uint8_t PERF_TIMER_VECTOR = 32;
 constexpr uint16_t PERF_IRQ_KIND_TIMER = 4;
 constexpr uint32_t PERF_IRQ_SLOW_TRACE_US = 30;
+constexpr bool K_ENABLE_SCHED_OWNER_SCAN_FALLBACK = true;
 
 // ============================================================================
 // Internal helpers
@@ -662,11 +663,26 @@ inline int64_t compute_avg_vruntime(RunQueue* rq) {
     return rq->min_vruntime + (rq->total_weighted_vruntime / rq->total_weight);
 }
 
+inline uint32_t task_load_for_incoming(task::Task const* task, task::TaskType incoming_type) {
+    constexpr uint32_t FULL_LOAD = 8;
+    constexpr uint32_t DAEMON_LOAD = 1;
+
+    if (task == nullptr || task->type == task::TaskType::IDLE) {
+        return 0;
+    }
+    if (incoming_type == task::TaskType::PROCESS && task->type == task::TaskType::DAEMON) {
+        return DAEMON_LOAD;
+    }
+    return FULL_LOAD;
+}
+
 // Add a task's EEVDF contribution to the run queue aggregate sums.
 // Call AFTER setting task->vruntime and inserting into the heap.
 inline void add_to_sums(RunQueue* rq, task::Task* t) {
     rq->total_weight += static_cast<int64_t>(t->sched_weight);
     rq->total_weighted_vruntime += (t->vruntime - rq->min_vruntime) * static_cast<int64_t>(t->sched_weight);
+    rq->cached_load_default.fetch_add(task_load_for_incoming(t, task::TaskType::DAEMON), std::memory_order_relaxed);
+    rq->cached_load_process.fetch_add(task_load_for_incoming(t, task::TaskType::PROCESS), std::memory_order_relaxed);
 }
 
 // Remove a task's EEVDF contribution from the run queue aggregate sums.
@@ -674,6 +690,8 @@ inline void add_to_sums(RunQueue* rq, task::Task* t) {
 inline void remove_from_sums(RunQueue* rq, task::Task* t) {
     rq->total_weight -= static_cast<int64_t>(t->sched_weight);
     rq->total_weighted_vruntime -= (t->vruntime - rq->min_vruntime) * static_cast<int64_t>(t->sched_weight);
+    rq->cached_load_default.fetch_sub(task_load_for_incoming(t, task::TaskType::DAEMON), std::memory_order_relaxed);
+    rq->cached_load_process.fetch_sub(task_load_for_incoming(t, task::TaskType::PROCESS), std::memory_order_relaxed);
 }
 
 inline bool process_has_kernel_resume_frame(const task::Task* t) {
@@ -682,10 +700,10 @@ inline bool process_has_kernel_resume_frame(const task::Task* t) {
 
 inline void finish_wait_metadata_for_runqueue(task::Task* t) {
     if (process_has_kernel_resume_frame(t)) {
-        t->voluntary_block = true;
+        t->set_voluntary_blocked(true);
         return;
     }
-    t->voluntary_block = false;
+    t->set_voluntary_blocked(false);
     t->wait_channel = nullptr;
 }
 
@@ -937,6 +955,8 @@ inline auto compute_wakeup_floor_vruntime(RunQueue* rq, task::Task* t, uint64_t 
 //
 // Returns true if a task was stolen and inserted into our heap.
 // ============================================================================
+inline auto cpu_mask_contains(uint64_t mask, uint64_t cpu_no) -> bool { return cpu_no < 64 && (mask & (1ULL << cpu_no)) != 0U; }
+
 auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
     if (run_queues == nullptr) {
         return false;
@@ -962,7 +982,7 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
         if (VICTIM_CPU == stealing_cpu) {
             continue;
         }
-        if ((GROUP_MASK & (1ULL << VICTIM_CPU)) == 0U) {
+        if (!cpu_mask_contains(GROUP_MASK, VICTIM_CPU)) {
             continue;
         }
 
@@ -975,7 +995,7 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
             uint32_t const VICTIM_DOM_ID = victim_rq_raw->domain_id;
             if (VICTIM_DOM_ID != 0) {
                 auto* victim_dom = smt::get_cpu_domain(VICTIM_DOM_ID);
-                if (victim_dom != nullptr && victim_dom->hard && ((victim_dom->cpu_mask & (1ULL << stealing_cpu)) == 0U)) {
+                if (victim_dom != nullptr && victim_dom->hard && !cpu_mask_contains(victim_dom->cpu_mask, stealing_cpu)) {
                     continue;  // Do not steal across hard-domain boundary
                 }
             }
@@ -984,7 +1004,8 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
         uint32_t const VLOAD = victim_rq_raw->runnable_heap.size * FULL_LOAD;
         // Phase 8b: soft-exclusive CPUs (daemon_load_penalty > 0) are only stolen from
         // if the load differential is 2× the normal threshold, preserving their intent.
-        uint32_t const MIN_STEAL_LOAD = (victim_rq_raw->daemon_load_penalty > 0) ? FULL_LOAD * 4 : FULL_LOAD * 2;
+        uint32_t const MIN_STEAL_LOAD =
+            (victim_rq_raw->daemon_load_penalty.load(std::memory_order_relaxed) > 0) ? FULL_LOAD * 4 : FULL_LOAD * 2;
         if (VLOAD < MIN_STEAL_LOAD) {
             continue;
         }
@@ -1080,24 +1101,11 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
     return false;
 }
 
-inline uint32_t task_load_for_incoming(task::Task const* task, task::TaskType incoming_type) {
-    constexpr uint32_t FULL_LOAD = 8;
-    constexpr uint32_t DAEMON_LOAD = 1;
-
-    if (task == nullptr || task->type == task::TaskType::IDLE) {
-        return 0;
-    }
-    if (incoming_type == task::TaskType::PROCESS && task->type == task::TaskType::DAEMON) {
-        return DAEMON_LOAD;
-    }
-    return FULL_LOAD;
-}
-
 inline uint32_t compute_heap_load_locked(RunQueue* rq, task::Task const* current, task::TaskType incoming_type) {
     uint32_t load = 0;
     for (uint32_t i = 0; i < rq->runnable_heap.size; ++i) {
         task::Task const* task = run_heap_entry(rq->runnable_heap, i);
-        if (task == current && task->voluntary_block) {
+        if (task == current && task->is_voluntary_blocked()) {
             continue;
         }
         load += task_load_for_incoming(task, incoming_type);
@@ -1110,7 +1118,7 @@ inline uint32_t compute_effective_load_locked(RunQueue* rq, task::TaskType incom
     auto* cur = rq->current_task;
     bool const CUR_IN_HEAP = cur != nullptr && rq->runnable_heap.contains(cur);
 
-    bool const HAS_ACTIVE = (cur != nullptr && cur->type != task::TaskType::IDLE && !cur->voluntary_block);
+    bool const HAS_ACTIVE = (cur != nullptr && cur->type != task::TaskType::IDLE && !cur->is_voluntary_blocked());
     if (HAS_ACTIVE && !CUR_IN_HEAP) {
         load += task_load_for_incoming(cur, incoming_type);
     }
@@ -1121,8 +1129,28 @@ inline uint32_t compute_effective_load_locked(RunQueue* rq, task::TaskType incom
     // Soft-exclusive daemon CPU penalty (Phase 1): if this RunQueue is marked as a
     // soft-exclusive daemon CPU and the incoming task is a PROCESS, inflate the
     // reported load so compute tasks prefer other CPUs.
-    if (rq->daemon_load_penalty > 0 && incoming_type == task::TaskType::PROCESS) {
-        load += rq->daemon_load_penalty;
+    uint32_t const DAEMON_PENALTY = rq->daemon_load_penalty.load(std::memory_order_relaxed);
+    if (DAEMON_PENALTY > 0 && incoming_type == task::TaskType::PROCESS) {
+        load += DAEMON_PENALTY;
+    }
+
+    return load;
+}
+
+inline uint32_t cached_effective_load_for_cpu(uint64_t cpu_no, task::TaskType incoming_type) {
+    constexpr uint32_t FULL_LOAD = 8;
+
+    auto* rq = run_queues != nullptr ? run_queues->that_cpu(cpu_no) : nullptr;
+    if (rq == nullptr) {
+        return UINT32_MAX;
+    }
+
+    uint32_t load = (incoming_type == task::TaskType::PROCESS ? rq->cached_load_process.load(std::memory_order_relaxed)
+                                                              : rq->cached_load_default.load(std::memory_order_relaxed));
+    load += rq->placement_reservations.load(std::memory_order_relaxed) * FULL_LOAD;
+
+    if (incoming_type == task::TaskType::PROCESS) {
+        load += rq->daemon_load_penalty.load(std::memory_order_relaxed);
     }
 
     return load;
@@ -1153,14 +1181,16 @@ uint64_t get_least_loaded_cpu_for_task(task::Task* incoming_task) {
 
     auto best_cpu = static_cast<uint64_t>(__builtin_ctzll(allowed_mask));  // safe default
     uint32_t best_load = UINT32_MAX;
+    constexpr uint64_t PLACEMENT_SAMPLES = 4;
+    uint64_t samples = 0;
 
-    for (uint64_t off = 0; off < CORE_COUNT; ++off) {
+    for (uint64_t off = 0; off < CORE_COUNT && samples < PLACEMENT_SAMPLES; ++off) {
         uint64_t const CPU_NO = (START + off) % CORE_COUNT;
-        if ((allowed_mask & (1ULL << CPU_NO)) == 0) {
+        if (!cpu_mask_contains(allowed_mask, CPU_NO)) {
             continue;
         }
-        uint32_t const LOAD = run_queues->with_lock(
-            CPU_NO, [INCOMING_TYPE](RunQueue* rq) -> uint32_t { return compute_effective_load_locked(rq, INCOMING_TYPE); });
+        samples++;
+        uint32_t const LOAD = cached_effective_load_for_cpu(CPU_NO, INCOMING_TYPE);
 
         if (LOAD < best_load) {
             best_load = LOAD;
@@ -1844,7 +1874,7 @@ auto event_wake_target_cpu(const task::Task* task, uint64_t waker_cpu) -> uint64
     }
 
     bool const WAITING = task->sched_queue == task::Task::sched_queue::WAITING;
-    bool const VOLUNTARY_BLOCK = task->voluntary_block;
+    bool const VOLUNTARY_BLOCK = task->is_voluntary_blocked();
     if (event_wake_prefers_waker_cpu(task->cpu_pinned, WAITING, VOLUNTARY_BLOCK)) {
         return waker_cpu;
     }
@@ -2134,7 +2164,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
     // A PROCESS task that set voluntary_block is at a safe preemption point
     // (e.g. sti;hlt wait loop in a syscall).  Treat it like a DAEMON for
     // context-save and preemption purposes.
-    bool const KERNEL_PREEMPT_SAFE = IS_DAEMON || current_task->voluntary_block;
+    bool const KERNEL_PREEMPT_SAFE = IS_DAEMON || current_task->is_voluntary_blocked();
     bool const PREEMPT_DISABLED = current_task->preempt_disable_depth != 0;
     bool const CAN_PREEMPT_KERNEL = KERNEL_PREEMPT_SAFE && !PREEMPT_DISABLED;
 
@@ -2166,12 +2196,12 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
         auto chargeable_us = static_cast<uint64_t>(delta_us);
         if (current_task->type != task::TaskType::IDLE) {
             chargeable_us = account_runtime_slice(rq, current_task, NOW_US, static_cast<uint64_t>(delta_us), IN_KERNEL_MODE,
-                                                  !current_task->voluntary_block);
+                                                  !current_task->is_voluntary_blocked());
 
             // kern_yield() sleepers stay on the runnable heap, so record a
             // pseudo-sleep interval here. That lets the preemption guard treat
             // them like bursty wakeups instead of runnable compute peers.
-            if (current_task->voluntary_block) {
+            if (current_task->is_voluntary_blocked()) {
                 if (current_task->last_sleep_start_us == 0) {
                     current_task->last_run_us = current_task->slice_used_ns / 1000U;
                     note_perf_wait_callsite(current_task, current_task->context.frame.rip);
@@ -2190,7 +2220,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
         int64_t const DELTA_NS = static_cast<int64_t>(chargeable_us) * 1000;
 
         // Perf: periodic CPU sample (~100 Hz sub-sampled from 1 kHz timer)
-        if (!current_task->voluntary_block) {
+        if (!current_task->is_voluntary_blocked()) {
             perf::record_sample(static_cast<uint32_t>(cpu::current_cpu()), current_task->pid, current_task->context.frame.rip,
                                 !IN_KERNEL_MODE, compute_avg_vruntime(rq) - current_task->vruntime);
         }
@@ -2343,11 +2373,12 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             background_preempt_granularity_us =
                 std::max<uint64_t>(background_preempt_granularity_us, compute_bursty_preempt_guard_us(next));
         }
-        if (!current_task->voluntary_block && (LOWER_PRIORITY_PROCESS_PREEMPT || LOWER_WEIGHT_PREEMPT || BURSTY_PROCESS_WAKEUP_PREEMPT) &&
+        if (!current_task->is_voluntary_blocked() &&
+            (LOWER_PRIORITY_PROCESS_PREEMPT || LOWER_WEIGHT_PREEMPT || BURSTY_PROCESS_WAKEUP_PREEMPT) &&
             rq->runnable_heap.contains(current_task) && RUN_DURATION_US < background_preempt_granularity_us) {
             return nullptr;
         }
-        if (!current_task->voluntary_block && current_task->slice_used_ns < current_task->slice_ns &&
+        if (!current_task->is_voluntary_blocked() && current_task->slice_used_ns < current_task->slice_ns &&
             rq->runnable_heap.contains(current_task) &&
             (next->vdeadline >= current_task->vdeadline || (next->just_woke && RUN_DURATION_US < SCHED_MIN_GRANULARITY_US))) {
             return nullptr;
@@ -2402,9 +2433,10 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
 #endif
     // Perf: record preemption context switch
     {
-        uint8_t const SW_FLAGS = current_task->voluntary_block ? perf::PERF_FLAG_BLOCK : perf::PERF_FLAG_PREEMPT;
+        uint8_t const SW_FLAGS = current_task->is_voluntary_blocked() ? perf::PERF_FLAG_BLOCK : perf::PERF_FLAG_PREEMPT;
         perf::record_switch(static_cast<uint32_t>(cpu::current_cpu()), current_task->pid, next_task->pid, SW_FLAGS, perf_lag_out,
-                            current_task->slice_used_ns / 1000U, current_task->voluntary_block ? perf_wait_callsite(current_task) : 0);
+                            current_task->slice_used_ns / 1000U,
+                            current_task->is_voluntary_blocked() ? perf_wait_callsite(current_task) : 0);
     }
     // Perform context switch. The next task is only reserved under the lock;
     // publish it as current after the live timer frame has been changed.
@@ -2727,7 +2759,7 @@ void check_pending_signals_deferred(task::Task* task) {
     // preempted at a voluntary syscall wait point.  Signal frames must only be
     // built on a real user stack; the syscall/interrupt return paths will
     // deliver the signal once the task reaches a user-mode return boundary.
-    if ((task->context.frame.cs & 0x3) != 0x3 || task->voluntary_block) {
+    if ((task->context.frame.cs & 0x3) != 0x3 || task->is_voluntary_blocked()) {
         return;
     }
 
@@ -2757,7 +2789,7 @@ void check_pending_signals_deferred(task::Task* task) {
         }
         // Stop signals
         if (SIGNO == 19 || SIGNO == 20 || SIGNO == 21 || SIGNO == 22) {
-            task->voluntary_block = true;
+            task->set_voluntary_blocked(true);
             return;
         }
         // All other SIG_DFL: fatal terminate.
@@ -3218,23 +3250,13 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
 
     // Set up GS/FS for next task
     uint64_t const REAL_CPU_ID = cpu::current_cpu();
-    auto* scratch_area = reinterpret_cast<cpu::PerCpu*>(next_task->context.syscall_scratch_area);
-    scratch_area->cpu_id = REAL_CPU_ID;
-
-    if (next_task->thread != nullptr) {
-        cpu::wrgsbase(next_task->context.syscall_scratch_area);
-        cpu_set_msr(IA32_KERNEL_GS_BASE, next_task->thread->gsbase);
-        cpu::wrfsbase(next_task->thread->fsbase);
-    } else {
-        cpu::wrgsbase(next_task->context.syscall_scratch_area);
-        cpu_set_msr(IA32_KERNEL_GS_BASE, next_task->context.syscall_scratch_area);
-    }
+    sys::context_switch::install_task_cpu_bases(next_task, REAL_CPU_ID);
 
     mm::virt::switch_pagemap(next_task);
 
     // Validate context before restoring (only for PROCESS tasks - DAEMON uses kernel addresses)
     // Skip validation when voluntary_block is set - kernel-mode context is legitimate.
-    if (next_task->type == task::TaskType::PROCESS && !next_task->voluntary_block) {
+    if (next_task->type == task::TaskType::PROCESS && !next_task->is_voluntary_blocked()) {
         if (next_task->context.frame.cs != desc::gdt::GDT_USER_CS) {
             dbg::log("deferred_task_switch: CORRUPT cs=0x%x (expected 0x%x) PID %x", next_task->context.frame.cs, desc::gdt::GDT_USER_CS,
                      next_task->pid);
@@ -3267,6 +3289,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     if (next_task->type == task::TaskType::PROCESS && next_task->fx_state.saved) {
         sys::context_switch::restore_fpu_state(next_task);
     }
+    sys::context_switch::restore_debug_registers_for_task(next_task);
 
     wos_deferred_task_switch_return(&next_task->context.regs, &next_task->context.frame);
     __builtin_unreachable();
@@ -3412,43 +3435,48 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
                                    });
     }
 
-    // Slow path: scan all CPUs only if not found on last known CPU
+    // Rare recovery path: task->cpu is the authoritative owner for runnable,
+    // waiting, current, and handoff tasks.  Normal wakeups must not reach this
+    // path; if the owner is stale, keep correctness by scanning once and count
+    // it so the invariant violation is visible in perf cpustat.
     if (!found_and_removed && !is_current_on_some_cpu) {
-        run_queues->this_cpu()->slow_reschedule_scans.fetch_add(1, std::memory_order_relaxed);
-        for (uint64_t search_cpu = 0; search_cpu < NCPUS_RESCHED; ++search_cpu) {
-            if (search_cpu == LAST_CPU) {
-                continue;  // already checked
+        if constexpr (K_ENABLE_SCHED_OWNER_SCAN_FALLBACK) {
+            run_queues->this_cpu()->slow_reschedule_scans.fetch_add(1, std::memory_order_relaxed);
+            for (uint64_t search_cpu = 0; search_cpu < NCPUS_RESCHED; ++search_cpu) {
+                if (search_cpu == LAST_CPU) {
+                    continue;  // already checked
+                }
+                run_queues->with_lock_void(
+                    search_cpu, [task, &is_current_on_some_cpu, &current_cpu_of_task, &found_and_removed, search_cpu](RunQueue* rq) {
+                        if (found_and_removed || is_current_on_some_cpu) {
+                            return;
+                        }
+                        if (runqueue_task_is_reserved_locked(rq, task)) {
+                            is_current_on_some_cpu = true;
+                            current_cpu_of_task = search_cpu;
+                            task->cpu = search_cpu;
+#ifdef SCHED_DEBUG
+                            dbg::log("RESCHED: PID %x is currentTask on CPU %d", task->pid, static_cast<int>(search_cpu));
+#endif
+                            return;
+                        }
+                        if (wait_list_remove_locked(rq, task)) {
+                            found_and_removed = true;
+#ifdef SCHED_DEBUG
+                            dbg::log("RESCHED: PID %x removed from CPU %d wait_list", task->pid, static_cast<int>(search_cpu));
+#endif
+                        }
+                        if (rq->runnable_heap.contains(task)) {
+#ifdef SCHED_DEBUG
+                            dbg::log("RESCHED: PID %x found in CPU %d heap (idx=%d), removing", task->pid, static_cast<int>(search_cpu),
+                                     task->heap_index);
+#endif
+                            remove_from_sums(rq, task);
+                            rq->runnable_heap.remove(task);
+                            found_and_removed = true;
+                        }
+                    });
             }
-            run_queues->with_lock_void(
-                search_cpu, [task, &is_current_on_some_cpu, &current_cpu_of_task, &found_and_removed, search_cpu](RunQueue* rq) {
-                    if (found_and_removed || is_current_on_some_cpu) {
-                        return;
-                    }
-                    if (runqueue_task_is_reserved_locked(rq, task)) {
-                        is_current_on_some_cpu = true;
-                        current_cpu_of_task = search_cpu;
-                        task->cpu = search_cpu;
-#ifdef SCHED_DEBUG
-                        dbg::log("RESCHED: PID %x is currentTask on CPU %d", task->pid, static_cast<int>(search_cpu));
-#endif
-                        return;
-                    }
-                    if (wait_list_remove_locked(rq, task)) {
-                        found_and_removed = true;
-#ifdef SCHED_DEBUG
-                        dbg::log("RESCHED: PID %x removed from CPU %d wait_list", task->pid, static_cast<int>(search_cpu));
-#endif
-                    }
-                    if (rq->runnable_heap.contains(task)) {
-#ifdef SCHED_DEBUG
-                        dbg::log("RESCHED: PID %x found in CPU %d heap (idx=%d), removing", task->pid, static_cast<int>(search_cpu),
-                                 task->heap_index);
-#endif
-                        remove_from_sums(rq, task);
-                        rq->runnable_heap.remove(task);
-                        found_and_removed = true;
-                    }
-                });
         }
     }
 
@@ -3465,7 +3493,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
 
         uint64_t const NOW_US = time::get_us();
         uint64_t const WAKE_AT_US = task->wake_at_us;
-        bool const WAKE_CURRENT = task->voluntary_block || task->wants_block || task->last_sleep_start_us != 0;
+        bool const WAKE_CURRENT = task->is_voluntary_blocked() || task->wants_block || task->last_sleep_start_us != 0;
         // If a wake races a deferred kern_block()/kern_sleep_us() request,
         // cancel the pending sleep/block before nudging the CPU. Otherwise the
         // next scheduler pass can still move the task to WAITING after the
@@ -3536,7 +3564,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         if (!process_has_kernel_resume_frame(task)) {
             task->wait_channel = nullptr;
         } else {
-            task->voluntary_block = true;
+            task->set_voluntary_blocked(true);
         }
         // Mark justWoke if this is a sleep->run transition (task was in WAITING state).
         // justWoke inhibits wakeup-preemption for SCHED_MIN_GRANULARITY_US; see process_tasks.
@@ -3724,7 +3752,7 @@ void wake_task_for_signal(task::Task* task) {
 
     // If the task is blocked or sleeping in a syscall path, put it back on
     // a runnable queue so it can process pending signals promptly.
-    if (task->sched_queue == task::Task::sched_queue::WAITING || task->deferred_task_switch || task->voluntary_block) {
+    if (task->sched_queue == task::Task::sched_queue::WAITING || task->deferred_task_switch || task->is_voluntary_blocked()) {
         if (task->wait_channel != nullptr && strcmp(task->wait_channel, "sigsuspend") == 0) {
             task->context.regs.rax = static_cast<uint64_t>(-EINTR);
         }
@@ -4277,7 +4305,7 @@ auto get_scheduler_timer_decision_for_this_cpu(uint64_t now_us) -> SchedulerTime
 
         // kern_yield-style wait loops remain runnable and halt voluntarily.
         // Keep a tick for those so condition polling cannot sleep forever.
-        if (CURRENT != nullptr && CURRENT->voluntary_block) {
+        if (CURRENT != nullptr && CURRENT->is_voluntary_blocked()) {
             note_scheduler_timer_arm_reason_locked(rq, SchedulerTimerArmReason::VOLUNTARY_BLOCK);
             return FIXED_QUANTUM;
         }
@@ -4400,7 +4428,7 @@ auto get_load_average_snapshot() -> LoadAverageSnapshot {
             if (DEAD || task->ptrace_stopped) {
                 continue;
             }
-            bool const IS_RUNNABLE = task->sched_queue == task::Task::sched_queue::RUNNABLE && !task->voluntary_block;
+            bool const IS_RUNNABLE = task->sched_queue == task::Task::sched_queue::RUNNABLE && !task->is_voluntary_blocked();
             bool const IS_UNINTERRUPTIBLE =
                 task->sched_queue == task::Task::sched_queue::WAITING && task->wait_channel != nullptr && !task->ptrace_stopped;
             if (IS_RUNNABLE) {
@@ -4513,7 +4541,7 @@ auto get_scheduler_cpu_state(uint64_t cpu_no) -> SchedulerCpuState {
             state.current_pid = current->pid;
             state.current_name = current->name != nullptr ? current->name : "?";
             state.current_type = static_cast<uint8_t>(current->type);
-            state.current_voluntary_block = current->voluntary_block;
+            state.current_voluntary_block = current->is_voluntary_blocked();
             state.current_wants_block = current->wants_block;
             state.current_cpu_pinned = current->cpu_pinned;
             state.current_preempt_depth = current->preempt_disable_depth;
@@ -4583,21 +4611,18 @@ auto get_least_loaded_cpu() -> uint64_t {
         return 0;
     }
 
-    // Simple load metric: runnable_heap.size plus a running non-idle task.
-    // Discount a current task that is sitting at a voluntary blocking point,
-    // since it can be preempted immediately and should not make the CPU look
-    // busy for fresh thread placement. Also include in-flight placement
-    // reservations so burst thread creation does not keep choosing the same CPU
-    // before earlier insertions become visible in the steady-state load metric.
     static std::atomic<uint64_t> rr_seed{0};
     uint64_t const START = rr_seed.fetch_add(1, std::memory_order_relaxed) % CORE_COUNT;
 
     uint64_t best_cpu = START;
     uint32_t best_load = UINT32_MAX;
+    constexpr uint64_t PLACEMENT_SAMPLES = 4;
+    uint64_t samples = 0;
 
-    for (uint64_t off = 0; off < CORE_COUNT; off++) {
+    for (uint64_t off = 0; off < CORE_COUNT && samples < PLACEMENT_SAMPLES; off++) {
         uint64_t const I = (START + off) % CORE_COUNT;
-        uint32_t const LOAD = run_queues->with_lock(I, [](RunQueue* rq) -> uint32_t { return compute_effective_load_locked(rq); });
+        samples++;
+        uint32_t const LOAD = cached_effective_load_for_cpu(I, task::TaskType::DAEMON);
 
         if (LOAD < best_load) {
             best_load = LOAD;
@@ -4624,9 +4649,17 @@ auto get_least_loaded_cpu_in_mask(uint64_t mask) -> uint64_t {
 
     auto best_cpu = static_cast<uint64_t>(__builtin_ctzll(mask));
     uint32_t best_load = UINT32_MAX;
-    for (uint64_t tmp = mask; tmp != 0; tmp &= tmp - 1) {
-        auto const CPU = static_cast<uint64_t>(__builtin_ctzll(tmp));
-        uint32_t const LOAD = run_queues->with_lock(CPU, [](RunQueue* rq) -> uint32_t { return compute_effective_load_locked(rq); });
+    static std::atomic<uint64_t> rr_seed{0};
+    uint64_t const START = rr_seed.fetch_add(1, std::memory_order_relaxed) % CORE_COUNT;
+    constexpr uint64_t PLACEMENT_SAMPLES = 4;
+    uint64_t samples = 0;
+    for (uint64_t off = 0; off < CORE_COUNT && samples < PLACEMENT_SAMPLES; ++off) {
+        uint64_t const CPU = (START + off) % CORE_COUNT;
+        if (!cpu_mask_contains(mask, CPU)) {
+            continue;
+        }
+        samples++;
+        uint32_t const LOAD = cached_effective_load_for_cpu(CPU, task::TaskType::DAEMON);
         if (LOAD < best_load) {
             best_load = LOAD;
             best_cpu = CPU;
@@ -4642,7 +4675,7 @@ void set_cpu_daemon_penalty(uint64_t cpu_no, uint32_t penalty) {
     if (run_queues == nullptr) {
         return;
     }
-    run_queues->with_lock_void(cpu_no, [penalty](RunQueue* rq) { rq->daemon_load_penalty = penalty; });
+    run_queues->with_lock_void(cpu_no, [penalty](RunQueue* rq) { rq->daemon_load_penalty.store(penalty, std::memory_order_relaxed); });
 }
 
 void set_cpu_domain_id(uint64_t cpu_no, uint32_t new_domain_id) {

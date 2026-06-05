@@ -844,7 +844,7 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     req.task_flags |= task->waited_on ? TASK_FLAG_WAITED_ON : 0;
     req.task_flags |= task->deferred_task_switch ? TASK_FLAG_DEFERRED_TASK_SWITCH : 0;
     req.task_flags |= task->yield_switch ? TASK_FLAG_YIELD_SWITCH : 0;
-    req.task_flags |= task->voluntary_block ? TASK_FLAG_VOLUNTARY_BLOCK : 0;
+    req.task_flags |= task->is_voluntary_blocked() ? TASK_FLAG_VOLUNTARY_BLOCK : 0;
     req.task_flags |= task->preempt_pending ? TASK_FLAG_PREEMPT_PENDING : 0;
     req.task_flags |= task->in_signal_handler ? TASK_FLAG_IN_SIGNAL_HANDLER : 0;
     req.task_flags |= task->do_sigreturn ? TASK_FLAG_DO_SIGRETURN : 0;

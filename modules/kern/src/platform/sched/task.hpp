@@ -146,6 +146,11 @@ struct Task {
     uint64_t entry{};
     void (*kthread_entry)(){};  // Kernel thread entry (DAEMON only), nullptr otherwise
     const char* name{};
+    // Authoritative scheduler owner while ACTIVE: for RUNNABLE/WAITING tasks
+    // this names the runqueue holding the task; for current/handoff tasks it
+    // names the CPU whose stack is executing or about to execute it. Updates
+    // happen under the owning runqueue lock or during task construction before
+    // publication.
     uint64_t cpu{};
 
     // CPU domain affinity (Phase 1 - CPU domain infrastructure).
@@ -355,7 +360,11 @@ struct Task {
     // When true, a PROCESS task is at a safe voluntary blocking point (e.g. sti;hlt
     // in a syscall wait loop). The scheduler may preempt it as if it were a
     // DAEMON, saving and restoring kernel-mode context. Set before hlt, cleared after wake.
-    volatile bool voluntary_block = false;
+    std::atomic<bool> voluntary_block{false};
+
+    [[nodiscard]] auto is_voluntary_blocked() const -> bool { return voluntary_block.load(std::memory_order_acquire); }
+
+    void set_voluntary_blocked(bool value) { voluntary_block.store(value, std::memory_order_release); }
 
     bool preempt_pending = false;
     bool in_signal_handler{};  // Set to true when a signal handler frame is being delivered

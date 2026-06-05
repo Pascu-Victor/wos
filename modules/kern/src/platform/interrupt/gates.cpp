@@ -462,7 +462,7 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
         journal::panic("  syscall_scratch_area: 0x%lx", current_task->context.syscall_scratch_area);
         journal::panic("Task Scheduler State:");
         journal::panic("  cpu=%lu queue=%u voluntary=%u wants_block=%u deferred=%u yield=%u", current_task->cpu,
-                       static_cast<unsigned>(current_task->sched_queue), current_task->voluntary_block ? 1U : 0U,
+                       static_cast<unsigned>(current_task->sched_queue), current_task->is_voluntary_blocked() ? 1U : 0U,
                        current_task->wants_block ? 1U : 0U, current_task->deferred_task_switch ? 1U : 0U,
                        current_task->yield_switch ? 1U : 0U);
         journal::panic("  preemptDepth=%u preempt_pending=%u preemptMaxUs=%lu", current_task->preempt_disable_depth,

@@ -277,7 +277,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->waited_on = false;
     child->deferred_task_switch = false;
     child->yield_switch = false;
-    child->voluntary_block = false;
+    child->set_voluntary_blocked(false);
     child->kthread_entry = nullptr;
     child->elf_buffer = nullptr;
     child->elf_buffer_size = 0;

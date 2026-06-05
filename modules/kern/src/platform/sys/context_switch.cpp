@@ -32,6 +32,15 @@ extern "C" char __kernel_text_start[];                                // NOLINT(
 extern "C" char __kernel_text_end[];                                  // NOLINT(readability-identifier-naming)
 
 namespace {
+// Enables deeper scheduler/context validation such as stack-owner checks on
+// every timer interrupt.  Keep off in production: the cheap selector/rip/rsp
+// guards below still catch obviously corrupt return frames.
+#ifdef SCHED_VALIDATE_CONTEXT
+constexpr bool K_ENABLE_SCHED_VALIDATE_CONTEXT = true;
+#else
+constexpr bool K_ENABLE_SCHED_VALIDATE_CONTEXT = false;
+#endif
+
 inline auto valid_kernel_stack(uint64_t rsp) -> bool { return rsp >= 0xffff800000000000ULL && rsp < 0xffff900000000000ULL; }
 
 inline auto is_kernel_text_pointer(uint64_t rip) -> bool {
@@ -74,14 +83,15 @@ inline void validate_kernel_frame(const gates::InterruptFrame& frame, sched::tas
 
     const bool RIP_BAD = !is_kernel_text_pointer(frame.rip);
     const bool RSP_BAD = !valid_kernel_stack(frame.rsp);
-    const bool STACK_OWNER_BAD = task != nullptr && task->type != sched::task::TaskType::IDLE && !stack_belongs_to_task(task, frame.rsp);
+    const bool STACK_OWNER_BAD = K_ENABLE_SCHED_VALIDATE_CONTEXT && task != nullptr && task->type != sched::task::TaskType::IDLE &&
+                                 !stack_belongs_to_task(task, frame.rsp);
     const bool FLAGS_BAD = (frame.flags & 0x2ULL) == 0;
     const bool SS_BAD = frame.ss != desc::gdt::GDT_KERN_DS;
     if (!RIP_BAD && !RSP_BAD && !STACK_OWNER_BAD && !FLAGS_BAD && !SS_BAD) {
         return;
     }
 
-    auto* owner = sched::debug_find_task_by_kernel_stack(frame.rsp);
+    auto* owner = K_ENABLE_SCHED_VALIDATE_CONTEXT ? sched::debug_find_task_by_kernel_stack(frame.rsp) : nullptr;
     dbg::logger<"ctxswitch">::error(
         "bad kernel return frame: path=%s pid=%lu name=%s rip=0x%llx rsp=0x%llx stack=0x%llx owner=%lu(%s) cs=0x%llx ss=0x%llx "
         "flags=0x%llx task=%p",
@@ -113,6 +123,13 @@ auto interrupted_caller_from_rbp(uint64_t rbp) -> uint64_t {
 }
 
 void validate_timer_stack(const gates::InterruptFrame& frame, const cpu::GPRegs& gpr, sched::task::Task* task) {
+    if constexpr (!K_ENABLE_SCHED_VALIDATE_CONTEXT) {
+        (void)frame;
+        (void)gpr;
+        (void)task;
+        return;
+    }
+
     if (task == nullptr || frame.cs != desc::gdt::GDT_KERN_CS || task->type == sched::task::TaskType::IDLE) {
         return;
     }
@@ -280,6 +297,24 @@ __attribute__((noinline, no_sanitize("address", "undefined", "coverage"))) void 
 }
 }  // namespace
 
+void restore_debug_registers_for_task(sched::task::Task* task) { restore_debug_registers(task); }
+
+void install_task_cpu_bases(sched::task::Task* next_task, uint64_t cpu_id) {
+    auto* scratch_area = reinterpret_cast<cpu::PerCpu*>(next_task->context.syscall_scratch_area);
+    scratch_area->cpu_id = cpu_id;
+
+    // These bases are part of the syscall/interrupt ABI.  Do not infer the
+    // actual CPU state from current_task here: entry/return assembly can change
+    // GS state independently of scheduler metadata.
+    cpu::wrgsbase(next_task->context.syscall_scratch_area);
+    if (next_task->thread != nullptr) {
+        cpu_set_msr(IA32_KERNEL_GS_BASE, next_task->thread->gsbase);
+        cpu::wrfsbase(next_task->thread->fsbase);
+    } else {
+        cpu_set_msr(IA32_KERNEL_GS_BASE, next_task->context.syscall_scratch_area);
+    }
+}
+
 auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task* next_task) -> bool {
     // CRITICAL: We must do ALL validation BEFORE modifying any state.
     // If we modify gpr/frame but fail to switch pagemap, the iretq will use
@@ -374,7 +409,7 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
     // Only validate user-mode context for PROCESS tasks (IDLE/DAEMON run in ring 0)
     // Skip validation when voluntary_block is set - the saved context is legitimately
     // kernel-mode (task was preempted at a safe blocking point like sti;hlt in a syscall).
-    if (next_task->type == sched::task::TaskType::PROCESS && !next_task->voluntary_block) {
+    if (next_task->type == sched::task::TaskType::PROCESS && !next_task->is_voluntary_blocked()) {
         if (frame.cs != desc::gdt::GDT_USER_CS) {
             dbg::log("switchTo: CORRUPT cs=0x%x (expected 0x%x) PID %x", frame.cs, desc::gdt::GDT_USER_CS, next_task->pid);
             for (;;) {
@@ -401,23 +436,11 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
         }
     }
 
-    // Update scratch area cpu_id
-    auto* scratch_area = reinterpret_cast<cpu::PerCpu*>(next_task->context.syscall_scratch_area);
-    scratch_area->cpu_id = REAL_CPU_ID;
+    install_task_cpu_bases(next_task, REAL_CPU_ID);
 
-    // Set up GS/FS bases
-    if (next_task->thread != nullptr) {
-        cpu::wrgsbase(next_task->context.syscall_scratch_area);
-        cpu_set_msr(IA32_KERNEL_GS_BASE, next_task->thread->gsbase);
-        cpu::wrfsbase(next_task->thread->fsbase);
-    } else {
-        // Idle task uses kernel-allocated scratch area for both
-        cpu::wrgsbase(next_task->context.syscall_scratch_area);
-        cpu_set_msr(IA32_KERNEL_GS_BASE, next_task->context.syscall_scratch_area);
-    }
-
-    // Switch pagemap for user tasks
-    // We've already validated pagemap != nullptr for user tasks above
+    // Switch pagemap for user tasks.  Keep the unconditional CR3 reload inside
+    // mm::virt::switch_pagemap(): it also refreshes kernel mappings and owns
+    // the stale-TLB/address-space-reuse guard.
     if (next_task->pagemap != nullptr) {
         mm::virt::switch_pagemap(next_task);
     }
@@ -426,7 +449,7 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
     if (next_task->type == sched::task::TaskType::PROCESS && next_task->fx_state.saved) {
         restore_fpu_state(next_task);
     }
-    restore_debug_registers(next_task);
+    restore_debug_registers_for_task(next_task);
 
     return true;
 }
@@ -639,7 +662,7 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
                     dbg::log("schedhot: cpu%lu pid=%lu(%s) streak=%lu type=%u vblk=%u wblk=%u pinned=%u runq=%lu waitq=%lu cs=0x%x",
                              static_cast<unsigned long>(CPU_NO), static_cast<unsigned long>(return_task->pid),
                              return_task->name != nullptr ? return_task->name : "?", static_cast<unsigned long>(tracker.streak),
-                             static_cast<unsigned>(return_task->type), return_task->voluntary_block ? 1U : 0U,
+                             static_cast<unsigned>(return_task->type), return_task->is_voluntary_blocked() ? 1U : 0U,
                              return_task->wants_block ? 1U : 0U, return_task->cpu_pinned ? 1U : 0U,
                              static_cast<unsigned long>(stats.active_task_count), static_cast<unsigned long>(stats.wait_queue_count),
                              static_cast<unsigned>(frame_ptr->cs));

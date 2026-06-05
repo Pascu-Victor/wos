@@ -427,7 +427,7 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->waited_on = false;
     t->deferred_task_switch = false;
     t->yield_switch = false;
-    t->voluntary_block = false;
+    t->set_voluntary_blocked(false);
     t->waiting_for_pid = 0;
     t->wait_status_user_addr = 0;
     t->wait_status_phys_addr = 0;

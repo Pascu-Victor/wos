@@ -661,7 +661,7 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz, bool thread_view) ->
     append("\nDeferredSwitch:\t");
     append(task->deferred_task_switch ? "1" : "0");
     append("\nVoluntaryBlock:\t");
-    append(task->voluntary_block ? "1" : "0");
+    append(task->is_voluntary_blocked() ? "1" : "0");
     append("\nWaitingForPid:\t");
     append_int(task->waiting_for_pid);
 

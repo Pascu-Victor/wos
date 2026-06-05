@@ -162,8 +162,8 @@ void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
         if (waiter_matches_child(parent, child) && !parent->deferred_task_switch) {
             complete_exit_wait(parent, child, parent->waiting_for_pid == WAIT_ANY_CHILD ? "exit-any" : "exit-specific-parent");
             wake_parent = true;
-        } else if ((waiter_matches_child(parent, child) && parent->voluntary_block) || parent->deferred_task_switch ||
-                   parent->voluntary_block) {
+        } else if ((waiter_matches_child(parent, child) && parent->is_voluntary_blocked()) || parent->deferred_task_switch ||
+                   parent->is_voluntary_blocked()) {
             // The deferred switch path will re-check waitability after it saves
             // the parent's syscall context.  This is also how unrelated blocking
             // syscalls notice SIGCHLD promptly.

@@ -118,13 +118,13 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
         }
         // Uncatchable stop signal
         if (SIGNO == WOS_SIGSTOP) {
-            task->voluntary_block = true;
+            task->set_voluntary_blocked(true);
             return 0;
         }
         // Job control stop signals: default action is to stop the process
         if (SIGNO == 20 || SIGNO == 21 || SIGNO == 22) {  // SIGTSTP, SIGTTIN, SIGTTOU
             // Block the task so the scheduler won't run it until SIGCONT
-            task->voluntary_block = true;
+            task->set_voluntary_blocked(true);
             return 0;
         }
         // Default terminate semantics for normal fatal signals.
@@ -201,7 +201,7 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
     // Only deliver on a direct return to userspace. Voluntary-blocked tasks
     // can carry a kernel-mode context in frame/gpr and must use the existing
     // deferred resume path instead.
-    if ((frame.cs & 0x3) != 0x3 || task->voluntary_block) {
+    if ((frame.cs & 0x3) != 0x3 || task->is_voluntary_blocked()) {
         return;
     }
 
@@ -228,11 +228,11 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
             return;
         }
         if (SIGNO == WOS_SIGSTOP) {
-            task->voluntary_block = true;
+            task->set_voluntary_blocked(true);
             return;
         }
         if (SIGNO == 20 || SIGNO == 21 || SIGNO == 22) {
-            task->voluntary_block = true;
+            task->set_voluntary_blocked(true);
             return;
         }
         if (SIGNO == WOS_SIGHUP || SIGNO == WOS_SIGINT || SIGNO == WOS_SIGQUIT || SIGNO == WOS_SIGTERM || SIGNO == WOS_SIGKILL ||

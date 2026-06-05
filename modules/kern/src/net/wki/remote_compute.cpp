@@ -715,7 +715,7 @@ void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status
                     cpu = ker::mod::sched::get_least_loaded_cpu();
                 }
                 ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
-            } else if (parent->deferred_task_switch || parent->voluntary_block) {
+            } else if (parent->deferred_task_switch || parent->is_voluntary_blocked()) {
                 uint64_t cpu = parent->cpu;
                 if (cpu >= ker::mod::smt::get_core_count()) {
                     cpu = ker::mod::sched::get_least_loaded_cpu();
