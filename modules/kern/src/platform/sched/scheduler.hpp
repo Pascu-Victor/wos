@@ -69,6 +69,7 @@ struct RunQueue {
     std::atomic<uint64_t> scheduler_timer_arm_runqueue;
     std::atomic<uint64_t> scheduler_timer_arm_competitor;
     std::atomic<uint64_t> wake_ipis_sent;
+    std::atomic<uint64_t> wake_ipis_coalesced;
     std::atomic<uint64_t> local_reschedule_requests;
     std::atomic<uint64_t> local_reschedule_timer_pokes;
     std::atomic<uint64_t> slow_reschedule_scans;
@@ -115,6 +116,7 @@ struct RunQueue {
           scheduler_timer_arm_runqueue(0),
           scheduler_timer_arm_competitor(0),
           wake_ipis_sent(0),
+          wake_ipis_coalesced(0),
           local_reschedule_requests(0),
           local_reschedule_timer_pokes(0),
           slow_reschedule_scans(0),
@@ -150,6 +152,7 @@ struct SchedulerTraceStats {
     uint64_t scheduler_timer_arm_runqueue;
     uint64_t scheduler_timer_arm_competitor;
     uint64_t wake_ipis_sent;
+    uint64_t wake_ipis_coalesced;
     uint64_t local_reschedule_requests;
     uint64_t local_reschedule_timer_pokes;
     uint64_t slow_reschedule_scans;

@@ -2152,10 +2152,10 @@ void cmd_cpustat() {
     }
 
     std::println("");
-    std::println("{:>4}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}", "CPU", "idle_arm", "idle_disarm",
-                 "idle_wake", "wake_ipi", "gc_pass", "gc_reclaim", "gc_us", "gc_max_us", "lb_push");
-    std::println("{:->4}  {:->10}  {:->12}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->8}", "", "", "", "", "", "", "", "",
-                 "", "");
+    std::println("{:>4}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}", "CPU", "idle_arm", "idle_disarm",
+                 "idle_wake", "wake_ipi", "wake_coal", "gc_pass", "gc_reclaim", "gc_us", "gc_max_us", "lb_push");
+    std::println("{:->4}  {:->10}  {:->12}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->8}", "", "", "", "", "", "",
+                 "", "", "", "", "");
 
     pos = 0;
     while (pos < buffer->size()) {
@@ -2174,9 +2174,9 @@ void cmd_cpustat() {
             return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
         };
 
-        std::println("{:>4}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}", get_val("cpu="), get_val("idle_arm="),
-                     get_val("idle_disarm="), get_val("idle_wake="), get_val("wake_ipi="), get_val("gc_pass="), get_val("gc_reclaim="),
-                     get_val("gc_us="), get_val("gc_max_us="), get_val("lb_push="));
+        std::println("{:>4}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}", get_val("cpu="),
+                     get_val("idle_arm="), get_val("idle_disarm="), get_val("idle_wake="), get_val("wake_ipi="), get_val("wake_coal="),
+                     get_val("gc_pass="), get_val("gc_reclaim="), get_val("gc_us="), get_val("gc_max_us="), get_val("lb_push="));
     }
 
     std::println("");

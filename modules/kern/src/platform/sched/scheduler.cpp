@@ -1510,6 +1510,7 @@ void wake_cpu(uint64_t cpu_no) {
         // remote wakeups before that timer fires do not need more IPIs.  The
         // timer interrupt clears this bit in note_scheduler_timer_interrupt().
         if (rq->resched_timer_pending.exchange(true, std::memory_order_acq_rel)) {
+            rq->wake_ipis_coalesced.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         rq->wake_ipis_sent.fetch_add(1, std::memory_order_relaxed);
@@ -4659,6 +4660,7 @@ auto get_scheduler_trace_stats(uint64_t cpu_no) -> SchedulerTraceStats {
             .scheduler_timer_arm_runqueue = rq->scheduler_timer_arm_runqueue.load(std::memory_order_relaxed),
             .scheduler_timer_arm_competitor = rq->scheduler_timer_arm_competitor.load(std::memory_order_relaxed),
             .wake_ipis_sent = rq->wake_ipis_sent.load(std::memory_order_relaxed),
+            .wake_ipis_coalesced = rq->wake_ipis_coalesced.load(std::memory_order_relaxed),
             .local_reschedule_requests = rq->local_reschedule_requests.load(std::memory_order_relaxed),
             .local_reschedule_timer_pokes = rq->local_reschedule_timer_pokes.load(std::memory_order_relaxed),
             .slow_reschedule_scans = rq->slow_reschedule_scans.load(std::memory_order_relaxed),
@@ -4721,26 +4723,27 @@ void dump_scheduler_trace_stats() {
     for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
         auto stats = get_scheduler_trace_stats(cpu_no);
         if (stats.idle_timer_arms == 0 && stats.idle_timer_disarms == 0 && stats.idle_timer_wakeups == 0 && stats.wake_ipis_sent == 0 &&
-            stats.local_reschedule_requests == 0 && stats.slow_reschedule_scans == 0 && stats.load_balance_pushes == 0 &&
-            stats.scheduler_timer_interrupts == 0 && stats.scheduler_timer_arms == 0 && stats.scheduler_timer_disarms == 0 &&
-            stats.local_reschedule_timer_pokes == 0 && stats.wait_list_scan_iterations == 0 && stats.timer_expired_wakeups == 0 &&
-            stats.gc_passes_triggered == 0 && stats.gc_tasks_reclaimed == 0) {
+            stats.wake_ipis_coalesced == 0 && stats.local_reschedule_requests == 0 && stats.slow_reschedule_scans == 0 &&
+            stats.load_balance_pushes == 0 && stats.scheduler_timer_interrupts == 0 && stats.scheduler_timer_arms == 0 &&
+            stats.scheduler_timer_disarms == 0 && stats.local_reschedule_timer_pokes == 0 && stats.wait_list_scan_iterations == 0 &&
+            stats.timer_expired_wakeups == 0 && stats.gc_passes_triggered == 0 && stats.gc_tasks_reclaimed == 0) {
             continue;
         }
 
         dbg::log(
             "schedstats: cpu%lu timer_irq=%lu sched_arm=%lu sched_disarm=%lu idle_arm=%lu idle_disarm=%lu idle_wake=%lu wake_ipi=%lu "
-            "local_resched=%lu local_poke=%lu slow_scan=%lu wait_scan=%lu timer_wake=%lu gc_pass=%lu gc_reclaim=%lu gc_us=%lu "
-            "gc_max_us=%lu lb_push=%lu",
+            "wake_coal=%lu local_resched=%lu local_poke=%lu slow_scan=%lu wait_scan=%lu timer_wake=%lu gc_pass=%lu gc_reclaim=%lu "
+            "gc_us=%lu gc_max_us=%lu lb_push=%lu",
             static_cast<unsigned long>(cpu_no), static_cast<unsigned long>(stats.scheduler_timer_interrupts),
             static_cast<unsigned long>(stats.scheduler_timer_arms), static_cast<unsigned long>(stats.scheduler_timer_disarms),
             static_cast<unsigned long>(stats.idle_timer_arms), static_cast<unsigned long>(stats.idle_timer_disarms),
             static_cast<unsigned long>(stats.idle_timer_wakeups), static_cast<unsigned long>(stats.wake_ipis_sent),
-            static_cast<unsigned long>(stats.local_reschedule_requests), static_cast<unsigned long>(stats.local_reschedule_timer_pokes),
-            static_cast<unsigned long>(stats.slow_reschedule_scans), static_cast<unsigned long>(stats.wait_list_scan_iterations),
-            static_cast<unsigned long>(stats.timer_expired_wakeups), static_cast<unsigned long>(stats.gc_passes_triggered),
-            static_cast<unsigned long>(stats.gc_tasks_reclaimed), static_cast<unsigned long>(stats.gc_work_us_total),
-            static_cast<unsigned long>(stats.gc_work_us_max), static_cast<unsigned long>(stats.load_balance_pushes));
+            static_cast<unsigned long>(stats.wake_ipis_coalesced), static_cast<unsigned long>(stats.local_reschedule_requests),
+            static_cast<unsigned long>(stats.local_reschedule_timer_pokes), static_cast<unsigned long>(stats.slow_reschedule_scans),
+            static_cast<unsigned long>(stats.wait_list_scan_iterations), static_cast<unsigned long>(stats.timer_expired_wakeups),
+            static_cast<unsigned long>(stats.gc_passes_triggered), static_cast<unsigned long>(stats.gc_tasks_reclaimed),
+            static_cast<unsigned long>(stats.gc_work_us_total), static_cast<unsigned long>(stats.gc_work_us_max),
+            static_cast<unsigned long>(stats.load_balance_pushes));
     }
 }
 

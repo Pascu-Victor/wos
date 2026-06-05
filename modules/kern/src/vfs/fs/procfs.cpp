@@ -2980,6 +2980,8 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, sched.idle_timer_wakeups);
         append_sconst(p, end, " wake_ipi=");
         append_dec64(p, end, sched.wake_ipis_sent);
+        append_sconst(p, end, " wake_coal=");
+        append_dec64(p, end, sched.wake_ipis_coalesced);
         append_sconst(p, end, " local_resched=");
         append_dec64(p, end, sched.local_reschedule_requests);
         append_sconst(p, end, " local_poke=");
@@ -3059,8 +3061,13 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
              pfd->node.type == ProcNodeType::MEMACC_PAGE_CALLERS_FILE || pfd->node.type == ProcNodeType::MEMACC_FEATURES_FILE ||
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_BUFFER_CACHE_FILE ||
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_PACKET_POOL_FILE);
-        size_t const ALLOC_SZ = IS_MEMACC ? MAX_MEMACC_BUF : (IS_KPERF ? MAX_KPERF_BUF : MAX_PROCFS_BUF);
-        pfd->content = new (std::nothrow) char[ALLOC_SZ];
+        size_t alloc_sz = MAX_PROCFS_BUF;
+        if (IS_MEMACC) {
+            alloc_sz = MAX_MEMACC_BUF;
+        } else if (IS_KPERF) {
+            alloc_sz = MAX_KPERF_BUF;
+        }
+        pfd->content = new (std::nothrow) char[alloc_sz];
         if (pfd->content == nullptr) {
             return -ENOMEM;
         }
