@@ -10,7 +10,6 @@
 #include <vector>
 
 #include "debug_info.hpp"
-#include "mod/io/serial/serial.hpp"
 #include "platform/asm/cpu.hpp"
 #include "platform/dbg/dbg.hpp"
 #include "platform/ktime/ktime.hpp"
@@ -53,6 +52,7 @@ constexpr uint64_t SHF_TLS = 0x400;
 
 namespace ker::loader::elf {
 namespace {
+using log = mod::dbg::logger<"elf">;
 
 auto header_is_valid(const Elf64_Ehdr& ehdr) -> bool {
     return ehdr.e_ident[EI_CLASS] == ELFCLASS64                  // 64-bit
@@ -623,7 +623,7 @@ auto load_segment(uint8_t* elf_base, ker::mod::mm::virt::PageTable* pagemap, Elf
 
     // Additional validation for PIE executables
     if (base_offset != 0 && PAGE_VA < mod::mm::virt::PAGE_SIZE) {
-        ker::mod::io::serial::write("PIE program trying to map too low address 0x%x\n", PAGE_VA);
+        log::error("PIE program trying to map too low address 0x%lx", PAGE_VA);
         return {};
     }
 

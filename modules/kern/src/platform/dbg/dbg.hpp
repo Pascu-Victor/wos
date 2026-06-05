@@ -45,6 +45,40 @@ void emit_kernel_log(const char* module, LogLevel level, const char* format, ...
 void set_serial_threshold(LogLevel level);
 auto get_serial_threshold() -> LogLevel;
 
+// Raw serial output for early-boot and emergency diagnostics only.
+// This bypasses the journal and writes directly to the UART using the serial
+// driver's unlocked path under a scoped serial lock.
+namespace emergency_serial {
+void write(const char* str);
+void write(const char* str, uint64_t len);
+void write(char c);
+void write(uint64_t num);
+void write_hex(uint64_t num);
+void write_bin(uint64_t num);
+}  // namespace emergency_serial
+
+// Emergency UART output that intentionally bypasses the serial lock.
+// Use only for panic/deadlock diagnostics where attempting to take the serial
+// lock could itself wedge the system.
+namespace emergency_serial_unlocked {
+void write(const char* str);
+void write(const char* str, uint64_t len);
+void write(char c);
+void write(uint64_t num);
+void write_hex(uint64_t num);
+void write_bin(uint64_t num);
+}  // namespace emergency_serial_unlocked
+
+void emergency_log_var(const char* format, ...);
+template <typename... Args>
+void emergency_log(const char* format, Args... args) {
+    if constexpr (sizeof...(args) == 0) {
+        emergency_serial::write(format);
+    } else {
+        emergency_log_var(format, args...);
+    }
+}
+
 template <FixedString Tag>
 // NOLINTNEXTLINE(readability-identifier-naming)
 struct logger {

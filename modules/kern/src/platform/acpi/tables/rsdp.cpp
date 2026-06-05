@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "mod/io/serial/serial.hpp"
+#include "platform/dbg/dbg.hpp"
 #include "util/hcf.hpp"
 
 namespace ker::mod::acpi::rsdp {
@@ -22,7 +22,7 @@ void validate_checksum(const Rsdp* rsdp) {
     }
 
     if ((sum & 0xFF) != 0) {
-        io::serial::write("ACPI: RSDP checksum failed\n");
+        dbg::emergency_log("ACPI: RSDP checksum failed\n");
         hcf();
     }
 }

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <platform/asm/cpu.hpp>
+#include <platform/sched/scheduler.hpp>
 
 #include "mod/io/port/port.hpp"
 
@@ -16,11 +17,13 @@ constexpr uint16_t STATUS_PORT = DATA_PORT + 5;
 constexpr uint8_t STATUS_TX_READY = 0x20;
 constexpr uint8_t OP_DISABLE_INTERRUPTS = 0x00;
 bool is_init = false;
-// Reentrant spinlock: tracks owner CPU and recursion depth
-// Use UINT64_MAX for "no owner"
-constexpr uint64_t NO_OWNER = UINT64_MAX;
-std::atomic<uint64_t> lock_owner{NO_OWNER};
+// Reentrant serial lock: track the owning task when scheduler context exists,
+// otherwise fall back to a tagged CPU id during very early boot.
+constexpr uintptr_t NO_OWNER = 0;
+constexpr uintptr_t FALLBACK_CPU_OWNER_TAG = 1;
+std::atomic<uintptr_t> lock_owner{NO_OWNER};
 std::atomic<uint64_t> lock_depth{0};
+ker::mod::sched::task::Task* lock_preempt_owner = nullptr;
 std::atomic<bool> cpu_id_available{false};
 
 // Set to true once any CPU enters panic mode.
@@ -28,6 +31,19 @@ std::atomic<bool> in_panic_mode{false};
 // CPU index of the first CPU to call enterPanicMode().
 constexpr uint64_t NO_PANIC_OWNER = UINT64_MAX;
 std::atomic<uint64_t> panic_owner_cpu{NO_PANIC_OWNER};
+
+auto current_lock_owner() -> uintptr_t {
+    if (ker::mod::sched::can_query_current_task()) {
+        if (auto* task = ker::mod::sched::get_current_task(); task != nullptr) {
+            return reinterpret_cast<uintptr_t>(task);
+        }
+    }
+
+    uint64_t const CPU = cpu_id_available.load(std::memory_order_acquire) ? cpu::current_cpu() : 0;
+    return (static_cast<uintptr_t>(CPU) << 1U) | FALLBACK_CPU_OWNER_TAG;
+}
+
+auto is_task_owner(uintptr_t owner) -> bool { return owner != NO_OWNER && (owner & FALLBACK_CPU_OWNER_TAG) == 0; }
 }  // namespace
 
 void mark_cpu_id_available() { cpu_id_available.store(true, std::memory_order_release); }
@@ -67,20 +83,35 @@ void acquire_lock() {
         return;
     }
 
-    uint64_t const CPU = cpu_id_available.load(std::memory_order_acquire) ? cpu::current_cpu() : 0;
+    uintptr_t const OWNER = current_lock_owner();
 
-    // If we already own the lock, just increment depth (reentrant)
-    if (lock_owner.load(std::memory_order_relaxed) == CPU) {
+    // If we already own the lock, just increment depth (reentrant).
+    if (lock_owner.load(std::memory_order_relaxed) == OWNER) {
         lock_depth.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
-    // Spin until we can acquire
-    uint64_t expected = NO_OWNER;
-    while (!lock_owner.compare_exchange_weak(expected, CPU, std::memory_order_acquire, std::memory_order_relaxed)) {
+    // Prevent the owning task from being preempted while another CPU spins on
+    // the serial lock. Early boot fallback owners do not have scheduler state.
+    auto* const PREEMPT_OWNER =
+        is_task_owner(OWNER) ? ker::mod::sched::preempt_disable_token_at(reinterpret_cast<uint64_t>(__builtin_return_address(0))) : nullptr;
+
+    // Spin until we can acquire. If an interrupt on this CPU re-entered the
+    // lock after we disabled preemption but before the CAS below, treat that as
+    // a same-owner recursive acquisition instead of taking the lock twice.
+    uintptr_t expected = NO_OWNER;
+    while (!lock_owner.compare_exchange_weak(expected, OWNER, std::memory_order_acquire, std::memory_order_relaxed)) {
+        if (expected == OWNER) {
+            if (PREEMPT_OWNER != nullptr) {
+                ker::mod::sched::preempt_enable_token_at(PREEMPT_OWNER, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+            }
+            lock_depth.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         expected = NO_OWNER;
         asm volatile("pause");
     }
+    lock_preempt_owner = PREEMPT_OWNER;
     lock_depth.store(1, std::memory_order_relaxed);
 }
 
@@ -92,7 +123,12 @@ void release_lock() {
 
     uint64_t const DEPTH = lock_depth.fetch_sub(1, std::memory_order_relaxed);
     if (DEPTH == 1) {
+        auto* const PREEMPT_OWNER = lock_preempt_owner;
+        lock_preempt_owner = nullptr;
         lock_owner.store(NO_OWNER, std::memory_order_release);
+        if (PREEMPT_OWNER != nullptr) {
+            ker::mod::sched::preempt_enable_token_at(PREEMPT_OWNER, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+        }
     }
 }
 
@@ -103,50 +139,6 @@ void write_char_unlocked(char c) {
         ;
     }
     outb(DATA_PORT, c);
-}
-
-// Per-CPU line buffers: each CPU accumulates characters here and only takes
-// the serial lock when flushing a complete line or on overflow. This prevents
-// characters from different CPUs interleaving within a single output line.
-constexpr size_t MAX_CPUS = 256;
-constexpr size_t BUF_DATA_SIZE = 256 - sizeof(size_t);  // 248 bytes, struct = 256 = 4 cache lines
-constexpr size_t SERIAL_BUF_ALIGNMENT = 256;            // Align to cache line size to avoid false sharing
-
-struct alignas(SERIAL_BUF_ALIGNMENT) CpuSerialBuf {
-    size_t len = 0;
-    std::array<char, BUF_DATA_SIZE> data{};
-};
-static_assert(sizeof(CpuSerialBuf) == SERIAL_BUF_ALIGNMENT, "CpuSerialBuf must be 256 bytes");
-
-std::array<CpuSerialBuf, MAX_CPUS> cpu_bufs{};
-
-auto get_buf_idx() -> size_t {
-    if (!cpu_id_available.load(std::memory_order_acquire)) {
-        return 0;  // during early boot all CPUs share buffer 0 (they run serially at that point)
-    }
-    return cpu::current_cpu() % MAX_CPUS;
-}
-
-void flush_buf(size_t idx) {
-    CpuSerialBuf& buf = cpu_bufs[idx];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-    if (buf.len == 0) {
-        return;
-    }
-    acquire_lock();
-    for (size_t i = 0; i < buf.len; i++) {
-        write_char_unlocked(buf.data[i]);  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-    }
-    release_lock();
-    buf.len = 0;
-}
-
-void buf_char(char c) {
-    size_t const IDX = get_buf_idx();
-    CpuSerialBuf& buf = cpu_bufs[IDX];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-    buf.data[buf.len++] = c;            // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-    if (c == '\n' || buf.len >= buf.data.size()) {
-        flush_buf(IDX);
-    }
 }
 }  // namespace
 
@@ -172,18 +164,23 @@ void init() {
 }
 
 void write(const char* str) {
+    ScopedLock const LOCK;
     for (size_t i = 0; str[i] != '\0'; i++) {
-        buf_char(str[i]);
+        write_char_unlocked(str[i]);
     }
 }
 
 void write(const char* str, uint64_t len) {
+    ScopedLock const LOCK;
     for (size_t i = 0; i < len; i++) {
-        buf_char(str[i]);
+        write_char_unlocked(str[i]);
     }
 }
 
-void write(const char C) { buf_char(C); }
+void write(const char C) {
+    ScopedLock const LOCK;
+    write_char_unlocked(C);
+}
 
 // NOLINTBEGIN(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access): fixed-size numeric formatting buffers.
 void write(uint64_t num) {
@@ -200,7 +197,8 @@ void write(uint64_t num) {
             num /= BASE;
         }
     }
-    write(str.data() + pos);
+    ScopedLock const LOCK;
+    write_unlocked(str.data() + pos);
 }
 
 void write_hex(uint64_t num) {
@@ -217,7 +215,8 @@ void write_hex(uint64_t num) {
     while (start < BUF_SIZE - 1 && str[start] == '0') {
         ++start;
     }
-    write(str.data() + start);
+    ScopedLock const LOCK;
+    write_unlocked(str.data() + start);
 }
 
 void write_bin(uint64_t num) {
@@ -227,7 +226,8 @@ void write_bin(uint64_t num) {
     for (uint64_t i = BUF_SIZE - 1; i > 0; i--) {
         str[static_cast<size_t>(BUF_SIZE - 2 - (i - 1))] = ((num & (1ULL << (i - 1))) != 0U) ? '1' : '0';
     }
-    write(str.data());
+    ScopedLock const LOCK;
+    write_unlocked(str.data());
 }
 
 // Unlocked write variants - caller must hold lock

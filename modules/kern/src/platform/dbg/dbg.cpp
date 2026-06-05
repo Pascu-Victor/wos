@@ -21,6 +21,7 @@ constexpr int MAX_RAW_STACK_TRACE = 64;
 constexpr size_t TIME_SEC_BUF_SIZE = 10;  // good enough for 30 years of uptime
 constexpr size_t TIME_MS_BUF_SIZE = 5;
 constexpr size_t U64_CONVERSION_BUF_SIZE = 32;
+constexpr size_t EMERGENCY_LOG_BUF_SIZE = abi::sys_log::JOURNAL_MESSAGE_MAX;
 sys::Spinlock log_lock{};
 bool is_init = false;
 bool is_time_available = false;
@@ -29,6 +30,56 @@ uint64_t lines_logged = 0;
 }  // namespace
 
 using namespace ker::mod;
+
+namespace emergency_serial {
+
+void write(const char* str) {
+    io::serial::ScopedLock const LOCK;
+    io::serial::write_unlocked(str);
+}
+
+void write(const char* str, uint64_t len) {
+    io::serial::ScopedLock const LOCK;
+    io::serial::write_unlocked(str, len);
+}
+
+void write(char c) {
+    io::serial::ScopedLock const LOCK;
+    io::serial::write_unlocked(c);
+}
+
+void write(uint64_t num) {
+    io::serial::ScopedLock const LOCK;
+    io::serial::write_unlocked(num);
+}
+
+void write_hex(uint64_t num) {
+    io::serial::ScopedLock const LOCK;
+    io::serial::write_hex_unlocked(num);
+}
+
+void write_bin(uint64_t num) {
+    io::serial::ScopedLock const LOCK;
+    io::serial::write_bin_unlocked(num);
+}
+
+}  // namespace emergency_serial
+
+namespace emergency_serial_unlocked {
+
+void write(const char* str) { io::serial::write_unlocked(str); }
+
+void write(const char* str, uint64_t len) { io::serial::write_unlocked(str, len); }
+
+void write(char c) { io::serial::write_unlocked(c); }
+
+void write(uint64_t num) { io::serial::write_unlocked(num); }
+
+void write_hex(uint64_t num) { io::serial::write_hex_unlocked(num); }
+
+void write_bin(uint64_t num) { io::serial::write_bin_unlocked(num); }
+
+}  // namespace emergency_serial_unlocked
 
 void init() {
     if (is_init) {
@@ -114,7 +165,7 @@ void fb_log(const char* str) {
         stamp_len++;
         lines_logged += gfx::fb::draw_string(stamp_len, line, str);
     } else {
-        mod::io::serial::write("Tried to write to framebuffer, module not enabled\n");
+        emergency_serial::write("Tried to write to framebuffer, module not enabled\n");
     }
 }
 
@@ -200,6 +251,26 @@ void emit_kernel_log(const char* module, LogLevel level, const char* format, ...
 void set_serial_threshold(LogLevel level) { journal::set_serial_threshold(level); }
 
 auto get_serial_threshold() -> LogLevel { return journal::get_serial_threshold(); }
+
+void emergency_log_var(const char* format, ...) {
+    std::array<char, EMERGENCY_LOG_BUF_SIZE> buf{};
+    va_list args;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    va_start(args, format);
+    if (format == nullptr) {
+        emergency_serial::write("(null)");
+        va_end(args);
+        return;
+    }
+    int const WRITTEN = std::vsnprintf(buf.data(), buf.size(), format, args);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+    va_end(args);
+    if (WRITTEN < 0) {
+        emergency_serial::write("emergency_log formatting failed");
+        return;
+    }
+    emergency_serial::write(buf.data());
+}
 
 namespace {
 

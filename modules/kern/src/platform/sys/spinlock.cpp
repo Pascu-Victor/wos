@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
 
 #if SPINLOCK_DEBUG
@@ -13,6 +14,7 @@ static constexpr uint64_t SPINLOCK_DEBUG_THRESHOLD = 100'000'000;
 namespace ker::mod::sys {
 
 namespace {
+namespace emergency_serial = ker::mod::dbg::emergency_serial_unlocked;
 
 #if SPINLOCK_DEBUG
 void print_hex(uint64_t val) {
@@ -22,7 +24,7 @@ void print_hex(uint64_t val) {
         hex[static_cast<size_t>(15 - i)] = nibble < 10 ? static_cast<char>('0' + nibble) : static_cast<char>('a' + nibble - 10);
     }
     hex[16] = '\0';
-    io::serial::writeUnlocked(hex.data());
+    emergency_serial::write(hex.data());
 }
 
 void print_uint(uint32_t val) {
@@ -37,7 +39,7 @@ void print_uint(uint32_t val) {
             val /= 10;
         }
     }
-    io::serial::writeUnlocked(buf.data() + pos);
+    emergency_serial::write(buf.data() + pos);
 }
 
 // Walk the RBP chain from the given frame pointer and store return addresses.
@@ -59,17 +61,17 @@ void walk_stack(void** fp, void** out, int depth) {
 }
 
 void print_stack(void** frames, int depth, const char* label) {
-    io::serial::writeUnlocked(label);
-    io::serial::writeUnlocked("\n");
+    emergency_serial::write(label);
+    emergency_serial::write("\n");
     for (int i = 0; i < depth; i++) {
         if (frames[i] == nullptr) {
             break;
         }
-        io::serial::writeUnlocked("  #");
+        emergency_serial::write("  #");
         print_uint(static_cast<uint32_t>(i));
-        io::serial::writeUnlocked(" 0x");
+        emergency_serial::write(" 0x");
         print_hex(reinterpret_cast<uint64_t>(frames[i]));
-        io::serial::writeUnlocked("\n");
+        emergency_serial::write("\n");
     }
 }
 
@@ -91,11 +93,11 @@ void lock_ticket(Spinlock* lock) {
         if (!warned && ++spins >= SPINLOCK_DEBUG_THRESHOLD) {
             warned = true;
 
-            io::serial::writeUnlocked("!!! SPINLOCK STUCK: waiter=0x");
+            emergency_serial::write("!!! SPINLOCK STUCK: waiter=0x");
             print_hex(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-            io::serial::writeUnlocked(" owner=0x");
+            emergency_serial::write(" owner=0x");
             print_hex(reinterpret_cast<uint64_t>(lock->owner_caller));
-            io::serial::writeUnlocked("\n");
+            emergency_serial::write("\n");
 
             // Waiter stack trace (current execution context)
             std::array<void*, Spinlock::SPINLOCK_STACK_DEPTH> waiter_frames{};

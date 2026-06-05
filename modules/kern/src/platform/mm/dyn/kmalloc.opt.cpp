@@ -6,7 +6,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <mod/io/serial/serial.hpp>
 #include <new>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/asm/cpu.hpp>
@@ -24,6 +23,7 @@
 #endif
 
 namespace ker::mod::mm::dyn::kmalloc {
+namespace emergency_serial = ker::mod::dbg::emergency_serial;
 
 static constexpr int NUM_SLAB_CLASSES = 9;
 static constexpr int MAGAZINE_CAPACITY = 32;
@@ -275,94 +275,94 @@ void dump_tracked_allocations() {
     uint64_t const MEDIUM_LOCK_FLAGS = medium_alloc_lock.lock_irqsave();
     uint64_t medium_total_bytes = 0;
     uint64_t medium_count = 0;
-    ker::mod::io::serial::write("kmalloc: Medium allocations (0x801-0xFFFF):\n");
+    emergency_serial::write("kmalloc: Medium allocations (0x801-0xFFFF):\n");
 
     for (MediumAllocationHeader const* curr = medium_alloc_list; curr != nullptr; curr = curr->next) {
         if (curr->magic == MEDIUM_ALLOC_MAGIC) {
             medium_count++;
             medium_total_bytes += curr->size;
-            ker::mod::io::serial::write("  addr=0x");
-            ker::mod::io::serial::write_hex((uint64_t)(curr + 1));
-            ker::mod::io::serial::write(" size=0x");
-            ker::mod::io::serial::write_hex(curr->size);
+            emergency_serial::write("  addr=0x");
+            emergency_serial::write_hex((uint64_t)(curr + 1));
+            emergency_serial::write(" size=0x");
+            emergency_serial::write_hex(curr->size);
 #ifdef WOS_KMALLOC_DEBUG_INFO
             uint64_t caller = 0;
             const char* tag = nullptr;
             if (debug_ref_has_any_generation(curr->debug_info, caller, tag)) {
-                ker::mod::io::serial::write(" caller=0x");
-                ker::mod::io::serial::write_hex(caller);
+                emergency_serial::write(" caller=0x");
+                emergency_serial::write_hex(caller);
                 if (tag != nullptr) {
-                    ker::mod::io::serial::write(" tag=");
-                    ker::mod::io::serial::write(tag);
+                    emergency_serial::write(" tag=");
+                    emergency_serial::write(tag);
                 }
             }
 #endif
-            ker::mod::io::serial::write("\n");
+            emergency_serial::write("\n");
         }
     }
     medium_alloc_lock.unlock_irqrestore(MEDIUM_LOCK_FLAGS);
 
-    ker::mod::io::serial::write("  medium_total: 0x");
-    ker::mod::io::serial::write_hex(medium_count);
-    ker::mod::io::serial::write(" entries, 0x");
-    ker::mod::io::serial::write_hex(medium_total_bytes);
-    ker::mod::io::serial::write(" bytes\n");
+    emergency_serial::write("  medium_total: 0x");
+    emergency_serial::write_hex(medium_count);
+    emergency_serial::write(" entries, 0x");
+    emergency_serial::write_hex(medium_total_bytes);
+    emergency_serial::write(" bytes\n");
 
     uint64_t const LARGE_LOCK_FLAGS = large_alloc_lock.lock_irqsave();
     uint64_t large_total_bytes = 0;
     uint64_t large_count = 0;
-    ker::mod::io::serial::write("kmalloc: Large allocations (>=0x10000):\n");
+    emergency_serial::write("kmalloc: Large allocations (>=0x10000):\n");
 
     for (LargeAllocationHeader const* curr = large_alloc_list; curr != nullptr; curr = curr->next) {
         if (curr->magic == LARGE_ALLOC_MAGIC) {
             large_count++;
             large_total_bytes += curr->size;
-            ker::mod::io::serial::write("  addr=0x");
-            ker::mod::io::serial::write_hex((uint64_t)(curr + 1));  // Data starts after header
-            ker::mod::io::serial::write(" size=0x");
-            ker::mod::io::serial::write_hex(curr->size);
+            emergency_serial::write("  addr=0x");
+            emergency_serial::write_hex((uint64_t)(curr + 1));  // Data starts after header
+            emergency_serial::write(" size=0x");
+            emergency_serial::write_hex(curr->size);
 #ifdef WOS_KMALLOC_DEBUG_INFO
             uint64_t caller = 0;
             const char* tag = nullptr;
             if (debug_ref_has_any_generation(curr->debug_info, caller, tag)) {
-                ker::mod::io::serial::write(" caller=0x");
-                ker::mod::io::serial::write_hex(caller);
+                emergency_serial::write(" caller=0x");
+                emergency_serial::write_hex(caller);
                 if (tag != nullptr) {
-                    ker::mod::io::serial::write(" tag=");
-                    ker::mod::io::serial::write(tag);
+                    emergency_serial::write(" tag=");
+                    emergency_serial::write(tag);
                 }
             }
 #endif
-            ker::mod::io::serial::write("\n");
+            emergency_serial::write("\n");
         }
     }
 
-    ker::mod::io::serial::write("  large_total: 0x");
-    ker::mod::io::serial::write_hex(large_count);
-    ker::mod::io::serial::write(" entries, 0x");
-    ker::mod::io::serial::write_hex(large_total_bytes);
-    ker::mod::io::serial::write(" bytes\n");
+    emergency_serial::write("  large_total: 0x");
+    emergency_serial::write_hex(large_count);
+    emergency_serial::write(" entries, 0x");
+    emergency_serial::write_hex(large_total_bytes);
+    emergency_serial::write(" bytes\n");
     large_alloc_lock.unlock_irqrestore(LARGE_LOCK_FLAGS);
 
 #ifdef WOS_KMALLOC_DEBUG_INFO
-    ker::mod::io::serial::write("kmalloc: Slab live allocations with debug info:\n");
+    emergency_serial::write("kmalloc: Slab live allocations with debug info:\n");
     mini_malloc::mini_iter_live_debug_slots(nullptr, [](void* /*ud*/, const void* ptr, size_t sz, uintptr_t debug_ref) -> void {
         uint64_t caller = 0;
         const char* tag = nullptr;
         if (!debug_ref_has_any_generation(reinterpret_cast<const AllocDebugInfo*>(debug_ref), caller, tag)) {
             return;
         }
-        ker::mod::io::serial::write("  addr=0x");
-        ker::mod::io::serial::write_hex((uint64_t)ptr);
-        ker::mod::io::serial::write(" sz=0x");
-        ker::mod::io::serial::write_hex(sz);
-        ker::mod::io::serial::write(" caller=0x");
-        ker::mod::io::serial::write_hex(caller);
+        emergency_serial::write("  addr=0x");
+        emergency_serial::write_hex((uint64_t)ptr);
+        emergency_serial::write(" sz=0x");
+        emergency_serial::write_hex(sz);
+        emergency_serial::write(" caller=0x");
+        emergency_serial::write_hex(caller);
         if (tag != nullptr) {
-            ker::mod::io::serial::write(" tag=");
-            ker::mod::io::serial::write(tag);
+            emergency_serial::write(" tag=");
+            emergency_serial::write(tag);
         }
-        ker::mod::io::serial::write("\n");
+        emergency_serial::write("\n");
     });
 #endif
 }
@@ -741,17 +741,17 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
         uint64_t const ALLOC_SIZE = (TOTAL_SIZE + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
 #ifdef DEBUG_KMALLOC
-        ker::mod::io::serial::write("kmalloc: Medium allocation (0x");
-        ker::mod::io::serial::writeHex(size);
-        ker::mod::io::serial::write(" bytes), using pageAlloc (0x");
-        ker::mod::io::serial::writeHex(alloc_size);
-        ker::mod::io::serial::write(" bytes)\n");
+        emergency_serial::write("kmalloc: Medium allocation (0x");
+        emergency_serial::write_hex(size);
+        emergency_serial::write(" bytes), using pageAlloc (0x");
+        emergency_serial::write_hex(ALLOC_SIZE);
+        emergency_serial::write(" bytes)\n");
 #endif
 
         void* alloc_ptr = phys::page_alloc(ALLOC_SIZE);
         if (alloc_ptr == nullptr) {
 #ifdef DEBUG_KMALLOC
-            ker::mod::io::serial::write("kmalloc: pageAlloc failed for medium allocation\n");
+            emergency_serial::write("kmalloc: pageAlloc failed for medium allocation\n");
 #endif
             return nullptr;
         }
@@ -790,11 +790,11 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
     uint64_t const ALLOC_SIZE = (TOTAL_SIZE + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
 #ifdef DEBUG_KMALLOC
-    ker::mod::io::serial::write("kmalloc: Large allocation (0x");
-    ker::mod::io::serial::writeHex(size);
-    ker::mod::io::serial::write(" bytes), using pageAllocHuge (0x");
-    ker::mod::io::serial::writeHex(alloc_size);
-    ker::mod::io::serial::write(" bytes)\n");
+    emergency_serial::write("kmalloc: Large allocation (0x");
+    emergency_serial::write_hex(size);
+    emergency_serial::write(" bytes), using pageAllocHuge (0x");
+    emergency_serial::write_hex(ALLOC_SIZE);
+    emergency_serial::write(" bytes)\n");
 #endif
 
     // Allocate from huge page zone
@@ -804,7 +804,7 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
         alloc_ptr = phys::page_alloc(ALLOC_SIZE);
         if (alloc_ptr == nullptr) {
 #ifdef DEBUG_KMALLOC
-            ker::mod::io::serial::write("kmalloc: pageAlloc failed for large allocation\n");
+            emergency_serial::write("kmalloc: pageAlloc failed for large allocation\n");
 #endif
             return nullptr;
         }
@@ -885,11 +885,11 @@ auto try_free_medium_alloc(void* data_ptr, uint64_t& out_size) -> TrackedFreeRes
         uint64_t caller = 0;
         const char* tag = nullptr;
         if (debug_ref_has_any_generation(node->debug_info, caller, tag)) {
-            ker::mod::io::serial::write(" caller=0x");
-            ker::mod::io::serial::write_hex(caller);
+            emergency_serial::write(" caller=0x");
+            emergency_serial::write_hex(caller);
             if (tag != nullptr) {
-                ker::mod::io::serial::write(" tag=");
-                ker::mod::io::serial::write(tag);
+                emergency_serial::write(" tag=");
+                emergency_serial::write(tag);
             }
         }
 #else
@@ -897,50 +897,50 @@ auto try_free_medium_alloc(void* data_ptr, uint64_t& out_size) -> TrackedFreeRes
 #endif
     };
 
-    ker::mod::io::serial::write("kmalloc: DoubleFree chain dump (target=0x");
-    ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(header));
-    ker::mod::io::serial::write(" size=0x");
-    ker::mod::io::serial::write_hex(header->size);
+    emergency_serial::write("kmalloc: DoubleFree chain dump (target=0x");
+    emergency_serial::write_hex(reinterpret_cast<uint64_t>(header));
+    emergency_serial::write(" size=0x");
+    emergency_serial::write_hex(header->size);
     print_debug_info(header);
-    ker::mod::io::serial::write("):\n");
+    emergency_serial::write("):\n");
 
     uint32_t n = 0;
     MediumAllocationHeader const* last_node = nullptr;
     bool found_corrupt = false;
     for (MediumAllocationHeader const* c = medium_alloc_list; c != nullptr && n < 8192; c = c->next, ++n) {
         if (c->magic != MEDIUM_ALLOC_MAGIC) {
-            ker::mod::io::serial::write("  BAD node=0x");
-            ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(c));
-            ker::mod::io::serial::write(" size=0x");
-            ker::mod::io::serial::write_hex(c->size);
-            ker::mod::io::serial::write(" magic=0x");
-            ker::mod::io::serial::write_hex(c->magic);
-            ker::mod::io::serial::write(" (prev had this as next)\n");
+            emergency_serial::write("  BAD node=0x");
+            emergency_serial::write_hex(reinterpret_cast<uint64_t>(c));
+            emergency_serial::write(" size=0x");
+            emergency_serial::write_hex(c->size);
+            emergency_serial::write(" magic=0x");
+            emergency_serial::write_hex(c->magic);
+            emergency_serial::write(" (prev had this as next)\n");
             found_corrupt = true;
             break;
         }
         MediumAllocationHeader const* nxt = c->next;
         if (nxt != nullptr && nxt->magic != MEDIUM_ALLOC_MAGIC) {
-            ker::mod::io::serial::write("  CORRUPT node=0x");
-            ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(c));
-            ker::mod::io::serial::write(" size=0x");
-            ker::mod::io::serial::write_hex(c->size);
+            emergency_serial::write("  CORRUPT node=0x");
+            emergency_serial::write_hex(reinterpret_cast<uint64_t>(c));
+            emergency_serial::write(" size=0x");
+            emergency_serial::write_hex(c->size);
             print_debug_info(c);
-            ker::mod::io::serial::write(" ->next=0x");
-            ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(nxt));
-            ker::mod::io::serial::write(" (next_magic=0x");
-            ker::mod::io::serial::write_hex(nxt->magic);
-            ker::mod::io::serial::write(")\n");
+            emergency_serial::write(" ->next=0x");
+            emergency_serial::write_hex(reinterpret_cast<uint64_t>(nxt));
+            emergency_serial::write(" (next_magic=0x");
+            emergency_serial::write_hex(nxt->magic);
+            emergency_serial::write(")\n");
             const auto* data = reinterpret_cast<const uint64_t*>(c + 1);
-            ker::mod::io::serial::write("  CORRUPT node data[0..3]: 0x");
-            ker::mod::io::serial::write_hex(data[0]);
-            ker::mod::io::serial::write(" 0x");
-            ker::mod::io::serial::write_hex(data[1]);
-            ker::mod::io::serial::write(" 0x");
-            ker::mod::io::serial::write_hex(data[2]);
-            ker::mod::io::serial::write(" 0x");
-            ker::mod::io::serial::write_hex(data[3]);
-            ker::mod::io::serial::write("\n");
+            emergency_serial::write("  CORRUPT node data[0..3]: 0x");
+            emergency_serial::write_hex(data[0]);
+            emergency_serial::write(" 0x");
+            emergency_serial::write_hex(data[1]);
+            emergency_serial::write(" 0x");
+            emergency_serial::write_hex(data[2]);
+            emergency_serial::write(" 0x");
+            emergency_serial::write_hex(data[3]);
+            emergency_serial::write("\n");
             found_corrupt = true;
             break;
         }
@@ -949,34 +949,34 @@ auto try_free_medium_alloc(void* data_ptr, uint64_t& out_size) -> TrackedFreeRes
     if (!found_corrupt && last_node != nullptr) {
         // Chain ended without finding target — the predecessor of target had its
         // ->next overwritten with null (or some other valid node, skipping target).
-        ker::mod::io::serial::write("  TRUNCATED: last valid node=0x");
-        ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(last_node));
-        ker::mod::io::serial::write(" size=0x");
-        ker::mod::io::serial::write_hex(last_node->size);
+        emergency_serial::write("  TRUNCATED: last valid node=0x");
+        emergency_serial::write_hex(reinterpret_cast<uint64_t>(last_node));
+        emergency_serial::write(" size=0x");
+        emergency_serial::write_hex(last_node->size);
         print_debug_info(last_node);
-        ker::mod::io::serial::write(" ->next=0x0\n");
+        emergency_serial::write(" ->next=0x0\n");
         const auto* data = reinterpret_cast<const uint64_t*>(last_node + 1);
-        ker::mod::io::serial::write("  TRUNCATED node data[0..7]: 0x");
-        ker::mod::io::serial::write_hex(data[0]);
-        ker::mod::io::serial::write(" 0x");
-        ker::mod::io::serial::write_hex(data[1]);
-        ker::mod::io::serial::write(" 0x");
-        ker::mod::io::serial::write_hex(data[2]);
-        ker::mod::io::serial::write(" 0x");
-        ker::mod::io::serial::write_hex(data[3]);
-        ker::mod::io::serial::write(" 0x");
-        ker::mod::io::serial::write_hex(data[4]);
-        ker::mod::io::serial::write(" 0x");
-        ker::mod::io::serial::write_hex(data[5]);
-        ker::mod::io::serial::write(" 0x");
-        ker::mod::io::serial::write_hex(data[6]);
-        ker::mod::io::serial::write(" 0x");
-        ker::mod::io::serial::write_hex(data[7]);
-        ker::mod::io::serial::write("\n");
+        emergency_serial::write("  TRUNCATED node data[0..7]: 0x");
+        emergency_serial::write_hex(data[0]);
+        emergency_serial::write(" 0x");
+        emergency_serial::write_hex(data[1]);
+        emergency_serial::write(" 0x");
+        emergency_serial::write_hex(data[2]);
+        emergency_serial::write(" 0x");
+        emergency_serial::write_hex(data[3]);
+        emergency_serial::write(" 0x");
+        emergency_serial::write_hex(data[4]);
+        emergency_serial::write(" 0x");
+        emergency_serial::write_hex(data[5]);
+        emergency_serial::write(" 0x");
+        emergency_serial::write_hex(data[6]);
+        emergency_serial::write(" 0x");
+        emergency_serial::write_hex(data[7]);
+        emergency_serial::write("\n");
     }
-    ker::mod::io::serial::write("kmalloc: DoubleFree chain dump done (");
-    ker::mod::io::serial::write_hex(n);
-    ker::mod::io::serial::write(" nodes walked)\n");
+    emergency_serial::write("kmalloc: DoubleFree chain dump done (");
+    emergency_serial::write_hex(n);
+    emergency_serial::write(" nodes walked)\n");
 
     medium_alloc_lock.unlock_irqrestore(FLAGS);
 
@@ -1238,11 +1238,11 @@ void free(void* ptr) {
         TrackedFreeResult const R = try_free_large_alloc(ptr, size);
         if (R == TrackedFreeResult::FREED) {
 #ifdef DEBUG_KMALLOC
-            ker::mod::io::serial::write("kmalloc: Freeing large allocation at 0x");
-            ker::mod::io::serial::writeHex((uint64_t)ptr);
-            ker::mod::io::serial::write(" (0x");
-            ker::mod::io::serial::writeHex(size);
-            ker::mod::io::serial::write(" bytes)\n");
+            emergency_serial::write("kmalloc: Freeing large allocation at 0x");
+            emergency_serial::write_hex((uint64_t)ptr);
+            emergency_serial::write(" (0x");
+            emergency_serial::write_hex(size);
+            emergency_serial::write(" bytes)\n");
 #endif
 #ifdef WOS_KASAN
             // Poison entire allocation (header + user data) as freed.
@@ -1263,11 +1263,11 @@ void free(void* ptr) {
         TrackedFreeResult const R = try_free_medium_alloc(ptr, size);
         if (R == TrackedFreeResult::FREED) {
 #ifdef DEBUG_KMALLOC
-            ker::mod::io::serial::write("kmalloc: Freeing medium allocation at 0x");
-            ker::mod::io::serial::writeHex((uint64_t)ptr);
-            ker::mod::io::serial::write(" (0x");
-            ker::mod::io::serial::writeHex(size);
-            ker::mod::io::serial::write(" bytes)\n");
+            emergency_serial::write("kmalloc: Freeing medium allocation at 0x");
+            emergency_serial::write_hex((uint64_t)ptr);
+            emergency_serial::write(" (0x");
+            emergency_serial::write_hex(size);
+            emergency_serial::write(" bytes)\n");
 #endif
 #ifdef WOS_KASAN
             kasan::poison_range(static_cast<void*>(potential_medium_header), size, kasan::SHADOW_HEAP_FREED);

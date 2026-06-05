@@ -4,12 +4,12 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
 
 #include "slab_allocator.hpp"
 namespace ker::mod::mm::mini_malloc {
 namespace {
+namespace emergency_serial = ker::mod::dbg::emergency_serial;
 constexpr size_t PAGE_SIZE = 0x2000;
 
 Slab<SLAB_SIZE10, PAGE_SIZE> slab_0x10;
@@ -184,25 +184,25 @@ void mini_dump_stats() {
         fill_info("0x80", slab_0x80, PAGE_SIZE),   fill_info("0x100", slab_0x100, PAGE_SIZE), fill_info("0x200", slab_0x200, PAGE_SIZE),
         fill_info("0x300", slab_0x300, PAGE_SIZE), fill_info("0x400", slab_0x400, PAGE_SIZE), fill_info("0x800", slab_0x800, PAGE_SIZE)};
 
-    ker::mod::io::serial::write("mini_malloc: Slab usage:\n");
+    emergency_serial::write("mini_malloc: Slab usage:\n");
     uint64_t total_slab_bytes = 0;
     for (const auto& info : INFOS) {
-        ker::mod::io::serial::write("  Slab ");
-        ker::mod::io::serial::write(info.name);
-        ker::mod::io::serial::write(": slabs=0x");
-        ker::mod::io::serial::write_hex(info.slab_count);
-        ker::mod::io::serial::write(" blocks_total=0x");
-        ker::mod::io::serial::write_hex(info.total_blocks);
-        ker::mod::io::serial::write(" free_blocks=0x");
-        ker::mod::io::serial::write_hex(info.free_blocks);
-        ker::mod::io::serial::write(" mem_bytes=0x");
-        ker::mod::io::serial::write_hex(info.page_bytes);
-        ker::mod::io::serial::write("\n");
+        emergency_serial::write("  Slab ");
+        emergency_serial::write(info.name);
+        emergency_serial::write(": slabs=0x");
+        emergency_serial::write_hex(info.slab_count);
+        emergency_serial::write(" blocks_total=0x");
+        emergency_serial::write_hex(info.total_blocks);
+        emergency_serial::write(" free_blocks=0x");
+        emergency_serial::write_hex(info.free_blocks);
+        emergency_serial::write(" mem_bytes=0x");
+        emergency_serial::write_hex(info.page_bytes);
+        emergency_serial::write("\n");
         total_slab_bytes += info.page_bytes;
     }
-    ker::mod::io::serial::write("  Total slab memory: 0x");
-    ker::mod::io::serial::write_hex(total_slab_bytes);
-    ker::mod::io::serial::write(" bytes\n");
+    emergency_serial::write("  Total slab memory: 0x");
+    emergency_serial::write_hex(total_slab_bytes);
+    emergency_serial::write(" bytes\n");
 }
 
 auto mini_malloc(size_t size) -> void* {

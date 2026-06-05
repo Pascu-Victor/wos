@@ -393,6 +393,8 @@ void init() {
     if (s_boot_id == 0) {
         s_boot_id = 1;
     }
+    // separate journal logs from the uefi/bootloader logs
+    mod::io::serial::write("\n\n\n\n\n");
 }
 
 void enable_time() { s_time_available.store(true, std::memory_order_release); }

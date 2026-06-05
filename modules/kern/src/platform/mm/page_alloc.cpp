@@ -4,7 +4,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/paging.hpp>
 
@@ -65,13 +64,8 @@ auto free_head_is_valid(const PageAllocator* alloc, PageAllocator::FreeBlock* bl
 }
 
 void drop_corrupt_free_list_head(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block) {
-    ker::mod::io::serial::write("page_alloc: dropping corrupt free-list head order=");
-    ker::mod::io::serial::write(static_cast<uint64_t>(order));
-    ker::mod::io::serial::write(" ptr=0x");
-    ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(block));
-    ker::mod::io::serial::write(" zone_base=0x");
-    ker::mod::io::serial::write_hex(alloc->base);
-    ker::mod::io::serial::write("\n");
+    dbg::emergency_log("page_alloc: dropping corrupt free-list head order=%lu ptr=0x%lx zone_base=0x%lx\n", static_cast<uint64_t>(order),
+                       reinterpret_cast<uint64_t>(block), alloc->base);
     alloc->free_list.at(static_cast<size_t>(order)) = nullptr;
 }
 
@@ -83,11 +77,8 @@ auto list_remove(PageAllocator* alloc, int order, PageAllocator::FreeBlock*& hea
     while (cur != nullptr) {
         uint32_t cur_idx = 0;
         if (!free_head_is_valid(alloc, cur, order, cur_idx)) {
-            ker::mod::io::serial::write("page_alloc: corrupt free-list node while removing order=");
-            ker::mod::io::serial::write(static_cast<uint64_t>(order));
-            ker::mod::io::serial::write(" ptr=0x");
-            ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(cur));
-            ker::mod::io::serial::write("\n");
+            dbg::emergency_log("page_alloc: corrupt free-list node while removing order=%lu ptr=0x%lx\n", static_cast<uint64_t>(order),
+                               reinterpret_cast<uint64_t>(cur));
             *prev = nullptr;
             return false;
         }
@@ -278,11 +269,7 @@ uint64_t PageAllocator::free(void* ptr) {
         return 0;
     }
     if (!ptr_in_zone(this, ptr)) {
-        ker::mod::io::serial::write("page_alloc: rejecting free outside zone ptr=0x");
-        ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(ptr));
-        ker::mod::io::serial::write(" zone_base=0x");
-        ker::mod::io::serial::write_hex(base);
-        ker::mod::io::serial::write("\n");
+        dbg::emergency_log("page_alloc: rejecting free outside zone ptr=0x%lx zone_base=0x%lx\n", reinterpret_cast<uint64_t>(ptr), base);
         return 0;
     }
 
@@ -305,22 +292,15 @@ uint64_t PageAllocator::free(void* ptr) {
         constexpr uint64_t MEDIUM_ALLOC_MAGIC = 0xCAFEBABE87654321ULL;
         const auto PAGE_BASE = reinterpret_cast<uint64_t>(page_to_ptr(base, page_idx));
         if (*reinterpret_cast<const uint64_t*>(PAGE_BASE + 16) == MEDIUM_ALLOC_MAGIC) {
-            ker::mod::io::serial::write("BUG: page_free on live medium alloc page=0x");
-            ker::mod::io::serial::write_hex(PAGE_BASE);
-            ker::mod::io::serial::write(" caller_ptr=0x");
-            ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(ptr));
-            ker::mod::io::serial::write("\n");
+            dbg::emergency_log("BUG: page_free on live medium alloc page=0x%lx caller_ptr=0x%lx\n", PAGE_BASE, reinterpret_cast<uint64_t>(ptr));
             ker::mod::dbg::panic_handler("page_free called on live kmalloc medium alloc");
         }
     }
 
     int const ORDER = FLAGS & 0x1F;
     if (ORDER > MAX_ORDER) {
-        ker::mod::io::serial::write("page_alloc: rejecting free with invalid order=");
-        ker::mod::io::serial::write(static_cast<uint64_t>(ORDER));
-        ker::mod::io::serial::write(" ptr=0x");
-        ker::mod::io::serial::write_hex(reinterpret_cast<uint64_t>(ptr));
-        ker::mod::io::serial::write("\n");
+        dbg::emergency_log("page_alloc: rejecting free with invalid order=%lu ptr=0x%lx\n", static_cast<uint64_t>(ORDER),
+                           reinterpret_cast<uint64_t>(ptr));
         return 0;
     }
 

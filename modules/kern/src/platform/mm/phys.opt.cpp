@@ -8,7 +8,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <mod/io/serial/serial.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/smt/smt.hpp>
 #include <sanitizer/kasan.hpp>
@@ -379,17 +378,9 @@ void copy_live_page_caller_stats_sorted(CallerPageStat* out, size_t max_rows, si
 }  // namespace
 
 void dump_alloc_stats() {
-    io::serial::write("Physical alloc stats: allocated=");
-    io::serial::write_hex(total_allocated_bytes.load());
-    io::serial::write(" freed=");
-    io::serial::write_hex(total_freed_bytes.load());
-    io::serial::write(" delta=");
-    io::serial::write_hex(total_allocated_bytes.load() - total_freed_bytes.load());
-    io::serial::write(" allocCount=");
-    io::serial::write_hex(alloc_count.load());
-    io::serial::write(" freeCount=");
-    io::serial::write_hex(free_count.load());
-    io::serial::write("\n");
+    dbg::emergency_log("Physical alloc stats: allocated=0x%lx freed=0x%lx delta=0x%lx allocCount=0x%lx freeCount=0x%lx\n",
+                       total_allocated_bytes.load(), total_freed_bytes.load(),
+                       total_allocated_bytes.load() - total_freed_bytes.load(), alloc_count.load(), free_count.load());
 }
 
 auto get_free_mem_bytes() -> uint64_t { return main_heap_size - (total_allocated_bytes.load() - total_freed_bytes.load()); }
@@ -532,9 +523,9 @@ auto snapshot_page_caller_stats(CallerPageStat* out, size_t max_rows, size_t& to
 
 void dump_caller_page_stats() {
 #ifndef WOS_PHYS_ALLOC_CALLER_STATS
-    io::serial::write("Physical page alloc by caller: disabled (build with WOS_PHYS_ALLOC_CALLER_STATS=ON)\n");
+    dbg::emergency_log("Physical page alloc by caller: disabled (build with WOS_PHYS_ALLOC_CALLER_STATS=ON)\n");
 #else
-    io::serial::write("Physical page alloc by caller (cumulative, sorted by pages desc):\n");
+    dbg::emergency_log("Physical page alloc by caller (cumulative, sorted by pages desc):\n");
 
     // Copy table under lock so we get a stable snapshot
     constexpr uint64_t BYTES_PER_KB = 1024;
@@ -568,13 +559,8 @@ void dump_caller_page_stats() {
         if (snapshot.at(i).caller == 0 || snapshot.at(i).pages == 0) {
             break;
         }
-        io::serial::write("  0x");
-        io::serial::write_hex(snapshot.at(i).caller);
-        io::serial::write(": ");
-        io::serial::write(snapshot.at(i).pages);
-        io::serial::write(" pages (");
-        io::serial::write(snapshot.at(i).pages * paging::PAGE_SIZE / BYTES_PER_KB);
-        io::serial::write(" KB)\n");
+        dbg::emergency_log("  0x%lx: %lu pages (%lu KB)\n", snapshot.at(i).caller, snapshot.at(i).pages,
+                           snapshot.at(i).pages * paging::PAGE_SIZE / BYTES_PER_KB);
     }
 #endif
 }
@@ -972,14 +958,8 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
         void* const OOM_CALLER_ADDR = __builtin_return_address(0);
 #endif
         // OOM condition - dump allocation info for debugging
-        io::serial::write("OOM: pageAlloc failed for size ");
-        io::serial::write_hex(size);
-        io::serial::write(" bytes\n");
-        io::serial::write("Allocation site: 0x");
-        io::serial::write_hex(reinterpret_cast<uint64_t>(OOM_CALLER_ADDR));
-        io::serial::write(" (");
-        io::serial::write(name.data(), name.size());
-        io::serial::write(")\n");
+        dbg::emergency_log("OOM: pageAlloc failed for size 0x%lx bytes\nAllocation site: 0x%lx (%.*s)\n", size,
+                           reinterpret_cast<uint64_t>(OOM_CALLER_ADDR), static_cast<int>(name.size()), name.data());
         dump_page_allocations_oom();
         return nullptr;
     }
@@ -992,9 +972,7 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
     constexpr uint64_t HHDM_BASE = 0xffff800000000000ULL;
     constexpr uint64_t HHDM_END = 0xffff808000000000ULL;  // ~512GB max physical
     if (block_addr < HHDM_BASE || block_addr >= HHDM_END) {
-        io::serial::write("FATAL: pageAlloc returned invalid HHDM addr: ");
-        io::serial::write_hex(block_addr);
-        io::serial::write("\n");
+        dbg::emergency_log("FATAL: pageAlloc returned invalid HHDM addr: 0x%lx\n", block_addr);
         hcf();
     }
 

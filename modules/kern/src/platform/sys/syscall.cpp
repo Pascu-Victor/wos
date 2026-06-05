@@ -13,9 +13,9 @@
 #include "abi/callnums/multiproc.h"
 #include "abi/callnums/process.h"
 #include "abi/callnums/sys_log.h"
-#include "mod/io/serial/serial.hpp"
 #include "platform/asm/cpu.hpp"
 #include "platform/asm/msr.hpp"
+#include "platform/dbg/dbg.hpp"
 #include "platform/debug/ptrace.hpp"
 #include "platform/interrupt/gdt.hpp"
 #include "platform/sched/scheduler.hpp"
@@ -99,29 +99,8 @@ extern "C" auto syscall_handler(cpu::GPRegs regs) -> uint64_t {
             break;
 
         default:
-            io::serial::write("Syscall undefined\n");
-            io::serial::write("Callnum: ");
-            io::serial::write(static_cast<uint64_t>(callnum));
-            io::serial::write("\n");
-            io::serial::write("a1: ");
-            io::serial::write(A1);
-            io::serial::write("\n");
-            io::serial::write("a2: ");
-            io::serial::write(A2);
-            io::serial::write("\n");
-            io::serial::write("a3: ");
-            io::serial::write(A3);
-            io::serial::write("\n");
-            io::serial::write("a4: ");
-            io::serial::write(A4);
-            io::serial::write("\n");
-            io::serial::write("a5: ");
-            io::serial::write(A5);
-            io::serial::write("\n");
-            io::serial::write("a6: ");
-            io::serial::write(A6);
-            io::serial::write("\n");
-            io::serial::write("Halting\n");
+            dbg::emergency_log("Syscall undefined\nCallnum: %lu\na1: %lu\na2: %lu\na3: %lu\na4: %lu\na5: %lu\na6: %lu\nHalting\n",
+                               static_cast<uint64_t>(callnum), A1, A2, A3, A4, A5, A6);
             hcf();
             __builtin_unreachable();
     }
@@ -138,52 +117,44 @@ extern "C" auto syscall_handler(cpu::GPRegs regs) -> uint64_t {
 // Called from syscall.asm when RCX (return RIP) was corrupted during syscall handling.
 // This means the kernel stack has been overwritten between pushq (entry) and popq (exit).
 extern "C" [[noreturn]] void wos_sysret_corrupt_panic(uint64_t actual_rcx, uint64_t expected_rcx, uint64_t user_rsp) {
-    io::serial::write("\n!!! SYSRET CORRUPTION DETECTED !!!\n");
-    io::serial::write("  RCX (actual):   0x");
-    io::serial::write(actual_rcx);
-    io::serial::write("\n  RCX (expected): 0x");
-    io::serial::write(expected_rcx);
-    io::serial::write("\n  User RSP:       0x");
-    io::serial::write(user_rsp);
-
-    // Dump CPU and task info
-    io::serial::write("\n  CPU: ");
-    io::serial::write(cpu::current_cpu());
+    uint64_t const CPU_ID = cpu::current_cpu();
 
     // Read the scratch area fields that might explain what happened
     // NOLINTNEXTLINE(misc-const-correctness)
     uint64_t gs_kern_stack = 0;
     asm volatile("movq %%gs:0x0, %0" : "=r"(gs_kern_stack));
-    io::serial::write("\n  gs:0x00 (kernel stack): 0x");
-    io::serial::write(gs_kern_stack);
 
     // NOLINTNEXTLINE(misc-const-correctness)
     uint64_t gs_saved_rip = 0;
     asm volatile("movq %%gs:0x28, %0" : "=r"(gs_saved_rip));
-    io::serial::write("\n  gs:0x28 (saved RIP):    0x");
-    io::serial::write(gs_saved_rip);
 
     // NOLINTNEXTLINE(misc-const-correctness)
     uint64_t gs_cpu_id = 0;
     asm volatile("movq %%gs:0x10, %0" : "=r"(gs_cpu_id));
-    io::serial::write("\n  gs:0x10 (cpuId):        0x");
-    io::serial::write(gs_cpu_id);
-
-    io::serial::write("\n  Halting.\n");
+    dbg::emergency_log(
+        "\n!!! SYSRET CORRUPTION DETECTED !!!\n"
+        "  RCX (actual):   0x%lx\n"
+        "  RCX (expected): 0x%lx\n"
+        "  User RSP:       0x%lx\n"
+        "  CPU: %lu\n"
+        "  gs:0x00 (kernel stack): 0x%lx\n"
+        "  gs:0x28 (saved RIP):    0x%lx\n"
+        "  gs:0x10 (cpuId):        0x%lx\n"
+        "  Halting.\n",
+        actual_rcx, expected_rcx, user_rsp, CPU_ID, gs_kern_stack, gs_saved_rip, gs_cpu_id);
     for (;;) {
         asm volatile("hlt");
     }
 }
 
 extern "C" [[noreturn]] void wos_syscall_bad_stack_panic(uint64_t gs_stack, uint64_t user_rsp, uint64_t cpu_id) {
-    io::serial::write("\n!!! SYSCALL STACK CORRUPTION DETECTED !!!\n");
-    io::serial::write("  gs:0x00 stack: 0x");
-    io::serial::write(gs_stack);
-    io::serial::write("\n  user RSP:      0x");
-    io::serial::write(user_rsp);
-    io::serial::write("\n  gs:0x10 CPU:   0x");
-    io::serial::write(cpu_id);
-    io::serial::write("\n  Halting before touching the user red zone.\n");
+    dbg::emergency_log(
+        "\n!!! SYSCALL STACK CORRUPTION DETECTED !!!\n"
+        "  gs:0x00 stack: 0x%lx\n"
+        "  user RSP:      0x%lx\n"
+        "  gs:0x10 CPU:   0x%lx\n"
+        "  Halting before touching the user red zone.\n",
+        gs_stack, user_rsp, cpu_id);
     for (;;) {
         asm volatile("hlt");
     }

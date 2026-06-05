@@ -10,12 +10,13 @@
 #include <cstring>
 
 #include "mod/gfx/fb_font.hpp"
-#include "mod/io/serial/serial.hpp"
+#include "platform/dbg/dbg.hpp"
 #include "platform/mm/addr.hpp"
 #include "util/hcf.hpp"
 
 namespace ker::mod::gfx::fb {
 namespace {
+using log = dbg::logger<"fb">;
 constexpr uint64_t MAX_FRAMEBUFFER_WIDTH = 3840;
 constexpr uint64_t MAX_FRAMEBUFFER_HEIGHT = 2160;
 constexpr std::size_t BACK_BUFFER_PIXELS = MAX_FRAMEBUFFER_WIDTH * MAX_FRAMEBUFFER_HEIGHT;
@@ -66,7 +67,7 @@ void init() {
 
         clear(TERM_BG_COLOR);
     } else {
-        mod::io::serial::write(
+        dbg::emergency_log(
             "Tried to init disabled subsystem: GFX::FB\n"
             "recompile with this system enabled or do not call this init functon\n"
             "HALTING");
@@ -361,25 +362,10 @@ void map_framebuffer() {
     if constexpr (WOS_HAS_GFX_FB) {
         auto const FB_PHYS =
             reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<mm::addr::paddr_t>(framebuffer->address)));
-
-        ker::mod::io::serial::write("Mapping framebuffer\n");
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("Width: ");
-        ker::mod::io::serial::write(framebuffer->width);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("Height: ");
-        ker::mod::io::serial::write(framebuffer->height);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("Start physical address: ");
-        ker::mod::io::serial::write_hex(FB_PHYS);
         uint64_t const FRAMEBUFFER_SIZE = framebuffer->width * framebuffer->height * framebuffer->bpp / 8;
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("Theoretical end physical address: ");
-        ker::mod::io::serial::write_hex(FB_PHYS + FRAMEBUFFER_SIZE);
-        ker::mod::io::serial::write("\n");
-        ker::mod::io::serial::write("Framebuffer size: ");
-        ker::mod::io::serial::write_hex(FRAMEBUFFER_SIZE);
-        ker::mod::io::serial::write("\n");
+
+        log::info("Mapping framebuffer: width=%lu height=%lu phys=0x%lx end=0x%lx size=0x%lx", framebuffer->width, framebuffer->height,
+                  FB_PHYS, FB_PHYS + FRAMEBUFFER_SIZE, FRAMEBUFFER_SIZE);
     } else {
         hcf();
     }

@@ -3,11 +3,11 @@
 #include <cstdint>
 #include <platform/acpi/hpet/hpet.hpp>
 
-#include "mod/io/serial/serial.hpp"
 #include "platform/acpi/acpi.hpp"
 #include "platform/acpi/madt/madt.hpp"
 #include "platform/asm/cpu.hpp"
 #include "platform/asm/msr.hpp"
+#include "platform/dbg/dbg.hpp"
 #include "platform/mm/addr.hpp"
 #include "util/hcf.hpp"
 namespace ker::mod::apic {
@@ -47,14 +47,14 @@ void init() {
         acpi::madt::ApicInfo const APIC_INFO = acpi::madt::parse_madt(MADT.data);
         apic_base = reinterpret_cast<uint64_t>(mm::addr::get_virt_pointer(APIC_INFO.lapic_addr));
     } else {
-        io::serial::write("Failed to parse MADT table\n");
+        dbg::emergency_log("Failed to parse MADT table\n");
         hcf();
     }
 }
 
 void init_apic_mp() {
     if (!check_x2_apic_support()) {
-        [[unlikely]] io::serial::write("X2APIC not supported\n");
+        [[unlikely]] dbg::emergency_log("X2APIC not supported\n");
         hcf();
     }
     uint64_t msr = 0;

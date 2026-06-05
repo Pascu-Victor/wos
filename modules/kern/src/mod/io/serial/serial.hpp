@@ -20,6 +20,7 @@ void acquire_lock();
 void release_lock();
 
 // Call this after per-CPU data is initialized to enable proper CPU ID tracking
+// for the early-boot owner fallback before current-task tracking is available.
 void mark_cpu_id_available();
 
 // Enter panic mode - switches to a simple non-reentrant raw spinlock that

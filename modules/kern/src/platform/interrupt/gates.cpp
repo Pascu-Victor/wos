@@ -22,7 +22,6 @@
 #include <syscalls_impl/process/exit.hpp>
 
 #include "abi/ptrace.hpp"
-#include "mod/io/serial/serial.hpp"
 #include "platform/acpi/apic/apic.hpp"
 #include "platform/asm/cpu.hpp"
 #include "platform/asm/msr.hpp"
@@ -686,9 +685,7 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, InterruptFrame frame) {
         interrupt_handlers.at(VECTOR)(gpr, frame);
     } else if (is_irq(frame.int_num)) {
         // Unexpected hardware IRQ with no handler - log and ignore.
-        ker::mod::io::serial::write("UNHANDLED IRQ: vector=");
-        ker::mod::io::serial::write_hex(static_cast<uint8_t>(frame.int_num));
-        ker::mod::io::serial::write("\n");
+        journal::warn("UNHANDLED IRQ: vector=0x%x", static_cast<unsigned>(frame.int_num));
         irq_kind = IRQ_KIND_UNHANDLED;
         irq_status = -1;
     } else {
@@ -707,11 +704,11 @@ static constexpr uint8_t TIMER_VECTOR = 32;
 
 void set_interrupt_handler(uint8_t int_num, interruptHandler_t handler) {
     if (int_num == TIMER_VECTOR) {
-        ker::mod::io::serial::write("setInterruptHandler: vector 32 is reserved for timer\n");
+        journal::error("setInterruptHandler: vector 32 is reserved for timer");
         return;
     }
     if (interrupt_handlers.at(int_num) != nullptr) {
-        ker::mod::io::serial::write("Handler already set\n");
+        journal::error("setInterruptHandler: vector %u already set", static_cast<unsigned>(int_num));
         return;
     }
     interrupt_handlers.at(int_num) = handler;

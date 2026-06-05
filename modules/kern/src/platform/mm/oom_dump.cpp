@@ -8,8 +8,8 @@
 #include <span>
 
 #include "minimalist_malloc/mini_malloc.hpp"
-#include "mod/io/serial/serial.hpp"
 #include "phys.hpp"
+#include "platform/dbg/dbg.hpp"
 #include "platform/mm/addr.hpp"
 #include "platform/mm/dyn/kmalloc.hpp"
 #include "platform/mm/page_alloc.hpp"
@@ -33,6 +33,10 @@ std::atomic<uint64_t> oom_dump_in_progress{0};
 // Buffer for number-to-string conversions
 
 namespace ker::mod::mm::phys {
+namespace emergency_serial = ker::mod::dbg::emergency_serial;
+namespace io::serial {
+using emergency_serial::write;
+}
 
 namespace {
 
