@@ -330,6 +330,7 @@ auto Slab<slab_size, memory_size>::request_memory_from_os(size_t size) -> void* 
         ker::mod::dbg::log("Malloc memory expansion failed halting.");
         assert(false);
     }
+    (void)ker::mod::mm::phys::page_mark_kind(address, ker::mod::mm::PageKind::SLAB);
     return address;
 }
 
