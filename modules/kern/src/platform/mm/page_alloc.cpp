@@ -1,6 +1,7 @@
 #include "page_alloc.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -49,6 +50,23 @@ auto ptr_in_zone(const PageAllocator* alloc, const void* ptr) -> bool {
     return ADDR >= alloc->base && ADDR < END;
 }
 
+auto page_kind_from_byte(uint8_t value) -> PageKind {
+    switch (static_cast<PageKind>(value)) {
+        case PageKind::FREE:
+        case PageKind::RESERVED:
+        case PageKind::NORMAL:
+        case PageKind::PAGE_TABLE:
+        case PageKind::SLAB:
+        case PageKind::MEDIUM:
+            return static_cast<PageKind>(value);
+        case PageKind::UNKNOWN:
+        default:
+            return PageKind::UNKNOWN;
+    }
+}
+
+void store_page_kind(std::atomic<uint8_t>& slot, PageKind kind) { slot.store(static_cast<uint8_t>(kind), std::memory_order_release); }
+
 auto free_head_is_valid(const PageAllocator* alloc, PageAllocator::FreeBlock* block, int order, uint32_t& page_idx) -> bool {
     if (!ptr_in_zone(alloc, block)) {
         return false;
@@ -92,6 +110,74 @@ auto list_remove(PageAllocator* alloc, int order, PageAllocator::FreeBlock*& hea
     return false;
 }
 
+auto page_has_live_medium_alloc_magic(PageAllocator* alloc, uint32_t page_idx) -> bool {
+    constexpr uint64_t MEDIUM_ALLOC_MAGIC = 0xCAFEBABE87654321ULL;
+    const auto PAGE_BASE = reinterpret_cast<uint64_t>(page_to_ptr(alloc->base, page_idx));
+    return *reinterpret_cast<const uint64_t*>(PAGE_BASE + 16) == MEDIUM_ALLOC_MAGIC;
+}
+
+auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order) -> uint64_t {
+    if (order < 0 || order > PageAllocator::MAX_ORDER) {
+        return 0;
+    }
+
+    uint32_t const BLOCK_SIZE = 1U << order;
+    if (page_idx >= alloc->total_pages || page_idx + BLOCK_SIZE > alloc->total_pages) {
+        return 0;
+    }
+
+    uint64_t const FREED_BYTES = static_cast<uint64_t>(BLOCK_SIZE) * paging::PAGE_SIZE;
+
+    // Clear flags for the entire allocation.
+    for (uint32_t i = 0; i < BLOCK_SIZE; i++) {
+        alloc->page_flags[page_idx + i] = PageAllocator::FLAG_FREE_INTERIOR;
+        store_page_kind(alloc->page_kinds[page_idx + i], PageKind::FREE);
+        alloc->page_refcounts[page_idx + i].store(0, std::memory_order_release);
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+        alloc->page_callers[page_idx + i] = 0;
+#endif
+    }
+
+    alloc->free_count += BLOCK_SIZE;
+
+    // Coalesce with buddies.
+    int k = order;
+    while (k < PageAllocator::MAX_ORDER) {
+        uint32_t const BUDDY_IDX = page_idx ^ (1U << k);
+
+        // Buddy must be within the zone and be a free head at exactly order k.
+        if (BUDDY_IDX >= alloc->total_pages) {
+            break;
+        }
+        if (alloc->page_flags[BUDDY_IDX] != (PageAllocator::FLAG_FREE_HEAD | static_cast<uint8_t>(k))) {
+            break;
+        }
+
+        // Remove buddy from its free list.
+        auto* buddy_block = reinterpret_cast<PageAllocator::FreeBlock*>(page_to_ptr(alloc->base, BUDDY_IDX));
+        if (!list_remove(alloc, k, alloc->free_list.at(static_cast<size_t>(k)), buddy_block)) {
+            break;
+        }
+
+        // Clear buddy's head flag (it becomes an interior page of the merged block).
+        alloc->page_flags[BUDDY_IDX] = PageAllocator::FLAG_FREE_INTERIOR;
+
+        // The merged block starts at the lower-aligned address.
+        page_idx = std::min(BUDDY_IDX, page_idx);
+
+        k++;
+    }
+
+    // Mark the (possibly merged) block as a free head.
+    alloc->page_flags[page_idx] = PageAllocator::FLAG_FREE_HEAD | static_cast<uint8_t>(k);
+
+    // Prepend to the free list.
+    auto* free_block = reinterpret_cast<PageAllocator::FreeBlock*>(page_to_ptr(alloc->base, page_idx));
+    free_block->next = alloc->free_list.at(static_cast<size_t>(k));
+    alloc->free_list.at(static_cast<size_t>(k)) = free_block;
+    return FREED_BYTES;
+}
+
 }  // namespace
 
 // ============================================================================
@@ -105,16 +191,19 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
     // --- lay out metadata at the beginning of the zone ---
 
     // PageAllocator struct occupies bytes [0, sizeof(*this)).
-    // page_flags array immediately after, then page_refcounts array.
+    // page_flags array immediately after, then page_kinds and page_refcounts.
     uint64_t const FLAGS_OFFSET = sizeof(PageAllocator);
     page_flags = reinterpret_cast<uint8_t*>(zone_base + FLAGS_OFFSET);
 
-    uint64_t refcounts_offset = FLAGS_OFFSET + static_cast<uint64_t>(total_pages);
+    uint64_t const KINDS_OFFSET = FLAGS_OFFSET + static_cast<uint64_t>(total_pages);
+    page_kinds = reinterpret_cast<std::atomic<uint8_t>*>(zone_base + KINDS_OFFSET);
+
+    uint64_t refcounts_offset = KINDS_OFFSET + (static_cast<uint64_t>(total_pages) * sizeof(std::atomic<uint8_t>));
     // Align refcounts to 4-byte boundary for uint32_t access
     refcounts_offset = (refcounts_offset + 3) & ~3ULL;
-    page_refcounts = reinterpret_cast<uint32_t*>(zone_base + refcounts_offset);
+    page_refcounts = reinterpret_cast<std::atomic<uint32_t>*>(zone_base + refcounts_offset);
 
-    uint64_t meta_bytes = refcounts_offset + (static_cast<uint64_t>(total_pages) * sizeof(uint32_t));
+    uint64_t meta_bytes = refcounts_offset + (static_cast<uint64_t>(total_pages) * sizeof(std::atomic<uint32_t>));
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     uint64_t const CALLERS_OFFSET = (meta_bytes + 7) & ~7ULL;
     page_callers = reinterpret_cast<uint64_t*>(zone_base + CALLERS_OFFSET);
@@ -130,7 +219,12 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
             list_head = nullptr;
         }
         std::memset(page_flags, FLAG_RESERVED, total_pages);
-        std::memset(page_refcounts, 0, total_pages * sizeof(uint32_t));
+        for (uint32_t i = 0; i < total_pages; ++i) {
+            store_page_kind(page_kinds[i], PageKind::RESERVED);
+        }
+        for (uint32_t i = 0; i < total_pages; ++i) {
+            page_refcounts[i].store(0, std::memory_order_relaxed);
+        }
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
         std::memset(page_callers, 0, total_pages * sizeof(uint64_t));
 #endif
@@ -149,8 +243,16 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
     // (prevents false buddy matches during the decomposition loop below).
     std::memset(page_flags, FLAG_RESERVED, metadata_pages);
     std::memset(page_flags + metadata_pages, FLAG_ALLOC_CONT, total_pages - metadata_pages);
+    for (uint32_t i = 0; i < metadata_pages; ++i) {
+        store_page_kind(page_kinds[i], PageKind::RESERVED);
+    }
+    for (uint32_t i = metadata_pages; i < total_pages; ++i) {
+        store_page_kind(page_kinds[i], PageKind::FREE);
+    }
     // Zero all refcounts (free pages have refcount 0)
-    std::memset(page_refcounts, 0, total_pages * sizeof(uint32_t));
+    for (uint32_t i = 0; i < total_pages; ++i) {
+        page_refcounts[i].store(0, std::memory_order_relaxed);
+    }
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     std::memset(page_callers, 0, total_pages * sizeof(uint64_t));
 #endif
@@ -250,7 +352,8 @@ void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
 
     // Set refcount to 1 for all pages in the block
     for (uint32_t i = 0; i < BLOCK_SIZE; i++) {
-        page_refcounts[page_idx + i] = 1;
+        store_page_kind(page_kinds[page_idx + i], PageKind::NORMAL);
+        page_refcounts[page_idx + i].store(1, std::memory_order_release);
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
         page_callers[page_idx + i] = caller;
 #endif
@@ -288,13 +391,10 @@ uint64_t PageAllocator::free(void* ptr) {
     // Guard: detect page_free on a live kmalloc medium allocation.
     // The MediumAllocationHeader layout is: next(8) size(8) magic(8) pad(8).
     // Magic lives at offset +16 from the page base.
-    {
-        constexpr uint64_t MEDIUM_ALLOC_MAGIC = 0xCAFEBABE87654321ULL;
-        const auto PAGE_BASE = reinterpret_cast<uint64_t>(page_to_ptr(base, page_idx));
-        if (*reinterpret_cast<const uint64_t*>(PAGE_BASE + 16) == MEDIUM_ALLOC_MAGIC) {
-            dbg::emergency_log("BUG: page_free on live medium alloc page=0x%lx caller_ptr=0x%lx\n", PAGE_BASE, reinterpret_cast<uint64_t>(ptr));
-            ker::mod::dbg::panic_handler("page_free called on live kmalloc medium alloc");
-        }
+    if (page_has_live_medium_alloc_magic(this, page_idx)) {
+        auto const PAGE_BASE = reinterpret_cast<uint64_t>(page_to_ptr(base, page_idx));
+        dbg::emergency_log("BUG: page_free on live medium alloc page=0x%lx caller_ptr=0x%lx\n", PAGE_BASE, reinterpret_cast<uint64_t>(ptr));
+        ker::mod::dbg::panic_handler("page_free called on live kmalloc medium alloc");
     }
 
     int const ORDER = FLAGS & 0x1F;
@@ -304,56 +404,22 @@ uint64_t PageAllocator::free(void* ptr) {
         return 0;
     }
 
-    uint32_t const BLOCK_SIZE = 1U << ORDER;
-    uint64_t const FREED_BYTES = static_cast<uint64_t>(BLOCK_SIZE) * paging::PAGE_SIZE;
+    return free_allocated_block(this, page_idx, ORDER);
+}
 
-    // Clear flags for the entire allocation.
-    for (uint32_t i = 0; i < BLOCK_SIZE; i++) {
-        page_flags[page_idx + i] = FLAG_FREE_INTERIOR;
-        page_refcounts[page_idx + i] = 0;
-#ifdef WOS_PHYS_ALLOC_CALLER_STATS
-        page_callers[page_idx + i] = 0;
-#endif
+uint64_t PageAllocator::free_order0_at(uint32_t page_idx) {
+    if (page_idx >= total_pages) {
+        return 0;
     }
-
-    free_count += BLOCK_SIZE;
-
-    // Coalesce with buddies.
-    int k = ORDER;
-    while (k < MAX_ORDER) {
-        uint32_t const BUDDY_IDX = page_idx ^ (1U << k);
-
-        // Buddy must be within the zone and be a free head at exactly order k.
-        if (BUDDY_IDX >= total_pages) {
-            break;
-        }
-        if (page_flags[BUDDY_IDX] != (FLAG_FREE_HEAD | static_cast<uint8_t>(k))) {
-            break;
-        }
-
-        // Remove buddy from its free list.
-        auto* buddy_block = reinterpret_cast<FreeBlock*>(page_to_ptr(base, BUDDY_IDX));
-        if (!list_remove(this, k, free_list.at(static_cast<size_t>(k)), buddy_block)) {
-            break;
-        }
-
-        // Clear buddy's head flag (it becomes an interior page of the merged block).
-        page_flags[BUDDY_IDX] = FLAG_FREE_INTERIOR;
-
-        // The merged block starts at the lower-aligned address.
-        page_idx = std::min(BUDDY_IDX, page_idx);
-
-        k++;
+    if (page_flags[page_idx] != FLAG_ALLOC_HEAD) {
+        return 0;
     }
-
-    // Mark the (possibly merged) block as a free head.
-    page_flags[page_idx] = FLAG_FREE_HEAD | static_cast<uint8_t>(k);
-
-    // Prepend to the free list.
-    auto* free_block = reinterpret_cast<FreeBlock*>(page_to_ptr(base, page_idx));
-    free_block->next = free_list.at(static_cast<size_t>(k));
-    free_list.at(static_cast<size_t>(k)) = free_block;
-    return FREED_BYTES;
+    if (page_has_live_medium_alloc_magic(this, page_idx)) {
+        auto const PAGE_BASE = reinterpret_cast<uint64_t>(page_to_ptr(base, page_idx));
+        dbg::emergency_log("BUG: page_free on live medium alloc page=0x%lx caller_idx=%lu\n", PAGE_BASE, static_cast<uint64_t>(page_idx));
+        ker::mod::dbg::panic_handler("page_free called on live kmalloc medium alloc");
+    }
+    return free_allocated_block(this, page_idx, 0);
 }
 
 auto PageAllocator::split_allocated_block_to_order0(void* ptr) const -> bool {
@@ -384,10 +450,12 @@ auto PageAllocator::split_allocated_block_to_order0(void* ptr) const -> bool {
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     uint64_t const CALLER = page_callers[PAGE_IDX];
 #endif
+    PageKind const KIND = page_kind_from_byte(page_kinds[PAGE_IDX].load(std::memory_order_acquire));
     for (uint32_t i = 0; i < BLOCK_SIZE; ++i) {
         page_flags[PAGE_IDX + i] = FLAG_ALLOC_HEAD;
-        if (page_refcounts[PAGE_IDX + i] == 0) {
-            page_refcounts[PAGE_IDX + i] = 1;
+        store_page_kind(page_kinds[PAGE_IDX + i], KIND);
+        if (page_refcounts[PAGE_IDX + i].load(std::memory_order_acquire) == 0) {
+            page_refcounts[PAGE_IDX + i].store(1, std::memory_order_release);
         }
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
         page_callers[PAGE_IDX + i] = CALLER;
@@ -395,6 +463,50 @@ auto PageAllocator::split_allocated_block_to_order0(void* ptr) const -> bool {
     }
 
     return true;
+}
+
+auto PageAllocator::mark_allocated_block_kind(void* ptr, PageKind kind) const -> bool {
+    if (ptr == nullptr || !ptr_in_zone(this, ptr)) {
+        return false;
+    }
+
+    uint32_t const PAGE_IDX = ptr_to_page(base, ptr);
+    if (PAGE_IDX >= total_pages) {
+        return false;
+    }
+
+    uint8_t const FLAGS = page_flags[PAGE_IDX];
+    if ((FLAGS & 0xC0) != FLAG_ALLOC_HEAD) {
+        return false;
+    }
+
+    int const ORDER = FLAGS & 0x1F;
+    if (ORDER > MAX_ORDER) {
+        return false;
+    }
+
+    uint32_t const BLOCK_SIZE = 1U << ORDER;
+    if (PAGE_IDX + BLOCK_SIZE > total_pages) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < BLOCK_SIZE; ++i) {
+        store_page_kind(page_kinds[PAGE_IDX + i], kind);
+    }
+    return true;
+}
+
+auto PageAllocator::kind_of(void* ptr) const -> PageKind {
+    if (ptr == nullptr || !ptr_in_zone(this, ptr)) {
+        return PageKind::UNKNOWN;
+    }
+
+    uint32_t const PAGE_IDX = ptr_to_page(base, ptr);
+    if (PAGE_IDX >= total_pages) {
+        return PageKind::UNKNOWN;
+    }
+
+    return page_kind_from_byte(page_kinds[PAGE_IDX].load(std::memory_order_acquire));
 }
 
 }  // namespace ker::mod::mm

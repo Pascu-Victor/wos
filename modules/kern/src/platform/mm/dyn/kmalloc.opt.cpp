@@ -14,6 +14,7 @@
 #include "minimalist_malloc/mini_malloc.hpp"
 #include "minimalist_malloc/slab_allocator.hpp"
 #include "platform/dbg/dbg.hpp"
+#include "platform/mm/page_alloc.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
 #include "platform/sys/spinlock.hpp"
@@ -755,6 +756,7 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
 #endif
             return nullptr;
         }
+        (void)phys::page_mark_kind(alloc_ptr, PageKind::MEDIUM);
 
         // Set up header with tracking info
         auto* header = static_cast<MediumAllocationHeader*>(alloc_ptr);
@@ -1126,6 +1128,7 @@ auto realloc(void* ptr, size_t size) -> void* {
             if (new_alloc == nullptr) {
                 return nullptr;
             }
+            (void)phys::page_mark_kind(new_alloc, PageKind::MEDIUM);
 
             auto* new_header = static_cast<MediumAllocationHeader*>(new_alloc);
             new_header->size = NEW_ALLOC_SIZE;

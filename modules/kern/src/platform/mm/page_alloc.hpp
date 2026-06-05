@@ -1,14 +1,25 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 
 namespace ker::mod::mm {
 
+enum class PageKind : uint8_t {
+    UNKNOWN = 0,
+    FREE = 1,
+    RESERVED = 2,
+    NORMAL = 3,
+    PAGE_TABLE = 4,
+    SLAB = 5,
+    MEDIUM = 6,
+};
+
 // Linux-style free-list buddy page allocator.
 // Manages a contiguous physical memory zone. Metadata is embedded at the
-// beginning of the zone (pageFlags array + this struct), consuming a small
-// fixed fraction (~0.024%) of the zone.
+// beginning of the zone (this struct + side tables), consuming a small fixed
+// fraction of the zone.
 //
 // All allocations are 4KB-page-aligned and sized in powers-of-two pages.
 // Free uses per-page flags to recover the allocation order, so callers do
@@ -37,7 +48,8 @@ struct PageAllocator {
 
     std::array<FreeBlock*, MAX_ORDER + 1> free_list{};  // one singly-linked list per order
     uint8_t* page_flags = nullptr;                      // 1 byte per page
-    uint32_t* page_refcounts = nullptr;                 // 1 refcount per page (for COW fork)
+    std::atomic<uint8_t>* page_kinds = nullptr;         // PageKind per page
+    std::atomic<uint32_t>* page_refcounts = nullptr;    // 1 refcount per page (for COW fork)
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     uint64_t* page_callers = nullptr;  // allocation return address for each live page
 #endif
@@ -62,11 +74,20 @@ struct PageAllocator {
     // number of bytes released, or 0 if the pointer was not a live allocation.
     uint64_t free(void* ptr);
 
+    // Fast path for callers that already resolved allocator/index under the
+    // global physical allocator lock. Only frees a live order-0 page.
+    uint64_t free_order0_at(uint32_t page_idx);
+
     // Re-tag a contiguous allocated block as a run of independently freeable
     // order-0 pages while preserving the existing per-page refcounts.
     // Use this when a multi-page allocation will be mapped/freed as separate
     // 4 KiB leaves.
     auto split_allocated_block_to_order0(void* ptr) const -> bool;
+
+    // Mark/query the kind metadata for a live allocation. Marking applies to
+    // every page in the allocation recovered from the buddy head flag.
+    auto mark_allocated_block_kind(void* ptr, PageKind kind) const -> bool;
+    [[nodiscard]] auto kind_of(void* ptr) const -> PageKind;
 
     [[nodiscard]] __attribute__((no_sanitize("address"))) uint32_t get_free_pages() const { return free_count; }
     [[nodiscard]] __attribute__((no_sanitize("address"))) uint32_t get_usable_pages() const { return usable_pages; }

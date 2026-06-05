@@ -11,6 +11,7 @@
 #include <platform/asm/cpu.hpp>
 #include <platform/smt/smt.hpp>
 #include <sanitizer/kasan.hpp>
+#include <span>
 #include <string_view>
 
 #ifdef WOS_PHYS_LOCK_DEBUG
@@ -379,8 +380,8 @@ void copy_live_page_caller_stats_sorted(CallerPageStat* out, size_t max_rows, si
 
 void dump_alloc_stats() {
     dbg::emergency_log("Physical alloc stats: allocated=0x%lx freed=0x%lx delta=0x%lx allocCount=0x%lx freeCount=0x%lx\n",
-                       total_allocated_bytes.load(), total_freed_bytes.load(),
-                       total_allocated_bytes.load() - total_freed_bytes.load(), alloc_count.load(), free_count.load());
+                       total_allocated_bytes.load(), total_freed_bytes.load(), total_allocated_bytes.load() - total_freed_bytes.load(),
+                       alloc_count.load(), free_count.load());
 }
 
 auto get_free_mem_bytes() -> uint64_t { return main_heap_size - (total_allocated_bytes.load() - total_freed_bytes.load()); }
@@ -1183,85 +1184,256 @@ auto find_allocator_for_page(void* page, PageAllocator*& out_alloc, uint32_t& ou
 }
 }  // namespace
 
+auto page_mark_kind(void* page, PageKind kind) -> bool {
+    if (page == nullptr) {
+        return false;
+    }
+
+    PageAllocator* alloc = nullptr;
+    uint32_t idx = 0;
+    uint64_t const FLAGS = memlock.lock_irq();
+    bool const OK = find_allocator_for_page(page, alloc, idx) && alloc != nullptr && alloc->mark_allocated_block_kind(page, kind);
+    memlock.unlock_irq(FLAGS);
+    return OK;
+}
+
+auto page_kind_get(void* page) -> PageKind {
+    if (page == nullptr) {
+        return PageKind::UNKNOWN;
+    }
+
+    PageAllocator* alloc = nullptr;
+    uint32_t idx = 0;
+    if (!find_allocator_for_page(page, alloc, idx) || alloc == nullptr) {
+        return PageKind::UNKNOWN;
+    }
+
+    return alloc->kind_of(page);
+}
+
 void page_ref_inc(void* page) {
     if (page == nullptr) {
         return;
     }
+
     PageAllocator* alloc = nullptr;
     uint32_t idx = 0;
-    uint64_t const FLAGS = memlock.lock_irq();
-    if (find_allocator_for_page(page, alloc, idx)) {
-        alloc->page_refcounts[idx]++;
+    if (!find_allocator_for_page(page, alloc, idx)) {
+        return;
     }
-    memlock.unlock_irq(FLAGS);
+
+    auto& refcount = alloc->page_refcounts[idx];
+    uint32_t old_ref = refcount.load(std::memory_order_acquire);
+    for (;;) {
+        if (old_ref == 0) {
+            log::critical("page_ref_inc on zero-ref page %p", page);
+            hcf();
+        }
+        if (old_ref == UINT32_MAX) {
+            log::critical("page_ref_inc overflow for page %p", page);
+            hcf();
+        }
+        if (refcount.compare_exchange_weak(old_ref, old_ref + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return;
+        }
+    }
 }
 
 void page_ref_add(void* page, uint64_t refs) {
     if (page == nullptr || refs == 0) {
         return;
     }
+    if (refs > UINT32_MAX) {
+        log::critical("page_ref_add overflow for page %p refs=%llu", page, static_cast<unsigned long long>(refs));
+        hcf();
+    }
+
     PageAllocator* alloc = nullptr;
     uint32_t idx = 0;
-    uint64_t const FLAGS = memlock.lock_irq();
-    if (find_allocator_for_page(page, alloc, idx)) {
-        if (refs > UINT32_MAX - alloc->page_refcounts[idx]) {
-            memlock.unlock_irq(FLAGS);
+    if (!find_allocator_for_page(page, alloc, idx)) {
+        return;
+    }
+
+    auto& refcount = alloc->page_refcounts[idx];
+    uint32_t old_ref = refcount.load(std::memory_order_acquire);
+    auto const ADD_REFS = static_cast<uint32_t>(refs);
+    for (;;) {
+        if (old_ref == 0) {
+            log::critical("page_ref_add on zero-ref page %p refs=%llu", page, static_cast<unsigned long long>(refs));
+            hcf();
+        }
+        if (ADD_REFS > UINT32_MAX - old_ref) {
             log::critical("page_ref_add overflow for page %p refs=%llu", page, static_cast<unsigned long long>(refs));
             hcf();
         }
-        alloc->page_refcounts[idx] += static_cast<uint32_t>(refs);
+        if (refcount.compare_exchange_weak(old_ref, old_ref + ADD_REFS, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
+namespace {
+
+struct ZeroRefPage {
+    void* page = nullptr;
+    PageAllocator* alloc = nullptr;
+    uint32_t idx = 0;
+};
+
+auto page_ref_dec_atomic(void* page, uint32_t& new_ref, ZeroRefPage& zero_ref_page) -> bool {
+    zero_ref_page = {};
+    PageAllocator* alloc = nullptr;
+    uint32_t idx = 0;
+    if (!find_allocator_for_page(page, alloc, idx)) {
+        new_ref = 0;
+        return false;
+    }
+
+    auto& refcount = alloc->page_refcounts[idx];
+    uint32_t old_ref = refcount.load(std::memory_order_acquire);
+    while (old_ref > 0) {
+        uint32_t const NEXT_REF = old_ref - 1;
+        if (refcount.compare_exchange_weak(old_ref, NEXT_REF, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            new_ref = NEXT_REF;
+            if (NEXT_REF == 0) {
+                zero_ref_page = ZeroRefPage{
+                    .page = page,
+                    .alloc = alloc,
+                    .idx = idx,
+                };
+            }
+            return true;
+        }
+    }
+
+    new_ref = 0;
+    return false;
+}
+
+void verify_zero_ref_page_is_not_live_slab(void* page, const char* op_name) {
+    constexpr uint32_t SLAB_MAGIC = 0x8CBEEFC8;
+    if (*reinterpret_cast<const volatile uint32_t*>(page) == SLAB_MAGIC) {
+        log::critical("DETECT: %s freeing live slab page - UAF trap! virt=%p", op_name, page);
+        hcf();
+    }
+}
+
+auto free_zero_ref_page_locked(ZeroRefPage const& zero_ref_page, uint64_t& freed_bytes) -> bool {
+    if (zero_ref_page.page == nullptr || zero_ref_page.alloc == nullptr || zero_ref_page.idx >= zero_ref_page.alloc->total_pages) {
+        freed_bytes = 0;
+        return false;
+    }
+
+    auto* const EXPECTED_PAGE =
+        reinterpret_cast<void*>(zero_ref_page.alloc->base + (static_cast<uint64_t>(zero_ref_page.idx) * paging::PAGE_SIZE));
+    if (EXPECTED_PAGE != zero_ref_page.page) {
+        freed_bytes = 0;
+        return false;
+    }
+
+    if (zero_ref_page.alloc->page_refcounts[zero_ref_page.idx].load(std::memory_order_acquire) != 0) {
+        freed_bytes = 0;
+        return false;
+    }
+
+    freed_bytes = zero_ref_page.alloc->free_order0_at(zero_ref_page.idx);
+    if (freed_bytes == 0) {
+        freed_bytes = zero_ref_page.alloc->free(zero_ref_page.page);
+    }
+    return freed_bytes != 0;
+}
+
+void free_zero_ref_pages(std::span<ZeroRefPage const> pages, PageRefBatchStats& stats) {
+    if (pages.empty()) {
+        return;
+    }
+
+    uint64_t const FLAGS = memlock.lock_irq();
+    for (ZeroRefPage const& page : pages) {
+        uint64_t freed_bytes = 0;
+        if (!free_zero_ref_page_locked(page, freed_bytes)) {
+            continue;
+        }
+        free_count.fetch_add(1, std::memory_order_relaxed);
+        total_freed_bytes.fetch_add(freed_bytes, std::memory_order_relaxed);
+        stats.pages_freed++;
     }
     memlock.unlock_irq(FLAGS);
 }
+
+}  // namespace
 
 auto page_ref_dec(void* page) -> uint32_t {
     if (page == nullptr) {
         return 0;
     }
-    PageAllocator* alloc = nullptr;
-    uint32_t idx = 0;
-    uint64_t const FLAGS = memlock.lock_irq();
-    if (find_allocator_for_page(page, alloc, idx)) {
-        uint32_t new_ref = alloc->page_refcounts[idx];
-        if (new_ref > 0) {
-            new_ref = --alloc->page_refcounts[idx];
-            if (new_ref == 0) {  // UAF sentinel: a live slab page must never reach refcount 0 via page_ref_dec.
-                // If the first 4 bytes match the slab magic the page is still in the slab
-                // chain - some corrupt PTE is being incorrectly treated as a user data page.
-                constexpr uint32_t SLAB_MAGIC = 0x8CBEEFC8;
-                if (*reinterpret_cast<const volatile uint32_t*>(page) == SLAB_MAGIC) {
-                    memlock.unlock_irq(FLAGS);
-                    log::critical("DETECT: page_ref_dec freeing live slab page - UAF trap! virt=%p", page);
-                    hcf();
-                }
 
-                // Refcount reached zero - free the page
-                uint64_t const FREED_BYTES = alloc->free(page);
-                free_count.fetch_add(1, std::memory_order_relaxed);
-                total_freed_bytes.fetch_add(FREED_BYTES, std::memory_order_relaxed);
-            }
-        }
-        // If new_ref was already 0 (page already freed), do NOT call alloc->free again.
-        memlock.unlock_irq(FLAGS);
+    uint32_t new_ref = 0;
+    ZeroRefPage zero_ref_page{};
+    if (!page_ref_dec_atomic(page, new_ref, zero_ref_page)) {
         return new_ref;
     }
-    memlock.unlock_irq(FLAGS);
-    return 0;
+    if (zero_ref_page.page == nullptr) {
+        return new_ref;
+    }
+
+    verify_zero_ref_page_is_not_live_slab(page, "page_ref_dec");
+    PageRefBatchStats stats{};
+    free_zero_ref_pages(std::span<ZeroRefPage const>{&zero_ref_page, 1}, stats);
+    return new_ref;
+}
+
+auto page_ref_dec_batch(std::span<void* const> pages) -> PageRefBatchStats {
+    PageRefBatchStats stats{};
+    if (pages.empty()) {
+        return stats;
+    }
+
+    constexpr size_t ZERO_REF_BATCH_CAP = 128;
+    std::array<ZeroRefPage, ZERO_REF_BATCH_CAP> zero_ref_pages{};
+    size_t zero_ref_count = 0;
+
+    auto flush_zero_ref_pages = [&]() {
+        free_zero_ref_pages(std::span<ZeroRefPage const>{zero_ref_pages.data(), zero_ref_count}, stats);
+        zero_ref_count = 0;
+    };
+
+    for (void* page : pages) {
+        if (page == nullptr) {
+            continue;
+        }
+
+        uint32_t new_ref = 0;
+        ZeroRefPage zero_ref_page{};
+        if (!page_ref_dec_atomic(page, new_ref, zero_ref_page)) {
+            continue;
+        }
+
+        stats.refs_decremented++;
+        if (zero_ref_page.page == nullptr) {
+            continue;
+        }
+        verify_zero_ref_page_is_not_live_slab(page, "page_ref_dec_batch");
+        zero_ref_pages.at(zero_ref_count++) = zero_ref_page;
+        if (zero_ref_count >= zero_ref_pages.size()) {
+            flush_zero_ref_pages();
+        }
+    }
+    flush_zero_ref_pages();
+    return stats;
 }
 
 auto page_ref_get(void* page) -> uint32_t {
     if (page == nullptr) {
         return 0;
     }
+
     PageAllocator* alloc = nullptr;
     uint32_t idx = 0;
-    uint64_t const FLAGS = memlock.lock_irq();
-    uint32_t ref = 0;
-    if (find_allocator_for_page(page, alloc, idx)) {
-        ref = alloc->page_refcounts[idx];
+    if (!find_allocator_for_page(page, alloc, idx)) {
+        return 0;
     }
-    memlock.unlock_irq(FLAGS);
-    return ref;
+    return alloc->page_refcounts[idx].load(std::memory_order_acquire);
 }
 
 void dump_mini_malloc_stats() { mini_malloc::mini_dump_stats(); }
