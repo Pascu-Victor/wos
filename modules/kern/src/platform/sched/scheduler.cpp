@@ -1355,6 +1355,10 @@ void arm_idle_timer_locked(RunQueue* rq) {
 // sends EOI after dispatching interruptHandlers[].
 void scheduler_wake_handler([[maybe_unused]] cpu::GPRegs gpr, [[maybe_unused]] gates::InterruptFrame frame) {
     auto* rq = run_queues->this_cpu();
+    // Consume the coalescing bit before looking at the run queue.  If this IPI
+    // was stale/empty, a racing later wake_cpu() must be able to send a fresh
+    // IPI instead of being suppressed by our old pending flag.
+    rq->resched_timer_pending.store(false, std::memory_order_release);
     if (rq->runnable_heap.size > 0) {
         rq->is_idle.store(false, std::memory_order_release);
         // Wake IPIs are the rescue path for CPUs halted in the idle loop.  The
@@ -1502,6 +1506,12 @@ void wake_cpu(uint64_t cpu_no) {
 
     auto* rq = run_queues != nullptr ? run_queues->that_cpu(cpu_no) : nullptr;
     if (rq != nullptr) {
+        // The wake IPI's handler only arms a near scheduler timer; repeated
+        // remote wakeups before that timer fires do not need more IPIs.  The
+        // timer interrupt clears this bit in note_scheduler_timer_interrupt().
+        if (rq->resched_timer_pending.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
         rq->wake_ipis_sent.fetch_add(1, std::memory_order_relaxed);
     }
 

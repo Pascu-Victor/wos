@@ -101,16 +101,19 @@ bool RunHeap::insert(task::Task* t) {
     if (size >= PER_CPU_HEAP_CAP) {
         return false;
     }
-    // DIAGNOSTIC: Detect double-insertion - task already in some heap
     if (t->heap_index >= 0) {
+#ifdef SCHED_DEBUG
+        // Duplicate insertion is a scheduler invariant violation.  Keep the
+        // expensive scan/log detail for debug builds; production only needs the
+        // O(1) refusal below.
         log::error("insert: PID %x already has heap_index=%d (size=%d, cpu=%d); refusing insert", t->pid, t->heap_index, size,
                    static_cast<int>(t->cpu));
-        // Scan our own entries to see if WE already have this task
         for (uint32_t i = 0; i < size; i++) {
             if (heap_entry(*this, i) == t) {
                 log::error("task is in this heap at index %d", i);
             }
         }
+#endif
         return false;
     }
     uint32_t const IDX = size;
