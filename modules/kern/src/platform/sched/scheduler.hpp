@@ -74,11 +74,25 @@ struct RunQueue {
     std::atomic<uint64_t> local_reschedule_timer_pokes;
     std::atomic<uint64_t> slow_reschedule_scans;
     std::atomic<uint64_t> wait_list_scan_iterations;
+    std::atomic<uint64_t> wait_list_scan_passes;
+    std::atomic<uint64_t> wait_list_scan_max;
     std::atomic<uint64_t> timer_expired_wakeups;
     std::atomic<uint64_t> gc_passes_triggered;
     std::atomic<uint64_t> gc_tasks_reclaimed;
     std::atomic<uint64_t> gc_work_us_total;
     std::atomic<uint64_t> gc_work_us_max;
+    std::atomic<uint64_t> gc_task_us_total;
+    std::atomic<uint64_t> gc_task_us_max;
+    std::atomic<uint64_t> gc_detach_us_total;
+    std::atomic<uint64_t> gc_detach_us_max;
+    std::atomic<uint64_t> gc_pagemap_us_total;
+    std::atomic<uint64_t> gc_pagemap_us_max;
+    std::atomic<uint64_t> gc_thread_us_total;
+    std::atomic<uint64_t> gc_thread_us_max;
+    std::atomic<uint64_t> gc_misc_us_total;
+    std::atomic<uint64_t> gc_misc_us_max;
+    std::atomic<uint64_t> gc_debug_us_total;
+    std::atomic<uint64_t> gc_debug_us_max;
     std::atomic<uint64_t> load_balance_pushes;
     std::atomic<uint32_t> cached_load_default;
     std::atomic<uint32_t> cached_load_process;
@@ -121,11 +135,25 @@ struct RunQueue {
           local_reschedule_timer_pokes(0),
           slow_reschedule_scans(0),
           wait_list_scan_iterations(0),
+          wait_list_scan_passes(0),
+          wait_list_scan_max(0),
           timer_expired_wakeups(0),
           gc_passes_triggered(0),
           gc_tasks_reclaimed(0),
           gc_work_us_total(0),
           gc_work_us_max(0),
+          gc_task_us_total(0),
+          gc_task_us_max(0),
+          gc_detach_us_total(0),
+          gc_detach_us_max(0),
+          gc_pagemap_us_total(0),
+          gc_pagemap_us_max(0),
+          gc_thread_us_total(0),
+          gc_thread_us_max(0),
+          gc_misc_us_total(0),
+          gc_misc_us_max(0),
+          gc_debug_us_total(0),
+          gc_debug_us_max(0),
           load_balance_pushes(0),
           cached_load_default(0),
           cached_load_process(0),
@@ -157,11 +185,25 @@ struct SchedulerTraceStats {
     uint64_t local_reschedule_timer_pokes;
     uint64_t slow_reschedule_scans;
     uint64_t wait_list_scan_iterations;
+    uint64_t wait_list_scan_passes;
+    uint64_t wait_list_scan_max;
     uint64_t timer_expired_wakeups;
     uint64_t gc_passes_triggered;
     uint64_t gc_tasks_reclaimed;
     uint64_t gc_work_us_total;
     uint64_t gc_work_us_max;
+    uint64_t gc_task_us_total;
+    uint64_t gc_task_us_max;
+    uint64_t gc_detach_us_total;
+    uint64_t gc_detach_us_max;
+    uint64_t gc_pagemap_us_total;
+    uint64_t gc_pagemap_us_max;
+    uint64_t gc_thread_us_total;
+    uint64_t gc_thread_us_max;
+    uint64_t gc_misc_us_total;
+    uint64_t gc_misc_us_max;
+    uint64_t gc_debug_us_total;
+    uint64_t gc_debug_us_max;
     uint64_t load_balance_pushes;
 };
 

@@ -81,7 +81,7 @@ constexpr int ISO_TIME_COLUMN_WIDTH = 30;
 constexpr std::size_t INITIAL_FILE_CAPACITY = 131072;
 constexpr std::size_t PROC_READ_CAPACITY = 512;
 constexpr std::size_t PERF_DRAIN_CAPACITY = 65536;
-constexpr std::size_t CPUSTAT_READ_CAPACITY = 4096;
+constexpr std::size_t CPUSTAT_READ_CAPACITY = 16384;
 constexpr std::size_t MAX_EVENT_TOKENS = 14;
 
 constexpr std::size_t PID_PREFIX_SIZE = 4;
@@ -2120,13 +2120,15 @@ void cmd_cpustat() {
     }
 
     std::println("=== perf cpustat ===================================================");
-    std::println("{:>4}  {:>10}  {:>8}  {:>10}  {:>10}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}  {:>10}",
-                 "CPU", "ctx", "preempt", "sleep", "wake", "sample", "fast_skip", "ring_write", "timer_irq", "sched_arm", "sched_disarm",
-                 "local_poke", "slow_scan", "wait_scan", "timer_wake");
+    std::println(
+        "{:>4}  {:>10}  {:>8}  {:>10}  {:>10}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  "
+        "{:>10}",
+        "CPU", "ctx", "preempt", "sleep", "wake", "sample", "fast_skip", "ring_write", "timer_irq", "sched_arm", "sched_disarm",
+        "local_poke", "slow_scan", "wait_scan", "wait_pass", "wait_max", "timer_wake");
     std::println(
         "{:->4}  {:->10}  {:->8}  {:->10}  {:->10}  {:->8}  {:->10}  {:->10}  {:->10}  {:->10}  {:->12}  {:->10}  {:->10}  "
-        "{:->10}  {:->10}",
-        "", "", "", "", "", "", "", "", "", "", "", "", "", "", "");
+        "{:->10}  {:->10}  {:->10}  {:->10}",
+        "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "");
 
     std::size_t pos = 0;
     while (pos < buffer->size()) {
@@ -2145,10 +2147,13 @@ void cmd_cpustat() {
             return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
         };
 
-        std::println("{:>4}  {:>10}  {:>8}  {:>10}  {:>10}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}  {:>10}",
-                     get_val("cpu="), get_val("ctx="), get_val("preempt="), get_val("sleep="), get_val("wake="), get_val("sample="),
-                     get_val("fast_skip="), get_val("ring_write="), get_val("timer_irq="), get_val("sched_arm="), get_val("sched_disarm="),
-                     get_val("local_poke="), get_val("slow_scan="), get_val("wait_scan="), get_val("timer_wake="));
+        std::println(
+            "{:>4}  {:>10}  {:>8}  {:>10}  {:>10}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  "
+            "{:>10}",
+            get_val("cpu="), get_val("ctx="), get_val("preempt="), get_val("sleep="), get_val("wake="), get_val("sample="),
+            get_val("fast_skip="), get_val("ring_write="), get_val("timer_irq="), get_val("sched_arm="), get_val("sched_disarm="),
+            get_val("local_poke="), get_val("slow_scan="), get_val("wait_scan="), get_val("wait_pass="), get_val("wait_max="),
+            get_val("timer_wake="));
     }
 
     std::println("");
@@ -2203,6 +2208,36 @@ void cmd_cpustat() {
 
         std::println("{:>4}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}  {:>10}", get_val("cpu="), get_val("arm_wait="), get_val("arm_itimer="),
                      get_val("arm_vol="), get_val("arm_idlework="), get_val("arm_runq="), get_val("arm_comp="));
+    }
+
+    std::println("");
+    std::println("{:>4}  {:>10}  {:>11}  {:>12}  {:>13}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>11}  {:>10}  {:>10}", "CPU", "gc_task",
+                 "gc_task_max", "gc_detach", "gc_detach_max", "gc_pm", "gc_pm_max", "gc_thr", "gc_thr_max", "gc_misc", "gc_misc_max",
+                 "gc_dbg", "gc_dbg_max");
+    std::println("{:->4}  {:->10}  {:->11}  {:->12}  {:->13}  {:->10}  {:->10}  {:->10}  {:->10}  {:->10}  {:->11}  {:->10}  {:->10}", "",
+                 "", "", "", "", "", "", "", "", "", "", "", "");
+
+    pos = 0;
+    while (pos < buffer->size()) {
+        std::string_view line = next_line(*buffer, pos);
+        if (line.empty()) {
+            continue;
+        }
+
+        auto get_val = [&](std::string_view key) {
+            std::size_t key_pos = line.find(key);
+            if (key_pos == std::string_view::npos) {
+                return uint64_t{0};
+            }
+            key_pos += key.size();
+            std::size_t const END = line.find(' ', key_pos);
+            return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
+        };
+
+        std::println("{:>4}  {:>10}  {:>11}  {:>12}  {:>13}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>11}  {:>10}  {:>10}",
+                     get_val("cpu="), get_val("gc_task_us="), get_val("gc_task_max="), get_val("gc_detach_us="), get_val("gc_detach_max="),
+                     get_val("gc_pm_us="), get_val("gc_pm_max="), get_val("gc_thr_us="), get_val("gc_thr_max="), get_val("gc_misc_us="),
+                     get_val("gc_misc_max="), get_val("gc_dbg_us="), get_val("gc_dbg_max="));
     }
 }
 

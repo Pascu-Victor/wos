@@ -583,6 +583,7 @@ uint8_t wake_ipi_vector = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global
 uint32_t idle_timer_ticks = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 constexpr uint64_t IDLE_TIMER_CALIBRATION_US = 10'000;
 constexpr uint32_t SCHED_GC_RECLAIM_BUDGET = 32;
+constexpr uint64_t SCHED_GC_WORK_BUDGET_US = 500;
 std::atomic<bool> scheduler_gc_requested{false};       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<bool> scheduler_gc_worker_started{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<task::Task*> scheduler_gc_task{nullptr};   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -715,6 +716,12 @@ inline auto min_nonzero_deadline(uint64_t lhs, uint64_t rhs) -> uint64_t {
         return lhs;
     }
     return std::min(lhs, rhs);
+}
+
+inline void update_relaxed_max(std::atomic<uint64_t>& slot, uint64_t value) {
+    uint64_t observed = slot.load(std::memory_order_relaxed);
+    while (value > observed && !slot.compare_exchange_weak(observed, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
 }
 
 inline auto task_wait_deadline_us(task::Task const* t) -> uint64_t {
@@ -2191,6 +2198,8 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                 t = t->sched_next;
             }
             rq->wait_list_scan_iterations.fetch_add(scan_iterations, std::memory_order_relaxed);
+            rq->wait_list_scan_passes.fetch_add(1, std::memory_order_relaxed);
+            update_relaxed_max(rq->wait_list_scan_max, scan_iterations);
             for (uint32_t i = 0; i < wake_count; i++) {
                 task::Task* w = pending_wake_slot(to_wake, i);
                 wait_list_remove_locked(rq, w);
@@ -4003,258 +4012,367 @@ void insert_into_dead_list(task::Task* task) {
     run_queues->with_lock_void(0, [task](RunQueue* rq) { rq->dead_list.push(task); });
 }
 
-auto gc_expired_tasks_budgeted(uint32_t max_tasks) -> uint32_t {
+namespace {
+
+inline auto gc_time_budget_expired(uint64_t start_us, uint64_t budget_us) -> bool {
+    if (budget_us == 0) {
+        return false;
+    }
+    uint64_t const NOW_US = time::get_us();
+    return NOW_US >= start_us && (NOW_US - start_us) >= budget_us;
+}
+
+inline auto elapsed_us_since(uint64_t start_us, uint64_t end_us) -> uint64_t { return end_us >= start_us ? end_us - start_us : 0; }
+
+struct GcDetachedTask {
+    task::Task* task = nullptr;
+    bool should_free_pagemap = false;
+    bool counted_without_cleanup = false;
+};
+
+struct GcTaskTiming {
+    uint64_t total_us = 0;
+    uint64_t detach_us = 0;
+    uint64_t pagemap_us = 0;
+    uint64_t thread_us = 0;
+    uint64_t misc_us = 0;
+    uint64_t debug_us = 0;
+};
+
+inline void add_gc_phase_sample(std::atomic<uint64_t>& total, std::atomic<uint64_t>& max, uint64_t elapsed_us) {
+    total.fetch_add(elapsed_us, std::memory_order_relaxed);
+    update_relaxed_max(max, elapsed_us);
+}
+
+void note_gc_task_timing(GcTaskTiming const& timing) {
+    if (run_queues == nullptr) {
+        return;
+    }
+
+    auto* rq = run_queues->this_cpu();
+    if (rq == nullptr) {
+        return;
+    }
+
+    add_gc_phase_sample(rq->gc_task_us_total, rq->gc_task_us_max, timing.total_us);
+    add_gc_phase_sample(rq->gc_detach_us_total, rq->gc_detach_us_max, timing.detach_us);
+    add_gc_phase_sample(rq->gc_pagemap_us_total, rq->gc_pagemap_us_max, timing.pagemap_us);
+    add_gc_phase_sample(rq->gc_thread_us_total, rq->gc_thread_us_max, timing.thread_us);
+    add_gc_phase_sample(rq->gc_misc_us_total, rq->gc_misc_us_max, timing.misc_us);
+    add_gc_phase_sample(rq->gc_debug_us_total, rq->gc_debug_us_max, timing.debug_us);
+}
+
+auto gc_task_has_pagemap_sibling_locked(task::Task* cur) -> bool {
+    if (cur == nullptr || cur->pagemap == nullptr) {
+        return false;
+    }
+
+    uint32_t const ACTIVE_COUNT = get_active_task_count();
+    for (uint32_t ai = 0; ai < ACTIVE_COUNT; ai++) {
+        auto* other = get_active_task_at_safe(ai);
+        if (other != nullptr) {
+            if (other != cur && other->pagemap == cur->pagemap && other->state.load(std::memory_order_acquire) != task::TaskState::DEAD) {
+                other->release();
+                return true;
+            }
+            other->release();
+        }
+    }
+
+    // This mirrors the existing conservative shared-pagemap check: a sibling
+    // that is already DEAD but still queued for GC must keep the pagemap alive
+    // until that sibling is detached and cleaned up too.
+    for (uint64_t scan_cpu = 0; scan_cpu < smt::get_core_count(); scan_cpu++) {
+        auto* dl = run_queues->that_cpu(scan_cpu)->dead_list.head;
+        while (dl != nullptr) {
+            if (dl != cur && dl->pagemap == cur->pagemap) {
+                return true;
+            }
+            dl = dl->sched_next;
+        }
+    }
+
+    return false;
+}
+
+auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no) -> GcDetachedTask {
+    if (rq == nullptr) {
+        return {};
+    }
+#ifndef SCHED_DEBUG
+    (void)cpu_no;
+#endif
+
+    task::Task* cur = rq->dead_list.head;
+    while (cur != nullptr) {
+        task::Task* next = cur->sched_next;
+
+        if (cur->state.load(std::memory_order_acquire) != task::TaskState::DEAD) {
+            cur = next;
+            continue;
+        }
+
+        uint64_t const DEATH_EPOCH = cur->death_epoch.load(std::memory_order_acquire);
+        if (!EpochManager::is_safe_to_reclaim(DEATH_EPOCH)) {
+#ifdef SCHED_DEBUG
+            static uint64_t epoch_skip_count = 0;
+            if (++epoch_skip_count % 1000 == 1) {
+                dbg::log("GC: PID %x death_epoch=%lu not safe yet", cur->pid, DEATH_EPOCH);
+            }
+#endif
+            cur = next;
+            continue;
+        }
+
+        // Check if any CPU still has this task as currentTask
+        bool still_in_use = false;
+        for (uint64_t check_cpu = 0; check_cpu < smt::get_core_count(); ++check_cpu) {
+            if (run_queues->that_cpu(check_cpu)->current_task == cur) {
+                still_in_use = true;
+#ifdef SCHED_DEBUG
+                dbg::log("GC: PID %x still current_task on CPU %d", cur->pid, check_cpu);
+#endif
+                break;
+            }
+        }
+        if (still_in_use) {
+            cur = next;
+            continue;
+        }
+
+        uint32_t const RC = cur->ref_count.load(std::memory_order_acquire);
+        if (RC != 1) {
+            cur = next;
+            continue;
+        }
+
+        // ZOMBIE BEHAVIOR: Don't reclaim until parent has called waitpid OR
+        // the parent is dead. Threads are joined via futex and do not waitpid.
+        if (cur->has_exited && !cur->waited_on && !cur->is_thread) {
+            if (cur->parent_pid != 0) {
+                auto* parent = find_task_by_pid(cur->parent_pid);
+                if (parent != nullptr && parent->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE) {
+#ifdef SCHED_DEBUG
+                    static uint64_t zombie_skip_count = 0;
+                    if (++zombie_skip_count % 1000 == 1) {
+                        dbg::log("GC: PID %x is zombie, waiting for parent PID %x to call waitpid", cur->pid, cur->parent_pid);
+                    }
+#endif
+                    cur = next;
+                    continue;
+                }
+#ifdef SCHED_DEBUG
+                dbg::log("GC: PID %x is orphaned zombie (parent PID %x dead), reaping", cur->pid, cur->parent_pid);
+#endif
+            }
+        }
+
+#ifdef SCHED_DEBUG
+        dbg::log("GC: Reclaiming PID %x from CPU %d", cur->pid, cpu_no);
+#endif
+
+        // Validate task struct before freeing
+        bool task_looks_valid = true;
+
+        if (cur->thread != nullptr) {
+            auto thread_addr = reinterpret_cast<uintptr_t>(cur->thread);
+            if (thread_addr < 0xffff800000000000ULL) {
+                dbg::log("GC: Task %p (PID %x) has invalid thread ptr %p, skipping", cur, cur->pid, cur->thread);
+                task_looks_valid = false;
+            }
+        }
+        if (cur->pagemap != nullptr) {
+            auto pm_addr = reinterpret_cast<uintptr_t>(cur->pagemap);
+            if (pm_addr >= 0xffffffff80000000ULL || pm_addr < 0xffff800000000000ULL) {
+                dbg::log("GC: Task %p (PID %x) has invalid pagemap ptr %p, skipping", cur, cur->pid, cur->pagemap);
+                task_looks_valid = false;
+            }
+        }
+
+        if (!task_looks_valid) {
+            while (rq->dead_list.remove(cur)) {
+            }
+            dbg::log("GC: Leaking corrupted task %p to avoid crash", cur);
+            return {.counted_without_cleanup = true};
+        }
+
+        bool should_free_pagemap = false;
+        if (cur->pagemap != nullptr && cur->type != task::TaskType::DAEMON && !cur->is_thread) {
+            should_free_pagemap = !gc_task_has_pagemap_sibling_locked(cur);
+        }
+
+        while (rq->dead_list.remove(cur)) {
+        }
+        cur->sched_queue = task::Task::sched_queue::NONE;
+
+        // Once the task is out of the registries, no new pid/active-list lookup
+        // can acquire it while the heavy cleanup runs outside the runqueue lock.
+        if (cur->pid > 0) {
+            pid_table_remove(cur->pid);
+            active_list_remove(cur->pid);
+        }
+
+        return {.task = cur, .should_free_pagemap = should_free_pagemap};
+    }
+
+    return {};
+}
+
+void cleanup_detached_gc_task(GcDetachedTask const& detached, GcTaskTiming& timing) {
+    auto* cur = detached.task;
+    if (cur == nullptr) {
+        return;
+    }
+
+    uint64_t const CLEANUP_START_US = time::get_us();
+
+    // Free pagemap.
+    // - DAEMON tasks use the kernel pagemap - must NOT free it.
+    // - Thread tasks share the owner process's pagemap - must NOT free it here.
+    // - Process tasks free only after detach confirmed no alive/dead sibling still
+    //   references the same pagemap.
+    if (cur->pagemap != nullptr) {
+        uint64_t const START_US = time::get_us();
+        if (detached.should_free_pagemap) {
+            mm::virt::destroy_user_space(cur->pagemap, cur->pid, cur->name, "task-exit-gc");
+            mm::phys::page_free(cur->pagemap);
+        }
+        cur->pagemap = nullptr;
+        timing.pagemap_us = elapsed_us_since(START_US, time::get_us());
+    }
+
+    // Free thread
+    if (cur->thread != nullptr) {
+        uint64_t const START_US = time::get_us();
+        auto* thread_ptr = cur->thread;
+        auto thread_addr = reinterpret_cast<uintptr_t>(thread_ptr);
+
+        bool const THREAD_IN_HHDM = (thread_addr >= 0xffff800000000000ULL && thread_addr < 0xffff900000000000ULL);
+        bool const THREAD_IN_KERNEL_STATIC = (thread_addr >= 0xffffffff80000000ULL && thread_addr < 0xffffffffc0000000ULL);
+        if (!THREAD_IN_HHDM && !THREAD_IN_KERNEL_STATIC) {
+            dbg::log("GC: Task %p (PID %x) thread ptr %p out of range; skipping", cur, cur->pid, thread_ptr);
+            cur->thread = nullptr;
+        } else {
+            if (thread_ptr->magic != 0xDEADBEEF) {
+                dbg::log("GC: Task %p (PID %x) thread bad magic 0x%x", cur, cur->pid, thread_ptr->magic);
+            } else {
+                thread_ptr->tls_phys_ptr = 0;
+                thread_ptr->stack_phys_ptr = 0;
+                threading::destroy_thread(thread_ptr);
+            }
+            cur->thread = nullptr;
+        }
+        timing.thread_us = elapsed_us_since(START_US, time::get_us());
+    }
+
+    uint64_t misc_start_us = time::get_us();
+    // Free kernel stack
+    if (cur->context.syscall_kernel_stack != 0) {
+        uint64_t const TOP = cur->context.syscall_kernel_stack;
+        uint64_t base = 0;
+        if (TOP > ker::mod::mm::KERNEL_STACK_SIZE) {
+            base = TOP - ker::mod::mm::KERNEL_STACK_SIZE;
+        }
+        if (base != 0) {
+            mm::phys::page_free(reinterpret_cast<void*>(base));
+        }
+        cur->context.syscall_kernel_stack = 0;
+    }
+
+    // Free scratch area
+    if (cur->context.syscall_scratch_area != 0) {
+        auto* sa = reinterpret_cast<cpu::PerCpu*>(cur->context.syscall_scratch_area);
+        auto sa_addr = reinterpret_cast<uintptr_t>(sa);
+        bool const IN_HHDM = (sa_addr >= 0xffff800000000000ULL && sa_addr < 0xffff900000000000ULL);
+        bool const IN_KERNEL_STATIC = (sa_addr >= 0xffffffff80000000ULL && sa_addr < 0xffffffffc0000000ULL);
+        if (IN_HHDM || IN_KERNEL_STATIC) {
+            delete sa;
+        }
+        cur->context.syscall_scratch_area = 0;
+    }
+
+    // Free name string
+    if (cur->name != nullptr) {
+        const auto* nm = cur->name;
+        auto nm_addr = reinterpret_cast<uintptr_t>(nm);
+        bool const IN_HHDM = (nm_addr >= 0xffff800000000000ULL && nm_addr < 0xffff900000000000ULL);
+        bool const IN_KERNEL_STATIC = (nm_addr >= 0xffffffff80000000ULL && nm_addr < 0xffffffffc0000000ULL);
+        if (IN_HHDM || IN_KERNEL_STATIC) {
+            const size_t MAX_NAME_LEN = 1024;
+            bool found_null = false;
+            for (size_t i = 0; i < MAX_NAME_LEN; ++i) {
+                volatile char const C = nm[i];
+                if (C == '\0') {
+                    found_null = true;
+                    break;
+                }
+            }
+            if (found_null) {
+                delete[] nm;
+            }
+        }
+        cur->name = nullptr;
+    }
+    timing.misc_us += elapsed_us_since(misc_start_us, time::get_us());
+
+    uint64_t const DEBUG_START_US = time::get_us();
+    loader::debug::unregister_process(cur->pid);
+    loader::debug::remove_gdb_debug_info(cur->pid);
+    timing.debug_us = elapsed_us_since(DEBUG_START_US, time::get_us());
+
+    misc_start_us = time::get_us();
+    delete cur;
+    timing.misc_us += elapsed_us_since(misc_start_us, time::get_us());
+    timing.total_us = timing.detach_us + elapsed_us_since(CLEANUP_START_US, time::get_us());
+}
+
+auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, bool* time_budget_exhausted) -> uint32_t {
     if (max_tasks == 0 || run_queues == nullptr) {
         return 0;
     }
 
+    uint64_t const START_US = max_work_us != 0 ? time::get_us() : 0;
+    bool hit_time_budget = false;
     uint32_t reclaimed = 0;
-    for (uint64_t cpu_no = 0; cpu_no < smt::get_core_count() && reclaimed < max_tasks; ++cpu_no) {
-        run_queues->with_lock_void(cpu_no, [cpu_no, max_tasks, &reclaimed](RunQueue* rq) -> void {
-#ifndef SCHED_DEBUG
-            (void)cpu_no;
-#endif
-            bool made_progress = true;
-            while (made_progress && reclaimed < max_tasks) {
-                made_progress = false;
-                task::Task* cur = rq->dead_list.head;
-                while (cur != nullptr && reclaimed < max_tasks) {
-                    task::Task* next = cur->sched_next;
-
-                    if (cur->state.load(std::memory_order_acquire) != task::TaskState::DEAD) {
-                        cur = next;
-                        continue;
-                    }
-
-                    uint64_t const DEATH_EPOCH = cur->death_epoch.load(std::memory_order_acquire);
-                    if (!EpochManager::is_safe_to_reclaim(DEATH_EPOCH)) {
-#ifdef SCHED_DEBUG
-                        static uint64_t epochSkipCount = 0;
-                        if (++epochSkipCount % 1000 == 1) {
-                            dbg::log("GC: PID %x death_epoch=%d not safe yet", cur->pid, death_epoch);
-                        }
-#endif
-                        cur = next;
-                        continue;
-                    }
-
-                    // Check if any CPU still has this task as currentTask
-                    bool still_in_use = false;
-                    for (uint64_t check_cpu = 0; check_cpu < smt::get_core_count(); ++check_cpu) {
-                        if (run_queues->that_cpu(check_cpu)->current_task == cur) {
-                            still_in_use = true;
-#ifdef SCHED_DEBUG
-                            dbg::log("GC: PID %x still current_task on CPU %d", cur->pid, check_cpu);
-#endif
-                            break;
-                        }
-                    }
-                    if (still_in_use) {
-                        cur = next;
-                        continue;
-                    }
-
-                    uint32_t const RC = cur->ref_count.load(std::memory_order_acquire);
-                    if (RC != 1) {
-                        cur = next;
-                        continue;
-                    }
-
-                    // ZOMBIE BEHAVIOR: Don't reclaim until parent has called waitpid
-                    // OR the parent is dead. This keeps the exit status available for waitpid.
-                    // EXCEPTION: Threads (is_thread) are joined via futex, not waitpid.
-                    // They never get waited_on set, so without this exception they'd
-                    // accumulate as zombies forever, bloating the dead list.
-                    if (cur->has_exited && !cur->waited_on && !cur->is_thread) {
-                        // Check if parent is still alive
-                        if (cur->parent_pid != 0) {
-                            auto* parent = find_task_by_pid(cur->parent_pid);
-                            if (parent != nullptr && parent->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE) {
-                                // Parent is alive and hasn't called waitpid yet - keep zombie
-#ifdef SCHED_DEBUG
-                                static uint64_t zombie_skip_count = 0;
-                                if (++zombie_skip_count % 1000 == 1) {
-                                    dbg::log("GC: PID %x is zombie, waiting for parent PID %x to call waitpid", cur->pid, cur->parent_pid);
-                                }
-#endif
-                                cur = next;
-                                continue;
-                            }
-                            // Parent is dead - orphaned zombie can be reaped immediately
-#ifdef SCHED_DEBUG
-                            dbg::log("GC: PID %x is orphaned zombie (parent PID %x dead), reaping", cur->pid, cur->parent_pid);
-#endif
-                        }
-                        // No parent (init) or parent is dead - safe to reclaim
-                    }
-
-#ifdef SCHED_DEBUG
-                    dbg::log("GC: Reclaiming PID %x from CPU %d", cur->pid, cpu_no);
-#endif
-
-                    // Validate task struct before freeing
-                    bool task_looks_valid = true;
-
-                    if (cur->thread != nullptr) {
-                        auto thread_addr = reinterpret_cast<uintptr_t>(cur->thread);
-                        if (thread_addr < 0xffff800000000000ULL) {
-                            dbg::log("GC: Task %p (PID %x) has invalid thread ptr %p, skipping", cur, cur->pid, cur->thread);
-                            task_looks_valid = false;
-                        }
-                    }
-                    if (cur->pagemap != nullptr) {
-                        auto pm_addr = reinterpret_cast<uintptr_t>(cur->pagemap);
-                        if (pm_addr >= 0xffffffff80000000ULL || pm_addr < 0xffff800000000000ULL) {
-                            dbg::log("GC: Task %p (PID %x) has invalid pagemap ptr %p, skipping", cur, cur->pid, cur->pagemap);
-                            task_looks_valid = false;
-                        }
-                    }
-
-                    if (!task_looks_valid) {
-                        while (rq->dead_list.remove(cur)) {
-                        }
-                        dbg::log("GC: Leaking corrupted task %p to avoid crash", cur);
-                        reclaimed++;
-                        made_progress = true;
-                        break;
-                    }
-
-                    while (rq->dead_list.remove(cur)) {
-                    }
-
-                    cur->sched_queue = task::Task::sched_queue::NONE;
-
-                    // Clear PID hash table entry
-                    if (cur->pid > 0) {
-                        pid_table_remove(cur->pid);
-                        active_list_remove(cur->pid);
-                    }
-
-                    // Free pagemap.
-                    // - DAEMON tasks use the kernel pagemap - must NOT free it.
-                    // - Thread tasks (isThread == true) share the owner process's pagemap -
-                    //   must NOT free it here; we only free when the last user is gone.
-                    // - For process tasks (isThread == false): only free if no sibling
-                    //   threads sharing the same pagemap are still alive (not yet DEAD).
-                    if (cur->pagemap != nullptr && cur->type != task::TaskType::DAEMON && !cur->is_thread) {
-                        bool sibling_alive = false;
-                        uint32_t const ACTIVE_COUNT = get_active_task_count();
-                        for (uint32_t ai = 0; ai < ACTIVE_COUNT; ai++) {
-                            auto* other = get_active_task_at_safe(ai);
-                            if (other != nullptr) {
-                                if (other != cur && other->pagemap == cur->pagemap &&
-                                    other->state.load(std::memory_order_acquire) != task::TaskState::DEAD) {
-                                    sibling_alive = true;
-                                    other->release();
-                                    break;
-                                }
-                                other->release();
-                            }
-                        }
-                        if (!sibling_alive) {
-                            for (uint64_t scan_cpu = 0; scan_cpu < smt::get_core_count() && !sibling_alive; scan_cpu++) {
-                                auto* dl = run_queues->that_cpu(scan_cpu)->dead_list.head;
-                                while (dl != nullptr) {
-                                    if (dl != cur && dl->pagemap == cur->pagemap) {
-                                        sibling_alive = true;
-                                        break;
-                                    }
-                                    dl = dl->sched_next;
-                                }
-                            }
-                        }
-                        if (!sibling_alive) {
-                            mm::virt::destroy_user_space(cur->pagemap, cur->pid, cur->name, "task-exit-gc");
-                            mm::phys::page_free(cur->pagemap);
-                        }
-                        cur->pagemap = nullptr;
-                    }
-
-                    // Free thread
-                    if (cur->thread != nullptr) {
-                        auto* thread_ptr = cur->thread;
-                        auto thread_addr = reinterpret_cast<uintptr_t>(thread_ptr);
-
-                        bool const THREAD_IN_HHDM = (thread_addr >= 0xffff800000000000ULL && thread_addr < 0xffff900000000000ULL);
-                        bool const THREAD_IN_KERNEL_STATIC = (thread_addr >= 0xffffffff80000000ULL && thread_addr < 0xffffffffc0000000ULL);
-                        if (!THREAD_IN_HHDM && !THREAD_IN_KERNEL_STATIC) {
-                            dbg::log("GC: Task %p (PID %x) thread ptr %p out of range; skipping", cur, cur->pid, thread_ptr);
-                            cur->thread = nullptr;
-                        } else {
-                            if (thread_ptr->magic != 0xDEADBEEF) {
-                                dbg::log("GC: Task %p (PID %x) thread bad magic 0x%x", cur, cur->pid, thread_ptr->magic);
-                            } else {
-                                thread_ptr->tls_phys_ptr = 0;
-                                thread_ptr->stack_phys_ptr = 0;
-                                threading::destroy_thread(thread_ptr);
-                            }
-                            cur->thread = nullptr;
-                        }
-                    }
-
-                    // Free kernel stack
-                    if (cur->context.syscall_kernel_stack != 0) {
-                        uint64_t const TOP = cur->context.syscall_kernel_stack;
-                        uint64_t base = 0;
-                        if (TOP > ker::mod::mm::KERNEL_STACK_SIZE) {
-                            base = TOP - ker::mod::mm::KERNEL_STACK_SIZE;
-                        }
-                        if (base != 0) {
-                            mm::phys::page_free(reinterpret_cast<void*>(base));
-                        }
-                        cur->context.syscall_kernel_stack = 0;
-                    }
-
-                    // Free scratch area
-                    if (cur->context.syscall_scratch_area != 0) {
-                        auto* sa = reinterpret_cast<cpu::PerCpu*>(cur->context.syscall_scratch_area);
-                        auto sa_addr = reinterpret_cast<uintptr_t>(sa);
-                        bool const IN_HHDM = (sa_addr >= 0xffff800000000000ULL && sa_addr < 0xffff900000000000ULL);
-                        bool const IN_KERNEL_STATIC = (sa_addr >= 0xffffffff80000000ULL && sa_addr < 0xffffffffc0000000ULL);
-                        if (IN_HHDM || IN_KERNEL_STATIC) {
-                            delete sa;
-                        }
-                        cur->context.syscall_scratch_area = 0;
-                    }
-
-                    // Free name string
-                    if (cur->name != nullptr) {
-                        const auto* nm = cur->name;
-                        auto nm_addr = reinterpret_cast<uintptr_t>(nm);
-                        bool const IN_HHDM = (nm_addr >= 0xffff800000000000ULL && nm_addr < 0xffff900000000000ULL);
-                        bool const IN_KERNEL_STATIC = (nm_addr >= 0xffffffff80000000ULL && nm_addr < 0xffffffffc0000000ULL);
-                        if (IN_HHDM || IN_KERNEL_STATIC) {
-                            const size_t MAX_NAME_LEN = 1024;
-                            bool found_null = false;
-                            for (size_t i = 0; i < MAX_NAME_LEN; ++i) {
-                                volatile char const C = nm[i];
-                                if (C == '\0') {
-                                    found_null = true;
-                                    break;
-                                }
-                            }
-                            if (found_null) {
-                                delete[] nm;
-                            }
-                        }
-                        cur->name = nullptr;
-                    }
-
-                    // Clean up debug info
-                    loader::debug::unregister_process(cur->pid);
-                    loader::debug::remove_gdb_debug_info(cur->pid);
-
-                    delete cur;
-
-                    reclaimed++;
-                    made_progress = true;
-                    break;  // Restart from head after removal
-                }
+    for (uint64_t cpu_no = 0; cpu_no < smt::get_core_count() && reclaimed < max_tasks && !hit_time_budget; ++cpu_no) {
+        while (reclaimed < max_tasks && !hit_time_budget) {
+            if (gc_time_budget_expired(START_US, max_work_us)) {
+                hit_time_budget = true;
+                break;
             }
-        });
+
+            GcDetachedTask detached{};
+            uint64_t const DETACH_START_US = time::get_us();
+            run_queues->with_lock_void(
+                cpu_no, [&detached, cpu_no](RunQueue* rq) -> void { detached = detach_next_reclaimable_task_locked(rq, cpu_no); });
+
+            GcTaskTiming timing{.detach_us = elapsed_us_since(DETACH_START_US, time::get_us())};
+            if (detached.counted_without_cleanup) {
+                timing.total_us = timing.detach_us;
+                note_gc_task_timing(timing);
+                reclaimed++;
+                continue;
+            }
+
+            if (detached.task == nullptr) {
+                break;
+            }
+
+            cleanup_detached_gc_task(detached, timing);
+            note_gc_task_timing(timing);
+            reclaimed++;
+            hit_time_budget = gc_time_budget_expired(START_US, max_work_us);
+        }
+    }
+    if (time_budget_exhausted != nullptr) {
+        *time_budget_exhausted = hit_time_budget;
     }
     return reclaimed;
 }
+
+}  // namespace
+
+auto gc_expired_tasks_budgeted(uint32_t max_tasks) -> uint32_t { return gc_expired_tasks_budgeted_impl(max_tasks, 0, nullptr); }
 
 void gc_expired_tasks() { (void)gc_expired_tasks_budgeted(UINT32_MAX); }
 
@@ -4288,11 +4406,12 @@ void scheduler_gc_thread_main() {
         }
 
         uint64_t const START_US = time::get_us();
-        uint32_t const RECLAIMED = gc_expired_tasks_budgeted(SCHED_GC_RECLAIM_BUDGET);
+        bool time_budget_exhausted = false;
+        uint32_t const RECLAIMED = gc_expired_tasks_budgeted_impl(SCHED_GC_RECLAIM_BUDGET, SCHED_GC_WORK_BUDGET_US, &time_budget_exhausted);
         uint64_t const END_US = time::get_us();
         note_gc_pass_result(RECLAIMED, END_US >= START_US ? END_US - START_US : 0);
 
-        if (RECLAIMED >= SCHED_GC_RECLAIM_BUDGET) {
+        if (RECLAIMED >= SCHED_GC_RECLAIM_BUDGET || (time_budget_exhausted && RECLAIMED != 0)) {
             scheduler_gc_requested.store(true, std::memory_order_release);
             kern_yield();
         }
@@ -4665,11 +4784,25 @@ auto get_scheduler_trace_stats(uint64_t cpu_no) -> SchedulerTraceStats {
             .local_reschedule_timer_pokes = rq->local_reschedule_timer_pokes.load(std::memory_order_relaxed),
             .slow_reschedule_scans = rq->slow_reschedule_scans.load(std::memory_order_relaxed),
             .wait_list_scan_iterations = rq->wait_list_scan_iterations.load(std::memory_order_relaxed),
+            .wait_list_scan_passes = rq->wait_list_scan_passes.load(std::memory_order_relaxed),
+            .wait_list_scan_max = rq->wait_list_scan_max.load(std::memory_order_relaxed),
             .timer_expired_wakeups = rq->timer_expired_wakeups.load(std::memory_order_relaxed),
             .gc_passes_triggered = rq->gc_passes_triggered.load(std::memory_order_relaxed),
             .gc_tasks_reclaimed = rq->gc_tasks_reclaimed.load(std::memory_order_relaxed),
             .gc_work_us_total = rq->gc_work_us_total.load(std::memory_order_relaxed),
             .gc_work_us_max = rq->gc_work_us_max.load(std::memory_order_relaxed),
+            .gc_task_us_total = rq->gc_task_us_total.load(std::memory_order_relaxed),
+            .gc_task_us_max = rq->gc_task_us_max.load(std::memory_order_relaxed),
+            .gc_detach_us_total = rq->gc_detach_us_total.load(std::memory_order_relaxed),
+            .gc_detach_us_max = rq->gc_detach_us_max.load(std::memory_order_relaxed),
+            .gc_pagemap_us_total = rq->gc_pagemap_us_total.load(std::memory_order_relaxed),
+            .gc_pagemap_us_max = rq->gc_pagemap_us_max.load(std::memory_order_relaxed),
+            .gc_thread_us_total = rq->gc_thread_us_total.load(std::memory_order_relaxed),
+            .gc_thread_us_max = rq->gc_thread_us_max.load(std::memory_order_relaxed),
+            .gc_misc_us_total = rq->gc_misc_us_total.load(std::memory_order_relaxed),
+            .gc_misc_us_max = rq->gc_misc_us_max.load(std::memory_order_relaxed),
+            .gc_debug_us_total = rq->gc_debug_us_total.load(std::memory_order_relaxed),
+            .gc_debug_us_max = rq->gc_debug_us_max.load(std::memory_order_relaxed),
             .load_balance_pushes = rq->load_balance_pushes.load(std::memory_order_relaxed),
         };
     });
@@ -4726,23 +4859,27 @@ void dump_scheduler_trace_stats() {
             stats.wake_ipis_coalesced == 0 && stats.local_reschedule_requests == 0 && stats.slow_reschedule_scans == 0 &&
             stats.load_balance_pushes == 0 && stats.scheduler_timer_interrupts == 0 && stats.scheduler_timer_arms == 0 &&
             stats.scheduler_timer_disarms == 0 && stats.local_reschedule_timer_pokes == 0 && stats.wait_list_scan_iterations == 0 &&
-            stats.timer_expired_wakeups == 0 && stats.gc_passes_triggered == 0 && stats.gc_tasks_reclaimed == 0) {
+            stats.wait_list_scan_passes == 0 && stats.wait_list_scan_max == 0 && stats.timer_expired_wakeups == 0 &&
+            stats.gc_passes_triggered == 0 && stats.gc_tasks_reclaimed == 0 && stats.gc_task_us_total == 0) {
             continue;
         }
 
         dbg::log(
             "schedstats: cpu%lu timer_irq=%lu sched_arm=%lu sched_disarm=%lu idle_arm=%lu idle_disarm=%lu idle_wake=%lu wake_ipi=%lu "
-            "wake_coal=%lu local_resched=%lu local_poke=%lu slow_scan=%lu wait_scan=%lu timer_wake=%lu gc_pass=%lu gc_reclaim=%lu "
-            "gc_us=%lu gc_max_us=%lu lb_push=%lu",
+            "wake_coal=%lu local_resched=%lu local_poke=%lu slow_scan=%lu wait_scan=%lu wait_pass=%lu wait_max=%lu timer_wake=%lu "
+            "gc_pass=%lu gc_reclaim=%lu gc_us=%lu gc_max_us=%lu gc_task_us=%lu gc_task_max=%lu gc_pm_us=%lu gc_pm_max=%lu lb_push=%lu",
             static_cast<unsigned long>(cpu_no), static_cast<unsigned long>(stats.scheduler_timer_interrupts),
             static_cast<unsigned long>(stats.scheduler_timer_arms), static_cast<unsigned long>(stats.scheduler_timer_disarms),
             static_cast<unsigned long>(stats.idle_timer_arms), static_cast<unsigned long>(stats.idle_timer_disarms),
             static_cast<unsigned long>(stats.idle_timer_wakeups), static_cast<unsigned long>(stats.wake_ipis_sent),
             static_cast<unsigned long>(stats.wake_ipis_coalesced), static_cast<unsigned long>(stats.local_reschedule_requests),
             static_cast<unsigned long>(stats.local_reschedule_timer_pokes), static_cast<unsigned long>(stats.slow_reschedule_scans),
-            static_cast<unsigned long>(stats.wait_list_scan_iterations), static_cast<unsigned long>(stats.timer_expired_wakeups),
+            static_cast<unsigned long>(stats.wait_list_scan_iterations), static_cast<unsigned long>(stats.wait_list_scan_passes),
+            static_cast<unsigned long>(stats.wait_list_scan_max), static_cast<unsigned long>(stats.timer_expired_wakeups),
             static_cast<unsigned long>(stats.gc_passes_triggered), static_cast<unsigned long>(stats.gc_tasks_reclaimed),
             static_cast<unsigned long>(stats.gc_work_us_total), static_cast<unsigned long>(stats.gc_work_us_max),
+            static_cast<unsigned long>(stats.gc_task_us_total), static_cast<unsigned long>(stats.gc_task_us_max),
+            static_cast<unsigned long>(stats.gc_pagemap_us_total), static_cast<unsigned long>(stats.gc_pagemap_us_max),
             static_cast<unsigned long>(stats.load_balance_pushes));
     }
 }
