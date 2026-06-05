@@ -546,6 +546,75 @@ def append_step(manifest: dict[str, Any], suite_dir: Path, step: dict[str, Any])
     write_json(suite_dir / "manifest.json", manifest)
 
 
+def attach_wos_cpustat(step: dict[str, Any], cpustat_entries: list[dict[str, Any]]) -> None:
+    if not cpustat_entries:
+        return
+    step["wos_perf_cpustat"] = cpustat_entries
+    artifacts = step.setdefault("artifacts", [])
+    for entry in cpustat_entries:
+        artifacts.extend(entry.get("artifacts", []))
+
+
+def collect_wos_cpustat(
+    args: argparse.Namespace,
+    step_dir: Path,
+    hosts: list[str],
+) -> list[dict[str, Any]]:
+    if not hosts:
+        return []
+
+    cpustat_dir = step_dir / "perf-cpustat"
+    cpustat_dir.mkdir(parents=True, exist_ok=True)
+    captures: list[dict[str, Any]] = []
+
+    for host in hosts:
+        stdout_path = cpustat_dir / f"{host}.stdout.log"
+        stderr_path = cpustat_dir / f"{host}.stderr.log"
+        metadata_path = cpustat_dir / f"{host}.json"
+        command = [str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, "/usr/bin/perf", "cpustat"]
+        started = time.monotonic()
+        entry: dict[str, Any] = {
+            "host": host,
+            "command": command,
+            "stdout_file": relpath(stdout_path),
+            "stderr_file": relpath(stderr_path),
+            "metadata_file": relpath(metadata_path),
+            "artifacts": [
+                relpath(stdout_path),
+                relpath(stderr_path),
+                relpath(metadata_path),
+            ],
+        }
+        try:
+            result = subprocess.run(
+                command,
+                cwd=ROOT,
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=args.wos_preflight_timeout,
+            )
+            write_text(stdout_path, result.stdout)
+            write_text(stderr_path, result.stderr)
+            entry["returncode"] = result.returncode
+            entry["duration_seconds"] = time.monotonic() - started
+            entry["status"] = "ok" if result.returncode == 0 else "failed"
+            if result.returncode != 0:
+                entry["error"] = f"command failed with exit code {result.returncode}"
+        except subprocess.TimeoutExpired as exc:
+            write_text(stdout_path, str(exc.stdout) if exc.stdout else "")
+            write_text(stderr_path, str(exc.stderr) if exc.stderr else "")
+            entry["returncode"] = None
+            entry["duration_seconds"] = time.monotonic() - started
+            entry["status"] = "timeout"
+            entry["error"] = f"command timed out after {args.wos_preflight_timeout:.1f}s"
+
+        write_json(metadata_path, entry)
+        captures.append(entry)
+
+    return captures
+
+
 def run_host_schedstat_probe(
     args: argparse.Namespace,
     suite_dir: Path,
@@ -885,6 +954,7 @@ def run_wos_renderbench(
         "ok": True,
         "os": "wos",
         "host": host,
+        "hosts": wos_hosts,
         "command": [str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, *command],
         "result_file": relpath(step_dir / "result.json"),
         "artifacts": [
@@ -1226,11 +1296,13 @@ def main() -> int:
         nonlocal failures
         print(f"[suite] {name}")
         trace_session = host_kvm_tracer.start(name) if host_kvm_trace else None
+        cpustat_hosts = wos_hosts if name.startswith("wos-") else []
         try:
             step = func()
         except Exception as exc:  # noqa: BLE001
             failures += 1
             trace_entries = host_kvm_tracer.stop(trace_session)
+            cpustat_entries = collect_wos_cpustat(args, suite_dir / name, cpustat_hosts)
             error_path = suite_dir / name / "error.txt"
             write_text(error_path, f"{exc}\n")
             failed_step = {
@@ -1240,6 +1312,7 @@ def main() -> int:
                 "error_file": relpath(error_path),
             }
             attach_host_kvm_trace(failed_step, trace_entries)
+            attach_wos_cpustat(failed_step, cpustat_entries)
             append_step(
                 manifest,
                 suite_dir,
@@ -1249,7 +1322,13 @@ def main() -> int:
             return
 
         trace_entries = host_kvm_tracer.stop(trace_session)
+        cpustat_entries = collect_wos_cpustat(
+            args,
+            suite_dir / name,
+            step.get("hosts", cpustat_hosts) if step.get("os") == "wos" else [],
+        )
         attach_host_kvm_trace(step, trace_entries)
+        attach_wos_cpustat(step, cpustat_entries)
         append_step(manifest, suite_dir, step)
         print(f"[suite] {name} complete")
 
