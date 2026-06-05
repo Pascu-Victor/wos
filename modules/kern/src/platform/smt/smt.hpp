@@ -172,6 +172,33 @@ class PerCpuCrossAccess {
         unlock_cpu(cpu, FLAGS);
     }
 
+    // Locked access to two CPU-local values.  Locks are always acquired in CPU
+    // order so scheduler migration paths can move an object between run queues
+    // without a remove/insert visibility gap or ABBA deadlock.
+    template <typename Func>
+    void with_two_locks_void(uint64_t cpu_a, uint64_t cpu_b, Func&& func) {
+        if (cpu_a == cpu_b) {
+            uint64_t const FLAGS = lock_cpu(cpu_a);
+            std::forward<Func>(func)(&data[cpu_a], &data[cpu_a]);
+            unlock_cpu(cpu_a, FLAGS);
+            return;
+        }
+
+        uint64_t const FIRST = cpu_a < cpu_b ? cpu_a : cpu_b;
+        uint64_t const SECOND = cpu_a < cpu_b ? cpu_b : cpu_a;
+        uint64_t const FIRST_FLAGS = lock_cpu(FIRST);
+        uint64_t const SECOND_FLAGS = lock_cpu(SECOND);
+
+        if (cpu_a == FIRST) {
+            std::forward<Func>(func)(&data[FIRST], &data[SECOND]);
+        } else {
+            std::forward<Func>(func)(&data[SECOND], &data[FIRST]);
+        }
+
+        unlock_cpu(SECOND, SECOND_FLAGS);
+        unlock_cpu(FIRST, FIRST_FLAGS);
+    }
+
     // Non-blocking try-lock: returns false immediately if lock is held.
     // Safe to call from interrupt context and idle paths (no spinning).
     template <typename Func>

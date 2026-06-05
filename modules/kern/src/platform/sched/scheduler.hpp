@@ -223,6 +223,8 @@ auto get_current_task() -> task::Task*;
 auto get_return_task() -> task::Task*;
 auto current_cpu_for_task(task::Task* task) -> uint64_t;
 auto owner_cpu_for_task(task::Task* task) -> uint64_t;
+auto migrate_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool;
+auto pin_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool;
 bool can_query_current_task();
 void remove_current_task();                                   // Remove current task from runqueue (for exit)
 auto find_task_by_pid(uint64_t pid) -> task::Task*;           // Find a task by PID (O(1) via PID registry)

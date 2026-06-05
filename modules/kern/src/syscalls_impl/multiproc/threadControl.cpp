@@ -192,15 +192,12 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
             if (std::has_single_bit(MASK)) {
                 // Single-CPU pin
                 uint64_t const TARGET_CPU = std::countr_zero(MASK);
+                if (!mod::sched::pin_task_to_cpu(task, TARGET_CPU)) {
+                    task->release();
+                    return static_cast<uint64_t>(-EBUSY);
+                }
                 task->domain_mask = MASK;
                 task->domain_hard = false;
-                task->cpu_pinned = true;
-                if (!IS_RUNNING && !IS_WAITING) {
-                    task->cpu = TARGET_CPU;
-                }
-                if (!IS_RUNNING && !IS_WAITING) {
-                    mod::sched::reschedule_task_for_cpu(TARGET_CPU, task);
-                }
             } else if (MASK == VALID_MASK) {
                 // Full mask: remove all affinity restrictions
                 task->domain_mask = ~0ULL;
@@ -208,13 +205,14 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
                 task->cpu_pinned = false;
             } else {
                 // Multi-bit subset: set domain_mask, pick least-loaded CPU within mask
+                uint64_t const TARGET_CPU = mod::sched::get_least_loaded_cpu_in_mask(MASK);
+                if (!IS_RUNNING && !IS_WAITING && !mod::sched::migrate_task_to_cpu(task, TARGET_CPU)) {
+                    task->release();
+                    return static_cast<uint64_t>(-EBUSY);
+                }
                 task->domain_mask = MASK;
                 task->domain_hard = false;
                 task->cpu_pinned = false;
-                uint64_t const TARGET_CPU = mod::sched::get_least_loaded_cpu_in_mask(MASK);
-                if (!IS_RUNNING && !IS_WAITING) {
-                    mod::sched::reschedule_task_for_cpu(TARGET_CPU, task);
-                }
             }
 
             task->release();

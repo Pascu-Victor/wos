@@ -235,24 +235,7 @@ auto napi_set_worker_cpu(NapiStruct* napi, uint64_t cpu) -> bool {
         return false;
     }
     auto* worker = napi->worker;
-    uint64_t const RUNNING_CPU = ker::mod::sched::current_cpu_for_task(worker);
-    if (RUNNING_CPU != UINT64_MAX) {
-        if (RUNNING_CPU != cpu) {
-            return false;
-        }
-        worker->cpu_pinned = true;
-        return true;
-    }
-
-    bool const WAS_PINNED = worker->cpu_pinned;
-    worker->cpu_pinned = false;
-    ker::mod::sched::reschedule_task_for_cpu(cpu, worker);
-    if (worker->cpu != cpu) {
-        worker->cpu_pinned = WAS_PINNED;
-        return false;
-    }
-    worker->cpu_pinned = true;
-    return true;
+    return ker::mod::sched::pin_task_to_cpu(worker, cpu);
 }
 
 void napi_disable(NapiStruct* napi) {

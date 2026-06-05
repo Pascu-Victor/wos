@@ -724,6 +724,18 @@ inline auto task_wait_deadline_us(task::Task const* t) -> uint64_t {
     return min_nonzero_deadline(t->wake_at_us, t->itimer_real_expire_us);
 }
 
+inline auto wait_list_contains_locked(RunQueue* rq, task::Task const* t) -> bool {
+    if (rq == nullptr || t == nullptr) {
+        return false;
+    }
+    for (task::Task const* cur = rq->wait_list.head; cur != nullptr; cur = cur->sched_next) {
+        if (cur == t) {
+            return true;
+        }
+    }
+    return false;
+}
+
 inline void note_wait_deadline_locked(RunQueue* rq, task::Task const* t) {
     uint64_t const DEADLINE_US = task_wait_deadline_us(t);
     if (rq == nullptr || DEADLINE_US == 0) {
@@ -784,6 +796,11 @@ inline void repair_stale_wait_membership_locked(RunQueue* rq, task::Task* t) {
 
 inline auto runqueue_task_is_reserved_locked(RunQueue* rq, task::Task const* task) -> bool {
     return rq != nullptr && task != nullptr && (rq->current_task == task || rq->handoff_task == task);
+}
+
+inline auto runqueue_owns_task_locked(RunQueue* rq, task::Task* task) -> bool {
+    return runqueue_task_is_reserved_locked(rq, task) || (rq != nullptr && rq->runnable_heap.contains(task)) ||
+           wait_list_contains_locked(rq, task);
 }
 
 inline void reserve_handoff_task_locked(RunQueue* rq, task::Task* task, uint64_t start_us) {
@@ -1693,6 +1710,138 @@ auto owner_cpu_for_task(task::Task* task) -> uint64_t {
     }
     return UINT64_MAX;
 }
+
+namespace {
+struct TaskOwnerMoveResult {
+    bool moved{false};
+    bool runnable{false};
+};
+
+auto hinted_or_scanned_owner_cpu(task::Task* task) -> uint64_t {
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    uint64_t const HINTED_CPU = task != nullptr ? task->cpu : UINT64_MAX;
+    if (task == nullptr || run_queues == nullptr) {
+        return UINT64_MAX;
+    }
+    if (HINTED_CPU < CORE_COUNT) {
+        bool hinted_owner = false;
+        run_queues->with_lock_void(HINTED_CPU, [task, &hinted_owner](RunQueue* rq) { hinted_owner = runqueue_owns_task_locked(rq, task); });
+        if (hinted_owner) {
+            return HINTED_CPU;
+        }
+    }
+    return owner_cpu_for_task(task);
+}
+
+auto move_task_owner_to_cpu(task::Task* task, uint64_t target_cpu, bool pin_to_target) -> TaskOwnerMoveResult {
+    TaskOwnerMoveResult result{};
+    if (task == nullptr || run_queues == nullptr || target_cpu >= smt::get_core_count()) {
+        return result;
+    }
+    if (task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
+        return result;
+    }
+
+    uint64_t const OWNER_CPU = hinted_or_scanned_owner_cpu(task);
+    if (OWNER_CPU == UINT64_MAX) {
+        return result;
+    }
+
+    bool const WAS_PINNED = task->cpu_pinned;
+    run_queues->with_two_locks_void(
+        OWNER_CPU, target_cpu, [task, OWNER_CPU, target_cpu, pin_to_target, WAS_PINNED, &result](RunQueue* owner_rq, RunQueue* target_rq) {
+            if (task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
+                return;
+            }
+
+            if (runqueue_task_is_reserved_locked(owner_rq, task)) {
+                if (owner_rq != target_rq) {
+                    return;
+                }
+                task->cpu = target_cpu;
+                if (pin_to_target) {
+                    task->cpu_pinned = true;
+                }
+                result.moved = true;
+                return;
+            }
+
+            bool const IN_HEAP = owner_rq->runnable_heap.contains(task);
+            bool const IN_WAIT = wait_list_contains_locked(owner_rq, task);
+            if (!IN_HEAP && !IN_WAIT) {
+                return;
+            }
+
+            if (owner_rq == target_rq) {
+                task->cpu = target_cpu;
+                if (pin_to_target) {
+                    task->cpu_pinned = true;
+                }
+                result.moved = true;
+                result.runnable = IN_HEAP;
+                return;
+            }
+
+            bool moved_waiting = false;
+            bool moved_runnable = false;
+            if (IN_WAIT) {
+                moved_waiting = wait_list_remove_locked(owner_rq, task);
+            }
+            if (IN_HEAP) {
+                moved_runnable = owner_rq->runnable_heap.remove(task);
+                if (moved_runnable) {
+                    remove_from_sums(owner_rq, task);
+                    moved_waiting = false;
+                }
+            }
+            if (!moved_waiting && !moved_runnable) {
+                return;
+            }
+
+            task->cpu = target_cpu;
+            if (pin_to_target) {
+                task->cpu_pinned = true;
+            }
+
+            if (moved_waiting) {
+                task->sched_queue = task::Task::sched_queue::WAITING;
+                wait_list_push_locked(target_rq, task);
+                result.moved = true;
+                return;
+            }
+
+            int64_t const FAIR_VRUNTIME = std::max(target_rq->min_vruntime, compute_avg_vruntime(target_rq));
+            task->vruntime = std::max(task->vruntime, FAIR_VRUNTIME);
+            task->vdeadline = task->vruntime + ((static_cast<int64_t>(task->slice_ns) * 1024) / static_cast<int64_t>(task->sched_weight));
+            task->sched_queue = task::Task::sched_queue::RUNNABLE;
+            if (target_rq->runnable_heap.insert(task)) {
+                add_to_sums(target_rq, task);
+                result.moved = true;
+                result.runnable = true;
+                return;
+            }
+
+            task->cpu = OWNER_CPU;
+            task->cpu_pinned = WAS_PINNED;
+            if (owner_rq->runnable_heap.insert(task)) {
+                add_to_sums(owner_rq, task);
+            }
+        });
+
+    if (result.moved && result.runnable) {
+        if (target_cpu == cpu::current_cpu()) {
+            request_local_reschedule();
+        } else {
+            wake_cpu(target_cpu);
+        }
+    }
+    return result;
+}
+}  // namespace
+
+auto migrate_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool { return move_task_owner_to_cpu(task, target_cpu, false).moved; }
+
+auto pin_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool { return move_task_owner_to_cpu(task, target_cpu, true).moved; }
 
 auto can_query_current_task() -> bool {
     if (run_queues == nullptr) {
