@@ -23,6 +23,24 @@ constexpr size_t PIPE_READ = 0;
 constexpr size_t PIPE_WRITE = 1;
 using init_log = wos::journal<"init">;
 
+}  // namespace
+
+auto spawn_local_service(const char* path, const char* const* argv, const char* const* envp) -> uint64_t {
+    int64_t const PID = ker::process::fork();
+    if (PID < 0) {
+        return 0;
+    }
+    if (PID == 0) {
+        ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_LOCAL);
+        ker::process::execve(path, argv, envp);
+        ker::process::exit(127);
+        __builtin_unreachable();
+    }
+    return static_cast<uint64_t>(PID);
+}
+
+namespace {
+
 // Spawn a process with stdout and stderr captured to the journal under `tag`.
 // A drain child reads lines from the pipe and emits them as INFO journal entries.
 // Returns the service PID, or 0 on failure.
@@ -105,7 +123,7 @@ void start_journald() {
     init_log::info("init[%llu]: spawning journald", static_cast<unsigned long long>(CPUNO));
     std::array<const char*, 2> argv = {"/sbin/journald", nullptr};
     InitEnv env = make_init_env();
-    uint64_t const PID = ker::process::exec("/sbin/journald", argv.data(), env.envp.data());
+    uint64_t const PID = spawn_local_service("/sbin/journald", argv.data(), env.envp.data());
     if (PID == 0) {
         init_log::warn("init[%llu]: failed to spawn journald", static_cast<unsigned long long>(CPUNO));
     } else {
@@ -125,7 +143,7 @@ void start_httpd() {
     init_log::info("init[%llu]: spawning httpd (HTTP server on port 80)", static_cast<unsigned long long>(CPUNO));
     std::array<const char*, 2> httpd_argv = {"/sbin/httpd", nullptr};
     InitEnv httpd_env = make_init_env();
-    uint64_t const HTTPD_PID = ker::process::exec("/sbin/httpd", httpd_argv.data(), httpd_env.envp.data());
+    uint64_t const HTTPD_PID = spawn_local_service("/sbin/httpd", httpd_argv.data(), httpd_env.envp.data());
     if (HTTPD_PID == 0) {
         init_log::error("init[%llu]: failed to spawn httpd", static_cast<unsigned long long>(CPUNO));
     } else {
@@ -201,7 +219,7 @@ void start_testd() {
     init_log::info("init[%llu]: spawning testd (kernel test daemon)", static_cast<unsigned long long>(CPUNO));
     std::array<const char*, 2> argv = {"/usr/bin/testd", nullptr};
     InitEnv env = make_init_env();
-    uint64_t const PID = ker::process::exec("/usr/bin/testd", argv.data(), env.envp.data());
+    uint64_t const PID = spawn_local_service("/usr/bin/testd", argv.data(), env.envp.data());
     if (PID == 0) {
         init_log::warn("init[%llu]: failed to spawn testd", static_cast<unsigned long long>(CPUNO));
     } else {

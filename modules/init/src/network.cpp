@@ -10,7 +10,6 @@
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/logging.h>
-#include <sys/process.h>
 #include <sys/socket.h>
 #include <time.h>  // NOLINT(modernize-deprecated-headers): WOS POSIX clock declarations live here.
 #include <unistd.h>
@@ -25,13 +24,15 @@
 #include <ctime>
 
 #include "env.h"
+#include "services.h"
 #include "sys/multiproc.h"
 
 namespace {
 using init_log = wos::journal<"init">;
 
 constexpr const char* NET_IFNAME = "eth0";
-constexpr long POLL_TIMEOUT_SECS = 45;
+constexpr long POLL_FIRST_DIAGNOSTIC_SECS = 45;
+constexpr long POLL_STATUS_INTERVAL_SECS = 60;
 constexpr long POLL_INTERVAL_MS = 50;
 constexpr size_t IF_DEBUG_CAP = 16;
 constexpr size_t ADDR_DEBUG_CAP = 32;
@@ -342,7 +343,7 @@ void dump_netdev_stats() {
 }
 
 void dump_network_failure_debug(const char* reason, uint64_t netd_pid, const PollDebug* poll, int sock) {
-    init_log::critical("network debug: === begin fatal network startup dump ===");
+    init_log::critical("network debug: === begin network startup diagnostic dump ===");
     init_log::critical("network debug: reason=%s netd_pid=%llu poll_socket=%d", reason != nullptr ? reason : "(unknown)",
                        static_cast<unsigned long long>(netd_pid), sock);
     if (poll != nullptr) {
@@ -352,10 +353,10 @@ void dump_network_failure_debug(const char* reason, uint64_t netd_pid, const Pol
         inet_ntop(AF_INET, &last_addr, last_ip.data(), last_ip.size());
         init_log::critical(
             "network debug: poll attempts=%llu addr_successes=%llu zero_addr_results=%llu addr_failures=%llu last_addr=%s raw=0x%x "
-            "timeout_secs=%ld",
+            "first_diagnostic_secs=%ld",
             static_cast<unsigned long long>(poll->attempts), static_cast<unsigned long long>(poll->addr_successes),
             static_cast<unsigned long long>(poll->addr_zero_results), static_cast<unsigned long long>(poll->addr_failures), last_ip.data(),
-            static_cast<unsigned>(ntohl(poll->last_addr)), POLL_TIMEOUT_SECS);
+            static_cast<unsigned>(ntohl(poll->last_addr)), POLL_FIRST_DIAGNOSTIC_SECS);
         init_log::critical("network debug: poll first_errno=%d (%s)", poll->first_errno,
                            poll->first_errno != 0 ? strerror(poll->first_errno) : "none");
         init_log::critical("network debug: poll last_errno=%d (%s)", poll->last_errno,
@@ -365,7 +366,7 @@ void dump_network_failure_debug(const char* reason, uint64_t netd_pid, const Pol
     dump_netctl_state();
     dump_netdev_stats();
     dump_journal_snapshot();
-    init_log::critical("network debug: === end fatal network startup dump ===");
+    init_log::critical("network debug: === end network startup diagnostic dump ===");
 }
 }  // namespace
 
@@ -375,7 +376,7 @@ auto start_network() -> bool {
     init_log::info("init[%llu]: spawning netd (DHCP daemon)", static_cast<unsigned long long>(CPUNO));
     std::array<const char*, 2> netd_argv = {"/sbin/netd", nullptr};
     InitEnv netd_env = make_init_env();
-    uint64_t const NETD_PID = ker::process::exec("/sbin/netd", netd_argv.data(), netd_env.envp.data());
+    uint64_t const NETD_PID = spawn_local_service("/sbin/netd", netd_argv.data(), netd_env.envp.data());
     if (NETD_PID == 0) {
         init_log::error("init[%llu]: failed to spawn netd", static_cast<unsigned long long>(CPUNO));
         dump_network_failure_debug("failed to spawn /sbin/netd", NETD_PID, nullptr, -1);
@@ -405,7 +406,8 @@ auto start_network() -> bool {
     }
 
     PollDebug poll{};
-    bool net_ready = false;
+    bool diagnostic_dumped = false;
+    long next_status_secs = POLL_FIRST_DIAGNOSTIC_SECS + POLL_STATUS_INTERVAL_SECS;
     for (;;) {
         poll.attempts++;
 
@@ -419,7 +421,6 @@ auto start_network() -> bool {
                 std::array<char, INET_ADDRSTRLEN> ip_str{};
                 inet_ntop(AF_INET, &addr->sin_addr, ip_str.data(), ip_str.size());
                 init_log::info("init[%llu]: eth0 configured with IP %s", static_cast<unsigned long long>(CPUNO), ip_str.data());
-                net_ready = true;
                 break;
             }
             poll.addr_zero_results++;
@@ -441,8 +442,16 @@ auto start_network() -> bool {
             close(POLL_SOCK);
             return false;
         }
-        if (now.tv_sec - poll_start.tv_sec >= POLL_TIMEOUT_SECS) {
-            break;
+        long const ELAPSED_SECS = now.tv_sec - poll_start.tv_sec;
+        if (!diagnostic_dumped && ELAPSED_SECS >= POLL_FIRST_DIAGNOSTIC_SECS) {
+            init_log::warn("init[%llu]: eth0 not configured after polling for %ld seconds; continuing to wait",
+                           static_cast<unsigned long long>(CPUNO), POLL_FIRST_DIAGNOSTIC_SECS);
+            dump_network_failure_debug("eth0 has not received a non-zero IPv4 address yet; continuing to wait", NETD_PID, &poll, POLL_SOCK);
+            diagnostic_dumped = true;
+        } else if (diagnostic_dumped && ELAPSED_SECS >= next_status_secs) {
+            init_log::warn("init[%llu]: still waiting for eth0 IPv4 configuration after %ld seconds",
+                           static_cast<unsigned long long>(CPUNO), ELAPSED_SECS);
+            next_status_secs += POLL_STATUS_INTERVAL_SECS;
         }
         struct timespec const POLL_SLEEP{
             .tv_sec = 0,
@@ -450,14 +459,6 @@ auto start_network() -> bool {
         };
         nanosleep(&POLL_SLEEP, nullptr);
     }
-    if (!net_ready) {
-        init_log::error("init[%llu]: eth0 not configured after polling for %ld seconds", static_cast<unsigned long long>(CPUNO),
-                        POLL_TIMEOUT_SECS);
-        dump_network_failure_debug("eth0 did not receive a non-zero IPv4 address before timeout", NETD_PID, &poll, POLL_SOCK);
-        close(POLL_SOCK);
-        return false;
-    }
-
     close(POLL_SOCK);
     return true;
 }
