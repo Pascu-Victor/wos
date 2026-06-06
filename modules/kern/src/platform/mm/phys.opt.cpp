@@ -1318,20 +1318,26 @@ void verify_zero_ref_page_is_not_live_slab(void* page, const char* op_name) {
     }
 }
 
-auto free_zero_ref_page_locked(ZeroRefPage const& zero_ref_page, uint64_t& freed_bytes) -> bool {
+auto zero_ref_page_is_valid_locked(ZeroRefPage const& zero_ref_page) -> bool {
     if (zero_ref_page.page == nullptr || zero_ref_page.alloc == nullptr || zero_ref_page.idx >= zero_ref_page.alloc->total_pages) {
-        freed_bytes = 0;
         return false;
     }
 
     auto* const EXPECTED_PAGE =
         reinterpret_cast<void*>(zero_ref_page.alloc->base + (static_cast<uint64_t>(zero_ref_page.idx) * paging::PAGE_SIZE));
     if (EXPECTED_PAGE != zero_ref_page.page) {
-        freed_bytes = 0;
         return false;
     }
 
     if (zero_ref_page.alloc->page_refcounts[zero_ref_page.idx].load(std::memory_order_acquire) != 0) {
+        return false;
+    }
+
+    return true;
+}
+
+auto free_zero_ref_page_locked(ZeroRefPage const& zero_ref_page, uint64_t& freed_bytes) -> bool {
+    if (!zero_ref_page_is_valid_locked(zero_ref_page)) {
         freed_bytes = 0;
         return false;
     }
@@ -1343,20 +1349,65 @@ auto free_zero_ref_page_locked(ZeroRefPage const& zero_ref_page, uint64_t& freed
     return freed_bytes != 0;
 }
 
+auto count_contiguous_zero_ref_run_locked(std::span<ZeroRefPage const> pages, size_t start) -> size_t {
+    if (start >= pages.size() || !zero_ref_page_is_valid_locked(pages[start])) {
+        return 0;
+    }
+
+    PageAllocator* const ALLOC = pages[start].alloc;
+    uint32_t expected_idx = pages[start].idx;
+    size_t count = 0;
+    while (start + count < pages.size()) {
+        ZeroRefPage const& page = pages[start + count];
+        if (page.alloc != ALLOC || page.idx != expected_idx || !zero_ref_page_is_valid_locked(page)) {
+            break;
+        }
+        expected_idx++;
+        count++;
+    }
+    return count;
+}
+
+void note_zero_ref_pages_freed(uint64_t freed_bytes, PageRefBatchStats& stats) {
+    if (freed_bytes == 0) {
+        return;
+    }
+
+    uint64_t const PAGES_FREED = freed_bytes / paging::PAGE_SIZE;
+    free_count.fetch_add(PAGES_FREED, std::memory_order_relaxed);
+    total_freed_bytes.fetch_add(freed_bytes, std::memory_order_relaxed);
+    stats.pages_freed += PAGES_FREED;
+}
+
 void free_zero_ref_pages(std::span<ZeroRefPage const> pages, PageRefBatchStats& stats) {
     if (pages.empty()) {
         return;
     }
 
     uint64_t const FLAGS = memlock.lock_irq();
-    for (ZeroRefPage const& page : pages) {
-        uint64_t freed_bytes = 0;
-        if (!free_zero_ref_page_locked(page, freed_bytes)) {
+    size_t i = 0;
+    while (i < pages.size()) {
+        size_t const RUN_COUNT = count_contiguous_zero_ref_run_locked(pages, i);
+        if (RUN_COUNT == 0) {
+            i++;
             continue;
         }
-        free_count.fetch_add(1, std::memory_order_relaxed);
-        total_freed_bytes.fetch_add(freed_bytes, std::memory_order_relaxed);
-        stats.pages_freed++;
+
+        ZeroRefPage const& first_page = pages[i];
+        uint64_t const FREED_BYTES = first_page.alloc->free_order0_range_at(first_page.idx, static_cast<uint32_t>(RUN_COUNT));
+        if (FREED_BYTES != 0) {
+            note_zero_ref_pages_freed(FREED_BYTES, stats);
+            i += RUN_COUNT;
+            continue;
+        }
+
+        for (size_t j = 0; j < RUN_COUNT; ++j) {
+            uint64_t freed_bytes = 0;
+            if (free_zero_ref_page_locked(pages[i + j], freed_bytes)) {
+                note_zero_ref_pages_freed(freed_bytes, stats);
+            }
+        }
+        i += RUN_COUNT;
     }
     memlock.unlock_irq(FLAGS);
 }
@@ -1394,6 +1445,15 @@ auto page_ref_dec_batch(std::span<void* const> pages) -> PageRefBatchStats {
     size_t zero_ref_count = 0;
 
     auto flush_zero_ref_pages = [&]() {
+        std::sort(zero_ref_pages.begin(), zero_ref_pages.begin() + static_cast<ptrdiff_t>(zero_ref_count),
+                  [](ZeroRefPage const& lhs, ZeroRefPage const& rhs) {
+                      auto const LHS_ALLOC = reinterpret_cast<uintptr_t>(lhs.alloc);
+                      auto const RHS_ALLOC = reinterpret_cast<uintptr_t>(rhs.alloc);
+                      if (LHS_ALLOC != RHS_ALLOC) {
+                          return LHS_ALLOC < RHS_ALLOC;
+                      }
+                      return lhs.idx < rhs.idx;
+                  });
         free_zero_ref_pages(std::span<ZeroRefPage const>{zero_ref_pages.data(), zero_ref_count}, stats);
         zero_ref_count = 0;
     };

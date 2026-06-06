@@ -28,6 +28,21 @@ auto size_to_order(uint64_t size_bytes) -> int {
     return bits;
 }
 
+auto largest_order_for_aligned_run(uint32_t page_idx, uint32_t page_count) -> int {
+    int order = 0;
+    while (order < PageAllocator::MAX_ORDER) {
+        uint32_t const NEXT_BLOCK_SIZE = 1U << (order + 1);
+        if (NEXT_BLOCK_SIZE > page_count) {
+            break;
+        }
+        if ((page_idx & (NEXT_BLOCK_SIZE - 1)) != 0) {
+            break;
+        }
+        order++;
+    }
+    return order;
+}
+
 // Convert a page index to the HHDM pointer inside the zone.
 auto page_to_ptr(uint64_t base, uint32_t page_idx) -> void* {
     return reinterpret_cast<void*>(base + (static_cast<uint64_t>(page_idx) * paging::PAGE_SIZE));
@@ -420,6 +435,40 @@ uint64_t PageAllocator::free_order0_at(uint32_t page_idx) {
         ker::mod::dbg::panic_handler("page_free called on live kmalloc medium alloc");
     }
     return free_allocated_block(this, page_idx, 0);
+}
+
+uint64_t PageAllocator::free_order0_range_at(uint32_t page_idx, uint32_t page_count) {
+    if (page_count == 0 || page_idx >= total_pages || page_count > total_pages - page_idx) {
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < page_count; ++i) {
+        uint32_t const CUR_IDX = page_idx + i;
+        if (page_flags[CUR_IDX] != FLAG_ALLOC_HEAD) {
+            return 0;
+        }
+        if (page_refcounts[CUR_IDX].load(std::memory_order_acquire) != 0) {
+            return 0;
+        }
+        if (page_has_live_medium_alloc_magic(this, CUR_IDX)) {
+            auto const PAGE_BASE = reinterpret_cast<uint64_t>(page_to_ptr(base, CUR_IDX));
+            dbg::emergency_log("BUG: page_free on live medium alloc page=0x%lx caller_idx=%lu\n", PAGE_BASE,
+                               static_cast<uint64_t>(CUR_IDX));
+            ker::mod::dbg::panic_handler("page_free called on live kmalloc medium alloc");
+        }
+    }
+
+    uint64_t freed_bytes = 0;
+    uint32_t cursor = page_idx;
+    uint32_t remaining = page_count;
+    while (remaining > 0) {
+        int const ORDER = largest_order_for_aligned_run(cursor, remaining);
+        uint32_t const BLOCK_SIZE = 1U << ORDER;
+        freed_bytes += free_allocated_block(this, cursor, ORDER);
+        cursor += BLOCK_SIZE;
+        remaining -= BLOCK_SIZE;
+    }
+    return freed_bytes;
 }
 
 auto PageAllocator::split_allocated_block_to_order0(void* ptr) const -> bool {

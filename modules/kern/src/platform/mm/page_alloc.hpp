@@ -78,6 +78,10 @@ struct PageAllocator {
     // global physical allocator lock. Only frees a live order-0 page.
     uint64_t free_order0_at(uint32_t page_idx);
 
+    // Batch fast path for callers that already hold the global physical
+    // allocator lock. Frees a contiguous run of live zero-ref order-0 pages.
+    uint64_t free_order0_range_at(uint32_t page_idx, uint32_t page_count);
+
     // Re-tag a contiguous allocated block as a run of independently freeable
     // order-0 pages while preserving the existing per-page refcounts.
     // Use this when a multi-page allocation will be mapped/freed as separate

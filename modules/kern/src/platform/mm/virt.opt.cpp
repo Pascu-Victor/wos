@@ -1259,6 +1259,11 @@ struct PageTableFrameSet {
 constexpr size_t DESTROY_REFDEC_BATCH_CAP = 64;
 
 struct DestroyUserSpaceBudgetState {
+    struct RefdecBatch {
+        std::array<void*, DESTROY_REFDEC_BATCH_CAP> pages{};
+        size_t count = 0;
+    };
+
     PageTable* pagemap = nullptr;
     uint64_t owner_pid = 0;
     const char* owner_name = nullptr;
@@ -1266,12 +1271,29 @@ struct DestroyUserSpaceBudgetState {
     DestroyUserSpacePhase phase = DestroyUserSpacePhase::DONE;
     PageTableFrameSet page_table_frames{};
     std::array<DestroyWalkFrame, 4> stack{};
-    std::array<void*, DESTROY_REFDEC_BATCH_CAP> refdec_batch{};
+    RefdecBatch refdec_batch{};
     size_t stack_size = 0;
-    size_t refdec_batch_count = 0;
 };
 
 namespace {
+
+using DestroyRefdecBatch = DestroyUserSpaceBudgetState::RefdecBatch;
+
+void destroy_refdec_batch_flush(DestroyRefdecBatch& batch) {
+    if (batch.count == 0) {
+        return;
+    }
+
+    (void)phys::page_ref_dec_batch(std::span<void* const>{batch.pages.data(), batch.count});
+    batch.count = 0;
+}
+
+void destroy_refdec_batch_queue(DestroyRefdecBatch& batch, void* page) {
+    batch.pages.at(batch.count++) = page;
+    if (batch.count >= batch.pages.size()) {
+        destroy_refdec_batch_flush(batch);
+    }
+}
 
 void destroy_state_reset_walk(DestroyUserSpaceBudgetState& state, DestroyUserSpacePhase next_phase) {
     state.phase = next_phase;
@@ -1312,21 +1334,9 @@ void destroy_state_pop(DestroyUserSpaceBudgetState& state) {
     }
 }
 
-void destroy_state_flush_refdec_batch(DestroyUserSpaceBudgetState& state) {
-    if (state.refdec_batch_count == 0) {
-        return;
-    }
+void destroy_state_flush_refdec_batch(DestroyUserSpaceBudgetState& state) { destroy_refdec_batch_flush(state.refdec_batch); }
 
-    (void)phys::page_ref_dec_batch(std::span<void* const>{state.refdec_batch.data(), state.refdec_batch_count});
-    state.refdec_batch_count = 0;
-}
-
-void destroy_state_queue_refdec(DestroyUserSpaceBudgetState& state, void* page) {
-    state.refdec_batch.at(state.refdec_batch_count++) = page;
-    if (state.refdec_batch_count >= state.refdec_batch.size()) {
-        destroy_state_flush_refdec_batch(state);
-    }
-}
+void destroy_state_queue_refdec(DestroyUserSpaceBudgetState& state, void* page) { destroy_refdec_batch_queue(state.refdec_batch, page); }
 
 void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& frames, DestroyUserSpaceCallStats* stats) {
     if (table == nullptr || level < 1) {
@@ -1768,8 +1778,8 @@ bool debug_log_user_phys_mappings(uint64_t target_phys, const char* trigger, uin
 namespace {
 
 void free_user_data_pages(PageTable* table, int level, PageTable* root, const PageTableFrameSet& page_table_frames,
-                          DestroyUserSpaceCallStats* stats, uint64_t vaddr_base = 0, uint64_t owner_pid = 0,
-                          const char* owner_name = nullptr, const char* reason = nullptr) {
+                          DestroyRefdecBatch& refdec_batch, DestroyUserSpaceCallStats* stats, uint64_t vaddr_base = 0,
+                          uint64_t owner_pid = 0, const char* owner_name = nullptr, const char* reason = nullptr) {
     if (table == nullptr || level < 1) {
         return;
     }
@@ -1831,7 +1841,8 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
                         continue;
                     }
                     auto* next_level = reinterpret_cast<PageTable*>(VIRT_RAW);
-                    free_user_data_pages(next_level, level - 1, root, page_table_frames, stats, ENTRY_VADDR, owner_pid, owner_name, reason);
+                    free_user_data_pages(next_level, level - 1, root, page_table_frames, refdec_batch, stats, ENTRY_VADDR, owner_pid,
+                                         owner_name, reason);
                 }
             }
         } else {
@@ -1855,7 +1866,7 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
                 uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
                 if ((VIRT_RAW >> CANONICAL_SIGN_BIT) == CANONICAL_KERNEL_UPPER) {
                     void* page_virt = reinterpret_cast<void*>(VIRT_RAW);
-                    phys::page_ref_dec(page_virt);
+                    destroy_refdec_batch_queue(refdec_batch, page_virt);
                     if (stats != nullptr) {
                         stats->data_pages_ref_decremented++;
                     }
@@ -2066,7 +2077,9 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owne
     stats.collect_frames_us = elapsed_us_since(phase_start_us, time::get_us());
 
     phase_start_us = time::get_us();
-    free_user_data_pages(pagemap, 4, pagemap, page_table_frames, &stats, 0, owner_pid, owner_name, reason);
+    DestroyRefdecBatch refdec_batch{};
+    free_user_data_pages(pagemap, 4, pagemap, page_table_frames, refdec_batch, &stats, 0, owner_pid, owner_name, reason);
+    destroy_refdec_batch_flush(refdec_batch);
     stats.free_data_us = elapsed_us_since(phase_start_us, time::get_us());
 
     phase_start_us = time::get_us();

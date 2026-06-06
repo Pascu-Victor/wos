@@ -2,10 +2,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
+#include <span>
 #include <test/ktest.hpp>
 
 namespace phys = ker::mod::mm::phys;
+namespace paging = ker::mod::mm::paging;
 
 namespace {
 
@@ -75,6 +78,27 @@ KTEST(MM, RefCountBasic) {
     KEXPECT_EQ(REMAINING, 1U);
     // Final free
     phys::page_free(page);
+}
+
+KTEST(MM, RefCountBatchFinalFreeContiguousRun) {
+    constexpr size_t PAGE_COUNT = 4;
+    auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));
+    KREQUIRE_NE(base, nullptr);
+    KREQUIRE_TRUE(phys::page_split_to_order0(base));
+
+    std::array<void*, PAGE_COUNT> pages{};
+    for (size_t i = 0; i < PAGE_COUNT; ++i) {
+        pages.at(i) = base + (i * paging::PAGE_SIZE);
+        KEXPECT_EQ(phys::page_ref_get(pages.at(i)), 1U);
+    }
+
+    phys::PageRefBatchStats const STATS = phys::page_ref_dec_batch(std::span<void* const>{pages.data(), pages.size()});
+    KEXPECT_EQ(STATS.refs_decremented, static_cast<uint64_t>(PAGE_COUNT));
+    KEXPECT_EQ(STATS.pages_freed, static_cast<uint64_t>(PAGE_COUNT));
+
+    for (void* page : pages) {
+        KEXPECT_EQ(phys::page_ref_get(page), 0U);
+    }
 }
 
 // ---------------------------------------------------------------------------
