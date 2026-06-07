@@ -53,9 +53,14 @@ struct DestroyUserSpaceStats {
     uint64_t tlb_flush_us_max;
     uint64_t data_leaf_entries_visited;
     uint64_t data_pages_ref_decremented;
+    uint64_t data_pages_freed;
     uint64_t page_table_pages_freed;
     uint64_t skipped_huge_pages;
+    uint64_t skipped_unknown_frames;
+    uint64_t skipped_slab_alloc_frames;
     uint64_t skipped_medium_alloc_frames;
+    uint64_t skipped_kmalloc_large_alloc_frames;
+    uint64_t skipped_page_table_aliases;
     uint64_t skipped_corrupt_entries;
 };
 

@@ -70,7 +70,7 @@ auto resolve_mount_path(const char* path, char* out, size_t outsize) -> int {
     }
     std::memcpy(out, path, PATH_LEN + 1);
 
-    if (ker::mod::sched::has_run_queues()) {
+    if (ker::mod::sched::can_query_current_task()) {
         auto* task = ker::mod::sched::get_current_task();
         if (task != nullptr) {
             size_t const ROOT_LEN = std::strlen(task->root.data());

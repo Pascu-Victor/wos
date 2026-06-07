@@ -1244,7 +1244,7 @@ bool is_logical_wki_root_dir(const char* path) {
         return true;
     }
 
-    if (!ker::mod::sched::has_run_queues()) {
+    if (!ker::mod::sched::can_query_current_task()) {
         return false;
     }
 
@@ -1264,7 +1264,7 @@ bool is_logical_wki_root_dir(const char* path) {
 bool logical_wki_root_has_mount_child() {
     std::array<char, MAX_PATH_LEN> resolved{"/wki"};
 
-    if (ker::mod::sched::has_run_queues()) {
+    if (ker::mod::sched::can_query_current_task()) {
         auto* task = ker::mod::sched::get_current_task();
         if (task != nullptr) {
             size_t const ROOT_LEN = std::strlen(task->root.data());
@@ -1366,7 +1366,7 @@ auto strip_current_task_root_prefix(const char* path, char* out, size_t out_size
         return -EINVAL;
     }
 
-    if (!ker::mod::sched::has_run_queues()) {
+    if (!ker::mod::sched::can_query_current_task()) {
         return copy_path_string(path, out, out_size);
     }
 
@@ -1630,7 +1630,7 @@ auto dir_contains_name(ker::vfs::File* file, bool has_fs_readdir, size_t fs_coun
 // Without this, absolute symlink targets (e.g. /usr/sbin) escape the pivoted
 // root and resolve against the global root instead of the task's root.
 auto reapply_root_prefix(char* path, size_t bufsize) -> int {
-    if (!ker::mod::sched::has_run_queues()) {
+    if (!ker::mod::sched::can_query_current_task()) {
         return 0;
     }
     auto* task = ker::mod::sched::get_current_task();

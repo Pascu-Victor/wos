@@ -119,11 +119,14 @@ uint64_t main_heap_size = 0;
 uint64_t huge_page_base = 0;
 uint64_t huge_page_size = 0;
 
-// Allocation tracking counters (now atomic for multi-CPU safety)
+// Allocation tracking counters (now atomic for multi-CPU safety).
+// Byte counters are cumulative, buddy-rounded physical allocator bytes.
+// Operation counters count logical allocation/release events, not pages and
+// not current buddy free-list blocks.
 std::atomic<uint64_t> total_allocated_bytes{0};
 std::atomic<uint64_t> total_freed_bytes{0};
-std::atomic<uint64_t> alloc_count{0};
-std::atomic<uint64_t> free_count{0};
+std::atomic<uint64_t> allocation_operation_count{0};
+std::atomic<uint64_t> free_operation_count{0};
 
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
 // Per-caller page allocation histogram. Indexed by return address so OOM
@@ -164,6 +167,29 @@ auto page_range_from_reserved(uint64_t base, uint64_t length) -> PhysRange {
 auto range_valid(PhysRange range) -> bool { return range.base < range.end; }
 
 auto range_overlaps(PhysRange a, PhysRange b) -> bool { return a.base < b.end && b.base < a.end; }
+
+auto accounted_pages(uint64_t bytes) -> uint64_t { return bytes / paging::PAGE_SIZE; }
+
+auto live_allocated_bytes_from_counters(uint64_t allocated, uint64_t freed) -> uint64_t {
+    return allocated >= freed ? allocated - freed : 0;
+}
+
+auto free_mem_bytes_from_live(uint64_t live_allocated_bytes) -> uint64_t {
+    return main_heap_size >= live_allocated_bytes ? main_heap_size - live_allocated_bytes : 0;
+}
+
+void note_physical_alloc(uint64_t accounted_bytes) {
+    total_allocated_bytes.fetch_add(accounted_bytes, std::memory_order_relaxed);
+    allocation_operation_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void note_physical_free(uint64_t freed_bytes, uint64_t release_operations = 1) {
+    if (freed_bytes == 0 || release_operations == 0) {
+        return;
+    }
+    total_freed_bytes.fetch_add(freed_bytes, std::memory_order_relaxed);
+    free_operation_count.fetch_add(release_operations, std::memory_order_relaxed);
+}
 
 void append_range(std::array<PhysRange, MAX_SANITIZED_RANGES>& ranges, size_t& count, PhysRange range) {
     if (!range_valid(range) || count >= ranges.size()) {
@@ -380,27 +406,41 @@ void copy_live_page_caller_stats_sorted(CallerPageStat* out, size_t max_rows, si
 }  // namespace
 
 void dump_alloc_stats() {
-    dbg::emergency_log("Physical alloc stats: allocated=0x%lx freed=0x%lx delta=0x%lx allocCount=0x%lx freeCount=0x%lx\n",
-                       total_allocated_bytes.load(), total_freed_bytes.load(), total_allocated_bytes.load() - total_freed_bytes.load(),
-                       alloc_count.load(), free_count.load());
+    uint64_t const ALLOCATED = total_allocated_bytes.load(std::memory_order_relaxed);
+    uint64_t const FREED = total_freed_bytes.load(std::memory_order_relaxed);
+    uint64_t const LIVE = live_allocated_bytes_from_counters(ALLOCATED, FREED);
+    dbg::emergency_log(
+        "Physical alloc stats: allocated=0x%lx freed=0x%lx live=0x%lx allocOps=0x%lx freeOps=0x%lx allocPages=0x%lx freePages=0x%lx\n",
+        ALLOCATED, FREED, LIVE, allocation_operation_count.load(std::memory_order_relaxed),
+        free_operation_count.load(std::memory_order_relaxed), accounted_pages(ALLOCATED), accounted_pages(FREED));
 }
 
-auto get_free_mem_bytes() -> uint64_t { return main_heap_size - (total_allocated_bytes.load() - total_freed_bytes.load()); }
+auto get_free_mem_bytes() -> uint64_t {
+    uint64_t const ALLOCATED = total_allocated_bytes.load(std::memory_order_relaxed);
+    uint64_t const FREED = total_freed_bytes.load(std::memory_order_relaxed);
+    return free_mem_bytes_from_live(live_allocated_bytes_from_counters(ALLOCATED, FREED));
+}
 
-auto get_free_mem_pages() -> uint64_t { return free_count.load(std::memory_order_relaxed); }
+auto get_free_mem_pages() -> uint64_t { return accounted_pages(get_free_mem_bytes()); }
 
 auto get_total_mem_bytes() -> uint64_t { return main_heap_size; }
 
 void get_alloc_stats_snapshot(AllocStatsSnapshot& out) {
     uint64_t const ALLOCATED = total_allocated_bytes.load(std::memory_order_relaxed);
     uint64_t const FREED = total_freed_bytes.load(std::memory_order_relaxed);
+    uint64_t const LIVE = live_allocated_bytes_from_counters(ALLOCATED, FREED);
+    uint64_t const FREE_BYTES = free_mem_bytes_from_live(LIVE);
     out = AllocStatsSnapshot{.total_allocated_bytes = ALLOCATED,
                              .total_freed_bytes = FREED,
-                             .live_allocated_bytes = ALLOCATED >= FREED ? ALLOCATED - FREED : 0,
-                             .alloc_count = alloc_count.load(std::memory_order_relaxed),
-                             .free_count = free_count.load(std::memory_order_relaxed),
+                             .live_allocated_bytes = LIVE,
+                             .alloc_count = allocation_operation_count.load(std::memory_order_relaxed),
+                             .free_count = free_operation_count.load(std::memory_order_relaxed),
+                             .total_allocated_pages = accounted_pages(ALLOCATED),
+                             .total_freed_pages = accounted_pages(FREED),
+                             .live_allocated_pages = accounted_pages(LIVE),
+                             .current_free_pages = accounted_pages(FREE_BYTES),
                              .total_mem_bytes = get_total_mem_bytes(),
-                             .free_mem_bytes = get_free_mem_bytes()};
+                             .free_mem_bytes = FREE_BYTES};
 }
 
 auto snapshot_zones(ZoneSnapshot* out, size_t max_rows) -> size_t {
@@ -576,7 +616,7 @@ auto find_free_block(uint64_t size, uint64_t caller = 0) -> void*;
 
 auto buddy_accounting_size(uint64_t size) -> uint64_t {
     if (size == 0) {
-        return 0;
+        return paging::PAGE_SIZE;
     }
 
     uint64_t pages = (size + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
@@ -909,8 +949,7 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
                 void* page = cache.pages.at(--cache.count);
                 cache.lock.unlock();
 
-                total_allocated_bytes.fetch_add(size, std::memory_order_relaxed);
-                alloc_count.fetch_add(1, std::memory_order_relaxed);
+                note_physical_alloc(size);
 
                 // Double-alloc sentinel: if the page still holds a live slab header
                 // it was freed to this cache while still in the slab chain.
@@ -969,8 +1008,7 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
         return nullptr;
     }
 
-    total_allocated_bytes.fetch_add(buddy_accounting_size(size), std::memory_order_relaxed);
-    alloc_count.fetch_add(1, std::memory_order_relaxed);
+    note_physical_alloc(buddy_accounting_size(size));
 
     // Validate the returned address is in a reasonable HHDM range
     auto block_addr = reinterpret_cast<uint64_t>(block);
@@ -1039,8 +1077,7 @@ auto page_alloc_huge(uint64_t size) -> void* {
         return nullptr;
     }
 
-    total_allocated_bytes.fetch_add(buddy_accounting_size(size), std::memory_order_relaxed);
-    alloc_count.fetch_add(1, std::memory_order_relaxed);
+    note_physical_alloc(buddy_accounting_size(size));
 
     // Zero outside the lock - the block is exclusively ours now
     uint64_t saved_cr3 = 0;
@@ -1082,8 +1119,7 @@ void page_free(void* page) {
                 cache.pages.at(cache.count++) = page;
                 cache.lock.unlock();
 
-                free_count.fetch_add(1, std::memory_order_relaxed);
-                total_freed_bytes.fetch_add(paging::PAGE_SIZE, std::memory_order_relaxed);
+                note_physical_free(paging::PAGE_SIZE);
                 return;
             }
             cache.lock.unlock();
@@ -1098,8 +1134,7 @@ void page_free(void* page) {
                 uint64_t const FLAGS = huge_page_zone->allocator->lock_irq();
                 uint64_t const FREED_BYTES = huge_page_zone->allocator->free(page);
                 huge_page_zone->allocator->unlock_irq(FLAGS);
-                free_count.fetch_add(1, std::memory_order_relaxed);
-                total_freed_bytes.fetch_add(FREED_BYTES, std::memory_order_relaxed);
+                note_physical_free(FREED_BYTES);
             }
             return;
         }
@@ -1116,8 +1151,7 @@ void page_free(void* page) {
             uint64_t const FLAGS = zone->allocator->lock_irq();
             uint64_t const FREED_BYTES = zone->allocator->free(page);
             zone->allocator->unlock_irq(FLAGS);
-            free_count.fetch_add(1, std::memory_order_relaxed);
-            total_freed_bytes.fetch_add(FREED_BYTES, std::memory_order_relaxed);
+            note_physical_free(FREED_BYTES);
         }
         break;
     }
@@ -1326,22 +1360,6 @@ struct ZeroRefPage {
     uint32_t idx = 0;
 };
 
-auto page_kind_from_ref_guard_byte(uint8_t value) -> PageKind {
-    switch (static_cast<PageKind>(value)) {
-        case PageKind::FREE:
-        case PageKind::RESERVED:
-        case PageKind::NORMAL:
-        case PageKind::PAGE_TABLE:
-        case PageKind::SLAB:
-        case PageKind::MEDIUM:
-        case PageKind::KMALLOC_LARGE:
-            return static_cast<PageKind>(value);
-        case PageKind::UNKNOWN:
-        default:
-            return PageKind::UNKNOWN;
-    }
-}
-
 auto page_ref_dec_atomic(void* page, uint32_t& new_ref, ZeroRefPage& zero_ref_page, PageAllocator*& allocator_hint) -> bool {
     zero_ref_page = {};
     PageAllocator* alloc = nullptr;
@@ -1372,14 +1390,18 @@ auto page_ref_dec_atomic(void* page, uint32_t& new_ref, ZeroRefPage& zero_ref_pa
     return false;
 }
 
+auto zero_ref_page_kind(ZeroRefPage const& zero_ref_page) -> PageKind {
+    if (zero_ref_page.alloc == nullptr || zero_ref_page.idx >= zero_ref_page.alloc->total_pages) {
+        return PageKind::UNKNOWN;
+    }
+    return decode_page_kind(zero_ref_page.alloc->page_kinds[zero_ref_page.idx].load(std::memory_order_acquire));
+}
+
 void verify_zero_ref_page_is_releasable(ZeroRefPage const& zero_ref_page, const char* op_name) {
     constexpr uint32_t SLAB_MAGIC = 0x8CBEEFC8;
     constexpr uint64_t MEDIUM_ALLOC_MAGIC = 0xCAFEBABE87654321ULL;
     constexpr uint64_t LARGE_ALLOC_MAGIC = 0xDEADBEEF12345678ULL;
-    PageKind const KIND =
-        zero_ref_page.alloc != nullptr && zero_ref_page.idx < zero_ref_page.alloc->total_pages
-            ? page_kind_from_ref_guard_byte(zero_ref_page.alloc->page_kinds[zero_ref_page.idx].load(std::memory_order_acquire))
-            : PageKind::UNKNOWN;
+    PageKind const KIND = zero_ref_page_kind(zero_ref_page);
     if (KIND == PageKind::SLAB) {
         log::critical("DETECT: %s freeing live slab page - UAF trap! virt=%p", op_name, zero_ref_page.page);
         hcf();
@@ -1462,14 +1484,13 @@ auto count_contiguous_zero_ref_run_locked(std::span<ZeroRefPage const> pages, si
     return count;
 }
 
-void note_zero_ref_pages_freed(uint64_t freed_bytes, PageRefBatchStats& stats) {
+void note_zero_ref_pages_freed(uint64_t freed_bytes, uint64_t release_operations, PageRefBatchStats& stats) {
     if (freed_bytes == 0) {
         return;
     }
 
     uint64_t const PAGES_FREED = freed_bytes / paging::PAGE_SIZE;
-    free_count.fetch_add(PAGES_FREED, std::memory_order_relaxed);
-    total_freed_bytes.fetch_add(freed_bytes, std::memory_order_relaxed);
+    note_physical_free(freed_bytes, release_operations);
     stats.pages_freed += PAGES_FREED;
 }
 
@@ -1503,7 +1524,7 @@ void free_zero_ref_pages(std::span<ZeroRefPage const> pages, PageRefBatchStats& 
             ZeroRefPage const& first_page = pages[group_i];
             uint64_t const FREED_BYTES = first_page.alloc->free_order0_range_at(first_page.idx, static_cast<uint32_t>(RUN_COUNT));
             if (FREED_BYTES != 0) {
-                note_zero_ref_pages_freed(FREED_BYTES, stats);
+                note_zero_ref_pages_freed(FREED_BYTES, RUN_COUNT, stats);
                 group_i += RUN_COUNT;
                 continue;
             }
@@ -1511,7 +1532,7 @@ void free_zero_ref_pages(std::span<ZeroRefPage const> pages, PageRefBatchStats& 
             for (size_t j = 0; j < RUN_COUNT; ++j) {
                 uint64_t freed_bytes = 0;
                 if (free_zero_ref_page_locked(pages[group_i + j], freed_bytes)) {
-                    note_zero_ref_pages_freed(freed_bytes, stats);
+                    note_zero_ref_pages_freed(freed_bytes, 1, stats);
                 }
             }
             group_i += RUN_COUNT;

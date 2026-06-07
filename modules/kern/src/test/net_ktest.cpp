@@ -8,7 +8,7 @@
 #include <test/ktest.hpp>
 
 // ---------------------------------------------------------------------------
-// Checksum: all-zero buffer → complement of 0 → 0xFFFF
+// Checksum: all-zero buffer -> complement of 0 -> 0xFFFF
 // ---------------------------------------------------------------------------
 
 KTEST(Net, ChecksumAllZero) {
@@ -19,7 +19,7 @@ KTEST(Net, ChecksumAllZero) {
 
 // ---------------------------------------------------------------------------
 // Checksum round-trip: embed computed checksum, re-verify = 0x0000
-// One's complement identity: sum + ~sum (folded) = 0xFFFF → ~0xFFFF = 0x0000
+// One's complement identity: sum + ~sum (folded) = 0xFFFF -> ~0xFFFF = 0x0000
 // ---------------------------------------------------------------------------
 
 KTEST(Net, ChecksumRoundTrip) {
@@ -33,12 +33,12 @@ KTEST(Net, ChecksumRoundTrip) {
 }
 
 // ---------------------------------------------------------------------------
-// Checksum: two identical 2-byte words → each word contributes identically
+// Checksum: two identical 2-byte words -> each word contributes identically
 // ---------------------------------------------------------------------------
 
 KTEST(Net, ChecksumSymmetric) {
     // buf = {0xAB, 0xCD, 0xAB, 0xCD}
-    // Each LE word = 0xCDAB; sum = 2 * 0xCDAB = 0x19B56; fold → 0x9B57; ~0x9B57 = 0x64A8
+    // Each LE word = 0xCDAB; sum = 2 * 0xCDAB = 0x19B56; fold -> 0x9B57; ~0x9B57 = 0x64A8
     static uint8_t buf[4] = {0xAB, 0xCD, 0xAB, 0xCD};
     uint16_t const CS = ker::net::checksum_compute(static_cast<const void*>(buf), 4);
     // Just verify it matches recomputing manually: the interesting property is
@@ -50,7 +50,7 @@ KTEST(Net, ChecksumSymmetric) {
 
 // ---------------------------------------------------------------------------
 // Checksum: single byte (odd length)
-// buf = {0xFF}: sum = 0xFF, fold → ~0xFF = 0xFF00
+// buf = {0xFF}: sum = 0xFF, fold -> ~0xFF = 0xFF00
 // ---------------------------------------------------------------------------
 
 KTEST(Net, ChecksumOddLength) {
@@ -60,8 +60,8 @@ KTEST(Net, ChecksumOddLength) {
 }
 
 // ---------------------------------------------------------------------------
-// TCP pseudo-header: src=0, dst=0, proto=0, len=0, no data → all zeros
-// sum = 0 → checksum = 0xFFFF
+// TCP pseudo-header: src=0, dst=0, proto=0, len=0, no data -> all zeros
+// sum = 0 -> checksum = 0xFFFF
 // ---------------------------------------------------------------------------
 
 KTEST(Net, PseudoHeaderAllZero) {

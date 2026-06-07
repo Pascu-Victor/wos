@@ -19,11 +19,17 @@ namespace ker::mod::mm::phys {
 constexpr size_t MEMACC_BUDDY_ORDER_COUNT = 21;
 
 struct AllocStatsSnapshot {
+    // Byte/page totals are cumulative and buddy-rounded. Count fields are
+    // operation counts; they are not free-list blocks or pages.
     uint64_t total_allocated_bytes;
     uint64_t total_freed_bytes;
     uint64_t live_allocated_bytes;
     uint64_t alloc_count;
-    uint64_t free_count;
+    uint64_t free_count;  // Compatibility name: successful physical free operations.
+    uint64_t total_allocated_pages;
+    uint64_t total_freed_pages;
+    uint64_t live_allocated_pages;
+    uint64_t current_free_pages;
     uint64_t total_mem_bytes;
     uint64_t free_mem_bytes;
 };

@@ -2269,9 +2269,9 @@ void cmd_cpustat() {
     }
 
     std::println("");
-    std::println("{:>4}  {:>10}  {:>10}  {:>10}  {:>11}  {:>15}  {:>11}", "CPU", "dus_leaf", "dus_refdec", "dus_ptfree", "huge_skip",
-                 "medium_skip", "dus_corrupt");
-    std::println("{:->4}  {:->10}  {:->10}  {:->10}  {:->11}  {:->15}  {:->11}", "", "", "", "", "", "", "");
+    std::println("{:>4}  {:>10}  {:>10}  {:>10}  {:>10}  {:>11}  {:>15}  {:>12}", "CPU", "dus_leaf", "dus_refdec", "dus_freed",
+                 "dus_ptfree", "huge_skip", "medium_skip", "corrupt_skip");
+    std::println("{:->4}  {:->10}  {:->10}  {:->10}  {:->10}  {:->11}  {:->15}  {:->12}", "", "", "", "", "", "", "", "");
 
     pos = 0;
     while (pos < buffer->size()) {
@@ -2290,8 +2290,39 @@ void cmd_cpustat() {
             return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
         };
 
-        std::println("{:>4}  {:>10}  {:>10}  {:>10}  {:>11}  {:>15}  {:>11}", get_val("cpu="), get_val("dus_leaf="), get_val("dus_refdec="),
-                     get_val("dus_ptfree="), get_val("dus_huge_skip="), get_val("dus_medium_skip="), get_val("dus_corrupt="));
+        uint64_t corrupt_skip = get_val("dus_corrupt_skip=");
+        if (corrupt_skip == 0) {
+            corrupt_skip = get_val("dus_corrupt=");
+        }
+
+        std::println("{:>4}  {:>10}  {:>10}  {:>10}  {:>10}  {:>11}  {:>15}  {:>12}", get_val("cpu="), get_val("dus_leaf="),
+                     get_val("dus_refdec="), get_val("dus_freed="), get_val("dus_ptfree="), get_val("dus_huge_skip="),
+                     get_val("dus_medium_skip="), corrupt_skip);
+    }
+
+    std::println("");
+    std::println("{:>4}  {:>12}  {:>10}  {:>10}  {:>10}", "CPU", "unknown_skip", "slab_skip", "large_skip", "alias_skip");
+    std::println("{:->4}  {:->12}  {:->10}  {:->10}  {:->10}", "", "", "", "", "");
+
+    pos = 0;
+    while (pos < buffer->size()) {
+        std::string_view line = next_line(*buffer, pos);
+        if (line.empty()) {
+            continue;
+        }
+
+        auto get_val = [&](std::string_view key) {
+            std::size_t key_pos = line.find(key);
+            if (key_pos == std::string_view::npos) {
+                return uint64_t{0};
+            }
+            key_pos += key.size();
+            std::size_t const END = line.find(' ', key_pos);
+            return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
+        };
+
+        std::println("{:>4}  {:>12}  {:>10}  {:>10}  {:>10}", get_val("cpu="), get_val("dus_unknown_skip="), get_val("dus_slab_skip="),
+                     get_val("dus_kmalloc_large_skip="), get_val("dus_alias_skip="));
     }
 }
 

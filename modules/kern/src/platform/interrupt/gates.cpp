@@ -396,8 +396,8 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
     uint64_t const CPU_ID = apic::get_apic_id();
     sched::task::Task const* current_task = nullptr;
 
-    if (!sched::has_run_queues()) {
-        journal::panic("WARNING: RunQueues not initialized OR runQueue not set - cannot get current task!");
+    if (!sched::can_query_current_task()) {
+        journal::panic("WARNING: current task is not queryable in this context - skipping task dump!");
         goto skip_task_dump;  // NOLINT
     }
 

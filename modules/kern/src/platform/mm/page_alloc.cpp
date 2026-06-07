@@ -65,23 +65,9 @@ auto ptr_in_zone(const PageAllocator* alloc, const void* ptr) -> bool {
     return ADDR >= alloc->base && ADDR < END;
 }
 
-auto page_kind_from_byte(uint8_t value) -> PageKind {
-    switch (static_cast<PageKind>(value)) {
-        case PageKind::FREE:
-        case PageKind::RESERVED:
-        case PageKind::NORMAL:
-        case PageKind::PAGE_TABLE:
-        case PageKind::SLAB:
-        case PageKind::MEDIUM:
-        case PageKind::KMALLOC_LARGE:
-            return static_cast<PageKind>(value);
-        case PageKind::UNKNOWN:
-        default:
-            return PageKind::UNKNOWN;
-    }
+void store_page_kind(std::atomic<uint8_t>& slot, PageKind kind) {
+    slot.store(static_cast<uint8_t>(decode_page_kind(static_cast<uint8_t>(kind))), std::memory_order_release);
 }
-
-void store_page_kind(std::atomic<uint8_t>& slot, PageKind kind) { slot.store(static_cast<uint8_t>(kind), std::memory_order_release); }
 
 auto free_head_is_valid(const PageAllocator* alloc, PageAllocator::FreeBlock* block, int order, uint32_t& page_idx) -> bool {
     if (!ptr_in_zone(alloc, block)) {
@@ -127,7 +113,7 @@ auto list_remove(PageAllocator* alloc, int order, PageAllocator::FreeBlock*& hea
 }
 
 auto page_has_live_tracked_alloc_magic(PageAllocator* alloc, uint32_t page_idx, PageKind tracked_kind, uint64_t magic) -> bool {
-    PageKind const KIND = page_kind_from_byte(alloc->page_kinds[page_idx].load(std::memory_order_acquire));
+    PageKind const KIND = decode_page_kind(alloc->page_kinds[page_idx].load(std::memory_order_acquire));
     if (KIND != tracked_kind && KIND != PageKind::UNKNOWN) {
         return false;
     }
@@ -552,7 +538,7 @@ auto PageAllocator::split_allocated_block_to_order0(void* ptr) const -> bool {
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     uint64_t const CALLER = page_callers[PAGE_IDX];
 #endif
-    PageKind const KIND = page_kind_from_byte(page_kinds[PAGE_IDX].load(std::memory_order_acquire));
+    PageKind const KIND = decode_page_kind(page_kinds[PAGE_IDX].load(std::memory_order_acquire));
     for (uint32_t i = 0; i < BLOCK_SIZE; ++i) {
         page_flags[PAGE_IDX + i] = FLAG_ALLOC_HEAD;
         store_page_kind(page_kinds[PAGE_IDX + i], KIND);
@@ -608,7 +594,7 @@ auto PageAllocator::kind_of(void* ptr) const -> PageKind {
         return PageKind::UNKNOWN;
     }
 
-    return page_kind_from_byte(page_kinds[PAGE_IDX].load(std::memory_order_acquire));
+    return decode_page_kind(page_kinds[PAGE_IDX].load(std::memory_order_acquire));
 }
 
 }  // namespace ker::mod::mm

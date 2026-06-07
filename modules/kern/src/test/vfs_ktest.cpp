@@ -321,7 +321,7 @@ KTEST(VFS, TmpfsAppendUsesCurrentEnd) {
 
 KTEST(VFS, WriteReadAligned4K) {
     // Write exactly 4 KB then read it back from the same file.
-    // Exercises the aligned write→read path (same as mmap_file in testd):
+    // Exercises the aligned write->read path (same as mmap_file in testd):
     // the filesystem must bridge the write's dirty buffer and the read's
     // block-cache lookup without going to disk.
     constexpr size_t SIZE = 4096;

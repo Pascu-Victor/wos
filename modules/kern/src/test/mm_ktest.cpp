@@ -1,22 +1,136 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iterator>
+#include <platform/asm/cpu.hpp>
+#include <platform/mm/addr.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/virt.hpp>
+#include <platform/smt/smt.hpp>
 #include <span>
 #include <test/ktest.hpp>
 
+namespace addr = ker::mod::mm::addr;
+namespace cpu = ker::mod::cpu;
 namespace phys = ker::mod::mm::phys;
 namespace paging = ker::mod::mm::paging;
+namespace smt = ker::mod::smt;
+namespace virt = ker::mod::mm::virt;
 namespace mm = ker::mod::mm;
 
 namespace {
 
 constexpr uintptr_t PAGE_ALIGNMENT_MASK = 0xFFFULL;
+constexpr uint64_t NON_RAM_TEST_PHYS = (1ULL << 52) - paging::PAGE_SIZE;
 
 auto is_page_aligned(const void* ptr) -> bool { return (reinterpret_cast<uintptr_t>(ptr) & PAGE_ALIGNMENT_MASK) == 0; }
+
+struct TestUserTree {
+    paging::PageTable* root = nullptr;
+    paging::PageTable* pml3 = nullptr;
+    paging::PageTable* pml2 = nullptr;
+    paging::PageTable* pml1 = nullptr;
+};
+
+auto phys_addr_of(const void* page) -> uint64_t {
+    return reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<addr::vaddr_t>(page)));
+}
+
+auto entry_for_page(const void* page, uint64_t flags = paging::page_types::USER) -> paging::PageTableEntry {
+    return paging::create_page_table_entry(phys_addr_of(page), flags);
+}
+
+auto entry_for_phys(uint64_t phys_addr, uint64_t flags = paging::page_types::USER) -> paging::PageTableEntry {
+    return paging::create_page_table_entry(phys_addr, flags);
+}
+
+auto alloc_test_page_table() -> paging::PageTable* {
+    auto* table = static_cast<paging::PageTable*>(phys::page_alloc());
+    if (table == nullptr) {
+        return nullptr;
+    }
+    if (!phys::page_mark_kind(table, mm::PageKind::PAGE_TABLE)) {
+        phys::page_free(table);
+        return nullptr;
+    }
+    std::memset(table, 0, paging::PAGE_SIZE);
+    return table;
+}
+
+template <typename T>
+void free_live_page(T*& page) {
+    if (page != nullptr && phys::page_ref_get(page) != 0U) {
+        phys::page_free(page);
+    }
+    page = nullptr;
+}
+
+void cleanup_test_user_tree(TestUserTree& tree) {
+    free_live_page(tree.pml1);
+    free_live_page(tree.pml2);
+    free_live_page(tree.pml3);
+    free_live_page(tree.root);
+}
+
+auto init_test_user_tree(TestUserTree& tree) -> bool {
+    tree.root = alloc_test_page_table();
+    tree.pml3 = alloc_test_page_table();
+    tree.pml2 = alloc_test_page_table();
+    tree.pml1 = alloc_test_page_table();
+    if (tree.root == nullptr || tree.pml3 == nullptr || tree.pml2 == nullptr || tree.pml1 == nullptr) {
+        cleanup_test_user_tree(tree);
+        return false;
+    }
+
+    tree.root->entries.at(0) = entry_for_page(tree.pml3);
+    tree.pml3->entries.at(0) = entry_for_page(tree.pml2);
+    tree.pml2->entries.at(0) = entry_for_page(tree.pml1);
+    return true;
+}
+
+auto destroy_stats_cpu() -> uint64_t {
+    if (smt::has_cpu_data()) {
+        return cpu::current_cpu();
+    }
+    return 0;
+}
+
+auto destroy_stats_delta(const virt::DestroyUserSpaceStats& before, const virt::DestroyUserSpaceStats& after)
+    -> virt::DestroyUserSpaceStats {
+    return {
+        .calls = after.calls - before.calls,
+        .collect_frames_us_total = after.collect_frames_us_total - before.collect_frames_us_total,
+        .collect_frames_us_max = after.collect_frames_us_max - before.collect_frames_us_max,
+        .free_data_us_total = after.free_data_us_total - before.free_data_us_total,
+        .free_data_us_max = after.free_data_us_max - before.free_data_us_max,
+        .free_pt_us_total = after.free_pt_us_total - before.free_pt_us_total,
+        .free_pt_us_max = after.free_pt_us_max - before.free_pt_us_max,
+        .tlb_flush_us_total = after.tlb_flush_us_total - before.tlb_flush_us_total,
+        .tlb_flush_us_max = after.tlb_flush_us_max - before.tlb_flush_us_max,
+        .data_leaf_entries_visited = after.data_leaf_entries_visited - before.data_leaf_entries_visited,
+        .data_pages_ref_decremented = after.data_pages_ref_decremented - before.data_pages_ref_decremented,
+        .data_pages_freed = after.data_pages_freed - before.data_pages_freed,
+        .page_table_pages_freed = after.page_table_pages_freed - before.page_table_pages_freed,
+        .skipped_huge_pages = after.skipped_huge_pages - before.skipped_huge_pages,
+        .skipped_unknown_frames = after.skipped_unknown_frames - before.skipped_unknown_frames,
+        .skipped_slab_alloc_frames = after.skipped_slab_alloc_frames - before.skipped_slab_alloc_frames,
+        .skipped_medium_alloc_frames = after.skipped_medium_alloc_frames - before.skipped_medium_alloc_frames,
+        .skipped_kmalloc_large_alloc_frames = after.skipped_kmalloc_large_alloc_frames - before.skipped_kmalloc_large_alloc_frames,
+        .skipped_page_table_aliases = after.skipped_page_table_aliases - before.skipped_page_table_aliases,
+        .skipped_corrupt_entries = after.skipped_corrupt_entries - before.skipped_corrupt_entries,
+    };
+}
+
+auto destroy_user_space_and_get_delta(paging::PageTable* root) -> virt::DestroyUserSpaceStats {
+    uint64_t const CPU_NO = destroy_stats_cpu();
+    virt::DestroyUserSpaceStats const BEFORE = virt::get_destroy_user_space_stats(CPU_NO);
+    virt::destroy_user_space(root, 0, "mm_ktest", "negative-contract");
+    virt::DestroyUserSpaceStats const AFTER = virt::get_destroy_user_space_stats(CPU_NO);
+    return destroy_stats_delta(BEFORE, AFTER);
+}
 
 }  // namespace
 
@@ -165,6 +279,146 @@ KTEST(MM, PageKindTracksSplitBatchFree) {
         KEXPECT_EQ(phys::page_kind_get(page), mm::PageKind::FREE);
         KEXPECT_EQ(phys::page_ref_get(page), 0U);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Negative reclaim contracts: protected or ambiguous frames must not be
+// reclaimed as ordinary user data.
+// ---------------------------------------------------------------------------
+
+KTEST(MM, DestroyUserSpaceSkipsProtectedLeafFrames) {
+    TestUserTree tree{};
+    KREQUIRE_TRUE(init_test_user_tree(tree));
+
+    void* medium_page = phys::page_alloc();
+    void* large_page = phys::page_alloc();
+    void* unknown_page = phys::page_alloc();
+    if (!KEXPECT_NE(medium_page, nullptr) || !KEXPECT_NE(large_page, nullptr) || !KEXPECT_NE(unknown_page, nullptr)) {
+        free_live_page(medium_page);
+        free_live_page(large_page);
+        free_live_page(unknown_page);
+        cleanup_test_user_tree(tree);
+        return;
+    }
+
+    if (!KEXPECT_TRUE(phys::page_mark_kind(medium_page, mm::PageKind::MEDIUM)) ||
+        !KEXPECT_TRUE(phys::page_mark_kind(large_page, mm::PageKind::KMALLOC_LARGE)) ||
+        !KEXPECT_TRUE(phys::page_mark_kind(unknown_page, mm::PageKind::UNKNOWN))) {
+        free_live_page(medium_page);
+        free_live_page(large_page);
+        free_live_page(unknown_page);
+        cleanup_test_user_tree(tree);
+        return;
+    }
+
+    tree.pml1->entries.at(0) = entry_for_page(medium_page);
+    tree.pml1->entries.at(1) = entry_for_page(large_page);
+    tree.pml1->entries.at(2) = entry_for_page(unknown_page);
+
+    virt::DestroyUserSpaceStats const DELTA = destroy_user_space_and_get_delta(tree.root);
+
+    KEXPECT_EQ(DELTA.calls, 1U);
+    KEXPECT_EQ(DELTA.data_leaf_entries_visited, 3U);
+    KEXPECT_EQ(DELTA.data_pages_ref_decremented, 0U);
+    KEXPECT_EQ(DELTA.data_pages_freed, 0U);
+    KEXPECT_EQ(DELTA.page_table_pages_freed, 3U);
+    KEXPECT_EQ(DELTA.skipped_unknown_frames, 1U);
+    KEXPECT_EQ(DELTA.skipped_slab_alloc_frames, 0U);
+    KEXPECT_EQ(DELTA.skipped_medium_alloc_frames, 1U);
+    KEXPECT_EQ(DELTA.skipped_kmalloc_large_alloc_frames, 1U);
+    KEXPECT_EQ(DELTA.skipped_page_table_aliases, 0U);
+    KEXPECT_EQ(DELTA.skipped_corrupt_entries, 0U);
+
+    KEXPECT_EQ(phys::page_ref_get(medium_page), 1U);
+    KEXPECT_EQ(phys::page_ref_get(large_page), 1U);
+    KEXPECT_EQ(phys::page_ref_get(unknown_page), 1U);
+    KEXPECT_EQ(phys::page_ref_get(tree.pml1), 0U);
+    KEXPECT_EQ(phys::page_ref_get(tree.pml2), 0U);
+    KEXPECT_EQ(phys::page_ref_get(tree.pml3), 0U);
+    KEXPECT_EQ(phys::page_ref_get(tree.root), 1U);
+    KEXPECT_EQ(tree.root->entries.at(0).present, 0U);
+
+    cleanup_test_user_tree(tree);
+    free_live_page(medium_page);
+    free_live_page(large_page);
+    free_live_page(unknown_page);
+}
+
+KTEST(MM, DestroyUserSpaceSkipsSlabUnknownAndCorruptNextLevelFrames) {
+    auto* root = alloc_test_page_table();
+    KREQUIRE_NE(root, nullptr);
+
+    void* slab_page = phys::page_alloc();
+    void* normal_page = phys::page_alloc();
+    if (!KEXPECT_NE(slab_page, nullptr) || !KEXPECT_NE(normal_page, nullptr)) {
+        free_live_page(slab_page);
+        free_live_page(normal_page);
+        free_live_page(root);
+        return;
+    }
+
+    if (!KEXPECT_TRUE(phys::page_mark_kind(slab_page, mm::PageKind::SLAB))) {
+        free_live_page(slab_page);
+        free_live_page(normal_page);
+        free_live_page(root);
+        return;
+    }
+    root->entries.at(0) = entry_for_page(slab_page);
+    root->entries.at(1) = entry_for_page(normal_page);
+    root->entries.at(2) = entry_for_phys(NON_RAM_TEST_PHYS);
+
+    virt::DestroyUserSpaceStats const DELTA = destroy_user_space_and_get_delta(root);
+
+    KEXPECT_EQ(DELTA.calls, 1U);
+    KEXPECT_EQ(DELTA.data_leaf_entries_visited, 0U);
+    KEXPECT_EQ(DELTA.data_pages_ref_decremented, 0U);
+    KEXPECT_EQ(DELTA.data_pages_freed, 0U);
+    KEXPECT_EQ(DELTA.page_table_pages_freed, 0U);
+    KEXPECT_EQ(DELTA.skipped_unknown_frames, 2U);
+    KEXPECT_EQ(DELTA.skipped_slab_alloc_frames, 2U);
+    KEXPECT_EQ(DELTA.skipped_medium_alloc_frames, 0U);
+    KEXPECT_EQ(DELTA.skipped_kmalloc_large_alloc_frames, 0U);
+    KEXPECT_EQ(DELTA.skipped_page_table_aliases, 0U);
+    KEXPECT_EQ(DELTA.skipped_corrupt_entries, 2U);
+
+    KEXPECT_EQ(phys::page_ref_get(slab_page), 1U);
+    KEXPECT_EQ(phys::page_ref_get(normal_page), 1U);
+    KEXPECT_EQ(root->entries.at(0).present, 0U);
+    KEXPECT_EQ(root->entries.at(1).present, 0U);
+    KEXPECT_EQ(root->entries.at(2).present, 0U);
+
+    free_live_page(root);
+    free_live_page(slab_page);
+    free_live_page(normal_page);
+}
+
+KTEST(MM, DestroyUserSpaceKeepsPageTableAliasOutOfDataRefdec) {
+    TestUserTree tree{};
+    KREQUIRE_TRUE(init_test_user_tree(tree));
+
+    tree.pml1->entries.at(7) = entry_for_page(tree.pml1);
+
+    virt::DestroyUserSpaceStats const DELTA = destroy_user_space_and_get_delta(tree.root);
+
+    KEXPECT_EQ(DELTA.calls, 1U);
+    KEXPECT_EQ(DELTA.data_leaf_entries_visited, 1U);
+    KEXPECT_EQ(DELTA.data_pages_ref_decremented, 0U);
+    KEXPECT_EQ(DELTA.data_pages_freed, 0U);
+    KEXPECT_EQ(DELTA.page_table_pages_freed, 3U);
+    KEXPECT_EQ(DELTA.skipped_unknown_frames, 0U);
+    KEXPECT_EQ(DELTA.skipped_slab_alloc_frames, 0U);
+    KEXPECT_EQ(DELTA.skipped_medium_alloc_frames, 0U);
+    KEXPECT_EQ(DELTA.skipped_kmalloc_large_alloc_frames, 0U);
+    KEXPECT_EQ(DELTA.skipped_page_table_aliases, 1U);
+    KEXPECT_EQ(DELTA.skipped_corrupt_entries, 0U);
+
+    KEXPECT_EQ(phys::page_ref_get(tree.pml1), 0U);
+    KEXPECT_EQ(phys::page_ref_get(tree.pml2), 0U);
+    KEXPECT_EQ(phys::page_ref_get(tree.pml3), 0U);
+    KEXPECT_EQ(phys::page_ref_get(tree.root), 1U);
+    KEXPECT_EQ(tree.root->entries.at(0).present, 0U);
+
+    cleanup_test_user_tree(tree);
 }
 
 KTEST(MM, RefCountBatchMixedFinalAndNonFinal) {

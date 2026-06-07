@@ -17,6 +17,38 @@ enum class PageKind : uint8_t {
     KMALLOC_LARGE = 7,
 };
 
+[[nodiscard]] constexpr auto decode_page_kind(uint8_t value) -> PageKind {
+    switch (static_cast<PageKind>(value)) {
+        case PageKind::UNKNOWN:
+        case PageKind::FREE:
+        case PageKind::RESERVED:
+        case PageKind::NORMAL:
+        case PageKind::PAGE_TABLE:
+        case PageKind::SLAB:
+        case PageKind::MEDIUM:
+        case PageKind::KMALLOC_LARGE:
+            return static_cast<PageKind>(value);
+        default:
+            return PageKind::UNKNOWN;
+    }
+}
+
+[[nodiscard]] constexpr auto page_kind_has_known_live_payload(PageKind kind) -> bool {
+    switch (kind) {
+        case PageKind::NORMAL:
+        case PageKind::PAGE_TABLE:
+        case PageKind::SLAB:
+        case PageKind::MEDIUM:
+        case PageKind::KMALLOC_LARGE:
+            return true;
+        case PageKind::UNKNOWN:
+        case PageKind::FREE:
+        case PageKind::RESERVED:
+        default:
+            return false;
+    }
+}
+
 // Linux-style free-list buddy page allocator.
 // Manages a contiguous physical memory zone. Metadata is embedded at the
 // beginning of the zone (this struct + side tables), consuming a small fixed
