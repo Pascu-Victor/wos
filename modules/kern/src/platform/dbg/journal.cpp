@@ -25,6 +25,7 @@
 #include "platform/dbg/dbg.hpp"
 #include "platform/ktime/ktime.hpp"
 #include "platform/sched/task.hpp"
+#include "release.hpp"
 
 namespace ker::mod::dbg::journal {
 namespace {
@@ -394,7 +395,18 @@ void init() {
         s_boot_id = 1;
     }
     // separate journal logs from the uefi/bootloader logs
-    mod::io::serial::write("\n\n\n\n\n");
+    mod::io::serial::write("\n");
+    mod::io::serial::write(ker::release::WOS_LOGO);
+    mod::io::serial::write(ker::release::NAME);
+    mod::io::serial::write(" version=");
+    mod::io::serial::write(ker::release::VERSION);
+    mod::io::serial::write(" boot_id=");
+    mod::io::serial::write_hex(s_boot_id);
+    mod::io::serial::write("\ncompiler=");
+    mod::io::serial::write(ker::release::COMPILER);
+    mod::io::serial::write("\nbuilder=");
+    mod::io::serial::write(ker::release::BUILDER);
+    mod::io::serial::write("\n");
 }
 
 void enable_time() { s_time_available.store(true, std::memory_order_release); }
