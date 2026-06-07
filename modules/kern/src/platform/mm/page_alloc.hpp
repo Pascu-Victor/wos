@@ -71,10 +71,12 @@ struct PageAllocator {
     //   bits 7-6  meaning
     //   -------  -------
     //     00     interior of a free block (non-head page)
+    //     00+0x20 cached order-0 free page (not linked in buddy lists)
     //     01     free block head   (bits 4-0 = order)
     //     10     allocated head    (bits 4-0 = order)
     //     11     allocated continuation / reserved
     static constexpr uint8_t FLAG_FREE_INTERIOR = 0x00;
+    static constexpr uint8_t FLAG_CACHED_ORDER0 = 0x20;
     static constexpr uint8_t FLAG_FREE_HEAD = 0x40;   // | order
     static constexpr uint8_t FLAG_ALLOC_HEAD = 0x80;  // | order
     static constexpr uint8_t FLAG_ALLOC_CONT = 0xC0;
@@ -88,10 +90,11 @@ struct PageAllocator {
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     uint64_t* page_callers = nullptr;  // allocation return address for each live page
 #endif
-    uint64_t base = 0;            // HHDM start of the managed region
-    uint32_t total_pages = 0;     // total pages in the region (incl. metadata)
-    uint32_t usable_pages = 0;    // pages available for allocation
-    uint32_t free_count = 0;      // current free page count
+    uint64_t base = 0;          // HHDM start of the managed region
+    uint32_t total_pages = 0;   // total pages in the region (incl. metadata)
+    uint32_t usable_pages = 0;  // pages available for allocation
+    uint32_t free_count = 0;    // current free page count
+    uint32_t cached_order0_count = 0;
     uint32_t metadata_pages = 0;  // pages consumed by metadata
 
     // Initialise this allocator over the zone starting at `zoneBase`
@@ -111,6 +114,14 @@ struct PageAllocator {
     // list head. The caller must hold this allocator's lock. Returns nullptr
     // when no proven order-0 page is immediately available.
     void* alloc_order0(uint64_t caller = 0);
+
+    // Per-CPU order-0 cache transitions. Callers must hold this allocator's
+    // lock. Cached pages are free capacity, but are deliberately not linked
+    // into buddy lists, so coalescing cannot consume a CPU-local cache entry.
+    auto claim_free_order0_for_cache(uint32_t& out_page_idx) -> void*;
+    auto cache_allocated_order0(void* ptr, uint32_t& out_page_idx) -> bool;
+    auto alloc_cached_order0_at(uint32_t page_idx, uint64_t caller = 0) -> void*;
+    auto release_cached_order0_at(uint32_t page_idx) -> uint64_t;
 
     // Free a previous allocation.  The allocation order is recovered from the
     // per-page flags - callers do not need to supply the size. Returns the

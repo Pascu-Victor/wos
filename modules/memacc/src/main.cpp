@@ -527,11 +527,13 @@ void print_dump(const Options& opt) {
         if (row.record != "zone") {
             continue;
         }
-        std::printf(
-            "zone=%llu name=%s free=%llu/%llu pages metadata=%llu mismatch=%llu\n", static_cast<unsigned long long>(get_u64(row, "id")),
-            get_string(row, "name").c_str(), static_cast<unsigned long long>(get_u64(row, "free_pages")),
-            static_cast<unsigned long long>(get_u64(row, "usable_pages")), static_cast<unsigned long long>(get_u64(row, "metadata_pages")),
-            static_cast<unsigned long long>(get_u64(row, "free_count_mismatch")));
+        std::printf("zone=%llu name=%s free=%llu/%llu pages cached0=%llu metadata=%llu mismatch=%llu\n",
+                    static_cast<unsigned long long>(get_u64(row, "id")), get_string(row, "name").c_str(),
+                    static_cast<unsigned long long>(get_u64(row, "free_pages")),
+                    static_cast<unsigned long long>(get_u64(row, "usable_pages")),
+                    static_cast<unsigned long long>(get_u64(row, "cached_order0_pages")),
+                    static_cast<unsigned long long>(get_u64(row, "metadata_pages")),
+                    static_cast<unsigned long long>(get_u64(row, "free_count_mismatch")));
     }
 
     if (!opt.full) {

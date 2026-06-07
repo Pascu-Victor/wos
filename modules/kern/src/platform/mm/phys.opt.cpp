@@ -40,9 +40,16 @@ namespace {
 using log = ker::mod::dbg::logger<"phys">;
 
 // Per-CPU page cache for reducing lock contention
+struct CachedOrder0Page {
+    PageAllocator* allocator = nullptr;
+    uint32_t page_idx = 0;
+};
+
 struct PerCpuPageCache {
     static constexpr size_t CACHE_SIZE = 16;  // Pages per CPU cache
-    std::array<void*, CACHE_SIZE> pages{};
+    static constexpr size_t REFILL_BATCH = 8;
+    static constexpr size_t DRAIN_BATCH = 8;
+    std::array<CachedOrder0Page, CACHE_SIZE> pages{};
     size_t count{};
     sys::Spinlock lock;  // Fine-grained per-CPU lock
 };
@@ -55,12 +62,10 @@ PerCpuPageCache* per_cpu_caches = nullptr;
 size_t num_cpus = 0;
 std::atomic<bool> per_cpu_ready{false};  // Set after per-CPU structures are initialized
 
-// The cache stores only bare 4 KiB pages, but page_free() does not receive the
-// allocation size. Caching the base of a multi-page allocation leaves the buddy
-// metadata tagged with the original larger order and can later free/reuse pages
-// that are still mapped elsewhere. Keep the cache disabled until frees carry
-// enough size/order information to prove an allocation is order-0.
-constexpr bool USE_PER_CPU_PAGE_CACHE = false;
+// The cache is enabled only for pages whose owning allocator proves they are
+// independent order-0 pages. Cached pages have a distinct allocator flag and are
+// not linked in buddy lists, so coalescing cannot consume a CPU-local entry.
+constexpr bool USE_PER_CPU_PAGE_CACHE = true;
 
 struct TrackedSpinlock {
     std::atomic<bool> locked{false};
@@ -185,6 +190,28 @@ std::atomic<uint64_t> page_ref_batch_pages{0};                 // NOLINT(cppcore
 std::atomic<uint64_t> page_ref_batch_zero_candidates{0};       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint64_t> page_ref_batch_free_runs{0};             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint64_t> page_ref_batch_pages_freed{0};           // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> page_cache_alloc_hits{0};                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> page_cache_alloc_misses{0};              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> page_cache_refill_calls{0};              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> page_cache_refill_pages{0};              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> page_cache_free_hits{0};                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> page_cache_free_misses{0};               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> page_cache_drain_calls{0};               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> page_cache_drain_pages{0};               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> page_cache_stale_entries{0};             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+auto total_cached_order0_pages_snapshot() -> uint64_t {
+    uint64_t total = 0;
+    for (paging::PageZone const* zone = zones; zone != nullptr; zone = zone->next) {
+        if (zone->allocator == nullptr) {
+            continue;
+        }
+        uint64_t const FLAGS = zone->allocator->lock_irq();
+        total += zone->allocator->cached_order0_count;
+        zone->allocator->unlock_irq(FLAGS);
+    }
+    return total;
+}
 
 auto live_allocated_bytes_from_counters(uint64_t allocated, uint64_t freed) -> uint64_t {
     return allocated >= freed ? allocated - freed : 0;
@@ -483,6 +510,7 @@ auto snapshot_zones(ZoneSnapshot* out, size_t max_rows) -> size_t {
             snap.usable_pages = alloc->usable_pages;
             snap.free_pages = alloc->free_count;
             snap.metadata_pages = alloc->metadata_pages;
+            snap.cached_order0_pages = alloc->cached_order0_count;
 
             const auto* expected_flags = reinterpret_cast<const uint8_t*>(alloc->base + sizeof(PageAllocator));
             snap.invalid_allocator = alloc->base == 0 || (alloc->base & (paging::PAGE_SIZE - 1)) != 0 ||
@@ -502,6 +530,7 @@ auto snapshot_zones(ZoneSnapshot* out, size_t max_rows) -> size_t {
                     snap.buddy_order_counts.at(ORD) += 1;
                     snap.scanned_free_pages += (1U << ORD);
                 }
+                snap.scanned_free_pages += alloc->cached_order0_count;
                 snap.free_count_mismatch = snap.scanned_free_pages != alloc->free_count;
             }
             alloc->unlock_irq(FLAGS);
@@ -996,50 +1025,184 @@ void prepare_allocated_block(void* block, uint64_t size, ReturnedPageZeroing zer
     }
 }
 
+void drain_per_cpu_cache_locked(PerCpuPageCache& cache, size_t max_pages) {
+    size_t drained = 0;
+    while (cache.count > 0 && drained < max_pages) {
+        CachedOrder0Page const ENTRY = cache.pages.at(--cache.count);
+        cache.pages.at(cache.count) = {};
+        if (ENTRY.allocator == nullptr) {
+            page_cache_stale_entries.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+
+        uint64_t const FLAGS = ENTRY.allocator->lock_irq();
+        uint64_t const RELEASED_BYTES = ENTRY.allocator->release_cached_order0_at(ENTRY.page_idx);
+        ENTRY.allocator->unlock_irq(FLAGS);
+        if (RELEASED_BYTES == paging::PAGE_SIZE) {
+            drained++;
+            continue;
+        }
+        page_cache_stale_entries.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (drained != 0) {
+        page_cache_drain_calls.fetch_add(1, std::memory_order_relaxed);
+        page_cache_drain_pages.fetch_add(drained, std::memory_order_relaxed);
+    }
+}
+
+void refill_per_cpu_cache_locked(PerCpuPageCache& cache) {
+    if (cache.count >= cache.pages.size()) {
+        return;
+    }
+
+    size_t const TARGET = std::min(cache.pages.size(), cache.count + PerCpuPageCache::REFILL_BATCH);
+    size_t refilled = 0;
+    page_cache_refill_calls.fetch_add(1, std::memory_order_relaxed);
+    for (paging::PageZone* zone = zones; zone != nullptr && cache.count < TARGET; zone = zone->next) {
+        if (zone->allocator == nullptr) {
+            continue;
+        }
+
+        uint64_t const FLAGS = zone->allocator->lock_irq();
+        while (cache.count < TARGET) {
+            uint32_t page_idx = 0;
+            void* const PAGE = zone->allocator->claim_free_order0_for_cache(page_idx);
+            if (PAGE == nullptr) {
+                break;
+            }
+            cache.pages.at(cache.count++) = CachedOrder0Page{
+                .allocator = zone->allocator,
+                .page_idx = page_idx,
+            };
+            refilled++;
+        }
+        zone->allocator->unlock_irq(FLAGS);
+    }
+
+    if (refilled != 0) {
+        page_cache_refill_pages.fetch_add(refilled, std::memory_order_relaxed);
+    }
+}
+
+auto try_alloc_from_per_cpu_cache(uint64_t caller_tag, ReturnedPageZeroing zeroing, void* caller_addr) -> void* {
+    if (!USE_PER_CPU_PAGE_CACHE || per_cpu_caches == nullptr || !per_cpu_ready.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+
+    uint64_t const CPU_ID = cpu::get_current_cpu_id_safe();
+    if (CPU_ID >= num_cpus) {
+        return nullptr;
+    }
+
+    PerCpuPageCache& cache = per_cpu_caches[CPU_ID];
+    uint64_t const CACHE_FLAGS = cache.lock.lock_irqsave();
+    if (cache.count == 0) {
+        refill_per_cpu_cache_locked(cache);
+    }
+
+    void* page = nullptr;
+    if (cache.count > 0) {
+        CachedOrder0Page const ENTRY = cache.pages.at(--cache.count);
+        cache.pages.at(cache.count) = {};
+        if (ENTRY.allocator != nullptr) {
+            uint64_t const FLAGS = ENTRY.allocator->lock_irq();
+            page = ENTRY.allocator->alloc_cached_order0_at(ENTRY.page_idx, caller_tag);
+            ENTRY.allocator->unlock_irq(FLAGS);
+        }
+        if (page == nullptr) {
+            page_cache_stale_entries.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    cache.lock.unlock_irqrestore(CACHE_FLAGS);
+
+    if (page == nullptr) {
+        page_cache_alloc_misses.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+
+    page_cache_alloc_hits.fetch_add(1, std::memory_order_relaxed);
+    note_physical_alloc(paging::PAGE_SIZE);
+
+    constexpr uint32_t SLAB_MAGIC_CACHE = 0x8CBEEFC8;
+    if (*reinterpret_cast<const volatile uint32_t*>(page) == SLAB_MAGIC_CACHE) {
+        log::critical("DETECT: pageAlloc (cache) returning live slab page - double-alloc trap! virt=%p", page);
+        hcf();
+    }
+
+    prepare_allocated_block(page, paging::PAGE_SIZE, zeroing);
+
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    record_page_alloc_caller(caller_addr, 1);
+#else
+    (void)caller_addr;
+#endif
+    return page;
+}
+
+auto try_cache_freed_order0_page(PageAllocator* allocator, void* page) -> bool {
+    if (!USE_PER_CPU_PAGE_CACHE || allocator == nullptr || page == nullptr || per_cpu_caches == nullptr ||
+        !per_cpu_ready.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    uint64_t const CPU_ID = cpu::get_current_cpu_id_safe();
+    if (CPU_ID >= num_cpus) {
+        return false;
+    }
+
+    PerCpuPageCache& cache = per_cpu_caches[CPU_ID];
+    uint64_t const CACHE_FLAGS = cache.lock.lock_irqsave();
+    if (cache.count >= cache.pages.size()) {
+        drain_per_cpu_cache_locked(cache, PerCpuPageCache::DRAIN_BATCH);
+    }
+
+    bool cached = false;
+    if (cache.count < cache.pages.size()) {
+        uint32_t page_idx = 0;
+        uint64_t const FLAGS = allocator->lock_irq();
+        cached = allocator->cache_allocated_order0(page, page_idx);
+        allocator->unlock_irq(FLAGS);
+        if (cached) {
+            cache.pages.at(cache.count++) = CachedOrder0Page{
+                .allocator = allocator,
+                .page_idx = page_idx,
+            };
+        }
+    }
+    cache.lock.unlock_irqrestore(CACHE_FLAGS);
+
+    if (!cached) {
+        page_cache_free_misses.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    page_cache_free_hits.fetch_add(1, std::memory_order_relaxed);
+    note_physical_free(paging::PAGE_SIZE);
+    return true;
+}
+
 auto page_alloc_impl(uint64_t size, std::string_view name, ReturnedPageZeroing zeroing, void* caller_addr) -> void* {
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     uint64_t const NUM_PAGES = (size + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
 #endif
-
-    // Try per-CPU cache first for single-page allocations
-    if (USE_PER_CPU_PAGE_CACHE && size == paging::PAGE_SIZE && per_cpu_caches != nullptr && per_cpu_ready.load(std::memory_order_acquire)) {
-        uint64_t const CPU_ID = cpu::get_current_cpu_id_safe();
-        if (CPU_ID < num_cpus) {
-            PerCpuPageCache& cache = per_cpu_caches[CPU_ID];
-            cache.lock.lock();
-
-            if (cache.count > 0) {
-                // Fast path: pop from cache
-                void* page = cache.pages.at(--cache.count);
-                cache.lock.unlock();
-
-                note_physical_alloc(size);
-
-                // Double-alloc sentinel: if the page still holds a live slab header
-                // it was freed to this cache while still in the slab chain.
-                constexpr uint32_t SLAB_MAGIC_CACHE = 0x8CBEEFC8;
-                if (*reinterpret_cast<const volatile uint32_t*>(page) == SLAB_MAGIC_CACHE) {
-                    log::critical("DETECT: pageAlloc (cache) returning live slab page - double-alloc trap! virt=%p", page);
-                    hcf();
-                }
-
-                prepare_allocated_block(page, size, zeroing);
-
-#ifdef WOS_PHYS_ALLOC_CALLER_STATS
-                record_page_alloc_caller(caller_addr, NUM_PAGES);
-#endif
-                return page;
-            }
-            cache.lock.unlock();
-        }
-    }
-
-    // Slow path: allocate from zones
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     uint64_t const CALLER_TAG = caller_stats_runtime_enabled.load(std::memory_order_relaxed) ? reinterpret_cast<uint64_t>(caller_addr) : 0;
 #else
     uint64_t const CALLER_TAG = 0;
 #endif
+
+    // Try per-CPU cache first for single-page allocations. Cached entries carry
+    // their allocator/index proof and are transitioned back to allocated state
+    // under the owning allocator lock before the page is exposed.
+    if (size == paging::PAGE_SIZE) {
+        void* const CACHED_PAGE = try_alloc_from_per_cpu_cache(CALLER_TAG, zeroing, caller_addr);
+        if (CACHED_PAGE != nullptr) {
+            return CACHED_PAGE;
+        }
+    }
+
+    // Slow path: allocate from zones
     void* block = nullptr;
     if (size == paging::PAGE_SIZE) {
         block = find_free_order0_block(CALLER_TAG);
@@ -1151,25 +1314,6 @@ auto page_alloc_huge(uint64_t size) -> void* {
 }
 
 void page_free(void* page) {
-    // Try to return single pages to per-CPU cache
-    if (USE_PER_CPU_PAGE_CACHE && per_cpu_caches != nullptr && per_cpu_ready.load(std::memory_order_acquire)) {
-        uint64_t const CPU_ID = cpu::get_current_cpu_id_safe();
-        if (CPU_ID < num_cpus) {
-            PerCpuPageCache& cache = per_cpu_caches[CPU_ID];
-            cache.lock.lock();
-
-            if (cache.count < PerCpuPageCache::CACHE_SIZE) {
-                // Fast path: push to cache
-                cache.pages.at(cache.count++) = page;
-                cache.lock.unlock();
-
-                note_physical_free(paging::PAGE_SIZE);
-                return;
-            }
-            cache.lock.unlock();
-        }
-    }
-
     // Try huge page zone first
     if (huge_page_zone != nullptr) {
         auto const PAGE_ADDR = reinterpret_cast<uint64_t>(page);
@@ -1192,6 +1336,10 @@ void page_free(void* page) {
         }
 
         if (zone->allocator != nullptr) {
+            if (try_cache_freed_order0_page(zone->allocator, page)) {
+                return;
+            }
+
             uint64_t const FLAGS = zone->allocator->lock_irq();
             uint64_t const FREED_BYTES = zone->allocator->free(page);
             zone->allocator->unlock_irq(FLAGS);
@@ -1710,6 +1858,23 @@ void get_page_ref_stats_snapshot(PageRefStatsSnapshot& out) {
         .batch_zero_candidates = page_ref_batch_zero_candidates.load(std::memory_order_relaxed),
         .batch_free_runs = page_ref_batch_free_runs.load(std::memory_order_relaxed),
         .batch_pages_freed = page_ref_batch_pages_freed.load(std::memory_order_relaxed),
+    };
+}
+
+void get_page_cache_stats_snapshot(PageCacheStatsSnapshot& out) {
+    out = PageCacheStatsSnapshot{
+        .enabled = USE_PER_CPU_PAGE_CACHE ? 1U : 0U,
+        .capacity = per_cpu_caches != nullptr ? static_cast<uint64_t>(num_cpus * PerCpuPageCache::CACHE_SIZE) : 0U,
+        .cached_pages = total_cached_order0_pages_snapshot(),
+        .alloc_hits = page_cache_alloc_hits.load(std::memory_order_relaxed),
+        .alloc_misses = page_cache_alloc_misses.load(std::memory_order_relaxed),
+        .refill_calls = page_cache_refill_calls.load(std::memory_order_relaxed),
+        .refill_pages = page_cache_refill_pages.load(std::memory_order_relaxed),
+        .free_hits = page_cache_free_hits.load(std::memory_order_relaxed),
+        .free_misses = page_cache_free_misses.load(std::memory_order_relaxed),
+        .drain_calls = page_cache_drain_calls.load(std::memory_order_relaxed),
+        .drain_pages = page_cache_drain_pages.load(std::memory_order_relaxed),
+        .stale_entries = page_cache_stale_entries.load(std::memory_order_relaxed),
     };
 }
 

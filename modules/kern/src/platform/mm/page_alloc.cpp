@@ -319,6 +319,7 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
         // Zone too small to hold any usable pages.
         usable_pages = 0;
         free_count = 0;
+        cached_order0_count = 0;
         for (auto*& list_head : free_list) {
             list_head = nullptr;
         }
@@ -337,6 +338,7 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
 
     usable_pages = total_pages - metadata_pages;
     free_count = 0;
+    cached_order0_count = 0;
 
     // Zero the free lists.
     for (auto*& list_head : free_list) {
@@ -500,6 +502,117 @@ void* PageAllocator::alloc_order0(uint64_t caller) {
 #endif
     free_count -= 1;
     return page_to_ptr(base, page_idx);
+}
+
+void* PageAllocator::claim_free_order0_for_cache(uint32_t& out_page_idx) {
+    out_page_idx = 0;
+    auto* const BLOCK = free_list.at(0);
+    if (BLOCK == nullptr) {
+        return nullptr;
+    }
+
+    uint32_t page_idx = 0;
+    if (!order0_free_head_is_reusable(this, BLOCK, page_idx)) {
+        return nullptr;
+    }
+
+    if (!remove_free_block(this, 0, BLOCK)) {
+        return nullptr;
+    }
+
+    page_flags[page_idx] = FLAG_CACHED_ORDER0;
+    store_page_kind(page_kinds[page_idx], PageKind::FREE);
+    page_refcounts[page_idx].store(0, std::memory_order_release);
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    page_callers[page_idx] = 0;
+#endif
+    cached_order0_count += 1;
+    out_page_idx = page_idx;
+    return page_to_ptr(base, page_idx);
+}
+
+auto PageAllocator::cache_allocated_order0(void* ptr, uint32_t& out_page_idx) -> bool {
+    out_page_idx = 0;
+    if (ptr == nullptr || !ptr_in_zone(this, ptr)) {
+        return false;
+    }
+
+    uint32_t const PAGE_IDX = ptr_to_page(base, ptr);
+    if (PAGE_IDX >= total_pages || page_flags[PAGE_IDX] != FLAG_ALLOC_HEAD) {
+        return false;
+    }
+    if (page_refcounts[PAGE_IDX].load(std::memory_order_acquire) != 1) {
+        return false;
+    }
+    if (page_has_live_medium_alloc_magic(this, PAGE_IDX)) {
+        auto const PAGE_BASE = reinterpret_cast<uint64_t>(page_to_ptr(base, PAGE_IDX));
+        dbg::emergency_log("BUG: page_free on live medium alloc page=0x%lx caller_ptr=0x%lx\n", PAGE_BASE, reinterpret_cast<uint64_t>(ptr));
+        ker::mod::dbg::panic_handler("page_free called on live kmalloc medium alloc");
+    }
+    if (page_has_live_large_alloc_magic(this, PAGE_IDX)) {
+        auto const PAGE_BASE = reinterpret_cast<uint64_t>(page_to_ptr(base, PAGE_IDX));
+        dbg::emergency_log("BUG: page_free on live large alloc page=0x%lx caller_ptr=0x%lx\n", PAGE_BASE, reinterpret_cast<uint64_t>(ptr));
+        ker::mod::dbg::panic_handler("page_free called on live kmalloc large alloc");
+    }
+
+    page_flags[PAGE_IDX] = FLAG_CACHED_ORDER0;
+    store_page_kind(page_kinds[PAGE_IDX], PageKind::FREE);
+    page_refcounts[PAGE_IDX].store(0, std::memory_order_release);
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    page_callers[PAGE_IDX] = 0;
+#endif
+    free_count += 1;
+    cached_order0_count += 1;
+    out_page_idx = PAGE_IDX;
+    return true;
+}
+
+auto PageAllocator::alloc_cached_order0_at(uint32_t page_idx, uint64_t caller) -> void* {
+#ifndef WOS_PHYS_ALLOC_CALLER_STATS
+    (void)caller;
+#endif
+    if (page_idx >= total_pages || page_flags[page_idx] != FLAG_CACHED_ORDER0) {
+        return nullptr;
+    }
+    if (decode_page_kind(page_kinds[page_idx].load(std::memory_order_acquire)) != PageKind::FREE) {
+        return nullptr;
+    }
+    if (page_refcounts[page_idx].load(std::memory_order_acquire) != 0) {
+        return nullptr;
+    }
+    if (free_count == 0 || cached_order0_count == 0) {
+        return nullptr;
+    }
+
+    page_flags[page_idx] = FLAG_ALLOC_HEAD;
+    store_page_kind(page_kinds[page_idx], PageKind::NORMAL);
+    page_refcounts[page_idx].store(1, std::memory_order_release);
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    page_callers[page_idx] = caller;
+#endif
+    free_count -= 1;
+    cached_order0_count -= 1;
+    return page_to_ptr(base, page_idx);
+}
+
+auto PageAllocator::release_cached_order0_at(uint32_t page_idx) -> uint64_t {
+    if (page_idx >= total_pages || page_flags[page_idx] != FLAG_CACHED_ORDER0) {
+        return 0;
+    }
+    if (decode_page_kind(page_kinds[page_idx].load(std::memory_order_acquire)) != PageKind::FREE) {
+        return 0;
+    }
+    if (page_refcounts[page_idx].load(std::memory_order_acquire) != 0) {
+        return 0;
+    }
+    if (free_count == 0 || cached_order0_count == 0) {
+        return 0;
+    }
+
+    cached_order0_count -= 1;
+    free_count -= 1;
+    page_flags[page_idx] = FLAG_ALLOC_HEAD;
+    return free_allocated_block(this, page_idx, 0);
 }
 
 // ============================================================================

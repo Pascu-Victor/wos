@@ -1929,6 +1929,7 @@ auto generate_memacc_zones(char* buf, size_t bufsz) -> size_t {
         append_memacc_dec(p, end, "free_pages", zone.free_pages);
         append_memacc_dec(p, end, "metadata_pages", zone.metadata_pages);
         append_memacc_dec(p, end, "scanned_free_pages", zone.scanned_free_pages);
+        append_memacc_dec(p, end, "cached_order0_pages", zone.cached_order0_pages);
         append_memacc_bool(p, end, "has_allocator", zone.has_allocator);
         append_memacc_bool(p, end, "invalid_allocator", zone.invalid_allocator);
         append_memacc_bool(p, end, "bad_order", zone.bad_order);
@@ -2944,8 +2945,10 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
         auto sched = ker::mod::sched::get_scheduler_trace_stats(c);
         auto mm_destroy = ker::mod::mm::virt::get_destroy_user_space_stats(c);
         ker::mod::mm::phys::PageRefStatsSnapshot ref_stats{};
+        ker::mod::mm::phys::PageCacheStatsSnapshot page_cache_stats{};
         if (c == 0) {
             ker::mod::mm::phys::get_page_ref_stats_snapshot(ref_stats);
+            ker::mod::mm::phys::get_page_cache_stats_snapshot(page_cache_stats);
         }
         append_sconst(p, end, "cpu=");
         append_dec64(p, end, c);
@@ -3139,6 +3142,30 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, ref_stats.batch_free_runs);
         append_sconst(p, end, " pa_ref_batch_freed=");
         append_dec64(p, end, ref_stats.batch_pages_freed);
+        append_sconst(p, end, " pa_cache_enabled=");
+        append_dec64(p, end, page_cache_stats.enabled);
+        append_sconst(p, end, " pa_cache_capacity=");
+        append_dec64(p, end, page_cache_stats.capacity);
+        append_sconst(p, end, " pa_cache_cached=");
+        append_dec64(p, end, page_cache_stats.cached_pages);
+        append_sconst(p, end, " pa_cache_hit=");
+        append_dec64(p, end, page_cache_stats.alloc_hits);
+        append_sconst(p, end, " pa_cache_miss=");
+        append_dec64(p, end, page_cache_stats.alloc_misses);
+        append_sconst(p, end, " pa_cache_refill=");
+        append_dec64(p, end, page_cache_stats.refill_calls);
+        append_sconst(p, end, " pa_cache_refill_pages=");
+        append_dec64(p, end, page_cache_stats.refill_pages);
+        append_sconst(p, end, " pa_cache_free=");
+        append_dec64(p, end, page_cache_stats.free_hits);
+        append_sconst(p, end, " pa_cache_free_miss=");
+        append_dec64(p, end, page_cache_stats.free_misses);
+        append_sconst(p, end, " pa_cache_drain=");
+        append_dec64(p, end, page_cache_stats.drain_calls);
+        append_sconst(p, end, " pa_cache_drain_pages=");
+        append_dec64(p, end, page_cache_stats.drain_pages);
+        append_sconst(p, end, " pa_cache_stale=");
+        append_dec64(p, end, page_cache_stats.stale_entries);
         append_sconst(p, end, " lb_push=");
         append_dec64(p, end, sched.load_balance_pushes);
         if (p + 1 < end) {

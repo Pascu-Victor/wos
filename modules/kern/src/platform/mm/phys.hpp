@@ -44,6 +44,7 @@ struct ZoneSnapshot {
     uint64_t free_pages;
     uint64_t metadata_pages;
     uint64_t scanned_free_pages;
+    uint64_t cached_order0_pages;
     std::array<uint32_t, MEMACC_BUDDY_ORDER_COUNT> buddy_order_counts;
     const char* name;
     bool has_allocator;
@@ -80,6 +81,21 @@ struct PageRefStatsSnapshot {
     uint64_t batch_pages_freed;
 };
 
+struct PageCacheStatsSnapshot {
+    uint64_t enabled;
+    uint64_t capacity;
+    uint64_t cached_pages;
+    uint64_t alloc_hits;
+    uint64_t alloc_misses;
+    uint64_t refill_calls;
+    uint64_t refill_pages;
+    uint64_t free_hits;
+    uint64_t free_misses;
+    uint64_t drain_calls;
+    uint64_t drain_pages;
+    uint64_t stale_entries;
+};
+
 struct PageLookupHint {
     PageAllocator* allocator = nullptr;
 };
@@ -112,6 +128,7 @@ uint32_t page_ref_dec(void* page, PageLookupHint* hint);
 auto page_ref_dec_batch(std::span<void* const> pages) -> PageRefBatchStats;
 auto page_ref_dec_batch(std::span<void* const> pages, PageLookupHint* hint) -> PageRefBatchStats;
 void get_page_ref_stats_snapshot(PageRefStatsSnapshot& out);
+void get_page_cache_stats_snapshot(PageCacheStatsSnapshot& out);
 // Get current refcount for a physical page. Returns 0 for unknown/free pages.
 uint32_t page_ref_get(void* page);
 uint32_t page_ref_get(void* page, PageLookupHint* hint);

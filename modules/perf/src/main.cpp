@@ -2432,6 +2432,36 @@ void cmd_cpustat() {
                      get_val("pa_ref_zero_freed="), get_val("pa_ref_zero_bad="), get_val("pa_ref_batch="), get_val("pa_ref_batch_pages="),
                      get_val("pa_ref_batch_zero="), get_val("pa_ref_batch_runs="), get_val("pa_ref_batch_freed="));
     }
+
+    std::println("");
+    std::println("{:>4}  {:>7}  {:>8}  {:>8}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}", "CPU", "enabled",
+                 "capacity", "cached", "hit", "miss", "refill", "refill_pg", "free", "free_miss", "drain", "drain_pg", "stale");
+    std::println("{:->4}  {:->7}  {:->8}  {:->8}  {:->10}  {:->10}  {:->10}  {:->12}  {:->10}  {:->10}  {:->10}  {:->12}  {:->10}", "", "",
+                 "", "", "", "", "", "", "", "", "", "", "");
+
+    pos = 0;
+    while (pos < buffer->size()) {
+        std::string_view line = next_line(*buffer, pos);
+        if (line.empty()) {
+            continue;
+        }
+
+        auto get_val = [&](std::string_view key) {
+            std::size_t key_pos = line.find(key);
+            if (key_pos == std::string_view::npos) {
+                return uint64_t{0};
+            }
+            key_pos += key.size();
+            std::size_t const END = line.find(' ', key_pos);
+            return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
+        };
+
+        std::println("{:>4}  {:>7}  {:>8}  {:>8}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}", get_val("cpu="),
+                     get_val("pa_cache_enabled="), get_val("pa_cache_capacity="), get_val("pa_cache_cached="), get_val("pa_cache_hit="),
+                     get_val("pa_cache_miss="), get_val("pa_cache_refill="), get_val("pa_cache_refill_pages="), get_val("pa_cache_free="),
+                     get_val("pa_cache_free_miss="), get_val("pa_cache_drain="), get_val("pa_cache_drain_pages="),
+                     get_val("pa_cache_stale="));
+    }
 }
 
 void cmd_contstat() {
