@@ -2241,6 +2241,35 @@ void cmd_cpustat() {
     }
 
     std::println("");
+    std::println("{:>4}  {:>11}  {:>11}  {:>8}  {:>10}  {:>11}  {:>11}  {:>13}  {:>12}  {:>12}", "CPU", "defer_q", "defer_done", "depth",
+                 "depth_max", "slices", "slice_done", "wait_max_us", "idle_boost", "foreground");
+    std::println("{:->4}  {:->11}  {:->11}  {:->8}  {:->10}  {:->11}  {:->11}  {:->13}  {:->12}  {:->12}", "", "", "", "", "", "", "", "",
+                 "", "");
+
+    pos = 0;
+    while (pos < buffer->size()) {
+        std::string_view line = next_line(*buffer, pos);
+        if (line.empty()) {
+            continue;
+        }
+
+        auto get_val = [&](std::string_view key) {
+            std::size_t key_pos = line.find(key);
+            if (key_pos == std::string_view::npos) {
+                return uint64_t{0};
+            }
+            key_pos += key.size();
+            std::size_t const END = line.find(' ', key_pos);
+            return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
+        };
+
+        std::println("{:>4}  {:>11}  {:>11}  {:>8}  {:>10}  {:>11}  {:>11}  {:>13}  {:>12}  {:>12}", get_val("cpu="),
+                     get_val("gc_defer_queued="), get_val("gc_defer_done="), get_val("gc_defer_depth="), get_val("gc_defer_depth_max="),
+                     get_val("gc_defer_slices="), get_val("gc_defer_slice_done="), get_val("gc_defer_wait_max_us="),
+                     get_val("gc_idle_boost_pass="), get_val("gc_foreground_pass="));
+    }
+
+    std::println("");
     std::println("{:>4}  {:>9}  {:>11}  {:>12}  {:>11}  {:>12}  {:>9}  {:>10}  {:>10}  {:>11}", "CPU", "dus_calls", "collect_us",
                  "collect_max", "data_us", "data_max", "pt_us", "pt_max", "tlb_us", "tlb_max");
     std::println("{:->4}  {:->9}  {:->11}  {:->12}  {:->11}  {:->12}  {:->9}  {:->10}  {:->10}  {:->11}", "", "", "", "", "", "", "", "",
@@ -2323,6 +2352,85 @@ void cmd_cpustat() {
 
         std::println("{:>4}  {:>12}  {:>10}  {:>10}  {:>10}", get_val("cpu="), get_val("dus_unknown_skip="), get_val("dus_slab_skip="),
                      get_val("dus_kmalloc_large_skip="), get_val("dus_alias_skip="));
+    }
+
+    std::println("");
+    std::println("{:>4}  {:>16}  {:>16}  {:>18}  {:>18}", "CPU", "magic_reads", "magic_slab", "magic_medium", "magic_large");
+    std::println("{:->4}  {:->16}  {:->16}  {:->18}  {:->18}", "", "", "", "", "");
+
+    pos = 0;
+    while (pos < buffer->size()) {
+        std::string_view line = next_line(*buffer, pos);
+        if (line.empty()) {
+            continue;
+        }
+
+        auto get_val = [&](std::string_view key) {
+            std::size_t key_pos = line.find(key);
+            if (key_pos == std::string_view::npos) {
+                return uint64_t{0};
+            }
+            key_pos += key.size();
+            std::size_t const END = line.find(' ', key_pos);
+            return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
+        };
+
+        std::println("{:>4}  {:>16}  {:>16}  {:>18}  {:>18}", get_val("cpu="), get_val("dus_magic_unknown_reads="),
+                     get_val("dus_magic_unknown_slab="), get_val("dus_magic_unknown_medium="), get_val("dus_magic_unknown_kmalloc_large="));
+    }
+
+    std::println("");
+    std::println("{:>4}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}", "CPU", "ref_inc", "inc_retry", "ref_add", "add_refs",
+                 "add_retry", "ref_dec", "dec_retry");
+    std::println("{:->4}  {:->10}  {:->10}  {:->10}  {:->12}  {:->10}  {:->10}  {:->10}", "", "", "", "", "", "", "", "");
+
+    pos = 0;
+    while (pos < buffer->size()) {
+        std::string_view line = next_line(*buffer, pos);
+        if (line.empty()) {
+            continue;
+        }
+
+        auto get_val = [&](std::string_view key) {
+            std::size_t key_pos = line.find(key);
+            if (key_pos == std::string_view::npos) {
+                return uint64_t{0};
+            }
+            key_pos += key.size();
+            std::size_t const END = line.find(' ', key_pos);
+            return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
+        };
+
+        std::println("{:>4}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}  {:>10}  {:>10}", get_val("cpu="), get_val("pa_ref_inc="),
+                     get_val("pa_ref_inc_retry="), get_val("pa_ref_add="), get_val("pa_ref_add_refs="), get_val("pa_ref_add_retry="),
+                     get_val("pa_ref_dec="), get_val("pa_ref_dec_retry="));
+    }
+
+    std::println("");
+    std::println("{:>4}  {:>10}  {:>14}  {:>10}  {:>12}  {:>13}  {:>11}  {:>10}  {:>13}", "CPU", "zero", "zero_freed", "zero_bad", "batch",
+                 "batch_pages", "batch_zero", "runs", "batch_freed");
+    std::println("{:->4}  {:->10}  {:->14}  {:->10}  {:->12}  {:->13}  {:->11}  {:->10}  {:->13}", "", "", "", "", "", "", "", "", "");
+
+    pos = 0;
+    while (pos < buffer->size()) {
+        std::string_view line = next_line(*buffer, pos);
+        if (line.empty()) {
+            continue;
+        }
+
+        auto get_val = [&](std::string_view key) {
+            std::size_t key_pos = line.find(key);
+            if (key_pos == std::string_view::npos) {
+                return uint64_t{0};
+            }
+            key_pos += key.size();
+            std::size_t const END = line.find(' ', key_pos);
+            return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
+        };
+
+        std::println("{:>4}  {:>10}  {:>14}  {:>10}  {:>12}  {:>13}  {:>11}  {:>10}  {:>13}", get_val("cpu="), get_val("pa_ref_zero="),
+                     get_val("pa_ref_zero_freed="), get_val("pa_ref_zero_bad="), get_val("pa_ref_batch="), get_val("pa_ref_batch_pages="),
+                     get_val("pa_ref_batch_zero="), get_val("pa_ref_batch_runs="), get_val("pa_ref_batch_freed="));
     }
 }
 

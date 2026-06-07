@@ -11,7 +11,7 @@
 #include <span>
 
 #include "config.hpp"
-#ifdef WOS
+#if MANDELBENCH_DEBUG
 #include <sys/multiproc.h>
 #endif
 #include <sys/time.h>
@@ -64,7 +64,7 @@ void note_cpu_sample(Arg* a, int current_cpu) {
 auto generate_image(void* param) -> int {
     auto* a = static_cast<Arg*>(param);
 #if MANDELBENCH_DEBUG
-    a->cpu_id = (int)ker::multiproc::getcurrent_cpu();
+    a->cpu_id = static_cast<int>(ker::multiproc::getcurrent_cpu());
     a->cpu_end_id = a->cpu_id;
     a->cpu_mask = cpu_bit(a->cpu_id);
     a->cpu_changes = 0;
@@ -110,7 +110,7 @@ auto generate_image(void* param) -> int {
             a->preempt_ns += gap;
             if (gap > a->max_gap_ns) a->max_gap_ns = gap;
         }
-        note_cpu_sample(a, (int)ker::multiproc::getcurrent_cpu());
+        note_cpu_sample(a, static_cast<int>(ker::multiproc::getcurrent_cpu()));
         a->rows_completed++;
 #endif
         for (col = 0; col < WIDTH; col++) {
@@ -135,7 +135,7 @@ auto generate_image(void* param) -> int {
 #endif
     }
 #if MANDELBENCH_DEBUG
-    note_cpu_sample(a, (int)ker::multiproc::getcurrent_cpu());
+    note_cpu_sample(a, static_cast<int>(ker::multiproc::getcurrent_cpu()));
     a->thread_end_ns = prev_row_end;
     a->thread_cpu_ns = thread_cpu_ns() - cpu_start;
 #endif
@@ -252,7 +252,7 @@ auto mandelbench(int width, int height, int max_iteration, int threads, int repe
         uint64_t t_end_max = a[0].thread_end_ns;
         int best_thread = 0;
         int worst_thread = 0;
-        for (i = 1; i < threads; i++) {
+        for (int i = 1; i < threads; i++) {
             t_start_min = std::min(a[i].thread_start_ns, t_start_min);
             t_start_max = std::max(a[i].thread_start_ns, t_start_max);
             t_end_max = std::max(a[i].thread_end_ns, t_end_max);
@@ -262,7 +262,7 @@ auto mandelbench(int width, int height, int max_iteration, int threads, int repe
         double max_thread_dur = 0;
         double min_cpu_eff = 1e18;
         double max_cpu_eff = 0;
-        for (i = 0; i < threads; i++) {
+        for (int i = 0; i < threads; i++) {
             double dur = (double)(a[i].thread_end_ns - a[i].thread_start_ns) / 1e6;
             if (dur < min_thread_dur) {
                 min_thread_dur = dur;
@@ -278,7 +278,7 @@ auto mandelbench(int width, int height, int max_iteration, int threads, int repe
         }
         // Print per-thread CPU placement for diagnosing co-location
         std::print(stderr, "  cpus:");
-        for (i = 0; i < threads; i++) std::print(stderr, " t{}->c{}", i, a[i].cpu_id);
+        for (int i = 0; i < threads; i++) std::print(stderr, " t{}->c{}", i, a[i].cpu_id);
         std::println(stderr, "");
         std::println(stderr,
                      "  breakdown: spawn={:.2f}ms start_skew={:.2f}ms compute={:.2f}ms join={:.2f}ms "

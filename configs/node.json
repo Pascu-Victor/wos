@@ -1,0 +1,60 @@
+{
+    "build": {
+        "dir": "build-ktest",
+        "sysroot": "ktest-data/sysroot",
+        "mlibc_build": "ktest-data/mlibc-build",
+        "busybox_build": "ktest-data/busybox-build",
+        "busybox_install": "ktest-data/busybox-install",
+        "dropbear_build": "ktest-data/dropbear-build"
+    },
+    "package": {
+        "kernel_cmdline": "--selftest"
+    },
+    "node": {
+        "id": 0,
+        "hostname": "wos-ktest",
+        "debug": false,
+        "mtu": 9000,
+        "vm": {
+            "memory": "32G",
+            "cpus": 32,
+            "disk0": "ktest-data/disk.qcow2",
+            "disk1": "ktest-data/mountfs.qcow2",
+            "overlay_dir": "ktest-data/overlays",
+            "serial_log": "ktest-data/serial-vm0.log",
+            "qemu_log": "ktest-data/qemu-vm0.log",
+            "tcg_log": "ktest-data/qemu-vm0-cpu%d.log"
+        },
+        "nics": [
+            {
+                "name": "lan",
+                "zone_id": 0,
+                "tap": "wos-lan-N0",
+                "mac": "52:54:00:00:00:00",
+                "model": "virtio-net-pci",
+                "queues": 2,
+                "vhost": false,
+                "driver": "dhcp",
+                "bridge": {
+                    "stp": false,
+                    "ip": "10.10.0.100/24",
+                    "dns": "10.10.0.1"
+                }
+            },
+            {
+                "name": "wki",
+                "zone_id": 1,
+                "tap": "wos-wki-N0",
+                "mac": "52:54:00:01:00:00",
+                "model": "virtio-net-pci",
+                "queues": 8,
+                "vhost": true,
+                "driver": "wki",
+                "bridge": {
+                    "stp": false,
+                    "ip": null
+                }
+            }
+        ]
+    }
+}

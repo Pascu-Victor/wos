@@ -34,9 +34,17 @@ add_subdirectory(modules)
 # Toolchain / external build targets
 # ---------------------------------------------------------------------------
 
-set(SYSROOT ${CMAKE_SOURCE_DIR}/toolchain/sysroot)
-set(MLIBC_BUILD_DIR ${CMAKE_SOURCE_DIR}/toolchain/mlibc-build)
-set(LIBCXX_BUILD_DIR ${CMAKE_SOURCE_DIR}/toolchain/libcxx-build)
+set(WOS_SYSROOT_PATH "${CMAKE_SOURCE_DIR}/toolchain/sysroot" CACHE PATH "WOS target sysroot")
+set(WOS_MLIBC_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/mlibc-build" CACHE PATH "mlibc build directory")
+set(WOS_LIBCXX_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/libcxx-build" CACHE PATH "libc++ build directory")
+set(WOS_BUSYBOX_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/busybox-build" CACHE PATH "BusyBox build directory")
+set(WOS_BUSYBOX_INSTALL_DIR "${CMAKE_SOURCE_DIR}/toolchain/busybox-install" CACHE PATH "BusyBox install staging directory")
+set(WOS_DROPBEAR_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/dropbear-build" CACHE PATH "Dropbear build directory")
+option(WOS_SKIP_LIBCXX_INSTALL "Skip the libc++ install target; useful when an isolated sysroot is pre-seeded" OFF)
+
+set(SYSROOT ${WOS_SYSROOT_PATH})
+set(MLIBC_BUILD_DIR ${WOS_MLIBC_BUILD_DIR})
+set(LIBCXX_BUILD_DIR ${WOS_LIBCXX_BUILD_DIR})
 set(WOS_BUILD_SCRIPTS_DIR ${CMAKE_SOURCE_DIR}/scripts/build)
 
 # --- check_headers: validate #pragma once in kern and init headers ----------
@@ -63,7 +71,10 @@ file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/stamps)
 set(MLIBC_STAMP ${CMAKE_BINARY_DIR}/stamps/mlibc.stamp)
 add_custom_command(
     OUTPUT ${MLIBC_STAMP}
-    COMMAND ${WOS_BUILD_SCRIPTS_DIR}/build_mlibc.sh ${CMAKE_BUILD_TYPE}
+    COMMAND ${CMAKE_COMMAND} -E env
+            WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+            WOS_MLIBC_BUILD_DIR=${WOS_MLIBC_BUILD_DIR}
+            ${WOS_BUILD_SCRIPTS_DIR}/build_mlibc.sh ${CMAKE_BUILD_TYPE}
     COMMAND ${CMAKE_COMMAND} -E touch ${MLIBC_STAMP}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Building mlibc..."
@@ -74,21 +85,37 @@ add_custom_target(mlibc DEPENDS ${MLIBC_STAMP})
 
 # --- libcxx: build and install libc++ ---------------------------------------
 set(LIBCXX_STAMP ${CMAKE_BINARY_DIR}/stamps/libcxx.stamp)
-add_custom_command(
-    OUTPUT ${LIBCXX_STAMP}
-    COMMAND ninja -C ${LIBCXX_BUILD_DIR}
-    COMMAND ninja -C ${LIBCXX_BUILD_DIR} install
-    COMMAND ${CMAKE_COMMAND} -E touch ${LIBCXX_STAMP}
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    COMMENT "Building libc++..."
-    DEPENDS ${MLIBC_STAMP}
-    USES_TERMINAL
-)
+if(WOS_SKIP_LIBCXX_INSTALL)
+    add_custom_command(
+        OUTPUT ${LIBCXX_STAMP}
+        COMMAND ${CMAKE_COMMAND} -E echo "Skipping libc++ install using pre-seeded sysroot ${WOS_SYSROOT_PATH}"
+        COMMAND ${CMAKE_COMMAND} -E touch ${LIBCXX_STAMP}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Using pre-seeded libc++ in isolated sysroot..."
+        DEPENDS ${MLIBC_STAMP}
+        USES_TERMINAL
+    )
+else()
+    add_custom_command(
+        OUTPUT ${LIBCXX_STAMP}
+        COMMAND ninja -C ${LIBCXX_BUILD_DIR}
+        COMMAND ninja -C ${LIBCXX_BUILD_DIR} install
+        COMMAND ${CMAKE_COMMAND} -E touch ${LIBCXX_STAMP}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Building libc++..."
+        DEPENDS ${MLIBC_STAMP}
+        USES_TERMINAL
+    )
+endif()
 add_custom_target(libcxx DEPENDS ${LIBCXX_STAMP})
 
 # --- busybox: cross-compile busybox for WOS ---------------------------------
 add_custom_target(busybox
-    COMMAND ${WOS_BUILD_SCRIPTS_DIR}/build_busybox.sh
+    COMMAND ${CMAKE_COMMAND} -E env
+            WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+            WOS_BUSYBOX_BUILD_DIR=${WOS_BUSYBOX_BUILD_DIR}
+            WOS_BUSYBOX_INSTALL_DIR=${WOS_BUSYBOX_INSTALL_DIR}
+            ${WOS_BUILD_SCRIPTS_DIR}/build_busybox.sh
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Building busybox..."
     USES_TERMINAL
@@ -97,7 +124,10 @@ add_dependencies(busybox mlibc libcxx)
 
 # --- dropbear: cross-compile dropbear SSH for WOS ---------------------------
 add_custom_target(dropbear
-    COMMAND ${WOS_BUILD_SCRIPTS_DIR}/build_dropbear.sh
+    COMMAND ${CMAKE_COMMAND} -E env
+            WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+            WOS_DROPBEAR_BUILD_DIR=${WOS_DROPBEAR_BUILD_DIR}
+            ${WOS_BUILD_SCRIPTS_DIR}/build_dropbear.sh
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Building dropbear..."
     USES_TERMINAL

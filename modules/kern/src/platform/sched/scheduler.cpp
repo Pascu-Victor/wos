@@ -4058,13 +4058,40 @@ struct GcDeferredCleanupItem {
     bool should_free_pagemap = false;
     mm::virt::DestroyUserSpaceBudgetState* pagemap_state = nullptr;
     uint64_t detach_us = 0;
+    uint64_t enqueue_us = 0;
     GcDeferredCleanupItem* next = nullptr;
 };
 
-GcDeferredCleanupItem* gc_deferred_cleanup_head = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-GcDeferredCleanupItem* gc_deferred_cleanup_tail = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+GcDeferredCleanupItem* gc_deferred_cleanup_head = nullptr;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+GcDeferredCleanupItem* gc_deferred_cleanup_tail = nullptr;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> gc_deferred_cleanup_items_queued{0};        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> gc_deferred_cleanup_items_completed{0};     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> gc_deferred_cleanup_depth{0};               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> gc_deferred_cleanup_depth_max{0};           // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> gc_deferred_cleanup_slices{0};              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> gc_deferred_cleanup_slices_completed{0};    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> gc_deferred_cleanup_oldest_wait_us_max{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> scheduler_gc_idle_boost_passes{0};          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> scheduler_gc_foreground_passes{0};          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 auto gc_deferred_cleanup_has_work() -> bool { return gc_deferred_cleanup_head != nullptr; }
+
+void note_gc_deferred_cleanup_push() {
+    gc_deferred_cleanup_items_queued.fetch_add(1, std::memory_order_relaxed);
+    uint64_t const DEPTH = gc_deferred_cleanup_depth.fetch_add(1, std::memory_order_relaxed) + 1;
+    update_relaxed_max(gc_deferred_cleanup_depth_max, DEPTH);
+}
+
+void note_gc_deferred_cleanup_complete(uint64_t wait_us) {
+    gc_deferred_cleanup_items_completed.fetch_add(1, std::memory_order_relaxed);
+    gc_deferred_cleanup_slices_completed.fetch_add(1, std::memory_order_relaxed);
+    update_relaxed_max(gc_deferred_cleanup_oldest_wait_us_max, wait_us);
+
+    uint64_t current = gc_deferred_cleanup_depth.load(std::memory_order_relaxed);
+    while (current != 0 &&
+           !gc_deferred_cleanup_depth.compare_exchange_weak(current, current - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
 
 void gc_deferred_cleanup_push(GcDeferredCleanupItem* item) {
     if (item == nullptr) {
@@ -4077,6 +4104,7 @@ void gc_deferred_cleanup_push(GcDeferredCleanupItem* item) {
         gc_deferred_cleanup_head = item;
     }
     gc_deferred_cleanup_tail = item;
+    note_gc_deferred_cleanup_push();
 }
 
 auto gc_deferred_cleanup_front() -> GcDeferredCleanupItem* { return gc_deferred_cleanup_head; }
@@ -4376,6 +4404,7 @@ auto queue_detached_gc_task_cleanup(GcDetachedTask const& detached, uint64_t det
         .should_free_pagemap = detached.should_free_pagemap,
         .pagemap_state = pagemap_state,
         .detach_us = detach_us,
+        .enqueue_us = time::get_us(),
         .next = nullptr,
     };
     if (item == nullptr) {
@@ -4399,6 +4428,7 @@ auto process_deferred_gc_cleanup_slice(GcTaskTiming& timing, uint32_t pagemap_st
     timing.detach_us = item->detach_us;
     item->detach_us = 0;
     uint64_t const CLEANUP_START_US = time::get_us();
+    gc_deferred_cleanup_slices.fetch_add(1, std::memory_order_relaxed);
     if (cur->pagemap != nullptr && item->should_free_pagemap && item->pagemap_state != nullptr) {
         uint64_t const START_US = time::get_us();
         if (!mm::virt::destroy_user_space_budgeted(item->pagemap_state, pagemap_step_budget)) {
@@ -4417,7 +4447,9 @@ auto process_deferred_gc_cleanup_slice(GcTaskTiming& timing, uint32_t pagemap_st
     }
 
     cleanup_task_after_pagemap(cur, timing, CLEANUP_START_US);
+    uint64_t const WAIT_US = elapsed_us_since(item->enqueue_us, time::get_us());
     gc_deferred_cleanup_pop();
+    note_gc_deferred_cleanup_complete(WAIT_US);
     delete item;
     return true;
 }
@@ -4602,6 +4634,11 @@ void scheduler_gc_thread_main() {
         }
 
         bool const BOOST_RECLAIM = scheduler_gc_should_boost_reclaim();
+        if (BOOST_RECLAIM) {
+            scheduler_gc_idle_boost_passes.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            scheduler_gc_foreground_passes.fetch_add(1, std::memory_order_relaxed);
+        }
         uint32_t const RECLAIM_BUDGET = BOOST_RECLAIM ? SCHED_GC_IDLE_RECLAIM_BUDGET : SCHED_GC_RECLAIM_BUDGET;
         uint64_t const WORK_BUDGET_US = BOOST_RECLAIM ? SCHED_GC_IDLE_WORK_BUDGET_US : SCHED_GC_WORK_BUDGET_US;
         uint32_t const PAGEMAP_STEP_BUDGET = BOOST_RECLAIM ? SCHED_GC_IDLE_PAGEMAP_STEP_BUDGET : SCHED_GC_PAGEMAP_STEP_BUDGET;
@@ -4963,7 +5000,7 @@ auto get_scheduler_trace_stats(uint64_t cpu_no) -> SchedulerTraceStats {
         return SchedulerTraceStats{};
     }
 
-    return run_queues->with_lock(cpu_no, [](RunQueue* rq) -> SchedulerTraceStats {
+    return run_queues->with_lock(cpu_no, [cpu_no](RunQueue* rq) -> SchedulerTraceStats {
         if (rq == nullptr) {
             return SchedulerTraceStats{};
         }
@@ -5006,6 +5043,15 @@ auto get_scheduler_trace_stats(uint64_t cpu_no) -> SchedulerTraceStats {
             .gc_misc_us_max = rq->gc_misc_us_max.load(std::memory_order_relaxed),
             .gc_debug_us_total = rq->gc_debug_us_total.load(std::memory_order_relaxed),
             .gc_debug_us_max = rq->gc_debug_us_max.load(std::memory_order_relaxed),
+            .gc_deferred_queued = cpu_no == 0 ? gc_deferred_cleanup_items_queued.load(std::memory_order_relaxed) : 0,
+            .gc_deferred_completed = cpu_no == 0 ? gc_deferred_cleanup_items_completed.load(std::memory_order_relaxed) : 0,
+            .gc_deferred_depth = cpu_no == 0 ? gc_deferred_cleanup_depth.load(std::memory_order_relaxed) : 0,
+            .gc_deferred_depth_max = cpu_no == 0 ? gc_deferred_cleanup_depth_max.load(std::memory_order_relaxed) : 0,
+            .gc_deferred_slices = cpu_no == 0 ? gc_deferred_cleanup_slices.load(std::memory_order_relaxed) : 0,
+            .gc_deferred_slices_completed = cpu_no == 0 ? gc_deferred_cleanup_slices_completed.load(std::memory_order_relaxed) : 0,
+            .gc_deferred_oldest_wait_us_max = cpu_no == 0 ? gc_deferred_cleanup_oldest_wait_us_max.load(std::memory_order_relaxed) : 0,
+            .gc_idle_boost_passes = cpu_no == 0 ? scheduler_gc_idle_boost_passes.load(std::memory_order_relaxed) : 0,
+            .gc_foreground_passes = cpu_no == 0 ? scheduler_gc_foreground_passes.load(std::memory_order_relaxed) : 0,
             .load_balance_pushes = rq->load_balance_pushes.load(std::memory_order_relaxed),
         };
     });

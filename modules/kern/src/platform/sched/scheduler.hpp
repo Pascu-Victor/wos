@@ -204,6 +204,15 @@ struct SchedulerTraceStats {
     uint64_t gc_misc_us_max;
     uint64_t gc_debug_us_total;
     uint64_t gc_debug_us_max;
+    uint64_t gc_deferred_queued;
+    uint64_t gc_deferred_completed;
+    uint64_t gc_deferred_depth;
+    uint64_t gc_deferred_depth_max;
+    uint64_t gc_deferred_slices;
+    uint64_t gc_deferred_slices_completed;
+    uint64_t gc_deferred_oldest_wait_us_max;
+    uint64_t gc_idle_boost_passes;
+    uint64_t gc_foreground_passes;
     uint64_t load_balance_pushes;
 };
 

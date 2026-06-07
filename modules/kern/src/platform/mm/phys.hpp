@@ -62,6 +62,24 @@ struct PageRefBatchStats {
     uint64_t pages_freed;
 };
 
+struct PageRefStatsSnapshot {
+    uint64_t inc_ops;
+    uint64_t inc_cas_retries;
+    uint64_t add_ops;
+    uint64_t add_refs;
+    uint64_t add_cas_retries;
+    uint64_t dec_ops;
+    uint64_t dec_cas_retries;
+    uint64_t dec_zero_candidates;
+    uint64_t dec_zero_pages_freed;
+    uint64_t dec_zero_validation_failed;
+    uint64_t batch_calls;
+    uint64_t batch_pages;
+    uint64_t batch_zero_candidates;
+    uint64_t batch_free_runs;
+    uint64_t batch_pages_freed;
+};
+
 struct PageLookupHint {
     PageAllocator* allocator = nullptr;
 };
@@ -71,6 +89,7 @@ void set_kernel_cr3(uint64_t cr3);    // Call after initPagemap to set kernel CR
 void init_huge_page_zone_deferred();  // Call after initPagemap to initialize huge page zone
 void enable_per_cpu_allocations();    // Call after cpuParamInit to enable per-CPU page caches
 auto page_alloc(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = "anonymous") -> void*;
+auto page_alloc_full_overwrite_page(std::string_view name = "full_overwrite") -> void*;
 auto page_alloc_huge(uint64_t size) -> void*;  // Try the optional huge page zone, if enabled.
 void page_free(void* page);
 auto page_split_to_order0(void* page) -> bool;
@@ -92,6 +111,7 @@ uint32_t page_ref_dec(void* page);
 uint32_t page_ref_dec(void* page, PageLookupHint* hint);
 auto page_ref_dec_batch(std::span<void* const> pages) -> PageRefBatchStats;
 auto page_ref_dec_batch(std::span<void* const> pages, PageLookupHint* hint) -> PageRefBatchStats;
+void get_page_ref_stats_snapshot(PageRefStatsSnapshot& out);
 // Get current refcount for a physical page. Returns 0 for unknown/free pages.
 uint32_t page_ref_get(void* page);
 uint32_t page_ref_get(void* page, PageLookupHint* hint);

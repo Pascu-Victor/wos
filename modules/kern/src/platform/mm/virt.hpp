@@ -63,6 +63,10 @@ struct DestroyUserSpaceStats {
     uint64_t skipped_kmalloc_large_alloc_frames;
     uint64_t skipped_page_table_aliases;
     uint64_t skipped_corrupt_entries;
+    uint64_t magic_unknown_probe_reads;
+    uint64_t magic_unknown_slab_hits;
+    uint64_t magic_unknown_medium_hits;
+    uint64_t magic_unknown_kmalloc_large_hits;
 };
 
 struct DestroyUserSpaceBudgetState;

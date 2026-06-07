@@ -5,7 +5,8 @@ set(CMAKE_CXX_COMPILER_WORKS ON)
 
 # Set paths to host tools and target sysroot
 set(HOST_PATH ${CMAKE_SOURCE_DIR}/toolchain/host)
-set(SYSROOT_PATH ${CMAKE_SOURCE_DIR}/toolchain/sysroot)
+set(WOS_SYSROOT_PATH "${CMAKE_SOURCE_DIR}/toolchain/sysroot" CACHE PATH "WOS target sysroot")
+set(SYSROOT_PATH ${WOS_SYSROOT_PATH})
 set(CMAKE_C_COMPILER "${HOST_PATH}/bin/clang" CACHE INTERNAL "Path to clang")
 set(CMAKE_CXX_COMPILER "${HOST_PATH}/bin/clang++" CACHE INTERNAL "Path to clang++")
 set(CMAKE_LINKER_TYPE "LLD")

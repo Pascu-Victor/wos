@@ -42,6 +42,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from itertools import combinations
 
+import node_setup
+
 # ---------------------------------------------------------------------------
 # Config loading and resolution
 # ---------------------------------------------------------------------------
@@ -896,9 +898,19 @@ def teardown(config: dict):
 
         print()
 
-    # Remove overlay directory
-    overlay_dir = "cluster-overlays"
-    if os.path.isdir(overlay_dir):
+    # Remove overlay directories derived from this config's VM specs.
+    overlay_dirs = set()
+    for zone_cfg in zones:
+        num_nodes = zone_cfg.get("nodes", 2)
+        for node_id in range(num_nodes):
+            node_override = get_node_config(zone_cfg, node_id)
+            effective = resolve_config(global_cfg, zone_cfg, node_override)
+            vm_cfg = effective.get("vm", {})
+            overlay_dirs.add(vm_cfg.get("overlay_dir", "cluster-overlays"))
+
+    for overlay_dir in sorted(overlay_dirs):
+        if not os.path.isdir(overlay_dir):
+            continue
         import shutil
 
         shutil.rmtree(overlay_dir)
@@ -1740,13 +1752,57 @@ def sync_live_rootfs(config: dict, filter_arg: str | None, include_live_access: 
     return True
 
 
-# TCG log-level presets (only useful with software emulation, no-ops under KVM)
-TCG_LOG_LEVELS = {
-    "": "cpu_reset,int,tid,in_asm,nochain,guest_errors,page",
-    "int": "cpu_reset,int,tid,pcall,in_asm,nochain,guest_errors,page",
-    "full": "cpu_reset,int,tid,exec,cpu,fpu,pcall,in_asm,nochain,guest_errors,page,mmu",
-    "none": "",
-}
+def cluster_node_spec(node_id: int, node_info: dict, config: dict) -> dict:
+    """Convert cluster zone membership into the shared single-node spec."""
+    eff = node_info["effective"]
+    global_cfg = find_global(config["zones"])
+    spec = {
+        "id": node_id,
+        "hostname": eff.get("hostname", f"wos-{node_id}"),
+        "debug": bool(eff.get("debug", False)),
+        "vm": deepcopy(eff.get("vm", {})),
+        "nics": [],
+        "ivshmem": [],
+    }
+
+    for zone_cfg in node_info["zones"]:
+        zone_id = zone_cfg["id"]
+        node_override = get_node_config(zone_cfg, node_id)
+        zone_eff = resolve_config(global_cfg, zone_cfg, node_override)
+        spec["nics"].append(
+            {
+                "name": zone_name(zone_cfg),
+                "zone_id": zone_id,
+                "tap": tap_name(zone_cfg, node_id),
+                "mac": mac_addr(zone_id, node_id, 0),
+                "model": zone_eff.get("nic_model", "virtio-net-pci"),
+                "queues": zone_eff.get("nic_queues", 1),
+                "vhost": bool(zone_eff.get("vhost", False)),
+                "driver": zone_eff.get("netdev_driver", "unmanaged"),
+            }
+        )
+
+    # Add ivshmem devices - one per ivshmem link involving this node.
+    # Pre-created /dev/shm files avoid BAR placement issues with hugepages
+    # on hosts with above-4G decoding enabled.
+    for zone_cfg in node_info["zones"]:
+        zone_eff = resolve_config(global_cfg, zone_cfg)
+        num_nodes = zone_cfg.get("nodes", 2)
+        links = ivshmem_links(zone_cfg, num_nodes)
+        ivshmem_cfg = zone_eff.get("ivshmem", {})
+        root_path = ivshmem_cfg.get("root_path", "/dev/shm")
+        size_str = ivshmem_cfg.get("size", "16M")
+
+        for node_a, node_b in links:
+            if node_a == node_id or node_b == node_id:
+                spec["ivshmem"].append(
+                    {
+                        "path": ivshmem_file(root_path, zone_cfg, node_a, node_b),
+                        "size": size_str,
+                    }
+                )
+
+    return node_setup.normalize_node_spec(spec)
 
 
 def build_qemu_args(
@@ -1757,207 +1813,15 @@ def build_qemu_args(
     debug_nodes: set[int] | None = None,
     log=print,
 ) -> list:
-    """Build QEMU command line for a single node.
-
-    tcg_level: None = KVM (default), "" = basic TCG, "int" = TCG+interrupts, "full" = TCG+cpu state
-    """
-    eff = node_info["effective"]
-    vm_cfg = eff.get("vm", {})
-    global_cfg = find_global(config["zones"])
-
-    memory = vm_cfg.get("memory", "4G")
-    cpus = vm_cfg.get("cpus", 2)
-    disk0 = vm_cfg.get("disk0", "disk.qcow2")
-    disk1 = vm_cfg.get("disk1", "mountfs.qcow2")
-    is_debug = eff.get("debug", False) or (
-        debug_nodes is not None and node_id in debug_nodes
+    """Build QEMU command line for a single cluster node."""
+    spec = cluster_node_spec(node_id, node_info, config)
+    force_debug = debug_nodes is not None and node_id in debug_nodes
+    return node_setup.build_qemu_args(
+        spec,
+        tcg_level=tcg_level,
+        force_debug=force_debug,
+        log=log,
     )
-
-    # Create overlay disks
-    overlay_dir = "cluster-overlays"
-    os.makedirs(overlay_dir, exist_ok=True)
-
-    overlay0 = os.path.join(overlay_dir, f"disk-vm{node_id}.qcow2")
-    overlay1 = os.path.join(overlay_dir, f"mountfs-vm{node_id}.qcow2")
-
-    # Remove old overlays for clean state (may be root-owned from previous sudo run)
-    for f in [overlay0, overlay1]:
-        if os.path.exists(f):
-            try:
-                os.remove(f)
-            except PermissionError:
-                run(f"rm -f {f}", quiet=True, privileged=True)
-
-    abs_disk0 = os.path.abspath(disk0)
-    abs_disk1 = os.path.abspath(disk1)
-
-    result = subprocess.run(
-        f"qemu-img create -f qcow2 -b {abs_disk0} -F qcow2 {overlay0}",
-        shell=True,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        log(f"  ERROR creating overlay {overlay0}: {result.stderr.strip()}")
-
-    result = subprocess.run(
-        f"qemu-img create -f qcow2 -b {abs_disk1} -F qcow2 {overlay1}",
-        shell=True,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        log(f"  ERROR creating overlay {overlay1}: {result.stderr.strip()}")
-
-    serial_log = f"serial-vm{node_id}.log"
-    qemu_log = f"qemu-vm{node_id}.log"
-
-    # Remove old logs
-    for pattern in (
-        f"qemu-vm{node_id}.log",
-        f"qemu-vm{node_id}.*log",
-        f"qemu-vm{node_id}-cpu*.log",
-    ):
-        for f in Path(".").glob(pattern):
-            f.unlink()
-    if os.path.exists(serial_log):
-        os.remove(serial_log)
-
-    # Acceleration: KVM (default) or TCG (software emulation for full tracing)
-    if tcg_level is not None:
-        accel_args = ["-accel", "tcg,thread=multi", "-cpu", "max"]
-        log_flags = TCG_LOG_LEVELS.get(tcg_level, TCG_LOG_LEVELS[""])
-        qemu_log = f"qemu-vm{node_id}-cpu%d.log"
-        log(
-            f"  [VM{node_id}] Using TCG (software emulation) — level: {tcg_level or 'default'}"
-        )
-    else:
-        accel_args = ["-cpu", "host,migratable=no,+invtsc", "--enable-kvm"]
-        # Under KVM only trace events and guest_errors produce output;
-        # in_asm/nochain/page/exec/cpu are TCG-only and silently ignored.
-        log_flags = "cpu_reset,guest_errors"
-
-    args = [
-        "qemu-system-x86_64",
-        "-M",
-        "q35",
-        *accel_args,
-        "-m",
-        memory,
-        "-smp",
-        str(cpus),
-        "-drive",
-        f"file={overlay0},if=none,id=drive0,format=qcow2,cache=unsafe",
-        "-device",
-        "ahci,id=ahci",
-        "-device",
-        "ide-hd,drive=drive0,bus=ahci.0",
-        "-drive",
-        f"file={overlay1},if=none,id=drive1,format=qcow2,cache=unsafe",
-        "-device",
-        "ide-hd,drive=drive1,bus=ahci.1",
-        "-chardev",
-        f"file,id=char0,path={serial_log}",
-        "-serial",
-        "chardev:char0",
-        "-display",
-        "none",
-        "-bios",
-        "/usr/share/OVMF/x64/OVMF.4m.fd",
-        *(["-d", log_flags] if log_flags else []),
-        "-D",
-        qemu_log,
-        "-no-reboot",
-    ]
-
-    # Add NICs - one per zone this node participates in
-    nic_idx = 0
-    for zone_cfg in node_info["zones"]:
-        zone_id = zone_cfg["id"]
-        node_override = get_node_config(zone_cfg, node_id)
-        zone_eff = resolve_config(global_cfg, zone_cfg, node_override)
-        nic_model = zone_eff.get("nic_model", "virtio-net-pci")
-        tap = tap_name(zone_cfg, node_id)
-        mac = mac_addr(zone_id, node_id, 0)
-        num_queues = zone_eff.get("nic_queues", 1)
-        use_vhost = bool(zone_eff.get("vhost", False))
-        netdev_options = [f"tap,id=net{nic_idx}", f"ifname={tap}", "script=no", "downscript=no"]
-        if use_vhost:
-            netdev_options.append("vhost=on")
-        else:
-            # Firmware DHCP uses raw Ethernet packets and cannot participate in
-            # the host-side virtio-net header contract.
-            netdev_options.append("vnet_hdr=off")
-        if num_queues > 1:
-            netdev_options.append(f"queues={num_queues}")
-        device_options = [f"{nic_model},netdev=net{nic_idx}", f"mac={mac}"]
-        if nic_model.startswith("virtio-net"):
-            device_options.append("mrg_rxbuf=on")
-            if num_queues > 1:
-                device_options.extend(["mq=on", f"vectors={2 * num_queues + 2}"])
-
-        args.extend(
-            [
-                "-netdev",
-                ",".join(netdev_options),
-                "-device",
-                ",".join(device_options),
-            ]
-        )
-        nic_idx += 1
-
-    # Add ivshmem devices - one per ivshmem link involving this node.
-    # Pre-created /dev/shm files avoid BAR placement issues with hugepages
-    # on hosts with above-4G decoding enabled.
-    ivshmem_idx = 0
-    for zone_cfg in node_info["zones"]:
-        zone_eff = resolve_config(global_cfg, zone_cfg)
-        num_nodes = zone_cfg.get("nodes", 2)
-        links = ivshmem_links(zone_cfg, num_nodes)
-
-        ivshmem_cfg = zone_eff.get("ivshmem", {})
-        root_path = ivshmem_cfg.get("root_path", "/dev/shm")
-        size_str = ivshmem_cfg.get("size", "16M")
-
-        for node_a, node_b in links:
-            if node_a == node_id or node_b == node_id:
-                fpath = ivshmem_file(root_path, zone_cfg, node_a, node_b)
-                args.extend(
-                    [
-                        "-object",
-                        f"memory-backend-file,size={size_str},share=on,mem-path={fpath},id=hmem{ivshmem_idx}",
-                        "-device",
-                        f"ivshmem-plain,memdev=hmem{ivshmem_idx}",
-                    ]
-                )
-                ivshmem_idx += 1
-
-    # Per-node hostname via QEMU fw_cfg (read by kernel before VFS is up)
-    node_hostname = f"wos-{node_id}"
-    args.extend(["-fw_cfg", f"name=opt/wos/hostname,string={node_hostname}"])
-
-    # Debug mode
-    if is_debug:
-        gdb_port = 1234 + node_id
-        debugcon_port = 23456 + node_id
-        monitor_port = 3002 + node_id
-
-        args.extend(["-gdb", f"tcp:127.0.0.1:{gdb_port}", "-S"])
-        args.extend(
-            [
-                "-chardev",
-                f"socket,id=debugger,port={debugcon_port},host=0.0.0.0,server=on,wait=off,telnet=on",
-                "-device",
-                "isa-debugcon,iobase=0x402,chardev=debugger",
-            ]
-        )
-        args.extend(["-monitor", f"tcp:0.0.0.0:{monitor_port},server,nowait"])
-
-        log(
-            f"  [VM{node_id}] DEBUG: gdb=127.0.0.1:{gdb_port} debugcon={debugcon_port} monitor={monitor_port}"
-        )
-
-    return args
 
 
 @dataclass
@@ -1990,6 +1854,7 @@ def launch_one_vm(
     lines = []
 
     try:
+        node_spec = cluster_node_spec(node_id, node_info, config)
         args = build_qemu_args(
             node_id,
             node_info,
@@ -2000,7 +1865,7 @@ def launch_one_vm(
         )
 
         zone_names = [zone_name(z) for z in node_info["zones"]]
-        is_debug = node_info["effective"].get("debug", False) or (
+        is_debug = node_setup.node_debug_enabled(node_spec) or (
             debug_nodes is not None and node_id in debug_nodes
         )
 
@@ -2008,29 +1873,18 @@ def launch_one_vm(
         lines.append(f"    cmd: {' '.join(args)}")
 
         # Inject per-node files into the mountfs overlay.
-        mountfs_overlay = os.path.join(
-            "cluster-overlays", f"mountfs-vm{node_id}.qcow2"
-        )
+        _, mountfs_overlay = node_setup.overlay_paths(node_spec)
         dropbear_key = os.path.join(
             SSH_KEYS_DIR, f"vm{node_id}", "dropbear_rsa_host_key"
         )
-        node_hostname = f"wos-{node_id}"
+        node_hostname = node_setup.node_hostname(node_spec)
         key_path = dropbear_key if os.path.exists(dropbear_key) else None
 
-        # Build /etc/netdevs from zone order, matching NIC enumeration.
-        global_cfg = find_global(config["zones"])
-        netdevs_lines = [
-            "# /etc/netdevs - generated by cluster_setup.py",
-            "# Format: <ifname> <driver>",
-            "# Drivers: wki, dhcp, linklocal, unmanaged",
-            "",
-        ]
-        for nic_idx, zone_cfg in enumerate(node_info["zones"]):
-            node_override = get_node_config(zone_cfg, node_id)
-            zone_eff = resolve_config(global_cfg, zone_cfg, node_override)
-            driver = zone_eff.get("netdev_driver", "unmanaged")
-            netdevs_lines.append(f"eth{nic_idx} {driver}")
-        netdevs_content = "\n".join(netdevs_lines) + "\n"
+        # Build /etc/netdevs from shared node spec NIC order, matching QEMU.
+        netdevs_content = node_setup.netdevs_content(
+            node_spec,
+            generated_by="cluster_setup.py",
+        )
 
         if os.path.exists(mountfs_overlay):
             if inject_into_overlay(
