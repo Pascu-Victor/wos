@@ -113,6 +113,7 @@ auto destroy_stats_delta(const virt::DestroyUserSpaceStats& before, const virt::
         .data_leaf_entries_visited = after.data_leaf_entries_visited - before.data_leaf_entries_visited,
         .data_pages_ref_decremented = after.data_pages_ref_decremented - before.data_pages_ref_decremented,
         .data_pages_freed = after.data_pages_freed - before.data_pages_freed,
+        .page_table_pages_ref_decremented = after.page_table_pages_ref_decremented - before.page_table_pages_ref_decremented,
         .page_table_pages_freed = after.page_table_pages_freed - before.page_table_pages_freed,
         .skipped_huge_pages = after.skipped_huge_pages - before.skipped_huge_pages,
         .skipped_unknown_frames = after.skipped_unknown_frames - before.skipped_unknown_frames,
@@ -121,6 +122,10 @@ auto destroy_stats_delta(const virt::DestroyUserSpaceStats& before, const virt::
         .skipped_kmalloc_large_alloc_frames = after.skipped_kmalloc_large_alloc_frames - before.skipped_kmalloc_large_alloc_frames,
         .skipped_page_table_aliases = after.skipped_page_table_aliases - before.skipped_page_table_aliases,
         .skipped_corrupt_entries = after.skipped_corrupt_entries - before.skipped_corrupt_entries,
+        .magic_unknown_probe_reads = after.magic_unknown_probe_reads - before.magic_unknown_probe_reads,
+        .magic_unknown_slab_hits = after.magic_unknown_slab_hits - before.magic_unknown_slab_hits,
+        .magic_unknown_medium_hits = after.magic_unknown_medium_hits - before.magic_unknown_medium_hits,
+        .magic_unknown_kmalloc_large_hits = after.magic_unknown_kmalloc_large_hits - before.magic_unknown_kmalloc_large_hits,
     };
 }
 
@@ -540,6 +545,66 @@ KTEST(MM, DestroyUserSpaceSkipsProtectedLeafFrames) {
     cleanup_test_user_tree(tree);
     free_live_page(medium_page);
     free_live_page(large_page);
+    free_live_page(unknown_page);
+}
+
+KTEST(MM, DestroyUserSpaceUnknownMagicProbeIsDiagnosticOnly) {
+    constexpr uint64_t MEDIUM_ALLOC_MAGIC = 0xCAFEBABE87654321ULL;
+
+    TestUserTree tree{};
+    KREQUIRE_TRUE(init_test_user_tree(tree));
+
+    void* unknown_page = phys::page_alloc();
+    if (!KEXPECT_NE(unknown_page, nullptr)) {
+        cleanup_test_user_tree(tree);
+        return;
+    }
+
+    auto* words = static_cast<uint64_t*>(unknown_page);
+    words[2] = MEDIUM_ALLOC_MAGIC;
+    if (!KEXPECT_TRUE(phys::page_mark_kind(unknown_page, mm::PageKind::UNKNOWN))) {
+        words[2] = 0;
+        free_live_page(unknown_page);
+        cleanup_test_user_tree(tree);
+        return;
+    }
+
+    tree.pml1->entries.at(0) = entry_for_page(unknown_page);
+
+    virt::DestroyUserSpaceStats const DELTA = destroy_user_space_and_get_delta(tree.root);
+
+    KEXPECT_EQ(DELTA.calls, 1U);
+    KEXPECT_EQ(DELTA.data_leaf_entries_visited, 1U);
+    KEXPECT_EQ(DELTA.data_pages_ref_decremented, 0U);
+    KEXPECT_EQ(DELTA.data_pages_freed, 0U);
+    KEXPECT_EQ(DELTA.page_table_pages_freed, 3U);
+#ifdef WOS_MM_RECLAIM_MAGIC_PROBES
+    KEXPECT_EQ(DELTA.skipped_unknown_frames, 0U);
+    KEXPECT_EQ(DELTA.skipped_medium_alloc_frames, 1U);
+    KEXPECT_EQ(DELTA.magic_unknown_probe_reads, 1U);
+    KEXPECT_EQ(DELTA.magic_unknown_medium_hits, 1U);
+#else
+    KEXPECT_EQ(DELTA.skipped_unknown_frames, 1U);
+    KEXPECT_EQ(DELTA.skipped_medium_alloc_frames, 0U);
+    KEXPECT_EQ(DELTA.magic_unknown_probe_reads, 0U);
+    KEXPECT_EQ(DELTA.magic_unknown_medium_hits, 0U);
+#endif
+    KEXPECT_EQ(DELTA.skipped_slab_alloc_frames, 0U);
+    KEXPECT_EQ(DELTA.skipped_kmalloc_large_alloc_frames, 0U);
+    KEXPECT_EQ(DELTA.skipped_page_table_aliases, 0U);
+    KEXPECT_EQ(DELTA.skipped_corrupt_entries, 0U);
+
+    KEXPECT_EQ(phys::page_ref_get(unknown_page), 1U);
+    KEXPECT_EQ(phys::page_ref_get(tree.pml1), 0U);
+    KEXPECT_EQ(phys::page_ref_get(tree.pml2), 0U);
+    KEXPECT_EQ(phys::page_ref_get(tree.pml3), 0U);
+    KEXPECT_EQ(phys::page_ref_get(tree.root), 1U);
+    KEXPECT_EQ(tree.root->entries.at(0).present, 0U);
+
+    // This is synthetic magic in an UNKNOWN page, not a real medium allocation.
+    // Clear it before returning the page so direct page_free guards stay armed.
+    words[2] = 0;
+    cleanup_test_user_tree(tree);
     free_live_page(unknown_page);
 }
 

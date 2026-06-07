@@ -316,6 +316,7 @@ void note_destroy_kind_skip(DestroyUserSpaceCallStats* stats, PageKind kind) {
     }
 }
 
+#ifdef WOS_MM_RECLAIM_MAGIC_PROBES
 void note_destroy_magic_unknown_probe(DestroyUserSpaceCallStats* stats) {
     if (stats != nullptr) {
         stats->magic_unknown_probe_reads++;
@@ -346,6 +347,7 @@ void note_destroy_magic_unknown_hit(DestroyUserSpaceCallStats* stats, PageKind k
             break;
     }
 }
+#endif
 
 void note_destroy_user_space_stats(DestroyUserSpaceCallStats const& sample) {
     uint64_t cpu_no = 0;
@@ -1274,6 +1276,7 @@ auto phys_to_hhdm_checked(uint64_t phys_addr, FrameProbeCache* cache = nullptr) 
     return reinterpret_cast<void*>(VIRT_RAW);
 }
 
+#ifdef WOS_MM_RECLAIM_MAGIC_PROBES
 auto phys_to_hhdm_for_live_probe(uint64_t phys_addr, PageKind kind, FrameProbeCache* cache = nullptr) -> void* {
     const uint64_t PAGE_BASE = phys_addr & ~(paging::PAGE_SIZE - 1);
     if (!phys_is_in_ram(PAGE_BASE, cache)) {
@@ -1298,6 +1301,7 @@ auto phys_to_hhdm_for_live_probe(uint64_t phys_addr, PageKind kind, FrameProbeCa
     }
     return reinterpret_cast<void*>(VIRT_RAW);
 }
+#endif
 
 auto frame_page_kind(uint64_t phys_addr, FrameProbeCache* cache = nullptr) -> PageKind {
     uint64_t const PAGE_BASE = phys_addr & ~(paging::PAGE_SIZE - 1);
@@ -1392,10 +1396,6 @@ auto live_allocator_kind_to_page_kind(LiveAllocatorFrameKind kind) -> PageKind {
 
 auto classify_live_allocator_frame(uint64_t phys_addr, PageKind kind, DestroyUserSpaceCallStats* stats, FrameProbeCache* cache = nullptr)
     -> LiveAllocatorFrameKind {
-    constexpr uint64_t MEDIUM_ALLOC_MAGIC = 0xCAFEBABE87654321ULL;
-    constexpr uint32_t SLAB_MAGIC = 0x8CBEEFC8;
-    constexpr uint64_t LARGE_ALLOC_MAGIC = 0xDEADBEEF12345678ULL;
-
     if (kind == PageKind::MEDIUM) {
         return LiveAllocatorFrameKind::MEDIUM;
     }
@@ -1408,6 +1408,16 @@ auto classify_live_allocator_frame(uint64_t phys_addr, PageKind kind, DestroyUse
     if (kind != PageKind::UNKNOWN) {
         return LiveAllocatorFrameKind::NONE;
     }
+
+#ifndef WOS_MM_RECLAIM_MAGIC_PROBES
+    (void)phys_addr;
+    (void)stats;
+    (void)cache;
+    return LiveAllocatorFrameKind::NONE;
+#else
+    constexpr uint64_t MEDIUM_ALLOC_MAGIC = 0xCAFEBABE87654321ULL;
+    constexpr uint32_t SLAB_MAGIC = 0x8CBEEFC8;
+    constexpr uint64_t LARGE_ALLOC_MAGIC = 0xDEADBEEF12345678ULL;
 
     auto* page_ptr = phys_to_hhdm_for_live_probe(phys_addr, kind, cache);
     if (page_ptr == nullptr) {
@@ -1428,6 +1438,7 @@ auto classify_live_allocator_frame(uint64_t phys_addr, PageKind kind, DestroyUse
         note_destroy_magic_unknown_hit(stats, live_allocator_kind_to_page_kind(fallback));
     }
     return fallback;
+#endif
 }
 
 struct PageTableFrameSet {

@@ -19,6 +19,7 @@ option(WOS_PHYS_ALLOC_CALLER_STATS "Track physical page allocation call sites fo
 option(WOS_PHYS_LOCK_DEBUG         "Track physical allocator memlock holder CR3/CPU/RIP"                OFF)
 option(WOS_KMALLOC_DEBUG_INFO      "Track kmalloc allocation call sites/tags for OOM/corruption dumps"  OFF)
 option(WOS_MEMACC_FULL_DEFAULT     "Compile and default-enable full memacc allocation provenance"       OFF)
+option(WOS_MM_RECLAIM_MAGIC_PROBES "Probe UNKNOWN reclaim frames for allocator magic in diagnostic builds" OFF)
 option(WOS_MM_PROVENANCE_PERF_CONTROL "Disable expensive MM provenance diagnostics for control builds"  ON)
 
 if(WOS_MM_PROVENANCE_PERF_CONTROL)
@@ -26,6 +27,7 @@ if(WOS_MM_PROVENANCE_PERF_CONTROL)
     set(WOS_PHYS_ALLOC_CALLER_STATS OFF CACHE BOOL "Track physical page allocation call sites for OOM reports" FORCE)
     set(WOS_PHYS_LOCK_DEBUG OFF CACHE BOOL "Track physical allocator memlock holder CR3/CPU/RIP" FORCE)
     set(WOS_KMALLOC_DEBUG_INFO OFF CACHE BOOL "Track kmalloc allocation call sites/tags for OOM/corruption dumps" FORCE)
+    set(WOS_MM_RECLAIM_MAGIC_PROBES OFF CACHE BOOL "Probe UNKNOWN reclaim frames for allocator magic in diagnostic builds" FORCE)
 endif()
 
 if(WOS_MEMACC_FULL_DEFAULT)
@@ -217,6 +219,11 @@ endif()
 if(WOS_KMALLOC_DEBUG_INFO)
     target_compile_definitions(${KERNEL} PRIVATE WOS_KMALLOC_DEBUG_INFO=1)
     message(STATUS "[WOS] kmalloc allocation provenance debug enabled")
+endif()
+
+if(WOS_MM_RECLAIM_MAGIC_PROBES)
+    target_compile_definitions(${KERNEL} PRIVATE WOS_MM_RECLAIM_MAGIC_PROBES=1)
+    message(STATUS "[WOS] MM UNKNOWN-frame reclaim magic probes enabled")
 endif()
 
 # Target-scoped includes for kernel only (do NOT include userspace stdlib src here)
