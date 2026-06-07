@@ -1089,23 +1089,42 @@ namespace {
 constexpr int CANONICAL_SIGN_BIT = 47;
 constexpr uint64_t CANONICAL_KERNEL_UPPER = 0x1ffffULL;
 
-auto phys_is_in_ram(uint64_t phys_addr) -> bool {
+struct FrameProbeCache {
+    phys::PageLookupHint lookup;
+};
+
+auto cached_allocator_contains_phys(FrameProbeCache* cache, uint64_t phys_addr) -> bool {
+    if (cache == nullptr || cache->lookup.allocator == nullptr) {
+        return false;
+    }
+
+    auto* const ALLOC = cache->lookup.allocator;
+    auto const ALLOC_START_PHYS = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(ALLOC->base)));
+    uint64_t const ALLOC_BYTES = static_cast<uint64_t>(ALLOC->total_pages) * paging::PAGE_SIZE;
+    uint64_t const ALLOC_END_PHYS = ALLOC_START_PHYS + ALLOC_BYTES;
+    return ALLOC_END_PHYS >= ALLOC_START_PHYS && phys_addr >= ALLOC_START_PHYS && phys_addr < ALLOC_END_PHYS;
+}
+
+auto phys_is_in_ram(uint64_t phys_addr, FrameProbeCache* cache = nullptr) -> bool {
+    if (cached_allocator_contains_phys(cache, phys_addr)) {
+        return true;
+    }
+
     for (auto* zone = phys::get_zones(); zone != nullptr; zone = zone->next) {
         auto zone_start_phys = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(zone->start)));
         if (phys_addr >= zone_start_phys && phys_addr < zone_start_phys + zone->len) {
+            if (cache != nullptr && zone->allocator != nullptr) {
+                cache->lookup.allocator = zone->allocator;
+            }
             return true;
         }
     }
     return false;
 }
 
-struct FrameProbeCache {
-    phys::PageLookupHint lookup;
-};
-
 auto phys_to_hhdm_checked(uint64_t phys_addr, FrameProbeCache* cache = nullptr) -> void* {
     const uint64_t PAGE_BASE = phys_addr & ~(paging::PAGE_SIZE - 1);
-    if (!phys_is_in_ram(PAGE_BASE)) {
+    if (!phys_is_in_ram(PAGE_BASE, cache)) {
         return nullptr;
     }
 
@@ -1123,7 +1142,7 @@ auto phys_to_hhdm_checked(uint64_t phys_addr, FrameProbeCache* cache = nullptr) 
 
 auto phys_to_hhdm_for_live_probe(uint64_t phys_addr, PageKind kind, FrameProbeCache* cache = nullptr) -> void* {
     const uint64_t PAGE_BASE = phys_addr & ~(paging::PAGE_SIZE - 1);
-    if (!phys_is_in_ram(PAGE_BASE)) {
+    if (!phys_is_in_ram(PAGE_BASE, cache)) {
         return nullptr;
     }
 
@@ -1154,7 +1173,7 @@ auto phys_to_hhdm_for_live_probe(uint64_t phys_addr, PageKind kind, FrameProbeCa
 
 auto frame_page_kind(uint64_t phys_addr, FrameProbeCache* cache = nullptr) -> PageKind {
     uint64_t const PAGE_BASE = phys_addr & ~(paging::PAGE_SIZE - 1);
-    if (!phys_is_in_ram(PAGE_BASE)) {
+    if (!phys_is_in_ram(PAGE_BASE, cache)) {
         return PageKind::UNKNOWN;
     }
 
