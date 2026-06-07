@@ -28,6 +28,7 @@
 #include <print>
 #include <span>
 
+#include "cowbench.hpp"
 #include "fsbench.hpp"
 #include "mandelbench/config.hpp"
 #include "mandelbench/mandelbench_wki.hpp"
@@ -487,6 +488,10 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     if (command != nullptr && (std::strcmp(command, "netbench-server") == 0 || std::strcmp(command, "netbench-client") == 0)) {
         return run_netbench(argc - 1, argv + 1);
+    }
+
+    if (command != nullptr && (std::strcmp(command, "fork-cow") == 0 || std::strcmp(command, "cow") == 0)) {
+        return run_cowbench(argc - 2, argv + 2);
     }
 
     if (command != nullptr && std::strcmp(command, "wki-target") == 0) {

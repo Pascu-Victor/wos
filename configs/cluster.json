@@ -16,8 +16,8 @@
                 "ip": null
             },
             "vm": {
-                "memory": "32G",
-                "cpus": 32,
+                "memory": "8G",
+                "cpus": 8,
                 "disk0": "disk.qcow2",
                 "disk1": "mountfs.qcow2"
             }
@@ -25,19 +25,23 @@
         {
             "id": 0,
             "name": "lan",
-            "nodes": 1,
+            "nodes": 4,
             "nic_model": "virtio-net-pci",
             "nic_queues": 2,
+            "vhost": false,
             "netdev_driver": "dhcp",
             "bridge": {
-                "ip": "10.10.0.100/16"
+                "ip": "10.10.0.100/24",
+                "dns": "10.10.0.1"
             }
         },
         {
             "id": 1,
             "name": "wki",
-            "nodes": 1,
+            "nodes": 4,
             "nic_model": "virtio-net-pci",
+            "nic_queues": 8,
+            "vhost": true,
             "netdev_driver": "wki",
             "ivshmem": {
                 "enabled": false,

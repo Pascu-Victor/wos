@@ -22,10 +22,12 @@ import argparse
 import base64
 import concurrent.futures
 import hashlib
+import ipaddress
 import json
 import os
 import pwd
 import queue
+import shlex
 import shutil
 import signal
 import stat
@@ -262,6 +264,142 @@ def tap_has_multiqueue(name: str) -> bool:
             text=True,
         )
     return result.returncode == 0 and "multi_queue" in result.stdout
+
+
+def bridge_ip_interface(ip_cfg):
+    if not isinstance(ip_cfg, str):
+        raise ValueError("bridge.ip must be a CIDR address string")
+    stripped = ip_cfg.strip()
+    if not stripped or "/" not in stripped:
+        raise ValueError("bridge.ip must be an IP address string with a prefix length")
+    try:
+        return ipaddress.ip_interface(stripped)
+    except ValueError as exc:
+        raise ValueError(
+            f"bridge.ip must be a CIDR address, got {ip_cfg!r}"
+        ) from exc
+
+
+def bridge_addr_info(bridge: str) -> list[dict]:
+    result = subprocess.run(
+        ["ip", "-j", "addr", "show", "dev", bridge],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"  WARNING: failed to read addresses for bridge {bridge}")
+        return []
+
+    try:
+        links = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print(f"  WARNING: failed to parse addresses for bridge {bridge}")
+        return []
+
+    if not links:
+        return []
+    return links[0].get("addr_info", [])
+
+
+def configure_bridge_ip(bridge: str, ip_cfg):
+    desired = bridge_ip_interface(ip_cfg)
+    desired_local = str(desired.ip)
+    desired_cidr = str(desired)
+    desired_family = "inet6" if desired.version == 6 else "inet"
+    current_cidrs = []
+
+    for info in bridge_addr_info(bridge):
+        if info.get("family") != desired_family:
+            continue
+        local = info.get("local")
+        prefixlen = info.get("prefixlen")
+        if local is None or prefixlen is None:
+            continue
+        current_cidr = f"{local}/{prefixlen}"
+        if local == desired_local:
+            current_cidrs.append(current_cidr)
+
+    for current_cidr in current_cidrs:
+        if current_cidr == desired_cidr:
+            continue
+        run(
+            f"ip addr del {shlex.quote(current_cidr)} dev {shlex.quote(bridge)}",
+            check=False,
+            privileged=True,
+        )
+        print(f"  Removed stale bridge IP: {current_cidr}")
+
+    if desired_cidr not in current_cidrs:
+        run(
+            f"ip addr add {shlex.quote(desired_cidr)} dev {shlex.quote(bridge)}",
+            check=False,
+            privileged=True,
+        )
+    print(f"  Bridge IP: {desired_cidr}")
+
+
+def bridge_dns_servers(dns_cfg) -> list[str]:
+    if dns_cfg is None or dns_cfg == "":
+        return []
+
+    if isinstance(dns_cfg, str):
+        raw_servers = [dns_cfg]
+    elif isinstance(dns_cfg, list):
+        raw_servers = dns_cfg
+    else:
+        raise ValueError(
+            "bridge.dns must be an IP address string or a list of IP address strings"
+        )
+
+    servers = []
+    for raw in raw_servers:
+        if not isinstance(raw, str):
+            raise ValueError("bridge.dns entries must be IP address strings")
+        server = raw.strip()
+        if not server:
+            continue
+        try:
+            ipaddress.ip_address(server)
+        except ValueError as exc:
+            raise ValueError(
+                f"bridge.dns must be an IP address, got {server!r}"
+            ) from exc
+        servers.append(server)
+    return servers
+
+
+def configure_bridge_dns(bridge: str, dns_cfg):
+    """Apply host-only .wos DNS settings for a bridge via systemd-resolved."""
+    dns_servers = bridge_dns_servers(dns_cfg)
+    if not dns_servers:
+        return
+
+    if shutil.which("resolvectl") is None:
+        print(
+            f"  WARNING: bridge DNS configured for {bridge}, but resolvectl was not found"
+        )
+        return
+
+    bridge_arg = shlex.quote(bridge)
+    dns_args = " ".join(shlex.quote(server) for server in dns_servers)
+    ok = run(f"resolvectl dns {bridge_arg} {dns_args}", privileged=True)
+    ok = run(f"resolvectl domain {bridge_arg} '~wos'", privileged=True) and ok
+    ok = run(f"resolvectl default-route {bridge_arg} false", privileged=True) and ok
+    if ok:
+        print(f"  Bridge DNS: {', '.join(dns_servers)} (.wos only)")
+        return
+
+    print(f"  WARNING: failed to configure bridge DNS for {bridge}")
+
+
+def revert_bridge_dns(bridge: str):
+    if shutil.which("resolvectl") is not None:
+        run(
+            f"resolvectl revert {shlex.quote(bridge)}",
+            check=False,
+            quiet=True,
+            privileged=True,
+        )
 
 
 def reattach_libvirt_vms(bridge: str):
@@ -606,8 +744,11 @@ def setup(config: dict):
         # Assign IP to bridge if specified
         ip_addr = bridge_cfg.get("ip")
         if ip_addr:
-            run(f"ip addr add {ip_addr} dev {br}", check=False, privileged=True)
-            print(f"  Bridge IP: {ip_addr}")
+            configure_bridge_ip(br, ip_addr)
+
+        # Host-only .wos DNS for this bridge.  Guest resolver state still comes
+        # from DHCP/netd inside WOS; this only updates the host link in resolved.
+        configure_bridge_dns(br, bridge_cfg.get("dns"))
 
         # Create TAP devices
         real_user = os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
@@ -737,6 +878,7 @@ def teardown(config: dict):
         # Delete bridge
         br = bridge_name(zone_cfg)
         if link_exists(br):
+            revert_bridge_dns(br)
             run(f"ip link set {br} down", check=False, quiet=True, privileged=True)
             run(f"ip link delete {br} type bridge", check=False, privileged=True)
             print(f"  Deleted bridge: {br}")

@@ -57,7 +57,8 @@ void add_permissions(UserMemoryBreakdown& stats, const paging::PageTableEntry& e
     }
 }
 
-void add_present_leaf(UserMemoryBreakdown& stats, const paging::PageTableEntry& entry, uint64_t vaddr, uint64_t page_count) {
+void add_present_leaf(UserMemoryBreakdown& stats, const paging::PageTableEntry& entry, uint64_t vaddr, uint64_t page_count,
+                      phys::PageLookupHint* lookup) {
     if (entry.user == 0) {
         return;
     }
@@ -72,7 +73,7 @@ void add_present_leaf(UserMemoryBreakdown& stats, const paging::PageTableEntry& 
     if (!shared && entry.frame != 0) {
         uint64_t const PHYS = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
         auto* virt_page = reinterpret_cast<void*>(addr::get_virt_pointer(PHYS));
-        shared = phys::page_ref_get(virt_page) > 1;
+        shared = phys::page_ref_get(virt_page, lookup) > 1;
     }
     if (shared) {
         stats.shared_pages += page_count;
@@ -91,6 +92,7 @@ auto collect_user_memory_breakdown(paging::PageTable* page_table) -> UserMemoryB
         return stats;
     }
 
+    phys::PageLookupHint ref_lookup{};
     stats.page_table_pages = 1;
     for (size_t i4 = 0; i4 < USER_PML4_ENTRIES; ++i4) {
         const auto& pml4e = page_table->entries.at(i4);
@@ -107,7 +109,7 @@ auto collect_user_memory_breakdown(paging::PageTable* page_table) -> UserMemoryB
             }
             uint64_t const VADDR_1G = (static_cast<uint64_t>(i4) << PML4_SHIFT) | (static_cast<uint64_t>(i3) << PML3_SHIFT);
             if (pml3e.pagesize != 0) {
-                add_present_leaf(stats, pml3e, VADDR_1G, PAGES_PER_1G);
+                add_present_leaf(stats, pml3e, VADDR_1G, PAGES_PER_1G, &ref_lookup);
                 continue;
             }
 
@@ -120,7 +122,7 @@ auto collect_user_memory_breakdown(paging::PageTable* page_table) -> UserMemoryB
                 }
                 uint64_t const VADDR_2M = VADDR_1G | (static_cast<uint64_t>(i2) << PML2_SHIFT);
                 if (pml2e.pagesize != 0) {
-                    add_present_leaf(stats, pml2e, VADDR_2M, PAGES_PER_2M);
+                    add_present_leaf(stats, pml2e, VADDR_2M, PAGES_PER_2M, &ref_lookup);
                     continue;
                 }
 
@@ -130,7 +132,7 @@ auto collect_user_memory_breakdown(paging::PageTable* page_table) -> UserMemoryB
                     const auto& pte = pml1->entries.at(i1);
                     uint64_t const VADDR = VADDR_2M | (static_cast<uint64_t>(i1) << PML1_SHIFT);
                     if (pte.present != 0) {
-                        add_present_leaf(stats, pte, VADDR, 1);
+                        add_present_leaf(stats, pte, VADDR, 1, &ref_lookup);
                     } else if (is_reserved_leaf(pte)) {
                         stats.virtual_pages++;
                     }

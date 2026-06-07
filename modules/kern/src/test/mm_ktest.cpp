@@ -132,6 +132,25 @@ auto destroy_user_space_and_get_delta(paging::PageTable* root) -> virt::DestroyU
     return destroy_stats_delta(BEFORE, AFTER);
 }
 
+auto alloc_stats_snapshot() -> phys::AllocStatsSnapshot {
+    phys::AllocStatsSnapshot snapshot{};
+    phys::get_alloc_stats_snapshot(snapshot);
+    return snapshot;
+}
+
+auto increasing_delta(uint64_t before, uint64_t after) -> uint64_t { return after >= before ? after - before : ~0ULL; }
+
+auto decreasing_delta(uint64_t before, uint64_t after) -> uint64_t { return before >= after ? before - after : ~0ULL; }
+
+void expect_alloc_stats_coherent(const phys::AllocStatsSnapshot& snapshot) {
+    KEXPECT_TRUE(snapshot.total_allocated_pages >= snapshot.total_freed_pages);
+    KEXPECT_TRUE(snapshot.total_allocated_bytes >= snapshot.total_freed_bytes);
+    KEXPECT_EQ(snapshot.live_allocated_pages, snapshot.total_allocated_pages - snapshot.total_freed_pages);
+    KEXPECT_EQ(snapshot.live_allocated_bytes, snapshot.total_allocated_bytes - snapshot.total_freed_bytes);
+    KEXPECT_EQ(snapshot.current_free_pages, snapshot.free_mem_bytes / paging::PAGE_SIZE);
+    KEXPECT_EQ(snapshot.current_free_pages + snapshot.live_allocated_pages, snapshot.total_mem_bytes / paging::PAGE_SIZE);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -174,6 +193,47 @@ KTEST(MM, MultiplePageAllocFree) {
             phys::page_free(page);
         }
     }
+}
+
+KTEST(MM, AllocStatsScalarLargeFreeDrift) {
+    constexpr uint64_t REQUESTED_PAGES = 3;
+    constexpr uint64_t ACCOUNTED_PAGES = 4;
+    constexpr uint64_t ACCOUNTED_BYTES = ACCOUNTED_PAGES * paging::PAGE_SIZE;
+
+    phys::AllocStatsSnapshot const BEFORE = alloc_stats_snapshot();
+    expect_alloc_stats_coherent(BEFORE);
+
+    void* mem = phys::page_alloc(REQUESTED_PAGES * paging::PAGE_SIZE);
+    KREQUIRE_NE(mem, nullptr);
+
+    phys::AllocStatsSnapshot const AFTER_ALLOC = alloc_stats_snapshot();
+    expect_alloc_stats_coherent(AFTER_ALLOC);
+    KEXPECT_EQ(increasing_delta(BEFORE.total_allocated_pages, AFTER_ALLOC.total_allocated_pages), ACCOUNTED_PAGES);
+    KEXPECT_EQ(increasing_delta(BEFORE.total_allocated_bytes, AFTER_ALLOC.total_allocated_bytes), ACCOUNTED_BYTES);
+    KEXPECT_EQ(increasing_delta(BEFORE.alloc_count, AFTER_ALLOC.alloc_count), 1U);
+    KEXPECT_EQ(increasing_delta(BEFORE.total_freed_pages, AFTER_ALLOC.total_freed_pages), 0U);
+    KEXPECT_EQ(increasing_delta(BEFORE.free_count, AFTER_ALLOC.free_count), 0U);
+    KEXPECT_EQ(increasing_delta(BEFORE.live_allocated_pages, AFTER_ALLOC.live_allocated_pages), ACCOUNTED_PAGES);
+    KEXPECT_EQ(decreasing_delta(BEFORE.current_free_pages, AFTER_ALLOC.current_free_pages), ACCOUNTED_PAGES);
+
+    phys::page_free(mem);
+
+    phys::AllocStatsSnapshot const AFTER_FREE = alloc_stats_snapshot();
+    expect_alloc_stats_coherent(AFTER_FREE);
+    KEXPECT_EQ(increasing_delta(AFTER_ALLOC.total_allocated_pages, AFTER_FREE.total_allocated_pages), 0U);
+    KEXPECT_EQ(increasing_delta(AFTER_ALLOC.alloc_count, AFTER_FREE.alloc_count), 0U);
+    KEXPECT_EQ(increasing_delta(AFTER_ALLOC.total_freed_pages, AFTER_FREE.total_freed_pages), ACCOUNTED_PAGES);
+    KEXPECT_EQ(increasing_delta(AFTER_ALLOC.total_freed_bytes, AFTER_FREE.total_freed_bytes), ACCOUNTED_BYTES);
+    KEXPECT_EQ(increasing_delta(AFTER_ALLOC.free_count, AFTER_FREE.free_count), 1U);
+    KEXPECT_EQ(decreasing_delta(AFTER_ALLOC.live_allocated_pages, AFTER_FREE.live_allocated_pages), ACCOUNTED_PAGES);
+    KEXPECT_EQ(increasing_delta(AFTER_ALLOC.current_free_pages, AFTER_FREE.current_free_pages), ACCOUNTED_PAGES);
+
+    KEXPECT_EQ(increasing_delta(BEFORE.total_allocated_pages, AFTER_FREE.total_allocated_pages), ACCOUNTED_PAGES);
+    KEXPECT_EQ(increasing_delta(BEFORE.total_freed_pages, AFTER_FREE.total_freed_pages), ACCOUNTED_PAGES);
+    KEXPECT_EQ(increasing_delta(BEFORE.alloc_count, AFTER_FREE.alloc_count), 1U);
+    KEXPECT_EQ(increasing_delta(BEFORE.free_count, AFTER_FREE.free_count), 1U);
+    KEXPECT_EQ(AFTER_FREE.live_allocated_pages, BEFORE.live_allocated_pages);
+    KEXPECT_EQ(AFTER_FREE.current_free_pages, BEFORE.current_free_pages);
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +309,68 @@ KTEST(MM, RefCountBatchFinalFreeWithLookupHint) {
 
     for (void* page : pages) {
         KEXPECT_EQ(phys::page_ref_get(page, &hint), 0U);
+    }
+}
+
+KTEST(MM, AllocStatsBatchRefDecFreeDrift) {
+    constexpr size_t PAGE_COUNT = 4;
+    constexpr uint64_t ACCOUNTED_PAGES = static_cast<uint64_t>(PAGE_COUNT);
+    constexpr uint64_t ACCOUNTED_BYTES = ACCOUNTED_PAGES * paging::PAGE_SIZE;
+
+    phys::AllocStatsSnapshot const BEFORE = alloc_stats_snapshot();
+    expect_alloc_stats_coherent(BEFORE);
+
+    auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));
+    KREQUIRE_NE(base, nullptr);
+
+    phys::AllocStatsSnapshot const AFTER_ALLOC = alloc_stats_snapshot();
+    expect_alloc_stats_coherent(AFTER_ALLOC);
+    if (!KEXPECT_TRUE(phys::page_split_to_order0(base))) {
+        phys::page_free(base);
+        return;
+    }
+
+    std::array<void*, PAGE_COUNT> pages{};
+    for (size_t i = 0; i < PAGE_COUNT; ++i) {
+        pages.at(i) = base + (i * paging::PAGE_SIZE);
+        KEXPECT_EQ(phys::page_ref_get(pages.at(i)), 1U);
+    }
+
+    KEXPECT_EQ(increasing_delta(BEFORE.total_allocated_pages, AFTER_ALLOC.total_allocated_pages), ACCOUNTED_PAGES);
+    KEXPECT_EQ(increasing_delta(BEFORE.total_allocated_bytes, AFTER_ALLOC.total_allocated_bytes), ACCOUNTED_BYTES);
+    KEXPECT_EQ(increasing_delta(BEFORE.alloc_count, AFTER_ALLOC.alloc_count), 1U);
+    KEXPECT_EQ(increasing_delta(BEFORE.total_freed_pages, AFTER_ALLOC.total_freed_pages), 0U);
+    KEXPECT_EQ(increasing_delta(BEFORE.free_count, AFTER_ALLOC.free_count), 0U);
+    KEXPECT_EQ(increasing_delta(BEFORE.live_allocated_pages, AFTER_ALLOC.live_allocated_pages), ACCOUNTED_PAGES);
+    KEXPECT_EQ(decreasing_delta(BEFORE.current_free_pages, AFTER_ALLOC.current_free_pages), ACCOUNTED_PAGES);
+
+    phys::PageRefBatchStats const STATS = phys::page_ref_dec_batch(std::span<void* const>{pages.data(), pages.size()});
+
+    phys::AllocStatsSnapshot const AFTER_BATCH = alloc_stats_snapshot();
+    expect_alloc_stats_coherent(AFTER_BATCH);
+    KEXPECT_EQ(STATS.refs_decremented, ACCOUNTED_PAGES);
+    KEXPECT_EQ(STATS.pages_freed, ACCOUNTED_PAGES);
+    KEXPECT_EQ(increasing_delta(AFTER_ALLOC.total_allocated_pages, AFTER_BATCH.total_allocated_pages), 0U);
+    KEXPECT_EQ(increasing_delta(AFTER_ALLOC.alloc_count, AFTER_BATCH.alloc_count), 0U);
+    KEXPECT_EQ(increasing_delta(AFTER_ALLOC.total_freed_pages, AFTER_BATCH.total_freed_pages), ACCOUNTED_PAGES);
+    KEXPECT_EQ(increasing_delta(AFTER_ALLOC.total_freed_bytes, AFTER_BATCH.total_freed_bytes), ACCOUNTED_BYTES);
+    KEXPECT_EQ(increasing_delta(AFTER_ALLOC.free_count, AFTER_BATCH.free_count), ACCOUNTED_PAGES);
+    KEXPECT_EQ(decreasing_delta(AFTER_ALLOC.live_allocated_pages, AFTER_BATCH.live_allocated_pages), ACCOUNTED_PAGES);
+    KEXPECT_EQ(increasing_delta(AFTER_ALLOC.current_free_pages, AFTER_BATCH.current_free_pages), ACCOUNTED_PAGES);
+
+    KEXPECT_EQ(increasing_delta(BEFORE.total_allocated_pages, AFTER_BATCH.total_allocated_pages), ACCOUNTED_PAGES);
+    KEXPECT_EQ(increasing_delta(BEFORE.total_freed_pages, AFTER_BATCH.total_freed_pages), ACCOUNTED_PAGES);
+    KEXPECT_EQ(increasing_delta(BEFORE.alloc_count, AFTER_BATCH.alloc_count), 1U);
+    KEXPECT_EQ(increasing_delta(BEFORE.free_count, AFTER_BATCH.free_count), ACCOUNTED_PAGES);
+    KEXPECT_EQ(AFTER_BATCH.live_allocated_pages, BEFORE.live_allocated_pages);
+    KEXPECT_EQ(AFTER_BATCH.current_free_pages, BEFORE.current_free_pages);
+
+    for (void* page : pages) {
+        KEXPECT_EQ(phys::page_ref_get(page), 0U);
+        KEXPECT_EQ(phys::page_kind_get(page), mm::PageKind::FREE);
+        if (phys::page_kind_get(page) != mm::PageKind::FREE) {
+            phys::page_free(page);
+        }
     }
 }
 

@@ -21,6 +21,7 @@ include_directories(
 
 # Source files
 set(SOURCES
+    src/cowbench.cpp
     src/fsbench.cpp
     src/main.cpp
     src/netbench.cpp

@@ -732,6 +732,24 @@ auto find_free_block(uint64_t size, uint64_t caller) -> void* {
     return nullptr;
 }
 
+auto find_free_order0_block(uint64_t caller) -> void* {
+    for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
+        if (zone->len < paging::PAGE_SIZE || zone->allocator == nullptr) {
+            continue;
+        }
+
+        uint64_t const FLAGS = zone->allocator->lock_irq();
+        void* const BLOCK = zone->allocator->alloc_order0(caller);
+        zone->allocator->unlock_irq(FLAGS);
+        if (BLOCK == nullptr) {
+            [[unlikely]] continue;
+        }
+        return BLOCK;
+    }
+
+    return nullptr;
+}
+
 auto find_free_block_huge(uint64_t size, uint64_t caller = 0) -> void* {
     if (huge_page_zone == nullptr || huge_page_zone->len < size || huge_page_zone->allocator == nullptr) {
         return nullptr;
@@ -993,7 +1011,13 @@ auto page_alloc(uint64_t size, std::string_view name) -> void* {
 #else
     uint64_t const CALLER_TAG = 0;
 #endif
-    void* block = find_free_block(size, CALLER_TAG);
+    void* block = nullptr;
+    if (size == paging::PAGE_SIZE) {
+        block = find_free_order0_block(CALLER_TAG);
+    }
+    if (block == nullptr) {
+        block = find_free_block(size, CALLER_TAG);
+    }
 
     if (block == nullptr) {
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS

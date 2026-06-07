@@ -107,6 +107,11 @@ struct PageAllocator {
     // failure.
     void* alloc(uint64_t size_bytes, uint64_t caller = 0);
 
+    // Allocate exactly one physical page from an already-split order-0 free
+    // list head. The caller must hold this allocator's lock. Returns nullptr
+    // when no proven order-0 page is immediately available.
+    void* alloc_order0(uint64_t caller = 0);
+
     // Free a previous allocation.  The allocation order is recovered from the
     // per-page flags - callers do not need to supply the size. Returns the
     // number of bytes released, or 0 if the pointer was not a live allocation.

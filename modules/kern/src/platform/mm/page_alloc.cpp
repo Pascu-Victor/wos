@@ -179,6 +179,25 @@ auto page_has_live_large_alloc_magic(PageAllocator* alloc, uint32_t page_idx) ->
     return page_has_live_tracked_alloc_magic(alloc, page_idx, PageKind::KMALLOC_LARGE, LARGE_ALLOC_MAGIC);
 }
 
+auto order0_free_head_is_reusable(PageAllocator* alloc, PageAllocator::FreeBlock* block, uint32_t& page_idx) -> bool {
+    if (!free_head_is_valid(alloc, block, 0, page_idx)) {
+        return false;
+    }
+
+    if (decode_page_kind(alloc->page_kinds[page_idx].load(std::memory_order_acquire)) != PageKind::FREE) {
+        return false;
+    }
+    if (alloc->page_refcounts[page_idx].load(std::memory_order_acquire) != 0) {
+        return false;
+    }
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    if (alloc->page_callers[page_idx] != 0) {
+        return false;
+    }
+#endif
+    return true;
+}
+
 auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order) -> uint64_t {
     if (order < 0 || order > PageAllocator::MAX_ORDER) {
         return 0;
@@ -452,6 +471,35 @@ void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
 
     free_count -= BLOCK_SIZE;
     return reinterpret_cast<void*>(base + (static_cast<uint64_t>(page_idx) * paging::PAGE_SIZE));
+}
+
+void* PageAllocator::alloc_order0(uint64_t caller) {
+#ifndef WOS_PHYS_ALLOC_CALLER_STATS
+    (void)caller;
+#endif
+
+    auto* const BLOCK = free_list.at(0);
+    if (BLOCK == nullptr) {
+        return nullptr;
+    }
+
+    uint32_t page_idx = 0;
+    if (!order0_free_head_is_reusable(this, BLOCK, page_idx)) {
+        return nullptr;
+    }
+
+    if (!remove_free_block(this, 0, BLOCK)) {
+        return nullptr;
+    }
+
+    page_flags[page_idx] = FLAG_ALLOC_HEAD;
+    store_page_kind(page_kinds[page_idx], PageKind::NORMAL);
+    page_refcounts[page_idx].store(1, std::memory_order_release);
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    page_callers[page_idx] = caller;
+#endif
+    free_count -= 1;
+    return page_to_ptr(base, page_idx);
 }
 
 // ============================================================================

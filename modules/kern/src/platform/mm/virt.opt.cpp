@@ -75,6 +75,18 @@ limine_memmap_response* memmap_response;
 limine_executable_file_response* kernel_file_response;
 limine_executable_address_response* kernel_address_response;
 
+auto alloc_zeroed_page_table() -> PageTable* {
+    auto* table = static_cast<PageTable*>(phys::page_alloc());
+    if (table == nullptr) {
+        return nullptr;
+    }
+
+    // page_alloc zeroes every returned PAGE_SIZE page; keep page-table ownership
+    // tagging centralized before any reclaim code can observe the page.
+    (void)phys::page_mark_kind(table, PageKind::PAGE_TABLE);
+    return table;
+}
+
 auto pte_raw(const paging::PageTableEntry& e) -> uint64_t {
     uint64_t val = 0;
     std::memcpy(&val, &e, sizeof(val));
@@ -377,14 +389,7 @@ void switch_to_kernel_pagemap() { wrcr3(reinterpret_cast<uint64_t>(addr::get_phy
 
 auto get_kernel_pagemap() -> PageTable* { return kernel_pagemap; }
 
-auto create_pagemap() -> PageTable* {
-    auto* page_table = static_cast<PageTable*>(phys::page_alloc());
-    if (page_table != nullptr) {
-        (void)phys::page_mark_kind(page_table, PageKind::PAGE_TABLE);
-        std::memset(page_table, 0, paging::PAGE_SIZE);
-    }
-    return page_table;
-}
+auto create_pagemap() -> PageTable* { return alloc_zeroed_page_table(); }
 
 void copy_kernel_mappings(sched::task::Task* t) {
     if (t == nullptr) {
@@ -532,8 +537,13 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
             // real content (causing e.g. RELR relocations to produce garbage VAs).
             phys::page_ref_inc(old_virt);
 
-            // Multiple owners - allocate a private page. page_alloc() already
-            // returns zeroed memory, so zero-page COW does not need a copy.
+            bool const DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE = !OLD_IS_ZERO_PAGE;
+
+            // Multiple owners - allocate a private page. phys::page_alloc()
+            // intentionally remains a zeroed allocation API, which zero-page
+            // COW depends on.  Non-zero COW is the future no-zero candidate:
+            // old_virt is pinned, memcpy writes the whole page, and the PTE is
+            // not updated until after the copy and racing-COW recheck below.
             void* new_page = phys::page_alloc(paging::PAGE_SIZE);
             if (new_page == nullptr) {
                 phys::page_ref_dec(old_virt);  // release pin
@@ -542,7 +552,7 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
                 return false;
             }
 
-            if (!OLD_IS_ZERO_PAGE) {
+            if (DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE) {
                 std::memcpy(new_page, old_virt, paging::PAGE_SIZE);  // safe: old page is pinned
             }
 
@@ -691,13 +701,12 @@ auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats {
 void init_pagemap() {
     cpu::enable_pae();
     cpu::enable_pse();
-    kernel_pagemap = static_cast<PageTable*>(phys::page_alloc());
+    kernel_pagemap = alloc_zeroed_page_table();
     if (kernel_pagemap == nullptr) {
         // PANIC!
         log::critical("init: failed to allocate kernel pagemap in init_pagemap");
         hcf();
     }
-    (void)phys::page_mark_kind(kernel_pagemap, PageKind::PAGE_TABLE);
     log::info("kernel pagemap allocated at %x", kernel_pagemap);
     for (size_t i = 0; i < memmap_response->entry_count; i++) {
         auto* entry = memmap_response->entries[i];
@@ -867,20 +876,17 @@ auto advance_page_table(paging::PageTable* page_table, size_t level, uint64_t fl
         return reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
     }
 
-    void* page_virt = phys::page_alloc();
-    if (page_virt == nullptr) {
+    auto* page_table_virt = alloc_zeroed_page_table();
+    if (page_table_virt == nullptr) {
         // PANIC!
         log::critical("init: failed to allocate kernel page table in advance_page_table");
         hcf();
     }
 
-    auto page_phys = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(page_virt)));
-
-    (void)phys::page_mark_kind(page_virt, PageKind::PAGE_TABLE);
-    std::memset(page_virt, 0, paging::PAGE_SIZE);
+    auto page_phys = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(page_table_virt)));
 
     entry_at(page_table, level) = paging::create_page_table_entry(page_phys, flags);
-    return static_cast<PageTable*>(page_virt);
+    return page_table_virt;
 }
 
 }  // namespace
@@ -2341,12 +2347,10 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
         auto* src_pml3 = reinterpret_cast<PageTable*>(addr::get_virt_pointer(SRC_PML3_PHYS));
 
         // Allocate a new PML3 for dst
-        auto* dst_pml3 = static_cast<PageTable*>(phys::page_alloc());
+        auto* dst_pml3 = alloc_zeroed_page_table();
         if (dst_pml3 == nullptr) {
             return false;
         }
-        (void)phys::page_mark_kind(dst_pml3, PageKind::PAGE_TABLE);
-        std::memset(dst_pml3, 0, paging::PAGE_SIZE);
 
         // Set PML4 entry in dst (copy flags from src)
         dst_pml4e = src_pml4e;
@@ -2362,12 +2366,10 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
             paddr_t const SRC_PML2_PHYS = src_pml3e.frame << paging::PAGE_SHIFT;
             auto* src_pml2 = reinterpret_cast<PageTable*>(addr::get_virt_pointer(SRC_PML2_PHYS));
 
-            auto* dst_pml2 = static_cast<PageTable*>(phys::page_alloc());
+            auto* dst_pml2 = alloc_zeroed_page_table();
             if (dst_pml2 == nullptr) {
                 return false;
             }
-            (void)phys::page_mark_kind(dst_pml2, PageKind::PAGE_TABLE);
-            std::memset(dst_pml2, 0, paging::PAGE_SIZE);
 
             dst_pml3e = src_pml3e;
             dst_pml3e.frame = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(dst_pml2))) >> paging::PAGE_SHIFT;
@@ -2388,12 +2390,10 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                     paddr_t const SRC_PHYS = src_pml2e.frame << paging::PAGE_SHIFT;
                     auto* src_virt = reinterpret_cast<uint8_t*>(addr::get_virt_pointer(SRC_PHYS));
 
-                    auto* dst_pml1 = static_cast<PageTable*>(phys::page_alloc());
+                    auto* dst_pml1 = alloc_zeroed_page_table();
                     if (dst_pml1 == nullptr) {
                         return false;
                     }
-                    (void)phys::page_mark_kind(dst_pml1, PageKind::PAGE_TABLE);
-                    std::memset(dst_pml1, 0, paging::PAGE_SIZE);
 
                     // Derive per-PTE flags from the source PML2 huge-page entry:
                     // clear PS bit (bit 7) and frame bits; preserve present/write/user/NX.
@@ -2428,12 +2428,10 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                 paddr_t const SRC_PML1_PHYS = src_pml2e.frame << paging::PAGE_SHIFT;
                 auto* src_pml1 = reinterpret_cast<PageTable*>(addr::get_virt_pointer(SRC_PML1_PHYS));
 
-                auto* dst_pml1 = static_cast<PageTable*>(phys::page_alloc());
+                auto* dst_pml1 = alloc_zeroed_page_table();
                 if (dst_pml1 == nullptr) {
                     return false;
                 }
-                (void)phys::page_mark_kind(dst_pml1, PageKind::PAGE_TABLE);
-                std::memset(dst_pml1, 0, paging::PAGE_SIZE);
 
                 dst_pml2e = src_pml2e;
                 dst_pml2e.frame =

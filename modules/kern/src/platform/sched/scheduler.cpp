@@ -588,6 +588,9 @@ constexpr uint64_t SCHED_GC_WORK_BUDGET_US = 500;
 // not monopolize a CPU while process-per-core workloads are launching bursts of
 // short-lived helpers. Throughput still comes from repeated self-wake passes.
 constexpr uint32_t SCHED_GC_PAGEMAP_STEP_BUDGET = 64;
+constexpr uint32_t SCHED_GC_IDLE_RECLAIM_BUDGET = 256;
+constexpr uint64_t SCHED_GC_IDLE_WORK_BUDGET_US = 10'000;
+constexpr uint32_t SCHED_GC_IDLE_PAGEMAP_STEP_BUDGET = 4096;
 std::atomic<bool> scheduler_gc_requested{false};       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<bool> scheduler_gc_worker_started{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<task::Task*> scheduler_gc_task{nullptr};   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -4384,11 +4387,13 @@ auto queue_detached_gc_task_cleanup(GcDetachedTask const& detached, uint64_t det
     return true;
 }
 
-auto process_deferred_gc_cleanup_slice(GcTaskTiming& timing) -> bool {
+auto process_deferred_gc_cleanup_slice(GcTaskTiming& timing, uint32_t pagemap_step_budget) -> bool {
     auto* item = gc_deferred_cleanup_front();
     if (item == nullptr || item->task == nullptr) {
         return false;
     }
+
+    pagemap_step_budget = std::max<uint32_t>(pagemap_step_budget, 1);
 
     auto* cur = item->task;
     timing.detach_us = item->detach_us;
@@ -4396,7 +4401,7 @@ auto process_deferred_gc_cleanup_slice(GcTaskTiming& timing) -> bool {
     uint64_t const CLEANUP_START_US = time::get_us();
     if (cur->pagemap != nullptr && item->should_free_pagemap && item->pagemap_state != nullptr) {
         uint64_t const START_US = time::get_us();
-        if (!mm::virt::destroy_user_space_budgeted(item->pagemap_state, SCHED_GC_PAGEMAP_STEP_BUDGET)) {
+        if (!mm::virt::destroy_user_space_budgeted(item->pagemap_state, pagemap_step_budget)) {
             timing.pagemap_us = elapsed_us_since(START_US, time::get_us());
             timing.total_us = timing.detach_us + timing.pagemap_us;
             return false;
@@ -4443,14 +4448,16 @@ void cleanup_detached_gc_task(GcDetachedTask const& detached, GcTaskTiming& timi
     cleanup_task_after_pagemap(cur, timing, CLEANUP_START_US);
 }
 
-auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, bool* time_budget_exhausted, bool* has_pending_work)
-    -> uint32_t {
+auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, uint32_t pagemap_step_budget, bool* time_budget_exhausted,
+                                    bool* has_pending_work) -> uint32_t {
     if (max_tasks == 0 || run_queues == nullptr) {
         if (has_pending_work != nullptr) {
             *has_pending_work = gc_deferred_cleanup_has_work();
         }
         return 0;
     }
+
+    pagemap_step_budget = std::max<uint32_t>(pagemap_step_budget, 1);
 
     uint64_t const START_US = max_work_us != 0 ? time::get_us() : 0;
     bool hit_time_budget = false;
@@ -4464,7 +4471,7 @@ auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, bo
 
             if (gc_deferred_cleanup_has_work()) {
                 GcTaskTiming timing{};
-                bool const COMPLETED = process_deferred_gc_cleanup_slice(timing);
+                bool const COMPLETED = process_deferred_gc_cleanup_slice(timing, pagemap_step_budget);
                 note_gc_task_timing(timing);
                 if (COMPLETED) {
                     reclaimed++;
@@ -4514,7 +4521,9 @@ auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, bo
 
 }  // namespace
 
-auto gc_expired_tasks_budgeted(uint32_t max_tasks) -> uint32_t { return gc_expired_tasks_budgeted_impl(max_tasks, 0, nullptr, nullptr); }
+auto gc_expired_tasks_budgeted(uint32_t max_tasks) -> uint32_t {
+    return gc_expired_tasks_budgeted_impl(max_tasks, 0, SCHED_GC_PAGEMAP_STEP_BUDGET, nullptr, nullptr);
+}
 
 void gc_expired_tasks() { (void)gc_expired_tasks_budgeted(UINT32_MAX); }
 
@@ -4540,6 +4549,51 @@ void note_gc_pass_result(uint32_t reclaimed, uint64_t elapsed_us) {
     }
 }
 
+auto task_blocks_idle_gc_boost(task::Task const* task) -> bool {
+    if (task == nullptr || task->type != task::TaskType::PROCESS || task->has_exited) {
+        return false;
+    }
+    if (task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
+        return false;
+    }
+    return !task->is_voluntary_blocked();
+}
+
+auto runqueue_has_foreground_work_locked(RunQueue* rq) -> bool {
+    if (rq == nullptr) {
+        return false;
+    }
+
+    auto* const CURRENT = rq->handoff_task != nullptr ? rq->handoff_task : rq->current_task;
+    if (task_blocks_idle_gc_boost(CURRENT)) {
+        return true;
+    }
+
+    for (uint32_t i = 0; i < rq->runnable_heap.size; ++i) {
+        if (task_blocks_idle_gc_boost(run_heap_entry(rq->runnable_heap, i))) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+auto scheduler_gc_should_boost_reclaim() -> bool {
+    if (run_queues == nullptr) {
+        return false;
+    }
+
+    for (uint64_t cpu_no = 0; cpu_no < smt::get_core_count(); ++cpu_no) {
+        bool const HAS_FOREGROUND_WORK =
+            run_queues->with_lock(cpu_no, [](RunQueue* rq) -> bool { return runqueue_has_foreground_work_locked(rq); });
+        if (HAS_FOREGROUND_WORK) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void scheduler_gc_thread_main() {
     for (;;) {
         if (!scheduler_gc_requested.exchange(false, std::memory_order_acq_rel)) {
@@ -4547,15 +4601,20 @@ void scheduler_gc_thread_main() {
             continue;
         }
 
+        bool const BOOST_RECLAIM = scheduler_gc_should_boost_reclaim();
+        uint32_t const RECLAIM_BUDGET = BOOST_RECLAIM ? SCHED_GC_IDLE_RECLAIM_BUDGET : SCHED_GC_RECLAIM_BUDGET;
+        uint64_t const WORK_BUDGET_US = BOOST_RECLAIM ? SCHED_GC_IDLE_WORK_BUDGET_US : SCHED_GC_WORK_BUDGET_US;
+        uint32_t const PAGEMAP_STEP_BUDGET = BOOST_RECLAIM ? SCHED_GC_IDLE_PAGEMAP_STEP_BUDGET : SCHED_GC_PAGEMAP_STEP_BUDGET;
+
         uint64_t const START_US = time::get_us();
         bool time_budget_exhausted = false;
         bool has_pending_work = false;
         uint32_t const RECLAIMED =
-            gc_expired_tasks_budgeted_impl(SCHED_GC_RECLAIM_BUDGET, SCHED_GC_WORK_BUDGET_US, &time_budget_exhausted, &has_pending_work);
+            gc_expired_tasks_budgeted_impl(RECLAIM_BUDGET, WORK_BUDGET_US, PAGEMAP_STEP_BUDGET, &time_budget_exhausted, &has_pending_work);
         uint64_t const END_US = time::get_us();
         note_gc_pass_result(RECLAIMED, END_US >= START_US ? END_US - START_US : 0);
 
-        if (has_pending_work || RECLAIMED >= SCHED_GC_RECLAIM_BUDGET || (time_budget_exhausted && RECLAIMED != 0)) {
+        if (has_pending_work || RECLAIMED >= RECLAIM_BUDGET || (time_budget_exhausted && RECLAIMED != 0)) {
             scheduler_gc_requested.store(true, std::memory_order_release);
             kern_yield();
         }
