@@ -426,6 +426,7 @@ inline void kern_yield_impl(uint64_t perf_callsite) {
             task->wait_channel = nullptr;
             return;
         }
+        request_local_timer_recheck();
     }
     bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED);
@@ -462,6 +463,7 @@ inline void kern_block_impl(uint64_t perf_callsite) {
             task->wait_channel = nullptr;
             return;
         }
+        request_local_timer_recheck();
     }
     bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     for (;;) {
@@ -516,6 +518,7 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
             task->wait_channel = nullptr;
             return;
         }
+        request_local_timer_recheck();
     }
     bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     for (;;) {
@@ -566,6 +569,7 @@ inline void preemptible_syscall_park_impl(const char* wait_channel, uint64_t dea
             task->wait_channel = nullptr;
             return;
         }
+        request_local_timer_recheck();
     }
     bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     for (;;) {

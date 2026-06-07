@@ -47,6 +47,7 @@ struct PageAllocator {
     static constexpr uint8_t FLAG_RESERVED = 0xFF;
 
     std::array<FreeBlock*, MAX_ORDER + 1> free_list{};  // one singly-linked list per order
+    std::atomic<bool> lock_held{false};                 // protects free_list/page_flags mutations
     uint8_t* page_flags = nullptr;                      // 1 byte per page
     std::atomic<uint8_t>* page_kinds = nullptr;         // PageKind per page
     std::atomic<uint32_t>* page_refcounts = nullptr;    // 1 refcount per page (for COW fork)
@@ -63,6 +64,9 @@ struct PageAllocator {
     // (HHDM address) with `sizeBytes` total bytes.  Metadata is placed at
     // the beginning; the rest becomes allocatable.
     void init(uint64_t zone_base, uint64_t size_bytes);
+
+    auto lock_irq() -> uint64_t;
+    void unlock_irq(uint64_t flags);
 
     // Allocate >= sizeBytes of contiguous physical pages (rounded up to the
     // next power-of-two page count).  Returns an HHDM pointer or nullptr on

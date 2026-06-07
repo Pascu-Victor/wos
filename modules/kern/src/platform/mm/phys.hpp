@@ -56,6 +56,10 @@ struct PageRefBatchStats {
     uint64_t pages_freed;
 };
 
+struct PageLookupHint {
+    PageAllocator* allocator = nullptr;
+};
+
 void init(limine_memmap_response* memmap_response);
 void set_kernel_cr3(uint64_t cr3);    // Call after initPagemap to set kernel CR3 for safe memset
 void init_huge_page_zone_deferred();  // Call after initPagemap to initialize huge page zone
@@ -66,6 +70,7 @@ void page_free(void* page);
 auto page_split_to_order0(void* page) -> bool;
 auto page_mark_kind(void* page, PageKind kind) -> bool;
 auto page_kind_get(void* page) -> PageKind;
+auto page_kind_get(void* page, PageLookupHint* hint) -> PageKind;
 auto page_alloc_can_satisfy(uint64_t size, uint64_t reserve_bytes = 0) -> bool;
 
 // --- Frame reference counting (for COW fork) ---
@@ -76,9 +81,12 @@ void page_ref_add(void* page, uint64_t refs);
 // Decrement the refcount. When it reaches 0 the page is freed.
 // Returns the new refcount (0 = freed).
 uint32_t page_ref_dec(void* page);
+uint32_t page_ref_dec(void* page, PageLookupHint* hint);
 auto page_ref_dec_batch(std::span<void* const> pages) -> PageRefBatchStats;
+auto page_ref_dec_batch(std::span<void* const> pages, PageLookupHint* hint) -> PageRefBatchStats;
 // Get current refcount for a physical page. Returns 0 for unknown/free pages.
 uint32_t page_ref_get(void* page);
+uint32_t page_ref_get(void* page, PageLookupHint* hint);
 
 // Get the head of the memory zones list (for OOM diagnostics)
 auto get_zones() -> paging::PageZone*;

@@ -1517,12 +1517,19 @@ void wake_cpu(uint64_t cpu_no) {
 
     auto* rq = run_queues != nullptr ? run_queues->that_cpu(cpu_no) : nullptr;
     if (rq != nullptr) {
-        // The wake IPI's handler only arms a near scheduler timer; repeated
-        // remote wakeups before that timer fires do not need more IPIs.  The
-        // timer interrupt clears this bit in note_scheduler_timer_interrupt().
+        // The wake IPI's handler only arms a near scheduler timer, so repeated
+        // remote wakeups before that timer fires can normally be coalesced.
+        // Do not coalesce against a stale pending bit when the target is halted:
+        // an idle CPU or a current task in a voluntary hlt needs the IPI itself
+        // to escape the wait point if the earlier timer/IPI was lost or stale.
+        auto* current = rq->current_task;
+        bool const HALTED_TARGET = rq->is_idle.load(std::memory_order_acquire) ||
+                                   (current != nullptr && (current->is_voluntary_blocked() || current->wants_block));
         if (rq->resched_timer_pending.exchange(true, std::memory_order_acq_rel)) {
-            rq->wake_ipis_coalesced.fetch_add(1, std::memory_order_relaxed);
-            return;
+            if (!HALTED_TARGET) {
+                rq->wake_ipis_coalesced.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
         }
         rq->wake_ipis_sent.fetch_add(1, std::memory_order_relaxed);
     }

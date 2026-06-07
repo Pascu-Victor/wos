@@ -80,6 +80,19 @@ KTEST(MM, RefCountBasic) {
     phys::page_free(page);
 }
 
+KTEST(MM, RefCountDecWithLookupHint) {
+    void* page = phys::page_alloc();
+    KREQUIRE_NE(page, nullptr);
+
+    phys::page_ref_inc(page);
+    phys::PageLookupHint hint{};
+    KEXPECT_EQ(phys::page_ref_get(page, &hint), 2U);
+
+    KEXPECT_EQ(phys::page_ref_dec(page, &hint), 1U);
+    KEXPECT_EQ(phys::page_ref_dec(page, &hint), 0U);
+    KEXPECT_EQ(phys::page_ref_get(page, &hint), 0U);
+}
+
 KTEST(MM, RefCountBatchFinalFreeContiguousRun) {
     constexpr size_t PAGE_COUNT = 4;
     auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));
@@ -98,6 +111,28 @@ KTEST(MM, RefCountBatchFinalFreeContiguousRun) {
 
     for (void* page : pages) {
         KEXPECT_EQ(phys::page_ref_get(page), 0U);
+    }
+}
+
+KTEST(MM, RefCountBatchFinalFreeWithLookupHint) {
+    constexpr size_t PAGE_COUNT = 4;
+    auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));
+    KREQUIRE_NE(base, nullptr);
+    KREQUIRE_TRUE(phys::page_split_to_order0(base));
+
+    std::array<void*, PAGE_COUNT> pages{};
+    phys::PageLookupHint hint{};
+    for (size_t i = 0; i < PAGE_COUNT; ++i) {
+        pages.at(i) = base + (i * paging::PAGE_SIZE);
+        KEXPECT_EQ(phys::page_ref_get(pages.at(i), &hint), 1U);
+    }
+
+    phys::PageRefBatchStats const STATS = phys::page_ref_dec_batch(std::span<void* const>{pages.data(), pages.size()}, &hint);
+    KEXPECT_EQ(STATS.refs_decremented, static_cast<uint64_t>(PAGE_COUNT));
+    KEXPECT_EQ(STATS.pages_freed, static_cast<uint64_t>(PAGE_COUNT));
+
+    for (void* page : pages) {
+        KEXPECT_EQ(phys::page_ref_get(page, &hint), 0U);
     }
 }
 

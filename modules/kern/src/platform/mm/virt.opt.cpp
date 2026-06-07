@@ -1099,7 +1099,11 @@ auto phys_is_in_ram(uint64_t phys_addr) -> bool {
     return false;
 }
 
-auto phys_to_hhdm_checked(uint64_t phys_addr) -> void* {
+struct FrameProbeCache {
+    phys::PageLookupHint lookup;
+};
+
+auto phys_to_hhdm_checked(uint64_t phys_addr, FrameProbeCache* cache = nullptr) -> void* {
     const uint64_t PAGE_BASE = phys_addr & ~(paging::PAGE_SIZE - 1);
     if (!phys_is_in_ram(PAGE_BASE)) {
         return nullptr;
@@ -1110,14 +1114,45 @@ auto phys_to_hhdm_checked(uint64_t phys_addr) -> void* {
         return nullptr;
     }
 
-    if (phys::page_ref_get(reinterpret_cast<void*>(VIRT_RAW)) == 0) {
+    if (phys::page_ref_get(reinterpret_cast<void*>(VIRT_RAW), cache != nullptr ? &cache->lookup : nullptr) == 0) {
         return nullptr;
     }
 
     return reinterpret_cast<void*>(VIRT_RAW);
 }
 
-auto frame_page_kind(uint64_t phys_addr) -> PageKind {
+auto phys_to_hhdm_for_live_probe(uint64_t phys_addr, PageKind kind, FrameProbeCache* cache = nullptr) -> void* {
+    const uint64_t PAGE_BASE = phys_addr & ~(paging::PAGE_SIZE - 1);
+    if (!phys_is_in_ram(PAGE_BASE)) {
+        return nullptr;
+    }
+
+    const uint64_t VIRT_RAW = PAGE_BASE + addr::get_hhdm_offset();
+    if ((VIRT_RAW >> CANONICAL_SIGN_BIT) != CANONICAL_KERNEL_UPPER) {
+        return nullptr;
+    }
+
+    switch (kind) {
+        case PageKind::NORMAL:
+        case PageKind::PAGE_TABLE:
+        case PageKind::SLAB:
+        case PageKind::MEDIUM:
+            return reinterpret_cast<void*>(VIRT_RAW);
+        case PageKind::FREE:
+        case PageKind::RESERVED:
+            return nullptr;
+        case PageKind::UNKNOWN:
+        default:
+            break;
+    }
+
+    if (phys::page_ref_get(reinterpret_cast<void*>(VIRT_RAW), cache != nullptr ? &cache->lookup : nullptr) == 0) {
+        return nullptr;
+    }
+    return reinterpret_cast<void*>(VIRT_RAW);
+}
+
+auto frame_page_kind(uint64_t phys_addr, FrameProbeCache* cache = nullptr) -> PageKind {
     uint64_t const PAGE_BASE = phys_addr & ~(paging::PAGE_SIZE - 1);
     if (!phys_is_in_ram(PAGE_BASE)) {
         return PageKind::UNKNOWN;
@@ -1128,7 +1163,7 @@ auto frame_page_kind(uint64_t phys_addr) -> PageKind {
         return PageKind::UNKNOWN;
     }
 
-    return phys::page_kind_get(reinterpret_cast<void*>(VIRT_RAW));
+    return phys::page_kind_get(reinterpret_cast<void*>(VIRT_RAW), cache != nullptr ? &cache->lookup : nullptr);
 }
 
 auto frame_kind_is_known_non_page_table(PageKind kind) -> bool {
@@ -1146,7 +1181,7 @@ auto frame_kind_is_known_non_page_table(PageKind kind) -> bool {
     }
 }
 
-auto page_table_tree_contains_frame(PageTable* root, uint64_t target_phys) -> bool {
+auto page_table_tree_contains_frame(PageTable* root, uint64_t target_phys, FrameProbeCache* cache = nullptr) -> bool {
     if (root == nullptr) {
         return false;
     }
@@ -1168,7 +1203,7 @@ auto page_table_tree_contains_frame(PageTable* root, uint64_t target_phys) -> bo
             return true;
         }
 
-        auto* pml3 = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(PML3_PHYS));
+        auto* pml3 = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(PML3_PHYS, cache));
         if (pml3 == nullptr) {
             continue;
         }
@@ -1182,7 +1217,7 @@ auto page_table_tree_contains_frame(PageTable* root, uint64_t target_phys) -> bo
                 return true;
             }
 
-            auto* pml2 = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(PML2_PHYS));
+            auto* pml2 = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(PML2_PHYS, cache));
             if (pml2 == nullptr) {
                 continue;
             }
@@ -1202,13 +1237,13 @@ auto page_table_tree_contains_frame(PageTable* root, uint64_t target_phys) -> bo
     return false;
 }
 
-auto frame_is_live_medium_alloc(uint64_t phys_addr, PageKind kind) -> bool {
+auto frame_is_live_medium_alloc(uint64_t phys_addr, PageKind kind, FrameProbeCache* cache = nullptr) -> bool {
     constexpr uint64_t MEDIUM_ALLOC_MAGIC = 0xCAFEBABE87654321ULL;
     if (kind == PageKind::MEDIUM) {
         return true;
     }
 
-    auto* page_ptr = phys_to_hhdm_checked(phys_addr);
+    auto* page_ptr = phys_to_hhdm_for_live_probe(phys_addr, kind, cache);
     if (page_ptr == nullptr) {
         return false;
     }
@@ -1216,13 +1251,13 @@ auto frame_is_live_medium_alloc(uint64_t phys_addr, PageKind kind) -> bool {
     return *reinterpret_cast<const uint64_t*>(PAGE_BASE + 16) == MEDIUM_ALLOC_MAGIC;
 }
 
-auto frame_is_live_slab_alloc(uint64_t phys_addr, PageKind kind) -> bool {
+auto frame_is_live_slab_alloc(uint64_t phys_addr, PageKind kind, FrameProbeCache* cache = nullptr) -> bool {
     constexpr uint32_t SLAB_MAGIC = 0x8CBEEFC8;
     if (kind == PageKind::SLAB) {
         return true;
     }
 
-    auto* page_ptr = phys_to_hhdm_checked(phys_addr);
+    auto* page_ptr = phys_to_hhdm_for_live_probe(phys_addr, kind, cache);
     if (page_ptr == nullptr) {
         return false;
     }
@@ -1245,12 +1280,12 @@ struct PageTableFrameSet {
         return true;
     }
 
-    auto contains(PageTable* root, uint64_t phys_addr) const -> bool {
+    auto contains(PageTable* root, uint64_t phys_addr, FrameProbeCache* cache = nullptr) const -> bool {
         phys_addr &= ~(paging::PAGE_SIZE - 1);
         if (frames.contains(phys_addr)) {
             return true;
         }
-        return !complete && page_table_tree_contains_frame(root, phys_addr);
+        return !complete && page_table_tree_contains_frame(root, phys_addr, cache);
     }
 };
 
@@ -1261,6 +1296,7 @@ constexpr size_t DESTROY_REFDEC_BATCH_CAP = 64;
 struct DestroyUserSpaceBudgetState {
     struct RefdecBatch {
         std::array<void*, DESTROY_REFDEC_BATCH_CAP> pages{};
+        phys::PageLookupHint lookup{};
         size_t count = 0;
     };
 
@@ -1270,6 +1306,7 @@ struct DestroyUserSpaceBudgetState {
     const char* reason = nullptr;
     DestroyUserSpacePhase phase = DestroyUserSpacePhase::DONE;
     PageTableFrameSet page_table_frames{};
+    FrameProbeCache frame_probe_cache{};
     std::array<DestroyWalkFrame, 4> stack{};
     RefdecBatch refdec_batch{};
     size_t stack_size = 0;
@@ -1284,7 +1321,7 @@ void destroy_refdec_batch_flush(DestroyRefdecBatch& batch) {
         return;
     }
 
-    (void)phys::page_ref_dec_batch(std::span<void* const>{batch.pages.data(), batch.count});
+    (void)phys::page_ref_dec_batch(std::span<void* const>{batch.pages.data(), batch.count}, &batch.lookup);
     batch.count = 0;
 }
 
@@ -1338,7 +1375,8 @@ void destroy_state_flush_refdec_batch(DestroyUserSpaceBudgetState& state) { dest
 
 void destroy_state_queue_refdec(DestroyUserSpaceBudgetState& state, void* page) { destroy_refdec_batch_queue(state.refdec_batch, page); }
 
-void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& frames, DestroyUserSpaceCallStats* stats) {
+void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& frames, DestroyUserSpaceCallStats* stats,
+                               FrameProbeCache* frame_probe_cache = nullptr) {
     if (table == nullptr || level < 1) {
         return;
     }
@@ -1362,14 +1400,14 @@ void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& f
             }
             continue;
         }
-        PageKind const KIND = frame_page_kind(PHYS_ADDR);
-        if (frame_is_live_medium_alloc(PHYS_ADDR, KIND)) {
+        PageKind const KIND = frame_page_kind(PHYS_ADDR, frame_probe_cache);
+        if (frame_is_live_medium_alloc(PHYS_ADDR, KIND, frame_probe_cache)) {
             if (stats != nullptr) {
                 stats->skipped_medium_alloc_frames++;
             }
             continue;
         }
-        if (frame_is_live_slab_alloc(PHYS_ADDR, KIND)) {
+        if (frame_is_live_slab_alloc(PHYS_ADDR, KIND, frame_probe_cache)) {
             if (stats != nullptr) {
                 stats->skipped_corrupt_entries++;
             }
@@ -1383,9 +1421,9 @@ void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& f
         }
 
         frames.add(PHYS_ADDR);
-        auto* next_level = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(PHYS_ADDR));
+        auto* next_level = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(PHYS_ADDR, frame_probe_cache));
         if (next_level != nullptr) {
-            collect_page_table_frames(next_level, level - 1, frames, stats);
+            collect_page_table_frames(next_level, level - 1, frames, stats, frame_probe_cache);
         }
     }
 }
@@ -1413,12 +1451,12 @@ auto advance_collect_frames_budgeted(DestroyUserSpaceBudgetState& state, Destroy
             stats.skipped_huge_pages++;
             return true;
         }
-        PageKind const KIND = frame_page_kind(PHYS_ADDR);
-        if (frame_is_live_medium_alloc(PHYS_ADDR, KIND)) {
+        PageKind const KIND = frame_page_kind(PHYS_ADDR, &state.frame_probe_cache);
+        if (frame_is_live_medium_alloc(PHYS_ADDR, KIND, &state.frame_probe_cache)) {
             stats.skipped_medium_alloc_frames++;
             return true;
         }
-        if (frame_is_live_slab_alloc(PHYS_ADDR, KIND)) {
+        if (frame_is_live_slab_alloc(PHYS_ADDR, KIND, &state.frame_probe_cache)) {
             stats.skipped_corrupt_entries++;
             return true;
         }
@@ -1428,7 +1466,7 @@ auto advance_collect_frames_budgeted(DestroyUserSpaceBudgetState& state, Destroy
         }
 
         state.page_table_frames.add(PHYS_ADDR);
-        auto* next_level = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(PHYS_ADDR));
+        auto* next_level = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(PHYS_ADDR, &state.frame_probe_cache));
         if (next_level != nullptr) {
             (void)destroy_state_push(state, next_level, frame.level - 1, 0, PHYS_ADDR);
         }
@@ -1468,13 +1506,13 @@ auto advance_free_data_budgeted(DestroyUserSpaceBudgetState& state, DestroyUserS
                 entry = paging::purge_page_table_entry();
                 return true;
             }
-            PageKind const KIND = frame_page_kind(PHYS_ADDR);
-            if (frame_is_live_medium_alloc(PHYS_ADDR, KIND)) {
+            PageKind const KIND = frame_page_kind(PHYS_ADDR, &state.frame_probe_cache);
+            if (frame_is_live_medium_alloc(PHYS_ADDR, KIND, &state.frame_probe_cache)) {
                 stats.skipped_medium_alloc_frames++;
                 entry = paging::purge_page_table_entry();
                 return true;
             }
-            if (frame_is_live_slab_alloc(PHYS_ADDR, KIND)) {
+            if (frame_is_live_slab_alloc(PHYS_ADDR, KIND, &state.frame_probe_cache)) {
                 stats.skipped_corrupt_entries++;
                 entry = paging::purge_page_table_entry();
                 return true;
@@ -1505,11 +1543,11 @@ auto advance_free_data_budgeted(DestroyUserSpaceBudgetState& state, DestroyUserS
         }
 
         stats.data_leaf_entries_visited++;
-        PageKind const KIND = frame_page_kind(PHYS_ADDR);
-        bool const IS_TREE_PAGE_TABLE_FRAME = state.page_table_frames.contains(state.pagemap, PHYS_ADDR);
+        PageKind const KIND = frame_page_kind(PHYS_ADDR, &state.frame_probe_cache);
+        bool const IS_TREE_PAGE_TABLE_FRAME = state.page_table_frames.contains(state.pagemap, PHYS_ADDR, &state.frame_probe_cache);
         bool const IS_PAGE_TABLE_KIND = KIND == PageKind::PAGE_TABLE;
-        bool const IS_MEDIUM_ALLOC = frame_is_live_medium_alloc(PHYS_ADDR, KIND);
-        bool const IS_SLAB_ALLOC = frame_is_live_slab_alloc(PHYS_ADDR, KIND);
+        bool const IS_MEDIUM_ALLOC = frame_is_live_medium_alloc(PHYS_ADDR, KIND, &state.frame_probe_cache);
+        bool const IS_SLAB_ALLOC = frame_is_live_slab_alloc(PHYS_ADDR, KIND, &state.frame_probe_cache);
         if (!IS_TREE_PAGE_TABLE_FRAME && !IS_PAGE_TABLE_KIND && !IS_MEDIUM_ALLOC && !IS_SLAB_ALLOC) {
             uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
             if ((VIRT_RAW >> CANONICAL_SIGN_BIT) == CANONICAL_KERNEL_UPPER) {
@@ -1559,7 +1597,7 @@ auto advance_free_page_tables_budgeted(DestroyUserSpaceBudgetState& state, Destr
             int const LEVEL = static_cast<int>(static_cast<uint8_t>(frame.level));
             destroy_state_pop(state);
             if (LEVEL < 4 && PHYS_ADDR != 0) {
-                phys::page_ref_dec(table);
+                phys::page_ref_dec(table, &state.frame_probe_cache.lookup);
                 stats.page_table_pages_freed++;
                 return true;
             }
@@ -1580,9 +1618,9 @@ auto advance_free_page_tables_budgeted(DestroyUserSpaceBudgetState& state, Destr
         int const LEVEL_SHIFT = 12 + (9 * (frame.level - 1));
         uint64_t const ENTRY_VADDR = frame.vaddr_base | (static_cast<uint64_t>(INDEX) << LEVEL_SHIFT);
 
-        PageKind const KIND = frame.level > 1 ? frame_page_kind(PHYS_ADDR) : PageKind::UNKNOWN;
-        bool const IS_MEDIUM_ALLOC = frame.level > 1 && frame_is_live_medium_alloc(PHYS_ADDR, KIND);
-        bool const IS_SLAB_ALLOC = frame.level > 1 && frame_is_live_slab_alloc(PHYS_ADDR, KIND);
+        PageKind const KIND = frame.level > 1 ? frame_page_kind(PHYS_ADDR, &state.frame_probe_cache) : PageKind::UNKNOWN;
+        bool const IS_MEDIUM_ALLOC = frame.level > 1 && frame_is_live_medium_alloc(PHYS_ADDR, KIND, &state.frame_probe_cache);
+        bool const IS_SLAB_ALLOC = frame.level > 1 && frame_is_live_slab_alloc(PHYS_ADDR, KIND, &state.frame_probe_cache);
         if (frame.level > 1 && entry.pagesize == 0 && !IS_MEDIUM_ALLOC && !IS_SLAB_ALLOC && !frame_kind_is_known_non_page_table(KIND)) {
             uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
             if ((VIRT_RAW >> CANONICAL_SIGN_BIT) != CANONICAL_KERNEL_UPPER) {
@@ -1779,7 +1817,8 @@ namespace {
 
 void free_user_data_pages(PageTable* table, int level, PageTable* root, const PageTableFrameSet& page_table_frames,
                           DestroyRefdecBatch& refdec_batch, DestroyUserSpaceCallStats* stats, uint64_t vaddr_base = 0,
-                          uint64_t owner_pid = 0, const char* owner_name = nullptr, const char* reason = nullptr) {
+                          uint64_t owner_pid = 0, const char* owner_name = nullptr, const char* reason = nullptr,
+                          FrameProbeCache* frame_probe_cache = nullptr) {
     if (table == nullptr || level < 1) {
         return;
     }
@@ -1812,13 +1851,13 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
                     stats->skipped_huge_pages++;
                 }
             } else {
-                PageKind const KIND = frame_page_kind(PHYS_ADDR);
-                if (frame_is_live_medium_alloc(PHYS_ADDR, KIND)) {
+                PageKind const KIND = frame_page_kind(PHYS_ADDR, frame_probe_cache);
+                if (frame_is_live_medium_alloc(PHYS_ADDR, KIND, frame_probe_cache)) {
                     if (stats != nullptr) {
                         stats->skipped_medium_alloc_frames++;
                     }
                     entry = paging::purge_page_table_entry();
-                } else if (frame_is_live_slab_alloc(PHYS_ADDR, KIND) || frame_kind_is_known_non_page_table(KIND)) {
+                } else if (frame_is_live_slab_alloc(PHYS_ADDR, KIND, frame_probe_cache) || frame_kind_is_known_non_page_table(KIND)) {
                     if (stats != nullptr) {
                         stats->skipped_corrupt_entries++;
                     }
@@ -1842,7 +1881,7 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
                     }
                     auto* next_level = reinterpret_cast<PageTable*>(VIRT_RAW);
                     free_user_data_pages(next_level, level - 1, root, page_table_frames, refdec_batch, stats, ENTRY_VADDR, owner_pid,
-                                         owner_name, reason);
+                                         owner_name, reason, frame_probe_cache);
                 }
             }
         } else {
@@ -1857,11 +1896,11 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
             // cleanup reaches the same frame, which turns into a page_free()
             // of a live kmalloc page. Keep page-table frames owned by the
             // page-table cleanup phase below.
-            PageKind const KIND = frame_page_kind(PHYS_ADDR);
-            bool const IS_TREE_PAGE_TABLE_FRAME = page_table_frames.contains(root, PHYS_ADDR);
+            PageKind const KIND = frame_page_kind(PHYS_ADDR, frame_probe_cache);
+            bool const IS_TREE_PAGE_TABLE_FRAME = page_table_frames.contains(root, PHYS_ADDR, frame_probe_cache);
             bool const IS_PAGE_TABLE_KIND = KIND == PageKind::PAGE_TABLE;
-            bool const IS_MEDIUM_ALLOC = frame_is_live_medium_alloc(PHYS_ADDR, KIND);
-            bool const IS_SLAB_ALLOC = frame_is_live_slab_alloc(PHYS_ADDR, KIND);
+            bool const IS_MEDIUM_ALLOC = frame_is_live_medium_alloc(PHYS_ADDR, KIND, frame_probe_cache);
+            bool const IS_SLAB_ALLOC = frame_is_live_slab_alloc(PHYS_ADDR, KIND, frame_probe_cache);
             if (!IS_TREE_PAGE_TABLE_FRAME && !IS_PAGE_TABLE_KIND && !IS_MEDIUM_ALLOC && !IS_SLAB_ALLOC) {
                 uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
                 if ((VIRT_RAW >> CANONICAL_SIGN_BIT) == CANONICAL_KERNEL_UPPER) {
@@ -1908,7 +1947,8 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
 // Helper to free a page table level recursively after user data pages are gone.
 // level: 4=PML4, 3=PML3, 2=PML2, 1=PML1
 // vaddr_base: accumulated virtual address bits from outer levels (for diagnostics)
-void free_page_table_pages(PageTable* table, int level, DestroyUserSpaceCallStats* stats, uint64_t vaddr_base = 0) {
+void free_page_table_pages(PageTable* table, int level, DestroyUserSpaceCallStats* stats, uint64_t vaddr_base = 0,
+                           FrameProbeCache* frame_probe_cache = nullptr) {
     if (table == nullptr || level < 1) {
         return;
     }
@@ -1933,9 +1973,9 @@ void free_page_table_pages(PageTable* table, int level, DestroyUserSpaceCallStat
         // Reconstruct virtual address for diagnostic output.
         const uint64_t ENTRY_VADDR = vaddr_base | (static_cast<uint64_t>(i) << LEVEL_SHIFT);
 
-        PageKind const KIND = level > 1 ? frame_page_kind(PHYS_ADDR) : PageKind::UNKNOWN;
-        bool const IS_MEDIUM_ALLOC = level > 1 && frame_is_live_medium_alloc(PHYS_ADDR, KIND);
-        bool const IS_SLAB_ALLOC = level > 1 && frame_is_live_slab_alloc(PHYS_ADDR, KIND);
+        PageKind const KIND = level > 1 ? frame_page_kind(PHYS_ADDR, frame_probe_cache) : PageKind::UNKNOWN;
+        bool const IS_MEDIUM_ALLOC = level > 1 && frame_is_live_medium_alloc(PHYS_ADDR, KIND, frame_probe_cache);
+        bool const IS_SLAB_ALLOC = level > 1 && frame_is_live_slab_alloc(PHYS_ADDR, KIND, frame_probe_cache);
         if (level > 1 && entry.pagesize == 0 && !IS_MEDIUM_ALLOC && !IS_SLAB_ALLOC && !frame_kind_is_known_non_page_table(KIND)) {
             uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
             if ((VIRT_RAW >> CANONICAL_SIGN_BIT) != CANONICAL_KERNEL_UPPER) {
@@ -1951,8 +1991,8 @@ void free_page_table_pages(PageTable* table, int level, DestroyUserSpaceCallStat
                 continue;
             }
             auto* next_level = reinterpret_cast<PageTable*>(VIRT_RAW);
-            free_page_table_pages(next_level, level - 1, stats, ENTRY_VADDR);
-            phys::page_ref_dec(next_level);
+            free_page_table_pages(next_level, level - 1, stats, ENTRY_VADDR, frame_probe_cache);
+            phys::page_ref_dec(next_level, frame_probe_cache != nullptr ? &frame_probe_cache->lookup : nullptr);
             if (stats != nullptr) {
                 stats->page_table_pages_freed++;
             }
@@ -2072,18 +2112,20 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owne
     // aliases a page-table frame cannot free that frame before the page-table
     // walk reaches it.
     PageTableFrameSet page_table_frames{};
+    FrameProbeCache frame_probe_cache{};
     uint64_t phase_start_us = time::get_us();
-    collect_page_table_frames(pagemap, 4, page_table_frames, &stats);
+    collect_page_table_frames(pagemap, 4, page_table_frames, &stats, &frame_probe_cache);
     stats.collect_frames_us = elapsed_us_since(phase_start_us, time::get_us());
 
     phase_start_us = time::get_us();
     DestroyRefdecBatch refdec_batch{};
-    free_user_data_pages(pagemap, 4, pagemap, page_table_frames, refdec_batch, &stats, 0, owner_pid, owner_name, reason);
+    free_user_data_pages(pagemap, 4, pagemap, page_table_frames, refdec_batch, &stats, 0, owner_pid, owner_name, reason,
+                         &frame_probe_cache);
     destroy_refdec_batch_flush(refdec_batch);
     stats.free_data_us = elapsed_us_since(phase_start_us, time::get_us());
 
     phase_start_us = time::get_us();
-    free_page_table_pages(pagemap, 4, &stats);
+    free_page_table_pages(pagemap, 4, &stats, 0, &frame_probe_cache);
     stats.free_pt_us = elapsed_us_since(phase_start_us, time::get_us());
 
     // Invalidate TLB for this address space

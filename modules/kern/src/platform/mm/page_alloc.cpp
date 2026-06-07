@@ -199,7 +199,30 @@ auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order) ->
 // init
 // ============================================================================
 
+auto PageAllocator::lock_irq() -> uint64_t {
+    uint64_t flags = 0;
+    asm volatile("pushfq; popq %0" : "=r"(flags));
+    asm volatile("cli");
+
+    while (lock_held.exchange(true, std::memory_order_acquire)) {
+        while (lock_held.load(std::memory_order_relaxed)) {
+            asm volatile("pause");
+        }
+    }
+
+    return flags;
+}
+
+void PageAllocator::unlock_irq(uint64_t flags) {
+    lock_held.store(false, std::memory_order_release);
+    constexpr uint64_t RFLAGS_INTERRUPT_ENABLE = 0x200;
+    if ((flags & RFLAGS_INTERRUPT_ENABLE) != 0) {
+        asm volatile("sti");
+    }
+}
+
 void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
+    lock_held.store(false, std::memory_order_release);
     base = zone_base;
     total_pages = static_cast<uint32_t>(size_bytes / paging::PAGE_SIZE);
 
