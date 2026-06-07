@@ -281,6 +281,83 @@ KTEST(MM, PageKindTracksSplitBatchFree) {
     }
 }
 
+KTEST(MM, UnsplitLargeAllocationContinuationIsNotLeafFreeable) {
+    constexpr size_t PAGE_COUNT = 4;
+    auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));
+    KREQUIRE_NE(base, nullptr);
+    KREQUIRE_TRUE(phys::page_mark_kind(base, mm::PageKind::PAGE_TABLE));
+
+    void* continuation_page = base + paging::PAGE_SIZE;
+    KEXPECT_EQ(phys::page_kind_get(base), mm::PageKind::PAGE_TABLE);
+    KEXPECT_EQ(phys::page_kind_get(continuation_page), mm::PageKind::PAGE_TABLE);
+    KEXPECT_EQ(phys::page_ref_get(base), 1U);
+    KEXPECT_EQ(phys::page_ref_get(continuation_page), 1U);
+
+    std::array<void*, 1> pages{continuation_page};
+    phys::PageRefBatchStats const STATS = phys::page_ref_dec_batch(std::span<void* const>{pages.data(), pages.size()});
+    KEXPECT_EQ(STATS.refs_decremented, 1U);
+    KEXPECT_EQ(STATS.pages_freed, 0U);
+
+    KEXPECT_EQ(phys::page_ref_get(base), 1U);
+    KEXPECT_EQ(phys::page_ref_get(continuation_page), 0U);
+    KEXPECT_EQ(phys::page_kind_get(base), mm::PageKind::PAGE_TABLE);
+    KEXPECT_EQ(phys::page_kind_get(continuation_page), mm::PageKind::PAGE_TABLE);
+
+    phys::page_free(base);
+}
+
+KTEST(MM, UnsplitLargeAllocationHeadIsNotLeafFreeable) {
+    constexpr size_t PAGE_COUNT = 4;
+    auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));
+    KREQUIRE_NE(base, nullptr);
+    KREQUIRE_TRUE(phys::page_mark_kind(base, mm::PageKind::PAGE_TABLE));
+
+    std::array<void*, 1> pages{base};
+    phys::PageRefBatchStats const STATS = phys::page_ref_dec_batch(std::span<void* const>{pages.data(), pages.size()});
+    KEXPECT_EQ(STATS.refs_decremented, 1U);
+    KEXPECT_EQ(STATS.pages_freed, 0U);
+
+    KEXPECT_EQ(phys::page_ref_get(base), 0U);
+    for (size_t i = 1; i < PAGE_COUNT; ++i) {
+        void* page = base + (i * paging::PAGE_SIZE);
+        KEXPECT_EQ(phys::page_ref_get(page), 1U);
+        KEXPECT_EQ(phys::page_kind_get(page), mm::PageKind::PAGE_TABLE);
+    }
+
+    phys::page_free(base);
+}
+
+KTEST(MM, SplitLargeAllocationMakesAllLeavesIndependentlyFreeable) {
+    constexpr size_t PAGE_COUNT = 8;
+    auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));
+    KREQUIRE_NE(base, nullptr);
+    KREQUIRE_TRUE(phys::page_mark_kind(base, mm::PageKind::PAGE_TABLE));
+
+    std::array<void*, PAGE_COUNT> pages{};
+    for (size_t i = 0; i < PAGE_COUNT; ++i) {
+        pages.at(i) = base + (i * paging::PAGE_SIZE);
+        KEXPECT_EQ(phys::page_kind_get(pages.at(i)), mm::PageKind::PAGE_TABLE);
+        KEXPECT_EQ(phys::page_ref_get(pages.at(i)), 1U);
+    }
+
+    KREQUIRE_TRUE(phys::page_split_to_order0(base));
+    KEXPECT_TRUE(phys::page_split_to_order0(base));
+
+    for (void* page : pages) {
+        KEXPECT_EQ(phys::page_kind_get(page), mm::PageKind::PAGE_TABLE);
+        KEXPECT_EQ(phys::page_ref_get(page), 1U);
+    }
+
+    phys::PageRefBatchStats const STATS = phys::page_ref_dec_batch(std::span<void* const>{pages.data(), pages.size()});
+    KEXPECT_EQ(STATS.refs_decremented, static_cast<uint64_t>(PAGE_COUNT));
+    KEXPECT_EQ(STATS.pages_freed, static_cast<uint64_t>(PAGE_COUNT));
+
+    for (void* page : pages) {
+        KEXPECT_EQ(phys::page_kind_get(page), mm::PageKind::FREE);
+        KEXPECT_EQ(phys::page_ref_get(page), 0U);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Negative reclaim contracts: protected or ambiguous frames must not be
 // reclaimed as ordinary user data.
@@ -516,4 +593,22 @@ KTEST(MM, LargePageAlloc) {
     KREQUIRE_NE(mem, nullptr);
     KEXPECT_EQ(is_page_aligned(mem), true);
     phys::page_free(mem);
+}
+
+KTEST(MM, PerCpuPageCacheRevivalOrder0FreeResetsMetadata) {
+    void* page = phys::page_alloc();
+    KREQUIRE_NE(page, nullptr);
+    KEXPECT_EQ(phys::page_ref_get(page), 1U);
+    KEXPECT_EQ(phys::page_kind_get(page), mm::PageKind::NORMAL);
+    KREQUIRE_TRUE(phys::page_mark_kind(page, mm::PageKind::PAGE_TABLE));
+
+    phys::page_free(page);
+    KEXPECT_EQ(phys::page_ref_get(page), 0U);
+    KEXPECT_EQ(phys::page_kind_get(page), mm::PageKind::FREE);
+
+    void* fresh_page = phys::page_alloc();
+    KREQUIRE_NE(fresh_page, nullptr);
+    KEXPECT_EQ(phys::page_ref_get(fresh_page), 1U);
+    KEXPECT_EQ(phys::page_kind_get(fresh_page), mm::PageKind::NORMAL);
+    phys::page_free(fresh_page);
 }

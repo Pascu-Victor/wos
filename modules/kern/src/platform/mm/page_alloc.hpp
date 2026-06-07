@@ -60,6 +60,7 @@ enum class PageKind : uint8_t {
 
 struct PageAllocator {
     struct FreeBlock {
+        FreeBlock* prev;
         FreeBlock* next;
     };
 
@@ -79,8 +80,8 @@ struct PageAllocator {
     static constexpr uint8_t FLAG_ALLOC_CONT = 0xC0;
     static constexpr uint8_t FLAG_RESERVED = 0xFF;
 
-    std::array<FreeBlock*, MAX_ORDER + 1> free_list{};  // one singly-linked list per order
-    std::atomic<bool> lock_held{false};                 // protects free_list/page_flags mutations
+    std::array<FreeBlock*, MAX_ORDER + 1> free_list{};  // one doubly-linked list per order
+    std::atomic<bool> lock_held{false};                 // protects free_list/page_flags/link mutations
     uint8_t* page_flags = nullptr;                      // 1 byte per page
     std::atomic<uint8_t>* page_kinds = nullptr;         // PageKind per page
     std::atomic<uint32_t>* page_refcounts = nullptr;    // 1 refcount per page (for COW fork)
@@ -120,9 +121,9 @@ struct PageAllocator {
     uint64_t free_order0_range_at(uint32_t page_idx, uint32_t page_count);
 
     // Re-tag a contiguous allocated block as a run of independently freeable
-    // order-0 pages while preserving the existing per-page refcounts.
-    // Use this when a multi-page allocation will be mapped/freed as separate
-    // 4 KiB leaves.
+    // order-0 pages while preserving the existing per-page kind/refcount/caller
+    // metadata. Call this before exposing a multi-page allocation through PTEs
+    // that teardown will later reclaim as separate 4 KiB leaves.
     auto split_allocated_block_to_order0(void* ptr) const -> bool;
 
     // Mark/query the kind metadata for a live allocation. Marking applies to

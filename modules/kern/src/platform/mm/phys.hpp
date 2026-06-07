@@ -83,7 +83,9 @@ auto page_alloc_can_satisfy(uint64_t size, uint64_t reserve_bytes = 0) -> bool;
 // Increment the refcount for a physical page (HHDM pointer).
 // Pages start at refcount 1 after pageAlloc().
 void page_ref_inc(void* page);
+void page_ref_inc(void* page, PageLookupHint* hint);
 void page_ref_add(void* page, uint64_t refs);
+void page_ref_add(void* page, uint64_t refs, PageLookupHint* hint);
 // Decrement the refcount. When it reaches 0 the page is freed.
 // Returns the new refcount (0 = freed).
 uint32_t page_ref_dec(void* page);

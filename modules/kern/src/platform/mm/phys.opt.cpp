@@ -1291,14 +1291,16 @@ auto page_kind_get(void* page, PageLookupHint* hint) -> PageKind {
     return alloc->kind_of(page);
 }
 
-void page_ref_inc(void* page) {
+void page_ref_inc(void* page) { page_ref_inc(page, nullptr); }
+
+void page_ref_inc(void* page, PageLookupHint* hint) {
     if (page == nullptr) {
         return;
     }
 
     PageAllocator* alloc = nullptr;
     uint32_t idx = 0;
-    if (!find_allocator_for_page(page, alloc, idx)) {
+    if (!find_allocator_for_page_cached(page, hint, alloc, idx)) {
         return;
     }
 
@@ -1319,7 +1321,9 @@ void page_ref_inc(void* page) {
     }
 }
 
-void page_ref_add(void* page, uint64_t refs) {
+void page_ref_add(void* page, uint64_t refs) { page_ref_add(page, refs, nullptr); }
+
+void page_ref_add(void* page, uint64_t refs, PageLookupHint* hint) {
     if (page == nullptr || refs == 0) {
         return;
     }
@@ -1330,7 +1334,7 @@ void page_ref_add(void* page, uint64_t refs) {
 
     PageAllocator* alloc = nullptr;
     uint32_t idx = 0;
-    if (!find_allocator_for_page(page, alloc, idx)) {
+    if (!find_allocator_for_page_cached(page, hint, alloc, idx)) {
         return;
     }
 
@@ -1458,10 +1462,10 @@ auto free_zero_ref_page_locked(ZeroRefPage const& zero_ref_page, uint64_t& freed
         return false;
     }
 
+    // Refcount teardown frees only independently freeable order-0 leaves.
+    // Multi-page buddy allocations must be split before any PTE can expose
+    // their pages to leaf-by-leaf reclaim.
     freed_bytes = zero_ref_page.alloc->free_order0_at(zero_ref_page.idx);
-    if (freed_bytes == 0) {
-        freed_bytes = zero_ref_page.alloc->free(zero_ref_page.page);
-    }
     return freed_bytes != 0;
 }
 

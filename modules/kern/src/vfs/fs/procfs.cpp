@@ -2060,6 +2060,12 @@ auto generate_memacc_alloc_totals(char* buf, size_t bufsz) -> size_t {
     append_memacc_dec(p, end, "free_count", phys.free_count);
     append_memacc_dec(p, end, "total_mem_bytes", phys.total_mem_bytes);
     append_memacc_dec(p, end, "free_mem_bytes", phys.free_mem_bytes);
+    append_memacc_dec(p, end, "total_allocated_pages", phys.total_allocated_pages);
+    append_memacc_dec(p, end, "total_freed_pages", phys.total_freed_pages);
+    append_memacc_dec(p, end, "live_allocated_pages", phys.live_allocated_pages);
+    append_memacc_dec(p, end, "current_free_pages", phys.current_free_pages);
+    append_memacc_dec(p, end, "alloc_operation_count", phys.alloc_count);
+    append_memacc_dec(p, end, "free_operation_count", phys.free_count);
     append_char(p, end, '\n');
 
     ker::mod::mm::dyn::kmalloc::KmallocTrackedTotals kmalloc{};
@@ -3053,6 +3059,8 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, mm_destroy.data_pages_ref_decremented);
         append_sconst(p, end, " dus_freed=");
         append_dec64(p, end, mm_destroy.data_pages_freed);
+        append_sconst(p, end, " dus_ptrefdec=");
+        append_dec64(p, end, mm_destroy.page_table_pages_ref_decremented);
         append_sconst(p, end, " dus_ptfree=");
         append_dec64(p, end, mm_destroy.page_table_pages_freed);
         append_sconst(p, end, " dus_huge_skip=");

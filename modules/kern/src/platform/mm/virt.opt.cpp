@@ -175,6 +175,7 @@ struct DestroyUserSpaceStatsAtomic {
     std::atomic<uint64_t> data_leaf_entries_visited{0};
     std::atomic<uint64_t> data_pages_ref_decremented{0};
     std::atomic<uint64_t> data_pages_freed{0};
+    std::atomic<uint64_t> page_table_pages_ref_decremented{0};
     std::atomic<uint64_t> page_table_pages_freed{0};
     std::atomic<uint64_t> skipped_huge_pages{0};
     std::atomic<uint64_t> skipped_unknown_frames{0};
@@ -193,6 +194,7 @@ struct DestroyUserSpaceCallStats {
     uint64_t data_leaf_entries_visited = 0;
     uint64_t data_pages_ref_decremented = 0;
     uint64_t data_pages_freed = 0;
+    uint64_t page_table_pages_ref_decremented = 0;
     uint64_t page_table_pages_freed = 0;
     uint64_t skipped_huge_pages = 0;
     uint64_t skipped_unknown_frames = 0;
@@ -237,6 +239,15 @@ void note_destroy_refdec_batch_stats(DestroyUserSpaceCallStats* stats, phys::Pag
 
     stats->data_pages_ref_decremented += batch_stats.refs_decremented;
     stats->data_pages_freed += batch_stats.pages_freed;
+}
+
+void note_destroy_page_table_refdec_batch_stats(DestroyUserSpaceCallStats* stats, phys::PageRefBatchStats const& batch_stats) {
+    if (stats == nullptr) {
+        return;
+    }
+
+    stats->page_table_pages_ref_decremented += batch_stats.refs_decremented;
+    stats->page_table_pages_freed += batch_stats.pages_freed;
 }
 
 void note_destroy_huge_skip(DestroyUserSpaceCallStats* stats) {
@@ -307,6 +318,7 @@ void note_destroy_user_space_stats(DestroyUserSpaceCallStats const& sample) {
     stats.data_leaf_entries_visited.fetch_add(sample.data_leaf_entries_visited, std::memory_order_relaxed);
     stats.data_pages_ref_decremented.fetch_add(sample.data_pages_ref_decremented, std::memory_order_relaxed);
     stats.data_pages_freed.fetch_add(sample.data_pages_freed, std::memory_order_relaxed);
+    stats.page_table_pages_ref_decremented.fetch_add(sample.page_table_pages_ref_decremented, std::memory_order_relaxed);
     stats.page_table_pages_freed.fetch_add(sample.page_table_pages_freed, std::memory_order_relaxed);
     stats.skipped_huge_pages.fetch_add(sample.skipped_huge_pages, std::memory_order_relaxed);
     stats.skipped_unknown_frames.fetch_add(sample.skipped_unknown_frames, std::memory_order_relaxed);
@@ -1400,6 +1412,7 @@ struct DestroyUserSpaceBudgetState {
     FrameProbeCache frame_probe_cache{};
     std::array<DestroyWalkFrame, 4> stack{};
     RefdecBatch refdec_batch{};
+    RefdecBatch page_table_refdec_batch{};
     size_t stack_size = 0;
 };
 
@@ -1407,21 +1420,38 @@ namespace {
 
 using DestroyRefdecBatch = DestroyUserSpaceBudgetState::RefdecBatch;
 
-void destroy_refdec_batch_flush(DestroyRefdecBatch& batch, DestroyUserSpaceCallStats* stats) {
+enum class DestroyRefdecBatchKind : uint8_t {
+    DATA,
+    PAGE_TABLE,
+};
+
+void note_destroy_refdec_batch_stats(DestroyUserSpaceCallStats* stats, phys::PageRefBatchStats const& batch_stats,
+                                     DestroyRefdecBatchKind kind) {
+    switch (kind) {
+        case DestroyRefdecBatchKind::DATA:
+            note_destroy_refdec_batch_stats(stats, batch_stats);
+            break;
+        case DestroyRefdecBatchKind::PAGE_TABLE:
+            note_destroy_page_table_refdec_batch_stats(stats, batch_stats);
+            break;
+    }
+}
+
+void destroy_refdec_batch_flush(DestroyRefdecBatch& batch, DestroyUserSpaceCallStats* stats, DestroyRefdecBatchKind kind) {
     if (batch.count == 0) {
         return;
     }
 
     phys::PageRefBatchStats const BATCH_STATS =
         phys::page_ref_dec_batch(std::span<void* const>{batch.pages.data(), batch.count}, &batch.lookup);
-    note_destroy_refdec_batch_stats(stats, BATCH_STATS);
+    note_destroy_refdec_batch_stats(stats, BATCH_STATS, kind);
     batch.count = 0;
 }
 
-void destroy_refdec_batch_queue(DestroyRefdecBatch& batch, void* page, DestroyUserSpaceCallStats* stats) {
+void destroy_refdec_batch_queue(DestroyRefdecBatch& batch, void* page, DestroyUserSpaceCallStats* stats, DestroyRefdecBatchKind kind) {
     batch.pages.at(batch.count++) = page;
     if (batch.count >= batch.pages.size()) {
-        destroy_refdec_batch_flush(batch, stats);
+        destroy_refdec_batch_flush(batch, stats, kind);
     }
 }
 
@@ -1465,11 +1495,19 @@ void destroy_state_pop(DestroyUserSpaceBudgetState& state) {
 }
 
 void destroy_state_flush_refdec_batch(DestroyUserSpaceBudgetState& state, DestroyUserSpaceCallStats* stats) {
-    destroy_refdec_batch_flush(state.refdec_batch, stats);
+    destroy_refdec_batch_flush(state.refdec_batch, stats, DestroyRefdecBatchKind::DATA);
+}
+
+void destroy_state_flush_page_table_refdec_batch(DestroyUserSpaceBudgetState& state, DestroyUserSpaceCallStats* stats) {
+    destroy_refdec_batch_flush(state.page_table_refdec_batch, stats, DestroyRefdecBatchKind::PAGE_TABLE);
 }
 
 void destroy_state_queue_refdec(DestroyUserSpaceBudgetState& state, void* page, DestroyUserSpaceCallStats& stats) {
-    destroy_refdec_batch_queue(state.refdec_batch, page, &stats);
+    destroy_refdec_batch_queue(state.refdec_batch, page, &stats, DestroyRefdecBatchKind::DATA);
+}
+
+void destroy_state_queue_page_table_refdec(DestroyUserSpaceBudgetState& state, void* page, DestroyUserSpaceCallStats& stats) {
+    destroy_refdec_batch_queue(state.page_table_refdec_batch, page, &stats, DestroyRefdecBatchKind::PAGE_TABLE);
 }
 
 void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& frames, DestroyUserSpaceCallStats* stats,
@@ -1703,8 +1741,7 @@ auto advance_free_page_tables_budgeted(DestroyUserSpaceBudgetState& state, Destr
             int const LEVEL = static_cast<int>(static_cast<uint8_t>(frame.level));
             destroy_state_pop(state);
             if (LEVEL < 4 && PHYS_ADDR != 0) {
-                phys::page_ref_dec(table, &state.frame_probe_cache.lookup);
-                stats.page_table_pages_freed++;
+                destroy_state_queue_page_table_refdec(state, table, stats);
                 return true;
             }
             continue;
@@ -1762,6 +1799,7 @@ auto advance_free_page_tables_budgeted(DestroyUserSpaceBudgetState& state, Destr
         return true;
     }
 
+    destroy_state_flush_page_table_refdec_batch(state, &stats);
     state.phase = DestroyUserSpacePhase::TLB_FLUSH;
     return false;
 }
@@ -2016,7 +2054,7 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
                 uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
                 if ((VIRT_RAW >> CANONICAL_SIGN_BIT) == CANONICAL_KERNEL_UPPER) {
                     void* page_virt = reinterpret_cast<void*>(VIRT_RAW);
-                    destroy_refdec_batch_queue(refdec_batch, page_virt, stats);
+                    destroy_refdec_batch_queue(refdec_batch, page_virt, stats, DestroyRefdecBatchKind::DATA);
                 } else {
                     note_destroy_corrupt_skip(stats);
                     log::warn(
@@ -2053,8 +2091,8 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
 // Helper to free a page table level recursively after user data pages are gone.
 // level: 4=PML4, 3=PML3, 2=PML2, 1=PML1
 // vaddr_base: accumulated virtual address bits from outer levels (for diagnostics)
-void free_page_table_pages(PageTable* table, int level, DestroyUserSpaceCallStats* stats, uint64_t vaddr_base = 0,
-                           FrameProbeCache* frame_probe_cache = nullptr) {
+void free_page_table_pages(PageTable* table, int level, DestroyRefdecBatch& page_table_refdec_batch, DestroyUserSpaceCallStats* stats,
+                           uint64_t vaddr_base = 0, FrameProbeCache* frame_probe_cache = nullptr) {
     if (table == nullptr || level < 1) {
         return;
     }
@@ -2097,11 +2135,9 @@ void free_page_table_pages(PageTable* table, int level, DestroyUserSpaceCallStat
                 continue;
             }
             auto* next_level = reinterpret_cast<PageTable*>(VIRT_RAW);
-            free_page_table_pages(next_level, level - 1, stats, ENTRY_VADDR, frame_probe_cache);
-            phys::page_ref_dec(next_level, frame_probe_cache != nullptr ? &frame_probe_cache->lookup : nullptr);
-            if (stats != nullptr) {
-                stats->page_table_pages_freed++;
-            }
+            entry = paging::purge_page_table_entry();
+            free_page_table_pages(next_level, level - 1, page_table_refdec_batch, stats, ENTRY_VADDR, frame_probe_cache);
+            destroy_refdec_batch_queue(page_table_refdec_batch, next_level, stats, DestroyRefdecBatchKind::PAGE_TABLE);
         } else if (level > 1 && entry.pagesize != 0) {
             note_destroy_huge_skip(stats);
         } else if (IS_MEDIUM_ALLOC) {
@@ -2191,6 +2227,7 @@ auto destroy_user_space_budgeted(DestroyUserSpaceBudgetState* state, uint32_t ma
     }
 
     destroy_state_flush_refdec_batch(*state, &stats);
+    destroy_state_flush_page_table_refdec_batch(*state, &stats);
     note_destroy_user_space_phase_time(stats, phase, elapsed_us_since(phase_started_us, time::get_us()));
     note_destroy_user_space_stats(stats);
     return state->phase == DestroyUserSpacePhase::DONE;
@@ -2201,6 +2238,7 @@ void destroy_user_space_budget_state_destroy(DestroyUserSpaceBudgetState* state)
         return;
     }
     destroy_state_flush_refdec_batch(*state, nullptr);
+    destroy_state_flush_page_table_refdec_batch(*state, nullptr);
     delete state;
 }
 
@@ -2229,11 +2267,13 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owne
     DestroyRefdecBatch refdec_batch{};
     free_user_data_pages(pagemap, 4, pagemap, page_table_frames, refdec_batch, &stats, 0, owner_pid, owner_name, reason,
                          &frame_probe_cache);
-    destroy_refdec_batch_flush(refdec_batch, &stats);
+    destroy_refdec_batch_flush(refdec_batch, &stats, DestroyRefdecBatchKind::DATA);
     stats.free_data_us = elapsed_us_since(phase_start_us, time::get_us());
 
     phase_start_us = time::get_us();
-    free_page_table_pages(pagemap, 4, &stats, 0, &frame_probe_cache);
+    DestroyRefdecBatch page_table_refdec_batch{};
+    free_page_table_pages(pagemap, 4, page_table_refdec_batch, &stats, 0, &frame_probe_cache);
+    destroy_refdec_batch_flush(page_table_refdec_batch, &stats, DestroyRefdecBatchKind::PAGE_TABLE);
     stats.free_pt_us = elapsed_us_since(phase_start_us, time::get_us());
 
     // Invalidate TLB for this address space
@@ -2268,6 +2308,7 @@ auto get_destroy_user_space_stats(uint64_t cpu_no) -> DestroyUserSpaceStats {
         .data_leaf_entries_visited = stats.data_leaf_entries_visited.load(std::memory_order_relaxed),
         .data_pages_ref_decremented = stats.data_pages_ref_decremented.load(std::memory_order_relaxed),
         .data_pages_freed = stats.data_pages_freed.load(std::memory_order_relaxed),
+        .page_table_pages_ref_decremented = stats.page_table_pages_ref_decremented.load(std::memory_order_relaxed),
         .page_table_pages_freed = stats.page_table_pages_freed.load(std::memory_order_relaxed),
         .skipped_huge_pages = stats.skipped_huge_pages.load(std::memory_order_relaxed),
         .skipped_unknown_frames = stats.skipped_unknown_frames.load(std::memory_order_relaxed),
@@ -2288,6 +2329,7 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
     // Page table pages (PML3/PML2/PML1) are freshly allocated for dst.
 
     constexpr size_t USER_PML4_ENTRIES = 256;
+    phys::PageLookupHint ref_lookup{};
     for (size_t i4 = 0; i4 < USER_PML4_ENTRIES; i4++) {
         auto& src_pml4e = entry_at(src, i4);
         auto& dst_pml4e = entry_at(dst, i4);
@@ -2428,12 +2470,13 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                     // Increment refcount on the shared data page
                     paddr_t const DATA_PHYS = src_pml1e.frame << paging::PAGE_SHIFT;
                     void* data_virt = reinterpret_cast<void*>(addr::get_virt_pointer(DATA_PHYS));
-                    phys::page_ref_inc(data_virt);
+                    phys::page_ref_inc(data_virt, &ref_lookup);
                     if (is_watched_mmap_vaddr(VADDR)) {
                         log::warn("watch mmap-cow: src=%p dst=%p vaddr=0x%llx phys=0x%llx writable=%u cow=%u ref=%llu",
                                   static_cast<void*>(src), static_cast<void*>(dst), static_cast<unsigned long long>(VADDR),
                                   static_cast<unsigned long long>(DATA_PHYS), WAS_WRITABLE ? 1U : 0U,
-                                  (raw & paging::PAGE_COW) != 0U ? 1U : 0U, static_cast<unsigned long long>(phys::page_ref_get(data_virt)));
+                                  (raw & paging::PAGE_COW) != 0U ? 1U : 0U,
+                                  static_cast<unsigned long long>(phys::page_ref_get(data_virt, &ref_lookup)));
                     }
                 }
             }

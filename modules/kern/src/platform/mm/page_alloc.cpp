@@ -89,27 +89,74 @@ void drop_corrupt_free_list_head(PageAllocator* alloc, int order, PageAllocator:
     alloc->free_list.at(static_cast<size_t>(order)) = nullptr;
 }
 
-// Remove a specific FreeBlock from a singly-linked list.
-// Returns true if found and removed.
-auto list_remove(PageAllocator* alloc, int order, PageAllocator::FreeBlock*& head, PageAllocator::FreeBlock* target) -> bool {
-    PageAllocator::FreeBlock** prev = &head;
-    PageAllocator::FreeBlock* cur = head;
-    while (cur != nullptr) {
-        uint32_t cur_idx = 0;
-        if (!free_head_is_valid(alloc, cur, order, cur_idx)) {
-            dbg::emergency_log("page_alloc: corrupt free-list node while removing order=%lu ptr=0x%lx\n", static_cast<uint64_t>(order),
-                               reinterpret_cast<uint64_t>(cur));
-            *prev = nullptr;
+auto free_list_head(PageAllocator* alloc, int order) -> PageAllocator::FreeBlock*& {
+    return alloc->free_list.at(static_cast<size_t>(order));
+}
+
+void insert_free_block(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block) {
+    auto& head = free_list_head(alloc, order);
+    if (head != nullptr) {
+        uint32_t head_idx = 0;
+        if (!free_head_is_valid(alloc, head, order, head_idx)) {
+            drop_corrupt_free_list_head(alloc, order, head);
+            head = nullptr;
+        } else {
+            head->prev = block;
+        }
+    }
+
+    block->prev = nullptr;
+    block->next = head;
+    head = block;
+}
+
+auto remove_free_block(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block) -> bool {
+    uint32_t block_idx = 0;
+    if (!free_head_is_valid(alloc, block, order, block_idx)) {
+        dbg::emergency_log("page_alloc: corrupt free-list target order=%lu ptr=0x%lx\n", static_cast<uint64_t>(order),
+                           reinterpret_cast<uint64_t>(block));
+        return false;
+    }
+
+    auto& head = free_list_head(alloc, order);
+    auto* const PREV = block->prev;
+    auto* const NEXT = block->next;
+
+    if (PREV == nullptr) {
+        if (head != block) {
+            dbg::emergency_log("page_alloc: free-list target missing prev order=%lu ptr=0x%lx head=0x%lx\n", static_cast<uint64_t>(order),
+                               reinterpret_cast<uint64_t>(block), reinterpret_cast<uint64_t>(head));
             return false;
         }
-        if (cur == target) {
-            *prev = cur->next;
-            return true;
+    } else {
+        uint32_t prev_idx = 0;
+        if (!free_head_is_valid(alloc, PREV, order, prev_idx) || PREV->next != block) {
+            dbg::emergency_log("page_alloc: corrupt free-list prev order=%lu ptr=0x%lx prev=0x%lx\n", static_cast<uint64_t>(order),
+                               reinterpret_cast<uint64_t>(block), reinterpret_cast<uint64_t>(PREV));
+            return false;
         }
-        prev = &cur->next;
-        cur = cur->next;
     }
-    return false;
+
+    if (NEXT != nullptr) {
+        uint32_t next_idx = 0;
+        if (!free_head_is_valid(alloc, NEXT, order, next_idx) || NEXT->prev != block) {
+            dbg::emergency_log("page_alloc: corrupt free-list next order=%lu ptr=0x%lx next=0x%lx\n", static_cast<uint64_t>(order),
+                               reinterpret_cast<uint64_t>(block), reinterpret_cast<uint64_t>(NEXT));
+            return false;
+        }
+    }
+
+    if (PREV == nullptr) {
+        head = NEXT;
+    } else {
+        PREV->next = NEXT;
+    }
+    if (NEXT != nullptr) {
+        NEXT->prev = PREV;
+    }
+    block->prev = nullptr;
+    block->next = nullptr;
+    return true;
 }
 
 auto page_has_live_tracked_alloc_magic(PageAllocator* alloc, uint32_t page_idx, PageKind tracked_kind, uint64_t magic) -> bool {
@@ -171,7 +218,7 @@ auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order) ->
 
         // Remove buddy from its free list.
         auto* buddy_block = reinterpret_cast<PageAllocator::FreeBlock*>(page_to_ptr(alloc->base, BUDDY_IDX));
-        if (!list_remove(alloc, k, alloc->free_list.at(static_cast<size_t>(k)), buddy_block)) {
+        if (!remove_free_block(alloc, k, buddy_block)) {
             break;
         }
 
@@ -189,8 +236,7 @@ auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order) ->
 
     // Prepend to the free list.
     auto* free_block = reinterpret_cast<PageAllocator::FreeBlock*>(page_to_ptr(alloc->base, page_idx));
-    free_block->next = alloc->free_list.at(static_cast<size_t>(k));
-    alloc->free_list.at(static_cast<size_t>(k)) = free_block;
+    insert_free_block(alloc, k, free_block);
     return FREED_BYTES;
 }
 
@@ -324,8 +370,7 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
 
         // Prepend to the order's free list (link through the page itself).
         auto* block = reinterpret_cast<FreeBlock*>(page_to_ptr(base, page));
-        block->next = free_list.at(static_cast<size_t>(order));
-        free_list.at(static_cast<size_t>(order)) = block;
+        insert_free_block(this, order, block);
 
         free_count += BLOCK_SIZE;
         page += BLOCK_SIZE;
@@ -337,6 +382,9 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
 // ============================================================================
 
 void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
+#ifndef WOS_PHYS_ALLOC_CALLER_STATS
+    (void)caller;
+#endif
     int const ORDER = size_to_order(size_bytes);
 
     // Walk up to find the smallest available block >= requested order.
@@ -357,7 +405,12 @@ void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
         }
 
         // Pop head of free_list[k].
-        free_list.at(static_cast<size_t>(k)) = block->next;
+        if (!remove_free_block(this, k, block)) {
+            drop_corrupt_free_list_head(this, k, block);
+            k++;
+            block = nullptr;
+            continue;
+        }
         break;
     }
 
@@ -378,8 +431,7 @@ void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
         }
 
         auto* buddy_block = reinterpret_cast<FreeBlock*>(page_to_ptr(base, BUDDY_IDX));
-        buddy_block->next = free_list.at(static_cast<size_t>(k));
-        free_list.at(static_cast<size_t>(k)) = buddy_block;
+        insert_free_block(this, k, buddy_block);
     }
 
     // Mark the allocated block.

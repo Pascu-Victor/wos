@@ -259,6 +259,36 @@ void print_kib_line(const char* label, uint64_t bytes) {
     std::printf("%-24s %12llu KiB\n", label, static_cast<unsigned long long>(bytes_to_kib(bytes)));
 }
 
+template <size_t N>
+auto contains_key(const std::array<std::string_view, N>& keys, std::string_view key) -> bool {
+    return std::find(keys.begin(), keys.end(), key) != keys.end();
+}
+
+template <size_t N>
+void print_ordered_row(const Row& row, const std::array<std::string_view, N>& keys) {
+    std::printf("%s", row.record.c_str());
+    for (std::string_view key : keys) {
+        auto it = row.kv.find(std::string(key));
+        if (it != row.kv.end()) {
+            std::printf(" %.*s=%s", static_cast<int>(key.size()), key.data(), it->second.c_str());
+        }
+    }
+    for (const auto& kv : row.kv) {
+        if (!contains_key(keys, kv.first)) {
+            std::printf(" %s=%s", kv.first.c_str(), kv.second.c_str());
+        }
+    }
+    std::printf("\n");
+}
+
+void print_raw_row(const Row& row) {
+    std::printf("%s", row.record.c_str());
+    for (const auto& kv : row.kv) {
+        std::printf(" %s=%s", kv.first.c_str(), kv.second.c_str());
+    }
+    std::printf("\n");
+}
+
 auto load_procs() -> std::vector<ProcRow> {
     std::vector<ProcRow> out;
     for (const auto& row : read_rows("procs")) {
@@ -434,6 +464,17 @@ void print_summary() {
                 static_cast<unsigned long long>(get_u64(*summary, "tasks")),
                 static_cast<unsigned long long>(get_u64(*summary, "kernel_tasks")));
 
+    auto alloc_rows = read_rows("alloc_totals");
+    if (const Row* phys = first_record(alloc_rows, "phys"); phys != nullptr) {
+        std::printf("physical allocator pages allocated=%llu freed=%llu live=%llu free=%llu alloc_ops=%llu free_ops=%llu\n",
+                    static_cast<unsigned long long>(get_u64(*phys, "total_allocated_pages")),
+                    static_cast<unsigned long long>(get_u64(*phys, "total_freed_pages")),
+                    static_cast<unsigned long long>(get_u64(*phys, "live_allocated_pages")),
+                    static_cast<unsigned long long>(get_u64(*phys, "current_free_pages")),
+                    static_cast<unsigned long long>(get_u64(*phys, "alloc_count")),
+                    static_cast<unsigned long long>(get_u64(*phys, "free_count")));
+    }
+
     for (const auto& row : rows) {
         if (row.record == "feature") {
             std::printf("feature %-14s available=%s enabled=%s generation=%llu\n", get_string(row, "name").c_str(),
@@ -444,12 +485,17 @@ void print_summary() {
 }
 
 void print_alloc_rows() {
+    constexpr std::array<std::string_view, 13> PHYS_ALLOC_KEYS{
+        "total_allocated_bytes", "total_freed_bytes",     "live_allocated_bytes",  "alloc_count",       "free_count",
+        "total_mem_bytes",       "free_mem_bytes",        "total_allocated_pages", "total_freed_pages", "live_allocated_pages",
+        "current_free_pages",    "alloc_operation_count", "free_operation_count"};
+
     for (const auto& row : read_rows("alloc_totals")) {
-        std::printf("%s", row.record.c_str());
-        for (const auto& kv : row.kv) {
-            std::printf(" %s=%s", kv.first.c_str(), kv.second.c_str());
+        if (row.record == "phys") {
+            print_ordered_row(row, PHYS_ALLOC_KEYS);
+        } else {
+            print_raw_row(row);
         }
-        std::printf("\n");
     }
 }
 
