@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <span>
@@ -9,6 +10,7 @@
 
 namespace phys = ker::mod::mm::phys;
 namespace paging = ker::mod::mm::paging;
+namespace mm = ker::mod::mm;
 
 namespace {
 
@@ -134,6 +136,120 @@ KTEST(MM, RefCountBatchFinalFreeWithLookupHint) {
     for (void* page : pages) {
         KEXPECT_EQ(phys::page_ref_get(page, &hint), 0U);
     }
+}
+
+KTEST(MM, PageKindTracksSplitBatchFree) {
+    constexpr size_t PAGE_COUNT = 4;
+    auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));
+    KREQUIRE_NE(base, nullptr);
+
+    KREQUIRE_TRUE(phys::page_mark_kind(base, mm::PageKind::PAGE_TABLE));
+
+    std::array<void*, PAGE_COUNT> pages{};
+    for (size_t i = 0; i < PAGE_COUNT; ++i) {
+        pages.at(i) = base + (i * paging::PAGE_SIZE);
+        KEXPECT_EQ(phys::page_kind_get(pages.at(i)), mm::PageKind::PAGE_TABLE);
+    }
+
+    KREQUIRE_TRUE(phys::page_split_to_order0(base));
+    for (void* page : pages) {
+        KEXPECT_EQ(phys::page_kind_get(page), mm::PageKind::PAGE_TABLE);
+        KEXPECT_EQ(phys::page_ref_get(page), 1U);
+    }
+
+    phys::PageRefBatchStats const STATS = phys::page_ref_dec_batch(std::span<void* const>{pages.data(), pages.size()});
+    KEXPECT_EQ(STATS.refs_decremented, static_cast<uint64_t>(PAGE_COUNT));
+    KEXPECT_EQ(STATS.pages_freed, static_cast<uint64_t>(PAGE_COUNT));
+
+    for (void* page : pages) {
+        KEXPECT_EQ(phys::page_kind_get(page), mm::PageKind::FREE);
+        KEXPECT_EQ(phys::page_ref_get(page), 0U);
+    }
+}
+
+KTEST(MM, RefCountBatchMixedFinalAndNonFinal) {
+    constexpr size_t PAGE_COUNT = 4;
+    std::array<void*, PAGE_COUNT> pages{};
+    for (auto& page : pages) {
+        page = phys::page_alloc();
+        if (!KEXPECT_NE(page, nullptr)) {
+            for (void* allocated_page : pages) {
+                if (allocated_page != nullptr) {
+                    phys::page_free(allocated_page);
+                }
+            }
+            return;
+        }
+    }
+
+    phys::page_ref_inc(pages.at(0));
+    phys::page_ref_inc(pages.at(2));
+    phys::page_ref_inc(pages.at(2));
+
+    phys::PageRefBatchStats const STATS = phys::page_ref_dec_batch(std::span<void* const>{pages.data(), pages.size()});
+    KEXPECT_EQ(STATS.refs_decremented, static_cast<uint64_t>(PAGE_COUNT));
+    KEXPECT_EQ(STATS.pages_freed, 2U);
+
+    KEXPECT_EQ(phys::page_ref_get(pages.at(0)), 1U);
+    KEXPECT_EQ(phys::page_ref_get(pages.at(1)), 0U);
+    KEXPECT_EQ(phys::page_ref_get(pages.at(2)), 2U);
+    KEXPECT_EQ(phys::page_ref_get(pages.at(3)), 0U);
+    KEXPECT_EQ(phys::page_kind_get(pages.at(1)), mm::PageKind::FREE);
+    KEXPECT_EQ(phys::page_kind_get(pages.at(3)), mm::PageKind::FREE);
+
+    KEXPECT_EQ(phys::page_ref_dec(pages.at(0)), 0U);
+    KEXPECT_EQ(phys::page_ref_dec(pages.at(2)), 1U);
+    KEXPECT_EQ(phys::page_ref_dec(pages.at(2)), 0U);
+}
+
+KTEST(MM, RefCountBatchFlushesMoreThanInternalCap) {
+    constexpr size_t PAGE_COUNT = 130;
+    std::array<void*, PAGE_COUNT> pages{};
+    for (auto& page : pages) {
+        page = phys::page_alloc();
+        if (!KEXPECT_NE(page, nullptr)) {
+            for (void* allocated_page : pages) {
+                if (allocated_page != nullptr) {
+                    phys::page_free(allocated_page);
+                }
+            }
+            return;
+        }
+    }
+
+    phys::PageRefBatchStats const STATS = phys::page_ref_dec_batch(std::span<void* const>{pages.data(), pages.size()});
+    KEXPECT_EQ(STATS.refs_decremented, static_cast<uint64_t>(PAGE_COUNT));
+    KEXPECT_EQ(STATS.pages_freed, static_cast<uint64_t>(PAGE_COUNT));
+
+    for (void* page : pages) {
+        KEXPECT_EQ(phys::page_ref_get(page), 0U);
+        KEXPECT_EQ(phys::page_kind_get(page), mm::PageKind::FREE);
+    }
+}
+
+KTEST(MM, RefCountBatchDuplicateAndNullEntries) {
+    void* duplicate_page = phys::page_alloc();
+    void* single_page = phys::page_alloc();
+    if (!KEXPECT_NE(duplicate_page, nullptr) || !KEXPECT_NE(single_page, nullptr)) {
+        if (duplicate_page != nullptr) {
+            phys::page_free(duplicate_page);
+        }
+        if (single_page != nullptr) {
+            phys::page_free(single_page);
+        }
+        return;
+    }
+
+    phys::page_ref_inc(duplicate_page);
+    std::array<void*, 5> pages{duplicate_page, nullptr, duplicate_page, single_page, nullptr};
+
+    phys::PageRefBatchStats const STATS = phys::page_ref_dec_batch(std::span<void* const>{pages.data(), pages.size()});
+    KEXPECT_EQ(STATS.refs_decremented, 3U);
+    KEXPECT_EQ(STATS.pages_freed, 2U);
+    KEXPECT_EQ(phys::page_ref_get(duplicate_page), 0U);
+    KEXPECT_EQ(phys::page_ref_get(single_page), 0U);
+    KEXPECT_EQ(phys::page_kind_get(duplicate_page), mm::PageKind::FREE);
+    KEXPECT_EQ(phys::page_kind_get(single_page), mm::PageKind::FREE);
 }
 
 // ---------------------------------------------------------------------------

@@ -73,6 +73,7 @@ auto page_kind_from_byte(uint8_t value) -> PageKind {
         case PageKind::PAGE_TABLE:
         case PageKind::SLAB:
         case PageKind::MEDIUM:
+        case PageKind::KMALLOC_LARGE:
             return static_cast<PageKind>(value);
         case PageKind::UNKNOWN:
         default:
@@ -125,10 +126,24 @@ auto list_remove(PageAllocator* alloc, int order, PageAllocator::FreeBlock*& hea
     return false;
 }
 
+auto page_has_live_tracked_alloc_magic(PageAllocator* alloc, uint32_t page_idx, PageKind tracked_kind, uint64_t magic) -> bool {
+    PageKind const KIND = page_kind_from_byte(alloc->page_kinds[page_idx].load(std::memory_order_acquire));
+    if (KIND != tracked_kind && KIND != PageKind::UNKNOWN) {
+        return false;
+    }
+
+    const auto PAGE_BASE = reinterpret_cast<uint64_t>(page_to_ptr(alloc->base, page_idx));
+    return *reinterpret_cast<const uint64_t*>(PAGE_BASE + 16) == magic;
+}
+
 auto page_has_live_medium_alloc_magic(PageAllocator* alloc, uint32_t page_idx) -> bool {
     constexpr uint64_t MEDIUM_ALLOC_MAGIC = 0xCAFEBABE87654321ULL;
-    const auto PAGE_BASE = reinterpret_cast<uint64_t>(page_to_ptr(alloc->base, page_idx));
-    return *reinterpret_cast<const uint64_t*>(PAGE_BASE + 16) == MEDIUM_ALLOC_MAGIC;
+    return page_has_live_tracked_alloc_magic(alloc, page_idx, PageKind::MEDIUM, MEDIUM_ALLOC_MAGIC);
+}
+
+auto page_has_live_large_alloc_magic(PageAllocator* alloc, uint32_t page_idx) -> bool {
+    constexpr uint64_t LARGE_ALLOC_MAGIC = 0xDEADBEEF12345678ULL;
+    return page_has_live_tracked_alloc_magic(alloc, page_idx, PageKind::KMALLOC_LARGE, LARGE_ALLOC_MAGIC);
 }
 
 auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order) -> uint64_t {
@@ -434,6 +449,11 @@ uint64_t PageAllocator::free(void* ptr) {
         dbg::emergency_log("BUG: page_free on live medium alloc page=0x%lx caller_ptr=0x%lx\n", PAGE_BASE, reinterpret_cast<uint64_t>(ptr));
         ker::mod::dbg::panic_handler("page_free called on live kmalloc medium alloc");
     }
+    if (page_has_live_large_alloc_magic(this, page_idx)) {
+        auto const PAGE_BASE = reinterpret_cast<uint64_t>(page_to_ptr(base, page_idx));
+        dbg::emergency_log("BUG: page_free on live large alloc page=0x%lx caller_ptr=0x%lx\n", PAGE_BASE, reinterpret_cast<uint64_t>(ptr));
+        ker::mod::dbg::panic_handler("page_free called on live kmalloc large alloc");
+    }
 
     int const ORDER = FLAGS & 0x1F;
     if (ORDER > MAX_ORDER) {
@@ -457,6 +477,11 @@ uint64_t PageAllocator::free_order0_at(uint32_t page_idx) {
         dbg::emergency_log("BUG: page_free on live medium alloc page=0x%lx caller_idx=%lu\n", PAGE_BASE, static_cast<uint64_t>(page_idx));
         ker::mod::dbg::panic_handler("page_free called on live kmalloc medium alloc");
     }
+    if (page_has_live_large_alloc_magic(this, page_idx)) {
+        auto const PAGE_BASE = reinterpret_cast<uint64_t>(page_to_ptr(base, page_idx));
+        dbg::emergency_log("BUG: page_free on live large alloc page=0x%lx caller_idx=%lu\n", PAGE_BASE, static_cast<uint64_t>(page_idx));
+        ker::mod::dbg::panic_handler("page_free called on live kmalloc large alloc");
+    }
     return free_allocated_block(this, page_idx, 0);
 }
 
@@ -478,6 +503,11 @@ uint64_t PageAllocator::free_order0_range_at(uint32_t page_idx, uint32_t page_co
             dbg::emergency_log("BUG: page_free on live medium alloc page=0x%lx caller_idx=%lu\n", PAGE_BASE,
                                static_cast<uint64_t>(CUR_IDX));
             ker::mod::dbg::panic_handler("page_free called on live kmalloc medium alloc");
+        }
+        if (page_has_live_large_alloc_magic(this, CUR_IDX)) {
+            auto const PAGE_BASE = reinterpret_cast<uint64_t>(page_to_ptr(base, CUR_IDX));
+            dbg::emergency_log("BUG: page_free on live large alloc page=0x%lx caller_idx=%lu\n", PAGE_BASE, static_cast<uint64_t>(CUR_IDX));
+            ker::mod::dbg::panic_handler("page_free called on live kmalloc large alloc");
         }
     }
 

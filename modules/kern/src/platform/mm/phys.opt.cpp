@@ -106,7 +106,7 @@ struct TrackedSpinlock {
     }
 };
 
-TrackedSpinlock memlock;  // Global lock for zone list and large allocations
+TrackedSpinlock memlock;  // Lifecycle lock for zone-list and huge-zone initialization
 
 // Per-CPU cache deferred initialization info
 uint64_t per_cpu_caches_phys_base = 0;
@@ -1326,6 +1326,22 @@ struct ZeroRefPage {
     uint32_t idx = 0;
 };
 
+auto page_kind_from_ref_guard_byte(uint8_t value) -> PageKind {
+    switch (static_cast<PageKind>(value)) {
+        case PageKind::FREE:
+        case PageKind::RESERVED:
+        case PageKind::NORMAL:
+        case PageKind::PAGE_TABLE:
+        case PageKind::SLAB:
+        case PageKind::MEDIUM:
+        case PageKind::KMALLOC_LARGE:
+            return static_cast<PageKind>(value);
+        case PageKind::UNKNOWN:
+        default:
+            return PageKind::UNKNOWN;
+    }
+}
+
 auto page_ref_dec_atomic(void* page, uint32_t& new_ref, ZeroRefPage& zero_ref_page, PageAllocator*& allocator_hint) -> bool {
     zero_ref_page = {};
     PageAllocator* alloc = nullptr;
@@ -1356,10 +1372,42 @@ auto page_ref_dec_atomic(void* page, uint32_t& new_ref, ZeroRefPage& zero_ref_pa
     return false;
 }
 
-void verify_zero_ref_page_is_not_live_slab(void* page, const char* op_name) {
+void verify_zero_ref_page_is_releasable(ZeroRefPage const& zero_ref_page, const char* op_name) {
     constexpr uint32_t SLAB_MAGIC = 0x8CBEEFC8;
-    if (*reinterpret_cast<const volatile uint32_t*>(page) == SLAB_MAGIC) {
-        log::critical("DETECT: %s freeing live slab page - UAF trap! virt=%p", op_name, page);
+    constexpr uint64_t MEDIUM_ALLOC_MAGIC = 0xCAFEBABE87654321ULL;
+    constexpr uint64_t LARGE_ALLOC_MAGIC = 0xDEADBEEF12345678ULL;
+    PageKind const KIND =
+        zero_ref_page.alloc != nullptr && zero_ref_page.idx < zero_ref_page.alloc->total_pages
+            ? page_kind_from_ref_guard_byte(zero_ref_page.alloc->page_kinds[zero_ref_page.idx].load(std::memory_order_acquire))
+            : PageKind::UNKNOWN;
+    if (KIND == PageKind::SLAB) {
+        log::critical("DETECT: %s freeing live slab page - UAF trap! virt=%p", op_name, zero_ref_page.page);
+        hcf();
+    }
+    if (KIND == PageKind::MEDIUM) {
+        log::critical("DETECT: %s freeing live kmalloc medium page - UAF trap! virt=%p", op_name, zero_ref_page.page);
+        hcf();
+    }
+    if (KIND == PageKind::KMALLOC_LARGE) {
+        log::critical("DETECT: %s freeing live kmalloc large page - UAF trap! virt=%p", op_name, zero_ref_page.page);
+        hcf();
+    }
+    if (KIND != PageKind::UNKNOWN) {
+        return;
+    }
+
+    void* const PAGE = zero_ref_page.page;
+    if (*reinterpret_cast<const volatile uint32_t*>(PAGE) == SLAB_MAGIC) {
+        log::critical("DETECT: %s freeing live slab page - UAF trap! virt=%p", op_name, PAGE);
+        hcf();
+    }
+    uint64_t const ALLOC_MAGIC = *reinterpret_cast<const volatile uint64_t*>(reinterpret_cast<uint64_t>(PAGE) + 16);
+    if (ALLOC_MAGIC == MEDIUM_ALLOC_MAGIC) {
+        log::critical("DETECT: %s freeing live kmalloc medium page - UAF trap! virt=%p", op_name, PAGE);
+        hcf();
+    }
+    if (ALLOC_MAGIC == LARGE_ALLOC_MAGIC) {
+        log::critical("DETECT: %s freeing live kmalloc large page - UAF trap! virt=%p", op_name, PAGE);
         hcf();
     }
 }
@@ -1496,7 +1544,7 @@ auto page_ref_dec(void* page, PageLookupHint* hint) -> uint32_t {
         return new_ref;
     }
 
-    verify_zero_ref_page_is_not_live_slab(page, "page_ref_dec");
+    verify_zero_ref_page_is_releasable(zero_ref_page, "page_ref_dec");
     PageRefBatchStats stats{};
     free_zero_ref_pages(std::span<ZeroRefPage const>{&zero_ref_page, 1}, stats);
     return new_ref;
@@ -1544,7 +1592,7 @@ auto page_ref_dec_batch(std::span<void* const> pages, PageLookupHint* hint) -> P
         if (zero_ref_page.page == nullptr) {
             continue;
         }
-        verify_zero_ref_page_is_not_live_slab(page, "page_ref_dec_batch");
+        verify_zero_ref_page_is_releasable(zero_ref_page, "page_ref_dec_batch");
         zero_ref_pages.at(zero_ref_count++) = zero_ref_page;
         if (zero_ref_count >= zero_ref_pages.size()) {
             flush_zero_ref_pages();

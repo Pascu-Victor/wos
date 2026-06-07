@@ -811,6 +811,7 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
             return nullptr;
         }
     }
+    (void)phys::page_mark_kind(alloc_ptr, PageKind::KMALLOC_LARGE);
 
     // Set up header with tracking info
     auto* header = static_cast<LargeAllocationHeader*>(alloc_ptr);
@@ -1064,6 +1065,7 @@ auto realloc(void* ptr, size_t size) -> void* {
                     return nullptr;
                 }
             }
+            (void)phys::page_mark_kind(new_alloc, PageKind::KMALLOC_LARGE);
 
             auto* new_header = static_cast<LargeAllocationHeader*>(new_alloc);
             new_header->size = NEW_ALLOC_SIZE;

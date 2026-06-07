@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "platform/mm/page_alloc.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
 
@@ -10,13 +11,15 @@ namespace ker::mod::mm::dyn::slab {
 
 namespace {
 
-auto slab_page(Slab* slab) -> void* {
-    return reinterpret_cast<void*>(page_align_down(reinterpret_cast<uint64_t>(slab)));
-}
+auto slab_page(Slab* slab) -> void* { return reinterpret_cast<void*>(page_align_down(reinterpret_cast<uint64_t>(slab))); }
 
 auto create_slab() -> Slab* {
     auto* free_slab = static_cast<FreeSlab*>(phys::page_alloc());
     if (free_slab == nullptr) {
+        return nullptr;
+    }
+    if (!phys::page_mark_kind(free_slab, PageKind::SLAB)) {
+        phys::page_free(free_slab);
         return nullptr;
     }
 
@@ -33,9 +36,7 @@ auto create_slab() -> Slab* {
     return slab;
 }
 
-void free_slab(Slab* slab) {
-    phys::page_free(slab_page(slab));
-}
+void free_slab(Slab* slab) { phys::page_free(slab_page(slab)); }
 
 void append_slab_list(SlabCache* cache, Slab* head) {
     if (head == nullptr) {

@@ -14,6 +14,7 @@ enum class PageKind : uint8_t {
     PAGE_TABLE = 4,
     SLAB = 5,
     MEDIUM = 6,
+    KMALLOC_LARGE = 7,
 };
 
 // Linux-style free-list buddy page allocator.
@@ -78,12 +79,12 @@ struct PageAllocator {
     // number of bytes released, or 0 if the pointer was not a live allocation.
     uint64_t free(void* ptr);
 
-    // Fast path for callers that already resolved allocator/index under the
-    // global physical allocator lock. Only frees a live order-0 page.
+    // Fast path for callers that already resolved allocator/index and hold
+    // the owning PageAllocator lock. Only frees a live order-0 page.
     uint64_t free_order0_at(uint32_t page_idx);
 
-    // Batch fast path for callers that already hold the global physical
-    // allocator lock. Frees a contiguous run of live zero-ref order-0 pages.
+    // Batch fast path for callers that already hold the owning PageAllocator
+    // lock. Frees a contiguous run of live zero-ref order-0 pages.
     uint64_t free_order0_range_at(uint32_t page_idx, uint32_t page_count);
 
     // Re-tag a contiguous allocated block as a run of independently freeable
