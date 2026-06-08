@@ -86,12 +86,10 @@ auto free_head_is_valid(const PageAllocator* alloc, PageAllocator::FreeBlock* bl
 void drop_corrupt_free_list_head(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block) {
     dbg::emergency_log("page_alloc: dropping corrupt free-list head order=%lu ptr=0x%lx zone_base=0x%lx\n", static_cast<uint64_t>(order),
                        reinterpret_cast<uint64_t>(block), alloc->base);
-    alloc->free_list.at(static_cast<size_t>(order)) = nullptr;
+    alloc->free_list[static_cast<size_t>(order)] = nullptr;
 }
 
-auto free_list_head(PageAllocator* alloc, int order) -> PageAllocator::FreeBlock*& {
-    return alloc->free_list.at(static_cast<size_t>(order));
-}
+auto free_list_head(PageAllocator* alloc, int order) -> PageAllocator::FreeBlock*& { return alloc->free_list[static_cast<size_t>(order)]; }
 
 void insert_free_block(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block) {
     auto& head = free_list_head(alloc, order);
@@ -413,7 +411,7 @@ void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
     uint32_t page_idx = 0;
     FreeBlock* block = nullptr;
     while (k <= MAX_ORDER) {
-        block = free_list.at(static_cast<size_t>(k));
+        block = free_list[static_cast<size_t>(k)];
         if (block == nullptr) {
             k++;
             continue;
@@ -480,7 +478,7 @@ void* PageAllocator::alloc_order0(uint64_t caller) {
     (void)caller;
 #endif
 
-    auto* const BLOCK = free_list.at(0);
+    auto* const BLOCK = free_list[0];
     if (BLOCK == nullptr) {
         return nullptr;
     }
@@ -506,7 +504,7 @@ void* PageAllocator::alloc_order0(uint64_t caller) {
 
 void* PageAllocator::claim_free_order0_for_cache(uint32_t& out_page_idx) {
     out_page_idx = 0;
-    auto* const BLOCK = free_list.at(0);
+    auto* const BLOCK = free_list[0];
     if (BLOCK == nullptr) {
         return nullptr;
     }

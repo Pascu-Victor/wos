@@ -57,6 +57,17 @@ struct PerCpuPageCache {
 __attribute__((section(".data"))) paging::PageZone* zones = nullptr;
 __attribute__((section(".data"))) paging::PageZone* huge_page_zone = nullptr;  // Dedicated zone for huge allocations
 
+struct ZoneLookupEntry {
+    uint64_t start = 0;
+    uint64_t end = 0;
+    paging::PageZone* zone = nullptr;
+};
+
+constexpr size_t MAX_ZONE_LOOKUP_ENTRIES = 128;
+std::array<ZoneLookupEntry, MAX_ZONE_LOOKUP_ENTRIES> regular_zone_lookup{};
+size_t regular_zone_lookup_count = 0;
+bool regular_zone_lookup_ready = false;
+
 // Per-CPU caches (initialized in init())
 PerCpuPageCache* per_cpu_caches = nullptr;
 size_t num_cpus = 0;
@@ -288,6 +299,68 @@ void subtract_ranges(std::array<PhysRange, MAX_SANITIZED_RANGES>& ranges, size_t
     for (size_t i = 0; i < cut_count; ++i) {
         subtract_range(ranges, count, cuts.at(i));
     }
+}
+
+paging::PageZone* scan_regular_zone_for_addr(uint64_t addr) {
+    for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
+        uint64_t const END = zone->start + zone->len;
+        if (END < zone->start || addr < zone->start || addr >= END) {
+            continue;
+        }
+        return zone;
+    }
+    return nullptr;
+}
+
+void rebuild_regular_zone_lookup_index() {
+    regular_zone_lookup_ready = false;
+    regular_zone_lookup_count = 0;
+    for (auto& entry : regular_zone_lookup) {
+        entry = {};
+    }
+
+    for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
+        uint64_t const END = zone->start + zone->len;
+        if (zone->allocator == nullptr || zone->len == 0 || END <= zone->start) {
+            continue;
+        }
+        if (regular_zone_lookup_count >= regular_zone_lookup.size()) {
+            regular_zone_lookup_count = 0;
+            return;
+        }
+        regular_zone_lookup[regular_zone_lookup_count++] = ZoneLookupEntry{
+            .start = zone->start,
+            .end = END,
+            .zone = zone,
+        };
+    }
+
+    std::sort(regular_zone_lookup.begin(), regular_zone_lookup.begin() + static_cast<ptrdiff_t>(regular_zone_lookup_count),
+              [](ZoneLookupEntry const& lhs, ZoneLookupEntry const& rhs) { return lhs.start < rhs.start; });
+    regular_zone_lookup_ready = regular_zone_lookup_count != 0;
+}
+
+paging::PageZone* regular_zone_for_addr(uint64_t addr) {
+    if (!regular_zone_lookup_ready) {
+        return scan_regular_zone_for_addr(addr);
+    }
+
+    size_t low = 0;
+    size_t high = regular_zone_lookup_count;
+    while (low < high) {
+        size_t const MID = low + ((high - low) / 2);
+        ZoneLookupEntry const& entry = regular_zone_lookup[MID];
+        if (addr < entry.start) {
+            high = MID;
+            continue;
+        }
+        if (addr >= entry.end) {
+            low = MID + 1;
+            continue;
+        }
+        return entry.zone;
+    }
+    return nullptr;
 }
 
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
@@ -701,7 +774,7 @@ auto allocator_has_free_block_for_order(const PageAllocator* allocator, int orde
     }
 
     for (int idx = order; idx <= PageAllocator::MAX_ORDER; ++idx) {
-        if (allocator->free_list.at(static_cast<size_t>(idx)) != nullptr) {
+        if (allocator->free_list[static_cast<size_t>(idx)] != nullptr) {
             return true;
         }
     }
@@ -922,6 +995,7 @@ void init(limine_memmap_response* memmap_response) {
     }
 
     zones_tail->next = nullptr;
+    rebuild_regular_zone_lookup_index();
 }
 
 void set_kernel_cr3(uint64_t cr3) {
@@ -1028,8 +1102,8 @@ void prepare_allocated_block(void* block, uint64_t size, ReturnedPageZeroing zer
 void drain_per_cpu_cache_locked(PerCpuPageCache& cache, size_t max_pages) {
     size_t drained = 0;
     while (cache.count > 0 && drained < max_pages) {
-        CachedOrder0Page const ENTRY = cache.pages.at(--cache.count);
-        cache.pages.at(cache.count) = {};
+        CachedOrder0Page const ENTRY = cache.pages[--cache.count];
+        cache.pages[cache.count] = {};
         if (ENTRY.allocator == nullptr) {
             page_cache_stale_entries.fetch_add(1, std::memory_order_relaxed);
             continue;
@@ -1071,7 +1145,7 @@ void refill_per_cpu_cache_locked(PerCpuPageCache& cache) {
             if (PAGE == nullptr) {
                 break;
             }
-            cache.pages.at(cache.count++) = CachedOrder0Page{
+            cache.pages[cache.count++] = CachedOrder0Page{
                 .allocator = zone->allocator,
                 .page_idx = page_idx,
             };
@@ -1103,8 +1177,8 @@ auto try_alloc_from_per_cpu_cache(uint64_t caller_tag, ReturnedPageZeroing zeroi
 
     void* page = nullptr;
     if (cache.count > 0) {
-        CachedOrder0Page const ENTRY = cache.pages.at(--cache.count);
-        cache.pages.at(cache.count) = {};
+        CachedOrder0Page const ENTRY = cache.pages[--cache.count];
+        cache.pages[cache.count] = {};
         if (ENTRY.allocator != nullptr) {
             uint64_t const FLAGS = ENTRY.allocator->lock_irq();
             page = ENTRY.allocator->alloc_cached_order0_at(ENTRY.page_idx, caller_tag);
@@ -1164,7 +1238,7 @@ auto try_cache_freed_order0_page(PageAllocator* allocator, void* page) -> bool {
         cached = allocator->cache_allocated_order0(page, page_idx);
         allocator->unlock_irq(FLAGS);
         if (cached) {
-            cache.pages.at(cache.count++) = CachedOrder0Page{
+            cache.pages[cache.count++] = CachedOrder0Page{
                 .allocator = allocator,
                 .page_idx = page_idx,
             };
@@ -1328,25 +1402,20 @@ void page_free(void* page) {
         }
     }
 
-    // Check regular zones
-    for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
-        auto const PAGE_ADDR = reinterpret_cast<uint64_t>(page);
-        if (PAGE_ADDR < zone->start || PAGE_ADDR >= zone->start + zone->len) {
-            continue;
-        }
-
-        if (zone->allocator != nullptr) {
-            if (try_cache_freed_order0_page(zone->allocator, page)) {
-                return;
-            }
-
-            uint64_t const FLAGS = zone->allocator->lock_irq();
-            uint64_t const FREED_BYTES = zone->allocator->free(page);
-            zone->allocator->unlock_irq(FLAGS);
-            note_physical_free(FREED_BYTES);
-        }
-        break;
+    auto const PAGE_ADDR = reinterpret_cast<uint64_t>(page);
+    paging::PageZone* zone = regular_zone_for_addr(PAGE_ADDR);
+    if (zone == nullptr || zone->allocator == nullptr) {
+        return;
     }
+
+    if (try_cache_freed_order0_page(zone->allocator, page)) {
+        return;
+    }
+
+    uint64_t const FLAGS = zone->allocator->lock_irq();
+    uint64_t const FREED_BYTES = zone->allocator->free(page);
+    zone->allocator->unlock_irq(FLAGS);
+    note_physical_free(FREED_BYTES);
 }
 
 auto page_split_to_order0(void* page) -> bool {
@@ -1366,21 +1435,16 @@ auto page_split_to_order0(void* page) -> bool {
         }
     }
 
-    for (paging::PageZone const* zone = zones; zone != nullptr; zone = zone->next) {
-        auto const PAGE_ADDR = reinterpret_cast<uint64_t>(page);
-        if (PAGE_ADDR < zone->start || PAGE_ADDR >= zone->start + zone->len) {
-            continue;
-        }
-
-        uint64_t const FLAGS = zone->allocator != nullptr ? zone->allocator->lock_irq() : 0;
-        bool const OK = zone->allocator != nullptr && zone->allocator->split_allocated_block_to_order0(page);
-        if (zone->allocator != nullptr) {
-            zone->allocator->unlock_irq(FLAGS);
-        }
-        return OK;
+    auto const PAGE_ADDR = reinterpret_cast<uint64_t>(page);
+    paging::PageZone* zone = regular_zone_for_addr(PAGE_ADDR);
+    if (zone == nullptr || zone->allocator == nullptr) {
+        return false;
     }
 
-    return false;
+    uint64_t const FLAGS = zone->allocator->lock_irq();
+    bool const OK = zone->allocator->split_allocated_block_to_order0(page);
+    zone->allocator->unlock_irq(FLAGS);
+    return OK;
 }
 
 // --- Frame reference counting helpers ---
@@ -1425,14 +1489,14 @@ auto allocator_owns_page_as(PageAllocator* alloc, PageLookupOwner owner, uint64_
 
 auto find_allocator_for_page_owned(void* page, PageAllocator*& out_alloc, uint32_t& out_idx, PageLookupOwner& out_owner) -> bool {
     auto addr = reinterpret_cast<uint64_t>(page);
-    // Check regular zones first
-    for (paging::PageZone const* zone = zones; zone != nullptr; zone = zone->next) {
-        if (addr >= zone->start && addr < zone->start + zone->len && allocator_owns_page(zone->allocator, addr, out_idx)) {
-            out_alloc = zone->allocator;
-            out_owner = PageLookupOwner::REGULAR_ZONE;
-            return true;
-        }
+    // Check regular zones first.
+    paging::PageZone* zone = regular_zone_for_addr(addr);
+    if (zone != nullptr && allocator_owns_page(zone->allocator, addr, out_idx)) {
+        out_alloc = zone->allocator;
+        out_owner = PageLookupOwner::REGULAR_ZONE;
+        return true;
     }
+
     // Check huge page zone
     if (huge_page_zone != nullptr && addr >= huge_page_zone->start && addr < huge_page_zone->start + huge_page_zone->len &&
         allocator_owns_page(huge_page_zone->allocator, addr, out_idx)) {
@@ -1853,7 +1917,7 @@ auto page_ref_dec_batch(std::span<void* const> pages, PageLookupHint* hint) -> P
         }
         page_ref_batch_zero_candidates.fetch_add(1, std::memory_order_relaxed);
         verify_zero_ref_page_is_releasable(zero_ref_page, "page_ref_dec_batch");
-        zero_ref_pages.at(zero_ref_count++) = zero_ref_page;
+        zero_ref_pages[zero_ref_count++] = zero_ref_page;
         if (zero_ref_count >= zero_ref_pages.size()) {
             flush_zero_ref_pages();
         }

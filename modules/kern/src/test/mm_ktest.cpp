@@ -180,6 +180,38 @@ KTEST(MM, PageAllocWriteReadback) {
     phys::page_free(page);
 }
 
+KTEST(MM, PagemapPoolReusesZeroedRootPage) {
+    virt::PageTablePoolStatsSnapshot before{};
+    virt::get_page_table_pool_stats_snapshot(before);
+
+    auto* first = virt::create_pagemap();
+    KREQUIRE_NE(first, nullptr);
+    first->entries.at(7).present = 1;
+    first->entries.at(7).writable = 1;
+    first->entries.at(7).frame = 0x12345;
+    virt::release_pagemap(first);
+
+    auto* second = virt::create_pagemap();
+    KREQUIRE_NE(second, nullptr);
+
+    paging::PageTableEntry zero_entry{};
+    bool table_zero = true;
+    for (auto const& entry : second->entries) {
+        if (std::memcmp(&entry, &zero_entry, sizeof(entry)) != 0) {
+            table_zero = false;
+            break;
+        }
+    }
+    KEXPECT_TRUE(table_zero);
+
+    virt::PageTablePoolStatsSnapshot after{};
+    virt::get_page_table_pool_stats_snapshot(after);
+    KEXPECT_TRUE(after.alloc_hits >= before.alloc_hits + 1);
+    KEXPECT_TRUE(after.releases >= before.releases + 1);
+
+    virt::release_pagemap(second);
+}
+
 KTEST(MM, MultiplePageAllocFree) {
     constexpr size_t PAGE_COUNT = 8;
     std::array<void*, PAGE_COUNT> pages{};

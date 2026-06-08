@@ -2462,6 +2462,32 @@ void cmd_cpustat() {
                      get_val("pa_cache_free_miss="), get_val("pa_cache_drain="), get_val("pa_cache_drain_pages="),
                      get_val("pa_cache_stale="));
     }
+
+    std::println("");
+    std::println("{:>4}  {:>8}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}", "CPU", "capacity", "cached", "hit", "miss", "release", "reject");
+    std::println("{:->4}  {:->8}  {:->8}  {:->10}  {:->10}  {:->10}  {:->10}", "", "", "", "", "", "", "");
+
+    pos = 0;
+    while (pos < buffer->size()) {
+        std::string_view line = next_line(*buffer, pos);
+        if (line.empty()) {
+            continue;
+        }
+
+        auto get_val = [&](std::string_view key) {
+            std::size_t key_pos = line.find(key);
+            if (key_pos == std::string_view::npos) {
+                return uint64_t{0};
+            }
+            key_pos += key.size();
+            std::size_t const END = line.find(' ', key_pos);
+            return parse_u64(line.substr(key_pos, END == std::string_view::npos ? line.size() - key_pos : END - key_pos));
+        };
+
+        std::println("{:>4}  {:>8}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}", get_val("cpu="), get_val("pt_pool_capacity="),
+                     get_val("pt_pool_cached="), get_val("pt_pool_hit="), get_val("pt_pool_miss="), get_val("pt_pool_release="),
+                     get_val("pt_pool_reject="));
+    }
 }
 
 void cmd_contstat() {

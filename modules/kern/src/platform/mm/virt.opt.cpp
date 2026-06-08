@@ -75,7 +75,103 @@ limine_memmap_response* memmap_response;
 limine_executable_file_response* kernel_file_response;
 limine_executable_address_response* kernel_address_response;
 
+constexpr size_t PAGE_TABLE_POOL_CAPACITY = 64;
+
+struct PageTablePool {
+    mod::sys::Spinlock lock;
+    std::array<PageTable*, PAGE_TABLE_POOL_CAPACITY> pages{};
+    size_t count = 0;
+};
+
+PageTablePool page_table_pool{};                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> page_table_pool_alloc_hits{0};    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> page_table_pool_alloc_misses{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> page_table_pool_releases{0};      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> page_table_pool_rejects{0};       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+auto is_current_pagemap(PageTable* pagemap) -> bool {
+    if (pagemap == nullptr) {
+        return false;
+    }
+
+    auto const PAGEMAP_PHYS = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(pagemap)));
+    return PAGEMAP_PHYS == rdcr3();
+}
+
+void zero_page_table_for_pool(PageTable* table) {
+    uint64_t saved_cr3 = 0;
+    if (kernel_pagemap != nullptr) {
+        auto const KERNEL_CR3 = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(kernel_pagemap)));
+        uint64_t const CURRENT_CR3 = rdcr3();
+        if (CURRENT_CR3 != KERNEL_CR3) {
+            saved_cr3 = CURRENT_CR3;
+            wrcr3(KERNEL_CR3);
+        }
+    }
+
+    std::memset(table, 0, sizeof(PageTable));
+
+    if (saved_cr3 != 0) {
+        wrcr3(saved_cr3);
+    }
+}
+
+auto try_alloc_page_table_from_pool() -> PageTable* {
+    auto& pool = page_table_pool;
+    uint64_t const FLAGS = pool.lock.lock_irqsave();
+    if (pool.count == 0) {
+        pool.lock.unlock_irqrestore(FLAGS);
+        page_table_pool_alloc_misses.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+
+    --pool.count;
+    auto* table = pool.pages[pool.count];
+    pool.pages[pool.count] = nullptr;
+    pool.lock.unlock_irqrestore(FLAGS);
+
+    if (phys::page_kind_get(table) != PageKind::PAGE_TABLE || phys::page_ref_get(table) != 1U) {
+        log::critical("page-table pool handed out corrupt page table page=%p", table);
+        hcf();
+    }
+
+    page_table_pool_alloc_hits.fetch_add(1, std::memory_order_relaxed);
+    return table;
+}
+
+auto try_release_page_table_to_pool(PageTable* table) -> bool {
+    if (table == nullptr) {
+        return true;
+    }
+
+    if (phys::page_kind_get(table) != PageKind::PAGE_TABLE || phys::page_ref_get(table) != 1U) {
+        page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    zero_page_table_for_pool(table);
+
+    auto& pool = page_table_pool;
+    uint64_t const FLAGS = pool.lock.lock_irqsave();
+    if (pool.count >= pool.pages.size()) {
+        pool.lock.unlock_irqrestore(FLAGS);
+        page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    pool.pages[pool.count] = table;
+    ++pool.count;
+    pool.lock.unlock_irqrestore(FLAGS);
+    page_table_pool_releases.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 auto alloc_zeroed_page_table() -> PageTable* {
+    auto* pooled_table = try_alloc_page_table_from_pool();
+    if (pooled_table != nullptr) {
+        return pooled_table;
+    }
+
     auto* table = static_cast<PageTable*>(phys::page_alloc());
     if (table == nullptr) {
         return nullptr;
@@ -101,9 +197,9 @@ auto pte_from_raw(uint64_t raw) -> paging::PageTableEntry {
 
 auto index_of(const uint64_t VADDR, const int OFFSET) -> uint64_t { return VADDR >> (12 + (9 * (OFFSET - 1))) & 0x1FF; }
 
-auto entry_at(PageTable* table, size_t index) -> PageTableEntry& { return table->entries.at(index); }
+auto entry_at(PageTable* table, size_t index) -> PageTableEntry& { return table->entries[index]; }
 
-auto entry_at(const PageTable* table, size_t index) -> const PageTableEntry& { return table->entries.at(index); }
+auto entry_at(const PageTable* table, size_t index) -> const PageTableEntry& { return table->entries[index]; }
 
 auto table_flags_for_leaf(const uint64_t FLAGS) -> uint64_t {
     uint64_t table_flags = paging::PAGE_PRESENT | paging::PAGE_WRITE;
@@ -358,7 +454,7 @@ void note_destroy_user_space_stats(DestroyUserSpaceCallStats const& sample) {
         return;
     }
 
-    auto& stats = g_destroy_user_space_stats.at(static_cast<size_t>(cpu_no));
+    auto& stats = g_destroy_user_space_stats[static_cast<size_t>(cpu_no)];
     stats.calls.fetch_add(1, std::memory_order_relaxed);
     stats.collect_frames_us_total.fetch_add(sample.collect_frames_us, std::memory_order_relaxed);
     update_relaxed_max(stats.collect_frames_us_max, sample.collect_frames_us);
@@ -435,6 +531,38 @@ void switch_to_kernel_pagemap() { wrcr3(reinterpret_cast<uint64_t>(addr::get_phy
 auto get_kernel_pagemap() -> PageTable* { return kernel_pagemap; }
 
 auto create_pagemap() -> PageTable* { return alloc_zeroed_page_table(); }
+
+void release_pagemap(PageTable* pagemap) {
+    if (pagemap == nullptr) {
+        return;
+    }
+
+    if (pagemap == kernel_pagemap || is_current_pagemap(pagemap)) {
+        page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    if (try_release_page_table_to_pool(pagemap)) {
+        return;
+    }
+
+    phys::page_free(pagemap);
+}
+
+void get_page_table_pool_stats_snapshot(PageTablePoolStatsSnapshot& out) {
+    uint64_t const FLAGS = page_table_pool.lock.lock_irqsave();
+    uint64_t const CACHED_PAGES = page_table_pool.count;
+    page_table_pool.lock.unlock_irqrestore(FLAGS);
+
+    out = {
+        .capacity = PAGE_TABLE_POOL_CAPACITY,
+        .cached_pages = CACHED_PAGES,
+        .alloc_hits = page_table_pool_alloc_hits.load(std::memory_order_relaxed),
+        .alloc_misses = page_table_pool_alloc_misses.load(std::memory_order_relaxed),
+        .releases = page_table_pool_releases.load(std::memory_order_relaxed),
+        .rejects = page_table_pool_rejects.load(std::memory_order_relaxed),
+    };
+}
 
 void copy_kernel_mappings(sched::task::Task* t) {
     if (t == nullptr) {
@@ -1523,7 +1651,10 @@ void destroy_refdec_batch_flush(DestroyRefdecBatch& batch, DestroyUserSpaceCallS
 }
 
 void destroy_refdec_batch_queue(DestroyRefdecBatch& batch, void* page, DestroyUserSpaceCallStats* stats, DestroyRefdecBatchKind kind) {
-    batch.pages.at(batch.count++) = page;
+    if (batch.count >= batch.pages.size()) {
+        destroy_refdec_batch_flush(batch, stats, kind);
+    }
+    batch.pages[batch.count++] = page;
     if (batch.count >= batch.pages.size()) {
         destroy_refdec_batch_flush(batch, stats, kind);
     }
@@ -1536,7 +1667,7 @@ void destroy_state_reset_walk(DestroyUserSpaceBudgetState& state, DestroyUserSpa
         return;
     }
 
-    state.stack.at(0) = DestroyWalkFrame{
+    state.stack[0] = DestroyWalkFrame{
         .table = state.pagemap,
         .vaddr_base = 0,
         .phys_addr = 0,
@@ -1550,7 +1681,7 @@ auto destroy_state_push(DestroyUserSpaceBudgetState& state, PageTable* table, in
     if (state.stack_size >= state.stack.size()) {
         return false;
     }
-    state.stack.at(state.stack_size++) = DestroyWalkFrame{
+    state.stack[state.stack_size++] = DestroyWalkFrame{
         .table = table,
         .vaddr_base = vaddr_base,
         .phys_addr = phys_addr,
@@ -1560,7 +1691,7 @@ auto destroy_state_push(DestroyUserSpaceBudgetState& state, PageTable* table, in
     return true;
 }
 
-auto destroy_state_top(DestroyUserSpaceBudgetState& state) -> DestroyWalkFrame& { return state.stack.at(state.stack_size - 1); }
+auto destroy_state_top(DestroyUserSpaceBudgetState& state) -> DestroyWalkFrame& { return state.stack[state.stack_size - 1]; }
 
 void destroy_state_pop(DestroyUserSpaceBudgetState& state) {
     if (state.stack_size > 0) {
@@ -2321,7 +2452,7 @@ auto get_destroy_user_space_stats(uint64_t cpu_no) -> DestroyUserSpaceStats {
         return {};
     }
 
-    auto const& stats = g_destroy_user_space_stats.at(static_cast<size_t>(cpu_no));
+    auto const& stats = g_destroy_user_space_stats[static_cast<size_t>(cpu_no)];
     return {
         .calls = stats.calls.load(std::memory_order_relaxed),
         .collect_frames_us_total = stats.collect_frames_us_total.load(std::memory_order_relaxed),

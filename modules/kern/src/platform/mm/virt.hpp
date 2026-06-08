@@ -69,6 +69,15 @@ struct DestroyUserSpaceStats {
     uint64_t magic_unknown_kmalloc_large_hits;
 };
 
+struct PageTablePoolStatsSnapshot {
+    uint64_t capacity;
+    uint64_t cached_pages;
+    uint64_t alloc_hits;
+    uint64_t alloc_misses;
+    uint64_t releases;
+    uint64_t rejects;
+};
+
 struct DestroyUserSpaceBudgetState;
 
 void init(limine_memmap_response* memmap_response, limine_executable_file_response* kernel_file_response,
@@ -93,6 +102,8 @@ void switch_to_kernel_pagemap();
 PageTable* get_kernel_pagemap();
 void init_pagemap();
 PageTable* create_pagemap();
+void release_pagemap(PageTable* pagemap);
+void get_page_table_pool_stats_snapshot(PageTablePoolStatsSnapshot& out);
 void copy_kernel_mappings(sched::task::Task* t);
 void switch_pagemap(sched::task::Task* t);
 bool pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, ker::mod::cpu::GPRegs& gpr);
@@ -114,7 +125,7 @@ void destroy_user_space_budget_state_destroy(DestroyUserSpaceBudgetState* state)
 
 // Free all user-space pages and page tables in a pagemap
 // Only frees the lower half (user space), keeps kernel mappings intact
-// After calling this, the pagemap itself should be freed with phys::page_free
+// After calling this, the root pagemap itself should be released with release_pagemap().
 void destroy_user_space(PageTable* pagemap, uint64_t owner_pid = 0, const char* owner_name = nullptr, const char* reason = nullptr);
 
 // Deep-copy user-space page tables from src to dst using COW.

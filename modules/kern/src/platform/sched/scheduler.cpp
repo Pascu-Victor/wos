@@ -4439,7 +4439,7 @@ auto process_deferred_gc_cleanup_slice(GcTaskTiming& timing, uint32_t pagemap_st
 
         mm::virt::destroy_user_space_budget_state_destroy(item->pagemap_state);
         item->pagemap_state = nullptr;
-        mm::phys::page_free(cur->pagemap);
+        mm::virt::release_pagemap(cur->pagemap);
         cur->pagemap = nullptr;
         timing.pagemap_us = elapsed_us_since(START_US, time::get_us());
     } else {
@@ -4471,7 +4471,7 @@ void cleanup_detached_gc_task(GcDetachedTask const& detached, GcTaskTiming& timi
         uint64_t const START_US = time::get_us();
         if (detached.should_free_pagemap) {
             mm::virt::destroy_user_space(cur->pagemap, cur->pid, cur->name, "task-exit-gc");
-            mm::phys::page_free(cur->pagemap);
+            mm::virt::release_pagemap(cur->pagemap);
         }
         cur->pagemap = nullptr;
         timing.pagemap_us = elapsed_us_since(START_US, time::get_us());

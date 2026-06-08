@@ -2946,9 +2946,11 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
         auto mm_destroy = ker::mod::mm::virt::get_destroy_user_space_stats(c);
         ker::mod::mm::phys::PageRefStatsSnapshot ref_stats{};
         ker::mod::mm::phys::PageCacheStatsSnapshot page_cache_stats{};
+        ker::mod::mm::virt::PageTablePoolStatsSnapshot page_table_pool_stats{};
         if (c == 0) {
             ker::mod::mm::phys::get_page_ref_stats_snapshot(ref_stats);
             ker::mod::mm::phys::get_page_cache_stats_snapshot(page_cache_stats);
+            ker::mod::mm::virt::get_page_table_pool_stats_snapshot(page_table_pool_stats);
         }
         append_sconst(p, end, "cpu=");
         append_dec64(p, end, c);
@@ -3166,6 +3168,18 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, page_cache_stats.drain_pages);
         append_sconst(p, end, " pa_cache_stale=");
         append_dec64(p, end, page_cache_stats.stale_entries);
+        append_sconst(p, end, " pt_pool_capacity=");
+        append_dec64(p, end, page_table_pool_stats.capacity);
+        append_sconst(p, end, " pt_pool_cached=");
+        append_dec64(p, end, page_table_pool_stats.cached_pages);
+        append_sconst(p, end, " pt_pool_hit=");
+        append_dec64(p, end, page_table_pool_stats.alloc_hits);
+        append_sconst(p, end, " pt_pool_miss=");
+        append_dec64(p, end, page_table_pool_stats.alloc_misses);
+        append_sconst(p, end, " pt_pool_release=");
+        append_dec64(p, end, page_table_pool_stats.releases);
+        append_sconst(p, end, " pt_pool_reject=");
+        append_dec64(p, end, page_table_pool_stats.rejects);
         append_sconst(p, end, " lb_push=");
         append_dec64(p, end, sched.load_balance_pushes);
         if (p + 1 < end) {
