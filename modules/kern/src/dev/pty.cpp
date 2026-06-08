@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
+#include <platform/mm/addr.hpp>
+#include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <span>
@@ -85,12 +87,42 @@ auto PtyRingBuf::read(void* dst, size_t len) -> size_t {
 namespace {
 
 constexpr uint32_t DEVFS_FILE_MAGIC = 0xDEADBEEF;
+constexpr uintptr_t USER_CANONICAL_TOP = 0x0000800000000000ULL;
 
 auto is_valid_kernel_pointer(const void* ptr) -> bool {
     auto addr = reinterpret_cast<uintptr_t>(ptr);
     bool const IN_HHDM = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL);
     bool const IN_KERNEL_STATIC = (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
     return IN_HHDM || IN_KERNEL_STATIC;
+}
+
+auto read_call_buffer_byte(const void* buf, size_t index, uint8_t* out) -> bool {
+    if (buf == nullptr || out == nullptr) {
+        return false;
+    }
+
+    auto const BASE = reinterpret_cast<uintptr_t>(buf);
+    if (BASE >= USER_CANONICAL_TOP) {
+        *out = static_cast<const uint8_t*>(buf)[index];
+        return true;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr || task->pagemap == nullptr) {
+        return false;
+    }
+
+    uint64_t const VADDR = BASE + index;
+    if (VADDR < BASE || VADDR >= USER_CANONICAL_TOP) {
+        return false;
+    }
+    uint64_t const PHYS = ker::mod::mm::virt::translate(task->pagemap, VADDR);
+    if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
+        return false;
+    }
+
+    *out = *reinterpret_cast<const uint8_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
+    return true;
 }
 
 struct DevFSFileHack {
@@ -150,7 +182,7 @@ auto current_task_has_deliverable_signal() -> bool {
     if (task == nullptr) {
         return false;
     }
-    return (task->sig_pending & ~task->sig_mask) != 0;
+    return task->has_interrupting_signal_pending();
 }
 
 auto make_devfs_name(const char* name) -> std::array<char, vfs::devfs::DEVFS_NAME_MAX> {
@@ -1210,11 +1242,16 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
         }
     }
 
-    const auto* bytes = static_cast<const uint8_t*>(buf);
     size_t written = 0;
 
     for (size_t i = 0; i < count; i++) {
-        uint8_t ch = bytes[i];
+        uint8_t ch = 0;
+        if (!read_call_buffer_byte(buf, i, &ch)) {
+            if (written == 0) {
+                return finish(-EFAULT);
+            }
+            break;
+        }
 
         // Output post-processing (OPOST)
         if (((pair->termios.c_oflag & TIOS_OPOST) != 0U) && ((pair->termios.c_oflag & TIOS_ONLCR) != 0U) && ch == '\n') {

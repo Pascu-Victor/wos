@@ -134,6 +134,13 @@ auto vfs_take_fd_locked(ker::mod::sched::task::Task* task, int fd) -> File* {
     return file;
 }
 
+auto clamp_io_count(ssize_t result, size_t requested) -> ssize_t {
+    if (result <= 0 || std::cmp_less_equal(result, requested)) {
+        return result;
+    }
+    return static_cast<ssize_t>(requested);
+}
+
 struct StreamFreshnessStamp {
     off_t size = 0;
     int64_t mtime_sec = 0;
@@ -988,7 +995,8 @@ auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, size_t* actu
 
         auto chunk = std::make_unique<StreamChunk>();
         chunk->offset = FETCH_OFFSET;
-        ssize_t const READ_RET = file->fops->vfs_read(file, chunk->data.data(), STREAM_CHUNK_SIZE, static_cast<size_t>(FETCH_OFFSET));
+        ssize_t const READ_RET = clamp_io_count(
+            file->fops->vfs_read(file, chunk->data.data(), STREAM_CHUNK_SIZE, static_cast<size_t>(FETCH_OFFSET)), STREAM_CHUNK_SIZE);
 
         g_stream_cache_lock.lock();
         island->producer_active = false;
@@ -2774,14 +2782,18 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
 
     ssize_t cached_result = 0;
     if (vfs_stream_cache_try_read(f, buf, count, actual_size, &cached_result)) {
+        cached_result = clamp_io_count(cached_result, count);
         if (cached_result >= 0) {
             f->pos += cached_result;
+            if (actual_size != nullptr) {
+                *actual_size = static_cast<size_t>(cached_result);
+            }
         }
         vfs_put_file(f);
         return cached_result;
     }
 
-    ssize_t const R = f->fops->vfs_read(f, buf, count, static_cast<size_t>(f->pos));
+    ssize_t const R = clamp_io_count(f->fops->vfs_read(f, buf, count, static_cast<size_t>(f->pos)), count);
     if (R >= 0) {
         f->pos += R;
         if (actual_size != nullptr) {
@@ -2823,6 +2835,7 @@ auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ss
         }
         result = f->fops->vfs_write(f, buf, count, static_cast<size_t>(f->pos));
     }
+    result = clamp_io_count(result, count);
     if (result >= 0) {
         stream_invalidate_file(f);
         if (TMPFS_APPEND || XFS_APPEND) {
@@ -4317,7 +4330,7 @@ auto vfs_pread(int fd, void* buf, size_t count, off_t offset) -> ssize_t {
     }
     // Read at given offset without modifying file position
     f->positional_read_depth.fetch_add(1, std::memory_order_acq_rel);
-    auto result = f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset));
+    auto result = clamp_io_count(f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset)), count);
     f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
     vfs_put_file(f);
     return result;
@@ -4336,7 +4349,7 @@ auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t 
         vfs_put_file(f);
         return -ENOSYS;
     }
-    auto result = f->fops->vfs_write(f, buf, count, static_cast<size_t>(offset));
+    auto result = clamp_io_count(f->fops->vfs_write(f, buf, count, static_cast<size_t>(offset)), count);
     vfs_put_file(f);
     return result;
 }
@@ -5100,7 +5113,7 @@ auto current_task_has_deliverable_signal() -> bool {
     if (task == nullptr) {
         return false;
     }
-    return (task->sig_pending & ~task->sig_mask) != 0;
+    return task->has_interrupting_signal_pending();
 }
 
 void signal_current_sigpipe() {
@@ -5364,7 +5377,7 @@ auto file_pread_direct(File* file, void* buf, size_t count, off_t offset) -> ssi
         return -ENOSYS;
     }
     file->positional_read_depth.fetch_add(1, std::memory_order_acq_rel);
-    ssize_t const RESULT = file->fops->vfs_read(file, buf, count, static_cast<size_t>(offset));
+    ssize_t const RESULT = clamp_io_count(file->fops->vfs_read(file, buf, count, static_cast<size_t>(offset)), count);
     file->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
     return RESULT;
 }
@@ -6142,7 +6155,7 @@ void vfs_wki_load_default_rules() {
         return;
     }
 
-    ssize_t const BYTES_READ = file->fops->vfs_read(file, buffer, BYTES_TO_READ, 0);
+    ssize_t const BYTES_READ = clamp_io_count(file->fops->vfs_read(file, buffer, BYTES_TO_READ, 0), BYTES_TO_READ);
     release_open_file(file);
     if (BYTES_READ <= 0) {
         delete[] buffer;

@@ -32,7 +32,8 @@ using log = ker::mod::dbg::logger<"vmem">;
 // Kernel space: 0xFFFF800000000000 - 0xFFFFFFFFFFFFFFFF
 constexpr uint64_t USER_SPACE_START = 0x0000000000400000ULL;  // Start after first 4MB (for NULL protection and low mem)
 constexpr uint64_t USER_SPACE_END = 0x00007FFFFFFFFFFFULL;    // Linux canonical address limit
-constexpr uint64_t MMAP_START = 0x0000100000000000ULL;        // mmap base - avoid collision with ELF debug info at 0x700000000000
+constexpr uint64_t MMAP_START = 0x0000200000000000ULL;        // mmap base above ASAN shadow, below ELF debug info
+constexpr uint64_t MREMAP_MAYMOVE = 1;
 
 namespace {
 // Get the current task
@@ -131,6 +132,218 @@ auto file_mmap_can_share(const ker::vfs::Stat& st, uint64_t prot) -> bool {
 }
 
 auto is_prot_none(uint64_t prot) -> bool { return prot == ker::abi::vmem::PROT_NONE; }
+
+auto ranges_overlap(uint64_t start, uint64_t end, uint64_t other_start, uint64_t other_end) -> bool {
+    return start < other_end && other_start < end;
+}
+
+struct OccupiedVmemRange {
+    uint64_t start = 0;
+    uint64_t end = 0;
+    bool found = false;
+};
+
+auto pte_raw(const ker::mod::mm::paging::PageTableEntry& entry) -> uint64_t {
+    uint64_t raw = 0;
+    std::memcpy(&raw, &entry, sizeof(raw));
+    return raw;
+}
+
+auto is_reserved_leaf(const ker::mod::mm::paging::PageTableEntry& entry) -> bool {
+    return entry.present == 0 && (pte_raw(entry) & ker::mod::mm::paging::PAGE_RESERVED) != 0U;
+}
+
+auto table_from_entry(const ker::mod::mm::paging::PageTableEntry& entry) -> ker::mod::mm::paging::PageTable* {
+    return reinterpret_cast<ker::mod::mm::paging::PageTable*>(
+        ker::mod::mm::addr::get_virt_pointer(static_cast<uint64_t>(entry.frame) << ker::mod::mm::paging::PAGE_SHIFT));
+}
+
+auto page_table_index(uint64_t vaddr, uint64_t shift) -> size_t { return static_cast<size_t>((vaddr >> shift) & 0x1FFU); }
+
+auto next_table_boundary(uint64_t vaddr, uint64_t shift) -> uint64_t {
+    uint64_t const MASK = (1ULL << shift) - 1;
+    return (vaddr | MASK) + 1;
+}
+
+auto first_pagemap_occupied_range(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t end) -> OccupiedVmemRange {
+    if (pagemap == nullptr || start >= end) {
+        return {};
+    }
+
+    constexpr uint64_t PML4_SHIFT = 39;
+    constexpr uint64_t PML3_SHIFT = 30;
+    constexpr uint64_t PML2_SHIFT = 21;
+    constexpr uint64_t PML1_SHIFT = 12;
+
+    uint64_t addr = page_align_down(start);
+    while (addr < end) {
+        uint64_t const PML4_END = std::min(next_table_boundary(addr, PML4_SHIFT), end);
+        auto const& pml4e = pagemap->entries[page_table_index(addr, PML4_SHIFT)];
+        if (pml4e.present == 0) {
+            addr = PML4_END;
+            continue;
+        }
+
+        auto* pml3 = table_from_entry(pml4e);
+        while (addr < PML4_END) {
+            uint64_t const PML3_END = std::min(next_table_boundary(addr, PML3_SHIFT), PML4_END);
+            auto const& pml3e = pml3->entries[page_table_index(addr, PML3_SHIFT)];
+            if (pml3e.present == 0) {
+                addr = PML3_END;
+                continue;
+            }
+            if (pml3e.pagesize != 0) {
+                return {.start = addr, .end = PML3_END, .found = true};
+            }
+
+            auto* pml2 = table_from_entry(pml3e);
+            while (addr < PML3_END) {
+                uint64_t const PML2_END = std::min(next_table_boundary(addr, PML2_SHIFT), PML3_END);
+                auto const& pml2e = pml2->entries[page_table_index(addr, PML2_SHIFT)];
+                if (pml2e.present == 0) {
+                    addr = PML2_END;
+                    continue;
+                }
+                if (pml2e.pagesize != 0) {
+                    return {.start = addr, .end = PML2_END, .found = true};
+                }
+
+                auto* pml1 = table_from_entry(pml2e);
+                while (addr < PML2_END) {
+                    uint64_t const PML1_END = std::min(next_table_boundary(addr, PML1_SHIFT), PML2_END);
+                    auto const& pte = pml1->entries[page_table_index(addr, PML1_SHIFT)];
+                    if (pte.present != 0 || is_reserved_leaf(pte)) {
+                        return {.start = addr, .end = PML1_END, .found = true};
+                    }
+                    addr = PML1_END;
+                }
+            }
+        }
+    }
+
+    return {};
+}
+
+auto first_lazy_vmem_overlap(ker::mod::sched::task::Task* task, uint64_t start, uint64_t end) -> OccupiedVmemRange {
+    if (task == nullptr || start >= end) {
+        return {};
+    }
+
+    OccupiedVmemRange first{};
+    for (const auto& range : task->lazy_vmem_ranges) {
+        if (!ranges_overlap(start, end, range.start, range.end)) {
+            continue;
+        }
+
+        OccupiedVmemRange const OVERLAP{
+            .start = std::max(start, range.start),
+            .end = std::min(end, range.end),
+            .found = true,
+        };
+        if (!first.found || OVERLAP.start < first.start) {
+            first = OVERLAP;
+        }
+    }
+    return first;
+}
+
+auto first_occupied_range(ker::mod::sched::task::Task* task, uint64_t start, uint64_t end) -> OccupiedVmemRange {
+    if (task == nullptr || task->pagemap == nullptr || start >= end) {
+        return {};
+    }
+
+    auto first = first_pagemap_occupied_range(task->pagemap, start, end);
+    auto const LAZY = first_lazy_vmem_overlap(task, start, end);
+    if (LAZY.found && (!first.found || LAZY.start < first.start)) {
+        first = LAZY;
+    }
+    return first;
+}
+
+auto remove_lazy_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size) -> bool {
+    if (task == nullptr || size == 0 || vaddr > UINT64_MAX - size) {
+        return true;
+    }
+
+    uint64_t const END = vaddr + size;
+    for (size_t i = 0; i < task->lazy_vmem_ranges.size();) {
+        auto range = task->lazy_vmem_ranges.at(i);
+        if (!ranges_overlap(vaddr, END, range.start, range.end)) {
+            i++;
+            continue;
+        }
+
+        task->lazy_vmem_ranges.remove_at(i);
+        if (range.start < vaddr) {
+            auto left = range;
+            left.end = vaddr;
+            if (!task->lazy_vmem_ranges.push_back(left)) {
+                return false;
+            }
+        }
+        if (END < range.end) {
+            auto right = range;
+            right.start = END;
+            if (!task->lazy_vmem_ranges.push_back(right)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+auto add_lazy_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size, uint64_t prot, uint64_t flags) -> bool {
+    if (task == nullptr || size == 0 || vaddr > UINT64_MAX - size) {
+        return false;
+    }
+    if (!remove_lazy_vmem_range(task, vaddr, size)) {
+        return false;
+    }
+
+    ker::mod::sched::task::LazyVmemRange const RANGE{.start = vaddr, .end = vaddr + size, .prot = prot, .flags = flags};
+    return task->lazy_vmem_ranges.push_back(RANGE);
+}
+
+auto protect_lazy_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size, uint64_t prot) -> bool {
+    if (task == nullptr || size == 0 || vaddr > UINT64_MAX - size) {
+        return true;
+    }
+
+    uint64_t const END = vaddr + size;
+    for (size_t i = 0; i < task->lazy_vmem_ranges.size();) {
+        auto range = task->lazy_vmem_ranges.at(i);
+        if (!ranges_overlap(vaddr, END, range.start, range.end)) {
+            i++;
+            continue;
+        }
+
+        task->lazy_vmem_ranges.remove_at(i);
+        if (range.start < vaddr) {
+            auto left = range;
+            left.end = vaddr;
+            if (!task->lazy_vmem_ranges.push_back(left)) {
+                return false;
+            }
+        }
+
+        auto middle = range;
+        middle.start = std::max(range.start, vaddr);
+        middle.end = std::min(range.end, END);
+        middle.prot = prot;
+        if (!task->lazy_vmem_ranges.push_back(middle)) {
+            return false;
+        }
+
+        if (END < range.end) {
+            auto right = range;
+            right.start = END;
+            if (!task->lazy_vmem_ranges.push_back(right)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
 
 auto file_mmap_cache_lookup(const FileMmapPageKey& key) -> void* {
     uint64_t const USE_STAMP = g_file_mmap_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -268,13 +481,7 @@ auto mmap_range_is_free(ker::mod::sched::task::Task* task, uint64_t vaddr, uint6
         return false;
     }
 
-    for (uint64_t addr = vaddr; addr < vaddr + size; addr += ker::mod::mm::paging::PAGE_SIZE) {
-        if (ker::mod::mm::virt::is_page_mapped_or_reserved(task->pagemap, addr)) {
-            return false;
-        }
-    }
-
-    return true;
+    return !first_occupied_range(task, vaddr, vaddr + size).found;
 }
 
 auto find_free_range_from(ker::mod::sched::task::Task* task, uint64_t size, uint64_t start) -> uint64_t {
@@ -284,21 +491,16 @@ auto find_free_range_from(ker::mod::sched::task::Task* task, uint64_t size, uint
 
     uint64_t current_addr = page_align_up(start);
     while (current_addr <= USER_SPACE_END - size) {
-        if (mmap_range_is_free(task, current_addr, size)) {
+        auto const OCCUPIED = first_occupied_range(task, current_addr, current_addr + size);
+        if (!OCCUPIED.found) {
             return current_addr;
         }
 
-        bool skipped_mapped_page = false;
-        for (uint64_t addr = current_addr; addr < current_addr + size; addr += ker::mod::mm::paging::PAGE_SIZE) {
-            if (ker::mod::mm::virt::is_page_mapped_or_reserved(task->pagemap, addr)) {
-                current_addr = page_align_up(addr + ker::mod::mm::paging::PAGE_SIZE);
-                skipped_mapped_page = true;
-                break;
-            }
+        uint64_t const NEXT_ADDR = page_align_up(OCCUPIED.end);
+        if (NEXT_ADDR <= current_addr) {
+            return 0;
         }
-        if (!skipped_mapped_page) {
-            current_addr += ker::mod::mm::paging::PAGE_SIZE;
-        }
+        current_addr = NEXT_ADDR;
     }
 
     return 0;
@@ -411,6 +613,35 @@ auto materialize_reserved_page(ker::mod::sched::task::Task* task, uint64_t vaddr
 
 void rollback_mapped_pages(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t mapped_pages);
 
+void release_fixed_mmap_range(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size) {
+    if (task == nullptr || task->pagemap == nullptr || size == 0) {
+        return;
+    }
+
+    (void)remove_lazy_vmem_range(task, vaddr, size);
+
+    uint64_t const END = vaddr + size;
+    uint64_t cursor = vaddr;
+    while (cursor < END) {
+        auto const OCCUPIED = first_pagemap_occupied_range(task->pagemap, cursor, END);
+        if (!OCCUPIED.found) {
+            return;
+        }
+
+        for (uint64_t current_vaddr = OCCUPIED.start; current_vaddr < OCCUPIED.end; current_vaddr += ker::mod::mm::paging::PAGE_SIZE) {
+            if (ker::mod::mm::virt::is_page_mapped_or_reserved(task->pagemap, current_vaddr)) {
+                ker::mod::mm::virt::unmap_page(task->pagemap, current_vaddr);
+            }
+        }
+
+        uint64_t const NEXT = page_align_up(OCCUPIED.end);
+        if (NEXT <= cursor) {
+            return;
+        }
+        cursor = NEXT;
+    }
+}
+
 auto private_anon_allocate(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size, uint64_t prot, uint64_t hint, uint64_t flags)
     -> uint64_t {
     auto const PAGE_FLAGS = prot_to_page_flags(prot);
@@ -499,8 +730,9 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
 
     // Find a free virtual address range
     uint64_t vaddr = 0;
+    bool const IS_FIXED = ((flags & ker::abi::vmem::MAP_FIXED) != 0) && hint != 0;
 
-    if (((flags & ker::abi::vmem::MAP_FIXED) != 0) && hint != 0) {
+    if (IS_FIXED) {
         // MAP_FIXED: use exact address
         if (hint < USER_SPACE_START || hint > USER_SPACE_END - size) {
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
@@ -519,9 +751,14 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
     }
 
     auto const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
+    if (IS_FIXED) {
+        release_fixed_mmap_range(task, vaddr, size);
+    }
 
-    if (is_prot_none(prot)) {
-        ker::mod::mm::virt::reserve_page_range(task->pagemap, vaddr, NUM_PAGES);
+    if (is_prot_none(prot) || (flags & ker::abi::vmem::MAP_NORESERVE) != 0) {
+        if (!add_lazy_vmem_range(task, vaddr, size, prot, flags)) {
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+        }
         advance_mmap_cursor(task, vaddr, size);
         record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 1, 0,
                                 vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
@@ -619,6 +856,9 @@ auto anon_free(uint64_t addr, uint64_t size) -> uint64_t {
 
     // Unmap pages
     uint64_t const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
+    if (!remove_lazy_vmem_range(task, addr, size)) {
+        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+    }
     for (uint64_t i = 0; i < NUM_PAGES; i++) {
         uint64_t const CURRENT_VADDR = addr + (i * ker::mod::mm::paging::PAGE_SIZE);
 
@@ -655,7 +895,11 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
     }
 
     ker::vfs::Stat st{};
-    if (ker::vfs::vfs_fstat(fd, &st) < 0) {
+    int const STAT_RET = ker::vfs::vfs_fstat(fd, &st);
+    if (STAT_RET < 0) {
+        log::warn("file mmap fstat failed: fd=%d ret=%d hint=0x%llx size=0x%llx flags=0x%llx prot=0x%llx off=0x%llx", fd, STAT_RET,
+                  static_cast<unsigned long long>(hint), static_cast<unsigned long long>(size), static_cast<unsigned long long>(flags),
+                  static_cast<unsigned long long>(prot), static_cast<unsigned long long>(offset));
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
@@ -665,8 +909,12 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
     }
 
     uint64_t vaddr = 0;
-    if (((flags & ker::abi::vmem::MAP_FIXED) != 0) && hint != 0) {
+    bool const IS_FIXED = ((flags & ker::abi::vmem::MAP_FIXED) != 0) && hint != 0;
+    if (IS_FIXED) {
         if (hint < USER_SPACE_START || hint > USER_SPACE_END - size) {
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+        }
+        if (hint % ker::mod::mm::paging::PAGE_SIZE != 0) {
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
         }
         vaddr = hint;
@@ -679,6 +927,9 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
 
     auto const PAGE_FLAGS = prot_to_page_flags(prot);
     auto const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
+    if (IS_FIXED) {
+        release_fixed_mmap_range(task, vaddr, size);
+    }
 
     if (file_mmap_can_share(st, prot)) {
         bool cache_ok = true;
@@ -801,6 +1052,72 @@ auto file_mmap_cache_stats() -> FileMmapCacheStats {
     return stats;
 }
 
+auto anon_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint64_t flags) -> uint64_t {
+    auto* task = get_current_task();
+    if (task == nullptr || task->pagemap == nullptr) {
+        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
+    }
+    if (old_addr == 0 || old_size == 0 || new_size == 0 || (old_addr % ker::mod::mm::paging::PAGE_SIZE) != 0) {
+        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+    }
+
+    uint64_t const OLD_SIZE = page_align_up(old_size);
+    uint64_t const NEW_SIZE = page_align_up(new_size);
+    if (old_addr + OLD_SIZE > USER_SPACE_END || old_addr + OLD_SIZE < old_addr) {
+        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+    }
+
+    if (NEW_SIZE == OLD_SIZE) {
+        return old_addr;
+    }
+    if (NEW_SIZE < OLD_SIZE) {
+        uint64_t const TAIL_ADDR = old_addr + NEW_SIZE;
+        uint64_t const TAIL_SIZE = OLD_SIZE - NEW_SIZE;
+        auto const RESULT = anon_free(TAIL_ADDR, TAIL_SIZE);
+        return static_cast<int64_t>(RESULT) < 0 ? RESULT : old_addr;
+    }
+    if ((flags & MREMAP_MAYMOVE) == 0) {
+        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+    }
+
+    auto const NEW_ADDR_RESULT = anon_allocate(0, NEW_SIZE, ker::abi::vmem::PROT_READ | ker::abi::vmem::PROT_WRITE,
+                                               ker::abi::vmem::MAP_PRIVATE | ker::abi::vmem::MAP_ANONYMOUS);
+    if (static_cast<int64_t>(NEW_ADDR_RESULT) < 0) {
+        return NEW_ADDR_RESULT;
+    }
+
+    uint64_t const NEW_ADDR = NEW_ADDR_RESULT;
+    uint64_t const COPY_SIZE = OLD_SIZE < NEW_SIZE ? OLD_SIZE : NEW_SIZE;
+    for (uint64_t off = 0; off < COPY_SIZE; off += ker::mod::mm::paging::PAGE_SIZE) {
+        uint64_t const SRC_VA = old_addr + off;
+        uint64_t const DST_VA = NEW_ADDR + off;
+        uint64_t const SRC_PA = ker::mod::mm::virt::translate(task->pagemap, SRC_VA);
+        if (SRC_PA == ker::mod::mm::virt::PADDR_INVALID) {
+            continue;
+        }
+        if (ker::mod::mm::virt::is_page_reserved(task->pagemap, DST_VA) &&
+            !materialize_reserved_page(task, DST_VA, ker::abi::vmem::PROT_READ | ker::abi::vmem::PROT_WRITE)) {
+            anon_free(NEW_ADDR, NEW_SIZE);
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+        }
+        uint64_t const DST_PA = ker::mod::mm::virt::translate(task->pagemap, DST_VA);
+        if (DST_PA == ker::mod::mm::virt::PADDR_INVALID) {
+            anon_free(NEW_ADDR, NEW_SIZE);
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
+        }
+
+        auto* src = reinterpret_cast<const void*>(ker::mod::mm::addr::get_virt_pointer(SRC_PA));
+        auto* dst = reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(DST_PA));
+        std::memcpy(dst, src, ker::mod::mm::paging::PAGE_SIZE);
+    }
+
+    auto const FREE_RESULT = anon_free(old_addr, OLD_SIZE);
+    if (static_cast<int64_t>(FREE_RESULT) < 0) {
+        return FREE_RESULT;
+    }
+    return NEW_ADDR;
+}
+
 // Main syscall handler
 auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -> uint64_t {
     switch (static_cast<ker::abi::vmem::ops>(op)) {
@@ -844,21 +1161,45 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
             }
 
-            auto page_flags = prot_to_page_flags(PROT);
-            uint64_t const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
+            if (!protect_lazy_vmem_range(task, ADDR, size, PROT)) {
+                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+            }
 
-            for (uint64_t i = 0; i < NUM_PAGES; i++) {
-                uint64_t const CURRENT_VADDR = ADDR + (i * ker::mod::mm::paging::PAGE_SIZE);
-                if (ker::mod::mm::virt::is_page_mapped(task->pagemap, CURRENT_VADDR)) {
-                    ker::mod::mm::virt::unify_page_flags(task->pagemap, CURRENT_VADDR, page_flags);
-                } else if (ker::mod::mm::virt::is_page_reserved(task->pagemap, CURRENT_VADDR)) {
-                    if (!materialize_reserved_page(task, CURRENT_VADDR, PROT)) {
+            auto page_flags = prot_to_page_flags(PROT);
+            uint64_t const END = ADDR + size;
+            uint64_t cursor = ADDR;
+            while (cursor < END) {
+                auto const OCCUPIED = first_pagemap_occupied_range(task->pagemap, cursor, END);
+                if (!OCCUPIED.found) {
+                    break;
+                }
+
+                for (uint64_t current_vaddr = OCCUPIED.start; current_vaddr < OCCUPIED.end;
+                     current_vaddr += ker::mod::mm::paging::PAGE_SIZE) {
+                    if (ker::mod::mm::virt::is_page_mapped(task->pagemap, current_vaddr)) {
+                        ker::mod::mm::virt::unify_page_flags(task->pagemap, current_vaddr, page_flags);
+                    } else if (ker::mod::mm::virt::is_page_reserved(task->pagemap, current_vaddr) &&
+                               !materialize_reserved_page(task, current_vaddr, PROT)) {
                         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
                     }
                 }
+
+                uint64_t const NEXT = page_align_up(OCCUPIED.end);
+                if (NEXT <= cursor) {
+                    break;
+                }
+                cursor = NEXT;
             }
 
             return 0;
+        }
+
+        case ker::abi::vmem::ops::MREMAP: {
+            // a1: old address
+            // a2: old size
+            // a3: new size
+            // a4: flags
+            return anon_mremap(a1, a2, a3, a4);
         }
 
         default:
@@ -869,14 +1210,30 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
 
 auto sys_vmem_map(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) -> uint64_t {
     if ((flags & ker::abi::vmem::MAP_ANONYMOUS) != 0) {
-        return anon_allocate(hint, size, prot, flags);
+        uint64_t const RESULT = anon_allocate(hint, size, prot, flags);
+        if (static_cast<int64_t>(RESULT) < 0) {
+            log::warn("anon mmap failed: ret=%ld hint=0x%llx size=0x%llx flags=0x%llx prot=0x%llx",
+                      static_cast<long>(static_cast<int64_t>(RESULT)), static_cast<unsigned long long>(hint),
+                      static_cast<unsigned long long>(size), static_cast<unsigned long long>(flags), static_cast<unsigned long long>(prot));
+        }
+        return RESULT;
     }
 
     if (fd > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+        log::warn("file mmap failed: fd out of range fd=0x%llx hint=0x%llx size=0x%llx flags=0x%llx prot=0x%llx off=0x%llx",
+                  static_cast<unsigned long long>(fd), static_cast<unsigned long long>(hint), static_cast<unsigned long long>(size),
+                  static_cast<unsigned long long>(flags), static_cast<unsigned long long>(prot), static_cast<unsigned long long>(offset));
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
-    return file_allocate(hint, size, prot, flags, static_cast<int>(fd), offset);
+    uint64_t const RESULT = file_allocate(hint, size, prot, flags, static_cast<int>(fd), offset);
+    if (static_cast<int64_t>(RESULT) < 0) {
+        log::warn("file mmap failed: ret=%ld fd=%llu hint=0x%llx size=0x%llx flags=0x%llx prot=0x%llx off=0x%llx",
+                  static_cast<long>(static_cast<int64_t>(RESULT)), static_cast<unsigned long long>(fd),
+                  static_cast<unsigned long long>(hint), static_cast<unsigned long long>(size), static_cast<unsigned long long>(flags),
+                  static_cast<unsigned long long>(prot), static_cast<unsigned long long>(offset));
+    }
+    return RESULT;
 }
 
 }  // namespace ker::syscall::vmem

@@ -66,7 +66,7 @@ auto current_task_has_deliverable_signal() -> bool {
     if (task == nullptr) {
         return false;
     }
-    return (task->sig_pending & ~task->sig_mask) != 0;
+    return task->has_interrupting_signal_pending();
 }
 
 constexpr int WKI_SIGPIPE_NUM = 13;
@@ -78,6 +78,13 @@ void clear_current_daemon_sigpipe() {
     }
 
     task->sig_pending &= ~(1ULL << (WKI_SIGPIPE_NUM - 1));
+}
+
+auto clamp_io_count(ssize_t result, size_t requested) -> ssize_t {
+    if (result <= 0 || std::cmp_less_equal(result, requested)) {
+        return result;
+    }
+    return static_cast<ssize_t>(requested);
 }
 
 void perf_record_ipc_event(uint8_t op, ker::mod::perf::WkiPerfPhase phase, uint16_t peer, uint16_t channel, uint32_t correlation,
@@ -635,7 +642,7 @@ auto export_pipe_write_nonblocking(ker::vfs::File* file, const uint8_t* data, ui
     }
 
     clear_current_daemon_sigpipe();
-    ssize_t const RET = file->fops->vfs_write(file, data, len, static_cast<size_t>(file->pos));
+    ssize_t const RET = clamp_io_count(file->fops->vfs_write(file, data, len, static_cast<size_t>(file->pos)), len);
     clear_current_daemon_sigpipe();
 
     if (IS_PIPE) {
@@ -2040,7 +2047,7 @@ template <int SLOT>
             IpcPerfTrace read_trace(ker::mod::perf::WkiPerfIpcOp::PIPE_PUMP_READ, target, WKI_CHAN_RESOURCE, WOS_PERF_CALLSITE());
             ssize_t n = 0;
             if (file != nullptr && file->fops != nullptr && file->fops->vfs_read != nullptr) {
-                n = file->fops->vfs_read(file, msg + HEADER_SIZE, BUF_SIZE, 0);
+                n = clamp_io_count(file->fops->vfs_read(file, msg + HEADER_SIZE, BUF_SIZE, 0), BUF_SIZE);
             } else {
                 break;
             }
@@ -2924,6 +2931,7 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
 
         if (existing_file != nullptr) {
             task->fd_table.remove(entry.local_fd);
+            ker::vfs::vfs_put_file(existing_file);
         }
         static_cast<void>(task->fd_table.insert(entry.local_fd, proxy_file));
 

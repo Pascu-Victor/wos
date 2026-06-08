@@ -40,9 +40,9 @@ wos_asm_syscall_handler:
     ; push qword 0x23       ; usermode code segment
     ; push rcx              ; usermode rip
 
-    ; Pass pointer to saved registers (GPRegs) as first argument
-    ; Skip the 8-byte return value slot
-    lea rdi, [rsp+8]
+    ; Pass pointer to saved registers (GPRegs) as first argument.
+    ; The separate syscall return-value slot is after the GPRegs block.
+    lea rdi, [rsp]
     xor rbp, rbp
 
     call syscall_handler
@@ -66,8 +66,8 @@ wos_asm_syscall_handler:
 
     ; Call deferred_task_switch with GPRegs and frame pointers
     extern deferred_task_switch
-    lea rdi, [rsp+8]       ; GPRegs pointer
-    lea rsi, [rsp+136]     ; Frame pointer (after GPRegs)
+    lea rdi, [rsp]         ; GPRegs pointer
+    lea rsi, [rsp+128]     ; Frame pointer (after GPRegs and return slot)
     call deferred_task_switch
     ; deferred_task_switch returns only if it decided to resume this task via
     ; the normal syscall exit path.

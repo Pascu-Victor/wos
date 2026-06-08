@@ -26,6 +26,7 @@
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sched/threading.hpp"
+#include "release.hpp"
 #include "syscalls_impl/process/exec.hpp"
 #include "syscalls_impl/process/exit.hpp"
 #include "syscalls_impl/process/getpid.hpp"
@@ -41,7 +42,29 @@
 static constexpr int WOS_SIGKILL = 9;
 static constexpr int WOS_SIGSTOP = 19;
 static constexpr uint64_t WOS_SA_RESTORER = 0x04000000;
+static constexpr uint64_t WOS_CLONE_VM = 0x00000100;
+static constexpr uint64_t WOS_CLONE_FS = 0x00000200;
+static constexpr uint64_t WOS_CLONE_FILES = 0x00000400;
+static constexpr uint64_t WOS_CLONE_UNTRACED = 0x00800000;
+static constexpr uint64_t WOS_PERSONALITY_QUERY = 0xffffffff;
+static constexpr uint64_t WOS_PERSONALITY_QUERY_ALL_BITS = ~0ULL;
 static constexpr int WOS_PRIO_PROCESS = 0;
+static constexpr int WOS_PR_SET_PDEATHSIG = 1;
+static constexpr int WOS_PR_GET_PDEATHSIG = 2;
+static constexpr int WOS_PR_GET_DUMPABLE = 3;
+static constexpr int WOS_PR_SET_DUMPABLE = 4;
+static constexpr int WOS_PR_SET_NAME = 15;
+static constexpr int WOS_PR_GET_NAME = 16;
+static constexpr int WOS_PR_SET_PTRACER = 0x59616d61;
+static constexpr int WOS_PR_SET_VMA = 0x53564d41;
+static constexpr int WOS_PR_SET_VMA_ANON_NAME = 0;
+static constexpr int WOS_ARCH_SET_GS = 0x1001;
+static constexpr int WOS_ARCH_SET_FS = 0x1002;
+static constexpr int WOS_ARCH_GET_FS = 0x1003;
+static constexpr int WOS_ARCH_GET_GS = 0x1004;
+static constexpr uint32_t WOS_SS_ONSTACK = 1;
+static constexpr uint32_t WOS_SS_DISABLE = 2;
+static constexpr size_t WOS_MINSIGSTKSZ = 2048;
 
 namespace ker::syscall::process {
 
@@ -372,6 +395,12 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete child;
         return finish_fork(-ENOMEM);
     }
+    if (!child->lazy_vmem_ranges.clone_from(parent->lazy_vmem_ranges)) {
+        delete[] child->name;
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
+        delete child;
+        return finish_fork(-ENOMEM);
+    }
     child->wki_skip_legacy_placement = false;
 
     // Copy POSIX credentials
@@ -382,6 +411,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->suid = parent->suid;
     child->sgid = parent->sgid;
     child->umask = parent->umask;
+    child->personality = parent->personality;
     if (!child->supplementary_groups.clone_from(parent->supplementary_groups)) {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
@@ -398,6 +428,11 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->sig_pending = 0;  // Pending signals are NOT inherited
     child->sig_mask = parent->sig_mask;
     child->sigsuspend_saved_mask = 0;
+    child->sigaltstack_sp = parent->sigaltstack_sp;
+    child->sigaltstack_size = parent->sigaltstack_size;
+    child->sigaltstack_flags = parent->sigaltstack_flags;
+    child->parent_death_signal = 0;
+    child->dumpable = parent->dumpable;
     child->sigsuspend_active = false;
     child->in_signal_handler = false;
     child->do_sigreturn = false;
@@ -563,6 +598,62 @@ struct KernelSigaction {
     // Remaining 120 bytes of sa_mask are unused padding
 };
 
+struct KernelStackT {
+    void* ss_sp;
+    int ss_flags;
+    size_t ss_size;
+};
+
+struct KernelUtsname {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+};
+
+struct CloneVmArgs {
+    uint64_t fn;
+    uint64_t child_stack;
+    uint64_t flags;
+    uint64_t arg;
+    uint64_t parent_tidptr;
+    uint64_t newtls;
+    uint64_t child_tidptr;
+};
+
+void copy_cstr_field(char* dst, size_t cap, const char* src) {
+    if (dst == nullptr || cap == 0) {
+        return;
+    }
+    if (src == nullptr) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t len = 0;
+    while (len + 1 < cap && src[len] != '\0') {
+        dst[len] = src[len];
+        ++len;
+    }
+    dst[len] = '\0';
+}
+
+auto wos_proc_uname(KernelUtsname* buf) -> uint64_t {
+    if (buf == nullptr) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+
+    std::memset(buf, 0, sizeof(*buf));
+    copy_cstr_field(buf->sysname, sizeof(buf->sysname), ker::release::NAME);
+    copy_cstr_field(buf->nodename, sizeof(buf->nodename), ker::util::hostname::get());
+    copy_cstr_field(buf->release, sizeof(buf->release), ker::release::VERSION);
+    copy_cstr_field(buf->version, sizeof(buf->version), ker::release::COMPILER);
+    copy_cstr_field(buf->machine, sizeof(buf->machine), "x86_64");
+    copy_cstr_field(buf->domainname, sizeof(buf->domainname), "localdomain");
+    return 0;
+}
+
 auto wos_proc_sigaction(int signum, uint64_t act_ptr, uint64_t oldact_ptr) -> uint64_t {
     using namespace ker::mod;
 
@@ -609,6 +700,51 @@ auto wos_proc_sigaction(int signum, uint64_t act_ptr, uint64_t oldact_ptr) -> ui
     return 0;
 }
 
+auto wos_proc_sigaltstack(const KernelStackT* ss, KernelStackT* old_ss, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
+    (void)gpr;
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+
+    uint64_t user_rsp = 0;
+    asm volatile("movq %%gs:0x08, %0" : "=r"(user_rsp));
+    bool const ON_STACK = (task->sigaltstack_flags & WOS_SS_DISABLE) == 0 && task->sigaltstack_sp != 0 &&
+                          user_rsp >= task->sigaltstack_sp && user_rsp < task->sigaltstack_sp + task->sigaltstack_size;
+
+    if (old_ss != nullptr) {
+        old_ss->ss_sp = reinterpret_cast<void*>(task->sigaltstack_sp);
+        old_ss->ss_size = task->sigaltstack_size;
+        old_ss->ss_flags = ON_STACK ? WOS_SS_ONSTACK : static_cast<int>(task->sigaltstack_flags);
+    }
+
+    if (ss == nullptr) {
+        return 0;
+    }
+    if (ON_STACK) {
+        return static_cast<uint64_t>(-EPERM);
+    }
+    uint32_t const FLAGS = static_cast<uint32_t>(ss->ss_flags);
+    if ((FLAGS & ~(WOS_SS_DISABLE)) != 0) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
+    if ((FLAGS & WOS_SS_DISABLE) == 0 && ss->ss_size < WOS_MINSIGSTKSZ) {
+        return static_cast<uint64_t>(-ENOMEM);
+    }
+
+    if ((FLAGS & WOS_SS_DISABLE) != 0) {
+        task->sigaltstack_sp = 0;
+        task->sigaltstack_size = 0;
+        task->sigaltstack_flags = WOS_SS_DISABLE;
+        return 0;
+    }
+
+    task->sigaltstack_sp = reinterpret_cast<uint64_t>(ss->ss_sp);
+    task->sigaltstack_size = ss->ss_size;
+    task->sigaltstack_flags = 0;
+    return 0;
+}
+
 auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr) -> uint64_t {
     using namespace ker::mod;
 
@@ -650,6 +786,19 @@ auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr) -> uin
     return 0;
 }
 
+auto wos_proc_personality(uint64_t persona) -> uint64_t {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+
+    uint64_t const OLD_PERSONALITY = task->personality;
+    if (persona != WOS_PERSONALITY_QUERY && persona != WOS_PERSONALITY_QUERY_ALL_BITS) {
+        task->personality = persona;
+    }
+    return OLD_PERSONALITY;
+}
+
 auto wos_proc_sigsuspend(uint64_t set_ptr, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     using namespace ker::mod;
 
@@ -678,6 +827,260 @@ auto wos_proc_sigsuspend(uint64_t set_ptr, ker::mod::cpu::GPRegs& gpr) -> uint64
     task->wait_channel = "sigsuspend";
     task->deferred_task_switch = true;
     return 0;
+}
+
+auto wos_proc_clone_vm(const CloneVmArgs* args) -> uint64_t {
+    using namespace ker::mod;
+
+    auto* parent = sched::get_current_task();
+    if (parent == nullptr || args == nullptr) {
+        return static_cast<uint64_t>(args == nullptr ? -EFAULT : -ESRCH);
+    }
+    if (args->fn == 0 || args->child_stack == 0 || (args->flags & WOS_CLONE_VM) == 0) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
+
+    uint64_t const SUPPORTED_FLAGS = WOS_CLONE_VM | WOS_CLONE_FS | WOS_CLONE_FILES | WOS_CLONE_UNTRACED | 0xFF;
+    if ((args->flags & ~SUPPORTED_FLAGS) != 0) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
+
+    auto const KERNEL_STACK_BASE = alloc_fork_kernel_stack_with_reclaim();
+    if (KERNEL_STACK_BASE == 0) {
+        return static_cast<uint64_t>(-ENOMEM);
+    }
+    uint64_t const KERNEL_RSP = KERNEL_STACK_BASE + ker::mod::mm::KERNEL_STACK_SIZE;
+
+    auto* child = new sched::task::Task{};
+    if (child == nullptr) {
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
+        return static_cast<uint64_t>(-ENOMEM);
+    }
+
+    auto cleanup_child = [&]() {
+        child->fd_table.for_each([](uint64_t /*key*/, void* val) {
+            if (val != nullptr) {
+                static_cast<ker::vfs::File*>(val)->refcount.fetch_sub(1, std::memory_order_relaxed);
+            }
+        });
+        delete child->thread;
+        delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
+        delete[] child->name;
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
+        child->pagemap = nullptr;
+        delete child;
+    };
+
+    if (parent->name != nullptr) {
+        size_t const NAME_LEN = std::strlen(parent->name);
+        char* name_copy = new char[NAME_LEN + 1];
+        if (name_copy == nullptr) {
+            cleanup_child();
+            return static_cast<uint64_t>(-ENOMEM);
+        }
+        std::memcpy(name_copy, parent->name, NAME_LEN + 1);
+        child->name = name_copy;
+    }
+
+    child->pid = sched::task::get_next_pid();
+    child->parent_pid = parent->pid;
+    child->type = sched::task::TaskType::PROCESS;
+    child->cpu = cpu::current_cpu();
+    child->pagemap = parent->pagemap;
+    child->entry = parent->entry;
+    child->program_header_addr = parent->program_header_addr;
+    child->elf_header_addr = parent->elf_header_addr;
+    child->program_header_count = parent->program_header_count;
+    child->program_header_ent_size = parent->program_header_ent_size;
+    child->interp_base = parent->interp_base;
+    child->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    child->sched_weight = parent->sched_weight;
+    child->sched_nice = parent->sched_nice;
+    child->slice_ns = parent->slice_ns;
+    child->heap_index = -1;
+    child->sched_queue = sched::task::Task::sched_queue::NONE;
+    child->cwd = parent->cwd;
+    child->root = parent->root;
+    child->exe_path = parent->exe_path;
+    child->session_id = parent->session_id;
+    child->pgid = (parent->pgid != 0) ? parent->pgid : parent->pid;
+    child->controlling_tty = parent->controlling_tty;
+    child->uid = parent->uid;
+    child->gid = parent->gid;
+    child->euid = parent->euid;
+    child->egid = parent->egid;
+    child->suid = parent->suid;
+    child->sgid = parent->sgid;
+    child->umask = parent->umask;
+    child->personality = parent->personality;
+    child->sig_pending = 0;
+    child->sig_mask = parent->sig_mask;
+    child->sig_handlers = parent->sig_handlers;
+    child->sigaltstack_sp = parent->sigaltstack_sp;
+    child->sigaltstack_size = parent->sigaltstack_size;
+    child->sigaltstack_flags = parent->sigaltstack_flags;
+    child->dumpable = parent->dumpable;
+    child->wki_skip_legacy_placement = true;
+    child->wki_target_flags = sched::task::Task::WKI_TARGET_FLAG_LOCAL;
+
+    if (!child->supplementary_groups.clone_from(parent->supplementary_groups) || !child->wki_vfs_rules.clone_from(parent->wki_vfs_rules) ||
+        !child->lazy_vmem_ranges.clone_from(parent->lazy_vmem_ranges)) {
+        cleanup_child();
+        return static_cast<uint64_t>(-ENOMEM);
+    }
+
+    auto* child_thread = new sched::threading::Thread();
+    if (child_thread == nullptr) {
+        cleanup_child();
+        return static_cast<uint64_t>(-ENOMEM);
+    }
+    if (parent->thread != nullptr) {
+        *child_thread = *parent->thread;
+        child_thread->tls_phys_ptr = 0;
+        child_thread->stack_phys_ptr = 0;
+    }
+    child_thread->fsbase = args->newtls != 0 ? args->newtls : (parent->thread != nullptr ? parent->thread->fsbase : 0);
+    child_thread->stack = args->child_stack;
+    child_thread->stack_size = 0;
+    child_thread->stack_base_virt = 0;
+    child_thread->stack_lowest_backed = 0;
+    child->thread = child_thread;
+
+    child->context.syscall_kernel_stack = KERNEL_RSP;
+    auto* per_cpu = new cpu::PerCpu();
+    if (per_cpu == nullptr) {
+        cleanup_child();
+        return static_cast<uint64_t>(-ENOMEM);
+    }
+    per_cpu->syscall_stack = KERNEL_RSP;
+    per_cpu->cpu_id = cpu::current_cpu();
+    per_cpu->user_rsp = args->child_stack;
+    per_cpu->syscall_ret_rip = args->fn;
+    per_cpu->syscall_ret_flags = 0x202;
+    child->context.syscall_scratch_area = reinterpret_cast<uint64_t>(per_cpu);
+    child_thread->gsbase = reinterpret_cast<uint64_t>(per_cpu);
+
+    child->context.regs = {};
+    child->context.regs.rdi = args->arg;
+    child->context.frame.rip = args->fn;
+    child->context.frame.rsp = args->child_stack;
+    child->context.frame.flags = 0x202;
+    child->context.frame.cs = desc::gdt::GDT_USER_CS;
+    child->context.frame.ss = desc::gdt::GDT_USER_DS;
+
+    parent->fd_table.for_each([&](uint64_t key, void* val) {
+        if (val != nullptr) {
+            auto* file = static_cast<ker::vfs::File*>(val);
+            file->refcount.fetch_add(1, std::memory_order_relaxed);
+            (void)child->fd_table.insert(key, file);
+        }
+    });
+    child->fd_cloexec = parent->fd_cloexec;
+
+    if (!sched::post_task_balanced(child)) {
+        cleanup_child();
+        return static_cast<uint64_t>(-ENOMEM);
+    }
+
+    if (args->parent_tidptr != 0) {
+        *reinterpret_cast<int*>(args->parent_tidptr) = static_cast<int>(child->pid);
+    }
+    if (args->child_tidptr != 0) {
+        *reinterpret_cast<int*>(args->child_tidptr) = static_cast<int>(child->pid);
+    }
+
+    return child->pid;
+}
+
+auto wos_proc_prctl(int option, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5) -> uint64_t {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+
+    switch (option) {
+        case WOS_PR_SET_PDEATHSIG:
+            if (arg2 > ker::mod::sched::task::Task::MAX_SIGNALS) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            task->parent_death_signal = static_cast<uint32_t>(arg2);
+            return 0;
+        case WOS_PR_GET_PDEATHSIG:
+            if (arg2 == 0) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            *reinterpret_cast<int*>(arg2) = static_cast<int>(task->parent_death_signal);
+            return 0;
+        case WOS_PR_GET_DUMPABLE:
+            return static_cast<uint64_t>(task->dumpable);
+        case WOS_PR_SET_DUMPABLE:
+            if (arg2 > 1) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            task->dumpable = static_cast<int32_t>(arg2);
+            return 0;
+        case WOS_PR_SET_NAME:
+            if (arg2 == 0) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            {
+                constexpr size_t TASK_NAME_MAX = 16;
+                auto* name = new char[TASK_NAME_MAX];
+                if (name == nullptr) {
+                    return static_cast<uint64_t>(-ENOMEM);
+                }
+                copy_cstr_field(name, TASK_NAME_MAX, reinterpret_cast<const char*>(arg2));
+                task->name = name;
+            }
+            return 0;
+        case WOS_PR_GET_NAME:
+            if (arg2 == 0) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            copy_cstr_field(reinterpret_cast<char*>(arg2), 16, task->name != nullptr ? task->name : "");
+            return 0;
+        case WOS_PR_SET_PTRACER:
+            task->ptrace_tracer_pid = arg2;
+            return 0;
+        case WOS_PR_SET_VMA:
+            return arg2 == WOS_PR_SET_VMA_ANON_NAME ? 0 : static_cast<uint64_t>(-EINVAL);
+        default:
+            (void)arg3;
+            (void)arg4;
+            (void)arg5;
+            return static_cast<uint64_t>(-EINVAL);
+    }
+}
+
+auto wos_proc_arch_prctl(int option, uint64_t arg2) -> uint64_t {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr || task->thread == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+
+    switch (option) {
+        case WOS_ARCH_SET_FS:
+            task->thread->fsbase = arg2;
+            ker::mod::cpu::wrfsbase(arg2);
+            return 0;
+        case WOS_ARCH_GET_FS:
+            if (arg2 == 0) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            *reinterpret_cast<uint64_t*>(arg2) = task->thread->fsbase;
+            return 0;
+        case WOS_ARCH_SET_GS:
+            (void)arg2;
+            return 0;
+        case WOS_ARCH_GET_GS:
+            if (arg2 == 0) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            *reinterpret_cast<uint64_t*>(arg2) = 0;
+            return 0;
+        default:
+            return static_cast<uint64_t>(-EINVAL);
+    }
 }
 
 auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
@@ -838,7 +1241,10 @@ auto wos_proc_getwkitarget(char* hostname_out, size_t hostname_out_size, uint32_
 }
 }  // namespace
 
-auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
+auto personality(uint64_t persona) -> uint64_t { return wos_proc_personality(persona); }
+
+auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, ker::mod::cpu::GPRegs& gpr)
+    -> uint64_t {
     switch (op) {
         case abi::process::procmgmt_ops::EXIT:
             wos_proc_exit(static_cast<int>(a2));
@@ -867,6 +1273,21 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         }
         case abi::process::procmgmt_ops::SIGSUSPEND: {
             return wos_proc_sigsuspend(a2, gpr);
+        }
+        case abi::process::procmgmt_ops::UNAME: {
+            return wos_proc_uname(reinterpret_cast<KernelUtsname*>(a2));
+        }
+        case abi::process::procmgmt_ops::CLONE_VM_PROC: {
+            return wos_proc_clone_vm(reinterpret_cast<const CloneVmArgs*>(a2));
+        }
+        case abi::process::procmgmt_ops::PRCTL: {
+            return wos_proc_prctl(static_cast<int>(a2), a3, a4, a5, a6);
+        }
+        case abi::process::procmgmt_ops::ARCH_PRCTL: {
+            return wos_proc_arch_prctl(static_cast<int>(a2), a3);
+        }
+        case abi::process::procmgmt_ops::SIGALTSTACK: {
+            return wos_proc_sigaltstack(reinterpret_cast<const KernelStackT*>(a2), reinterpret_cast<KernelStackT*>(a3), gpr);
         }
         case abi::process::procmgmt_ops::KILL: {
             return wos_proc_kill(static_cast<int64_t>(a2), static_cast<int>(a3));

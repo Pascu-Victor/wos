@@ -35,6 +35,13 @@ struct WkiVfsRule {
     uint8_t reserved = 0;
 };
 
+struct LazyVmemRange {
+    uint64_t start = 0;
+    uint64_t end = 0;
+    uint64_t prot = 0;
+    uint64_t flags = 0;
+};
+
 enum class TaskType : uint8_t {
     DAEMON,
     PROCESS,
@@ -137,6 +144,8 @@ struct Task {
     static constexpr uint32_t WKI_TARGET_FLAG_REMOTE = 1U << 3;     // prefer a remote node, falling back locally unless strict
     static constexpr uint32_t WKI_TARGET_FLAGS_ALL =
         WKI_TARGET_FLAG_STRICT | WKI_TARGET_FLAG_LOCAL | WKI_TARGET_FLAG_NOINHERIT | WKI_TARGET_FLAG_REMOTE;
+    static constexpr uint64_t PERSONALITY_ADDR_NO_RANDOMIZE = 0x0040000;
+    static constexpr uint64_t DEFAULT_PERSONALITY = PERSONALITY_ADDR_NO_RANDOMIZE;
 
     // Lock-free lifecycle management (epoch-based reclamation).
     alignas(8) std::atomic<TaskState> state{TaskState::ACTIVE};
@@ -169,6 +178,7 @@ struct Task {
     uint64_t elf_header_addr{};          // Virtual address of ELF header (AT_EHDR)
     uint64_t interp_base = 0;            // Load base of dynamic linker (AT_BASE), 0 if statically linked
     std::atomic<uint64_t> mmap_next{0};  // Next preferred mmap search address; zero means use syscall default.
+    ker::util::SmallVec<LazyVmemRange, 8> lazy_vmem_ranges;
 
     // PID of the process that owns this thread (set by create_user_thread).
     // 0 for regular processes.
@@ -182,6 +192,7 @@ struct Task {
     // Session and process group IDs (for setsid/setpgid/POSIX job control).
     uint64_t session_id = 0;  // Session ID (0 = inherit from parent, set by setsid)
     uint64_t pgid = 0;        // Process group ID (0 = same as pid, set by setpgid)
+    uint64_t personality = DEFAULT_PERSONALITY;
 
     // Plain spinlocks disable task preemption without masking interrupts. This
     // keeps preemptible DAEMON/NAPI workers from being switched out while they
@@ -205,6 +216,11 @@ struct Task {
     uint64_t sig_pending{};            // Bit N = signal N+1 is pending, signals 1-64
     uint64_t sig_mask{};               // Bitmask of blocked signals
     uint64_t sigsuspend_saved_mask{};  // Mask to restore after a sigsuspend wake.
+    uint64_t sigaltstack_sp{};         // Base address for sigaltstack(2), or 0 when disabled.
+    uint64_t sigaltstack_size{};       // Size of the alternate signal stack.
+    uint32_t sigaltstack_flags = 2;    // SS_DISABLE by default.
+    uint32_t parent_death_signal{};    // PR_SET_PDEATHSIG state.
+    int32_t dumpable = 1;              // PR_GET/SET_DUMPABLE state.
     bool sigsuspend_active{};          // Current signal mask is temporary for sigsuspend.
 
     auto signal_frame_saved_mask() -> uint64_t {
@@ -215,6 +231,29 @@ struct Task {
         sigsuspend_active = false;
         sigsuspend_saved_mask = 0;
         return SAVED;
+    }
+
+    auto has_interrupting_signal_pending() -> bool {
+        for (;;) {
+            uint64_t const DELIVERABLE = sig_pending & ~sig_mask;
+            if (DELIVERABLE == 0) {
+                return false;
+            }
+
+            int const SIGNO = __builtin_ctzll(DELIVERABLE) + 1;
+            auto const IDX = static_cast<unsigned>(SIGNO - 1);
+            auto const HANDLER = sig_handlers.at(IDX).handler;
+            bool const DEFAULT_IGNORED = SIGNO == 17 || SIGNO == 23 || SIGNO == 28 || SIGNO == 18;
+            bool const IGNORE = (HANDLER == 0 && DEFAULT_IGNORED) || HANDLER == 1;
+            if (!IGNORE) {
+                return true;
+            }
+
+            sig_pending &= ~(1ULL << IDX);
+            if (sigsuspend_active) {
+                sig_mask = signal_frame_saved_mask();
+            }
+        }
     }
 
     // Ptrace/debugging state. The syscall ABI is node-local; WKI proxy routing

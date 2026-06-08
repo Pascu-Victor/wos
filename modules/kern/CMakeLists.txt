@@ -8,8 +8,8 @@ set(KERNEL wos)
 # Kernel build-time diagnostics, sanitizers, and instrumentation.
 # ---------------------------------------------------------------------------
 option(WOS_KCFI                    "Enable Clang Kernel Control-Flow Integrity"                         OFF)
-option(WOS_KUBSAN                  "Enable Kernel UndefinedBehaviorSanitizer"                           OFF)
-option(WOS_KASAN                   "Enable Kernel AddressSanitizer (requires shadow map)"               OFF)
+option(WOS_KUBSAN                  "Enable Kernel UndefinedBehaviorSanitizer"                           ON)
+option(WOS_KASAN                   "Enable Kernel AddressSanitizer (requires shadow map)"               ON)
 option(WOS_KCOV                    "Enable kernel coverage instrumentation (for Syzkaller)"             OFF)
 option(WOS_KCOV_PANIC_TRACE        "Record a recent-PC ring for panic dumps using KCOV callbacks"       OFF)
 option(WOS_SELFTEST                "Enable kernel self-test mode (--selftest cmdline flag)"             OFF)
@@ -65,7 +65,7 @@ target_compile_options(${KERNEL} PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-fno-exceptions;-mcmodel=kernel;-mno-sse;-mno-red-zone;-fno-stack-protector;-fno-stack-check;-fno-lto;-fno-sanitize=safe-stack>
     $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions;-fno-rtti;-mcmodel=kernel;-mno-sse;-mno-red-zone;-fno-stack-protector;-fno-stack-check;-fno-lto;-fno-sanitize=safe-stack>
 )
-target_link_options(${KERNEL} PRIVATE -fno-lto)
+target_link_options(${KERNEL} PRIVATE -static -Wl,--no-dynamic-linker -fno-lto)
 
 # ---------------------------------------------------------------------------
 # Sanitizer flags (applied on top of the base kernel options)

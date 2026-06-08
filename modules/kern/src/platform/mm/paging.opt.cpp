@@ -29,7 +29,7 @@ auto purge_page_table_entry() -> PageTableEntry { return create_page_table_entry
 
 auto create_page_fault(uint64_t flags, bool is_critical) -> PageFault {
     PageFault fault{};
-    fault.present = 1;
+    fault.present = static_cast<uint8_t>(is_flag_set(flags, error_flags::PRESENT));
     fault.writable = static_cast<uint8_t>(is_flag_set(flags, error_flags::WRITE));
     fault.user = static_cast<uint8_t>(is_flag_set(flags, error_flags::USER));
     fault.reserved = 0;

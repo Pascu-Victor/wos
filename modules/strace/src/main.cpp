@@ -190,6 +190,8 @@ auto callnum_name(uint64_t callnum) -> std::string_view {
             return "debug";
         case ker::abi::callnums::shm:
             return "shm";
+        case ker::abi::callnums::personality:
+            return "personality";
     }
     return "unknown";
 }
@@ -317,6 +319,16 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "getwkitarget";
                 case ker::abi::process::procmgmt_ops::PTRACE:
                     return "ptrace";
+                case ker::abi::process::procmgmt_ops::CLONE_VM_PROC:
+                    return "clone_vm";
+                case ker::abi::process::procmgmt_ops::PRCTL:
+                    return "prctl";
+                case ker::abi::process::procmgmt_ops::ARCH_PRCTL:
+                    return "arch_prctl";
+                case ker::abi::process::procmgmt_ops::SIGALTSTACK:
+                    return "sigaltstack";
+                case ker::abi::process::procmgmt_ops::UNAME:
+                    return "uname";
             }
             break;
         case ker::abi::callnums::time:
@@ -497,6 +509,8 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "anon_free";
                 case ker::abi::vmem::ops::PROTECT:
                     return "protect";
+                case ker::abi::vmem::ops::MREMAP:
+                    return "mremap";
             }
             break;
         case ker::abi::callnums::debug:
@@ -513,7 +527,10 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "ctl";
             }
             break;
+        // NOLINTNEXTLINE(bugprone-branch-clone)
         case ker::abi::callnums::vmem_map:
+            break;
+        case ker::abi::callnums::personality:
             break;
     }
     return "op";
@@ -560,7 +577,7 @@ auto should_decode_string(uint64_t callnum, uint64_t op, int arg_index) -> bool 
         }
     }
     return false;
-}
+}  // namespace
 
 auto format_arg(uint64_t pid, uint64_t callnum, uint64_t op, int arg_index, uint64_t value) -> std::string {
     if (should_decode_string(callnum, op, arg_index) && value != 0) {

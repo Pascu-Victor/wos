@@ -29,12 +29,23 @@
 
 namespace ker::vfs::xfs {
 
+namespace {
+
+auto valid_btree_level(int level) -> bool { return level >= 0 && level < XFS_BTREE_MAXLEVELS; }
+
+auto valid_btree_depth(uint8_t nlevels) -> bool { return nlevels > 0 && nlevels <= XFS_BTREE_MAXLEVELS; }
+
+}  // namespace
+
 // ============================================================================
 // Cursor helper methods
 // ============================================================================
 
 template <typename Traits>
 auto XfsBtreeCursor<Traits>::numrecs(int level) const -> int {
+    if (!valid_btree_level(level)) {
+        return 0;
+    }
     if (level_at(level).bp == nullptr) {
         return 0;
     }
@@ -85,6 +96,10 @@ auto XfsBtreeCursor<Traits>::ptr_at(int level, int idx) const -> uint64_t {
 
 template <typename Traits>
 auto XfsBtreeCursor<Traits>::read_block(int level, uint64_t blockno) -> int {
+    if (!valid_btree_level(level)) {
+        return -EINVAL;
+    }
+
     // Release existing buffer at this level
     if (level_at(level).bp != nullptr) {
         brelse(level_at(level).bp);
@@ -128,6 +143,9 @@ auto XfsBtreeCursor<Traits>::read_block(int level, uint64_t blockno) -> int {
 
 template <typename Traits>
 auto XfsBtreeCursor<Traits>::left_sibling(int level) const -> uint64_t {
+    if (!valid_btree_level(level)) {
+        return (Traits::TYPE == XfsBtreeType::SHORT) ? NULLAGBLOCK : NULLFSBLOCK;
+    }
     if (level_at(level).bp == nullptr) {
         return (Traits::TYPE == XfsBtreeType::SHORT) ? NULLAGBLOCK : NULLFSBLOCK;
     }
@@ -142,6 +160,9 @@ auto XfsBtreeCursor<Traits>::left_sibling(int level) const -> uint64_t {
 
 template <typename Traits>
 auto XfsBtreeCursor<Traits>::right_sibling(int level) const -> uint64_t {
+    if (!valid_btree_level(level)) {
+        return (Traits::TYPE == XfsBtreeType::SHORT) ? NULLAGBLOCK : NULLFSBLOCK;
+    }
     if (level_at(level).bp == nullptr) {
         return (Traits::TYPE == XfsBtreeType::SHORT) ? NULLAGBLOCK : NULLFSBLOCK;
     }
@@ -162,6 +183,10 @@ template <typename Traits>
 auto xfs_btree_lookup(XfsBtreeCursor<Traits>* cur, uint64_t root_block, uint8_t nlevels, const typename Traits::IRec& target,
                       XfsBtreeLookup dir) -> int {
     using Key = Traits::Key;
+
+    if (cur == nullptr || cur->mount == nullptr || !valid_btree_depth(nlevels)) {
+        return -EINVAL;
+    }
 
     cur->nlevels = nlevels;
 
@@ -568,6 +593,17 @@ void btree_set_numrecs_raw(uint8_t* block_data, int nrecs) {
 template <typename Traits>
 auto btree_alloc_new_block(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, uint8_t level, uint64_t owner, BufHead** out_bh)
     -> uint64_t {
+    if (out_bh == nullptr || !valid_btree_level(level)) {
+        if (out_bh != nullptr) {
+            *out_bh = nullptr;
+        }
+        if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
+            return NULLAGBLOCK;
+        } else {
+            return NULLFSBLOCK;
+        }
+    }
+
     // Always use the AGFL for btree block allocation.  Falling back to
     // xfs_alloc_extent here would re-enter the bnobt/cntbt insert path
     // while we are already mid-split, invalidating the caller's cursor
@@ -838,6 +874,10 @@ template <typename Traits>
 auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int lev, const typename Traits::Key& new_key,
                               uint64_t new_ptr, uint64_t root_block, uint8_t nlevels, uint64_t* new_root, uint8_t* new_nlevels) -> int {
     if (lev == cur->nlevels) {
+        if (nlevels >= XFS_BTREE_MAXLEVELS) {
+            return -EIO;
+        }
+
         // Need a new root one level above the current root.
         BufHead const* old_root_bp = cur->level_at(nlevels - 1).bp;
         uint64_t const OWNER = (Traits::TYPE == XfsBtreeType::SHORT) ? cur->agno : 0;
@@ -1016,6 +1056,10 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
                       uint8_t nlevels, uint64_t* new_root, uint8_t* new_nlevels) -> int {
     using Key = Traits::Key;
     using Rec = Traits::Rec;
+
+    if (cur == nullptr || cur->mount == nullptr || !valid_btree_depth(nlevels)) {
+        return -EINVAL;
+    }
 
     if (new_root != nullptr) {
         *new_root = root_block;

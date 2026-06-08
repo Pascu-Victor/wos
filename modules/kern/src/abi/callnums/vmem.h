@@ -8,6 +8,7 @@ enum class ops : uint64_t {
     ANON_ALLOCATE,
     ANON_FREE,
     PROTECT,
+    MREMAP,
 };
 
 // Protection flags (matching Linux mmap)
@@ -21,6 +22,7 @@ constexpr uint64_t MAP_SHARED = 0x01;
 constexpr uint64_t MAP_PRIVATE = 0x02;
 constexpr uint64_t MAP_FIXED = 0x10;
 constexpr uint64_t MAP_ANONYMOUS = 0x20;
+constexpr uint64_t MAP_NORESERVE = 0x4000;
 
 // Error codes
 constexpr int VMEM_SUCCESS = 0;

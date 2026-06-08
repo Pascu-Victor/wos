@@ -3007,7 +3007,7 @@ void check_pending_signals_deferred(task::Task* task) {
     uint64_t const USER_RIP = task->context.frame.rip;
     uint64_t const USER_RFLAGS = task->context.frame.flags;
 
-    uint64_t const FRAME_ADDR = sys::signal::signal_frame_address(USER_RSP);
+    uint64_t const FRAME_ADDR = sys::signal::signal_frame_address_for_task(*task, USER_RSP, handler.flags);
     auto* sigframe = reinterpret_cast<sys::signal::SignalFrame*>(FRAME_ADDR);
 
     sigframe->pretcode = handler.restorer;
@@ -3071,12 +3071,10 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     asm volatile("movq %%gs:0x08, %0" : "=r"(user_rsp));
 
     // Save all GPRs from the syscall stack.
-    // syscall.asm passes rsp+8 in RDI; actual GPRegs block starts 8 bytes earlier.
-    auto* stack_regs = reinterpret_cast<cpu::GPRegs*>(reinterpret_cast<uint8_t*>(gpr_ptr) - 8);
-    current_task->context.regs = *stack_regs;
+    current_task->context.regs = *gpr_ptr;
 
     // Fix up RAX: syscall return value is stored in the slot past GPRegs
-    auto* return_value_slot = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(stack_regs) + sizeof(cpu::GPRegs));
+    auto* return_value_slot = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(gpr_ptr) + sizeof(cpu::GPRegs));
     current_task->context.regs.rax = *return_value_slot;
 
     // Restore clobbered RCX/R11
@@ -3103,8 +3101,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     // move this task to wait queue; resume userspace with EINTR.
     bool skip_wait_queue = false;
     if (!IS_YIELD && current_task->wki_proxy_task_id == 0) {
-        uint64_t const DELIVERABLE = current_task->sig_pending & ~current_task->sig_mask;
-        if (DELIVERABLE != 0) {
+        if (current_task->has_interrupting_signal_pending()) {
             skip_wait_queue = true;
             current_task->context.regs.rax = static_cast<uint64_t>(-EINTR);
         }
@@ -3412,7 +3409,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         // We are returning through syscall.asm's normal epilogue, not through
         // wos_deferred_task_switch_return(), so publish deferred wait results
         // back to the live syscall stack as well as Task::context.
-        *stack_regs = current_task->context.regs;
+        *gpr_ptr = current_task->context.regs;
         *return_value_slot = current_task->context.regs.rax;
         record_local_proc_first_run(current_task, WOS_PERF_CALLSITE());
         current_task->has_run = true;

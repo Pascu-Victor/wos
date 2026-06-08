@@ -106,6 +106,7 @@ const static uint64_t MMIO = PAGE_PRESENT | PAGE_WRITE | PAGE_PWT | PAGE_PCD;
 }  // namespace page_types
 
 namespace error_flags {
+const static uint64_t PRESENT = 0;
 const static uint64_t WRITE = 1;
 const static uint64_t USER = 2;
 const static uint64_t FETCH = 4;

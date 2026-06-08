@@ -6,6 +6,7 @@
 
 #include "platform/asm/cpu.hpp"
 #include "platform/interrupt/gates.hpp"
+#include "platform/sched/task.hpp"
 
 namespace ker::mod::sys::signal {
 
@@ -26,9 +27,30 @@ static_assert(sizeof(SignalFrame) == 176, "SignalFrame layout is userspace ABI")
 static_assert(offsetof(SignalFrame, saved_regs) == 56, "SignalFrame saved_regs offset is userspace ABI");
 
 constexpr uint64_t USER_RED_ZONE_SIZE = 128;
+constexpr uint64_t WOS_SA_ONSTACK = 0x08000000;
+constexpr uint32_t WOS_SS_ONSTACK = 1;
+constexpr uint32_t WOS_SS_DISABLE = 2;
 
 constexpr auto signal_frame_address(uint64_t user_rsp) -> uint64_t {
     return ((user_rsp - USER_RED_ZONE_SIZE - sizeof(SignalFrame)) & ~0xFULL) - 8;
+}
+
+inline auto is_on_alt_stack(const sched::task::Task& task, uint64_t user_rsp) -> bool {
+    uint64_t const START = task.sigaltstack_sp;
+    uint64_t const END = START + task.sigaltstack_size;
+    return START != 0 && END > START && user_rsp >= START && user_rsp < END;
+}
+
+inline auto signal_frame_address_for_task(const sched::task::Task& task, uint64_t user_rsp, uint64_t handler_flags) -> uint64_t {
+    if ((handler_flags & WOS_SA_ONSTACK) == 0 || (task.sigaltstack_flags & WOS_SS_DISABLE) != 0 || is_on_alt_stack(task, user_rsp)) {
+        return signal_frame_address(user_rsp);
+    }
+
+    uint64_t const ALT_TOP = task.sigaltstack_sp + task.sigaltstack_size;
+    if (ALT_TOP <= task.sigaltstack_sp) {
+        return signal_frame_address(user_rsp);
+    }
+    return signal_frame_address(ALT_TOP);
 }
 
 // Deliver one pending signal when an interrupt/scheduler path is about to

@@ -19,6 +19,7 @@
 #include <net/proto/tcp.hpp>
 #include <new>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/addr.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/memacc.hpp>
 #include <platform/mm/phys.hpp>
@@ -367,8 +368,8 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
 
     if (pfd->node.type == ProcNodeType::PID_DIR || pfd->node.type == ProcNodeType::TASK_TID_DIR) {
         // /proc/<pid> and /proc/<pid>/task/<tid>: index 2 = "stat", 3 = "status", 4 = "statm",
-        // 5 = "cmdline", 6 = "exe", 7 = "wki_launcher", 8 = "wki_runner", 9 = "wki_remote_pid".
-        // Top-level process dirs additionally expose "task" at index 10.
+        // 5 = "cmdline", 6 = "exe", 7 = "wki_launcher", 8 = "wki_runner", 9 = "wki_remote_pid",
+        // 10 = "maps". Top-level process dirs additionally expose "task" at index 11.
         if (count == 2) {
             buf->d_ino = 10;
             buf->d_off = 3;
@@ -433,9 +434,17 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             std::memcpy(buf->d_name.data(), "wki_remote_pid", 15);
             return 0;
         }
-        if (pfd->node.type == ProcNodeType::PID_DIR && count == 10) {
+        if (count == 10) {
             buf->d_ino = 18;
             buf->d_off = 11;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "maps", 5);
+            return 0;
+        }
+        if (pfd->node.type == ProcNodeType::PID_DIR && count == 11) {
+            buf->d_ino = 19;
+            buf->d_off = 12;
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_DIR;
             std::memcpy(buf->d_name.data(), "task", 5);
@@ -852,6 +861,148 @@ auto generate_statm(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     append_int(MEM.shared_pages);
     append(" 0 0 0 0\n");
     buf[off] = '\0';
+    return off;
+}
+
+auto procfs_pte_raw(const ker::mod::mm::paging::PageTableEntry& entry) -> uint64_t {
+    uint64_t raw = 0;
+    std::memcpy(&raw, &entry, sizeof(raw));
+    return raw;
+}
+
+auto procfs_page_table_from_entry(const ker::mod::mm::paging::PageTableEntry& entry) -> ker::mod::mm::paging::PageTable* {
+    uint64_t const PHYS = static_cast<uint64_t>(entry.frame) << ker::mod::mm::paging::PAGE_SHIFT;
+    return reinterpret_cast<ker::mod::mm::paging::PageTable*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
+}
+
+auto procfs_is_reserved_leaf(const ker::mod::mm::paging::PageTableEntry& entry) -> bool {
+    return entry.present == 0 && (procfs_pte_raw(entry) & ker::mod::mm::paging::PAGE_RESERVED) != 0U;
+}
+
+auto procfs_map_perms(const ker::mod::mm::paging::PageTableEntry& entry) -> std::array<char, 5> {
+    if (procfs_is_reserved_leaf(entry)) {
+        return {'-', '-', '-', 'p', '\0'};
+    }
+
+    uint64_t const RAW = procfs_pte_raw(entry);
+    return {
+        'r',
+        ((entry.writable != 0) || ((RAW & ker::mod::mm::paging::PAGE_COW) != 0U)) ? 'w' : '-',
+        entry.no_execute == 0 ? 'x' : '-',
+        (RAW & ker::mod::mm::paging::PAGE_SHARED) != 0U ? 's' : 'p',
+        '\0',
+    };
+}
+
+// Generate Linux-style /proc/<pid>/maps rows for sanitizer runtimes.
+auto generate_maps(uint64_t pid, char* buf, size_t bufsz) -> size_t {
+    auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
+    if (task == nullptr || task->pagemap == nullptr) {
+        if (task != nullptr) {
+            task->release();
+        }
+        return 0;
+    }
+
+    using ker::mod::mm::paging::PAGE_SIZE;
+    using ker::mod::mm::paging::PageTableEntry;
+
+    constexpr size_t USER_PML4_ENTRIES = 256;
+    constexpr uint64_t PAGES_PER_2M = 512;
+    constexpr uint64_t PAGES_PER_1G = 512 * PAGES_PER_2M;
+    constexpr uint64_t PML4_SHIFT = 39;
+    constexpr uint64_t PML3_SHIFT = 30;
+    constexpr uint64_t PML2_SHIFT = 21;
+    constexpr uint64_t PML1_SHIFT = 12;
+
+    size_t off = 0;
+    uint64_t range_start = 0;
+    uint64_t range_end = 0;
+    std::array<char, 5> range_perms{};
+    bool have_range = false;
+
+    auto append_range = [&]() {
+        if (!have_range || off >= bufsz - 1) {
+            return;
+        }
+        int const LEN =
+            std::snprintf(buf + off, bufsz - off, "%012llx-%012llx %s 00000000 00:00 0 \n", static_cast<unsigned long long>(range_start),
+                          static_cast<unsigned long long>(range_end), range_perms.data());
+        if (LEN <= 0) {
+            return;
+        }
+        off += std::min(static_cast<size_t>(LEN), bufsz - off - 1);
+    };
+
+    auto emit_leaf = [&](uint64_t vaddr, uint64_t page_count, const PageTableEntry& entry) {
+        auto const PERMS = procfs_map_perms(entry);
+        uint64_t const END = vaddr + (page_count * PAGE_SIZE);
+        if (have_range && range_end == vaddr && range_perms == PERMS) {
+            range_end = END;
+            return;
+        }
+
+        append_range();
+        range_start = vaddr;
+        range_end = END;
+        range_perms = PERMS;
+        have_range = true;
+    };
+
+    auto* pagemap = task->pagemap;
+    for (size_t i4 = 0; i4 < USER_PML4_ENTRIES; ++i4) {
+        const auto& pml4e = pagemap->entries.at(i4);
+        if (pml4e.present == 0) {
+            continue;
+        }
+
+        auto* pml3 = procfs_page_table_from_entry(pml4e);
+        for (size_t i3 = 0; i3 < pml3->entries.size(); ++i3) {
+            const auto& pml3e = pml3->entries.at(i3);
+            if (pml3e.present == 0) {
+                continue;
+            }
+            uint64_t const VADDR_1G = (static_cast<uint64_t>(i4) << PML4_SHIFT) | (static_cast<uint64_t>(i3) << PML3_SHIFT);
+            if (pml3e.pagesize != 0) {
+                if (pml3e.user != 0) {
+                    emit_leaf(VADDR_1G, PAGES_PER_1G, pml3e);
+                }
+                continue;
+            }
+
+            auto* pml2 = procfs_page_table_from_entry(pml3e);
+            for (size_t i2 = 0; i2 < pml2->entries.size(); ++i2) {
+                const auto& pml2e = pml2->entries.at(i2);
+                if (pml2e.present == 0) {
+                    continue;
+                }
+                uint64_t const VADDR_2M = VADDR_1G | (static_cast<uint64_t>(i2) << PML2_SHIFT);
+                if (pml2e.pagesize != 0) {
+                    if (pml2e.user != 0) {
+                        emit_leaf(VADDR_2M, PAGES_PER_2M, pml2e);
+                    }
+                    continue;
+                }
+
+                auto* pml1 = procfs_page_table_from_entry(pml2e);
+                for (size_t i1 = 0; i1 < pml1->entries.size(); ++i1) {
+                    const auto& pte = pml1->entries.at(i1);
+                    if (pte.present == 0 && !procfs_is_reserved_leaf(pte)) {
+                        continue;
+                    }
+                    if (pte.present != 0 && pte.user == 0) {
+                        continue;
+                    }
+                    uint64_t const VADDR = VADDR_2M | (static_cast<uint64_t>(i1) << PML1_SHIFT);
+                    emit_leaf(VADDR, 1, pte);
+                }
+            }
+        }
+    }
+
+    append_range();
+    buf[off] = '\0';
+    task->release();
     return off;
 }
 
@@ -3257,6 +3408,7 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         constexpr size_t MAX_PROCFS_BUF = 4096;
         constexpr size_t MAX_KPERF_BUF = 65536;  // 64 KiB for event streams
         constexpr size_t MAX_MEMACC_BUF = 262144;
+        bool const IS_MAPS = pfd->node.type == ProcNodeType::MAPS_FILE;
         bool const IS_KPERF = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KWKISTAT_FILE ||
                                pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCONTSTAT_FILE ||
                                pfd->node.type == ProcNodeType::KIPCSTAT_FILE || pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE ||
@@ -3270,7 +3422,7 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_BUFFER_CACHE_FILE ||
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_PACKET_POOL_FILE);
         size_t alloc_sz = MAX_PROCFS_BUF;
-        if (IS_MEMACC) {
+        if (IS_MEMACC || IS_MAPS) {
             alloc_sz = MAX_MEMACC_BUF;
         } else if (IS_KPERF) {
             alloc_sz = MAX_KPERF_BUF;
@@ -3292,6 +3444,9 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 break;
             case ProcNodeType::CMDLINE_FILE:
                 pfd->content_len = generate_cmdline(pfd->node.pid, pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::MAPS_FILE:
+                pfd->content_len = generate_maps(pfd->node.pid, pfd->content, MAX_MEMACC_BUF);
                 break;
             case ProcNodeType::MOUNTS_FILE:
                 pfd->content_len = generate_mounts(pfd->content, MAX_PROCFS_BUF);
@@ -3412,6 +3567,7 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             case ProcNodeType::STATUS_FILE:
             case ProcNodeType::STAT_FILE:
             case ProcNodeType::STATM_FILE:
+            case ProcNodeType::MAPS_FILE:
                 return true;
             default:
                 return false;
@@ -3915,6 +4071,9 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
         if (strcmp(task_sub, "cmdline") == 0) {
             return make_file(ProcNodeType::CMDLINE_FILE, TID_VALUE, false);
         }
+        if (strcmp(task_sub, "maps") == 0) {
+            return make_file(ProcNodeType::MAPS_FILE, TID_VALUE, false);
+        }
         if (strcmp(task_sub, "wki_launcher") == 0) {
             return make_file(ProcNodeType::WKI_LAUNCHER_FILE, TID_VALUE, false);
         }
@@ -4084,6 +4243,10 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     if (strcmp(path, "self/cmdline") == 0) {
         return make_file(ProcNodeType::CMDLINE_FILE, SELF_PID, false);
     }
+    // /proc/self/maps
+    if (strcmp(path, "self/maps") == 0) {
+        return make_file(ProcNodeType::MAPS_FILE, SELF_PID, false);
+    }
     // /proc/self/wki_launcher
     if (strcmp(path, "self/wki_launcher") == 0) {
         return make_file(ProcNodeType::WKI_LAUNCHER_FILE, SELF_PID, false);
@@ -4168,6 +4331,9 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     }
     if (strcmp(sub, "cmdline") == 0) {
         return make_file(ProcNodeType::CMDLINE_FILE, static_cast<uint64_t>(PID), false);
+    }
+    if (strcmp(sub, "maps") == 0) {
+        return make_file(ProcNodeType::MAPS_FILE, static_cast<uint64_t>(PID), false);
     }
     if (strcmp(sub, "wki_launcher") == 0) {
         return make_file(ProcNodeType::WKI_LAUNCHER_FILE, static_cast<uint64_t>(PID), false);

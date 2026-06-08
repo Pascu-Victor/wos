@@ -37,7 +37,7 @@ auto current_task_has_deliverable_signal() -> bool {
     if (task == nullptr) {
         return false;
     }
-    return (task->sig_pending & ~task->sig_mask) != 0;
+    return task->has_interrupting_signal_pending();
 }
 
 void perf_record_ipc_event(uint8_t op, ker::mod::perf::WkiPerfPhase phase, uint16_t peer, uint16_t channel, uint32_t correlation,

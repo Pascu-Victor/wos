@@ -382,22 +382,34 @@ void create_init_tasks(boot::HandoverModules& mod_struct, uint64_t kernel_rsp) {
         uint64_t const ALIGNED = CURRENT_ADDR & ~(ALIGNMENT - 1);
         current_virt_offset += (CURRENT_ADDR - ALIGNED);
 
-        constexpr uint64_t AT_NULL = 0;
-        constexpr uint64_t AT_PAGESZ = 6;
-        constexpr uint64_t AT_ENTRY = 9;
         constexpr uint64_t AT_PHDR = 3;
-        constexpr uint64_t AT_EHDR = 33;  // AT_EHDR (glibc extension but widely supported)
+        constexpr uint64_t AT_PHENT = 4;
+        constexpr uint64_t AT_PHNUM = 5;
+        constexpr uint64_t AT_PAGESZ = 6;
+        constexpr uint64_t AT_BASE = 7;
+        constexpr uint64_t AT_ENTRY = 9;
+        constexpr uint64_t AT_NULL = 0;
 
-        const std::array<uint64_t, 10> AUXV_ENTRIES = {AT_PAGESZ, mm::paging::PAGE_SIZE,
-                                                       AT_ENTRY,  new_task->entry,
-                                                       AT_PHDR,   new_task->program_header_addr,
-                                                       AT_EHDR,   new_task->elf_header_addr,
-                                                       AT_NULL,   0};
+        std::array<uint64_t, 14> auxv_entries{};
+        size_t auxv_entry_count = 0;
+        auto push_auxv_entry = [&](uint64_t key, uint64_t value) {
+            auxv_entries[auxv_entry_count++] = key;
+            auxv_entries[auxv_entry_count++] = value;
+        };
 
-        // Push auxv in reverse order
-        // NOLINTNEXTLINE(modernize-loop-convert): Reverse iterators keep this freestanding-friendly without ranges.
-        for (auto it = AUXV_ENTRIES.crbegin(); it != AUXV_ENTRIES.crend(); ++it) {
-            uint64_t val = *it;
+        push_auxv_entry(AT_PAGESZ, mm::paging::PAGE_SIZE);
+        push_auxv_entry(AT_ENTRY, new_task->entry);
+        push_auxv_entry(AT_PHDR, new_task->program_header_addr);
+        push_auxv_entry(AT_PHENT, new_task->program_header_ent_size);
+        push_auxv_entry(AT_PHNUM, new_task->program_header_count);
+        if (new_task->interp_base != 0) {
+            push_auxv_entry(AT_BASE, new_task->interp_base);
+        }
+        push_auxv_entry(AT_NULL, 0);
+
+        // Push auxv in reverse order so it reads forward at the final stack address.
+        for (size_t i = auxv_entry_count; i > 0; i--) {
+            uint64_t val = auxv_entries[i - 1];
             push_to_stack(&val, sizeof(uint64_t));
         }
 

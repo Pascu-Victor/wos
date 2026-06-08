@@ -12,6 +12,7 @@
 #include <cstring>
 #include <dev/block_device.hpp>
 #include <test/ktest.hpp>
+#include <vfs/fs/xfs/xfs_btree.hpp>
 #include <vfs/fs/xfs/xfs_format.hpp>
 #include <vfs/fs/xfs/xfs_mount.hpp>
 
@@ -79,5 +80,24 @@ KTEST(XFS, NullDeviceReturnsEINVAL) {
 KTEST(XFS, NullCtxOutReturnsEINVAL) {
     ker::dev::BlockDevice dev = make_xfs_null_bdev();
     int const RET = ker::vfs::xfs::xfs_mount(&dev, true, nullptr);
+    KEXPECT_EQ(RET, -EINVAL);
+}
+
+KTEST(XFS, BtreeLookupRejectsZeroDepth) {
+    ker::vfs::xfs::XfsBtreeCursor<ker::vfs::xfs::XfsCntbtTraits> cur;
+    ker::vfs::xfs::XfsCntbtTraits::IRec target{};
+
+    int const RET = ker::vfs::xfs::xfs_btree_lookup(&cur, 0, 0, target, ker::vfs::xfs::XfsBtreeLookup::GE);
+
+    KEXPECT_EQ(RET, -EINVAL);
+}
+
+KTEST(XFS, BtreeLookupRejectsOverMaxDepth) {
+    ker::vfs::xfs::XfsBtreeCursor<ker::vfs::xfs::XfsCntbtTraits> cur;
+    ker::vfs::xfs::XfsCntbtTraits::IRec target{};
+
+    int const RET = ker::vfs::xfs::xfs_btree_lookup(&cur, 0, static_cast<uint8_t>(ker::vfs::xfs::XFS_BTREE_MAXLEVELS + 1), target,
+                                                    ker::vfs::xfs::XfsBtreeLookup::GE);
+
     KEXPECT_EQ(RET, -EINVAL);
 }

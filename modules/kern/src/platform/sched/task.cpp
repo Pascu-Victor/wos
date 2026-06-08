@@ -1,5 +1,6 @@
 #include "task.hpp"
 
+#include <bits/off_t.h>
 #include <bits/ssize_t.h>
 
 #include <atomic>
@@ -12,7 +13,6 @@
 #include <platform/mm/mm.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
-#include <string_view>
 #include <vfs/file.hpp>
 #include <vfs/vfs.hpp>
 
@@ -25,6 +25,53 @@
 extern "C" void wos_kernel_thread_trampoline();  // NOLINT(readability-identifier-naming)
 
 namespace ker::mod::sched::task {
+namespace {
+
+void release_boot_file(ker::vfs::File* file) {
+    if (file == nullptr) {
+        return;
+    }
+    if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
+        file->fops->vfs_close(file);
+    }
+    delete[] file->vfs_path;
+    delete file;
+}
+
+auto read_boot_file_fully(const char* path, uint8_t** out_buf) -> bool {
+    if (path == nullptr || out_buf == nullptr) {
+        return false;
+    }
+
+    *out_buf = nullptr;
+
+    auto* file = ker::vfs::vfs_open_file_resolved(path, 0, 0);
+    if (file == nullptr || file->fops == nullptr || file->fops->vfs_read == nullptr || file->fops->vfs_lseek == nullptr) {
+        release_boot_file(file);
+        return false;
+    }
+
+    off_t const FILE_SIZE = file->fops->vfs_lseek(file, 0, 2);
+    if (FILE_SIZE <= 0) {
+        release_boot_file(file);
+        return false;
+    }
+
+    auto* buf = new uint8_t[static_cast<size_t>(FILE_SIZE)];
+    ssize_t const READ_SIZE = file->fops->vfs_read(file, buf, static_cast<size_t>(FILE_SIZE), 0);
+    release_boot_file(file);
+
+    if (READ_SIZE != FILE_SIZE) {
+        delete[] buf;
+        return false;
+    }
+
+    *out_buf = buf;
+    return true;
+}
+
+}  // namespace
+
 Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType type) {
     // CRITICAL: Copy the name string to kernel heap memory!
     // The passed 'name' might point to Limine boot memory or user memory
@@ -238,28 +285,9 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
         constexpr uint64_t INTERP_BASE = 0x40000000ULL;
         const char* const INTERP_PATH = std::begin(elf_result.interp_path);
 
-        int const INTERP_FD = ker::vfs::vfs_open(std::string_view(INTERP_PATH, __builtin_strlen(INTERP_PATH)), 0, 0);
-        if (INTERP_FD < 0) {
+        uint8_t* interp_buf = nullptr;
+        if (!read_boot_file_fully(INTERP_PATH, &interp_buf)) {
             dbg::log("Failed to open interpreter '%s' for task %s", INTERP_PATH, name);
-            hcf();
-        }
-
-        ssize_t const INTERP_SIZE = ker::vfs::vfs_lseek(INTERP_FD, 0, 2);
-        ker::vfs::vfs_lseek(INTERP_FD, 0, 0);
-        if (INTERP_SIZE <= 0) {
-            ker::vfs::vfs_close(INTERP_FD);
-            dbg::log("Invalid interpreter file size for '%s'", INTERP_PATH);
-            hcf();
-        }
-
-        auto* interp_buf = new uint8_t[INTERP_SIZE];
-        ssize_t interp_read = 0;
-        ker::vfs::vfs_read(INTERP_FD, interp_buf, INTERP_SIZE, reinterpret_cast<size_t*>(&interp_read));
-        ker::vfs::vfs_close(INTERP_FD);
-
-        if (interp_read != INTERP_SIZE) {
-            delete[] interp_buf;
-            dbg::log("Short read loading interpreter '%s'", INTERP_PATH);
             hcf();
         }
 
@@ -337,6 +365,12 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     // Share the parent's pagemap - do NOT create a new one
     t->pagemap = parent->pagemap;
     t->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    if (!t->lazy_vmem_ranges.clone_from(parent->lazy_vmem_ranges)) {
+        delete[] t->name;
+        mm::phys::page_free(reinterpret_cast<void*>(KSTACK_BASE));
+        delete t;
+        return nullptr;
+    }
 
     // Thread struct: only fsbase and stack are meaningful; mlibc manages the TLS allocation
     auto* thr = new threading::Thread{};
@@ -406,6 +440,7 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->suid = parent->suid;
     t->sgid = parent->sgid;
     t->umask = parent->umask;
+    t->personality = parent->personality;
     (void)t->supplementary_groups.clone_from(parent->supplementary_groups);
     t->session_id = parent->session_id;
     t->pgid = parent->pgid;

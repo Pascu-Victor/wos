@@ -76,7 +76,7 @@ __attribute__((section(".bss"))) size_t oom_known_pagemap_count;
 struct MemoryRegionStats {
     uint64_t code_pages;   // Low addresses (typically 0x400000 - 0x1000000) - ELF code/data
     uint64_t heap_pages;   // Heap region (brk area, typically after code)
-    uint64_t mmap_pages;   // mmap region (0x100000000000+) - where mlibc arenas live
+    uint64_t mmap_pages;   // mmap region where DSOs and mlibc arenas live
     uint64_t stack_pages;  // Stack region (high addresses near 0x7FFFFFFFFFFF)
     uint64_t other_pages;  // Other mapped pages
     uint64_t total_pages;
@@ -89,8 +89,8 @@ struct MemoryRegionStats {
 constexpr uint64_t CODE_REGION_START = 0x400000ULL;
 constexpr uint64_t CODE_REGION_END = 0x10000000ULL;  // 256MB for code/data
 constexpr uint64_t HEAP_REGION_START = 0x10000000ULL;
-constexpr uint64_t HEAP_REGION_END = 0x100000000000ULL;    // Up to mmap region
-constexpr uint64_t MMAP_REGION_START = 0x100000000000ULL;  // mlibc mmap base (changed from 0x700000000000)
+constexpr uint64_t HEAP_REGION_END = 0x200000000000ULL;    // Up to mmap region
+constexpr uint64_t MMAP_REGION_START = 0x200000000000ULL;  // Above ASAN shadow, below ELF debug info
 constexpr uint64_t MMAP_REGION_END = 0x700000000000ULL;    // Up to ELF debug info region
 constexpr uint64_t STACK_REGION_START = 0x7F0000000000ULL;
 constexpr uint64_t STACK_REGION_END = 0x800000000000ULL;  // End of canonical user space

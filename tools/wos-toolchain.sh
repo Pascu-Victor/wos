@@ -10,6 +10,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+source "$WORKSPACE_ROOT/tools/ccache_env.sh"
+wos_setup_ccache
+wos_setup_ccache_cmake_args
+WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
+WOS_MESON_COMPILER_PREFIX="$(wos_meson_compiler_prefix)"
+
 cd "$WORKSPACE_ROOT"
 
 B="$WORKSPACE_ROOT/toolchain"
@@ -57,10 +63,10 @@ mkdir -p $SYSROOT/bin $SYSROOT/lib $SYSROOT/include/abi-bits
 # headers-only mlibc -- compiler-rt needs these
 # Create a basic cross-file for headers-only build
 mkdir -p $B/../tools
-cat > $B/../tools/x86_64-pc-wos-mlibc.txt << 'EOF'
+cat > $B/../tools/x86_64-pc-wos-mlibc.txt << EOF
 [binaries]
-c = ['clang', '--target=x86_64-pc-wos', '-mcmodel=small']
-cpp = ['clang++', '--target=x86_64-pc-wos', '-mcmodel=small']
+c = [$WOS_MESON_COMPILER_PREFIX'clang', '--target=x86_64-pc-wos', '-mcmodel=small']
+cpp = [$WOS_MESON_COMPILER_PREFIX'clang++', '--target=x86_64-pc-wos', '-mcmodel=small']
 ar = 'llvm-ar'
 strip = 'llvm-strip'
 [host_machine]
@@ -107,6 +113,7 @@ export LDFLAGS="--sysroot=$SYSROOT"
 mkdir -p $B/compiler-rt-build
 cd $B/compiler-rt-build
 cmake -G Ninja \
+ "${WOS_CCACHE_CMAKE_ARGS[@]}" \
  -DCMAKE_BUILD_TYPE=Release \
  -DCMAKE_INSTALL_PREFIX=$HOST/lib/clang/22/target \
  -DCMAKE_C_COMPILER=$CC \
@@ -125,12 +132,18 @@ cmake -G Ninja \
  -DCOMPILER_RT_BUILD_BUILTINS=ON \
  -DCOMPILER_RT_BUILD_MEMPROF=OFF \
  -DCOMPILER_RT_BUILD_ORC=OFF \
+ -DCOMPILER_RT_BUILD_PROFILE=OFF \
+ -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
  -DCOMPILER_RT_HAS_SAFESTACK=OFF \
  -DCOMPILER_RT_OS_DIR="" \
  -DCOMPILER_RT_LIBCXXABI_ENABLE_LOCALIZATION=OFF \
  -DCOMPILER_RT_HAS_SCUDO_STANDALONE=OFF \
  -DCOMPILER_RT_BUILD_XRAY=OFF \
- -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
+ -DCOMPILER_RT_BUILD_SANITIZERS=ON \
+ -DCOMPILER_RT_SANITIZERS_TO_BUILD=asan \
+ -DCOMPILER_RT_HAS_GCC_S_LIB=OFF \
+ -DSANITIZER_CXX_ABI=none \
+ -DSANITIZER_TEST_CXX=none \
  -DCOMPILER_RT_STANDALONE_BUILD=ON \
  -DCOMPILER_RT_INTERCEPT_LIBDISPATCH=OFF \
  -DCOMPILER_RT_HAS_PTHREAD_LIB=OFF \
@@ -154,12 +167,16 @@ ln -fs $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.crtend-x86_64.a $HOST/lib
 ln -fs $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.builtins-x86_64.a $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.builtins.a
 ln -fs $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.crtbegin-x86_64.a $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.crtbegin.a
 ln -fs $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.crtend-x86_64.a $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.crtend.a
+ln -fs $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.asan_static-x86_64.a $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.asan_static.a
+ln -fs $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.asan-x86_64.a $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.asan.a
+ln -fs $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.asan_cxx-x86_64.a $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.asan_cxx.a
 
 # 3. Bootstrap libcxx (headers only, needed by mlibc)
 
 mkdir -p $B/libcxx-bootstrap
 cd $B/libcxx-bootstrap
 cmake -G Ninja \
+ "${WOS_CCACHE_CMAKE_ARGS[@]}" \
  -DCMAKE_BUILD_TYPE=Release \
  -DCMAKE_INSTALL_PREFIX=$SYSROOT \
  -DCMAKE_C_COMPILER=$CC \
@@ -205,8 +222,8 @@ cp -r $B/libcxx-bootstrap/include/* $SYSROOT/include/
 mkdir -p $B/../tools
 cat > $B/../tools/x86_64-pc-wos-mlibc.txt << EOF
 [binaries]
-c = ['clang', '--target=x86_64-pc-wos', '--sysroot=$SYSROOT', '-isystem', '$HOST/lib/clang/22/include', '-isystem', '$SYSROOT/include', '-mcmodel=small']
-cpp = ['clang++', '--target=x86_64-pc-wos', '--sysroot=$SYSROOT', '-isystem', '$SYSROOT/include/c++/v1', '-isystem', '$HOST/lib/clang/22/include', '-isystem', '$SYSROOT/include', '-mcmodel=small']
+c = [$WOS_MESON_COMPILER_PREFIX'clang', '--target=x86_64-pc-wos', '--sysroot=$SYSROOT', '-isystem', '$HOST/lib/clang/22/include', '-isystem', '$SYSROOT/include', '-mcmodel=small']
+cpp = [$WOS_MESON_COMPILER_PREFIX'clang++', '--target=x86_64-pc-wos', '--sysroot=$SYSROOT', '-isystem', '$SYSROOT/include/c++/v1', '-isystem', '$HOST/lib/clang/22/include', '-isystem', '$SYSROOT/include', '-mcmodel=small']
 ar = 'llvm-ar'
 strip = 'llvm-strip'
 
@@ -246,6 +263,7 @@ ninja && ninja install
 mkdir -p $B/libcxx-build
 cd $B/libcxx-build
 cmake -G Ninja \
+ "${WOS_CCACHE_CMAKE_ARGS[@]}" \
  -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;libunwind' \
  -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
  -DLIBCXXABI_USE_COMPILER_RT=On \
@@ -312,13 +330,13 @@ cd $B/busybox-build
 
 # Cross-compilation variables
 TARGET_SYSROOT="$SYSROOT"
-BB_CC="$HOST/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
+BB_CC="${WOS_CCACHE_PREFIX}$HOST/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
 BB_AR="$HOST/bin/llvm-ar"
 BB_STRIP="$HOST/bin/llvm-strip"
 BB_RANLIB="$HOST/bin/llvm-ranlib"
 BB_OBJCOPY="$HOST/bin/llvm-objcopy"
 BB_NM="$HOST/bin/llvm-nm"
-BB_HOSTCC="gcc"
+BB_HOSTCC="${WOS_CCACHE_PREFIX}gcc"
 BB_CFLAGS="--sysroot=$TARGET_SYSROOT -fno-sanitize=safe-stack -fno-stack-protector"
 BB_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld"
 
@@ -334,7 +352,7 @@ if [ -f $B/src/busybox/configs/wos_defconfig ]; then
         HOSTCC="$BB_HOSTCC" \
         CFLAGS="$BB_CFLAGS" \
         LDFLAGS="$BB_LDFLAGS" \
-        HOSTCC="/usr/bin/clang" \
+        HOSTCC="${WOS_CCACHE_PREFIX}/usr/bin/clang" \
         KCONFIG_ALLCONFIG=$B/src/busybox/configs/wos_defconfig \
         allnoconfig
 else
@@ -349,7 +367,7 @@ else
         HOSTCC="$BB_HOSTCC" \
         CFLAGS="$BB_CFLAGS" \
         LDFLAGS="$BB_LDFLAGS" \
-        HOSTCC="/usr/bin/clang" \
+        HOSTCC="${WOS_CCACHE_PREFIX}/usr/bin/clang" \
         defconfig
 fi
 
@@ -364,7 +382,7 @@ make -C $B/busybox-build -j$(nproc) \
     HOSTCC="$BB_HOSTCC" \
     CFLAGS="$BB_CFLAGS" \
     LDFLAGS="$BB_LDFLAGS" \
-    HOSTCC="/usr/bin/clang" \
+    HOSTCC="${WOS_CCACHE_PREFIX}/usr/bin/clang" \
     busybox
 
 cp $B/busybox-build/busybox $SYSROOT/bin/busybox
@@ -389,7 +407,7 @@ EOF
 
 TARGET_SYSROOT="$SYSROOT"
 DROPBEAR_CFLAGS="--sysroot=$TARGET_SYSROOT -O3 -g -fno-sanitize=safe-stack -fno-stack-protector -I$TARGET_SYSROOT/include"
-export CC="$HOST/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
+export CC="${WOS_CCACHE_PREFIX}$HOST/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
 export AR="$HOST/bin/llvm-ar"
 export RANLIB="$HOST/bin/llvm-ranlib"
 export STRIP="$HOST/bin/llvm-strip"

@@ -69,6 +69,31 @@ uint8_t next_alloc_vector = DYNAMIC_VECTOR_BEGIN;
     return static_cast<size_t>((vaddr >> shift) & 0x1FFU);
 }
 
+void log_userfault_lazy_vmem_ranges(ker::mod::sched::task::Task* task, uint64_t cr2) {
+    constexpr size_t MAX_LOGGED_RANGES = 24;
+    if (task == nullptr) {
+        return;
+    }
+
+    uint64_t shadow_app = 0;
+    bool const HAS_SHADOW_APP = cr2 >= 0x000000007fff8000ULL && cr2 < 0x0000800000000000ULL;
+    if (HAS_SHADOW_APP) {
+        shadow_app = (cr2 - 0x000000007fff8000ULL) << 3U;
+    }
+
+    size_t const RANGE_COUNT = task->lazy_vmem_ranges.size();
+    journal::warn(" userfault lazy_vmem: ranges=%llu cr2=0x%lx shadow_app=0x%lx", static_cast<unsigned long long>(RANGE_COUNT), cr2,
+                  HAS_SHADOW_APP ? shadow_app : 0UL);
+
+    size_t const LOG_COUNT = RANGE_COUNT < MAX_LOGGED_RANGES ? RANGE_COUNT : MAX_LOGGED_RANGES;
+    for (size_t i = 0; i < LOG_COUNT; ++i) {
+        auto const& range = task->lazy_vmem_ranges.at(i);
+        bool const CONTAINS = cr2 >= range.start && cr2 < range.end;
+        journal::warn("  lazy[%llu]: [0x%lx, 0x%lx) prot=0x%lx flags=0x%lx contains=%u", static_cast<unsigned long long>(i), range.start,
+                      range.end, range.prot, range.flags, CONTAINS ? 1U : 0U);
+    }
+}
+
 auto load_u64_unaligned(const void* ptr) -> uint64_t {
     uint64_t value = 0;
     __builtin_memcpy(&value, ptr, sizeof(value));
@@ -240,6 +265,10 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
         journal::warn("USERFAULT DEBUG: apicId=%d cpuFromApic=%d task=%p taskPid=%d cr3=0x%lx taskPagemap=%p", APIC_ID, CPU_ID_FROM_APIC,
                       current_task_for_dump, (current_task_for_dump != nullptr) ? current_task_for_dump->pid : 0xDEAD, cr3,
                       (current_task_for_dump != nullptr) ? reinterpret_cast<void*>(current_task_for_dump->pagemap) : nullptr);
+
+        if (frame.int_num == 14) {
+            log_userfault_lazy_vmem_ranges(current_task_for_dump, cr2);
+        }
 
         ker::mod::dbg::coredump::try_write_for_task(current_task_for_dump, gpr, frame, cr2, cr3, apic::get_apic_id());
 

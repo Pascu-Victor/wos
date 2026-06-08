@@ -23,6 +23,7 @@
 #include <platform/sched/task.hpp>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vfs/file.hpp>
 #include <vfs/vfs.hpp>
 
@@ -81,7 +82,14 @@ auto current_task_has_deliverable_signal() -> bool {
     if (task == nullptr) {
         return false;
     }
-    return (task->sig_pending & ~task->sig_mask) != 0;
+    return task->has_interrupting_signal_pending();
+}
+
+auto clamp_io_count(ssize_t result, size_t requested) -> ssize_t {
+    if (result <= 0 || std::cmp_less_equal(result, requested)) {
+        return result;
+    }
+    return static_cast<ssize_t>(requested);
 }
 
 void drain_network_rx_work() {
@@ -170,7 +178,7 @@ ssize_t socket_fops_read(ker::vfs::File* f, void* buf, size_t count, size_t /*un
     if (sock->proto_ops == nullptr || sock->proto_ops->recv == nullptr) {
         return -ENOSYS;
     }
-    return run_socket_call<ssize_t>(f, sock, 0, [&]() { return sock->proto_ops->recv(sock, buf, count, 0); });
+    return clamp_io_count(run_socket_call<ssize_t>(f, sock, 0, [&]() { return sock->proto_ops->recv(sock, buf, count, 0); }), count);
 }
 
 ssize_t socket_fops_write(ker::vfs::File* f, const void* buf, size_t count, size_t /*unused*/) {
@@ -181,7 +189,7 @@ ssize_t socket_fops_write(ker::vfs::File* f, const void* buf, size_t count, size
     if (sock->proto_ops == nullptr || sock->proto_ops->send == nullptr) {
         return -ENOSYS;
     }
-    return run_socket_call<ssize_t>(f, sock, 0, [&]() { return sock->proto_ops->send(sock, buf, count, 0); });
+    return clamp_io_count(run_socket_call<ssize_t>(f, sock, 0, [&]() { return sock->proto_ops->send(sock, buf, count, 0); }), count);
 }
 
 ker::vfs::FileOperations socket_fops = {
@@ -630,8 +638,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     if (file_handle.file->fops == nullptr || file_handle.file->fops->vfs_write == nullptr) {
                         return static_cast<uint64_t>(-ENOSYS);
                     }
-                    auto result =
-                        file_handle.file->fops->vfs_write(file_handle.file, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), 0);
+                    auto result = clamp_io_count(
+                        file_handle.file->fops->vfs_write(file_handle.file, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), 0),
+                        static_cast<size_t>(a3));
                     return static_cast<uint64_t>(result);
                 }
                 return static_cast<uint64_t>(-EBADF);
@@ -642,7 +651,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto const RESULT = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&]() {
                 return sock->proto_ops->send(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4));
             });
-            return static_cast<uint64_t>(RESULT);
+            return static_cast<uint64_t>(clamp_io_count(RESULT, static_cast<size_t>(a3)));
         }
 
         case ker::abi::net::ops::RECV: {
@@ -658,8 +667,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     if (file_handle.file->fops == nullptr || file_handle.file->fops->vfs_read == nullptr) {
                         return static_cast<uint64_t>(-ENOSYS);
                     }
-                    auto result =
-                        file_handle.file->fops->vfs_read(file_handle.file, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), 0);
+                    auto result = clamp_io_count(
+                        file_handle.file->fops->vfs_read(file_handle.file, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), 0),
+                        static_cast<size_t>(a3));
                     return static_cast<uint64_t>(result);
                 }
                 return static_cast<uint64_t>(-EBADF);
@@ -670,7 +680,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto const RESULT = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&]() {
                 return sock->proto_ops->recv(sock, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4));
             });
-            return static_cast<uint64_t>(RESULT);
+            return static_cast<uint64_t>(clamp_io_count(RESULT, static_cast<size_t>(a3)));
         }
 
         case ker::abi::net::ops::CLOSE: {
@@ -694,7 +704,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return sock->proto_ops->sendto(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4),
                                                reinterpret_cast<const void*>(a5), alen);
             });
-            return static_cast<uint64_t>(RESULT);
+            return static_cast<uint64_t>(clamp_io_count(RESULT, static_cast<size_t>(a3)));
         }
 
         case ker::abi::net::ops::RECVFROM: {
@@ -712,7 +722,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return sock->proto_ops->recvfrom(sock, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4),
                                                  reinterpret_cast<void*>(a5), &alen);
             });
-            return static_cast<uint64_t>(RESULT);
+            return static_cast<uint64_t>(clamp_io_count(RESULT, static_cast<size_t>(a3)));
         }
 
         case ker::abi::net::ops::SETSOCKOPT: {

@@ -21,6 +21,7 @@ enum class ProcNodeType : uint8_t {
     STAT_FILE,            // /proc/<pid>/stat
     STATM_FILE,           // /proc/<pid>/statm
     CMDLINE_FILE,         // /proc/<pid>/cmdline
+    MAPS_FILE,            // /proc/<pid>/maps
     UPTIME_FILE,          // /proc/uptime
     CPU_STAT_FILE,        // /proc/stat
     LOADAVG_FILE,         // /proc/loadavg

@@ -154,7 +154,7 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
 
     // Preserve the SysV user red zone; mlibc and clang-generated leaf code may
     // keep live locals in the 128 bytes below RSP across syscalls.
-    uint64_t const FRAME_ADDR = signal_frame_address(USER_RSP);
+    uint64_t const FRAME_ADDR = signal_frame_address_for_task(*task, USER_RSP, handler.flags);
     auto* frame = reinterpret_cast<SignalFrame*>(FRAME_ADDR);
 
     // Write the signal frame to user-space stack
@@ -251,7 +251,7 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
         return;
     }
 
-    uint64_t const FRAME_ADDR = signal_frame_address(frame.rsp);
+    uint64_t const FRAME_ADDR = signal_frame_address_for_task(*task, frame.rsp, handler.flags);
     auto* sigframe = reinterpret_cast<SignalFrame*>(FRAME_ADDR);
 
     sigframe->pretcode = handler.restorer;

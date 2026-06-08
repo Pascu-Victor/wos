@@ -7,6 +7,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+source "$WORKSPACE_ROOT/tools/ccache_env.sh"
+wos_setup_ccache
+wos_setup_ccache_cmake_args
+
 cd "$WORKSPACE_ROOT"
 
 mkdir -p toolchain
@@ -30,6 +34,7 @@ export CXX=clang++
 mkdir -p $B/host-build
 cd $B/host-build
 cmake -G Ninja \
+ "${WOS_CCACHE_CMAKE_ARGS[@]}" \
  -DCMAKE_BUILD_TYPE=Release \
  -DCMAKE_INSTALL_PREFIX=$B/host \
  -DLLVM_TARGETS_TO_BUILD=X86 \

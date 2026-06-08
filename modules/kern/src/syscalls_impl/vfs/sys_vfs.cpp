@@ -232,7 +232,22 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
         }
         case ops::PIPE: {
             auto* pipefd = reinterpret_cast<int*>(a1);
-            return static_cast<int64_t>(ker::vfs::vfs_pipe(pipefd));
+            std::array<int, 2> kernel_pipefd = {-1, -1};
+            int const RET = ker::vfs::vfs_pipe(kernel_pipefd.data());
+            if (RET < 0) {
+                return static_cast<int64_t>(RET);
+            }
+            if (int const COPY_RET = copy_value_to_user(pipefd, kernel_pipefd.at(0)); COPY_RET < 0) {
+                static_cast<void>(ker::vfs::vfs_close(kernel_pipefd.at(0)));
+                static_cast<void>(ker::vfs::vfs_close(kernel_pipefd.at(1)));
+                return static_cast<int64_t>(COPY_RET);
+            }
+            if (int const COPY_RET = copy_value_to_user(pipefd + 1, kernel_pipefd.at(1)); COPY_RET < 0) {
+                static_cast<void>(ker::vfs::vfs_close(kernel_pipefd.at(0)));
+                static_cast<void>(ker::vfs::vfs_close(kernel_pipefd.at(1)));
+                return static_cast<int64_t>(COPY_RET);
+            }
+            return static_cast<int64_t>(RET);
         }
         case ops::PREAD: {
             int const FD = static_cast<int>(a1);

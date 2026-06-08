@@ -56,6 +56,75 @@ auto cow_ref_category(uint32_t refcount) -> uint16_t {
     return 4;
 }
 
+auto lazy_user_vmem_flags(uint64_t prot) -> uint64_t {
+    uint64_t flags = paging::PAGE_PRESENT | paging::PAGE_USER;
+    if ((prot & 0x2ULL) != 0) {
+        flags |= paging::PAGE_WRITE;
+    }
+    if ((prot & 0x4ULL) == 0) {
+        flags |= paging::PAGE_NX;
+    }
+    return flags;
+}
+
+auto is_asan_shadow_address(uint64_t vaddr) -> bool {
+    constexpr uint64_t ASAN_LOW_SHADOW_BEG = 0x000000007fff8000ULL;
+    constexpr uint64_t ASAN_HIGH_SHADOW_END = 0x000010007fff7fffULL;
+    return vaddr >= ASAN_LOW_SHADOW_BEG && vaddr <= ASAN_HIGH_SHADOW_END;
+}
+
+void log_lazy_vmem_fault_state(sched::task::Task* task, uint64_t page_vaddr, const paging::PageFault& fault, const char* reason) {
+    constexpr size_t MAX_LOGGED_RANGES = 24;
+    if (task == nullptr || !is_asan_shadow_address(page_vaddr)) {
+        return;
+    }
+
+    log::warn("lazy vmem %s: pid=%lu page=0x%llx err_present=%u err_write=%u ranges=%llu", reason, task->pid,
+              static_cast<unsigned long long>(page_vaddr), static_cast<unsigned>(fault.present), static_cast<unsigned>(fault.writable),
+              static_cast<unsigned long long>(task->lazy_vmem_ranges.size()));
+
+    size_t const RANGE_COUNT = task->lazy_vmem_ranges.size();
+    size_t const LOG_COUNT = RANGE_COUNT < MAX_LOGGED_RANGES ? RANGE_COUNT : MAX_LOGGED_RANGES;
+    for (size_t i = 0; i < LOG_COUNT; ++i) {
+        auto const& range = task->lazy_vmem_ranges.at(i);
+        bool const CONTAINS = page_vaddr >= range.start && page_vaddr < range.end;
+        log::warn(" lazy[%llu]: [0x%llx, 0x%llx) prot=0x%llx flags=0x%llx contains=%u", static_cast<unsigned long long>(i),
+                  static_cast<unsigned long long>(range.start), static_cast<unsigned long long>(range.end),
+                  static_cast<unsigned long long>(range.prot), static_cast<unsigned long long>(range.flags),
+                  static_cast<unsigned>(CONTAINS));
+    }
+}
+
+auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const paging::PageFault& fault) -> bool {
+    if (task == nullptr || task->pagemap == nullptr) {
+        return false;
+    }
+
+    uint64_t const PAGE_VADDR = vaddr & ~(paging::PAGE_SIZE - 1);
+    for (const auto& range : task->lazy_vmem_ranges) {
+        if (PAGE_VADDR < range.start || PAGE_VADDR >= range.end) {
+            continue;
+        }
+        if (range.prot == 0 || (((range.prot & 0x2ULL) == 0) && fault.writable != 0U)) {
+            log_lazy_vmem_fault_state(task, PAGE_VADDR, fault, "deny");
+            return false;
+        }
+
+        void* const PAGE = phys::page_alloc(paging::PAGE_SIZE, "lazy-vmem");
+        if (PAGE == nullptr) {
+            log::error("lazy vmem fault: OOM pid=%lu vaddr=0x%llx", task->pid, static_cast<unsigned long long>(PAGE_VADDR));
+            return false;
+        }
+        std::memset(PAGE, 0, paging::PAGE_SIZE);
+        auto const PADDR = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(PAGE)));
+        map_page(task->pagemap, PAGE_VADDR, PADDR, lazy_user_vmem_flags(range.prot));
+        return true;
+    }
+
+    log_lazy_vmem_fault_state(task, PAGE_VADDR, fault, "miss");
+    return false;
+}
+
 void record_cow_perf_event(sched::task::Task* task, perf::WkiPerfLocalVmemOp op, uint64_t vaddr, uint32_t refcount, uint64_t started_us) {
     if (task == nullptr || !perf::is_wki_recording_enabled()) {
         return;
@@ -878,6 +947,9 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
     // syscall copy paths writing into a not-yet-backed user stack page.
     if (PAGEFAULT.present == 0U && control_register < 0x0000800000000000ULL) {
         auto* current_task = sched::get_current_task();
+        if (handle_lazy_vmem_fault(current_task, control_register, PAGEFAULT)) {
+            return true;
+        }
         if (current_task != nullptr && current_task->pagemap != nullptr && current_task->thread != nullptr &&
             sched::threading::handle_lazy_stack_fault(current_task->thread, current_task->pagemap, control_register, frame.rsp)) {
             return true;

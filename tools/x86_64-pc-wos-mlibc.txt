@@ -1,6 +1,6 @@
 [binaries]
-c = ['clang', '--target=x86_64-pc-wos', '--sysroot=/home/womywomwoo/git/wos/toolchain/sysroot', '-isystem', '/home/womywomwoo/git/wos/toolchain/host/lib/clang/22/include', '-isystem', '/home/womywomwoo/git/wos/toolchain/sysroot/include', '-mcmodel=small']
-cpp = ['clang++', '--target=x86_64-pc-wos', '--sysroot=/home/womywomwoo/git/wos/toolchain/sysroot', '-isystem', '/home/womywomwoo/git/wos/toolchain/sysroot/include/c++/v1', '-isystem', '/home/womywomwoo/git/wos/toolchain/host/lib/clang/22/include', '-isystem', '/home/womywomwoo/git/wos/toolchain/sysroot/include', '-mcmodel=small']
+c = ['/usr/bin/ccache', 'clang', '--target=x86_64-pc-wos', '--sysroot=/home/womywomwoo/git/wos/toolchain/sysroot', '-isystem', '/home/womywomwoo/git/wos/toolchain/host/lib/clang/22/include', '-isystem', '/home/womywomwoo/git/wos/toolchain/sysroot/include', '-mcmodel=small']
+cpp = ['/usr/bin/ccache', 'clang++', '--target=x86_64-pc-wos', '--sysroot=/home/womywomwoo/git/wos/toolchain/sysroot', '-isystem', '/home/womywomwoo/git/wos/toolchain/sysroot/include/c++/v1', '-isystem', '/home/womywomwoo/git/wos/toolchain/host/lib/clang/22/include', '-isystem', '/home/womywomwoo/git/wos/toolchain/sysroot/include', '-mcmodel=small']
 ar = 'llvm-ar'
 strip = 'llvm-strip'
 

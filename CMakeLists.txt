@@ -3,6 +3,17 @@ cmake_minimum_required(VERSION 3.20)
 include(ExternalProject)
 
 option(WOS_BUILD_LINUX_BENCHMARKS "Build Linux host benchmark binaries alongside WOS artifacts" OFF)
+option(WOS_USE_CCACHE "Use ccache/cccache as a compiler launcher when available" ON)
+set(WOS_CCACHE_PROGRAM "" CACHE FILEPATH "Path to ccache/cccache")
+
+if(WOS_USE_CCACHE AND NOT WOS_CCACHE_PROGRAM)
+    find_program(WOS_CCACHE_PROGRAM NAMES ccache cccache)
+endif()
+
+set(WOS_TOOLS_CCACHE_CMAKE_ARGS -DWOS_USE_CCACHE=${WOS_USE_CCACHE})
+if(WOS_CCACHE_PROGRAM)
+    list(APPEND WOS_TOOLS_CCACHE_CMAKE_ARGS -DWOS_CCACHE_PROGRAM=${WOS_CCACHE_PROGRAM})
+endif()
 
 ExternalProject_Add(wos_tools_build
     SOURCE_DIR ${CMAKE_SOURCE_DIR}/tools
@@ -12,6 +23,7 @@ ExternalProject_Add(wos_tools_build
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
         -DCMAKE_BUILD_TYPE=Release
         -DWOS_BUILD_LINUX_BENCHMARKS=${WOS_BUILD_LINUX_BENCHMARKS}
+        ${WOS_TOOLS_CCACHE_CMAKE_ARGS}
     INSTALL_COMMAND ""
     USES_TERMINAL_CONFIGURE TRUE
     USES_TERMINAL_BUILD TRUE

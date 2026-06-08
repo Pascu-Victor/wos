@@ -26,21 +26,27 @@
 
 namespace ker::mod::sys {
 
-extern "C" auto syscall_handler(cpu::GPRegs regs) -> uint64_t {
+extern "C" auto syscall_handler(cpu::GPRegs* regs) -> uint64_t {
     sched::begin_syscall_accounting();
 
-    uint64_t callnum_raw = regs.rax;
-    if (ker::mod::debug::ptrace::report_syscall_stop(regs, callnum_raw, false)) {
-        callnum_raw = regs.rax;
+    if (regs == nullptr) {
+        dbg::emergency_log("Syscall handler received null register frame\nHalting\n");
+        hcf();
+        __builtin_unreachable();
+    }
+
+    uint64_t callnum_raw = regs->rax;
+    if (ker::mod::debug::ptrace::report_syscall_stop(*regs, callnum_raw, false)) {
+        callnum_raw = regs->rax;
     }
 
     auto callnum = static_cast<abi::callnums>(callnum_raw);
-    uint64_t const A1 = regs.rdi;
-    uint64_t const A2 = regs.rsi;
-    uint64_t const A3 = regs.rdx;
-    uint64_t const A4 = regs.r8;
-    uint64_t const A5 = regs.r9;
-    uint64_t const A6 = regs.r10;
+    uint64_t const A1 = regs->rdi;
+    uint64_t const A2 = regs->rsi;
+    uint64_t const A3 = regs->rdx;
+    uint64_t const A4 = regs->r8;
+    uint64_t const A5 = regs->r9;
+    uint64_t const A6 = regs->r10;
 
     uint64_t result = 0;
     switch (callnum) {
@@ -76,10 +82,13 @@ extern "C" auto syscall_handler(cpu::GPRegs regs) -> uint64_t {
             result = ker::syscall::vmem::sys_vmem_map(A1, A2, A3, A4, A5, A6);
             break;
         case abi::callnums::PROCESS:
-            result = ker::syscall::process::process(static_cast<abi::process::procmgmt_ops>(A1), A2, A3, A4, A5, regs);
+            result = ker::syscall::process::process(static_cast<abi::process::procmgmt_ops>(A1), A2, A3, A4, A5, A6, *regs);
             break;
         case abi::callnums::SHM:
             result = ker::syscall::shm::sys_shm(A1, A2, A3, A4, A5);
+            break;
+        case abi::callnums::PERSONALITY:
+            result = ker::syscall::process::personality(A1);
             break;
         case abi::callnums::DEBUG:
             // a1=0: disable interrupts on this CPU; a1=1: re-enable
@@ -99,13 +108,21 @@ extern "C" auto syscall_handler(cpu::GPRegs regs) -> uint64_t {
             break;
 
         default:
-            dbg::emergency_log("Syscall undefined\nCallnum: %lu\na1: %lu\na2: %lu\na3: %lu\na4: %lu\na5: %lu\na6: %lu\nHalting\n",
-                               static_cast<uint64_t>(callnum), A1, A2, A3, A4, A5, A6);
+            uint64_t user_rip = 0;
+            uint64_t user_rsp = 0;
+            uint64_t user_flags = 0;
+            asm volatile("movq %%gs:0x28, %0" : "=r"(user_rip));
+            asm volatile("movq %%gs:0x08, %0" : "=r"(user_rsp));
+            asm volatile("movq %%gs:0x30, %0" : "=r"(user_flags));
+            dbg::emergency_log(
+                "Syscall undefined\nCallnum: %lu\na1: %lu\na2: %lu\na3: %lu\na4: %lu\na5: %lu\na6: %lu\nuser_rip: 0x%lx\nuser_rsp: "
+                "0x%lx\nuser_rflags: 0x%lx\nkernel_caller: %p\n",
+                static_cast<uint64_t>(callnum), A1, A2, A3, A4, A5, A6, user_rip, user_rsp, user_flags, __builtin_return_address(0));
             hcf();
             __builtin_unreachable();
     }
 
-    auto exit_regs = regs;
+    auto exit_regs = *regs;
     exit_regs.rax = result;
     sched::finish_syscall_accounting();
     if (ker::mod::debug::ptrace::report_syscall_stop(exit_regs, callnum_raw, true)) {
