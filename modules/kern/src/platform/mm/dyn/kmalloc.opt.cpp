@@ -24,7 +24,7 @@
 #endif
 
 namespace ker::mod::mm::dyn::kmalloc {
-namespace emergency_serial = ker::mod::dbg::emergency_serial;
+namespace emergency_serial = ker::mod::dbg::emergency_serial_unlocked;
 
 static constexpr int NUM_SLAB_CLASSES = 9;
 static constexpr int MAGAZINE_CAPACITY = 32;
@@ -173,7 +173,9 @@ auto pop_debug_slot_locked() -> AllocDebugInfo* {
     return info;
 }
 
-auto allocate_debug_block() -> AllocDebugBlock* { return static_cast<AllocDebugBlock*>(phys::page_alloc(ALLOC_DEBUG_BLOCK_BYTES)); }
+auto allocate_debug_block() -> AllocDebugBlock* {
+    return static_cast<AllocDebugBlock*>(phys::page_alloc_with_reclaim(ALLOC_DEBUG_BLOCK_BYTES, "kmalloc_debug"));
+}
 
 auto register_alloc_debug(uintptr_t caller, const char* tag) -> AllocDebugInfo* {
     if (!s_alloc_debug_enabled.load(std::memory_order_relaxed)) {
@@ -686,6 +688,16 @@ auto slab_size_to_idx(size_t slab_size) -> SlabClass {
     }
 }
 
+auto alloc_medium_backing(uint64_t size) -> void* { return phys::page_alloc_with_reclaim(size, "kmalloc_medium"); }
+
+auto alloc_large_backing(uint64_t size) -> void* {
+    void* alloc_ptr = phys::page_alloc_huge(size);
+    if (alloc_ptr != nullptr) {
+        return alloc_ptr;
+    }
+    return phys::page_alloc_with_reclaim(size, "kmalloc_large");
+}
+
 auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
 #ifndef WOS_KMALLOC_DEBUG_INFO
     (void)caller;
@@ -749,7 +761,7 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
         emergency_serial::write(" bytes)\n");
 #endif
 
-        void* alloc_ptr = phys::page_alloc(ALLOC_SIZE);
+        void* alloc_ptr = alloc_medium_backing(ALLOC_SIZE);
         if (alloc_ptr == nullptr) {
 #ifdef DEBUG_KMALLOC
             emergency_serial::write("kmalloc: pageAlloc failed for medium allocation\n");
@@ -799,17 +811,14 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
     emergency_serial::write(" bytes)\n");
 #endif
 
-    // Allocate from huge page zone
-    void* alloc_ptr = phys::page_alloc_huge(ALLOC_SIZE);
+    // Allocate from huge page zone first; if it is full, the regular-zone
+    // fallback may yield to scheduler GC when the caller is preemptible.
+    void* alloc_ptr = alloc_large_backing(ALLOC_SIZE);
     if (alloc_ptr == nullptr) {
-        // Fallback to regular pageAlloc if huge zone is full
-        alloc_ptr = phys::page_alloc(ALLOC_SIZE);
-        if (alloc_ptr == nullptr) {
 #ifdef DEBUG_KMALLOC
-            emergency_serial::write("kmalloc: pageAlloc failed for large allocation\n");
+        emergency_serial::write("kmalloc: pageAlloc failed for large allocation\n");
 #endif
-            return nullptr;
-        }
+        return nullptr;
     }
     (void)phys::page_mark_kind(alloc_ptr, PageKind::KMALLOC_LARGE);
 
@@ -1058,12 +1067,9 @@ auto realloc(void* ptr, size_t size) -> void* {
             }
 
             // Need to reallocate - allocate new, copy, free old
-            void* new_alloc = phys::page_alloc_huge(NEW_ALLOC_SIZE);
+            void* new_alloc = alloc_large_backing(NEW_ALLOC_SIZE);
             if (new_alloc == nullptr) {
-                new_alloc = phys::page_alloc(NEW_ALLOC_SIZE);
-                if (new_alloc == nullptr) {
-                    return nullptr;
-                }
+                return nullptr;
             }
             (void)phys::page_mark_kind(new_alloc, PageKind::KMALLOC_LARGE);
 
@@ -1126,7 +1132,7 @@ auto realloc(void* ptr, size_t size) -> void* {
             }
 
             // Need to reallocate - allocate new, copy, free old
-            void* new_alloc = phys::page_alloc(NEW_ALLOC_SIZE);
+            void* new_alloc = alloc_medium_backing(NEW_ALLOC_SIZE);
             if (new_alloc == nullptr) {
                 return nullptr;
             }

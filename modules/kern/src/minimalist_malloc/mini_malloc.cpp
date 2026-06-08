@@ -9,7 +9,7 @@
 #include "slab_allocator.hpp"
 namespace ker::mod::mm::mini_malloc {
 namespace {
-namespace emergency_serial = ker::mod::dbg::emergency_serial;
+namespace emergency_serial = ker::mod::dbg::emergency_serial_unlocked;
 constexpr size_t PAGE_SIZE = 0x2000;
 
 Slab<SLAB_SIZE10, PAGE_SIZE> slab_0x10;

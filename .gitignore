@@ -20,6 +20,7 @@
 llvm-build
 libcxx-build
 build
+build-*
 
 #ccache
 .cache
@@ -32,7 +33,7 @@ coredumps
 
 #cluster data (persistent SSH keys, etc.)
 cluster-data
-
+ktest-data
 
 reference/
 

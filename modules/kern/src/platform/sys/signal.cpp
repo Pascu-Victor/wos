@@ -128,15 +128,14 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
             return 0;
         }
         // Default terminate semantics for normal fatal signals.
-        // Shells expect status 128 + signo for signal-terminated tasks.
         if (SIGNO == WOS_SIGHUP || SIGNO == WOS_SIGINT || SIGNO == WOS_SIGQUIT || SIGNO == WOS_SIGTERM || SIGNO == WOS_SIGKILL ||
             SIGNO == 13 || SIGNO == 11 || SIGNO == 6 || SIGNO == 8 || SIGNO == 4 || SIGNO == 7) {
-            ker::syscall::process::wos_proc_exit(128 + SIGNO);
+            ker::syscall::process::wos_proc_exit_signal(SIGNO);
             __builtin_unreachable();
         }
 
         // Conservative fallback: terminate by signal number if action is unknown.
-        ker::syscall::process::wos_proc_exit(128 + SIGNO);
+        ker::syscall::process::wos_proc_exit_signal(SIGNO);
         __builtin_unreachable();
     }
 
@@ -237,11 +236,11 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
         }
         if (SIGNO == WOS_SIGHUP || SIGNO == WOS_SIGINT || SIGNO == WOS_SIGQUIT || SIGNO == WOS_SIGTERM || SIGNO == WOS_SIGKILL ||
             SIGNO == 13 || SIGNO == 11 || SIGNO == 6 || SIGNO == 8 || SIGNO == 4 || SIGNO == 7) {
-            ker::syscall::process::wos_proc_exit(128 + SIGNO);
+            ker::syscall::process::wos_proc_exit_signal(SIGNO);
             __builtin_unreachable();
         }
 
-        ker::syscall::process::wos_proc_exit(128 + SIGNO);
+        ker::syscall::process::wos_proc_exit_signal(SIGNO);
         __builtin_unreachable();
     }
 

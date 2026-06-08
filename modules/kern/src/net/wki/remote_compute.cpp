@@ -250,6 +250,8 @@ constexpr int32_t WKI_SIGINT_NUM = 2;
 constexpr int32_t WKI_SIGKILL_NUM = 9;
 constexpr int32_t WKI_SIGTERM_NUM = 15;
 constexpr uint64_t WKI_SIGCHLD_NUM = 17;
+constexpr int32_t WKI_WAIT_STATUS_SIGNAL_MASK = 0x7f;
+constexpr int32_t WKI_WAIT_STATUS_STOPPED = 0x7f;
 constexpr int32_t WKI_WAIT_STATUS_EXIT_SHIFT = 8;
 constexpr int32_t WKI_WAIT_STATUS_FAILURE_CODE = 255;
 constexpr std::string_view WKI_PATH_PREFIX = "/wki/";
@@ -556,6 +558,18 @@ auto encode_remote_wait_status(int32_t exit_status) -> int32_t {
 }
 
 auto normalize_local_exit_status_for_wire(int32_t exit_status) -> int32_t {
+    int32_t const TERMSIG = exit_status & WKI_WAIT_STATUS_SIGNAL_MASK;
+    if (TERMSIG != 0 && TERMSIG != WKI_WAIT_STATUS_STOPPED) {
+        switch (TERMSIG) {
+            case WKI_SIGKILL_NUM:
+                return -WKI_SIGKILL_NUM;
+            case WKI_SIGTERM_NUM:
+                return -WKI_SIGTERM_NUM;
+            default:
+                return exit_status;
+        }
+    }
+
     switch (exit_status) {
         case 128 + WKI_SIGKILL_NUM:
             return -WKI_SIGKILL_NUM;

@@ -45,6 +45,8 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->has_exited = false;  // Task hasn't exited yet
     this->exit_notify_ready.store(false, std::memory_order_relaxed);
     this->waited_on = false;
+    this->zombie_resources_reclaiming.store(false, std::memory_order_relaxed);
+    this->zombie_resources_reclaimed.store(false, std::memory_order_relaxed);
     this->deferred_task_switch = false;  // No deferred switch by default
     this->yield_switch = false;
     this->kthread_entry = nullptr;
@@ -425,6 +427,8 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->exit_notify_ready.store(false, std::memory_order_relaxed);
     t->exit_status = 0;
     t->waited_on = false;
+    t->zombie_resources_reclaiming.store(false, std::memory_order_relaxed);
+    t->zombie_resources_reclaimed.store(false, std::memory_order_relaxed);
     t->deferred_task_switch = false;
     t->yield_switch = false;
     t->set_voluntary_blocked(false);

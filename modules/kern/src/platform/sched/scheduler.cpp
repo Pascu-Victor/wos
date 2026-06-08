@@ -595,12 +595,17 @@ constexpr uint32_t SCHED_GC_PAGEMAP_STEP_BUDGET = 64;
 constexpr uint32_t SCHED_GC_DEFERRED_RECLAIM_BUDGET = 128;
 constexpr uint64_t SCHED_GC_DEFERRED_WORK_BUDGET_US = 2'000;
 constexpr uint32_t SCHED_GC_DEFERRED_PAGEMAP_STEP_BUDGET = 1024;
+constexpr uint32_t SCHED_GC_PRESSURE_RECLAIM_BUDGET = 512;
+constexpr uint64_t SCHED_GC_PRESSURE_WORK_BUDGET_US = 50'000;
+constexpr uint32_t SCHED_GC_PRESSURE_PAGEMAP_STEP_BUDGET = 65'536;
 constexpr uint32_t SCHED_GC_IDLE_RECLAIM_BUDGET = 256;
 constexpr uint64_t SCHED_GC_IDLE_WORK_BUDGET_US = 10'000;
 constexpr uint32_t SCHED_GC_IDLE_PAGEMAP_STEP_BUDGET = 4096;
-std::atomic<bool> scheduler_gc_requested{false};       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<bool> scheduler_gc_worker_started{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<task::Task*> scheduler_gc_task{nullptr};   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> scheduler_gc_requested{false};                  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> scheduler_gc_worker_started{false};             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<task::Task*> scheduler_gc_task{nullptr};              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> scheduler_gc_memory_pressure_requested{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> scheduler_gc_reclaim_active{false};             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 constexpr uint8_t PERF_TIMER_VECTOR = 32;
 constexpr uint16_t PERF_IRQ_KIND_TIMER = 4;
 constexpr uint32_t PERF_IRQ_SLOW_TRACE_US = 30;
@@ -1505,10 +1510,10 @@ void request_local_timer_recheck() { request_local_reschedule(); }
 
 void set_task_nice(task::Task* task, int nice) { set_task_nice_impl(task, nice); }
 
-// Unconditional wake IPI - breaks a CPU out of hlt regardless of scheduler
-// idle state.  Used by NAPI to wake worker threads that sleep via sti;hlt
-// as the current_task (so is_idle is false, and wake_idle_cpu would skip them).
-void wake_cpu(uint64_t cpu_no) {
+// Wake IPI - breaks a CPU out of hlt regardless of scheduler idle state.
+// Used by NAPI to wake worker threads that sleep via sti;hlt as the
+// current_task (so is_idle is false, and wake_idle_cpu would skip them).
+void wake_cpu(uint64_t cpu_no, WakeCpuMode mode) {
     if (wake_ipi_vector == 0) {
         return;
     }
@@ -1535,11 +1540,13 @@ void wake_cpu(uint64_t cpu_no) {
         auto* current = rq->current_task;
         bool const HALTED_TARGET = rq->is_idle.load(std::memory_order_acquire) ||
                                    (current != nullptr && (current->is_voluntary_blocked() || current->wants_block));
-        if (rq->resched_timer_pending.exchange(true, std::memory_order_acq_rel)) {
+        if (mode == WakeCpuMode::COALESCE && rq->resched_timer_pending.exchange(true, std::memory_order_acq_rel)) {
             if (!HALTED_TARGET) {
                 rq->wake_ipis_coalesced.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
+        } else if (mode == WakeCpuMode::FORCE) {
+            rq->resched_timer_pending.store(true, std::memory_order_release);
         }
         rq->wake_ipis_sent.fetch_add(1, std::memory_order_relaxed);
     }
@@ -2984,7 +2991,7 @@ void check_pending_signals_deferred(task::Task* task) {
         }
         // All other SIG_DFL: fatal terminate.
         // GS/pagemap/rq->currentTask are all set to `task` at this call site.
-        ker::syscall::process::wos_proc_exit(128 + SIGNO);
+        ker::syscall::process::wos_proc_exit_signal(SIGNO);
         __builtin_unreachable();
     }
 
@@ -3937,7 +3944,8 @@ void wake_task_for_signal(task::Task* task) {
     if (task->cpu == cpu::current_cpu()) {
         request_local_reschedule();
     } else {
-        wake_cpu(task->cpu);
+        // Signal latency should not depend on an earlier coalesced wake timer.
+        wake_cpu(task->cpu, WakeCpuMode::FORCE);
     }
 
     // If the task is blocked or sleeping in a syscall path, put it back on
@@ -4049,6 +4057,7 @@ struct GcDetachedTask {
     task::Task* task = nullptr;
     bool should_free_pagemap = false;
     bool counted_without_cleanup = false;
+    bool zombie_resources_only = false;
 };
 
 struct GcTaskTiming {
@@ -4063,6 +4072,7 @@ struct GcTaskTiming {
 struct GcDeferredCleanupItem {
     task::Task* task = nullptr;
     bool should_free_pagemap = false;
+    bool zombie_resources_only = false;
     mm::virt::DestroyUserSpaceBudgetState* pagemap_state = nullptr;
     uint64_t detach_us = 0;
     uint64_t enqueue_us = 0;
@@ -4081,7 +4091,7 @@ std::atomic<uint64_t> gc_deferred_cleanup_oldest_wait_us_max{0};  // NOLINT(cppc
 std::atomic<uint64_t> scheduler_gc_idle_boost_passes{0};          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint64_t> scheduler_gc_foreground_passes{0};          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
-auto gc_deferred_cleanup_has_work() -> bool { return gc_deferred_cleanup_head != nullptr; }
+auto gc_deferred_cleanup_has_work() -> bool { return gc_deferred_cleanup_depth.load(std::memory_order_relaxed) != 0; }
 
 void note_gc_deferred_cleanup_push() {
     gc_deferred_cleanup_items_queued.fetch_add(1, std::memory_order_relaxed);
@@ -4232,13 +4242,34 @@ auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no) -> GcDet
             cur = next;
             continue;
         }
+        if (cur->zombie_resources_reclaiming.load(std::memory_order_acquire)) {
+            cur = next;
+            continue;
+        }
 
         // ZOMBIE BEHAVIOR: Don't reclaim until parent has called waitpid OR
         // the parent is dead. Threads are joined via futex and do not waitpid.
+        // A waitable zombie must keep its Task/PID/exit status, but it does not
+        // need to pin the full address space or kernel stack while waiting for
+        // waitpid. Reclaim those heavy resources once the epoch/current-task
+        // guards above prove the task is no longer executing.
         if (cur->has_exited && !cur->waited_on && !cur->is_thread) {
             if (cur->parent_pid != 0) {
                 auto* parent = find_task_by_pid(cur->parent_pid);
                 if (parent != nullptr && parent->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE) {
+                    bool expected = false;
+                    if (!cur->zombie_resources_reclaimed.load(std::memory_order_acquire) &&
+                        cur->zombie_resources_reclaiming.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+                                                                                 std::memory_order_acquire)) {
+                        bool should_free_pagemap = false;
+                        if (cur->pagemap != nullptr && cur->type != task::TaskType::DAEMON) {
+                            should_free_pagemap = !gc_task_has_pagemap_sibling_locked(cur);
+                        }
+                        return {.task = cur,
+                                .should_free_pagemap = should_free_pagemap,
+                                .counted_without_cleanup = false,
+                                .zombie_resources_only = true};
+                    }
 #ifdef SCHED_DEBUG
                     static uint64_t zombie_skip_count = 0;
                     if (++zombie_skip_count % 1000 == 1) {
@@ -4395,6 +4426,76 @@ void cleanup_task_after_pagemap(task::Task* cur, GcTaskTiming& timing, uint64_t 
     timing.total_us = timing.detach_us + elapsed_us_since(cleanup_start_us, time::get_us());
 }
 
+void finish_waitable_zombie_resource_cleanup(task::Task* cur, GcTaskTiming& timing, uint64_t cleanup_start_us) {
+    if (cur == nullptr) {
+        return;
+    }
+
+    if (cur->thread != nullptr) {
+        uint64_t const START_US = time::get_us();
+        auto* thread_ptr = cur->thread;
+        auto thread_addr = reinterpret_cast<uintptr_t>(thread_ptr);
+        bool const THREAD_IN_HHDM = (thread_addr >= 0xffff800000000000ULL && thread_addr < 0xffff900000000000ULL);
+        bool const THREAD_IN_KERNEL_STATIC = (thread_addr >= 0xffffffff80000000ULL && thread_addr < 0xffffffffc0000000ULL);
+        if ((THREAD_IN_HHDM || THREAD_IN_KERNEL_STATIC) && thread_ptr->magic == 0xDEADBEEF) {
+            thread_ptr->tls_phys_ptr = 0;
+            thread_ptr->stack_phys_ptr = 0;
+            threading::destroy_thread(thread_ptr);
+        }
+        cur->thread = nullptr;
+        timing.thread_us = elapsed_us_since(START_US, time::get_us());
+    }
+
+    uint64_t misc_start_us = time::get_us();
+    if (cur->context.syscall_kernel_stack != 0) {
+        uint64_t const TOP = cur->context.syscall_kernel_stack;
+        uint64_t base = 0;
+        if (TOP > ker::mod::mm::KERNEL_STACK_SIZE) {
+            base = TOP - ker::mod::mm::KERNEL_STACK_SIZE;
+        }
+        if (base != 0) {
+            mm::phys::page_free(reinterpret_cast<void*>(base));
+        }
+        cur->context.syscall_kernel_stack = 0;
+    }
+
+    if (cur->context.syscall_scratch_area != 0) {
+        auto* sa = reinterpret_cast<cpu::PerCpu*>(cur->context.syscall_scratch_area);
+        auto sa_addr = reinterpret_cast<uintptr_t>(sa);
+        bool const IN_HHDM = (sa_addr >= 0xffff800000000000ULL && sa_addr < 0xffff900000000000ULL);
+        bool const IN_KERNEL_STATIC = (sa_addr >= 0xffffffff80000000ULL && sa_addr < 0xffffffffc0000000ULL);
+        if (IN_HHDM || IN_KERNEL_STATIC) {
+            delete sa;
+        }
+        cur->context.syscall_scratch_area = 0;
+    }
+    timing.misc_us += elapsed_us_since(misc_start_us, time::get_us());
+
+    cur->zombie_resources_reclaimed.store(true, std::memory_order_release);
+    cur->zombie_resources_reclaiming.store(false, std::memory_order_release);
+    timing.total_us = timing.detach_us + elapsed_us_since(cleanup_start_us, time::get_us());
+}
+
+void cleanup_waitable_zombie_resources(GcDetachedTask const& detached, GcTaskTiming& timing) {
+    auto* cur = detached.task;
+    if (cur == nullptr) {
+        return;
+    }
+
+    uint64_t const CLEANUP_START_US = time::get_us();
+    if (cur->pagemap != nullptr) {
+        uint64_t const START_US = time::get_us();
+        if (detached.should_free_pagemap) {
+            mm::virt::destroy_user_space(cur->pagemap, cur->pid, cur->name, "task-zombie-gc");
+            mm::virt::release_pagemap(cur->pagemap);
+        }
+        cur->pagemap = nullptr;
+        timing.pagemap_us = elapsed_us_since(START_US, time::get_us());
+    }
+
+    finish_waitable_zombie_resource_cleanup(cur, timing, CLEANUP_START_US);
+}
+
 auto queue_detached_gc_task_cleanup(GcDetachedTask const& detached, uint64_t detach_us) -> bool {
     auto* cur = detached.task;
     if (cur == nullptr || cur->pagemap == nullptr || !detached.should_free_pagemap) {
@@ -4409,6 +4510,7 @@ auto queue_detached_gc_task_cleanup(GcDetachedTask const& detached, uint64_t det
     auto* item = new GcDeferredCleanupItem{
         .task = cur,
         .should_free_pagemap = detached.should_free_pagemap,
+        .zombie_resources_only = detached.zombie_resources_only,
         .pagemap_state = pagemap_state,
         .detach_us = detach_us,
         .enqueue_us = time::get_us(),
@@ -4453,7 +4555,11 @@ auto process_deferred_gc_cleanup_slice(GcTaskTiming& timing, uint32_t pagemap_st
         cur->pagemap = nullptr;
     }
 
-    cleanup_task_after_pagemap(cur, timing, CLEANUP_START_US);
+    if (item->zombie_resources_only) {
+        finish_waitable_zombie_resource_cleanup(cur, timing, CLEANUP_START_US);
+    } else {
+        cleanup_task_after_pagemap(cur, timing, CLEANUP_START_US);
+    }
     uint64_t const WAIT_US = elapsed_us_since(item->enqueue_us, time::get_us());
     gc_deferred_cleanup_pop();
     note_gc_deferred_cleanup_complete(WAIT_US);
@@ -4538,6 +4644,18 @@ auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, ui
                 break;
             }
 
+            if (detached.zombie_resources_only) {
+                if (queue_detached_gc_task_cleanup(detached, timing.detach_us)) {
+                    hit_time_budget = gc_time_budget_expired(START_US, max_work_us);
+                    continue;
+                }
+                cleanup_waitable_zombie_resources(detached, timing);
+                note_gc_task_timing(timing);
+                reclaimed++;
+                hit_time_budget = gc_time_budget_expired(START_US, max_work_us);
+                continue;
+            }
+
             if (queue_detached_gc_task_cleanup(detached, timing.detach_us)) {
                 hit_time_budget = gc_time_budget_expired(START_US, max_work_us);
                 continue;
@@ -4586,6 +4704,33 @@ void note_gc_pass_result(uint32_t reclaimed, uint64_t elapsed_us) {
     while (elapsed_us > observed &&
            !rq->gc_work_us_max.compare_exchange_weak(observed, elapsed_us, std::memory_order_relaxed, std::memory_order_relaxed)) {
     }
+}
+
+struct GcPassResult {
+    uint32_t reclaimed = 0;
+    bool time_budget_exhausted = false;
+    bool has_pending_work = false;
+    bool ran = false;
+};
+
+auto gc_pass_needs_followup(GcPassResult const& result, uint32_t reclaim_budget) -> bool {
+    return result.has_pending_work || result.reclaimed >= reclaim_budget || (result.time_budget_exhausted && result.reclaimed != 0);
+}
+
+auto run_gc_reclaim_pass_exclusive(uint32_t reclaim_budget, uint64_t work_budget_us, uint32_t pagemap_step_budget) -> GcPassResult {
+    bool expected = false;
+    if (!scheduler_gc_reclaim_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return {};
+    }
+
+    uint64_t const START_US = time::get_us();
+    GcPassResult result{.ran = true};
+    result.reclaimed = gc_expired_tasks_budgeted_impl(reclaim_budget, work_budget_us, pagemap_step_budget, &result.time_budget_exhausted,
+                                                      &result.has_pending_work);
+    uint64_t const END_US = time::get_us();
+    note_gc_pass_result(result.reclaimed, END_US >= START_US ? END_US - START_US : 0);
+    scheduler_gc_reclaim_active.store(false, std::memory_order_release);
+    return result;
 }
 
 auto task_blocks_idle_gc_boost(task::Task const* task) -> bool {
@@ -4640,7 +4785,8 @@ void scheduler_gc_thread_main() {
             continue;
         }
 
-        bool const BOOST_RECLAIM = scheduler_gc_should_boost_reclaim();
+        bool const PRESSURE_RECLAIM = scheduler_gc_memory_pressure_requested.exchange(false, std::memory_order_acq_rel);
+        bool const BOOST_RECLAIM = !PRESSURE_RECLAIM && scheduler_gc_should_boost_reclaim();
         if (BOOST_RECLAIM) {
             scheduler_gc_idle_boost_passes.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -4649,7 +4795,11 @@ void scheduler_gc_thread_main() {
         uint32_t reclaim_budget = SCHED_GC_RECLAIM_BUDGET;
         uint64_t work_budget_us = SCHED_GC_WORK_BUDGET_US;
         uint32_t pagemap_step_budget = SCHED_GC_PAGEMAP_STEP_BUDGET;
-        if (BOOST_RECLAIM) {
+        if (PRESSURE_RECLAIM) {
+            reclaim_budget = SCHED_GC_PRESSURE_RECLAIM_BUDGET;
+            work_budget_us = SCHED_GC_PRESSURE_WORK_BUDGET_US;
+            pagemap_step_budget = SCHED_GC_PRESSURE_PAGEMAP_STEP_BUDGET;
+        } else if (BOOST_RECLAIM) {
             reclaim_budget = SCHED_GC_IDLE_RECLAIM_BUDGET;
             work_budget_us = SCHED_GC_IDLE_WORK_BUDGET_US;
             pagemap_step_budget = SCHED_GC_IDLE_PAGEMAP_STEP_BUDGET;
@@ -4659,15 +4809,17 @@ void scheduler_gc_thread_main() {
             pagemap_step_budget = SCHED_GC_DEFERRED_PAGEMAP_STEP_BUDGET;
         }
 
-        uint64_t const START_US = time::get_us();
-        bool time_budget_exhausted = false;
-        bool has_pending_work = false;
-        uint32_t const RECLAIMED =
-            gc_expired_tasks_budgeted_impl(reclaim_budget, work_budget_us, pagemap_step_budget, &time_budget_exhausted, &has_pending_work);
-        uint64_t const END_US = time::get_us();
-        note_gc_pass_result(RECLAIMED, END_US >= START_US ? END_US - START_US : 0);
+        GcPassResult const PASS = run_gc_reclaim_pass_exclusive(reclaim_budget, work_budget_us, pagemap_step_budget);
+        if (!PASS.ran) {
+            scheduler_gc_requested.store(true, std::memory_order_release);
+            kern_yield();
+            continue;
+        }
 
-        if (has_pending_work || RECLAIMED >= reclaim_budget || (time_budget_exhausted && RECLAIMED != 0)) {
+        if (PRESSURE_RECLAIM && PASS.has_pending_work) {
+            scheduler_gc_memory_pressure_requested.store(true, std::memory_order_release);
+        }
+        if (gc_pass_needs_followup(PASS, reclaim_budget)) {
             scheduler_gc_requested.store(true, std::memory_order_release);
             kern_yield();
         }
@@ -4689,6 +4841,28 @@ void request_gc() {
         target_cpu = 0;
     }
     wake_task_from_event_on_cpu(task, target_cpu, EventWakeDeferredSwitch::PRESERVE);
+}
+
+void request_gc_memory_pressure() {
+    scheduler_gc_memory_pressure_requested.store(true, std::memory_order_release);
+    request_gc();
+}
+
+auto reclaim_memory_pressure() -> uint32_t {
+    GcPassResult const PASS = run_gc_reclaim_pass_exclusive(SCHED_GC_PRESSURE_RECLAIM_BUDGET, SCHED_GC_PRESSURE_WORK_BUDGET_US,
+                                                            SCHED_GC_PRESSURE_PAGEMAP_STEP_BUDGET);
+    if (!PASS.ran) {
+        request_gc_memory_pressure();
+        return 0;
+    }
+
+    if (PASS.has_pending_work) {
+        scheduler_gc_memory_pressure_requested.store(true, std::memory_order_release);
+    }
+    if (gc_pass_needs_followup(PASS, SCHED_GC_PRESSURE_RECLAIM_BUDGET)) {
+        request_gc_memory_pressure();
+    }
+    return PASS.reclaimed;
 }
 
 void start_gc_worker() {

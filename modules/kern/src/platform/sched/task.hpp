@@ -348,7 +348,9 @@ struct Task {
     bool has_exited{};
     // Set after exit cleanup finishes; waitpid may reap only after this.
     std::atomic<bool> exit_notify_ready{false};
-    bool waited_on{};             // Set to true when parent retrieves exit status via waitpid
+    bool waited_on{};  // Set to true when parent retrieves exit status via waitpid
+    std::atomic<bool> zombie_resources_reclaiming{false};
+    std::atomic<bool> zombie_resources_reclaimed{false};
     bool deferred_task_switch{};  // Move to wait queue after syscall returns
     bool yield_switch{};          // Put task in expired queue instead of wait queue
 

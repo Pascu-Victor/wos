@@ -311,13 +311,20 @@ void wake_task_from_event_on_cpu(task::Task* task, uint64_t target_cpu,
                                                       EventWakeDeferredSwitch deferred_switch = EventWakeDeferredSwitch::PRESERVE) -> bool;
 void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task);  // Reschedule a specific task on a specific CPU
 auto debug_stop_task(task::Task* task) -> bool;                   // Move a traced task out of runnable scheduling if possible
-void wake_cpu(uint64_t cpu_no);                                   // Send wake IPI to a CPU (unconditional, for hlt wakeup)
-void insert_into_dead_list(task::Task* task);                     // Place a task into CPU 0's dead list for GC
-void gc_expired_tasks();                                          // Garbage collect dead tasks from dead lists
-auto gc_expired_tasks_budgeted(uint32_t max_tasks) -> uint32_t;   // Budgeted task GC for scheduler GC daemon
-void request_gc();                                                // Request deferred scheduler GC from IRQ-safe paths
-void start_gc_worker();                                           // Start scheduler GC daemon after init task creation
-void request_local_timer_recheck();                               // Arm a local timer tick after a new current-task deadline
+enum class WakeCpuMode : uint8_t {
+    COALESCE,
+    FORCE,
+};
+
+void wake_cpu(uint64_t cpu_no, WakeCpuMode mode = WakeCpuMode::COALESCE);  // Send wake IPI to a CPU
+void insert_into_dead_list(task::Task* task);                              // Place a task into CPU 0's dead list for GC
+void gc_expired_tasks();                                                   // Garbage collect dead tasks from dead lists
+auto gc_expired_tasks_budgeted(uint32_t max_tasks) -> uint32_t;            // Budgeted task GC for scheduler GC daemon
+void request_gc();                                                         // Request deferred scheduler GC from IRQ-safe paths
+void request_gc_memory_pressure();                                         // Request aggressive GC from allocation pressure paths
+auto reclaim_memory_pressure() -> uint32_t;                                // Synchronously run one exclusive pressure-GC pass when safe
+void start_gc_worker();                                                    // Start scheduler GC daemon after init task creation
+void request_local_timer_recheck();                                        // Arm a local timer tick after a new current-task deadline
 void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr,
                               ker::mod::gates::InterruptFrame& frame);  // Move current task to wait queue with context saved
 extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr,

@@ -207,9 +207,29 @@ void notify_tracer_after_exit_ready(ker::mod::sched::task::Task* child) {
     tracer->release();
 }
 
+void release_exiting_user_address_space(ker::mod::sched::task::Task* task) {
+    if (task == nullptr || task->is_thread || task->pagemap == nullptr) {
+        return;
+    }
+
+    auto* pagemap = task->pagemap;
+
+    // The task has already transitioned out of ACTIVE, so it will not return to
+    // userspace. Switch this CPU away from the exiting address space, then make
+    // the Task stop publishing the pagemap before destroying the user half.
+    // Waitpid-visible zombie state stays in the Task; scheduler GC still reclaims
+    // the thread object, kernel stack, and scratch area after the epoch guard.
+    ker::mod::mm::virt::switch_to_kernel_pagemap();
+    task->pagemap = nullptr;
+    ker::mod::mm::virt::destroy_user_space(pagemap, task->pid, task->name, "process-exit");
+    ker::mod::mm::virt::release_pagemap(pagemap);
+}
+
 }  // namespace
 
-void wos_proc_exit(int status) {
+namespace {
+
+void wos_proc_exit_with_wait_status(int status, int wait_status) {
     auto* current_task = ker::mod::sched::get_current_task();
     if (current_task == nullptr) {
         return;
@@ -236,8 +256,7 @@ void wos_proc_exit(int status) {
     log::debug("task PID %x exiting with status %d", current_task->pid, status);
 #endif
 
-    // Store exit status in POSIX waitpid format
-    current_task->exit_status = (status & 0xff) << 8;
+    current_task->exit_status = wait_status;
     current_task->has_exited = true;
 #ifdef EXIT_DEBUG
     log::trace("wos_proc_exit: pid=%lu name=%s status=%d thread=%d owner=%lu pagemap=%p", current_task->pid,
@@ -289,6 +308,11 @@ void wos_proc_exit(int status) {
             current_task->elf_buffer_size = 0;
         }
     }
+
+    // A waitable zombie keeps only status/accounting/PID metadata. It must not
+    // pin the exiting process's user address space while waiting for the parent
+    // to reap it, especially under fork/COW storms.
+    release_exiting_user_address_space(current_task);
 
     ker::mod::sched::finish_syscall_accounting();
     current_task->exit_notify_ready.store(true, std::memory_order_release);
@@ -363,28 +387,6 @@ void wos_proc_exit(int status) {
     notify_tracer_after_exit_ready(current_task);
     notify_parent_after_exit_ready(current_task);
 
-    // CRITICAL: Do NOT modify or destroy pagemap/thread here!
-    // Another CPU might be in switchTo() and about to:
-    //   - Load our pagemap into CR3
-    //   - Read thread->gsbase/fsbase
-    //
-    // Even calling destroyUserSpace() is unsafe because it MODIFIES the pagemap
-    // contents (clears page table entries) while another CPU might be using it.
-    //
-    // ALL pagemap and thread cleanup is deferred to gcExpiredTasks() which runs
-    // after the epoch grace period, ensuring no CPU is still using these resources.
-    //
-    // The downside is user pages remain allocated ~1 second longer, but this is
-    // necessary for correctness in the face of concurrent scheduling.
-    //
-    // For threads (is_thread == true): the pagemap is shared with the owning process
-    // and must NEVER be freed or even switched away from here; GC will skip it.
-    if (!current_task->is_thread && current_task->pagemap != nullptr) {
-        // Switch to kernel pagemap so we don't use our own pagemap anymore
-        ker::mod::mm::virt::switch_to_kernel_pagemap();
-        // Pagemap destruction deferred to gcExpiredTasks()
-    }
-
     // Thread destruction deferred to gcExpiredTasks()
 
     // NOTE: We CANNOT free the kernel stack here because we're still running on it!
@@ -426,6 +428,18 @@ void wos_proc_exit(int status) {
     jump_to_next_task_no_save();
 
     __builtin_unreachable();
+}
+
+}  // namespace
+
+void wos_proc_exit(int status) {
+    // Store normal process exits in POSIX waitpid format.
+    wos_proc_exit_with_wait_status(status, (status & 0xff) << 8);
+}
+
+void wos_proc_exit_signal(int signo) {
+    // A shell turns WIFSIGNALED(status)/WTERMSIG(status) into "$? = 128 + signo".
+    wos_proc_exit_with_wait_status(128 + signo, signo & 0x7f);
 }
 
 }  // namespace ker::syscall::process

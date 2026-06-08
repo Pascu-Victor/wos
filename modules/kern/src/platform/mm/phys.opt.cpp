@@ -26,6 +26,7 @@
 #include "platform/mm/dyn/kmalloc.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
+#include "platform/sched/scheduler.hpp"
 #include "platform/sys/spinlock.hpp"
 #include "util/hcf.hpp"
 
@@ -38,6 +39,9 @@ namespace ker::mod::mm::phys {
 
 namespace {
 using log = ker::mod::dbg::logger<"phys">;
+namespace emergency_serial = ker::mod::dbg::emergency_serial_unlocked;
+void dump_page_alloc_oom_header(uint64_t size, void* caller_addr, std::string_view name);
+void write_hex_field(const char* label, uint64_t value);
 
 // Per-CPU page cache for reducing lock contention
 struct CachedOrder0Page {
@@ -525,10 +529,15 @@ void dump_alloc_stats() {
     uint64_t const ALLOCATED = total_allocated_bytes.load(std::memory_order_relaxed);
     uint64_t const FREED = total_freed_bytes.load(std::memory_order_relaxed);
     uint64_t const LIVE = live_allocated_bytes_from_counters(ALLOCATED, FREED);
-    dbg::emergency_log(
-        "Physical alloc stats: allocated=0x%lx freed=0x%lx live=0x%lx allocOps=0x%lx freeOps=0x%lx allocPages=0x%lx freePages=0x%lx\n",
-        ALLOCATED, FREED, LIVE, allocation_operation_count.load(std::memory_order_relaxed),
-        free_operation_count.load(std::memory_order_relaxed), accounted_pages(ALLOCATED), accounted_pages(FREED));
+    emergency_serial::write("Physical alloc stats:");
+    write_hex_field(" allocated=", ALLOCATED);
+    write_hex_field(" freed=", FREED);
+    write_hex_field(" live=", LIVE);
+    write_hex_field(" allocOps=", allocation_operation_count.load(std::memory_order_relaxed));
+    write_hex_field(" freeOps=", free_operation_count.load(std::memory_order_relaxed));
+    write_hex_field(" allocPages=", accounted_pages(ALLOCATED));
+    write_hex_field(" freePages=", accounted_pages(FREED));
+    emergency_serial::write("\n");
 }
 
 auto get_free_mem_bytes() -> uint64_t {
@@ -683,9 +692,9 @@ auto snapshot_page_caller_stats(CallerPageStat* out, size_t max_rows, size_t& to
 
 void dump_caller_page_stats() {
 #ifndef WOS_PHYS_ALLOC_CALLER_STATS
-    dbg::emergency_log("Physical page alloc by caller: disabled (build with WOS_PHYS_ALLOC_CALLER_STATS=ON)\n");
+    emergency_serial::write("Physical page alloc by caller: disabled (build with WOS_PHYS_ALLOC_CALLER_STATS=ON)\n");
 #else
-    dbg::emergency_log("Physical page alloc by caller (cumulative, sorted by pages desc):\n");
+    emergency_serial::write("Physical page alloc by caller (cumulative, sorted by pages desc):\n");
 
     // Copy table under lock so we get a stable snapshot
     constexpr uint64_t BYTES_PER_KB = 1024;
@@ -719,8 +728,13 @@ void dump_caller_page_stats() {
         if (snapshot.at(i).caller == 0 || snapshot.at(i).pages == 0) {
             break;
         }
-        dbg::emergency_log("  0x%lx: %lu pages (%lu KB)\n", snapshot.at(i).caller, snapshot.at(i).pages,
-                           snapshot.at(i).pages * paging::PAGE_SIZE / BYTES_PER_KB);
+        emergency_serial::write("  0x");
+        emergency_serial::write_hex(snapshot.at(i).caller);
+        emergency_serial::write(": pages=0x");
+        emergency_serial::write_hex(snapshot.at(i).pages);
+        emergency_serial::write(" kb=0x");
+        emergency_serial::write_hex(snapshot.at(i).pages * paging::PAGE_SIZE / BYTES_PER_KB);
+        emergency_serial::write("\n");
     }
 #endif
 }
@@ -1256,7 +1270,7 @@ auto try_cache_freed_order0_page(PageAllocator* allocator, void* page) -> bool {
     return true;
 }
 
-auto page_alloc_impl(uint64_t size, std::string_view name, ReturnedPageZeroing zeroing, void* caller_addr) -> void* {
+auto page_alloc_impl(uint64_t size, std::string_view name, ReturnedPageZeroing zeroing, void* caller_addr, bool log_oom) -> void* {
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     uint64_t const NUM_PAGES = (size + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
 #endif
@@ -1286,14 +1300,18 @@ auto page_alloc_impl(uint64_t size, std::string_view name, ReturnedPageZeroing z
     }
 
     if (block == nullptr) {
+        if (!log_oom) {
+            return nullptr;
+        }
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
         void* const OOM_CALLER_ADDR = caller_addr;
 #else
         void* const OOM_CALLER_ADDR = caller_addr;
 #endif
-        // OOM condition - dump allocation info for debugging
-        dbg::emergency_log("OOM: pageAlloc failed for size 0x%lx bytes\nAllocation site: 0x%lx (%.*s)\n", size,
-                           reinterpret_cast<uint64_t>(OOM_CALLER_ADDR), static_cast<int>(name.size()), name.data());
+        // OOM condition - dump allocation info for debugging. Keep this path
+        // allocation-free and serial-lock-free so the real allocator dump can
+        // run even if the journal or serial lock is wedged.
+        dump_page_alloc_oom_header(size, OOM_CALLER_ADDR, name);
         dump_page_allocations_oom();
         return nullptr;
     }
@@ -1326,14 +1344,75 @@ auto page_alloc_impl(uint64_t size, std::string_view name, ReturnedPageZeroing z
     return block;
 }
 
+auto can_wait_for_reclaim() -> bool {
+    // Reclaim wait loops eventually enter kern_yield(), which is only safe from
+    // a normal task context. Exception handlers such as the COW page-fault path
+    // arrive with IF cleared; yielding there can hand the CPU to the timer
+    // interrupt and later attempt an iretq back into an in-flight fault frame.
+    return sched::has_run_queues() && sched::preempt_count() == 0 && sched::interrupts_enabled();
+}
+
+auto page_alloc_with_reclaim_impl(uint64_t size, std::string_view name, ReturnedPageZeroing zeroing, void* caller_addr,
+                                  uint32_t retry_count) -> void* {
+    for (uint32_t attempt = 0; attempt < retry_count; ++attempt) {
+        void* const PAGE = page_alloc_impl(size, name, zeroing, caller_addr, false);
+        if (PAGE != nullptr) {
+            return PAGE;
+        }
+        if (!can_wait_for_reclaim()) {
+            break;
+        }
+        uint32_t const RECLAIMED = sched::reclaim_memory_pressure();
+        if (RECLAIMED == 0) {
+            sched::request_gc_memory_pressure();
+            sched::kern_yield_impl(reinterpret_cast<uint64_t>(caller_addr));
+        }
+    }
+
+    return page_alloc_impl(size, name, zeroing, caller_addr, true);
+}
+
+void dump_page_alloc_oom_header(uint64_t size, void* caller_addr, std::string_view name) {
+    emergency_serial::write("OOM: pageAlloc failed for size 0x");
+    emergency_serial::write_hex(size);
+    emergency_serial::write(" bytes\nAllocation site: 0x");
+    emergency_serial::write_hex(reinterpret_cast<uint64_t>(caller_addr));
+    emergency_serial::write(" (");
+    emergency_serial::write(name.data(), name.size());
+    emergency_serial::write(")\n");
+}
+
+void write_hex_field(const char* label, uint64_t value) {
+    emergency_serial::write(label);
+    emergency_serial::write("0x");
+    emergency_serial::write_hex(value);
+}
+
 }  // namespace
 
 auto page_alloc(uint64_t size, std::string_view name) -> void* {
-    return page_alloc_impl(size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0));
+    return page_alloc_impl(size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), true);
 }
 
 auto page_alloc_full_overwrite_page(std::string_view name) -> void* {
-    return page_alloc_impl(paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0));
+    return page_alloc_impl(paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0), true);
+}
+
+auto page_alloc_may_fail(uint64_t size, std::string_view name) -> void* {
+    return page_alloc_impl(size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), false);
+}
+
+auto page_alloc_full_overwrite_page_may_fail(std::string_view name) -> void* {
+    return page_alloc_impl(paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0), false);
+}
+
+auto page_alloc_with_reclaim(uint64_t size, std::string_view name, uint32_t retry_count) -> void* {
+    return page_alloc_with_reclaim_impl(size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), retry_count);
+}
+
+auto page_alloc_full_overwrite_page_with_reclaim(std::string_view name, uint32_t retry_count) -> void* {
+    return page_alloc_with_reclaim_impl(paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0),
+                                        retry_count);
 }
 
 auto page_alloc_huge(uint64_t size) -> void* {

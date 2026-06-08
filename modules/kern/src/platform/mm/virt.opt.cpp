@@ -70,6 +70,11 @@ void record_cow_perf_event(sched::task::Task* task, perf::WkiPerfLocalVmemOp op,
                              paging::PAGE_SIZE);
 }
 
+auto alloc_cow_destination_page(bool full_overwrite) -> void* {
+    return full_overwrite ? phys::page_alloc_full_overwrite_page_with_reclaim("cow_copy")
+                          : phys::page_alloc_with_reclaim(paging::PAGE_SIZE, "cow_zero");
+}
+
 paging::PageTable* kernel_pagemap;
 limine_memmap_response* memmap_response;
 limine_executable_file_response* kernel_file_response;
@@ -210,7 +215,7 @@ auto alloc_zeroed_page_table() -> PageTable* {
         return pooled_table;
     }
 
-    auto* table = static_cast<PageTable*>(phys::page_alloc());
+    auto* table = static_cast<PageTable*>(phys::page_alloc_with_reclaim(paging::PAGE_SIZE, "page_table"));
     if (table == nullptr) {
         return nullptr;
     }
@@ -975,8 +980,7 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
             // full-overwrite helper because old_virt is pinned, memcpy writes
             // the whole page, and the PTE is not updated until after the copy
             // and racing-COW recheck below.
-            void* new_page = DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE ? phys::page_alloc_full_overwrite_page("cow_copy")
-                                                                        : phys::page_alloc(paging::PAGE_SIZE, "cow_zero");
+            void* new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);
             if (new_page == nullptr) {
                 phys::page_ref_dec(old_virt, &cow_lookup);  // release pin
                 log::error("COW fault: OOM allocating new page for vaddr 0x%x", VADDR);

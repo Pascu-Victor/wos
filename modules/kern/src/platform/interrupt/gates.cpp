@@ -87,6 +87,25 @@ auto current_perf_pid() -> uint64_t {
     return task != nullptr ? task->pid : 0;
 }
 
+auto signal_for_user_exception(uint64_t vector) -> int {
+    switch (vector) {
+        case 0:
+            return 8;  // SIGFPE
+        case 1:
+        case 3:
+            return 5;  // SIGTRAP
+        case 6:
+            return 4;  // SIGILL
+        case 13:
+        case 14:
+            return 11;  // SIGSEGV
+        default: {
+            int const SIGNO = static_cast<int>(vector & 0x7f);
+            return SIGNO != 0 ? SIGNO : 6;  // SIGABRT fallback
+        }
+    }
+}
+
 void record_irq_perf(uint8_t vector, uint16_t kind, int32_t status, uint64_t started_us) {
     if (started_us == 0) {
         return;
@@ -312,8 +331,7 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
                 }
             }
 
-            // Conventional exit code for a segfault-like crash.
-            ker::syscall::process::wos_proc_exit(139);
+            ker::syscall::process::wos_proc_exit_signal(11);
             __builtin_unreachable();
         }
 
@@ -325,13 +343,13 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
             asm volatile("mov %0, %%dr6" ::"r"(DR6_CLEAR));
             journal::debug("Userspace debug trap (INT 1): rip=0x%lx pid=%x", frame.rip,
                            (ker::mod::sched::get_current_task() != nullptr) ? ker::mod::sched::get_current_task()->pid : 0);
-            ker::syscall::process::wos_proc_exit(128 + 5);  // 133 = SIGTRAP
+            ker::syscall::process::wos_proc_exit_signal(5);
             __builtin_unreachable();
         }
 
         journal::warn("Userspace exception: int=%d err=%d rip=0x%lx pid=%x", frame.int_num, frame.err_code, frame.rip,
                       (ker::mod::sched::get_current_task() != nullptr) ? ker::mod::sched::get_current_task()->pid : 0);
-        ker::syscall::process::wos_proc_exit(128 + static_cast<int>(frame.int_num & 0x7f));
+        ker::syscall::process::wos_proc_exit_signal(signal_for_user_exception(frame.int_num));
         __builtin_unreachable();
     }
 

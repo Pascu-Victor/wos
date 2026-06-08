@@ -602,12 +602,12 @@ ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
 
 // --- Line discipline helpers ---
 
-// Send signal to the foreground process group
-void pty_signal_fg(PtyPair* pair, int sig) {
-    if (pair->foreground_pgrp <= 0) {
+// Send signal to a foreground process group snapshot.
+void pty_signal_pgrp(int foreground_pgrp, int sig) {
+    if (foreground_pgrp <= 0) {
         return;
     }
-    ker::mod::sched::signal_process_group(static_cast<uint64_t>(pair->foreground_pgrp), sig);
+    ker::mod::sched::signal_process_group(static_cast<uint64_t>(foreground_pgrp), sig);
 }
 
 // Echo a single byte to s2m, applying output post-processing
@@ -723,7 +723,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
         // Signal generation (c_lflag ISIG)
         if ((pair->termios.c_lflag & TIOS_ISIG) != 0U) {
             if (ch == pair->termios.c_cc[CC_VINTR] && pair->termios.c_cc[CC_VINTR] != 0) {
-                pty_signal_fg(pair, SIG_INT);
+                int const SIGNAL_PGRP = pair->foreground_pgrp;
                 if ((pair->termios.c_lflag & TIOS_ECHO) != 0U) {
                     pty_echo_ctrl(pair, ch);
                     pty_echo_byte(pair, '\n');
@@ -733,13 +733,14 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     pair->canon_len = 0;
                 }
                 pair->lock.unlock_irqrestore(IRQF);
+                pty_signal_pgrp(SIGNAL_PGRP, SIG_INT);
                 if (!from_replay) {
                     processed++;
                 }
                 continue;
             }
             if (ch == pair->termios.c_cc[CC_VQUIT] && pair->termios.c_cc[CC_VQUIT] != 0) {
-                pty_signal_fg(pair, SIG_QUIT);
+                int const SIGNAL_PGRP = pair->foreground_pgrp;
                 if ((pair->termios.c_lflag & TIOS_ECHO) != 0U) {
                     pty_echo_ctrl(pair, ch);
                     pty_echo_byte(pair, '\n');
@@ -749,18 +750,20 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     pair->canon_len = 0;
                 }
                 pair->lock.unlock_irqrestore(IRQF);
+                pty_signal_pgrp(SIGNAL_PGRP, SIG_QUIT);
                 if (!from_replay) {
                     processed++;
                 }
                 continue;
             }
             if (ch == pair->termios.c_cc[CC_VSUSP] && pair->termios.c_cc[CC_VSUSP] != 0) {
-                pty_signal_fg(pair, SIG_TSTP);
+                int const SIGNAL_PGRP = pair->foreground_pgrp;
                 if ((pair->termios.c_lflag & TIOS_ECHO) != 0U) {
                     pty_echo_ctrl(pair, ch);
                     pty_echo_byte(pair, '\n');
                 }
                 pair->lock.unlock_irqrestore(IRQF);
+                pty_signal_pgrp(SIGNAL_PGRP, SIG_TSTP);
                 if (!from_replay) {
                     processed++;
                 }

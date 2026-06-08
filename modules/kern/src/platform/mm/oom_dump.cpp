@@ -33,7 +33,7 @@ std::atomic<uint64_t> oom_dump_in_progress{0};
 // Buffer for number-to-string conversions
 
 namespace ker::mod::mm::phys {
-namespace emergency_serial = ker::mod::dbg::emergency_serial;
+namespace emergency_serial = ker::mod::dbg::emergency_serial_unlocked;
 namespace io::serial {
 using emergency_serial::write;
 }

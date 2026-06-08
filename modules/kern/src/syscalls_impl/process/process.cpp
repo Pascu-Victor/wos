@@ -19,6 +19,7 @@
 #include "platform/interrupt/gdt.hpp"
 #include "platform/ktime/ktime.hpp"
 #include "platform/mm/mm.hpp"
+#include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/perf/perf_events.hpp"
@@ -47,6 +48,9 @@ namespace ker::syscall::process {
 namespace {
 using fork_log = ker::mod::dbg::logger<"fork">;
 using process_log = ker::mod::dbg::logger<"process">;
+constexpr uint32_t FORK_GC_NO_PROGRESS_YIELD_LIMIT = 64;
+constexpr uint64_t FORK_GC_FREE_PAGE_LOW_WATERMARK_DIVISOR = 32;
+constexpr uint64_t FORK_GC_FREE_PAGE_LOW_WATERMARK_MIN = 4096;
 
 inline auto signal_handler_slot(ker::mod::sched::task::Task& task, size_t index) -> ker::mod::sched::task::Task::SigHandler& {
     // Signal numbers are range-checked before conversion to this zero-based index.
@@ -225,6 +229,45 @@ inline void log_unmapped_child_resume_state(const ker::mod::sched::task::Task* p
         static_cast<unsigned long long>(saved_flags), parent != nullptr ? static_cast<void*>(parent->pagemap) : nullptr);
 }
 
+auto alloc_fork_kernel_stack_with_reclaim() -> uint64_t {
+    return reinterpret_cast<uint64_t>(ker::mod::mm::phys::page_alloc_with_reclaim(ker::mod::mm::KERNEL_STACK_SIZE, "fork_kstack"));
+}
+
+auto fork_free_page_low_watermark() -> uint64_t {
+    uint64_t const TOTAL_PAGES = ker::mod::mm::phys::get_total_mem_bytes() / ker::mod::mm::paging::PAGE_SIZE;
+    uint64_t const SCALED_WATERMARK = TOTAL_PAGES / FORK_GC_FREE_PAGE_LOW_WATERMARK_DIVISOR;
+    return SCALED_WATERMARK > FORK_GC_FREE_PAGE_LOW_WATERMARK_MIN ? SCALED_WATERMARK : FORK_GC_FREE_PAGE_LOW_WATERMARK_MIN;
+}
+
+auto fork_should_reclaim_for_pressure(uint64_t free_pages) -> bool { return free_pages < fork_free_page_low_watermark(); }
+
+auto fork_pressure_has_emergency_headroom(uint64_t free_pages) -> bool { return free_pages >= fork_free_page_low_watermark(); }
+
+auto throttle_fork_for_reclaim_pressure(uint64_t callsite) -> bool {
+    if (!ker::mod::sched::has_run_queues() || ker::mod::sched::preempt_count() != 0 || !ker::mod::sched::interrupts_enabled()) {
+        return true;
+    }
+
+    uint32_t no_progress_yields = 0;
+    for (;;) {
+        uint64_t const FREE_PAGES = ker::mod::mm::phys::get_free_mem_pages();
+        if (!fork_should_reclaim_for_pressure(FREE_PAGES)) {
+            return true;
+        }
+
+        if (ker::mod::sched::reclaim_memory_pressure() == 0) {
+            ker::mod::sched::request_gc_memory_pressure();
+            ker::mod::sched::kern_yield_impl(callsite);
+            ++no_progress_yields;
+            if (no_progress_yields >= FORK_GC_NO_PROGRESS_YIELD_LIMIT) {
+                return fork_pressure_has_emergency_headroom(ker::mod::mm::phys::get_free_mem_pages());
+            }
+        } else {
+            no_progress_yields = 0;
+        }
+    }
+}
+
 auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     using namespace ker::mod;
 
@@ -240,20 +283,25 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         return static_cast<uint64_t>(result);
     };
 
-    // Save parent's register context (will be copied to child)
-    parent->context.regs = gpr;
-
-    // --- Allocate child kernel stack ---
-    auto kernel_stack_base = reinterpret_cast<uint64_t>(mm::phys::page_alloc(ker::mod::mm::KERNEL_STACK_SIZE));
-    if (kernel_stack_base == 0) {
+    if (!throttle_fork_for_reclaim_pressure(WOS_PERF_CALLSITE())) {
         return finish_fork(-ENOMEM);
     }
-    uint64_t const KERNEL_RSP = kernel_stack_base + ker::mod::mm::KERNEL_STACK_SIZE;
+
+    // --- Allocate child kernel stack ---
+    auto const KERNEL_STACK_BASE = alloc_fork_kernel_stack_with_reclaim();
+    if (KERNEL_STACK_BASE == 0) {
+        return finish_fork(-ENOMEM);
+    }
+    uint64_t const KERNEL_RSP = KERNEL_STACK_BASE + ker::mod::mm::KERNEL_STACK_SIZE;
+
+    // Save parent's register context after any pressure-reclaim yield; this
+    // snapshot is copied into the child as the fork return frame.
+    parent->context.regs = gpr;
 
     // --- Allocate child Task without the ELF-loading constructor ---
     auto* child = new sched::task::Task{};
     if (child == nullptr) {
-        mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         return finish_fork(-ENOMEM);
     }
 
@@ -275,6 +323,8 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->has_exited = false;
     child->exit_notify_ready.store(false, std::memory_order_relaxed);
     child->waited_on = false;
+    child->zombie_resources_reclaiming.store(false, std::memory_order_relaxed);
+    child->zombie_resources_reclaimed.store(false, std::memory_order_relaxed);
     child->deferred_task_switch = false;
     child->yield_switch = false;
     child->set_voluntary_blocked(false);
@@ -318,7 +368,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
             : 0;
     if (!child->wki_vfs_rules.clone_from(parent->wki_vfs_rules)) {
         delete[] child->name;
-        mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
         return finish_fork(-ENOMEM);
     }
@@ -334,7 +384,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->umask = parent->umask;
     if (!child->supplementary_groups.clone_from(parent->supplementary_groups)) {
         delete[] child->name;
-        mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
         return finish_fork(-ENOMEM);
     }
@@ -357,7 +407,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->pagemap = mm::virt::create_pagemap();
     if (child->pagemap == nullptr) {
         delete[] child->name;
-        mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
         return finish_fork(-ENOMEM);
     }
@@ -370,7 +420,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-cow-fail");
         mm::phys::page_free(child->pagemap);
         delete[] child->name;
-        mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
         return finish_fork(-ENOMEM);
     }
@@ -379,7 +429,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-shm-clone-fail");
         mm::phys::page_free(child->pagemap);
         delete[] child->name;
-        mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
         return finish_fork(-ENOMEM);
     }
@@ -394,7 +444,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
             mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-thread-alloc-fail");
             mm::phys::page_free(child->pagemap);
             delete[] child->name;
-            mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
+            mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
             delete child;
             return finish_fork(-ENOMEM);
         }
@@ -490,7 +540,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-post-task-fail");
         mm::phys::page_free(child->pagemap);
         delete[] child->name;
-        mm::phys::page_free(reinterpret_cast<void*>(kernel_stack_base));
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
         return finish_fork(-ENOMEM);
     }

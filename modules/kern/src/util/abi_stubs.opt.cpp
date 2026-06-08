@@ -8,7 +8,27 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <util/hcf.hpp>
+
+#include "abi/callnums/sys_log.h"
 // NOLINTBEGIN(readability-identifier-naming,misc-use-internal-linkage,misc-use-anonymous-namespace)
+
+namespace {
+
+[[noreturn]] void panic_verbose_abort(char const* format, va_list args) noexcept {
+    constexpr size_t PANIC_BUF_SIZE = ker::abi::sys_log::JOURNAL_MESSAGE_MAX;
+    std::array<char, PANIC_BUF_SIZE> message{};
+    char const* const SAFE_FORMAT = (format != nullptr) ? format : "__libcpp_verbose_abort";
+    int const WRITTEN = std::vsnprintf(message.data(), message.size(), SAFE_FORMAT, args);
+    if (WRITTEN < 0) {
+        ker::mod::dbg::panic_handler("__libcpp_verbose_abort formatting failed");
+        hcf();
+    }
+    ker::mod::dbg::panic_handler(message.data());
+    hcf();
+}
+
+}  // namespace
+
 extern "C" {
 // Kernel-friendly assert handler used by C library headers that call
 // __assert_fail. Print to kernel log then halt the CPU.
@@ -59,15 +79,17 @@ void run_atexit_handlers() {
 // NOLINTBEGIN(bugprone-std-namespace-modification,modernize-avoid-c-arrays,modernize-avoid-variadic-functions)
 namespace std {
 _LIBCPP_WEAK void __libcpp_verbose_abort(char const* format, ...) noexcept {
-    ker::mod::dbg::log_string((format != nullptr) ? format : "__libcpp_verbose_abort");
-    hcf();
+    va_list args;
+    va_start(args, format);
+    panic_verbose_abort(format, args);
 }
 }  // namespace std
 
 namespace std::inline __1 {
 _LIBCPP_WEAK void __libcpp_verbose_abort(char const* format, ...) noexcept {
-    ker::mod::dbg::log_string((format != nullptr) ? format : "__libcpp_verbose_abort");
-    hcf();
+    va_list args;
+    va_start(args, format);
+    panic_verbose_abort(format, args);
 }
 
 [[noreturn]] _LIBCPP_WEAK void __throw_bad_array_new_length() {
