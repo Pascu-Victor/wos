@@ -212,6 +212,38 @@ KTEST(MM, PagemapPoolReusesZeroedRootPage) {
     virt::release_pagemap(second);
 }
 
+KTEST(MM, OwnedFrameTrackingMapUnmapPrivateNormalPage) {
+    constexpr uint64_t TEST_VADDR = 0x40000000ULL;
+
+    virt::OwnedFrameStatsSnapshot before{};
+    virt::get_owned_frame_stats_snapshot(before);
+
+    auto* root = virt::create_pagemap();
+    KREQUIRE_NE(root, nullptr);
+
+    void* page = phys::page_alloc(paging::PAGE_SIZE, "owned_frame_ktest");
+    if (page == nullptr) {
+        virt::release_pagemap(root);
+        KREQUIRE_NE(page, nullptr);
+    }
+
+    virt::map_page(root, TEST_VADDR, phys_addr_of(page), paging::page_types::USER);
+
+    virt::OwnedFrameStatsSnapshot after_map{};
+    virt::get_owned_frame_stats_snapshot(after_map);
+    KEXPECT_TRUE(after_map.track_added >= before.track_added + 1);
+    KEXPECT_TRUE(after_map.entries >= before.entries + 1);
+
+    virt::unmap_page(root, TEST_VADDR);
+
+    virt::OwnedFrameStatsSnapshot after_unmap{};
+    virt::get_owned_frame_stats_snapshot(after_unmap);
+    KEXPECT_TRUE(after_unmap.untrack_removed >= after_map.untrack_removed + 1);
+
+    virt::destroy_user_space(root, 0, "mm_ktest", "owned-frame");
+    virt::release_pagemap(root);
+}
+
 KTEST(MM, MultiplePageAllocFree) {
     constexpr size_t PAGE_COUNT = 8;
     std::array<void*, PAGE_COUNT> pages{};

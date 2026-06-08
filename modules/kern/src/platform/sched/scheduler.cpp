@@ -588,6 +588,13 @@ constexpr uint64_t SCHED_GC_WORK_BUDGET_US = 500;
 // not monopolize a CPU while process-per-core workloads are launching bursts of
 // short-lived helpers. Throughput still comes from repeated self-wake passes.
 constexpr uint32_t SCHED_GC_PAGEMAP_STEP_BUDGET = 64;
+// When deferred pagemap cleanup is already queued, foreground variance is often
+// dominated by repeatedly re-entering tiny reclaim slices. Use a middle budget:
+// large enough to finish old address spaces in far fewer passes, but still much
+// smaller than the idle-only drain budget.
+constexpr uint32_t SCHED_GC_DEFERRED_RECLAIM_BUDGET = 128;
+constexpr uint64_t SCHED_GC_DEFERRED_WORK_BUDGET_US = 2'000;
+constexpr uint32_t SCHED_GC_DEFERRED_PAGEMAP_STEP_BUDGET = 1024;
 constexpr uint32_t SCHED_GC_IDLE_RECLAIM_BUDGET = 256;
 constexpr uint64_t SCHED_GC_IDLE_WORK_BUDGET_US = 10'000;
 constexpr uint32_t SCHED_GC_IDLE_PAGEMAP_STEP_BUDGET = 4096;
@@ -4639,19 +4646,28 @@ void scheduler_gc_thread_main() {
         } else {
             scheduler_gc_foreground_passes.fetch_add(1, std::memory_order_relaxed);
         }
-        uint32_t const RECLAIM_BUDGET = BOOST_RECLAIM ? SCHED_GC_IDLE_RECLAIM_BUDGET : SCHED_GC_RECLAIM_BUDGET;
-        uint64_t const WORK_BUDGET_US = BOOST_RECLAIM ? SCHED_GC_IDLE_WORK_BUDGET_US : SCHED_GC_WORK_BUDGET_US;
-        uint32_t const PAGEMAP_STEP_BUDGET = BOOST_RECLAIM ? SCHED_GC_IDLE_PAGEMAP_STEP_BUDGET : SCHED_GC_PAGEMAP_STEP_BUDGET;
+        uint32_t reclaim_budget = SCHED_GC_RECLAIM_BUDGET;
+        uint64_t work_budget_us = SCHED_GC_WORK_BUDGET_US;
+        uint32_t pagemap_step_budget = SCHED_GC_PAGEMAP_STEP_BUDGET;
+        if (BOOST_RECLAIM) {
+            reclaim_budget = SCHED_GC_IDLE_RECLAIM_BUDGET;
+            work_budget_us = SCHED_GC_IDLE_WORK_BUDGET_US;
+            pagemap_step_budget = SCHED_GC_IDLE_PAGEMAP_STEP_BUDGET;
+        } else if (gc_deferred_cleanup_has_work()) {
+            reclaim_budget = SCHED_GC_DEFERRED_RECLAIM_BUDGET;
+            work_budget_us = SCHED_GC_DEFERRED_WORK_BUDGET_US;
+            pagemap_step_budget = SCHED_GC_DEFERRED_PAGEMAP_STEP_BUDGET;
+        }
 
         uint64_t const START_US = time::get_us();
         bool time_budget_exhausted = false;
         bool has_pending_work = false;
         uint32_t const RECLAIMED =
-            gc_expired_tasks_budgeted_impl(RECLAIM_BUDGET, WORK_BUDGET_US, PAGEMAP_STEP_BUDGET, &time_budget_exhausted, &has_pending_work);
+            gc_expired_tasks_budgeted_impl(reclaim_budget, work_budget_us, pagemap_step_budget, &time_budget_exhausted, &has_pending_work);
         uint64_t const END_US = time::get_us();
         note_gc_pass_result(RECLAIMED, END_US >= START_US ? END_US - START_US : 0);
 
-        if (has_pending_work || RECLAIMED >= RECLAIM_BUDGET || (time_budget_exhausted && RECLAIMED != 0)) {
+        if (has_pending_work || RECLAIMED >= reclaim_budget || (time_budget_exhausted && RECLAIMED != 0)) {
             scheduler_gc_requested.store(true, std::memory_order_release);
             kern_yield();
         }

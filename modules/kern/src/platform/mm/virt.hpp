@@ -78,6 +78,22 @@ struct PageTablePoolStatsSnapshot {
     uint64_t rejects;
 };
 
+struct OwnedFrameStatsSnapshot {
+    uint64_t capacity;
+    uint64_t entries;
+    uint64_t track_attempts;
+    uint64_t track_added;
+    uint64_t track_replaced;
+    uint64_t track_skipped;
+    uint64_t track_conflicts;
+    uint64_t track_probe_failures;
+    uint64_t untrack_attempts;
+    uint64_t untrack_removed;
+    uint64_t untrack_missed;
+    uint64_t purge_calls;
+    uint64_t purge_removed;
+};
+
 struct DestroyUserSpaceBudgetState;
 
 void init(limine_memmap_response* memmap_response, limine_executable_file_response* kernel_file_response,
@@ -104,6 +120,7 @@ void init_pagemap();
 PageTable* create_pagemap();
 void release_pagemap(PageTable* pagemap);
 void get_page_table_pool_stats_snapshot(PageTablePoolStatsSnapshot& out);
+void get_owned_frame_stats_snapshot(OwnedFrameStatsSnapshot& out);
 void copy_kernel_mappings(sched::task::Task* t);
 void switch_pagemap(sched::task::Task* t);
 bool pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, ker::mod::cpu::GPRegs& gpr);

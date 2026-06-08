@@ -2947,10 +2947,12 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
         ker::mod::mm::phys::PageRefStatsSnapshot ref_stats{};
         ker::mod::mm::phys::PageCacheStatsSnapshot page_cache_stats{};
         ker::mod::mm::virt::PageTablePoolStatsSnapshot page_table_pool_stats{};
+        ker::mod::mm::virt::OwnedFrameStatsSnapshot owned_frame_stats{};
         if (c == 0) {
             ker::mod::mm::phys::get_page_ref_stats_snapshot(ref_stats);
             ker::mod::mm::phys::get_page_cache_stats_snapshot(page_cache_stats);
             ker::mod::mm::virt::get_page_table_pool_stats_snapshot(page_table_pool_stats);
+            ker::mod::mm::virt::get_owned_frame_stats_snapshot(owned_frame_stats);
         }
         append_sconst(p, end, "cpu=");
         append_dec64(p, end, c);
@@ -3180,6 +3182,32 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, page_table_pool_stats.releases);
         append_sconst(p, end, " pt_pool_reject=");
         append_dec64(p, end, page_table_pool_stats.rejects);
+        append_sconst(p, end, " of_capacity=");
+        append_dec64(p, end, owned_frame_stats.capacity);
+        append_sconst(p, end, " of_entries=");
+        append_dec64(p, end, owned_frame_stats.entries);
+        append_sconst(p, end, " of_track=");
+        append_dec64(p, end, owned_frame_stats.track_attempts);
+        append_sconst(p, end, " of_added=");
+        append_dec64(p, end, owned_frame_stats.track_added);
+        append_sconst(p, end, " of_replaced=");
+        append_dec64(p, end, owned_frame_stats.track_replaced);
+        append_sconst(p, end, " of_skipped=");
+        append_dec64(p, end, owned_frame_stats.track_skipped);
+        append_sconst(p, end, " of_conflict=");
+        append_dec64(p, end, owned_frame_stats.track_conflicts);
+        append_sconst(p, end, " of_probe_fail=");
+        append_dec64(p, end, owned_frame_stats.track_probe_failures);
+        append_sconst(p, end, " of_untrack=");
+        append_dec64(p, end, owned_frame_stats.untrack_attempts);
+        append_sconst(p, end, " of_removed=");
+        append_dec64(p, end, owned_frame_stats.untrack_removed);
+        append_sconst(p, end, " of_missed=");
+        append_dec64(p, end, owned_frame_stats.untrack_missed);
+        append_sconst(p, end, " of_purge=");
+        append_dec64(p, end, owned_frame_stats.purge_calls);
+        append_sconst(p, end, " of_purge_removed=");
+        append_dec64(p, end, owned_frame_stats.purge_removed);
         append_sconst(p, end, " lb_push=");
         append_dec64(p, end, sched.load_balance_pushes);
         if (p + 1 < end) {
