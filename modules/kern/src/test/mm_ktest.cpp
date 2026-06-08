@@ -274,6 +274,38 @@ KTEST(MM, RefCountDecWithLookupHint) {
     KEXPECT_EQ(phys::page_ref_get(page, &hint), 0U);
 }
 
+KTEST(MM, LookupHintOwnerMustMatchAllocatorDomain) {
+    void* regular_page = phys::page_alloc();
+    KREQUIRE_NE(regular_page, nullptr);
+
+    phys::PageLookupHint hint{};
+    KEXPECT_EQ(phys::page_ref_get(regular_page, &hint), 1U);
+    KEXPECT_EQ(hint.owner, phys::PageLookupOwner::REGULAR_ZONE);
+
+    hint.owner = phys::PageLookupOwner::HUGE_ZONE;
+    KEXPECT_EQ(phys::page_ref_get(regular_page, &hint), 1U);
+    KEXPECT_EQ(hint.owner, phys::PageLookupOwner::REGULAR_ZONE);
+
+    void* huge_page = phys::page_alloc_huge(paging::PAGE_SIZE);
+    if (huge_page == nullptr) {
+        phys::page_free(regular_page);
+        return;
+    }
+
+    KEXPECT_EQ(phys::page_ref_get(huge_page, &hint), 1U);
+    KEXPECT_EQ(hint.owner, phys::PageLookupOwner::HUGE_ZONE);
+
+    hint.owner = phys::PageLookupOwner::REGULAR_ZONE;
+    KEXPECT_EQ(phys::page_ref_get(huge_page, &hint), 1U);
+    KEXPECT_EQ(hint.owner, phys::PageLookupOwner::HUGE_ZONE);
+
+    KEXPECT_EQ(phys::page_kind_get(regular_page, &hint), mm::PageKind::NORMAL);
+    KEXPECT_EQ(hint.owner, phys::PageLookupOwner::REGULAR_ZONE);
+
+    phys::page_free(huge_page);
+    phys::page_free(regular_page);
+}
+
 KTEST(MM, RefCountBatchFinalFreeContiguousRun) {
     constexpr size_t PAGE_COUNT = 4;
     auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));

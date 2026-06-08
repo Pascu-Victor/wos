@@ -1404,12 +1404,32 @@ auto allocator_owns_page(PageAllocator* alloc, uint64_t addr, uint32_t& out_idx)
     return out_idx < alloc->total_pages;
 }
 
-auto find_allocator_for_page(void* page, PageAllocator*& out_alloc, uint32_t& out_idx) -> bool {
+auto allocator_is_huge_zone(PageAllocator const* alloc) -> bool { return huge_page_zone != nullptr && huge_page_zone->allocator == alloc; }
+
+auto allocator_owns_page_as(PageAllocator* alloc, PageLookupOwner owner, uint64_t addr, uint32_t& out_idx) -> bool {
+    if (owner == PageLookupOwner::NONE || alloc == nullptr) {
+        return false;
+    }
+    if (owner == PageLookupOwner::HUGE_ZONE) {
+        if (!allocator_is_huge_zone(alloc)) {
+            return false;
+        }
+        return addr >= huge_page_zone->start && addr < huge_page_zone->start + huge_page_zone->len &&
+               allocator_owns_page(alloc, addr, out_idx);
+    }
+    if (allocator_is_huge_zone(alloc)) {
+        return false;
+    }
+    return allocator_owns_page(alloc, addr, out_idx);
+}
+
+auto find_allocator_for_page_owned(void* page, PageAllocator*& out_alloc, uint32_t& out_idx, PageLookupOwner& out_owner) -> bool {
     auto addr = reinterpret_cast<uint64_t>(page);
     // Check regular zones first
     for (paging::PageZone const* zone = zones; zone != nullptr; zone = zone->next) {
         if (addr >= zone->start && addr < zone->start + zone->len && allocator_owns_page(zone->allocator, addr, out_idx)) {
             out_alloc = zone->allocator;
+            out_owner = PageLookupOwner::REGULAR_ZONE;
             return true;
         }
     }
@@ -1417,22 +1437,31 @@ auto find_allocator_for_page(void* page, PageAllocator*& out_alloc, uint32_t& ou
     if (huge_page_zone != nullptr && addr >= huge_page_zone->start && addr < huge_page_zone->start + huge_page_zone->len &&
         allocator_owns_page(huge_page_zone->allocator, addr, out_idx)) {
         out_alloc = huge_page_zone->allocator;
+        out_owner = PageLookupOwner::HUGE_ZONE;
         return true;
     }
+    out_owner = PageLookupOwner::NONE;
     return false;
 }
 
-auto find_allocator_for_page_with_hint(void* page, PageAllocator*& allocator_hint, PageAllocator*& out_alloc, uint32_t& out_idx) -> bool {
+auto find_allocator_for_page(void* page, PageAllocator*& out_alloc, uint32_t& out_idx) -> bool {
+    PageLookupOwner owner = PageLookupOwner::NONE;
+    return find_allocator_for_page_owned(page, out_alloc, out_idx, owner);
+}
+
+auto find_allocator_for_page_with_hint(void* page, PageLookupHint& hint, PageAllocator*& out_alloc, uint32_t& out_idx) -> bool {
     auto const ADDR = reinterpret_cast<uint64_t>(page);
-    if (allocator_owns_page(allocator_hint, ADDR, out_idx)) {
-        out_alloc = allocator_hint;
+    if (allocator_owns_page_as(hint.allocator, hint.owner, ADDR, out_idx)) {
+        out_alloc = hint.allocator;
         return true;
     }
 
-    if (!find_allocator_for_page(page, out_alloc, out_idx)) {
+    PageLookupOwner owner = PageLookupOwner::NONE;
+    if (!find_allocator_for_page_owned(page, out_alloc, out_idx, owner)) {
         return false;
     }
-    allocator_hint = out_alloc;
+    hint.allocator = out_alloc;
+    hint.owner = owner;
     return true;
 }
 
@@ -1441,12 +1470,7 @@ auto find_allocator_for_page_cached(void* page, PageLookupHint* hint, PageAlloca
         return find_allocator_for_page(page, out_alloc, out_idx);
     }
 
-    PageAllocator* allocator_hint = hint->allocator;
-    if (!find_allocator_for_page_with_hint(page, allocator_hint, out_alloc, out_idx)) {
-        return false;
-    }
-    hint->allocator = allocator_hint;
-    return true;
+    return find_allocator_for_page_with_hint(page, *hint, out_alloc, out_idx);
 }
 }  // namespace
 
@@ -1561,11 +1585,11 @@ struct ZeroRefPage {
     uint32_t idx = 0;
 };
 
-auto page_ref_dec_atomic(void* page, uint32_t& new_ref, ZeroRefPage& zero_ref_page, PageAllocator*& allocator_hint) -> bool {
+auto page_ref_dec_atomic(void* page, uint32_t& new_ref, ZeroRefPage& zero_ref_page, PageLookupHint& hint) -> bool {
     zero_ref_page = {};
     PageAllocator* alloc = nullptr;
     uint32_t idx = 0;
-    if (!find_allocator_for_page_with_hint(page, allocator_hint, alloc, idx)) {
+    if (!find_allocator_for_page_with_hint(page, hint, alloc, idx)) {
         new_ref = 0;
         return false;
     }
@@ -1765,10 +1789,10 @@ auto page_ref_dec(void* page, PageLookupHint* hint) -> uint32_t {
 
     uint32_t new_ref = 0;
     ZeroRefPage zero_ref_page{};
-    PageAllocator* allocator_hint = hint != nullptr ? hint->allocator : nullptr;
-    bool const DEC_OK = page_ref_dec_atomic(page, new_ref, zero_ref_page, allocator_hint);
+    PageLookupHint lookup_hint = hint != nullptr ? *hint : PageLookupHint{};
+    bool const DEC_OK = page_ref_dec_atomic(page, new_ref, zero_ref_page, lookup_hint);
     if (hint != nullptr) {
-        hint->allocator = allocator_hint;
+        *hint = lookup_hint;
     }
     if (!DEC_OK) {
         return new_ref;
@@ -1811,7 +1835,7 @@ auto page_ref_dec_batch(std::span<void* const> pages, PageLookupHint* hint) -> P
         zero_ref_count = 0;
     };
 
-    PageAllocator* allocator_hint = hint != nullptr ? hint->allocator : nullptr;
+    PageLookupHint lookup_hint = hint != nullptr ? *hint : PageLookupHint{};
     for (void* page : pages) {
         if (page == nullptr) {
             continue;
@@ -1819,7 +1843,7 @@ auto page_ref_dec_batch(std::span<void* const> pages, PageLookupHint* hint) -> P
 
         uint32_t new_ref = 0;
         ZeroRefPage zero_ref_page{};
-        if (!page_ref_dec_atomic(page, new_ref, zero_ref_page, allocator_hint)) {
+        if (!page_ref_dec_atomic(page, new_ref, zero_ref_page, lookup_hint)) {
             continue;
         }
 
@@ -1836,7 +1860,7 @@ auto page_ref_dec_batch(std::span<void* const> pages, PageLookupHint* hint) -> P
     }
     flush_zero_ref_pages();
     if (hint != nullptr) {
-        hint->allocator = allocator_hint;
+        *hint = lookup_hint;
     }
     return stats;
 }

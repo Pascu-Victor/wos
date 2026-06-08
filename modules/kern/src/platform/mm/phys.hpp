@@ -96,8 +96,15 @@ struct PageCacheStatsSnapshot {
     uint64_t stale_entries;
 };
 
+enum class PageLookupOwner : uint8_t {
+    NONE = 0,
+    REGULAR_ZONE,
+    HUGE_ZONE,
+};
+
 struct PageLookupHint {
     PageAllocator* allocator = nullptr;
+    PageLookupOwner owner = PageLookupOwner::NONE;
 };
 
 void init(limine_memmap_response* memmap_response);
