@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build the host toolchain (clang/lld) for cross-compiling to WOS.
-# This produces the compiler binaries in toolchain/host/.
+# Build the host toolchain (clang/lld/lldb) for cross-compiling and debugging WOS.
+# This produces the host-side tool binaries in toolchain/host/.
 # WOS target libraries go into toolchain/sysroot/ (built by wos-toolchain.sh).
 set -euo pipefail
 
@@ -17,6 +17,11 @@ mkdir -p toolchain
 B="$WORKSPACE_ROOT/toolchain"
 TARGET_ARCH=x86_64-pc-wos
 export NINJA_STATUS="[%f/%t %e] "
+HOST_PYTHON="${HOST_PYTHON:-$(command -v python3)}"
+HOST_PYTHON_INCLUDE="$("$HOST_PYTHON" -c 'import sysconfig; print(sysconfig.get_path("include"))')"
+HOST_PYTHON_LIBRARY="$("$HOST_PYTHON" -c 'import pathlib, sysconfig; print(pathlib.Path(sysconfig.get_config_var("LIBDIR")) / sysconfig.get_config_var("LDLIBRARY"))')"
+HOST_PYTHON_LIBDIR="$(dirname "$HOST_PYTHON_LIBRARY")"
+HOST_TOOLCHAIN_RPATH="\$ORIGIN/../lib;$HOST_PYTHON_LIBDIR"
 
 # 1. Clone repositories
 mkdir -p $B/src
@@ -33,12 +38,17 @@ export CC=clang
 export CXX=clang++
 mkdir -p $B/host-build
 cd $B/host-build
-cmake -G Ninja \
+cmake -U'Python3_*' -U'_Python3_*' -G Ninja \
  "${WOS_CCACHE_CMAKE_ARGS[@]}" \
  -DCMAKE_BUILD_TYPE=Release \
  -DCMAKE_INSTALL_PREFIX=$B/host \
+ -DCMAKE_INSTALL_RPATH="$HOST_TOOLCHAIN_RPATH" \
  -DLLVM_TARGETS_TO_BUILD=X86 \
- -DLLVM_ENABLE_PROJECTS='clang;lld' \
+ -DLLVM_ENABLE_PROJECTS='clang;lld;lldb' \
+ -DLLDB_ENABLE_PYTHON=ON \
+ -DPython3_EXECUTABLE="$HOST_PYTHON" \
+ -DPython3_INCLUDE_DIR="$HOST_PYTHON_INCLUDE" \
+ -DPython3_LIBRARY="$HOST_PYTHON_LIBRARY" \
  -DLLVM_ENABLE_LIBXML2=Off \
  -DLLVM_ENABLE_LLD=On \
  -DLLVM_DEFAULT_TARGET_TRIPLE=$TARGET_ARCH \

@@ -4,8 +4,11 @@
 #include <abi-bits/socket.h>
 #include <abi-bits/socklen_t.h>
 #include <abi-bits/wait.h>
+#include <abi/callnums/process.h>
 #include <arpa/inet.h>
 #include <bits/ssize_t.h>
+#include <poll.h>
+#include <sys/callnums.h>
 #include <sys/process.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -22,7 +25,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <format>
-#include <poll.h>
 #include <print>
 #include <string>
 #include <string_view>
@@ -83,10 +85,19 @@ struct HardwareBreakpoint {
 struct Session {
     int fd = -1;
     uint64_t pid = 0;
+    bool attached = true;
+    bool tracing_active = true;
     bool no_ack = false;
     bool received_interrupt = false;
     std::vector<SoftwareBreakpoint> software_breakpoints;
     std::vector<HardwareBreakpoint> hardware_breakpoints;
+};
+
+struct LaunchOptions {
+    uint16_t port = DEFAULT_PORT;
+    uint64_t attach_pid = 0;
+    bool break_on_start = false;
+    char** command_argv = nullptr;
 };
 
 auto hex_digit(uint8_t value) -> char {
@@ -220,11 +231,34 @@ auto parse_hex_u64(std::string_view text, uint64_t& value) -> bool {
     return true;
 }
 
-auto fetch_event(Session& session, ker::abi::ptrace::Event& event) -> bool {
-    int64_t const GETEVENTMSG_RESULT = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::GETEVENTMSG), session.pid, 0,
-                                                            reinterpret_cast<uint64_t>(&event));
+auto parse_decimal_u64(std::string_view text, uint64_t max, uint64_t& value) -> bool {
+    value = 0;
+    if (text.empty()) {
+        return false;
+    }
+    for (char const C : text) {
+        if (C < '0' || C > '9') {
+            return false;
+        }
+        auto const DIGIT = static_cast<uint64_t>(C - '0');
+        if (value > (max - DIGIT) / 10U) {
+            return false;
+        }
+        value = (value * 10U) + DIGIT;
+    }
+    return true;
+}
+
+auto ptrace_call(ker::abi::ptrace::request request, uint64_t pid, uint64_t addr, uint64_t data) -> int64_t {
+    return ker::process::ptrace(static_cast<uint64_t>(request), pid, addr, data);
+}
+
+auto fetch_event_for_pid(uint64_t pid, ker::abi::ptrace::Event& event) -> bool {
+    int64_t const GETEVENTMSG_RESULT = ptrace_call(ker::abi::ptrace::request::GETEVENTMSG, pid, 0, reinterpret_cast<uint64_t>(&event));
     return GETEVENTMSG_RESULT >= 0;
 }
+
+auto fetch_event(Session& session, ker::abi::ptrace::Event& event) -> bool { return fetch_event_for_pid(session.pid, event); }
 
 auto stop_reason_name(ker::abi::ptrace::stop_reason reason) -> std::string_view {
     switch (reason) {
@@ -254,11 +288,33 @@ auto stop_reason_name(ker::abi::ptrace::stop_reason reason) -> std::string_view 
     return "signal";
 }
 
+auto exception_address_field(const ker::abi::ptrace::Event& event) -> std::string {
+    if (event.address == 0) {
+        return {};
+    }
+    if (event.signal == SIGSYS) {
+        return std::format("syscall:{:x};", event.address);
+    }
+    return std::format("fault:{:x};", event.address);
+}
+
 auto stop_reply_from_event(Session& session, const ker::abi::ptrace::Event& event) -> std::string {
-    uint32_t const SIG = event.signal != 0 ? event.signal : SIGTRAP;
-    std::string reply = std::format("T{:02x}thread:{:x};reason:{};", SIG, session.pid, stop_reason_name(event.reason));
+    if (event.reason == ker::abi::ptrace::stop_reason::EXIT) {
+        session.tracing_active = false;
+        if (event.signal != 0) {
+            return std::format("X{:02x}", event.signal);
+        }
+        return std::format("W{:02x}", static_cast<uint32_t>(event.message & 0xffU));
+    }
+
+    uint32_t const WOS_SIGNAL = event.signal != 0 ? event.signal : SIGTRAP;
+    std::string reply = std::format("T{:02x}thread:{:x};reason:{};", WOS_SIGNAL, session.pid, stop_reason_name(event.reason));
     if (event.reason == ker::abi::ptrace::stop_reason::INTERRUPT) {
         reply += "description:interrupted;";
+    }
+    if (event.reason == ker::abi::ptrace::stop_reason::EXCEPTION) {
+        reply += "description:fatal-exception;";
+        reply += exception_address_field(event);
     }
     if (event.reason == ker::abi::ptrace::stop_reason::WATCHPOINT && event.address != 0) {
         reply += std::format("watch:{:x};description:watchpoint;", event.address);
@@ -276,16 +332,17 @@ auto stop_reply(Session& session) -> std::string {
     return stop_reply_from_event(session, event);
 }
 
-auto get_gprs(Session& session, ker::abi::ptrace::X86_64GprState& gprs) -> bool {
+auto read_gprs_for_pid(uint64_t pid, ker::abi::ptrace::X86_64GprState& gprs) -> bool {
     ker::abi::ptrace::RegsetIo io{
         .kind = ker::abi::ptrace::regset::X86_64_GPR,
         .buffer = &gprs,
         .size = sizeof(gprs),
     };
-    int64_t const REGISTER_SET_RESULT =
-        ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::GETREGSET), session.pid, 0, reinterpret_cast<uint64_t>(&io));
+    int64_t const REGISTER_SET_RESULT = ptrace_call(ker::abi::ptrace::request::GETREGSET, pid, 0, reinterpret_cast<uint64_t>(&io));
     return REGISTER_SET_RESULT >= 0;
 }
+
+auto get_gprs(Session& session, ker::abi::ptrace::X86_64GprState& gprs) -> bool { return read_gprs_for_pid(session.pid, gprs); }
 
 auto set_gprs(Session& session, ker::abi::ptrace::X86_64GprState& gprs) -> bool {
     ker::abi::ptrace::RegsetIo io{
@@ -611,13 +668,48 @@ auto thread_is_alive(Session& session, std::string_view packet) -> std::string {
     return "E44";
 }
 
+auto event_from_wait_status(Session& session, int status, ker::abi::ptrace::Event& event) -> bool {
+    event = {};
+    event.tid = session.pid;
+
+    if (WIFEXITED(status)) {
+        event.reason = ker::abi::ptrace::stop_reason::EXIT;
+        event.signal = 0;
+        event.message = static_cast<uint64_t>(WEXITSTATUS(status));
+        session.tracing_active = false;
+        return true;
+    }
+    if (WIFSIGNALED(status)) {
+        event.reason = ker::abi::ptrace::stop_reason::EXIT;
+        event.signal = static_cast<uint32_t>(WTERMSIG(status));
+        event.message = event.signal;
+        session.tracing_active = false;
+        return true;
+    }
+    if (!WIFSTOPPED(status)) {
+        return false;
+    }
+    if (fetch_event(session, event)) {
+        return true;
+    }
+    {
+        event.reason = ker::abi::ptrace::stop_reason::SIGNAL;
+        event.signal = static_cast<uint32_t>(WSTOPSIG(status));
+        event.tid = session.pid;
+        return true;
+    }
+}
+
 auto wait_for_debug_event(Session& session, ker::abi::ptrace::Event& event) -> bool {
     int status = 0;
     pid_t const WAITED = waitpid(static_cast<pid_t>(session.pid), &status, WUNTRACED);
     if (WAITED < 0) {
         return false;
     }
-    return fetch_event(session, event);
+    if (event_from_wait_status(session, status, event)) {
+        return true;
+    }
+    return false;
 }
 
 auto poll_debug_event(Session& session, ker::abi::ptrace::Event& event) -> bool {
@@ -626,7 +718,10 @@ auto poll_debug_event(Session& session, ker::abi::ptrace::Event& event) -> bool 
     if (WAITED <= 0) {
         return false;
     }
-    return fetch_event(session, event);
+    if (event_from_wait_status(session, status, event)) {
+        return true;
+    }
+    return false;
 }
 
 auto find_breakpoint(Session& session, uint64_t address) -> SoftwareBreakpoint* {
@@ -839,8 +934,7 @@ auto single_step_one_instruction(Session& session, ker::abi::ptrace::Event& even
 }
 
 auto stop_for_internal_update(Session& session, ker::abi::ptrace::Event& event) -> bool {
-    int64_t const INTERRUPT_RESULT =
-        ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::INTERRUPT), session.pid, 0, 0);
+    int64_t const INTERRUPT_RESULT = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::INTERRUPT), session.pid, 0, 0);
     return INTERRUPT_RESULT >= 0 && wait_for_debug_event(session, event);
 }
 
@@ -933,17 +1027,21 @@ auto handle_packet(Session& session, std::string_view packet) -> std::string {
         return handle_vcont(session, packet);
     }
     if (packet.starts_with("qSupported")) {
-        return "PacketSize=1000;QStartNoAckMode+;qXfer:features:read+;qXfer:libraries-svr4:read+;qThreadStopInfo+;vContSupported+";
+        return "PacketSize=1000;QStartNoAckMode+;native-signals+;qXfer:features:read+;qXfer:libraries-svr4:read+;qThreadStopInfo+;"
+               "vContSupported+";
     }
     if (packet == "QStartNoAckMode") {
         session.no_ack = true;
+        return "OK";
+    }
+    if (packet == "qLaunchSuccess") {
         return "OK";
     }
     if (packet == "qHostInfo") {
         return "triple:x86_64-unknown-wos;endian:little;ptrsize:8;";
     }
     if (packet == "qAttached") {
-        return "1";
+        return session.attached ? "1" : "0";
     }
     if (packet == "qC") {
         return std::format("QC{:x}", session.pid);
@@ -1013,11 +1111,17 @@ auto handle_packet(Session& session, std::string_view packet) -> std::string {
         return thread_is_alive(session, packet);
     }
     if (packet == "k") {
-        (void)ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::KILL), session.pid, 0, 0);
+        if (session.tracing_active) {
+            (void)ptrace_call(ker::abi::ptrace::request::KILL, session.pid, 0, 0);
+            session.tracing_active = false;
+        }
         return "OK";
     }
     if (packet == "D") {
-        (void)ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::DETACH), session.pid, 0, 0);
+        if (session.tracing_active) {
+            (void)ptrace_call(ker::abi::ptrace::request::DETACH, session.pid, 0, 0);
+            session.tracing_active = false;
+        }
         return "OK";
     }
     return "";
@@ -1122,45 +1226,214 @@ auto listen_socket(uint16_t port) -> int {
     return FD;
 }
 
-void usage() { std::println("usage: debugserver --listen :PORT --attach PID"); }
+auto is_execve_entry(const ker::abi::ptrace::X86_64GprState& regs) -> bool {
+    return regs.rax == static_cast<uint64_t>(ker::abi::callnums::process) &&
+           regs.rdi == static_cast<uint64_t>(ker::abi::process::procmgmt_ops::EXECVE);
+}
+
+auto wait_for_traced_stop(uint64_t pid, int options, int& status) -> bool {
+    pid_t const WAITED = waitpid(static_cast<pid_t>(pid), &status, options);
+    if (WAITED < 0) {
+        std::perror("debugserver: waitpid");
+        return false;
+    }
+    if (WIFEXITED(status)) {
+        std::println(stderr, "debugserver: launched process exited with {}", WEXITSTATUS(status));
+        return false;
+    }
+    if (WIFSIGNALED(status)) {
+        std::println(stderr, "debugserver: launched process killed by signal {}", WTERMSIG(status));
+        return false;
+    }
+    return WIFSTOPPED(status);
+}
+
+auto launch_tracee(char** command_argv) -> int {
+    if (ptrace_call(ker::abi::ptrace::request::TRACEME, 0, 0, 0) < 0) {
+        std::perror("debugserver: PTRACE_TRACEME");
+        return 1;
+    }
+
+    int64_t const TARGET_RC =
+        ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_LOCAL | ker::process::WKI_TARGET_FLAG_NOINHERIT);
+    if (TARGET_RC < 0) {
+        std::println(stderr, "debugserver: failed to pin tracee locally: {}", static_cast<long long>(TARGET_RC));
+        return 1;
+    }
+
+    if (ker::process::kill(static_cast<int64_t>(ker::process::getpid()), SIGSTOP) != 0) {
+        std::perror("debugserver: SIGSTOP");
+        return 1;
+    }
+
+    execvp(command_argv[0], command_argv);
+    std::perror("debugserver: execvp");
+    return 127;
+}
+
+auto run_to_exec_start(uint64_t pid) -> bool {
+    bool pending_execve = false;
+
+    if (ptrace_call(ker::abi::ptrace::request::SYSCALL, pid, 0, 0) < 0) {
+        std::println(stderr, "debugserver: PTRACE_SYSCALL failed");
+        return false;
+    }
+
+    for (;;) {
+        int status = 0;
+        if (!wait_for_traced_stop(pid, 0, status)) {
+            return false;
+        }
+
+        ker::abi::ptrace::Event event{};
+        if (!fetch_event_for_pid(pid, event)) {
+            std::println(stderr, "debugserver: failed to read launch event");
+            return false;
+        }
+
+        if (event.reason == ker::abi::ptrace::stop_reason::SYSCALL_ENTER) {
+            ker::abi::ptrace::X86_64GprState regs{};
+            pending_execve = read_gprs_for_pid(pid, regs) && is_execve_entry(regs);
+        } else if (event.reason == ker::abi::ptrace::stop_reason::SYSCALL_EXIT) {
+            if (pending_execve) {
+                ker::abi::ptrace::X86_64GprState regs{};
+                if (!read_gprs_for_pid(pid, regs)) {
+                    std::println(stderr, "debugserver: failed to read execve result");
+                    return false;
+                }
+                pending_execve = false;
+                if (regs.rax == 0) {
+                    return true;
+                }
+            }
+        } else {
+            return true;
+        }
+
+        if (ptrace_call(ker::abi::ptrace::request::SYSCALL, pid, 0, 0) < 0) {
+            std::println(stderr, "debugserver: launch resume failed");
+            return false;
+        }
+    }
+}
+
+auto launch_process(char** command_argv, bool break_on_start, uint64_t& pid) -> bool {
+    pid_t const CHILD = fork();
+    if (CHILD < 0) {
+        std::perror("debugserver: fork");
+        return false;
+    }
+    if (CHILD == 0) {
+        _exit(launch_tracee(command_argv));
+    }
+
+    pid = static_cast<uint64_t>(CHILD);
+
+    int status = 0;
+    if (!wait_for_traced_stop(pid, WUNTRACED, status)) {
+        return false;
+    }
+
+    if (!break_on_start) {
+        return true;
+    }
+
+    return run_to_exec_start(pid);
+}
+
+auto parse_port(std::string_view text, uint16_t& port) -> bool {
+    size_t const COLON = text.rfind(':');
+    size_t const PORT_START = COLON == std::string_view::npos ? 0 : COLON + 1;
+    std::string_view const PORT_TEXT{text.data() + PORT_START, text.size() - PORT_START};
+    uint64_t parsed = 0;
+    if (!parse_decimal_u64(PORT_TEXT, UINT16_MAX, parsed)) {
+        return false;
+    }
+    port = static_cast<uint16_t>(parsed);
+    return true;
+}
+
+auto parse_pid(std::string_view text, uint64_t& pid) -> bool { return parse_decimal_u64(text, UINT64_MAX, pid) && pid != 0; }
+
+auto parse_args(int argc, char** argv, LaunchOptions& options) -> bool {
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view ARG = argv[i];
+        if (ARG == "--listen" && i + 1 < argc) {
+            if (!parse_port(argv[++i], options.port)) {
+                return false;
+            }
+        } else if (ARG == "--attach" && i + 1 < argc) {
+            if (options.command_argv != nullptr || !parse_pid(argv[++i], options.attach_pid)) {
+                return false;
+            }
+        } else if (ARG == "--break-on-start") {
+            options.break_on_start = true;
+        } else if (ARG == "--launch" && i + 1 < argc) {
+            if (options.attach_pid != 0 || options.command_argv != nullptr) {
+                return false;
+            }
+            options.command_argv = &argv[++i];
+            return true;
+        } else if (ARG == "--" && i + 1 < argc) {
+            if (options.attach_pid != 0 || options.command_argv != nullptr) {
+                return false;
+            }
+            options.command_argv = &argv[i + 1];
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    if ((options.attach_pid != 0) == (options.command_argv != nullptr)) {
+        return false;
+    }
+    return !options.break_on_start || options.command_argv != nullptr;
+}
+
+void usage() {
+    std::println("usage: debugserver --listen :PORT --attach PID");
+    std::println("       debugserver --listen :PORT [--break-on-start] --launch PROGRAM [ARGS...]");
+    std::println("       debugserver --listen :PORT [--break-on-start] -- PROGRAM [ARGS...]");
+}
 
 }  // namespace
 
 auto main(int argc, char** argv) -> int {
-    uint16_t port = DEFAULT_PORT;
-    uint64_t pid = 0;
-
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view ARG = argv[i];
-        if (ARG == "--listen" && i + 1 < argc) {
-            const std::string_view LISTEN = argv[++i];
-            size_t const COLON = LISTEN.rfind(':');
-            const std::string_view PORT_TEXT = COLON == std::string_view::npos ? LISTEN : LISTEN.substr(COLON + 1);
-            port = static_cast<uint16_t>(std::strtoul(std::string(PORT_TEXT).c_str(), nullptr, 10));
-        } else if (ARG == "--attach" && i + 1 < argc) {
-            pid = std::strtoull(argv[++i], nullptr, 10);
-        } else {
-            usage();
-            return 1;
-        }
-    }
-
-    if (pid == 0) {
+    LaunchOptions options{};
+    if (!parse_args(argc, argv, options)) {
         usage();
         return 1;
     }
-    int64_t const ATTACH_RET = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::ATTACH), pid, 0, 0);
-    if (ATTACH_RET < 0) {
-        std::println("debugserver: attach failed: {}", static_cast<long long>(ATTACH_RET));
+
+    uint64_t pid = options.attach_pid;
+    bool const ATTACHED = options.command_argv == nullptr;
+    if (ATTACHED) {
+        int64_t const ATTACH_RET = ptrace_call(ker::abi::ptrace::request::ATTACH, pid, 0, 0);
+        if (ATTACH_RET < 0) {
+            std::println("debugserver: attach failed: {}", static_cast<long long>(ATTACH_RET));
+            return 1;
+        }
+    } else if (!launch_process(options.command_argv, options.break_on_start, pid)) {
         return 1;
     }
 
-    int const SERVER = listen_socket(port);
+    int const SERVER = listen_socket(options.port);
     if (SERVER < 0) {
         std::println("debugserver: listen failed: errno={}", errno);
+        if (ATTACHED) {
+            (void)ptrace_call(ker::abi::ptrace::request::DETACH, pid, 0, 0);
+        } else {
+            (void)ptrace_call(ker::abi::ptrace::request::KILL, pid, 0, 0);
+        }
         return 1;
     }
-    std::println("debugserver: listening on :{} attached to pid {}", port, static_cast<unsigned long long>(pid));
+    if (ATTACHED) {
+        std::println("debugserver: listening on :{} attached to pid {}", options.port, static_cast<unsigned long long>(pid));
+    } else {
+        std::println("debugserver: listening on :{} launched pid {} ({})", options.port, static_cast<unsigned long long>(pid),
+                     options.command_argv[0]);
+    }
 
     sockaddr_in peer{};
     socklen_t peer_len = sizeof(peer);
@@ -1170,7 +1443,14 @@ auto main(int argc, char** argv) -> int {
         return 1;
     }
 
-    Session session{.fd = CLIENT, .pid = pid, .no_ack = false, .software_breakpoints = {}, .hardware_breakpoints = {}};
+    Session session{.fd = CLIENT,
+                    .pid = pid,
+                    .attached = ATTACHED,
+                    .tracing_active = true,
+                    .no_ack = false,
+                    .received_interrupt = false,
+                    .software_breakpoints = {},
+                    .hardware_breakpoints = {}};
     std::string packet;
     while (recv_packet(session, packet)) {
         const std::string REPLY = handle_packet(session, packet);
@@ -1179,12 +1459,14 @@ auto main(int argc, char** argv) -> int {
         }
     }
     close(CLIENT);
-    for (auto& bp : session.hardware_breakpoints) {
-        (void)apply_hardware_breakpoint(session, bp, false);
+    if (session.tracing_active) {
+        for (auto& bp : session.hardware_breakpoints) {
+            (void)apply_hardware_breakpoint(session, bp, false);
+        }
+        for (auto& bp : session.software_breakpoints) {
+            (void)uninstall_breakpoint(session, bp);
+        }
+        (void)ptrace_call(session.attached ? ker::abi::ptrace::request::DETACH : ker::abi::ptrace::request::KILL, pid, 0, 0);
     }
-    for (auto& bp : session.software_breakpoints) {
-        (void)uninstall_breakpoint(session, bp);
-    }
-    (void)ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::DETACH), pid, 0, 0);
     return 0;
 }
