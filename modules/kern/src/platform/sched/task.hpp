@@ -273,6 +273,7 @@ struct Task {
     bool ptrace_single_step = false;
     bool ptrace_syscall_trace = false;
     bool ptrace_syscall_in_stop = false;
+    bool ptrace_stop_uses_syscall_snapshot = false;
     cpu::GPRegs ptrace_syscall_regs{};
     gates::InterruptFrame ptrace_syscall_frame{};
 
@@ -299,9 +300,9 @@ struct Task {
     // Wait channel: human-readable string describing why the task is blocked.
     const char* wait_channel = nullptr;
 
-    // Owned futex waiter node while this task is blocked in futex_wait().
-    // Wake and exit cleanup atomically exchange this pointer to guarantee the
-    // waiter is detached and freed exactly once.
+    // Published futex waiter node while this task is blocked in futex_wait().
+    // Wake and abort/exit cleanup atomically clear this pointer; the path that
+    // removes the node from the futex table owns the final delete.
     std::atomic<void*> futex_waiter{nullptr};
 
     // Intrusive list pointer for wait queue and dead list (zero allocations).

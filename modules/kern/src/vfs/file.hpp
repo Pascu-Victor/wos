@@ -19,6 +19,14 @@ constexpr int O_TRUNC = 01000;
 constexpr int O_DIRECTORY = 0200000;
 // O_APPEND: writes always go to end of file (Linux value)
 constexpr int O_APPEND = 02000;
+// O_NOTIFY_CACHE_CHANGE: reserve file-cache invalidation notifications for this open.
+constexpr int O_NOTIFY_CACHE_CHANGE = 040000000;
+// O_NO_CACHE: bypass per-open and detached VFS/WKI file caches for this open.
+constexpr int O_NO_CACHE = 0100000000;
+// O_LOCAL: bypass task WKI VFS rerouting and resolve this open against the local namespace.
+constexpr int O_LOCAL = 0200000000;
+// O_ALWAYS_CACHE: trust detached file-cache contents until explicitly invalidated.
+constexpr int O_ALWAYS_CACHE = 0400000000;
 // FD_CLOEXEC: per-descriptor flag indicating close-on-exec
 constexpr int FD_CLOEXEC = 1;
 
@@ -49,6 +57,9 @@ struct File {
 
     // Optional VFS-core streamed-read cache attachment.
     void* stream_cache_attachment = nullptr;
+
+    // Optional VFS-core cache-notify attachment for O_NOTIFY_CACHE_CHANGE.
+    void* cache_notify_attachment = nullptr;
 
     // Hint for filesystem backends that this file is currently being serviced
     // through vfs_pread(), so sequential prefetch/read-ahead should be avoided.

@@ -1,15 +1,14 @@
 #include "gates.hpp"
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mod/io/serial/serial.hpp>
 #include <platform/dbg/coredump.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/debug/ptrace.hpp>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/task.hpp>
@@ -26,7 +25,6 @@
 #include "platform/asm/cpu.hpp"
 #include "platform/asm/msr.hpp"
 #include "platform/mm/paging.hpp"
-#include "platform/mm/phys.hpp"
 #include "platform/perf/perf_events.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "util/hcf.hpp"
@@ -65,12 +63,7 @@ uint8_t next_alloc_vector = DYNAMIC_VECTOR_BEGIN;
     return (addr >= HHDM_BEGIN && addr < HHDM_END) || (addr >= KERNEL_STATIC_BEGIN && addr < KERNEL_STATIC_END);
 }
 
-[[nodiscard]] constexpr auto page_table_index(uint64_t vaddr, uint8_t shift) -> size_t {
-    return static_cast<size_t>((vaddr >> shift) & 0x1FFU);
-}
-
 void log_userfault_lazy_vmem_ranges(ker::mod::sched::task::Task* task, uint64_t cr2) {
-    constexpr size_t MAX_LOGGED_RANGES = 24;
     if (task == nullptr) {
         return;
     }
@@ -85,13 +78,18 @@ void log_userfault_lazy_vmem_ranges(ker::mod::sched::task::Task* task, uint64_t 
     journal::warn(" userfault lazy_vmem: ranges=%llu cr2=0x%lx shadow_app=0x%lx", static_cast<unsigned long long>(RANGE_COUNT), cr2,
                   HAS_SHADOW_APP ? shadow_app : 0UL);
 
-    size_t const LOG_COUNT = RANGE_COUNT < MAX_LOGGED_RANGES ? RANGE_COUNT : MAX_LOGGED_RANGES;
-    for (size_t i = 0; i < LOG_COUNT; ++i) {
+    for (size_t i = 0; i < RANGE_COUNT; ++i) {
         auto const& range = task->lazy_vmem_ranges.at(i);
         bool const CONTAINS = cr2 >= range.start && cr2 < range.end;
-        journal::warn("  lazy[%llu]: [0x%lx, 0x%lx) prot=0x%lx flags=0x%lx contains=%u", static_cast<unsigned long long>(i), range.start,
-                      range.end, range.prot, range.flags, CONTAINS ? 1U : 0U);
+        if (!CONTAINS) {
+            continue;
+        }
+        journal::warn("  lazy_hit[%llu]: [0x%lx, 0x%lx) prot=0x%lx flags=0x%lx", static_cast<unsigned long long>(i), range.start, range.end,
+                      range.prot, range.flags);
+        return;
     }
+
+    journal::warn("  lazy_hit: <none>");
 }
 
 auto load_u64_unaligned(const void* ptr) -> uint64_t {
@@ -173,38 +171,6 @@ void dump_stack_owner(const char* label, uint64_t rsp) {
     }
 }
 
-auto lookup_user_pte(ker::mod::mm::paging::PageTable* pagemap, uint64_t vaddr) -> const ker::mod::mm::paging::PageTableEntry* {
-    if (pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
-        return nullptr;
-    }
-
-    const auto IDX4 = page_table_index(vaddr, 39);
-    const auto IDX3 = page_table_index(vaddr, 30);
-    const auto IDX2 = page_table_index(vaddr, 21);
-    const auto IDX1 = page_table_index(vaddr, 12);
-
-    if (!pagemap->entries.at(IDX4).present) {
-        return nullptr;
-    }
-    auto* pml3 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
-        ker::mod::mm::addr::get_virt_pointer(pagemap->entries.at(IDX4).frame << ker::mod::mm::paging::PAGE_SHIFT));
-    if (!pml3->entries.at(IDX3).present) {
-        return nullptr;
-    }
-    auto* pml2 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
-        ker::mod::mm::addr::get_virt_pointer(pml3->entries.at(IDX3).frame << ker::mod::mm::paging::PAGE_SHIFT));
-    if (!pml2->entries.at(IDX2).present) {
-        return nullptr;
-    }
-    auto* pml1 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
-        ker::mod::mm::addr::get_virt_pointer(pml2->entries.at(IDX2).frame << ker::mod::mm::paging::PAGE_SHIFT));
-    if (!pml1->entries.at(IDX1).present) {
-        return nullptr;
-    }
-
-    return &pml1->entries.at(IDX1);
-}
-
 auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
     // Page fault handler - handles COW faults and user-space segfaults.
     // This MUST run before the panic ownership CAS below, because page faults
@@ -257,6 +223,12 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
             return;
         }
 
+        auto const FATAL_SIGNAL = static_cast<uint32_t>(signal_for_user_exception(frame.int_num));
+        uint64_t const FATAL_ADDRESS = frame.int_num == 14 ? cr2 : frame.rip;
+        if (ker::mod::debug::ptrace::report_user_exception_stop(gpr, frame, FATAL_SIGNAL, FATAL_ADDRESS, frame.int_num)) {
+            return;
+        }
+
         auto* current_task_for_dump = ker::mod::sched::get_current_task();
 
         // DEBUG: Log detailed info about the mismatch between currentTask and CR3
@@ -276,88 +248,10 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
             journal::warn("Userspace page fault: cr2=0x%lx err=%d rip=0x%lx rsp=0x%lx pid=%d", cr2, frame.err_code, frame.rip, frame.rsp,
                           (ker::mod::sched::get_current_task() != nullptr) ? ker::mod::sched::get_current_task()->pid : 0);
             if (current_task_for_dump != nullptr) {
-                bool ret_slot_matches_rip = false;
                 journal::warn(" task_ctx: saved_rip=0x%lx saved_rsp=0x%lx entry=0x%lx thread=%p scratch=%p",
                               current_task_for_dump->context.frame.rip, current_task_for_dump->context.frame.rsp,
                               current_task_for_dump->entry, current_task_for_dump->thread,
                               reinterpret_cast<void*>(current_task_for_dump->context.syscall_scratch_area));
-                if (current_task_for_dump->pagemap != nullptr) {
-                    const uint64_t RSP_PHYS = ker::mod::mm::virt::translate(current_task_for_dump->pagemap, frame.rsp);
-                    const uint64_t RET_SLOT_VA = (frame.rsp >= sizeof(uint64_t)) ? (frame.rsp - sizeof(uint64_t)) : frame.rsp;
-                    const uint64_t RET_SLOT_PHYS = ker::mod::mm::virt::translate(current_task_for_dump->pagemap, RET_SLOT_VA);
-
-                    if (RET_SLOT_PHYS != ker::mod::mm::virt::PADDR_INVALID && RET_SLOT_PHYS != 0) {
-                        const auto* ret_slot = reinterpret_cast<const uint64_t*>(ker::mod::mm::addr::get_virt_pointer(RET_SLOT_PHYS));
-                        ret_slot_matches_rip = ret_slot[0] == frame.rip;
-                        journal::warn(" fault_ret_slot_va=0x%lx phys=0x%lx q_m1=0x%lx rip_match=%d", RET_SLOT_VA, RET_SLOT_PHYS,
-                                      ret_slot[0], ret_slot_matches_rip ? 1 : 0);
-                    } else {
-                        journal::warn(" fault_ret_slot_va=0x%lx phys=0x0 (unmapped)", RET_SLOT_VA);
-                    }
-
-                    if (RSP_PHYS != ker::mod::mm::virt::PADDR_INVALID && RSP_PHYS != 0) {
-                        const auto* stack_words = reinterpret_cast<const uint64_t*>(ker::mod::mm::addr::get_virt_pointer(RSP_PHYS));
-                        const uint64_t PAGE_OFF = frame.rsp & (ker::mod::mm::paging::PAGE_SIZE - 1);
-                        size_t words_available = (ker::mod::mm::paging::PAGE_SIZE - PAGE_OFF) / sizeof(uint64_t);
-                        words_available = std::min<size_t>(words_available, 4);
-                        const uint64_t Q0 = (words_available > 0) ? stack_words[0] : 0;
-                        const uint64_t Q1 = (words_available > 1) ? stack_words[1] : 0;
-                        const uint64_t Q2 = (words_available > 2) ? stack_words[2] : 0;
-                        const uint64_t Q3 = (words_available > 3) ? stack_words[3] : 0;
-                        journal::warn(" fault_rsp_phys=0x%lx stack_qwords=%zu q0=0x%lx q1=0x%lx q2=0x%lx q3=0x%lx", RSP_PHYS,
-                                      words_available, Q0, Q1, Q2, Q3);
-                    } else {
-                        journal::warn(" fault_rsp_phys=0x0 (unmapped)");
-                    }
-
-                    if (const auto* stack_pte = lookup_user_pte(current_task_for_dump->pagemap, frame.rsp); stack_pte != nullptr) {
-                        const uint64_t STACK_PAGE_PHYS = static_cast<uint64_t>(stack_pte->frame) << ker::mod::mm::paging::PAGE_SHIFT;
-                        uint64_t stack_pte_raw = 0;
-                        __builtin_memcpy(&stack_pte_raw, stack_pte, sizeof(stack_pte_raw));
-                        const bool STACK_COW = (stack_pte_raw & ker::mod::mm::paging::PAGE_COW) != 0U;
-                        const auto STACK_REF = ker::mod::mm::phys::page_ref_get(
-                            reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(STACK_PAGE_PHYS)));
-                        journal::warn(" stack_pte: vaddr=0x%lx phys=0x%lx user=%u rw=%u nx=%u cow=%u ref=%llu",
-                                      frame.rsp & ~(ker::mod::mm::paging::PAGE_SIZE - 1), STACK_PAGE_PHYS, stack_pte->user,
-                                      stack_pte->writable, stack_pte->no_execute, STACK_COW ? 1U : 0U,
-                                      static_cast<unsigned long long>(STACK_REF));
-
-                        if (ret_slot_matches_rip) {
-                            ker::mod::mm::virt::debug_log_user_phys_mappings(STACK_PAGE_PHYS, "userfault-stack-ret",
-                                                                             current_task_for_dump->pid, current_task_for_dump->name, true);
-                        }
-                    } else {
-                        journal::warn(" stack_pte: vaddr=0x%lx unmapped", frame.rsp & ~(ker::mod::mm::paging::PAGE_SIZE - 1));
-                    }
-                }
-            }
-
-            auto* pml4 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(ker::mod::mm::addr::get_virt_pointer(cr3 & ~0xFFF));
-            const auto IDX4 = page_table_index(cr2, 39);
-            const auto IDX3 = page_table_index(cr2, 30);
-            const auto IDX2 = page_table_index(cr2, 21);
-            const auto IDX1 = page_table_index(cr2, 12);
-
-            const auto& pml4e = pml4->entries.at(IDX4);
-            journal::warn("PML4[%d]: present=%d frame=0x%lx", IDX4, pml4e.present, pml4e.frame);
-            if (pml4e.present) {
-                auto* pml3 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
-                    ker::mod::mm::addr::get_virt_pointer(pml4e.frame << ker::mod::mm::paging::PAGE_SHIFT));
-                const auto& pml3e = pml3->entries.at(IDX3);
-                journal::warn(" PML3[%d]: present=%d frame=0x%lx", IDX3, pml3e.present, pml3e.frame);
-                if (pml3e.present) {
-                    auto* pml2 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
-                        ker::mod::mm::addr::get_virt_pointer(pml3e.frame << ker::mod::mm::paging::PAGE_SHIFT));
-                    const auto& pml2e = pml2->entries.at(IDX2);
-                    journal::warn("  PML2[%d]: present=%d frame=0x%lx", IDX2, pml2e.present, pml2e.frame);
-                    if (pml2e.present) {
-                        auto* pml1 = reinterpret_cast<ker::mod::mm::paging::PageTable*>(
-                            ker::mod::mm::addr::get_virt_pointer(pml2e.frame << ker::mod::mm::paging::PAGE_SHIFT));
-                        const auto& pml1e = pml1->entries.at(IDX1);
-                        journal::warn("   PML1[%d]: present=%d frame=0x%lx user=%d rw=%d nx=%d", IDX1, pml1e.present, pml1e.frame,
-                                      pml1e.user, pml1e.writable, pml1e.no_execute);
-                    }
-                }
             }
 
             ker::syscall::process::wos_proc_exit_signal(11);

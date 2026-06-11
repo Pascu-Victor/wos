@@ -76,7 +76,7 @@ struct DevServerBinding {
     uint8_t* vfs_rdma_read_staging_buf = nullptr;
     uint32_t vfs_rdma_read_staging_rkey = 0;
 
-    // VFS bulk staging (RoCE pull mode): 2 MB staging region for OP_VFS_READ_BULK pull mode.
+    // VFS bulk staging (RoCE pull mode): transport-sized staging region for OP_VFS_READ_BULK pull mode.
     uint8_t* vfs_rdma_bulk_staging_buf = nullptr;
     uint32_t vfs_rdma_bulk_staging_rkey = 0;
 
@@ -217,6 +217,8 @@ auto wki_dev_server_get_vfs_write_region(uint16_t consumer_node, uint16_t channe
 // duplicate control retransmits carrying the same request cookie.
 void wki_dev_server_complete_vfs_write(uint16_t consumer_node, uint16_t channel_id, uint16_t req_cookie, int16_t status,
                                        uint32_t bytes_written);
+
+void wki_dev_server_send_vfs_notify(uint32_t resource_id, uint16_t op_id, const uint8_t* data, uint16_t data_len);
 
 // Look up the server-side VFS read staging buffer (RoCE pull mode).
 // Returns nullptr if pull mode is not active for this binding.

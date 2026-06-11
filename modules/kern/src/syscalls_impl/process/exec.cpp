@@ -1082,7 +1082,11 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         LocalProcStage const LOAD_INTERP_STAGE =
             begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, 0, WOS_PERF_CALLSITE());
 
-        int const INTERP_FD = vfs::vfs_open(std::string_view(INTERP_PATH, std::strlen(INTERP_PATH)), 0, 0);
+        int interp_open_flags = vfs::O_NOTIFY_CACHE_CHANGE;
+        if (task->wki_submitter_hostname.front() == '\0') {
+            interp_open_flags |= vfs::O_LOCAL;
+        }
+        int const INTERP_FD = vfs::vfs_open(std::string_view(INTERP_PATH, std::strlen(INTERP_PATH)), interp_open_flags, 0);
         if (INTERP_FD < 0) {
             dbg::log("wos_proc_execve: Failed to open interpreter '%s'", INTERP_PATH);
             end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -ENOEXEC, 0, WOS_PERF_CALLSITE());

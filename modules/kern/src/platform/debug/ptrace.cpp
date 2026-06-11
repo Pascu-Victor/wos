@@ -39,6 +39,7 @@ constexpr uint64_t X86_DR7_SLOT_CONTROL_MASK = 0xf;
 constexpr uint64_t X86_DR7_RW_MASK = 0x3;
 constexpr uint64_t X86_DR7_RESERVED_ONES = 1ULL << 10;
 constexpr uint64_t PTRACE_O_TRACESYSGOOD = 0x00000001;
+constexpr uint32_t WOS_SIGSYS = 31;
 
 auto as_error(int err) -> uint64_t { return static_cast<uint64_t>(-err); }
 
@@ -117,8 +118,58 @@ auto copy_task_memory(Task& target, uint64_t target_addr, void* user_buffer, siz
     return done == len ? 0 : as_error(EFAULT);
 }
 
+auto is_user_canonical(uint64_t value) -> bool { return value != 0 && value < 0x0000'8000'0000'0000ULL; }
+
+auto uses_stop_snapshot(const Task& target) -> bool {
+    return target.ptrace_stopped && (is_syscall_stop(target.ptrace_stop_reason) || target.ptrace_stop_uses_syscall_snapshot);
+}
+
+auto syscall_scratch(Task& target) -> ker::mod::cpu::PerCpu* {
+    if (target.context.syscall_scratch_area == 0) {
+        return nullptr;
+    }
+    return reinterpret_cast<ker::mod::cpu::PerCpu*>(target.context.syscall_scratch_area);
+}
+
+auto publish_stop_snapshot_to_syscall_scratch(Task& target) -> bool {
+    auto* scratch = syscall_scratch(target);
+    if (scratch == nullptr) {
+        return false;
+    }
+    scratch->user_rsp = target.ptrace_syscall_frame.rsp;
+    scratch->syscall_ret_rip = target.ptrace_syscall_frame.rip;
+    scratch->syscall_ret_flags = target.ptrace_syscall_frame.flags;
+    return true;
+}
+
+auto capture_async_syscall_return_snapshot(Task& target) -> bool {
+    target.ptrace_stop_uses_syscall_snapshot = false;
+    if (target.type != ker::mod::sched::task::TaskType::PROCESS || (target.context.frame.cs & 0x3U) == 3) {
+        return false;
+    }
+
+    auto* scratch = syscall_scratch(target);
+    if (scratch == nullptr || !is_user_canonical(scratch->syscall_ret_rip) || !is_user_canonical(scratch->user_rsp) ||
+        (scratch->syscall_ret_flags & 0x2ULL) == 0) {
+        return false;
+    }
+
+    target.ptrace_syscall_regs = target.context.regs;
+    target.ptrace_syscall_regs.rcx = scratch->syscall_ret_rip;
+    target.ptrace_syscall_regs.r11 = scratch->syscall_ret_flags;
+    target.ptrace_syscall_frame.int_num = 0;
+    target.ptrace_syscall_frame.err_code = 0;
+    target.ptrace_syscall_frame.rip = scratch->syscall_ret_rip;
+    target.ptrace_syscall_frame.cs = ker::mod::desc::gdt::GDT_USER_CS;
+    target.ptrace_syscall_frame.flags = scratch->syscall_ret_flags;
+    target.ptrace_syscall_frame.rsp = scratch->user_rsp;
+    target.ptrace_syscall_frame.ss = ker::mod::desc::gdt::GDT_USER_DS;
+    target.ptrace_stop_uses_syscall_snapshot = true;
+    return true;
+}
+
 auto fill_gprs(Task& target, abi::ptrace::X86_64GprState& out) -> void {
-    bool const USE_SYSCALL_SNAPSHOT = target.ptrace_stopped && is_syscall_stop(target.ptrace_stop_reason);
+    bool const USE_SYSCALL_SNAPSHOT = uses_stop_snapshot(target);
     const auto& regs = USE_SYSCALL_SNAPSHOT ? target.ptrace_syscall_regs : target.context.regs;
     const auto& frame = USE_SYSCALL_SNAPSHOT ? target.ptrace_syscall_frame : target.context.frame;
     out.rax = regs.rax;
@@ -146,7 +197,7 @@ auto fill_gprs(Task& target, abi::ptrace::X86_64GprState& out) -> void {
 }
 
 auto set_gprs(Task& target, const abi::ptrace::X86_64GprState& in) -> void {
-    bool const USE_SYSCALL_SNAPSHOT = target.ptrace_stopped && is_syscall_stop(target.ptrace_stop_reason);
+    bool const USE_SYSCALL_SNAPSHOT = uses_stop_snapshot(target);
     auto& regs = USE_SYSCALL_SNAPSHOT ? target.ptrace_syscall_regs : target.context.regs;
     auto& frame = USE_SYSCALL_SNAPSHOT ? target.ptrace_syscall_frame : target.context.frame;
     regs.rax = in.rax;
@@ -171,6 +222,22 @@ auto set_gprs(Task& target, const abi::ptrace::X86_64GprState& in) -> void {
         target.thread->fsbase = in.fs_base;
         target.thread->gsbase = in.gs_base;
     }
+    if (USE_SYSCALL_SNAPSHOT) {
+        (void)publish_stop_snapshot_to_syscall_scratch(target);
+    }
+}
+
+auto user_resume_frame_for_step(Task& target) -> ker::mod::gates::InterruptFrame* {
+    if (!target.ptrace_stopped) {
+        return nullptr;
+    }
+    auto* frame = uses_stop_snapshot(target) ? &target.ptrace_syscall_frame : &target.context.frame;
+    return (frame->cs & 0x3U) == 3 ? frame : nullptr;
+}
+
+void clear_task_trap_flags(Task& target) {
+    target.context.frame.flags &= ~X86_RFLAGS_TF;
+    target.ptrace_syscall_frame.flags &= ~X86_RFLAGS_TF;
 }
 
 void complete_trace_wait(Task& tracer, Task& stopped) {
@@ -222,12 +289,14 @@ auto record_signal_stop(Task& stopped, uint32_t signal) -> bool {
     stopped.ptrace_stop_pending = true;
     stopped.ptrace_single_step = false;
     stopped.wait_channel = "ptrace";
+    stopped.ptrace_stop_uses_syscall_snapshot = false;
 
     auto* current = ker::mod::sched::get_current_task();
     if (current == &stopped) {
         stopped.deferred_task_switch = true;
     } else {
         ker::mod::sched::debug_stop_task(&stopped);
+        (void)capture_async_syscall_return_snapshot(stopped);
     }
 
     wake_tracer_for_stop(stopped);
@@ -265,9 +334,11 @@ auto attach(Task& tracer, Task& target, bool seize) -> uint64_t {
     target.ptrace_stop_signal = seize ? 0 : SIGSTOP;
     target.ptrace_stopped = !seize;
     target.ptrace_stop_pending = !seize;
+    target.ptrace_stop_uses_syscall_snapshot = false;
     target.wait_channel = target.ptrace_stopped ? "ptrace" : target.wait_channel;
     if (target.ptrace_stopped) {
         ker::mod::sched::debug_stop_task(&target);
+        (void)capture_async_syscall_return_snapshot(target);
         wake_tracer_for_stop(target);
     }
     log::debug("trace attach tracer=%lu target=%lu seize=%u", tracer.pid, target.pid, seize ? 1U : 0U);
@@ -278,6 +349,9 @@ auto detach(Task& tracer, Task& target) -> uint64_t {
     uint64_t const ERR = require_traced(tracer, target);
     if (ERR != 0) {
         return ERR;
+    }
+    if (uses_stop_snapshot(target)) {
+        (void)publish_stop_snapshot_to_syscall_scratch(target);
     }
     target.ptrace_traced = false;
     target.ptrace_tracer_pid = 0;
@@ -290,10 +364,11 @@ auto detach(Task& tracer, Task& target) -> uint64_t {
     target.ptrace_single_step = false;
     target.ptrace_syscall_trace = false;
     target.ptrace_syscall_in_stop = false;
+    target.ptrace_stop_uses_syscall_snapshot = false;
     target.ptrace_dr_addr = {};
     target.ptrace_dr6 = 0;
     target.ptrace_dr7 = 0;
-    target.context.frame.flags &= ~X86_RFLAGS_TF;
+    clear_task_trap_flags(target);
     if (target.wait_channel != nullptr && std::strcmp(target.wait_channel, "ptrace") == 0) {
         target.wait_channel = nullptr;
     }
@@ -647,20 +722,26 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
                 target->ptrace_single_step = false;
                 target->ptrace_syscall_trace = false;
                 target->ptrace_syscall_in_stop = false;
-                target->context.frame.flags &= ~X86_RFLAGS_TF;
+                target->ptrace_stop_uses_syscall_snapshot = false;
+                clear_task_trap_flags(*target);
                 ker::mod::sched::reschedule_task_for_cpu(target->cpu, target);
             }
             break;
         case abi::ptrace::request::CONT:
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
+                bool const USE_STOP_SNAPSHOT = uses_stop_snapshot(*target);
                 bool const WAS_STOPPED = target->ptrace_stopped;
                 target->ptrace_stopped = false;
                 target->ptrace_stop_pending = false;
                 target->ptrace_single_step = false;
                 target->ptrace_syscall_trace = false;
                 target->ptrace_syscall_in_stop = false;
-                target->context.frame.flags &= ~X86_RFLAGS_TF;
+                clear_task_trap_flags(*target);
+                if (USE_STOP_SNAPSHOT) {
+                    (void)publish_stop_snapshot_to_syscall_scratch(*target);
+                }
+                target->ptrace_stop_uses_syscall_snapshot = false;
                 if (WAS_STOPPED) {
                     ker::mod::sched::reschedule_task_for_cpu(target->cpu, target);
                 }
@@ -669,13 +750,24 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
         case abi::ptrace::request::SINGLESTEP:
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
+                auto* step_frame = user_resume_frame_for_step(*target);
+                if (step_frame == nullptr) {
+                    ret = as_error(EIO);
+                    break;
+                }
+                bool const USE_STOP_SNAPSHOT = uses_stop_snapshot(*target);
                 bool const WAS_STOPPED = target->ptrace_stopped;
                 target->ptrace_stopped = false;
                 target->ptrace_stop_pending = false;
                 target->ptrace_single_step = true;
                 target->ptrace_syscall_trace = false;
                 target->ptrace_syscall_in_stop = false;
-                target->context.frame.flags |= X86_RFLAGS_TF;
+                clear_task_trap_flags(*target);
+                step_frame->flags |= X86_RFLAGS_TF;
+                if (USE_STOP_SNAPSHOT) {
+                    (void)publish_stop_snapshot_to_syscall_scratch(*target);
+                }
+                target->ptrace_stop_uses_syscall_snapshot = false;
                 if (WAS_STOPPED) {
                     ker::mod::sched::reschedule_task_for_cpu(target->cpu, target);
                 }
@@ -684,6 +776,7 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
         case abi::ptrace::request::SYSCALL:
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
+                bool const USE_STOP_SNAPSHOT = uses_stop_snapshot(*target);
                 bool const WAS_STOPPED = target->ptrace_stopped;
                 target->ptrace_stopped = false;
                 target->ptrace_stop_pending = false;
@@ -692,7 +785,11 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
                 if (target->ptrace_stop_reason != abi::ptrace::stop_reason::SYSCALL_ENTER) {
                     target->ptrace_syscall_in_stop = false;
                 }
-                target->context.frame.flags &= ~X86_RFLAGS_TF;
+                clear_task_trap_flags(*target);
+                if (USE_STOP_SNAPSHOT) {
+                    (void)publish_stop_snapshot_to_syscall_scratch(*target);
+                }
+                target->ptrace_stop_uses_syscall_snapshot = false;
                 if (WAS_STOPPED) {
                     ker::mod::sched::reschedule_task_for_cpu(target->cpu, target);
                 }
@@ -705,8 +802,10 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
                 target->ptrace_stop_signal = SIGSTOP;
                 target->ptrace_stopped = true;
                 target->ptrace_stop_pending = true;
+                target->ptrace_stop_uses_syscall_snapshot = false;
                 target->wait_channel = "ptrace";
                 ker::mod::sched::debug_stop_task(target);
+                (void)capture_async_syscall_return_snapshot(*target);
                 wake_tracer_for_stop(*target);
             }
             break;
@@ -828,21 +927,21 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
     return ret;
 }
 
-auto report_user_stop(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame, abi::ptrace::stop_reason reason, uint32_t signal,
-                      uint64_t address) -> bool {
+namespace {
+
+auto report_user_stop_common(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame, abi::ptrace::stop_reason reason,
+                             uint32_t signal, uint64_t address, uint64_t message) -> bool {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr || !task->ptrace_traced) {
         return false;
     }
 
     bool const SOFTWARE_BREAKPOINT = reason == abi::ptrace::stop_reason::BREAKPOINT;
-    uint64_t const RAW_DEBUG_STATUS = address;
-    decode_debug_register_stop(*task, RAW_DEBUG_STATUS, reason, address);
-    if (SOFTWARE_BREAKPOINT) {
-        task->ptrace_dr6 = 0;
-    } else {
-        task->ptrace_dr6 = RAW_DEBUG_STATUS;
+    uint64_t const RAW_DEBUG_STATUS = message;
+    if (reason == abi::ptrace::stop_reason::TRACE) {
+        decode_debug_register_stop(*task, RAW_DEBUG_STATUS, reason, address);
     }
+    task->ptrace_dr6 = reason == abi::ptrace::stop_reason::TRACE ? RAW_DEBUG_STATUS : 0;
 
     if (SOFTWARE_BREAKPOINT && frame.rip > 0) {
         --frame.rip;
@@ -854,15 +953,28 @@ auto report_user_stop(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFram
     task->ptrace_stop_reason = reason;
     task->ptrace_stop_signal = signal;
     task->ptrace_stop_address = address;
-    task->ptrace_event_msg = RAW_DEBUG_STATUS;
+    task->ptrace_event_msg = message;
     task->ptrace_stopped = true;
     task->ptrace_stop_pending = true;
     task->ptrace_single_step = false;
-    task->context.frame.flags &= ~X86_RFLAGS_TF;
+    task->ptrace_stop_uses_syscall_snapshot = false;
+    clear_task_trap_flags(*task);
     task->wait_channel = "ptrace";
     ker::mod::sched::place_task_in_wait_queue(gpr, frame);
     wake_tracer_for_stop(*task);
     return true;
+}
+
+}  // namespace
+
+auto report_user_stop(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame, abi::ptrace::stop_reason reason, uint32_t signal,
+                      uint64_t address) -> bool {
+    return report_user_stop_common(gpr, frame, reason, signal, address, address);
+}
+
+auto report_user_exception_stop(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame, uint32_t signal, uint64_t address,
+                                uint64_t message) -> bool {
+    return report_user_stop_common(gpr, frame, abi::ptrace::stop_reason::EXCEPTION, signal, address, message);
 }
 
 auto report_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum, bool exiting) -> bool {
@@ -891,6 +1003,33 @@ auto report_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum, bool exit
     task->ptrace_event_msg = callnum;
     task->ptrace_stopped = true;
     task->ptrace_stop_pending = true;
+    task->ptrace_stop_uses_syscall_snapshot = false;
+    task->wait_channel = "ptrace";
+    wake_tracer_for_stop(*task);
+
+    while (task->ptrace_stopped) {
+        ker::mod::sched::kern_yield();
+    }
+    restore_syscall_stop_context(*task, gpr);
+    return true;
+}
+
+auto report_fatal_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum) -> bool {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr || !task->ptrace_traced) {
+        return false;
+    }
+
+    capture_syscall_stop_context(*task, gpr);
+    task->ptrace_stop_reason = abi::ptrace::stop_reason::EXCEPTION;
+    task->ptrace_stop_signal = WOS_SIGSYS;
+    task->ptrace_stop_address = callnum;
+    task->ptrace_event_msg = callnum;
+    task->ptrace_stopped = true;
+    task->ptrace_stop_pending = true;
+    task->ptrace_single_step = false;
+    task->ptrace_syscall_in_stop = false;
+    task->ptrace_stop_uses_syscall_snapshot = false;
     task->wait_channel = "ptrace";
     wake_tracer_for_stop(*task);
 

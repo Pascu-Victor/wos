@@ -8,6 +8,8 @@ enum class sys_log_ops : uint64_t {
     LOG,
     LOG_LINE,
     LOG_EX,
+    LOG_BLOCK_BEGIN,
+    LOG_BLOCK_END,
 };
 
 enum class sys_log_device : uint64_t {

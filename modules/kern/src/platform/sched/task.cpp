@@ -3,9 +3,12 @@
 #include <bits/off_t.h>
 #include <bits/ssize_t.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <deque>
 #include <iterator>
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/elf_loader.hpp>
@@ -13,7 +16,10 @@
 #include <platform/mm/mm.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/sched/scheduler.hpp>
+#include <platform/sys/mutex.hpp>
 #include <vfs/file.hpp>
+#include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
 #include "platform/asm/cpu.hpp"
@@ -27,15 +33,160 @@ extern "C" void wos_kernel_thread_trampoline();  // NOLINT(readability-identifie
 namespace ker::mod::sched::task {
 namespace {
 
+struct BootFileCacheEntry {
+    std::array<char, 512> path = {};
+    ker::vfs::Stat freshness = {};
+    uint8_t* buffer = nullptr;
+    size_t size = 0;
+    uint64_t last_used = 0;
+};
+
+constexpr size_t BOOT_FILE_CACHE_MAX_ENTRIES = 4;
+
+std::deque<BootFileCacheEntry> g_boot_file_cache;
+ker::mod::sys::Mutex g_boot_file_cache_lock;
+std::atomic<uint64_t> g_boot_file_cache_clock{0};
+
+auto boot_file_stat_has_freshness(const ker::vfs::Stat& st) -> bool {
+    // Some remote VFS stat paths do not provide a rich freshness tuple on
+    // every mount/backend combination. Allow caching as long as size is known;
+    // the full observed stat tuple still participates in equality checks.
+    return st.st_size > 0;
+}
+
+auto boot_file_freshness_matches(const ker::vfs::Stat& lhs, const ker::vfs::Stat& rhs) -> bool {
+    return lhs.st_size > 0 && lhs.st_size == rhs.st_size;
+}
+
+auto boot_file_path_matches(const BootFileCacheEntry& entry, const char* path) -> bool {
+    if (path == nullptr) {
+        return false;
+    }
+
+    size_t const ENTRY_LEN = std::strlen(entry.path.data());
+    size_t const PATH_LEN = std::strlen(path);
+    return ENTRY_LEN == PATH_LEN && std::strncmp(entry.path.data(), path, PATH_LEN) == 0;
+}
+
+void build_boot_file_cache_key(const char* submitter, const char* path, char* out, size_t out_size) {
+    if (out == nullptr || out_size == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+    char const* const CACHE_SUBMITTER = (submitter != nullptr && submitter[0] != '\0') ? submitter : "-";
+    char const* const CACHE_PATH = (path != nullptr) ? path : "";
+    std::snprintf(out, out_size, "%s:%s", CACHE_SUBMITTER, CACHE_PATH);
+}
+
+auto boot_file_is_dynamic_loader(const char* path) -> bool {
+    if (path == nullptr || path[0] == '\0') {
+        return false;
+    }
+
+    char const* name = path;
+    for (char const* cursor = path; *cursor != '\0'; ++cursor) {
+        if (*cursor == '/') {
+            name = cursor + 1;
+        }
+    }
+    return std::strcmp(name, "ld.so") == 0;
+}
+
+auto boot_file_open_flags(const char* path, bool has_remote_submitter_identity) -> int {
+    int flags = ker::vfs::O_NOTIFY_CACHE_CHANGE;
+    if (!has_remote_submitter_identity && boot_file_is_dynamic_loader(path)) {
+        flags |= ker::vfs::O_LOCAL;
+    }
+    return flags;
+}
+
+auto boot_file_cache_lookup_copy(const char* path, const ker::vfs::Stat& freshness, uint8_t** out_buf, size_t* out_size) -> bool {
+    if (path == nullptr || out_buf == nullptr || out_size == nullptr) {
+        return false;
+    }
+
+    g_boot_file_cache_lock.lock();
+#ifdef TASK_LDSO_CACHE_DEBUG
+    dbg::log("boot_file_cache: probe key='%s' entries=%zu req_size=%ld", path, g_boot_file_cache.size(),
+             static_cast<long>(freshness.st_size));
+    size_t entry_index = 0;
+#endif
+    for (auto& entry : g_boot_file_cache) {
+        bool const PATH_MATCH = boot_file_path_matches(entry, path);
+        bool const FRESHNESS_MATCH = boot_file_freshness_matches(entry.freshness, freshness);
+#ifdef TASK_LDSO_CACHE_DEBUG
+        dbg::log("boot_file_cache: entry[%zu] key='%s' buf=%p size=%zu st_size=%ld path_match=%d freshness_match=%d", entry_index,
+                 entry.path.data(), static_cast<void*>(entry.buffer), entry.size, static_cast<long>(entry.freshness.st_size),
+                 PATH_MATCH ? 1 : 0, FRESHNESS_MATCH ? 1 : 0);
+        entry_index++;
+#endif
+        if (entry.buffer == nullptr || entry.size == 0 || !PATH_MATCH || !FRESHNESS_MATCH) {
+            continue;
+        }
+
+        auto* clone = new uint8_t[entry.size];
+        std::memcpy(clone, entry.buffer, entry.size);
+        entry.last_used = g_boot_file_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+        *out_buf = clone;
+        *out_size = entry.size;
+        g_boot_file_cache_lock.unlock();
+        return true;
+    }
+    g_boot_file_cache_lock.unlock();
+    return false;
+}
+
+void boot_file_cache_store_copy(const char* path, const ker::vfs::Stat& freshness, const uint8_t* buf, size_t size) {
+    if (path == nullptr || buf == nullptr || size == 0 || !boot_file_stat_has_freshness(freshness)) {
+        return;
+    }
+
+    auto* cached = new uint8_t[size];
+    std::memcpy(cached, buf, size);
+
+    g_boot_file_cache_lock.lock();
+    for (auto& entry : g_boot_file_cache) {
+        if (boot_file_path_matches(entry, path) && boot_file_freshness_matches(entry.freshness, freshness)) {
+            delete[] entry.buffer;
+            entry.buffer = cached;
+            entry.size = size;
+            entry.freshness = freshness;
+            entry.last_used = g_boot_file_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+            g_boot_file_cache_lock.unlock();
+            return;
+        }
+    }
+
+    if (g_boot_file_cache.size() >= BOOT_FILE_CACHE_MAX_ENTRIES) {
+        auto victim = g_boot_file_cache.begin();
+        for (auto it = g_boot_file_cache.begin(); it != g_boot_file_cache.end(); ++it) {
+            if (it->last_used < victim->last_used) {
+                victim = it;
+            }
+        }
+        delete[] victim->buffer;
+        g_boot_file_cache.erase(victim);
+    }
+
+    BootFileCacheEntry entry = {};
+    std::strncpy(entry.path.data(), path, entry.path.size() - 1);
+    entry.freshness = freshness;
+    entry.buffer = cached;
+    entry.size = size;
+    entry.last_used = g_boot_file_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_boot_file_cache.push_back(entry);
+#ifdef TASK_LDSO_CACHE_DEBUG
+    dbg::log("boot_file_cache: stored key='%s' size=%zu entries=%zu", path, size, g_boot_file_cache.size());
+#endif
+    g_boot_file_cache_lock.unlock();
+}
+
 void release_boot_file(ker::vfs::File* file) {
     if (file == nullptr) {
         return;
     }
-    if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
-        file->fops->vfs_close(file);
-    }
-    delete[] file->vfs_path;
-    delete file;
+    (void)ker::vfs::vfs_close_file(file);
 }
 
 auto read_boot_file_fully(const char* path, uint8_t** out_buf) -> bool {
@@ -45,25 +196,114 @@ auto read_boot_file_fully(const char* path, uint8_t** out_buf) -> bool {
 
     *out_buf = nullptr;
 
-    auto* file = ker::vfs::vfs_open_file_resolved(path, 0, 0);
+    auto* current_task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    [[maybe_unused]] auto const* task_name = (current_task != nullptr && current_task->name != nullptr) ? current_task->name : "?";
+    [[maybe_unused]] auto const* task_root = (current_task != nullptr) ? current_task->root.data() : "-";
+    [[maybe_unused]] auto const* task_cwd = (current_task != nullptr) ? current_task->cwd.data() : "-";
+    bool const HAS_REMOTE_SUBMITTER_IDENTITY = current_task != nullptr && current_task->wki_submitter_hostname.front() != '\0';
+    auto const* submitter = HAS_REMOTE_SUBMITTER_IDENTITY ? current_task->wki_submitter_hostname.data() : "-";
+    bool constexpr TRACE_INTERP = false;
+    bool constexpr ALLOW_BOOT_FILE_CACHE = true;
+    std::array<char, 512> cache_key = {};
+    build_boot_file_cache_key(submitter, path, cache_key.data(), cache_key.size());
+
+    // Keep the kernel-side loader open local for ordinary exec paths, but
+    // still honor the submitter's temporary VFS identity during remote task
+    // construction so cross-node launches continue to resolve against the
+    // submitter when required.
+    int const OPEN_FLAGS = boot_file_open_flags(path, HAS_REMOTE_SUBMITTER_IDENTITY);
+    auto* file = ker::vfs::vfs_open_file(path, OPEN_FLAGS, 0);
     if (file == nullptr || file->fops == nullptr || file->fops->vfs_read == nullptr || file->fops->vfs_lseek == nullptr) {
+        if constexpr (TRACE_INTERP) {
+            ker::vfs::Stat statbuf = {};
+            int const STAT_RET = ker::vfs::vfs_stat(path, &statbuf);
+            dbg::log(
+                "read_boot_file_fully: open failed path='%s' task=%s pid=0x%lx root='%s' cwd='%s' submitter='%s' file=%p fops=%p "
+                "read=%p lseek=%p fs=%d stat_ret=%d mode=0x%x size=%ld",
+                path, task_name, static_cast<unsigned long>(current_task != nullptr ? current_task->pid : 0), task_root, task_cwd,
+                submitter, static_cast<void*>(file), (file != nullptr) ? static_cast<void*>(file->fops) : nullptr,
+                (file != nullptr && file->fops != nullptr) ? reinterpret_cast<void*>(file->fops->vfs_read) : nullptr,
+                (file != nullptr && file->fops != nullptr) ? reinterpret_cast<void*>(file->fops->vfs_lseek) : nullptr,
+                (file != nullptr) ? static_cast<int>(file->fs_type) : -1, STAT_RET, static_cast<unsigned>(statbuf.st_mode),
+                static_cast<long>(statbuf.st_size));
+        }
         release_boot_file(file);
         return false;
+    }
+
+    if constexpr (TRACE_INTERP) {
+        auto const PID = static_cast<unsigned long>(current_task != nullptr ? current_task->pid : 0);
+        auto const* vfs_path = file->vfs_path != nullptr ? file->vfs_path : "-";
+        dbg::log("read_boot_file_fully: opened path='%s' task=%s pid=0x%lx root='%s' cwd='%s' submitter='%s' vfs_path='%s' fs=%d", path,
+                 task_name, PID, task_root, task_cwd, submitter, vfs_path, static_cast<int>(file->fs_type));
+    }
+
+    ker::vfs::Stat freshness = {};
+    bool const HAVE_FRESHNESS =
+        ALLOW_BOOT_FILE_CACHE && ker::vfs::vfs_fstat_file(file, &freshness) == 0 && boot_file_stat_has_freshness(freshness);
+    if (HAVE_FRESHNESS) {
+        size_t cached_size = 0;
+        if (boot_file_cache_lookup_copy(cache_key.data(), freshness, out_buf, &cached_size)) {
+            release_boot_file(file);
+            if constexpr (TRACE_INTERP) {
+                dbg::log("read_boot_file_fully: cache hit key='%s' task=%s pid=0x%lx size=%zu", cache_key.data(), task_name,
+                         static_cast<unsigned long>(current_task != nullptr ? current_task->pid : 0), cached_size);
+            }
+            return true;
+        }
+        if constexpr (TRACE_INTERP) {
+            dbg::log("read_boot_file_fully: cache miss key='%s' task=%s pid=0x%lx stat_size=%ld", cache_key.data(), task_name,
+                     static_cast<unsigned long>(current_task != nullptr ? current_task->pid : 0), static_cast<long>(freshness.st_size));
+        }
+    } else if constexpr (TRACE_INTERP) {
+        dbg::log("read_boot_file_fully: cache unavailable key='%s' task=%s pid=0x%lx stat_size=%ld", cache_key.data(), task_name,
+                 static_cast<unsigned long>(current_task != nullptr ? current_task->pid : 0), static_cast<long>(freshness.st_size));
     }
 
     off_t const FILE_SIZE = file->fops->vfs_lseek(file, 0, 2);
     if (FILE_SIZE <= 0) {
+        if constexpr (TRACE_INTERP) {
+            dbg::log("read_boot_file_fully: seek-end failed path='%s' task=%s pid=0x%lx size=%ld", path, task_name,
+                     static_cast<unsigned long>(current_task != nullptr ? current_task->pid : 0), static_cast<long>(FILE_SIZE));
+        }
         release_boot_file(file);
         return false;
     }
 
-    auto* buf = new uint8_t[static_cast<size_t>(FILE_SIZE)];
-    ssize_t const READ_SIZE = file->fops->vfs_read(file, buf, static_cast<size_t>(FILE_SIZE), 0);
+    if constexpr (TRACE_INTERP) {
+        dbg::log("read_boot_file_fully: seek-end ok path='%s' task=%s pid=0x%lx size=%ld", path, task_name,
+                 static_cast<unsigned long>(current_task != nullptr ? current_task->pid : 0), static_cast<long>(FILE_SIZE));
+    }
+
+    auto const BOOT_FILE_SIZE = static_cast<size_t>(FILE_SIZE);
+    auto* buf = new uint8_t[BOOT_FILE_SIZE];
+    size_t total_read = 0;
+    while (total_read < BOOT_FILE_SIZE) {
+        ssize_t const READ_SIZE = file->fops->vfs_read(file, buf + total_read, BOOT_FILE_SIZE - total_read, total_read);
+        if (READ_SIZE <= 0) {
+            if constexpr (TRACE_INTERP) {
+                dbg::log("read_boot_file_fully: read failed path='%s' task=%s pid=0x%lx read=%ld total=%lu size=%lu", path, task_name,
+                         static_cast<unsigned long>(current_task != nullptr ? current_task->pid : 0), static_cast<long>(READ_SIZE),
+                         static_cast<unsigned long>(total_read), static_cast<unsigned long>(FILE_SIZE));
+            }
+            release_boot_file(file);
+            delete[] buf;
+            return false;
+        }
+        total_read += static_cast<size_t>(READ_SIZE);
+    }
     release_boot_file(file);
 
-    if (READ_SIZE != FILE_SIZE) {
-        delete[] buf;
-        return false;
+    if (HAVE_FRESHNESS && freshness.st_size == FILE_SIZE) {
+        boot_file_cache_store_copy(cache_key.data(), freshness, buf, BOOT_FILE_SIZE);
+        if constexpr (TRACE_INTERP) {
+            dbg::log("read_boot_file_fully: cache store key='%s' task=%s pid=0x%lx size=%zu", cache_key.data(), task_name,
+                     static_cast<unsigned long>(current_task != nullptr ? current_task->pid : 0), BOOT_FILE_SIZE);
+        }
+    } else if constexpr (TRACE_INTERP) {
+        dbg::log("read_boot_file_fully: cache store skipped key='%s' task=%s pid=0x%lx have_freshness=%d stat_size=%ld file_size=%ld",
+                 cache_key.data(), task_name, static_cast<unsigned long>(current_task != nullptr ? current_task->pid : 0),
+                 HAVE_FRESHNESS ? 1 : 0, static_cast<long>(freshness.st_size), static_cast<long>(FILE_SIZE));
     }
 
     *out_buf = buf;
@@ -214,6 +454,16 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->cpu = cpu::current_cpu();
     this->context.syscall_kernel_stack = kernel_rsp;
 
+    auto fail_process_construction = [&]() {
+        // Match the existing create_thread() failure contract so higher layers
+        // can reject the exec without freezing the whole kernel on a remote
+        // loader miss or malformed interpreter image.
+        this->type = TaskType::IDLE;
+        this->thread = nullptr;
+        this->pagemap = nullptr;
+        this->entry = 0;
+    };
+
     this->pid = sched::task::get_next_pid();
     // POSIX: default process group = own pid (processes start in their own group)
     if (this->pgid == 0) {
@@ -269,7 +519,8 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
         loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(elf_start), this->pagemap, this->pid, this->name);
     if (elf_result.entry_point == 0) {
         dbg::log("Failed to load ELF for task %s", name);
-        hcf();
+        fail_process_construction();
+        return;
     }
     this->entry = elf_result.entry_point;
     this->context.frame.rip = elf_result.entry_point;
@@ -288,7 +539,8 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
         uint8_t* interp_buf = nullptr;
         if (!read_boot_file_fully(INTERP_PATH, &interp_buf)) {
             dbg::log("Failed to open interpreter '%s' for task %s", INTERP_PATH, name);
-            hcf();
+            fail_process_construction();
+            return;
         }
 
         loader::elf::ElfLoadResult const INTERP_RESULT =
@@ -298,7 +550,8 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
         if (INTERP_RESULT.entry_point == 0) {
             delete[] interp_buf;
             dbg::log("Failed to load interpreter ELF '%s'", INTERP_PATH);
-            hcf();
+            fail_process_construction();
+            return;
         }
 
         // Entry point becomes the interpreter's entry (ld.so _start).

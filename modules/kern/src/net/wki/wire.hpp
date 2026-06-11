@@ -164,7 +164,7 @@ struct HelloPayload {
     uint32_t rdma_zone_bitmap{};  // RDMA zone membership (32 zones max)
     std::array<uint8_t, 8> reserved{};
     // --- V2 extension (offset 32) ---
-    std::array<char, WKI_HOSTNAME_MAX> hostname;  // sender's hostname, UTF-8, NUL-terminated if shorter than WKI_HOSTNAME_MAX
+    std::array<char, WKI_HOSTNAME_MAX> hostname{};  // sender's hostname, UTF-8, NUL-terminated if shorter than WKI_HOSTNAME_MAX
 } __attribute__((packed));
 
 static_assert(sizeof(HelloPayload) == 96, "HelloPayload must be 96 bytes");
@@ -624,6 +624,8 @@ constexpr uint16_t OP_VFS_READDIR_BATCH =
     0x0412;  // Batch readdir: req={fd:i32,start:u32,max:u32}(12B) resp={count:u32,entries:DirEntry[count]}
 constexpr uint16_t OP_VFS_READ_BULK =
     0x0413;  // Bulk RDMA read: req={fd:i32,len:u32,off:i64,bulk_rkey:u32}(20B) resp={bytes:u32}(4B), up to 2 MB via rdma_write
+constexpr uint16_t OP_VFS_INVALIDATE =
+    0x0414;  // Owner->consumer notify: req={old_len:u16,new_len:u16,paths...}; no DEV_OP_RESP is expected
 
 // IPC Pipe (0x0700–0x070F) — data moves via wire messages
 constexpr uint16_t OP_PIPE_CLOSE_READ = 0x0700;

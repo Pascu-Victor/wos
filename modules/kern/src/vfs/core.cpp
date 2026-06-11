@@ -62,6 +62,8 @@ constexpr size_t WKI_PATH_PREFIX_LEN = 5;
 auto make_absolute(const char* path, char* out, size_t outsize) -> int;
 auto canonicalize_path(char* path, size_t bufsize) -> int;
 auto normalize_task_path_inplace(char* path, size_t bufsize) -> int;
+auto normalize_task_path_inplace_with_route(char* path, size_t bufsize, bool apply_task_route) -> int;
+auto resolve_task_path_raw_impl(const char* path, char* out, size_t outsize, bool apply_task_route) -> int;
 auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize_t;
 auto strip_mount_prefix(const MountPoint* mount, const char* path) -> const char*;
 auto tmpfs_root_for_mount(const MountPoint* mount) -> ker::vfs::tmpfs::TmpNode*;
@@ -76,6 +78,7 @@ struct VfsRouteDecision {
 constexpr size_t STREAM_CHUNK_SIZE = 65536;
 constexpr size_t STREAM_ENTRY_BYTE_CAP = size_t{8} * 1024 * 1024;
 constexpr size_t STREAM_DETACHED_REUSE_MAX = size_t{8} * 1024 * 1024;
+constexpr size_t STREAM_DETACHED_PARTIAL_REUSE_MAX = size_t{256} * 1024;
 constexpr size_t STREAM_MAX_ACTIVE_ISLANDS = 4;
 constexpr uint64_t STREAM_DETACHED_TTL_US = 5000000;
 constexpr uint64_t STREAM_SPLIT_DISTANCE_BYTES = uint64_t{2} * 1024 * 1024;
@@ -84,9 +87,18 @@ constexpr size_t PIPE_WAKE_BATCH = 32;
 constexpr size_t PIPE_DEFAULT_CAPACITY = 256UL * 1024UL;
 constexpr size_t PIPE_DIRECT_MAX_CAPACITY = 256UL * 1024UL;
 
+struct StreamCacheIdentity;
+struct StreamFreshnessStamp;
+
 void stream_detach_file(File* file);
 void stream_invalidate_file(File* file);
-auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, size_t* actual_size, ssize_t* result) -> bool;
+void cache_notify_detach_file(File* file);
+void stream_invalidate_identity_locked(const StreamCacheIdentity& identity);
+void stream_gc_locked(uint64_t now_us);
+auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t start_offset, size_t* actual_size, ssize_t* result) -> bool;
+auto vfs_stream_cache_get_file_stat(File* file, Stat* statbuf) -> int;
+auto stream_build_identity(File* file, const Stat& statbuf, StreamCacheIdentity* identity, StreamFreshnessStamp* stamp,
+                           bool* can_reuse_detached, bool* retain_full_file) -> int;
 
 auto vfs_destroy_file(File* f) -> int {
     if (f == nullptr) {
@@ -95,6 +107,7 @@ auto vfs_destroy_file(File* f) -> int {
 
     int close_result = 0;
     stream_detach_file(f);
+    cache_notify_detach_file(f);
     if ((f->fops != nullptr) && (f->fops->vfs_close != nullptr)) {
         close_result = f->fops->vfs_close(f);
     }
@@ -114,7 +127,7 @@ auto apply_open_truncation(File* f, int flags) -> int {
 
     int const RET = f->fops->vfs_truncate(f, 0);
     if (RET == 0) {
-        stream_invalidate_file(f);
+        vfs_cache_notify_file_changed(f);
     }
     return RET;
 }
@@ -148,12 +161,16 @@ struct StreamFreshnessStamp {
     int64_t ctime_sec = 0;
     int64_t ctime_nsec = 0;
     bool valid = false;
+    bool size_only = false;
 };
 
 struct StreamCacheIdentity {
     const void* scope_key = nullptr;
     FSType fs_type = FSType::TMPFS;
     ino_t ino = 0;
+    uint64_t remote_path_hash = 0;
+    uint16_t remote_owner_node = 0;
+    uint32_t remote_resource_id = 0;
 };
 
 struct StreamChunk {
@@ -191,6 +208,7 @@ struct StreamCacheEntry {
     StreamFreshnessStamp freshness = {};
     bool can_reuse_detached = false;
     bool retain_full_file = false;
+    bool pinned_detached = false;
     uint64_t last_used_us = 0;
     size_t cached_bytes = 0;
     std::deque<std::unique_ptr<StreamIsland>> islands;
@@ -198,6 +216,32 @@ struct StreamCacheEntry {
 
 std::deque<std::unique_ptr<StreamCacheEntry>> g_stream_cache;
 ker::mod::sys::Mutex g_stream_cache_lock;
+
+struct CacheNotifyEntry {
+    uint64_t path_hash = 0;
+    StreamCacheIdentity identity = {};
+    StreamFreshnessStamp freshness = {};
+    bool has_snapshot = false;
+    bool can_reuse_detached = false;
+    bool retain_full_file = false;
+    uint64_t generation = 1;
+    uint64_t validated_generation = 0;
+    uint64_t last_used_us = 0;
+    size_t watcher_count = 0;
+};
+
+struct CacheNotifyWatcher {
+    static constexpr uint64_t MAGIC = 0x434143484e4f5446ULL;  // "CACHNOTF"
+    uint64_t magic = MAGIC;
+    File* file = nullptr;
+    CacheNotifyEntry* entry = nullptr;
+    uint64_t seen_generation = 0;
+};
+
+std::deque<std::unique_ptr<CacheNotifyEntry>> g_cache_notify_entries;
+std::deque<CacheNotifyWatcher*> g_cache_notify_watchers;
+ker::mod::sys::Mutex g_cache_notify_lock;
+constexpr uint64_t CACHE_NOTIFY_ENTRY_TTL_US = 60000000;
 
 auto stream_attachment_pointer_looks_valid(const void* ptr) -> bool {
     auto const ADDR = reinterpret_cast<uintptr_t>(ptr);
@@ -213,27 +257,292 @@ auto stream_attachment_pointer_looks_valid(const void* ptr) -> bool {
 auto stream_now_us() -> uint64_t { return ker::mod::time::get_us(); }
 
 auto stream_identity_equals(const StreamCacheIdentity& lhs, const StreamCacheIdentity& rhs) -> bool {
-    return lhs.scope_key == rhs.scope_key && lhs.fs_type == rhs.fs_type && lhs.ino == rhs.ino;
+    if (lhs.fs_type != rhs.fs_type) {
+        return false;
+    }
+
+    if (lhs.fs_type == FSType::REMOTE) {
+        if (lhs.remote_path_hash == 0 || lhs.remote_path_hash != rhs.remote_path_hash) {
+            return false;
+        }
+
+        bool const HAS_STABLE_REMOTE_SCOPE =
+            lhs.remote_owner_node != 0 && rhs.remote_owner_node != 0 && lhs.remote_resource_id != 0 && rhs.remote_resource_id != 0;
+        if (HAS_STABLE_REMOTE_SCOPE) {
+            return lhs.remote_owner_node == rhs.remote_owner_node && lhs.remote_resource_id == rhs.remote_resource_id;
+        }
+
+        return lhs.scope_key != nullptr && lhs.scope_key == rhs.scope_key;
+    }
+
+    if (lhs.scope_key != rhs.scope_key) {
+        return false;
+    }
+    return lhs.ino == rhs.ino;
+}
+
+auto stream_hash_path(const char* path) -> uint64_t {
+    if (path == nullptr || path[0] == '\0') {
+        return 0;
+    }
+
+    uint64_t hash = 1469598103934665603ULL;
+    for (auto const* p = reinterpret_cast<const uint8_t*>(path); *p != 0; ++p) {
+        hash ^= *p;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+auto cache_notify_entry_is_clean(const CacheNotifyEntry* entry) -> bool {
+    return entry != nullptr && entry->has_snapshot && entry->validated_generation == entry->generation;
+}
+
+auto cache_notify_entry_is_dirty(const CacheNotifyEntry* entry) -> bool { return entry != nullptr && !cache_notify_entry_is_clean(entry); }
+
+auto cache_notify_find_entry_locked(uint64_t path_hash) -> CacheNotifyEntry* {
+    for (auto& entry : g_cache_notify_entries) {
+        if (entry != nullptr && entry->path_hash == path_hash) {
+            return entry.get();
+        }
+    }
+    return nullptr;
+}
+
+auto cache_notify_attach_pointer_looks_valid(const void* ptr) -> bool {
+    auto const ADDR = reinterpret_cast<uintptr_t>(ptr);
+    constexpr uintptr_t HHDM_START = 0xffff800000000000ULL;
+    constexpr uintptr_t HHDM_END = 0xffff900000000000ULL;
+    constexpr uintptr_t KERNEL_STATIC_START = 0xffffffff80000000ULL;
+    constexpr uintptr_t KERNEL_STATIC_END = 0xffffffffc0000000ULL;
+    bool const IN_HHDM = ADDR >= HHDM_START && ADDR < HHDM_END;
+    bool const IN_KERNEL_STATIC = ADDR >= KERNEL_STATIC_START && ADDR < KERNEL_STATIC_END;
+    return (IN_HHDM || IN_KERNEL_STATIC) && ((ADDR & (alignof(CacheNotifyWatcher) - 1)) == 0);
+}
+
+void cache_notify_gc_locked(uint64_t now_us) {
+    for (auto it = g_cache_notify_entries.begin(); it != g_cache_notify_entries.end();) {
+        auto* entry = it->get();
+        if (entry != nullptr && entry->watcher_count == 0 && (now_us - entry->last_used_us) > CACHE_NOTIFY_ENTRY_TTL_US) {
+            it = g_cache_notify_entries.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+auto cache_notify_ensure_entry_locked(uint64_t path_hash, uint64_t now_us) -> CacheNotifyEntry* {
+    CacheNotifyEntry* entry = cache_notify_find_entry_locked(path_hash);
+    if (entry == nullptr) {
+        g_cache_notify_entries.push_back(std::make_unique<CacheNotifyEntry>());
+        entry = g_cache_notify_entries.back().get();
+        entry->path_hash = path_hash;
+    }
+    entry->last_used_us = now_us;
+    return entry;
+}
+
+void cache_notify_drop_snapshot_locked(CacheNotifyEntry* entry) {
+    if (entry == nullptr) {
+        return;
+    }
+    entry->validated_generation = 0;
+    entry->has_snapshot = false;
+    entry->can_reuse_detached = false;
+    entry->retain_full_file = false;
+}
+
+void cache_notify_attach_file(File* file) {
+    if (file == nullptr || file->vfs_path == nullptr || (file->open_flags & ker::vfs::O_NOTIFY_CACHE_CHANGE) == 0 ||
+        file->cache_notify_attachment != nullptr) {
+        return;
+    }
+
+    uint64_t const PATH_HASH = stream_hash_path(file->vfs_path);
+    if (PATH_HASH == 0) {
+        return;
+    }
+
+    auto* watcher = new (std::nothrow) CacheNotifyWatcher;
+    if (watcher == nullptr) {
+        return;
+    }
+
+    watcher->file = file;
+
+    uint64_t const NOW_US = stream_now_us();
+    g_cache_notify_lock.lock();
+    cache_notify_gc_locked(NOW_US);
+    CacheNotifyEntry* entry = cache_notify_ensure_entry_locked(PATH_HASH, NOW_US);
+    entry->watcher_count++;
+    watcher->entry = entry;
+    watcher->seen_generation = entry->generation;
+    g_cache_notify_watchers.push_back(watcher);
+    file->cache_notify_attachment = watcher;
+    g_cache_notify_lock.unlock();
+}
+
+void cache_notify_detach_file(File* file) {
+    if (file == nullptr || file->cache_notify_attachment == nullptr) {
+        return;
+    }
+
+    auto* watcher = static_cast<CacheNotifyWatcher*>(file->cache_notify_attachment);
+    file->cache_notify_attachment = nullptr;
+    if (!cache_notify_attach_pointer_looks_valid(watcher) || watcher->magic != CacheNotifyWatcher::MAGIC) {
+        return;
+    }
+
+    g_cache_notify_lock.lock();
+    if (watcher->entry != nullptr && watcher->entry->watcher_count > 0) {
+        watcher->entry->watcher_count--;
+        watcher->entry->last_used_us = stream_now_us();
+    }
+    std::erase(g_cache_notify_watchers, watcher);
+    cache_notify_gc_locked(stream_now_us());
+    g_cache_notify_lock.unlock();
+
+    watcher->magic = 0;
+    delete watcher;
+}
+
+auto cache_notify_try_copy_snapshot(File* file, StreamCacheIdentity* identity, StreamFreshnessStamp* freshness, bool* can_reuse_detached,
+                                    bool* retain_full_file) -> bool {
+    if (file == nullptr || file->cache_notify_attachment == nullptr || identity == nullptr || freshness == nullptr ||
+        can_reuse_detached == nullptr || retain_full_file == nullptr) {
+        return false;
+    }
+
+    auto* watcher = static_cast<CacheNotifyWatcher*>(file->cache_notify_attachment);
+    if (!cache_notify_attach_pointer_looks_valid(watcher) || watcher->magic != CacheNotifyWatcher::MAGIC) {
+        return false;
+    }
+
+    bool found = false;
+    g_cache_notify_lock.lock();
+    CacheNotifyEntry* entry = watcher->entry;
+    if (entry != nullptr && cache_notify_entry_is_clean(entry)) {
+        *identity = entry->identity;
+        *freshness = entry->freshness;
+        *can_reuse_detached = entry->can_reuse_detached;
+        *retain_full_file = entry->retain_full_file;
+        watcher->seen_generation = entry->generation;
+        entry->last_used_us = stream_now_us();
+        found = true;
+    }
+    g_cache_notify_lock.unlock();
+    return found;
+}
+
+void cache_notify_store_snapshot(File* file, const StreamCacheIdentity& identity, const StreamFreshnessStamp& freshness,
+                                 bool can_reuse_detached, bool retain_full_file) {
+    if (file == nullptr || file->cache_notify_attachment == nullptr) {
+        return;
+    }
+
+    auto* watcher = static_cast<CacheNotifyWatcher*>(file->cache_notify_attachment);
+    if (!cache_notify_attach_pointer_looks_valid(watcher) || watcher->magic != CacheNotifyWatcher::MAGIC) {
+        return;
+    }
+
+    g_cache_notify_lock.lock();
+    if (watcher->entry != nullptr) {
+        watcher->entry->identity = identity;
+        watcher->entry->freshness = freshness;
+        watcher->entry->has_snapshot = true;
+        watcher->entry->can_reuse_detached = can_reuse_detached;
+        watcher->entry->retain_full_file = retain_full_file;
+        watcher->entry->validated_generation = watcher->entry->generation;
+        watcher->entry->last_used_us = stream_now_us();
+        watcher->seen_generation = watcher->entry->generation;
+    }
+    g_cache_notify_lock.unlock();
+}
+
+auto cache_notify_invalidate_path_local(const char* vfs_path) -> bool {
+    if (vfs_path == nullptr || vfs_path[0] == '\0') {
+        return false;
+    }
+
+    uint64_t const PATH_HASH = stream_hash_path(vfs_path);
+    if (PATH_HASH == 0) {
+        return false;
+    }
+
+    StreamCacheIdentity cached_identity = {};
+    bool have_cached_identity = false;
+    ker::util::SmallVec<File*, 8> remote_files;
+    bool transitioned_to_dirty = false;
+
+    g_cache_notify_lock.lock();
+    if (CacheNotifyEntry* entry = cache_notify_find_entry_locked(PATH_HASH); entry != nullptr) {
+        bool const WAS_DIRTY = cache_notify_entry_is_dirty(entry);
+        if (!WAS_DIRTY) {
+            entry->generation++;
+            transitioned_to_dirty = true;
+        }
+        entry->last_used_us = stream_now_us();
+        if (transitioned_to_dirty && entry->has_snapshot) {
+            cached_identity = entry->identity;
+            have_cached_identity = true;
+        }
+        cache_notify_drop_snapshot_locked(entry);
+
+        if (transitioned_to_dirty) {
+            for (auto* watcher : g_cache_notify_watchers) {
+                if (watcher == nullptr || watcher->entry != entry || watcher->file == nullptr) {
+                    continue;
+                }
+                if (watcher->file->fs_type == FSType::REMOTE) {
+                    (void)remote_files.push_back(watcher->file);
+                }
+            }
+        }
+    }
+    cache_notify_gc_locked(stream_now_us());
+    g_cache_notify_lock.unlock();
+
+    if (have_cached_identity) {
+        g_stream_cache_lock.lock();
+        stream_invalidate_identity_locked(cached_identity);
+        stream_gc_locked(stream_now_us());
+        g_stream_cache_lock.unlock();
+    }
+
+    for (auto* file : remote_files) {
+        ker::net::wki::wki_remote_vfs_invalidate_open_file_caches(file);
+    }
+
+    return transitioned_to_dirty;
 }
 
 auto stream_stat_has_freshness(const Stat& st) -> bool {
     return st.st_mtim.tv_sec != 0 || st.st_mtim.tv_nsec != 0 || st.st_ctim.tv_sec != 0 || st.st_ctim.tv_nsec != 0;
 }
 
-auto stream_capture_freshness(const Stat& st) -> StreamFreshnessStamp {
+auto stream_capture_freshness(const Stat& st, FSType fs_type) -> StreamFreshnessStamp {
     StreamFreshnessStamp stamp = {};
     stamp.size = st.st_size;
     stamp.mtime_sec = st.st_mtim.tv_sec;
     stamp.mtime_nsec = st.st_mtim.tv_nsec;
     stamp.ctime_sec = st.st_ctim.tv_sec;
     stamp.ctime_nsec = st.st_ctim.tv_nsec;
-    stamp.valid = stream_stat_has_freshness(st);
+    if (fs_type == FSType::REMOTE && st.st_size > 0) {
+        stamp.valid = true;
+        stamp.size_only = true;
+    } else {
+        stamp.valid = stream_stat_has_freshness(st);
+    }
     return stamp;
 }
 
 auto stream_freshness_matches(const StreamFreshnessStamp& stamp, const Stat& st) -> bool {
     if (!stamp.valid) {
         return false;
+    }
+
+    if (stamp.size_only) {
+        return stamp.size > 0 && stamp.size == st.st_size;
     }
 
     return stamp.size == st.st_size && stamp.mtime_sec == st.st_mtim.tv_sec && stamp.mtime_nsec == st.st_mtim.tv_nsec &&
@@ -358,14 +667,48 @@ auto stream_entry_is_fully_cached(const StreamCacheEntry* entry) -> bool {
     return false;
 }
 
+auto stream_entry_cached_prefix_bytes(const StreamCacheEntry* entry) -> uint64_t {
+    if (entry == nullptr) {
+        return 0;
+    }
+
+    uint64_t best_prefix = 0;
+    for (const auto& island : entry->islands) {
+        if (island == nullptr || island->retired) {
+            continue;
+        }
+
+        if (stream_island_start(island.get()) != 0) {
+            continue;
+        }
+
+        best_prefix = std::max(best_prefix, stream_island_end(island.get()));
+    }
+
+    return best_prefix;
+}
+
 auto stream_entry_should_keep_detached(const StreamCacheEntry* entry, uint64_t now_us) -> bool {
     if (entry == nullptr || stream_entry_has_readers(entry)) {
         return false;
     }
-    if (!entry->can_reuse_detached || !entry->retain_full_file || !stream_entry_is_fully_cached(entry)) {
+    if (entry->pinned_detached && entry->retain_full_file && stream_entry_is_fully_cached(entry)) {
+        return true;
+    }
+    if (!entry->can_reuse_detached || (now_us - entry->last_used_us) > STREAM_DETACHED_TTL_US) {
         return false;
     }
-    return (now_us - entry->last_used_us) <= STREAM_DETACHED_TTL_US;
+
+    if (entry->retain_full_file && stream_entry_is_fully_cached(entry)) {
+        return true;
+    }
+
+    if (entry->identity.fs_type != FSType::REMOTE || !entry->retain_full_file) {
+        return false;
+    }
+
+    uint64_t const PREFIX_BYTES = stream_entry_cached_prefix_bytes(entry);
+    return PREFIX_BYTES > 0 && std::cmp_less_equal(PREFIX_BYTES, STREAM_DETACHED_PARTIAL_REUSE_MAX);
 }
 
 void stream_gc_locked(uint64_t now_us) {
@@ -572,6 +915,7 @@ void stream_reset_entry_locked(StreamCacheEntry* entry) {
         return;
     }
 
+    entry->pinned_detached = false;
     entry->cached_bytes = 0;
     for (auto& island : entry->islands) {
         if (island == nullptr) {
@@ -650,8 +994,14 @@ auto vfs_stream_cache_get_file_stat(File* file, Stat* statbuf) -> int {
         case FSType::DEVFS:
         case FSType::SOCKET:
         case FSType::PROCFS:
-        case FSType::REMOTE:  // REMOTE has its own caching (ReadAheadCache/WriteBehindBuffer/RDMA); not in kernel stream cache
             return -ENOSYS;
+        case FSType::REMOTE: {
+            int const R = ker::net::wki::wki_remote_vfs_fstat(file, statbuf);
+            if (R == 0 && statbuf->st_dev == 0) {
+                statbuf->st_dev = SC_DEV_ID;
+            }
+            return R;
+        }
         case FSType::XFS: {
             int const R = ker::vfs::xfs::xfs_fstat(file, statbuf);
             if (R == 0) {
@@ -686,20 +1036,40 @@ auto stream_build_identity(File* file, const Stat& statbuf, StreamCacheIdentity*
     identity->scope_key = stream_scope_key_for_mount(mount);
     identity->fs_type = mount->fs_type;
     identity->ino = statbuf.st_ino;
+    identity->remote_path_hash = 0;
+    identity->remote_owner_node = 0;
+    identity->remote_resource_id = 0;
 
-    if (identity->scope_key == nullptr || identity->ino == 0) {
+    if (mount->fs_type == FSType::REMOTE) {
+        const char* fs_path = strip_mount_prefix(mount, file->vfs_path);
+        identity->remote_path_hash = stream_hash_path(fs_path);
+        auto const* state = static_cast<const ker::net::wki::ProxyVfsState*>(mount->private_data);
+        if (state != nullptr) {
+            identity->remote_owner_node = state->owner_node;
+            identity->remote_resource_id = state->resource_id;
+        }
+    }
+
+    bool const REMOTE_IDENTITY_VALID =
+        identity->remote_path_hash != 0 &&
+        ((identity->remote_owner_node != 0 && identity->remote_resource_id != 0) || identity->scope_key != nullptr);
+    bool const LOCAL_IDENTITY_VALID = identity->scope_key != nullptr && identity->ino != 0;
+    bool const IDENTITY_VALID = (mount->fs_type == FSType::REMOTE) ? REMOTE_IDENTITY_VALID : LOCAL_IDENTITY_VALID;
+    if (!IDENTITY_VALID) {
         return -ENOSYS;
     }
 
+    bool const HAS_REUSABLE_FRESHNESS = (mount->fs_type == FSType::REMOTE) ? statbuf.st_size > 0 : stream_stat_has_freshness(statbuf);
+
     if (stamp != nullptr) {
-        *stamp = stream_capture_freshness(statbuf);
+        *stamp = stream_capture_freshness(statbuf, mount->fs_type);
     }
     if (can_reuse_detached != nullptr) {
-        *can_reuse_detached = stream_stat_has_freshness(statbuf);
+        *can_reuse_detached = HAS_REUSABLE_FRESHNESS;
     }
     if (retain_full_file != nullptr) {
         *retain_full_file =
-            stream_stat_has_freshness(statbuf) && statbuf.st_size > 0 && std::cmp_less_equal(statbuf.st_size, STREAM_DETACHED_REUSE_MAX);
+            HAS_REUSABLE_FRESHNESS && statbuf.st_size > 0 && std::cmp_less_equal(statbuf.st_size, STREAM_DETACHED_REUSE_MAX);
     }
 
     return 0;
@@ -810,18 +1180,28 @@ auto stream_attach_file(File* file) -> StreamReaderAttachment* {
         delete existing;
     }
 
-    Stat st = {};
-    if (vfs_stream_cache_get_file_stat(file, &st) != 0) {
-        return nullptr;
-    }
-
     StreamCacheIdentity identity = {};
     StreamFreshnessStamp freshness = {};
     bool can_reuse_detached = false;
     bool retain_full_file = false;
-    if (stream_build_identity(file, st, &identity, &freshness, &can_reuse_detached, &retain_full_file) != 0) {
-        return nullptr;
+    Stat st = {};
+    bool have_notify_snapshot = cache_notify_try_copy_snapshot(file, &identity, &freshness, &can_reuse_detached, &retain_full_file);
+
+    if (!have_notify_snapshot) {
+        if (vfs_stream_cache_get_file_stat(file, &st) != 0) {
+            return nullptr;
+        }
+
+        if (stream_build_identity(file, st, &identity, &freshness, &can_reuse_detached, &retain_full_file) != 0) {
+            return nullptr;
+        }
+
+        if ((file->open_flags & ker::vfs::O_NOTIFY_CACHE_CHANGE) != 0) {
+            cache_notify_store_snapshot(file, identity, freshness, can_reuse_detached, retain_full_file);
+        }
     }
+    bool const ALWAYS_CACHE = (file->open_flags & ker::vfs::O_ALWAYS_CACHE) != 0;
+    bool const PIN_DETACHED = ALWAYS_CACHE && retain_full_file;
 
     auto* attachment = new StreamReaderAttachment;
     attachment->desired_offset = static_cast<uint64_t>(file->pos);
@@ -838,15 +1218,21 @@ auto stream_attach_file(File* file) -> StreamReaderAttachment* {
         entry->freshness = freshness;
         entry->can_reuse_detached = can_reuse_detached;
         entry->retain_full_file = retain_full_file;
+        entry->pinned_detached = PIN_DETACHED;
         entry->last_used_us = NOW_US;
     } else if (!stream_entry_has_readers(entry)) {
-        if (!stream_entry_should_keep_detached(entry, NOW_US) || !stream_freshness_matches(entry->freshness, st)) {
+        if (!ALWAYS_CACHE && (!stream_entry_should_keep_detached(entry, NOW_US) ||
+                              (!have_notify_snapshot && !stream_freshness_matches(entry->freshness, st)))) {
             stream_reset_entry_locked(entry);
             entry->freshness = freshness;
             entry->can_reuse_detached = can_reuse_detached;
             entry->retain_full_file = retain_full_file;
+            entry->pinned_detached = PIN_DETACHED;
         }
+        entry->pinned_detached = entry->pinned_detached || PIN_DETACHED;
         entry->last_used_us = NOW_US;
+    } else if (PIN_DETACHED) {
+        entry->pinned_detached = true;
     }
 
     attachment->entry = entry;
@@ -930,7 +1316,109 @@ void stream_invalidate_mount_scope(FSType fs_type, const void* scope_key) {
     g_stream_cache_lock.unlock();
 }
 
-auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, size_t* actual_size, ssize_t* result) -> bool {
+void cache_notify_register_open_file_impl(File* file) {
+    if (file == nullptr || file->vfs_path == nullptr || (file->open_flags & ker::vfs::O_NOTIFY_CACHE_CHANGE) == 0) {
+        return;
+    }
+
+    cache_notify_attach_file(file);
+
+    if ((file->open_flags & ker::vfs::O_NO_CACHE) != 0) {
+        return;
+    }
+
+    StreamCacheIdentity identity = {};
+    StreamFreshnessStamp freshness = {};
+    bool can_reuse_detached = false;
+    bool retain_full_file = false;
+    if (cache_notify_try_copy_snapshot(file, &identity, &freshness, &can_reuse_detached, &retain_full_file)) {
+        return;
+    }
+
+    Stat st = {};
+    if (vfs_stream_cache_get_file_stat(file, &st) != 0) {
+        return;
+    }
+
+    if (stream_build_identity(file, st, &identity, &freshness, &can_reuse_detached, &retain_full_file) != 0) {
+        return;
+    }
+
+    cache_notify_store_snapshot(file, identity, freshness, can_reuse_detached, retain_full_file);
+}
+
+void cache_notify_invalidate_path_impl(const char* vfs_path) { cache_notify_invalidate_path_local(vfs_path); }
+
+void cache_notify_path_changed_impl(const char* old_vfs_path, const char* new_vfs_path) {
+    bool old_became_dirty = false;
+    bool new_became_dirty = false;
+    if (old_vfs_path != nullptr) {
+        old_became_dirty = cache_notify_invalidate_path_local(old_vfs_path);
+    }
+    if (new_vfs_path != nullptr && (old_vfs_path == nullptr || std::strcmp(old_vfs_path, new_vfs_path) != 0)) {
+        new_became_dirty = cache_notify_invalidate_path_local(new_vfs_path);
+    }
+    // Invalidation notifications are edge-triggered: once a path is dirty,
+    // further writes do not need another network broadcast until some reader
+    // revalidates and stores a fresh snapshot.
+    if (old_became_dirty || new_became_dirty) {
+        ker::net::wki::wki_remote_vfs_notify_path_changed(old_vfs_path, new_vfs_path);
+    }
+}
+
+void cache_notify_file_changed_impl(File* file) {
+    if (file == nullptr) {
+        return;
+    }
+    stream_invalidate_file(file);
+    // devfs-backed character devices (for example PTYs) can carry stream I/O
+    // without any underlying pathname/content mutation. Treating each write as
+    // a path change floods remote VFS peers with bogus invalidates such as
+    // /dev/ptmx and /dev/pts/N.
+    if (file->fs_type == FSType::DEVFS) {
+        return;
+    }
+    cache_notify_path_changed_impl(file->vfs_path, nullptr);
+}
+
+auto cache_notify_file_dirty_impl(File* file) -> bool {
+    if (file == nullptr || file->cache_notify_attachment == nullptr) {
+        return false;
+    }
+
+    auto* watcher = static_cast<CacheNotifyWatcher*>(file->cache_notify_attachment);
+    if (!cache_notify_attach_pointer_looks_valid(watcher) || watcher->magic != CacheNotifyWatcher::MAGIC) {
+        return false;
+    }
+
+    bool dirty = false;
+    g_cache_notify_lock.lock();
+    if (watcher->entry != nullptr) {
+        dirty = watcher->seen_generation != watcher->entry->generation;
+    }
+    g_cache_notify_lock.unlock();
+    return dirty;
+}
+
+void cache_notify_acknowledge_file_impl(File* file) {
+    if (file == nullptr || file->cache_notify_attachment == nullptr) {
+        return;
+    }
+
+    auto* watcher = static_cast<CacheNotifyWatcher*>(file->cache_notify_attachment);
+    if (!cache_notify_attach_pointer_looks_valid(watcher) || watcher->magic != CacheNotifyWatcher::MAGIC) {
+        return;
+    }
+
+    g_cache_notify_lock.lock();
+    if (watcher->entry != nullptr) {
+        watcher->seen_generation = watcher->entry->generation;
+        watcher->entry->last_used_us = stream_now_us();
+    }
+    g_cache_notify_lock.unlock();
+}
+
+auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t start_offset, size_t* actual_size, ssize_t* result) -> bool {
     if (result == nullptr || file == nullptr || buf == nullptr || count == 0 || file->fops == nullptr || file->fops->vfs_read == nullptr) {
         return false;
     }
@@ -945,7 +1433,7 @@ auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, size_t* actu
     int premature_eof_retries = 0;
 
     while (total < count) {
-        uint64_t const OFFSET = static_cast<uint64_t>(file->pos) + total;
+        uint64_t const OFFSET = start_offset + total;
 
         g_stream_cache_lock.lock();
         auto* island = stream_select_island_locked(attachment, OFFSET);
@@ -1889,12 +2377,21 @@ auto normalize_task_path_inplace(char* path, size_t bufsize) -> int {
         return CANONICAL;
     }
 
-    std::array<char, MAX_PATH_LEN> routed{};
-    ker::mod::sched::task::Task const* current_task = nullptr;
-    if (ker::mod::sched::can_query_current_task()) {
-        current_task = ker::mod::sched::get_current_task();
+    return normalize_task_path_inplace_with_route(path, bufsize, true);
+}
+
+auto normalize_task_path_inplace_with_route(char* path, size_t bufsize, bool apply_task_route) -> int {
+    if (path == nullptr) {
+        return -EINVAL;
     }
 
+    if (!apply_task_route) {
+        return 0;
+    }
+
+    std::array<char, MAX_PATH_LEN> routed{};
+    ker::mod::sched::task::Task const* current_task =
+        ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
     int const ROUTE_RESULT = apply_task_vfs_route(current_task, path, routed.data(), routed.size());
     if (ROUTE_RESULT < 0) {
         return ROUTE_RESULT;
@@ -1904,6 +2401,10 @@ auto normalize_task_path_inplace(char* path, size_t bufsize) -> int {
 }
 
 auto resolve_task_path_raw(const char* path, char* out, size_t outsize) -> int {
+    return resolve_task_path_raw_impl(path, out, outsize, true);
+}
+
+auto resolve_task_path_raw_impl(const char* path, char* out, size_t outsize, bool apply_task_route) -> int {
     int const ABSOLUTE = make_absolute(path, out, outsize);
     if (ABSOLUTE < 0) {
         return ABSOLUTE;
@@ -1936,7 +2437,7 @@ auto resolve_task_path_raw(const char* path, char* out, size_t outsize) -> int {
         }
     }
 
-    return normalize_task_path_inplace(out, outsize);
+    return normalize_task_path_inplace_with_route(out, outsize, apply_task_route);
 }
 
 auto add_default_vfs_rule(const char* prefix, uint8_t route) -> int {
@@ -2542,6 +3043,7 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
 
 auto vfs_open(std::string_view path, int flags, int mode) -> int {
     vfs_debug_log("vfs_open: opening file\n");
+    bool const OPEN_LOCAL = (flags & ker::vfs::O_LOCAL) != 0;
 
     // Apply umask on creation
     if ((flags & ker::vfs::O_CREAT) != 0) {
@@ -2571,7 +3073,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
 
     std::array<char, MAX_PATH_LEN> path_buffer{};
     // NOLINTNEXTLINE(readability-suspicious-call-argument)
-    if (resolve_task_path_raw(raw_path.data(), path_buffer.data(), MAX_PATH_LEN) < 0) {
+    if (resolve_task_path_raw_impl(raw_path.data(), path_buffer.data(), MAX_PATH_LEN, !OPEN_LOCAL) < 0) {
         log_loader_path_event("resolve-failed", raw_path.data(), nullptr, nullptr, -ENOENT);
         return -ENOENT;
     }
@@ -2587,7 +3089,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
 
     if (!REMOTE_MOUNT) {
         char resolved[MAX_PATH_LEN];  // NOLINT
-        int const RESOLVE_RET = resolve_symlinks(path_buffer.data(), resolved, MAX_PATH_LEN, true);
+        int const RESOLVE_RET = resolve_symlinks(path_buffer.data(), resolved, MAX_PATH_LEN, !OPEN_LOCAL);
         if (RESOLVE_RET == -ELOOP) {
             log::warn("vfs_open: too many symlink levels");
             return -ELOOP;
@@ -2730,6 +3232,10 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
         vfs_destroy_file(f);
         return TRUNCATE_RET;
     }
+    if ((flags & ker::vfs::O_NO_CACHE) != 0) {
+        vfs_cache_notify_path_changed(f->vfs_path, nullptr);
+    }
+    vfs_cache_notify_register_open_file(f);
 
     int const FD = vfs_alloc_fd(current, f);
     if (FD < 0) {
@@ -2740,6 +3246,8 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     }
     return FD;
 }
+
+auto vfs_close_file(File* file) -> int { return vfs_destroy_file(file); }
 
 auto vfs_close(int fd) -> int {
     // Release FD from current task
@@ -2780,8 +3288,9 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
         return -EINVAL;
     }
 
+    bool const USE_STREAM_CACHE = (f->open_flags & ker::vfs::O_NO_CACHE) == 0;
     ssize_t cached_result = 0;
-    if (vfs_stream_cache_try_read(f, buf, count, actual_size, &cached_result)) {
+    if (USE_STREAM_CACHE && vfs_stream_cache_try_read(f, buf, count, static_cast<uint64_t>(f->pos), actual_size, &cached_result)) {
         cached_result = clamp_io_count(cached_result, count);
         if (cached_result >= 0) {
             f->pos += cached_result;
@@ -2837,7 +3346,7 @@ auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ss
     }
     result = clamp_io_count(result, count);
     if (result >= 0) {
-        stream_invalidate_file(f);
+        vfs_cache_notify_file_changed(f);
         if (TMPFS_APPEND || XFS_APPEND) {
             f->pos = static_cast<off_t>(append_offset + static_cast<size_t>(result));
         } else {
@@ -3363,7 +3872,11 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int {
     }
 
     auto* node = ker::vfs::tmpfs::tmpfs_create_symlink(parent, link_name, target);
-    return (node != nullptr) ? 0 : -1;
+    if (node == nullptr) {
+        return -1;
+    }
+    vfs_cache_notify_path_changed(abs_linkpath.data(), nullptr);
+    return 0;
 }
 
 // Internal readlink operating on an already-resolved absolute path (no root
@@ -3470,6 +3983,20 @@ auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize
 
 }  // namespace
 
+void vfs_cache_notify_register_open_file(File* file) { cache_notify_register_open_file_impl(file); }
+
+void vfs_cache_notify_invalidate_path(const char* vfs_path) { cache_notify_invalidate_path_impl(vfs_path); }
+
+void vfs_cache_notify_path_changed(const char* old_vfs_path, const char* new_vfs_path) {
+    cache_notify_path_changed_impl(old_vfs_path, new_vfs_path);
+}
+
+void vfs_cache_notify_file_changed(File* file) { cache_notify_file_changed_impl(file); }
+
+auto vfs_cache_notify_file_dirty(File* file) -> bool { return cache_notify_file_dirty_impl(file); }
+
+void vfs_cache_notify_acknowledge_file(File* file) { cache_notify_acknowledge_file_impl(file); }
+
 auto vfs_readlink_resolved(const char* path, char* buf, size_t bufsize) -> ssize_t {
     if (path == nullptr || buf == nullptr || bufsize == 0) {
         return -EINVAL;
@@ -3515,19 +4042,31 @@ auto vfs_mkdir(const char* path, int mode) -> int {
 
     if (mount->fs_type == FSType::TMPFS) {
         auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, true);
-        return (node != nullptr) ? 0 : -1;
+        if (node == nullptr) {
+            return -1;
+        }
+        vfs_cache_notify_path_changed(abs_path.data(), nullptr);
+        return 0;
     }
 
     if (mount->fs_type == FSType::XFS) {
         auto* xctx = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
         int const R = ker::vfs::xfs::xfs_mkdir_path(fs_path, mode, xctx);
         // mkdir -p calls mkdir on existing dirs; treat EEXIST as success
-        return (R == -EEXIST) ? 0 : R;
+        int const RESULT = (R == -EEXIST) ? 0 : R;
+        if (RESULT == 0) {
+            vfs_cache_notify_path_changed(abs_path.data(), nullptr);
+        }
+        return RESULT;
     }
 
     if (mount->fs_type == FSType::REMOTE) {
         int const R = ker::net::wki::wki_remote_vfs_mkdir(mount->private_data, fs_path, mode);
-        return (R == -EEXIST) ? 0 : R;
+        int const RESULT = (R == -EEXIST) ? 0 : R;
+        if (RESULT == 0) {
+            vfs_cache_notify_path_changed(abs_path.data(), nullptr);
+        }
+        return RESULT;
     }
 
     // For other mounts (devfs, procfs, etc.) return 0 if the directory exists
@@ -3769,28 +4308,15 @@ auto vfs_lstat(const char* path, Stat* statbuf) -> int { return vfs_stat_impl(pa
 
 auto vfs_stat_resolved(const char* path, Stat* statbuf) -> int { return vfs_stat_impl(path, statbuf, false, false, true); }
 
-auto vfs_fstat(int fd, Stat* statbuf) -> int {
-    if (statbuf == nullptr) {
+auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
+    if (file == nullptr || statbuf == nullptr) {
         return -EINVAL;
     }
 
-    auto* task = ker::mod::sched::get_current_task();
-    if (task == nullptr) {
-        return -ESRCH;
-    }
-
-    auto* file = vfs_get_file_retain(task, fd);
-    if (file == nullptr) {
-        return -EBADF;
-    }
-
-    // Initialize stat buffer
     std::memset(statbuf, 0, sizeof(Stat));
 
     if (file->fops == nullptr && file->private_data == nullptr && file->is_directory && file->vfs_path != nullptr) {
-        int const RESULT = fill_synthetic_mount_dir_stat(file->vfs_path, statbuf);
-        vfs_put_file(file);
-        return RESULT;
+        return fill_synthetic_mount_dir_stat(file->vfs_path, statbuf);
     }
 
     MountPoint const* fstat_mount = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path) : nullptr;
@@ -3803,12 +4329,10 @@ auto vfs_fstat(int fd, Stat* statbuf) -> int {
                 // Return minimal stat for pseudo-TMPFS (pipes, epoll)
                 statbuf->st_mode = S_IFIFO;
                 statbuf->st_blksize = 4096;
-                vfs_put_file(file);
                 return 0;
             }
             auto* node = static_cast<ker::vfs::tmpfs::TmpNode*>(file->private_data);
             if (node == nullptr) {
-                vfs_put_file(file);
                 return -EBADF;
             }
             statbuf->st_dev = FSTAT_DEV_ID;
@@ -3831,7 +4355,6 @@ auto vfs_fstat(int fd, Stat* statbuf) -> int {
                     statbuf->st_mode = S_IFLNK | node->mode;
                     break;
             }
-            vfs_put_file(file);
             return 0;
         }
         case FSType::FAT32: {
@@ -3839,7 +4362,6 @@ auto vfs_fstat(int fd, Stat* statbuf) -> int {
             if (R == 0) {
                 statbuf->st_dev = FSTAT_DEV_ID;
             }
-            vfs_put_file(file);
             return R;
         }
         case FSType::DEVFS: {
@@ -3860,7 +4382,6 @@ auto vfs_fstat(int fd, Stat* statbuf) -> int {
             } else {
                 statbuf->st_mode = S_IFCHR | ((node != nullptr) ? node->mode : 0666);
             }
-            vfs_put_file(file);
             return 0;
         }
         case FSType::SOCKET: {
@@ -3874,21 +4395,12 @@ auto vfs_fstat(int fd, Stat* statbuf) -> int {
             statbuf->st_size = 0;
             statbuf->st_blksize = 4096;
             statbuf->st_blocks = 0;
-            vfs_put_file(file);
             return 0;
         }
         case FSType::REMOTE: {
-            if (file->vfs_path != nullptr) {
-                MountPoint const* mount = find_mount_point(file->vfs_path);
-                if (mount != nullptr && mount->fs_type == FSType::REMOTE) {
-                    const char* fs_path = strip_mount_prefix(mount, file->vfs_path);
-                    int const RET = ker::net::wki::wki_remote_vfs_stat(mount->private_data, fs_path, statbuf);
-                    if (RET == 0) {
-                        statbuf->st_dev = mount->dev_id;
-                        vfs_put_file(file);
-                        return 0;
-                    }
-                }
+            int const RET = ker::net::wki::wki_remote_vfs_fstat(file, statbuf);
+            if (RET == 0) {
+                return 0;
             }
 
             // Fall back to a synthetic stat if path-based remote metadata lookup fails.
@@ -3907,12 +4419,10 @@ auto vfs_fstat(int fd, Stat* statbuf) -> int {
                 statbuf->st_mode = S_IFREG | 0644;
                 statbuf->st_size = 0;
             }
-            vfs_put_file(file);
             return 0;
         }
         case FSType::PROCFS: {
             int const R = ker::vfs::procfs::procfs_fill_stat(file, statbuf, FSTAT_DEV_ID);
-            vfs_put_file(file);
             return R;
         }
         case FSType::XFS: {
@@ -3920,13 +4430,31 @@ auto vfs_fstat(int fd, Stat* statbuf) -> int {
             if (R == 0) {
                 statbuf->st_dev = FSTAT_DEV_ID;
             }
-            vfs_put_file(file);
             return R;
         }
         default:
-            vfs_put_file(file);
             return -ENOSYS;
     }
+}
+
+auto vfs_fstat(int fd, Stat* statbuf) -> int {
+    if (statbuf == nullptr) {
+        return -EINVAL;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+
+    auto* file = vfs_get_file_retain(task, fd);
+    if (file == nullptr) {
+        return -EBADF;
+    }
+
+    int const RESULT = vfs_fstat_file(file, statbuf);
+    vfs_put_file(file);
+    return RESULT;
 }
 
 // --- statvfs / fstatvfs ---
@@ -4330,6 +4858,15 @@ auto vfs_pread(int fd, void* buf, size_t count, off_t offset) -> ssize_t {
     }
     // Read at given offset without modifying file position
     f->positional_read_depth.fetch_add(1, std::memory_order_acq_rel);
+    bool const USE_STREAM_CACHE = (f->open_flags & ker::vfs::O_NO_CACHE) == 0;
+    ssize_t cached_result = 0;
+    if (USE_STREAM_CACHE && vfs_stream_cache_try_read(f, buf, count, static_cast<uint64_t>(offset), nullptr, &cached_result)) {
+        cached_result = clamp_io_count(cached_result, count);
+        f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
+        vfs_put_file(f);
+        return cached_result;
+    }
+
     auto result = clamp_io_count(f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset)), count);
     f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
     vfs_put_file(f);
@@ -4350,6 +4887,9 @@ auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t 
         return -ENOSYS;
     }
     auto result = clamp_io_count(f->fops->vfs_write(f, buf, count, static_cast<size_t>(offset)), count);
+    if (result >= 0) {
+        vfs_cache_notify_file_changed(f);
+    }
     vfs_put_file(f);
     return result;
 }
@@ -4372,17 +4912,29 @@ auto vfs_unlink(const char* path) -> int {
 
     if (mount->fs_type == FSType::XFS) {
         const char* fs_path = strip_mount_prefix(mount, path_buf.data());
-        return ker::vfs::xfs::xfs_unlink_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+        int const RET = ker::vfs::xfs::xfs_unlink_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+        if (RET == 0) {
+            vfs_cache_notify_path_changed(path_buf.data(), nullptr);
+        }
+        return RET;
     }
 
     if (mount->fs_type == FSType::FAT32) {
         const char* fs_path = strip_mount_prefix(mount, path_buf.data());
-        return ker::vfs::fat32::fat32_unlink_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), fs_path);
+        int const RET = ker::vfs::fat32::fat32_unlink_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), fs_path);
+        if (RET == 0) {
+            vfs_cache_notify_path_changed(path_buf.data(), nullptr);
+        }
+        return RET;
     }
 
     if (mount->fs_type == FSType::REMOTE) {
         const char* fs_path = strip_mount_prefix(mount, path_buf.data());
-        return ker::net::wki::wki_remote_vfs_unlink(mount->private_data, fs_path);
+        int const RET = ker::net::wki::wki_remote_vfs_unlink(mount->private_data, fs_path);
+        if (RET == 0) {
+            vfs_cache_notify_path_changed(path_buf.data(), nullptr);
+        }
+        return RET;
     }
 
     if (mount->fs_type != FSType::TMPFS) {
@@ -4440,6 +4992,7 @@ auto vfs_unlink(const char* path) -> int {
             ker::vfs::tmpfs::tmpfs_free_node(child);
         }
         ker::vfs::tmpfs::tmpfs_unlock_tree();
+        vfs_cache_notify_path_changed(path_buf.data(), nullptr);
         return 0;
     }
     ker::vfs::tmpfs::tmpfs_unlock_tree();
@@ -4464,17 +5017,29 @@ auto vfs_rmdir(const char* path) -> int {
 
     if (mount->fs_type == FSType::FAT32) {
         const char* fs_path = strip_mount_prefix(mount, path_buf.data());
-        return ker::vfs::fat32::fat32_rmdir_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), fs_path);
+        int const RET = ker::vfs::fat32::fat32_rmdir_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), fs_path);
+        if (RET == 0) {
+            vfs_cache_notify_path_changed(path_buf.data(), nullptr);
+        }
+        return RET;
     }
 
     if (mount->fs_type == FSType::REMOTE) {
         const char* fs_path = strip_mount_prefix(mount, path_buf.data());
-        return ker::net::wki::wki_remote_vfs_rmdir(mount->private_data, fs_path);
+        int const RET = ker::net::wki::wki_remote_vfs_rmdir(mount->private_data, fs_path);
+        if (RET == 0) {
+            vfs_cache_notify_path_changed(path_buf.data(), nullptr);
+        }
+        return RET;
     }
 
     if (mount->fs_type == FSType::XFS) {
         const char* fs_path = strip_mount_prefix(mount, path_buf.data());
-        return ker::vfs::xfs::xfs_rmdir_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+        int const RET = ker::vfs::xfs::xfs_rmdir_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+        if (RET == 0) {
+            vfs_cache_notify_path_changed(path_buf.data(), nullptr);
+        }
+        return RET;
     }
 
     if (mount->fs_type != FSType::TMPFS) {
@@ -4534,6 +5099,7 @@ auto vfs_rmdir(const char* path) -> int {
             ker::vfs::tmpfs::tmpfs_free_node(child);
         }
         ker::vfs::tmpfs::tmpfs_unlock_tree();
+        vfs_cache_notify_path_changed(path_buf.data(), nullptr);
         return 0;
     }
     ker::vfs::tmpfs::tmpfs_unlock_tree();
@@ -4588,19 +5154,32 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
     }
 
     if (old_mount->fs_type == FSType::FAT32 && new_mount->fs_type == FSType::FAT32 && old_mount == new_mount) {
-        return ker::vfs::fat32::fat32_rename_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(old_mount->private_data),
-                                                  strip_mount_prefix(old_mount, old_buf.data()),
-                                                  strip_mount_prefix(new_mount, new_buf.data()));
+        int const RET = ker::vfs::fat32::fat32_rename_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(old_mount->private_data),
+                                                           strip_mount_prefix(old_mount, old_buf.data()),
+                                                           strip_mount_prefix(new_mount, new_buf.data()));
+        if (RET == 0) {
+            vfs_cache_notify_path_changed(old_buf.data(), new_buf.data());
+        }
+        return RET;
     }
 
     if (old_mount->fs_type == FSType::REMOTE && new_mount->fs_type == FSType::REMOTE && old_mount == new_mount) {
-        return ker::net::wki::wki_remote_vfs_rename(old_mount->private_data, strip_mount_prefix(old_mount, old_buf.data()),
-                                                    strip_mount_prefix(new_mount, new_buf.data()));
+        int const RET = ker::net::wki::wki_remote_vfs_rename(old_mount->private_data, strip_mount_prefix(old_mount, old_buf.data()),
+                                                             strip_mount_prefix(new_mount, new_buf.data()));
+        if (RET == 0) {
+            vfs_cache_notify_path_changed(old_buf.data(), new_buf.data());
+        }
+        return RET;
     }
 
     if (old_mount->fs_type == FSType::XFS && new_mount->fs_type == FSType::XFS && old_mount == new_mount) {
-        return ker::vfs::xfs::xfs_rename_path(strip_mount_prefix(old_mount, old_buf.data()), strip_mount_prefix(new_mount, new_buf.data()),
-                                              static_cast<ker::vfs::xfs::XfsMountContext*>(old_mount->private_data));
+        int const RET =
+            ker::vfs::xfs::xfs_rename_path(strip_mount_prefix(old_mount, old_buf.data()), strip_mount_prefix(new_mount, new_buf.data()),
+                                           static_cast<ker::vfs::xfs::XfsMountContext*>(old_mount->private_data));
+        if (RET == 0) {
+            vfs_cache_notify_path_changed(old_buf.data(), new_buf.data());
+        }
+        return RET;
     }
 
     if (old_mount->fs_type != FSType::TMPFS || new_mount->fs_type != FSType::TMPFS) {
@@ -4714,6 +5293,7 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
     }
 
     ker::vfs::tmpfs::tmpfs_unlock_tree();
+    vfs_cache_notify_path_changed(old_buf.data(), new_buf.data());
     return 0;
 }
 
@@ -4742,6 +5322,7 @@ auto vfs_chmod(const char* path, int mode) -> int {
                 return -ENOENT;
             }
             node->mode = static_cast<uint32_t>(mode) & 07777;
+            vfs_cache_notify_path_changed(path_buffer.data(), nullptr);
             return 0;
         }
         case FSType::DEVFS: {
@@ -4750,12 +5331,18 @@ auto vfs_chmod(const char* path, int mode) -> int {
                 return -ENOENT;
             }
             node->mode = static_cast<uint32_t>(mode) & 07777;
+            vfs_cache_notify_path_changed(path_buffer.data(), nullptr);
             return 0;
         }
         case FSType::FAT32:
             return 0;  // FAT32 has no permission model; silently accept
-        case FSType::XFS:
-            return ker::vfs::xfs::xfs_chmod_path(fs_path, mode, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+        case FSType::XFS: {
+            int const RET = ker::vfs::xfs::xfs_chmod_path(fs_path, mode, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+            if (RET == 0) {
+                vfs_cache_notify_path_changed(path_buffer.data(), nullptr);
+            }
+            return RET;
+        }
         default:
             return -ENOSYS;
     }
@@ -4779,6 +5366,7 @@ auto vfs_fchmod(int fd, int mode) -> int {
                 return -EBADF;
             }
             node->mode = static_cast<uint32_t>(mode) & 07777;
+            vfs_cache_notify_file_changed(f);
             vfs_put_file(f);
             return 0;
         }
@@ -4788,6 +5376,9 @@ auto vfs_fchmod(int fd, int mode) -> int {
             return 0;  // No permission model; silently accept
         case FSType::XFS: {
             int const RESULT = ker::vfs::xfs::xfs_fchmod(f, mode);
+            if (RESULT == 0) {
+                vfs_cache_notify_file_changed(f);
+            }
             vfs_put_file(f);
             return RESULT;
         }
@@ -4826,6 +5417,7 @@ auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
             if (std::cmp_not_equal(group, -1)) {
                 node->gid = group;
             }
+            vfs_cache_notify_path_changed(path_buffer.data(), nullptr);
             return 0;
         }
         case FSType::DEVFS: {
@@ -4839,6 +5431,7 @@ auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
             if (std::cmp_not_equal(group, -1)) {
                 node->gid = group;
             }
+            vfs_cache_notify_path_changed(path_buffer.data(), nullptr);
             return 0;
         }
         case FSType::FAT32:
@@ -4872,6 +5465,7 @@ auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int {
             if (std::cmp_not_equal(group, -1)) {
                 node->gid = group;
             }
+            vfs_cache_notify_file_changed(f);
             vfs_put_file(f);
             return 0;
         }
@@ -4902,7 +5496,7 @@ auto vfs_ftruncate(int fd, off_t length) -> int {
     }
     int const RET = f->fops->vfs_truncate(f, length);
     if (RET == 0) {
-        stream_invalidate_file(f);
+        vfs_cache_notify_file_changed(f);
     }
     vfs_put_file(f);
     return RET;
@@ -6280,6 +6874,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
         return nullptr;
     }
 
+    bool const OPEN_LOCAL = (flags & ker::vfs::O_LOCAL) != 0;
     int const ACCMODE = flags & 3;
     bool const PATH_REQUIRES_DIRECTORY = resolve_task_path && path_requires_directory(path);
     bool const FLAGS_REQUIRE_DIRECTORY = (flags & ker::vfs::O_DIRECTORY) != 0;
@@ -6293,15 +6888,18 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
 
     char pathBuffer[MAX_PATH_LEN];  // NOLINT
     if (resolve_task_path) {
-        if (resolve_task_path_raw(path, pathBuffer, MAX_PATH_LEN) < 0) {
+        if (resolve_task_path_raw_impl(path, pathBuffer, MAX_PATH_LEN, !OPEN_LOCAL) < 0) {
             return nullptr;
         }
+
+        // attach before the backend open can find a mount point.
+        ensure_wki_host_root_mount(pathBuffer);
     } else if (copy_path_string(path, pathBuffer, sizeof(pathBuffer)) < 0) {
         return nullptr;
     }
 
     char resolved[MAX_PATH_LEN];  // NOLINT
-    int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy);
+    int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy && !OPEN_LOCAL);
     if (RESOLVE_RET == 0) {
         std::memcpy(pathBuffer, resolved, MAX_PATH_LEN);
     }
@@ -6404,6 +7002,12 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
             f->vfs_path = nullptr;
         }
         f->dir_fs_count = static_cast<size_t>(-1);
+        f->open_flags = flags;
+        f->fd_flags = 0;
+        if ((flags & ker::vfs::O_NO_CACHE) != 0) {
+            vfs_cache_notify_path_changed(f->vfs_path, nullptr);
+        }
+        vfs_cache_notify_register_open_file(f);
     }
 
     return f;

@@ -25,7 +25,8 @@
 #include <net/wki/zone.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
-#include <platform/sched/workqueue.hpp>
+#include <platform/sched/scheduler.hpp>
+#include <platform/sched/task.hpp>
 #include <utility>
 
 #include "platform/sys/spinlock.hpp"
@@ -37,18 +38,41 @@ namespace ker::net::wki {
 // -----------------------------------------------------------------------------
 
 namespace {
-std::deque<DevServerBinding> g_bindings;            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-bool g_dev_server_initialized = false;              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-ker::mod::sys::Spinlock s_server_lock;              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-ker::mod::sched::Workqueue* s_vfs_op_wq = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+constexpr uint32_t WKI_VFS_DAEMON_SLICE_NS = 2'000'000;
+constexpr int WKI_VFS_DAEMON_NICE = -5;
+
+std::deque<DevServerBinding> g_bindings;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+bool g_dev_server_initialized = false;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_server_lock;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 struct DeferredVfsOp {
-    ker::mod::sched::WorkItem work{};
     WkiHeader hdr{};
     uint16_t op_id = 0;
     uint16_t req_data_len = 0;
     uint8_t* req_data = nullptr;
+    DeferredVfsOp* next = nullptr;
 };
+
+constexpr size_t VFS_OP_WORKER_COUNT = 8;
+
+struct VfsOpWorkerShard {
+    ker::mod::sys::Spinlock lock;
+    DeferredVfsOp* head = nullptr;
+    DeferredVfsOp* tail = nullptr;
+    ker::mod::sched::task::Task* task = nullptr;
+    std::atomic<uint32_t> pending{0};
+};
+
+std::array<VfsOpWorkerShard, VFS_OP_WORKER_COUNT> s_vfs_op_workers;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+void promote_vfs_worker(ker::mod::sched::task::Task* task) {
+    if (task == nullptr || task->type != ker::mod::sched::task::TaskType::DAEMON) {
+        return;
+    }
+
+    task->slice_ns = WKI_VFS_DAEMON_SLICE_NS;
+    ker::mod::sched::set_task_nice(task, WKI_VFS_DAEMON_NICE);
+}
 
 struct CachedVfsWriteResponse {
     bool found = false;
@@ -189,8 +213,70 @@ void run_deferred_vfs_op(void* arg) {
     delete op;
 }
 
+auto vfs_worker_index(uint16_t src_node, uint16_t channel_id) -> size_t {
+    auto hash = static_cast<uint32_t>(src_node);
+    hash ^= static_cast<uint32_t>(channel_id) << 16U;
+    hash ^= hash >> 16U;
+    hash *= 0x7feb352dU;
+    hash ^= hash >> 15U;
+    return static_cast<size_t>(hash % VFS_OP_WORKER_COUNT);
+}
+
+auto vfs_worker_dequeue(size_t index) -> DeferredVfsOp* {
+    auto& shard = s_vfs_op_workers.at(index);
+    uint64_t const FLAGS = shard.lock.lock_irqsave();
+    DeferredVfsOp* op = shard.head;
+    if (op != nullptr) {
+        shard.head = op->next;
+        if (shard.head == nullptr) {
+            shard.tail = nullptr;
+        }
+        op->next = nullptr;
+        shard.pending.fetch_sub(1, std::memory_order_relaxed);
+    }
+    shard.lock.unlock_irqrestore(FLAGS);
+    return op;
+}
+
+void vfs_op_worker_loop(size_t index) {
+    while (true) {
+        DeferredVfsOp* op = vfs_worker_dequeue(index);
+        if (op != nullptr) {
+            run_deferred_vfs_op(op);
+            continue;
+        }
+        ker::mod::sched::kern_block();
+    }
+}
+
+void vfs_op_worker_0() { vfs_op_worker_loop(0); }
+void vfs_op_worker_1() { vfs_op_worker_loop(1); }
+void vfs_op_worker_2() { vfs_op_worker_loop(2); }
+void vfs_op_worker_3() { vfs_op_worker_loop(3); }
+void vfs_op_worker_4() { vfs_op_worker_loop(4); }
+void vfs_op_worker_5() { vfs_op_worker_loop(5); }
+void vfs_op_worker_6() { vfs_op_worker_loop(6); }
+void vfs_op_worker_7() { vfs_op_worker_loop(7); }
+
+auto vfs_worker_for(const WkiHeader* hdr) -> VfsOpWorkerShard* {
+    if (hdr == nullptr) {
+        return nullptr;
+    }
+
+    size_t const START = vfs_worker_index(hdr->src_node, hdr->channel_id);
+    for (size_t attempt = 0; attempt < VFS_OP_WORKER_COUNT; ++attempt) {
+        size_t const INDEX = (START + attempt) % VFS_OP_WORKER_COUNT;
+        auto& shard = s_vfs_op_workers.at(INDEX);
+        if (shard.task != nullptr) {
+            return &shard;
+        }
+    }
+    return nullptr;
+}
+
 auto queue_vfs_op(const WkiHeader* hdr, uint16_t op_id, const uint8_t* req_data, uint16_t req_data_len) -> bool {
-    if (s_vfs_op_wq == nullptr) {
+    auto* shard = vfs_worker_for(hdr);
+    if (shard == nullptr) {
         return false;
     }
 
@@ -208,12 +294,22 @@ auto queue_vfs_op(const WkiHeader* hdr, uint16_t op_id, const uint8_t* req_data,
         std::memcpy(op->req_data, req_data, req_data_len);
     }
 
-    op->work.fn = run_deferred_vfs_op;
-    op->work.arg = op;
     op->hdr = *hdr;
     op->op_id = op_id;
     op->req_data_len = req_data_len;
-    s_vfs_op_wq->enqueue(&op->work);
+    op->next = nullptr;
+
+    uint64_t const FLAGS = shard->lock.lock_irqsave();
+    if (shard->tail != nullptr) {
+        shard->tail->next = op;
+    } else {
+        shard->head = op;
+    }
+    shard->tail = op;
+    shard->pending.fetch_add(1, std::memory_order_relaxed);
+    shard->lock.unlock_irqrestore(FLAGS);
+
+    ker::mod::sched::kern_wake(shard->task);
     return true;
 }
 
@@ -354,9 +450,31 @@ void wki_dev_server_init() {
     if (g_dev_server_initialized) {
         return;
     }
-    s_vfs_op_wq = ker::mod::sched::Workqueue::create("wki_vfs_srv");
-    if (s_vfs_op_wq == nullptr) {
-        ker::mod::dbg::log("[WKI] Dev server failed to create VFS workqueue");
+
+    using WorkerEntry = void (*)();
+    constexpr std::array<WorkerEntry, VFS_OP_WORKER_COUNT> VFS_OP_WORKER_ENTRIES = {
+        vfs_op_worker_0, vfs_op_worker_1, vfs_op_worker_2, vfs_op_worker_3,
+        vfs_op_worker_4, vfs_op_worker_5, vfs_op_worker_6, vfs_op_worker_7,
+    };
+    constexpr std::array<const char*, VFS_OP_WORKER_COUNT> VFS_OP_WORKER_NAMES = {
+        "wki_vfs_srv0", "wki_vfs_srv1", "wki_vfs_srv2", "wki_vfs_srv3", "wki_vfs_srv4", "wki_vfs_srv5", "wki_vfs_srv6", "wki_vfs_srv7",
+    };
+
+    bool any_vfs_worker = false;
+    for (size_t i = 0; i < VFS_OP_WORKER_COUNT; ++i) {
+        auto* worker = ker::mod::sched::task::Task::create_kernel_thread(VFS_OP_WORKER_NAMES.at(i), VFS_OP_WORKER_ENTRIES.at(i));
+        s_vfs_op_workers.at(i).task = worker;
+        if (worker != nullptr) {
+            promote_vfs_worker(worker);
+            ker::mod::sched::post_task_balanced(worker);
+            any_vfs_worker = true;
+        } else {
+            ker::mod::dbg::log("[WKI] Dev server failed to create VFS worker: index=%u", static_cast<unsigned>(i));
+        }
+    }
+
+    if (!any_vfs_worker) {
+        ker::mod::dbg::log("[WKI] Dev server failed to create any VFS workers");
     }
     g_dev_server_initialized = true;
     ker::mod::dbg::log("[WKI] Dev server subsystem initialized");
@@ -829,14 +947,14 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                     }
 
                     // Bulk staging buffer (RoCE bulk pull mode): server reads
-                    // large VFS chunks here, then the consumer pulls them via
-                    // RDMA. This keeps renderbench/file-transfer paths on the
-                    // 2 MiB bulk protocol instead of the 64 KiB fallback.
-                    auto* bbuf = new (std::nothrow) uint8_t[VFS_RDMA_BULK_SIZE];
+                    // transport-sized VFS chunks here, then the consumer pulls
+                    // them via RDMA. RoCE already caps each pull burst, so avoid
+                    // reserving a 2 MiB buffer for a 128 KiB transfer window.
+                    auto* bbuf = new (std::nothrow) uint8_t[VFS_RDMA_ROCE_BULK_SIZE];
                     if (bbuf != nullptr) {
                         uint32_t brkey = 0;
                         int const BREG_RET = peer->rdma_transport->rdma_register_region(
-                            peer->rdma_transport, reinterpret_cast<uint64_t>(bbuf), VFS_RDMA_BULK_SIZE, &brkey);
+                            peer->rdma_transport, reinterpret_cast<uint64_t>(bbuf), VFS_RDMA_ROCE_BULK_SIZE, &brkey);
                         if (BREG_RET == 0 && brkey != 0) {
                             binding.vfs_rdma_bulk_staging_buf = bbuf;
                             binding.vfs_rdma_bulk_staging_rkey = brkey;
@@ -844,7 +962,12 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                             ack.rdma_bulk_staging_rkey = brkey;
                         } else {
                             delete[] bbuf;
+                            ker::mod::dbg::log("[WKI] VFS attach: bulk staging registration failed node=0x%04x ret=%d", hdr->src_node,
+                                               BREG_RET);
                         }
+                    } else {
+                        ker::mod::dbg::log("[WKI] VFS attach: bulk staging allocation failed node=0x%04x size=%u", hdr->src_node,
+                                           VFS_RDMA_ROCE_BULK_SIZE);
                     }
                 }
             }
@@ -1073,6 +1196,10 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
         // D11: OP_NET_RX_NOTIFY is sent server->consumer on the dynamic channel.
         // The consumer has a proxy (not a server binding), so route to the
         // consumer-side handler instead of returning an error.
+        if (req->op_id == OP_VFS_INVALIDATE) {
+            detail::handle_vfs_invalidate_notify(hdr, req_data, REQ_DATA_LEN);
+            return;
+        }
         if (req->op_id == OP_NET_RX_NOTIFY) {
             detail::handle_net_rx_notify(hdr, req_data, REQ_DATA_LEN);
             return;
@@ -1782,6 +1909,42 @@ void wki_dev_server_complete_vfs_write(uint16_t consumer_node, uint16_t channel_
         binding->vfs_rdma_write_resp_bytes = bytes_written;
     }
     s_server_lock.unlock_irqrestore(SRV_FLAGS);
+}
+
+void wki_dev_server_send_vfs_notify(uint32_t resource_id, uint16_t op_id, const uint8_t* data, uint16_t data_len) {
+    if (resource_id == 0 || data == nullptr) {
+        return;
+    }
+
+    std::array<uint8_t, sizeof(DevOpReqPayload) + 516> req{};
+    size_t const TOTAL = sizeof(DevOpReqPayload) + data_len;
+    if (TOTAL > req.size()) {
+        return;
+    }
+
+    auto* req_hdr = reinterpret_cast<DevOpReqPayload*>(req.data());
+    req_hdr->op_id = op_id;
+    req_hdr->data_len = data_len;
+    std::memcpy(req.data() + sizeof(DevOpReqPayload), data, data_len);
+
+    struct Target {
+        uint16_t consumer_node = WKI_NODE_INVALID;
+        uint16_t channel_id = 0;
+    };
+    std::deque<Target> targets;
+
+    uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+    for (const auto& binding : g_bindings) {
+        if (!binding.active || binding.resource_type != ResourceType::VFS || binding.resource_id != resource_id) {
+            continue;
+        }
+        targets.push_back({.consumer_node = binding.consumer_node, .channel_id = binding.assigned_channel});
+    }
+    s_server_lock.unlock_irqrestore(SRV_FLAGS);
+
+    for (const auto& target : targets) {
+        static_cast<void>(wki_send(target.consumer_node, target.channel_id, MsgType::DEV_OP_REQ, req.data(), static_cast<uint16_t>(TOTAL)));
+    }
 }
 
 auto wki_dev_server_get_vfs_read_staging_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t* {

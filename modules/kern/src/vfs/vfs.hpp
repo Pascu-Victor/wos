@@ -53,6 +53,8 @@ auto vfs_open_file(const char* path, int flags, int mode) -> File*;
 // Open an already resolved absolute backing path without consulting the current
 // task's root or WKI routing policy.
 auto vfs_open_file_resolved(const char* path, int flags, int mode) -> File*;
+// Close and destroy a File* that was opened without FD allocation.
+auto vfs_close_file(File* file) -> int;
 auto vfs_close(int fd) -> int;
 auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
 auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
@@ -71,6 +73,8 @@ auto vfs_stat(const char* path, Stat* statbuf) -> int;
 auto vfs_lstat(const char* path, Stat* statbuf) -> int;
 auto vfs_stat_resolved(const char* path, Stat* statbuf) -> int;
 auto vfs_fstat(int fd, Stat* statbuf) -> int;
+// Stat an already-open file without allocating an FD or consulting task state.
+auto vfs_fstat_file(File* file, Stat* statbuf) -> int;
 
 // Filesystem statistics
 auto vfs_statvfs(const char* path, Statvfs* buf) -> int;
@@ -181,5 +185,13 @@ void init();
 
 // Stream-cache teardown helper for REMOTE mounts.
 void vfs_stream_cache_invalidate_remote_scope(const void* remote_scope);
+
+// Cache-notify helpers shared with WKI remote VFS.
+void vfs_cache_notify_register_open_file(File* file);
+void vfs_cache_notify_invalidate_path(const char* vfs_path);
+void vfs_cache_notify_path_changed(const char* old_vfs_path, const char* new_vfs_path);
+void vfs_cache_notify_file_changed(File* file);
+auto vfs_cache_notify_file_dirty(File* file) -> bool;
+void vfs_cache_notify_acknowledge_file(File* file);
 
 }  // namespace ker::vfs

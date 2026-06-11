@@ -14,6 +14,9 @@ namespace ker::mod::debug::ptrace {
 auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t data, ker::mod::cpu::GPRegs& caller_regs) -> uint64_t;
 auto report_user_stop(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame, abi::ptrace::stop_reason reason, uint32_t signal,
                       uint64_t address) -> bool;
+auto report_user_exception_stop(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame, uint32_t signal, uint64_t address,
+                                uint64_t message) -> bool;
+auto report_fatal_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum) -> bool;
 auto report_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum, bool exiting) -> bool;
 auto report_signal_stop(ker::mod::sched::task::Task& task, uint32_t signal) -> bool;
 

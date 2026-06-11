@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -18,7 +19,7 @@ namespace ker::net::wki {
 
 constexpr size_t VFS_EXPORT_PATH_LEN = 256;
 constexpr size_t VFS_EXPORT_NAME_LEN = 64;
-constexpr size_t VFS_READLINK_CACHE_ENTRIES = 32;
+constexpr size_t VFS_READLINK_CACHE_ENTRIES = 128;
 constexpr size_t VFS_READLINK_CACHE_TEXT_MAX = 512;
 
 // Bounce buffer sizes for RDMA-backed VFS I/O.
@@ -29,6 +30,10 @@ constexpr uint32_t VFS_RDMA_WRITE_SIZE = 4 * 1024 * 1024;
 // Reads > VFS_RDMA_BOUNCE_SIZE are serviced through a single RDMA write into this
 // larger buffer instead of looping in 64 KB chunks.
 constexpr uint32_t VFS_RDMA_BULK_SIZE = 2097152;  // 2 MB
+// RoCE pull-mode bulk reads are intentionally capped below the Ethernet TX ring
+// pressure point. Allocate only the window the transport will actually use.
+constexpr uint32_t VFS_RDMA_ROCE_BULK_SIZE = 128 * 1024;
+static_assert(VFS_RDMA_ROCE_BULK_SIZE >= VFS_RDMA_BOUNCE_SIZE);
 
 // -----------------------------------------------------------------------------
 // VfsExport (server side) - explicitly registered export paths
@@ -94,24 +99,30 @@ struct ProxyVfsState {
     std::array<ReadlinkCacheEntry, VFS_READLINK_CACHE_ENTRIES> readlink_cache = {};
 
     // RDMA-backed I/O - populated at mount time when peer has RDMA transport.
-    // Consumer registers rdma_bounce_buf for reads (server rdma_writes here).
-    // For writes, consumer rdma_writes directly from caller/write-behind memory
-    // into the server's pre-registered receive region.
+    // Consumer registers rdma_bounce_buf for 64 KiB read mode. For writes,
+    // consumer rdma_writes directly from caller/write-behind memory into the
+    // server's pre-registered receive region.
     bool rdma_capable = false;
     WkiTransport* rdma_transport = nullptr;
-    uint32_t rdma_read_rkey = 0;                 // our bounce buffer's rkey (server writes file data here)
-    uint8_t* rdma_bounce_buf = nullptr;          // 64 KB bounce buffer for reads
-    uint32_t rdma_server_write_rkey = 0;         // server's receive region rkey (consumer writes here for writes)
-    uint32_t rdma_server_read_staging_rkey = 0;  // server's read staging rkey (RoCE pull mode: client rdma_reads from here)
-    uint32_t rdma_server_bulk_staging_rkey = 0;  // server's bulk staging rkey (RoCE bulk pull mode)
+    uint32_t rdma_read_rkey = 0;                  // our bounce buffer rkey for read-push mode
+    uint8_t* rdma_bounce_buf = nullptr;           // 64 KB bounce/staging buffer for reads
+    uint32_t rdma_server_write_rkey = 0;          // server's receive region rkey (consumer writes here for writes)
+    uint32_t rdma_server_read_staging_rkey = 0;   // server's read staging rkey (RoCE pull mode: client rdma_reads from here)
+    uint32_t rdma_server_bulk_staging_rkey = 0;   // server's bulk staging rkey (RoCE bulk pull mode)
+    std::atomic<bool> rdma_read_disabled{false};  // Runtime fallback after read-side RDMA transport failures.
+    std::atomic<uint64_t> rdma_read_retry_after_us{0};
+    std::atomic<uint32_t> rdma_read_failure_count{0};
 
-    // Bulk RDMA I/O - larger registered buffer for sequential reads > 64 KB.
-    // Reduces round-trips from N (64 KB chunks) to 1 (up to 2 MB).
+    // Bulk RDMA I/O - larger registered buffer for sequential reads and mmap
+    // prefetch. The size is transport-specific.
     bool bulk_rdma_capable = false;
-    uint32_t rdma_bulk_rkey = 0;       // our bulk buffer's rkey (server writes large file data here)
-    uint8_t* rdma_bulk_buf = nullptr;  // 2 MB bulk buffer for large reads
-    uint32_t rdma_bulk_size = 0;       // actual allocated size
-    int32_t bulk_owner_fd = -1;        // remote_fd of file that last prefetched into bulk buffer
+    uint32_t rdma_bulk_rkey = 0;                  // our bulk buffer's rkey (server writes large file data here)
+    uint8_t* rdma_bulk_buf = nullptr;             // transport-sized bulk buffer for large reads
+    uint32_t rdma_bulk_size = 0;                  // actual allocated size
+    int32_t bulk_owner_fd = -1;                   // remote_fd of file that last prefetched into bulk buffer
+    std::atomic<bool> bulk_rdma_disabled{false};  // Runtime fallback after bulk RDMA transport failures.
+    std::atomic<uint64_t> bulk_rdma_retry_after_us{0};
+    std::atomic<uint32_t> bulk_rdma_failure_count{0};
     std::atomic<bool> shared_io_in_use{false};
 
     ker::mod::sys::Spinlock lock;
@@ -152,6 +163,10 @@ struct RemoteFileContext {
     // D6: Read-ahead and write-behind (lazily allocated on first use)
     ReadAheadCache* read_cache = nullptr;
     WriteBehindBuffer* write_buf = nullptr;
+
+    ker::mod::sys::Spinlock stat_cache_lock;
+    bool stat_cache_valid = false;
+    ker::vfs::Stat stat_cache = {};
 
     // Bulk prefetch cache state - tracks which region of the shared
     // proxy->rdma_bulk_buf belongs to this file.  Valid only when
@@ -211,6 +226,9 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
 // Consumer side: called from vfs_stat() for FSType::REMOTE mounts
 auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path, ker::vfs::Stat* statbuf) -> int;
 
+// Consumer side: cached metadata lookup for an already-open remote file.
+auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int;
+
 // Consumer side: called from vfs_mkdir() for FSType::REMOTE mounts
 auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path, int mode) -> int;
 
@@ -228,6 +246,12 @@ auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relat
 
 // Consumer side: get the FileOperations for remote VFS files
 auto wki_remote_vfs_get_fops() -> ker::vfs::FileOperations*;
+
+// Invalidate per-open remote caches for an already-open remote file.
+void wki_remote_vfs_invalidate_open_file_caches(ker::vfs::File* file);
+
+// Best-effort owner-side invalidation notification for exported local paths.
+void wki_remote_vfs_notify_path_changed(const char* old_local_vfs_path, const char* new_local_vfs_path);
 
 // D9: Auto-discover and advertise exportable local mount points as VFS resources
 void wki_remote_vfs_auto_discover();
@@ -251,6 +275,7 @@ void wki_remote_vfs_gc_stale_fds();
 // -----------------------------------------------------------------------------
 
 namespace detail {
+void handle_vfs_invalidate_notify(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
 
 // Server side: handle VFS operations (called from dev_server handle_dev_op_req)
 void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export_path, const char* export_name, uint16_t op_id,

@@ -324,13 +324,17 @@ void compact_pending_task_completions_locked() {
 }
 
 auto shared_elf_path_matches(const SharedElfCacheEntry& entry, const char* path) -> bool {
-    return path != nullptr && std::strncmp(entry.path.data(), path, entry.path.size()) == 0;
+    if (path == nullptr) {
+        return false;
+    }
+
+    size_t const ENTRY_LEN = std::strlen(entry.path.data());
+    size_t const PATH_LEN = std::strlen(path);
+    return ENTRY_LEN == PATH_LEN && std::strncmp(entry.path.data(), path, PATH_LEN) == 0;
 }
 
 auto shared_elf_freshness_matches(const ker::vfs::Stat& lhs, const ker::vfs::Stat& rhs) -> bool {
-    return lhs.st_ino == rhs.st_ino && lhs.st_size == rhs.st_size && lhs.st_mtim.tv_sec == rhs.st_mtim.tv_sec &&
-           lhs.st_mtim.tv_nsec == rhs.st_mtim.tv_nsec && lhs.st_ctim.tv_sec == rhs.st_ctim.tv_sec &&
-           lhs.st_ctim.tv_nsec == rhs.st_ctim.tv_nsec;
+    return lhs.st_size > 0 && lhs.st_size == rhs.st_size;
 }
 
 auto find_shared_elf_cache_locked(uint16_t submitter_node, const char* path, const ker::vfs::Stat& freshness) -> SharedElfCacheEntry* {
@@ -835,6 +839,47 @@ void apply_submitted_task_identity(ker::mod::sched::task::Task* task, const WkiT
         task->wki_submitter_hostname.back() = '\0';
     }
 }
+
+struct ScopedSubmitVfsIdentity {
+    ker::mod::sched::task::Task* task = nullptr;
+    ker::mod::sched::task::Task::PathBuffer saved_root{};
+    ker::mod::sched::task::Task::HostnameBuffer saved_submitter{};
+    bool active = false;
+
+    ScopedSubmitVfsIdentity(ker::mod::sched::task::Task* current_task, const WkiTaskIdentityContext* identity,
+                            const char* submitter_hostname)
+        : task(current_task) {
+        if (task == nullptr) {
+            return;
+        }
+
+        saved_root = task->root;
+        saved_submitter = task->wki_submitter_hostname;
+
+        if (identity != nullptr && identity->root.front() == '/') {
+            task->root = identity->root;
+        }
+
+        if (submitter_hostname != nullptr && submitter_hostname[0] != '\0') {
+            std::strncpy(task->wki_submitter_hostname.data(), submitter_hostname, task->wki_submitter_hostname.size() - 1);
+            task->wki_submitter_hostname.back() = '\0';
+        } else if (identity != nullptr && identity->submitter_hostname.front() != '\0') {
+            task->wki_submitter_hostname = identity->submitter_hostname;
+        } else {
+            task->wki_submitter_hostname.front() = '\0';
+        }
+
+        active = true;
+    }
+
+    ~ScopedSubmitVfsIdentity() {
+        if (!active || task == nullptr) {
+            return;
+        }
+        task->root = saved_root;
+        task->wki_submitter_hostname = saved_submitter;
+    }
+};
 
 auto serialized_task_vfs_rules_size(const ker::mod::sched::task::Task* task) -> uint16_t {
     if (task == nullptr || task->wki_vfs_rules.empty()) {
@@ -2880,7 +2925,11 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
             file_size = static_cast<size_t>(retry_stat.st_size);
         }
 
-        int const FD = ker::vfs::vfs_open(resolved_path, 0, 0);
+        int open_flags = ker::vfs::O_NOTIFY_CACHE_CHANGE;
+        if (using_disconnected_host_fallback) {
+            open_flags |= ker::vfs::O_LOCAL;
+        }
+        int const FD = ker::vfs::vfs_open(resolved_path, open_flags, 0);
         if (FD < 0) {
             if (RETRY_WINDOW_OPEN && attempt + 1 < WKI_VFS_LOAD_MAX_ATTEMPTS) {
                 uint64_t const WAIT_UNTIL_US = wki_now_us() + WKI_VFS_LOAD_RETRY_BACKOFF_US;
@@ -3039,6 +3088,8 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     std::array<char, 256> exe_path_buf = {};
     const uint8_t* submit_context = nullptr;
     uint16_t submit_context_len = 0;
+    WkiTaskIdentityContext submitted_identity = {};
+    bool has_submitted_identity = false;
     std::strncpy(exe_path_buf.data(), "wki-remote", exe_path_buf.size() - 1);
 
     auto mode = static_cast<TaskDeliveryMode>(submit->delivery_mode);
@@ -3167,6 +3218,9 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
                                         !valid_task_identity_len(submit->identity_len);
     if (INVALID_SUBMIT_CONTEXT) {
         reject_reason = TaskRejectReason::FETCH_FAILED;
+    } else if (submit->identity_len == WkiTaskIdentityContext::V1_SIZE || submit->identity_len == sizeof(WkiTaskIdentityContext)) {
+        memcpy(&submitted_identity, submit_context + submit->args_len, submit->identity_len);
+        has_submitted_identity = true;
     }
 
     // If binary loading failed, reject
@@ -3184,6 +3238,12 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     }
 
     // Execute the ELF buffer (creates task but does NOT schedule it yet)
+    auto* current_task = ker::mod::sched::get_current_task();
+    const char* effective_submitter_hostname = (has_submitted_identity && submitted_identity.submitter_hostname.front() != '\0')
+                                                   ? submitted_identity.submitter_hostname.data()
+                                                   : wki_peer_get_hostname(hdr->src_node);
+    ScopedSubmitVfsIdentity const SUBMIT_VFS_IDENTITY(current_task, has_submitted_identity ? &submitted_identity : nullptr,
+                                                      effective_submitter_hostname);
     ExecResult const EXEC = exec_elf_buffer(elf_buffer, binary_len, elf_buffer_shared);
     if (EXEC.task == nullptr) {
         auto exec_reason = EXEC.reject_reason;
@@ -3235,12 +3295,6 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     const uint8_t* identity_cursor = submit_context + submit->args_len;
     const uint8_t* policy_cursor = identity_cursor + submit->identity_len;
     auto const POLICY_LEN = static_cast<uint16_t>(context_without_ipc - submit->args_len - submit->identity_len);
-    WkiTaskIdentityContext submitted_identity = {};
-    bool has_submitted_identity = false;
-    if (submit->identity_len == WkiTaskIdentityContext::V1_SIZE || submit->identity_len == sizeof(WkiTaskIdentityContext)) {
-        memcpy(&submitted_identity, identity_cursor, submit->identity_len);
-        has_submitted_identity = true;
-    }
 
     if (submit->argc > 0) {
         argv_strings = new const char*[static_cast<size_t>(submit->argc) + 1];

@@ -2,6 +2,7 @@
 
 #include <bits/off_t.h>
 #include <bits/ssize_t.h>
+#include <extern/elf.h>
 
 #include <algorithm>
 #include <array>
@@ -915,6 +916,36 @@ auto generate_maps(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     constexpr uint64_t PML2_SHIFT = 21;
     constexpr uint64_t PML1_SHIFT = 12;
 
+    auto* image_task = task;
+    ker::mod::sched::task::Task* owner_task = nullptr;
+    if (task->owner_pid != 0) {
+        owner_task = ker::mod::sched::find_task_by_pid_safe(task->owner_pid);
+        if (owner_task != nullptr && owner_task->pagemap == task->pagemap) {
+            image_task = owner_task;
+        }
+    }
+
+    auto executable_load_base = [](const ker::mod::sched::task::Task* t) -> uint64_t {
+        if (t == nullptr || t->elf_buffer == nullptr || t->elf_buffer_size < sizeof(Elf64_Ehdr)) {
+            return 0;
+        }
+        const auto* elf = reinterpret_cast<const Elf64_Ehdr*>(t->elf_buffer);
+        if (elf->e_ident[EI_MAG0] != ELFMAG0 || elf->e_ident[EI_MAG1] != ELFMAG1 || elf->e_ident[EI_MAG2] != ELFMAG2 ||
+            elf->e_ident[EI_MAG3] != ELFMAG3 || elf->e_ident[EI_CLASS] != ELFCLASS64) {
+            return 0;
+        }
+        if (elf->e_type != ET_EXEC && elf->e_type != ET_DYN) {
+            return 0;
+        }
+        if (t->entry < elf->e_entry) {
+            return 0;
+        }
+        return t->entry - elf->e_entry;
+    };
+
+    const char* const EXE_PATH = (image_task->exe_path[0] != '\0') ? image_task->exe_path.data() : "";
+    uint64_t const EXE_LOAD_BASE = executable_load_base(image_task);
+
     size_t off = 0;
     uint64_t range_start = 0;
     uint64_t range_end = 0;
@@ -925,9 +956,12 @@ auto generate_maps(uint64_t pid, char* buf, size_t bufsz) -> size_t {
         if (!have_range || off >= bufsz - 1) {
             return;
         }
+        bool const HAS_PATH = range_perms[2] == 'x' && EXE_PATH[0] != '\0';
+        uint64_t const MAP_OFFSET = HAS_PATH && range_start >= EXE_LOAD_BASE ? range_start - EXE_LOAD_BASE : 0;
         int const LEN =
-            std::snprintf(buf + off, bufsz - off, "%012llx-%012llx %s 00000000 00:00 0 \n", static_cast<unsigned long long>(range_start),
-                          static_cast<unsigned long long>(range_end), range_perms.data());
+            std::snprintf(buf + off, bufsz - off, "%012llx-%012llx %s %08llx 00:00 0%s%s\n", static_cast<unsigned long long>(range_start),
+                          static_cast<unsigned long long>(range_end), range_perms.data(), static_cast<unsigned long long>(MAP_OFFSET),
+                          HAS_PATH ? " " : "", HAS_PATH ? EXE_PATH : "");
         if (LEN <= 0) {
             return;
         }
@@ -1002,6 +1036,9 @@ auto generate_maps(uint64_t pid, char* buf, size_t bufsz) -> size_t {
 
     append_range();
     buf[off] = '\0';
+    if (owner_task != nullptr) {
+        owner_task->release();
+    }
     task->release();
     return off;
 }

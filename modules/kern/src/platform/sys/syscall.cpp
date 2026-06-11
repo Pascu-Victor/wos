@@ -21,10 +21,14 @@
 #include "platform/sched/scheduler.hpp"
 #include "syscalls_impl/log/sys_log.hpp"
 #include "syscalls_impl/multiproc/threadInfo.hpp"
+#include "syscalls_impl/process/exit.hpp"
 #include "syscalls_impl/process/process.hpp"
 #include "util/hcf.hpp"
 
 namespace ker::mod::sys {
+namespace {
+constexpr int WOS_SIGSYS = 31;
+}
 
 extern "C" auto syscall_handler(cpu::GPRegs* regs) -> uint64_t {
     sched::begin_syscall_accounting();
@@ -52,7 +56,7 @@ extern "C" auto syscall_handler(cpu::GPRegs* regs) -> uint64_t {
     switch (callnum) {
         case abi::callnums::SYS_LOG:
             result = ker::syscall::log::sys_log(static_cast<abi::sys_log::sys_log_ops>(A1), reinterpret_cast<const char*>(A2), A3, A4,
-                                                reinterpret_cast<const char*>(A5));
+                                                reinterpret_cast<const char*>(A5), A6);
             break;
         case abi::callnums::FUTEX:
             result = ker::syscall::futex::sys_futex(A1, A2, A3, A4);
@@ -108,6 +112,11 @@ extern "C" auto syscall_handler(cpu::GPRegs* regs) -> uint64_t {
             break;
 
         default:
+            if (ker::mod::debug::ptrace::report_fatal_syscall_stop(*regs, callnum_raw)) {
+                ker::syscall::process::wos_proc_exit_signal(WOS_SIGSYS);
+                __builtin_unreachable();
+            }
+
             uint64_t user_rip = 0;
             uint64_t user_rsp = 0;
             uint64_t user_flags = 0;
