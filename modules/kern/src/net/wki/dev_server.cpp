@@ -53,7 +53,7 @@ struct DeferredVfsOp {
     DeferredVfsOp* next = nullptr;
 };
 
-constexpr size_t VFS_OP_WORKER_COUNT = 8;
+constexpr size_t VFS_OP_WORKER_COUNT = 16;
 
 struct VfsOpWorkerShard {
     ker::mod::sys::Spinlock lock;
@@ -214,11 +214,12 @@ void run_deferred_vfs_op(void* arg) {
 }
 
 auto vfs_worker_index(uint16_t src_node, uint16_t channel_id) -> size_t {
-    auto hash = static_cast<uint32_t>(src_node);
-    hash ^= static_cast<uint32_t>(channel_id) << 16U;
+    auto hash = static_cast<uint32_t>(src_node) ^ (static_cast<uint32_t>(channel_id) * 0x9e3779b9U);
     hash ^= hash >> 16U;
     hash *= 0x7feb352dU;
     hash ^= hash >> 15U;
+    hash *= 0x846ca68bU;
+    hash ^= hash >> 16U;
     return static_cast<size_t>(hash % VFS_OP_WORKER_COUNT);
 }
 
@@ -257,6 +258,14 @@ void vfs_op_worker_4() { vfs_op_worker_loop(4); }
 void vfs_op_worker_5() { vfs_op_worker_loop(5); }
 void vfs_op_worker_6() { vfs_op_worker_loop(6); }
 void vfs_op_worker_7() { vfs_op_worker_loop(7); }
+void vfs_op_worker_8() { vfs_op_worker_loop(8); }
+void vfs_op_worker_9() { vfs_op_worker_loop(9); }
+void vfs_op_worker_10() { vfs_op_worker_loop(10); }
+void vfs_op_worker_11() { vfs_op_worker_loop(11); }
+void vfs_op_worker_12() { vfs_op_worker_loop(12); }
+void vfs_op_worker_13() { vfs_op_worker_loop(13); }
+void vfs_op_worker_14() { vfs_op_worker_loop(14); }
+void vfs_op_worker_15() { vfs_op_worker_loop(15); }
 
 auto vfs_worker_for(const WkiHeader* hdr) -> VfsOpWorkerShard* {
     if (hdr == nullptr) {
@@ -309,7 +318,7 @@ auto queue_vfs_op(const WkiHeader* hdr, uint16_t op_id, const uint8_t* req_data,
     shard->pending.fetch_add(1, std::memory_order_relaxed);
     shard->lock.unlock_irqrestore(FLAGS);
 
-    ker::mod::sched::kern_wake(shard->task);
+    ker::mod::sched::wake_task_from_event(shard->task);
     return true;
 }
 
@@ -453,11 +462,14 @@ void wki_dev_server_init() {
 
     using WorkerEntry = void (*)();
     constexpr std::array<WorkerEntry, VFS_OP_WORKER_COUNT> VFS_OP_WORKER_ENTRIES = {
-        vfs_op_worker_0, vfs_op_worker_1, vfs_op_worker_2, vfs_op_worker_3,
-        vfs_op_worker_4, vfs_op_worker_5, vfs_op_worker_6, vfs_op_worker_7,
+        vfs_op_worker_0,  vfs_op_worker_1,  vfs_op_worker_2,  vfs_op_worker_3,  vfs_op_worker_4,  vfs_op_worker_5,
+        vfs_op_worker_6,  vfs_op_worker_7,  vfs_op_worker_8,  vfs_op_worker_9,  vfs_op_worker_10, vfs_op_worker_11,
+        vfs_op_worker_12, vfs_op_worker_13, vfs_op_worker_14, vfs_op_worker_15,
     };
     constexpr std::array<const char*, VFS_OP_WORKER_COUNT> VFS_OP_WORKER_NAMES = {
-        "wki_vfs_srv0", "wki_vfs_srv1", "wki_vfs_srv2", "wki_vfs_srv3", "wki_vfs_srv4", "wki_vfs_srv5", "wki_vfs_srv6", "wki_vfs_srv7",
+        "wki_vfs_srv0",  "wki_vfs_srv1",  "wki_vfs_srv2",  "wki_vfs_srv3",  "wki_vfs_srv4",  "wki_vfs_srv5",
+        "wki_vfs_srv6",  "wki_vfs_srv7",  "wki_vfs_srv8",  "wki_vfs_srv9",  "wki_vfs_srv10", "wki_vfs_srv11",
+        "wki_vfs_srv12", "wki_vfs_srv13", "wki_vfs_srv14", "wki_vfs_srv15",
     };
 
     bool any_vfs_worker = false;

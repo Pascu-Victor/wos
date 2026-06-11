@@ -77,7 +77,8 @@ auto transport_supports_vfs_read_push_rdma(const WkiTransport* transport) -> boo
     // region, and the consumer-side "rdma_read" below is just a local sync/copy.
     // That is true for ivshmem, but not for RoCE: a RoCE rdma_read would issue a
     // network read against neighbor 0/local rkey, fail, and leave stale zeros in
-    // the bounce buffer. RoCE reads must use pull-mode staging or message I/O.
+    // the bounce buffer. RoCE read-push is handled by the explicit tagged-write
+    // path below, not by this ivshmem local-copy helper.
     return std::strcmp(transport->name, "wki-ivshmem") == 0;
 }
 
@@ -151,7 +152,14 @@ struct OpenRespPayload {
     uint8_t is_dir = 0;
     uint8_t has_stat = 0;
     ker::vfs::Stat stat = {};
+    uint32_t prefetched_bytes = 0;
 } __attribute__((packed));
+
+constexpr uint16_t OPEN_REQ_BASE_LEN = 10;
+constexpr uint16_t OPEN_PREFETCH_REQ_LEN = 8;
+constexpr uint16_t OPEN_RESP_NO_STAT_LEN = static_cast<uint16_t>(offsetof(OpenRespPayload, stat));
+constexpr uint16_t OPEN_RESP_WITH_STAT_LEN = static_cast<uint16_t>(offsetof(OpenRespPayload, prefetched_bytes));
+constexpr uint16_t OPEN_RESP_WITH_PREFETCH_LEN = static_cast<uint16_t>(sizeof(OpenRespPayload));
 
 auto perf_current_pid() -> uint64_t {
     auto* task = ker::mod::sched::get_current_task();
@@ -808,11 +816,23 @@ void invalidate_readlink_cache(ProxyVfsState* state) {
     state->lock.unlock();
 }
 
+void clear_remote_file_open_prefetch(RemoteFileContext* ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+
+    delete[] ctx->open_prefetch_buf;
+    ctx->open_prefetch_buf = nullptr;
+    ctx->open_prefetch_offset = -1;
+    ctx->open_prefetch_len = 0;
+}
+
 void invalidate_remote_file_open_caches(RemoteFileContext* ctx) {
     if (ctx == nullptr) {
         return;
     }
 
+    clear_remote_file_open_prefetch(ctx);
     remote_vfs_invalidate_cached_stat(ctx);
 
     if (ctx->read_cache != nullptr) {
@@ -832,14 +852,14 @@ auto path_matches_export(const char* export_path, const char* local_vfs_path) ->
         return false;
     }
 
-    size_t const export_len = std::strlen(export_path);
-    if (export_len == 0) {
+    size_t const EXPORT_LEN = std::strlen(export_path);
+    if (EXPORT_LEN == 0) {
         return false;
     }
-    if (std::strncmp(export_path, local_vfs_path, export_len) != 0) {
+    if (std::strncmp(export_path, local_vfs_path, EXPORT_LEN) != 0) {
         return false;
     }
-    return local_vfs_path[export_len] == '\0' || local_vfs_path[export_len] == '/';
+    return local_vfs_path[EXPORT_LEN] == '\0' || local_vfs_path[EXPORT_LEN] == '/';
 }
 
 auto trim_export_prefix(const char* export_path, const char* local_vfs_path) -> const char* {
@@ -847,8 +867,8 @@ auto trim_export_prefix(const char* export_path, const char* local_vfs_path) -> 
         return nullptr;
     }
 
-    size_t const export_len = std::strlen(export_path);
-    const char* rel = local_vfs_path + export_len;
+    size_t const EXPORT_LEN = std::strlen(export_path);
+    const char* rel = local_vfs_path + EXPORT_LEN;
     while (*rel == '/') {
         rel++;
     }
@@ -1047,9 +1067,31 @@ struct SharedIoSlotGuard {
     ProxyVfsState* state;
 };
 
+struct OptionalSharedIoSlotGuard {
+    OptionalSharedIoSlotGuard(ProxyVfsState* state_ref, bool enabled) : state(enabled ? state_ref : nullptr) {
+        proxy_acquire_shared_io_slot(state);
+    }
+    ~OptionalSharedIoSlotGuard() { proxy_release_shared_io_slot(state); }
+
+    OptionalSharedIoSlotGuard(const OptionalSharedIoSlotGuard&) = delete;
+    auto operator=(const OptionalSharedIoSlotGuard&) -> OptionalSharedIoSlotGuard& = delete;
+
+    ProxyVfsState* state;
+};
+
+struct RoceTaggedReceive {
+    uint32_t rkey = 0;
+    uint16_t cookie = 0;
+};
+
+auto proxy_op_slot_busy(ProxyVfsState* state) -> bool {
+    return state->op_pending.load(std::memory_order_acquire) || state->op_untracked_send_pending.load(std::memory_order_acquire);
+}
+
 // Helper: send DEV_OP_REQ and wait for response
 auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, uint16_t req_data_len, void* resp_buf,
-                             uint16_t resp_buf_max, uint16_t* resp_len_out = nullptr, uint64_t wait_timeout_us = WKI_OP_TIMEOUT_US) -> int {
+                             uint16_t resp_buf_max, uint16_t* resp_len_out = nullptr, uint64_t wait_timeout_us = WKI_OP_TIMEOUT_US,
+                             RoceTaggedReceive* tagged_receive = nullptr) -> int {
     uint64_t const CALLSITE = WOS_PERF_CALLSITE();
     uint64_t const PROXY_WAIT_START = wki_now_us();
 
@@ -1075,11 +1117,11 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
     // Another thread may be using the same proxy (e.g., concurrent stat+open).
     while (true) {
         state->lock.lock();
-        if (!state->op_pending.load(std::memory_order_acquire)) {
+        if (!proxy_op_slot_busy(state)) {
             break;
         }
         state->lock.unlock();
-        if (!state->op_pending.load(std::memory_order_acquire)) {
+        if (!proxy_op_slot_busy(state)) {
             continue;
         }
         ker::mod::sched::kern_sleep_us(VFS_PROXY_CONTENTION_SLEEP_US);
@@ -1098,6 +1140,15 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
         return -EIO;
     }
     uint32_t const CORRELATION = expected_seq;
+
+    if (tagged_receive != nullptr) {
+        if (tagged_receive->rkey == 0 || !wki_roce_region_prepare_tagged_write(tagged_receive->rkey, expected_seq)) {
+            state->lock.unlock();
+            delete[] req_buf;
+            return -EIO;
+        }
+        tagged_receive->cookie = expected_seq;
+    }
 
     // Lock held, op_pending still false - set up wait entry and response fields
     WkiWaitEntry wait = {};
@@ -1203,6 +1254,79 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
     return normalize_proxy_status_for_errno(STATUS);
 }
 
+auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, uint16_t req_data_len) -> int {
+    if (state == nullptr) {
+        return -EINVAL;
+    }
+
+    uint64_t const CALLSITE = WOS_PERF_CALLSITE();
+    uint64_t const PROXY_WAIT_START = wki_now_us();
+
+    auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + req_data_len);
+    auto* req_buf = new (std::nothrow) uint8_t[req_total];
+    if (req_buf == nullptr) {
+        return -ENOMEM;
+    }
+
+    auto* req = reinterpret_cast<DevOpReqPayload*>(req_buf);
+    req->op_id = op_id;
+    req->data_len = req_data_len;
+
+    if (req_data_len > 0 && req_data != nullptr) {
+        memcpy(req_buf + sizeof(DevOpReqPayload), req_data, req_data_len);
+    }
+
+    while (true) {
+        state->lock.lock();
+        if (!proxy_op_slot_busy(state)) {
+            state->op_untracked_send_pending.store(true, std::memory_order_release);
+            break;
+        }
+        state->lock.unlock();
+        if (!proxy_op_slot_busy(state)) {
+            continue;
+        }
+        ker::mod::sched::kern_sleep_us(VFS_PROXY_CONTENTION_SLEEP_US);
+    }
+
+    auto const PROXY_WAIT_US = static_cast<uint32_t>(wki_now_us() - PROXY_WAIT_START);
+    if (PROXY_WAIT_US > 0) {
+        perf_record_vfs_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::PROXY_WAIT), state->owner_node, state->assigned_channel, 0,
+                              PROXY_WAIT_US, CALLSITE);
+    }
+
+    uint16_t expected_seq = 0;
+    if (!peek_channel_tx_seq16(state->owner_node, state->assigned_channel, &expected_seq)) {
+        state->op_untracked_send_pending.store(false, std::memory_order_release);
+        state->lock.unlock();
+        delete[] req_buf;
+        return -EIO;
+    }
+    uint32_t const CORRELATION = expected_seq;
+    state->lock.unlock();
+
+    uint64_t const STARTED_US = wki_now_us();
+    ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id),
+                                     ker::mod::perf::WkiPerfPhase::BEGIN, state->owner_node, state->assigned_channel, CORRELATION, 0,
+                                     req_data_len, CALLSITE);
+
+    int const SEND_RET = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
+    delete[] req_buf;
+
+    state->lock.lock();
+    state->op_untracked_send_pending.store(false, std::memory_order_release);
+    state->lock.unlock();
+
+    auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
+    ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id),
+                                     ker::mod::perf::WkiPerfPhase::END, state->owner_node, state->assigned_channel, CORRELATION, SEND_RET,
+                                     ELAPSED_US, CALLSITE);
+    ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id), state->owner_node,
+                                       state->assigned_channel, SEND_RET, ELAPSED_US, true, 0, req_data_len);
+
+    return normalize_proxy_status_for_errno(encode_proxy_wki_status(SEND_RET));
+}
+
 auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int64_t offset, const uint8_t* src, uint32_t chunk,
                                    uint32_t* written_out) -> int {
     if (state == nullptr || src == nullptr || written_out == nullptr || state->rdma_transport == nullptr ||
@@ -1219,11 +1343,11 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
 
     while (true) {
         state->lock.lock();
-        if (!state->op_pending.load(std::memory_order_acquire)) {
+        if (!proxy_op_slot_busy(state)) {
             break;
         }
         state->lock.unlock();
-        if (!state->op_pending.load(std::memory_order_acquire)) {
+        if (!proxy_op_slot_busy(state)) {
             continue;
         }
         ker::mod::sched::kern_sleep_us(VFS_PROXY_CONTENTION_SLEEP_US);
@@ -1447,6 +1571,21 @@ auto remote_vfs_rdma_retry_ready(const std::atomic<uint64_t>& retry_after_us, ui
     return RETRY_AFTER_US == 0 || now_us >= RETRY_AFTER_US;
 }
 
+auto remote_vfs_open_prefetch_capable(ProxyVfsState* state, int flags) -> bool {
+    constexpr int OPEN_ACCMODE = 0x3;
+    constexpr int OPEN_WRONLY = 0x1;
+
+    if (state == nullptr || (flags & ker::vfs::O_NO_CACHE) != 0 || (flags & ker::vfs::O_TRUNC) != 0 || (flags & ker::vfs::O_CREAT) != 0 ||
+        (flags & ker::vfs::O_DIRECTORY) != 0 || (flags & OPEN_ACCMODE) == OPEN_WRONLY) {
+        return false;
+    }
+
+    return !state->bulk_rdma_disabled.load(std::memory_order_acquire) &&
+           remote_vfs_rdma_retry_ready(state->bulk_rdma_retry_after_us, wki_now_us()) && transport_is_roce(state->rdma_transport) &&
+           state->bulk_rdma_capable && state->rdma_transport != nullptr && state->rdma_bulk_rkey != 0 && state->rdma_bulk_buf != nullptr &&
+           state->rdma_bulk_size > 0;
+}
+
 void remote_vfs_rdma_note_success(std::atomic<uint32_t>& failure_count, std::atomic<uint64_t>& retry_after_us) {
     failure_count.store(0, std::memory_order_release);
     retry_after_us.store(0, std::memory_order_release);
@@ -1467,10 +1606,11 @@ auto remote_vfs_rdma_note_transient_failure(std::atomic<uint32_t>& failure_count
 }
 
 auto vfs_proxy_read_with_retry(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, uint16_t req_data_len, void* resp_buf,
-                               uint16_t resp_buf_max, uint16_t* resp_len_out = nullptr, const char* debug_path = nullptr) -> int {
+                               uint16_t resp_buf_max, uint16_t* resp_len_out = nullptr, const char* debug_path = nullptr,
+                               RoceTaggedReceive* tagged_receive = nullptr) -> int {
     for (uint32_t attempt = 0;; ++attempt) {
         int const STATUS = vfs_proxy_send_and_wait(state, op_id, req_data, req_data_len, resp_buf, resp_buf_max, resp_len_out,
-                                                   vfs_read_retry_timeout_us(op_id, attempt));
+                                                   vfs_read_retry_timeout_us(op_id, attempt), tagged_receive);
         if (!vfs_read_status_is_retryable(STATUS) || attempt >= VFS_READ_RETRIES) {
             return normalize_proxy_status_for_errno(STATUS);
         }
@@ -1589,6 +1729,7 @@ auto remote_vfs_close(ker::vfs::File* f) -> int {
     }
     auto* ctx = static_cast<RemoteFileContext*>(f->private_data);
     if (ctx->proxy == nullptr || !ctx->proxy->active) {
+        clear_remote_file_open_prefetch(ctx);
         delete ctx->read_cache;
         delete ctx->write_buf;
         delete ctx;
@@ -1605,10 +1746,25 @@ auto remote_vfs_close(ker::vfs::File* f) -> int {
     s_vfs_lock.unlock();
 
     // Send OP_VFS_CLOSE: {remote_fd:i32} = 4 bytes
+    // Read-only closes can be fire-and-forget: the request still travels on the
+    // reliable WKI channel, but the local caller does not need remote close
+    // status before the dynamic loader opens the next shared object.
+    constexpr int OPEN_ACCESS_MODE_MASK = 0x3;
+    bool const NEEDS_CLOSE_STATUS = FLUSH_STATUS != 0 || (f->open_flags & OPEN_ACCESS_MODE_MASK) != 0;
     int32_t remote_fd = ctx->remote_fd;
-    vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_CLOSE, reinterpret_cast<const uint8_t*>(&remote_fd), sizeof(int32_t), nullptr, 0);
+    if (NEEDS_CLOSE_STATUS) {
+        vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_CLOSE, reinterpret_cast<const uint8_t*>(&remote_fd), sizeof(int32_t), nullptr, 0);
+    } else {
+        int const SEND_STATUS =
+            vfs_proxy_send_untracked(ctx->proxy, OP_VFS_CLOSE, reinterpret_cast<const uint8_t*>(&remote_fd), sizeof(int32_t));
+        if (SEND_STATUS != 0) {
+            ker::mod::dbg::log("[WKI] async remote close send failed: node=0x%04x ch=%u fd=%d rc=%d", ctx->proxy->owner_node,
+                               ctx->proxy->assigned_channel, remote_fd, SEND_STATUS);
+        }
+    }
 
     // D6: Free caches
+    clear_remote_file_open_prefetch(ctx);
     delete ctx->read_cache;
     delete ctx->write_buf;
 
@@ -1645,6 +1801,31 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     ssize_t total_read = 0;
     bool const POSITIONAL_READ = f->positional_read_depth.load(std::memory_order_acquire) != 0;
     bool const ALLOW_READ_CACHES = (f->open_flags & ker::vfs::O_NO_CACHE) == 0;
+
+    if (ALLOW_READ_CACHES && ctx->open_prefetch_buf != nullptr && ctx->open_prefetch_len > 0 && cur_offset >= ctx->open_prefetch_offset) {
+        int64_t const PREFETCH_END = ctx->open_prefetch_offset + static_cast<int64_t>(ctx->open_prefetch_len);
+        if (cur_offset < PREFETCH_END) {
+            auto off_in_buf = static_cast<uint32_t>(cur_offset - ctx->open_prefetch_offset);
+            auto available = static_cast<uint32_t>(PREFETCH_END - cur_offset);
+            auto to_copy = std::min(remaining, available);
+
+            memcpy(dest, ctx->open_prefetch_buf + off_in_buf, to_copy);
+            dest += to_copy;
+            cur_offset += static_cast<int64_t>(to_copy);
+            remaining -= to_copy;
+            total_read += static_cast<ssize_t>(to_copy);
+
+            if (remaining == 0) {
+                return total_read;
+            }
+
+            ker::vfs::Stat cached_stat = {};
+            if (remote_vfs_try_copy_cached_stat(ctx, &cached_stat) && cached_stat.st_size >= 0 && cur_offset >= cached_stat.st_size) {
+                return total_read;
+            }
+        }
+    }
+
     // -- Bulk RDMA path ----------------------------------------------------
     // Two modes:
     //  (a) Direct bulk - positional reads and request > 64 KB: issue
@@ -1662,13 +1843,17 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     bool skip_read_rdma_this_call = false;
     const bool BULK_READ_ENABLED = !ctx->proxy->bulk_rdma_disabled.load(std::memory_order_acquire) &&
                                    remote_vfs_rdma_retry_ready(ctx->proxy->bulk_rdma_retry_after_us, wki_now_us());
-    const bool BULK_PULL_CAPABLE = BULK_READ_ENABLED && transport_supports_rdma_read_pull(ctx->proxy->rdma_transport) &&
-                                   ctx->proxy->bulk_rdma_capable && ctx->proxy->rdma_transport != nullptr &&
-                                   ctx->proxy->rdma_server_bulk_staging_rkey != 0 && ctx->proxy->rdma_bulk_buf != nullptr;
+    const bool BULK_ROCE_PUSH_CAPABLE = BULK_READ_ENABLED && transport_is_roce(ctx->proxy->rdma_transport) &&
+                                        ctx->proxy->bulk_rdma_capable && ctx->proxy->rdma_transport != nullptr &&
+                                        ctx->proxy->rdma_bulk_rkey != 0 && ctx->proxy->rdma_bulk_buf != nullptr;
+    const bool BULK_PULL_CAPABLE = !BULK_ROCE_PUSH_CAPABLE && BULK_READ_ENABLED &&
+                                   transport_supports_rdma_read_pull(ctx->proxy->rdma_transport) && ctx->proxy->bulk_rdma_capable &&
+                                   ctx->proxy->rdma_transport != nullptr && ctx->proxy->rdma_server_bulk_staging_rkey != 0 &&
+                                   ctx->proxy->rdma_bulk_buf != nullptr;
     const bool BULK_PUSH_CAPABLE = !BULK_PULL_CAPABLE && transport_supports_vfs_read_push_rdma(ctx->proxy->rdma_transport) &&
                                    BULK_READ_ENABLED && ctx->proxy->bulk_rdma_capable && ctx->proxy->rdma_transport != nullptr &&
                                    ctx->proxy->rdma_bulk_rkey != 0 && ctx->proxy->rdma_bulk_buf != nullptr;
-    if (BULK_PULL_CAPABLE || BULK_PUSH_CAPABLE) {
+    if (BULK_PULL_CAPABLE || BULK_ROCE_PUSH_CAPABLE || BULK_PUSH_CAPABLE) {
         SharedIoSlotGuard const SHARED_IO_GUARD(ctx->proxy);
         int bulk_error = 0;
 #ifdef WKI_DEBUG
@@ -1677,7 +1862,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
                                ctx->proxy->assigned_channel, ctx->remote_fd, remaining);
         }
 #endif
-        bool const USE_BULK_PREFETCH_CACHE = ALLOW_READ_CACHES && remaining <= VFS_RDMA_BOUNCE_SIZE;
+        bool const USE_BULK_PREFETCH_CACHE = ALLOW_READ_CACHES;
 
         // -- (b) Prefetch path: try to satisfy from the existing bulk cache --
         if (USE_BULK_PREFETCH_CACHE && ctx->proxy->bulk_owner_fd == ctx->remote_fd && ctx->bulk_cached_len > 0 &&
@@ -1732,8 +1917,16 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
             memcpy(req.data() + 8, &fetch_offset, sizeof(int64_t));
             memcpy(req.data() + 16, &req_rkey, sizeof(uint32_t));
 
+            RoceTaggedReceive tagged_receive{};
+            RoceTaggedReceive* tagged_receive_ptr = nullptr;
+            if (BULK_ROCE_PUSH_CAPABLE) {
+                tagged_receive.rkey = ctx->proxy->rdma_bulk_rkey;
+                tagged_receive_ptr = &tagged_receive;
+            }
+
             uint32_t bytes_read = 0;
-            int const STATUS = vfs_proxy_read_with_retry(ctx->proxy, OP_VFS_READ_BULK, req.data(), 20, &bytes_read, sizeof(uint32_t));
+            int const STATUS = vfs_proxy_read_with_retry(ctx->proxy, OP_VFS_READ_BULK, req.data(), 20, &bytes_read, sizeof(uint32_t),
+                                                         nullptr, nullptr, tagged_receive_ptr);
             if (STATUS != 0) {
                 bulk_error = STATUS;
                 // Invalidate cache on error
@@ -1758,6 +1951,13 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
                     ctx->proxy->bulk_owner_fd = -1;
                     break;
                 }
+            } else if (BULK_ROCE_PUSH_CAPABLE) {
+                if (!wki_roce_region_wait_tagged_write(ctx->proxy->rdma_bulk_rkey, tagged_receive.cookie, bytes_read, WKI_OP_TIMEOUT_US)) {
+                    bulk_error = -ETIMEDOUT;
+                    ctx->bulk_cached_len = 0;
+                    ctx->proxy->bulk_owner_fd = -1;
+                    break;
+                }
             } else {
                 // Push mode: server wrote data into shared memory at rdma_bulk_rkey.
                 int const RDMA_RET = ctx->proxy->rdma_transport->rdma_read(ctx->proxy->rdma_transport, 0, ctx->proxy->rdma_bulk_rkey, 0,
@@ -1770,7 +1970,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
                 }
             }
             remote_vfs_rdma_note_success(ctx->proxy->bulk_rdma_failure_count, ctx->proxy->bulk_rdma_retry_after_us);
-            if (BULK_PULL_CAPABLE) {
+            if (BULK_PULL_CAPABLE || BULK_ROCE_PUSH_CAPABLE) {
                 remote_vfs_rdma_note_success(ctx->proxy->rdma_read_failure_count, ctx->proxy->rdma_read_retry_after_us);
             }
 
@@ -1820,12 +2020,12 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
         uint64_t cooldown_us = 0;
         if (DISABLE_RDMA) {
             ctx->proxy->bulk_rdma_disabled.store(true, std::memory_order_release);
-            if (BULK_PULL_CAPABLE) {
+            if (BULK_PULL_CAPABLE || BULK_ROCE_PUSH_CAPABLE) {
                 ctx->proxy->rdma_read_disabled.store(true, std::memory_order_release);
             }
         } else {
             cooldown_us = remote_vfs_rdma_note_transient_failure(ctx->proxy->bulk_rdma_failure_count, ctx->proxy->bulk_rdma_retry_after_us);
-            if (BULK_PULL_CAPABLE) {
+            if (BULK_PULL_CAPABLE || BULK_ROCE_PUSH_CAPABLE) {
                 remote_vfs_rdma_note_transient_failure(ctx->proxy->rdma_read_failure_count, ctx->proxy->rdma_read_retry_after_us);
                 skip_read_rdma_this_call = true;
             }
@@ -1850,13 +2050,17 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     // Push mode (ivshmem): server rdma_writes to client's bounce buf; client reads locally.
     const bool RDMA_READ_ENABLED = !skip_read_rdma_this_call && !ctx->proxy->rdma_read_disabled.load(std::memory_order_acquire) &&
                                    remote_vfs_rdma_retry_ready(ctx->proxy->rdma_read_retry_after_us, wki_now_us());
-    const bool RDMA_PULL_CAPABLE = RDMA_READ_ENABLED && transport_supports_rdma_read_pull(ctx->proxy->rdma_transport) &&
-                                   ctx->proxy->rdma_capable && ctx->proxy->rdma_transport != nullptr &&
-                                   ctx->proxy->rdma_server_read_staging_rkey != 0 && ctx->proxy->rdma_bounce_buf != nullptr;
+    const bool RDMA_ROCE_PUSH_CAPABLE = RDMA_READ_ENABLED && transport_is_roce(ctx->proxy->rdma_transport) && ctx->proxy->rdma_capable &&
+                                        ctx->proxy->rdma_transport != nullptr && ctx->proxy->rdma_read_rkey != 0 &&
+                                        ctx->proxy->rdma_bounce_buf != nullptr;
+    const bool RDMA_PULL_CAPABLE = !RDMA_ROCE_PUSH_CAPABLE && RDMA_READ_ENABLED &&
+                                   transport_supports_rdma_read_pull(ctx->proxy->rdma_transport) && ctx->proxy->rdma_capable &&
+                                   ctx->proxy->rdma_transport != nullptr && ctx->proxy->rdma_server_read_staging_rkey != 0 &&
+                                   ctx->proxy->rdma_bounce_buf != nullptr;
     const bool RDMA_PUSH_CAPABLE = !RDMA_PULL_CAPABLE && transport_supports_vfs_read_push_rdma(ctx->proxy->rdma_transport) &&
                                    RDMA_READ_ENABLED && ctx->proxy->rdma_capable && ctx->proxy->rdma_transport != nullptr &&
                                    ctx->proxy->rdma_read_rkey != 0 && ctx->proxy->rdma_bounce_buf != nullptr;
-    if (RDMA_PULL_CAPABLE || RDMA_PUSH_CAPABLE) {
+    if (RDMA_PULL_CAPABLE || RDMA_ROCE_PUSH_CAPABLE || RDMA_PUSH_CAPABLE) {
         SharedIoSlotGuard const SHARED_IO_GUARD(ctx->proxy);
         int rdma_error = 0;
         while (remaining > 0) {
@@ -1872,8 +2076,16 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
             memcpy(req.data() + 16, &req_rkey, sizeof(uint32_t));
 
             // Response: {bytes_read:u32} = 4 bytes
+            RoceTaggedReceive tagged_receive{};
+            RoceTaggedReceive* tagged_receive_ptr = nullptr;
+            if (RDMA_ROCE_PUSH_CAPABLE) {
+                tagged_receive.rkey = ctx->proxy->rdma_read_rkey;
+                tagged_receive_ptr = &tagged_receive;
+            }
+
             uint32_t bytes_read = 0;
-            int const STATUS = vfs_proxy_read_with_retry(ctx->proxy, OP_VFS_READ_RDMA, req.data(), 20, &bytes_read, sizeof(uint32_t));
+            int const STATUS = vfs_proxy_read_with_retry(ctx->proxy, OP_VFS_READ_RDMA, req.data(), 20, &bytes_read, sizeof(uint32_t),
+                                                         nullptr, nullptr, tagged_receive_ptr);
             if (STATUS != 0) {
                 rdma_error = STATUS;
                 break;
@@ -1890,6 +2102,11 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
                                                                            ctx->proxy->rdma_bounce_buf, to_copy);
                 if (RDMA_RET != 0) {
                     rdma_error = RDMA_RET;
+                    break;
+                }
+            } else if (RDMA_ROCE_PUSH_CAPABLE) {
+                if (!wki_roce_region_wait_tagged_write(ctx->proxy->rdma_read_rkey, tagged_receive.cookie, to_copy, WKI_OP_TIMEOUT_US)) {
+                    rdma_error = -ETIMEDOUT;
                     break;
                 }
             } else {
@@ -2056,6 +2273,7 @@ auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t o
     }
 
     // Invalidate bulk prefetch cache on write
+    clear_remote_file_open_prefetch(ctx);
     ctx->bulk_cached_len = 0;
     ctx->bulk_cached_offset = -1;
 
@@ -2181,6 +2399,21 @@ auto remote_vfs_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
             int const FLUSH_STATUS = flush_write_behind(ctx);
             if (FLUSH_STATUS != 0) {
                 return FLUSH_STATUS;
+            }
+
+            ker::vfs::Stat cached_stat{};
+            if ((f->open_flags & ker::vfs::O_NO_CACHE) == 0 && remote_vfs_try_copy_cached_stat(ctx, &cached_stat)) {
+                auto const BASE = static_cast<int64_t>(cached_stat.st_size);
+                auto const OFF = static_cast<int64_t>(offset);
+                if ((OFF > 0 && BASE > INT64_MAX - OFF) || (OFF < 0 && BASE < INT64_MIN - OFF)) {
+                    return -EINVAL;
+                }
+                int64_t const NEW_POS = BASE + OFF;
+                if (NEW_POS < 0) {
+                    return -EINVAL;
+                }
+                f->pos = static_cast<off_t>(NEW_POS);
+                break;
             }
 
             // Request: {remote_fd:i32, offset:i64} = 12 bytes
@@ -2588,8 +2821,8 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 
     switch (op_id) {
         case OP_VFS_OPEN: {
-            // Request: {flags:u32, mode:u32, path_len:u16, path[path_len]}
-            if (data_len < 10) {
+            // Request: {flags:u32, mode:u32, path_len:u16, path[path_len], optional prefetch_rkey:u32, prefetch_len:u32}
+            if (data_len < OPEN_REQ_BASE_LEN) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_OPEN;
                 resp.status = -1;
@@ -2606,7 +2839,8 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             memcpy(&mode, data + 4, sizeof(uint32_t));
             memcpy(&path_len, data + 8, sizeof(uint16_t));
 
-            if (data_len < 10 + path_len) {
+            size_t const OPEN_PATH_END = OPEN_REQ_BASE_LEN + static_cast<size_t>(path_len);
+            if (data_len < OPEN_PATH_END) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_OPEN;
                 resp.status = -1;
@@ -2614,6 +2848,14 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.reserved = REQ_COOKIE;
                 wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
                 break;
+            }
+
+            uint32_t prefetch_rkey = 0;
+            uint32_t prefetch_len = 0;
+            if (data_len >= OPEN_PATH_END + OPEN_PREFETCH_REQ_LEN) {
+                memcpy(&prefetch_rkey, data + OPEN_PATH_END, sizeof(uint32_t));
+                memcpy(&prefetch_len, data + OPEN_PATH_END + sizeof(uint32_t), sizeof(uint32_t));
+                prefetch_len = std::min<uint32_t>(prefetch_len, VFS_RDMA_BULK_SIZE);
             }
 
             // Build full path: export_path + "/" + relative_path
@@ -2666,8 +2908,37 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 open_resp.stat = open_stat;
             }
 
-            uint16_t const OPEN_DATA_LEN = open_resp.has_stat ? static_cast<uint16_t>(sizeof(OpenRespPayload))
-                                                              : static_cast<uint16_t>(offsetof(OpenRespPayload, stat));
+            if (prefetch_rkey != 0 && prefetch_len > 0 && open_resp.has_stat != 0 &&
+                (open_stat.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG && file->fops != nullptr && file->fops->vfs_read != nullptr) {
+                WkiPeer const* prefetch_peer = wki_peer_find(hdr->src_node);
+                if (prefetch_peer != nullptr && prefetch_peer->rdma_transport != nullptr &&
+                    prefetch_peer->rdma_transport->rdma_write != nullptr && transport_is_roce(prefetch_peer->rdma_transport)) {
+                    uint8_t* allocated_prefetch_buf = nullptr;
+                    // VFS ops for one binding/channel are worker-serialized, so
+                    // the per-binding bulk staging region is safe temporary
+                    // scratch for open-prefetch before we send the response.
+                    uint8_t* prefetch_buf = wki_dev_server_get_vfs_bulk_staging_buf(hdr->src_node, channel_id);
+                    if (prefetch_buf == nullptr) {
+                        allocated_prefetch_buf = new (std::nothrow) uint8_t[prefetch_len];
+                        prefetch_buf = allocated_prefetch_buf;
+                    }
+                    if (prefetch_buf != nullptr) {
+                        ssize_t const BYTES_READ = read_local_file_windowed(file, prefetch_buf, prefetch_len, 0);
+                        if (BYTES_READ > 0) {
+                            int const WRITE_RET = wki_roce_rdma_write_tagged(hdr->src_node, prefetch_rkey, 0, prefetch_buf,
+                                                                             static_cast<uint32_t>(BYTES_READ), REQ_COOKIE);
+                            if (WRITE_RET == 0) {
+                                open_resp.prefetched_bytes = static_cast<uint32_t>(BYTES_READ);
+                            }
+                        }
+                    }
+                    delete[] allocated_prefetch_buf;
+                }
+            }
+
+            uint16_t const OPEN_DATA_LEN = (open_resp.has_stat == 0)          ? OPEN_RESP_NO_STAT_LEN
+                                           : (open_resp.prefetched_bytes > 0) ? OPEN_RESP_WITH_PREFETCH_LEN
+                                                                              : OPEN_RESP_WITH_STAT_LEN;
             std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(OpenRespPayload)> resp_buf{};  // NOLINT(modernize-avoid-c-arrays)
             auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf.data());
             resp->op_id = OP_VFS_OPEN;
@@ -3662,10 +3933,17 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 
             len = std::min<uint32_t>(len, VFS_RDMA_BOUNCE_SIZE);
 
-            // Determine mode: pull if server has a read staging buf for this binding.
-            uint8_t* read_staging = wki_dev_server_get_vfs_read_staging_buf(hdr->src_node, channel_id);
+            // Determine mode from the request rkey. rkey=0 keeps the legacy
+            // pull path where the server stages data and the client rdma_reads
+            // it; nonzero asks the server to push into the consumer region.
+            bool const PULL_MODE = consumer_rkey == 0;
+            uint8_t* read_staging = PULL_MODE ? wki_dev_server_get_vfs_read_staging_buf(hdr->src_node, channel_id) : nullptr;
             WkiPeer const* rdma_peer = nullptr;
-            if (read_staging == nullptr) {
+            if (PULL_MODE && read_staging == nullptr) {
+                send_rdma_read_err(-EIO);
+                break;
+            }
+            if (!PULL_MODE) {
                 // Push mode: need rdma_write capability.
                 rdma_peer = wki_peer_find(hdr->src_node);
                 if (rdma_peer == nullptr || rdma_peer->rdma_transport == nullptr || rdma_peer->rdma_transport->rdma_write == nullptr) {
@@ -3685,32 +3963,40 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             ker::vfs::File* local_file = rfd->file;
             s_vfs_lock.unlock();
 
-            // Allocate a temporary buffer, read into it, then either push or stage.
-            auto* read_buf = new (std::nothrow) uint8_t[len];
-            if (read_buf == nullptr) {
-                send_rdma_read_err(-ENOMEM);
-                break;
-            }
-
-            ssize_t const BYTES_READ = read_local_file_windowed(local_file, read_buf, len, static_cast<size_t>(offset));
-            if (BYTES_READ > 0) {
-                if (read_staging != nullptr) {
-                    // Pull mode: copy into server staging buf; client will rdma_read from it.
-                    memcpy(read_staging, read_buf, static_cast<uint32_t>(BYTES_READ));
-                } else {
-                    // Push mode: rdma_write data directly into consumer's bounce buf.
-                    rdma_peer->rdma_transport->rdma_write(rdma_peer->rdma_transport, hdr->src_node, consumer_rkey, 0, read_buf,
-                                                          static_cast<uint32_t>(BYTES_READ));
+            ssize_t bytes_read = 0;
+            if (read_staging != nullptr) {
+                // Pull mode: read directly into server staging; client will rdma_read from it.
+                bytes_read = read_local_file_windowed(local_file, read_staging, len, static_cast<size_t>(offset));
+            } else {
+                auto* read_buf = new (std::nothrow) uint8_t[len];
+                if (read_buf == nullptr) {
+                    send_rdma_read_err(-ENOMEM);
+                    break;
                 }
+
+                bytes_read = read_local_file_windowed(local_file, read_buf, len, static_cast<size_t>(offset));
+                if (bytes_read > 0) {
+                    int write_ret = 0;
+                    if (transport_is_roce(rdma_peer->rdma_transport)) {
+                        write_ret = wki_roce_rdma_write_tagged(hdr->src_node, consumer_rkey, 0, read_buf, static_cast<uint32_t>(bytes_read),
+                                                               REQ_COOKIE);
+                    } else {
+                        write_ret = rdma_peer->rdma_transport->rdma_write(rdma_peer->rdma_transport, hdr->src_node, consumer_rkey, 0,
+                                                                          read_buf, static_cast<uint32_t>(bytes_read));
+                    }
+                    if (write_ret != 0) {
+                        bytes_read = -EIO;
+                    }
+                }
+                delete[] read_buf;
             }
-            delete[] read_buf;
 
             // Response: {bytes_read:u32} = 4 bytes (data is now in consumer bounce buf)
-            uint32_t br = (BYTES_READ > 0) ? static_cast<uint32_t>(BYTES_READ) : 0;
+            uint32_t br = (bytes_read > 0) ? static_cast<uint32_t>(bytes_read) : 0;
             std::array<uint8_t, sizeof(DevOpRespPayload) + 4> resp_buf{};
             auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf.data());
             resp->op_id = OP_VFS_READ_RDMA;
-            resp->status = (BYTES_READ >= 0) ? 0 : static_cast<int16_t>(BYTES_READ);
+            resp->status = (bytes_read >= 0) ? 0 : static_cast<int16_t>(bytes_read);
             resp->data_len = 4;
             resp->reserved = REQ_COOKIE;
             memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &br, sizeof(uint32_t));
@@ -3751,13 +4037,20 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             // a smaller server staging window than the ivshmem push path.
             len = std::min<uint32_t>(len, VFS_RDMA_BULK_SIZE);
 
-            // Determine mode: pull if server has a bulk staging buf for this binding.
-            uint8_t* bulk_staging = wki_dev_server_get_vfs_bulk_staging_buf(hdr->src_node, channel_id);
+            // Determine mode from the request rkey. rkey=0 keeps the legacy
+            // pull path where the server stages data and the client rdma_reads
+            // it; nonzero asks the server to push into the consumer region.
+            bool const PULL_MODE = consumer_rkey == 0;
+            uint8_t* bulk_staging = PULL_MODE ? wki_dev_server_get_vfs_bulk_staging_buf(hdr->src_node, channel_id) : nullptr;
             WkiPeer const* bulk_peer = nullptr;
             if (bulk_staging != nullptr) {
                 len = std::min<uint32_t>(len, VFS_RDMA_ROCE_BULK_SIZE);
             }
-            if (bulk_staging == nullptr) {
+            if (PULL_MODE && bulk_staging == nullptr) {
+                send_bulk_read_err(-EIO);
+                break;
+            }
+            if (!PULL_MODE) {
                 bulk_peer = wki_peer_find(hdr->src_node);
                 if (bulk_peer == nullptr || bulk_peer->rdma_transport == nullptr || bulk_peer->rdma_transport->rdma_write == nullptr) {
                     send_bulk_read_err(-EIO);
@@ -3776,30 +4069,39 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             ker::vfs::File* local_file = rfd->file;
             s_vfs_lock.unlock();
 
-            auto* read_buf = new (std::nothrow) uint8_t[len];
-            if (read_buf == nullptr) {
-                send_bulk_read_err(-ENOMEM);
-                break;
-            }
-
-            ssize_t const BYTES_READ = read_local_file_windowed(local_file, read_buf, len, static_cast<size_t>(offset));
-            if (BYTES_READ > 0) {
-                if (bulk_staging != nullptr) {
-                    // Pull mode: copy into server staging buf; client will rdma_read from it.
-                    memcpy(bulk_staging, read_buf, static_cast<uint32_t>(BYTES_READ));
-                } else {
-                    // Push mode: rdma_write directly into consumer's bulk buf.
-                    bulk_peer->rdma_transport->rdma_write(bulk_peer->rdma_transport, hdr->src_node, consumer_rkey, 0, read_buf,
-                                                          static_cast<uint32_t>(BYTES_READ));
+            ssize_t bytes_read = 0;
+            if (bulk_staging != nullptr) {
+                // Pull mode: read directly into server staging; client will rdma_read from it.
+                bytes_read = read_local_file_windowed(local_file, bulk_staging, len, static_cast<size_t>(offset));
+            } else {
+                auto* read_buf = new (std::nothrow) uint8_t[len];
+                if (read_buf == nullptr) {
+                    send_bulk_read_err(-ENOMEM);
+                    break;
                 }
-            }
-            delete[] read_buf;
 
-            uint32_t br = (BYTES_READ > 0) ? static_cast<uint32_t>(BYTES_READ) : 0;
+                bytes_read = read_local_file_windowed(local_file, read_buf, len, static_cast<size_t>(offset));
+                if (bytes_read > 0) {
+                    int write_ret = 0;
+                    if (transport_is_roce(bulk_peer->rdma_transport)) {
+                        write_ret = wki_roce_rdma_write_tagged(hdr->src_node, consumer_rkey, 0, read_buf, static_cast<uint32_t>(bytes_read),
+                                                               REQ_COOKIE);
+                    } else {
+                        write_ret = bulk_peer->rdma_transport->rdma_write(bulk_peer->rdma_transport, hdr->src_node, consumer_rkey, 0,
+                                                                          read_buf, static_cast<uint32_t>(bytes_read));
+                    }
+                    if (write_ret != 0) {
+                        bytes_read = -EIO;
+                    }
+                }
+                delete[] read_buf;
+            }
+
+            uint32_t br = (bytes_read > 0) ? static_cast<uint32_t>(bytes_read) : 0;
             std::array<uint8_t, sizeof(DevOpRespPayload) + 4> bulk_resp_buf{};
             auto* bulk_resp = reinterpret_cast<DevOpRespPayload*>(bulk_resp_buf.data());
             bulk_resp->op_id = OP_VFS_READ_BULK;
-            bulk_resp->status = (BYTES_READ >= 0) ? 0 : static_cast<int16_t>(BYTES_READ);
+            bulk_resp->status = (bytes_read >= 0) ? 0 : static_cast<int16_t>(bytes_read);
             bulk_resp->data_len = 4;
             bulk_resp->reserved = REQ_COOKIE;
             memcpy(bulk_resp_buf.data() + sizeof(DevOpRespPayload), &br, sizeof(uint32_t));
@@ -4227,13 +4529,18 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
         return nullptr;
     }
 
-    // Build request: {flags:u32, mode:u32, path_len:u16, path[N]}
+    bool const WANT_OPEN_PREFETCH = remote_vfs_open_prefetch_capable(state, flags);
+    uint32_t const OPEN_PREFETCH_LEN = WANT_OPEN_PREFETCH ? std::min<uint32_t>(state->rdma_bulk_size, VFS_RDMA_BULK_SIZE) : 0;
+    bool const SEND_OPEN_PREFETCH = WANT_OPEN_PREFETCH && OPEN_PREFETCH_LEN > 0;
+
+    // Build request: {flags:u32, mode:u32, path_len:u16, path[N], optional prefetch_rkey:u32, prefetch_len:u32}
     size_t const PATH_LEN = strlen(fs_relative_path);
-    if (PATH_LEN > UINT16_MAX - 10U) {
+    size_t const REQ_FIXED_LEN = OPEN_REQ_BASE_LEN + (SEND_OPEN_PREFETCH ? OPEN_PREFETCH_REQ_LEN : 0);
+    if (PATH_LEN > UINT16_MAX - REQ_FIXED_LEN) {
         return nullptr;
     }
     auto path_len = static_cast<uint16_t>(PATH_LEN);
-    auto req_data_len = static_cast<uint16_t>(10 + path_len);
+    auto req_data_len = static_cast<uint16_t>(OPEN_REQ_BASE_LEN + path_len + (SEND_OPEN_PREFETCH ? OPEN_PREFETCH_REQ_LEN : 0));
     auto* req_data = new (std::nothrow) uint8_t[req_data_len];
     if (req_data == nullptr) {
         return nullptr;
@@ -4247,14 +4554,45 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
     if (path_len > 0) {
         memcpy(req_data + 10, fs_relative_path, path_len);
     }
+    if (SEND_OPEN_PREFETCH) {
+        size_t const PREFETCH_OFF = OPEN_REQ_BASE_LEN + static_cast<size_t>(path_len);
+        uint32_t const PREFETCH_RKEY = state->rdma_bulk_rkey;
+        memcpy(req_data + PREFETCH_OFF, &PREFETCH_RKEY, sizeof(uint32_t));
+        memcpy(req_data + PREFETCH_OFF + sizeof(uint32_t), &OPEN_PREFETCH_LEN, sizeof(uint32_t));
+    }
 
     OpenRespPayload open_resp = {};
     uint16_t open_resp_len = 0;
-    int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_OPEN, req_data, req_data_len, &open_resp, sizeof(open_resp), &open_resp_len);
+    OptionalSharedIoSlotGuard const OPEN_PREFETCH_GUARD(state, SEND_OPEN_PREFETCH);
+    RoceTaggedReceive tagged_receive{};
+    RoceTaggedReceive* tagged_receive_ptr = nullptr;
+    if (SEND_OPEN_PREFETCH) {
+        tagged_receive.rkey = state->rdma_bulk_rkey;
+        tagged_receive_ptr = &tagged_receive;
+    }
+
+    int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_OPEN, req_data, req_data_len, &open_resp, sizeof(open_resp), &open_resp_len,
+                                               WKI_OP_TIMEOUT_US, tagged_receive_ptr);
     delete[] req_data;
 
     if (STATUS != 0 || open_resp.fd < 0) {
         return nullptr;
+    }
+
+    uint32_t valid_prefetched_bytes = 0;
+    if (SEND_OPEN_PREFETCH && open_resp_len >= OPEN_RESP_WITH_PREFETCH_LEN && open_resp.prefetched_bytes > 0 &&
+        open_resp.prefetched_bytes <= OPEN_PREFETCH_LEN) {
+        if (wki_roce_region_wait_tagged_write(state->rdma_bulk_rkey, tagged_receive.cookie, open_resp.prefetched_bytes,
+                                              WKI_OP_TIMEOUT_US)) {
+            valid_prefetched_bytes = open_resp.prefetched_bytes;
+            remote_vfs_rdma_note_success(state->bulk_rdma_failure_count, state->bulk_rdma_retry_after_us);
+            remote_vfs_rdma_note_success(state->rdma_read_failure_count, state->rdma_read_retry_after_us);
+        } else {
+            remote_vfs_rdma_note_transient_failure(state->bulk_rdma_failure_count, state->bulk_rdma_retry_after_us);
+            remote_vfs_rdma_note_transient_failure(state->rdma_read_failure_count, state->rdma_read_retry_after_us);
+            ker::mod::dbg::log("[WKI] open prefetch tagged write timeout: node=0x%04x ch=%u fd=%d bytes=%u", state->owner_node,
+                               state->assigned_channel, open_resp.fd, open_resp.prefetched_bytes);
+        }
     }
 
     // Allocate File + RemoteFileContext
@@ -4298,8 +4636,21 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
     file->vfs_path = nullptr;                      // Set by vfs_open after return
     file->dir_fs_count = static_cast<size_t>(-1);  // Unknown FS entry count
 
-    if ((flags & ker::vfs::O_NO_CACHE) == 0 && open_resp_len >= sizeof(OpenRespPayload) && open_resp.has_stat != 0) {
+    if ((flags & ker::vfs::O_NO_CACHE) == 0 && open_resp_len >= OPEN_RESP_WITH_STAT_LEN && open_resp.has_stat != 0) {
         remote_vfs_store_cached_stat(ctx, open_resp.stat);
+    }
+    if (valid_prefetched_bytes > 0) {
+        auto* prefetch_copy = new (std::nothrow) uint8_t[valid_prefetched_bytes];
+        if (prefetch_copy != nullptr) {
+            memcpy(prefetch_copy, state->rdma_bulk_buf, valid_prefetched_bytes);
+            ctx->open_prefetch_buf = prefetch_copy;
+            ctx->open_prefetch_offset = 0;
+            ctx->open_prefetch_len = valid_prefetched_bytes;
+        }
+
+        state->bulk_owner_fd = open_resp.fd;
+        ctx->bulk_cached_offset = 0;
+        ctx->bulk_cached_len = valid_prefetched_bytes;
     }
 
     return file;
@@ -4748,7 +5099,7 @@ void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     VfsProxyResponseLookup const LOOKUP = find_vfs_proxy_for_response_locked(hdr->src_node, hdr->channel_id, resp->op_id, resp->reserved);
     ProxyVfsState* state = LOOKUP.matched_state;
     if (state == nullptr) {
-        if (LOOKUP.saw_pending_candidate) {
+        if (LOOKUP.saw_pending_candidate && resp->op_id != OP_VFS_CLOSE) {
             ker::mod::dbg::log(
                 "[WKI] Ignoring stale VFS response: node=0x%04x ch=%u resp_op=%u expected_op=%u resp_seq=%u expected_seq=%u "
                 "active_candidates=%llu pending_candidates=%llu",

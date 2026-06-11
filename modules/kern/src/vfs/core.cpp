@@ -6898,14 +6898,18 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
         return nullptr;
     }
 
-    char resolved[MAX_PATH_LEN];  // NOLINT
-    int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy && !OPEN_LOCAL);
-    if (RESOLVE_RET == 0) {
-        std::memcpy(pathBuffer, resolved, MAX_PATH_LEN);
+    MountPoint const* mount = find_mount_point(pathBuffer);
+    bool const REMOTE_MOUNT = mount != nullptr && mount->fs_type == FSType::REMOTE;
+    if (!REMOTE_MOUNT) {
+        char resolved[MAX_PATH_LEN];  // NOLINT
+        int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy && !OPEN_LOCAL);
+        if (RESOLVE_RET == 0) {
+            std::memcpy(pathBuffer, resolved, MAX_PATH_LEN);
+        }
+
+        mount = find_mount_point(pathBuffer);
     }
 
-    // Find mount point
-    MountPoint const* mount = find_mount_point(pathBuffer);
     if (mount == nullptr) {
         return nullptr;
     }

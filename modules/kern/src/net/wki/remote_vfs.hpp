@@ -30,10 +30,12 @@ constexpr uint32_t VFS_RDMA_WRITE_SIZE = 4 * 1024 * 1024;
 // Reads > VFS_RDMA_BOUNCE_SIZE are serviced through a single RDMA write into this
 // larger buffer instead of looping in 64 KB chunks.
 constexpr uint32_t VFS_RDMA_BULK_SIZE = 2097152;  // 2 MB
-// RoCE pull-mode bulk reads are intentionally capped below the Ethernet TX ring
-// pressure point. Allocate only the window the transport will actually use.
-constexpr uint32_t VFS_RDMA_ROCE_BULK_SIZE = 128 * 1024;
+// RoCE pull-mode bulk reads use the same logical window as the ivshmem push
+// path.  Dynamic linker/SO cold starts otherwise serialize too many small
+// VFS bulk pulls per remote worker.
+constexpr uint32_t VFS_RDMA_ROCE_BULK_SIZE = VFS_RDMA_BULK_SIZE;
 static_assert(VFS_RDMA_ROCE_BULK_SIZE >= VFS_RDMA_BOUNCE_SIZE);
+static_assert(VFS_RDMA_ROCE_BULK_SIZE <= VFS_RDMA_BULK_SIZE);
 
 // -----------------------------------------------------------------------------
 // VfsExport (server side) - explicitly registered export paths
@@ -88,6 +90,7 @@ struct ProxyVfsState {
     uint16_t op_resp_len = 0;
     uint16_t op_resp_max = 0;
     WkiWaitEntry* op_wait_entry = nullptr;  // V2 I-4: async wait for DEV_OP_RESP
+    std::atomic<bool> op_untracked_send_pending{false};
 
     std::atomic<bool> attach_pending{false};
     uint8_t attach_status = 0;
@@ -167,6 +170,12 @@ struct RemoteFileContext {
     ker::mod::sys::Spinlock stat_cache_lock;
     bool stat_cache_valid = false;
     ker::vfs::Stat stat_cache = {};
+
+    // Open-time prefetch is retained per file because the shared bulk buffer can
+    // be overwritten by another loader open before this file's first read.
+    uint8_t* open_prefetch_buf = nullptr;
+    int64_t open_prefetch_offset = -1;
+    uint32_t open_prefetch_len = 0;
 
     // Bulk prefetch cache state - tracks which region of the shared
     // proxy->rdma_bulk_buf belongs to this file.  Valid only when

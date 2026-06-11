@@ -233,7 +233,7 @@ struct ScopedComputeMeasure {
 constexpr uint64_t WKI_TASK_SUBMIT_VFS_TIMEOUT_US = 60000000;  // 60 s for remote binary fetch + launch
 // Keep executable preads bounded: remote VFS may split one logical pread into
 // several RDMA sub-requests, and cold fan-out does this concurrently per node.
-constexpr size_t WKI_VFS_LOAD_CHUNK = size_t{256} * 1024;
+constexpr size_t WKI_VFS_LOAD_CHUNK = size_t{2} * 1024 * 1024;
 constexpr uint32_t WKI_VFS_LOAD_IDLE_RETRIES = 8;
 constexpr uint32_t WKI_VFS_LOAD_MAX_ATTEMPTS = 24;
 constexpr uint64_t WKI_VFS_LOAD_RETRY_WINDOW_US = 15000000;
@@ -246,6 +246,8 @@ constexpr uint64_t WKI_VFS_LOAD_RETRY_BACKOFF_US = 750000;
 constexpr size_t WKI_EXEC_CACHE_MAX_ENTRIES = 16;
 constexpr uint64_t WKI_EXEC_CACHE_MAX_BYTES = 96ULL * 1024ULL * 1024ULL;
 constexpr uint64_t WKI_EXEC_CACHE_RETENTION_US = 300000000;
+constexpr uint64_t WKI_EXEC_CACHE_INFLIGHT_WAIT_US = 1000;
+constexpr uint64_t WKI_VFS_LOAD_BACKOFF_POLL_US = 10000;
 constexpr int32_t WKI_SIGINT_NUM = 2;
 constexpr int32_t WKI_SIGKILL_NUM = 9;
 constexpr int32_t WKI_SIGTERM_NUM = 15;
@@ -258,6 +260,16 @@ constexpr std::string_view WKI_PATH_PREFIX = "/wki/";
 
 auto wki_local_hostname() -> const char* {
     return g_wki.local_hostname.data();  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
+}
+
+void sleep_until_us(uint64_t deadline_us, uint64_t max_sleep_us) {
+    uint64_t const NOW_US = wki_now_us();
+    if (NOW_US >= deadline_us) {
+        ker::mod::sched::kern_yield();
+        return;
+    }
+
+    ker::mod::sched::kern_sleep_us(std::min(deadline_us - NOW_US, max_sleep_us));
 }
 
 auto task_uses_local_vfs_route_for_path(const ker::mod::sched::task::Task* task, const char* path) -> bool {
@@ -2850,7 +2862,7 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
                     load_measure.finish(perf_compute_reject_status(result.reject_reason));
                     return result;
                 }
-                ker::mod::sched::kern_yield();
+                ker::mod::sched::kern_sleep_us(WKI_EXEC_CACHE_INFLIGHT_WAIT_US);
                 continue;
             }
 
@@ -2911,7 +2923,7 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
                 if (RETRY_WINDOW_OPEN && attempt + 1 < WKI_VFS_LOAD_MAX_ATTEMPTS) {
                     uint64_t const WAIT_UNTIL_US = wki_now_us() + WKI_VFS_LOAD_RETRY_BACKOFF_US;
                     while (wki_now_us() < WAIT_UNTIL_US) {
-                        ker::mod::sched::kern_yield();
+                        sleep_until_us(WAIT_UNTIL_US, WKI_VFS_LOAD_BACKOFF_POLL_US);
                     }
                 }
                 continue;
@@ -2934,7 +2946,7 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
             if (RETRY_WINDOW_OPEN && attempt + 1 < WKI_VFS_LOAD_MAX_ATTEMPTS) {
                 uint64_t const WAIT_UNTIL_US = wki_now_us() + WKI_VFS_LOAD_RETRY_BACKOFF_US;
                 while (wki_now_us() < WAIT_UNTIL_US) {
-                    ker::mod::sched::kern_yield();
+                    sleep_until_us(WAIT_UNTIL_US, WKI_VFS_LOAD_BACKOFF_POLL_US);
                 }
                 continue;
             }
@@ -2983,7 +2995,7 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
                                total_read, file_size, attempt + 1, WKI_VFS_LOAD_MAX_ATTEMPTS, static_cast<unsigned long long>(ELAPSED_MS));
             uint64_t const WAIT_UNTIL_US = wki_now_us() + WKI_VFS_LOAD_RETRY_BACKOFF_US;
             while (wki_now_us() < WAIT_UNTIL_US) {
-                ker::mod::sched::kern_yield();
+                sleep_until_us(WAIT_UNTIL_US, WKI_VFS_LOAD_BACKOFF_POLL_US);
             }
         }
     }
