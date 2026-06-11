@@ -51,6 +51,9 @@ constexpr size_t WORKER_PIPE_BUFFER_RESERVE = static_cast<size_t>(256U) * 1024U;
 constexpr size_t WORKER_PIPE_DRAIN_BYTE_BUDGET = static_cast<size_t>(1024U) * 1024U;
 constexpr double STATUS_UPDATE_INTERVAL_SECONDS = 0.75;
 constexpr double PREVIEW_UPDATE_INTERVAL_SECONDS = 10.0;
+constexpr double WORKER_CANCEL_KILL_AFTER_SECONDS = 2.0;
+constexpr double WORKER_CANCEL_GIVE_UP_AFTER_SECONDS = 10.0;
+constexpr long WORKER_WAIT_POLL_NS = 50'000'000L;
 constexpr int WORKER_STDOUT_FD = 1;
 constexpr int WORKER_COMMAND_FD = 0;
 volatile sig_atomic_t g_cancel_signal = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -367,6 +370,7 @@ auto local_cpu_count() -> int {
     long const ONLINE = ::sysconf(_SC_NPROCESSORS_ONLN);
     return ONLINE > 0 ? static_cast<int>(ONLINE) : 1;
 }
+
 #endif
 
 auto make_progress(const tracebench::Options& options, uint64_t tiles_done, uint64_t total_tiles, double started, bool done)
@@ -1154,6 +1158,10 @@ void install_worker_scene_vfs_policy(const tracebench::Options& options, const I
         }
     };
 
+    add_local_rule("/usr", "worker runtime");
+    add_local_rule("/bin", "worker runtime");
+    add_local_rule("/lib", "worker runtime");
+    add_local_rule("/lib64", "worker runtime");
     add_local_rule("/usr/bin/renderbench", "worker executable");
     add_local_rule("/bin/renderbench", "worker executable fallback");
 
@@ -1439,6 +1447,23 @@ void close_worker_pipes(std::span<ChildWorker> workers) {
     }
 }
 
+void sleep_worker_wait_poll() {
+    timespec delay{
+        .tv_sec = 0,
+        .tv_nsec = WORKER_WAIT_POLL_NS,
+    };
+    while (::nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+    }
+}
+
+auto note_worker_exit_status(ChildWorker& worker, int status, bool cancellation_expected) -> bool {
+    if (!cancellation_expected && (!WIFEXITED(status) || WEXITSTATUS(status) != 0)) {
+        std::println(stderr, "renderbench: worker on {} exited with status {}", worker.hostname, status);
+        return false;
+    }
+    return true;
+}
+
 auto wait_for_child(ChildWorker& worker, bool cancellation_expected) -> bool {
     if (worker.pid <= 0) {
         return true;
@@ -1454,12 +1479,67 @@ auto wait_for_child(ChildWorker& worker, bool cancellation_expected) -> bool {
         ok = false;
         break;
     }
-    if (!cancellation_expected && (!WIFEXITED(status) || WEXITSTATUS(status) != 0)) {
-        std::println(stderr, "renderbench: worker on {} exited with status {}", worker.hostname, status);
-        ok = false;
-    }
+    ok = note_worker_exit_status(worker, status, cancellation_expected) && ok;
     worker.pid = -1;
     return ok;
+}
+
+auto wait_for_children_after_cancel(std::span<ChildWorker> workers, bool cancellation_expected) -> bool {
+    bool ok = true;
+    bool kill_sent = false;
+    double const STARTED = tracebench::monotonic_seconds();
+
+    for (;;) {
+        size_t remaining = 0;
+        for (auto& worker : workers) {
+            if (worker.pid <= 0) {
+                continue;
+            }
+
+            int status = 0;
+            pid_t const WAITED = ::waitpid(worker.pid, &status, WNOHANG);
+            if (WAITED == worker.pid) {
+                ok = note_worker_exit_status(worker, status, cancellation_expected) && ok;
+                worker.pid = -1;
+                continue;
+            }
+            if (WAITED < 0) {
+                if (errno == EINTR) {
+                    ++remaining;
+                    continue;
+                }
+                std::perror("renderbench: waitpid");
+                worker.pid = -1;
+                ok = false;
+                continue;
+            }
+
+            ++remaining;
+        }
+
+        if (remaining == 0) {
+            return ok;
+        }
+
+        double const NOW = tracebench::monotonic_seconds();
+        double const ELAPSED = NOW - STARTED;
+        if (!kill_sent && ELAPSED >= WORKER_CANCEL_KILL_AFTER_SECONDS) {
+            kill_sent = true;
+            std::println(stderr, "renderbench: {} worker(s) still exiting after {:.1f}s; escalating to SIGKILL", remaining, ELAPSED);
+            signal_workers(workers, SIGKILL);
+        }
+        if (ELAPSED >= WORKER_CANCEL_GIVE_UP_AFTER_SECONDS) {
+            for (const auto& worker : workers) {
+                if (worker.pid > 0) {
+                    std::println(stderr, "renderbench: worker {} on {} pid={} did not exit after cancellation", worker.worker_id,
+                                 worker.hostname, worker.pid);
+                }
+            }
+            return false;
+        }
+
+        sleep_worker_wait_poll();
+    }
 }
 
 auto dynamic_batch_size(const tracebench::Options& options, size_t total_tiles, size_t worker_count, int worker_threads, bool local_worker)
@@ -2184,7 +2264,8 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
         return run_node_threads(options);
     }
 
-    bool const USE_PERSISTENT_PROCESS_BATCHES = options.placement == tracebench::Placement::NodeThreads;
+    bool const USE_PERSISTENT_PROCESS_BATCHES =
+        options.placement == tracebench::Placement::NodeThreads || options.placement == tracebench::Placement::ProcessPerCore;
     for (auto& spec : specs) {
         spec.command_stream = USE_PERSISTENT_PROCESS_BATCHES;
     }
@@ -2210,10 +2291,10 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
     if (USE_PERSISTENT_PROCESS_BATCHES) {
         int const EFFECTIVE_LOCAL_RESERVE_CPUS = local_coordinator_reserve_cpus(options, peers.size());
         std::println(stderr,
-                     "renderbench: node-thread ipc config workers={} batch_size={} coordinator_reserve_cpus={} effective_reserve_cpus={} "
-                     "coordinator_skip_local_worker={}",
-                     specs.size(), PERSISTENT_BATCH_SIZE, options.coordinator_reserve_cpus, EFFECTIVE_LOCAL_RESERVE_CPUS,
-                     options.coordinator_skip_local_worker ? 1 : 0);
+                     "renderbench: ipc persistent config placement={} workers={} batch_size={} coordinator_reserve_cpus={} "
+                     "effective_reserve_cpus={} coordinator_skip_local_worker={}",
+                     tracebench::placement_name(options.placement), specs.size(), PERSISTENT_BATCH_SIZE, options.coordinator_reserve_cpus,
+                     EFFECTIVE_LOCAL_RESERVE_CPUS, options.coordinator_skip_local_worker ? 1 : 0);
     }
 
     double const STARTED = tracebench::monotonic_seconds();
@@ -2364,11 +2445,16 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
 
     if (!ok && !cancellation_sent) {
         std::println(stderr, "renderbench: worker failure detected; canceling remaining workers");
+        worker_termination_expected = true;
         signal_workers(std::span<ChildWorker>(workers.data(), workers.size()), SIGTERM);
         close_worker_pipes(std::span<ChildWorker>(workers.data(), workers.size()));
     }
 
-    ok = wait_for_children(std::span<ChildWorker>(workers.data(), workers.size()), worker_termination_expected) && ok;
+    if (worker_termination_expected) {
+        ok = wait_for_children_after_cancel(std::span<ChildWorker>(workers.data(), workers.size()), true) && ok;
+    } else {
+        ok = wait_for_children(std::span<ChildWorker>(workers.data(), workers.size()), false) && ok;
+    }
     if (tiles_done != tiles.size()) {
         std::println(stderr, "renderbench: completed {} of {} tiles", tiles_done, tiles.size());
         print_missing_tile_summary(tile_seen);

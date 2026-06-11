@@ -31,12 +31,20 @@
 #include "tinycthread.hpp"
 #include "util.hpp"
 
+#define MANDELBENCH_TRACE(...)                \
+    do {                                     \
+        if (MANDELBENCH_DEBUG_ENABLED) {     \
+            std::println(stderr, __VA_ARGS__); \
+        }                                    \
+    } while (false)
+
 namespace {
 
 constexpr int EINTR_NEG = -4;  // WOS returns -errno from syscalls.
 constexpr const char* DEVICE_NAME = "process";
 constexpr uint64_t PIPE_READ_IDLE_TIMEOUT_US = 60'000'000;
 constexpr uint64_t WORKER_WAIT_TIMEOUT_US = 60'000'000;
+constexpr uint64_t STATUS_LOG_INTERVAL_US = 1'000'000;
 constexpr int WORKER_EVENT_POLL_TIMEOUT_MS = 10;
 constexpr int WORKER_OUTPUT_FD = 3;
 constexpr int WORKER_RELEASE_FD = 4;
@@ -54,6 +62,13 @@ auto now_us() -> uint64_t {
 }
 
 auto elapsed_ms(uint64_t start_us, uint64_t end_us) -> double { return static_cast<double>(end_us - start_us) / 1000.0; }
+
+auto repeat_prefix(int repeat_index) -> std::string {
+    if (repeat_index < 0) {
+        return "final";
+    }
+    return std::format("repeat {}", repeat_index);
+}
 
 auto mandelbench_profile_enabled() -> bool {
     const char* value = std::getenv("MANDELBENCH_PROFILE");
@@ -120,8 +135,17 @@ auto parse_int_arg(const char* text, int& value) -> bool {
 
 auto write_all(int fd, std::span<const unsigned char> bytes, ssize_t* failed_ret = nullptr, int* failed_errno = nullptr) -> bool {
     size_t written_total = 0;
+    bool const CONTROL_DIAG = MANDELBENCH_DEBUG_ENABLED && bytes.size() == 1;
     while (written_total < bytes.size()) {
+        if (CONTROL_DIAG) {
+            MANDELBENCH_TRACE("mandelbench: write_all control fd={} offset={} size={} syscall begin", fd, written_total, bytes.size());
+        }
+        errno = 0;
         ssize_t const WRITTEN = write(fd, bytes.data() + written_total, bytes.size() - written_total);
+        if (CONTROL_DIAG) {
+            MANDELBENCH_TRACE("mandelbench: write_all control fd={} offset={} ret={} errno={} syscall end", fd, written_total, WRITTEN,
+                              errno);
+        }
         if (WRITTEN <= 0) {
             if (failed_ret != nullptr) {
                 *failed_ret = WRITTEN;
@@ -146,11 +170,14 @@ auto wait_for_control_byte(int fd, int worker_id, const char* label) -> bool {
         return true;
     }
 
+    MANDELBENCH_TRACE("mandelbench-worker[{}]: waiting for {} on fd {}", worker_id, label, fd);
     unsigned char control_byte = 0;
     while (true) {
         errno = 0;
         ssize_t const BYTES_READ = read(fd, &control_byte, 1);
         if (BYTES_READ == 1) {
+            MANDELBENCH_TRACE("mandelbench-worker[{}]: received {} byte={} fd={}", worker_id, label, static_cast<unsigned>(control_byte),
+                              fd);
             return true;
         }
         if (BYTES_READ == EINTR_NEG || errno == EINTR) {
@@ -226,6 +253,10 @@ struct WorkerThreadArg {
     int local_thread_id;
     int local_thread_count;
     int rows_done;
+    int diag_worker_id;
+    int diag_repeat_index;
+    int diag_progress_stride;
+    uint64_t diag_compute_start_us;
 };
 
 struct WorkerChunk {
@@ -236,6 +267,12 @@ struct WorkerChunk {
 
 auto generate_rows(void* param) -> int {
     auto* arg = static_cast<WorkerThreadArg*>(param);
+    int thread_rows_done = 0;
+    int const THREAD_ROW_TOTAL =
+        arg->local_thread_id < arg->row_count
+            ? ((arg->row_count - 1 - arg->local_thread_id) / std::max(arg->local_thread_count, 1)) + 1
+            : 0;
+    int const PROGRESS_STRIDE = std::max(arg->diag_progress_stride, 1);
 
     for (int local_row = arg->local_thread_id; local_row < arg->row_count; local_row += arg->local_thread_count) {
         int const ROW = arg->start_row + local_row;
@@ -255,6 +292,14 @@ auto generate_rows(void* param) -> int {
             set_pixel(arg->image, arg->width, col, local_row, &arg->colormap[static_cast<size_t>(iteration * 3)]);
         }
         arg->rows_done++;
+        thread_rows_done++;
+        if (arg->diag_worker_id >= 0 &&
+            (thread_rows_done == 1 || (thread_rows_done % PROGRESS_STRIDE) == 0 || thread_rows_done == THREAD_ROW_TOTAL)) {
+            MANDELBENCH_TRACE(
+                "mandelbench-worker[{}]: repeat {} compute progress thread={}/{} rows={}/{} last_row={} elapsed_ms={:.3f}",
+                arg->diag_worker_id, arg->diag_repeat_index, arg->local_thread_id, arg->local_thread_count, thread_rows_done,
+                THREAD_ROW_TOTAL, ROW, elapsed_ms(arg->diag_compute_start_us, now_us()));
+        }
     }
     return 0;
 }
@@ -280,11 +325,13 @@ struct WorkerLaunch {
     uint64_t header_begin_us;
     uint64_t header_end_us;
     uint64_t header_last_progress_us;
+    uint64_t header_last_status_us;
     std::array<unsigned char, WORKER_OUTPUT_HEADER_SIZE> header;
     size_t header_offset;
     uint64_t read_begin_us;
     uint64_t read_end_us;
     uint64_t read_last_progress_us;
+    uint64_t read_last_status_us;
     unsigned char* read_dest;
     size_t read_target;
     size_t read_offset;
@@ -406,11 +453,13 @@ auto make_worker_launch(int output_slot, std::string target_node) -> WorkerLaunc
         .header_begin_us = 0,
         .header_end_us = 0,
         .header_last_progress_us = 0,
+        .header_last_status_us = 0,
         .header = {},
         .header_offset = 0,
         .read_begin_us = 0,
         .read_end_us = 0,
         .read_last_progress_us = 0,
+        .read_last_status_us = 0,
         .read_dest = nullptr,
         .read_target = 0,
         .read_offset = 0,
@@ -649,6 +698,7 @@ auto signal_workers(std::span<WorkerLaunch> launches, unsigned char signal_byte,
         if (launch.release_write_fd < 0) {
             continue;
         }
+        MANDELBENCH_TRACE("mandelbench: signal {} worker={} fd={} begin", label, launch.output_slot, launch.release_write_fd);
         ssize_t write_fail_ret = 0;
         int write_fail_errno = 0;
         if (!write_all(launch.release_write_fd, std::span(&signal_byte, size_t{1}), &write_fail_ret, &write_fail_errno)) {
@@ -656,6 +706,7 @@ auto signal_workers(std::span<WorkerLaunch> launches, unsigned char signal_byte,
                          write_fail_ret, write_fail_errno, std::strerror(write_fail_errno));
             ok = false;
         }
+        MANDELBENCH_TRACE("mandelbench: signal {} worker={} fd={} end ok={}", label, launch.output_slot, launch.release_write_fd, ok);
         if (close_after_signal) {
             close_fd(launch.release_write_fd);
         }
@@ -734,12 +785,14 @@ void reset_worker_transfer(WorkerLaunch& launch, unsigned char* read_dest, size_
     launch.header_begin_us = 0;
     launch.header_end_us = 0;
     launch.header_last_progress_us = 0;
+    launch.header_last_status_us = 0;
     launch.header.fill(0);
     launch.header_offset = 0;
     launch.read_ok = false;
     launch.read_begin_us = 0;
     launch.read_end_us = 0;
     launch.read_last_progress_us = 0;
+    launch.read_last_status_us = 0;
 }
 
 void configure_worker_read_targets(std::span<WorkerLaunch> launches, unsigned char* /*image*/, size_t row_size) {
@@ -780,7 +833,7 @@ auto scatter_worker_outputs(std::span<const WorkerLaunch> launches, unsigned cha
 }
 
 auto compute_local_launches(std::span<const WorkerLaunch> launches, unsigned char* image, unsigned char* colormap, int width, int height,
-                            int max_iteration, size_t row_size) -> bool {
+                            int max_iteration, size_t row_size, int repeat_index) -> bool {
     if (launches.empty()) {
         return true;
     }
@@ -801,6 +854,10 @@ auto compute_local_launches(std::span<const WorkerLaunch> launches, unsigned cha
         compute_thread.arg.local_thread_id = 0;
         compute_thread.arg.local_thread_count = 1;
         compute_thread.arg.rows_done = 0;
+        compute_thread.arg.diag_worker_id = launch.output_slot;
+        compute_thread.arg.diag_repeat_index = repeat_index;
+        compute_thread.arg.diag_progress_stride = std::max(launch.row_count / 8, 1);
+        compute_thread.arg.diag_compute_start_us = now_us();
 
         if (thrd_create(&compute_thread.thread, generate_rows, &compute_thread.arg) != THRD_SUCCESS) {
             std::println(stderr, "mandelbench: failed to create local compute thread for worker {}", launch.output_slot);
@@ -843,10 +900,13 @@ struct WorkerHeaderResult {
     uint64_t loop_end_us;
 };
 
-auto complete_worker_headers(std::span<WorkerLaunch> launches, uint16_t expected_flags) -> WorkerHeaderResult {
+auto complete_worker_headers(std::span<WorkerLaunch> launches, uint16_t expected_flags, int repeat_index) -> WorkerHeaderResult {
     uint64_t const START_US = now_us();
     uint64_t header_end_us = START_US;
     bool ok = true;
+    std::string const PHASE = repeat_prefix(repeat_index);
+
+    MANDELBENCH_TRACE("mandelbench: {} header-wait begin workers={} expected_flags={}", PHASE, launches.size(), expected_flags);
 
     for (auto& launch : launches) {
         if (launch.pipe_read_fd < 0) {
@@ -856,6 +916,10 @@ auto complete_worker_headers(std::span<WorkerLaunch> launches, uint16_t expected
         }
         launch.header_begin_us = START_US;
         launch.header_last_progress_us = START_US;
+        launch.header_last_status_us = START_US;
+        MANDELBENCH_TRACE("mandelbench: {} header-wait worker={} pid={} target='{}' fd={} payload_bytes={} chunks='{}'", PHASE,
+                          launch.output_slot, launch.child_pid, launch.target_node, launch.pipe_read_fd, launch.read_target,
+                          format_worker_chunks(launch.chunks));
     }
 
     std::vector<pollfd> pollfds;
@@ -883,6 +947,17 @@ auto complete_worker_headers(std::span<WorkerLaunch> launches, uint16_t expected
         }
 
         uint64_t const NOW_US = now_us();
+        for (auto& launch : launches) {
+            if (header_is_pending(launch) && NOW_US - launch.header_last_status_us >= STATUS_LOG_INTERVAL_US) {
+                MANDELBENCH_TRACE(
+                    "mandelbench: {} header-wait pending worker={} pid={} target='{}' read={}/{} fd={} idle_ms={:.3f} "
+                    "elapsed_ms={:.3f} wait_done={} wait_ok={}",
+                    PHASE, launch.output_slot, launch.child_pid, launch.target_node, launch.header_offset, launch.header.size(),
+                    launch.pipe_read_fd, elapsed_ms(launch.header_last_progress_us, NOW_US), elapsed_ms(START_US, NOW_US),
+                    launch.wait_done, launch.wait_ok);
+                launch.header_last_status_us = NOW_US;
+            }
+        }
         for (auto& launch : launches) {
             if (header_is_pending(launch) && NOW_US - launch.header_last_progress_us > PIPE_READ_IDLE_TIMEOUT_US) {
                 std::println(stderr, "mandelbench: output header timeout for worker {} read={}/{} pipe_fd={} elapsed_ms={:.3f}",
@@ -917,14 +992,19 @@ auto complete_worker_headers(std::span<WorkerLaunch> launches, uint16_t expected
     }
 
     uint64_t const LOOP_END_US = now_us();
+    MANDELBENCH_TRACE("mandelbench: {} header-wait end ok={} header_ms={:.3f} loop_ms={:.3f}", PHASE, ok,
+                      elapsed_ms(START_US, std::max(header_end_us, START_US)), elapsed_ms(START_US, LOOP_END_US));
     return WorkerHeaderResult{.ok = ok, .header_end_us = std::max(header_end_us, START_US), .loop_end_us = LOOP_END_US};
 }
 
-auto complete_workers_and_outputs(std::span<WorkerLaunch> launches, bool require_worker_exit) -> WorkerEventResult {
+auto complete_workers_and_outputs(std::span<WorkerLaunch> launches, bool require_worker_exit, int repeat_index) -> WorkerEventResult {
     uint64_t const START_US = now_us();
     uint64_t wait_end_us = START_US;
     uint64_t read_end_us = START_US;
     bool ok = true;
+    std::string const PHASE = repeat_prefix(repeat_index);
+
+    MANDELBENCH_TRACE("mandelbench: {} output-wait begin workers={} require_exit={}", PHASE, launches.size(), require_worker_exit);
 
     for (auto& launch : launches) {
         if (launch.read_offset == launch.read_target) {
@@ -939,6 +1019,9 @@ auto complete_workers_and_outputs(std::span<WorkerLaunch> launches, bool require
         }
         launch.read_begin_us = START_US;
         launch.read_last_progress_us = START_US;
+        launch.read_last_status_us = START_US;
+        MANDELBENCH_TRACE("mandelbench: {} output-wait worker={} pid={} target='{}' fd={} bytes={}/{}", PHASE, launch.output_slot,
+                          launch.child_pid, launch.target_node, launch.pipe_read_fd, launch.read_offset, launch.read_target);
     }
 
     std::vector<pollfd> pollfds;
@@ -975,6 +1058,17 @@ auto complete_workers_and_outputs(std::span<WorkerLaunch> launches, bool require
         }
 
         uint64_t const NOW_US = now_us();
+        for (auto& launch : launches) {
+            if (read_is_pending(launch) && NOW_US - launch.read_last_status_us >= STATUS_LOG_INTERVAL_US) {
+                MANDELBENCH_TRACE(
+                    "mandelbench: {} output-wait pending worker={} pid={} target='{}' read={}/{} fd={} idle_ms={:.3f} "
+                    "elapsed_ms={:.3f} wait_done={} wait_ok={}",
+                    PHASE, launch.output_slot, launch.child_pid, launch.target_node, launch.read_offset, launch.read_target,
+                    launch.pipe_read_fd, elapsed_ms(launch.read_last_progress_us, NOW_US), elapsed_ms(START_US, NOW_US),
+                    launch.wait_done, launch.wait_ok);
+                launch.read_last_status_us = NOW_US;
+            }
+        }
         if (PENDING_WAITS > 0 && NOW_US - START_US > WORKER_WAIT_TIMEOUT_US) {
             for (const auto& launch : launches) {
                 if (!launch.wait_done && launch.child_pid >= 0) {
@@ -1021,6 +1115,8 @@ auto complete_workers_and_outputs(std::span<WorkerLaunch> launches, bool require
     uint64_t const LOOP_END_US = now_us();
     wait_end_us = std::max(wait_end_us, START_US);
     read_end_us = std::max(read_end_us, START_US);
+    MANDELBENCH_TRACE("mandelbench: {} output-wait end ok={} read_ms={:.3f} wait_ms={:.3f} loop_ms={:.3f}", PHASE, ok,
+                      elapsed_ms(START_US, read_end_us), elapsed_ms(START_US, wait_end_us), elapsed_ms(START_US, LOOP_END_US));
     return WorkerEventResult{.ok = ok, .wait_end_us = wait_end_us, .read_end_us = read_end_us, .loop_end_us = LOOP_END_US};
 }
 
@@ -1089,9 +1185,24 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
     }
 
     size_t const ROW_SIZE = static_cast<size_t>(width) * 4;
+    MANDELBENCH_TRACE(
+        "mandelbench: setup begin pid={} width={} height={} max_iter={} requested_workers={} active_workers={} repeat={} "
+        "remote_launches={} local_launches={} nodes={} launcher='{}' runner='{}'",
+        static_cast<int>(ker::process::getpid()), width, height, max_iteration, workers, ACTIVE_WORKERS, repeat, remote_launches.size(),
+        local_launches.size(), TARGET_NODE_TEXT, wki_launcher_node(), wki_runner_node());
+    for (const auto& launch : remote_launches) {
+        MANDELBENCH_TRACE("mandelbench: remote plan worker={} target='{}' start_row={} row_count={} payload_bytes={} chunks='{}'",
+                          launch.output_slot, launch.target_node, launch.start_row, launch.row_count,
+                          worker_chunks_bytes(launch.chunks, ROW_SIZE), format_worker_chunks(launch.chunks));
+    }
+    for (const auto& launch : local_launches) {
+        MANDELBENCH_TRACE("mandelbench: local plan worker={} target='{}' start_row={} row_count={} chunks='{}'", launch.output_slot,
+                          launch.target_node, launch.start_row, launch.row_count, format_worker_chunks(launch.chunks));
+    }
 
     uint64_t const SETUP_START_US = now_us();
     for (auto& launch : remote_launches) {
+        MANDELBENCH_TRACE("mandelbench: worker {} setup pipes target='{}'", launch.output_slot, launch.target_node);
         if (!create_worker_pipe(launch)) {
             close_worker_pipes(remote_launches);
             return 1;
@@ -1130,6 +1241,8 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
         argv.push_back(nullptr);
 
         launch.fork_begin_us = now_us();
+        MANDELBENCH_TRACE("mandelbench: worker {} fork begin target='{}' chunks='{}'", launch.output_slot, launch.target_node,
+                          CHUNK_SPEC);
         int64_t child_pid = ker::process::fork();
         launch.fork_return_us = now_us();
         if (child_pid < 0) {
@@ -1138,6 +1251,8 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
             return 1;
         }
         if (child_pid == 0) {
+            MANDELBENCH_TRACE("mandelbench-child[{}]: forked target='{}' output_fd={} control_fd={} exec='{}'", launch.output_slot,
+                              launch.target_node, launch.pipe_write_fd, launch.release_read_fd, get_testprog_path());
             close_child_pipe_fds(remote_launches, launch.pipe_write_fd, launch.release_read_fd);
             if (!move_child_output_fd(launch.pipe_write_fd)) {
                 std::println(stderr, "mandelbench: failed to move output fd for worker {} from {} to {} errno={} ({})",
@@ -1158,10 +1273,14 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
             _exit(1);
         }
         launch.child_pid = child_pid;
+        MANDELBENCH_TRACE("mandelbench: worker {} forked pid={} target='{}' fork_ms={:.3f}", launch.output_slot, launch.child_pid,
+                          launch.target_node, elapsed_ms(launch.fork_begin_us, launch.fork_return_us));
         close_fd(launch.pipe_write_fd);
         close_fd(launch.release_read_fd);
     }
     uint64_t const AFTER_LAUNCH_US = now_us();
+    MANDELBENCH_TRACE("mandelbench: setup launched remote_workers={} local_workers={} setup_ms={:.3f}", remote_launches.size(),
+                      local_launches.size(), elapsed_ms(SETUP_START_US, AFTER_LAUNCH_US));
 
     if (PROFILE) {
         uint64_t fork_sum_us = 0;
@@ -1177,35 +1296,44 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
 
     int repeat_index = 0;
     for (auto& elapsed_seconds : times) {
+        MANDELBENCH_TRACE("mandelbench: repeat {} begin", repeat_index);
         std::ranges::fill(image, 0);
         configure_worker_read_targets(remote_launches, image.data(), ROW_SIZE);
 
         uint64_t const START_US = now_us();
+        MANDELBENCH_TRACE("mandelbench: repeat {} start-signal begin remote_workers={}", repeat_index, remote_launches.size());
         if (!signal_worker_starts(remote_launches)) {
             close_worker_pipes(remote_launches);
             return 1;
         }
         uint64_t const AFTER_START_SIGNAL_US = now_us();
         uint64_t const LOCAL_COMPUTE_START_US = now_us();
-        if (!compute_local_launches(local_launches, image.data(), local_colormap.data(), width, height, max_iteration, ROW_SIZE)) {
+        MANDELBENCH_TRACE("mandelbench: repeat {} local-compute begin local_workers={}", repeat_index, local_launches.size());
+        if (!compute_local_launches(local_launches, image.data(), local_colormap.data(), width, height, max_iteration, ROW_SIZE,
+                                    repeat_index)) {
             close_worker_pipes(remote_launches);
             return 1;
         }
         uint64_t const AFTER_LOCAL_COMPUTE_US = now_us();
+        MANDELBENCH_TRACE("mandelbench: repeat {} local-compute end ms={:.3f}", repeat_index,
+                          elapsed_ms(LOCAL_COMPUTE_START_US, AFTER_LOCAL_COMPUTE_US));
 
-        WorkerHeaderResult const HEADER_RESULT = complete_worker_headers(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD);
+        WorkerHeaderResult const HEADER_RESULT = complete_worker_headers(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index);
         uint64_t const AFTER_HEADER_US = HEADER_RESULT.header_end_us;
         if (!HEADER_RESULT.ok) {
             close_worker_pipes(remote_launches);
             return 1;
         }
         uint64_t const PAYLOAD_RELEASE_START_US = now_us();
+        MANDELBENCH_TRACE("mandelbench: repeat {} payload-release begin", repeat_index);
         if (!release_worker_payloads(remote_launches)) {
             close_worker_pipes(remote_launches);
             return 1;
         }
         uint64_t const AFTER_PAYLOAD_RELEASE_US = now_us();
-        WorkerEventResult const WORKER_RESULT = complete_workers_and_outputs(remote_launches, false);
+        MANDELBENCH_TRACE("mandelbench: repeat {} payload-release end ms={:.3f}", repeat_index,
+                          elapsed_ms(PAYLOAD_RELEASE_START_US, AFTER_PAYLOAD_RELEASE_US));
+        WorkerEventResult const WORKER_RESULT = complete_workers_and_outputs(remote_launches, false, repeat_index);
         uint64_t const AFTER_WAIT_US = WORKER_RESULT.wait_end_us;
         uint64_t const AFTER_READ_US = WORKER_RESULT.read_end_us;
         if (!WORKER_RESULT.ok) {
@@ -1218,6 +1346,7 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
         }
 
         uint64_t const AFTER_MERGE_US = now_us();
+        MANDELBENCH_TRACE("mandelbench: repeat {} merge end total_ms={:.3f}", repeat_index, elapsed_ms(START_US, AFTER_MERGE_US));
         elapsed_seconds = static_cast<double>(AFTER_MERGE_US - START_US) / 1000000.0;
 
         if (PROFILE) {
@@ -1234,18 +1363,23 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
         }
 
         std::string const IMG_PATH = std::format(IMAGE, DEVICE_NAME, repeat_index);
+        MANDELBENCH_TRACE("mandelbench: repeat {} save begin path='{}'", repeat_index, IMG_PATH);
         save_image(IMG_PATH.c_str(), image.data(), static_cast<unsigned>(width), static_cast<unsigned>(height));
+        MANDELBENCH_TRACE("mandelbench: repeat {} save end", repeat_index);
         progress(DEVICE_NAME, width, height, max_iteration, workers, repeat, repeat_index, elapsed_seconds);
         repeat_index++;
     }
 
-    WorkerEventResult const EXIT_RESULT = complete_workers_and_outputs(remote_launches, true);
+    MANDELBENCH_TRACE("mandelbench: final worker-exit wait begin remote_workers={}", remote_launches.size());
+    WorkerEventResult const EXIT_RESULT = complete_workers_and_outputs(remote_launches, true, -1);
     close_worker_pipes(remote_launches);
     if (!EXIT_RESULT.ok) {
         return 1;
     }
 
+    MANDELBENCH_TRACE("mandelbench: report begin");
     report(DEVICE_NAME, width, height, max_iteration, workers, repeat, times);
+    MANDELBENCH_TRACE("mandelbench: complete");
     return 0;
 }
 
@@ -1335,6 +1469,11 @@ auto mandelbench_worker(int argc, char** argv) -> int {
         row_count = total_rows;
     }
     uint64_t const AFTER_PARSE_US = now_us();
+    MANDELBENCH_TRACE(
+        "mandelbench-worker[{}]: entry pid={} launcher='{}' runner='{}' width={} height={} max_iter={} threads={} "
+        "repeat_index={} repeat_count={} start_row={} row_count={} total_rows={} output_fd={} control_fd={} chunks='{}'",
+        id, static_cast<int>(ker::process::getpid()), wki_launcher_node(), wki_runner_node(), width, height, max_iter, thread_count,
+        repeat_index, repeat_count, start_row, row_count, total_rows, output_fd, control_fd, GROUPED_CHUNKS ? chunk_spec : "");
 
     std::vector<unsigned char> colormap(static_cast<size_t>((max_iter + 1) * 3));
     init_colormap(max_iter + 1, colormap.data());
@@ -1364,6 +1503,7 @@ auto mandelbench_worker(int argc, char** argv) -> int {
     for (int repeat_offset = 0; repeat_offset < repeat_count; repeat_offset++) {
         int const CURRENT_REPEAT = repeat_index + repeat_offset;
         uint64_t const REPEAT_ENTRY_US = now_us();
+        MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} begin", id, CURRENT_REPEAT);
         if (control_fd >= 0 && !wait_for_control_byte(control_fd, id, "start")) {
             close(OUTPUT_STREAM_FD);
             close(CONTROL_FD);
@@ -1372,8 +1512,10 @@ auto mandelbench_worker(int argc, char** argv) -> int {
         uint64_t const AFTER_START_US = now_us();
 
         uint64_t const COMPUTE_START_US = now_us();
-        int thread_index = 0;
-        for (auto& worker_thread : worker_threads) {
+        MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} compute begin threads={} chunks={} bytes={}", id, CURRENT_REPEAT,
+                          thread_count, chunks.size(), image.size());
+        int const PROGRESS_STRIDE = std::max(total_rows / 8, 1);
+        auto prepare_thread_arg = [&](WorkerThread& worker_thread, int thread_index) {
             auto& thread_arg = worker_thread.arg;
             WorkerChunk const& chunk = GROUPED_CHUNKS ? chunks.at(static_cast<size_t>(thread_index)) : chunks.front();
             thread_arg.image = GROUPED_CHUNKS ? image.data() + chunk_offsets.at(static_cast<size_t>(thread_index)) : image.data();
@@ -1386,31 +1528,47 @@ auto mandelbench_worker(int argc, char** argv) -> int {
             thread_arg.local_thread_id = GROUPED_CHUNKS ? 0 : thread_index;
             thread_arg.local_thread_count = GROUPED_CHUNKS ? 1 : thread_count;
             thread_arg.rows_done = 0;
+            thread_arg.diag_worker_id = id;
+            thread_arg.diag_repeat_index = CURRENT_REPEAT;
+            thread_arg.diag_progress_stride = PROGRESS_STRIDE;
+            thread_arg.diag_compute_start_us = COMPUTE_START_US;
+        };
 
-            if (thrd_create(&worker_thread.thread, generate_rows, &thread_arg) != THRD_SUCCESS) {
+        int thread_index = 0;
+        for (auto& worker_thread : worker_threads) {
+            prepare_thread_arg(worker_thread, thread_index);
+            MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} thread {} create begin", id, CURRENT_REPEAT, thread_index);
+            if (thrd_create(&worker_thread.thread, generate_rows, &worker_thread.arg) != THRD_SUCCESS) {
                 std::println(stderr, "mandelbench-worker[{}]: failed to create thread {}", id, thread_index);
                 close(OUTPUT_STREAM_FD);
                 close(CONTROL_FD);
                 return 1;
             }
+            MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} thread {} create end", id, CURRENT_REPEAT, thread_index);
             thread_index++;
         }
 
         int rows_done = 0;
         int joined_thread_index = 0;
         for (auto& worker_thread : worker_threads) {
+            MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} thread {} join begin", id, CURRENT_REPEAT, joined_thread_index);
             if (thrd_join(worker_thread.thread, nullptr) != THRD_SUCCESS) {
                 std::println(stderr, "mandelbench-worker[{}]: failed to join thread {}", id, joined_thread_index);
                 close(OUTPUT_STREAM_FD);
                 close(CONTROL_FD);
                 return 1;
             }
+            MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} thread {} join end", id, CURRENT_REPEAT, joined_thread_index);
             rows_done += worker_thread.arg.rows_done;
             joined_thread_index++;
         }
         uint64_t const COMPUTE_END_US = now_us();
+        MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} compute end rows_done={} expected_rows={} ms={:.3f}", id, CURRENT_REPEAT,
+                          rows_done, total_rows, elapsed_ms(COMPUTE_START_US, COMPUTE_END_US));
 
         uint64_t const WRITE_START_US = now_us();
+        MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} open/write begin output_fd={} output='{}'", id, CURRENT_REPEAT,
+                          OUTPUT_STREAM_FD, output != nullptr ? output : "");
         int const FD = OUTPUT_STREAM_FD >= 0 ? OUTPUT_STREAM_FD : open(output, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         uint64_t const OPEN_END_US = now_us();
         if (FD < 0) {
@@ -1428,6 +1586,8 @@ auto mandelbench_worker(int argc, char** argv) -> int {
                 std::println(stderr, "mandelbench-worker[{}]: failed to build output header bytes={}", id, image.size());
                 return 1;
             }
+            MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} header write begin fd={} bytes={}", id, CURRENT_REPEAT, FD,
+                              header.size());
             if (!write_all(FD, header, &write_fail_ret, &write_fail_errno)) {
                 close(FD);
                 close(CONTROL_FD);
@@ -1435,6 +1595,7 @@ auto mandelbench_worker(int argc, char** argv) -> int {
                              write_fail_errno, std::strerror(write_fail_errno));
                 return 1;
             }
+            MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} header write end fd={} bytes={}", id, CURRENT_REPEAT, FD, header.size());
             if (!wait_for_control_byte(CONTROL_FD, id, "payload release")) {
                 close(FD);
                 close(CONTROL_FD);
@@ -1443,6 +1604,7 @@ auto mandelbench_worker(int argc, char** argv) -> int {
         }
 
         uint64_t const WRITE_BODY_START_US = now_us();
+        MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} payload write begin fd={} bytes={}", id, CURRENT_REPEAT, FD, image.size());
         if (!write_all(FD, image, &write_fail_ret, &write_fail_errno)) {
             close(FD);
             close(CONTROL_FD);
@@ -1451,6 +1613,8 @@ auto mandelbench_worker(int argc, char** argv) -> int {
             return 1;
         }
         uint64_t const WRITE_BODY_END_US = now_us();
+        MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} payload write end fd={} bytes={} ms={:.3f}", id, CURRENT_REPEAT, FD,
+                          image.size(), elapsed_ms(WRITE_BODY_START_US, WRITE_BODY_END_US));
 
         if (OUTPUT_STREAM_FD < 0 && close(FD) != 0) {
             std::println(stderr, "mandelbench-worker[{}]: close failed for output", id);
@@ -1480,6 +1644,8 @@ auto mandelbench_worker(int argc, char** argv) -> int {
         if (MANDELBENCH_DEBUG_ENABLED) {
             std::println(stderr, "mandelbench-worker[{}]: computed {} rows using {} threads", id, rows_done, thread_count);
         }
+        MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} end total_ms={:.3f}", id, CURRENT_REPEAT,
+                          elapsed_ms(REPEAT_ENTRY_US, WRITE_END_US));
     }
 
     if (OUTPUT_STREAM_FD >= 0 && close(OUTPUT_STREAM_FD) != 0) {
@@ -1490,5 +1656,6 @@ auto mandelbench_worker(int argc, char** argv) -> int {
     if (CONTROL_FD >= 0) {
         close(CONTROL_FD);
     }
+    MANDELBENCH_TRACE("mandelbench-worker[{}]: exit ok", id);
     return 0;
 }
