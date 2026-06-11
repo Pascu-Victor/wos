@@ -18,7 +18,7 @@ void wki_channel_send_ack(WkiChannel* ch) {
 
     WkiHeader ack = {};
     ack.version_flags = wki_version_flags(WKI_VERSION, WKI_FLAG_ACK_PRESENT | WKI_FLAG_PRIORITY);
-    ack.msg_type = 0;  // pure ACK, no message
+    ack.msg_type = static_cast<uint8_t>(MsgType::HEARTBEAT_ACK);  // pure ACK carrier
     ack.src_node = g_wki.my_node_id;
     ack.dst_node = ch->peer_node_id;
     ack.channel_id = ch->channel_id;

@@ -77,6 +77,45 @@ auto lsa_lists_neighbor(const void* payload, uint16_t payload_len, uint16_t node
     return std::ranges::any_of(NBRS, [node_id](auto const& neighbor) { return neighbor.node_id == node_id; });
 }
 
+auto collect_direct_neighbors(std::array<LsaNeighborEntry, WKI_MAX_NEIGHBORS_PER_LSA>& neighbors) -> uint16_t {
+    uint16_t num_nbrs = 0;
+    for (auto const& peer : g_wki.peers) {
+        if (peer.node_id == WKI_NODE_INVALID) {
+            continue;
+        }
+        if (peer.state != PeerState::CONNECTED) {
+            continue;
+        }
+        if (!peer.is_direct) {
+            continue;
+        }
+        if (num_nbrs >= WKI_MAX_NEIGHBORS_PER_LSA) {
+            break;
+        }
+
+        auto& neighbor = neighbors.at(num_nbrs++);
+        neighbor.node_id = peer.node_id;
+        neighbor.link_cost = peer.link_cost > 0 ? peer.link_cost : WKI_DEFAULT_LINK_COST;
+        neighbor.transport_mtu = (peer.transport != nullptr) ? peer.transport->mtu : 0;
+    }
+    return num_nbrs;
+}
+
+auto own_lsa_matches_locked(uint16_t num_neighbors, std::span<LsaNeighborEntry const> neighbors, uint32_t rdma_zone_bitmap) -> bool {
+    LsdbEntry const* entry = lsdb_find(g_wki.my_node_id);
+    if (entry == nullptr || !entry->valid) {
+        return false;
+    }
+    if (entry->rdma_zone_bitmap != rdma_zone_bitmap || entry->num_neighbors != num_neighbors) {
+        return false;
+    }
+
+    std::span<LsaNeighborEntry const> const EXISTING{entry->neighbors.data(), num_neighbors};
+    return std::ranges::equal(EXISTING, neighbors, [](auto const& lhs, auto const& rhs) {
+        return lhs.node_id == rhs.node_id && lhs.link_cost == rhs.link_cost && lhs.transport_mtu == rhs.transport_mtu;
+    });
+}
+
 void flood_lsa(const void* payload, uint16_t payload_len, uint16_t exclude_node, bool suppress_origin_neighbors) {
     auto const* lsa = payload_len >= sizeof(LsaPayload) ? static_cast<const LsaPayload*>(payload) : nullptr;
     for (auto const& peer : g_wki.peers) {
@@ -134,32 +173,27 @@ void wki_lsa_generate_and_flood() {
         return;
     }
 
-    // Rate limit LSA generation to prevent flooding during rapid state changes
     uint64_t const NOW_US = wki_now_us();
     uint64_t const MIN_INTERVAL_US = static_cast<uint64_t>(WKI_LSA_MIN_INTERVAL_MS) * 1000;
+
+    std::array<LsaNeighborEntry, WKI_MAX_NEIGHBORS_PER_LSA> current_neighbors{};
+    uint16_t const NUM_NBRS = collect_direct_neighbors(current_neighbors);
+    std::span<LsaNeighborEntry const> const CURRENT_NBRS{current_neighbors.data(), NUM_NBRS};
+
+    s_routing_lock.lock();
+    bool const UNCHANGED = own_lsa_matches_locked(NUM_NBRS, CURRENT_NBRS, g_wki.rdma_zone_bitmap);
+    s_routing_lock.unlock();
+    if (UNCHANGED) {
+        s_lsa_pending = false;
+        return;
+    }
+
+    // Rate limit LSA generation to prevent flooding during rapid state changes.
     if (s_last_own_lsa_time != 0 && NOW_US - s_last_own_lsa_time < MIN_INTERVAL_US) {
-        // Mark that an LSA should be generated when the rate limit expires
         s_lsa_pending = true;
         return;
     }
     s_lsa_pending = false;
-
-    // Count direct CONNECTED neighbors
-    uint16_t num_nbrs = 0;
-    for (auto const& peer : g_wki.peers) {
-        if (peer.node_id == WKI_NODE_INVALID) {
-            continue;
-        }
-        if (peer.state != PeerState::CONNECTED) {
-            continue;
-        }
-        if (!peer.is_direct) {
-            continue;
-        }
-        num_nbrs++;
-    }
-
-    num_nbrs = std::min<uint16_t>(num_nbrs, static_cast<uint16_t>(WKI_MAX_NEIGHBORS_PER_LSA));
 
     // Build LSA payload on the stack
     constexpr size_t BUF_SIZE = sizeof(LsaPayload) + (WKI_MAX_NEIGHBORS_PER_LSA * sizeof(LsaNeighborEntry));
@@ -168,33 +202,13 @@ void wki_lsa_generate_and_flood() {
     auto* lsa = reinterpret_cast<LsaPayload*>(buf.data());
     lsa->origin_node = g_wki.my_node_id;
     lsa->lsa_seq = ++g_wki.my_lsa_seq;
-    lsa->num_neighbors = num_nbrs;
+    lsa->num_neighbors = NUM_NBRS;
     lsa->rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
 
-    std::span<LsaNeighborEntry> const LSA_NBRS{lsa_neighbors(lsa), num_nbrs};
-    auto nbr_it = LSA_NBRS.begin();
-    for (auto const& peer : g_wki.peers) {
-        if (nbr_it == LSA_NBRS.end()) {
-            break;
-        }
-        if (peer.node_id == WKI_NODE_INVALID) {
-            continue;
-        }
-        if (peer.state != PeerState::CONNECTED) {
-            continue;
-        }
-        if (!peer.is_direct) {
-            continue;
-        }
+    std::span<LsaNeighborEntry> const LSA_NBRS{lsa_neighbors(lsa), NUM_NBRS};
+    std::ranges::copy(CURRENT_NBRS, LSA_NBRS.begin());
 
-        auto& neighbor = *nbr_it;
-        neighbor.node_id = peer.node_id;
-        neighbor.link_cost = peer.link_cost > 0 ? peer.link_cost : WKI_DEFAULT_LINK_COST;
-        neighbor.transport_mtu = (peer.transport != nullptr) ? peer.transport->mtu : 0;
-        ++nbr_it;
-    }
-
-    auto const PAYLOAD_LEN = static_cast<uint16_t>(sizeof(LsaPayload) + (num_nbrs * sizeof(LsaNeighborEntry)));
+    auto const PAYLOAD_LEN = static_cast<uint16_t>(sizeof(LsaPayload) + (NUM_NBRS * sizeof(LsaNeighborEntry)));
 
     // Store in our own LSDB
     s_routing_lock.lock();
@@ -205,7 +219,7 @@ void wki_lsa_generate_and_flood() {
     if (entry != nullptr) {
         entry->lsa_seq = lsa->lsa_seq;
         entry->rdma_zone_bitmap = lsa->rdma_zone_bitmap;
-        entry->num_neighbors = num_nbrs;
+        entry->num_neighbors = NUM_NBRS;
         std::ranges::copy(LSA_NBRS, entry->neighbors.begin());
         entry->received_time_us = wki_now_us();
     }
@@ -219,7 +233,7 @@ void wki_lsa_generate_and_flood() {
 
     s_last_own_lsa_time = wki_now_us();
 #ifdef DEBUG_WKI_ROUTING
-    log::debug("Generated own LSA seq=%u nbrs=%u", lsa->lsa_seq, num_nbrs);
+    log::debug("Generated own LSA seq=%u nbrs=%u", lsa->lsa_seq, NUM_NBRS);
 #endif
 }
 
@@ -506,12 +520,6 @@ void wki_routing_timer_tick(uint64_t now_us) {
     // Check if we have a pending LSA that was rate-limited
     uint64_t const MIN_INTERVAL_US{static_cast<uint64_t>(WKI_LSA_MIN_INTERVAL_MS) * 1000};
     if (s_lsa_pending && now_us - s_last_own_lsa_time >= MIN_INTERVAL_US) {
-        wki_lsa_generate_and_flood();
-    }
-
-    // Periodic LSA refresh
-    uint64_t const LSA_REFRESH_US{static_cast<uint64_t>(WKI_LSA_REFRESH_MS) * 1000};
-    if (now_us - s_last_own_lsa_time >= LSA_REFRESH_US) {
         wki_lsa_generate_and_flood();
     }
 

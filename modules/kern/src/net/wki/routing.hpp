@@ -17,7 +17,7 @@ constexpr uint32_t WKI_COST_INFINITY = 0xFFFFFFFF;
 // Default link cost (used when peer.link_cost is 0)
 constexpr uint16_t WKI_DEFAULT_LINK_COST = 1;
 
-// LSDB entry aging: entries older than 3x refresh interval are purged
+// LSDB entry aging factor for the disabled aging path retained in routing.cpp.
 constexpr uint32_t WKI_LSDB_AGE_FACTOR = 3;
 
 // Minimum interval between LSA generations (rate limiting to prevent flooding)
@@ -56,8 +56,9 @@ struct RoutingEntry {
 // Initialize routing subsystem (called from wki_init)
 void wki_routing_init();
 
-// Generate our own LSA from the peer table and flood to all direct neighbors.
-// Also stores the LSA in our own LSDB and recomputes routes.
+// Generate our own LSA from the peer table and flood to all direct neighbors
+// only when the advertised local topology changed. Also stores the LSA in our
+// own LSDB and recomputes routes after a new sequence is emitted.
 void wki_lsa_generate_and_flood();
 
 // Recompute routing table from LSDB using Dijkstra SPF
@@ -72,7 +73,7 @@ auto wki_routing_lookup(uint16_t dst_node) -> const RoutingEntry*;
 // Does NOT recompute routes - caller should call wki_routing_recompute() after.
 void wki_routing_invalidate_node(uint16_t node_id);
 
-// Periodic timer: LSA refresh, LSDB aging.
+// Periodic timer: pending rate-limited LSA emission, LSDB aging.
 // Called from wki_peer_timer_tick().
 void wki_routing_timer_tick(uint64_t now_us);
 

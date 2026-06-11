@@ -412,9 +412,7 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
     // existing voluntary-yield path for now: proxy exec handoff intentionally
     // suppresses one class of concurrent wake in deferred_task_switch(), and
     // using kern_block() here can therefore lose a wake and strand the task
-    // until an unrelated signal arrives. The tighter WKI timer cadence and the
-    // broader inline RX draining still reduce the latency floor for process
-    // callers without taking that scheduler risk.
+    // until an unrelated signal arrives.
     while (!wait_done(entry)) {
         if (entry->deadline_us != 0 && wki_now_us() >= entry->deadline_us) {
             // Timed out locally. Claim completion before returning so a late
@@ -999,7 +997,9 @@ void refresh_tx_credits_from_advertisement_locked(WkiChannel* ch, uint8_t advert
 
 struct AckSnapshot {
     WkiHeader hdr = {};
+    WkiChannel* channel = nullptr;
     uint16_t peer = WKI_NODE_INVALID;
+    uint16_t channel_id = 0;
     uint32_t ack_num = 0;
 };
 
@@ -1017,9 +1017,40 @@ auto capture_ack_snapshot_locked(WkiChannel* ch) -> AckSnapshot {
     ack.hdr.hop_ttl = WKI_DEFAULT_TTL;
     ack.hdr.checksum = 0;
     ack.hdr.reserved = 0;
+    ack.channel = ch;
     ack.peer = ch->peer_node_id;
+    ack.channel_id = ch->channel_id;
     ack.ack_num = ch->rx_ack_pending;
     return ack;
+}
+
+auto ack_snapshot_present(const AckSnapshot& ack) -> bool { return ack.peer != WKI_NODE_INVALID && ack.channel != nullptr; }
+
+auto capture_pending_peer_ack_for_tx_locked(WkiPeer* peer, WkiChannel* tx_ch) -> AckSnapshot {
+    if (peer == nullptr || tx_ch == nullptr) {
+        return {};
+    }
+
+    for (WkiChannel* candidate : peer->channels) {
+        if (candidate == nullptr || candidate == tx_ch) {
+            continue;
+        }
+        if (!candidate->lock.try_lock()) {
+            continue;
+        }
+
+        AckSnapshot ack = {};
+        if (candidate->active && candidate->peer_node_id == peer->node_id && candidate->ack_pending) {
+            ack = capture_ack_snapshot_locked(candidate);
+        }
+
+        candidate->lock.unlock();
+        if (ack_snapshot_present(ack)) {
+            return ack;
+        }
+    }
+
+    return {};
 }
 
 auto transmit_ack_snapshot(const AckSnapshot& ack) -> int {
@@ -1069,8 +1100,13 @@ void complete_ack_transmit_locked(WkiChannel* ch, uint32_t ack_num, int tx_ret, 
 }
 
 void apply_ack_transmit_result(WkiChannel* ch, const AckSnapshot& ack, int tx_ret, bool& notify_timer) {
+    if (ch == nullptr) {
+        return;
+    }
     ch->lock.lock();
-    complete_ack_transmit_locked(ch, ack.ack_num, tx_ret, notify_timer);
+    if (ch->peer_node_id == ack.peer && ch->channel_id == ack.channel_id) {
+        complete_ack_transmit_locked(ch, ack.ack_num, tx_ret, notify_timer);
+    }
     ch->lock.unlock();
 }
 
@@ -1555,16 +1591,25 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
 
     perf_record_transport_begin(dst_node, channel_id, TRACE_CORRELATION, payload_len, TRACE_CALLSITE);
 
-    // A prior pure ACK may have been dropped; carry the latest cumulative ACK
-    // on every later reliable data frame once this channel has received data.
-    bool const HAS_CUMULATIVE_ACK = ch->rx_seq != 0;
+    // Give pending ACK state a chance to ride on this reliable frame. Prefer
+    // the carrier channel's cumulative ACK; otherwise borrow one pending ACK
+    // from another channel to the same peer without blocking on its lock.
+    AckSnapshot piggyback_ack = {};
+    if (ch->ack_pending || ch->rx_seq != 0) {
+        piggyback_ack = capture_ack_snapshot_locked(ch);
+    } else {
+        piggyback_ack = capture_pending_peer_ack_for_tx_locked(peer, ch);
+    }
 
     uint8_t flags = 0;
     if (ch->priority == PriorityClass::LATENCY) {
         flags |= WKI_FLAG_PRIORITY;
     }
-    if (ch->ack_pending || HAS_CUMULATIVE_ACK) {
+    if (ack_snapshot_present(piggyback_ack)) {
         flags |= WKI_FLAG_ACK_PRESENT;
+        if (piggyback_ack.channel_id != channel_id) {
+            flags |= WKI_FLAG_ACK_CHANNEL;
+        }
     }
 
     auto* hdr = reinterpret_cast<WkiHeader*>(frame);
@@ -1574,14 +1619,15 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
     hdr->dst_node = dst_node;
     hdr->channel_id = channel_id;
     hdr->seq_num = ch->tx_seq;
-    hdr->ack_num = ((flags & WKI_FLAG_ACK_PRESENT) != 0) ? ch->rx_ack_pending : 0;
+    hdr->ack_num = ack_snapshot_present(piggyback_ack) ? piggyback_ack.ack_num : 0;
     hdr->payload_len = payload_len;
-    hdr->credits = static_cast<uint8_t>(ch->rx_credits > 255 ? 255 : ch->rx_credits);
+    auto const LOCAL_RX_CREDITS = static_cast<uint8_t>(ch->rx_credits > 255 ? 255 : ch->rx_credits);
+    hdr->credits = ack_snapshot_present(piggyback_ack) ? piggyback_ack.hdr.credits : LOCAL_RX_CREDITS;
     hdr->hop_ttl = WKI_DEFAULT_TTL;
     hdr->src_port = 0;
     hdr->dst_port = 0;
     hdr->checksum = 0;
-    hdr->reserved = 0;
+    hdr->reserved = ((flags & WKI_FLAG_ACK_CHANNEL) != 0) ? wki_ack_reserved(piggyback_ack.channel_id) : 0;
 
     if ((payload != nullptr) && payload_len > 0) {
         memcpy(frame + WKI_HEADER_SIZE, payload, payload_len);
@@ -1679,10 +1725,23 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
     // pressure, but the retry timer can still deliver this sequence.
     ch->tx_seq++;
     ch->tx_credits--;
-    ch->ack_pending = false;
+    AckSnapshot post_unlock_ack = {};
+    if (ack_snapshot_present(piggyback_ack)) {
+        if (piggyback_ack.channel == ch) {
+            complete_ack_transmit_locked(ch, piggyback_ack.ack_num, WKI_OK, notify_timer);
+        } else {
+            post_unlock_ack = piggyback_ack;
+        }
+    }
     ch->bytes_sent += payload_len;
 
     ch->lock.unlock();
+
+    if (ack_snapshot_present(post_unlock_ack)) {
+        bool ack_notify_timer = false;
+        apply_ack_transmit_result(post_unlock_ack.channel, post_unlock_ack, WKI_OK, ack_notify_timer);
+        notify_timer = notify_timer || ack_notify_timer;
+    }
 
     if (notify_timer) {
         wki_timer_notify();
@@ -1937,7 +1996,8 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
 
     // Process piggybacked ACK
     if ((wki_flags(hdr->version_flags) & WKI_FLAG_ACK_PRESENT) != 0) {
-        WkiChannel* ch = wki_channel_get(hdr->src_node, hdr->channel_id);
+        uint16_t const ACK_CHANNEL_ID = wki_ack_channel_id(*hdr);
+        WkiChannel* ch = wki_channel_get(hdr->src_node, ACK_CHANNEL_ID);
         if (ch != nullptr) {
             auto* fast_retransmit_data = static_cast<uint8_t*>(nullptr);
             uint16_t fast_retransmit_len = 0;
@@ -2164,19 +2224,9 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 ch->bytes_received += PAYLOAD_LEN;
 
                 bool notify_timer = false;
-                AckSnapshot early_ack = {};
-                bool const EARLY_ACK = ch->priority == PriorityClass::LATENCY;
-                if (EARLY_ACK) {
-                    early_ack = capture_ack_snapshot_locked(ch);
-                }
-
                 ch->lock.unlock();
-                mark_peer_rx_progress(hdr->src_node);
 
-                if (EARLY_ACK) {
-                    int const ACK_RET = transmit_ack_snapshot(early_ack);
-                    apply_ack_transmit_result(ch, early_ack, ACK_RET, notify_timer);
-                }
+                mark_peer_rx_progress(hdr->src_node);
 
                 // Dispatch to handler via shared helper
                 wki_dispatch_reliable_msg_ordered(ch, msg, hdr, payload, PAYLOAD_LEN);
@@ -2205,18 +2255,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     uint8_t* ro_data = ro->data;
                     uint16_t const RO_LEN = ro->len;
 
-                    AckSnapshot ro_early_ack = {};
-                    bool const RO_EARLY_ACK = ch->priority == PriorityClass::LATENCY;
-                    if (RO_EARLY_ACK) {
-                        ro_early_ack = capture_ack_snapshot_locked(ch);
-                    }
-
                     ch->lock.unlock();
-
-                    if (RO_EARLY_ACK) {
-                        int const ACK_RET = transmit_ack_snapshot(ro_early_ack);
-                        apply_ack_transmit_result(ch, ro_early_ack, ACK_RET, notify_timer);
-                    }
 
                     // Re-dispatch reordered message through the same handler switch
                     wki_dispatch_reliable_msg_ordered(ch, RO_MSG, &RO_HDR, ro_data, RO_LEN);
@@ -2225,10 +2264,10 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     delete ro;
                     ch->lock.lock();
                 }
-                // For LATENCY channels, send ACK immediately instead of waiting
-                // for wki_timer_tick() (~10ms cadence).  The response message
-                // piggybacks an ACK, but the ACK of the *response itself* has
-                // no piggyback vehicle and would otherwise stall up to 10ms.
+                // For LATENCY channels, send a pure ACK immediately after the
+                // handler only if no response/other reliable frame consumed the
+                // pending ACK. This gives piggybacking first chance while still
+                // avoiding a timer-cadence stall for one-way messages.
                 bool const IMM_ACK = (ch->priority == PriorityClass::LATENCY && ch->ack_pending);
                 WkiHeader imm_ack_hdr = {};
                 uint16_t imm_ack_peer = 0;

@@ -13,7 +13,7 @@ namespace ker::net::wki {
 
 constexpr uint16_t WKI_ETHERTYPE = 0x88B7;
 constexpr uint16_t WKI_ETHERTYPE_ROCE = 0x88B8;  // RoCE RDMA data frames (L2, MAC-based GIDs)
-constexpr uint8_t WKI_VERSION = 1;
+constexpr uint8_t WKI_VERSION = 2;
 constexpr uint32_t WKI_HELLO_MAGIC = 0x574B4900;  // "WKI\0"
 constexpr uint16_t WKI_NODE_INVALID = 0x0000;
 constexpr uint16_t WKI_NODE_BROADCAST = 0xFFFF;
@@ -27,10 +27,11 @@ constexpr size_t WKI_ETH_MAX_PAYLOAD = 8954;
 // Header Flags (lower 4 bits of version_flags byte)
 // -----------------------------------------------------------------------------
 
-constexpr uint8_t WKI_FLAG_ACK_PRESENT = 0x08;  // ack_num field is valid
+constexpr uint8_t WKI_FLAG_ACK_PRESENT = 0x08;  // ack_num/credits fields are valid
 constexpr uint8_t WKI_FLAG_PRIORITY = 0x04;     // latency-optimized path
 constexpr uint8_t WKI_FLAG_FRAGMENT = 0x02;     // fragment of larger message
-constexpr uint8_t WKI_FLAG_RESERVED = 0x01;
+constexpr uint8_t WKI_FLAG_ACK_CHANNEL = 0x01;  // reserved[15:0] carries ACK channel_id
+constexpr uint8_t WKI_FLAG_RESERVED = WKI_FLAG_ACK_CHANNEL;
 
 // Helper: build version_flags byte
 constexpr uint8_t wki_version_flags(uint8_t version, uint8_t flags) { return static_cast<uint8_t>((version << 4) | (flags & 0x0F)); }
@@ -138,10 +139,25 @@ struct WkiHeader {
     uint16_t src_port;  // resource addressing
     uint16_t dst_port;  // resource addressing
     uint32_t checksum;  // CRC32 of header+payload (0 = disabled)
-    uint32_t reserved;
+    uint32_t reserved;  // ACK_CHANNEL uses low 16 bits for ack channel_id
 } __attribute__((packed));
 
 static_assert(sizeof(WkiHeader) == 32, "WkiHeader must be 32 bytes");
+
+// ACK_PRESENT normally acknowledges the frame's channel_id. When ACK_CHANNEL
+// is also set, reserved[15:0] carries the acknowledged channel so any outgoing
+// reliable frame can carry an ACK for another channel to the same peer.
+constexpr uint32_t WKI_ACK_CHANNEL_MASK = 0x0000FFFFU;
+
+inline auto wki_ack_channel_id(const WkiHeader& hdr) -> uint16_t {
+    uint8_t const FLAGS = wki_flags(hdr.version_flags);
+    if ((FLAGS & WKI_FLAG_ACK_PRESENT) == 0 || (FLAGS & WKI_FLAG_ACK_CHANNEL) == 0) {
+        return hdr.channel_id;
+    }
+    return static_cast<uint16_t>(hdr.reserved & WKI_ACK_CHANNEL_MASK);
+}
+
+inline auto wki_ack_reserved(uint16_t channel_id) -> uint32_t { return static_cast<uint32_t>(channel_id); }
 
 // -----------------------------------------------------------------------------
 // HELLO / HELLO_ACK Payload - 32 bytes

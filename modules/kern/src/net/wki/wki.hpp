@@ -81,9 +81,6 @@ constexpr uint16_t WKI_REORDER_RESOURCE = 1024;
 constexpr uint16_t WKI_REORDER_DYNAMIC = WKI_CREDITS_DYNAMIC;
 constexpr uint16_t WKI_REORDER_IPC_DATA = WKI_CREDITS_IPC_DATA;
 
-// LSA
-constexpr uint32_t WKI_LSA_REFRESH_MS = 5000;  // 5 seconds
-
 // -----------------------------------------------------------------------------
 // Error codes
 // -----------------------------------------------------------------------------

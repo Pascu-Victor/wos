@@ -52,6 +52,7 @@ constexpr uint8_t ROCE_VERSION = 1;
 constexpr uint32_t ROCE_MAX_PAYLOAD = 9000 - proto::ETH_HLEN - sizeof(RoceHeader);  // ~8962 bytes
 constexpr uint32_t ROCE_WRITE_TAG_VALID = 0x80000000U;
 constexpr uint32_t ROCE_WRITE_TAG_COOKIE_MASK = 0x0000FFFFU;
+constexpr uint64_t ROCE_RDMA_READ_TIMEOUT_US = 100'000;
 
 auto roce_write_tag(uint16_t cookie) -> uint32_t { return ROCE_WRITE_TAG_VALID | cookie; }
 
@@ -117,6 +118,25 @@ auto region_find_locked(uint32_t rkey) -> RoceRegion* {
     return nullptr;
 }
 
+auto region_unlink_locked(uint32_t rkey) -> RoceRegion* {
+    RoceRegion** link = &region_bucket(rkey);
+    while (*link != nullptr) {
+        if ((*link)->rkey == rkey) {
+            RoceRegion* removed = *link;
+            *link = removed->next;
+            removed->next = nullptr;
+            return removed;
+        }
+        link = &((*link)->next);
+    }
+    return nullptr;
+}
+
+auto region_temporary_complete_locked(const RoceRegion* region) -> bool {
+    return region != nullptr && region->temporary && region->write_complete && !region->receive_gap &&
+           region->received_bytes >= region->size;
+}
+
 auto next_region_rkey_locked() -> uint32_t {
     // Keep RoCE region rkeys below 0x00010000 so they stay disjoint from
     // zone doorbell values (node_id<<16 | counter, minimum 0x00010001).
@@ -175,44 +195,30 @@ auto region_register(uint64_t vaddr, uint32_t size, bool temporary, uint32_t* rk
 }
 
 auto region_unregister(uint32_t rkey) -> bool {
-    RoceRegion* removed = nullptr;
     uint64_t const FLAGS = s_region_lock.lock_irqsave();
-    RoceRegion** link = &region_bucket(rkey);
-    while (*link != nullptr) {
-        if ((*link)->rkey == rkey) {
-            removed = *link;
-            *link = removed->next;
-            removed->next = nullptr;
-            break;
-        }
-        link = &((*link)->next);
-    }
+    RoceRegion* removed = region_unlink_locked(rkey);
     s_region_lock.unlock_irqrestore(FLAGS);
 
     delete removed;
     return removed != nullptr;
 }
 
-auto region_unregister_completed_temporary(uint32_t rkey) -> bool {
+auto region_note_temporary_doorbell(uint32_t rkey) -> bool {
     RoceRegion* removed = nullptr;
+    bool handled = false;
     uint64_t const FLAGS = s_region_lock.lock_irqsave();
-    RoceRegion** link = &region_bucket(rkey);
-    while (*link != nullptr) {
-        if ((*link)->rkey == rkey) {
-            if (!(*link)->temporary || (*link)->receive_gap || (*link)->received_bytes < (*link)->size) {
-                break;
-            }
-            removed = *link;
-            *link = removed->next;
-            removed->next = nullptr;
-            break;
+    RoceRegion* region = region_find_locked(rkey);
+    if (region != nullptr && region->temporary) {
+        handled = true;
+        region->write_complete = true;
+        if (region_temporary_complete_locked(region)) {
+            removed = region_unlink_locked(rkey);
         }
-        link = &((*link)->next);
     }
     s_region_lock.unlock_irqrestore(FLAGS);
 
     delete removed;
-    return removed != nullptr;
+    return handled;
 }
 
 auto region_is_registered(uint32_t rkey) -> bool {
@@ -247,10 +253,8 @@ auto region_prepare_tagged_write(uint32_t rkey, uint16_t cookie) -> bool {
         return false;
     }
 
-    if (!region->tagged_receive || region->received_cookie != cookie) {
-        region->received_bytes = 0;
-        region->receive_gap = false;
-    }
+    region->received_bytes = 0;
+    region->receive_gap = false;
     region->tagged_receive = true;
     region->received_cookie = cookie;
     region->write_complete = false;
@@ -302,12 +306,36 @@ auto region_snapshot(uint32_t rkey, RoceRegionSnapshot& out) -> bool {
     return true;
 }
 
+auto wait_for_temporary_region_completion(uint32_t rkey) -> int {
+    uint64_t const DEADLINE = wki_now_us() + ROCE_RDMA_READ_TIMEOUT_US;
+    uint32_t spins = 0;
+
+    while (region_is_registered(rkey)) {
+        if (wki_now_us() >= DEADLINE) {
+            return region_unregister(rkey) ? WKI_ERR_TIMEOUT : WKI_OK;
+        }
+
+        // RDMA read completion is itself delivered by RX packets. Keep the
+        // network queues moving even when the caller is a WKI daemon.
+        wki_spin_yield();
+
+        if ((++spins & 0x3FU) == 0) {
+            ker::mod::sched::kern_yield();
+        } else {
+            asm volatile("pause" ::: "memory");
+        }
+    }
+
+    return WKI_OK;
+}
+
 auto region_write(uint32_t rkey, uint64_t offset, const uint8_t* payload, uint32_t length, uint32_t payload_len, uint32_t write_tag)
     -> bool {
     if (payload == nullptr || length > payload_len) {
         return false;
     }
 
+    RoceRegion* completed = nullptr;
     uint64_t const FLAGS = s_region_lock.lock_irqsave();
     RoceRegion* region = region_find_locked(rkey);
     if (region == nullptr || offset > region->size || length > (static_cast<uint64_t>(region->size) - offset)) {
@@ -318,17 +346,19 @@ auto region_write(uint32_t rkey, uint64_t offset, const uint8_t* payload, uint32
     if (roce_write_tag_valid(write_tag)) {
         uint16_t const COOKIE = roce_write_tag_cookie(write_tag);
         if (!region->tagged_receive || region->received_cookie != COOKIE) {
-            region->received_bytes = 0;
-            region->receive_gap = false;
+            s_region_lock.unlock_irqrestore(FLAGS);
+            return false;
         }
-        region->tagged_receive = true;
-        region->received_cookie = COOKIE;
-        region->write_complete = false;
     }
 
     memcpy(static_cast<uint8_t*>(region->vaddr) + offset, payload, length);
     region->received_bytes = std::min(region->size, region->received_bytes + length);
+    if (region_temporary_complete_locked(region)) {
+        completed = region_unlink_locked(rkey);
+    }
     s_region_lock.unlock_irqrestore(FLAGS);
+
+    delete completed;
     return true;
 }
 
@@ -439,7 +469,8 @@ int roce_rdma_write(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey,
 int roce_rdma_read(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, uint64_t remote_offset, void* local_buf, uint32_t len) {
     // Send RDMA_READ_REQ - responder sends back data as RDMA_WRITE frames
     // into a temporary registered region, then a DOORBELL to signal completion.
-    // For now, use a simple synchronous approach with a completion flag.
+    // Use a synchronous inline poll so the caller keeps RX/backlog progress
+    // moving while waiting for the doorbell.
 
     // Register our local buffer as a temporary region for the response
     uint32_t local_rkey = 0;
@@ -463,29 +494,7 @@ int roce_rdma_read(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t rkey, 
         return RET;
     }
 
-    // Spin-wait for the response data to arrive (responder sends RDMA_WRITE + DOORBELL).
-    // We MUST poll the NIC during the wait, otherwise the response frames can never
-    // be received and the read will always time out.
-    uint64_t const DEADLINE = wki_now_us() + 100000;  // 100ms timeout
-    while (wki_now_us() < DEADLINE) {
-        if (!region_is_registered(local_rkey)) {
-            break;  // region was deregistered by DOORBELL handler -> data arrived
-        }
-        // Drive NIC RX so the RDMA_WRITE + DOORBELL response can be processed.
-        NetDevice* net_dev = wki_eth_get_netdev();
-        if (net_dev != nullptr) {
-            napi_poll_all_pending();
-            backlog_drain_all_pending_inline();
-        }
-        asm volatile("pause" ::: "memory");
-    }
-
-    // Clean up if still registered (timeout)
-    if (region_unregister(local_rkey)) {
-        return WKI_ERR_TIMEOUT;  // timeout
-    }
-
-    return 0;
+    return wait_for_temporary_region_completion(local_rkey);
 }
 
 int roce_doorbell(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t value) {
@@ -663,9 +672,9 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
             // (always >= 0x00010001).
             uint32_t const VAL = hdr->doorbell_val;
 
-            if (region_unregister_completed_temporary(VAL)) {
-                // Read-completion doorbell - deregister temporary region to
-                // unblock the roce_rdma_read spin-wait.
+            if (region_note_temporary_doorbell(VAL)) {
+                // Read-completion doorbell. If data fragments are still in
+                // flight, the final RDMA_WRITE will deregister the region.
                 break;
             }
 

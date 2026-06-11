@@ -916,13 +916,14 @@ void handle_fence_notify(const WkiHeader* /*hdr*/, const uint8_t* payload, uint1
 namespace {
 
 // Track when we last sent heartbeats / HELLOs
-uint64_t s_last_heartbeat_send = 0;                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint64_t s_last_hello_broadcast = 0;                       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint64_t s_last_vfs_fd_gc = 0;                             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint64_t s_jitter_state = 0;                               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint64_t s_next_heartbeat_send_deadline = 0;               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-constexpr uint64_t HELLO_BROADCAST_INTERVAL_US = 1000000;  // 1 second
-constexpr uint64_t VFS_FD_GC_INTERVAL_US = 10000000;       // 10 seconds
+uint64_t s_last_heartbeat_send = 0;                                  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t s_last_hello_broadcast = 0;                                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t s_last_vfs_fd_gc = 0;                                       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t s_jitter_state = 0;                                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t s_next_heartbeat_send_deadline = 0;                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+constexpr uint64_t HELLO_DISCOVERY_BROADCAST_INTERVAL_US = 1000000;  // 1 second
+constexpr uint64_t HELLO_STABLE_BROADCAST_INTERVAL_US = 30000000;    // 30 seconds
+constexpr uint64_t VFS_FD_GC_INTERVAL_US = 10000000;                 // 10 seconds
 constexpr uint8_t WKI_PEER_FENCE_PROBE_ROUNDS = 4;
 
 // Simple xorshift64 for jitter generation (not cryptographic, just for timing variance)
@@ -960,6 +961,16 @@ auto wki_min_heartbeat_interval_us() -> uint64_t {
         min_interval_us = std::min(min_interval_us, PEER_INTERVAL_US);
     }
     return min_interval_us;
+}
+
+auto wki_has_connected_direct_peers() -> bool {
+    return std::ranges::any_of(g_wki.peers, [](const WkiPeer& peer) -> bool {
+        return peer.node_id != WKI_NODE_INVALID && peer.state == PeerState::CONNECTED && peer.is_direct;
+    });
+}
+
+auto wki_hello_broadcast_interval_us() -> uint64_t {
+    return wki_has_connected_direct_peers() ? HELLO_STABLE_BROADCAST_INTERVAL_US : HELLO_DISCOVERY_BROADCAST_INTERVAL_US;
 }
 
 auto wki_schedule_next_heartbeat_deadline(uint64_t now_us, uint64_t min_interval_us) -> uint64_t {
@@ -1070,7 +1081,9 @@ void wki_peer_timer_tick(uint64_t now_us) {
 
     drain_pending_fence_notifies();
 
-    // Periodically send HELLO broadcasts to discover new neighbors
+    // Use a fast discovery beacon until we join a mesh, then keep only a slow
+    // stable-state beacon for late nodes and partition healing.
+    uint64_t const HELLO_BROADCAST_INTERVAL_US = wki_hello_broadcast_interval_us();
     if (now_us - s_last_hello_broadcast >= HELLO_BROADCAST_INTERVAL_US) {
         wki_peer_send_hello_broadcast();
         s_last_hello_broadcast = now_us;
@@ -1202,7 +1215,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
         s_last_vfs_fd_gc = now_us;
     }
 
-    // Run routing periodic tasks (LSA refresh, LSDB aging)
+    // Run routing periodic tasks (pending LSA emission, LSDB aging)
     wki_routing_timer_tick(now_us);
 
     // Also run the channel-level retransmit/ACK timer
@@ -1316,7 +1329,7 @@ void wki_timer_notify() {
 namespace {
 
 auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
-    uint64_t next_deadline = s_last_hello_broadcast + HELLO_BROADCAST_INTERVAL_US;
+    uint64_t next_deadline = s_last_hello_broadcast + wki_hello_broadcast_interval_us();
 
     if (s_next_heartbeat_send_deadline != 0) {
         next_deadline = std::min(next_deadline, s_next_heartbeat_send_deadline);
