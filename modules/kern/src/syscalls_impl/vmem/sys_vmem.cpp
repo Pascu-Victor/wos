@@ -20,7 +20,10 @@
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sched/task.hpp>
 #include <platform/sys/mutex.hpp>
+#include <util/smallvec.hpp>
+#include <utility>
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
@@ -142,6 +145,16 @@ struct OccupiedVmemRange {
     uint64_t end = 0;
     bool found = false;
 };
+
+using LazyVmemRange = ker::mod::sched::task::LazyVmemRange;
+using LazyVmemRangeVec = ker::util::SmallVec<LazyVmemRange, 8>;
+
+auto push_lazy_vmem_range(LazyVmemRangeVec& ranges, const LazyVmemRange& range) -> bool {
+    if (range.start >= range.end) {
+        return true;
+    }
+    return ranges.push_back(range);
+}
 
 auto pte_raw(const ker::mod::mm::paging::PageTableEntry& entry) -> uint64_t {
     uint64_t raw = 0;
@@ -266,29 +279,31 @@ auto remove_lazy_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, u
     }
 
     uint64_t const END = vaddr + size;
-    for (size_t i = 0; i < task->lazy_vmem_ranges.size();) {
-        auto range = task->lazy_vmem_ranges.at(i);
+    LazyVmemRangeVec rewritten;
+    for (const auto& range : task->lazy_vmem_ranges) {
         if (!ranges_overlap(vaddr, END, range.start, range.end)) {
-            i++;
+            if (!push_lazy_vmem_range(rewritten, range)) {
+                return false;
+            }
             continue;
         }
 
-        task->lazy_vmem_ranges.remove_at(i);
         if (range.start < vaddr) {
             auto left = range;
             left.end = vaddr;
-            if (!task->lazy_vmem_ranges.push_back(left)) {
+            if (!push_lazy_vmem_range(rewritten, left)) {
                 return false;
             }
         }
         if (END < range.end) {
             auto right = range;
             right.start = END;
-            if (!task->lazy_vmem_ranges.push_back(right)) {
+            if (!push_lazy_vmem_range(rewritten, right)) {
                 return false;
             }
         }
     }
+    task->lazy_vmem_ranges = std::move(rewritten);
     return true;
 }
 
@@ -310,18 +325,19 @@ auto protect_lazy_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, 
     }
 
     uint64_t const END = vaddr + size;
-    for (size_t i = 0; i < task->lazy_vmem_ranges.size();) {
-        auto range = task->lazy_vmem_ranges.at(i);
+    LazyVmemRangeVec rewritten;
+    for (const auto& range : task->lazy_vmem_ranges) {
         if (!ranges_overlap(vaddr, END, range.start, range.end)) {
-            i++;
+            if (!push_lazy_vmem_range(rewritten, range)) {
+                return false;
+            }
             continue;
         }
 
-        task->lazy_vmem_ranges.remove_at(i);
         if (range.start < vaddr) {
             auto left = range;
             left.end = vaddr;
-            if (!task->lazy_vmem_ranges.push_back(left)) {
+            if (!push_lazy_vmem_range(rewritten, left)) {
                 return false;
             }
         }
@@ -330,18 +346,19 @@ auto protect_lazy_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, 
         middle.start = std::max(range.start, vaddr);
         middle.end = std::min(range.end, END);
         middle.prot = prot;
-        if (!task->lazy_vmem_ranges.push_back(middle)) {
+        if (!push_lazy_vmem_range(rewritten, middle)) {
             return false;
         }
 
         if (END < range.end) {
             auto right = range;
             right.start = END;
-            if (!task->lazy_vmem_ranges.push_back(right)) {
+            if (!push_lazy_vmem_range(rewritten, right)) {
                 return false;
             }
         }
     }
+    task->lazy_vmem_ranges = std::move(rewritten);
     return true;
 }
 

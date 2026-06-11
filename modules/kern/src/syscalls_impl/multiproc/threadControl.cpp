@@ -6,6 +6,8 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <platform/mm/addr.hpp>
+#include <platform/mm/virt.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -19,6 +21,7 @@
 namespace ker::syscall::multiproc {
 namespace {
 constexpr uint32_t SOFT_EXCLUSIVE_DAEMON_PENALTY = 7;
+constexpr uint64_t MLIBC_TCB_TID_OFFSET = 0x18;
 std::atomic<uint64_t> next_thread_cpu{0};
 
 auto online_cpu_mask() -> uint64_t {
@@ -71,6 +74,23 @@ void release_thread_fd_refs(mod::sched::task::Task* task) {
         }
     }
 }
+
+auto publish_thread_tid_to_tcb(mod::sched::task::Task* parent, uint64_t tcb_va, uint64_t tid) -> bool {
+    if (parent == nullptr || tcb_va == 0) {
+        return false;
+    }
+
+    uint64_t const TID_PHYS = mod::mm::virt::translate(parent->pagemap, tcb_va + MLIBC_TCB_TID_OFFSET);
+    if (TID_PHYS == mod::mm::virt::PADDR_INVALID) {
+        return false;
+    }
+
+    uint64_t const TID_PAGE = TID_PHYS & ~0xFFFULL;
+    uint64_t const TID_OFFSET = TID_PHYS & 0xFFFULL;
+    auto* tid_ptr = reinterpret_cast<int*>(reinterpret_cast<uint64_t>(mod::mm::addr::get_virt_pointer(TID_PAGE)) + TID_OFFSET);
+    __atomic_store_n(tid_ptr, static_cast<int>(tid), __ATOMIC_RELEASE);
+    return true;
+}
 }  // namespace
 
 auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2, void* arg3) -> uint64_t {
@@ -100,6 +120,13 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
             auto tcb_va = reinterpret_cast<uint64_t>(arg1);
             auto user_sp = reinterpret_cast<uint64_t>(arg2);
             auto enter_va = reinterpret_cast<uint64_t>(arg3);
+            if (parent == nullptr || tcb_va == 0) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            uint64_t const TID_PHYS = mod::mm::virt::translate(parent->pagemap, tcb_va + MLIBC_TCB_TID_OFFSET);
+            if (TID_PHYS == mod::mm::virt::PADDR_INVALID) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
 
             auto* t = mod::sched::task::Task::create_user_thread(parent, tcb_va, user_sp, enter_va);
             if (t == nullptr) {
@@ -111,6 +138,10 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
                 return static_cast<uint64_t>(-ENOMEM);
             }
             uint64_t const TARGET_CPU = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % CPU_COUNT;
+
+            if (!publish_thread_tid_to_tcb(parent, tcb_va, t->pid)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
 
             bool const POSTED = mod::sched::post_task_for_cpu(TARGET_CPU, t);
             if (!POSTED) {

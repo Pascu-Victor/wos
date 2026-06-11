@@ -29,6 +29,7 @@ namespace {
 
 constexpr uint32_t NET_LATENCY_DAEMON_SLICE_NS = 2'000'000;
 constexpr int NET_LATENCY_DAEMON_NICE = -5;
+constexpr int NAPI_WORKER_MAX_FULL_BUDGET_POLLS = 8;
 constexpr size_t NAPI_INLINE_REGISTRY_CAPACITY = 64;
 constexpr size_t NAPI_POLL_SNAPSHOT_CAPACITY = 64;
 
@@ -127,6 +128,7 @@ void unregister_napi(NapiStruct* napi) {
         }
 
         // Poll while work remains.
+        int full_budget_polls = 0;
         for (;;) {
             if (!poll_fn_is_valid(napi->poll)) {
                 log::critical("invalid NAPI poll function for %s: poll=0x%lx napi=%p", napi->dev != nullptr ? napi->dev->name.data() : "?",
@@ -143,6 +145,11 @@ void unregister_napi(NapiStruct* napi) {
             if (PROCESSED < napi->weight) {
                 // Driver called napi_complete().
                 break;
+            }
+
+            if (++full_budget_polls >= NAPI_WORKER_MAX_FULL_BUDGET_POLLS) {
+                full_budget_polls = 0;
+                ker::mod::sched::kern_yield();
             }
         }
 

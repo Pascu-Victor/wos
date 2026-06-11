@@ -83,6 +83,9 @@ void process_backlog_batch(PacketBuffer* batch) {
             reversed = next;
             continue;
         }
+        if (reversed->dev != nullptr && reversed->dev->wki_rx_forward != nullptr) {
+            reversed->dev->wki_rx_forward(reversed->dev, reversed);
+        }
         proto::eth_rx(reversed->dev, reversed);
         reversed = next;
     }

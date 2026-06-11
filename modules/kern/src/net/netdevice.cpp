@@ -192,12 +192,6 @@ void netdev_rx(NetDevice* dev, PacketBuffer* pkt) {
     dev->rx_packets++;
     dev->rx_bytes += pkt->len;
 
-    // D11: Forward packet to WKI remote consumers (if any are attached)
-    if (dev->wki_rx_forward != nullptr) {
-        dev->wki_rx_forward(dev, pkt);
-        // Original packet still processed locally
-    }
-
     // Loopback device sends raw IP packets (no Ethernet header)
     // Check if this is loopback by name
     if (is_loopback_name(dev->name)) {
@@ -234,6 +228,9 @@ void netdev_rx(NetDevice* dev, PacketBuffer* pkt) {
     }
 
     // Inline processing: same-CPU fast path, early boot, or single CPU.
+    if (dev->wki_rx_forward != nullptr) {
+        dev->wki_rx_forward(dev, pkt);
+    }
     NET_TRACE_TICK();
     proto::eth_rx(dev, pkt);
 }
