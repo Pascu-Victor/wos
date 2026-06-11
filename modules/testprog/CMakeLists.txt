@@ -21,6 +21,7 @@ include_directories(
 
 # Source files
 set(SOURCES
+    src/asan_crasher.cpp
     src/cowbench.cpp
     src/fsbench.cpp
     src/main.cpp

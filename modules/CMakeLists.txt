@@ -33,8 +33,10 @@ project(wos_modules C CXX ASM_NASM)
 # Disable C++ modules support which requires experimental compiler features
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF CACHE BOOL "Disable C++ modules" FORCE)
 
-option(WOS_UASAN "Enable AddressSanitizer instrumentation for WOS userspace modules" ON)
+option(WOS_UASAN "Enable AddressSanitizer instrumentation for WOS userspace modules" OFF)
 set(WOS_UASAN_RUNTIME_DIR "" CACHE PATH "Clang runtime directory containing WOS AddressSanitizer libraries")
+option(WOS_DYNAMIC_USERSPACE_PIE "Build dynamic WOS userspace executables as PIE" OFF)
+option(WOS_DYNAMIC_USERSPACE_NO_PLT "Use GOT calls instead of PLT stubs for dynamic WOS userspace executables" OFF)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options(
@@ -56,9 +58,6 @@ set(WOS_BASE_LINK_OPTIONS
     "-std=c++23"
     "-flto"
 )
-if(NOT WOS_UASAN)
-    list(APPEND WOS_BASE_LINK_OPTIONS "-static")
-endif()
 add_link_options(${WOS_BASE_LINK_OPTIONS})
 
 # Set the linker to use from host tools
@@ -89,7 +88,21 @@ set(WOS_USERSPACE_TARGETS
 )
 set(WOS_USERSPACE_LOGGING_TARGETS
     init
+)
+set(WOS_DYNAMIC_USERSPACE_EXECUTABLE_TARGETS
     testprog
+    testd
+    netd
+    httpd
+    debugserver
+    perf
+    top
+    memacc
+    journal
+    wkictl
+    renderbench
+    strace
+    sftpserver
 )
 
 if(WOS_UASAN)
@@ -133,35 +146,56 @@ function(wos_strip_link_flag out_value in_value flag)
     set(${out_value} "${stripped_value}" PARENT_SCOPE)
 endfunction()
 
-function(wos_make_target_dynamic_for_asan user_target)
+function(wos_make_target_dynamic_user_executable user_target)
     get_target_property(existing_link_flags ${user_target} LINK_FLAGS)
     if(NOT existing_link_flags)
         set(existing_link_flags "")
     endif()
     wos_strip_link_flag(existing_link_flags "${existing_link_flags}" "-static")
-    wos_strip_link_flag(existing_link_flags "${existing_link_flags}" "-no-pie")
+    if(WOS_DYNAMIC_USERSPACE_PIE)
+        wos_strip_link_flag(existing_link_flags "${existing_link_flags}" "-no-pie")
+    endif()
     wos_strip_link_flag(existing_link_flags "${existing_link_flags}" "-Wl,--no-dynamic-linker")
     set_target_properties(${user_target} PROPERTIES
         LINK_FLAGS "${existing_link_flags}"
-        POSITION_INDEPENDENT_CODE ON
+        POSITION_INDEPENDENT_CODE ${WOS_DYNAMIC_USERSPACE_PIE}
+        SKIP_BUILD_RPATH ON
+        BUILD_RPATH ""
+        INSTALL_RPATH ""
     )
 
     get_target_property(existing_link_options ${user_target} LINK_OPTIONS)
     if(existing_link_options)
         list(REMOVE_ITEM existing_link_options
             "-static"
-            "-no-pie"
             "-Wl,--no-dynamic-linker"
             "-Wl,-T,${CMAKE_SOURCE_DIR}/modules/init/service.ld"
         )
+        if(WOS_DYNAMIC_USERSPACE_PIE)
+            list(REMOVE_ITEM existing_link_options "-no-pie")
+        endif()
         set_target_properties(${user_target} PROPERTIES LINK_OPTIONS "${existing_link_options}")
     endif()
+
+    if(NOT WOS_DYNAMIC_USERSPACE_PIE)
+        target_link_options(${user_target} PRIVATE "-Wl,--no-pie")
+    endif()
+
+    if(WOS_DYNAMIC_USERSPACE_NO_PLT)
+        target_compile_options(${user_target} PRIVATE "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-fno-plt>")
+    endif()
 endfunction()
+
+foreach(user_target IN LISTS WOS_DYNAMIC_USERSPACE_EXECUTABLE_TARGETS)
+    if(TARGET ${user_target})
+        wos_make_target_dynamic_user_executable(${user_target})
+    endif()
+endforeach()
 
 if(WOS_UASAN)
     foreach(user_target IN LISTS WOS_USERSPACE_TARGETS)
         if(TARGET ${user_target})
-            wos_make_target_dynamic_for_asan(${user_target})
+            wos_make_target_dynamic_user_executable(${user_target})
             target_compile_options(${user_target} PRIVATE
                 "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-fsanitize=address;-fno-omit-frame-pointer;-fno-optimize-sibling-calls>"
             )

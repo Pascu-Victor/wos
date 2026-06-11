@@ -9,7 +9,6 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sys/ioctl.h>
-#include <sys/logging.h>
 #include <sys/multiproc.h>
 #include <sys/process.h>
 #include <sys/socket.h>
@@ -28,6 +27,7 @@
 #include <print>
 #include <span>
 
+#include "asan_crasher.hpp"
 #include "cowbench.hpp"
 #include "fsbench.hpp"
 #include "mandelbench/config.hpp"
@@ -36,8 +36,6 @@
 #include "perfbench.hpp"
 
 namespace {
-
-using tprog_log = wos::journal<"tprog">;
 
 void copy_ifreq_name(struct ifreq& ifr, const char* ifname) {
     auto dest = std::span<char, IFNAMSIZ>(ifr.ifr_name);
@@ -99,7 +97,7 @@ auto ping(const char* ip_str) -> bool {
     // Create raw socket for ICMP
     int const SOCK = socket(AF_INET, SOCK_RAW, 1);  // 1 = IPPROTO_ICMP
     if (SOCK < 0) {
-        tprog_log::error("testprog[t:%d,p:%d]: failed to create socket: %d", TID, PID, SOCK);
+        std::println(stderr, "testprog[t:{},p:{}]: failed to create socket: {}", TID, PID, SOCK);
         return false;
     }
 
@@ -131,7 +129,7 @@ auto ping(const char* ip_str) -> bool {
     ssize_t const SENT = sendto(SOCK, packet.data(), PACKET_SIZE, 0, reinterpret_cast<struct sockaddr*>(&dest_addr), sizeof(dest_addr));
 
     if (SENT < 0) {
-        tprog_log::error("testprog[t:%d,p:%d]: failed to send ping: %lld", TID, PID, static_cast<long long>(SENT));
+        std::println(stderr, "testprog[t:{},p:{}]: failed to send ping: {}", TID, PID, static_cast<long long>(SENT));
         close(SOCK);
         return false;
     }
@@ -157,7 +155,7 @@ auto ping(const char* ip_str) -> bool {
     if (received > 0) {
         return true;
     }
-    tprog_log::warn("testprog[t:%d,p:%d]: no response from %s (received=%lld)", TID, PID, ip_str, static_cast<long long>(received));
+    std::println(stderr, "testprog[t:{},p:{}]: no response from {} (received={})", TID, PID, ip_str, static_cast<long long>(received));
     return false;
 }
 
@@ -170,7 +168,7 @@ auto get_interface_info(const char* ifname) -> bool {
 
     int const SOCK = socket(AF_INET, SOCK_DGRAM, 0);
     if (SOCK < 0) {
-        tprog_log::error("testprog[t:%d,p:%d]: failed to create socket for ioctl", TID, PID);
+        std::println(stderr, "testprog[t:{},p:{}]: failed to create socket for ioctl", TID, PID);
         return false;
     }
 
@@ -186,7 +184,7 @@ auto get_interface_info(const char* ifname) -> bool {
         inet_ntop(AF_INET, &addr->sin_addr, ip_str.data(), ip_str.size());
         // std::println("testprog[t:{},p:{}]:   IP address: {}", tid, pid, ip_str);
     } else {
-        tprog_log::error("testprog[t:%d,p:%d]: failed to get IP address", TID, PID);
+        std::println(stderr, "testprog[t:{},p:{}]: failed to get IP address", TID, PID);
         close(SOCK);
         return false;
     }
@@ -504,6 +502,10 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     if (command != nullptr && std::strcmp(command, "perf") == 0) {
         return run_perf(argc - 2, argv + 2);
+    }
+
+    if (command != nullptr && std::strcmp(command, "asan-crasher") == 0) {
+        return run_asan_crasher(argc - 2, argv + 2);
     }
 
     if (command != nullptr && std::strcmp(command, "mandelbench") == 0) {
