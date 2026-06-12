@@ -1224,7 +1224,7 @@ uint64_t get_least_loaded_cpu_for_task(task::Task* incoming_task) {
 
     auto best_cpu = static_cast<uint64_t>(__builtin_ctzll(allowed_mask));  // safe default
     uint32_t best_load = UINT32_MAX;
-    constexpr uint64_t PLACEMENT_SAMPLES = 4;
+    uint64_t const PLACEMENT_SAMPLES = INCOMING_TYPE == task::TaskType::PROCESS && CORE_COUNT <= 64 ? CORE_COUNT : 4;
     uint64_t samples = 0;
 
     for (uint64_t off = 0; off < CORE_COUNT && samples < PLACEMENT_SAMPLES; ++off) {

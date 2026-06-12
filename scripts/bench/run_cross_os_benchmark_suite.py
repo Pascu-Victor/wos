@@ -192,6 +192,15 @@ def fetch_remote_file(fetcher: Path, host: str, remote_path: str, local_path: Pa
     run_command([str(fetcher), host, remote_path, str(local_path)])
 
 
+def fetch_optional_remote_file(fetcher: Path, host: str, remote_path: str, local_path: Path) -> bool:
+    try:
+        fetch_remote_file(fetcher, host, remote_path, local_path)
+    except Exception as exc:  # noqa: BLE001
+        write_text(local_path.with_suffix(local_path.suffix + ".fetch-error.txt"), f"{exc}\n")
+        return False
+    return True
+
+
 def parse_mandel_report(text: str) -> dict[str, Any]:
     line = ""
     for candidate in text.splitlines():
@@ -556,6 +565,16 @@ def attach_wos_cpustat(step: dict[str, Any], cpustat_entries: list[dict[str, Any
         artifacts.extend(entry.get("artifacts", []))
 
 
+def attach_wos_perf_diagnostics(step: dict[str, Any], diagnostic_entries: list[dict[str, Any]]) -> None:
+    if not diagnostic_entries:
+        return
+    existing = step.setdefault("wos_perf_diagnostics", [])
+    existing.extend(diagnostic_entries)
+    artifacts = step.setdefault("artifacts", [])
+    for entry in diagnostic_entries:
+        artifacts.extend(entry.get("artifacts", []))
+
+
 def collect_wos_cpustat(
     args: argparse.Namespace,
     step_dir: Path,
@@ -618,6 +637,83 @@ def collect_wos_cpustat(
     return captures
 
 
+def collect_wos_perf_command(
+    args: argparse.Namespace,
+    step_dir: Path,
+    hosts: list[str],
+    phase: str,
+    report_name: str,
+    perf_args: list[str],
+) -> list[dict[str, Any]]:
+    if not hosts or args.skip_wos_perf_diagnostics:
+        return []
+
+    report_dir = step_dir / f"perf-{report_name}" / phase
+    report_dir.mkdir(parents=True, exist_ok=True)
+    captures: list[dict[str, Any]] = []
+
+    for host in hosts:
+        stdout_path = report_dir / f"{host}.stdout.log"
+        stderr_path = report_dir / f"{host}.stderr.log"
+        metadata_path = report_dir / f"{host}.json"
+        command = [str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, "/usr/bin/perf", *perf_args]
+        started = time.monotonic()
+        entry: dict[str, Any] = {
+            "host": host,
+            "phase": phase,
+            "report": report_name,
+            "command": command,
+            "stdout_file": relpath(stdout_path),
+            "stderr_file": relpath(stderr_path),
+            "metadata_file": relpath(metadata_path),
+            "artifacts": [
+                relpath(stdout_path),
+                relpath(stderr_path),
+                relpath(metadata_path),
+            ],
+        }
+        try:
+            result = subprocess.run(
+                command,
+                cwd=ROOT,
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=args.wos_preflight_timeout,
+            )
+            write_text(stdout_path, result.stdout)
+            write_text(stderr_path, result.stderr)
+            entry["returncode"] = result.returncode
+            entry["duration_seconds"] = time.monotonic() - started
+            entry["status"] = "ok" if result.returncode == 0 else "failed"
+            if result.returncode != 0:
+                entry["error"] = f"command failed with exit code {result.returncode}"
+        except subprocess.TimeoutExpired as exc:
+            write_text(stdout_path, str(exc.stdout) if exc.stdout else "")
+            write_text(stderr_path, str(exc.stderr) if exc.stderr else "")
+            entry["returncode"] = None
+            entry["duration_seconds"] = time.monotonic() - started
+            entry["status"] = "timeout"
+            entry["error"] = f"command timed out after {args.wos_preflight_timeout:.1f}s"
+
+        write_json(metadata_path, entry)
+        captures.append(entry)
+
+    return captures
+
+
+def collect_wos_perf_diagnostics(
+    args: argparse.Namespace,
+    step_dir: Path,
+    hosts: list[str],
+    phase: str,
+) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    diagnostics.extend(collect_wos_perf_command(args, step_dir, hosts, phase, "ipc-report", ["ipc-report", "30"]))
+    diagnostics.extend(collect_wos_perf_command(args, step_dir, hosts, phase, "wki-report", ["wki-report"]))
+    return diagnostics
+
+
 def run_host_schedstat_probe(
     args: argparse.Namespace,
     suite_dir: Path,
@@ -678,6 +774,54 @@ def run_host_schedstat_probe(
     }
 
 
+def schedstat_probe_prefix(args: argparse.Namespace, result_path: Path, report_path: Path) -> list[str]:
+    command = [
+        sys.executable,
+        str(BENCH_SCRIPTS / "schedstat_probe.py"),
+        "--output-json",
+        str(result_path),
+        "--output-text",
+        str(report_path),
+    ]
+    for qemu_pid in args.schedstat_qemu_pid:
+        command += ["--qemu-vm", qemu_pid]
+    if args.schedstat_auto_discover_qemu:
+        for vm_index in range(args.num_vms):
+            command += ["--auto-discover-vm", str(vm_index)]
+    return command
+
+
+def run_benchmark_command(
+    args: argparse.Namespace,
+    step_dir: Path,
+    payload_command: list[str],
+) -> tuple[subprocess.CompletedProcess[str], list[dict[str, Any]]]:
+    timeout = args.benchmark_timeout if args.benchmark_timeout > 0 else None
+    if not args.schedstat_wrap_steps:
+        return run_command(payload_command, timeout=timeout), []
+
+    schedstat_dir = step_dir / "host-schedstat"
+    schedstat_dir.mkdir(parents=True, exist_ok=True)
+    result_path = schedstat_dir / "result.json"
+    report_path = schedstat_dir / "report.txt"
+    command = schedstat_probe_prefix(args, result_path, report_path) + ["--", *payload_command]
+    result = run_command(command, timeout=timeout)
+    summary = json.loads(result_path.read_text(encoding="utf-8"))
+    return result, [
+        {
+            "kind": "host-schedstat",
+            "command": command,
+            "result_file": relpath(result_path),
+            "report_file": relpath(report_path),
+            "summary": summary.get("summary", {}),
+            "artifacts": [
+                relpath(result_path),
+                relpath(report_path),
+            ],
+        }
+    ]
+
+
 def run_wos_mandelbench(
     args: argparse.Namespace,
     suite_dir: Path,
@@ -713,7 +857,7 @@ def run_wos_mandelbench(
             shlex.quote(",".join(wos_hosts)),
         ]
     )
-    result = run_command([str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, remote_command])
+    result, schedstat_entries = run_benchmark_command(args, step_dir, [str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, remote_command])
     write_text(step_dir / "command.log", step_log_text(result))
 
     report_local = step_dir / "report.txt"
@@ -761,6 +905,7 @@ def run_wos_mandelbench(
         "command": [str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, remote_command],
         "result_file": relpath(step_dir / "result.json"),
         "artifacts": artifacts,
+        "host_schedstat": schedstat_entries,
     }
 
 
@@ -810,7 +955,7 @@ def run_linux_mandelbench(
     if args.linux_use_host_binary:
         command += ["--use-host-binary"]
 
-    result = run_command(command)
+    result, schedstat_entries = run_benchmark_command(args, step_dir, command)
     write_text(step_dir / "command.log", step_log_text(result))
 
     report_local = step_dir / "report.txt"
@@ -858,6 +1003,7 @@ def run_linux_mandelbench(
         "command": command,
         "result_file": relpath(step_dir / "result.json"),
         "artifacts": artifacts,
+        "host_schedstat": schedstat_entries,
     }
 
 
@@ -909,15 +1055,59 @@ def run_wos_renderbench(
         command += ["--debug-node-thread-batch-size", str(args.render_debug_node_thread_batch_size)]
     if args.wos_coordinator_reserve_cpus is not None:
         command += ["--coordinator-reserve-cpus", str(args.wos_coordinator_reserve_cpus)]
-    if args.wos_coordinator_skip_local_worker:
+    node_worker_reserve_cpus = args.wos_node_worker_reserve_cpus
+    if args.wos_render_tuning == "safe" and placement == "node-threads" and node_worker_reserve_cpus == 0:
+        node_worker_reserve_cpus = 1
+    if node_worker_reserve_cpus > 0 and placement == "node-threads":
+        command += ["--node-worker-reserve-cpus", str(node_worker_reserve_cpus)]
+    if args.wos_coordinator_skip_local_worker and placement == "node-threads":
         command += ["--coordinator-skip-local-worker"]
+    if args.wos_disable_worker_output_queue:
+        command += ["--disable-worker-output-queue"]
+    if args.wos_enable_single_thread_worker_queue:
+        command += ["--enable-single-thread-worker-queue"]
+    elif args.wos_disable_single_thread_worker_queue:
+        command += ["--disable-single-thread-worker-queue"]
+    if placement == "process-per-core":
+        enable_process_persistent_workers = (
+            args.wos_enable_process_persistent_workers or args.wos_render_tuning in {"optimal", "safe"}
+        )
+        if args.wos_disable_process_persistent_workers:
+            command += ["--disable-process-persistent-workers"]
+        elif enable_process_persistent_workers:
+            command += ["--enable-process-persistent-workers"]
 
-    result = run_command([str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, *command])
+    host_command = [str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, *command]
+    write_text(step_dir / "command.log", "=== command ===\n" + shlex.join(host_command) + "\n")
+    try:
+        result, schedstat_entries = run_benchmark_command(args, step_dir, host_command)
+    except Exception:
+        remote_run_dir = f"{remote_output_root}/{run_id}"
+        fetch_optional_remote_file(
+            REMOTE_SCRIPTS / "wos_sftp_get.sh",
+            host,
+            f"{remote_run_dir}/metrics.json",
+            step_dir / "partial-metrics.json",
+        )
+        fetch_optional_remote_file(
+            REMOTE_SCRIPTS / "wos_sftp_get.sh",
+            host,
+            f"{remote_run_dir}/status.json",
+            step_dir / "partial-status.json",
+        )
+        fetch_optional_remote_file(
+            REMOTE_SCRIPTS / "wos_sftp_get.sh",
+            host,
+            f"{remote_run_dir}/ipc_profile.json",
+            step_dir / "partial-ipc_profile.json",
+        )
+        raise
     write_text(step_dir / "command.log", step_log_text(result))
 
     remote_run_dir = f"{remote_output_root}/{run_id}"
     metrics_local = step_dir / "metrics.json"
     status_local = step_dir / "status.json"
+    ipc_profile_local = step_dir / "ipc_profile.json"
     frame_local = step_dir / "frame_000.png"
     fetch_remote_file(
         REMOTE_SCRIPTS / "wos_sftp_get.sh",
@@ -934,13 +1124,21 @@ def run_wos_renderbench(
     fetch_remote_file(
         REMOTE_SCRIPTS / "wos_sftp_get.sh",
         host,
+        f"{remote_run_dir}/ipc_profile.json",
+        ipc_profile_local,
+    )
+    fetch_remote_file(
+        REMOTE_SCRIPTS / "wos_sftp_get.sh",
+        host,
         f"{remote_run_dir}/frame_000.png",
         frame_local,
     )
 
     metrics = json.loads(metrics_local.read_text(encoding="utf-8"))
     status = json.loads(status_local.read_text(encoding="utf-8"))
+    ipc_profile = json.loads(ipc_profile_local.read_text(encoding="utf-8"))
     merged = {**status, **metrics}
+    merged["ipc_profile"] = ipc_profile
     merged.update(
         {
             "benchmark": "renderbench",
@@ -958,14 +1156,16 @@ def run_wos_renderbench(
         "os": "wos",
         "host": host,
         "hosts": wos_hosts,
-        "command": [str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, *command],
+        "command": host_command,
         "result_file": relpath(step_dir / "result.json"),
         "artifacts": [
             relpath(metrics_local),
             relpath(status_local),
+            relpath(ipc_profile_local),
             relpath(frame_local),
             relpath(step_dir / "result.json"),
         ],
+        "host_schedstat": schedstat_entries,
     }
 
 
@@ -1024,7 +1224,7 @@ def run_linux_renderbench(
     if args.linux_use_host_binary:
         command += ["--use-host-binary"]
 
-    result = run_command(command)
+    result, schedstat_entries = run_benchmark_command(args, step_dir, command)
     write_text(step_dir / "command.log", step_log_text(result))
     artifacts = [relpath(output_path), relpath(step_dir / "command.log")]
     frame_path = step_dir / "result-artifacts" / "frame_000.png"
@@ -1040,6 +1240,7 @@ def run_linux_renderbench(
         "command": command,
         "result_file": relpath(output_path),
         "artifacts": artifacts,
+        "host_schedstat": schedstat_entries,
     }
 
 
@@ -1096,14 +1297,54 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--linux-duck-scene", default="configs/drive/srv/Duck.glb")
     parser.add_argument("--wos-render-threads", type=int)
     parser.add_argument(
+        "--wos-render-tuning",
+        choices=("manual", "optimal", "safe"),
+        default="manual",
+        help=(
+            "Category-specific WOS renderbench tuning. 'optimal' keeps node-threads on the fast no-reserve path "
+            "and enables persistent process-per-core workers; 'safe' also reserves one node-thread CPU per host."
+        ),
+    )
+    parser.add_argument(
         "--wos-coordinator-reserve-cpus",
         type=int,
         help="Reserve this many local launcher CPUs from WOS node-thread render workers; omit for renderbench default.",
     )
     parser.add_argument(
+        "--wos-node-worker-reserve-cpus",
+        type=int,
+        default=0,
+        help="Diagnostic/stability mode: reserve this many CPUs from each WOS node-thread render worker host.",
+    )
+    parser.add_argument(
         "--wos-coordinator-skip-local-worker",
         action="store_true",
         help="Do not run a WOS node-thread render worker on the local launcher host when remote workers exist.",
+    )
+    parser.add_argument(
+        "--wos-disable-worker-output-queue",
+        action="store_true",
+        help="Disable renderbench's worker output queue for every WOS worker thread count.",
+    )
+    parser.add_argument(
+        "--wos-disable-single-thread-worker-queue",
+        action="store_true",
+        help="Disable renderbench's worker output queue for WOS workers with exactly one render thread.",
+    )
+    parser.add_argument(
+        "--wos-enable-single-thread-worker-queue",
+        action="store_true",
+        help="Force renderbench's worker output queue on for WOS workers with exactly one render thread.",
+    )
+    parser.add_argument(
+        "--wos-disable-process-persistent-workers",
+        action="store_true",
+        help="Use dynamic short-lived WOS process-per-core workers instead of persistent command-stream workers.",
+    )
+    parser.add_argument(
+        "--wos-enable-process-persistent-workers",
+        action="store_true",
+        help="Force persistent command-stream workers for WOS process-per-core renderbench.",
     )
     parser.add_argument("--linux-render-threads", type=int)
     parser.add_argument("--linux-use-host-binary", action="store_true")
@@ -1169,6 +1410,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--schedstat-wrap-steps",
+        action="store_true",
+        help=(
+            "Wrap each benchmark command in the host-side schedstat probe and attach the result to that step. "
+            "Requires --schedstat-qemu-pid or --schedstat-auto-discover-qemu."
+        ),
+    )
+    parser.add_argument(
         "--schedstat-qemu-pid",
         action="append",
         type=parse_schedstat_qemu_pid,
@@ -1205,6 +1454,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=8.0,
         help="Seconds to wait for each WOS preflight or cleanup SSH command.",
     )
+    parser.add_argument(
+        "--benchmark-timeout",
+        type=float,
+        default=900.0,
+        help="Seconds to wait for each benchmark command; default 900, 0 disables the benchmark command timeout.",
+    )
+    parser.add_argument(
+        "--skip-wos-perf-diagnostics",
+        action="store_true",
+        help="Do not capture WOS perf ipc-report and wki-report snapshots around WOS benchmark steps.",
+    )
     parser.add_argument("--skip-mandelbench", action="store_true")
     parser.add_argument("--skip-renderbench", action="store_true")
     return parser
@@ -1226,6 +1486,8 @@ def main() -> int:
         parser.error("--render-debug-node-thread-batch-size must be nonnegative")
     if args.wos_coordinator_reserve_cpus is not None and args.wos_coordinator_reserve_cpus < 0:
         parser.error("--wos-coordinator-reserve-cpus must be nonnegative")
+    if args.wos_node_worker_reserve_cpus < 0:
+        parser.error("--wos-node-worker-reserve-cpus must be nonnegative")
     if args.host_kvm_trace_buffer_kb <= 0:
         parser.error("--host-kvm-trace-buffer-kb must be greater than zero")
     if args.host_kvm_trace_startup_grace < 0:
@@ -1236,9 +1498,25 @@ def main() -> int:
         parser.error("--host-kvm-trace-max-seconds must be greater than zero")
     if args.schedstat_duration < 0:
         parser.error("--schedstat-duration must be nonnegative")
-    if args.schedstat_probe:
+    if args.wos_disable_single_thread_worker_queue and args.wos_enable_single_thread_worker_queue:
+        parser.error("--wos-disable-single-thread-worker-queue and --wos-enable-single-thread-worker-queue are mutually exclusive")
+    if args.wos_disable_worker_output_queue and args.wos_enable_single_thread_worker_queue:
+        parser.error("--wos-disable-worker-output-queue and --wos-enable-single-thread-worker-queue are mutually exclusive")
+    if args.wos_disable_process_persistent_workers and args.wos_enable_process_persistent_workers:
+        parser.error("--wos-disable-process-persistent-workers and --wos-enable-process-persistent-workers are mutually exclusive")
+    if args.wos_render_tuning == "optimal":
+        if args.wos_node_worker_reserve_cpus > 0:
+            parser.error("--wos-render-tuning optimal is incompatible with --wos-node-worker-reserve-cpus")
+        if args.wos_coordinator_skip_local_worker:
+            parser.error("--wos-render-tuning optimal is incompatible with --wos-coordinator-skip-local-worker")
+        if args.wos_disable_process_persistent_workers:
+            parser.error("--wos-render-tuning optimal is incompatible with --wos-disable-process-persistent-workers")
+    if args.benchmark_timeout < 0:
+        parser.error("--benchmark-timeout must be nonnegative")
+    if args.schedstat_probe or args.schedstat_wrap_steps:
         if not args.schedstat_qemu_pid and not args.schedstat_auto_discover_qemu:
-            parser.error("--schedstat-probe requires --schedstat-qemu-pid or --schedstat-auto-discover-qemu")
+            parser.error("--schedstat-probe/--schedstat-wrap-steps requires --schedstat-qemu-pid or --schedstat-auto-discover-qemu")
+    if args.schedstat_probe:
         if args.schedstat_command and args.schedstat_duration > 0:
             parser.error("--schedstat-command and --schedstat-duration are mutually exclusive")
         if args.os == "linux" and not args.schedstat_command and args.schedstat_duration <= 0:
@@ -1295,11 +1573,20 @@ def main() -> int:
         for entry in trace_entries:
             artifacts.extend(entry.get("artifacts", []))
 
+    def attach_host_schedstat(step: dict[str, Any]) -> None:
+        entries = step.get("host_schedstat", [])
+        if not entries:
+            return
+        artifacts = step.setdefault("artifacts", [])
+        for entry in entries:
+            artifacts.extend(entry.get("artifacts", []))
+
     def run_step(name: str, func: Any, *, host_kvm_trace: bool = True) -> None:
         nonlocal failures
         print(f"[suite] {name}")
         cpustat_hosts = wos_hosts if name.startswith("wos-") else []
         pre_cpustat_entries = collect_wos_cpustat(args, suite_dir / name, cpustat_hosts, "before")
+        pre_perf_diagnostic_entries = collect_wos_perf_diagnostics(args, suite_dir / name, cpustat_hosts, "before")
         trace_session = host_kvm_tracer.start(name) if host_kvm_trace else None
         try:
             step = func()
@@ -1307,17 +1594,27 @@ def main() -> int:
             failures += 1
             trace_entries = host_kvm_tracer.stop(trace_session)
             post_cpustat_entries = collect_wos_cpustat(args, suite_dir / name, cpustat_hosts, "after")
+            post_perf_diagnostic_entries = collect_wos_perf_diagnostics(args, suite_dir / name, cpustat_hosts, "after")
             error_path = suite_dir / name / "error.txt"
             write_text(error_path, f"{exc}\n")
+            step_dir = suite_dir / name
+            artifacts = [relpath(error_path)]
+            command_log = step_dir / "command.log"
+            if command_log.exists():
+                artifacts.append(relpath(command_log))
+            artifacts.extend(relpath(path) for path in sorted(step_dir.glob("partial-*")) if path.is_file())
             failed_step = {
                 "name": name,
                 "ok": False,
                 "error": str(exc),
                 "error_file": relpath(error_path),
+                "artifacts": artifacts,
             }
             attach_host_kvm_trace(failed_step, trace_entries)
             attach_wos_cpustat(failed_step, pre_cpustat_entries)
             attach_wos_cpustat(failed_step, post_cpustat_entries)
+            attach_wos_perf_diagnostics(failed_step, pre_perf_diagnostic_entries)
+            attach_wos_perf_diagnostics(failed_step, post_perf_diagnostic_entries)
             append_step(
                 manifest,
                 suite_dir,
@@ -1333,9 +1630,18 @@ def main() -> int:
             step.get("hosts", cpustat_hosts) if step.get("os") == "wos" else [],
             "after",
         )
+        post_perf_diagnostic_entries = collect_wos_perf_diagnostics(
+            args,
+            suite_dir / name,
+            step.get("hosts", cpustat_hosts) if step.get("os") == "wos" else [],
+            "after",
+        )
         attach_host_kvm_trace(step, trace_entries)
+        attach_host_schedstat(step)
         attach_wos_cpustat(step, pre_cpustat_entries)
         attach_wos_cpustat(step, post_cpustat_entries)
+        attach_wos_perf_diagnostics(step, pre_perf_diagnostic_entries)
+        attach_wos_perf_diagnostics(step, post_perf_diagnostic_entries)
         append_step(manifest, suite_dir, step)
         print(f"[suite] {name} complete")
 

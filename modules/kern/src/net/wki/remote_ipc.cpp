@@ -183,6 +183,14 @@ uint32_t g_next_ipc_resource_id = 0x7000;
 // Client-side (remote node) proxies — tracked for cleanup
 std::deque<ProxyIpcState*> g_ipc_proxies;
 
+std::atomic<uint64_t> g_proxy_write_payload_bytes{0};
+std::atomic<uint64_t> g_proxy_write_no_credit_waits{0};
+std::atomic<uint64_t> g_proxy_write_block_us{0};
+std::atomic<uint64_t> g_proxy_pipe_rdma_full_waits{0};
+std::atomic<uint64_t> g_proxy_ring_full_waits{0};
+std::atomic<uint64_t> g_proxy_ring_full_bytes{0};
+std::atomic<uint64_t> g_pipe_payload_bytes{0};
+
 struct PendingPipeChunk {
     uint8_t* data = nullptr;
     uint16_t len = 0;
@@ -1217,7 +1225,10 @@ auto proxy_pipe_write_rdma(ProxyIpcState* proxy, const uint8_t* src, size_t coun
                 static_cast<void>(notify_proxy_pipe_rdma_data(proxy));
             }
             attempts++;
-            ker::mod::sched::kern_sleep_us(ipc_pipe_send_retry_sleep_us(WKI_ERR_NO_CREDITS, attempts));
+            uint64_t const SLEEP_US = ipc_pipe_send_retry_sleep_us(WKI_ERR_NO_CREDITS, attempts);
+            g_proxy_pipe_rdma_full_waits.fetch_add(1, std::memory_order_relaxed);
+            g_proxy_write_block_us.fetch_add(SLEEP_US, std::memory_order_relaxed);
+            ker::mod::sched::kern_sleep_us(SLEEP_US);
             continue;
         }
 
@@ -1246,6 +1257,7 @@ auto proxy_pipe_write_rdma(ProxyIpcState* proxy, const uint8_t* src, size_t coun
         proxy->pipe_rdma_head = NEW_HEAD;
         sent += TO_SEND;
         proxy->bytes_written.fetch_add(TO_SEND, std::memory_order_acq_rel);
+        g_proxy_write_payload_bytes.fetch_add(TO_SEND, std::memory_order_relaxed);
         perf_record_ipc_point(ker::mod::perf::WkiPerfIpcOp::PROXY_WRITE, proxy->home_node, WKI_CHAN_IPC_DATA, 0, 0, TO_SEND, callsite);
         static_cast<void>(notify_proxy_pipe_rdma_data(proxy));
     }
@@ -1315,7 +1327,14 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
                 delete[] msg;
                 return finish(sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EINTR), sent);
             }
-            pause_for_ipc_send_retry(ret, attempts++);
+            uint32_t const ATTEMPT = attempts++;
+            if (ret == WKI_ERR_NO_CREDITS) {
+                g_proxy_write_no_credit_waits.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (ret != WKI_ERR_NO_CREDITS || ATTEMPT != 0) {
+                g_proxy_write_block_us.fetch_add(ipc_pipe_send_retry_sleep_us(ret, ATTEMPT), std::memory_order_relaxed);
+            }
+            pause_for_ipc_send_retry(ret, ATTEMPT);
         }
 
         if (ret != WKI_OK) {
@@ -1325,6 +1344,7 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
 
         sent += TO_SEND;
         proxy->bytes_written.fetch_add(TO_SEND, std::memory_order_acq_rel);
+        g_proxy_write_payload_bytes.fetch_add(TO_SEND, std::memory_order_relaxed);
     }
 
     delete[] msg;
@@ -2619,6 +2639,14 @@ void wki_ipc_get_perf_snapshot(WkiIpcPerfSnapshot& out) {
         }
     }
 
+    snapshot.proxy_write_payload_bytes = g_proxy_write_payload_bytes.load(std::memory_order_relaxed);
+    snapshot.proxy_write_no_credit_waits = g_proxy_write_no_credit_waits.load(std::memory_order_relaxed);
+    snapshot.proxy_write_block_us = g_proxy_write_block_us.load(std::memory_order_relaxed);
+    snapshot.proxy_pipe_rdma_full_waits = g_proxy_pipe_rdma_full_waits.load(std::memory_order_relaxed);
+    snapshot.proxy_ring_full_waits = g_proxy_ring_full_waits.load(std::memory_order_relaxed);
+    snapshot.proxy_ring_full_bytes = g_proxy_ring_full_bytes.load(std::memory_order_relaxed);
+    snapshot.pipe_payload_bytes = g_pipe_payload_bytes.load(std::memory_order_relaxed);
+
     snapshot.approx_alloc_bytes = (snapshot.exports * sizeof(WkiIpcExport)) + (snapshot.proxies * sizeof(ProxyIpcState)) +
                                   snapshot.proxy_ring_bytes + (snapshot.pending_deliveries * sizeof(PendingPipeDelivery)) +
                                   (snapshot.pending_chunks * sizeof(PendingPipeChunk)) + snapshot.pending_bytes +
@@ -3448,6 +3476,9 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             pipe_trace.finish(0);
             return;
         }
+        if (OP_DATA_LEN != 0) {
+            g_pipe_payload_bytes.fetch_add(OP_DATA_LEN, std::memory_order_relaxed);
+        }
 
         // Consumer receives pipe data — write into the local proxy ring if
         // present, otherwise route it to the exported home-side pipe.
@@ -3519,6 +3550,8 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
 
             if (OP_DATA_LEN > FREE_SPACE) {
                 queue_overflow = true;
+                g_proxy_ring_full_waits.fetch_add(1, std::memory_order_relaxed);
+                g_proxy_ring_full_bytes.fetch_add(OP_DATA_LEN, std::memory_order_relaxed);
             } else {
                 uint32_t const RING_HEAD = HEAD % CAP;
                 uint32_t const FIRST = CAP - RING_HEAD;

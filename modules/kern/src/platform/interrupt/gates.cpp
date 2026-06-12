@@ -240,11 +240,6 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
 
         if (frame.int_num == 14) {
             log_userfault_lazy_vmem_ranges(current_task_for_dump, cr2);
-        }
-
-        ker::mod::dbg::coredump::try_write_for_task(current_task_for_dump, gpr, frame, cr2, cr3, apic::get_apic_id());
-
-        if (frame.int_num == 14) {
             journal::warn("Userspace page fault: cr2=0x%lx err=%d rip=0x%lx rsp=0x%lx pid=%d", cr2, frame.err_code, frame.rip, frame.rsp,
                           (ker::mod::sched::get_current_task() != nullptr) ? ker::mod::sched::get_current_task()->pid : 0);
             if (current_task_for_dump != nullptr) {
@@ -253,7 +248,11 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
                               current_task_for_dump->entry, current_task_for_dump->thread,
                               reinterpret_cast<void*>(current_task_for_dump->context.syscall_scratch_area));
             }
+        }
 
+        ker::mod::dbg::coredump::try_write_for_task(current_task_for_dump, gpr, frame, cr2, cr3, apic::get_apic_id());
+
+        if (frame.int_num == 14) {
             ker::syscall::process::wos_proc_exit_signal(11);
             __builtin_unreachable();
         }

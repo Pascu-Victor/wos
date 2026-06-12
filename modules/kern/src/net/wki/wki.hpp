@@ -44,7 +44,8 @@ constexpr uint16_t WKI_DEFAULT_HEARTBEAT_INTERVAL_MS = 1000;  // 1 second
 constexpr uint16_t WKI_MIN_HEARTBEAT_INTERVAL_MS = 300;       // 300 ms
 constexpr uint16_t WKI_MAX_HEARTBEAT_INTERVAL_MS = 5000;      // 5 seconds
 constexpr uint8_t WKI_DEFAULT_MISS_THRESHOLD = 10;            // 10 misses = 10 second timeout
-constexpr uint32_t WKI_PEER_FENCE_CONFIRM_GRACE_MS = 30000;   // second chance before destructive fence cleanup
+constexpr uint32_t WKI_PEER_FENCE_CONFIRM_GRACE_MS = 5000;    // per-probe grace before destructive fence cleanup
+constexpr uint8_t WKI_PEER_FENCE_PROBE_ROUNDS = 2;            // candidate + one re-probe before fencing
 
 // Grace period for newly connected peers
 constexpr uint32_t WKI_PEER_GRACE_PERIOD_MS = static_cast<uint32_t>(WKI_DEFAULT_MISS_THRESHOLD) * WKI_DEFAULT_HEARTBEAT_INTERVAL_MS;

@@ -261,6 +261,13 @@ struct IpcStatsSnapshot {
     uint64_t export_flush_queue{};
     uint64_t dev_op_queue{};
     uint64_t dev_op_payload_bytes{};
+    uint64_t proxy_write_payload_bytes{};
+    uint64_t proxy_write_no_credit_waits{};
+    uint64_t proxy_write_block_us{};
+    uint64_t proxy_pipe_rdma_full_waits{};
+    uint64_t proxy_ring_full_waits{};
+    uint64_t proxy_ring_full_bytes{};
+    uint64_t pipe_payload_bytes{};
     uint64_t approx_alloc_bytes{};
     uint64_t local_pipe_active{};
     uint64_t local_pipe_created{};
@@ -1390,6 +1397,13 @@ auto parse_ipc_stats_line(std::string_view line, IpcStatsSnapshot& out) -> bool 
     out.export_flush_queue = parse_u64(extract_value(line, "export_flush_queue="));
     out.dev_op_queue = parse_u64(extract_value(line, "dev_op_queue="));
     out.dev_op_payload_bytes = parse_u64(extract_value(line, "dev_op_payload_bytes="));
+    out.proxy_write_payload_bytes = parse_u64(extract_value(line, "proxy_write_payload_bytes="));
+    out.proxy_write_no_credit_waits = parse_u64(extract_value(line, "proxy_write_no_credit_waits="));
+    out.proxy_write_block_us = parse_u64(extract_value(line, "proxy_write_block_us="));
+    out.proxy_pipe_rdma_full_waits = parse_u64(extract_value(line, "proxy_pipe_rdma_full_waits="));
+    out.proxy_ring_full_waits = parse_u64(extract_value(line, "proxy_ring_full_waits="));
+    out.proxy_ring_full_bytes = parse_u64(extract_value(line, "proxy_ring_full_bytes="));
+    out.pipe_payload_bytes = parse_u64(extract_value(line, "pipe_payload_bytes="));
     out.approx_alloc_bytes = parse_u64(extract_value(line, "approx_alloc_bytes="));
     out.local_pipe_active = parse_u64(extract_value(line, "local_pipe_active="));
     out.local_pipe_created = parse_u64(extract_value(line, "local_pipe_created="));
@@ -3054,6 +3068,11 @@ void print_ipc_memory_snapshot(const std::optional<WkiLoadedText>& loaded) {
                  format_scaled_bytes(snapshot->dev_op_payload_bytes));
     std::println("remote: blocked_readers={} poll_waiters={} export_flush_queue={}", snapshot->blocked_readers, snapshot->poll_waiters,
                  snapshot->export_flush_queue);
+    std::println("remote: pipe_payload={} proxy_write={} no_credit_waits={} write_block_us={} rdma_full_waits={}",
+                 format_scaled_bytes(snapshot->pipe_payload_bytes), format_scaled_bytes(snapshot->proxy_write_payload_bytes),
+                 snapshot->proxy_write_no_credit_waits, snapshot->proxy_write_block_us, snapshot->proxy_pipe_rdma_full_waits);
+    std::println("remote: proxy_ring_full_waits={} proxy_ring_full_bytes={}", snapshot->proxy_ring_full_waits,
+                 format_scaled_bytes(snapshot->proxy_ring_full_bytes));
     std::println("local_pipe: active={} created={} peak={}  capacity={} peak_capacity={} buffered={}", snapshot->local_pipe_active,
                  snapshot->local_pipe_created, snapshot->local_pipe_peak, format_scaled_bytes(snapshot->local_pipe_capacity),
                  format_scaled_bytes(snapshot->local_pipe_peak_capacity), format_scaled_bytes(snapshot->local_pipe_buffered));

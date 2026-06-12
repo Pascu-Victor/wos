@@ -25,8 +25,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <fstream>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #if TRACEBENCH_ENABLE_MPI
@@ -48,7 +50,10 @@ constexpr std::array<char, 4> DONE_PACKET_MAGIC = {'R', 'B', 'T', 'D'};
 constexpr std::array<char, 4> BATCH_DONE_PACKET_MAGIC = {'R', 'B', 'T', 'B'};
 constexpr std::array<char, 4> BATCH_COMMAND_MAGIC = {'R', 'B', 'T', 'C'};
 constexpr size_t WORKER_PIPE_BUFFER_RESERVE = static_cast<size_t>(256U) * 1024U;
-constexpr size_t WORKER_PIPE_DRAIN_BYTE_BUDGET = static_cast<size_t>(1024U) * 1024U;
+constexpr size_t WORKER_PIPE_DRAIN_BYTE_BUDGET = static_cast<size_t>(8U) * 1024U * 1024U;
+constexpr size_t WORKER_OUTPUT_QUEUE_BYTE_LIMIT = static_cast<size_t>(8U) * 1024U * 1024U;
+constexpr size_t WORKER_OUTPUT_BATCH_BYTE_LIMIT = static_cast<size_t>(1024U) * 1024U;
+constexpr int WORKER_PIPE_IDLE_POLL_TIMEOUT_MS = 5;
 constexpr double STATUS_UPDATE_INTERVAL_SECONDS = 0.75;
 constexpr double PREVIEW_UPDATE_INTERVAL_SECONDS = 10.0;
 constexpr double WORKER_CANCEL_KILL_AFTER_SECONDS = 2.0;
@@ -183,6 +188,27 @@ struct ChildWorker {
     bool command_stream = false;
     bool ready_for_batch = false;
     bool stop_sent = false;
+    bool drain_budget_hit = false;
+};
+
+struct WorkerOutputQueue {
+    mtx_t lock{};
+    cnd_t not_empty{};
+    cnd_t not_full{};
+    cnd_t drained{};
+    std::deque<std::vector<unsigned char> > packets;
+    size_t queued_bytes = 0;
+    bool stop = false;
+    bool failed = false;
+    bool writer_active = false;
+};
+
+struct WorkerOutputRuntime {
+    WorkerOutputQueue queue{};
+    thrd_t writer{};
+    bool running = false;
+    mtx_t direct_lock{};
+    bool direct_lock_initialized = false;
 };
 
 struct HostIpcProfile {
@@ -192,6 +218,7 @@ struct HostIpcProfile {
     uint64_t worker_render_total_ms = 0;
     uint64_t worker_render_cpu_total_ms = 0;
     uint64_t worker_send_total_ms = 0;
+    uint64_t worker_thread_capacity_total_ms = 0;
     uint32_t min_worker_ms = UINT32_MAX;
     uint32_t max_worker_ms = 0;
     uint32_t max_render_ms = 0;
@@ -199,6 +226,7 @@ struct HostIpcProfile {
     uint32_t max_send_ms = 0;
     uint64_t worker_cpu_mask = 0;
     uint64_t worker_cpu_migrations = 0;
+    uint64_t effective_threads = 0;
 };
 
 struct ProcessIpcProfile {
@@ -239,6 +267,8 @@ struct ProcessIpcProfile {
     int last_batch_start = 0;
     int last_batch_count = 0;
     double last_closed_seconds = 0.0;
+    int persistent_batch_size = 0;
+    int effective_reserve_cpus = 0;
     std::vector<HostIpcProfile> hosts;
 };
 
@@ -260,6 +290,7 @@ struct WorkerThreadState {
     std::atomic<bool>* failed = nullptr;
     std::atomic<uint64_t>* tiles_rendered = nullptr;
     std::atomic<uint64_t>* tiles_sent = nullptr;
+    WorkerOutputQueue* output_queue = nullptr;
     mtx_t* output_lock = nullptr;
     std::span<unsigned char> packet_buffer;
     double render_seconds = 0.0;
@@ -409,6 +440,7 @@ void print_mpi_metrics_json(const tracebench::Options& options, const tracebench
     std::printf("\"debug_constant_tile_us\":%d,", options.debug_constant_tile_us);
     std::printf("\"debug_node_thread_batch_size\":%d,", options.debug_node_thread_batch_size);
     std::printf("\"coordinator_reserve_cpus\":%d,", options.coordinator_reserve_cpus);
+    std::printf("\"node_worker_reserve_cpus\":%d,", options.node_worker_reserve_cpus);
     std::printf("\"coordinator_skip_local_worker\":%s,", options.coordinator_skip_local_worker ? "true" : "false");
     std::printf("\"world_size\":%d,", world_size);
     std::printf("\"threads_per_rank\":%d,", threads_per_rank);
@@ -583,6 +615,211 @@ auto write_all(int fd, std::span<const unsigned char> bytes) -> bool {
     return true;
 }
 
+auto init_output_queue(WorkerOutputQueue& queue) -> bool {
+    if (mtx_init(&queue.lock, MTX_PLAIN) != THRD_SUCCESS) {
+        return false;
+    }
+    if (cnd_init(&queue.not_empty) != THRD_SUCCESS) {
+        mtx_destroy(&queue.lock);
+        return false;
+    }
+    if (cnd_init(&queue.not_full) != THRD_SUCCESS) {
+        cnd_destroy(&queue.not_empty);
+        mtx_destroy(&queue.lock);
+        return false;
+    }
+    if (cnd_init(&queue.drained) != THRD_SUCCESS) {
+        cnd_destroy(&queue.not_full);
+        cnd_destroy(&queue.not_empty);
+        mtx_destroy(&queue.lock);
+        return false;
+    }
+    return true;
+}
+
+void destroy_output_queue(WorkerOutputQueue& queue) {
+    cnd_destroy(&queue.drained);
+    cnd_destroy(&queue.not_full);
+    cnd_destroy(&queue.not_empty);
+    mtx_destroy(&queue.lock);
+}
+
+auto enqueue_output_packet(WorkerOutputQueue& queue, std::span<const unsigned char> bytes) -> bool {
+    std::vector<unsigned char> packet(bytes.begin(), bytes.end());
+    mtx_lock(&queue.lock);
+    while (!queue.failed && !queue.stop && !queue.packets.empty() && queue.queued_bytes + packet.size() > WORKER_OUTPUT_QUEUE_BYTE_LIMIT) {
+        (void)cnd_wait(&queue.not_full, &queue.lock);
+    }
+    if (queue.failed || queue.stop) {
+        mtx_unlock(&queue.lock);
+        return false;
+    }
+    queue.queued_bytes += packet.size();
+    queue.packets.push_back(std::move(packet));
+    (void)cnd_signal(&queue.not_empty);
+    mtx_unlock(&queue.lock);
+    return true;
+}
+
+auto wait_output_queue_drained(WorkerOutputQueue& queue) -> bool {
+    mtx_lock(&queue.lock);
+    while (!queue.failed && (!queue.packets.empty() || queue.writer_active)) {
+        (void)cnd_wait(&queue.drained, &queue.lock);
+    }
+    bool const OK = !queue.failed;
+    mtx_unlock(&queue.lock);
+    return OK;
+}
+
+auto output_writer_thread(void* raw) -> int {
+    auto* queue = static_cast<WorkerOutputQueue*>(raw);
+    std::vector<unsigned char> batch;
+    batch.reserve(WORKER_OUTPUT_BATCH_BYTE_LIMIT);
+    for (;;) {
+        mtx_lock(&queue->lock);
+        while (!queue->stop && !queue->failed && queue->packets.empty()) {
+            (void)cnd_wait(&queue->not_empty, &queue->lock);
+        }
+        if ((queue->stop || queue->failed) && queue->packets.empty()) {
+            (void)cnd_broadcast(&queue->drained);
+            mtx_unlock(&queue->lock);
+            break;
+        }
+
+        queue->writer_active = true;
+        batch.clear();
+        while (!queue->packets.empty() &&
+               (batch.empty() || batch.size() + queue->packets.front().size() <= WORKER_OUTPUT_BATCH_BYTE_LIMIT)) {
+            auto& packet = queue->packets.front();
+            batch.insert(batch.end(), packet.begin(), packet.end());
+            queue->queued_bytes -= packet.size();
+            queue->packets.pop_front();
+        }
+        (void)cnd_broadcast(&queue->not_full);
+        mtx_unlock(&queue->lock);
+
+        bool const WROTE = write_all(WORKER_STDOUT_FD, std::span<const unsigned char>(batch.data(), batch.size()));
+
+        mtx_lock(&queue->lock);
+        queue->writer_active = false;
+        if (!WROTE) {
+            queue->failed = true;
+        }
+        if (queue->packets.empty()) {
+            (void)cnd_broadcast(&queue->drained);
+        }
+        if (queue->failed) {
+            (void)cnd_broadcast(&queue->not_full);
+            (void)cnd_broadcast(&queue->not_empty);
+        }
+        mtx_unlock(&queue->lock);
+
+        if (!WROTE) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+auto stop_output_writer(WorkerOutputQueue& queue, thrd_t writer) -> bool {
+    mtx_lock(&queue.lock);
+    queue.stop = true;
+    (void)cnd_signal(&queue.not_empty);
+    mtx_unlock(&queue.lock);
+    int result = 0;
+    thrd_join(writer, &result);
+    mtx_lock(&queue.lock);
+    bool const OK = !queue.failed && result == 0;
+    mtx_unlock(&queue.lock);
+    return OK;
+}
+
+auto start_output_runtime(WorkerOutputRuntime& output) -> bool {
+    if (!init_output_queue(output.queue)) {
+        return false;
+    }
+    if (thrd_create(&output.writer, output_writer_thread, &output.queue) != THRD_SUCCESS) {
+        destroy_output_queue(output.queue);
+        return false;
+    }
+    output.running = true;
+    return true;
+}
+
+auto stop_output_runtime(WorkerOutputRuntime& output) -> bool {
+    if (!output.running) {
+        return true;
+    }
+    bool const OK = stop_output_writer(output.queue, output.writer);
+    destroy_output_queue(output.queue);
+    output.running = false;
+    return OK;
+}
+
+auto active_output_queue(WorkerOutputRuntime& output) -> WorkerOutputQueue* { return output.running ? &output.queue : nullptr; }
+
+auto start_direct_output_runtime(WorkerOutputRuntime& output, int worker_threads) -> bool {
+    if (worker_threads <= 1) {
+        return true;
+    }
+    if (mtx_init(&output.direct_lock, MTX_PLAIN) != THRD_SUCCESS) {
+        return false;
+    }
+    output.direct_lock_initialized = true;
+    return true;
+}
+
+void stop_direct_output_runtime(WorkerOutputRuntime& output) {
+    if (!output.direct_lock_initialized) {
+        return;
+    }
+    mtx_destroy(&output.direct_lock);
+    output.direct_lock_initialized = false;
+}
+
+auto start_worker_output_runtime(WorkerOutputRuntime& output, bool use_output_queue, int worker_threads) -> bool {
+    if (use_output_queue) {
+        return start_output_runtime(output);
+    }
+    return start_direct_output_runtime(output, worker_threads);
+}
+
+auto stop_worker_output_runtime(WorkerOutputRuntime& output) -> bool {
+    bool const OK = stop_output_runtime(output);
+    stop_direct_output_runtime(output);
+    return OK;
+}
+
+auto active_output_lock(WorkerOutputRuntime& output) -> mtx_t* { return output.direct_lock_initialized ? &output.direct_lock : nullptr; }
+
+auto wait_worker_output_drained(WorkerOutputQueue* queue) -> bool {
+    if (queue == nullptr) {
+        return true;
+    }
+    return wait_output_queue_drained(*queue);
+}
+
+auto single_thread_worker_queue_disabled(const tracebench::Options& options, int worker_threads) -> bool {
+    return options.disable_single_thread_worker_queue && worker_threads == 1;
+}
+
+auto worker_output_queue_disabled(const tracebench::Options& options, int worker_threads) -> bool {
+    return options.disable_worker_output_queue || single_thread_worker_queue_disabled(options, worker_threads);
+}
+
+auto send_worker_output_packet(WorkerThreadState& state, std::span<const unsigned char> bytes) -> bool {
+    if (state.output_queue == nullptr) {
+        if (state.output_lock == nullptr) {
+            return write_all(WORKER_STDOUT_FD, bytes);
+        }
+        mtx_lock(state.output_lock);
+        bool const OK = write_all(WORKER_STDOUT_FD, bytes);
+        mtx_unlock(state.output_lock);
+        return OK;
+    }
+    return enqueue_output_packet(*state.output_queue, bytes);
+}
+
 auto read_exact(int fd, std::span<unsigned char> bytes) -> bool {
     while (!bytes.empty()) {
         ssize_t const READ = ::read(fd, bytes.data(), bytes.size());
@@ -712,9 +949,7 @@ auto render_worker_tile(WorkerThreadState& state, const tracebench::Tile& tile) 
     TilePacketHeader const HEADER = make_tile_packet_header(tile, tile_payload.size());
     std::memcpy(state.packet_buffer.data(), &HEADER, sizeof(HEADER));
     double const SEND_STARTED = tracebench::monotonic_seconds();
-    mtx_lock(state.output_lock);
-    bool const SENT = write_all(WORKER_STDOUT_FD, state.packet_buffer.first(PACKET_BYTES));
-    mtx_unlock(state.output_lock);
+    bool const SENT = send_worker_output_packet(state, state.packet_buffer.first(PACKET_BYTES));
     state.send_seconds += tracebench::monotonic_seconds() - SEND_STARTED;
     if (!SENT) {
         state.failed->store(true, std::memory_order_relaxed);
@@ -1072,8 +1307,9 @@ auto parse_worker_packets(ChildWorker& worker, tracebench::FilmView film, std::v
 
 auto drain_ready_worker_pipe(ChildWorker& worker, tracebench::FilmView film, std::vector<unsigned char>& tile_seen,
                              std::span<const int> tile_owner, uint64_t& tiles_done) -> bool {
-    std::array<unsigned char, 16384> chunk = {};
+    std::array<unsigned char, 65536> chunk = {};
     size_t drained_bytes = 0;
+    worker.drain_budget_hit = false;
     while (worker.read_fd >= 0 && drained_bytes < WORKER_PIPE_DRAIN_BYTE_BUDGET) {
         ssize_t const READ = ::read(worker.read_fd, chunk.data(), chunk.size());
         if (READ > 0) {
@@ -1102,6 +1338,7 @@ auto drain_ready_worker_pipe(ChildWorker& worker, tracebench::FilmView film, std
         std::perror("renderbench: read worker pipe");
         return false;
     }
+    worker.drain_budget_hit = worker.read_fd >= 0 && drained_bytes >= WORKER_PIPE_DRAIN_BYTE_BUDGET;
     return parse_worker_packets(worker, film, tile_seen, tile_owner, tiles_done);
 }
 
@@ -1225,6 +1462,19 @@ auto make_worker_args(const std::string& program_path, const tracebench::Options
     if (options.debug_constant_tile_us > 0) {
         args.emplace_back("--debug-constant-tile-us");
         args.emplace_back(std::to_string(options.debug_constant_tile_us));
+    }
+    if (options.disable_single_thread_worker_queue) {
+        args.emplace_back("--disable-single-thread-worker-queue");
+    } else {
+        args.emplace_back("--enable-single-thread-worker-queue");
+    }
+    if (options.disable_worker_output_queue) {
+        args.emplace_back("--disable-worker-output-queue");
+    }
+    if (options.process_persistent_workers) {
+        args.emplace_back("--enable-process-persistent-workers");
+    } else {
+        args.emplace_back("--disable-process-persistent-workers");
     }
     return args;
 }
@@ -1550,7 +1800,8 @@ auto dynamic_batch_size(const tracebench::Options& options, size_t total_tiles, 
     size_t const THREADS = static_cast<size_t>(std::max(1, worker_threads));
 
     if (options.placement == tracebench::Placement::ProcessPerCore) {
-        size_t target = (total_tiles + ((WORKERS * 16U) - 1U)) / (WORKERS * 16U);
+        size_t const TARGET_WAVES = total_tiles >= WORKERS * 64U ? 8U : 16U;
+        size_t target = (total_tiles + ((WORKERS * TARGET_WAVES) - 1U)) / (WORKERS * TARGET_WAVES);
         target = std::clamp<size_t>(target, THREADS * 8U, THREADS * 64U);
         return static_cast<int>(std::max<size_t>(1, target));
     }
@@ -1570,12 +1821,26 @@ auto dynamic_batch_size(const tracebench::Options& options, size_t total_tiles, 
     return static_cast<int>(std::max<size_t>(1, target));
 }
 
+auto persistent_batch_worker_threads(const tracebench::Options& options, std::span<const IpcWorkerSpec> specs) -> int {
+    int threads = 1;
+    for (const auto& spec : specs) {
+        threads = std::max(threads, spec.worker_threads);
+    }
+    if (options.placement == tracebench::Placement::NodeThreads && options.threads <= 0) {
+        threads += std::max(0, options.node_worker_reserve_cpus);
+    }
+    return threads;
+}
+
 auto local_coordinator_reserve_cpus(const tracebench::Options& options, size_t peer_count) -> int {
     if (peer_count <= 1U) {
         return 0;
     }
     if (options.coordinator_reserve_cpus >= 0) {
         return options.coordinator_reserve_cpus;
+    }
+    if (options.placement == tracebench::Placement::ProcessPerCore) {
+        return 0;
     }
     return options.threads <= 0 ? 1 : 0;
 }
@@ -1648,7 +1913,13 @@ auto launch_next_worker_batch(const std::string& program_path, const tracebench:
     return 1;
 }
 
-void wait_for_worker_pipe_activity(std::span<const ChildWorker> workers) {
+auto should_poll_workers_immediately(std::span<const ChildWorker> workers) -> bool {
+    return std::ranges::any_of(workers, [](const ChildWorker& worker) {
+        return worker.pipe_open && worker.read_fd >= 0 && (worker.drain_budget_hit || !worker.buffer.empty());
+    });
+}
+
+void wait_for_worker_pipe_activity(std::span<const ChildWorker> workers, int timeout_ms) {
     std::vector<pollfd> fds;
     fds.reserve(workers.size());
     for (const auto& worker : workers) {
@@ -1664,7 +1935,7 @@ void wait_for_worker_pipe_activity(std::span<const ChildWorker> workers) {
         return;
     }
 
-    int const READY = ::poll(fds.data(), fds.size(), 50);
+    int const READY = ::poll(fds.data(), fds.size(), timeout_ms);
     if (READY < 0 && errno != EINTR) {
         ::usleep(1000);
     }
@@ -1688,6 +1959,9 @@ void note_process_ipc_profile(ProcessIpcProfile& profile, const ChildWorker& wor
         host = profile.hosts.end() - 1;
     }
     ++host->completed_runs;
+    uint64_t const EFFECTIVE_THREADS = static_cast<uint64_t>(std::max(1, worker.worker_threads));
+    host->effective_threads += EFFECTIVE_THREADS;
+    host->worker_thread_capacity_total_ms += static_cast<uint64_t>(WORKER_MS) * EFFECTIVE_THREADS;
     host->worker_elapsed_total_ms += WORKER_MS;
     host->worker_render_total_ms += RENDER_MS;
     host->worker_render_cpu_total_ms += RENDER_CPU_MS;
@@ -1799,6 +2073,122 @@ void print_process_ipc_profile(const ProcessIpcProfile& profile, double started,
     }
 }
 
+auto json_escape(std::string_view text) -> std::string {
+    std::string out;
+    out.reserve(text.size() + 8U);
+    for (char ch : text) {
+        switch (ch) {
+            case '\\':
+                out += "\\\\";
+                break;
+            case '"':
+                out += "\\\"";
+                break;
+            case '\n':
+                out += "\\n";
+                break;
+            case '\r':
+                out += "\\r";
+                break;
+            case '\t':
+                out += "\\t";
+                break;
+            default:
+                out.push_back(ch);
+                break;
+        }
+    }
+    return out;
+}
+
+auto ratio_or_zero(double numerator, double denominator) -> double { return denominator > 0.0 ? numerator / denominator : 0.0; }
+
+auto host_thread_capacity_ms(const HostIpcProfile& host) -> double {
+    if (host.completed_runs == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(host.worker_thread_capacity_total_ms) / static_cast<double>(host.completed_runs);
+}
+
+auto write_process_ipc_profile_json(const tracebench::Options& options, const ProcessIpcProfile& profile, double launch_seconds,
+                                    uint64_t tiles_done, uint64_t total_tiles) -> bool {
+    std::ostringstream out;
+    uint32_t const MIN_WORKER_MS = profile.min_worker_ms == UINT32_MAX ? 0 : profile.min_worker_ms;
+    double const AVG_WORKER_MS = profile.completed_runs == 0
+                                     ? 0.0
+                                     : static_cast<double>(profile.worker_elapsed_total_ms) / static_cast<double>(profile.completed_runs);
+
+    out << "{\n"
+        << "  \"worker_slots\": " << profile.worker_slots << ",\n"
+        << "  \"completed_runs\": " << profile.completed_runs << ",\n"
+        << "  \"persistent_batch_size\": " << profile.persistent_batch_size << ",\n"
+        << "  \"effective_reserve_cpus\": " << profile.effective_reserve_cpus << ",\n"
+        << "  \"node_worker_reserve_cpus\": " << options.node_worker_reserve_cpus << ",\n"
+        << "  \"worker_output_queue_disabled\": " << (options.disable_worker_output_queue ? "true" : "false") << ",\n"
+        << "  \"single_thread_worker_queue_disabled\": " << (options.disable_single_thread_worker_queue ? "true" : "false") << ",\n"
+        << "  \"process_persistent_workers\": " << (options.process_persistent_workers ? "true" : "false") << ",\n"
+        << "  \"tiles_done\": " << tiles_done << ",\n"
+        << "  \"total_tiles\": " << total_tiles << ",\n"
+        << "  \"launch_seconds\": " << launch_seconds << ",\n"
+        << "  \"first_packet_seconds\": " << profile.first_packet_seconds << ",\n"
+        << "  \"last_close_seconds\": " << profile.last_close_seconds << ",\n"
+        << "  \"read_bytes\": " << profile.total_read_bytes << ",\n"
+        << "  \"read_calls\": " << profile.total_read_calls << ",\n"
+        << "  \"worker_ms_min\": " << MIN_WORKER_MS << ",\n"
+        << "  \"worker_ms_avg\": " << AVG_WORKER_MS << ",\n"
+        << "  \"worker_ms_max\": " << profile.max_worker_ms << ",\n"
+        << "  \"hosts\": [\n";
+
+    bool first = true;
+    for (const auto& host : profile.hosts) {
+        if (host.completed_runs == 0) {
+            continue;
+        }
+        if (!first) {
+            out << ",\n";
+        }
+        first = false;
+        uint32_t const HOST_MIN_WORKER_MS = host.min_worker_ms == UINT32_MAX ? 0 : host.min_worker_ms;
+        double const AVG_HOST_WORKER_MS = static_cast<double>(host.worker_elapsed_total_ms) / static_cast<double>(host.completed_runs);
+        double const AVG_RENDER_MS = static_cast<double>(host.worker_render_total_ms) / static_cast<double>(host.completed_runs);
+        double const AVG_RENDER_CPU_MS = static_cast<double>(host.worker_render_cpu_total_ms) / static_cast<double>(host.completed_runs);
+        double const AVG_SEND_MS = static_cast<double>(host.worker_send_total_ms) / static_cast<double>(host.completed_runs);
+        double const CAPACITY_MS = host_thread_capacity_ms(host);
+        out << "    {\n"
+            << "      \"host\": \"" << json_escape(host.hostname) << "\",\n"
+            << "      \"runs\": " << host.completed_runs << ",\n"
+            << "      \"effective_threads\": "
+            << ratio_or_zero(static_cast<double>(host.effective_threads), static_cast<double>(host.completed_runs)) << ",\n"
+            << "      \"worker_ms_min\": " << HOST_MIN_WORKER_MS << ",\n"
+            << "      \"worker_ms_avg\": " << AVG_HOST_WORKER_MS << ",\n"
+            << "      \"worker_ms_max\": " << host.max_worker_ms << ",\n"
+            << "      \"render_ms_avg\": " << AVG_RENDER_MS << ",\n"
+            << "      \"render_ms_max\": " << host.max_render_ms << ",\n"
+            << "      \"render_cpu_ms_avg\": " << AVG_RENDER_CPU_MS << ",\n"
+            << "      \"render_cpu_ms_max\": " << host.max_render_cpu_ms << ",\n"
+            << "      \"send_ms_avg\": " << AVG_SEND_MS << ",\n"
+            << "      \"send_ms_max\": " << host.max_send_ms << ",\n"
+            << "      \"thread_capacity_ms\": " << CAPACITY_MS << ",\n"
+            << "      \"render_cpu_occupancy\": " << ratio_or_zero(AVG_RENDER_CPU_MS, CAPACITY_MS) << ",\n"
+            << "      \"pipeline_occupancy\": " << ratio_or_zero(AVG_RENDER_MS, CAPACITY_MS) << ",\n"
+            << "      \"render_cpu_to_render_ratio\": "
+            << ratio_or_zero(static_cast<double>(host.worker_render_cpu_total_ms), static_cast<double>(host.worker_render_total_ms))
+            << ",\n"
+            << "      \"worker_cpu_mask\": " << host.worker_cpu_mask << ",\n"
+            << "      \"migrations\": " << host.worker_cpu_migrations << "\n"
+            << "    }";
+    }
+    out << "\n  ]\n"
+        << "}\n";
+
+    std::ofstream file(tracebench::run_dir(options) + "/ipc_profile.json", std::ios::trunc);
+    if (!file) {
+        return false;
+    }
+    file << out.str();
+    return static_cast<bool>(file);
+}
+
 auto make_node_thread_specs(const tracebench::Options& options, const std::vector<WkiPeerInfo>& peers) -> std::vector<IpcWorkerSpec> {
     struct PendingSpec {
         const WkiPeerInfo* peer = nullptr;
@@ -1816,8 +2206,12 @@ auto make_node_thread_specs(const tracebench::Options& options, const std::vecto
             continue;
         }
         int worker_threads = std::max(1, options.threads > 0 ? options.threads : peer.cpus);
-        if (peer.local && LOCAL_COORDINATOR_RESERVE_CPUS > 0) {
-            worker_threads = std::max(0, worker_threads - LOCAL_COORDINATOR_RESERVE_CPUS);
+        int reserve_cpus = std::max(0, options.node_worker_reserve_cpus);
+        if (peer.local) {
+            reserve_cpus = std::max(reserve_cpus, LOCAL_COORDINATOR_RESERVE_CPUS);
+        }
+        if (reserve_cpus > 0) {
+            worker_threads = std::max(0, worker_threads - reserve_cpus);
         }
         if (worker_threads <= 0) {
             continue;
@@ -1865,12 +2259,12 @@ auto make_process_specs(const tracebench::Options& options, const std::vector<Wk
     }
 
     std::vector<WorkerHost> worker_hosts;
-    bool const RESERVE_LOCAL_COORDINATOR = options.threads <= 0 && peers.size() > 1U;
+    int const LOCAL_COORDINATOR_RESERVE_CPUS = local_coordinator_reserve_cpus(options, peers.size());
     for (int cpu = 0; cpu < max_cpus; ++cpu) {
         for (const auto& peer : peers) {
             int usable_cpus = peer.cpus;
-            if (RESERVE_LOCAL_COORDINATOR && peer.local && usable_cpus > 1) {
-                --usable_cpus;
+            if (peer.local && LOCAL_COORDINATOR_RESERVE_CPUS > 0) {
+                usable_cpus = std::max(0, usable_cpus - LOCAL_COORDINATOR_RESERVE_CPUS);
             }
             if (cpu < usable_cpus) {
                 worker_hosts.push_back({
@@ -1994,29 +2388,30 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
         }
         std::vector<thrd_t> threads(static_cast<size_t>(THREADS));
         std::vector<CommandStreamThreadState> states(static_cast<size_t>(THREADS));
-        mtx_t output_lock{};
-        if (mtx_init(&output_lock, MTX_PLAIN) != THRD_SUCCESS) {
-            std::println(stderr, "renderbench: failed to initialize worker output lock");
+        WorkerOutputRuntime output{};
+        bool const USE_OUTPUT_QUEUE = !worker_output_queue_disabled(options, THREADS);
+        if (!start_worker_output_runtime(output, USE_OUTPUT_QUEUE, THREADS)) {
+            std::println(stderr, "renderbench: failed to initialize worker output path");
             return 2;
         }
         CommandStreamThreadPool pool{};
         pool.tiles = &all_tiles;
         if (mtx_init(&pool.lock, MTX_PLAIN) != THRD_SUCCESS) {
             std::println(stderr, "renderbench: failed to initialize worker pool lock");
-            mtx_destroy(&output_lock);
+            (void)stop_worker_output_runtime(output);
             return 2;
         }
         if (cnd_init(&pool.wake) != THRD_SUCCESS) {
             std::println(stderr, "renderbench: failed to initialize worker pool wake condition");
             mtx_destroy(&pool.lock);
-            mtx_destroy(&output_lock);
+            (void)stop_worker_output_runtime(output);
             return 2;
         }
         if (cnd_init(&pool.done) != THRD_SUCCESS) {
             std::println(stderr, "renderbench: failed to initialize worker pool done condition");
             cnd_destroy(&pool.wake);
             mtx_destroy(&pool.lock);
-            mtx_destroy(&output_lock);
+            (void)stop_worker_output_runtime(output);
             return 2;
         }
 
@@ -2053,7 +2448,8 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
                         .failed = &pool.failed,
                         .tiles_rendered = &pool.tiles_rendered,
                         .tiles_sent = &pool.tiles_sent,
-                        .output_lock = &output_lock,
+                        .output_queue = active_output_queue(output),
+                        .output_lock = active_output_lock(output),
                         .packet_buffer = std::span<unsigned char>(thread_packets.at(static_cast<size_t>(i)).data(),
                                                                   thread_packets.at(static_cast<size_t>(i)).size()),
                     },
@@ -2109,7 +2505,11 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
                 render_cpu_seconds += states.at(static_cast<size_t>(i)).worker.render_cpu_seconds;
                 send_seconds += states.at(static_cast<size_t>(i)).worker.send_seconds;
             }
-            bool const BATCH_FAILED = pool.failed.load(std::memory_order_relaxed) || RENDERED != EXPECTED || SENT != EXPECTED;
+            double const FLUSH_STARTED = tracebench::monotonic_seconds();
+            bool const OUTPUT_DRAINED = wait_worker_output_drained(active_output_queue(output));
+            send_seconds += tracebench::monotonic_seconds() - FLUSH_STARTED;
+            bool const BATCH_FAILED =
+                pool.failed.load(std::memory_order_relaxed) || !OUTPUT_DRAINED || RENDERED != EXPECTED || SENT != EXPECTED;
             total_expected += EXPECTED;
             total_rendered += RENDERED;
             total_sent += SENT;
@@ -2139,6 +2539,8 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
         }
 
         stop_threads();
+        bool const OUTPUT_WRITER_OK = stop_worker_output_runtime(output);
+        failed = failed || !OUTPUT_WRITER_OK;
         uint32_t const WORKER_END_CPU = current_worker_cpu();
         bool const DONE_SENT =
             send_worker_done_packet(WORKER_STDOUT_FD, worker.worker_id, total_expected, total_rendered, total_sent, failed,
@@ -2148,7 +2550,6 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
         cnd_destroy(&pool.done);
         cnd_destroy(&pool.wake);
         mtx_destroy(&pool.lock);
-        mtx_destroy(&output_lock);
         return failed || !DONE_SENT ? 2 : 0;
     }
     std::vector<tracebench::Tile> assigned_tiles;
@@ -2182,9 +2583,10 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
     std::atomic<bool> failed{false};
     std::atomic<uint64_t> tiles_rendered{0};
     std::atomic<uint64_t> tiles_sent{0};
-    mtx_t output_lock{};
-    if (mtx_init(&output_lock, MTX_PLAIN) != THRD_SUCCESS) {
-        std::println(stderr, "renderbench: failed to initialize worker output lock");
+    WorkerOutputRuntime output{};
+    bool const USE_OUTPUT_QUEUE = !worker_output_queue_disabled(options, THREADS);
+    if (!start_worker_output_runtime(output, USE_OUTPUT_QUEUE, THREADS)) {
+        std::println(stderr, "renderbench: failed to initialize worker output path");
         return 2;
     }
 
@@ -2197,7 +2599,8 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
             .failed = &failed,
             .tiles_rendered = &tiles_rendered,
             .tiles_sent = &tiles_sent,
-            .output_lock = &output_lock,
+            .output_queue = active_output_queue(output),
+            .output_lock = active_output_lock(output),
             .packet_buffer = std::span<unsigned char>(thread_packets.at(static_cast<size_t>(index)).data(),
                                                       thread_packets.at(static_cast<size_t>(index)).size()),
         };
@@ -2235,7 +2638,12 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
         render_cpu_seconds += states.at(static_cast<size_t>(i)).render_cpu_seconds;
         send_seconds += states.at(static_cast<size_t>(i)).send_seconds;
     }
-    bool const WORKER_FAILED = failed.load(std::memory_order_relaxed) || RENDERED != EXPECTED || SENT != EXPECTED;
+    double const FLUSH_STARTED = tracebench::monotonic_seconds();
+    bool const OUTPUT_DRAINED = wait_worker_output_drained(active_output_queue(output));
+    send_seconds += tracebench::monotonic_seconds() - FLUSH_STARTED;
+    bool const OUTPUT_WRITER_OK = stop_worker_output_runtime(output);
+    bool const WORKER_FAILED =
+        failed.load(std::memory_order_relaxed) || !OUTPUT_DRAINED || !OUTPUT_WRITER_OK || RENDERED != EXPECTED || SENT != EXPECTED;
     uint32_t const WORKER_END_CPU = current_worker_cpu();
     bool const DONE_SENT = send_worker_done_packet(WORKER_STDOUT_FD, worker.worker_id, EXPECTED, RENDERED, SENT, WORKER_FAILED,
                                                    elapsed_milliseconds_since(WORKER_STARTED), seconds_to_milliseconds(render_seconds),
@@ -2245,7 +2653,6 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
         std::println(stderr, "renderbench: worker {} completed host-side with expected={} rendered={} sent={} failed={} done_sent={}",
                      worker.worker_id, EXPECTED, RENDERED, SENT, failed.load(std::memory_order_relaxed) ? 1 : 0, DONE_SENT ? 1 : 0);
     }
-    mtx_destroy(&output_lock);
     return WORKER_FAILED || !DONE_SENT ? 2 : 0;
 }
 
@@ -2265,7 +2672,8 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
     }
 
     bool const USE_PERSISTENT_PROCESS_BATCHES =
-        options.placement == tracebench::Placement::NodeThreads || options.placement == tracebench::Placement::ProcessPerCore;
+        options.placement == tracebench::Placement::NodeThreads ||
+        (options.placement == tracebench::Placement::ProcessPerCore && options.process_persistent_workers);
     for (auto& spec : specs) {
         spec.command_stream = USE_PERSISTENT_PROCESS_BATCHES;
     }
@@ -2286,15 +2694,20 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
                                       : make_tile_owner_map(std::span<const tracebench::Tile>(tiles.data(), tiles.size()),
                                                             std::span<const IpcWorkerSpec>(specs.data(), specs.size()));
     std::string const PROGRAM_PATH = renderbench_program_path(argv0);
+    int const PERSISTENT_BATCH_THREADS =
+        persistent_batch_worker_threads(options, std::span<const IpcWorkerSpec>(specs.data(), specs.size()));
     int const PERSISTENT_BATCH_SIZE =
-        USE_PERSISTENT_PROCESS_BATCHES ? dynamic_batch_size(options, tiles.size(), specs.size(), specs.front().worker_threads, false) : 0;
-    if (USE_PERSISTENT_PROCESS_BATCHES) {
+        USE_PERSISTENT_PROCESS_BATCHES ? dynamic_batch_size(options, tiles.size(), specs.size(), PERSISTENT_BATCH_THREADS, false) : 0;
+    if (USE_PERSISTENT_PROCESS_BATCHES || options.placement == tracebench::Placement::ProcessPerCore) {
         int const EFFECTIVE_LOCAL_RESERVE_CPUS = local_coordinator_reserve_cpus(options, peers.size());
         std::println(stderr,
-                     "renderbench: ipc persistent config placement={} workers={} batch_size={} coordinator_reserve_cpus={} "
-                     "effective_reserve_cpus={} coordinator_skip_local_worker={}",
-                     tracebench::placement_name(options.placement), specs.size(), PERSISTENT_BATCH_SIZE, options.coordinator_reserve_cpus,
-                     EFFECTIVE_LOCAL_RESERVE_CPUS, options.coordinator_skip_local_worker ? 1 : 0);
+                     "renderbench: ipc config placement={} workers={} persistent_workers={} batch_size={} coordinator_reserve_cpus={} "
+                     "effective_reserve_cpus={} node_worker_reserve_cpus={} coordinator_skip_local_worker={} "
+                     "worker_output_queue_disabled={} single_thread_worker_queue_disabled={}",
+                     tracebench::placement_name(options.placement), specs.size(), USE_PERSISTENT_PROCESS_BATCHES ? 1 : 0,
+                     PERSISTENT_BATCH_SIZE, options.coordinator_reserve_cpus, EFFECTIVE_LOCAL_RESERVE_CPUS,
+                     options.node_worker_reserve_cpus, options.coordinator_skip_local_worker ? 1 : 0,
+                     options.disable_worker_output_queue ? 1 : 0, options.disable_single_thread_worker_queue ? 1 : 0);
     }
 
     double const STARTED = tracebench::monotonic_seconds();
@@ -2307,6 +2720,8 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
     bool ok = true;
     ProcessIpcProfile ipc_profile{};
     ipc_profile.worker_slots = specs.size();
+    ipc_profile.persistent_batch_size = PERSISTENT_BATCH_SIZE;
+    ipc_profile.effective_reserve_cpus = local_coordinator_reserve_cpus(options, peers.size());
     size_t open_pipes = 0;
     for (size_t i = 0; i < specs.size(); ++i) {
         if (USE_PERSISTENT_PROCESS_BATCHES) {
@@ -2439,7 +2854,10 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
             next_preview = NOW + PREVIEW_UPDATE_INTERVAL_SECONDS;
         }
         if (open_pipes != 0) {
-            wait_for_worker_pipe_activity(std::span<const ChildWorker>(workers.data(), workers.size()));
+            int const POLL_TIMEOUT_MS = should_poll_workers_immediately(std::span<const ChildWorker>(workers.data(), workers.size()))
+                                            ? 0
+                                            : WORKER_PIPE_IDLE_POLL_TIMEOUT_MS;
+            wait_for_worker_pipe_activity(std::span<const ChildWorker>(workers.data(), workers.size()), POLL_TIMEOUT_MS);
         }
     }
 
@@ -2470,6 +2888,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
         progress.elapsed_seconds > 0.0 ? static_cast<double>(progress.total_samples) / progress.elapsed_seconds : 0.0;
     (void)tracebench::write_status(options, progress);
     (void)tracebench::write_metrics(options, progress, RAYS_PER_SECOND);
+    (void)write_process_ipc_profile_json(options, ipc_profile, LAUNCH_FINISHED - STARTED, tiles_done, tiles.size());
     (void)tracebench::write_final_png(options, film);
     (void)tracebench::write_preview_png(options, film);
     print_process_ipc_profile(ipc_profile, STARTED, LAUNCH_FINISHED, tiles_done, tiles.size());

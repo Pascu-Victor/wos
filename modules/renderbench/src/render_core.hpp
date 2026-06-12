@@ -40,7 +40,11 @@ struct Options {
     int debug_constant_tile_us = 0;
     int debug_node_thread_batch_size = 0;
     int coordinator_reserve_cpus = -1;
+    int node_worker_reserve_cpus = 0;
     bool coordinator_skip_local_worker = false;
+    bool disable_worker_output_queue = false;
+    bool disable_single_thread_worker_queue = true;
+    bool process_persistent_workers = false;
 };
 
 struct Tile {

@@ -2143,7 +2143,10 @@ void print_usage(const char* argv0) {
                  "usage: %s --scene scene.glb --backend ipc|mpi --placement node-threads|process-per-core "
                  "--width N --height N --spp N --max-depth N --tile-size N --output-root PATH [--threads N] "
                  "[--debug-edge-colors] [--debug-constant-tile-us N] [--debug-node-thread-batch-size N] "
-                 "[--coordinator-reserve-cpus N] [--coordinator-skip-local-worker]\n",
+                 "[--coordinator-reserve-cpus N] [--node-worker-reserve-cpus N] [--coordinator-skip-local-worker] "
+                 "[--disable-worker-output-queue|--enable-worker-output-queue] "
+                 "[--disable-single-thread-worker-queue|--enable-single-thread-worker-queue] "
+                 "[--enable-process-persistent-workers|--disable-process-persistent-workers]\n",
                  argv0 != nullptr ? argv0 : "renderbench");
 }
 
@@ -2240,8 +2243,24 @@ auto parse_options(int argc, char* const* argv, Backend default_backend, Options
             if (!parse_required_int(0, options.coordinator_reserve_cpus)) {
                 return ParseStatus::Error;
             }
+        } else if (ARG == "--node-worker-reserve-cpus") {
+            if (!parse_required_int(0, options.node_worker_reserve_cpus)) {
+                return ParseStatus::Error;
+            }
         } else if (ARG == "--coordinator-skip-local-worker") {
             options.coordinator_skip_local_worker = true;
+        } else if (ARG == "--disable-worker-output-queue") {
+            options.disable_worker_output_queue = true;
+        } else if (ARG == "--enable-worker-output-queue") {
+            options.disable_worker_output_queue = false;
+        } else if (ARG == "--disable-single-thread-worker-queue") {
+            options.disable_single_thread_worker_queue = true;
+        } else if (ARG == "--enable-single-thread-worker-queue") {
+            options.disable_single_thread_worker_queue = false;
+        } else if (ARG == "--enable-process-persistent-workers") {
+            options.process_persistent_workers = true;
+        } else if (ARG == "--disable-process-persistent-workers") {
+            options.process_persistent_workers = false;
         } else if (ARG == "--tracebench-worker" || ARG == "--worker-command-stream") {
             continue;
         } else if (ARG == "--worker-id") {
@@ -2505,7 +2524,10 @@ auto write_status(const Options& options, const Progress& progress) -> bool {
         << "  \"debug_constant_tile_us\": " << options.debug_constant_tile_us << ",\n"
         << "  \"debug_node_thread_batch_size\": " << options.debug_node_thread_batch_size << ",\n"
         << "  \"coordinator_reserve_cpus\": " << options.coordinator_reserve_cpus << ",\n"
+        << "  \"node_worker_reserve_cpus\": " << options.node_worker_reserve_cpus << ",\n"
         << "  \"coordinator_skip_local_worker\": " << (options.coordinator_skip_local_worker ? "true" : "false") << ",\n"
+        << "  \"worker_output_queue_disabled\": " << (options.disable_worker_output_queue ? "true" : "false") << ",\n"
+        << "  \"single_thread_worker_queue_disabled\": " << (options.disable_single_thread_worker_queue ? "true" : "false") << ",\n"
         << "  \"tiles_done\": " << progress.tiles_done << ",\n"
         << "  \"total_tiles\": " << progress.total_tiles << ",\n"
         << "  \"samples_done\": " << progress.samples_done << ",\n"
@@ -2531,7 +2553,10 @@ auto write_metrics(const Options& options, const Progress& progress, double rays
         << "  \"debug_constant_tile_us\": " << options.debug_constant_tile_us << ",\n"
         << "  \"debug_node_thread_batch_size\": " << options.debug_node_thread_batch_size << ",\n"
         << "  \"coordinator_reserve_cpus\": " << options.coordinator_reserve_cpus << ",\n"
+        << "  \"node_worker_reserve_cpus\": " << options.node_worker_reserve_cpus << ",\n"
         << "  \"coordinator_skip_local_worker\": " << (options.coordinator_skip_local_worker ? "true" : "false") << ",\n"
+        << "  \"worker_output_queue_disabled\": " << (options.disable_worker_output_queue ? "true" : "false") << ",\n"
+        << "  \"single_thread_worker_queue_disabled\": " << (options.disable_single_thread_worker_queue ? "true" : "false") << ",\n"
         << "  \"elapsed_seconds\": " << progress.elapsed_seconds << ",\n"
         << "  \"primary_samples\": " << progress.total_samples << ",\n"
         << "  \"rays_per_second_estimate\": " << rays_per_second << "\n"

@@ -29,6 +29,7 @@ using log = ker::mod::dbg::logger<"cdmp">;
 constexpr uint64_t COREDUMP_MAGIC = 0x504d55444f43534fULL;  // "WOSCODMP" little-endian-ish identifier
 constexpr uint32_t COREDUMP_VERSION = 3;
 constexpr size_t MAX_WALK_WARNINGS_PER_LEVEL = 8;
+constexpr bool CAPTURE_USER_MEMORY_SNAPSHOT = false;
 
 // x86-64 canonical address check: bits[63:47] must all be the same.
 // For kernel HHDM addresses (bit 47 set) the upper 17 bits are all 1s.
@@ -434,6 +435,7 @@ struct CoreDumpRequest {
     uint64_t elf_buffer_addr;
     uint64_t captured_elf_buffer_size;
     uint64_t elf_buffer_shared_value;
+    uint64_t task_pagemap_value;
     uint64_t start_time_us;
     uint64_t user_time_us;
     uint64_t system_time_us;
@@ -619,7 +621,7 @@ void perform_coredump(const CoreDumpRequest& req) {
     hdr.saved_frame = req.saved_frame;
     hdr.saved_regs = req.saved_regs;
     hdr.task_entry = req.entry;
-    hdr.task_pagemap = reinterpret_cast<uint64_t>(req.pagemap);
+    hdr.task_pagemap = req.task_pagemap_value;
     hdr.elf_header_addr = req.elf_header_addr;
     hdr.program_header_addr = req.program_header_addr;
     hdr.segment_count = seg_capacity;
@@ -749,7 +751,7 @@ void init() {
 
 void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPRegs& gpr, const ker::mod::gates::InterruptFrame& frame,
                         uint64_t cr2, uint64_t cr3, uint64_t cpu_id) {
-    if (task == nullptr || g_coredump_task == nullptr) {
+    if (task == nullptr || g_coredump_task == nullptr || task->dumpable == 0) {
         return;
     }
 
@@ -763,9 +765,11 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
         return;
     }
 
-    // Take a refcount on the task. This prevents GC from reclaiming it (and its pagemap
-    // and user pages) while the coredump task reads them via HHDM. The coredump task
-    // calls task->release() when done. try_acquire fails if task is already EXITING/DEAD.
+    // Take a refcount on the task. This prevents GC from reclaiming the Task
+    // metadata while the coredump task writes the request and any stolen ELF
+    // buffer. It does not pin the pagemap; async memory snapshots stay disabled
+    // until page-table ownership is explicit. try_acquire fails if task is
+    // already EXITING/DEAD.
     if (!task->try_acquire()) {
         return;
     }
@@ -819,6 +823,7 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     req.elf_buffer_addr = reinterpret_cast<uint64_t>(task->elf_buffer);
     req.captured_elf_buffer_size = task->elf_buffer_size;
     req.elf_buffer_shared_value = task->is_elf_buffer_shared ? 1 : 0;
+    req.task_pagemap_value = reinterpret_cast<uint64_t>(task->pagemap);
     req.start_time_us = task->start_time_us;
     req.user_time_us = task->user_time_us;
     req.system_time_us = task->system_time_us;
@@ -854,7 +859,10 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     req.task_flags |= task->domain_hard ? TASK_FLAG_DOMAIN_HARD : 0;
     req.task_flags |= task->wki_prefer_inline ? TASK_FLAG_WKI_PREFER_INLINE : 0;
     req.task_flags |= task->wki_skip_legacy_placement ? TASK_FLAG_WKI_SKIP_LEGACY_PLACEMENT : 0;
-    req.pagemap = task->pagemap;
+    // A Task ref keeps the Task object alive, but process exit is still allowed
+    // to destroy and release task->pagemap immediately. Until coredump owns or
+    // pins page-table pages separately, keep async dumps to metadata + ELF bytes.
+    req.pagemap = CAPTURE_USER_MEMORY_SNAPSHOT ? task->pagemap : nullptr;
     req.user_rsp = frame.rsp;
     req.timestamp = ker::mod::time::get_ticks();
     req.task_ptr = task;

@@ -14,6 +14,7 @@
 #include <net/wki/peer.hpp>
 #include <net/wki/remotable.hpp>
 #include <net/wki/remote_compute.hpp>
+#include <net/wki/remote_ipc.hpp>
 #include <net/wki/remote_net.hpp>
 #include <net/wki/remote_vfs.hpp>
 #include <net/wki/routing.hpp>
@@ -801,6 +802,10 @@ void wki_peer_fence_impl(WkiPeer* peer, bool notify_connected_peers) {
     // Clean up remote compute tasks and load cache for this peer
     wki_remote_compute_cleanup_for_peer(fenced_id);
 
+    // Clean up remote IPC exports/proxies after compute waiters have been
+    // finalized so fenced proxy tasks cannot leave pipe state alive.
+    wki_ipc_cleanup_for_peer(fenced_id);
+
     // Destroy all shared memory zones with this peer
     wki_zones_destroy_for_peer(fenced_id);
 
@@ -924,7 +929,6 @@ uint64_t s_next_heartbeat_send_deadline = 0;                         // NOLINT(c
 constexpr uint64_t HELLO_DISCOVERY_BROADCAST_INTERVAL_US = 1000000;  // 1 second
 constexpr uint64_t HELLO_STABLE_BROADCAST_INTERVAL_US = 30000000;    // 30 seconds
 constexpr uint64_t VFS_FD_GC_INTERVAL_US = 10000000;                 // 10 seconds
-constexpr uint8_t WKI_PEER_FENCE_PROBE_ROUNDS = 4;
 
 // Simple xorshift64 for jitter generation (not cryptographic, just for timing variance)
 auto wki_jitter_rand() -> uint64_t {
