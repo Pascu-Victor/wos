@@ -116,6 +116,7 @@ UNIT_TESTS=(
     netpoll_backlog_source_test
     futex_source_test
     waitpid_source_test
+    phys_source_test
     wki_timer_source_test
     wki_wait_source_test
     wki_dev_server_source_test

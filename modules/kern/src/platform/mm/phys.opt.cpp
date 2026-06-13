@@ -316,7 +316,12 @@ auto select_internal_reservation(uint64_t base, uint64_t length, uint64_t reques
     uint64_t const ALIGNED_START = page_align_up(base);
     uint64_t const ALIGNED_END = page_align_down(END);
     uint64_t const NEEDED = page_align_up(requested_size);
-    if (ALIGNED_START >= ALIGNED_END || NEEDED == 0 || NEEDED > ALIGNED_END - ALIGNED_START) {
+    if (ALIGNED_START == 0 || ALIGNED_START >= ALIGNED_END || NEEDED == 0) {
+        return false;
+    }
+
+    uint64_t const AVAILABLE = ALIGNED_END - ALIGNED_START;
+    if (NEEDED > AVAILABLE || AVAILABLE - NEEDED < paging::PAGE_SIZE) {
         return false;
     }
 
@@ -971,7 +976,17 @@ auto selftest_internal_reservation_carveout_preserves_page_alignment() -> bool {
     }
 
     PhysRange too_small{};
-    return !select_internal_reservation(0x1FFF, paging::PAGE_SIZE, paging::PAGE_SIZE, too_small);
+    if (select_internal_reservation(0x1FFF, paging::PAGE_SIZE, paging::PAGE_SIZE, too_small)) {
+        return false;
+    }
+
+    PhysRange zero_base{};
+    if (select_internal_reservation(0, paging::PAGE_SIZE * 8, paging::PAGE_SIZE, zero_base)) {
+        return false;
+    }
+
+    PhysRange no_spare{};
+    return !select_internal_reservation(0x1000, paging::PAGE_SIZE * 2, paging::PAGE_SIZE * 2, no_spare);
 }
 #endif
 
