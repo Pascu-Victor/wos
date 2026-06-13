@@ -11,6 +11,7 @@
 #include <net/packet.hpp>
 #include <net/proto/ethernet.hpp>
 #include <net/wki/remote_ipc.hpp>
+#include <net/wki/timer_math.hpp>
 #include <net/wki/transport_eth.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -307,7 +308,7 @@ auto region_snapshot(uint32_t rkey, RoceRegionSnapshot& out) -> bool {
 }
 
 auto wait_for_temporary_region_completion(uint32_t rkey) -> int {
-    uint64_t const DEADLINE = wki_now_us() + ROCE_RDMA_READ_TIMEOUT_US;
+    uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), ROCE_RDMA_READ_TIMEOUT_US);
     uint32_t spins = 0;
 
     while (region_is_registered(rkey)) {
@@ -521,7 +522,7 @@ auto wki_roce_region_wait_received(uint32_t rkey, uint32_t len, uint64_t timeout
         return region_is_registered(rkey);
     }
 
-    uint64_t const DEADLINE = wki_now_us() + timeout_us;
+    uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), timeout_us);
     uint32_t spins = 0;
     while (wki_now_us() < DEADLINE) {
         if (region_received_at_least(rkey, len)) {
@@ -549,7 +550,7 @@ auto wki_roce_region_wait_tagged_write(uint32_t rkey, uint16_t cookie, uint32_t 
         return region_is_registered(rkey);
     }
 
-    uint64_t const DEADLINE = wki_now_us() + timeout_us;
+    uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), timeout_us);
     uint32_t spins = 0;
     while (wki_now_us() < DEADLINE) {
         if (region_tagged_write_received_at_least(rkey, cookie, len)) {
