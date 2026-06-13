@@ -38,6 +38,7 @@ uint8_t g_block_attach_next_cookie = 1;                  // NOLINT(cppcoreguidel
 constexpr size_t MAX_PROXY_SCRATCH = 64;
 constexpr uint64_t DEV_PROXY_CONTENTION_SLEEP_US = 1000;
 constexpr uint64_t DEV_PROXY_SLOT_WAIT_TIMEOUT_US = WKI_DEV_PROXY_TIMEOUT_US;
+constexpr uint64_t DEV_PROXY_BULK_WAIT_TIMEOUT_US = wki_saturating_mul_us(WKI_DEV_PROXY_TIMEOUT_US, 4);
 
 auto tag_completion(ProxyBlockState* state, uint32_t tag) -> ProxyBlockState::TagCompletion& { return state->tag_completions.at(tag); }
 
@@ -673,7 +674,7 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
 
     // -- 3. Wait for completion ----------------------------------------------
     WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-    uint64_t const DEADLINE = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+    uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
     BlkCqEntry cqe = {};
     bool got_cqe = false;
 
@@ -914,7 +915,7 @@ auto remote_block_write_rdma(ProxyBlockState* state, uint64_t block, uint32_t co
 
         // Spin-wait for CQE with matching tag
         WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-        uint64_t const DEADLINE = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+        uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
         BlkCqEntry cqe = {};
         bool got_cqe = false;
 
@@ -1040,7 +1041,7 @@ auto remote_block_flush_rdma(ProxyBlockState* state) -> int {
 
     // Spin-wait for CQE
     WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-    uint64_t const DEADLINE = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+    uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
     BlkCqEntry cqe = {};
     bool got_cqe = false;
 
@@ -1181,7 +1182,7 @@ void rdma_batch_signal(ProxyBlockState* state) {
 auto rdma_batch_collect(ProxyBlockState* state, const std::array<BatchEntry, WKI_DEV_PROXY_MAX_BATCH>& entries, uint32_t count,
                         bool blocking) -> int {
     WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-    uint64_t const DEADLINE = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+    uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
 
     for (;;) {
         // Count completed entries
@@ -1503,7 +1504,7 @@ auto remote_block_bulk_read_rdma(ProxyBlockState* state, uint64_t lba, uint32_t 
 
         // Wait for completion - server RDMA-writes data into our staging buffer
         WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-        uint64_t const DEADLINE = wki_now_us() + (WKI_DEV_PROXY_TIMEOUT_US * 4);  // larger timeout for bulk
+        uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), DEV_PROXY_BULK_WAIT_TIMEOUT_US);
         BlkCqEntry cqe = {};
         bool got_cqe = false;
 
@@ -1627,7 +1628,7 @@ auto remote_block_bulk_write_rdma(ProxyBlockState* state, uint64_t lba, uint32_t
 
         // Wait for completion
         WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-        uint64_t const DEADLINE = wki_now_us() + (WKI_DEV_PROXY_TIMEOUT_US * 4);
+        uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), DEV_PROXY_BULK_WAIT_TIMEOUT_US);
         BlkCqEntry cqe = {};
         bool got_cqe = false;
 
@@ -1869,7 +1870,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
     if (state->rdma_zone_id != 0) {
         mod::dbg::log("[WKI] Dev proxy attach ACK received, waiting for RDMA zone: node=0x%04x res_id=%u zone_id=0x%08x", owner_node,
                       resource_id, state->rdma_zone_id);
-        uint64_t const ZONE_DEADLINE = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+        uint64_t const ZONE_DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
         WkiZone const* zone = nullptr;
 
         // Wait for the RDMA zone to appear (server creates it, zone negotiation completes)
@@ -1897,7 +1898,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
             // wait for zone->remote_rkey to become non-zero before we can do any
             // RDMA operations targeting the server's zone memory.
             if (state->rdma_roce) {
-                uint64_t const RKEY_DEADLINE = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+                uint64_t const RKEY_DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
                 while (zone->remote_rkey == 0 && wki_now_us() < RKEY_DEADLINE) {
                     asm volatile("pause" ::: "memory");
                     // Drive NIC + WKI RX so the rkey-exchange notification can be processed
@@ -1922,7 +1923,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
 
             // Wait for server_ready flag in ring header
             auto* ring_hdr = blk_ring_header(state->rdma_zone_ptr);
-            uint64_t const READY_DEADLINE = wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US;
+            uint64_t const READY_DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
             while (ring_hdr->server_ready == 0 && wki_now_us() < READY_DEADLINE) {
                 asm volatile("pause" ::: "memory");
 

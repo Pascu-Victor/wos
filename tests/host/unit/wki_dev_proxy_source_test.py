@@ -136,6 +136,49 @@ def test_proxy_op_slot_wait_is_bounded() -> None:
         fail("prepare_block_op_wait must not contain its own unbounded contention sleep loop")
 
 
+def test_rdmaring_wait_deadlines_are_saturating() -> None:
+    source = DEV_PROXY_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "constexpr uint64_t DEV_PROXY_BULK_WAIT_TIMEOUT_US = wki_saturating_mul_us(WKI_DEV_PROXY_TIMEOUT_US, 4);",
+            "wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US)",
+            "wki_future_deadline_us(wki_now_us(), DEV_PROXY_BULK_WAIT_TIMEOUT_US)",
+        ],
+        "dev proxy RDMA deadline helper use",
+    )
+
+    forbidden = [
+        "wki_now_us() + WKI_DEV_PROXY_TIMEOUT_US",
+        "wki_now_us() + (WKI_DEV_PROXY_TIMEOUT_US * 4)",
+        "WKI_DEV_PROXY_TIMEOUT_US * 4",
+    ]
+    present = [token for token in forbidden if token in source]
+    if present:
+        fail("dev proxy waits must not use wrapping deadline arithmetic: " + ", ".join(present))
+
+    for function in [
+        "remote_block_read_rdma",
+        "remote_block_write_rdma",
+        "remote_block_flush_rdma",
+        "rdma_batch_collect",
+        "remote_block_bulk_read_rdma",
+        "remote_block_bulk_write_rdma",
+    ]:
+        body = function_body(source, function)
+        if "uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us()," not in body:
+            fail(f"{function} must build wait deadlines with wki_future_deadline_us")
+
+    attach_body = function_body(source, "wki_dev_proxy_attach_block")
+    for token in [
+        "uint64_t const ZONE_DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US)",
+        "uint64_t const RKEY_DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US)",
+        "uint64_t const READY_DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US)",
+    ]:
+        if token not in attach_body:
+            fail(f"wki_dev_proxy_attach_block is missing saturating deadline: {token}")
+
+
 def test_fence_wait_uses_ordered_lifecycle_helpers() -> None:
     body = function_body(DEV_PROXY_CPP.read_text(), "wait_for_fence_lift")
     required = [
@@ -248,6 +291,7 @@ def main() -> None:
     test_lifecycle_helpers_use_acquire_release()
     test_lifecycle_flags_are_only_accessed_through_helpers()
     test_proxy_op_slot_wait_is_bounded()
+    test_rdmaring_wait_deadlines_are_saturating()
     test_fence_wait_uses_ordered_lifecycle_helpers()
     test_timeout_marks_inactive_with_release_store()
     test_dev_proxy_selftest_declared()
