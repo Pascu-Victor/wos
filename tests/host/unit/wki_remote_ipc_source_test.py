@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+
+import re
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[3]
+REMOTE_IPC_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_ipc.cpp"
+REMOTE_IPC_SOCKET_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_ipc_socket.cpp"
+REMOTE_IPC_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_ipc.hpp"
+WKI_WAIT_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_wait_ktest.cpp"
+
+
+def fail(message: str) -> None:
+    raise AssertionError(message)
+
+
+def function_body(source: str, name: str) -> str:
+    match = re.search(rf"\b(?:void|auto)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>*]+)?\s*\{{", source)
+    if match is None:
+        fail(f"missing function {name}")
+
+    depth = 1
+    pos = match.end()
+    while pos < len(source) and depth > 0:
+        if source[pos] == "{":
+            depth += 1
+        elif source[pos] == "}":
+            depth -= 1
+        pos += 1
+    if depth != 0:
+        fail(f"unterminated function {name}")
+    return source[match.end() : pos - 1]
+
+
+def require_order(body: str, before: str, after: str, context: str) -> None:
+    before_pos = body.find(before)
+    after_pos = body.find(after)
+    if before_pos < 0 or after_pos < 0 or before_pos >= after_pos:
+        fail(f"{context}: expected {before!r} before {after!r}")
+
+
+def test_poll_wake_drains_all_batches() -> None:
+    body = function_body(REMOTE_IPC_CPP.read_text(), "wki_ipc_proxy_wake_poll_waiters")
+    required = [
+        "while (true)",
+        "proxy_collect_waiters_locked(proxy->poll_waiters, pending_waiters, &pending_waiter_count)",
+        "if (pending_waiter_count == 0)",
+        "proxy_reschedule_waiters(pending_waiters, pending_waiter_count)",
+    ]
+    missing = [token for token in required if token not in body]
+    if missing:
+        fail("poll waiter wake path must drain every fixed-size batch: " + ", ".join(missing))
+    require_order(body, "proxy->lock.unlock_irqrestore(IRQF);", "proxy_reschedule_waiters", "poll wake lock release")
+
+
+def test_inactive_proxy_poll_reports_terminal_readiness() -> None:
+    pipe_body = function_body(REMOTE_IPC_CPP.read_text(), "proxy_pipe_poll_check")
+    socket_body = function_body(REMOTE_IPC_SOCKET_CPP.read_text(), "proxy_socket_poll_check")
+
+    pipe_required = [
+        "!proxy->active.load(std::memory_order_acquire)",
+        "return dev::pty::POLLHUP",
+        "return dev::pty::POLLERR",
+    ]
+    socket_required = [
+        "!proxy->active.load(std::memory_order_acquire)",
+        "return 0x0008 | 0x0010",
+    ]
+    missing = [token for token in pipe_required if token not in pipe_body]
+    missing += [token for token in socket_required if token not in socket_body]
+    if missing:
+        fail("inactive IPC proxy poll paths must report terminal readiness: " + ", ".join(missing))
+
+
+def test_epoll_close_releases_lookup_ref_after_detach() -> None:
+    body = function_body(REMOTE_IPC_CPP.read_text(), "proxy_epoll_close")
+    require_order(body, "proxy = find_proxy_by_endpoint_locked(HOME_NODE, resource_id);", "wki_ipc_detach_proxy_file(f, proxy);", "epoll lookup")
+    detach_pos = body.find("wki_ipc_detach_proxy_file(f, proxy);")
+    if detach_pos < 0 or "proxy_release(proxy);" not in body[detach_pos:]:
+        fail("epoll close must release the lookup ref after detaching the proxy file")
+
+
+def test_proxy_lookup_is_peer_scoped() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    lookup_body = function_body(remote_ipc, "find_proxy_by_endpoint_locked")
+    if "find_proxy_by_endpoint_locked(uint16_t home_node, uint32_t resource_id)" not in remote_ipc:
+        fail("IPC proxy lookup helper must accept home_node and resource_id")
+    lookup_required = [
+        "proxy->home_node == home_node",
+        "proxy->resource_id == resource_id",
+        "proxy->refcount.fetch_add(1, std::memory_order_acq_rel)",
+    ]
+    missing = [token for token in lookup_required if token not in lookup_body]
+    if missing:
+        fail("IPC proxy lookup must be keyed by home node and resource id: " + ", ".join(missing))
+    if "find_proxy_by_resource_id" in remote_ipc:
+        fail("IPC proxy lookup must not use resource_id-only helpers")
+
+    path_required = {
+        "should_defer_ipc_dev_op": "find_proxy_by_endpoint_locked(src_node, resource_id)",
+        "proxy_epoll_close": "find_proxy_by_endpoint_locked(HOME_NODE, resource_id)",
+        "wki_ipc_epoll_ctl_forward": "find_proxy_by_endpoint_locked(HOME_NODE, epf->resource_id)",
+        "wki_ipc_handle_dev_op_resp": "find_proxy_by_endpoint_locked(src_node, poll_resource_id)",
+    }
+    for name, token in path_required.items():
+        body = function_body(remote_ipc, name)
+        if token not in body:
+            fail(f"{name} must use peer-scoped IPC proxy lookup: {token}")
+
+    dev_req_body = function_body(remote_ipc, "handle_ipc_dev_op_req_inline")
+    if dev_req_body.count("find_proxy_by_endpoint_locked(hdr->src_node, resource_id)") < 2:
+        fail("IPC DEV_OP request data/close paths must use source-node-scoped proxy lookup")
+
+    resp_body = function_body(remote_ipc, "wki_ipc_socket_handle_dev_op_resp")
+    response_required = [
+        "p->active.load(std::memory_order_acquire)",
+        "p->home_node == src_node",
+        "p->resource_id == resource_id",
+    ]
+    missing = [token for token in response_required if token not in resp_body]
+    if missing:
+        fail("IPC DEV_OP response lookup must be scoped to the response source: " + ", ".join(missing))
+
+
+def test_export_pipe_write_uses_nonmutating_nonblocking_view() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    view_body = function_body(remote_ipc, "init_nonblocking_pipe_write_view")
+    write_body = function_body(remote_ipc, "export_pipe_write_nonblocking")
+
+    view_required = [
+        "view.open_flags = source.open_flags | WKI_IPC_O_NONBLOCK",
+        "view.private_data = source.private_data",
+        "view.fops = source.fops",
+        "view.pos = source.pos",
+        "view.stream_cache_attachment = source.stream_cache_attachment",
+        "view.cache_notify_attachment = source.cache_notify_attachment",
+    ]
+    missing = [token for token in view_required if token not in view_body]
+    if missing:
+        fail("nonblocking pipe write view must preserve backend-facing file fields: " + ", ".join(missing))
+
+    write_required = [
+        "ker::vfs::File pipe_write_view{}",
+        "ker::vfs::File* write_file = file",
+        "init_nonblocking_pipe_write_view(pipe_write_view, *file)",
+        "write_file = &pipe_write_view",
+        "write_file->fops->vfs_write(write_file, data, len, static_cast<size_t>(write_file->pos))",
+    ]
+    missing = [token for token in write_required if token not in write_body]
+    if missing:
+        fail("export pipe writes must use a local nonblocking file view: " + ", ".join(missing))
+    if "file->open_flags =" in write_body:
+        fail("export pipe writes must not mutate shared File::open_flags")
+
+
+def test_pipe_fd_open_flags_preserve_nonblocking_access_mode() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+
+    required = [
+        "constexpr int WKI_IPC_FD_ACCESS_MASK = 0x0003",
+        "constexpr int WKI_IPC_O_NONBLOCK = 04000",
+        "constexpr int WKI_IPC_FD_OPEN_FLAG_MASK = WKI_IPC_FD_ACCESS_MASK | WKI_IPC_O_NONBLOCK",
+        "ipc_fd_access_mode",
+        "ipc_fd_export_open_flags",
+        "ipc_fd_import_open_flags",
+    ]
+    missing = [token for token in required if token not in remote_ipc]
+    if missing:
+        fail("IPC fd flag export/import helpers are missing: " + ", ".join(missing))
+
+    access_body = function_body(remote_ipc, "ipc_fd_access_mode")
+    export_flags_body = function_body(remote_ipc, "ipc_fd_export_open_flags")
+    import_flags_body = function_body(remote_ipc, "ipc_fd_import_open_flags")
+    if "open_flags & WKI_IPC_FD_ACCESS_MASK" not in access_body:
+        fail("IPC fd access helper must isolate only access-mode bits")
+    if "open_flags & WKI_IPC_FD_OPEN_FLAG_MASK" not in export_flags_body:
+        fail("IPC fd export helper must preserve allowed open flags")
+    if "flags & WKI_IPC_FD_OPEN_FLAG_MASK" not in import_flags_body:
+        fail("IPC fd import helper must reject unexported flag bits")
+
+    export_body = function_body(remote_ipc, "wki_ipc_export_task_fds")
+    export_required = [
+        "uint16_t const ACCESS_MODE = ipc_fd_access_mode(file->open_flags)",
+        "if (res_type == ResourceType::IPC_PIPE && ACCESS_MODE != 0)",
+        "bool const NEEDS_DATA_PUMP = (res_type == ResourceType::IPC_PIPE && ACCESS_MODE == 0) || res_type == ResourceType::IPC_SOCKET",
+        "entry.reserved1 = ipc_fd_export_open_flags(file->open_flags)",
+        "setup_export_pipe_rdma(exp, target_node, entry)",
+    ]
+    missing = [token for token in export_required if token not in export_body]
+    if missing:
+        fail("IPC export must preserve O_NONBLOCK while classifying pipe ends by access mode: " + ", ".join(missing))
+    if "file->open_flags == 0" in export_body or "file->open_flags != 0" in export_body:
+        fail("IPC export must not classify pipe read/write ends by raw open_flags")
+
+    attach_body = function_body(remote_ipc, "wki_ipc_attach_task_fds")
+    attach_required = [
+        "int const OPEN_FLAGS = ipc_fd_import_open_flags(entry.reserved1)",
+        "uint16_t const ACCESS_MODE = ipc_fd_access_mode(OPEN_FLAGS)",
+        "proxy_file->open_flags = OPEN_FLAGS",
+        "if (ACCESS_MODE != 0 && entry.rdma_rkey != 0 && entry.rdma_offset != 0 && WKI_IPC_PIPE_RDMA_DOORBELL_ENABLED)",
+        "if (ACCESS_MODE == 0)",
+    ]
+    missing = [token for token in attach_required if token not in attach_body]
+    if missing:
+        fail("IPC attach must restore open flags but choose pipe proxy fops from access mode: " + ", ".join(missing))
+    if "entry.reserved1 & WKI_IPC_FD_ACCESS_MASK" in attach_body:
+        fail("IPC attach must not strip nonblocking flags with the access-only mask")
+
+    status_body = function_body(remote_ipc, "ipc_pipe_nonblocking_send_status")
+    status_required = [
+        "case WKI_ERR_NO_CREDITS",
+        "case WKI_ERR_BUSY",
+        "case WKI_ERR_TX_FAILED",
+        "return -EAGAIN",
+        "case WKI_ERR_NO_MEM",
+        "return -ENOMEM",
+        "return -EIO",
+    ]
+    missing = [token for token in status_required if token not in status_body]
+    if missing:
+        fail("IPC nonblocking send status must map backpressure without sleeping: " + ", ".join(missing))
+
+    acquire_body = function_body(remote_ipc, "acquire_proxy_pipe_rdma_writer")
+    if "nonblocking || current_task_has_deliverable_signal()" not in acquire_body:
+        fail("RDMA writer acquisition must return immediately for nonblocking pipe writes")
+
+    if "auto proxy_pipe_write_rdma(ProxyIpcState* proxy, const uint8_t* src, size_t count, uint64_t callsite, bool nonblocking)" not in remote_ipc:
+        fail("RDMA pipe write helper must receive nonblocking mode")
+    rdma_body = function_body(remote_ipc, "proxy_pipe_write_rdma")
+    rdma_required = [
+        "acquire_proxy_pipe_rdma_writer(proxy, nonblocking)",
+        "return nonblocking ? -EAGAIN : -EINTR",
+        "if (nonblocking)",
+        "return sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EAGAIN)",
+    ]
+    missing = [token for token in rdma_required if token not in rdma_body]
+    if missing:
+        fail("RDMA pipe writes must not sleep when the proxy fd is nonblocking: " + ", ".join(missing))
+    require_order(rdma_body, "if (nonblocking)", "ker::mod::sched::kern_sleep_us(SLEEP_US)", "RDMA nonblocking full-ring check")
+
+    write_body = function_body(remote_ipc, "proxy_pipe_write")
+    write_required = [
+        "bool const NONBLOCKING = (f->open_flags & WKI_IPC_O_NONBLOCK) != 0",
+        "proxy_pipe_write_rdma(proxy, static_cast<const uint8_t*>(buf), count, WOS_PERF_CALLSITE(), NONBLOCKING)",
+        "if (NONBLOCKING)",
+        "ipc_pipe_nonblocking_send_status(ret)",
+    ]
+    missing = [token for token in write_required if token not in write_body]
+    if missing:
+        fail("message-path pipe writes must honor nonblocking fds before retry sleeps: " + ", ".join(missing))
+    require_order(write_body, "if (NONBLOCKING)", "pause_for_ipc_send_retry(ret, ATTEMPT)", "message nonblocking send check")
+
+
+def test_attach_fd_install_is_transactional() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    install_body = function_body(remote_ipc, "install_ipc_proxy_file")
+    attach_body = function_body(remote_ipc, "wki_ipc_attach_task_fds")
+
+    install_required = [
+        "task->fd_table_lock.lock_irqsave()",
+        "task->fd_table.lookup(fd)",
+        "task->fd_table.insert(fd, proxy_file)",
+        "IpcProxyFdInstallResult{.inserted = INSERTED, .existing = existing}",
+    ]
+    missing = [token for token in install_required if token not in install_body]
+    if missing:
+        fail("IPC attach fd install must be a locked replace operation: " + ", ".join(missing))
+
+    attach_required = [
+        "entry.local_fd >= ker::mod::sched::task::Task::FD_TABLE_SIZE",
+        "IpcProxyFdInstallResult const INSTALL = install_ipc_proxy_file(task, entry.local_fd, proxy_file)",
+        "free_uninstalled_ipc_proxy_file(proxy_file, proxy)",
+        "ker::vfs::vfs_put_file(INSTALL.existing)",
+        "g_ipc_proxies.push_back(proxy)",
+    ]
+    missing = [token for token in attach_required if token not in attach_body]
+    if missing:
+        fail("IPC attach must cleanly handle proxy fd install failure: " + ", ".join(missing))
+    if "task->fd_table.remove(entry.local_fd)" in attach_body:
+        fail("IPC attach must not remove the old fd before the proxy insert succeeds")
+    if "static_cast<void>(task->fd_table.insert(entry.local_fd, proxy_file))" in attach_body:
+        fail("IPC attach must not ignore proxy fd insert failure")
+    require_order(attach_body, "IpcProxyFdInstallResult const INSTALL", "ker::vfs::vfs_put_file(INSTALL.existing)", "attach replacement")
+    require_order(attach_body, "IpcProxyFdInstallResult const INSTALL", "g_ipc_proxies.push_back(proxy)", "attach registration")
+
+
+def test_dev_op_response_cookies_fence_stale_waiters() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    remote_socket = REMOTE_IPC_SOCKET_CPP.read_text()
+    header = REMOTE_IPC_HPP.read_text()
+
+    header_required = [
+        "uint16_t pending_wait_cookie = 0",
+        "uint16_t next_wait_cookie = 1",
+        "wki_ipc_allocate_wait_cookie_locked",
+        "wki_ipc_response_matches_pending",
+    ]
+    missing = [token for token in header_required if token not in header]
+    if missing:
+        fail("proxy control waiters must carry nonzero response cookies: " + ", ".join(missing))
+
+    response_body = function_body(remote_ipc, "wki_ipc_socket_handle_dev_op_resp")
+    if "wki_ipc_response_matches_pending(resp.op_id, resp.reserved, *target_proxy)" not in response_body:
+        fail("DEV_OP_RESP handler must match both op id and echoed response cookie")
+    if "target_proxy->pending_wait_op = 0" in response_body or "target_proxy->pending_wait_cookie = 0" in response_body:
+        fail("DEV_OP_RESP handler must keep the busy slot occupied until the waiter consumes the response")
+    if "wki_ipc_consume_pending_wait_response" not in remote_ipc:
+        fail("proxy control waiters must consume and clear side-band responses through the shared helper")
+
+    server_body = function_body(remote_ipc, "handle_ipc_dev_op_req_inline")
+    server_required = [
+        "ipc_op_uses_response_cookie(OP_ID)",
+        "std::memcpy(&request_cookie, op_data, WKI_IPC_OP_COOKIE_BYTES)",
+        "resp.reserved = response_cookie",
+        "send_ipc_dev_op_error_response(hdr, op_id, resource_id, -ENOMEM, REQUEST_COOKIE)",
+        "send_ipc_dev_op_error_response(hdr, op_id, resource_id, -EAGAIN, REQUEST_COOKIE)",
+        "resp->reserved = request_cookie",
+        "ctl_resp.reserved = request_cookie",
+        "wake_resp.reserved = request_cookie",
+        "pty_resp.reserved = request_cookie",
+    ]
+    missing = [token for token in server_required if token not in remote_ipc]
+    if missing:
+        fail("home-side IPC control responses must echo request cookies: " + ", ".join(missing))
+
+    socket_body = function_body(remote_socket, "send_socket_op_sync")
+    pty_body = function_body(remote_ipc, "proxy_pty_ioctl")
+    epoll_body = function_body(remote_ipc, "wki_ipc_epoll_ctl_forward")
+    sender_required = [
+        (socket_body, "RID_SIZE + WKI_IPC_OP_COOKIE_BYTES + extra_len", "socket request size"),
+        (socket_body, "proxy->pending_wait_cookie = op_cookie", "socket pending cookie"),
+        (socket_body, "std::memcpy(msg + sizeof(DevOpReqPayload) + RID_SIZE, &op_cookie, WKI_IPC_OP_COOKIE_BYTES)", "socket cookie write"),
+        (
+            socket_body,
+            "wki_ipc_consume_pending_wait_response(proxy, &wait, op_id, op_cookie",
+            "socket consume keeps busy slot until response is read",
+        ),
+        (pty_body, "WKI_IPC_OP_COOKIE_BYTES + EXTRA", "pty request size"),
+        (pty_body, "proxy->pending_wait_cookie = op_cookie", "pty pending cookie"),
+        (
+            pty_body,
+            "wki_ipc_consume_pending_wait_response(proxy, &wait, OP_PTY_IOCTL, op_cookie",
+            "pty consume keeps busy slot until response is read",
+        ),
+        (epoll_body, "RID_SIZE + WKI_IPC_OP_COOKIE_BYTES + EXTRA_SIZE", "epoll request size"),
+        (epoll_body, "proxy->pending_wait_cookie = op_cookie", "epoll pending cookie"),
+        (
+            epoll_body,
+            "wki_ipc_consume_pending_wait_response(proxy, &wait, OP_EPOLL_CTL, op_cookie",
+            "epoll consume keeps busy slot until response is read",
+        ),
+    ]
+    for body, token, context in sender_required:
+        if token not in body:
+            fail(f"{context}: missing {token!r}")
+
+
+def test_peer_cleanup_drains_deferred_dev_op_work() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+
+    worker_struct_required = [
+        "uint64_t cleanup_epoch = 0",
+        "std::array<IpcPeerCleanupEpoch, WKI_MAX_PEERS> g_ipc_peer_cleanup_epochs",
+        "begin_ipc_peer_dev_op_cleanup_locked",
+        "end_ipc_peer_dev_op_cleanup_locked",
+        "ipc_dev_op_work_is_fenced_locked",
+    ]
+    missing = [token for token in worker_struct_required if token not in remote_ipc]
+    if missing:
+        fail("deferred IPC DEV_OP work must carry peer cleanup epoch fencing: " + ", ".join(missing))
+
+    enqueue_body = function_body(remote_ipc, "enqueue_ipc_dev_op_work")
+    if "work->cleanup_epoch = ipc_peer_cleanup_epoch_locked(hdr->src_node)" not in enqueue_body:
+        fail("deferred IPC DEV_OP enqueue must snapshot the source peer cleanup epoch")
+
+    worker_body = function_body(remote_ipc, "ipc_dev_op_worker_thread_fn")
+    require_order(
+        worker_body,
+        "bool const FENCED = ipc_dev_op_work_is_fenced_locked(work)",
+        "handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len)",
+        "worker stale work check",
+    )
+    if "free_ipc_dev_op_work(work);" not in worker_body[worker_body.find("bool const FENCED") :]:
+        fail("deferred IPC DEV_OP worker must free stale work without handling it")
+
+    batch = remote_ipc[remote_ipc.find("struct IpcPeerCleanupBatch") : remote_ipc.find("auto export_needs_peer_cleanup_locked")]
+    for snippet in [
+        "std::array<IpcDevOpWork*, WKI_IPC_DEV_OP_CLEANUP_BATCH> detached_dev_ops",
+        "size_t detached_dev_op_count = 0",
+    ]:
+        if snippet not in batch:
+            fail(f"peer cleanup batch must carry detached DEV_OP work: {snippet}")
+
+    collect_body = function_body(remote_ipc, "collect_ipc_peer_cleanup_batch_locked")
+    for snippet in [
+        "for (auto& queue : g_ipc_dev_op_queues)",
+        "work->hdr.src_node != node_id",
+        "batch.detached_dev_ops.at(batch.detached_dev_op_count++) = work",
+        "it = queue.erase(it)",
+    ]:
+        if snippet not in collect_body:
+            fail(f"peer cleanup must drain queued deferred DEV_OP work for the fenced peer: {snippet}")
+
+    drain_body = function_body(remote_ipc, "drain_ipc_peer_cleanup_batch")
+    if "std::span(batch.detached_dev_ops.data(), batch.detached_dev_op_count)" not in drain_body:
+        fail("peer cleanup drain must iterate detached DEV_OP work")
+    if "free_ipc_dev_op_work(work)" not in drain_body:
+        fail("peer cleanup drain must free detached DEV_OP work")
+
+    cleanup_body = function_body(remote_ipc, "wki_ipc_cleanup_for_peer")
+    require_order(
+        cleanup_body,
+        "begin_ipc_peer_dev_op_cleanup_locked(node_id)",
+        "collect_ipc_peer_cleanup_batch_locked(node_id, batch)",
+        "cleanup begin epoch",
+    )
+    require_order(
+        cleanup_body,
+        "collect_ipc_peer_cleanup_batch_locked(node_id, batch)",
+        "end_ipc_peer_dev_op_cleanup_locked(node_id)",
+        "cleanup end epoch",
+    )
+
+
+def test_ipc_selftests_are_declared_and_registered() -> None:
+    header = REMOTE_IPC_HPP.read_text()
+    ktest = WKI_WAIT_KTEST.read_text()
+    required = [
+        "wki_ipc_selftest_cleanup_for_peer_drains_deferred_dev_ops",
+        "wki_ipc_selftest_poll_wake_drains_over_capacity",
+        "wki_ipc_selftest_inactive_proxy_poll_is_terminal",
+        "wki_ipc_selftest_epoll_close_releases_lookup_ref",
+        "wki_ipc_selftest_nonblocking_pipe_write_view_preserves_source_flags",
+        "wki_ipc_selftest_pipe_fd_flags_preserve_nonblocking_access_mode",
+        "wki_ipc_selftest_attach_insert_failure_preserves_existing_fd",
+        "wki_ipc_selftest_dev_op_response_cookie_fences_stale_completion",
+        "wki_ipc_selftest_dev_op_response_uses_home_node_identity",
+    ]
+    for token in required:
+        if token not in header:
+            fail(f"missing selftest declaration {token}")
+        if token not in ktest:
+            fail(f"missing KTEST coverage for {token}")
+
+
+def main() -> None:
+    test_poll_wake_drains_all_batches()
+    test_inactive_proxy_poll_reports_terminal_readiness()
+    test_epoll_close_releases_lookup_ref_after_detach()
+    test_proxy_lookup_is_peer_scoped()
+    test_export_pipe_write_uses_nonmutating_nonblocking_view()
+    test_pipe_fd_open_flags_preserve_nonblocking_access_mode()
+    test_attach_fd_install_is_transactional()
+    test_dev_op_response_cookies_fence_stale_waiters()
+    test_peer_cleanup_drains_deferred_dev_op_work()
+    test_ipc_selftests_are_declared_and_registered()
+    print("WKI remote IPC source invariants hold")
+
+
+if __name__ == "__main__":
+    main()

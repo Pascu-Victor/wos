@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <minimalist_malloc/mini_malloc.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 
 namespace km = ker::mod::mm::dyn::kmalloc;

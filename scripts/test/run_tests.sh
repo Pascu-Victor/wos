@@ -94,8 +94,53 @@ err()   { printf '\033[1;31m==>\033[0m %s\n' "$*" >&2; }
 
 timestamp() { date '+%Y-%m-%d_%H%M%S'; }
 
-FUZZ_TARGETS=(wki_wire_fuzz data_struct_fuzz tcp_fuzz xfs_format_fuzz wki_routing_fuzz)
-UNIT_TESTS=(wki_wire_test wki_routing_test data_struct_test tcp_test xfs_format_test wki_channel_test)
+FUZZ_TARGETS=(wki_wire_fuzz data_struct_fuzz tcp_fuzz xfs_format_fuzz wki_routing_fuzz slab_fuzz)
+UNIT_TESTS=(
+    host_test_manifest_test
+    ktest_cov_test
+    ktest_manifest_test
+    runtime_test_audit_test
+    testd_manifest_test
+    testprog_source_test
+    httpd_source_test
+    top_source_test
+    init_source_test
+    strace_source_test
+    journal_source_test
+    wkictl_source_test
+    perf_source_test
+    memacc_source_test
+    renderbench_source_test
+    debugserver_source_test
+    sftp_timeout_source_test
+    netpoll_backlog_source_test
+    futex_source_test
+    waitpid_source_test
+    wki_timer_source_test
+    wki_wait_source_test
+    wki_dev_server_source_test
+    wki_dev_proxy_source_test
+    wki_remote_ipc_source_test
+    wki_zone_source_test
+    wki_peer_source_test
+    wki_remote_compute_source_test
+    wki_remote_vfs_source_test
+    vfs_mount_lifetime_source_test
+    wki_wire_test
+    wki_routing_test
+    data_struct_test
+    tcp_test
+    xfs_format_test
+    wki_channel_test
+    wki_peer_liveness_test
+    wki_event_test
+    renderbench_options_test
+    bitmap_test
+    net_checksum_test
+    util_list_test
+    crc32c_test
+    buffer_cache_test
+)
 
 list_targets() {
     echo "Unit tests:"
@@ -126,8 +171,12 @@ do_configure() {
         -DCMAKE_EXE_LINKER_FLAGS="$HOST_CMAKE_EXTRA_FLAGS" \
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
-    # Symlink compile_commands.json into the repo root for clangd.
-    ln -sf "$BUILD_DIR/compile_commands.json" \
+    # Keep stable repo-local entry points for clangd regardless of where the
+    # actual host-test build directory lives.
+    mkdir -p "$WOS_ROOT/build_tests"
+    ln -sfT "$BUILD_DIR/compile_commands.json" \
+           "$WOS_ROOT/build_tests/compile_commands.json" 2>/dev/null || true
+    ln -sfT "$BUILD_DIR/compile_commands.json" \
            "$WOS_ROOT/compile_commands_tests.json" 2>/dev/null || true
 }
 
@@ -365,6 +414,8 @@ do_report() {
 do_clean() {
     info "Removing $BUILD_DIR"
     rm -rf "$BUILD_DIR"
+    rm -f "$WOS_ROOT/build_tests/compile_commands.json"
+    rmdir "$WOS_ROOT/build_tests" 2>/dev/null || true
     ok "Clean"
 }
 

@@ -52,10 +52,17 @@ include(CheckCXXSourceCompiles)
 set(CMAKE_REQUIRED_FLAGS "-fsanitize=fuzzer-no-link")
 check_cxx_source_compiles("int main() { return 0; }" HAS_FUZZER_SANITIZER)
 unset(CMAKE_REQUIRED_FLAGS)
+if(NOT HAS_FUZZER_SANITIZER)
+    message(FATAL_ERROR "Host fuzz smoke tests require compiler support for -fsanitize=fuzzer-no-link")
+endif()
 
 # ---------------------------------------------------------------------------
 # Helper: add a unit test target
 # ---------------------------------------------------------------------------
+
+option(WOS_HOST_TEST_DISABLE_LSAN "Disable LeakSanitizer for host CTest runs that execute under ptrace-style wrappers" ON)
+set(WOS_HOST_FUZZ_SMOKE_RUNS "16" CACHE STRING "Number of LibFuzzer iterations for host CTest smoke runs")
+set(WOS_HOST_FUZZ_SMOKE_MAX_LEN "256" CACHE STRING "Maximum generated input size for host CTest fuzz smoke runs")
 
 function(wos_add_unit_test name)
     cmake_parse_arguments(ARG "" "" "SOURCES;KERN_SOURCES" ${ARGN})
@@ -72,6 +79,12 @@ function(wos_add_unit_test name)
     target_link_options(${name} PRIVATE -fsanitize=address,undefined)
 
     add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "host;unit")
+    if(WOS_HOST_TEST_DISABLE_LSAN)
+        set_tests_properties(${name} PROPERTIES
+            ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0;LSAN_OPTIONS=detect_leaks=0"
+        )
+    endif()
 endfunction()
 
 # ---------------------------------------------------------------------------
@@ -79,11 +92,6 @@ endfunction()
 # ---------------------------------------------------------------------------
 
 function(wos_add_fuzz_target name)
-    if(NOT HAS_FUZZER_SANITIZER)
-        message(STATUS "Skipping fuzz target ${name} — compiler lacks -fsanitize=fuzzer")
-        return()
-    endif()
-
     cmake_parse_arguments(ARG "" "" "SOURCES;KERN_SOURCES" ${ARGN})
 
     add_executable(${name} ${ARG_SOURCES} ${ARG_KERN_SOURCES})
@@ -95,6 +103,26 @@ function(wos_add_fuzz_target name)
         -Wall -Wextra
     )
     target_link_options(${name} PRIVATE -fsanitize=address,undefined,fuzzer)
+
+    set(fuzz_artifact_dir "${CMAKE_CURRENT_BINARY_DIR}/fuzz-artifacts")
+    file(MAKE_DIRECTORY "${fuzz_artifact_dir}")
+
+    add_test(
+        NAME ${name}_smoke
+        COMMAND ${name}
+                -runs=${WOS_HOST_FUZZ_SMOKE_RUNS}
+                -max_len=${WOS_HOST_FUZZ_SMOKE_MAX_LEN}
+                -artifact_prefix=${fuzz_artifact_dir}/${name}-
+    )
+    set_tests_properties(${name}_smoke PROPERTIES
+        LABELS "host;fuzz;smoke"
+        TIMEOUT 20
+    )
+    if(WOS_HOST_TEST_DISABLE_LSAN)
+        set_tests_properties(${name}_smoke PROPERTIES
+            ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0;LSAN_OPTIONS=detect_leaks=0"
+        )
+    endif()
 endfunction()
 
 # ---------------------------------------------------------------------------

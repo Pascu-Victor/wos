@@ -99,9 +99,11 @@ TEST(ChecksumPseudoIPv6, SelfValidating) {
     std::array<uint8_t, 16> src{}, dst{};
     src[15] = 1;  // ::1
     dst[15] = 2;  // ::2
+    auto const src_addr = ker::net::proto::IPv6Address::from_bytes(src);
+    auto const dst_addr = ker::net::proto::IPv6Address::from_bytes(dst);
     uint8_t segment[4] = {0x00, 0x50, 0x00, 0x00};
-    uint16_t cs = ker::net::checksum_pseudo_ipv6(src, dst, 6, 4, segment, 4);
+    uint16_t cs = ker::net::checksum_pseudo_ipv6(src_addr, dst_addr, 6, 4, segment, 4);
     memcpy(segment + 2, &cs, 2);
-    uint16_t verify = ker::net::checksum_pseudo_ipv6(src, dst, 6, 4, segment, 4);
+    uint16_t verify = ker::net::checksum_pseudo_ipv6(src_addr, dst_addr, 6, 4, segment, 4);
     EXPECT_EQ(verify, 0x0000u);
 }

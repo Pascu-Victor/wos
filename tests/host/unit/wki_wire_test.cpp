@@ -3,8 +3,9 @@
 // and payload layout assertions.
 
 #include <gtest/gtest.h>
-#include <net/wki/wire.hpp>
+
 #include <cstring>
+#include <net/wki/wire.hpp>
 
 using namespace ker::net::wki;
 
@@ -12,17 +13,11 @@ using namespace ker::net::wki;
 // Header size and layout
 // ---------------------------------------------------------------------------
 
-TEST(WkiWire, HeaderIs32Bytes) {
-    EXPECT_EQ(sizeof(WkiHeader), 32u);
-}
+TEST(WkiWire, HeaderIs32Bytes) { EXPECT_EQ(sizeof(WkiHeader), 32u); }
 
-TEST(WkiWire, HelloPayloadIs96Bytes) {
-    EXPECT_EQ(sizeof(HelloPayload), 96u);
-}
+TEST(WkiWire, HelloPayloadIs96Bytes) { EXPECT_EQ(sizeof(HelloPayload), 96u); }
 
-TEST(WkiWire, HeartbeatPayloadIs16Bytes) {
-    EXPECT_EQ(sizeof(HeartbeatPayload), 16u);
-}
+TEST(WkiWire, HeartbeatPayloadIs16Bytes) { EXPECT_EQ(sizeof(HeartbeatPayload), 16u); }
 
 // ---------------------------------------------------------------------------
 // Version/flags byte helpers
@@ -38,9 +33,9 @@ TEST(WkiWire, VersionFlagsRoundTrip) {
     }
 }
 
-TEST(WkiWire, CurrentVersionIs1) {
+TEST(WkiWire, CurrentVersionMatchesConstant) {
     uint8_t vf = wki_version_flags(WKI_VERSION, 0);
-    EXPECT_EQ(wki_version(vf), 1);
+    EXPECT_EQ(wki_version(vf), WKI_VERSION);
     EXPECT_EQ(wki_flags(vf), 0);
 }
 
@@ -80,8 +75,8 @@ TEST(WkiWire, SeqArithmeticWraparound) {
 
 TEST(WkiWire, SeqBetween) {
     EXPECT_TRUE(seq_between(5, 3, 10));
-    EXPECT_TRUE(seq_between(3, 3, 10));   // inclusive low
-    EXPECT_FALSE(seq_between(10, 3, 10)); // exclusive high
+    EXPECT_TRUE(seq_between(3, 3, 10));    // inclusive low
+    EXPECT_FALSE(seq_between(10, 3, 10));  // exclusive high
     EXPECT_FALSE(seq_between(2, 3, 10));
 
     // Wraparound
@@ -161,10 +156,10 @@ TEST(WkiWire, HelloMagicValue) {
     // Verify magic bytes spell "WKI\0"
     auto* bytes = reinterpret_cast<uint8_t*>(&hello.magic);
     // Packed struct, little-endian on x86
-    EXPECT_EQ(bytes[0], 0x00); // '\0'
-    EXPECT_EQ(bytes[1], 0x49); // 'I'
-    EXPECT_EQ(bytes[2], 0x4B); // 'K'
-    EXPECT_EQ(bytes[3], 0x57); // 'W'
+    EXPECT_EQ(bytes[0], 0x00);  // '\0'
+    EXPECT_EQ(bytes[1], 0x49);  // 'I'
+    EXPECT_EQ(bytes[2], 0x4B);  // 'K'
+    EXPECT_EQ(bytes[3], 0x57);  // 'W'
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +182,79 @@ TEST(WkiWire, MsgTypeEnumValues) {
     EXPECT_EQ(static_cast<uint8_t>(MsgType::EVENT_PUBLISH), 0x32);
     EXPECT_EQ(static_cast<uint8_t>(MsgType::DEV_ATTACH_REQ), 0x40);
     EXPECT_EQ(static_cast<uint8_t>(MsgType::TASK_SUBMIT), 0x50);
+}
+
+TEST(WkiWire, DevDetachMatchesBindingIdentity) {
+    DevDetachPayload detach = {};
+    detach.target_node = 0x1001;
+    detach.resource_type = static_cast<uint16_t>(ResourceType::VFS);
+    detach.resource_id = 42;
+
+    EXPECT_TRUE(wki_dev_detach_matches_binding(0x2002, ResourceType::VFS, 42, 0x2002, detach));
+    EXPECT_FALSE(wki_dev_detach_matches_binding(0x2003, ResourceType::VFS, 42, 0x2002, detach));
+    EXPECT_FALSE(wki_dev_detach_matches_binding(0x2002, ResourceType::BLOCK, 42, 0x2002, detach));
+    EXPECT_FALSE(wki_dev_detach_matches_binding(0x2002, ResourceType::VFS, 43, 0x2002, detach));
+}
+
+TEST(WkiWire, DevDetachOptionalCookieMatchesBinding) {
+    uint8_t payload[sizeof(DevDetachPayload) + WKI_DEV_DETACH_COOKIE_BYTES] = {};
+    auto* detach = reinterpret_cast<DevDetachPayload*>(payload);
+    detach->target_node = 0x1001;
+    detach->resource_type = static_cast<uint16_t>(ResourceType::NET);
+    detach->resource_id = 42;
+    payload[sizeof(DevDetachPayload)] = 0x5C;
+
+    EXPECT_EQ(wki_dev_detach_cookie_from_payload(payload, sizeof(payload)), 0x5C);
+    EXPECT_EQ(wki_dev_detach_cookie_from_payload(payload, sizeof(DevDetachPayload)), 0);
+    EXPECT_TRUE(wki_dev_detach_cookie_matches_binding(0x5C, 0x5C));
+    EXPECT_FALSE(wki_dev_detach_cookie_matches_binding(0x5C, 0));
+    EXPECT_TRUE(wki_dev_detach_cookie_matches_binding(0, 0));
+    EXPECT_FALSE(wki_dev_detach_cookie_matches_binding(0x5C, 0x5D));
+}
+
+TEST(WkiWire, DevOpResponseMatchesExpectedIdentity) {
+    DevOpRespPayload resp = {};
+    resp.op_id = OP_BLOCK_READ;
+    resp.reserved = 0x1234;
+
+    EXPECT_TRUE(wki_dev_op_response_matches_expected(OP_BLOCK_READ, 0x1234, resp));
+    EXPECT_FALSE(wki_dev_op_response_matches_expected(OP_BLOCK_WRITE, 0x1234, resp));
+    EXPECT_FALSE(wki_dev_op_response_matches_expected(OP_BLOCK_READ, 0x1235, resp));
+
+    resp.op_id = OP_NET_OPEN;
+    resp.reserved = 0xCAFE;
+    EXPECT_TRUE(wki_dev_op_response_matches_expected(OP_NET_OPEN, 0xCAFE, resp));
+    EXPECT_FALSE(wki_dev_op_response_matches_expected(OP_NET_CLOSE, 0xCAFE, resp));
+    EXPECT_FALSE(wki_dev_op_response_matches_expected(OP_NET_OPEN, 0xCAFF, resp));
+
+    resp.op_id = OP_NET_GET_STATS;
+    resp.reserved = 0xBEEF;
+    EXPECT_TRUE(wki_dev_op_response_matches_expected(OP_NET_GET_STATS, 0xBEEF, resp));
+    EXPECT_FALSE(wki_dev_op_response_matches_expected(OP_NET_GET_STATS, 0xBEEE, resp));
+}
+
+TEST(WkiWire, DevAttachAckMatchesExpectedCookie) {
+    DevAttachAckPayload ack = {};
+    ack.resource_id = 55;
+    ack.reserved = 0x7A;
+
+    EXPECT_TRUE(wki_dev_attach_ack_matches_expected(0x7A, ack));
+    EXPECT_FALSE(wki_dev_attach_ack_matches_expected(0x7B, ack));
+}
+
+TEST(WkiWire, NetNotifyHeaderMatchesExpectedCookieAndLength) {
+    NetNotifyHeader notify = {};
+    notify.magic = WKI_NET_NOTIFY_MAGIC;
+    notify.attach_cookie = 0x2A;
+    notify.data_len = 64;
+
+    EXPECT_TRUE(wki_net_notify_header_matches_expected(0x2A, notify));
+    EXPECT_FALSE(wki_net_notify_header_matches_expected(0x2B, notify));
+    EXPECT_TRUE(wki_net_notify_payload_fits(sizeof(NetNotifyHeader) + 64, notify));
+    EXPECT_FALSE(wki_net_notify_payload_fits(sizeof(NetNotifyHeader) + 63, notify));
+
+    notify.magic = 0;
+    EXPECT_FALSE(wki_net_notify_header_matches_expected(0x2A, notify));
 }
 
 // ---------------------------------------------------------------------------

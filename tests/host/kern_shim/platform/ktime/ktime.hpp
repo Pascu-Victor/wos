@@ -2,8 +2,9 @@
 
 // Host shim: replaces kernel time source with clock_gettime.
 
-#include <cstdint>
 #include <time.h>
+
+#include <cstdint>
 
 namespace ker::mod::ktime {
 
@@ -16,3 +17,9 @@ inline uint64_t now_ns() {
 inline uint64_t now_us() { return now_ns() / 1000; }
 
 }  // namespace ker::mod::ktime
+
+namespace ker::mod::time {
+
+inline uint64_t get_us() { return ker::mod::ktime::now_us(); }
+
+}  // namespace ker::mod::time

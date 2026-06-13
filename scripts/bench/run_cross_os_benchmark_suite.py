@@ -19,6 +19,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 BENCH_SCRIPTS = ROOT / "scripts" / "bench"
 REMOTE_SCRIPTS = ROOT / "scripts" / "remote"
+DEFAULT_ARTIFACT_FETCH_TIMEOUT_SECONDS = 120.0
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,10 @@ def run_command(
             message.append("stderr: (empty)")
         raise RuntimeError("\n".join(message))
     return result
+
+
+def positive_timeout(seconds: float) -> float | None:
+    return seconds if seconds > 0 else None
 
 
 def wos_remote_command(host: str, command: str, *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
@@ -188,13 +193,27 @@ def step_log_text(result: subprocess.CompletedProcess[str]) -> str:
     )
 
 
-def fetch_remote_file(fetcher: Path, host: str, remote_path: str, local_path: Path) -> None:
-    run_command([str(fetcher), host, remote_path, str(local_path)])
+def fetch_remote_file(
+    fetcher: Path,
+    host: str,
+    remote_path: str,
+    local_path: Path,
+    *,
+    timeout: float | None,
+) -> None:
+    run_command([str(fetcher), host, remote_path, str(local_path)], timeout=timeout)
 
 
-def fetch_optional_remote_file(fetcher: Path, host: str, remote_path: str, local_path: Path) -> bool:
+def fetch_optional_remote_file(
+    fetcher: Path,
+    host: str,
+    remote_path: str,
+    local_path: Path,
+    *,
+    timeout: float | None,
+) -> bool:
     try:
-        fetch_remote_file(fetcher, host, remote_path, local_path)
+        fetch_remote_file(fetcher, host, remote_path, local_path, timeout=timeout)
     except Exception as exc:  # noqa: BLE001
         write_text(local_path.with_suffix(local_path.suffix + ".fetch-error.txt"), f"{exc}\n")
         return False
@@ -796,7 +815,7 @@ def run_benchmark_command(
     step_dir: Path,
     payload_command: list[str],
 ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, Any]]]:
-    timeout = args.benchmark_timeout if args.benchmark_timeout > 0 else None
+    timeout = positive_timeout(args.benchmark_timeout)
     if not args.schedstat_wrap_steps:
         return run_command(payload_command, timeout=timeout), []
 
@@ -859,6 +878,7 @@ def run_wos_mandelbench(
     )
     result, schedstat_entries = run_benchmark_command(args, step_dir, [str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, remote_command])
     write_text(step_dir / "command.log", step_log_text(result))
+    fetch_timeout = positive_timeout(args.artifact_fetch_timeout)
 
     report_local = step_dir / "report.txt"
     fetch_remote_file(
@@ -866,6 +886,7 @@ def run_wos_mandelbench(
         host,
         f"{remote_work_dir}/report.txt",
         report_local,
+        timeout=fetch_timeout,
     )
     summary = parse_mandel_report(report_local.read_text(encoding="utf-8"))
     summary.update(
@@ -893,6 +914,7 @@ def run_wos_mandelbench(
             host,
             f"{remote_work_dir}/{image_name}",
             local_image,
+            timeout=fetch_timeout,
         )
         artifacts.append(relpath(local_image))
 
@@ -957,6 +979,7 @@ def run_linux_mandelbench(
 
     result, schedstat_entries = run_benchmark_command(args, step_dir, command)
     write_text(step_dir / "command.log", step_log_text(result))
+    fetch_timeout = positive_timeout(args.artifact_fetch_timeout)
 
     report_local = step_dir / "report.txt"
     fetch_remote_file(
@@ -964,6 +987,7 @@ def run_linux_mandelbench(
         launcher,
         f"{remote_work_dir}/report.txt",
         report_local,
+        timeout=fetch_timeout,
     )
     summary = parse_mandel_report(report_local.read_text(encoding="utf-8"))
     summary.update(
@@ -991,6 +1015,7 @@ def run_linux_mandelbench(
             launcher,
             f"{remote_work_dir}/{image_name}",
             local_image,
+            timeout=fetch_timeout,
         )
         artifacts.append(relpath(local_image))
 
@@ -1044,6 +1069,8 @@ def run_wos_renderbench(
         remote_output_root,
         "--run-id",
         run_id,
+        "--final-image-max-pixels",
+        str(args.wos_render_final_image_max_pixels),
     ]
     if case.wos_scene:
         command += ["--scene", case.wos_scene]
@@ -1083,55 +1110,79 @@ def run_wos_renderbench(
         result, schedstat_entries = run_benchmark_command(args, step_dir, host_command)
     except Exception:
         remote_run_dir = f"{remote_output_root}/{run_id}"
+        fetch_timeout = positive_timeout(args.artifact_fetch_timeout)
         fetch_optional_remote_file(
             REMOTE_SCRIPTS / "wos_sftp_get.sh",
             host,
             f"{remote_run_dir}/metrics.json",
             step_dir / "partial-metrics.json",
+            timeout=fetch_timeout,
         )
         fetch_optional_remote_file(
             REMOTE_SCRIPTS / "wos_sftp_get.sh",
             host,
             f"{remote_run_dir}/status.json",
             step_dir / "partial-status.json",
+            timeout=fetch_timeout,
         )
         fetch_optional_remote_file(
             REMOTE_SCRIPTS / "wos_sftp_get.sh",
             host,
             f"{remote_run_dir}/ipc_profile.json",
             step_dir / "partial-ipc_profile.json",
+            timeout=fetch_timeout,
+        )
+        fetch_optional_remote_file(
+            REMOTE_SCRIPTS / "wos_sftp_get.sh",
+            host,
+            f"{remote_run_dir}/preview.png",
+            step_dir / "partial-preview.png",
+            timeout=fetch_timeout,
         )
         raise
     write_text(step_dir / "command.log", step_log_text(result))
+    fetch_timeout = positive_timeout(args.artifact_fetch_timeout)
 
     remote_run_dir = f"{remote_output_root}/{run_id}"
     metrics_local = step_dir / "metrics.json"
     status_local = step_dir / "status.json"
     ipc_profile_local = step_dir / "ipc_profile.json"
     frame_local = step_dir / "frame_000.png"
+    preview_local = step_dir / "preview.png"
     fetch_remote_file(
         REMOTE_SCRIPTS / "wos_sftp_get.sh",
         host,
         f"{remote_run_dir}/metrics.json",
         metrics_local,
+        timeout=fetch_timeout,
     )
     fetch_remote_file(
         REMOTE_SCRIPTS / "wos_sftp_get.sh",
         host,
         f"{remote_run_dir}/status.json",
         status_local,
+        timeout=fetch_timeout,
     )
     fetch_remote_file(
         REMOTE_SCRIPTS / "wos_sftp_get.sh",
         host,
         f"{remote_run_dir}/ipc_profile.json",
         ipc_profile_local,
+        timeout=fetch_timeout,
     )
-    fetch_remote_file(
+    frame_fetched = fetch_optional_remote_file(
         REMOTE_SCRIPTS / "wos_sftp_get.sh",
         host,
         f"{remote_run_dir}/frame_000.png",
         frame_local,
+        timeout=fetch_timeout,
+    )
+    fetch_remote_file(
+        REMOTE_SCRIPTS / "wos_sftp_get.sh",
+        host,
+        f"{remote_run_dir}/preview.png",
+        preview_local,
+        timeout=fetch_timeout,
     )
 
     metrics = json.loads(metrics_local.read_text(encoding="utf-8"))
@@ -1146,6 +1197,7 @@ def run_wos_renderbench(
             "host": host,
             "scene": case.name,
             "scene_path": case.wos_scene,
+            "image_artifact": "frame_000.png" if frame_fetched else "preview.png",
         }
     )
     write_json(step_dir / "result.json", merged)
@@ -1162,9 +1214,9 @@ def run_wos_renderbench(
             relpath(metrics_local),
             relpath(status_local),
             relpath(ipc_profile_local),
-            relpath(frame_local),
+            relpath(preview_local),
             relpath(step_dir / "result.json"),
-        ],
+        ] + ([relpath(frame_local)] if frame_fetched else []),
         "host_schedstat": schedstat_entries,
     }
 
@@ -1296,6 +1348,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wos-duck-scene", default="/srv/Duck.glb")
     parser.add_argument("--linux-duck-scene", default="configs/drive/srv/Duck.glb")
     parser.add_argument("--wos-render-threads", type=int)
+    parser.add_argument(
+        "--wos-render-final-image-max-pixels",
+        type=int,
+        default=8 * 1024 * 1024,
+        help="Maximum pixels for WOS renderbench frame_000.png; 0 disables the guard and always attempts the full frame.",
+    )
     parser.add_argument(
         "--wos-render-tuning",
         choices=("manual", "optimal", "safe"),
@@ -1461,6 +1519,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds to wait for each benchmark command; default 900, 0 disables the benchmark command timeout.",
     )
     parser.add_argument(
+        "--artifact-fetch-timeout",
+        type=float,
+        default=DEFAULT_ARTIFACT_FETCH_TIMEOUT_SECONDS,
+        help=(
+            "Seconds to wait for each benchmark artifact SFTP fetch; default "
+            f"{DEFAULT_ARTIFACT_FETCH_TIMEOUT_SECONDS:.0f}, 0 disables the artifact fetch timeout."
+        ),
+    )
+    parser.add_argument(
         "--skip-wos-perf-diagnostics",
         action="store_true",
         help="Do not capture WOS perf ipc-report and wki-report snapshots around WOS benchmark steps.",
@@ -1513,6 +1580,8 @@ def main() -> int:
             parser.error("--wos-render-tuning optimal is incompatible with --wos-disable-process-persistent-workers")
     if args.benchmark_timeout < 0:
         parser.error("--benchmark-timeout must be nonnegative")
+    if args.artifact_fetch_timeout < 0:
+        parser.error("--artifact-fetch-timeout must be nonnegative")
     if args.schedstat_probe or args.schedstat_wrap_steps:
         if not args.schedstat_qemu_pid and not args.schedstat_auto_discover_qemu:
             parser.error("--schedstat-probe/--schedstat-wrap-steps requires --schedstat-qemu-pid or --schedstat-auto-discover-qemu")

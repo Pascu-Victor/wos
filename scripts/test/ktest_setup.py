@@ -31,6 +31,7 @@ DIAGNOSTIC_CMAKE_OPTIONS = [
     "-DWOS_KASAN=ON",
     "-DWOS_KCOV=ON",
     "-DWOS_KCOV_PANIC_TRACE=ON",
+    "-DWOS_KCOV_SOURCE_FRIENDLY=ON",
     "-DWOS_SELFTEST=ON",
     "-DWOS_NET_TRACE=ON",
     "-DWOS_NET_PACKET_DEBUG=ON",
@@ -41,6 +42,28 @@ DIAGNOSTIC_CMAKE_OPTIONS = [
     "-DWOS_KMALLOC_DEBUG_INFO=ON",
     "-DWOS_MANDELBENCH_DEBUG=ON",
 ]
+
+FAST_CMAKE_OPTION_OVERRIDES = {
+    "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+    "WOS_KCOV_SOURCE_FRIENDLY": "OFF",
+}
+
+
+def diagnostic_cmake_options(fast: bool) -> list[str]:
+    if not fast:
+        return list(DIAGNOSTIC_CMAKE_OPTIONS)
+
+    options = []
+    for option in DIAGNOSTIC_CMAKE_OPTIONS:
+        if not option.startswith("-D"):
+            options.append(option)
+            continue
+        name, separator, value = option[2:].partition("=")
+        if not separator:
+            options.append(option)
+            continue
+        options.append(f"-D{name}={FAST_CMAKE_OPTION_OVERRIDES.get(name, value)}")
+    return options
 
 BUILD_TARGETS = [
     "check_headers",
@@ -117,6 +140,7 @@ def configure_build(
     roots: dict[str, Path],
     extra_cmake_options: list[str],
     generator: str,
+    fast: bool,
 ):
     cmd = [
         "cmake",
@@ -130,7 +154,7 @@ def configure_build(
         f"-DWOS_BUSYBOX_INSTALL_DIR={roots['busybox_install']}",
         f"-DWOS_DROPBEAR_BUILD_DIR={roots['dropbear_build']}",
         "-DWOS_SKIP_LIBCXX_INSTALL=ON",
-        *DIAGNOSTIC_CMAKE_OPTIONS,
+        *diagnostic_cmake_options(fast),
         *extra_cmake_options,
     ]
     run_command(cmd)
@@ -196,6 +220,11 @@ def main() -> int:
         action="store_true",
         help="Configure/build the isolated diagnostic artifacts, then stop",
     )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Use RelWithDebInfo and disable KCOV source-friendly codegen for faster selftest runs",
+    )
     parser.add_argument("--no-build", action="store_true", help="Skip configure/build")
     parser.add_argument("--no-package", action="store_true", help="Skip disk packaging")
     parser.add_argument("--no-launch", action="store_true", help="Set up topology but do not launch")
@@ -231,7 +260,7 @@ def main() -> int:
 
     if not args.no_build:
         seed_isolated_sysroot(roots["sysroot"], args.reset_sysroot)
-        configure_build(build_dir, roots, args.cmake_option, args.generator)
+        configure_build(build_dir, roots, args.cmake_option, args.generator, args.fast)
         build_artifacts(build_dir)
     if args.build_only:
         return 0

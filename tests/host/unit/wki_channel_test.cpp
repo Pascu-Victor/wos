@@ -5,10 +5,24 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cstdint>
+#include <limits>
+#include <net/wki/channel.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 
 using namespace ker::net::wki;
+
+namespace ker::net::wki {
+
+WkiState g_wki;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+auto wki_peer_find(uint16_t /*node_id*/) -> WkiPeer* { return nullptr; }
+
+auto wki_now_us() -> uint64_t { return 0; }
+
+}  // namespace ker::net::wki
 
 // =============================================================================
 // Channel Default State
@@ -19,6 +33,7 @@ TEST(WkiChannel, DefaultState) {
     EXPECT_EQ(ch.channel_id, 0);
     EXPECT_EQ(ch.peer_node_id, WKI_NODE_INVALID);
     EXPECT_FALSE(ch.active);
+    EXPECT_EQ(ch.generation, 0u);
     EXPECT_EQ(ch.tx_seq, 0u);
     EXPECT_EQ(ch.tx_ack, 0u);
     EXPECT_EQ(ch.rx_seq, 0u);
@@ -46,6 +61,146 @@ TEST(WkiChannel, DupAckInitZero) {
     WkiChannel ch{};
     EXPECT_EQ(ch.last_dup_ack, 0u);
     EXPECT_EQ(ch.dup_ack_count, 0u);
+}
+
+TEST(WkiChannel, ResetClearsPostFenceReliabilityState) {
+    WkiChannel ch{};
+    ch.channel_id = WKI_CHAN_IPC_DATA;
+    ch.peer_node_id = 0x1234;
+    ch.priority = PriorityClass::THROUGHPUT;
+    ch.active = true;
+    ch.generation = 7;
+    ch.tx_seq = 41;
+    ch.tx_ack = 17;
+    ch.rx_seq = 99;
+    ch.rx_dispatch_seq = 97;
+    ch.rx_ack_pending = 98;
+    ch.ack_pending = true;
+    ch.ack_pending_since_us = std::numeric_limits<uint64_t>::max();
+    ch.tx_credits = 1;
+    ch.rx_credits = 2;
+    ch.rto_us = WKI_MAX_RTO_US;
+    ch.srtt_us = 123;
+    ch.rttvar_us = 456;
+    ch.retransmit_deadline = std::numeric_limits<uint64_t>::max();
+    ch.last_dup_ack = 96;
+    ch.dup_ack_count = WKI_FAST_RETRANSMIT_THRESH;
+    ch.bytes_sent = 111;
+    ch.bytes_received = 222;
+    ch.retransmits = 3;
+    ch.perf_last_stall_report_us = 444;
+    ch.perf_last_stall_status = 555;
+
+    auto* rt = new WkiRetransmitEntry{};
+    rt->data = new uint8_t[4]{};
+    rt->len = 4;
+    rt->seq = 41;
+    ch.retransmit_head = rt;
+    ch.retransmit_tail = rt;
+    ch.retransmit_count = 1;
+
+    auto* ro = new WkiReorderEntry{};
+    ro->data = new uint8_t[2]{};
+    ro->len = 2;
+    ro->seq = 100;
+    ch.reorder_head = ro;
+    ch.reorder_count = 1;
+
+    wki_channel_reset(&ch);
+
+    EXPECT_TRUE(ch.active);
+    EXPECT_EQ(ch.channel_id, WKI_CHAN_IPC_DATA);
+    EXPECT_EQ(ch.peer_node_id, 0x1234);
+    EXPECT_EQ(ch.priority, PriorityClass::THROUGHPUT);
+    EXPECT_EQ(ch.generation, 7u);
+    EXPECT_EQ(ch.tx_seq, 0u);
+    EXPECT_EQ(ch.tx_ack, 0u);
+    EXPECT_EQ(ch.rx_seq, 0u);
+    EXPECT_EQ(ch.rx_dispatch_seq, 0u);
+    EXPECT_EQ(ch.rx_ack_pending, 0u);
+    EXPECT_FALSE(ch.ack_pending);
+    EXPECT_EQ(ch.ack_pending_since_us, 0u);
+    EXPECT_EQ(ch.tx_credits, WKI_CREDITS_IPC_DATA);
+    EXPECT_EQ(ch.rx_credits, WKI_CREDITS_IPC_DATA);
+    EXPECT_EQ(ch.retransmit_head, nullptr);
+    EXPECT_EQ(ch.retransmit_tail, nullptr);
+    EXPECT_EQ(ch.retransmit_count, 0u);
+    EXPECT_EQ(ch.reorder_head, nullptr);
+    EXPECT_EQ(ch.reorder_count, 0u);
+    EXPECT_EQ(ch.last_dup_ack, 0u);
+    EXPECT_EQ(ch.dup_ack_count, 0u);
+    EXPECT_EQ(ch.rto_us, WKI_INITIAL_RTO_US);
+    EXPECT_EQ(ch.srtt_us, 0u);
+    EXPECT_EQ(ch.rttvar_us, 0u);
+    EXPECT_EQ(ch.retransmit_deadline, 0u);
+    EXPECT_EQ(ch.bytes_sent, 0u);
+    EXPECT_EQ(ch.bytes_received, 0u);
+    EXPECT_EQ(ch.retransmits, 0u);
+    EXPECT_EQ(ch.perf_last_stall_report_us, 0u);
+    EXPECT_EQ(ch.perf_last_stall_status, 0u);
+    EXPECT_FALSE(ch.tx_rt_entry_in_use);
+}
+
+TEST(WkiChannel, ResetKeepsInlineRetransmitStorageOwnedByChannel) {
+    WkiChannel ch{};
+    ch.channel_id = WKI_CHAN_CONTROL;
+    ch.peer_node_id = 0x5678;
+    ch.active = true;
+    ch.tx_rt_entry_in_use = true;
+    ch.tx_rt_entry.data = ch.tx_rt_buf.data();
+    ch.tx_rt_entry.len = 16;
+    ch.tx_rt_entry.seq = 7;
+    ch.retransmit_head = &ch.tx_rt_entry;
+    ch.retransmit_tail = &ch.tx_rt_entry;
+    ch.retransmit_count = 1;
+
+    wki_channel_reset(&ch);
+
+    EXPECT_TRUE(ch.active);
+    EXPECT_EQ(ch.channel_id, WKI_CHAN_CONTROL);
+    EXPECT_EQ(ch.peer_node_id, 0x5678);
+    EXPECT_EQ(ch.retransmit_head, nullptr);
+    EXPECT_EQ(ch.retransmit_tail, nullptr);
+    EXPECT_EQ(ch.retransmit_count, 0u);
+    EXPECT_FALSE(ch.tx_rt_entry_in_use);
+    EXPECT_EQ(ch.tx_rt_entry.data, nullptr);
+}
+
+TEST(WkiChannel, LookupInPeerReturnsOnlyActiveMatchingSlot) {
+    WkiPeer peer{};
+    peer.node_id = 0x4321;
+    WkiChannel ch{};
+    constexpr uint16_t CHANNEL_ID = WKI_CHAN_RESOURCE;
+
+    EXPECT_EQ(wki_channel_lookup_in_peer(&peer, peer.node_id, CHANNEL_ID), nullptr);
+
+    peer.channels.at(CHANNEL_ID) = &ch;
+    EXPECT_EQ(wki_channel_lookup_in_peer(&peer, peer.node_id, CHANNEL_ID), nullptr);
+
+    ch.active = true;
+    ch.peer_node_id = 0x9999;
+    ch.channel_id = CHANNEL_ID;
+    EXPECT_EQ(wki_channel_lookup_in_peer(&peer, peer.node_id, CHANNEL_ID), nullptr);
+
+    ch.peer_node_id = peer.node_id;
+    ch.channel_id = WKI_CHAN_EVENT_BUS;
+    EXPECT_EQ(wki_channel_lookup_in_peer(&peer, peer.node_id, CHANNEL_ID), nullptr);
+
+    ch.channel_id = CHANNEL_ID;
+    EXPECT_EQ(wki_channel_lookup_in_peer(&peer, peer.node_id, CHANNEL_ID), &ch);
+    EXPECT_EQ(wki_channel_lookup_in_peer(nullptr, peer.node_id, CHANNEL_ID), nullptr);
+    EXPECT_EQ(wki_channel_lookup_in_peer(&peer, peer.node_id, WKI_MAX_CHANNELS), nullptr);
+}
+
+TEST(WkiChannel, AckNextMustNotAdvancePastTransmittedSeq) {
+    WkiChannel ch{};
+    ch.tx_seq = 1;
+    ch.tx_ack = 0;
+
+    EXPECT_TRUE(wki_channel_ack_next_within_sent_window(&ch, 0));
+    EXPECT_TRUE(wki_channel_ack_next_within_sent_window(&ch, 1));
+    EXPECT_FALSE(wki_channel_ack_next_within_sent_window(&ch, 2));
+    EXPECT_FALSE(wki_channel_ack_next_within_sent_window(nullptr, 1));
 }
 
 // =============================================================================

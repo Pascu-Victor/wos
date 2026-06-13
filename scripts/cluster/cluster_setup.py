@@ -959,6 +959,7 @@ def collect_unique_nodes(config: dict) -> dict:
 
 LIVE_SYNC_MANIFEST = "/etc/wos-live-sync-manifest.json"
 LIVE_SYNC_BATCH_FILES = 24
+LIVE_SYNC_SFTP_TIMEOUT_SECONDS = 180.0
 # These are injected per node during launch and must not be flattened by a
 # host-wide live rootfs refresh.
 LIVE_SYNC_EXCLUDED_PATHS = {
@@ -1068,6 +1069,48 @@ class SftpBatchError(RuntimeError):
                 "rebuild/relaunch with a rootfs image that already contains those paths."
             )
 
+        details.append("batch preview:")
+        details.append(indent_text("\n".join(preview_sftp_batch(self.lines)), "  "))
+        return "\n".join(details)
+
+
+class SftpBatchTimeoutError(RuntimeError):
+    def __init__(
+        self,
+        operation: str,
+        hostname: str,
+        user: str,
+        port: str | None,
+        timeout: float,
+        stdout: str | bytes | None,
+        stderr: str | bytes | None,
+        lines: list[str],
+    ):
+        super().__init__(operation)
+        self.operation = operation
+        self.hostname = hostname
+        self.user = user
+        self.port = port
+        self.timeout = timeout
+        self.stdout = stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout
+        self.stderr = stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr
+        self.lines = lines
+
+    def __str__(self) -> str:
+        target = f"{self.user}@{self.hostname}"
+        if self.port:
+            target += f" port {self.port}"
+
+        details = [
+            f"{self.operation} timed out for {target}",
+            f"sftp timeout: {self.timeout:.1f}s",
+        ]
+        if self.stderr and self.stderr.strip():
+            details.append("stderr:")
+            details.append(indent_text(self.stderr.strip(), "  "))
+        if self.stdout and self.stdout.strip():
+            details.append("stdout:")
+            details.append(indent_text(self.stdout.strip(), "  "))
         details.append("batch preview:")
         details.append(indent_text("\n".join(preview_sftp_batch(self.lines)), "  "))
         return "\n".join(details)
@@ -1337,6 +1380,8 @@ def run_sftp_batch(
     user: str,
     port: str | None,
     operation: str,
+    *,
+    timeout: float | None,
 ) -> subprocess.CompletedProcess:
     with tempfile.NamedTemporaryFile(
         mode="w", prefix="wos-live-sftp-", suffix=".batch", delete=False
@@ -1362,7 +1407,20 @@ def run_sftp_batch(
     args.extend(["-b", batch_path, f"{user}@{hostname}"])
 
     try:
-        result = subprocess.run(args, capture_output=True, text=True)
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        assert timeout is not None
+        raise SftpBatchTimeoutError(
+            operation,
+            hostname,
+            user,
+            port,
+            timeout,
+            exc.stdout,
+            exc.stderr,
+            lines,
+        ) from exc
+    else:
         if result.returncode != 0:
             raise SftpBatchError(operation, hostname, user, port, result, lines)
         return result
@@ -1370,7 +1428,9 @@ def run_sftp_batch(
         os.unlink(batch_path)
 
 
-def load_remote_sync_manifest(hostname: str, user: str, port: str | None) -> dict:
+def load_remote_sync_manifest(
+    hostname: str, user: str, port: str | None, sftp_timeout: float | None
+) -> dict:
     with tempfile.NamedTemporaryFile(prefix="wos-live-manifest-", delete=False) as tmp:
         local_manifest = tmp.name
     os.unlink(local_manifest)
@@ -1382,6 +1442,7 @@ def load_remote_sync_manifest(hostname: str, user: str, port: str | None) -> dic
             user,
             port,
             f"read remote manifest {LIVE_SYNC_MANIFEST}",
+            timeout=sftp_timeout,
         )
         if not os.path.exists(local_manifest) or os.path.getsize(local_manifest) == 0:
             return {"version": 1, "files": {}}
@@ -1410,6 +1471,7 @@ def upload_manifest(
     manifest_file: Path,
     user: str,
     port: str | None,
+    sftp_timeout: float | None,
 ):
     lines = []
     for directory in remote_parent_dirs(LIVE_SYNC_MANIFEST):
@@ -1425,6 +1487,7 @@ def upload_manifest(
         user,
         port,
         f"write remote manifest {LIVE_SYNC_MANIFEST}",
+        timeout=sftp_timeout,
     )
 
 
@@ -1433,6 +1496,7 @@ def upload_sync_chunk(
     chunk: list[SyncItem],
     user: str,
     port: str | None,
+    sftp_timeout: float | None,
 ):
     lines = []
     mkdirs: set[str] = set()
@@ -1456,6 +1520,7 @@ def upload_sync_chunk(
             f"upload {len(chunk)} file(s), {format_bytes(sum(item.size for item in chunk))} "
             f"from {first_path} through {last_path}"
         ),
+        timeout=sftp_timeout,
     )
 
 
@@ -1469,13 +1534,14 @@ def sync_host(
     selected_items: list[SyncItem],
     filter_used: bool,
     events: queue.Queue,
+    sftp_timeout: float | None,
 ) -> HostSyncSummary:
     user = os.environ.get("WOS_SSH_USER", "root")
     port = os.environ.get("WOS_SSH_PORT") or None
 
     try:
         events.put({"type": "host_status", "host": hostname, "phase": "probing"})
-        remote_manifest = load_remote_sync_manifest(hostname, user, port)
+        remote_manifest = load_remote_sync_manifest(hostname, user, port, sftp_timeout)
         remote_files = remote_manifest.get("files", {})
 
         changed = [
@@ -1498,7 +1564,7 @@ def sync_host(
         uploaded_files = 0
         uploaded_bytes = 0
         for chunk in chunked(changed, LIVE_SYNC_BATCH_FILES):
-            upload_sync_chunk(hostname, chunk, user, port)
+            upload_sync_chunk(hostname, chunk, user, port, sftp_timeout)
             for item in chunk:
                 uploaded_files += 1
                 uploaded_bytes += item.size
@@ -1524,7 +1590,7 @@ def sync_host(
             manifest_path = Path(manifest_tmp.name)
         try:
             write_manifest_file(manifest_path, manifest_files)
-            upload_manifest(hostname, manifest_path, user, port)
+            upload_manifest(hostname, manifest_path, user, port, sftp_timeout)
         finally:
             manifest_path.unlink(missing_ok=True)
 
@@ -1671,7 +1737,12 @@ class LiveSyncTui:
         sys.stdout.flush()
 
 
-def sync_live_rootfs(config: dict, filter_arg: str | None, include_live_access: bool) -> bool:
+def sync_live_rootfs(
+    config: dict,
+    filter_arg: str | None,
+    include_live_access: bool,
+    sftp_timeout: float | None,
+) -> bool:
     repo = repo_root()
     nodes = collect_unique_nodes(config)
     if not nodes:
@@ -1717,7 +1788,14 @@ def sync_live_rootfs(config: dict, filter_arg: str | None, include_live_access: 
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
-                executor.submit(sync_host, hostname, selected_items, bool(filter_arg), events)
+                executor.submit(
+                    sync_host,
+                    hostname,
+                    selected_items,
+                    bool(filter_arg),
+                    events,
+                    sftp_timeout,
+                )
                 for hostname in hostnames
             ]
             with LiveSyncTui(hostnames, events, use_tui) as tui:
@@ -2047,6 +2125,15 @@ def main():
         help="With --sync, also update SSH/SFTP access files that are skipped by default",
     )
     parser.add_argument(
+        "--sync-timeout",
+        type=float,
+        default=LIVE_SYNC_SFTP_TIMEOUT_SECONDS,
+        help=(
+            "Seconds to wait for each --sync SFTP batch; default "
+            f"{LIVE_SYNC_SFTP_TIMEOUT_SECONDS:.0f}, 0 disables the SFTP batch timeout."
+        ),
+    )
+    parser.add_argument(
         "--tcg",
         nargs="?",
         const="",
@@ -2074,6 +2161,8 @@ def main():
         parser.error("--filter is only valid with --sync")
     if args.include_live_access and not args.sync:
         parser.error("--include-live-access is only valid with --sync")
+    if args.sync_timeout < 0:
+        parser.error("--sync-timeout must be nonnegative")
     if args.debug_node and not args.launch:
         parser.error("--debug-node is only valid with --launch")
 
@@ -2083,7 +2172,13 @@ def main():
     config = load_config(str(config_path))
 
     if args.sync:
-        if not sync_live_rootfs(config, args.filter, args.include_live_access):
+        sync_timeout = args.sync_timeout if args.sync_timeout > 0 else None
+        if not sync_live_rootfs(
+            config,
+            args.filter,
+            args.include_live_access,
+            sync_timeout,
+        ):
             sys.exit(1)
     elif args.teardown:
         # Cache sudo credentials once upfront for privileged network operations.
