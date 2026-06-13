@@ -291,12 +291,16 @@ auto pingpong_thread(void* param) -> int {
     return 0;
 }
 
-void test_context_switch() {
+auto test_context_switch() -> bool {
     constexpr int ITERS = 2000;
 
     mtx_t mtx;
     std::atomic<int> counter{0};
-    mtx_init(&mtx, MTX_PLAIN);
+    int const MTX_RESULT = mtx_init(&mtx, MTX_PLAIN);
+    if (MTX_RESULT != THRD_SUCCESS) {
+        std::println(stderr, "[perf] ctx_switch:         FAILED (mtx_init rc={})", MTX_RESULT);
+        return false;
+    }
 
     PingPongArg a0{.mtx = &mtx, .counter = &counter, .target = ITERS * 2, .role = 0};
     PingPongArg a1{.mtx = &mtx, .counter = &counter, .target = ITERS * 2, .role = 1};
@@ -307,10 +311,29 @@ void test_context_switch() {
         thrd_t t0 = nullptr;
         thrd_t t1 = nullptr;
         uint64_t const T_START = now_ns();
-        thrd_create(&t0, pingpong_thread, &a0);
-        thrd_create(&t1, pingpong_thread, &a1);
-        thrd_join(t0, nullptr);
-        thrd_join(t1, nullptr);
+        int const CREATE_RESULT_0 = thrd_create(&t0, pingpong_thread, &a0);
+        if (CREATE_RESULT_0 != THRD_SUCCESS) {
+            std::println(stderr, "[perf] ctx_switch[{}]: FAILED (create t0 rc={})", repeat, CREATE_RESULT_0);
+            mtx_destroy(&mtx);
+            return false;
+        }
+        int const CREATE_RESULT_1 = thrd_create(&t1, pingpong_thread, &a1);
+        if (CREATE_RESULT_1 != THRD_SUCCESS) {
+            std::println(stderr, "[perf] ctx_switch[{}]: FAILED (create t1 rc={})", repeat, CREATE_RESULT_1);
+            int const JOIN_RESULT_0 = thrd_join(t0, nullptr);
+            if (JOIN_RESULT_0 != THRD_SUCCESS) {
+                std::println(stderr, "[perf] ctx_switch[{}]: FAILED (cleanup join t0 rc={})", repeat, JOIN_RESULT_0);
+            }
+            mtx_destroy(&mtx);
+            return false;
+        }
+        int const JOIN_RESULT_0 = thrd_join(t0, nullptr);
+        int const JOIN_RESULT_1 = thrd_join(t1, nullptr);
+        if (JOIN_RESULT_0 != THRD_SUCCESS || JOIN_RESULT_1 != THRD_SUCCESS) {
+            std::println(stderr, "[perf] ctx_switch[{}]: FAILED (join t0 rc={} t1 rc={})", repeat, JOIN_RESULT_0, JOIN_RESULT_1);
+            mtx_destroy(&mtx);
+            return false;
+        }
         uint64_t const ELAPSED = now_ns() - T_START;
         // elapsed covers 2*ITERS lock/unlock pairs split across 2 threads
         double const US = static_cast<double>(ELAPSED) / (2.0 * ITERS * 1000.0);
@@ -320,6 +343,7 @@ void test_context_switch() {
     mtx_destroy(&mtx);
 
     std::println(stderr, "[perf] ctx_switch:         best={:.1f}µs/lock-round-trip  ({} total increments)", best_us, ITERS * 2);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -926,7 +950,9 @@ auto run_perf(int argc, char** argv) -> int {
     }
 
     std::println(stderr, "[perf] --- context switch cost ---");
-    test_context_switch();
+    if (!test_context_switch()) {
+        return 1;
+    }
 
     if (options.verbose) {
         std::println(stderr, "[perf] --- per-CPU compute scan ---");

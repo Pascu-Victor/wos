@@ -311,6 +311,7 @@ def test_perfbench_context_switch_counter_is_atomic() -> None:
     require_tokens(
         source,
         [
+            "auto test_context_switch() -> bool",
             "std::atomic<int>* counter",
             "std::atomic<int> counter{0}",
             "counter.store(0, std::memory_order_release)",
@@ -338,6 +339,41 @@ def test_perfbench_context_switch_counter_is_atomic() -> None:
     present = [snippet for snippet in forbidden if snippet in source]
     if present:
         fail(f"perfbench context switch counter still uses racy volatile state: {present[0]}")
+
+    context_body = function_body(source, "test_context_switch")
+    require_tokens(
+        context_body,
+        [
+            "int const MTX_RESULT = mtx_init(&mtx, MTX_PLAIN)",
+            "if (MTX_RESULT != THRD_SUCCESS)",
+            "int const CREATE_RESULT_0 = thrd_create(&t0, pingpong_thread, &a0)",
+            "if (CREATE_RESULT_0 != THRD_SUCCESS)",
+            "int const CREATE_RESULT_1 = thrd_create(&t1, pingpong_thread, &a1)",
+            "if (CREATE_RESULT_1 != THRD_SUCCESS)",
+            "int const JOIN_RESULT_0 = thrd_join(t0, nullptr)",
+            "int const JOIN_RESULT_1 = thrd_join(t1, nullptr)",
+            "if (JOIN_RESULT_0 != THRD_SUCCESS || JOIN_RESULT_1 != THRD_SUCCESS)",
+            "mtx_destroy(&mtx)",
+            "return true;",
+        ],
+        "perfbench context switch thread lifecycle checks",
+    )
+    unchecked_calls = {
+        "thrd_create(&t0, pingpong_thread, &a0);",
+        "thrd_create(&t1, pingpong_thread, &a1);",
+        "thrd_join(t0, nullptr);",
+        "thrd_join(t1, nullptr);",
+    }
+    for line in context_body.splitlines():
+        if line.strip() in unchecked_calls:
+            fail(f"perfbench context switch must check lifecycle call result: {line.strip()}")
+
+    run_body = function_body(source, "run_perf")
+    require_tokens(
+        run_body,
+        ["if (!test_context_switch())", "return 1;"],
+        "perfbench context switch failure propagation",
+    )
 
 
 def test_perfbench_parallel_workers_cleanup_before_failure_return() -> None:
