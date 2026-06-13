@@ -342,20 +342,11 @@ void cdc_detach(UsbDevice* dev) {
         cdc.netdev.wki_rx_forward = nullptr;
         ker::net::netdev_unregister(&cdc.netdev);
 
-        if (cdc.bulk_in.ring != nullptr) {
-            ker::mod::mm::phys::page_free(cdc.bulk_in.ring);
-        }
-        if (cdc.bulk_out.ring != nullptr && cdc.bulk_out.ring != cdc.bulk_in.ring) {
-            ker::mod::mm::phys::page_free(cdc.bulk_out.ring);
-        }
         if (dev->driver_data == &cdc) {
             dev->driver_data = nullptr;
         }
-
-        cdc = CdcEtherDevice{};
-        while (cdc_count > 0 && !cdc_devices.at(cdc_count - 1).active) {
-            cdc_count--;
-        }
+        cdc.usb_dev = nullptr;
+        cdc.hc = nullptr;
         return;
     }
 }
