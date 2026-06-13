@@ -722,18 +722,6 @@ void queue_export_pipe_write_flush_locked(ExportPipeWriteBacklog* backlog) {
     g_export_pipe_write_flush_queues.at(export_pipe_write_backlog_shard(backlog)).push_back(backlog);
 }
 
-void note_export_pipe_data_received_locked(WkiIpcExport* exp, uint16_t len) {
-    if (exp == nullptr || len == 0) {
-        return;
-    }
-
-    exp->pipe_bytes_received += len;
-    auto* backlog = find_export_pipe_write_backlog_locked(exp);
-    if (backlog != nullptr && backlog->close_pending) {
-        queue_export_pipe_write_flush_locked(backlog);
-    }
-}
-
 auto queue_export_pipe_write_data(uint32_t resource_id, const uint8_t* data, uint16_t len) -> bool {
     if (data == nullptr || len == 0) {
         return true;
@@ -762,6 +750,7 @@ auto queue_export_pipe_write_data(uint32_t resource_id, const uint8_t* data, uin
 
     backlog->chunks.push_back(PendingPipeChunk{.data = copy, .len = len});
     backlog->buffered_bytes += len;
+    exp->pipe_bytes_received += len;
     queue_export_pipe_write_flush_locked(backlog);
     size_t const FLUSH_SHARD = export_pipe_write_backlog_shard(backlog);
     s_ipc_lock.unlock_irqrestore(IRQF);
@@ -1824,16 +1813,17 @@ auto proxy_pty_close(ker::vfs::File* f) -> int {
         return 0;
     }
 
-    // Send OP_PTY_CLOSE to home node (no response expected)
-    constexpr size_t MSG_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t);
+    constexpr size_t HEADER_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t);
+    constexpr size_t MSG_SIZE = HEADER_SIZE + sizeof(uint64_t);
     std::array<uint8_t, MSG_SIZE> msg = {};
     auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
     req->op_id = OP_PTY_CLOSE;
-    req->data_len = sizeof(uint32_t);
+    req->data_len = sizeof(uint32_t) + sizeof(uint64_t);
     std::memcpy(msg.data() + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
-    if (proxy->home_node != WKI_NODE_INVALID) {
-        wki_send(proxy->home_node, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size()));
-    }
+    uint64_t const EXPECTED_BYTES = proxy->bytes_written.load(std::memory_order_acquire);
+    std::memcpy(msg.data() + HEADER_SIZE, &EXPECTED_BYTES, sizeof(EXPECTED_BYTES));
+
+    send_proxy_pipe_close(proxy, msg.data(), static_cast<uint16_t>(msg.size()), proxy->resource_id, OP_PTY_CLOSE);
 
     wki_ipc_detach_proxy_file(f, proxy);
     return 0;
@@ -4802,16 +4792,11 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
         auto* proxy = find_proxy_by_endpoint_locked(hdr->src_node, resource_id);
         bool const PENDING_BUFFERED = find_pending_pipe_delivery_locked(hdr->src_node, resource_id) != nullptr;
-        ker::vfs::File* export_file = nullptr;
-        bool export_queue_behind_backlog = false;
+        bool export_exists = false;
         if (proxy == nullptr) {
             auto* exp = find_export_by_resource_id(resource_id);
             if (exp != nullptr && exp->active && exp->file != nullptr) {
-                export_file = exp->file;
-                export_file->refcount.fetch_add(1, std::memory_order_acq_rel);
-                note_export_pipe_data_received_locked(exp, OP_DATA_LEN);
-                auto* backlog = find_export_pipe_write_backlog_locked(exp);
-                export_queue_behind_backlog = backlog != nullptr && (!backlog->chunks.empty() || backlog->close_pending);
+                export_exists = true;
             }
         }
         s_ipc_lock.unlock_irqrestore(IRQF);
@@ -4911,43 +4896,19 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             return;
         }
 
-        if (export_file == nullptr) {
+        if (!export_exists) {
             if (OP_DATA_LEN > 0 && !queue_pending_pipe_data(hdr->src_node, resource_id, op_data, OP_DATA_LEN)) {
                 ker::mod::dbg::log("[WKI] IPC pending pipe DATA queue failed: resource_id=%u len=%u", resource_id, OP_DATA_LEN);
             }
             return;
         }
         if (OP_DATA_LEN == 0) {
-            ipc_release_file_ref(export_file);
             pipe_trace.finish(0);
             return;
         }
-        if (export_queue_behind_backlog) {
-            if (!queue_export_pipe_write_data(resource_id, op_data, OP_DATA_LEN)) {
-                ker::mod::dbg::log("[WKI] IPC export pipe backlog ordered queue failed: resource_id=%u len=%u", resource_id, OP_DATA_LEN);
-            }
-            ipc_release_file_ref(export_file);
-            pipe_trace.finish(0, OP_DATA_LEN);
-            return;
+        if (!queue_export_pipe_write_data(resource_id, op_data, OP_DATA_LEN)) {
+            ker::mod::dbg::log("[WKI] IPC export pipe backlog queue failed: resource_id=%u len=%u", resource_id, OP_DATA_LEN);
         }
-        if (export_file->fops != nullptr && export_file->fops->vfs_write != nullptr) {
-            ssize_t const WRITE_RET = export_pipe_write_nonblocking(export_file, op_data, OP_DATA_LEN);
-            if (std::cmp_not_equal(WRITE_RET, OP_DATA_LEN)) {
-                uint16_t written = 0;
-                if (WRITE_RET > 0) {
-                    written = static_cast<uint16_t>(std::cmp_less(WRITE_RET, OP_DATA_LEN) ? WRITE_RET : OP_DATA_LEN);
-                } else if (WRITE_RET != -EAGAIN && WRITE_RET != -EINTR) {
-                    ker::mod::dbg::log("[WKI] IPC export pipe immediate write failed: resource_id=%u ret=%ld len=%u", resource_id,
-                                       WRITE_RET, OP_DATA_LEN);
-                }
-
-                if (!queue_export_pipe_write_data(resource_id, op_data + written, static_cast<uint16_t>(OP_DATA_LEN - written))) {
-                    ker::mod::dbg::log("[WKI] IPC export pipe backlog queue failed: resource_id=%u written=%u total=%u", resource_id,
-                                       written, OP_DATA_LEN);
-                }
-            }
-        }
-        ipc_release_file_ref(export_file);
         pipe_trace.finish(0, OP_DATA_LEN);
         return;
     }
@@ -5123,27 +5084,16 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
     }
 
     if (OP_ID == OP_PTY_CLOSE) {
-        // Consumer closed its proxy PTY — tear down the export
-        ker::mod::sched::task::Task* pump_task = nullptr;
-        uint64_t const IRQF = s_ipc_lock.lock_irqsave();
-        auto* exp = find_export_by_resource_id(resource_id);
-        if (exp != nullptr && exp->active) {
-            pump_task = stop_pipe_pump_locked(exp);
-            ker::vfs::File* f = exp->file;
-            exp->file = nullptr;
-            exp->active = false;
-            auto* retired_exports = compact_inactive_exports_locked();
-            s_ipc_lock.unlock_irqrestore(IRQF);
-            wake_pipe_pump(pump_task);
-            if (f != nullptr && f->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                if (f->fops != nullptr && f->fops->vfs_close != nullptr) {
-                    f->fops->vfs_close(f);
-                }
-                delete f;
-            }
-            free_retired_exports(retired_exports);
-        } else {
-            s_ipc_lock.unlock_irqrestore(IRQF);
+        bool has_expected_bytes = false;
+        uint64_t expected_bytes = 0;
+        if (OP_DATA_LEN >= sizeof(expected_bytes)) {
+            std::memcpy(&expected_bytes, op_data, sizeof(expected_bytes));
+            has_expected_bytes = true;
+        }
+
+        // PTY payloads use the pipe data path, so close must follow the ordered write backlog.
+        if (!mark_export_pipe_write_closed(resource_id, expected_bytes, has_expected_bytes)) {
+            ker::mod::dbg::logger<"wki">::warn("IPC PTY close queue failed: resource_id=%u", resource_id);
         }
         return;
     }

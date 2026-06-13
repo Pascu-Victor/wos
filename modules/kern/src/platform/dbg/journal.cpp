@@ -326,9 +326,21 @@ int journal_open(ker::vfs::File* file) {
 
 int journal_close(ker::vfs::File* /*file*/) { return 0; }
 
-ssize_t journal_read(ker::vfs::File* file, void* buf, size_t count) { return read_records(file, buf, count, module_from_file(file)); }
+void preserve_sequence_cursor_after_vfs_transfer(ker::vfs::File* file, ssize_t bytes) {
+    if (file == nullptr || bytes <= 0) {
+        return;
+    }
+    // VFS applies byte-offset accounting after device ops; journal stores a sequence cursor in File::pos.
+    file->pos -= static_cast<off_t>(bytes);
+}
 
-ssize_t journal_write(ker::vfs::File* /*file*/, const void* buf, size_t count) {
+ssize_t journal_read(ker::vfs::File* file, void* buf, size_t count) {
+    ssize_t const RET = read_records(file, buf, count, module_from_file(file));
+    preserve_sequence_cursor_after_vfs_transfer(file, RET);
+    return RET;
+}
+
+ssize_t journal_write(ker::vfs::File* file, const void* buf, size_t count) {
     if (buf == nullptr) {
         return -EINVAL;
     }
@@ -337,7 +349,9 @@ ssize_t journal_write(ker::vfs::File* /*file*/, const void* buf, size_t count) {
     std::memcpy(message.data(), buf, COPY_LEN);
     message.at(COPY_LEN) = '\0';
     emit(LogLevel::INFO, "userspace", message.data(), (count >= JOURNAL_MESSAGE_MAX) ? JOURNAL_FLAG_TRUNCATED : 0);
-    return static_cast<ssize_t>(count);
+    auto const WRITTEN = static_cast<ssize_t>(count);
+    preserve_sequence_cursor_after_vfs_transfer(file, WRITTEN);
+    return WRITTEN;
 }
 
 auto journal_isatty(ker::vfs::File* /*file*/) -> bool { return false; }
