@@ -9,6 +9,7 @@ TESTPROG_MAIN_CPP = ROOT / "modules" / "testprog" / "src" / "main.cpp"
 NETBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "netbench.cpp"
 PERFBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "perfbench.cpp"
 COWBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "cowbench.cpp"
+MANDELBENCH_WKI_CPP = ROOT / "modules" / "testprog" / "src" / "mandelbench" / "mandelbench_wki.cpp"
 USERLAND_SUITE = ROOT / "configs" / "drive" / "srv" / "wos_userland_suite.sh"
 
 
@@ -438,6 +439,64 @@ def test_cowbench_child_wait_is_deadline_bounded() -> None:
     require_tokens(stress_body, ["wait_for_child(PID, options.child_timeout_ms)"], "cowbench stress wait timeout plumbing")
 
 
+def test_mandelbench_worker_waits_use_monotonic_elapsed_time() -> None:
+    source = MANDELBENCH_WKI_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "#include <time.h>",
+            "clock_gettime(CLOCK_MONOTONIC, &ts)",
+            "ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC",
+            "if (SEC > (std::numeric_limits<uint64_t>::max() - NSEC_US) / USEC_PER_SEC)",
+            "return std::numeric_limits<uint64_t>::max()",
+            "auto elapsed_us(uint64_t start_us, uint64_t end_us) -> uint64_t",
+            "if (end_us <= start_us)",
+        ],
+        "mandelbench monotonic timestamp conversion",
+    )
+    if "gettimeofday(" in source or "#include <sys/time.h>" in source:
+        fail("mandelbench worker wait deadlines must not use wall-clock gettimeofday")
+
+    header_body = function_body(source, "complete_worker_headers")
+    output_body = function_body(source, "complete_workers_and_outputs")
+    streaming_body = function_body(source, "complete_worker_payloads_streaming")
+    for body, context in [
+        (header_body, "mandelbench header wait"),
+        (output_body, "mandelbench output wait"),
+        (streaming_body, "mandelbench streaming wait"),
+    ]:
+        if "NOW_US -" in body:
+            fail(f"{context} must compare elapsed_us() instead of subtracting unsigned timestamps directly")
+
+    require_tokens(
+        header_body,
+        [
+            "elapsed_us(launch.header_last_status_us, NOW_US) >= STATUS_LOG_INTERVAL_US",
+            "elapsed_us(launch.header_last_progress_us, NOW_US) > PIPE_READ_IDLE_TIMEOUT_US",
+        ],
+        "mandelbench header wait elapsed checks",
+    )
+    require_tokens(
+        output_body,
+        [
+            "elapsed_us(launch.read_last_status_us, NOW_US) >= STATUS_LOG_INTERVAL_US",
+            "elapsed_us(START_US, NOW_US) > WORKER_WAIT_TIMEOUT_US",
+            "elapsed_us(launch.read_last_progress_us, NOW_US) > PIPE_READ_IDLE_TIMEOUT_US",
+        ],
+        "mandelbench output wait elapsed checks",
+    )
+    require_tokens(
+        streaming_body,
+        [
+            "elapsed_us(launch.header_last_status_us, NOW_US) >= STATUS_LOG_INTERVAL_US",
+            "elapsed_us(launch.read_last_status_us, NOW_US) >= STATUS_LOG_INTERVAL_US",
+            "elapsed_us(launch.header_last_progress_us, NOW_US) > PIPE_READ_IDLE_TIMEOUT_US",
+            "elapsed_us(launch.read_last_progress_us, NOW_US) > PIPE_READ_IDLE_TIMEOUT_US",
+        ],
+        "mandelbench streaming wait elapsed checks",
+    )
+
+
 def main() -> None:
     test_ping_receive_is_deadline_bounded()
     test_netbench_io_is_deadline_bounded()
@@ -446,7 +505,8 @@ def main() -> None:
     test_perfbench_context_switch_counter_is_atomic()
     test_perfbench_parallel_workers_cleanup_before_failure_return()
     test_cowbench_child_wait_is_deadline_bounded()
-    print("testprog ping, netbench socket waits, userland suite cases, and cowbench child waits are deadline bounded")
+    test_mandelbench_worker_waits_use_monotonic_elapsed_time()
+    print("testprog ping, netbench, suite, perfbench, cowbench, and mandelbench waits are deadline bounded")
 
 
 if __name__ == "__main__":

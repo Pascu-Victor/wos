@@ -6,7 +6,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/process.h>
-#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -56,14 +56,36 @@ constexpr size_t WORKER_OUTPUT_HEADER_SIZE = 16;
 constexpr unsigned char WORKER_CONTROL_START = 1;
 constexpr unsigned char WORKER_CONTROL_RELEASE_PAYLOAD = 2;
 constexpr int MANDELBENCH_ROW_BAND_ROWS = 8;
+constexpr uint64_t USEC_PER_SEC = 1'000'000;
+constexpr int64_t NSEC_PER_SEC = 1'000'000'000;
+constexpr uint64_t NSEC_PER_USEC = 1'000;
 
 auto now_us() -> uint64_t {
-    timeval tv{};
-    gettimeofday(&tv, nullptr);
-    return (static_cast<uint64_t>(tv.tv_sec) * 1000000) + tv.tv_usec;
+    timespec ts{};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC) {
+        return 0;
+    }
+
+    uint64_t const NSEC_US = static_cast<uint64_t>(ts.tv_nsec) / NSEC_PER_USEC;
+    auto const SEC = static_cast<uint64_t>(ts.tv_sec);
+    if (SEC > (std::numeric_limits<uint64_t>::max() - NSEC_US) / USEC_PER_SEC) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+
+    return (SEC * USEC_PER_SEC) + NSEC_US;
 }
 
-auto elapsed_ms(uint64_t start_us, uint64_t end_us) -> double { return static_cast<double>(end_us - start_us) / 1000.0; }
+auto elapsed_us(uint64_t start_us, uint64_t end_us) -> uint64_t {
+    if (end_us <= start_us) {
+        return 0;
+    }
+    return end_us - start_us;
+}
+
+auto elapsed_ms(uint64_t start_us, uint64_t end_us) -> double { return static_cast<double>(elapsed_us(start_us, end_us)) / 1000.0; }
 
 auto repeat_prefix(int repeat_index) -> std::string {
     if (repeat_index < 0) {
@@ -1055,7 +1077,7 @@ struct WorkerPayloadResult {
 
         uint64_t const NOW_US = now_us();
         for (auto& launch : launches) {
-            if (header_is_pending(launch) && NOW_US - launch.header_last_status_us >= STATUS_LOG_INTERVAL_US) {
+            if (header_is_pending(launch) && elapsed_us(launch.header_last_status_us, NOW_US) >= STATUS_LOG_INTERVAL_US) {
                 MANDELBENCH_TRACE(
                     "mandelbench: {} header-wait pending worker={} pid={} target='{}' read={}/{} fd={} idle_ms={:.3f} "
                     "elapsed_ms={:.3f} wait_done={} wait_ok={}",
@@ -1066,7 +1088,7 @@ struct WorkerPayloadResult {
             }
         }
         for (auto& launch : launches) {
-            if (header_is_pending(launch) && NOW_US - launch.header_last_progress_us > PIPE_READ_IDLE_TIMEOUT_US) {
+            if (header_is_pending(launch) && elapsed_us(launch.header_last_progress_us, NOW_US) > PIPE_READ_IDLE_TIMEOUT_US) {
                 std::println(stderr, "mandelbench: output header timeout for worker {} read={}/{} pipe_fd={} elapsed_ms={:.3f}",
                              launch.output_slot, launch.header_offset, launch.header.size(), launch.pipe_read_fd,
                              elapsed_ms(launch.header_last_progress_us, NOW_US));
@@ -1166,7 +1188,7 @@ auto complete_workers_and_outputs(std::span<WorkerLaunch> launches, bool require
 
         uint64_t const NOW_US = now_us();
         for (auto& launch : launches) {
-            if (read_is_pending(launch) && NOW_US - launch.read_last_status_us >= STATUS_LOG_INTERVAL_US) {
+            if (read_is_pending(launch) && elapsed_us(launch.read_last_status_us, NOW_US) >= STATUS_LOG_INTERVAL_US) {
                 MANDELBENCH_TRACE(
                     "mandelbench: {} output-wait pending worker={} pid={} target='{}' read={}/{} fd={} idle_ms={:.3f} "
                     "elapsed_ms={:.3f} wait_done={} wait_ok={}",
@@ -1176,7 +1198,7 @@ auto complete_workers_and_outputs(std::span<WorkerLaunch> launches, bool require
                 launch.read_last_status_us = NOW_US;
             }
         }
-        if (PENDING_WAITS > 0 && NOW_US - START_US > WORKER_WAIT_TIMEOUT_US) {
+        if (PENDING_WAITS > 0 && elapsed_us(START_US, NOW_US) > WORKER_WAIT_TIMEOUT_US) {
             for (const auto& launch : launches) {
                 if (!launch.wait_done && launch.child_pid >= 0) {
                     std::println(stderr, "mandelbench: worker {} wait timeout pid={} target='{}' read={}/{} pipe_fd={} elapsed_ms={:.3f}",
@@ -1188,7 +1210,7 @@ auto complete_workers_and_outputs(std::span<WorkerLaunch> launches, bool require
             break;
         }
         for (auto& launch : launches) {
-            if (read_is_pending(launch) && NOW_US - launch.read_last_progress_us > PIPE_READ_IDLE_TIMEOUT_US) {
+            if (read_is_pending(launch) && elapsed_us(launch.read_last_progress_us, NOW_US) > PIPE_READ_IDLE_TIMEOUT_US) {
                 std::println(stderr, "mandelbench: pipe read timeout for worker {} read={}/{} pipe_fd={} elapsed_ms={:.3f}",
                              launch.output_slot, launch.read_offset, launch.read_target, launch.pipe_read_fd,
                              elapsed_ms(launch.read_last_progress_us, NOW_US));
@@ -1318,7 +1340,7 @@ auto complete_worker_payloads_streaming(std::span<WorkerLaunch> launches, uint16
 
         uint64_t const NOW_US = now_us();
         for (auto& launch : launches) {
-            if (header_is_pending(launch) && NOW_US - launch.header_last_status_us >= STATUS_LOG_INTERVAL_US) {
+            if (header_is_pending(launch) && elapsed_us(launch.header_last_status_us, NOW_US) >= STATUS_LOG_INTERVAL_US) {
                 MANDELBENCH_TRACE(
                     "mandelbench: {} streaming header pending worker={} pid={} target='{}' read={}/{} fd={} idle_ms={:.3f} "
                     "elapsed_ms={:.3f} wait_done={} wait_ok={}",
@@ -1327,7 +1349,8 @@ auto complete_worker_payloads_streaming(std::span<WorkerLaunch> launches, uint16
                     launch.wait_done, launch.wait_ok);
                 launch.header_last_status_us = NOW_US;
             }
-            if (launch.header_ok && read_is_pending(launch) && NOW_US - launch.read_last_status_us >= STATUS_LOG_INTERVAL_US) {
+            if (launch.header_ok && read_is_pending(launch) &&
+                elapsed_us(launch.read_last_status_us, NOW_US) >= STATUS_LOG_INTERVAL_US) {
                 MANDELBENCH_TRACE(
                     "mandelbench: {} streaming payload pending worker={} pid={} target='{}' read={}/{} fd={} idle_ms={:.3f} "
                     "elapsed_ms={:.3f} wait_done={} wait_ok={}",
@@ -1338,7 +1361,7 @@ auto complete_worker_payloads_streaming(std::span<WorkerLaunch> launches, uint16
             }
         }
         for (auto& launch : launches) {
-            if (header_is_pending(launch) && NOW_US - launch.header_last_progress_us > PIPE_READ_IDLE_TIMEOUT_US) {
+            if (header_is_pending(launch) && elapsed_us(launch.header_last_progress_us, NOW_US) > PIPE_READ_IDLE_TIMEOUT_US) {
                 std::println(stderr, "mandelbench: output header timeout for worker {} read={}/{} pipe_fd={} elapsed_ms={:.3f}",
                              launch.output_slot, launch.header_offset, launch.header.size(), launch.pipe_read_fd,
                              elapsed_ms(launch.header_last_progress_us, NOW_US));
@@ -1347,7 +1370,8 @@ auto complete_worker_payloads_streaming(std::span<WorkerLaunch> launches, uint16
                 close_fd(launch.pipe_read_fd);
                 ok = false;
             }
-            if (launch.header_ok && read_is_pending(launch) && NOW_US - launch.read_last_progress_us > PIPE_READ_IDLE_TIMEOUT_US) {
+            if (launch.header_ok && read_is_pending(launch) &&
+                elapsed_us(launch.read_last_progress_us, NOW_US) > PIPE_READ_IDLE_TIMEOUT_US) {
                 std::println(stderr, "mandelbench: pipe read timeout for worker {} read={}/{} pipe_fd={} elapsed_ms={:.3f}",
                              launch.output_slot, launch.read_offset, launch.read_target, launch.pipe_read_fd,
                              elapsed_ms(launch.read_last_progress_us, NOW_US));
@@ -1559,7 +1583,7 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
     if (PROFILE) {
         uint64_t fork_sum_us = 0;
         for (const auto& launch : remote_launches) {
-            fork_sum_us += launch.fork_return_us - launch.fork_begin_us;
+            fork_sum_us += elapsed_us(launch.fork_begin_us, launch.fork_return_us);
         }
         std::println(stderr,
                      "mandelbench-profile setup launch_wall_ms={:.3f} fork_sum_ms={:.3f} workers={} remote_workers={} local_workers={} "
@@ -1610,7 +1634,7 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
 
         uint64_t const AFTER_MERGE_US = now_us();
         MANDELBENCH_TRACE("mandelbench: repeat {} merge end total_ms={:.3f}", repeat_index, elapsed_ms(START_US, AFTER_MERGE_US));
-        elapsed_seconds = static_cast<double>(AFTER_MERGE_US - START_US) / 1000000.0;
+        elapsed_seconds = static_cast<double>(elapsed_us(START_US, AFTER_MERGE_US)) / 1000000.0;
 
         if (PROFILE) {
             std::println(stderr,
