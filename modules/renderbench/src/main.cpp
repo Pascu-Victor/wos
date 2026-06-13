@@ -25,7 +25,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <deque>
 #include <fstream>
 #include <span>
 #include <sstream>
@@ -50,11 +49,11 @@ constexpr std::array<char, 4> TILE_PACKET_MAGIC = {'R', 'B', 'T', 'L'};
 constexpr std::array<char, 4> DONE_PACKET_MAGIC = {'R', 'B', 'T', 'D'};
 constexpr std::array<char, 4> BATCH_DONE_PACKET_MAGIC = {'R', 'B', 'T', 'B'};
 constexpr std::array<char, 4> BATCH_COMMAND_MAGIC = {'R', 'B', 'T', 'C'};
+constexpr std::array<char, 4> PHASE_PACKET_MAGIC = {'R', 'B', 'T', 'P'};
 constexpr size_t WORKER_PIPE_BUFFER_RESERVE = static_cast<size_t>(256U) * 1024U;
 constexpr size_t WORKER_PIPE_DRAIN_BYTE_BUDGET = static_cast<size_t>(8U) * 1024U * 1024U;
-constexpr size_t WORKER_OUTPUT_QUEUE_BYTE_LIMIT = static_cast<size_t>(8U) * 1024U * 1024U;
-constexpr size_t WORKER_OUTPUT_BATCH_BYTE_LIMIT = static_cast<size_t>(1024U) * 1024U;
 constexpr int WORKER_PIPE_IDLE_POLL_TIMEOUT_MS = 5;
+constexpr double COORDINATOR_STALL_REPORT_SECONDS = 15.0;
 constexpr double STATUS_UPDATE_INTERVAL_SECONDS = 0.75;
 constexpr double PREVIEW_UPDATE_INTERVAL_SECONDS = 10.0;
 constexpr double WORKER_CANCEL_KILL_AFTER_SECONDS = 2.0;
@@ -64,6 +63,7 @@ constexpr double WORKER_EXIT_GIVE_UP_AFTER_SECONDS = 10.0;
 constexpr long WORKER_WAIT_POLL_NS = 50'000'000L;
 constexpr int WORKER_STDOUT_FD = 1;
 constexpr int WORKER_COMMAND_FD = 0;
+constexpr int WORKER_CHILD_FD_CLOSE_LIMIT = 256;
 constexpr int IPC_SAFE_DEFAULT_TILE_SIZE = 24;
 volatile sig_atomic_t g_cancel_signal = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
@@ -99,6 +99,16 @@ struct IpcWorkerSpec {
     std::string hostname;
     bool local = false;
     bool command_stream = false;
+};
+
+enum class WorkerPhase : uint8_t {
+    STARTED = 1,
+    SCENE_LOADED = 2,
+    SCENE_LOAD_FAILED = 3,
+    BATCH_BEGIN = 4,
+    BATCH_RENDERED = 5,
+    BATCH_WRITING = 6,
+    DONE_SENDING = 7,
 };
 
 struct TilePacketHeader {
@@ -140,6 +150,16 @@ struct WorkerBatchDonePacket {
     uint32_t render_cpu_ms = 0;
 };
 
+struct WorkerPhasePacket {
+    std::array<char, 4> magic = PHASE_PACKET_MAGIC;
+    uint32_t worker_id = 0;
+    uint32_t phase = 0;
+    uint32_t batch_start = 0;
+    uint32_t batch_count = 0;
+    uint32_t detail0 = 0;
+    uint32_t detail1 = 0;
+};
+
 struct WorkerBatchCommand {
     std::array<char, 4> magic = BATCH_COMMAND_MAGIC;
     uint32_t batch_start = 0;
@@ -152,6 +172,8 @@ static_assert(offsetof(WorkerDonePacket, magic) == 0);
 static_assert(sizeof(WorkerDonePacket) >= sizeof(TilePacketHeader));
 static_assert(offsetof(WorkerBatchDonePacket, magic) == 0);
 static_assert(sizeof(WorkerBatchDonePacket) >= sizeof(TilePacketHeader));
+static_assert(offsetof(WorkerPhasePacket, magic) == 0);
+static_assert(sizeof(WorkerPhasePacket) == sizeof(TilePacketHeader));
 static_assert(offsetof(WorkerBatchCommand, magic) == 0);
 static_assert(sizeof(TilePacketHeader) % alignof(float) == 0);
 
@@ -183,36 +205,33 @@ struct ChildWorker {
     uint64_t done_end_cpu = UINT32_MAX;
     uint64_t read_bytes = 0;
     uint64_t read_calls = 0;
+    uint64_t assigned_batches = 0;
+    uint64_t batch_done_packets = 0;
+    uint64_t phase_packets = 0;
+    uint32_t last_phase = 0;
+    uint32_t last_phase_batch_start = 0;
+    uint32_t last_phase_batch_count = 0;
+    uint32_t last_phase_detail0 = 0;
+    uint32_t last_phase_detail1 = 0;
+    uint64_t last_batch_rendered_tiles = 0;
+    uint64_t last_batch_sent_tiles = 0;
+    bool last_batch_failed = false;
+    uint64_t last_batch_elapsed_ms = 0;
     double launched_at = 0.0;
     double first_packet_at = 0.0;
+    double last_read_at = 0.0;
+    double last_assignment_at = 0.0;
+    double last_batch_done_at = 0.0;
+    double last_phase_at = 0.0;
     double closed_at = 0.0;
     std::string hostname;
+    bool local = false;
     std::vector<unsigned char> buffer;
     bool pipe_open = true;
     bool command_stream = false;
     bool ready_for_batch = false;
     bool stop_sent = false;
     bool drain_budget_hit = false;
-};
-
-struct WorkerOutputQueue {
-    mtx_t lock{};
-    cnd_t not_empty{};
-    cnd_t not_full{};
-    cnd_t drained{};
-    std::deque<std::vector<unsigned char> > packets;
-    size_t queued_bytes = 0;
-    bool stop = false;
-    bool failed = false;
-    bool writer_active = false;
-};
-
-struct WorkerOutputRuntime {
-    WorkerOutputQueue queue{};
-    thrd_t writer{};
-    bool running = false;
-    mtx_t direct_lock{};
-    bool direct_lock_initialized = false;
 };
 
 struct HostIpcProfile {
@@ -286,42 +305,19 @@ struct ThreadState {
     uint64_t seed = 0;
 };
 
-struct WorkerThreadState {
+struct WorkerBatchRenderThreadState {
     const tracebench::Scene* scene = nullptr;
     const tracebench::Options* options = nullptr;
     const std::vector<tracebench::Tile>* tiles = nullptr;
     std::atomic<int>* next_tile = nullptr;
     std::atomic<bool>* failed = nullptr;
     std::atomic<uint64_t>* tiles_rendered = nullptr;
-    std::atomic<uint64_t>* tiles_sent = nullptr;
-    WorkerOutputQueue* output_queue = nullptr;
-    mtx_t* output_lock = nullptr;
+    std::vector<std::vector<unsigned char> >* packets = nullptr;
     std::span<unsigned char> packet_buffer;
     double render_seconds = 0.0;
     double render_cpu_seconds = 0.0;
-    double send_seconds = 0.0;
 };
 
-struct CommandStreamThreadPool {
-    const std::vector<tracebench::Tile>* tiles = nullptr;
-    std::atomic<int> next_tile{0};
-    std::atomic<bool> failed{false};
-    std::atomic<uint64_t> tiles_rendered{0};
-    std::atomic<uint64_t> tiles_sent{0};
-    mtx_t lock{};
-    cnd_t wake{};
-    cnd_t done{};
-    size_t batch_start = 0;
-    size_t batch_count = 0;
-    int active_threads = 0;
-    uint64_t generation = 0;
-    bool stop = false;
-};
-
-struct CommandStreamThreadState {
-    CommandStreamThreadPool* pool = nullptr;
-    WorkerThreadState worker;
-};
 #endif
 
 #if !TRACEBENCH_ENABLE_MPI
@@ -346,10 +342,14 @@ auto cancel_exit_code() -> int {
 }
 
 void apply_distributed_ipc_defaults(tracebench::Options& options) {
-    if (options.tile_size_explicit || options.tile_size <= IPC_SAFE_DEFAULT_TILE_SIZE) {
+    if (options.tile_size <= IPC_SAFE_DEFAULT_TILE_SIZE) {
         return;
     }
 
+    if (options.tile_size_explicit) {
+        std::println(stderr, "renderbench: distributed ipc tile-size {} exceeds chunk-safe max {}; using {}", options.tile_size,
+                     IPC_SAFE_DEFAULT_TILE_SIZE, IPC_SAFE_DEFAULT_TILE_SIZE);
+    }
     options.tile_size = IPC_SAFE_DEFAULT_TILE_SIZE;
 }
 
@@ -633,230 +633,6 @@ auto write_all(int fd, std::span<const unsigned char> bytes) -> bool {
     return true;
 }
 
-void mark_output_queue_failed_locked(WorkerOutputQueue& queue) {
-    queue.failed = true;
-    (void)cnd_broadcast(&queue.not_full);
-    (void)cnd_broadcast(&queue.not_empty);
-    (void)cnd_broadcast(&queue.drained);
-}
-
-auto init_output_queue(WorkerOutputQueue& queue) -> bool {
-    if (mtx_init(&queue.lock, MTX_PLAIN) != THRD_SUCCESS) {
-        return false;
-    }
-    if (cnd_init(&queue.not_empty) != THRD_SUCCESS) {
-        mtx_destroy(&queue.lock);
-        return false;
-    }
-    if (cnd_init(&queue.not_full) != THRD_SUCCESS) {
-        cnd_destroy(&queue.not_empty);
-        mtx_destroy(&queue.lock);
-        return false;
-    }
-    if (cnd_init(&queue.drained) != THRD_SUCCESS) {
-        cnd_destroy(&queue.not_full);
-        cnd_destroy(&queue.not_empty);
-        mtx_destroy(&queue.lock);
-        return false;
-    }
-    return true;
-}
-
-void destroy_output_queue(WorkerOutputQueue& queue) {
-    cnd_destroy(&queue.drained);
-    cnd_destroy(&queue.not_full);
-    cnd_destroy(&queue.not_empty);
-    mtx_destroy(&queue.lock);
-}
-
-auto enqueue_output_packet(WorkerOutputQueue& queue, std::span<const unsigned char> bytes) -> bool {
-    std::vector<unsigned char> packet(bytes.begin(), bytes.end());
-    mtx_lock(&queue.lock);
-    while (!queue.failed && !queue.stop && !queue.packets.empty() && queue.queued_bytes + packet.size() > WORKER_OUTPUT_QUEUE_BYTE_LIMIT) {
-        (void)cnd_wait(&queue.not_full, &queue.lock);
-        if (cancel_requested()) {
-            mark_output_queue_failed_locked(queue);
-        }
-    }
-    if (queue.failed || queue.stop || cancel_requested()) {
-        if (cancel_requested()) {
-            mark_output_queue_failed_locked(queue);
-        }
-        mtx_unlock(&queue.lock);
-        return false;
-    }
-    queue.queued_bytes += packet.size();
-    queue.packets.push_back(std::move(packet));
-    (void)cnd_signal(&queue.not_empty);
-    mtx_unlock(&queue.lock);
-    return true;
-}
-
-auto wait_output_queue_drained(WorkerOutputQueue& queue) -> bool {
-    mtx_lock(&queue.lock);
-    while (!queue.failed && (!queue.packets.empty() || queue.writer_active)) {
-        (void)cnd_wait(&queue.drained, &queue.lock);
-        if (cancel_requested()) {
-            mark_output_queue_failed_locked(queue);
-        }
-    }
-    bool const OK = !queue.failed;
-    mtx_unlock(&queue.lock);
-    return OK;
-}
-
-auto output_writer_thread(void* raw) -> int {
-    auto* queue = static_cast<WorkerOutputQueue*>(raw);
-    std::vector<unsigned char> batch;
-    batch.reserve(WORKER_OUTPUT_BATCH_BYTE_LIMIT);
-    for (;;) {
-        mtx_lock(&queue->lock);
-        while (!queue->stop && !queue->failed && queue->packets.empty()) {
-            (void)cnd_wait(&queue->not_empty, &queue->lock);
-            if (cancel_requested()) {
-                mark_output_queue_failed_locked(*queue);
-            }
-        }
-        if ((queue->stop || queue->failed) && queue->packets.empty()) {
-            (void)cnd_broadcast(&queue->drained);
-            mtx_unlock(&queue->lock);
-            break;
-        }
-
-        queue->writer_active = true;
-        batch.clear();
-        while (!queue->packets.empty() &&
-               (batch.empty() || batch.size() + queue->packets.front().size() <= WORKER_OUTPUT_BATCH_BYTE_LIMIT)) {
-            auto& packet = queue->packets.front();
-            batch.insert(batch.end(), packet.begin(), packet.end());
-            queue->queued_bytes -= packet.size();
-            queue->packets.pop_front();
-        }
-        (void)cnd_broadcast(&queue->not_full);
-        mtx_unlock(&queue->lock);
-
-        bool const WROTE = write_all(WORKER_STDOUT_FD, std::span<const unsigned char>(batch.data(), batch.size()));
-
-        mtx_lock(&queue->lock);
-        queue->writer_active = false;
-        if (!WROTE) {
-            queue->failed = true;
-        }
-        if (queue->packets.empty()) {
-            (void)cnd_broadcast(&queue->drained);
-        }
-        if (queue->failed) {
-            (void)cnd_broadcast(&queue->not_full);
-            (void)cnd_broadcast(&queue->not_empty);
-        }
-        mtx_unlock(&queue->lock);
-
-        if (!WROTE) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-auto stop_output_writer(WorkerOutputQueue& queue, thrd_t writer) -> bool {
-    mtx_lock(&queue.lock);
-    queue.stop = true;
-    (void)cnd_signal(&queue.not_empty);
-    mtx_unlock(&queue.lock);
-    int result = 0;
-    thrd_join(writer, &result);
-    mtx_lock(&queue.lock);
-    bool const OK = !queue.failed && result == 0;
-    mtx_unlock(&queue.lock);
-    return OK;
-}
-
-auto start_output_runtime(WorkerOutputRuntime& output) -> bool {
-    if (!init_output_queue(output.queue)) {
-        return false;
-    }
-    if (thrd_create(&output.writer, output_writer_thread, &output.queue) != THRD_SUCCESS) {
-        destroy_output_queue(output.queue);
-        return false;
-    }
-    output.running = true;
-    return true;
-}
-
-auto stop_output_runtime(WorkerOutputRuntime& output) -> bool {
-    if (!output.running) {
-        return true;
-    }
-    bool const OK = stop_output_writer(output.queue, output.writer);
-    destroy_output_queue(output.queue);
-    output.running = false;
-    return OK;
-}
-
-auto active_output_queue(WorkerOutputRuntime& output) -> WorkerOutputQueue* { return output.running ? &output.queue : nullptr; }
-
-auto start_direct_output_runtime(WorkerOutputRuntime& output, int worker_threads) -> bool {
-    if (worker_threads <= 1) {
-        return true;
-    }
-    if (mtx_init(&output.direct_lock, MTX_PLAIN) != THRD_SUCCESS) {
-        return false;
-    }
-    output.direct_lock_initialized = true;
-    return true;
-}
-
-void stop_direct_output_runtime(WorkerOutputRuntime& output) {
-    if (!output.direct_lock_initialized) {
-        return;
-    }
-    mtx_destroy(&output.direct_lock);
-    output.direct_lock_initialized = false;
-}
-
-auto start_worker_output_runtime(WorkerOutputRuntime& output, bool use_output_queue, int worker_threads) -> bool {
-    if (use_output_queue) {
-        return start_output_runtime(output);
-    }
-    return start_direct_output_runtime(output, worker_threads);
-}
-
-auto stop_worker_output_runtime(WorkerOutputRuntime& output) -> bool {
-    bool const OK = stop_output_runtime(output);
-    stop_direct_output_runtime(output);
-    return OK;
-}
-
-auto active_output_lock(WorkerOutputRuntime& output) -> mtx_t* { return output.direct_lock_initialized ? &output.direct_lock : nullptr; }
-
-auto wait_worker_output_drained(WorkerOutputQueue* queue) -> bool {
-    if (queue == nullptr) {
-        return true;
-    }
-    return wait_output_queue_drained(*queue);
-}
-
-auto single_thread_worker_queue_disabled(const tracebench::Options& options, int worker_threads) -> bool {
-    return options.disable_single_thread_worker_queue && worker_threads == 1;
-}
-
-auto worker_output_queue_disabled(const tracebench::Options& options, int worker_threads) -> bool {
-    return options.disable_worker_output_queue || single_thread_worker_queue_disabled(options, worker_threads);
-}
-
-auto send_worker_output_packet(WorkerThreadState& state, std::span<const unsigned char> bytes) -> bool {
-    if (state.output_queue == nullptr) {
-        if (state.output_lock == nullptr) {
-            return write_all(WORKER_STDOUT_FD, bytes);
-        }
-        mtx_lock(state.output_lock);
-        bool const OK = write_all(WORKER_STDOUT_FD, bytes);
-        mtx_unlock(state.output_lock);
-        return OK;
-    }
-    return enqueue_output_packet(*state.output_queue, bytes);
-}
-
 auto read_exact(int fd, std::span<unsigned char> bytes) -> bool {
     while (!bytes.empty()) {
         if (cancel_requested()) {
@@ -901,6 +677,21 @@ auto current_thread_cpu_seconds() -> double {
 auto current_worker_cpu() -> uint32_t {
     uint64_t const CPU = ker::multiproc::getcurrent_cpu();
     return CPU <= UINT32_MAX ? static_cast<uint32_t>(CPU) : UINT32_MAX;
+}
+
+auto send_worker_phase_packet(int fd, int worker_id, WorkerPhase phase, uint64_t batch_start, uint64_t batch_count, uint64_t detail0 = 0,
+                              uint64_t detail1 = 0) -> bool {
+    WorkerPhasePacket const PACKET = {
+        .magic = PHASE_PACKET_MAGIC,
+        .worker_id = static_cast<uint32_t>(std::max(0, worker_id)),
+        .phase = static_cast<uint32_t>(phase),
+        .batch_start = static_cast<uint32_t>(std::min<uint64_t>(batch_start, UINT32_MAX)),
+        .batch_count = static_cast<uint32_t>(std::min<uint64_t>(batch_count, UINT32_MAX)),
+        .detail0 = static_cast<uint32_t>(std::min<uint64_t>(detail0, UINT32_MAX)),
+        .detail1 = static_cast<uint32_t>(std::min<uint64_t>(detail1, UINT32_MAX)),
+    };
+    auto const* bytes = reinterpret_cast<const unsigned char*>(&PACKET);
+    return write_all(fd, std::span<const unsigned char>(bytes, sizeof(PACKET)));
 }
 
 auto send_worker_done_packet(int fd, int worker_id, uint64_t expected_tiles, uint64_t rendered_tiles, uint64_t sent_tiles, bool failed,
@@ -964,7 +755,16 @@ auto read_worker_batch_command(int fd, WorkerBatchCommand& command) -> bool {
     return command.magic == BATCH_COMMAND_MAGIC;
 }
 
-auto render_worker_tile(WorkerThreadState& state, const tracebench::Tile& tile) -> bool {
+auto one_shot_worker_render_threads(const tracebench::Options& options, const WorkerInvocation& worker) -> int {
+    int const REQUESTED = std::max(1, worker.worker_threads);
+    if (!worker.command_stream && worker.batch_count > 0 && options.placement == tracebench::Placement::NodeThreads) {
+        // Dynamic node-thread batches are short-lived; avoid creating a new thread fanout for every batch process.
+        return 1;
+    }
+    return REQUESTED;
+}
+
+auto render_worker_tile_packet(WorkerBatchRenderThreadState& state, int tile_offset, const tracebench::Tile& tile) -> bool {
     if (cancel_requested()) {
         state.failed->store(true, std::memory_order_relaxed);
         return false;
@@ -972,7 +772,7 @@ auto render_worker_tile(WorkerThreadState& state, const tracebench::Tile& tile) 
     size_t const PAYLOAD_FLOATS = tile_float_count(tile);
     size_t const PAYLOAD_BYTES = PAYLOAD_FLOATS * sizeof(float);
     size_t const PACKET_BYTES = sizeof(TilePacketHeader) + PAYLOAD_BYTES;
-    if (state.packet_buffer.size() < PACKET_BYTES) {
+    if (state.packet_buffer.size() < PACKET_BYTES || tile_offset < 0 || std::cmp_greater_equal(tile_offset, state.packets->size())) {
         state.failed->store(true, std::memory_order_relaxed);
         return false;
     }
@@ -988,30 +788,21 @@ auto render_worker_tile(WorkerThreadState& state, const tracebench::Tile& tile) 
     if (RENDER_CPU_FINISHED >= RENDER_CPU_STARTED) {
         state.render_cpu_seconds += RENDER_CPU_FINISHED - RENDER_CPU_STARTED;
     }
-    if (!RENDERED) {
+    if (!RENDERED || cancel_requested()) {
         state.failed->store(true, std::memory_order_relaxed);
         return false;
     }
-    if (cancel_requested()) {
-        state.failed->store(true, std::memory_order_relaxed);
-        return false;
-    }
-    state.tiles_rendered->fetch_add(1, std::memory_order_relaxed);
+
     TilePacketHeader const HEADER = make_tile_packet_header(tile, tile_payload.size());
     std::memcpy(state.packet_buffer.data(), &HEADER, sizeof(HEADER));
-    double const SEND_STARTED = tracebench::monotonic_seconds();
-    bool const SENT = send_worker_output_packet(state, state.packet_buffer.first(PACKET_BYTES));
-    state.send_seconds += tracebench::monotonic_seconds() - SEND_STARTED;
-    if (!SENT) {
-        state.failed->store(true, std::memory_order_relaxed);
-        return false;
-    }
-    state.tiles_sent->fetch_add(1, std::memory_order_relaxed);
+    auto& packet = state.packets->at(static_cast<size_t>(tile_offset));
+    packet.assign(state.packet_buffer.begin(), state.packet_buffer.begin() + static_cast<ptrdiff_t>(PACKET_BYTES));
+    state.tiles_rendered->fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
-auto worker_thread(void* raw) -> int {
-    auto* state = static_cast<WorkerThreadState*>(raw);
+auto batch_render_thread(void* raw) -> int {
+    auto* state = static_cast<WorkerBatchRenderThreadState*>(raw);
     for (;;) {
         if (cancel_requested()) {
             state->failed->store(true, std::memory_order_relaxed);
@@ -1025,62 +816,9 @@ auto worker_thread(void* raw) -> int {
             break;
         }
         const auto& tile = state->tiles->at(static_cast<size_t>(INDEX));
-        if (!render_worker_tile(*state, tile)) {
+        if (!render_worker_tile_packet(*state, INDEX, tile)) {
             break;
         }
-    }
-    return 0;
-}
-
-auto command_stream_worker_thread(void* raw) -> int {
-    auto* state = static_cast<CommandStreamThreadState*>(raw);
-    auto* pool = state->pool;
-    uint64_t seen_generation = 0;
-    for (;;) {
-        mtx_lock(&pool->lock);
-        while (!pool->stop && !cancel_requested() && pool->generation == seen_generation) {
-            (void)cnd_wait(&pool->wake, &pool->lock);
-        }
-        if (cancel_requested()) {
-            pool->failed.store(true, std::memory_order_relaxed);
-        }
-        if (pool->stop || cancel_requested()) {
-            mtx_unlock(&pool->lock);
-            break;
-        }
-        seen_generation = pool->generation;
-        size_t const BATCH_START = pool->batch_start;
-        size_t const BATCH_COUNT = pool->batch_count;
-        mtx_unlock(&pool->lock);
-
-        for (;;) {
-            if (cancel_requested()) {
-                pool->failed.store(true, std::memory_order_relaxed);
-                break;
-            }
-            if (pool->failed.load(std::memory_order_relaxed)) {
-                break;
-            }
-            int const OFFSET = pool->next_tile.fetch_add(1, std::memory_order_relaxed);
-            if (std::cmp_greater_equal(OFFSET, BATCH_COUNT)) {
-                break;
-            }
-            size_t const TILE_INDEX = BATCH_START + static_cast<size_t>(OFFSET);
-            if (TILE_INDEX >= pool->tiles->size()) {
-                pool->failed.store(true, std::memory_order_relaxed);
-                break;
-            }
-            if (!render_worker_tile(state->worker, pool->tiles->at(TILE_INDEX))) {
-                break;
-            }
-        }
-
-        mtx_lock(&pool->lock);
-        --pool->active_threads;
-        if (pool->active_threads == 0) {
-            (void)cnd_signal(&pool->done);
-        }
-        mtx_unlock(&pool->lock);
     }
     return 0;
 }
@@ -1123,6 +861,7 @@ enum class WorkerPacketKind : uint8_t {
     TILE,
     DONE,
     BATCH_DONE,
+    PHASE,
 };
 
 auto packet_magic_at(const std::vector<unsigned char>& bytes, size_t offset, std::span<const char, 4> magic) -> bool {
@@ -1146,6 +885,9 @@ auto packet_kind_at(const std::vector<unsigned char>& bytes, size_t offset) -> W
     }
     if (packet_magic_at(bytes, offset, BATCH_DONE_PACKET_MAGIC)) {
         return WorkerPacketKind::BATCH_DONE;
+    }
+    if (packet_magic_at(bytes, offset, PHASE_PACKET_MAGIC)) {
+        return WorkerPacketKind::PHASE;
     }
     return WorkerPacketKind::NONE;
 }
@@ -1210,6 +952,41 @@ auto validate_tile_header(tracebench::FilmView film, const TilePacketHeader& hea
     return header.float_count == payload_floats;
 }
 
+auto worker_phase_name(uint32_t phase) -> std::string_view {
+    switch (phase) {
+        case static_cast<uint32_t>(WorkerPhase::STARTED):
+            return "started";
+        case static_cast<uint32_t>(WorkerPhase::SCENE_LOADED):
+            return "scene-loaded";
+        case static_cast<uint32_t>(WorkerPhase::SCENE_LOAD_FAILED):
+            return "scene-load-failed";
+        case static_cast<uint32_t>(WorkerPhase::BATCH_BEGIN):
+            return "batch-begin";
+        case static_cast<uint32_t>(WorkerPhase::BATCH_RENDERED):
+            return "batch-rendered";
+        case static_cast<uint32_t>(WorkerPhase::BATCH_WRITING):
+            return "batch-writing";
+        case static_cast<uint32_t>(WorkerPhase::DONE_SENDING):
+            return "done-sending";
+        default:
+            return "unknown";
+    }
+}
+
+void note_worker_phase_packet(ChildWorker& worker, const WorkerPhasePacket& packet) {
+    ++worker.phase_packets;
+    worker.last_phase = packet.phase;
+    worker.last_phase_batch_start = packet.batch_start;
+    worker.last_phase_batch_count = packet.batch_count;
+    worker.last_phase_detail0 = packet.detail0;
+    worker.last_phase_detail1 = packet.detail1;
+    worker.last_phase_at = tracebench::monotonic_seconds();
+    if (packet.worker_id != static_cast<uint32_t>(worker.worker_id)) {
+        std::println(stderr, "renderbench: phase packet from {} reported worker {} expected {}", worker.hostname, packet.worker_id,
+                     worker.worker_id);
+    }
+}
+
 void note_worker_done_packet(ChildWorker& worker, const WorkerDonePacket& packet) {
     if (worker.done_seen) {
         std::println(stderr, "renderbench: duplicate done packet from {}", worker.hostname);
@@ -1243,6 +1020,12 @@ void note_worker_done_packet(ChildWorker& worker, const WorkerDonePacket& packet
 }
 
 void note_worker_batch_done_packet(ChildWorker& worker, const WorkerBatchDonePacket& packet) {
+    ++worker.batch_done_packets;
+    worker.last_batch_done_at = tracebench::monotonic_seconds();
+    worker.last_batch_rendered_tiles = packet.rendered_tiles;
+    worker.last_batch_sent_tiles = packet.sent_tiles;
+    worker.last_batch_failed = packet.failed != 0;
+    worker.last_batch_elapsed_ms = packet.elapsed_ms;
     if (packet.worker_id != static_cast<uint32_t>(worker.worker_id)) {
         std::println(stderr, "renderbench: batch-done packet from {} reported worker {} expected {}", worker.hostname, packet.worker_id,
                      worker.worker_id);
@@ -1329,6 +1112,17 @@ auto parse_worker_packets(ChildWorker& worker, tracebench::FilmView film, std::v
             continue;
         }
 
+        if (KIND == WorkerPacketKind::PHASE) {
+            if (worker.buffer.size() - consumed < sizeof(WorkerPhasePacket)) {
+                break;
+            }
+            WorkerPhasePacket packet = {};
+            std::memcpy(&packet, worker.buffer.data() + consumed, sizeof(packet));
+            note_worker_phase_packet(worker, packet);
+            consumed += sizeof(packet);
+            continue;
+        }
+
         TilePacketHeader header = {};
         std::memcpy(&header, worker.buffer.data() + consumed, sizeof(header));
 
@@ -1388,9 +1182,11 @@ auto drain_ready_worker_pipe(ChildWorker& worker, tracebench::FilmView film, std
     while (worker.read_fd >= 0 && drained_bytes < WORKER_PIPE_DRAIN_BYTE_BUDGET) {
         ssize_t const READ = ::read(worker.read_fd, chunk.data(), chunk.size());
         if (READ > 0) {
+            double const NOW = tracebench::monotonic_seconds();
             if (worker.first_packet_at == 0.0) {
-                worker.first_packet_at = tracebench::monotonic_seconds();
+                worker.first_packet_at = NOW;
             }
+            worker.last_read_at = NOW;
             worker.read_calls++;
             worker.read_bytes += static_cast<uint64_t>(READ);
             drained_bytes += static_cast<size_t>(READ);
@@ -1484,6 +1280,12 @@ void install_worker_scene_vfs_policy(const tracebench::Options& options, const I
     add_local_rule("/srv", "scene reads");
 }
 
+void close_worker_child_extra_fds() {
+    for (int fd = 3; fd < WORKER_CHILD_FD_CLOSE_LIMIT; ++fd) {
+        (void)::close(fd);
+    }
+}
+
 auto make_worker_args(const std::string& program_path, const tracebench::Options& options, const IpcWorkerSpec& spec)
     -> std::vector<std::string> {
     std::vector<std::string> args{
@@ -1570,6 +1372,7 @@ auto make_worker_args(const std::string& program_path, const tracebench::Options
     if (stdout_fd != WORKER_STDOUT_FD) {
         ::close(stdout_fd);
     }
+    close_worker_child_extra_fds();
 
     install_worker_scene_vfs_policy(options, spec);
 
@@ -1657,6 +1460,7 @@ auto launch_worker(const std::string& program_path, const tracebench::Options& o
         .expected_tiles = static_cast<uint64_t>(std::max(0, spec.batch_count)),
         .launched_at = tracebench::monotonic_seconds(),
         .hostname = spec.hostname,
+        .local = spec.local,
         .buffer = {},
         .pipe_open = true,
         .command_stream = spec.command_stream,
@@ -1952,6 +1756,7 @@ auto assign_worker_batch(ChildWorker& worker, std::span<const tracebench::Tile> 
         if (!send_worker_batch_command(worker.write_fd, 0, 0, true)) {
             return -1;
         }
+        worker.last_assignment_at = tracebench::monotonic_seconds();
         ::close(worker.write_fd);
         worker.write_fd = -1;
         worker.stop_sent = true;
@@ -1977,6 +1782,8 @@ auto assign_worker_batch(ChildWorker& worker, std::span<const tracebench::Tile> 
     worker.batch_start = static_cast<int>(START);
     worker.batch_count = static_cast<int>(COUNT);
     worker.expected_tiles += COUNT;
+    ++worker.assigned_batches;
+    worker.last_assignment_at = tracebench::monotonic_seconds();
     worker.ready_for_batch = false;
     return 1;
 }
@@ -2014,6 +1821,55 @@ auto should_poll_workers_immediately(std::span<const ChildWorker> workers) -> bo
     return std::ranges::any_of(workers, [](const ChildWorker& worker) {
         return worker.pipe_open && worker.read_fd >= 0 && (worker.drain_budget_hit || !worker.buffer.empty());
     });
+}
+
+auto worker_event_age_seconds(double now, double event_at) -> double {
+    if (event_at <= 0.0 || now < event_at) {
+        return -1.0;
+    }
+    return now - event_at;
+}
+
+auto worker_last_tile_label(const ChildWorker& worker) -> std::string {
+    if (worker.last_tile_index == UINT64_MAX) {
+        return "none";
+    }
+    return std::to_string(worker.last_tile_index);
+}
+
+auto worker_phase_label(const ChildWorker& worker) -> std::string_view {
+    if (worker.phase_packets == 0) {
+        return "none";
+    }
+    return worker_phase_name(worker.last_phase);
+}
+
+void print_worker_stall_report(std::span<const ChildWorker> workers, uint64_t tiles_done, size_t total_tiles, size_t next_tile_position,
+                               size_t open_pipes, int batch_size, double now) {
+    std::println(stderr,
+                 "renderbench: ipc stall: no completed tile progress for {:.1f}s tiles={}/{} next_tile={} open_pipes={} batch_size={}",
+                 COORDINATOR_STALL_REPORT_SECONDS, tiles_done, total_tiles, next_tile_position, open_pipes, batch_size);
+    for (const auto& worker : workers) {
+        if (!worker.pipe_open) {
+            continue;
+        }
+        std::println(stderr,
+                     "renderbench: ipc stall worker={} host={} local={} pid={} fd={} ready={} stop={} command_stream={} batch={}+{} "
+                     "expected={} unique={} packets={} assigned_batches={} batch_done={} last_batch_rendered={} last_batch_sent={} "
+                     "last_batch_failed={} last_batch_elapsed_ms={} read_bytes={} read_calls={} buffered={} last_tile={} done={} "
+                     "failed={} drain_budget={} phase_packets={} phase={} phase_batch={}+{} phase_detail={}/{} age_read_s={:.3f} "
+                     "age_assign_s={:.3f} age_batch_done_s={:.3f} age_phase_s={:.3f}",
+                     worker.worker_id, worker.hostname, worker.local ? 1 : 0, worker.pid, worker.read_fd, worker.ready_for_batch ? 1 : 0,
+                     worker.stop_sent ? 1 : 0, worker.command_stream ? 1 : 0, worker.batch_start, worker.batch_count, worker.expected_tiles,
+                     worker.unique_tiles, worker.received_packets, worker.assigned_batches, worker.batch_done_packets,
+                     worker.last_batch_rendered_tiles, worker.last_batch_sent_tiles, worker.last_batch_failed ? 1 : 0,
+                     worker.last_batch_elapsed_ms, worker.read_bytes, worker.read_calls, worker.buffer.size(),
+                     worker_last_tile_label(worker), worker.done_seen ? 1 : 0, worker.done_failed ? 1 : 0, worker.drain_budget_hit ? 1 : 0,
+                     worker.phase_packets, worker_phase_label(worker), worker.last_phase_batch_start, worker.last_phase_batch_count,
+                     worker.last_phase_detail0, worker.last_phase_detail1, worker_event_age_seconds(now, worker.last_read_at),
+                     worker_event_age_seconds(now, worker.last_assignment_at), worker_event_age_seconds(now, worker.last_batch_done_at),
+                     worker_event_age_seconds(now, worker.last_phase_at));
+    }
 }
 
 void wait_for_worker_pipe_activity(std::span<const ChildWorker> workers, int timeout_ms) {
@@ -2464,11 +2320,17 @@ auto run_node_threads(const tracebench::Options& options) -> int {
 auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& worker) -> int {
     double const WORKER_STARTED = tracebench::monotonic_seconds();
     uint32_t const WORKER_START_CPU = current_worker_cpu();
+    (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::STARTED, worker.batch_start, worker.batch_count,
+                                   worker.command_stream ? 1U : 0U, static_cast<uint32_t>(worker.worker_threads));
     auto scene = tracebench::load_scene(options.scene_path);
     if (!scene) {
+        (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::SCENE_LOAD_FAILED, worker.batch_start,
+                                       worker.batch_count);
         return 2;
     }
     auto all_tiles = tracebench::make_tiles(options.width, options.height, options.tile_size);
+    (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::SCENE_LOADED, worker.batch_start, worker.batch_count,
+                                   all_tiles.size(), static_cast<uint32_t>(options.tile_size));
     if (options.placement == tracebench::Placement::ProcessPerCore) {
         scramble_process_tiles(all_tiles);
     }
@@ -2483,35 +2345,6 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
         for (auto& packet : thread_packets) {
             packet.resize(MAX_PACKET_BYTES);
         }
-        std::vector<thrd_t> threads(static_cast<size_t>(THREADS));
-        std::vector<CommandStreamThreadState> states(static_cast<size_t>(THREADS));
-        WorkerOutputRuntime output{};
-        bool const USE_OUTPUT_QUEUE = !worker_output_queue_disabled(options, THREADS);
-        if (!start_worker_output_runtime(output, USE_OUTPUT_QUEUE, THREADS)) {
-            std::println(stderr, "renderbench: failed to initialize worker output path");
-            return 2;
-        }
-        CommandStreamThreadPool pool{};
-        pool.tiles = &all_tiles;
-        if (mtx_init(&pool.lock, MTX_PLAIN) != THRD_SUCCESS) {
-            std::println(stderr, "renderbench: failed to initialize worker pool lock");
-            (void)stop_worker_output_runtime(output);
-            return 2;
-        }
-        if (cnd_init(&pool.wake) != THRD_SUCCESS) {
-            std::println(stderr, "renderbench: failed to initialize worker pool wake condition");
-            mtx_destroy(&pool.lock);
-            (void)stop_worker_output_runtime(output);
-            return 2;
-        }
-        if (cnd_init(&pool.done) != THRD_SUCCESS) {
-            std::println(stderr, "renderbench: failed to initialize worker pool done condition");
-            cnd_destroy(&pool.wake);
-            mtx_destroy(&pool.lock);
-            (void)stop_worker_output_runtime(output);
-            return 2;
-        }
-
         uint64_t total_expected = 0;
         uint64_t total_rendered = 0;
         uint64_t total_sent = 0;
@@ -2519,53 +2352,9 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
         double total_send_seconds = 0.0;
         double total_render_cpu_seconds = 0.0;
         bool failed = false;
-        int created_threads = 0;
-
-        auto stop_threads = [&] {
-            mtx_lock(&pool.lock);
-            pool.stop = true;
-            ++pool.generation;
-            (void)cnd_broadcast(&pool.wake);
-            mtx_unlock(&pool.lock);
-            for (int i = 0; i < created_threads; ++i) {
-                thrd_join(threads.at(static_cast<size_t>(i)), nullptr);
-            }
-            created_threads = 0;
-        };
-
-        for (int i = 0; i < THREADS; ++i) {
-            states.at(static_cast<size_t>(i)) = {
-                .pool = &pool,
-                .worker =
-                    {
-                        .scene = scene.get(),
-                        .options = &options,
-                        .tiles = &all_tiles,
-                        .next_tile = &pool.next_tile,
-                        .failed = &pool.failed,
-                        .tiles_rendered = &pool.tiles_rendered,
-                        .tiles_sent = &pool.tiles_sent,
-                        .output_queue = active_output_queue(output),
-                        .output_lock = active_output_lock(output),
-                        .packet_buffer = std::span<unsigned char>(thread_packets.at(static_cast<size_t>(i)).data(),
-                                                                  thread_packets.at(static_cast<size_t>(i)).size()),
-                    },
-            };
-            if (thrd_create(&threads.at(static_cast<size_t>(i)), command_stream_worker_thread, &states.at(static_cast<size_t>(i))) !=
-                THRD_SUCCESS) {
-                std::println(stderr, "renderbench: failed to start command-stream worker thread {}", i);
-                failed = true;
-                break;
-            }
-            ++created_threads;
-        }
 
         auto run_batch = [&](const WorkerBatchCommand& command) -> bool {
-            if (created_threads != THREADS) {
-                return false;
-            }
             if (cancel_requested()) {
-                pool.failed.store(true, std::memory_order_relaxed);
                 return false;
             }
             size_t const START = std::min(static_cast<size_t>(command.batch_start), all_tiles.size());
@@ -2573,46 +2362,79 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
             size_t const END = std::min(START + COUNT, all_tiles.size());
             size_t const EXPECTED = END - START;
             double const BATCH_STARTED = tracebench::monotonic_seconds();
+            (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_BEGIN, command.batch_start, EXPECTED,
+                                           static_cast<uint32_t>(THREADS));
 
+            std::vector<tracebench::Tile> batch_tiles;
+            batch_tiles.insert(batch_tiles.end(), all_tiles.begin() + static_cast<ptrdiff_t>(START),
+                               all_tiles.begin() + static_cast<ptrdiff_t>(END));
+            std::vector<std::vector<unsigned char> > batch_packets(EXPECTED);
+            std::vector<thrd_t> batch_threads(static_cast<size_t>(THREADS));
+            std::vector<WorkerBatchRenderThreadState> states(static_cast<size_t>(THREADS));
+            std::atomic<int> next_tile{0};
+            std::atomic<bool> batch_failed{false};
+            std::atomic<uint64_t> tiles_rendered{0};
             for (int i = 0; i < THREADS; ++i) {
-                auto& worker_state = states.at(static_cast<size_t>(i)).worker;
-                worker_state.render_seconds = 0.0;
-                worker_state.render_cpu_seconds = 0.0;
-                worker_state.send_seconds = 0.0;
+                states.at(static_cast<size_t>(i)) = {
+                    .scene = scene.get(),
+                    .options = &options,
+                    .tiles = &batch_tiles,
+                    .next_tile = &next_tile,
+                    .failed = &batch_failed,
+                    .tiles_rendered = &tiles_rendered,
+                    .packets = &batch_packets,
+                    .packet_buffer = std::span<unsigned char>(thread_packets.at(static_cast<size_t>(i)).data(),
+                                                              thread_packets.at(static_cast<size_t>(i)).size()),
+                };
             }
 
-            pool.next_tile.store(0, std::memory_order_relaxed);
-            pool.failed.store(false, std::memory_order_relaxed);
-            pool.tiles_rendered.store(0, std::memory_order_relaxed);
-            pool.tiles_sent.store(0, std::memory_order_relaxed);
-            mtx_lock(&pool.lock);
-            pool.batch_start = START;
-            pool.batch_count = EXPECTED;
-            pool.active_threads = THREADS;
-            ++pool.generation;
-            (void)cnd_broadcast(&pool.wake);
-            while (pool.active_threads != 0) {
-                (void)cnd_wait(&pool.done, &pool.lock);
-                if (cancel_requested()) {
-                    pool.failed.store(true, std::memory_order_relaxed);
+            int created_threads = 0;
+            if (THREADS == 1) {
+                (void)batch_render_thread(&states.at(0));
+            } else {
+                for (int i = 0; i < THREADS; ++i) {
+                    if (thrd_create(&batch_threads.at(static_cast<size_t>(i)), batch_render_thread, &states.at(static_cast<size_t>(i))) !=
+                        THRD_SUCCESS) {
+                        std::println(stderr, "renderbench: failed to start command-stream batch thread {}", i);
+                        batch_failed.store(true, std::memory_order_relaxed);
+                        break;
+                    }
+                    ++created_threads;
                 }
             }
-            mtx_unlock(&pool.lock);
+            for (int i = 0; i < created_threads; ++i) {
+                thrd_join(batch_threads.at(static_cast<size_t>(i)), nullptr);
+            }
 
-            uint64_t const RENDERED = pool.tiles_rendered.load(std::memory_order_relaxed);
-            uint64_t const SENT = pool.tiles_sent.load(std::memory_order_relaxed);
+            uint64_t const RENDERED = tiles_rendered.load(std::memory_order_relaxed);
             double render_seconds = 0.0;
-            double send_seconds = 0.0;
             double render_cpu_seconds = 0.0;
             for (int i = 0; i < THREADS; ++i) {
-                render_seconds += states.at(static_cast<size_t>(i)).worker.render_seconds;
-                render_cpu_seconds += states.at(static_cast<size_t>(i)).worker.render_cpu_seconds;
-                send_seconds += states.at(static_cast<size_t>(i)).worker.send_seconds;
+                render_seconds += states.at(static_cast<size_t>(i)).render_seconds;
+                render_cpu_seconds += states.at(static_cast<size_t>(i)).render_cpu_seconds;
             }
-            double const FLUSH_STARTED = tracebench::monotonic_seconds();
-            bool const OUTPUT_DRAINED = wait_worker_output_drained(active_output_queue(output));
-            send_seconds += tracebench::monotonic_seconds() - FLUSH_STARTED;
-            bool const BATCH_FAILED = cancel_requested() || pool.failed.load(std::memory_order_relaxed) || !OUTPUT_DRAINED ||
+            (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_RENDERED, command.batch_start, EXPECTED,
+                                           RENDERED, batch_failed.load(std::memory_order_relaxed) ? 1U : 0U);
+            uint64_t sent = 0;
+            double send_seconds = 0.0;
+            bool output_ok = true;
+            (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_WRITING, command.batch_start, EXPECTED,
+                                           RENDERED);
+            for (const auto& packet : batch_packets) {
+                if (packet.empty()) {
+                    output_ok = false;
+                    break;
+                }
+                double const SEND_STARTED = tracebench::monotonic_seconds();
+                output_ok = write_all(WORKER_STDOUT_FD, std::span<const unsigned char>(packet.data(), packet.size()));
+                send_seconds += tracebench::monotonic_seconds() - SEND_STARTED;
+                if (!output_ok) {
+                    break;
+                }
+                ++sent;
+            }
+            uint64_t const SENT = sent;
+            bool const BATCH_FAILED = cancel_requested() || batch_failed.load(std::memory_order_relaxed) || !output_ok ||
                                       RENDERED != EXPECTED || SENT != EXPECTED;
             total_expected += EXPECTED;
             total_rendered += RENDERED;
@@ -2642,18 +2464,15 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
             }
         }
 
-        stop_threads();
-        bool const OUTPUT_WRITER_OK = stop_worker_output_runtime(output);
-        failed = failed || cancel_requested() || !OUTPUT_WRITER_OK;
+        failed = failed || cancel_requested();
         uint32_t const WORKER_END_CPU = current_worker_cpu();
+        (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::DONE_SENDING, 0, total_expected, total_rendered,
+                                       total_sent);
         bool const DONE_SENT =
             send_worker_done_packet(WORKER_STDOUT_FD, worker.worker_id, total_expected, total_rendered, total_sent, failed,
                                     elapsed_milliseconds_since(WORKER_STARTED), seconds_to_milliseconds(total_render_seconds),
                                     seconds_to_milliseconds(total_send_seconds), seconds_to_milliseconds(total_render_cpu_seconds),
                                     WORKER_START_CPU, WORKER_END_CPU);
-        cnd_destroy(&pool.done);
-        cnd_destroy(&pool.wake);
-        mtx_destroy(&pool.lock);
         return failed || !DONE_SENT ? 2 : 0;
     }
     std::vector<tracebench::Tile> assigned_tiles;
@@ -2670,8 +2489,9 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
             }
         }
     }
-
-    int const THREADS = std::max(1, worker.worker_threads);
+    int const THREADS = one_shot_worker_render_threads(options, worker);
+    (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_BEGIN, worker.batch_start, assigned_tiles.size(),
+                                   static_cast<uint32_t>(THREADS), static_cast<uint32_t>(std::max(1, worker.worker_threads)));
     size_t max_payload_floats = 0;
     for (const auto& tile : assigned_tiles) {
         max_payload_floats = std::max(max_payload_floats, tile_float_count(tile));
@@ -2681,18 +2501,12 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
     for (auto& packet : thread_packets) {
         packet.resize(MAX_PACKET_BYTES);
     }
+    std::vector<std::vector<unsigned char> > batch_packets(assigned_tiles.size());
     std::vector<thrd_t> threads(static_cast<size_t>(THREADS));
-    std::vector<WorkerThreadState> states(static_cast<size_t>(THREADS));
+    std::vector<WorkerBatchRenderThreadState> states(static_cast<size_t>(THREADS));
     std::atomic<int> next_tile{0};
     std::atomic<bool> failed{false};
     std::atomic<uint64_t> tiles_rendered{0};
-    std::atomic<uint64_t> tiles_sent{0};
-    WorkerOutputRuntime output{};
-    bool const USE_OUTPUT_QUEUE = !worker_output_queue_disabled(options, THREADS);
-    if (!start_worker_output_runtime(output, USE_OUTPUT_QUEUE, THREADS)) {
-        std::println(stderr, "renderbench: failed to initialize worker output path");
-        return 2;
-    }
 
     auto init_thread_state = [&](int index) {
         states.at(static_cast<size_t>(index)) = {
@@ -2702,9 +2516,7 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
             .next_tile = &next_tile,
             .failed = &failed,
             .tiles_rendered = &tiles_rendered,
-            .tiles_sent = &tiles_sent,
-            .output_queue = active_output_queue(output),
-            .output_lock = active_output_lock(output),
+            .packets = &batch_packets,
             .packet_buffer = std::span<unsigned char>(thread_packets.at(static_cast<size_t>(index)).data(),
                                                       thread_packets.at(static_cast<size_t>(index)).size()),
         };
@@ -2713,11 +2525,11 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
     int created_threads = 0;
     if (THREADS == 1) {
         init_thread_state(0);
-        (void)worker_thread(&states.at(0));
+        (void)batch_render_thread(&states.at(0));
     } else {
         for (int i = 0; i < THREADS; ++i) {
             init_thread_state(i);
-            if (thrd_create(&threads[static_cast<size_t>(i)], worker_thread, &states[static_cast<size_t>(i)]) != THRD_SUCCESS) {
+            if (thrd_create(&threads[static_cast<size_t>(i)], batch_render_thread, &states[static_cast<size_t>(i)]) != THRD_SUCCESS) {
                 std::println(stderr, "renderbench: failed to start IPC worker thread {}", i);
                 failed.store(true, std::memory_order_relaxed);
                 break;
@@ -2732,23 +2544,38 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
 
     uint64_t const EXPECTED = assigned_tiles.size();
     uint64_t const RENDERED = tiles_rendered.load(std::memory_order_relaxed);
-    uint64_t const SENT = tiles_sent.load(std::memory_order_relaxed);
     int const ACTIVE_STATES = THREADS == 1 ? 1 : created_threads;
     double render_seconds = 0.0;
-    double send_seconds = 0.0;
     double render_cpu_seconds = 0.0;
     for (int i = 0; i < ACTIVE_STATES; ++i) {
         render_seconds += states.at(static_cast<size_t>(i)).render_seconds;
         render_cpu_seconds += states.at(static_cast<size_t>(i)).render_cpu_seconds;
-        send_seconds += states.at(static_cast<size_t>(i)).send_seconds;
     }
-    double const FLUSH_STARTED = tracebench::monotonic_seconds();
-    bool const OUTPUT_DRAINED = wait_worker_output_drained(active_output_queue(output));
-    send_seconds += tracebench::monotonic_seconds() - FLUSH_STARTED;
-    bool const OUTPUT_WRITER_OK = stop_worker_output_runtime(output);
-    bool const WORKER_FAILED = cancel_requested() || failed.load(std::memory_order_relaxed) || !OUTPUT_DRAINED || !OUTPUT_WRITER_OK ||
-                               RENDERED != EXPECTED || SENT != EXPECTED;
+    (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_RENDERED, worker.batch_start, EXPECTED, RENDERED,
+                                   failed.load(std::memory_order_relaxed) ? 1U : 0U);
+    uint64_t sent = 0;
+    double send_seconds = 0.0;
+    bool output_ok = true;
+    (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_WRITING, worker.batch_start, EXPECTED, RENDERED);
+    for (const auto& packet : batch_packets) {
+        if (packet.empty()) {
+            output_ok = false;
+            break;
+        }
+        double const SEND_STARTED = tracebench::monotonic_seconds();
+        output_ok = write_all(WORKER_STDOUT_FD, std::span<const unsigned char>(packet.data(), packet.size()));
+        send_seconds += tracebench::monotonic_seconds() - SEND_STARTED;
+        if (!output_ok) {
+            break;
+        }
+        ++sent;
+    }
+    uint64_t const SENT = sent;
+    bool const WORKER_FAILED =
+        cancel_requested() || failed.load(std::memory_order_relaxed) || !output_ok || RENDERED != EXPECTED || SENT != EXPECTED;
     uint32_t const WORKER_END_CPU = current_worker_cpu();
+    (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::DONE_SENDING, worker.batch_start, EXPECTED, RENDERED,
+                                   SENT);
     bool const DONE_SENT = send_worker_done_packet(WORKER_STDOUT_FD, worker.worker_id, EXPECTED, RENDERED, SENT, WORKER_FAILED,
                                                    elapsed_milliseconds_since(WORKER_STARTED), seconds_to_milliseconds(render_seconds),
                                                    seconds_to_milliseconds(send_seconds), seconds_to_milliseconds(render_cpu_seconds),
@@ -2776,8 +2603,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
     }
 
     bool const USE_PERSISTENT_PROCESS_BATCHES =
-        options.placement == tracebench::Placement::NodeThreads ||
-        (options.placement == tracebench::Placement::ProcessPerCore && options.process_persistent_workers);
+        options.placement == tracebench::Placement::ProcessPerCore && options.process_persistent_workers;
     for (auto& spec : specs) {
         spec.command_stream = USE_PERSISTENT_PROCESS_BATCHES;
     }
@@ -2802,7 +2628,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
         persistent_batch_worker_threads(options, std::span<const IpcWorkerSpec>(specs.data(), specs.size()));
     int const PERSISTENT_BATCH_SIZE =
         USE_PERSISTENT_PROCESS_BATCHES ? dynamic_batch_size(options, tiles.size(), specs.size(), PERSISTENT_BATCH_THREADS, false) : 0;
-    if (USE_PERSISTENT_PROCESS_BATCHES || options.placement == tracebench::Placement::ProcessPerCore) {
+    if (options.placement == tracebench::Placement::NodeThreads || options.placement == tracebench::Placement::ProcessPerCore) {
         int const EFFECTIVE_LOCAL_RESERVE_CPUS = local_coordinator_reserve_cpus(options, peers.size());
         std::println(stderr,
                      "renderbench: ipc config placement={} workers={} persistent_workers={} batch_size={} coordinator_reserve_cpus={} "
@@ -2869,6 +2695,8 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
         }
     }
     double const LAUNCH_FINISHED = tracebench::monotonic_seconds();
+    uint64_t last_stall_report_tiles_done = tiles_done;
+    double next_stall_report = LAUNCH_FINISHED + COORDINATOR_STALL_REPORT_SECONDS;
 
     bool cancellation_sent = false;
     bool worker_termination_expected = false;
@@ -2943,6 +2771,14 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
         }
 
         double const NOW = tracebench::monotonic_seconds();
+        if (tiles_done != last_stall_report_tiles_done) {
+            last_stall_report_tiles_done = tiles_done;
+            next_stall_report = NOW + COORDINATOR_STALL_REPORT_SECONDS;
+        } else if (!worker_termination_expected && open_pipes != 0 && NOW >= next_stall_report) {
+            print_worker_stall_report(std::span<const ChildWorker>(workers.data(), workers.size()), tiles_done, tiles.size(),
+                                      next_tile_position, open_pipes, PERSISTENT_BATCH_SIZE, NOW);
+            next_stall_report = NOW + COORDINATOR_STALL_REPORT_SECONDS;
+        }
         if (cancellation_sent && !kill_escalated && NOW - cancel_started >= 2.0) {
             kill_escalated = true;
             signal_workers(std::span<ChildWorker>(workers.data(), workers.size()), SIGKILL);

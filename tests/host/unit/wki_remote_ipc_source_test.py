@@ -54,6 +54,14 @@ def test_poll_wake_drains_all_batches() -> None:
     require_order(body, "proxy->lock.unlock_irqrestore(IRQF);", "proxy_reschedule_waiters", "poll wake lock release")
 
 
+def test_proxy_poll_wake_preserves_prepark_wake_token() -> None:
+    body = function_body(REMOTE_IPC_CPP.read_text(), "proxy_reschedule_waiters")
+    if "EventWakeDeferredSwitch::CANCEL" in body:
+        fail("proxy poll wakes must preserve wakeup_pending; CANCEL can erase a wake that races before preemptible_syscall_park")
+    if "ker::mod::sched::wake_task_from_event(waiter);" not in body:
+        fail("proxy poll wakes must use the default event wake path")
+
+
 def test_inactive_proxy_poll_reports_terminal_readiness() -> None:
     pipe_body = function_body(REMOTE_IPC_CPP.read_text(), "proxy_pipe_poll_check")
     socket_body = function_body(REMOTE_IPC_SOCKET_CPP.read_text(), "proxy_socket_poll_check")
@@ -459,6 +467,7 @@ def test_ipc_selftests_are_declared_and_registered() -> None:
 
 def main() -> None:
     test_poll_wake_drains_all_batches()
+    test_proxy_poll_wake_preserves_prepark_wake_token()
     test_inactive_proxy_poll_reports_terminal_readiness()
     test_epoll_close_releases_lookup_ref_after_detach()
     test_proxy_lookup_is_peer_scoped()

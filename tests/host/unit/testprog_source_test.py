@@ -532,7 +532,7 @@ def test_mandelbench_worker_waits_use_monotonic_elapsed_time() -> None:
         [
             "elapsed_us(launch.read_last_status_us, NOW_US) >= STATUS_LOG_INTERVAL_US",
             "elapsed_us(START_US, NOW_US) > WORKER_WAIT_TIMEOUT_US",
-            "elapsed_us(launch.read_last_progress_us, NOW_US) > PIPE_READ_IDLE_TIMEOUT_US",
+            "elapsed_us(launch.read_last_progress_us, NOW_US) > PIPE_PAYLOAD_IDLE_TIMEOUT_US",
         ],
         "mandelbench output wait elapsed checks",
     )
@@ -542,10 +542,160 @@ def test_mandelbench_worker_waits_use_monotonic_elapsed_time() -> None:
             "elapsed_us(launch.header_last_status_us, NOW_US) >= STATUS_LOG_INTERVAL_US",
             "elapsed_us(launch.read_last_status_us, NOW_US) >= STATUS_LOG_INTERVAL_US",
             "elapsed_us(launch.header_last_progress_us, NOW_US) > PIPE_READ_IDLE_TIMEOUT_US",
-            "elapsed_us(launch.read_last_progress_us, NOW_US) > PIPE_READ_IDLE_TIMEOUT_US",
+            "elapsed_us(launch.read_last_progress_us, NOW_US) > PIPE_PAYLOAD_IDLE_TIMEOUT_US",
         ],
         "mandelbench streaming wait elapsed checks",
     )
+
+
+def test_mandelbench_auto_nodes_request_remote_wki_placement() -> None:
+    source = MANDELBENCH_WKI_CPP.read_text()
+    target_body = function_body(source, "set_child_target")
+    require_tokens(
+        target_body,
+        [
+            "ker::process::WKI_TARGET_FLAG_STRICT | ker::process::WKI_TARGET_FLAG_NOINHERIT",
+            "if (target_node.empty())",
+            "INHERIT_FLAGS | ker::process::WKI_TARGET_FLAG_REMOTE",
+            "ker::process::setwkitarget(nullptr, 0, FLAGS)",
+            "failed to auto-target worker",
+            "ker::process::setwkitarget(target_node.c_str(), static_cast<uint64_t>(target_node.size()), FLAGS)",
+        ],
+        "mandelbench auto-node WKI target selection",
+    )
+    if re.search(r"if\s*\(\s*target_node\.empty\(\)\s*\)\s*\{\s*return true;", target_body) is not None:
+        fail("mandelbench auto-node workers must request remote WKI placement, not silently run locally")
+
+
+def test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local() -> None:
+    source = MANDELBENCH_WKI_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "constexpr uint64_t PIPE_PAYLOAD_IDLE_TIMEOUT_US = 300'000'000;",
+            "MANDELBENCH_SAVE_IMAGES",
+            "MANDELBENCH_PROFILE_WORKER_LIMIT",
+            '#include <sys/vfs.h>',
+            'auto get_testprog_path() -> const char* { return "/usr/bin/testprog"; }',
+        ],
+        "mandelbench remote worker slot settings",
+    )
+    if "MANDELBENCH_THREADS_PER_WORKER_SLOT" in source or "find_or_create_launch" in source:
+        fail("mandelbench must not fan requested threads out into one WKI pipe per worker slot")
+    if "find_or_create_local_launch" in source:
+        fail("mandelbench local slots must use child workers, not coordinator-local thread coalescing")
+
+    coordinator_body = function_body(source, "mandelbench_wki")
+    require_tokens(
+        coordinator_body,
+        [
+            "std::vector<WorkerLaunch> remote_launches;",
+            "std::vector<WorkerLaunch> local_launches;",
+            "remote_launches.reserve(static_cast<size_t>(TARGET_NODES.empty() ? ACTIVE_WORKERS : TARGET_NODES.size()));",
+            "local_launches.reserve(static_cast<size_t>(ACTIVE_WORKERS));",
+            "int const BASE_ROWS = height / ACTIVE_WORKERS;",
+            "int const EXTRA_ROWS = height % ACTIVE_WORKERS;",
+            "std::ranges::find_if(remote_launches",
+            "launch.target_node == TARGET_NODE",
+            "local_launches.push_back(make_worker_launch(worker_id, TARGET_NODE, 1, true));",
+            "launch.thread_count = std::max<int>(1, static_cast<int>(launch.chunks.size()));",
+            "bool const SAVE_IMAGES = mandelbench_save_images_enabled();",
+            "compute_local_launches(local_launches, image.data(), local_colormap.data(), width, height, max_iteration, ROW_SIZE,",
+            "complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index)",
+            "print_slowest_worker_profiles(remote_launches, repeat_index, START_US);",
+            "if (SAVE_IMAGES)",
+            "save_skipped=1",
+            "install_worker_vfs_policy(launch.output_slot, launch.target_node);",
+            "close_standard_fds_for_worker_child();",
+            "if (!set_child_target(launch.target_node, launch.output_slot))",
+        ],
+        "mandelbench coalesced remote planner",
+    )
+    if "worker_launches.reserve(static_cast<size_t>(ACTIVE_WORKERS));" in coordinator_body:
+        fail("mandelbench must not launch one child pipe per active worker slot")
+    require_order(coordinator_body, "progress(DEVICE_NAME", "if (SAVE_IMAGES)", "mandelbench progress before optional save")
+    require_order(
+        coordinator_body,
+        "install_worker_vfs_policy(launch.output_slot, launch.target_node);",
+        "close_standard_fds_for_worker_child();",
+        "mandelbench child VFS policy before stdio cleanup",
+    )
+    require_order(
+        coordinator_body,
+        "close_standard_fds_for_worker_child();",
+        "!set_child_target(launch.target_node, launch.output_slot)",
+        "mandelbench child fd cleanup before remote placement",
+    )
+
+    vfs_policy_body = function_body(source, "install_worker_vfs_policy")
+    require_tokens(
+        vfs_policy_body,
+        [
+            "ker::abi::vfs::wki_rule_add_vfs(path, ker::abi::vfs::WKI_VFS_ROUTE_LOCAL)",
+            'add_local_rule("/usr", "worker runtime");',
+            'add_local_rule("/bin", "worker runtime fallback");',
+            'add_local_rule("/lib", "worker runtime");',
+            'add_local_rule("/lib64", "worker runtime");',
+            'add_local_rule("/usr/bin/testprog", "worker executable");',
+            'add_local_rule("/bin/testprog", "worker executable fallback");',
+        ],
+        "mandelbench worker VFS policy",
+    )
+
+    close_stdio_body = function_body(source, "close_standard_fds_for_worker_child")
+    require_tokens(
+        close_stdio_body,
+        ["close(STDIN_FILENO);", "close(STDOUT_FILENO);", "close(STDERR_FILENO);"],
+        "mandelbench worker child stdio cleanup",
+    )
+
+    worker_body = function_body(source, "mandelbench_worker")
+    require_tokens(
+        worker_body,
+        [
+            "mandelbench_profile_enabled() && fd_is_open(STDERR_FILENO)",
+            "if (thread_count == 1)",
+            "(void)generate_rows(&worker_thread.arg);",
+            "WorkerChunk const& chunk = GROUPED_CHUNKS ? chunks.at(static_cast<size_t>(thread_index)) : chunks.front();",
+            "thread_arg.local_thread_count = GROUPED_CHUNKS ? 1 : thread_count;",
+        ],
+        "mandelbench inline worker compute",
+    )
+    if "WorkerChunkThreadArg" in source or "generate_chunk_pool_rows" in source or "std::atomic<int> next_chunk" in source:
+        fail("mandelbench grouped workers must map chunks directly to threads, not through a shared atomic chunk pool")
+    require_order(worker_body, "header write begin", "compute begin", "mandelbench worker output protocol")
+    if 'wait_for_control_byte(CONTROL_FD, id, "payload release")' in worker_body:
+        fail("mandelbench worker must not wait for a payload-release control byte after writing its header")
+
+    streaming_body = function_body(source, "complete_worker_payloads_streaming")
+    if "release_worker_payload(launch" in streaming_body:
+        fail("mandelbench coordinator must not send a payload-release control byte in streaming mode")
+
+    local_compute_body = function_body(source, "compute_local_launches")
+    require_tokens(
+        local_compute_body,
+        [
+            "std::vector<LocalComputeThread> compute_threads(thread_count);",
+            "for (const auto& launch : launches)",
+            "for (const WorkerChunk& chunk : launch.chunks)",
+            "thrd_create(&compute_thread.thread, generate_rows, &compute_thread.arg)",
+            "for (size_t i = 0; i < created_threads; ++i)",
+            "thrd_join(compute_thread.thread, nullptr)",
+        ],
+        "mandelbench local compute direct per-chunk threads",
+    )
+    require_order(
+        local_compute_body,
+        "for (const auto& launch : launches)",
+        "for (size_t i = 0; i < created_threads; ++i)",
+        "mandelbench local compute must start all local chunk threads before joining any",
+    )
+    create_loop_start = local_compute_body.find("for (const auto& launch : launches)")
+    join_loop_start = local_compute_body.find("for (size_t i = 0; i < created_threads; ++i)")
+    if create_loop_start < 0 or join_loop_start < 0:
+        fail("mandelbench local compute loops not found")
+    if "thrd_join(" in local_compute_body[create_loop_start:join_loop_start]:
+        fail("mandelbench local compute must not join one local chunk before starting the next")
 
 
 def main() -> None:
@@ -557,6 +707,8 @@ def main() -> None:
     test_perfbench_parallel_workers_cleanup_before_failure_return()
     test_cowbench_child_wait_is_deadline_bounded()
     test_mandelbench_worker_waits_use_monotonic_elapsed_time()
+    test_mandelbench_auto_nodes_request_remote_wki_placement()
+    test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local()
     print("testprog ping, netbench, suite, perfbench, cowbench, and mandelbench waits are deadline bounded")
 
 

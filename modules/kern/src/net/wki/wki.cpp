@@ -2293,9 +2293,26 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 ch->bytes_received += PAYLOAD_LEN;
 
                 bool notify_timer = false;
+                AckSnapshot pre_dispatch_ack = {};
+                if (ch->channel_id == WKI_CHAN_IPC_DATA) {
+                    pre_dispatch_ack = capture_ack_snapshot_locked(ch);
+                }
                 ch->lock.unlock();
 
                 mark_peer_rx_progress(hdr->src_node);
+
+                // IPC pipe writers are paced by reliable-channel credits. Send
+                // the cumulative ACK as soon as the ordered transport accepts
+                // the frame, before local pipe/proxy delivery can delay credit
+                // return by seconds under load.
+                if (ack_snapshot_present(pre_dispatch_ack)) {
+                    int const ACK_RET = transmit_ack_snapshot(pre_dispatch_ack);
+                    apply_ack_transmit_result(pre_dispatch_ack.channel, pre_dispatch_ack, ACK_RET, notify_timer);
+                    if (notify_timer) {
+                        wki_timer_notify();
+                        notify_timer = false;
+                    }
+                }
 
                 // Dispatch to handler via shared helper
                 wki_dispatch_reliable_msg_ordered(ch, msg, hdr, payload, PAYLOAD_LEN);
@@ -2327,8 +2344,21 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     auto const RO_MSG = static_cast<MsgType>(ro->msg_type);
                     uint8_t* ro_data = ro->data;
                     uint16_t const RO_LEN = ro->len;
+                    AckSnapshot ro_pre_dispatch_ack = {};
+                    if (ch->channel_id == WKI_CHAN_IPC_DATA) {
+                        ro_pre_dispatch_ack = capture_ack_snapshot_locked(ch);
+                    }
 
                     ch->lock.unlock();
+
+                    if (ack_snapshot_present(ro_pre_dispatch_ack)) {
+                        int const ACK_RET = transmit_ack_snapshot(ro_pre_dispatch_ack);
+                        apply_ack_transmit_result(ro_pre_dispatch_ack.channel, ro_pre_dispatch_ack, ACK_RET, notify_timer);
+                        if (notify_timer) {
+                            wki_timer_notify();
+                            notify_timer = false;
+                        }
+                    }
 
                     // Re-dispatch reordered message through the same handler switch
                     wki_dispatch_reliable_msg_ordered(ch, RO_MSG, &RO_HDR, ro_data, RO_LEN);
@@ -2341,11 +2371,12 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                         return;
                     }
                 }
-                // For LATENCY channels, send a pure ACK immediately after the
-                // handler only if no response/other reliable frame consumed the
-                // pending ACK. This gives piggybacking first chance while still
-                // avoiding a timer-cadence stall for one-way messages.
-                bool const IMM_ACK = (ch->priority == PriorityClass::LATENCY && ch->ack_pending);
+                // For latency traffic, send a pure ACK immediately after the
+                // handler only if no response or other reliable frame consumed
+                // the pending ACK. IPC_DATA normally ACKs before dispatch above;
+                // keeping it here provides a fallback for ACK TX failure or
+                // reorder-gap repeat ACKs.
+                bool const IMM_ACK = ((ch->priority == PriorityClass::LATENCY || ch->channel_id == WKI_CHAN_IPC_DATA) && ch->ack_pending);
                 WkiHeader imm_ack_hdr = {};
                 uint16_t imm_ack_peer = 0;
                 uint32_t imm_ack_num = 0;

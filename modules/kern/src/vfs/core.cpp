@@ -12,6 +12,7 @@
 #include <deque>
 #include <dev/block_device.hpp>
 #include <dev/device.hpp>
+#include <dev/gpt.hpp>
 #include <memory>
 #include <net/wki/remotable.hpp>
 #include <net/wki/remote_vfs.hpp>
@@ -26,7 +27,6 @@
 #include <string_view>
 #include <util/smallvec.hpp>
 #include <utility>
-#include <vfs/buffer_cache.hpp>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/fs/fat32.hpp>
 #include <vfs/fs/procfs.hpp>
@@ -5911,7 +5911,7 @@ void pipe_reschedule_waiters(const PipeWakeList& waiters, size_t waiter_count, b
             waiter->sig_pending |= (1ULL << (13 - 1));
         }
 
-        ker::mod::sched::wake_task_from_event(waiter, ker::mod::sched::EventWakeDeferredSwitch::CANCEL);
+        ker::mod::sched::wake_task_from_event(waiter);
         waiter->release();
     }
 }
@@ -6818,6 +6818,92 @@ auto vfs_selftest_pipe_failure_unwinds() -> bool {
 }
 #endif
 
+namespace {
+
+auto resolve_mount_source_path(const char* source, char* out, size_t outsize) -> int {
+    if (source == nullptr || out == nullptr || outsize == 0) {
+        return -EINVAL;
+    }
+
+    std::array<char, MAX_PATH_LEN> abs_source{};
+    int const RAW_RET = resolve_task_path_raw(source, abs_source.data(), abs_source.size());
+    if (RAW_RET < 0) {
+        return RAW_RET;
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved_source{};
+    int const SYMLINK_RET = resolve_symlinks(abs_source.data(), resolved_source.data(), resolved_source.size(), true);
+    if (SYMLINK_RET < 0) {
+        return SYMLINK_RET;
+    }
+
+    return strip_current_task_root_prefix(resolved_source.data(), out, outsize);
+}
+
+enum class BlockFsProbe : uint8_t {
+    UNKNOWN,
+    FAT32,
+    XFS,
+};
+
+auto probe_block_sector_fstype(ker::dev::BlockDevice* bdev, uint64_t lba) -> BlockFsProbe {
+    if (bdev == nullptr || bdev->block_size < 512) {
+        return BlockFsProbe::UNKNOWN;
+    }
+
+    auto* sector = new uint8_t[bdev->block_size];
+    if (sector == nullptr) {
+        return BlockFsProbe::UNKNOWN;
+    }
+
+    int const READ_RC = ker::dev::block_read(bdev, lba, 1, sector);
+    if (READ_RC != 0) {
+        delete[] sector;
+        return BlockFsProbe::UNKNOWN;
+    }
+
+    BlockFsProbe result = BlockFsProbe::UNKNOWN;
+    if (ker::dev::gpt::sector_looks_like_xfs_superblock(sector, bdev->block_size)) {
+        result = BlockFsProbe::XFS;
+    } else if (ker::dev::gpt::sector_looks_like_fat32_boot(sector, bdev->block_size)) {
+        result = BlockFsProbe::FAT32;
+    }
+
+    delete[] sector;
+    return result;
+}
+
+auto block_fs_probe_name(BlockFsProbe probe) -> const char* {
+    switch (probe) {
+        case BlockFsProbe::FAT32:
+            return "fat32";
+        case BlockFsProbe::XFS:
+            return "xfs";
+        case BlockFsProbe::UNKNOWN:
+            break;
+    }
+    return nullptr;
+}
+
+auto probe_block_device_fstype(ker::dev::BlockDevice* bdev) -> const char* {
+    BlockFsProbe const DIRECT_PROBE = probe_block_sector_fstype(bdev, 0);
+    if (DIRECT_PROBE != BlockFsProbe::UNKNOWN) {
+        return block_fs_probe_name(DIRECT_PROBE);
+    }
+
+    if (bdev == nullptr || bdev->is_partition) {
+        return nullptr;
+    }
+
+    if (ker::dev::gpt::gpt_find_fat32_partition(bdev) != 0) {
+        return "fat32";
+    }
+
+    return nullptr;
+}
+
+}  // namespace
+
 auto vfs_mount(const char* source, const char* target, const char* fstype) -> int {
     if (target == nullptr) {
         return -EINVAL;
@@ -6907,38 +6993,40 @@ auto vfs_mount(const char* source, const char* target, const char* fstype) -> in
             }
         } else if (source[0] == '/' && source[1] == 'd' && source[2] == 'e' && source[3] == 'v' && source[4] == '/') {
             // /dev/XXX - lookup by device name
-            bdev = ker::dev::block_device_find_by_name(source + 5);
+            std::array<char, MAX_PATH_LEN> resolved_source{};
+            int const SOURCE_RET = resolve_mount_source_path(source, resolved_source.data(), resolved_source.size());
+            if (SOURCE_RET < 0) {
+                return SOURCE_RET;
+            }
+
+            const char* block_source = resolved_source.data();
+            if (block_source[0] != '/' || block_source[1] != 'd' || block_source[2] != 'e' || block_source[3] != 'v' ||
+                block_source[4] != '/') {
+                log::warn("vfs_mount: device symlink did not resolve under /dev: %s -> %s", source, block_source);
+                return -ENOENT;
+            }
+
+            bdev = ker::dev::block_device_find_by_name(block_source + 5);
             if (bdev == nullptr) {
                 // Walk devfs tree - handles subdirectory paths like wki/block/<name>
                 // and triggers WKI proxy attach for remote block devices
-                bdev = ker::vfs::devfs::devfs_resolve_block_device(source + 5);
+                bdev = ker::vfs::devfs::devfs_resolve_block_device(block_source + 5);
             }
             if (bdev == nullptr) {
-                log::warn("vfs_mount: device not found: %s", source);
+                log::warn("vfs_mount: device not found: %s", block_source);
                 return -ENOENT;
             }
         }
     }
 
     // Auto-detect filesystem type when a block device is present and the
-    // caller did NOT supply an explicit fstype (i.e. fstype was NULL or
-    // empty, which we defaulted to "fat32" above).  Probe the first sector
-    // for known superblock magic so the correct driver is selected.
+    // caller did NOT supply an explicit fstype. Probe the selected device
+    // directly, then inspect GPT partition contents for whole-disk mounts.
     if (bdev != nullptr && (fstype == nullptr || fstype[0] == '\0')) {
-        ker::vfs::buffer_cache_init();
-        auto* probe_buf = ker::vfs::bread(bdev, 0);
-        if (probe_buf != nullptr) {
-            // XFS superblock magic at offset 0: 0x58465342 ('XFSB') big-endian
-            if (probe_buf->size >= 4) {
-                uint32_t const MAGIC = (static_cast<uint32_t>(probe_buf->data[0]) << 24) |
-                                       (static_cast<uint32_t>(probe_buf->data[1]) << 16) |
-                                       (static_cast<uint32_t>(probe_buf->data[2]) << 8) | (static_cast<uint32_t>(probe_buf->data[3]));
-                if (MAGIC == 0x58465342) {  // XFS_SB_MAGIC
-                    effective_fstype = "xfs";
-                    log::info("vfs_mount: auto-detected XFS filesystem");
-                }
-            }
-            ker::vfs::brelse(probe_buf);
+        const char* detected_fstype = probe_block_device_fstype(bdev);
+        if (detected_fstype != nullptr) {
+            effective_fstype = detected_fstype;
+            log::info("vfs_mount: auto-detected %s filesystem", detected_fstype);
         }
     }
 

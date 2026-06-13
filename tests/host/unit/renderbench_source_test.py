@@ -95,7 +95,7 @@ def test_renderbench_worker_cancellation_is_cooperative() -> None:
         "renderbench worker mode must install signal handlers before entering worker loop",
     )
 
-    for name in ["read_exact", "write_all", "render_worker_tile", "worker_thread", "command_stream_worker_thread"]:
+    for name in ["read_exact", "write_all", "render_worker_tile_packet", "batch_render_thread"]:
         body = function_body(source, name)
         if "cancel_requested()" not in body:
             fail(f"{name} must observe cooperative cancellation")
@@ -125,6 +125,7 @@ def test_renderbench_distributed_ipc_uses_chunk_safe_default_tiles() -> None:
             "IPC_SAFE_DEFAULT_TILE_SIZE = 24",
             "apply_distributed_ipc_defaults",
             "options.tile_size_explicit",
+            "exceeds chunk-safe max",
         ],
         "renderbench distributed IPC tile-size default",
     )
@@ -138,11 +139,147 @@ def test_renderbench_distributed_ipc_uses_chunk_safe_default_tiles() -> None:
     )
 
 
+def test_renderbench_worker_child_closes_inherited_fds() -> None:
+    source = RENDERBENCH_MAIN_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "WORKER_CHILD_FD_CLOSE_LIMIT = 256",
+            "close_worker_child_extra_fds",
+        ],
+        "renderbench worker child fd hygiene surface",
+    )
+
+    close_body = function_body(source, "close_worker_child_extra_fds")
+    require_tokens(
+        close_body,
+        [
+            "int fd = 3",
+            "fd < WORKER_CHILD_FD_CLOSE_LIMIT",
+            "(void)::close(fd);",
+        ],
+        "renderbench worker child fd close loop",
+    )
+
+    exec_body = function_body(source, "exec_worker_child")
+    require_order(
+        exec_body,
+        "close_worker_child_extra_fds();",
+        "install_worker_scene_vfs_policy(options, spec);",
+        "renderbench worker child must close inherited coordinator fds before WKI targeting/exec",
+    )
+
+
+def test_renderbench_coordinator_stall_report_exposes_batch_state() -> None:
+    source = RENDERBENCH_MAIN_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "COORDINATOR_STALL_REPORT_SECONDS",
+            "print_worker_stall_report",
+            "assigned_batches",
+            "batch_done_packets",
+            "phase_packets",
+            "WorkerPhasePacket",
+            "PHASE_PACKET_MAGIC",
+            "note_worker_phase_packet",
+            "last_batch_done_at",
+            "last_assignment_at",
+            "last_phase_at",
+            "worker.local",
+            "no completed tile progress",
+            "phase={}",
+        ],
+        "renderbench coordinator stall report surface",
+    )
+
+    run_body = function_body(source, "run_distributed_ipc")
+    require_tokens(
+        run_body,
+        [
+            "last_stall_report_tiles_done",
+            "next_stall_report",
+            "tiles_done != last_stall_report_tiles_done",
+            "print_worker_stall_report",
+        ],
+        "renderbench distributed IPC stall report loop",
+    )
+    require_order(
+        run_body,
+        "print_worker_stall_report(",
+        "wait_for_worker_pipe_activity(",
+        "renderbench must report stalled worker state before polling again",
+    )
+
+
+def test_renderbench_command_stream_uses_per_batch_thread_join() -> None:
+    source = RENDERBENCH_MAIN_CPP.read_text()
+    if "CommandStreamThreadPool" in source or "command_stream_worker_thread" in source:
+        fail("renderbench command-stream batches must not use a persistent condition-variable thread pool")
+
+    run_body = function_body(source, "run_ipc_worker")
+    require_tokens(
+        run_body,
+        [
+            "std::vector<tracebench::Tile> batch_tiles;",
+            "std::vector<std::vector<unsigned char> > batch_packets",
+            "std::vector<thrd_t> batch_threads",
+            "batch_render_thread",
+            "thrd_join(batch_threads.at",
+            "write_all(WORKER_STDOUT_FD",
+            "send_worker_phase_packet",
+            "send_worker_batch_done_packet",
+        ],
+        "renderbench command-stream per-batch thread join path",
+    )
+    require_order(
+        run_body,
+        "thrd_join(batch_threads.at",
+        "send_worker_batch_done_packet",
+        "renderbench must join batch threads before sending batch-done",
+    )
+    require_order(
+        run_body,
+        "write_all(WORKER_STDOUT_FD",
+        "send_worker_batch_done_packet",
+        "renderbench command-stream worker main thread must send tile packets before batch-done",
+    )
+
+
+def test_renderbench_node_threads_avoid_persistent_command_stream() -> None:
+    source = RENDERBENCH_MAIN_CPP.read_text()
+    run_body = function_body(source, "run_distributed_ipc")
+    require_tokens(
+        run_body,
+        [
+            "USE_PERSISTENT_PROCESS_BATCHES =\n        options.placement == tracebench::Placement::ProcessPerCore && options.process_persistent_workers",
+            "USE_DYNAMIC_BATCHES = !USE_PERSISTENT_PROCESS_BATCHES && (options.placement == tracebench::Placement::NodeThreads",
+            "spec.command_stream = USE_PERSISTENT_PROCESS_BATCHES",
+        ],
+        "renderbench node-thread command-stream policy",
+    )
+
+    render_threads_body = function_body(source, "one_shot_worker_render_threads")
+    require_tokens(
+        render_threads_body,
+        [
+            "worker.batch_count > 0",
+            "options.placement == tracebench::Placement::NodeThreads",
+            "return 1;",
+        ],
+        "renderbench dynamic node-thread worker thread cap",
+    )
+
+
 def main() -> None:
     test_renderbench_worker_reap_is_deadline_bounded()
     test_renderbench_worker_cancellation_is_cooperative()
     test_renderbench_worker_stream_corruption_is_fatal()
     test_renderbench_distributed_ipc_uses_chunk_safe_default_tiles()
+    test_renderbench_worker_child_closes_inherited_fds()
+    test_renderbench_coordinator_stall_report_exposes_batch_state()
+    test_renderbench_command_stream_uses_per_batch_thread_join()
+    test_renderbench_node_threads_avoid_persistent_command_stream()
     print("renderbench worker source invariants hold")
 
 

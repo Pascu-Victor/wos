@@ -314,12 +314,48 @@ def test_ack_only_frames_do_not_refresh_peer_liveness() -> None:
         fail("wki_rx must not refresh peer liveness for every validated frame before ACK filtering")
 
 
+def test_ipc_data_acks_before_ordered_dispatch() -> None:
+    source = WKI_CPP.read_text()
+    body = function_body(source, "wki_rx")
+    required = [
+        "ch->channel_id == WKI_CHAN_IPC_DATA",
+        "pre_dispatch_ack = capture_ack_snapshot_locked(ch);",
+        "ack_snapshot_present(pre_dispatch_ack)",
+        "transmit_ack_snapshot(pre_dispatch_ack)",
+        "apply_ack_transmit_result(pre_dispatch_ack.channel, pre_dispatch_ack, ACK_RET, notify_timer)",
+        "ro_pre_dispatch_ack = capture_ack_snapshot_locked(ch);",
+        "apply_ack_transmit_result(ro_pre_dispatch_ack.channel, ro_pre_dispatch_ack, ACK_RET, notify_timer)",
+    ]
+    missing = [token for token in required if token not in body]
+    if missing:
+        fail("IPC_DATA pre-dispatch ACK path is missing token(s): " + ", ".join(missing))
+    require_order(
+        body,
+        "pre_dispatch_ack = capture_ack_snapshot_locked(ch);",
+        "wki_dispatch_reliable_msg_ordered(ch, msg, hdr, payload, PAYLOAD_LEN);",
+        "IPC_DATA ACK must be captured before ordered dispatch can block in pipe delivery",
+    )
+    require_order(
+        body,
+        "transmit_ack_snapshot(pre_dispatch_ack)",
+        "wki_dispatch_reliable_msg_ordered(ch, msg, hdr, payload, PAYLOAD_LEN);",
+        "IPC_DATA ACK must be transmitted before ordered dispatch can block in pipe delivery",
+    )
+    require_order(
+        body,
+        "ro_pre_dispatch_ack = capture_ack_snapshot_locked(ch);",
+        "wki_dispatch_reliable_msg_ordered(ch, RO_MSG, &RO_HDR, ro_data, RO_LEN);",
+        "reordered IPC_DATA ACK must be captured before reordered dispatch",
+    )
+
+
 def main() -> None:
     test_hello_ack_reconnects_fenced_peer_outside_peer_lock()
     test_hello_boot_epoch_fences_connected_broadcast_restarts()
     test_reliable_rx_rejects_fenced_peer_before_channel_lookup()
     test_fence_notify_rejects_invalid_targets_before_routing()
     test_ack_only_frames_do_not_refresh_peer_liveness()
+    test_ipc_data_acks_before_ordered_dispatch()
     print("WKI peer source invariants hold")
 
 

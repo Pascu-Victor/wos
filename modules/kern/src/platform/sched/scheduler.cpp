@@ -2114,15 +2114,6 @@ void remove_current_task() {
 // processTasks - timer interrupt hot path (EEVDF)
 // ============================================================================
 
-namespace {
-enum class CurrentTaskWakeupPending : uint8_t {
-    RECORD,
-    CLEAR,
-};
-
-void reschedule_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, CurrentTaskWakeupPending current_task_wakeup_pending);
-}  // namespace
-
 void kern_wake(task::Task* task) {
     if (task == nullptr) {
         return;
@@ -2165,7 +2156,7 @@ void wake_task_from_event_on_cpu(task::Task* task, uint64_t target_cpu, EventWak
     if (cpu >= smt::get_core_count()) {
         cpu = get_least_loaded_cpu();
     }
-    reschedule_task_for_cpu_impl(cpu, task, CANCEL_DEFERRED_SWITCH ? CurrentTaskWakeupPending::CLEAR : CurrentTaskWakeupPending::RECORD);
+    reschedule_task_for_cpu(cpu, task);
 }
 
 void wake_task_from_event(task::Task* task, EventWakeDeferredSwitch deferred_switch) {
@@ -3728,8 +3719,7 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Inter
 // rescheduleTaskForCpu - wake task from wait queue onto target CPU
 // ============================================================================
 
-namespace {
-void reschedule_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, CurrentTaskWakeupPending current_task_wakeup_pending) {
+void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
 #ifdef SCHED_DEBUG
     // DIAGNOSTIC: Always log reschedule attempts
     dbg::log("RESCHED: PID %x -> CPU %d (heapIdx=%d, schedQ=%d, curCpu=%d)", task->pid, static_cast<int>(cpu_no), task->heap_index,
@@ -3829,16 +3819,12 @@ void reschedule_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, CurrentTask
 #ifdef SCHED_DEBUG
         dbg::log("RESCHED: PID %x ABORT - is currentTask somewhere", task->pid);
 #endif
-        // Signal to deferred_task_switch that a wakeup was attempted while
-        // the task is still currentTask.  EventWakeDeferredSwitch::CANCEL is
-        // different: syscall.asm will skip deferred_task_switch after the flag
-        // is cleared, so a recorded token would survive and poison the next
-        // blocking syscall.
-        if (current_task_wakeup_pending == CurrentTaskWakeupPending::RECORD) {
-            task->wakeup_pending.store(true, std::memory_order_release);
-        } else {
-            task->wakeup_pending.store(false, std::memory_order_release);
-        }
+        // Signal to deferred_task_switch that a wakeup was attempted while the
+        // task is still currentTask.  This remains required for CANCEL wakes:
+        // syscall.asm may already have observed deferred_task_switch before the
+        // waker cleared it, and deferred_task_switch must see a wake token
+        // instead of parking after the event owner has removed its waiter.
+        task->wakeup_pending.store(true, std::memory_order_release);
 
         uint64_t const NOW_US = time::get_us();
         uint64_t const WAKE_AT_US = task->wake_at_us;
@@ -3960,11 +3946,6 @@ void reschedule_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, CurrentTask
     dbg::log("RESCHED: PID %x DONE -> CPU %d (heapIdx=%d)", task->pid, static_cast<int>(cpu_no), task->heap_index);
 #endif
 }
-}  // namespace
-
-void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
-    reschedule_task_for_cpu_impl(cpu_no, task, CurrentTaskWakeupPending::RECORD);
-}
 
 // ============================================================================
 // PID lookup (O(1) via registry)
@@ -3974,6 +3955,27 @@ __attribute__((no_sanitize("address"))) auto find_task_by_pid(uint64_t pid) -> t
 
 __attribute__((no_sanitize("address"))) auto find_task_by_pid_safe(uint64_t pid) -> task::Task* {
     return pid_table_find_internal(pid, true);
+}
+
+auto task_has_live_pagemap_sibling(task::Task* subject) -> bool {
+    if (subject == nullptr || subject->pagemap == nullptr) {
+        return false;
+    }
+
+    auto* const PAGEMAP = subject->pagemap;
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    for (uint32_t i = 0; i < active_task_count; ++i) {
+        auto* other = active_task_slot(i);
+        if (other == nullptr || other == subject || other->pagemap != PAGEMAP) {
+            continue;
+        }
+        if (other->state.load(std::memory_order_acquire) != task::TaskState::DEAD) {
+            global_task_registry_lock.unlock_irqrestore(FLAGS);
+            return true;
+        }
+    }
+    global_task_registry_lock.unlock_irqrestore(FLAGS);
+    return false;
 }
 
 auto get_active_task_count() -> uint32_t {
@@ -4653,8 +4655,8 @@ void cleanup_waitable_zombie_resources(GcDetachedTask const& detached, GcTaskTim
         if (detached.should_free_pagemap) {
             mm::virt::destroy_user_space(cur->pagemap, cur->pid, cur->name, "task-zombie-gc");
             mm::virt::release_pagemap(cur->pagemap);
+            cur->pagemap = nullptr;
         }
-        cur->pagemap = nullptr;
         timing.pagemap_us = elapsed_us_since(START_US, time::get_us());
     }
 

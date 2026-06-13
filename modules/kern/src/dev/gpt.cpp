@@ -13,15 +13,101 @@
 namespace ker::dev::gpt {
 
 namespace {
-// Compare two GUIDs as byte arrays
-auto guid_compare(std::span<const uint8_t, GUID_SIZE> guid1, std::span<const uint8_t, GUID_SIZE> guid2) -> bool {
-    return std::equal(guid1.begin(), guid1.end(), guid2.begin());
-}
-
 // Check if a GPT partition entry is empty (all-zero type GUID)
 auto is_entry_empty(const GPTPartitionEntry* entry) -> bool {
     std::span<const uint8_t, GUID_SIZE> const TYPE_GUID{entry->partition_type_guid};
     return std::ranges::all_of(TYPE_GUID, [](uint8_t value) { return value == 0; });
+}
+
+auto read_le16(const uint8_t* data, size_t offset) -> uint16_t {
+    return static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
+}
+
+auto read_le32(const uint8_t* data, size_t offset) -> uint32_t {
+    return static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1]) << 8) |
+           (static_cast<uint32_t>(data[offset + 2]) << 16) | (static_cast<uint32_t>(data[offset + 3]) << 24);
+}
+
+auto is_power_of_two(uint32_t value) -> bool { return value != 0 && (value & (value - 1)) == 0; }
+
+using SectorProbe = bool (*)(const uint8_t*, size_t);
+
+auto gpt_find_partition_by_content(BlockDevice* device, SectorProbe probe, const char* label) -> uint64_t {
+    if (device == nullptr || probe == nullptr || device->block_size < 512) {
+        return 0;
+    }
+
+    auto* entries_buf = new (std::nothrow) uint8_t[device->block_size];
+    auto* probe_buf = new (std::nothrow) uint8_t[device->block_size];
+    if (entries_buf == nullptr || probe_buf == nullptr) {
+        delete[] entries_buf;
+        delete[] probe_buf;
+        return 0;
+    }
+
+    if (ker::dev::block_read(device, 1, 1, entries_buf) != 0) {
+        delete[] entries_buf;
+        delete[] probe_buf;
+        return 0;
+    }
+
+    auto* raw_header = reinterpret_cast<GPTHeader*>(entries_buf);
+    if (raw_header->signature != 0x5452415020494645ULL || raw_header->partition_entry_size < sizeof(GPTPartitionEntry) ||
+        raw_header->partition_entry_size > device->block_size) {
+        delete[] entries_buf;
+        delete[] probe_buf;
+        return 0;
+    }
+
+    GPTHeader const HEADER = *raw_header;
+    uint32_t const ENTRIES_PER_SECTOR = device->block_size / HEADER.partition_entry_size;
+    if (ENTRIES_PER_SECTOR == 0) {
+        delete[] entries_buf;
+        delete[] probe_buf;
+        return 0;
+    }
+
+    uint32_t const NUM_SECTORS_NEEDED = (HEADER.num_partition_entries + ENTRIES_PER_SECTOR - 1) / ENTRIES_PER_SECTOR;
+    for (uint32_t sector = 0; sector < NUM_SECTORS_NEEDED; ++sector) {
+        if (ker::dev::block_read(device, HEADER.partition_entries_lba + sector, 1, entries_buf) != 0) {
+            delete[] entries_buf;
+            delete[] probe_buf;
+            return 0;
+        }
+
+        uint32_t entries_in_sector = ENTRIES_PER_SECTOR;
+        if (sector == NUM_SECTORS_NEEDED - 1) {
+            uint32_t const REMAINING = HEADER.num_partition_entries - (sector * ENTRIES_PER_SECTOR);
+            entries_in_sector = REMAINING < ENTRIES_PER_SECTOR ? REMAINING : ENTRIES_PER_SECTOR;
+        }
+
+        for (uint32_t i = 0; i < entries_in_sector; i++) {
+            auto* entry = reinterpret_cast<GPTPartitionEntry*>(entries_buf + (static_cast<size_t>(i) * HEADER.partition_entry_size));
+            GPTPartitionEntry const ENTRY = *entry;
+            if (is_entry_empty(&ENTRY) || ENTRY.starting_lba >= device->total_blocks) {
+                continue;
+            }
+
+            if (ker::dev::block_read(device, ENTRY.starting_lba, 1, probe_buf) != 0) {
+                continue;
+            }
+
+            if (probe(probe_buf, device->block_size)) {
+                gpt_log("gpt_find_partition_by_content: Found ");
+                gpt_log(label);
+                gpt_log(" partition at LBA 0x");
+                gpt_log_hex(ENTRY.starting_lba);
+                gpt_log("\n");
+                delete[] entries_buf;
+                delete[] probe_buf;
+                return ENTRY.starting_lba;
+            }
+        }
+    }
+
+    delete[] entries_buf;
+    delete[] probe_buf;
+    return 0;
 }
 
 constexpr std::array HEX_CHARS = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
@@ -62,6 +148,39 @@ auto guid_to_string(const uint8_t* guid, char* out) -> void {
     byte_to_hex(guid[14], out + 32);
     byte_to_hex(guid[15], out + 34);
     out[36] = '\0';
+}
+
+auto sector_looks_like_fat32_boot(const uint8_t* sector, size_t size) -> bool {
+    if (sector == nullptr || size < 512) {
+        return false;
+    }
+
+    uint16_t const SIGNATURE = read_le16(sector, 510);
+    if (SIGNATURE != 0xAA55) {
+        return false;
+    }
+
+    uint16_t const BYTES_PER_SECTOR = read_le16(sector, 11);
+    bool const VALID_SECTOR_SIZE =
+        BYTES_PER_SECTOR == 512 || BYTES_PER_SECTOR == 1024 || BYTES_PER_SECTOR == 2048 || BYTES_PER_SECTOR == 4096;
+    if (!VALID_SECTOR_SIZE) {
+        return false;
+    }
+
+    uint8_t const SECTORS_PER_CLUSTER = sector[13];
+    uint16_t const RESERVED_SECTORS = read_le16(sector, 14);
+    uint8_t const NUM_FATS = sector[16];
+    uint16_t const TOTAL_SECTORS_16 = read_le16(sector, 19);
+    uint32_t const TOTAL_SECTORS_32 = read_le32(sector, 32);
+    uint32_t const SECTORS_PER_FAT_32 = read_le32(sector, 36);
+    uint32_t const ROOT_CLUSTER = read_le32(sector, 44);
+
+    return is_power_of_two(SECTORS_PER_CLUSTER) && SECTORS_PER_CLUSTER <= 128 && RESERVED_SECTORS != 0 && NUM_FATS != 0 && NUM_FATS <= 2 &&
+           TOTAL_SECTORS_16 == 0 && TOTAL_SECTORS_32 != 0 && SECTORS_PER_FAT_32 != 0 && ROOT_CLUSTER >= 2;
+}
+
+auto sector_looks_like_xfs_superblock(const uint8_t* sector, size_t size) -> bool {
+    return sector != nullptr && size >= 4 && sector[0] == 'X' && sector[1] == 'F' && sector[2] == 'S' && sector[3] == 'B';
 }
 
 auto gpt_enumerate_partitions(BlockDevice* device, GPTDiskInfo* disk_info) -> int {
@@ -155,139 +274,7 @@ auto gpt_enumerate_partitions(BlockDevice* device, GPTDiskInfo* disk_info) -> in
 
 // Find FAT32 partition on a GPT-partitioned disk
 auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t {
-    if (device == nullptr) {
-        gpt_log("gpt_find_fat32_partition: Invalid device\n");
-        return 0;
-    }
-
-    // Allocate buffer for one sector
-    auto* sector_buf = new (std::nothrow) uint8_t[device->block_size];
-    if (sector_buf == nullptr) {
-        gpt_log("gpt_find_fat32_partition: Memory allocation failed\n");
-        return 0;
-    }
-
-    // Read GPT header from LBA 1 (primary GPT header)
-    if (ker::dev::block_read(device, 1, 1, sector_buf) != 0) {
-        gpt_log("gpt_find_fat32_partition: Failed to read GPT header\n");
-        // Intentionally leaking this boot-time buffer to preserve existing behavior.
-        return 0;
-    }
-
-    auto* gpt_header = reinterpret_cast<GPTHeader*>(sector_buf);
-
-    // Validate GPT signature "EFI PART"
-    if (gpt_header->signature != 0x5452415020494645ULL) {
-        gpt_log("gpt_find_fat32_partition: Invalid GPT signature\n");
-        // Intentionally leaking this boot-time buffer to preserve existing behavior.
-        return 0;
-    }
-
-    gpt_log("gpt_find_fat32_partition: Valid GPT found\n");
-    gpt_log("gpt_find_fat32_partition: Looking for FAT32 GUID: ");
-    size_t guid_offset = 0;
-    for (uint8_t const BYTE : FAT32_PARTITION_GUID) {
-        gpt_log_hex(BYTE);
-        if (++guid_offset < FAT32_PARTITION_GUID.size()) {
-            gpt_log(" ");
-        }
-    }
-    gpt_log("\n");
-    gpt_log("gpt_find_fat32_partition: Partition entries at LBA 0x");
-    gpt_log_hex(gpt_header->partition_entries_lba);
-    gpt_log(", count: ");
-    gpt_log_hex(gpt_header->num_partition_entries);
-    gpt_log(", entry size: ");
-    gpt_log_hex(gpt_header->partition_entry_size);
-    gpt_log("\n");
-
-    // Read partition entries one sector at a time to avoid large allocations
-    uint32_t const ENTRIES_PER_SECTOR = device->block_size / gpt_header->partition_entry_size;
-    uint32_t const NUM_SECTORS_NEEDED = (gpt_header->num_partition_entries + ENTRIES_PER_SECTOR - 1) / ENTRIES_PER_SECTOR;
-
-    gpt_log("gpt_find_fat32_partition: Reading ");
-    gpt_log_hex(NUM_SECTORS_NEEDED);
-    gpt_log(" sectors of partition entries\n");
-
-    // Reuse sector_buf to read one sector at a time
-    uint64_t fat32_start_lba = 0;
-    bool found = false;
-
-    for (uint32_t sector = 0; sector < NUM_SECTORS_NEEDED && !found; ++sector) {
-        // Read one sector of partition entries
-        if (ker::dev::block_read(device, gpt_header->partition_entries_lba + sector, 1, sector_buf) != 0) {
-            gpt_log("gpt_find_fat32_partition: Failed to read partition entries sector ");
-            gpt_log_hex(sector);
-            gpt_log("\n");
-            // Intentionally leaking this boot-time buffer to preserve existing behavior.
-            return 0;
-        }
-
-        // Check entries in this sector
-        uint32_t entries_in_sector = ENTRIES_PER_SECTOR;
-        if (sector == NUM_SECTORS_NEEDED - 1) {
-            // Last sector might have fewer entries
-            uint32_t const REMAINING = gpt_header->num_partition_entries - (sector * ENTRIES_PER_SECTOR);
-            entries_in_sector = REMAINING < ENTRIES_PER_SECTOR ? REMAINING : ENTRIES_PER_SECTOR;
-        }
-
-        for (uint32_t i = 0; i < entries_in_sector && !found; i++) {
-            auto* entry = reinterpret_cast<GPTPartitionEntry*>(sector_buf + (static_cast<size_t>(i) * gpt_header->partition_entry_size));
-
-            if (is_entry_empty(entry)) {
-                continue;
-            }
-
-            // Print the GUID we found
-            gpt_log("gpt: Partition ");
-            gpt_log_hex((sector * ENTRIES_PER_SECTOR) + i);
-            gpt_log(" GUID: ");
-            for (size_t j = 0; j < GUID_SIZE; ++j) {
-                gpt_log_hex(entry->partition_type_guid[j]);
-                if (j < GUID_SIZE - 1) {
-                    gpt_log(" ");
-                }
-            }
-            gpt_log("\n");
-
-            // Check if partition type matches FAT32
-            std::span<const uint8_t, GUID_SIZE> const TYPE_GUID{entry->partition_type_guid};
-            if (guid_compare(TYPE_GUID, std::span<const uint8_t, GUID_SIZE>{FAT32_PARTITION_GUID})) {
-                fat32_start_lba = entry->starting_lba;
-                gpt_log("gpt_find_fat32_partition: Found FAT32 partition at LBA 0x");
-                gpt_log_hex(fat32_start_lba);
-                gpt_log("\n");
-                found = true;
-            }
-
-            // Also check for Microsoft Basic Data partition (commonly used for FAT32)
-            if (!found && guid_compare(TYPE_GUID, std::span<const uint8_t, GUID_SIZE>{BASIC_DATA_PARTITION_GUID})) {
-                fat32_start_lba = entry->starting_lba;
-                gpt_log("gpt_find_fat32_partition: Found Basic Data partition at LBA 0x");
-                gpt_log_hex(fat32_start_lba);
-                gpt_log("\n");
-                found = true;
-            }
-
-            // Also check for Linux filesystem data partition (used by guestfish)
-            if (!found && guid_compare(TYPE_GUID, std::span<const uint8_t, GUID_SIZE>{LINUX_DATA_PARTITION_GUID})) {
-                fat32_start_lba = entry->starting_lba;
-                gpt_log("gpt_find_fat32_partition: Found Linux data partition at LBA 0x");
-                gpt_log_hex(fat32_start_lba);
-                gpt_log("\n");
-                found = true;
-            }
-        }
-    }
-
-    // Intentionally leaking this boot-time buffer to preserve existing behavior.
-    // This is acceptable as GPT parsing happens once during initialization
-
-    if (fat32_start_lba == 0) {
-        gpt_log("gpt_find_fat32_partition: No FAT32 partition found\n");
-    }
-
-    return fat32_start_lba;
+    return gpt_find_partition_by_content(device, sector_looks_like_fat32_boot, "FAT32");
 }
 
 }  // namespace ker::dev::gpt

@@ -160,14 +160,7 @@ auto erase_retired_binding_locked(DevServerBinding* binding) -> bool {
 }
 
 auto find_block_device_by_resource_id(uint32_t resource_id) -> ker::dev::BlockDevice* {
-    size_t const COUNT = ker::dev::block_device_count();
-    for (size_t i = 0; i < COUNT; i++) {
-        ker::dev::BlockDevice* bdev = ker::dev::block_device_at(i);
-        if (bdev != nullptr && static_cast<uint32_t>(bdev->minor) == resource_id) {
-            return bdev;
-        }
-    }
-    return nullptr;
+    return ker::dev::block_device_at(static_cast<size_t>(resource_id));
 }
 
 auto find_net_device_by_resource_id(uint32_t resource_id) -> ker::net::NetDevice* {

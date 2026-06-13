@@ -101,6 +101,10 @@ auto guid_to_string(const uint8_t* guid, char* out) -> void;
 // Returns 0 on success, -1 on failure.
 auto gpt_enumerate_partitions(BlockDevice* device, GPTDiskInfo* disk_info) -> int;
 
+// Lightweight filesystem probes for a sector read from a block device.
+auto sector_looks_like_fat32_boot(const uint8_t* sector, size_t size) -> bool;
+auto sector_looks_like_xfs_superblock(const uint8_t* sector, size_t size) -> bool;
+
 // Find FAT32 partition on a GPT-partitioned disk
 // Returns the starting LBA of the FAT32 partition, or 0 if not found
 auto gpt_find_fat32_partition(BlockDevice* device) -> uint64_t;

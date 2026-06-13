@@ -1658,8 +1658,16 @@ auto generate_kipcstat(char* buf, size_t bufsz) -> size_t {
     append_dec64(p, end, snapshot.export_backlog_chunks);
     append_sconst(p, end, " export_backlog_bytes=");
     append_dec64(p, end, snapshot.export_backlog_bytes);
+    append_sconst(p, end, " export_close_pending=");
+    append_dec64(p, end, snapshot.export_close_pending);
+    append_sconst(p, end, " export_close_waiting_for_bytes=");
+    append_dec64(p, end, snapshot.export_close_waiting_for_bytes);
     append_sconst(p, end, " export_flush_queue=");
     append_dec64(p, end, snapshot.export_flush_queue);
+    append_sconst(p, end, " proxy_close_queue=");
+    append_dec64(p, end, snapshot.proxy_close_queue);
+    append_sconst(p, end, " proxy_close_attempts=");
+    append_dec64(p, end, snapshot.proxy_close_attempts);
     append_sconst(p, end, " dev_op_queue=");
     append_dec64(p, end, snapshot.dev_op_queue);
     append_sconst(p, end, " dev_op_payload_bytes=");
@@ -1793,6 +1801,52 @@ auto remote_compute_diag_kind_name(ker::net::wki::WkiRemoteComputeDiagKind kind)
             return "running";
         case ker::net::wki::WkiRemoteComputeDiagKind::PENDING_COMPLETE:
             return "pending_complete";
+    }
+    return "unknown";
+}
+
+auto ipc_diag_kind_name(ker::net::wki::WkiIpcDiagKind kind) -> const char* {
+    switch (kind) {
+        case ker::net::wki::WkiIpcDiagKind::UNKNOWN:
+            return "unknown";
+        case ker::net::wki::WkiIpcDiagKind::EXPORT:
+            return "export";
+        case ker::net::wki::WkiIpcDiagKind::PROXY:
+            return "proxy";
+        case ker::net::wki::WkiIpcDiagKind::EXPORT_BACKLOG:
+            return "export_backlog";
+        case ker::net::wki::WkiIpcDiagKind::PROXY_CLOSE:
+            return "proxy_close";
+    }
+    return "unknown";
+}
+
+auto ipc_resource_type_name(uint16_t raw_type) -> const char* {
+    switch (static_cast<ker::net::wki::ResourceType>(raw_type)) {
+        case ker::net::wki::ResourceType::BLOCK:
+            return "block";
+        case ker::net::wki::ResourceType::CHAR:
+            return "char";
+        case ker::net::wki::ResourceType::NET:
+            return "net";
+        case ker::net::wki::ResourceType::VFS:
+            return "vfs";
+        case ker::net::wki::ResourceType::COMPUTE:
+            return "compute";
+        case ker::net::wki::ResourceType::CUSTOM:
+            return "custom";
+        case ker::net::wki::ResourceType::IPC_PIPE:
+            return "ipc_pipe";
+        case ker::net::wki::ResourceType::IPC_EVENTFD:
+            return "ipc_eventfd";
+        case ker::net::wki::ResourceType::IPC_PTY:
+            return "ipc_pty";
+        case ker::net::wki::ResourceType::IPC_FUTEX:
+            return "ipc_futex";
+        case ker::net::wki::ResourceType::IPC_EPOLL:
+            return "ipc_epoll";
+        case ker::net::wki::ResourceType::IPC_SOCKET:
+            return "ipc_socket";
     }
     return "unknown";
 }
@@ -2358,6 +2412,10 @@ auto generate_memacc_alloc_totals(char* buf, size_t bufsz) -> size_t {
     append_memacc_dec(p, end, "pending_chunks", ipc.pending_chunks);
     append_memacc_dec(p, end, "pending_bytes", ipc.pending_bytes);
     append_memacc_dec(p, end, "export_backlog_bytes", ipc.export_backlog_bytes);
+    append_memacc_dec(p, end, "export_close_pending", ipc.export_close_pending);
+    append_memacc_dec(p, end, "export_close_waiting_for_bytes", ipc.export_close_waiting_for_bytes);
+    append_memacc_dec(p, end, "proxy_close_queue", ipc.proxy_close_queue);
+    append_memacc_dec(p, end, "proxy_close_attempts", ipc.proxy_close_attempts);
     append_memacc_dec(p, end, "dev_op_payload_bytes", ipc.dev_op_payload_bytes);
     append_memacc_dec(p, end, "approx_alloc_bytes", ipc.approx_alloc_bytes);
     append_char(p, end, '\n');
@@ -2831,9 +2889,86 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
     append_dec64(p, end, ipc.pending_bytes);
     append_sconst(p, end, " export_flush_queue=");
     append_dec64(p, end, ipc.export_flush_queue);
+    append_sconst(p, end, " export_close_pending=");
+    append_dec64(p, end, ipc.export_close_pending);
+    append_sconst(p, end, " export_close_waiting_for_bytes=");
+    append_dec64(p, end, ipc.export_close_waiting_for_bytes);
+    append_sconst(p, end, " proxy_close_queue=");
+    append_dec64(p, end, ipc.proxy_close_queue);
     append_sconst(p, end, " dev_op_queue=");
     append_dec64(p, end, ipc.dev_op_queue);
     append_char(p, end, '\n');
+
+    ker::net::wki::WkiIpcDiagCounts ipc_diag_counts{};
+    std::array<ker::net::wki::WkiIpcDiagRow, ker::net::wki::WKI_IPC_DIAG_MAX> ipc_diag_rows{};
+    size_t const IPC_DIAG_ROW_COUNT = ker::net::wki::wki_ipc_diag_snapshot(ipc_diag_rows.data(), ipc_diag_rows.size(), &ipc_diag_counts);
+    append_sconst(p, end, "wki_ipc_diag_counts exports=");
+    append_dec64(p, end, ipc_diag_counts.exports);
+    append_sconst(p, end, " proxies=");
+    append_dec64(p, end, ipc_diag_counts.proxies);
+    append_sconst(p, end, " export_backlogs=");
+    append_dec64(p, end, ipc_diag_counts.export_backlogs);
+    append_sconst(p, end, " proxy_close_queue=");
+    append_dec64(p, end, ipc_diag_counts.proxy_close_queue);
+    append_sconst(p, end, " truncated=");
+    append_dec64(p, end, ipc_diag_counts.truncated);
+    append_char(p, end, '\n');
+    for (size_t i = 0; i < IPC_DIAG_ROW_COUNT; ++i) {
+        const auto& row = ipc_diag_rows.at(i);
+        append_sconst(p, end, "wki_ipc_diag kind=");
+        append_sconst(p, end, ipc_diag_kind_name(row.kind));
+        append_sconst(p, end, " resource=");
+        append_dec64(p, end, row.resource_id);
+        append_sconst(p, end, " type=");
+        append_sconst(p, end, ipc_resource_type_name(row.res_type));
+        append_sconst(p, end, " peer=");
+        append_hex16(p, end, row.peer_node);
+        append_sconst(p, end, " ch=");
+        append_dec64(p, end, row.assigned_channel);
+        append_sconst(p, end, " active=");
+        append_bool01(p, end, row.active);
+        append_sconst(p, end, " file=");
+        append_bool01(p, end, row.has_file);
+        append_sconst(p, end, " flags=");
+        append_dec64(p, end, static_cast<uint32_t>(row.open_flags));
+        append_sconst(p, end, " pump_running=");
+        append_bool01(p, end, row.pump_running);
+        append_sconst(p, end, " pump_queued=");
+        append_bool01(p, end, row.pump_queued);
+        append_sconst(p, end, " pump_task=");
+        append_bool01(p, end, row.has_pump_task);
+        append_sconst(p, end, " pipe_bytes_received=");
+        append_dec64(p, end, row.pipe_bytes_received);
+        append_sconst(p, end, " proxy_bytes_written=");
+        append_dec64(p, end, row.proxy_bytes_written);
+        append_sconst(p, end, " ring_used=");
+        append_dec64(p, end, row.ring_used);
+        append_sconst(p, end, " ring_capacity=");
+        append_dec64(p, end, row.ring_capacity);
+        append_sconst(p, end, " write_closed=");
+        append_bool01(p, end, row.write_closed);
+        append_sconst(p, end, " blocked_reader=");
+        append_dec64(p, end, row.blocked_reader_pid);
+        append_sconst(p, end, " poll_waiters=");
+        append_dec64(p, end, row.poll_waiters);
+        append_sconst(p, end, " backlog_bytes=");
+        append_dec64(p, end, row.backlog_bytes);
+        append_sconst(p, end, " backlog_chunks=");
+        append_dec64(p, end, row.backlog_chunks);
+        append_sconst(p, end, " close_pending=");
+        append_bool01(p, end, row.close_pending);
+        append_sconst(p, end, " close_has_expected_bytes=");
+        append_bool01(p, end, row.close_has_expected_bytes);
+        append_sconst(p, end, " close_expected_bytes=");
+        append_dec64(p, end, row.close_expected_bytes);
+        append_sconst(p, end, " op=");
+        append_dec64(p, end, row.op_id);
+        append_sconst(p, end, " msg_size=");
+        append_dec64(p, end, row.msg_size);
+        append_sconst(p, end, " attempts=");
+        append_dec64(p, end, row.attempts);
+        append_char(p, end, '\n');
+    }
 
     ker::net::wki::WkiRemoteComputeDiagCounts compute_counts{};
     std::array<ker::net::wki::WkiRemoteComputeDiagRow, ker::net::wki::WKI_REMOTE_COMPUTE_DIAG_MAX> compute_rows{};

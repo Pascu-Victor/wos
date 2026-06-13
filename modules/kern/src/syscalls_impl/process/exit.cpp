@@ -239,6 +239,9 @@ void release_exiting_user_address_space(ker::mod::sched::task::Task* task) {
     if (task == nullptr || task->is_thread || task->pagemap == nullptr) {
         return;
     }
+    if (ker::mod::sched::task_has_live_pagemap_sibling(task)) {
+        return;
+    }
 
     auto* pagemap = task->pagemap;
 

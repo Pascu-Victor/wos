@@ -52,59 +52,40 @@ def require_order(source: str, first: str, second: str, context: str) -> None:
         fail(f"{context}: expected {first} before {second}")
 
 
-def test_event_wake_cancel_clears_current_task_wakeup_token() -> None:
+def test_event_wake_cancel_preserves_current_task_wakeup_token() -> None:
     source = SCHEDULER_CPP.read_text()
     wake_body = function_body(source, "wake_task_from_event_on_cpu")
-    reschedule_body = function_body(source, "reschedule_task_for_cpu_impl")
-    wrapper_body = function_body(source, "reschedule_task_for_cpu")
+    reschedule_body = function_body(source, "reschedule_task_for_cpu")
 
-    require_tokens(
-        source,
-        [
-            "enum class CurrentTaskWakeupPending",
-            "RECORD",
-            "CLEAR",
-            "reschedule_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, CurrentTaskWakeupPending current_task_wakeup_pending)",
-        ],
-        "scheduler current-task wake token mode",
-    )
     require_tokens(
         wake_body,
         [
             "bool const CANCEL_DEFERRED_SWITCH = event_wake_cancels_deferred_switch(deferred_switch)",
             "task->deferred_task_switch = false",
-            "CANCEL_DEFERRED_SWITCH ? CurrentTaskWakeupPending::CLEAR : CurrentTaskWakeupPending::RECORD",
+            "reschedule_task_for_cpu(cpu, task)",
         ],
         "event wake cancellation mode",
     )
     require_order(
         wake_body,
         "task->deferred_task_switch = false",
-        "reschedule_task_for_cpu_impl(cpu, task",
+        "reschedule_task_for_cpu(cpu, task)",
         "deferred switch must be cleared before the reschedule decision",
     )
+    if "CurrentTaskWakeupPending" in source:
+        fail("current-task event wakes must not select a mode that clears wakeup_pending")
+
+    current_task_branch = reschedule_body[reschedule_body.find("if (is_current_on_some_cpu)") :]
+    current_task_branch = current_task_branch[: current_task_branch.find("uint64_t const NOW_US")]
     require_tokens(
-        reschedule_body,
+        current_task_branch,
         [
-            "if (current_task_wakeup_pending == CurrentTaskWakeupPending::RECORD)",
             "task->wakeup_pending.store(true, std::memory_order_release)",
-            "task->wakeup_pending.store(false, std::memory_order_release)",
-            "task->wants_block = false",
-            "task->wake_at_us = 0",
         ],
         "reschedule current-task wake token handling",
     )
-    require_order(
-        reschedule_body,
-        "task->wakeup_pending.store(false, std::memory_order_release)",
-        "task->wants_block = false",
-        "cancelled current-task wake must discard token before clearing block metadata",
-    )
-    require_tokens(
-        wrapper_body,
-        ["reschedule_task_for_cpu_impl(cpu_no, task, CurrentTaskWakeupPending::RECORD)"],
-        "public reschedule wrapper preserves wake token behavior",
-    )
+    if "task->wakeup_pending.store(false" in current_task_branch:
+        fail("current-task event wakes must preserve wakeup_pending, even when deferred switch is cancelled")
 
 
 def test_runtime_accounting_deltas_are_saturating() -> None:
@@ -145,7 +126,7 @@ def test_runtime_accounting_deltas_are_saturating() -> None:
 
 
 def main() -> None:
-    test_event_wake_cancel_clears_current_task_wakeup_token()
+    test_event_wake_cancel_preserves_current_task_wakeup_token()
     test_runtime_accounting_deltas_are_saturating()
     print("scheduler wake-token and runtime accounting invariants hold")
 

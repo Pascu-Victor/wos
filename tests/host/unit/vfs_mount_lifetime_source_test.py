@@ -17,7 +17,7 @@ def fail(message: str) -> None:
 
 
 def function_body(source: str, name: str) -> str:
-    match = re.search(rf"\b(?:void|auto)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>*]+)?\s*\{{", source)
+    match = re.search(rf"\b(?:static\s+)?(?:void|auto)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>*]+)?\s*\{{", source)
     if match is None:
         fail(f"missing function {name}")
 
@@ -101,6 +101,43 @@ def test_vfs_umount_invalidates_only_exact_mount() -> None:
     require_order(body, "std::strcmp(mount->path, resolved.data()) == 0", "stream_invalidate_mount_scope", "exact umount invalidation")
 
 
+def test_vfs_mount_resolves_dev_source_symlinks() -> None:
+    source = CORE_CPP.read_text()
+    helper_body = function_body(source, "resolve_mount_source_path")
+    helper_required = [
+        "resolve_task_path_raw(source, abs_source.data(), abs_source.size())",
+        "resolve_symlinks(abs_source.data(), resolved_source.data(), resolved_source.size(), true)",
+        "strip_current_task_root_prefix(resolved_source.data(), out, outsize)",
+    ]
+    missing = [token for token in helper_required if token not in helper_body]
+    if missing:
+        fail("resolve_mount_source_path() must use normal VFS symlink resolution: " + ", ".join(missing))
+
+    body = function_body(source, "vfs_mount")
+    required = [
+        "std::array<char, MAX_PATH_LEN> resolved_source{};",
+        "int const SOURCE_RET = resolve_mount_source_path(source, resolved_source.data(), resolved_source.size());",
+        "const char* block_source = resolved_source.data();",
+        "ker::dev::block_device_find_by_name(block_source + 5)",
+        "ker::vfs::devfs::devfs_resolve_block_device(block_source + 5)",
+    ]
+    missing = [token for token in required if token not in body]
+    if missing:
+        fail("vfs_mount() must resolve /dev source symlinks before block lookup: " + ", ".join(missing))
+    require_order(body, "wki://<hostname>/<export>", "resolve_mount_source_path", "WKI URI mount before dev source resolution")
+    require_order(body, "if (IS_PARTUUID)", "resolve_mount_source_path", "PARTUUID before dev source resolution")
+    require_order(body, "resolve_mount_source_path", "block_device_find_by_name(block_source + 5)", "source symlink before name lookup")
+    require_order(body, "block_device_find_by_name(block_source + 5)", "devfs_resolve_block_device(block_source + 5)", "direct lookup before devfs walk")
+
+
+def test_pipe_wake_preserves_prepark_wake_token() -> None:
+    body = function_body(CORE_CPP.read_text(), "pipe_reschedule_waiters")
+    if "EventWakeDeferredSwitch::CANCEL" in body:
+        fail("pipe readiness wakes must preserve wakeup_pending; CANCEL can erase a wake that races before preemptible_syscall_park")
+    if "ker::mod::sched::wake_task_from_event(waiter);" not in body:
+        fail("pipe readiness wakes must use the default event wake path")
+
+
 def test_no_raw_mount_lookup_assignments_outside_owner() -> None:
     raw_lookup = re.compile(
         r"(?:MountPoint(?:\s+const)?\s*\*|auto\s*\*)\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*"
@@ -131,6 +168,8 @@ def main() -> None:
     test_unmount_retires_removes_then_waits_before_destroy()
     test_path_rewrites_are_fenced_by_active_refs()
     test_vfs_umount_invalidates_only_exact_mount()
+    test_vfs_mount_resolves_dev_source_symlinks()
+    test_pipe_wake_preserves_prepark_wake_token()
     test_no_raw_mount_lookup_assignments_outside_owner()
     test_iteration_users_use_snapshots_when_possible()
     print("VFS mount lifetime source invariants hold")

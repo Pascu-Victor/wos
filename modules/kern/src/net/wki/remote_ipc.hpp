@@ -29,6 +29,7 @@ constexpr size_t WKI_IPC_MAX_PROXIES = 64;
 
 // RDMA shared region sizes
 constexpr uint32_t WKI_IPC_PIPE_REGION_SIZE = 65536;  // 64 KB pipe ring buffer
+constexpr size_t WKI_IPC_DIAG_MAX = 128;
 constexpr uint32_t WKI_IPC_EVENTFD_REGION_SIZE = 64;  // one cache line
 constexpr uint32_t WKI_IPC_FUTEX_REGION_SIZE = 64;    // one waiter block
 constexpr uint32_t WKI_IPC_EPOLL_REGION_SIZE = 512;   // readiness bitmap
@@ -238,7 +239,11 @@ struct WkiIpcPerfSnapshot {
     uint64_t export_backlogs = 0;
     uint64_t export_backlog_chunks = 0;
     uint64_t export_backlog_bytes = 0;
+    uint64_t export_close_pending = 0;
+    uint64_t export_close_waiting_for_bytes = 0;
     uint64_t export_flush_queue = 0;
+    uint64_t proxy_close_queue = 0;
+    uint64_t proxy_close_attempts = 0;
     uint64_t dev_op_queue = 0;
     uint64_t dev_op_payload_bytes = 0;
     uint64_t proxy_write_payload_bytes = 0;
@@ -251,6 +256,51 @@ struct WkiIpcPerfSnapshot {
     uint64_t approx_alloc_bytes = 0;
 };
 
+enum class WkiIpcDiagKind : uint8_t {
+    UNKNOWN = 0,
+    EXPORT = 1,
+    PROXY = 2,
+    EXPORT_BACKLOG = 3,
+    PROXY_CLOSE = 4,
+};
+
+struct WkiIpcDiagCounts {
+    size_t exports = 0;
+    size_t proxies = 0;
+    size_t export_backlogs = 0;
+    size_t proxy_close_queue = 0;
+    size_t truncated = 0;
+};
+
+struct WkiIpcDiagRow {
+    WkiIpcDiagKind kind = WkiIpcDiagKind::EXPORT;
+    uint32_t resource_id = 0;
+    uint16_t peer_node = WKI_NODE_INVALID;
+    uint16_t assigned_channel = 0;
+    uint16_t res_type = 0;
+    uint16_t op_id = 0;
+    uint16_t msg_size = 0;
+    uint32_t attempts = 0;
+    int open_flags = 0;
+    bool active = false;
+    bool has_file = false;
+    bool pump_running = false;
+    bool pump_queued = false;
+    bool has_pump_task = false;
+    bool write_closed = false;
+    bool close_pending = false;
+    bool close_has_expected_bytes = false;
+    uint64_t pipe_bytes_received = 0;
+    uint64_t proxy_bytes_written = 0;
+    uint64_t ring_used = 0;
+    uint64_t ring_capacity = 0;
+    uint64_t blocked_reader_pid = 0;
+    uint64_t poll_waiters = 0;
+    uint64_t backlog_bytes = 0;
+    uint64_t backlog_chunks = 0;
+    uint64_t close_expected_bytes = 0;
+};
+
 // -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
@@ -260,6 +310,9 @@ void wki_ipc_subsystem_init();
 
 // Read a best-effort IPC perf/memory snapshot for /proc and perf tooling.
 void wki_ipc_get_perf_snapshot(WkiIpcPerfSnapshot& out);
+
+// Read bounded IPC diagnostic rows for /proc/wki/netdiag.
+auto wki_ipc_diag_snapshot(WkiIpcDiagRow* rows, size_t capacity, WkiIpcDiagCounts* counts) -> size_t;
 
 // Export a task's IPC fds before remote submission.
 // Iterates fd_table, identifies IPC primitives, creates exports.

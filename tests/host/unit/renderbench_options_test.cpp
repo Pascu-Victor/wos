@@ -80,6 +80,25 @@ TEST(RenderbenchOptions, TracksExplicitTileSize) {
     EXPECT_TRUE(options.tile_size_explicit);
 }
 
+TEST(RenderbenchOptions, WorkerOutputQueueIsOptIn) {
+    std::vector<char*> default_argv{
+        const_cast<char*>("renderbench"),
+    };
+    tracebench::Options options;
+    ASSERT_EQ(parse(default_argv, options), tracebench::ParseStatus::Ok);
+    EXPECT_TRUE(options.disable_worker_output_queue);
+    EXPECT_TRUE(options.disable_single_thread_worker_queue);
+
+    std::vector<char*> enabled_argv{
+        const_cast<char*>("renderbench"),
+        const_cast<char*>("--enable-worker-output-queue"),
+        const_cast<char*>("--enable-single-thread-worker-queue"),
+    };
+    ASSERT_EQ(parse(enabled_argv, options), tracebench::ParseStatus::Ok);
+    EXPECT_FALSE(options.disable_worker_output_queue);
+    EXPECT_FALSE(options.disable_single_thread_worker_queue);
+}
+
 TEST(RenderbenchFilmView, StorageCompletenessRequiresRgbTriplesForEveryPixel) {
     auto storage = tracebench::make_film_storage(3, 2);
     tracebench::FilmView complete{

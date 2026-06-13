@@ -287,9 +287,10 @@ auto owner_cpu_for_task(task::Task* task) -> uint64_t;
 auto migrate_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool;
 auto pin_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool;
 bool can_query_current_task();
-void remove_current_task();                                   // Remove current task from runqueue (for exit)
-auto find_task_by_pid(uint64_t pid) -> task::Task*;           // Find a task by PID (O(1) via PID registry)
-auto find_task_by_pid_safe(uint64_t pid) -> task::Task*;      // Find task by PID with refcount (caller must release!)
+void remove_current_task();                               // Remove current task from runqueue (for exit)
+auto find_task_by_pid(uint64_t pid) -> task::Task*;       // Find a task by PID (O(1) via PID registry)
+auto find_task_by_pid_safe(uint64_t pid) -> task::Task*;  // Find task by PID with refcount (caller must release!)
+auto task_has_live_pagemap_sibling(task::Task* subject) -> bool;
 void set_task_nice(task::Task* task, int nice);               // Update task weight safely on its run queue
 auto signal_process_group(uint64_t pgid, int sig) -> size_t;  // Send signal to all live tasks in a process group
 void wake_task_for_signal(task::Task* task);                  // Make a signaled blocked task runnable so signal delivery can occur

@@ -71,7 +71,8 @@ void devfs_populate_partition_symlinks();
 void devfs_populate_net_nodes();
 
 // Populate /dev/wki/ hierarchy with discovered remotable resources.
-// Three views: by-type (root), by-zone, and by-peer.
+// Views: by-type (root), by-zone, by-peer-id, by-peer-host, and the legacy
+// by-peer id alias.
 // Call after WKI peering and resource discovery.
 void devfs_populate_wki();
 

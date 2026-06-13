@@ -942,6 +942,8 @@ struct WkiAutoLock {
 DevFSNode* g_wki_dir = nullptr;                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 DevFSNode* g_wki_by_zone = nullptr;             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 DevFSNode* g_wki_by_peer = nullptr;             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+DevFSNode* g_wki_by_peer_id = nullptr;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+DevFSNode* g_wki_by_peer_host = nullptr;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::array<uint32_t, 7> g_wki_type_counters{};  // indexed by ResourceType (1-6), slot 0 unused // NOLINT
 size_t g_wki_total = 0;                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
@@ -1022,6 +1024,8 @@ struct WkiDevfsCtx {
     uint8_t flags{};
     std::array<char, 64> remote_name{};
     std::array<char, 64> dev_name{};  // persistent name backing Device::name
+    std::array<char, 64> display_name{};
+    std::array<char, ker::net::wki::WKI_HOSTNAME_MAX> peer_hostname{};
 };
 
 // Read handler for WKI device nodes
@@ -1157,29 +1161,78 @@ void wki_build_dev_name(char* buf, size_t cap, uint16_t zone_id, uint16_t peer_i
     buf[p] = '\0';
 }
 
+void wki_build_display_name(char* buf, size_t cap, ker::net::wki::ResourceType type, uint32_t local_num) {
+    if (buf == nullptr || cap == 0) {
+        return;
+    }
+    std::snprintf(buf, cap, "%s%u", wki_type_prefix(type), local_num);
+}
+
+void wki_copy_peer_hostname(char* buf, size_t cap, uint16_t peer_id) {
+    if (buf == nullptr || cap == 0) {
+        return;
+    }
+
+    const char* hostname = ker::net::wki::wki_peer_get_hostname(peer_id);
+    if (hostname != nullptr && hostname[0] != '\0') {
+        std::snprintf(buf, cap, "%s", hostname);
+    } else {
+        std::snprintf(buf, cap, "node-%04x", peer_id);
+    }
+}
+
 // Ensure the /dev/wki/ directory hierarchy exists. Returns false on failure.
 auto wki_ensure_dirs() -> bool {
-    if (g_wki_dir != nullptr) {
-        return true;
+    if (g_wki_dir == nullptr) {
+        g_wki_dir = walk_path("wki", true);
     }
-    g_wki_dir = walk_path("wki", true);
     if (g_wki_dir == nullptr) {
         return false;
     }
-    g_wki_by_zone = walk_path("wki/by-zone", true);
+    if (g_wki_by_zone == nullptr) {
+        g_wki_by_zone = walk_path("wki/by-zone", true);
+    }
     if (g_wki_by_zone == nullptr) {
         return false;
     }
-    g_wki_by_peer = walk_path("wki/by-peer", true);
-    return g_wki_by_peer != nullptr;
+    if (g_wki_by_peer == nullptr) {
+        g_wki_by_peer = walk_path("wki/by-peer", true);
+    }
+    if (g_wki_by_peer == nullptr) {
+        return false;
+    }
+    if (g_wki_by_peer_id == nullptr) {
+        g_wki_by_peer_id = walk_path("wki/by-peer-id", true);
+    }
+    if (g_wki_by_peer_id == nullptr) {
+        return false;
+    }
+    if (g_wki_by_peer_host == nullptr) {
+        g_wki_by_peer_host = walk_path("wki/by-peer-host", true);
+    }
+    return g_wki_by_peer_host != nullptr;
 }
 
 // Add a symlink named `name` under `parent_dir`, pointing to `target`.
 void wki_add_symlink(DevFSNode* parent_dir, std::string_view name, std::string_view target) {
+    if (parent_dir == nullptr) {
+        return;
+    }
+
     std::array<char, DEVFS_NAME_MAX> name_buf{};
     size_t const NLEN = (name.size() < DEVFS_NAME_MAX - 1) ? name.size() : DEVFS_NAME_MAX - 1;
     std::memcpy(name_buf.data(), name.data(), NLEN);
     name_buf[NLEN] = '\0';
+
+    if (auto* existing = find_child(parent_dir, name_buf.data()); existing != nullptr) {
+        if (existing->type != DevFSNodeType::SYMLINK) {
+            return;
+        }
+        size_t const TLEN = (target.size() < DEVFS_SYMLINK_MAX - 1) ? target.size() : DEVFS_SYMLINK_MAX - 1;
+        std::memcpy(existing->symlink_target.data(), target.data(), TLEN);
+        existing->symlink_target[TLEN] = '\0';
+        return;
+    }
 
     auto* link = create_node(name_buf.data(), DevFSNodeType::SYMLINK);
     if (link == nullptr) {
@@ -1199,6 +1252,22 @@ auto wki_ensure_hex_subdir(DevFSNode* parent, uint16_t num) -> DevFSNode* {
     DevFSNode* sub = find_child(parent, name.data());
     if (sub == nullptr) {
         sub = create_node(name.data(), DevFSNodeType::DIRECTORY);
+        if (sub != nullptr) {
+            add_child(parent, sub);
+        }
+    }
+    return sub;
+}
+
+// Find or create a named subdirectory under parent.
+auto wki_ensure_named_subdir(DevFSNode* parent, const char* name) -> DevFSNode* {
+    if (parent == nullptr || name == nullptr || name[0] == '\0') {
+        return nullptr;
+    }
+
+    DevFSNode* sub = find_child(parent, name);
+    if (sub == nullptr) {
+        sub = create_node(name, DevFSNodeType::DIRECTORY);
         if (sub != nullptr) {
             add_child(parent, sub);
         }
@@ -1226,6 +1295,62 @@ void wki_remove_named_child(DevFSNode* dir, const char* name) {
     delete child;
 }
 
+void wki_remove_named_child_if_distinct(DevFSNode* dir, const char* preferred_name, const char* fallback_name) {
+    wki_remove_named_child(dir, preferred_name);
+    if (std::strcmp(preferred_name, fallback_name) != 0) {
+        wki_remove_named_child(dir, fallback_name);
+    }
+}
+
+void wki_add_symlink_if_absent(DevFSNode* parent_dir, std::string_view name, std::string_view target) {
+    if (parent_dir == nullptr || name.empty()) {
+        return;
+    }
+
+    std::array<char, DEVFS_NAME_MAX> name_buf{};
+    size_t const NLEN = (name.size() < DEVFS_NAME_MAX - 1) ? name.size() : DEVFS_NAME_MAX - 1;
+    std::memcpy(name_buf.data(), name.data(), NLEN);
+    name_buf[NLEN] = '\0';
+
+    if (find_child(parent_dir, name_buf.data()) != nullptr) {
+        return;
+    }
+
+    wki_add_symlink(parent_dir, name, target);
+}
+
+auto wki_block_remote_alias(const WkiDevfsCtx* ctx) -> const char* {
+    if (ctx == nullptr || ctx->resource_type != ker::net::wki::ResourceType::BLOCK || ctx->remote_name[0] == '\0') {
+        return nullptr;
+    }
+    return ctx->remote_name.data();
+}
+
+void wki_add_block_remote_alias(DevFSNode* dir, const WkiDevfsCtx* ctx, std::string_view target) {
+    const char* alias = wki_block_remote_alias(ctx);
+    if (alias == nullptr) {
+        return;
+    }
+    if (std::strcmp(alias, ctx->display_name.data()) == 0 || std::strcmp(alias, ctx->dev_name.data()) == 0) {
+        return;
+    }
+
+    wki_add_symlink_if_absent(dir, alias, target);
+}
+
+void wki_remove_wki_resource_aliases(DevFSNode* dir, const WkiDevfsCtx* ctx) {
+    wki_remove_named_child_if_distinct(dir, ctx->display_name.data(), ctx->dev_name.data());
+
+    const char* alias = wki_block_remote_alias(ctx);
+    if (alias == nullptr) {
+        return;
+    }
+    if (std::strcmp(alias, ctx->display_name.data()) == 0 || std::strcmp(alias, ctx->dev_name.data()) == 0) {
+        return;
+    }
+    wki_remove_named_child(dir, alias);
+}
+
 // Find the WKI device node matching (node_id, type, resource_id) in a type directory.
 // Returns the node, or nullptr if not found.
 auto wki_find_device_in_type_dir(DevFSNode* type_dir, uint16_t node_id, ker::net::wki::ResourceType res_type, uint32_t resource_id)
@@ -1251,8 +1376,6 @@ auto wki_find_device_in_type_dir(DevFSNode* type_dir, uint16_t node_id, ker::net
 
 // Remove a device node and its by-zone/by-peer symlinks given the device name and zone/peer IDs.
 void wki_remove_device_and_symlinks(DevFSNode* type_dir, DevFSNode* device_node, const WkiDevfsCtx* ctx) {
-    const char* name = ctx->dev_name.data();
-
     // Remove symlink from by-zone subdirectory
     {
         std::array<char, 8> zone_str{};
@@ -1260,18 +1383,37 @@ void wki_remove_device_and_symlinks(DevFSNode* type_dir, DevFSNode* device_node,
         zone_str[4] = '\0';
         DevFSNode* zone_sub = find_child(g_wki_by_zone, zone_str.data());
         if (zone_sub != nullptr) {
-            wki_remove_named_child(zone_sub, name);
+            wki_remove_wki_resource_aliases(zone_sub, ctx);
         }
     }
 
-    // Remove symlink from by-peer subdirectory
+    // Remove symlink from legacy by-peer subdirectory
     {
         std::array<char, 8> peer_str{};
         fmt_u16_hex4(peer_str.data(), peer_str.size() - 1, ctx->peer_node_id);
         peer_str[4] = '\0';
         DevFSNode* peer_sub = find_child(g_wki_by_peer, peer_str.data());
         if (peer_sub != nullptr) {
-            wki_remove_named_child(peer_sub, name);
+            wki_remove_wki_resource_aliases(peer_sub, ctx);
+        }
+    }
+
+    // Remove symlink from by-peer-id subdirectory
+    {
+        std::array<char, 8> peer_str{};
+        fmt_u16_hex4(peer_str.data(), peer_str.size() - 1, ctx->peer_node_id);
+        peer_str[4] = '\0';
+        DevFSNode* peer_sub = find_child(g_wki_by_peer_id, peer_str.data());
+        if (peer_sub != nullptr) {
+            wki_remove_wki_resource_aliases(peer_sub, ctx);
+        }
+    }
+
+    // Remove symlink from by-peer-host subdirectory
+    if (ctx->peer_hostname[0] != '\0') {
+        DevFSNode* peer_host_sub = find_child(g_wki_by_peer_host, ctx->peer_hostname.data());
+        if (peer_host_sub != nullptr) {
+            wki_remove_wki_resource_aliases(peer_host_sub, ctx);
         }
     }
 
@@ -1337,6 +1479,8 @@ void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t r
         rctx->remote_name[nlen] = '\0';  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     }
     wki_build_dev_name(rctx->dev_name.data(), rctx->dev_name.size(), ZONE_ID, node_id, type, LOCAL_NUM);
+    wki_build_display_name(rctx->display_name.data(), rctx->display_name.size(), type, LOCAL_NUM);
+    wki_copy_peer_hostname(rctx->peer_hostname.data(), rctx->peer_hostname.size(), node_id);
 
     // Allocate Device struct
     auto* dev = new ker::dev::Device();
@@ -1377,19 +1521,35 @@ void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t r
         target[p] = '\0';
     }
 
-    std::string_view const DEV_NAME_SV{rctx->dev_name.data()};
+    std::string_view const DISPLAY_NAME_SV{rctx->display_name.data()};
     std::string_view const TARGET_SV{target.data()};
 
     // Symlink in by-zone/{zone_id}/
     DevFSNode* zone_sub = wki_ensure_hex_subdir(g_wki_by_zone, ZONE_ID);
     if (zone_sub != nullptr) {
-        wki_add_symlink(zone_sub, DEV_NAME_SV, TARGET_SV);
+        wki_add_symlink(zone_sub, DISPLAY_NAME_SV, TARGET_SV);
+        wki_add_block_remote_alias(zone_sub, rctx, TARGET_SV);
     }
 
-    // Symlink in by-peer/{peer_id}/
+    // Symlink in legacy by-peer/{peer_id}/
     DevFSNode* peer_sub = wki_ensure_hex_subdir(g_wki_by_peer, node_id);
     if (peer_sub != nullptr) {
-        wki_add_symlink(peer_sub, DEV_NAME_SV, TARGET_SV);
+        wki_add_symlink(peer_sub, DISPLAY_NAME_SV, TARGET_SV);
+        wki_add_block_remote_alias(peer_sub, rctx, TARGET_SV);
+    }
+
+    // Symlink in by-peer-id/{peer_id}/
+    DevFSNode* peer_id_sub = wki_ensure_hex_subdir(g_wki_by_peer_id, node_id);
+    if (peer_id_sub != nullptr) {
+        wki_add_symlink(peer_id_sub, DISPLAY_NAME_SV, TARGET_SV);
+        wki_add_block_remote_alias(peer_id_sub, rctx, TARGET_SV);
+    }
+
+    // Symlink in by-peer-host/{hostname}/
+    DevFSNode* peer_host_sub = wki_ensure_named_subdir(g_wki_by_peer_host, rctx->peer_hostname.data());
+    if (peer_host_sub != nullptr) {
+        wki_add_symlink(peer_host_sub, DISPLAY_NAME_SV, TARGET_SV);
+        wki_add_block_remote_alias(peer_host_sub, rctx, TARGET_SV);
     }
 
     g_wki_total++;
@@ -1430,11 +1590,17 @@ void devfs_wki_remove_peer_resources(uint16_t node_id) {
         if (type_dir->type != DevFSNodeType::DIRECTORY) {
             continue;
         }
-        // Skip by-zone and by-peer directories
+        // Skip WKI metadata view directories
         if (std::strcmp(type_dir->name.data(), "by-zone") == 0) {
             continue;
         }
         if (std::strcmp(type_dir->name.data(), "by-peer") == 0) {
+            continue;
+        }
+        if (std::strcmp(type_dir->name.data(), "by-peer-id") == 0) {
+            continue;
+        }
+        if (std::strcmp(type_dir->name.data(), "by-peer-host") == 0) {
             continue;
         }
 

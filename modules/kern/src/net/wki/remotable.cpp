@@ -420,7 +420,7 @@ void advertise_resources_to_peer(uint16_t peer_node) {
             continue;
         }
 
-        auto resource_id = static_cast<uint32_t>(bdev->minor);
+        auto resource_id = static_cast<uint32_t>(i);
         send_resource_advert_to_peer(peer_node, bdev, resource_id);
     }
 

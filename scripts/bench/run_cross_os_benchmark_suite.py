@@ -1332,7 +1332,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duck-render-height", type=int, default=4000)
     parser.add_argument("--duck-render-spp", type=int, default=1600)
     parser.add_argument("--render-max-depth", type=int, default=6)
-    parser.add_argument("--render-tile-size", type=int, default=32)
+    parser.add_argument("--render-tile-size", type=int, default=24)
     parser.add_argument(
         "--render-debug-constant-tile-us",
         type=int,
