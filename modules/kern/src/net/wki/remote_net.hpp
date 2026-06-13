@@ -34,6 +34,8 @@ constexpr auto wki_remote_net_xmit_request_size(size_t packet_len) -> WkiRemoteN
     };
 }
 
+auto wki_remote_net_selftest_cancel_preserves_successor_op() -> bool;
+
 // -----------------------------------------------------------------------------
 // ProxyNetState (consumer side) - per-remote-NIC proxy state
 // -----------------------------------------------------------------------------

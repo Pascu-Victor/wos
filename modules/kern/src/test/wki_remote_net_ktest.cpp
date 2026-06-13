@@ -25,3 +25,7 @@ KTEST(WkiRemoteNetXmit, RejectsOversizeBeforeUint16Truncation) {
     KEXPECT_FALSE(ker::net::wki::wki_remote_net_xmit_request_size(MAX_PACKET_LEN + 1).ok);
     KEXPECT_FALSE(ker::net::wki::wki_remote_net_xmit_request_size(static_cast<size_t>(UINT16_MAX) + 1U).ok);
 }
+
+KTEST(WkiRemoteNetOpCancel, PreservesSuccessorSlot) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_net_selftest_cancel_preserves_successor_op());
+}

@@ -6,6 +6,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 REMOTE_NET_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_net.cpp"
+REMOTE_NET_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_net.hpp"
+REMOTE_NET_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_remote_net_ktest.cpp"
 
 
 def fail(message: str) -> None:
@@ -41,6 +43,28 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
     missing = [token for token in tokens if token not in source]
     if missing:
         fail(f"{context}: missing {', '.join(missing)}")
+
+
+def braced_block_after(source: str, token: str) -> str:
+    start = source.find(token)
+    if start < 0:
+        fail(f"missing block token {token!r}")
+
+    brace = source.find("{", start)
+    if brace < 0:
+        fail(f"missing block after {token!r}")
+
+    depth = 1
+    pos = brace + 1
+    while pos < len(source) and depth > 0:
+        if source[pos] == "{":
+            depth += 1
+        elif source[pos] == "}":
+            depth -= 1
+        pos += 1
+    if depth != 0:
+        fail(f"unterminated block after {token!r}")
+    return source[brace + 1 : pos - 1]
 
 
 def test_net_proxy_op_slot_wait_is_bounded() -> None:
@@ -102,8 +126,58 @@ def test_net_proxy_op_slot_wait_is_bounded() -> None:
         fail("prepare_net_op_wait must not contain its own unbounded contention sleep loop")
 
 
+def test_cancel_op_waiter_preserves_successor_slot() -> None:
+    source = REMOTE_NET_CPP.read_text()
+    body = function_body(source, "cancel_op_waiter")
+    owner_block = braced_block_after(body, "if (state->op_wait_entry == &wait)")
+
+    require_tokens(
+        owner_block,
+        [
+            "state->op_wait_entry = nullptr",
+            "clear_net_op_state_locked(state, result)",
+        ],
+        "remote net cancel owned slot cleanup",
+    )
+    if body.count("clear_net_op_state_locked(state, result)") != 1:
+        fail("cancel_op_waiter must clear op state only when the canceled waiter still owns the slot")
+    require_order(
+        body,
+        "if (state->op_wait_entry == &wait)",
+        "claimed = wki_claim_op(&wait)",
+        "cancel still completes the canceled waiter after ownership check",
+    )
+
+
+def test_cancel_op_waiter_has_ktest_coverage() -> None:
+    source = REMOTE_NET_CPP.read_text()
+    header = REMOTE_NET_HPP.read_text()
+    ktest = REMOTE_NET_KTEST.read_text()
+
+    require_tokens(
+        source,
+        ["auto wki_remote_net_selftest_cancel_preserves_successor_op() -> bool"],
+        "remote net cancel selftest implementation",
+    )
+    require_tokens(
+        header,
+        ["auto wki_remote_net_selftest_cancel_preserves_successor_op() -> bool;"],
+        "remote net cancel selftest declaration",
+    )
+    require_tokens(
+        ktest,
+        [
+            "KTEST(WkiRemoteNetOpCancel, PreservesSuccessorSlot)",
+            "wki_remote_net_selftest_cancel_preserves_successor_op()",
+        ],
+        "remote net cancel KTEST coverage",
+    )
+
+
 def main() -> None:
     test_net_proxy_op_slot_wait_is_bounded()
+    test_cancel_op_waiter_preserves_successor_slot()
+    test_cancel_op_waiter_has_ktest_coverage()
     print("WKI remote net source invariants hold")
 
 

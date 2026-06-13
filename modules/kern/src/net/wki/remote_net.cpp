@@ -352,8 +352,8 @@ void cancel_op_waiter(ProxyNetState* state, WkiWaitEntry& wait, int result) {
     state->lock.lock();
     if (state->op_wait_entry == &wait) {
         state->op_wait_entry = nullptr;
+        clear_net_op_state_locked(state, result);
     }
-    clear_net_op_state_locked(state, result);
     claimed = wki_claim_op(&wait);
     state->lock.unlock();
     finish_or_wait_for_cancelled_waiter(wait, claimed, result);
@@ -1448,6 +1448,43 @@ void wki_remote_net_cleanup_for_peer(uint16_t node_id) {
             ker::mod::dbg::log("[WKI] Remote NIC proxy fenced: node=0x%04x", node_id);
         }
     }
+}
+
+auto wki_remote_net_selftest_cancel_preserves_successor_op() -> bool {
+    ProxyNetState state = {};
+    WkiWaitEntry old_wait = {};
+    WkiWaitEntry next_wait = {};
+
+    old_wait.state.store(WkiWaitEntry::DONE, std::memory_order_release);
+    state.op_wait_entry = &next_wait;
+    state.op_expected_id = OP_NET_SET_MAC;
+    state.op_expected_seq = 0x1234;
+    state.op_deadline_us = 0x5678;
+    state.op_status = 19;
+    state.op_pending.store(true, std::memory_order_release);
+
+    cancel_op_waiter(&state, old_wait, WKI_ERR_TIMEOUT);
+
+    bool const SUCCESSOR_PRESERVED = state.op_wait_entry == &next_wait && state.op_expected_id == OP_NET_SET_MAC &&
+                                     state.op_expected_seq == 0x1234 && state.op_deadline_us == 0x5678 && state.op_status == 19 &&
+                                     state.op_pending.load(std::memory_order_acquire);
+
+    WkiWaitEntry owned_wait = {};
+    state.op_wait_entry = &owned_wait;
+    state.op_expected_id = OP_NET_OPEN;
+    state.op_expected_seq = 0x9abc;
+    state.op_deadline_us = 0xdef0;
+    state.op_status = 0;
+    state.op_pending.store(true, std::memory_order_release);
+
+    cancel_op_waiter(&state, owned_wait, WKI_ERR_TIMEOUT);
+
+    bool const OWNED_SLOT_CLEARED = state.op_wait_entry == nullptr && state.op_expected_id == 0 && state.op_expected_seq == 0 &&
+                                    state.op_deadline_us == 0 && state.op_status == WKI_ERR_TIMEOUT &&
+                                    !state.op_pending.load(std::memory_order_acquire) && owned_wait.result == WKI_ERR_TIMEOUT &&
+                                    owned_wait.state.load(std::memory_order_acquire) == WkiWaitEntry::DONE;
+
+    return SUCCESSOR_PRESERVED && OWNED_SLOT_CLEARED;
 }
 
 }  // namespace ker::net::wki
