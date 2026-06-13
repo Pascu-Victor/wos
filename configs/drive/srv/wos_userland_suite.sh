@@ -118,6 +118,7 @@ NETBENCH_PAYLOAD_SIZE="${WOS_SUITE_NETBENCH_PAYLOAD_SIZE:-4096}"
 NETBENCH_ITERATIONS="${WOS_SUITE_NETBENCH_ITERATIONS:-$DEFAULT_NET_ITERATIONS}"
 NETBENCH_TOTAL_BYTES="${WOS_SUITE_NETBENCH_TOTAL_BYTES:-$DEFAULT_NET_TOTAL_BYTES}"
 NETBENCH_STARTUP_SECONDS="${WOS_SUITE_NETBENCH_STARTUP_SECONDS:-1}"
+NETBENCH_TIMEOUT_MS="${WOS_SUITE_NETBENCH_TIMEOUT_MS:-30000}"
 
 RUN_TESTD="${WOS_SUITE_RUN_TESTD:-1}"
 RUN_TESTPROG_PERF="${WOS_SUITE_RUN_TESTPROG_PERF:-$DEFAULT_RUN_TESTPROG_PERF}"
@@ -280,6 +281,14 @@ skip_case() {
     record_summary "$name" "SKIP" "$reason"
 }
 
+skip_case_group() {
+    reason="$1"
+    shift
+    for name in "$@"; do
+        skip_case "$name" "$reason"
+    done
+}
+
 cleanup_large_work() {
     if [ "$KEEP_LARGE_WORK" = "1" ]; then
         printf 'keeping large work files in %s\n' "$WORK_DIR"
@@ -439,7 +448,7 @@ run_netbench_one() {
     mode="$1"
     server_log="$WORK_DIR/netbench-$mode-server.log"
     rm -f "$server_log"
-    /usr/bin/testprog netbench-server --port "$NETBENCH_PORT" --sessions 1 > "$server_log" 2>&1 &
+    /usr/bin/testprog netbench-server --port "$NETBENCH_PORT" --sessions 1 --timeout-ms "$NETBENCH_TIMEOUT_MS" > "$server_log" 2>&1 &
     server_pid="$!"
 
     sleep "$NETBENCH_STARTUP_SECONDS"
@@ -450,7 +459,8 @@ run_netbench_one() {
             --port "$NETBENCH_PORT" \
             --mode pingpong \
             --payload-size "$NETBENCH_PAYLOAD_SIZE" \
-            --iterations "$NETBENCH_ITERATIONS"
+            --iterations "$NETBENCH_ITERATIONS" \
+            --timeout-ms "$NETBENCH_TIMEOUT_MS"
         client_rc="$?"
     else
         /usr/bin/testprog netbench-client \
@@ -458,7 +468,8 @@ run_netbench_one() {
             --port "$NETBENCH_PORT" \
             --mode stream \
             --payload-size "$NETBENCH_PAYLOAD_SIZE" \
-            --total-bytes "$NETBENCH_TOTAL_BYTES"
+            --total-bytes "$NETBENCH_TOTAL_BYTES" \
+            --timeout-ms "$NETBENCH_TIMEOUT_MS"
         client_rc="$?"
     fi
 
@@ -550,25 +561,43 @@ if require_exe testprog_smoke /usr/bin/testprog; then
     fi
     run_case mandelbench_large case_mandelbench
     run_case netbench_loopback case_netbench_loopback
+else
+    skip_case_group "missing executable: /usr/bin/testprog" \
+        make_large_file \
+        vfsbench_read \
+        vfsbench_stat \
+        cp_large_file \
+        dd_large_file \
+        testprog_perf_suite \
+        mandelbench_large \
+        netbench_loopback
 fi
 
 if require_exe renderbench_duck /usr/bin/renderbench; then
     run_case renderbench_duck case_renderbench_duck
 fi
 
-if [ "$RUN_STRACE" = "1" ] && require_exe strace_vfsbench /usr/bin/strace; then
-    run_case strace_vfsbench case_strace_vfsbench
-elif [ "$RUN_STRACE" != "1" ]; then
+if [ "$RUN_STRACE" != "1" ]; then
     skip_case strace_vfsbench "disabled by WOS_SUITE_RUN_STRACE=$RUN_STRACE"
+elif ! require_exe strace_vfsbench /usr/bin/strace; then
+    :
+elif ! have_exe /usr/bin/testprog; then
+    skip_case strace_vfsbench "missing executable: /usr/bin/testprog"
+else
+    run_case strace_vfsbench case_strace_vfsbench
 fi
 
 if require_exe perf_stat /usr/bin/perf; then
     run_case perf_stat case_perf_stat
-    if [ "$RUN_PERF_TRACE" = "1" ]; then
-        run_case perf_trace_vfs case_perf_trace_vfs
-    else
+    if [ "$RUN_PERF_TRACE" != "1" ]; then
         skip_case perf_trace_vfs "disabled by WOS_SUITE_RUN_PERF_TRACE=$RUN_PERF_TRACE"
+    elif ! have_exe /usr/bin/testprog; then
+        skip_case perf_trace_vfs "missing executable: /usr/bin/testprog"
+    else
+        run_case perf_trace_vfs case_perf_trace_vfs
     fi
+else
+    skip_case perf_trace_vfs "missing executable: /usr/bin/perf"
 fi
 
 if [ "$FAIL" -eq 0 ]; then
