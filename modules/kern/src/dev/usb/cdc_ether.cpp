@@ -342,6 +342,10 @@ void cdc_detach(UsbDevice* dev) {
         cdc.netdev.wki_rx_forward = nullptr;
         ker::net::netdev_unregister(&cdc.netdev);
 
+        // TODO: Add xHCI stop/drop-endpoint or disable-slot support before freeing
+        // bulk rings; the controller may still have endpoint contexts pointing here.
+        // TODO: Add netdev lifetime/refcount synchronization before recycling this
+        // static CDC slot after unregister.
         if (dev->driver_data == &cdc) {
             dev->driver_data = nullptr;
         }
