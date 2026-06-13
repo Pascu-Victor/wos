@@ -304,6 +304,57 @@ inline uint32_t observed_sleep_us(const task::Task* task, uint64_t now_us) {
     return static_cast<uint32_t>(std::min<uint64_t>(now_us - task->last_sleep_start_us, UINT32_MAX));
 }
 
+inline auto runtime_delta_ns_from_us(uint64_t delta_us) -> uint64_t {
+    if (delta_us > UINT64_MAX / 1000ULL) {
+        return UINT64_MAX;
+    }
+    return delta_us * 1000ULL;
+}
+
+inline auto vruntime_delta_from_runtime_ns(uint64_t delta_ns, uint32_t sched_weight) -> int64_t {
+    uint64_t const WEIGHT = std::max<uint32_t>(sched_weight, 1U);
+    uint64_t const WHOLE = delta_ns / WEIGHT;
+    uint64_t const REMAINDER = delta_ns % WEIGHT;
+    auto const MAX_I64 = static_cast<uint64_t>(INT64_MAX);
+    uint64_t const SCALED_WHOLE = WHOLE > MAX_I64 / 1024ULL ? MAX_I64 : WHOLE * 1024ULL;
+    uint64_t const SCALED_REMAINDER = (REMAINDER * 1024ULL) / WEIGHT;
+    if (SCALED_WHOLE > MAX_I64 - SCALED_REMAINDER) {
+        return INT64_MAX;
+    }
+    return static_cast<int64_t>(SCALED_WHOLE + SCALED_REMAINDER);
+}
+
+inline auto saturating_i64_mul(int64_t lhs, uint32_t rhs) -> int64_t {
+    if (lhs <= 0 || rhs == 0) {
+        return 0;
+    }
+    auto const RHS = static_cast<int64_t>(rhs);
+    if (lhs > INT64_MAX / RHS) {
+        return INT64_MAX;
+    }
+    return lhs * RHS;
+}
+
+inline void add_weighted_vruntime_delta(RunQueue* rq, int64_t vruntime_delta, uint32_t sched_weight) {
+    int64_t const WEIGHTED_DELTA = saturating_i64_mul(vruntime_delta, sched_weight);
+    if (rq->total_weighted_vruntime > INT64_MAX - WEIGHTED_DELTA) {
+        rq->total_weighted_vruntime = INT64_MAX;
+        return;
+    }
+    rq->total_weighted_vruntime += WEIGHTED_DELTA;
+}
+
+inline auto accumulate_slice_used_ns(uint32_t used_ns, uint64_t delta_ns, uint32_t slice_ns) -> uint32_t {
+    if (slice_ns == 0) {
+        return 0;
+    }
+    uint64_t const USED = used_ns;
+    if (delta_ns >= static_cast<uint64_t>(slice_ns) || USED > static_cast<uint64_t>(slice_ns) - delta_ns) {
+        return slice_ns;
+    }
+    return static_cast<uint32_t>(USED + delta_ns);
+}
+
 inline void note_perf_wait_callsite(task::Task* task, uint64_t fallback_rip) {
     if (task == nullptr) {
         return;
@@ -2063,6 +2114,15 @@ void remove_current_task() {
 // processTasks - timer interrupt hot path (EEVDF)
 // ============================================================================
 
+namespace {
+enum class CurrentTaskWakeupPending : uint8_t {
+    RECORD,
+    CLEAR,
+};
+
+void reschedule_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, CurrentTaskWakeupPending current_task_wakeup_pending);
+}  // namespace
+
 void kern_wake(task::Task* task) {
     if (task == nullptr) {
         return;
@@ -2097,14 +2157,15 @@ void wake_task_from_event_on_cpu(task::Task* task, uint64_t target_cpu, EventWak
     if (task == nullptr) {
         return;
     }
-    if (event_wake_cancels_deferred_switch(deferred_switch)) {
+    bool const CANCEL_DEFERRED_SWITCH = event_wake_cancels_deferred_switch(deferred_switch);
+    if (CANCEL_DEFERRED_SWITCH) {
         task->deferred_task_switch = false;
     }
     uint64_t cpu = target_cpu;
     if (cpu >= smt::get_core_count()) {
         cpu = get_least_loaded_cpu();
     }
-    reschedule_task_for_cpu(cpu, task);
+    reschedule_task_for_cpu_impl(cpu, task, CANCEL_DEFERRED_SWITCH ? CurrentTaskWakeupPending::CLEAR : CurrentTaskWakeupPending::RECORD);
 }
 
 void wake_task_from_event(task::Task* task, EventWakeDeferredSwitch deferred_switch) {
@@ -2443,7 +2504,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             // first scheduling window after a sleep->wake transition.
             current_task->just_woke = false;
         }
-        int64_t const DELTA_NS = static_cast<int64_t>(chargeable_us) * 1000;
+        uint64_t const DELTA_NS = runtime_delta_ns_from_us(chargeable_us);
 
         // Perf: periodic CPU sample (~100 Hz sub-sampled from 1 kHz timer)
         if (!current_task->is_voluntary_blocked()) {
@@ -2463,12 +2524,12 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
 
         // Update vruntime if task is in the heap
         if (rq->runnable_heap.contains(current_task)) {
-            int64_t const VRUNTIME_DELTA = (DELTA_NS * 1024) / static_cast<int64_t>(current_task->sched_weight);
+            int64_t const VRUNTIME_DELTA = vruntime_delta_from_runtime_ns(DELTA_NS, current_task->sched_weight);
             current_task->vruntime += VRUNTIME_DELTA;
-            current_task->slice_used_ns += static_cast<uint32_t>(DELTA_NS);
+            current_task->slice_used_ns = accumulate_slice_used_ns(current_task->slice_used_ns, DELTA_NS, current_task->slice_ns);
 
             // Track weighted sum: delta_v * weight = deltaNs * 1024 always
-            rq->total_weighted_vruntime += VRUNTIME_DELTA * static_cast<int64_t>(current_task->sched_weight);
+            add_weighted_vruntime_delta(rq, VRUNTIME_DELTA, current_task->sched_weight);
 
             // Slice exhausted - reset and recalculate deadline
             if (current_task->slice_used_ns >= current_task->slice_ns) {
@@ -3324,12 +3385,12 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             if (current_task->type != task::TaskType::IDLE) {
                 chargeable_us = account_runtime_slice(rq, current_task, NOW_US, static_cast<uint64_t>(delta_us), false, true);
             }
-            int64_t const DELTA_NS = static_cast<int64_t>(chargeable_us) * 1000;
+            uint64_t const DELTA_NS = runtime_delta_ns_from_us(chargeable_us);
 
             if (rq->runnable_heap.contains(current_task)) {
-                int64_t const VRUNTIME_DELTA = (DELTA_NS * 1024) / static_cast<int64_t>(current_task->sched_weight);
+                int64_t const VRUNTIME_DELTA = vruntime_delta_from_runtime_ns(DELTA_NS, current_task->sched_weight);
                 current_task->vruntime += VRUNTIME_DELTA;
-                rq->total_weighted_vruntime += VRUNTIME_DELTA * static_cast<int64_t>(current_task->sched_weight);
+                add_weighted_vruntime_delta(rq, VRUNTIME_DELTA, current_task->sched_weight);
             }
 
             // A concurrent wakeup may have seen this task as rq->currentTask and
@@ -3667,7 +3728,8 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Inter
 // rescheduleTaskForCpu - wake task from wait queue onto target CPU
 // ============================================================================
 
-void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
+namespace {
+void reschedule_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, CurrentTaskWakeupPending current_task_wakeup_pending) {
 #ifdef SCHED_DEBUG
     // DIAGNOSTIC: Always log reschedule attempts
     dbg::log("RESCHED: PID %x -> CPU %d (heapIdx=%d, schedQ=%d, curCpu=%d)", task->pid, static_cast<int>(cpu_no), task->heap_index,
@@ -3768,8 +3830,15 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         dbg::log("RESCHED: PID %x ABORT - is currentTask somewhere", task->pid);
 #endif
         // Signal to deferred_task_switch that a wakeup was attempted while
-        // the task is still currentTask.
-        task->wakeup_pending.store(true, std::memory_order_release);
+        // the task is still currentTask.  EventWakeDeferredSwitch::CANCEL is
+        // different: syscall.asm will skip deferred_task_switch after the flag
+        // is cleared, so a recorded token would survive and poison the next
+        // blocking syscall.
+        if (current_task_wakeup_pending == CurrentTaskWakeupPending::RECORD) {
+            task->wakeup_pending.store(true, std::memory_order_release);
+        } else {
+            task->wakeup_pending.store(false, std::memory_order_release);
+        }
 
         uint64_t const NOW_US = time::get_us();
         uint64_t const WAKE_AT_US = task->wake_at_us;
@@ -3890,6 +3959,11 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
 #ifdef SCHED_DEBUG
     dbg::log("RESCHED: PID %x DONE -> CPU %d (heapIdx=%d)", task->pid, static_cast<int>(cpu_no), task->heap_index);
 #endif
+}
+}  // namespace
+
+void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
+    reschedule_task_for_cpu_impl(cpu_no, task, CurrentTaskWakeupPending::RECORD);
 }
 
 // ============================================================================
@@ -5550,6 +5624,22 @@ auto get_expired_task_refcounts(uint64_t cpu_no, uint64_t* pids, uint32_t* refco
         return count;
     });
 }
+
+#ifdef WOS_SELFTEST
+auto scheduler_selftest_runtime_delta_saturates() -> bool {
+    bool const REGULAR_US_TO_NS = runtime_delta_ns_from_us(1234) == 1'234'000ULL;
+    bool const HUGE_US_TO_NS_SATURATES = runtime_delta_ns_from_us(UINT64_MAX) == UINT64_MAX;
+    bool const NICE0_VRUNTIME_MATCHES_NS = vruntime_delta_from_runtime_ns(1'000'000ULL, 1024) == 1'000'000;
+    bool const ZERO_WEIGHT_IS_SAFE = vruntime_delta_from_runtime_ns(1024ULL, 0) == 1'048'576;
+    bool const HUGE_VRUNTIME_SATURATES = vruntime_delta_from_runtime_ns(UINT64_MAX, 1) == INT64_MAX;
+    bool const SLICE_ACCUMULATES = accumulate_slice_used_ns(100, 200, 1000) == 300;
+    bool const SLICE_SATURATES = accumulate_slice_used_ns(900, 500, 1000) == 1000;
+    bool const WEIGHTED_MUL_SATURATES = saturating_i64_mul(INT64_MAX, 2) == INT64_MAX;
+
+    return REGULAR_US_TO_NS && HUGE_US_TO_NS_SATURATES && NICE0_VRUNTIME_MATCHES_NS && ZERO_WEIGHT_IS_SAFE && HUGE_VRUNTIME_SATURATES &&
+           SLICE_ACCUMULATES && SLICE_SATURATES && WEIGHTED_MUL_SATURATES;
+}
+#endif
 
 }  // namespace ker::mod::sched
 

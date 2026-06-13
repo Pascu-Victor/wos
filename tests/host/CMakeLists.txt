@@ -101,6 +101,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/waitpid_source_test.py
 )
 add_test(
+    NAME scheduler_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scheduler_source_test.py
+)
+add_test(
     NAME phys_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/phys_source_test.py
 )
@@ -185,6 +189,7 @@ set_tests_properties(
     poll_deadline_source_test
     futex_source_test
     waitpid_source_test
+    scheduler_source_test
     phys_source_test
     wki_timer_source_test
     wki_wait_source_test

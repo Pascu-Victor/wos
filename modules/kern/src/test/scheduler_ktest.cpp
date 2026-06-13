@@ -14,6 +14,10 @@ static constexpr uint32_t WEIGHT_NICE_0 = 1024;
 static constexpr uint32_t WEIGHT_NICE_P5 = 335;   // nice=+5 (lower prio)
 static constexpr uint32_t WEIGHT_NICE_N5 = 3121;  // nice=-5 (higher prio)
 
+namespace ker::mod::sched {
+auto scheduler_selftest_runtime_delta_saturates() -> bool;
+}  // namespace ker::mod::sched
+
 KTEST(Sched, VruntimeOrdering) {
     // vruntime delta = elapsed_ns * 1024 / weight
     // Lower weight -> larger delta -> vruntime accumulates faster.
@@ -55,8 +59,10 @@ KTEST(Sched, SaturatingDeadlineUs) {
     KEXPECT_EQ(saturating_deadline_us(UINT64_MAX, 1), UINT64_MAX);
 }
 
+KTEST(SchedulerRuntime, RuntimeDeltaSaturates) { KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_runtime_delta_saturates()); }
+
 // ---------------------------------------------------------------------------
-// RunHeap ordering test — push tasks with known deadlines, verify min-order.
+// RunHeap ordering test - push tasks with known deadlines, verify min-order.
 // ---------------------------------------------------------------------------
 
 // File-scope to avoid __cxa_guard_acquire (unavailable in freestanding kernel).
