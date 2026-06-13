@@ -33,6 +33,7 @@ int64_t futex_wake_by_phys(uint64_t phys_addr);
 #ifdef WOS_SELFTEST
 auto futex_selftest_table_init_is_serialized() -> bool;
 auto futex_selftest_addr_alignment_guard() -> bool;
+auto futex_selftest_stale_wake_does_not_claim_waiter() -> bool;
 #endif
 
 }  // namespace ker::syscall::futex

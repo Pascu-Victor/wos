@@ -91,6 +91,15 @@ auto deadline_from_now_us(uint64_t timeout_us) -> uint64_t {
 
 auto futex_addr_is_aligned(const void* addr) -> bool { return (reinterpret_cast<uintptr_t>(addr) % alignof(int)) == 0; }
 
+auto claim_task_waiter(mod::sched::task::Task* task, FutexWaiter* waiter) -> bool {
+    if (task == nullptr || waiter == nullptr) {
+        return false;
+    }
+
+    void* expected_waiter = waiter;
+    return task->futex_waiter.compare_exchange_strong(expected_waiter, nullptr, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
 }  // namespace
 
 // ============================================================================
@@ -221,13 +230,12 @@ int64_t futex_wake(int* addr) {  // NOLINT
         bool own_waiter = true;
         auto* waiter_task = mod::sched::find_task_by_pid_safe(waiter->task_pid);
         if (waiter_task != nullptr) {
-            void* expected_waiter = waiter;
-            if (!waiter_task->futex_waiter.compare_exchange_strong(expected_waiter, nullptr, std::memory_order_acq_rel,
-                                                                   std::memory_order_acquire)) {
+            if (!claim_task_waiter(waiter_task, waiter)) {
                 own_waiter = false;
+            } else {
+                mod::sched::wake_task_from_event_on_cpu(waiter_task, waiter->task_cpu, mod::sched::EventWakeDeferredSwitch::CANCEL);
+                woken_count++;
             }
-            mod::sched::wake_task_from_event_on_cpu(waiter_task, waiter->task_cpu, mod::sched::EventWakeDeferredSwitch::CANCEL);
-            woken_count++;
             waiter_task->release();
         }
         if (waiter_task == nullptr || own_waiter) {
@@ -265,13 +273,12 @@ int64_t futex_wake_by_phys(uint64_t phys_addr) {
         bool own_waiter = true;
         auto* waiter_task = mod::sched::find_task_by_pid_safe(waiter->task_pid);
         if (waiter_task != nullptr) {
-            void* expected_waiter = waiter;
-            if (!waiter_task->futex_waiter.compare_exchange_strong(expected_waiter, nullptr, std::memory_order_acq_rel,
-                                                                   std::memory_order_acquire)) {
+            if (!claim_task_waiter(waiter_task, waiter)) {
                 own_waiter = false;
+            } else {
+                mod::sched::wake_task_from_event_on_cpu(waiter_task, waiter->task_cpu, mod::sched::EventWakeDeferredSwitch::CANCEL);
+                woken_count++;
             }
-            mod::sched::wake_task_from_event_on_cpu(waiter_task, waiter->task_cpu, mod::sched::EventWakeDeferredSwitch::CANCEL);
-            woken_count++;
             waiter_task->release();
         }
         if (waiter_task == nullptr || own_waiter) {
@@ -290,6 +297,27 @@ auto futex_selftest_table_init_is_serialized() -> bool {
 
 auto futex_selftest_addr_alignment_guard() -> bool {
     return futex_addr_is_aligned(reinterpret_cast<const int*>(0x1000)) && !futex_addr_is_aligned(reinterpret_cast<const int*>(0x1001));
+}
+
+auto futex_selftest_stale_wake_does_not_claim_waiter() -> bool {
+    mod::sched::task::Task task{};
+    FutexWaiter waiter{};
+    FutexWaiter stale{};
+
+    task.futex_waiter.store(&waiter, std::memory_order_release);
+    if (!claim_task_waiter(&task, &waiter)) {
+        return false;
+    }
+    if (task.futex_waiter.load(std::memory_order_acquire) != nullptr) {
+        return false;
+    }
+
+    task.futex_waiter.store(&stale, std::memory_order_release);
+    if (claim_task_waiter(&task, &waiter)) {
+        return false;
+    }
+
+    return task.futex_waiter.load(std::memory_order_acquire) == &stale;
 }
 #endif
 

@@ -102,6 +102,36 @@ def require_futex_user_word_alignment_is_validated(source: str) -> None:
             fail(f"{name} unaligned futex guard must return -EINVAL")
 
 
+def require_futex_wake_counts_only_claimed_waiters(source: str) -> None:
+    claim_body = function_body(source, "claim_task_waiter")
+    for snippet in [
+        "task == nullptr || waiter == nullptr",
+        "void* expected_waiter = waiter",
+        "task->futex_waiter.compare_exchange_strong(expected_waiter, nullptr, std::memory_order_acq_rel, std::memory_order_acquire)",
+    ]:
+        if snippet not in claim_body:
+            fail(f"claim_task_waiter is missing stale-wake fence snippet: {snippet}")
+
+    for name in ["futex_wake", "futex_wake_by_phys"]:
+        body = function_body(source, name)
+        claim = body.find("if (!claim_task_waiter(waiter_task, waiter))")
+        wake = body.find("wake_task_from_event_on_cpu(waiter_task, waiter->task_cpu", claim)
+        count = body.find("woken_count++", claim)
+        release = body.find("waiter_task->release()", claim)
+        if claim < 0:
+            fail(f"{name} must claim task->futex_waiter before waking")
+        if wake < 0 or count < 0:
+            fail(f"{name} must wake/count only after claiming task->futex_waiter")
+        if not (claim < wake < release and claim < count < release):
+            fail(f"{name} must keep wake/count inside the successful waiter claim branch")
+        stale_branch = body[claim:wake]
+        if "own_waiter = false" not in stale_branch:
+            fail(f"{name} must mark stale waiters as not owned by the wake path")
+
+    if "futex_selftest_stale_wake_does_not_claim_waiter" not in source:
+        fail("KTEST helper must cover stale futex wake ownership")
+
+
 def require_deferred_switch_futex_cleanup_outside_runqueue_lock(source: str) -> None:
     body = function_body(source, "deferred_task_switch")
     initial_lock_pos = body.find("&futex_abort_cleanup_task")
@@ -141,6 +171,7 @@ def main() -> None:
     scheduler_source = SCHEDULER_CPP.read_text()
     require_futex_table_init_is_serialized(futex_source)
     require_futex_user_word_alignment_is_validated(futex_source)
+    require_futex_wake_counts_only_claimed_waiters(futex_source)
     require_deferred_switch_futex_cleanup_outside_runqueue_lock(scheduler_source)
     require_timer_futex_cleanup_outside_runqueue_lock(scheduler_source)
     print("futex source lock-order invariants hold")
