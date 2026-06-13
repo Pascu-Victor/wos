@@ -20,6 +20,23 @@ namespace {
 constexpr uint64_t USEC_PER_MSEC = 1000;
 constexpr int EPOLL_CLOEXEC_FLAG = 02000000;
 
+auto poll_timeout_us_from_ms(int timeout_ms) -> uint64_t {
+    auto const TIMEOUT_MS = static_cast<uint64_t>(timeout_ms);
+    if (TIMEOUT_MS > UINT64_MAX / USEC_PER_MSEC) {
+        return UINT64_MAX;
+    }
+    return TIMEOUT_MS * USEC_PER_MSEC;
+}
+
+auto poll_deadline_after_ms(int timeout_ms) -> uint64_t {
+    uint64_t const TIMEOUT_US = poll_timeout_us_from_ms(timeout_ms);
+    uint64_t const NOW_US = ker::mod::time::get_us();
+    if (UINT64_MAX - NOW_US < TIMEOUT_US) {
+        return UINT64_MAX;
+    }
+    return NOW_US + TIMEOUT_US;
+}
+
 auto register_poll_waiter(File* file, uint64_t pid) -> bool {
     if (file == nullptr) {
         return false;
@@ -43,7 +60,7 @@ auto begin_poll_timeout(ker::mod::sched::task::Task* task, int timeout_ms) -> ui
         return 0;
     }
     if (task->poll_wait_deadline_us == 0) {
-        task->poll_wait_deadline_us = ker::mod::time::get_us() + (static_cast<uint64_t>(timeout_ms) * USEC_PER_MSEC);
+        task->poll_wait_deadline_us = poll_deadline_after_ms(timeout_ms);
     }
     return task->poll_wait_deadline_us;
 }
