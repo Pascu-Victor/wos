@@ -148,12 +148,45 @@ def test_vfs_ref_loader_rejects_null_or_empty_path_before_vfs_use() -> None:
         require_order(body, guard, later, "VFS_REF loader must reject null/empty path before VFS/cache use")
 
 
+def test_vfs_ref_loader_deadlines_are_saturating() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    body = function_body(source, "load_elf_from_vfs_path")
+
+    for snippet in [
+        "#include <net/wki/timer_math.hpp>",
+        "uint64_t const INFLIGHT_DEADLINE_US = wki_future_deadline_us(wki_now_us(), WKI_TASK_SUBMIT_VFS_TIMEOUT_US)",
+        "uint64_t const RETRY_DEADLINE_US = wki_future_deadline_us(RETRY_WINDOW_START_US, WKI_VFS_LOAD_RETRY_WINDOW_US)",
+        "uint64_t const WAIT_UNTIL_US = wki_future_deadline_us(wki_now_us(), WKI_VFS_LOAD_RETRY_BACKOFF_US)",
+    ]:
+        if snippet not in source:
+            fail(f"VFS_REF loader deadline helper use is missing: {snippet}")
+
+    forbidden = [
+        "wki_now_us() + WKI_TASK_SUBMIT_VFS_TIMEOUT_US",
+        "RETRY_WINDOW_START_US + WKI_VFS_LOAD_RETRY_WINDOW_US",
+        "wki_now_us() + WKI_VFS_LOAD_RETRY_BACKOFF_US",
+    ]
+    present = [token for token in forbidden if token in body]
+    if present:
+        fail("VFS_REF loader must not use wrapping deadline arithmetic: " + ", ".join(present))
+
+    require_order(
+        body,
+        "s_compute_lock.unlock();",
+        "if (wki_now_us() >= INFLIGHT_DEADLINE_US)",
+        "inflight wait timeout must be checked after dropping compute lock",
+    )
+    if body.count("sleep_until_us(WAIT_UNTIL_US, WKI_VFS_LOAD_BACKOFF_POLL_US)") < 3:
+        fail("VFS_REF loader must keep retry backoff sleeps on every retry path")
+
+
 def main() -> None:
     test_peer_cleanup_marks_all_targeted_submits_terminal_failure()
     test_proxy_wait_completion_respects_waitpid_publish_fence()
     test_task_wait_consumes_completed_submitted_row()
     test_receiver_path_localization_bounds_suffix_scan()
     test_vfs_ref_loader_rejects_null_or_empty_path_before_vfs_use()
+    test_vfs_ref_loader_deadlines_are_saturating()
     print("WKI remote compute source invariants hold")
 
 

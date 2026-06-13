@@ -14,6 +14,7 @@
 #include <deque>
 #include <iterator>
 #include <net/wki/remote_ipc.hpp>
+#include <net/wki/timer_math.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <new>
@@ -3005,7 +3006,7 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
 
     ker::vfs::Stat cache_key = statbuf;
     bool is_loader = false;
-    uint64_t const INFLIGHT_DEADLINE_US = wki_now_us() + WKI_TASK_SUBMIT_VFS_TIMEOUT_US;
+    uint64_t const INFLIGHT_DEADLINE_US = wki_future_deadline_us(wki_now_us(), WKI_TASK_SUBMIT_VFS_TIMEOUT_US);
 
     auto fail_inflight_load = [&]() {
         if (!is_loader) {
@@ -3086,7 +3087,7 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
     size_t final_file_size = file_size;
     bool load_ok = false;
     uint64_t const RETRY_WINDOW_START_US = wki_now_us();
-    uint64_t const RETRY_DEADLINE_US = RETRY_WINDOW_START_US + WKI_VFS_LOAD_RETRY_WINDOW_US;
+    uint64_t const RETRY_DEADLINE_US = wki_future_deadline_us(RETRY_WINDOW_START_US, WKI_VFS_LOAD_RETRY_WINDOW_US);
 
     for (uint32_t attempt = 0; attempt < WKI_VFS_LOAD_MAX_ATTEMPTS; attempt++) {
         uint64_t const NOW_US = wki_now_us();
@@ -3106,7 +3107,7 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
             ker::vfs::Stat retry_stat = {};
             if (ker::vfs::vfs_stat(resolved_path, &retry_stat) != 0 || retry_stat.st_size <= 0) {
                 if (RETRY_WINDOW_OPEN && attempt + 1 < WKI_VFS_LOAD_MAX_ATTEMPTS) {
-                    uint64_t const WAIT_UNTIL_US = wki_now_us() + WKI_VFS_LOAD_RETRY_BACKOFF_US;
+                    uint64_t const WAIT_UNTIL_US = wki_future_deadline_us(wki_now_us(), WKI_VFS_LOAD_RETRY_BACKOFF_US);
                     while (wki_now_us() < WAIT_UNTIL_US) {
                         sleep_until_us(WAIT_UNTIL_US, WKI_VFS_LOAD_BACKOFF_POLL_US);
                     }
@@ -3129,7 +3130,7 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
         int const FD = ker::vfs::vfs_open(resolved_path, open_flags, 0);
         if (FD < 0) {
             if (RETRY_WINDOW_OPEN && attempt + 1 < WKI_VFS_LOAD_MAX_ATTEMPTS) {
-                uint64_t const WAIT_UNTIL_US = wki_now_us() + WKI_VFS_LOAD_RETRY_BACKOFF_US;
+                uint64_t const WAIT_UNTIL_US = wki_future_deadline_us(wki_now_us(), WKI_VFS_LOAD_RETRY_BACKOFF_US);
                 while (wki_now_us() < WAIT_UNTIL_US) {
                     sleep_until_us(WAIT_UNTIL_US, WKI_VFS_LOAD_BACKOFF_POLL_US);
                 }
@@ -3178,7 +3179,7 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
             uint64_t const ELAPSED_MS = (wki_now_us() - RETRY_WINDOW_START_US) / 1000;
             ker::mod::dbg::log("[WKI] VFS_REF: short read retry for '%s' (%zu/%zu bytes) attempt %u/%u elapsed=%llu ms", resolved_path,
                                total_read, file_size, attempt + 1, WKI_VFS_LOAD_MAX_ATTEMPTS, static_cast<unsigned long long>(ELAPSED_MS));
-            uint64_t const WAIT_UNTIL_US = wki_now_us() + WKI_VFS_LOAD_RETRY_BACKOFF_US;
+            uint64_t const WAIT_UNTIL_US = wki_future_deadline_us(wki_now_us(), WKI_VFS_LOAD_RETRY_BACKOFF_US);
             while (wki_now_us() < WAIT_UNTIL_US) {
                 sleep_until_us(WAIT_UNTIL_US, WKI_VFS_LOAD_BACKOFF_POLL_US);
             }
