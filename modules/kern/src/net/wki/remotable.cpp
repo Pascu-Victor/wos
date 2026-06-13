@@ -14,6 +14,7 @@
 #include <net/route.hpp>
 #include <net/wki/remote_net.hpp>
 #include <net/wki/remote_vfs.hpp>
+#include <net/wki/timer_math.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -295,7 +296,7 @@ auto requeue_net_attach(PendingNetAttach& pending) -> bool {
     pending.retry_count++;
     uint64_t delay_us = NET_AUTO_ATTACH_RETRY_BASE_US << (pending.retry_count - 1);
     delay_us = std::min(delay_us, NET_AUTO_ATTACH_RETRY_MAX_US);
-    pending.next_attempt_us = wki_now_us() + delay_us;
+    pending.next_attempt_us = wki_future_deadline_us(wki_now_us(), delay_us);
 
     s_remotable_lock.lock();
     queue_net_attach_locked(pending.node_id, pending.resource_id, pending.nic_name.data(), pending.hostname.data(),
@@ -305,7 +306,7 @@ auto requeue_net_attach(PendingNetAttach& pending) -> bool {
 }
 
 void defer_net_attach_for_local_ipv4(PendingNetAttach& pending) {
-    pending.next_attempt_us = wki_now_us() + NET_AUTO_ATTACH_LOCAL_IPV4_RETRY_US;
+    pending.next_attempt_us = wki_future_deadline_us(wki_now_us(), NET_AUTO_ATTACH_LOCAL_IPV4_RETRY_US);
 
     s_remotable_lock.lock();
     queue_net_attach_locked(pending.node_id, pending.resource_id, pending.nic_name.data(), pending.hostname.data(),
@@ -838,7 +839,7 @@ void wki_remotable_process_pending_mounts() {
                 pending.retry_count++;
                 uint64_t delay_us = VFS_AUTO_MOUNT_RETRY_BASE_US << (pending.retry_count - 1);
                 delay_us = std::min(delay_us, VFS_AUTO_MOUNT_RETRY_MAX_US);
-                pending.next_attempt_us = wki_now_us() + delay_us;
+                pending.next_attempt_us = wki_future_deadline_us(wki_now_us(), delay_us);
 
                 s_remotable_lock.lock();
                 g_pending_vfs_mounts.push_back(pending);

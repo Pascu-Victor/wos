@@ -117,6 +117,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_roce_source_test.py
 )
 add_test(
+    NAME wki_remotable_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_remotable_source_test.py
+)
+add_test(
     NAME wki_zone_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_zone_source_test.py
 )
@@ -165,6 +169,7 @@ set_tests_properties(
     wki_remote_ipc_source_test
     wki_remote_net_source_test
     wki_roce_source_test
+    wki_remotable_source_test
     wki_zone_source_test
     wki_peer_source_test
     wki_remote_compute_source_test

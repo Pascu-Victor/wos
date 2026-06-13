@@ -124,6 +124,7 @@ UNIT_TESTS=(
     wki_remote_ipc_source_test
     wki_remote_net_source_test
     wki_roce_source_test
+    wki_remotable_source_test
     wki_zone_source_test
     wki_peer_source_test
     wki_remote_compute_source_test
