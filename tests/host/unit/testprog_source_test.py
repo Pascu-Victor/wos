@@ -339,6 +339,52 @@ def test_perfbench_context_switch_counter_is_atomic() -> None:
         fail(f"perfbench context switch counter still uses racy volatile state: {present[0]}")
 
 
+def test_perfbench_parallel_workers_cleanup_before_failure_return() -> None:
+    source = PERFBENCH_CPP.read_text()
+    release_body = function_body(source, "release_parallel_workers")
+    join_body = function_body(source, "join_parallel_workers")
+    cleanup_body = function_body(source, "cleanup_parallel_workers")
+    parallel_body = function_body(source, "test_parallel_efficiency")
+
+    require_tokens(
+        release_body,
+        ["go.store(1, std::memory_order_release)"],
+        "perfbench parallel worker release",
+    )
+    require_tokens(
+        join_body,
+        ["thrd_join(thread, nullptr)", "thread = nullptr"],
+        "perfbench parallel worker join cleanup",
+    )
+    require_tokens(
+        cleanup_body,
+        ["release_parallel_workers(go)", "join_parallel_workers(threads)"],
+        "perfbench parallel worker cleanup helper",
+    )
+
+    for context, marker, cleanup in [
+        ("create failure", "if (create_failed)", "cleanup_parallel_workers(go, threads);"),
+        ("ready timeout", "if (!wait_for_counter(ready_count, n, PARALLEL_READY_TIMEOUT_NS))", "cleanup_parallel_workers(go, threads);"),
+        ("done timeout", "if (!wait_for_counter(done_count, n, PARALLEL_DONE_TIMEOUT_NS))", "join_parallel_workers(threads);"),
+    ]:
+        start = parallel_body.find(marker)
+        if start < 0:
+            fail(f"perfbench parallel_eff missing {context} branch")
+        ret = parallel_body.find("return false;", start)
+        if ret < 0:
+            fail(f"perfbench parallel_eff {context} branch no longer returns false")
+        branch = parallel_body[start:ret]
+        if cleanup not in branch:
+            fail(f"perfbench parallel_eff {context} branch must cleanup workers before returning")
+
+    require_order(
+        parallel_body,
+        "release_parallel_workers(go);",
+        "if (!wait_for_counter(done_count, n, PARALLEL_DONE_TIMEOUT_NS))",
+        "perfbench parallel_eff releases workers before waiting for completion",
+    )
+
+
 def test_cowbench_child_wait_is_deadline_bounded() -> None:
     source = COWBENCH_CPP.read_text()
     require_tokens(
@@ -398,6 +444,7 @@ def main() -> None:
     test_userland_suite_passes_netbench_timeout()
     test_userland_suite_cases_are_watchdog_bounded()
     test_perfbench_context_switch_counter_is_atomic()
+    test_perfbench_parallel_workers_cleanup_before_failure_return()
     test_cowbench_child_wait_is_deadline_bounded()
     print("testprog ping, netbench socket waits, userland suite cases, and cowbench child waits are deadline bounded")
 

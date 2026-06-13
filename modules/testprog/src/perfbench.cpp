@@ -404,6 +404,25 @@ auto par_eff_thread(void* param) -> int {
     return 0;
 }
 
+void release_parallel_workers(std::atomic<int>& go) {
+    go.store(1, std::memory_order_release);
+    futex_wake(go);
+}
+
+void join_parallel_workers(std::vector<thrd_t>& threads) {
+    for (auto*& thread : threads) {
+        if (thread != nullptr) {
+            thrd_join(thread, nullptr);
+            thread = nullptr;
+        }
+    }
+}
+
+void cleanup_parallel_workers(std::atomic<int>& go, std::vector<thrd_t>& threads) {
+    release_parallel_workers(go);
+    join_parallel_workers(threads);
+}
+
 void print_parallel_outliers(int n, const std::vector<ParEffArg>& args) {
     int min_idx = 0;
     int max_idx = 0;
@@ -669,23 +688,17 @@ auto test_parallel_efficiency(int iters, int repeats, bool verbose) -> bool {
                 next_cpu = (next_cpu + 1) % CPU_TOTAL;
             }
             if (create_failed) {
-                for (auto* thread : threads) {
-                    if (thread != nullptr) {
-                        thrd_join(thread, nullptr);
-                    }
-                }
+                cleanup_parallel_workers(go, threads);
                 return false;
             }
             if (!wait_for_counter(ready_count, n, PARALLEL_READY_TIMEOUT_NS)) {
                 int const READY = ready_count.load(std::memory_order_acquire);
-                go.store(1, std::memory_order_release);
-                futex_wake(go);
                 std::println(stderr, "[perf] parallel_eff[{}]: FAILED (ready timeout repeat={} ready={}/{})", n, repeat + 1, READY, n);
+                cleanup_parallel_workers(go, threads);
                 return false;
             }
             uint64_t const T0 = now_ns();
-            go.store(1, std::memory_order_release);
-            futex_wake(go);
+            release_parallel_workers(go);
             if (!wait_for_counter(done_count, n, PARALLEL_DONE_TIMEOUT_NS)) {
                 int const DONE = done_count.load(std::memory_order_acquire);
                 std::println(stderr, "[perf] parallel_eff[{}]: FAILED (done timeout repeat={} done={}/{})", n, repeat + 1, DONE, n);
@@ -694,11 +707,10 @@ auto test_parallel_efficiency(int iters, int repeats, bool verbose) -> bool {
                     std::println(stderr, "[perf]   worker[{}]: start={} end={} cpu={} last_cpu={} changes={} result={:#x}", i, arg.start_ns,
                                  arg.end_ns, arg.cpu_id, arg.cpu_end_id, arg.cpu_changes, static_cast<unsigned long long>(arg.result));
                 }
+                join_parallel_workers(threads);
                 return false;
             }
-            for (auto* thread : threads) {
-                thrd_join(thread, nullptr);
-            }
+            join_parallel_workers(threads);
 
             double worst_thread_s = 0.0;
             for (const auto& arg : args) {
