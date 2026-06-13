@@ -219,10 +219,47 @@ def test_reliable_rx_rejects_fenced_peer_before_channel_lookup() -> None:
             fail(f"reliable RX fence KTEST is missing {token}")
 
 
+def test_fence_notify_rejects_invalid_targets_before_routing() -> None:
+    source = PEER_CPP.read_text()
+    helper = function_body(source, "fence_notify_target_is_valid")
+    handle_body = function_body(source, "handle_fence_notify")
+    queue_body = function_body(source, "queue_pending_fence_notify")
+    drain_body = function_body(source, "drain_pending_fence_notifies")
+
+    for token in [
+        "fenced_node != WKI_NODE_INVALID",
+        "fenced_node != WKI_NODE_BROADCAST",
+        "fenced_node != g_wki.my_node_id",
+    ]:
+        if token not in helper:
+            fail(f"FENCE_NOTIFY target helper is missing guard: {token}")
+
+    for name, body in [
+        ("queue_pending_fence_notify", queue_body),
+        ("drain_pending_fence_notifies", drain_body),
+    ]:
+        if "!fence_notify_target_is_valid(" not in body:
+            fail(f"{name} must reject invalid/self/broadcast FENCE_NOTIFY targets")
+
+    guard = "if (!fence_notify_target_is_valid(fn->fenced_node))"
+    if guard not in handle_body:
+        fail("handle_fence_notify must reject invalid/self/broadcast targets")
+    require_order(
+        handle_body,
+        guard,
+        "wki_routing_invalidate_node(fn->fenced_node)",
+        "FENCE_NOTIFY target validation before route invalidation",
+    )
+    guarded_tail = handle_body[handle_body.find(guard) : handle_body.find("wki_routing_invalidate_node(fn->fenced_node)")]
+    if "return;" not in guarded_tail:
+        fail("handle_fence_notify invalid target guard must return before route invalidation")
+
+
 def main() -> None:
     test_hello_ack_reconnects_fenced_peer_outside_peer_lock()
     test_hello_boot_epoch_fences_connected_broadcast_restarts()
     test_reliable_rx_rejects_fenced_peer_before_channel_lookup()
+    test_fence_notify_rejects_invalid_targets_before_routing()
     print("WKI peer source invariants hold")
 
 

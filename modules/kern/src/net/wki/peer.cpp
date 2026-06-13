@@ -891,8 +891,12 @@ std::atomic<uint32_t> s_pending_fence_notify_drops{0};                     // NO
 
 auto local_observation_confirms_fence(const WkiPeer* peer, uint64_t now_us) -> bool;
 
+auto fence_notify_target_is_valid(uint16_t fenced_node) -> bool {
+    return fenced_node != WKI_NODE_INVALID && fenced_node != WKI_NODE_BROADCAST && fenced_node != g_wki.my_node_id;
+}
+
 auto queue_pending_fence_notify(const FenceNotifyPayload& fn) -> bool {
-    if (fn.fenced_node == WKI_NODE_INVALID || fn.fenced_node == WKI_NODE_BROADCAST || fn.fenced_node == g_wki.my_node_id) {
+    if (!fence_notify_target_is_valid(fn.fenced_node)) {
         return true;
     }
 
@@ -1027,7 +1031,7 @@ void drain_pending_fence_notifies() {
 
     for (size_t i = 0; i < PENDING_COUNT; ++i) {
         auto const& pending = pending_notifies.at(i);
-        if (pending.fenced_node == WKI_NODE_INVALID || pending.fenced_node == g_wki.my_node_id) {
+        if (!fence_notify_target_is_valid(pending.fenced_node)) {
             continue;
         }
 
@@ -1061,14 +1065,16 @@ void handle_fence_notify(const WkiHeader* /*hdr*/, const uint8_t* payload, uint1
 
     log::warn("Received FENCE_NOTIFY: node 0x%04x fenced by 0x%04x", fn->fenced_node, fn->fencing_node);
 
-    if (fn->fenced_node != g_wki.my_node_id) {
-        if (queue_pending_fence_notify(*fn)) {
-            wki_timer_notify();
-        } else {
-            uint32_t const DROPS = s_pending_fence_notify_drops.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (DROPS == 1 || (DROPS & (DROPS - 1)) == 0) {
-                log::warn("Pending FENCE_NOTIFY queue full; dropped %u notifications", DROPS);
-            }
+    if (!fence_notify_target_is_valid(fn->fenced_node)) {
+        return;
+    }
+
+    if (queue_pending_fence_notify(*fn)) {
+        wki_timer_notify();
+    } else {
+        uint32_t const DROPS = s_pending_fence_notify_drops.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (DROPS == 1 || (DROPS & (DROPS - 1)) == 0) {
+            log::warn("Pending FENCE_NOTIFY queue full; dropped %u notifications", DROPS);
         }
     }
 
