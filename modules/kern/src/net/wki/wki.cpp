@@ -2013,11 +2013,6 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
     const auto* payload = static_cast<const uint8_t*>(data) + WKI_HEADER_SIZE;
     auto msg = static_cast<MsgType>(hdr->msg_type);
 
-    // Any validated inbound WKI frame proves peer liveness. Do this before
-    // channel ordering so out-of-order data during heavy load cannot be
-    // mistaken for a heartbeat loss.
-    mark_peer_rx_progress(hdr->src_node);
-
     // Forwarding: if this packet is not for us, forward it
     if (hdr->dst_node != g_wki.my_node_id && hdr->dst_node != WKI_NODE_BROADCAST) {
         // Decrement TTL

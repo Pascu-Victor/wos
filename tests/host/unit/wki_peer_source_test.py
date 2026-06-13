@@ -39,6 +39,14 @@ def require_order(body: str, before: str, after: str, context: str) -> None:
         fail(f"{context}: expected {before!r} before {after!r}")
 
 
+def require_token_after(body: str, anchor: str, token: str, context: str) -> None:
+    anchor_pos = body.find(anchor)
+    if anchor_pos < 0:
+        fail(f"{context}: missing anchor {anchor!r}")
+    if body.find(token, anchor_pos) < 0:
+        fail(f"{context}: expected {token!r} after {anchor!r}")
+
+
 def test_hello_ack_reconnects_fenced_peer_outside_peer_lock() -> None:
     source = PEER_CPP.read_text()
     transition = function_body(source, "apply_hello_ack_peer_state_locked")
@@ -255,11 +263,63 @@ def test_fence_notify_rejects_invalid_targets_before_routing() -> None:
         fail("handle_fence_notify invalid target guard must return before route invalidation")
 
 
+def test_ack_only_frames_do_not_refresh_peer_liveness() -> None:
+    source = WKI_CPP.read_text()
+    peer_source = PEER_CPP.read_text()
+    body = function_body(source, "wki_rx")
+    heartbeat_ack = function_body(peer_source, "handle_heartbeat_ack")
+
+    first_rx_progress = body.find("mark_peer_rx_progress(hdr->src_node);")
+    if first_rx_progress < 0:
+        fail("wki_rx must refresh peer liveness on real receive progress")
+    ack_progress_pos = body.find("if (ack_progress)")
+    if ack_progress_pos < 0:
+        fail("wki_rx must gate ACK-only liveness on ack_progress")
+    if first_rx_progress < ack_progress_pos:
+        fail("wki_rx must not refresh peer liveness before ACK progress filtering")
+
+    require_order(
+        body,
+        "if (ack_progress)",
+        "mark_peer_rx_progress(hdr->src_node);",
+        "ACK liveness refresh must be gated by tx ACK progress",
+    )
+    require_order(
+        body,
+        "bool const RELIABLE_RX_ACCEPTED = reliable_rx_peer_accepts(hdr->src_node)",
+        "if (ack_progress)",
+        "ACK liveness refresh must happen after reliable peer-state filtering",
+    )
+    require_token_after(
+        body,
+        "if (hdr->seq_num == ch->rx_seq)",
+        "mark_peer_rx_progress(hdr->src_node);",
+        "in-order reliable payloads still refresh liveness",
+    )
+    require_token_after(
+        body,
+        "if (!already_buffered)",
+        "mark_peer_rx_progress(hdr->src_node);",
+        "new out-of-order reliable payloads still refresh liveness",
+    )
+    require_order(
+        heartbeat_ack,
+        "if (payload_len < sizeof(HeartbeatPayload))",
+        "peer->last_rx_activity = peer->last_heartbeat;",
+        "zero-payload ACK carriers must not refresh heartbeat ACK liveness",
+    )
+
+    pre_dispatch = body[: body.find("// Forwarding: if this packet is not for us, forward it")]
+    if "mark_peer_rx_progress" in pre_dispatch:
+        fail("wki_rx must not refresh peer liveness for every validated frame before ACK filtering")
+
+
 def main() -> None:
     test_hello_ack_reconnects_fenced_peer_outside_peer_lock()
     test_hello_boot_epoch_fences_connected_broadcast_restarts()
     test_reliable_rx_rejects_fenced_peer_before_channel_lookup()
     test_fence_notify_rejects_invalid_targets_before_routing()
+    test_ack_only_frames_do_not_refresh_peer_liveness()
     print("WKI peer source invariants hold")
 
 
