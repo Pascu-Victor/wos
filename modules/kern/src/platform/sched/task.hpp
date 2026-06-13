@@ -41,6 +41,7 @@ struct LazyVmemRange {
     uint64_t prot = 0;
     uint64_t flags = 0;
 };
+using LazyVmemRangeVec = ker::util::SmallVec<LazyVmemRange, 8>;
 
 enum class TaskType : uint8_t {
     DAEMON,
@@ -178,7 +179,8 @@ struct Task {
     uint64_t elf_header_addr{};          // Virtual address of ELF header (AT_EHDR)
     uint64_t interp_base = 0;            // Load base of dynamic linker (AT_BASE), 0 if statically linked
     std::atomic<uint64_t> mmap_next{0};  // Next preferred mmap search address; zero means use syscall default.
-    ker::util::SmallVec<LazyVmemRange, 8> lazy_vmem_ranges;
+    LazyVmemRangeVec lazy_vmem_ranges;
+    mod::sys::Spinlock lazy_vmem_lock;
 
     // PID of the process that owns this thread (set by create_user_thread).
     // 0 for regular processes.
@@ -517,6 +519,7 @@ struct Task {
 
 auto get_next_pid() -> uint64_t;
 void destroy_unpublished_user_thread(Task* task);
+[[nodiscard]] auto clone_lazy_vmem_ranges(Task& dst, Task& src) -> bool;
 
 [[nodiscard]] inline auto task_waited_on(const Task& task) -> bool { return task.waited_on.load(std::memory_order_acquire); }
 

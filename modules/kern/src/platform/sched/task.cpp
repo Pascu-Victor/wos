@@ -72,19 +72,22 @@ auto boot_file_path_matches(const BootFileCacheEntry& entry, const char* path) -
     return ENTRY_LEN == PATH_LEN && std::strncmp(entry.path.data(), path, PATH_LEN) == 0;
 }
 
-auto infer_user_stack_range(const Task* task, uint64_t user_sp, uint64_t& stack_base, uint64_t& stack_size) -> bool {
+auto infer_user_stack_range(Task* task, uint64_t user_sp, uint64_t& stack_base, uint64_t& stack_size) -> bool {
     if (task == nullptr || user_sp == 0) {
         return false;
     }
 
     uint64_t const STACK_PAGE = page_align_down(user_sp);
+    uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
     for (const auto& range : task->lazy_vmem_ranges) {
         if (STACK_PAGE >= range.start && STACK_PAGE < range.end) {
             stack_base = range.start;
             stack_size = range.end - range.start;
+            task->lazy_vmem_lock.unlock_irqrestore(IRQF);
             return true;
         }
     }
+    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
     return false;
 }
 
@@ -391,6 +394,13 @@ void destroy_unpublished_user_thread(Task* task) {
         mm::phys::page_free(reinterpret_cast<void*>(task->context.syscall_kernel_stack - ker::mod::mm::KERNEL_STACK_SIZE));
     }
     delete task;
+}
+
+auto clone_lazy_vmem_ranges(Task& dst, Task& src) -> bool {
+    uint64_t const IRQF = src.lazy_vmem_lock.lock_irqsave();
+    bool const OK = dst.lazy_vmem_ranges.clone_from(src.lazy_vmem_ranges);
+    src.lazy_vmem_lock.unlock_irqrestore(IRQF);
+    return OK;
 }
 
 #ifdef WOS_SELFTEST
@@ -782,7 +792,7 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->program_header_ent_size = parent->program_header_ent_size;
     t->interp_base = parent->interp_base;
     t->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    if (!t->lazy_vmem_ranges.clone_from(parent->lazy_vmem_ranges)) {
+    if (!clone_lazy_vmem_ranges(*t, *parent)) {
         delete[] t->name;
         mm::phys::page_free(reinterpret_cast<void*>(KSTACK_BASE));
         delete t;

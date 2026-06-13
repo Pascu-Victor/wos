@@ -440,7 +440,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete child;
         return finish_fork(-ENOMEM);
     }
-    if (!child->lazy_vmem_ranges.clone_from(parent->lazy_vmem_ranges)) {
+    if (!sched::task::clone_lazy_vmem_ranges(*child, *parent)) {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
@@ -964,7 +964,7 @@ auto wos_proc_clone_vm(const CloneVmArgs* args) -> uint64_t {
     child->wki_target_flags = sched::task::Task::WKI_TARGET_FLAG_LOCAL;
 
     if (!child->supplementary_groups.clone_from(parent->supplementary_groups) || !child->wki_vfs_rules.clone_from(parent->wki_vfs_rules) ||
-        !child->lazy_vmem_ranges.clone_from(parent->lazy_vmem_ranges)) {
+        !sched::task::clone_lazy_vmem_ranges(*child, *parent)) {
         cleanup_child();
         return static_cast<uint64_t>(-ENOMEM);
     }

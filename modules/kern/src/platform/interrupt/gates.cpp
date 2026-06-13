@@ -74,18 +74,25 @@ void log_userfault_lazy_vmem_ranges(ker::mod::sched::task::Task* task, uint64_t 
         shadow_app = (cr2 - 0x000000007fff8000ULL) << 3U;
     }
 
+    ker::mod::sched::task::LazyVmemRange hit{};
+    bool found_hit = false;
+    uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
     size_t const RANGE_COUNT = task->lazy_vmem_ranges.size();
+    for (size_t i = 0; i < RANGE_COUNT; ++i) {
+        auto const& range = task->lazy_vmem_ranges.at(i);
+        if (cr2 >= range.start && cr2 < range.end) {
+            hit = range;
+            found_hit = true;
+            break;
+        }
+    }
+    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+
     journal::warn(" userfault lazy_vmem: ranges=%llu cr2=0x%lx shadow_app=0x%lx", static_cast<unsigned long long>(RANGE_COUNT), cr2,
                   HAS_SHADOW_APP ? shadow_app : 0UL);
 
-    for (size_t i = 0; i < RANGE_COUNT; ++i) {
-        auto const& range = task->lazy_vmem_ranges.at(i);
-        bool const CONTAINS = cr2 >= range.start && cr2 < range.end;
-        if (!CONTAINS) {
-            continue;
-        }
-        journal::warn("  lazy_hit[%llu]: [0x%lx, 0x%lx) prot=0x%lx flags=0x%lx", static_cast<unsigned long long>(i), range.start, range.end,
-                      range.prot, range.flags);
+    if (found_hit) {
+        journal::warn("  lazy_hit: [0x%lx, 0x%lx) prot=0x%lx flags=0x%lx", hit.start, hit.end, hit.prot, hit.flags);
         return;
     }
 

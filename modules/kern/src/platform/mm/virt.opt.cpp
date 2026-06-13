@@ -2,7 +2,6 @@
 
 #include <extern/limine.h>
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -80,14 +79,21 @@ void log_lazy_vmem_fault_state(sched::task::Task* task, uint64_t page_vaddr, con
         return;
     }
 
-    log::warn("lazy vmem %s: pid=%lu page=0x%llx err_present=%u err_write=%u ranges=%llu", reason, task->pid,
-              static_cast<unsigned long long>(page_vaddr), static_cast<unsigned>(fault.present), static_cast<unsigned>(fault.writable),
-              static_cast<unsigned long long>(task->lazy_vmem_ranges.size()));
-
+    std::array<sched::task::LazyVmemRange, MAX_LOGGED_RANGES> ranges{};
+    uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
     size_t const RANGE_COUNT = task->lazy_vmem_ranges.size();
     size_t const LOG_COUNT = RANGE_COUNT < MAX_LOGGED_RANGES ? RANGE_COUNT : MAX_LOGGED_RANGES;
     for (size_t i = 0; i < LOG_COUNT; ++i) {
-        auto const& range = task->lazy_vmem_ranges.at(i);
+        ranges.at(i) = task->lazy_vmem_ranges.at(i);
+    }
+    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+
+    log::warn("lazy vmem %s: pid=%lu page=0x%llx err_present=%u err_write=%u ranges=%llu", reason, task->pid,
+              static_cast<unsigned long long>(page_vaddr), static_cast<unsigned>(fault.present), static_cast<unsigned>(fault.writable),
+              static_cast<unsigned long long>(RANGE_COUNT));
+
+    for (size_t i = 0; i < LOG_COUNT; ++i) {
+        auto const& range = ranges.at(i);
         bool const CONTAINS = page_vaddr >= range.start && page_vaddr < range.end;
         log::warn(" lazy[%llu]: [0x%llx, 0x%llx) prot=0x%llx flags=0x%llx contains=%u", static_cast<unsigned long long>(i),
                   static_cast<unsigned long long>(range.start), static_cast<unsigned long long>(range.end),
@@ -102,25 +108,30 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
     }
 
     uint64_t const PAGE_VADDR = vaddr & ~(paging::PAGE_SIZE - 1);
+    uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
     for (const auto& range : task->lazy_vmem_ranges) {
         if (PAGE_VADDR < range.start || PAGE_VADDR >= range.end) {
             continue;
         }
         if (range.prot == 0 || (((range.prot & 0x2ULL) == 0) && fault.writable != 0U)) {
+            task->lazy_vmem_lock.unlock_irqrestore(IRQF);
             log_lazy_vmem_fault_state(task, PAGE_VADDR, fault, "deny");
             return false;
         }
 
         void* const PAGE = phys::page_alloc(paging::PAGE_SIZE, "lazy-vmem");
         if (PAGE == nullptr) {
+            task->lazy_vmem_lock.unlock_irqrestore(IRQF);
             log::error("lazy vmem fault: OOM pid=%lu vaddr=0x%llx", task->pid, static_cast<unsigned long long>(PAGE_VADDR));
             return false;
         }
         std::memset(PAGE, 0, paging::PAGE_SIZE);
         auto const PADDR = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(PAGE)));
         map_page(task->pagemap, PAGE_VADDR, PADDR, lazy_user_vmem_flags(range.prot));
+        task->lazy_vmem_lock.unlock_irqrestore(IRQF);
         return true;
     }
+    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
 
     log_lazy_vmem_fault_state(task, PAGE_VADDR, fault, "miss");
     return false;
@@ -134,10 +145,16 @@ auto writable_anonymous_range_contains(sched::task::Task* task, uint64_t vaddr) 
     constexpr uint64_t PROT_WRITE = 0x2ULL;
     constexpr uint64_t MAP_ANONYMOUS = 0x20ULL;
     uint64_t const PAGE_VADDR = vaddr & ~(paging::PAGE_SIZE - 1);
-    return std::ranges::any_of(task->lazy_vmem_ranges, [PAGE_VADDR](const auto& range) {
-        return PAGE_VADDR >= range.start && PAGE_VADDR < range.end && (range.prot & PROT_WRITE) != 0U &&
-               (range.flags & MAP_ANONYMOUS) != 0U;
-    });
+    bool contains = false;
+    uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
+    for (const auto& range : task->lazy_vmem_ranges) {
+        if (PAGE_VADDR >= range.start && PAGE_VADDR < range.end && (range.prot & PROT_WRITE) != 0U && (range.flags & MAP_ANONYMOUS) != 0U) {
+            contains = true;
+            break;
+        }
+    }
+    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+    return contains;
 }
 
 void record_cow_perf_event(sched::task::Task* task, perf::WkiPerfLocalVmemOp op, uint64_t vaddr, uint32_t refcount, uint64_t started_us) {
