@@ -3,7 +3,7 @@
     "tasks": [
         {
             "label": "Build WOS",
-            "command": "cmake -B build -GNinja . && cmake --build build --target wos_full",
+            "command": "${workspaceFolder}/scripts/dev/build_wos.sh",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}",

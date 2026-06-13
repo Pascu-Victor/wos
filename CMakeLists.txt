@@ -52,26 +52,38 @@ set(WOS_LIBCXX_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/libcxx-build" CACHE PATH
 set(WOS_BUSYBOX_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/busybox-build" CACHE PATH "BusyBox build directory")
 set(WOS_BUSYBOX_INSTALL_DIR "${CMAKE_SOURCE_DIR}/toolchain/busybox-install" CACHE PATH "BusyBox install staging directory")
 set(WOS_DROPBEAR_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/dropbear-build" CACHE PATH "Dropbear build directory")
+set(WOS_BOOT_DISK "${CMAKE_SOURCE_DIR}/disk.qcow2" CACHE FILEPATH "WOS boot disk image")
+set(WOS_ROOTFS_DISK "${CMAKE_SOURCE_DIR}/mountfs.qcow2" CACHE FILEPATH "WOS rootfs disk image")
 option(WOS_SKIP_LIBCXX_INSTALL "Skip the libc++ install target; useful when an isolated sysroot is pre-seeded" OFF)
 
 set(SYSROOT ${WOS_SYSROOT_PATH})
 set(MLIBC_BUILD_DIR ${WOS_MLIBC_BUILD_DIR})
 set(LIBCXX_BUILD_DIR ${WOS_LIBCXX_BUILD_DIR})
 set(WOS_BUILD_SCRIPTS_DIR ${CMAKE_SOURCE_DIR}/scripts/build)
+set(WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX "/(\\.git|\\.github|debian|docs?|testsuite|test|fuzz|manpages)(/|$)")
 
 # --- check_headers: validate #pragma once in kern and init headers ----------
-add_custom_target(check_headers
+file(GLOB_RECURSE WOS_HEADER_CHECK_FILES CONFIGURE_DEPENDS
+    ${CMAKE_SOURCE_DIR}/modules/kern/*.hpp
+    ${CMAKE_SOURCE_DIR}/modules/init/*.hpp
+)
+set(CHECK_HEADERS_STAMP ${CMAKE_BINARY_DIR}/stamps/check_headers.stamp)
+add_custom_command(
+    OUTPUT ${CHECK_HEADERS_STAMP}
     COMMAND sh ${WOS_BUILD_SCRIPTS_DIR}/check_headers.sh ${CMAKE_SOURCE_DIR}/modules/kern
     COMMAND sh ${WOS_BUILD_SCRIPTS_DIR}/check_headers.sh ${CMAKE_SOURCE_DIR}/modules/init
+    COMMAND ${CMAKE_COMMAND} -E touch ${CHECK_HEADERS_STAMP}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Checking #pragma once in kernel/init headers..."
+    DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/check_headers.sh ${WOS_HEADER_CHECK_FILES}
     USES_TERMINAL
 )
+add_custom_target(check_headers DEPENDS ${CHECK_HEADERS_STAMP})
 
 # --- mlibc: build and install the C library ---------------------------------
-# Glob all mlibc sources so the stamp invalidates when any file changes.
-# New files require a CMake reconfigure (cmake -B build).
-file(GLOB_RECURSE MLIBC_SOURCES
+# Glob all mlibc sources so the stamp invalidates when any file changes,
+# including source additions discovered by Ninja's CMake regeneration check.
+file(GLOB_RECURSE MLIBC_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.cpp
     ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.c
     ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.hpp
@@ -122,50 +134,128 @@ endif()
 add_custom_target(libcxx DEPENDS ${LIBCXX_STAMP})
 
 # --- busybox: cross-compile busybox for WOS ---------------------------------
-add_custom_target(busybox
+file(GLOB_RECURSE BUSYBOX_SOURCES CONFIGURE_DEPENDS
+    ${CMAKE_SOURCE_DIR}/toolchain/src/busybox/*
+)
+list(FILTER BUSYBOX_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
+set(BUSYBOX_STAMP ${CMAKE_BINARY_DIR}/stamps/busybox.stamp)
+add_custom_command(
+    OUTPUT ${BUSYBOX_STAMP}
     COMMAND ${CMAKE_COMMAND} -E env
             WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
             WOS_BUSYBOX_BUILD_DIR=${WOS_BUSYBOX_BUILD_DIR}
             WOS_BUSYBOX_INSTALL_DIR=${WOS_BUSYBOX_INSTALL_DIR}
             ${WOS_BUILD_SCRIPTS_DIR}/build_busybox.sh
+    COMMAND ${CMAKE_COMMAND} -E touch ${BUSYBOX_STAMP}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Building busybox..."
+    DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/build_busybox.sh ${BUSYBOX_SOURCES} ${MLIBC_STAMP} ${LIBCXX_STAMP}
     USES_TERMINAL
 )
-add_dependencies(busybox mlibc libcxx)
+add_custom_target(busybox DEPENDS ${BUSYBOX_STAMP})
 
 # --- dropbear: cross-compile dropbear SSH for WOS ---------------------------
-add_custom_target(dropbear
+file(GLOB_RECURSE DROPBEAR_SOURCES CONFIGURE_DEPENDS
+    ${CMAKE_SOURCE_DIR}/toolchain/src/dropbear/*
+)
+list(FILTER DROPBEAR_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
+set(DROPBEAR_STAMP ${CMAKE_BINARY_DIR}/stamps/dropbear.stamp)
+add_custom_command(
+    OUTPUT ${DROPBEAR_STAMP}
     COMMAND ${CMAKE_COMMAND} -E env
             WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
             WOS_DROPBEAR_BUILD_DIR=${WOS_DROPBEAR_BUILD_DIR}
             ${WOS_BUILD_SCRIPTS_DIR}/build_dropbear.sh
+    COMMAND ${CMAKE_COMMAND} -E touch ${DROPBEAR_STAMP}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Building dropbear..."
+    DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/build_dropbear.sh ${DROPBEAR_SOURCES} ${MLIBC_STAMP} ${LIBCXX_STAMP}
     USES_TERMINAL
 )
-add_dependencies(dropbear mlibc libcxx)
+add_custom_target(dropbear DEPENDS ${DROPBEAR_STAMP})
 
 # --- mountfs_disk: create or delta-sync the XFS rootfs image ----------------
 # If mountfs.qcow2 doesn't exist, create it from scratch.
 # If it already exists, delta-sync changed binaries and libraries.
-add_custom_target(mountfs_disk
-    COMMAND bash -c "if [ -f '${CMAKE_SOURCE_DIR}/mountfs.qcow2' ]\; then '${WOS_BUILD_SCRIPTS_DIR}/sync_rootfs.sh'\; else '${WOS_BUILD_SCRIPTS_DIR}/create_mountfs_disk.sh'\; fi"
+file(GLOB_RECURSE WOS_ROOTFS_CONFIG_INPUTS CONFIGURE_DEPENDS
+    ${CMAKE_SOURCE_DIR}/configs/rootfs/*
+    ${CMAKE_SOURCE_DIR}/configs/drive/srv/*
+)
+set(WOS_MODULE_TARGET_FILES
+    $<TARGET_FILE:wos>
+    $<TARGET_FILE:init>
+    $<TARGET_FILE:testprog>
+    $<TARGET_FILE:testd>
+    $<TARGET_FILE:netd>
+    $<TARGET_FILE:httpd>
+    $<TARGET_FILE:debugserver>
+    $<TARGET_FILE:perf>
+    $<TARGET_FILE:top>
+    $<TARGET_FILE:memacc>
+    $<TARGET_FILE:journal>
+    $<TARGET_FILE:journal_lib>
+    $<TARGET_FILE:wkictl>
+    $<TARGET_FILE:renderbench>
+    $<TARGET_FILE:strace>
+    $<TARGET_FILE:sftpserver>
+)
+set(MOUNTFS_STAMP ${CMAKE_BINARY_DIR}/stamps/mountfs_disk.stamp)
+add_custom_command(
+    OUTPUT ${WOS_ROOTFS_DISK} ${MOUNTFS_STAMP}
+    COMMAND ${CMAKE_COMMAND} -E env
+            WOS_BUILD_DIR=${CMAKE_BINARY_DIR}
+            WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+            WOS_BUSYBOX_INSTALL_DIR=${WOS_BUSYBOX_INSTALL_DIR}
+            WOS_ROOTFS_DISK=${WOS_ROOTFS_DISK}
+            bash -c "if [ -f '${WOS_ROOTFS_DISK}' ]\; then '${WOS_BUILD_SCRIPTS_DIR}/sync_rootfs.sh'\; else '${WOS_BUILD_SCRIPTS_DIR}/create_mountfs_disk.sh'\; fi"
+    COMMAND ${CMAKE_COMMAND} -E touch ${MOUNTFS_STAMP}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Syncing rootfs disk..."
+    DEPENDS
+        ${WOS_BUILD_SCRIPTS_DIR}/create_mountfs_disk.sh
+        ${WOS_BUILD_SCRIPTS_DIR}/rootfs_common.sh
+        ${WOS_BUILD_SCRIPTS_DIR}/sync_rootfs.sh
+        ${CMAKE_SOURCE_DIR}/configs/system.conf
+        ${WOS_ROOTFS_CONFIG_INPUTS}
+        ${WOS_MODULE_TARGET_FILES}
+        ${BUSYBOX_STAMP}
+        ${DROPBEAR_STAMP}
+        ${LIBCXX_STAMP}
     USES_TERMINAL
 )
-# Needs testprog and init binaries from the modules build
-add_dependencies(mountfs_disk wos_modules)
+add_custom_target(mountfs_disk DEPENDS ${WOS_ROOTFS_DISK} ${MOUNTFS_STAMP})
 
 # --- boot_image: create the boot disk + initramfs --------------------------
-add_custom_target(boot_image
-    COMMAND ${WOS_BUILD_SCRIPTS_DIR}/make_image.sh
+set(INITRAMFS_OUTPUT ${CMAKE_BINARY_DIR}/initramfs.cpio)
+set(BOOT_IMAGE_STAMP ${CMAKE_BINARY_DIR}/stamps/boot_image.stamp)
+add_custom_command(
+    OUTPUT ${WOS_BOOT_DISK} ${INITRAMFS_OUTPUT} ${BOOT_IMAGE_STAMP}
+    COMMAND ${CMAKE_COMMAND} -E env
+            WOS_BUILD_DIR=${CMAKE_BINARY_DIR}
+            WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+            WOS_BUSYBOX_INSTALL_DIR=${WOS_BUSYBOX_INSTALL_DIR}
+            WOS_BOOT_DISK=${WOS_BOOT_DISK}
+            WOS_ROOTFS_DISK=${WOS_ROOTFS_DISK}
+            ${WOS_BUILD_SCRIPTS_DIR}/make_image.sh
+    COMMAND ${CMAKE_COMMAND} -E touch ${BOOT_IMAGE_STAMP}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Creating boot image..."
+    DEPENDS
+        ${WOS_BUILD_SCRIPTS_DIR}/make_image.sh
+        ${WOS_BUILD_SCRIPTS_DIR}/make_initramfs.sh
+        ${CMAKE_SOURCE_DIR}/configs/disks.conf
+        ${CMAKE_SOURCE_DIR}/configs/netdevs.conf
+        ${CMAKE_SOURCE_DIR}/configs/system.conf
+        ${CMAKE_SOURCE_DIR}/configs/vfstab
+        ${CMAKE_SOURCE_DIR}/modules/kern/limine.conf
+        $<TARGET_FILE:wos>
+        $<TARGET_FILE:init>
+        ${WOS_ROOTFS_DISK}
+        ${MOUNTFS_STAMP}
+        ${LIBCXX_STAMP}
     USES_TERMINAL
 )
-add_dependencies(boot_image wos_modules mountfs_disk)
+add_custom_target(boot_image DEPENDS ${WOS_BOOT_DISK} ${INITRAMFS_OUTPUT} ${BOOT_IMAGE_STAMP})
 
 foreach(mod wos init testprog testd netd httpd perf top memacc journal wkictl renderbench sftpserver)
     add_dependencies(${mod} mlibc libcxx)
