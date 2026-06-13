@@ -77,15 +77,21 @@ struct WkiZone {
     ZoneNotifyHandler post_handler = nullptr;
 
     // Synchronous read/write state (for message-based zones)
+    uint32_t next_op_cookie = 1;
+
     std::atomic<bool> read_pending{false};
     void* read_dest_buf = nullptr;
     uint32_t read_result_len = 0;
     uint32_t read_expected_offset = 0;
     uint32_t read_expected_len = 0;
+    uint32_t read_expected_cookie = 0;
     int read_status = 0;
     WkiWaitEntry* read_wait_entry = nullptr;  // V2 I-4: async wait for ZONE_READ_RESP
 
     std::atomic<bool> write_pending{false};
+    uint32_t write_expected_offset = 0;
+    uint32_t write_expected_len = 0;
+    uint32_t write_expected_cookie = 0;
     int write_status = 0;
     WkiWaitEntry* write_wait_entry = nullptr;  // V2 I-4: async wait for ZONE_WRITE_ACK
 
@@ -136,6 +142,7 @@ auto wki_zones_list() -> auto;
 #ifdef WOS_SELFTEST
 auto wki_zone_selftest_timeout_retirement_fences_stale_completion() -> bool;
 auto wki_zone_selftest_range_and_read_response_validation() -> bool;
+auto wki_zone_selftest_waiter_slots_and_cookies() -> bool;
 #endif
 
 // -----------------------------------------------------------------------------

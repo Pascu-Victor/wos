@@ -81,6 +81,7 @@ def test_timeout_cleanup_clears_pending_waiters() -> None:
             "wait_result == WKI_ERR_TIMEOUT",
             "zone->read_status = WKI_ERR_ZONE_TIMEOUT",
             "zone->read_pending.store(false, std::memory_order_release)",
+            "zone->read_expected_cookie = 0",
         ],
         "zone read timeout cleanup",
     )
@@ -91,6 +92,9 @@ def test_timeout_cleanup_clears_pending_waiters() -> None:
             "wait_result == WKI_ERR_TIMEOUT",
             "zone->write_status = WKI_ERR_ZONE_TIMEOUT",
             "zone->write_pending.store(false, std::memory_order_release)",
+            "zone->write_expected_offset = 0",
+            "zone->write_expected_len = 0",
+            "zone->write_expected_cookie = 0",
         ],
         "zone write timeout cleanup",
     )
@@ -146,10 +150,15 @@ def test_zone_ranges_and_read_responses_are_validated_without_wrapping() -> None
     require_tokens(
         header,
         [
+            "uint32_t next_op_cookie = 1",
             "uint32_t read_expected_offset = 0",
             "uint32_t read_expected_len = 0",
+            "uint32_t read_expected_cookie = 0",
+            "uint32_t write_expected_offset = 0",
+            "uint32_t write_expected_len = 0",
+            "uint32_t write_expected_cookie = 0",
         ],
-        "zone pending read metadata",
+        "zone pending operation metadata",
     )
 
     range_body = function_body(source, "zone_range_valid")
@@ -162,8 +171,19 @@ def test_zone_ranges_and_read_responses_are_validated_without_wrapping() -> None
         [
             "resp.offset == zone.read_expected_offset",
             "resp.length == zone.read_expected_len",
+            "resp.op_cookie == zone.read_expected_cookie",
         ],
         "zone read response matcher",
+    )
+    write_match_body = function_body(source, "zone_write_ack_matches_pending")
+    require_tokens(
+        write_match_body,
+        [
+            "ack.offset == zone.write_expected_offset",
+            "ack.length == zone.write_expected_len",
+            "ack.op_cookie == zone.write_expected_cookie",
+        ],
+        "zone write ACK matcher",
     )
 
     read_body = function_body(source, "wki_zone_read")
@@ -176,12 +196,54 @@ def test_zone_ranges_and_read_responses_are_validated_without_wrapping() -> None
         read_body,
         [
             "!zone_range_valid(offset, len, zone->size)",
+            "if (zone->read_pending.load(std::memory_order_acquire))",
+            "return WKI_ERR_BUSY",
+            "uint32_t const OP_COOKIE = allocate_zone_op_cookie_locked(zone)",
             "zone->read_expected_offset = cur_offset",
             "zone->read_expected_len = chunk",
+            "zone->read_expected_cookie = OP_COOKIE",
+            "req.op_cookie = OP_COOKIE",
         ],
         "zone read initiator range and response tracking",
     )
-    require_tokens(write_body, ["!zone_range_valid(offset, len, zone->size)"], "zone write initiator range")
+    require_order(
+        read_body,
+        "if (zone->read_pending.load(std::memory_order_acquire))",
+        "zone->read_wait_entry = &read_wait",
+        "zone read slot busy check",
+    )
+    require_order(
+        read_body,
+        "zone->read_expected_cookie = OP_COOKIE",
+        "zone->read_pending.store(true, std::memory_order_release)",
+        "zone read metadata before pending publish",
+    )
+    require_tokens(
+        write_body,
+        [
+            "!zone_range_valid(offset, len, zone->size)",
+            "if (zone->write_pending.load(std::memory_order_acquire))",
+            "return WKI_ERR_BUSY",
+            "uint32_t const OP_COOKIE = allocate_zone_op_cookie_locked(zone)",
+            "zone->write_expected_offset = cur_offset",
+            "zone->write_expected_len = chunk",
+            "zone->write_expected_cookie = OP_COOKIE",
+            "req->op_cookie = OP_COOKIE",
+        ],
+        "zone write initiator range and ACK tracking",
+    )
+    require_order(
+        write_body,
+        "if (zone->write_pending.load(std::memory_order_acquire))",
+        "zone->write_wait_entry = &write_wait",
+        "zone write slot busy check",
+    )
+    require_order(
+        write_body,
+        "zone->write_expected_cookie = OP_COOKIE",
+        "zone->write_pending.store(true, std::memory_order_release)",
+        "zone write metadata before pending publish",
+    )
     reject_tokens(read_body + write_body, ["offset + len > zone->size"], "zone initiator range checks")
 
     require_tokens(
@@ -189,6 +251,7 @@ def test_zone_ranges_and_read_responses_are_validated_without_wrapping() -> None
         [
             "req->length > WKI_ZONE_MAX_MSG_DATA",
             "!zone_range_valid(req->offset, req->length, zone->size)",
+            "resp->op_cookie = req->op_cookie",
         ],
         "zone read request bounds",
     )
@@ -198,6 +261,9 @@ def test_zone_ranges_and_read_responses_are_validated_without_wrapping() -> None
             "req->length > WKI_ZONE_MAX_MSG_DATA",
             "!zone_range_valid(req->offset, req->length, zone->size)",
             "req->length > payload_len - sizeof(ZoneWriteReqPayload)",
+            "ack.offset = req->offset",
+            "ack.length = req->length",
+            "ack.op_cookie = req->op_cookie",
         ],
         "zone write request bounds",
     )
@@ -211,8 +277,34 @@ def test_zone_ranges_and_read_responses_are_validated_without_wrapping() -> None
             "zone->read_dest_buf = nullptr",
             "zone->read_expected_offset = 0",
             "zone->read_expected_len = 0",
+            "zone->read_expected_cookie = 0",
         ],
         "zone read response bounds",
+    )
+    require_order(
+        read_resp_body,
+        "if (resp->length > payload_len - sizeof(ZoneReadRespPayload) || !zone_read_response_matches_pending(*zone, *resp))",
+        "claim_and_clear_waiter_locked(zone->read_wait_entry)",
+        "zone read response validates before claiming waiter",
+    )
+    reject_tokens(read_resp_body, ["zone->read_status = WKI_ERR_INVALID"], "stale read response handling")
+
+    write_ack_body = function_body(source, "handle_zone_write_ack")
+    require_tokens(
+        write_ack_body,
+        [
+            "!zone_write_ack_matches_pending(*zone, *ack)",
+            "zone->write_expected_offset = 0",
+            "zone->write_expected_len = 0",
+            "zone->write_expected_cookie = 0",
+        ],
+        "zone write ACK identity fence",
+    )
+    require_order(
+        write_ack_body,
+        "if (!zone_write_ack_matches_pending(*zone, *ack))",
+        "claim_and_clear_waiter_locked(zone->write_wait_entry)",
+        "zone write ACK validates before claiming waiter",
     )
 
 
@@ -250,6 +342,23 @@ def test_range_validation_is_declared_and_covered_by_ktest() -> None:
     )
 
 
+def test_operation_cookie_validation_is_declared_and_covered_by_ktest() -> None:
+    header = ZONE_HPP.read_text()
+    ktest = WKI_WAIT_KTEST.read_text()
+    token = "wki_zone_selftest_waiter_slots_and_cookies"
+
+    if token not in header:
+        fail(f"missing selftest declaration {token}")
+    require_tokens(
+        ktest,
+        [
+            "RejectsStaleZoneOperationCookies",
+            token,
+        ],
+        "zone operation cookie KTEST",
+    )
+
+
 def main() -> None:
     test_timeout_retirement_helper_marks_inactive_under_table_lock()
     test_timeout_cleanup_clears_pending_waiters()
@@ -258,6 +367,7 @@ def main() -> None:
     test_zone_ranges_and_read_responses_are_validated_without_wrapping()
     test_timeout_retirement_is_declared_and_covered_by_ktest()
     test_range_validation_is_declared_and_covered_by_ktest()
+    test_operation_cookie_validation_is_declared_and_covered_by_ktest()
     print("WKI zone source invariants hold")
 
 

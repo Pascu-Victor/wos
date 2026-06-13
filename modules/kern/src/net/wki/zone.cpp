@@ -75,8 +75,24 @@ auto allocate_zone_backing(uint32_t size) -> void* {
 
 auto zone_range_valid(uint32_t offset, uint32_t len, uint32_t size) -> bool { return offset <= size && len <= size - offset; }
 
+auto allocate_zone_op_cookie_locked(WkiZone* zone) -> uint32_t {
+    uint32_t cookie = zone->next_op_cookie;
+    if (cookie == 0) {
+        cookie = 1;
+    }
+    zone->next_op_cookie = cookie + 1U;
+    if (zone->next_op_cookie == 0) {
+        zone->next_op_cookie = 1;
+    }
+    return cookie;
+}
+
 auto zone_read_response_matches_pending(const WkiZone& zone, const ZoneReadRespPayload& resp) -> bool {
-    return resp.offset == zone.read_expected_offset && resp.length == zone.read_expected_len;
+    return resp.op_cookie == zone.read_expected_cookie && resp.offset == zone.read_expected_offset && resp.length == zone.read_expected_len;
+}
+
+auto zone_write_ack_matches_pending(const WkiZone& zone, const ZoneWriteAckPayload& ack) -> bool {
+    return ack.op_cookie == zone.write_expected_cookie && ack.offset == zone.write_expected_offset && ack.length == zone.write_expected_len;
 }
 
 void reset_zone_metadata(WkiZone* zone) {
@@ -98,14 +114,19 @@ void reset_zone_metadata(WkiZone* zone) {
     zone->is_initiator = false;
     zone->pre_handler = nullptr;
     zone->post_handler = nullptr;
+    zone->next_op_cookie = 1;
     zone->read_pending.store(false, std::memory_order_release);
     zone->read_dest_buf = nullptr;
     zone->read_result_len = 0;
     zone->read_expected_offset = 0;
     zone->read_expected_len = 0;
+    zone->read_expected_cookie = 0;
     zone->read_status = 0;
     zone->read_wait_entry = nullptr;
     zone->write_pending.store(false, std::memory_order_release);
+    zone->write_expected_offset = 0;
+    zone->write_expected_len = 0;
+    zone->write_expected_cookie = 0;
     zone->write_status = 0;
     zone->write_wait_entry = nullptr;
 }
@@ -202,6 +223,7 @@ void cancel_read_waiter(WkiZone* zone, WkiWaitEntry& wait, int result) {
         zone->read_dest_buf = nullptr;
         zone->read_expected_offset = 0;
         zone->read_expected_len = 0;
+        zone->read_expected_cookie = 0;
     }
     claimed = wki_claim_op(&wait);
     zone->lock.unlock();
@@ -215,6 +237,9 @@ void cancel_write_waiter(WkiZone* zone, WkiWaitEntry& wait, int result) {
         zone->write_wait_entry = nullptr;
         zone->write_status = result;
         zone->write_pending.store(false, std::memory_order_release);
+        zone->write_expected_offset = 0;
+        zone->write_expected_len = 0;
+        zone->write_expected_cookie = 0;
     }
     claimed = wki_claim_op(&wait);
     zone->lock.unlock();
@@ -232,6 +257,7 @@ void clear_read_waiter_after_wait(WkiZone* zone, WkiWaitEntry& wait, int wait_re
         zone->read_dest_buf = nullptr;
         zone->read_expected_offset = 0;
         zone->read_expected_len = 0;
+        zone->read_expected_cookie = 0;
     }
     zone->lock.unlock();
 }
@@ -244,6 +270,9 @@ void clear_write_waiter_after_wait(WkiZone* zone, WkiWaitEntry& wait, int wait_r
     if (wait_result == WKI_ERR_TIMEOUT) {
         zone->write_status = WKI_ERR_ZONE_TIMEOUT;
         zone->write_pending.store(false, std::memory_order_release);
+        zone->write_expected_offset = 0;
+        zone->write_expected_len = 0;
+        zone->write_expected_cookie = 0;
     }
     zone->lock.unlock();
 }
@@ -404,14 +433,21 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
     zone->remote_phys_addr = 0;
     zone->pre_handler = nullptr;
     zone->post_handler = nullptr;
+    zone->next_op_cookie = 1;
     zone->read_pending = false;
     zone->read_dest_buf = nullptr;
     zone->read_result_len = 0;
     zone->read_expected_offset = 0;
     zone->read_expected_len = 0;
+    zone->read_expected_cookie = 0;
     zone->read_wait_entry = nullptr;
     zone->read_status = 0;
     zone->write_pending = false;
+    zone->write_expected_offset = 0;
+    zone->write_expected_len = 0;
+    zone->write_expected_cookie = 0;
+    zone->write_wait_entry = nullptr;
+    zone->write_status = 0;
     zone->retiring.store(false, std::memory_order_release);
     retain_zone(zone);
 
@@ -487,9 +523,16 @@ auto wki_zone_destroy(uint32_t zone_id) -> int {
     zone->read_status = -1;
     read_waiter = claim_and_clear_waiter_locked(zone->read_wait_entry);
     zone->read_pending.store(false, std::memory_order_release);
+    zone->read_dest_buf = nullptr;
+    zone->read_expected_offset = 0;
+    zone->read_expected_len = 0;
+    zone->read_expected_cookie = 0;
     zone->write_status = -1;
     write_waiter = claim_and_clear_waiter_locked(zone->write_wait_entry);
     zone->write_pending.store(false, std::memory_order_release);
+    zone->write_expected_offset = 0;
+    zone->write_expected_len = 0;
+    zone->write_expected_cookie = 0;
     zone->lock.unlock();
 
     s_zone_table_lock.unlock();
@@ -573,13 +616,20 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
             release_zone(zone);
             return WKI_ERR_ZONE_INACTIVE;
         }
+        if (zone->read_pending.load(std::memory_order_acquire)) {
+            zone->lock.unlock();
+            release_zone(zone);
+            return WKI_ERR_BUSY;
+        }
+        uint32_t const OP_COOKIE = allocate_zone_op_cookie_locked(zone);
         zone->read_wait_entry = &read_wait;
-        zone->read_pending.store(true, std::memory_order_release);
         zone->read_dest_buf = dest;
         zone->read_result_len = 0;
         zone->read_expected_offset = cur_offset;
         zone->read_expected_len = chunk;
+        zone->read_expected_cookie = OP_COOKIE;
         zone->read_status = 0;
+        zone->read_pending.store(true, std::memory_order_release);
         zone->lock.unlock();
 
         // Send ZONE_READ_REQ
@@ -587,6 +637,7 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
         req.zone_id = zone_id;
         req.offset = cur_offset;
         req.length = chunk;
+        req.op_cookie = OP_COOKIE;
 
         int const RET = wki_send(zone->peer_node_id, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_READ_REQ, &req, sizeof(req));
         if (RET != WKI_OK) {
@@ -686,10 +737,21 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
             release_zone(zone);
             return WKI_ERR_ZONE_INACTIVE;
         }
+        if (zone->write_pending.load(std::memory_order_acquire)) {
+            zone->lock.unlock();
+            delete[] msg_buf;
+            release_zone(zone);
+            return WKI_ERR_BUSY;
+        }
+        uint32_t const OP_COOKIE = allocate_zone_op_cookie_locked(zone);
         zone->write_wait_entry = &write_wait;
-        zone->write_pending.store(true, std::memory_order_release);
+        zone->write_expected_offset = cur_offset;
+        zone->write_expected_len = chunk;
+        zone->write_expected_cookie = OP_COOKIE;
         zone->write_status = 0;
+        zone->write_pending.store(true, std::memory_order_release);
         zone->lock.unlock();
+        req->op_cookie = OP_COOKIE;
 
         int const RET = wki_send(zone->peer_node_id, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_WRITE_REQ, msg_buf, msg_len);
         delete[] msg_buf;
@@ -787,9 +849,16 @@ void wki_zones_destroy_for_peer(uint16_t node_id) {
             zone->read_status = -1;
             read_waiter = claim_and_clear_waiter_locked(zone->read_wait_entry);
             zone->read_pending.store(false, std::memory_order_release);
+            zone->read_dest_buf = nullptr;
+            zone->read_expected_offset = 0;
+            zone->read_expected_len = 0;
+            zone->read_expected_cookie = 0;
             zone->write_status = -1;
             write_waiter = claim_and_clear_waiter_locked(zone->write_wait_entry);
             zone->write_pending.store(false, std::memory_order_release);
+            zone->write_expected_offset = 0;
+            zone->write_expected_len = 0;
+            zone->write_expected_cookie = 0;
             zone->lock.unlock();
             break;
         }
@@ -871,14 +940,22 @@ auto wki_zone_selftest_range_and_read_response_validation() -> bool {
     WkiZone zone = {};
     zone.read_expected_offset = 128;
     zone.read_expected_len = 64;
+    zone.read_expected_cookie = 77;
 
     ZoneReadRespPayload resp = {};
     resp.offset = 128;
     resp.length = 64;
+    resp.op_cookie = 77;
     if (!zone_read_response_matches_pending(zone, resp)) {
         return false;
     }
 
+    resp.op_cookie = 78;
+    if (zone_read_response_matches_pending(zone, resp)) {
+        return false;
+    }
+
+    resp.op_cookie = 77;
     resp.length = 65;
     if (zone_read_response_matches_pending(zone, resp)) {
         return false;
@@ -887,6 +964,59 @@ auto wki_zone_selftest_range_and_read_response_validation() -> bool {
     resp.length = 64;
     resp.offset = 129;
     return !zone_read_response_matches_pending(zone, resp);
+}
+
+auto wki_zone_selftest_waiter_slots_and_cookies() -> bool {
+    WkiZone cookie_zone = {};
+    cookie_zone.next_op_cookie = 0;
+    if (allocate_zone_op_cookie_locked(&cookie_zone) != 1 || cookie_zone.next_op_cookie != 2) {
+        return false;
+    }
+
+    cookie_zone.next_op_cookie = 0xFFFFFFFFU;
+    if (allocate_zone_op_cookie_locked(&cookie_zone) != 0xFFFFFFFFU || cookie_zone.next_op_cookie != 1) {
+        return false;
+    }
+
+    WkiZone read_zone = {};
+    read_zone.read_expected_offset = 32;
+    read_zone.read_expected_len = 16;
+    read_zone.read_expected_cookie = 1234;
+
+    ZoneReadRespPayload read_resp = {};
+    read_resp.offset = 32;
+    read_resp.length = 16;
+    read_resp.op_cookie = 1235;
+    if (zone_read_response_matches_pending(read_zone, read_resp)) {
+        return false;
+    }
+
+    read_resp.op_cookie = 1234;
+    if (!zone_read_response_matches_pending(read_zone, read_resp)) {
+        return false;
+    }
+
+    WkiZone write_zone = {};
+    write_zone.write_expected_offset = 64;
+    write_zone.write_expected_len = 24;
+    write_zone.write_expected_cookie = 4321;
+
+    ZoneWriteAckPayload write_ack = {};
+    write_ack.offset = 64;
+    write_ack.length = 24;
+    write_ack.op_cookie = 4322;
+    if (zone_write_ack_matches_pending(write_zone, write_ack)) {
+        return false;
+    }
+
+    write_ack.op_cookie = 4321;
+    write_ack.offset = 65;
+    if (zone_write_ack_matches_pending(write_zone, write_ack)) {
+        return false;
+    }
+
+    write_ack.offset = 64;
+    return zone_write_ack_matches_pending(write_zone, write_ack);
 }
 #endif
 
@@ -1005,6 +1135,7 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
     zone->remote_rkey = 0;
     zone->remote_phys_addr = 0;
     zone->rdma_transport = zone_rdma_transport;
+    zone->next_op_cookie = 1;
     zone->pre_handler = nullptr;
     zone->post_handler = nullptr;
     zone->read_wait_entry = nullptr;
@@ -1013,9 +1144,13 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
     zone->read_dest_buf = nullptr;
     zone->read_expected_offset = 0;
     zone->read_expected_len = 0;
+    zone->read_expected_cookie = 0;
     zone->read_pending = false;
     zone->write_wait_entry = nullptr;
     zone->write_status = 0;
+    zone->write_expected_offset = 0;
+    zone->write_expected_len = 0;
+    zone->write_expected_cookie = 0;
     zone->write_pending = false;
     zone->retiring.store(false, std::memory_order_release);
 
@@ -1207,9 +1342,16 @@ void handle_zone_destroy(const WkiHeader* hdr, const uint8_t* payload, uint16_t 
     zone->read_status = -1;
     read_waiter = claim_and_clear_waiter_locked(zone->read_wait_entry);
     zone->read_pending.store(false, std::memory_order_release);
+    zone->read_dest_buf = nullptr;
+    zone->read_expected_offset = 0;
+    zone->read_expected_len = 0;
+    zone->read_expected_cookie = 0;
     zone->write_status = -1;
     write_waiter = claim_and_clear_waiter_locked(zone->write_wait_entry);
     zone->write_pending.store(false, std::memory_order_release);
+    zone->write_expected_offset = 0;
+    zone->write_expected_len = 0;
+    zone->write_expected_cookie = 0;
     zone->lock.unlock();
 
     s_zone_table_lock.unlock();
@@ -1352,6 +1494,7 @@ void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     resp->zone_id = req->zone_id;
     resp->offset = req->offset;
     resp->length = DATA_LEN;
+    resp->op_cookie = req->op_cookie;
 
     // Copy data from local zone backing
     memcpy(resp_buf + sizeof(ZoneReadRespPayload), static_cast<uint8_t*>(zone->local_vaddr) + req->offset, DATA_LEN);
@@ -1382,25 +1525,20 @@ void handle_zone_read_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_
         return;
     }
 
+    if (resp->length > payload_len - sizeof(ZoneReadRespPayload) || !zone_read_response_matches_pending(*zone, *resp)) {
+        zone->lock.unlock();
+        release_zone(zone);
+        return;
+    }
+
     waiter = claim_and_clear_waiter_locked(zone->read_wait_entry);
     if (waiter == nullptr) {
         zone->read_pending.store(false, std::memory_order_release);
         zone->read_dest_buf = nullptr;
         zone->read_expected_offset = 0;
         zone->read_expected_len = 0;
+        zone->read_expected_cookie = 0;
         zone->lock.unlock();
-        release_zone(zone);
-        return;
-    }
-
-    if (resp->length > payload_len - sizeof(ZoneReadRespPayload) || !zone_read_response_matches_pending(*zone, *resp)) {
-        zone->read_status = WKI_ERR_INVALID;
-        zone->read_pending.store(false, std::memory_order_release);
-        zone->read_dest_buf = nullptr;
-        zone->read_expected_offset = 0;
-        zone->read_expected_len = 0;
-        zone->lock.unlock();
-        finish_claimed_waiter(waiter, 0);
         release_zone(zone);
         return;
     }
@@ -1416,6 +1554,7 @@ void handle_zone_read_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_
     zone->read_dest_buf = nullptr;
     zone->read_expected_offset = 0;
     zone->read_expected_len = 0;
+    zone->read_expected_cookie = 0;
     zone->lock.unlock();
     finish_claimed_waiter(waiter, 0);
     release_zone(zone);
@@ -1446,7 +1585,10 @@ void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
     if ((zone->access_policy & ZONE_ACCESS_REMOTE_WRITE) == 0) {
         ZoneWriteAckPayload ack = {};
         ack.zone_id = req->zone_id;
+        ack.offset = req->offset;
+        ack.length = req->length;
         ack.status = WKI_ERR_ZONE_ACCESS;
+        ack.op_cookie = req->op_cookie;
         wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_WRITE_ACK, &ack, sizeof(ack));
         release_zone(zone);
         return;
@@ -1468,7 +1610,10 @@ void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
     // Send ACK
     ZoneWriteAckPayload ack = {};
     ack.zone_id = req->zone_id;
+    ack.offset = req->offset;
+    ack.length = req->length;
     ack.status = 0;  // success
+    ack.op_cookie = req->op_cookie;
     wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_WRITE_ACK, &ack, sizeof(ack));
     release_zone(zone);
 }
@@ -1494,9 +1639,18 @@ void handle_zone_write_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
         return;
     }
 
+    if (!zone_write_ack_matches_pending(*zone, *ack)) {
+        zone->lock.unlock();
+        release_zone(zone);
+        return;
+    }
+
     waiter = claim_and_clear_waiter_locked(zone->write_wait_entry);
     if (waiter == nullptr) {
         zone->write_pending.store(false, std::memory_order_release);
+        zone->write_expected_offset = 0;
+        zone->write_expected_len = 0;
+        zone->write_expected_cookie = 0;
         zone->lock.unlock();
         release_zone(zone);
         return;
@@ -1504,6 +1658,9 @@ void handle_zone_write_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
 
     zone->write_status = ack->status;
     zone->write_pending.store(false, std::memory_order_release);
+    zone->write_expected_offset = 0;
+    zone->write_expected_len = 0;
+    zone->write_expected_cookie = 0;
     zone->lock.unlock();
     finish_claimed_waiter(waiter, 0);
     release_zone(zone);

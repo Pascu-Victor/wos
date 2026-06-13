@@ -404,14 +404,17 @@ struct ZoneNotifyAckPayload {
 static_assert(sizeof(ZoneNotifyAckPayload) == 4, "ZoneNotifyAckPayload must be 4 bytes");
 
 // -----------------------------------------------------------------------------
-// ZONE_READ_REQ Payload - 12 bytes
+// ZONE_READ_REQ Payload - 16 bytes
 // -----------------------------------------------------------------------------
 
 struct ZoneReadReqPayload {
     uint32_t zone_id;
     uint32_t offset;
     uint32_t length;
+    uint32_t op_cookie;
 } __attribute__((packed));
+
+static_assert(sizeof(ZoneReadReqPayload) == 16, "ZoneReadReqPayload must be 16 bytes");
 
 // -----------------------------------------------------------------------------
 // ZONE_READ_RESP / ZONE_WRITE_REQ - variable length
@@ -422,21 +425,31 @@ struct ZoneReadRespPayload {
     uint32_t zone_id;
     uint32_t offset;
     uint32_t length;
+    uint32_t op_cookie;
     // Followed by `length` bytes of data
 } __attribute__((packed));
+
+static_assert(sizeof(ZoneReadRespPayload) == 16, "ZoneReadRespPayload must be 16 bytes");
 
 struct ZoneWriteReqPayload {
     uint32_t zone_id;
     uint32_t offset;
     uint32_t length;
+    uint32_t op_cookie;
     // Followed by `length` bytes of data
 } __attribute__((packed));
 
-// ZONE_WRITE_ACK uses ZoneDestroyPayload-like format (just zone_id + status)
+static_assert(sizeof(ZoneWriteReqPayload) == 16, "ZoneWriteReqPayload must be 16 bytes");
+
 struct ZoneWriteAckPayload {
     uint32_t zone_id;
+    uint32_t offset;
+    uint32_t length;
     int32_t status;  // 0 = success, negative = error
+    uint32_t op_cookie;
 } __attribute__((packed));
+
+static_assert(sizeof(ZoneWriteAckPayload) == 20, "ZoneWriteAckPayload must be 20 bytes");
 
 // -----------------------------------------------------------------------------
 // EVENT_SUBSCRIBE / EVENT_UNSUBSCRIBE Payload - 8 bytes

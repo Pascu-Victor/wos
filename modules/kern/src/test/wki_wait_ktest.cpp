@@ -131,6 +131,8 @@ KTEST(WkiZone, RejectsWrappedRangesAndMismatchedReadResponses) {
     KEXPECT_TRUE(ker::net::wki::wki_zone_selftest_range_and_read_response_validation());
 }
 
+KTEST(WkiZone, RejectsStaleZoneOperationCookies) { KEXPECT_TRUE(ker::net::wki::wki_zone_selftest_waiter_slots_and_cookies()); }
+
 KTEST(WkiIpcPendingWait, CancelClaimsAndClearsPublishedStackWaiter) {
     ker::net::wki::ProxyIpcState proxy{};
     ker::net::wki::WkiWaitEntry wait{};
