@@ -46,6 +46,7 @@ constexpr uint32_t BENCH_VERSION = 1;
 constexpr int DEFAULT_NETBENCH_TIMEOUT_MS = 30000;
 constexpr int MSEC_PER_SEC = 1000;
 constexpr int NSEC_PER_MSEC = 1000000;
+constexpr int64_t NSEC_PER_SEC = 1000LL * NSEC_PER_MSEC;
 
 struct ServerOptions {
     uint16_t port = 9000;
@@ -111,7 +112,18 @@ auto monotonic_now_ms() -> int64_t {
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
         return -1;
     }
-    return (static_cast<int64_t>(ts.tv_sec) * MSEC_PER_SEC) + (static_cast<int64_t>(ts.tv_nsec) / NSEC_PER_MSEC);
+
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC) {
+        return -1;
+    }
+
+    int64_t const NSEC_MS = static_cast<int64_t>(ts.tv_nsec) / NSEC_PER_MSEC;
+    auto const SEC = static_cast<int64_t>(ts.tv_sec);
+    if (SEC > (INT64_MAX - NSEC_MS) / MSEC_PER_SEC) {
+        return INT64_MAX;
+    }
+
+    return (SEC * MSEC_PER_SEC) + NSEC_MS;
 }
 
 auto deadline_after_ms(int timeout_ms) -> int64_t {
@@ -119,7 +131,15 @@ auto deadline_after_ms(int timeout_ms) -> int64_t {
     if (NOW_MS < 0) {
         return -1;
     }
-    return NOW_MS + timeout_ms;
+    if (timeout_ms <= 0) {
+        return NOW_MS;
+    }
+
+    auto const TIMEOUT_MS = static_cast<int64_t>(timeout_ms);
+    if (INT64_MAX - NOW_MS < TIMEOUT_MS) {
+        return INT64_MAX;
+    }
+    return NOW_MS + TIMEOUT_MS;
 }
 
 auto remaining_ms_until(int64_t deadline_ms, int fallback_timeout_ms) -> int {
@@ -130,11 +150,11 @@ auto remaining_ms_until(int64_t deadline_ms, int fallback_timeout_ms) -> int {
     if (NOW_MS < 0) {
         return fallback_timeout_ms;
     }
-    int64_t const REMAINING_MS = deadline_ms - NOW_MS;
-    if (REMAINING_MS <= 0) {
+    if (deadline_ms <= NOW_MS) {
         errno = ETIMEDOUT;
         return 0;
     }
+    int64_t const REMAINING_MS = deadline_ms - NOW_MS;
     return REMAINING_MS > INT_MAX ? INT_MAX : static_cast<int>(REMAINING_MS);
 }
 

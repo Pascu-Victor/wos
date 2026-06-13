@@ -276,6 +276,41 @@ def remote_helper_mode_body(source: str, mode: str) -> str:
 
 
 def require_deadline_safe_wait_helpers(source: str) -> None:
+    monotonic_now_body = function_body(source, "monotonic_now_ms")
+    for snippet in [
+        "ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC",
+        "int64_t const NSEC_MS = static_cast<int64_t>(ts.tv_nsec) / NSEC_PER_MSEC",
+        "if (SEC > (INT64_MAX - NSEC_MS) / MSEC_PER_SEC)",
+        "return INT64_MAX",
+    ]:
+        if snippet not in monotonic_now_body:
+            fail(f"monotonic_now_ms is missing saturating conversion snippet: {snippet}")
+
+    deadline_after_body = function_body(source, "deadline_after_ms")
+    for snippet in [
+        "if (timeout_ms <= 0)",
+        "auto const TIMEOUT_MS = static_cast<int64_t>(timeout_ms)",
+        "if (INT64_MAX - NOW_MS < TIMEOUT_MS)",
+        "return INT64_MAX",
+        "return NOW_MS + TIMEOUT_MS",
+    ]:
+        if snippet not in deadline_after_body:
+            fail(f"deadline_after_ms is missing saturating addition snippet: {snippet}")
+    if "return NOW_MS + timeout_ms" in deadline_after_body:
+        fail("deadline_after_ms must not use wrapping timeout addition")
+
+    remaining_body = function_body(source, "remaining_ms_until")
+    for snippet in [
+        "if (deadline_ms <= NOW_MS)",
+        "errno = ETIMEDOUT",
+        "int64_t const REMAINING_MS = deadline_ms - NOW_MS",
+        "REMAINING_MS > INT_MAX ? INT_MAX : static_cast<int>(REMAINING_MS)",
+    ]:
+        if snippet not in remaining_body:
+            fail(f"remaining_ms_until is missing overflow-safe remaining-time snippet: {snippet}")
+    if "int64_t const REMAINING_MS = deadline_ms - NOW_MS;\n    if (REMAINING_MS <= 0)" in remaining_body:
+        fail("remaining_ms_until must compare before subtracting to avoid signed overflow")
+
     wait_fd_ready_body = function_body(source, "wait_fd_ready")
     if "poll(&pfd, 1, timeout_ms)" not in wait_fd_ready_body:
         fail("wait_fd_ready no longer performs the raw bounded poll expected by timeout helpers")

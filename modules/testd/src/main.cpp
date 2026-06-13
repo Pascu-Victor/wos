@@ -331,6 +331,7 @@ constexpr int CHILD_WAIT_POLL_US = 10000;
 constexpr int CHILD_KILL_GRACE_MS = 2000;
 constexpr int64_t USEC_PER_MSEC = 1000;
 constexpr int64_t NSEC_PER_MSEC = 1000000;
+constexpr int64_t NSEC_PER_SEC = 1000 * NSEC_PER_MSEC;
 constexpr int64_t MSEC_PER_SEC = 1000;
 constexpr uint32_t WKI_VFS_ROUTE_LOCAL = 0;
 constexpr uint32_t WKI_VFS_ROUTE_HOST = 1;
@@ -389,7 +390,18 @@ auto monotonic_now_ms() -> int64_t {
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
         return -1;
     }
-    return (static_cast<int64_t>(ts.tv_sec) * MSEC_PER_SEC) + (static_cast<int64_t>(ts.tv_nsec) / NSEC_PER_MSEC);
+
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC) {
+        return -1;
+    }
+
+    int64_t const NSEC_MS = static_cast<int64_t>(ts.tv_nsec) / NSEC_PER_MSEC;
+    auto const SEC = static_cast<int64_t>(ts.tv_sec);
+    if (SEC > (INT64_MAX - NSEC_MS) / MSEC_PER_SEC) {
+        return INT64_MAX;
+    }
+
+    return (SEC * MSEC_PER_SEC) + NSEC_MS;
 }
 
 auto deadline_after_ms(int timeout_ms) -> int64_t {
@@ -397,7 +409,15 @@ auto deadline_after_ms(int timeout_ms) -> int64_t {
     if (NOW_MS < 0) {
         return -1;
     }
-    return NOW_MS + timeout_ms;
+    if (timeout_ms <= 0) {
+        return NOW_MS;
+    }
+
+    auto const TIMEOUT_MS = static_cast<int64_t>(timeout_ms);
+    if (INT64_MAX - NOW_MS < TIMEOUT_MS) {
+        return INT64_MAX;
+    }
+    return NOW_MS + TIMEOUT_MS;
 }
 
 auto remaining_ms_until(int64_t deadline_ms, int fallback_timeout_ms) -> int {
@@ -408,11 +428,11 @@ auto remaining_ms_until(int64_t deadline_ms, int fallback_timeout_ms) -> int {
     if (NOW_MS < 0) {
         return fallback_timeout_ms;
     }
-    int64_t const REMAINING_MS = deadline_ms - NOW_MS;
-    if (REMAINING_MS <= 0) {
+    if (deadline_ms <= NOW_MS) {
         errno = ETIMEDOUT;
         return 0;
     }
+    int64_t const REMAINING_MS = deadline_ms - NOW_MS;
     return REMAINING_MS > INT_MAX ? INT_MAX : static_cast<int>(REMAINING_MS);
 }
 
