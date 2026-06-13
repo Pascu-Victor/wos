@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -82,6 +83,10 @@ constexpr std::size_t INITIAL_FILE_CAPACITY = 131072;
 constexpr std::size_t PROC_READ_CAPACITY = 512;
 constexpr std::size_t PERF_DRAIN_CAPACITY = 65536;
 constexpr std::size_t CPUSTAT_READ_CAPACITY = 16384;
+constexpr std::size_t READ_CHUNK_CAPACITY = 4096;
+constexpr std::size_t PROCFS_READ_LIMIT = 262144;
+constexpr std::size_t PERF_PROC_READ_LIMIT = 65536;
+constexpr std::size_t PERF_DATA_READ_LIMIT = std::size_t{8} * 1024 * 1024;
 constexpr std::size_t MAX_EVENT_TOKENS = 14;
 
 constexpr std::size_t PID_PREFIX_SIZE = 4;
@@ -592,25 +597,47 @@ void write_all(int fd, std::string_view text) {
     }
 }
 
-auto read_fd(ScopedFd& fd, std::size_t initial_capacity = INITIAL_FILE_CAPACITY) -> std::string {
-    std::size_t const CAPACITY = std::max<std::size_t>(initial_capacity, 1);
-    std::string buffer(CAPACITY, '\0');
-    std::size_t total = 0;
-
-    for (;;) {
-        if (total == buffer.size()) {
-            buffer.resize(buffer.size() * 2);
-        }
-
-        ssize_t const COUNT = read(fd.get(), buffer.data() + total, buffer.size() - total);
-        if (COUNT <= 0) {
-            break;
-        }
-        total += static_cast<std::size_t>(COUNT);
+auto read_limit_for_path(std::string_view path) -> std::size_t {
+    if (path == KPERF_PATH || path == KWKISTAT_PATH || path == KIPCSTAT_PATH || path == KCPUSTAT_PATH || path == KCONTSTAT_PATH) {
+        return PERF_PROC_READ_LIMIT;
     }
+    if (path.starts_with(PROC_ROOT) || path.starts_with(DEV_NODES_ROOT)) {
+        return PROCFS_READ_LIMIT;
+    }
+    return PERF_DATA_READ_LIMIT;
+}
 
-    buffer.resize(total);
-    return buffer;
+auto read_fd(ScopedFd& fd, std::size_t initial_capacity = INITIAL_FILE_CAPACITY, std::size_t max_bytes = PERF_DATA_READ_LIMIT)
+    -> std::optional<std::string> {
+    std::string buffer;
+    buffer.reserve(std::min(std::max<std::size_t>(initial_capacity, 1), max_bytes));
+    std::array<char, READ_CHUNK_CAPACITY> chunk{};
+    for (;;) {
+        std::size_t const REMAINING = max_bytes - buffer.size();
+        if (REMAINING == 0) {
+            char extra = '\0';
+            ssize_t const COUNT = read(fd.get(), &extra, 1);
+            if (COUNT < 0 && errno == EINTR) {
+                continue;
+            }
+            if (COUNT < 0 || COUNT > 0) {
+                return std::nullopt;
+            }
+            return buffer;
+        }
+
+        ssize_t const COUNT = read(fd.get(), chunk.data(), std::min(chunk.size(), REMAINING));
+        if (COUNT < 0 && errno == EINTR) {
+            continue;
+        }
+        if (COUNT < 0) {
+            return std::nullopt;
+        }
+        if (COUNT == 0) {
+            return buffer;
+        }
+        buffer.append(chunk.data(), static_cast<std::size_t>(COUNT));
+    }
 }
 
 auto read_file(std::string_view path, std::size_t initial_capacity = INITIAL_FILE_CAPACITY) -> std::optional<std::string> {
@@ -618,7 +645,7 @@ auto read_file(std::string_view path, std::size_t initial_capacity = INITIAL_FIL
     if (!fd.valid()) {
         return std::nullopt;
     }
-    return read_fd(fd, initial_capacity);
+    return read_fd(fd, initial_capacity, read_limit_for_path(path));
 }
 
 auto build_proc_path(std::string_view pid, std::string_view suffix) -> std::string {
@@ -3990,7 +4017,7 @@ void cmd_run(int argc, char** argv) {
             }
         });
 
-        if (command_exited || !any_alive) {
+        if (command_exited && !any_alive) {
             break;
         }
 

@@ -8,17 +8,22 @@
 #include <bits/ssize_t.h>
 #include <dirent.h>
 #include <fcntl.h>
-#include <sched.h>
+#include <poll.h>
+#include <signal.h>  // NOLINT(modernize-deprecated-headers): WOS signal constants live here.
 #include <sys/logging.h>
 #include <sys/multiproc.h>
 #include <sys/process.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -44,8 +49,173 @@ void log_message(std::format_string<Args...> fmt, Args&&... args) {
     httpd_log::info("%s", MSG.c_str());
 }
 constexpr size_t REQUEST_BUFFER_SIZE = 4096;
+constexpr size_t MAX_REQUEST_BYTES = static_cast<size_t>(64) * 1024;
+constexpr size_t MAX_CONTENT_LENGTH = static_cast<size_t>(32) * 1024;
 constexpr size_t FILE_STREAM_BUFFER_SIZE = static_cast<size_t>(4096) * 1024;
+constexpr std::string_view HEADER_TERMINATOR = "\r\n\r\n";
 constexpr int MAX_PENDING_CONNECTIONS = 128;
+constexpr int CLIENT_IO_TIMEOUT_MS = 30000;
+constexpr int CLIENT_DRAIN_TIMEOUT_MS = 1000;
+constexpr int CHILD_WAIT_POLL_US = 1000;
+constexpr int MOUNT_CHILD_TIMEOUT_MS = 30000;
+constexpr int MOUNT_CHILD_REAP_RETRIES = 1000;
+constexpr int MSEC_PER_SEC = 1000;
+constexpr int NSEC_PER_MSEC = 1000000;
+constexpr int USEC_PER_MSEC = 1000;
+
+auto monotonic_now_ms() -> int64_t {
+    timespec ts{};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return -1;
+    }
+    return (static_cast<int64_t>(ts.tv_sec) * MSEC_PER_SEC) + (static_cast<int64_t>(ts.tv_nsec) / NSEC_PER_MSEC);
+}
+
+auto deadline_after_ms(int timeout_ms) -> int64_t {
+    int64_t const NOW_MS = monotonic_now_ms();
+    if (NOW_MS < 0) {
+        return -1;
+    }
+    return NOW_MS + timeout_ms;
+}
+
+auto remaining_ms_until(int64_t deadline_ms, int fallback_timeout_ms) -> int {
+    if (deadline_ms < 0) {
+        return fallback_timeout_ms;
+    }
+    int64_t const NOW_MS = monotonic_now_ms();
+    if (NOW_MS < 0) {
+        return fallback_timeout_ms;
+    }
+    int64_t const REMAINING_MS = deadline_ms - NOW_MS;
+    if (REMAINING_MS <= 0) {
+        errno = ETIMEDOUT;
+        return 0;
+    }
+    return REMAINING_MS > INT_MAX ? INT_MAX : static_cast<int>(REMAINING_MS);
+}
+
+auto wait_fd_ready_until(int fd, short events, int64_t deadline_ms, int fallback_timeout_ms) -> int {
+    for (;;) {
+        int const TIMEOUT_MS = remaining_ms_until(deadline_ms, fallback_timeout_ms);
+        if (TIMEOUT_MS <= 0) {
+            return 0;
+        }
+
+        struct pollfd pfd{
+            .fd = fd,
+            .events = events,
+            .revents = 0,
+        };
+        int const READY = poll(&pfd, 1, TIMEOUT_MS);
+        if (READY < 0 && errno == EINTR) {
+            continue;
+        }
+        if (READY == 0) {
+            errno = ETIMEDOUT;
+        }
+        return READY;
+    }
+}
+
+auto set_nonblocking_for_timeout(int fd, int& old_flags) -> bool {
+    old_flags = fcntl(fd, F_GETFL, 0);
+    if (old_flags < 0) {
+        return false;
+    }
+    if ((old_flags & O_NONBLOCK) != 0) {
+        return true;
+    }
+    return fcntl(fd, F_SETFL, old_flags | O_NONBLOCK) == 0;
+}
+
+void restore_fd_flags(int fd, int old_flags) {
+    if (old_flags >= 0) {
+        (void)fcntl(fd, F_SETFL, old_flags);
+    }
+}
+
+void set_fd_cloexec_best_effort(int fd) {
+    int const FLAGS = fcntl(fd, F_GETFD, 0);
+    if (FLAGS >= 0) {
+        (void)fcntl(fd, F_SETFD, FLAGS | FD_CLOEXEC);
+    }
+}
+
+auto socket_error_from_result(ssize_t result) -> int {
+    if (result < -1) {
+        return static_cast<int>(-result);
+    }
+    return errno;
+}
+
+auto retryable_socket_error(int err) -> bool {
+    return err == EAGAIN || err == EWOULDBLOCK || err == EINTR || err == EINPROGRESS || err == EALREADY;
+}
+
+auto retryable_socket_result(ssize_t result) -> bool { return result < 0 && retryable_socket_error(socket_error_from_result(result)); }
+
+auto child_wait_timed_out(int64_t deadline_ms, uint64_t waited_us, int timeout_ms) -> bool {
+    if (deadline_ms >= 0) {
+        int64_t const NOW_MS = monotonic_now_ms();
+        if (NOW_MS >= 0) {
+            return NOW_MS >= deadline_ms;
+        }
+    }
+    return waited_us >= static_cast<uint64_t>(timeout_ms) * USEC_PER_MSEC;
+}
+
+void reap_child_after_timeout(int64_t pid) {
+    if (pid <= 0) {
+        return;
+    }
+
+    (void)ker::process::kill(pid, SIGKILL);
+    for (int retry = 0; retry < MOUNT_CHILD_REAP_RETRIES; ++retry) {
+        int32_t reap_status = 0;
+        int64_t const REAPED = ker::process::waitpid(pid, &reap_status, WNOHANG, nullptr);
+        if (REAPED == pid || (REAPED < 0 && REAPED != -EINTR)) {
+            return;
+        }
+        usleep(CHILD_WAIT_POLL_US);
+    }
+}
+
+auto wait_for_child_timeout(int64_t pid, int32_t* status, int timeout_ms) -> bool {
+    if (pid <= 0) {
+        if (status != nullptr) {
+            *status = -EINVAL;
+        }
+        return false;
+    }
+
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
+    uint64_t waited_us = 0;
+
+    for (;;) {
+        int64_t const WAITED = ker::process::waitpid(pid, status, WNOHANG, nullptr);
+        if (WAITED == pid) {
+            return true;
+        }
+        if (WAITED < 0 && WAITED != -EINTR) {
+            if (status != nullptr) {
+                *status = static_cast<int32_t>(WAITED);
+            }
+            return false;
+        }
+        if (child_wait_timed_out(DEADLINE_MS, waited_us, timeout_ms)) {
+            break;
+        }
+        usleep(CHILD_WAIT_POLL_US);
+        waited_us += CHILD_WAIT_POLL_US;
+    }
+
+    reap_child_after_timeout(pid);
+    if (status != nullptr) {
+        *status = -ETIMEDOUT;
+    }
+    return false;
+}
 
 // MIME type lookup based on file extension
 auto get_mime_type(std::string_view path) -> const char* {
@@ -426,40 +596,236 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
     return html;
 }
 
-// Send all data, handling partial sends and EAGAIN
-auto send_all(int fd, const void* data, size_t len) -> ssize_t {
+// Send all data without allowing a stalled peer to spin or block this server forever.
+auto send_all_timeout(int fd, const void* data, size_t len, int timeout_ms) -> ssize_t {
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return -1;
+    }
+
     const auto* ptr = static_cast<const char*>(data);
     size_t remaining = len;
     size_t total_sent = 0;
-    int retries = 0;
-    constexpr int MAX_SEND_RETRIES = 10000;
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
 
     while (remaining > 0) {
+        if (wait_fd_ready_until(fd, POLLOUT, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
+
+        errno = 0;
         ssize_t const SENT = send(fd, ptr, remaining, 0);
         if (SENT < 0) {
-            // EAGAIN (-11): window full or buffer exhaustion - retry
-            if (SENT == -11 && retries < MAX_SEND_RETRIES) {
-                retries++;
-                sched_yield();
+            if (retryable_socket_result(SENT)) {
                 continue;
             }
-            // Other error or too many retries
-            if (total_sent > 0) {
-                return static_cast<ssize_t>(total_sent);
-            }
-            return SENT;
+            restore_fd_flags(fd, old_flags);
+            return -1;
         }
         if (SENT == 0) {
-            // Connection closed
-            break;
+            errno = ETIMEDOUT;
+            restore_fd_flags(fd, old_flags);
+            return -1;
         }
         ptr += SENT;
         remaining -= SENT;
         total_sent += SENT;
-        retries = 0;  // Reset retry counter on progress
     }
 
+    restore_fd_flags(fd, old_flags);
     return static_cast<ssize_t>(total_sent);
+}
+
+auto send_all(int fd, const void* data, size_t len) -> ssize_t { return send_all_timeout(fd, data, len, CLIENT_IO_TIMEOUT_MS); }
+
+auto ascii_lower(char ch) -> char {
+    if (ch >= 'A' && ch <= 'Z') {
+        return static_cast<char>(ch - 'A' + 'a');
+    }
+    return ch;
+}
+
+auto ascii_iequals(std::string_view lhs, std::string_view rhs) -> bool {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.size(); ++i) {
+        if (ascii_lower(lhs.at(i)) != ascii_lower(rhs.at(i))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto trim_optional_whitespace(std::string_view value) -> std::string_view {
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+        value.remove_prefix(1);
+    }
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+        value.remove_suffix(1);
+    }
+    return value;
+}
+
+auto parse_content_length_value(std::string_view value, size_t& content_length) -> bool {
+    value = trim_optional_whitespace(value);
+    if (value.empty()) {
+        return false;
+    }
+
+    size_t parsed = 0;
+    for (char const CH : value) {
+        if (CH < '0' || CH > '9') {
+            return false;
+        }
+        auto const DIGIT = static_cast<size_t>(CH - '0');
+        if (parsed > (MAX_CONTENT_LENGTH - DIGIT) / 10) {
+            return false;
+        }
+        parsed = (parsed * 10) + DIGIT;
+    }
+
+    content_length = parsed;
+    return true;
+}
+
+auto parse_content_length(std::string_view headers, size_t& content_length) -> bool {
+    content_length = 0;
+    bool found = false;
+
+    size_t line_start = headers.find("\r\n");
+    if (line_start == std::string_view::npos) {
+        return true;
+    }
+    line_start += 2;
+
+    while (line_start < headers.size()) {
+        size_t line_end = headers.find("\r\n", line_start);
+        if (line_end == std::string_view::npos) {
+            line_end = headers.size();
+        }
+
+        std::string_view const LINE = headers.substr(line_start, line_end - line_start);
+        if (LINE.empty()) {
+            break;
+        }
+
+        size_t const COLON = LINE.find(':');
+        if (COLON != std::string_view::npos && ascii_iequals(trim_optional_whitespace(LINE.substr(0, COLON)), "Content-Length")) {
+            size_t parsed = 0;
+            if (!parse_content_length_value(LINE.substr(COLON + 1), parsed)) {
+                errno = EINVAL;
+                return false;
+            }
+            if (found && parsed != content_length) {
+                errno = EINVAL;
+                return false;
+            }
+            content_length = parsed;
+            found = true;
+        }
+
+        line_start = line_end + 2;
+    }
+
+    return true;
+}
+
+auto read_request_timeout(int fd, std::string& request, int timeout_ms) -> bool {
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return false;
+    }
+
+    request.clear();
+    request.reserve(REQUEST_BUFFER_SIZE);
+
+    std::array<char, REQUEST_BUFFER_SIZE> buffer{};
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
+    for (;;) {
+        size_t const HEADER_END = request.find(HEADER_TERMINATOR);
+        if (HEADER_END != std::string::npos) {
+            size_t content_length = 0;
+            if (!parse_content_length(request.substr(0, HEADER_END), content_length)) {
+                restore_fd_flags(fd, old_flags);
+                return false;
+            }
+
+            size_t const HEADER_SIZE = HEADER_END + HEADER_TERMINATOR.size();
+            if (HEADER_SIZE > MAX_REQUEST_BYTES || content_length > MAX_REQUEST_BYTES - HEADER_SIZE) {
+                errno = EMSGSIZE;
+                restore_fd_flags(fd, old_flags);
+                return false;
+            }
+
+            size_t const EXPECTED_SIZE = HEADER_SIZE + content_length;
+            if (request.size() >= EXPECTED_SIZE) {
+                request.resize(EXPECTED_SIZE);
+                restore_fd_flags(fd, old_flags);
+                return true;
+            }
+        }
+
+        if (request.size() >= MAX_REQUEST_BYTES) {
+            errno = EMSGSIZE;
+            restore_fd_flags(fd, old_flags);
+            return false;
+        }
+
+        size_t const ROOM = MAX_REQUEST_BYTES - request.size();
+        size_t const CHUNK_LEN = std::min(buffer.size(), ROOM);
+        if (wait_fd_ready_until(fd, POLLIN, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(fd, old_flags);
+            return false;
+        }
+
+        errno = 0;
+        ssize_t const RECEIVED = recv(fd, buffer.data(), CHUNK_LEN, 0);
+        if (RECEIVED > 0) {
+            request.append(buffer.data(), static_cast<size_t>(RECEIVED));
+            continue;
+        }
+        if (RECEIVED == 0) {
+            errno = ECONNRESET;
+            restore_fd_flags(fd, old_flags);
+            return false;
+        }
+        if (retryable_socket_result(RECEIVED)) {
+            continue;
+        }
+
+        restore_fd_flags(fd, old_flags);
+        return false;
+    }
+}
+
+void drain_client_input_timeout(int fd, int timeout_ms) {
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return;
+    }
+
+    std::array<char, 512> drain{};
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
+    for (;;) {
+        int const READY = wait_fd_ready_until(fd, POLLIN, DEADLINE_MS, timeout_ms);
+        if (READY <= 0) {
+            break;
+        }
+
+        errno = 0;
+        ssize_t const RECEIVED = recv(fd, drain.data(), drain.size(), 0);
+        if (RECEIVED > 0) {
+            continue;
+        }
+        if (RECEIVED < 0 && retryable_socket_result(RECEIVED)) {
+            continue;
+        }
+        break;
+    }
+
+    restore_fd_flags(fd, old_flags);
 }
 
 // Send an HTTP response with custom headers
@@ -493,7 +859,7 @@ auto serve_file(int client_fd, const std::string& fs_path, std::string_view url_
     struct stat st{};
     if (stat(fs_path.c_str(), &st) != 0) {
         log_message("httpd[t:{},p:{}]: File not found: {}", tid, pid, fs_path);
-        send(client_fd, HTTP_404_RESPONSE.data(), HTTP_404_RESPONSE.size(), 0);
+        send_all(client_fd, HTTP_404_RESPONSE.data(), HTTP_404_RESPONSE.size());
         return false;
     }
 
@@ -521,7 +887,7 @@ auto serve_file(int client_fd, const std::string& fs_path, std::string_view url_
 
     // Regular file
     if (!S_ISREG(st.st_mode)) {
-        send(client_fd, HTTP_403_RESPONSE.data(), HTTP_403_RESPONSE.size(), 0);
+        send_all(client_fd, HTTP_403_RESPONSE.data(), HTTP_403_RESPONSE.size());
         return false;
     }
 
@@ -529,7 +895,7 @@ auto serve_file(int client_fd, const std::string& fs_path, std::string_view url_
     int const FD = open(fs_path.c_str(), O_RDONLY);
     if (FD < 0) {
         log_message("httpd[t:{},p:{}]: Failed to open file: {}", tid, pid, fs_path);
-        send(client_fd, HTTP_500_RESPONSE.data(), HTTP_500_RESPONSE.size(), 0);
+        send_all(client_fd, HTTP_500_RESPONSE.data(), HTTP_500_RESPONSE.size());
         return false;
     }
 
@@ -607,11 +973,11 @@ auto parse_request_path(std::string_view request) -> std::string_view {
 
 // Extract POST body from HTTP request (content after \r\n\r\n)
 auto parse_request_body(std::string_view request) -> std::string_view {
-    auto body_start = request.find("\r\n\r\n");
+    auto body_start = request.find(HEADER_TERMINATOR);
     if (body_start == std::string_view::npos) {
         return {};
     }
-    return request.substr(body_start + 4);
+    return request.substr(body_start + HEADER_TERMINATOR.size());
 }
 
 // Extract a URL-encoded form field value by key from a body like "key1=val1&key2=val2"
@@ -655,7 +1021,7 @@ auto handle_request(int client_fd, std::string_view request) -> void {
     // Security check
     if (!is_safe_path(decoded_path)) {
         log_message("httpd[t:{},p:{}]: Rejected unsafe path: {}", tid, pid, decoded_path);
-        send(client_fd, HTTP_403_RESPONSE.data(), HTTP_403_RESPONSE.size(), 0);
+        send_all(client_fd, HTTP_403_RESPONSE.data(), HTTP_403_RESPONSE.size());
         return;
     }
 
@@ -688,7 +1054,7 @@ auto handle_request(int client_fd, std::string_view request) -> void {
         constexpr std::array<const char*, 1> ENVP = {nullptr};
         auto exec_res = ker::process::exec("/bin/mount", argv.data(), ENVP.data());
 
-        if (exec_res < 0) {
+        if (exec_res == 0) {
             log_message("httpd[t:{},p:{}]: Failed to exec for mount {} at {}", tid, pid, device, mount_path);
             std::string result_html;
             result_html.reserve(512);
@@ -704,11 +1070,11 @@ auto handle_request(int client_fd, std::string_view request) -> void {
             return;
         }
 
-        // Parent: wait for mount to complete
+        // Parent: wait for mount to complete without wedging the request loop forever.
         int32_t exit_code = 0;
-        ker::process::waitpid(static_cast<int64_t>(exec_res), &exit_code, 0, nullptr);
+        bool const MOUNT_COMPLETED = wait_for_child_timeout(static_cast<int64_t>(exec_res), &exit_code, MOUNT_CHILD_TIMEOUT_MS);
 
-        if (exit_code == 0) {
+        if (MOUNT_COMPLETED && exit_code == 0) {
             log_message("httpd[t:{},p:{}]: Mounted {} at {} ({})", tid, pid, device, mount_path, fstype);
             // Redirect to the newly mounted path so the browser sees the result
             auto redirect = std::format(
@@ -720,7 +1086,7 @@ auto handle_request(int client_fd, std::string_view request) -> void {
                 mount_path);
             send_all(client_fd, redirect.data(), redirect.size());
         } else {
-            log_message("httpd[t:{},p:{}]: Failed to mount {} at {} ({}): exit code {}", tid, pid, device, mount_path, fstype, exit_code);
+            log_message("httpd[t:{},p:{}]: Failed to mount {} at {} ({}): status {}", tid, pid, device, mount_path, fstype, exit_code);
             std::string result_html;
             result_html.reserve(512);
             result_html += "<html><head><title>Mount Error</title></head><body>";
@@ -728,7 +1094,7 @@ auto handle_request(int client_fd, std::string_view request) -> void {
             result_html += device;
             result_html += "</b> at <b>";
             result_html += mount_path;
-            result_html += "</b> (exit code ";
+            result_html += "</b> (status ";
             result_html += std::to_string(exit_code);
             result_html += ")</p>";
             result_html += "<hr><p><a href=\"/dev/\">Back to /dev/</a></p>";
@@ -813,6 +1179,7 @@ auto main(int argc, char** argv) -> int {
         log_message("httpd[t:{},p:{}]: Failed to create socket: {}", tid, pid, server_fd);
         return 1;
     }
+    set_fd_cloexec_best_effort(server_fd);
 
     // Set socket options (SO_REUSEADDR)
     int opt = 1;
@@ -844,8 +1211,6 @@ auto main(int argc, char** argv) -> int {
     log_message("httpd[t:{},p:{}]: Listening for connections (backlog={})", tid, pid, MAX_PENDING_CONNECTIONS);
 
     // Main server loop
-    std::array<char, REQUEST_BUFFER_SIZE> buffer{};
-
     for (;;) {
         struct sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
@@ -856,6 +1221,7 @@ auto main(int argc, char** argv) -> int {
             log_message("httpd[t:{},p:{}]: Failed to accept connection: {}", tid, pid, client_fd);
             continue;
         }
+        set_fd_cloexec_best_effort(client_fd);
 
         // Get client IP
         std::array<char, INET_ADDRSTRLEN> client_ip{};
@@ -865,23 +1231,18 @@ auto main(int argc, char** argv) -> int {
         log_message("httpd[t:{},p:{}]: Accepted connection from {}:{}", tid, pid, std::string_view(client_ip.data()), CLIENT_PORT);
 
         // Read request
-        ssize_t received = recv(client_fd, buffer.data(), REQUEST_BUFFER_SIZE - 1, 0);
-        if (received < 0) {
-            log_message("httpd[t:{},p:{}]: Failed to read request: {}", tid, pid, received);
+        std::string request;
+        if (!read_request_timeout(client_fd, request, CLIENT_IO_TIMEOUT_MS)) {
+            int const READ_ERRNO = errno;
+            log_message("httpd[t:{},p:{}]: Failed to read complete request: {}", tid, pid, READ_ERRNO);
             close(client_fd);
             continue;
         }
 
-        if (received == 0) {
-            log_message("httpd[t:{},p:{}]: Client closed connection", tid, pid);
-            close(client_fd);
-            continue;
-        }
+        std::string_view const REQUEST(request.data(), request.size());
 
-        buffer.at(static_cast<size_t>(received)) = '\0';
-        std::string_view const REQUEST(buffer.data(), static_cast<size_t>(received));
-
-        log_message("httpd[t:{},p:{}]: Received {} bytes from {}:{}", tid, pid, received, std::string_view(client_ip.data()), CLIENT_PORT);
+        log_message("httpd[t:{},p:{}]: Received {} bytes from {}:{}", tid, pid, request.size(), std::string_view(client_ip.data()),
+                    CLIENT_PORT);
 
         // Handle request and send response
         handle_request(client_fd, REQUEST);
@@ -892,12 +1253,7 @@ auto main(int argc, char** argv) -> int {
         // Without this, close() on a socket with unread data sends RST
         // instead of FIN, causing NS_ERROR_NET_RESET in the browser.
         shutdown(client_fd, SHUT_WR);
-        {
-            std::array<char, 512> drain{};
-            while (recv(client_fd, drain.data(), drain.size(), 0) > 0) {
-                // discard
-            }
-        }
+        drain_client_input_timeout(client_fd, CLIENT_DRAIN_TIMEOUT_MS);
         close(client_fd);
         log_message("httpd[t:{},p:{}]: Connection closed", tid, pid);
     }

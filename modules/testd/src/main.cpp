@@ -29,30 +29,36 @@
 #include <bits/posix/stat.h>
 #include <bits/ssize_t.h>
 #include <bits/winsize.h>
+#include <callnums/futex.h>
+#include <callnums/sys_log.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>  // NOLINT(modernize-deprecated-headers): this sysroot exposes PATH_MAX here.
 #include <netinet/in.h>
 #include <poll.h>
+#include <signal.h>  // NOLINT(modernize-deprecated-headers,misc-include-cleaner): this sysroot declares signal()/SIGUSR1 here.
+#include <sys/callnums.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/process.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>  // NOLINT(modernize-deprecated-headers): this sysroot declares nanosleep here.
 #include <unistd.h>
 
 #include <array>
 #include <cerrno>
 #include <climits>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg)
@@ -94,6 +100,25 @@ constexpr mode_t MODE_0644 = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
 constexpr mode_t MODE_0755 = S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;
 constexpr mode_t MODE_0600 = S_IRUSR | S_IWUSR;
 constexpr mode_t MODE_MASK = 0777;
+
+auto futex_wait_raw(int* addr, int expected, const timespec* timeout) -> int64_t {
+    return static_cast<int64_t>(syscall(ker::abi::callnums::futex, static_cast<uint64_t>(ker::abi::futex::futex_ops::FUTEX_WAIT),
+                                        reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(expected),
+                                        reinterpret_cast<uint64_t>(timeout)));
+}
+
+auto futex_wake_raw(int* addr) -> int64_t {
+    return static_cast<int64_t>(syscall(ker::abi::callnums::futex, static_cast<uint64_t>(ker::abi::futex::futex_ops::FUTEX_WAKE),
+                                        reinterpret_cast<uint64_t>(addr)));
+}
+
+volatile sig_atomic_t g_futex_signal_seen = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+void futex_test_signal_handler(int signum) {
+    (void)signum;
+    g_futex_signal_seen = 1;
+}
+
 // FIXME: look into the print flushing to fix this
 //  Keep testd's own progress reporting off std::println/FILE flushing; the
 //  current WOS libc++/stdio path can fault while formatting these status lines.
@@ -108,15 +133,164 @@ void testd_write_all(const char* data, size_t size) {
     }
 }
 
-template <size_t FMT_SIZE, typename... Args>
-void testd_logf(const char (&fmt)[FMT_SIZE], Args... args) {
-    std::array<char, 1024> buf{};
-    int const N = std::snprintf(buf.data(), buf.size(), fmt, args...);
-    if (N < 0) {
+template <size_t N>
+struct TestdFormatWriter {
+    std::array<char, N>& buf;
+    size_t len = 0;
+
+    void push(char c) {
+        if (len + 1 < N) {
+            buf[len] = c;
+        }
+        len++;
+    }
+
+    void append(std::string_view text) {
+        for (char c : text) {
+            push(c);
+        }
+    }
+
+    void terminate() { buf[(len < N) ? len : (N - 1)] = '\0'; }
+};
+
+template <size_t N>
+void testd_append_decimal(TestdFormatWriter<N>& out, uint64_t value) {
+    std::array<char, 32> digits{};
+    size_t used = 0;
+    do {
+        digits[used++] = static_cast<char>('0' + (value % 10));
+        value /= 10;
+    } while (value != 0);
+    while (used > 0) {
+        out.push(digits[--used]);
+    }
+}
+
+template <size_t N>
+void testd_append_hex(TestdFormatWriter<N>& out, uint64_t value) {
+    constexpr std::string_view HEX = "0123456789abcdef";
+    std::array<char, 32> digits{};
+    size_t used = 0;
+    do {
+        digits[used++] = HEX[value & 0xF];
+        value >>= 4;
+    } while (value != 0);
+    while (used > 0) {
+        out.push(digits[--used]);
+    }
+}
+
+template <size_t N, typename T>
+void testd_append_arg(TestdFormatWriter<N>& out, char spec, bool size_modifier, T&& value) {
+    using Decayed = std::remove_cvref_t<T>;
+    if (spec == 's') {
+        if constexpr (std::is_convertible_v<T, const char*>) {
+            const char* text = value;
+            out.append(text != nullptr ? std::string_view(text) : std::string_view("(null)"));
+            return;
+        } else if constexpr (std::is_same_v<Decayed, std::string_view>) {
+            out.append(value);
+            return;
+        } else {
+            out.append("<?>");
+            return;
+        }
+    }
+
+    if constexpr (std::is_integral_v<Decayed> || std::is_enum_v<Decayed>) {
+        if (spec == 'd' || (size_modifier && spec == 'd')) {
+            int64_t const signed_value = static_cast<int64_t>(value);
+            if (signed_value < 0) {
+                out.push('-');
+                testd_append_decimal(out, static_cast<uint64_t>(-(signed_value + 1)) + 1);
+            } else {
+                testd_append_decimal(out, static_cast<uint64_t>(signed_value));
+            }
+            return;
+        }
+        if (spec == 'u' || (size_modifier && spec == 'u')) {
+            if constexpr (std::is_enum_v<Decayed>) {
+                using Unsigned = std::make_unsigned_t<std::underlying_type_t<Decayed>>;
+                testd_append_decimal(out, static_cast<uint64_t>(static_cast<Unsigned>(value)));
+            } else {
+                using Unsigned = std::make_unsigned_t<Decayed>;
+                testd_append_decimal(out, static_cast<uint64_t>(static_cast<Unsigned>(value)));
+            }
+            return;
+        }
+        if (spec == 'x') {
+            if constexpr (std::is_enum_v<Decayed>) {
+                using Unsigned = std::make_unsigned_t<std::underlying_type_t<Decayed>>;
+                testd_append_hex(out, static_cast<uint64_t>(static_cast<Unsigned>(value)));
+            } else {
+                using Unsigned = std::make_unsigned_t<Decayed>;
+                testd_append_hex(out, static_cast<uint64_t>(static_cast<Unsigned>(value)));
+            }
+            return;
+        }
+        out.append("<?>");
         return;
     }
 
-    size_t const LEN = (static_cast<size_t>(N) < buf.size()) ? static_cast<size_t>(N) : buf.size() - 1;
+    out.append("<?>");
+}
+
+template <size_t N>
+void testd_format_impl(TestdFormatWriter<N>& out, const char* fmt) {
+    while (*fmt != '\0') {
+        if (fmt[0] == '%' && fmt[1] == '%') {
+            out.push('%');
+            fmt += 2;
+            continue;
+        }
+        out.push(*fmt++);
+    }
+}
+
+template <size_t N, typename T, typename... Rest>
+void testd_format_impl(TestdFormatWriter<N>& out, const char* fmt, T&& value, Rest&&... rest) {
+    while (*fmt != '\0') {
+        if (*fmt != '%') {
+            out.push(*fmt++);
+            continue;
+        }
+
+        ++fmt;
+        if (*fmt == '%') {
+            out.push('%');
+            ++fmt;
+            continue;
+        }
+
+        bool size_modifier = false;
+        if (*fmt == 'z') {
+            size_modifier = true;
+            ++fmt;
+        }
+        if (*fmt == '\0') {
+            return;
+        }
+
+        testd_append_arg(out, *fmt, size_modifier, std::forward<T>(value));
+        testd_format_impl(out, fmt + 1, std::forward<Rest>(rest)...);
+        return;
+    }
+}
+
+template <size_t N, typename... Args>
+size_t testd_format_to_array(std::array<char, N>& buf, const char* fmt, Args&&... args) {
+    static_assert(N > 0);
+    TestdFormatWriter<N> out{buf};
+    testd_format_impl(out, fmt, std::forward<Args>(args)...);
+    out.terminate();
+    return (out.len < N) ? out.len : (N - 1);
+}
+
+template <size_t FMT_SIZE, typename... Args>
+void testd_logf(const char (&fmt)[FMT_SIZE], Args... args) {
+    std::array<char, 1024> buf{};
+    size_t const LEN = testd_format_to_array(buf, fmt, std::forward<Args>(args)...);
     testd_write_all(buf.data(), LEN);
     testd_write_all("\n", 1);
 }
@@ -160,13 +334,24 @@ constexpr std::string_view RH_SOCKET_WRITE_MSG = "remote_sock_ok\n";
 constexpr int RH_SOCKET_CTRL_RCVBUF = 16384;
 constexpr int RH_EXIT_EXEC_FAILED = 127;
 constexpr int RH_EXIT_UNKNOWN_MODE = 127;
+constexpr char RH_WAIT_READY_BYTE = 'R';
+constexpr int REMOTE_IPC_TIMEOUT_MS = 15000;
+constexpr int CHILD_WAIT_POLL_US = 10000;
+constexpr int CHILD_KILL_GRACE_MS = 2000;
+constexpr int64_t USEC_PER_MSEC = 1000;
+constexpr int64_t NSEC_PER_MSEC = 1000000;
+constexpr int64_t MSEC_PER_SEC = 1000;
+constexpr uint32_t WKI_VFS_ROUTE_LOCAL = 0;
+constexpr uint32_t WKI_VFS_ROUTE_HOST = 1;
+constexpr size_t JOURNAL_SCAN_BATCH = 8;
+constexpr size_t JOURNAL_SCAN_BATCHES = 512;
 
 // Fork a child and exec testd --rh <mode> <fd>.
 // Closes close_fd in the child (the end we don't want the child to have).
 // Returns child pid or -1 on error.
 auto spawn_remote_helper(const char* mode, int fd, int close_fd) -> pid_t {
     std::array<char, 16> fd_str{};
-    std::snprintf(fd_str.data(), fd_str.size(), "%d", fd);
+    (void)testd_format_to_array(fd_str, "%d", fd);
     pid_t const PID = fork();
     if (PID == 0) {
         if (close_fd >= 0) {
@@ -175,7 +360,7 @@ auto spawn_remote_helper(const char* mode, int fd, int close_fd) -> pid_t {
         auto exec_path = std::to_array("/usr/bin/testd");
         auto rh_flag = std::to_array("--rh");
         std::array<char, 16> mode_buf{};
-        std::snprintf(mode_buf.data(), mode_buf.size(), "%s", mode);
+        (void)testd_format_to_array(mode_buf, "%s", mode);
         std::array<char*, 5> child_argv = {
             exec_path.data(), rh_flag.data(), mode_buf.data(), fd_str.data(), nullptr,
         };
@@ -194,14 +379,110 @@ auto make_pty_raw(int fd) -> bool {
     return tcsetattr(fd, TCSANOW, &tio) == 0;
 }
 
-auto read_expected_bytes(int fd, char* buf, size_t expected) -> ssize_t {
+auto wait_fd_ready(int fd, short events, int timeout_ms) -> int {
+    struct pollfd pfd{
+        .fd = fd,
+        .events = events,
+        .revents = 0,
+    };
+
+    int const READY = poll(&pfd, 1, timeout_ms);
+    if (READY == 0) {
+        errno = ETIMEDOUT;
+    }
+    return READY;
+}
+
+auto monotonic_now_ms() -> int64_t {
+    timespec ts{};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return -1;
+    }
+    return (static_cast<int64_t>(ts.tv_sec) * MSEC_PER_SEC) + (static_cast<int64_t>(ts.tv_nsec) / NSEC_PER_MSEC);
+}
+
+auto deadline_after_ms(int timeout_ms) -> int64_t {
+    int64_t const NOW_MS = monotonic_now_ms();
+    if (NOW_MS < 0) {
+        return -1;
+    }
+    return NOW_MS + timeout_ms;
+}
+
+auto remaining_ms_until(int64_t deadline_ms, int fallback_timeout_ms) -> int {
+    if (deadline_ms < 0) {
+        return fallback_timeout_ms;
+    }
+    int64_t const NOW_MS = monotonic_now_ms();
+    if (NOW_MS < 0) {
+        return fallback_timeout_ms;
+    }
+    int64_t const REMAINING_MS = deadline_ms - NOW_MS;
+    if (REMAINING_MS <= 0) {
+        errno = ETIMEDOUT;
+        return 0;
+    }
+    return REMAINING_MS > INT_MAX ? INT_MAX : static_cast<int>(REMAINING_MS);
+}
+
+auto wait_fd_ready_until(int fd, short events, int64_t deadline_ms, int fallback_timeout_ms) -> int {
+    if (deadline_ms < 0) {
+        return wait_fd_ready(fd, events, fallback_timeout_ms);
+    }
+
+    for (;;) {
+        int const TIMEOUT_MS = remaining_ms_until(deadline_ms, fallback_timeout_ms);
+        if (TIMEOUT_MS <= 0) {
+            return 0;
+        }
+
+        int const READY = wait_fd_ready(fd, events, TIMEOUT_MS);
+        if (READY < 0 && errno == EINTR) {
+            continue;
+        }
+        return READY;
+    }
+}
+
+auto set_nonblocking_for_timeout(int fd, int& old_flags) -> bool {
+    old_flags = fcntl(fd, F_GETFL, 0);
+    if (old_flags < 0) {
+        return false;
+    }
+    if ((old_flags & O_NONBLOCK) != 0) {
+        return true;
+    }
+    return fcntl(fd, F_SETFL, old_flags | O_NONBLOCK) == 0;
+}
+
+void restore_fd_flags(int fd, int old_flags) {
+    if (old_flags >= 0) {
+        (void)fcntl(fd, F_SETFL, old_flags);
+    }
+}
+
+auto retryable_would_block() -> bool { return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR; }
+
+auto read_expected_bytes_timeout(int fd, char* buf, size_t expected, int timeout_ms) -> ssize_t {
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return -1;
+    }
+
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
     size_t total = 0;
     while (total < expected) {
+        if (wait_fd_ready_until(fd, POLLIN, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
+
         ssize_t const N = read(fd, buf + total, expected - total);
         if (N < 0) {
-            if (errno == EINTR) {
+            if (retryable_would_block()) {
                 continue;
             }
+            restore_fd_flags(fd, old_flags);
             return -1;
         }
         if (N == 0) {
@@ -209,24 +490,68 @@ auto read_expected_bytes(int fd, char* buf, size_t expected) -> ssize_t {
         }
         total += static_cast<size_t>(N);
     }
+    restore_fd_flags(fd, old_flags);
     return static_cast<ssize_t>(total);
 }
 
-auto recv_retry(int fd, void* buf, size_t len, int flags) -> ssize_t {
+auto read_expected_bytes(int fd, char* buf, size_t expected) -> ssize_t {
+    return read_expected_bytes_timeout(fd, buf, expected, REMOTE_IPC_TIMEOUT_MS);
+}
+
+auto wait_remote_waiter_ready(int ready_fd) -> bool {
+    char byte = 0;
+    ssize_t const N = read_expected_bytes_timeout(ready_fd, &byte, 1, REMOTE_IPC_TIMEOUT_MS);
+    return N == 1 && byte == RH_WAIT_READY_BYTE;
+}
+
+auto signal_remote_wait_ready(int ready_fd) -> bool {
+    char const BYTE = RH_WAIT_READY_BYTE;
+    ssize_t const N = write(ready_fd, &BYTE, 1);
+    close(ready_fd);
+    return N == 1;
+}
+
+auto recv_once_timeout(int fd, void* buf, size_t len, int flags, int timeout_ms) -> ssize_t {
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return -1;
+    }
+
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
     for (;;) {
+        if (wait_fd_ready_until(fd, POLLIN, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
         ssize_t const N = recv(fd, buf, len, flags);
-        if (N < 0 && errno == EINTR) {
+        if (N < 0 && retryable_would_block()) {
             continue;
         }
+        restore_fd_flags(fd, old_flags);
         return N;
     }
 }
 
-auto recv_expected_bytes(int fd, char* buf, size_t expected) -> ssize_t {
+auto recv_expected_bytes_timeout(int fd, char* buf, size_t expected, int timeout_ms) -> ssize_t {
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return -1;
+    }
+
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
     size_t total = 0;
     while (total < expected) {
-        ssize_t const N = recv_retry(fd, buf + total, expected - total, 0);
+        if (wait_fd_ready_until(fd, POLLIN, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
+
+        ssize_t const N = recv(fd, buf + total, expected - total, 0);
         if (N < 0) {
+            if (retryable_would_block()) {
+                continue;
+            }
+            restore_fd_flags(fd, old_flags);
             return -1;
         }
         if (N == 0) {
@@ -234,14 +559,119 @@ auto recv_expected_bytes(int fd, char* buf, size_t expected) -> ssize_t {
         }
         total += static_cast<size_t>(N);
     }
+    restore_fd_flags(fd, old_flags);
     return static_cast<ssize_t>(total);
+}
+
+auto recv_expected_bytes(int fd, char* buf, size_t expected) -> ssize_t {
+    return recv_expected_bytes_timeout(fd, buf, expected, REMOTE_IPC_TIMEOUT_MS);
+}
+
+auto send_all_timeout(int fd, const char* buf, size_t expected, int flags, int timeout_ms) -> ssize_t {
+    if (expected == 0) {
+        return 0;
+    }
+
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return -1;
+    }
+
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
+    size_t total = 0;
+    while (total < expected) {
+        if (wait_fd_ready_until(fd, POLLOUT, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
+
+        ssize_t const N = send(fd, buf + total, expected - total, flags);
+        if (N < 0) {
+            if (retryable_would_block()) {
+                continue;
+            }
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
+        if (N == 0) {
+            errno = ETIMEDOUT;
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
+        total += static_cast<size_t>(N);
+    }
+
+    restore_fd_flags(fd, old_flags);
+    return static_cast<ssize_t>(total);
+}
+
+auto accept_timeout(int fd, sockaddr* addr, socklen_t* addrlen, int timeout_ms) -> int {
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return -1;
+    }
+
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
+    for (;;) {
+        if (wait_fd_ready_until(fd, POLLIN, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
+
+        int const CLIENT = accept(fd, addr, addrlen);
+        if (CLIENT >= 0) {
+            restore_fd_flags(fd, old_flags);
+            return CLIENT;
+        }
+        if (retryable_would_block()) {
+            continue;
+        }
+        restore_fd_flags(fd, old_flags);
+        return -1;
+    }
+}
+
+auto connect_timeout(int fd, const sockaddr* addr, socklen_t addrlen, int timeout_ms) -> int {
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return -1;
+    }
+
+    int const CONNECT_RET = connect(fd, addr, addrlen);
+    if (CONNECT_RET == 0) {
+        restore_fd_flags(fd, old_flags);
+        return 0;
+    }
+    if (errno != EINPROGRESS && errno != EALREADY && errno != EWOULDBLOCK) {
+        restore_fd_flags(fd, old_flags);
+        return -1;
+    }
+
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
+    for (;;) {
+        if (wait_fd_ready_until(fd, POLLOUT, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
+
+        int const RETRY_RET = connect(fd, addr, addrlen);
+        if (RETRY_RET == 0 || errno == EISCONN) {
+            restore_fd_flags(fd, old_flags);
+            return 0;
+        }
+        if (errno == EINPROGRESS || errno == EALREADY || errno == EWOULDBLOCK || errno == EINTR) {
+            continue;
+        }
+        restore_fd_flags(fd, old_flags);
+        return -1;
+    }
 }
 
 auto spawn_remote_helper_arg(const char* mode, int fd, int close_fd, const char* arg) -> pid_t {
     std::array<char, 16> fd_str{};
     std::array<char, 16> arg_str{};
-    std::snprintf(fd_str.data(), fd_str.size(), "%d", fd);
-    std::snprintf(arg_str.data(), arg_str.size(), "%s", arg);
+    (void)testd_format_to_array(fd_str, "%d", fd);
+    (void)testd_format_to_array(arg_str, "%s", arg);
     pid_t const PID = fork();
     if (PID == 0) {
         if (close_fd >= 0) {
@@ -250,7 +680,7 @@ auto spawn_remote_helper_arg(const char* mode, int fd, int close_fd, const char*
         auto exec_path = std::to_array("/usr/bin/testd");
         auto rh_flag = std::to_array("--rh");
         std::array<char, 16> mode_buf{};
-        std::snprintf(mode_buf.data(), mode_buf.size(), "%s", mode);
+        (void)testd_format_to_array(mode_buf, "%s", mode);
         std::array<char*, 6> child_argv = {
             exec_path.data(), rh_flag.data(), mode_buf.data(), fd_str.data(), arg_str.data(), nullptr,
         };
@@ -258,6 +688,90 @@ auto spawn_remote_helper_arg(const char* mode, int fd, int close_fd, const char*
         _exit(RH_EXIT_EXEC_FAILED);
     }
     return PID;
+}
+
+auto spawn_remote_wait_helper(const char* mode, int fd, int close_fd, int ready_fd, int close_ready_fd) -> pid_t {
+    std::array<char, 16> fd_str{};
+    std::array<char, 16> ready_fd_str{};
+    (void)testd_format_to_array(fd_str, "%d", fd);
+    (void)testd_format_to_array(ready_fd_str, "%d", ready_fd);
+    pid_t const PID = fork();
+    if (PID == 0) {
+        if (close_fd >= 0) {
+            close(close_fd);
+        }
+        if (close_ready_fd >= 0) {
+            close(close_ready_fd);
+        }
+        auto exec_path = std::to_array("/usr/bin/testd");
+        auto rh_flag = std::to_array("--rh");
+        std::array<char, 16> mode_buf{};
+        (void)testd_format_to_array(mode_buf, "%s", mode);
+        std::array<char*, 6> child_argv = {
+            exec_path.data(), rh_flag.data(), mode_buf.data(), fd_str.data(), ready_fd_str.data(), nullptr,
+        };
+        execve("/usr/bin/testd", child_argv.data(), nullptr);
+        _exit(RH_EXIT_EXEC_FAILED);
+    }
+    return PID;
+}
+
+auto waitpid_timeout(pid_t pid, int* status, int timeout_ms) -> bool {
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
+    int64_t waited_us = 0;
+    int64_t const TIMEOUT_US = static_cast<int64_t>(timeout_ms) * USEC_PER_MSEC;
+    while ((DEADLINE_MS >= 0 && remaining_ms_until(DEADLINE_MS, 0) > 0) || (DEADLINE_MS < 0 && waited_us <= TIMEOUT_US)) {
+        pid_t const RET = waitpid(pid, status, WNOHANG);
+        if (RET == pid) {
+            return true;
+        }
+        if (RET < 0 && errno != EINTR) {
+            return false;
+        }
+        usleep(CHILD_WAIT_POLL_US);
+        waited_us += CHILD_WAIT_POLL_US;
+    }
+
+    (void)kill(pid, SIGKILL);
+    int64_t const KILL_DEADLINE_MS = deadline_after_ms(CHILD_KILL_GRACE_MS);
+    int64_t kill_waited_us = 0;
+    int64_t const KILL_GRACE_US = static_cast<int64_t>(CHILD_KILL_GRACE_MS) * USEC_PER_MSEC;
+    while ((KILL_DEADLINE_MS >= 0 && remaining_ms_until(KILL_DEADLINE_MS, 0) > 0) ||
+           (KILL_DEADLINE_MS < 0 && kill_waited_us <= KILL_GRACE_US)) {
+        pid_t const RET = waitpid(pid, status, WNOHANG);
+        if (RET == pid) {
+            errno = ETIMEDOUT;
+            return false;
+        }
+        if (RET < 0 && errno != EINTR) {
+            return false;
+        }
+        usleep(CHILD_WAIT_POLL_US);
+        kill_waited_us += CHILD_WAIT_POLL_US;
+    }
+
+    errno = ETIMEDOUT;
+    return false;
+}
+
+auto waitpid_any_timeout(int* status, int timeout_ms) -> pid_t {
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
+    int64_t waited_us = 0;
+    int64_t const TIMEOUT_US = static_cast<int64_t>(timeout_ms) * USEC_PER_MSEC;
+    while ((DEADLINE_MS >= 0 && remaining_ms_until(DEADLINE_MS, 0) > 0) || (DEADLINE_MS < 0 && waited_us <= TIMEOUT_US)) {
+        pid_t const RET = waitpid(-1, status, WNOHANG);
+        if (RET > 0) {
+            return RET;
+        }
+        if (RET < 0 && errno != EINTR) {
+            return RET;
+        }
+        usleep(CHILD_WAIT_POLL_US);
+        waited_us += CHILD_WAIT_POLL_US;
+    }
+
+    errno = ETIMEDOUT;
+    return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -584,7 +1098,7 @@ TESTD_RUN(test_vfs_dup) {
     close(FD_DUP);
 
     std::array<char, 4> buf{};
-    ssize_t const NR = read(fds[0], buf.data(), buf.size());
+    ssize_t const NR = read_expected_bytes_timeout(fds[0], buf.data(), 2, REMOTE_IPC_TIMEOUT_MS);
     close(fds[0]);
 
     if (NR != 2 || buf[0] != 'A' || buf[1] != 'B') {
@@ -616,7 +1130,7 @@ TESTD_RUN(test_vfs_dup2) {
     close(TARGET);
 
     std::array<char, 4> buf{};
-    ssize_t const NR = read(fds[0], buf.data(), buf.size());
+    ssize_t const NR = read_expected_bytes_timeout(fds[0], buf.data(), 2, REMOTE_IPC_TIMEOUT_MS);
     close(fds[0]);
 
     if (NR != 2 || buf[0] != 'X' || buf[1] != 'Y') {
@@ -654,7 +1168,7 @@ TESTD_RUN(test_vfs_readdir_unlink_progress) {
     const char* dir_path = "/tmp/testd_readdir_unlink";
     for (int i = 0; i < 8; ++i) {
         std::array<char, 64> path{};
-        std::snprintf(path.data(), path.size(), "%s/f%d", dir_path, i);
+        (void)testd_format_to_array(path, "%s/f%d", dir_path, i);
         unlink(path.data());
     }
     rmdir(dir_path);
@@ -665,7 +1179,7 @@ TESTD_RUN(test_vfs_readdir_unlink_progress) {
 
     for (int i = 0; i < 8; ++i) {
         std::array<char, 64> path{};
-        std::snprintf(path.data(), path.size(), "%s/f%d", dir_path, i);
+        (void)testd_format_to_array(path, "%s/f%d", dir_path, i);
         int fd = open(path.data(), O_CREAT | O_WRONLY | O_TRUNC, MODE_0644);
         if (fd < 0) {
             fail("vfs_readdir_unlink_seed", "open seed failed");
@@ -686,7 +1200,7 @@ TESTD_RUN(test_vfs_readdir_unlink_progress) {
             continue;
         }
         std::array<char, 64> path{};
-        std::snprintf(path.data(), path.size(), "%s/%s", dir_path, ent->d_name);
+        (void)testd_format_to_array(path, "%s/%s", dir_path, ent->d_name);
         if (unlink(path.data()) != 0) {
             closedir(dir);
             fail("vfs_readdir_unlink_remove", "unlink during readdir failed");
@@ -862,7 +1376,7 @@ TESTD_RUN(test_pipe_basic) {
 
     std::array<char, 64> rbuf{};
     close(fds[1]);
-    ssize_t const NR = read(fds[0], rbuf.data(), rbuf.size());
+    ssize_t const NR = read_expected_bytes_timeout(fds[0], rbuf.data(), MSG.size(), REMOTE_IPC_TIMEOUT_MS);
     close(fds[0]);
 
     if (NR != NW || std::string_view(rbuf.data(), static_cast<size_t>(NR)) != MSG) {
@@ -882,7 +1396,7 @@ TESTD_RUN(test_pipe_eof_on_writer_close) {
     close(fds[1]);
 
     std::array<char, 4> buf{};
-    ssize_t const NR = read(fds[0], buf.data(), buf.size());
+    ssize_t const NR = read_expected_bytes_timeout(fds[0], buf.data(), 1, REMOTE_IPC_TIMEOUT_MS);
     close(fds[0]);
 
     // EOF: read must return 0 when write-end is closed and pipe is empty
@@ -911,27 +1425,368 @@ TESTD_RUN(test_pipe_blocking_read_wake) {
 
     constexpr char BYTE = 0x5A;
     if (PID == 0) {
-        close(fds[0]);
-        usleep(50000);
-        ssize_t const NW = write(fds[1], &BYTE, 1);
         close(fds[1]);
-        _exit(NW == 1 ? 0 : 1);
+        char got = 0;
+        ssize_t const NR = read(fds[0], &got, 1);
+        close(fds[0]);
+        _exit((NR == 1 && got == BYTE) ? 0 : 1);
     }
 
-    close(fds[1]);
-    char got = 0;
-    ssize_t const NR = read(fds[0], &got, 1);
     close(fds[0]);
+    usleep(50000);
+    ssize_t const NW = write(fds[1], &BYTE, 1);
+    close(fds[1]);
 
     int status = 0;
-    waitpid(PID, &status, 0);
-    if (NR != 1 || got != BYTE || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+    if (NW != 1 || !WAIT_RET || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         fail("pipe_blocking_read_wake", "blocking read did not wake with byte");
         return;
     }
     TESTD_PASS("pipe_blocking_read_wake");
 }
 TESTD_RUN_END(test_pipe_blocking_read_wake)
+
+TESTD_RUN(test_pipe_lost_wake_race_many) {
+    constexpr int ITERATIONS = 64;
+    for (int i = 0; i < ITERATIONS; ++i) {
+        std::array<int, 2> fds = {-1, -1};
+        if (pipe(fds.data()) != 0) {
+            fail("pipe_lost_wake_create", "pipe failed");
+            return;
+        }
+
+        pid_t const PID = fork();
+        if (PID < 0) {
+            close(fds[0]);
+            close(fds[1]);
+            fail("pipe_lost_wake_fork", "fork failed");
+            return;
+        }
+
+        char const BYTE = static_cast<char>(0x30 + (i & 0x0F));
+        if (PID == 0) {
+            close(fds[0]);
+            ssize_t const NW = write(fds[1], &BYTE, 1);
+            close(fds[1]);
+            _exit(NW == 1 ? 0 : 1);
+        }
+
+        close(fds[1]);
+        char got = 0;
+        ssize_t const NR = read_expected_bytes_timeout(fds[0], &got, 1, REMOTE_IPC_TIMEOUT_MS);
+        close(fds[0]);
+
+        int status = 0;
+        bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+        if (NR != 1 || got != BYTE || !WAIT_RET || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            fail("pipe_lost_wake_race_many", "immediate writer did not wake reader with expected byte");
+            return;
+        }
+    }
+    TESTD_PASS("pipe_lost_wake_race_many");
+}
+TESTD_RUN_END(test_pipe_lost_wake_race_many)
+
+TESTD_RUN(test_futex_rejects_unaligned_address) {
+    constexpr size_t PAGE_SIZE = 4096;
+    void* mapping = mmap(nullptr, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) {
+        fail("futex_unaligned_mmap", "mmap failed");
+        return;
+    }
+
+    auto* base = static_cast<char*>(mapping);
+    auto* unaligned = reinterpret_cast<int*>(base + 1);
+    timespec timeout{
+        .tv_sec = 0,
+        .tv_nsec = 0,
+    };
+    int64_t const WAIT_RC = futex_wait_raw(unaligned, 0, &timeout);
+    int64_t const WAKE_RC = futex_wake_raw(unaligned);
+    munmap(mapping, PAGE_SIZE);
+
+    if (WAIT_RC != -EINVAL || WAKE_RC != -EINVAL) {
+        fail("futex_unaligned_address", "unaligned futex wait/wake did not fail with EINVAL");
+        return;
+    }
+    TESTD_PASS("futex_unaligned_address");
+}
+TESTD_RUN_END(test_futex_rejects_unaligned_address)
+
+TESTD_RUN(test_futex_wait_relative_timeout) {
+    constexpr size_t PAGE_SIZE = 4096;
+    auto* futex_word = static_cast<int*>(mmap(nullptr, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (futex_word == MAP_FAILED) {
+        fail("futex_timeout_mmap", "mmap failed");
+        return;
+    }
+    *futex_word = 17;
+
+    std::array<int, 2> ready = {-1, -1};
+    if (pipe(ready.data()) != 0) {
+        munmap(futex_word, PAGE_SIZE);
+        fail("futex_timeout_pipe", "pipe failed");
+        return;
+    }
+
+    pid_t const PID = fork();
+    if (PID < 0) {
+        close(ready[0]);
+        close(ready[1]);
+        munmap(futex_word, PAGE_SIZE);
+        fail("futex_timeout_fork", "fork failed");
+        return;
+    }
+
+    if (PID == 0) {
+        close(ready[0]);
+        constexpr char BYTE = 't';
+        static_cast<void>(write(ready[1], &BYTE, 1));
+        close(ready[1]);
+
+        timespec timeout{
+            .tv_sec = 0,
+            .tv_nsec = 20000000,
+        };
+        int64_t const RC = futex_wait_raw(futex_word, 17, &timeout);
+        _exit(RC == -ETIMEDOUT ? 0 : 1);
+    }
+
+    close(ready[1]);
+    char byte = 0;
+    ssize_t const NR = read_expected_bytes_timeout(ready[0], &byte, 1, REMOTE_IPC_TIMEOUT_MS);
+    close(ready[0]);
+    if (NR != 1 || byte != 't') {
+        static_cast<void>(futex_wake_raw(futex_word));
+        int status = 0;
+        static_cast<void>(waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS));
+        munmap(futex_word, PAGE_SIZE);
+        fail("futex_timeout_ready", "child did not enter futex timeout test");
+        return;
+    }
+
+    usleep(150000);
+    static_cast<void>(futex_wake_raw(futex_word));
+
+    int status = 0;
+    bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+    munmap(futex_word, PAGE_SIZE);
+    if (!WAIT_RET || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("futex_wait_relative_timeout", "timed futex wait did not return ETIMEDOUT before guard wake");
+        return;
+    }
+    TESTD_PASS("futex_wait_relative_timeout");
+}
+TESTD_RUN_END(test_futex_wait_relative_timeout)
+
+TESTD_RUN(test_futex_wait_wake_before_timeout) {
+    constexpr size_t PAGE_SIZE = 4096;
+    auto* futex_word = static_cast<int*>(mmap(nullptr, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (futex_word == MAP_FAILED) {
+        fail("futex_wake_timeout_mmap", "mmap failed");
+        return;
+    }
+    *futex_word = 23;
+
+    std::array<int, 2> ready = {-1, -1};
+    if (pipe(ready.data()) != 0) {
+        munmap(futex_word, PAGE_SIZE);
+        fail("futex_wake_timeout_pipe", "pipe failed");
+        return;
+    }
+
+    pid_t const PID = fork();
+    if (PID < 0) {
+        close(ready[0]);
+        close(ready[1]);
+        munmap(futex_word, PAGE_SIZE);
+        fail("futex_wake_timeout_fork", "fork failed");
+        return;
+    }
+
+    if (PID == 0) {
+        close(ready[0]);
+        constexpr char BYTE = 'w';
+        static_cast<void>(write(ready[1], &BYTE, 1));
+        close(ready[1]);
+
+        timespec timeout{
+            .tv_sec = 1,
+            .tv_nsec = 0,
+        };
+        int64_t const RC = futex_wait_raw(futex_word, 23, &timeout);
+        _exit(RC == 0 ? 0 : 1);
+    }
+
+    close(ready[1]);
+    char byte = 0;
+    ssize_t const NR = read_expected_bytes_timeout(ready[0], &byte, 1, REMOTE_IPC_TIMEOUT_MS);
+    close(ready[0]);
+    if (NR != 1 || byte != 'w') {
+        static_cast<void>(futex_wake_raw(futex_word));
+        int status = 0;
+        static_cast<void>(waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS));
+        munmap(futex_word, PAGE_SIZE);
+        fail("futex_wake_timeout_ready", "child did not enter futex wake test");
+        return;
+    }
+
+    usleep(100000);
+    static_cast<void>(futex_wake_raw(futex_word));
+
+    int status = 0;
+    bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+    munmap(futex_word, PAGE_SIZE);
+    if (!WAIT_RET || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("futex_wait_wake_before_timeout", "explicit futex wake did not beat the timeout");
+        return;
+    }
+    TESTD_PASS("futex_wait_wake_before_timeout");
+}
+TESTD_RUN_END(test_futex_wait_wake_before_timeout)
+
+TESTD_RUN(test_futex_wait_interrupted_by_signal) {
+    constexpr size_t PAGE_SIZE = 4096;
+    auto* futex_word = static_cast<int*>(mmap(nullptr, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (futex_word == MAP_FAILED) {
+        fail("futex_signal_mmap", "mmap failed");
+        return;
+    }
+    *futex_word = 31;
+
+    std::array<int, 2> ready = {-1, -1};
+    if (pipe(ready.data()) != 0) {
+        munmap(futex_word, PAGE_SIZE);
+        fail("futex_signal_pipe", "pipe failed");
+        return;
+    }
+
+    pid_t const PID = fork();
+    if (PID < 0) {
+        close(ready[0]);
+        close(ready[1]);
+        munmap(futex_word, PAGE_SIZE);
+        fail("futex_signal_fork", "fork failed");
+        return;
+    }
+
+    if (PID == 0) {
+        close(ready[0]);
+        if (signal(SIGUSR1, futex_test_signal_handler) == SIG_ERR) {  // NOLINT(misc-include-cleaner)
+            close(ready[1]);
+            _exit(2);
+        }
+
+        constexpr char BYTE = 's';
+        static_cast<void>(write(ready[1], &BYTE, 1));
+        close(ready[1]);
+
+        // A signal that lands just before FUTEX_WAIT should not decide this test.
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            g_futex_signal_seen = 0;
+            timespec timeout{
+                .tv_sec = 0,
+                .tv_nsec = 200000000,
+            };
+            int64_t const RC = futex_wait_raw(futex_word, 31, &timeout);
+            if (RC == -EINTR && g_futex_signal_seen != 0) {
+                _exit(0);
+            }
+            if (RC != 0 && RC != -ETIMEDOUT) {
+                _exit(1);
+            }
+        }
+        _exit(1);
+    }
+
+    close(ready[1]);
+    char byte = 0;
+    ssize_t const NR = read_expected_bytes_timeout(ready[0], &byte, 1, REMOTE_IPC_TIMEOUT_MS);
+    close(ready[0]);
+    if (NR != 1 || byte != 's') {
+        static_cast<void>(futex_wake_raw(futex_word));
+        int status = 0;
+        static_cast<void>(waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS));
+        munmap(futex_word, PAGE_SIZE);
+        fail("futex_signal_ready", "child did not enter futex signal test");
+        return;
+    }
+
+    int status = 0;
+    bool child_exited = false;
+    // The ready byte means the child is about to wait; short repeated windows
+    // keep the test focused on a signal that interrupts the futex wait itself.
+    for (int attempt = 0; attempt < 8 && !child_exited; ++attempt) {
+        pid_t wait_ret = waitpid(PID, &status, WNOHANG);
+        if (wait_ret == PID) {
+            child_exited = true;
+            break;
+        }
+        if (wait_ret < 0) {
+            static_cast<void>(futex_wake_raw(futex_word));
+            munmap(futex_word, PAGE_SIZE);
+            fail("futex_signal_waitpid", "waitpid(WNOHANG) failed");
+            return;
+        }
+
+        usleep(50000);
+        if (kill(PID, SIGUSR1) != 0) {  // NOLINT(misc-include-cleaner)
+            wait_ret = waitpid(PID, &status, WNOHANG);
+            if (wait_ret == PID) {
+                child_exited = true;
+                break;
+            }
+            static_cast<void>(futex_wake_raw(futex_word));
+            static_cast<void>(waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS));
+            munmap(futex_word, PAGE_SIZE);
+            fail("futex_signal_kill", "kill(SIGUSR1) failed");
+            return;
+        }
+
+        usleep(50000);
+        wait_ret = waitpid(PID, &status, WNOHANG);
+        if (wait_ret == PID) {
+            child_exited = true;
+            break;
+        }
+        if (wait_ret < 0) {
+            static_cast<void>(futex_wake_raw(futex_word));
+            munmap(futex_word, PAGE_SIZE);
+            fail("futex_signal_waitpid", "waitpid(WNOHANG) failed");
+            return;
+        }
+
+        static_cast<void>(futex_wake_raw(futex_word));
+    }
+
+    bool const WAIT_RET = child_exited || waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+    munmap(futex_word, PAGE_SIZE);
+    if (!WAIT_RET || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (WAIT_RET) {
+            errno = 0;
+        }
+        fail("futex_wait_interrupted_by_signal", "caught signal did not interrupt futex wait with EINTR");
+        return;
+    }
+    TESTD_PASS("futex_wait_interrupted_by_signal");
+}
+TESTD_RUN_END(test_futex_wait_interrupted_by_signal)
+
+TESTD_RUN(test_nanosleep_rejects_invalid_nsec) {
+    timespec invalid{
+        .tv_sec = 0,
+        .tv_nsec = 1000000000,
+    };
+    errno = 0;
+    int const RC = nanosleep(&invalid, nullptr);
+    if (RC != -1 || errno != EINVAL) {
+        fail("nanosleep_rejects_invalid_nsec", "nanosleep accepted tv_nsec outside [0, 1e9)");
+        return;
+    }
+    TESTD_PASS("nanosleep_rejects_invalid_nsec");
+}
+TESTD_RUN_END(test_nanosleep_rejects_invalid_nsec)
 
 TESTD_RUN(test_poll_pipe_timeout_and_wake) {
     std::array<int, 2> fds = {-1, -1};
@@ -973,18 +1828,62 @@ TESTD_RUN(test_poll_pipe_timeout_and_wake) {
     pfd.revents = 0;
     int const READY = poll(&pfd, 1, 1000);
     char got = 0;
-    ssize_t const NR = read(fds[0], &got, 1);
+    ssize_t const NR = read_expected_bytes_timeout(fds[0], &got, 1, REMOTE_IPC_TIMEOUT_MS);
     close(fds[0]);
 
     int status = 0;
-    waitpid(PID, &status, 0);
-    if (READY != 1 || (pfd.revents & POLLIN) == 0 || NR != 1 || got != BYTE || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+    if (READY != 1 || (pfd.revents & POLLIN) == 0 || NR != 1 || got != BYTE || !WAIT_RET || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
         fail("poll_pipe_wake", "poll did not wake on pipe readable");
         return;
     }
     TESTD_PASS("poll_pipe_timeout_and_wake");
 }
 TESTD_RUN_END(test_poll_pipe_timeout_and_wake)
+
+TESTD_RUN(test_poll_pipe_hup_on_writer_close) {
+    std::array<int, 2> fds = {-1, -1};
+    if (pipe(fds.data()) != 0) {
+        fail("poll_pipe_hup_create", "pipe failed");
+        return;
+    }
+
+    pid_t const PID = fork();
+    if (PID < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        fail("poll_pipe_hup_fork", "fork failed");
+        return;
+    }
+
+    if (PID == 0) {
+        close(fds[0]);
+        usleep(50000);
+        close(fds[1]);
+        _exit(0);
+    }
+
+    close(fds[1]);
+    struct pollfd pfd{
+        .fd = fds[0],
+        .events = POLLIN,
+        .revents = 0,
+    };
+    int const READY = poll(&pfd, 1, 1000);
+    char got = 0;
+    ssize_t const NR = read_expected_bytes_timeout(fds[0], &got, 1, REMOTE_IPC_TIMEOUT_MS);
+    close(fds[0]);
+
+    int status = 0;
+    bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+    if (READY != 1 || (pfd.revents & POLLHUP) == 0 || NR != 0 || !WAIT_RET || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("poll_pipe_hup_on_writer_close", "poll did not wake with HUP and EOF");
+        return;
+    }
+    TESTD_PASS("poll_pipe_hup_on_writer_close");
+}
+TESTD_RUN_END(test_poll_pipe_hup_on_writer_close)
 
 TESTD_RUN(test_epoll_pipe_timeout_and_wake) {
     std::array<int, 2> fds = {-1, -1};
@@ -1043,13 +1942,13 @@ TESTD_RUN(test_epoll_pipe_timeout_and_wake) {
     close(fds[1]);
     int const READY = epoll_wait(EPFD, &out, 1, 1000);
     char got = 0;
-    ssize_t const NR = read(fds[0], &got, 1);
+    ssize_t const NR = read_expected_bytes_timeout(fds[0], &got, 1, REMOTE_IPC_TIMEOUT_MS);
     close(EPFD);
     close(fds[0]);
 
     int status = 0;
-    waitpid(PID, &status, 0);
-    if (READY != 1 || out.data.fd != fds[0] || (out.events & EPOLLIN) == 0 || NR != 1 || got != BYTE || !WIFEXITED(status) ||
+    bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+    if (READY != 1 || out.data.fd != fds[0] || (out.events & EPOLLIN) == 0 || NR != 1 || got != BYTE || !WAIT_RET || !WIFEXITED(status) ||
         WEXITSTATUS(status) != 0) {
         fail("epoll_pipe_wake", "epoll did not wake on pipe readable");
         return;
@@ -1057,6 +1956,68 @@ TESTD_RUN(test_epoll_pipe_timeout_and_wake) {
     TESTD_PASS("epoll_pipe_timeout_and_wake");
 }
 TESTD_RUN_END(test_epoll_pipe_timeout_and_wake)
+
+TESTD_RUN(test_epoll_pipe_hup_on_writer_close) {
+    std::array<int, 2> fds = {-1, -1};
+    if (pipe(fds.data()) != 0) {
+        fail("epoll_pipe_hup_create", "pipe failed");
+        return;
+    }
+
+    int const EPFD = epoll_create1(0);
+    if (EPFD < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        fail("epoll_pipe_hup_create1", "epoll_create1 failed");
+        return;
+    }
+
+    struct epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = fds[0];
+    if (epoll_ctl(EPFD, EPOLL_CTL_ADD, fds[0], &ev) != 0) {
+        close(EPFD);
+        close(fds[0]);
+        close(fds[1]);
+        fail("epoll_pipe_hup_ctl", "epoll_ctl failed");
+        return;
+    }
+
+    pid_t const PID = fork();
+    if (PID < 0) {
+        close(EPFD);
+        close(fds[0]);
+        close(fds[1]);
+        fail("epoll_pipe_hup_fork", "fork failed");
+        return;
+    }
+
+    if (PID == 0) {
+        close(EPFD);
+        close(fds[0]);
+        usleep(50000);
+        close(fds[1]);
+        _exit(0);
+    }
+
+    close(fds[1]);
+    struct epoll_event out{};
+    int const READY = epoll_wait(EPFD, &out, 1, 1000);
+    char got = 0;
+    ssize_t const NR = read_expected_bytes_timeout(fds[0], &got, 1, REMOTE_IPC_TIMEOUT_MS);
+    close(EPFD);
+    close(fds[0]);
+
+    int status = 0;
+    bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+    if (READY != 1 || out.data.fd != fds[0] || (out.events & EPOLLHUP) == 0 || NR != 0 || !WAIT_RET || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+        fail("epoll_pipe_hup_on_writer_close", "epoll did not wake with HUP and EOF");
+        return;
+    }
+    TESTD_PASS("epoll_pipe_hup_on_writer_close");
+}
+TESTD_RUN_END(test_epoll_pipe_hup_on_writer_close)
 
 TESTD_RUN(test_pty_blocking_read_wake) {
     int const MASTER_FD = open("/dev/ptmx", O_RDWR);
@@ -1080,7 +2041,7 @@ TESTD_RUN(test_pty_blocking_read_wake) {
     }
 
     std::array<char, 32> slave_path{};
-    std::snprintf(slave_path.data(), slave_path.size(), "/dev/pts/%u", pty_num);
+    (void)testd_format_to_array(slave_path, "/dev/pts/%u", pty_num);
     int const SLAVE_FD = open(slave_path.data(), O_RDWR);
     if (SLAVE_FD < 0) {
         close(MASTER_FD);
@@ -1117,9 +2078,9 @@ TESTD_RUN(test_pty_blocking_read_wake) {
     close(MASTER_FD);
 
     int status = 0;
-    waitpid(PID, &status, 0);
-    if (std::cmp_not_equal(NR, MSG.size()) || std::string_view(buf.data(), static_cast<size_t>(NR)) != MSG || !WIFEXITED(status) ||
-        WEXITSTATUS(status) != 0) {
+    bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+    if (std::cmp_not_equal(NR, MSG.size()) || std::string_view(buf.data(), static_cast<size_t>(NR)) != MSG || !WAIT_RET ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         fail("pty_blocking_read_wake", "blocking PTY read did not wake with payload");
         return;
     }
@@ -1144,8 +2105,8 @@ TESTD_RUN(test_fork_exit) {
     }
 
     int status = 0;
-    pid_t const WPID = waitpid(PID, &status, 0);
-    if (WPID != PID) {
+    bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+    if (!WAIT_RET) {
         fail("fork_waitpid", "wrong pid from waitpid");
         return;
     }
@@ -1156,6 +2117,100 @@ TESTD_RUN(test_fork_exit) {
     TESTD_PASS("fork_exit");
 }
 TESTD_RUN_END(test_fork_exit)
+
+TESTD_RUN(test_waitpid_exit_before_park_race) {
+    constexpr int ITERATIONS = 64;
+    for (int i = 0; i < ITERATIONS; ++i) {
+        pid_t const PID = fork();
+        if (PID < 0) {
+            fail("waitpid_exit_before_park_fork", "fork failed");
+            return;
+        }
+
+        constexpr int EXIT_BASE = 17;
+        int const EXPECTED_EXIT = EXIT_BASE + (i & 0x07);
+        if (PID == 0) {
+            _exit(EXPECTED_EXIT);
+        }
+
+        int status = 0;
+        bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+        if (!WAIT_RET || !WIFEXITED(status) || WEXITSTATUS(status) != EXPECTED_EXIT) {
+            fail("waitpid_exit_before_park_race", "waitpid missed immediate child exit or returned wrong status");
+            return;
+        }
+    }
+    TESTD_PASS("waitpid_exit_before_park_race");
+}
+TESTD_RUN_END(test_waitpid_exit_before_park_race)
+
+TESTD_RUN(test_waitpid_any_exit_before_park_race) {
+    constexpr int ITERATIONS = 64;
+    for (int i = 0; i < ITERATIONS; ++i) {
+        pid_t const PID = fork();
+        if (PID < 0) {
+            fail("waitpid_any_exit_before_park_fork", "fork failed");
+            return;
+        }
+
+        constexpr int EXIT_BASE = 29;
+        int const EXPECTED_EXIT = EXIT_BASE + (i & 0x07);
+        if (PID == 0) {
+            _exit(EXPECTED_EXIT);
+        }
+
+        int status = 0;
+        pid_t const WPID = waitpid_any_timeout(&status, REMOTE_IPC_TIMEOUT_MS);
+        if (WPID != PID || !WIFEXITED(status) || WEXITSTATUS(status) != EXPECTED_EXIT) {
+            fail("waitpid_any_exit_before_park_race", "waitpid(-1) missed immediate child exit or returned wrong status");
+            return;
+        }
+    }
+    TESTD_PASS("waitpid_any_exit_before_park_race");
+}
+TESTD_RUN_END(test_waitpid_any_exit_before_park_race)
+
+TESTD_RUN(test_waitpid_any_multi_child_drain) {
+    constexpr size_t CHILDREN = 8;
+    std::array<pid_t, CHILDREN> pids{};
+    std::array<bool, CHILDREN> reaped{};
+
+    for (size_t i = 0; i < CHILDREN; ++i) {
+        pid_t const PID = fork();
+        if (PID < 0) {
+            fail("waitpid_any_multi_child_drain_fork", "fork failed");
+            return;
+        }
+        if (PID == 0) {
+            _exit(static_cast<int>(40 + i));
+        }
+        pids.at(i) = PID;
+    }
+
+    for (size_t reap = 0; reap < CHILDREN; ++reap) {
+        int status = 0;
+        pid_t const WPID = waitpid_any_timeout(&status, REMOTE_IPC_TIMEOUT_MS);
+        bool matched = false;
+        for (size_t i = 0; i < CHILDREN; ++i) {
+            if (pids.at(i) == WPID && !reaped.at(i)) {
+                if (!WIFEXITED(status) || WEXITSTATUS(status) != static_cast<int>(40 + i)) {
+                    fail("waitpid_any_multi_child_drain_status", "waitpid(-1) returned wrong child status");
+                    return;
+                }
+                reaped.at(i) = true;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            fail("waitpid_any_multi_child_drain_pid", "waitpid(-1) returned duplicate or unknown child pid");
+            return;
+        }
+    }
+
+    TESTD_PASS("waitpid_any_multi_child_drain");
+}
+TESTD_RUN_END(test_waitpid_any_multi_child_drain)
 
 // Fork: child writes a single byte; parent verifies byte value and count.
 TESTD_RUN(test_fork_pipe_byte) {
@@ -1180,20 +2235,25 @@ TESTD_RUN(test_fork_pipe_byte) {
     }
     close(fds[1]);
     char b = 0;
-    ssize_t nr = read(fds[0], &b, 1);
+    ssize_t nr = read_expected_bytes_timeout(fds[0], &b, 1, REMOTE_IPC_TIMEOUT_MS);
     int read_errno = errno;
     close(fds[0]);
     int close_errno = errno;
-    pid_t wait_ret = waitpid(PID, nullptr, 0);
+    int status = 0;
+    bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
     int wait_errno = errno;
     if (nr != 1) {
         testd_logf("[TESTD] DBG fork_pipe_byte: nr=%zd read_errno=%d b=0x%x close_errno=%d wait_ret=%d wait_errno=%d", nr, read_errno,
-                   static_cast<unsigned>(static_cast<unsigned char>(b)), close_errno, static_cast<int>(wait_ret), wait_errno);
+                   static_cast<unsigned>(static_cast<unsigned char>(b)), close_errno, static_cast<int>(WAIT_RET), wait_errno);
         fail("fork_pipe_byte_count", "read returned wrong count");
         return;
     }
     if (b != BYTE) {
         fail("fork_pipe_byte_val", "wrong byte value");
+        return;
+    }
+    if (!WAIT_RET || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("fork_pipe_byte_exit", "child did not exit cleanly");
         return;
     }
     TESTD_PASS("fork_pipe_byte");
@@ -1227,17 +2287,17 @@ TESTD_RUN(test_fork_pipe_communication) {
     // Parent: read from pipe
     close(fds[1]);
     std::array<char, 16> buf{};
-    ssize_t const NR = read(fds[0], buf.data(), buf.size());
+    ssize_t const NR = read_expected_bytes_timeout(fds[0], buf.data(), MSG.size(), REMOTE_IPC_TIMEOUT_MS);
     close(fds[0]);
 
     int status = 0;
-    waitpid(PID, &status, 0);
+    bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
 
     if (std::cmp_not_equal(NR, MSG.size()) || std::string_view(buf.data(), static_cast<size_t>(NR)) != MSG) {
         fail("fork_pipe_data", "data mismatch");
         return;
     }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    if (!WAIT_RET || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         fail("fork_child_exit", "bad exit status");
         return;
     }
@@ -1263,8 +2323,8 @@ TESTD_RUN(test_fork_multiple) {
     bool all_ok = true;
     for (int i = 0; i < N; ++i) {
         int status = 0;
-        pid_t const WPID = waitpid(pids[i], &status, 0);
-        if (WPID != pids[i] || !WIFEXITED(status) || WEXITSTATUS(status) != (i + 1)) {
+        bool const WAIT_RET = waitpid_timeout(pids[i], &status, REMOTE_IPC_TIMEOUT_MS);
+        if (!WAIT_RET || !WIFEXITED(status) || WEXITSTATUS(status) != (i + 1)) {
             all_ok = false;
         }
     }
@@ -1447,7 +2507,7 @@ void tcp_echo_server(int ready_fd) {
         close(ready_fd);
     }
 
-    int const CLI = accept(SRV, nullptr, nullptr);
+    int const CLI = accept_timeout(SRV, nullptr, nullptr, REMOTE_IPC_TIMEOUT_MS);
     if (CLI < 0) {
         close(SRV);
         _exit(4);
@@ -1457,14 +2517,11 @@ void tcp_echo_server(int ready_fd) {
     std::array<char, 512> buf{};
     ssize_t n = 0;
     int recv_errno = 0;
-    while ((n = recv_retry(CLI, buf.data(), buf.size(), 0)) > 0) {
-        ssize_t sent = 0;
-        while (sent < n) {
-            ssize_t const S = send(CLI, buf.data() + sent, static_cast<size_t>(n - sent), 0);
-            if (S <= 0) {
-                break;
-            }
-            sent += S;
+    while ((n = recv_once_timeout(CLI, buf.data(), buf.size(), 0, REMOTE_IPC_TIMEOUT_MS)) > 0) {
+        ssize_t const SENT = send_all_timeout(CLI, buf.data(), static_cast<size_t>(n), 0, REMOTE_IPC_TIMEOUT_MS);
+        if (SENT != n) {
+            n = -1;
+            break;
         }
     }
     if (n < 0) {
@@ -1503,13 +2560,20 @@ TESTD_RUN(test_tcp_loopback) {
 
     // Block until server signals it is listening
     char byte = 0;
-    read(ready_pipe[0], &byte, 1);
+    ssize_t const READY_NR = read_expected_bytes_timeout(ready_pipe[0], &byte, 1, REMOTE_IPC_TIMEOUT_MS);
     close(ready_pipe[0]);
+    if (READY_NR != 1 || byte != 1) {
+        int status = 0;
+        (void)waitpid_timeout(SRV_PID, &status, REMOTE_IPC_TIMEOUT_MS);
+        fail("tcp_ready_signal", "server did not signal listen readiness");
+        return;
+    }
 
     // Connect as client
     int const CLI = socket(AF_INET, SOCK_STREAM, 0);
     if (CLI < 0) {
-        waitpid(SRV_PID, nullptr, 0);
+        int status = 0;
+        (void)waitpid_timeout(SRV_PID, &status, REMOTE_IPC_TIMEOUT_MS);
         fail("tcp_client_socket", "socket failed");
         return;
     }
@@ -1519,9 +2583,10 @@ TESTD_RUN(test_tcp_loopback) {
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(TESTD_TCP_PORT);
 
-    if (connect(CLI, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+    if (connect_timeout(CLI, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr), REMOTE_IPC_TIMEOUT_MS) != 0) {
         close(CLI);
-        waitpid(SRV_PID, nullptr, 0);
+        int status = 0;
+        (void)waitpid_timeout(SRV_PID, &status, REMOTE_IPC_TIMEOUT_MS);
         fail("tcp_connect", "connect failed");
         return;
     }
@@ -1535,18 +2600,12 @@ TESTD_RUN(test_tcp_loopback) {
         send_buf[i] = static_cast<char>(i & PATTERN_MASK);
     }
 
-    ssize_t total_sent = 0;
-    while (std::cmp_less(total_sent, DATA_SIZE)) {
-        ssize_t const S = send(CLI, send_buf.data() + total_sent, static_cast<size_t>(DATA_SIZE) - static_cast<size_t>(total_sent), 0);
-        if (S <= 0) {
-            break;
-        }
-        total_sent += S;
-    }
+    ssize_t const TOTAL_SENT = send_all_timeout(CLI, send_buf.data(), DATA_SIZE, 0, REMOTE_IPC_TIMEOUT_MS);
 
-    if (std::cmp_not_equal(total_sent, DATA_SIZE)) {
+    if (std::cmp_not_equal(TOTAL_SENT, DATA_SIZE)) {
         close(CLI);
-        waitpid(SRV_PID, nullptr, 0);
+        int status = 0;
+        (void)waitpid_timeout(SRV_PID, &status, REMOTE_IPC_TIMEOUT_MS);
         fail("tcp_send", "short send");
         return;
     }
@@ -1554,30 +2613,22 @@ TESTD_RUN(test_tcp_loopback) {
 
     // Receive echoed data
     std::array<char, DATA_SIZE> recv_buf{};
-    ssize_t total_recv = 0;
-    ssize_t last_recv = 0;
-    int last_recv_errno = 0;
     shutdown(CLI, SHUT_WR);  // signal EOF to server
-    while (std::cmp_less(total_recv, DATA_SIZE)) {
-        ssize_t const N =
-            recv_retry(CLI, recv_buf.data() + total_recv, static_cast<size_t>(DATA_SIZE) - static_cast<size_t>(total_recv), 0);
-        last_recv = N;
-        if (N < 0) {
-            last_recv_errno = errno;
-        }
-        if (N <= 0) {
-            break;
-        }
-        total_recv += N;
-    }
+    ssize_t const TOTAL_RECV = recv_expected_bytes_timeout(CLI, recv_buf.data(), DATA_SIZE, REMOTE_IPC_TIMEOUT_MS);
+    int const LAST_RECV_ERRNO = errno;
     close(CLI);
 
     int srv_status = 0;
-    waitpid(SRV_PID, &srv_status, 0);
+    bool const SERVER_EXITED = waitpid_timeout(SRV_PID, &srv_status, REMOTE_IPC_TIMEOUT_MS);
 
-    if (std::cmp_not_equal(total_recv, DATA_SIZE)) {
-        testd_logf("[TESTD] INFO: tcp_recv short total_recv=%zd expected=%d last_recv=%zd errno=%d srv_status=%d", total_recv, DATA_SIZE,
-                   last_recv, last_recv_errno, srv_status);
+    if (!SERVER_EXITED) {
+        testd_logf("[TESTD] INFO: tcp_server_exit timed out status=%d errno=%d", srv_status, errno);
+        fail("tcp_server_exit", "server did not exit after loopback exchange");
+        return;
+    }
+    if (std::cmp_not_equal(TOTAL_RECV, DATA_SIZE)) {
+        testd_logf("[TESTD] INFO: tcp_recv short total_recv=%zd expected=%d errno=%d srv_status=%d", TOTAL_RECV, DATA_SIZE, LAST_RECV_ERRNO,
+                   srv_status);
         fail("tcp_recv", "short recv");
         return;
     }
@@ -1603,7 +2654,7 @@ TESTD_RUN(test_tcp_nonblocking_connect_refused) {
     addr.sin_port = htons(TCP_PORT);  // no server on this port
 
     // Blocking connect to a closed port must fail with ECONNREFUSED
-    int const RC = connect(FD, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+    int const RC = connect_timeout(FD, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr), REMOTE_IPC_TIMEOUT_MS);
     int saved_errno = errno;
     close(FD);
 
@@ -1771,11 +2822,14 @@ TESTD_RUN(test_remote_ipc_pipe_child_write) {
     close(fds[1]);
 
     std::array<char, 64> buf{};
-    ssize_t const NR = read(fds[0], buf.data(), buf.size() - 1);
+    ssize_t const NR = read_expected_bytes(fds[0], buf.data(), RH_PIPE_WRITE_MSG.size());
     close(fds[0]);
 
     int status = 0;
-    waitpid(PID, &status, 0);
+    if (!waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)) {
+        fail("remote_pipe_child_exit", "child timed out or waitpid failed");
+        return;
+    }
 
     if (std::cmp_not_equal(NR, RH_PIPE_WRITE_MSG.size()) || std::string_view(buf.data(), static_cast<size_t>(NR)) != RH_PIPE_WRITE_MSG) {
         fail("remote_pipe_child_write", "data mismatch or short read");
@@ -1814,7 +2868,10 @@ TESTD_RUN(test_remote_ipc_pipe_parent_write) {
     close(fds[1]);
 
     int status = 0;
-    waitpid(PID, &status, 0);
+    if (!waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)) {
+        fail("remote_pipe_parent_write", "child timed out or waitpid failed");
+        return;
+    }
 
     if (std::cmp_not_equal(NW, RH_PIPE_READ_EXPECT.size())) {
         fail("remote_pipe_parent_write", "short write");
@@ -1852,7 +2909,7 @@ TESTD_RUN(test_remote_ipc_pty_child_write) {
     }
 
     std::array<char, 32> slave_path{};
-    std::snprintf(slave_path.data(), slave_path.size(), "/dev/pts/%u", pty_num);
+    (void)testd_format_to_array(slave_path, "/dev/pts/%u", pty_num);
     int const SLAVE_FD = open(slave_path.data(), O_RDWR);
     if (SLAVE_FD < 0) {
         close(MASTER_FD);
@@ -1883,7 +2940,11 @@ TESTD_RUN(test_remote_ipc_pty_child_write) {
     ssize_t const N = read_expected_bytes(MASTER_FD, buf.data(), RH_PTY_WRITE_MSG.size());
 
     int status = 0;
-    waitpid(PID, &status, 0);
+    if (!waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)) {
+        close(MASTER_FD);
+        fail("remote_pty_child_exit", "child timed out or waitpid failed");
+        return;
+    }
     close(MASTER_FD);
 
     if (std::cmp_not_equal(N, RH_PTY_WRITE_MSG.size()) || std::string_view(buf.data(), static_cast<size_t>(N)) != RH_PTY_WRITE_MSG) {
@@ -1926,7 +2987,7 @@ TESTD_RUN(test_remote_ipc_pty_ioctl) {
     }
 
     std::array<char, 32> slave_path{};
-    std::snprintf(slave_path.data(), slave_path.size(), "/dev/pts/%u", pty_num);
+    (void)testd_format_to_array(slave_path, "/dev/pts/%u", pty_num);
     int const SLAVE_FD = open(slave_path.data(), O_RDWR);
     if (SLAVE_FD < 0) {
         close(MASTER_FD);
@@ -1948,7 +3009,11 @@ TESTD_RUN(test_remote_ipc_pty_ioctl) {
     close(SLAVE_FD);
 
     int status = 0;
-    waitpid(PID, &status, 0);
+    if (!waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)) {
+        close(MASTER_FD);
+        fail("remote_pty_ioctl", "child timed out or waitpid failed");
+        return;
+    }
     close(MASTER_FD);
 
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
@@ -1998,14 +3063,14 @@ TESTD_RUN(test_remote_ipc_socket_child_write) {
         fail("remote_sock_client_socket", "socket failed");
         return;
     }
-    if (connect(CLIENT_FD, reinterpret_cast<struct sockaddr*>(&got_addr), sizeof(got_addr)) != 0) {
+    if (connect_timeout(CLIENT_FD, reinterpret_cast<struct sockaddr*>(&got_addr), sizeof(got_addr), REMOTE_IPC_TIMEOUT_MS) != 0) {
         close(CLIENT_FD);
         close(LISTEN_FD);
         fail("remote_sock_connect", "connect failed");
         return;
     }
 
-    int const SERVER_FD = accept(LISTEN_FD, nullptr, nullptr);
+    int const SERVER_FD = accept_timeout(LISTEN_FD, nullptr, nullptr, REMOTE_IPC_TIMEOUT_MS);
     close(LISTEN_FD);
     if (SERVER_FD < 0) {
         close(CLIENT_FD);
@@ -2031,7 +3096,10 @@ TESTD_RUN(test_remote_ipc_socket_child_write) {
     close(SERVER_FD);
 
     int status = 0;
-    waitpid(PID, &status, 0);
+    if (!waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)) {
+        fail("remote_sock_child_exit", "child timed out or waitpid failed");
+        return;
+    }
 
     if (std::cmp_not_equal(NR, RH_SOCKET_WRITE_MSG.size()) ||
         std::string_view(recv_buf.data(), static_cast<size_t>(NR)) != RH_SOCKET_WRITE_MSG) {
@@ -2086,14 +3154,14 @@ TESTD_RUN(test_remote_ipc_socket_control_ops) {
         fail("remote_sock_ctrl_client_socket", "socket failed");
         return;
     }
-    if (connect(CLIENT_FD, reinterpret_cast<struct sockaddr*>(&got_addr), sizeof(got_addr)) != 0) {
+    if (connect_timeout(CLIENT_FD, reinterpret_cast<struct sockaddr*>(&got_addr), sizeof(got_addr), REMOTE_IPC_TIMEOUT_MS) != 0) {
         close(CLIENT_FD);
         close(LISTEN_FD);
         fail("remote_sock_ctrl_connect", "connect failed");
         return;
     }
 
-    int const SERVER_FD = accept(LISTEN_FD, nullptr, nullptr);
+    int const SERVER_FD = accept_timeout(LISTEN_FD, nullptr, nullptr, REMOTE_IPC_TIMEOUT_MS);
     close(LISTEN_FD);
     if (SERVER_FD < 0) {
         close(CLIENT_FD);
@@ -2102,7 +3170,7 @@ TESTD_RUN(test_remote_ipc_socket_control_ops) {
     }
 
     std::array<char, 16> port_buf{};
-    std::snprintf(port_buf.data(), port_buf.size(), "%u", static_cast<unsigned>(ntohs(got_addr.sin_port)));
+    (void)testd_format_to_array(port_buf, "%u", static_cast<unsigned>(ntohs(got_addr.sin_port)));
 
     ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
     pid_t const PID = spawn_remote_helper_arg("sock-ctrl", CLIENT_FD, SERVER_FD, port_buf.data());
@@ -2118,11 +3186,14 @@ TESTD_RUN(test_remote_ipc_socket_control_ops) {
     close(CLIENT_FD);
 
     char eof_probe = 0;
-    ssize_t const NR = recv_retry(SERVER_FD, &eof_probe, sizeof(eof_probe), 0);
+    ssize_t const NR = recv_once_timeout(SERVER_FD, &eof_probe, sizeof(eof_probe), 0, REMOTE_IPC_TIMEOUT_MS);
     close(SERVER_FD);
 
     int status = 0;
-    waitpid(PID, &status, 0);
+    if (!waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)) {
+        fail("remote_sock_ctrl_ops", "child timed out or waitpid failed");
+        return;
+    }
 
     if (NR != 0) {
         fail("remote_sock_ctrl_shutdown", "expected EOF after remote shutdown");
@@ -2136,11 +3207,130 @@ TESTD_RUN(test_remote_ipc_socket_control_ops) {
 }
 TESTD_RUN_END(test_remote_ipc_socket_control_ops)
 
-// Remote child blocks in epoll_wait() on an inherited IPC pipe proxy and wakes on parent write.
-TESTD_RUN(test_remote_ipc_epoll_wait_pipe_readable) {
+// Remote child blocks in poll() on an inherited IPC pipe proxy and wakes on parent write.
+TESTD_RUN(test_remote_ipc_poll_wait_pipe_readable) {
     std::array<int, 2> pipe_fds = {-1, -1};
     if (pipe(pipe_fds.data()) != 0) {
-        fail("remote_epoll_wait_pipe", "pipe failed");
+        fail("remote_poll_wait_pipe", "pipe failed");
+        return;
+    }
+    std::array<int, 2> ready_pipe = {-1, -1};
+    if (pipe(ready_pipe.data()) != 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        fail("remote_poll_wait_ready_pipe", "ready pipe failed");
+        return;
+    }
+
+    ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    pid_t const PID = spawn_remote_wait_helper("poll-wait", pipe_fds[0], pipe_fds[1], ready_pipe[1], ready_pipe[0]);
+    ker::process::setwkitarget(nullptr, 0, 0);
+
+    close(pipe_fds[0]);
+    close(ready_pipe[1]);
+
+    if (PID < 0) {
+        close(pipe_fds[1]);
+        close(ready_pipe[0]);
+        fail("remote_poll_wait_fork", "fork failed");
+        return;
+    }
+
+    if (!wait_remote_waiter_ready(ready_pipe[0])) {
+        close(pipe_fds[1]);
+        close(ready_pipe[0]);
+        int status = 0;
+        (void)waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+        fail("remote_poll_wait_ready", "remote poll helper did not reach wait point");
+        return;
+    }
+    close(ready_pipe[0]);
+
+    std::string_view const MSG = "P";
+    if (write(pipe_fds[1], MSG.data(), MSG.size()) != static_cast<ssize_t>(MSG.size())) {
+        close(pipe_fds[1]);
+        int status = 0;
+        (void)waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+        fail("remote_poll_wait_write", "write failed");
+        return;
+    }
+    close(pipe_fds[1]);
+
+    int status = 0;
+    if (!waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)) {
+        fail("remote_poll_wait_child", "remote poll child timed out or waitpid failed");
+        return;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("remote_poll_wait_child", "remote poll child failed");
+        return;
+    }
+
+    TESTD_PASS("remote_ipc_poll_wait_pipe_readable");
+}
+TESTD_RUN_END(test_remote_ipc_poll_wait_pipe_readable)
+
+// Remote child blocks in poll() on an inherited IPC pipe proxy and wakes with
+// HUP/EOF when the home-side writer closes without sending data.
+TESTD_RUN(test_remote_ipc_poll_wait_pipe_hup) {
+    std::array<int, 2> pipe_fds = {-1, -1};
+    if (pipe(pipe_fds.data()) != 0) {
+        fail("remote_poll_hup_pipe", "pipe failed");
+        return;
+    }
+    std::array<int, 2> ready_pipe = {-1, -1};
+    if (pipe(ready_pipe.data()) != 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        fail("remote_poll_hup_ready_pipe", "ready pipe failed");
+        return;
+    }
+
+    ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    pid_t const PID = spawn_remote_wait_helper("poll-wait-hup", pipe_fds[0], pipe_fds[1], ready_pipe[1], ready_pipe[0]);
+    ker::process::setwkitarget(nullptr, 0, 0);
+
+    close(pipe_fds[0]);
+    close(ready_pipe[1]);
+
+    if (PID < 0) {
+        close(pipe_fds[1]);
+        close(ready_pipe[0]);
+        fail("remote_poll_hup_fork", "fork failed");
+        return;
+    }
+
+    if (!wait_remote_waiter_ready(ready_pipe[0])) {
+        close(pipe_fds[1]);
+        close(ready_pipe[0]);
+        int status = 0;
+        (void)waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+        fail("remote_poll_hup_ready", "remote poll HUP helper did not reach wait point");
+        return;
+    }
+    close(ready_pipe[0]);
+    close(pipe_fds[1]);
+
+    int status = 0;
+    if (!waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)) {
+        fail("remote_poll_hup_child", "remote poll HUP child timed out or waitpid failed");
+        return;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("remote_poll_hup_child", "remote poll HUP child failed");
+        return;
+    }
+
+    TESTD_PASS("remote_ipc_poll_wait_pipe_hup");
+}
+TESTD_RUN_END(test_remote_ipc_poll_wait_pipe_hup)
+
+// Remote poll waiter must still observe HUP/EOF when the home-side writer is
+// already closed before the helper has definitely registered its waiter.
+TESTD_RUN(test_remote_ipc_poll_pipe_preclosed_hup) {
+    std::array<int, 2> pipe_fds = {-1, -1};
+    if (pipe(pipe_fds.data()) != 0) {
+        fail("remote_poll_preclosed_hup_pipe", "pipe failed");
         return;
     }
 
@@ -2150,11 +3340,11 @@ TESTD_RUN(test_remote_ipc_epoll_wait_pipe_readable) {
         close(pipe_fds[1]);
 
         std::array<char, 16> fd_str{};
-        std::snprintf(fd_str.data(), fd_str.size(), "%d", pipe_fds[0]);
+        (void)testd_format_to_array(fd_str, "%d", pipe_fds[0]);
 
         auto exec_path = std::to_array("/usr/bin/testd");
         auto rh_flag = std::to_array("--rh");
-        auto mode_buf = std::to_array("epoll-wait");
+        auto mode_buf = std::to_array("poll-preclosed-hup");
         std::array<char*, 5> child_argv = {
             exec_path.data(), rh_flag.data(), mode_buf.data(), fd_str.data(), nullptr,
         };
@@ -2167,26 +3357,144 @@ TESTD_RUN(test_remote_ipc_epoll_wait_pipe_readable) {
 
     if (PID < 0) {
         close(pipe_fds[1]);
+        fail("remote_poll_preclosed_hup_fork", "fork failed");
+        return;
+    }
+
+    close(pipe_fds[1]);
+
+    int status = 0;
+    if (!waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)) {
+        fail("remote_poll_preclosed_hup_child", "remote preclosed poll HUP child timed out or waitpid failed");
+        return;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("remote_poll_preclosed_hup_child", "remote preclosed poll HUP child failed");
+        return;
+    }
+
+    TESTD_PASS("remote_ipc_poll_pipe_preclosed_hup");
+}
+TESTD_RUN_END(test_remote_ipc_poll_pipe_preclosed_hup)
+
+// Remote child must not lose data when the home-side writer sends one byte and
+// then closes. This guards pending-data versus close ordering.
+TESTD_RUN(test_remote_ipc_poll_pipe_read_then_hup) {
+    std::array<int, 2> pipe_fds = {-1, -1};
+    if (pipe(pipe_fds.data()) != 0) {
+        fail("remote_poll_drain_hup_pipe", "pipe failed");
+        return;
+    }
+    std::array<int, 2> ready_pipe = {-1, -1};
+    if (pipe(ready_pipe.data()) != 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        fail("remote_poll_drain_hup_ready_pipe", "ready pipe failed");
+        return;
+    }
+
+    ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    pid_t const PID = spawn_remote_wait_helper("poll-drain-hup", pipe_fds[0], pipe_fds[1], ready_pipe[1], ready_pipe[0]);
+    ker::process::setwkitarget(nullptr, 0, 0);
+
+    close(pipe_fds[0]);
+    close(ready_pipe[1]);
+
+    if (PID < 0) {
+        close(pipe_fds[1]);
+        close(ready_pipe[0]);
+        fail("remote_poll_drain_hup_fork", "fork failed");
+        return;
+    }
+
+    if (!wait_remote_waiter_ready(ready_pipe[0])) {
+        close(pipe_fds[1]);
+        close(ready_pipe[0]);
+        int status = 0;
+        (void)waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+        fail("remote_poll_drain_hup_ready", "remote poll drain/HUP helper did not reach wait point");
+        return;
+    }
+    close(ready_pipe[0]);
+
+    std::string_view const MSG = "D";
+    if (write(pipe_fds[1], MSG.data(), MSG.size()) != static_cast<ssize_t>(MSG.size())) {
+        close(pipe_fds[1]);
+        int status = 0;
+        (void)waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+        fail("remote_poll_drain_hup_write", "write failed");
+        return;
+    }
+    close(pipe_fds[1]);
+
+    int status = 0;
+    if (!waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)) {
+        fail("remote_poll_drain_hup_child", "remote poll drain/HUP child timed out or waitpid failed");
+        return;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("remote_poll_drain_hup_child", "remote poll drain/HUP child failed");
+        return;
+    }
+
+    TESTD_PASS("remote_ipc_poll_pipe_read_then_hup");
+}
+TESTD_RUN_END(test_remote_ipc_poll_pipe_read_then_hup)
+
+// Remote child blocks in epoll_wait() on an inherited IPC pipe proxy and wakes on parent write.
+TESTD_RUN(test_remote_ipc_epoll_wait_pipe_readable) {
+    std::array<int, 2> pipe_fds = {-1, -1};
+    if (pipe(pipe_fds.data()) != 0) {
+        fail("remote_epoll_wait_pipe", "pipe failed");
+        return;
+    }
+    std::array<int, 2> ready_pipe = {-1, -1};
+    if (pipe(ready_pipe.data()) != 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        fail("remote_epoll_wait_ready_pipe", "ready pipe failed");
+        return;
+    }
+
+    ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    pid_t const PID = spawn_remote_wait_helper("epoll-wait", pipe_fds[0], pipe_fds[1], ready_pipe[1], ready_pipe[0]);
+    ker::process::setwkitarget(nullptr, 0, 0);
+
+    close(pipe_fds[0]);
+    close(ready_pipe[1]);
+
+    if (PID < 0) {
+        close(pipe_fds[1]);
+        close(ready_pipe[0]);
         fail("remote_epoll_wait_fork", "fork failed");
         return;
     }
 
-    // Give the remote helper a short head start so it can enter epoll_wait()
-    // before we make the pipe readable.
-    usleep(200000);
+    if (!wait_remote_waiter_ready(ready_pipe[0])) {
+        close(pipe_fds[1]);
+        close(ready_pipe[0]);
+        int status = 0;
+        (void)waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+        fail("remote_epoll_wait_ready", "remote epoll helper did not reach wait point");
+        return;
+    }
+    close(ready_pipe[0]);
 
     std::string_view const MSG = "E";
     if (write(pipe_fds[1], MSG.data(), MSG.size()) != static_cast<ssize_t>(MSG.size())) {
         close(pipe_fds[1]);
         int status = 0;
-        waitpid(PID, &status, 0);
+        (void)waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
         fail("remote_epoll_wait_write", "write failed");
         return;
     }
     close(pipe_fds[1]);
 
     int status = 0;
-    waitpid(PID, &status, 0);
+    if (!waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)) {
+        fail("remote_epoll_wait_child", "remote epoll_wait child timed out or waitpid failed");
+        return;
+    }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         fail("remote_epoll_wait_child", "remote epoll_wait child failed");
         return;
@@ -2195,6 +3503,177 @@ TESTD_RUN(test_remote_ipc_epoll_wait_pipe_readable) {
     TESTD_PASS("remote_ipc_epoll_wait_pipe_readable");
 }
 TESTD_RUN_END(test_remote_ipc_epoll_wait_pipe_readable)
+
+// Remote child blocks in epoll_wait() on an inherited IPC pipe proxy and wakes
+// with HUP/EOF when the home-side writer closes without sending data.
+TESTD_RUN(test_remote_ipc_epoll_wait_pipe_hup) {
+    std::array<int, 2> pipe_fds = {-1, -1};
+    if (pipe(pipe_fds.data()) != 0) {
+        fail("remote_epoll_hup_pipe", "pipe failed");
+        return;
+    }
+    std::array<int, 2> ready_pipe = {-1, -1};
+    if (pipe(ready_pipe.data()) != 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        fail("remote_epoll_hup_ready_pipe", "ready pipe failed");
+        return;
+    }
+
+    ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    pid_t const PID = spawn_remote_wait_helper("epoll-wait-hup", pipe_fds[0], pipe_fds[1], ready_pipe[1], ready_pipe[0]);
+    ker::process::setwkitarget(nullptr, 0, 0);
+
+    close(pipe_fds[0]);
+    close(ready_pipe[1]);
+
+    if (PID < 0) {
+        close(pipe_fds[1]);
+        close(ready_pipe[0]);
+        fail("remote_epoll_hup_fork", "fork failed");
+        return;
+    }
+
+    if (!wait_remote_waiter_ready(ready_pipe[0])) {
+        close(pipe_fds[1]);
+        close(ready_pipe[0]);
+        int status = 0;
+        (void)waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+        fail("remote_epoll_hup_ready", "remote epoll HUP helper did not reach wait point");
+        return;
+    }
+    close(ready_pipe[0]);
+    close(pipe_fds[1]);
+
+    int status = 0;
+    if (!waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)) {
+        fail("remote_epoll_hup_child", "remote epoll_wait HUP child timed out or waitpid failed");
+        return;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("remote_epoll_hup_child", "remote epoll_wait HUP child failed");
+        return;
+    }
+
+    TESTD_PASS("remote_ipc_epoll_wait_pipe_hup");
+}
+TESTD_RUN_END(test_remote_ipc_epoll_wait_pipe_hup)
+
+// Remote epoll waiter must still observe HUP/EOF when the home-side writer is
+// already closed before the helper has definitely registered its waiter.
+TESTD_RUN(test_remote_ipc_epoll_pipe_preclosed_hup) {
+    std::array<int, 2> pipe_fds = {-1, -1};
+    if (pipe(pipe_fds.data()) != 0) {
+        fail("remote_epoll_preclosed_hup_pipe", "pipe failed");
+        return;
+    }
+
+    ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    pid_t const PID = fork();
+    if (PID == 0) {
+        close(pipe_fds[1]);
+
+        std::array<char, 16> fd_str{};
+        (void)testd_format_to_array(fd_str, "%d", pipe_fds[0]);
+
+        auto exec_path = std::to_array("/usr/bin/testd");
+        auto rh_flag = std::to_array("--rh");
+        auto mode_buf = std::to_array("epoll-preclosed-hup");
+        std::array<char*, 5> child_argv = {
+            exec_path.data(), rh_flag.data(), mode_buf.data(), fd_str.data(), nullptr,
+        };
+        execve("/usr/bin/testd", child_argv.data(), nullptr);
+        _exit(RH_EXIT_EXEC_FAILED);
+    }
+    ker::process::setwkitarget(nullptr, 0, 0);
+
+    close(pipe_fds[0]);
+
+    if (PID < 0) {
+        close(pipe_fds[1]);
+        fail("remote_epoll_preclosed_hup_fork", "fork failed");
+        return;
+    }
+
+    close(pipe_fds[1]);
+
+    int status = 0;
+    if (!waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)) {
+        fail("remote_epoll_preclosed_hup_child", "remote preclosed epoll HUP child timed out or waitpid failed");
+        return;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("remote_epoll_preclosed_hup_child", "remote preclosed epoll HUP child failed");
+        return;
+    }
+
+    TESTD_PASS("remote_ipc_epoll_pipe_preclosed_hup");
+}
+TESTD_RUN_END(test_remote_ipc_epoll_pipe_preclosed_hup)
+
+// Remote child must not lose data when epoll observes a proxy pipe whose
+// home-side writer sends one byte and then closes.
+TESTD_RUN(test_remote_ipc_epoll_pipe_read_then_hup) {
+    std::array<int, 2> pipe_fds = {-1, -1};
+    if (pipe(pipe_fds.data()) != 0) {
+        fail("remote_epoll_drain_hup_pipe", "pipe failed");
+        return;
+    }
+    std::array<int, 2> ready_pipe = {-1, -1};
+    if (pipe(ready_pipe.data()) != 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        fail("remote_epoll_drain_hup_ready_pipe", "ready pipe failed");
+        return;
+    }
+
+    ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
+    pid_t const PID = spawn_remote_wait_helper("epoll-drain-hup", pipe_fds[0], pipe_fds[1], ready_pipe[1], ready_pipe[0]);
+    ker::process::setwkitarget(nullptr, 0, 0);
+
+    close(pipe_fds[0]);
+    close(ready_pipe[1]);
+
+    if (PID < 0) {
+        close(pipe_fds[1]);
+        close(ready_pipe[0]);
+        fail("remote_epoll_drain_hup_fork", "fork failed");
+        return;
+    }
+
+    if (!wait_remote_waiter_ready(ready_pipe[0])) {
+        close(pipe_fds[1]);
+        close(ready_pipe[0]);
+        int status = 0;
+        (void)waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+        fail("remote_epoll_drain_hup_ready", "remote epoll drain/HUP helper did not reach wait point");
+        return;
+    }
+    close(ready_pipe[0]);
+
+    std::string_view const MSG = "G";
+    if (write(pipe_fds[1], MSG.data(), MSG.size()) != static_cast<ssize_t>(MSG.size())) {
+        close(pipe_fds[1]);
+        int status = 0;
+        (void)waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+        fail("remote_epoll_drain_hup_write", "write failed");
+        return;
+    }
+    close(pipe_fds[1]);
+
+    int status = 0;
+    if (!waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)) {
+        fail("remote_epoll_drain_hup_child", "remote epoll drain/HUP child timed out or waitpid failed");
+        return;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("remote_epoll_drain_hup_child", "remote epoll drain/HUP child failed");
+        return;
+    }
+
+    TESTD_PASS("remote_ipc_epoll_pipe_read_then_hup");
+}
+TESTD_RUN_END(test_remote_ipc_epoll_pipe_read_then_hup)
 
 // Remote child performs epoll_ctl(ADD) on inherited epoll fd (IPC_EPOLL proxy).
 TESTD_RUN(test_remote_ipc_epoll_ctl_add) {
@@ -2217,8 +3696,8 @@ TESTD_RUN(test_remote_ipc_epoll_ctl_add) {
         close(fds[1]);
         std::array<char, 16> epfd_str{};
         std::array<char, 16> rfd_str{};
-        std::snprintf(epfd_str.data(), epfd_str.size(), "%d", EPFD);
-        std::snprintf(rfd_str.data(), rfd_str.size(), "%d", fds[0]);
+        (void)testd_format_to_array(epfd_str, "%d", EPFD);
+        (void)testd_format_to_array(rfd_str, "%d", fds[0]);
 
         auto exec_path = std::to_array("/usr/bin/testd");
         auto rh_flag = std::to_array("--rh");
@@ -2240,7 +3719,13 @@ TESTD_RUN(test_remote_ipc_epoll_ctl_add) {
     }
 
     int status = 0;
-    waitpid(PID, &status, 0);
+    if (!waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)) {
+        close(fds[0]);
+        close(fds[1]);
+        close(EPFD);
+        fail("remote_epoll_ctl_add", "remote epoll child timed out or waitpid failed");
+        return;
+    }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         close(fds[0]);
         close(fds[1]);
@@ -2272,6 +3757,242 @@ TESTD_RUN(test_remote_ipc_epoll_ctl_add) {
 }
 TESTD_RUN_END(test_remote_ipc_epoll_ctl_add)
 
+TESTD_RUN(test_wki_target_policy_syscalls) {
+    auto restore = [] { (void)ker::process::setwkitarget(nullptr, 0, 0); };
+
+    restore();
+    std::array<char, 64> hostname{};
+    uint32_t flags = 0;
+    int64_t rc = ker::process::getwkitarget(hostname.data(), hostname.size(), &flags);
+    if (rc != 0 || flags != 0 || hostname[0] != '\0') {
+        restore();
+        fail("wki_target_clear_get", "clear target did not return auto policy");
+        return;
+    }
+    TESTD_PASS("wki_target_clear_get");
+
+    rc = ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_LOCAL | ker::process::WKI_TARGET_FLAG_NOINHERIT);
+    if (rc != 0) {
+        restore();
+        fail("wki_target_local_set", "local target set failed");
+        return;
+    }
+    flags = 0;
+    rc = ker::process::getwkitarget(hostname.data(), hostname.size(), &flags);
+    if (rc != 0 || flags != (ker::process::WKI_TARGET_FLAG_LOCAL | ker::process::WKI_TARGET_FLAG_NOINHERIT) || hostname[0] != '\0') {
+        restore();
+        fail("wki_target_local_get", "local target flags did not round-trip");
+        return;
+    }
+    TESTD_PASS("wki_target_local_roundtrip");
+
+    constexpr std::string_view HOST = "testd-remote";
+    constexpr auto HOST_LEN = static_cast<int64_t>(HOST.size());
+    rc = ker::process::setwkitarget(HOST.data(), HOST.size(), ker::process::WKI_TARGET_FLAG_REMOTE | ker::process::WKI_TARGET_FLAG_STRICT);
+    if (rc != 0) {
+        restore();
+        fail("wki_target_hostname_set", "hostname target set failed");
+        return;
+    }
+    hostname.fill('\0');
+    flags = 0;
+    rc = ker::process::getwkitarget(hostname.data(), hostname.size(), &flags);
+    if (rc != HOST_LEN || flags != (ker::process::WKI_TARGET_FLAG_REMOTE | ker::process::WKI_TARGET_FLAG_STRICT) ||
+        std::strncmp(hostname.data(), HOST.data(), HOST.size()) != 0) {
+        restore();
+        fail("wki_target_hostname_get", "hostname target did not round-trip");
+        return;
+    }
+    TESTD_PASS("wki_target_hostname_roundtrip");
+
+    std::array<char, 4> small_hostname{};
+    rc = ker::process::getwkitarget(small_hostname.data(), small_hostname.size(), nullptr);
+    if (rc != -ENAMETOOLONG) {
+        restore();
+        fail("wki_target_small_buffer", "small hostname buffer was not rejected");
+        return;
+    }
+    TESTD_PASS("wki_target_small_buffer");
+
+    rc = ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_LOCAL | ker::process::WKI_TARGET_FLAG_REMOTE);
+    if (rc != -EINVAL) {
+        restore();
+        fail("wki_target_invalid_local_remote", "local+remote target flags were not rejected");
+        return;
+    }
+    TESTD_PASS("wki_target_rejects_local_remote");
+
+    rc = ker::process::setwkitarget(HOST.data(), HOST.size(), ker::process::WKI_TARGET_FLAG_LOCAL);
+    if (rc != -EINVAL) {
+        restore();
+        fail("wki_target_invalid_hostname_local", "hostname+local target was not rejected");
+        return;
+    }
+    TESTD_PASS("wki_target_rejects_hostname_local");
+
+    std::array<char, 64> too_long_hostname{};
+    too_long_hostname.fill('x');
+    rc = ker::process::setwkitarget(too_long_hostname.data(), too_long_hostname.size(), ker::process::WKI_TARGET_FLAG_REMOTE);
+    if (rc != -ENAMETOOLONG) {
+        restore();
+        fail("wki_target_hostname_too_long", "oversized hostname was not rejected");
+        return;
+    }
+    TESTD_PASS("wki_target_rejects_oversized_hostname");
+
+    restore();
+}
+TESTD_RUN_END(test_wki_target_policy_syscalls)
+
+TESTD_RUN(test_wki_vfs_rule_syscalls) {
+    auto restore = [] { (void)ker::abi::vfs::wki_rule_clear_vfs(); };
+
+    restore();
+    std::array<char, 128> prefix{};
+    uint32_t route = UINT32_MAX;
+    int rc = ker::abi::vfs::wki_rule_get_vfs(0, prefix.data(), prefix.size(), &route);
+    if (rc != -ENOENT) {
+        restore();
+        fail("wki_vfs_clear_empty", "clear did not leave task rule list empty");
+        return;
+    }
+    TESTD_PASS("wki_vfs_clear_empty");
+
+    rc = ker::abi::vfs::wki_rule_add_vfs("/tmp/testd-wki", WKI_VFS_ROUTE_HOST);
+    if (rc != 0) {
+        restore();
+        fail("wki_vfs_add_host", "adding host route failed");
+        return;
+    }
+    prefix.fill('\0');
+    route = UINT32_MAX;
+    rc = ker::abi::vfs::wki_rule_get_vfs(0, prefix.data(), prefix.size(), &route);
+    if (rc <= 0 || route != WKI_VFS_ROUTE_HOST || std::strcmp(prefix.data(), "/tmp/testd-wki") != 0) {
+        restore();
+        fail("wki_vfs_get_host", "host route did not round-trip");
+        return;
+    }
+    TESTD_PASS("wki_vfs_add_get_host");
+
+    rc = ker::abi::vfs::wki_rule_add_vfs("/tmp/testd-wki", WKI_VFS_ROUTE_LOCAL);
+    if (rc != 0) {
+        restore();
+        fail("wki_vfs_replace_local", "replacing route failed");
+        return;
+    }
+    prefix.fill('\0');
+    route = UINT32_MAX;
+    rc = ker::abi::vfs::wki_rule_get_vfs(0, prefix.data(), prefix.size(), &route);
+    if (rc <= 0 || route != WKI_VFS_ROUTE_LOCAL || std::strcmp(prefix.data(), "/tmp/testd-wki") != 0) {
+        restore();
+        fail("wki_vfs_get_local", "replacement route did not round-trip");
+        return;
+    }
+    TESTD_PASS("wki_vfs_replace_get_local");
+
+    std::array<char, 4> small_prefix{};
+    rc = ker::abi::vfs::wki_rule_get_vfs(0, small_prefix.data(), small_prefix.size(), nullptr);
+    if (rc != -ERANGE) {
+        restore();
+        fail("wki_vfs_small_buffer", "small prefix buffer was not rejected");
+        return;
+    }
+    TESTD_PASS("wki_vfs_small_buffer");
+
+    rc = ker::abi::vfs::wki_rule_add_vfs("/tmp/testd-wki-bad", 42);
+    if (rc != -EINVAL) {
+        restore();
+        fail("wki_vfs_invalid_route", "invalid route was not rejected");
+        return;
+    }
+    TESTD_PASS("wki_vfs_rejects_invalid_route");
+
+    restore();
+    rc = ker::abi::vfs::wki_rule_get_vfs(0, prefix.data(), prefix.size(), &route);
+    if (rc != -ENOENT) {
+        fail("wki_vfs_clear_final", "final clear did not empty task rules");
+        return;
+    }
+    TESTD_PASS("wki_vfs_clear_final");
+}
+TESTD_RUN_END(test_wki_vfs_rule_syscalls)
+
+TESTD_RUN(test_journal_device_userspace_record) {
+    int const FD = open("/dev/journal", O_RDWR);
+    if (FD < 0) {
+        fail("journal_device_open", "open /dev/journal failed");
+        return;
+    }
+
+    std::array<char, 64> token{};
+    (void)testd_format_to_array(token, "testd-journal-%d", getpid());
+    size_t const TOKEN_LEN = std::strlen(token.data());
+    ssize_t const WRITTEN = write(FD, token.data(), TOKEN_LEN);
+    if (WRITTEN < 0 || std::cmp_not_equal(WRITTEN, TOKEN_LEN)) {
+        close(FD);
+        fail("journal_device_write", "write to /dev/journal failed or was short");
+        return;
+    }
+    TESTD_PASS("journal_device_write");
+
+    bool found = false;
+    std::array<ker::abi::sys_log::JournalRecord, JOURNAL_SCAN_BATCH> records{};
+    for (size_t batch = 0; batch < JOURNAL_SCAN_BATCHES && !found; ++batch) {
+        ssize_t const N = read(FD, records.data(), records.size() * sizeof(ker::abi::sys_log::JournalRecord));
+        if (N < 0) {
+            close(FD);
+            fail("journal_device_read", "read from /dev/journal failed");
+            return;
+        }
+        if (N == 0) {
+            break;
+        }
+        if ((N % static_cast<ssize_t>(sizeof(ker::abi::sys_log::JournalRecord))) != 0) {
+            close(FD);
+            fail("journal_record_size", "journal read returned partial record");
+            return;
+        }
+
+        size_t const COUNT = static_cast<size_t>(N) / sizeof(ker::abi::sys_log::JournalRecord);
+        for (size_t i = 0; i < COUNT; ++i) {
+            const auto& rec = records.at(i);
+            constexpr std::string_view USERSPACE_MODULE = "userspace";
+            bool module_matches = true;
+            for (size_t pos = 0; pos < USERSPACE_MODULE.size(); ++pos) {
+                module_matches = module_matches && rec.module[pos] == USERSPACE_MODULE.at(pos);
+            }
+            module_matches = module_matches && rec.module[USERSPACE_MODULE.size()] == '\0';
+            if (!module_matches) {
+                continue;
+            }
+            bool message_matches = rec.message_len == TOKEN_LEN;
+            for (size_t pos = 0; pos < TOKEN_LEN && message_matches; ++pos) {
+                message_matches = rec.message[pos] == token.at(pos);
+            }
+            if (!message_matches) {
+                continue;
+            }
+            if (rec.magic != ker::abi::sys_log::JOURNAL_RECORD_MAGIC || rec.version != ker::abi::sys_log::JOURNAL_RECORD_VERSION ||
+                rec.header_size != sizeof(ker::abi::sys_log::JournalRecord) - ker::abi::sys_log::JOURNAL_MESSAGE_MAX ||
+                rec.level != static_cast<uint8_t>(ker::abi::sys_log::sys_log_level::INFO)) {
+                close(FD);
+                fail("journal_record_abi", "userspace journal record had invalid ABI fields");
+                return;
+            }
+            found = true;
+            break;
+        }
+    }
+    close(FD);
+
+    if (!found) {
+        fail("journal_device_find_record", "userspace journal record was not found");
+        return;
+    }
+    TESTD_PASS("journal_device_userspace_record");
+}
+TESTD_RUN_END(test_journal_device_userspace_record)
+
 // NOLINTBEGIN(cppcoreguidelines-macro-usage)
 #define TESTD_TESTS(X)                          \
     X(test_vfs_open_write_read_close)           \
@@ -2293,12 +4014,23 @@ TESTD_RUN_END(test_remote_ipc_epoll_ctl_add)
     X(test_pipe_basic)                          \
     X(test_pipe_eof_on_writer_close)            \
     X(test_pipe_blocking_read_wake)             \
+    X(test_pipe_lost_wake_race_many)            \
+    X(test_futex_rejects_unaligned_address)     \
+    X(test_futex_wait_relative_timeout)         \
+    X(test_futex_wait_wake_before_timeout)      \
+    X(test_futex_wait_interrupted_by_signal)    \
+    X(test_nanosleep_rejects_invalid_nsec)      \
     X(test_poll_pipe_timeout_and_wake)          \
+    X(test_poll_pipe_hup_on_writer_close)       \
     X(test_epoll_pipe_timeout_and_wake)         \
+    X(test_epoll_pipe_hup_on_writer_close)      \
     X(test_pty_blocking_read_wake)              \
     X(test_getpid_getppid)                      \
     X(test_getcwd_chdir)                        \
     X(test_fork_exit)                           \
+    X(test_waitpid_exit_before_park_race)       \
+    X(test_waitpid_any_exit_before_park_race)   \
+    X(test_waitpid_any_multi_child_drain)       \
     X(test_fork_pipe_byte)                      \
     X(test_fork_pipe_communication)             \
     X(test_fork_multiple)                       \
@@ -2307,17 +4039,31 @@ TESTD_RUN_END(test_remote_ipc_epoll_ctl_add)
     X(test_mmap_file)                           \
     X(test_tcp_loopback)                        \
     X(test_tcp_nonblocking_connect_refused)     \
+    X(test_journal_device_userspace_record)     \
+    X(test_wki_target_policy_syscalls)          \
+    X(test_wki_vfs_rule_syscalls)               \
     X(test_remote_ipc_pipe_child_write)         \
     X(test_remote_ipc_pipe_parent_write)        \
     X(test_remote_ipc_pty_child_write)          \
     X(test_remote_ipc_pty_ioctl)                \
     X(test_remote_ipc_socket_child_write)       \
     X(test_remote_ipc_socket_control_ops)       \
+    X(test_remote_ipc_poll_wait_pipe_readable)  \
+    X(test_remote_ipc_poll_wait_pipe_hup)       \
+    X(test_remote_ipc_poll_pipe_preclosed_hup)  \
+    X(test_remote_ipc_poll_pipe_read_then_hup)  \
     X(test_remote_ipc_epoll_wait_pipe_readable) \
+    X(test_remote_ipc_epoll_wait_pipe_hup)      \
+    X(test_remote_ipc_epoll_pipe_preclosed_hup) \
+    X(test_remote_ipc_epoll_pipe_read_then_hup) \
     X(test_remote_ipc_epoll_ctl_add)
 // NOLINTEND(cppcoreguidelines-macro-usage)
 constexpr auto K_TESTS = std::array{
-#define TESTD_MAKE_SPEC(fn) TestSpec{fn, fn##_pass_count},
+#define TESTD_MAKE_SPEC(fn)                                                                                         \
+    [] {                                                                                                            \
+        static_assert(fn##_pass_count > 0, "TESTD tests must execute at least one TESTD_PASS or TESTD_CHECK path"); \
+        return TestSpec{fn, fn##_pass_count};                                                                       \
+    }(),
     TESTD_TESTS(TESTD_MAKE_SPEC)
 #undef TESTD_MAKE_SPEC
 };
@@ -2360,144 +4106,479 @@ auto main(int argc, char** argv) -> int {
     // Remote helper mode: child process execed to run on a remote node.
     // argv: testd --rh <mode> <fd>
     if (argc >= 4 && std::strcmp(argv[1], "--rh") == 0) {
-        const char* mode = argv[2];
-        int const FD = parse_int_arg(argv[3]);
-        if (FD < 0) {
-            return 1;
-        }
-        if (std::strcmp(mode, "pipe-write") == 0) {
-            ssize_t const N = write(FD, RH_PIPE_WRITE_MSG.data(), RH_PIPE_WRITE_MSG.size());
-            close(FD);
-            return (std::cmp_equal(N, RH_PIPE_WRITE_MSG.size())) ? 0 : 1;
-        }
-        if (std::strcmp(mode, "pipe-read") == 0) {
-            std::array<char, 32> buf{};
-            ssize_t const N = read(FD, buf.data(), buf.size() - 1);
-            close(FD);
-            if (N <= 0) {
+        int const RH_STATUS = [&]() -> int {
+            const char* mode = argv[2];
+            int const FD = parse_int_arg(argv[3]);
+            if (FD < 0) {
                 return 1;
             }
-            std::string_view const GOT{buf.data(), static_cast<size_t>(N)};
-            return (GOT == RH_PIPE_READ_EXPECT) ? 0 : 1;
-        }
-        if (std::strcmp(mode, "pty-ioctl") == 0) {
-            struct winsize ws{};
-            int const RC = ioctl(FD, TIOCGWINSZ, &ws);
-            close(FD);
-            return (RC == 0) ? 0 : 1;
-        }
-        if (std::strcmp(mode, "pty-write") == 0) {
-            ssize_t const N = write(FD, RH_PTY_WRITE_MSG.data(), RH_PTY_WRITE_MSG.size());
-            close(FD);
-            return (std::cmp_equal(N, RH_PTY_WRITE_MSG.size())) ? 0 : 1;
-        }
-        if (std::strcmp(mode, "sock-write") == 0) {
-            ssize_t const N = send(FD, RH_SOCKET_WRITE_MSG.data(), RH_SOCKET_WRITE_MSG.size(), 0);
-            close(FD);
-            return (std::cmp_equal(N, RH_SOCKET_WRITE_MSG.size())) ? 0 : 1;
-        }
-        if (std::strcmp(mode, "sock-ctrl") == 0) {
-            if (argc < 5) {
+            if (std::strcmp(mode, "pipe-write") == 0) {
+                ssize_t const N = write(FD, RH_PIPE_WRITE_MSG.data(), RH_PIPE_WRITE_MSG.size());
                 close(FD);
-                return 1;
+                return (std::cmp_equal(N, RH_PIPE_WRITE_MSG.size())) ? 0 : 1;
             }
-            int const EXPECTED_PORT = parse_int_arg(argv[4]);
-            if (EXPECTED_PORT < 0) {
+            if (std::strcmp(mode, "pipe-read") == 0) {
+                std::array<char, 32> buf{};
+                ssize_t const N = read(FD, buf.data(), buf.size() - 1);
                 close(FD);
-                return 1;
+                if (N <= 0) {
+                    return 1;
+                }
+                std::string_view const GOT{buf.data(), static_cast<size_t>(N)};
+                return (GOT == RH_PIPE_READ_EXPECT) ? 0 : 1;
             }
-            struct sockaddr_in peer{};
-            socklen_t peer_len = sizeof(peer);
-            if (getpeername(FD, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) != 0) {
+            if (std::strcmp(mode, "pty-ioctl") == 0) {
+                struct winsize ws{};
+                int const RC = ioctl(FD, TIOCGWINSZ, &ws);
                 close(FD);
-                return 1;
+                return (RC == 0) ? 0 : 1;
             }
-            if (peer_len != sizeof(peer) || peer.sin_family != AF_INET || ntohl(peer.sin_addr.s_addr) != INADDR_LOOPBACK ||
-                std::cmp_not_equal(ntohs(peer.sin_port), EXPECTED_PORT)) {
+            if (std::strcmp(mode, "pty-write") == 0) {
+                ssize_t const N = write(FD, RH_PTY_WRITE_MSG.data(), RH_PTY_WRITE_MSG.size());
                 close(FD);
-                return 1;
+                return (std::cmp_equal(N, RH_PTY_WRITE_MSG.size())) ? 0 : 1;
             }
+            if (std::strcmp(mode, "sock-write") == 0) {
+                ssize_t const N = send(FD, RH_SOCKET_WRITE_MSG.data(), RH_SOCKET_WRITE_MSG.size(), 0);
+                close(FD);
+                return (std::cmp_equal(N, RH_SOCKET_WRITE_MSG.size())) ? 0 : 1;
+            }
+            if (std::strcmp(mode, "sock-ctrl") == 0) {
+                if (argc < 5) {
+                    close(FD);
+                    return 1;
+                }
+                int const EXPECTED_PORT = parse_int_arg(argv[4]);
+                if (EXPECTED_PORT < 0) {
+                    close(FD);
+                    return 1;
+                }
+                struct sockaddr_in peer{};
+                socklen_t peer_len = sizeof(peer);
+                if (getpeername(FD, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) != 0) {
+                    close(FD);
+                    return 1;
+                }
+                if (peer_len != sizeof(peer) || peer.sin_family != AF_INET || ntohl(peer.sin_addr.s_addr) != INADDR_LOOPBACK ||
+                    std::cmp_not_equal(ntohs(peer.sin_port), EXPECTED_PORT)) {
+                    close(FD);
+                    return 1;
+                }
 
-            int rcvbuf = RH_SOCKET_CTRL_RCVBUF;
-            if (setsockopt(FD, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) != 0) {
-                close(FD);
-                return 1;
-            }
+                int rcvbuf = RH_SOCKET_CTRL_RCVBUF;
+                if (setsockopt(FD, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) != 0) {
+                    close(FD);
+                    return 1;
+                }
 
-            int got_rcvbuf = 0;
-            socklen_t got_rcvbuf_len = sizeof(got_rcvbuf);
-            if (getsockopt(FD, SOL_SOCKET, SO_RCVBUF, &got_rcvbuf, &got_rcvbuf_len) != 0) {
-                close(FD);
-                return 1;
-            }
-            if (got_rcvbuf_len != sizeof(got_rcvbuf) || got_rcvbuf != RH_SOCKET_CTRL_RCVBUF) {
-                close(FD);
-                return 1;
-            }
+                int got_rcvbuf = 0;
+                socklen_t got_rcvbuf_len = sizeof(got_rcvbuf);
+                if (getsockopt(FD, SOL_SOCKET, SO_RCVBUF, &got_rcvbuf, &got_rcvbuf_len) != 0) {
+                    close(FD);
+                    return 1;
+                }
+                if (got_rcvbuf_len != sizeof(got_rcvbuf) || got_rcvbuf != RH_SOCKET_CTRL_RCVBUF) {
+                    close(FD);
+                    return 1;
+                }
 
-            int keepalive = 1;
-            if (setsockopt(FD, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive)) != 0) {
-                close(FD);
-                return 1;
-            }
+                int keepalive = 1;
+                if (setsockopt(FD, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive)) != 0) {
+                    close(FD);
+                    return 1;
+                }
 
-            if (shutdown(FD, SHUT_WR) != 0) {
-                close(FD);
-                return 1;
-            }
+                if (shutdown(FD, SHUT_WR) != 0) {
+                    close(FD);
+                    return 1;
+                }
 
-            usleep(100000);
-            close(FD);
-            return 0;
-        }
-        if (std::strcmp(mode, "epoll-add") == 0) {
-            if (argc < 5) {
+                usleep(100000);
                 close(FD);
-                return 1;
+                return 0;
             }
-            int const TARGET_FD = parse_int_arg(argv[4]);
-            if (TARGET_FD < 0) {
+            if (std::strcmp(mode, "epoll-add") == 0) {
+                if (argc < 5) {
+                    close(FD);
+                    return 1;
+                }
+                int const TARGET_FD = parse_int_arg(argv[4]);
+                if (TARGET_FD < 0) {
+                    close(FD);
+                    return 1;
+                }
+                struct epoll_event ev{};
+                ev.events = EPOLLIN;
+                ev.data.fd = TARGET_FD;
+                int const RC = epoll_ctl(FD, EPOLL_CTL_ADD, TARGET_FD, &ev);
                 close(FD);
-                return 1;
+                return (RC == 0) ? 0 : 1;
             }
-            struct epoll_event ev{};
-            ev.events = EPOLLIN;
-            ev.data.fd = TARGET_FD;
-            int const RC = epoll_ctl(FD, EPOLL_CTL_ADD, TARGET_FD, &ev);
-            close(FD);
-            return (RC == 0) ? 0 : 1;
-        }
-        if (std::strcmp(mode, "epoll-wait") == 0) {
-            int const EPFD = epoll_create1(0);
-            if (EPFD < 0) {
-                close(FD);
-                return 1;
-            }
+            if (std::strcmp(mode, "poll-wait") == 0) {
+                if (argc < 5) {
+                    close(FD);
+                    return 1;
+                }
+                int const READY_FD = parse_int_arg(argv[4]);
+                if (READY_FD < 0) {
+                    close(FD);
+                    return 1;
+                }
+                struct pollfd pfd{
+                    .fd = FD,
+                    .events = POLLIN,
+                    .revents = 0,
+                };
 
-            struct epoll_event ev{};
-            ev.events = EPOLLIN;
-            ev.data.fd = FD;
-            if (epoll_ctl(EPFD, EPOLL_CTL_ADD, FD, &ev) != 0) {
+                struct pollfd preflight = pfd;
+                int const PRE_READY = poll(&preflight, 1, 0);
+                if (PRE_READY != 0) {
+                    close(READY_FD);
+                    close(FD);
+                    return 1;
+                }
+                if (!signal_remote_wait_ready(READY_FD)) {
+                    close(FD);
+                    return 1;
+                }
+
+                int const RC = poll(&pfd, 1, 1000);
+                if (RC != 1 || pfd.fd != FD || (pfd.revents & POLLIN) == 0) {
+                    close(FD);
+                    return 1;
+                }
+
+                char byte = 0;
+                ssize_t const NR = read(FD, &byte, sizeof(byte));
+                close(FD);
+                return (NR == 1 && byte == 'P') ? 0 : 1;
+            }
+            if (std::strcmp(mode, "poll-preclosed-hup") == 0) {
+                struct pollfd pfd{
+                    .fd = FD,
+                    .events = POLLIN,
+                    .revents = 0,
+                };
+
+                int const RC = poll(&pfd, 1, 1000);
+                if (RC != 1 || pfd.fd != FD || (pfd.revents & POLLHUP) == 0) {
+                    close(FD);
+                    return 1;
+                }
+
+                char byte = 0;
+                ssize_t const NR = read(FD, &byte, sizeof(byte));
+                close(FD);
+                return (NR == 0) ? 0 : 1;
+            }
+            if (std::strcmp(mode, "poll-wait-hup") == 0) {
+                if (argc < 5) {
+                    close(FD);
+                    return 1;
+                }
+                int const READY_FD = parse_int_arg(argv[4]);
+                if (READY_FD < 0) {
+                    close(FD);
+                    return 1;
+                }
+                struct pollfd pfd{
+                    .fd = FD,
+                    .events = POLLIN,
+                    .revents = 0,
+                };
+
+                struct pollfd preflight = pfd;
+                int const PRE_READY = poll(&preflight, 1, 0);
+                if (PRE_READY != 0) {
+                    close(READY_FD);
+                    close(FD);
+                    return 1;
+                }
+                if (!signal_remote_wait_ready(READY_FD)) {
+                    close(FD);
+                    return 1;
+                }
+
+                int const RC = poll(&pfd, 1, 1000);
+                if (RC != 1 || pfd.fd != FD || (pfd.revents & POLLHUP) == 0) {
+                    close(FD);
+                    return 1;
+                }
+
+                char byte = 0;
+                ssize_t const NR = read(FD, &byte, sizeof(byte));
+                close(FD);
+                return (NR == 0) ? 0 : 1;
+            }
+            if (std::strcmp(mode, "poll-drain-hup") == 0) {
+                if (argc < 5) {
+                    close(FD);
+                    return 1;
+                }
+                int const READY_FD = parse_int_arg(argv[4]);
+                if (READY_FD < 0) {
+                    close(FD);
+                    return 1;
+                }
+                struct pollfd pfd{
+                    .fd = FD,
+                    .events = POLLIN,
+                    .revents = 0,
+                };
+
+                struct pollfd preflight = pfd;
+                int const PRE_READY = poll(&preflight, 1, 0);
+                if (PRE_READY != 0) {
+                    close(READY_FD);
+                    close(FD);
+                    return 1;
+                }
+                if (!signal_remote_wait_ready(READY_FD)) {
+                    close(FD);
+                    return 1;
+                }
+
+                int const READY = poll(&pfd, 1, 1000);
+                if (READY != 1 || pfd.fd != FD || (pfd.revents & POLLIN) == 0) {
+                    close(FD);
+                    return 1;
+                }
+
+                char byte = 0;
+                ssize_t const NR = read(FD, &byte, sizeof(byte));
+                if (NR != 1 || byte != 'D') {
+                    close(FD);
+                    return 1;
+                }
+
+                pfd.revents = 0;
+                int const HUP_READY = poll(&pfd, 1, 1000);
+                if (HUP_READY != 1 || pfd.fd != FD || (pfd.revents & POLLHUP) == 0) {
+                    close(FD);
+                    return 1;
+                }
+
+                char eof_probe = 0;
+                ssize_t const EOF_NR = read(FD, &eof_probe, sizeof(eof_probe));
+                close(FD);
+                return (EOF_NR == 0) ? 0 : 1;
+            }
+            if (std::strcmp(mode, "epoll-wait") == 0) {
+                if (argc < 5) {
+                    close(FD);
+                    return 1;
+                }
+                int const READY_FD = parse_int_arg(argv[4]);
+                if (READY_FD < 0) {
+                    close(FD);
+                    return 1;
+                }
+                int const EPFD = epoll_create1(0);
+                if (EPFD < 0) {
+                    close(READY_FD);
+                    close(FD);
+                    return 1;
+                }
+
+                struct epoll_event ev{};
+                ev.events = EPOLLIN;
+                ev.data.fd = FD;
+                if (epoll_ctl(EPFD, EPOLL_CTL_ADD, FD, &ev) != 0) {
+                    close(READY_FD);
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+
+                struct epoll_event preflight{};
+                int const PRE_READY = epoll_wait(EPFD, &preflight, 1, 0);
+                if (PRE_READY != 0) {
+                    close(READY_FD);
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+                if (!signal_remote_wait_ready(READY_FD)) {
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+
+                struct epoll_event out{};
+                int const RC = epoll_wait(EPFD, &out, 1, 1000);
+                if (RC != 1 || out.data.fd != FD || (out.events & EPOLLIN) == 0) {
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+
+                char byte = 0;
+                ssize_t const NR = read(FD, &byte, sizeof(byte));
                 close(EPFD);
                 close(FD);
-                return 1;
+                return (NR == 1 && byte == 'E') ? 0 : 1;
             }
+            if (std::strcmp(mode, "epoll-wait-hup") == 0) {
+                if (argc < 5) {
+                    close(FD);
+                    return 1;
+                }
+                int const READY_FD = parse_int_arg(argv[4]);
+                if (READY_FD < 0) {
+                    close(FD);
+                    return 1;
+                }
+                int const EPFD = epoll_create1(0);
+                if (EPFD < 0) {
+                    close(READY_FD);
+                    close(FD);
+                    return 1;
+                }
 
-            struct epoll_event out{};
-            int const RC = epoll_wait(EPFD, &out, 1, 1000);
-            if (RC != 1 || out.data.fd != FD || (out.events & EPOLLIN) == 0) {
+                struct epoll_event ev{};
+                ev.events = EPOLLIN;
+                ev.data.fd = FD;
+                if (epoll_ctl(EPFD, EPOLL_CTL_ADD, FD, &ev) != 0) {
+                    close(READY_FD);
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+
+                struct epoll_event preflight{};
+                int const PRE_READY = epoll_wait(EPFD, &preflight, 1, 0);
+                if (PRE_READY != 0) {
+                    close(READY_FD);
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+                if (!signal_remote_wait_ready(READY_FD)) {
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+
+                struct epoll_event out{};
+                int const RC = epoll_wait(EPFD, &out, 1, 1000);
+                if (RC != 1 || out.data.fd != FD || (out.events & EPOLLHUP) == 0) {
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+
+                char byte = 0;
+                ssize_t const NR = read(FD, &byte, sizeof(byte));
                 close(EPFD);
                 close(FD);
-                return 1;
+                return (NR == 0) ? 0 : 1;
             }
+            if (std::strcmp(mode, "epoll-preclosed-hup") == 0) {
+                int const EPFD = epoll_create1(0);
+                if (EPFD < 0) {
+                    close(FD);
+                    return 1;
+                }
 
-            char byte = 0;
-            ssize_t const NR = read(FD, &byte, sizeof(byte));
-            close(EPFD);
-            close(FD);
-            return (NR == 1 && byte == 'E') ? 0 : 1;
-        }
-        return RH_EXIT_UNKNOWN_MODE;
+                struct epoll_event ev{};
+                ev.events = EPOLLIN;
+                ev.data.fd = FD;
+                if (epoll_ctl(EPFD, EPOLL_CTL_ADD, FD, &ev) != 0) {
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+
+                struct epoll_event out{};
+                int const RC = epoll_wait(EPFD, &out, 1, 1000);
+                if (RC != 1 || out.data.fd != FD || (out.events & EPOLLHUP) == 0) {
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+
+                char byte = 0;
+                ssize_t const NR = read(FD, &byte, sizeof(byte));
+                close(EPFD);
+                close(FD);
+                return (NR == 0) ? 0 : 1;
+            }
+            if (std::strcmp(mode, "epoll-drain-hup") == 0) {
+                if (argc < 5) {
+                    close(FD);
+                    return 1;
+                }
+                int const READY_FD = parse_int_arg(argv[4]);
+                if (READY_FD < 0) {
+                    close(FD);
+                    return 1;
+                }
+                int const EPFD = epoll_create1(0);
+                if (EPFD < 0) {
+                    close(READY_FD);
+                    close(FD);
+                    return 1;
+                }
+
+                struct epoll_event ev{};
+                ev.events = EPOLLIN;
+                ev.data.fd = FD;
+                if (epoll_ctl(EPFD, EPOLL_CTL_ADD, FD, &ev) != 0) {
+                    close(READY_FD);
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+
+                struct epoll_event preflight{};
+                int const PRE_READY = epoll_wait(EPFD, &preflight, 1, 0);
+                if (PRE_READY != 0) {
+                    close(READY_FD);
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+                if (!signal_remote_wait_ready(READY_FD)) {
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+
+                struct epoll_event out{};
+                int const READY = epoll_wait(EPFD, &out, 1, 1000);
+                if (READY != 1 || out.data.fd != FD || (out.events & EPOLLIN) == 0) {
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+
+                char byte = 0;
+                ssize_t const NR = read(FD, &byte, sizeof(byte));
+                if (NR != 1 || byte != 'G') {
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+
+                struct epoll_event hup_out{};
+                int const HUP_READY = epoll_wait(EPFD, &hup_out, 1, 1000);
+                if (HUP_READY != 1 || hup_out.data.fd != FD || (hup_out.events & EPOLLHUP) == 0) {
+                    close(EPFD);
+                    close(FD);
+                    return 1;
+                }
+
+                char eof_probe = 0;
+                ssize_t const EOF_NR = read(FD, &eof_probe, sizeof(eof_probe));
+                close(EPFD);
+                close(FD);
+                return (EOF_NR == 0) ? 0 : 1;
+            }
+            return RH_EXIT_UNKNOWN_MODE;
+        }();
+        // Helper processes report only their remote FD operation status.
+        // Do not let libc/rtld finalizers obscure that result.
+        _exit(RH_STATUS);
     }
 
     testd_logf("%s", "[TESTD] starting");
@@ -2509,6 +4590,10 @@ auto main(int argc, char** argv) -> int {
         test.run();
     }
 
+    if (g_fail == 0 && g_pass != total_tests()) {
+        testd_logf("[TESTD] FAIL: accounting mismatch: expected %d checks, ran %d", total_tests(), g_pass);
+        return 1;
+    }
     testd_logf("[TESTD] DONE: %d passed, %d failed", g_pass, g_fail);
 
     return (g_fail == 0) ? 0 : 1;

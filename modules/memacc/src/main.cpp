@@ -1,12 +1,12 @@
 #include <abi-bits/fcntl.h>
 #include <bits/ssize_t.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <time.h>  // NOLINT(modernize-deprecated-headers): POSIX nanosleep is declared here.
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +23,8 @@ namespace {
 constexpr std::string_view MEMACC_ROOT = "/proc/memacc";
 constexpr uint64_t KIB = 1024;
 constexpr int DEFAULT_LIMIT = 15;
+constexpr size_t READ_CHUNK_CAPACITY = 4096;
+constexpr size_t MEMACC_READ_LIMIT = 262144;
 
 struct Row {
     std::string record;
@@ -98,26 +100,40 @@ class ScopedFd {
     int fd;
 };
 
-auto read_file(std::string_view path) -> std::optional<std::string> {
+auto read_file(std::string_view path, size_t max_bytes = MEMACC_READ_LIMIT) -> std::optional<std::string> {
     ScopedFd fd(open(std::string(path).c_str(), O_RDONLY));
     if (!fd.valid()) {
         return std::nullopt;
     }
 
     std::string out;
-    char buf[4096];
+    out.reserve(std::min(max_bytes, READ_CHUNK_CAPACITY));
+    std::array<char, READ_CHUNK_CAPACITY> buf{};
     while (true) {
-        ssize_t const n = read(fd.get(), buf, sizeof(buf));
-        if (n < 0 && errno == EINTR) {
+        size_t const REMAINING = max_bytes - out.size();
+        if (REMAINING == 0) {
+            char extra = '\0';
+            ssize_t const COUNT = read(fd.get(), &extra, 1);
+            if (COUNT < 0 && errno == EINTR) {
+                continue;
+            }
+            if (COUNT < 0 || COUNT > 0) {
+                return std::nullopt;
+            }
+            return out;
+        }
+
+        ssize_t const COUNT = read(fd.get(), buf.data(), std::min(buf.size(), REMAINING));
+        if (COUNT < 0 && errno == EINTR) {
             continue;
         }
-        if (n < 0) {
+        if (COUNT < 0) {
             return std::nullopt;
         }
-        if (n == 0) {
+        if (COUNT == 0) {
             break;
         }
-        out.append(buf, static_cast<size_t>(n));
+        out.append(buf.data(), static_cast<size_t>(COUNT));
     }
     return out;
 }

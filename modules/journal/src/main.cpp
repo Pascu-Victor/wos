@@ -102,11 +102,12 @@ auto parse_level(const char* text, uint8_t* out) -> bool {
 }
 
 void sleep_short() {
-    timespec const TS{
+    timespec remaining{
         .tv_sec = 0,
         .tv_nsec = 200L * 1000L * 1000L,
     };
-    nanosleep(&TS, nullptr);
+    while (nanosleep(&remaining, &remaining) < 0 && errno == EINTR) {
+    }
 }
 
 auto write_all(int fd, const void* data, size_t len) -> bool {
@@ -114,6 +115,9 @@ auto write_all(int fd, const void* data, size_t len) -> bool {
     size_t done = 0;
     while (done < len) {
         ssize_t const N = write(fd, p + done, len - done);
+        if (N < 0 && errno == EINTR) {
+            continue;
+        }
         if (N <= 0) {
             return false;
         }
@@ -150,6 +154,37 @@ auto valid_record(const JournalRecord& rec) -> bool {
         return false;
     }
     return bounded_string_length(rec.message, static_cast<size_t>(rec.message_len) + 1) == rec.message_len;
+}
+
+auto read_journal_record(int fd, JournalRecord& rec) -> bool {
+    auto* out = reinterpret_cast<char*>(&rec);
+    size_t done = 0;
+    while (done < sizeof(rec)) {
+        ssize_t const N = read(fd, out + done, sizeof(rec) - done);
+        if (N < 0 && errno == EINTR) {
+            continue;
+        }
+        if (N <= 0) {
+            return false;
+        }
+        done += static_cast<size_t>(N);
+    }
+    return true;
+}
+
+auto read_journal_batch(int fd, std::array<JournalRecord, 16>& batch, size_t& count) -> bool {
+    count = 0;
+    for (;;) {
+        ssize_t const N = read(fd, batch.data(), batch.size() * sizeof(JournalRecord));
+        if (N < 0 && errno == EINTR) {
+            continue;
+        }
+        if (N <= 0) {
+            return false;
+        }
+        count = static_cast<size_t>(N) / sizeof(JournalRecord);
+        return count > 0;
+    }
 }
 
 struct Options {
@@ -205,11 +240,7 @@ auto print_record(const JournalRecord& rec) -> bool {
 void load_records_from_fd(int fd, std::vector<JournalRecord>& records) {
     JournalRecord rec{};
     for (;;) {
-        ssize_t const N = read(fd, &rec, sizeof(rec));
-        if (N == 0) {
-            break;
-        }
-        if (std::cmp_not_equal(N, sizeof(rec))) {
+        if (!read_journal_record(fd, rec)) {
             break;
         }
         if (valid_record(rec)) {
@@ -259,13 +290,12 @@ auto run_daemon() -> int {
 
     for (;;) {
         std::array<JournalRecord, 16> batch{};
-        ssize_t const N = read(DEV, batch.data(), batch.size() * sizeof(JournalRecord));
-        if (N <= 0) {
+        size_t records = 0;
+        if (!read_journal_batch(DEV, batch, records)) {
             sleep_short();
             continue;
         }
-        size_t const RECORDS = static_cast<size_t>(N) / sizeof(JournalRecord);
-        for (size_t i = 0; i < RECORDS; i++) {
+        for (size_t i = 0; i < records; i++) {
             const auto& rec = *std::next(batch.begin(), static_cast<ptrdiff_t>(i));
             if (!valid_record(rec)) {
                 continue;
@@ -377,13 +407,12 @@ auto run_query(const Options& opts) -> int {
     if (opts.follow && DEV >= 0) {
         for (;;) {
             std::array<JournalRecord, 16> batch{};
-            ssize_t const N = read(DEV, batch.data(), batch.size() * sizeof(JournalRecord));
-            if (N <= 0) {
+            size_t records = 0;
+            if (!read_journal_batch(DEV, batch, records)) {
                 sleep_short();
                 continue;
             }
-            size_t const COUNT = static_cast<size_t>(N) / sizeof(JournalRecord);
-            for (size_t i = 0; i < COUNT; i++) {
+            for (size_t i = 0; i < records; i++) {
                 const auto& rec = *std::next(batch.begin(), static_cast<ptrdiff_t>(i));
                 if (record_matches(rec, opts)) {
                     if (!print_record(rec)) {

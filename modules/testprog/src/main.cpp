@@ -6,14 +6,17 @@
 #include <abi-bits/stat.h>
 #include <arpa/inet.h>
 #include <bits/ssize_t.h>
+#include <fcntl.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/multiproc.h>
 #include <sys/process.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -37,6 +40,10 @@
 
 namespace {
 
+constexpr int MSEC_PER_SEC = 1000;
+constexpr int NSEC_PER_MSEC = 1000000;
+constexpr int PING_REPLY_TIMEOUT_MS = 1000;
+
 void copy_ifreq_name(struct ifreq& ifr, const char* ifname) {
     auto dest = std::span<char, IFNAMSIZ>(ifr.ifr_name);
     std::ranges::fill(dest, '\0');
@@ -55,6 +62,85 @@ void copy_literal(std::array<char, Size>& dest, const char* literal) {
     }
     size_t const LEN = std::min(std::strlen(literal), dest.size() - 1);
     std::copy_n(literal, LEN, dest.data());
+}
+
+auto monotonic_now_ms() -> int64_t {
+    timespec ts{};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return -1;
+    }
+    return (static_cast<int64_t>(ts.tv_sec) * MSEC_PER_SEC) + (static_cast<int64_t>(ts.tv_nsec) / NSEC_PER_MSEC);
+}
+
+auto deadline_after_ms(int timeout_ms) -> int64_t {
+    int64_t const NOW_MS = monotonic_now_ms();
+    if (NOW_MS < 0) {
+        return -1;
+    }
+    return NOW_MS + timeout_ms;
+}
+
+auto remaining_ms_until(int64_t deadline_ms, int fallback_timeout_ms) -> int {
+    if (deadline_ms < 0) {
+        return fallback_timeout_ms;
+    }
+    int64_t const NOW_MS = monotonic_now_ms();
+    if (NOW_MS < 0) {
+        return fallback_timeout_ms;
+    }
+    int64_t const REMAINING_MS = deadline_ms - NOW_MS;
+    if (REMAINING_MS <= 0) {
+        errno = ETIMEDOUT;
+        return 0;
+    }
+    return REMAINING_MS > INT_MAX ? INT_MAX : static_cast<int>(REMAINING_MS);
+}
+
+auto wait_fd_ready_until(int fd, short events, int64_t deadline_ms, int fallback_timeout_ms) -> int {
+    for (;;) {
+        int const TIMEOUT_MS = remaining_ms_until(deadline_ms, fallback_timeout_ms);
+        if (TIMEOUT_MS <= 0) {
+            return 0;
+        }
+
+        struct pollfd pfd{
+            .fd = fd,
+            .events = events,
+            .revents = 0,
+        };
+        int const READY = poll(&pfd, 1, TIMEOUT_MS);
+        if (READY < 0 && errno == EINTR) {
+            continue;
+        }
+        if (READY == 0) {
+            errno = ETIMEDOUT;
+        }
+        return READY;
+    }
+}
+
+auto set_nonblocking_for_timeout(int fd, int& old_flags) -> bool {
+    old_flags = fcntl(fd, F_GETFL, 0);
+    if (old_flags < 0) {
+        return false;
+    }
+    if ((old_flags & O_NONBLOCK) != 0) {
+        return true;
+    }
+    return fcntl(fd, F_SETFL, old_flags | O_NONBLOCK) == 0;
+}
+
+void restore_fd_flags(int fd, int old_flags) {
+    if (old_flags >= 0) {
+        (void)fcntl(fd, F_SETFL, old_flags);
+    }
+}
+
+auto retryable_socket_result(ssize_t result) -> bool {
+    if (result == -EAGAIN || result == -EWOULDBLOCK || result == -EINTR) {
+        return true;
+    }
+    return result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR);
 }
 
 // ICMP Echo Request structure
@@ -85,6 +171,29 @@ auto icmp_checksum(std::span<const uint8_t> data) -> uint16_t {
     sum += (sum >> 16);
 
     return static_cast<uint16_t>(~sum);
+}
+
+auto receive_ping_reply_timeout(int sock, std::array<uint8_t, 1024>& recv_buf, struct sockaddr_in& from_addr, int timeout_ms) -> ssize_t {
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(sock, old_flags)) {
+        return -1;
+    }
+
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
+    for (;;) {
+        if (wait_fd_ready_until(sock, POLLIN, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(sock, old_flags);
+            return -1;
+        }
+
+        socklen_t from_len = sizeof(from_addr);
+        ssize_t const RECEIVED =
+            recvfrom(sock, recv_buf.data(), recv_buf.size(), 0, reinterpret_cast<struct sockaddr*>(&from_addr), &from_len);
+        if (RECEIVED > 0 || !retryable_socket_result(RECEIVED)) {
+            restore_fd_flags(sock, old_flags);
+            return RECEIVED;
+        }
+    }
 }
 
 // Ping a specific IP address
@@ -136,26 +245,17 @@ auto ping(const char* ip_str) -> bool {
 
     // std::println("testprog[t:{},p:{}]: Sent {} bytes to {}", tid, pid, sent, ip_str);
 
-    // Try to receive response (with polling retry for EAGAIN)
+    // Try to receive response without allowing the smoke test to block forever.
     std::array<uint8_t, 1024> recv_buf{};
     struct sockaddr_in from_addr{};
-    socklen_t from_len = sizeof(from_addr);
-
-    ssize_t received = -1;
-    constexpr int MAX_RETRIES = 4;
-    for (int retry = 0; retry < MAX_RETRIES; ++retry) {
-        received = recvfrom(SOCK, recv_buf.data(), recv_buf.size(), 0, reinterpret_cast<struct sockaddr*>(&from_addr), &from_len);
-        if (received != -11) {  // -11 is EAGAIN
-            break;
-        }
-    }
+    ssize_t const RECEIVED = receive_ping_reply_timeout(SOCK, recv_buf, from_addr, PING_REPLY_TIMEOUT_MS);
 
     close(SOCK);
 
-    if (received > 0) {
+    if (RECEIVED > 0) {
         return true;
     }
-    std::println(stderr, "testprog[t:{},p:{}]: no response from {} (received={})", TID, PID, ip_str, static_cast<long long>(received));
+    std::println(stderr, "testprog[t:{},p:{}]: no response from {} (received={})", TID, PID, ip_str, static_cast<long long>(RECEIVED));
     return false;
 }
 

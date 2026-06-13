@@ -7,17 +7,20 @@
 #include <abi/callnums/process.h>
 #include <arpa/inet.h>
 #include <bits/ssize_t.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/callnums.h>
 #include <sys/process.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <abi/ptrace.hpp>
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <climits>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -37,6 +40,12 @@ constexpr size_t MAX_PACKET = 4096;
 constexpr size_t MAX_THREADS = 128;
 constexpr uint64_t MAX_MEM_READ = 4096;
 constexpr uint8_t X86_INT3 = 0xcc;
+constexpr int DEBUGSERVER_PACKET_IO_TIMEOUT_MS = 30000;
+constexpr int DEBUGSERVER_EVENT_POLL_MS = 10;
+constexpr uint32_t DEBUGSERVER_STARTUP_WAIT_RETRIES = 500;
+constexpr useconds_t DEBUGSERVER_STARTUP_WAIT_POLL_US = 10 * 1000;
+constexpr int MSEC_PER_SEC = 1000;
+constexpr int NSEC_PER_MSEC = 1000000;
 
 constexpr std::string_view TARGET_XML = R"xml(<?xml version="1.0"?>
 <!DOCTYPE target SYSTEM "gdb-target.dtd">
@@ -126,17 +135,125 @@ auto checksum(std::string_view payload) -> uint8_t {
     return sum;
 }
 
-auto write_all(int fd, std::string_view data) -> bool {
+auto monotonic_now_ms() -> int64_t {
+    timespec ts{};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return -1;
+    }
+    return (static_cast<int64_t>(ts.tv_sec) * MSEC_PER_SEC) + (static_cast<int64_t>(ts.tv_nsec) / NSEC_PER_MSEC);
+}
+
+auto deadline_after_ms(int timeout_ms) -> int64_t {
+    int64_t const NOW_MS = monotonic_now_ms();
+    if (NOW_MS < 0) {
+        return -1;
+    }
+    return NOW_MS + timeout_ms;
+}
+
+auto remaining_ms_until(int64_t deadline_ms, int fallback_timeout_ms) -> int {
+    if (deadline_ms < 0) {
+        return fallback_timeout_ms;
+    }
+    int64_t const NOW_MS = monotonic_now_ms();
+    if (NOW_MS < 0) {
+        return fallback_timeout_ms;
+    }
+    int64_t const REMAINING_MS = deadline_ms - NOW_MS;
+    if (REMAINING_MS <= 0) {
+        errno = ETIMEDOUT;
+        return 0;
+    }
+    return REMAINING_MS > INT_MAX ? INT_MAX : static_cast<int>(REMAINING_MS);
+}
+
+auto wait_fd_ready_until(int fd, short events, int64_t deadline_ms, int fallback_timeout_ms) -> int {
+    for (;;) {
+        int const TIMEOUT_MS = remaining_ms_until(deadline_ms, fallback_timeout_ms);
+        if (TIMEOUT_MS <= 0) {
+            return 0;
+        }
+
+        pollfd pfd{
+            .fd = fd,
+            .events = events,
+            .revents = 0,
+        };
+        int const READY = poll(&pfd, 1, TIMEOUT_MS);
+        if (READY < 0 && errno == EINTR) {
+            continue;
+        }
+        if (READY == 0) {
+            errno = ETIMEDOUT;
+        }
+        return READY;
+    }
+}
+
+auto set_nonblocking_for_timeout(int fd, int& old_flags) -> bool {
+    old_flags = fcntl(fd, F_GETFL, 0);
+    if (old_flags < 0) {
+        return false;
+    }
+    if ((old_flags & O_NONBLOCK) != 0) {
+        return true;
+    }
+    return fcntl(fd, F_SETFL, old_flags | O_NONBLOCK) == 0;
+}
+
+void restore_fd_flags(int fd, int old_flags) {
+    if (old_flags >= 0) {
+        (void)fcntl(fd, F_SETFL, old_flags);
+    }
+}
+
+auto io_error_from_result(ssize_t result) -> int {
+    if (result < -1) {
+        return static_cast<int>(-result);
+    }
+    return errno;
+}
+
+auto retryable_io_error(int err) -> bool { return err == EAGAIN || err == EWOULDBLOCK || err == EINTR; }
+
+auto retryable_io_result(ssize_t result) -> bool { return result < 0 && retryable_io_error(io_error_from_result(result)); }
+
+auto write_all_timeout(int fd, std::string_view data, int timeout_ms) -> bool {
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return false;
+    }
+
     size_t done = 0;
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
     while (done < data.size()) {
+        if (wait_fd_ready_until(fd, POLLOUT, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(fd, old_flags);
+            return false;
+        }
+
+        errno = 0;
         ssize_t const BYTES_WRITTEN = write(fd, data.data() + done, data.size() - done);
-        if (BYTES_WRITTEN <= 0) {
+        if (BYTES_WRITTEN < 0) {
+            if (retryable_io_result(BYTES_WRITTEN)) {
+                continue;
+            }
+            restore_fd_flags(fd, old_flags);
+            return false;
+        }
+        if (BYTES_WRITTEN == 0) {
+            errno = ETIMEDOUT;
+            restore_fd_flags(fd, old_flags);
             return false;
         }
         done += static_cast<size_t>(BYTES_WRITTEN);
     }
+
+    restore_fd_flags(fd, old_flags);
     return true;
 }
+
+auto write_all(int fd, std::string_view data) -> bool { return write_all_timeout(fd, data, DEBUGSERVER_PACKET_IO_TIMEOUT_MS); }
 
 auto send_packet(Session& session, std::string_view payload) -> bool {
     std::string framed;
@@ -150,13 +267,42 @@ auto send_packet(Session& session, std::string_view payload) -> bool {
     return write_all(session.fd, framed);
 }
 
+auto read_exact_timeout(int fd, void* data, size_t len, int64_t deadline_ms, int timeout_ms) -> bool {
+    auto* out = static_cast<char*>(data);
+    size_t done = 0;
+    while (done < len) {
+        if (wait_fd_ready_until(fd, POLLIN, deadline_ms, timeout_ms) <= 0) {
+            return false;
+        }
+
+        errno = 0;
+        ssize_t const BYTES_READ = read(fd, out + done, len - done);
+        if (BYTES_READ < 0) {
+            if (retryable_io_result(BYTES_READ)) {
+                continue;
+            }
+            return false;
+        }
+        if (BYTES_READ == 0) {
+            errno = ECONNRESET;
+            return false;
+        }
+        done += static_cast<size_t>(BYTES_READ);
+    }
+    return true;
+}
+
+auto read_byte_timeout(int fd, char& c, int64_t deadline_ms, int timeout_ms) -> bool {
+    return read_exact_timeout(fd, &c, sizeof(c), deadline_ms, timeout_ms);
+}
+
 auto recv_packet(Session& session, std::string& out) -> bool {
     out.clear();
     session.received_interrupt = false;
     char c = 0;
+    int64_t const DEADLINE_MS = deadline_after_ms(DEBUGSERVER_PACKET_IO_TIMEOUT_MS);
     while (true) {
-        ssize_t const BYTES_READ = read(session.fd, &c, 1);
-        if (BYTES_READ <= 0) {
+        if (!read_byte_timeout(session.fd, c, DEADLINE_MS, DEBUGSERVER_PACKET_IO_TIMEOUT_MS)) {
             return false;
         }
         if (c == '$' || c == 0x03) {
@@ -173,8 +319,7 @@ auto recv_packet(Session& session, std::string& out) -> bool {
 
     uint8_t sum = 0;
     while (true) {
-        ssize_t const BYTES_READ = read(session.fd, &c, 1);
-        if (BYTES_READ <= 0) {
+        if (!read_byte_timeout(session.fd, c, DEADLINE_MS, DEBUGSERVER_PACKET_IO_TIMEOUT_MS)) {
             return false;
         }
         if (c == '#') {
@@ -188,7 +333,7 @@ auto recv_packet(Session& session, std::string& out) -> bool {
     }
 
     std::array<char, 2> csum{};
-    if (read(session.fd, csum.data(), csum.size()) != static_cast<ssize_t>(csum.size())) {
+    if (!read_exact_timeout(session.fd, csum.data(), csum.size(), DEADLINE_MS, DEBUGSERVER_PACKET_IO_TIMEOUT_MS)) {
         return false;
     }
     int const HI = from_hex(csum.at(0));
@@ -1139,7 +1284,7 @@ auto continue_event_loop(Session& session) -> std::string {
             .events = POLLIN,
             .revents = 0,
         };
-        int const POLL_RESULT = poll(&pfd, 1, 10);
+        int const POLL_RESULT = poll(&pfd, 1, DEBUGSERVER_EVENT_POLL_MS);
         if (POLL_RESULT < 0) {
             return "E0b";
         }
@@ -1232,20 +1377,48 @@ auto is_execve_entry(const ker::abi::ptrace::X86_64GprState& regs) -> bool {
 }
 
 auto wait_for_traced_stop(uint64_t pid, int options, int& status) -> bool {
-    pid_t const WAITED = waitpid(static_cast<pid_t>(pid), &status, options);
-    if (WAITED < 0) {
-        std::perror("debugserver: waitpid");
-        return false;
+    for (uint32_t attempt = 0; attempt < DEBUGSERVER_STARTUP_WAIT_RETRIES; attempt++) {
+        status = 0;
+        pid_t const WAITED = waitpid(static_cast<pid_t>(pid), &status, options | WNOHANG);
+        if (WAITED == static_cast<pid_t>(pid)) {
+            if (WIFEXITED(status)) {
+                std::println(stderr, "debugserver: launched process exited with {}", WEXITSTATUS(status));
+                return false;
+            }
+            if (WIFSIGNALED(status)) {
+                std::println(stderr, "debugserver: launched process killed by signal {}", WTERMSIG(status));
+                return false;
+            }
+            if (WIFSTOPPED(status)) {
+                return true;
+            }
+            std::println(stderr, "debugserver: launched process reported unexpected wait status {:#x}", status);
+            return false;
+        }
+        if (WAITED < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            std::perror("debugserver: waitpid");
+            return false;
+        }
+        usleep(DEBUGSERVER_STARTUP_WAIT_POLL_US);
     }
-    if (WIFEXITED(status)) {
-        std::println(stderr, "debugserver: launched process exited with {}", WEXITSTATUS(status));
-        return false;
+
+    std::println(stderr, "debugserver: timed out waiting for launched process {} to stop", static_cast<unsigned long long>(pid));
+    return false;
+}
+
+void terminate_launched_tracee_after_startup_failure(uint64_t pid) {
+    (void)ptrace_call(ker::abi::ptrace::request::KILL, pid, 0, 0);
+    for (uint32_t attempt = 0; attempt < DEBUGSERVER_STARTUP_WAIT_RETRIES; attempt++) {
+        int status = 0;
+        pid_t const WAITED = waitpid(static_cast<pid_t>(pid), &status, WNOHANG);
+        if (WAITED == static_cast<pid_t>(pid) || (WAITED < 0 && errno != EINTR)) {
+            return;
+        }
+        usleep(DEBUGSERVER_STARTUP_WAIT_POLL_US);
     }
-    if (WIFSIGNALED(status)) {
-        std::println(stderr, "debugserver: launched process killed by signal {}", WTERMSIG(status));
-        return false;
-    }
-    return WIFSTOPPED(status);
 }
 
 auto launch_tracee(char** command_argv) -> int {
@@ -1331,6 +1504,7 @@ auto launch_process(char** command_argv, bool break_on_start, uint64_t& pid) -> 
 
     int status = 0;
     if (!wait_for_traced_stop(pid, WUNTRACED, status)) {
+        terminate_launched_tracee_after_startup_failure(pid);
         return false;
     }
 
@@ -1338,7 +1512,11 @@ auto launch_process(char** command_argv, bool break_on_start, uint64_t& pid) -> 
         return true;
     }
 
-    return run_to_exec_start(pid);
+    if (!run_to_exec_start(pid)) {
+        terminate_launched_tracee_after_startup_failure(pid);
+        return false;
+    }
+    return true;
 }
 
 auto parse_port(std::string_view text, uint16_t& port) -> bool {

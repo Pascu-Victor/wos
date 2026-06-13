@@ -105,8 +105,8 @@ struct ScopedDir {
 
 class TerminalMode {
    public:
-    TerminalMode() {
-        if (!isatty(STDIN_FILENO)) {
+    explicit TerminalMode(bool interactive) {
+        if (!interactive) {
             return;
         }
         if (tcgetattr(STDIN_FILENO, &old_term) != 0) {
@@ -791,12 +791,14 @@ auto append_visible_line(std::string& out, std::string_view line, int col_offset
     }
 }
 
-auto render(const Snapshot& snap, const Snapshot* previous, int row_offset, int col_offset) -> std::string {
+auto render(const Snapshot& snap, const Snapshot* previous, int row_offset, int col_offset, bool interactive) -> std::string {
     TerminalSize const TERM = terminal_size();
     CpuPercent const CPU = cpu_percent_from_delta(previous != nullptr ? diff_cpu(snap.cpu, previous->cpu) : snap.cpu);
     std::string out;
     out.reserve(8192);
-    out += "\r\x1b[H\x1b[2J\x1b[H\x1b[?25l";
+    if (interactive) {
+        out += "\r\x1b[H\x1b[2J\x1b[H\x1b[?25l";
+    }
     int rendered_lines = 0;
     auto append_screen_line = [&](std::string_view text) -> bool {
         if (rendered_lines >= TERM.rows) {
@@ -886,6 +888,7 @@ auto render(const Snapshot& snap, const Snapshot* previous, int row_offset, int 
 enum class Key : uint8_t {
     NONE,
     QUIT,
+    INPUT_CLOSED,
     UP,
     DOWN,
     LEFT,
@@ -899,6 +902,15 @@ enum class Key : uint8_t {
 auto read_key() -> Key {
     std::array<char, 16> buf{};
     ssize_t const N = read(STDIN_FILENO, buf.data(), buf.size());
+    if (N == 0) {
+        return Key::INPUT_CLOSED;
+    }
+    if (N < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+            return Key::NONE;
+        }
+        return Key::INPUT_CLOSED;
+    }
     if (N <= 0) {
         return Key::NONE;
     }
@@ -966,6 +978,7 @@ void apply_key(Key key, int& row_offset, int& col_offset, int row_count) {
             break;
         case Key::NONE:
         case Key::QUIT:
+        case Key::INPUT_CLOSED:
             break;
     }
 }
@@ -985,7 +998,8 @@ auto parse_interval_ms(int argc, char** argv) -> int {
 
 int main(int argc, char** argv) {
     int const INTERVAL_MS = parse_interval_ms(argc, argv);
-    [[maybe_unused]] TerminalMode const terminal_mode;
+    bool const INTERACTIVE = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+    [[maybe_unused]] TerminalMode const terminal_mode(INTERACTIVE);
     auto users = read_passwd();
 
     std::optional<Snapshot> previous;
@@ -999,12 +1013,16 @@ int main(int argc, char** argv) {
         int const PAGE = std::max(1, TERM.rows - HEADER_LINES);
         row_offset = std::clamp(row_offset, 0, std::max(0, static_cast<int>(snap.rows.size()) - PAGE));
 
-        std::string screen = render(snap, previous.has_value() ? &*previous : nullptr, row_offset, col_offset);
+        std::string screen = render(snap, previous.has_value() ? &*previous : nullptr, row_offset, col_offset, INTERACTIVE);
         if (!write_all(STDOUT_FILENO, screen)) {
             return 1;
         }
 
         previous = std::move(snap);
+        if (!INTERACTIVE) {
+            break;
+        }
+
         int remaining_ms = INTERVAL_MS;
         while (remaining_ms > 0 && !quit) {
             int const WAIT_MS = std::min(remaining_ms, 100);
@@ -1014,9 +1032,20 @@ int main(int argc, char** argv) {
                 .revents = 0,
             };
             int const READY = poll(&pfd, 1, WAIT_MS);
+            if (READY < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                quit = true;
+                break;
+            }
+            if (READY > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+                quit = true;
+                break;
+            }
             if (READY > 0 && (pfd.revents & POLLIN) != 0) {
                 Key const KEY = read_key();
-                if (KEY == Key::QUIT) {
+                if (KEY == Key::QUIT || KEY == Key::INPUT_CLOSED) {
                     quit = true;
                     break;
                 }

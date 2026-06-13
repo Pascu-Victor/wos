@@ -5,13 +5,18 @@
 #include <arpa/inet.h>
 #include <bits/ssize_t.h>
 #include <bits/timeval.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -38,10 +43,14 @@ struct BenchHeader {
 
 constexpr uint32_t BENCH_MAGIC = 0x57424e43;
 constexpr uint32_t BENCH_VERSION = 1;
+constexpr int DEFAULT_NETBENCH_TIMEOUT_MS = 30000;
+constexpr int MSEC_PER_SEC = 1000;
+constexpr int NSEC_PER_MSEC = 1000000;
 
 struct ServerOptions {
     uint16_t port = 9000;
     uint32_t sessions = 1;
+    int timeout_ms = DEFAULT_NETBENCH_TIMEOUT_MS;
 };
 
 struct ClientOptions {
@@ -51,6 +60,7 @@ struct ClientOptions {
     uint32_t payload_size = 1024;
     uint32_t iterations = 1000;
     uint64_t total_bytes = 64ULL * 1024ULL * 1024ULL;
+    int timeout_ms = DEFAULT_NETBENCH_TIMEOUT_MS;
 };
 
 auto parse_u32(const char* value, uint32_t* out) -> bool {
@@ -79,37 +89,172 @@ auto parse_u64(const char* value, uint64_t* out) -> bool {
     return true;
 }
 
-void print_usage() {
-    std::println("Usage:");
-    std::println("  testprog netbench-server --port <port> [--sessions N]");
-    std::println(
-        "  testprog netbench-client --host <ipv4> --port <port> --mode pingpong|stream [--payload-size N] [--iterations N] [--total-bytes "
-        "N]");
-}
-
-auto recv_all(int fd, void* buf, size_t len) -> bool {
-    auto* dst = static_cast<uint8_t*>(buf);
-    size_t offset = 0;
-    while (offset < len) {
-        ssize_t const RET = recv(fd, dst + offset, len - offset, 0);
-        if (RET <= 0) {
-            return false;
-        }
-        offset += static_cast<size_t>(RET);
+auto parse_timeout_ms(const char* value, int* out) -> bool {
+    uint32_t parsed = 0;
+    if (!parse_u32(value, &parsed) || parsed == 0 || parsed > static_cast<uint32_t>(INT_MAX)) {
+        return false;
     }
+    *out = static_cast<int>(parsed);
     return true;
 }
 
-auto send_all(int fd, const void* buf, size_t len) -> bool {
-    const auto* src = static_cast<const uint8_t*>(buf);
+void print_usage() {
+    std::println("Usage:");
+    std::println("  testprog netbench-server --port <port> [--sessions N] [--timeout-ms N]");
+    std::println(
+        "  testprog netbench-client --host <ipv4> --port <port> --mode pingpong|stream [--payload-size N] [--iterations N] [--total-bytes "
+        "N] [--timeout-ms N]");
+}
+
+auto monotonic_now_ms() -> int64_t {
+    timespec ts{};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return -1;
+    }
+    return (static_cast<int64_t>(ts.tv_sec) * MSEC_PER_SEC) + (static_cast<int64_t>(ts.tv_nsec) / NSEC_PER_MSEC);
+}
+
+auto deadline_after_ms(int timeout_ms) -> int64_t {
+    int64_t const NOW_MS = monotonic_now_ms();
+    if (NOW_MS < 0) {
+        return -1;
+    }
+    return NOW_MS + timeout_ms;
+}
+
+auto remaining_ms_until(int64_t deadline_ms, int fallback_timeout_ms) -> int {
+    if (deadline_ms < 0) {
+        return fallback_timeout_ms;
+    }
+    int64_t const NOW_MS = monotonic_now_ms();
+    if (NOW_MS < 0) {
+        return fallback_timeout_ms;
+    }
+    int64_t const REMAINING_MS = deadline_ms - NOW_MS;
+    if (REMAINING_MS <= 0) {
+        errno = ETIMEDOUT;
+        return 0;
+    }
+    return REMAINING_MS > INT_MAX ? INT_MAX : static_cast<int>(REMAINING_MS);
+}
+
+auto wait_fd_ready_until(int fd, short events, int64_t deadline_ms, int fallback_timeout_ms) -> int {
+    for (;;) {
+        int const TIMEOUT_MS = remaining_ms_until(deadline_ms, fallback_timeout_ms);
+        if (TIMEOUT_MS <= 0) {
+            return 0;
+        }
+
+        struct pollfd pfd{
+            .fd = fd,
+            .events = events,
+            .revents = 0,
+        };
+        int const READY = poll(&pfd, 1, TIMEOUT_MS);
+        if (READY < 0 && errno == EINTR) {
+            continue;
+        }
+        if (READY == 0) {
+            errno = ETIMEDOUT;
+        }
+        return READY;
+    }
+}
+
+auto set_nonblocking_for_timeout(int fd, int& old_flags) -> bool {
+    old_flags = fcntl(fd, F_GETFL, 0);
+    if (old_flags < 0) {
+        return false;
+    }
+    if ((old_flags & O_NONBLOCK) != 0) {
+        return true;
+    }
+    return fcntl(fd, F_SETFL, old_flags | O_NONBLOCK) == 0;
+}
+
+void restore_fd_flags(int fd, int old_flags) {
+    if (old_flags >= 0) {
+        (void)fcntl(fd, F_SETFL, old_flags);
+    }
+}
+
+auto socket_error_from_result(ssize_t result) -> int {
+    if (result < -1) {
+        return static_cast<int>(-result);
+    }
+    return errno;
+}
+
+auto retryable_socket_error(int err) -> bool {
+    return err == EAGAIN || err == EWOULDBLOCK || err == EINTR || err == EINPROGRESS || err == EALREADY;
+}
+
+auto retryable_socket_result(ssize_t result) -> bool { return result < 0 && retryable_socket_error(socket_error_from_result(result)); }
+
+auto recv_all_timeout(int fd, void* buf, size_t len, int timeout_ms) -> bool {
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return false;
+    }
+
+    auto* dst = static_cast<uint8_t*>(buf);
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
     size_t offset = 0;
     while (offset < len) {
-        ssize_t const RET = send(fd, src + offset, len - offset, 0);
-        if (RET <= 0) {
+        if (wait_fd_ready_until(fd, POLLIN, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(fd, old_flags);
+            return false;
+        }
+        errno = 0;
+        ssize_t const RET = recv(fd, dst + offset, len - offset, 0);
+        if (RET < 0) {
+            if (retryable_socket_result(RET)) {
+                continue;
+            }
+            restore_fd_flags(fd, old_flags);
+            return false;
+        }
+        if (RET == 0) {
+            restore_fd_flags(fd, old_flags);
             return false;
         }
         offset += static_cast<size_t>(RET);
     }
+    restore_fd_flags(fd, old_flags);
+    return true;
+}
+
+auto send_all_timeout(int fd, const void* buf, size_t len, int timeout_ms) -> bool {
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return false;
+    }
+
+    const auto* src = static_cast<const uint8_t*>(buf);
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
+    size_t offset = 0;
+    while (offset < len) {
+        if (wait_fd_ready_until(fd, POLLOUT, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(fd, old_flags);
+            return false;
+        }
+        errno = 0;
+        ssize_t const RET = send(fd, src + offset, len - offset, 0);
+        if (RET < 0) {
+            if (retryable_socket_result(RET)) {
+                continue;
+            }
+            restore_fd_flags(fd, old_flags);
+            return false;
+        }
+        if (RET == 0) {
+            errno = ETIMEDOUT;
+            restore_fd_flags(fd, old_flags);
+            return false;
+        }
+        offset += static_cast<size_t>(RET);
+    }
+    restore_fd_flags(fd, old_flags);
     return true;
 }
 
@@ -151,7 +296,73 @@ auto open_server_socket(uint16_t port) -> int {
     return FD;
 }
 
-auto connect_to_host(const char* host, uint16_t port) -> int {
+auto accept_timeout(int fd, int timeout_ms) -> int {
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return -1;
+    }
+
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
+    for (;;) {
+        if (wait_fd_ready_until(fd, POLLIN, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
+
+        errno = 0;
+        int const CLIENT = accept(fd, nullptr, nullptr);
+        if (CLIENT >= 0) {
+            restore_fd_flags(fd, old_flags);
+            return CLIENT;
+        }
+        if (retryable_socket_result(CLIENT)) {
+            continue;
+        }
+        restore_fd_flags(fd, old_flags);
+        return -1;
+    }
+}
+
+auto connect_timeout(int fd, const sockaddr* addr, socklen_t addrlen, int timeout_ms) -> int {
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return -1;
+    }
+
+    errno = 0;
+    int const CONNECT_RET = connect(fd, addr, addrlen);
+    if (CONNECT_RET == 0) {
+        restore_fd_flags(fd, old_flags);
+        return 0;
+    }
+    if (!retryable_socket_result(CONNECT_RET)) {
+        restore_fd_flags(fd, old_flags);
+        return -1;
+    }
+
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
+    for (;;) {
+        if (wait_fd_ready_until(fd, POLLOUT, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
+
+        errno = 0;
+        int const RETRY_RET = connect(fd, addr, addrlen);
+        int const RETRY_ERR = socket_error_from_result(RETRY_RET);
+        if (RETRY_RET == 0 || RETRY_ERR == EISCONN) {
+            restore_fd_flags(fd, old_flags);
+            return 0;
+        }
+        if (retryable_socket_error(RETRY_ERR)) {
+            continue;
+        }
+        restore_fd_flags(fd, old_flags);
+        return -1;
+    }
+}
+
+auto connect_to_host(const char* host, uint16_t port, int timeout_ms) -> int {
     int const FD = socket(AF_INET, SOCK_STREAM, 0);
     if (FD < 0) {
         return -1;
@@ -167,7 +378,7 @@ auto connect_to_host(const char* host, uint16_t port) -> int {
         return -1;
     }
 
-    if (connect(FD, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    if (connect_timeout(FD, reinterpret_cast<sockaddr*>(&addr), sizeof(addr), timeout_ms) != 0) {
         close(FD);
         return -1;
     }
@@ -181,16 +392,16 @@ void fill_payload(uint8_t* buf, uint32_t len) {
     }
 }
 
-auto handle_pingpong_server(int client_fd, const BenchHeader& header) -> bool {
+auto handle_pingpong_server(int client_fd, const BenchHeader& header, int timeout_ms) -> bool {
     std::vector<uint8_t> buf(header.payload_size);
 
     bool ok = true;
     for (uint32_t i = 0; i < header.iterations; ++i) {
-        ok = recv_all(client_fd, buf.data(), buf.size());
+        ok = recv_all_timeout(client_fd, buf.data(), buf.size(), timeout_ms);
         if (!ok) {
             break;
         }
-        ok = send_all(client_fd, buf.data(), buf.size());
+        ok = send_all_timeout(client_fd, buf.data(), buf.size(), timeout_ms);
         if (!ok) {
             break;
         }
@@ -199,7 +410,7 @@ auto handle_pingpong_server(int client_fd, const BenchHeader& header) -> bool {
     return ok;
 }
 
-auto handle_stream_server(int client_fd, const BenchHeader& header) -> bool {
+auto handle_stream_server(int client_fd, const BenchHeader& header, int timeout_ms) -> bool {
     std::vector<uint8_t> buf(header.payload_size);
 
     uint64_t remaining = header.total_bytes;
@@ -209,7 +420,7 @@ auto handle_stream_server(int client_fd, const BenchHeader& header) -> bool {
         if (remaining < chunk) {
             chunk = static_cast<uint32_t>(remaining);
         }
-        ok = recv_all(client_fd, buf.data(), chunk);
+        ok = recv_all_timeout(client_fd, buf.data(), chunk, timeout_ms);
         if (!ok) {
             break;
         }
@@ -218,7 +429,7 @@ auto handle_stream_server(int client_fd, const BenchHeader& header) -> bool {
 
     uint64_t ack = header.total_bytes - remaining;
     if (ok) {
-        ok = send_all(client_fd, &ack, sizeof(ack));
+        ok = send_all_timeout(client_fd, &ack, sizeof(ack), timeout_ms);
     }
 
     return ok;
@@ -239,6 +450,11 @@ auto run_server(int argc, char** argv) -> int {
                 print_usage();
                 return 1;
             }
+        } else if (std::strcmp(argv[i], "--timeout-ms") == 0 && i + 1 < argc) {
+            if (!parse_timeout_ms(argv[++i], &options.timeout_ms)) {
+                print_usage();
+                return 1;
+            }
         } else {
             print_usage();
             return 1;
@@ -255,7 +471,7 @@ auto run_server(int argc, char** argv) -> int {
 
     uint32_t completed = 0;
     while (completed < options.sessions) {
-        int const CLIENT_FD = accept(SERVER_FD, nullptr, nullptr);
+        int const CLIENT_FD = accept_timeout(SERVER_FD, options.timeout_ms);
         if (CLIENT_FD < 0) {
             close(SERVER_FD);
             return 1;
@@ -263,7 +479,7 @@ auto run_server(int argc, char** argv) -> int {
         tune_tcp_low_latency(CLIENT_FD);
 
         BenchHeader header{};
-        bool ok = recv_all(CLIENT_FD, &header, sizeof(header));
+        bool ok = recv_all_timeout(CLIENT_FD, &header, sizeof(header), options.timeout_ms);
         if (!ok || header.magic != BENCH_MAGIC || header.version != BENCH_VERSION || header.payload_size == 0) {
             std::println("netbench-server: invalid session header");
             close(CLIENT_FD);
@@ -272,9 +488,9 @@ auto run_server(int argc, char** argv) -> int {
         }
 
         if (header.mode == static_cast<uint32_t>(BenchMode::K_PINGPONG)) {
-            ok = handle_pingpong_server(CLIENT_FD, header);
+            ok = handle_pingpong_server(CLIENT_FD, header, options.timeout_ms);
         } else if (header.mode == static_cast<uint32_t>(BenchMode::K_STREAM)) {
-            ok = handle_stream_server(CLIENT_FD, header);
+            ok = handle_stream_server(CLIENT_FD, header, options.timeout_ms);
         } else {
             ok = false;
         }
@@ -329,6 +545,11 @@ auto run_client(int argc, char** argv) -> int {
                 print_usage();
                 return 1;
             }
+        } else if (std::strcmp(argv[i], "--timeout-ms") == 0 && i + 1 < argc) {
+            if (!parse_timeout_ms(argv[++i], &options.timeout_ms)) {
+                print_usage();
+                return 1;
+            }
         } else {
             print_usage();
             return 1;
@@ -344,7 +565,7 @@ auto run_client(int argc, char** argv) -> int {
         options.total_bytes = std::max<uint64_t>(options.total_bytes, options.payload_size);
     }
 
-    int const FD = connect_to_host(options.host, options.port);
+    int const FD = connect_to_host(options.host, options.port, options.timeout_ms);
     if (FD < 0) {
         std::println("netbench-client: failed to connect to {}:{}", options.host, options.port);
         return 1;
@@ -358,7 +579,7 @@ auto run_client(int argc, char** argv) -> int {
     header.iterations = options.iterations;
     header.total_bytes = options.total_bytes;
 
-    if (!send_all(FD, &header, sizeof(header))) {
+    if (!send_all_timeout(FD, &header, sizeof(header), options.timeout_ms)) {
         close(FD);
         return 1;
     }
@@ -370,11 +591,11 @@ auto run_client(int argc, char** argv) -> int {
     bool ok = true;
     if (options.mode == BenchMode::K_PINGPONG) {
         for (uint32_t i = 0; i < options.iterations; ++i) {
-            ok = send_all(FD, payload.data(), payload.size());
+            ok = send_all_timeout(FD, payload.data(), payload.size(), options.timeout_ms);
             if (!ok) {
                 break;
             }
-            ok = recv_all(FD, payload.data(), payload.size());
+            ok = recv_all_timeout(FD, payload.data(), payload.size(), options.timeout_ms);
             if (!ok) {
                 break;
             }
@@ -386,7 +607,7 @@ auto run_client(int argc, char** argv) -> int {
             if (remaining < chunk) {
                 chunk = static_cast<uint32_t>(remaining);
             }
-            ok = send_all(FD, payload.data(), chunk);
+            ok = send_all_timeout(FD, payload.data(), chunk, options.timeout_ms);
             if (!ok) {
                 break;
             }
@@ -394,7 +615,7 @@ auto run_client(int argc, char** argv) -> int {
         }
         uint64_t ack = 0;
         if (ok) {
-            ok = recv_all(FD, &ack, sizeof(ack)) && ack == options.total_bytes;
+            ok = recv_all_timeout(FD, &ack, sizeof(ack), options.timeout_ms) && ack == options.total_bytes;
         }
     }
     uint64_t const ELAPSED_US = wallclock_us() - START_US;

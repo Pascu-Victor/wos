@@ -34,6 +34,8 @@ namespace {
 
 constexpr uint64_t TRACE_SYSGOOD_OPTION = 0x00000001ULL;
 constexpr size_t MAX_STRING_LEN = 256;
+constexpr uint32_t STRACE_STARTUP_WAIT_RETRIES = 500;
+constexpr useconds_t STRACE_STARTUP_WAIT_POLL_US = 10 * 1000;
 
 auto strace_path_arg() -> char* {
     static std::array<char, sizeof("/usr/bin/strace")> arg{"/usr/bin/strace"};
@@ -669,6 +671,51 @@ auto exec_strace_remote_attach(const ker::abi::ptrace::RemoteInfo& info) -> int 
     return 127;
 }
 
+auto wait_for_trace_startup_stop(pid_t pid, int& status) -> bool {
+    for (uint32_t attempt = 0; attempt < STRACE_STARTUP_WAIT_RETRIES; attempt++) {
+        status = 0;
+        pid_t const WAITED = waitpid(pid, &status, WUNTRACED | WNOHANG);
+        if (WAITED == pid) {
+            if (WIFSTOPPED(status)) {
+                return true;
+            }
+            if (WIFEXITED(status)) {
+                std::println(stderr, "strace: pid {} exited with {} before tracing", static_cast<int>(pid), WEXITSTATUS(status));
+            } else if (WIFSIGNALED(status)) {
+                std::println(stderr, "strace: pid {} was killed by signal {} before tracing", static_cast<int>(pid), WTERMSIG(status));
+            } else {
+                std::println(stderr, "strace: pid {} reported unexpected startup wait status {:#x}", static_cast<int>(pid), status);
+            }
+            return false;
+        }
+        if (WAITED < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            std::perror("strace: waitpid");
+            return false;
+        }
+        usleep(STRACE_STARTUP_WAIT_POLL_US);
+    }
+
+    std::println(stderr, "strace: timed out waiting for pid {} to stop before tracing", static_cast<int>(pid));
+    return false;
+}
+
+void reap_tracee_after_startup_failure(pid_t pid) {
+    (void)kill(pid, SIGKILL);
+    for (uint32_t attempt = 0; attempt < STRACE_STARTUP_WAIT_RETRIES; attempt++) {
+        int status = 0;
+        pid_t const WAITED = waitpid(pid, &status, WNOHANG);
+        if (WAITED == pid || (WAITED < 0 && errno != EINTR)) {
+            return;
+        }
+        usleep(STRACE_STARTUP_WAIT_POLL_US);
+    }
+}
+
+void detach_tracee_after_startup_failure(uint64_t pid) { (void)ptrace_call(ker::abi::ptrace::request::DETACH, pid, 0, 0); }
+
 auto trace_loop(uint64_t pid) -> int {
     std::unordered_map<uint64_t, PendingSyscall> pending;
 
@@ -682,6 +729,9 @@ auto trace_loop(uint64_t pid) -> int {
         int status = 0;
         pid_t const WAITED = waitpid(static_cast<pid_t>(pid), &status, 0);
         if (WAITED < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
             std::perror("strace: waitpid");
             return 1;
         }
@@ -770,8 +820,8 @@ auto attach_and_trace(uint64_t pid, bool route_proxy) -> int {
         return 1;
     }
     int status = 0;
-    if (waitpid(static_cast<pid_t>(pid), &status, WUNTRACED) < 0) {
-        std::perror("strace: waitpid");
+    if (!wait_for_trace_startup_stop(static_cast<pid_t>(pid), status)) {
+        detach_tracee_after_startup_failure(pid);
         return 1;
     }
     return trace_loop(pid);
@@ -787,8 +837,8 @@ auto trace_command(char** argv) -> int {
         return launch_tracee(argv);
     }
     int status = 0;
-    if (waitpid(CHILD, &status, WUNTRACED) < 0) {
-        std::perror("strace: waitpid");
+    if (!wait_for_trace_startup_stop(CHILD, status)) {
+        reap_tracee_after_startup_failure(CHILD);
         return 1;
     }
     if (target_is_proxy(static_cast<uint64_t>(CHILD))) {

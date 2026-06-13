@@ -1,5 +1,6 @@
 #include "cowbench.hpp"
 
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <time.h>  // NOLINT(modernize-deprecated-headers): WOS POSIX clock declarations live here.
@@ -20,18 +21,22 @@ constexpr uint32_t DEFAULT_CHILDREN = 4;
 constexpr uint32_t DEFAULT_ITERATIONS = 5;
 constexpr uint64_t DEFAULT_BYTES = 32ULL * 1024ULL * 1024ULL;
 constexpr uint32_t DEFAULT_WRITE_PAGES = 256;
+constexpr uint32_t DEFAULT_CHILD_TIMEOUT_MS = 30000;
+constexpr uint32_t CHILD_WAIT_POLL_US = 1000;
+constexpr uint64_t NSEC_PER_MSEC = 1000000ULL;
 
 struct CowOptions {
     uint64_t bytes = DEFAULT_BYTES;
     uint32_t children = DEFAULT_CHILDREN;
     uint32_t iterations = DEFAULT_ITERATIONS;
     uint32_t write_pages = DEFAULT_WRITE_PAGES;
+    uint32_t child_timeout_ms = DEFAULT_CHILD_TIMEOUT_MS;
     bool verbose = false;
 };
 
 auto monotonic_ns() -> uint64_t {
     struct timespec ts{};
-    clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return (static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL) + static_cast<uint64_t>(ts.tv_nsec);
 }
 
@@ -90,8 +95,10 @@ auto parse_size(const char* text, uint64_t& out, bool allow_zero) -> bool {
 
 void print_usage() {
     std::println("Usage:");
-    std::println("  testprog fork-cow [--bytes N[k|m|g]] [--children N] [--iterations N] [--write-pages N] [--verbose]");
-    std::println("  testprog cow      [--bytes N[k|m|g]] [--children N] [--iterations N] [--write-pages N] [--verbose]");
+    std::println(
+        "  testprog fork-cow [--bytes N[k|m|g]] [--children N] [--iterations N] [--write-pages N] [--child-timeout-ms N] [--verbose]");
+    std::println(
+        "  testprog cow      [--bytes N[k|m|g]] [--children N] [--iterations N] [--write-pages N] [--child-timeout-ms N] [--verbose]");
 }
 
 auto parse_options(int argc, char** argv, CowOptions& options) -> bool {
@@ -120,6 +127,13 @@ auto parse_options(int argc, char** argv, CowOptions& options) -> bool {
         if (std::strcmp(argv[i], "--write-pages") == 0 && i + 1 < argc) {
             if (!parse_u32(argv[++i], options.write_pages, true)) {
                 std::println(stderr, "fork-cow: invalid --write-pages '{}'", argv[i]);
+                return false;
+            }
+            continue;
+        }
+        if (std::strcmp(argv[i], "--child-timeout-ms") == 0 && i + 1 < argc) {
+            if (!parse_u32(argv[++i], options.child_timeout_ms, false)) {
+                std::println(stderr, "fork-cow: invalid --child-timeout-ms '{}'", argv[i]);
                 return false;
             }
             continue;
@@ -194,11 +208,26 @@ auto run_child(uint8_t* region, size_t page_count, uint32_t write_pages, uint32_
     return 0;
 }
 
-auto wait_for_child(pid_t pid) -> bool {
-    for (;;) {
-        int status = 0;
+auto reap_child_after_timeout(pid_t pid) -> void {
+    (void)kill(pid, SIGKILL);
+    for (uint32_t retry = 0; retry < 1000; ++retry) {
+        int reap_status = 0;
+        pid_t const REAPED = waitpid(pid, &reap_status, WNOHANG);
+        if (REAPED == pid || (REAPED < 0 && errno != EINTR)) {
+            return;
+        }
+        usleep(CHILD_WAIT_POLL_US);
+    }
+}
+
+auto wait_for_child(pid_t pid, uint32_t timeout_ms) -> bool {
+    uint64_t const START_NS = monotonic_ns();
+    uint64_t const TIMEOUT_NS = static_cast<uint64_t>(timeout_ms) * NSEC_PER_MSEC;
+    int status = 0;
+
+    while (monotonic_ns() - START_NS <= TIMEOUT_NS) {
         errno = 0;
-        pid_t const WAITED = waitpid(pid, &status, 0);
+        pid_t const WAITED = waitpid(pid, &status, WNOHANG);
         if (WAITED < 0) {
             if (errno == EINTR) {
                 continue;
@@ -207,6 +236,7 @@ auto wait_for_child(pid_t pid) -> bool {
             return false;
         }
         if (WAITED == 0) {
+            usleep(CHILD_WAIT_POLL_US);
             continue;
         }
         if (WAITED != pid) {
@@ -224,6 +254,10 @@ auto wait_for_child(pid_t pid) -> bool {
         }
         return true;
     }
+
+    std::println(stderr, "fork-cow: child {} timed out after {}ms", static_cast<int>(pid), timeout_ms);
+    reap_child_after_timeout(pid);
+    return false;
 }
 
 auto run_stress(const CowOptions& options) -> int {
@@ -250,8 +284,9 @@ auto run_stress(const CowOptions& options) -> int {
     initialize_region(REGION, PAGE_COUNT);
 
     if (options.verbose) {
-        std::println(stderr, "fork-cow: bytes={} pages={} children={} iterations={} write_pages={}", static_cast<uint64_t>(MAP_BYTES),
-                     static_cast<uint64_t>(PAGE_COUNT), options.children, options.iterations, options.write_pages);
+        std::println(stderr, "fork-cow: bytes={} pages={} children={} iterations={} write_pages={} child_timeout_ms={}",
+                     static_cast<uint64_t>(MAP_BYTES), static_cast<uint64_t>(PAGE_COUNT), options.children, options.iterations,
+                     options.write_pages, options.child_timeout_ms);
     }
 
     uint64_t const START_NS = monotonic_ns();
@@ -271,7 +306,7 @@ auto run_stress(const CowOptions& options) -> int {
                 _exit(run_child(REGION, PAGE_COUNT, options.write_pages, iteration, child));
             }
             ++forks;
-            if (!wait_for_child(PID)) {
+            if (!wait_for_child(PID, options.child_timeout_ms)) {
                 munmap(REGION, MAP_BYTES);
                 return 1;
             }

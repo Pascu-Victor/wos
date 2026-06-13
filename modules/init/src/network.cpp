@@ -8,9 +8,12 @@
 #include <callnums/sys_log.h>
 #include <fcntl.h>
 #include <net/if.h>
+#include <signal.h>  // NOLINT(modernize-deprecated-headers): WOS signal constants live here.
 #include <sys/ioctl.h>
 #include <sys/logging.h>
+#include <sys/process.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <time.h>  // NOLINT(modernize-deprecated-headers): WOS POSIX clock declarations live here.
 #include <unistd.h>
 #include <wos/netctl.h>
@@ -33,7 +36,9 @@ using init_log = wos::journal<"init">;
 constexpr const char* NET_IFNAME = "eth0";
 constexpr long POLL_FIRST_DIAGNOSTIC_SECS = 45;
 constexpr long POLL_STATUS_INTERVAL_SECS = 60;
+constexpr long POLL_FAILURE_TIMEOUT_SECS = 180;
 constexpr long POLL_INTERVAL_MS = 50;
+constexpr uint32_t NETD_KILL_REAP_RETRIES = 1000;
 constexpr size_t IF_DEBUG_CAP = 16;
 constexpr size_t ADDR_DEBUG_CAP = 32;
 constexpr size_t JOURNAL_READ_BATCH = 16;
@@ -368,6 +373,26 @@ void dump_network_failure_debug(const char* reason, uint64_t netd_pid, const Pol
     dump_journal_snapshot();
     init_log::critical("network debug: === end network startup diagnostic dump ===");
 }
+
+void terminate_netd_after_startup_timeout(int64_t netd_pid) {
+    if (netd_pid <= 0) {
+        return;
+    }
+
+    (void)ker::process::kill(netd_pid, SIGKILL);
+    for (uint32_t retry = 0; retry < NETD_KILL_REAP_RETRIES; retry++) {
+        int32_t status = 0;
+        int64_t const REAPED = ker::process::waitpid(netd_pid, &status, WNOHANG, nullptr);
+        if (REAPED == netd_pid || (REAPED < 0 && REAPED != -EINTR)) {
+            return;
+        }
+        struct timespec const POLL_SLEEP{
+            .tv_sec = 0,
+            .tv_nsec = POLL_INTERVAL_MS * 1000L * 1000L,
+        };
+        nanosleep(&POLL_SLEEP, nullptr);
+    }
+}
 }  // namespace
 
 auto start_network() -> bool {
@@ -452,6 +477,15 @@ auto start_network() -> bool {
             init_log::warn("init[%llu]: still waiting for eth0 IPv4 configuration after %ld seconds",
                            static_cast<unsigned long long>(CPUNO), ELAPSED_SECS);
             next_status_secs += POLL_STATUS_INTERVAL_SECS;
+        }
+        if (ELAPSED_SECS >= POLL_FAILURE_TIMEOUT_SECS) {
+            init_log::critical("init[%llu]: eth0 not configured after %ld seconds; failing network startup",
+                               static_cast<unsigned long long>(CPUNO), POLL_FAILURE_TIMEOUT_SECS);
+            dump_network_failure_debug("eth0 did not receive a non-zero IPv4 address before the startup timeout", NETD_PID, &poll,
+                                       POLL_SOCK);
+            terminate_netd_after_startup_timeout(static_cast<int64_t>(NETD_PID));
+            close(POLL_SOCK);
+            return false;
         }
         struct timespec const POLL_SLEEP{
             .tv_sec = 0,

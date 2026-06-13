@@ -3,13 +3,16 @@
 #include <abi-bits/resource.h>
 #include <bits/ssize_t.h>
 #include <callnums/sys_log.h>
+#include <signal.h>  // NOLINT(modernize-deprecated-headers): WOS signal constants live here.
 #include <sys/logging.h>
 #include <sys/process.h>
 #include <sys/vfs.h>
+#include <sys/wait.h>
 #include <time.h>  // NOLINT(modernize-deprecated-headers): WOS POSIX sleep declarations live here.
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <ctime>
 #include <span>
@@ -21,7 +24,52 @@ namespace {
 constexpr int BACKGROUND_SERVICE_NICE = 10;
 constexpr size_t PIPE_READ = 0;
 constexpr size_t PIPE_WRITE = 1;
+constexpr uint32_t DROPBEAR_KEYGEN_TIMEOUT_MS = 30000;
+constexpr uint32_t CHILD_WAIT_POLL_US = 1000;
+constexpr uint64_t NSEC_PER_MSEC = 1000000ULL;
 using init_log = wos::journal<"init">;
+
+auto monotonic_ns() -> uint64_t {
+    timespec ts{};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL) + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+void reap_child_after_timeout(int64_t pid) {
+    (void)ker::process::kill(pid, SIGKILL);
+    for (uint32_t retry = 0; retry < 1000; ++retry) {
+        int32_t reap_status = 0;
+        int64_t const REAPED = ker::process::waitpid(pid, &reap_status, WNOHANG, nullptr);
+        if (REAPED == pid || (REAPED < 0 && REAPED != -EINTR)) {
+            return;
+        }
+        usleep(CHILD_WAIT_POLL_US);
+    }
+}
+
+auto wait_for_child_timeout(int64_t pid, int32_t* status, uint32_t timeout_ms) -> bool {
+    uint64_t const START_NS = monotonic_ns();
+    uint64_t const TIMEOUT_NS = static_cast<uint64_t>(timeout_ms) * NSEC_PER_MSEC;
+    uint64_t waited_us = 0;
+
+    while ((START_NS != 0 && monotonic_ns() - START_NS <= TIMEOUT_NS) ||
+           (START_NS == 0 && waited_us <= static_cast<uint64_t>(timeout_ms) * 1000ULL)) {
+        int64_t const WAITED = ker::process::waitpid(pid, status, WNOHANG, nullptr);
+        if (WAITED == pid) {
+            return true;
+        }
+        if (WAITED < 0 && WAITED != -EINTR) {
+            return false;
+        }
+        usleep(CHILD_WAIT_POLL_US);
+        waited_us += CHILD_WAIT_POLL_US;
+    }
+
+    reap_child_after_timeout(pid);
+    return false;
+}
 
 }  // namespace
 
@@ -174,9 +222,14 @@ void start_dropbear() {
         if (KEYGEN_PID == 0) {
             init_log::error("init[%llu]: failed to spawn dropbearkey", static_cast<unsigned long long>(CPUNO));
         } else {
-            int exit_code = 0;
-            ker::process::waitpid(static_cast<int64_t>(KEYGEN_PID), &exit_code, 0, nullptr);
-            init_log::info("init[%llu]: dropbearkey exited with code %d", static_cast<unsigned long long>(CPUNO), exit_code);
+            int32_t exit_code = 0;
+            bool const KEYGEN_EXITED = wait_for_child_timeout(static_cast<int64_t>(KEYGEN_PID), &exit_code, DROPBEAR_KEYGEN_TIMEOUT_MS);
+            if (KEYGEN_EXITED) {
+                init_log::info("init[%llu]: dropbearkey exited with code %d", static_cast<unsigned long long>(CPUNO), exit_code);
+            } else {
+                init_log::warn("init[%llu]: dropbearkey did not exit within %ums; continuing boot", static_cast<unsigned long long>(CPUNO),
+                               DROPBEAR_KEYGEN_TIMEOUT_MS);
+            }
         }
     }
 
