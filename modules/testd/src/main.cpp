@@ -509,6 +509,44 @@ auto read_expected_bytes(int fd, char* buf, size_t expected) -> ssize_t {
     return read_expected_bytes_timeout(fd, buf, expected, REMOTE_IPC_TIMEOUT_MS);
 }
 
+auto write_all_timeout(int fd, const char* buf, size_t expected, int timeout_ms) -> ssize_t {
+    if (expected == 0) {
+        return 0;
+    }
+
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return -1;
+    }
+
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
+    size_t total = 0;
+    while (total < expected) {
+        if (wait_fd_ready_until(fd, POLLOUT, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
+
+        ssize_t const N = write(fd, buf + total, expected - total);
+        if (N < 0) {
+            if (retryable_would_block()) {
+                continue;
+            }
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
+        if (N == 0) {
+            errno = ETIMEDOUT;
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
+        total += static_cast<size_t>(N);
+    }
+
+    restore_fd_flags(fd, old_flags);
+    return static_cast<ssize_t>(total);
+}
+
 auto wait_remote_waiter_ready(int ready_fd) -> bool {
     char byte = 0;
     ssize_t const N = read_expected_bytes_timeout(ready_fd, &byte, 1, REMOTE_IPC_TIMEOUT_MS);
@@ -1553,7 +1591,10 @@ TESTD_RUN(test_futex_wait_relative_timeout) {
     if (PID == 0) {
         close(ready[0]);
         constexpr char BYTE = 't';
-        static_cast<void>(write(ready[1], &BYTE, 1));
+        if (write_all_timeout(ready[1], &BYTE, 1, REMOTE_IPC_TIMEOUT_MS) != 1) {
+            close(ready[1]);
+            _exit(2);
+        }
         close(ready[1]);
 
         timespec timeout{
@@ -1619,7 +1660,10 @@ TESTD_RUN(test_futex_wait_wake_before_timeout) {
     if (PID == 0) {
         close(ready[0]);
         constexpr char BYTE = 'w';
-        static_cast<void>(write(ready[1], &BYTE, 1));
+        if (write_all_timeout(ready[1], &BYTE, 1, REMOTE_IPC_TIMEOUT_MS) != 1) {
+            close(ready[1]);
+            _exit(2);
+        }
         close(ready[1]);
 
         timespec timeout{
@@ -1690,7 +1734,10 @@ TESTD_RUN(test_futex_wait_interrupted_by_signal) {
         }
 
         constexpr char BYTE = 's';
-        static_cast<void>(write(ready[1], &BYTE, 1));
+        if (write_all_timeout(ready[1], &BYTE, 1, REMOTE_IPC_TIMEOUT_MS) != 1) {
+            close(ready[1]);
+            _exit(2);
+        }
         close(ready[1]);
 
         // A signal that lands just before FUTEX_WAIT should not decide this test.
