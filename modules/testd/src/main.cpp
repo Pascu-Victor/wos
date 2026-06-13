@@ -29,7 +29,6 @@
 #include <bits/posix/stat.h>
 #include <bits/ssize_t.h>
 #include <bits/winsize.h>
-#include <callnums/futex.h>
 #include <callnums/sys_log.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -37,14 +36,13 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>  // NOLINT(modernize-deprecated-headers,misc-include-cleaner): this sysroot declares signal()/SIGUSR1 here.
-#include <sys/callnums.h>
 #include <sys/epoll.h>
+#include <sys/futex.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/process.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -101,16 +99,9 @@ constexpr mode_t MODE_0755 = S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S
 constexpr mode_t MODE_0600 = S_IRUSR | S_IWUSR;
 constexpr mode_t MODE_MASK = 0777;
 
-auto futex_wait_raw(int* addr, int expected, const timespec* timeout) -> int64_t {
-    return static_cast<int64_t>(syscall(ker::abi::callnums::futex, static_cast<uint64_t>(ker::abi::futex::futex_ops::FUTEX_WAIT),
-                                        reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(expected),
-                                        reinterpret_cast<uint64_t>(timeout)));
-}
+auto futex_wait(int* addr, int expected, const timespec* timeout) -> int64_t { return ker::futex::wait(addr, expected, timeout); }
 
-auto futex_wake_raw(int* addr) -> int64_t {
-    return static_cast<int64_t>(syscall(ker::abi::callnums::futex, static_cast<uint64_t>(ker::abi::futex::futex_ops::FUTEX_WAKE),
-                                        reinterpret_cast<uint64_t>(addr)));
-}
+auto futex_wake(int* addr, int count) -> int64_t { return ker::futex::wake(addr, count); }
 
 volatile sig_atomic_t g_futex_signal_seen = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
@@ -1502,8 +1493,8 @@ TESTD_RUN(test_futex_rejects_unaligned_address) {
         .tv_sec = 0,
         .tv_nsec = 0,
     };
-    int64_t const WAIT_RC = futex_wait_raw(unaligned, 0, &timeout);
-    int64_t const WAKE_RC = futex_wake_raw(unaligned);
+    int64_t const WAIT_RC = futex_wait(unaligned, 0, &timeout);
+    int64_t const WAKE_RC = futex_wake(unaligned, 1);
     munmap(mapping, PAGE_SIZE);
 
     if (WAIT_RC != -EINVAL || WAKE_RC != -EINVAL) {
@@ -1549,7 +1540,7 @@ TESTD_RUN(test_futex_wait_relative_timeout) {
             .tv_sec = 0,
             .tv_nsec = 20000000,
         };
-        int64_t const RC = futex_wait_raw(futex_word, 17, &timeout);
+        int64_t const RC = futex_wait(futex_word, 17, &timeout);
         _exit(RC == -ETIMEDOUT ? 0 : 1);
     }
 
@@ -1558,7 +1549,7 @@ TESTD_RUN(test_futex_wait_relative_timeout) {
     ssize_t const NR = read_expected_bytes_timeout(ready[0], &byte, 1, REMOTE_IPC_TIMEOUT_MS);
     close(ready[0]);
     if (NR != 1 || byte != 't') {
-        static_cast<void>(futex_wake_raw(futex_word));
+        static_cast<void>(futex_wake(futex_word, 1));
         int status = 0;
         static_cast<void>(waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS));
         munmap(futex_word, PAGE_SIZE);
@@ -1567,7 +1558,7 @@ TESTD_RUN(test_futex_wait_relative_timeout) {
     }
 
     usleep(150000);
-    static_cast<void>(futex_wake_raw(futex_word));
+    static_cast<void>(futex_wake(futex_word, 1));
 
     int status = 0;
     bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
@@ -1615,7 +1606,7 @@ TESTD_RUN(test_futex_wait_wake_before_timeout) {
             .tv_sec = 1,
             .tv_nsec = 0,
         };
-        int64_t const RC = futex_wait_raw(futex_word, 23, &timeout);
+        int64_t const RC = futex_wait(futex_word, 23, &timeout);
         _exit(RC == 0 ? 0 : 1);
     }
 
@@ -1624,7 +1615,7 @@ TESTD_RUN(test_futex_wait_wake_before_timeout) {
     ssize_t const NR = read_expected_bytes_timeout(ready[0], &byte, 1, REMOTE_IPC_TIMEOUT_MS);
     close(ready[0]);
     if (NR != 1 || byte != 'w') {
-        static_cast<void>(futex_wake_raw(futex_word));
+        static_cast<void>(futex_wake(futex_word, 1));
         int status = 0;
         static_cast<void>(waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS));
         munmap(futex_word, PAGE_SIZE);
@@ -1633,7 +1624,7 @@ TESTD_RUN(test_futex_wait_wake_before_timeout) {
     }
 
     usleep(100000);
-    static_cast<void>(futex_wake_raw(futex_word));
+    static_cast<void>(futex_wake(futex_word, 1));
 
     int status = 0;
     bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
@@ -1689,7 +1680,7 @@ TESTD_RUN(test_futex_wait_interrupted_by_signal) {
                 .tv_sec = 0,
                 .tv_nsec = 200000000,
             };
-            int64_t const RC = futex_wait_raw(futex_word, 31, &timeout);
+            int64_t const RC = futex_wait(futex_word, 31, &timeout);
             if (RC == -EINTR && g_futex_signal_seen != 0) {
                 _exit(0);
             }
@@ -1705,7 +1696,7 @@ TESTD_RUN(test_futex_wait_interrupted_by_signal) {
     ssize_t const NR = read_expected_bytes_timeout(ready[0], &byte, 1, REMOTE_IPC_TIMEOUT_MS);
     close(ready[0]);
     if (NR != 1 || byte != 's') {
-        static_cast<void>(futex_wake_raw(futex_word));
+        static_cast<void>(futex_wake(futex_word, 1));
         int status = 0;
         static_cast<void>(waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS));
         munmap(futex_word, PAGE_SIZE);
@@ -1724,7 +1715,7 @@ TESTD_RUN(test_futex_wait_interrupted_by_signal) {
             break;
         }
         if (wait_ret < 0) {
-            static_cast<void>(futex_wake_raw(futex_word));
+            static_cast<void>(futex_wake(futex_word, 1));
             munmap(futex_word, PAGE_SIZE);
             fail("futex_signal_waitpid", "waitpid(WNOHANG) failed");
             return;
@@ -1737,7 +1728,7 @@ TESTD_RUN(test_futex_wait_interrupted_by_signal) {
                 child_exited = true;
                 break;
             }
-            static_cast<void>(futex_wake_raw(futex_word));
+            static_cast<void>(futex_wake(futex_word, 1));
             static_cast<void>(waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS));
             munmap(futex_word, PAGE_SIZE);
             fail("futex_signal_kill", "kill(SIGUSR1) failed");
@@ -1751,13 +1742,13 @@ TESTD_RUN(test_futex_wait_interrupted_by_signal) {
             break;
         }
         if (wait_ret < 0) {
-            static_cast<void>(futex_wake_raw(futex_word));
+            static_cast<void>(futex_wake(futex_word, 1));
             munmap(futex_word, PAGE_SIZE);
             fail("futex_signal_waitpid", "waitpid(WNOHANG) failed");
             return;
         }
 
-        static_cast<void>(futex_wake_raw(futex_word));
+        static_cast<void>(futex_wake(futex_word, 1));
     }
 
     bool const WAIT_RET = child_exited || waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);

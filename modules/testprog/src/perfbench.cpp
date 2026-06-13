@@ -1,9 +1,8 @@
 #include "perfbench.hpp"
 
-#include <callnums/futex.h>
+#include <sys/futex.h>
 #include <sys/multiproc.h>
 #include <sys/process.h>
-#include <sys/syscall.h>
 #include <time.h>
 
 #include <algorithm>
@@ -122,15 +121,9 @@ auto atomic_int_addr(std::atomic<int>& value) -> int* { return reinterpret_cast<
 
 auto atomic_int_addr(std::atomic<int>* value) -> int* { return reinterpret_cast<int*>(value); }
 
-void futex_wait(std::atomic<int>* value, int expected) {
-    static_cast<void>(syscall(ker::abi::callnums::futex, static_cast<uint64_t>(ker::abi::futex::futex_ops::FUTEX_WAIT),
-                              reinterpret_cast<uint64_t>(atomic_int_addr(value)), static_cast<uint64_t>(expected), 0));
-}
+void futex_wait(std::atomic<int>* value, int expected) { static_cast<void>(ker::futex::wait(atomic_int_addr(value), expected, nullptr)); }
 
-void futex_wake(std::atomic<int>& value) {
-    static_cast<void>(syscall(ker::abi::callnums::futex, static_cast<uint64_t>(ker::abi::futex::futex_ops::FUTEX_WAKE),
-                              reinterpret_cast<uint64_t>(atomic_int_addr(value))));
-}
+void futex_wake(std::atomic<int>& value) { static_cast<void>(ker::futex::wake_all(atomic_int_addr(value))); }
 
 auto wait_for_counter(std::atomic<int>& counter, int expected, uint64_t timeout_ns) -> bool {
     uint64_t const START_NS = now_ns();
