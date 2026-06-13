@@ -104,6 +104,7 @@ UNIT_TESTS=(
     testprog_source_test
     httpd_source_test
     top_source_test
+    time_source_test
     init_source_test
     strace_source_test
     journal_source_test

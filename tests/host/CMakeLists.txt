@@ -37,6 +37,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/top_source_test.py
 )
 add_test(
+    NAME time_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/time_source_test.py
+)
+add_test(
     NAME init_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/init_source_test.py
 )
@@ -165,6 +169,7 @@ set_tests_properties(
     testprog_source_test
     httpd_source_test
     top_source_test
+    time_source_test
     init_source_test
     strace_source_test
     journal_source_test

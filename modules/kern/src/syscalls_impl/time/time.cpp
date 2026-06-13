@@ -51,6 +51,26 @@ auto relative_timespec_to_us(const struct timespec& ts, uint64_t& out_us) -> boo
     return true;
 }
 
+auto relative_timeval_to_us(const struct timeval& tv, uint64_t& out_us) -> bool {
+    out_us = 0;
+    if (tv.tv_sec < 0 || tv.tv_usec < 0) {
+        return false;
+    }
+
+    auto const USEC = static_cast<uint64_t>(tv.tv_usec);
+    if (USEC >= USEC_PER_SEC) {
+        return false;
+    }
+
+    auto const SEC = static_cast<uint64_t>(tv.tv_sec);
+    if (SEC > (UINT64_MAX - USEC) / USEC_PER_SEC) {
+        return false;
+    }
+
+    out_us = (SEC * USEC_PER_SEC) + USEC;
+    return true;
+}
+
 auto deadline_from_now_us(uint64_t sleep_us) -> uint64_t {
     uint64_t const NOW_US = ker::mod::time::get_us();
     if (UINT64_MAX - NOW_US < sleep_us) {
@@ -194,17 +214,18 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 return static_cast<uint64_t>(-EFAULT);
             }
 
-            uint64_t const NEW_VAL_US =
-                (static_cast<uint64_t>(nv->it_value.tv_sec) * 1000000ULL) + static_cast<uint64_t>(nv->it_value.tv_usec);
-            uint64_t const NEW_INTERVAL_US =
-                (static_cast<uint64_t>(nv->it_interval.tv_sec) * 1000000ULL) + static_cast<uint64_t>(nv->it_interval.tv_usec);
+            uint64_t new_val_us = 0;
+            uint64_t new_interval_us = 0;
+            if (!relative_timeval_to_us(nv->it_value, new_val_us) || !relative_timeval_to_us(nv->it_interval, new_interval_us)) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
 
-            if (NEW_VAL_US == 0) {
+            if (new_val_us == 0) {
                 task->itimer_real_expire_us = 0;
                 task->itimer_real_interval_us = 0;
             } else {
-                task->itimer_real_expire_us = ker::mod::time::get_us() + NEW_VAL_US;
-                task->itimer_real_interval_us = NEW_INTERVAL_US;
+                task->itimer_real_expire_us = deadline_from_now_us(new_val_us);
+                task->itimer_real_interval_us = new_interval_us;
                 ker::mod::sched::request_local_timer_recheck();
             }
             return 0;
