@@ -305,6 +305,25 @@ void subtract_ranges(std::array<PhysRange, MAX_SANITIZED_RANGES>& ranges, size_t
     }
 }
 
+auto select_internal_reservation(uint64_t base, uint64_t length, uint64_t requested_size, PhysRange& out) -> bool {
+    out = {};
+    if (length == 0 || requested_size == 0 || base > (~0ULL - (paging::PAGE_SIZE - 1)) ||
+        requested_size > (~0ULL - (paging::PAGE_SIZE - 1))) {
+        return false;
+    }
+
+    uint64_t const END = checked_range_end(base, length);
+    uint64_t const ALIGNED_START = page_align_up(base);
+    uint64_t const ALIGNED_END = page_align_down(END);
+    uint64_t const NEEDED = page_align_up(requested_size);
+    if (ALIGNED_START >= ALIGNED_END || NEEDED == 0 || NEEDED > ALIGNED_END - ALIGNED_START) {
+        return false;
+    }
+
+    out = {.base = ALIGNED_START, .end = ALIGNED_START + NEEDED};
+    return range_valid(out);
+}
+
 paging::PageZone* scan_regular_zone_for_addr(uint64_t addr) {
     for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
         uint64_t const END = zone->start + zone->len;
@@ -573,7 +592,7 @@ auto snapshot_zones(ZoneSnapshot* out, size_t max_rows) -> size_t {
         return 0;
     }
 
-    static_assert(MEMACC_BUDDY_ORDER_COUNT == static_cast<size_t>(PageAllocator::MAX_ORDER + 1));
+    static_assert(MEMACC_BUDDY_ORDER_COUNT == static_cast<size_t>(PageAllocator::MAX_ORDER) + 1, "Buddy order count mismatch");
 
     size_t rows = 0;
     for (paging::PageZone const* zone = zones; zone != nullptr && rows < max_rows; zone = zone->next) {
@@ -928,6 +947,34 @@ auto page_alloc_can_satisfy(uint64_t size, uint64_t reserve_bytes) -> bool {
     return total_free_pages - requested_pages >= RESERVE_PAGES;
 }
 
+#ifdef WOS_SELFTEST
+auto selftest_internal_reservation_carveout_preserves_page_alignment() -> bool {
+    PhysRange reservation{};
+    if (!select_internal_reservation(0x1003, (paging::PAGE_SIZE * 4) + 17, paging::PAGE_SIZE * 2, reservation)) {
+        return false;
+    }
+    if (reservation.base != 0x2000 || reservation.end != 0x4000) {
+        return false;
+    }
+
+    std::array<PhysRange, MAX_SANITIZED_RANGES> usable_ranges{};
+    size_t usable_range_count = 0;
+    append_range(usable_ranges, usable_range_count, page_range_from_usable(0x1003, (paging::PAGE_SIZE * 4) + 17));
+    subtract_range(usable_ranges, usable_range_count, reservation);
+
+    if (usable_range_count != 1) {
+        return false;
+    }
+    PhysRange const REMAINING = usable_ranges.at(0);
+    if (REMAINING.base != 0x4000 || REMAINING.end != 0x5000) {
+        return false;
+    }
+
+    PhysRange too_small{};
+    return !select_internal_reservation(0x1FFF, paging::PAGE_SIZE, paging::PAGE_SIZE, too_small);
+}
+#endif
+
 void init(limine_memmap_response* memmap_response) {
     if (memmap_response == nullptr) {
         // TODO: logging
@@ -956,11 +1003,11 @@ void init(limine_memmap_response* memmap_response) {
     // We'll allocate these from the first usable memory region
     per_cpu_caches_size = page_align_up(sizeof(PerCpuPageCache) * num_cpus);
     for (size_t i = 0; i < MEMMAP.entry_count; i++) {
-        if (MEMMAP.entries[i]->type == LIMINE_MEMMAP_USABLE && MEMMAP.entries[i]->length >= per_cpu_caches_size + paging::PAGE_SIZE) {
-            // Save the physical address for later mapping
-            per_cpu_caches_phys_base = MEMMAP.entries[i]->base;
-            append_range(reserved_ranges, reserved_range_count,
-                         {.base = per_cpu_caches_phys_base, .end = per_cpu_caches_phys_base + per_cpu_caches_size});
+        PhysRange cache_range{};
+        if (MEMMAP.entries[i]->type == LIMINE_MEMMAP_USABLE &&
+            select_internal_reservation(MEMMAP.entries[i]->base, MEMMAP.entries[i]->length, per_cpu_caches_size, cache_range)) {
+            per_cpu_caches_phys_base = cache_range.base;
+            append_range(reserved_ranges, reserved_range_count, cache_range);
             break;
         }
     }

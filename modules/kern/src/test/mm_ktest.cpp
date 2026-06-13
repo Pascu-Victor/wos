@@ -180,6 +180,10 @@ KTEST(MM, PageAllocWriteReadback) {
     phys::page_free(page);
 }
 
+KTEST(MM, InternalReservationCarveoutPreservesPageAlignment) {
+    KEXPECT_TRUE(phys::selftest_internal_reservation_carveout_preserves_page_alignment());
+}
+
 KTEST(MM, PagemapPoolReusesZeroedRootPage) {
     virt::PageTablePoolStatsSnapshot before{};
     virt::get_page_table_pool_stats_snapshot(before);

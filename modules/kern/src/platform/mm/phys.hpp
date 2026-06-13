@@ -177,6 +177,10 @@ auto page_caller_stats_generation() -> uint64_t;
 auto page_caller_stats_default_enabled() -> bool;
 auto snapshot_page_caller_stats(CallerPageStat* out, size_t max_rows, size_t& total_rows) -> bool;
 
+#ifdef WOS_SELFTEST
+auto selftest_internal_reservation_carveout_preserves_page_alignment() -> bool;
+#endif
+
 template <typename T>
 inline static void page_free(T* page) {
     page_free(static_cast<void*>(page));
