@@ -220,6 +220,35 @@ def test_shared_io_callers_timeout_or_fallback() -> None:
     )
 
 
+def test_rdma_retry_cooldowns_are_saturating() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    body = function_body(source, "remote_vfs_rdma_note_transient_failure")
+
+    require_order(
+        body,
+        [
+            "uint32_t const FAILURES = failure_count.fetch_add(1, std::memory_order_acq_rel) + 1",
+            "uint32_t const SHIFT = std::min<uint32_t>(FAILURES - 1, VFS_RDMA_TRANSIENT_COOLDOWN_SHIFT_MAX)",
+            "uint64_t const COOLDOWN_US = std::min<uint64_t>(VFS_RDMA_TRANSIENT_COOLDOWN_BASE_US << SHIFT, VFS_RDMA_TRANSIENT_COOLDOWN_MAX_US)",
+            "retry_after_us.store(wki_future_deadline_us(wki_now_us(), COOLDOWN_US), std::memory_order_release)",
+            "return COOLDOWN_US",
+        ],
+        "RDMA transient failure cooldown",
+    )
+    if "retry_after_us.store(wki_now_us() + COOLDOWN_US" in body:
+        fail("RDMA retry cooldown must not use wrapping deadline arithmetic")
+
+    retry_ready_body = function_body(source, "remote_vfs_rdma_retry_ready")
+    require_order(
+        retry_ready_body,
+        [
+            "uint64_t const RETRY_AFTER_US = retry_after_us.load(std::memory_order_acquire)",
+            "return RETRY_AFTER_US == 0 || now_us >= RETRY_AFTER_US",
+        ],
+        "RDMA retry gate",
+    )
+
+
 def test_vfs_attach_ack_requires_expected_cookie_before_completion() -> None:
     header = REMOTE_VFS_HPP.read_text()
     source = REMOTE_VFS_CPP.read_text()
@@ -280,6 +309,7 @@ def main() -> None:
     test_proxy_operations_fail_before_setup_when_slot_wait_times_out()
     test_shared_io_slot_waits_are_bounded()
     test_shared_io_callers_timeout_or_fallback()
+    test_rdma_retry_cooldowns_are_saturating()
     test_vfs_attach_ack_requires_expected_cookie_before_completion()
     print("WKI remote VFS source invariants hold")
 

@@ -1663,7 +1663,7 @@ auto remote_vfs_rdma_note_transient_failure(std::atomic<uint32_t>& failure_count
     uint32_t const FAILURES = failure_count.fetch_add(1, std::memory_order_acq_rel) + 1;
     uint32_t const SHIFT = std::min<uint32_t>(FAILURES - 1, VFS_RDMA_TRANSIENT_COOLDOWN_SHIFT_MAX);
     uint64_t const COOLDOWN_US = std::min<uint64_t>(VFS_RDMA_TRANSIENT_COOLDOWN_BASE_US << SHIFT, VFS_RDMA_TRANSIENT_COOLDOWN_MAX_US);
-    retry_after_us.store(wki_now_us() + COOLDOWN_US, std::memory_order_release);
+    retry_after_us.store(wki_future_deadline_us(wki_now_us(), COOLDOWN_US), std::memory_order_release);
     return COOLDOWN_US;
 }
 
