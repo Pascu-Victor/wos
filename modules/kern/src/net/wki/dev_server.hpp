@@ -263,6 +263,7 @@ void wki_dev_server_refresh_vfs_binding(uint32_t resource_id, const char* export
 
 #ifdef WOS_SELFTEST
 auto wki_dev_server_selftest_binding_lifecycle_flags() -> bool;
+auto wki_dev_server_selftest_attach_ack_failure_rolls_back_binding() -> bool;
 #endif
 
 // -----------------------------------------------------------------------------

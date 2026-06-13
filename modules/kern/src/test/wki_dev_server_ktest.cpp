@@ -16,3 +16,7 @@ KTEST(WkiDevServerBinding, LifecycleFlagsAreAtomic) {
 }
 
 KTEST(WkiDevServerBinding, MovePreservesLifecycleFlags) { KEXPECT_TRUE(ker::net::wki::wki_dev_server_selftest_binding_lifecycle_flags()); }
+
+KTEST(WkiDevServerAttachAckFailure, RollsBackBlockAndVfsBindings) {
+    KEXPECT_TRUE(ker::net::wki::wki_dev_server_selftest_attach_ack_failure_rolls_back_binding());
+}

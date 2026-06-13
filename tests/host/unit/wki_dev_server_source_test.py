@@ -6,10 +6,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 DEV_SERVER_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "dev_server.cpp"
+DEV_SERVER_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "dev_server.hpp"
 REMOTE_NET_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_net.cpp"
 REMOTE_NET_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_net.hpp"
 WIRE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wire.hpp"
 WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
+WKI_DEV_SERVER_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_dev_server_ktest.cpp"
 
 
 def fail(message: str) -> None:
@@ -334,6 +336,91 @@ def test_detach_waits_for_binding_refs_before_cleanup_and_erase() -> None:
     require_order(detach_body, "wki_zone_destroy(info.blk_zone_id);", "erase_retired_binding_locked(info.binding);", "detach erase after cleanup")
 
 
+def test_attach_ack_failure_rolls_back_block_and_vfs_bindings() -> None:
+    source = DEV_SERVER_CPP.read_text()
+    header = DEV_SERVER_HPP.read_text()
+    ktest = WKI_DEV_SERVER_KTEST.read_text()
+    attach_body = function_body(source, "handle_dev_attach_req")
+    rollback_body = function_body(source, "rollback_attach_ack_failure")
+
+    required = [
+        "void rollback_attach_ack_failure(uint16_t consumer_node, ResourceType resource_type, uint32_t resource_id, uint16_t assigned_channel)",
+        "rollback_attach_ack_failure(hdr->src_node, ResourceType::BLOCK, req->resource_id, ch->channel_id);",
+        "rollback_attach_ack_failure(hdr->src_node, ResourceType::VFS, req->resource_id, ch->channel_id);",
+        "auto wki_dev_server_selftest_attach_ack_failure_rolls_back_binding() -> bool",
+    ]
+    missing = [token for token in required if token not in source]
+    if missing:
+        fail("attach ACK failure rollback scaffolding is missing: " + ", ".join(missing))
+
+    for token in [
+        "binding.consumer_node != consumer_node",
+        "binding.resource_type != resource_type",
+        "binding.resource_id != resource_id",
+        "binding.assigned_channel != assigned_channel",
+        "mark_binding_retiring_locked(binding)",
+        "wait_for_binding_refs_to_drain(info.binding)",
+        "delete[] info.vfs_rdma_write_buf",
+        "delete[] info.vfs_rdma_read_staging_buf",
+        "delete[] info.vfs_rdma_bulk_staging_buf",
+        "wki_zone_destroy(info.blk_zone_id)",
+        "info.block_dev->remotable->on_remote_detach(info.consumer_node)",
+        "wki_channel_lookup(info.consumer_node, info.assigned_channel)",
+        "wki_channel_close(ch)",
+        "erase_retired_binding_locked(info.binding)",
+    ]:
+        if token not in rollback_body:
+            fail(f"attach ACK failure rollback helper is missing {token!r}")
+    if "wki_channel_get(info.consumer_node, info.assigned_channel)" in rollback_body:
+        fail("attach ACK rollback must not allocate a channel while cleaning up a failed attach")
+
+    require_order(
+        attach_body,
+        "int const ACK_RET = wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));",
+        "rollback_attach_ack_failure(hdr->src_node, ResourceType::BLOCK, req->resource_id, ch->channel_id);",
+        "BLOCK attach ACK rollback",
+    )
+    require_order(
+        attach_body,
+        "int const ACK_RET = wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));",
+        "rollback_attach_ack_failure(hdr->src_node, ResourceType::VFS, req->resource_id, ch->channel_id);",
+        "VFS attach ACK rollback",
+    )
+    require_order(
+        rollback_body,
+        "mark_binding_retiring_locked(binding)",
+        "wait_for_binding_refs_to_drain(info.binding)",
+        "rollback retires before waiting",
+    )
+    require_order(
+        rollback_body,
+        "wait_for_binding_refs_to_drain(info.binding)",
+        "delete[] info.vfs_rdma_write_buf",
+        "rollback waits before freeing VFS buffers",
+    )
+    require_order(
+        rollback_body,
+        "wait_for_binding_refs_to_drain(info.binding)",
+        "wki_zone_destroy(info.blk_zone_id)",
+        "rollback waits before destroying block zone",
+    )
+    require_order(
+        rollback_body,
+        "wki_channel_close(ch)",
+        "erase_retired_binding_locked(info.binding)",
+        "rollback erases after channel close",
+    )
+
+    if "auto wki_dev_server_selftest_attach_ack_failure_rolls_back_binding() -> bool;" not in header:
+        fail("dev-server attach ACK rollback selftest must be declared")
+    for token in [
+        "KTEST(WkiDevServerAttachAckFailure, RollsBackBlockAndVfsBindings)",
+        "wki_dev_server_selftest_attach_ack_failure_rolls_back_binding()",
+    ]:
+        if token not in ktest:
+            fail(f"dev-server attach ACK rollback KTEST coverage is missing {token!r}")
+
+
 def main() -> None:
     test_rx_forward_does_not_spend_credits_before_delivery_is_possible()
     test_rx_forward_sends_notify_cookie_envelope()
@@ -352,6 +439,7 @@ def main() -> None:
     test_channel_reuse_generation_guards_unlock_tx_relock_paths()
     test_block_ring_binding_lifetime_is_retained_outside_server_lock()
     test_detach_waits_for_binding_refs_before_cleanup_and_erase()
+    test_attach_ack_failure_rolls_back_block_and_vfs_bindings()
     print("WKI dev server source invariants hold")
 
 
