@@ -117,6 +117,59 @@ auto vfs_destroy_file(File* f) -> int {
     return close_result;
 }
 
+auto vfs_install_open_file(ker::mod::sched::task::Task* task, File* file) -> int {
+    int const FD = vfs_alloc_fd(task, file);
+    if (FD < 0) {
+        vfs_put_file(file);
+        return FD;
+    }
+    return FD;
+}
+
+#ifdef WOS_SELFTEST
+std::atomic<int> g_vfs_selftest_close_count{0};
+std::atomic<bool> g_vfs_selftest_force_dup2_insert_failure{false};
+
+auto vfs_selftest_close(File*) -> int {
+    g_vfs_selftest_close_count.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+}
+
+FileOperations g_vfs_selftest_fops = {
+    .vfs_open = nullptr,
+    .vfs_close = vfs_selftest_close,
+    .vfs_read = nullptr,
+    .vfs_write = nullptr,
+    .vfs_lseek = nullptr,
+    .vfs_isatty = nullptr,
+    .vfs_readdir = nullptr,
+    .vfs_readlink = nullptr,
+    .vfs_truncate = nullptr,
+    .vfs_poll_check = nullptr,
+    .vfs_poll_register_waiter = nullptr,
+    .vfs_ioctl = nullptr,
+};
+#endif
+
+struct VfsDup2ReplaceResult {
+    bool inserted = false;
+    File* existing = nullptr;
+};
+
+auto vfs_replace_fd_for_dup2_locked(ker::mod::sched::task::Task* task, int newfd, File* file) -> VfsDup2ReplaceResult {
+    auto* existing = reinterpret_cast<File*>(task->fd_table.lookup(static_cast<uint64_t>(newfd)));
+#ifdef WOS_SELFTEST
+    if (g_vfs_selftest_force_dup2_insert_failure.load(std::memory_order_relaxed)) {
+        return VfsDup2ReplaceResult{.inserted = false, .existing = existing};
+    }
+#endif
+    bool const INSERTED = task->fd_table.insert(static_cast<uint64_t>(newfd), file);
+    if (INSERTED) {
+        task->clear_fd_cloexec(static_cast<unsigned>(newfd));
+    }
+    return VfsDup2ReplaceResult{.inserted = INSERTED, .existing = existing};
+}
+
 auto apply_open_truncation(File* f, int flags) -> int {
     if ((flags & ker::vfs::O_TRUNC) == 0 || f == nullptr || f->is_directory) {
         return 0;
@@ -145,6 +198,19 @@ auto vfs_take_fd_locked(ker::mod::sched::task::Task* task, int fd) -> File* {
     task->fd_table.remove(static_cast<uint64_t>(fd));
     task->clear_fd_cloexec(static_cast<unsigned>(fd));
     return file;
+}
+
+auto vfs_find_free_fd_below_limit_locked(ker::mod::sched::task::Task* task, uint64_t start) -> uint64_t {
+    if (task == nullptr || start >= ker::mod::sched::task::Task::FD_TABLE_SIZE) {
+        return UINT64_MAX;
+    }
+
+    for (uint64_t slot = start; slot < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++slot) {
+        if (task->fd_table.lookup(slot) == nullptr) {
+            return slot;
+        }
+    }
+    return UINT64_MAX;
 }
 
 auto clamp_io_count(ssize_t result, size_t requested) -> ssize_t {
@@ -949,7 +1015,8 @@ auto vfs_stream_cache_get_file_stat(File* file, Stat* statbuf) -> int {
 
     std::memset(statbuf, 0, sizeof(Stat));
 
-    MountPoint const* sc_mount = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path) : nullptr;
+    MountRef sc_mount_ref = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path) : MountRef{};
+    MountPoint const* sc_mount = sc_mount_ref.get();
     uint32_t const SC_DEV_ID = (sc_mount != nullptr) ? sc_mount->dev_id : 0;
 
     switch (file->fs_type) {
@@ -1020,7 +1087,8 @@ auto stream_build_identity(File* file, const Stat& statbuf, StreamCacheIdentity*
         return -EINVAL;
     }
 
-    MountPoint const* mount = find_mount_point(file->vfs_path);
+    auto mount_ref = find_mount_point(file->vfs_path);
+    MountPoint const* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
@@ -1710,25 +1778,26 @@ auto strip_mount_prefix(const MountPoint* mount, const char* path) -> const char
     return path + mount_len;
 }
 
-auto find_first_mount_child(const char* path) -> MountPoint* {
+auto find_first_mount_child(const char* path) -> MountRef {
     if (path == nullptr) {
-        return nullptr;
+        return MountRef{};
     }
 
     size_t const PATH_LEN = std::strlen(path);
     for (size_t mi = 0; mi < get_mount_count(); ++mi) {
-        MountPoint* mp = get_mount_at(mi);
+        auto mount_ref = get_mount_at(mi);
+        MountPoint* mp = mount_ref.get();
         if (mp == nullptr || mp->path == nullptr) {
             continue;
         }
 
         size_t const MP_LEN = std::strlen(mp->path);
         if (MP_LEN > PATH_LEN && std::strncmp(mp->path, path, PATH_LEN) == 0 && mp->path[PATH_LEN] == '/') {
-            return mp;
+            return mount_ref;
         }
     }
 
-    return nullptr;
+    return MountRef{};
 }
 
 bool is_logical_wki_root_dir(const char* path) {
@@ -1774,7 +1843,7 @@ bool logical_wki_root_has_mount_child() {
         }
     }
 
-    return find_first_mount_child(resolved.data()) != nullptr;
+    return static_cast<bool>(find_first_mount_child(resolved.data()));
 }
 
 auto fill_synthetic_mount_dir_stat(const char* path, Stat* statbuf) -> int {
@@ -1782,7 +1851,8 @@ auto fill_synthetic_mount_dir_stat(const char* path, Stat* statbuf) -> int {
         return -EINVAL;
     }
 
-    MountPoint const* child_mount = find_first_mount_child(path);
+    auto child_mount_ref = find_first_mount_child(path);
+    MountPoint const* child_mount = child_mount_ref.get();
     if (child_mount == nullptr && !(ker::net::wki::g_wki.initialized && is_logical_wki_root_dir(path))) {
         return -ENOENT;
     }
@@ -1803,7 +1873,7 @@ auto fill_synthetic_mount_dir_stat(const char* path, Stat* statbuf) -> int {
 }
 
 auto create_synthetic_mount_dir_file(const char* path, FSType fs_type) -> File* {
-    if (find_first_mount_child(path) == nullptr && !(ker::net::wki::g_wki.initialized && is_logical_wki_root_dir(path))) {
+    if (!find_first_mount_child(path) && !(ker::net::wki::g_wki.initialized && is_logical_wki_root_dir(path))) {
         return nullptr;
     }
 
@@ -1969,8 +2039,9 @@ auto ensure_wki_host_root_mount(const char* path) -> int {
 
     std::array<char, MAX_PATH_LEN> resolved_mount_root{};
     if (resolve_mount_path(mount_root.data(), resolved_mount_root.data(), resolved_mount_root.size()) == 0) {
-        if (MountPoint const* existing = find_mount_point(resolved_mount_root.data());
-            existing != nullptr && existing->fs_type == FSType::REMOTE && std::strcmp(existing->path, resolved_mount_root.data()) == 0) {
+        auto existing_ref = find_mount_point(resolved_mount_root.data());
+        MountPoint const* existing = existing_ref.get();
+        if (existing != nullptr && existing->fs_type == FSType::REMOTE && std::strcmp(existing->path, resolved_mount_root.data()) == 0) {
             return 0;
         }
     }
@@ -2741,7 +2812,8 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
             return 0;
         }
 
-        MountPoint const* mount = find_mount_point(resolved_buf);
+        auto mount_ref = find_mount_point(resolved_buf);
+        MountPoint const* mount = mount_ref.get();
         if (mount == nullptr) {
             return 0;
         }
@@ -3084,7 +3156,8 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     // Remote mounts resolve symlinks on the server side during the actual open.
     // Avoid probing each path component with client-side READLINK RPCs here:
     // they are redundant and can fail independently of the real open.
-    MountPoint const* mount = find_mount_point(path_buffer.data());
+    auto mount_ref = find_mount_point(path_buffer.data());
+    MountPoint const* mount = mount_ref.get();
     bool const REMOTE_MOUNT = (mount != nullptr && mount->fs_type == FSType::REMOTE);
 
     if (!REMOTE_MOUNT) {
@@ -3112,7 +3185,8 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     int const ACCMODE = flags & 3;
 
     // Find the mount point for this path
-    mount = find_mount_point(path_buffer.data());
+    mount_ref = find_mount_point(path_buffer.data());
+    mount = mount_ref.get();
     if (mount == nullptr) {
         vfs_debug_log("vfs_open: no mount point found for path\n");
         log::warn("vfs_open: no mount point found for path: %s", path_buffer.data());
@@ -3237,7 +3311,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     }
     vfs_cache_notify_register_open_file(f);
 
-    int const FD = vfs_alloc_fd(current, f);
+    int const FD = vfs_install_open_file(current, f);
     if (FD < 0) {
         return FD;
     }
@@ -3385,21 +3459,21 @@ auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int {
         return -EINVAL;
     }
     uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-    uint64_t slot = task->fd_table.find_first_unset(0);
-    if (slot == UINT64_MAX) {
-        slot = task->fd_table.current_capacity();
+    uint64_t const SLOT = vfs_find_free_fd_below_limit_locked(task, 0);
+    bool const INSERTED = SLOT != UINT64_MAX && task->fd_table.insert(SLOT, file);
+    if (INSERTED) {
+        task->clear_fd_cloexec(static_cast<unsigned>(SLOT));
     }
-    bool const INSERTED = slot != UINT64_MAX && task->fd_table.insert(slot, file);
     size_t const FD_COUNT = task->fd_table.size();
     task->fd_table_lock.unlock_irqrestore(IRQF);
 
     if (!INSERTED) {
         return -EMFILE;  // fd_table cannot currently distinguish OOM from exhaustion
     }
-    file->fd = static_cast<int>(slot);
+    file->fd = static_cast<int>(SLOT);
     ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_INSERT,
                                           static_cast<int64_t>(FD_COUNT), 0, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-    return static_cast<int>(slot);
+    return static_cast<int>(SLOT);
 }
 
 auto vfs_get_file(ker::mod::sched::task::Task* task, int fd) -> struct File* {
@@ -3442,6 +3516,7 @@ auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int {
     }
     uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
     task->fd_table.remove(static_cast<uint64_t>(fd));
+    task->clear_fd_cloexec(static_cast<unsigned>(fd));
     size_t const FD_COUNT = task->fd_table.size();
     task->fd_table_lock.unlock_irqrestore(IRQF);
     ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
@@ -3829,7 +3904,8 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int {
     }
 
     // Find mount point for the linkpath
-    MountPoint const* mount = find_mount_point(abs_linkpath.data());
+    auto mount_ref = find_mount_point(abs_linkpath.data());
+    MountPoint const* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
@@ -3889,7 +3965,8 @@ auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize
         return -EINVAL;
     }
 
-    MountPoint const* mount = find_mount_point(abs_path);
+    auto mount_ref = find_mount_point(abs_path);
+    MountPoint const* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
@@ -4029,7 +4106,8 @@ auto vfs_mkdir(const char* path, int mode) -> int {
         return -ENOENT;
     }
 
-    MountPoint const* mount = find_mount_point(abs_path.data());
+    auto mount_ref = find_mount_point(abs_path.data());
+    MountPoint const* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
@@ -4131,7 +4209,8 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     // Remote mounts resolve symlinks on the server side during the actual stat.
     // Avoid a redundant client-side READLINK walk here; it pessimizes metadata
     // traffic and can fail independently of the real remote stat operation.
-    MountPoint const* mount = find_mount_point(pathBuffer);
+    auto mount_ref = find_mount_point(pathBuffer);
+    MountPoint const* mount = mount_ref.get();
     bool const REMOTE_MOUNT = (mount != nullptr && mount->fs_type == FSType::REMOTE);
 
     if (!REMOTE_MOUNT) {
@@ -4172,7 +4251,8 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     }
 
     // Find mount point
-    mount = find_mount_point(pathBuffer);
+    mount_ref = find_mount_point(pathBuffer);
+    mount = mount_ref.get();
     if (mount == nullptr) {
         log_loader_path_event("stat-mount-miss", path, pathBuffer, nullptr, -ENOENT);
         return -ENOENT;
@@ -4319,7 +4399,8 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
         return fill_synthetic_mount_dir_stat(file->vfs_path, statbuf);
     }
 
-    MountPoint const* fstat_mount = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path) : nullptr;
+    MountRef fstat_mount_ref = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path) : MountRef{};
+    MountPoint const* fstat_mount = fstat_mount_ref.get();
     uint32_t const FSTAT_DEV_ID = (fstat_mount != nullptr) ? fstat_mount->dev_id : 0;
 
     switch (file->fs_type) {
@@ -4481,7 +4562,8 @@ auto vfs_statvfs(const char* path, Statvfs* buf) -> int {
         return -ENOENT;
     }
 
-    MountPoint const* mount = find_mount_point(resolved.data());
+    auto mount_ref = find_mount_point(resolved.data());
+    MountPoint const* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
@@ -4541,7 +4623,8 @@ auto vfs_fstatvfs(int fd, Statvfs* buf) -> int {
     // For any fs type that has a path, delegate to vfs_statvfs so mount
     // context lookup is centralised.
     if (file->vfs_path != nullptr) {
-        MountPoint const* mount = find_mount_point(file->vfs_path);
+        auto mount_ref = find_mount_point(file->vfs_path);
+        MountPoint const* mount = mount_ref.get();
         if (mount != nullptr) {
             switch (mount->fs_type) {
                 case FSType::XFS: {
@@ -4605,8 +4688,12 @@ auto vfs_umount(const char* target) -> int {
         return -ENAMETOOLONG;
     }
 
-    if (MountPoint const* mount = find_mount_point(resolved.data()); mount != nullptr) {
-        stream_invalidate_mount_scope(mount->fs_type, stream_scope_key_for_mount(mount));
+    {
+        auto mount_ref = find_mount_point(resolved.data());
+        MountPoint const* mount = mount_ref.get();
+        if (mount != nullptr && mount->path != nullptr && std::strcmp(mount->path, resolved.data()) == 0) {
+            stream_invalidate_mount_scope(mount->fs_type, stream_scope_key_for_mount(mount));
+        }
     }
     return unmount_filesystem(target);
 }
@@ -4705,21 +4792,16 @@ auto vfs_dup2(int oldfd, int newfd) -> int {
     }
 
     uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-    auto* existing = vfs_take_fd_locked(task, newfd);
-    bool const INSERTED = task->fd_table.insert(static_cast<uint64_t>(newfd), f);
-    task->clear_fd_cloexec(static_cast<unsigned>(newfd));
+    VfsDup2ReplaceResult const REPLACE = vfs_replace_fd_for_dup2_locked(task, newfd, f);
     task->fd_table_lock.unlock_irqrestore(IRQF);
 
-    if (!INSERTED) {
-        if (existing != nullptr) {
-            vfs_put_file(existing);
-        }
+    if (!REPLACE.inserted) {
         vfs_put_file(f);
         return -EMFILE;
     }
 
-    if (existing != nullptr) {
-        vfs_put_file(existing);
+    if (REPLACE.existing != nullptr) {
+        vfs_put_file(REPLACE.existing);
     }
     return newfd;
 }
@@ -4905,7 +4987,8 @@ auto vfs_unlink(const char* path) -> int {
         return -ENAMETOOLONG;
     }
 
-    MountPoint const* mount = find_mount_point(path_buf.data());
+    auto mount_ref = find_mount_point(path_buf.data());
+    MountPoint const* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
@@ -5010,7 +5093,8 @@ auto vfs_rmdir(const char* path) -> int {
         return -ENAMETOOLONG;
     }
 
-    MountPoint const* mount = find_mount_point(path_buf.data());
+    auto mount_ref = find_mount_point(path_buf.data());
+    MountPoint const* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
@@ -5123,8 +5207,10 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
         return -ENAMETOOLONG;
     }
 
-    MountPoint* old_mount = find_mount_point(old_buf.data());
-    MountPoint* new_mount = find_mount_point(new_buf.data());
+    auto old_mount_ref = find_mount_point(old_buf.data());
+    auto new_mount_ref = find_mount_point(new_buf.data());
+    MountPoint* old_mount = old_mount_ref.get();
+    MountPoint* new_mount = new_mount_ref.get();
     if ((old_mount == nullptr) || (new_mount == nullptr)) {
         return -ENOENT;
     }
@@ -5308,7 +5394,8 @@ auto vfs_chmod(const char* path, int mode) -> int {
         return -ENAMETOOLONG;
     }
 
-    auto* mount = find_mount_point(path_buffer.data());
+    auto mount_ref = find_mount_point(path_buffer.data());
+    auto* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
@@ -5398,7 +5485,8 @@ auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
         return -ENAMETOOLONG;
     }
 
-    auto* mount = find_mount_point(path_buffer.data());
+    auto mount_ref = find_mount_point(path_buffer.data());
+    auto* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
@@ -5516,8 +5604,12 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
     // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4 (Linux values)
     switch (cmd) {
         case 0: {  // F_DUPFD - dup to fd >= arg
+            if (arg >= ker::mod::sched::task::Task::FD_TABLE_SIZE) {
+                vfs_put_file(f);
+                return -EINVAL;
+            }
             uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-            uint64_t const SLOT = task->fd_table.find_first_unset(arg);
+            uint64_t const SLOT = vfs_find_free_fd_below_limit_locked(task, arg);
             bool const INSERTED = SLOT != UINT64_MAX && task->fd_table.insert(SLOT, f);
             if (INSERTED) {
                 task->clear_fd_cloexec(static_cast<unsigned>(SLOT));
@@ -5560,8 +5652,12 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
             vfs_put_file(f);
             return 0;
         case 1030: {  // F_DUPFD_CLOEXEC - dup to fd >= arg, set close-on-exec
+            if (arg >= ker::mod::sched::task::Task::FD_TABLE_SIZE) {
+                vfs_put_file(f);
+                return -EINVAL;
+            }
             uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-            uint64_t const SLOT = task->fd_table.find_first_unset(arg);
+            uint64_t const SLOT = vfs_find_free_fd_below_limit_locked(task, arg);
             bool const INSERTED = SLOT != UINT64_MAX && task->fd_table.insert(SLOT, f);
             if (INSERTED) {
                 task->set_fd_cloexec(static_cast<unsigned>(SLOT));
@@ -5622,6 +5718,24 @@ struct PipeDirectWriteWindow {
     size_t capacity;
 };
 
+#ifdef WOS_SELFTEST
+enum class PipeSelftestFailStage : int {
+    NONE = 0,
+    BUFFER = 1,
+    STATE = 2,
+    READ_FILE = 3,
+    WRITE_FILE = 4,
+    READ_FD = 5,
+    WRITE_FD = 6,
+};
+
+std::atomic<int> g_vfs_selftest_pipe_fail_stage{static_cast<int>(PipeSelftestFailStage::NONE)};
+
+auto pipe_selftest_should_fail(PipeSelftestFailStage stage) -> bool {
+    return g_vfs_selftest_pipe_fail_stage.load(std::memory_order_relaxed) == static_cast<int>(stage);
+}
+#endif
+
 void pipe_update_peak(std::atomic<uint64_t>& peak, uint64_t candidate) {
     uint64_t observed = peak.load(std::memory_order_relaxed);
     while (candidate > observed && !peak.compare_exchange_weak(observed, candidate, std::memory_order_release, std::memory_order_relaxed)) {
@@ -5677,6 +5791,28 @@ void pipe_destroy_state(PipeState* st) {
     pipe_unregister_state(st);
     delete[] st->buf;
     delete st;
+}
+
+void pipe_destroy_unregistered_state(PipeState* st) {
+    if (st == nullptr) {
+        return;
+    }
+
+    delete[] st->buf;
+    delete st;
+}
+
+void pipe_init_file(File* file, PipeState* state, FileOperations* fops, int open_flags) {
+    file->private_data = state;
+    file->fops = fops;
+    file->pos = 0;
+    file->is_directory = false;
+    file->fs_type = FSType::TMPFS;
+    file->refcount.store(1, std::memory_order_relaxed);
+    file->open_flags = open_flags;
+    file->fd_flags = 0;
+    file->vfs_path = nullptr;
+    file->dir_fs_count = 0;
 }
 
 auto pipe_register_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
@@ -6057,20 +6193,39 @@ auto vfs_sendfile_to_pipe(File* outfile, File* infile, off_t* source_offset, siz
 }
 }  // namespace
 
-auto vfs_pipe(int pipefd[2]) -> int {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+namespace {
+auto vfs_pipe_for_task(ker::mod::sched::task::Task* task,
+                       int pipefd[2]) -> int {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     if (pipefd == nullptr) {
         return -EINVAL;
     }
-    auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return -ESRCH;
     }
 
     // Keep a moderate default capacity so simple producer/consumer pipelines do
     // not bounce through the scheduler every 4 KiB.
+#ifdef WOS_SELFTEST
+    if (pipe_selftest_should_fail(PipeSelftestFailStage::BUFFER)) {
+        return -ENOMEM;
+    }
+#endif
     auto* pipe_buf = new char[PIPE_DEFAULT_CAPACITY];
+    if (pipe_buf == nullptr) {
+        return -ENOMEM;
+    }
 
+#ifdef WOS_SELFTEST
+    if (pipe_selftest_should_fail(PipeSelftestFailStage::STATE)) {
+        delete[] pipe_buf;
+        return -ENOMEM;
+    }
+#endif
     auto* ps = new PipeState{};
+    if (ps == nullptr) {
+        delete[] pipe_buf;
+        return -ENOMEM;
+    }
     ps->buf = pipe_buf;
     ps->capacity = PIPE_DEFAULT_CAPACITY;
     ps->head = 0;
@@ -6427,53 +6582,78 @@ auto vfs_pipe(int pipefd[2]) -> int {  // NOLINT(cppcoreguidelines-avoid-c-array
     g_pipe_write_fops_ptr = &pipe_write_fops;
 
     // Create read-end File
-    auto* rf = new File;
-    rf->private_data = ps;
-    rf->fops = &pipe_read_fops;
-    rf->pos = 0;
-    rf->is_directory = false;
-    rf->fs_type = FSType::TMPFS;  // pseudo-type
-    rf->refcount = 1;
-    rf->open_flags = 0;  // O_RDONLY
-    rf->fd_flags = 0;
-    rf->vfs_path = nullptr;
-    rf->dir_fs_count = 0;
+#ifdef WOS_SELFTEST
+    if (pipe_selftest_should_fail(PipeSelftestFailStage::READ_FILE)) {
+        pipe_destroy_unregistered_state(ps);
+        return -ENOMEM;
+    }
+#endif
+    auto* rf = new File{};
+    if (rf == nullptr) {
+        pipe_destroy_unregistered_state(ps);
+        return -ENOMEM;
+    }
+    pipe_init_file(rf, ps, &pipe_read_fops, 0);
 
     // Create write-end File
-    auto* wf = new File;
-    wf->private_data = ps;
-    wf->fops = &pipe_write_fops;
-    wf->pos = 0;
-    wf->is_directory = false;
-    wf->fs_type = FSType::TMPFS;
-    wf->refcount = 1;
-    wf->open_flags = 1;  // O_WRONLY
-    wf->fd_flags = 0;
-    wf->vfs_path = nullptr;
-    wf->dir_fs_count = 0;
+#ifdef WOS_SELFTEST
+    if (pipe_selftest_should_fail(PipeSelftestFailStage::WRITE_FILE)) {
+        delete rf;
+        pipe_destroy_unregistered_state(ps);
+        return -ENOMEM;
+    }
+#endif
+    auto* wf = new File{};
+    if (wf == nullptr) {
+        delete rf;
+        pipe_destroy_unregistered_state(ps);
+        return -ENOMEM;
+    }
+    pipe_init_file(wf, ps, &pipe_write_fops, 1);
 
+#ifdef WOS_SELFTEST
+    if (pipe_selftest_should_fail(PipeSelftestFailStage::READ_FD)) {
+        delete rf;
+        delete wf;
+        pipe_destroy_unregistered_state(ps);
+        return -EMFILE;
+    }
+#endif
     int const RFD = vfs_alloc_fd(task, rf);
     if (RFD < 0) {
         delete rf;
         delete wf;
-        delete[] pipe_buf;
-        delete ps;
+        pipe_destroy_unregistered_state(ps);
+        return RFD;
+    }
+
+#ifdef WOS_SELFTEST
+    if (pipe_selftest_should_fail(PipeSelftestFailStage::WRITE_FD)) {
+        vfs_release_fd(task, RFD);
+        delete rf;
+        delete wf;
+        pipe_destroy_unregistered_state(ps);
         return -EMFILE;
     }
+#endif
     int const WFD = vfs_alloc_fd(task, wf);
     if (WFD < 0) {
         vfs_release_fd(task, RFD);
         delete rf;
         delete wf;
-        delete[] pipe_buf;
-        delete ps;
-        return -EMFILE;
+        pipe_destroy_unregistered_state(ps);
+        return WFD;
     }
 
     pipefd[0] = RFD;
     pipefd[1] = WFD;
     pipe_register_state(ps);
     return 0;
+}
+}  // namespace
+
+auto vfs_pipe(int pipefd[2]) -> int {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    return vfs_pipe_for_task(ker::mod::sched::get_current_task(), pipefd);
 }
 
 auto vfs_pipe_reserve_capacity(File* file, size_t capacity) -> bool {
@@ -6572,6 +6752,71 @@ void vfs_reset_local_pipe_perf_counters() {
     g_pipe_peak_count.store(active_pipes, std::memory_order_release);
     g_pipe_peak_capacity_bytes.store(active_capacity, std::memory_order_release);
 }
+
+#ifdef WOS_SELFTEST
+auto pipe_snapshot_unchanged(const LocalPipePerfSnapshot& before, const LocalPipePerfSnapshot& after) -> bool {
+    return before.active_pipes == after.active_pipes && before.created_since_reset == after.created_since_reset &&
+           before.capacity_bytes == after.capacity_bytes && before.buffered_bytes == after.buffered_bytes &&
+           before.approx_alloc_bytes == after.approx_alloc_bytes;
+}
+
+auto pipe_close_fake_task_fd(ker::mod::sched::task::Task& task, int fd) -> bool {
+    auto* file = static_cast<File*>(task.fd_table.lookup(static_cast<uint64_t>(fd)));
+    if (file == nullptr) {
+        return false;
+    }
+    if (vfs_release_fd(&task, fd) < 0) {
+        return false;
+    }
+    vfs_put_file(file);
+    return true;
+}
+
+auto vfs_selftest_pipe_failure_unwinds() -> bool {
+    constexpr std::array<PipeSelftestFailStage, 6> FAIL_STAGES{
+        PipeSelftestFailStage::BUFFER,     PipeSelftestFailStage::STATE,   PipeSelftestFailStage::READ_FILE,
+        PipeSelftestFailStage::WRITE_FILE, PipeSelftestFailStage::READ_FD, PipeSelftestFailStage::WRITE_FD,
+    };
+
+    bool ok = true;
+    for (PipeSelftestFailStage stage : FAIL_STAGES) {
+        ker::mod::sched::task::Task task{};
+        std::array<int, 2> pipefd{-1, -1};
+        LocalPipePerfSnapshot before{};
+        LocalPipePerfSnapshot after{};
+        vfs_get_local_pipe_perf_snapshot(before);
+
+        g_vfs_selftest_pipe_fail_stage.store(static_cast<int>(stage), std::memory_order_relaxed);
+        int const RET = vfs_pipe_for_task(&task, pipefd.data());
+        g_vfs_selftest_pipe_fail_stage.store(static_cast<int>(PipeSelftestFailStage::NONE), std::memory_order_relaxed);
+
+        vfs_get_local_pipe_perf_snapshot(after);
+        bool const EXPECTED_ERRNO =
+            (stage == PipeSelftestFailStage::READ_FD || stage == PipeSelftestFailStage::WRITE_FD) ? (RET == -EMFILE) : (RET == -ENOMEM);
+        ok = ok && EXPECTED_ERRNO && pipefd[0] == -1 && pipefd[1] == -1 && task.fd_table.empty() && pipe_snapshot_unchanged(before, after);
+    }
+
+    ker::mod::sched::task::Task task{};
+    std::array<int, 2> pipefd{-1, -1};
+    LocalPipePerfSnapshot before_success{};
+    LocalPipePerfSnapshot active_success{};
+    LocalPipePerfSnapshot after_success_cleanup{};
+    vfs_get_local_pipe_perf_snapshot(before_success);
+    int const RET = vfs_pipe_for_task(&task, pipefd.data());
+    vfs_get_local_pipe_perf_snapshot(active_success);
+    ok = ok && RET == 0 && pipefd[0] >= 0 && pipefd[1] >= 0 && task.fd_table.size() == 2 &&
+         active_success.active_pipes == before_success.active_pipes + 1 &&
+         active_success.capacity_bytes == before_success.capacity_bytes + PIPE_DEFAULT_CAPACITY;
+
+    bool const CLOSED_READ = pipefd[0] >= 0 && pipe_close_fake_task_fd(task, pipefd[0]);
+    bool const CLOSED_WRITE = pipefd[1] >= 0 && pipe_close_fake_task_fd(task, pipefd[1]);
+    vfs_get_local_pipe_perf_snapshot(after_success_cleanup);
+    ok = ok && CLOSED_READ && CLOSED_WRITE && task.fd_table.empty() && after_success_cleanup.active_pipes == before_success.active_pipes &&
+         after_success_cleanup.capacity_bytes == before_success.capacity_bytes;
+
+    return ok;
+}
+#endif
 
 auto vfs_mount(const char* source, const char* target, const char* fstype) -> int {
     if (target == nullptr) {
@@ -6898,7 +7143,8 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
         return nullptr;
     }
 
-    MountPoint const* mount = find_mount_point(pathBuffer);
+    auto mount_ref = find_mount_point(pathBuffer);
+    MountPoint const* mount = mount_ref.get();
     bool const REMOTE_MOUNT = mount != nullptr && mount->fs_type == FSType::REMOTE;
     if (!REMOTE_MOUNT) {
         char resolved[MAX_PATH_LEN];  // NOLINT
@@ -6907,7 +7153,8 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
             std::memcpy(pathBuffer, resolved, MAX_PATH_LEN);
         }
 
-        mount = find_mount_point(pathBuffer);
+        mount_ref = find_mount_point(pathBuffer);
+        mount = mount_ref.get();
     }
 
     if (mount == nullptr) {
@@ -7020,6 +7267,126 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
 auto vfs_open_file(const char* path, int flags, int mode) -> File* { return vfs_open_file_impl(path, flags, mode, true, true); }
 
 auto vfs_open_file_resolved(const char* path, int flags, int mode) -> File* { return vfs_open_file_impl(path, flags, mode, false, false); }
+
+#ifdef WOS_SELFTEST
+auto vfs_selftest_make_file() -> File* {
+    auto* file = new File();
+    file->refcount.store(1, std::memory_order_relaxed);
+    file->fops = &g_vfs_selftest_fops;
+    return file;
+}
+
+auto vfs_selftest_fd_install_failure_closes_file() -> bool {
+    g_vfs_selftest_close_count.store(0, std::memory_order_relaxed);
+
+    auto* file = vfs_selftest_make_file();
+
+    int const RET = vfs_install_open_file(nullptr, file);
+    return RET == -EINVAL && g_vfs_selftest_close_count.load(std::memory_order_relaxed) == 1;
+}
+
+auto vfs_selftest_dup2_replace_preserves_newfd_on_failure() -> bool {
+    constexpr int FD = 7;
+
+    g_vfs_selftest_close_count.store(0, std::memory_order_relaxed);
+    g_vfs_selftest_force_dup2_insert_failure.store(false, std::memory_order_relaxed);
+
+    ker::mod::sched::task::Task task{};
+    auto* existing = vfs_selftest_make_file();
+    auto* replacement = vfs_selftest_make_file();
+    if (!task.fd_table.insert(FD, existing)) {
+        vfs_put_file(existing);
+        vfs_put_file(replacement);
+        return false;
+    }
+    task.set_fd_cloexec(FD);
+
+    VfsDup2ReplaceResult const SUCCESS = vfs_replace_fd_for_dup2_locked(&task, FD, replacement);
+    bool ok = SUCCESS.inserted && SUCCESS.existing == existing && task.fd_table.lookup(FD) == static_cast<void*>(replacement) &&
+              !task.get_fd_cloexec(FD) && g_vfs_selftest_close_count.load(std::memory_order_relaxed) == 0;
+    vfs_put_file(SUCCESS.existing);
+
+    auto* failed_replacement = vfs_selftest_make_file();
+    task.set_fd_cloexec(FD);
+    g_vfs_selftest_force_dup2_insert_failure.store(true, std::memory_order_relaxed);
+    VfsDup2ReplaceResult const FAILURE = vfs_replace_fd_for_dup2_locked(&task, FD, failed_replacement);
+    g_vfs_selftest_force_dup2_insert_failure.store(false, std::memory_order_relaxed);
+    ok = ok && !FAILURE.inserted && FAILURE.existing == replacement && task.fd_table.lookup(FD) == static_cast<void*>(replacement) &&
+         task.get_fd_cloexec(FD) && g_vfs_selftest_close_count.load(std::memory_order_relaxed) == 1;
+    vfs_put_file(failed_replacement);
+
+    auto* still_open = reinterpret_cast<File*>(task.fd_table.remove(FD));
+    task.clear_fd_cloexec(FD);
+    ok = ok && still_open == replacement;
+    vfs_put_file(still_open);
+
+    return ok && g_vfs_selftest_close_count.load(std::memory_order_relaxed) == 3;
+}
+
+auto vfs_selftest_fd_allocation_caps_cloexec_range() -> bool {
+    using ker::mod::sched::task::Task;
+
+    ker::mod::sched::task::Task task{};
+    bool ok = true;
+
+    for (unsigned fd = 0; fd < Task::FD_TABLE_SIZE; ++fd) {
+        auto* file = vfs_selftest_make_file();
+        if (file == nullptr) {
+            ok = false;
+            break;
+        }
+
+        int const ALLOCATED = vfs_alloc_fd(&task, file);
+        if (ALLOCATED != static_cast<int>(fd)) {
+            if (ALLOCATED < 0) {
+                vfs_put_file(file);
+            }
+            ok = false;
+            break;
+        }
+
+        task.set_fd_cloexec(fd);
+        ok = ok && task.get_fd_cloexec(fd);
+    }
+
+    auto* overflow = vfs_selftest_make_file();
+    if (overflow == nullptr) {
+        ok = false;
+    } else {
+        int const RET = vfs_alloc_fd(&task, overflow);
+        ok = ok && RET == -EMFILE && task.fd_table.lookup(Task::FD_TABLE_SIZE) == nullptr &&
+             vfs_find_free_fd_below_limit_locked(&task, 0) == UINT64_MAX &&
+             vfs_find_free_fd_below_limit_locked(&task, Task::FD_TABLE_SIZE) == UINT64_MAX;
+        vfs_put_file(overflow);
+    }
+
+    constexpr unsigned HOLE_FD = 17;
+    auto* removed = static_cast<File*>(task.fd_table.lookup(HOLE_FD));
+    int const RELEASE_RET = vfs_release_fd(&task, HOLE_FD);
+    ok = ok && RELEASE_RET == 0 && !task.get_fd_cloexec(HOLE_FD);
+    vfs_put_file(removed);
+
+    ok = ok && vfs_find_free_fd_below_limit_locked(&task, HOLE_FD) == HOLE_FD;
+    auto* replacement = vfs_selftest_make_file();
+    if (replacement == nullptr) {
+        ok = false;
+    } else {
+        int const RET = vfs_alloc_fd(&task, replacement);
+        ok = ok && RET == static_cast<int>(HOLE_FD) && !task.get_fd_cloexec(HOLE_FD);
+        if (RET < 0) {
+            vfs_put_file(replacement);
+        }
+    }
+
+    task.fd_table.for_each([](uint64_t /*fd*/, void* val) {
+        if (val != nullptr) {
+            vfs_put_file(static_cast<File*>(val));
+        }
+    });
+
+    return ok;
+}
+#endif
 
 auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
     // Get the current task
@@ -7177,8 +7544,10 @@ auto vfs_link(const char* oldpath, const char* newpath) -> int {
         return -ENAMETOOLONG;
     }
 
-    MountPoint const* old_mount = find_mount_point(old_buf.data());
-    MountPoint const* new_mount = find_mount_point(new_buf.data());
+    auto old_mount_ref = find_mount_point(old_buf.data());
+    auto new_mount_ref = find_mount_point(new_buf.data());
+    MountPoint const* old_mount = old_mount_ref.get();
+    MountPoint const* new_mount = new_mount_ref.get();
     if ((old_mount == nullptr) || (new_mount == nullptr)) {
         return -ENOENT;
     }

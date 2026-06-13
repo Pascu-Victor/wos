@@ -26,12 +26,38 @@ struct Itimerval {
 };
 
 constexpr int ITIMER_REAL = 0;
+constexpr long NSEC_PER_SEC = 1000000000L;
+constexpr uint64_t USEC_PER_SEC = 1000000ULL;
 
 // CLK_TCK for times() return values - must match userspace sysconf(_SC_CLK_TCK)
 constexpr uint64_t WOS_CLK_TCK = 100;
 
 // Convert microseconds to clock ticks (CLK_TCK = 100, so 1 tick = 10000 us)
 auto us_to_ticks(uint64_t us) -> uint64_t { return us / (1000000 / WOS_CLK_TCK); }
+
+auto relative_timespec_to_us(const struct timespec& ts, uint64_t& out_us) -> bool {
+    out_us = 0;
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC) {
+        return false;
+    }
+
+    auto const NSEC_US = (static_cast<uint64_t>(ts.tv_nsec) + 999ULL) / 1000ULL;
+    auto const SEC = static_cast<uint64_t>(ts.tv_sec);
+    if (SEC > (UINT64_MAX - NSEC_US) / USEC_PER_SEC) {
+        return false;
+    }
+
+    out_us = (SEC * USEC_PER_SEC) + NSEC_US;
+    return true;
+}
+
+auto deadline_from_now_us(uint64_t sleep_us) -> uint64_t {
+    uint64_t const NOW_US = ker::mod::time::get_us();
+    if (UINT64_MAX - NOW_US < sleep_us) {
+        return UINT64_MAX;
+    }
+    return NOW_US + sleep_us;
+}
 
 }  // namespace
 
@@ -96,14 +122,17 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 return static_cast<uint64_t>(-1);
             }
             const auto* req = reinterpret_cast<const struct timespec*>(arg1);
-            uint64_t const SLEEP_US = (static_cast<uint64_t>(req->tv_sec) * 1000000ULL) + (static_cast<uint64_t>(req->tv_nsec) / 1000ULL);
-            if (SLEEP_US > 0) {
+            uint64_t sleep_us = 0;
+            if (!relative_timespec_to_us(*req, sleep_us)) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            if (sleep_us > 0) {
                 auto* task = ker::mod::sched::get_current_task();
                 if (task != nullptr) {
                     // Set wake deadline and use deferred_task_switch to properly block
                     // (move to wait list). The timer tick wakeup scan will reschedule us
                     // once wake_at_us is reached.
-                    task->wake_at_us = ker::mod::time::get_us() + SLEEP_US;
+                    task->wake_at_us = deadline_from_now_us(sleep_us);
                     task->wait_channel = "nanosleep";
                     task->deferred_task_switch = true;
                     // Return 0 now - syscall exit path sees deferred_task_switch=true,
@@ -111,7 +140,7 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 } else {
                     // Pre-scheduler fallback: spin-wait
                     uint64_t const START = ker::mod::time::get_us();
-                    while (ker::mod::time::get_us() - START < SLEEP_US) {
+                    while (ker::mod::time::get_us() - START < sleep_us) {
                     }
                 }
             }

@@ -6,12 +6,15 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 #include <new>
 #include <platform/dbg/dbg.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sys/spinlock.hpp>
 #include <util/hashtable.hpp>
 
 namespace ker::syscall::futex {
@@ -33,17 +36,60 @@ struct FutexKeyExtract {
     uint64_t operator()(const FutexWaiter& w) const { return w.phys_addr; }
 };
 
+constexpr long NSEC_PER_SEC = 1000000000L;
+constexpr uint64_t USEC_PER_SEC = 1000000ULL;
+
 // 256 buckets — per-bucket spinlocks replace the single global lock.
 // Default-constructed (no allocation); init() called on first use.
 ker::util::IntrHashTable<FutexWaiter, FutexKeyExtract, ker::util::IntHash, ker::util::IntEqual> futex_table;
-bool futex_table_initialized = false;
+ker::mod::sys::Spinlock futex_init_lock;
+std::atomic<bool> futex_table_initialized{false};
 
-void ensure_futex_table() {
-    if (__builtin_expect(static_cast<long>(!futex_table_initialized), 0) != 0) {
-        static_cast<void>(futex_table.init(256));
-        futex_table_initialized = true;
+[[nodiscard]] auto ensure_futex_table() -> bool {
+    if (__builtin_expect(static_cast<long>(!futex_table_initialized.load(std::memory_order_acquire)), 0) == 0) {
+        return true;
     }
+
+    uint64_t const FLAGS = futex_init_lock.lock_irqsave();
+    bool initialized = futex_table_initialized.load(std::memory_order_relaxed);
+    if (!initialized) {
+        initialized = futex_table.init(256);
+        futex_table_initialized.store(initialized, std::memory_order_release);
+    }
+    futex_init_lock.unlock_irqrestore(FLAGS);
+    return initialized;
 }
+
+auto relative_timeout_us(const void* timeout, uint64_t& out_us) -> int64_t {
+    out_us = 0;
+    if (timeout == nullptr) {
+        return 0;
+    }
+
+    auto const* ts = reinterpret_cast<const timespec*>(timeout);
+    if (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= NSEC_PER_SEC) {
+        return -EINVAL;
+    }
+
+    auto const NSEC_US = (static_cast<uint64_t>(ts->tv_nsec) + 999ULL) / 1000ULL;
+    auto const SEC = static_cast<uint64_t>(ts->tv_sec);
+    if (SEC > (UINT64_MAX - NSEC_US) / USEC_PER_SEC) {
+        return -EINVAL;
+    }
+
+    out_us = (SEC * USEC_PER_SEC) + NSEC_US;
+    return 0;
+}
+
+auto deadline_from_now_us(uint64_t timeout_us) -> uint64_t {
+    uint64_t const NOW_US = ker::mod::time::get_us();
+    if (UINT64_MAX - NOW_US < timeout_us) {
+        return UINT64_MAX;
+    }
+    return NOW_US + timeout_us;
+}
+
+auto futex_addr_is_aligned(const void* addr) -> bool { return (reinterpret_cast<uintptr_t>(addr) % alignof(int)) == 0; }
 
 }  // namespace
 
@@ -71,8 +117,12 @@ uint64_t sys_futex(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3) {
 // ============================================================================
 
 int64_t futex_wait(const int* addr, int expected, const void* timeout) {
-    (void)timeout;  // TODO: Implement timeout support
-    ensure_futex_table();
+    if (!futex_addr_is_aligned(addr)) {
+        return -EINVAL;
+    }
+    if (!ensure_futex_table()) {
+        return -ENOMEM;
+    }
 
     auto* current_task = mod::sched::get_current_task();
     if (current_task == nullptr) {
@@ -90,6 +140,16 @@ int64_t futex_wait(const int* addr, int expected, const void* timeout) {
     uint64_t const PHYS_PAGE = PHYS_ADDR & ~0xFFFULL;
     uint64_t const OFFSET = PHYS_ADDR & 0xFFF;
     int const* kernel_addr = reinterpret_cast<int*>(reinterpret_cast<uint64_t>(mod::mm::addr::get_virt_pointer(PHYS_PAGE)) + OFFSET);
+
+    uint64_t timeout_us = 0;
+    int64_t const TIMEOUT_STATUS = relative_timeout_us(timeout, timeout_us);
+    if (TIMEOUT_STATUS != 0) {
+        return TIMEOUT_STATUS;
+    }
+
+    if (timeout != nullptr && timeout_us == 0) {
+        return *kernel_addr == expected ? -ETIMEDOUT : -EAGAIN;
+    }
 
     // Allocate a waiter node
     auto* waiter = new (std::nothrow) FutexWaiter{};
@@ -113,8 +173,9 @@ int64_t futex_wait(const int* addr, int expected, const void* timeout) {
             int const CURRENT_VALUE = *kernel_addr;
             return CURRENT_VALUE == expected;
         },
-        [current_task, waiter, &previous_waiter]() {
+        [current_task, waiter, timeout, timeout_us, &previous_waiter]() {
             current_task->wait_channel = "futex_wait";
+            current_task->wake_at_us = timeout != nullptr ? deadline_from_now_us(timeout_us) : 0;
             current_task->deferred_task_switch = true;
             previous_waiter = current_task->futex_waiter.exchange(waiter, std::memory_order_acq_rel);
         });
@@ -135,7 +196,12 @@ int64_t futex_wait(const int* addr, int expected, const void* timeout) {
 // ============================================================================
 
 int64_t futex_wake(int* addr) {  // NOLINT
-    ensure_futex_table();
+    if (!futex_addr_is_aligned(addr)) {
+        return -EINVAL;
+    }
+    if (!ensure_futex_table()) {
+        return -ENOMEM;
+    }
     auto* current_task = mod::sched::get_current_task();
     if (current_task == nullptr) {
         return -EINVAL;
@@ -190,7 +256,9 @@ int64_t futex_wake_by_phys(uint64_t phys_addr) {
     if (phys_addr == 0) {
         return -EINVAL;
     }
-    ensure_futex_table();
+    if (!ensure_futex_table()) {
+        return -ENOMEM;
+    }
 
     int woken_count = 0;
     futex_table.remove_all_by_key(phys_addr, [&](FutexWaiter* waiter) {
@@ -212,5 +280,17 @@ int64_t futex_wake_by_phys(uint64_t phys_addr) {
     });
     return woken_count;
 }
+
+#ifdef WOS_SELFTEST
+auto futex_selftest_table_init_is_serialized() -> bool {
+    bool const FIRST = ensure_futex_table();
+    bool const SECOND = ensure_futex_table();
+    return FIRST && SECOND && futex_table_initialized.load(std::memory_order_acquire) && futex_table.valid();
+}
+
+auto futex_selftest_addr_alignment_guard() -> bool {
+    return futex_addr_is_aligned(reinterpret_cast<const int*>(0x1000)) && !futex_addr_is_aligned(reinterpret_cast<const int*>(0x1001));
+}
+#endif
 
 }  // namespace ker::syscall::futex

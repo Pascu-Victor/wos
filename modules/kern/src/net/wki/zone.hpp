@@ -80,6 +80,8 @@ struct WkiZone {
     std::atomic<bool> read_pending{false};
     void* read_dest_buf = nullptr;
     uint32_t read_result_len = 0;
+    uint32_t read_expected_offset = 0;
+    uint32_t read_expected_len = 0;
     int read_status = 0;
     WkiWaitEntry* read_wait_entry = nullptr;  // V2 I-4: async wait for ZONE_READ_RESP
 
@@ -87,6 +89,8 @@ struct WkiZone {
     int write_status = 0;
     WkiWaitEntry* write_wait_entry = nullptr;  // V2 I-4: async wait for ZONE_WRITE_ACK
 
+    std::atomic<uint32_t> refs{0};
+    std::atomic<bool> retiring{false};
     mod::sys::Spinlock lock;
 };
 
@@ -128,6 +132,11 @@ void wki_zone_set_handlers(uint32_t zone_id, ZoneNotifyHandler pre, ZoneNotifyHa
 void wki_zones_destroy_for_peer(uint16_t node_id);
 
 auto wki_zones_list() -> auto;
+
+#ifdef WOS_SELFTEST
+auto wki_zone_selftest_timeout_retirement_fences_stale_completion() -> bool;
+auto wki_zone_selftest_range_and_read_response_validation() -> bool;
+#endif
 
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers (called from wki.cpp dispatch)

@@ -1,19 +1,16 @@
 #include "cpu.hpp"
 
-#include <atomic>
 #include <cstdint>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/smt/smt.hpp>
 
+extern "C" uint8_t wos_per_cpu_ready_state = 0;
+
 namespace ker::mod::cpu {
 
-namespace {
-std::atomic<bool> s_per_cpu_ready{false};
-}  // namespace
-
 [[clang::no_sanitize("coverage")]] auto get_current_cpu_id_safe() -> uint64_t {
-    if (s_per_cpu_ready.load(std::memory_order_acquire)) {
-        return current_cpu();
+    if (per_cpu_ready_flag_acquire()) {
+        return current_cpu_fast();
     }
     // Early boot: use APIC ID
     uint32_t const APIC_ID = apic::get_apic_id();
@@ -23,24 +20,16 @@ std::atomic<bool> s_per_cpu_ready{false};
     return 0;  // BSP during very early init
 }
 
-[[clang::no_sanitize("coverage")]] auto is_per_cpu_ready() -> bool { return s_per_cpu_ready.load(std::memory_order_acquire); }
+[[clang::no_sanitize("coverage")]] auto is_per_cpu_ready() -> bool { return per_cpu_ready_flag_acquire(); }
 
-void notify_per_cpu_ready() { s_per_cpu_ready.store(true, std::memory_order_release); }
+void notify_per_cpu_ready() { __atomic_store_n(&wos_per_cpu_ready_state, static_cast<uint8_t>(1), __ATOMIC_RELEASE); }
 void cpuid(struct CpuidContext* cpuid_context) {
     asm volatile("cpuid"
                  : "=a"(cpuid_context->eax), "=b"(cpuid_context->ebx), "=c"(cpuid_context->ecx), "=d"(cpuid_context->edx)
                  : "a"(cpuid_context->function));
 }
 
-[[clang::no_sanitize("coverage")]] uint64_t current_cpu() {
-    // After swapgs in syscall/interrupt handler, GS_BASE points to the per-task
-    // scratch area (PerCpu structure). cpuId is at offset 0x10 in PerCpu.
-    // We must read via gs: segment, NOT from KERNEL_GS_BASE (which holds user's TLS after swapgs).
-    // NOLINTNEXTLINE(misc-const-correctness)
-    uint64_t cpu_id = 0;
-    asm volatile("mov %%gs:0x10, %0" : "=r"(cpu_id)::"memory");
-    return cpu_id;
-}
+[[clang::no_sanitize("coverage")]] uint64_t current_cpu() { return current_cpu_fast(); }
 
 [[clang::no_sanitize("coverage")]] void set_current_cpuid(uint64_t id) {
     // Write cpuId to gs:0x10 (offset of cpuId in PerCpu structure)

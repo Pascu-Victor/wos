@@ -1088,11 +1088,13 @@ auto generate_mounts(char* buf, size_t bufsz) -> size_t {
 
     // Iterate mount table
     for (size_t i = 0; i < ker::vfs::get_mount_count(); ++i) {
-        auto* m = ker::vfs::get_mount_at(i);
-        if (m == nullptr) {
+        ker::vfs::MountSnapshot mount_snapshot{};
+        if (!ker::vfs::get_mount_snapshot_at(i, &mount_snapshot)) {
             continue;
         }
-        const char* mount_path = (m->path != nullptr) ? m->path : "/";
+        const char* snapshot_path = static_cast<const char*>(mount_snapshot.path);
+        const char* snapshot_fstype = static_cast<const char*>(mount_snapshot.fstype);
+        const char* mount_path = (snapshot_path[0] != '\0') ? snapshot_path : "/";
 
         // Compute the task-relative display path by stripping the task root prefix.
         const char* display_path = mount_path;
@@ -1105,11 +1107,11 @@ auto generate_mounts(char* buf, size_t bufsz) -> size_t {
             }
         }
 
-        append((m->fstype != nullptr) ? m->fstype : "none");
+        append((snapshot_fstype[0] != '\0') ? snapshot_fstype : "none");
         append(" ");
         append(display_path);
         append(" ");
-        append((m->fstype != nullptr) ? m->fstype : "none");
+        append((snapshot_fstype[0] != '\0') ? snapshot_fstype : "none");
         append(" rw 0 0\n");
     }
 

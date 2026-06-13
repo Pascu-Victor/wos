@@ -1,5 +1,6 @@
-// Pure-logic network checksum and PacketBuffer inline-method tests.
-// No NIC, no pool initialization, no tasks required.
+// Network checksum and PacketBuffer tests.
+// Most tests avoid NICs, packet-pool initialization, and tasks; the lifetime
+// release test intentionally uses the real packet pool to guard pkt_free().
 
 #include <cstddef>
 #include <cstdint>
@@ -98,6 +99,11 @@ KTEST(Net, PseudoHeaderRoundTrip) {
 
 static ker::net::PacketBuffer g_ktest_pkt;  // NOLINT
 
+static void ktest_pkt_lifetime_release(void* ctx) {
+    auto* count = static_cast<uint32_t*>(ctx);
+    (*count)++;
+}
+
 KTEST(Net, PacketBufferPushPull) {
     // Reset to initial state
     g_ktest_pkt.data = g_ktest_pkt.storage.data() + ker::net::PKT_HEADROOM;
@@ -132,4 +138,36 @@ KTEST(Net, PacketBufferPut) {
     // tailroom should have shrunk
     size_t const EXPECTED_TAILROOM = ker::net::PKT_BUF_SIZE - ker::net::PKT_HEADROOM - 20;
     KEXPECT_EQ(g_ktest_pkt.tailroom(), EXPECTED_TAILROOM);
+}
+
+KTEST(Net, PacketBufferLifetimeReleaseRunsOnceAndClearsBeforeReuse) {
+    ker::net::pkt_pool_init();
+    size_t const BASELINE_FREE = ker::net::pkt_pool_free_count();
+
+    ker::net::PacketBuffer* pkt = ker::net::pkt_alloc();
+    KEXPECT_NE(pkt, nullptr);
+    if (pkt == nullptr) {
+        return;
+    }
+    KEXPECT_EQ(ker::net::pkt_pool_free_count(), BASELINE_FREE - 1);
+
+    uint32_t release_count = 0;
+    pkt->lifetime_ctx = &release_count;
+    pkt->lifetime_release = ktest_pkt_lifetime_release;
+
+    ker::net::pkt_free(pkt);
+    KEXPECT_EQ(release_count, 1U);
+    KEXPECT_EQ(ker::net::pkt_pool_free_count(), BASELINE_FREE);
+
+    ker::net::PacketBuffer* reused = ker::net::pkt_alloc();
+    KEXPECT_NE(reused, nullptr);
+    if (reused == nullptr) {
+        return;
+    }
+    KEXPECT_NULL(reused->lifetime_ctx);
+    KEXPECT_NULL(reinterpret_cast<void*>(reused->lifetime_release));
+
+    ker::net::pkt_free(reused);
+    KEXPECT_EQ(release_count, 1U);
+    KEXPECT_EQ(ker::net::pkt_pool_free_count(), BASELINE_FREE);
 }

@@ -11,6 +11,8 @@ option(WOS_KCFI                    "Enable Clang Kernel Control-Flow Integrity" 
 option(WOS_KUBSAN                  "Enable Kernel UndefinedBehaviorSanitizer"                           OFF)
 option(WOS_KASAN                   "Enable Kernel AddressSanitizer (requires shadow map)"               OFF)
 option(WOS_KCOV                    "Enable kernel coverage instrumentation (for Syzkaller)"             OFF)
+option(WOS_KCOV_NO_PRUNE           "Disable KCOV coverage pruning to instrument all eligible trace-pc blocks" ON)
+option(WOS_KCOV_SOURCE_FRIENDLY    "Tune KCOV-enabled kernel codegen for source-level coverage fidelity" OFF)
 option(WOS_KCOV_PANIC_TRACE        "Record a recent-PC ring for panic dumps using KCOV callbacks"       OFF)
 option(WOS_SELFTEST                "Enable kernel self-test mode (--selftest cmdline flag)"             OFF)
 option(WOS_NET_TRACE               "Enable network hot-path cycle-count trace spans"                    OFF)
@@ -39,21 +41,25 @@ if(WOS_KCOV_PANIC_TRACE AND NOT WOS_KCOV)
     message(FATAL_ERROR "WOS_KCOV_PANIC_TRACE requires WOS_KCOV=ON")
 endif()
 
+if(WOS_KCOV_SOURCE_FRIENDLY AND NOT WOS_KCOV)
+    message(FATAL_ERROR "WOS_KCOV_SOURCE_FRIENDLY requires WOS_KCOV=ON")
+endif()
+
 # Internal flags
 set(CMAKE_LINK_FLAGS "LINKER:-m,elf_x86_64" "SHELL:-nostdlib" "SHELL:-z max-page-size=0x1000" "SHELL:-Wl,-T,${CMAKE_SOURCE_DIR}/modules/kern/linker.ld")
 
 # Include directories
 
 # Find source files
-file(GLOB_RECURSE CFILES src/*.c)
-file(GLOB_RECURSE ASFILES src/*.S)
-file(GLOB_RECURSE NASMFILES src/*.asm)
-file(GLOB_RECURSE CXXFILES src/*.cpp)
+file(GLOB_RECURSE CFILES CONFIGURE_DEPENDS src/*.c)
+file(GLOB_RECURSE ASFILES CONFIGURE_DEPENDS src/*.S)
+file(GLOB_RECURSE NASMFILES CONFIGURE_DEPENDS src/*.asm)
+file(GLOB_RECURSE CXXFILES CONFIGURE_DEPENDS src/*.cpp)
 
 # Exclude test sources unless self-test mode is explicitly enabled.
 # GLOB_RECURSE picks up src/test/*.cpp; strip them in production builds.
 if(NOT WOS_SELFTEST)
-    file(GLOB_RECURSE KTEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/test/*.cpp)
+    file(GLOB_RECURSE KTEST_SRCS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/test/*.cpp)
     list(REMOVE_ITEM CXXFILES ${KTEST_SRCS})
 endif()
 
@@ -89,9 +95,12 @@ if(WOS_KUBSAN)
 endif()
 
 if(WOS_KASAN)
+    set(KERNEL_SANITIZER_IGNORELIST ${CMAKE_CURRENT_SOURCE_DIR}/sancov.ignore)
+
     # -fsanitize=kernel-address applies to C/CXX only (not NASM/ASM).
     target_compile_options(${KERNEL} PRIVATE
         $<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=kernel-address>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize-ignorelist=${KERNEL_SANITIZER_IGNORELIST}>
     )
     # -mllvm flags must be passed as SHELL: pairs so CMake doesn't strip the
     # repeated -mllvm tokens (deduplication). They also must be language-gated
@@ -136,6 +145,16 @@ if(WOS_KASAN)
         src/platform/interrupt/idt.cpp
         src/platform/interrupt/interrupt.cpp
         src/platform/interrupt/kmem.cpp
+        # Early ACPI/APIC discovery is used while firmware tables and CPU/APIC
+        # state are still being brought up. Keep this path out of KASAN so
+        # compiler-emitted stack/object shadow poisoning does not recurse into
+        # unmapped-shadow faults before the boot fault path is fully safe.
+        src/platform/acpi/acpi.cpp
+        src/platform/acpi/apic/apic.cpp
+        src/platform/acpi/hpet/hpet.cpp
+        src/platform/acpi/ioapic/ioapic.cpp
+        src/platform/acpi/madt/madt.cpp
+        src/platform/acpi/tables/rsdp.cpp
         # KASan/UBSan/KCOV runtimes (must not instrument themselves)
         src/sanitizer/kasan.cpp
         src/sanitizer/ubsan.cpp
@@ -167,14 +186,32 @@ if(WOS_KASAN)
     endforeach()
 
     message(STATUS "[WOS] KASan enabled (requires shadow memory setup)")
+    message(STATUS "[WOS] KASan ignorelist enabled: ${KERNEL_SANITIZER_IGNORELIST}")
 endif()
 
 if(WOS_KCOV)
     target_compile_options(${KERNEL} PRIVATE
         $<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-fsanitize-coverage=trace-pc>
     )
+    if(WOS_KCOV_NO_PRUNE)
+        target_compile_options(${KERNEL} PRIVATE
+            $<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-Xclang -fsanitize-coverage-no-prune>
+        )
+    endif()
     target_compile_definitions(${KERNEL} PRIVATE WOS_KCOV=1)
     message(STATUS "[WOS] KCOV enabled (for Syzkaller coverage)")
+    if(WOS_KCOV_NO_PRUNE)
+        message(STATUS "[WOS] KCOV no-prune enabled (instrument all eligible trace-pc blocks)")
+    endif()
+    if(WOS_KCOV_SOURCE_FRIENDLY)
+        # The repository-wide module flags add -O3. Override that for the
+        # kernel in KCOV-focused builds so LLVM keeps more source statements,
+        # call sites, and basic-block boundaries visible to addr2line/LCOV.
+        target_compile_options(${KERNEL} PRIVATE
+            $<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-O0;-fno-inline;-fno-inline-functions;-fno-optimize-sibling-calls>
+        )
+        message(STATUS "[WOS] KCOV source-friendly codegen enabled (O0, reduced inlining, no tail-call folding)")
+    endif()
 
     if(WOS_KCOV_PANIC_TRACE)
         target_compile_definitions(${KERNEL} PRIVATE WOS_KCOV_PANIC_TRACE=1)

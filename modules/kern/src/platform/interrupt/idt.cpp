@@ -11,6 +11,7 @@ namespace {
 
 alignas(0x10) std::array<IdtEntry, IDT_ENTRIES> idt{};  // at most 256 interrupts
 IdtPtr idt_ptr;
+uint8_t idt_ready_state = 0;
 
 inline auto calc_idt_entry(uint8_t int_number) -> IdtEntry* { return &idt.at(int_number); }
 
@@ -306,10 +307,13 @@ void idt_init() {
     idt_ptr.base = reinterpret_cast<uint64_t>(idt.data());
 
     load_idt();
+    __atomic_store_n(&idt_ready_state, static_cast<uint8_t>(1), __ATOMIC_RELEASE);
 }
 
 void load_idt() {
     __asm__ volatile("lidt %0" : : "m"(idt_ptr));  // load the new IDT
 }
+
+auto is_idt_ready() -> bool { return __atomic_load_n(&idt_ready_state, __ATOMIC_ACQUIRE) != 0; }
 
 }  // namespace ker::mod::desc::idt

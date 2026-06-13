@@ -40,6 +40,8 @@ struct SiteSummary {
 };
 
 constexpr size_t DEBUG_SITE_TRACK_SLOTS = 32;
+
+auto packet_debug_cpu() -> uint16_t { return static_cast<uint16_t>(ker::mod::cpu::get_current_cpu_id_safe()); }
 #endif
 
 // ---------------------------------------------------------------------------
@@ -291,10 +293,12 @@ auto pkt_alloc() -> PacketBuffer* {
     pkt->len = 0;
     pkt->next = nullptr;
     pkt->dev = nullptr;
+    pkt->lifetime_ctx = nullptr;
+    pkt->lifetime_release = nullptr;
     pkt->protocol = 0;
 #ifdef WOS_NET_PACKET_DEBUG
     pkt->debug_in_use = true;
-    pkt->debug_alloc_cpu = static_cast<uint16_t>(ker::mod::cpu::current_cpu());
+    pkt->debug_alloc_cpu = packet_debug_cpu();
     pkt->debug_alloc_seq = alloc_seq.fetch_add(1, std::memory_order_relaxed) + 1;
     pkt->debug_alloc_site = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     pkt->debug_free_cpu = 0;
@@ -337,9 +341,17 @@ void pkt_free(PacketBuffer* pkt) {
         return;
     }
 
+    auto* release = pkt->lifetime_release;
+    void* release_ctx = pkt->lifetime_ctx;
+    pkt->lifetime_release = nullptr;
+    pkt->lifetime_ctx = nullptr;
+    if (release != nullptr) {
+        release(release_ctx);
+    }
+
 #ifdef WOS_NET_PACKET_DEBUG
     pkt->debug_in_use = false;
-    pkt->debug_free_cpu = static_cast<uint16_t>(ker::mod::cpu::current_cpu());
+    pkt->debug_free_cpu = packet_debug_cpu();
     pkt->debug_free_site = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
 #endif
     pkt_global_free(pkt);

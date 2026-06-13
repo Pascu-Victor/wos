@@ -24,6 +24,12 @@ auto wki_channel_retransmit(WkiChannel* ch) -> int;
 // Reset a channel to initial state (used during reconnection)
 void wki_channel_reset(WkiChannel* ch);
 
+// Return an active peer/channel table entry without allocating a channel.
+auto wki_channel_lookup_in_peer(WkiPeer* peer, uint16_t peer_node, uint16_t channel_id) -> WkiChannel*;
+
+// True when ACK_NEXT does not acknowledge beyond bytes this channel has sent.
+auto wki_channel_ack_next_within_sent_window(const WkiChannel* ch, uint32_t ack_next) -> bool;
+
 // Get default credit count for a well-known channel
 auto wki_channel_default_credits(uint16_t channel_id) -> uint16_t;
 

@@ -573,6 +573,139 @@ auto promote_user_write_path(PageTableEntry& pml4e, PageTableEntry& pml3e, PageT
     }
     return changed;
 }
+
+void flush_user_mapping_if_current(PageTable* pagemap, vaddr_t vaddr, bool reload_cr3) {
+    if (!is_current_pagemap(pagemap)) {
+        return;
+    }
+    if (reload_cr3) {
+        wrcr3(rdcr3());
+        return;
+    }
+    invlpg(vaddr);
+}
+
+auto ensure_user_page_writable_for_task(sched::task::Task* task, vaddr_t vaddr) -> bool {
+    if (task == nullptr || task->pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
+        return false;
+    }
+
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        PageTable* pml4 = task->pagemap;
+        uint64_t const VADDR = vaddr;
+        uint64_t const IDX4 = index_of(VADDR, 4);
+        uint64_t const IDX3 = index_of(VADDR, 3);
+        uint64_t const IDX2 = index_of(VADDR, 2);
+        uint64_t const IDX1 = index_of(VADDR, 1);
+
+        PageTableEntry& pml4e = entry_at(pml4, IDX4);
+        if (!pml4e.present) {
+            goto maybe_lazy_backing;
+        }
+
+        {
+            auto* pml3 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml4e.frame << paging::PAGE_SHIFT));
+            PageTableEntry& pml3e = entry_at(pml3, IDX3);
+            if (!pml3e.present || pml3e.pagesize != 0) {
+                goto maybe_lazy_backing;
+            }
+
+            auto* pml2 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml3e.frame << paging::PAGE_SHIFT));
+            PageTableEntry& pml2e = entry_at(pml2, IDX2);
+            if (!pml2e.present || pml2e.pagesize != 0) {
+                goto maybe_lazy_backing;
+            }
+
+            auto* pml1 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml2e.frame << paging::PAGE_SHIFT));
+            PageTableEntry& pte = entry_at(pml1, IDX1);
+            if (!pte.present) {
+                goto maybe_lazy_backing;
+            }
+
+            uint64_t raw = pte_raw(pte);
+            if ((raw & paging::PAGE_COW) == 0U) {
+                if ((raw & paging::PAGE_WRITE) == 0U || (raw & paging::PAGE_USER) == 0U) {
+                    return false;
+                }
+                bool const PATH_PROMOTED = promote_user_write_path(pml4e, pml3e, pml2e);
+                flush_user_mapping_if_current(task->pagemap, VADDR, PATH_PROMOTED);
+                return true;
+            }
+
+            uint64_t const COW_STARTED_US = time::get_us();
+            bool const PATH_PROMOTED = promote_user_write_path(pml4e, pml3e, pml2e);
+
+            paddr_t const OLD_PHYS = pte.frame << paging::PAGE_SHIFT;
+            void* old_virt = reinterpret_cast<void*>(addr::get_virt_pointer(OLD_PHYS));
+
+            phys::PageLookupHint cow_lookup{};
+            uint32_t const REFCOUNT = phys::page_ref_get(old_virt, &cow_lookup);
+            bool const OLD_IS_ZERO_PAGE = perf::is_local_vmem_zero_page(old_virt);
+            perf::WkiPerfLocalVmemOp cow_op = perf::WkiPerfLocalVmemOp::COW_COPY;
+            if (OLD_IS_ZERO_PAGE) {
+                cow_op = perf::WkiPerfLocalVmemOp::COW_ZERO;
+            } else if (REFCOUNT <= 1) {
+                cow_op = perf::WkiPerfLocalVmemOp::COW_PROMOTE;
+            }
+
+            if (REFCOUNT <= 1) {
+                raw &= ~paging::PAGE_COW;
+                raw |= paging::PAGE_WRITE;
+                pte = pte_from_raw(raw);
+                owned_frame_track_private_mapping(task->pagemap, VADDR, OLD_PHYS, raw);
+                flush_user_mapping_if_current(task->pagemap, VADDR, PATH_PROMOTED);
+                record_cow_perf_event(task, cow_op, VADDR, REFCOUNT, COW_STARTED_US);
+                return true;
+            }
+
+            phys::page_ref_inc(old_virt, &cow_lookup);
+
+            bool const DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE = !OLD_IS_ZERO_PAGE;
+            void* new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);
+            if (new_page == nullptr) {
+                phys::page_ref_dec(old_virt, &cow_lookup);
+                log::error("COW fault: OOM allocating new page for vaddr 0x%x", VADDR);
+                hcf();
+                return false;
+            }
+
+            if (DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE) {
+                std::memcpy(new_page, old_virt, paging::PAGE_SIZE);
+            }
+
+            uint64_t const RAW_NOW = pte_raw(pte);
+            if ((RAW_NOW & paging::PAGE_COW) == 0U) {
+                phys::page_ref_dec(new_page);
+                phys::page_ref_dec(old_virt, &cow_lookup);
+                flush_user_mapping_if_current(task->pagemap, VADDR, PATH_PROMOTED);
+                record_cow_perf_event(task, cow_op, VADDR, REFCOUNT, COW_STARTED_US);
+                return true;
+            }
+
+            auto new_phys = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(new_page)));
+            raw &= ~paging::PAGE_COW;
+            raw |= paging::PAGE_WRITE;
+            raw &= ~(0xFFFFFFFFFFULL << 12);
+            raw |= (new_phys & ~0xFFFULL);
+            pte = pte_from_raw(raw);
+            owned_frame_track_fresh_normal_mapping(task->pagemap, VADDR, new_phys, raw);
+            flush_user_mapping_if_current(task->pagemap, VADDR, PATH_PROMOTED);
+
+            phys::page_ref_dec(old_virt, &cow_lookup);
+            phys::page_ref_dec(old_virt, &cow_lookup);
+            record_cow_perf_event(task, cow_op, VADDR, REFCOUNT, COW_STARTED_US);
+            return true;
+        }
+
+    maybe_lazy_backing:
+        paging::PageFault const WRITE_FAULT = paging::create_page_fault(1ULL << paging::error_flags::WRITE, true);
+        if (!handle_lazy_vmem_fault(task, vaddr, WRITE_FAULT)) {
+            return false;
+        }
+    }
+
+    return false;
+}
 }  // namespace
 
 constexpr size_t KERNEL_PML4_START = 256;
@@ -1129,6 +1262,8 @@ paddr_t translate(PageTable* page_table, vaddr_t vaddr) {
     uint64_t const PHYS = (pte.frame << paging::PAGE_SHIFT) + (vaddr & (paging::PAGE_SIZE - 1));
     return PHYS;  // Return physical address only
 }
+
+bool ensure_user_page_writable(sched::task::Task* task, vaddr_t vaddr) { return ensure_user_page_writable_for_task(task, vaddr); }
 
 auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats {
     UserMemoryStats stats{};

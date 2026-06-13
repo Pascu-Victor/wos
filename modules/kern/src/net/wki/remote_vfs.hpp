@@ -96,6 +96,7 @@ struct ProxyVfsState {
     uint8_t attach_status = 0;
     uint16_t attach_channel = 0;
     uint16_t attach_max_op_size = 0;
+    uint8_t attach_expected_cookie = 0;
     WkiWaitEntry* attach_wait_entry = nullptr;  // V2 I-4: async wait for DEV_ATTACH_ACK
 
     std::array<char, VFS_EXPORT_PATH_LEN> local_mount_path = {};
@@ -219,6 +220,8 @@ void wki_remote_vfs_advertise_exports_to_peer(uint16_t peer_node);
 
 // Consumer side: mount a remote VFS at local_mount_path
 auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path) -> int;
+
+auto wki_remote_vfs_selftest_attach_ack_cookie_fences_stale_completion() -> bool;
 
 // Consumer side: best-effort diagnostic snapshot for /proc/wki/netdiag.
 auto wki_remote_vfs_proxy_diag_snapshot(WkiRemoteVfsProxyDiag* out, size_t max) -> size_t;

@@ -22,12 +22,15 @@ constexpr uint32_t BH_DATA_PAGE_ALLOC = (1U << 4);  // Buffer data was allocated
 // Buffer head - represents a single cached block from a block device.
 // Analogous to Linux struct buffer_head / simplified xfs_buf.
 struct BufHead {
-    uint8_t* data{};                // Pointer to cached block data
-    uint64_t block_no{};            // Block number on the device
-    dev::BlockDevice* bdev{};       // Owning block device
-    std::atomic<int32_t> refcount;  // Reference count (0 = reclaimable)
-    uint32_t flags{};               // BH_DIRTY, BH_VALID, etc.
-    size_t size{};                  // Size of buffer in bytes (== bdev->block_size)
+    uint8_t* data{};                   // Pointer to cached block data
+    uint64_t block_no{};               // Block number on the device
+    dev::BlockDevice* bdev{};          // Owning block device
+    std::atomic<int32_t> refcount;     // Reference count (0 = reclaimable)
+    uint32_t flags{};                  // BH_DIRTY, BH_VALID, etc.
+    uint64_t writeback_epoch{};        // Owner token for an in-progress writeback
+    uint64_t dirty_epoch{};            // Incremented whenever data is marked dirty
+    uint64_t writeback_dirty_epoch{};  // Dirty epoch captured by in-progress writeback
+    size_t size{};                     // Size of buffer in bytes (== bdev->block_size)
 
     // LRU doubly-linked list pointers (protected by cache lock)
     BufHead* lru_prev{};
@@ -88,7 +91,10 @@ auto has_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t coun
 // Returns 0 on success, negative errno on failure.
 auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> int;
 
-// Invalidate all cached buffers for a device (e.g. on unmount).
+// Invalidate unreferenced cached buffers for a device (e.g. on unmount).
+// Referenced buffers are left cached so callers holding BufHead pointers do
+// not observe use-after-free; releasing them and calling invalidate again will
+// remove them.
 void invalidate_bdev(dev::BlockDevice* bdev);
 
 // Discard cached buffers overlapping a device block range without writeback.

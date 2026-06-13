@@ -25,6 +25,23 @@ constexpr uint64_t GATE_IF_MASK = 0x200;
 auto get_current_cpu_id_safe() -> uint64_t;
 auto is_per_cpu_ready() -> bool;
 void notify_per_cpu_ready();
+}  // namespace ker::mod::cpu
+
+extern "C" uint8_t wos_per_cpu_ready_state;
+
+namespace ker::mod::cpu {
+
+[[clang::no_sanitize("coverage")]] static ALWAYS_INLINE auto per_cpu_ready_flag_acquire() -> bool {
+    return __atomic_load_n(&wos_per_cpu_ready_state, __ATOMIC_ACQUIRE) != 0;
+}
+
+[[clang::no_sanitize("coverage")]] static ALWAYS_INLINE auto current_cpu_fast() -> uint64_t {
+    // Written by inline asm output constraints.
+    // NOLINTNEXTLINE(misc-const-correctness)
+    uint64_t cpu_id = 0;
+    asm volatile("mov %%gs:0x10, %0" : "=r"(cpu_id)::"memory");
+    return cpu_id;
+}
 
 struct GPRegs {
     uint64_t r15;

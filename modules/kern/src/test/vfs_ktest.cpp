@@ -20,6 +20,14 @@
 //
 // All test paths are under /tmp/ktest_* to avoid colliding with real content.
 
+KTEST(VFS, OpenFdInstallFailureClosesFile) { KEXPECT_TRUE(ker::vfs::vfs_selftest_fd_install_failure_closes_file()); }
+
+KTEST(VFS, Dup2ReplacePreservesNewfdOnFailure) { KEXPECT_TRUE(ker::vfs::vfs_selftest_dup2_replace_preserves_newfd_on_failure()); }
+
+KTEST(VFS, PipeFailureUnwindsAllStages) { KEXPECT_TRUE(ker::vfs::vfs_selftest_pipe_failure_unwinds()); }
+
+KTEST(VFS, FdAllocationCapsCloexecRange) { KEXPECT_TRUE(ker::vfs::vfs_selftest_fd_allocation_caps_cloexec_range()); }
+
 KTEST(VFS, CreateAndStat) {
     ker::vfs::vfs_mkdir("/tmp", 0755);  // idempotent if /tmp already exists
 
@@ -253,6 +261,47 @@ KTEST(VFS, TmpfsMountHasSeparateRoot) {
     KEXPECT_NE(ker::vfs::vfs_stat(MOUNT_FILE, &st), 0);
 
     ker::vfs::vfs_unlink(ROOT_ONLY_FILE);
+    ker::vfs::vfs_rmdir(MOUNTPOINT);
+}
+
+KTEST(VFS, MountLookupRefsFencePathMutation) {
+    constexpr const char* MOUNTPOINT = "/tmp/ktest_mount_ref";
+    constexpr const char* PUT_OLD = "/tmp/ktest_mount_ref_oldroot";
+
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+    ker::vfs::unmount_filesystem(MOUNTPOINT);
+    ker::vfs::vfs_rmdir(MOUNTPOINT);
+    KEXPECT_EQ(ker::vfs::vfs_mkdir(MOUNTPOINT, 0755), 0);
+    KREQUIRE_EQ(ker::vfs::mount_filesystem(MOUNTPOINT, "tmpfs", nullptr), 0);
+
+    ker::vfs::MountRef mount_ref = ker::vfs::find_mount_point(MOUNTPOINT);
+    KREQUIRE_TRUE(static_cast<bool>(mount_ref));
+    ker::vfs::MountPoint* mount = mount_ref.get();
+    KEXPECT_EQ(mount->fs_type, ker::vfs::FSType::TMPFS);
+    KEXPECT_EQ(ker::vfs::mount_point_ref_count_for_test(mount), static_cast<uint32_t>(1));
+
+    bool saw_snapshot = false;
+    for (size_t i = 0; i < ker::vfs::get_mount_count(); ++i) {
+        ker::vfs::MountSnapshot snapshot{};
+        if (!ker::vfs::get_mount_snapshot_at(i, &snapshot)) {
+            continue;
+        }
+        if (std::strcmp(snapshot.path, MOUNTPOINT) == 0) {
+            saw_snapshot = snapshot.fs_type == ker::vfs::FSType::TMPFS && std::strcmp(snapshot.fstype, "tmpfs") == 0;
+            break;
+        }
+    }
+    KEXPECT_TRUE(saw_snapshot);
+
+    {
+        ker::vfs::MountRef root_ref = ker::vfs::find_mount_point("/");
+        KREQUIRE_TRUE(static_cast<bool>(root_ref));
+        KEXPECT_EQ(ker::vfs::remap_mounts_for_pivot(MOUNTPOINT, PUT_OLD), -EBUSY);
+    }
+
+    mount_ref.reset();
+    KEXPECT_EQ(ker::vfs::mount_point_ref_count_for_test(mount), static_cast<uint32_t>(0));
+    KEXPECT_EQ(ker::vfs::unmount_filesystem(MOUNTPOINT), 0);
     ker::vfs::vfs_rmdir(MOUNTPOINT);
 }
 

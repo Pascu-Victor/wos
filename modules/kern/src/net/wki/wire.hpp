@@ -499,7 +499,7 @@ struct DevAttachReqPayload {
     uint16_t resource_type;  // ResourceType enum
     uint32_t resource_id;
     uint8_t attach_mode;  // AttachMode
-    uint8_t reserved;
+    uint8_t attach_cookie;
     uint16_t requested_channel;  // 0 = auto-assign
 } __attribute__((packed));
 
@@ -531,11 +531,15 @@ struct DevAttachAckPayload {
 
 static_assert(sizeof(DevAttachAckPayload) == 24, "DevAttachAckPayload must be 24 bytes");
 
+constexpr auto wki_dev_attach_ack_matches_expected(uint8_t expected_cookie, const DevAttachAckPayload& ack) -> bool {
+    return ack.reserved == expected_cookie;
+}
+
 // V2: Extended attach ACK for NET resources - includes owner NIC info [V2 A5.3]
 struct DevAttachAckNetPayload {
     // V1 base fields (identical layout to DevAttachAckPayload)
     uint8_t status{};
-    uint8_t reserved{};
+    uint8_t attach_cookie{};
     uint16_t assigned_channel{};
     uint32_t resource_id{};
     uint16_t max_op_size{};
@@ -561,6 +565,25 @@ struct NetStateNotifyPayload {
 
 static_assert(sizeof(NetStateNotifyPayload) == 20, "NetStateNotifyPayload must be 20 bytes");
 
+constexpr uint32_t WKI_NET_NOTIFY_MAGIC = 0x314E4E57;  // "WNN1" little-endian
+
+struct NetNotifyHeader {
+    uint32_t magic{};
+    uint8_t attach_cookie{};
+    uint8_t reserved{};
+    uint16_t data_len{};
+} __attribute__((packed));
+
+static_assert(sizeof(NetNotifyHeader) == 8, "NetNotifyHeader must be 8 bytes");
+
+constexpr auto wki_net_notify_header_matches_expected(uint8_t expected_cookie, const NetNotifyHeader& notify) -> bool {
+    return notify.magic == WKI_NET_NOTIFY_MAGIC && notify.attach_cookie == expected_cookie;
+}
+
+constexpr auto wki_net_notify_payload_fits(uint16_t payload_len, const NetNotifyHeader& notify) -> bool {
+    return payload_len >= sizeof(NetNotifyHeader) && notify.data_len <= payload_len - sizeof(NetNotifyHeader);
+}
+
 // RDMA flags for DevAttachAckPayload
 constexpr uint16_t DEV_ATTACH_RDMA_BLK_RING = 0x0001;   // block ring RDMA zone available
 constexpr uint16_t DEV_ATTACH_RDMA_VFS = 0x0002;        // VFS RDMA available; blk_zone_id carries server write-recv rkey
@@ -577,6 +600,26 @@ struct DevDetachPayload {
     uint16_t resource_type;
     uint32_t resource_id;
 } __attribute__((packed));
+
+static_assert(sizeof(DevDetachPayload) == 8, "DevDetachPayload must be 8 bytes");
+
+constexpr uint16_t WKI_DEV_DETACH_COOKIE_BYTES = sizeof(uint8_t);
+
+constexpr auto wki_dev_detach_cookie_from_payload(const uint8_t* payload, uint16_t payload_len) -> uint8_t {
+    return (payload != nullptr && payload_len >= sizeof(DevDetachPayload) + WKI_DEV_DETACH_COOKIE_BYTES) ? payload[sizeof(DevDetachPayload)]
+                                                                                                         : 0;
+}
+
+constexpr auto wki_dev_detach_matches_binding(uint16_t binding_consumer_node, ResourceType binding_resource_type,
+                                              uint32_t binding_resource_id, uint16_t request_src_node, const DevDetachPayload& detach)
+    -> bool {
+    return binding_consumer_node == request_src_node && binding_resource_type == static_cast<ResourceType>(detach.resource_type) &&
+           binding_resource_id == detach.resource_id;
+}
+
+constexpr auto wki_dev_detach_cookie_matches_binding(uint8_t binding_attach_cookie, uint8_t request_cookie) -> bool {
+    return binding_attach_cookie == request_cookie;
+}
 
 // -----------------------------------------------------------------------------
 // DEV_OP_REQ / DEV_OP_RESP Payload - variable length
@@ -595,6 +638,10 @@ struct DevOpRespPayload {
     uint16_t reserved;
     // Followed by data_len bytes of marshaled response data
 } __attribute__((packed));
+
+constexpr auto wki_dev_op_response_matches_expected(uint16_t expected_op_id, uint16_t expected_seq, const DevOpRespPayload& resp) -> bool {
+    return resp.op_id == expected_op_id && resp.reserved == expected_seq;
+}
 
 // Well-known operation IDs for default marshaling
 constexpr uint16_t OP_BLOCK_READ = 0x0100;

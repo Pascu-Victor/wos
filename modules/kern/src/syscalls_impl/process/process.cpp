@@ -75,6 +75,10 @@ constexpr uint32_t FORK_GC_NO_PROGRESS_YIELD_LIMIT = 64;
 constexpr uint64_t FORK_GC_FREE_PAGE_LOW_WATERMARK_DIVISOR = 32;
 constexpr uint64_t FORK_GC_FREE_PAGE_LOW_WATERMARK_MIN = 4096;
 
+#ifdef WOS_SELFTEST
+std::atomic<bool> g_process_selftest_force_fd_clone_insert_failure{false};
+#endif
+
 inline auto signal_handler_slot(ker::mod::sched::task::Task& task, size_t index) -> ker::mod::sched::task::Task::SigHandler& {
     // Signal numbers are range-checked before conversion to this zero-based index.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
@@ -96,6 +100,47 @@ inline auto is_live_signal_target(const ker::mod::sched::task::Task& task) -> bo
 }
 
 auto process_pid_for_task(const ker::mod::sched::task::Task& task) -> uint64_t { return ker::mod::sched::task::process_pid(task); }
+
+void release_cloned_fd_table_refs(ker::mod::sched::task::Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+    task->fd_table.for_each([](uint64_t /*key*/, void* val) {
+        if (val != nullptr) {
+            static_cast<ker::vfs::File*>(val)->refcount.fetch_sub(1, std::memory_order_relaxed);
+        }
+    });
+}
+
+auto clone_fd_table_shared_checked(ker::mod::sched::task::Task* parent, ker::mod::sched::task::Task* child) -> bool {
+    if (parent == nullptr || child == nullptr) {
+        return false;
+    }
+
+    bool ok = true;
+    uint64_t const IRQF = parent->fd_table_lock.lock_irqsave();
+    parent->fd_table.for_each([&](uint64_t key, void* val) {
+        if (!ok || val == nullptr) {
+            return;
+        }
+
+        auto* file = static_cast<ker::vfs::File*>(val);
+        file->refcount.fetch_add(1, std::memory_order_relaxed);
+#ifdef WOS_SELFTEST
+        if (g_process_selftest_force_fd_clone_insert_failure.load(std::memory_order_relaxed)) {
+            file->refcount.fetch_sub(1, std::memory_order_relaxed);
+            ok = false;
+            return;
+        }
+#endif
+        if (!child->fd_table.insert(key, file)) {
+            file->refcount.fetch_sub(1, std::memory_order_relaxed);
+            ok = false;
+        }
+    });
+    parent->fd_table_lock.unlock_irqrestore(IRQF);
+    return ok;
+}
 
 auto find_process_leader_safe(uint64_t pid) -> ker::mod::sched::task::Task* {
     auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
@@ -345,7 +390,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->exit_status = 0;
     child->has_exited = false;
     child->exit_notify_ready.store(false, std::memory_order_relaxed);
-    child->waited_on = false;
+    sched::task::task_clear_waited_on(*child);
     child->zombie_resources_reclaiming.store(false, std::memory_order_relaxed);
     child->zombie_resources_reclaimed.store(false, std::memory_order_relaxed);
     child->deferred_task_switch = false;
@@ -548,26 +593,25 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->program_header_ent_size = parent->program_header_ent_size;
 
     // --- Clone file descriptors ---
-    parent->fd_table.for_each([&](uint64_t key, void* val) {
-        if (val != nullptr) {
-            auto* file = static_cast<ker::vfs::File*>(val);
-            file->refcount.fetch_add(1, std::memory_order_relaxed);  // Increment refcount for shared file
-            // TODO: Checked insertion, should have a process cleanup system that can handle partially initialized processes if this fails
-            // instead of leaking
-            (void)child->fd_table.insert(key, file);
-        }
-    });
+    if (!clone_fd_table_shared_checked(parent, child)) {
+        release_cloned_fd_table_refs(child);
+        delete child->thread;
+        delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
+        ker::syscall::shm::shm_cleanup_for_task(child);
+        mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-fd-clone-fail");
+        mm::phys::page_free(child->pagemap);
+        delete[] child->name;
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
+        delete child;
+        return finish_fork(-ENOMEM);
+    }
 
     child->fd_cloexec = parent->fd_cloexec;
 
     // --- Enqueue child ---
     if (!sched::post_task_balanced(child)) {
         // Undo FD refcount increments
-        child->fd_table.for_each([](uint64_t /*key*/, void* val) {
-            if (val != nullptr) {
-                static_cast<ker::vfs::File*>(val)->refcount.fetch_sub(1, std::memory_order_relaxed);
-            }
-        });
+        release_cloned_fd_table_refs(child);
 
         delete child->thread;
         delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
@@ -858,11 +902,7 @@ auto wos_proc_clone_vm(const CloneVmArgs* args) -> uint64_t {
     }
 
     auto cleanup_child = [&]() {
-        child->fd_table.for_each([](uint64_t /*key*/, void* val) {
-            if (val != nullptr) {
-                static_cast<ker::vfs::File*>(val)->refcount.fetch_sub(1, std::memory_order_relaxed);
-            }
-        });
+        release_cloned_fd_table_refs(child);
         delete child->thread;
         delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
         delete[] child->name;
@@ -968,13 +1008,10 @@ auto wos_proc_clone_vm(const CloneVmArgs* args) -> uint64_t {
     child->context.frame.cs = desc::gdt::GDT_USER_CS;
     child->context.frame.ss = desc::gdt::GDT_USER_DS;
 
-    parent->fd_table.for_each([&](uint64_t key, void* val) {
-        if (val != nullptr) {
-            auto* file = static_cast<ker::vfs::File*>(val);
-            file->refcount.fetch_add(1, std::memory_order_relaxed);
-            (void)child->fd_table.insert(key, file);
-        }
-    });
+    if (!clone_fd_table_shared_checked(parent, child)) {
+        cleanup_child();
+        return static_cast<uint64_t>(-ENOMEM);
+    }
     child->fd_cloexec = parent->fd_cloexec;
 
     if (!sched::post_task_balanced(child)) {
@@ -1240,6 +1277,28 @@ auto wos_proc_getwkitarget(char* hostname_out, size_t hostname_out_size, uint32_
     return LEN;
 }
 }  // namespace
+
+#ifdef WOS_SELFTEST
+auto process_selftest_fd_clone_failure_releases_refs() -> bool {
+    ker::mod::sched::task::Task parent{};
+    ker::mod::sched::task::Task child{};
+    ker::vfs::File file{};
+    file.refcount.store(1, std::memory_order_relaxed);
+
+    constexpr uint64_t FD = 17;
+    if (!parent.fd_table.insert(FD, &file)) {
+        return false;
+    }
+
+    g_process_selftest_force_fd_clone_insert_failure.store(true, std::memory_order_relaxed);
+    bool const CLONED = clone_fd_table_shared_checked(&parent, &child);
+    g_process_selftest_force_fd_clone_insert_failure.store(false, std::memory_order_relaxed);
+
+    bool ok = !CLONED && file.refcount.load(std::memory_order_relaxed) == 1 && child.fd_table.lookup(FD) == nullptr;
+    parent.fd_table.remove(FD);
+    return ok;
+}
+#endif
 
 auto personality(uint64_t persona) -> uint64_t { return wos_proc_personality(persona); }
 

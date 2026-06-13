@@ -37,6 +37,8 @@ void idt_init();
 
 void load_idt();
 
+[[nodiscard]] auto is_idt_ready() -> bool;
+
 extern "C" {
 #define ISR(n) void isr##n(void)
 #define ISR_EXCEPT(n) void isr_except##n(void)

@@ -49,6 +49,43 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 constexpr int MAX_SHEBANG_DEPTH = 4;
 constexpr size_t EXEC_PATH_MAX = 512;
 using exec_log = ker::mod::dbg::logger<"exec">;
+using FdSnapshot = std::array<uint64_t, ker::mod::sched::task::Task::FD_TABLE_SIZE>;
+
+#ifdef WOS_SELFTEST
+std::atomic<bool> g_exec_selftest_force_fd_clone_insert_failure{false};
+std::atomic<bool> g_exec_selftest_force_stdio_insert_failure{false};
+std::atomic<int> g_exec_selftest_close_count{0};
+
+auto exec_selftest_close(vfs::File*) -> int {
+    g_exec_selftest_close_count.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+}
+
+vfs::FileOperations g_exec_selftest_fops = {
+    .vfs_open = nullptr,
+    .vfs_close = exec_selftest_close,
+    .vfs_read = nullptr,
+    .vfs_write = nullptr,
+    .vfs_lseek = nullptr,
+    .vfs_isatty = nullptr,
+    .vfs_readdir = nullptr,
+    .vfs_readlink = nullptr,
+    .vfs_truncate = nullptr,
+    .vfs_poll_check = nullptr,
+    .vfs_poll_register_waiter = nullptr,
+    .vfs_ioctl = nullptr,
+};
+
+auto exec_selftest_make_file() -> vfs::File* {
+    auto* file = new vfs::File{};
+    if (file == nullptr) {
+        return nullptr;
+    }
+    file->refcount.store(1, std::memory_order_relaxed);
+    file->fops = &g_exec_selftest_fops;
+    return file;
+}
+#endif
 
 void record_local_proc_event(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op, ker::mod::perf::WkiPerfPhase phase,
                              uint32_t correlation, int32_t status, uint32_t aux, uint64_t callsite) {
@@ -114,6 +151,125 @@ auto fixed_slot(std::array<T, N>& values, size_t index) -> T& {
     // Callers validate logical extents before indexing fixed kernel buffers.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     return values[index];
+}
+
+void release_task_fd_table_files(ker::mod::sched::task::Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+    task->fd_table.for_each([](uint64_t /*key*/, void* val) {
+        if (val != nullptr) {
+            vfs::vfs_put_file(static_cast<vfs::File*>(val));
+        }
+    });
+}
+
+auto clone_exec_fd_table_checked(ker::mod::sched::task::Task* parent, ker::mod::sched::task::Task* child) -> bool {
+    if (parent == nullptr || child == nullptr) {
+        return false;
+    }
+
+    bool ok = true;
+    uint64_t const IRQF = parent->fd_table_lock.lock_irqsave();
+    parent->fd_table.for_each([&](uint64_t key, void* val) {
+        if (!ok || val == nullptr) {
+            return;
+        }
+        if (parent->get_fd_cloexec(static_cast<unsigned>(key))) {
+            return;
+        }
+
+        auto* parent_file = static_cast<vfs::File*>(val);
+        parent_file->refcount.fetch_add(1, std::memory_order_acq_rel);
+#ifdef WOS_SELFTEST
+        if (g_exec_selftest_force_fd_clone_insert_failure.load(std::memory_order_relaxed)) {
+            parent_file->refcount.fetch_sub(1, std::memory_order_acq_rel);
+            ok = false;
+            return;
+        }
+#endif
+        if (!child->fd_table.insert(key, parent_file)) {
+            parent_file->refcount.fetch_sub(1, std::memory_order_acq_rel);
+            ok = false;
+        }
+    });
+    parent->fd_table_lock.unlock_irqrestore(IRQF);
+    return ok;
+}
+
+auto install_exec_fd_file_checked(ker::mod::sched::task::Task* task, unsigned fd, vfs::File* file) -> bool {
+    if (task == nullptr || file == nullptr) {
+        vfs::vfs_put_file(file);
+        return false;
+    }
+
+    bool inserted = false;
+    uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
+#ifdef WOS_SELFTEST
+    bool const FORCE_FAILURE = g_exec_selftest_force_stdio_insert_failure.load(std::memory_order_relaxed);
+#else
+    bool const FORCE_FAILURE = false;
+#endif
+    if (!FORCE_FAILURE && task->fd_table.lookup(fd) == nullptr) {
+        inserted = task->fd_table.insert(fd, file);
+        if (inserted) {
+            file->fd = static_cast<int>(fd);
+            task->clear_fd_cloexec(fd);
+        }
+    }
+    task->fd_table_lock.unlock_irqrestore(IRQF);
+
+    if (!inserted) {
+        vfs::vfs_put_file(file);
+    }
+    return inserted;
+}
+
+auto ensure_exec_stdio_fallbacks(ker::mod::sched::task::Task* task) -> bool {
+    if (task == nullptr) {
+        return false;
+    }
+
+    for (unsigned fd = 0; fd < 3; ++fd) {
+        {
+            uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
+            bool const PRESENT = task->fd_table.lookup(fd) != nullptr;
+            task->fd_table_lock.unlock_irqrestore(IRQF);
+            if (PRESENT) {
+                continue;
+            }
+        }
+
+        vfs::File* new_file = vfs::devfs::devfs_open_path("/dev/console", 0, 0);
+        if (new_file == nullptr) {
+            continue;
+        }
+        new_file->fops = vfs::devfs::get_devfs_fops();
+        new_file->refcount.store(1, std::memory_order_relaxed);
+        if (!install_exec_fd_file_checked(task, fd, new_file)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto collect_cloexec_fds_locked(ker::mod::sched::task::Task* task, FdSnapshot& fds) -> size_t {
+    if (task == nullptr) {
+        return 0;
+    }
+
+    size_t fd_count = 0;
+    uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
+    task->fd_table.for_each([&](uint64_t key, void* val) {
+        if (val == nullptr || key >= ker::mod::sched::task::Task::FD_TABLE_SIZE) {
+            return;
+        }
+        if (task->get_fd_cloexec(static_cast<unsigned>(key)) && fd_count < fds.size()) {
+            fixed_slot(fds, fd_count++) = key;
+        }
+    });
+    task->fd_table_lock.unlock_irqrestore(IRQF);
+    return fd_count;
 }
 
 inline auto local_wki_hostname() -> const char* { return std::begin(ker::net::wki::g_wki.local_hostname); }
@@ -259,6 +415,94 @@ auto exec_shebang_script(const char* script_path, const char* const* argv, const
 }
 
 }  // namespace
+
+#ifdef WOS_SELFTEST
+auto exec_selftest_fd_clone_skips_cloexec_and_rolls_back_failure() -> bool {
+    ker::mod::sched::task::Task parent{};
+    ker::mod::sched::task::Task child{};
+    ker::vfs::File inherited{};
+    ker::vfs::File cloexec{};
+    inherited.refcount.store(1, std::memory_order_relaxed);
+    cloexec.refcount.store(1, std::memory_order_relaxed);
+
+    constexpr uint64_t INHERITED_FD = 5;
+    constexpr uint64_t CLOEXEC_FD = 7;
+    bool ok = parent.fd_table.insert(INHERITED_FD, &inherited) && parent.fd_table.insert(CLOEXEC_FD, &cloexec);
+    parent.set_fd_cloexec(static_cast<unsigned>(CLOEXEC_FD));
+
+    ok = ok && clone_exec_fd_table_checked(&parent, &child);
+    ok = ok && child.fd_table.lookup(INHERITED_FD) == &inherited && child.fd_table.lookup(CLOEXEC_FD) == nullptr &&
+         inherited.refcount.load(std::memory_order_relaxed) == 2 && cloexec.refcount.load(std::memory_order_relaxed) == 1;
+    release_task_fd_table_files(&child);
+    ok = ok && inherited.refcount.load(std::memory_order_relaxed) == 1;
+
+    ker::mod::sched::task::Task failed_child{};
+    g_exec_selftest_force_fd_clone_insert_failure.store(true, std::memory_order_relaxed);
+    bool const CLONED = clone_exec_fd_table_checked(&parent, &failed_child);
+    g_exec_selftest_force_fd_clone_insert_failure.store(false, std::memory_order_relaxed);
+    ok = ok && !CLONED && failed_child.fd_table.empty() && inherited.refcount.load(std::memory_order_relaxed) == 1 &&
+         cloexec.refcount.load(std::memory_order_relaxed) == 1;
+
+    parent.fd_table.remove(INHERITED_FD);
+    parent.fd_table.remove(CLOEXEC_FD);
+    return ok;
+}
+
+auto exec_selftest_stdio_insert_failure_closes_file() -> bool {
+    g_exec_selftest_close_count.store(0, std::memory_order_relaxed);
+    g_exec_selftest_force_stdio_insert_failure.store(false, std::memory_order_relaxed);
+
+    ker::mod::sched::task::Task task{};
+    auto* success_file = exec_selftest_make_file();
+    if (success_file == nullptr) {
+        return false;
+    }
+
+    constexpr unsigned FD = 0;
+    task.set_fd_cloexec(FD);
+    bool ok = install_exec_fd_file_checked(&task, FD, success_file) && task.fd_table.lookup(FD) == success_file && !task.get_fd_cloexec(FD);
+
+    auto* installed = static_cast<vfs::File*>(task.fd_table.remove(FD));
+    ok = ok && installed == success_file;
+    vfs::vfs_put_file(installed);
+
+    auto* failed_file = exec_selftest_make_file();
+    if (failed_file == nullptr) {
+        return false;
+    }
+    g_exec_selftest_force_stdio_insert_failure.store(true, std::memory_order_relaxed);
+    bool const INSERTED = install_exec_fd_file_checked(&task, FD, failed_file);
+    g_exec_selftest_force_stdio_insert_failure.store(false, std::memory_order_relaxed);
+
+    ok = ok && !INSERTED && task.fd_table.lookup(FD) == nullptr && g_exec_selftest_close_count.load(std::memory_order_relaxed) == 2;
+    return ok;
+}
+
+auto exec_selftest_cloexec_snapshot_collects_marked_fds() -> bool {
+    ker::mod::sched::task::Task task{};
+    ker::vfs::File fd0{};
+    ker::vfs::File fd1{};
+    ker::vfs::File fd255{};
+
+    bool ok = task.fd_table.insert(0, &fd0) && task.fd_table.insert(1, &fd1) && task.fd_table.insert(255, &fd255);
+    task.set_fd_cloexec(0);
+    task.set_fd_cloexec(255);
+
+    FdSnapshot snapshot{};
+    size_t const COUNT = collect_cloexec_fds_locked(&task, snapshot);
+    bool saw0 = false;
+    bool saw255 = false;
+    for (size_t i = 0; i < COUNT; ++i) {
+        saw0 = saw0 || fixed_slot(snapshot, i) == 0;
+        saw255 = saw255 || fixed_slot(snapshot, i) == 255;
+    }
+
+    task.fd_table.remove(0);
+    task.fd_table.remove(1);
+    task.fd_table.remove(255);
+    return ok && COUNT == 2 && saw0 && saw255;
+}
+#endif
 
 auto wos_proc_exec(const char* path, const char* const* argv, const char* const* envp) -> uint64_t {
     return wos_proc_exec_impl(path, argv, envp, 0);
@@ -426,10 +670,15 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
 
         delete new_task;
 
-        // TODO: Free kernel stack pages
+        // TODO: Free kernel stack pages if we do not already
         delete[] elf_buffer;
         return 0;
     }
+    auto cleanup_unpublished_task = [&]() {
+        release_task_fd_table_files(new_task);
+        delete new_task;
+        delete[] elf_buffer;
+    };
 
 #ifdef EXEC_DEBUG
     dbg::log("wos_proc_exec: Task constructor completed successfully");
@@ -449,7 +698,10 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     new_task->suid = parent_task->suid;
     new_task->sgid = parent_task->sgid;
     new_task->umask = parent_task->umask;
-    [[maybe_unused]] bool const CLONED_GROUPS = new_task->supplementary_groups.clone_from(parent_task->supplementary_groups);
+    if (!new_task->supplementary_groups.clone_from(parent_task->supplementary_groups)) {
+        cleanup_unpublished_task();
+        return 0;
+    }
     new_task->session_id = parent_task->session_id;
     new_task->pgid = (parent_task->pgid != 0) ? parent_task->pgid : PARENT_PID;
     new_task->controlling_tty = parent_task->controlling_tty;
@@ -461,35 +713,21 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
                                 std::strcmp(new_task->wki_submitter_hostname.data(), local_wki_hostname()) != 0)
                                    ? new_task->pid
                                    : 0;
-    [[maybe_unused]] bool const CLONED_RULES = new_task->wki_vfs_rules.clone_from(parent_task->wki_vfs_rules);
+    if (!new_task->wki_vfs_rules.clone_from(parent_task->wki_vfs_rules)) {
+        cleanup_unpublished_task();
+        return 0;
+    }
 
     // Inherit file descriptors from parent, respecting FD_CLOEXEC (per-fd bitmap).
-    // FDs with FD_CLOEXEC set are NOT inherited (closed on exec).
-    // FDs without FD_CLOEXEC are inherited by incrementing refcount.
-    // For fds 0/1/2 (stdin/stdout/stderr), if not inherited, re-open /dev/console.
-    parent_task->fd_table.for_each([&](uint64_t key, void* val) {
-        if (val == nullptr) {
-            return;
-        }
-        auto* parent_file = static_cast<vfs::File*>(val);
-        if (parent_task->get_fd_cloexec(static_cast<unsigned>(key))) {
-            return;  // FD_CLOEXEC is set - do NOT inherit
-        }
-        parent_file->refcount.fetch_add(1, std::memory_order_acq_rel);
-        [[maybe_unused]] bool const INSERTED = new_task->fd_table.insert(key, parent_file);
-    });
+    if (!clone_exec_fd_table_checked(parent_task, new_task)) {
+        cleanup_unpublished_task();
+        return 0;
+    }
 
     // Ensure fds 0/1/2 are always set (open /dev/console if not inherited)
-    for (unsigned i = 0; i < 3; ++i) {
-        if (new_task->fd_table.lookup(i) == nullptr) {
-            vfs::File* new_file = vfs::devfs::devfs_open_path("/dev/console", 0, 0);
-            if (new_file != nullptr) {
-                new_file->fops = vfs::devfs::get_devfs_fops();
-                new_file->fd = static_cast<int>(i);
-                new_file->refcount = 1;
-                [[maybe_unused]] bool const INSERTED = new_task->fd_table.insert(i, new_file);
-            }
-        }
+    if (!ensure_exec_stdio_fallbacks(new_task)) {
+        cleanup_unpublished_task();
+        return 0;
     }
 
     new_task->elf_buffer = elf_buffer;
@@ -605,8 +843,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         if (argv_addrs[i] == 0) {
             dbg::log("wos_proc_exec: Failed to push argv string");
             delete[] argv_addrs;
-            delete new_task;
-            delete[] elf_buffer;
+            cleanup_unpublished_task();
             return 0;
         }
     }
@@ -620,8 +857,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
             dbg::log("wos_proc_exec: Failed to push envp string");
             delete[] envp_addrs;
             delete[] argv_addrs;
-            delete new_task;
-            delete[] elf_buffer;
+            cleanup_unpublished_task();
             return 0;
         }
     }
@@ -680,8 +916,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
             dbg::log("wos_proc_exec: Failed to build auxv");
             delete[] envp_addrs;
             delete[] argv_addrs;
-            delete new_task;
-            delete[] elf_buffer;
+            cleanup_unpublished_task();
             return 0;
         }
 
@@ -719,8 +954,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         return new_task->pid;
     }
     if (remote_result == ker::net::wki::WkiRemoteSpawnResult::FAILED) {
-        delete new_task;
-        delete[] elf_buffer;
+        cleanup_unpublished_task();
         return 0;
     }
 
@@ -733,8 +967,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     // Use load-balanced task posting to distribute across CPUs
     if (!sched::post_task_balanced(new_task)) {
         dbg::log("wos_proc_exec: Failed to post task to scheduler");
-        delete new_task;
-        delete[] elf_buffer;
+        cleanup_unpublished_task();
         return 0;
     }
 
@@ -1346,23 +1579,14 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     // exec only closes FD_CLOEXEC descriptors after the new image is ready;
     // failed execve() must leave the original process image intact.
     // Snapshot descriptors first because vfs_close() mutates fd_table.
-    while (!task->fd_table.empty()) {
-        std::array<uint64_t, sched::task::Task::FD_TABLE_SIZE> fds{};
-        size_t fd_count = 0;
-        task->fd_table.for_each([&](uint64_t key, void* val) {
-            if (val == nullptr) {
-                return;
-            }
-            if (task->get_fd_cloexec(static_cast<unsigned>(key)) && fd_count < sched::task::Task::FD_TABLE_SIZE) {
-                fixed_slot(fds, fd_count++) = key;
-            }
-        });
-
-        if (fd_count == 0) {
+    for (;;) {
+        FdSnapshot fds{};
+        size_t const FD_COUNT = collect_cloexec_fds_locked(task, fds);
+        if (FD_COUNT == 0) {
             break;
         }
 
-        for (size_t i = 0; i < fd_count; ++i) {
+        for (size_t i = 0; i < FD_COUNT; ++i) {
             vfs::vfs_close(static_cast<int>(fixed_slot(fds, i)));
         }
     }
@@ -1412,17 +1636,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         sh = {.handler = 0, .flags = 0, .restorer = 0, .mask = 0};
     }
 
-    for (unsigned i = 0; i < 3; ++i) {
-        if (task->fd_table.lookup(i) == nullptr) {
-            vfs::File* new_file = vfs::devfs::devfs_open_path("/dev/console", 0, 0);
-            if (new_file != nullptr) {
-                new_file->fops = vfs::devfs::get_devfs_fops();
-                new_file->fd = static_cast<int>(i);
-                new_file->refcount = 1;
-                [[maybe_unused]] bool const INSERTED = task->fd_table.insert(i, new_file);
-            }
-        }
-    }
+    static_cast<void>(ensure_exec_stdio_fallbacks(task));
 
     // --- Set up the task context to jump to the new binary ---
     uint64_t const NEW_RSP = user_stack_virt - current_virt_offset;

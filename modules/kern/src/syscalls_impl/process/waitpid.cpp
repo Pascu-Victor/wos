@@ -16,6 +16,7 @@
 namespace ker::syscall::process {
 namespace {
 using log = ker::mod::dbg::logger<"waitpid">;
+namespace sched_task = ker::mod::sched::task;
 
 // Fill POSIX struct rusage with the child's timing data (ru_utime and ru_stime only).
 // rusage_phys_addr: physical address of the userspace rusage struct, 0 to skip.
@@ -43,7 +44,8 @@ auto is_waitable_exit(const ker::mod::sched::task::Task* task) -> bool {
 }
 
 auto is_unwaited_child(const ker::mod::sched::task::Task* parent, const ker::mod::sched::task::Task* child) -> bool {
-    return parent != nullptr && child != nullptr && !child->is_thread && child->parent_pid == parent->pid && !child->waited_on;
+    return parent != nullptr && child != nullptr && !child->is_thread && child->parent_pid == parent->pid &&
+           !sched_task::task_waited_on(*child);
 }
 
 auto ptrace_stop_status(const ker::mod::sched::task::Task& task) -> int32_t {
@@ -89,11 +91,11 @@ auto consume_ptrace_stop_if_waitable(ker::mod::sched::task::Task* waiter, ker::m
 // intentionally rejects DEAD/EXITING tasks. Use the registry pointer directly:
 // a matching unwaited child cannot be reclaimed until this parent marks it
 // waited_on.
-auto find_exited_child(ker::mod::sched::task::Task* parent) -> ker::mod::sched::task::Task* {
+auto claim_exited_child(ker::mod::sched::task::Task* parent) -> ker::mod::sched::task::Task* {
     uint32_t const COUNT = ker::mod::sched::get_active_task_count();
     for (uint32_t i = 0; i < COUNT; i++) {
         auto* child = ker::mod::sched::get_active_task_at(i);
-        if (is_unwaited_child(parent, child) && is_waitable_exit(child)) {
+        if (is_unwaited_child(parent, child) && is_waitable_exit(child) && sched_task::task_try_mark_waited_on(*child)) {
             return child;
         }
     }
@@ -120,6 +122,12 @@ void clear_wait_resume_debug(ker::mod::sched::task::Task* task) {
     task->wait_resume_rip_phys_addr = 0;
     task->wait_resume_rsp_user_addr = 0;
     task->wait_resume_rsp_phys_addr = 0;
+}
+
+void clear_waitpid_publish_pending(ker::mod::sched::task::Task* task) {
+    if (task != nullptr) {
+        task->waitpid_publish_pending.store(false, std::memory_order_release);
+    }
 }
 
 auto current_syscall_user_rsp() -> uint64_t {
@@ -166,9 +174,14 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
 
     // --- Handle pid == -1 or pid == 0: wait for ANY child ---
     if (pid <= 0) {
+        current_task->waitpid_publish_pending.store(true, std::memory_order_release);
+        current_task->waiting_for_pid = WAIT_ANY_CHILD;
+
         // Check for already-exited children
-        auto* exited = find_exited_child(current_task);
+        auto* exited = claim_exited_child(current_task);
         if (exited != nullptr) {
+            clear_waitpid_publish_pending(current_task);
+            current_task->waiting_for_pid = 0;
             if (status != nullptr) {
                 *status = exited->exit_status;
             }
@@ -181,7 +194,6 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             current_task->wait_rusage_user_addr = 0;
             current_task->wait_rusage_phys_addr = 0;
             clear_wait_resume_debug(current_task);
-            exited->waited_on = true;
             return exited->pid;
         }
 
@@ -189,16 +201,19 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         // with ECHILD here; otherwise shells can block forever after their
         // last pipeline child has already exited and been consumed.
         if (!has_unwaited_child(current_task)) {
+            clear_waitpid_publish_pending(current_task);
+            current_task->waiting_for_pid = 0;
             return static_cast<uint64_t>(-ECHILD);
         }
 
         // WNOHANG: return 0 immediately if no exited child
         if ((options & WOS_WNOHANG) != 0) {
+            clear_waitpid_publish_pending(current_task);
+            current_task->waiting_for_pid = 0;
             return 0;
         }
 
         // No exited child yet - block until SIGCHLD wakes us
-        current_task->waiting_for_pid = WAIT_ANY_CHILD;
         if (status != nullptr) {
             current_task->wait_status_user_addr = reinterpret_cast<uint64_t>(status);
             uint64_t const PHYS = ker::mod::mm::virt::translate(current_task->pagemap, reinterpret_cast<uint64_t>(status));
@@ -219,6 +234,25 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
 
         current_task->wait_channel = "waitpid";
         current_task->deferred_task_switch = true;
+        exited = claim_exited_child(current_task);
+        if (exited != nullptr) {
+            clear_waitpid_publish_pending(current_task);
+            current_task->deferred_task_switch = false;
+            if (status != nullptr) {
+                *status = exited->exit_status;
+            }
+            if (rusage_vaddr != 0) {
+                uint64_t const PHYS = ker::mod::mm::virt::translate(current_task->pagemap, rusage_vaddr);
+                fill_rusage(PHYS, exited);
+            }
+            current_task->wait_status_user_addr = 0;
+            current_task->wait_status_phys_addr = 0;
+            current_task->wait_rusage_user_addr = 0;
+            current_task->wait_rusage_phys_addr = 0;
+            clear_wait_resume_debug(current_task);
+            current_task->waiting_for_pid = 0;
+            return exited->pid;
+        }
         return 0;
     }
 
@@ -239,7 +273,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     }
 
     bool const TRACE_WAIT = is_ptrace_wait_target(*current_task, *target_task);
-    if ((!TRACE_WAIT && target_task->parent_pid != current_task->pid) || target_task->waited_on) {
+    if ((!TRACE_WAIT && target_task->parent_pid != current_task->pid) || sched_task::task_waited_on(*target_task)) {
         return static_cast<uint64_t>(-ECHILD);
     }
 
@@ -248,6 +282,9 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
 #ifdef WAITPID_DEBUG
         log::debug("target task PID %x has already exited with status %d", pid, target_task->exit_status);
 #endif
+        if (!sched_task::task_try_mark_waited_on(*target_task)) {
+            return static_cast<uint64_t>(-ECHILD);
+        }
         if (status != nullptr) {
             *status = target_task->exit_status;
         }
@@ -260,8 +297,6 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         current_task->wait_rusage_user_addr = 0;
         current_task->wait_rusage_phys_addr = 0;
         clear_wait_resume_debug(current_task);
-        // Mark that the parent has retrieved the exit status (zombie can now be reaped)
-        target_task->waited_on = true;
         return pid;  // Return the PID of the exited process
     }
 
@@ -275,6 +310,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
 
     // Prepare the current task's wait state before publishing ourselves on the child's
     // waiter list. Once the child can see our PID, it may wake us immediately.
+    current_task->waitpid_publish_pending.store(true, std::memory_order_release);
     current_task->waiting_for_pid = pid;
     if (status != nullptr) {
         current_task->wait_status_user_addr = reinterpret_cast<uint64_t>(status);
@@ -297,6 +333,35 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
 
     if (TRACE_WAIT) {
         current_task->deferred_task_switch = true;
+        if (is_waitable_exit(target_task)) {
+            if (!sched_task::task_try_mark_waited_on(*target_task)) {
+                clear_waitpid_publish_pending(current_task);
+                current_task->deferred_task_switch = false;
+                current_task->waiting_for_pid = 0;
+                current_task->wait_status_user_addr = 0;
+                current_task->wait_status_phys_addr = 0;
+                current_task->wait_rusage_user_addr = 0;
+                current_task->wait_rusage_phys_addr = 0;
+                clear_wait_resume_debug(current_task);
+                return static_cast<uint64_t>(-ECHILD);
+            }
+            clear_waitpid_publish_pending(current_task);
+            current_task->deferred_task_switch = false;
+            if (status != nullptr) {
+                *status = target_task->exit_status;
+            }
+            if (rusage_vaddr != 0) {
+                uint64_t const PHYS = ker::mod::mm::virt::translate(current_task->pagemap, rusage_vaddr);
+                fill_rusage(PHYS, target_task);
+            }
+            current_task->waiting_for_pid = 0;
+            current_task->wait_status_user_addr = 0;
+            current_task->wait_status_phys_addr = 0;
+            current_task->wait_rusage_user_addr = 0;
+            current_task->wait_rusage_phys_addr = 0;
+            clear_wait_resume_debug(current_task);
+            return pid;
+        }
         return 0;
     }
 
@@ -305,6 +370,16 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     uint64_t const WAITER_LOCK_FLAGS = target_task->exit_waiters_lock.lock_irqsave();
     if (is_waitable_exit(target_task)) {
         target_task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
+        clear_waitpid_publish_pending(current_task);
+        if (!sched_task::task_try_mark_waited_on(*target_task)) {
+            current_task->waiting_for_pid = 0;
+            current_task->wait_status_user_addr = 0;
+            current_task->wait_status_phys_addr = 0;
+            current_task->wait_rusage_user_addr = 0;
+            current_task->wait_rusage_phys_addr = 0;
+            clear_wait_resume_debug(current_task);
+            return static_cast<uint64_t>(-ECHILD);
+        }
         if (status != nullptr) {
             *status = target_task->exit_status;
         }
@@ -318,13 +393,13 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         current_task->wait_rusage_user_addr = 0;
         current_task->wait_rusage_phys_addr = 0;
         clear_wait_resume_debug(current_task);
-        target_task->waited_on = true;
         return pid;
     }
 
     // Add the current task's PID to the target task's awaitee list
     if (!target_task->awaitee_on_exit.push_back(current_task->pid)) {
         target_task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
+        clear_waitpid_publish_pending(current_task);
         current_task->waiting_for_pid = 0;
         current_task->wait_status_user_addr = 0;
         current_task->wait_status_phys_addr = 0;

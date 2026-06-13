@@ -2,10 +2,26 @@
 #include <cstdint>
 #include <cstring>
 #include <net/wki/channel.hpp>
+#include <net/wki/timer_math.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 
 namespace ker::net::wki {
+
+namespace {
+
+void reset_retransmit_entry_storage(WkiChannel* ch, WkiRetransmitEntry* rt) {
+    if (rt == &ch->tx_rt_entry) {
+        ch->tx_rt_entry_in_use = false;
+        ch->tx_rt_entry = {};
+        return;
+    }
+
+    delete[] rt->data;
+    delete rt;
+}
+
+}  // namespace
 
 // -----------------------------------------------------------------------------
 // Standalone ACK
@@ -101,7 +117,7 @@ auto wki_channel_retransmit(WkiChannel* ch) -> int {
     ch->rto_us *= 2;
     ch->rto_us = std::min(ch->rto_us, WKI_MAX_RTO_US);
 
-    ch->retransmit_deadline = rt->send_time_us + ch->rto_us;
+    ch->retransmit_deadline = wki_future_deadline_us(rt->send_time_us, ch->rto_us);
 
     return WKI_OK;
 }
@@ -116,11 +132,10 @@ void wki_channel_reset(WkiChannel* ch) {
     }
 
     // Free retransmit queue
-    WkiRetransmitEntry const* rt = ch->retransmit_head;
+    WkiRetransmitEntry* rt = ch->retransmit_head;
     while (rt != nullptr) {
-        WkiRetransmitEntry const* next = rt->next;
-        delete[] rt->data;
-        delete rt;
+        WkiRetransmitEntry* next = rt->next;
+        reset_retransmit_entry_storage(ch, rt);
         rt = next;
     }
 
@@ -137,13 +152,16 @@ void wki_channel_reset(WkiChannel* ch) {
     ch->tx_seq = 0;
     ch->tx_ack = 0;
     ch->rx_seq = 0;
+    ch->rx_dispatch_seq = 0;
     ch->rx_ack_pending = 0;
     ch->ack_pending = false;
+    ch->ack_pending_since_us = 0;
     ch->retransmit_head = nullptr;
     ch->retransmit_tail = nullptr;
     ch->retransmit_count = 0;
     ch->reorder_head = nullptr;
     ch->reorder_count = 0;
+    ch->last_dup_ack = 0;
     ch->dup_ack_count = 0;
     ch->rto_us = WKI_INITIAL_RTO_US;
     ch->srtt_us = 0;
@@ -154,10 +172,32 @@ void wki_channel_reset(WkiChannel* ch) {
     ch->retransmits = 0;
     ch->perf_last_stall_report_us = 0;
     ch->perf_last_stall_status = 0;
+    ch->tx_rt_entry = {};
+    ch->tx_rt_entry_in_use = false;
 
     // Restore default credits
     ch->tx_credits = wki_channel_default_credits(ch->channel_id);
     ch->rx_credits = ch->tx_credits;
+}
+
+auto wki_channel_lookup_in_peer(WkiPeer* peer, uint16_t peer_node, uint16_t channel_id) -> WkiChannel* {
+    if (peer == nullptr || channel_id >= WKI_MAX_CHANNELS) {
+        return nullptr;
+    }
+
+    WkiChannel* ch = peer->channels.at(channel_id);
+    if (ch == nullptr || !ch->active || ch->peer_node_id != peer_node || ch->channel_id != channel_id) {
+        return nullptr;
+    }
+
+    return ch;
+}
+
+auto wki_channel_ack_next_within_sent_window(const WkiChannel* ch, uint32_t ack_next) -> bool {
+    if (ch == nullptr) {
+        return false;
+    }
+    return !seq_after(ack_next, ch->tx_seq);
 }
 
 // -----------------------------------------------------------------------------

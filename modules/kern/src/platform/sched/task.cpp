@@ -46,6 +46,9 @@ constexpr size_t BOOT_FILE_CACHE_MAX_ENTRIES = 4;
 std::deque<BootFileCacheEntry> g_boot_file_cache;
 ker::mod::sys::Mutex g_boot_file_cache_lock;
 std::atomic<uint64_t> g_boot_file_cache_clock{0};
+#ifdef WOS_SELFTEST
+std::atomic<bool> g_task_selftest_force_fd_clone_insert_failure{false};
+#endif
 
 auto boot_file_stat_has_freshness(const ker::vfs::Stat& st) -> bool {
     // Some remote VFS stat paths do not provide a rich freshness tuple on
@@ -189,6 +192,52 @@ void release_boot_file(ker::vfs::File* file) {
     (void)ker::vfs::vfs_close_file(file);
 }
 
+void release_cloned_fd_table_refs(Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+    task->fd_table.for_each([](uint64_t /*key*/, void* val) {
+        if (val != nullptr) {
+            ker::vfs::vfs_put_file(static_cast<ker::vfs::File*>(val));
+        }
+    });
+}
+
+auto clone_user_thread_fds_checked(Task* parent, Task* child) -> bool {
+    if (parent == nullptr || child == nullptr) {
+        return false;
+    }
+
+    bool ok = true;
+    uint64_t const IRQF = parent->fd_table_lock.lock_irqsave();
+    parent->fd_table.for_each([&](uint64_t key, void* val) {
+        if (!ok) {
+            return;
+        }
+
+        if (val != nullptr) {
+            static_cast<ker::vfs::File*>(val)->refcount.fetch_add(1, std::memory_order_relaxed);
+        }
+#ifdef WOS_SELFTEST
+        if (g_task_selftest_force_fd_clone_insert_failure.load(std::memory_order_relaxed)) {
+            if (val != nullptr) {
+                static_cast<ker::vfs::File*>(val)->refcount.fetch_sub(1, std::memory_order_relaxed);
+            }
+            ok = false;
+            return;
+        }
+#endif
+        if (!child->fd_table.insert(key, val)) {
+            if (val != nullptr) {
+                static_cast<ker::vfs::File*>(val)->refcount.fetch_sub(1, std::memory_order_relaxed);
+            }
+            ok = false;
+        }
+    });
+    parent->fd_table_lock.unlock_irqrestore(IRQF);
+    return ok;
+}
+
 auto read_boot_file_fully(const char* path, uint8_t** out_buf) -> bool {
     if (path == nullptr || out_buf == nullptr) {
         return false;
@@ -312,6 +361,95 @@ auto read_boot_file_fully(const char* path, uint8_t** out_buf) -> bool {
 
 }  // namespace
 
+void destroy_unpublished_user_thread(Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+
+    release_cloned_fd_table_refs(task);
+    delete task->thread;
+    delete reinterpret_cast<cpu::PerCpu*>(task->context.syscall_scratch_area);
+    delete[] task->name;
+    if (task->context.syscall_kernel_stack >= ker::mod::mm::KERNEL_STACK_SIZE) {
+        mm::phys::page_free(reinterpret_cast<void*>(task->context.syscall_kernel_stack - ker::mod::mm::KERNEL_STACK_SIZE));
+    }
+    delete task;
+}
+
+#ifdef WOS_SELFTEST
+auto task_selftest_fd_clone_failure_releases_refs() -> bool {
+    Task parent{};
+    Task child{};
+    ker::vfs::File file{};
+    file.refcount.store(1, std::memory_order_relaxed);
+
+    constexpr uint64_t FD = 19;
+    if (!parent.fd_table.insert(FD, &file)) {
+        return false;
+    }
+
+    g_task_selftest_force_fd_clone_insert_failure.store(true, std::memory_order_relaxed);
+    bool const CLONED = clone_user_thread_fds_checked(&parent, &child);
+    g_task_selftest_force_fd_clone_insert_failure.store(false, std::memory_order_relaxed);
+
+    bool const OK = !CLONED && file.refcount.load(std::memory_order_relaxed) == 1 && child.fd_table.lookup(FD) == nullptr;
+    parent.fd_table.remove(FD);
+    return OK;
+}
+
+auto task_selftest_destroy_unpublished_user_thread_releases_refs() -> bool {
+    auto* task = new Task{};
+    if (task == nullptr) {
+        return false;
+    }
+
+    ker::vfs::File file{};
+    file.refcount.store(2, std::memory_order_relaxed);
+
+    constexpr uint64_t FD = 23;
+    if (!task->fd_table.insert(FD, &file)) {
+        delete task;
+        return false;
+    }
+
+    destroy_unpublished_user_thread(task);
+    return file.refcount.load(std::memory_order_relaxed) == 1;
+}
+
+auto task_selftest_waited_on_claim_is_single_winner() -> bool {
+    Task task{};
+    task_clear_waited_on(task);
+
+    bool const FIRST = task_try_mark_waited_on(task);
+    bool const SECOND = task_try_mark_waited_on(task);
+    bool const OBSERVED = task_waited_on(task);
+    task_clear_waited_on(task);
+
+    return FIRST && !SECOND && OBSERVED && !task_waited_on(task);
+}
+
+auto task_selftest_waitpid_block_state_clear_resets_fields() -> bool {
+    Task task{};
+    task.waiting_for_pid = 123;
+    task.wait_status_user_addr = 1;
+    task.wait_status_phys_addr = 2;
+    task.wait_rusage_user_addr = 3;
+    task.wait_rusage_phys_addr = 4;
+    task.wait_resume_rip_user_addr = 5;
+    task.wait_resume_rip_phys_addr = 6;
+    task.wait_resume_rsp_user_addr = 7;
+    task.wait_resume_rsp_phys_addr = 8;
+    task.wait_channel = "waitpid";
+
+    task_clear_waitpid_block_state(task);
+
+    return task.waiting_for_pid == 0 && task.wait_status_user_addr == 0 && task.wait_status_phys_addr == 0 &&
+           task.wait_rusage_user_addr == 0 && task.wait_rusage_phys_addr == 0 && task.wait_resume_rip_user_addr == 0 &&
+           task.wait_resume_rip_phys_addr == 0 && task.wait_resume_rsp_user_addr == 0 && task.wait_resume_rsp_phys_addr == 0 &&
+           task.wait_channel == nullptr;
+}
+#endif
+
 Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType type) {
     // CRITICAL: Copy the name string to kernel heap memory!
     // The passed 'name' might point to Limine boot memory or user memory
@@ -331,9 +469,10 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->exit_status = 0;     // Initialize exit status
     this->has_exited = false;  // Task hasn't exited yet
     this->exit_notify_ready.store(false, std::memory_order_relaxed);
-    this->waited_on = false;
+    task_clear_waited_on(*this);
     this->zombie_resources_reclaiming.store(false, std::memory_order_relaxed);
     this->zombie_resources_reclaimed.store(false, std::memory_order_relaxed);
+    this->waitpid_publish_pending.store(false, std::memory_order_relaxed);
     this->deferred_task_switch = false;  // No deferred switch by default
     this->yield_switch = false;
     this->kthread_entry = nullptr;
@@ -647,6 +786,7 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->context.syscall_kernel_stack = K_RSP;
     t->context.syscall_scratch_area = reinterpret_cast<uint64_t>(per_cpu);
     thr->gsbase = reinterpret_cast<uint64_t>(per_cpu);
+    auto cleanup_constructed_thread_task = [&]() { destroy_unpublished_user_thread(t); };
 
     // User-mode interrupt frame: jump straight into __mlibc_enter_thread.
     // sys_prepare_stack pushed [ user_arg, entry ] below userSp (i.e. at userSp and userSp+8).
@@ -674,13 +814,11 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->context.regs.rdi = entry_va;     // arg1: entry function
     t->context.regs.rsi = user_arg_va;  // arg2: user_arg
 
-    // Inherit FDs: share the same File* pointers and bump each refcount
-    parent->fd_table.for_each([&](uint64_t key, void* val) {
-        if (val != nullptr) {
-            reinterpret_cast<ker::vfs::File*>(val)->refcount.fetch_add(1, std::memory_order_relaxed);
-        }
-        (void)t->fd_table.insert(key, val);
-    });
+    // Inherit FDs: share the same File* pointers and bump each refcount.
+    if (!clone_user_thread_fds_checked(parent, t)) {
+        cleanup_constructed_thread_task();
+        return nullptr;
+    }
     // Copy fixed per-process storage inherited by userspace threads.
     t->fd_cloexec = parent->fd_cloexec;
     t->cwd = parent->cwd;
@@ -694,7 +832,10 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->sgid = parent->sgid;
     t->umask = parent->umask;
     t->personality = parent->personality;
-    (void)t->supplementary_groups.clone_from(parent->supplementary_groups);
+    if (!t->supplementary_groups.clone_from(parent->supplementary_groups)) {
+        cleanup_constructed_thread_task();
+        return nullptr;
+    }
     t->session_id = parent->session_id;
     t->pgid = parent->pgid;
     t->controlling_tty = parent->controlling_tty;
@@ -702,7 +843,10 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->wki_target_flags = parent->wki_target_flags;
     t->wki_submitter_hostname = parent->wki_submitter_hostname;
     t->wki_remote_pid = parent->wki_remote_pid;
-    (void)t->wki_vfs_rules.clone_from(parent->wki_vfs_rules);
+    if (!t->wki_vfs_rules.clone_from(parent->wki_vfs_rules)) {
+        cleanup_constructed_thread_task();
+        return nullptr;
+    }
     t->wki_skip_legacy_placement = false;
 
     // ELF buffer: threads have no separate ELF
@@ -714,9 +858,10 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->has_exited = false;
     t->exit_notify_ready.store(false, std::memory_order_relaxed);
     t->exit_status = 0;
-    t->waited_on = false;
+    task_clear_waited_on(*t);
     t->zombie_resources_reclaiming.store(false, std::memory_order_relaxed);
     t->zombie_resources_reclaimed.store(false, std::memory_order_relaxed);
+    t->waitpid_publish_pending.store(false, std::memory_order_relaxed);
     t->deferred_task_switch = false;
     t->yield_switch = false;
     t->set_voluntary_blocked(false);

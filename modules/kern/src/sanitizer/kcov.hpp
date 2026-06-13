@@ -16,8 +16,10 @@
 
 namespace ker::sanitizer::kcov {
 
-// Maximum PCs per task buffer (256K entries = 2MB per task)
-constexpr size_t KCOV_MAX_ENTRIES = static_cast<size_t>(256) * 1024;
+// Default PCs for callers that want a fixed-size buffer (8M entries = 64MB).
+// Passing 0 to alloc_buffer() requests the largest practical buffer the
+// current allocator state can satisfy while keeping a memory reserve.
+constexpr size_t KCOV_DEFAULT_ENTRIES = static_cast<size_t>(1024) * 1024 * 8;
 
 // Per-task KCOV buffer.  Allocated lazily when userspace enables coverage
 // collection for a task via ioctl/procfs.
@@ -26,6 +28,7 @@ struct KcovBuffer {
     uint64_t count = 0;       // Number of PCs recorded so far
     uint64_t capacity = 0;    // Allocated size (in entries)
     bool enabled = false;     // Coverage collection active?
+    bool truncated = false;   // At least one callback dropped a PC
 };
 
 // Initialize the KCOV subsystem (called from kernel init)

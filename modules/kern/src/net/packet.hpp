@@ -60,10 +60,12 @@ struct PacketPoolReclaimStats {
 
 struct PacketBuffer {
     std::array<uint8_t, PKT_BUF_SIZE> storage{};
-    uint8_t* data{};            // current data pointer
-    size_t len{};               // current data length
-    PacketBuffer* next{};       // freelist / queue linkage
-    NetDevice* dev{};           // source/dest device
+    uint8_t* data{};       // current data pointer
+    size_t len{};          // current data length
+    PacketBuffer* next{};  // freelist / queue linkage
+    NetDevice* dev{};      // source/dest device
+    void* lifetime_ctx{};  // optional owner released when pkt_free() consumes the buffer
+    void (*lifetime_release)(void*) = nullptr;
     uint16_t protocol{};        // EtherType (host byte order)
     proto::MacAddress src_mac;  // incoming source MAC (for reply use)
 #ifdef WOS_NET_PACKET_DEBUG

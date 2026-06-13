@@ -11,6 +11,7 @@
 #include <net/wki/wki.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <vector>
 
 #include "platform/mm/addr.hpp"
@@ -42,7 +43,8 @@ auto find_zone_slot(uint32_t zone_id) -> WkiZone* {
 
 auto alloc_zone_slot() -> WkiZone* {
     for (auto& zone : s_zone_table) {
-        if (zone.state == ZoneState::NONE) {
+        if (zone.state == ZoneState::NONE && !zone.retiring.load(std::memory_order_acquire) &&
+            zone.refs.load(std::memory_order_acquire) == 0) {
             return &zone;
         }
     }
@@ -69,6 +71,181 @@ void free_zone_backing(WkiZone* zone) {
 auto allocate_zone_backing(uint32_t size) -> void* {
     // Allocate physically contiguous pages from buddy allocator
     return ker::mod::mm::phys::page_alloc(size);
+}
+
+auto zone_range_valid(uint32_t offset, uint32_t len, uint32_t size) -> bool { return offset <= size && len <= size - offset; }
+
+auto zone_read_response_matches_pending(const WkiZone& zone, const ZoneReadRespPayload& resp) -> bool {
+    return resp.offset == zone.read_expected_offset && resp.length == zone.read_expected_len;
+}
+
+void reset_zone_metadata(WkiZone* zone) {
+    zone->zone_id = 0;
+    zone->peer_node_id = WKI_NODE_INVALID;
+    zone->state = ZoneState::NONE;
+    zone->size = 0;
+    zone->local_vaddr = nullptr;
+    zone->local_phys_addr = 0;
+    zone->local_rkey = 0;
+    zone->access_policy = 0;
+    zone->notify_mode = ZoneNotifyMode::NONE;
+    zone->type_hint = ZoneTypeHint::BUFFER;
+    zone->is_rdma = false;
+    zone->is_roce = false;
+    zone->remote_rkey = 0;
+    zone->remote_phys_addr = 0;
+    zone->rdma_transport = nullptr;
+    zone->is_initiator = false;
+    zone->pre_handler = nullptr;
+    zone->post_handler = nullptr;
+    zone->read_pending.store(false, std::memory_order_release);
+    zone->read_dest_buf = nullptr;
+    zone->read_result_len = 0;
+    zone->read_expected_offset = 0;
+    zone->read_expected_len = 0;
+    zone->read_status = 0;
+    zone->read_wait_entry = nullptr;
+    zone->write_pending.store(false, std::memory_order_release);
+    zone->write_status = 0;
+    zone->write_wait_entry = nullptr;
+}
+
+void finalize_retired_zone_if_idle(WkiZone* zone) {
+    if (zone == nullptr || !zone->retiring.load(std::memory_order_acquire) || zone->refs.load(std::memory_order_acquire) != 0) {
+        return;
+    }
+
+    s_zone_table_lock.lock();
+    if (zone->retiring.load(std::memory_order_acquire) && zone->refs.load(std::memory_order_acquire) == 0) {
+        free_zone_backing(zone);
+        reset_zone_metadata(zone);
+        zone->retiring.store(false, std::memory_order_release);
+    }
+    s_zone_table_lock.unlock();
+}
+
+void retain_zone(WkiZone* zone) {
+    if (zone != nullptr) {
+        zone->refs.fetch_add(1, std::memory_order_acq_rel);
+    }
+}
+
+void release_zone(WkiZone* zone) {
+    if (zone == nullptr) {
+        return;
+    }
+    uint32_t const PREV = zone->refs.fetch_sub(1, std::memory_order_acq_rel);
+    if (PREV == 1) {
+        finalize_retired_zone_if_idle(zone);
+    }
+}
+
+auto acquire_zone_slot(uint32_t zone_id) -> WkiZone* {
+    s_zone_table_lock.lock();
+    WkiZone* zone = find_zone_slot(zone_id);
+    if (zone != nullptr && !zone->retiring.load(std::memory_order_acquire)) {
+        retain_zone(zone);
+    } else {
+        zone = nullptr;
+    }
+    s_zone_table_lock.unlock();
+    return zone;
+}
+
+void mark_zone_retiring_locked(WkiZone* zone) {
+    if (zone == nullptr || zone->retiring.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    zone->state = ZoneState::NONE;
+}
+
+void retire_zone_after_timeout(WkiZone* zone) {
+    s_zone_table_lock.lock();
+    mark_zone_retiring_locked(zone);
+    s_zone_table_lock.unlock();
+}
+
+// Caller must hold WkiZone::lock.
+auto claim_and_clear_waiter_locked(WkiWaitEntry*& waiter_slot) -> WkiWaitEntry* {
+    WkiWaitEntry* waiter = waiter_slot;
+    waiter_slot = nullptr;
+    if (!wki_claim_op(waiter)) {
+        return nullptr;
+    }
+    return waiter;
+}
+
+void finish_claimed_waiter(WkiWaitEntry* waiter, int result) {
+    if (waiter != nullptr) {
+        wki_finish_claimed_op(waiter, result);
+    }
+}
+
+void finish_or_wait_for_cancelled_waiter(WkiWaitEntry& wait, bool claimed, int result) {
+    if (claimed) {
+        wki_finish_claimed_op(&wait, result);
+        return;
+    }
+
+    while (wait.state.load(std::memory_order_acquire) != static_cast<uint8_t>(WkiWaitEntry::DONE)) {
+        ker::mod::sched::kern_yield();
+    }
+}
+
+void cancel_read_waiter(WkiZone* zone, WkiWaitEntry& wait, int result) {
+    bool claimed = false;
+    zone->lock.lock();
+    if (zone->read_wait_entry == &wait) {
+        zone->read_wait_entry = nullptr;
+        zone->read_status = result;
+        zone->read_pending.store(false, std::memory_order_release);
+        zone->read_dest_buf = nullptr;
+        zone->read_expected_offset = 0;
+        zone->read_expected_len = 0;
+    }
+    claimed = wki_claim_op(&wait);
+    zone->lock.unlock();
+    finish_or_wait_for_cancelled_waiter(wait, claimed, result);
+}
+
+void cancel_write_waiter(WkiZone* zone, WkiWaitEntry& wait, int result) {
+    bool claimed = false;
+    zone->lock.lock();
+    if (zone->write_wait_entry == &wait) {
+        zone->write_wait_entry = nullptr;
+        zone->write_status = result;
+        zone->write_pending.store(false, std::memory_order_release);
+    }
+    claimed = wki_claim_op(&wait);
+    zone->lock.unlock();
+    finish_or_wait_for_cancelled_waiter(wait, claimed, result);
+}
+
+void clear_read_waiter_after_wait(WkiZone* zone, WkiWaitEntry& wait, int wait_result) {
+    zone->lock.lock();
+    if (zone->read_wait_entry == &wait) {
+        zone->read_wait_entry = nullptr;
+    }
+    if (wait_result == WKI_ERR_TIMEOUT) {
+        zone->read_status = WKI_ERR_ZONE_TIMEOUT;
+        zone->read_pending.store(false, std::memory_order_release);
+        zone->read_dest_buf = nullptr;
+        zone->read_expected_offset = 0;
+        zone->read_expected_len = 0;
+    }
+    zone->lock.unlock();
+}
+
+void clear_write_waiter_after_wait(WkiZone* zone, WkiWaitEntry& wait, int wait_result) {
+    zone->lock.lock();
+    if (zone->write_wait_entry == &wait) {
+        zone->write_wait_entry = nullptr;
+    }
+    if (wait_result == WKI_ERR_TIMEOUT) {
+        zone->write_status = WKI_ERR_ZONE_TIMEOUT;
+        zone->write_pending.store(false, std::memory_order_release);
+    }
+    zone->lock.unlock();
 }
 
 // Check if a peer has any RDMA-capable transport (ivshmem or RoCE)
@@ -166,6 +343,8 @@ void wki_zone_init() {
     for (auto& zone : s_zone_table) {
         zone.state = ZoneState::NONE;
         zone.zone_id = 0;
+        zone.refs.store(0, std::memory_order_release);
+        zone.retiring.store(false, std::memory_order_release);
     }
 
     s_zone_initialized = true;
@@ -226,7 +405,15 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
     zone->pre_handler = nullptr;
     zone->post_handler = nullptr;
     zone->read_pending = false;
+    zone->read_dest_buf = nullptr;
+    zone->read_result_len = 0;
+    zone->read_expected_offset = 0;
+    zone->read_expected_len = 0;
+    zone->read_wait_entry = nullptr;
+    zone->read_status = 0;
     zone->write_pending = false;
+    zone->retiring.store(false, std::memory_order_release);
+    retain_zone(zone);
 
     s_zone_table_lock.unlock();
 
@@ -241,36 +428,40 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
     // Set up wait entry before send (temporarily use read_wait_entry;
     // zone is NEGOTIATING so no reads are possible)
     WkiWaitEntry create_wait = {};
+    zone->lock.lock();
     zone->read_wait_entry = &create_wait;
+    zone->read_status = 0;
+    zone->lock.unlock();
 
     int const RET = wki_send(peer, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_REQ, &req, sizeof(req));
     if (RET != WKI_OK) {
-        // Clean up on send failure
-        zone->read_wait_entry = nullptr;
+        cancel_read_waiter(zone, create_wait, RET);
         s_zone_table_lock.lock();
-        zone->state = ZoneState::NONE;
-        zone->zone_id = 0;
+        mark_zone_retiring_locked(zone);
         s_zone_table_lock.unlock();
+        release_zone(zone);
         return RET;
     }
 
     // Wait for ACK via async wait queue
     int const WAIT_RC = wki_wait_for_op(&create_wait, WKI_OP_TIMEOUT_US);
-    zone->read_wait_entry = nullptr;
+    clear_read_waiter_after_wait(zone, create_wait, WAIT_RC);
     if (WAIT_RC == WKI_ERR_TIMEOUT) {
         // Timeout - clean up
         s_zone_table_lock.lock();
-        zone->state = ZoneState::NONE;
-        zone->zone_id = 0;
+        mark_zone_retiring_locked(zone);
         s_zone_table_lock.unlock();
+        release_zone(zone);
         return WKI_ERR_ZONE_TIMEOUT;
     }
 
     if (zone->state == ZoneState::ACTIVE) {
+        release_zone(zone);
         return WKI_OK;
     }
 
     // Zone was rejected - slot already cleaned up by ACK handler
+    release_zone(zone);
     return WKI_ERR_ZONE_REJECTED;
 }
 
@@ -279,6 +470,8 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
 // -----------------------------------------------------------------------------
 
 auto wki_zone_destroy(uint32_t zone_id) -> int {
+    WkiWaitEntry* read_waiter = nullptr;
+    WkiWaitEntry* write_waiter = nullptr;
     s_zone_table_lock.lock();
 
     WkiZone* zone = find_zone_slot(zone_id);
@@ -289,14 +482,21 @@ auto wki_zone_destroy(uint32_t zone_id) -> int {
 
     uint16_t const PEER = zone->peer_node_id;
 
-    // Free backing memory
-    free_zone_backing(zone);
-
-    // Clear the slot
-    zone->state = ZoneState::NONE;
-    zone->zone_id = 0;
+    mark_zone_retiring_locked(zone);
+    zone->lock.lock();
+    zone->read_status = -1;
+    read_waiter = claim_and_clear_waiter_locked(zone->read_wait_entry);
+    zone->read_pending.store(false, std::memory_order_release);
+    zone->write_status = -1;
+    write_waiter = claim_and_clear_waiter_locked(zone->write_wait_entry);
+    zone->write_pending.store(false, std::memory_order_release);
+    zone->lock.unlock();
 
     s_zone_table_lock.unlock();
+
+    finish_claimed_waiter(read_waiter, -1);
+    finish_claimed_waiter(write_waiter, -1);
+    finalize_retired_zone_if_idle(zone);
 
     // Notify peer
     ZoneDestroyPayload destroy = {};
@@ -324,29 +524,35 @@ auto wki_zone_find(uint32_t zone_id) -> WkiZone* {
 // -----------------------------------------------------------------------------
 
 auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -> int {
-    WkiZone* zone = wki_zone_find(zone_id);
+    WkiZone* zone = acquire_zone_slot(zone_id);
     if (zone == nullptr) {
         return WKI_ERR_ZONE_NOT_FOUND;
     }
     if (zone->state != ZoneState::ACTIVE) {
+        release_zone(zone);
         return WKI_ERR_ZONE_INACTIVE;
     }
 
     // Check access policy - we need REMOTE_READ on the peer's zone
     // (The remote side validates this too, but checking early avoids network round-trip)
     if ((zone->access_policy & ZONE_ACCESS_REMOTE_READ) == 0) {
+        release_zone(zone);
         return WKI_ERR_ZONE_ACCESS;
+    }
+
+    if (!zone_range_valid(offset, len, zone->size)) {
+        release_zone(zone);
+        return WKI_ERR_INVALID;
     }
 
     // For RDMA zones, the caller should use wki_zone_get_ptr() directly
     if (zone->is_rdma) {
         if (zone->local_vaddr == nullptr) {
+            release_zone(zone);
             return WKI_ERR_ZONE_INACTIVE;
         }
-        if (offset + len > zone->size) {
-            return WKI_ERR_INVALID;
-        }
         memcpy(buf, static_cast<uint8_t*>(zone->local_vaddr) + offset, len);
+        release_zone(zone);
         return WKI_OK;
     }
 
@@ -362,10 +568,17 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
         // Set up pending read state
         WkiWaitEntry read_wait = {};
         zone->lock.lock();
+        if (zone->retiring.load(std::memory_order_acquire) || zone->state != ZoneState::ACTIVE) {
+            zone->lock.unlock();
+            release_zone(zone);
+            return WKI_ERR_ZONE_INACTIVE;
+        }
         zone->read_wait_entry = &read_wait;
         zone->read_pending.store(true, std::memory_order_release);
         zone->read_dest_buf = dest;
         zone->read_result_len = 0;
+        zone->read_expected_offset = cur_offset;
+        zone->read_expected_len = chunk;
         zone->read_status = 0;
         zone->lock.unlock();
 
@@ -377,21 +590,24 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
 
         int const RET = wki_send(zone->peer_node_id, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_READ_REQ, &req, sizeof(req));
         if (RET != WKI_OK) {
-            zone->read_wait_entry = nullptr;
-            zone->read_pending.store(false, std::memory_order_relaxed);
+            cancel_read_waiter(zone, read_wait, RET);
+            release_zone(zone);
             return RET;
         }
 
         // Wait for response via async wait queue
         int const WAIT_RC = wki_wait_for_op(&read_wait, WKI_OP_TIMEOUT_US);
-        zone->read_wait_entry = nullptr;
+        clear_read_waiter_after_wait(zone, read_wait, WAIT_RC);
         if (WAIT_RC == WKI_ERR_TIMEOUT) {
-            zone->read_pending.store(false, std::memory_order_relaxed);
+            retire_zone_after_timeout(zone);
+            release_zone(zone);
             return WKI_ERR_ZONE_TIMEOUT;
         }
 
         if (zone->read_status != 0) {
-            return zone->read_status;
+            int const STATUS = zone->read_status;
+            release_zone(zone);
+            return STATUS;
         }
 
         dest += chunk;
@@ -399,6 +615,7 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
         remaining -= chunk;
     }
 
+    release_zone(zone);
     return WKI_OK;
 }
 
@@ -407,27 +624,33 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
 // -----------------------------------------------------------------------------
 
 auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t len) -> int {
-    WkiZone* zone = wki_zone_find(zone_id);
+    WkiZone* zone = acquire_zone_slot(zone_id);
     if (zone == nullptr) {
         return WKI_ERR_ZONE_NOT_FOUND;
     }
     if (zone->state != ZoneState::ACTIVE) {
+        release_zone(zone);
         return WKI_ERR_ZONE_INACTIVE;
     }
 
     if ((zone->access_policy & ZONE_ACCESS_REMOTE_WRITE) == 0) {
+        release_zone(zone);
         return WKI_ERR_ZONE_ACCESS;
+    }
+
+    if (!zone_range_valid(offset, len, zone->size)) {
+        release_zone(zone);
+        return WKI_ERR_INVALID;
     }
 
     // For RDMA zones, the caller should use wki_zone_get_ptr() directly
     if (zone->is_rdma) {
         if (zone->local_vaddr == nullptr) {
+            release_zone(zone);
             return WKI_ERR_ZONE_INACTIVE;
         }
-        if (offset + len > zone->size) {
-            return WKI_ERR_INVALID;
-        }
         memcpy(static_cast<uint8_t*>(zone->local_vaddr) + offset, buf, len);
+        release_zone(zone);
         return WKI_OK;
     }
 
@@ -444,6 +667,7 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
         auto msg_len = static_cast<uint16_t>(sizeof(ZoneWriteReqPayload) + chunk);
         auto* msg_buf = new (std::nothrow) uint8_t[msg_len];
         if (msg_buf == nullptr) {
+            release_zone(zone);
             return WKI_ERR_ZONE_NO_MEM;
         }
 
@@ -456,6 +680,12 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
         // Set up pending write state
         WkiWaitEntry write_wait = {};
         zone->lock.lock();
+        if (zone->retiring.load(std::memory_order_acquire) || zone->state != ZoneState::ACTIVE) {
+            zone->lock.unlock();
+            delete[] msg_buf;
+            release_zone(zone);
+            return WKI_ERR_ZONE_INACTIVE;
+        }
         zone->write_wait_entry = &write_wait;
         zone->write_pending.store(true, std::memory_order_release);
         zone->write_status = 0;
@@ -465,21 +695,24 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
         delete[] msg_buf;
 
         if (RET != WKI_OK) {
-            zone->write_wait_entry = nullptr;
-            zone->write_pending.store(false, std::memory_order_relaxed);
+            cancel_write_waiter(zone, write_wait, RET);
+            release_zone(zone);
             return RET;
         }
 
         // Wait for ACK via async wait queue
         int const WAIT_RC = wki_wait_for_op(&write_wait, WKI_OP_TIMEOUT_US);
-        zone->write_wait_entry = nullptr;
+        clear_write_waiter_after_wait(zone, write_wait, WAIT_RC);
         if (WAIT_RC == WKI_ERR_TIMEOUT) {
-            zone->write_pending.store(false, std::memory_order_relaxed);
+            retire_zone_after_timeout(zone);
+            release_zone(zone);
             return WKI_ERR_ZONE_TIMEOUT;
         }
 
         if (zone->write_status != 0) {
-            return zone->write_status;
+            int const STATUS = zone->write_status;
+            release_zone(zone);
+            return STATUS;
         }
 
         src += chunk;
@@ -487,6 +720,7 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
         remaining -= chunk;
     }
 
+    release_zone(zone);
     return WKI_OK;
 }
 
@@ -500,11 +734,14 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
 // No enforcement is done here - policy checks are performed at the message-based
 // read/write paths (wki_zone_read / wki_zone_write).
 auto wki_zone_get_ptr(uint32_t zone_id) -> void* {
-    WkiZone const* zone = wki_zone_find(zone_id);
+    WkiZone* zone = acquire_zone_slot(zone_id);
     if (zone == nullptr || zone->state != ZoneState::ACTIVE) {
+        release_zone(zone);
         return nullptr;
     }
-    return zone->local_vaddr;
+    void* ptr = zone->local_vaddr;
+    release_zone(zone);
+    return ptr;
 }
 
 // -----------------------------------------------------------------------------
@@ -512,14 +749,17 @@ auto wki_zone_get_ptr(uint32_t zone_id) -> void* {
 // -----------------------------------------------------------------------------
 
 void wki_zone_set_handlers(uint32_t zone_id, ZoneNotifyHandler pre, ZoneNotifyHandler post) {
-    WkiZone* zone = wki_zone_find(zone_id);
+    WkiZone* zone = acquire_zone_slot(zone_id);
     if (zone == nullptr) {
         return;
     }
     zone->lock.lock();
-    zone->pre_handler = pre;
-    zone->post_handler = post;
+    if (zone->state == ZoneState::ACTIVE && !zone->retiring.load(std::memory_order_acquire)) {
+        zone->pre_handler = pre;
+        zone->post_handler = post;
+    }
     zone->lock.unlock();
+    release_zone(zone);
 }
 
 // -----------------------------------------------------------------------------
@@ -527,32 +767,44 @@ void wki_zone_set_handlers(uint32_t zone_id, ZoneNotifyHandler pre, ZoneNotifyHa
 // -----------------------------------------------------------------------------
 
 void wki_zones_destroy_for_peer(uint16_t node_id) {
-    s_zone_table_lock.lock();
+    while (true) {
+        WkiZone* zone = nullptr;
+        uint32_t zone_id = 0;
+        WkiWaitEntry* read_waiter = nullptr;
+        WkiWaitEntry* write_waiter = nullptr;
 
-    for (auto& zone : s_zone_table) {
-        if (zone.state == ZoneState::NONE) {
-            continue;
-        }
-        if (zone.peer_node_id != node_id) {
-            continue;
+        s_zone_table_lock.lock();
+        for (auto& candidate : s_zone_table) {
+            if (candidate.state == ZoneState::NONE || candidate.peer_node_id != node_id) {
+                continue;
+            }
+
+            zone = &candidate;
+            zone_id = candidate.zone_id;
+            mark_zone_retiring_locked(zone);
+
+            zone->lock.lock();
+            zone->read_status = -1;
+            read_waiter = claim_and_clear_waiter_locked(zone->read_wait_entry);
+            zone->read_pending.store(false, std::memory_order_release);
+            zone->write_status = -1;
+            write_waiter = claim_and_clear_waiter_locked(zone->write_wait_entry);
+            zone->write_pending.store(false, std::memory_order_release);
+            zone->lock.unlock();
+            break;
         }
 
-        log::info("Destroying zone 0x%08x (peer 0x%04x fenced)", zone.zone_id, node_id);
+        s_zone_table_lock.unlock();
 
-        // Wake any pending waiters with error
-        if (zone.read_wait_entry != nullptr) {
-            wki_wake_op(zone.read_wait_entry, -1);
-        }
-        if (zone.write_wait_entry != nullptr) {
-            wki_wake_op(zone.write_wait_entry, -1);
+        if (zone == nullptr) {
+            break;
         }
 
-        free_zone_backing(&zone);
-        zone.state = ZoneState::NONE;
-        zone.zone_id = 0;
+        log::info("Destroying zone 0x%08x (peer 0x%04x fenced)", zone_id, node_id);
+        finish_claimed_waiter(read_waiter, -1);
+        finish_claimed_waiter(write_waiter, -1);
+        finalize_retired_zone_if_idle(zone);
     }
-
-    s_zone_table_lock.unlock();
 }
 
 // -----------------------------------------------------------------------------
@@ -570,6 +822,73 @@ auto wki_zones_list() -> auto {
     s_zone_table_lock.unlock();
     return zones;
 }
+
+#ifdef WOS_SELFTEST
+auto wki_zone_selftest_timeout_retirement_fences_stale_completion() -> bool {
+    WkiZone read_zone = {};
+    WkiWaitEntry read_wait = {};
+
+    read_zone.zone_id = 0xABCD;
+    read_zone.peer_node_id = 0x1234;
+    read_zone.state = ZoneState::ACTIVE;
+    read_zone.read_pending.store(true, std::memory_order_release);
+    read_zone.read_wait_entry = &read_wait;
+
+    clear_read_waiter_after_wait(&read_zone, read_wait, WKI_ERR_TIMEOUT);
+    retire_zone_after_timeout(&read_zone);
+
+    bool const READ_FENCED = read_zone.retiring.load(std::memory_order_acquire) && read_zone.state == ZoneState::NONE &&
+                             !read_zone.read_pending.load(std::memory_order_acquire) && read_zone.read_wait_entry == nullptr &&
+                             read_zone.read_status == WKI_ERR_ZONE_TIMEOUT;
+
+    WkiZone write_zone = {};
+    WkiWaitEntry write_wait = {};
+
+    write_zone.zone_id = 0xBCDE;
+    write_zone.peer_node_id = 0x1234;
+    write_zone.state = ZoneState::ACTIVE;
+    write_zone.write_pending.store(true, std::memory_order_release);
+    write_zone.write_wait_entry = &write_wait;
+
+    clear_write_waiter_after_wait(&write_zone, write_wait, WKI_ERR_TIMEOUT);
+    retire_zone_after_timeout(&write_zone);
+
+    bool const WRITE_FENCED = write_zone.retiring.load(std::memory_order_acquire) && write_zone.state == ZoneState::NONE &&
+                              !write_zone.write_pending.load(std::memory_order_acquire) && write_zone.write_wait_entry == nullptr &&
+                              write_zone.write_status == WKI_ERR_ZONE_TIMEOUT;
+
+    return READ_FENCED && WRITE_FENCED;
+}
+
+auto wki_zone_selftest_range_and_read_response_validation() -> bool {
+    if (!zone_range_valid(0, 0, 4096) || !zone_range_valid(4096, 0, 4096) || !zone_range_valid(1024, 2048, 4096)) {
+        return false;
+    }
+    if (zone_range_valid(4097, 0, 4096) || zone_range_valid(4000, 128, 4096) || zone_range_valid(0xFFFFF000U, 0x2000U, 0xFFFFFFFFU)) {
+        return false;
+    }
+
+    WkiZone zone = {};
+    zone.read_expected_offset = 128;
+    zone.read_expected_len = 64;
+
+    ZoneReadRespPayload resp = {};
+    resp.offset = 128;
+    resp.length = 64;
+    if (!zone_read_response_matches_pending(zone, resp)) {
+        return false;
+    }
+
+    resp.length = 65;
+    if (zone_read_response_matches_pending(zone, resp)) {
+        return false;
+    }
+
+    resp.length = 64;
+    resp.offset = 129;
+    return !zone_read_response_matches_pending(zone, resp);
+}
+#endif
 
 // -----------------------------------------------------------------------------
 // RX Handlers - Zone negotiation
@@ -688,8 +1007,17 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
     zone->rdma_transport = zone_rdma_transport;
     zone->pre_handler = nullptr;
     zone->post_handler = nullptr;
+    zone->read_wait_entry = nullptr;
+    zone->read_status = 0;
+    zone->read_result_len = 0;
+    zone->read_dest_buf = nullptr;
+    zone->read_expected_offset = 0;
+    zone->read_expected_len = 0;
     zone->read_pending = false;
+    zone->write_wait_entry = nullptr;
+    zone->write_status = 0;
     zone->write_pending = false;
+    zone->retiring.store(false, std::memory_order_release);
 
     s_zone_table_lock.unlock();
 
@@ -714,6 +1042,8 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
     }
 
     const auto* ack = reinterpret_cast<const ZoneCreateAckPayload*>(payload);
+    auto const STATUS = static_cast<ZoneCreateStatus>(ack->status);
+    WkiWaitEntry* create_waiter = nullptr;
 
     s_zone_table_lock.lock();
 
@@ -729,9 +1059,28 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
         return;
     }
 
-    auto status = static_cast<ZoneCreateStatus>(ack->status);
+    uint32_t const ZONE_SIZE = zone->size;
 
-    if (status == ZoneCreateStatus::ACCEPTED) {
+    zone->lock.lock();
+    zone->read_status = 0;
+    create_waiter = claim_and_clear_waiter_locked(zone->read_wait_entry);
+    zone->read_pending.store(false, std::memory_order_release);
+    zone->lock.unlock();
+
+    if (create_waiter == nullptr) {
+        mark_zone_retiring_locked(zone);
+        s_zone_table_lock.unlock();
+
+        if (STATUS == ZoneCreateStatus::ACCEPTED) {
+            ZoneDestroyPayload destroy = {};
+            destroy.zone_id = ack->zone_id;
+            wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_DESTROY, &destroy, sizeof(destroy));
+        }
+        finalize_retired_zone_if_idle(zone);
+        return;
+    }
+
+    if (STATUS == ZoneCreateStatus::ACCEPTED) {
         bool use_rdma = false;
         bool use_roce = false;
         void* backing = nullptr;
@@ -742,7 +1091,7 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
         // If responder provided an rkey, try RDMA allocation on our side too
         if (ack->rkey != 0 && peer_has_rdma(hdr->src_node)) {
             // Try ivshmem first
-            backing = allocate_rdma_zone_backing(zone->size, rdma_offset);
+            backing = allocate_rdma_zone_backing(ZONE_SIZE, rdma_offset);
             if (backing != nullptr) {
                 use_rdma = true;
                 local_rkey = static_cast<uint32_t>(rdma_offset);
@@ -753,7 +1102,7 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
                 WkiTransport* roce = peer_rdma_transport(hdr->src_node);
                 if (roce != nullptr) {
                     uint32_t roce_rkey = 0;
-                    backing = allocate_roce_zone_backing(roce, zone->size, roce_rkey);
+                    backing = allocate_roce_zone_backing(roce, ZONE_SIZE, roce_rkey);
                     if (backing != nullptr) {
                         use_rdma = true;
                         use_roce = true;
@@ -766,20 +1115,21 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
 
         // Fall back to message-based allocation
         if (backing == nullptr) {
-            backing = allocate_zone_backing(zone->size);
+            backing = allocate_zone_backing(ZONE_SIZE);
             if (backing == nullptr) {
-                zone->state = ZoneState::NONE;
-                zone->zone_id = 0;
+                mark_zone_retiring_locked(zone);
                 s_zone_table_lock.unlock();
 
+                finish_claimed_waiter(create_waiter, 0);
                 ZoneDestroyPayload destroy = {};
                 destroy.zone_id = ack->zone_id;
                 wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_DESTROY, &destroy, sizeof(destroy));
+                finalize_retired_zone_if_idle(zone);
                 return;
             }
         }
 
-        memset(backing, 0, zone->size);
+        memset(backing, 0, ZONE_SIZE);
 
         zone->local_vaddr = backing;
         zone->is_rdma = use_rdma;
@@ -810,28 +1160,20 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
             wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_NOTIFY_POST, &rkey_notify, sizeof(rkey_notify));
         }
 
-        log::info("Zone 0x%08x active (initiator, peer 0x%04x, %u bytes, rdma=%d, roce=%d)", ack->zone_id, hdr->src_node, zone->size,
+        log::info("Zone 0x%08x active (initiator, peer 0x%04x, %u bytes, rdma=%d, roce=%d)", ack->zone_id, hdr->src_node, ZONE_SIZE,
                   use_rdma ? 1 : 0, use_roce ? 1 : 0);
 
         wki_event_publish(EVENT_CLASS_ZONE, EVENT_ZONE_CREATED, &ack->zone_id, sizeof(ack->zone_id));
-
-        // Wake the creator waiting in wki_zone_create()
-        if (zone->read_wait_entry != nullptr) {
-            wki_wake_op(zone->read_wait_entry, 0);
-        }
+        finish_claimed_waiter(create_waiter, 0);
     } else {
         // Rejected
         log::warn("Zone 0x%08x rejected by peer 0x%04x (status=%u)", ack->zone_id, hdr->src_node, ack->status);
 
-        WkiWaitEntry* waiter = zone->read_wait_entry;
-        zone->state = ZoneState::NONE;
-        zone->zone_id = 0;
+        mark_zone_retiring_locked(zone);
         s_zone_table_lock.unlock();
 
-        // Wake the creator waiting in wki_zone_create()
-        if (waiter != nullptr) {
-            wki_wake_op(waiter, 0);
-        }
+        finish_claimed_waiter(create_waiter, 0);
+        finalize_retired_zone_if_idle(zone);
     }
 }
 
@@ -841,6 +1183,8 @@ void handle_zone_destroy(const WkiHeader* hdr, const uint8_t* payload, uint16_t 
     }
 
     const auto* destroy = reinterpret_cast<const ZoneDestroyPayload*>(payload);
+    WkiWaitEntry* read_waiter = nullptr;
+    WkiWaitEntry* write_waiter = nullptr;
 
     s_zone_table_lock.lock();
 
@@ -858,19 +1202,21 @@ void handle_zone_destroy(const WkiHeader* hdr, const uint8_t* payload, uint16_t 
 
     log::info("Zone 0x%08x destroyed by peer 0x%04x", destroy->zone_id, hdr->src_node);
 
-    // Wake any pending waiters with error
-    if (zone->read_wait_entry != nullptr) {
-        wki_wake_op(zone->read_wait_entry, -1);
-    }
-    if (zone->write_wait_entry != nullptr) {
-        wki_wake_op(zone->write_wait_entry, -1);
-    }
-
-    free_zone_backing(zone);
-    zone->state = ZoneState::NONE;
-    zone->zone_id = 0;
+    mark_zone_retiring_locked(zone);
+    zone->lock.lock();
+    zone->read_status = -1;
+    read_waiter = claim_and_clear_waiter_locked(zone->read_wait_entry);
+    zone->read_pending.store(false, std::memory_order_release);
+    zone->write_status = -1;
+    write_waiter = claim_and_clear_waiter_locked(zone->write_wait_entry);
+    zone->write_pending.store(false, std::memory_order_release);
+    zone->lock.unlock();
 
     s_zone_table_lock.unlock();
+
+    finish_claimed_waiter(read_waiter, -1);
+    finish_claimed_waiter(write_waiter, -1);
+    finalize_retired_zone_if_idle(zone);
 }
 
 // -----------------------------------------------------------------------------
@@ -884,23 +1230,33 @@ void handle_zone_notify_pre(const WkiHeader* hdr, const uint8_t* payload, uint16
 
     const auto* notify = reinterpret_cast<const ZoneNotifyPayload*>(payload);
 
-    WkiZone const* zone = wki_zone_find(notify->zone_id);
+    WkiZone* zone = acquire_zone_slot(notify->zone_id);
     if (zone == nullptr || zone->state != ZoneState::ACTIVE) {
+        release_zone(zone);
         return;
     }
     if (zone->peer_node_id != hdr->src_node) {
+        release_zone(zone);
         return;
     }
 
+    ZoneNotifyHandler handler = nullptr;
+    zone->lock.lock();
+    if (!zone->retiring.load(std::memory_order_acquire) && zone->state == ZoneState::ACTIVE) {
+        handler = zone->pre_handler;
+    }
+    zone->lock.unlock();
+
     // Invoke pre-notification handler if registered
-    if (zone->pre_handler != nullptr) {
-        zone->pre_handler(notify->zone_id, notify->offset, notify->length, notify->op_type);
+    if (handler != nullptr) {
+        handler(notify->zone_id, notify->offset, notify->length, notify->op_type);
     }
 
     // Send ACK back to notifier
     ZoneNotifyAckPayload ack = {};
     ack.zone_id = notify->zone_id;
     wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_NOTIFY_PRE_ACK, &ack, sizeof(ack));
+    release_zone(zone);
 }
 
 void handle_zone_notify_post(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
@@ -910,31 +1266,44 @@ void handle_zone_notify_post(const WkiHeader* hdr, const uint8_t* payload, uint1
 
     const auto* notify = reinterpret_cast<const ZoneNotifyPayload*>(payload);
 
-    WkiZone* zone = wki_zone_find(notify->zone_id);
+    WkiZone* zone = acquire_zone_slot(notify->zone_id);
     if (zone == nullptr || zone->state != ZoneState::ACTIVE) {
+        release_zone(zone);
         return;
     }
     if (zone->peer_node_id != hdr->src_node) {
+        release_zone(zone);
         return;
     }
 
     // op_type=0xFE: rkey-exchange - the initiator is telling us its RDMA rkey
     // so we can write/read its zone memory.  Store it in remote_rkey.
     if (notify->op_type == 0xFE) {
+        zone->lock.lock();
         zone->remote_rkey = notify->offset;  // rkey encoded in offset field
+        zone->lock.unlock();
         // No ACK needed for rkey-exchange - the initiator doesn't wait.
+        release_zone(zone);
         return;
     }
 
+    ZoneNotifyHandler handler = nullptr;
+    zone->lock.lock();
+    if (!zone->retiring.load(std::memory_order_acquire) && zone->state == ZoneState::ACTIVE) {
+        handler = zone->post_handler;
+    }
+    zone->lock.unlock();
+
     // Invoke post-notification handler if registered
-    if (zone->post_handler != nullptr) {
-        zone->post_handler(notify->zone_id, notify->offset, notify->length, notify->op_type);
+    if (handler != nullptr) {
+        handler(notify->zone_id, notify->offset, notify->length, notify->op_type);
     }
 
     // Send ACK back to notifier
     ZoneNotifyAckPayload ack = {};
     ack.zone_id = notify->zone_id;
     wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_NOTIFY_POST_ACK, &ack, sizeof(ack));
+    release_zone(zone);
 }
 
 // -----------------------------------------------------------------------------
@@ -948,24 +1317,25 @@ void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t
 
     const auto* req = reinterpret_cast<const ZoneReadReqPayload*>(payload);
 
-    s_zone_table_lock.lock();
-    WkiZone const* zone = find_zone_slot(req->zone_id);
-    s_zone_table_lock.unlock();
-
+    WkiZone* zone = acquire_zone_slot(req->zone_id);
     if (zone == nullptr || zone->state != ZoneState::ACTIVE) {
+        release_zone(zone);
         return;
     }
     if (zone->peer_node_id != hdr->src_node) {
+        release_zone(zone);
         return;
     }
 
     // Check access policy - peer wants to read our local data
     if ((zone->access_policy & ZONE_ACCESS_REMOTE_READ) == 0) {
+        release_zone(zone);
         return;
     }
 
     // Bounds check
-    if (req->offset + req->length > zone->size) {
+    if (req->length > WKI_ZONE_MAX_MSG_DATA || !zone_range_valid(req->offset, req->length, zone->size)) {
+        release_zone(zone);
         return;
     }
 
@@ -974,6 +1344,7 @@ void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     auto resp_len = static_cast<uint16_t>(sizeof(ZoneReadRespPayload) + DATA_LEN);
     auto* resp_buf = new (std::nothrow) uint8_t[resp_len];
     if (resp_buf == nullptr) {
+        release_zone(zone);
         return;
     }
 
@@ -987,30 +1358,50 @@ void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t
 
     wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_READ_RESP, resp_buf, resp_len);
     delete[] resp_buf;
+    release_zone(zone);
 }
 
-void handle_zone_read_resp(const WkiHeader* /*hdr*/, const uint8_t* payload, uint16_t payload_len) {
+void handle_zone_read_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
     if (payload_len < sizeof(ZoneReadRespPayload)) {
         return;
     }
 
     const auto* resp = reinterpret_cast<const ZoneReadRespPayload*>(payload);
+    WkiWaitEntry* waiter = nullptr;
 
-    s_zone_table_lock.lock();
-    WkiZone* zone = find_zone_slot(resp->zone_id);
-    s_zone_table_lock.unlock();
-
-    if (zone == nullptr || !zone->read_pending.load(std::memory_order_acquire)) {
+    WkiZone* zone = acquire_zone_slot(resp->zone_id);
+    if (zone == nullptr) {
         return;
     }
 
-    // Validate data fits
-    if (sizeof(ZoneReadRespPayload) + resp->length > payload_len) {
+    zone->lock.lock();
+    if (zone->peer_node_id != hdr->src_node || zone->retiring.load(std::memory_order_acquire) || zone->state != ZoneState::ACTIVE ||
+        !zone->read_pending.load(std::memory_order_acquire)) {
+        zone->lock.unlock();
+        release_zone(zone);
+        return;
+    }
+
+    waiter = claim_and_clear_waiter_locked(zone->read_wait_entry);
+    if (waiter == nullptr) {
+        zone->read_pending.store(false, std::memory_order_release);
+        zone->read_dest_buf = nullptr;
+        zone->read_expected_offset = 0;
+        zone->read_expected_len = 0;
+        zone->lock.unlock();
+        release_zone(zone);
+        return;
+    }
+
+    if (resp->length > payload_len - sizeof(ZoneReadRespPayload) || !zone_read_response_matches_pending(*zone, *resp)) {
         zone->read_status = WKI_ERR_INVALID;
         zone->read_pending.store(false, std::memory_order_release);
-        if (zone->read_wait_entry != nullptr) {
-            wki_wake_op(zone->read_wait_entry, 0);
-        }
+        zone->read_dest_buf = nullptr;
+        zone->read_expected_offset = 0;
+        zone->read_expected_len = 0;
+        zone->lock.unlock();
+        finish_claimed_waiter(waiter, 0);
+        release_zone(zone);
         return;
     }
 
@@ -1022,9 +1413,12 @@ void handle_zone_read_resp(const WkiHeader* /*hdr*/, const uint8_t* payload, uin
     zone->read_result_len = resp->length;
     zone->read_status = 0;
     zone->read_pending.store(false, std::memory_order_release);
-    if (zone->read_wait_entry != nullptr) {
-        wki_wake_op(zone->read_wait_entry, 0);
-    }
+    zone->read_dest_buf = nullptr;
+    zone->read_expected_offset = 0;
+    zone->read_expected_len = 0;
+    zone->lock.unlock();
+    finish_claimed_waiter(waiter, 0);
+    release_zone(zone);
 }
 
 // -----------------------------------------------------------------------------
@@ -1038,14 +1432,13 @@ void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
 
     const auto* req = reinterpret_cast<const ZoneWriteReqPayload*>(payload);
 
-    s_zone_table_lock.lock();
-    WkiZone const* zone = find_zone_slot(req->zone_id);
-    s_zone_table_lock.unlock();
-
+    WkiZone* zone = acquire_zone_slot(req->zone_id);
     if (zone == nullptr || zone->state != ZoneState::ACTIVE) {
+        release_zone(zone);
         return;
     }
     if (zone->peer_node_id != hdr->src_node) {
+        release_zone(zone);
         return;
     }
 
@@ -1055,14 +1448,17 @@ void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         ack.zone_id = req->zone_id;
         ack.status = WKI_ERR_ZONE_ACCESS;
         wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_WRITE_ACK, &ack, sizeof(ack));
+        release_zone(zone);
         return;
     }
 
     // Validate data
-    if (sizeof(ZoneWriteReqPayload) + req->length > payload_len) {
+    if (req->length > payload_len - sizeof(ZoneWriteReqPayload)) {
+        release_zone(zone);
         return;
     }
-    if (req->offset + req->length > zone->size) {
+    if (req->length > WKI_ZONE_MAX_MSG_DATA || !zone_range_valid(req->offset, req->length, zone->size)) {
+        release_zone(zone);
         return;
     }
 
@@ -1074,28 +1470,43 @@ void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
     ack.zone_id = req->zone_id;
     ack.status = 0;  // success
     wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_WRITE_ACK, &ack, sizeof(ack));
+    release_zone(zone);
 }
 
-void handle_zone_write_ack(const WkiHeader* /*hdr*/, const uint8_t* payload, uint16_t payload_len) {
+void handle_zone_write_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
     if (payload_len < sizeof(ZoneWriteAckPayload)) {
         return;
     }
 
     const auto* ack = reinterpret_cast<const ZoneWriteAckPayload*>(payload);
+    WkiWaitEntry* waiter = nullptr;
 
-    s_zone_table_lock.lock();
-    WkiZone* zone = find_zone_slot(ack->zone_id);
-    s_zone_table_lock.unlock();
+    WkiZone* zone = acquire_zone_slot(ack->zone_id);
+    if (zone == nullptr) {
+        return;
+    }
 
-    if (zone == nullptr || !zone->write_pending.load(std::memory_order_acquire)) {
+    zone->lock.lock();
+    if (zone->peer_node_id != hdr->src_node || zone->retiring.load(std::memory_order_acquire) || zone->state != ZoneState::ACTIVE ||
+        !zone->write_pending.load(std::memory_order_acquire)) {
+        zone->lock.unlock();
+        release_zone(zone);
+        return;
+    }
+
+    waiter = claim_and_clear_waiter_locked(zone->write_wait_entry);
+    if (waiter == nullptr) {
+        zone->write_pending.store(false, std::memory_order_release);
+        zone->lock.unlock();
+        release_zone(zone);
         return;
     }
 
     zone->write_status = ack->status;
     zone->write_pending.store(false, std::memory_order_release);
-    if (zone->write_wait_entry != nullptr) {
-        wki_wake_op(zone->write_wait_entry, 0);
-    }
+    zone->lock.unlock();
+    finish_claimed_waiter(waiter, 0);
+    release_zone(zone);
 }
 
 }  // namespace detail

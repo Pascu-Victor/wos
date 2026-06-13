@@ -1254,7 +1254,9 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
         }
 
         // Output post-processing (OPOST)
-        if (((pair->termios.c_oflag & TIOS_OPOST) != 0U) && ((pair->termios.c_oflag & TIOS_ONLCR) != 0U) && ch == '\n') {
+        bool const EXPAND_NEWLINE =
+            ((pair->termios.c_oflag & TIOS_OPOST) != 0U) && ((pair->termios.c_oflag & TIOS_ONLCR) != 0U) && ch == '\n';
+        if (EXPAND_NEWLINE) {
             if ((OPEN_FLAGS & 04000) != 0) {
                 uint64_t const IRQF = pair->lock.lock_irqsave();
                 bool const HAS_SPACE = pair->s2m.space() >= 2;
@@ -1303,14 +1305,37 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
                     }
                 }
             }
-            uint8_t cr = '\r';
+
+            constexpr std::array<uint8_t, 2> CRLF = {'\r', '\n'};
             uint64_t const IRQF = pair->lock.lock_irqsave();
             bool const WAS_EMPTY = pair->s2m.available() == 0;
-            size_t const WR = pair->s2m.write(&cr, 1);
+            size_t const WR = pair->s2m.write(CRLF.data(), CRLF.size());
             pair->lock.unlock_irqrestore(IRQF);
             if (WR != 0 && (WAS_EMPTY || written == 0)) {
                 wake_master_output_available(pair);
             }
+
+            if (WR != CRLF.size()) {
+                if (written == 0) {
+                    return finish(-EAGAIN);
+                }
+                break;
+            }
+
+            written++;
+
+            // Prevent long-running writers from starving the scheduler when output
+            // arrives faster than the SSH/network side can consume it.
+            if ((written % PTY_WRITE_FAIR_YIELD_INTERVAL) == 0) {
+                if (current_task_has_deliverable_signal()) {
+                    goto wake_and_return;
+                }
+                ker::mod::sched::kern_yield();
+                if (current_task_has_deliverable_signal()) {
+                    goto wake_and_return;
+                }
+            }
+            continue;
         }
 
         if ((OPEN_FLAGS & 04000) != 0) {

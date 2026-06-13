@@ -22,6 +22,7 @@ namespace ker::net::wki {
 constexpr uint32_t WKI_DOORBELL_IPC_BASE = 0x00070000;  // doorbell value base for IPC primitives
 constexpr uint32_t WKI_DOORBELL_IPC_MASK = 0xFFFF0000;  // mask to identify IPC doorbells
 constexpr uint32_t WKI_IPC_RESOURCE_MASK = 0x0000FFFF;  // lower 16 bits = resource_id
+constexpr uint16_t WKI_IPC_OP_COOKIE_BYTES = sizeof(uint16_t);
 
 constexpr size_t WKI_IPC_MAX_EXPORTS = 64;
 constexpr size_t WKI_IPC_MAX_PROXIES = 64;
@@ -156,6 +157,8 @@ struct ProxyIpcState {
     // Protected by lock; only one in-flight control op per proxy at a time.
     WkiWaitEntry* pending_wait = nullptr;
     uint16_t pending_wait_op = 0;
+    uint16_t pending_wait_cookie = 0;
+    uint16_t next_wait_cookie = 1;
     int pending_wait_status = 0;
     static constexpr size_t SOCK_CTRL_RESP_MAX = 128;
     uint8_t pending_wait_resp[SOCK_CTRL_RESP_MAX] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
@@ -171,6 +174,25 @@ struct ProxyIpcState {
     ProxyIpcState(const ProxyIpcState&) = delete;
     auto operator=(const ProxyIpcState&) -> ProxyIpcState& = delete;
 };
+
+inline auto wki_ipc_allocate_wait_cookie_locked(ProxyIpcState* proxy) -> uint16_t {
+    if (proxy == nullptr) {
+        return 0;
+    }
+    uint16_t cookie = proxy->next_wait_cookie;
+    if (cookie == 0) {
+        cookie = 1;
+    }
+    proxy->next_wait_cookie = static_cast<uint16_t>(cookie + 1U);
+    if (proxy->next_wait_cookie == 0) {
+        proxy->next_wait_cookie = 1;
+    }
+    return cookie;
+}
+
+constexpr auto wki_ipc_response_matches_pending(uint16_t response_op, uint16_t response_cookie, const ProxyIpcState& proxy) -> bool {
+    return proxy.pending_wait != nullptr && proxy.pending_wait_op == response_op && proxy.pending_wait_cookie == response_cookie;
+}
 
 // -----------------------------------------------------------------------------
 // WkiIpcExport (server/home side) - per-exported IPC primitive
@@ -267,11 +289,40 @@ void wki_ipc_handle_dev_op_req(uint16_t src_node, uint16_t channel, const uint8_
 // DEV_OP response handler for IPC control ops
 void wki_ipc_handle_dev_op_resp(uint16_t src_node, uint16_t channel, const uint8_t* payload, uint16_t len);
 
+#ifdef WOS_SELFTEST
+auto wki_ipc_selftest_poll_state_response_refs() -> int;
+auto wki_ipc_selftest_export_compaction_frees() -> int;
+auto wki_ipc_selftest_cleanup_for_peer_drains_over_capacity() -> int;
+auto wki_ipc_selftest_cleanup_for_peer_drains_deferred_dev_ops() -> int;
+auto wki_ipc_selftest_poll_wake_drains_over_capacity() -> int;
+auto wki_ipc_selftest_inactive_proxy_poll_is_terminal() -> int;
+auto wki_ipc_selftest_epoll_close_releases_lookup_ref() -> int;
+auto wki_ipc_selftest_nonblocking_pipe_write_view_preserves_source_flags() -> int;
+auto wki_ipc_selftest_pipe_fd_flags_preserve_nonblocking_access_mode() -> int;
+auto wki_ipc_selftest_attach_insert_failure_preserves_existing_fd() -> int;
+auto wki_ipc_selftest_dev_op_response_cookie_fences_stale_completion() -> int;
+auto wki_ipc_selftest_dev_op_response_uses_home_node_identity() -> int;
+auto wki_ipc_selftest_dev_op_response_keeps_slot_busy_until_consumed() -> int;
+#endif
+
 // Cleanup all IPC exports/proxies for a fenced peer
 void wki_ipc_cleanup_for_peer(uint16_t node_id);
 
 // Shared proxy teardown helper for non-pipe proxy fops.
 void wki_ipc_detach_proxy_file(ker::vfs::File* f, ProxyIpcState* proxy);
+
+// Cancel a locally published proxy control waiter before the caller unwinds.
+// Safe when a send failed before wki_wait_for_op() started sleeping; if a
+// concurrent close/fence path already claimed the waiter, this waits until that
+// claim is fully published so the stack entry cannot be used after return.
+void wki_ipc_cancel_pending_wait(ProxyIpcState* proxy, WkiWaitEntry* wait, int result);
+
+// Consume side-band status/response data for a proxy control waiter that was
+// completed by a DEV_OP_RESP. The op/cookie slot remains busy until this call
+// clears it, preventing another control op from overwriting the response before
+// the original waiter reads it.
+auto wki_ipc_consume_pending_wait_response(ProxyIpcState* proxy, WkiWaitEntry* wait, uint16_t expected_op, uint16_t expected_cookie,
+                                           void* resp_buf, uint16_t resp_max, uint16_t* resp_len_out) -> int;
 
 // Shared proxy poll waiter helpers for pipe/socket/pty proxy fops.
 auto wki_ipc_proxy_register_poll_waiter(ProxyIpcState* proxy, uint64_t pid) -> bool;

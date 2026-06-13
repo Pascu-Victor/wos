@@ -1,6 +1,7 @@
 #include "mount.hpp"
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -38,15 +39,30 @@ auto path_is_under_root(const char* path, const char* root, size_t root_len) -> 
     return std::strncmp(path, root, root_len) == 0 && (path[root_len] == '/' || path[root_len] == '\0');
 }
 
-auto replace_mount_path_locked(MountPoint* mount, const char* new_path, size_t new_path_len) -> bool {
+auto mount_has_active_refs_locked(const MountPoint* mount) -> bool {
+    return mount != nullptr && mount->refs.load(std::memory_order_acquire) != 0;
+}
+
+auto retain_mount_locked(MountPoint* mount) -> bool {
+    if (mount == nullptr || mount->path == nullptr || mount->retiring.load(std::memory_order_acquire)) {
+        return false;
+    }
+    mount->refs.fetch_add(1, std::memory_order_acq_rel);
+    return true;
+}
+
+auto replace_mount_path_locked(MountPoint* mount, const char* new_path, size_t new_path_len) -> int {
+    if (mount_has_active_refs_locked(mount)) {
+        return -EBUSY;
+    }
     auto* replacement = new char[new_path_len + 1];
     if (replacement == nullptr) {
-        return false;
+        return -ENOMEM;
     }
     std::memcpy(replacement, new_path, new_path_len + 1);
     delete[] mount->path;
     mount->path = replacement;
-    return true;
+    return 0;
 }
 
 void destroy_mount(MountPoint* mount) {
@@ -58,7 +74,58 @@ void destroy_mount(MountPoint* mount) {
     delete mount;
 }
 
+void wait_for_mount_refs_to_drain(MountPoint* mount) {
+    if (mount == nullptr) {
+        return;
+    }
+    while (mount->refs.load(std::memory_order_acquire) != 0) {
+        if (ker::mod::sched::can_query_current_task()) {
+            ker::mod::sched::kern_yield();
+        } else {
+            asm volatile("pause" ::: "memory");
+        }
+    }
+}
+
 }  // namespace
+
+void put_mount_point(MountPoint* mount) {
+    if (mount == nullptr) {
+        return;
+    }
+    uint32_t const OLD_REFS = mount->refs.fetch_sub(1, std::memory_order_acq_rel);
+    if (OLD_REFS == 0) {
+        mount->refs.store(0, std::memory_order_release);
+    }
+}
+
+auto MountRef::operator=(MountRef&& other) noexcept -> MountRef& {
+    if (this != &other) {
+        put_mount_point(mount_);
+        mount_ = other.mount_;
+        other.mount_ = nullptr;
+    }
+    return *this;
+}
+
+MountRef::~MountRef() { reset(); }
+
+void MountRef::reset(MountPoint* mount) {
+    if (mount_ == mount) {
+        return;
+    }
+    put_mount_point(mount_);
+    mount_ = mount;
+}
+
+#ifdef WOS_SELFTEST
+auto mount_point_ref_count_for_test(const MountPoint* mount) -> uint32_t {
+    if (mount == nullptr) {
+        return 0;
+    }
+    return mount->refs.load(std::memory_order_acquire);
+}
+#endif
 
 // Resolve path through current task's root prefix so mount paths are stored
 // in the same namespace that find_mount_point receives from resolve_task_path_raw.
@@ -147,7 +214,6 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     mount->device = device;
     mount->private_data = nullptr;
     mount->fops = nullptr;
-    mount->dev_id = next_dev_id++;
 
     // Initialize the appropriate filesystem
     if (std::strcmp(fstype, "fat32") == 0 || std::strcmp(fstype, "vfat") == 0) {
@@ -223,13 +289,16 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         return -ENODEV;
     }
 
+    size_t mount_count_after_insert = 0;
     mount_lock.lock();
+    mount->dev_id = next_dev_id++;
     if (!mounts.push_back(mount)) {
         mount_lock.unlock();
         vfs_debug_log("mount_filesystem: mount table full (OOM)\n");
         destroy_mount(mount);
         return -ENOMEM;
     }
+    mount_count_after_insert = mounts.size();
     mount_lock.unlock();
 
     vfs_debug_log("mount_filesystem: mounted ");
@@ -239,7 +308,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     vfs_debug_log("\n");
 
     ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::MOUNT_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_INSERT,
-                                          static_cast<int64_t>(mounts.size()), 0, 0);
+                                          static_cast<int64_t>(mount_count_after_insert), 0, 0);
 
     // Emit WKI storage mount event (if WKI is active)
     if (ker::net::wki::g_wki.initialized) {
@@ -265,12 +334,16 @@ auto unmount_filesystem(const char* path) -> int {
     for (size_t i = 0; i < mounts.size(); ++i) {
         MountPoint* mp = mounts.at(i);
         if (mp != nullptr && mp->path != nullptr && std::strcmp(resolved.data(), mp->path) == 0) {
-            destroy_mount(mp);
+            mp->retiring.store(true, std::memory_order_release);
             mounts.remove_at(i);
+            size_t const MOUNT_COUNT_AFTER_REMOVE = mounts.size();
             mount_lock.unlock();
 
+            wait_for_mount_refs_to_drain(mp);
+            destroy_mount(mp);
+
             ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::MOUNT_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
-                                                  static_cast<int64_t>(mounts.size()), 0, 0);
+                                                  static_cast<int64_t>(MOUNT_COUNT_AFTER_REMOVE), 0, 0);
 
             vfs_debug_log("unmount_filesystem: unmounted ");
             vfs_debug_log(path);
@@ -289,9 +362,9 @@ auto unmount_filesystem(const char* path) -> int {
     return -ENOENT;
 }
 
-auto find_mount_point(const char* path) -> MountPoint* {
+auto find_mount_point(const char* path) -> MountRef {
     if (path == nullptr) {
-        return nullptr;
+        return MountRef{};
     }
 
     // Find the longest matching mount point
@@ -331,9 +404,12 @@ auto find_mount_point(const char* path) -> MountPoint* {
             }
         }
     }
+    if (best_match != nullptr && !retain_mount_locked(best_match)) {
+        best_match = nullptr;
+    }
     mount_lock.unlock();
 
-    return best_match;
+    return MountRef{best_match};
 }
 
 auto configure_mount_point_exact(const char* path, FSType expected_type, void* private_data, FileOperations* fops) -> bool {
@@ -391,9 +467,29 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int {
         return -EINVAL;
     }
 
-    if (old_root_mount != nullptr && !replace_mount_path_locked(old_root_mount, put_old, PUT_OLD_LEN)) {
+    if (old_root_mount != nullptr && mount_has_active_refs_locked(old_root_mount)) {
         mount_lock.unlock();
-        return -ENOMEM;
+        return -EBUSY;
+    }
+    for (auto* mp : mounts) {
+        if (mp == nullptr || mp->path == nullptr || mp == new_mount) {
+            continue;
+        }
+        if (path_is_under_root(mp->path, new_root, NEW_ROOT_LEN)) {
+            continue;
+        }
+        if (mount_has_active_refs_locked(mp)) {
+            mount_lock.unlock();
+            return -EBUSY;
+        }
+    }
+
+    if (old_root_mount != nullptr) {
+        int const REPLACE_RET = replace_mount_path_locked(old_root_mount, put_old, PUT_OLD_LEN);
+        if (REPLACE_RET < 0) {
+            mount_lock.unlock();
+            return REPLACE_RET;
+        }
     }
 
     for (auto* mp : mounts) {
@@ -439,6 +535,9 @@ void rebase_wki_mounts_for_new_root(const char* new_root) {
         if (path_is_under_root(mp->path, new_root, NEW_ROOT_LEN)) {
             continue;
         }
+        if (mount_has_active_refs_locked(mp)) {
+            continue;
+        }
 
         size_t const MP_LEN = std::strlen(mp->path);
         auto* remapped = new char[NEW_ROOT_LEN + MP_LEN + 1];
@@ -462,15 +561,18 @@ auto get_mount_count() -> size_t {
     return COUNT;
 }
 
-auto get_mount_at(size_t index) -> MountPoint* {
+auto get_mount_at(size_t index) -> MountRef {
     mount_lock.lock();
     if (index >= mounts.size()) {
         mount_lock.unlock();
-        return nullptr;
+        return MountRef{};
     }
     MountPoint* mp = mounts.at(index);
+    if (!retain_mount_locked(mp)) {
+        mp = nullptr;
+    }
     mount_lock.unlock();
-    return mp;
+    return MountRef{mp};
 }
 
 auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool {
@@ -499,6 +601,12 @@ auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool {
     std::memcpy(static_cast<void*>(out->path), mp->path, PATH_LEN + 1);
     out->fs_type = mp->fs_type;
     out->dev_id = mp->dev_id;
+    if (mp->fstype != nullptr) {
+        size_t const FSTYPE_LEN = std::strlen(mp->fstype);
+        size_t const COPY_LEN = (FSTYPE_LEN < MOUNT_FSTYPE_MAX) ? FSTYPE_LEN : MOUNT_FSTYPE_MAX - 1;
+        std::memcpy(static_cast<void*>(out->fstype), mp->fstype, COPY_LEN);
+        out->fstype[COPY_LEN] = '\0';
+    }
 
     mount_lock.unlock();
     return true;

@@ -25,9 +25,9 @@ constexpr uint32_t WKI_DEV_PROXY_MAX_BATCH = 32;            // max SQEs per batc
 // -----------------------------------------------------------------------------
 
 struct ProxyBlockState {
-    bool active = false;
-    bool fenced = false;         // peer is fenced - ops should block and wait for reconnection
-    uint64_t fence_time_us = 0;  // timestamp when fenced (for timeout-based teardown)
+    std::atomic<bool> active{false};
+    std::atomic<bool> fenced{false};  // peer is fenced - ops should block and wait for reconnection
+    uint64_t fence_time_us = 0;       // timestamp when fenced (for timeout-based teardown)
     uint16_t owner_node = WKI_NODE_INVALID;
     uint16_t assigned_channel = 0;
     uint32_t resource_id = 0;
@@ -35,6 +35,8 @@ struct ProxyBlockState {
 
     // Synchronous blocking for DEV_OP_RESP
     std::atomic<bool> op_pending{false};
+    uint16_t op_expected_id = 0;
+    uint16_t op_expected_seq = 0;
     int16_t op_status = 0;
     void* op_resp_buf = nullptr;
     uint16_t op_resp_len = 0;
@@ -46,6 +48,7 @@ struct ProxyBlockState {
     uint8_t attach_status = 0;
     uint16_t attach_channel = 0;
     uint16_t attach_max_op_size = 0;
+    uint8_t attach_expected_cookie = 0;
     WkiWaitEntry* attach_wait_entry = nullptr;  // V2 I-4: async wait for DEV_ATTACH_ACK
 
     // RDMA block ring state (Phase 3: shared memory SQ/CQ for block I/O)
@@ -153,6 +156,8 @@ auto wki_dev_proxy_bulk_read(dev::BlockDevice* bdev, uint64_t lba, uint32_t bloc
 // RDMA read by server from consumer staging buffer.
 // Returns 0 on success, negative on error (or if bulk not supported).
 auto wki_dev_proxy_bulk_write(dev::BlockDevice* bdev, uint64_t lba, uint32_t block_count, const void* buffer) -> int;
+
+auto wki_dev_proxy_selftest_attach_ack_cookie_fences_stale_completion() -> bool;
 
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers (called from wki.cpp dispatch)

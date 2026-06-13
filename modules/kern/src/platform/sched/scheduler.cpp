@@ -27,6 +27,7 @@
 #include "platform/dbg/dbg.hpp"
 #include "platform/interrupt/gates.hpp"
 #include "platform/interrupt/gdt.hpp"
+#include "platform/interrupt/idt.hpp"
 #include "platform/ktime/ktime.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
@@ -346,6 +347,10 @@ inline bool is_low_latency_handoff_wait_channel(const char* wait_channel) {
     return is_local_pipe_wait_channel(wait_channel) || (wait_channel != nullptr && std::strcmp(wait_channel, "waitpid") == 0);
 }
 
+inline bool is_futex_wait_channel(const char* wait_channel) {
+    return wait_channel != nullptr && std::strcmp(wait_channel, "futex_wait") == 0;
+}
+
 inline void note_task_wakeup(task::Task* task, uint64_t now_us, const char* wait_channel) {
     if (task->last_sleep_start_us != 0 && now_us > task->last_sleep_start_us) {
         uint64_t const SLEEP_US = now_us - task->last_sleep_start_us;
@@ -617,7 +622,7 @@ constexpr bool K_ENABLE_SCHED_OWNER_SCAN_FALLBACK = true;
 
 void request_local_reschedule();
 
-inline auto current_task_for_preempt() -> task::Task* {
+[[clang::no_sanitize("kernel-address")]] inline auto current_task_for_preempt() -> task::Task* {
     if (!can_query_current_task()) {
         return nullptr;
     }
@@ -1889,7 +1894,7 @@ auto migrate_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool { return
 
 auto pin_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool { return move_task_owner_to_cpu(task, target_cpu, true).moved; }
 
-auto can_query_current_task() -> bool {
+[[clang::no_sanitize("kernel-address")]] auto can_query_current_task() -> bool {
     if (run_queues == nullptr) {
         return false;
     }
@@ -1938,7 +1943,7 @@ void resume_syscall_accounting() {
     task->syscall_account_start_us = time::get_us();
 }
 
-auto preempt_disable_token_at(uint64_t caller) -> task::Task* {
+[[clang::no_sanitize("kernel-address")]] auto preempt_disable_token_at(uint64_t caller) -> task::Task* {
     auto* task = current_task_for_preempt();
     if (task == nullptr) {
         return nullptr;
@@ -1952,20 +1957,24 @@ auto preempt_disable_token_at(uint64_t caller) -> task::Task* {
     return task;
 }
 
-void preempt_disable_at(uint64_t caller) { (void)preempt_disable_token_at(caller); }
+[[clang::no_sanitize("kernel-address")]] void preempt_disable_at(uint64_t caller) { (void)preempt_disable_token_at(caller); }
 
-void preempt_disable() { preempt_disable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0))); }
+[[clang::no_sanitize("kernel-address")]] void preempt_disable() {
+    preempt_disable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+}
 
-void preempt_enable_token_at(task::Task* task, uint64_t caller) {
+[[clang::no_sanitize("kernel-address")]] void preempt_enable_token_at(task::Task* task, uint64_t caller) {
     if (task == nullptr) {
         return;
     }
 
     if (task->preempt_disable_depth == 0) {
-        uint64_t const COUNT = g_preempt_block_warnings.fetch_add(1, std::memory_order_relaxed);
-        if ((COUNT & 0xffULL) == 0) {
-            preempt_log::warn("preempt_enable without disable: pid=%lu caller=0x%llx rip=0x%llx", task->pid,
-                              static_cast<unsigned long long>(caller), static_cast<unsigned long long>(task->context.frame.rip));
+        if (desc::idt::is_idt_ready()) {
+            uint64_t const COUNT = g_preempt_block_warnings.fetch_add(1, std::memory_order_relaxed);
+            if ((COUNT & 0xffULL) == 0) {
+                preempt_log::warn("preempt_enable without disable: pid=%lu caller=0x%llx rip=0x%llx", task->pid,
+                                  static_cast<unsigned long long>(caller), static_cast<unsigned long long>(task->context.frame.rip));
+            }
         }
         return;
     }
@@ -1993,20 +2002,28 @@ void preempt_enable_token_at(task::Task* task, uint64_t caller) {
     }
 }
 
-void preempt_enable_at(uint64_t caller) { preempt_enable_token_at(current_task_for_preempt(), caller); }
+[[clang::no_sanitize("kernel-address")]] void preempt_enable_at(uint64_t caller) {
+    preempt_enable_token_at(current_task_for_preempt(), caller);
+}
 
-void preempt_enable() { preempt_enable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0))); }
+[[clang::no_sanitize("kernel-address")]] void preempt_enable() {
+    preempt_enable_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+}
 
-auto preempt_count() -> uint32_t {
+[[clang::no_sanitize("kernel-address")]] auto preempt_count() -> uint32_t {
     auto* task = current_task_for_preempt();
     return task != nullptr ? task->preempt_disable_depth : 0;
 }
 
-auto preemptible() -> bool { return preempt_count() == 0; }
+[[clang::no_sanitize("kernel-address")]] auto preemptible() -> bool { return preempt_count() == 0; }
 
-void note_preempt_disabled_block(const char* op, uint64_t perf_callsite) {
+[[clang::no_sanitize("kernel-address")]] void note_preempt_disabled_block(const char* op, uint64_t perf_callsite) {
     auto* task = current_task_for_preempt();
     if (task == nullptr || task->preempt_disable_depth == 0) {
+        return;
+    }
+
+    if (!desc::idt::is_idt_ready()) {
         return;
     }
 
@@ -2197,10 +2214,13 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
     // Also arm ITIMER_REAL for blocked tasks so signal-driven interfaces
     // like ping can wake from a blocking recvfrom().
     PendingWakeList signal_wake{};
+    PendingWakeList futex_timeout_cleanup{};
     uint32_t signal_wake_count = 0;
+    uint32_t futex_timeout_cleanup_count = 0;
     {
         uint64_t const NOW_US = time::get_us();
-        run_queues->this_cpu_locked_void([NOW_US, &signal_wake, &signal_wake_count](RunQueue* rq) {
+        run_queues->this_cpu_locked_void([NOW_US, &signal_wake, &signal_wake_count, &futex_timeout_cleanup,
+                                          &futex_timeout_cleanup_count](RunQueue* rq) {
             if (rq->next_wait_deadline_us == 0 || NOW_US < rq->next_wait_deadline_us) {
                 return;
             }
@@ -2236,6 +2256,12 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                 w->just_woke = !LOW_LATENCY_HANDOFF;
                 // Perf: record wakeup before clearing wakeAtUs
                 uint64_t const WAKE_AT_US = w->wake_at_us;
+                bool const FUTEX_TIMEOUT = w->wait_channel != nullptr && strcmp(w->wait_channel, "futex_wait") == 0 &&
+                                           w->futex_waiter.load(std::memory_order_acquire) != nullptr;
+                if (FUTEX_TIMEOUT) {
+                    w->context.regs.rax = static_cast<uint64_t>(-ETIMEDOUT);
+                    pending_wake_slot(futex_timeout_cleanup, futex_timeout_cleanup_count++) = w;
+                }
                 perf::record_wake(static_cast<uint32_t>(cpu::current_cpu()), w->pid, WAKE_AT_US, perf_wake_flags(WAKE_AT_US, false, false),
                                   observed_sleep_us(w, NOW_US), perf_wait_callsite(w), w->wait_channel);
                 w->wake_at_us = 0;
@@ -2259,6 +2285,9 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             }
             recompute_wait_deadline_locked(rq);
         });
+    }
+    for (uint32_t i = 0; i < futex_timeout_cleanup_count; ++i) {
+        ker::syscall::futex::futex_wait_cleanup_for_task(pending_wake_slot(futex_timeout_cleanup, i));
     }
     for (uint32_t i = 0; i < signal_wake_count; ++i) {
         wake_task_for_signal(pending_wake_slot(signal_wake, i));
@@ -2947,7 +2976,19 @@ void start_scheduler() {
 // so we must handle signals here for tasks woken from the wait queue.
 // Called with GS and pagemap already switched to `task`.
 namespace {
-void check_pending_signals_deferred(task::Task* task) {
+constexpr uint64_t WOS_SIG_DFL = 0;
+constexpr uint64_t WOS_SIG_IGN = 1;
+
+enum class DeferredSignalDelivery : uint8_t {
+    FULL,
+    USER_HANDLERS_ONLY,
+};
+
+inline auto is_user_signal_handler(task::Task::SigHandler const& handler) -> bool {
+    return handler.handler != WOS_SIG_DFL && handler.handler != WOS_SIG_IGN;
+}
+
+void check_pending_signals_deferred(task::Task* task, DeferredSignalDelivery delivery) {
     if (task->type != task::TaskType::PROCESS) {
         return;
     }
@@ -2972,11 +3013,15 @@ void check_pending_signals_deferred(task::Task* task) {
 
     int const SIGNO = __builtin_ctzll(DELIVERABLE) + 1;
     auto idx = static_cast<unsigned>(SIGNO - 1);
-    task->sig_pending &= ~(1ULL << idx);
-
     auto& handler = signal_handler_slot(*task, idx);
 
-    if (handler.handler == 0 /*SIG_DFL*/) {
+    if (delivery == DeferredSignalDelivery::USER_HANDLERS_ONLY && !is_user_signal_handler(handler)) {
+        return;
+    }
+
+    task->sig_pending &= ~(1ULL << idx);
+
+    if (handler.handler == WOS_SIG_DFL) {
         // Signals with default-ignore action: SIGCHLD, SIGURG, SIGWINCH, SIGCONT
         if (SIGNO == 17 || SIGNO == 23 || SIGNO == 28 || SIGNO == 18) {
             if (task->sigsuspend_active) {
@@ -2995,7 +3040,7 @@ void check_pending_signals_deferred(task::Task* task) {
         __builtin_unreachable();
     }
 
-    if (handler.handler == 1 /*SIG_IGN*/) {
+    if (handler.handler == WOS_SIG_IGN) {
         if (task->sigsuspend_active) {
             task->sig_mask = task->signal_frame_saved_mask();
         }
@@ -3089,13 +3134,30 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     current_task->context.frame.rsp = user_rsp;
     current_task->context.frame.ss = desc::gdt::GDT_USER_DS;
     validate_user_resume_target(current_task, "deferred-save-current");
+    current_task->waitpid_publish_pending.store(false, std::memory_order_release);
 
     // Save outgoing task's FPU/SSE/AVX state
     sys::context_switch::save_fpu_state(current_task);
 
     bool const IS_YIELD = current_task->yield_switch;
     current_task->yield_switch = false;
-    current_task->deferred_task_switch = false;
+    static constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
+
+    auto unlink_specific_waitpid_waiter = [&]() {
+        uint64_t const WAIT_TARGET = current_task->waiting_for_pid;
+        if (WAIT_TARGET == 0 || WAIT_TARGET == WAIT_ANY_CHILD) {
+            return;
+        }
+
+        auto* target = find_task_by_pid(WAIT_TARGET);
+        if (target == nullptr) {
+            return;
+        }
+
+        uint64_t const WAITER_LOCK_FLAGS = target->exit_waiters_lock.lock_irqsave();
+        (void)target->awaitee_on_exit.remove(current_task->pid);
+        target->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
+    };
 
     // Signal race check: if a deliverable signal is already pending, do not
     // move this task to wait queue; resume userspace with EINTR.
@@ -3104,16 +3166,21 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         if (current_task->has_interrupting_signal_pending()) {
             skip_wait_queue = true;
             current_task->context.regs.rax = static_cast<uint64_t>(-EINTR);
+            unlink_specific_waitpid_waiter();
+            task::task_clear_waitpid_block_state(*current_task);
         }
     }
+    current_task->deferred_task_switch = false;
 
     // Race check: for blocking waits, verify target hasn't already exited
-    static constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
     if (!IS_YIELD && current_task->waiting_for_pid != 0) {
         if (current_task->waiting_for_pid == WAIT_ANY_CHILD) {
             auto try_reap_wait_any_child = [&](task::Task* child, const char* path) -> bool {
                 if (child == nullptr || child->is_thread || child->parent_pid != current_task->pid ||
-                    !child->exit_notify_ready.load(std::memory_order_acquire) || !child->has_exited || child->waited_on) {
+                    !child->exit_notify_ready.load(std::memory_order_acquire) || !child->has_exited || task::task_waited_on(*child)) {
+                    return false;
+                }
+                if (!task::task_try_mark_waited_on(*child)) {
                     return false;
                 }
 
@@ -3142,7 +3209,6 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                     current_task->wait_rusage_phys_addr = 0;
                 }
                 current_task->waiting_for_pid = 0;
-                child->waited_on = true;
                 return true;
             };
 
@@ -3202,41 +3268,48 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             }
             if (target != nullptr && target->exit_notify_ready.load(std::memory_order_acquire) && target->has_exited) {
                 skip_wait_queue = true;
-                current_task->context.regs.rax = target->pid;
-                validate_wait_resume_mapping(current_task, target, "sched-specific");
-                if (current_task->wait_status_user_addr != 0 && current_task->pagemap != nullptr) {
-                    uint64_t const STATUS_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_status_user_addr);
-                    if (STATUS_PHYS != mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
-                        auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(STATUS_PHYS));
-                        *status_ptr = target->exit_status;
+                if (task::task_try_mark_waited_on(*target)) {
+                    current_task->context.regs.rax = target->pid;
+                    validate_wait_resume_mapping(current_task, target, "sched-specific");
+                    if (current_task->wait_status_user_addr != 0 && current_task->pagemap != nullptr) {
+                        uint64_t const STATUS_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_status_user_addr);
+                        if (STATUS_PHYS != mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
+                            auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(STATUS_PHYS));
+                            *status_ptr = target->exit_status;
+                        }
+                        current_task->wait_status_user_addr = 0;
+                        current_task->wait_status_phys_addr = 0;
                     }
+                    if (current_task->wait_rusage_user_addr != 0 && current_task->pagemap != nullptr) {
+                        uint64_t const RUSAGE_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_rusage_user_addr);
+                        if (RUSAGE_PHYS != mm::virt::PADDR_INVALID && RUSAGE_PHYS != 0) {
+                            auto* ru = reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(RUSAGE_PHYS));
+                            ru->ru_utime_sec = static_cast<int64_t>(target->user_time_us / 1000000ULL);
+                            ru->ru_utime_usec = static_cast<int64_t>(target->user_time_us % 1000000ULL);
+                            ru->ru_stime_sec = static_cast<int64_t>(target->system_time_us / 1000000ULL);
+                            ru->ru_stime_usec = static_cast<int64_t>(target->system_time_us % 1000000ULL);
+                        }
+                        current_task->wait_rusage_user_addr = 0;
+                        current_task->wait_rusage_phys_addr = 0;
+                    }
+                } else {
+                    current_task->context.regs.rax = static_cast<uint64_t>(-ECHILD);
                     current_task->wait_status_user_addr = 0;
                     current_task->wait_status_phys_addr = 0;
-                }
-                if (current_task->wait_rusage_user_addr != 0 && current_task->pagemap != nullptr) {
-                    uint64_t const RUSAGE_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_rusage_user_addr);
-                    if (RUSAGE_PHYS != mm::virt::PADDR_INVALID && RUSAGE_PHYS != 0) {
-                        auto* ru = reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(RUSAGE_PHYS));
-                        ru->ru_utime_sec = static_cast<int64_t>(target->user_time_us / 1000000ULL);
-                        ru->ru_utime_usec = static_cast<int64_t>(target->user_time_us % 1000000ULL);
-                        ru->ru_stime_sec = static_cast<int64_t>(target->system_time_us / 1000000ULL);
-                        ru->ru_stime_usec = static_cast<int64_t>(target->system_time_us % 1000000ULL);
-                    }
                     current_task->wait_rusage_user_addr = 0;
                     current_task->wait_rusage_phys_addr = 0;
                 }
                 current_task->waiting_for_pid = 0;
-                // Mark that parent has retrieved exit status (zombie can now be reaped)
-                target->waited_on = true;
             }
         }
     }
 
     bool notify_wki_proxy_blocked = false;
+    task::Task* futex_abort_cleanup_task = nullptr;
 
     // Under lock: update EEVDF state and pick next task
-    task::Task* next_task =
-        run_queues->this_cpu_locked([current_task, IS_YIELD, skip_wait_queue, &notify_wki_proxy_blocked](RunQueue* rq) -> task::Task* {
+    task::Task* next_task = run_queues->this_cpu_locked(
+        [current_task, IS_YIELD, skip_wait_queue, &notify_wki_proxy_blocked, &futex_abort_cleanup_task](RunQueue* rq) -> task::Task* {
             // Account for time used during syscall
             uint64_t const NOW_US = time::get_us();
             auto delta_us = static_cast<int64_t>(NOW_US - rq->last_tick_us);
@@ -3272,10 +3345,15 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             }
 
             if (IS_YIELD || skip_wait_queue || woke) {
+                if (is_futex_wait_channel(current_task->wait_channel) && current_task->has_interrupting_signal_pending()) {
+                    current_task->context.regs.rax = static_cast<uint64_t>(-EINTR);
+                }
+
                 // A signal or concurrent wake can abort a futex block after the
-                // waiter node has already been published. Detach it here so a
-                // later futex_wait() does not keep replacing stale nodes.
-                ker::syscall::futex::futex_wait_cleanup_for_task(current_task);
+                // waiter node has already been published. Defer detaching it
+                // until after the runqueue lock drops; cleanup takes futex
+                // bucket locks and must not run inside scheduler locking.
+                futex_abort_cleanup_task = current_task;
 
                 // Yield / target already exited / concurrent wakeup: task stays in heap with fresh deadline
                 if (rq->runnable_heap.contains(current_task)) {
@@ -3325,6 +3403,10 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             reserve_handoff_task_locked(rq, next, time::get_us());
             return next;
         });
+
+    if (futex_abort_cleanup_task != nullptr) {
+        ker::syscall::futex::futex_wait_cleanup_for_task(futex_abort_cleanup_task);
+    }
 
     if (notify_wki_proxy_blocked) {
         ker::net::wki::wki_proxy_task_blocked(current_task);
@@ -3476,7 +3558,9 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
 
     validate_kernel_resume_target(next_task, "deferred-resume-next");
     if (next_task == get_current_task()) {
-        check_pending_signals_deferred(next_task);
+        check_pending_signals_deferred(next_task, DeferredSignalDelivery::FULL);
+    } else if (next_task == get_return_task()) {
+        check_pending_signals_deferred(next_task, DeferredSignalDelivery::USER_HANDLERS_ONLY);
     }
 
     // Restore incoming task's FPU/SSE/AVX state (PROCESS tasks only).
@@ -3948,8 +4032,16 @@ void wake_task_for_signal(task::Task* task) {
     // If the task is blocked or sleeping in a syscall path, put it back on
     // a runnable queue so it can process pending signals promptly.
     if (task->sched_queue == task::Task::sched_queue::WAITING || task->deferred_task_switch || task->is_voluntary_blocked()) {
-        if (task->wait_channel != nullptr && strcmp(task->wait_channel, "sigsuspend") == 0) {
+        bool const HAS_FUTEX_WAITER = task->futex_waiter.load(std::memory_order_acquire) != nullptr;
+        bool const MAY_INTERRUPT_FUTEX = is_futex_wait_channel(task->wait_channel) || HAS_FUTEX_WAITER;
+        bool const HAS_INTERRUPTING_SIGNAL = MAY_INTERRUPT_FUTEX && task->has_interrupting_signal_pending();
+        bool const INTERRUPTS_WAIT = (task->wait_channel != nullptr && strcmp(task->wait_channel, "sigsuspend") == 0) ||
+                                     (MAY_INTERRUPT_FUTEX && HAS_INTERRUPTING_SIGNAL);
+        if (INTERRUPTS_WAIT) {
             task->context.regs.rax = static_cast<uint64_t>(-EINTR);
+        }
+        if (HAS_FUTEX_WAITER && HAS_INTERRUPTING_SIGNAL) {
+            ker::syscall::futex::futex_wait_cleanup_for_task(task);
         }
 
         // Use the least-loaded CPU to avoid piling daemon wakeups onto CPUs
@@ -4250,7 +4342,7 @@ auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no) -> GcDet
         // need to pin the full address space or kernel stack while waiting for
         // waitpid. Reclaim those heavy resources once the epoch/current-task
         // guards above prove the task is no longer executing.
-        if (cur->has_exited && !cur->waited_on && !cur->is_thread) {
+        if (cur->has_exited && !task::task_waited_on(*cur) && !cur->is_thread) {
             if (cur->parent_pid != 0) {
                 auto* parent = find_task_by_pid(cur->parent_pid);
                 if (parent != nullptr && parent->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE) {

@@ -39,4 +39,10 @@ void wki_timer_thread_start();
 // Wake the timer thread after arming earlier retransmit/ACK/timeout work.
 void wki_timer_notify();
 
+#ifdef WOS_SELFTEST
+auto wki_peer_selftest_hello_ack_state_transition() -> bool;
+auto wki_peer_selftest_hello_epoch_words_are_independent() -> bool;
+auto wki_peer_selftest_remote_boot_epoch_detects_restart() -> bool;
+#endif
+
 }  // namespace ker::net::wki

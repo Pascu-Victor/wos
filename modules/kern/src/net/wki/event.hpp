@@ -30,6 +30,45 @@ constexpr uint16_t EVENT_ZONE_DESTROYED = 0x0002;
 // Wildcard matching
 constexpr uint16_t EVENT_WILDCARD = 0xFFFF;
 
+// Event payloads are kept intentionally small so they can be logged, replayed,
+// and retransmitted from fixed kernel buffers.
+constexpr uint16_t WKI_EVENT_DATA_MAX = 256;
+
+struct WkiEventPayloadSize {
+    uint16_t data_len = 0;
+    uint16_t total_len = 0;
+    bool truncated = false;
+};
+
+constexpr auto wki_event_payload_size(uint16_t requested_data_len) -> WkiEventPayloadSize {
+    uint16_t const DATA_LEN = requested_data_len > WKI_EVENT_DATA_MAX ? WKI_EVENT_DATA_MAX : requested_data_len;
+    return WkiEventPayloadSize{
+        .data_len = DATA_LEN,
+        .total_len = static_cast<uint16_t>(sizeof(EventPublishPayload) + DATA_LEN),
+        .truncated = DATA_LEN != requested_data_len,
+    };
+}
+
+constexpr auto wki_event_filter_matches(uint16_t filter_class, uint16_t filter_id, uint16_t event_class, uint16_t event_id) -> bool {
+    if (filter_class != EVENT_WILDCARD && filter_class != event_class) {
+        return false;
+    }
+    if (filter_id != EVENT_WILDCARD && filter_id != event_id) {
+        return false;
+    }
+    return true;
+}
+
+constexpr auto wki_event_ack_matches(uint16_t pending_subscriber_node, uint16_t ack_sender_node, uint16_t pending_event_class,
+                                     uint16_t pending_event_id, uint16_t pending_origin_node, const EventAckPayload& ack) -> bool {
+    return pending_subscriber_node == ack_sender_node && pending_event_class == ack.event_class && pending_event_id == ack.event_id &&
+           pending_origin_node == ack.origin_node;
+}
+
+constexpr auto wki_event_ack_should_record_perf(uint32_t correlation, bool recording_enabled) -> bool {
+    return correlation != 0 && recording_enabled;
+}
+
 // -----------------------------------------------------------------------------
 // Subscription - tracks which remote nodes want events from us
 // -----------------------------------------------------------------------------
@@ -87,6 +126,10 @@ void wki_event_timer_tick(uint64_t now_us);
 // Earliest retry deadline for reliable events, or UINT64_MAX when no reliable
 // event retry is pending.
 auto wki_event_next_timer_deadline_us(uint64_t now_us) -> uint64_t;
+
+#ifdef WOS_SELFTEST
+auto wki_event_selftest_ack_removes_single_matching_pending() -> bool;
+#endif
 
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers (called from wki.cpp dispatch)

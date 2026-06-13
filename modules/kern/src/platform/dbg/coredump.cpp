@@ -846,7 +846,7 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     req.task_flags |= task->is_elf_buffer_shared ? TASK_FLAG_IS_ELF_BUFFER_SHARED : 0;
     req.task_flags |= task->has_run ? TASK_FLAG_HAS_RUN : 0;
     req.task_flags |= task->has_exited ? TASK_FLAG_HAS_EXITED : 0;
-    req.task_flags |= task->waited_on ? TASK_FLAG_WAITED_ON : 0;
+    req.task_flags |= ker::mod::sched::task::task_waited_on(*task) ? TASK_FLAG_WAITED_ON : 0;
     req.task_flags |= task->deferred_task_switch ? TASK_FLAG_DEFERRED_TASK_SWITCH : 0;
     req.task_flags |= task->yield_switch ? TASK_FLAG_YIELD_SWITCH : 0;
     req.task_flags |= task->is_voluntary_blocked() ? TASK_FLAG_VOLUNTARY_BLOCK : 0;

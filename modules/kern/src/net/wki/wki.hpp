@@ -205,6 +205,7 @@ struct WkiPeer {
     // duplicate.
     uint32_t local_channel_epoch = 0;
     uint32_t remote_channel_epoch = 0;
+    uint32_t remote_boot_epoch = 0;
 
     // HELLO retry
     uint64_t hello_sent_time = 0;
@@ -262,6 +263,7 @@ struct WkiChannel {
     uint16_t peer_node_id = WKI_NODE_INVALID;
     PriorityClass priority = PriorityClass::LATENCY;
     bool active = false;
+    uint32_t generation = 0;  // Incremented on each pool-slot allocation.
 
     // Reliability (seq/ack)
     uint32_t tx_seq = 0;           // next seq to send
@@ -376,6 +378,7 @@ struct WkiState {
     uint16_t capabilities = 0;
     uint16_t max_channels = WKI_MAX_CHANNELS;
     uint32_t rdma_zone_bitmap = 0;
+    uint32_t local_boot_epoch = 1;
 
     // LSA state
     uint32_t my_lsa_seq = 0;
@@ -453,6 +456,9 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len);
 // Find or create a well-known channel to a peer
 auto wki_channel_get(uint16_t peer_node, uint16_t channel_id) -> WkiChannel*;
 
+// Find an existing channel to a peer without allocating a pool slot.
+auto wki_channel_lookup(uint16_t peer_node, uint16_t channel_id) -> WkiChannel*;
+
 // Allocate a dynamic channel to a peer
 auto wki_channel_alloc(uint16_t peer_node, PriorityClass priority) -> WkiChannel*;
 
@@ -526,11 +532,11 @@ struct WkiWaitEntry {
         DONE = 2,
     };
 
-    ker::mod::sched::task::Task* task = nullptr;  // The task that is waiting
-    std::atomic<uint8_t> state{PENDING};          // Result writer ownership/state
-    int result = 0;                               // Operation result code
-    uint64_t deadline_us = 0;                     // Timeout deadline (0 = no timeout)
-    WkiWaitEntry* next = nullptr;                 // Intrusive linked list
+    std::atomic<ker::mod::sched::task::Task*> task{nullptr};  // The task that is waiting
+    std::atomic<uint8_t> state{PENDING};                      // Result writer ownership/state
+    int result = 0;                                           // Operation result code
+    uint64_t deadline_us = 0;                                 // Timeout deadline (0 = no timeout)
+    WkiWaitEntry* next = nullptr;                             // Intrusive linked list
     WkiWaitEntry* prev = nullptr;
 };
 
@@ -555,6 +561,12 @@ void wki_wait_timeout_scan(uint64_t now_us);
 
 // Unlink all pending wait entries belonging to task. Called on task exit.
 void wki_wait_cleanup_for_task(ker::mod::sched::task::Task* task);
+
+#ifdef WOS_SELFTEST
+void wki_selftest_wait_list_link(WkiWaitEntry* entry);
+auto wki_selftest_wait_list_contains(WkiWaitEntry const* entry) -> bool;
+auto wki_selftest_reliable_rx_peer_state_accepts(PeerState state) -> bool;
+#endif
 
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers (implemented in peer.cpp, channel.cpp, etc.)

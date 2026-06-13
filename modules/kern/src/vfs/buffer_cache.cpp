@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/paging.hpp>
@@ -58,9 +59,13 @@ bool is_valid_bufhead_ptr(const BufHead* ptr) {
     if ((addr & 7U) != 0) {
         return false;
     }  // must be at least 8-byte aligned
+#ifdef WOS_HOST_TEST
+    return true;
+#else
     const bool IN_HHDM = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL);
     const bool IN_STATIC = (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
     return IN_HHDM || IN_STATIC;
+#endif
 }
 
 // Dump a single hash bucket chain for diagnostics (called while cache_lock held).
@@ -198,8 +203,15 @@ size_t cache_dirty_bytes = 0;
 
 uint64_t stat_hits = 0;
 uint64_t stat_misses = 0;
+std::atomic<uint64_t> next_writeback_epoch{1};
+std::atomic<uint64_t> next_dirty_epoch{1};
 
 bool cache_initialized = false;
+
+struct WritebackSnapshot {
+    uint8_t* data = nullptr;
+    uint32_t flags = 0;
+};
 
 auto perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp op) -> uint64_t {
     return ker::mod::perf::is_wki_scope_recording_enabled(ker::mod::perf::WkiPerfScope::LOCAL_XFS, static_cast<uint8_t>(op))
@@ -242,17 +254,40 @@ auto allocate_buffer_data(size_t size, uint32_t& flags) -> uint8_t* {
     return new uint8_t[size];
 }
 
+void free_data_buffer(uint8_t* data, uint32_t flags) {
+    if (data == nullptr) {
+        return;
+    }
+    if ((flags & BH_DATA_PAGE_ALLOC) != 0) {
+        ker::mod::mm::phys::page_free(data);
+    } else {
+        delete[] data;
+    }
+}
+
 void free_buffer_data(BufHead* bh) {
     if (bh == nullptr || bh->data == nullptr) {
         return;
     }
-    if ((bh->flags & BH_DATA_PAGE_ALLOC) != 0) {
-        ker::mod::mm::phys::page_free(bh->data);
-    } else {
-        delete[] bh->data;
-    }
+    free_data_buffer(bh->data, bh->flags);
     bh->data = nullptr;
     bh->flags &= ~BH_DATA_PAGE_ALLOC;
+}
+
+auto make_writeback_snapshot(const BufHead* bh) -> WritebackSnapshot {
+    WritebackSnapshot snapshot{};
+    snapshot.data = allocate_buffer_data(bh->size, snapshot.flags);
+    if (snapshot.data == nullptr) {
+        return snapshot;
+    }
+    memcpy(snapshot.data, bh->data, bh->size);
+    return snapshot;
+}
+
+void free_writeback_snapshot(WritebackSnapshot& snapshot) {
+    free_data_buffer(snapshot.data, snapshot.flags);
+    snapshot.data = nullptr;
+    snapshot.flags = 0;
 }
 
 void free_unlinked_buffer(BufHead* bh) {
@@ -322,6 +357,9 @@ auto alloc_buffer_with_size(dev::BlockDevice* bdev, uint64_t block_no, size_t si
     bh->refcount.store(1, std::memory_order_relaxed);
     bh->flags = initial_flags | data_flags;
     bh->size = size;
+    bh->writeback_epoch = 0;
+    bh->dirty_epoch = 0;
+    bh->writeback_dirty_epoch = 0;
     bh->lru_prev = nullptr;
     bh->lru_next = nullptr;
     bh->hash_next = nullptr;
@@ -371,14 +409,14 @@ auto read_block_from_disk(BufHead* bh) -> int {
     return RC;
 }
 
-// Write the buffer data to disk.
-auto write_block_to_disk(BufHead* bh) -> int {
+// Write a stable buffer-data snapshot to disk.
+auto write_block_to_disk(BufHead* bh, const uint8_t* data) -> int {
     size_t block_count = bh->size / bh->bdev->block_size;
     if (block_count == 0) {
         block_count = 1;
     }
     uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISK_WRITE);
-    int const RC = dev::block_write(bh->bdev, bh->block_no, block_count, bh->data);
+    int const RC = dev::block_write(bh->bdev, bh->block_no, block_count, data);
     perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISK_WRITE, STARTED_US, RC, bh->size);
     return RC;
 }
@@ -391,12 +429,142 @@ auto buffer_block_count(const BufHead* bh) -> size_t {
     return block_count;
 }
 
-auto buffer_overlaps_range(const BufHead* bh, dev::BlockDevice* bdev, uint64_t block_no, uint64_t range_end) -> bool {
+auto block_range_last_block(uint64_t block_no, size_t count) -> uint64_t {
+    if (count == 0) {
+        return block_no;
+    }
+    size_t const LAST_OFFSET = count - 1;
+    if (LAST_OFFSET > static_cast<size_t>(UINT64_MAX - block_no)) {
+        return UINT64_MAX;
+    }
+    return block_no + static_cast<uint64_t>(LAST_OFFSET);
+}
+
+auto block_ranges_overlap(uint64_t a_block_no, size_t a_count, uint64_t b_block_no, size_t b_count) -> bool {
+    if (a_count == 0 || b_count == 0) {
+        return false;
+    }
+    uint64_t const A_LAST = block_range_last_block(a_block_no, a_count);
+    uint64_t const B_LAST = block_range_last_block(b_block_no, b_count);
+    return a_block_no <= B_LAST && b_block_no <= A_LAST;
+}
+
+auto buffers_overlap(const BufHead* a, const BufHead* b) -> bool {
+    if (a == nullptr || b == nullptr || a == b || a->bdev != b->bdev) {
+        return false;
+    }
+    return block_ranges_overlap(a->block_no, buffer_block_count(a), b->block_no, buffer_block_count(b));
+}
+
+auto buffer_overlaps_range(const BufHead* bh, dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> bool {
     if (bh == nullptr || bh->bdev != bdev) {
         return false;
     }
-    uint64_t const BUF_END = bh->block_no + buffer_block_count(bh);
-    return bh->block_no < range_end && BUF_END > block_no;
+    return block_ranges_overlap(bh->block_no, buffer_block_count(bh), block_no, count);
+}
+
+auto allocate_dirty_epoch() -> uint64_t {
+    uint64_t epoch = next_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
+    if (epoch == 0) {
+        epoch = next_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
+    }
+    return epoch;
+}
+
+auto allocate_writeback_epoch() -> uint64_t {
+    uint64_t epoch = next_writeback_epoch.fetch_add(1, std::memory_order_relaxed);
+    if (epoch == 0) {
+        epoch = next_writeback_epoch.fetch_add(1, std::memory_order_relaxed);
+    }
+    return epoch;
+}
+
+void mark_buffer_writeback(BufHead* bh, uint64_t epoch) {
+    bh->flags |= BH_WRITEBACK;
+    bh->writeback_epoch = epoch;
+    bh->writeback_dirty_epoch = bh->dirty_epoch;
+}
+
+void clear_buffer_writeback(BufHead* bh) {
+    bh->flags &= ~BH_WRITEBACK;
+    bh->writeback_epoch = 0;
+    bh->writeback_dirty_epoch = 0;
+}
+
+auto owns_writeback_epoch(const BufHead* bh, uint64_t epoch) -> bool {
+    return epoch != 0 && (bh->flags & BH_WRITEBACK) != 0 && bh->writeback_epoch == epoch;
+}
+
+auto mark_buffer_dirty_locked(BufHead* bh) -> bool {
+    bh->dirty_epoch = allocate_dirty_epoch();
+    if ((bh->flags & BH_DIRTY) != 0) {
+        return false;
+    }
+
+    bh->flags |= BH_DIRTY;
+    cache_dirty_buffers++;
+    cache_dirty_bytes += bh->size;
+    return true;
+}
+
+auto has_older_overlapping_dirty_buffer_locked(const BufHead* target) -> bool {
+    for (auto* bucket_head : hash_buckets) {
+        for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
+            if ((bh->flags & BH_DIRTY) == 0 || !buffers_overlap(target, bh)) {
+                continue;
+            }
+            if (bh->dirty_epoch < target->dirty_epoch) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void clear_writeback_for_bdev(dev::BlockDevice* bdev, uint64_t epoch) {
+    for (auto* bucket_head : hash_buckets) {
+        for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
+            if (bh->bdev == bdev && bh->writeback_epoch == epoch) {
+                clear_buffer_writeback(bh);
+            }
+        }
+    }
+}
+
+void clear_writeback_for_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint64_t epoch) {
+    for (auto* bucket_head : hash_buckets) {
+        for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
+            if (bh->writeback_epoch == epoch && buffer_overlaps_range(bh, bdev, block_no, count)) {
+                clear_buffer_writeback(bh);
+            }
+        }
+    }
+}
+
+auto write_buffer_snapshot_for_epoch(BufHead* bh, uint64_t writeback_dirty_epoch, uint64_t owned_writeback_epoch) -> int {
+    WritebackSnapshot snapshot = make_writeback_snapshot(bh);
+    if (snapshot.data == nullptr) {
+        uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+        if (owns_writeback_epoch(bh, owned_writeback_epoch)) {
+            clear_buffer_writeback(bh);
+        }
+        cache_lock.unlock_irqrestore(IRQFLAGS);
+        return -ENOMEM;
+    }
+
+    int const RC = write_block_to_disk(bh, snapshot.data);
+    free_writeback_snapshot(snapshot);
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    if (RC == 0 && (bh->flags & BH_DIRTY) != 0 && bh->dirty_epoch == writeback_dirty_epoch) {
+        bh->flags &= ~BH_DIRTY;
+        cache_dirty_buffers--;
+        cache_dirty_bytes -= bh->size;
+    }
+    if (owns_writeback_epoch(bh, owned_writeback_epoch)) {
+        clear_buffer_writeback(bh);
+    }
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    return RC;
 }
 
 }  // anonymous namespace
@@ -591,17 +759,20 @@ auto bwrite(BufHead* bh) -> int {
         return -EINVAL;
     }
 
-    int const RC = write_block_to_disk(bh);
-    if (RC == 0) {
+    uint64_t writeback_dirty_epoch = 0;
+    uint64_t owned_writeback_epoch = 0;
+    {
         uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
-        if ((bh->flags & BH_DIRTY) != 0) {
-            bh->flags &= ~BH_DIRTY;
-            cache_dirty_buffers--;
-            cache_dirty_bytes -= bh->size;
+        mark_buffer_dirty_locked(bh);
+        writeback_dirty_epoch = bh->dirty_epoch;
+        if ((bh->flags & BH_WRITEBACK) == 0) {
+            owned_writeback_epoch = allocate_writeback_epoch();
+            mark_buffer_writeback(bh, owned_writeback_epoch);
         }
         cache_lock.unlock_irqrestore(IRQFLAGS);
     }
-    return RC;
+
+    return write_buffer_snapshot_for_epoch(bh, writeback_dirty_epoch, owned_writeback_epoch);
 }
 
 void bdirty(BufHead* bh) {
@@ -612,12 +783,7 @@ void bdirty(BufHead* bh) {
     uint64_t const PERF_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DIRTY);
     bool became_dirty = false;
     uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
-    if ((bh->flags & BH_DIRTY) == 0) {
-        bh->flags |= BH_DIRTY;
-        cache_dirty_buffers++;
-        cache_dirty_bytes += bh->size;
-        became_dirty = true;
-    }
+    became_dirty = mark_buffer_dirty_locked(bh);
     cache_lock.unlock_irqrestore(IRQFLAGS);
     if (became_dirty) {
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DIRTY, PERF_STARTED_US, 0, bh->size);
@@ -728,18 +894,35 @@ auto sync_blockdev(dev::BlockDevice* bdev) -> int {
     // Use a fixed-size batch to avoid dynamic allocation.
     constexpr size_t BATCH_SIZE = 64;
     std::array<BufHead*, BATCH_SIZE> batch{};
+    std::array<uint64_t, BATCH_SIZE> batch_dirty_epochs{};
     size_t batch_count = 0;
     bool more = true;
+    uint64_t const WRITEBACK_EPOCH = allocate_writeback_epoch();
 
     while (more) {
         batch_count = 0;
         more = false;
+        bool saw_foreign_writeback = false;
 
         for (auto* bucket_head : hash_buckets) {
             for (BufHead* bh = bucket_head; bh != nullptr && batch_count < BATCH_SIZE; bh = bh->hash_next) {
-                if (bh->bdev == bdev && (bh->flags & BH_DIRTY) != 0) {
+                if (bh->bdev != bdev || (bh->flags & BH_DIRTY) == 0) {
+                    continue;
+                }
+                if ((bh->flags & BH_WRITEBACK) != 0) {
+                    saw_foreign_writeback = saw_foreign_writeback || bh->writeback_epoch != WRITEBACK_EPOCH;
+                    continue;
+                }
+                if (has_older_overlapping_dirty_buffer_locked(bh)) {
+                    more = true;
+                    continue;
+                }
+                {
+                    mark_buffer_writeback(bh, WRITEBACK_EPOCH);
                     bh->refcount.fetch_add(1, std::memory_order_relaxed);
-                    batch[batch_count++] = bh;  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+                    batch_dirty_epochs[batch_count] =
+                        bh->writeback_dirty_epoch;  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+                    batch[batch_count++] = bh;      // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
                 }
             }
             // If the batch is full, there may be more dirty buffers
@@ -748,23 +931,38 @@ auto sync_blockdev(dev::BlockDevice* bdev) -> int {
                 break;
             }
         }
+        if (saw_foreign_writeback) {
+            more = true;
+        }
 
         cache_lock.unlock_irqrestore(irqflags);
 
         // Write each dirty buffer with lock released
         for (size_t i = 0; i < batch_count; i++) {
             auto* bh = batch[i];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-            int const RC = bwrite(bh);
+            int const RC = write_buffer_snapshot_for_epoch(bh, batch_dirty_epochs[i],
+                                                           0);  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
             if (RC != 0) {
                 result = RC;
             }
             brelse(bh);
         }
 
+        if (batch_count == 0 && saw_foreign_writeback) {
+            ker::mod::sched::kern_yield();
+        }
+        if (batch_count == 0 && !saw_foreign_writeback) {
+            more = false;
+        }
+
         if (more) {
             irqflags = cache_lock.lock_irqsave();
         }
     }
+
+    irqflags = cache_lock.lock_irqsave();
+    clear_writeback_for_bdev(bdev, WRITEBACK_EPOCH);
+    cache_lock.unlock_irqrestore(irqflags);
 
     // Flush the device if it supports it
     if (bdev->flush != nullptr) {
@@ -789,7 +987,6 @@ auto has_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t coun
         return false;
     }
 
-    uint64_t const RANGE_END = block_no + count;
     uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
     if (cache_dirty_buffers == 0) {
         cache_lock.unlock_irqrestore(IRQFLAGS);
@@ -798,7 +995,7 @@ auto has_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t coun
 
     for (auto* bucket_head : hash_buckets) {
         for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
-            if (buffer_overlaps_range(bh, bdev, block_no, RANGE_END) && (bh->flags & BH_DIRTY) != 0) {
+            if (buffer_overlaps_range(bh, bdev, block_no, count) && (bh->flags & BH_DIRTY) != 0) {
                 cache_lock.unlock_irqrestore(IRQFLAGS);
                 return true;
             }
@@ -823,7 +1020,6 @@ auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) ->
 
     int result = 0;
     bool wrote_dirty = false;
-    uint64_t const RANGE_END = block_no + count;
     uint64_t irqflags = cache_lock.lock_irqsave();
     if (cache_dirty_buffers == 0) {
         cache_lock.unlock_irqrestore(irqflags);
@@ -832,18 +1028,36 @@ auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) ->
 
     constexpr size_t BATCH_SIZE = 64;
     std::array<BufHead*, BATCH_SIZE> batch{};
+    std::array<uint64_t, BATCH_SIZE> batch_dirty_epochs{};
     size_t batch_count = 0;
     bool more = true;
+    bool waited_for_foreign_writeback = false;
+    uint64_t const WRITEBACK_EPOCH = allocate_writeback_epoch();
 
     while (more) {
         batch_count = 0;
         more = false;
+        bool saw_foreign_writeback = false;
 
         for (auto* bucket_head : hash_buckets) {
             for (BufHead* bh = bucket_head; bh != nullptr && batch_count < BATCH_SIZE; bh = bh->hash_next) {
-                if (buffer_overlaps_range(bh, bdev, block_no, RANGE_END) && (bh->flags & BH_DIRTY) != 0) {
+                if (!buffer_overlaps_range(bh, bdev, block_no, count) || (bh->flags & BH_DIRTY) == 0) {
+                    continue;
+                }
+                if ((bh->flags & BH_WRITEBACK) != 0) {
+                    saw_foreign_writeback = saw_foreign_writeback || bh->writeback_epoch != WRITEBACK_EPOCH;
+                    continue;
+                }
+                if (has_older_overlapping_dirty_buffer_locked(bh)) {
+                    more = true;
+                    continue;
+                }
+                {
+                    mark_buffer_writeback(bh, WRITEBACK_EPOCH);
                     bh->refcount.fetch_add(1, std::memory_order_relaxed);
-                    batch[batch_count++] = bh;  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+                    batch_dirty_epochs[batch_count] =
+                        bh->writeback_dirty_epoch;  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+                    batch[batch_count++] = bh;      // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
                 }
             }
             if (batch_count >= BATCH_SIZE) {
@@ -851,17 +1065,29 @@ auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) ->
                 break;
             }
         }
+        if (saw_foreign_writeback) {
+            waited_for_foreign_writeback = true;
+            more = true;
+        }
 
         cache_lock.unlock_irqrestore(irqflags);
 
         for (size_t i = 0; i < batch_count; i++) {
             auto* bh = batch[i];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
             wrote_dirty = true;
-            int const RC = bwrite(bh);
+            int const RC = write_buffer_snapshot_for_epoch(bh, batch_dirty_epochs[i],
+                                                           0);  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
             if (RC != 0) {
                 result = RC;
             }
             brelse(bh);
+        }
+
+        if (batch_count == 0 && saw_foreign_writeback) {
+            ker::mod::sched::kern_yield();
+        }
+        if (batch_count == 0 && !saw_foreign_writeback) {
+            more = false;
         }
 
         if (more) {
@@ -869,7 +1095,11 @@ auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) ->
         }
     }
 
-    if (wrote_dirty && bdev->flush != nullptr) {
+    irqflags = cache_lock.lock_irqsave();
+    clear_writeback_for_bdev_range(bdev, block_no, count, WRITEBACK_EPOCH);
+    cache_lock.unlock_irqrestore(irqflags);
+
+    if ((wrote_dirty || waited_for_foreign_writeback) && bdev->flush != nullptr) {
         int const RC = dev::block_flush(bdev);
         if (RC != 0) {
             result = RC;
@@ -897,6 +1127,11 @@ void invalidate_bdev(dev::BlockDevice* bdev) {
         while (*pp != nullptr) {
             BufHead* bh = *pp;
             if (bh->bdev == bdev) {
+                if (bh->refcount.load(std::memory_order_relaxed) > 0) {
+                    pp = &bh->hash_next;
+                    continue;
+                }
+
                 *pp = bh->hash_next;
                 bh->hash_next = nullptr;
                 lru_remove(bh);
@@ -920,7 +1155,6 @@ void discard_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count)
         buffer_cache_init();
     }
 
-    uint64_t const RANGE_END = block_no + count;
     uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
     uint64_t discarded_bytes = 0;
 
@@ -928,7 +1162,7 @@ void discard_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count)
         BufHead** pp = &hash_bucket;
         while (*pp != nullptr) {
             BufHead* bh = *pp;
-            if (!buffer_overlaps_range(bh, bdev, block_no, RANGE_END) || bh->refcount.load(std::memory_order_relaxed) > 0) {
+            if (!buffer_overlaps_range(bh, bdev, block_no, count) || bh->refcount.load(std::memory_order_relaxed) > 0) {
                 pp = &bh->hash_next;
                 continue;
             }

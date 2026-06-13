@@ -5,16 +5,23 @@
 
 #include "platform/asm/cpu.hpp"
 #include "platform/interrupt/gates.hpp"
+#include "platform/mm/addr.hpp"
+#include "platform/mm/paging.hpp"
+#include "platform/mm/virt.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
+#include "platform/sched/threading.hpp"
 #include "syscalls_impl/process/exit.hpp"
 
 namespace {
+
+using Task = ker::mod::sched::task::Task;
 
 // Signal constants (matching Linux ABI)
 constexpr uint64_t WOS_SIG_DFL = 0;
 constexpr uint64_t WOS_SIG_IGN = 1;
 constexpr int WOS_SIGKILL = 9;
+constexpr int WOS_SIGSEGV = 11;
 constexpr int WOS_SIGHUP = 1;
 constexpr int WOS_SIGINT = 2;
 constexpr int WOS_SIGQUIT = 3;
@@ -41,6 +48,120 @@ auto stack_read(const uint8_t* base, int offset) -> uint64_t { return *reinterpr
 // Helper: write a uint64_t to a stack slot
 void stack_write(uint8_t* base, int offset, uint64_t value) { *reinterpret_cast<uint64_t*>(base + offset) = value; }
 
+inline auto is_user_signal_handler(const ker::mod::sched::task::Task::SigHandler& handler) -> bool {
+    return handler.handler != WOS_SIG_DFL && handler.handler != WOS_SIG_IGN;
+}
+
+auto user_range_valid(uint64_t start, size_t size) -> bool {
+    constexpr uint64_t USER_ADDR_LIMIT = 0x0000800000000000ULL;
+    uint64_t const END = start + static_cast<uint64_t>(size);
+    return size != 0 && END >= start && END <= USER_ADDR_LIMIT;
+}
+
+auto user_copy_chunk(size_t remaining, uint64_t user_addr) -> size_t {
+    uint64_t const PAGE_OFFSET = user_addr & (ker::mod::mm::paging::PAGE_SIZE - 1);
+    uint64_t const PAGE_REMAINING = ker::mod::mm::paging::PAGE_SIZE - PAGE_OFFSET;
+    return remaining < PAGE_REMAINING ? remaining : static_cast<size_t>(PAGE_REMAINING);
+}
+
+auto task_stack_contains(const Task& task, uint64_t start, uint64_t end) -> bool {
+    if (task.thread == nullptr || task.thread->stack_size == 0) {
+        return false;
+    }
+    uint64_t const STACK_BASE = task.thread->stack_base_virt;
+    uint64_t const STACK_TOP = STACK_BASE + task.thread->stack_size;
+    return STACK_TOP >= STACK_BASE && start >= STACK_BASE && end <= STACK_TOP;
+}
+
+auto ensure_signal_frame_destination(Task& task, uint64_t frame_addr) -> bool {
+    if (task.pagemap == nullptr || !user_range_valid(frame_addr, sizeof(ker::mod::sys::signal::SignalFrame))) {
+        return false;
+    }
+
+    uint64_t const FRAME_END = frame_addr + sizeof(ker::mod::sys::signal::SignalFrame);
+    if (task_stack_contains(task, frame_addr, FRAME_END) &&
+        !ker::mod::sched::threading::ensure_stack_backing(task.thread, task.pagemap, frame_addr, FRAME_END)) {
+        return false;
+    }
+
+    uint64_t const PAGE_END = page_align_up(FRAME_END);
+    for (uint64_t page = page_align_down(frame_addr); page < PAGE_END; page += ker::mod::mm::paging::PAGE_SIZE) {
+        if (!ker::mod::mm::virt::ensure_user_page_writable(&task, page)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto copy_from_task_user(Task& task, uint64_t user_addr, void* dst, size_t size) -> bool {
+    if (task.pagemap == nullptr || dst == nullptr || !user_range_valid(user_addr, size)) {
+        return false;
+    }
+
+    auto* out = static_cast<uint8_t*>(dst);
+    size_t copied = 0;
+    while (copied < size) {
+        uint64_t const CUR = user_addr + copied;
+        uint64_t const PHYS = ker::mod::mm::virt::translate(task.pagemap, CUR);
+        if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
+            return false;
+        }
+        size_t const CHUNK = user_copy_chunk(size - copied, CUR);
+        auto const* src = reinterpret_cast<const uint8_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
+        std::memcpy(out + copied, src, CHUNK);
+        copied += CHUNK;
+    }
+    return true;
+}
+
+auto copy_to_task_user(Task& task, uint64_t user_addr, const void* src, size_t size) -> bool {
+    if (task.pagemap == nullptr || src == nullptr || !user_range_valid(user_addr, size)) {
+        return false;
+    }
+
+    auto const* in = static_cast<const uint8_t*>(src);
+    size_t copied = 0;
+    while (copied < size) {
+        uint64_t const CUR = user_addr + copied;
+        uint64_t const PHYS = ker::mod::mm::virt::translate(task.pagemap, CUR);
+        if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
+            return false;
+        }
+        size_t const CHUNK = user_copy_chunk(size - copied, CUR);
+        auto* dst = reinterpret_cast<uint8_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
+        std::memcpy(dst, in + copied, CHUNK);
+        copied += CHUNK;
+    }
+    return true;
+}
+
+auto write_signal_frame(Task& task, uint64_t frame_addr, const ker::mod::sys::signal::SignalFrame& frame) -> bool {
+    return ensure_signal_frame_destination(task, frame_addr) && copy_to_task_user(task, frame_addr, &frame, sizeof(frame));
+}
+
+auto read_signal_frame(Task& task, uint64_t frame_addr, ker::mod::sys::signal::SignalFrame& frame) -> bool {
+    return copy_from_task_user(task, frame_addr, &frame, sizeof(frame));
+}
+
+auto signal_frame_saved_mask_value(const Task& task) -> uint64_t {
+    return task.sigsuspend_active ? task.sigsuspend_saved_mask : task.sig_mask;
+}
+
+void consume_signal_frame_saved_mask(Task& task) {
+    if (!task.sigsuspend_active) {
+        return;
+    }
+    task.sigsuspend_active = false;
+    task.sigsuspend_saved_mask = 0;
+}
+
+void handle_signal_frame_fault(Task* task) {
+    if (task == ker::mod::sched::get_current_task()) {
+        ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);
+        __builtin_unreachable();
+    }
+}
+
 }  // namespace
 
 namespace ker::mod::sys::signal {
@@ -65,25 +186,29 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
         // User RSP at sigreturn syscall entry points to &frame.signo
         // (restorer's `ret` already popped pretcode, so RSP = pretcode + 8 = &signo)
         uint64_t const USER_RSP = per_cpu->user_rsp;
-        auto* frame_start = reinterpret_cast<uint8_t*>(USER_RSP - 8);  // back up to pretcode
-        auto* frame = reinterpret_cast<SignalFrame*>(frame_start);
+        uint64_t const FRAME_START = USER_RSP - 8;  // back up to pretcode
+        SignalFrame frame{};
+        if (!read_signal_frame(*task, FRAME_START, frame)) {
+            ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);
+            __builtin_unreachable();
+        }
 
         // Restore signal mask
-        task->sig_mask = frame->saved_mask;
+        task->sig_mask = frame.saved_mask;
 
         // Restore GP registers to the on-stack positions
         for (int i = 0; i < 15; i++) {
-            stack_write(stack_base, i * 8, frame->saved_regs.at(static_cast<size_t>(i)));
+            stack_write(stack_base, i * 8, frame.saved_regs.at(static_cast<size_t>(i)));
         }
 
         // Restore the return value slot
-        stack_write(stack_base, STACK_OFF_RETVAL, frame->saved_retval);
-        stack_write(stack_base, STACK_OFF_RAX, frame->saved_retval);
+        stack_write(stack_base, STACK_OFF_RETVAL, frame.saved_retval);
+        stack_write(stack_base, STACK_OFF_RAX, frame.saved_retval);
 
         // Restore user RIP, RSP, and RFLAGS through PerCpu
-        per_cpu->user_rsp = frame->saved_rsp;
-        per_cpu->syscall_ret_rip = frame->saved_rip;
-        per_cpu->syscall_ret_flags = frame->saved_rflags;
+        per_cpu->user_rsp = frame.saved_rsp;
+        per_cpu->syscall_ret_rip = frame.saved_rip;
+        per_cpu->syscall_ret_flags = frame.saved_rflags;
 
         task->in_signal_handler = false;
         return 1;  // Return via iretq so RCX/R11 are restored as user GPRs.
@@ -99,13 +224,11 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
     int const SIGNO = __builtin_ctzll(DELIVERABLE) + 1;
     auto const IDX = static_cast<unsigned>(SIGNO - 1);
 
-    // Clear the pending bit
-    task->sig_pending &= ~(1ULL << IDX);
-
     auto& handler = task->sig_handlers.at(IDX);
 
     // Handle SIG_DFL
     if (handler.handler == WOS_SIG_DFL) {
+        task->sig_pending &= ~(1ULL << IDX);
         // Default action depends on signal:
         // SIGCHLD, SIGURG, SIGWINCH, SIGCONT: ignore
         // SIGTSTP(20), SIGTTIN(21), SIGTTOU(22): stop (for job control)
@@ -141,6 +264,7 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
 
     // Handle SIG_IGN
     if (handler.handler == WOS_SIG_IGN) {
+        task->sig_pending &= ~(1ULL << IDX);
         if (task->sigsuspend_active) {
             task->sig_mask = task->signal_frame_saved_mask();
         }
@@ -155,22 +279,27 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
     // Preserve the SysV user red zone; mlibc and clang-generated leaf code may
     // keep live locals in the 128 bytes below RSP across syscalls.
     uint64_t const FRAME_ADDR = signal_frame_address_for_task(*task, USER_RSP, handler.flags);
-    auto* frame = reinterpret_cast<SignalFrame*>(FRAME_ADDR);
+    SignalFrame frame{};
 
-    // Write the signal frame to user-space stack
-    // (We're still in the task's pagemap during syscall, so direct writes work)
-    frame->pretcode = handler.restorer;  // sa_restorer trampoline
-    frame->signo = static_cast<uint64_t>(SIGNO);
-    frame->saved_mask = task->signal_frame_saved_mask();
-    frame->saved_rip = USER_RIP;
-    frame->saved_rsp = USER_RSP;
-    frame->saved_rflags = USER_RFLAGS;
-    frame->saved_retval = stack_read(stack_base, STACK_OFF_RETVAL);
+    frame.pretcode = handler.restorer;  // sa_restorer trampoline
+    frame.signo = static_cast<uint64_t>(SIGNO);
+    frame.saved_mask = signal_frame_saved_mask_value(*task);
+    frame.saved_rip = USER_RIP;
+    frame.saved_rsp = USER_RSP;
+    frame.saved_rflags = USER_RFLAGS;
+    frame.saved_retval = stack_read(stack_base, STACK_OFF_RETVAL);
 
     // Save all 15 GP registers from the stack
     for (int i = 0; i < 15; i++) {
-        frame->saved_regs.at(static_cast<size_t>(i)) = stack_read(stack_base, i * 8);
+        frame.saved_regs.at(static_cast<size_t>(i)) = stack_read(stack_base, i * 8);
     }
+
+    if (!write_signal_frame(*task, FRAME_ADDR, frame)) {
+        handle_signal_frame_fault(task);
+        return 0;
+    }
+    consume_signal_frame_saved_mask(*task);
+    task->sig_pending &= ~(1ULL << IDX);
 
     // Modify the on-stack registers to redirect to the signal handler
     stack_write(stack_base, STACK_OFF_RCX, handler.handler);               // sysret target = handler
@@ -215,11 +344,11 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
 
     int const SIGNO = __builtin_ctzll(DELIVERABLE) + 1;
     auto const IDX = static_cast<unsigned>(SIGNO - 1);
-    task->sig_pending &= ~(1ULL << IDX);
 
     auto& handler = task->sig_handlers.at(IDX);
 
     if (handler.handler == WOS_SIG_DFL) {
+        task->sig_pending &= ~(1ULL << IDX);
         if (SIGNO == WOS_SIGCHLD || SIGNO == WOS_SIGURG || SIGNO == WOS_SIGWINCH || SIGNO == WOS_SIGCONT) {
             if (task->sigsuspend_active) {
                 task->sig_mask = task->signal_frame_saved_mask();
@@ -245,6 +374,7 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
     }
 
     if (handler.handler == WOS_SIG_IGN) {
+        task->sig_pending &= ~(1ULL << IDX);
         if (task->sigsuspend_active) {
             task->sig_mask = task->signal_frame_saved_mask();
         }
@@ -252,20 +382,27 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
     }
 
     uint64_t const FRAME_ADDR = signal_frame_address_for_task(*task, frame.rsp, handler.flags);
-    auto* sigframe = reinterpret_cast<SignalFrame*>(FRAME_ADDR);
+    SignalFrame sigframe{};
 
-    sigframe->pretcode = handler.restorer;
-    sigframe->signo = static_cast<uint64_t>(SIGNO);
-    sigframe->saved_mask = task->signal_frame_saved_mask();
-    sigframe->saved_rip = frame.rip;
-    sigframe->saved_rsp = frame.rsp;
-    sigframe->saved_rflags = frame.flags;
-    sigframe->saved_retval = gpr.rax;
+    sigframe.pretcode = handler.restorer;
+    sigframe.signo = static_cast<uint64_t>(SIGNO);
+    sigframe.saved_mask = signal_frame_saved_mask_value(*task);
+    sigframe.saved_rip = frame.rip;
+    sigframe.saved_rsp = frame.rsp;
+    sigframe.saved_rflags = frame.flags;
+    sigframe.saved_retval = gpr.rax;
 
     const auto* regs_arr = reinterpret_cast<const uint64_t*>(&gpr);
     for (int i = 0; i < 15; i++) {
-        sigframe->saved_regs.at(static_cast<size_t>(i)) = regs_arr[i];
+        sigframe.saved_regs.at(static_cast<size_t>(i)) = regs_arr[i];
     }
+
+    if (!write_signal_frame(*task, FRAME_ADDR, sigframe)) {
+        handle_signal_frame_fault(task);
+        return;
+    }
+    consume_signal_frame_saved_mask(*task);
+    task->sig_pending &= ~(1ULL << IDX);
 
     gpr.rdi = static_cast<uint64_t>(SIGNO);
     frame.rip = handler.handler;
@@ -276,6 +413,73 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
         task->sig_mask |= (1ULL << IDX);
     }
     task->in_signal_handler = true;
+}
+
+void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, gates::InterruptFrame& frame) {
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS) {
+        return;
+    }
+
+    if ((frame.cs & 0x3) != 0x3 || task->is_voluntary_blocked()) {
+        return;
+    }
+
+    if (task->in_signal_handler) {
+        return;
+    }
+
+    uint64_t const DELIVERABLE = task->sig_pending & ~task->sig_mask;
+    if (DELIVERABLE == 0) {
+        return;
+    }
+
+    int const SIGNO = __builtin_ctzll(DELIVERABLE) + 1;
+    auto const IDX = static_cast<unsigned>(SIGNO - 1);
+    auto& handler = task->sig_handlers.at(IDX);
+
+    if (!is_user_signal_handler(handler)) {
+        return;
+    }
+
+    uint64_t const FRAME_ADDR = signal_frame_address_for_task(*task, frame.rsp, handler.flags);
+    SignalFrame sigframe{};
+
+    sigframe.pretcode = handler.restorer;
+    sigframe.signo = static_cast<uint64_t>(SIGNO);
+    sigframe.saved_mask = signal_frame_saved_mask_value(*task);
+    sigframe.saved_rip = frame.rip;
+    sigframe.saved_rsp = frame.rsp;
+    sigframe.saved_rflags = frame.flags;
+    sigframe.saved_retval = gpr.rax;
+
+    const auto* regs_arr = reinterpret_cast<const uint64_t*>(&gpr);
+    for (int i = 0; i < 15; i++) {
+        sigframe.saved_regs.at(static_cast<size_t>(i)) = regs_arr[i];
+    }
+
+    if (!write_signal_frame(*task, FRAME_ADDR, sigframe)) {
+        handle_signal_frame_fault(task);
+        return;
+    }
+    consume_signal_frame_saved_mask(*task);
+    task->sig_pending &= ~(1ULL << IDX);
+
+    gpr.rdi = static_cast<uint64_t>(SIGNO);
+    frame.rip = handler.handler;
+    frame.rsp = FRAME_ADDR;
+
+    auto* per_cpu = reinterpret_cast<cpu::PerCpu*>(task->context.syscall_scratch_area);
+    per_cpu->user_rsp = FRAME_ADDR;
+    per_cpu->syscall_ret_rip = handler.handler;
+    per_cpu->syscall_ret_flags = frame.flags;
+
+    task->sig_mask |= handler.mask;
+    if ((handler.flags & 0x40000000ULL) == 0U) {
+        task->sig_mask |= (1ULL << IDX);
+    }
+    task->in_signal_handler = true;
+    task->context.regs = gpr;
+    task->context.frame = frame;
 }
 
 }  // namespace ker::mod::sys::signal

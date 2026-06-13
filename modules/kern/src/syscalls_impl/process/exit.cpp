@@ -29,9 +29,13 @@ namespace ker::syscall::process {
 
 namespace {
 using log = ker::mod::dbg::logger<"pexit">;
+namespace sched_task = ker::mod::sched::task;
 
 constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
 constexpr uint64_t SIGCHLD_MASK = 1ULL << (17 - 1);
+constexpr size_t EXIT_WAITER_NOTIFY_BATCH = 16;
+
+using ExitWaiterBatch = std::array<uint64_t, EXIT_WAITER_NOTIFY_BATCH>;
 
 auto clamp_perf_aux(uint64_t value) -> uint32_t { return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value); }
 
@@ -136,13 +140,36 @@ auto waiter_matches_child(ker::mod::sched::task::Task* waiter, ker::mod::sched::
     return waiter != nullptr && child != nullptr && (waiter->waiting_for_pid == WAIT_ANY_CHILD || waiter->waiting_for_pid == child->pid);
 }
 
-void complete_exit_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child, const char* path) {
+auto waiter_context_can_be_completed(ker::mod::sched::task::Task* waiter) -> bool {
+    return waiter != nullptr && !waiter->deferred_task_switch && !waiter->waitpid_publish_pending.load(std::memory_order_acquire);
+}
+
+auto drain_exit_waiters_for_notify(ker::mod::sched::task::Task* exiting, ExitWaiterBatch& waiting_pids) -> size_t {
+    if (exiting == nullptr) {
+        return 0;
+    }
+
+    size_t count = 0;
+    uint64_t const WAITER_LOCK_FLAGS = exiting->exit_waiters_lock.lock_irqsave();
+    while (count < waiting_pids.size() && !exiting->awaitee_on_exit.empty()) {
+        size_t const INDEX = exiting->awaitee_on_exit.size() - 1;
+        waiting_pids.at(count++) = exiting->awaitee_on_exit.at(INDEX);
+        exiting->awaitee_on_exit.pop_back();
+    }
+    exiting->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
+    return count;
+}
+
+auto complete_exit_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child, const char* path) -> bool {
+    if (child == nullptr || !sched_task::task_try_mark_waited_on(*child)) {
+        return false;
+    }
     waiter->context.regs.rax = child->pid;
     validate_waiter_resume_for_exit(waiter, child, path);
     write_wait_status_for_waiter(waiter, child->exit_status);
     fill_rusage_for_waiter(waiter, child);
     waiter->waiting_for_pid = 0;
-    child->waited_on = true;
+    return true;
 }
 
 void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
@@ -158,10 +185,10 @@ void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
     parent->sig_pending |= SIGCHLD_MASK;
 
     bool wake_parent = false;
-    if (!child->waited_on) {
-        if (waiter_matches_child(parent, child) && !parent->deferred_task_switch) {
-            complete_exit_wait(parent, child, parent->waiting_for_pid == WAIT_ANY_CHILD ? "exit-any" : "exit-specific-parent");
-            wake_parent = true;
+    if (!sched_task::task_waited_on(*child)) {
+        if (waiter_matches_child(parent, child) && waiter_context_can_be_completed(parent)) {
+            wake_parent =
+                complete_exit_wait(parent, child, parent->waiting_for_pid == WAIT_ANY_CHILD ? "exit-any" : "exit-specific-parent");
         } else if ((waiter_matches_child(parent, child) && parent->is_voluntary_blocked()) || parent->deferred_task_switch ||
                    parent->is_voluntary_blocked()) {
             // The deferred switch path will re-check waitability after it saves
@@ -192,10 +219,9 @@ void notify_tracer_after_exit_ready(ker::mod::sched::task::Task* child) {
     }
 
     bool wake_tracer = false;
-    if (!child->waited_on && waiter_matches_child(tracer, child)) {
-        if (!tracer->deferred_task_switch) {
-            complete_exit_wait(tracer, child, "exit-ptrace");
-            wake_tracer = true;
+    if (!sched_task::task_waited_on(*child) && waiter_matches_child(tracer, child)) {
+        if (waiter_context_can_be_completed(tracer)) {
+            wake_tracer = complete_exit_wait(tracer, child, "exit-ptrace");
         } else {
             wake_tracer = true;
         }
@@ -321,66 +347,62 @@ void wos_proc_exit_with_wait_status(int status, int wait_status) {
     // This happens AFTER reparenting + FD cleanup so that any files written
     // by the exiting process are fully committed to the VFS before waitpid
     // returns to the waiter.
-    uint64_t const WAITER_LOCK_FLAGS = current_task->exit_waiters_lock.lock_irqsave();
-    const size_t WAITER_COUNT = current_task->awaitee_on_exit.size();
-    std::array<uint64_t, 16> waiting_pids{};
-    const size_t WAITING_PIDS_CAP = waiting_pids.size();
-    for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; ++i) {
-        waiting_pids.at(i) = current_task->awaitee_on_exit.at(i);
-    }
-    current_task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
+    for (;;) {
+        ExitWaiterBatch waiting_pids{};
+        size_t const WAITER_COUNT = drain_exit_waiters_for_notify(current_task, waiting_pids);
+        if (WAITER_COUNT == 0) {
+            break;
+        }
 
-    for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; ++i) {
-        uint64_t const WAITING_PID = waiting_pids.at(i);
+        for (size_t i = 0; i < WAITER_COUNT; ++i) {
+            uint64_t const WAITING_PID = waiting_pids.at(i);
 #ifdef EXIT_DEBUG
-        log::debug("rescheduling waiting task PID %x", WAITING_PID);
+            log::debug("rescheduling waiting task PID %x", WAITING_PID);
 #endif
 
-        // Use findTaskByPidSafe to get a refcounted reference - prevents use-after-free
-        auto* waiting_task = ker::mod::sched::find_task_by_pid_safe(WAITING_PID);
-        if (waiting_task != nullptr) {
-            // Only modify the waiting task's saved context when it's safely in waitQueue
-            // (deferred_task_switch is false). When deferred_task_switch is true, the task is
-            // still running on another CPU - writing to context.regs is a data race and the
-            // values would be overwritten by deferred_task_switch's context save anyway.
-            // In that case, deferred_task_switch() will detect hasExited==true and set rax
-            // correctly before re-scheduling the task (see scheduler.cpp deferred_task_switch).
-            if (!waiting_task->deferred_task_switch) {
-                waiting_task->context.regs.rax = current_task->pid;
-                validate_waiter_resume_for_exit(waiting_task, current_task, "exit-specific");
-                write_wait_status_for_waiter(waiting_task, current_task->exit_status);
+            // Use findTaskByPidSafe to get a refcounted reference - prevents use-after-free
+            auto* waiting_task = ker::mod::sched::find_task_by_pid_safe(WAITING_PID);
+            if (waiting_task != nullptr) {
+                // Only modify the waiting task's saved context when it's safely in waitQueue
+                // (deferred_task_switch is false). When deferred_task_switch is true, the task is
+                // still running on another CPU - writing to context.regs is a data race and the
+                // values would be overwritten by deferred_task_switch's context save anyway.
+                // In that case, deferred_task_switch() will detect hasExited==true and set rax
+                // correctly before re-scheduling the task (see scheduler.cpp deferred_task_switch).
+                bool completed_wait = false;
+                if (waiter_context_can_be_completed(waiting_task) && waiter_matches_child(waiting_task, current_task)) {
+                    completed_wait = sched_task::task_try_mark_waited_on(*current_task);
+                }
+                if (completed_wait) {
+                    waiting_task->context.regs.rax = current_task->pid;
+                    validate_waiter_resume_for_exit(waiting_task, current_task, "exit-specific");
+                    write_wait_status_for_waiter(waiting_task, current_task->exit_status);
 #ifdef EXIT_DEBUG
-                log::debug("set exit status %d for waiting task PID %x", current_task->exit_status, WAITING_PID);
+                    log::debug("set exit status %d for waiting task PID %x", current_task->exit_status, WAITING_PID);
 #endif
-                fill_rusage_for_waiter(waiting_task, current_task);
-                waiting_task->waiting_for_pid = 0;
+                    fill_rusage_for_waiter(waiting_task, current_task);
+                    waiting_task->waiting_for_pid = 0;
+                }
+
+                // Reschedule the waiting task on its last-known CPU to avoid cross-CPU migration
+                // latency and the risk of landing on a non-preemptible CPU.  Fall back to the
+                // least-loaded CPU only if the stored cpu index is out of range.
+                uint64_t target_cpu = waiting_task->cpu;
+                if (target_cpu >= ker::mod::smt::get_core_count()) {
+                    target_cpu = ker::mod::sched::get_least_loaded_cpu();
+                }
+                ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiting_task);
+#ifdef EXIT_DEBUG
+                log::debug("successfully rescheduled waiting task PID %x on CPU %d", WAITING_PID, waiting_task->cpu);
+#endif
+
+                // Release the reference we acquired from findTaskByPidSafe
+                waiting_task->release();
+            } else {
+#ifdef EXIT_DEBUG
+                log::debug("could not find waiting task PID %x", WAITING_PID);
+#endif
             }
-
-            // Mark that this waiter has consumed the exit status (zombie can now be reaped)
-            // Note: If multiple processes wait for the same child (not typical but possible),
-            // only the first one marks waited_on. In Linux, only one waiter succeeds anyway.
-            if (i == 0) {  // First waiter marks the process as waited-on
-                current_task->waited_on = true;
-            }
-
-            // Reschedule the waiting task on its last-known CPU to avoid cross-CPU migration
-            // latency and the risk of landing on a non-preemptible CPU.  Fall back to the
-            // least-loaded CPU only if the stored cpu index is out of range.
-            uint64_t target_cpu = waiting_task->cpu;
-            if (target_cpu >= ker::mod::smt::get_core_count()) {
-                target_cpu = ker::mod::sched::get_least_loaded_cpu();
-            }
-            ker::mod::sched::reschedule_task_for_cpu(target_cpu, waiting_task);
-#ifdef EXIT_DEBUG
-            log::debug("successfully rescheduled waiting task PID %x on CPU %d", WAITING_PID, waiting_task->cpu);
-#endif
-
-            // Release the reference we acquired from findTaskByPidSafe
-            waiting_task->release();
-        } else {
-#ifdef EXIT_DEBUG
-            log::debug("could not find waiting task PID %x", WAITING_PID);
-#endif
         }
     }
 
@@ -441,5 +463,46 @@ void wos_proc_exit_signal(int signo) {
     // A shell turns WIFSIGNALED(status)/WTERMSIG(status) into "$? = 128 + signo".
     wos_proc_exit_with_wait_status(128 + signo, signo & 0x7f);
 }
+
+#ifdef WOS_SELFTEST
+auto process_selftest_exit_waiter_notify_drains_over_batch() -> bool {
+    ker::mod::sched::task::Task exiting{};
+    constexpr size_t WAITER_COUNT = (EXIT_WAITER_NOTIFY_BATCH * 2) + 3;
+    constexpr uint64_t FIRST_PID = 1000;
+    std::array<bool, WAITER_COUNT> seen{};
+
+    for (size_t i = 0; i < WAITER_COUNT; ++i) {
+        if (!exiting.awaitee_on_exit.push_back(FIRST_PID + i)) {
+            return false;
+        }
+    }
+
+    size_t drained = 0;
+    bool saw_full_batch = false;
+    for (;;) {
+        ExitWaiterBatch batch{};
+        size_t const COUNT = drain_exit_waiters_for_notify(&exiting, batch);
+        if (COUNT == 0) {
+            break;
+        }
+        saw_full_batch = saw_full_batch || COUNT == EXIT_WAITER_NOTIFY_BATCH;
+
+        for (size_t i = 0; i < COUNT; ++i) {
+            uint64_t const PID = batch.at(i);
+            if (PID < FIRST_PID || PID >= FIRST_PID + WAITER_COUNT) {
+                return false;
+            }
+            size_t const INDEX = static_cast<size_t>(PID - FIRST_PID);
+            if (seen.at(INDEX)) {
+                return false;
+            }
+            seen.at(INDEX) = true;
+            drained++;
+        }
+    }
+
+    return saw_full_batch && drained == WAITER_COUNT && exiting.awaitee_on_exit.empty();
+}
+#endif
 
 }  // namespace ker::syscall::process

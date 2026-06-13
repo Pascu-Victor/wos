@@ -601,6 +601,8 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
     auto* return_task = sched::get_return_task();
     if (return_task == sched::get_current_task()) {
         sys::signal::check_pending_signals_interrupt(*gpr_ptr, *frame_ptr);
+    } else {
+        sys::signal::check_pending_signals_handoff(return_task, *gpr_ptr, *frame_ptr);
     }
     validate_kernel_frame(*frame_ptr, return_task, "timer-return");
 
@@ -723,6 +725,8 @@ extern "C" void wos_jump_to_next_task_no_save(void* stack_ptr) {
     auto* return_task = sched::get_return_task();
     if (return_task == sched::get_current_task()) {
         sys::signal::check_pending_signals_interrupt(*gpr_ptr, *frame_ptr);
+    } else {
+        sys::signal::check_pending_signals_handoff(return_task, *gpr_ptr, *frame_ptr);
     }
     validate_kernel_frame(*frame_ptr, return_task, "exit-return");
 }

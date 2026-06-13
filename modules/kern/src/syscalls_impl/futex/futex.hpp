@@ -30,4 +30,9 @@ void futex_wait_cleanup_for_task(ker::mod::sched::task::Task* task);
 // Returns the number of threads woken, or -EINVAL if phys_addr == 0.
 int64_t futex_wake_by_phys(uint64_t phys_addr);
 
+#ifdef WOS_SELFTEST
+auto futex_selftest_table_init_is_serialized() -> bool;
+auto futex_selftest_addr_alignment_guard() -> bool;
+#endif
+
 }  // namespace ker::syscall::futex

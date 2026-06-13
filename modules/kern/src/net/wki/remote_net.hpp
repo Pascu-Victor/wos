@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <net/address.hpp>
 #include <net/netdevice.hpp>
@@ -9,6 +10,29 @@
 #include <platform/sys/spinlock.hpp>
 
 namespace ker::net::wki {
+
+constexpr uint64_t WKI_REMOTE_NET_STATS_POLL_INTERVAL_US = 1'000'000;
+
+struct WkiRemoteNetXmitRequestSize {
+    bool ok = false;
+    uint16_t total_len = 0;
+};
+
+constexpr auto wki_remote_net_stats_poll_due(uint64_t now_us, uint64_t last_poll_us,
+                                             uint64_t interval_us = WKI_REMOTE_NET_STATS_POLL_INTERVAL_US) -> bool {
+    return interval_us == 0 || last_poll_us == 0 || now_us < last_poll_us || now_us - last_poll_us >= interval_us;
+}
+
+constexpr auto wki_remote_net_xmit_request_size(size_t packet_len) -> WkiRemoteNetXmitRequestSize {
+    constexpr size_t HEADER_LEN = sizeof(DevOpReqPayload);
+    if (HEADER_LEN > WKI_ETH_MAX_PAYLOAD || packet_len > WKI_ETH_MAX_PAYLOAD - HEADER_LEN) {
+        return {};
+    }
+    return WkiRemoteNetXmitRequestSize{
+        .ok = true,
+        .total_len = static_cast<uint16_t>(HEADER_LEN + packet_len),
+    };
+}
 
 // -----------------------------------------------------------------------------
 // ProxyNetState (consumer side) - per-remote-NIC proxy state
@@ -22,6 +46,10 @@ struct ProxyNetState {
     uint16_t max_op_size = 0;
 
     std::atomic<bool> op_pending{false};
+    uint16_t op_expected_id = 0;
+    uint16_t op_expected_seq = 0;
+    uint16_t op_next_cookie = 1;
+    uint64_t op_deadline_us = 0;
     int16_t op_status = 0;
     void* op_resp_buf = nullptr;  // D13: response data buffer for synchronous ops
     uint16_t op_resp_len = 0;
@@ -32,6 +60,8 @@ struct ProxyNetState {
     uint8_t attach_status = 0;
     uint16_t attach_channel = 0;
     uint16_t attach_max_op_size = 0;
+    uint8_t attach_cookie = 0;
+    uint8_t attach_expected_cookie = 0;
     WkiWaitEntry* attach_wait_entry = nullptr;  // V2 I-4: async wait for DEV_ATTACH_ACK
 
     // V2: Extended attach info from NET ACK [V2 A5.3]
@@ -46,6 +76,8 @@ struct ProxyNetState {
 
     net::NetDevice netdev;
     mod::sys::Spinlock lock;
+    std::atomic<uint32_t> refs{0};
+    std::atomic<bool> retiring{false};
 };
 
 // -----------------------------------------------------------------------------
@@ -78,7 +110,7 @@ namespace detail {
 
 // Server side: handle NET operations (called from dev_server handle_dev_op_req)
 void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, net::NetDevice* net_dev, uint16_t op_id, const uint8_t* data,
-                   uint16_t data_len, void* binding_ptr = nullptr);
+                   uint16_t data_len);
 
 // Consumer side: handle DEV_OP_RESP for NET proxy (SET_MAC, GET_STATS)
 void handle_net_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);

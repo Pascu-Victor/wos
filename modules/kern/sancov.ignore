@@ -1,0 +1,14 @@
+# Keep libc++ implementation helpers and ABI entry points out of KASAN.
+# These templates are fine in normal builds, but early-boot KASAN shadow checks
+# inside instantiated libc++ helpers have been a recurring source of pre-IDT
+# faults in the KTEST kernel.
+src:*/include/c++/v1/*
+src:*/llvm-project/libcxx/include/*
+src:*/libcxx/include/*
+
+# Belt-and-suspenders coverage for instantiated helper names that may not keep
+# a useful source path in diagnostics.
+fun:*std::__*
+fun:*std::*
+fun:*__cxx*
+fun:*__libcpp*

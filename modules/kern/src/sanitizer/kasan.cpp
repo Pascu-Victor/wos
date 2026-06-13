@@ -225,27 +225,46 @@ auto handle_shadow_fault(uint64_t cr2) -> bool {
 // ---------------------------------------------------------------------------
 
 void poison_range(const void* ptr, size_t size, int8_t value) {
-    auto addr = reinterpret_cast<uintptr_t>(ptr);
-
-    // Poison whole-granule (8-byte) units first
-    size_t const FULL_UNITS = size / 8;
-    int8_t* shadow = addr_to_shadow(addr);
-    if (FULL_UNITS > 0) {
-        std::memset(shadow, value, FULL_UNITS);
+    if (size == 0) {
+        return;
+    }
+    if (value == SHADOW_ACCESSIBLE) {
+        unpoison_range(ptr, size);
+        return;
     }
 
-    // Partial last granule: if poisoning, mark as partially accessible
-    // (only the leading bytes are valid — same as ASan partial poisoning).
-    size_t const REMAINDER = size % 8;
-    if (REMAINDER != 0) {
-        // For partial poisoning we store the count of accessible bytes
-        // (ASan convention: shadow byte = N means first N bytes accessible).
-        // When unpoisoning (value == 0) we clear it fully.
-        shadow[FULL_UNITS] = (value == SHADOW_ACCESSIBLE) ? 0 : static_cast<int8_t>(REMAINDER);
+    auto const START = reinterpret_cast<uintptr_t>(ptr);
+    uintptr_t const END = START + size;
+    for (uintptr_t granule = START & ~0x7ULL; granule < END; granule += 8) {
+        uintptr_t const POISON_START = START > granule ? START : granule;
+        int8_t* shadow = addr_to_shadow(granule);
+        if (POISON_START == granule) {
+            *shadow = value;
+        } else {
+            *shadow = static_cast<int8_t>(POISON_START - granule);
+        }
     }
 }
 
-void unpoison_range(const void* ptr, size_t size) { poison_range(ptr, size, SHADOW_ACCESSIBLE); }
+void unpoison_range(const void* ptr, size_t size) {
+    if (size == 0) {
+        return;
+    }
+
+    auto const START = reinterpret_cast<uintptr_t>(ptr);
+    uintptr_t const END = START + size;
+    for (uintptr_t granule = START & ~0x7ULL; granule < END; granule += 8) {
+        uintptr_t const ACCESS_START = START > granule ? START : granule;
+        uintptr_t const GRANULE_END = granule + 8;
+        uintptr_t const ACCESS_END = END < GRANULE_END ? END : GRANULE_END;
+        int8_t* shadow = addr_to_shadow(granule);
+        if (ACCESS_START != granule || ACCESS_END == GRANULE_END) {
+            *shadow = SHADOW_ACCESSIBLE;
+        } else {
+            *shadow = static_cast<int8_t>(ACCESS_END - granule);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // KASan early init — unpoison the kernel static image

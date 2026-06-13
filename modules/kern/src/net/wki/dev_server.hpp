@@ -28,10 +28,13 @@ struct NetRxFilter {
 
 struct DevServerBinding {
     bool active = false;
+    std::atomic<uint32_t> refs{0};
+    std::atomic<bool> retiring{false};
     uint16_t consumer_node = WKI_NODE_INVALID;
     uint16_t assigned_channel = 0;
     ResourceType resource_type = ResourceType::BLOCK;
     uint32_t resource_id = 0;
+    uint8_t attach_cookie = 0;
     dev::BlockDevice* block_dev = nullptr;
     char vfs_export_path[256] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     char vfs_export_name[256] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
@@ -86,10 +89,13 @@ struct DevServerBinding {
     auto operator=(const DevServerBinding&) -> DevServerBinding& = delete;
     DevServerBinding(DevServerBinding&& o) noexcept
         : active(o.active),
+          refs(o.refs.load(std::memory_order_relaxed)),
+          retiring(o.retiring.load(std::memory_order_relaxed)),
           consumer_node(o.consumer_node),
           assigned_channel(o.assigned_channel),
           resource_type(o.resource_type),
           resource_id(o.resource_id),
+          attach_cookie(o.attach_cookie),
           block_dev(o.block_dev),
           net_dev(o.net_dev),
           net_rx_filter(o.net_rx_filter),
@@ -136,10 +142,13 @@ struct DevServerBinding {
     auto operator=(DevServerBinding&& o) noexcept -> DevServerBinding& {
         if (this != &o) {
             active = o.active;
+            refs.store(o.refs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            retiring.store(o.retiring.load(std::memory_order_relaxed), std::memory_order_relaxed);
             consumer_node = o.consumer_node;
             assigned_channel = o.assigned_channel;
             resource_type = o.resource_type;
             resource_id = o.resource_id;
+            attach_cookie = o.attach_cookie;
             block_dev = o.block_dev;
             // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
             __builtin_memcpy(vfs_export_path, o.vfs_export_path, sizeof(vfs_export_path));
@@ -241,10 +250,20 @@ void wki_dev_server_forward_net_rx(net::NetDevice* dev, net::PacketBuffer* pkt);
 // proxies when a real NIC changes locally.
 void wki_dev_server_notify_net_changed(net::NetDevice* dev);
 
+// Update NET binding state from owner-side NET op handlers. These helpers
+// revalidate under the server lock so detach/fence erasure cannot race with a
+// raw DevServerBinding pointer captured in the RX handler.
+void wki_dev_server_mark_net_opened(uint16_t consumer_node, uint16_t channel_id, net::NetDevice* dev, bool opened);
+void wki_dev_server_add_net_rx_credits(uint16_t consumer_node, uint16_t channel_id, net::NetDevice* dev, uint16_t credits);
+
 // Refresh cached VFS export path/name for active bindings attached to a
 // resource whose advertised backing path changed (for example after
 // pivot_root() rebuilds the export table).
 void wki_dev_server_refresh_vfs_binding(uint32_t resource_id, const char* export_path, const char* export_name);
+
+#ifdef WOS_SELFTEST
+auto wki_dev_server_selftest_binding_lifecycle_flags() -> bool;
+#endif
 
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers (called from wki.cpp dispatch)

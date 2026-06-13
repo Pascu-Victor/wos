@@ -135,16 +135,20 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
 
             uint64_t const CPU_COUNT = mod::smt::get_core_count();
             if (CPU_COUNT == 0) {
+                mod::sched::task::destroy_unpublished_user_thread(t);
                 return static_cast<uint64_t>(-ENOMEM);
             }
             uint64_t const TARGET_CPU = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % CPU_COUNT;
 
             if (!publish_thread_tid_to_tcb(parent, tcb_va, t->pid)) {
+                mod::sched::task::destroy_unpublished_user_thread(t);
                 return static_cast<uint64_t>(-EFAULT);
             }
 
             bool const POSTED = mod::sched::post_task_for_cpu(TARGET_CPU, t);
             if (!POSTED) {
+                (void)publish_thread_tid_to_tcb(parent, tcb_va, 0);
+                mod::sched::task::destroy_unpublished_user_thread(t);
                 return static_cast<uint64_t>(-ENOMEM);
             }
 

@@ -12,12 +12,14 @@
 #include <net/wki/event.hpp>
 #include <net/wki/irq_fwd.hpp>
 #include <net/wki/peer.hpp>
+#include <net/wki/peer_liveness.hpp>
 #include <net/wki/remotable.hpp>
 #include <net/wki/remote_compute.hpp>
 #include <net/wki/remote_ipc.hpp>
 #include <net/wki/remote_net.hpp>
 #include <net/wki/remote_vfs.hpp>
 #include <net/wki/routing.hpp>
+#include <net/wki/timer_math.hpp>
 #include <net/wki/transport_eth.hpp>
 #include <net/wki/transport_roce.hpp>
 #include <net/wki/wire.hpp>
@@ -39,6 +41,7 @@ using log = ker::mod::dbg::logger<"wki">;
 
 namespace {
 constexpr size_t HELLO_CHANNEL_EPOCH_OFFSET = 0;
+constexpr size_t HELLO_BOOT_EPOCH_OFFSET = HELLO_CHANNEL_EPOCH_OFFSET + sizeof(uint32_t);
 
 void hello_set_channel_epoch(HelloPayload* hello, uint32_t epoch) {
     if (hello == nullptr || HELLO_CHANNEL_EPOCH_OFFSET + sizeof(uint32_t) > hello->reserved.size()) {
@@ -62,6 +65,28 @@ auto hello_channel_epoch(const HelloPayload* hello) -> uint32_t {
            (static_cast<uint32_t>(hello->reserved.at(HELLO_CHANNEL_EPOCH_OFFSET + 3)) << 24U);
 }
 
+void hello_set_boot_epoch(HelloPayload* hello, uint32_t epoch) {
+    if (hello == nullptr || HELLO_BOOT_EPOCH_OFFSET + sizeof(uint32_t) > hello->reserved.size()) {
+        return;
+    }
+
+    hello->reserved.at(HELLO_BOOT_EPOCH_OFFSET + 0) = static_cast<uint8_t>(epoch & 0xFFU);
+    hello->reserved.at(HELLO_BOOT_EPOCH_OFFSET + 1) = static_cast<uint8_t>((epoch >> 8U) & 0xFFU);
+    hello->reserved.at(HELLO_BOOT_EPOCH_OFFSET + 2) = static_cast<uint8_t>((epoch >> 16U) & 0xFFU);
+    hello->reserved.at(HELLO_BOOT_EPOCH_OFFSET + 3) = static_cast<uint8_t>((epoch >> 24U) & 0xFFU);
+}
+
+auto hello_boot_epoch(const HelloPayload* hello) -> uint32_t {
+    if (hello == nullptr || HELLO_BOOT_EPOCH_OFFSET + sizeof(uint32_t) > hello->reserved.size()) {
+        return 0;
+    }
+
+    return static_cast<uint32_t>(hello->reserved.at(HELLO_BOOT_EPOCH_OFFSET + 0)) |
+           (static_cast<uint32_t>(hello->reserved.at(HELLO_BOOT_EPOCH_OFFSET + 1)) << 8U) |
+           (static_cast<uint32_t>(hello->reserved.at(HELLO_BOOT_EPOCH_OFFSET + 2)) << 16U) |
+           (static_cast<uint32_t>(hello->reserved.at(HELLO_BOOT_EPOCH_OFFSET + 3)) << 24U);
+}
+
 auto next_channel_epoch(uint32_t epoch) -> uint32_t {
     ++epoch;
     return epoch == 0 ? 1 : epoch;
@@ -74,6 +99,44 @@ auto peer_note_remote_channel_epoch_locked(WkiPeer* peer, uint32_t remote_epoch)
 
     peer->remote_channel_epoch = remote_epoch;
     return true;
+}
+
+auto peer_note_remote_boot_epoch_locked(WkiPeer* peer, uint32_t remote_epoch) -> bool {
+    if (peer == nullptr || remote_epoch == 0 || remote_epoch == peer->remote_boot_epoch) {
+        return false;
+    }
+
+    peer->remote_boot_epoch = remote_epoch;
+    return true;
+}
+
+auto hello_boot_epoch_matches_peer(const WkiPeer* peer, uint32_t remote_epoch) -> bool {
+    return peer != nullptr && (remote_epoch == 0 || peer->remote_boot_epoch == remote_epoch);
+}
+
+enum class HelloAckPeerTransition : uint8_t {
+    UNCHANGED,
+    CONNECTED,
+    RECONNECTING,
+};
+
+auto apply_hello_ack_peer_state_locked(WkiPeer* peer, uint64_t now_us) -> HelloAckPeerTransition {
+    if (peer == nullptr) {
+        return HelloAckPeerTransition::UNCHANGED;
+    }
+
+    if (peer->state == PeerState::FENCED) {
+        peer->state = PeerState::RECONNECTING;
+        return HelloAckPeerTransition::RECONNECTING;
+    }
+
+    if (peer->state == PeerState::HELLO_SENT || peer->state == PeerState::UNKNOWN) {
+        peer->state = PeerState::CONNECTED;
+        peer->connected_time = now_us;
+        return HelloAckPeerTransition::CONNECTED;
+    }
+
+    return HelloAckPeerTransition::UNCHANGED;
 }
 
 void copy_hostname_for_log(std::array<char, WKI_HOSTNAME_MAX>& dst, const std::array<char, WKI_HOSTNAME_MAX>& src) {
@@ -118,6 +181,7 @@ void wki_peer_send_hello_broadcast() {
     hello.rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
     // V2: include local hostname
     hello.hostname = g_wki.local_hostname;
+    hello_set_boot_epoch(&hello, g_wki.local_boot_epoch);
 
     wki_send_raw(WKI_NODE_BROADCAST, MsgType::HELLO, &hello, sizeof(hello), WKI_FLAG_PRIORITY);
 }
@@ -134,6 +198,7 @@ void wki_peer_send_hello(WkiTransport* transport, uint16_t dst_node) {
     hello.rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
     // V2: include local hostname
     hello.hostname = g_wki.local_hostname;
+    hello_set_boot_epoch(&hello, g_wki.local_boot_epoch);
     if (WkiPeer* peer = wki_peer_find(dst_node); peer != nullptr) {
         hello_set_channel_epoch(&hello, peer->local_channel_epoch);
     }
@@ -175,6 +240,7 @@ void wki_peer_send_hello_ack(WkiPeer* peer) {
     ack.rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
     // V2: include local hostname
     ack.hostname = g_wki.local_hostname;
+    hello_set_boot_epoch(&ack, g_wki.local_boot_epoch);
     hello_set_channel_epoch(&ack, peer->local_channel_epoch);
 
     wki_send_raw(peer->node_id, MsgType::HELLO_ACK, &ack, sizeof(ack), WKI_FLAG_PRIORITY);
@@ -274,15 +340,19 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
     bool log_hostname_collision = false;
     bool log_reconnecting = false;
     bool log_connected = false;
+    bool remote_boot_epoch_changed = false;
     bool remote_channel_epoch_changed = false;
-    uint32_t const REMOTE_CHANNEL_EPOCH = (hdr != nullptr && hdr->dst_node != WKI_NODE_BROADCAST) ? hello_channel_epoch(hello) : 0;
+    bool resync_connected_peer = false;
+    uint32_t const REMOTE_BOOT_EPOCH = hello_boot_epoch(hello);
+    uint32_t const REMOTE_CHANNEL_EPOCH = hello_channel_epoch(hello);
 
     g_wki.peer_lock.lock();
 
     WkiPeer* peer = wki_peer_find(peer_node);
     // Periodic broadcast HELLOs are discovery beacons. Once a direct peer is
     // already connected, refresh contact state but do not make every node ACK.
-    if (peer != nullptr && IS_BROADCAST_HELLO && peer->state == PeerState::CONNECTED && peer->is_direct) {
+    if (peer != nullptr && IS_BROADCAST_HELLO && peer->state == PeerState::CONNECTED && peer->is_direct &&
+        hello_boot_epoch_matches_peer(peer, REMOTE_BOOT_EPOCH)) {
         uint64_t const NOW_US = wki_now_us();
         peer->mac = hello->mac_addr;
         if (peer->transport == nullptr || transport->rdma_capable || !peer->transport->rdma_capable) {
@@ -330,6 +400,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
     peer->last_rx_activity = peer->last_heartbeat;
     peer->missed_beats = 0;
     peer->fence_defer_until_us = 0;
+    remote_boot_epoch_changed = peer_note_remote_boot_epoch_locked(peer, REMOTE_BOOT_EPOCH);
     remote_channel_epoch_changed = peer_note_remote_channel_epoch_locked(peer, REMOTE_CHANNEL_EPOCH);
 
     // V2: Copy hostname from HELLO payload
@@ -411,7 +482,11 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
     if (log_hostname_collision) {
         log::warn("Hostname collision with 0x%04x, falling back to '%s'", peer_node, local_hostname_fallback.data());
     }
-    if (remote_channel_epoch_changed) {
+    if (remote_boot_epoch_changed) {
+        log::info("Peer 0x%04x boot epoch changed to %u; resetting stale channel state", peer_node, REMOTE_BOOT_EPOCH);
+        wki_channels_close_for_peer(peer_node);
+        resync_connected_peer = !newly_connected && !WAS_FENCED;
+    } else if (remote_channel_epoch_changed) {
         log::info("Peer 0x%04x channel epoch advanced to %u; resetting stale channel state", peer_node, REMOTE_CHANNEL_EPOCH);
         wki_channels_close_for_peer(peer_node);
     }
@@ -438,7 +513,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
     }
 
     // Only run topology updates and resource discovery on actual state transitions
-    if (newly_connected) {
+    if (newly_connected || resync_connected_peer) {
         // Topology changed: regenerate our LSA and flood
         wki_lsa_generate_and_flood();
 
@@ -448,8 +523,10 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
         // V2: Register peer in /dev/nodes/ hierarchy
         vfs::devfs::devfs_nodes_add_peer(log_hostname.data(), peer_node);
 
-        // Emit NODE_JOIN event
-        wki_event_publish(EVENT_CLASS_SYSTEM, EVENT_SYSTEM_NODE_JOIN, &peer_node, sizeof(peer_node));
+        if (newly_connected) {
+            // Emit NODE_JOIN event
+            wki_event_publish(EVENT_CLASS_SYSTEM, EVENT_SYSTEM_NODE_JOIN, &peer_node, sizeof(peer_node));
+        }
     }
 }
 
@@ -469,7 +546,10 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
     uint16_t peer_node = ack->node_id;
     std::array<char, WKI_HOSTNAME_MAX> log_hostname{};
     bool remote_channel_epoch_changed = false;
+    bool remote_boot_epoch_changed = false;
+    bool resync_connected_peer = false;
     uint32_t const REMOTE_CHANNEL_EPOCH = hello_channel_epoch(ack);
+    uint32_t const REMOTE_BOOT_EPOCH = hello_boot_epoch(ack);
 
     g_wki.peer_lock.lock();
 
@@ -513,6 +593,7 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
     peer->last_rx_activity = peer->last_heartbeat;
     peer->missed_beats = 0;
     peer->fence_defer_until_us = 0;
+    remote_boot_epoch_changed = peer_note_remote_boot_epoch_locked(peer, REMOTE_BOOT_EPOCH);
     remote_channel_epoch_changed = peer_note_remote_channel_epoch_locked(peer, REMOTE_CHANNEL_EPOCH);
 
     // Negotiate heartbeat interval
@@ -532,12 +613,9 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
         }
     }
 
-    bool newly_connected = false;
-    if (peer->state == PeerState::HELLO_SENT || peer->state == PeerState::UNKNOWN) {
-        peer->state = PeerState::CONNECTED;
-        peer->connected_time = wki_now_us();  // Record connection time for grace period
-        newly_connected = true;
-    }
+    HelloAckPeerTransition const STATE_TRANSITION = apply_hello_ack_peer_state_locked(peer, wki_now_us());
+    bool newly_connected = STATE_TRANSITION == HelloAckPeerTransition::CONNECTED;
+    bool const WAS_FENCED = STATE_TRANSITION == HelloAckPeerTransition::RECONNECTING;
     copy_hostname_for_log(log_hostname, peer->hostname);
     const char* log_transport_name = peer->transport != nullptr ? peer->transport->name : "?";
 
@@ -545,14 +623,49 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
 
     wki_eth_neighbor_add(peer_node, ack->mac_addr);
 
-    if (remote_channel_epoch_changed) {
+    if (WAS_FENCED) {
+        log::info("Peer 0x%04x '%s' reconnecting from HELLO_ACK (was fenced)", peer_node, log_hostname.data());
+    }
+
+    if (remote_boot_epoch_changed && !WAS_FENCED) {
+        log::info("Peer 0x%04x boot epoch changed to %u; resetting stale channel state", peer_node, REMOTE_BOOT_EPOCH);
+        wki_channels_close_for_peer(peer_node);
+        resync_connected_peer = !newly_connected;
+    } else if (remote_channel_epoch_changed && !WAS_FENCED) {
         log::info("Peer 0x%04x channel epoch advanced to %u; resetting stale channel state", peer_node, REMOTE_CHANNEL_EPOCH);
         wki_channels_close_for_peer(peer_node);
     }
 
+    bool reconnected = false;
+    if (WAS_FENCED) {
+        wki_channels_close_for_peer(peer_node);
+
+        g_wki.peer_lock.lock();
+        if (peer->state == PeerState::RECONNECTING) {
+            peer->state = PeerState::CONNECTED;
+            peer->connected_time = wki_now_us();
+            copy_hostname_for_log(log_hostname, peer->hostname);
+            newly_connected = true;
+            reconnected = true;
+        }
+        g_wki.peer_lock.unlock();
+
+        if (reconnected) {
+            log::info("Peer 0x%04x '%s' reconnected from HELLO_ACK, reconciling", peer_node, log_hostname.data());
+            wki_dev_proxy_resume_for_peer(peer_node);
+        }
+    }
+
     // Topology changed: regenerate our LSA and flood
-    if (newly_connected) {
-        log::info("Peer 0x%04x '%s' connected (HELLO_ACK received, transport=%s)", peer_node, log_hostname.data(), log_transport_name);
+    if (newly_connected || resync_connected_peer) {
+        if (!reconnected) {
+            if (newly_connected) {
+                log::info("Peer 0x%04x '%s' connected (HELLO_ACK received, transport=%s)", peer_node, log_hostname.data(),
+                          log_transport_name);
+            } else {
+                log::info("Peer 0x%04x '%s' resyncing after boot epoch change", peer_node, log_hostname.data());
+            }
+        }
 
         wki_lsa_generate_and_flood();
 
@@ -562,12 +675,68 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
         // V2: Register peer in /dev/nodes/ hierarchy
         vfs::devfs::devfs_nodes_add_peer(log_hostname.data(), peer_node);
 
-        // Emit NODE_JOIN event
-        wki_event_publish(EVENT_CLASS_SYSTEM, EVENT_SYSTEM_NODE_JOIN, &peer_node, sizeof(peer_node));
+        if (newly_connected) {
+            // Emit NODE_JOIN event
+            wki_event_publish(EVENT_CLASS_SYSTEM, EVENT_SYSTEM_NODE_JOIN, &peer_node, sizeof(peer_node));
+        }
     }
 }
 
 }  // namespace detail
+
+#ifdef WOS_SELFTEST
+auto wki_peer_selftest_hello_ack_state_transition() -> bool {
+    WkiPeer peer{};
+
+    peer.state = PeerState::FENCED;
+    auto transition = apply_hello_ack_peer_state_locked(&peer, 100);
+    bool const FENCED_RECONNECTS = transition == HelloAckPeerTransition::RECONNECTING && peer.state == PeerState::RECONNECTING;
+
+    peer.state = PeerState::HELLO_SENT;
+    peer.connected_time = 0;
+    transition = apply_hello_ack_peer_state_locked(&peer, 200);
+    bool const HELLO_SENT_CONNECTS =
+        transition == HelloAckPeerTransition::CONNECTED && peer.state == PeerState::CONNECTED && peer.connected_time == 200;
+
+    peer.state = PeerState::CONNECTED;
+    peer.connected_time = 300;
+    transition = apply_hello_ack_peer_state_locked(&peer, 400);
+    bool const CONNECTED_UNCHANGED =
+        transition == HelloAckPeerTransition::UNCHANGED && peer.state == PeerState::CONNECTED && peer.connected_time == 300;
+
+    return FENCED_RECONNECTS && HELLO_SENT_CONNECTS && CONNECTED_UNCHANGED;
+}
+
+auto wki_peer_selftest_hello_epoch_words_are_independent() -> bool {
+    HelloPayload hello = {};
+    hello_set_channel_epoch(&hello, 0x11223344);
+    hello_set_boot_epoch(&hello, 0xA1B2C3D4);
+
+    bool const INITIAL_VALUES_MATCH = hello_channel_epoch(&hello) == 0x11223344 && hello_boot_epoch(&hello) == 0xA1B2C3D4;
+
+    hello_set_channel_epoch(&hello, 0x55667788);
+    bool const CHANNEL_UPDATE_PRESERVES_BOOT = hello_channel_epoch(&hello) == 0x55667788 && hello_boot_epoch(&hello) == 0xA1B2C3D4;
+
+    hello_set_boot_epoch(&hello, 0x01020304);
+    bool const BOOT_UPDATE_PRESERVES_CHANNEL = hello_channel_epoch(&hello) == 0x55667788 && hello_boot_epoch(&hello) == 0x01020304;
+
+    return INITIAL_VALUES_MATCH && CHANNEL_UPDATE_PRESERVES_BOOT && BOOT_UPDATE_PRESERVES_CHANNEL;
+}
+
+auto wki_peer_selftest_remote_boot_epoch_detects_restart() -> bool {
+    WkiPeer peer{};
+
+    bool const ZERO_IGNORED = !peer_note_remote_boot_epoch_locked(&peer, 0) && peer.remote_boot_epoch == 0;
+    bool const FIRST_NONZERO_RECORDS = peer_note_remote_boot_epoch_locked(&peer, 0x10203040) && peer.remote_boot_epoch == 0x10203040;
+    bool const SAME_NONZERO_IGNORED = !peer_note_remote_boot_epoch_locked(&peer, 0x10203040);
+    bool const NEW_NONZERO_DETECTED = peer_note_remote_boot_epoch_locked(&peer, 0x10203041) && peer.remote_boot_epoch == 0x10203041;
+    bool const MATCH_HELPER_ACCEPTS_CURRENT = hello_boot_epoch_matches_peer(&peer, 0x10203041);
+    bool const MATCH_HELPER_REJECTS_STALE = !hello_boot_epoch_matches_peer(&peer, 0x10203040);
+
+    return ZERO_IGNORED && FIRST_NONZERO_RECORDS && SAME_NONZERO_IGNORED && NEW_NONZERO_DETECTED && MATCH_HELPER_ACCEPTS_CURRENT &&
+           MATCH_HELPER_REJECTS_STALE;
+}
+#endif
 
 // -----------------------------------------------------------------------------
 // Heartbeat - send and receive
@@ -606,7 +775,7 @@ void wki_peer_send_heartbeats() {
         // FROM the peer). That only proves THEIR liveness to us, not ours
         // to them — using it caused false-positive fencing when a peer was
         // sending to us but we weren't replying.
-        uint64_t const SUPPRESS_US = static_cast<uint64_t>(peer.heartbeat_interval_ms) * 1000;
+        uint64_t const SUPPRESS_US = wki_peer_interval_us(&peer);
         uint64_t const NOW_HB = wki_now_us();
         if (peer.last_tx_activity != 0 && (NOW_HB - peer.last_tx_activity) < SUPPRESS_US) {
             continue;
@@ -961,7 +1130,7 @@ auto wki_min_heartbeat_interval_us() -> uint64_t {
         if (peer.node_id == WKI_NODE_INVALID || peer.state != PeerState::CONNECTED) {
             continue;
         }
-        uint64_t const PEER_INTERVAL_US = static_cast<uint64_t>(peer.heartbeat_interval_ms) * 1000;
+        uint64_t const PEER_INTERVAL_US = wki_peer_interval_us(&peer);
         min_interval_us = std::min(min_interval_us, PEER_INTERVAL_US);
     }
     return min_interval_us;
@@ -989,46 +1158,7 @@ auto wki_schedule_next_heartbeat_deadline(uint64_t now_us, uint64_t min_interval
         effective_interval = min_interval_us * 2;
     }
 
-    return now_us + effective_interval;
-}
-
-auto wki_peer_observed_liveness_us(const WkiPeer* peer) -> uint64_t {
-    if (peer == nullptr) {
-        return 0;
-    }
-    return std::max(peer->last_heartbeat, peer->last_rx_activity);
-}
-
-auto wki_peer_confirm_grace_us(const WkiPeer* peer) -> uint64_t {
-    if (peer == nullptr) {
-        return 0;
-    }
-    uint64_t const INTERVAL_US = static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000;
-    uint64_t const CONFIRM_GRACE_US = static_cast<uint64_t>(WKI_PEER_FENCE_CONFIRM_GRACE_MS) * 1000;
-    return std::max<uint64_t>(INTERVAL_US, CONFIRM_GRACE_US);
-}
-
-auto wki_peer_timeout_us(const WkiPeer* peer) -> uint64_t {
-    if (peer == nullptr) {
-        return 0;
-    }
-    return static_cast<uint64_t>(peer->heartbeat_interval_ms) * 1000 * peer->miss_threshold;
-}
-
-auto wki_peer_timeout_deadline_us(const WkiPeer* peer, uint64_t now_us) -> uint64_t {
-    if (peer == nullptr) {
-        return UINT64_MAX;
-    }
-
-    uint64_t const TIMEOUT_US = wki_peer_timeout_us(peer);
-    uint64_t next_deadline = wki_peer_observed_liveness_us(peer) + TIMEOUT_US;
-    if (peer->missed_beats != 0) {
-        next_deadline += wki_peer_confirm_grace_us(peer);
-    }
-    if (peer->fence_defer_until_us > now_us) {
-        next_deadline = std::max(next_deadline, peer->fence_defer_until_us);
-    }
-    return next_deadline > now_us ? next_deadline : now_us + 1;
+    return wki_future_deadline_us(now_us, effective_interval);
 }
 
 auto wki_send_heartbeat_probe(WkiPeer* peer) -> int {
@@ -1045,35 +1175,7 @@ auto wki_send_heartbeat_probe(WkiPeer* peer) -> int {
 }
 
 auto local_observation_confirms_fence(const WkiPeer* peer, uint64_t now_us) -> bool {
-    if (peer == nullptr) {
-        return true;
-    }
-    if (peer->state == PeerState::FENCED) {
-        return true;
-    }
-    if (peer->state != PeerState::CONNECTED || !peer->is_direct) {
-        return true;
-    }
-    if (peer->fence_defer_until_us > now_us) {
-        return false;
-    }
-    if (wki_eth_recent_tx_pressure(now_us)) {
-        return false;
-    }
-    if (now_us >= peer->connected_time) {
-        uint64_t const GRACE_PERIOD_US = static_cast<uint64_t>(WKI_PEER_GRACE_PERIOD_MS) * 1000;
-        if (now_us - peer->connected_time < GRACE_PERIOD_US) {
-            return false;
-        }
-    }
-
-    uint64_t const LAST_SEEN = wki_peer_observed_liveness_us(peer);
-    if (LAST_SEEN >= now_us) {
-        return false;
-    }
-
-    uint64_t const ELAPSED = now_us - LAST_SEEN;
-    return ELAPSED >= wki_peer_timeout_us(peer) + wki_peer_confirm_grace_us(peer);
+    return wki_peer_local_observation_confirms_fence(peer, now_us, wki_eth_recent_tx_pressure(now_us));
 }
 
 }  // namespace
@@ -1108,9 +1210,6 @@ void wki_peer_timer_tick(uint64_t now_us) {
         }
     }
 
-    // Check for heartbeat timeouts and fence dead peers
-    uint64_t const GRACE_PERIOD_US = static_cast<uint64_t>(WKI_PEER_GRACE_PERIOD_MS) * 1000;
-
     for (auto& peer : g_wki.peers) {
         if (peer.node_id == WKI_NODE_INVALID) {
             continue;
@@ -1127,8 +1226,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
         }
 
         // Skip timeout check during grace period after initial connection
-        uint64_t const SINCE_CONNECTED = now_us - peer.connected_time;
-        if (SINCE_CONNECTED < GRACE_PERIOD_US) {
+        if (wki_peer_startup_grace_pending(&peer, now_us)) {
             continue;
         }
 
@@ -1150,7 +1248,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
         }
 
         uint64_t const ELAPSED = now_us - LAST_SEEN;
-        uint64_t const TIMEOUT_US = static_cast<uint64_t>(peer.heartbeat_interval_ms) * 1000 * peer.miss_threshold;
+        uint64_t const TIMEOUT_US = wki_peer_timeout_us(&peer);
 
         if (ELAPSED < TIMEOUT_US) {
             peer.missed_beats = 0;
@@ -1167,19 +1265,19 @@ void wki_peer_timer_tick(uint64_t now_us) {
             int const PROBE_RET = wki_send_heartbeat_probe(&peer);
             if (PROBE_RET < 0) {
                 log::warn("Heartbeat probe TX failed for peer 0x%04x (rc=%d); deferring fence confirmation", peer.node_id, PROBE_RET);
-                peer.fence_defer_until_us = now_us + CONFIRM_GRACE_US;
+                peer.fence_defer_until_us = wki_future_deadline_us(now_us, CONFIRM_GRACE_US);
                 continue;
             }
             peer.missed_beats = 1;
-            peer.fence_defer_until_us = now_us + CONFIRM_GRACE_US;
+            peer.fence_defer_until_us = wki_future_deadline_us(now_us, CONFIRM_GRACE_US);
             continue;
         }
 
-        if (ELAPSED >= TIMEOUT_US + CONFIRM_GRACE_US) {
+        if (ELAPSED >= wki_peer_timeout_with_confirm_grace_us(&peer)) {
             if (wki_eth_recent_tx_pressure(now_us)) {
                 log::warn("Heartbeat fence deferred for peer 0x%04x under local WKI TX pressure (%llu us elapsed)", peer.node_id, ELAPSED);
                 (void)wki_send_heartbeat_probe(&peer);
-                peer.fence_defer_until_us = now_us + CONFIRM_GRACE_US;
+                peer.fence_defer_until_us = wki_future_deadline_us(now_us, CONFIRM_GRACE_US);
                 continue;
             }
             if (peer.missed_beats < WKI_PEER_FENCE_PROBE_ROUNDS) {
@@ -1192,7 +1290,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
                               PROBE_RET);
                 }
                 peer.missed_beats = NEXT_ROUND;
-                peer.fence_defer_until_us = now_us + CONFIRM_GRACE_US;
+                peer.fence_defer_until_us = wki_future_deadline_us(now_us, CONFIRM_GRACE_US);
                 continue;
             }
             log::warn("Heartbeat timeout for peer 0x%04x (%llu us elapsed, timeout %llu us)", peer.node_id, ELAPSED, TIMEOUT_US);
@@ -1333,21 +1431,20 @@ void wki_timer_notify() {
 namespace {
 
 auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
-    uint64_t next_deadline = s_last_hello_broadcast + wki_hello_broadcast_interval_us();
+    uint64_t next_deadline = wki_future_deadline_us(s_last_hello_broadcast, wki_hello_broadcast_interval_us());
 
     if (s_next_heartbeat_send_deadline != 0) {
         next_deadline = std::min(next_deadline, s_next_heartbeat_send_deadline);
     }
 
-    next_deadline = std::min(next_deadline, s_last_vfs_fd_gc + VFS_FD_GC_INTERVAL_US);
+    next_deadline = std::min(next_deadline, wki_future_deadline_us(s_last_vfs_fd_gc, VFS_FD_GC_INTERVAL_US));
 
-    uint64_t const GRACE_PERIOD_US = static_cast<uint64_t>(WKI_PEER_GRACE_PERIOD_MS) * 1000;
     for (auto const& peer : g_wki.peers) {
         if (peer.node_id == WKI_NODE_INVALID || peer.state != PeerState::CONNECTED || !peer.is_direct) {
             continue;
         }
-        if (now_us >= peer.connected_time && now_us - peer.connected_time < GRACE_PERIOD_US) {
-            next_deadline = std::min(next_deadline, peer.connected_time + GRACE_PERIOD_US);
+        if (wki_peer_startup_grace_pending(&peer, now_us)) {
+            next_deadline = std::min(next_deadline, wki_peer_startup_grace_deadline_us(&peer));
             continue;
         }
 
@@ -1389,7 +1486,7 @@ auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
             continue;
         }
 
-        uint64_t const WAIT_UNTIL_US = mod::time::get_us() + std::max<uint64_t>(sleep_us, 1);
+        uint64_t const WAIT_UNTIL_US = wki_future_deadline_us(mod::time::get_us(), std::max<uint64_t>(sleep_us, 1));
         wki_timer_wait_until(WAIT_UNTIL_US, NOTIFY_SEQ_BEFORE_SLEEP);
         s_wki_timer_sleep_armed.store(false, std::memory_order_release);
     }

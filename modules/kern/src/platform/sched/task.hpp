@@ -310,8 +310,8 @@ struct Task {
     alignas(8) std::atomic<uint64_t> death_epoch{0};  // Epoch when task became DEAD
 
     // File descriptor table for the task (per-process model).
-    // Dynamic radix tree: no fixed upper bound on FD count.
-    // FD_TABLE_SIZE retained as a soft limit for dup2/fcntl bounds checking.
+    // Sparse radix storage backs ordinary fd allocation, which is capped at
+    // FD_TABLE_SIZE so per-fd CLOEXEC state remains representable.
     ker::util::RadixTree<void*> fd_table;
 
     // Per-fd close-on-exec bitmap (POSIX FD_CLOEXEC is per-fd, not per-file).
@@ -388,9 +388,13 @@ struct Task {
     bool has_exited{};
     // Set after exit cleanup finishes; waitpid may reap only after this.
     std::atomic<bool> exit_notify_ready{false};
-    bool waited_on{};  // Set to true when parent retrieves exit status via waitpid
+    std::atomic<bool> waited_on{false};  // Set when waitpid atomically claims the exit status.
     std::atomic<bool> zombie_resources_reclaiming{false};
     std::atomic<bool> zombie_resources_reclaimed{false};
+    // True while waitpid has begun publishing wait metadata but deferred_task_switch
+    // has not yet saved the syscall return context. Exit notification may wake
+    // the task in this window, but must not write saved registers directly.
+    std::atomic<bool> waitpid_publish_pending{false};
     bool deferred_task_switch{};  // Move to wait queue after syscall returns
     bool yield_switch{};          // Put task in expired queue instead of wait queue
 
@@ -510,4 +514,34 @@ struct Task {
 [[nodiscard]] inline auto process_visible(const Task& task) -> bool { return !task.is_thread && !task.wki_proxy_task; }
 
 auto get_next_pid() -> uint64_t;
+void destroy_unpublished_user_thread(Task* task);
+
+[[nodiscard]] inline auto task_waited_on(const Task& task) -> bool { return task.waited_on.load(std::memory_order_acquire); }
+
+inline void task_clear_waited_on(Task& task) { task.waited_on.store(false, std::memory_order_relaxed); }
+
+[[nodiscard]] inline auto task_try_mark_waited_on(Task& task) -> bool {
+    bool expected = false;
+    return task.waited_on.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+inline void task_clear_waitpid_block_state(Task& task) {
+    task.waiting_for_pid = 0;
+    task.wait_status_user_addr = 0;
+    task.wait_status_phys_addr = 0;
+    task.wait_rusage_user_addr = 0;
+    task.wait_rusage_phys_addr = 0;
+    task.wait_resume_rip_user_addr = 0;
+    task.wait_resume_rip_phys_addr = 0;
+    task.wait_resume_rsp_user_addr = 0;
+    task.wait_resume_rsp_phys_addr = 0;
+    task.wait_channel = nullptr;
+}
+
+#ifdef WOS_SELFTEST
+auto task_selftest_fd_clone_failure_releases_refs() -> bool;
+auto task_selftest_destroy_unpublished_user_thread_releases_refs() -> bool;
+auto task_selftest_waited_on_claim_is_single_winner() -> bool;
+auto task_selftest_waitpid_block_state_clear_resets_fields() -> bool;
+#endif
 }  // namespace ker::mod::sched::task

@@ -304,6 +304,27 @@ auto find_submitted_task_any(uint32_t task_id) -> SubmittedTask* {
     return nullptr;
 }
 
+// s_compute_lock must be held by caller.
+auto claim_and_clear_waiter_locked(WkiWaitEntry*& waiter_slot) -> WkiWaitEntry* {
+    WkiWaitEntry* waiter = waiter_slot;
+    waiter_slot = nullptr;
+    if (!wki_claim_op(waiter)) {
+        return nullptr;
+    }
+    return waiter;
+}
+
+void finish_or_wait_for_cancelled_waiter(WkiWaitEntry& wait, bool claimed, int result) {
+    if (claimed) {
+        wki_finish_claimed_op(&wait, result);
+        return;
+    }
+
+    while (wait.state.load(std::memory_order_acquire) != static_cast<uint8_t>(WkiWaitEntry::DONE)) {
+        ker::mod::sched::kern_yield();
+    }
+}
+
 // s_compute_lock must be held by caller
 auto find_remote_load(uint16_t node_id) -> RemoteNodeLoad* {
     for (auto& rl : g_remote_loads) {
@@ -596,6 +617,54 @@ auto normalize_local_exit_status_for_wire(int32_t exit_status) -> int32_t {
     }
 }
 
+auto proxy_waiter_context_can_be_completed(ker::mod::sched::task::Task* waiter) -> bool {
+    return waiter != nullptr && !waiter->deferred_task_switch && !waiter->waitpid_publish_pending.load(std::memory_order_acquire);
+}
+
+void clear_proxy_wait_result_state(ker::mod::sched::task::Task* waiter) {
+    if (waiter == nullptr) {
+        return;
+    }
+
+    waiter->wait_status_user_addr = 0;
+    waiter->wait_status_phys_addr = 0;
+    waiter->wait_rusage_user_addr = 0;
+    waiter->wait_rusage_phys_addr = 0;
+}
+
+void write_proxy_wait_status(ker::mod::sched::task::Task* waiter, int32_t wait_status) {
+    if (waiter == nullptr || waiter->wait_status_user_addr == 0 || waiter->pagemap == nullptr) {
+        if (waiter != nullptr) {
+            waiter->wait_status_user_addr = 0;
+            waiter->wait_status_phys_addr = 0;
+        }
+        return;
+    }
+
+    uint64_t const STATUS_PHYS = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_status_user_addr);
+    if (STATUS_PHYS != ker::mod::mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
+        auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(STATUS_PHYS));
+        *status_ptr = wait_status;
+    }
+    waiter->wait_status_user_addr = 0;
+    waiter->wait_status_phys_addr = 0;
+}
+
+auto try_complete_proxy_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* proxy, int32_t wait_status) -> bool {
+    if (proxy == nullptr || !proxy_waiter_context_can_be_completed(waiter)) {
+        return false;
+    }
+    if (!ker::mod::sched::task::task_try_mark_waited_on(*proxy)) {
+        return false;
+    }
+
+    waiter->context.regs.rax = proxy->pid;
+    write_proxy_wait_status(waiter, wait_status);
+    clear_proxy_wait_result_state(waiter);
+    waiter->waiting_for_pid = 0;
+    return true;
+}
+
 void cleanup_proxy_resources(ker::mod::sched::task::Task* task) {
     if (task == nullptr || task->is_thread) {
         return;
@@ -664,26 +733,7 @@ void wake_proxy_waiters(ker::mod::sched::task::Task* proxy, int32_t exit_status)
         uint64_t const WAITING_PID = waiting_pids.at(i);
         auto* waiting_task = ker::mod::sched::find_task_by_pid_safe(WAITING_PID);
         if (waiting_task != nullptr) {
-            bool completed_wait = false;
-            if (!waiting_task->deferred_task_switch) {
-                waiting_task->context.regs.rax = proxy->pid;
-                if (waiting_task->wait_status_user_addr != 0 && waiting_task->pagemap != nullptr) {
-                    uint64_t const STATUS_PHYS = ker::mod::mm::virt::translate(waiting_task->pagemap, waiting_task->wait_status_user_addr);
-                    if (STATUS_PHYS != ker::mod::mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
-                        auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(STATUS_PHYS));
-                        *status_ptr = WAIT_STATUS;
-                    }
-                    waiting_task->wait_status_user_addr = 0;
-                    waiting_task->wait_status_phys_addr = 0;
-                }
-                waiting_task->wait_rusage_user_addr = 0;
-                waiting_task->wait_rusage_phys_addr = 0;
-                waiting_task->waiting_for_pid = 0;
-                completed_wait = true;
-            }
-            if (completed_wait && !proxy->waited_on) {
-                proxy->waited_on = true;
-            }
+            (void)try_complete_proxy_wait(waiting_task, proxy, WAIT_STATUS);
             uint64_t const CPU = ker::mod::sched::get_least_loaded_cpu();
             ker::mod::sched::reschedule_task_for_cpu(CPU, waiting_task);
             waiting_task->release();
@@ -727,19 +777,7 @@ void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status
             parent->sig_pending |= (1ULL << (WKI_SIGCHLD_NUM - 1));
 
             static constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
-            if (parent->waiting_for_pid == WAIT_ANY_CHILD && !parent->deferred_task_switch) {
-                parent->context.regs.rax = proxy->pid;
-                if (parent->wait_status_user_addr != 0 && parent->pagemap != nullptr) {
-                    uint64_t const STATUS_PHYS = ker::mod::mm::virt::translate(parent->pagemap, parent->wait_status_user_addr);
-                    if (STATUS_PHYS != ker::mod::mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
-                        auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(STATUS_PHYS));
-                        *status_ptr = WAIT_STATUS;
-                    }
-                    parent->wait_status_user_addr = 0;
-                    parent->wait_status_phys_addr = 0;
-                }
-                parent->waiting_for_pid = 0;
-                proxy->waited_on = true;
+            if (parent->waiting_for_pid == WAIT_ANY_CHILD && try_complete_proxy_wait(parent, proxy, WAIT_STATUS)) {
                 uint64_t cpu = parent->cpu;
                 if (cpu >= ker::mod::smt::get_core_count()) {
                     cpu = ker::mod::sched::get_least_loaded_cpu();
@@ -1182,8 +1220,10 @@ auto localize_receiver_logical_path(const char* path, char* out, size_t out_size
         return false;
     }
 
+    size_t const PATH_LEN = std::strlen(path);
+    const char* const PATH_END = path + PATH_LEN;
     const char* suffix = host_part + HOST_LEN;
-    while (*suffix == '/') {
+    while (suffix < PATH_END && *suffix == '/') {
         suffix++;
     }
 
@@ -1709,13 +1749,18 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     delete[] buf;
 
     if (SEND_RET != WKI_OK) {
+        bool claimed_waiter = false;
         s_compute_lock.lock();
         if (auto* task_ptr = find_submitted_task_any(TASK_ID); task_ptr != nullptr) {
-            task_ptr->response_wait_entry = nullptr;
+            if (task_ptr->response_wait_entry == &wait) {
+                task_ptr->response_wait_entry = nullptr;
+            }
             task_ptr->response_pending.store(false, std::memory_order_relaxed);
             task_ptr->active = false;
         }
+        claimed_waiter = wki_claim_op(&wait);
         s_compute_lock.unlock();
+        finish_or_wait_for_cancelled_waiter(wait, claimed_waiter, SEND_RET);
         cleanup_ipc_exports();
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_INLINE, target_node, TASK_ID, SEND_RET,
                                 static_cast<uint32_t>(wki_now_us() - STARTED_US), binary_len, CALLSITE);
@@ -1881,13 +1926,18 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
     delete[] buf;
 
     if (SEND_RET != WKI_OK) {
+        bool claimed_waiter = false;
         s_compute_lock.lock();
         if (auto* task_ptr = find_submitted_task_any(TASK_ID); task_ptr != nullptr) {
-            task_ptr->response_wait_entry = nullptr;
+            if (task_ptr->response_wait_entry == &wait) {
+                task_ptr->response_wait_entry = nullptr;
+            }
             task_ptr->response_pending.store(false, std::memory_order_relaxed);
             task_ptr->active = false;
         }
+        claimed_waiter = wki_claim_op(&wait);
         s_compute_lock.unlock();
+        finish_or_wait_for_cancelled_waiter(wait, claimed_waiter, SEND_RET);
         cleanup_ipc_exports();
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, TASK_ID, SEND_RET,
                                 static_cast<uint32_t>(wki_now_us() - STARTED_US), path_len, CALLSITE);
@@ -1942,22 +1992,36 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
 // ===============================================================================
 
 auto wki_task_wait(uint32_t task_id, int32_t* exit_status, uint64_t timeout_us) -> int {
+    uint64_t const STARTED_US = wki_now_us();
+    uint64_t const CALLSITE = WOS_PERF_CALLSITE();
+
     s_compute_lock.lock();
-    SubmittedTask* task = find_submitted_task(task_id);
+    SubmittedTask* task = find_submitted_task_any(task_id);
     if (task == nullptr) {
         s_compute_lock.unlock();
         return -1;
+    }
+
+    uint16_t const TARGET_NODE = task->target_node;
+    if (!task->active) {
+        int32_t const COMPLETED_EXIT_STATUS = task->exit_status;
+        s_compute_lock.unlock();
+
+        if (exit_status != nullptr) {
+            *exit_status = COMPLETED_EXIT_STATUS;
+        }
+        perf_record_compute_begin(ker::mod::perf::WkiPerfComputeOp::COMPLETE_WAIT, TARGET_NODE, task_id, 0, CALLSITE);
+        perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::COMPLETE_WAIT, TARGET_NODE, task_id, 0,
+                                static_cast<uint32_t>(wki_now_us() - STARTED_US), 0, CALLSITE);
+        return 0;
     }
 
     // V2 I-4: Set up async wait entry before marking pending
     WkiWaitEntry wait = {};
     task->complete_wait_entry = &wait;
     task->complete_pending.store(true, std::memory_order_release);
-    uint16_t const TARGET_NODE = task->target_node;
     s_compute_lock.unlock();
 
-    uint64_t const STARTED_US = wki_now_us();
-    uint64_t const CALLSITE = WOS_PERF_CALLSITE();
     perf_record_compute_begin(ker::mod::perf::WkiPerfComputeOp::COMPLETE_WAIT, TARGET_NODE, task_id, 0, CALLSITE);
 
     int const WAIT_RC = wki_wait_for_op(&wait, timeout_us);
@@ -2339,46 +2403,90 @@ auto wki_preferred_remote_node() -> uint16_t {
 // ===============================================================================
 
 void wki_remote_compute_cleanup_for_peer(uint16_t node_id) {
-    constexpr size_t MAX_PROXIES = 32;
-    constexpr size_t MAX_WAITERS = 64;
-    std::array<ker::mod::sched::task::Task*, MAX_PROXIES> proxy_tasks = {};
-    size_t proxy_count = 0;
-    std::array<WkiWaitEntry*, MAX_WAITERS> waiters_to_wake = {};
-    size_t waiter_count = 0;
+    constexpr size_t MAX_PROXIES_PER_BATCH = 64;
+    constexpr size_t MAX_WAITERS_PER_BATCH = MAX_PROXIES_PER_BATCH * 2;
+
+    for (;;) {
+        std::array<ker::mod::sched::task::Task*, MAX_PROXIES_PER_BATCH> proxy_tasks = {};
+        size_t proxy_count = 0;
+        std::array<WkiWaitEntry*, MAX_WAITERS_PER_BATCH> waiters_to_finish = {};
+        size_t waiter_count = 0;
+        bool drained_submitted = true;
+
+        s_compute_lock.lock();
+
+        // Fail submitted tasks targeting this peer in bounded batches. Each
+        // stack waiter is claimed while s_compute_lock still owns the published
+        // pointer so timeout and late-response paths cannot touch it after the
+        // submitter unwinds.
+        for (auto& t : g_submitted_tasks) {
+            if (!t.active || t.target_node != node_id) {
+                continue;
+            }
+
+            size_t needed_waiters = 0;
+            if (t.response_pending.load(std::memory_order_acquire) && t.response_wait_entry != nullptr) {
+                needed_waiters++;
+            }
+            if (t.complete_pending.load(std::memory_order_acquire) && t.complete_wait_entry != nullptr) {
+                needed_waiters++;
+            }
+            size_t const NEEDED_PROXIES = (t.local_task != nullptr && t.proxy_ready) ? 1U : 0U;
+            if (waiter_count + needed_waiters > waiters_to_finish.size() || proxy_count + NEEDED_PROXIES > proxy_tasks.size()) {
+                drained_submitted = false;
+                break;
+            }
+
+            // Any active submit aimed at a fenced peer is terminal failure,
+            // even if the local exec proxy has not reached its deferred
+            // blocked state yet.  wki_proxy_task_blocked() may finalize that
+            // proxy later and must not consume the default success status.
+            t.exit_status = -1;
+
+            if (t.response_pending.load(std::memory_order_acquire)) {
+                WkiWaitEntry* waiter = claim_and_clear_waiter_locked(t.response_wait_entry);
+                if (waiter != nullptr) {
+                    t.accept_status = static_cast<uint8_t>(TaskRejectReason::OVERLOADED);
+                    *std::next(waiters_to_finish.begin(), static_cast<ptrdiff_t>(waiter_count++)) = waiter;
+                }
+                t.response_pending.store(false, std::memory_order_release);
+            }
+            if (t.complete_pending.load(std::memory_order_acquire)) {
+                WkiWaitEntry* waiter = claim_and_clear_waiter_locked(t.complete_wait_entry);
+                if (waiter != nullptr) {
+                    *std::next(waiters_to_finish.begin(), static_cast<ptrdiff_t>(waiter_count++)) = waiter;
+                }
+                t.complete_pending.store(false, std::memory_order_release);
+            }
+
+            // Collect only proxies that are already safely parked.
+            if (t.local_task != nullptr && t.proxy_ready) {
+                *std::next(proxy_tasks.begin(), static_cast<ptrdiff_t>(proxy_count++)) = t.local_task;
+                t.local_task = nullptr;
+            }
+
+            t.active = false;
+        }
+
+        s_compute_lock.unlock();
+
+        for (size_t i = 0; i < waiter_count; i++) {
+            wki_finish_claimed_op(*std::next(waiters_to_finish.begin(), static_cast<ptrdiff_t>(i)), -1);
+        }
+
+        for (size_t i = 0; i < proxy_count; i++) {
+            auto* proxy = *std::next(proxy_tasks.begin(), static_cast<ptrdiff_t>(i));
+            finalize_proxy_task(proxy, -1, nullptr, 0, 0);
+
+            ker::mod::dbg::log("[WKI] Proxy task fenced: pid=0x%lx (peer 0x%04x)", proxy->pid, node_id);
+        }
+
+        if (drained_submitted) {
+            break;
+        }
+    }
 
     s_compute_lock.lock();
-
-    // Fail any submitted tasks targeting this peer
-    for (auto& t : g_submitted_tasks) {
-        if (!t.active || t.target_node != node_id) {
-            continue;
-        }
-
-        if (t.response_pending.load(std::memory_order_acquire)) {
-            t.accept_status = static_cast<uint8_t>(TaskRejectReason::OVERLOADED);
-            t.response_pending.store(false, std::memory_order_release);
-            if (t.response_wait_entry != nullptr && waiter_count < MAX_WAITERS) {
-                *std::next(waiters_to_wake.begin(), static_cast<ptrdiff_t>(waiter_count++)) = t.response_wait_entry;
-                t.response_wait_entry = nullptr;
-            }
-        }
-        if (t.complete_pending.load(std::memory_order_acquire)) {
-            t.exit_status = -1;
-            t.complete_pending.store(false, std::memory_order_release);
-            if (t.complete_wait_entry != nullptr && waiter_count < MAX_WAITERS) {
-                *std::next(waiters_to_wake.begin(), static_cast<ptrdiff_t>(waiter_count++)) = t.complete_wait_entry;
-                t.complete_wait_entry = nullptr;
-            }
-        }
-
-        // Collect only proxies that are already safely parked.
-        if (t.local_task != nullptr && t.proxy_ready && proxy_count < MAX_PROXIES) {
-            *std::next(proxy_tasks.begin(), static_cast<ptrdiff_t>(proxy_count++)) = t.local_task;
-            t.local_task = nullptr;
-        }
-
-        t.active = false;
-    }
 
     // Invalidate load cache for this peer
     std::erase_if(g_remote_loads, [node_id](const RemoteNodeLoad& rl) { return rl.node_id == node_id; });
@@ -2417,20 +2525,91 @@ void wki_remote_compute_cleanup_for_peer(uint16_t node_id) {
     gc_shared_elf_cache_locked(wki_now_us());
 
     s_compute_lock.unlock();
-
-    // V2 I-4: Wake any blocked waiters (outside lock)
-    for (size_t i = 0; i < waiter_count; i++) {
-        wki_wake_op(*std::next(waiters_to_wake.begin(), static_cast<ptrdiff_t>(i)), -1);
-    }
-
-    // Wake proxy tasks with error exit status (outside lock - scheduling operations)
-    for (size_t i = 0; i < proxy_count; i++) {
-        auto* proxy = *std::next(proxy_tasks.begin(), static_cast<ptrdiff_t>(i));
-        finalize_proxy_task(proxy, -1, nullptr, 0, 0);
-
-        ker::mod::dbg::log("[WKI] Proxy task fenced: pid=0x%lx (peer 0x%04x)", proxy->pid, node_id);
-    }
 }
+
+#ifdef WOS_SELFTEST
+auto wki_remote_compute_selftest_cleanup_marks_unready_proxy_failure() -> bool {
+    constexpr uint16_t TARGET_NODE = 0x7A21;
+    constexpr uint32_t TASK_ID = 0xC0FFEEU;
+
+    SubmittedTask task;
+    task.active = true;
+    task.task_id = TASK_ID;
+    task.target_node = TARGET_NODE;
+    task.exit_status = 0;
+    task.proxy_ready = false;
+    task.complete_pending.store(false, std::memory_order_relaxed);
+
+    s_compute_lock.lock();
+    std::erase_if(g_submitted_tasks, [](const SubmittedTask& submitted) { return submitted.task_id == TASK_ID; });
+    g_submitted_tasks.push_back(std::move(task));
+    s_compute_lock.unlock();
+
+    wki_remote_compute_cleanup_for_peer(TARGET_NODE);
+
+    bool ok = false;
+    s_compute_lock.lock();
+    for (const auto& submitted : g_submitted_tasks) {
+        if (submitted.task_id == TASK_ID) {
+            ok = !submitted.active && submitted.exit_status == -1 && !submitted.complete_pending.load(std::memory_order_relaxed);
+            break;
+        }
+    }
+    std::erase_if(g_submitted_tasks, [](const SubmittedTask& submitted) { return submitted.task_id == TASK_ID; });
+    s_compute_lock.unlock();
+
+    return ok;
+}
+
+auto wki_remote_compute_selftest_proxy_wait_completion_respects_publish_fence() -> bool {
+    ker::mod::sched::task::Task waiter{};
+    ker::mod::sched::task::Task proxy{};
+
+    proxy.pid = 0x7A22;
+    ker::mod::sched::task::task_clear_waited_on(proxy);
+
+    waiter.context.regs.rax = 0xBAD0;
+    waiter.waiting_for_pid = proxy.pid;
+    waiter.deferred_task_switch = false;
+    waiter.waitpid_publish_pending.store(true, std::memory_order_release);
+
+    bool const BLOCKED_WHILE_PUBLISHING = !try_complete_proxy_wait(&waiter, &proxy, 0x1234) &&
+                                          !ker::mod::sched::task::task_waited_on(proxy) && waiter.context.regs.rax == 0xBAD0 &&
+                                          waiter.waiting_for_pid == proxy.pid;
+
+    waiter.waitpid_publish_pending.store(false, std::memory_order_release);
+    bool const COMPLETED_AFTER_PUBLISH = try_complete_proxy_wait(&waiter, &proxy, 0x1234) && ker::mod::sched::task::task_waited_on(proxy) &&
+                                         waiter.context.regs.rax == proxy.pid && waiter.waiting_for_pid == 0;
+
+    return BLOCKED_WHILE_PUBLISHING && COMPLETED_AFTER_PUBLISH;
+}
+
+auto wki_remote_compute_selftest_task_wait_consumes_completed_row() -> bool {
+    constexpr uint16_t TARGET_NODE = 0x7A23;
+    constexpr uint32_t TASK_ID = 0xC0FFEFU;
+    constexpr int32_t EXIT_STATUS = 0x4D2;
+
+    SubmittedTask task;
+    task.active = false;
+    task.task_id = TASK_ID;
+    task.target_node = TARGET_NODE;
+    task.exit_status = EXIT_STATUS;
+
+    s_compute_lock.lock();
+    std::erase_if(g_submitted_tasks, [](const SubmittedTask& submitted) { return submitted.task_id == TASK_ID; });
+    g_submitted_tasks.push_back(std::move(task));
+    s_compute_lock.unlock();
+
+    int32_t observed_status = -1;
+    int const WAIT_RC = wki_task_wait(TASK_ID, &observed_status, 0);
+
+    s_compute_lock.lock();
+    std::erase_if(g_submitted_tasks, [](const SubmittedTask& submitted) { return submitted.task_id == TASK_ID; });
+    s_compute_lock.unlock();
+
+    return WAIT_RC == 0 && observed_status == EXIT_STATUS;
+}
+#endif
 
 auto wki_remote_compute_diag_snapshot(WkiRemoteComputeDiagRow* rows, size_t capacity, WkiRemoteComputeDiagCounts* counts) -> size_t {
     WkiRemoteComputeDiagCounts local_counts{};
@@ -2770,6 +2949,11 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
     VfsLoadResult result;
     ScopedComputeMeasure load_measure(ker::mod::perf::WkiPerfComputeOp::LOAD_ELF, submitter_node, correlation,
                                       path != nullptr ? static_cast<uint32_t>(std::strlen(path)) : 0U, WOS_PERF_CALLSITE());
+    if (path == nullptr || path[0] == '\0') {
+        result.reject_reason = TaskRejectReason::BINARY_NOT_FOUND;
+        load_measure.finish(perf_compute_reject_status(result.reject_reason));
+        return result;
+    }
 
     std::array<char, 512> localized_path = {};
     std::array<char, 512> fallback_local_path = {};
@@ -3858,24 +4042,25 @@ void handle_task_accept(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 
     s_compute_lock.lock();
     SubmittedTask* task = find_submitted_task(resp->task_id);
-    if (task == nullptr || !task->response_pending) {
+    if (task == nullptr || !task->response_pending.load(std::memory_order_acquire)) {
         s_compute_lock.unlock();
         return;
     }
 
-    task->accept_status = resp->status;
-    task->accepted_at_us = wki_now_us();
-    task->complete_received_at_us = 0;
-    if (task->local_task != nullptr) {
-        task->local_task->wki_remote_pid = resp->remote_pid;
+    WkiWaitEntry* waiter = claim_and_clear_waiter_locked(task->response_wait_entry);
+    if (waiter != nullptr) {
+        task->accept_status = resp->status;
+        task->accepted_at_us = wki_now_us();
+        task->complete_received_at_us = 0;
+        if (task->local_task != nullptr) {
+            task->local_task->wki_remote_pid = resp->remote_pid;
+        }
     }
-
     task->response_pending.store(false, std::memory_order_release);
-    WkiWaitEntry* waiter = task->response_wait_entry;
     s_compute_lock.unlock();
 
     if (waiter != nullptr) {
-        wki_wake_op(waiter, 0);
+        wki_finish_claimed_op(waiter, 0);
     }
 
     perf_record_compute_point(ker::mod::perf::WkiPerfComputeOp::ACCEPT, hdr != nullptr ? hdr->src_node : WKI_NODE_INVALID, resp->task_id, 0,
@@ -3891,22 +4076,23 @@ void handle_task_reject(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 
     s_compute_lock.lock();
     SubmittedTask* task = find_submitted_task(resp->task_id);
-    if (task == nullptr || !task->response_pending) {
+    if (task == nullptr || !task->response_pending.load(std::memory_order_acquire)) {
         s_compute_lock.unlock();
         return;
     }
 
-    task->accept_status = resp->status;
-    if (task->local_task != nullptr) {
-        task->local_task->wki_remote_pid = 0;
+    WkiWaitEntry* waiter = claim_and_clear_waiter_locked(task->response_wait_entry);
+    if (waiter != nullptr) {
+        task->accept_status = resp->status;
+        if (task->local_task != nullptr) {
+            task->local_task->wki_remote_pid = 0;
+        }
     }
-
     task->response_pending.store(false, std::memory_order_release);
-    WkiWaitEntry* waiter = task->response_wait_entry;
     s_compute_lock.unlock();
 
     if (waiter != nullptr) {
-        wki_wake_op(waiter, 0);
+        wki_finish_claimed_op(waiter, 0);
     }
 
     perf_record_compute_point(ker::mod::perf::WkiPerfComputeOp::REJECT, hdr != nullptr ? hdr->src_node : WKI_NODE_INVALID, resp->task_id,
@@ -3951,17 +4137,17 @@ void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     }
 
     if (task->response_pending.load(std::memory_order_acquire)) {
-        task->accept_status = static_cast<uint8_t>(TaskRejectReason::ACCEPTED);
-        if (task->accepted_at_us == 0) {
-            task->accepted_at_us = COMPLETE_NOW_US;
+        response_waiter = claim_and_clear_waiter_locked(task->response_wait_entry);
+        if (response_waiter != nullptr) {
+            task->accept_status = static_cast<uint8_t>(TaskRejectReason::ACCEPTED);
+            if (task->accepted_at_us == 0) {
+                task->accepted_at_us = COMPLETE_NOW_US;
+            }
         }
         task->response_pending.store(false, std::memory_order_release);
-        response_waiter = task->response_wait_entry;
-        task->response_wait_entry = nullptr;
     }
     task->complete_pending.store(false, std::memory_order_release);
-    complete_waiter = task->complete_wait_entry;
-    task->complete_wait_entry = nullptr;
+    complete_waiter = claim_and_clear_waiter_locked(task->complete_wait_entry);
     task->active = false;
     s_compute_lock.unlock();
 
@@ -3998,7 +4184,7 @@ void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t
         // forward any captured output.
 #ifdef DEBUG_WKI_COMPUTE
         ker::mod::dbg::log("[WKI] TASK_COMPLETE early (proxy not ready): task_id=%u exit=%d local_task=%p", comp->task_id,
-                           comp->exit_status, task->local_task);
+                           comp->exit_status, local_task_for_output);
 #endif
         if (local_task_for_output != nullptr) {
             const uint8_t* output_data = payload + sizeof(TaskCompletePayload);
@@ -4017,10 +4203,10 @@ void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     }
 
     if (complete_waiter != nullptr) {
-        wki_wake_op(complete_waiter, 0);
+        wki_finish_claimed_op(complete_waiter, 0);
     }
     if (response_waiter != nullptr) {
-        wki_wake_op(response_waiter, 0);
+        wki_finish_claimed_op(response_waiter, 0);
     }
 
     perf_record_compute_point(ker::mod::perf::WkiPerfComputeOp::COMPLETE, hdr != nullptr ? hdr->src_node : WKI_NODE_INVALID, comp->task_id,

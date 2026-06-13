@@ -276,11 +276,29 @@ class RadixTree {
         return cap;
     }
 
-    Node* alloc_interior_node() { return new (std::nothrow) Node(InteriorNodeTag{}); }
+    Node* alloc_interior_node() {
+        void* storage = ker::mod::mm::dyn::kmalloc::malloc(sizeof(Node));
+        if (storage == nullptr) {
+            return nullptr;
+        }
+        return new (storage) Node(InteriorNodeTag{});
+    }
 
-    Node* alloc_leaf_node() { return new (std::nothrow) Node(LeafNodeTag{}); }
+    Node* alloc_leaf_node() {
+        void* storage = ker::mod::mm::dyn::kmalloc::malloc(sizeof(Node));
+        if (storage == nullptr) {
+            return nullptr;
+        }
+        return new (storage) Node(LeafNodeTag{});
+    }
 
-    void free_node(Node* n) { delete n; }
+    void free_node(Node* n) {
+        if (n == nullptr) {
+            return;
+        }
+        n->~Node();
+        ker::mod::mm::dyn::kmalloc::free(n);
+    }
 
     // Grow tree depth by 1: allocate new root, make old root its child[0]
     [[nodiscard]] bool grow_depth() {

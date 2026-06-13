@@ -8,6 +8,7 @@
 #include <cstring>
 #include <deque>
 #include <dev/block_device.hpp>
+#include <list>
 #include <net/address.hpp>
 #include <net/endian.hpp>
 #include <net/netdevice.hpp>
@@ -41,9 +42,9 @@ namespace {
 constexpr uint32_t WKI_VFS_DAEMON_SLICE_NS = 2'000'000;
 constexpr int WKI_VFS_DAEMON_NICE = -5;
 
-std::deque<DevServerBinding> g_bindings;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-bool g_dev_server_initialized = false;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-ker::mod::sys::Spinlock s_server_lock;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::list<DevServerBinding> g_bindings;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+bool g_dev_server_initialized = false;   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_server_lock;   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 struct DeferredVfsOp {
     WkiHeader hdr{};
@@ -84,7 +85,8 @@ struct CachedVfsWriteResponse {
 // s_server_lock must be held by caller
 auto find_binding_by_channel(uint16_t consumer_node, uint16_t channel_id) -> DevServerBinding* {
     for (auto& b : g_bindings) {
-        if (b.active && b.consumer_node == consumer_node && b.assigned_channel == channel_id) {
+        if (b.active && !b.retiring.load(std::memory_order_acquire) && b.consumer_node == consumer_node &&
+            b.assigned_channel == channel_id) {
             return &b;
         }
     }
@@ -94,7 +96,8 @@ auto find_binding_by_channel(uint16_t consumer_node, uint16_t channel_id) -> Dev
 // s_server_lock must be held by caller
 auto find_binding_by_resource(uint16_t consumer_node, ResourceType resource_type, uint32_t resource_id) -> DevServerBinding* {
     for (auto& b : g_bindings) {
-        if (b.active && b.consumer_node == consumer_node && b.resource_type == resource_type && b.resource_id == resource_id) {
+        if (b.active && !b.retiring.load(std::memory_order_acquire) && b.consumer_node == consumer_node &&
+            b.resource_type == resource_type && b.resource_id == resource_id) {
             return &b;
         }
     }
@@ -104,11 +107,56 @@ auto find_binding_by_resource(uint16_t consumer_node, ResourceType resource_type
 // s_server_lock must be held by caller
 auto find_binding_by_zone_id(uint32_t zone_id) -> DevServerBinding* {
     for (auto& b : g_bindings) {
-        if (b.active && b.blk_rdma_active && b.blk_zone_id == zone_id) {
+        if (b.active && !b.retiring.load(std::memory_order_acquire) && b.blk_rdma_active && b.blk_zone_id == zone_id) {
             return &b;
         }
     }
     return nullptr;
+}
+
+// s_server_lock must be held by caller
+auto retain_binding_locked(DevServerBinding* binding) -> bool {
+    if (binding == nullptr || !binding->active || binding->retiring.load(std::memory_order_acquire)) {
+        return false;
+    }
+    binding->refs.fetch_add(1, std::memory_order_acq_rel);
+    return true;
+}
+
+void release_binding(DevServerBinding* binding) {
+    if (binding == nullptr) {
+        return;
+    }
+    uint32_t const PREV = binding->refs.fetch_sub(1, std::memory_order_acq_rel);
+    if (PREV == 0) {
+        binding->refs.store(0, std::memory_order_release);
+    }
+}
+
+void wait_for_binding_refs_to_drain(DevServerBinding* binding) {
+    while (binding != nullptr && binding->refs.load(std::memory_order_acquire) != 0) {
+        ker::mod::sched::kern_yield();
+    }
+}
+
+// s_server_lock must be held by caller
+void mark_binding_retiring_locked(DevServerBinding& binding) {
+    binding.active = false;
+    binding.retiring.store(true, std::memory_order_release);
+}
+
+// s_server_lock must be held by caller
+auto erase_retired_binding_locked(DevServerBinding* binding) -> bool {
+    if (binding == nullptr || binding->refs.load(std::memory_order_acquire) != 0) {
+        return false;
+    }
+    for (auto it = g_bindings.begin(); it != g_bindings.end(); ++it) {
+        if (&*it == binding && !it->active) {
+            g_bindings.erase(it);
+            return true;
+        }
+    }
+    return false;
 }
 
 auto find_block_device_by_resource_id(uint32_t resource_id) -> ker::dev::BlockDevice* {
@@ -325,6 +373,7 @@ auto queue_vfs_op(const WkiHeader* hdr, uint16_t op_id, const uint8_t* req_data,
 struct ExistingNetBindingInfo {
     bool found = false;
     uint16_t assigned_channel = 0;
+    uint8_t attach_cookie = 0;
     ker::net::NetDevice* net_dev = nullptr;
 };
 
@@ -345,6 +394,7 @@ auto find_existing_net_binding(uint16_t consumer_node, uint32_t resource_id) -> 
     if (auto* binding = find_binding_by_resource(consumer_node, ResourceType::NET, resource_id); binding != nullptr) {
         info.found = true;
         info.assigned_channel = binding->assigned_channel;
+        info.attach_cookie = binding->attach_cookie;
         info.net_dev = binding->net_dev;
     }
     s_server_lock.unlock_irqrestore(SRV_FLAGS);
@@ -504,6 +554,15 @@ auto has_net_binding_for_dev(ker::net::NetDevice* dev) -> bool {
         g_bindings, [dev](const DevServerBinding& b) { return b.active && b.resource_type == ResourceType::NET && b.net_dev == dev; });
 }
 
+auto net_request_cookie_from_payload(const uint8_t* req_data, uint16_t req_data_len, uint16_t fallback) -> uint16_t {
+    if (req_data == nullptr || req_data_len < sizeof(uint16_t)) {
+        return fallback;
+    }
+    uint16_t cookie = 0;
+    memcpy(&cookie, req_data, sizeof(cookie));
+    return cookie != 0 ? cookie : fallback;
+}
+
 }  // namespace
 
 // -----------------------------------------------------------------------------
@@ -511,7 +570,7 @@ auto has_net_binding_for_dev(ker::net::NetDevice* dev) -> bool {
 // -----------------------------------------------------------------------------
 
 void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt) {
-    if (dev == nullptr || pkt == nullptr || pkt->len == 0) {
+    if (dev == nullptr || pkt == nullptr || pkt->data == nullptr || pkt->len == 0) {
         return;
     }
 
@@ -520,6 +579,12 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
     // make them re-enter the WKI stack and explode traffic fanout with many peers.
     if (forwarded_frame_is_wki(pkt)) {
         return;
+    }
+
+    auto pkt_data_len = static_cast<uint16_t>(pkt->len);
+    auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + sizeof(NetNotifyHeader) + pkt_data_len);
+    if (req_total > WKI_ETH_MAX_PAYLOAD) {
+        return;  // Packet too large for a single WKI message
     }
 
     // D12: Determine packet type from destination MAC (first 6 bytes of Ethernet frame)
@@ -535,6 +600,7 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
     struct RxTarget {
         uint16_t consumer_node;
         uint16_t assigned_channel;
+        uint8_t attach_cookie;
     };
     constexpr size_t MAX_RX_TARGETS = 32;
     std::array<RxTarget, MAX_RX_TARGETS> targets = {};
@@ -548,30 +614,28 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
         if (!b.net_nic_opened) {
             continue;
         }
-        if (b.net_rx_credits == 0) {
-            b.net_dev->rx_dropped++;
-            continue;
-        }
-        b.net_rx_credits--;
         if (is_broadcast && !b.net_rx_filter.accept_broadcast) {
             continue;
         }
         if (is_multicast && !b.net_rx_filter.accept_multicast) {
             continue;
         }
+        if (b.net_rx_credits == 0) {
+            b.net_dev->rx_dropped++;
+            continue;
+        }
         if (target_count < MAX_RX_TARGETS) {
-            targets.at(target_count++) = {.consumer_node = b.consumer_node, .assigned_channel = b.assigned_channel};
+            targets.at(target_count++) = {
+                .consumer_node = b.consumer_node,
+                .assigned_channel = b.assigned_channel,
+                .attach_cookie = b.attach_cookie,
+            };
+            b.net_rx_credits--;
         }
     }
     s_server_lock.unlock_irqrestore(SRV_FLAGS);
 
     // Build and send OP_NET_RX_NOTIFY outside the lock (fire-and-forget)
-    auto pkt_data_len = static_cast<uint16_t>(pkt->len);
-    auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + pkt_data_len);
-    if (req_total > WKI_ETH_MAX_PAYLOAD) {
-        return;  // Packet too large for a single WKI message
-    }
-
     for (size_t i = 0; i < target_count; i++) {
         const auto& target = targets.at(i);
         auto* req_buf = new (std::nothrow) uint8_t[req_total];
@@ -580,11 +644,46 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
         }
         auto* req = reinterpret_cast<DevOpReqPayload*>(req_buf);
         req->op_id = OP_NET_RX_NOTIFY;
-        req->data_len = pkt_data_len;
-        memcpy(req_buf + sizeof(DevOpReqPayload), pkt->data, pkt_data_len);
+        req->data_len = static_cast<uint16_t>(sizeof(NetNotifyHeader) + pkt_data_len);
+        auto* notify = reinterpret_cast<NetNotifyHeader*>(req_buf + sizeof(DevOpReqPayload));
+        notify->magic = WKI_NET_NOTIFY_MAGIC;
+        notify->attach_cookie = target.attach_cookie;
+        notify->reserved = 0;
+        notify->data_len = pkt_data_len;
+        memcpy(req_buf + sizeof(DevOpReqPayload) + sizeof(NetNotifyHeader), pkt->data, pkt_data_len);
         wki_send(target.consumer_node, target.assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
         delete[] req_buf;
     }
+}
+
+void wki_dev_server_mark_net_opened(uint16_t consumer_node, uint16_t channel_id, ker::net::NetDevice* dev, bool opened) {
+    if (dev == nullptr) {
+        return;
+    }
+
+    uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+    DevServerBinding* binding = find_binding_by_channel(consumer_node, channel_id);
+    if (binding != nullptr && binding->active && binding->resource_type == ResourceType::NET && binding->net_dev == dev) {
+        binding->net_nic_opened = opened;
+        if (opened) {
+            binding->net_rx_filter.accept_broadcast = true;
+            binding->net_rx_filter.accept_multicast = true;
+        }
+    }
+    s_server_lock.unlock_irqrestore(SRV_FLAGS);
+}
+
+void wki_dev_server_add_net_rx_credits(uint16_t consumer_node, uint16_t channel_id, ker::net::NetDevice* dev, uint16_t credits) {
+    if (dev == nullptr || credits == 0) {
+        return;
+    }
+
+    uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+    DevServerBinding* binding = find_binding_by_channel(consumer_node, channel_id);
+    if (binding != nullptr && binding->active && binding->resource_type == ResourceType::NET && binding->net_dev == dev) {
+        binding->net_rx_credits += credits;
+    }
+    s_server_lock.unlock_irqrestore(SRV_FLAGS);
 }
 
 void wki_dev_server_notify_net_changed(ker::net::NetDevice* dev) {
@@ -595,6 +694,7 @@ void wki_dev_server_notify_net_changed(ker::net::NetDevice* dev) {
     struct NotifyTarget {
         uint16_t consumer_node;
         uint16_t assigned_channel;
+        uint8_t attach_cookie;
     };
     constexpr size_t MAX_NOTIFY_TARGETS = 32;
     std::array<NotifyTarget, MAX_NOTIFY_TARGETS> targets = {};
@@ -616,7 +716,11 @@ void wki_dev_server_notify_net_changed(ker::net::NetDevice* dev) {
 
         record_binding_net_state(b, SNAP);
         if (target_count < MAX_NOTIFY_TARGETS) {
-            targets.at(target_count++) = {.consumer_node = b.consumer_node, .assigned_channel = b.assigned_channel};
+            targets.at(target_count++) = {
+                .consumer_node = b.consumer_node,
+                .assigned_channel = b.assigned_channel,
+                .attach_cookie = b.attach_cookie,
+            };
         }
     }
     s_server_lock.unlock_irqrestore(SRV_FLAGS);
@@ -625,15 +729,19 @@ void wki_dev_server_notify_net_changed(ker::net::NetDevice* dev) {
         return;
     }
 
-    std::array<uint8_t, sizeof(DevOpReqPayload) + sizeof(NetStateNotifyPayload)> msg{};
+    std::array<uint8_t, sizeof(DevOpReqPayload) + sizeof(NetNotifyHeader) + sizeof(NetStateNotifyPayload)> msg{};
     auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
     req->op_id = OP_NET_STATE_NOTIFY;
-    req->data_len = sizeof(NetStateNotifyPayload);
-    auto* state = reinterpret_cast<NetStateNotifyPayload*>(msg.data() + sizeof(DevOpReqPayload));
+    req->data_len = sizeof(NetNotifyHeader) + sizeof(NetStateNotifyPayload);
+    auto* notify = reinterpret_cast<NetNotifyHeader*>(msg.data() + sizeof(DevOpReqPayload));
+    notify->magic = WKI_NET_NOTIFY_MAGIC;
+    notify->data_len = sizeof(NetStateNotifyPayload);
+    auto* state = reinterpret_cast<NetStateNotifyPayload*>(msg.data() + sizeof(DevOpReqPayload) + sizeof(NetNotifyHeader));
     fill_net_state_payload(*state, SNAP);
 
     for (size_t i = 0; i < target_count; i++) {
         const auto& target = targets.at(i);
+        notify->attach_cookie = target.attach_cookie;
         wki_send(target.consumer_node, target.assigned_channel, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size()));
     }
 }
@@ -682,98 +790,108 @@ void wki_dev_server_refresh_vfs_binding(uint32_t resource_id, const char* export
 void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
     // Collect work items and cleanup info under the lock
     struct DetachWork {
+        DevServerBinding* binding;
         uint32_t blk_zone_id;
         bool blk_rdma_active;
         ker::dev::BlockDevice* block_dev;
         ker::net::NetDevice* net_dev;
         uint16_t consumer_node;
         uint16_t assigned_channel;
+        uint8_t* vfs_rdma_write_buf;
+        uint8_t* vfs_rdma_read_staging_buf;
+        uint8_t* vfs_rdma_bulk_staging_buf;
     };
     constexpr size_t MAX_DETACH = 32;
-    std::array<DetachWork, MAX_DETACH> work = {};
-    size_t work_count = 0;
 
     constexpr size_t MAX_NET_DEVS = 16;
-    std::array<ker::net::NetDevice*, MAX_NET_DEVS> uninstall_devs = {};
-    size_t uninstall_count = 0;
 
-    uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
-    for (auto& b : g_bindings) {
-        if (!b.active || b.consumer_node != node_id) {
-            continue;
-        }
-        if (work_count < MAX_DETACH) {
-            work.at(work_count++) = {.blk_zone_id = b.blk_zone_id,
+    while (true) {
+        std::array<DetachWork, MAX_DETACH> work = {};
+        size_t work_count = 0;
+        std::array<ker::net::NetDevice*, MAX_NET_DEVS> uninstall_devs = {};
+        size_t uninstall_count = 0;
+
+        uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+        for (auto& b : g_bindings) {
+            if (!b.active || b.consumer_node != node_id) {
+                continue;
+            }
+            if (work_count >= MAX_DETACH) {
+                break;
+            }
+            work.at(work_count++) = {.binding = &b,
+                                     .blk_zone_id = b.blk_zone_id,
                                      .blk_rdma_active = b.blk_rdma_active,
                                      .block_dev = b.block_dev,
                                      .net_dev = b.net_dev,
                                      .consumer_node = b.consumer_node,
-                                     .assigned_channel = b.assigned_channel};
+                                     .assigned_channel = b.assigned_channel,
+                                     .vfs_rdma_write_buf = b.vfs_rdma_write_buf,
+                                     .vfs_rdma_read_staging_buf = b.vfs_rdma_read_staging_buf,
+                                     .vfs_rdma_bulk_staging_buf = b.vfs_rdma_bulk_staging_buf};
+            b.vfs_rdma_write_buf = nullptr;
+            b.vfs_rdma_read_staging_buf = nullptr;
+            b.vfs_rdma_bulk_staging_buf = nullptr;
+            mark_binding_retiring_locked(b);
         }
-        b.active = false;
-    }
-    // TODO: RAII for this \/
-    //  Free VFS RDMA buffers before erasing (DevServerBinding has no destructor)
-    for (auto& b : g_bindings) {
-        if (!b.active) {
-            if (b.vfs_rdma_write_buf != nullptr) {
-                delete[] b.vfs_rdma_write_buf;
-                b.vfs_rdma_write_buf = nullptr;
-            }
-            if (b.vfs_rdma_read_staging_buf != nullptr) {
-                delete[] b.vfs_rdma_read_staging_buf;
-                b.vfs_rdma_read_staging_buf = nullptr;
-            }
-            if (b.vfs_rdma_bulk_staging_buf != nullptr) {
-                delete[] b.vfs_rdma_bulk_staging_buf;
-                b.vfs_rdma_bulk_staging_buf = nullptr;
-            }
-        }
-    }
 
-    // Remove inactive entries
-    std::erase_if(g_bindings, [](const DevServerBinding& b) { return !b.active; });
-
-    // Determine which NET devices need their RX forward hook uninstalled
-    for (size_t i = 0; i < work_count; i++) {
-        const auto& item = work.at(i);
-        if (item.net_dev == nullptr) {
-            continue;
-        }
-        bool dup = false;
-        for (size_t j = 0; j < uninstall_count; j++) {
-            if (uninstall_devs.at(j) == item.net_dev) {
-                dup = true;
-                break;
+        // Determine which NET devices need their RX forward hook uninstalled.
+        for (size_t i = 0; i < work_count; i++) {
+            const auto& item = work.at(i);
+            if (item.net_dev == nullptr) {
+                continue;
+            }
+            bool dup = false;
+            for (size_t j = 0; j < uninstall_count; j++) {
+                if (uninstall_devs.at(j) == item.net_dev) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup && uninstall_count < MAX_NET_DEVS && !has_net_binding_for_dev(item.net_dev)) {
+                uninstall_devs.at(uninstall_count++) = item.net_dev;
             }
         }
-        if (!dup && uninstall_count < MAX_NET_DEVS && !has_net_binding_for_dev(item.net_dev)) {
-            uninstall_devs.at(uninstall_count++) = item.net_dev;
-        }
-    }
-    s_server_lock.unlock_irqrestore(SRV_FLAGS);
+        s_server_lock.unlock_irqrestore(SRV_FLAGS);
 
-    // Perform cleanup outside the lock
-    for (size_t i = 0; i < work_count; i++) {
-        const auto& item = work.at(i);
-        if (item.blk_rdma_active && item.blk_zone_id != 0) {
-            wki_zone_destroy(item.blk_zone_id);
+        if (work_count == 0) {
+            break;
         }
-        if (item.block_dev != nullptr && item.block_dev->remotable != nullptr) {
-            item.block_dev->remotable->on_remote_fault(node_id);
-        }
-        if (item.net_dev != nullptr && item.net_dev->remotable != nullptr) {
-            item.net_dev->remotable->on_remote_fault(node_id);
-        }
-        WkiChannel* ch = wki_channel_get(item.consumer_node, item.assigned_channel);
-        if (ch != nullptr) {
-            wki_channel_close(ch);
-        }
-    }
 
-    // D11: Uninstall RX forward hooks for NET devices that no longer have bindings
-    for (size_t i = 0; i < uninstall_count; i++) {
-        uninstall_devs.at(i)->wki_rx_forward = nullptr;
+        // Perform cleanup outside the lock.
+        for (size_t i = 0; i < work_count; i++) {
+            const auto& item = work.at(i);
+            wait_for_binding_refs_to_drain(item.binding);
+            delete[] item.vfs_rdma_write_buf;
+            delete[] item.vfs_rdma_read_staging_buf;
+            delete[] item.vfs_rdma_bulk_staging_buf;
+            if (item.blk_rdma_active && item.blk_zone_id != 0) {
+                wki_zone_destroy(item.blk_zone_id);
+            }
+            if (item.block_dev != nullptr && item.block_dev->remotable != nullptr) {
+                item.block_dev->remotable->on_remote_fault(node_id);
+            }
+            if (item.net_dev != nullptr && item.net_dev->remotable != nullptr) {
+                item.net_dev->remotable->on_remote_fault(node_id);
+            }
+            WkiChannel* ch = wki_channel_get(item.consumer_node, item.assigned_channel);
+            if (ch != nullptr) {
+                wki_channel_close(ch);
+            }
+        }
+
+        {
+            uint64_t const ERASE_FLAGS = s_server_lock.lock_irqsave();
+            for (size_t i = 0; i < work_count; i++) {
+                erase_retired_binding_locked(work.at(i).binding);
+            }
+            s_server_lock.unlock_irqrestore(ERASE_FLAGS);
+        }
+
+        // D11: Uninstall RX forward hooks for NET devices that no longer have bindings.
+        for (size_t i = 0; i < uninstall_count; i++) {
+            uninstall_devs.at(i)->wki_rx_forward = nullptr;
+        }
     }
 }
 
@@ -792,6 +910,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
 
     // Prepare response
     DevAttachAckPayload ack = {};
+    ack.reserved = req->attach_cookie;
     ack.resource_id = req->resource_id;
 
     auto res_type = static_cast<ResourceType>(req->resource_type);
@@ -836,6 +955,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.assigned_channel = ch->channel_id;
         binding.resource_type = ResourceType::BLOCK;
         binding.resource_id = req->resource_id;
+        binding.attach_cookie = req->attach_cookie;
         binding.block_dev = bdev;
 
         // Compute the RDMA zone ID for the block ring.  Zone creation is
@@ -912,6 +1032,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.assigned_channel = ch->channel_id;
         binding.resource_type = ResourceType::VFS;
         binding.resource_id = req->resource_id;
+        binding.attach_cookie = req->attach_cookie;
         memcpy(static_cast<void*>(binding.vfs_export_path), static_cast<const void*>(exp->export_path), sizeof(binding.vfs_export_path));
         memcpy(static_cast<void*>(binding.vfs_export_name), static_cast<const void*>(exp->name), sizeof(binding.vfs_export_name));
 
@@ -1026,6 +1147,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         if (auto existing = find_existing_net_binding(hdr->src_node, req->resource_id); existing.found && existing.net_dev != nullptr) {
             DevAttachAckNetPayload existing_ack = {};
             build_net_attach_ack(existing_ack, existing.net_dev, req->resource_id, existing.assigned_channel);
+            existing_ack.attach_cookie = existing.attach_cookie;
 
             int const ACK_RET = wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &existing_ack, sizeof(existing_ack));
             if (ACK_RET != WKI_OK) {
@@ -1058,6 +1180,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.assigned_channel = ch->channel_id;
         binding.resource_type = ResourceType::NET;
         binding.resource_id = req->resource_id;
+        binding.attach_cookie = req->attach_cookie;
         binding.net_dev = ndev;
         record_binding_net_state(binding, capture_net_state(ndev));
 
@@ -1073,6 +1196,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         // V2: Send extended NET attach ACK with owner NIC info
         DevAttachAckNetPayload net_ack = {};
         build_net_attach_ack(net_ack, ndev, req->resource_id, ch->channel_id);
+        net_ack.attach_cookie = req->attach_cookie;
         uint32_t netmask = net_ack.ipv4_mask;
         uint32_t bit_count = 0;
         while (netmask) {
@@ -1100,9 +1224,11 @@ void handle_dev_detach(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     }
 
     const auto* det = reinterpret_cast<const DevDetachPayload*>(payload);
+    uint8_t const DETACH_COOKIE = wki_dev_detach_cookie_from_payload(payload, payload_len);
 
     // Collect binding info under the lock, erase from deque, then cleanup outside
     struct DetachInfo {
+        DevServerBinding* binding;
         uint32_t blk_zone_id;
         bool blk_rdma_active;
         ker::dev::BlockDevice* block_dev;
@@ -1119,24 +1245,27 @@ void handle_dev_detach(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
 
     {
         uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
-        for (auto it = g_bindings.begin(); it != g_bindings.end(); ++it) {
-            if (!it->active || it->consumer_node != hdr->src_node || it->resource_id != det->resource_id) {
+        for (auto& binding : g_bindings) {
+            if (!binding.active ||
+                !wki_dev_detach_matches_binding(binding.consumer_node, binding.resource_type, binding.resource_id, hdr->src_node, *det) ||
+                !wki_dev_detach_cookie_matches_binding(binding.attach_cookie, DETACH_COOKIE)) {
                 continue;
             }
             info.found = true;
-            info.blk_zone_id = it->blk_zone_id;
-            info.blk_rdma_active = it->blk_rdma_active;
-            info.block_dev = it->block_dev;
-            info.net_dev = it->net_dev;
-            info.consumer_node = it->consumer_node;
-            info.assigned_channel = it->assigned_channel;
-            info.vfs_rdma_write_buf = it->vfs_rdma_write_buf;
-            info.vfs_rdma_read_staging_buf = it->vfs_rdma_read_staging_buf;
-            info.vfs_rdma_bulk_staging_buf = it->vfs_rdma_bulk_staging_buf;
-            it->vfs_rdma_write_buf = nullptr;
-            it->vfs_rdma_read_staging_buf = nullptr;
-            it->vfs_rdma_bulk_staging_buf = nullptr;
-            g_bindings.erase(it);
+            info.binding = &binding;
+            info.blk_zone_id = binding.blk_zone_id;
+            info.blk_rdma_active = binding.blk_rdma_active;
+            info.block_dev = binding.block_dev;
+            info.net_dev = binding.net_dev;
+            info.consumer_node = binding.consumer_node;
+            info.assigned_channel = binding.assigned_channel;
+            info.vfs_rdma_write_buf = binding.vfs_rdma_write_buf;
+            info.vfs_rdma_read_staging_buf = binding.vfs_rdma_read_staging_buf;
+            info.vfs_rdma_bulk_staging_buf = binding.vfs_rdma_bulk_staging_buf;
+            binding.vfs_rdma_write_buf = nullptr;
+            binding.vfs_rdma_read_staging_buf = nullptr;
+            binding.vfs_rdma_bulk_staging_buf = nullptr;
+            mark_binding_retiring_locked(binding);
             if (info.net_dev != nullptr) {
                 info.uninstall_rx_forward = !has_net_binding_for_dev(info.net_dev);
             }
@@ -1150,6 +1279,8 @@ void handle_dev_detach(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     }
 
     // Cleanup outside the lock
+
+    wait_for_binding_refs_to_drain(info.binding);
 
     delete[] info.vfs_rdma_write_buf;
 
@@ -1170,9 +1301,15 @@ void handle_dev_detach(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     if (ch != nullptr) {
         wki_channel_close(ch);
     }
-    ker::mod::dbg::log("[WKI] Dev detach: node=0x%04x res_id=%u", hdr->src_node, det->resource_id);
+    ker::mod::dbg::log("[WKI] Dev detach: node=0x%04x type=%u res_id=%u", hdr->src_node, det->resource_type, det->resource_id);
     if (info.uninstall_rx_forward) {
         info.net_dev->wki_rx_forward = nullptr;
+    }
+
+    {
+        uint64_t const ERASE_FLAGS = s_server_lock.lock_irqsave();
+        erase_retired_binding_locked(info.binding);
+        s_server_lock.unlock_irqrestore(ERASE_FLAGS);
     }
 }
 
@@ -1190,21 +1327,32 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
         return;
     }
 
+    uint16_t const REQUEST_COOKIE = req_cookie_from_header(hdr);
     bool const IS_VFS_OP = is_vfs_op(req->op_id);
 
-    // Find binding by (src_node, channel_id) - pointer is stable (std::deque reference stability)
-    DevServerBinding* binding = nullptr;
+    // Snapshot binding identity under the lock. Detach/fence may erase the
+    // binding after this point, so code below must not dereference it.
+    bool binding_found = false;
+    ResourceType binding_resource_type = ResourceType::BLOCK;
+    ker::net::NetDevice* binding_net_dev = nullptr;
+    ker::dev::BlockDevice* binding_block_dev = nullptr;
     uint32_t vfs_write_rkey = 0;
     {
         uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
-        binding = find_binding_by_channel(hdr->src_node, hdr->channel_id);
+        DevServerBinding* binding = find_binding_by_channel(hdr->src_node, hdr->channel_id);
         if (binding != nullptr && binding->resource_type == ResourceType::VFS) {
             vfs_write_rkey = binding->vfs_rdma_write_rkey;
+        }
+        if (binding != nullptr) {
+            binding_found = true;
+            binding_resource_type = binding->resource_type;
+            binding_net_dev = binding->net_dev;
+            binding_block_dev = binding->block_dev;
         }
         s_server_lock.unlock_irqrestore(SRV_FLAGS);
     }
 
-    if (binding == nullptr) {
+    if (!binding_found) {
         // D11: OP_NET_RX_NOTIFY is sent server->consumer on the dynamic channel.
         // The consumer has a proxy (not a server binding), so route to the
         // consumer-side handler instead of returning an error.
@@ -1234,10 +1382,14 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
         }
 
         // Send error response
+        uint16_t const RESPONSE_COOKIE = (req->op_id >= OP_NET_XMIT && req->op_id <= OP_NET_STATE_NOTIFY)
+                                             ? net_request_cookie_from_payload(req_data, REQ_DATA_LEN, REQUEST_COOKIE)
+                                             : REQUEST_COOKIE;
         DevOpRespPayload resp = {};
         resp.op_id = req->op_id;
         resp.status = -1;
         resp.data_len = 0;
+        resp.reserved = RESPONSE_COOKIE;
         wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
         return;
     }
@@ -1306,29 +1458,31 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
 
     // Dispatch NET operations to remote_net handler
     if (req->op_id >= OP_NET_XMIT && req->op_id <= OP_NET_STATE_NOTIFY) {
-        if (binding->net_dev == nullptr) {
+        if (binding_resource_type != ResourceType::NET || binding_net_dev == nullptr) {
             DevOpRespPayload resp = {};
             resp.op_id = req->op_id;
             resp.status = -1;
             resp.data_len = 0;
+            resp.reserved = net_request_cookie_from_payload(req_data, REQ_DATA_LEN, REQUEST_COOKIE);
             wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
             return;
         }
-        detail::handle_net_op(hdr, hdr->channel_id, binding->net_dev, req->op_id, req_data, REQ_DATA_LEN, binding);
+        detail::handle_net_op(hdr, hdr->channel_id, binding_net_dev, req->op_id, req_data, REQ_DATA_LEN);
         return;
     }
 
     // Block device operations require block_dev
-    if (binding->block_dev == nullptr) {
+    if (binding_block_dev == nullptr) {
         DevOpRespPayload resp = {};
         resp.op_id = req->op_id;
         resp.status = -1;
         resp.data_len = 0;
+        resp.reserved = REQUEST_COOKIE;
         wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
         return;
     }
 
-    ker::dev::BlockDevice* bdev = binding->block_dev;
+    ker::dev::BlockDevice* bdev = binding_block_dev;
 
     switch (req->op_id) {
         case OP_BLOCK_INFO: {
@@ -1340,6 +1494,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
             resp->op_id = OP_BLOCK_INFO;
             resp->status = 0;
             resp->data_len = INFO_DATA_LEN;
+            resp->reserved = REQUEST_COOKIE;
 
             auto* info_data = buf.data() + sizeof(DevOpRespPayload);
             uint64_t bs = bdev->block_size;
@@ -1359,6 +1514,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
                 resp.op_id = OP_BLOCK_READ;
                 resp.status = -1;
                 resp.data_len = 0;
+                resp.reserved = REQUEST_COOKIE;
                 wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
                 break;
             }
@@ -1381,6 +1537,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
                     resp.op_id = OP_BLOCK_READ;
                     resp.status = -1;
                     resp.data_len = 0;
+                    resp.reserved = REQUEST_COOKIE;
                     wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
                     break;
                 }
@@ -1394,6 +1551,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
                 resp.op_id = OP_BLOCK_READ;
                 resp.status = -1;
                 resp.data_len = 0;
+                resp.reserved = REQUEST_COOKIE;
                 wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
                 break;
             }
@@ -1406,7 +1564,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
             resp->op_id = OP_BLOCK_READ;
             resp->status = static_cast<int16_t>(RET);
             resp->data_len = (RET == 0) ? static_cast<uint16_t>(data_bytes) : 0;
-            resp->reserved = 0;
+            resp->reserved = REQUEST_COOKIE;
 
             uint16_t const SEND_LEN = (RET == 0) ? resp_total : static_cast<uint16_t>(sizeof(DevOpRespPayload));
             wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, buf, SEND_LEN);
@@ -1422,6 +1580,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
                 resp.op_id = OP_BLOCK_WRITE;
                 resp.status = -1;
                 resp.data_len = 0;
+                resp.reserved = REQUEST_COOKIE;
                 wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
                 break;
             }
@@ -1441,6 +1600,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
                 resp.op_id = OP_BLOCK_WRITE;
                 resp.status = -1;
                 resp.data_len = 0;
+                resp.reserved = REQUEST_COOKIE;
                 wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
                 break;
             }
@@ -1451,6 +1611,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
             resp.op_id = OP_BLOCK_WRITE;
             resp.status = static_cast<int16_t>(RET);
             resp.data_len = 0;
+            resp.reserved = REQUEST_COOKIE;
             wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
             break;
         }
@@ -1462,6 +1623,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
             resp.op_id = OP_BLOCK_FLUSH;
             resp.status = static_cast<int16_t>(RET);
             resp.data_len = 0;
+            resp.reserved = REQUEST_COOKIE;
             wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
             break;
         }
@@ -1473,6 +1635,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
             resp.op_id = req->op_id;
             resp.status = -1;
             resp.data_len = 0;
+            resp.reserved = REQUEST_COOKIE;
             wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
             break;
         }
@@ -1782,8 +1945,10 @@ void blk_zone_post_handler(uint32_t zone_id, uint32_t /*offset*/, uint32_t /*len
     {
         uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
         binding = find_binding_by_zone_id(zone_id);
-        if (binding != nullptr) {
+        if (retain_binding_locked(binding)) {
             binding->blk_sq_notified = true;
+        } else {
+            binding = nullptr;
         }
         s_server_lock.unlock_irqrestore(SRV_FLAGS);
     }
@@ -1791,6 +1956,7 @@ void blk_zone_post_handler(uint32_t zone_id, uint32_t /*offset*/, uint32_t /*len
     // blk_ring_server_poll may do block I/O - call outside the lock
     if (binding != nullptr) {
         blk_ring_server_poll(binding);
+        release_binding(binding);
     }
 }
 
@@ -1802,8 +1968,14 @@ void blk_zone_post_handler(uint32_t zone_id, uint32_t /*offset*/, uint32_t /*len
 
 void wki_dev_server_process_pending_zones() {
     // Collect pending bindings under the lock, then process outside
+    struct PendingBinding {
+        DevServerBinding* binding;
+        uint16_t consumer_node;
+        uint32_t blk_zone_id;
+        ker::dev::BlockDevice* block_dev;
+    };
     constexpr size_t MAX_PENDING = 32;
-    std::array<DevServerBinding*, MAX_PENDING> pending = {};
+    std::array<PendingBinding, MAX_PENDING> pending = {};
     size_t pending_count = 0;
 
     {
@@ -1812,9 +1984,13 @@ void wki_dev_server_process_pending_zones() {
             if (!b.active || !b.blk_zone_pending) {
                 continue;
             }
-            b.blk_zone_pending = false;  // only attempt once
             if (pending_count < MAX_PENDING) {
-                pending.at(pending_count++) = &b;
+                if (!retain_binding_locked(&b)) {
+                    continue;
+                }
+                b.blk_zone_pending = false;  // only attempt once
+                pending.at(pending_count++) = {
+                    .binding = &b, .consumer_node = b.consumer_node, .blk_zone_id = b.blk_zone_id, .block_dev = b.block_dev};
             }
         }
         s_server_lock.unlock_irqrestore(SRV_FLAGS);
@@ -1822,38 +1998,78 @@ void wki_dev_server_process_pending_zones() {
 
     // Process each pending binding outside the lock (wki_zone_create may block)
     for (size_t pi = 0; pi < pending_count; pi++) {
-        auto& b = *pending.at(pi);
+        const auto& item = pending.at(pi);
+        DevServerBinding* binding = item.binding;
 
         uint32_t const ZONE_SZ = blk_ring_default_zone_size();
         uint8_t const ZONE_ACCESS = ZONE_ACCESS_LOCAL_READ | ZONE_ACCESS_LOCAL_WRITE | ZONE_ACCESS_REMOTE_READ | ZONE_ACCESS_REMOTE_WRITE;
 
         int const ZONE_RET =
-            wki_zone_create(b.consumer_node, b.blk_zone_id, ZONE_SZ, ZONE_ACCESS, ZoneNotifyMode::POST_ONLY, ZoneTypeHint::MSG_QUEUE);
+            wki_zone_create(item.consumer_node, item.blk_zone_id, ZONE_SZ, ZONE_ACCESS, ZoneNotifyMode::POST_ONLY, ZoneTypeHint::MSG_QUEUE);
         if (ZONE_RET != WKI_OK) {
             ker::mod::dbg::log("[WKI] Deferred block RDMA ring creation failed (err=%d) for zone 0x%08x - consumer falls back to msg path",
-                               ZONE_RET, b.blk_zone_id);
-            b.blk_zone_id = 0;
+                               ZONE_RET, item.blk_zone_id);
+            {
+                uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+                if (binding->active && !binding->retiring.load(std::memory_order_acquire) && binding->blk_zone_id == item.blk_zone_id) {
+                    binding->blk_zone_id = 0;
+                }
+                s_server_lock.unlock_irqrestore(SRV_FLAGS);
+            }
+            release_binding(binding);
             continue;
         }
 
-        b.blk_zone_ptr = wki_zone_get_ptr(b.blk_zone_id);
-        b.blk_rdma_active = (b.blk_zone_ptr != nullptr);
+        void* zone_ptr = wki_zone_get_ptr(item.blk_zone_id);
+        bool blk_rdma_active = (zone_ptr != nullptr);
 
-        if (!b.blk_rdma_active) {
-            ker::mod::dbg::log("[WKI] Deferred block RDMA zone ptr null for zone 0x%08x", b.blk_zone_id);
+        if (!blk_rdma_active) {
+            ker::mod::dbg::log("[WKI] Deferred block RDMA zone ptr null for zone 0x%08x", item.blk_zone_id);
+            {
+                uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+                if (binding->active && !binding->retiring.load(std::memory_order_acquire) && binding->blk_zone_id == item.blk_zone_id) {
+                    binding->blk_zone_id = 0;
+                }
+                s_server_lock.unlock_irqrestore(SRV_FLAGS);
+            }
+            wki_zone_destroy(item.blk_zone_id);
+            release_binding(binding);
             continue;
         }
 
         // Check if the zone is RoCE-backed (needs explicit rdma_write/read sync)
-        WkiZone const* blk_zone = wki_zone_find(b.blk_zone_id);
+        WkiZone const* blk_zone = wki_zone_find(item.blk_zone_id);
+        bool blk_roce = false;
+        uint32_t blk_remote_rkey = 0;
+        WkiTransport* blk_rdma_transport = nullptr;
         if (blk_zone != nullptr && blk_zone->is_roce) {
-            b.blk_roce = true;
-            b.blk_remote_rkey = blk_zone->remote_rkey;
-            b.blk_rdma_transport = blk_zone->rdma_transport;
+            blk_roce = true;
+            blk_remote_rkey = blk_zone->remote_rkey;
+            blk_rdma_transport = blk_zone->rdma_transport;
+        }
+
+        bool binding_still_active = false;
+        {
+            uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+            if (binding->active && !binding->retiring.load(std::memory_order_acquire) && binding->blk_zone_id == item.blk_zone_id) {
+                binding->blk_zone_ptr = zone_ptr;
+                binding->blk_rdma_active = true;
+                binding->blk_roce = blk_roce;
+                binding->blk_remote_rkey = blk_remote_rkey;
+                binding->blk_rdma_transport = blk_rdma_transport;
+                binding_still_active = true;
+            }
+            s_server_lock.unlock_irqrestore(SRV_FLAGS);
+        }
+
+        if (!binding_still_active) {
+            wki_zone_destroy(item.blk_zone_id);
+            release_binding(binding);
+            continue;
         }
 
         // Initialize the ring header in local memory
-        auto* ring_hdr = blk_ring_header(b.blk_zone_ptr);
+        auto* ring_hdr = blk_ring_header(zone_ptr);
         ring_hdr->sq_head = 0;
         ring_hdr->sq_tail = 0;
         ring_hdr->cq_head = 0;
@@ -1862,24 +2078,25 @@ void wki_dev_server_process_pending_zones() {
         ring_hdr->cq_depth = BLK_RING_DEFAULT_CQ_DEPTH;
         ring_hdr->data_slot_count = BLK_RING_DEFAULT_DATA_SLOTS;
         ring_hdr->data_slot_size = BLK_RING_DEFAULT_DATA_SLOT_SIZE;
-        ring_hdr->block_size = static_cast<uint32_t>(b.block_dev->block_size);
-        ring_hdr->total_blocks = b.block_dev->total_blocks;
+        ring_hdr->block_size = item.block_dev != nullptr ? static_cast<uint32_t>(item.block_dev->block_size) : 0;
+        ring_hdr->total_blocks = item.block_dev != nullptr ? item.block_dev->total_blocks : 0;
         // Compiler barrier: ensure all fields are visible before server_ready
         asm volatile("" ::: "memory");
         ring_hdr->server_ready = 1;
 
         // For RoCE zones: push the entire ring header to the proxy so it
         // can see server_ready and device parameters
-        if (b.blk_roce && b.blk_rdma_transport != nullptr && b.blk_remote_rkey != 0) {
-            b.blk_rdma_transport->rdma_write(b.blk_rdma_transport, b.consumer_node, b.blk_remote_rkey, 0, ring_hdr, sizeof(BlkRingHeader));
+        if (blk_roce && blk_rdma_transport != nullptr && blk_remote_rkey != 0) {
+            blk_rdma_transport->rdma_write(blk_rdma_transport, item.consumer_node, blk_remote_rkey, 0, ring_hdr, sizeof(BlkRingHeader));
         }
 
-        ker::mod::dbg::log("[WKI] Deferred block RDMA ring created: zone=0x%08x size=%u roce=%d", b.blk_zone_id, ZONE_SZ,
-                           b.blk_roce ? 1 : 0);
+        ker::mod::dbg::log("[WKI] Deferred block RDMA ring created: zone=0x%08x size=%u roce=%d", item.blk_zone_id, ZONE_SZ,
+                           blk_roce ? 1 : 0);
 
         // Register a zone post_handler so that ZONE_NOTIFY_POST from the consumer
         // triggers immediate ring polling instead of waiting for the ~10ms timer tick.
-        wki_zone_set_handlers(b.blk_zone_id, nullptr, blk_zone_post_handler);
+        wki_zone_set_handlers(item.blk_zone_id, nullptr, blk_zone_post_handler);
+        release_binding(binding);
     }
 }
 
@@ -2004,8 +2221,11 @@ void wki_dev_server_poll_rings() {
             if (b.blk_roce && !b.blk_sq_notified) {
                 continue;
             }
-            b.blk_sq_notified = false;
             if (ring_count < MAX_RINGS) {
+                if (!retain_binding_locked(&b)) {
+                    continue;
+                }
+                b.blk_sq_notified = false;
                 rings.at(ring_count++) = &b;
             }
         }
@@ -2014,8 +2234,22 @@ void wki_dev_server_poll_rings() {
 
     // blk_ring_server_poll may do block I/O - call outside the lock
     for (size_t i = 0; i < ring_count; i++) {
-        blk_ring_server_poll(rings.at(i));
+        DevServerBinding* binding = rings.at(i);
+        blk_ring_server_poll(binding);
+        release_binding(binding);
     }
 }
+
+#ifdef WOS_SELFTEST
+auto wki_dev_server_selftest_binding_lifecycle_flags() -> bool {
+    DevServerBinding binding;
+    binding.active = true;
+    binding.refs.store(2, std::memory_order_relaxed);
+    binding.retiring.store(true, std::memory_order_relaxed);
+
+    DevServerBinding moved(std::move(binding));
+    return moved.active && moved.refs.load(std::memory_order_relaxed) == 2 && moved.retiring.load(std::memory_order_relaxed);
+}
+#endif
 
 }  // namespace ker::net::wki

@@ -125,9 +125,9 @@ auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra
         return finish(-EHOSTUNREACH);
     }
 
-    // Build request: [DevOpReqPayload][resource_id:u32][extra...]
+    // Build request: [DevOpReqPayload][resource_id:u32][cookie:u16][extra...]
     constexpr size_t RID_SIZE = sizeof(uint32_t);
-    const size_t TOTAL_DATA = RID_SIZE + extra_len;
+    const size_t TOTAL_DATA = RID_SIZE + WKI_IPC_OP_COOKIE_BYTES + extra_len;
     const size_t MSG_SIZE = sizeof(DevOpReqPayload) + TOTAL_DATA;
 
     auto* msg = new (std::nothrow) uint8_t[MSG_SIZE];
@@ -138,58 +138,50 @@ auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra
     auto* req_hdr = reinterpret_cast<DevOpReqPayload*>(msg);
     req_hdr->op_id = op_id;
     req_hdr->data_len = static_cast<uint16_t>(TOTAL_DATA);
-    std::memcpy(msg + sizeof(DevOpReqPayload), &proxy->resource_id, RID_SIZE);
-    if (extra != nullptr && extra_len > 0) {
-        std::memcpy(msg + sizeof(DevOpReqPayload) + RID_SIZE, extra, extra_len);
-    }
-
     // Register wait entry on the proxy (serialised by proxy->lock).
     WkiWaitEntry wait = {};
+    uint16_t op_cookie = 0;
     uint64_t irqf = proxy->lock.lock_irqsave();
-    if (proxy->pending_wait != nullptr) {
+    if (proxy->pending_wait_op != 0) {
         // Another in-flight control op — unlikely, return busy.
         proxy->lock.unlock_irqrestore(irqf);
         delete[] msg;
         return finish(-EBUSY);
     }
+    op_cookie = wki_ipc_allocate_wait_cookie_locked(proxy);
     proxy->pending_wait = &wait;
     proxy->pending_wait_op = op_id;
+    proxy->pending_wait_cookie = op_cookie;
     proxy->pending_wait_status = -ETIMEDOUT;
     proxy->pending_wait_resp_len = 0;
     proxy->lock.unlock_irqrestore(irqf);
+
+    std::memcpy(msg + sizeof(DevOpReqPayload), &proxy->resource_id, RID_SIZE);
+    std::memcpy(msg + sizeof(DevOpReqPayload) + RID_SIZE, &op_cookie, WKI_IPC_OP_COOKIE_BYTES);
+    if (extra != nullptr && extra_len > 0) {
+        std::memcpy(msg + sizeof(DevOpReqPayload) + RID_SIZE + WKI_IPC_OP_COOKIE_BYTES, extra, extra_len);
+    }
 
     int const TX = wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(MSG_SIZE));
     delete[] msg;
 
     if (TX != WKI_OK) {
-        irqf = proxy->lock.lock_irqsave();
-        proxy->pending_wait = nullptr;
-        proxy->lock.unlock_irqrestore(irqf);
+        wki_ipc_cancel_pending_wait(proxy, &wait, WKI_ERR_TX_FAILED);
         return finish(-EIO);
     }
 
     int const WAIT_RC = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
     if (WAIT_RC != 0) {
-        irqf = proxy->lock.lock_irqsave();
-        proxy->pending_wait = nullptr;
-        proxy->lock.unlock_irqrestore(irqf);
+        wki_ipc_cancel_pending_wait(proxy, &wait, -ETIMEDOUT);
         return finish(-ETIMEDOUT);
     }
 
-    irqf = proxy->lock.lock_irqsave();
-    int const STATUS = proxy->pending_wait_status;
-    uint16_t const RESP_LEN = proxy->pending_wait_resp_len;
-    if (resp_buf != nullptr && resp_max > 0 && RESP_LEN > 0) {
-        uint16_t const COPY_LEN = RESP_LEN < resp_max ? RESP_LEN : resp_max;
-        std::memcpy(resp_buf, static_cast<const void*>(proxy->pending_wait_resp), COPY_LEN);
-    }
+    uint16_t resp_len = 0;
+    int const STATUS = wki_ipc_consume_pending_wait_response(proxy, &wait, op_id, op_cookie, resp_buf, resp_max, &resp_len);
     if (resp_len_out != nullptr) {
-        *resp_len_out = RESP_LEN;
+        *resp_len_out = resp_len;
     }
-    proxy->pending_wait = nullptr;
-    proxy->lock.unlock_irqrestore(irqf);
-
-    return finish(STATUS, RESP_LEN);
+    return finish(STATUS, resp_len);
 }
 
 auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra, uint16_t extra_len, void* resp_buf, uint16_t resp_max)
@@ -342,8 +334,11 @@ auto proxy_socket_close(ker::vfs::File* f) -> int {
 
 auto proxy_socket_poll_check(ker::vfs::File* f, int events) -> int {
     auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
-    if (proxy == nullptr || !proxy->active.load(std::memory_order_acquire)) {
+    if (proxy == nullptr) {
         return 0;
+    }
+    if (!proxy->active.load(std::memory_order_acquire)) {
+        return 0x0008 | 0x0010;  // POLLERR | POLLHUP
     }
 
     int ready = 0;
