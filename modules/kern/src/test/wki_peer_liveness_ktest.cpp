@@ -132,6 +132,23 @@ KTEST(WkiPeerLiveness, TimeoutDeadlineSaturatesInsteadOfWrapping) {
                std::numeric_limits<uint64_t>::max());
 }
 
+KTEST(WkiPeerLiveness, HeartbeatJitterArithmeticSaturatesInsteadOfWrapping) {
+    constexpr uint64_t BASE_US = 1'000'000;
+    constexpr uint64_t SPAN_US = BASE_US * ker::net::wki::WKI_HEARTBEAT_JITTER_PERCENT / 100;
+    KEXPECT_EQ(ker::net::wki::wki_heartbeat_jitter_span_us(BASE_US), SPAN_US);
+    KEXPECT_EQ(ker::net::wki::wki_heartbeat_jitter_range_us(BASE_US), SPAN_US * 2);
+    KEXPECT_EQ(ker::net::wki::wki_heartbeat_interval_with_jitter_us(BASE_US, 0), BASE_US - SPAN_US);
+    KEXPECT_EQ(ker::net::wki::wki_heartbeat_interval_with_jitter_us(BASE_US, SPAN_US), BASE_US);
+    KEXPECT_EQ(ker::net::wki::wki_heartbeat_interval_with_jitter_us(BASE_US, (SPAN_US * 2) - 1), BASE_US + SPAN_US - 1);
+
+    uint64_t const HUGE_BASE = std::numeric_limits<uint64_t>::max();
+    uint64_t const HUGE_SPAN = ker::net::wki::wki_heartbeat_jitter_span_us(HUGE_BASE);
+    KEXPECT_NE(HUGE_SPAN, 0U);
+    KEXPECT_EQ(ker::net::wki::wki_heartbeat_interval_with_jitter_us(HUGE_BASE, 0), HUGE_BASE - HUGE_SPAN);
+    KEXPECT_EQ(ker::net::wki::wki_heartbeat_interval_with_jitter_us(HUGE_BASE, HUGE_SPAN), HUGE_BASE);
+    KEXPECT_EQ(ker::net::wki::wki_heartbeat_interval_with_jitter_us(HUGE_BASE, std::numeric_limits<uint64_t>::max()), HUGE_BASE);
+}
+
 KTEST(WkiPeerLiveness, LocalObservationRequiresStartupAndProbeGrace) {
     ker::net::wki::WkiPeer peer{};
     init_connected_direct_peer(peer);
@@ -155,8 +172,9 @@ KTEST(WkiPeerLiveness, LocalObservationRequiresStartupAndProbeGrace) {
 KTEST(WkiPeerLiveness, LocalObservationDefersDuringTxPressureOrFreshActivity) {
     ker::net::wki::WkiPeer peer{};
     init_connected_direct_peer(peer);
-    uint64_t const CONFIRMED_NOW = peer.last_heartbeat + DEFAULT_TIMEOUT_US + DEFAULT_CONFIRM_GRACE_US;
+    uint64_t const CONFIRMED_NOW = peer.last_heartbeat + DEFAULT_TIMEOUT_US + DEFAULT_FENCE_CONFIRMATION_WINDOW_US;
 
+    KEXPECT_TRUE(ker::net::wki::wki_peer_local_observation_confirms_fence(&peer, CONFIRMED_NOW, false));
     KEXPECT_FALSE(ker::net::wki::wki_peer_local_observation_confirms_fence(&peer, CONFIRMED_NOW, true));
 
     peer.fence_defer_until_us = CONFIRMED_NOW + 1;

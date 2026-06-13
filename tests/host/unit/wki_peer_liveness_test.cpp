@@ -127,6 +127,23 @@ TEST(WkiPeerLiveness, TimeoutDeadlineSaturatesInsteadOfWrapping) {
     EXPECT_EQ(wki_peer_timeout_deadline_us(&peer, std::numeric_limits<uint64_t>::max()), std::numeric_limits<uint64_t>::max());
 }
 
+TEST(WkiPeerLiveness, HeartbeatJitterArithmeticSaturatesInsteadOfWrapping) {
+    constexpr uint64_t BASE_US = 1'000'000;
+    constexpr uint64_t SPAN_US = BASE_US * WKI_HEARTBEAT_JITTER_PERCENT / 100;
+    EXPECT_EQ(wki_heartbeat_jitter_span_us(BASE_US), SPAN_US);
+    EXPECT_EQ(wki_heartbeat_jitter_range_us(BASE_US), SPAN_US * 2);
+    EXPECT_EQ(wki_heartbeat_interval_with_jitter_us(BASE_US, 0), BASE_US - SPAN_US);
+    EXPECT_EQ(wki_heartbeat_interval_with_jitter_us(BASE_US, SPAN_US), BASE_US);
+    EXPECT_EQ(wki_heartbeat_interval_with_jitter_us(BASE_US, (SPAN_US * 2) - 1), BASE_US + SPAN_US - 1);
+
+    uint64_t const HUGE_BASE = std::numeric_limits<uint64_t>::max();
+    uint64_t const HUGE_SPAN = wki_heartbeat_jitter_span_us(HUGE_BASE);
+    EXPECT_NE(HUGE_SPAN, 0u);
+    EXPECT_EQ(wki_heartbeat_interval_with_jitter_us(HUGE_BASE, 0), HUGE_BASE - HUGE_SPAN);
+    EXPECT_EQ(wki_heartbeat_interval_with_jitter_us(HUGE_BASE, HUGE_SPAN), HUGE_BASE);
+    EXPECT_EQ(wki_heartbeat_interval_with_jitter_us(HUGE_BASE, std::numeric_limits<uint64_t>::max()), HUGE_BASE);
+}
+
 TEST(WkiPeerLiveness, LocalObservationRequiresDirectConnectedPeerToOutliveStartupAndProbeGrace) {
     WkiPeer peer{};
     init_connected_direct_peer(peer);
@@ -150,8 +167,9 @@ TEST(WkiPeerLiveness, LocalObservationRequiresDirectConnectedPeerToOutliveStartu
 TEST(WkiPeerLiveness, LocalObservationDefersDuringTxPressureOrFenceDeferWindow) {
     WkiPeer peer{};
     init_connected_direct_peer(peer);
-    uint64_t const CONFIRMED_NOW = peer.last_heartbeat + DEFAULT_TIMEOUT_US + DEFAULT_CONFIRM_GRACE_US;
+    uint64_t const CONFIRMED_NOW = peer.last_heartbeat + DEFAULT_TIMEOUT_US + DEFAULT_FENCE_CONFIRMATION_WINDOW_US;
 
+    EXPECT_TRUE(wki_peer_local_observation_confirms_fence(&peer, CONFIRMED_NOW, false));
     EXPECT_FALSE(wki_peer_local_observation_confirms_fence(&peer, CONFIRMED_NOW, true));
 
     peer.fence_defer_until_us = CONFIRMED_NOW + 1;

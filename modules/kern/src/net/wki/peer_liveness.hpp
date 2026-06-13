@@ -84,6 +84,29 @@ inline auto wki_peer_timeout_deadline_us(const WkiPeer* peer, uint64_t now_us) -
     return next_deadline > now_us ? next_deadline : wki_future_deadline_us(now_us, 1);
 }
 
+constexpr auto wki_heartbeat_jitter_span_us(uint64_t base_interval_us) -> uint64_t {
+    return wki_saturating_mul_us(base_interval_us, WKI_HEARTBEAT_JITTER_PERCENT) / 100;
+}
+
+constexpr auto wki_heartbeat_jitter_range_us(uint64_t base_interval_us) -> uint64_t {
+    return wki_saturating_mul_us(wki_heartbeat_jitter_span_us(base_interval_us), 2);
+}
+
+constexpr auto wki_heartbeat_interval_with_jitter_us(uint64_t base_interval_us, uint64_t jitter_us) -> uint64_t {
+    uint64_t const MAX_JITTER_US = wki_heartbeat_jitter_span_us(base_interval_us);
+    uint64_t interval_us = 0;
+    if (jitter_us >= MAX_JITTER_US) {
+        interval_us = wki_saturating_add_us(base_interval_us, jitter_us - MAX_JITTER_US);
+    } else {
+        uint64_t const NEGATIVE_JITTER_US = MAX_JITTER_US - jitter_us;
+        interval_us = NEGATIVE_JITTER_US >= base_interval_us ? 0 : base_interval_us - NEGATIVE_JITTER_US;
+    }
+
+    uint64_t const MIN_INTERVAL_US = base_interval_us / 2;
+    uint64_t const MAX_INTERVAL_US = wki_saturating_mul_us(base_interval_us, 2);
+    return std::clamp(interval_us, MIN_INTERVAL_US, MAX_INTERVAL_US);
+}
+
 inline auto wki_peer_local_observation_confirms_fence(const WkiPeer* peer, uint64_t now_us, bool recent_tx_pressure) -> bool {
     if (peer == nullptr) {
         return true;

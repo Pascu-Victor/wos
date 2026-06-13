@@ -1115,11 +1115,15 @@ auto wki_jitter_rand() -> uint64_t {
 // Get jitter amount in microseconds based on interval
 auto wki_get_jitter_us(uint64_t base_interval_us) -> uint64_t {
     // +/- WKI_HEARTBEAT_JITTER_PERCENT of the base interval
-    uint64_t const MAX_JITTER = (base_interval_us * WKI_HEARTBEAT_JITTER_PERCENT) / 100;
+    uint64_t const MAX_JITTER = wki_heartbeat_jitter_span_us(base_interval_us);
     if (MAX_JITTER == 0) {
         return 0;
     }
-    uint64_t const JITTER = wki_jitter_rand() % (2 * MAX_JITTER);
+    uint64_t const JITTER_RANGE = wki_heartbeat_jitter_range_us(base_interval_us);
+    if (JITTER_RANGE == 0) {
+        return 0;
+    }
+    uint64_t const JITTER = wki_jitter_rand() % JITTER_RANGE;
     // Return signed jitter as offset from base (can be negative via subtraction)
     return JITTER;  // Will be subtracted by max_jitter by caller to center around 0
 }
@@ -1147,18 +1151,9 @@ auto wki_hello_broadcast_interval_us() -> uint64_t {
 }
 
 auto wki_schedule_next_heartbeat_deadline(uint64_t now_us, uint64_t min_interval_us) -> uint64_t {
-    uint64_t const MAX_JITTER = (min_interval_us * WKI_HEARTBEAT_JITTER_PERCENT) / 100;
     uint64_t const JITTER = wki_get_jitter_us(min_interval_us);
-    int64_t const JITTER_OFFSET = static_cast<int64_t>(JITTER) - static_cast<int64_t>(MAX_JITTER);
-    auto effective_interval = static_cast<uint64_t>(static_cast<int64_t>(min_interval_us) + JITTER_OFFSET);
-
-    if (effective_interval < min_interval_us / 2) {
-        effective_interval = min_interval_us / 2;
-    } else if (effective_interval > min_interval_us * 2) {
-        effective_interval = min_interval_us * 2;
-    }
-
-    return wki_future_deadline_us(now_us, effective_interval);
+    uint64_t const EFFECTIVE_INTERVAL = wki_heartbeat_interval_with_jitter_us(min_interval_us, JITTER);
+    return wki_future_deadline_us(now_us, EFFECTIVE_INTERVAL);
 }
 
 auto wki_send_heartbeat_probe(WkiPeer* peer) -> int {
