@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <platform/sched/run_heap.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <test/ktest.hpp>
 
@@ -42,6 +43,16 @@ KTEST(Sched, DeadlineComputation) {
     // Lower weight (higher nice) -> larger deadline -> less urgent
     KEXPECT_TRUE(DL_WP5 > DL_W0);
     KEXPECT_TRUE(DL_W0 > DL_WN5);
+}
+
+KTEST(Sched, SaturatingDeadlineUs) {
+    using ker::mod::sched::saturating_deadline_us;
+
+    KEXPECT_EQ(saturating_deadline_us(10, 5), 15ULL);
+    KEXPECT_EQ(saturating_deadline_us(10, 0), 10ULL);
+    KEXPECT_EQ(saturating_deadline_us(UINT64_MAX - 5ULL, 5), UINT64_MAX);
+    KEXPECT_EQ(saturating_deadline_us(UINT64_MAX - 5ULL, 6), UINT64_MAX);
+    KEXPECT_EQ(saturating_deadline_us(UINT64_MAX, 1), UINT64_MAX);
 }
 
 // ---------------------------------------------------------------------------

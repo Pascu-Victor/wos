@@ -2237,7 +2237,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                 } else if (t->itimer_real_expire_us != 0 && NOW_US >= t->itimer_real_expire_us && signal_wake_count < PENDING_WAKE_LIMIT) {
                     t->sig_pending |= (1ULL << (14 - 1));  // SIGALRM = 14
                     if (t->itimer_real_interval_us != 0) {
-                        t->itimer_real_expire_us = NOW_US + t->itimer_real_interval_us;
+                        t->itimer_real_expire_us = saturating_deadline_us(NOW_US, t->itimer_real_interval_us);
                     } else {
                         t->itimer_real_expire_us = 0;
                     }
@@ -2455,7 +2455,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
         if (current_task->itimer_real_expire_us != 0 && NOW_US >= current_task->itimer_real_expire_us) {
             current_task->sig_pending |= (1ULL << (14 - 1));  // SIGALRM = 14
             if (current_task->itimer_real_interval_us != 0) {
-                current_task->itimer_real_expire_us = NOW_US + current_task->itimer_real_interval_us;
+                current_task->itimer_real_expire_us = saturating_deadline_us(NOW_US, current_task->itimer_real_interval_us);
             } else {
                 current_task->itimer_real_expire_us = 0;
             }

@@ -18,6 +18,13 @@ namespace ker::mod::sched {
 // Maximum PIDs system-wide (2^24)
 static constexpr uint32_t MAX_PIDS = (1 << 24);
 
+[[nodiscard]] constexpr auto saturating_deadline_us(uint64_t base_us, uint64_t delta_us) -> uint64_t {
+    if (UINT64_MAX - base_us < delta_us) {
+        return UINT64_MAX;
+    }
+    return base_us + delta_us;
+}
+
 struct RunQueue {
     RunHeap runnable_heap{};        // EEVDF min-heap of runnable tasks (keyed on vdeadline)
     IntrusiveTaskList wait_list{};  // Tasks blocked on I/O or events (waitpid, socket recv)
@@ -524,7 +531,7 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
         task->wait_channel = "kern_sleep";
-        task->wake_at_us = ker::mod::time::get_us() + sleep_us;
+        task->wake_at_us = saturating_deadline_us(ker::mod::time::get_us(), sleep_us);
         task->wants_block = true;
         task->set_voluntary_blocked(true);
         if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
