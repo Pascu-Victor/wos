@@ -720,7 +720,7 @@ def require_journal_device_test(source: str) -> None:
         'testd_format_to_array(token, "testd-journal-%d", getpid())',
         "write(FD, token.data(), TOKEN_LEN)",
         "std::array<ker::abi::sys_log::JournalRecord, JOURNAL_SCAN_BATCH>",
-        "read(FD, records.data(), records.size() * sizeof(ker::abi::sys_log::JournalRecord))",
+        "read_once_timeout(FD, records.data(), records.size() * sizeof(ker::abi::sys_log::JournalRecord), REMOTE_IPC_TIMEOUT_MS)",
         "N % static_cast<ssize_t>(sizeof(ker::abi::sys_log::JournalRecord))",
         'constexpr std::string_view USERSPACE_MODULE = "userspace"',
         "rec.module[pos] == USERSPACE_MODULE.at(pos)",
@@ -737,6 +737,8 @@ def require_journal_device_test(source: str) -> None:
     for snippet in snippets:
         if snippet not in body:
             fail(f"test_journal_device_userspace_record is missing snippet: {snippet}")
+    if "read(FD, records.data(), records.size() * sizeof(ker::abi::sys_log::JournalRecord))" in body:
+        fail("test_journal_device_userspace_record still uses an unbounded journal read")
 
 
 def require_compiled_manifest_rejects_empty_tests(source: str) -> None:

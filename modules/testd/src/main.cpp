@@ -528,6 +528,30 @@ auto read_expected_bytes(int fd, char* buf, size_t expected) -> ssize_t {
     return read_expected_bytes_timeout(fd, buf, expected, REMOTE_IPC_TIMEOUT_MS);
 }
 
+auto read_once_timeout(int fd, void* buf, size_t len, int timeout_ms) -> ssize_t {
+    int old_flags = -1;
+    if (!set_nonblocking_for_timeout(fd, old_flags)) {
+        return -1;
+    }
+
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
+    for (;;) {
+        ssize_t const N = read(fd, buf, len);
+        if (N >= 0) {
+            restore_fd_flags(fd, old_flags);
+            return N;
+        }
+        if (!retryable_would_block()) {
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
+        if (wait_fd_ready_until(fd, POLLIN, DEADLINE_MS, timeout_ms) <= 0) {
+            restore_fd_flags(fd, old_flags);
+            return -1;
+        }
+    }
+}
+
 auto wait_remote_waiter_ready(int ready_fd) -> bool {
     char byte = 0;
     ssize_t const N = read_expected_bytes_timeout(ready_fd, &byte, 1, REMOTE_IPC_TIMEOUT_MS);
@@ -3947,7 +3971,8 @@ TESTD_RUN(test_journal_device_userspace_record) {
     bool found = false;
     std::array<ker::abi::sys_log::JournalRecord, JOURNAL_SCAN_BATCH> records{};
     for (size_t batch = 0; batch < JOURNAL_SCAN_BATCHES && !found; ++batch) {
-        ssize_t const N = read(FD, records.data(), records.size() * sizeof(ker::abi::sys_log::JournalRecord));
+        ssize_t const N =
+            read_once_timeout(FD, records.data(), records.size() * sizeof(ker::abi::sys_log::JournalRecord), REMOTE_IPC_TIMEOUT_MS);
         if (N < 0) {
             close(FD);
             fail("journal_device_read", "read from /dev/journal failed");
