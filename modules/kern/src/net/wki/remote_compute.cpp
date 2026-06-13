@@ -658,6 +658,7 @@ auto try_complete_proxy_wait(ker::mod::sched::task::Task* waiter, ker::mod::sche
         return false;
     }
 
+    ker::mod::sched::task::task_accumulate_waited_child_times(*waiter, *proxy);
     waiter->context.regs.rax = proxy->pid;
     write_proxy_wait_status(waiter, wait_status);
     clear_proxy_wait_result_state(waiter);

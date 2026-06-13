@@ -325,8 +325,39 @@ int cdc_attach(UsbDevice* dev, UsbInterfaceDescriptor* iface, uint8_t* config_da
     return 0;
 }
 
-void cdc_detach(UsbDevice* /*unused*/) {
-    // TODO: tear down
+void cdc_detach(UsbDevice* dev) {
+    if (dev == nullptr) {
+        return;
+    }
+
+    for (size_t i = 0; i < cdc_count; i++) {
+        auto& cdc = cdc_devices.at(i);
+        if (!cdc.active || cdc.usb_dev != dev) {
+            continue;
+        }
+
+        cdc.active = false;
+        cdc.netdev.state = 0;
+        cdc.netdev.remotable = nullptr;
+        cdc.netdev.wki_rx_forward = nullptr;
+        ker::net::netdev_unregister(&cdc.netdev);
+
+        if (cdc.bulk_in.ring != nullptr) {
+            ker::mod::mm::phys::page_free(cdc.bulk_in.ring);
+        }
+        if (cdc.bulk_out.ring != nullptr && cdc.bulk_out.ring != cdc.bulk_in.ring) {
+            ker::mod::mm::phys::page_free(cdc.bulk_out.ring);
+        }
+        if (dev->driver_data == &cdc) {
+            dev->driver_data = nullptr;
+        }
+
+        cdc = CdcEtherDevice{};
+        while (cdc_count > 0 && !cdc_devices.at(cdc_count - 1).active) {
+            cdc_count--;
+        }
+        return;
+    }
 }
 
 UsbClassDriver cdc_driver = {

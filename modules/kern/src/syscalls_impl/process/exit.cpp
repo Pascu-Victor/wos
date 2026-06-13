@@ -17,6 +17,7 @@
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/context_switch.hpp>
+#include <platform/sys/signal.hpp>
 #include <vfs/vfs.hpp>
 
 #include "platform/sched/task.hpp"
@@ -164,6 +165,7 @@ auto complete_exit_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::ta
     if (child == nullptr || !sched_task::task_try_mark_waited_on(*child)) {
         return false;
     }
+    sched_task::task_accumulate_waited_child_times(*waiter, *child);
     waiter->context.regs.rax = child->pid;
     validate_waiter_resume_for_exit(waiter, child, path);
     write_wait_status_for_waiter(waiter, child->exit_status);
@@ -249,6 +251,25 @@ void release_exiting_user_address_space(ker::mod::sched::task::Task* task) {
     task->pagemap = nullptr;
     ker::mod::mm::virt::destroy_user_space(pagemap, task->pid, task->name, "process-exit");
     ker::mod::mm::virt::release_pagemap(pagemap);
+}
+
+void cleanup_signal_handlers_for_exit(ker::mod::sched::task::Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+
+    task->sig_pending = 0;
+    task->sig_mask = 0;
+    task->sigsuspend_saved_mask = 0;
+    task->sigaltstack_sp = 0;
+    task->sigaltstack_size = 0;
+    task->sigaltstack_flags = ker::mod::sys::signal::WOS_SS_DISABLE;
+    task->sigsuspend_active = false;
+    task->in_signal_handler = false;
+    task->do_sigreturn = false;
+    for (auto& handler : task->sig_handlers) {
+        handler = {};
+    }
 }
 
 }  // namespace
@@ -374,6 +395,7 @@ void wos_proc_exit_with_wait_status(int status, int wait_status) {
                     completed_wait = sched_task::task_try_mark_waited_on(*current_task);
                 }
                 if (completed_wait) {
+                    sched_task::task_accumulate_waited_child_times(*waiting_task, *current_task);
                     waiting_task->context.regs.rax = current_task->pid;
                     validate_waiter_resume_for_exit(waiting_task, current_task, "exit-specific");
                     write_wait_status_for_waiter(waiting_task, current_task->exit_status);
@@ -428,7 +450,7 @@ void wos_proc_exit_with_wait_status(int status, int wait_status) {
 
     ker::syscall::shm::shm_cleanup_for_task(current_task);
 
-    // TODO: Handle signal handlers cleanup
+    cleanup_signal_handlers_for_exit(current_task);
 
     uint32_t const EXIT_US = clamp_perf_aux(ker::mod::time::get_us() - EXIT_STARTED_US);
     record_local_proc_event(current_task, ker::mod::perf::WkiPerfLocalProcOp::EXIT, ker::mod::perf::WkiPerfPhase::END, EXIT_CORR, 0,

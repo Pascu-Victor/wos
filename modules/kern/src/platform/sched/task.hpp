@@ -281,6 +281,8 @@ struct Task {
     uint64_t start_time_us{};               // Wall-clock time when task was created
     uint64_t user_time_us{};                // Cumulative user-mode CPU time
     uint64_t system_time_us{};              // Cumulative kernel-mode CPU time
+    uint64_t child_user_time_us{};          // User-mode CPU time from children reaped by waitpid
+    uint64_t child_system_time_us{};        // Kernel-mode CPU time from children reaped by waitpid
     uint64_t syscall_account_start_us{};    // Non-zero while this task is executing a syscall
     uint64_t precharged_syscall_time_us{};  // Syscall time already charged before the next scheduler tick
 
@@ -523,6 +525,15 @@ inline void task_clear_waited_on(Task& task) { task.waited_on.store(false, std::
 [[nodiscard]] inline auto task_try_mark_waited_on(Task& task) -> bool {
     bool expected = false;
     return task.waited_on.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+inline void task_accumulate_waited_child_times(Task& parent, const Task& child) {
+    if (child.parent_pid != parent.pid) {
+        return;
+    }
+
+    parent.child_user_time_us += child.user_time_us + child.child_user_time_us;
+    parent.child_system_time_us += child.system_time_us + child.child_system_time_us;
 }
 
 inline void task_clear_waitpid_block_state(Task& task) {

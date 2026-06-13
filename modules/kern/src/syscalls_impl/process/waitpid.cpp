@@ -182,6 +182,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         if (exited != nullptr) {
             clear_waitpid_publish_pending(current_task);
             current_task->waiting_for_pid = 0;
+            sched_task::task_accumulate_waited_child_times(*current_task, *exited);
             if (status != nullptr) {
                 *status = exited->exit_status;
             }
@@ -238,6 +239,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         if (exited != nullptr) {
             clear_waitpid_publish_pending(current_task);
             current_task->deferred_task_switch = false;
+            sched_task::task_accumulate_waited_child_times(*current_task, *exited);
             if (status != nullptr) {
                 *status = exited->exit_status;
             }
@@ -285,6 +287,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         if (!sched_task::task_try_mark_waited_on(*target_task)) {
             return static_cast<uint64_t>(-ECHILD);
         }
+        sched_task::task_accumulate_waited_child_times(*current_task, *target_task);
         if (status != nullptr) {
             *status = target_task->exit_status;
         }
@@ -347,6 +350,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             }
             clear_waitpid_publish_pending(current_task);
             current_task->deferred_task_switch = false;
+            sched_task::task_accumulate_waited_child_times(*current_task, *target_task);
             if (status != nullptr) {
                 *status = target_task->exit_status;
             }
@@ -380,6 +384,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             clear_wait_resume_debug(current_task);
             return static_cast<uint64_t>(-ECHILD);
         }
+        sched_task::task_accumulate_waited_child_times(*current_task, *target_task);
         if (status != nullptr) {
             *status = target_task->exit_status;
         }

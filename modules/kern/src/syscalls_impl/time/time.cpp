@@ -163,8 +163,8 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 auto* tms = reinterpret_cast<struct tms*>(arg1);
                 tms->tms_utime = static_cast<long>(us_to_ticks(task->user_time_us));
                 tms->tms_stime = static_cast<long>(us_to_ticks(task->system_time_us));
-                tms->tms_cutime = 0;  // TODO: accumulate children's times on waitpid
-                tms->tms_cstime = 0;
+                tms->tms_cutime = static_cast<long>(us_to_ticks(task->child_user_time_us));
+                tms->tms_cstime = static_cast<long>(us_to_ticks(task->child_system_time_us));
             }
 
             // Return value: elapsed real time in ticks since an arbitrary epoch (system boot)

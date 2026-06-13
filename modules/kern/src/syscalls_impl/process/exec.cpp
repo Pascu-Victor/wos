@@ -668,9 +668,12 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     if (new_task == nullptr || new_task->thread == nullptr || new_task->pagemap == nullptr) {
         dbg::log("wos_proc_exec: Failed to create task (OOM during thread/pagemap allocation)");
 
+        ker::mod::mm::phys::page_free(reinterpret_cast<void*>(KERNEL_RSP - ker::mod::mm::KERNEL_STACK_SIZE));
+        if (new_task != nullptr) {
+            new_task->context.syscall_kernel_stack = 0;
+        }
         delete new_task;
 
-        // TODO: Free kernel stack pages if we do not already
         delete[] elf_buffer;
         return 0;
     }

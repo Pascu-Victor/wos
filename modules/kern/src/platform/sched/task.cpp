@@ -493,6 +493,8 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->start_time_us = 0;  // Will be set when task is first scheduled
     this->user_time_us = 0;
     this->system_time_us = 0;
+    this->child_user_time_us = 0;
+    this->child_system_time_us = 0;
     this->syscall_account_start_us = 0;
     this->precharged_syscall_time_us = 0;
 
@@ -893,6 +895,8 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->start_time_us = 0;
     t->user_time_us = 0;
     t->system_time_us = 0;
+    t->child_user_time_us = 0;
+    t->child_system_time_us = 0;
     t->syscall_account_start_us = 0;
     t->precharged_syscall_time_us = 0;
     t->itimer_real_expire_us = 0;

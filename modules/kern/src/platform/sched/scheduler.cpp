@@ -3185,6 +3185,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                 }
 
                 skip_wait_queue = true;
+                task::task_accumulate_waited_child_times(*current_task, *child);
                 current_task->context.regs.rax = child->pid;
                 validate_wait_resume_mapping(current_task, child, path);
                 if (current_task->wait_status_user_addr != 0 && current_task->pagemap != nullptr) {
@@ -3269,6 +3270,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             if (target != nullptr && target->exit_notify_ready.load(std::memory_order_acquire) && target->has_exited) {
                 skip_wait_queue = true;
                 if (task::task_try_mark_waited_on(*target)) {
+                    task::task_accumulate_waited_child_times(*current_task, *target);
                     current_task->context.regs.rax = target->pid;
                     validate_wait_resume_mapping(current_task, target, "sched-specific");
                     if (current_task->wait_status_user_addr != 0 && current_task->pagemap != nullptr) {
