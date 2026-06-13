@@ -2358,7 +2358,20 @@ void wki_load_report_send() {
     }
 }
 
-auto wki_remote_node_load(uint16_t node_id) -> const RemoteNodeLoad* { return find_remote_load(node_id); }
+auto wki_remote_node_load_snapshot(uint16_t node_id, RemoteNodeLoad* out) -> bool {
+    if (out == nullptr) {
+        return false;
+    }
+
+    s_compute_lock.lock();
+    RemoteNodeLoad const* load = find_remote_load(node_id);
+    bool const FOUND = load != nullptr && load->valid;
+    if (FOUND) {
+        *out = *load;
+    }
+    s_compute_lock.unlock();
+    return FOUND;
+}
 
 auto wki_least_loaded_node(uint16_t local_load) -> uint16_t {
     uint16_t best_node = WKI_NODE_INVALID;
@@ -2671,6 +2684,40 @@ auto wki_remote_compute_selftest_task_wait_timeout_preserves_successor() -> bool
                                observed_status == task.exit_status;
 
     return BUSY_REJECTED && SUCCESSOR_PRESERVED && PUBLISHED_AFTER_CLEAR && OWNED_CLEARED;
+}
+
+auto wki_remote_compute_selftest_load_snapshot_survives_cleanup() -> bool {
+    constexpr uint16_t NODE_ID = 0x7A25;
+    constexpr uint16_t CPU_COUNT = 4;
+    constexpr uint16_t LOAD_PCT = 321;
+    constexpr uint64_t LAST_UPDATE_US = 0x12345678ULL;
+
+    RemoteNodeLoad seeded = {};
+    seeded.valid = true;
+    seeded.node_id = NODE_ID;
+    seeded.num_cpus = CPU_COUNT;
+    seeded.avg_load_pct = LOAD_PCT;
+    seeded.last_update_us = LAST_UPDATE_US;
+
+    s_compute_lock.lock();
+    std::erase_if(g_remote_loads, [](const RemoteNodeLoad& load) { return load.node_id == NODE_ID; });
+    g_remote_loads.push_back(seeded);
+    s_compute_lock.unlock();
+
+    RemoteNodeLoad snapshot = {};
+    bool const SNAPSHOT_FOUND = wki_remote_node_load_snapshot(NODE_ID, &snapshot);
+
+    wki_remote_compute_cleanup_for_peer(NODE_ID);
+
+    RemoteNodeLoad after_cleanup = {};
+    bool const CLEANED_UP = !wki_remote_node_load_snapshot(NODE_ID, &after_cleanup);
+
+    s_compute_lock.lock();
+    std::erase_if(g_remote_loads, [](const RemoteNodeLoad& load) { return load.node_id == NODE_ID; });
+    s_compute_lock.unlock();
+
+    return SNAPSHOT_FOUND && snapshot.valid && snapshot.node_id == NODE_ID && snapshot.num_cpus == CPU_COUNT &&
+           snapshot.avg_load_pct == LOAD_PCT && snapshot.last_update_us == LAST_UPDATE_US && CLEANED_UP;
 }
 #endif
 

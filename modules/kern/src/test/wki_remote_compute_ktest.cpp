@@ -16,3 +16,7 @@ KTEST(WkiRemoteCompute, TaskWaitConsumesCompletedRow) {
 KTEST(WkiRemoteCompute, TaskWaitTimeoutPreservesSuccessor) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_task_wait_timeout_preserves_successor());
 }
+
+KTEST(WkiRemoteCompute, LoadSnapshotSurvivesCleanup) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_load_snapshot_survives_cleanup());
+}

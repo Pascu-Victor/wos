@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[3]
 REMOTE_COMPUTE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_compute.cpp"
 REMOTE_COMPUTE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_compute.hpp"
 REMOTE_COMPUTE_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_remote_compute_ktest.cpp"
+PROCFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.cpp"
 
 
 def fail(message: str) -> None:
@@ -192,6 +193,59 @@ def test_task_wait_completion_slot_is_single_owner() -> None:
     )
 
 
+def test_remote_load_procfs_uses_locked_snapshot() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    header = REMOTE_COMPUTE_HPP.read_text()
+    procfs = PROCFS_CPP.read_text()
+    ktest = REMOTE_COMPUTE_KTEST.read_text()
+
+    if "wki_remote_node_load(" in header + source + procfs:
+        fail("remote load callers must not expose or consume raw RemoteNodeLoad pointers")
+
+    require_tokens(
+        header,
+        ["auto wki_remote_node_load_snapshot(uint16_t node_id, RemoteNodeLoad* out) -> bool;"],
+        "remote load snapshot declaration",
+    )
+    snapshot_body = function_body(source, "wki_remote_node_load_snapshot")
+    require_tokens(
+        snapshot_body,
+        [
+            "s_compute_lock.lock()",
+            "RemoteNodeLoad const* load = find_remote_load(node_id)",
+            "*out = *load",
+            "s_compute_lock.unlock()",
+            "return FOUND",
+        ],
+        "remote load snapshot locking",
+    )
+    require_order(snapshot_body, "s_compute_lock.lock()", "*out = *load", "snapshot copy under compute lock")
+    require_order(snapshot_body, "*out = *load", "s_compute_lock.unlock()", "snapshot unlock after copy")
+
+    peers_body = function_body(procfs, "generate_wki_peers")
+    require_tokens(
+        peers_body,
+        [
+            "struct PeerProcSnapshot",
+            "std::array<PeerProcSnapshot, ker::net::wki::WKI_MAX_PEERS> peer_rows{}",
+            "ker::net::wki::g_wki.peer_lock.unlock_irqrestore(FLAGS)",
+            "wki_remote_node_load_snapshot(row.node_id, &load)",
+        ],
+        "procfs WKI peer load snapshots",
+    )
+    require_order(
+        peers_body,
+        "ker::net::wki::g_wki.peer_lock.unlock_irqrestore(FLAGS)",
+        "wki_remote_node_load_snapshot(row.node_id, &load)",
+        "procfs must not query remote load while holding peer lock",
+    )
+
+    token = "wki_remote_compute_selftest_load_snapshot_survives_cleanup"
+    require_tokens(source, [f"auto {token}() -> bool"], "remote load snapshot selftest implementation")
+    require_tokens(header, [f"auto {token}() -> bool;"], "remote load snapshot selftest declaration")
+    require_tokens(ktest, ["LoadSnapshotSurvivesCleanup", token], "remote load snapshot KTEST coverage")
+
+
 def test_receiver_path_localization_bounds_suffix_scan() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
     body = function_body(source, "localize_receiver_logical_path")
@@ -254,6 +308,7 @@ def main() -> None:
     test_proxy_wait_completion_respects_waitpid_publish_fence()
     test_task_wait_consumes_completed_submitted_row()
     test_task_wait_completion_slot_is_single_owner()
+    test_remote_load_procfs_uses_locked_snapshot()
     test_receiver_path_localization_bounds_suffix_scan()
     test_vfs_ref_loader_rejects_null_or_empty_path_before_vfs_use()
     test_vfs_ref_loader_deadlines_are_saturating()

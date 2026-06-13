@@ -1426,6 +1426,14 @@ auto generate_wki_peers(char* buf, size_t bufsz) -> size_t {
         return 0;
     }
 
+    struct PeerProcSnapshot {
+        std::array<char, net::wki::WKI_HOSTNAME_MAX> hostname = {};
+        uint16_t node_id = ker::net::wki::WKI_NODE_INVALID;
+        ker::net::wki::PeerState state = ker::net::wki::PeerState::UNKNOWN;
+        uint64_t last_heartbeat = 0;
+        uint64_t last_rx_activity = 0;
+    };
+
     size_t off = 0;
     auto append = [&](const char* s) {
         while (*s != '\0' && off < bufsz - 1) {
@@ -1459,20 +1467,36 @@ auto generate_wki_peers(char* buf, size_t bufsz) -> size_t {
     uint16_t const LOCAL_NODE = ker::net::wki::g_wki.my_node_id != ker::net::wki::WKI_NODE_INVALID ? ker::net::wki::g_wki.my_node_id : 0;
     append_row(ker::net::wki::g_wki.local_hostname, LOCAL_NODE, true, CPU_COUNT, LOCAL_LOAD, ker::net::wki::wki_now_us(), true);
 
+    std::array<PeerProcSnapshot, ker::net::wki::WKI_MAX_PEERS> peer_rows{};
+    size_t peer_count = 0;
+
     uint64_t const FLAGS = ker::net::wki::g_wki.peer_lock.lock_irqsave();
     for (const auto& peer : ker::net::wki::g_wki.peers) {
         if (peer.node_id == ker::net::wki::WKI_NODE_INVALID) {
             continue;
         }
+        if (peer_count >= peer_rows.size()) {
+            break;
+        }
 
-        auto const* load = ker::net::wki::wki_remote_node_load(peer.node_id);
-        uint64_t const CPUS = load != nullptr && load->valid && load->num_cpus != 0 ? load->num_cpus : 0;
-        uint64_t const LOAD_PCT = load != nullptr && load->valid ? load->avg_load_pct : 0;
-        uint64_t const LAST_UPDATE =
-            load != nullptr && load->valid ? load->last_update_us : std::max(peer.last_heartbeat, peer.last_rx_activity);
-        append_row(peer.hostname, peer.node_id, peer.state == ker::net::wki::PeerState::CONNECTED, CPUS, LOAD_PCT, LAST_UPDATE, false);
+        auto& row = peer_rows.at(peer_count++);
+        row.hostname = peer.hostname;
+        row.node_id = peer.node_id;
+        row.state = peer.state;
+        row.last_heartbeat = peer.last_heartbeat;
+        row.last_rx_activity = peer.last_rx_activity;
     }
     ker::net::wki::g_wki.peer_lock.unlock_irqrestore(FLAGS);
+
+    for (size_t i = 0; i < peer_count; ++i) {
+        const auto& row = peer_rows.at(i);
+        ker::net::wki::RemoteNodeLoad load = {};
+        bool const HAS_LOAD = ker::net::wki::wki_remote_node_load_snapshot(row.node_id, &load);
+        uint64_t const CPUS = HAS_LOAD && load.num_cpus != 0 ? load.num_cpus : 0;
+        uint64_t const LOAD_PCT = HAS_LOAD ? load.avg_load_pct : 0;
+        uint64_t const LAST_UPDATE = HAS_LOAD ? load.last_update_us : std::max(row.last_heartbeat, row.last_rx_activity);
+        append_row(row.hostname, row.node_id, row.state == ker::net::wki::PeerState::CONNECTED, CPUS, LOAD_PCT, LAST_UPDATE, false);
+    }
 
     buf[off] = '\0';
     return off;

@@ -225,8 +225,9 @@ void wki_task_cancel(uint32_t task_id, int signum);
 // Called periodically from wki_peer_timer_tick().
 void wki_load_report_send();
 
-// Query cached remote load for a specific node.
-auto wki_remote_node_load(uint16_t node_id) -> const RemoteNodeLoad*;
+// Query cached remote load for a specific node. Copies the row under the
+// remote-compute lock so callers never retain a pointer into the load deque.
+auto wki_remote_node_load_snapshot(uint16_t node_id, RemoteNodeLoad* out) -> bool;
 
 // Find the least-loaded remote node (or WKI_NODE_INVALID if none better).
 // local_load: the caller's local load (0-1000) for comparison.
@@ -277,6 +278,7 @@ auto wki_remote_compute_selftest_cleanup_marks_unready_proxy_failure() -> bool;
 auto wki_remote_compute_selftest_proxy_wait_completion_respects_publish_fence() -> bool;
 auto wki_remote_compute_selftest_task_wait_consumes_completed_row() -> bool;
 auto wki_remote_compute_selftest_task_wait_timeout_preserves_successor() -> bool;
+auto wki_remote_compute_selftest_load_snapshot_survives_cleanup() -> bool;
 #endif
 
 // -----------------------------------------------------------------------------
