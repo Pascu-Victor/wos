@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 TESTPROG_MAIN_CPP = ROOT / "modules" / "testprog" / "src" / "main.cpp"
 NETBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "netbench.cpp"
+PERFBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "perfbench.cpp"
 COWBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "cowbench.cpp"
 USERLAND_SUITE = ROOT / "configs" / "drive" / "srv" / "wos_userland_suite.sh"
 
@@ -263,6 +264,40 @@ def test_userland_suite_cases_are_watchdog_bounded() -> None:
     require_order(run_case, "elif [ \"$timed_out\" -eq 1 ]", "record_summary \"$name\" \"FAIL\"", "suite timeout accounting order")
 
 
+def test_perfbench_context_switch_counter_is_atomic() -> None:
+    source = PERFBENCH_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "std::atomic<int>* counter",
+            "std::atomic<int> counter{0}",
+            "counter.store(0, std::memory_order_release)",
+        ],
+        "perfbench context switch counter storage",
+    )
+
+    pingpong_body = function_body(source, "pingpong_thread")
+    require_tokens(
+        pingpong_body,
+        [
+            "a->counter->load(std::memory_order_acquire) < a->target",
+            "auto const OBSERVED = a->counter->load(std::memory_order_relaxed)",
+            "a->counter->store(OBSERVED + 1, std::memory_order_release)",
+        ],
+        "perfbench context switch counter synchronization",
+    )
+
+    forbidden = [
+        "volatile int* counter",
+        "volatile int counter = 0",
+        "while (*a->counter < a->target)",
+        "*a->counter = *a->counter + 1",
+    ]
+    present = [snippet for snippet in forbidden if snippet in source]
+    if present:
+        fail(f"perfbench context switch counter still uses racy volatile state: {present[0]}")
+
+
 def test_cowbench_child_wait_is_deadline_bounded() -> None:
     source = COWBENCH_CPP.read_text()
     require_tokens(
@@ -321,6 +356,7 @@ def main() -> None:
     test_netbench_io_is_deadline_bounded()
     test_userland_suite_passes_netbench_timeout()
     test_userland_suite_cases_are_watchdog_bounded()
+    test_perfbench_context_switch_counter_is_atomic()
     test_cowbench_child_wait_is_deadline_bounded()
     print("testprog ping, netbench socket waits, userland suite cases, and cowbench child waits are deadline bounded")
 

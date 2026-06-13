@@ -280,7 +280,7 @@ auto test_spawn_and_placement(int n, bool verbose) -> bool {
 
 struct PingPongArg {
     mtx_t* mtx;
-    volatile int* counter;
+    std::atomic<int>* counter;
     int target;
     int role;  // 0 or 1 - only used for identification
 };
@@ -289,10 +289,11 @@ auto pingpong_thread(void* param) -> int {
     auto* a = static_cast<PingPongArg*>(param);
     // Each thread grabs the mutex, bumps the counter, releases.
     // Stop when counter reaches target.
-    while (*a->counter < a->target) {
+    while (a->counter->load(std::memory_order_acquire) < a->target) {
         mtx_lock(a->mtx);
-        if (*a->counter < a->target) {
-            *a->counter = *a->counter + 1;
+        auto const OBSERVED = a->counter->load(std::memory_order_relaxed);
+        if (OBSERVED < a->target) {
+            a->counter->store(OBSERVED + 1, std::memory_order_release);
         }
         mtx_unlock(a->mtx);
     }
@@ -303,7 +304,7 @@ void test_context_switch() {
     constexpr int ITERS = 2000;
 
     mtx_t mtx;
-    volatile int counter = 0;
+    std::atomic<int> counter{0};
     mtx_init(&mtx, MTX_PLAIN);
 
     PingPongArg a0{.mtx = &mtx, .counter = &counter, .target = ITERS * 2, .role = 0};
@@ -311,7 +312,7 @@ void test_context_switch() {
 
     double best_us = 1e18;
     for (int repeat = 0; repeat < 3; ++repeat) {
-        counter = 0;
+        counter.store(0, std::memory_order_release);
         thrd_t t0 = nullptr;
         thrd_t t1 = nullptr;
         uint64_t const T_START = now_ns();
