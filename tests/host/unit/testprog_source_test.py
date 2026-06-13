@@ -342,11 +342,26 @@ def test_perfbench_context_switch_counter_is_atomic() -> None:
 
 def test_perfbench_parallel_workers_cleanup_before_failure_return() -> None:
     source = PERFBENCH_CPP.read_text()
+    worker_body = function_body(source, "par_eff_thread")
     release_body = function_body(source, "release_parallel_workers")
     join_body = function_body(source, "join_parallel_workers")
     cleanup_body = function_body(source, "cleanup_parallel_workers")
     parallel_body = function_body(source, "test_parallel_efficiency")
 
+    forbidden = ["#include <sys/futex.h>", "ker::futex::", "futex_wait(", "futex_wake("]
+    present = [snippet for snippet in forbidden if snippet in source]
+    if present:
+        fail(f"perfbench parallel_eff must not depend on direct userspace futex calls: {present[0]}")
+
+    require_tokens(
+        worker_body,
+        [
+            "while (a->go->load(std::memory_order_acquire) == 0)",
+            "timespec const REQ{.tv_sec = 0, .tv_nsec = COUNTER_WAIT_SLEEP_NS}",
+            "nanosleep(&REQ, nullptr)",
+        ],
+        "perfbench parallel worker libc-neutral start wait",
+    )
     require_tokens(
         release_body,
         ["go.store(1, std::memory_order_release)"],

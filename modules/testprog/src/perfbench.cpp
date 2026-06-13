@@ -1,6 +1,5 @@
 #include "perfbench.hpp"
 
-#include <sys/futex.h>
 #include <sys/multiproc.h>
 #include <sys/process.h>
 #include <time.h>
@@ -116,14 +115,6 @@ auto spawn_thread(void* param) -> int {
 
 constexpr uint64_t COUNTER_WAIT_TIMEOUT_NS = 5000000000ULL;
 constexpr long COUNTER_WAIT_SLEEP_NS = 100'000;
-
-auto atomic_int_addr(std::atomic<int>& value) -> int* { return reinterpret_cast<int*>(&value); }
-
-auto atomic_int_addr(std::atomic<int>* value) -> int* { return reinterpret_cast<int*>(value); }
-
-void futex_wait(std::atomic<int>* value, int expected) { static_cast<void>(ker::futex::wait(atomic_int_addr(value), expected, nullptr)); }
-
-void futex_wake(std::atomic<int>& value) { static_cast<void>(ker::futex::wake_all(atomic_int_addr(value))); }
 
 auto wait_for_counter(std::atomic<int>& counter, int expected, uint64_t timeout_ns) -> bool {
     uint64_t const START_NS = now_ns();
@@ -377,7 +368,8 @@ auto par_eff_thread(void* param) -> int {
     a->tid = static_cast<int>(ker::multiproc::currentThreadId());
     a->ready_count->fetch_add(1, std::memory_order_release);
     while (a->go->load(std::memory_order_acquire) == 0) {
-        futex_wait(a->go, 0);
+        timespec const REQ{.tv_sec = 0, .tv_nsec = COUNTER_WAIT_SLEEP_NS};
+        nanosleep(&REQ, nullptr);
     }
     a->cpu_id = static_cast<int>(ker::multiproc::getcurrent_cpu());
     a->cpu_end_id = a->cpu_id;
@@ -404,10 +396,7 @@ auto par_eff_thread(void* param) -> int {
     return 0;
 }
 
-void release_parallel_workers(std::atomic<int>& go) {
-    go.store(1, std::memory_order_release);
-    futex_wake(go);
-}
+void release_parallel_workers(std::atomic<int>& go) { go.store(1, std::memory_order_release); }
 
 void join_parallel_workers(std::vector<thrd_t>& threads) {
     for (auto*& thread : threads) {
