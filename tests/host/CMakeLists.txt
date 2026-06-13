@@ -175,6 +175,10 @@ wos_add_unit_test(data_struct_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/data_struct_test.cpp
 )
 
+wos_add_unit_test(hashtable_limit_test
+    SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/hashtable_limit_test.cpp
+)
+
 wos_add_unit_test(tcp_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/tcp_test.cpp
 )

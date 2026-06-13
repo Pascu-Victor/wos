@@ -27,6 +27,7 @@ def find_matching_brace(source: str, brace: int) -> int:
 def function_body(source: str, name: str) -> str:
     candidates = [
         source.find(f"auto {name}("),
+        source.find(f"uint64_t {name}("),
         source.find(f"int64_t {name}("),
         source.find(f"void {name}("),
         source.find(f"extern \"C\" void {name}("),
@@ -132,6 +133,44 @@ def require_futex_wake_counts_only_claimed_waiters(source: str) -> None:
         fail("KTEST helper must cover stale futex wake ownership")
 
 
+def require_futex_wake_honors_count_argument(source: str) -> None:
+    sys_body = function_body(source, "sys_futex")
+    if "futex_wake(reinterpret_cast<int*>(a1), static_cast<int>(a2))" not in sys_body:
+        fail("FUTEX_WAKE must pass the caller wake count into futex_wake")
+
+    limit_body = function_body(source, "futex_wake_limit_from_count")
+    for snippet in [
+        "out_limit = 0",
+        "if (count < 0)",
+        "return -EINVAL;",
+        "out_limit = static_cast<size_t>(count)",
+    ]:
+        if snippet not in limit_body:
+            fail(f"futex wake count validation is missing snippet: {snippet}")
+
+    for name, key in [("futex_wake", "PHYS_ADDR"), ("futex_wake_by_phys", "phys_addr")]:
+        signature_start = source.find(f"int64_t {name}(")
+        signature_end = source.find("{", signature_start)
+        if signature_start < 0 or signature_end < 0 or "int count" not in source[signature_start:signature_end]:
+            fail(f"{name} must accept an explicit wake count")
+
+        body = function_body(source, name)
+        for snippet in [
+            "size_t wake_limit = 0",
+            "futex_wake_limit_from_count(count, wake_limit)",
+            "COUNT_STATUS != 0 || wake_limit == 0",
+            f"remove_by_key_limit({key}, wake_limit",
+            "return claimed_waiter;",
+        ]:
+            if snippet not in body:
+                fail(f"{name} must honor bounded wake count; missing {snippet}")
+        if "remove_all_by_key" in body:
+            fail(f"{name} must not remove every waiter when a bounded wake count was requested")
+
+    if "futex_selftest_wake_count_limit" not in source:
+        fail("KTEST helper must cover futex wake count validation")
+
+
 def require_deferred_switch_futex_cleanup_outside_runqueue_lock(source: str) -> None:
     body = function_body(source, "deferred_task_switch")
     initial_lock_pos = body.find("&futex_abort_cleanup_task")
@@ -172,6 +211,7 @@ def main() -> None:
     require_futex_table_init_is_serialized(futex_source)
     require_futex_user_word_alignment_is_validated(futex_source)
     require_futex_wake_counts_only_claimed_waiters(futex_source)
+    require_futex_wake_honors_count_argument(futex_source)
     require_deferred_switch_futex_cleanup_outside_runqueue_lock(scheduler_source)
     require_timer_futex_cleanup_outside_runqueue_lock(scheduler_source)
     print("futex source lock-order invariants hold")

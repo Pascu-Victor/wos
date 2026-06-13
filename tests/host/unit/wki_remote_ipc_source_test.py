@@ -423,6 +423,19 @@ def test_peer_cleanup_drains_deferred_dev_op_work() -> None:
     )
 
 
+def test_futex_dev_op_preserves_broadcast_wake_count() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    for snippet in [
+        "OP_ID == OP_FUTEX_WAKE",
+        "op_data layout: [phys_addr:u64]",
+        "futex_wake_by_phys(phys_addr, INT32_MAX)",
+    ]:
+        if snippet not in remote_ipc:
+            fail(f"remote IPC futex wake bridge is missing broadcast-count snippet: {snippet}")
+    if "futex_wake_by_phys(phys_addr));" in remote_ipc:
+        fail("remote IPC futex wake bridge must pass an explicit wake count")
+
+
 def test_ipc_selftests_are_declared_and_registered() -> None:
     header = REMOTE_IPC_HPP.read_text()
     ktest = WKI_WAIT_KTEST.read_text()
@@ -454,6 +467,7 @@ def main() -> None:
     test_attach_fd_install_is_transactional()
     test_dev_op_response_cookies_fence_stale_waiters()
     test_peer_cleanup_drains_deferred_dev_op_work()
+    test_futex_dev_op_preserves_broadcast_wake_count()
     test_ipc_selftests_are_declared_and_registered()
     print("WKI remote IPC source invariants hold")
 

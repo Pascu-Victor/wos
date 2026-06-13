@@ -91,6 +91,15 @@ auto deadline_from_now_us(uint64_t timeout_us) -> uint64_t {
 
 auto futex_addr_is_aligned(const void* addr) -> bool { return (reinterpret_cast<uintptr_t>(addr) % alignof(int)) == 0; }
 
+auto futex_wake_limit_from_count(int count, size_t& out_limit) -> int64_t {
+    out_limit = 0;
+    if (count < 0) {
+        return -EINVAL;
+    }
+    out_limit = static_cast<size_t>(count);
+    return 0;
+}
+
 auto claim_task_waiter(mod::sched::task::Task* task, FutexWaiter* waiter) -> bool {
     if (task == nullptr || waiter == nullptr) {
         return false;
@@ -114,7 +123,7 @@ uint64_t sys_futex(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3) {
             return static_cast<uint64_t>(futex_wait(reinterpret_cast<int*>(a1), static_cast<int>(a2), reinterpret_cast<const void*>(a3)));
 
         case abi::futex::futex_ops::FUTEX_WAKE:
-            return static_cast<uint64_t>(futex_wake(reinterpret_cast<int*>(a1)));
+            return static_cast<uint64_t>(futex_wake(reinterpret_cast<int*>(a1), static_cast<int>(a2)));
 
         default:
             return static_cast<uint64_t>(-ENOSYS);
@@ -204,10 +213,17 @@ int64_t futex_wait(const int* addr, int expected, const void* timeout) {
 // futex_wake - Wake one or more waiters
 // ============================================================================
 
-int64_t futex_wake(int* addr) {  // NOLINT
+int64_t futex_wake(int* addr, int count) {  // NOLINT
+    size_t wake_limit = 0;
+    int64_t const COUNT_STATUS = futex_wake_limit_from_count(count, wake_limit);
+    if (COUNT_STATUS != 0 || wake_limit == 0) {
+        return COUNT_STATUS;
+    }
+
     if (!futex_addr_is_aligned(addr)) {
         return -EINVAL;
     }
+
     if (!ensure_futex_table()) {
         return -ENOMEM;
     }
@@ -225,15 +241,16 @@ int64_t futex_wake(int* addr) {  // NOLINT
 
     int woken_count = 0;
 
-    // Remove all waiters on this address and wake them
-    futex_table.remove_all_by_key(PHYS_ADDR, [&](FutexWaiter* waiter) {
+    futex_table.remove_by_key_limit(PHYS_ADDR, wake_limit, [&](FutexWaiter* waiter) -> bool {
         bool own_waiter = true;
+        bool claimed_waiter = false;
         auto* waiter_task = mod::sched::find_task_by_pid_safe(waiter->task_pid);
         if (waiter_task != nullptr) {
             if (!claim_task_waiter(waiter_task, waiter)) {
                 own_waiter = false;
             } else {
                 mod::sched::wake_task_from_event_on_cpu(waiter_task, waiter->task_cpu, mod::sched::EventWakeDeferredSwitch::CANCEL);
+                claimed_waiter = true;
                 woken_count++;
             }
             waiter_task->release();
@@ -241,6 +258,7 @@ int64_t futex_wake(int* addr) {  // NOLINT
         if (waiter_task == nullptr || own_waiter) {
             delete waiter;
         }
+        return claimed_waiter;
     });
 
     return woken_count;
@@ -260,23 +278,32 @@ void futex_wait_cleanup_for_task(mod::sched::task::Task* task) {
     delete waiter;
 }
 
-int64_t futex_wake_by_phys(uint64_t phys_addr) {
+int64_t futex_wake_by_phys(uint64_t phys_addr, int count) {
+    size_t wake_limit = 0;
+    int64_t const COUNT_STATUS = futex_wake_limit_from_count(count, wake_limit);
+    if (COUNT_STATUS != 0 || wake_limit == 0) {
+        return COUNT_STATUS;
+    }
+
     if (phys_addr == 0) {
         return -EINVAL;
     }
+
     if (!ensure_futex_table()) {
         return -ENOMEM;
     }
 
     int woken_count = 0;
-    futex_table.remove_all_by_key(phys_addr, [&](FutexWaiter* waiter) {
+    futex_table.remove_by_key_limit(phys_addr, wake_limit, [&](FutexWaiter* waiter) -> bool {
         bool own_waiter = true;
+        bool claimed_waiter = false;
         auto* waiter_task = mod::sched::find_task_by_pid_safe(waiter->task_pid);
         if (waiter_task != nullptr) {
             if (!claim_task_waiter(waiter_task, waiter)) {
                 own_waiter = false;
             } else {
                 mod::sched::wake_task_from_event_on_cpu(waiter_task, waiter->task_cpu, mod::sched::EventWakeDeferredSwitch::CANCEL);
+                claimed_waiter = true;
                 woken_count++;
             }
             waiter_task->release();
@@ -284,6 +311,7 @@ int64_t futex_wake_by_phys(uint64_t phys_addr) {
         if (waiter_task == nullptr || own_waiter) {
             delete waiter;
         }
+        return claimed_waiter;
     });
     return woken_count;
 }
@@ -318,6 +346,20 @@ auto futex_selftest_stale_wake_does_not_claim_waiter() -> bool {
     }
 
     return task.futex_waiter.load(std::memory_order_acquire) == &stale;
+}
+
+auto futex_selftest_wake_count_limit() -> bool {
+    size_t limit = 99;
+    if (futex_wake_limit_from_count(-1, limit) != -EINVAL || limit != 0) {
+        return false;
+    }
+    if (futex_wake_limit_from_count(0, limit) != 0 || limit != 0) {
+        return false;
+    }
+    if (futex_wake_limit_from_count(3, limit) != 0 || limit != 3) {
+        return false;
+    }
+    return true;
 }
 #endif
 

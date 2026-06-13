@@ -5057,7 +5057,7 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
         if (OP_DATA_LEN >= sizeof(uint64_t)) {
             uint64_t phys_addr = 0;
             std::memcpy(&phys_addr, op_data, sizeof(uint64_t));
-            wake_resp.status = static_cast<int16_t>(ker::syscall::futex::futex_wake_by_phys(phys_addr));
+            wake_resp.status = static_cast<int16_t>(ker::syscall::futex::futex_wake_by_phys(phys_addr, INT32_MAX));
         }
 
         std::memcpy(wake_resp_buf.data(), &wake_resp, sizeof(wake_resp));

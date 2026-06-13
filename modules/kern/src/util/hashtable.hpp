@@ -244,6 +244,42 @@ class IntrHashTable {
         return removed;
     }
 
+    // Remove elements matching key until the callback accepts max_count of them.
+    // Returns the accepted count; stale/unaccepted removals do not consume the limit.
+    template <typename Key, typename Fn>
+    size_t remove_by_key_limit(const Key& key, size_t max_count, Fn fn) {
+        if (!m_buckets || max_count == 0) {
+            return 0;
+        }
+
+        size_t const IDX = m_hash(key) & m_mask;
+        auto& bucket = m_buckets[IDX];
+        size_t accepted = 0;
+        size_t removed = 0;
+
+        auto saved = bucket.lock.lock_irqsave();
+        T** pp = &bucket.head;
+        while (*pp && accepted < max_count) {
+            if (m_key_equal(m_key_extract(**pp), key)) {
+                T* found = *pp;
+                *pp = found->hash_next;
+                found->hash_next = nullptr;
+                bucket.count--;
+                removed++;
+                if (fn(found)) {
+                    accepted++;
+                }
+            } else {
+                pp = &((*pp)->hash_next);
+            }
+        }
+        bucket.lock.unlock_irqrestore(saved);
+        if (removed > 0) {
+            m_size.fetch_sub(removed, std::memory_order_relaxed);
+        }
+        return accepted;
+    }
+
     // Iterate all elements. Callback: void(T*). Acquires each bucket lock in turn.
     // NOT safe to insert/remove during iteration.
     template <typename Fn>

@@ -130,6 +130,7 @@ UNIT_TESTS=(
     wki_wire_test
     wki_routing_test
     data_struct_test
+    hashtable_limit_test
     tcp_test
     xfs_format_test
     wki_channel_test

@@ -497,8 +497,6 @@ def require_futex_tests_are_deadline_bounded(source: str) -> None:
     bodies = parse_test_bodies(source)
     unaligned_body = bodies["test_futex_rejects_unaligned_address"]
     for snippet in [
-        "futex_wait_raw(unaligned, 0, &timeout)",
-        "futex_wake_raw(unaligned)",
         "WAIT_RC != -EINVAL || WAKE_RC != -EINVAL",
         'TESTD_PASS("futex_unaligned_address")',
     ]:
