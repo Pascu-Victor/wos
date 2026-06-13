@@ -60,6 +60,31 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         (void)ws;
     }
 
+    // --- Deadline arithmetic: saturating millisecond addition ---
+    if (size >= 16) {
+        uint64_t now_ms, delay_ms;
+        memcpy(&now_ms, data, 8);
+        memcpy(&delay_ms, data + 8, 8);
+
+        uint64_t const SUM = tcp_saturating_add_ms(now_ms, delay_ms);
+        uint64_t const DEADLINE = tcp_deadline_after_ms(now_ms, delay_ms);
+        if (SUM != DEADLINE) {
+            __builtin_trap();
+        }
+
+        if (UINT64_MAX - now_ms < delay_ms) {
+            if (SUM != UINT64_MAX) {
+                __builtin_trap();
+            }
+        } else if (SUM != now_ms + delay_ms || SUM < now_ms) {
+            __builtin_trap();
+        }
+
+        if (tcp_deadline_after_ms(now_ms, 0) != now_ms) {
+            __builtin_trap();
+        }
+    }
+
     // --- Sequence arithmetic stress: triangle of 3 fuzzed values ---
     if (size >= 12) {
         uint32_t a, b, c;
