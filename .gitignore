@@ -42,3 +42,6 @@ test-results/
 
 WKI-REF
 build_tests
+
+#not build scripts directory!
+!scripts/build
