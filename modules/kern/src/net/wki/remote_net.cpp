@@ -36,6 +36,7 @@ uint8_t g_net_attach_next_cookie = 1;                      // NOLINT(cppcoreguid
 uint64_t g_last_net_stats_poll_us = 0;                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 constexpr uint64_t NET_PROXY_CONTENTION_SLEEP_US = 1000;
+constexpr uint64_t NET_PROXY_SLOT_WAIT_TIMEOUT_US = WKI_OP_TIMEOUT_US;
 constexpr uint16_t NET_OP_COOKIE_BYTES = sizeof(uint16_t);
 
 // s_net_proxy_lock must be held by caller
@@ -99,6 +100,31 @@ void clear_net_op_state_locked(ProxyNetState* state, int status) {
 auto net_stats_poll_expired_locked(ProxyNetState const* state, uint64_t now_us) -> bool {
     return net_proxy_op_slot_busy(state) && net_stats_poll_owns_slot(state) &&
            (state->op_deadline_us == 0 || now_us >= state->op_deadline_us);
+}
+
+auto acquire_net_op_slot_locked(ProxyNetState* state, uint64_t start_us) -> int {
+    uint64_t const DEADLINE_US = wki_future_deadline_us(start_us, NET_PROXY_SLOT_WAIT_TIMEOUT_US);
+    while (true) {
+        state->lock.lock();
+        if (state->retiring.load(std::memory_order_acquire)) {
+            state->lock.unlock();
+            return WKI_ERR_PEER_FENCED;
+        }
+        if (net_proxy_op_slot_busy(state) && net_stats_poll_owns_slot(state)) {
+            clear_net_op_state_locked(state, WKI_ERR_TIMEOUT);
+        }
+        if (!net_proxy_op_slot_busy(state)) {
+            return WKI_OK;
+        }
+        state->lock.unlock();
+        if (!net_proxy_op_slot_busy(state)) {
+            continue;
+        }
+        if (wki_now_us() >= DEADLINE_US) {
+            return WKI_ERR_TIMEOUT;
+        }
+        ker::mod::sched::kern_sleep_us(NET_PROXY_CONTENTION_SLEEP_US);
+    }
 }
 
 auto net_req_cookie_from_header(const WkiHeader* hdr) -> uint16_t {
@@ -280,23 +306,9 @@ void finish_or_wait_for_cancelled_waiter(WkiWaitEntry& wait, bool claimed, int r
 
 auto prepare_net_op_wait(ProxyNetState* state, uint16_t op_id, WkiWaitEntry& wait, void* resp_buf, uint16_t resp_max, uint64_t timeout_us,
                          uint16_t* cookie_out) -> int {
-    while (true) {
-        state->lock.lock();
-        if (state->retiring.load(std::memory_order_acquire)) {
-            state->lock.unlock();
-            return WKI_ERR_PEER_FENCED;
-        }
-        if (net_proxy_op_slot_busy(state) && net_stats_poll_owns_slot(state)) {
-            clear_net_op_state_locked(state, WKI_ERR_TIMEOUT);
-        }
-        if (!net_proxy_op_slot_busy(state)) {
-            break;
-        }
-        state->lock.unlock();
-        if (!net_proxy_op_slot_busy(state)) {
-            continue;
-        }
-        ker::mod::sched::kern_sleep_us(NET_PROXY_CONTENTION_SLEEP_US);
+    int const SLOT_RET = acquire_net_op_slot_locked(state, wki_now_us());
+    if (SLOT_RET != WKI_OK) {
+        return SLOT_RET;
     }
 
     uint16_t const COOKIE = allocate_net_op_cookie_locked(state);
