@@ -213,6 +213,15 @@ inline auto tcp_seq_between(uint32_t seq, uint32_t low, uint32_t high) -> bool {
     return !tcp_seq_before(seq, low) && tcp_seq_before(seq, high);
 }
 
+constexpr auto tcp_saturating_add_ms(uint64_t lhs_ms, uint64_t rhs_ms) -> uint64_t {
+    if (UINT64_MAX - lhs_ms < rhs_ms) {
+        return UINT64_MAX;
+    }
+    return lhs_ms + rhs_ms;
+}
+
+constexpr auto tcp_deadline_after_ms(uint64_t now_ms, uint64_t delay_ms) -> uint64_t { return tcp_saturating_add_ms(now_ms, delay_ms); }
+
 inline auto tcp_receive_window_space(const TcpCB* cb, const Socket* sock) -> uint32_t {
     if (sock == nullptr) {
         return 0;

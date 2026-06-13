@@ -117,10 +117,10 @@ void tcp_timer_arm(TcpCB* cb) {
         deadline = std::min(deadline, cb->time_wait_deadline);
     }
     if (cb->state == TcpState::FIN_WAIT_2 && cb->socket == nullptr) {
-        deadline = std::min(deadline, cb->time_wait_deadline != 0 ? cb->time_wait_deadline : tcp_now_ms() + 60000);
+        deadline = std::min(deadline, cb->time_wait_deadline != 0 ? cb->time_wait_deadline : tcp_deadline_after_ms(tcp_now_ms(), 60000));
     }
     if (cb->ack_pending) {
-        deadline = std::min(deadline, tcp_now_ms() + 10);
+        deadline = std::min(deadline, tcp_deadline_after_ms(tcp_now_ms(), 10));
     }
     if (cb->delayed_ack_deadline != 0) {
         deadline = std::min(deadline, cb->delayed_ack_deadline);
@@ -225,7 +225,7 @@ void tcp_timer_tick(uint64_t now_ms) {
             should_remove = true;
         } else if (cb->state == TcpState::FIN_WAIT_2 && cb->socket == nullptr) {
             if (cb->time_wait_deadline == 0) {
-                cb->time_wait_deadline = now_ms + 60000;
+                cb->time_wait_deadline = tcp_deadline_after_ms(now_ms, 60000);
             }
             deadline = cb->time_wait_deadline;
             if (now_ms >= deadline) {
@@ -265,7 +265,7 @@ void tcp_timer_tick(uint64_t now_ms) {
             next_earliest = std::min(next_earliest, cb->retransmit_deadline);
         }
         if (cb->ack_pending) {
-            next_earliest = std::min(next_earliest, now_ms + 10);
+            next_earliest = std::min(next_earliest, tcp_deadline_after_ms(now_ms, 10));
         }
         if (cb->delayed_ack_deadline != 0) {
             next_earliest = std::min(next_earliest, cb->delayed_ack_deadline);
@@ -392,7 +392,7 @@ void tcp_timer_tick(uint64_t now_ms) {
                     };
                 }
                 rcb->keepalive_count++;
-                rcb->keepalive_deadline = now_ms + rcb->keepalive_intvl_ms;
+                rcb->keepalive_deadline = tcp_deadline_after_ms(now_ms, rcb->keepalive_intvl_ms);
             }
         }
 
@@ -428,7 +428,7 @@ void tcp_timer_tick(uint64_t now_ms) {
 
                     rcb->rto_ms = rcb->rto_ms * 2;
                     rcb->rto_ms = std::min<uint64_t>(rcb->rto_ms, 60000);
-                    rcb->retransmit_deadline = now_ms + rcb->rto_ms;
+                    rcb->retransmit_deadline = tcp_deadline_after_ms(now_ms, rcb->rto_ms);
                 }
             }
         }

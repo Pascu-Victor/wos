@@ -122,6 +122,17 @@ TEST(TcpSeq, BetweenWraparound) {
     EXPECT_FALSE(tcp_seq_between(0xFFFFFFE0, low, high));  // before window
 }
 
+TEST(TcpDeadline, SaturatesOnOverflow) {
+    EXPECT_EQ(tcp_saturating_add_ms(UINT64_MAX - 1, 2), UINT64_MAX);
+    EXPECT_EQ(tcp_deadline_after_ms(UINT64_MAX - 7, 8), UINT64_MAX);
+}
+
+TEST(TcpDeadline, PreservesNormalDeadlines) {
+    EXPECT_EQ(tcp_saturating_add_ms(100, 25), 125u);
+    EXPECT_EQ(tcp_deadline_after_ms(250, 0), 250u);
+    EXPECT_EQ(tcp_deadline_after_ms(250, 75), 325u);
+}
+
 // =============================================================================
 // Window Scaling
 // =============================================================================

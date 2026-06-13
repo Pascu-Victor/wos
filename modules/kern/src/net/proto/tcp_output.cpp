@@ -134,7 +134,7 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
         if (cb->retransmit_head == nullptr) {
             cb->retransmit_head = rtx_entry;
             cb->retransmit_tail = rtx_entry;
-            cb->retransmit_deadline = tcp_now_ms() + cb->rto_ms;
+            cb->retransmit_deadline = tcp_deadline_after_ms(tcp_now_ms(), cb->rto_ms);
             tcp_timer_arm(cb);
         } else {
             cb->retransmit_tail->next = rtx_entry;

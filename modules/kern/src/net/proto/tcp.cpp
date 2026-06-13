@@ -598,7 +598,7 @@ int tcp_setsockopt_op(Socket* sock, int /*unused*/, int optname, const void* opt
             cb->keepalive_enabled = optint != 0;
             if (cb->keepalive_enabled && cb->state == TcpState::ESTABLISHED) {
                 cb->keepalive_count = 0;
-                cb->keepalive_deadline = tcp_now_ms() + cb->keepalive_idle_ms;
+                cb->keepalive_deadline = tcp_deadline_after_ms(tcp_now_ms(), cb->keepalive_idle_ms);
                 tcp_timer_arm(cb);
             } else {
                 cb->keepalive_deadline = 0;

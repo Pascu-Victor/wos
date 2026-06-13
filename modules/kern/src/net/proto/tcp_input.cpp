@@ -438,7 +438,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
             }
 
             if (cb->retransmit_head != nullptr) {
-                cb->retransmit_deadline = NOW + cb->rto_ms;
+                cb->retransmit_deadline = tcp_deadline_after_ms(NOW, cb->rto_ms);
             }
 
             cb->ack_pending = false;
@@ -609,7 +609,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
             // Any valid segment resets the keepalive idle timer.
             if (cb->keepalive_enabled) {
                 cb->keepalive_count = 0;
-                cb->keepalive_deadline = tcp_now_ms() + cb->keepalive_idle_ms;
+                cb->keepalive_deadline = tcp_deadline_after_ms(tcp_now_ms(), cb->keepalive_idle_ms);
                 tcp_timer_arm(cb);
             }
 
@@ -646,7 +646,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                         tcp_timer_arm(cb);
                     }
                 } else if (cb->delayed_ack_deadline == 0) {
-                    cb->delayed_ack_deadline = tcp_now_ms() + 40;
+                    cb->delayed_ack_deadline = tcp_deadline_after_ms(tcp_now_ms(), 40);
                     tcp_timer_arm(cb);
                 }
             } else if (payload_len > 0) {
@@ -729,7 +729,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     }
 
                     if (cb->retransmit_head != nullptr) {
-                        cb->retransmit_deadline = tcp_now_ms() + cb->rto_ms;
+                        cb->retransmit_deadline = tcp_deadline_after_ms(tcp_now_ms(), cb->rto_ms);
                     }
 
                     // Full ACK includes our FIN.
@@ -739,7 +739,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                             build_deferred_ack();
                             drain_retransmit_queue(cb);
                             cb->state = TcpState::TIME_WAIT;
-                            cb->time_wait_deadline = tcp_now_ms() + 10000;
+                            cb->time_wait_deadline = tcp_deadline_after_ms(tcp_now_ms(), 10000);
                             tcp_timer_arm(cb);
                             deferred_wake = true;
                         } else {
@@ -804,7 +804,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 build_deferred_ack();
                 drain_retransmit_queue(cb);
                 cb->state = TcpState::TIME_WAIT;
-                cb->time_wait_deadline = tcp_now_ms() + 10000;
+                cb->time_wait_deadline = tcp_deadline_after_ms(tcp_now_ms(), 10000);
                 tcp_timer_arm(cb);
                 deferred_wake = true;
             }
@@ -815,7 +815,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
             if ((flags & TCP_ACK) != 0 && seg_ack == cb->snd_nxt) {
                 drain_retransmit_queue(cb);
                 cb->state = TcpState::TIME_WAIT;
-                cb->time_wait_deadline = tcp_now_ms() + 10000;
+                cb->time_wait_deadline = tcp_deadline_after_ms(tcp_now_ms(), 10000);
                 tcp_timer_arm(cb);
                 deferred_wake = true;
             }
