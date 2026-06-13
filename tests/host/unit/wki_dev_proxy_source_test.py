@@ -179,6 +179,37 @@ def test_rdmaring_wait_deadlines_are_saturating() -> None:
             fail(f"wki_dev_proxy_attach_block is missing saturating deadline: {token}")
 
 
+def test_rdmaring_sq_space_waits_are_bounded() -> None:
+    source = DEV_PROXY_CPP.read_text()
+    helper_body = function_body(source, "wait_for_rdma_sq_space")
+    require_tokens(
+        helper_body,
+        [
+            "while (blk_sq_full(ring_hdr))",
+            "if (!proxy_block_active(state) || proxy_block_fenced(state))",
+            "if (wki_now_us() >= deadline_us)",
+            "rdma_drain_cq(state)",
+            "wki_spin_yield_channel(ch)",
+            "return true",
+        ],
+        "bounded RDMA SQ-space wait helper",
+    )
+    if source.count("while (blk_sq_full(ring_hdr))") != 1:
+        fail("dev proxy RDMA SQ-space waits must go through wait_for_rdma_sq_space")
+
+    for function in [
+        "remote_block_read_rdma",
+        "remote_block_write_rdma",
+        "remote_block_flush_rdma",
+        "rdma_batch_submit",
+        "remote_block_bulk_read_rdma",
+        "remote_block_bulk_write_rdma",
+    ]:
+        body = function_body(source, function)
+        if "wait_for_rdma_sq_space(state, ring_hdr, ch, DEADLINE)" not in body:
+            fail(f"{function} must bound SQ-full waits with wait_for_rdma_sq_space")
+
+
 def test_fence_wait_uses_ordered_lifecycle_helpers() -> None:
     body = function_body(DEV_PROXY_CPP.read_text(), "wait_for_fence_lift")
     required = [
@@ -210,9 +241,11 @@ def test_dev_proxy_selftest_declared() -> None:
     required = [
         "KTEST(WkiDevProxyFenceFlags, LifecycleFlagsAreAtomic)",
         "KTEST(WkiDevProxyAttachAck, CookieFencesStaleBlockCompletion)",
+        "KTEST(WkiDevProxyRdmaSqWait, StopsOnFenceOrInactive)",
         "std::is_same_v<decltype(std::declval<State&>().active), std::atomic<bool>>",
         "std::is_same_v<decltype(std::declval<State&>().fenced), std::atomic<bool>>",
         "wki_dev_proxy_selftest_attach_ack_cookie_fences_stale_completion()",
+        "wki_dev_proxy_selftest_rdma_sq_wait_stops_on_fence()",
     ]
     missing = [token for token in required if token not in ktest]
     if missing:
@@ -227,6 +260,7 @@ def test_attach_ack_requires_expected_cookie_before_completion() -> None:
         [
             "uint8_t attach_expected_cookie = 0;",
             "auto wki_dev_proxy_selftest_attach_ack_cookie_fences_stale_completion() -> bool;",
+            "auto wki_dev_proxy_selftest_rdma_sq_wait_stops_on_fence() -> bool;",
         ],
         "dev proxy attach-cookie state",
     )
@@ -292,6 +326,7 @@ def main() -> None:
     test_lifecycle_flags_are_only_accessed_through_helpers()
     test_proxy_op_slot_wait_is_bounded()
     test_rdmaring_wait_deadlines_are_saturating()
+    test_rdmaring_sq_space_waits_are_bounded()
     test_fence_wait_uses_ordered_lifecycle_helpers()
     test_timeout_marks_inactive_with_release_store()
     test_dev_proxy_selftest_declared()

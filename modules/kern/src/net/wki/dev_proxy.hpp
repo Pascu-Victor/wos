@@ -158,6 +158,7 @@ auto wki_dev_proxy_bulk_read(dev::BlockDevice* bdev, uint64_t lba, uint32_t bloc
 auto wki_dev_proxy_bulk_write(dev::BlockDevice* bdev, uint64_t lba, uint32_t block_count, const void* buffer) -> int;
 
 auto wki_dev_proxy_selftest_attach_ack_cookie_fences_stale_completion() -> bool;
+auto wki_dev_proxy_selftest_rdma_sq_wait_stops_on_fence() -> bool;
 
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers (called from wki.cpp dispatch)

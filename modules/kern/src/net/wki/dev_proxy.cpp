@@ -453,6 +453,21 @@ void rdma_drain_cq(ProxyBlockState* state) {
     }
 }
 
+auto wait_for_rdma_sq_space(ProxyBlockState* state, BlkRingHeader* ring_hdr, WkiChannel* ch, uint64_t deadline_us) -> bool {
+    while (blk_sq_full(ring_hdr)) {
+        if (!proxy_block_active(state) || proxy_block_fenced(state)) {
+            return false;
+        }
+        if (wki_now_us() >= deadline_us) {
+            return false;
+        }
+        asm volatile("pause" ::: "memory");
+        rdma_drain_cq(state);
+        wki_spin_yield_channel(ch);
+    }
+    return true;
+}
+
 // Drain CQ and look for a specific tag. Returns true if found and fills out_cqe.
 auto rdma_drain_cq_for_tag(ProxyBlockState* state, uint32_t tag, BlkCqEntry* out_cqe) -> bool {
     // Check per-tag completion array (O(1) lookup)
@@ -643,9 +658,11 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
     }
 
     // Wait for SQ space
-    while (blk_sq_full(ring_hdr)) {
-        asm volatile("pause" ::: "memory");
-        rdma_drain_cq(state);
+    WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
+    uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
+    if (!wait_for_rdma_sq_space(state, ring_hdr, ch, DEADLINE)) {
+        rdma_free_slot(state, static_cast<uint32_t>(slot));
+        return -1;
     }
 
     // Post SQE - request the full prefetch range
@@ -673,8 +690,6 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
     rdma_signal_server(state);
 
     // -- 3. Wait for completion ----------------------------------------------
-    WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-    uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
     BlkCqEntry cqe = {};
     bool got_cqe = false;
 
@@ -884,9 +899,11 @@ auto remote_block_write_rdma(ProxyBlockState* state, uint64_t block, uint32_t co
         roce_push_data_slot(state, static_cast<uint32_t>(slot), chunk_bytes);
 
         // Wait for SQ space
-        while (blk_sq_full(ring_hdr)) {
-            asm volatile("pause" ::: "memory");
-            rdma_drain_cq(state);
+        WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
+        uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
+        if (!wait_for_rdma_sq_space(state, ring_hdr, ch, DEADLINE)) {
+            rdma_free_slot(state, static_cast<uint32_t>(slot));
+            return -1;
         }
 
         // Post SQE
@@ -914,8 +931,6 @@ auto remote_block_write_rdma(ProxyBlockState* state, uint64_t block, uint32_t co
         rdma_signal_server(state);
 
         // Spin-wait for CQE with matching tag
-        WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-        uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
         BlkCqEntry cqe = {};
         bool got_cqe = false;
 
@@ -1012,9 +1027,10 @@ auto remote_block_flush_rdma(ProxyBlockState* state) -> int {
     auto* sq = blk_sq_entries(state->rdma_zone_ptr);
 
     // Wait for SQ space
-    while (blk_sq_full(ring_hdr)) {
-        asm volatile("pause" ::: "memory");
-        rdma_drain_cq(state);
+    WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
+    uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
+    if (!wait_for_rdma_sq_space(state, ring_hdr, ch, DEADLINE)) {
+        return -1;
     }
 
     // Post SQE - flush uses no data slot
@@ -1040,8 +1056,6 @@ auto remote_block_flush_rdma(ProxyBlockState* state) -> int {
     rdma_signal_server(state);
 
     // Spin-wait for CQE
-    WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-    uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
     BlkCqEntry cqe = {};
     bool got_cqe = false;
 
@@ -1108,6 +1122,8 @@ auto rdma_batch_submit(ProxyBlockState* state, BlkOpcode opcode, const BlockRang
 
     auto* ring_hdr = blk_ring_header(state->rdma_zone_ptr);
     auto* sq = blk_sq_entries(state->rdma_zone_ptr);
+    WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
+    uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
 
     uint32_t posted = 0;
     for (uint32_t i = 0; i < count; i++) {
@@ -1144,9 +1160,12 @@ auto rdma_batch_submit(ProxyBlockState* state, BlkOpcode opcode, const BlockRang
         }
 
         // Wait for SQ space
-        while (blk_sq_full(ring_hdr)) {
-            asm volatile("pause" ::: "memory");
-            rdma_drain_cq(state);
+        if (!wait_for_rdma_sq_space(state, ring_hdr, ch, DEADLINE)) {
+            if (slot >= 0) {
+                rdma_free_slot(state, static_cast<uint32_t>(slot));
+            }
+            rdma_free_tag(state, static_cast<uint32_t>(tag));
+            break;
         }
 
         // Post SQE
@@ -1470,9 +1489,10 @@ auto remote_block_bulk_read_rdma(ProxyBlockState* state, uint64_t lba, uint32_t 
         ra_invalidate(state);
 
         // Wait for SQ space
-        while (blk_sq_full(ring_hdr)) {
-            asm volatile("pause" ::: "memory");
-            rdma_drain_cq(state);
+        WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
+        uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), DEV_PROXY_BULK_WAIT_TIMEOUT_US);
+        if (!wait_for_rdma_sq_space(state, ring_hdr, ch, DEADLINE)) {
+            return -1;
         }
 
         // Allocate tag
@@ -1503,8 +1523,6 @@ auto remote_block_bulk_read_rdma(ProxyBlockState* state, uint64_t lba, uint32_t 
         rdma_signal_server(state);
 
         // Wait for completion - server RDMA-writes data into our staging buffer
-        WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-        uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), DEV_PROXY_BULK_WAIT_TIMEOUT_US);
         BlkCqEntry cqe = {};
         bool got_cqe = false;
 
@@ -1595,9 +1613,10 @@ auto remote_block_bulk_write_rdma(ProxyBlockState* state, uint64_t lba, uint32_t
         }
 
         // Wait for SQ space
-        while (blk_sq_full(ring_hdr)) {
-            asm volatile("pause" ::: "memory");
-            rdma_drain_cq(state);
+        WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
+        uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), DEV_PROXY_BULK_WAIT_TIMEOUT_US);
+        if (!wait_for_rdma_sq_space(state, ring_hdr, ch, DEADLINE)) {
+            return -1;
         }
 
         // Allocate tag
@@ -1627,8 +1646,6 @@ auto remote_block_bulk_write_rdma(ProxyBlockState* state, uint64_t lba, uint32_t
         rdma_signal_server(state);
 
         // Wait for completion
-        WkiChannel* ch = wki_channel_get(state->owner_node, state->assigned_channel);
-        uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), DEV_PROXY_BULK_WAIT_TIMEOUT_US);
         BlkCqEntry cqe = {};
         bool got_cqe = false;
 
@@ -2728,6 +2745,32 @@ auto wki_dev_proxy_selftest_attach_ack_cookie_fences_stale_completion() -> bool 
     state.attach_expected_cookie = 0x42;
     state.attach_pending.store(false, std::memory_order_release);
     return !block_attach_ack_matches_pending_locked(&state, ack);
+}
+
+auto wki_dev_proxy_selftest_rdma_sq_wait_stops_on_fence() -> bool {
+    ProxyBlockState state = {};
+    BlkRingHeader ring = {};
+    ring.sq_depth = 2;
+
+    ring.sq_head = 1;
+    ring.sq_tail = 0;
+    state.active.store(true, std::memory_order_release);
+    state.fenced.store(true, std::memory_order_release);
+    bool const FENCED_FULL_RING_STOPS =
+        !wait_for_rdma_sq_space(&state, &ring, nullptr, wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US));
+
+    state.fenced.store(false, std::memory_order_release);
+    state.active.store(false, std::memory_order_release);
+    bool const INACTIVE_FULL_RING_STOPS =
+        !wait_for_rdma_sq_space(&state, &ring, nullptr, wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US));
+
+    ring.sq_head = 0;
+    ring.sq_tail = 0;
+    state.active.store(true, std::memory_order_release);
+    bool const AVAILABLE_RING_PROCEEDS =
+        wait_for_rdma_sq_space(&state, &ring, nullptr, wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US));
+
+    return FENCED_FULL_RING_STOPS && INACTIVE_FULL_RING_STOPS && AVAILABLE_RING_PROCEEDS;
 }
 
 namespace detail {
