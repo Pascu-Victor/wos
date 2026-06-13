@@ -35,9 +35,8 @@
 #include <limits.h>  // NOLINT(modernize-deprecated-headers): this sysroot exposes PATH_MAX here.
 #include <netinet/in.h>
 #include <poll.h>
-#include <signal.h>  // NOLINT(modernize-deprecated-headers,misc-include-cleaner): this sysroot declares signal()/SIGUSR1 here.
+#include <signal.h>  // NOLINT(modernize-deprecated-headers,misc-include-cleaner): this sysroot declares kill()/SIGKILL here.
 #include <sys/epoll.h>
-#include <sys/futex.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/process.h>
@@ -46,6 +45,7 @@
 #include <sys/vfs.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <threads.h>
 #include <time.h>  // NOLINT(modernize-deprecated-headers): this sysroot declares nanosleep here.
 #include <unistd.h>
 
@@ -98,17 +98,6 @@ constexpr mode_t MODE_0644 = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
 constexpr mode_t MODE_0755 = S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;
 constexpr mode_t MODE_0600 = S_IRUSR | S_IWUSR;
 constexpr mode_t MODE_MASK = 0777;
-
-auto futex_wait(int* addr, int expected, const timespec* timeout) -> int64_t { return ker::futex::wait(addr, expected, timeout); }
-
-auto futex_wake(int* addr, int count) -> int64_t { return ker::futex::wake(addr, count); }
-
-volatile sig_atomic_t g_futex_signal_seen = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-
-void futex_test_signal_handler(int signum) {
-    (void)signum;
-    g_futex_signal_seen = 1;
-}
 
 // FIXME: look into the print flushing to fix this
 //  Keep testd's own progress reporting off std::println/FILE flushing; the
@@ -333,10 +322,32 @@ constexpr int64_t USEC_PER_MSEC = 1000;
 constexpr int64_t NSEC_PER_MSEC = 1000000;
 constexpr int64_t NSEC_PER_SEC = 1000 * NSEC_PER_MSEC;
 constexpr int64_t MSEC_PER_SEC = 1000;
+constexpr int THREAD_SYNC_TIMEOUT_MS = 100;
+constexpr int THREAD_SYNC_WORKERS = 4;
 constexpr uint32_t WKI_VFS_ROUTE_LOCAL = 0;
 constexpr uint32_t WKI_VFS_ROUTE_HOST = 1;
 constexpr size_t JOURNAL_SCAN_BATCH = 8;
 constexpr size_t JOURNAL_SCAN_BATCHES = 512;
+
+struct ThreadCondState {
+    mtx_t lock{};
+    cnd_t ready{};
+    cnd_t release{};
+    int waiting = 0;
+    int woken = 0;
+    bool release_all = false;
+};
+
+auto realtime_after_ms(int timeout_ms, timespec& out) -> bool {
+    if (clock_gettime(CLOCK_REALTIME, &out) != 0) {
+        return false;
+    }
+
+    int64_t nsec = static_cast<int64_t>(out.tv_nsec) + (static_cast<int64_t>(timeout_ms) * NSEC_PER_MSEC);
+    out.tv_sec += static_cast<time_t>(nsec / NSEC_PER_SEC);
+    out.tv_nsec = static_cast<long>(nsec % NSEC_PER_SEC);
+    return true;
+}
 
 // Fork a child and exec testd --rh <mode> <fd>.
 // Closes close_fd in the child (the end we don't want the child to have).
@@ -507,44 +518,6 @@ auto read_expected_bytes_timeout(int fd, char* buf, size_t expected, int timeout
 
 auto read_expected_bytes(int fd, char* buf, size_t expected) -> ssize_t {
     return read_expected_bytes_timeout(fd, buf, expected, REMOTE_IPC_TIMEOUT_MS);
-}
-
-auto write_all_timeout(int fd, const char* buf, size_t expected, int timeout_ms) -> ssize_t {
-    if (expected == 0) {
-        return 0;
-    }
-
-    int old_flags = -1;
-    if (!set_nonblocking_for_timeout(fd, old_flags)) {
-        return -1;
-    }
-
-    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
-    size_t total = 0;
-    while (total < expected) {
-        if (wait_fd_ready_until(fd, POLLOUT, DEADLINE_MS, timeout_ms) <= 0) {
-            restore_fd_flags(fd, old_flags);
-            return -1;
-        }
-
-        ssize_t const N = write(fd, buf + total, expected - total);
-        if (N < 0) {
-            if (retryable_would_block()) {
-                continue;
-            }
-            restore_fd_flags(fd, old_flags);
-            return -1;
-        }
-        if (N == 0) {
-            errno = ETIMEDOUT;
-            restore_fd_flags(fd, old_flags);
-            return -1;
-        }
-        total += static_cast<size_t>(N);
-    }
-
-    restore_fd_flags(fd, old_flags);
-    return static_cast<ssize_t>(total);
 }
 
 auto wait_remote_waiter_ready(int ready_fd) -> bool {
@@ -801,6 +774,153 @@ auto waitpid_timeout(pid_t pid, int* status, int timeout_ms) -> bool {
 
     errno = ETIMEDOUT;
     return false;
+}
+
+using ThreadChildFn = int (*)();
+
+auto run_thread_child_with_timeout(ThreadChildFn child_fn, const char* fail_name, const char* fail_reason) -> bool {
+    pid_t const PID = fork();
+    if (PID < 0) {
+        fail(fail_name, "fork failed");
+        return false;
+    }
+    if (PID == 0) {
+        _exit(child_fn());
+    }
+
+    int status = 0;
+    bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+    if (!WAIT_RET || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail(fail_name, fail_reason);
+        return false;
+    }
+    return true;
+}
+
+auto thread_condition_waiter(void* arg) -> int {
+    auto* state = static_cast<ThreadCondState*>(arg);
+    if (mtx_lock(&state->lock) != thrd_success) {
+        return 1;
+    }
+
+    state->waiting++;
+    if (cnd_signal(&state->ready) != thrd_success) {
+        static_cast<void>(mtx_unlock(&state->lock));
+        return 2;
+    }
+
+    while (!state->release_all) {
+        if (cnd_wait(&state->release, &state->lock) != thrd_success) {
+            static_cast<void>(mtx_unlock(&state->lock));
+            return 3;
+        }
+    }
+
+    state->woken++;
+    if (cnd_signal(&state->ready) != thrd_success) {
+        static_cast<void>(mtx_unlock(&state->lock));
+        return 4;
+    }
+    if (mtx_unlock(&state->lock) != thrd_success) {
+        return 5;
+    }
+    return 0;
+}
+
+auto run_threads_condition_timeout_child() -> int {
+    mtx_t lock{};
+    cnd_t cond{};
+    if (mtx_init(&lock, mtx_plain) != thrd_success) {
+        return 1;
+    }
+    if (cnd_init(&cond) != thrd_success) {
+        mtx_destroy(&lock);
+        return 2;
+    }
+    if (mtx_lock(&lock) != thrd_success) {
+        cnd_destroy(&cond);
+        mtx_destroy(&lock);
+        return 3;
+    }
+
+    timespec deadline{};
+    if (!realtime_after_ms(THREAD_SYNC_TIMEOUT_MS, deadline)) {
+        static_cast<void>(mtx_unlock(&lock));
+        cnd_destroy(&cond);
+        mtx_destroy(&lock);
+        return 4;
+    }
+
+    int const WAIT_RC = cnd_timedwait(&cond, &lock, &deadline);
+    int const UNLOCK_RC = mtx_unlock(&lock);
+    cnd_destroy(&cond);
+    mtx_destroy(&lock);
+    return (WAIT_RC == thrd_timedout && UNLOCK_RC == thrd_success) ? 0 : 5;
+}
+
+auto run_threads_condition_broadcast_child() -> int {
+    ThreadCondState state{};
+    if (mtx_init(&state.lock, mtx_plain) != thrd_success) {
+        return 1;
+    }
+    if (cnd_init(&state.ready) != thrd_success) {
+        mtx_destroy(&state.lock);
+        return 2;
+    }
+    if (cnd_init(&state.release) != thrd_success) {
+        cnd_destroy(&state.ready);
+        mtx_destroy(&state.lock);
+        return 3;
+    }
+
+    std::array<thrd_t, static_cast<size_t>(THREAD_SYNC_WORKERS)> threads{};
+    size_t created = 0;
+    for (; created < threads.size(); ++created) {
+        if (thrd_create(&threads[created], thread_condition_waiter, &state) != thrd_success) {
+            return 4;
+        }
+    }
+
+    if (mtx_lock(&state.lock) != thrd_success) {
+        return 5;
+    }
+    while (state.waiting < THREAD_SYNC_WORKERS) {
+        if (cnd_wait(&state.ready, &state.lock) != thrd_success) {
+            static_cast<void>(mtx_unlock(&state.lock));
+            return 6;
+        }
+    }
+    if (state.woken != 0) {
+        static_cast<void>(mtx_unlock(&state.lock));
+        return 7;
+    }
+
+    state.release_all = true;
+    if (cnd_broadcast(&state.release) != thrd_success) {
+        static_cast<void>(mtx_unlock(&state.lock));
+        return 8;
+    }
+    while (state.woken < THREAD_SYNC_WORKERS) {
+        if (cnd_wait(&state.ready, &state.lock) != thrd_success) {
+            static_cast<void>(mtx_unlock(&state.lock));
+            return 9;
+        }
+    }
+    if (mtx_unlock(&state.lock) != thrd_success) {
+        return 10;
+    }
+
+    for (size_t i = 0; i < created; ++i) {
+        int result = -1;
+        if (thrd_join(threads[i], &result) != thrd_success || result != 0) {
+            return 11;
+        }
+    }
+
+    cnd_destroy(&state.release);
+    cnd_destroy(&state.ready);
+    mtx_destroy(&state.lock);
+    return 0;
 }
 
 auto waitpid_any_timeout(int* status, int timeout_ms) -> pid_t {
@@ -1537,299 +1657,50 @@ TESTD_RUN(test_pipe_lost_wake_race_many) {
 }
 TESTD_RUN_END(test_pipe_lost_wake_race_many)
 
-TESTD_RUN(test_futex_rejects_unaligned_address) {
-    constexpr size_t PAGE_SIZE = 4096;
-    void* mapping = mmap(nullptr, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mapping == MAP_FAILED) {
-        fail("futex_unaligned_mmap", "mmap failed");
+TESTD_RUN(test_threads_mutex_trylock_busy) {
+    mtx_t lock{};
+    if (mtx_init(&lock, mtx_plain) != thrd_success) {
+        fail("threads_mutex_init", "mtx_init failed");
         return;
     }
-
-    auto* base = static_cast<char*>(mapping);
-    auto* unaligned = reinterpret_cast<int*>(base + 1);
-    timespec timeout{
-        .tv_sec = 0,
-        .tv_nsec = 0,
-    };
-    int64_t const WAIT_RC = futex_wait(unaligned, 0, &timeout);
-    int64_t const WAKE_RC = futex_wake(unaligned, 1);
-    munmap(mapping, PAGE_SIZE);
-
-    if (WAIT_RC != -EINVAL || WAKE_RC != -EINVAL) {
-        fail("futex_unaligned_address", "unaligned futex wait/wake did not fail with EINVAL");
+    if (mtx_lock(&lock) != thrd_success) {
+        mtx_destroy(&lock);
+        fail("threads_mutex_lock", "mtx_lock failed");
         return;
     }
-    TESTD_PASS("futex_unaligned_address");
+    if (mtx_trylock(&lock) != thrd_busy) {
+        static_cast<void>(mtx_unlock(&lock));
+        mtx_destroy(&lock);
+        fail("threads_mutex_trylock_busy", "mtx_trylock did not report a held mutex");
+        return;
+    }
+    if (mtx_unlock(&lock) != thrd_success) {
+        mtx_destroy(&lock);
+        fail("threads_mutex_unlock", "mtx_unlock failed");
+        return;
+    }
+    mtx_destroy(&lock);
+    TESTD_PASS("threads_mutex_trylock_busy");
 }
-TESTD_RUN_END(test_futex_rejects_unaligned_address)
+TESTD_RUN_END(test_threads_mutex_trylock_busy)
 
-TESTD_RUN(test_futex_wait_relative_timeout) {
-    constexpr size_t PAGE_SIZE = 4096;
-    auto* futex_word = static_cast<int*>(mmap(nullptr, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (futex_word == MAP_FAILED) {
-        fail("futex_timeout_mmap", "mmap failed");
+TESTD_RUN(test_threads_condition_timedwait_timeout) {
+    if (!run_thread_child_with_timeout(run_threads_condition_timeout_child, "threads_condition_timedwait_timeout",
+                                       "cnd_timedwait child did not return thrd_timedout")) {
         return;
     }
-    *futex_word = 17;
-
-    std::array<int, 2> ready = {-1, -1};
-    if (pipe(ready.data()) != 0) {
-        munmap(futex_word, PAGE_SIZE);
-        fail("futex_timeout_pipe", "pipe failed");
-        return;
-    }
-
-    pid_t const PID = fork();
-    if (PID < 0) {
-        close(ready[0]);
-        close(ready[1]);
-        munmap(futex_word, PAGE_SIZE);
-        fail("futex_timeout_fork", "fork failed");
-        return;
-    }
-
-    if (PID == 0) {
-        close(ready[0]);
-        constexpr char BYTE = 't';
-        if (write_all_timeout(ready[1], &BYTE, 1, REMOTE_IPC_TIMEOUT_MS) != 1) {
-            close(ready[1]);
-            _exit(2);
-        }
-        close(ready[1]);
-
-        timespec timeout{
-            .tv_sec = 0,
-            .tv_nsec = 20000000,
-        };
-        int64_t const RC = futex_wait(futex_word, 17, &timeout);
-        _exit(RC == -ETIMEDOUT ? 0 : 1);
-    }
-
-    close(ready[1]);
-    char byte = 0;
-    ssize_t const NR = read_expected_bytes_timeout(ready[0], &byte, 1, REMOTE_IPC_TIMEOUT_MS);
-    close(ready[0]);
-    if (NR != 1 || byte != 't') {
-        static_cast<void>(futex_wake(futex_word, 1));
-        int status = 0;
-        static_cast<void>(waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS));
-        munmap(futex_word, PAGE_SIZE);
-        fail("futex_timeout_ready", "child did not enter futex timeout test");
-        return;
-    }
-
-    usleep(150000);
-    static_cast<void>(futex_wake(futex_word, 1));
-
-    int status = 0;
-    bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
-    munmap(futex_word, PAGE_SIZE);
-    if (!WAIT_RET || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        fail("futex_wait_relative_timeout", "timed futex wait did not return ETIMEDOUT before guard wake");
-        return;
-    }
-    TESTD_PASS("futex_wait_relative_timeout");
+    TESTD_PASS("threads_condition_timedwait_timeout");
 }
-TESTD_RUN_END(test_futex_wait_relative_timeout)
+TESTD_RUN_END(test_threads_condition_timedwait_timeout)
 
-TESTD_RUN(test_futex_wait_wake_before_timeout) {
-    constexpr size_t PAGE_SIZE = 4096;
-    auto* futex_word = static_cast<int*>(mmap(nullptr, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (futex_word == MAP_FAILED) {
-        fail("futex_wake_timeout_mmap", "mmap failed");
+TESTD_RUN(test_threads_condition_broadcast_wakes_all) {
+    if (!run_thread_child_with_timeout(run_threads_condition_broadcast_child, "threads_condition_broadcast_wakes_all",
+                                       "cnd_broadcast did not wake every waiting thread")) {
         return;
     }
-    *futex_word = 23;
-
-    std::array<int, 2> ready = {-1, -1};
-    if (pipe(ready.data()) != 0) {
-        munmap(futex_word, PAGE_SIZE);
-        fail("futex_wake_timeout_pipe", "pipe failed");
-        return;
-    }
-
-    pid_t const PID = fork();
-    if (PID < 0) {
-        close(ready[0]);
-        close(ready[1]);
-        munmap(futex_word, PAGE_SIZE);
-        fail("futex_wake_timeout_fork", "fork failed");
-        return;
-    }
-
-    if (PID == 0) {
-        close(ready[0]);
-        constexpr char BYTE = 'w';
-        if (write_all_timeout(ready[1], &BYTE, 1, REMOTE_IPC_TIMEOUT_MS) != 1) {
-            close(ready[1]);
-            _exit(2);
-        }
-        close(ready[1]);
-
-        timespec timeout{
-            .tv_sec = 1,
-            .tv_nsec = 0,
-        };
-        int64_t const RC = futex_wait(futex_word, 23, &timeout);
-        _exit(RC == 0 ? 0 : 1);
-    }
-
-    close(ready[1]);
-    char byte = 0;
-    ssize_t const NR = read_expected_bytes_timeout(ready[0], &byte, 1, REMOTE_IPC_TIMEOUT_MS);
-    close(ready[0]);
-    if (NR != 1 || byte != 'w') {
-        static_cast<void>(futex_wake(futex_word, 1));
-        int status = 0;
-        static_cast<void>(waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS));
-        munmap(futex_word, PAGE_SIZE);
-        fail("futex_wake_timeout_ready", "child did not enter futex wake test");
-        return;
-    }
-
-    usleep(100000);
-    static_cast<void>(futex_wake(futex_word, 1));
-
-    int status = 0;
-    bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
-    munmap(futex_word, PAGE_SIZE);
-    if (!WAIT_RET || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        fail("futex_wait_wake_before_timeout", "explicit futex wake did not beat the timeout");
-        return;
-    }
-    TESTD_PASS("futex_wait_wake_before_timeout");
+    TESTD_PASS("threads_condition_broadcast_wakes_all");
 }
-TESTD_RUN_END(test_futex_wait_wake_before_timeout)
-
-TESTD_RUN(test_futex_wait_interrupted_by_signal) {
-    constexpr size_t PAGE_SIZE = 4096;
-    auto* futex_word = static_cast<int*>(mmap(nullptr, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (futex_word == MAP_FAILED) {
-        fail("futex_signal_mmap", "mmap failed");
-        return;
-    }
-    *futex_word = 31;
-
-    std::array<int, 2> ready = {-1, -1};
-    if (pipe(ready.data()) != 0) {
-        munmap(futex_word, PAGE_SIZE);
-        fail("futex_signal_pipe", "pipe failed");
-        return;
-    }
-
-    pid_t const PID = fork();
-    if (PID < 0) {
-        close(ready[0]);
-        close(ready[1]);
-        munmap(futex_word, PAGE_SIZE);
-        fail("futex_signal_fork", "fork failed");
-        return;
-    }
-
-    if (PID == 0) {
-        close(ready[0]);
-        if (signal(SIGUSR1, futex_test_signal_handler) == SIG_ERR) {  // NOLINT(misc-include-cleaner)
-            close(ready[1]);
-            _exit(2);
-        }
-
-        constexpr char BYTE = 's';
-        if (write_all_timeout(ready[1], &BYTE, 1, REMOTE_IPC_TIMEOUT_MS) != 1) {
-            close(ready[1]);
-            _exit(2);
-        }
-        close(ready[1]);
-
-        // A signal that lands just before FUTEX_WAIT should not decide this test.
-        for (int attempt = 0; attempt < 8; ++attempt) {
-            g_futex_signal_seen = 0;
-            timespec timeout{
-                .tv_sec = 0,
-                .tv_nsec = 200000000,
-            };
-            int64_t const RC = futex_wait(futex_word, 31, &timeout);
-            if (RC == -EINTR && g_futex_signal_seen != 0) {
-                _exit(0);
-            }
-            if (RC != 0 && RC != -ETIMEDOUT) {
-                _exit(1);
-            }
-        }
-        _exit(1);
-    }
-
-    close(ready[1]);
-    char byte = 0;
-    ssize_t const NR = read_expected_bytes_timeout(ready[0], &byte, 1, REMOTE_IPC_TIMEOUT_MS);
-    close(ready[0]);
-    if (NR != 1 || byte != 's') {
-        static_cast<void>(futex_wake(futex_word, 1));
-        int status = 0;
-        static_cast<void>(waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS));
-        munmap(futex_word, PAGE_SIZE);
-        fail("futex_signal_ready", "child did not enter futex signal test");
-        return;
-    }
-
-    int status = 0;
-    bool child_exited = false;
-    // The ready byte means the child is about to wait; short repeated windows
-    // keep the test focused on a signal that interrupts the futex wait itself.
-    for (int attempt = 0; attempt < 8 && !child_exited; ++attempt) {
-        pid_t wait_ret = waitpid(PID, &status, WNOHANG);
-        if (wait_ret == PID) {
-            child_exited = true;
-            break;
-        }
-        if (wait_ret < 0) {
-            static_cast<void>(futex_wake(futex_word, 1));
-            munmap(futex_word, PAGE_SIZE);
-            fail("futex_signal_waitpid", "waitpid(WNOHANG) failed");
-            return;
-        }
-
-        usleep(50000);
-        if (kill(PID, SIGUSR1) != 0) {  // NOLINT(misc-include-cleaner)
-            wait_ret = waitpid(PID, &status, WNOHANG);
-            if (wait_ret == PID) {
-                child_exited = true;
-                break;
-            }
-            static_cast<void>(futex_wake(futex_word, 1));
-            static_cast<void>(waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS));
-            munmap(futex_word, PAGE_SIZE);
-            fail("futex_signal_kill", "kill(SIGUSR1) failed");
-            return;
-        }
-
-        usleep(50000);
-        wait_ret = waitpid(PID, &status, WNOHANG);
-        if (wait_ret == PID) {
-            child_exited = true;
-            break;
-        }
-        if (wait_ret < 0) {
-            static_cast<void>(futex_wake(futex_word, 1));
-            munmap(futex_word, PAGE_SIZE);
-            fail("futex_signal_waitpid", "waitpid(WNOHANG) failed");
-            return;
-        }
-
-        static_cast<void>(futex_wake(futex_word, 1));
-    }
-
-    bool const WAIT_RET = child_exited || waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
-    munmap(futex_word, PAGE_SIZE);
-    if (!WAIT_RET || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        if (WAIT_RET) {
-            errno = 0;
-        }
-        fail("futex_wait_interrupted_by_signal", "caught signal did not interrupt futex wait with EINTR");
-        return;
-    }
-    TESTD_PASS("futex_wait_interrupted_by_signal");
-}
-TESTD_RUN_END(test_futex_wait_interrupted_by_signal)
+TESTD_RUN_END(test_threads_condition_broadcast_wakes_all)
 
 TESTD_RUN(test_nanosleep_rejects_invalid_nsec) {
     timespec invalid{
@@ -4052,68 +3923,67 @@ TESTD_RUN(test_journal_device_userspace_record) {
 TESTD_RUN_END(test_journal_device_userspace_record)
 
 // NOLINTBEGIN(cppcoreguidelines-macro-usage)
-#define TESTD_TESTS(X)                          \
-    X(test_vfs_open_write_read_close)           \
-    X(test_vfs_stat)                            \
-    X(test_vfs_lseek)                           \
-    X(test_vfs_mkdir_rmdir)                     \
-    X(test_vfs_unlink_rename)                   \
-    X(test_vfs_lstat_symlink)                   \
-    X(test_vfs_shell_fsops_shape)               \
-    X(test_vfs_dup)                             \
-    X(test_vfs_dup2)                            \
-    X(test_vfs_readdir)                         \
-    X(test_vfs_readdir_unlink_progress)         \
-    X(test_vfs_directory_requirements)          \
-    X(test_vfs_rename_file_parent_enotdir)      \
-    X(test_vfs_access)                          \
-    X(test_chmod)                               \
-    X(test_truncate)                            \
-    X(test_pipe_basic)                          \
-    X(test_pipe_eof_on_writer_close)            \
-    X(test_pipe_blocking_read_wake)             \
-    X(test_pipe_lost_wake_race_many)            \
-    X(test_futex_rejects_unaligned_address)     \
-    X(test_futex_wait_relative_timeout)         \
-    X(test_futex_wait_wake_before_timeout)      \
-    X(test_futex_wait_interrupted_by_signal)    \
-    X(test_nanosleep_rejects_invalid_nsec)      \
-    X(test_poll_pipe_timeout_and_wake)          \
-    X(test_poll_pipe_hup_on_writer_close)       \
-    X(test_epoll_pipe_timeout_and_wake)         \
-    X(test_epoll_pipe_hup_on_writer_close)      \
-    X(test_pty_blocking_read_wake)              \
-    X(test_getpid_getppid)                      \
-    X(test_getcwd_chdir)                        \
-    X(test_fork_exit)                           \
-    X(test_waitpid_exit_before_park_race)       \
-    X(test_waitpid_any_exit_before_park_race)   \
-    X(test_waitpid_any_multi_child_drain)       \
-    X(test_fork_pipe_byte)                      \
-    X(test_fork_pipe_communication)             \
-    X(test_fork_multiple)                       \
-    X(test_mmap_anon)                           \
-    X(test_file_write_read)                     \
-    X(test_mmap_file)                           \
-    X(test_tcp_loopback)                        \
-    X(test_tcp_nonblocking_connect_refused)     \
-    X(test_journal_device_userspace_record)     \
-    X(test_wki_target_policy_syscalls)          \
-    X(test_wki_vfs_rule_syscalls)               \
-    X(test_remote_ipc_pipe_child_write)         \
-    X(test_remote_ipc_pipe_parent_write)        \
-    X(test_remote_ipc_pty_child_write)          \
-    X(test_remote_ipc_pty_ioctl)                \
-    X(test_remote_ipc_socket_child_write)       \
-    X(test_remote_ipc_socket_control_ops)       \
-    X(test_remote_ipc_poll_wait_pipe_readable)  \
-    X(test_remote_ipc_poll_wait_pipe_hup)       \
-    X(test_remote_ipc_poll_pipe_preclosed_hup)  \
-    X(test_remote_ipc_poll_pipe_read_then_hup)  \
-    X(test_remote_ipc_epoll_wait_pipe_readable) \
-    X(test_remote_ipc_epoll_wait_pipe_hup)      \
-    X(test_remote_ipc_epoll_pipe_preclosed_hup) \
-    X(test_remote_ipc_epoll_pipe_read_then_hup) \
+#define TESTD_TESTS(X)                            \
+    X(test_vfs_open_write_read_close)             \
+    X(test_vfs_stat)                              \
+    X(test_vfs_lseek)                             \
+    X(test_vfs_mkdir_rmdir)                       \
+    X(test_vfs_unlink_rename)                     \
+    X(test_vfs_lstat_symlink)                     \
+    X(test_vfs_shell_fsops_shape)                 \
+    X(test_vfs_dup)                               \
+    X(test_vfs_dup2)                              \
+    X(test_vfs_readdir)                           \
+    X(test_vfs_readdir_unlink_progress)           \
+    X(test_vfs_directory_requirements)            \
+    X(test_vfs_rename_file_parent_enotdir)        \
+    X(test_vfs_access)                            \
+    X(test_chmod)                                 \
+    X(test_truncate)                              \
+    X(test_pipe_basic)                            \
+    X(test_pipe_eof_on_writer_close)              \
+    X(test_pipe_blocking_read_wake)               \
+    X(test_pipe_lost_wake_race_many)              \
+    X(test_threads_mutex_trylock_busy)            \
+    X(test_threads_condition_timedwait_timeout)   \
+    X(test_threads_condition_broadcast_wakes_all) \
+    X(test_nanosleep_rejects_invalid_nsec)        \
+    X(test_poll_pipe_timeout_and_wake)            \
+    X(test_poll_pipe_hup_on_writer_close)         \
+    X(test_epoll_pipe_timeout_and_wake)           \
+    X(test_epoll_pipe_hup_on_writer_close)        \
+    X(test_pty_blocking_read_wake)                \
+    X(test_getpid_getppid)                        \
+    X(test_getcwd_chdir)                          \
+    X(test_fork_exit)                             \
+    X(test_waitpid_exit_before_park_race)         \
+    X(test_waitpid_any_exit_before_park_race)     \
+    X(test_waitpid_any_multi_child_drain)         \
+    X(test_fork_pipe_byte)                        \
+    X(test_fork_pipe_communication)               \
+    X(test_fork_multiple)                         \
+    X(test_mmap_anon)                             \
+    X(test_file_write_read)                       \
+    X(test_mmap_file)                             \
+    X(test_tcp_loopback)                          \
+    X(test_tcp_nonblocking_connect_refused)       \
+    X(test_journal_device_userspace_record)       \
+    X(test_wki_target_policy_syscalls)            \
+    X(test_wki_vfs_rule_syscalls)                 \
+    X(test_remote_ipc_pipe_child_write)           \
+    X(test_remote_ipc_pipe_parent_write)          \
+    X(test_remote_ipc_pty_child_write)            \
+    X(test_remote_ipc_pty_ioctl)                  \
+    X(test_remote_ipc_socket_child_write)         \
+    X(test_remote_ipc_socket_control_ops)         \
+    X(test_remote_ipc_poll_wait_pipe_readable)    \
+    X(test_remote_ipc_poll_wait_pipe_hup)         \
+    X(test_remote_ipc_poll_pipe_preclosed_hup)    \
+    X(test_remote_ipc_poll_pipe_read_then_hup)    \
+    X(test_remote_ipc_epoll_wait_pipe_readable)   \
+    X(test_remote_ipc_epoll_wait_pipe_hup)        \
+    X(test_remote_ipc_epoll_pipe_preclosed_hup)   \
+    X(test_remote_ipc_epoll_pipe_read_then_hup)   \
     X(test_remote_ipc_epoll_ctl_add)
 // NOLINTEND(cppcoreguidelines-macro-usage)
 constexpr auto K_TESTS = std::array{
