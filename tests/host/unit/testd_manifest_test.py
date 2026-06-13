@@ -641,6 +641,39 @@ def require_non_waitpid_wake_tests_bound_parent_reads(source: str) -> None:
                 fail(f"{test_name} still has a raw parent pipe read: {forbidden}")
 
 
+def require_thread_sync_tests_are_child_bounded(source: str) -> None:
+    bodies = parse_test_bodies(source)
+    mutex_body = bodies["test_threads_mutex_contended_lock_wake"]
+    for snippet in [
+        "run_thread_child_with_timeout(run_threads_mutex_contended_wake_child",
+        'TESTD_PASS("threads_mutex_contended_lock_wake")',
+    ]:
+        if snippet not in mutex_body:
+            fail(f"test_threads_mutex_contended_lock_wake is missing child-bounded snippet: {snippet}")
+
+    waiter_body = function_body(source, "thread_mutex_waiter")
+    for snippet in [
+        "state->waiting.store(1, std::memory_order_release)",
+        "mtx_lock(&state->lock)",
+        "state->acquired.store(1, std::memory_order_release)",
+    ]:
+        if snippet not in waiter_body:
+            fail(f"thread_mutex_waiter is missing contended lock snippet: {snippet}")
+
+    child_body = function_body(source, "run_threads_mutex_contended_wake_child")
+    for snippet in [
+        "mtx_lock(&state.lock)",
+        "thrd_create(&thread, thread_mutex_waiter, &state)",
+        "wait_for_atomic_value(state.waiting, 1, THREAD_SYNC_PROGRESS_TIMEOUT_MS)",
+        "state.acquired.load(std::memory_order_acquire) != 0",
+        "mtx_unlock(&state.lock)",
+        "wait_for_atomic_value(state.acquired, 1, THREAD_SYNC_PROGRESS_TIMEOUT_MS)",
+        "thrd_join(thread, &result)",
+    ]:
+        if snippet not in child_body:
+            fail(f"run_threads_mutex_contended_wake_child is missing bounded progress snippet: {snippet}")
+
+
 def require_wki_policy_syscall_tests(source: str) -> None:
     bodies = parse_test_bodies(source)
     target_body = bodies["test_wki_target_policy_syscalls"]
@@ -882,6 +915,7 @@ def main() -> None:
     require_non_waitpid_wake_tests_bound_child_waits(source)
     require_process_waitpid_tests_are_deadline_bounded(source)
     require_non_waitpid_wake_tests_bound_parent_reads(source)
+    require_thread_sync_tests_are_child_bounded(source)
     require_wki_policy_syscall_tests(source)
     require_journal_device_test(source)
     require_compiled_manifest_rejects_empty_tests(source)

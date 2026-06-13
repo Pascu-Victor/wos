@@ -50,6 +50,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <climits>
 #include <cstdint>
@@ -323,6 +324,7 @@ constexpr int64_t NSEC_PER_MSEC = 1000000;
 constexpr int64_t NSEC_PER_SEC = 1000 * NSEC_PER_MSEC;
 constexpr int64_t MSEC_PER_SEC = 1000;
 constexpr int THREAD_SYNC_TIMEOUT_MS = 100;
+constexpr int THREAD_SYNC_PROGRESS_TIMEOUT_MS = 1000;
 constexpr int THREAD_SYNC_WORKERS = 4;
 constexpr uint32_t WKI_VFS_ROUTE_LOCAL = 0;
 constexpr uint32_t WKI_VFS_ROUTE_HOST = 1;
@@ -336,6 +338,12 @@ struct ThreadCondState {
     int waiting = 0;
     int woken = 0;
     bool release_all = false;
+};
+
+struct ThreadMutexWakeState {
+    mtx_t lock{};
+    std::atomic<int> waiting{0};
+    std::atomic<int> acquired{0};
 };
 
 auto realtime_after_ms(int timeout_ms, timespec& out) -> bool {
@@ -795,6 +803,69 @@ auto run_thread_child_with_timeout(ThreadChildFn child_fn, const char* fail_name
         return false;
     }
     return true;
+}
+
+auto wait_for_atomic_value(std::atomic<int>& value, int expected, int timeout_ms) -> bool {
+    int64_t const DEADLINE_MS = deadline_after_ms(timeout_ms);
+    int64_t waited_us = 0;
+    int64_t const TIMEOUT_US = static_cast<int64_t>(timeout_ms) * USEC_PER_MSEC;
+    while ((DEADLINE_MS >= 0 && remaining_ms_until(DEADLINE_MS, 0) > 0) || (DEADLINE_MS < 0 && waited_us <= TIMEOUT_US)) {
+        if (value.load(std::memory_order_acquire) == expected) {
+            return true;
+        }
+        usleep(CHILD_WAIT_POLL_US);
+        waited_us += CHILD_WAIT_POLL_US;
+    }
+    return value.load(std::memory_order_acquire) == expected;
+}
+
+auto thread_mutex_waiter(void* arg) -> int {
+    auto* state = static_cast<ThreadMutexWakeState*>(arg);
+    state->waiting.store(1, std::memory_order_release);
+    if (mtx_lock(&state->lock) != thrd_success) {
+        return 1;
+    }
+    state->acquired.store(1, std::memory_order_release);
+    return (mtx_unlock(&state->lock) == thrd_success) ? 0 : 2;
+}
+
+auto run_threads_mutex_contended_wake_child() -> int {
+    ThreadMutexWakeState state{};
+    if (mtx_init(&state.lock, mtx_plain) != thrd_success) {
+        return 1;
+    }
+    if (mtx_lock(&state.lock) != thrd_success) {
+        mtx_destroy(&state.lock);
+        return 2;
+    }
+
+    thrd_t thread{};
+    if (thrd_create(&thread, thread_mutex_waiter, &state) != thrd_success) {
+        static_cast<void>(mtx_unlock(&state.lock));
+        mtx_destroy(&state.lock);
+        return 3;
+    }
+    if (!wait_for_atomic_value(state.waiting, 1, THREAD_SYNC_PROGRESS_TIMEOUT_MS)) {
+        return 4;
+    }
+
+    usleep(CHILD_WAIT_POLL_US * 2);
+    if (state.acquired.load(std::memory_order_acquire) != 0) {
+        return 5;
+    }
+    if (mtx_unlock(&state.lock) != thrd_success) {
+        return 6;
+    }
+    if (!wait_for_atomic_value(state.acquired, 1, THREAD_SYNC_PROGRESS_TIMEOUT_MS)) {
+        return 7;
+    }
+
+    int result = -1;
+    if (thrd_join(thread, &result) != thrd_success || result != 0) {
+        return 8;
+    }
+    mtx_destroy(&state.lock);
+    return 0;
 }
 
 auto thread_condition_waiter(void* arg) -> int {
@@ -1683,6 +1754,15 @@ TESTD_RUN(test_threads_mutex_trylock_busy) {
     TESTD_PASS("threads_mutex_trylock_busy");
 }
 TESTD_RUN_END(test_threads_mutex_trylock_busy)
+
+TESTD_RUN(test_threads_mutex_contended_lock_wake) {
+    if (!run_thread_child_with_timeout(run_threads_mutex_contended_wake_child, "threads_mutex_contended_lock_wake",
+                                       "mtx_unlock did not wake a contended mtx_lock")) {
+        return;
+    }
+    TESTD_PASS("threads_mutex_contended_lock_wake");
+}
+TESTD_RUN_END(test_threads_mutex_contended_lock_wake)
 
 TESTD_RUN(test_threads_condition_timedwait_timeout) {
     if (!run_thread_child_with_timeout(run_threads_condition_timeout_child, "threads_condition_timedwait_timeout",
@@ -3945,6 +4025,7 @@ TESTD_RUN_END(test_journal_device_userspace_record)
     X(test_pipe_blocking_read_wake)               \
     X(test_pipe_lost_wake_race_many)              \
     X(test_threads_mutex_trylock_busy)            \
+    X(test_threads_mutex_contended_lock_wake)     \
     X(test_threads_condition_timedwait_timeout)   \
     X(test_threads_condition_broadcast_wakes_all) \
     X(test_nanosleep_rejects_invalid_nsec)        \
