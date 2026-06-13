@@ -77,6 +77,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/netpoll_backlog_source_test.py
 )
 add_test(
+    NAME virtio_net_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/virtio_net_source_test.py
+)
+add_test(
     NAME poll_deadline_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/poll_deadline_source_test.py
 )
@@ -167,6 +171,7 @@ set_tests_properties(
     debugserver_source_test
     sftp_timeout_source_test
     netpoll_backlog_source_test
+    virtio_net_source_test
     poll_deadline_source_test
     futex_source_test
     waitpid_source_test

@@ -63,6 +63,14 @@ constexpr uint8_t MIN_MQ_QUEUE_PAIRS = 2;
 constexpr uint8_t DEFAULT_MQ_QUEUE_PAIR_LIMIT = 4;
 constexpr uint8_t WKI_CONTROL_TX_RETRY_POLLS = 8;
 
+auto future_deadline_ms(uint64_t timeout_ms) -> uint64_t {
+    uint64_t const NOW_MS = ker::mod::time::get_ms();
+    if (UINT64_MAX - NOW_MS < timeout_ms) {
+        return UINT64_MAX;
+    }
+    return NOW_MS + timeout_ms;
+}
+
 void init_queue_pair_contexts(VirtIONetDevice* dev) {
     for (uint8_t i = 0; i < VIRTIO_NET_MAX_QUEUE_PAIRS; i++) {
         auto& pair = dev->queue_pairs.at(i);
@@ -521,7 +529,7 @@ auto send_mq_ctrl_cmd(VirtIONetDevice* dev, uint16_t queue_pairs) -> bool {
     // processing our ctrl-queue kick, creating a self-inflicted timeout.
     // 5 s covers any host scheduler latency during early boot.
     constexpr uint64_t CTRL_ACK_TIMEOUT_MS = 5000;
-    uint64_t const DEADLINE_MS = ker::mod::time::get_ms() + CTRL_ACK_TIMEOUT_MS;
+    uint64_t const DEADLINE_MS = future_deadline_ms(CTRL_ACK_TIMEOUT_MS);
     while (ker::mod::time::get_ms() < DEADLINE_MS) {
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (ctrlq->used->idx != 0) {
