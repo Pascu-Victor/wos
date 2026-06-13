@@ -33,6 +33,7 @@ struct Options {
     int spp = 16;
     int max_depth = 6;
     int tile_size = 32;
+    bool tile_size_explicit = false;
     std::string output_root = "/srv/tracebench/runs";
     int threads = 0;
     std::string run_id;
@@ -45,6 +46,8 @@ struct Options {
     bool disable_worker_output_queue = false;
     bool disable_single_thread_worker_queue = true;
     bool process_persistent_workers = false;
+    bool write_final_image = true;
+    uint64_t final_image_max_pixels = 8ULL * 1024ULL * 1024ULL;
 };
 
 struct Tile {
@@ -92,6 +95,9 @@ auto write_status(const Options& options, const Progress& progress) -> bool;
 auto write_metrics(const Options& options, const Progress& progress, double rays_per_second) -> bool;
 auto write_preview_png(const Options& options, FilmView film) -> bool;
 auto write_final_png(const Options& options, FilmView film) -> bool;
+auto final_image_pixel_count(FilmView film, uint64_t& pixels) -> bool;
+auto film_storage_is_complete(FilmView film) -> bool;
+auto should_write_final_image(const Options& options, FilmView film) -> bool;
 void print_usage(const char* argv0);
 
 }  // namespace tracebench

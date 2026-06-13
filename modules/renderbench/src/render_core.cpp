@@ -1439,6 +1439,42 @@ auto write_preview_png_atomic(const std::string& path, FilmView film) -> bool {
 
 }  // namespace
 
+auto final_image_pixel_count(FilmView film, uint64_t& pixels) -> bool {
+    if (film.width <= 0 || film.height <= 0) {
+        return false;
+    }
+    auto const WIDTH = static_cast<uint64_t>(film.width);
+    auto const HEIGHT = static_cast<uint64_t>(film.height);
+    if (HEIGHT != 0 && WIDTH > std::numeric_limits<uint64_t>::max() / HEIGHT) {
+        return false;
+    }
+    pixels = WIDTH * HEIGHT;
+    return true;
+}
+
+auto film_storage_is_complete(FilmView film) -> bool {
+    uint64_t pixels = 0;
+    if (!final_image_pixel_count(film, pixels)) {
+        return false;
+    }
+    if (pixels > std::numeric_limits<uint64_t>::max() / 3U) {
+        return false;
+    }
+    uint64_t const REQUIRED_FLOATS = pixels * 3U;
+    return REQUIRED_FLOATS <= static_cast<uint64_t>(film.rgb.size());
+}
+
+auto should_write_final_image(const Options& options, FilmView film) -> bool {
+    if (!options.write_final_image) {
+        return false;
+    }
+    uint64_t pixels = 0;
+    if (!final_image_pixel_count(film, pixels)) {
+        return false;
+    }
+    return options.final_image_max_pixels == 0 || pixels <= options.final_image_max_pixels;
+}
+
 struct Scene {
     std::vector<Material> materials;
     std::vector<Texture> textures;
@@ -2146,7 +2182,8 @@ void print_usage(const char* argv0) {
                  "[--coordinator-reserve-cpus N] [--node-worker-reserve-cpus N] [--coordinator-skip-local-worker] "
                  "[--disable-worker-output-queue|--enable-worker-output-queue] "
                  "[--disable-single-thread-worker-queue|--enable-single-thread-worker-queue] "
-                 "[--enable-process-persistent-workers|--disable-process-persistent-workers]\n",
+                 "[--enable-process-persistent-workers|--disable-process-persistent-workers] "
+                 "[--disable-final-image|--enable-final-image] [--final-image-max-pixels N]\n",
                  argv0 != nullptr ? argv0 : "renderbench");
 }
 
@@ -2213,6 +2250,7 @@ auto parse_options(int argc, char* const* argv, Backend default_backend, Options
             if (!parse_required_int(4, options.tile_size)) {
                 return ParseStatus::Error;
             }
+            options.tile_size_explicit = true;
         } else if (ARG == "--output-root") {
             const char* const VALUE = require_option_value(argc, argv, i, ARG);
             if (VALUE == nullptr) {
@@ -2261,6 +2299,16 @@ auto parse_options(int argc, char* const* argv, Backend default_backend, Options
             options.process_persistent_workers = true;
         } else if (ARG == "--disable-process-persistent-workers") {
             options.process_persistent_workers = false;
+        } else if (ARG == "--disable-final-image") {
+            options.write_final_image = false;
+        } else if (ARG == "--enable-final-image") {
+            options.write_final_image = true;
+        } else if (ARG == "--final-image-max-pixels") {
+            int parsed = 0;
+            if (!parse_required_int(0, parsed)) {
+                return ParseStatus::Error;
+            }
+            options.final_image_max_pixels = static_cast<uint64_t>(parsed);
         } else if (ARG == "--tracebench-worker" || ARG == "--worker-command-stream") {
             continue;
         } else if (ARG == "--worker-id") {
@@ -2528,6 +2576,8 @@ auto write_status(const Options& options, const Progress& progress) -> bool {
         << "  \"coordinator_skip_local_worker\": " << (options.coordinator_skip_local_worker ? "true" : "false") << ",\n"
         << "  \"worker_output_queue_disabled\": " << (options.disable_worker_output_queue ? "true" : "false") << ",\n"
         << "  \"single_thread_worker_queue_disabled\": " << (options.disable_single_thread_worker_queue ? "true" : "false") << ",\n"
+        << "  \"final_image_enabled\": " << (options.write_final_image ? "true" : "false") << ",\n"
+        << "  \"final_image_max_pixels\": " << options.final_image_max_pixels << ",\n"
         << "  \"tiles_done\": " << progress.tiles_done << ",\n"
         << "  \"total_tiles\": " << progress.total_tiles << ",\n"
         << "  \"samples_done\": " << progress.samples_done << ",\n"
@@ -2557,6 +2607,8 @@ auto write_metrics(const Options& options, const Progress& progress, double rays
         << "  \"coordinator_skip_local_worker\": " << (options.coordinator_skip_local_worker ? "true" : "false") << ",\n"
         << "  \"worker_output_queue_disabled\": " << (options.disable_worker_output_queue ? "true" : "false") << ",\n"
         << "  \"single_thread_worker_queue_disabled\": " << (options.disable_single_thread_worker_queue ? "true" : "false") << ",\n"
+        << "  \"final_image_enabled\": " << (options.write_final_image ? "true" : "false") << ",\n"
+        << "  \"final_image_max_pixels\": " << options.final_image_max_pixels << ",\n"
         << "  \"elapsed_seconds\": " << progress.elapsed_seconds << ",\n"
         << "  \"primary_samples\": " << progress.total_samples << ",\n"
         << "  \"rays_per_second_estimate\": " << rays_per_second << "\n"
@@ -2568,6 +2620,16 @@ auto write_preview_png(const Options& options, FilmView film) -> bool {
     return write_preview_png_atomic(run_dir(options) + "/preview.png", film);
 }
 
-auto write_final_png(const Options& options, FilmView film) -> bool { return write_png_atomic(run_dir(options) + "/frame_000.png", film); }
+auto write_final_png(const Options& options, FilmView film) -> bool {
+    if (!should_write_final_image(options, film)) {
+        uint64_t pixels = 0;
+        if (final_image_pixel_count(film, pixels)) {
+            std::fprintf(stderr, "renderbench: skipping final PNG (%llu pixels, max=%llu); preview.png remains available\n",
+                         static_cast<unsigned long long>(pixels), static_cast<unsigned long long>(options.final_image_max_pixels));
+        }
+        return false;
+    }
+    return write_png_atomic(run_dir(options) + "/frame_000.png", film);
+}
 
 }  // namespace tracebench

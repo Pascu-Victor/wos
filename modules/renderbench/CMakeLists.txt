@@ -20,6 +20,7 @@ include_directories(
 add_executable(renderbench
     src/main.cpp
     src/render_core.cpp
+    src/render_protocol.cpp
     ${CMAKE_SOURCE_DIR}/modules/testprog/src/mandelbench/lodepng.cpp
     ${CMAKE_SOURCE_DIR}/modules/testprog/src/mandelbench/tinycthread.cpp
 )
