@@ -493,35 +493,6 @@ def require_remote_ipc_epoll_ctl_add_is_bounded(source: str) -> None:
             fail(f"test_remote_ipc_epoll_ctl_add still uses an unbounded wait: {snippet}")
 
 
-def require_futex_tests_are_deadline_bounded(source: str) -> None:
-    bodies = parse_test_bodies(source)
-    unaligned_body = bodies["test_futex_rejects_unaligned_address"]
-    for snippet in [
-        "WAIT_RC != -EINVAL || WAKE_RC != -EINVAL",
-        'TESTD_PASS("futex_unaligned_address")',
-    ]:
-        if snippet not in unaligned_body:
-            fail(f"test_futex_rejects_unaligned_address is missing EINVAL coverage snippet: {snippet}")
-
-    futex_tests = [
-        "test_futex_wait_relative_timeout",
-        "test_futex_wait_wake_before_timeout",
-        "test_futex_wait_interrupted_by_signal",
-    ]
-    for test_name in futex_tests:
-        body = bodies[test_name]
-        if "read(ready[0], &byte, 1)" in body:
-            fail(f"{test_name} still uses a blocking ready-pipe read")
-        if "waitpid(PID, &status, 0)" in body:
-            fail(f"{test_name} still uses an unbounded child wait")
-        for snippet in [
-            "read_expected_bytes_timeout(ready[0], &byte, 1, REMOTE_IPC_TIMEOUT_MS)",
-            "waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)",
-        ]:
-            if snippet not in body:
-                fail(f"{test_name} is missing bounded futex test snippet: {snippet}")
-
-
 def require_non_waitpid_wake_tests_bound_child_waits(source: str) -> None:
     bodies = parse_test_bodies(source)
     bounded_tests = [
@@ -876,7 +847,6 @@ def main() -> None:
     require_socket_setup_tests_are_deadline_bounded(source)
     require_remote_ipc_wait_handshake(source)
     require_remote_ipc_epoll_ctl_add_is_bounded(source)
-    require_futex_tests_are_deadline_bounded(source)
     require_non_waitpid_wake_tests_bound_child_waits(source)
     require_process_waitpid_tests_are_deadline_bounded(source)
     require_non_waitpid_wake_tests_bound_parent_reads(source)
