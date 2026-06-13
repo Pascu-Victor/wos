@@ -97,6 +97,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_wait_source_test.py
 )
 add_test(
+    NAME wki_ivshmem_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_ivshmem_source_test.py
+)
+add_test(
     NAME wki_dev_server_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_dev_server_source_test.py
 )
@@ -164,6 +168,7 @@ set_tests_properties(
     phys_source_test
     wki_timer_source_test
     wki_wait_source_test
+    wki_ivshmem_source_test
     wki_dev_server_source_test
     wki_dev_proxy_source_test
     wki_remote_ipc_source_test

@@ -119,6 +119,7 @@ UNIT_TESTS=(
     phys_source_test
     wki_timer_source_test
     wki_wait_source_test
+    wki_ivshmem_source_test
     wki_dev_server_source_test
     wki_dev_proxy_source_test
     wki_remote_ipc_source_test

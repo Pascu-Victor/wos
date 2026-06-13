@@ -8,6 +8,7 @@
 #include <dev/pci.hpp>
 #include <net/packet.hpp>
 #include <net/wki/irq_fwd.hpp>
+#include <net/wki/timer_math.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
@@ -508,7 +509,7 @@ void wki_ivshmem_transport_init() {
     // VM0: poll for peer_ready with 5s timeout
     if (s_ivshmem_priv.my_vm_id == 0) {
         constexpr uint64_t PEER_READY_TIMEOUT_US = 5'000'000;
-        uint64_t const DEADLINE = ker::mod::time::get_us() + PEER_READY_TIMEOUT_US;
+        uint64_t const DEADLINE = wki_future_deadline_us(ker::mod::time::get_us(), PEER_READY_TIMEOUT_US);
         while (hdr->peer_ready == 0) {
             if (ker::mod::time::get_us() >= DEADLINE) {
                 ker::mod::dbg::log("[WKI] ivshmem: peer_ready timeout - continuing without peer");
