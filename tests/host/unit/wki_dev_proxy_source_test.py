@@ -320,6 +320,64 @@ def test_attach_ack_requires_expected_cookie_before_completion() -> None:
     )
 
 
+def test_failed_attach_erases_exact_proxy_not_tail() -> None:
+    header = DEV_PROXY_HPP.read_text()
+    source = DEV_PROXY_CPP.read_text()
+    attach_body = function_body(source, "wki_dev_proxy_attach_block")
+    cleanup_body = function_body(source, "cleanup_failed_block_attach")
+    erase_body = function_body(source, "erase_proxy_exact_locked")
+
+    require_tokens(
+        header,
+        ["auto wki_dev_proxy_selftest_failed_attach_erases_exact_proxy() -> bool;"],
+        "dev proxy failed attach exact erase declaration",
+    )
+    require_tokens(
+        source,
+        [
+            "auto erase_proxy_exact_locked(ProxyBlockState* state) -> bool",
+            "void cleanup_failed_block_attach(ProxyBlockState* state, WkiChannel* channel_to_close, bool send_detach)",
+            "auto wki_dev_proxy_selftest_failed_attach_erases_exact_proxy() -> bool",
+        ],
+        "dev proxy failed attach exact erase scaffolding",
+    )
+    require_tokens(
+        erase_body,
+        [
+            "it->get() == state",
+            "g_proxies.erase(it)",
+            "return true",
+        ],
+        "dev proxy exact erase helper",
+    )
+    require_tokens(
+        cleanup_body,
+        [
+            "send_block_detach(owner_node, resource_id)",
+            "wki_channel_close(channel_to_close)",
+            "wki_zone_destroy(rdma_zone_id)",
+            "delete[] ra_buf",
+            "delete[] bulk_buf",
+            "erase_proxy_exact(state)",
+        ],
+        "dev proxy failed attach cleanup",
+    )
+    if "g_proxies.pop_back()" in attach_body:
+        fail("failed block attach cleanup must erase the exact proxy, not the current deque tail")
+    if attach_body.count("cleanup_failed_block_attach(state,") < 8:
+        fail("all block attach failure exits must use cleanup_failed_block_attach")
+
+    ktest = WKI_DEV_PROXY_KTEST.read_text()
+    require_tokens(
+        ktest,
+        [
+            "KTEST(WkiDevProxyAttachFailure, ErasesExactProxy)",
+            "wki_dev_proxy_selftest_failed_attach_erases_exact_proxy()",
+        ],
+        "dev proxy failed attach exact erase KTEST coverage",
+    )
+
+
 def main() -> None:
     test_lifecycle_flags_are_atomic()
     test_lifecycle_helpers_use_acquire_release()
@@ -331,6 +389,7 @@ def main() -> None:
     test_timeout_marks_inactive_with_release_store()
     test_dev_proxy_selftest_declared()
     test_attach_ack_requires_expected_cookie_before_completion()
+    test_failed_attach_erases_exact_proxy_not_tail()
     print("WKI dev proxy source invariants hold")
 
 

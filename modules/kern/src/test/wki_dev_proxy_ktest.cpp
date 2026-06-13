@@ -19,6 +19,10 @@ KTEST(WkiDevProxyAttachAck, CookieFencesStaleBlockCompletion) {
     KEXPECT_TRUE(ker::net::wki::wki_dev_proxy_selftest_attach_ack_cookie_fences_stale_completion());
 }
 
+KTEST(WkiDevProxyAttachFailure, ErasesExactProxy) {
+    KEXPECT_TRUE(ker::net::wki::wki_dev_proxy_selftest_failed_attach_erases_exact_proxy());
+}
+
 KTEST(WkiDevProxyRdmaSqWait, StopsOnFenceOrInactive) { KEXPECT_TRUE(ker::net::wki::wki_dev_proxy_selftest_rdma_sq_wait_stops_on_fence()); }
 
 KTEST(WkiRemoteVfsAttachAck, CookieFencesStaleMountCompletion) {
