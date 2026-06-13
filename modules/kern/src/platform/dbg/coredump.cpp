@@ -799,7 +799,7 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     if (task->thread != nullptr) {
         req.thread_fs_base = task->thread->fsbase;
         req.thread_gs_base = task->thread->gsbase;
-        req.thread_stack_base = task->thread->gsbase;
+        req.thread_stack_base = task->thread->stack_base_virt;
         req.thread_stack_size = task->thread->stack_size;
         req.thread_tls_base = task->thread->tls_base_virt;
         req.thread_tls_size = task->thread->tls_size;

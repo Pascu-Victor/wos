@@ -2,6 +2,7 @@
 
 #include <extern/limine.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -123,6 +124,20 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
 
     log_lazy_vmem_fault_state(task, PAGE_VADDR, fault, "miss");
     return false;
+}
+
+auto writable_anonymous_range_contains(sched::task::Task* task, uint64_t vaddr) -> bool {
+    if (task == nullptr) {
+        return false;
+    }
+
+    constexpr uint64_t PROT_WRITE = 0x2ULL;
+    constexpr uint64_t MAP_ANONYMOUS = 0x20ULL;
+    uint64_t const PAGE_VADDR = vaddr & ~(paging::PAGE_SIZE - 1);
+    return std::ranges::any_of(task->lazy_vmem_ranges, [PAGE_VADDR](const auto& range) {
+        return PAGE_VADDR >= range.start && PAGE_VADDR < range.end && (range.prot & PROT_WRITE) != 0U &&
+               (range.flags & MAP_ANONYMOUS) != 0U;
+    });
 }
 
 void record_cow_perf_event(sched::task::Task* task, perf::WkiPerfLocalVmemOp op, uint64_t vaddr, uint32_t refcount, uint64_t started_us) {
@@ -623,6 +638,13 @@ auto ensure_user_page_writable_for_task(sched::task::Task* task, vaddr_t vaddr) 
             }
 
             uint64_t raw = pte_raw(pte);
+            bool const SYNTHETIC_ANON_COW = (raw & (paging::PAGE_COW | paging::PAGE_WRITE)) == 0U && (raw & paging::PAGE_USER) != 0U &&
+                                            writable_anonymous_range_contains(task, VADDR);
+            if (SYNTHETIC_ANON_COW) {
+                owned_frame_untrack_leaf(task->pagemap, VADDR, pte);
+                raw |= paging::PAGE_COW;
+                pte = pte_from_raw(raw);
+            }
             if ((raw & paging::PAGE_COW) == 0U) {
                 if ((raw & paging::PAGE_WRITE) == 0U || (raw & paging::PAGE_USER) == 0U) {
                     return false;
@@ -1135,7 +1157,23 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
             }
 
             uint64_t raw = pte_raw(pte);
+            bool const SYNTHETIC_ANON_COW = (raw & (paging::PAGE_COW | paging::PAGE_WRITE)) == 0U && (raw & paging::PAGE_USER) != 0U &&
+                                            writable_anonymous_range_contains(current_task, VADDR);
+            if (SYNTHETIC_ANON_COW) {
+                owned_frame_untrack_leaf(current_task->pagemap, VADDR, pte);
+                raw |= paging::PAGE_COW;
+                pte = pte_from_raw(raw);
+            }
             if ((raw & paging::PAGE_COW) == 0U) {
+                if ((raw & paging::PAGE_WRITE) != 0U && (raw & paging::PAGE_USER) != 0U) {
+                    bool const PATH_PROMOTED = promote_user_write_path(pml4e, pml3e, pml2e);
+                    if (PATH_PROMOTED) {
+                        wrcr3(rdcr3());
+                    } else {
+                        invlpg(VADDR);
+                    }
+                    return true;
+                }
                 goto not_cow;
             }
 

@@ -14,6 +14,7 @@
 #include <platform/loader/elf_loader.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/mm.hpp>
+#include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -69,6 +70,22 @@ auto boot_file_path_matches(const BootFileCacheEntry& entry, const char* path) -
     size_t const ENTRY_LEN = std::strlen(entry.path.data());
     size_t const PATH_LEN = std::strlen(path);
     return ENTRY_LEN == PATH_LEN && std::strncmp(entry.path.data(), path, PATH_LEN) == 0;
+}
+
+auto infer_user_stack_range(const Task* task, uint64_t user_sp, uint64_t& stack_base, uint64_t& stack_size) -> bool {
+    if (task == nullptr || user_sp == 0) {
+        return false;
+    }
+
+    uint64_t const STACK_PAGE = page_align_down(user_sp);
+    for (const auto& range : task->lazy_vmem_ranges) {
+        if (STACK_PAGE >= range.start && STACK_PAGE < range.end) {
+            stack_base = range.start;
+            stack_size = range.end - range.start;
+            return true;
+        }
+    }
+    return false;
 }
 
 void build_boot_file_cache_key(const char* submitter, const char* path, char* out, size_t out_size) {
@@ -758,6 +775,12 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
 
     // Share the parent's pagemap - do NOT create a new one
     t->pagemap = parent->pagemap;
+    t->entry = parent->entry;
+    t->program_header_addr = parent->program_header_addr;
+    t->elf_header_addr = parent->elf_header_addr;
+    t->program_header_count = parent->program_header_count;
+    t->program_header_ent_size = parent->program_header_ent_size;
+    t->interp_base = parent->interp_base;
     t->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
     if (!t->lazy_vmem_ranges.clone_from(parent->lazy_vmem_ranges)) {
         delete[] t->name;
@@ -768,11 +791,15 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
 
     // Thread struct: only fsbase and stack are meaningful; mlibc manages the TLS allocation
     auto* thr = new threading::Thread{};
+    uint64_t stack_base = 0;
+    uint64_t stack_size = 0;
+    (void)infer_user_stack_range(t, user_sp, stack_base, stack_size);
     thr->magic = 0xDEADBEEF;
     thr->fsbase = tcb_vaddr;
     thr->gsbase = 0;
     thr->stack = user_sp;
-    thr->stack_size = 0;
+    thr->stack_size = stack_size;
+    thr->stack_base_virt = stack_base;
     thr->tls_size = 0;
     thr->tls_base_virt = 0;
     thr->tls_phys_ptr = 0;
