@@ -6,6 +6,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 REMOTE_COMPUTE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_compute.cpp"
+REMOTE_COMPUTE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_compute.hpp"
+REMOTE_COMPUTE_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_remote_compute_ktest.cpp"
 
 
 def fail(message: str) -> None:
@@ -35,6 +37,12 @@ def require_order(body: str, before: str, after: str, context: str) -> None:
     after_pos = body.find(after)
     if before_pos < 0 or after_pos < 0 or before_pos >= after_pos:
         fail(f"{context}: expected {before!r} before {after!r}")
+
+
+def require_tokens(source: str, tokens: list[str], context: str) -> None:
+    missing = [token for token in tokens if token not in source]
+    if missing:
+        fail(f"{context}: missing {', '.join(missing)}")
 
 
 def test_peer_cleanup_marks_all_targeted_submits_terminal_failure() -> None:
@@ -106,7 +114,7 @@ def test_task_wait_consumes_completed_submitted_row() -> None:
     require_order(
         body,
         "if (!task->active)",
-        "task->complete_wait_entry = &wait;",
+        "publish_task_complete_waiter_locked(task, wait)",
         "wki_task_wait must not publish complete_wait_entry for already-completed rows",
     )
     inactive_block = body[body.find("if (!task->active)") : body.find("// V2 I-4")]
@@ -121,6 +129,67 @@ def test_task_wait_consumes_completed_submitted_row() -> None:
         fail("wki_task_wait must not use the active-only submitted-task lookup")
     if "wki_remote_compute_selftest_task_wait_consumes_completed_row" not in source:
         fail("remote-compute KTEST selftest must cover waiting after TASK_COMPLETE made the row inactive")
+
+
+def test_task_wait_completion_slot_is_single_owner() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    header = REMOTE_COMPUTE_HPP.read_text()
+    ktest = REMOTE_COMPUTE_KTEST.read_text()
+
+    publish_body = function_body(source, "publish_task_complete_waiter_locked")
+    require_tokens(
+        publish_body,
+        [
+            "task->complete_pending.load(std::memory_order_acquire)",
+            "return false",
+            "task->complete_wait_entry = &wait",
+            "task->complete_pending.store(true, std::memory_order_release)",
+        ],
+        "task wait publish helper",
+    )
+
+    clear_body = function_body(source, "clear_task_complete_waiter_after_wait_locked")
+    require_tokens(
+        clear_body,
+        [
+            "WAIT_SLOT_OWNED = task->complete_wait_entry == &wait",
+            "if (WAIT_SLOT_OWNED)",
+            "task->complete_wait_entry = nullptr",
+            "wait_result == WKI_ERR_TIMEOUT && WAIT_SLOT_OWNED",
+            "task->complete_pending.store(false, std::memory_order_release)",
+        ],
+        "task wait timeout cleanup helper",
+    )
+
+    wait_body = function_body(source, "wki_task_wait")
+    require_order(
+        wait_body,
+        "if (!publish_task_complete_waiter_locked(task, wait))",
+        "wki_wait_for_op(&wait, timeout_us)",
+        "wki_task_wait must publish before waiting",
+    )
+    require_order(
+        wait_body,
+        "clear_task_complete_waiter_after_wait_locked(task, wait, WAIT_RC, completed_exit_status)",
+        "if (WAIT_RC == WKI_ERR_TIMEOUT)",
+        "wki_task_wait must perform ownership cleanup before timeout return",
+    )
+    if "task->complete_wait_entry = nullptr;" in wait_body:
+        fail("wki_task_wait must clear complete_wait_entry through the ownership helper")
+    if "task->complete_pending.store(false" in wait_body:
+        fail("wki_task_wait must clear complete_pending only through the ownership helper")
+
+    token = "wki_remote_compute_selftest_task_wait_timeout_preserves_successor"
+    require_tokens(source, [f"auto {token}() -> bool"], "task wait timeout successor selftest implementation")
+    require_tokens(header, [f"auto {token}() -> bool;"], "task wait timeout successor selftest declaration")
+    require_tokens(
+        ktest,
+        [
+            "TaskWaitTimeoutPreservesSuccessor",
+            token,
+        ],
+        "task wait timeout successor KTEST coverage",
+    )
 
 
 def test_receiver_path_localization_bounds_suffix_scan() -> None:
@@ -184,6 +253,7 @@ def main() -> None:
     test_peer_cleanup_marks_all_targeted_submits_terminal_failure()
     test_proxy_wait_completion_respects_waitpid_publish_fence()
     test_task_wait_consumes_completed_submitted_row()
+    test_task_wait_completion_slot_is_single_owner()
     test_receiver_path_localization_bounds_suffix_scan()
     test_vfs_ref_loader_rejects_null_or_empty_path_before_vfs_use()
     test_vfs_ref_loader_deadlines_are_saturating()

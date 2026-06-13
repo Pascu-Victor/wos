@@ -326,6 +326,35 @@ void finish_or_wait_for_cancelled_waiter(WkiWaitEntry& wait, bool claimed, int r
     }
 }
 
+// s_compute_lock must be held by caller.
+auto publish_task_complete_waiter_locked(SubmittedTask* task, WkiWaitEntry& wait) -> bool {
+    if (task == nullptr || task->complete_pending.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    task->complete_wait_entry = &wait;
+    task->complete_pending.store(true, std::memory_order_release);
+    return true;
+}
+
+// s_compute_lock must be held by caller.
+auto clear_task_complete_waiter_after_wait_locked(SubmittedTask* task, WkiWaitEntry& wait, int wait_result, int32_t& completed_exit_status)
+    -> bool {
+    if (task == nullptr) {
+        return false;
+    }
+
+    bool const WAIT_SLOT_OWNED = task->complete_wait_entry == &wait;
+    if (WAIT_SLOT_OWNED) {
+        task->complete_wait_entry = nullptr;
+    }
+    completed_exit_status = task->exit_status;
+    if (wait_result == WKI_ERR_TIMEOUT && WAIT_SLOT_OWNED) {
+        task->complete_pending.store(false, std::memory_order_release);
+    }
+    return WAIT_SLOT_OWNED;
+}
+
 // s_compute_lock must be held by caller
 auto find_remote_load(uint16_t node_id) -> RemoteNodeLoad* {
     for (auto& rl : g_remote_loads) {
@@ -2020,8 +2049,10 @@ auto wki_task_wait(uint32_t task_id, int32_t* exit_status, uint64_t timeout_us) 
 
     // V2 I-4: Set up async wait entry before marking pending
     WkiWaitEntry wait = {};
-    task->complete_wait_entry = &wait;
-    task->complete_pending.store(true, std::memory_order_release);
+    if (!publish_task_complete_waiter_locked(task, wait)) {
+        s_compute_lock.unlock();
+        return -1;
+    }
     s_compute_lock.unlock();
 
     perf_record_compute_begin(ker::mod::perf::WkiPerfComputeOp::COMPLETE_WAIT, TARGET_NODE, task_id, 0, CALLSITE);
@@ -2033,13 +2064,9 @@ auto wki_task_wait(uint32_t task_id, int32_t* exit_status, uint64_t timeout_us) 
     task = find_submitted_task_any(task_id);
     if (task != nullptr) {
         task_still_present = true;
-        task->complete_wait_entry = nullptr;
-        completed_exit_status = task->exit_status;
+        static_cast<void>(clear_task_complete_waiter_after_wait_locked(task, wait, WAIT_RC, completed_exit_status));
     }
     if (WAIT_RC == WKI_ERR_TIMEOUT) {
-        if (task != nullptr) {
-            task->complete_pending.store(false, std::memory_order_relaxed);
-        }
         s_compute_lock.unlock();
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::COMPLETE_WAIT, TARGET_NODE, task_id, WAIT_RC,
                                 static_cast<uint32_t>(wki_now_us() - STARTED_US), 0, CALLSITE);
@@ -2610,6 +2637,40 @@ auto wki_remote_compute_selftest_task_wait_consumes_completed_row() -> bool {
     s_compute_lock.unlock();
 
     return WAIT_RC == 0 && observed_status == EXIT_STATUS;
+}
+
+auto wki_remote_compute_selftest_task_wait_timeout_preserves_successor() -> bool {
+    SubmittedTask task;
+    WkiWaitEntry pending_wait = {};
+    WkiWaitEntry contender_wait = {};
+    WkiWaitEntry stale_wait = {};
+    WkiWaitEntry owned_wait = {};
+
+    task.active = true;
+    task.task_id = 0xC10000U;
+    task.target_node = 0x7A24;
+    task.exit_status = 33;
+    task.complete_wait_entry = &pending_wait;
+    task.complete_pending.store(true, std::memory_order_release);
+
+    bool const BUSY_REJECTED = !publish_task_complete_waiter_locked(&task, contender_wait) && task.complete_wait_entry == &pending_wait &&
+                               task.complete_pending.load(std::memory_order_acquire);
+
+    int32_t observed_status = 0;
+    bool const STALE_OWNED = clear_task_complete_waiter_after_wait_locked(&task, stale_wait, WKI_ERR_TIMEOUT, observed_status);
+    bool const SUCCESSOR_PRESERVED = !STALE_OWNED && task.complete_wait_entry == &pending_wait &&
+                                     task.complete_pending.load(std::memory_order_acquire) && observed_status == task.exit_status;
+
+    task.complete_wait_entry = nullptr;
+    task.complete_pending.store(false, std::memory_order_release);
+    bool const PUBLISHED_AFTER_CLEAR = publish_task_complete_waiter_locked(&task, owned_wait) && task.complete_wait_entry == &owned_wait &&
+                                       task.complete_pending.load(std::memory_order_acquire);
+
+    bool const OWNED_CLEARED = clear_task_complete_waiter_after_wait_locked(&task, owned_wait, WKI_ERR_TIMEOUT, observed_status) &&
+                               task.complete_wait_entry == nullptr && !task.complete_pending.load(std::memory_order_acquire) &&
+                               observed_status == task.exit_status;
+
+    return BUSY_REJECTED && SUCCESSOR_PRESERVED && PUBLISHED_AFTER_CLEAR && OWNED_CLEARED;
 }
 #endif
 

@@ -276,6 +276,7 @@ void wki_remote_compute_notify_pending_submit();
 auto wki_remote_compute_selftest_cleanup_marks_unready_proxy_failure() -> bool;
 auto wki_remote_compute_selftest_proxy_wait_completion_respects_publish_fence() -> bool;
 auto wki_remote_compute_selftest_task_wait_consumes_completed_row() -> bool;
+auto wki_remote_compute_selftest_task_wait_timeout_preserves_successor() -> bool;
 #endif
 
 // -----------------------------------------------------------------------------

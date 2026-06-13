@@ -12,3 +12,7 @@ KTEST(WkiRemoteCompute, ProxyWaitCompletionRespectsPublishFence) {
 KTEST(WkiRemoteCompute, TaskWaitConsumesCompletedRow) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_task_wait_consumes_completed_row());
 }
+
+KTEST(WkiRemoteCompute, TaskWaitTimeoutPreservesSuccessor) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_task_wait_timeout_preserves_successor());
+}
