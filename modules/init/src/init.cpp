@@ -4,6 +4,7 @@
 #include <time.h>  // NOLINT(modernize-deprecated-headers): WOS POSIX sleep declarations live here.
 
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <ctime>
 #include <utility>
@@ -18,6 +19,11 @@ namespace {
 
 using init_log = wos::journal<"init">;
 
+constexpr int PIVOT_ROOT_MAX_ATTEMPTS = 100;
+constexpr long PIVOT_ROOT_RETRY_MS = 50;
+constexpr const char* ROOTFS_MOUNTPOINT = "/rootfs";
+constexpr const char* OLD_ROOT_MOUNTPOINT = "/rootfs/oldroot";
+
 // Simple atoi implementation
 int simple_atoi(const char* str) {
     int result = 0;
@@ -26,6 +32,34 @@ int simple_atoi(const char* str) {
         str++;
     }
     return result;
+}
+
+void sleep_ms(long milliseconds) {
+    struct timespec const SLEEP{
+        .tv_sec = milliseconds / 1000,
+        .tv_nsec = (milliseconds % 1000) * 1000L * 1000L,
+    };
+    nanosleep(&SLEEP, nullptr);
+}
+
+auto pivot_root_with_busy_retry(uint64_t cpuno) -> int {
+    int ret = 0;
+    for (int attempt = 1; attempt <= PIVOT_ROOT_MAX_ATTEMPTS; ++attempt) {
+        ret = ker::abi::vfs::pivot_root_vfs(ROOTFS_MOUNTPOINT, OLD_ROOT_MOUNTPOINT);
+        if (ret != -EBUSY) {
+            return ret;
+        }
+        if (attempt == PIVOT_ROOT_MAX_ATTEMPTS) {
+            break;
+        }
+
+        if (attempt == 1 || (attempt % 10) == 0) {
+            init_log::warn("init[%llu]: pivot_root busy (attempt %d/%d), retrying", static_cast<unsigned long long>(cpuno), attempt,
+                           PIVOT_ROOT_MAX_ATTEMPTS);
+        }
+        sleep_ms(PIVOT_ROOT_RETRY_MS);
+    }
+    return ret;
 }
 
 }  // namespace
@@ -83,7 +117,7 @@ auto main(int argc, char** argv) -> int {
     // Pivot root from initramfs to the real rootfs.
     // After mount_filesystems(), the XFS rootfs is mounted at /rootfs.
     // pivot_root makes it appear as "/" for this task and all children.
-    int const PIVOT_RET = ker::abi::vfs::pivot_root_vfs("/rootfs", "/rootfs/oldroot");
+    int const PIVOT_RET = pivot_root_with_busy_retry(CPUNO);
     if (PIVOT_RET < 0) {
         init_log::warn("init[%llu]: pivot_root failed (ret=%d), continuing with initramfs root", static_cast<unsigned long long>(CPUNO),
                        PIVOT_RET);

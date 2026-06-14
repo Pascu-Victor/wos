@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
+INIT_CPP = ROOT / "modules" / "init" / "src" / "init.cpp"
 SERVICES_CPP = ROOT / "modules" / "init" / "src" / "services.cpp"
 NETWORK_CPP = ROOT / "modules" / "init" / "src" / "network.cpp"
 
@@ -131,7 +132,28 @@ def test_network_startup_poll_is_deadline_bounded() -> None:
     )
 
 
+def test_pivot_root_retries_transient_busy_mount_refs() -> None:
+    source = INIT_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "#include <cerrno>",
+            "PIVOT_ROOT_MAX_ATTEMPTS",
+            "PIVOT_ROOT_RETRY_MS",
+            "pivot_root_with_busy_retry",
+            "ret = ker::abi::vfs::pivot_root_vfs(ROOTFS_MOUNTPOINT, OLD_ROOT_MOUNTPOINT)",
+            "if (ret != -EBUSY)",
+            "init_log::warn(\"init[%llu]: pivot_root busy (attempt %d/%d), retrying\"",
+            "sleep_ms(PIVOT_ROOT_RETRY_MS)",
+            "int const PIVOT_RET = pivot_root_with_busy_retry(CPUNO)",
+            "pivot_root failed (ret=%d), continuing with initramfs root",
+        ],
+        "init pivot_root transient busy retry",
+    )
+
+
 def main() -> None:
+    test_pivot_root_retries_transient_busy_mount_refs()
     test_dropbear_keygen_wait_is_deadline_bounded()
     test_network_startup_poll_is_deadline_bounded()
     print("init dropbear key generation and network readiness waits are deadline bounded")
