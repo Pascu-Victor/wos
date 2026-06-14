@@ -663,7 +663,8 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
 
     // FIXED: Parse ELF first to get actual TLS size, then create thread
     ker::loader::elf::TlsModule const ACTUAL_TLS_INFO = loader::elf::extract_tls_info(reinterpret_cast<void*>(elf_start));
-    this->thread = threading::create_thread(ker::mod::mm::USER_STACK_SIZE, ACTUAL_TLS_INFO.tls_size, this->pagemap, ACTUAL_TLS_INFO);
+    this->thread =
+        threading::create_thread(ker::mod::mm::USER_STACK_SIZE, ACTUAL_TLS_INFO.tls_size, this->pagemap, this->pid, ACTUAL_TLS_INFO);
     if (this->thread == nullptr) {
         dbg::log("Failed to create thread for task %s - OOM", name);
         // Can't continue without a thread - this is a fatal error for the task

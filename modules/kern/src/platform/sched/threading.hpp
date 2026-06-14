@@ -34,7 +34,7 @@ struct Thread {
 
 void init_threading();
 
-Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTable* page_table,
+Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTable* page_table, uint64_t initial_tid,
                       const ker::loader::elf::TlsModule& tls_info);
 void destroy_thread(Thread* thread);
 bool ensure_stack_backing(Thread* thread, mm::paging::PageTable* page_table, uint64_t start, uint64_t end);

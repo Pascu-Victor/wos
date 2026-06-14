@@ -145,7 +145,7 @@ bool handle_lazy_stack_fault(Thread* thread, mm::paging::PageTable* page_table, 
     return ensure_stack_backing(thread, page_table, low, high);
 }
 
-Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTable* page_table,
+Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTable* page_table, uint64_t initial_tid,
                       const ker::loader::elf::TlsModule& tls_info) {
     auto* thread = new Thread();
     if (thread == nullptr) {
@@ -235,8 +235,8 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
     tcb_ptr[2] = 0;              // dtvPointers (can be null for now)
 
     auto* tcb_i32 = static_cast<uint32_t*>(tcb);
-    tcb_i32[6] = 0;  // tid (will be set later)
-    tcb_i32[7] = 0;  // didExit
+    tcb_i32[6] = static_cast<uint32_t>(initial_tid);  // tid, used by mlibc futex locks
+    tcb_i32[7] = 0;                                   // didExit
 
     // CRITICAL: Set the stack canary at offset 0x28 (40 decimal)
     tcb_ptr[5] = 0x3000000018ULL;  // stackCanary at fs:[0x28]

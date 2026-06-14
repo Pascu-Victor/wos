@@ -1248,7 +1248,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 
     // --- Create new thread (user stack + TLS) ---
     ker::loader::elf::TlsModule const TLS_INFO = loader::elf::extract_tls_info(static_cast<void*>(elf_buffer));
-    auto* new_thread = mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, new_pagemap, TLS_INFO);
+    auto* new_thread =
+        mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, new_pagemap, task->pid, TLS_INFO);
     char* new_name = nullptr;
     auto cleanup_new_image = [&]() {
         if (new_pagemap != nullptr) {

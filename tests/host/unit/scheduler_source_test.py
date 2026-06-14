@@ -6,6 +6,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 SCHEDULER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.cpp"
+THREADING_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.cpp"
+THREADING_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.hpp"
+TASK_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.cpp"
+EXEC_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "exec.cpp"
+THREAD_CONTROL_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "multiproc" / "threadControl.cpp"
 SCHEDULER_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "scheduler_ktest.cpp"
 
 
@@ -15,7 +20,7 @@ def fail(message: str) -> None:
 
 def function_body(source: str, name: str) -> str:
     match = re.search(
-        rf"\b(?:auto|void)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
+        rf"\b(?:auto|void|Thread\*)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
         source,
         flags=re.DOTALL,
     )
@@ -125,9 +130,67 @@ def test_runtime_accounting_deltas_are_saturating() -> None:
     )
 
 
+def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
+    threading_source = THREADING_CPP.read_text()
+    threading_header = THREADING_HPP.read_text()
+    task_source = TASK_CPP.read_text()
+    exec_source = EXEC_CPP.read_text()
+    thread_control_source = THREAD_CONTROL_CPP.read_text()
+
+    require_tokens(
+        threading_header,
+        ["create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTable* page_table, uint64_t initial_tid"],
+        "threading create_thread TID contract",
+    )
+
+    create_thread_body = function_body(threading_source, "create_thread")
+    require_tokens(
+        create_thread_body,
+        [
+            "tcb_i32[6] = static_cast<uint32_t>(initial_tid);",
+            "used by mlibc futex locks",
+        ],
+        "initial user TCB tid publish",
+    )
+    if "tcb_i32[6] = 0" in create_thread_body:
+        fail("initial user TCB tid must not be left as zero; mlibc futex locks use zero as unlocked")
+
+    require_tokens(
+        task_source,
+        [
+            "static uint64_t next_pid = 1",
+            "this->pid = sched::task::get_next_pid();",
+            "threading::create_thread(ker::mod::mm::USER_STACK_SIZE, ACTUAL_TLS_INFO.tls_size, this->pagemap, this->pid",
+        ],
+        "fresh process TCB tid publish",
+    )
+    require_order(
+        task_source,
+        "this->pid = sched::task::get_next_pid();",
+        "threading::create_thread(ker::mod::mm::USER_STACK_SIZE, ACTUAL_TLS_INFO.tls_size, this->pagemap, this->pid",
+        "fresh process must allocate a PID before building the initial TCB",
+    )
+
+    require_tokens(
+        exec_source,
+        [
+            "mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, new_pagemap, task->pid",
+        ],
+        "execve replacement TCB tid publish",
+    )
+
+    require_order(
+        thread_control_source,
+        "publish_thread_tid_to_tcb(parent, tcb_va, t->pid)",
+        "mod::sched::post_task_for_cpu(TARGET_CPU, t)",
+        "secondary pthread TCB tid must be published before scheduling",
+    )
+
+
 def main() -> None:
     test_event_wake_cancel_preserves_current_task_wakeup_token()
     test_runtime_accounting_deltas_are_saturating()
+    test_user_thread_tcbs_publish_nonzero_tid_before_user_execution()
     print("scheduler wake-token and runtime accounting invariants hold")
 
 
