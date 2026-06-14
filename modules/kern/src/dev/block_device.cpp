@@ -1,6 +1,7 @@
 #include "block_device.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -29,6 +30,27 @@ auto max_io_blocks(BlockDevice const* bdev) -> size_t {
         return 1;
     }
     return std::max<size_t>(1, MAX_BLOCK_IO_BYTES / bdev->block_size);
+}
+
+auto whole_disk_for(BlockDevice const* bdev) -> BlockDevice const* {
+    while (bdev != nullptr && bdev->is_partition && bdev->parent_disk != nullptr) {
+        bdev = bdev->parent_disk;
+    }
+    return bdev;
+}
+
+auto block_range_start(BlockDevice const* bdev) -> uint64_t {
+    return (bdev != nullptr && bdev->is_partition) ? bdev->partition_start_lba : 0;
+}
+
+auto block_range_end(BlockDevice const* bdev) -> uint64_t {
+    if (bdev == nullptr) {
+        return 0;
+    }
+    if (bdev->is_partition) {
+        return bdev->partition_end_lba;
+    }
+    return bdev->total_blocks == 0 ? 0 : bdev->total_blocks - 1;
 }
 }  // namespace
 
@@ -166,6 +188,10 @@ auto block_write(BlockDevice* bdev, uint64_t block, size_t count, const void* bu
         return -1;
     }
 
+    if (block_device_is_read_only(bdev)) {
+        return -EROFS;
+    }
+
     if (block > bdev->total_blocks || count > bdev->total_blocks - block) {
         log::warn("block_write: write past end of device: block=%lu count=%lu total=%lu caller=%p", static_cast<unsigned long>(block),
                   static_cast<unsigned long>(count), static_cast<unsigned long>(bdev->total_blocks), __builtin_return_address(0));
@@ -294,6 +320,7 @@ auto block_device_create_partition(BlockDevice* parent_disk, uint64_t start_lba,
     part->flush = partition_flush;
     part->private_data = nullptr;
     part->remotable = parent_disk->remotable;
+    part->read_only = parent_disk->read_only;
 
     part->is_partition = true;
     std::copy_n(partuuid, part->partuuid.size(), part->partuuid.begin());
@@ -337,6 +364,39 @@ auto block_device_init() -> void {
     }
 
     log::debug("Block device init complete: %d devices registered", static_cast<unsigned>(block_devices.size()));
+}
+
+auto block_devices_overlap(const BlockDevice* lhs, const BlockDevice* rhs) -> bool {
+    if (lhs == nullptr || rhs == nullptr) {
+        return false;
+    }
+
+    if (whole_disk_for(lhs) != whole_disk_for(rhs)) {
+        return false;
+    }
+
+    uint64_t const LHS_START = block_range_start(lhs);
+    uint64_t const LHS_END = block_range_end(lhs);
+    uint64_t const RHS_START = block_range_start(rhs);
+    uint64_t const RHS_END = block_range_end(rhs);
+    return LHS_START <= RHS_END && RHS_START <= LHS_END;
+}
+
+auto block_device_set_read_only(BlockDevice* bdev, bool read_only) -> void {
+    if (bdev == nullptr) {
+        return;
+    }
+
+    for (auto* dev : block_devices) {
+        if (dev != nullptr && block_devices_overlap(dev, bdev)) {
+            dev->read_only = read_only;
+        }
+    }
+    bdev->read_only = read_only;
+}
+
+auto block_device_is_read_only(const BlockDevice* bdev) -> bool {
+    return bdev != nullptr && (bdev->read_only || (bdev->is_partition && bdev->parent_disk != nullptr && bdev->parent_disk->read_only));
 }
 
 }  // namespace ker::dev

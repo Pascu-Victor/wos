@@ -5,8 +5,11 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <dev/block_device.hpp>
 #include <dev/gpt.hpp>
+#include <net/wki/dev_server.hpp>
 #include <net/wki/event.hpp>
+#include <net/wki/remotable.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -15,6 +18,7 @@
 #include <platform/sys/spinlock.hpp>
 #include <util/smallvec.hpp>
 #include <vfs/fs/fat32.hpp>
+#include <vfs/fs/xfs/xfs_mount.hpp>
 #include <vfs/fs/xfs/xfs_vfs.hpp>
 
 #include "vfs/file.hpp"
@@ -34,9 +38,170 @@ uint32_t next_dev_id = 1;
 using log = ker::mod::dbg::logger<"vfs_mount">;
 
 constexpr size_t MAX_MOUNT_PATH = 512;
+constexpr size_t MAX_MOUNT_COMPONENTS = 64;
 
 auto path_is_under_root(const char* path, const char* root, size_t root_len) -> bool {
     return std::strncmp(path, root, root_len) == 0 && (path[root_len] == '/' || path[root_len] == '\0');
+}
+
+auto copy_mount_path_string(const char* path, char* out, size_t outsize) -> int {
+    if (path == nullptr || out == nullptr || outsize == 0) {
+        return -EINVAL;
+    }
+
+    size_t const PATH_LEN = std::strlen(path);
+    if (PATH_LEN + 1 > outsize) {
+        return -ENAMETOOLONG;
+    }
+
+    std::memcpy(out, path, PATH_LEN + 1);
+    return 0;
+}
+
+auto make_mount_path_absolute(const char* path, char* out, size_t outsize) -> int {
+    if (path == nullptr || out == nullptr || outsize == 0) {
+        return -EINVAL;
+    }
+
+    size_t const PATH_LEN = std::strlen(path);
+    if (PATH_LEN == 0) {
+        return -EINVAL;
+    }
+
+    if (path[0] == '/') {
+        return copy_mount_path_string(path, out, outsize);
+    }
+
+    if (!ker::mod::sched::can_query_current_task()) {
+        return -ESRCH;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+
+    size_t const CWD_LEN = std::strlen(task->cwd.data());
+    if (CWD_LEN == 0) {
+        return -EINVAL;
+    }
+
+    bool const NEED_SEP = CWD_LEN > 1;
+    size_t const TOTAL = CWD_LEN + (NEED_SEP ? 1 : 0) + PATH_LEN + 1;
+    if (TOTAL > outsize) {
+        return -ENAMETOOLONG;
+    }
+
+    std::memcpy(out, task->cwd.data(), CWD_LEN);
+    if (NEED_SEP) {
+        out[CWD_LEN] = '/';
+        std::memcpy(out + CWD_LEN + 1, path, PATH_LEN + 1);
+    } else {
+        std::memcpy(out + CWD_LEN, path, PATH_LEN + 1);
+    }
+    return 0;
+}
+
+auto canonicalize_mount_path(char* path, size_t bufsize) -> int {
+    if (path == nullptr || bufsize == 0 || path[0] != '/') {
+        return -EINVAL;
+    }
+
+    std::array<const char*, MAX_MOUNT_COMPONENTS> components{};
+    size_t num_components = 0;
+
+    char* p = path + 1;
+    while (*p != '\0') {
+        while (*p == '/') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+
+        char const* comp_start = p;
+        while (*p != '\0' && *p != '/') {
+            p++;
+        }
+
+        char const SAVED = *p;
+        *p = '\0';
+
+        if (comp_start[0] == '.' && comp_start[1] == '\0') {
+            // Skip ".".
+        } else if (comp_start[0] == '.' && comp_start[1] == '.' && comp_start[2] == '\0') {
+            if (num_components > 0) {
+                num_components--;
+            }
+        } else {
+            if (num_components >= components.size()) {
+                return -ENAMETOOLONG;
+            }
+            components[num_components++] = comp_start;
+        }
+
+        if (SAVED == '/') {
+            p++;
+        }
+    }
+
+    std::array<char, MAX_MOUNT_PATH> result{};
+    size_t pos = 0;
+    result[pos++] = '/';
+
+    for (size_t i = 0; i < num_components; ++i) {
+        if (i > 0) {
+            if (pos >= result.size() - 1) {
+                return -ENAMETOOLONG;
+            }
+            result[pos++] = '/';
+        }
+
+        size_t const COMP_LEN = std::strlen(components[i]);
+        if (pos + COMP_LEN >= result.size()) {
+            return -ENAMETOOLONG;
+        }
+
+        std::memcpy(result.data() + pos, components[i], COMP_LEN);
+        pos += COMP_LEN;
+    }
+    result[pos] = '\0';
+
+    if (pos >= bufsize) {
+        return -ENAMETOOLONG;
+    }
+
+    std::memcpy(path, result.data(), pos + 1);
+    return 0;
+}
+
+auto apply_current_task_root_prefix(const char* path, char* out, size_t outsize) -> int {
+    if (path == nullptr || out == nullptr || outsize == 0) {
+        return -EINVAL;
+    }
+
+    if (ker::mod::sched::can_query_current_task()) {
+        auto* task = ker::mod::sched::get_current_task();
+        if (task != nullptr) {
+            size_t const ROOT_LEN = std::strlen(task->root.data());
+            if (ROOT_LEN > 1) {
+                size_t const PATH_LEN = std::strlen(path);
+                if (ROOT_LEN + PATH_LEN + 1 > outsize) {
+                    return -ENAMETOOLONG;
+                }
+
+                if (out == path) {
+                    std::memmove(out + ROOT_LEN, out, PATH_LEN + 1);
+                } else {
+                    std::memcpy(out + ROOT_LEN, path, PATH_LEN + 1);
+                }
+                std::memcpy(out, task->root.data(), ROOT_LEN);
+                return 0;
+            }
+        }
+    }
+
+    return copy_mount_path_string(path, out, outsize);
 }
 
 auto mount_has_active_refs_locked(const MountPoint* mount) -> bool {
@@ -65,10 +230,29 @@ auto replace_mount_path_locked(MountPoint* mount, const char* new_path, size_t n
     return 0;
 }
 
+void destroy_mount_private_data(MountPoint* mount) {
+    if (mount == nullptr || mount->private_data == nullptr) {
+        return;
+    }
+
+    switch (mount->fs_type) {
+        case FSType::FAT32:
+            ker::vfs::fat32::fat32_unmount(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data));
+            break;
+        case FSType::XFS:
+            ker::vfs::xfs::xfs_unmount(static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+            break;
+        default:
+            break;
+    }
+    mount->private_data = nullptr;
+}
+
 void destroy_mount(MountPoint* mount) {
     if (mount == nullptr) {
         return;
     }
+    destroy_mount_private_data(mount);
     delete[] mount->path;
     delete[] mount->fstype;
     delete mount;
@@ -127,30 +311,27 @@ auto mount_point_ref_count_for_test(const MountPoint* mount) -> uint32_t {
 }
 #endif
 
-// Resolve path through current task's root prefix so mount paths are stored
-// in the same namespace that find_mount_point receives from resolve_task_path_raw.
-// After pivot_root("/rootfs", ...), "/wki/node-xxx" -> "/rootfs/wki/node-xxx".
+// Resolve path like resolve_task_path_raw does for mount-table keys:
+// first make relative targets absolute against cwd, then canonicalize, then
+// apply the current task's root prefix. After pivot_root("/rootfs", ...),
+// "mnt" from cwd "/root" becomes "/rootfs/root/mnt".
 auto resolve_mount_path(const char* path, char* out, size_t outsize) -> int {
-    size_t const PATH_LEN = std::strlen(path);
-    if (PATH_LEN + 1 > outsize) {
-        return -ENAMETOOLONG;
+    if (path == nullptr || out == nullptr || outsize == 0) {
+        return -EINVAL;
     }
-    std::memcpy(out, path, PATH_LEN + 1);
 
-    if (ker::mod::sched::can_query_current_task()) {
-        auto* task = ker::mod::sched::get_current_task();
-        if (task != nullptr) {
-            size_t const ROOT_LEN = std::strlen(task->root.data());
-            if (ROOT_LEN > 1) {  // root != "/"
-                if (ROOT_LEN + PATH_LEN + 1 > outsize) {
-                    return -ENAMETOOLONG;
-                }
-                std::memmove(out + ROOT_LEN, out, PATH_LEN + 1);
-                std::memcpy(out, task->root.data(), ROOT_LEN);
-            }
-        }
+    std::array<char, MAX_MOUNT_PATH> logical{};
+    int result = make_mount_path_absolute(path, logical.data(), logical.size());
+    if (result < 0) {
+        return result;
     }
-    return 0;
+
+    result = canonicalize_mount_path(logical.data(), logical.size());
+    if (result < 0) {
+        return result;
+    }
+
+    return apply_current_task_root_prefix(logical.data(), out, outsize);
 }
 
 auto fstype_to_enum(const char* fstype) -> FSType {
@@ -175,6 +356,22 @@ auto fstype_to_enum(const char* fstype) -> FSType {
     return FSType::TMPFS;
 }
 
+auto mounted_block_device_overlaps(const ker::dev::BlockDevice* device) -> bool {
+    if (device == nullptr) {
+        return false;
+    }
+
+    mount_lock.lock();
+    for (auto* mount : mounts) {
+        if (mount != nullptr && mount->device != nullptr && ker::dev::block_devices_overlap(mount->device, device)) {
+            mount_lock.unlock();
+            return true;
+        }
+    }
+    mount_lock.unlock();
+    return false;
+}
+
 auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device) -> int {
     if (path == nullptr || fstype == nullptr) {
         vfs_debug_log("mount_filesystem: invalid arguments\n");
@@ -184,9 +381,10 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     // Resolve through task root prefix so the stored path matches what
     // find_mount_point receives after resolve_task_path_raw.
     std::array<char, MAX_MOUNT_PATH> resolved{};
-    if (resolve_mount_path(path, resolved.data(), resolved.size()) < 0) {
-        vfs_debug_log("mount_filesystem: path too long\n");
-        return -ENAMETOOLONG;
+    int const PATH_RET = resolve_mount_path(path, resolved.data(), resolved.size());
+    if (PATH_RET < 0) {
+        vfs_debug_log("mount_filesystem: path resolution failed\n");
+        return PATH_RET;
     }
 
     auto* mount = new MountPoint;
@@ -214,6 +412,15 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     mount->device = device;
     mount->private_data = nullptr;
     mount->fops = nullptr;
+    mount->read_only = device != nullptr && ker::dev::block_device_is_read_only(device);
+
+    bool const BLOCK_RW_FS = mount->fs_type == FSType::FAT32 || mount->fs_type == FSType::XFS;
+    if (BLOCK_RW_FS && device != nullptr && !ker::dev::block_device_is_read_only(device) &&
+        ker::net::wki::wki_dev_server_block_has_remote_writer(device)) {
+        vfs_debug_log("mount_filesystem: block device has a remote writer\n");
+        destroy_mount(mount);
+        return -EBUSY;
+    }
 
     // Initialize the appropriate filesystem
     if (std::strcmp(fstype, "fat32") == 0 || std::strcmp(fstype, "vfat") == 0) {
@@ -314,6 +521,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     if (ker::net::wki::g_wki.initialized) {
         ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE, ker::net::wki::EVENT_STORAGE_MOUNT, path,
                                          static_cast<uint16_t>(std::strlen(path) + 1));
+        ker::net::wki::wki_resource_advertise_all();
     }
 
     return 0;
@@ -326,8 +534,9 @@ auto unmount_filesystem(const char* path) -> int {
 
     // Resolve through task root prefix to match stored mount paths.
     std::array<char, MAX_MOUNT_PATH> resolved{};
-    if (resolve_mount_path(path, resolved.data(), resolved.size()) < 0) {
-        return -ENAMETOOLONG;
+    int const PATH_RET = resolve_mount_path(path, resolved.data(), resolved.size());
+    if (PATH_RET < 0) {
+        return PATH_RET;
     }
 
     mount_lock.lock();
@@ -353,6 +562,7 @@ auto unmount_filesystem(const char* path) -> int {
             if (ker::net::wki::g_wki.initialized) {
                 ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE, ker::net::wki::EVENT_STORAGE_UNMOUNT, path,
                                                  static_cast<uint16_t>(std::strlen(path) + 1));
+                ker::net::wki::wki_resource_advertise_all();
             }
 
             return 0;
@@ -601,6 +811,7 @@ auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool {
     std::memcpy(static_cast<void*>(out->path), mp->path, PATH_LEN + 1);
     out->fs_type = mp->fs_type;
     out->dev_id = mp->dev_id;
+    out->read_only = mp->read_only;
     if (mp->fstype != nullptr) {
         size_t const FSTYPE_LEN = std::strlen(mp->fstype);
         size_t const COPY_LEN = (FSTYPE_LEN < MOUNT_FSTYPE_MAX) ? FSTYPE_LEN : MOUNT_FSTYPE_MAX - 1;

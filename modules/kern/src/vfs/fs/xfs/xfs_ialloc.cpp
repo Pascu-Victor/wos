@@ -154,7 +154,7 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
                     agi->agi_newino = Be32::from_cpu(AGINO);
                     // Recompute CRC
                     agi->agi_crc = Be32{0};
-                    uint32_t crc = util::crc32c_block_with_cksum(agi, sizeof(XfsAgi), XFS_AGI_CRC_OFF);
+                    uint32_t crc = util::crc32c_block_with_cksum(agi, mount->sect_size, XFS_AGI_CRC_OFF);
                     __builtin_memcpy(&agi->agi_crc, &crc, sizeof(crc));
                     xfs_trans_log_buf(tp, agi_bh, static_cast<uint32_t>(agi_offset), static_cast<uint32_t>(sizeof(XfsAgi)));
                     brelse(agi_bh);
@@ -320,7 +320,7 @@ auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int
         agi->agi_freecount = Be32::from_cpu(pag->agi_freecount);
         // Recompute CRC
         agi->agi_crc = Be32{0};
-        uint32_t crc = util::crc32c_block_with_cksum(agi, sizeof(XfsAgi), XFS_AGI_CRC_OFF);
+        uint32_t crc = util::crc32c_block_with_cksum(agi, mount->sect_size, XFS_AGI_CRC_OFF);
         __builtin_memcpy(&agi->agi_crc, &crc, sizeof(crc));
         xfs_trans_log_buf(tp, agi_bh, static_cast<uint32_t>(agi_offset), static_cast<uint32_t>(sizeof(XfsAgi)));
         brelse(agi_bh);

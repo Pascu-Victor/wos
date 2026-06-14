@@ -271,6 +271,9 @@ enum class ResourceType : uint16_t {  // NOLINT(performance-enum-size)
 
 constexpr uint8_t RESOURCE_FLAG_SHAREABLE = 0x01;
 constexpr uint8_t RESOURCE_FLAG_PASSTHROUGH_CAPABLE = 0x02;
+constexpr uint8_t RESOURCE_FLAG_READABLE = 0x04;
+constexpr uint8_t RESOURCE_FLAG_WRITABLE = 0x08;
+constexpr uint8_t RESOURCE_FLAG_OCCUPIED = 0x10;
 
 struct ResourceAdvertPayload {
     uint16_t node_id;        // owner node
@@ -507,6 +510,23 @@ enum class AttachMode : uint8_t {
     PASSTHROUGH = 1,
 };
 
+constexpr uint8_t DEV_ATTACH_MODE_KIND_MASK = 0x0F;
+constexpr uint8_t DEV_ATTACH_ACCESS_READ = 0x10;
+constexpr uint8_t DEV_ATTACH_ACCESS_WRITE = 0x20;
+constexpr uint8_t DEV_ATTACH_ACCESS_MASK = DEV_ATTACH_ACCESS_READ | DEV_ATTACH_ACCESS_WRITE;
+
+constexpr auto dev_attach_mode_kind(uint8_t mode) -> AttachMode { return static_cast<AttachMode>(mode & DEV_ATTACH_MODE_KIND_MASK); }
+
+constexpr auto dev_attach_requests_read(uint8_t mode) -> bool {
+    uint8_t const ACCESS = mode & DEV_ATTACH_ACCESS_MASK;
+    return ACCESS == 0 || (ACCESS & DEV_ATTACH_ACCESS_READ) != 0;
+}
+
+constexpr auto dev_attach_requests_write(uint8_t mode) -> bool {
+    uint8_t const ACCESS = mode & DEV_ATTACH_ACCESS_MASK;
+    return ACCESS == 0 || (ACCESS & DEV_ATTACH_ACCESS_WRITE) != 0;
+}
+
 struct DevAttachReqPayload {
     uint16_t target_node;
     uint16_t resource_type;  // ResourceType enum
@@ -603,6 +623,7 @@ constexpr uint16_t DEV_ATTACH_RDMA_VFS = 0x0002;        // VFS RDMA available; b
 constexpr uint16_t DEV_ATTACH_RDMA_BULK = 0x0004;       // bulk RDMA transfer supported (large sequential I/O)
 constexpr uint16_t DEV_ATTACH_RDMA_VFS_READ = 0x0008;   // VFS read staging buf available (pull mode); rdma_read_staging_rkey valid
 constexpr uint16_t DEV_ATTACH_RDMA_BULK_PULL = 0x0010;  // VFS bulk staging buf available (pull mode); rdma_bulk_staging_rkey valid
+constexpr uint16_t DEV_ATTACH_READ_ONLY = 0x0020;       // attached device accepts reads but rejects writes
 
 // -----------------------------------------------------------------------------
 // DEV_DETACH Payload - 8 bytes

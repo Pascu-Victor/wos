@@ -29,6 +29,13 @@ struct FAT32MountContext {
     uint32_t data_start_sector;
     uint32_t total_sectors;
     uint32_t root_cluster;
+    uint8_t root_create_time_tenths;
+    uint16_t root_create_time;
+    uint16_t root_create_date;
+    uint16_t root_access_date;
+    uint16_t root_modify_time;
+    uint16_t root_modify_date;
+    bool read_only;
     ker::mod::sys::Spinlock lock;  // Protects concurrent access to this mount
 };
 
@@ -110,6 +117,7 @@ auto fat32_init(void* disk_buffer, size_t disk_size) -> int;
 
 // Initialize FAT32 with a block device - returns mount context
 auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_lba = 0) -> FAT32MountContext*;
+void fat32_unmount(FAT32MountContext* ctx);
 
 // FAT32 filesystem operations
 auto fat32_open_path(const char* path, int flags, int mode, FAT32MountContext* ctx) -> File*;

@@ -49,6 +49,8 @@ namespace {
 
 constexpr uint32_t XFS_SLOW_TRACE_US = 2048;
 constexpr size_t XFS_DIRECT_READ_MIN_BYTES = size_t{64} * 1024;
+constexpr uint64_t XFS_NSEC_PER_SEC = 1000000000ULL;
+constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
 
 // ============================================================================
 // Per-open-file state
@@ -105,6 +107,31 @@ auto perf_current_cpu() -> uint32_t {
 }
 
 auto perf_clamp_u16(uint64_t value) -> uint16_t { return value > UINT16_MAX ? UINT16_MAX : static_cast<uint16_t>(value); }
+
+auto xfs_encode_epoch_timestamp(uint64_t epoch_ns, bool bigtime) -> uint64_t {
+    uint64_t const SEC = epoch_ns / XFS_NSEC_PER_SEC;
+    uint64_t const NSEC = epoch_ns % XFS_NSEC_PER_SEC;
+    if (bigtime) {
+        return ((SEC + static_cast<uint64_t>(XFS_BIGTIME_EPOCH_OFFSET)) * XFS_NSEC_PER_SEC) + NSEC;
+    }
+    return (SEC << 32U) | NSEC;
+}
+
+auto xfs_current_timestamp(const XfsInode* ip) -> uint64_t {
+    bool const BIGTIME = ip != nullptr && (ip->flags2 & XFS_DIFLAG2_BIGTIME) != 0;
+    return xfs_encode_epoch_timestamp(ker::mod::time::get_epoch_ns(), BIGTIME);
+}
+
+void xfs_stamp_new_inode(XfsInode* ip) {
+    if (ip == nullptr) {
+        return;
+    }
+    uint64_t const NOW = xfs_current_timestamp(ip);
+    ip->atime = NOW;
+    ip->mtime = NOW;
+    ip->ctime = NOW;
+    ip->crtime = NOW;
+}
 
 void perf_record_xfs_slow_event(ker::mod::perf::WkiPerfLocalXfsOp op, int32_t status, uint32_t latency_us, uint64_t bytes,
                                 uint64_t callsite) {
@@ -1311,6 +1338,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         ip->data_fork.extents.list = nullptr;
         ip->data_fork.extents.count = 0;
         ip->nextents = 0;
+        xfs_stamp_new_inode(ip);
         ip->dirty = true;
 
         // Commit the new inode's core fields to disk so they persist.
@@ -1696,6 +1724,7 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
     new_ip->data_fork.format = XFS_DINODE_FMT_LOCAL;
     new_ip->data_fork.local.data = sf_data;
     new_ip->data_fork.local.size = static_cast<uint32_t>(SF_SIZE);
+    xfs_stamp_new_inode(new_ip);
     new_ip->dirty = true;
 
     XfsTransaction* tp2 = xfs_trans_alloc(ctx);
@@ -2078,7 +2107,7 @@ auto xfs_vfs_init_device(dev::BlockDevice* device) -> XfsMountContext* {
     }
 
     XfsMountContext* ctx = nullptr;
-    int ret = xfs_mount(device, false /* read_write */, &ctx);
+    int ret = xfs_mount(device, dev::block_device_is_read_only(device), &ctx);
     if (ret != 0) {
         log::error("mount failed with error %d", ret);
         return nullptr;

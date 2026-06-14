@@ -87,6 +87,11 @@ constexpr size_t PIPE_WAKE_BATCH = 32;
 constexpr size_t PIPE_DEFAULT_CAPACITY = 256UL * 1024UL;
 constexpr size_t PIPE_DIRECT_MAX_CAPACITY = 256UL * 1024UL;
 
+auto open_flags_require_fs_write(int flags) -> bool {
+    int const ACCMODE = flags & 3;
+    return ACCMODE == 1 || ACCMODE == 2 || (flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0;
+}
+
 struct StreamCacheIdentity;
 struct StreamFreshnessStamp;
 
@@ -1008,6 +1013,24 @@ auto stream_scope_key_for_mount(const MountPoint* mount) -> const void* {
     return mount;
 }
 
+void fill_tmpfs_stat_timestamps(const ker::vfs::tmpfs::TmpNode* node, Stat* statbuf) {
+    if (node == nullptr || statbuf == nullptr) {
+        return;
+    }
+    statbuf->st_atim = node->atime;
+    statbuf->st_mtim = node->mtime;
+    statbuf->st_ctim = node->ctime;
+}
+
+void fill_devfs_stat_timestamps(const ker::vfs::devfs::DevFSNode* node, Stat* statbuf) {
+    if (node == nullptr || statbuf == nullptr) {
+        return;
+    }
+    statbuf->st_atim = node->atime;
+    statbuf->st_mtim = node->mtime;
+    statbuf->st_ctim = node->ctime;
+}
+
 auto vfs_stream_cache_get_file_stat(File* file, Stat* statbuf) -> int {
     if (file == nullptr || statbuf == nullptr) {
         return -EINVAL;
@@ -1049,6 +1072,7 @@ auto vfs_stream_cache_get_file_stat(File* file, Stat* statbuf) -> int {
                     statbuf->st_mode = S_IFLNK | node->mode;
                     break;
             }
+            fill_tmpfs_stat_timestamps(node, statbuf);
             return 0;
         }
         case FSType::FAT32: {
@@ -3196,6 +3220,10 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     log_loader_path_event("mount-found", raw_path.data(), path_buffer.data(), mount, 0);
 
     const char* fs_relative_path = strip_mount_prefix(mount, path_buffer.data());
+    if (mount->read_only && open_flags_require_fs_write(backend_flags)) {
+        log_loader_path_event("open-readonly", raw_path.data(), path_buffer.data(), mount, -EROFS);
+        return -EROFS;
+    }
 
     ker::vfs::File* f = nullptr;
 
@@ -4293,6 +4321,7 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
                     statbuf->st_mode = S_IFLNK | node->mode;
                     break;
             }
+            fill_tmpfs_stat_timestamps(node, statbuf);
             result = 0;
             break;
         }
@@ -4326,6 +4355,7 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
             } else {
                 statbuf->st_mode = S_IFCHR | node->mode;
             }
+            fill_devfs_stat_timestamps(node, statbuf);
             result = 0;
             break;
         }
@@ -4436,6 +4466,7 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
                     statbuf->st_mode = S_IFLNK | node->mode;
                     break;
             }
+            fill_tmpfs_stat_timestamps(node, statbuf);
             return 0;
         }
         case FSType::FAT32: {
@@ -4446,7 +4477,7 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
             return R;
         }
         case FSType::DEVFS: {
-            auto* node = static_cast<ker::vfs::devfs::DevFSNode*>(file->private_data);
+            auto* node = ker::vfs::devfs::devfs_file_node(file);
             statbuf->st_dev = FSTAT_DEV_ID;
             statbuf->st_ino = (node != nullptr) ? reinterpret_cast<ino_t>(node) : 1;
             statbuf->st_nlink = 1;
@@ -4457,12 +4488,16 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
             statbuf->st_blksize = 4096;
             statbuf->st_blocks = 0;
 
-            // Set mode based on whether this is a directory or device
-            if (file->is_directory) {
-                statbuf->st_mode = S_IFDIR | ((node != nullptr) ? node->mode : 0755);
+            if (node != nullptr && node->type == ker::vfs::devfs::DevFSNodeType::DIRECTORY) {
+                statbuf->st_mode = S_IFDIR | node->mode;
+            } else if (node != nullptr && node->type == ker::vfs::devfs::DevFSNodeType::SYMLINK) {
+                statbuf->st_mode = S_IFLNK | node->mode;
+            } else if (node != nullptr && node->device != nullptr && node->device->type == ker::dev::DeviceType::BLOCK) {
+                statbuf->st_mode = S_IFBLK | node->mode;
             } else {
                 statbuf->st_mode = S_IFCHR | ((node != nullptr) ? node->mode : 0666);
             }
+            fill_devfs_stat_timestamps(node, statbuf);
             return 0;
         }
         case FSType::SOCKET: {
@@ -7264,6 +7299,10 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
         fs_relative_path = "";
     } else {
         fs_relative_path = pathBuffer + mount_len;
+    }
+
+    if (mount->read_only && open_flags_require_fs_write(backend_flags)) {
+        return nullptr;
     }
 
     File* f = nullptr;

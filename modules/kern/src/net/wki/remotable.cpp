@@ -12,6 +12,7 @@
 #include <net/netdevice.hpp>
 #include <net/netif.hpp>
 #include <net/route.hpp>
+#include <net/wki/dev_server.hpp>
 #include <net/wki/remote_net.hpp>
 #include <net/wki/remote_vfs.hpp>
 #include <net/wki/timer_math.hpp>
@@ -19,6 +20,7 @@
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <vfs/fs/devfs.hpp>
+#include <vfs/mount.hpp>
 #include <vfs/vfs.hpp>
 
 #include "platform/sys/spinlock.hpp"
@@ -357,6 +359,12 @@ void send_resource_advert_to_peer(uint16_t peer_node, ker::dev::BlockDevice* bde
         if (bdev->remotable->can_passthrough()) {
             adv->flags |= RESOURCE_FLAG_PASSTHROUGH_CAPABLE;
         }
+    }
+    adv->flags |= RESOURCE_FLAG_READABLE;
+    if (ker::vfs::mounted_block_device_overlaps(bdev) || wki_dev_server_block_has_remote_writer(bdev)) {
+        adv->flags |= RESOURCE_FLAG_OCCUPIED;
+    } else if (!ker::dev::block_device_is_read_only(bdev)) {
+        adv->flags |= RESOURCE_FLAG_WRITABLE;
     }
 
     adv->name_len = name_len;

@@ -7,6 +7,7 @@
 #include <platform/sys/mutex.hpp>
 
 #include "../file_operations.hpp"
+#include "../stat.hpp"
 #include "../vfs.hpp"
 #include "bits/ssize_t.h"
 
@@ -33,6 +34,9 @@ struct TmpNode {
     uint32_t mode = 0;  // Permission bits (e.g. 0644 for files, 0755 for dirs)
     uint32_t uid = 0;   // Owner user ID
     uint32_t gid = 0;   // Owner group ID
+    Timespec atime{};
+    Timespec mtime{};
+    Timespec ctime{};
 
     // Serializes file data/size updates for regular file I/O.
     ker::mod::sys::Mutex io_lock;

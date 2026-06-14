@@ -124,7 +124,7 @@ void agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
             agf->agf_bno_level = Be32::from_cpu(pag->agf_bno_level);
             agf->agf_cnt_level = Be32::from_cpu(pag->agf_cnt_level);
             agf->agf_crc = Be32{0};
-            uint32_t crc = util::crc32c_block_with_cksum(agf, sizeof(XfsAgf), XFS_AGF_CRC_OFF);
+            uint32_t crc = util::crc32c_block_with_cksum(agf, mount->sect_size, XFS_AGF_CRC_OFF);
             __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
             xfs_trans_log_buf(tp, agf_bh, static_cast<uint32_t>(AGF_OFF), static_cast<uint32_t>(sizeof(XfsAgf)));
             brelse(agf_bh);
@@ -285,7 +285,7 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
         agf->agf_cnt_level = Be32::from_cpu(pag->agf_cnt_level);
         // Recompute CRC
         agf->agf_crc = Be32{0};
-        uint32_t crc = util::crc32c_block_with_cksum(agf, sizeof(XfsAgf), XFS_AGF_CRC_OFF);
+        uint32_t crc = util::crc32c_block_with_cksum(agf, mount->sect_size, XFS_AGF_CRC_OFF);
         __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
         // ---- 5. Log the AGF buffer ----
         xfs_trans_log_buf(tp, agf_bh, static_cast<uint32_t>(AGF_OFFSET), static_cast<uint32_t>(sizeof(XfsAgf)));
@@ -317,7 +317,7 @@ void log_agf_free_space_roots(XfsMountContext* mount, XfsTransaction* tp, xfs_ag
     agf->agf_bno_level = Be32::from_cpu(pag->agf_bno_level);
     agf->agf_cnt_level = Be32::from_cpu(pag->agf_cnt_level);
     agf->agf_crc = Be32{0};
-    uint32_t crc = util::crc32c_block_with_cksum(agf, sizeof(XfsAgf), XFS_AGF_CRC_OFF);
+    uint32_t crc = util::crc32c_block_with_cksum(agf, mount->sect_size, XFS_AGF_CRC_OFF);
     __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
     xfs_trans_log_buf(tp, agf_bh, static_cast<uint32_t>(AGF_OFFSET), static_cast<uint32_t>(sizeof(XfsAgf)));
     brelse(agf_bh);
@@ -524,7 +524,7 @@ void log_agf_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     agf->agf_fllast = Be32::from_cpu(pag->agf_fllast);
     agf->agf_flcount = Be32::from_cpu(pag->agf_flcount);
     agf->agf_crc = Be32{0};
-    uint32_t crc = util::crc32c_block_with_cksum(agf, sizeof(XfsAgf), XFS_AGF_CRC_OFF);
+    uint32_t crc = util::crc32c_block_with_cksum(agf, mount->sect_size, XFS_AGF_CRC_OFF);
     __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
     xfs_trans_log_buf(tp, ag0_bh, static_cast<uint32_t>(AGF_OFF), static_cast<uint32_t>(sizeof(XfsAgf)));
 }

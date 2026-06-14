@@ -17,6 +17,7 @@
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/dbg/journal.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <string_view>
 #include <utility>
@@ -36,6 +37,7 @@ namespace ker::vfs::devfs {
 namespace {
 
 constexpr uint32_t DEVFS_FILE_MAGIC = 0xDEADBEEF;
+constexpr uint64_t NS_PER_SEC = 1000000000ULL;
 using log = ker::mod::dbg::logger<"devfs">;
 
 auto is_valid_kernel_pointer(const void* ptr) -> bool {
@@ -52,6 +54,33 @@ DevFSNode root_node;
 constexpr size_t INITIAL_CHILDREN_CAPACITY = 16;
 
 // -- Tree helpers -----------------------------------------------------
+
+auto current_timespec() -> Timespec {
+    uint64_t const NOW_NS = ker::mod::time::get_epoch_ns();
+    return Timespec{
+        .tv_sec = static_cast<int64_t>(NOW_NS / NS_PER_SEC),
+        .tv_nsec = static_cast<int64_t>(NOW_NS % NS_PER_SEC),
+    };
+}
+
+void stamp_new_node(DevFSNode* node) {
+    if (node == nullptr) {
+        return;
+    }
+    Timespec const NOW = current_timespec();
+    node->atime = NOW;
+    node->mtime = NOW;
+    node->ctime = NOW;
+}
+
+void touch_node_modified(DevFSNode* node) {
+    if (node == nullptr) {
+        return;
+    }
+    Timespec const NOW = current_timespec();
+    node->mtime = NOW;
+    node->ctime = NOW;
+}
 
 void ensure_children_capacity(DevFSNode* node) {
     if (node->children_count < node->children_capacity) {
@@ -91,6 +120,7 @@ void add_child(DevFSNode* parent, DevFSNode* child) {
     }
     child->parent = parent;
     parent->children[parent->children_count++] = child;
+    touch_node_modified(parent);
 }
 
 void remove_child(DevFSNode* parent, DevFSNode* child) {
@@ -105,6 +135,7 @@ void remove_child(DevFSNode* parent, DevFSNode* child) {
             }
             parent->children_count--;
             child->parent = nullptr;
+            touch_node_modified(parent);
             return;
         }
     }
@@ -134,6 +165,7 @@ auto create_node(const char* name, DevFSNodeType type) -> DevFSNode* {
             node->mode = 0777;
             break;
     }
+    stamp_new_node(node);
     return node;
 }
 
@@ -469,6 +501,11 @@ auto devfs_ioctl(File* f, unsigned long cmd, unsigned long arg) -> int {
 
 auto devfs_walk_path(const char* path) -> DevFSNode* { return walk_path(path, false); }
 
+auto devfs_file_node(File* file) -> DevFSNode* {
+    auto* devfs_file = validate_devfs_file(file, "file_node");
+    return (devfs_file != nullptr) ? devfs_file->node : nullptr;
+}
+
 auto devfs_open_path(const char* path, int /*flags*/, int /*mode*/) -> File* {
     if (path == nullptr) {
         return nullptr;
@@ -655,6 +692,7 @@ auto devfs_add_device_node(const std::array<char, DEVFS_NAME_MAX>& name, ker::de
         existing->type = DevFSNodeType::DEVICE;
         existing->device = dev;
         existing->mode = 0666;
+        touch_node_modified(existing);
         return existing;
     }
 
@@ -736,6 +774,7 @@ void devfs_init() {
     // Initialize root node
     root_node.name[0] = '\0';
     root_node.type = DevFSNodeType::DIRECTORY;
+    stamp_new_node(&root_node);
 
     // Populate with registered character devices
     size_t const DEV_COUNT = ker::dev::dev_get_count();
@@ -1083,6 +1122,15 @@ ker::dev::CharDeviceOps wki_resource_ops = {
         if (ctx->flags & ker::net::wki::RESOURCE_FLAG_PASSTHROUGH_CAPABLE) {
             append_str(" passthrough");
         }
+        if (ctx->flags & ker::net::wki::RESOURCE_FLAG_READABLE) {
+            append_str(" readable");
+        }
+        if (ctx->flags & ker::net::wki::RESOURCE_FLAG_WRITABLE) {
+            append_str(" writable");
+        }
+        if (ctx->flags & ker::net::wki::RESOURCE_FLAG_OCCUPIED) {
+            append_str(" occupied");
+        }
         if (ctx->flags == 0) {
             append_str(" none");
         }
@@ -1231,6 +1279,7 @@ void wki_add_symlink(DevFSNode* parent_dir, std::string_view name, std::string_v
         size_t const TLEN = (target.size() < DEVFS_SYMLINK_MAX - 1) ? target.size() : DEVFS_SYMLINK_MAX - 1;
         std::memcpy(existing->symlink_target.data(), target.data(), TLEN);
         existing->symlink_target[TLEN] = '\0';
+        touch_node_modified(existing);
         return;
     }
 

@@ -12,6 +12,7 @@
 #include <dev/block_device.hpp>
 #include <net/wki/blk_ring.hpp>
 #include <net/wki/dev_proxy.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
 #include <vfs/stat.hpp>
@@ -38,6 +39,8 @@ namespace {
 
 // Keep this in sync with the userspace fcntl.h values (Linux-compatible octal).
 constexpr int O_CREAT = 0100;  // octal = 64 decimal = 0x40 hex
+constexpr uint64_t NS_PER_SEC = 1000000000ULL;
+constexpr uint64_t SECS_PER_DAY = 86400ULL;
 
 // Simple file node for FAT32
 struct FAT32Node {
@@ -50,11 +53,23 @@ struct FAT32Node {
     // Track directory entry location for updating on write
     uint32_t dir_entry_cluster{};  // Which cluster contains the directory entry
     uint32_t dir_entry_offset{};   // Offset within that cluster (in bytes)
+    uint8_t create_time_tenths{};
+    uint16_t create_time{};
+    uint16_t create_date{};
+    uint16_t access_date{};
+    uint16_t modify_time{};
+    uint16_t modify_date{};
 
     // POSIX permission model (runtime-only, not persisted to FAT32 disk)
     uint32_t mode = 0;  // Permission bits (synthesized from FAT32 attributes)
     uint32_t uid = 0;   // Owner user ID
     uint32_t gid = 0;   // Owner group ID
+};
+
+struct FatDateTime {
+    uint8_t create_time_tenths{};
+    uint16_t time{};
+    uint16_t date{};
 };
 
 // Long File Name entry (FAT32 VFAT). Packed on-disk.
@@ -73,6 +88,142 @@ struct __attribute__((packed)) FAT32LongNameEntry {
 static_assert(sizeof(FAT32LongNameEntry) == sizeof(FAT32DirectoryEntry));
 
 constexpr uint8_t FAT32_LFN_ATTR = 0x0F;
+
+auto is_leap_year(uint32_t year) -> bool { return (year % 4U) == 0U && ((year % 100U) != 0U || (year % 400U) == 0U); }
+
+auto days_in_month(uint32_t year, uint32_t month) -> uint32_t {
+    static constexpr std::array<uint8_t, 12> COMMON{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (month == 2 && is_leap_year(year)) {
+        return 29;
+    }
+    if (month < 1 || month > 12) {
+        return 31;
+    }
+    return COMMON.at(month - 1);
+}
+
+void epoch_seconds_to_ymdhms(uint64_t epoch_sec, uint32_t& year, uint32_t& month, uint32_t& day, uint32_t& hour, uint32_t& minute,
+                             uint32_t& second) {
+    uint64_t days = epoch_sec / SECS_PER_DAY;
+    uint64_t day_second = epoch_sec % SECS_PER_DAY;
+
+    hour = static_cast<uint32_t>(day_second / 3600ULL);
+    day_second %= 3600ULL;
+    minute = static_cast<uint32_t>(day_second / 60ULL);
+    second = static_cast<uint32_t>(day_second % 60ULL);
+
+    year = 1970;
+    while (true) {
+        uint32_t const YEAR_DAYS = is_leap_year(year) ? 366U : 365U;
+        if (days < YEAR_DAYS) {
+            break;
+        }
+        days -= YEAR_DAYS;
+        year++;
+        if (year > 2107) {
+            year = 2107;
+            month = 12;
+            day = 31;
+            hour = 23;
+            minute = 59;
+            second = 58;
+            return;
+        }
+    }
+
+    month = 1;
+    while (true) {
+        uint32_t const MONTH_DAYS = days_in_month(year, month);
+        if (days < MONTH_DAYS) {
+            break;
+        }
+        days -= MONTH_DAYS;
+        month++;
+    }
+    day = static_cast<uint32_t>(days) + 1;
+}
+
+auto ymdhms_to_epoch_seconds(uint32_t year, uint32_t month, uint32_t day, uint32_t hour, uint32_t minute, uint32_t second) -> uint64_t {
+    uint64_t days = 0;
+    for (uint32_t y = 1970; y < year; ++y) {
+        days += is_leap_year(y) ? 366ULL : 365ULL;
+    }
+    for (uint32_t m = 1; m < month; ++m) {
+        days += days_in_month(year, m);
+    }
+    days += day - 1;
+    return (days * SECS_PER_DAY) + (static_cast<uint64_t>(hour) * 3600ULL) + (static_cast<uint64_t>(minute) * 60ULL) + second;
+}
+
+auto current_fat_datetime() -> FatDateTime {
+    uint64_t const NOW_NS = ker::mod::time::get_epoch_ns();
+    uint64_t const NOW_SEC = NOW_NS / NS_PER_SEC;
+    uint32_t year = 0;
+    uint32_t month = 0;
+    uint32_t day = 0;
+    uint32_t hour = 0;
+    uint32_t minute = 0;
+    uint32_t second = 0;
+    epoch_seconds_to_ymdhms(NOW_SEC, year, month, day, hour, minute, second);
+
+    if (year < 1980) {
+        year = 1980;
+        month = 1;
+        day = 1;
+        hour = 0;
+        minute = 0;
+        second = 0;
+    }
+
+    auto hundredths = static_cast<uint8_t>((NOW_NS % NS_PER_SEC) / 10000000ULL);
+    if ((second & 1U) != 0U) {
+        hundredths = static_cast<uint8_t>(hundredths + 100U);
+    }
+
+    return FatDateTime{
+        .create_time_tenths = hundredths,
+        .time = static_cast<uint16_t>((hour << 11U) | (minute << 5U) | (second / 2U)),
+        .date = static_cast<uint16_t>(((year - 1980U) << 9U) | (month << 5U) | day),
+    };
+}
+
+auto decode_fat_datetime(uint16_t date, uint16_t time, uint8_t create_time_tenths = 0) -> Timespec {
+    if (date == 0) {
+        return Timespec{};
+    }
+
+    uint32_t const YEAR = 1980U + ((date >> 9U) & 0x7FU);
+    uint32_t const MONTH = (date >> 5U) & 0x0FU;
+    uint32_t const DAY = date & 0x1FU;
+    uint32_t const HOUR = (time >> 11U) & 0x1FU;
+    uint32_t const MINUTE = (time >> 5U) & 0x3FU;
+    uint32_t second = (time & 0x1FU) * 2U;
+    uint32_t hundredths = create_time_tenths;
+    if (hundredths >= 100U) {
+        second++;
+        hundredths -= 100U;
+    }
+
+    if (YEAR < 1980 || YEAR > 2107 || MONTH < 1 || MONTH > 12 || DAY < 1 || DAY > days_in_month(YEAR, MONTH) || HOUR > 23 || MINUTE > 59 ||
+        second > 59) {
+        return Timespec{};
+    }
+
+    return Timespec{
+        .tv_sec = static_cast<int64_t>(ymdhms_to_epoch_seconds(YEAR, MONTH, DAY, HOUR, MINUTE, second)),
+        .tv_nsec = static_cast<int64_t>(hundredths * 10000000U),
+    };
+}
+
+void fill_stat_timestamps_from_fat(ker::vfs::Stat* statbuf, uint8_t create_time_tenths, uint16_t create_time, uint16_t create_date,
+                                   uint16_t access_date, uint16_t modify_time, uint16_t modify_date) {
+    if (statbuf == nullptr) {
+        return;
+    }
+    statbuf->st_atim = decode_fat_datetime(access_date, 0);
+    statbuf->st_mtim = decode_fat_datetime(modify_date, modify_time);
+    statbuf->st_ctim = decode_fat_datetime(create_date, create_time, create_time_tenths);
+}
 
 auto lfn_checksum_83(const std::array<char, 11>& short_name) -> uint8_t {
     uint8_t sum = 0;
@@ -296,6 +447,14 @@ auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_l
     context->data_start_sector = 0;
     context->total_sectors = 0;
     context->root_cluster = 0;
+    FatDateTime const MOUNT_TIME = current_fat_datetime();
+    context->root_create_time_tenths = MOUNT_TIME.create_time_tenths;
+    context->root_create_time = MOUNT_TIME.time;
+    context->root_create_date = MOUNT_TIME.date;
+    context->root_access_date = MOUNT_TIME.date;
+    context->root_modify_time = MOUNT_TIME.time;
+    context->root_modify_date = MOUNT_TIME.date;
+    context->read_only = ker::dev::block_device_is_read_only(device);
 
     // Allocate buffer for boot sector
     auto* boot_buf = new uint8_t[device->block_size];
@@ -376,6 +535,24 @@ auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_l
     log::debug("fat32_init_device: initialized successfully");
 #endif
     return context;
+}
+
+void fat32_unmount(FAT32MountContext* ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+
+    if (ctx->fat_table != nullptr && !ctx->read_only) {
+        (void)flush_fat_table(ctx);
+    }
+
+    if (ctx->device != nullptr) {
+        (void)ker::dev::block_flush(ctx->device);
+    }
+
+    delete[] ctx->fat_table;
+    ctx->fat_table = nullptr;
+    delete ctx;
 }
 
 // Helper to get next cluster in chain
@@ -508,6 +685,9 @@ static auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_clu
         log::warn("create_file_in_directory: invalid arguments");
         return nullptr;
     }
+    if (ctx->read_only) {
+        return nullptr;
+    }
 
 #ifdef FAT32_DEBUG
     log::debug("create_file_in_directory: creating '%s' in cluster 0x%x", filename, parent_cluster);
@@ -616,7 +796,13 @@ static auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_clu
     sfn_entry->cluster_high = 0;
     sfn_entry->cluster_low = 0;
     sfn_entry->file_size = 0;
-    // Time/date fields left as 0
+    FatDateTime const NOW = current_fat_datetime();
+    sfn_entry->create_time_tenths = NOW.create_time_tenths;
+    sfn_entry->create_time = NOW.time;
+    sfn_entry->create_date = NOW.date;
+    sfn_entry->access_date = NOW.date;
+    sfn_entry->modify_time = NOW.time;
+    sfn_entry->modify_date = NOW.date;
 
     // Mark the next entry as end-of-directory if needed
     size_t const NEXT_ENTRY_IDX = found_start_index + LFN_COUNT + 1;
@@ -656,6 +842,12 @@ static auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_clu
     node->context = ctx;
     node->dir_entry_cluster = found_cluster;
     node->dir_entry_offset = static_cast<uint32_t>((found_start_index + LFN_COUNT) * sizeof(FAT32DirectoryEntry));
+    node->create_time_tenths = sfn_entry->create_time_tenths;
+    node->create_time = sfn_entry->create_time;
+    node->create_date = sfn_entry->create_date;
+    node->access_date = sfn_entry->access_date;
+    node->modify_time = sfn_entry->modify_time;
+    node->modify_date = sfn_entry->modify_date;
     node->mode = 0644;  // Default mode for new files
     node->uid = 0;
     node->gid = 0;
@@ -713,6 +905,12 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
         node->mode = 0755;    // Default mode for root directory
         node->uid = 0;
         node->gid = 0;
+        node->create_time_tenths = ctx->root_create_time_tenths;
+        node->create_time = ctx->root_create_time;
+        node->create_date = ctx->root_create_date;
+        node->access_date = ctx->root_access_date;
+        node->modify_time = ctx->root_modify_time;
+        node->modify_date = ctx->root_modify_date;
 
         auto* file = new File;
         file->fd = -1;
@@ -924,6 +1122,12 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
     node->context = ctx;
     node->dir_entry_cluster = final_entry_cluster;
     node->dir_entry_offset = final_entry_offset;
+    node->create_time_tenths = final_entry.create_time_tenths;
+    node->create_time = final_entry.create_time;
+    node->create_date = final_entry.create_date;
+    node->access_date = final_entry.access_date;
+    node->modify_time = final_entry.modify_time;
+    node->modify_date = final_entry.modify_date;
     // Synthesize POSIX mode from FAT32 attributes
     if (node->is_directory) {
         node->mode = 0755;
@@ -1121,6 +1325,9 @@ auto flush_fat_table(const FAT32MountContext* ctx) -> int {
         log::warn("flush_fat_table: invalid context");
         return -EINVAL;
     }
+    if (ctx->read_only) {
+        return -EROFS;
+    }
 
     // Calculate how many sectors to write
     size_t const FAT_SIZE_BYTES = static_cast<size_t>(ctx->sectors_per_fat) * ctx->bytes_per_sector;
@@ -1163,6 +1370,9 @@ auto fat32_fsync(File* f) -> int {
     if (node->context == nullptr) {
         return -EINVAL;
     }
+    if (node->context->read_only) {
+        return node->context->device != nullptr ? ker::dev::block_flush(node->context->device) : 0;
+    }
 
     int result = flush_fat_table(node->context);
     if (result != 0) {
@@ -1174,13 +1384,16 @@ auto fat32_fsync(File* f) -> int {
 }
 
 // Update file's directory entry on disk
-static auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> int {
+static auto update_directory_entry(FAT32Node* node, uint32_t new_size) -> int {
     if (node == nullptr || node->context == nullptr || node->context->device == nullptr) {
         log::warn("update_directory_entry: invalid node or context");
         return -EINVAL;
     }
 
     const FAT32MountContext* ctx = node->context;
+    if (ctx->read_only) {
+        return -EROFS;
+    }
     uint32_t const CLUSTER_SIZE = static_cast<uint32_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
 
 #ifdef FAT32_DEBUG
@@ -1209,6 +1422,13 @@ static auto update_directory_entry(const FAT32Node* node, uint32_t new_size) -> 
 
     // Update the file size
     entry->file_size = new_size;
+    FatDateTime const NOW = current_fat_datetime();
+    entry->modify_time = NOW.time;
+    entry->modify_date = NOW.date;
+    entry->access_date = NOW.date;
+    node->modify_time = entry->modify_time;
+    node->modify_date = entry->modify_date;
+    node->access_date = entry->access_date;
 
     // Also persist the file's start cluster. Newly created files are emitted with
     // cluster_low/high = 0 and the first cluster is allocated on first write.
@@ -1248,6 +1468,9 @@ auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize
     if (ctx->device == nullptr) {
         log::warn("fat32_write: no block device available");
         return -EIO;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
     }
 
     // Calculate starting cluster and offset within cluster
@@ -1614,6 +1837,8 @@ auto fat32_stat(const char* path, ker::vfs::Stat* statbuf, FAT32MountContext* ct
         statbuf->st_size = 0;
         statbuf->st_blksize = static_cast<blksize_t>(static_cast<size_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster);
         statbuf->st_blocks = 0;
+        fill_stat_timestamps_from_fat(statbuf, ctx->root_create_time_tenths, ctx->root_create_time, ctx->root_create_date,
+                                      ctx->root_access_date, ctx->root_modify_time, ctx->root_modify_date);
         return 0;
     }
 
@@ -1653,6 +1878,7 @@ auto fat32_stat(const char* path, ker::vfs::Stat* statbuf, FAT32MountContext* ct
         uint32_t found_cluster = 0;
         uint32_t found_size = 0;
         uint8_t found_attr = 0;
+        FAT32DirectoryEntry found_entry{};
 
         constexpr size_t MAX_LFN = 20;
         std::array<FAT32LongNameEntry, MAX_LFN> lfn_entries{};
@@ -1728,6 +1954,7 @@ auto fat32_stat(const char* path, ker::vfs::Stat* statbuf, FAT32MountContext* ct
                     found_cluster = decode_dirent_cluster(entries[i]);
                     found_size = entries[i].file_size;
                     found_attr = entries[i].attributes;
+                    found_entry = entries[i];
                     break;
                 }
             }
@@ -1764,6 +1991,8 @@ auto fat32_stat(const char* path, ker::vfs::Stat* statbuf, FAT32MountContext* ct
             } else {
                 statbuf->st_mode = ker::vfs::S_IFREG | 0644;
             }
+            fill_stat_timestamps_from_fat(statbuf, found_entry.create_time_tenths, found_entry.create_time, found_entry.create_date,
+                                          found_entry.access_date, found_entry.modify_time, found_entry.modify_date);
 
             ctx->lock.unlock();
             return 0;
@@ -1804,6 +2033,8 @@ auto fat32_fstat(File* f, ker::vfs::Stat* statbuf) -> int {
     } else {
         statbuf->st_mode = ker::vfs::S_IFREG | node->mode;
     }
+    fill_stat_timestamps_from_fat(statbuf, node->create_time_tenths, node->create_time, node->create_date, node->access_date,
+                                  node->modify_time, node->modify_date);
 
     return 0;
 }
@@ -1841,7 +2072,7 @@ auto fat32_statvfs(FAT32MountContext* ctx, ker::vfs::Statvfs* buf) -> int {
     buf->f_ffree = 0;
     buf->f_favail = 0;
     buf->f_fsid = 0;
-    buf->f_flag = 0;
+    buf->f_flag = ctx->read_only ? ker::vfs::ST_RDONLY : 0;
     buf->f_namemax = 255;
     return 0;
 }
@@ -1854,6 +2085,9 @@ auto fat32_statvfs(FAT32MountContext* ctx, ker::vfs::Statvfs* buf) -> int {
 static auto write_cluster(const FAT32MountContext* ctx, uint32_t cluster, const void* buffer) -> int {
     if (ctx == nullptr || ctx->device == nullptr || cluster < 2) {
         return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
     }
     uint64_t const CLUSTER_LBA =
         ctx->partition_offset + ctx->data_start_sector + (static_cast<uint64_t>(cluster - 2) * ctx->sectors_per_cluster);
@@ -1868,6 +2102,9 @@ static auto total_data_clusters(const FAT32MountContext* ctx) -> uint32_t {
 
 // Allocate a single cluster - find first free FAT entry, mark EOC
 static auto allocate_cluster(FAT32MountContext* ctx) -> uint32_t {
+    if (ctx == nullptr || ctx->read_only) {
+        return 0;
+    }
     uint32_t const MAX_CLUSTER = total_data_clusters(ctx);
     for (uint32_t i = 2; i < MAX_CLUSTER; ++i) {
         if ((ctx->fat_table[i] & FAT32_EOC) == 0) {
@@ -1880,6 +2117,12 @@ static auto allocate_cluster(FAT32MountContext* ctx) -> uint32_t {
 
 // Free an entire cluster chain starting at start_cluster
 static auto free_cluster_chain(FAT32MountContext* ctx, uint32_t start_cluster) -> int {
+    if (ctx == nullptr) {
+        return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
+    }
     if (start_cluster < 2) {
         return 0;
     }
@@ -1904,6 +2147,9 @@ static auto fat32_truncate(File* f, off_t length) -> int {
     auto* ctx = node->context;
     if (ctx == nullptr) {
         return -EIO;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
     }
 
     uint32_t const CLUSTER_SIZE = ctx->bytes_per_sector * ctx->sectors_per_cluster;
@@ -2265,6 +2511,12 @@ static auto fat32_delete_dir_entries(FAT32MountContext* ctx, const DirEntryLocat
     // For simplicity, we handle the case where all entries are in the same cluster
     // (which is how create_file_in_dir creates them - contiguous in one cluster).
     // A more robust implementation would handle cross-cluster LFN entries.
+    if (ctx == nullptr || loc == nullptr) {
+        return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
+    }
 
     uint32_t const CLUSTER_SIZE = ctx->bytes_per_sector * ctx->sectors_per_cluster;
     auto* cluster_buf = new uint8_t[CLUSTER_SIZE];
@@ -2305,6 +2557,12 @@ static auto fat32_delete_dir_entries(FAT32MountContext* ctx, const DirEntryLocat
 // ============================================================================
 
 auto fat32_unlink_path(FAT32MountContext* ctx, const char* path) -> int {
+    if (ctx == nullptr) {
+        return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
+    }
     const char* entry_name = nullptr;
     auto* parent = fat32_walk_to_parent(ctx, path, &entry_name);
     if (parent == nullptr) {
@@ -2335,6 +2593,12 @@ auto fat32_unlink_path(FAT32MountContext* ctx, const char* path) -> int {
 }
 
 auto fat32_rmdir_path(FAT32MountContext* ctx, const char* path) -> int {
+    if (ctx == nullptr) {
+        return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
+    }
     const char* entry_name = nullptr;
     auto* parent = fat32_walk_to_parent(ctx, path, &entry_name);
     if (parent == nullptr) {
@@ -2367,6 +2631,12 @@ auto fat32_rmdir_path(FAT32MountContext* ctx, const char* path) -> int {
 }
 
 auto fat32_rename_path(FAT32MountContext* ctx, const char* oldpath, const char* newpath) -> int {
+    if (ctx == nullptr) {
+        return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
+    }
     // Step 1: Find old entry
     const char* old_name = nullptr;
     auto* old_parent = fat32_walk_to_parent(ctx, oldpath, &old_name);

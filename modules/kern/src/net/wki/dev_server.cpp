@@ -29,6 +29,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <utility>
+#include <vfs/mount.hpp>
 
 #include "platform/sys/spinlock.hpp"
 
@@ -172,6 +173,17 @@ auto find_net_device_by_resource_id(uint32_t resource_id) -> ker::net::NetDevice
         }
     }
     return nullptr;
+}
+
+// s_server_lock must be held by caller
+auto block_has_remote_writer_locked(const ker::dev::BlockDevice* dev) -> bool {
+    if (dev == nullptr) {
+        return false;
+    }
+    return std::ranges::any_of(g_bindings, [dev](const DevServerBinding& binding) {
+        return binding.active && !binding.retiring.load(std::memory_order_acquire) && binding.resource_type == ResourceType::BLOCK &&
+               !binding.block_read_only && ker::dev::block_devices_overlap(binding.block_dev, dev);
+    });
 }
 
 auto is_vfs_op(uint16_t op_id) -> bool { return op_id >= OP_VFS_OPEN && op_id <= OP_VFS_READ_BULK; }
@@ -606,6 +618,13 @@ void wki_dev_server_init() {
     ker::mod::dbg::log("[WKI] Dev server subsystem initialized");
 }
 
+auto wki_dev_server_block_has_remote_writer(const dev::BlockDevice* dev) -> bool {
+    uint64_t const FLAGS = s_server_lock.lock_irqsave();
+    bool const HAS_WRITER = block_has_remote_writer_locked(dev);
+    s_server_lock.unlock_irqrestore(FLAGS);
+    return HAS_WRITER;
+}
+
 // -----------------------------------------------------------------------------
 // D11: Check if any active NET binding still references a given device
 // -----------------------------------------------------------------------------
@@ -868,6 +887,7 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
     constexpr size_t MAX_DETACH = 32;
 
     constexpr size_t MAX_NET_DEVS = 16;
+    bool detached_any = false;
 
     while (true) {
         std::array<DetachWork, MAX_DETACH> work = {};
@@ -921,6 +941,7 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
         if (work_count == 0) {
             break;
         }
+        detached_any = true;
 
         // Perform cleanup outside the lock.
         for (size_t i = 0; i < work_count; i++) {
@@ -956,6 +977,10 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
         for (size_t i = 0; i < uninstall_count; i++) {
             uninstall_devs.at(i)->wki_rx_forward = nullptr;
         }
+    }
+
+    if (detached_any) {
+        wki_resource_advertise_all();
     }
 }
 
@@ -995,6 +1020,23 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
             return;
         }
 
+        bool const REQUEST_READ = dev_attach_requests_read(req->attach_mode);
+        bool const REQUEST_WRITE = dev_attach_requests_write(req->attach_mode);
+        bool const OWNER_MOUNTED = ker::vfs::mounted_block_device_overlaps(bdev);
+        bool read_only_attach = false;
+        {
+            uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+            bool const WRITE_UNAVAILABLE =
+                ker::dev::block_device_is_read_only(bdev) || OWNER_MOUNTED || block_has_remote_writer_locked(bdev);
+            read_only_attach = !REQUEST_WRITE || (REQUEST_WRITE && WRITE_UNAVAILABLE);
+            s_server_lock.unlock_irqrestore(SRV_FLAGS);
+        }
+        if (read_only_attach && !REQUEST_READ) {
+            ack.status = static_cast<uint8_t>(DevAttachStatus::BUSY);
+            wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
+            return;
+        }
+
         // The lower node ID is the channel allocator for the peer pair.
         WkiChannel* ch = reserve_attach_channel(hdr->src_node, req->requested_channel, PriorityClass::THROUGHPUT);
         if (ch == nullptr) {
@@ -1021,6 +1063,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.resource_id = req->resource_id;
         binding.attach_cookie = req->attach_cookie;
         binding.block_dev = bdev;
+        binding.block_read_only = read_only_attach;
 
         // Compute the RDMA zone ID for the block ring.  Zone creation is
         // deferred to the timer tick (wki_dev_server_process_pending_zones)
@@ -1036,7 +1079,17 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.blk_rdma_active = false;  // not yet - set when deferred creation succeeds
 
         {
+            bool const OWNER_MOUNTED_NOW = ker::vfs::mounted_block_device_overlaps(bdev);
             uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+            if (REQUEST_WRITE && !read_only_attach &&
+                (ker::dev::block_device_is_read_only(bdev) || OWNER_MOUNTED_NOW || block_has_remote_writer_locked(bdev))) {
+                s_server_lock.unlock_irqrestore(SRV_FLAGS);
+                bdev->remotable->on_remote_detach(hdr->src_node);
+                wki_channel_close(ch);
+                ack.status = static_cast<uint8_t>(DevAttachStatus::BUSY);
+                wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
+                return;
+            }
             g_bindings.push_back(std::move(binding));
             s_server_lock.unlock_irqrestore(SRV_FLAGS);
         }
@@ -1047,6 +1100,9 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         ack.assigned_channel = ch->channel_id;
         ack.max_op_size = static_cast<uint16_t>(WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload));
         ack.rdma_flags = DEV_ATTACH_RDMA_BLK_RING;
+        if (read_only_attach) {
+            ack.rdma_flags |= DEV_ATTACH_READ_ONLY;
+        }
         ack.blk_zone_id = BLK_ZONE_ID;
 
         // Advertise streaming bulk RDMA transfer support when the peer has an
@@ -1059,8 +1115,8 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
             }
         }
 
-        ker::mod::dbg::log("[WKI] Dev attach: node=0x%04x res_id=%u ch=%u rdma=deferred zone=0x%08x", hdr->src_node, req->resource_id,
-                           ch->channel_id, BLK_ZONE_ID);
+        ker::mod::dbg::log("[WKI] Dev attach: node=0x%04x res_id=%u ch=%u rdma=deferred zone=0x%08x access=%s", hdr->src_node,
+                           req->resource_id, ch->channel_id, BLK_ZONE_ID, read_only_attach ? "ro" : "rw");
 
         // Send ACK on WKI_CHAN_RESOURCE (the same channel the request arrived on) so that
         // the piggybacked ACK properly drains the client's retransmit queue for channel 3.
@@ -1069,6 +1125,9 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         if (ACK_RET != WKI_OK) {
             ker::mod::dbg::log("[WKI] Dev attach ACK send failed: node=0x%04x err=%d", hdr->src_node, ACK_RET);
             rollback_attach_ack_failure(hdr->src_node, ResourceType::BLOCK, req->resource_id, ch->channel_id);
+            wki_resource_advertise_all();
+        } else {
+            wki_resource_advertise_all();
         }
     } else if (res_type == ResourceType::VFS) {
         // Find the VFS export
@@ -1377,6 +1436,7 @@ void handle_dev_detach(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
         erase_retired_binding_locked(info.binding);
         s_server_lock.unlock_irqrestore(ERASE_FLAGS);
     }
+    wki_resource_advertise_all();
 }
 
 void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
@@ -1402,6 +1462,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     ResourceType binding_resource_type = ResourceType::BLOCK;
     ker::net::NetDevice* binding_net_dev = nullptr;
     ker::dev::BlockDevice* binding_block_dev = nullptr;
+    bool binding_block_read_only = false;
     uint32_t vfs_write_rkey = 0;
     {
         uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
@@ -1414,6 +1475,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
             binding_resource_type = binding->resource_type;
             binding_net_dev = binding->net_dev;
             binding_block_dev = binding->block_dev;
+            binding_block_read_only = binding->block_read_only;
         }
         s_server_lock.unlock_irqrestore(SRV_FLAGS);
     }
@@ -1659,6 +1721,16 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
             const uint8_t* write_data = req_data + 12;
             auto write_data_len = static_cast<uint16_t>(REQ_DATA_LEN - 12);
 
+            if (binding_block_read_only) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_BLOCK_WRITE;
+                resp.status = -EROFS;
+                resp.data_len = 0;
+                resp.reserved = REQUEST_COOKIE;
+                wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                break;
+            }
+
             // Validate data length
             auto expected = static_cast<uint32_t>(count * bdev->block_size);
             if (write_data_len < expected) {
@@ -1731,10 +1803,10 @@ void blk_ring_signal_consumer(DevServerBinding* binding) {
     // Tier 2: RoCE doorbell (if RDMA overlay transport has doorbell)
     if (peer->rdma_transport != nullptr && peer->rdma_transport->doorbell != nullptr) {
         peer->rdma_transport->doorbell(peer->rdma_transport, binding->consumer_node, binding->blk_zone_id);
-        return;
     }
 
-    // Tier 3: WKI ZONE_NOTIFY_POST message (reliable, higher latency)
+    // Reliable notify as fallback/backup for RoCE doorbell loss. The consumer
+    // watches the pushed CQ state directly, so duplicate notifications are fine.
     ZoneNotifyPayload notify = {};
     notify.zone_id = binding->blk_zone_id;
     notify.op_type = 0;  // completion notification
@@ -1749,7 +1821,19 @@ void blk_ring_signal_consumer(DevServerBinding* binding) {
 
 namespace {
 
-// RoCE helper: push CQ entries, data slots, and updated header to proxy.
+void roce_write_consumer_header_u32(DevServerBinding* binding, uint64_t offset, uint32_t value) {
+    binding->blk_rdma_transport->rdma_write(binding->blk_rdma_transport, binding->consumer_node, binding->blk_remote_rkey, offset, &value,
+                                            sizeof(value));
+}
+
+void roce_push_server_indices(DevServerBinding* binding, const BlkRingHeader* hdr) {
+    // sq_tail and cq_head are server-owned.  Push cq_head last because the
+    // consumer treats it as the completion-availability signal.
+    roce_write_consumer_header_u32(binding, __builtin_offsetof(BlkRingHeader, sq_tail), hdr->sq_tail);
+    roce_write_consumer_header_u32(binding, __builtin_offsetof(BlkRingHeader, cq_head), hdr->cq_head);
+}
+
+// RoCE helper: push CQ entries, data slots, and server-owned indices to proxy.
 // Only the single new CQ entry is pushed instead of the entire CQ region to
 // minimise RDMA bytes and frame count.
 void roce_push_completions(DevServerBinding* binding, uint32_t data_slot, uint32_t data_bytes, uint32_t cq_idx) {
@@ -1771,9 +1855,8 @@ void roce_push_completions(DevServerBinding* binding, uint32_t data_slot, uint32
     binding->blk_rdma_transport->rdma_write(binding->blk_rdma_transport, binding->consumer_node, binding->blk_remote_rkey, ENTRY_OFF,
                                             static_cast<uint8_t*>(binding->blk_zone_ptr) + ENTRY_OFF, sizeof(BlkCqEntry));
 
-    // Push updated header (sq_tail, cq_head changed)
-    binding->blk_rdma_transport->rdma_write(binding->blk_rdma_transport, binding->consumer_node, binding->blk_remote_rkey, 0,
-                                            binding->blk_zone_ptr, BLK_RING_HEADER_SIZE);
+    // Push only server-owned indices; do not overwrite the consumer's sq_head/cq_tail.
+    roce_push_server_indices(binding, hdr);
 }
 
 // Track accumulated RoCE completions for batch push after draining the SQ loop.
@@ -1785,7 +1868,7 @@ struct BatchCqPush {
 
 // RoCE helper: push all accumulated completions in a single burst.
 // Data slots are pushed individually (each may be large), but CQ entries and
-// the header are pushed once at the end - amortizing per-completion frame overhead.
+// the server-owned indices are pushed once at the end - amortizing per-completion frame overhead.
 void roce_push_completions_batch(DevServerBinding* binding, const BatchCqPush* entries, uint32_t count) {
     if (!binding->blk_roce || binding->blk_rdma_transport == nullptr || count == 0) {
         return;
@@ -1809,9 +1892,8 @@ void roce_push_completions_batch(DevServerBinding* binding, const BatchCqPush* e
     binding->blk_rdma_transport->rdma_write(binding->blk_rdma_transport, binding->consumer_node, binding->blk_remote_rkey, CQ_BASE,
                                             static_cast<uint8_t*>(binding->blk_zone_ptr) + CQ_BASE, CQ_TOTAL);
 
-    // 3. Push updated header last (contains cq_head + sq_tail pointers)
-    binding->blk_rdma_transport->rdma_write(binding->blk_rdma_transport, binding->consumer_node, binding->blk_remote_rkey, 0,
-                                            binding->blk_zone_ptr, BLK_RING_HEADER_SIZE);
+    // 3. Push server-owned indices last (cq_head is the availability signal).
+    roce_push_server_indices(binding, hdr);
 }
 
 void blk_ring_server_poll(DevServerBinding* binding) {
@@ -1877,6 +1959,11 @@ void blk_ring_server_poll(DevServerBinding* binding) {
                     cqe.bytes_transferred = 0;
                     break;
                 }
+                if (binding->block_read_only) {
+                    cqe.status = -EROFS;
+                    cqe.bytes_transferred = 0;
+                    break;
+                }
                 // For RoCE writes: pull the data slot from proxy before writing to disk
                 if (binding->blk_roce && binding->blk_rdma_transport != nullptr) {
                     uint32_t const SLOT_OFFSET =
@@ -1928,6 +2015,12 @@ void blk_ring_server_poll(DevServerBinding* binding) {
             case BlkOpcode::BULK_WRITE: {
                 // Streaming bulk write: RDMA-read entire range from consumer's
                 // registered staging buffer, then write blocks to device.
+                if (binding->block_read_only) {
+                    cqe.status = -EROFS;
+                    cqe.bytes_transferred = 0;
+                    data_bytes = 0;
+                    break;
+                }
                 uint32_t const CONSUMER_RKEY = sqe->data_slot;
                 uint32_t const TOTAL_BYTES = sqe->block_count * hdr->block_size;
                 auto* staging = new (std::nothrow) uint8_t[TOTAL_BYTES];
@@ -1979,9 +2072,9 @@ void blk_ring_server_poll(DevServerBinding* binding) {
 
     // Batch-push all accumulated RoCE completions in one burst:
     // - Data slots are pushed individually (each up to 64KB)
-    // - CQ region + header pushed once at the end
-    // For single completions this falls back to the legacy per-CQE path
-    // (equivalent cost: N data + 1 CQ region + 1 header, vs N * (1 data + 1 CQ entry + 1 header)).
+    // - CQ region + server-owned indices pushed once at the end
+    // For single completions this falls back to the per-CQE path
+    // (equivalent cost: N data + 1 CQ region + indices, vs N * (1 data + 1 CQ entry + indices)).
     if (batch_count == 1) {
         const auto& push = batch_pushes.front();
         roce_push_completions(binding, push.data_slot, push.data_bytes, push.cq_idx);

@@ -10,11 +10,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <platform/ktime/ktime.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <vfs/file.hpp>
+#include <vfs/stat.hpp>
 
 #include "vfs/file_operations.hpp"
 #include "vfs/vfs.hpp"
@@ -61,6 +63,7 @@ constexpr int O_CREAT = 0100;  // octal = 64 decimal = 0x40 hex
 constexpr uint64_t TMPFS_MIN_FREE_RESERVE_BYTES = 16ULL * 1024ULL * 1024ULL;
 constexpr uint64_t TMPFS_MAX_FREE_RESERVE_BYTES = 256ULL * 1024ULL * 1024ULL;
 constexpr uint64_t TMPFS_FREE_RESERVE_DIVISOR = 8;
+constexpr uint64_t NS_PER_SEC = 1000000000ULL;
 
 namespace {
 TmpNode* root_node = nullptr;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -70,6 +73,33 @@ ker::mod::sys::Spinlock tmpfs_lock;  // NOLINT(cppcoreguidelines-avoid-non-const
 // --- Internal helpers ---
 
 namespace {
+auto current_timespec() -> Timespec {
+    uint64_t const NOW_NS = ker::mod::time::get_epoch_ns();
+    return Timespec{
+        .tv_sec = static_cast<int64_t>(NOW_NS / NS_PER_SEC),
+        .tv_nsec = static_cast<int64_t>(NOW_NS % NS_PER_SEC),
+    };
+}
+
+void stamp_new_node(TmpNode* node) {
+    if (node == nullptr) {
+        return;
+    }
+    Timespec const NOW = current_timespec();
+    node->atime = NOW;
+    node->mtime = NOW;
+    node->ctime = NOW;
+}
+
+void touch_modified(TmpNode* node) {
+    if (node == nullptr) {
+        return;
+    }
+    Timespec const NOW = current_timespec();
+    node->mtime = NOW;
+    node->ctime = NOW;
+}
+
 auto tmpfs_capacity_for_size(size_t size, size_t& out_capacity) -> bool {
     if (size == 0) {
         out_capacity = 0;
@@ -208,6 +238,7 @@ void add_child(TmpNode* parent, TmpNode* child) {
     }
     parent->children_live_count++;
     child->parent = parent;
+    touch_modified(parent);
 }
 
 auto tmpfs_write_locked(TmpNode* n, const void* buf, size_t count, size_t offset) -> ssize_t {
@@ -256,6 +287,7 @@ auto tmpfs_write_locked(TmpNode* n, const void* buf, size_t count, size_t offset
     }
     std::memcpy(n->data + offset, buf, write_count);
     n->size = std::max(need, n->size);
+    touch_modified(n);
     return static_cast<ssize_t>(write_count);
 }
 
@@ -270,6 +302,7 @@ auto tmpfs_resize_locked(TmpNode* n, size_t new_size) -> int {
             n->data = nullptr;
             n->capacity = 0;
             n->size = 0;
+            touch_modified(n);
             return 0;
         }
         if (new_cap > n->capacity && !tmpfs_can_grow_capacity(new_cap)) {
@@ -290,6 +323,7 @@ auto tmpfs_resize_locked(TmpNode* n, size_t new_size) -> int {
         std::memset(n->data + n->size, 0, new_size - n->size);
     }
     n->size = new_size;
+    touch_modified(n);
     return 0;
 }
 
@@ -301,6 +335,7 @@ auto create_root_node_internal() -> TmpNode* {
     copy_name(node->name, "/");
     node->type = TmpNodeType::DIRECTORY;
     node->mode = 0755;
+    stamp_new_node(node);
     return node;
 }
 }  // namespace
@@ -348,6 +383,7 @@ auto tmpfs_mkdir(TmpNode* parent, const char* name) -> TmpNode* {
     copy_name(node->name, name);
     node->type = TmpNodeType::DIRECTORY;
     node->mode = 0755;
+    stamp_new_node(node);
     add_child(parent, node);
     return node;
 }
@@ -364,6 +400,7 @@ auto tmpfs_create_file(TmpNode* parent, const char* name, uint32_t create_mode) 
     copy_name(node->name, name);
     node->type = TmpNodeType::FILE;
     node->mode = create_mode & 07777;
+    stamp_new_node(node);
     add_child(parent, node);
     return node;
 }
@@ -380,6 +417,7 @@ auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target)
     copy_name(node->name, name);
     node->type = TmpNodeType::SYMLINK;
     node->mode = 0777;
+    stamp_new_node(node);
     // Allocate and copy the symlink target
     size_t target_len = 0;
     while (target[target_len] != '\0') {

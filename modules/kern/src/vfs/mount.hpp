@@ -21,6 +21,7 @@ struct MountPoint {
     FileOperations* fops{};           // Filesystem operations
     void* private_data{};             // Filesystem-specific data
     uint32_t dev_id{};                // Unique synthetic st_dev for this mount
+    bool read_only{};                 // True when this mount must reject filesystem mutations
     std::atomic<uint32_t> refs{0};    // Active users that outlive mount_lock
     std::atomic<bool> retiring{false};
 };
@@ -32,6 +33,7 @@ struct MountSnapshot {
     char path[MOUNT_PATH_MAX]{};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     FSType fs_type{};
     uint32_t dev_id{};
+    bool read_only{};
     char fstype[MOUNT_FSTYPE_MAX]{};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 };
 
@@ -61,6 +63,7 @@ class MountRef {
 auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device) -> int;
 auto unmount_filesystem(const char* path) -> int;
 auto find_mount_point(const char* path) -> MountRef;
+auto mounted_block_device_overlaps(const ker::dev::BlockDevice* device) -> bool;
 auto configure_mount_point_exact(const char* path, FSType expected_type, void* private_data, FileOperations* fops) -> bool;
 auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int;
 void rebase_wki_mounts_for_new_root(const char* new_root);

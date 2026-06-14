@@ -1112,7 +1112,7 @@ auto generate_mounts(char* buf, size_t bufsz) -> size_t {
         append(display_path);
         append(" ");
         append((snapshot_fstype[0] != '\0') ? snapshot_fstype : "none");
-        append(" rw 0 0\n");
+        append(mount_snapshot.read_only ? " ro 0 0\n" : " rw 0 0\n");
     }
 
     buf[off] = '\0';

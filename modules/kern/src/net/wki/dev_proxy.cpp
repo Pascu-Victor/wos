@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -159,6 +160,7 @@ void cleanup_failed_block_attach(ProxyBlockState* state, WkiChannel* channel_to_
     bulk_buf = state->bulk_staging_buf;
     state->attach_wait_entry = nullptr;
     state->attach_expected_cookie = 0;
+    state->attach_read_only = false;
     state->attach_pending.store(false, std::memory_order_release);
     state->op_wait_entry = nullptr;
     clear_block_op_state_locked(state, WKI_ERR_PEER_FENCED);
@@ -174,6 +176,7 @@ void cleanup_failed_block_attach(ProxyBlockState* state, WkiChannel* channel_to_
     state->rdma_roce = false;
     state->rdma_transport = nullptr;
     state->rdma_remote_rkey = 0;
+    ker::dev::block_device_set_read_only(&state->bdev, false);
     set_proxy_block_active(state, false);
     state->lock.unlock();
 
@@ -388,16 +391,29 @@ void rdma_free_tag(ProxyBlockState* state, uint32_t tag) {
     }
 }
 
-// RoCE helper: push SQ region (header + SQ entries) to server so it can see new SQEs.
+void roce_write_header_u32(ProxyBlockState* state, uint64_t offset, uint32_t value) {
+    state->rdma_transport->rdma_write(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, offset, &value, sizeof(value));
+}
+
+void roce_read_header_u32(ProxyBlockState* state, uint64_t offset, uint32_t* value) {
+    state->rdma_transport->rdma_read(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, offset, value, sizeof(*value));
+}
+
+// RoCE helper: push SQ entries and consumer-owned indices to the server.
 void roce_push_sq(ProxyBlockState* state) {
     if (!state->rdma_roce || state->rdma_transport == nullptr) {
         return;
     }
     auto* hdr = blk_ring_header(state->rdma_zone_ptr);
-    // Push header (contains sq_head) + entire SQ ring
-    uint32_t const SQ_REGION_SIZE = BLK_RING_HEADER_SIZE + blk_ring_sq_size(hdr->sq_depth);
-    state->rdma_transport->rdma_write(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, 0, state->rdma_zone_ptr,
-                                      SQ_REGION_SIZE);
+    uint32_t const SQ_OFF = blk_ring_sq_offset();
+    uint32_t const SQ_SIZE = blk_ring_sq_size(hdr->sq_depth);
+    state->rdma_transport->rdma_write(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, SQ_OFF,
+                                      static_cast<uint8_t*>(state->rdma_zone_ptr) + SQ_OFF, SQ_SIZE);
+
+    // sq_head and cq_tail are consumer-owned.  Do not overwrite the server's
+    // sq_tail/cq_head with stale copies from our local header.
+    roce_write_header_u32(state, __builtin_offsetof(BlkRingHeader, cq_tail), hdr->cq_tail);
+    roce_write_header_u32(state, __builtin_offsetof(BlkRingHeader, sq_head), hdr->sq_head);
 }
 
 // RoCE helper: push a data slot to the server (for WRITE ops - data must be visible before SQE).
@@ -411,32 +427,26 @@ void roce_push_data_slot(ProxyBlockState* state, uint32_t slot, uint32_t bytes) 
                                       blk_data_slot(state->rdma_zone_ptr, hdr, slot), bytes);
 }
 
-// RoCE helper: pull CQ region + header from server to see completions.
-// Saves and restores consumer-owned header fields (sq_head, cq_tail) to prevent
-// the full header read from clobbering them with stale server-side copies.
+// RoCE helper: pull CQ region and server-owned indices from server to see completions.
 void roce_pull_cq(ProxyBlockState* state) {
     if (!state->rdma_roce || state->rdma_transport == nullptr) {
         return;
     }
     auto* hdr = blk_ring_header(state->rdma_zone_ptr);
 
-    // Save consumer-owned fields before the pull overwrites them
-    uint32_t const SAVED_SQ_HEAD = hdr->sq_head;
-    uint32_t const SAVED_CQ_TAIL = hdr->cq_tail;
-
     // Pull CQ entries
     uint32_t const CQ_OFF = blk_ring_cq_offset(hdr->sq_depth);
     uint32_t const CQ_TOTAL = blk_ring_cq_size(hdr->cq_depth);
     state->rdma_transport->rdma_read(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, CQ_OFF,
                                      static_cast<uint8_t*>(state->rdma_zone_ptr) + CQ_OFF, CQ_TOTAL);
-    // Pull updated header (cq_head changed by server)
-    state->rdma_transport->rdma_read(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, 0, state->rdma_zone_ptr,
-                                     BLK_RING_HEADER_SIZE);
 
-    // Restore consumer-owned fields - the server's copy of sq_head/cq_tail may
-    // be stale (lagging behind the consumer's latest values)
-    hdr->sq_head = SAVED_SQ_HEAD;
-    hdr->cq_tail = SAVED_CQ_TAIL;
+    // sq_tail and cq_head are server-owned.  Leave our sq_head/cq_tail intact.
+    uint32_t sq_tail = hdr->sq_tail;
+    uint32_t cq_head = hdr->cq_head;
+    roce_read_header_u32(state, __builtin_offsetof(BlkRingHeader, sq_tail), &sq_tail);
+    roce_read_header_u32(state, __builtin_offsetof(BlkRingHeader, cq_head), &cq_head);
+    hdr->sq_tail = sq_tail;
+    hdr->cq_head = cq_head;
 }
 
 // RoCE helper: pull a data slot from server (for READ ops - data filled by server).
@@ -513,7 +523,7 @@ auto rdma_wait_cqe_push(ProxyBlockState* state, uint32_t tag, BlkCqEntry* out_cq
 
 // Drain all available CQ entries into the per-tag completion tracking array.
 void rdma_drain_cq(ProxyBlockState* state) {
-    // For RoCE zones: pull CQ + header from server before checking for completions
+    // For RoCE zones: pull CQ + server-owned indices before checking for completions
     roce_pull_cq(state);
 
     auto* hdr = blk_ring_header(state->rdma_zone_ptr);
@@ -602,10 +612,10 @@ void rdma_signal_server(ProxyBlockState* state) {
     // Tier 2: RoCE doorbell (raw Ethernet frame)
     if (peer->rdma_transport != nullptr && peer->rdma_transport->doorbell != nullptr) {
         peer->rdma_transport->doorbell(peer->rdma_transport, state->owner_node, state->rdma_zone_id);
-        return;
     }
 
-    // Tier 3: WKI reliable message fallback
+    // Reliable notify as fallback/backup for RoCE doorbell loss. The server
+    // poll path is idempotent, so duplicate raw + reliable signals are okay.
     ZoneNotifyPayload notify = {};
     notify.zone_id = state->rdma_zone_id;
     notify.op_type = 1;  // WRITE (new SQ entries available)
@@ -698,10 +708,10 @@ auto remote_block_read_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, u
 
 // RDMA ring-based block read - with read-ahead cache and server-push optimisation.
 //
-// Prefetches a full data-slot worth of blocks (typically 64 KB) on each RDMA
-// round-trip and caches the excess for subsequent reads.  For RoCE zones the
-// server already pushes data + CQ + header via rdma_write, so the consumer
-// avoids all rdma_read round-trips (no roce_pull_cq / roce_pull_data_slot).
+// Fetches random misses at the caller's requested size, then expands to a full
+// data-slot prefetch once access becomes sequential. For RoCE zones the server
+// already pushes data, CQ, and server-owned indices via rdma_write, so the
+// consumer avoids all rdma_read round-trips (no roce_pull_cq / roce_pull_data_slot).
 auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t count, void* buffer) -> int {
     if (!proxy_block_active(state) || state->rdma_zone_ptr == nullptr) {
         return -1;
@@ -714,6 +724,32 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
     if (BLOCKS_PER_SLOT == 0) {
         return -1;
     }
+    if (count == 0) {
+        return 0;
+    }
+    if (block >= ring_hdr->total_blocks) {
+        return -1;
+    }
+    uint64_t const AVAILABLE_BLOCKS = ring_hdr->total_blocks - block;
+    if (static_cast<uint64_t>(count) > AVAILABLE_BLOCKS) {
+        return -1;
+    }
+    if (count > BLOCKS_PER_SLOT) {
+        auto* dest = static_cast<uint8_t*>(buffer);
+        uint64_t lba = block;
+        uint32_t remaining = count;
+        while (remaining > 0) {
+            uint32_t const CHUNK = (remaining > BLOCKS_PER_SLOT) ? BLOCKS_PER_SLOT : remaining;
+            int const RET = remote_block_read_rdma(state, lba, CHUNK, dest);
+            if (RET != 0) {
+                return RET;
+            }
+            dest += static_cast<size_t>(CHUNK) * BLK_SZ;
+            lba += CHUNK;
+            remaining -= CHUNK;
+        }
+        return 0;
+    }
 
     // -- 1. Serve from read-ahead cache if the request is fully covered ------
     if (ra_cache_hit(state, block, count)) {
@@ -722,13 +758,17 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
         return 0;
     }
 
-    // -- 2. Cache miss - fetch a full slot starting at the requested LBA -----
-    //    Cap at device boundary.
-    uint32_t fetch_count = BLOCKS_PER_SLOT;
-    if (block + fetch_count > ring_hdr->total_blocks) {
-        fetch_count = static_cast<uint32_t>(ring_hdr->total_blocks - block);
+    // -- 2. Cache miss -------------------------------------------------------
+    // Random XFS metadata reads are commonly 4 KiB (8 x 512-byte sectors).
+    // Fetching a full 64 KiB slot for every miss overloads RoCE completion
+    // latency during directory walks.  Keep the caller's span for random
+    // misses, and expand only once the access pattern proves sequential.
+    bool const SEQUENTIAL_MISS = state->ra_buffer != nullptr && state->ra_valid && block == (state->ra_base_lba + state->ra_block_count);
+    uint32_t fetch_count = SEQUENTIAL_MISS ? BLOCKS_PER_SLOT : count;
+    if (fetch_count > AVAILABLE_BLOCKS) {
+        fetch_count = static_cast<uint32_t>(AVAILABLE_BLOCKS);
     }
-    if (fetch_count == 0) {
+    if (fetch_count < count) {
         return -1;
     }
     auto fetch_bytes = fetch_count * BLK_SZ;
@@ -780,7 +820,7 @@ auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t cou
     bool got_cqe = false;
 
     if (state->rdma_roce) {
-        // Server-push mode: the server pushes data slot + CQ + header into our
+        // Server-push mode: the server pushes data slot + CQ + server-owned indices into our
         // local zone via rdma_write.  wki_spin_yield_channel drives NIC RX so
         // those frames land in local memory.  No rdma_read needed.
         while (!got_cqe) {
@@ -1067,6 +1107,9 @@ auto remote_block_write(ker::dev::BlockDevice* dev, uint64_t block, size_t count
     // Re-check active after potentially blocking in fence wait
     if (!proxy_block_active(state)) {
         return -1;
+    }
+    if (ker::dev::block_device_is_read_only(dev)) {
+        return -EROFS;
     }
 
     auto cnt = static_cast<uint32_t>(count);
@@ -1516,6 +1559,9 @@ auto remote_block_write_batch(ker::dev::BlockDevice* dev, const BlockRange* rang
     if (!proxy_block_active(state)) {
         return -1;
     }
+    if (ker::dev::block_device_is_read_only(dev)) {
+        return -EROFS;
+    }
 
     if (state->rdma_attached) {
         return remote_block_write_batch_rdma(state, ranges, count);
@@ -1794,6 +1840,9 @@ auto remote_block_bulk_write(ker::dev::BlockDevice* dev, uint64_t lba, uint32_t 
             return -1;
         }
     }
+    if (ker::dev::block_device_is_read_only(dev)) {
+        return -EROFS;
+    }
     if (!proxy_block_active(state) || !state->rdma_attached || !state->bulk_capable) {
         return -1;
     }
@@ -1834,7 +1883,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
     attach_req.target_node = owner_node;
     attach_req.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
     attach_req.resource_id = resource_id;
-    attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY);
+    attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY) | DEV_ATTACH_ACCESS_READ | DEV_ATTACH_ACCESS_WRITE;
 
     WkiChannel* reserved_channel = nullptr;
     if (wki_requester_controls_dynamic_channel(g_wki.my_node_id, owner_node)) {
@@ -1852,6 +1901,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
     state->attach_status = 0;
     state->attach_channel = 0;
     state->attach_expected_cookie = 0;
+    state->attach_read_only = false;
 
 #ifdef DEBUG_WKI_TRANSPORT
     ker::mod::dbg::log("[WKI-DBG] attach_block: starting attach to node=0x%04x res_id=%u cpu=%u proxies=%u", owner_node, resource_id,
@@ -2123,6 +2173,8 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
         memcpy(state->bdev.name.data(), local_name, name_len);
         state->bdev.name.at(name_len) = '\0';
     }
+    state->bdev.capabilities = 0;
+    ker::dev::block_device_set_read_only(&state->bdev, state->attach_read_only);
     state->bdev.block_size = static_cast<size_t>(block_size);
     state->bdev.total_blocks = total_blocks;
     state->bdev.read_blocks = remote_block_read;
@@ -2171,8 +2223,9 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const
     // Register in the block device subsystem
     ker::dev::block_device_register(&state->bdev);
 
-    ker::mod::dbg::log("[WKI] Dev proxy attached: %s node=0x%04x res_id=%u ch=%u bs=%u tb=%llu", state->bdev.name.data(), owner_node,
-                       resource_id, state->assigned_channel, static_cast<unsigned>(block_size), total_blocks);
+    ker::mod::dbg::log("[WKI] Dev proxy attached: %s node=0x%04x res_id=%u ch=%u bs=%u tb=%llu access=%s", state->bdev.name.data(),
+                       owner_node, resource_id, state->assigned_channel, static_cast<unsigned>(block_size), total_blocks,
+                       ker::dev::block_device_is_read_only(&state->bdev) ? "ro" : "rw");
 
     return &state->bdev;
 }
@@ -2202,6 +2255,8 @@ void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev) {
     state->bulk_staging_rkey = 0;
     state->bulk_staging_size = 0;
     state->bulk_max_transfer = 0;
+    state->attach_read_only = false;
+    ker::dev::block_device_set_read_only(&state->bdev, false);
     ra_invalidate(state);
     set_proxy_block_active(state, false);
     if (HAD_RDMA) {
@@ -2377,12 +2432,13 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
         attach_req.target_node = node_id;
         attach_req.resource_type = static_cast<uint16_t>(ResourceType::BLOCK);
         attach_req.resource_id = p->resource_id;
-        attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY);
+        attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY) | DEV_ATTACH_ACCESS_READ | DEV_ATTACH_ACCESS_WRITE;
         attach_req.requested_channel = 0;  // auto-assign
 
         p->attach_pending.store(true, std::memory_order_release);
         p->attach_status = 0;
         p->attach_channel = 0;
+        p->attach_read_only = false;
         p->attach_expected_cookie = 0;
 
         constexpr int MAX_RESUME_RETRIES = 5;
@@ -2430,6 +2486,7 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
         s_proxy_lock.lock();
         p->assigned_channel = p->attach_channel;
         p->max_op_size = p->attach_max_op_size;
+        ker::dev::block_device_set_read_only(&p->bdev, p->attach_read_only);
         s_proxy_lock.unlock();
 
         // Re-attach RDMA zone if the new attach ACK provided one (RDMA ops outside lock)
@@ -2476,8 +2533,8 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
         p->fence_time_us = 0;
         s_proxy_lock.unlock();
 
-        ker::mod::dbg::log("[WKI] Dev proxy resumed: %s node=0x%04x ch=%u - blocked I/O will now proceed", p->bdev.name.data(), node_id,
-                           p->assigned_channel);
+        ker::mod::dbg::log("[WKI] Dev proxy resumed: %s node=0x%04x ch=%u access=%s - blocked I/O will now proceed", p->bdev.name.data(),
+                           node_id, p->assigned_channel, ker::dev::block_device_is_read_only(&p->bdev) ? "ro" : "rw");
     }
 }
 
@@ -2729,6 +2786,7 @@ void handle_dev_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
     state->attach_status = ack->status;
     state->attach_channel = ack->assigned_channel;
     state->attach_max_op_size = ack->max_op_size;
+    state->attach_read_only = (ack->rdma_flags & DEV_ATTACH_READ_ONLY) != 0;
 
     // Check for RDMA block ring zone in the extended payload
     if (payload_len >= sizeof(DevAttachAckPayload) && (ack->rdma_flags & DEV_ATTACH_RDMA_BLK_RING) != 0 && ack->blk_zone_id != 0) {

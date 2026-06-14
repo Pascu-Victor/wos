@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
+#include <vfs/stat.hpp>
 
 namespace ker::dev {
 struct Device;
@@ -32,6 +33,9 @@ struct DevFSNode {
     uint32_t mode = 0755;  // Permission bits (default: rwxr-xr-x for dirs)
     uint32_t uid = 0;      // Owner user ID
     uint32_t gid = 0;      // Owner group ID
+    Timespec atime{};
+    Timespec mtime{};
+    Timespec ctime{};
 };
 
 // Register devfs as a virtual filesystem
@@ -61,6 +65,9 @@ auto devfs_remove_node(const char* path) -> bool;
 
 // Walk a path and return the DevFSNode (for stat operations)
 auto devfs_walk_path(const char* path) -> DevFSNode*;
+
+// Return the DevFSNode stored behind an opened devfs File wrapper.
+auto devfs_file_node(File* file) -> DevFSNode*;
 
 // Populate /dev/disk/by-partuuid/<GUID> symlinks from registered block devices.
 // Call after block_device_init() has enumerated GPT partitions.

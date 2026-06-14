@@ -47,6 +47,7 @@ struct BlockDevice {
 
     // Capability flags (BDEV_CAP_* bits) - set during remote attach negotiation
     uint32_t capabilities = 0;
+    bool read_only = false;
 
     // WKI remotable trait - set by drivers that support remote access
     ker::net::wki::RemotableOps const* remotable = nullptr;
@@ -85,6 +86,14 @@ auto block_device_count() -> size_t;
 
 // Returns block device at index (for enumeration)
 auto block_device_at(size_t index) -> BlockDevice*;
+
+// Returns true when two block device handles address overlapping storage.
+// Partition devices are compared against their whole-disk parent and LBA range.
+auto block_devices_overlap(const BlockDevice* lhs, const BlockDevice* rhs) -> bool;
+
+// Set read-only state on this device and all registered overlapping aliases.
+auto block_device_set_read_only(BlockDevice* bdev, bool read_only) -> void;
+auto block_device_is_read_only(const BlockDevice* bdev) -> bool;
 
 // Initializes block devices and enumerates GPT partitions
 auto block_device_init() -> void;

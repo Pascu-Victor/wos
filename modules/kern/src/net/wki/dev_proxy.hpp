@@ -48,6 +48,7 @@ struct ProxyBlockState {
     uint8_t attach_status = 0;
     uint16_t attach_channel = 0;
     uint16_t attach_max_op_size = 0;
+    bool attach_read_only = false;
     uint8_t attach_expected_cookie = 0;
     WkiWaitEntry* attach_wait_entry = nullptr;  // V2 I-4: async wait for DEV_ATTACH_ACK
 
