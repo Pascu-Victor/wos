@@ -38,9 +38,14 @@ cmake --build build
 ### Running
 
 start via terminal
-- will start a qemu instance with debugging enabled on port 1234 attach gdb to debug
+- will set up the configured WOS cluster topology and launch the VMs
 ```
-./scripts/run_kern.sh
+wos-cluster --launch
+```
+
+- to start VM0 paused with a GDB stub on port 1234
+```
+wos-cluster --launch --debug-node 0
 ```
 
 - in a separate terminal
