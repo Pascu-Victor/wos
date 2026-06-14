@@ -45,3 +45,6 @@ build_tests
 
 #not build scripts directory!
 !scripts/build
+
+#not the benchmarks themselves!
+!tools/benchmarks
