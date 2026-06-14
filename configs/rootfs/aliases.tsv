@@ -7,6 +7,10 @@ copy	build/modules/top/top	/usr/bin/top
 copy	build/modules/memacc/memacc	/usr/bin/memacc
 copy	build/modules/renderbench/renderbench	/usr/bin/renderbench
 copy-mode	configs/drive/srv/wos_userland_suite.sh	/usr/bin/wos-userland-suite	755
+copy	configs/rootfs/root/wos-showcase	/root/wos-showcase
+symlink	/root/wos-showcase/run-all.sh	/root/run-wos-showcase
+symlink	/root/wos-showcase	/wos-showcase
+symlink	/root/wos-showcase/run-all.sh	/run-wos-showcase
 copy	build/modules/debugserver/debugserver	/usr/bin/debugserver
 copy	build/modules/strace/strace	/usr/bin/strace
 copy-mode	build/modules/sftpserver/sftp-server	/usr/libexec/sftp-server	755

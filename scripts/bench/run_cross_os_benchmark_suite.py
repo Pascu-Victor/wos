@@ -244,6 +244,30 @@ def parse_mandel_report(text: str) -> dict[str, Any]:
     return out
 
 
+def parse_showcase_summary(text: str) -> dict[str, Any]:
+    cases: list[dict[str, str]] = []
+    counts = {"PASS": 0, "FAIL": 0, "SKIP": 0}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        fields = stripped.split("\t", 2)
+        if len(fields) < 2:
+            continue
+        name = fields[0]
+        status = fields[1]
+        detail = fields[2] if len(fields) >= 3 else ""
+        cases.append({"name": name, "status": status, "detail": detail})
+        if status in counts:
+            counts[status] += 1
+    return {
+        "cases": cases,
+        "pass": counts["PASS"],
+        "fail": counts["FAIL"],
+        "skip": counts["SKIP"],
+    }
+
+
 def render_cases(args: argparse.Namespace) -> list[RenderCase]:
     return [
         RenderCase(
@@ -1293,6 +1317,158 @@ def run_linux_renderbench(
     }
 
 
+def run_wos_showcase(
+    args: argparse.Namespace,
+    suite_dir: Path,
+    suite_remote_root: str,
+    host: str,
+    wos_hosts: list[str],
+) -> dict[str, Any]:
+    prepare_wos_hosts(args, wos_hosts)
+
+    step_name = "wos-showcase"
+    step_dir = suite_dir / step_name
+    step_dir.mkdir(parents=True, exist_ok=True)
+    remote_output_root = f"{suite_remote_root}/{step_name}"
+    remote_command = " ".join(
+        [
+            shlex.quote(args.wos_showcase_script),
+            "--scale",
+            shlex.quote(args.showcase_scale),
+            "--hosts",
+            shlex.quote(",".join(wos_hosts)),
+            "--output-root",
+            shlex.quote(remote_output_root),
+        ]
+    )
+    host_command = [str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, remote_command]
+    write_text(step_dir / "command.log", "=== command ===\n" + shlex.join(host_command) + "\n")
+    fetch_timeout = positive_timeout(args.artifact_fetch_timeout)
+    try:
+        result, schedstat_entries = run_benchmark_command(args, step_dir, host_command)
+    except Exception:
+        fetch_optional_remote_file(
+            REMOTE_SCRIPTS / "wos_sftp_get.sh",
+            host,
+            f"{remote_output_root}/summary.tsv",
+            step_dir / "partial-summary.tsv",
+            timeout=fetch_timeout,
+        )
+        raise
+    write_text(step_dir / "command.log", step_log_text(result))
+
+    summary_local = step_dir / "summary.tsv"
+    fetch_remote_file(
+        REMOTE_SCRIPTS / "wos_sftp_get.sh",
+        host,
+        f"{remote_output_root}/summary.tsv",
+        summary_local,
+        timeout=fetch_timeout,
+    )
+    summary = parse_showcase_summary(summary_local.read_text(encoding="utf-8"))
+    summary.update(
+        {
+            "benchmark": "showcase",
+            "os": "wos",
+            "host": host,
+            "hosts": wos_hosts,
+            "scale": args.showcase_scale,
+            "remote_result_dir": remote_output_root,
+        }
+    )
+    write_json(step_dir / "result.json", summary)
+
+    return {
+        "name": step_name,
+        "ok": True,
+        "os": "wos",
+        "host": host,
+        "hosts": wos_hosts,
+        "command": host_command,
+        "result_file": relpath(step_dir / "result.json"),
+        "artifacts": [
+            relpath(summary_local),
+            relpath(step_dir / "result.json"),
+            relpath(step_dir / "command.log"),
+        ],
+        "host_schedstat": schedstat_entries,
+    }
+
+
+def run_linux_showcase(
+    args: argparse.Namespace,
+    suite_dir: Path,
+    linux_hosts: list[str],
+    launcher: str,
+) -> dict[str, Any]:
+    step_name = "linux-showcase"
+    step_dir = suite_dir / step_name
+    step_dir.mkdir(parents=True, exist_ok=True)
+    output_path = step_dir / "result.json"
+    summary_path = step_dir / "summary.tsv"
+    remote_output_root = f"/var/lib/wos-bench/results/showcase/{args.remote_suite_name}/{step_name}"
+
+    command = [
+        str(BENCH_SCRIPTS / "run_linux_showcase_suite.sh"),
+        "--launcher",
+        launcher,
+        "--hosts",
+        ",".join(linux_hosts),
+        "--scale",
+        args.showcase_scale,
+        "--output-root",
+        remote_output_root,
+        "--summary",
+        str(summary_path),
+        "--output",
+        str(output_path),
+    ]
+    write_text(step_dir / "command.log", "=== command ===\n" + shlex.join(command) + "\n")
+    try:
+        result, schedstat_entries = run_benchmark_command(args, step_dir, command)
+    except Exception:
+        if output_path.exists():
+            shutil.copyfile(output_path, step_dir / "partial-result.json")
+        if summary_path.exists():
+            shutil.copyfile(summary_path, step_dir / "partial-summary.tsv")
+        raise
+    write_text(step_dir / "command.log", step_log_text(result))
+
+    summary = json.loads(output_path.read_text(encoding="utf-8"))
+    summary.update(
+        {
+            "benchmark": "showcase",
+            "os": "linux",
+            "host": launcher,
+            "hosts": linux_hosts,
+            "scale": args.showcase_scale,
+            "remote_result_dir": remote_output_root,
+        }
+    )
+    write_json(output_path, summary)
+
+    artifacts = [
+        relpath(output_path),
+        relpath(summary_path),
+        relpath(step_dir / "command.log"),
+    ]
+    log_dir = Path(str(output_path.with_suffix("")) + "-logs")
+    if log_dir.is_dir():
+        artifacts.extend(relpath(path) for path in sorted(log_dir.glob("*.log")))
+
+    return {
+        "name": step_name,
+        "ok": True,
+        "os": "linux",
+        "host": launcher,
+        "hosts": linux_hosts,
+        "command": command,
+        "result_file": relpath(output_path),
+        "artifacts": artifacts,
+        "host_schedstat": schedstat_entries,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the configured WOS/Linux benchmark suite across already-running VMs."
@@ -1530,6 +1706,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not capture WOS perf ipc-report and wki-report snapshots around WOS benchmark steps.",
     )
+    parser.add_argument(
+        "--showcase-scale",
+        choices=("quick", "full", "stress"),
+        default="quick",
+        help="Scale for the WOS/Linux showcase script suites.",
+    )
+    parser.add_argument(
+        "--wos-showcase-script",
+        default="/root/run-wos-showcase",
+        help="Remote WOS showcase runner path installed in the XFS rootfs.",
+    )
+    parser.add_argument("--skip-showcase", action="store_true")
     parser.add_argument("--skip-mandelbench", action="store_true")
     parser.add_argument("--skip-renderbench", action="store_true")
     return parser
@@ -1719,6 +1907,18 @@ def main() -> int:
             lambda: run_host_schedstat_probe(args, suite_dir, wos_launcher),
             host_kvm_trace=False,
         )
+
+    if not args.skip_showcase:
+        if run_wos:
+            run_step(
+                "wos-showcase",
+                lambda: run_wos_showcase(args, suite_dir, suite_remote_root, wos_launcher, wos_hosts),
+            )
+        if run_linux:
+            run_step(
+                "linux-showcase",
+                lambda: run_linux_showcase(args, suite_dir, linux_hosts, linux_launcher),
+            )
 
     if not args.skip_mandelbench:
         if run_wos:
