@@ -487,6 +487,18 @@ auto start_network() -> bool {
             close(POLL_SOCK);
             return false;
         }
+
+        int32_t netd_status = 0;
+        auto const NETD_PID_SIGNED = static_cast<int64_t>(NETD_PID);
+        int64_t const NETD_REAPED = ker::process::waitpid(NETD_PID_SIGNED, &netd_status, WNOHANG, nullptr);
+        if (NETD_REAPED == NETD_PID_SIGNED) {
+            init_log::critical("init[%llu]: netd exited before eth0 IPv4 configuration (status=%d)", static_cast<unsigned long long>(CPUNO),
+                               netd_status);
+            dump_network_failure_debug("netd exited before eth0 received a non-zero IPv4 address", NETD_PID, &poll, POLL_SOCK);
+            close(POLL_SOCK);
+            return false;
+        }
+
         struct timespec const POLL_SLEEP{
             .tv_sec = 0,
             .tv_nsec = POLL_INTERVAL_MS * 1000L * 1000L,

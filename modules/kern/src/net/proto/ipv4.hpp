@@ -35,6 +35,10 @@ void ipv4_rx(NetDevice* dev, PacketBuffer* pkt);
 // TX: build IPv4 header, route, resolve ARP, send
 auto ipv4_tx(PacketBuffer* pkt, IPv4Address src, IPv4Address dst, uint8_t proto, uint8_t ttl) -> int;
 
+// TX: build IPv4 header and send through a specific device. Used by sockets
+// bound with SO_BINDTODEVICE.
+auto ipv4_tx_on_dev(PacketBuffer* pkt, NetDevice* out_dev, IPv4Address src, IPv4Address dst, uint8_t proto, uint8_t ttl) -> int;
+
 // Convenience: auto-select source address based on routing
 auto ipv4_tx_auto(PacketBuffer* pkt, IPv4Address dst, uint8_t proto) -> int;
 

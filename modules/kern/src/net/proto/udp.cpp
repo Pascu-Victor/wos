@@ -9,6 +9,7 @@
 #include <cstring>
 #include <net/address.hpp>
 #include <net/endian.hpp>
+#include <net/netif.hpp>
 #include <net/proto/ipv4.hpp>
 #include <platform/sys/spinlock.hpp>
 
@@ -68,6 +69,29 @@ auto binding_accepts_dev(const UdpBinding* binding, NetDevice const* dev) -> boo
     }
     uint32_t const BOUND_IFINDEX = binding->sock->bound_ifindex;
     return BOUND_IFINDEX == 0 || (dev != nullptr && dev->ifindex == BOUND_IFINDEX);
+}
+
+auto netdev_find_by_ifindex(uint32_t ifindex) -> NetDevice* {
+    if (ifindex == 0) {
+        return nullptr;
+    }
+
+    size_t const COUNT = netdev_count();
+    for (size_t i = 0; i < COUNT; i++) {
+        auto* dev = netdev_at(i);
+        if (dev != nullptr && dev->ifindex == ifindex) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
+auto first_ipv4_or_any(NetDevice* dev) -> IPv4Address {
+    auto* nif = netif_get(dev);
+    if (nif == nullptr || nif->ipv4_addr_count == 0) {
+        return IPv4Address::any();
+    }
+    return nif->ipv4_addrs.front().addr;
 }
 
 int udp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
@@ -206,7 +230,11 @@ auto udp_sendto(Socket* sock, const void* buf, size_t len, int /*unused*/, const
 
     uint32_t const SRC = sock->local_v4.addr;
     int tx_ret = -1;
-    if (SRC == 0) {
+    if (sock->bound_ifindex != 0) {
+        auto* bound_dev = netdev_find_by_ifindex(sock->bound_ifindex);
+        IPv4Address const BOUND_SRC = SRC == 0 ? first_ipv4_or_any(bound_dev) : IPv4Address(SRC);
+        tx_ret = ipv4_tx_on_dev(pkt, bound_dev, BOUND_SRC, ip, IPPROTO_UDP, UDP_IPV4_TTL);
+    } else if (SRC == 0) {
         tx_ret = ipv4_tx_auto(pkt, ip, IPPROTO_UDP);
     } else {
         tx_ret = ipv4_tx(pkt, SRC, ip, IPPROTO_UDP, UDP_IPV4_TTL);

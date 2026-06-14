@@ -534,6 +534,11 @@ auto set_netdev_hwaddr(ker::net::NetDevice* dev, const uint8_t* hwaddr, uint8_t 
     ker::net::wki::wki_remotable_notify_net_changed(dev);
     return 0;
 }
+
+void notify_netdev_l3_changed(ker::net::NetDevice* dev) {
+    ker::net::wki::wki_dev_server_notify_net_changed(dev);
+    ker::net::wki::wki_remotable_notify_net_changed(dev);
+}
 }  // namespace
 
 uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
@@ -990,10 +995,14 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     uint32_t const ADDR = ker::net::ntohl(load_unaligned<uint32_t>(arg + 20));
                     // Check if interface already has addresses; if so, update first one
                     auto* nif = ker::net::netif_get(dev);
-                    if (nif != nullptr && nif->ipv4_addr_count > 0) {
+                    if (nif == nullptr) {
+                        return static_cast<uint64_t>(-ENOMEM);
+                    }
+                    if (nif->ipv4_addr_count > 0) {
                         nif->ipv4_addrs[0].addr = ADDR;
+                        notify_netdev_l3_changed(dev);
                     } else {
-                        ker::net::netif_add_ipv4(dev, ADDR, 0xFFFFFF00);  // default /24
+                        return static_cast<uint64_t>(ker::net::netif_add_ipv4(dev, ADDR, 0xFFFFFF00));  // default /24
                     }
                     return 0;
                 }
@@ -1010,9 +1019,14 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 case SIOC_SIFNETMASK: {
                     uint32_t const MASK = ker::net::ntohl(load_unaligned<uint32_t>(arg + 20));
                     auto* nif = ker::net::netif_get(dev);
-                    if (nif != nullptr && nif->ipv4_addr_count > 0) {
-                        nif->ipv4_addrs[0].netmask = MASK;
+                    if (nif == nullptr) {
+                        return static_cast<uint64_t>(-ENOMEM);
                     }
+                    if (nif->ipv4_addr_count == 0) {
+                        return static_cast<uint64_t>(-EADDRNOTAVAIL);
+                    }
+                    nif->ipv4_addrs[0].netmask = MASK;
+                    notify_netdev_l3_changed(dev);
                     return 0;
                 }
                 case SIOC_GIFHWADDR: {

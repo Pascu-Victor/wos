@@ -538,11 +538,14 @@ auto parse_reply(const uint8_t* data, size_t len, uint32_t expected_xid, DhcpLea
     return msg_type;
 }
 
-void apply_lease(const char* ifname, const DhcpLease& lease) {
+auto apply_lease(const char* ifname, const DhcpLease& lease) -> bool {
     int const SOCK = socket(AF_INET, SOCK_DGRAM, 0);
     if (SOCK < 0) {
-        return;
+        logger::error("netd: failed to open lease apply socket: errno=%d", errno);
+        return false;
     }
+
+    bool applied = true;
 
     // Set IP address
     {
@@ -551,7 +554,11 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
         addr->sin_family = AF_INET;
         addr->sin_addr.s_addr = htonl(lease.your_ip);
-        ioctl(SOCK, SIOCSIFADDR, &ifr);
+        int const RET = ioctl(SOCK, SIOCSIFADDR, &ifr);
+        if (RET != 0) {
+            logger::error("netd: failed to set %s IPv4 address: ret=%d errno=%d", ifname, RET, errno);
+            applied = false;
+        }
     }
 
     // Set netmask
@@ -561,7 +568,11 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_netmask);
         addr->sin_family = AF_INET;
         addr->sin_addr.s_addr = htonl(lease.subnet_mask);
-        ioctl(SOCK, SIOCSIFNETMASK, &ifr);
+        int const RET = ioctl(SOCK, SIOCSIFNETMASK, &ifr);
+        if (RET != 0) {
+            logger::error("netd: failed to set %s IPv4 netmask: ret=%d errno=%d", ifname, RET, errno);
+            applied = false;
+        }
     }
 
     // Add local subnet route (direct, no gateway) so on-subnet traffic is
@@ -575,7 +586,10 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
         auto* genmask = reinterpret_cast<struct sockaddr_in*>(&rt.rt_genmask);
         genmask->sin_family = AF_INET;
         genmask->sin_addr.s_addr = htonl(lease.subnet_mask);
-        ioctl(SOCK, SIOCADDRT, &rt);
+        int const RET = ioctl(SOCK, SIOCADDRT, &rt);
+        if (RET != 0) {
+            logger::warn("netd: failed to add local subnet route for %s: ret=%d errno=%d", ifname, RET, errno);
+        }
     }
 
     // Add default route via router
@@ -585,11 +599,17 @@ void apply_lease(const char* ifname, const DhcpLease& lease) {
         auto* gateway = reinterpret_cast<struct sockaddr_in*>(&rt.rt_gateway);
         gateway->sin_family = AF_INET;
         gateway->sin_addr.s_addr = htonl(lease.router);
-        ioctl(SOCK, SIOCADDRT, &rt);
+        int const RET = ioctl(SOCK, SIOCADDRT, &rt);
+        if (RET != 0) {
+            logger::warn("netd: failed to add default route for %s: ret=%d errno=%d", ifname, RET, errno);
+        }
     }
 
     close(SOCK);
-    write_resolv_conf(lease);
+    if (applied) {
+        write_resolv_conf(lease);
+    }
+    return applied;
 }
 
 auto monotonic_now_us() -> uint64_t {
@@ -891,7 +911,11 @@ request_failed:
 
     // === APPLY CONFIGURATION ===
     logger::info("netd: DHCP ACK received, applying configuration");
-    apply_lease(ifname, lease);
+    if (!apply_lease(ifname, lease)) {
+        logger::error("netd: DHCP lease apply failed, exiting");
+        close(SOCK);
+        return 1;
+    }
 
     {
         std::array<char, 16> ip_str{};
@@ -979,7 +1003,12 @@ request_failed:
                 resolver_changed = true;
             }
             if (network_changed) {
-                apply_lease(ifname, lease);
+                if (!apply_lease(ifname, lease)) {
+                    logger::warn("netd: renewal lease apply failed, retrying renewal path");
+                    consecutive_renewal_failures++;
+                    t1_seconds = DHCP_RENEWAL_RETRY_SECS;
+                    continue;
+                }
             } else if (resolver_changed) {
                 write_resolv_conf(lease);
             }

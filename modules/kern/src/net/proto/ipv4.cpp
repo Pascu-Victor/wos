@@ -24,7 +24,59 @@ using log = ker::mod::dbg::logger<"ipv4">;
 
 namespace {
 uint16_t ip_id_counter = 0;
+
+void write_ipv4_header(PacketBuffer* pkt, IPv4Address src, IPv4Address dst, uint8_t proto, uint8_t ttl) {
+    auto* hdr = reinterpret_cast<IPv4Header*>(pkt->push(sizeof(IPv4Header)));
+    std::memset(hdr, 0, sizeof(IPv4Header));
+
+    hdr->ihl_version = (4 << 4) | 5;  // IPv4, 5 dwords (no options)
+    hdr->tos = 0;
+    hdr->total_len = htons(static_cast<uint16_t>(pkt->len));
+    hdr->id = htons(ip_id_counter++);
+    hdr->flags_fragoff = htons(0x4000);  // Don't Fragment flag
+    hdr->ttl = ttl;
+    hdr->protocol = proto;
+    hdr->checksum = 0;
+    hdr->src_addr = src.to_network_order();
+    hdr->dst_addr = dst.to_network_order();
+    hdr->checksum = checksum_compute(hdr, sizeof(IPv4Header));
 }
+
+auto deliver_local_or_emit(PacketBuffer* pkt, IPv4Address dst, NetDevice* out_dev, IPv4Address next_hop) -> int {
+    // Packets destined to one of our own interface addresses should be
+    // reinjected locally instead of depending on NIC/ARP self-delivery.
+    if (auto* local_nif = netif_find_by_ipv4(dst); local_nif != nullptr && local_nif->dev != nullptr) {
+        pkt->dev = local_nif->dev;
+        pkt->src_mac = local_nif->dev->mac;
+        ipv4_rx(local_nif->dev, pkt);
+        return 0;  // pkt ownership transferred to ipv4_rx()
+    }
+
+    if (out_dev == nullptr) {
+        pkt_free(pkt);
+        return -1;
+    }
+
+    // If the device is loopback, bypass ARP
+    if (std::strcmp(out_dev->name.data(), "lo") == 0) {
+#ifdef DEBUG_IPV4
+        log::debug("ipv4_tx: loopback device, calling start_xmit");
+#endif
+        return out_dev->ops->start_xmit(out_dev, pkt);
+    }
+
+    // Resolve MAC address via ARP
+    MacAddress dst_mac{};
+    int const ARP_RESULT = arp_resolve(out_dev, next_hop, dst_mac, pkt);
+    if (ARP_RESULT < 0) {
+        // Packet queued in ARP pending list or dropped on timeout
+        // Packet ownership transferred to ARP subsystem
+        return 0;
+    }
+
+    return eth_tx(out_dev, pkt, dst_mac, ETH_TYPE_IPV4);
+}
+}  // namespace
 
 void ipv4_rx(NetDevice* dev, PacketBuffer* pkt) {
 #ifdef DEBUG_IPV4
@@ -127,32 +179,7 @@ void ipv4_rx(NetDevice* dev, PacketBuffer* pkt) {
 }
 
 auto ipv4_tx(PacketBuffer* pkt, IPv4Address src, IPv4Address dst, uint8_t proto, uint8_t ttl) -> int {
-    // Prepend IPv4 header
-    auto* hdr = reinterpret_cast<IPv4Header*>(pkt->push(sizeof(IPv4Header)));
-    std::memset(hdr, 0, sizeof(IPv4Header));
-
-    hdr->ihl_version = (4 << 4) | 5;  // IPv4, 5 dwords (no options)
-    hdr->tos = 0;
-    hdr->total_len = htons(static_cast<uint16_t>(pkt->len));
-    hdr->id = htons(ip_id_counter++);
-    hdr->flags_fragoff = htons(0x4000);  // Don't Fragment flag
-    hdr->ttl = ttl;
-    hdr->protocol = proto;
-    hdr->checksum = 0;
-    hdr->src_addr = src.to_network_order();
-    hdr->dst_addr = dst.to_network_order();
-
-    // Compute header checksum
-    hdr->checksum = checksum_compute(hdr, sizeof(IPv4Header));
-
-    // Packets destined to one of our own interface addresses should be
-    // reinjected locally instead of depending on NIC/ARP self-delivery.
-    if (auto* local_nif = netif_find_by_ipv4(dst); local_nif != nullptr && local_nif->dev != nullptr) {
-        pkt->dev = local_nif->dev;
-        pkt->src_mac = local_nif->dev->mac;
-        ipv4_rx(local_nif->dev, pkt);
-        return 0;  // pkt ownership transferred to ipv4_rx()
-    }
+    write_ipv4_header(pkt, src, dst, proto, ttl);
 
     // Route the packet
     auto* route = route_lookup(dst);
@@ -171,11 +198,6 @@ auto ipv4_tx(PacketBuffer* pkt, IPv4Address src, IPv4Address dst, uint8_t proto,
         }
     }
 
-    if (out_dev == nullptr) {
-        pkt_free(pkt);
-        return -1;
-    }
-
     // Determine next hop: if the matched route has a gateway, use it.
     // Direct routes (on-link) have gateway=0, so next_hop stays as dst.
     IPv4Address next_hop = dst;
@@ -183,24 +205,24 @@ auto ipv4_tx(PacketBuffer* pkt, IPv4Address src, IPv4Address dst, uint8_t proto,
         next_hop = route->gateway;
     }
 
-    // If the device is loopback, bypass ARP
-    if (std::strcmp(out_dev->name.data(), "lo") == 0) {
-#ifdef DEBUG_IPV4
-        log::debug("ipv4_tx: loopback device, calling start_xmit");
-#endif
-        return out_dev->ops->start_xmit(out_dev, pkt);
+    return deliver_local_or_emit(pkt, dst, out_dev, next_hop);
+}
+
+auto ipv4_tx_on_dev(PacketBuffer* pkt, NetDevice* out_dev, IPv4Address src, IPv4Address dst, uint8_t proto, uint8_t ttl) -> int {
+    write_ipv4_header(pkt, src, dst, proto, ttl);
+
+    if (out_dev == nullptr || out_dev->state == 0) {
+        pkt_free(pkt);
+        return -1;
     }
 
-    // Resolve MAC address via ARP
-    MacAddress dst_mac{};
-    int const ARP_RESULT = arp_resolve(out_dev, next_hop, dst_mac, pkt);
-    if (ARP_RESULT < 0) {
-        // Packet queued in ARP pending list or dropped on timeout
-        // Packet ownership transferred to ARP subsystem
-        return 0;
+    IPv4Address next_hop = dst;
+    auto* route = route_lookup(dst);
+    if (route != nullptr && route->dev == out_dev && !route->gateway.is_any()) {
+        next_hop = route->gateway;
     }
 
-    return eth_tx(out_dev, pkt, dst_mac, ETH_TYPE_IPV4);
+    return deliver_local_or_emit(pkt, dst, out_dev, next_hop);
 }
 
 auto ipv4_tx_auto(PacketBuffer* pkt, IPv4Address dst, uint8_t proto) -> int {
