@@ -17,6 +17,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <util/crc32c.hpp>
 #include <vfs/buffer_cache.hpp>
@@ -315,6 +316,60 @@ auto inactivate_unlinked_inode(XfsInode* ip) -> int {
     return rc;
 }
 
+auto count_cached_mount_inodes(const XfsMountContext* mount) -> size_t {
+    size_t count = 0;
+    for (auto& bucket : icache) {
+        uint64_t const FLAGS = bucket.lock.lock_irqsave();
+        for (XfsInode* ip = bucket.head; ip != nullptr; ip = ip->hash_next) {
+            if (ip->mount == mount && !ip->inactivation_started) {
+                ++count;
+            }
+        }
+        bucket.lock.unlock_irqrestore(FLAGS);
+    }
+    return count;
+}
+
+auto collect_cached_mount_inodes(const XfsMountContext* mount, XfsInode** inodes, size_t capacity) -> size_t {
+    if (inodes == nullptr || capacity == 0) {
+        return 0;
+    }
+
+    size_t count = 0;
+    for (auto& bucket : icache) {
+        uint64_t const FLAGS = bucket.lock.lock_irqsave();
+        for (XfsInode* ip = bucket.head; ip != nullptr && count < capacity; ip = ip->hash_next) {
+            if (ip->mount == mount && !ip->inactivation_started) {
+                ip->refcount++;
+                inodes[count++] = ip;  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+            }
+        }
+        bucket.lock.unlock_irqrestore(FLAGS);
+        if (count == capacity) {
+            break;
+        }
+    }
+    return count;
+}
+
+auto xfs_commit_cached_dirty_inode(XfsMountContext* mount, XfsInode* ip) -> int {
+    if (mount == nullptr || ip == nullptr || mount->read_only || !ip->dirty) {
+        return 0;
+    }
+
+    uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ILOG);
+    XfsTransaction* tp = xfs_trans_alloc(mount);
+    if (tp == nullptr) {
+        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ILOG, STARTED_US, -ENOMEM, 0);
+        return -ENOMEM;
+    }
+
+    xfs_trans_log_inode(tp, ip);
+    int const RET = xfs_trans_commit(tp);
+    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ILOG, STARTED_US, RET, 0);
+    return RET == 0 ? 0 : -EIO;
+}
+
 // Parse a fork from the on-disk inode. data_size is the available fork space;
 // local_size is the logical byte count for LOCAL forks.
 auto parse_ifork(XfsIfork* fork, uint8_t fmt, const uint8_t* data_ptr, size_t data_size, size_t local_size, uint32_t nextents) -> int {
@@ -424,6 +479,65 @@ void xfs_icache_purge(XfsMountContext* mount) {
         }
         i.lock.unlock_irqrestore(FLAGS);
     }
+}
+
+auto xfs_icache_sync_dirty(XfsMountContext* mount) -> int {
+    if (mount == nullptr || mount->read_only) {
+        return 0;
+    }
+
+    xfs_icache_init();
+
+    size_t const INODE_COUNT = count_cached_mount_inodes(mount);
+    if (INODE_COUNT == 0) {
+        return 0;
+    }
+
+    auto** inodes = new (std::nothrow) XfsInode*[INODE_COUNT];
+    if (inodes == nullptr) {
+        return -ENOMEM;
+    }
+
+    size_t const COLLECTED = std::min(collect_cached_mount_inodes(mount, inodes, INODE_COUNT), INODE_COUNT);
+    int result = 0;
+
+    for (size_t i = 0; i < COLLECTED; ++i) {
+        auto* ip = inodes[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        {
+            mod::sys::MutexGuard guard(ip->io_lock);
+            if (ip->mount == mount && !ip->inactivation_started) {
+                int const RET = xfs_commit_cached_dirty_inode(mount, ip);
+                if (RET != 0 && result == 0) {
+                    result = RET;
+                }
+            }
+        }
+        xfs_inode_release(ip);
+    }
+
+    delete[] inodes;
+    return result;
+}
+
+auto xfs_inode_truncate_data(XfsInode* ip, XfsTransaction* tp) -> int {
+    if (ip == nullptr || ip->mount == nullptr || tp == nullptr) {
+        return -EINVAL;
+    }
+
+    int const RC = free_inode_data_extents(ip, tp);
+    if (RC != 0) {
+        return RC;
+    }
+
+    free_ifork(&ip->data_fork);
+    ip->data_fork.format = XFS_DINODE_FMT_EXTENTS;
+    ip->data_fork.extents.list = nullptr;
+    ip->data_fork.extents.count = 0;
+    ip->data_fork.extents.capacity = 0;
+    ip->nextents = 0;
+    ip->nblocks = 0;
+    ip->dirty = true;
+    return 0;
 }
 
 auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {

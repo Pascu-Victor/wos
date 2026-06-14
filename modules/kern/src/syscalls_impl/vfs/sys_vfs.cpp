@@ -392,6 +392,9 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             int const FD = static_cast<int>(a1);
             return static_cast<int64_t>(ker::vfs::vfs_fsync(FD));
         }
+        case ops::SYNC: {
+            return static_cast<int64_t>(ker::vfs::vfs_sync());
+        }
         case ops::LINK: {
             const auto* oldpath = reinterpret_cast<const char*>(a1);
             const auto* newpath = reinterpret_cast<const char*>(a2);

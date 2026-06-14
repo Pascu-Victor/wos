@@ -15,6 +15,7 @@
 #include <vfs/fs/xfs/xfs_btree.hpp>
 #include <vfs/fs/xfs/xfs_format.hpp>
 #include <vfs/fs/xfs/xfs_mount.hpp>
+#include <vfs/fs/xfs/xfs_vfs.hpp>
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -56,6 +57,37 @@ KTEST(XFS, InodeStructSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsDinode), stati
 KTEST(XFS, AgfStructSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsAgf), static_cast<size_t>(224)); }
 
 KTEST(XFS, BmbtRecSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsBmbtRec), static_cast<size_t>(16)); }
+
+KTEST(XFS, SmallHoleWriteAllocatesOnlyNeededBlocks) {
+    constexpr size_t BLOCK_SIZE = 4096;
+    constexpr uint32_t BLOCK_LOG = 12;
+    constexpr ker::vfs::xfs::xfs_filblks_t UNBOUNDED_HOLE = ~static_cast<ker::vfs::xfs::xfs_filblks_t>(0);
+
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(0, 12, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG),
+               static_cast<ker::vfs::xfs::xfs_extlen_t>(1));
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(0, 4096, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG),
+               static_cast<ker::vfs::xfs::xfs_extlen_t>(1));
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(0, 4097, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG),
+               static_cast<ker::vfs::xfs::xfs_extlen_t>(2));
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(4095, 2, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG),
+               static_cast<ker::vfs::xfs::xfs_extlen_t>(2));
+}
+
+KTEST(XFS, HoleWriteStillCapsLargeAllocations) {
+    constexpr size_t BLOCK_SIZE = 4096;
+    constexpr uint32_t BLOCK_LOG = 12;
+    constexpr size_t BIG_WRITE_BYTES = size_t{512} * 1024 * 1024;
+    constexpr ker::vfs::xfs::xfs_filblks_t UNBOUNDED_HOLE = ~static_cast<ker::vfs::xfs::xfs_filblks_t>(0);
+
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(0, BIG_WRITE_BYTES, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG),
+               static_cast<ker::vfs::xfs::xfs_extlen_t>(65536));
+}
+
+KTEST(XFS, TruncateZeroResetsStaleDataFork) {
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_truncate_zero_resets_data(12, 1));
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_truncate_zero_resets_data(0, 1024));
+    KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_truncate_zero_resets_data(0, 0));
+}
 
 // ---------------------------------------------------------------------------
 // xfs_mount() error path: corrupt magic (all zeros) must return != 0

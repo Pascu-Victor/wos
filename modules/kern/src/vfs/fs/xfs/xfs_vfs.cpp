@@ -51,6 +51,10 @@ constexpr uint32_t XFS_SLOW_TRACE_US = 2048;
 constexpr size_t XFS_DIRECT_READ_MIN_BYTES = size_t{64} * 1024;
 constexpr uint64_t XFS_NSEC_PER_SEC = 1000000000ULL;
 constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
+// Maximum blocks to allocate per metadata transaction.
+// Each transaction covers one contiguous extent allocation, so the actual
+// number of transactions for a sequential write is (total_blocks / batch).
+constexpr xfs_extlen_t XFS_WRITE_BATCH_BLOCKS = 65536;  // up to 256 MiB per transaction
 
 // ============================================================================
 // Per-open-file state
@@ -121,6 +125,16 @@ auto xfs_current_timestamp(const XfsInode* ip) -> uint64_t {
     bool const BIGTIME = ip != nullptr && (ip->flags2 & XFS_DIFLAG2_BIGTIME) != 0;
     return xfs_encode_epoch_timestamp(ker::mod::time::get_epoch_ns(), BIGTIME);
 }
+
+auto xfs_hole_write_alloc_blocks(size_t block_off, size_t remaining_bytes, xfs_filblks_t hole_blocks, size_t block_size, uint32_t block_log)
+    -> xfs_extlen_t {
+    size_t const BLOCKS_NEEDED = (block_off + remaining_bytes + block_size - 1) >> block_log;
+    auto alloc_blocks = static_cast<xfs_extlen_t>(std::min(hole_blocks, static_cast<xfs_filblks_t>(BLOCKS_NEEDED)));
+    alloc_blocks = std::min(alloc_blocks, XFS_WRITE_BATCH_BLOCKS);
+    return alloc_blocks == 0 ? 1 : alloc_blocks;
+}
+
+auto xfs_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks) -> bool { return old_size != 0 || nblocks != 0; }
 
 void xfs_stamp_new_inode(XfsInode* ip) {
     if (ip == nullptr) {
@@ -622,11 +636,6 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     return finish_read(static_cast<ssize_t>(total_read));
 }
 
-// Maximum blocks to allocate per metadata transaction.
-// Each transaction covers one contiguous extent allocation, so the actual
-// number of transactions for a sequential write is (total_blocks / batch).
-constexpr xfs_extlen_t XFS_WRITE_BATCH_BLOCKS = 65536;  // up to 256 MiB per transaction
-
 auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset) -> ssize_t {
     if (f == nullptr || buf == nullptr) {
         return -EINVAL;
@@ -775,21 +784,9 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
             loc_hole++;
 #endif
             // Hole: batch-allocate as many contiguous blocks as we can.
-            // bmap.blockcount tells us how many blocks remain in this hole.
             size_t const REMAINING_BYTES = count - total_written;
-            // Blocks needed to cover remaining write (may start mid-block)
-            size_t blocks_needed = (BLOCK_OFF + REMAINING_BYTES + ctx->block_size - 1) >> ctx->block_log;
-            // Always allocate at least 1024 blocks (4MB) to amortise per-transaction overhead
-            // across many small write() syscalls. The extra blocks become pre-allocated extent
-            // that subsequent writes find already mapped, skipping allocation entirely.
-            constexpr xfs_extlen_t XFS_WRITE_MIN_ALLOC = 1024;
-            blocks_needed = std::max(blocks_needed, static_cast<size_t>(XFS_WRITE_MIN_ALLOC));
-            // Cap to hole size and batch limit
-            auto hole_blocks = static_cast<xfs_extlen_t>(std::min(bmap.blockcount, static_cast<xfs_filblks_t>(blocks_needed)));
-            hole_blocks = std::min(hole_blocks, XFS_WRITE_BATCH_BLOCKS);
-            if (hole_blocks == 0) {
-                hole_blocks = 1;
-            }
+            xfs_extlen_t const HOLE_BLOCKS =
+                xfs_hole_write_alloc_blocks(BLOCK_OFF, REMAINING_BYTES, bmap.blockcount, ctx->block_size, ctx->block_log);
 
 #ifdef XFS_BENCH
             t0 = ker::mod::tsc::get_ns();
@@ -808,7 +805,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
             req.agno = PREF_AG;
             req.agbno = 0;
             req.minlen = 1;
-            req.maxlen = hole_blocks;
+            req.maxlen = HOLE_BLOCKS;
             req.alignment = 0;
 
             XfsAllocResult alloc_result{};
@@ -1152,15 +1149,32 @@ auto xfs_vfs_truncate(File* f, off_t length) -> int {
     auto new_size = static_cast<uint64_t>(length);
 
     uint64_t const OLD_SIZE = ip->size;
-    if (new_size == OLD_SIZE) {
+    bool const ZERO_TRUNCATE_RESETS_DATA = new_size == 0 && xfs_truncate_zero_resets_data(OLD_SIZE, ip->nblocks);
+    if (new_size == OLD_SIZE && !ZERO_TRUNCATE_RESETS_DATA) {
         return 0;  // no change
     }
 
-    if (new_size == 0 && OLD_SIZE != 0) {
-        int const DISCARD_RET = discard_inode_data_buffers(ctx, ip, OLD_SIZE);
-        if (DISCARD_RET < 0) {
-            return DISCARD_RET;
+    if (ZERO_TRUNCATE_RESETS_DATA) {
+        if (OLD_SIZE != 0) {
+            int const DISCARD_RET = discard_inode_data_buffers(ctx, ip, OLD_SIZE);
+            if (DISCARD_RET < 0) {
+                return DISCARD_RET;
+            }
         }
+
+        XfsTransaction* tp = xfs_trans_alloc(ctx);
+        if (tp == nullptr) {
+            return -ENOMEM;
+        }
+        int const TRUNC_RET = xfs_inode_truncate_data(ip, tp);
+        if (TRUNC_RET != 0) {
+            xfs_trans_cancel(tp);
+            return TRUNC_RET;
+        }
+        ip->size = 0;
+        xfs_trans_log_inode(tp, ip);
+        int const RET = xfs_trans_commit(tp);
+        return (RET == 0) ? 0 : -EIO;
     }
 
     // Update the inode size
@@ -1199,6 +1213,17 @@ FileOperations xfs_fops = {
 
 auto get_xfs_fops() -> FileOperations* { return &xfs_fops; }
 
+#ifdef WOS_SELFTEST
+auto xfs_selftest_hole_write_alloc_blocks(size_t block_off, size_t remaining_bytes, xfs_filblks_t hole_blocks, size_t block_size,
+                                          uint32_t block_log) -> xfs_extlen_t {
+    return xfs_hole_write_alloc_blocks(block_off, remaining_bytes, hole_blocks, block_size, block_log);
+}
+
+auto xfs_selftest_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks) -> bool {
+    return xfs_truncate_zero_resets_data(old_size, nblocks);
+}
+#endif
+
 auto xfs_write_append(File* f, const void* buf, size_t count, size_t* offset_out) -> ssize_t {
     if (f == nullptr || buf == nullptr) {
         return -EINVAL;
@@ -1229,6 +1254,16 @@ auto xfs_fsync(File* f) -> int {
     int const DATA_RET = sync_inode_data_buffers(xfd->mount, xfd->inode, xfd->inode->size);
     int const INODE_RET = xfs_commit_dirty_inode(xfd->mount, xfd->inode);
     return (DATA_RET != 0) ? DATA_RET : INODE_RET;
+}
+
+auto xfs_sync_mount(XfsMountContext* ctx) -> int {
+    if (ctx == nullptr || ctx->device == nullptr) {
+        return -EINVAL;
+    }
+
+    int const INODE_RET = xfs_icache_sync_dirty(ctx);
+    int const BLOCK_RET = sync_blockdev(ctx->device);
+    return (INODE_RET != 0) ? INODE_RET : BLOCK_RET;
 }
 
 // ============================================================================
@@ -1371,25 +1406,50 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
                       static_cast<unsigned long>(ip->size));
 #endif
         uint64_t const OLD_SIZE = ip->size;
-        if (OLD_SIZE != 0) {
-            int const DISCARD_RET = discard_inode_data_buffers(ctx, ip, OLD_SIZE);
-            if (DISCARD_RET < 0) {
+        if (xfs_truncate_zero_resets_data(OLD_SIZE, ip->nblocks)) {
+            if (OLD_SIZE != 0) {
+                int const DISCARD_RET = discard_inode_data_buffers(ctx, ip, OLD_SIZE);
+                if (DISCARD_RET < 0) {
+                    xfs_inode_release(ip);
+                    return nullptr;
+                }
+            }
+
+            XfsTransaction* tp = xfs_trans_alloc(ctx);
+            if (tp == nullptr) {
                 xfs_inode_release(ip);
                 return nullptr;
             }
-        }
-        ip->size = 0;
-        ip->dirty = true;
-        XfsTransaction* tp = xfs_trans_alloc(ctx);
-        if (tp != nullptr) {
+            int const TRUNC_RET = xfs_inode_truncate_data(ip, tp);
+            if (TRUNC_RET != 0) {
+                xfs_trans_cancel(tp);
+                xfs_inode_release(ip);
+                return nullptr;
+            }
+            ip->size = 0;
             xfs_trans_log_inode(tp, ip);
             int const TRC = xfs_trans_commit(tp);
 #ifdef XFS_DEBUG
-            mod::dbg::log("[xfs] O_TRUNC: commit rc=%d", trc);
+            mod::dbg::log("[xfs] O_TRUNC: free-data commit rc=%d", TRC);
 #endif
             if (TRC != 0) {
                 xfs_inode_release(ip);
                 return nullptr;
+            }
+        } else {
+            ip->size = 0;
+            ip->dirty = true;
+            XfsTransaction* tp = xfs_trans_alloc(ctx);
+            if (tp != nullptr) {
+                xfs_trans_log_inode(tp, ip);
+                int const TRC = xfs_trans_commit(tp);
+#ifdef XFS_DEBUG
+                mod::dbg::log("[xfs] O_TRUNC: commit rc=%d", TRC);
+#endif
+                if (TRC != 0) {
+                    xfs_inode_release(ip);
+                    return nullptr;
+                }
             }
         }
     }

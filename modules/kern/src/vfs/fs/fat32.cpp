@@ -1361,7 +1361,24 @@ auto flush_fat_table(const FAT32MountContext* ctx) -> int {
     return 0;
 }
 
-// Sync file data to disk
+// Sync FAT table and device state to disk.
+auto fat32_sync_mount(FAT32MountContext* ctx) -> int {
+    if (ctx == nullptr || ctx->device == nullptr) {
+        return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return ker::dev::block_flush(ctx->device);
+    }
+
+    ctx->lock.lock();
+    int const FAT_RESULT = flush_fat_table(ctx);
+    ctx->lock.unlock();
+
+    int const FLUSH_RESULT = ker::dev::block_flush(ctx->device);
+    return (FAT_RESULT != 0) ? FAT_RESULT : FLUSH_RESULT;
+}
+
+// Sync file data to disk.
 auto fat32_fsync(File* f) -> int {
     if (f == nullptr || f->private_data == nullptr) {
         return -EINVAL;
@@ -1370,17 +1387,7 @@ auto fat32_fsync(File* f) -> int {
     if (node->context == nullptr) {
         return -EINVAL;
     }
-    if (node->context->read_only) {
-        return node->context->device != nullptr ? ker::dev::block_flush(node->context->device) : 0;
-    }
-
-    int result = flush_fat_table(node->context);
-    if (result != 0) {
-        return result;
-    }
-
-    result = ker::dev::block_flush(node->context->device);
-    return result;
+    return fat32_sync_mount(node->context);
 }
 
 // Update file's directory entry on disk

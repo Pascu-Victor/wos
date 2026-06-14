@@ -7657,6 +7657,41 @@ auto vfs_fsync(int fd) -> int {
     }
 }
 
+auto vfs_sync() -> int {
+    int result = 0;
+
+    for (size_t i = 0;; ++i) {
+        auto mount_ref = get_mount_at(i);
+        if (!mount_ref) {
+            break;
+        }
+
+        auto* mount = mount_ref.get();
+        int sync_result = 0;
+        switch (mount->fs_type) {
+            case FSType::FAT32:
+                sync_result = ker::vfs::fat32::fat32_sync_mount(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data));
+                break;
+            case FSType::XFS:
+                sync_result = ker::vfs::xfs::xfs_sync_mount(static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+                break;
+            case FSType::TMPFS:
+            case FSType::DEVFS:
+            case FSType::PROCFS:
+            case FSType::REMOTE:
+            default:
+                sync_result = 0;
+                break;
+        }
+
+        if (sync_result != 0 && result == 0) {
+            result = sync_result;
+        }
+    }
+
+    return result;
+}
+
 auto vfs_link(const char* oldpath, const char* newpath) -> int {
     if (oldpath == nullptr || newpath == nullptr) {
         return -EINVAL;

@@ -147,6 +147,7 @@ void vfs_reset_local_pipe_perf_counters();
 
 // Sync
 auto vfs_fsync(int fd) -> int;
+auto vfs_sync() -> int;
 
 // Hard link
 auto vfs_link(const char* oldpath, const char* newpath) -> int;

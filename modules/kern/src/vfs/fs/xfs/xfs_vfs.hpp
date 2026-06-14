@@ -40,6 +40,15 @@ auto xfs_write_append(File* f, const void* buf, size_t count, size_t* offset_out
 // Commit dirty inode metadata for an open file.
 auto xfs_fsync(File* f) -> int;
 
+// Commit dirty mount metadata and flush the backing block device.
+auto xfs_sync_mount(XfsMountContext* ctx) -> int;
+
+#ifdef WOS_SELFTEST
+auto xfs_selftest_hole_write_alloc_blocks(size_t block_off, size_t remaining_bytes, xfs_filblks_t hole_blocks, size_t block_size,
+                                          uint32_t block_log) -> xfs_extlen_t;
+auto xfs_selftest_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks) -> bool;
+#endif
+
 // Filesystem statistics (statvfs).
 auto xfs_statvfs(XfsMountContext* ctx, ker::vfs::Statvfs* buf) -> int;
 

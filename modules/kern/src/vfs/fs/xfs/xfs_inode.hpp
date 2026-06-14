@@ -128,11 +128,19 @@ void xfs_inode_release(XfsInode* ip);
 struct XfsTransaction;
 auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int;
 
+// Free all data extents for a regular file and reset the in-memory data fork.
+// Caller must hold the inode's I/O lock and commit the supplied transaction.
+auto xfs_inode_truncate_data(XfsInode* ip, XfsTransaction* tp) -> int;
+
 // Initialize the inode cache (call once at mount time).
 void xfs_icache_init();
 
 // Purge all cached inodes for a given mount (call at unmount time).
 void xfs_icache_purge(XfsMountContext* mount);
+
+// Commit dirty cached inodes for a mount.  Used by mount-level sync before the
+// block cache is flushed.
+auto xfs_icache_sync_dirty(XfsMountContext* mount) -> int;
 
 // Helper: compute the filesystem block containing a given inode
 inline auto xfs_inode_block(const XfsMountContext* ctx, xfs_ino_t ino) -> xfs_fsblock_t {
