@@ -216,6 +216,7 @@ add_custom_command(
         ${WOS_BUILD_SCRIPTS_DIR}/rootfs_common.sh
         ${WOS_BUILD_SCRIPTS_DIR}/sync_rootfs.sh
         ${CMAKE_SOURCE_DIR}/configs/system.conf
+        ${CMAKE_SOURCE_DIR}/configs/vfstab
         ${WOS_ROOTFS_CONFIG_INPUTS}
         ${WOS_MODULE_TARGET_FILES}
         ${BUSYBOX_STAMP}

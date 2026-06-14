@@ -209,6 +209,21 @@ vfat
 tmpfs
 EOF
 
+    if [ -f "$ROOTFS_REPO/configs/vfstab" ]; then
+        rootfs_copy_entry "configs/vfstab" "/etc/vfstab"
+    else
+        cat > "$ROOTFS_STAGING/etc/vfstab" <<'EOF'
+# prefix route
+/wki local
+/proc local
+/dev local
+/tmp local
+/run local
+/ host
+EOF
+        rootfs_record_managed_path "/etc/vfstab"
+    fi
+
     if [ -f "$ROOTFS_REPO/configs/system.conf" ]; then
         # shellcheck disable=SC1091
         source "$ROOTFS_REPO/configs/system.conf"

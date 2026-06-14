@@ -9,6 +9,7 @@ BUILD_DIR="${WOS_BUILD_DIR:-build}"
 SYSROOT_DIR="${WOS_SYSROOT_PATH:-toolchain/sysroot}"
 INIT_BINARY="$BUILD_DIR/modules/init/init"
 INITRAMFS_OUT="$BUILD_DIR/initramfs.cpio"
+ROOTFS_DISK="${WOS_ROOTFS_DISK:-mountfs.qcow2}"
 READELF="${WOS_READELF:-}"
 
 if [ ! -f "$INIT_BINARY" ]; then
@@ -132,6 +133,24 @@ stage_init_dynamic_runtime() {
     done < <(elf_needed_libraries "$INIT_BINARY")
 }
 
+sync_rootfs_etc_tables() {
+    if [ ! -f "$ROOTFS_DISK" ]; then
+        echo "  rootfs: $ROOTFS_DISK not found, skipping /etc/fstab and /etc/vfstab sync"
+        return 0
+    fi
+
+    guestfish --rw -a "$ROOTFS_DISK" <<EOF
+run
+mount /dev/sda1 /
+mkdir-p /etc
+upload $INITRAMFS_DIR/etc/fstab /etc/fstab
+upload $INITRAMFS_DIR/etc/vfstab /etc/vfstab
+sync
+umount /
+EOF
+    echo "  rootfs: synced /etc/fstab and /etc/vfstab into $ROOTFS_DISK"
+}
+
 # Create temporary directory for initramfs contents
 INITRAMFS_DIR=$(mktemp -d)
 trap 'rm -rf "$INITRAMFS_DIR"' EXIT
@@ -190,6 +209,8 @@ else
 EOF
     echo "  initramfs: added default /etc/vfstab"
 fi
+
+sync_rootfs_etc_tables
 
 # Create CPIO newc archive
 mkdir -p "$(dirname "$INITRAMFS_OUT")"
