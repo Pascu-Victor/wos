@@ -282,6 +282,10 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssiz
     size_t sent = 0;
 
     while (sent < len) {
+        if (sent >= TCP_SEND_BURST_BYTES) {
+            return static_cast<ssize_t>(sent);
+        }
+
         cb->lock.lock();
 
         if (cb->state != TcpState::ESTABLISHED && cb->state != TcpState::CLOSE_WAIT) {
@@ -307,10 +311,8 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssiz
             return -EAGAIN;
         }
 
-        // Limit by send window
-        uint32_t const WINDOW = cb->snd_wnd;
-        uint32_t const IN_FLIGHT = cb->snd_nxt - cb->snd_una;
-        if (IN_FLIGHT >= WINDOW) {
+        uint32_t const AVAILABLE = tcp_send_available_bytes(cb);
+        if (AVAILABLE == 0) {
             cb->lock.unlock();
             if (sent > 0) {
                 return static_cast<ssize_t>(sent);
@@ -321,7 +323,7 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssiz
             defer_socket_wait(sock);
             return -EAGAIN;
         }
-        uint32_t const AVAILABLE = WINDOW - IN_FLIGHT;
+        chunk = std::min<size_t>(chunk, TCP_SEND_BURST_BYTES - sent);
         chunk = std::min<size_t>(chunk, AVAILABLE);
 
         cb->lock.unlock();
@@ -634,11 +636,15 @@ int tcp_poll_check_op(Socket* sock, int events) {
         }
     }
     if ((events & 4) != 0) {  // POLLOUT
-        if (cb == nullptr || cb->state != TcpState::ESTABLISHED) {
+        if (cb == nullptr) {
             ready |= 4;
         } else {
-            uint32_t const IN_FLIGHT = cb->snd_nxt - cb->snd_una;
-            if (IN_FLIGHT < cb->snd_wnd) {
+            uint64_t const FLAGS = cb->lock.lock_irqsave();
+            bool const CAN_SEND = cb->state == TcpState::ESTABLISHED || cb->state == TcpState::CLOSE_WAIT;
+            bool const HAS_SEND_CREDIT = CAN_SEND && tcp_send_available_bytes(cb) > 0;
+            bool const REPORT_ERROR_READY = !CAN_SEND;
+            cb->lock.unlock_irqrestore(FLAGS);
+            if (HAS_SEND_CREDIT || REPORT_ERROR_READY) {
                 ready |= 4;
             }
         }

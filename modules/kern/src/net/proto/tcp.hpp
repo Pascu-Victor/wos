@@ -66,6 +66,8 @@ struct TcpOutOfOrderSegment {
 constexpr uint8_t TCP_KEEPALIVE_PROBES_DEFAULT = 9;
 constexpr uint64_t TCP_KEEPALIVE_IDLE_MS_DEFAULT = 7200000;  // 2 hours
 constexpr uint64_t TCP_KEEPALIVE_INTVL_MS_DEFAULT = 75000;   // 75 seconds
+// Per-send syscall burst before returning a partial count; not an in-flight cap.
+constexpr uint32_t TCP_SEND_BURST_BYTES = 1024U * 1024U;
 
 struct TcpCB {
     TcpState state = TcpState::CLOSED;
@@ -211,6 +213,18 @@ inline auto tcp_seq_before(uint32_t a, uint32_t b) -> bool { return static_cast<
 inline auto tcp_seq_after(uint32_t a, uint32_t b) -> bool { return tcp_seq_before(b, a); }
 inline auto tcp_seq_between(uint32_t seq, uint32_t low, uint32_t high) -> bool {
     return !tcp_seq_before(seq, low) && tcp_seq_before(seq, high);
+}
+
+inline auto tcp_send_available_bytes(const TcpCB* cb) -> uint32_t {
+    if (cb == nullptr) {
+        return 0;
+    }
+
+    uint32_t const IN_FLIGHT = cb->snd_nxt - cb->snd_una;
+    if (IN_FLIGHT >= cb->snd_wnd) {
+        return 0;
+    }
+    return cb->snd_wnd - IN_FLIGHT;
 }
 
 constexpr auto tcp_saturating_add_ms(uint64_t lhs_ms, uint64_t rhs_ms) -> uint64_t {

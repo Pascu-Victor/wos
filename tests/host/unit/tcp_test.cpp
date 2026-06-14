@@ -169,6 +169,40 @@ TEST(TcpWscale, Monotonic) {
 }
 
 // =============================================================================
+// Send Credit
+// =============================================================================
+
+TEST(TcpSendCredit, FollowsHugePeerWindow) {
+    TcpCB cb{};
+    cb.snd_wnd = TCP_SEND_BURST_BYTES * 4;
+    cb.snd_una = 1000;
+    cb.snd_nxt = 1000;
+
+    EXPECT_EQ(tcp_send_available_bytes(&cb), TCP_SEND_BURST_BYTES * 4);
+}
+
+TEST(TcpSendCredit, ShrinksWithInFlightBytes) {
+    TcpCB cb{};
+    cb.snd_wnd = TCP_SEND_BURST_BYTES * 4;
+    cb.snd_una = 1000;
+    cb.snd_nxt = 1000 + (TCP_SEND_BURST_BYTES / 2);
+
+    EXPECT_EQ(tcp_send_available_bytes(&cb), (TCP_SEND_BURST_BYTES * 4) - (TCP_SEND_BURST_BYTES / 2));
+
+    cb.snd_nxt = 1000 + (TCP_SEND_BURST_BYTES * 4);
+    EXPECT_EQ(tcp_send_available_bytes(&cb), 0u);
+}
+
+TEST(TcpSendCredit, RespectsSmallerPeerWindow) {
+    TcpCB cb{};
+    cb.snd_wnd = 4096;
+    cb.snd_una = 2000;
+    cb.snd_nxt = 3000;
+
+    EXPECT_EQ(tcp_send_available_bytes(&cb), 3096u);
+}
+
+// =============================================================================
 // Hash Functions
 // =============================================================================
 
