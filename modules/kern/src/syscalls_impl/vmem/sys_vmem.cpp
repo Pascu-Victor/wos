@@ -41,6 +41,8 @@ namespace {
 // Get the current task
 inline auto get_current_task() -> ker::mod::sched::task::Task* { return ker::mod::sched::get_current_task(); }
 
+ker::mod::sys::Mutex g_mmap_reserve_lock;
+
 constexpr bool ENABLE_WATCHED_MMAP_LOGS = false;
 constexpr uint64_t WATCH_MMAP_VADDR = 0x00001000007da000ULL;
 
@@ -645,6 +647,31 @@ auto find_free_range(ker::mod::sched::task::Task* task, uint64_t size, uint64_t 
     return 0;  // No free range found
 }
 
+auto reserve_free_mmap_range(ker::mod::sched::task::Task* task, uint64_t size, uint64_t hint, uint64_t& out_vaddr) -> uint64_t {
+    out_vaddr = 0;
+
+    ker::mod::sys::MutexGuard guard(g_mmap_reserve_lock);
+    uint64_t const VADDR = find_free_range(task, size, hint);
+    if (VADDR == 0) {
+        return ker::abi::vmem::VMEM_ENOMEM;
+    }
+
+    // Reserve the chosen range before returning it to the mapper. This closes
+    // the check-then-map race between sibling threads that share a pagemap.
+    if (!add_shared_vmem_range(task, VADDR, size, 0, 0)) {
+        return ker::abi::vmem::VMEM_ENOMEM;
+    }
+
+    out_vaddr = VADDR;
+    return 0;
+}
+
+void release_mmap_reservation(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size, bool reserved) {
+    if (reserved) {
+        (void)remove_shared_vmem_range(task, vaddr, size);
+    }
+}
+
 // Convert protection flags to page table flags
 auto prot_to_page_flags(uint64_t prot) -> uint64_t {
     uint64_t flags = ker::mod::mm::paging::PAGE_PRESENT | ker::mod::mm::paging::PAGE_USER;
@@ -836,14 +863,16 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
         }
         vaddr = hint;
     } else {
-        // Find a suitable range
-        vaddr = find_free_range(task, size, hint);
-        if (vaddr == 0) {
-            log::warn("no free range found for size %x", size);
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+        uint64_t const RESERVE_RET = reserve_free_mmap_range(task, size, hint, vaddr);
+        if (RESERVE_RET != 0) {
+            if (RESERVE_RET == ker::abi::vmem::VMEM_ENOMEM) {
+                log::warn("no free range found for size %x", size);
+            }
+            return -RESERVE_RET;
         }
     }
 
+    bool const HAS_ADDRESS_RESERVATION = !IS_FIXED;
     auto const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
     if (IS_FIXED) {
         release_fixed_mmap_range(task, vaddr, size);
@@ -870,6 +899,7 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
     void* const ZERO_PAGE = get_anon_zero_page();
     if (ZERO_PAGE == nullptr) {
         log::error("out of physical memory allocating anon zero page");
+        release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
     }
 
@@ -879,6 +909,7 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
     auto const PAGE_FLAGS = anon_zero_page_flags(prot);
     auto const ZERO_PADDR = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(ZERO_PAGE)));
     if (NUM_PAGES > std::numeric_limits<uint32_t>::max()) {
+        release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
     }
 
@@ -1017,12 +1048,13 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
         }
         vaddr = hint;
     } else {
-        vaddr = find_free_range(task, size, hint);
-        if (vaddr == 0) {
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+        uint64_t const RESERVE_RET = reserve_free_mmap_range(task, size, hint, vaddr);
+        if (RESERVE_RET != 0) {
+            return -RESERVE_RET;
         }
     }
 
+    bool const HAS_ADDRESS_RESERVATION = !IS_FIXED;
     auto const PAGE_FLAGS = prot_to_page_flags(prot);
     auto const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
     if (IS_FIXED) {
@@ -1065,6 +1097,7 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
 
         if (cache_ok) {
             ker::mod::mm::virt::flush_page_map_batch(&map_batch);
+            release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
             advance_shared_mmap_cursor(task, vaddr, size);
             record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0, 0,
                                     vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
@@ -1085,6 +1118,7 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
         void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc(ker::mod::mm::paging::PAGE_SIZE, "vmem-file");
         if (PHYS_PAGE == nullptr) {
             rollback_mapped_pages(task, vaddr, mapped_pages);
+            release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
         }
         std::memset(PHYS_PAGE, 0, ker::mod::mm::paging::PAGE_SIZE);
@@ -1092,6 +1126,7 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
         if (i > (std::numeric_limits<uint64_t>::max() - offset) / ker::mod::mm::paging::PAGE_SIZE) {
             ker::mod::mm::phys::page_ref_dec(PHYS_PAGE);
             rollback_mapped_pages(task, vaddr, mapped_pages);
+            release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
         }
 
@@ -1101,6 +1136,7 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
             if (FILE_OFFSET > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
                 ker::mod::mm::phys::page_ref_dec(PHYS_PAGE);
                 rollback_mapped_pages(task, vaddr, mapped_pages);
+                release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
             }
 
@@ -1108,6 +1144,7 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
             if (READ_RET < 0) {
                 ker::mod::mm::phys::page_ref_dec(PHYS_PAGE);
                 rollback_mapped_pages(task, vaddr, mapped_pages);
+                release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
             }
         }
@@ -1126,6 +1163,7 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
         }
     }
 
+    release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
     advance_shared_mmap_cursor(task, vaddr, size);
     record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0, 0,
                             vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
