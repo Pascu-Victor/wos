@@ -85,6 +85,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/virtio_net_source_test.py
 )
 add_test(
+    NAME udp_bind_device_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/udp_bind_device_source_test.py
+)
+add_test(
     NAME tcp_deadline_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tcp_deadline_source_test.py
 )
@@ -189,6 +193,7 @@ set_tests_properties(
     sftp_timeout_source_test
     netpoll_backlog_source_test
     virtio_net_source_test
+    udp_bind_device_source_test
     tcp_deadline_source_test
     poll_deadline_source_test
     futex_source_test
