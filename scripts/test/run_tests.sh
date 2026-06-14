@@ -151,6 +151,7 @@ UNIT_TESTS=(
     util_list_test
     crc32c_test
     buffer_cache_test
+    vmem_source_test
 )
 
 list_targets() {

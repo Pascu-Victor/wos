@@ -122,9 +122,27 @@ def test_cross_os_artifact_fetches_are_bounded() -> None:
     )
 
 
+def test_cross_os_process_persistent_workers_are_explicit() -> None:
+    source = BENCH_SUITE.read_text()
+    module = ast.parse(source, filename=str(BENCH_SUITE))
+
+    run_wos_renderbench = find_function(module, "run_wos_renderbench")
+    body = ast.get_source_segment(source, run_wos_renderbench)
+    if body is None:
+        fail("missing run_wos_renderbench source segment")
+
+    if 'args.wos_render_tuning in {"optimal", "safe"}' in body:
+        fail("WOS render tuning must not implicitly enable persistent process-per-core workers")
+    if 'elif args.wos_enable_process_persistent_workers:' not in body:
+        fail("WOS persistent process workers must remain an explicit opt-in")
+    if 'command += ["--enable-process-persistent-workers"]' not in body:
+        fail("WOS renderbench process worker opt-in no longer passes the renderbench flag")
+
+
 def main() -> None:
     test_cluster_live_sync_sftp_batches_are_bounded()
     test_cross_os_artifact_fetches_are_bounded()
+    test_cross_os_process_persistent_workers_are_explicit()
     print("SFTP automation paths are timeout bounded")
 
 

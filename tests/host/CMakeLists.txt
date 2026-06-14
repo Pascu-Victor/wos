@@ -164,6 +164,10 @@ add_test(
     NAME vfs_mount_lifetime_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_mount_lifetime_source_test.py
 )
+add_test(
+    NAME vmem_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vmem_source_test.py
+)
 set_tests_properties(
     host_test_manifest_test
     ktest_cov_test
@@ -205,6 +209,7 @@ set_tests_properties(
     wki_remote_compute_source_test
     wki_remote_vfs_source_test
     vfs_mount_lifetime_source_test
+    vmem_source_test
     PROPERTIES LABELS "host;source"
 )
 

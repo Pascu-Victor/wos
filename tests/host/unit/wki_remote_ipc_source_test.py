@@ -54,12 +54,29 @@ def test_poll_wake_drains_all_batches() -> None:
     require_order(body, "proxy->lock.unlock_irqrestore(IRQF);", "proxy_reschedule_waiters", "poll wake lock release")
 
 
-def test_proxy_poll_wake_preserves_prepark_wake_token() -> None:
+def test_proxy_poll_wake_cancels_deferred_switch_without_losing_wake_token() -> None:
     body = function_body(REMOTE_IPC_CPP.read_text(), "proxy_reschedule_waiters")
-    if "EventWakeDeferredSwitch::CANCEL" in body:
-        fail("proxy poll wakes must preserve wakeup_pending; CANCEL can erase a wake that races before preemptible_syscall_park")
-    if "ker::mod::sched::wake_task_from_event(waiter);" not in body:
-        fail("proxy poll wakes must use the default event wake path")
+    required = [
+        "ker::mod::sched::wake_task_from_event(waiter, ker::mod::sched::EventWakeDeferredSwitch::CANCEL)",
+        "waiter->release()",
+    ]
+    missing = [token for token in required if token not in body]
+    if missing:
+        fail("proxy poll wakes must cancel deferred parking without losing the scheduler wake token: " + ", ".join(missing))
+
+
+def test_pipe_pump_read_waiter_uses_event_block_fast_path() -> None:
+    body = function_body(REMOTE_IPC_CPP.read_text(), "pipe_pump_read_ready")
+    required = [
+        "register_poll_read_waiter(file, &ready_now)",
+        "if (ready_now)",
+        "ker::mod::sched::kern_block()",
+    ]
+    missing = [token for token in required if token not in body]
+    if missing:
+        fail("pipe pump read path must block on the registered poll waiter fast path: " + ", ".join(missing))
+    if "kern_sleep_us(WKI_IPC_PIPE_READ_POLL_RECHECK_US)" in body:
+        fail("pipe pump read fast path must not use timer polling after registering a poll waiter")
 
 
 def test_inactive_proxy_poll_reports_terminal_readiness() -> None:
@@ -467,7 +484,8 @@ def test_ipc_selftests_are_declared_and_registered() -> None:
 
 def main() -> None:
     test_poll_wake_drains_all_batches()
-    test_proxy_poll_wake_preserves_prepark_wake_token()
+    test_proxy_poll_wake_cancels_deferred_switch_without_losing_wake_token()
+    test_pipe_pump_read_waiter_uses_event_block_fast_path()
     test_inactive_proxy_poll_reports_terminal_readiness()
     test_epoll_close_releases_lookup_ref_after_detach()
     test_proxy_lookup_is_peer_scoped()
