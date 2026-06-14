@@ -755,15 +755,6 @@ auto read_worker_batch_command(int fd, WorkerBatchCommand& command) -> bool {
     return command.magic == BATCH_COMMAND_MAGIC;
 }
 
-auto one_shot_worker_render_threads(const tracebench::Options& options, const WorkerInvocation& worker) -> int {
-    int const REQUESTED = std::max(1, worker.worker_threads);
-    if (!worker.command_stream && worker.batch_count > 0 && options.placement == tracebench::Placement::NodeThreads) {
-        // Dynamic node-thread batches are short-lived; avoid creating a new thread fanout for every batch process.
-        return 1;
-    }
-    return REQUESTED;
-}
-
 auto render_worker_tile_packet(WorkerBatchRenderThreadState& state, int tile_offset, const tracebench::Tile& tile) -> bool {
     if (cancel_requested()) {
         state.failed->store(true, std::memory_order_relaxed);
@@ -2489,7 +2480,7 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
             }
         }
     }
-    int const THREADS = one_shot_worker_render_threads(options, worker);
+    int const THREADS = std::max(1, worker.worker_threads);
     (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_BEGIN, worker.batch_start, assigned_tiles.size(),
                                    static_cast<uint32_t>(THREADS), static_cast<uint32_t>(std::max(1, worker.worker_threads)));
     size_t max_payload_floats = 0;

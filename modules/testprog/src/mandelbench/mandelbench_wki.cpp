@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cerrno>
 #include <cstddef>
@@ -55,6 +56,8 @@ constexpr uint16_t WORKER_OUTPUT_VERSION = 1;
 constexpr uint16_t WORKER_OUTPUT_FLAG_PAYLOAD = 0;
 constexpr size_t WORKER_OUTPUT_HEADER_SIZE = 16;
 constexpr unsigned char WORKER_CONTROL_START = 1;
+constexpr unsigned char WORKER_CONTROL_RELEASE_PAYLOAD = 2;
+constexpr int MANDELBENCH_ROW_BAND_ROWS = 8;
 constexpr size_t MANDELBENCH_PROFILE_WORKER_LIMIT = 8;
 constexpr uint64_t USEC_PER_SEC = 1'000'000;
 constexpr int64_t NSEC_PER_SEC = 1'000'000'000;
@@ -101,6 +104,11 @@ auto mandelbench_profile_enabled() -> bool {
 
 auto mandelbench_save_images_enabled() -> bool {
     const char* value = std::getenv("MANDELBENCH_SAVE_IMAGES");
+    return value == nullptr || value[0] == '\0' || value[0] != '0';
+}
+
+auto mandelbench_payload_release_enabled() -> bool {
+    const char* value = std::getenv("MANDELBENCH_PAYLOAD_RELEASE");
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
@@ -302,6 +310,25 @@ struct WorkerChunk {
     int row_count;
 };
 
+struct WorkerBandThreadArg {
+    unsigned char* image;
+    unsigned char* colormap;
+    int width;
+    int height;
+    int max_iteration;
+    const std::vector<WorkerChunk>* chunks;
+    const std::vector<size_t>* chunk_offsets;
+    std::atomic<int>* next_chunk;
+    std::atomic<int>* total_rows_done;
+    int rows_done;
+    int local_thread_id;
+    int local_thread_count;
+    int diag_worker_id;
+    int diag_repeat_index;
+    int diag_progress_stride;
+    uint64_t diag_compute_start_us;
+};
+
 auto generate_rows(void* param) -> int {
     auto* arg = static_cast<WorkerThreadArg*>(param);
     int thread_rows_done = 0;
@@ -337,6 +364,41 @@ auto generate_rows(void* param) -> int {
                 arg->diag_worker_id, arg->diag_repeat_index, arg->local_thread_id, arg->local_thread_count, thread_rows_done,
                 THREAD_ROW_TOTAL, ROW, elapsed_ms(arg->diag_compute_start_us, now_us()));
         }
+    }
+    return 0;
+}
+
+auto generate_dynamic_chunk_rows(void* param) -> int {
+    auto* arg = static_cast<WorkerBandThreadArg*>(param);
+    arg->rows_done = 0;
+
+    while (true) {
+        int const CHUNK_INDEX = arg->next_chunk->fetch_add(1, std::memory_order_relaxed);
+        if (CHUNK_INDEX >= static_cast<int>(arg->chunks->size())) {
+            break;
+        }
+
+        auto const CHUNK_OFFSET = static_cast<size_t>(CHUNK_INDEX);
+        const auto& chunk = arg->chunks->at(CHUNK_OFFSET);
+        WorkerThreadArg row_arg{
+            .image = arg->image + arg->chunk_offsets->at(CHUNK_OFFSET),
+            .colormap = arg->colormap,
+            .width = arg->width,
+            .height = arg->height,
+            .max_iteration = arg->max_iteration,
+            .start_row = chunk.start_row,
+            .row_count = chunk.row_count,
+            .local_thread_id = 0,
+            .local_thread_count = 1,
+            .rows_done = 0,
+            .diag_worker_id = arg->diag_worker_id,
+            .diag_repeat_index = arg->diag_repeat_index,
+            .diag_progress_stride = arg->diag_progress_stride,
+            .diag_compute_start_us = arg->diag_compute_start_us,
+        };
+        (void)generate_rows(&row_arg);
+        arg->rows_done += row_arg.rows_done;
+        arg->total_rows_done->fetch_add(row_arg.rows_done, std::memory_order_relaxed);
     }
     return 0;
 }
@@ -380,7 +442,7 @@ struct WorkerLaunch {
 };
 
 struct LocalComputeThread {
-    WorkerThreadArg arg{};
+    WorkerBandThreadArg arg{};
     thrd_t thread{};
     int worker_id = -1;
 };
@@ -517,6 +579,26 @@ void add_chunk_to_launch(WorkerLaunch& launch, const WorkerChunk& chunk) {
     }
     launch.row_count += chunk.row_count;
     launch.chunks.push_back(chunk);
+}
+
+struct WorkerSlot {
+    int worker_id;
+    std::string target_node;
+    bool local;
+};
+
+auto count_slots_for_target(std::span<const WorkerSlot> slots, std::string_view target_node, bool local) -> int {
+    return static_cast<int>(std::count_if(slots.begin(), slots.end(), [&](const WorkerSlot& slot) {
+        return slot.local == local && slot.target_node == target_node;
+    }));
+}
+
+auto find_launch_for_target(std::vector<WorkerLaunch>& launches, std::string_view target_node) -> std::vector<WorkerLaunch>::iterator {
+    return std::ranges::find_if(launches, [&](const WorkerLaunch& launch) { return launch.target_node == target_node; });
+}
+
+auto find_launch_for_output_slot(std::vector<WorkerLaunch>& launches, int output_slot) -> std::vector<WorkerLaunch>::iterator {
+    return std::ranges::find_if(launches, [&](const WorkerLaunch& launch) { return launch.output_slot == output_slot; });
 }
 
 auto make_chunk_offsets(std::span<const WorkerChunk> chunks, size_t row_size, bool compact_payload) -> std::vector<size_t> {
@@ -796,6 +878,26 @@ auto signal_worker_starts(std::span<WorkerLaunch> launches) -> bool {
     return signal_workers(launches, WORKER_CONTROL_START, "start", false);
 }
 
+auto release_worker_payload(WorkerLaunch& launch, int repeat_index) -> bool {
+    if (launch.payload_released) {
+        return true;
+    }
+
+    unsigned char const SIGNAL = WORKER_CONTROL_RELEASE_PAYLOAD;
+    ssize_t write_fail_ret = 0;
+    int write_fail_errno = 0;
+    MANDELBENCH_TRACE("mandelbench: repeat {} payload-release worker={} fd={} begin", repeat_index, launch.output_slot,
+                      launch.release_write_fd);
+    if (!write_all(launch.release_write_fd, std::span(&SIGNAL, size_t{1}), &write_fail_ret, &write_fail_errno)) {
+        std::println(stderr, "mandelbench: failed to release worker {} payload ret={} errno={} ({})", launch.output_slot, write_fail_ret,
+                     write_fail_errno, std::strerror(write_fail_errno));
+        return false;
+    }
+    launch.payload_released = true;
+    MANDELBENCH_TRACE("mandelbench: repeat {} payload-release worker={} end", repeat_index, launch.output_slot);
+    return true;
+}
+
 auto poll_worker_exit(WorkerLaunch& launch) -> bool {
     if (launch.wait_done || launch.child_pid < 0) {
         return true;
@@ -949,34 +1051,51 @@ void print_slowest_worker_profiles(std::span<const WorkerLaunch> launches, int r
 
     size_t thread_count = 0;
     for (const auto& launch : launches) {
-        thread_count += launch.chunks.size();
+        thread_count += static_cast<size_t>(std::clamp(launch.thread_count, 1, static_cast<int>(launch.chunks.size())));
     }
     std::vector<LocalComputeThread> compute_threads(thread_count);
+    std::vector<std::vector<size_t>> chunk_offsets;
+    chunk_offsets.reserve(launches.size());
+    for (const auto& launch : launches) {
+        chunk_offsets.push_back(make_chunk_offsets(launch.chunks, row_size, false));
+    }
+    std::vector<std::atomic<int>> next_chunks(launches.size());
+    std::vector<std::atomic<int>> rows_done_by_launch(launches.size());
+    for (size_t launch_index = 0; launch_index < launches.size(); ++launch_index) {
+        next_chunks.at(launch_index).store(0, std::memory_order_relaxed);
+        rows_done_by_launch.at(launch_index).store(0, std::memory_order_relaxed);
+    }
 
     bool ok = true;
     size_t created_threads = 0;
-    for (const auto& launch : launches) {
-        for (const WorkerChunk& chunk : launch.chunks) {
+    for (size_t launch_index = 0; launch_index < launches.size(); ++launch_index) {
+        const auto& launch = launches[launch_index];
+        int const THREADS = std::clamp(launch.thread_count, 1, static_cast<int>(launch.chunks.size()));
+        uint64_t const COMPUTE_START_US = now_us();
+        for (int thread_index = 0; thread_index < THREADS; ++thread_index) {
             auto& compute_thread = compute_threads.at(created_threads);
-            compute_thread.worker_id = chunk.worker_id;
+            compute_thread.worker_id = launch.output_slot;
             compute_thread.arg = {
-                .image = image + (static_cast<size_t>(chunk.start_row) * row_size),
+                .image = image,
                 .colormap = colormap,
                 .width = width,
                 .height = height,
                 .max_iteration = max_iteration,
-                .start_row = chunk.start_row,
-                .row_count = chunk.row_count,
-                .local_thread_id = 0,
-                .local_thread_count = 1,
+                .chunks = &launch.chunks,
+                .chunk_offsets = &chunk_offsets.at(launch_index),
+                .next_chunk = &next_chunks.at(launch_index),
+                .total_rows_done = &rows_done_by_launch.at(launch_index),
                 .rows_done = 0,
-                .diag_worker_id = chunk.worker_id,
+                .local_thread_id = thread_index,
+                .local_thread_count = THREADS,
+                .diag_worker_id = launch.output_slot,
                 .diag_repeat_index = repeat_index,
-                .diag_progress_stride = std::max(chunk.row_count / 8, 1),
-                .diag_compute_start_us = now_us(),
+                .diag_progress_stride = std::max(launch.row_count / 8, 1),
+                .diag_compute_start_us = COMPUTE_START_US,
             };
-            if (thrd_create(&compute_thread.thread, generate_rows, &compute_thread.arg) != THRD_SUCCESS) {
-                std::println(stderr, "mandelbench: failed to create local compute thread for worker {}", chunk.worker_id);
+            if (thrd_create(&compute_thread.thread, generate_dynamic_chunk_rows, &compute_thread.arg) != THRD_SUCCESS) {
+                std::println(stderr, "mandelbench: failed to create local compute thread {} for worker {}", thread_index,
+                             launch.output_slot);
                 ok = false;
                 break;
             }
@@ -993,9 +1112,12 @@ void print_slowest_worker_profiles(std::span<const WorkerLaunch> launches, int r
             std::println(stderr, "mandelbench: failed to join local compute thread for worker {}", compute_thread.worker_id);
             ok = false;
         }
-        if (compute_thread.arg.rows_done != compute_thread.arg.row_count) {
-            std::println(stderr, "mandelbench: local worker {} completed {}/{} rows", compute_thread.worker_id,
-                         compute_thread.arg.rows_done, compute_thread.arg.row_count);
+    }
+    for (size_t launch_index = 0; launch_index < launches.size(); ++launch_index) {
+        const auto& launch = launches[launch_index];
+        int const rows_done = rows_done_by_launch.at(launch_index).load(std::memory_order_relaxed);
+        if (rows_done != launch.row_count) {
+            std::println(stderr, "mandelbench: local worker {} completed {}/{} rows", launch.output_slot, rows_done, launch.row_count);
             ok = false;
         }
     }
@@ -1245,7 +1367,8 @@ auto complete_workers_and_outputs(std::span<WorkerLaunch> launches, bool require
     return WorkerEventResult{.ok = ok, .wait_end_us = wait_end_us, .read_end_us = read_end_us, .loop_end_us = LOOP_END_US};
 }
 
-auto complete_worker_payloads_streaming(std::span<WorkerLaunch> launches, uint16_t expected_flags, int repeat_index) -> WorkerPayloadResult {
+auto complete_worker_payloads_streaming(std::span<WorkerLaunch> launches, uint16_t expected_flags, int repeat_index,
+                                        bool payload_release_enabled) -> WorkerPayloadResult {
     uint64_t const START_US = now_us();
     uint64_t header_end_us = START_US;
     uint64_t release_end_us = START_US;
@@ -1285,7 +1408,13 @@ auto complete_worker_payloads_streaming(std::span<WorkerLaunch> launches, uint16
                 header_end_us = std::max(header_end_us, launch.header_end_us);
             }
             if (launch.header_ok && !launch.payload_released) {
-                launch.payload_released = true;
+                if (payload_release_enabled) {
+                    if (!release_worker_payload(launch, repeat_index)) {
+                        ok = false;
+                    }
+                } else {
+                    launch.payload_released = true;
+                }
                 release_end_us = std::max(release_end_us, now_us());
             }
             bool const READ_WAS_PENDING = read_is_pending(launch);
@@ -1397,6 +1526,7 @@ auto complete_worker_payloads_streaming(std::span<WorkerLaunch> launches, uint16
 auto mandelbench_wki(int width, int height, int max_iteration, int workers, int repeat, const char* nodes) -> int {
     bool const PROFILE = mandelbench_profile_enabled() && fd_is_open(STDERR_FILENO);
     bool const SAVE_IMAGES = mandelbench_save_images_enabled();
+    bool const PAYLOAD_RELEASE = mandelbench_payload_release_enabled();
     const char* node_text = nodes;
     if (node_text == nullptr || node_text[0] == '\0') {
         node_text = std::getenv("MANDELBENCH_NODES");
@@ -1424,42 +1554,53 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
     std::vector<WorkerLaunch> remote_launches;
     std::vector<WorkerLaunch> local_launches;
     remote_launches.reserve(static_cast<size_t>(TARGET_NODES.empty() ? ACTIVE_WORKERS : TARGET_NODES.size()));
-    local_launches.reserve(static_cast<size_t>(ACTIVE_WORKERS));
+    local_launches.reserve(TARGET_NODES.empty() ? 0U : 1U);
 
-    int next_start_row = 0;
-    int const BASE_ROWS = height / ACTIVE_WORKERS;
-    int const EXTRA_ROWS = height % ACTIVE_WORKERS;
+    std::vector<WorkerSlot> worker_slots;
+    worker_slots.reserve(static_cast<size_t>(ACTIVE_WORKERS));
     for (int worker_id = 0; worker_id < ACTIVE_WORKERS; ++worker_id) {
-        int const ROW_COUNT = BASE_ROWS + (worker_id < EXTRA_ROWS ? 1 : 0);
-        std::string const TARGET_NODE =
+        std::string target_node =
             TARGET_NODES.empty() ? std::string{} : TARGET_NODES.at(static_cast<size_t>(worker_id) % TARGET_NODES.size());
-        WorkerChunk const CHUNK{
+        bool const LOCAL = !TARGET_NODES.empty() && target_node == LAUNCHER_NODE;
+        worker_slots.push_back({
             .worker_id = worker_id,
-            .start_row = next_start_row,
+            .target_node = std::move(target_node),
+            .local = LOCAL,
+        });
+    }
+
+    for (int start_row = 0, band_index = 0; start_row < height; start_row += MANDELBENCH_ROW_BAND_ROWS, ++band_index) {
+        int const ROW_COUNT = std::min(MANDELBENCH_ROW_BAND_ROWS, height - start_row);
+        const auto& slot = worker_slots.at(static_cast<size_t>(band_index % ACTIVE_WORKERS));
+        WorkerChunk const CHUNK{
+            .worker_id = slot.worker_id,
+            .start_row = start_row,
             .row_count = ROW_COUNT,
         };
+        int const THREAD_COUNT = count_slots_for_target(worker_slots, slot.target_node, slot.local);
 
         if (TARGET_NODES.empty()) {
-            remote_launches.push_back(make_worker_launch(worker_id, {}, 1, false));
-            add_chunk_to_launch(remote_launches.back(), CHUNK);
-        } else if (TARGET_NODE != LAUNCHER_NODE) {
-            auto launch_it =
-                std::ranges::find_if(remote_launches, [&](const WorkerLaunch& launch) { return launch.target_node == TARGET_NODE; });
+            auto launch_it = find_launch_for_output_slot(remote_launches, slot.worker_id);
             if (launch_it == remote_launches.end()) {
-                remote_launches.push_back(make_worker_launch(worker_id, TARGET_NODE, 1, false));
+                remote_launches.push_back(make_worker_launch(slot.worker_id, {}, 1, false));
+                launch_it = std::prev(remote_launches.end());
+            }
+            add_chunk_to_launch(*launch_it, CHUNK);
+        } else if (!slot.local) {
+            auto launch_it = find_launch_for_target(remote_launches, slot.target_node);
+            if (launch_it == remote_launches.end()) {
+                remote_launches.push_back(make_worker_launch(slot.worker_id, slot.target_node, THREAD_COUNT, false));
                 launch_it = std::prev(remote_launches.end());
             }
             add_chunk_to_launch(*launch_it, CHUNK);
         } else {
-            local_launches.push_back(make_worker_launch(worker_id, TARGET_NODE, 1, true));
-            add_chunk_to_launch(local_launches.back(), CHUNK);
+            auto launch_it = find_launch_for_target(local_launches, slot.target_node);
+            if (launch_it == local_launches.end()) {
+                local_launches.push_back(make_worker_launch(slot.worker_id, slot.target_node, THREAD_COUNT, true));
+                launch_it = std::prev(local_launches.end());
+            }
+            add_chunk_to_launch(*launch_it, CHUNK);
         }
-
-        next_start_row += ROW_COUNT;
-    }
-
-    for (auto& launch : remote_launches) {
-        launch.thread_count = std::max<int>(1, static_cast<int>(launch.chunks.size()));
     }
 
     size_t const ROW_SIZE = static_cast<size_t>(width) * 4;
@@ -1601,7 +1742,7 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
                           elapsed_ms(LOCAL_COMPUTE_START_US, AFTER_LOCAL_COMPUTE_US));
 
         WorkerPayloadResult const WORKER_RESULT =
-            complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index);
+            complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index, PAYLOAD_RELEASE);
         uint64_t const AFTER_HEADER_US = WORKER_RESULT.header_end_us;
         uint64_t const PAYLOAD_RELEASE_START_US = AFTER_LOCAL_COMPUTE_US;
         uint64_t const AFTER_PAYLOAD_RELEASE_US = WORKER_RESULT.release_end_us;
@@ -1763,6 +1904,7 @@ auto mandelbench_worker(int argc, char** argv) -> int {
     std::vector<unsigned char> image(static_cast<size_t>(total_rows) * ROW_SIZE);
     struct WorkerThread {
         WorkerThreadArg arg{};
+        WorkerBandThreadArg band_arg{};
         thrd_t thread{};
     };
     std::vector<WorkerThread> worker_threads(static_cast<size_t>(thread_count));
@@ -1770,6 +1912,7 @@ auto mandelbench_worker(int argc, char** argv) -> int {
 
     uint64_t const AFTER_ALLOC_US = now_us();
     bool const PROFILE = mandelbench_profile_enabled() && fd_is_open(STDERR_FILENO);
+    bool const PAYLOAD_RELEASE = mandelbench_payload_release_enabled();
 
     int const CONTROL_FD = control_fd >= 0 ? control_fd : release_fd;
     int const OUTPUT_STREAM_FD = output_fd;
@@ -1787,43 +1930,46 @@ auto mandelbench_worker(int argc, char** argv) -> int {
         }
         uint64_t const AFTER_START_US = now_us();
 
-        if (OUTPUT_STREAM_FD >= 0) {
-            std::array<unsigned char, WORKER_OUTPUT_HEADER_SIZE> header{};
-            if (!make_worker_output_header(id, image.size(), header)) {
-                close(OUTPUT_STREAM_FD);
-                close(CONTROL_FD);
-                std::println(stderr, "mandelbench-worker[{}]: failed to build output header bytes={}", id, image.size());
-                return 1;
-            }
-            MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} header write begin fd={} bytes={}", id, CURRENT_REPEAT,
-                              OUTPUT_STREAM_FD, header.size());
-            if (!write_all(OUTPUT_STREAM_FD, header, &write_fail_ret, &write_fail_errno)) {
-                close(OUTPUT_STREAM_FD);
-                close(CONTROL_FD);
-                std::println(stderr, "mandelbench-worker[{}]: failed while writing output header ret={} errno={} ({})", id,
-                             write_fail_ret, write_fail_errno, std::strerror(write_fail_errno));
-                return 1;
-            }
-            MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} header write end fd={} bytes={}", id, CURRENT_REPEAT, OUTPUT_STREAM_FD,
-                              header.size());
-        }
-
         uint64_t const COMPUTE_START_US = now_us();
         MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} compute begin threads={} chunks={} bytes={}", id, CURRENT_REPEAT,
                           thread_count, chunks.size(), image.size());
         int const PROGRESS_STRIDE = std::max(total_rows / 8, 1);
+        std::atomic<int> next_chunk{0};
+        std::atomic<int> grouped_rows_done{0};
         auto prepare_thread_arg = [&](WorkerThread& worker_thread, int thread_index) {
+            if (GROUPED_CHUNKS) {
+                worker_thread.band_arg = {
+                    .image = image.data(),
+                    .colormap = colormap.data(),
+                    .width = width,
+                    .height = height,
+                    .max_iteration = max_iter,
+                    .chunks = &chunks,
+                    .chunk_offsets = &chunk_offsets,
+                    .next_chunk = &next_chunk,
+                    .total_rows_done = &grouped_rows_done,
+                    .rows_done = 0,
+                    .local_thread_id = thread_index,
+                    .local_thread_count = thread_count,
+                    .diag_worker_id = id,
+                    .diag_repeat_index = CURRENT_REPEAT,
+                    .diag_progress_stride = PROGRESS_STRIDE,
+                    .diag_compute_start_us = COMPUTE_START_US,
+                };
+                return;
+            }
+
             auto& thread_arg = worker_thread.arg;
-            WorkerChunk const& chunk = GROUPED_CHUNKS ? chunks.at(static_cast<size_t>(thread_index)) : chunks.front();
-            thread_arg.image = GROUPED_CHUNKS ? image.data() + chunk_offsets.at(static_cast<size_t>(thread_index)) : image.data();
+            WorkerChunk const& chunk = chunks.front();
+            thread_arg.image = image.data();
             thread_arg.colormap = colormap.data();
             thread_arg.width = width;
             thread_arg.height = height;
             thread_arg.max_iteration = max_iter;
             thread_arg.start_row = chunk.start_row;
             thread_arg.row_count = chunk.row_count;
-            thread_arg.local_thread_id = GROUPED_CHUNKS ? 0 : thread_index;
-            thread_arg.local_thread_count = GROUPED_CHUNKS ? 1 : thread_count;
+            thread_arg.local_thread_id = thread_index;
+            thread_arg.local_thread_count = thread_count;
             thread_arg.rows_done = 0;
             thread_arg.diag_worker_id = id;
             thread_arg.diag_repeat_index = CURRENT_REPEAT;
@@ -1836,15 +1982,22 @@ auto mandelbench_worker(int argc, char** argv) -> int {
             auto& worker_thread = worker_threads.front();
             prepare_thread_arg(worker_thread, 0);
             MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} inline compute begin", id, CURRENT_REPEAT);
-            (void)generate_rows(&worker_thread.arg);
-            rows_done = worker_thread.arg.rows_done;
+            if (GROUPED_CHUNKS) {
+                (void)generate_dynamic_chunk_rows(&worker_thread.band_arg);
+                rows_done = grouped_rows_done.load(std::memory_order_relaxed);
+            } else {
+                (void)generate_rows(&worker_thread.arg);
+                rows_done = worker_thread.arg.rows_done;
+            }
             MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} inline compute end", id, CURRENT_REPEAT);
         } else {
             int thread_index = 0;
             for (auto& worker_thread : worker_threads) {
                 prepare_thread_arg(worker_thread, thread_index);
                 MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} thread {} create begin", id, CURRENT_REPEAT, thread_index);
-                if (thrd_create(&worker_thread.thread, generate_rows, &worker_thread.arg) != THRD_SUCCESS) {
+                auto* thread_arg = GROUPED_CHUNKS ? static_cast<void*>(&worker_thread.band_arg) : static_cast<void*>(&worker_thread.arg);
+                auto thread_func = GROUPED_CHUNKS ? generate_dynamic_chunk_rows : generate_rows;
+                if (thrd_create(&worker_thread.thread, thread_func, thread_arg) != THRD_SUCCESS) {
                     std::println(stderr, "mandelbench-worker[{}]: failed to create thread {}", id, thread_index);
                     close(OUTPUT_STREAM_FD);
                     close(CONTROL_FD);
@@ -1864,8 +2017,13 @@ auto mandelbench_worker(int argc, char** argv) -> int {
                     return 1;
                 }
                 MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} thread {} join end", id, CURRENT_REPEAT, joined_thread_index);
-                rows_done += worker_thread.arg.rows_done;
+                if (!GROUPED_CHUNKS) {
+                    rows_done += worker_thread.arg.rows_done;
+                }
                 joined_thread_index++;
+            }
+            if (GROUPED_CHUNKS) {
+                rows_done = grouped_rows_done.load(std::memory_order_relaxed);
             }
         }
         uint64_t const COMPUTE_END_US = now_us();
@@ -1882,6 +2040,32 @@ auto mandelbench_worker(int argc, char** argv) -> int {
             close(OUTPUT_STREAM_FD);
             close(CONTROL_FD);
             return 1;
+        }
+
+        if (OUTPUT_STREAM_FD >= 0) {
+            std::array<unsigned char, WORKER_OUTPUT_HEADER_SIZE> header{};
+            if (!make_worker_output_header(id, image.size(), header)) {
+                close(FD);
+                close(CONTROL_FD);
+                std::println(stderr, "mandelbench-worker[{}]: failed to build output header bytes={}", id, image.size());
+                return 1;
+            }
+            MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} header write begin fd={} bytes={}", id, CURRENT_REPEAT, FD,
+                              header.size());
+            if (!write_all(FD, header, &write_fail_ret, &write_fail_errno)) {
+                close(FD);
+                close(CONTROL_FD);
+                std::println(stderr, "mandelbench-worker[{}]: failed while writing output header ret={} errno={} ({})", id,
+                             write_fail_ret, write_fail_errno, std::strerror(write_fail_errno));
+                return 1;
+            }
+            MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} header write end fd={} bytes={}", id, CURRENT_REPEAT, FD,
+                              header.size());
+            if (PAYLOAD_RELEASE && !wait_for_control_byte(CONTROL_FD, id, "payload release")) {
+                close(FD);
+                close(CONTROL_FD);
+                return 1;
+            }
         }
 
         uint64_t const WRITE_BODY_START_US = now_us();

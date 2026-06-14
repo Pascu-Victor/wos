@@ -1096,12 +1096,9 @@ def run_wos_renderbench(
     elif args.wos_disable_single_thread_worker_queue:
         command += ["--disable-single-thread-worker-queue"]
     if placement == "process-per-core":
-        enable_process_persistent_workers = (
-            args.wos_enable_process_persistent_workers or args.wos_render_tuning in {"optimal", "safe"}
-        )
         if args.wos_disable_process_persistent_workers:
             command += ["--disable-process-persistent-workers"]
-        elif enable_process_persistent_workers:
+        elif args.wos_enable_process_persistent_workers:
             command += ["--enable-process-persistent-workers"]
 
     host_command = [str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, *command]
@@ -1360,7 +1357,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="manual",
         help=(
             "Category-specific WOS renderbench tuning. 'optimal' keeps node-threads on the fast no-reserve path "
-            "and enables persistent process-per-core workers; 'safe' also reserves one node-thread CPU per host."
+            "and 'safe' also reserves one node-thread CPU per host. Persistent process-per-core workers remain "
+            "explicitly opt-in."
         ),
     )
     parser.add_argument(
@@ -1576,8 +1574,6 @@ def main() -> int:
             parser.error("--wos-render-tuning optimal is incompatible with --wos-node-worker-reserve-cpus")
         if args.wos_coordinator_skip_local_worker:
             parser.error("--wos-render-tuning optimal is incompatible with --wos-coordinator-skip-local-worker")
-        if args.wos_disable_process_persistent_workers:
-            parser.error("--wos-render-tuning optimal is incompatible with --wos-disable-process-persistent-workers")
     if args.benchmark_timeout < 0:
         parser.error("--benchmark-timeout must be nonnegative")
     if args.artifact_fetch_timeout < 0:

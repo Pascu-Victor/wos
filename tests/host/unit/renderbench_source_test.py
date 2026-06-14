@@ -259,15 +259,15 @@ def test_renderbench_node_threads_avoid_persistent_command_stream() -> None:
         "renderbench node-thread command-stream policy",
     )
 
-    render_threads_body = function_body(source, "one_shot_worker_render_threads")
+    worker_body = function_body(source, "run_ipc_worker")
     require_tokens(
-        render_threads_body,
+        worker_body,
         [
-            "worker.batch_count > 0",
-            "options.placement == tracebench::Placement::NodeThreads",
-            "return 1;",
+            "int const THREADS = std::max(1, worker.worker_threads);",
+            "std::vector<thrd_t> threads(static_cast<size_t>(THREADS));",
+            "thrd_create(&threads[static_cast<size_t>(i)], batch_render_thread",
         ],
-        "renderbench dynamic node-thread worker thread cap",
+        "renderbench node-thread worker thread fanout",
     )
 
 

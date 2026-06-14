@@ -573,10 +573,17 @@ def test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local() ->
         source,
         [
             "constexpr uint64_t PIPE_PAYLOAD_IDLE_TIMEOUT_US = 300'000'000;",
+            "constexpr unsigned char WORKER_CONTROL_RELEASE_PAYLOAD = 2;",
+            "constexpr int MANDELBENCH_ROW_BAND_ROWS = 8;",
             "MANDELBENCH_SAVE_IMAGES",
+            "MANDELBENCH_PAYLOAD_RELEASE",
+            "return value == nullptr || value[0] == '\\0' || value[0] != '0';",
             "MANDELBENCH_PROFILE_WORKER_LIMIT",
             '#include <sys/vfs.h>',
+            '#include <atomic>',
             'auto get_testprog_path() -> const char* { return "/usr/bin/testprog"; }',
+            "auto generate_dynamic_chunk_rows(void* param) -> int",
+            "fetch_add(1, std::memory_order_relaxed)",
         ],
         "mandelbench remote worker slot settings",
     )
@@ -585,6 +592,16 @@ def test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local() ->
     if "find_or_create_local_launch" in source:
         fail("mandelbench local slots must use child workers, not coordinator-local thread coalescing")
 
+    payload_release_config_body = function_body(source, "mandelbench_payload_release_enabled")
+    require_tokens(
+        payload_release_config_body,
+        [
+            "MANDELBENCH_PAYLOAD_RELEASE",
+            "return value != nullptr && value[0] != '\\0' && value[0] != '0';",
+        ],
+        "mandelbench payload release opt-in",
+    )
+
     coordinator_body = function_body(source, "mandelbench_wki")
     require_tokens(
         coordinator_body,
@@ -592,16 +609,20 @@ def test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local() ->
             "std::vector<WorkerLaunch> remote_launches;",
             "std::vector<WorkerLaunch> local_launches;",
             "remote_launches.reserve(static_cast<size_t>(TARGET_NODES.empty() ? ACTIVE_WORKERS : TARGET_NODES.size()));",
-            "local_launches.reserve(static_cast<size_t>(ACTIVE_WORKERS));",
-            "int const BASE_ROWS = height / ACTIVE_WORKERS;",
-            "int const EXTRA_ROWS = height % ACTIVE_WORKERS;",
-            "std::ranges::find_if(remote_launches",
-            "launch.target_node == TARGET_NODE",
-            "local_launches.push_back(make_worker_launch(worker_id, TARGET_NODE, 1, true));",
-            "launch.thread_count = std::max<int>(1, static_cast<int>(launch.chunks.size()));",
+            "std::vector<WorkerSlot> worker_slots;",
+            "start_row += MANDELBENCH_ROW_BAND_ROWS",
+            "band_index % ACTIVE_WORKERS",
+            "int const THREAD_COUNT = count_slots_for_target(worker_slots, slot.target_node, slot.local);",
+            "auto launch_it = find_launch_for_output_slot(remote_launches, slot.worker_id);",
+            "make_worker_launch(slot.worker_id, {}, 1, false)",
+            "auto launch_it = find_launch_for_target(remote_launches, slot.target_node);",
+            "make_worker_launch(slot.worker_id, slot.target_node, THREAD_COUNT, false)",
+            "auto launch_it = find_launch_for_target(local_launches, slot.target_node);",
+            "make_worker_launch(slot.worker_id, slot.target_node, THREAD_COUNT, true)",
             "bool const SAVE_IMAGES = mandelbench_save_images_enabled();",
+            "bool const PAYLOAD_RELEASE = mandelbench_payload_release_enabled();",
             "compute_local_launches(local_launches, image.data(), local_colormap.data(), width, height, max_iteration, ROW_SIZE,",
-            "complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index)",
+            "complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index, PAYLOAD_RELEASE)",
             "print_slowest_worker_profiles(remote_launches, repeat_index, START_US);",
             "if (SAVE_IMAGES)",
             "save_skipped=1",
@@ -656,33 +677,47 @@ def test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local() ->
             "mandelbench_profile_enabled() && fd_is_open(STDERR_FILENO)",
             "if (thread_count == 1)",
             "(void)generate_rows(&worker_thread.arg);",
-            "WorkerChunk const& chunk = GROUPED_CHUNKS ? chunks.at(static_cast<size_t>(thread_index)) : chunks.front();",
-            "thread_arg.local_thread_count = GROUPED_CHUNKS ? 1 : thread_count;",
+            "(void)generate_dynamic_chunk_rows(&worker_thread.band_arg);",
+            "std::atomic<int> next_chunk{0};",
+            "std::atomic<int> grouped_rows_done{0};",
+            "auto thread_func = GROUPED_CHUNKS ? generate_dynamic_chunk_rows : generate_rows;",
+            "rows_done = grouped_rows_done.load(std::memory_order_relaxed);",
+            "bool const PAYLOAD_RELEASE = mandelbench_payload_release_enabled();",
+            'PAYLOAD_RELEASE && !wait_for_control_byte(CONTROL_FD, id, "payload release")',
         ],
-        "mandelbench inline worker compute",
+        "mandelbench dynamic chunk worker compute",
     )
-    if "WorkerChunkThreadArg" in source or "generate_chunk_pool_rows" in source or "std::atomic<int> next_chunk" in source:
-        fail("mandelbench grouped workers must map chunks directly to threads, not through a shared atomic chunk pool")
-    require_order(worker_body, "header write begin", "compute begin", "mandelbench worker output protocol")
-    if 'wait_for_control_byte(CONTROL_FD, id, "payload release")' in worker_body:
-        fail("mandelbench worker must not wait for a payload-release control byte after writing its header")
+    if "generate_chunk_pool_rows" in source:
+        fail("mandelbench grouped workers must use the current finite dynamic chunk scheduler")
+    require_order(worker_body, "compute begin", "header write begin", "mandelbench worker computes before output header")
+    require_order(worker_body, "header write begin", "payload write begin", "mandelbench worker output header before payload")
 
     streaming_body = function_body(source, "complete_worker_payloads_streaming")
-    if "release_worker_payload(launch" in streaming_body:
-        fail("mandelbench coordinator must not send a payload-release control byte in streaming mode")
+    require_tokens(
+        streaming_body,
+        [
+            "if (payload_release_enabled)",
+            "release_worker_payload(launch, repeat_index)",
+            "launch.payload_released = true;",
+        ],
+        "mandelbench payload release gate",
+    )
 
     local_compute_body = function_body(source, "compute_local_launches")
     require_tokens(
         local_compute_body,
         [
-            "std::vector<LocalComputeThread> compute_threads(thread_count);",
+            "std::vector<std::vector<size_t>> chunk_offsets;",
+            "std::vector<std::atomic<int>> next_chunks(launches.size());",
+            "std::vector<std::atomic<int>> rows_done_by_launch(launches.size());",
             "for (const auto& launch : launches)",
-            "for (const WorkerChunk& chunk : launch.chunks)",
-            "thrd_create(&compute_thread.thread, generate_rows, &compute_thread.arg)",
+            "int const THREADS = std::clamp(launch.thread_count, 1, static_cast<int>(launch.chunks.size()));",
+            "thrd_create(&compute_thread.thread, generate_dynamic_chunk_rows, &compute_thread.arg)",
             "for (size_t i = 0; i < created_threads; ++i)",
             "thrd_join(compute_thread.thread, nullptr)",
+            "rows_done_by_launch.at(launch_index).load(std::memory_order_relaxed)",
         ],
-        "mandelbench local compute direct per-chunk threads",
+        "mandelbench local compute dynamic chunk threads",
     )
     require_order(
         local_compute_body,

@@ -460,7 +460,7 @@ void proxy_reschedule_waiters(const std::array<uint64_t, WKI_IPC_MAX_POLL_WAKE_W
             continue;
         }
 
-        ker::mod::sched::wake_task_from_event(waiter);
+        ker::mod::sched::wake_task_from_event(waiter, ker::mod::sched::EventWakeDeferredSwitch::CANCEL);
         waiter->release();
     }
 }
@@ -2154,10 +2154,7 @@ auto pipe_pump_read_ready(ker::vfs::File* file) -> bool {
         return true;
     }
 
-    // The pump is the only bridge from a home-node pipe read end to the remote
-    // proxy.  Keep poll wakeups as the fast path, but bound the sleep so a lost
-    // daemon wake cannot strand a remote reader forever.
-    ker::mod::sched::kern_sleep_us(WKI_IPC_PIPE_READ_POLL_RECHECK_US);
+    ker::mod::sched::kern_block();
     return false;
 }
 
@@ -2302,7 +2299,7 @@ template <int SLOT>
                 bool ready_now = false;
                 if (register_poll_read_waiter(file, &ready_now)) {
                     if (!ready_now) {
-                        ker::mod::sched::kern_sleep_us(WKI_IPC_PIPE_READ_POLL_RECHECK_US);
+                        ker::mod::sched::kern_block();
                     }
                 } else {
                     ker::mod::sched::kern_sleep_us(WKI_IPC_PIPE_READ_POLL_RECHECK_US);
