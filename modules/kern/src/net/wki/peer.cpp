@@ -881,18 +881,37 @@ struct PendingFenceNotify {
     uint32_t reason = 0;
 };
 
-// Received FENCE_NOTIFY frames are dispatched from the WKI RX path.  Full peer
-// fencing closes channels and may send reliable control packets, so keep RX to a
+struct PendingPeerGoodbye {
+    uint16_t leaving_node = WKI_NODE_INVALID;
+    uint16_t reason = 0;
+};
+
+enum class PeerDisconnectKind : uint8_t {
+    FENCE,
+    GRACEFUL_LEAVE,
+};
+
+// Received lifecycle frames are dispatched from the WKI RX path.  Full peer
+// cleanup closes channels and may send reliable control packets, so keep RX to a
 // bounded enqueue and let the WKI timer thread perform the teardown.
 mod::sys::Spinlock s_pending_fence_lock;                                   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::array<PendingFenceNotify, WKI_MAX_PEERS> s_pending_fence_notifies{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 size_t s_pending_fence_notify_count = 0;                                   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint32_t> s_pending_fence_notify_drops{0};                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+mod::sys::Spinlock s_pending_goodbye_lock;                                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<PendingPeerGoodbye, WKI_MAX_PEERS> s_pending_goodbyes{};        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+size_t s_pending_goodbye_count = 0;                                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint32_t> s_pending_goodbye_drops{0};                          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 auto local_observation_confirms_fence(const WkiPeer* peer, uint64_t now_us) -> bool;
 
 auto fence_notify_target_is_valid(uint16_t fenced_node) -> bool {
     return fenced_node != WKI_NODE_INVALID && fenced_node != WKI_NODE_BROADCAST && fenced_node != g_wki.my_node_id;
+}
+
+auto peer_goodbye_target_is_valid(uint16_t leaving_node, uint16_t src_node) -> bool {
+    return leaving_node != WKI_NODE_INVALID && leaving_node != WKI_NODE_BROADCAST && leaving_node != g_wki.my_node_id &&
+           leaving_node == src_node;
 }
 
 auto queue_pending_fence_notify(const FenceNotifyPayload& fn) -> bool {
@@ -933,7 +952,43 @@ auto queue_pending_fence_notify(const FenceNotifyPayload& fn) -> bool {
     return true;
 }
 
-void wki_peer_fence_impl(WkiPeer* peer, bool notify_connected_peers) {
+auto queue_pending_peer_goodbye(const PeerGoodbyePayload& goodbye, uint16_t src_node) -> bool {
+    if (!peer_goodbye_target_is_valid(goodbye.leaving_node, src_node)) {
+        return true;
+    }
+
+    WkiPeer* leaving_peer = wki_peer_find(goodbye.leaving_node);
+    if (leaving_peer == nullptr || leaving_peer->state == PeerState::FENCED) {
+        return true;
+    }
+
+    s_pending_goodbye_lock.lock();
+
+    for (size_t i = 0; i < s_pending_goodbye_count; ++i) {
+        auto& pending = s_pending_goodbyes.at(i);
+        if (pending.leaving_node == goodbye.leaving_node) {
+            pending.reason = goodbye.reason;
+            s_pending_goodbye_lock.unlock();
+            return true;
+        }
+    }
+
+    if (s_pending_goodbye_count >= s_pending_goodbyes.size()) {
+        s_pending_goodbye_lock.unlock();
+        return false;
+    }
+
+    s_pending_goodbyes.at(s_pending_goodbye_count) = PendingPeerGoodbye{
+        .leaving_node = goodbye.leaving_node,
+        .reason = goodbye.reason,
+    };
+    ++s_pending_goodbye_count;
+
+    s_pending_goodbye_lock.unlock();
+    return true;
+}
+
+void wki_peer_disconnect_impl(WkiPeer* peer, PeerDisconnectKind kind, bool notify_connected_peers) {
     peer->lock.lock();
     if (peer->state == PeerState::FENCED) {
         peer->lock.unlock();
@@ -947,7 +1002,11 @@ void wki_peer_fence_impl(WkiPeer* peer, bool notify_connected_peers) {
     peer->local_channel_epoch = next_channel_epoch(peer->local_channel_epoch);
     peer->lock.unlock();
 
-    log::warn("FENCED peer 0x%04x", fenced_id);
+    if (kind == PeerDisconnectKind::FENCE) {
+        log::warn("FENCED peer 0x%04x", fenced_id);
+    } else {
+        log::info("Peer 0x%04x left gracefully", fenced_id);
+    }
 
     // Emit NODE_LEAVE event before cleanup
     wki_event_publish(EVENT_CLASS_SYSTEM, EVENT_SYSTEM_NODE_LEAVE, &fenced_id, sizeof(fenced_id));
@@ -985,7 +1044,7 @@ void wki_peer_fence_impl(WkiPeer* peer, bool notify_connected_peers) {
     // Close all channels to this peer
     wki_channels_close_for_peer(fenced_id);
 
-    if (notify_connected_peers) {
+    if (kind == PeerDisconnectKind::FENCE && notify_connected_peers) {
         FenceNotifyPayload fn = {};
         fn.fenced_node = fenced_id;
         fn.fencing_node = g_wki.my_node_id;
@@ -1046,13 +1105,42 @@ void drain_pending_fence_notifies() {
         }
 
         log::warn("Applying deferred FENCE_NOTIFY: node 0x%04x fenced by 0x%04x", pending.fenced_node, pending.fencing_node);
-        wki_peer_fence_impl(fenced_peer, false);
+        wki_peer_disconnect_impl(fenced_peer, PeerDisconnectKind::FENCE, false);
+    }
+}
+
+void drain_pending_peer_goodbyes() {
+    std::array<PendingPeerGoodbye, WKI_MAX_PEERS> pending_goodbyes{};
+
+    s_pending_goodbye_lock.lock();
+    size_t const PENDING_COUNT = s_pending_goodbye_count;
+    for (size_t i = 0; i < PENDING_COUNT; ++i) {
+        pending_goodbyes.at(i) = s_pending_goodbyes.at(i);
+    }
+    s_pending_goodbye_count = 0;
+    s_pending_goodbye_lock.unlock();
+
+    for (size_t i = 0; i < PENDING_COUNT; ++i) {
+        auto const& pending = pending_goodbyes.at(i);
+        if (!peer_goodbye_target_is_valid(pending.leaving_node, pending.leaving_node)) {
+            continue;
+        }
+
+        WkiPeer* leaving_peer = wki_peer_find(pending.leaving_node);
+        if (leaving_peer == nullptr || leaving_peer->state == PeerState::FENCED) {
+            continue;
+        }
+
+        log::info("Applying deferred PEER_GOODBYE: node 0x%04x reason=%u", pending.leaving_node, pending.reason);
+        wki_peer_disconnect_impl(leaving_peer, PeerDisconnectKind::GRACEFUL_LEAVE, false);
     }
 }
 
 }  // namespace
 
-void wki_peer_fence(WkiPeer* peer) { wki_peer_fence_impl(peer, true); }
+void wki_peer_fence(WkiPeer* peer) { wki_peer_disconnect_impl(peer, PeerDisconnectKind::FENCE, true); }
+
+void wki_peer_graceful_leave(WkiPeer* peer) { wki_peer_disconnect_impl(peer, PeerDisconnectKind::GRACEFUL_LEAVE, false); }
 
 namespace detail {
 
@@ -1082,6 +1170,32 @@ void handle_fence_notify(const WkiHeader* /*hdr*/, const uint8_t* payload, uint1
     // The fencing node will also flood an updated LSA without the fenced peer,
     // but proactive invalidation avoids stale routes in the interim.
     wki_routing_invalidate_node(fn->fenced_node);
+    wki_routing_recompute();
+}
+
+void handle_peer_goodbye(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+    if (hdr == nullptr || payload_len < sizeof(PeerGoodbyePayload)) {
+        return;
+    }
+
+    const auto* goodbye = reinterpret_cast<const PeerGoodbyePayload*>(payload);
+
+    if (!peer_goodbye_target_is_valid(goodbye->leaving_node, hdr->src_node)) {
+        return;
+    }
+
+    log::info("Received PEER_GOODBYE: node 0x%04x reason=%u", goodbye->leaving_node, goodbye->reason);
+
+    if (queue_pending_peer_goodbye(*goodbye, hdr->src_node)) {
+        wki_timer_notify();
+    } else {
+        uint32_t const DROPS = s_pending_goodbye_drops.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (DROPS == 1 || (DROPS & (DROPS - 1)) == 0) {
+            log::warn("Pending PEER_GOODBYE queue full; dropped %u notifications", DROPS);
+        }
+    }
+
+    wki_routing_invalidate_node(goodbye->leaving_node);
     wki_routing_recompute();
 }
 
@@ -1187,6 +1301,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
     }
 
     drain_pending_fence_notifies();
+    drain_pending_peer_goodbyes();
 
     // Use a fast discovery beacon until we join a mesh, then keep only a slow
     // stable-state beacon for late nodes and partition healing.

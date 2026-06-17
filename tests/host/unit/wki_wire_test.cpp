@@ -19,6 +19,8 @@ TEST(WkiWire, HelloPayloadIs96Bytes) { EXPECT_EQ(sizeof(HelloPayload), 96u); }
 
 TEST(WkiWire, HeartbeatPayloadIs16Bytes) { EXPECT_EQ(sizeof(HeartbeatPayload), 16u); }
 
+TEST(WkiWire, PeerGoodbyePayloadIs8Bytes) { EXPECT_EQ(sizeof(PeerGoodbyePayload), 8u); }
+
 // ---------------------------------------------------------------------------
 // Version/flags byte helpers
 // ---------------------------------------------------------------------------
@@ -178,6 +180,7 @@ TEST(WkiWire, MsgTypeEnumValues) {
     EXPECT_EQ(static_cast<uint8_t>(MsgType::HELLO), 0x01);
     EXPECT_EQ(static_cast<uint8_t>(MsgType::HEARTBEAT), 0x03);
     EXPECT_EQ(static_cast<uint8_t>(MsgType::LSA), 0x05);
+    EXPECT_EQ(static_cast<uint8_t>(MsgType::PEER_GOODBYE), 0x0C);
     EXPECT_EQ(static_cast<uint8_t>(MsgType::ZONE_CREATE_REQ), 0x20);
     EXPECT_EQ(static_cast<uint8_t>(MsgType::EVENT_PUBLISH), 0x32);
     EXPECT_EQ(static_cast<uint8_t>(MsgType::DEV_ATTACH_REQ), 0x40);

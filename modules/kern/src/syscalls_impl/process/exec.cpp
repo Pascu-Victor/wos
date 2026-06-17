@@ -22,6 +22,7 @@
 #include <platform/mm/mm.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/power/power.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <string_view>
@@ -510,6 +511,9 @@ auto wos_proc_exec(const char* path, const char* const* argv, const char* const*
 
 namespace {
 auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* const* envp, int shebang_depth) -> uint64_t {
+    if (ker::mod::power::shutdown_in_progress()) {
+        return static_cast<uint64_t>(-ESHUTDOWN);
+    }
     std::string_view const STR(path, std::strlen(path));
     size_t argv_count = 0;
     if (argv != nullptr) {
@@ -991,6 +995,9 @@ auto wos_proc_execve(const char* path, const char* const* argv, const char* cons
 namespace {
 auto wos_proc_execve_impl(const char* path, const char* const* argv, const char* const* envp, ker::mod::cpu::GPRegs& gpr, int shebang_depth)
     -> uint64_t {
+    if (ker::mod::power::shutdown_in_progress()) {
+        return static_cast<uint64_t>(-ESHUTDOWN);
+    }
     // POSIX execve: replace current process image with a new one.
     // On success, the sysret return path is patched to land at the new
     // binary's entry point (gpr is a local copy and NOT used).

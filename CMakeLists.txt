@@ -195,6 +195,7 @@ set(WOS_MODULE_TARGET_FILES
     $<TARGET_FILE:journal>
     $<TARGET_FILE:journal_lib>
     $<TARGET_FILE:wkictl>
+    $<TARGET_FILE:powerctl>
     $<TARGET_FILE:renderbench>
     $<TARGET_FILE:strace>
     $<TARGET_FILE:sftpserver>
@@ -258,7 +259,7 @@ add_custom_command(
 )
 add_custom_target(boot_image DEPENDS ${WOS_BOOT_DISK} ${INITRAMFS_OUTPUT} ${BOOT_IMAGE_STAMP})
 
-foreach(mod wos init testprog testd netd httpd perf top memacc journal wkictl renderbench sftpserver)
+foreach(mod wos init testprog testd netd httpd perf top memacc journal wkictl powerctl renderbench sftpserver)
     add_dependencies(${mod} mlibc libcxx)
 endforeach()
 # busybox and dropbear are only needed for image creation, not compilation.

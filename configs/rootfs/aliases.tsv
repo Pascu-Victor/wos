@@ -16,6 +16,15 @@ copy	build/modules/strace/strace	/usr/bin/strace
 copy-mode	build/modules/sftpserver/sftp-server	/usr/libexec/sftp-server	755
 copy	build/modules/journal/journal	/usr/bin/journalctl
 copy	build/modules/wkictl/wkictl	/usr/bin/wkictl
+copy	build/modules/powerctl/powerctl	/usr/sbin/powerctl
+symlink	/usr/sbin/powerctl	/sbin/reboot
+symlink	/usr/sbin/powerctl	/sbin/poweroff
+symlink	/usr/sbin/powerctl	/sbin/halt
+symlink	/usr/sbin/powerctl	/sbin/shutdown
+symlink	/usr/sbin/powerctl	/usr/bin/reboot
+symlink	/usr/sbin/powerctl	/usr/bin/poweroff
+symlink	/usr/sbin/powerctl	/usr/bin/halt
+symlink	/usr/sbin/powerctl	/usr/bin/shutdown
 symlink	/usr/bin/wkictl	/usr/bin/locally
 symlink	/usr/bin/wkictl	/usr/bin/remotely
 symlink	/usr/bin/wkictl	/usr/bin/homeward

@@ -41,6 +41,7 @@ constexpr auto STACK_OFF_RDI = 0x48;
 constexpr auto STACK_OFF_RCX = 0x60;
 constexpr auto STACK_OFF_RAX = 0x70;
 constexpr auto STACK_OFF_RETVAL = 0x78;
+constexpr uint64_t USER_ADDR_LIMIT = 0x0000800000000000ULL;
 
 // Helper: read a uint64_t from a stack slot
 auto stack_read(const uint8_t* base, int offset) -> uint64_t { return *reinterpret_cast<const uint64_t*>(base + offset); }
@@ -52,8 +53,47 @@ inline auto is_user_signal_handler(const ker::mod::sched::task::Task::SigHandler
     return handler.handler != WOS_SIG_DFL && handler.handler != WOS_SIG_IGN;
 }
 
+auto user_pointer_valid(uint64_t ptr) -> bool { return ptr != 0 && ptr < USER_ADDR_LIMIT; }
+
+auto user_signal_target_valid(const ker::mod::sched::task::Task::SigHandler& handler) -> bool {
+    return user_pointer_valid(handler.handler) && user_pointer_valid(handler.restorer);
+}
+
+auto live_syscall_user_rsp() -> uint64_t {
+    uint64_t value = 0;
+    asm volatile("movq %%gs:0x08, %0" : "=r"(value)::"memory");
+    return value;
+}
+
+auto live_syscall_return_rip() -> uint64_t {
+    uint64_t value = 0;
+    asm volatile("movq %%gs:0x28, %0" : "=r"(value)::"memory");
+    return value;
+}
+
+auto live_syscall_return_flags() -> uint64_t {
+    uint64_t value = 0;
+    asm volatile("movq %%gs:0x30, %0" : "=r"(value)::"memory");
+    return value;
+}
+
+void write_live_syscall_return(uint64_t user_rsp, uint64_t user_rip, uint64_t user_flags) {
+    asm volatile("movq %0, %%gs:0x08" ::"r"(user_rsp) : "memory");
+    asm volatile("movq %0, %%gs:0x28" ::"r"(user_rip) : "memory");
+    asm volatile("movq %0, %%gs:0x30" ::"r"(user_flags) : "memory");
+}
+
+void write_task_syscall_return(Task& task, uint64_t user_rsp, uint64_t user_rip, uint64_t user_flags) {
+    if (task.context.syscall_scratch_area == 0) {
+        return;
+    }
+    auto* per_cpu = reinterpret_cast<ker::mod::cpu::PerCpu*>(task.context.syscall_scratch_area);
+    per_cpu->user_rsp = user_rsp;
+    per_cpu->syscall_ret_rip = user_rip;
+    per_cpu->syscall_ret_flags = user_flags;
+}
+
 auto user_range_valid(uint64_t start, size_t size) -> bool {
-    constexpr uint64_t USER_ADDR_LIMIT = 0x0000800000000000ULL;
     uint64_t const END = start + static_cast<uint64_t>(size);
     return size != 0 && END >= start && END <= USER_ADDR_LIMIT;
 }
@@ -176,16 +216,13 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
         return 0;
     }
 
-    // Get PerCpu struct to read/write user RSP, RIP, and RFLAGS
-    auto* per_cpu = reinterpret_cast<cpu::PerCpu*>(task->context.syscall_scratch_area);
-
     // --- Handle sigreturn first ---
     if (task->do_sigreturn) {
         task->do_sigreturn = false;
 
         // User RSP at sigreturn syscall entry points to &frame.signo
         // (restorer's `ret` already popped pretcode, so RSP = pretcode + 8 = &signo)
-        uint64_t const USER_RSP = per_cpu->user_rsp;
+        uint64_t const USER_RSP = live_syscall_user_rsp();
         uint64_t const FRAME_START = USER_RSP - 8;  // back up to pretcode
         SignalFrame frame{};
         if (!read_signal_frame(*task, FRAME_START, frame)) {
@@ -205,10 +242,10 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
         stack_write(stack_base, STACK_OFF_RETVAL, frame.saved_retval);
         stack_write(stack_base, STACK_OFF_RAX, frame.saved_retval);
 
-        // Restore user RIP, RSP, and RFLAGS through PerCpu
-        per_cpu->user_rsp = frame.saved_rsp;
-        per_cpu->syscall_ret_rip = frame.saved_rip;
-        per_cpu->syscall_ret_flags = frame.saved_rflags;
+        // Restore user RIP, RSP, and RFLAGS through the same live GS scratch
+        // that syscall.asm will consume for the imminent return.
+        write_task_syscall_return(*task, frame.saved_rsp, frame.saved_rip, frame.saved_rflags);
+        write_live_syscall_return(frame.saved_rsp, frame.saved_rip, frame.saved_rflags);
 
         task->in_signal_handler = false;
         return 1;  // Return via iretq so RCX/R11 are restored as user GPRs.
@@ -271,10 +308,16 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
         return 0;
     }
 
+    if (!user_signal_target_valid(handler)) {
+        task->sig_pending &= ~(1ULL << IDX);
+        ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);
+        __builtin_unreachable();
+    }
+
     // --- Deliver the signal: set up signal frame on user stack ---
-    uint64_t const USER_RSP = per_cpu->user_rsp;
-    uint64_t const USER_RIP = per_cpu->syscall_ret_rip;
-    uint64_t const USER_RFLAGS = per_cpu->syscall_ret_flags;
+    uint64_t const USER_RSP = live_syscall_user_rsp();
+    uint64_t const USER_RIP = live_syscall_return_rip();
+    uint64_t const USER_RFLAGS = live_syscall_return_flags();
 
     // Preserve the SysV user red zone; mlibc and clang-generated leaf code may
     // keep live locals in the 128 bytes below RSP across syscalls.
@@ -305,9 +348,10 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
     stack_write(stack_base, STACK_OFF_RCX, handler.handler);               // sysret target = handler
     stack_write(stack_base, STACK_OFF_RDI, static_cast<uint64_t>(SIGNO));  // arg1 = signo
 
-    // Update PerCpu for the modified return path
-    per_cpu->user_rsp = FRAME_ADDR;              // new user stack (with frame)
-    per_cpu->syscall_ret_rip = handler.handler;  // update diagnostic check value
+    // Update the stored task scratch and the live GS scratch.  The latter is
+    // what syscall.asm checks immediately before SYSRET.
+    write_task_syscall_return(*task, FRAME_ADDR, handler.handler, USER_RFLAGS);
+    write_live_syscall_return(FRAME_ADDR, handler.handler, USER_RFLAGS);
 
     // Block additional signals during handler execution
     // Block the handler's sa_mask + the signal itself (unless SA_NODEFER)
@@ -381,6 +425,12 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
         return;
     }
 
+    if (!user_signal_target_valid(handler)) {
+        task->sig_pending &= ~(1ULL << IDX);
+        ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);
+        __builtin_unreachable();
+    }
+
     uint64_t const FRAME_ADDR = signal_frame_address_for_task(*task, frame.rsp, handler.flags);
     SignalFrame sigframe{};
 
@@ -440,6 +490,11 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
     if (!is_user_signal_handler(handler)) {
         return;
     }
+    if (!user_signal_target_valid(handler)) {
+        task->sig_pending &= ~(1ULL << IDX);
+        ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);
+        __builtin_unreachable();
+    }
 
     uint64_t const FRAME_ADDR = signal_frame_address_for_task(*task, frame.rsp, handler.flags);
     SignalFrame sigframe{};
@@ -468,10 +523,7 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
     frame.rip = handler.handler;
     frame.rsp = FRAME_ADDR;
 
-    auto* per_cpu = reinterpret_cast<cpu::PerCpu*>(task->context.syscall_scratch_area);
-    per_cpu->user_rsp = FRAME_ADDR;
-    per_cpu->syscall_ret_rip = handler.handler;
-    per_cpu->syscall_ret_flags = frame.flags;
+    write_task_syscall_return(*task, FRAME_ADDR, handler.handler, frame.flags);
 
     task->sig_mask |= handler.mask;
     if ((handler.flags & 0x40000000ULL) == 0U) {

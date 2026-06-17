@@ -1,6 +1,7 @@
 #include <sys/logging.h>
 #include <sys/process.h>
 #include <sys/vfs.h>
+#include <sys/wait.h>
 #include <time.h>  // NOLINT(modernize-deprecated-headers): WOS POSIX sleep declarations live here.
 
 #include <array>
@@ -13,6 +14,7 @@
 #include "fstab.h"
 #include "network.h"
 #include "services.h"
+#include "shutdown.h"
 #include "sys/multiproc.h"
 
 namespace {
@@ -105,6 +107,7 @@ auto main(int argc, char** argv) -> int {
 
     // === ROOT INIT MODE ===
     init_log::info("init[%llu]: root init starting", static_cast<unsigned long long>(CPUNO));
+    shutdown_init();
 
     // Pin init itself to the local node. NOINHERIT makes forked children start
     // with automatic WKI placement; service launch code re-pins daemons locally
@@ -150,19 +153,29 @@ auto main(int argc, char** argv) -> int {
     start_dropbear();
     // start_testd();
 
-    // Keep init alive and reap orphaned zombie children.
-    // When children are still alive, block in waitpid() until one exits.
-    // If init temporarily has no children at all, sleep instead of spinning.
+    // Keep init alive, reap orphaned zombie children, and poll scheduled
+    // shutdown state without blocking forever in waitpid().
     for (;;) {
-        int32_t reap_status = 0;
-        auto reap_pid = ker::process::waitpid(-1, &reap_status, 0, nullptr);
-        if (std::cmp_equal(reap_pid, -1)) {
-            struct timespec const IDLE_SLEEP{
-                .tv_sec = 1,
-                .tv_nsec = 0,
-            };
-            nanosleep(&IDLE_SLEEP, nullptr);
+        ShutdownAction const ACTION = shutdown_poll();
+        if (ACTION != ShutdownAction::NONE) {
+            shutdown_perform(ACTION);
         }
+
+        int32_t reap_status = 0;
+        for (;;) {
+            auto reap_pid = ker::process::waitpid(-1, &reap_status, WNOHANG, nullptr);
+            if (reap_pid > 0) {
+                note_service_reaped(static_cast<uint64_t>(reap_pid));
+                continue;
+            }
+            break;
+        }
+
+        struct timespec const IDLE_SLEEP{
+            .tv_sec = 0,
+            .tv_nsec = 100L * 1000L * 1000L,
+        };
+        nanosleep(&IDLE_SLEEP, nullptr);
     }
 
     return 0;

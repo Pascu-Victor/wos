@@ -62,6 +62,7 @@ class MountRef {
 // Mount point management
 auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device) -> int;
 auto unmount_filesystem(const char* path) -> int;
+auto shutdown_unmount_all_exact(const char* root_path) -> int;
 auto find_mount_point(const char* path) -> MountRef;
 auto mounted_block_device_overlaps(const ker::dev::BlockDevice* device) -> bool;
 auto configure_mount_point_exact(const char* path, FSType expected_type, void* private_data, FileOperations* fops) -> bool;

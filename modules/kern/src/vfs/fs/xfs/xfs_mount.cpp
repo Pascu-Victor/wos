@@ -21,6 +21,7 @@
 
 #include "dev/block_device.hpp"
 #include "vfs/fs/xfs/xfs_format.hpp"
+#include "vfs/fs/xfs/xfs_vfs.hpp"
 
 namespace ker::vfs::xfs {
 
@@ -374,8 +375,7 @@ void xfs_unmount(XfsMountContext* ctx) {
     }
 
     if (!ctx->read_only) {
-        // Flush all dirty buffers
-        sync_blockdev(ctx->device);
+        (void)xfs_sync_mount(ctx);
     }
 
     // Invalidate cached buffers

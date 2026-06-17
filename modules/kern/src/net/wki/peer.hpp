@@ -31,6 +31,9 @@ void wki_peer_timer_tick(uint64_t now_us);
 // Fence a peer (immediate) - fails in-flight ops, notifies resource layers
 void wki_peer_fence(WkiPeer* peer);
 
+// Gracefully detach a peer that intentionally left the mesh.
+void wki_peer_graceful_leave(WkiPeer* peer);
+
 // WKI timer kernel thread - calls wki_peer_timer_tick() in a loop (~10ms cadence).
 // Must be started after scheduler is running (from smt.cpp, like tcp_timer_thread).
 [[noreturn]] void wki_timer_thread();

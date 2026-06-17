@@ -734,10 +734,31 @@ void wki_shutdown() {
 
     ker::mod::dbg::log("[WKI] Shutting down...");
 
-    // Fence all connected peers (triggers full cleanup cascade per peer)
+    std::array<uint16_t, WKI_MAX_PEERS> connected_peers{};
+    size_t connected_count = 0;
     for (auto& peer : g_wki.peers) {
         if (peer.node_id != WKI_NODE_INVALID && peer.state == PeerState::CONNECTED) {
-            wki_peer_fence(&peer);
+            connected_peers.at(connected_count++) = peer.node_id;
+            if (connected_count >= connected_peers.size()) {
+                break;
+            }
+        }
+    }
+
+    PeerGoodbyePayload goodbye = {};
+    goodbye.leaving_node = g_wki.my_node_id;
+    goodbye.reason = WKI_GOODBYE_REASON_SHUTDOWN;
+
+    for (size_t i = 0; i < connected_count; ++i) {
+        (void)wki_send_raw(connected_peers.at(i), MsgType::PEER_GOODBYE, &goodbye, sizeof(goodbye), WKI_FLAG_PRIORITY);
+    }
+
+    // Gracefully detach connected peers locally. This reuses the normal cleanup
+    // cascade without claiming that healthy peers failed.
+    for (size_t i = 0; i < connected_count; ++i) {
+        WkiPeer* peer = wki_peer_find(connected_peers.at(i));
+        if (peer != nullptr && peer->state == PeerState::CONNECTED) {
+            wki_peer_graceful_leave(peer);
         }
     }
 
@@ -2201,6 +2222,9 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
             return;
         case MsgType::HEARTBEAT_ACK:
             detail::handle_heartbeat_ack(hdr, payload, PAYLOAD_LEN);
+            return;
+        case MsgType::PEER_GOODBYE:
+            detail::handle_peer_goodbye(hdr, payload, PAYLOAD_LEN);
             return;
 
         // Reliable control messages - check seq ordering

@@ -4,6 +4,7 @@
 #include <syscalls_impl/futex/futex.hpp>
 #include <syscalls_impl/multiproc/threadControl.hpp>
 #include <syscalls_impl/net/sys_net.hpp>
+#include <syscalls_impl/power/sys_power.hpp>
 #include <syscalls_impl/shm/shm.hpp>
 #include <syscalls_impl/time/time.hpp>
 #include <syscalls_impl/vfs/sys_vfs.hpp>
@@ -93,6 +94,9 @@ extern "C" auto syscall_handler(cpu::GPRegs* regs) -> uint64_t {
             break;
         case abi::callnums::PERSONALITY:
             result = ker::syscall::process::personality(A1);
+            break;
+        case abi::callnums::POWER:
+            result = ker::syscall::power::sys_power(A1, A2);
             break;
         case abi::callnums::DEBUG:
             // a1=0: disable interrupts on this CPU; a1=1: re-enable

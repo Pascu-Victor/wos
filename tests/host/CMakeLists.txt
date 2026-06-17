@@ -13,6 +13,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ktest_cov_test.py
 )
 add_test(
+    NAME coverage_summary_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/coverage_summary_test.py
+)
+add_test(
     NAME ktest_manifest_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ktest_manifest_test.py
 )
@@ -43,6 +47,14 @@ add_test(
 add_test(
     NAME init_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/init_source_test.py
+)
+add_test(
+    NAME shutdown_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/shutdown_source_test.py
+)
+add_test(
+    NAME pty_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/pty_source_test.py
 )
 add_test(
     NAME strace_source_test
@@ -107,6 +119,10 @@ add_test(
 add_test(
     NAME scheduler_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scheduler_source_test.py
+)
+add_test(
+    NAME signal_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/signal_source_test.py
 )
 add_test(
     NAME phys_source_test
@@ -175,6 +191,7 @@ add_test(
 set_tests_properties(
     host_test_manifest_test
     ktest_cov_test
+    coverage_summary_test
     ktest_manifest_test
     runtime_test_audit_test
     testd_manifest_test
@@ -183,6 +200,8 @@ set_tests_properties(
     top_source_test
     time_source_test
     init_source_test
+    shutdown_source_test
+    pty_source_test
     strace_source_test
     journal_source_test
     wkictl_source_test
@@ -199,6 +218,7 @@ set_tests_properties(
     futex_source_test
     waitpid_source_test
     scheduler_source_test
+    signal_source_test
     phys_source_test
     wki_timer_source_test
     wki_wait_source_test

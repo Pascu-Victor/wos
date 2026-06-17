@@ -156,7 +156,10 @@ auto pair_from_device(ker::dev::Device* device, const char* op) -> PtyPair* {
         return nullptr;
     }
     auto* pair = static_cast<PtyPair*>(device->private_data);
-    if (pair == nullptr || !is_valid_kernel_pointer(pair)) {
+    if (pair == nullptr) {
+        return nullptr;
+    }
+    if (!is_valid_kernel_pointer(pair)) {
         log::warn("pty_%s: invalid pair pointer %p from device %p", op, pair, device);
         return nullptr;
     }
@@ -537,11 +540,13 @@ int master_close(ker::vfs::File* file) {
     }
 
     uint64_t const IRQF = pair->lock.lock_irqsave();
-    pair->master_opened--;
+    if (pair->master_opened > 0) {
+        pair->master_opened--;
+    }
 
     bool should_free = false;
-    // If slave is also closed AND no one else is already freeing, free the pair
-    if (pair->slave_opened <= 0 && !pair->freeing) {
+    // If both endpoints are closed AND no one else is already freeing, free the pair.
+    if (pair->master_opened <= 0 && pair->slave_opened <= 0 && !pair->freeing) {
         pair->allocated = false;
         pair->freeing = true;
         pty_detach_devices(pair);
@@ -1131,11 +1136,13 @@ int slave_close(ker::vfs::File* file) {
     }
 
     uint64_t const IRQF = pair->lock.lock_irqsave();
-    pair->slave_opened--;
+    if (pair->slave_opened > 0) {
+        pair->slave_opened--;
+    }
 
     bool should_free = false;
-    // If master is also closed AND no one else is already freeing, free the pair
-    if (pair->master_opened <= 0 && !pair->freeing) {
+    // If both endpoints are closed AND no one else is already freeing, free the pair.
+    if (pair->master_opened <= 0 && pair->slave_opened <= 0 && !pair->freeing) {
         pair->allocated = false;
         pair->freeing = true;
         pty_detach_devices(pair);

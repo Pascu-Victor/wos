@@ -580,6 +580,7 @@ void handle_heartbeat(const WkiHeader* hdr, const uint8_t* payload, uint16_t pay
 void handle_heartbeat_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
 void handle_lsa(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
 void handle_fence_notify(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
+void handle_peer_goodbye(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
 
 }  // namespace detail
 

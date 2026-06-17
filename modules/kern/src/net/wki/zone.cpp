@@ -869,7 +869,7 @@ void wki_zones_destroy_for_peer(uint16_t node_id) {
             break;
         }
 
-        log::info("Destroying zone 0x%08x (peer 0x%04x fenced)", zone_id, node_id);
+        log::info("Destroying zone 0x%08x during peer cleanup (peer 0x%04x)", zone_id, node_id);
         finish_claimed_waiter(read_waiter, -1);
         finish_claimed_waiter(write_waiter, -1);
         finalize_retired_zone_if_idle(zone);

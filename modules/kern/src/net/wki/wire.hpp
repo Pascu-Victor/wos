@@ -59,6 +59,7 @@ enum class MsgType : uint8_t {
     RECONCILE_ACK = 0x09,
     RESOURCE_ADVERT = 0x0A,
     RESOURCE_WITHDRAW = 0x0B,
+    PEER_GOODBYE = 0x0C,
 
     // Zone management (channel 1)
     ZONE_CREATE_REQ = 0x20,
@@ -239,6 +240,20 @@ struct FenceNotifyPayload {
     uint16_t fencing_node;  // node that performed the fencing
     uint32_t reason;        // 0 = heartbeat timeout, 1 = manual
 } __attribute__((packed));
+
+// ---------------------------------------------------------------------------
+// PEER_GOODBYE Payload - 8 bytes
+// ---------------------------------------------------------------------------
+
+constexpr uint16_t WKI_GOODBYE_REASON_SHUTDOWN = 1;
+
+struct PeerGoodbyePayload {
+    uint16_t leaving_node;  // node that is intentionally disconnecting
+    uint16_t reason;        // WKI_GOODBYE_REASON_*
+    uint32_t reserved;
+} __attribute__((packed));
+
+static_assert(sizeof(PeerGoodbyePayload) == 8, "PeerGoodbyePayload must be 8 bytes");
 
 // -----------------------------------------------------------------------------
 // RECONCILE_REQ / RECONCILE_ACK Payload - 8 bytes

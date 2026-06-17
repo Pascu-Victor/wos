@@ -2385,7 +2385,7 @@ void wki_dev_proxy_suspend_for_peer(uint16_t node_id) {
         set_proxy_block_fenced(p.get(), true);
         p->fence_time_us = NOW;
 
-        ker::mod::dbg::log("[WKI] Dev proxy suspended (fenced): %s node=0x%04x - I/O will block until reconnect or %llu s timeout",
+        ker::mod::dbg::log("[WKI] Dev proxy suspended for peer cleanup: %s node=0x%04x - I/O will block until reconnect or %llu s timeout",
                            p->bdev.name.data(), node_id, WKI_DEV_PROXY_FENCE_WAIT_US / 1000000ULL);
     }
     s_proxy_lock.unlock();

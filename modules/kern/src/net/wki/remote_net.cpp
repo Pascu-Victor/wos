@@ -1445,7 +1445,7 @@ void wki_remote_net_cleanup_for_peer(uint16_t node_id) {
                 }
             }
             erase_net_proxy(entry.state);
-            ker::mod::dbg::log("[WKI] Remote NIC proxy fenced: node=0x%04x", node_id);
+            ker::mod::dbg::log("[WKI] Remote NIC proxy cleanup: node=0x%04x", node_id);
         }
     }
 }

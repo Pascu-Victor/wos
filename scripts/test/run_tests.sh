@@ -98,6 +98,7 @@ FUZZ_TARGETS=(wki_wire_fuzz data_struct_fuzz tcp_fuzz xfs_format_fuzz wki_routin
 UNIT_TESTS=(
     host_test_manifest_test
     ktest_cov_test
+    coverage_summary_test
     ktest_manifest_test
     runtime_test_audit_test
     testd_manifest_test
@@ -106,6 +107,8 @@ UNIT_TESTS=(
     top_source_test
     time_source_test
     init_source_test
+    shutdown_source_test
+    pty_source_test
     strace_source_test
     journal_source_test
     wkictl_source_test
@@ -122,6 +125,7 @@ UNIT_TESTS=(
     futex_source_test
     waitpid_source_test
     scheduler_source_test
+    signal_source_test
     phys_source_test
     wki_timer_source_test
     wki_wait_source_test

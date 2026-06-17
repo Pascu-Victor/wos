@@ -21,6 +21,7 @@
 #include "platform/interrupt/gdt.hpp"
 #include "platform/mm/mm.hpp"
 #include "platform/mm/virt.hpp"
+#include "platform/power/power.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sys/signal.hpp"
 
@@ -173,6 +174,35 @@ auto current_stack_allows_local_reschedule() -> bool {
     // other than current_task, which can happen during the handoff window after
     // current_task is changed but before the actual RSP switch.
     return sched::debug_find_task_by_kernel_stack(rsp) == nullptr;
+}
+
+auto defer_process_reschedule_to_syscall_exit() -> bool {
+    if (!sched::can_query_current_task()) {
+        return false;
+    }
+    if (power::shutdown_in_progress()) {
+        return false;
+    }
+
+    auto* task = sched::get_current_task();
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->deferred_task_switch || task->is_voluntary_blocked() ||
+        task->wants_block) {
+        return false;
+    }
+
+    // Same-CPU event wakes from syscalls only need to yield at the syscall
+    // return boundary. Avoid arming a one-tick APIC timer while the process is
+    // deep on its syscall stack; daemon hlt/yield paths still use the timer.
+    uint64_t rsp = 0;
+    asm volatile("mov %%rsp, %0" : "=r"(rsp)::"memory");
+    if (!stack_belongs_to_task(task, rsp)) {
+        return false;
+    }
+
+    task->yield_switch = true;
+    task->deferred_task_switch = true;
+    task->wait_channel = "local_reschedule";
+    return true;
 }
 
 [[noreturn]] void enter_idle_from_timer(sched::task::Task* task, const gates::InterruptFrame& frame) {
@@ -738,6 +768,10 @@ void start_sched_timer() {
 }
 
 auto request_reschedule() -> bool {
+    if (defer_process_reschedule_to_syscall_exit()) {
+        return true;
+    }
+
     if (!current_stack_allows_local_reschedule()) {
         if (!sched::interrupts_enabled()) {
             return false;

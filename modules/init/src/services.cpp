@@ -27,7 +27,19 @@ constexpr size_t PIPE_WRITE = 1;
 constexpr uint32_t DROPBEAR_KEYGEN_TIMEOUT_MS = 30000;
 constexpr uint32_t CHILD_WAIT_POLL_US = 1000;
 constexpr uint64_t NSEC_PER_MSEC = 1000000ULL;
+constexpr uint32_t SERVICE_TERM_TIMEOUT_MS = 2000;
+constexpr uint32_t SERVICE_KILL_TIMEOUT_MS = 1000;
+constexpr size_t MAX_TRACKED_SERVICES = 16;
 using init_log = wos::journal<"init">;
+
+struct ServiceEntry {
+    const char* name{};
+    uint64_t pid{};
+    ServiceKind kind{};
+    bool active{};
+};
+
+std::array<ServiceEntry, MAX_TRACKED_SERVICES> tracked_services{};
 
 auto monotonic_ns() -> uint64_t {
     timespec ts{};
@@ -71,7 +83,93 @@ auto wait_for_child_timeout(int64_t pid, int32_t* status, uint32_t timeout_ms) -
     return false;
 }
 
+auto wait_for_child_exit(int64_t pid, int32_t* status, uint32_t timeout_ms) -> bool {
+    uint64_t const START_NS = monotonic_ns();
+    uint64_t const TIMEOUT_NS = static_cast<uint64_t>(timeout_ms) * NSEC_PER_MSEC;
+    uint64_t waited_us = 0;
+
+    while ((START_NS != 0 && monotonic_ns() - START_NS <= TIMEOUT_NS) ||
+           (START_NS == 0 && waited_us <= static_cast<uint64_t>(timeout_ms) * 1000ULL)) {
+        int64_t const WAITED = ker::process::waitpid(pid, status, WNOHANG, nullptr);
+        if (WAITED == pid) {
+            return true;
+        }
+        if (WAITED < 0 && WAITED != -EINTR) {
+            return true;
+        }
+        usleep(CHILD_WAIT_POLL_US);
+        waited_us += CHILD_WAIT_POLL_US;
+    }
+
+    return false;
+}
+
 }  // namespace
+
+void register_service(const char* name, uint64_t pid, ServiceKind kind) {
+    if (pid == 0) {
+        return;
+    }
+    for (auto& service : tracked_services) {
+        if (!service.active) {
+            service.name = name;
+            service.pid = pid;
+            service.kind = kind;
+            service.active = true;
+            return;
+        }
+    }
+    init_log::warn("init: service registry full; not tracking %s pid %llu", name != nullptr ? name : "?",
+                   static_cast<unsigned long long>(pid));
+}
+
+void note_service_reaped(uint64_t pid) {
+    if (pid == 0) {
+        return;
+    }
+    for (auto& service : tracked_services) {
+        if (service.active && service.pid == pid) {
+            service.active = false;
+            return;
+        }
+    }
+}
+
+namespace {
+
+void stop_one_service(ServiceEntry& service) {
+    if (!service.active || service.pid == 0) {
+        return;
+    }
+    init_log::info("init: stopping %s pid %llu", service.name != nullptr ? service.name : "service",
+                   static_cast<unsigned long long>(service.pid));
+    (void)ker::process::kill(static_cast<int64_t>(service.pid), SIGTERM);
+    int32_t status = 0;
+    if (!wait_for_child_exit(static_cast<int64_t>(service.pid), &status, SERVICE_TERM_TIMEOUT_MS)) {
+        init_log::warn("init: %s pid %llu did not stop after SIGTERM; sending SIGKILL", service.name != nullptr ? service.name : "service",
+                       static_cast<unsigned long long>(service.pid));
+        (void)ker::process::kill(static_cast<int64_t>(service.pid), SIGKILL);
+        (void)wait_for_child_timeout(static_cast<int64_t>(service.pid), &status, SERVICE_KILL_TIMEOUT_MS);
+    }
+    service.active = false;
+}
+
+void stop_services_by_kind(ServiceKind kind) {
+    for (auto& service : tracked_services) {
+        if (service.active && service.kind == kind) {
+            stop_one_service(service);
+        }
+    }
+}
+
+}  // namespace
+
+void stop_services_for_shutdown() {
+    stop_services_by_kind(ServiceKind::NETWORK);
+    stop_services_by_kind(ServiceKind::NORMAL);
+}
+
+void stop_journald_for_shutdown() { stop_services_by_kind(ServiceKind::JOURNAL); }
 
 auto spawn_local_service(const char* path, const char* const* argv, const char* const* envp) -> uint64_t {
     int64_t const PID = ker::process::fork();
@@ -175,6 +273,7 @@ void start_journald() {
     if (PID == 0) {
         init_log::warn("init[%llu]: failed to spawn journald", static_cast<unsigned long long>(CPUNO));
     } else {
+        register_service("journald", PID, ServiceKind::JOURNAL);
         int64_t const PRIO_RC = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(PID), BACKGROUND_SERVICE_NICE);
         init_log::info("init[%llu]: journald spawned as PID %llu", static_cast<unsigned long long>(CPUNO),
                        static_cast<unsigned long long>(PID));
@@ -195,6 +294,7 @@ void start_httpd() {
     if (HTTPD_PID == 0) {
         init_log::error("init[%llu]: failed to spawn httpd", static_cast<unsigned long long>(CPUNO));
     } else {
+        register_service("httpd", HTTPD_PID, ServiceKind::NETWORK);
         int64_t const PRIO_RC = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(HTTPD_PID), BACKGROUND_SERVICE_NICE);
         init_log::info("init[%llu]: httpd spawned as PID %llu", static_cast<unsigned long long>(CPUNO),
                        static_cast<unsigned long long>(HTTPD_PID));
@@ -243,6 +343,7 @@ void start_dropbear() {
     if (DROPBEAR_PID == 0) {
         init_log::error("init[%llu]: failed to spawn dropbear", static_cast<unsigned long long>(CPUNO));
     } else {
+        register_service("dropbear", DROPBEAR_PID, ServiceKind::NETWORK);
         int64_t const PRIO_RC = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(DROPBEAR_PID), BACKGROUND_SERVICE_NICE);
         init_log::info("init[%llu]: dropbear spawned as PID %llu", static_cast<unsigned long long>(CPUNO),
                        static_cast<unsigned long long>(DROPBEAR_PID));
@@ -276,6 +377,7 @@ void start_testd() {
     if (PID == 0) {
         init_log::warn("init[%llu]: failed to spawn testd", static_cast<unsigned long long>(CPUNO));
     } else {
+        register_service("testd", PID, ServiceKind::NORMAL);
         init_log::info("init[%llu]: testd spawned as PID %llu", static_cast<unsigned long long>(CPUNO),
                        static_cast<unsigned long long>(PID));
     }

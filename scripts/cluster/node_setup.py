@@ -250,7 +250,6 @@ def build_qemu_args(
         *(["-d", log_flags] if log_flags else []),
         "-D",
         str(qemu_log),
-        "-no-reboot",
     ]
 
     for nic_idx, nic in enumerate(spec.get("nics", [])):

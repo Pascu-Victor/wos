@@ -2520,7 +2520,7 @@ void wki_remote_compute_cleanup_for_peer(uint16_t node_id) {
             auto* proxy = *std::next(proxy_tasks.begin(), static_cast<ptrdiff_t>(i));
             finalize_proxy_task(proxy, -1, nullptr, 0, 0);
 
-            ker::mod::dbg::log("[WKI] Proxy task fenced: pid=0x%lx (peer 0x%04x)", proxy->pid, node_id);
+            ker::mod::dbg::log("[WKI] Proxy task cleanup: pid=0x%lx (peer 0x%04x)", proxy->pid, node_id);
         }
 
         if (drained_submitted) {

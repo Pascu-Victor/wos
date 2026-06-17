@@ -286,10 +286,36 @@ rootfs_stage_misc_dirs() {
     mkdir -p "$ROOTFS_STAGING/oldroot"
 }
 
+rootfs_finalize_usr_merge_link() {
+    local link_name="$1"
+    local target="$2"
+    local link_path="$ROOTFS_STAGING/$link_name"
+    local target_path="$ROOTFS_STAGING/$target"
+    local entry
+
+    mkdir -p "$target_path"
+
+    if [ -d "$link_path" ] && [ ! -L "$link_path" ]; then
+        # Earlier staging steps may place explicit aliases under /bin, /sbin, or /lib.
+        # Preserve those entries under /usr before replacing the top-level path.
+        rm -f "$link_path/$link_name"
+        for entry in "$link_path"/* "$link_path"/.[!.]* "$link_path"/..?*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            mv -f "$entry" "$target_path/"
+        done
+        rmdir "$link_path"
+    else
+        rm -f "$link_path"
+    fi
+
+    ln -sfn "$target" "$link_path"
+    rootfs_record_managed_path "/$link_name"
+}
+
 rootfs_finalize_usr_merge() {
-    ln -sfn usr/lib "$ROOTFS_STAGING/lib"
-    ln -sfn usr/bin "$ROOTFS_STAGING/bin"
-    ln -sfn usr/sbin "$ROOTFS_STAGING/sbin"
+    rootfs_finalize_usr_merge_link lib usr/lib
+    rootfs_finalize_usr_merge_link bin usr/bin
+    rootfs_finalize_usr_merge_link sbin usr/sbin
 }
 
 rootfs_write_managed_paths() {

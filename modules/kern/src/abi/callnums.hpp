@@ -20,5 +20,6 @@ enum class callnums : uint64_t {
     DEBUG,
     SHM,
     PERSONALITY,
+    POWER,
 };
 }  // namespace ker::abi

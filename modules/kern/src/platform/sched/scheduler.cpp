@@ -452,6 +452,8 @@ constexpr uint32_t MAX_ACTIVE_TASKS = 2048;
 std::array<task::Task*, MAX_ACTIVE_TASKS> active_task_list = {nullptr};
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 uint32_t active_task_count = 0;
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> kernel_thread_shutdown_requested{false};
 
 ker::mod::sys::Spinlock global_task_registry_lock;
 
@@ -459,6 +461,27 @@ inline auto active_task_slot(uint32_t index) -> task::Task*& {
     // Callers hold global_task_registry_lock and bound index by active_task_count.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     return active_task_list[static_cast<size_t>(index)];
+}
+
+auto is_kernel_thread_shutdown_target(task::Task* task, task::Task* current) -> bool {
+    return task != nullptr && task != current && task->type == task::TaskType::DAEMON &&
+           task->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE && !task->has_exited;
+}
+
+auto count_kernel_thread_shutdown_targets(task::Task* current) -> size_t {
+    size_t remaining = 0;
+    uint32_t const COUNT = get_active_task_count();
+    for (uint32_t i = 0; i < COUNT; ++i) {
+        auto* task = get_active_task_at_safe(i);
+        if (task == nullptr) {
+            continue;
+        }
+        if (is_kernel_thread_shutdown_target(task, current)) {
+            ++remaining;
+        }
+        task->release();
+    }
+    return remaining;
 }
 
 inline auto pid_slot(uint32_t index) -> PidHashEntry& {
@@ -1326,6 +1349,9 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
     dbg::log("POST: PID %x '%s' -> CPU %d (heapIdx=%d, from CPU %d)", task->pid, (task->name != nullptr) ? task->name : "?",
              static_cast<int>(cpu_no), task->heap_index, static_cast<int>(cpu::current_cpu()));
 #endif
+    if (task->type == task::TaskType::DAEMON && kernel_threads_shutdown_requested()) {
+        task->kernel_shutdown_requested.store(true, std::memory_order_release);
+    }
     task->cpu = cpu_no;
 
     if (task->start_time_us == 0) {
@@ -2129,6 +2155,63 @@ void kern_wake(task::Task* task) {
         preferred_cpu = get_least_loaded_cpu();
     }
     reschedule_task_for_cpu(preferred_cpu, task);
+}
+
+auto kernel_threads_shutdown_requested() -> bool { return kernel_thread_shutdown_requested.load(std::memory_order_acquire); }
+
+void maybe_exit_current_kernel_thread_for_shutdown() {
+    if (!kernel_threads_shutdown_requested()) {
+        return;
+    }
+
+    auto* task = get_current_task();
+    if (task == nullptr || task->type != task::TaskType::DAEMON || !task->kernel_shutdown_requested.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    task->wakeup_pending.store(false, std::memory_order_release);
+    task->deferred_task_switch = false;
+    task->yield_switch = false;
+    task->wants_block = false;
+    task->wake_at_us = 0;
+    task->set_voluntary_blocked(false);
+    task->wait_channel = nullptr;
+    ker::syscall::process::wos_proc_exit(0);
+    for (;;) {
+        asm volatile("hlt" ::: "memory");
+    }
+}
+
+auto request_kernel_threads_shutdown(uint64_t timeout_us) -> KernelThreadShutdownResult {
+    kernel_thread_shutdown_requested.store(true, std::memory_order_release);
+
+    auto* current = get_current_task();
+    KernelThreadShutdownResult result{};
+    uint32_t const COUNT = get_active_task_count();
+    for (uint32_t i = 0; i < COUNT; ++i) {
+        auto* task = get_active_task_at_safe(i);
+        if (task == nullptr) {
+            continue;
+        }
+
+        if (is_kernel_thread_shutdown_target(task, current)) {
+            bool const WAS_REQUESTED = task->kernel_shutdown_requested.exchange(true, std::memory_order_acq_rel);
+            if (!WAS_REQUESTED) {
+                ++result.requested;
+            }
+            task->wakeup_pending.store(true, std::memory_order_release);
+            kern_wake(task);
+        }
+        task->release();
+    }
+
+    uint64_t const START_US = time::get_us();
+    result.remaining = count_kernel_thread_shutdown_targets(current);
+    while (result.remaining != 0 && time::get_us() - START_US < timeout_us) {
+        kern_yield();
+        result.remaining = count_kernel_thread_shutdown_targets(current);
+    }
+    return result;
 }
 
 auto event_wake_target_cpu(const task::Task* task, uint64_t waker_cpu) -> uint64_t {
@@ -3030,6 +3113,8 @@ void start_scheduler() {
 namespace {
 constexpr uint64_t WOS_SIG_DFL = 0;
 constexpr uint64_t WOS_SIG_IGN = 1;
+constexpr uint64_t USER_ADDR_LIMIT = 0x0000800000000000ULL;
+constexpr int WOS_SIGSEGV = 11;
 
 enum class DeferredSignalDelivery : uint8_t {
     FULL,
@@ -3038,6 +3123,10 @@ enum class DeferredSignalDelivery : uint8_t {
 
 inline auto is_user_signal_handler(task::Task::SigHandler const& handler) -> bool {
     return handler.handler != WOS_SIG_DFL && handler.handler != WOS_SIG_IGN;
+}
+
+inline auto user_signal_target_valid(task::Task::SigHandler const& handler) -> bool {
+    return handler.handler != 0 && handler.handler < USER_ADDR_LIMIT && handler.restorer != 0 && handler.restorer < USER_ADDR_LIMIT;
 }
 
 void check_pending_signals_deferred(task::Task* task, DeferredSignalDelivery delivery) {
@@ -3069,6 +3158,11 @@ void check_pending_signals_deferred(task::Task* task, DeferredSignalDelivery del
 
     if (delivery == DeferredSignalDelivery::USER_HANDLERS_ONLY && !is_user_signal_handler(handler)) {
         return;
+    }
+    if (is_user_signal_handler(handler) && !user_signal_target_valid(handler)) {
+        task->sig_pending &= ~(1ULL << idx);
+        ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);
+        __builtin_unreachable();
     }
 
     task->sig_pending &= ~(1ULL << idx);
@@ -4152,6 +4246,33 @@ auto signal_process_group(uint64_t pgid, int sig) -> size_t {
             }
             t->release();
         }
+    }
+    return matched;
+}
+
+auto signal_visible_processes_except(uint64_t excluded_pid, uint64_t excluded_owner_pid, int sig) -> size_t {
+    if (sig < 0 || std::cmp_greater(sig, task::Task::MAX_SIGNALS)) {
+        return 0;
+    }
+    uint64_t const MASK = sig > 0 ? (1ULL << (sig - 1)) : 0;
+    size_t matched = 0;
+    uint32_t const COUNT = get_active_task_count();
+    for (uint32_t i = 0; i < COUNT; ++i) {
+        auto* t = get_active_task_at_safe(i);
+        if (t == nullptr) {
+            continue;
+        }
+        bool const ALIVE = t->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE && !t->has_exited;
+        uint64_t const PROCESS_PID = task::process_pid(*t);
+        bool const EXCLUDED = t->pid == excluded_pid || PROCESS_PID == excluded_owner_pid || PROCESS_PID == 1;
+        if (ALIVE && t->type == task::TaskType::PROCESS && task::process_visible(*t) && !EXCLUDED) {
+            ++matched;
+            if (sig != 0) {
+                t->sig_pending |= MASK;
+                wake_task_for_signal(t);
+            }
+        }
+        t->release();
     }
     return matched;
 }

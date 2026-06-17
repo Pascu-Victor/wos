@@ -20,6 +20,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/power/power.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/mutex.hpp>
@@ -6940,6 +6941,10 @@ auto probe_block_device_fstype(ker::dev::BlockDevice* bdev) -> const char* {
 }  // namespace
 
 auto vfs_mount(const char* source, const char* target, const char* fstype) -> int {
+    if (ker::mod::power::shutdown_in_progress()) {
+        return -ESHUTDOWN;
+    }
+
     if (target == nullptr) {
         return -EINVAL;
     }
@@ -7691,6 +7696,10 @@ auto vfs_sync() -> int {
 
     return result;
 }
+
+auto vfs_shutdown_sync() -> int { return vfs_sync(); }
+
+auto vfs_shutdown_unmount_all(const char* root_path) -> int { return shutdown_unmount_all_exact(root_path); }
 
 auto vfs_link(const char* oldpath, const char* newpath) -> int {
     if (oldpath == nullptr || newpath == nullptr) {

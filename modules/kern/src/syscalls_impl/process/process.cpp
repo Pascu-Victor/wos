@@ -23,6 +23,7 @@
 #include "platform/mm/phys.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/perf/perf_events.hpp"
+#include "platform/power/power.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sched/threading.hpp"
@@ -342,6 +343,9 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     auto* parent = sched::get_current_task();
     if (parent == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
+    }
+    if (power::shutdown_in_progress()) {
+        return static_cast<uint64_t>(-ESHUTDOWN);
     }
 
     LocalProcStage const FORK_STAGE = begin_local_proc_stage(parent, perf::WkiPerfLocalProcOp::FORK, 0, WOS_PERF_CALLSITE());
@@ -879,6 +883,9 @@ auto wos_proc_clone_vm(const CloneVmArgs* args) -> uint64_t {
     auto* parent = sched::get_current_task();
     if (parent == nullptr || args == nullptr) {
         return static_cast<uint64_t>(args == nullptr ? -EFAULT : -ESRCH);
+    }
+    if (power::shutdown_in_progress()) {
+        return static_cast<uint64_t>(-ESHUTDOWN);
     }
     if (args->fn == 0 || args->child_stack == 0 || (args->flags & WOS_CLONE_VM) == 0) {
         return static_cast<uint64_t>(-EINVAL);

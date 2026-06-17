@@ -41,6 +41,8 @@ auto is_wki_control_reserve_frame(const void* data, uint16_t len) -> bool {
             return hdr->payload_len <= sizeof(HeartbeatPayload);
         case MsgType::FENCE_NOTIFY:
             return hdr->channel_id == WKI_CHAN_CONTROL && hdr->payload_len <= sizeof(FenceNotifyPayload);
+        case MsgType::PEER_GOODBYE:
+            return hdr->channel_id == WKI_CHAN_CONTROL && hdr->payload_len <= sizeof(PeerGoodbyePayload);
         default:
             return false;
     }

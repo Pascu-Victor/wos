@@ -4,6 +4,7 @@
 #include <abi/callnums/futex.h>
 #include <abi/callnums/multiproc.h>
 #include <abi/callnums/net.h>
+#include <abi/callnums/power.h>
 #include <abi/callnums/process.h>
 #include <abi/callnums/shm.h>
 #include <abi/callnums/sys_log.h>
@@ -194,6 +195,8 @@ auto callnum_name(uint64_t callnum) -> std::string_view {
             return "shm";
         case ker::abi::callnums::personality:
             return "personality";
+        case ker::abi::callnums::power:
+            return "power";
     }
     return "unknown";
 }
@@ -539,6 +542,16 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
         case ker::abi::callnums::vmem_map:
             break;
         case ker::abi::callnums::personality:
+            break;
+        case ker::abi::callnums::power:
+            switch (static_cast<ker::abi::power::ops>(op)) {
+                case ker::abi::power::ops::REBOOT:
+                    return "reboot";
+                case ker::abi::power::ops::GET_STATE:
+                    return "get_state";
+                case ker::abi::power::ops::PREPARE:
+                    return "prepare";
+            }
             break;
     }
     return "op";

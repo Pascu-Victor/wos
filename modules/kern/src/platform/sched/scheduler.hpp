@@ -256,6 +256,11 @@ struct CpuAccountingSnapshot {
     uint64_t steal_us;
 };
 
+struct KernelThreadShutdownResult {
+    size_t requested{};
+    size_t remaining{};
+};
+
 struct LoadAverageSnapshot {
     uint64_t load1_milli;
     uint64_t load5_milli;
@@ -293,7 +298,11 @@ auto find_task_by_pid_safe(uint64_t pid) -> task::Task*;  // Find task by PID wi
 auto task_has_live_pagemap_sibling(task::Task* subject) -> bool;
 void set_task_nice(task::Task* task, int nice);               // Update task weight safely on its run queue
 auto signal_process_group(uint64_t pgid, int sig) -> size_t;  // Send signal to all live tasks in a process group
-void wake_task_for_signal(task::Task* task);                  // Make a signaled blocked task runnable so signal delivery can occur
+auto signal_visible_processes_except(uint64_t excluded_pid, uint64_t excluded_owner_pid, int sig) -> size_t;
+void wake_task_for_signal(task::Task* task);  // Make a signaled blocked task runnable so signal delivery can occur
+[[nodiscard]] auto kernel_threads_shutdown_requested() -> bool;
+void maybe_exit_current_kernel_thread_for_shutdown();
+auto request_kernel_threads_shutdown(uint64_t timeout_us) -> KernelThreadShutdownResult;
 
 // Event-driven waiters should resume on the CPU that observed the event when
 // they are truly parked and migratable.  Keeping this policy central prevents
@@ -436,6 +445,7 @@ extern bool (*wki_try_remote_placement_fn)(task::Task* task);  // NOLINT(cppcore
 //   while (!condition) { kern_yield(); }
 //
 inline void kern_yield_impl(uint64_t perf_callsite) {
+    maybe_exit_current_kernel_thread_for_shutdown();
     if (preempt_count() != 0) {
         note_preempt_disabled_block("kern_yield", perf_callsite);
     }
@@ -462,6 +472,7 @@ inline void kern_yield_impl(uint64_t perf_callsite) {
     if (PAUSED_SYSCALL_ACCOUNTING) {
         resume_syscall_accounting();
     }
+    maybe_exit_current_kernel_thread_for_shutdown();
 }
 
 // kern_block() - request that the current DAEMON task be truly blocked
@@ -471,6 +482,7 @@ inline void kern_yield_impl(uint64_t perf_callsite) {
 // under the run queue lock with interrupts disabled.
 // Must only be called from DAEMON kernel threads.
 inline void kern_block_impl(uint64_t perf_callsite) {
+    maybe_exit_current_kernel_thread_for_shutdown();
     if (preempt_count() != 0) {
         note_preempt_disabled_block("kern_block", perf_callsite);
     }
@@ -513,12 +525,14 @@ inline void kern_block_impl(uint64_t perf_callsite) {
     if (PAUSED_SYSCALL_ACCOUNTING) {
         resume_syscall_accounting();
     }
+    maybe_exit_current_kernel_thread_for_shutdown();
 }
 
 // kern_sleep_us() -- block the current DAEMON task until the timer wake scan
 // reaches the requested deadline. This avoids keeping timer/worker threads as
 // the current task on otherwise idle CPUs.
 inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
+    maybe_exit_current_kernel_thread_for_shutdown();
     if (sleep_us == 0) {
         kern_yield_impl(perf_callsite);
         return;
@@ -568,6 +582,7 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
     if (PAUSED_SYSCALL_ACCOUNTING) {
         resume_syscall_accounting();
     }
+    maybe_exit_current_kernel_thread_for_shutdown();
 }
 
 // preemptible_syscall_park() -- park a PROCESS syscall wait loop at a scheduler

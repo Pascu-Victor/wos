@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 SCHEDULER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.cpp"
+CONTEXT_SWITCH_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "context_switch.cpp"
 THREADING_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.cpp"
 THREADING_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.hpp"
 TASK_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.cpp"
@@ -187,10 +188,45 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
     )
 
 
+def test_process_syscall_reschedules_defer_to_syscall_exit() -> None:
+    source = CONTEXT_SWITCH_CPP.read_text()
+    helper_body = function_body(source, "defer_process_reschedule_to_syscall_exit")
+    request_body = function_body(source, "request_reschedule")
+
+    require_tokens(
+        helper_body,
+        [
+            "power::shutdown_in_progress()",
+            "task->type != sched::task::TaskType::PROCESS",
+            "task->deferred_task_switch",
+            "task->is_voluntary_blocked()",
+            "task->wants_block",
+            "stack_belongs_to_task(task, rsp)",
+            "task->yield_switch = true;",
+            "task->deferred_task_switch = true;",
+            'task->wait_channel = "local_reschedule";',
+        ],
+        "process syscall local reschedule deferral guard",
+    )
+    require_order(
+        request_body,
+        "defer_process_reschedule_to_syscall_exit()",
+        "apic::one_shot_timer(1)",
+        "process syscall reschedules must defer before arming the one-tick timer",
+    )
+    require_order(
+        helper_body,
+        "task->is_voluntary_blocked()",
+        "task->yield_switch = true;",
+        "voluntary hlt paths must not be converted to syscall-exit yields",
+    )
+
+
 def main() -> None:
     test_event_wake_cancel_preserves_current_task_wakeup_token()
     test_runtime_accounting_deltas_are_saturating()
     test_user_thread_tcbs_publish_nonzero_tid_before_user_execution()
+    test_process_syscall_reschedules_defer_to_syscall_exit()
     print("scheduler wake-token and runtime accounting invariants hold")
 
 

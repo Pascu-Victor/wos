@@ -5517,7 +5517,7 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id) {
         invalidate_readlink_cache(cleanup.state);
 
         if (cleanup.had_op_pending) {
-            ker::mod::dbg::log("[WKI] VFS op FENCE_CLEANUP: node=0x%04x ch=%u op=%u seq=%u mount=%s", cleanup.owner_node,
+            ker::mod::dbg::log("[WKI] VFS op PEER_CLEANUP: node=0x%04x ch=%u op=%u seq=%u mount=%s", cleanup.owner_node,
                                cleanup.assigned_channel, cleanup.op_expected_id, cleanup.op_expected_seq, cleanup.local_mount_path.data());
         }
 
@@ -5529,7 +5529,7 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id) {
             wki_channel_close(ch);
         }
 
-        ker::mod::dbg::log("[WKI] Remote VFS proxy fenced: %s node=0x%04x", cleanup.local_mount_path.data(), node_id);
+        ker::mod::dbg::log("[WKI] Remote VFS proxy cleanup: %s node=0x%04x", cleanup.local_mount_path.data(), node_id);
     }
 }
 

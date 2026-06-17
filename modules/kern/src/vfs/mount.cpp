@@ -14,6 +14,7 @@
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/power/power.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <util/smallvec.hpp>
@@ -39,6 +40,7 @@ using log = ker::mod::dbg::logger<"vfs_mount">;
 
 constexpr size_t MAX_MOUNT_PATH = 512;
 constexpr size_t MAX_MOUNT_COMPONENTS = 64;
+constexpr uint32_t SHUTDOWN_UNMOUNT_DRAIN_YIELDS = 5000;
 
 auto path_is_under_root(const char* path, const char* root, size_t root_len) -> bool {
     return std::strncmp(path, root, root_len) == 0 && (path[root_len] == '/' || path[root_len] == '\0');
@@ -271,6 +273,91 @@ void wait_for_mount_refs_to_drain(MountPoint* mount) {
     }
 }
 
+auto wait_for_mount_refs_to_drain_bounded(MountPoint* mount) -> bool {
+    if (mount == nullptr) {
+        return true;
+    }
+    for (uint32_t attempt = 0; attempt < SHUTDOWN_UNMOUNT_DRAIN_YIELDS; ++attempt) {
+        if (mount->refs.load(std::memory_order_acquire) == 0) {
+            return true;
+        }
+        if (ker::mod::sched::can_query_current_task()) {
+            ker::mod::sched::kern_yield();
+        } else {
+            asm volatile("pause" ::: "memory");
+        }
+    }
+    return mount->refs.load(std::memory_order_acquire) == 0;
+}
+
+auto sync_mount_for_shutdown(MountPoint* mount) -> int {
+    if (mount == nullptr) {
+        return -EINVAL;
+    }
+    switch (mount->fs_type) {
+        case FSType::FAT32:
+            return ker::vfs::fat32::fat32_sync_mount(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data));
+        case FSType::XFS:
+            return ker::vfs::xfs::xfs_sync_mount(static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+        case FSType::TMPFS:
+        case FSType::DEVFS:
+        case FSType::PROCFS:
+        case FSType::REMOTE:
+        default:
+            return 0;
+    }
+}
+
+auto is_shutdown_root_mount(const MountPoint* mount, const char* root_path) -> bool {
+    return mount != nullptr && mount->path != nullptr && root_path != nullptr && std::strcmp(mount->path, root_path) == 0;
+}
+
+auto mount_path_depth(const MountPoint* mount) -> size_t {
+    if (mount == nullptr || mount->path == nullptr) {
+        return 0;
+    }
+    size_t depth = 0;
+    for (const char* p = mount->path; *p != '\0'; ++p) {
+        if (*p == '/') {
+            ++depth;
+        }
+    }
+    return depth;
+}
+
+auto mount_should_come_after(const MountPoint* lhs, const MountPoint* rhs, const char* root_path) -> bool {
+    bool const LHS_ROOT = is_shutdown_root_mount(lhs, root_path);
+    bool const RHS_ROOT = is_shutdown_root_mount(rhs, root_path);
+    if (LHS_ROOT != RHS_ROOT) {
+        return LHS_ROOT;
+    }
+
+    size_t const LHS_DEPTH = mount_path_depth(lhs);
+    size_t const RHS_DEPTH = mount_path_depth(rhs);
+    if (LHS_DEPTH != RHS_DEPTH) {
+        return LHS_DEPTH < RHS_DEPTH;
+    }
+
+    size_t const LHS_LEN = lhs != nullptr && lhs->path != nullptr ? std::strlen(lhs->path) : 0;
+    size_t const RHS_LEN = rhs != nullptr && rhs->path != nullptr ? std::strlen(rhs->path) : 0;
+    return LHS_LEN < RHS_LEN;
+}
+
+void sort_shutdown_mounts(MountPoint** mounts_to_unmount, size_t count, const char* root_path) {
+    if (mounts_to_unmount == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        for (size_t j = i + 1; j < count; ++j) {
+            if (mount_should_come_after(mounts_to_unmount[i], mounts_to_unmount[j], root_path)) {
+                auto* tmp = mounts_to_unmount[i];
+                mounts_to_unmount[i] = mounts_to_unmount[j];
+                mounts_to_unmount[j] = tmp;
+            }
+        }
+    }
+}
+
 }  // namespace
 
 void put_mount_point(MountPoint* mount) {
@@ -376,6 +463,10 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     if (path == nullptr || fstype == nullptr) {
         vfs_debug_log("mount_filesystem: invalid arguments\n");
         return -EINVAL;
+    }
+    if (ker::mod::power::shutdown_in_progress()) {
+        vfs_debug_log("mount_filesystem: shutdown in progress\n");
+        return -ESHUTDOWN;
     }
 
     // Resolve through task root prefix so the stored path matches what
@@ -570,6 +661,70 @@ auto unmount_filesystem(const char* path) -> int {
     }
     mount_lock.unlock();
     return -ENOENT;
+}
+
+auto shutdown_unmount_all_exact(const char* root_path) -> int {
+    if (root_path == nullptr || root_path[0] != '/') {
+        return -EINVAL;
+    }
+
+    mount_lock.lock();
+    size_t const COUNT = mounts.size();
+    mount_lock.unlock();
+    if (COUNT == 0) {
+        return 0;
+    }
+
+    auto** pending = new MountPoint*[COUNT];
+    if (pending == nullptr) {
+        return -ENOMEM;
+    }
+
+    int result = 0;
+    size_t pending_count = 0;
+    mount_lock.lock();
+    while (!mounts.empty() && pending_count < COUNT) {
+        auto* mp = mounts.at(0);
+        if (mp != nullptr) {
+            mp->retiring.store(true, std::memory_order_release);
+            pending[pending_count++] = mp;
+        }
+        mounts.remove_at(0);
+    }
+    if (!mounts.empty()) {
+        log::warn("shutdown unmount table changed while snapshotting; %lu mounts remain", static_cast<unsigned long>(mounts.size()));
+        result = -EAGAIN;
+    }
+    mount_lock.unlock();
+
+    sort_shutdown_mounts(pending, pending_count, root_path);
+
+    for (size_t i = 0; i < pending_count; ++i) {
+        auto* mp = pending[i];
+        if (mp == nullptr) {
+            continue;
+        }
+
+        int const SYNC_RET = sync_mount_for_shutdown(mp);
+        if (SYNC_RET != 0 && result == 0) {
+            result = SYNC_RET;
+        }
+
+        if (!wait_for_mount_refs_to_drain_bounded(mp)) {
+            log::warn("shutdown unmount busy: path=%s refs=%u", mp->path != nullptr ? mp->path : "?",
+                      mp->refs.load(std::memory_order_acquire));
+            if (result == 0) {
+                result = -EBUSY;
+            }
+            continue;
+        }
+
+        log::info("shutdown unmounted %s", mp->path != nullptr ? mp->path : "?");
+        destroy_mount(mp);
+    }
+
+    delete[] pending;
+    return result;
 }
 
 auto find_mount_point(const char* path) -> MountRef {

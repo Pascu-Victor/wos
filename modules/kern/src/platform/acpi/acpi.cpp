@@ -8,7 +8,6 @@
 #include "platform/acpi/tables/rsdp.hpp"
 #include "platform/acpi/tables/sdt.hpp"
 #include "platform/mm/addr.hpp"
-#include "util/hcf.hpp"
 
 namespace {
 
@@ -49,11 +48,12 @@ void init() { ker::mod::acpi::rsdp::init(reinterpret_cast<uint64_t>(rsdp_request
 ACPIResult parse_acpi_tables(const char* ident) {
     rsdp::Rsdp const RSDP = rsdp::get();
 
-    Rsdt const* rsdt = reinterpret_cast<Rsdt*>(mm::addr::get_virt_pointer(RSDP.xsdt_addr));
+    Rsdt const* rsdt = nullptr;
     Xsdt const* xsdt = nullptr;
     Sdt header{};
+    bool const USE_XSDT = rsdp::use_xsdt();
 
-    if (rsdp::use_xsdt()) {
+    if (USE_XSDT) {
         xsdt = reinterpret_cast<Xsdt*>(mm::addr::get_virt_pointer(RSDP.xsdt_addr));
         header = xsdt->header;
     } else {
@@ -61,12 +61,9 @@ ACPIResult parse_acpi_tables(const char* ident) {
         header = rsdt->header;
     }
 
-    size_t const ENTRIES = (header.length - sizeof(Sdt)) / (rsdp::use_xsdt() ? sizeof(uint64_t) : sizeof(uint32_t));
-    if (xsdt == nullptr) {
-        hcf();  // no xsdt entries???
-    }
+    size_t const ENTRIES = (header.length - sizeof(Sdt)) / (USE_XSDT ? sizeof(uint64_t) : sizeof(uint32_t));
     for (size_t i = 0; i < ENTRIES; i++) {
-        auto const TABLE_PHYS = rsdp::use_xsdt() ? xsdt->next[i] : static_cast<uint64_t>(rsdt->next[i]);
+        auto const TABLE_PHYS = USE_XSDT ? xsdt->next[i] : static_cast<uint64_t>(rsdt->next[i]);
         auto* sdt = reinterpret_cast<Sdt*>(mm::addr::get_virt_pointer(TABLE_PHYS));
         if (signature_matches(*sdt, ident) && validate_checksum(sdt)) {
             ACPIResult result{};

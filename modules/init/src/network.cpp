@@ -32,6 +32,7 @@
 
 namespace {
 using init_log = wos::journal<"init">;
+using init_net_log = wos::journal<"init_net">;
 
 constexpr const char* NET_IFNAME = "eth0";
 constexpr long POLL_FIRST_DIAGNOSTIC_SECS = 45;
@@ -124,14 +125,14 @@ void replay_journal_record(const ker::abi::sys_log::JournalRecord& rec) {
     std::memcpy(line.data() + cursor, rec.message, COPY_LEN);
     cursor += COPY_LEN;
     line.at(cursor) = '\0';
-    ker::logging::logEx("init", ker::abi::sys_log::sys_log_level::CRITICAL, line.data(), static_cast<uint64_t>(cursor));
+    init_net_log::critical(line.data(), static_cast<uint64_t>(cursor));
 }
 
 void dump_journal_snapshot() {
     int fd = ::open("/dev/journal", O_RDONLY);
     if (fd < 0) {
         int const ERR = errno;
-        init_log::critical("network debug: unable to open /dev/journal for failure dump: errno=%d (%s)", ERR, strerror(ERR));
+        init_net_log::critical("unable to open /dev/journal for failure dump: errno=%d (%s)", ERR, strerror(ERR));
         return;
     }
 
@@ -156,8 +157,8 @@ void dump_journal_snapshot() {
     }
     ::close(fd);
 
-    init_log::critical("network debug: replaying %llu journal record(s) up to sequence %llu", static_cast<unsigned long long>(record_count),
-                       static_cast<unsigned long long>(latest_sequence));
+    init_net_log::critical("replaying %llu journal record(s) up to sequence %llu", static_cast<unsigned long long>(record_count),
+                           static_cast<unsigned long long>(latest_sequence));
     if (latest_sequence == 0) {
         return;
     }
@@ -165,7 +166,7 @@ void dump_journal_snapshot() {
     fd = ::open("/dev/journal", O_RDONLY);
     if (fd < 0) {
         int const ERR = errno;
-        init_log::critical("network debug: unable to reopen /dev/journal for failure dump: errno=%d (%s)", ERR, strerror(ERR));
+        init_net_log::critical("unable to reopen /dev/journal for failure dump: errno=%d (%s)", ERR, strerror(ERR));
         return;
     }
 
@@ -188,45 +189,45 @@ void dump_journal_snapshot() {
 
 void dump_ioctl_state(int sock) {
     if (sock < 0) {
-        init_log::critical("network debug: no AF_INET/SOCK_DGRAM socket available for ioctl probes");
+        init_net_log::critical("no AF_INET/SOCK_DGRAM socket available for ioctl probes");
         return;
     }
 
     struct ifreq ifr{};
     copy_ifreq_name(ifr, NET_IFNAME);
     if (ioctl(sock, SIOCGIFFLAGS, &ifr) == 0) {
-        init_log::critical("network debug: %s SIOCGIFFLAGS flags=0x%x", NET_IFNAME, static_cast<unsigned>(ifr.ifr_flags));
+        init_net_log::critical("%s SIOCGIFFLAGS flags=0x%x", NET_IFNAME, static_cast<unsigned>(ifr.ifr_flags));
     } else {
         int const ERR = errno;
-        init_log::critical("network debug: %s SIOCGIFFLAGS failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
+        init_net_log::critical("%s SIOCGIFFLAGS failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
     }
 
     copy_ifreq_name(ifr, NET_IFNAME);
     if (ioctl(sock, SIOCGIFINDEX, &ifr) == 0) {
-        init_log::critical("network debug: %s SIOCGIFINDEX ifindex=%d", NET_IFNAME, ifr.ifr_ifindex);
+        init_net_log::critical("%s SIOCGIFINDEX ifindex=%d", NET_IFNAME, ifr.ifr_ifindex);
     } else {
         int const ERR = errno;
-        init_log::critical("network debug: %s SIOCGIFINDEX failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
+        init_net_log::critical("%s SIOCGIFINDEX failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
     }
 
     copy_ifreq_name(ifr, NET_IFNAME);
     if (ioctl(sock, SIOCGIFMTU, &ifr) == 0) {
-        init_log::critical("network debug: %s SIOCGIFMTU mtu=%d", NET_IFNAME, ifr.ifr_mtu);
+        init_net_log::critical("%s SIOCGIFMTU mtu=%d", NET_IFNAME, ifr.ifr_mtu);
     } else {
         int const ERR = errno;
-        init_log::critical("network debug: %s SIOCGIFMTU failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
+        init_net_log::critical("%s SIOCGIFMTU failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
     }
 
     copy_ifreq_name(ifr, NET_IFNAME);
     if (ioctl(sock, SIOCGIFHWADDR, &ifr) == 0) {
         auto const* mac = reinterpret_cast<const unsigned char*>(ifr.ifr_hwaddr.sa_data);
-        init_log::critical("network debug: %s SIOCGIFHWADDR family=%u mac=%02x:%02x:%02x:%02x:%02x:%02x", NET_IFNAME,
-                           static_cast<unsigned>(ifr.ifr_hwaddr.sa_family), static_cast<unsigned>(mac[0]), static_cast<unsigned>(mac[1]),
-                           static_cast<unsigned>(mac[2]), static_cast<unsigned>(mac[3]), static_cast<unsigned>(mac[4]),
-                           static_cast<unsigned>(mac[5]));
+        init_net_log::critical("%s SIOCGIFHWADDR family=%u mac=%02x:%02x:%02x:%02x:%02x:%02x", NET_IFNAME,
+                               static_cast<unsigned>(ifr.ifr_hwaddr.sa_family), static_cast<unsigned>(mac[0]),
+                               static_cast<unsigned>(mac[1]), static_cast<unsigned>(mac[2]), static_cast<unsigned>(mac[3]),
+                               static_cast<unsigned>(mac[4]), static_cast<unsigned>(mac[5]));
     } else {
         int const ERR = errno;
-        init_log::critical("network debug: %s SIOCGIFHWADDR failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
+        init_net_log::critical("%s SIOCGIFHWADDR failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
     }
 
     copy_ifreq_name(ifr, NET_IFNAME);
@@ -234,11 +235,11 @@ void dump_ioctl_state(int sock) {
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
         std::array<char, INET_ADDRSTRLEN> ip_str{};
         inet_ntop(AF_INET, &addr->sin_addr, ip_str.data(), ip_str.size());
-        init_log::critical("network debug: %s SIOCGIFADDR family=%u addr=%s raw=0x%x", NET_IFNAME, static_cast<unsigned>(addr->sin_family),
-                           ip_str.data(), static_cast<unsigned>(ntohl(addr->sin_addr.s_addr)));
+        init_net_log::critical("%s SIOCGIFADDR family=%u addr=%s raw=0x%x", NET_IFNAME, static_cast<unsigned>(addr->sin_family),
+                               ip_str.data(), static_cast<unsigned>(ntohl(addr->sin_addr.s_addr)));
     } else {
         int const ERR = errno;
-        init_log::critical("network debug: %s SIOCGIFADDR failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
+        init_net_log::critical("%s SIOCGIFADDR failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
     }
 
     copy_ifreq_name(ifr, NET_IFNAME);
@@ -246,11 +247,11 @@ void dump_ioctl_state(int sock) {
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_netmask);
         std::array<char, INET_ADDRSTRLEN> mask_str{};
         inet_ntop(AF_INET, &addr->sin_addr, mask_str.data(), mask_str.size());
-        init_log::critical("network debug: %s SIOCGIFNETMASK family=%u mask=%s raw=0x%x", NET_IFNAME,
-                           static_cast<unsigned>(addr->sin_family), mask_str.data(), static_cast<unsigned>(ntohl(addr->sin_addr.s_addr)));
+        init_net_log::critical("%s SIOCGIFNETMASK family=%u mask=%s raw=0x%x", NET_IFNAME, static_cast<unsigned>(addr->sin_family),
+                               mask_str.data(), static_cast<unsigned>(ntohl(addr->sin_addr.s_addr)));
     } else {
         int const ERR = errno;
-        init_log::critical("network debug: %s SIOCGIFNETMASK failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
+        init_net_log::critical("%s SIOCGIFNETMASK failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
     }
 }
 
@@ -259,15 +260,15 @@ void dump_netctl_state() {
     size_t if_count = ifs.size();
     if (wos_net_if_list(ifs.data(), &if_count) != 0) {
         int const ERR = errno;
-        init_log::critical("network debug: wos_net_if_list failed errno=%d (%s)", ERR, strerror(ERR));
+        init_net_log::critical("wos_net_if_list failed errno=%d (%s)", ERR, strerror(ERR));
     } else {
         size_t const WRITTEN = std::min(if_count, ifs.size());
-        init_log::critical("network debug: netctl reports %llu interface(s), dumping %llu", static_cast<unsigned long long>(if_count),
-                           static_cast<unsigned long long>(WRITTEN));
+        init_net_log::critical("netctl reports %llu interface(s), dumping %llu", static_cast<unsigned long long>(if_count),
+                               static_cast<unsigned long long>(WRITTEN));
         for (size_t i = 0; i < WRITTEN; i++) {
             auto const& info = ifs.at(i);
             init_log::critical(
-                "network debug: if[%llu] index=%u name=%.*s flags=0x%x mtu=%u txqlen=%u type=%u operstate=%u addr_len=%u "
+                "if_net[%llu] index=%u name=%.*s flags=0x%x mtu=%u txqlen=%u type=%u operstate=%u addr_len=%u "
                 "mac=%02x:%02x:%02x:%02x:%02x:%02x",
                 static_cast<unsigned long long>(i), info.ifindex, WOS_NET_IF_NAME_LEN, info.name, info.flags, info.mtu, info.tx_queue_len,
                 static_cast<unsigned>(info.type), static_cast<unsigned>(info.operstate), static_cast<unsigned>(info.addr_len),
@@ -280,13 +281,13 @@ void dump_netctl_state() {
     size_t addr_count = addrs.size();
     if (wos_net_addr_list(addrs.data(), &addr_count) != 0) {
         int const ERR = errno;
-        init_log::critical("network debug: wos_net_addr_list failed errno=%d (%s)", ERR, strerror(ERR));
+        init_net_log::critical("wos_net_addr_list failed errno=%d (%s)", ERR, strerror(ERR));
         return;
     }
 
     size_t const WRITTEN = std::min(addr_count, addrs.size());
-    init_log::critical("network debug: netctl reports %llu address(es), dumping %llu", static_cast<unsigned long long>(addr_count),
-                       static_cast<unsigned long long>(WRITTEN));
+    init_net_log::critical("netctl reports %llu address(es), dumping %llu", static_cast<unsigned long long>(addr_count),
+                           static_cast<unsigned long long>(WRITTEN));
     for (size_t i = 0; i < WRITTEN; i++) {
         auto const& addr = addrs.at(i);
         if (addr.family == AF_INET) {
@@ -294,15 +295,15 @@ void dump_netctl_state() {
             std::array<char, INET_ADDRSTRLEN> broadcast{};
             inet_ntop(AF_INET, addr.local, local.data(), local.size());
             inet_ntop(AF_INET, addr.broadcast, broadcast.data(), broadcast.size());
-            init_log::critical(
-                "network debug: addr[%llu] ifindex=%u label=%.*s family=AF_INET prefix=%u scope=%u flags=0x%x local=%s brd=%s",
-                static_cast<unsigned long long>(i), addr.ifindex, WOS_NET_IF_NAME_LEN, addr.label, static_cast<unsigned>(addr.prefix_len),
-                static_cast<unsigned>(addr.scope), addr.flags, local.data(), broadcast.data());
-        } else {
-            init_log::critical("network debug: addr[%llu] ifindex=%u label=%.*s family=%u prefix=%u scope=%u flags=0x%x",
+            init_log::critical("add_netr[%llu] ifindex=%u label=%.*s family=AF_INET prefix=%u scope=%u flags=0x%x local=%s brd=%s",
                                static_cast<unsigned long long>(i), addr.ifindex, WOS_NET_IF_NAME_LEN, addr.label,
-                               static_cast<unsigned>(addr.family), static_cast<unsigned>(addr.prefix_len),
-                               static_cast<unsigned>(addr.scope), addr.flags);
+                               static_cast<unsigned>(addr.prefix_len), static_cast<unsigned>(addr.scope), addr.flags, local.data(),
+                               broadcast.data());
+        } else {
+            init_net_log::critical("addr[%llu] ifindex=%u label=%.*s family=%u prefix=%u scope=%u flags=0x%x",
+                                   static_cast<unsigned long long>(i), addr.ifindex, WOS_NET_IF_NAME_LEN, addr.label,
+                                   static_cast<unsigned>(addr.family), static_cast<unsigned>(addr.prefix_len),
+                                   static_cast<unsigned>(addr.scope), addr.flags);
         }
     }
 }
@@ -311,7 +312,7 @@ void dump_netdev_stats_file(const char* path) {
     int const FD = ::open(path, O_RDONLY);
     if (FD < 0) {
         int const ERR = errno;
-        init_log::critical("network debug: unable to open %s: errno=%d (%s)", path, ERR, strerror(ERR));
+        init_net_log::critical("unable to open %s: errno=%d (%s)", path, ERR, strerror(ERR));
         return;
     }
 
@@ -320,11 +321,11 @@ void dump_netdev_stats_file(const char* path) {
     ::close(FD);
     if (N < 0) {
         int const ERR = errno;
-        init_log::critical("network debug: unable to read %s: errno=%d (%s)", path, ERR, strerror(ERR));
+        init_net_log::critical("unable to read %s: errno=%d (%s)", path, ERR, strerror(ERR));
         return;
     }
     if (N == 0) {
-        init_log::critical("network debug: %s is empty", path);
+        init_net_log::critical("%s is empty", path);
         return;
     }
 
@@ -336,7 +337,7 @@ void dump_netdev_stats_file(const char* path) {
         }
         size_t const LINE_LEN = i - line_start;
         if (LINE_LEN != 0) {
-            init_log::critical("network debug: %s: %.*s", path, static_cast<int>(LINE_LEN), buf.data() + line_start);
+            init_net_log::critical("%s: %.*s", path, static_cast<int>(LINE_LEN), buf.data() + line_start);
         }
         line_start = i + 1;
     }
@@ -348,30 +349,29 @@ void dump_netdev_stats() {
 }
 
 void dump_network_failure_debug(const char* reason, uint64_t netd_pid, const PollDebug* poll, int sock) {
-    init_log::critical("network debug: === begin network startup diagnostic dump ===");
-    init_log::critical("network debug: reason=%s netd_pid=%llu poll_socket=%d", reason != nullptr ? reason : "(unknown)",
-                       static_cast<unsigned long long>(netd_pid), sock);
+    init_net_log::critical("=== begin network startup diagnostic dump ===");
+    init_net_log::critical("reason=%s netd_pid=%llu poll_socket=%d", reason != nullptr ? reason : "(unknown)",
+                           static_cast<unsigned long long>(netd_pid), sock);
     if (poll != nullptr) {
         std::array<char, INET_ADDRSTRLEN> last_ip{};
         struct in_addr last_addr{};
         last_addr.s_addr = poll->last_addr;
         inet_ntop(AF_INET, &last_addr, last_ip.data(), last_ip.size());
         init_log::critical(
-            "network debug: poll attempts=%llu addr_successes=%llu zero_addr_results=%llu addr_failures=%llu last_addr=%s raw=0x%x "
+            "pol_netl attempts=%llu addr_successes=%llu zero_addr_results=%llu addr_failures=%llu last_addr=%s raw=0x%x "
             "first_diagnostic_secs=%ld",
             static_cast<unsigned long long>(poll->attempts), static_cast<unsigned long long>(poll->addr_successes),
             static_cast<unsigned long long>(poll->addr_zero_results), static_cast<unsigned long long>(poll->addr_failures), last_ip.data(),
             static_cast<unsigned>(ntohl(poll->last_addr)), POLL_FIRST_DIAGNOSTIC_SECS);
-        init_log::critical("network debug: poll first_errno=%d (%s)", poll->first_errno,
-                           poll->first_errno != 0 ? strerror(poll->first_errno) : "none");
-        init_log::critical("network debug: poll last_errno=%d (%s)", poll->last_errno,
-                           poll->last_errno != 0 ? strerror(poll->last_errno) : "none");
+        init_net_log::critical("poll first_errno=%d (%s)", poll->first_errno,
+                               poll->first_errno != 0 ? strerror(poll->first_errno) : "none");
+        init_net_log::critical("poll last_errno=%d (%s)", poll->last_errno, poll->last_errno != 0 ? strerror(poll->last_errno) : "none");
     }
     dump_ioctl_state(sock);
     dump_netctl_state();
     dump_netdev_stats();
     dump_journal_snapshot();
-    init_log::critical("network debug: === end network startup diagnostic dump ===");
+    init_net_log::critical("=== end network startup diagnostic dump ===");
 }
 
 void terminate_netd_after_startup_timeout(int64_t netd_pid) {
@@ -409,6 +409,7 @@ auto start_network() -> bool {
     }
     init_log::info("init[%llu]: netd spawned as PID %llu", static_cast<unsigned long long>(CPUNO),
                    static_cast<unsigned long long>(NETD_PID));
+    register_service("netd", NETD_PID, ServiceKind::NETWORK);
 
     // Poll eth0 for IP address readiness (wait for DHCP to complete)
     int const POLL_SOCK = socket(AF_INET, SOCK_DGRAM, 0);

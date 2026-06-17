@@ -8,6 +8,7 @@ set(CXXFILES
     src/fstab.cpp
     src/network.cpp
     src/services.cpp
+    src/shutdown.cpp
 )
 
 add_executable(${TARGET} ${CXXFILES})
@@ -39,7 +40,6 @@ target_link_options(${TARGET} PRIVATE
     "-fuse-ld=lld"
     "-L${CMAKE_SYSROOT}/lib"
     "-static"
-    "-no-pie"
     "-mcmodel=small"
     "-Wl,-z,now"        # bind-now: resolve all PLT entries at load time
     "-Wl,-T,${CMAKE_SOURCE_DIR}/modules/init/service.ld"

@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 PEER_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "peer.cpp"
 WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
+WIRE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wire.hpp"
 WKI_PEER_LIVENESS_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_peer_liveness_ktest.cpp"
 
 
@@ -263,6 +264,90 @@ def test_fence_notify_rejects_invalid_targets_before_routing() -> None:
         fail("handle_fence_notify invalid target guard must return before route invalidation")
 
 
+def test_shutdown_uses_graceful_goodbye_not_fence() -> None:
+    peer_source = PEER_CPP.read_text()
+    wki_source = WKI_CPP.read_text()
+    wire_source = WIRE_HPP.read_text()
+    shutdown_body = function_body(wki_source, "wki_shutdown")
+    rx_body = function_body(wki_source, "wki_rx")
+    disconnect_body = function_body(peer_source, "wki_peer_disconnect_impl")
+    goodbye_handler = function_body(peer_source, "handle_peer_goodbye")
+    goodbye_drain = function_body(peer_source, "drain_pending_peer_goodbyes")
+    goodbye_queue = function_body(peer_source, "queue_pending_peer_goodbye")
+
+    for token in [
+        "PEER_GOODBYE = 0x0C",
+        "struct PeerGoodbyePayload",
+        "WKI_GOODBYE_REASON_SHUTDOWN",
+        "static_assert(sizeof(PeerGoodbyePayload) == 8",
+    ]:
+        if token not in wire_source:
+            fail(f"graceful goodbye wire ABI is missing {token}")
+
+    for token in [
+        "PeerGoodbyePayload goodbye = {}",
+        "goodbye.leaving_node = g_wki.my_node_id",
+        "goodbye.reason = WKI_GOODBYE_REASON_SHUTDOWN",
+        "wki_send_raw(connected_peers.at(i), MsgType::PEER_GOODBYE",
+        "wki_peer_graceful_leave(peer);",
+    ]:
+        if token not in shutdown_body:
+            fail(f"wki_shutdown must use graceful goodbye path: missing {token}")
+    if "wki_peer_fence(" in shutdown_body:
+        fail("wki_shutdown must not fence healthy peers during normal local shutdown")
+
+    require_order(
+        shutdown_body,
+        "wki_send_raw(connected_peers.at(i), MsgType::PEER_GOODBYE",
+        "wki_peer_graceful_leave(peer);",
+        "shutdown must send goodbye before local peer cleanup closes channels/transports",
+    )
+
+    for token in [
+        "enum class PeerDisconnectKind",
+        "PeerDisconnectKind::FENCE",
+        "PeerDisconnectKind::GRACEFUL_LEAVE",
+        "Peer 0x%04x left gracefully",
+        "kind == PeerDisconnectKind::FENCE && notify_connected_peers",
+    ]:
+        if token not in peer_source:
+            fail(f"peer disconnect helper is missing graceful/fence split: {token}")
+
+    require_order(
+        rx_body,
+        "case MsgType::PEER_GOODBYE:",
+        "Reliable control messages - check seq ordering",
+        "PEER_GOODBYE must stay on the bounded raw-control path",
+    )
+    if "detail::handle_peer_goodbye(hdr, payload, PAYLOAD_LEN);" not in rx_body:
+        fail("wki_rx must dispatch PEER_GOODBYE to handle_peer_goodbye")
+
+    for name, body in [
+        ("handle_peer_goodbye", goodbye_handler),
+        ("queue_pending_peer_goodbye", goodbye_queue),
+        ("drain_pending_peer_goodbyes", goodbye_drain),
+    ]:
+        if "peer_goodbye_target_is_valid(" not in body:
+            fail(f"{name} must validate PEER_GOODBYE target/source")
+
+    require_order(
+        goodbye_handler,
+        "if (!peer_goodbye_target_is_valid(goodbye->leaving_node, hdr->src_node))",
+        "queue_pending_peer_goodbye(*goodbye, hdr->src_node)",
+        "PEER_GOODBYE handler must validate before queueing cleanup",
+    )
+    require_order(
+        goodbye_handler,
+        "queue_pending_peer_goodbye(*goodbye, hdr->src_node)",
+        "wki_routing_invalidate_node(goodbye->leaving_node)",
+        "PEER_GOODBYE route invalidation must follow accepted queue attempt",
+    )
+    if "wki_peer_disconnect_impl(leaving_peer, PeerDisconnectKind::GRACEFUL_LEAVE, false);" not in goodbye_drain:
+        fail("deferred PEER_GOODBYE drain must use graceful leave, not fence")
+    if "wki_peer_disconnect_impl(fenced_peer, PeerDisconnectKind::FENCE, false);" not in peer_source:
+        fail("deferred FENCE_NOTIFY must keep fence semantics")
+
+
 def test_ack_only_frames_do_not_refresh_peer_liveness() -> None:
     source = WKI_CPP.read_text()
     peer_source = PEER_CPP.read_text()
@@ -354,6 +439,7 @@ def main() -> None:
     test_hello_boot_epoch_fences_connected_broadcast_restarts()
     test_reliable_rx_rejects_fenced_peer_before_channel_lookup()
     test_fence_notify_rejects_invalid_targets_before_routing()
+    test_shutdown_uses_graceful_goodbye_not_fence()
     test_ack_only_frames_do_not_refresh_peer_liveness()
     test_ipc_data_acks_before_ordered_dispatch()
     print("WKI peer source invariants hold")

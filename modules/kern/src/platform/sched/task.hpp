@@ -402,6 +402,11 @@ struct Task {
     bool deferred_task_switch{};  // Move to wait queue after syscall returns
     bool yield_switch{};          // Put task in expired queue instead of wait queue
 
+    // Cooperative kernel-thread shutdown. Set centrally by the power
+    // subsystem; DAEMON tasks observe it at scheduler block/sleep/yield points
+    // and exit through the normal task-exit path.
+    std::atomic<bool> kernel_shutdown_requested{false};
+
     // Set by reschedule_task_for_cpu when a wakeup fires while this task is
     // still currentTask (about to block via deferred_task_switch). Checked
     // under the RQ lock in deferred_task_switch to avoid lost wakeups.
