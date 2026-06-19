@@ -67,8 +67,8 @@ auto current_task_is_root() -> int {
     return 0;
 }
 
-void quiesce_kernel_threads() {
-    auto const RESULT = sched::request_kernel_threads_shutdown(KERNEL_THREAD_WAIT_US);
+void quiesce_kernel_threads(uint64_t timeout_us) {
+    auto const RESULT = sched::request_kernel_threads_shutdown(timeout_us);
     if (RESULT.requested != 0) {
         log::info("shutdown requested stop for %lu kernel threads", static_cast<unsigned long>(RESULT.requested));
     }
@@ -89,8 +89,10 @@ void clear_current_finalizer_sched_state() {
     current->set_voluntary_blocked(false);
     current->wants_block = false;
     current->wake_at_us = 0;
-    current->wait_channel = nullptr;
+    current->clear_wait_channel();
 }
+
+void wait_for_shutdown_progress() { sched::kern_yield(); }
 
 void wait_for_process_quiescence(uint64_t excluded_pid, uint64_t excluded_owner_pid, uint64_t timeout_us) {
     uint64_t const START = ker::mod::time::get_us();
@@ -98,7 +100,7 @@ void wait_for_process_quiescence(uint64_t excluded_pid, uint64_t excluded_owner_
         if (ker::mod::time::get_us() - START >= timeout_us) {
             return;
         }
-        sched::kern_yield();
+        wait_for_shutdown_progress();
     }
 }
 
@@ -169,7 +171,7 @@ void io_delay_loop() {
     g_phase.store(ShutdownPhase::FINALIZING, std::memory_order_release);
     log::info("system shutdown finalizer starting action=%lu", static_cast<unsigned long>(action));
 
-    quiesce_kernel_threads();
+    quiesce_kernel_threads(KERNEL_THREAD_WAIT_US);
     clear_current_finalizer_sched_state();
 
     teardown_processes();
@@ -239,7 +241,7 @@ auto prepare_shutdown() -> int {
         return -EBUSY;
     }
 
-    quiesce_kernel_threads();
+    quiesce_kernel_threads(0);
     return 0;
 }
 
@@ -270,5 +272,14 @@ auto begin_reboot_command(uint64_t cmd) -> int {
     g_action.store(action, std::memory_order_release);
     run_finalizer(action);
 }
+
+#ifdef WOS_SELFTEST
+[[noreturn]] void selftest_poweroff() {
+    g_action.store(ShutdownAction::POWEROFF, std::memory_order_release);
+    g_phase.store(ShutdownPhase::PLATFORM_ACTION, std::memory_order_release);
+    log::info("selftest complete; powering off");
+    platform_poweroff();
+}
+#endif
 
 }  // namespace ker::mod::power

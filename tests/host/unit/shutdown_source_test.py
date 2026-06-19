@@ -9,6 +9,7 @@ POWERCTL_CPP = ROOT / "modules" / "powerctl" / "src" / "main.cpp"
 INIT_SHUTDOWN_CPP = ROOT / "modules" / "init" / "src" / "shutdown.cpp"
 INIT_SERVICES_CPP = ROOT / "modules" / "init" / "src" / "services.cpp"
 INIT_FSTAB_CPP = ROOT / "modules" / "init" / "src" / "fstab.cpp"
+INIT_WRAPPERS_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "init" / "init_wrappers.cpp"
 POWER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "power" / "power.cpp"
 POWER_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "power" / "power.hpp"
 POWER_ABI = ROOT / "modules" / "kern" / "src" / "abi" / "callnums" / "power.h"
@@ -236,6 +237,7 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
     power_abi = POWER_ABI.read_text()
     sys_power = SYS_POWER_CPP.read_text()
     mlibc_power = MLIBC_POWER_H.read_text()
+    init_wrappers = INIT_WRAPPERS_CPP.read_text()
     run_body = function_body(source, "run_finalizer")
     require_tokens(
         source,
@@ -270,6 +272,8 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
         "kernel shutdown finalizer surface",
     )
     require_tokens(power_hpp, ["PREPARING = 7", "prepare_shutdown()"], "power prepare diagnostic phase is append-only")
+    require_tokens(power_hpp, ["selftest_poweroff()"], "KTEST poweroff hook declaration")
+    require_tokens(source, ["selftest_poweroff()", 'log::info("selftest complete; powering off")', "platform_poweroff();"], "KTEST poweroff hook")
     require_tokens(power_abi, ["PREPARE = 2"], "power syscall prepare op is append-only")
     require_tokens(sys_power, ["case ker::abi::power::ops::PREPARE:", "ker::mod::power::prepare_shutdown()"], "power syscall prepare dispatch")
     require_tokens(mlibc_power, ["static inline int64_t prepare_shutdown()", "ops::PREPARE"], "mlibc power prepare wrapper")
@@ -285,6 +289,11 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
         ("smt::halt_other_cores();", "platform_reboot();", "CPU quiesce before platform reboot"),
     ]:
         require_order(run_body, first, second, context)
+
+    sched_init_body = function_body(init_wrappers, "sched_init")
+    require_tokens(sched_init_body, ["strcmp(get_kernel_cmdline(), \"--selftest\") == 0", "mod::power::selftest_poweroff();"], "KTEST selftest poweroff call")
+    require_order(sched_init_body, "ker::test::run_all();", "mod::power::selftest_poweroff();", "KTEST powers off only after the selftest runner returns")
+    require_order(sched_init_body, "mod::power::selftest_poweroff();", "hcf();", "KTEST hcf remains fallback after poweroff")
 
 
 def test_kernel_thread_shutdown_is_scheduler_owned_not_ntp_specific() -> None:

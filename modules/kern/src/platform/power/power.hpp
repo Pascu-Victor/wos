@@ -28,5 +28,8 @@ enum class ShutdownPhase : uint64_t {
 [[nodiscard]] auto shutdown_phase() -> ShutdownPhase;
 [[nodiscard]] auto prepare_shutdown() -> int;
 [[nodiscard]] auto begin_reboot_command(uint64_t cmd) -> int;
+#ifdef WOS_SELFTEST
+[[noreturn]] void selftest_poweroff();
+#endif
 
 }  // namespace ker::mod::power

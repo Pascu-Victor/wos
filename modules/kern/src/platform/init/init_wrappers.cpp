@@ -64,6 +64,7 @@
 #include "limine_requests.hpp"
 #ifdef WOS_SELFTEST
 #include <cstring>
+#include <platform/power/power.hpp>
 #include <test/ktest.hpp>
 #endif
 
@@ -257,6 +258,7 @@ void sched_init() {
     if (strcmp(get_kernel_cmdline(), "--selftest") == 0) {
         mod::smt::park_secondary_cpus_for_selftest();
         ker::test::run_all();
+        mod::power::selftest_poweroff();
         hcf();
     }
 #endif
