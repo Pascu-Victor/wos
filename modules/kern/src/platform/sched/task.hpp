@@ -18,6 +18,10 @@
 #include <util/smallvec.hpp>
 // Avoid pulling in in-tree std headers into kernel translation units from here.
 
+namespace ker::vfs {
+struct File;
+}  // namespace ker::vfs
+
 namespace ker::mod::sched::task {
 
 enum class WkiVfsRoute : uint8_t {
@@ -35,11 +39,26 @@ struct WkiVfsRule {
     uint8_t reserved = 0;
 };
 
+enum class LazyVmemKind : uint8_t {
+    ANONYMOUS,
+    FILE_BACKED,
+};
+
 struct LazyVmemRange {
     uint64_t start = 0;
     uint64_t end = 0;
     uint64_t prot = 0;
     uint64_t flags = 0;
+    LazyVmemKind kind = LazyVmemKind::ANONYMOUS;
+    ker::vfs::File* file = nullptr;
+    uint64_t file_offset = 0;
+    uint64_t file_dev = 0;
+    uint64_t file_ino = 0;
+    uint64_t file_size = 0;
+    int64_t file_mtime_sec = 0;
+    int64_t file_mtime_nsec = 0;
+    int64_t file_ctime_sec = 0;
+    int64_t file_ctime_nsec = 0;
 };
 using LazyVmemRangeVec = ker::util::SmallVec<LazyVmemRange, 8>;
 
@@ -229,6 +248,7 @@ struct Task {
     // Signal state.
     uint64_t sig_pending{};            // Bit N = signal N+1 is pending, signals 1-64
     uint64_t sig_mask{};               // Bitmask of blocked signals
+    uint64_t sig_mask_seq{};           // Monotonic version mirrored into the userspace TCB cache.
     uint64_t sigsuspend_saved_mask{};  // Mask to restore after a sigsuspend wake.
     uint64_t sigaltstack_sp{};         // Base address for sigaltstack(2), or 0 when disabled.
     uint64_t sigaltstack_size{};       // Size of the alternate signal stack.
@@ -547,6 +567,7 @@ struct Task {
 auto get_next_pid() -> uint64_t;
 void destroy_unpublished_user_thread(Task* task);
 [[nodiscard]] auto clone_lazy_vmem_ranges(Task& dst, Task& src) -> bool;
+void release_lazy_vmem_ranges(Task& task);
 
 [[nodiscard]] inline auto task_waited_on(const Task& task) -> bool { return task.waited_on.load(std::memory_order_acquire); }
 
@@ -564,6 +585,12 @@ inline void task_accumulate_waited_child_times(Task& parent, const Task& child) 
 
     parent.child_user_time_us += child.user_time_us + child.child_user_time_us;
     parent.child_system_time_us += child.system_time_us + child.child_system_time_us;
+}
+
+[[nodiscard]] inline auto task_rusage_user_time_us(const Task& task) -> uint64_t { return task.user_time_us + task.child_user_time_us; }
+
+[[nodiscard]] inline auto task_rusage_system_time_us(const Task& task) -> uint64_t {
+    return task.system_time_us + task.child_system_time_us;
 }
 
 inline void task_clear_waitpid_block_state(Task& task) {

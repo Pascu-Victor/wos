@@ -106,6 +106,10 @@ struct FileMmapPageCacheEntry {
     uint64_t last_used = 0;
 };
 
+struct FileMmapPageCacheSet {
+    std::array<FileMmapPageCacheEntry, 4> ways{};
+};
+
 struct FileMmapRange {
     ker::mod::mm::paging::PageTable* pagemap = nullptr;
     uint64_t start = 0;
@@ -128,8 +132,11 @@ enum class FileMmapCacheInsertResult : uint8_t {
     EVICTED,
 };
 
-constexpr size_t FILE_MMAP_CACHE_PAGES = 512;
-std::array<FileMmapPageCacheEntry, FILE_MMAP_CACHE_PAGES> g_file_mmap_cache{};
+constexpr size_t FILE_MMAP_CACHE_SET_COUNT = 2048;
+constexpr size_t FILE_MMAP_CACHE_WAYS = 4;
+constexpr size_t FILE_MMAP_CACHE_PAGES = FILE_MMAP_CACHE_SET_COUNT * FILE_MMAP_CACHE_WAYS;
+static_assert((FILE_MMAP_CACHE_SET_COUNT & (FILE_MMAP_CACHE_SET_COUNT - 1)) == 0);
+std::array<FileMmapPageCacheSet, FILE_MMAP_CACHE_SET_COUNT> g_file_mmap_cache{};
 ker::mod::sys::Mutex g_file_mmap_cache_lock;
 std::atomic<uint64_t> g_file_mmap_cache_clock{0};
 ker::util::SmallVec<FileMmapRange, 32> g_file_mmap_ranges;
@@ -139,6 +146,18 @@ auto file_mmap_key_equal(const FileMmapPageKey& lhs, const FileMmapPageKey& rhs)
     return lhs.dev == rhs.dev && lhs.ino == rhs.ino && lhs.size == rhs.size && lhs.mtime_sec == rhs.mtime_sec &&
            lhs.mtime_nsec == rhs.mtime_nsec && lhs.ctime_sec == rhs.ctime_sec && lhs.ctime_nsec == rhs.ctime_nsec &&
            lhs.offset == rhs.offset;
+}
+
+auto file_mmap_key_hash(const FileMmapPageKey& key) -> uint64_t {
+    uint64_t hash = key.dev ^ (key.ino << 7U) ^ (key.ino >> 3U) ^ key.size ^ key.offset;
+    hash ^= static_cast<uint64_t>(key.mtime_sec) + 0x9e3779b97f4a7c15ULL + (hash << 6U) + (hash >> 2U);
+    hash ^= static_cast<uint64_t>(key.mtime_nsec) + 0xbf58476d1ce4e5b9ULL + (hash << 6U) + (hash >> 2U);
+    hash ^= static_cast<uint64_t>(key.ctime_sec) + 0x94d049bb133111ebULL + (hash << 6U) + (hash >> 2U);
+    hash ^= static_cast<uint64_t>(key.ctime_nsec) + 0x2545f4914f6cdd1dULL + (hash << 6U) + (hash >> 2U);
+    hash ^= hash >> 33U;
+    hash *= 0xff51afd7ed558ccdULL;
+    hash ^= hash >> 33U;
+    return hash;
 }
 
 auto file_mmap_page_key(const ker::vfs::Stat& st, uint64_t offset) -> FileMmapPageKey {
@@ -183,6 +202,7 @@ struct OccupiedVmemRange {
 };
 
 using LazyVmemRange = ker::mod::sched::task::LazyVmemRange;
+using LazyVmemKind = ker::mod::sched::task::LazyVmemKind;
 using LazyVmemRangeVec = ker::mod::sched::task::LazyVmemRangeVec;
 
 auto push_lazy_vmem_range(LazyVmemRangeVec& ranges, const LazyVmemRange& range) -> bool {
@@ -190,6 +210,39 @@ auto push_lazy_vmem_range(LazyVmemRangeVec& ranges, const LazyVmemRange& range) 
         return true;
     }
     return ranges.push_back(range);
+}
+
+auto lazy_vmem_range_has_file(const LazyVmemRange& range) -> bool {
+    return range.kind == LazyVmemKind::FILE_BACKED && range.file != nullptr;
+}
+
+void retain_lazy_vmem_range_file(const LazyVmemRange& range) {
+    if (lazy_vmem_range_has_file(range)) {
+        ker::vfs::vfs_retain_file(range.file);
+    }
+}
+
+void release_lazy_vmem_range_file(const LazyVmemRange& range) {
+    if (lazy_vmem_range_has_file(range)) {
+        ker::vfs::vfs_put_file(range.file);
+    }
+}
+
+void release_lazy_vmem_range_files(const LazyVmemRangeVec& ranges) {
+    for (const auto& range : ranges) {
+        release_lazy_vmem_range_file(range);
+    }
+}
+
+auto push_lazy_vmem_range_copy(LazyVmemRangeVec& ranges, const LazyVmemRange& range) -> bool {
+    size_t const BEFORE = ranges.size();
+    if (!push_lazy_vmem_range(ranges, range)) {
+        return false;
+    }
+    if (ranges.size() != BEFORE) {
+        retain_lazy_vmem_range_file(ranges.at(BEFORE));
+    }
+    return true;
 }
 
 auto pte_raw(const ker::mod::mm::paging::PageTableEntry& entry) -> uint64_t {
@@ -311,84 +364,100 @@ auto first_occupied_range(ker::mod::sched::task::Task* task, uint64_t start, uin
     return first;
 }
 
-auto remove_lazy_vmem_range_locked(ker::mod::sched::task::Task& task, uint64_t vaddr, uint64_t size) -> bool {
-    uint64_t const END = vaddr + size;
-    LazyVmemRangeVec rewritten;
-    for (const auto& range : task.lazy_vmem_ranges) {
-        if (!ranges_overlap(vaddr, END, range.start, range.end)) {
-            if (!push_lazy_vmem_range(rewritten, range)) {
-                return false;
-            }
-            continue;
-        }
-
-        if (range.start < vaddr) {
-            auto left = range;
-            left.end = vaddr;
-            if (!push_lazy_vmem_range(rewritten, left)) {
-                return false;
-            }
-        }
-        if (END < range.end) {
-            auto right = range;
-            right.start = END;
-            if (!push_lazy_vmem_range(rewritten, right)) {
-                return false;
-            }
-        }
-    }
-    task.lazy_vmem_ranges = std::move(rewritten);
-    return true;
-}
-
-auto protect_lazy_vmem_range_locked(ker::mod::sched::task::Task& task, uint64_t vaddr, uint64_t size, uint64_t prot) -> bool {
-    uint64_t const END = vaddr + size;
-    LazyVmemRangeVec rewritten;
-    for (const auto& range : task.lazy_vmem_ranges) {
-        if (!ranges_overlap(vaddr, END, range.start, range.end)) {
-            if (!push_lazy_vmem_range(rewritten, range)) {
-                return false;
-            }
-            continue;
-        }
-
-        if (range.start < vaddr) {
-            auto left = range;
-            left.end = vaddr;
-            if (!push_lazy_vmem_range(rewritten, left)) {
-                return false;
-            }
-        }
-
-        auto middle = range;
-        middle.start = std::max(range.start, vaddr);
-        middle.end = std::min(range.end, END);
-        middle.prot = prot;
-        if (!push_lazy_vmem_range(rewritten, middle)) {
-            return false;
-        }
-
-        if (END < range.end) {
-            auto right = range;
-            right.start = END;
-            if (!push_lazy_vmem_range(rewritten, right)) {
-                return false;
-            }
-        }
-    }
-    task.lazy_vmem_ranges = std::move(rewritten);
-    return true;
-}
-
 auto remove_lazy_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size) -> bool {
     if (task == nullptr || size == 0 || vaddr > UINT64_MAX - size) {
         return true;
     }
 
+    uint64_t const END = vaddr + size;
+    LazyVmemRangeVec rewritten;
+    LazyVmemRangeVec ranges_to_release;
+    bool ok = true;
     uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
-    bool const OK = remove_lazy_vmem_range_locked(*task, vaddr, size);
+    for (const auto& range : task->lazy_vmem_ranges) {
+        if (!ranges_overlap(vaddr, END, range.start, range.end)) {
+            ok = push_lazy_vmem_range_copy(rewritten, range);
+            if (!ok) {
+                break;
+            }
+            continue;
+        }
+
+        if (range.start < vaddr) {
+            auto left = range;
+            left.end = vaddr;
+            ok = push_lazy_vmem_range_copy(rewritten, left);
+            if (!ok) {
+                break;
+            }
+        }
+        if (END < range.end) {
+            auto right = range;
+            right.start = END;
+            ok = push_lazy_vmem_range_copy(rewritten, right);
+            if (!ok) {
+                break;
+            }
+        }
+    }
+    if (ok) {
+        ranges_to_release = std::move(task->lazy_vmem_ranges);
+        task->lazy_vmem_ranges = std::move(rewritten);
+    } else {
+        ranges_to_release = std::move(rewritten);
+    }
     task->lazy_vmem_lock.unlock_irqrestore(IRQF);
-    return OK;
+    release_lazy_vmem_range_files(ranges_to_release);
+    return ok;
+}
+
+auto add_lazy_vmem_range_entry(ker::mod::sched::task::Task* task, const LazyVmemRange& new_range) -> bool {
+    if (task == nullptr || new_range.start >= new_range.end) {
+        return false;
+    }
+
+    LazyVmemRangeVec rewritten;
+    LazyVmemRangeVec ranges_to_release;
+    bool ok = true;
+    uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
+    for (const auto& range : task->lazy_vmem_ranges) {
+        if (!ranges_overlap(new_range.start, new_range.end, range.start, range.end)) {
+            ok = push_lazy_vmem_range_copy(rewritten, range);
+            if (!ok) {
+                break;
+            }
+            continue;
+        }
+
+        if (range.start < new_range.start) {
+            auto left = range;
+            left.end = new_range.start;
+            ok = push_lazy_vmem_range_copy(rewritten, left);
+            if (!ok) {
+                break;
+            }
+        }
+        if (new_range.end < range.end) {
+            auto right = range;
+            right.start = new_range.end;
+            ok = push_lazy_vmem_range_copy(rewritten, right);
+            if (!ok) {
+                break;
+            }
+        }
+    }
+    if (ok) {
+        ok = push_lazy_vmem_range_copy(rewritten, new_range);
+    }
+    if (ok) {
+        ranges_to_release = std::move(task->lazy_vmem_ranges);
+        task->lazy_vmem_ranges = std::move(rewritten);
+    } else {
+        ranges_to_release = std::move(rewritten);
+    }
+    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+    release_lazy_vmem_range_files(ranges_to_release);
+    return ok;
 }
 
 auto add_lazy_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size, uint64_t prot, uint64_t flags) -> bool {
@@ -396,14 +465,31 @@ auto add_lazy_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, uint
         return false;
     }
 
-    uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
-    bool ok = remove_lazy_vmem_range_locked(*task, vaddr, size);
-    if (ok) {
-        ker::mod::sched::task::LazyVmemRange const RANGE{.start = vaddr, .end = vaddr + size, .prot = prot, .flags = flags};
-        ok = task->lazy_vmem_ranges.push_back(RANGE);
+    LazyVmemRange const RANGE{.start = vaddr, .end = vaddr + size, .prot = prot, .flags = flags};
+    return add_lazy_vmem_range_entry(task, RANGE);
+}
+
+auto add_lazy_file_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size, uint64_t prot, uint64_t flags,
+                              ker::vfs::File* file, uint64_t file_offset, const ker::vfs::Stat& st) -> bool {
+    if (task == nullptr || file == nullptr || size == 0 || vaddr > UINT64_MAX - size) {
+        return false;
     }
-    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
-    return ok;
+
+    LazyVmemRange const RANGE{.start = vaddr,
+                              .end = vaddr + size,
+                              .prot = prot,
+                              .flags = flags,
+                              .kind = LazyVmemKind::FILE_BACKED,
+                              .file = file,
+                              .file_offset = file_offset,
+                              .file_dev = st.st_dev,
+                              .file_ino = st.st_ino,
+                              .file_size = st.st_size > 0 ? static_cast<uint64_t>(st.st_size) : 0,
+                              .file_mtime_sec = st.st_mtim.tv_sec,
+                              .file_mtime_nsec = st.st_mtim.tv_nsec,
+                              .file_ctime_sec = st.st_ctim.tv_sec,
+                              .file_ctime_nsec = st.st_ctim.tv_nsec};
+    return add_lazy_vmem_range_entry(task, RANGE);
 }
 
 auto protect_lazy_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size, uint64_t prot) -> bool {
@@ -411,10 +497,56 @@ auto protect_lazy_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, 
         return true;
     }
 
+    uint64_t const END = vaddr + size;
+    LazyVmemRangeVec rewritten;
+    LazyVmemRangeVec ranges_to_release;
+    bool ok = true;
     uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
-    bool const OK = protect_lazy_vmem_range_locked(*task, vaddr, size, prot);
+    for (const auto& range : task->lazy_vmem_ranges) {
+        if (!ranges_overlap(vaddr, END, range.start, range.end)) {
+            ok = push_lazy_vmem_range_copy(rewritten, range);
+            if (!ok) {
+                break;
+            }
+            continue;
+        }
+
+        if (range.start < vaddr) {
+            auto left = range;
+            left.end = vaddr;
+            ok = push_lazy_vmem_range_copy(rewritten, left);
+            if (!ok) {
+                break;
+            }
+        }
+
+        auto middle = range;
+        middle.start = std::max(range.start, vaddr);
+        middle.end = std::min(range.end, END);
+        middle.prot = prot;
+        ok = push_lazy_vmem_range_copy(rewritten, middle);
+        if (!ok) {
+            break;
+        }
+
+        if (END < range.end) {
+            auto right = range;
+            right.start = END;
+            ok = push_lazy_vmem_range_copy(rewritten, right);
+            if (!ok) {
+                break;
+            }
+        }
+    }
+    if (ok) {
+        ranges_to_release = std::move(task->lazy_vmem_ranges);
+        task->lazy_vmem_ranges = std::move(rewritten);
+    } else {
+        ranges_to_release = std::move(rewritten);
+    }
     task->lazy_vmem_lock.unlock_irqrestore(IRQF);
-    return OK;
+    release_lazy_vmem_range_files(ranges_to_release);
+    return ok;
 }
 
 template <typename Fn>
@@ -458,6 +590,13 @@ auto add_shared_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, ui
     });
 }
 
+auto add_shared_lazy_file_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size, uint64_t prot, uint64_t flags,
+                                     ker::vfs::File* file, uint64_t file_offset, const ker::vfs::Stat& st) -> bool {
+    return update_shared_vmem_ranges(task, [vaddr, size, prot, flags, file, file_offset, &st](ker::mod::sched::task::Task* candidate) {
+        return add_lazy_file_vmem_range(candidate, vaddr, size, prot, flags, file, file_offset, st);
+    });
+}
+
 auto protect_shared_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size, uint64_t prot) -> bool {
     return update_shared_vmem_ranges(task, [vaddr, size, prot](ker::mod::sched::task::Task* candidate) {
         return protect_lazy_vmem_range(candidate, vaddr, size, prot);
@@ -466,9 +605,10 @@ auto protect_shared_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr
 
 auto file_mmap_cache_lookup(const FileMmapPageKey& key) -> void* {
     uint64_t const USE_STAMP = g_file_mmap_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto& set = g_file_mmap_cache.at(file_mmap_key_hash(key) & (FILE_MMAP_CACHE_SET_COUNT - 1));
 
     g_file_mmap_cache_lock.lock();
-    for (auto& entry : g_file_mmap_cache) {
+    for (auto& entry : set.ways) {
         if (entry.page != nullptr && file_mmap_key_equal(entry.key, key)) {
             entry.last_used = USE_STAMP;
             ker::mod::mm::phys::page_ref_inc(entry.page);
@@ -484,9 +624,10 @@ auto file_mmap_cache_lookup(const FileMmapPageKey& key) -> void* {
 
 auto file_mmap_cache_insert_or_discard(const FileMmapPageKey& key, void* new_page, void** page_for_mapping) -> FileMmapCacheInsertResult {
     uint64_t const USE_STAMP = g_file_mmap_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto& set = g_file_mmap_cache.at(file_mmap_key_hash(key) & (FILE_MMAP_CACHE_SET_COUNT - 1));
 
     g_file_mmap_cache_lock.lock();
-    for (auto& entry : g_file_mmap_cache) {
+    for (auto& entry : set.ways) {
         if (entry.page != nullptr && file_mmap_key_equal(entry.key, key)) {
             entry.last_used = USE_STAMP;
             ker::mod::mm::phys::page_ref_inc(entry.page);
@@ -497,8 +638,8 @@ auto file_mmap_cache_insert_or_discard(const FileMmapPageKey& key, void* new_pag
         }
     }
 
-    auto* victim = &g_file_mmap_cache.front();
-    for (auto& entry : g_file_mmap_cache) {
+    auto* victim = &set.ways.front();
+    for (auto& entry : set.ways) {
         if (entry.page == nullptr) {
             victim = &entry;
             break;
@@ -524,8 +665,11 @@ auto file_mmap_cache_insert_or_discard(const FileMmapPageKey& key, void* new_pag
     return FileMmapCacheInsertResult::INSERTED;
 }
 
-auto file_mmap_cached_page(int fd, const ker::vfs::Stat& st, uint64_t file_offset, void** page_out) -> bool {
+auto file_mmap_cached_page_for_file(ker::vfs::File* file, const ker::vfs::Stat& st, uint64_t file_offset, void** page_out) -> bool {
     if (page_out == nullptr) {
+        return false;
+    }
+    if (file == nullptr) {
         return false;
     }
 
@@ -545,12 +689,17 @@ auto file_mmap_cached_page(int fd, const ker::vfs::Stat& st, uint64_t file_offse
     if (NEW_PAGE == nullptr) {
         return false;
     }
+    std::memset(NEW_PAGE, 0, ker::mod::mm::paging::PAGE_SIZE);
 
     uint64_t const FILL_STARTED_US = ker::mod::time::get_us();
     uint64_t const FILE_SIZE = KEY.size;
     if (file_offset < FILE_SIZE) {
         size_t const READ_SIZE = static_cast<size_t>(std::min<uint64_t>(ker::mod::mm::paging::PAGE_SIZE, FILE_SIZE - file_offset));
-        ssize_t const READ_RET = ker::vfs::vfs_pread(fd, NEW_PAGE, READ_SIZE, static_cast<off_t>(file_offset));
+        if (file_offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+            ker::mod::mm::phys::page_ref_dec(NEW_PAGE);
+            return false;
+        }
+        ssize_t const READ_RET = ker::vfs::vfs_pread_file_direct(file, NEW_PAGE, READ_SIZE, static_cast<off_t>(file_offset));
         if (READ_RET < 0) {
             ker::mod::mm::phys::page_ref_dec(NEW_PAGE);
             return false;
@@ -568,6 +717,17 @@ auto file_mmap_cached_page(int fd, const ker::vfs::Stat& st, uint64_t file_offse
         }
     }
     return true;
+}
+
+auto file_mmap_cached_page(int fd, const ker::vfs::Stat& st, uint64_t file_offset, void** page_out) -> bool {
+    auto* task = get_current_task();
+    auto* file = ker::vfs::vfs_get_file_retain(task, fd);
+    if (file == nullptr) {
+        return false;
+    }
+    bool const OK = file_mmap_cached_page_for_file(file, st, file_offset, page_out);
+    ker::vfs::vfs_put_file(file);
+    return OK;
 }
 
 auto present_leaf_entry(ker::mod::mm::paging::PageTable* pagemap, uint64_t vaddr) -> ker::mod::mm::paging::PageTableEntry* {
@@ -677,7 +837,7 @@ auto sync_file_mmap_range(ker::mod::mm::paging::PageTable* pagemap, uint64_t sta
                 uint64_t const WRITE_END = std::min(PAGE_END, range.sync_end);
                 if (WRITE_START < WRITE_END) {
                     uint64_t const PHYS_PAGE = static_cast<uint64_t>(entry->frame) << ker::mod::mm::paging::PAGE_SHIFT;
-                    auto* const PAGE = reinterpret_cast<const uint8_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS_PAGE));
+                    const auto* const PAGE = reinterpret_cast<const uint8_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS_PAGE));
                     uint64_t const PAGE_DELTA = WRITE_START - PAGE_START;
                     uint64_t const FILE_DELTA = WRITE_START - range.mapping_start;
                     uint64_t const FILE_OFFSET = range.file_offset + FILE_DELTA;
@@ -995,6 +1155,93 @@ auto file_mapping_page_flags(uint64_t prot, uint64_t mmap_flags) -> uint64_t {
         flags |= ker::mod::mm::paging::PAGE_SHARED;
     }
     return flags;
+}
+
+auto lazy_file_range_matches(const LazyVmemRange& lhs, const LazyVmemRange& rhs, uint64_t page_vaddr) -> bool {
+    return lhs.kind == LazyVmemKind::FILE_BACKED && lhs.start == rhs.start && lhs.end == rhs.end && lhs.prot == rhs.prot &&
+           lhs.flags == rhs.flags && lhs.file == rhs.file && lhs.file_offset == rhs.file_offset && lhs.file_dev == rhs.file_dev &&
+           lhs.file_ino == rhs.file_ino && page_vaddr >= lhs.start && page_vaddr < lhs.end;
+}
+
+auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const LazyVmemRange& range, uint64_t page_vaddr,
+                                     const ker::mod::mm::paging::PageFault& fault) -> bool {
+    if (task == nullptr || task->pagemap == nullptr || range.kind != LazyVmemKind::FILE_BACKED || range.file == nullptr) {
+        return false;
+    }
+    if (page_vaddr < range.start || page_vaddr >= range.end || (page_vaddr & (ker::mod::mm::paging::PAGE_SIZE - 1)) != 0) {
+        return false;
+    }
+    if (range.prot == 0 || (((range.prot & ker::abi::vmem::PROT_WRITE) == 0) && fault.writable != 0U)) {
+        return false;
+    }
+
+    uint64_t const DELTA = page_vaddr - range.start;
+    if (range.file_offset > UINT64_MAX - DELTA) {
+        return false;
+    }
+    uint64_t const FILE_OFFSET = range.file_offset + DELTA;
+
+    ker::vfs::Stat st{};
+    st.st_dev = range.file_dev;
+    st.st_ino = range.file_ino;
+    st.st_size = static_cast<off_t>(range.file_size);
+    st.st_mtim.tv_sec = range.file_mtime_sec;
+    st.st_mtim.tv_nsec = range.file_mtime_nsec;
+    st.st_ctim.tv_sec = range.file_ctime_sec;
+    st.st_ctim.tv_nsec = range.file_ctime_nsec;
+    st.st_mode = ker::vfs::S_IFREG;
+
+    void* page = nullptr;
+    bool const USE_SHARED_CACHE = (range.prot & ker::abi::vmem::PROT_WRITE) == 0 && file_mmap_can_share(st, range.prot);
+    if (USE_SHARED_CACHE) {
+        if (!file_mmap_cached_page_for_file(range.file, st, FILE_OFFSET, &page)) {
+            return false;
+        }
+    } else {
+        page = ker::mod::mm::phys::page_alloc(ker::mod::mm::paging::PAGE_SIZE, "vmem-file-lazy");
+        if (page == nullptr) {
+            return false;
+        }
+        std::memset(page, 0, ker::mod::mm::paging::PAGE_SIZE);
+        if (FILE_OFFSET < range.file_size) {
+            size_t const READ_SIZE =
+                static_cast<size_t>(std::min<uint64_t>(ker::mod::mm::paging::PAGE_SIZE, range.file_size - FILE_OFFSET));
+            if (FILE_OFFSET > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+                ker::mod::mm::phys::page_ref_dec(page);
+                return false;
+            }
+            ssize_t const READ_RET = ker::vfs::vfs_pread_file_direct(range.file, page, READ_SIZE, static_cast<off_t>(FILE_OFFSET));
+            if (READ_RET < 0) {
+                ker::mod::mm::phys::page_ref_dec(page);
+                return false;
+            }
+        }
+    }
+
+    uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
+    bool still_current = false;
+    for (const auto& candidate : task->lazy_vmem_ranges) {
+        if (lazy_file_range_matches(candidate, range, page_vaddr)) {
+            still_current = true;
+            break;
+        }
+    }
+    if (!still_current) {
+        task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+        ker::mod::mm::phys::page_ref_dec(page);
+        return false;
+    }
+
+    if (ker::mod::mm::virt::translate(task->pagemap, page_vaddr) != ker::mod::mm::virt::PADDR_INVALID) {
+        task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+        ker::mod::mm::phys::page_ref_dec(page);
+        return true;
+    }
+
+    auto const PADDR = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(page)));
+    ker::mod::mm::virt::map_page(task->pagemap, page_vaddr, PADDR, file_mapping_page_flags(range.prot, range.flags));
+    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+    return true;
 }
 
 auto anon_zero_page_flags(uint64_t prot) -> uint64_t {
@@ -1393,6 +1640,35 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
         release_fixed_mmap_range(task, vaddr, size);
     }
 
+    if ((st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG) {
+        auto* file = ker::vfs::vfs_get_file_retain(task, fd);
+        if (file == nullptr) {
+            release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+        }
+
+        if (!add_shared_lazy_file_vmem_range(task, vaddr, size, prot, flags, file, offset, st)) {
+            ker::vfs::vfs_put_file(file);
+            (void)remove_shared_vmem_range(task, vaddr, size);
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+        }
+
+        if (TRACK_FILE_MAPPING) {
+            int const REGISTER_RET = register_file_mmap_range_from_fd(task, fd, vaddr, REQUESTED_SIZE, offset);
+            if (REGISTER_RET < 0) {
+                (void)remove_shared_vmem_range(task, vaddr, size);
+                ker::vfs::vfs_put_file(file);
+                return static_cast<uint64_t>(REGISTER_RET);
+            }
+        }
+
+        ker::vfs::vfs_put_file(file);
+        advance_shared_mmap_cursor(task, vaddr, size);
+        record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0, 0,
+                                vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
+        return vaddr;
+    }
+
     if (file_mmap_can_share(st, prot)) {
         bool cache_ok = true;
         uint64_t mapped_pages = 0;
@@ -1521,14 +1797,21 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
 
 }  // anonymous namespace
 
+auto materialize_lazy_file_page(ker::mod::sched::task::Task* task, const ker::mod::sched::task::LazyVmemRange& range, uint64_t page_vaddr,
+                                const ker::mod::mm::paging::PageFault& fault) -> bool {
+    return materialize_lazy_file_page_impl(task, range, page_vaddr, fault);
+}
+
 auto file_mmap_cache_stats() -> FileMmapCacheStats {
     FileMmapCacheStats stats{};
     stats.capacity_pages = FILE_MMAP_CACHE_PAGES;
 
     g_file_mmap_cache_lock.lock();
-    for (const auto& entry : g_file_mmap_cache) {
-        if (entry.page != nullptr) {
-            stats.pages++;
+    for (const auto& set : g_file_mmap_cache) {
+        for (const auto& entry : set.ways) {
+            if (entry.page != nullptr) {
+                stats.pages++;
+            }
         }
     }
     g_file_mmap_cache_lock.unlock();

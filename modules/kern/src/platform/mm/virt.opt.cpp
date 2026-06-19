@@ -31,7 +31,9 @@
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
 #include "platform/sched/threading.hpp"
+#include "syscalls_impl/vmem/sys_vmem.hpp"
 #include "util/hcf.hpp"
+#include "vfs/vfs.hpp"
 
 extern "C" char __kernel_end[];  // NOLINT(readability-identifier-naming)
 
@@ -123,6 +125,19 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
             task->lazy_vmem_lock.unlock_irqrestore(IRQF);
             log_lazy_vmem_fault_state(task, PAGE_VADDR, fault, "deny");
             return false;
+        }
+
+        if (range.kind == sched::task::LazyVmemKind::FILE_BACKED) {
+            auto file_range = range;
+            if (file_range.file != nullptr) {
+                ker::vfs::vfs_retain_file(file_range.file);
+            }
+            task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+            bool const OK = ker::syscall::vmem::materialize_lazy_file_page(task, file_range, PAGE_VADDR, fault);
+            if (file_range.file != nullptr) {
+                ker::vfs::vfs_put_file(file_range.file);
+            }
+            return OK;
         }
 
         void* const PAGE = phys::page_alloc(paging::PAGE_SIZE, "lazy-vmem");

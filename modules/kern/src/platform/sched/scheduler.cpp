@@ -1395,13 +1395,25 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
     return true;
 }
 
+auto local_reschedule_requires_fresh_timer(RunQueue* rq) -> bool {
+    if (rq == nullptr) {
+        return false;
+    }
+
+    auto* current = rq->current_task;
+    return rq->is_idle.load(std::memory_order_acquire) || current == nullptr || current->type == task::TaskType::IDLE ||
+           current->is_voluntary_blocked() || current->wants_block;
+}
+
 // Send a scheduler wake IPI to a specific CPU if it's currently idle.
 // This ensures idle CPUs don't sleep up to 10ms before noticing new work.
 void request_local_reschedule() {
     auto* rq = run_queues->this_cpu();
+    bool fresh_timer_required = false;
     if (rq != nullptr) {
+        fresh_timer_required = local_reschedule_requires_fresh_timer(rq);
         rq->local_reschedule_requests.fetch_add(1, std::memory_order_relaxed);
-        if (rq->resched_timer_pending.exchange(true, std::memory_order_acq_rel)) {
+        if (rq->resched_timer_pending.exchange(true, std::memory_order_acq_rel) && !fresh_timer_required) {
             return;
         }
     }
@@ -3269,10 +3281,12 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                     uint64_t const RUSAGE_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_rusage_user_addr);
                     if (RUSAGE_PHYS != mm::virt::PADDR_INVALID && RUSAGE_PHYS != 0) {
                         auto* ru = reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(RUSAGE_PHYS));
-                        ru->ru_utime_sec = static_cast<int64_t>(child->user_time_us / 1000000ULL);
-                        ru->ru_utime_usec = static_cast<int64_t>(child->user_time_us % 1000000ULL);
-                        ru->ru_stime_sec = static_cast<int64_t>(child->system_time_us / 1000000ULL);
-                        ru->ru_stime_usec = static_cast<int64_t>(child->system_time_us % 1000000ULL);
+                        uint64_t const USER_TIME_US = task::task_rusage_user_time_us(*child);
+                        uint64_t const SYSTEM_TIME_US = task::task_rusage_system_time_us(*child);
+                        ru->ru_utime_sec = static_cast<int64_t>(USER_TIME_US / 1000000ULL);
+                        ru->ru_utime_usec = static_cast<int64_t>(USER_TIME_US % 1000000ULL);
+                        ru->ru_stime_sec = static_cast<int64_t>(SYSTEM_TIME_US / 1000000ULL);
+                        ru->ru_stime_usec = static_cast<int64_t>(SYSTEM_TIME_US % 1000000ULL);
                     }
                     current_task->wait_rusage_user_addr = 0;
                     current_task->wait_rusage_phys_addr = 0;
@@ -3354,10 +3368,12 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                         uint64_t const RUSAGE_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_rusage_user_addr);
                         if (RUSAGE_PHYS != mm::virt::PADDR_INVALID && RUSAGE_PHYS != 0) {
                             auto* ru = reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(RUSAGE_PHYS));
-                            ru->ru_utime_sec = static_cast<int64_t>(target->user_time_us / 1000000ULL);
-                            ru->ru_utime_usec = static_cast<int64_t>(target->user_time_us % 1000000ULL);
-                            ru->ru_stime_sec = static_cast<int64_t>(target->system_time_us / 1000000ULL);
-                            ru->ru_stime_usec = static_cast<int64_t>(target->system_time_us % 1000000ULL);
+                            uint64_t const USER_TIME_US = task::task_rusage_user_time_us(*target);
+                            uint64_t const SYSTEM_TIME_US = task::task_rusage_system_time_us(*target);
+                            ru->ru_utime_sec = static_cast<int64_t>(USER_TIME_US / 1000000ULL);
+                            ru->ru_utime_usec = static_cast<int64_t>(USER_TIME_US % 1000000ULL);
+                            ru->ru_stime_sec = static_cast<int64_t>(SYSTEM_TIME_US / 1000000ULL);
+                            ru->ru_stime_usec = static_cast<int64_t>(SYSTEM_TIME_US % 1000000ULL);
                         }
                         current_task->wait_rusage_user_addr = 0;
                         current_task->wait_rusage_phys_addr = 0;
@@ -4508,6 +4524,8 @@ void cleanup_task_after_pagemap(task::Task* cur, GcTaskTiming& timing, uint64_t 
         return;
     }
 
+    task::release_lazy_vmem_ranges(*cur);
+
     // Free thread
     if (cur->thread != nullptr) {
         uint64_t const START_US = time::get_us();
@@ -4597,6 +4615,8 @@ void finish_waitable_zombie_resource_cleanup(task::Task* cur, GcTaskTiming& timi
     if (cur == nullptr) {
         return;
     }
+
+    task::release_lazy_vmem_ranges(*cur);
 
     if (cur->thread != nullptr) {
         uint64_t const START_US = time::get_us();

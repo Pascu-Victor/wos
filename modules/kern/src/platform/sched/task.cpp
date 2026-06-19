@@ -19,6 +19,7 @@
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/mutex.hpp>
+#include <utility>
 #include <vfs/file.hpp>
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
@@ -386,6 +387,7 @@ void destroy_unpublished_user_thread(Task* task) {
         return;
     }
 
+    release_lazy_vmem_ranges(*task);
     release_cloned_fd_table_refs(task);
     delete task->thread;
     delete reinterpret_cast<cpu::PerCpu*>(task->context.syscall_scratch_area);
@@ -399,8 +401,29 @@ void destroy_unpublished_user_thread(Task* task) {
 auto clone_lazy_vmem_ranges(Task& dst, Task& src) -> bool {
     uint64_t const IRQF = src.lazy_vmem_lock.lock_irqsave();
     bool const OK = dst.lazy_vmem_ranges.clone_from(src.lazy_vmem_ranges);
+    if (OK) {
+        for (const auto& range : dst.lazy_vmem_ranges) {
+            if (range.kind == LazyVmemKind::FILE_BACKED && range.file != nullptr) {
+                ker::vfs::vfs_retain_file(range.file);
+            }
+        }
+    }
     src.lazy_vmem_lock.unlock_irqrestore(IRQF);
     return OK;
+}
+
+void release_lazy_vmem_ranges(Task& task) {
+    LazyVmemRangeVec ranges;
+    uint64_t const IRQF = task.lazy_vmem_lock.lock_irqsave();
+    ranges = std::move(task.lazy_vmem_ranges);
+    task.lazy_vmem_ranges = LazyVmemRangeVec{};
+    task.lazy_vmem_lock.unlock_irqrestore(IRQF);
+
+    for (const auto& range : ranges) {
+        if (range.kind == LazyVmemKind::FILE_BACKED && range.file != nullptr) {
+            ker::vfs::vfs_put_file(range.file);
+        }
+    }
 }
 
 #ifdef WOS_SELFTEST
