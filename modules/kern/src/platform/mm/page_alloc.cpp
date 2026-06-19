@@ -16,6 +16,9 @@ namespace {
 // Helpers
 // ============================================================================
 
+static_assert(sizeof(std::atomic<uint8_t>) == sizeof(uint8_t), "PageKind table fill assumes byte-sized atomics");
+static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t), "Page refcount table clear assumes uint32-sized atomics");
+
 // Smallest order k such that (1 << k) pages >= the requested byte count.
 auto size_to_order(uint64_t size_bytes) -> int {
     uint64_t const PAGES = (size_bytes + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
@@ -67,6 +70,21 @@ auto ptr_in_zone(const PageAllocator* alloc, const void* ptr) -> bool {
 
 void store_page_kind(std::atomic<uint8_t>& slot, PageKind kind) {
     slot.store(static_cast<uint8_t>(decode_page_kind(static_cast<uint8_t>(kind))), std::memory_order_release);
+}
+
+void fill_page_kinds(std::atomic<uint8_t>* kinds, uint32_t count, PageKind kind) {
+    if (count == 0) {
+        return;
+    }
+    std::memset(kinds, static_cast<int>(static_cast<uint8_t>(decode_page_kind(static_cast<uint8_t>(kind)))),
+                static_cast<size_t>(count) * sizeof(std::atomic<uint8_t>));
+}
+
+void zero_page_refcounts(std::atomic<uint32_t>* refcounts, uint32_t count) {
+    if (count == 0) {
+        return;
+    }
+    std::memset(refcounts, 0, static_cast<size_t>(count) * sizeof(std::atomic<uint32_t>));
 }
 
 auto free_head_is_valid(const PageAllocator* alloc, PageAllocator::FreeBlock* block, int order, uint32_t& page_idx) -> bool {
@@ -322,12 +340,8 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
             list_head = nullptr;
         }
         std::memset(page_flags, FLAG_RESERVED, total_pages);
-        for (uint32_t i = 0; i < total_pages; ++i) {
-            store_page_kind(page_kinds[i], PageKind::RESERVED);
-        }
-        for (uint32_t i = 0; i < total_pages; ++i) {
-            page_refcounts[i].store(0, std::memory_order_relaxed);
-        }
+        fill_page_kinds(page_kinds, total_pages, PageKind::RESERVED);
+        zero_page_refcounts(page_refcounts, total_pages);
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
         std::memset(page_callers, 0, total_pages * sizeof(uint64_t));
 #endif
@@ -343,20 +357,13 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
         list_head = nullptr;
     }
 
-    // Mark metadata pages as reserved, all others as allocated-continuation
-    // (prevents false buddy matches during the decomposition loop below).
+    // Mark metadata pages as reserved and pre-clear all usable pages as free
+    // interiors. The decomposition loop only needs to stamp block heads.
     std::memset(page_flags, FLAG_RESERVED, metadata_pages);
-    std::memset(page_flags + metadata_pages, FLAG_ALLOC_CONT, total_pages - metadata_pages);
-    for (uint32_t i = 0; i < metadata_pages; ++i) {
-        store_page_kind(page_kinds[i], PageKind::RESERVED);
-    }
-    for (uint32_t i = metadata_pages; i < total_pages; ++i) {
-        store_page_kind(page_kinds[i], PageKind::FREE);
-    }
-    // Zero all refcounts (free pages have refcount 0)
-    for (uint32_t i = 0; i < total_pages; ++i) {
-        page_refcounts[i].store(0, std::memory_order_relaxed);
-    }
+    std::memset(page_flags + metadata_pages, FLAG_FREE_INTERIOR, total_pages - metadata_pages);
+    fill_page_kinds(page_kinds, metadata_pages, PageKind::RESERVED);
+    fill_page_kinds(page_kinds + metadata_pages, total_pages - metadata_pages, PageKind::FREE);
+    zero_page_refcounts(page_refcounts, total_pages);
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     std::memset(page_callers, 0, total_pages * sizeof(uint64_t));
 #endif
@@ -381,11 +388,8 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
 
         uint32_t const BLOCK_SIZE = 1U << order;
 
-        // Mark head page as free-head, interior pages as free-interior.
+        // Mark the head; interior pages were pre-cleared above.
         page_flags[page] = FLAG_FREE_HEAD | static_cast<uint8_t>(order);
-        for (uint32_t i = 1; i < BLOCK_SIZE; i++) {
-            page_flags[page + i] = FLAG_FREE_INTERIOR;
-        }
 
         // Prepend to the order's free list (link through the page itself).
         auto* block = reinterpret_cast<FreeBlock*>(page_to_ptr(base, page));

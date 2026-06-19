@@ -55,13 +55,13 @@ namespace {
 using log = mod::dbg::logger<"elf">;
 
 auto header_is_valid(const Elf64_Ehdr& ehdr) -> bool {
-    return ehdr.e_ident[EI_CLASS] == ELFCLASS64                  // 64-bit
-           && ehdr.e_ident[EI_OSABI] == ELFOSABI_NONE            // System V
-           && (ehdr.e_type == ET_EXEC || ehdr.e_type == ET_DYN)  // Executable or PIE
-           && ehdr.e_ident[EI_MAG0] == ELFMAG0                   // Magic 0
-           && ehdr.e_ident[EI_MAG1] == ELFMAG1                   // Magic 1
-           && ehdr.e_ident[EI_MAG2] == ELFMAG2                   // Magic 2
-           && ehdr.e_ident[EI_MAG3] == ELFMAG3;                  // Magic 3
+    return ehdr.e_ident[EI_CLASS] == ELFCLASS64                                                      // 64-bit
+           && (ehdr.e_ident[EI_OSABI] == ELFOSABI_NONE || ehdr.e_ident[EI_OSABI] == ELFOSABI_LINUX)  // System V or GNU/Linux
+           && (ehdr.e_type == ET_EXEC || ehdr.e_type == ET_DYN)                                      // Executable or PIE
+           && ehdr.e_ident[EI_MAG0] == ELFMAG0                                                       // Magic 0
+           && ehdr.e_ident[EI_MAG1] == ELFMAG1                                                       // Magic 1
+           && ehdr.e_ident[EI_MAG2] == ELFMAG2                                                       // Magic 2
+           && ehdr.e_ident[EI_MAG3] == ELFMAG3;                                                      // Magic 3
 }
 
 template <typename T>
@@ -817,6 +817,8 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
                       elf_file.elf_head.e_ident[EI_MAG1], elf_file.elf_head.e_ident[EI_MAG2], elf_file.elf_head.e_ident[EI_MAG3], ELFMAG0,
                       ELFMAG1, ELFMAG2, ELFMAG3);
         mod::dbg::log("  e_ident[EI_CLASS]: 0x%x (expected ELFCLASS64=0x%x)", elf_file.elf_head.e_ident[EI_CLASS], ELFCLASS64);
+        mod::dbg::log("  e_ident[EI_OSABI]: 0x%x (expected ELFOSABI_NONE=0x%x or ELFOSABI_LINUX=0x%x)", elf_file.elf_head.e_ident[EI_OSABI],
+                      ELFOSABI_NONE, ELFOSABI_LINUX);
         mod::dbg::log("  e_type: 0x%x (expected ET_EXEC=0x%x or ET_DYN=0x%x)", elf_file.elf_head.e_type, ET_EXEC, ET_DYN);
         mod::dbg::log("  e_phoff: 0x%x, e_shoff: 0x%x", elf_file.elf_head.e_phoff, elf_file.elf_head.e_shoff);
         return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0};

@@ -1009,7 +1009,7 @@ void init(limine_memmap_response* memmap_response) {
     }
 
     // Initialize per-CPU caches
-    num_cpus = smt::get_core_count();
+    num_cpus = smt::get_early_cpu_count();
     if (num_cpus == 0) {
         num_cpus = 1;  // Fallback to single CPU
     }

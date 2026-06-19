@@ -32,10 +32,16 @@
 #include "platform/mm/phys.hpp"
 #include "platform/sched/threading.hpp"
 #include "util/hcf.hpp"
+
+extern "C" char __kernel_end[];  // NOLINT(readability-identifier-naming)
+
 namespace ker::mod::mm::virt {
 
 namespace {
 using log = ker::mod::dbg::logger<"virt">;
+
+constexpr uint64_t LARGE_PAGE_2M_BYTES = paging::PAGE_SIZE * paging::PAGE_TABLE_ENTRIES;
+constexpr uint64_t LARGE_PAGE_1G_BYTES = LARGE_PAGE_2M_BYTES * paging::PAGE_TABLE_ENTRIES;
 
 auto perf_clamp_u32(uint64_t value) -> uint32_t { return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value); }
 
@@ -557,6 +563,10 @@ auto table_flags_for_leaf(const uint64_t FLAGS) -> uint64_t {
     return table_flags;
 }
 
+auto is_aligned_to(uint64_t value, uint64_t alignment) -> bool { return (value & (alignment - 1)) == 0; }
+
+auto advance_page_table(paging::PageTable* page_table, size_t level, uint64_t flags) -> paging::PageTable*;
+
 auto is_reserved_leaf(const PageTableEntry& entry) -> bool {
     uint64_t const RAW = pte_raw(entry);
     return entry.present == 0 && (RAW & paging::PAGE_RESERVED) != 0U;
@@ -577,6 +587,27 @@ auto leaf_entry(PageTable* root, vaddr_t vaddr) -> PageTableEntry* {
     }
 
     return &entry_at(table, index_of(vaddr, 1));
+}
+
+auto present_mapping_entry(PageTable* root, vaddr_t vaddr) -> const PageTableEntry* {
+    if (root == nullptr) {
+        return nullptr;
+    }
+
+    PageTable const* table = root;
+    for (int level = 4; level > 1; --level) {
+        PageTableEntry const& entry = entry_at(table, index_of(vaddr, level));
+        if (entry.present == 0) {
+            return nullptr;
+        }
+        if (level < 4 && entry.pagesize != 0) {
+            return &entry;
+        }
+        table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+    }
+
+    PageTableEntry const& entry = entry_at(table, index_of(vaddr, 1));
+    return entry.present != 0 ? &entry : nullptr;
 }
 
 void drop_present_leaf_ref(const PageTableEntry& entry) {
@@ -999,6 +1030,83 @@ void refresh_kernel_mappings(PageTable* page_table) {
         }
     }
 }
+
+auto range_valid(Range range) -> bool { return range.start < range.end; }
+
+auto memmap_page_range(const limine_memmap_entry* entry, Range& range) -> bool {
+    range = {};
+    if (entry == nullptr || entry->length < paging::PAGE_SIZE) {
+        return false;
+    }
+
+    uint64_t const PAGE_COUNT = entry->length / paging::PAGE_SIZE;
+    uint64_t const BYTES = PAGE_COUNT * paging::PAGE_SIZE;
+    if (entry->base > UINT64_MAX - BYTES) {
+        return false;
+    }
+
+    range = Range{.start = entry->base, .end = entry->base + BYTES};
+    return range_valid(range);
+}
+
+auto direct_map_flags_for_entry(uint64_t type) -> uint64_t {
+    bool const READONLY =
+        type == LIMINE_MEMMAP_RESERVED || type == LIMINE_MEMMAP_BAD_MEMORY || type == LIMINE_MEMMAP_EXECUTABLE_AND_MODULES;
+    return READONLY ? paging::page_types::READONLY : paging::page_types::KERNEL;
+}
+
+struct BootDirectMapStats {
+    size_t pages{};
+    size_t small_4k{};
+    size_t large_2m{};
+};
+
+auto map_2m_page(PageTable* page_table, vaddr_t vaddr, paddr_t paddr, uint64_t flags) -> bool {
+    if (page_table == nullptr || flags == 0 || !is_aligned_to(vaddr, LARGE_PAGE_2M_BYTES) || !is_aligned_to(paddr, LARGE_PAGE_2M_BYTES)) {
+        return false;
+    }
+
+    PageTable* pml3 = advance_page_table(page_table, index_of(vaddr, 4), table_flags_for_leaf(flags));
+    PageTable* pml2 = advance_page_table(pml3, index_of(vaddr, 3), table_flags_for_leaf(flags));
+    PageTableEntry& entry = entry_at(pml2, index_of(vaddr, 2));
+    if (entry.present != 0 && entry.pagesize == 0) {
+        return false;
+    }
+
+    entry = paging::create_page_table_entry(paddr, flags);
+    entry.pagesize = 1;
+    return true;
+}
+
+auto map_boot_direct_range(PageTable* page_table, Range range, uint64_t flags) -> BootDirectMapStats {
+    BootDirectMapStats stats{};
+    if (!range_valid(range)) {
+        return stats;
+    }
+
+    PageMapBatch batch{};
+    init_page_map_batch(&batch, page_table, flags);
+    bool const HHDM_SUPPORTS_2M = is_aligned_to(addr::get_hhdm_offset(), LARGE_PAGE_2M_BYTES);
+    for (uint64_t phys = range.start; phys < range.end; phys += paging::PAGE_SIZE) {
+        auto const VADDR = reinterpret_cast<vaddr_t>(addr::get_virt_pointer(phys));
+        if (HHDM_SUPPORTS_2M && is_aligned_to(phys, LARGE_PAGE_2M_BYTES) && range.end - phys >= LARGE_PAGE_2M_BYTES &&
+            map_2m_page(page_table, VADDR, phys, flags)) {
+            stats.pages += paging::PAGE_TABLE_ENTRIES;
+            stats.large_2m++;
+            phys += LARGE_PAGE_2M_BYTES - paging::PAGE_SIZE;
+            continue;
+        }
+
+        map_page_batched(&batch, VADDR, phys, flags);
+        stats.pages++;
+        stats.small_4k++;
+    }
+    flush_page_map_batch(&batch);
+    if (stats.large_2m > 0) {
+        wrcr3(rdcr3());
+    }
+    return stats;
+}
 }  // namespace
 
 void init(limine_memmap_response* memmap_response_param, limine_executable_file_response* kernel_file_response_param,
@@ -1301,13 +1409,19 @@ paddr_t translate(PageTable* page_table, vaddr_t vaddr) {
     }
 
     PageTable const* table = page_table;
-    for (int i = 4; i > 1; i--) {
-        const auto& entry = entry_at(table, index_of(vaddr, i));
+    for (int level = 4; level > 1; level--) {
+        const auto& entry = entry_at(table, index_of(vaddr, level));
         if (!entry.present) {
             return PADDR_INVALID;
         }
         uint64_t const PHYS = entry.frame << paging::PAGE_SHIFT;
-        table = reinterpret_cast<PageTable*>(PHYS + 0xffff800000000000ULL);  // Use HHDM for page table walk
+        if (level == 3 && entry.pagesize != 0) {
+            return PHYS + (vaddr & (LARGE_PAGE_1G_BYTES - 1));
+        }
+        if (level == 2 && entry.pagesize != 0) {
+            return PHYS + (vaddr & (LARGE_PAGE_2M_BYTES - 1));
+        }
+        table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(PHYS));
     }
 
     const auto& pte = entry_at(table, index_of(vaddr, 1));
@@ -1435,34 +1549,45 @@ void init_pagemap() {
         log::debug("memory map entry %d: %x - %x (%s)", i, entry->base, entry->base + entry->length, type_str);
     }
 
-    size_t total_pages_mapped = 0;
+    BootDirectMapStats direct_map_stats{};
     for (size_t i = 0; i < memmap_response->entry_count; i++) {
         auto* entry = memmap_response->entries[i];
-        size_t const NUM_PAGES = entry->length / paging::PAGE_SIZE;
-
-        for (size_t j = 0; j < NUM_PAGES; j++) {
-            auto vaddr = reinterpret_cast<paddr_t>(addr::get_virt_pointer(entry->base + (j * paging::PAGE_SIZE)));
-            map_page(kernel_pagemap,
-                     vaddr,                                                          // virtual address
-                     entry->base + (j * paging::PAGE_SIZE),                          // physical address
-                     entry->type == LIMINE_MEMMAP_RESERVED                           // reserved memory
-                             || entry->type == LIMINE_MEMMAP_BAD_MEMORY              // bad memory
-                             || entry->type == LIMINE_MEMMAP_EXECUTABLE_AND_MODULES  // kernel and modules
-                         ? paging::page_types::READONLY                              // becomes read-only
-                         : paging::page_types::KERNEL                                // otherwise kernel memory
-            );
-            total_pages_mapped++;
+        Range entry_range{};
+        if (!memmap_page_range(entry, entry_range)) {
+            continue;
         }
-    }
-    log::info("mapped total of %zu pages from memory map", total_pages_mapped);
 
-    for (size_t i = 0; i <= kernel_file_response->executable_file->size; i++) {
-        vaddr_t const VADDR = kernel_address_response->virtual_base + (i * paging::PAGE_SIZE);
-        map_page(kernel_pagemap,
-                 VADDR,                                                             // virtual address
-                 kernel_address_response->physical_base + (i * paging::PAGE_SIZE),  // physical address
-                 paging::page_types::KERNEL                                         // kernel memory
-        );
+        BootDirectMapStats const ENTRY_STATS = map_boot_direct_range(kernel_pagemap, entry_range, direct_map_flags_for_entry(entry->type));
+        direct_map_stats.pages += ENTRY_STATS.pages;
+        direct_map_stats.small_4k += ENTRY_STATS.small_4k;
+        direct_map_stats.large_2m += ENTRY_STATS.large_2m;
+    }
+    log::info("mapped total of %zu pages from memory map (%zu x 2M, %zu x 4K)", direct_map_stats.pages, direct_map_stats.large_2m,
+              direct_map_stats.small_4k);
+
+    if (kernel_file_response == nullptr || kernel_file_response->executable_file == nullptr || kernel_address_response == nullptr) {
+        log::critical("init_pagemap: missing kernel executable metadata");
+        hcf();
+    }
+
+    uint64_t const KERNEL_VIRT_BASE = kernel_address_response->virtual_base;
+    auto const KERNEL_IMAGE_END = reinterpret_cast<uint64_t>(__kernel_end);
+    if (KERNEL_IMAGE_END < KERNEL_VIRT_BASE) {
+        log::critical("init_pagemap: invalid kernel image bounds base=%p end=%p", KERNEL_VIRT_BASE, KERNEL_IMAGE_END);
+        hcf();
+    }
+
+    uint64_t const KERNEL_IMAGE_SIZE = KERNEL_IMAGE_END - KERNEL_VIRT_BASE;
+    uint64_t const KERNEL_PAGE_COUNT = page_align_up(KERNEL_IMAGE_SIZE) / paging::PAGE_SIZE;
+    if (KERNEL_PAGE_COUNT > 0) {
+        PageMapBatch kernel_batch{};
+        init_page_map_batch(&kernel_batch, kernel_pagemap, paging::page_types::KERNEL);
+        for (uint64_t i = 0; i < KERNEL_PAGE_COUNT; i++) {
+            vaddr_t const VADDR = kernel_address_response->virtual_base + (i * paging::PAGE_SIZE);
+            paddr_t const PADDR = kernel_address_response->physical_base + (i * paging::PAGE_SIZE);
+            map_page_batched(&kernel_batch, VADDR, PADDR, paging::page_types::KERNEL);
+        }
+        flush_page_map_batch(&kernel_batch);
     }
 
     // CRITICAL: Ensure all page table pages are mapped in the HHDM.
@@ -1498,6 +1623,9 @@ void init_pagemap() {
                 if (!pml3e.present) {
                     continue;
                 }
+                if (pml3e.pagesize != 0) {
+                    continue;
+                }
 
                 paddr_t const PML2_PHYS = pml3e.frame << paging::PAGE_SHIFT;
                 auto pml2_virt = reinterpret_cast<vaddr_t>(addr::get_virt_pointer(PML2_PHYS));
@@ -1511,6 +1639,9 @@ void init_pagemap() {
                 auto* pml2 = reinterpret_cast<PageTable*>(pml2_virt);
                 for (auto& pml2e : pml2->entries) {
                     if (!pml2e.present) {
+                        continue;
+                    }
+                    if (pml2e.pagesize != 0) {
                         continue;
                     }
 
@@ -1652,18 +1783,18 @@ void map_page_batched(PageMapBatch* batch, const vaddr_t VADDR, const paddr_t PA
     uint64_t const IDX3 = index_of(VADDR, 3);
     uint64_t const IDX2 = index_of(VADDR, 2);
 
-    if (IDX4 != batch->cached_idx4) {
+    if (IDX4 != batch->cached_idx4 || batch->pml3 == nullptr) {
         batch->pml3 = advance_page_table(batch->root, IDX4, batch->table_flags);
         batch->cached_idx4 = IDX4;
         batch->cached_idx3 = UINT64_MAX;
         batch->cached_idx2 = UINT64_MAX;
     }
-    if (IDX3 != batch->cached_idx3) {
+    if (IDX3 != batch->cached_idx3 || batch->pml2 == nullptr) {
         batch->pml2 = advance_page_table(batch->pml3, IDX3, batch->table_flags);
         batch->cached_idx3 = IDX3;
         batch->cached_idx2 = UINT64_MAX;
     }
-    if (IDX2 != batch->cached_idx2) {
+    if (IDX2 != batch->cached_idx2 || batch->pml1 == nullptr) {
         batch->pml1 = advance_page_table(batch->pml2, IDX2, batch->table_flags);
         batch->cached_idx2 = IDX2;
     }
@@ -1760,8 +1891,7 @@ auto is_page_mapped(PageTable* page_table, vaddr_t vaddr) -> bool {
         hcf();
     }
 
-    const PageTableEntry* entry = leaf_entry(page_table, vaddr);
-    return entry != nullptr && entry->present != 0;
+    return present_mapping_entry(page_table, vaddr) != nullptr;
 }
 
 auto is_page_reserved(PageTable* page_table, vaddr_t vaddr) -> bool {
