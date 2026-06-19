@@ -67,6 +67,7 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t;
 auto vfs_symlink(const char* target, const char* linkpath) -> int;
 auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t;
 auto vfs_readlink_resolved(const char* path, char* buf, size_t bufsize) -> ssize_t;
+auto vfs_realpath(const char* path, char* buf, size_t bufsize) -> int;
 
 // Stat operations
 auto vfs_stat(const char* path, Stat* statbuf) -> int;
@@ -106,6 +107,8 @@ auto vfs_check_permission(uint32_t file_mode, uint32_t file_uid, uint32_t file_g
 
 // Positional I/O (does not modify file position)
 auto vfs_pread(int fd, void* buf, size_t count, off_t offset) -> ssize_t;
+auto vfs_pread_file(File* file, void* buf, size_t count, off_t offset) -> ssize_t;
+auto vfs_pread_file_direct(File* file, void* buf, size_t count, off_t offset) -> ssize_t;
 auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t;
 
 // File removal / rename
@@ -144,6 +147,26 @@ struct LocalPipePerfSnapshot {
 
 void vfs_get_local_pipe_perf_snapshot(LocalPipePerfSnapshot& out);
 void vfs_reset_local_pipe_perf_counters();
+
+struct VfsCachePerfSnapshot {
+    uint64_t metadata_hits{};
+    uint64_t metadata_misses{};
+    uint64_t metadata_stores{};
+    uint64_t symlink_hits{};
+    uint64_t symlink_misses{};
+    uint64_t symlink_stores{};
+    uint64_t stream_hits{};
+    uint64_t stream_misses{};
+    uint64_t stream_backend_reads{};
+    uint64_t stream_backend_bytes{};
+    uint64_t stream_copied_bytes{};
+    uint64_t fstat_snapshot_hits{};
+    uint64_t fstat_snapshot_misses{};
+    uint64_t fstat_snapshot_stores{};
+};
+
+void vfs_get_cache_perf_snapshot(VfsCachePerfSnapshot& out);
+auto vfs_cache_epoch_snapshot() -> uint64_t;
 
 // Sync
 auto vfs_fsync(int fd) -> int;

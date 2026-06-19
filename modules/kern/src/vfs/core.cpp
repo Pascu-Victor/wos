@@ -80,13 +80,82 @@ constexpr size_t STREAM_CHUNK_SIZE = 65536;
 constexpr size_t STREAM_ENTRY_BYTE_CAP = size_t{8} * 1024 * 1024;
 constexpr size_t STREAM_DETACHED_REUSE_MAX = size_t{8} * 1024 * 1024;
 constexpr size_t STREAM_DETACHED_PARTIAL_REUSE_MAX = size_t{256} * 1024;
+constexpr size_t STREAM_LOCAL_SMALL_FILE_RETAIN_MAX = size_t{128} * 1024;
 constexpr size_t STREAM_MAX_ACTIVE_ISLANDS = 4;
 constexpr uint64_t STREAM_DETACHED_TTL_US = 5000000;
+constexpr uint64_t STREAM_LOCAL_SMALL_FILE_DETACHED_TTL_US = 60000000;
 constexpr uint64_t STREAM_SPLIT_DISTANCE_BYTES = uint64_t{2} * 1024 * 1024;
 constexpr int STREAM_PREMATURE_EOF_RETRIES = 3;
 constexpr size_t PIPE_WAKE_BATCH = 32;
 constexpr size_t PIPE_DEFAULT_CAPACITY = 256UL * 1024UL;
 constexpr size_t PIPE_DIRECT_MAX_CAPACITY = 256UL * 1024UL;
+constexpr size_t METADATA_CACHE_SET_COUNT = 256;
+constexpr size_t METADATA_CACHE_WAYS = 4;
+constexpr size_t SYMLINK_CACHE_SET_COUNT = 512;
+constexpr size_t SYMLINK_CACHE_WAYS = 4;
+static_assert((METADATA_CACHE_SET_COUNT & (METADATA_CACHE_SET_COUNT - 1)) == 0);
+static_assert((SYMLINK_CACHE_SET_COUNT & (SYMLINK_CACHE_SET_COUNT - 1)) == 0);
+
+struct MetadataCacheEntry {
+    std::array<char, MAX_PATH_LEN> path{};
+    Stat stat{};
+    uint64_t hash = 0;
+    uint64_t epoch = 0;
+    uint64_t last_used = 0;
+    uint64_t dev_id = 0;
+    size_t path_len = 0;
+    int result = 0;
+    FSType fs_type = FSType::TMPFS;
+    bool follow_final_symlink = false;
+    bool require_directory = false;
+    bool valid = false;
+};
+
+struct MetadataCacheSet {
+    std::array<MetadataCacheEntry, METADATA_CACHE_WAYS> ways{};
+};
+
+struct SymlinkCacheEntry {
+    std::array<char, MAX_PATH_LEN> path{};
+    std::array<char, MAX_PATH_LEN> target{};
+    uint64_t hash = 0;
+    uint64_t epoch = 0;
+    uint64_t last_used = 0;
+    uint64_t dev_id = 0;
+    size_t path_len = 0;
+    size_t target_len = 0;
+    ssize_t result = 0;
+    FSType fs_type = FSType::TMPFS;
+    bool valid = false;
+};
+
+struct SymlinkCacheSet {
+    std::array<SymlinkCacheEntry, SYMLINK_CACHE_WAYS> ways{};
+};
+
+std::array<MetadataCacheSet, METADATA_CACHE_SET_COUNT> g_metadata_cache{};
+ker::mod::sys::Mutex g_metadata_cache_lock;
+std::atomic<uint64_t> g_metadata_cache_epoch{1};
+std::atomic<uint64_t> g_metadata_cache_clock{0};
+
+std::array<SymlinkCacheSet, SYMLINK_CACHE_SET_COUNT> g_symlink_cache{};
+ker::mod::sys::Mutex g_symlink_cache_lock;
+std::atomic<uint64_t> g_symlink_cache_clock{0};
+
+std::atomic<uint64_t> g_vfs_metadata_hits{0};
+std::atomic<uint64_t> g_vfs_metadata_misses{0};
+std::atomic<uint64_t> g_vfs_metadata_stores{0};
+std::atomic<uint64_t> g_vfs_symlink_hits{0};
+std::atomic<uint64_t> g_vfs_symlink_misses{0};
+std::atomic<uint64_t> g_vfs_symlink_stores{0};
+std::atomic<uint64_t> g_vfs_stream_hits{0};
+std::atomic<uint64_t> g_vfs_stream_misses{0};
+std::atomic<uint64_t> g_vfs_stream_backend_reads{0};
+std::atomic<uint64_t> g_vfs_stream_backend_bytes{0};
+std::atomic<uint64_t> g_vfs_stream_copied_bytes{0};
+std::atomic<uint64_t> g_vfs_fstat_snapshot_hits{0};
+std::atomic<uint64_t> g_vfs_fstat_snapshot_misses{0};
+std::atomic<uint64_t> g_vfs_fstat_snapshot_stores{0};
 
 auto open_flags_require_fs_write(int flags) -> bool {
     int const ACCMODE = flags & 3;
@@ -105,6 +174,290 @@ auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t sta
 auto vfs_stream_cache_get_file_stat(File* file, Stat* statbuf) -> int;
 auto stream_build_identity(File* file, const Stat& statbuf, StreamCacheIdentity* identity, StreamFreshnessStamp* stamp,
                            bool* can_reuse_detached, bool* retain_full_file) -> int;
+
+auto metadata_hash_mix(uint64_t value) -> uint64_t {
+    value ^= value >> 33U;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33U;
+    value *= 0xc4ceb9fe1a85ec53ULL;
+    value ^= value >> 33U;
+    return value;
+}
+
+auto metadata_hash_path(const char* path, size_t len, bool follow_final_symlink, bool require_directory, FSType fs_type, uint64_t dev_id)
+    -> uint64_t {
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= static_cast<unsigned char>(path[i]);
+        hash *= 1099511628211ULL;
+    }
+    hash ^= follow_final_symlink ? 0x9e3779b97f4a7c15ULL : 0x517cc1b727220a95ULL;
+    hash = metadata_hash_mix(hash ^ (require_directory ? 0x94d049bb133111ebULL : 0x2545f4914f6cdd1dULL));
+    hash = metadata_hash_mix(hash ^ (static_cast<uint64_t>(fs_type) << 56U) ^ dev_id);
+    return hash == 0 ? 1 : hash;
+}
+
+auto metadata_cacheable_fs(FSType fs_type) -> bool {
+    return fs_type == FSType::TMPFS || fs_type == FSType::FAT32 || fs_type == FSType::XFS;
+}
+
+auto metadata_cacheable_result(int result) -> bool { return result == 0 || result == -ENOENT; }
+
+void metadata_cache_bump_epoch() { g_metadata_cache_epoch.fetch_add(1, std::memory_order_acq_rel); }
+
+auto symlink_cacheable_fs(FSType fs_type) -> bool { return fs_type == FSType::TMPFS || fs_type == FSType::FAT32 || fs_type == FSType::XFS; }
+
+auto symlink_cacheable_result(ssize_t result) -> bool { return result >= 0 || result == -EINVAL || result == -ENOSYS || result == -ENOENT; }
+
+auto file_stat_snapshot_cacheable(const File* file) -> bool {
+    if (file == nullptr || file->is_directory || (file->open_flags & (ker::vfs::O_NO_CACHE | ker::vfs::O_TRUNC | ker::vfs::O_CREAT)) != 0) {
+        return false;
+    }
+    if ((file->open_flags & 3) != 0) {
+        return false;
+    }
+    return metadata_cacheable_fs(file->fs_type);
+}
+
+void file_stat_snapshot_store(File* file, const Stat& statbuf) {
+    if (!file_stat_snapshot_cacheable(file) || (statbuf.st_mode & S_IFMT) != S_IFREG) {
+        return;
+    }
+    file->stat_cache = statbuf;
+    file->stat_cache_epoch = g_metadata_cache_epoch.load(std::memory_order_acquire);
+    file->stat_cache_valid = true;
+    g_vfs_fstat_snapshot_stores.fetch_add(1, std::memory_order_relaxed);
+}
+
+auto file_stat_snapshot_lookup(File* file, Stat* statbuf) -> bool {
+    if (file == nullptr || statbuf == nullptr || !file->stat_cache_valid || !file_stat_snapshot_cacheable(file)) {
+        g_vfs_fstat_snapshot_misses.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (file->stat_cache_epoch != g_metadata_cache_epoch.load(std::memory_order_acquire)) {
+        g_vfs_fstat_snapshot_misses.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    *statbuf = file->stat_cache;
+    g_vfs_fstat_snapshot_hits.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void file_stat_snapshot_refresh(File* file) {
+    if (!file_stat_snapshot_cacheable(file)) {
+        return;
+    }
+    Stat statbuf{};
+    if (vfs_stream_cache_get_file_stat(file, &statbuf) == 0) {
+        file_stat_snapshot_store(file, statbuf);
+    }
+}
+
+auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bool follow_final_symlink, bool require_directory,
+                           Stat* statbuf) -> int {
+    if (path == nullptr || statbuf == nullptr || !metadata_cacheable_fs(fs_type)) {
+        return -EAGAIN;
+    }
+
+    size_t const PATH_LEN = std::strlen(path);
+    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
+        return -EAGAIN;
+    }
+
+    uint64_t const EPOCH = g_metadata_cache_epoch.load(std::memory_order_acquire);
+    uint64_t const HASH = metadata_hash_path(path, PATH_LEN, follow_final_symlink, require_directory, fs_type, dev_id);
+    auto& set = g_metadata_cache.at(HASH & (METADATA_CACHE_SET_COUNT - 1));
+
+    g_metadata_cache_lock.lock();
+    for (auto& entry : set.ways) {
+        if (!entry.valid || entry.epoch != EPOCH || entry.hash != HASH || entry.path_len != PATH_LEN || entry.fs_type != fs_type ||
+            entry.dev_id != dev_id || entry.follow_final_symlink != follow_final_symlink || entry.require_directory != require_directory) {
+            continue;
+        }
+        if (std::memcmp(entry.path.data(), path, PATH_LEN + 1) != 0) {
+            continue;
+        }
+
+        entry.last_used = g_metadata_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+        int const RESULT = entry.result;
+        if (RESULT == 0) {
+            *statbuf = entry.stat;
+        }
+        g_metadata_cache_lock.unlock();
+        g_vfs_metadata_hits.fetch_add(1, std::memory_order_relaxed);
+        return RESULT;
+    }
+    g_metadata_cache_lock.unlock();
+    g_vfs_metadata_misses.fetch_add(1, std::memory_order_relaxed);
+    return -EAGAIN;
+}
+
+void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, bool follow_final_symlink, bool require_directory, int result,
+                          const Stat* statbuf) {
+    if (path == nullptr || !metadata_cacheable_fs(fs_type) || !metadata_cacheable_result(result)) {
+        return;
+    }
+    if (result == 0 && statbuf == nullptr) {
+        return;
+    }
+
+    size_t const PATH_LEN = std::strlen(path);
+    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
+        return;
+    }
+
+    uint64_t const EPOCH = g_metadata_cache_epoch.load(std::memory_order_acquire);
+    uint64_t const HASH = metadata_hash_path(path, PATH_LEN, follow_final_symlink, require_directory, fs_type, dev_id);
+    uint64_t const USE_STAMP = g_metadata_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto& set = g_metadata_cache.at(HASH & (METADATA_CACHE_SET_COUNT - 1));
+
+    g_metadata_cache_lock.lock();
+    MetadataCacheEntry* victim = &set.ways.front();
+    for (auto& entry : set.ways) {
+        if (entry.valid && entry.epoch == EPOCH && entry.hash == HASH && entry.path_len == PATH_LEN && entry.fs_type == fs_type &&
+            entry.dev_id == dev_id && entry.follow_final_symlink == follow_final_symlink && entry.require_directory == require_directory &&
+            std::memcmp(entry.path.data(), path, PATH_LEN + 1) == 0) {
+            victim = &entry;
+            break;
+        }
+        if (!entry.valid || entry.epoch != EPOCH) {
+            victim = &entry;
+            break;
+        }
+        if (entry.last_used < victim->last_used) {
+            victim = &entry;
+        }
+    }
+
+    victim->path.fill('\0');
+    std::memcpy(victim->path.data(), path, PATH_LEN + 1);
+    victim->stat = (result == 0) ? *statbuf : Stat{};
+    victim->hash = HASH;
+    victim->epoch = EPOCH;
+    victim->last_used = USE_STAMP;
+    victim->dev_id = dev_id;
+    victim->path_len = PATH_LEN;
+    victim->result = result;
+    victim->fs_type = fs_type;
+    victim->follow_final_symlink = follow_final_symlink;
+    victim->require_directory = require_directory;
+    victim->valid = true;
+    g_vfs_metadata_stores.fetch_add(1, std::memory_order_relaxed);
+    g_metadata_cache_lock.unlock();
+}
+
+auto symlink_hash_path(const char* path, size_t len, FSType fs_type, uint64_t dev_id) -> uint64_t {
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= static_cast<unsigned char>(path[i]);
+        hash *= 1099511628211ULL;
+    }
+    return metadata_hash_mix(hash ^ (static_cast<uint64_t>(fs_type) << 56U) ^ dev_id);
+}
+
+auto symlink_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, char* buf, size_t bufsize, ssize_t* out_result) -> bool {
+    if (path == nullptr || buf == nullptr || bufsize == 0 || out_result == nullptr || !symlink_cacheable_fs(fs_type)) {
+        return false;
+    }
+
+    size_t const PATH_LEN = std::strlen(path);
+    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
+        return false;
+    }
+
+    uint64_t const EPOCH = g_metadata_cache_epoch.load(std::memory_order_acquire);
+    uint64_t const HASH = symlink_hash_path(path, PATH_LEN, fs_type, dev_id);
+    auto& set = g_symlink_cache.at(HASH & (SYMLINK_CACHE_SET_COUNT - 1));
+
+    g_symlink_cache_lock.lock();
+    for (auto& entry : set.ways) {
+        if (!entry.valid || entry.epoch != EPOCH || entry.hash != HASH || entry.path_len != PATH_LEN || entry.fs_type != fs_type ||
+            entry.dev_id != dev_id) {
+            continue;
+        }
+        if (std::memcmp(entry.path.data(), path, PATH_LEN + 1) != 0) {
+            continue;
+        }
+
+        entry.last_used = g_symlink_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+        ssize_t result = entry.result;
+        if (result > 0) {
+            size_t const TO_COPY = std::min<size_t>(entry.target_len, bufsize);
+            std::memcpy(buf, entry.target.data(), TO_COPY);
+            result = static_cast<ssize_t>(TO_COPY);
+        }
+        g_symlink_cache_lock.unlock();
+        *out_result = result;
+        g_vfs_symlink_hits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    g_symlink_cache_lock.unlock();
+    g_vfs_symlink_misses.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+void symlink_cache_store(const char* path, FSType fs_type, uint64_t dev_id, ssize_t result, const char* target) {
+    if (path == nullptr || !symlink_cacheable_fs(fs_type) || !symlink_cacheable_result(result)) {
+        return;
+    }
+
+    size_t const PATH_LEN = std::strlen(path);
+    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
+        return;
+    }
+
+    size_t target_len = 0;
+    if (result > 0) {
+        if (target == nullptr) {
+            return;
+        }
+        target_len = static_cast<size_t>(result);
+        if (target_len >= MAX_PATH_LEN) {
+            return;
+        }
+    }
+
+    uint64_t const EPOCH = g_metadata_cache_epoch.load(std::memory_order_acquire);
+    uint64_t const HASH = symlink_hash_path(path, PATH_LEN, fs_type, dev_id);
+    uint64_t const USE_STAMP = g_symlink_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto& set = g_symlink_cache.at(HASH & (SYMLINK_CACHE_SET_COUNT - 1));
+
+    g_symlink_cache_lock.lock();
+    SymlinkCacheEntry* victim = &set.ways.front();
+    for (auto& entry : set.ways) {
+        if (entry.valid && entry.epoch == EPOCH && entry.hash == HASH && entry.path_len == PATH_LEN && entry.fs_type == fs_type &&
+            entry.dev_id == dev_id && std::memcmp(entry.path.data(), path, PATH_LEN + 1) == 0) {
+            victim = &entry;
+            break;
+        }
+        if (!entry.valid || entry.epoch != EPOCH) {
+            victim = &entry;
+            break;
+        }
+        if (entry.last_used < victim->last_used) {
+            victim = &entry;
+        }
+    }
+
+    victim->path.fill('\0');
+    victim->target.fill('\0');
+    std::memcpy(victim->path.data(), path, PATH_LEN + 1);
+    if (target_len > 0) {
+        std::memcpy(victim->target.data(), target, target_len);
+        victim->target[target_len] = '\0';
+    }
+    victim->hash = HASH;
+    victim->epoch = EPOCH;
+    victim->last_used = USE_STAMP;
+    victim->dev_id = dev_id;
+    victim->path_len = PATH_LEN;
+    victim->target_len = target_len;
+    victim->result = result;
+    victim->fs_type = fs_type;
+    victim->valid = true;
+    g_vfs_symlink_stores.fetch_add(1, std::memory_order_relaxed);
+    g_symlink_cache_lock.unlock();
+}
 
 auto vfs_destroy_file(File* f) -> int {
     if (f == nullptr) {
@@ -760,6 +1113,14 @@ auto stream_entry_cached_prefix_bytes(const StreamCacheEntry* entry) -> uint64_t
     return best_prefix;
 }
 
+auto stream_detached_ttl_us(const StreamCacheEntry* entry) -> uint64_t {
+    if (entry != nullptr && entry->identity.fs_type != FSType::REMOTE && entry->retain_full_file && entry->freshness.size > 0 &&
+        std::cmp_less_equal(entry->freshness.size, STREAM_LOCAL_SMALL_FILE_RETAIN_MAX)) {
+        return STREAM_LOCAL_SMALL_FILE_DETACHED_TTL_US;
+    }
+    return STREAM_DETACHED_TTL_US;
+}
+
 auto stream_entry_should_keep_detached(const StreamCacheEntry* entry, uint64_t now_us) -> bool {
     if (entry == nullptr || stream_entry_has_readers(entry)) {
         return false;
@@ -767,7 +1128,7 @@ auto stream_entry_should_keep_detached(const StreamCacheEntry* entry, uint64_t n
     if (entry->pinned_detached && entry->retain_full_file && stream_entry_is_fully_cached(entry)) {
         return true;
     }
-    if (!entry->can_reuse_detached || (now_us - entry->last_used_us) > STREAM_DETACHED_TTL_US) {
+    if (!entry->can_reuse_detached || (now_us - entry->last_used_us) > stream_detached_ttl_us(entry)) {
         return false;
     }
 
@@ -1440,9 +1801,17 @@ void cache_notify_register_open_file_impl(File* file) {
     cache_notify_store_snapshot(file, identity, freshness, can_reuse_detached, retain_full_file);
 }
 
-void cache_notify_invalidate_path_impl(const char* vfs_path) { cache_notify_invalidate_path_local(vfs_path); }
+void cache_notify_invalidate_path_impl(const char* vfs_path) {
+    if (vfs_path != nullptr) {
+        metadata_cache_bump_epoch();
+    }
+    cache_notify_invalidate_path_local(vfs_path);
+}
 
 void cache_notify_path_changed_impl(const char* old_vfs_path, const char* new_vfs_path) {
+    if (old_vfs_path != nullptr || new_vfs_path != nullptr) {
+        metadata_cache_bump_epoch();
+    }
     bool old_became_dirty = false;
     bool new_became_dirty = false;
     if (old_vfs_path != nullptr) {
@@ -1518,6 +1887,7 @@ auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t sta
 
     auto* attachment = stream_attach_file(file);
     if (attachment == nullptr || attachment->entry == nullptr) {
+        g_vfs_stream_misses.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
@@ -1532,6 +1902,7 @@ auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t sta
         auto* island = stream_select_island_locked(attachment, OFFSET);
         if (island == nullptr) {
             g_stream_cache_lock.unlock();
+            g_vfs_stream_misses.fetch_add(1, std::memory_order_relaxed);
             break;
         }
 
@@ -1544,6 +1915,8 @@ auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t sta
             stream_trim_island_front_locked(attachment->entry, island);
             stream_enforce_entry_cap_locked(attachment->entry, attachment->desired_offset);
             g_stream_cache_lock.unlock();
+            g_vfs_stream_hits.fetch_add(1, std::memory_order_relaxed);
+            g_vfs_stream_copied_bytes.fetch_add(COPIED, std::memory_order_relaxed);
             total += COPIED;
             continue;
         }
@@ -1576,8 +1949,12 @@ auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t sta
 
         auto chunk = std::make_unique<StreamChunk>();
         chunk->offset = FETCH_OFFSET;
+        g_vfs_stream_backend_reads.fetch_add(1, std::memory_order_relaxed);
         ssize_t const READ_RET = clamp_io_count(
             file->fops->vfs_read(file, chunk->data.data(), STREAM_CHUNK_SIZE, static_cast<size_t>(FETCH_OFFSET)), STREAM_CHUNK_SIZE);
+        if (READ_RET > 0) {
+            g_vfs_stream_backend_bytes.fetch_add(static_cast<uint64_t>(READ_RET), std::memory_order_relaxed);
+        }
 
         g_stream_cache_lock.lock();
         island->producer_active = false;
@@ -2992,36 +3369,8 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
 
         // XFS: resolve symlinks via xfs_readlink
         if (mount->fs_type == FSType::XFS) {
-            size_t mount_len = 0;
-            while (mount->path[mount_len] != '\0') {
-                mount_len++;
-            }
-            const char* fs_path = resolved_buf;
-            if (mount_len == 1 && mount->path[0] == '/') {
-                fs_path = resolved_buf + 1;
-            } else if (resolved_buf[mount_len] == '/') {
-                fs_path = resolved_buf + mount_len + 1;
-            } else if (resolved_buf[mount_len] == '\0') {
-                fs_path = "";
-            } else {
-                fs_path = resolved_buf + mount_len;
-            }
-
-            // Open the path to check if it's a symlink
-            auto* xctx = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
-            auto* f = ker::vfs::xfs::xfs_open_path(fs_path, 0, 0, xctx);
-            if (f == nullptr) {
-                return 0;
-            }
-            if (f->fops == nullptr || f->fops->vfs_readlink == nullptr) {
-                ker::vfs::xfs::get_xfs_fops()->vfs_close(f);
-                delete f;
-                return 0;
-            }
             std::array<char, MAX_PATH_LEN> linkbuf{};
-            ssize_t const LINK_LEN = f->fops->vfs_readlink(f, linkbuf.data(), linkbuf.size() - 1);
-            ker::vfs::xfs::get_xfs_fops()->vfs_close(f);
-            delete f;
+            ssize_t const LINK_LEN = readlink_resolved(resolved_buf, linkbuf.data(), linkbuf.size() - 1);
             if (LINK_LEN <= 0) {
                 return 0;  // Not a symlink or error
             }
@@ -3335,10 +3684,14 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
         vfs_destroy_file(f);
         return TRUNCATE_RET;
     }
+    if ((backend_flags & ker::vfs::O_CREAT) != 0) {
+        metadata_cache_bump_epoch();
+    }
     if ((flags & ker::vfs::O_NO_CACHE) != 0) {
         vfs_cache_notify_path_changed(f->vfs_path, nullptr);
     }
     vfs_cache_notify_register_open_file(f);
+    file_stat_snapshot_refresh(f);
 
     int const FD = vfs_install_open_file(current, f);
     if (FD < 0) {
@@ -3403,6 +3756,9 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
         }
         vfs_put_file(f);
         return cached_result;
+    }
+    if (USE_STREAM_CACHE) {
+        g_vfs_stream_misses.fetch_add(1, std::memory_order_relaxed);
     }
 
     ssize_t const R = clamp_io_count(f->fops->vfs_read(f, buf, count, static_cast<size_t>(f->pos)), count);
@@ -4006,6 +4362,11 @@ auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize
     if (mount == nullptr) {
         return -ENOENT;
     }
+    uint64_t const DEV_ID = mount->dev_id;
+    ssize_t cached_result = 0;
+    if (symlink_cache_lookup(abs_path, mount->fs_type, DEV_ID, buf, bufsize, &cached_result)) {
+        return cached_result;
+    }
 
     if (mount->fs_type == FSType::PROCFS) {
         const char* fsp = strip_mount_prefix(mount, abs_path);
@@ -4038,11 +4399,15 @@ auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize
         auto* xctx = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
         auto* f = ker::vfs::xfs::xfs_open_path(fs_path, 0, 0, xctx);
         if (f == nullptr) {
+            symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -ENOENT, nullptr);
             return -ENOENT;
         }
         ssize_t const RET = ker::vfs::xfs::get_xfs_fops()->vfs_readlink(f, buf, bufsize);
         ker::vfs::xfs::get_xfs_fops()->vfs_close(f);
         delete f;
+        if (RET <= 0 || std::cmp_less(RET, bufsize)) {
+            symlink_cache_store(abs_path, mount->fs_type, DEV_ID, RET, RET > 0 ? buf : nullptr);
+        }
         return RET;
     }
 
@@ -4071,6 +4436,7 @@ auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize
     }
 
     if (mount->fs_type != FSType::TMPFS) {
+        symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -ENOSYS, nullptr);
         return -ENOSYS;
     }
 
@@ -4078,10 +4444,12 @@ auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize
 
     auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, false);
     if (node == nullptr) {
+        symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -ENOENT, nullptr);
         return -ENOENT;
     }
 
     if (node->type != ker::vfs::tmpfs::TmpNodeType::SYMLINK || node->symlink_target == nullptr) {
+        symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -EINVAL, nullptr);
         return -EINVAL;
     }
 
@@ -4091,7 +4459,244 @@ auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize
     }
     size_t const TO_COPY = (len < bufsize) ? len : bufsize;
     std::memcpy(buf, node->symlink_target, TO_COPY);
+    if (TO_COPY == len) {
+        symlink_cache_store(abs_path, mount->fs_type, DEV_ID, static_cast<ssize_t>(TO_COPY), buf);
+    }
     return static_cast<ssize_t>(TO_COPY);
+}
+
+auto realpath_reset_to_task_root(char* resolved, size_t resolved_size, size_t* min_len) -> int {
+    if (resolved == nullptr || min_len == nullptr || resolved_size == 0) {
+        return -EINVAL;
+    }
+
+    const char* root = "/";
+    if (ker::mod::sched::can_query_current_task()) {
+        auto* task = ker::mod::sched::get_current_task();
+        if (task != nullptr && task->root[0] != '\0') {
+            root = task->root.data();
+        }
+    }
+
+    int const COPY_RESULT = copy_path_string(root, resolved, resolved_size);
+    if (COPY_RESULT < 0) {
+        return COPY_RESULT;
+    }
+
+    *min_len = std::strlen(resolved);
+    if (*min_len == 0) {
+        return copy_path_string("/", resolved, resolved_size);
+    }
+    if (*min_len == 1) {
+        *min_len = 1;
+    }
+    return 0;
+}
+
+auto realpath_append_component(char* resolved, size_t resolved_size, const char* component, size_t component_len) -> int {
+    if (resolved == nullptr || component == nullptr) {
+        return -EINVAL;
+    }
+    if (component_len == 0) {
+        return 0;
+    }
+
+    size_t const BASE_LEN = std::strlen(resolved);
+    bool const NEED_SLASH = BASE_LEN != 1 || resolved[0] != '/';
+    size_t const TOTAL = BASE_LEN + (NEED_SLASH ? 1 : 0) + component_len + 1;
+    if (TOTAL > resolved_size) {
+        return -ENAMETOOLONG;
+    }
+
+    size_t pos = BASE_LEN;
+    if (NEED_SLASH) {
+        resolved[pos++] = '/';
+    }
+    std::memcpy(resolved + pos, component, component_len);
+    resolved[pos + component_len] = '\0';
+    return 0;
+}
+
+void realpath_pop_component(char* resolved, size_t min_len) {
+    if (resolved == nullptr) {
+        return;
+    }
+
+    size_t len = std::strlen(resolved);
+    if (len <= min_len) {
+        return;
+    }
+
+    char* slash = resolved + len;
+    while (slash > resolved && *slash != '/') {
+        --slash;
+    }
+
+    if (slash <= resolved + min_len) {
+        resolved[min_len] = '\0';
+        return;
+    }
+    if (slash == resolved) {
+        resolved[1] = '\0';
+        return;
+    }
+    *slash = '\0';
+}
+
+auto realpath_set_pending(const char* first, size_t first_len, const char* rest, char* pending, size_t pending_size) -> int {
+    if (pending == nullptr) {
+        return -EINVAL;
+    }
+
+    while (first != nullptr && first_len > 0 && *first == '/') {
+        ++first;
+        --first_len;
+    }
+    while (rest != nullptr && *rest == '/') {
+        ++rest;
+    }
+
+    size_t const REST_LEN = rest != nullptr ? std::strlen(rest) : 0;
+    size_t const SEP_LEN = (first_len > 0 && REST_LEN > 0) ? 1 : 0;
+    if (first_len + SEP_LEN + REST_LEN + 1 > pending_size) {
+        return -ENAMETOOLONG;
+    }
+
+    std::array<char, MAX_PATH_LEN> rest_copy{};
+    if (REST_LEN > 0) {
+        if (REST_LEN >= rest_copy.size()) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(rest_copy.data(), rest, REST_LEN);
+        rest_copy[REST_LEN] = '\0';
+    }
+
+    size_t pos = 0;
+    if (first_len > 0) {
+        std::memcpy(pending + pos, first, first_len);
+        pos += first_len;
+    }
+    if (SEP_LEN != 0) {
+        pending[pos++] = '/';
+    }
+    if (REST_LEN > 0) {
+        std::memcpy(pending + pos, rest_copy.data(), REST_LEN);
+        pos += REST_LEN;
+    }
+    pending[pos] = '\0';
+    return 0;
+}
+
+auto realpath_resolve_visible_path(const char* path, char* resolved, size_t resolved_size) -> int {
+    if (path == nullptr || resolved == nullptr || resolved_size == 0) {
+        return -EINVAL;
+    }
+
+    std::array<char, MAX_PATH_LEN> visible_abs{};
+    int ret = make_absolute(path, visible_abs.data(), visible_abs.size());
+    if (ret < 0) {
+        return ret;
+    }
+
+    std::array<char, MAX_PATH_LEN> logical_abs{};
+    ret = strip_current_task_root_prefix(visible_abs.data(), logical_abs.data(), logical_abs.size());
+    if (ret < 0) {
+        return ret;
+    }
+
+    size_t min_len = 1;
+    ret = realpath_reset_to_task_root(resolved, resolved_size, &min_len);
+    if (ret < 0) {
+        return ret;
+    }
+
+    std::array<char, MAX_PATH_LEN> pending{};
+    const char* initial = logical_abs.data();
+    while (*initial == '/') {
+        ++initial;
+    }
+    ret = copy_path_string(initial, pending.data(), pending.size());
+    if (ret < 0) {
+        return ret;
+    }
+
+    size_t pos = 0;
+    int symlink_depth = 0;
+    while (true) {
+        while (pending[pos] == '/') {
+            ++pos;
+        }
+        if (pending[pos] == '\0') {
+            break;
+        }
+
+        const char* component = pending.data() + pos;
+        size_t component_len = 0;
+        while (component[component_len] != '\0' && component[component_len] != '/') {
+            ++component_len;
+        }
+        pos += component_len;
+        const char* rest = pending.data() + pos;
+        while (*rest == '/') {
+            ++rest;
+        }
+
+        if (component_len == 1 && component[0] == '.') {
+            continue;
+        }
+        if (component_len == 2 && component[0] == '.' && component[1] == '.') {
+            realpath_pop_component(resolved, min_len);
+            continue;
+        }
+
+        ret = realpath_append_component(resolved, resolved_size, component, component_len);
+        if (ret < 0) {
+            return ret;
+        }
+
+        std::array<char, MAX_PATH_LEN> linkbuf{};
+        ssize_t const LINK_LEN = readlink_resolved(resolved, linkbuf.data(), linkbuf.size() - 1);
+        if (LINK_LEN == -EINVAL || LINK_LEN == -ENOSYS) {
+            if (*rest != '\0') {
+                Stat st{};
+                ret = vfs_stat_resolved(resolved, &st);
+                if (ret < 0) {
+                    return ret;
+                }
+                if ((st.st_mode & S_IFMT) != S_IFDIR) {
+                    return -ENOTDIR;
+                }
+            }
+            continue;
+        }
+        if (LINK_LEN < 0) {
+            return static_cast<int>(LINK_LEN);
+        }
+        if (std::cmp_greater_equal(LINK_LEN, linkbuf.size())) {
+            return -ENAMETOOLONG;
+        }
+        linkbuf[static_cast<size_t>(LINK_LEN)] = '\0';
+        if (++symlink_depth > MAX_SYMLINK_DEPTH) {
+            return -ELOOP;
+        }
+
+        if (linkbuf[0] == '/') {
+            ret = realpath_reset_to_task_root(resolved, resolved_size, &min_len);
+            if (ret < 0) {
+                return ret;
+            }
+        } else {
+            realpath_pop_component(resolved, min_len);
+        }
+
+        ret = realpath_set_pending(linkbuf.data(), static_cast<size_t>(LINK_LEN), rest, pending.data(), pending.size());
+        if (ret < 0) {
+            return ret;
+        }
+        pos = 0;
+    }
+
+    return 0;
 }
 
 }  // namespace
@@ -4109,6 +4714,25 @@ void vfs_cache_notify_file_changed(File* file) { cache_notify_file_changed_impl(
 auto vfs_cache_notify_file_dirty(File* file) -> bool { return cache_notify_file_dirty_impl(file); }
 
 void vfs_cache_notify_acknowledge_file(File* file) { cache_notify_acknowledge_file_impl(file); }
+
+auto vfs_cache_epoch_snapshot() -> uint64_t { return g_metadata_cache_epoch.load(std::memory_order_acquire); }
+
+void vfs_get_cache_perf_snapshot(VfsCachePerfSnapshot& out) {
+    out.metadata_hits = g_vfs_metadata_hits.load(std::memory_order_relaxed);
+    out.metadata_misses = g_vfs_metadata_misses.load(std::memory_order_relaxed);
+    out.metadata_stores = g_vfs_metadata_stores.load(std::memory_order_relaxed);
+    out.symlink_hits = g_vfs_symlink_hits.load(std::memory_order_relaxed);
+    out.symlink_misses = g_vfs_symlink_misses.load(std::memory_order_relaxed);
+    out.symlink_stores = g_vfs_symlink_stores.load(std::memory_order_relaxed);
+    out.stream_hits = g_vfs_stream_hits.load(std::memory_order_relaxed);
+    out.stream_misses = g_vfs_stream_misses.load(std::memory_order_relaxed);
+    out.stream_backend_reads = g_vfs_stream_backend_reads.load(std::memory_order_relaxed);
+    out.stream_backend_bytes = g_vfs_stream_backend_bytes.load(std::memory_order_relaxed);
+    out.stream_copied_bytes = g_vfs_stream_copied_bytes.load(std::memory_order_relaxed);
+    out.fstat_snapshot_hits = g_vfs_fstat_snapshot_hits.load(std::memory_order_relaxed);
+    out.fstat_snapshot_misses = g_vfs_fstat_snapshot_misses.load(std::memory_order_relaxed);
+    out.fstat_snapshot_stores = g_vfs_fstat_snapshot_stores.load(std::memory_order_relaxed);
+}
 
 auto vfs_readlink_resolved(const char* path, char* buf, size_t bufsize) -> ssize_t {
     if (path == nullptr || buf == nullptr || bufsize == 0) {
@@ -4129,6 +4753,62 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
     }
 
     return readlink_resolved(abs_path.data(), buf, bufsize);
+}
+
+auto vfs_realpath(const char* path, char* buf, size_t bufsize) -> int {
+    if (path == nullptr || buf == nullptr || bufsize == 0) {
+        return -EINVAL;
+    }
+
+    std::array<char, MAX_PATH_LEN> local_backing_path{};
+    int ret = resolve_task_path_raw_impl(path, local_backing_path.data(), local_backing_path.size(), false);
+    if (ret < 0) {
+        return ret;
+    }
+
+    std::array<char, MAX_PATH_LEN> backing_path{};
+    ret = resolve_task_path_raw(path, backing_path.data(), backing_path.size());
+    if (ret < 0) {
+        return ret;
+    }
+
+    // If WKI routing rewrites the path to a backing namespace, keep userspace on
+    // the generic resolver so realpath() returns process-visible paths.
+    if (std::strcmp(local_backing_path.data(), backing_path.data()) != 0) {
+        return -ENOSYS;
+    }
+
+    ensure_wki_host_root_mount(backing_path.data());
+
+    std::array<char, MAX_PATH_LEN> resolved{};
+    ret = realpath_resolve_visible_path(path, resolved.data(), resolved.size());
+    if (ret < 0) {
+        return ret;
+    }
+
+    Stat st{};
+    ret = vfs_stat_resolved(resolved.data(), &st);
+    if (ret < 0) {
+        return ret;
+    }
+
+    std::array<char, MAX_PATH_LEN> visible_path{};
+    ret = strip_current_task_root_prefix(resolved.data(), visible_path.data(), visible_path.size());
+    if (ret < 0) {
+        return ret;
+    }
+
+    ret = canonicalize_path(visible_path.data(), visible_path.size());
+    if (ret < 0) {
+        return ret;
+    }
+
+    size_t const LEN = std::strlen(visible_path.data());
+    if (LEN + 1 > bufsize) {
+        return -ERANGE;
+    }
+    std::memcpy(buf, visible_path.data(), LEN + 1);
+    return 0;
 }
 
 auto vfs_mkdir(const char* path, int mode) -> int {
@@ -4296,17 +4976,28 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     log_loader_path_event("stat-mount-found", path, pathBuffer, mount, 0);
 
     const char* fs_path = strip_mount_prefix(mount, pathBuffer);
+    if (!is_wki_entry) {
+        int const CACHED_RESULT =
+            metadata_cache_lookup(pathBuffer, mount->fs_type, mount->dev_id, follow_final_symlink, REQUIRE_DIRECTORY, statbuf);
+        if (CACHED_RESULT != -EAGAIN) {
+            log_loader_path_event(CACHED_RESULT == 0 ? "stat-cache-hit" : "stat-cache-negative-hit", path, pathBuffer, mount,
+                                  CACHED_RESULT);
+            return CACHED_RESULT;
+        }
+    }
 
     // Initialize stat buffer
     std::memset(statbuf, 0, sizeof(ker::vfs::Stat));
 
     int result = -ENOSYS;
+    bool synthetic_stat = false;
 
     switch (mount->fs_type) {
         case FSType::TMPFS: {
             auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, false);
             if (node == nullptr) {
-                return -ENOENT;
+                result = -ENOENT;
+                break;
             }
             // Access node fields immediately while potentially still holding any implicit lock
             statbuf->st_dev = mount->dev_id;
@@ -4398,6 +5089,7 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     // backing XFS filesystem has no such directory entry.
     if (result != 0) {
         result = fill_synthetic_mount_dir_stat(pathBuffer, statbuf);
+        synthetic_stat = result == 0;
     }
 
     if (result == 0 && REQUIRE_DIRECTORY && (statbuf->st_mode & S_IFMT) != S_IFDIR) {
@@ -4415,6 +5107,10 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
         statbuf->st_mode |= S_WOSLINK;
     }
 
+    if (!is_wki_entry && !synthetic_stat) {
+        metadata_cache_store(pathBuffer, mount->fs_type, mount->dev_id, follow_final_symlink, REQUIRE_DIRECTORY, result, statbuf);
+    }
+
     log_loader_path_event(result == 0 ? "stat-ok" : "stat-failed", path, pathBuffer, mount, result);
 
     return result;
@@ -4429,6 +5125,10 @@ auto vfs_stat_resolved(const char* path, Stat* statbuf) -> int { return vfs_stat
 auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
     if (file == nullptr || statbuf == nullptr) {
         return -EINVAL;
+    }
+
+    if (file_stat_snapshot_lookup(file, statbuf)) {
+        return 0;
     }
 
     std::memset(statbuf, 0, sizeof(Stat));
@@ -4991,10 +5691,52 @@ auto vfs_pread(int fd, void* buf, size_t count, off_t offset) -> ssize_t {
         vfs_put_file(f);
         return cached_result;
     }
+    if (USE_STREAM_CACHE) {
+        g_vfs_stream_misses.fetch_add(1, std::memory_order_relaxed);
+    }
 
     auto result = clamp_io_count(f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset)), count);
     f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
     vfs_put_file(f);
+    return result;
+}
+
+auto vfs_pread_file(File* f, void* buf, size_t count, off_t offset) -> ssize_t {
+    if (f == nullptr) {
+        return -EBADF;
+    }
+    if (f->fops == nullptr || f->fops->vfs_read == nullptr) {
+        return -ENOSYS;
+    }
+
+    f->positional_read_depth.fetch_add(1, std::memory_order_acq_rel);
+    bool const USE_STREAM_CACHE = (f->open_flags & ker::vfs::O_NO_CACHE) == 0;
+    ssize_t cached_result = 0;
+    if (USE_STREAM_CACHE && vfs_stream_cache_try_read(f, buf, count, static_cast<uint64_t>(offset), nullptr, &cached_result)) {
+        cached_result = clamp_io_count(cached_result, count);
+        f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
+        return cached_result;
+    }
+    if (USE_STREAM_CACHE) {
+        g_vfs_stream_misses.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    auto result = clamp_io_count(f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset)), count);
+    f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
+    return result;
+}
+
+auto vfs_pread_file_direct(File* f, void* buf, size_t count, off_t offset) -> ssize_t {
+    if (f == nullptr) {
+        return -EBADF;
+    }
+    if (f->fops == nullptr || f->fops->vfs_read == nullptr) {
+        return -ENOSYS;
+    }
+
+    f->positional_read_depth.fetch_add(1, std::memory_order_acq_rel);
+    auto result = clamp_io_count(f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset)), count);
+    f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
     return result;
 }
 
@@ -6147,13 +6889,7 @@ auto pipe_finish_direct_write(PipeState* st, size_t bytes_read) -> bool {
 }
 
 auto file_pread_direct(File* file, void* buf, size_t count, off_t offset) -> ssize_t {
-    if (file == nullptr || file->fops == nullptr || file->fops->vfs_read == nullptr) {
-        return -ENOSYS;
-    }
-    file->positional_read_depth.fetch_add(1, std::memory_order_acq_rel);
-    ssize_t const RESULT = clamp_io_count(file->fops->vfs_read(file, buf, count, static_cast<size_t>(offset)), count);
-    file->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
-    return RESULT;
+    return vfs_pread_file_direct(file, buf, count, offset);
 }
 
 auto vfs_sendfile_to_pipe(File* outfile, File* infile, off_t* source_offset, size_t count) -> ssize_t {
@@ -7401,10 +8137,14 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
         f->dir_fs_count = static_cast<size_t>(-1);
         f->open_flags = flags;
         f->fd_flags = 0;
+        if ((backend_flags & ker::vfs::O_CREAT) != 0) {
+            metadata_cache_bump_epoch();
+        }
         if ((flags & ker::vfs::O_NO_CACHE) != 0) {
             vfs_cache_notify_path_changed(f->vfs_path, nullptr);
         }
         vfs_cache_notify_register_open_file(f);
+        file_stat_snapshot_refresh(f);
     }
 
     return f;

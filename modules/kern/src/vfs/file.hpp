@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vfs/file_operations.hpp>
+#include <vfs/stat.hpp>
 
 namespace ker::vfs {
 
@@ -60,6 +61,13 @@ struct File {
 
     // Optional VFS-core cache-notify attachment for O_NOTIFY_CACHE_CHANGE.
     void* cache_notify_attachment = nullptr;
+
+    // Immutable open-time stat snapshot.  VFS uses this only while the global
+    // metadata epoch still matches, so path/file mutations cannot observe stale
+    // fstat data.
+    Stat stat_cache{};
+    uint64_t stat_cache_epoch = 0;
+    bool stat_cache_valid = false;
 
     // Hint for filesystem backends that this file is currently being serviced
     // through vfs_pread(), so sequential prefetch/read-ahead should be avoided.

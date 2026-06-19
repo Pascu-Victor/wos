@@ -55,6 +55,7 @@ enum class ops : uint64_t {
     FSTATVFS,              // 47
     LSTAT,                 // 48
     SYNC,                  // 49
+    REALPATH,              // 50
 };
 
 }  // namespace ker::abi::vfs

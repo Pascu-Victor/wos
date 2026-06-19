@@ -11,16 +11,19 @@
 #include "xfs_dir2.hpp"
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
+#include <platform/sys/spinlock.hpp>
 #include <util/crc32c.hpp>
 #include <utility>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_alloc.hpp>
 #include <vfs/fs/xfs/xfs_bmap.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
+#include <vfs/vfs.hpp>
 
 #include "net/endian.hpp"
 #include "vfs/fs/xfs/xfs_format.hpp"
@@ -115,6 +118,144 @@ void fill_dir_entry(const XfsMountContext* ctx, const XfsDir2DataEntry* dep, Xfs
     entry->namelen = dep->namelen;
     __builtin_memcpy(entry->name.data(), xfs_dir2_data_entry_name(dep), dep->namelen);
     entry->name.at(dep->namelen) = '\0';
+}
+
+constexpr size_t XFS_DENTRY_CACHE_SET_COUNT = 1024;
+constexpr size_t XFS_DENTRY_CACHE_WAYS = 4;
+static_assert((XFS_DENTRY_CACHE_SET_COUNT & (XFS_DENTRY_CACHE_SET_COUNT - 1)) == 0);
+
+struct XfsDentryCacheEntry {
+    std::array<char, 256> name{};
+    XfsDirEntry entry{};
+    XfsMountContext* mount{};
+    xfs_ino_t parent_ino{};
+    uint64_t hash{};
+    uint64_t vfs_epoch{};
+    uint64_t dir_generation{};
+    uint64_t last_used{};
+    uint16_t namelen{};
+    int result{};
+    bool valid{};
+};
+
+struct XfsDentryCacheSet {
+    std::array<XfsDentryCacheEntry, XFS_DENTRY_CACHE_WAYS> ways{};
+};
+
+std::array<XfsDentryCacheSet, XFS_DENTRY_CACHE_SET_COUNT> g_xfs_dentry_cache{};
+ker::mod::sys::Spinlock g_xfs_dentry_cache_lock;
+std::atomic<uint64_t> g_xfs_dentry_cache_clock{0};
+std::atomic<uint64_t> g_xfs_dentry_generation{1};
+std::atomic<uint64_t> g_xfs_dentry_hits{0};
+std::atomic<uint64_t> g_xfs_dentry_misses{0};
+std::atomic<uint64_t> g_xfs_dentry_stores{0};
+std::atomic<uint64_t> g_xfs_dentry_invalidations{0};
+
+auto xfs_dentry_hash_name(XfsMountContext* mount, xfs_ino_t parent_ino, const char* name, uint16_t namelen) -> uint64_t {
+    uint64_t hash = 1469598103934665603ULL;
+    auto const MOUNT_VALUE = reinterpret_cast<uintptr_t>(mount);
+    for (int shift = 0; shift < 64; shift += 8) {
+        hash ^= static_cast<uint8_t>((MOUNT_VALUE >> shift) & 0xffU);
+        hash *= 1099511628211ULL;
+    }
+    for (int shift = 0; shift < 64; shift += 8) {
+        hash ^= static_cast<uint8_t>((parent_ino >> shift) & 0xffU);
+        hash *= 1099511628211ULL;
+    }
+    for (uint16_t i = 0; i < namelen; ++i) {
+        hash ^= static_cast<unsigned char>(name[i]);
+        hash *= 1099511628211ULL;
+    }
+    hash ^= namelen;
+    hash *= 1099511628211ULL;
+    return hash == 0 ? 1 : hash;
+}
+
+auto xfs_dentry_cache_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry, int* result) -> bool {
+    if (dp == nullptr || dp->mount == nullptr || name == nullptr || entry == nullptr || result == nullptr || namelen >= 256) {
+        return false;
+    }
+
+    uint64_t const VFS_EPOCH = ker::vfs::vfs_cache_epoch_snapshot();
+    uint64_t const DIR_GENERATION = g_xfs_dentry_generation.load(std::memory_order_acquire);
+    uint64_t const HASH = xfs_dentry_hash_name(dp->mount, dp->ino, name, namelen);
+    auto& set = g_xfs_dentry_cache.at(HASH & (XFS_DENTRY_CACHE_SET_COUNT - 1));
+
+    uint64_t const IRQF = g_xfs_dentry_cache_lock.lock_irqsave();
+    for (auto& candidate : set.ways) {
+        if (!candidate.valid || candidate.hash != HASH || candidate.mount != dp->mount || candidate.parent_ino != dp->ino ||
+            candidate.namelen != namelen || candidate.vfs_epoch != VFS_EPOCH || candidate.dir_generation != DIR_GENERATION) {
+            continue;
+        }
+        if (std::memcmp(candidate.name.data(), name, namelen) != 0) {
+            continue;
+        }
+
+        candidate.last_used = g_xfs_dentry_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+        *result = candidate.result;
+        if (candidate.result == 0) {
+            *entry = candidate.entry;
+        }
+        g_xfs_dentry_cache_lock.unlock_irqrestore(IRQF);
+        g_xfs_dentry_hits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    g_xfs_dentry_cache_lock.unlock_irqrestore(IRQF);
+    g_xfs_dentry_misses.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+void xfs_dentry_cache_store(XfsInode* dp, const char* name, uint16_t namelen, int result, const XfsDirEntry* entry) {
+    if (dp == nullptr || dp->mount == nullptr || name == nullptr || namelen >= 256 || (result != 0 && result != -ENOENT)) {
+        return;
+    }
+    if (result == 0 && entry == nullptr) {
+        return;
+    }
+
+    uint64_t const VFS_EPOCH = ker::vfs::vfs_cache_epoch_snapshot();
+    uint64_t const DIR_GENERATION = g_xfs_dentry_generation.load(std::memory_order_acquire);
+    uint64_t const HASH = xfs_dentry_hash_name(dp->mount, dp->ino, name, namelen);
+    uint64_t const USE_STAMP = g_xfs_dentry_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto& set = g_xfs_dentry_cache.at(HASH & (XFS_DENTRY_CACHE_SET_COUNT - 1));
+
+    uint64_t const IRQF = g_xfs_dentry_cache_lock.lock_irqsave();
+    XfsDentryCacheEntry* victim = &set.ways.front();
+    for (auto& candidate : set.ways) {
+        if (candidate.valid && candidate.hash == HASH && candidate.mount == dp->mount && candidate.parent_ino == dp->ino &&
+            candidate.namelen == namelen && candidate.vfs_epoch == VFS_EPOCH && candidate.dir_generation == DIR_GENERATION &&
+            std::memcmp(candidate.name.data(), name, namelen) == 0) {
+            victim = &candidate;
+            break;
+        }
+        if (!candidate.valid || candidate.vfs_epoch != VFS_EPOCH || candidate.dir_generation != DIR_GENERATION) {
+            victim = &candidate;
+            break;
+        }
+        if (candidate.last_used < victim->last_used) {
+            victim = &candidate;
+        }
+    }
+
+    victim->name.fill('\0');
+    std::memcpy(victim->name.data(), name, namelen);
+    victim->mount = dp->mount;
+    victim->parent_ino = dp->ino;
+    victim->hash = HASH;
+    victim->vfs_epoch = VFS_EPOCH;
+    victim->dir_generation = DIR_GENERATION;
+    victim->last_used = USE_STAMP;
+    victim->namelen = namelen;
+    victim->result = result;
+    victim->entry = (result == 0) ? *entry : XfsDirEntry{};
+    victim->valid = true;
+    g_xfs_dentry_cache_lock.unlock_irqrestore(IRQF);
+    g_xfs_dentry_stores.fetch_add(1, std::memory_order_relaxed);
+}
+
+void xfs_dentry_cache_invalidate() {
+    g_xfs_dentry_generation.fetch_add(1, std::memory_order_acq_rel);
+    g_xfs_dentry_invalidations.fetch_add(1, std::memory_order_relaxed);
 }
 
 // Get directory block number from dataptr
@@ -808,21 +949,33 @@ auto xfs_dir_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntr
     mod::dbg::log("[xfs] dir_lookup: ino=%lu fmt=%d size=%lu name=%.*s", static_cast<unsigned long>(dp->ino), dp->data_fork.format,
                   static_cast<unsigned long>(dp->size), static_cast<int>(namelen), name);
 #endif
+    int cached_result = 0;
+    if (xfs_dentry_cache_lookup(dp, name, namelen, entry, &cached_result)) {
+        return cached_result;
+    }
+
+    int result = 0;
     switch (dp->data_fork.format) {
         case XFS_DINODE_FMT_LOCAL:
-            return dir2_sf_lookup(dp, name, namelen, entry);
+            result = dir2_sf_lookup(dp, name, namelen, entry);
+            break;
 
         case XFS_DINODE_FMT_EXTENTS:
         case XFS_DINODE_FMT_BTREE: {
             if (dir2_is_single_block_dir(dp)) {
-                return dir2_block_lookup(dp, name, namelen, entry);
+                result = dir2_block_lookup(dp, name, namelen, entry);
+            } else {
+                result = dir2_leaf_node_lookup(dp, name, namelen, entry);
             }
-            return dir2_leaf_node_lookup(dp, name, namelen, entry);
+            break;
         }
 
         default:
-            return -EINVAL;
+            result = -EINVAL;
+            break;
     }
+    xfs_dentry_cache_store(dp, name, namelen, result, entry);
+    return result;
 }
 
 auto xfs_dir_iterate(XfsInode* dp, XfsDirIterFn fn, void* ctx) -> int {
@@ -2383,22 +2536,28 @@ auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
                     return rc;
                 }
                 // Now it's a block-format directory; add the new entry there.
-                return dir2_block_addname(dp, name, namelen, ino, ftype, tp);
+                rc = dir2_block_addname(dp, name, namelen, ino, ftype, tp);
             }
-            return rc;
+            break;
         }
 
         case XFS_DINODE_FMT_EXTENTS:
         case XFS_DINODE_FMT_BTREE: {
             if (dir2_is_single_block_dir(dp)) {
-                return dir2_block_addname(dp, name, namelen, ino, ftype, tp);
+                rc = dir2_block_addname(dp, name, namelen, ino, ftype, tp);
+            } else {
+                rc = dir2_leaf_node_addname(dp, name, namelen, ino, ftype, tp);
             }
-            return dir2_leaf_node_addname(dp, name, namelen, ino, ftype, tp);
+            break;
         }
 
         default:
             return -EINVAL;
     }
+    if (rc == 0) {
+        xfs_dentry_cache_invalidate();
+    }
+    return rc;
 }
 
 // Remove a name from a directory.  Dispatches to the appropriate format handler.
@@ -2410,22 +2569,99 @@ auto xfs_dir_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTra
         return -ENOTDIR;
     }
 
+    int rc = 0;
     switch (dp->data_fork.format) {
         case XFS_DINODE_FMT_LOCAL: {
-            return dir2_sf_removename(dp, name, namelen, tp);
+            rc = dir2_sf_removename(dp, name, namelen, tp);
+            break;
         }
 
         case XFS_DINODE_FMT_EXTENTS:
         case XFS_DINODE_FMT_BTREE: {
             if (dir2_is_single_block_dir(dp)) {
-                return dir2_block_removename(dp, name, namelen, tp);
+                rc = dir2_block_removename(dp, name, namelen, tp);
+            } else {
+                rc = dir2_leaf_node_removename(dp, name, namelen, tp);
             }
-            return dir2_leaf_node_removename(dp, name, namelen, tp);
+            break;
         }
 
         default:
             return -EINVAL;
     }
+    if (rc == 0) {
+        xfs_dentry_cache_invalidate();
+    }
+    return rc;
 }
+
+void xfs_dentry_cache_stats(XfsDentryCacheStats& out) {
+    out.hits = g_xfs_dentry_hits.load(std::memory_order_relaxed);
+    out.misses = g_xfs_dentry_misses.load(std::memory_order_relaxed);
+    out.stores = g_xfs_dentry_stores.load(std::memory_order_relaxed);
+    out.invalidations = g_xfs_dentry_invalidations.load(std::memory_order_relaxed);
+}
+
+#ifdef WOS_SELFTEST
+auto xfs_selftest_dentry_cache_shortform() -> bool {
+    XfsMountContext mount{};
+    mount.inode_size = 512;
+    mount.feat_incompat = XFS_SB_FEAT_INCOMPAT_FTYPE;
+
+    std::array<uint8_t, 32> data{};
+    auto* hdr = reinterpret_cast<XfsDir2SfHdr*>(data.data());
+    hdr->count = 1;
+    hdr->i8count = 0;
+    hdr->parent.at(3) = 7;
+
+    uint8_t* p = data.data() + xfs_dir2_sf_hdr_size(hdr);
+    auto* sfep = reinterpret_cast<XfsDir2SfEntry*>(p);
+    sfep->namelen = 3;
+    sfep->offset.at(0) = 0;
+    sfep->offset.at(1) = 1;
+    std::memcpy(xfs_dir2_sf_entry_name(sfep), "foo", 3);
+    uint8_t* ino_ptr = xfs_dir2_sf_entry_name(sfep) + 3;
+    *ino_ptr++ = XFS_DIR3_FT_REG_FILE;
+    ino_ptr[0] = 0;
+    ino_ptr[1] = 0;
+    ino_ptr[2] = 0;
+    ino_ptr[3] = 42;
+
+    XfsInode dir{};
+    dir.ino = 100;
+    dir.mount = &mount;
+    dir.mode = 0040755;
+    dir.data_fork.format = XFS_DINODE_FMT_LOCAL;
+    dir.data_fork.local.data = data.data();
+    dir.data_fork.local.size = static_cast<size_t>((ino_ptr + 4) - data.data());
+    dir.size = dir.data_fork.local.size;
+
+    XfsDentryCacheStats before{};
+    xfs_dentry_cache_stats(before);
+
+    XfsDirEntry entry{};
+    if (xfs_dir_lookup(&dir, "foo", 3, &entry) != 0 || entry.ino != 42 || entry.ftype != XFS_DIR3_FT_REG_FILE) {
+        return false;
+    }
+    if (xfs_dir_lookup(&dir, "foo", 3, &entry) != 0 || entry.ino != 42) {
+        return false;
+    }
+
+    XfsDentryCacheStats after_hit{};
+    xfs_dentry_cache_stats(after_hit);
+    if (after_hit.hits <= before.hits || after_hit.stores <= before.stores) {
+        return false;
+    }
+
+    xfs_dentry_cache_invalidate();
+    if (xfs_dir_lookup(&dir, "foo", 3, &entry) != 0) {
+        return false;
+    }
+
+    XfsDentryCacheStats after_invalidate{};
+    xfs_dentry_cache_stats(after_invalidate);
+    return after_invalidate.misses > after_hit.misses && after_invalidate.invalidations > after_hit.invalidations;
+}
+#endif
 
 }  // namespace ker::vfs::xfs

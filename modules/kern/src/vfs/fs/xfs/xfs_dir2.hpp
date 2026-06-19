@@ -78,6 +78,19 @@ auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
 // Supports shortform, block-format, and leaf/node directories.
 auto xfs_dir_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTransaction* tp) -> int;
 
+struct XfsDentryCacheStats {
+    uint64_t hits{};
+    uint64_t misses{};
+    uint64_t stores{};
+    uint64_t invalidations{};
+};
+
+void xfs_dentry_cache_stats(XfsDentryCacheStats& out);
+
+#ifdef WOS_SELFTEST
+auto xfs_selftest_dentry_cache_shortform() -> bool;
+#endif
+
 // ============================================================================
 // Hash function
 // ============================================================================

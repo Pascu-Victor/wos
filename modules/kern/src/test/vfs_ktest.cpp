@@ -42,6 +42,167 @@ KTEST(VFS, CreateAndStat) {
     ker::vfs::vfs_unlink("/tmp/ktest_create");
 }
 
+KTEST(VFS, MetadataCacheInvalidatesPathMutation) {
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_meta_cache";
+    constexpr const char* RENAMED = "/tmp/ktest_meta_cache_renamed";
+    ker::vfs::vfs_unlink(PATH);
+    ker::vfs::vfs_unlink(RENAMED);
+
+    ker::vfs::Stat st{};
+    KEXPECT_NE(ker::vfs::vfs_stat(PATH, &st), 0);
+    KEXPECT_NE(ker::vfs::vfs_stat(PATH, &st), 0);
+
+    ker::vfs::File* f = ker::vfs::vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(f, nullptr);
+    ker::vfs::tmpfs::tmpfs_fops_close(f);
+
+    KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
+    KEXPECT_TRUE((st.st_mode & ker::vfs::S_IFREG) != 0U);
+    KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
+
+    KEXPECT_EQ(ker::vfs::vfs_rename(PATH, RENAMED), 0);
+    KEXPECT_NE(ker::vfs::vfs_stat(PATH, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_stat(RENAMED, &st), 0);
+
+    KEXPECT_EQ(ker::vfs::vfs_unlink(RENAMED), 0);
+    KEXPECT_NE(ker::vfs::vfs_stat(RENAMED, &st), 0);
+}
+
+KTEST(VFS, MetadataCacheRepeatedStatRecordsHit) {
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_meta_counter";
+    ker::vfs::vfs_unlink(PATH);
+
+    ker::vfs::File* f = ker::vfs::vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(f, nullptr);
+    ker::vfs::vfs_put_file(f);
+
+    ker::vfs::VfsCachePerfSnapshot before{};
+    ker::vfs::vfs_get_cache_perf_snapshot(before);
+
+    ker::vfs::Stat st{};
+    KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
+
+    ker::vfs::VfsCachePerfSnapshot after{};
+    ker::vfs::vfs_get_cache_perf_snapshot(after);
+    KEXPECT_TRUE(after.metadata_stores > before.metadata_stores);
+    KEXPECT_TRUE(after.metadata_hits > before.metadata_hits);
+
+    KEXPECT_EQ(ker::vfs::vfs_unlink(PATH), 0);
+}
+
+KTEST(VFS, OpenFileFstatSnapshotHitsAndInvalidates) {
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_fstat_snapshot";
+    constexpr char DATA[] = "snapshot";
+    ker::vfs::vfs_unlink(PATH);
+
+    ker::vfs::File* wf = ker::vfs::vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(wf, nullptr);
+    KREQUIRE_NE(wf->fops, nullptr);
+    KREQUIRE_NE(wf->fops->vfs_write, nullptr);
+    KEXPECT_EQ(wf->fops->vfs_write(wf, DATA, sizeof(DATA) - 1, 0), static_cast<ssize_t>(sizeof(DATA) - 1));
+    ker::vfs::vfs_put_file(wf);
+
+    ker::vfs::VfsCachePerfSnapshot before{};
+    ker::vfs::vfs_get_cache_perf_snapshot(before);
+
+    ker::vfs::File* rf = ker::vfs::vfs_open_file(PATH, 0, 0);
+    KREQUIRE_NE(rf, nullptr);
+
+    ker::vfs::Stat st{};
+    KEXPECT_EQ(ker::vfs::vfs_fstat_file(rf, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_fstat_file(rf, &st), 0);
+    KEXPECT_EQ(st.st_size, static_cast<off_t>(sizeof(DATA) - 1));
+
+    ker::vfs::VfsCachePerfSnapshot after_hits{};
+    ker::vfs::vfs_get_cache_perf_snapshot(after_hits);
+    KEXPECT_TRUE(after_hits.fstat_snapshot_stores > before.fstat_snapshot_stores);
+    KEXPECT_TRUE(after_hits.fstat_snapshot_hits >= before.fstat_snapshot_hits + 2);
+
+    ker::vfs::vfs_cache_notify_file_changed(rf);
+    KEXPECT_EQ(ker::vfs::vfs_fstat_file(rf, &st), 0);
+
+    ker::vfs::VfsCachePerfSnapshot after_invalidate{};
+    ker::vfs::vfs_get_cache_perf_snapshot(after_invalidate);
+    KEXPECT_TRUE(after_invalidate.fstat_snapshot_misses > after_hits.fstat_snapshot_misses);
+
+    ker::vfs::vfs_put_file(rf);
+    KEXPECT_EQ(ker::vfs::vfs_unlink(PATH), 0);
+}
+
+KTEST(VFS, StreamCacheRepeatedPreadRecordsHits) {
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_stream_counter";
+    constexpr char DATA[] = "abcdefghijklmnopqrstuvwxyz";
+    ker::vfs::vfs_unlink(PATH);
+
+    ker::vfs::File* wf = ker::vfs::vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(wf, nullptr);
+    KREQUIRE_NE(wf->fops, nullptr);
+    KREQUIRE_NE(wf->fops->vfs_write, nullptr);
+    KEXPECT_EQ(wf->fops->vfs_write(wf, DATA, sizeof(DATA) - 1, 0), static_cast<ssize_t>(sizeof(DATA) - 1));
+    ker::vfs::vfs_put_file(wf);
+
+    ker::vfs::File* rf = ker::vfs::vfs_open_file(PATH, 0, 0);
+    KREQUIRE_NE(rf, nullptr);
+
+    ker::vfs::VfsCachePerfSnapshot before{};
+    ker::vfs::vfs_get_cache_perf_snapshot(before);
+
+    char buf[8] = {};
+    KEXPECT_EQ(ker::vfs::vfs_pread_file(rf, buf, sizeof(buf), 0), static_cast<ssize_t>(sizeof(buf)));
+    KEXPECT_EQ(ker::vfs::vfs_pread_file(rf, buf, sizeof(buf), 0), static_cast<ssize_t>(sizeof(buf)));
+    KEXPECT_TRUE(std::memcmp(buf, DATA, sizeof(buf)) == 0);
+
+    ker::vfs::VfsCachePerfSnapshot after{};
+    ker::vfs::vfs_get_cache_perf_snapshot(after);
+    KEXPECT_TRUE(after.stream_backend_reads > before.stream_backend_reads);
+    KEXPECT_TRUE(after.stream_hits > before.stream_hits);
+    KEXPECT_TRUE(after.stream_copied_bytes >= before.stream_copied_bytes + sizeof(buf));
+
+    ker::vfs::vfs_put_file(rf);
+    KEXPECT_EQ(ker::vfs::vfs_unlink(PATH), 0);
+}
+
+KTEST(VFS, SymlinkCacheRepeatedReadlinkRecordsHit) {
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* TARGET = "/tmp/ktest_symlink_counter_target";
+    constexpr const char* LINK = "/tmp/ktest_symlink_counter_link";
+    ker::vfs::vfs_unlink(LINK);
+    ker::vfs::vfs_unlink(TARGET);
+
+    ker::vfs::File* f = ker::vfs::vfs_open_file(TARGET, ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(f, nullptr);
+    ker::vfs::vfs_put_file(f);
+    KEXPECT_EQ(ker::vfs::vfs_symlink(TARGET, LINK), 0);
+
+    ker::vfs::VfsCachePerfSnapshot before{};
+    ker::vfs::vfs_get_cache_perf_snapshot(before);
+
+    char buf[128] = {};
+    KEXPECT_EQ(ker::vfs::vfs_readlink_resolved(LINK, buf, sizeof(buf)), static_cast<ssize_t>(std::strlen(TARGET)));
+    KEXPECT_TRUE(std::strcmp(buf, TARGET) == 0);
+    std::memset(buf, 0, sizeof(buf));
+    KEXPECT_EQ(ker::vfs::vfs_readlink_resolved(LINK, buf, sizeof(buf)), static_cast<ssize_t>(std::strlen(TARGET)));
+    KEXPECT_TRUE(std::strcmp(buf, TARGET) == 0);
+
+    ker::vfs::VfsCachePerfSnapshot after{};
+    ker::vfs::vfs_get_cache_perf_snapshot(after);
+    KEXPECT_TRUE(after.symlink_stores > before.symlink_stores);
+    KEXPECT_TRUE(after.symlink_hits > before.symlink_hits);
+
+    KEXPECT_EQ(ker::vfs::vfs_unlink(LINK), 0);
+    KEXPECT_EQ(ker::vfs::vfs_unlink(TARGET), 0);
+}
+
 KTEST(VFS, WriteRead) {
     ker::vfs::vfs_mkdir("/tmp", 0755);
 
@@ -219,6 +380,39 @@ KTEST(VFS, LstatDoesNotFollowFinalTmpfsSymlink) {
     KEXPECT_NE(ker::vfs::vfs_stat(LINK, &st), 0);
 
     KEXPECT_EQ(ker::vfs::vfs_unlink(LINK), 0);
+}
+
+KTEST(VFS, RealpathFastPathFollowsSimpleSymlink) {
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* TARGET = "/tmp/ktest_realpath_target";
+    constexpr const char* LINK = "/tmp/ktest_realpath_link";
+    constexpr const char* MISSING = "/tmp/ktest_realpath_missing";
+    constexpr const char* FILE_PATH = "/tmp/ktest_realpath_file";
+
+    ker::vfs::vfs_unlink(LINK);
+    ker::vfs::vfs_unlink(FILE_PATH);
+    ker::vfs::vfs_rmdir(TARGET);
+    KEXPECT_EQ(ker::vfs::vfs_mkdir(TARGET, 0755), 0);
+    KEXPECT_EQ(ker::vfs::vfs_symlink(TARGET, LINK), 0);
+    ker::vfs::File* file = ker::vfs::vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(file, nullptr);
+    ker::vfs::tmpfs::tmpfs_fops_close(file);
+
+    char buf[512]{};
+    KEXPECT_EQ(ker::vfs::vfs_realpath(LINK, buf, sizeof(buf)), 0);
+    KEXPECT_TRUE(std::strcmp(buf, TARGET) == 0);
+
+    KEXPECT_NE(ker::vfs::vfs_realpath(MISSING, buf, sizeof(buf)), 0);
+    KEXPECT_EQ(ker::vfs::vfs_realpath("/tmp/ktest_realpath_link/..", buf, sizeof(buf)), 0);
+    KEXPECT_TRUE(std::strcmp(buf, "/tmp") == 0);
+    KEXPECT_EQ(ker::vfs::vfs_realpath("/tmp/ktest_realpath_target/../ktest_realpath_target", buf, sizeof(buf)), 0);
+    KEXPECT_TRUE(std::strcmp(buf, TARGET) == 0);
+    KEXPECT_EQ(ker::vfs::vfs_realpath("/tmp/ktest_realpath_file/..", buf, sizeof(buf)), -ENOTDIR);
+
+    KEXPECT_EQ(ker::vfs::vfs_unlink(FILE_PATH), 0);
+    KEXPECT_EQ(ker::vfs::vfs_unlink(LINK), 0);
+    KEXPECT_EQ(ker::vfs::vfs_rmdir(TARGET), 0);
 }
 
 KTEST(VFS, Mkdir) {

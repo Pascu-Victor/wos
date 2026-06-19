@@ -13,6 +13,7 @@
 #include <dev/block_device.hpp>
 #include <test/ktest.hpp>
 #include <vfs/fs/xfs/xfs_btree.hpp>
+#include <vfs/fs/xfs/xfs_dir2.hpp>
 #include <vfs/fs/xfs/xfs_format.hpp>
 #include <vfs/fs/xfs/xfs_mount.hpp>
 #include <vfs/fs/xfs/xfs_vfs.hpp>
@@ -88,6 +89,8 @@ KTEST(XFS, TruncateZeroResetsStaleDataFork) {
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_truncate_zero_resets_data(0, 1024));
     KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_truncate_zero_resets_data(0, 0));
 }
+
+KTEST(XFS, DentryCacheHitsAndInvalidates) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_dentry_cache_shortform()); }
 
 // ---------------------------------------------------------------------------
 // xfs_mount() error path: corrupt magic (all zeros) must return != 0

@@ -437,9 +437,15 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto* buf = reinterpret_cast<ker::vfs::Statvfs*>(a2);
             return static_cast<int64_t>(ker::vfs::vfs_fstatvfs(FD, buf));
         }
+        case ops::REALPATH: {
+            const auto* path = reinterpret_cast<const char*>(a1);
+            auto* buf = reinterpret_cast<char*>(a2);
+            auto bufsize = static_cast<size_t>(a3);
+            return static_cast<int64_t>(ker::vfs::vfs_realpath(path, buf, bufsize));
+        }
         default:
             ker::vfs::vfs_debug_log("sys_vfs: unknown op\n");
-            return static_cast<int64_t>(ENOSYS);
+            return static_cast<int64_t>(-ENOSYS);
     }
 }
 

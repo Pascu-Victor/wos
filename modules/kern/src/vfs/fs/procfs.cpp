@@ -32,6 +32,7 @@
 #include <utility>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/file.hpp>
+#include <vfs/fs/xfs/xfs_dir2.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
@@ -2384,6 +2385,34 @@ auto generate_memacc_alloc_totals(char* buf, size_t bufsz) -> size_t {
     append_memacc_dec(p, end, "max_bytes", BCACHE.max_bytes);
     append_memacc_dec(p, end, "hits", BCACHE.hits);
     append_memacc_dec(p, end, "misses", BCACHE.misses);
+    append_char(p, end, '\n');
+
+    ker::vfs::VfsCachePerfSnapshot vfs_cache{};
+    ker::vfs::vfs_get_cache_perf_snapshot(vfs_cache);
+    append_sconst(p, end, "vfs_cache");
+    append_memacc_dec(p, end, "metadata_hits", vfs_cache.metadata_hits);
+    append_memacc_dec(p, end, "metadata_misses", vfs_cache.metadata_misses);
+    append_memacc_dec(p, end, "metadata_stores", vfs_cache.metadata_stores);
+    append_memacc_dec(p, end, "symlink_hits", vfs_cache.symlink_hits);
+    append_memacc_dec(p, end, "symlink_misses", vfs_cache.symlink_misses);
+    append_memacc_dec(p, end, "symlink_stores", vfs_cache.symlink_stores);
+    append_memacc_dec(p, end, "stream_hits", vfs_cache.stream_hits);
+    append_memacc_dec(p, end, "stream_misses", vfs_cache.stream_misses);
+    append_memacc_dec(p, end, "stream_backend_reads", vfs_cache.stream_backend_reads);
+    append_memacc_dec(p, end, "stream_backend_bytes", vfs_cache.stream_backend_bytes);
+    append_memacc_dec(p, end, "stream_copied_bytes", vfs_cache.stream_copied_bytes);
+    append_memacc_dec(p, end, "fstat_snapshot_hits", vfs_cache.fstat_snapshot_hits);
+    append_memacc_dec(p, end, "fstat_snapshot_misses", vfs_cache.fstat_snapshot_misses);
+    append_memacc_dec(p, end, "fstat_snapshot_stores", vfs_cache.fstat_snapshot_stores);
+    append_char(p, end, '\n');
+
+    ker::vfs::xfs::XfsDentryCacheStats xfs_dentry{};
+    ker::vfs::xfs::xfs_dentry_cache_stats(xfs_dentry);
+    append_sconst(p, end, "xfs_dentry_cache");
+    append_memacc_dec(p, end, "hits", xfs_dentry.hits);
+    append_memacc_dec(p, end, "misses", xfs_dentry.misses);
+    append_memacc_dec(p, end, "stores", xfs_dentry.stores);
+    append_memacc_dec(p, end, "invalidations", xfs_dentry.invalidations);
     append_char(p, end, '\n');
 
     auto const FILE_CACHE = ker::syscall::vmem::file_mmap_cache_stats();
