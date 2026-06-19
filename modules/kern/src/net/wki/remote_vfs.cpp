@@ -538,6 +538,22 @@ auto read_local_file_with_retry(ker::vfs::File* local_file, void* buf, size_t le
     return -EIO;
 }
 
+auto dev_attach_status_to_errno(uint8_t status) -> int {
+    switch (static_cast<DevAttachStatus>(status)) {
+        case DevAttachStatus::OK:
+            return 0;
+        case DevAttachStatus::NOT_FOUND:
+            return -ENOENT;
+        case DevAttachStatus::NOT_REMOTABLE:
+            return -ENODEV;
+        case DevAttachStatus::BUSY:
+            return -EBUSY;
+        case DevAttachStatus::NO_PASSTHROUGH:
+            return -EOPNOTSUPP;
+    }
+    return -EIO;
+}
+
 auto read_local_file_windowed(ker::vfs::File* local_file, void* buf, size_t len, size_t offset) -> ssize_t {
     auto* dst = static_cast<uint8_t*>(buf);
     size_t total_read = 0;
@@ -4363,14 +4379,16 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     }
 
     if (state->attach_status != static_cast<uint8_t>(DevAttachStatus::OK)) {
-        ker::mod::dbg::log("[WKI] Remote VFS attach rejected: status=%u", state->attach_status);
+        int const ATTACH_ERRNO = dev_attach_status_to_errno(state->attach_status);
+        ker::mod::dbg::log("[WKI] Remote VFS attach rejected: node=0x%04x res_id=%u path=%s status=%u ret=%d", owner_node, resource_id,
+                           local_mount_path, state->attach_status, ATTACH_ERRNO);
         if (reserved_channel != nullptr) {
             wki_channel_close(reserved_channel);
         }
         s_vfs_lock.lock();
         g_vfs_proxies.pop_back();
         s_vfs_lock.unlock();
-        return -EIO;
+        return ATTACH_ERRNO;
     }
 
     if (reserved_channel != nullptr) {

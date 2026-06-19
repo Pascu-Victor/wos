@@ -3695,6 +3695,7 @@ void wki_ipc_handle_dev_op_resp(uint16_t src_node, uint16_t channel, const uint8
         if (proxy != nullptr) {
             auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
             wake_blocked_ipc_reader(reader);
+            wki_ipc_proxy_wake_poll_waiters(proxy);
             proxy_release(proxy);
         }
         return;
@@ -3724,6 +3725,14 @@ auto wki_ipc_selftest_poll_state_response_refs() -> int {
     proxy->refcount.store(1, std::memory_order_release);
 
     {
+        uint64_t const PROXY_IRQF = proxy->lock.lock_irqsave();
+        if (!proxy_register_waiter_locked(proxy->poll_waiters, 0x600D)) {
+            proxy->lock.unlock_irqrestore(PROXY_IRQF);
+            proxy_release(proxy);
+            return -ENOMEM;
+        }
+        proxy->lock.unlock_irqrestore(PROXY_IRQF);
+
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
         g_ipc_proxies.push_back(proxy);
         s_ipc_lock.unlock_irqrestore(IRQF);
@@ -3743,6 +3752,12 @@ auto wki_ipc_selftest_poll_state_response_refs() -> int {
     wki_ipc_handle_dev_op_resp(WKI_NODE_INVALID, WKI_CHAN_RESOURCE, payload.data(), static_cast<uint16_t>(payload.size()));
 
     int const REFS_AFTER_RESPONSE = proxy->refcount.load(std::memory_order_acquire);
+    bool poll_waiters_drained = false;
+    {
+        uint64_t const IRQF = proxy->lock.lock_irqsave();
+        poll_waiters_drained = proxy->poll_waiters.empty();
+        proxy->lock.unlock_irqrestore(IRQF);
+    }
     {
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
         proxy_unregister_locked(proxy);
@@ -3752,7 +3767,7 @@ auto wki_ipc_selftest_poll_state_response_refs() -> int {
     for (int i = 0; i < REFS_AFTER_RESPONSE; ++i) {
         proxy_release(proxy);
     }
-    return REFS_AFTER_RESPONSE;
+    return poll_waiters_drained ? REFS_AFTER_RESPONSE : -EIO;
 }
 
 auto wki_ipc_selftest_export_compaction_frees() -> int {

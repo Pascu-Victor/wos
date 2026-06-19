@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -174,6 +175,39 @@ void build_vfs_mount_path(char* out, size_t out_size, const char* hostname, cons
 
 auto pending_vfs_mount_is_live_locked(const PendingVfsMount& pending) -> bool {
     return find_resource_unlocked(pending.node_id, ResourceType::VFS, pending.resource_id) != nullptr;
+}
+
+auto pending_vfs_mount_matches_resource_locked(const PendingVfsMount& pending, const DiscoveredResource& res) -> bool {
+    const char* hostname = wki_peer_get_hostname(pending.node_id);
+    if (hostname == nullptr || hostname[0] == '\0') {
+        return false;
+    }
+
+    std::array<char, VFS_MOUNT_PATH_LEN> expected_mount_path{};
+    build_vfs_mount_path(expected_mount_path.data(), expected_mount_path.size(), hostname, static_cast<const char*>(res.name));
+    return std::strncmp(expected_mount_path.data(), pending.mount_path.data(), expected_mount_path.size()) == 0;
+}
+
+auto forget_stale_vfs_resource_after_not_found(const PendingVfsMount& pending) -> bool {
+    bool removed = false;
+    s_remotable_lock.lock();
+    auto* resource = find_resource_unlocked(pending.node_id, ResourceType::VFS, pending.resource_id);
+    if (resource != nullptr && pending_vfs_mount_matches_resource_locked(pending, *resource)) {
+        std::erase_if(g_discovered, [&](const DiscoveredResource& res) {
+            return res.node_id == pending.node_id && res.resource_type == ResourceType::VFS && res.resource_id == pending.resource_id;
+        });
+        std::erase_if(g_pending_vfs_mounts, [&](const PendingVfsMount& queued) {
+            return queued.node_id == pending.node_id && queued.resource_id == pending.resource_id &&
+                   std::strncmp(queued.mount_path.data(), pending.mount_path.data(), queued.mount_path.size()) == 0;
+        });
+        removed = true;
+    }
+    s_remotable_lock.unlock();
+
+    if (removed) {
+        ker::vfs::devfs::devfs_wki_remove_resource(pending.node_id, static_cast<uint16_t>(ResourceType::VFS), pending.resource_id);
+    }
+    return removed;
 }
 
 auto capture_net_advert_state(ker::net::NetDevice* dev) -> NetAdvertState {
@@ -840,6 +874,17 @@ void wki_remotable_process_pending_mounts() {
             int const RET = wki_remote_vfs_mount(pending.node_id, pending.resource_id, pending.mount_path.data());
             if (RET == 0) {
                 ker::mod::dbg::log("[WKI] Auto-mounted VFS: %s -> node=0x%04x", pending.mount_path.data(), pending.node_id);
+                continue;
+            }
+
+            if (RET == -ENOENT) {
+                if (forget_stale_vfs_resource_after_not_found(pending)) {
+                    log::debug("Dropped stale VFS resource after attach NOT_FOUND: node=0x%04x res_id=%u path=%s", pending.node_id,
+                               pending.resource_id, pending.mount_path.data());
+                } else {
+                    log::debug("Skipping VFS auto-mount after attach NOT_FOUND: node=0x%04x res_id=%u path=%s", pending.node_id,
+                               pending.resource_id, pending.mount_path.data());
+                }
                 continue;
             }
 
