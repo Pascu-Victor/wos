@@ -10,11 +10,12 @@ Usage:
     wos-cluster                     # setup (default)
     wos-cluster --setup              # explicit setup
     wos-cluster --launch             # setup + launch VMs
+    wos-cluster --launch --no-setup  # launch VMs, assuming topology exists
     wos-cluster --sync               # live-sync rootfs/sysroot files
     wos-cluster --teardown           # destroy everything
     wos-cluster --config path.json   # custom config
 
-Note: sudo is used internally only for privileged operations (network setup).
+Note: sudo is used internally only for privileged setup/teardown operations.
       The script will prompt for your password once if needed.
 """
 
@@ -43,6 +44,9 @@ from pathlib import Path
 from itertools import combinations
 
 import node_setup
+
+
+TOPOLOGY_PROBE_TIMEOUT_SECONDS = 5.0
 
 # ---------------------------------------------------------------------------
 # Config loading and resolution
@@ -227,18 +231,28 @@ def parse_size(s: str) -> int:
     return int(s)
 
 
-def tap_owner_uid(name: str) -> int | None:
-    result = subprocess.run(
-        ["sudo", "-n", "ip", "tuntap", "show", "dev", name],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        result = subprocess.run(
-            ["ip", "tuntap", "show", "dev", name],
+def run_topology_probe(args: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run a host topology inspection command with a short anti-hang timeout."""
+    try:
+        return subprocess.run(
+            args,
             capture_output=True,
             text=True,
+            timeout=TOPOLOGY_PROBE_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            exc.cmd,
+            124,
+            stdout=exc.stdout or "",
+            stderr=exc.stderr or f"timed out after {TOPOLOGY_PROBE_TIMEOUT_SECONDS:.1f}s",
+        )
+
+
+def tap_owner_uid(name: str) -> int | None:
+    result = run_topology_probe(["sudo", "-n", "ip", "tuntap", "show", "dev", name])
+    if result.returncode != 0:
+        result = run_topology_probe(["ip", "tuntap", "show", "dev", name])
     if result.returncode != 0:
         return None
 
@@ -254,17 +268,9 @@ def tap_owner_uid(name: str) -> int | None:
 
 def tap_has_multiqueue(name: str) -> bool:
     """Return True if the TAP device was created with IFF_MULTI_QUEUE."""
-    result = subprocess.run(
-        ["sudo", "-n", "ip", "tuntap", "show", "dev", name],
-        capture_output=True,
-        text=True,
-    )
+    result = run_topology_probe(["sudo", "-n", "ip", "tuntap", "show", "dev", name])
     if result.returncode != 0:
-        result = subprocess.run(
-            ["ip", "tuntap", "show", "dev", name],
-            capture_output=True,
-            text=True,
-        )
+        result = run_topology_probe(["ip", "tuntap", "show", "dev", name])
     return result.returncode == 0 and "multi_queue" in result.stdout
 
 
@@ -924,6 +930,10 @@ def teardown(config: dict):
 # ---------------------------------------------------------------------------
 
 
+class NoSetupTopologyError(RuntimeError):
+    pass
+
+
 def collect_unique_nodes(config: dict) -> dict:
     """Build a map: node_id -> list of (zone_cfg, effective_cfg, node_cfg)."""
     zones = [z for z in config["zones"] if z.get("id") != "GLOBAL"]
@@ -951,6 +961,72 @@ def collect_unique_nodes(config: dict) -> dict:
                     nodes[node_id]["effective"].get("vm", {}), vm_override
                 )
     return nodes
+
+
+def link_json(name: str) -> dict | None:
+    result = run_topology_probe(["ip", "-j", "link", "show", "dev", name])
+    if result.returncode != 0:
+        return None
+    try:
+        links = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return links[0] if links else None
+
+
+def link_is_up(link: dict) -> bool:
+    flags = link.get("flags", [])
+    return isinstance(flags, list) and "UP" in flags
+
+
+def link_master(link: dict) -> str | None:
+    master = link.get("master")
+    return str(master) if master else None
+
+
+def validate_no_setup_topology(config: dict) -> None:
+    """Validate the already-created topology before rootless VM launch."""
+    zones = [z for z in config["zones"] if z.get("id") != "GLOBAL"]
+    global_cfg = find_global(config["zones"])
+    failures: list[str] = []
+
+    for zone_cfg in zones:
+        zname = zone_name(zone_cfg)
+        num_nodes = int(zone_cfg.get("nodes", 2))
+        effective = resolve_config(global_cfg, zone_cfg)
+        bridge = bridge_name(zone_cfg)
+        bridge_link = link_json(bridge)
+        if bridge_link is None:
+            failures.append(f"missing bridge {bridge} for zone {zname}")
+        elif not link_is_up(bridge_link):
+            failures.append(f"bridge {bridge} for zone {zname} is not UP")
+
+        for node_id in range(num_nodes):
+            tap = tap_name(zone_cfg, node_id)
+            tap_link = link_json(tap)
+            if tap_link is None:
+                failures.append(f"missing TAP {tap} for node {node_id} zone {zname}")
+                continue
+            if link_master(tap_link) != bridge:
+                failures.append(
+                    f"TAP {tap} for node {node_id} zone {zname} is not enslaved to {bridge}"
+                )
+            if not link_is_up(tap_link):
+                failures.append(f"TAP {tap} for node {node_id} zone {zname} is not UP")
+
+            queue_count = int(effective.get("nic_queues", 1))
+            if queue_count > 1 and not tap_has_multiqueue(tap):
+                failures.append(
+                    f"TAP {tap} for node {node_id} zone {zname} is not multi_queue"
+                )
+
+    if failures:
+        details = "\n  - ".join(failures)
+        raise NoSetupTopologyError(
+            "--no-setup requires an existing configured topology; run "
+            "`bin/wos-cluster --setup --config <config>` once, then retry "
+            f"the rootless launch.\n  - {details}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1994,10 +2070,15 @@ def launch(
     config: dict,
     tcg_level: str | None = None,
     debug_nodes: set[int] | None = None,
+    skip_setup: bool = False,
 ):
-    """Setup topology, then launch VMs."""
-    setup(config)
-    print()
+    """Setup topology unless requested otherwise, then launch VMs."""
+    if skip_setup:
+        validate_no_setup_topology(config)
+        print("=== Skipping cluster topology setup (--no-setup) ===\n")
+    else:
+        setup(config)
+        print()
 
     nodes = collect_unique_nodes(config)
     pids = []
@@ -2083,7 +2164,7 @@ def launch(
         shutdown(None, None)
 
     print(f"\n=== {len(pids)} VMs launched ===")
-    print("Press Ctrl+C to stop all VMs.\n")
+    print("Press Ctrl+C to stop all VMs.\n", flush=True)
 
     # Wait for all VMs
     with pids_lock:
@@ -2142,6 +2223,14 @@ def main():
         help="Use TCG instead of KVM. Optional level: int, full (default: basic)",
     )
     parser.add_argument(
+        "--no-setup",
+        action="store_true",
+        help=(
+            "With --launch, skip privileged topology setup and use existing "
+            "bridges, TAPs, and ivshmem files"
+        ),
+    )
+    parser.add_argument(
         "--debug-node",
         action="append",
         type=int,
@@ -2165,6 +2254,8 @@ def main():
         parser.error("--sync-timeout must be nonnegative")
     if args.debug_node and not args.launch:
         parser.error("--debug-node is only valid with --launch")
+    if args.no_setup and not args.launch:
+        parser.error("--no-setup is only valid with --launch")
 
     config_path = Path(args.config)
     if not config_path.is_absolute():
@@ -2185,12 +2276,18 @@ def main():
         ensure_sudo()
         teardown(config)
     elif args.launch:
-        ensure_sudo()
-        launch(
-            config,
-            tcg_level=args.tcg,
-            debug_nodes=set(args.debug_node) if args.debug_node else None,
-        )
+        if not args.no_setup:
+            ensure_sudo()
+        try:
+            launch(
+                config,
+                tcg_level=args.tcg,
+                debug_nodes=set(args.debug_node) if args.debug_node else None,
+                skip_setup=args.no_setup,
+            )
+        except NoSetupTopologyError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
     else:
         ensure_sudo()
         setup(config)

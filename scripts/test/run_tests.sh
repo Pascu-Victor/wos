@@ -99,6 +99,7 @@ UNIT_TESTS=(
     host_test_manifest_test
     ktest_cov_test
     coverage_summary_test
+    cluster_setup_test
     ktest_manifest_test
     runtime_test_audit_test
     testd_manifest_test

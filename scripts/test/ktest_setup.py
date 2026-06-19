@@ -197,7 +197,7 @@ def main() -> int:
             "are not touched."
         ),
     )
-    parser.add_argument("--config", default="configs/node.json", help="Single-node VM spec")
+    parser.add_argument("--config", default="configs/node_ktest.json", help="Single-node VM spec")
     parser.add_argument("--build-dir", help="Override build directory from node config")
     parser.add_argument(
         "--kernel-cmdline",
@@ -228,6 +228,11 @@ def main() -> int:
     parser.add_argument("--no-build", action="store_true", help="Skip configure/build")
     parser.add_argument("--no-package", action="store_true", help="Skip disk packaging")
     parser.add_argument("--no-launch", action="store_true", help="Set up topology but do not launch")
+    parser.add_argument(
+        "--no-setup",
+        action="store_true",
+        help="Launch without privileged topology setup; assumes bridge/TAP state already exists",
+    )
     parser.add_argument("--teardown", action="store_true", help="Tear down the single-node topology")
     parser.add_argument(
         "--tcg",
@@ -243,6 +248,8 @@ def main() -> int:
         help="Launch the KTEST VM paused with a GDB stub",
     )
     args = parser.parse_args()
+    if args.no_setup and (args.teardown or args.no_launch or args.build_only):
+        parser.error("--no-setup is only valid when launching")
 
     config_path = Path(args.config)
     if not config_path.is_absolute():
@@ -269,13 +276,20 @@ def main() -> int:
         seed_isolated_sysroot(roots["sysroot"], False)
         package_disks(spec, build_dir, roots, kernel_cmdline)
 
-    cluster_setup.ensure_sudo()
     if args.no_launch:
+        cluster_setup.ensure_sudo()
         cluster_setup.setup(cluster_config)
         return 0
 
+    if not args.no_setup:
+        cluster_setup.ensure_sudo()
     debug_nodes = {node_setup.node_id(spec)} if args.debug_node else None
-    cluster_setup.launch(cluster_config, tcg_level=args.tcg, debug_nodes=debug_nodes)
+    cluster_setup.launch(
+        cluster_config,
+        tcg_level=args.tcg,
+        debug_nodes=debug_nodes,
+        skip_setup=args.no_setup,
+    )
     return 0
 
 

@@ -17,6 +17,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/coverage_summary_test.py
 )
 add_test(
+    NAME cluster_setup_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster_setup_test.py
+)
+add_test(
     NAME ktest_manifest_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ktest_manifest_test.py
 )
@@ -192,6 +196,7 @@ set_tests_properties(
     host_test_manifest_test
     ktest_cov_test
     coverage_summary_test
+    cluster_setup_test
     ktest_manifest_test
     runtime_test_audit_test
     testd_manifest_test
