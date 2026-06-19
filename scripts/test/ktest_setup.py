@@ -70,6 +70,8 @@ BUILD_TARGETS = [
     "wos_modules",
     "busybox",
     "dropbear",
+    "gnu_make",
+    "python_for_wos",
 ]
 
 DEFAULT_SOURCE_SYSROOT = ROOT / "toolchain" / "sysroot"
@@ -119,6 +121,9 @@ def build_roots(raw_config: dict) -> dict[str, Path]:
         "busybox_build": abs_path(path_from_build_config(raw_config, "busybox_build", "ktest-data/busybox-build")),
         "busybox_install": abs_path(path_from_build_config(raw_config, "busybox_install", "ktest-data/busybox-install")),
         "dropbear_build": abs_path(path_from_build_config(raw_config, "dropbear_build", "ktest-data/dropbear-build")),
+        "make_build": abs_path(path_from_build_config(raw_config, "make_build", "ktest-data/make-build")),
+        "cmake_build": abs_path(path_from_build_config(raw_config, "cmake_build", "ktest-data/cmake-wos-build")),
+        "python_build": abs_path(path_from_build_config(raw_config, "python_build", "ktest-data/python-build")),
     }
 
 
@@ -153,6 +158,9 @@ def configure_build(
         f"-DWOS_BUSYBOX_BUILD_DIR={roots['busybox_build']}",
         f"-DWOS_BUSYBOX_INSTALL_DIR={roots['busybox_install']}",
         f"-DWOS_DROPBEAR_BUILD_DIR={roots['dropbear_build']}",
+        f"-DWOS_MAKE_BUILD_DIR={roots['make_build']}",
+        f"-DWOS_CMAKE_FOR_WOS_BUILD_DIR={roots['cmake_build']}",
+        f"-DWOS_PYTHON_BUILD_DIR={roots['python_build']}",
         "-DWOS_SKIP_LIBCXX_INSTALL=ON",
         *diagnostic_cmake_options(fast),
         *extra_cmake_options,

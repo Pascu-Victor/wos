@@ -16,3 +16,10 @@
 [submodule "tools/wireshark/WireMCP"]
 	path = tools/wireshark/WireMCP
 	url = https://github.com/0xKoda/WireMCP.git
+[submodule "toolchain/src/cmake"]
+	path = toolchain/src/cmake
+	url = https://github.com/Pascu-Victor/CMake.git
+	branch = wos-support
+[submodule "toolchain/src/ninja"]
+	path = toolchain/src/ninja
+	url = https://github.com/Pascu-Victor/ninja.git

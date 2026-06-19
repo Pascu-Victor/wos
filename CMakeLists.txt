@@ -52,11 +52,20 @@ set(WOS_LIBCXX_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/libcxx-build" CACHE PATH
 set(WOS_BUSYBOX_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/busybox-build" CACHE PATH "BusyBox build directory")
 set(WOS_BUSYBOX_INSTALL_DIR "${CMAKE_SOURCE_DIR}/toolchain/busybox-install" CACHE PATH "BusyBox install staging directory")
 set(WOS_DROPBEAR_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/dropbear-build" CACHE PATH "Dropbear build directory")
+set(WOS_MAKE_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/make-build" CACHE PATH "GNU make build directory")
+set(WOS_MAKE_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/make" CACHE PATH "GNU make source directory")
 set(WOS_CLANG_FOR_WOS_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/clang-wos-build" CACHE PATH "Native WOS clang build directory")
+set(WOS_NINJA_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/ninja-build" CACHE PATH "Native WOS Ninja build directory")
+set(WOS_CMAKE_FOR_WOS_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/cmake-wos-build" CACHE PATH "Native WOS CMake build directory")
+set(WOS_PYTHON_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/python" CACHE PATH "CPython source directory")
+set(WOS_PYTHON_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/python-build" CACHE PATH "Native WOS Python build directory")
 set(WOS_BOOT_DISK "${CMAKE_SOURCE_DIR}/disk.qcow2" CACHE FILEPATH "WOS boot disk image")
 set(WOS_ROOTFS_DISK "${CMAKE_SOURCE_DIR}/mountfs.qcow2" CACHE FILEPATH "WOS rootfs disk image")
 option(WOS_SKIP_LIBCXX_INSTALL "Skip the libc++ install target; useful when an isolated sysroot is pre-seeded" OFF)
 option(WOS_BUILD_CLANG_FOR_WOS "Build a native WOS clang/lld toolchain and stage it into the rootfs" ON)
+option(WOS_BUILD_NINJA_FOR_WOS "Build a native WOS Ninja and stage it into the rootfs" ON)
+option(WOS_BUILD_CMAKE_FOR_WOS "Build native WOS CMake tools and stage them into the rootfs" OFF)
+option(WOS_BUILD_PYTHON_FOR_WOS "Build native WOS Python and stage it into the rootfs" OFF)
 
 set(SYSROOT ${WOS_SYSROOT_PATH})
 set(MLIBC_BUILD_DIR ${WOS_MLIBC_BUILD_DIR})
@@ -176,6 +185,27 @@ add_custom_command(
 )
 add_custom_target(dropbear DEPENDS ${DROPBEAR_STAMP})
 
+# --- gnu_make: cross-compile GNU make for WOS -------------------------------
+file(GLOB_RECURSE GNU_MAKE_SOURCES CONFIGURE_DEPENDS
+    ${WOS_MAKE_SOURCE_DIR}/*
+)
+list(FILTER GNU_MAKE_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
+set(GNU_MAKE_STAMP ${CMAKE_BINARY_DIR}/stamps/gnu_make.stamp)
+add_custom_command(
+    OUTPUT ${GNU_MAKE_STAMP}
+    COMMAND ${CMAKE_COMMAND} -E env
+            WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+            WOS_MAKE_BUILD_DIR=${WOS_MAKE_BUILD_DIR}
+            WOS_MAKE_SOURCE_DIR=${WOS_MAKE_SOURCE_DIR}
+            ${WOS_BUILD_SCRIPTS_DIR}/build_make.sh
+    COMMAND ${CMAKE_COMMAND} -E touch ${GNU_MAKE_STAMP}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Building GNU make..."
+    DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/build_make.sh ${GNU_MAKE_SOURCES} ${MLIBC_STAMP} ${LIBCXX_STAMP}
+    USES_TERMINAL
+)
+add_custom_target(gnu_make DEPENDS ${GNU_MAKE_STAMP})
+
 # --- clang_for_wos: cross-compile clang/lld to run inside WOS ---------------
 file(GLOB_RECURSE CLANG_FOR_WOS_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_SOURCE_DIR}/toolchain/src/llvm-project/llvm/*
@@ -207,6 +237,93 @@ if(WOS_BUILD_CLANG_FOR_WOS)
     )
     add_custom_target(clang_for_wos DEPENDS ${CLANG_FOR_WOS_STAMP})
     list(APPEND WOS_CLANG_FOR_WOS_ROOTFS_INPUTS ${CLANG_FOR_WOS_STAMP})
+endif()
+
+# --- ninja_for_wos: cross-compile Ninja to run inside WOS -------------------
+file(GLOB_RECURSE NINJA_FOR_WOS_SOURCES CONFIGURE_DEPENDS
+    ${CMAKE_SOURCE_DIR}/toolchain/src/ninja/*
+)
+list(FILTER NINJA_FOR_WOS_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
+set(NINJA_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/ninja_for_wos.stamp)
+set(WOS_NINJA_FOR_WOS_ROOTFS_INPUTS)
+if(WOS_BUILD_NINJA_FOR_WOS)
+    add_custom_command(
+        OUTPUT ${NINJA_FOR_WOS_STAMP}
+        COMMAND ${CMAKE_COMMAND} -E env
+                WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+                WOS_NINJA_BUILD_DIR=${WOS_NINJA_BUILD_DIR}
+                ${WOS_BUILD_SCRIPTS_DIR}/build_ninja_for_wos.sh
+        COMMAND ${CMAKE_COMMAND} -E touch ${NINJA_FOR_WOS_STAMP}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Building native WOS Ninja..."
+        DEPENDS
+            ${WOS_BUILD_SCRIPTS_DIR}/build_ninja_for_wos.sh
+            ${CMAKE_SOURCE_DIR}/toolchain/src/ninja/CMakeLists.txt
+            ${NINJA_FOR_WOS_SOURCES}
+            ${MLIBC_STAMP}
+            ${LIBCXX_STAMP}
+        USES_TERMINAL
+    )
+    add_custom_target(ninja_for_wos DEPENDS ${NINJA_FOR_WOS_STAMP})
+    list(APPEND WOS_NINJA_FOR_WOS_ROOTFS_INPUTS ${NINJA_FOR_WOS_STAMP})
+endif()
+
+# --- cmake_for_wos: cross-compile CMake to run inside WOS ------------------
+file(GLOB_RECURSE CMAKE_FOR_WOS_SOURCES CONFIGURE_DEPENDS
+    ${CMAKE_SOURCE_DIR}/toolchain/src/cmake/*
+)
+list(FILTER CMAKE_FOR_WOS_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
+set(CMAKE_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/cmake_for_wos.stamp)
+set(WOS_CMAKE_FOR_WOS_ROOTFS_INPUTS)
+if(WOS_BUILD_CMAKE_FOR_WOS)
+    add_custom_command(
+        OUTPUT ${CMAKE_FOR_WOS_STAMP}
+        COMMAND ${CMAKE_COMMAND} -E env
+                WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+                WOS_CMAKE_FOR_WOS_BUILD_DIR=${WOS_CMAKE_FOR_WOS_BUILD_DIR}
+                ${WOS_BUILD_SCRIPTS_DIR}/build_cmake_for_wos.sh
+        COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_FOR_WOS_STAMP}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Building native WOS CMake tools..."
+        DEPENDS
+            ${WOS_BUILD_SCRIPTS_DIR}/build_cmake_for_wos.sh
+            ${CMAKE_SOURCE_DIR}/toolchain/src/cmake/CMakeLists.txt
+            ${CMAKE_FOR_WOS_SOURCES}
+            ${MLIBC_STAMP}
+            ${LIBCXX_STAMP}
+        USES_TERMINAL
+    )
+    add_custom_target(cmake_for_wos DEPENDS ${CMAKE_FOR_WOS_STAMP})
+    list(APPEND WOS_CMAKE_FOR_WOS_ROOTFS_INPUTS ${CMAKE_FOR_WOS_STAMP})
+endif()
+
+# --- python_for_wos: cross-compile CPython to run inside WOS ----------------
+file(GLOB_RECURSE PYTHON_FOR_WOS_SOURCES CONFIGURE_DEPENDS
+    ${WOS_PYTHON_SOURCE_DIR}/*
+)
+list(FILTER PYTHON_FOR_WOS_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
+set(PYTHON_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/python_for_wos.stamp)
+set(WOS_PYTHON_FOR_WOS_ROOTFS_INPUTS)
+if(WOS_BUILD_PYTHON_FOR_WOS)
+    add_custom_command(
+        OUTPUT ${PYTHON_FOR_WOS_STAMP}
+        COMMAND ${CMAKE_COMMAND} -E env
+                WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+                WOS_PYTHON_BUILD_DIR=${WOS_PYTHON_BUILD_DIR}
+                WOS_PYTHON_SOURCE_DIR=${WOS_PYTHON_SOURCE_DIR}
+                ${WOS_BUILD_SCRIPTS_DIR}/build_python_for_wos.sh
+        COMMAND ${CMAKE_COMMAND} -E touch ${PYTHON_FOR_WOS_STAMP}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Building native WOS Python..."
+        DEPENDS
+            ${WOS_BUILD_SCRIPTS_DIR}/build_python_for_wos.sh
+            ${PYTHON_FOR_WOS_SOURCES}
+            ${MLIBC_STAMP}
+            ${LIBCXX_STAMP}
+        USES_TERMINAL
+    )
+    add_custom_target(python_for_wos DEPENDS ${PYTHON_FOR_WOS_STAMP})
+    list(APPEND WOS_PYTHON_FOR_WOS_ROOTFS_INPUTS ${PYTHON_FOR_WOS_STAMP})
 endif()
 
 # --- mountfs_disk: create or delta-sync the XFS rootfs image ----------------
@@ -257,13 +374,26 @@ add_custom_command(
         ${WOS_MODULE_TARGET_FILES}
         ${BUSYBOX_STAMP}
         ${DROPBEAR_STAMP}
+        ${GNU_MAKE_STAMP}
         ${LIBCXX_STAMP}
         ${WOS_CLANG_FOR_WOS_ROOTFS_INPUTS}
+        ${WOS_NINJA_FOR_WOS_ROOTFS_INPUTS}
+        ${WOS_CMAKE_FOR_WOS_ROOTFS_INPUTS}
+        ${WOS_PYTHON_FOR_WOS_ROOTFS_INPUTS}
     USES_TERMINAL
 )
 add_custom_target(mountfs_disk DEPENDS ${WOS_ROOTFS_DISK} ${MOUNTFS_STAMP})
 if(WOS_BUILD_CLANG_FOR_WOS)
     add_dependencies(mountfs_disk clang_for_wos)
+endif()
+if(WOS_BUILD_NINJA_FOR_WOS)
+    add_dependencies(mountfs_disk ninja_for_wos)
+endif()
+if(WOS_BUILD_CMAKE_FOR_WOS)
+    add_dependencies(mountfs_disk cmake_for_wos)
+endif()
+if(WOS_BUILD_PYTHON_FOR_WOS)
+    add_dependencies(mountfs_disk python_for_wos)
 endif()
 
 # --- boot_image: create the boot disk + initramfs --------------------------
@@ -301,8 +431,17 @@ add_custom_target(boot_image DEPENDS ${WOS_BOOT_DISK} ${INITRAMFS_OUTPUT} ${BOOT
 foreach(mod wos init testprog testd netd httpd perf top memacc journal wkictl powerctl renderbench sftpserver)
     add_dependencies(${mod} mlibc libcxx)
 endforeach()
-# busybox and dropbear are only needed for image creation, not compilation.
-add_dependencies(boot_image busybox dropbear)
+# busybox, dropbear, GNU make, Ninja, CMake, and Python are only needed for image creation, not compilation.
+add_dependencies(boot_image busybox dropbear gnu_make)
+if(WOS_BUILD_NINJA_FOR_WOS)
+    add_dependencies(boot_image ninja_for_wos)
+endif()
+if(WOS_BUILD_CMAKE_FOR_WOS)
+    add_dependencies(boot_image cmake_for_wos)
+endif()
+if(WOS_BUILD_PYTHON_FOR_WOS)
+    add_dependencies(boot_image python_for_wos)
+endif()
 
 # --- wos_full: top-level target that builds everything ---------------------
 add_custom_target(wos_full
@@ -317,4 +456,13 @@ add_dependencies(wos_full
 )
 if(WOS_BUILD_CLANG_FOR_WOS)
     add_dependencies(wos_full clang_for_wos)
+endif()
+if(WOS_BUILD_NINJA_FOR_WOS)
+    add_dependencies(wos_full ninja_for_wos)
+endif()
+if(WOS_BUILD_CMAKE_FOR_WOS)
+    add_dependencies(wos_full cmake_for_wos)
+endif()
+if(WOS_BUILD_PYTHON_FOR_WOS)
+    add_dependencies(wos_full python_for_wos)
 endif()

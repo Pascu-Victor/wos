@@ -19,6 +19,8 @@ Default KTEST roots:
 - `ktest-data/busybox-build`
 - `ktest-data/busybox-install`
 - `ktest-data/dropbear-build`
+- `ktest-data/make-build`
+- `ktest-data/python-build`
 - `ktest-data/disk.qcow2`
 - `ktest-data/mountfs.qcow2`
 - `ktest-data/overlays/`

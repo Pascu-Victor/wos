@@ -5,7 +5,10 @@
         "mlibc_build": "ktest-data/mlibc-build",
         "busybox_build": "ktest-data/busybox-build",
         "busybox_install": "ktest-data/busybox-install",
-        "dropbear_build": "ktest-data/dropbear-build"
+        "dropbear_build": "ktest-data/dropbear-build",
+        "make_build": "ktest-data/make-build",
+        "cmake_build": "ktest-data/cmake-wos-build",
+        "python_build": "ktest-data/python-build"
     },
     "package": {
         "kernel_cmdline": "--selftest"

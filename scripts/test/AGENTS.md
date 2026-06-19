@@ -10,7 +10,7 @@ Preserve the isolation contract:
 - Build directory: `build-ktest/`
 - Generated data and disks: `ktest-data/`
 - Target sysroot: `ktest-data/sysroot`
-- mlibc, BusyBox, and Dropbear build/install roots under `ktest-data/`
+- mlibc, BusyBox, Dropbear, GNU make, and CPython build/install roots under `ktest-data/`
 
 Do not silently fall back to `build/`, `toolchain/sysroot`, `disk.qcow2`, or
 `mountfs.qcow2`. `--reset-sysroot` should delete and re-seed only the isolated

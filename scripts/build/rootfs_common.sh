@@ -94,6 +94,50 @@ rootfs_stage_sysroot_headers() {
     rootfs_copy_entry "$sysroot_include" "/usr/include"
 }
 
+rootfs_stage_sysroot_cmake_data() {
+    local sysroot_share
+    local entry
+
+    if [ -n "$ROOTFS_SYSROOT_DIR" ]; then
+        sysroot_share="$ROOTFS_SYSROOT_DIR/share"
+    else
+        sysroot_share="$ROOTFS_REPO/toolchain/sysroot/share"
+    fi
+    if [ ! -d "$sysroot_share" ]; then
+        return 0
+    fi
+
+    for entry in "$sysroot_share"/cmake-*; do
+        [ -e "$entry" ] || continue
+        rootfs_copy_entry "$entry" "/usr/share/$(basename "$entry")"
+    done
+}
+
+rootfs_stage_sysroot_python() {
+    local sysroot_dir
+    local entry
+
+    if [ -n "$ROOTFS_SYSROOT_DIR" ]; then
+        sysroot_dir="$ROOTFS_SYSROOT_DIR"
+    else
+        sysroot_dir="$ROOTFS_REPO/toolchain/sysroot"
+    fi
+
+    if [ -d "$sysroot_dir/bin" ]; then
+        for entry in "$sysroot_dir"/bin/python "$sysroot_dir"/bin/python[0-9] "$sysroot_dir"/bin/python[0-9].[0-9]*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            rootfs_copy_entry "$entry" "/usr/bin/$(basename "$entry")"
+        done
+    fi
+
+    if [ -d "$sysroot_dir/lib" ]; then
+        for entry in "$sysroot_dir"/lib/python[0-9]*; do
+            [ -d "$entry" ] || continue
+            rootfs_copy_entry "$entry" "/usr/lib/$(basename "$entry")"
+        done
+    fi
+}
+
 rootfs_stage_busybox_install() {
     local bb_install
     local source_dir
@@ -337,6 +381,8 @@ rootfs_stage_tree() {
 
     rootfs_stage_sysroot_libs
     rootfs_stage_sysroot_headers
+    rootfs_stage_sysroot_cmake_data
+    rootfs_stage_sysroot_python
     rootfs_stage_busybox_install
     rootfs_stage_manifest
     rootfs_stage_etc

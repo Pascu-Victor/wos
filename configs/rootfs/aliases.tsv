@@ -36,6 +36,9 @@ symlink	/usr/bin/dropbearmulti	/usr/bin/dropbear
 symlink	/usr/bin/dropbearmulti	/usr/bin/dbclient
 symlink	/usr/bin/dropbearmulti	/usr/bin/dropbearkey
 symlink	/usr/bin/dropbearmulti	/usr/bin/scp
+copy	toolchain/sysroot/bin/make	/usr/bin/make
+symlink	/usr/bin/make	/usr/bin/gmake
+copy	toolchain/sysroot/bin/ninja	/usr/bin/ninja
 copy	toolchain/sysroot/bin/clang	/usr/bin/clang
 copy	toolchain/sysroot/bin/ld.lld	/usr/bin/ld.lld
 copy	toolchain/sysroot/bin/lld	/usr/bin/lld
@@ -48,6 +51,9 @@ copy	toolchain/sysroot/bin/llvm-readelf	/usr/bin/llvm-readelf
 copy	toolchain/sysroot/bin/llvm-objdump	/usr/bin/llvm-objdump
 copy	toolchain/sysroot/bin/x86_64-pc-wos.cfg	/usr/bin/x86_64-pc-wos.cfg
 copy	toolchain/sysroot/lib/clang	/usr/lib/clang
+copy	toolchain/sysroot/bin/cmake	/usr/bin/cmake
+copy	toolchain/sysroot/bin/ctest	/usr/bin/ctest
+copy	toolchain/sysroot/bin/cpack	/usr/bin/cpack
 symlink	/usr/bin/clang	/usr/bin/clang++
 symlink	/usr/bin/clang	/usr/bin/clang-22
 symlink	/usr/bin/clang	/usr/bin/cc

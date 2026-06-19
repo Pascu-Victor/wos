@@ -1,5 +1,6 @@
 #!/bin/bash
-# Build the WOS target toolchain: sysroot, compiler-rt, mlibc, libc++, busybox, dropbear.
+# Build the WOS target toolchain: sysroot, compiler-rt, mlibc, libc++, busybox,
+# dropbear, GNU make, and Ninja.
 # Requires host-toolchain.sh to have been run first.
 #
 # Layout:
@@ -445,3 +446,40 @@ make -j$(nproc) PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 dropbearmul
 
 cp $B/dropbear-build/dropbearmulti $SYSROOT/bin/dropbearmulti
 echo "Dropbear installed to $SYSROOT/bin/dropbearmulti"
+
+# 8. Build GNU make for WOS userspace
+WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_MAKE_BUILD_DIR="$B/make-build" \
+    "$B/../scripts/build/build_make.sh"
+
+# 9. Build Ninja for WOS userspace
+cd "$B/src"
+if [ ! -f ninja/CMakeLists.txt ]; then
+    if [ -d "$WORKSPACE_ROOT/.git" ]; then
+        git -C "$WORKSPACE_ROOT" submodule update --init --depth=1 toolchain/src/ninja || true
+    fi
+fi
+if [ ! -f ninja/CMakeLists.txt ]; then
+    git clone --depth=1 https://github.com/Pascu-Victor/ninja.git ninja
+fi
+
+WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_NINJA_BUILD_DIR="$B/ninja-build" \
+    "$B/../scripts/build/build_ninja_for_wos.sh"
+
+# 10. Build CPython for WOS userspace
+cd "$B/src"
+PYTHON_GIT_BRANCH="${WOS_PYTHON_GIT_BRANCH:-main}"
+if [ ! -f python/configure ]; then
+    if [ -d "$WORKSPACE_ROOT/.git" ]; then
+        git -C "$WORKSPACE_ROOT" submodule update --init --depth=1 toolchain/src/python || true
+    fi
+fi
+if [ ! -f python/configure ]; then
+    git clone --depth=1 --branch "$PYTHON_GIT_BRANCH" https://github.com/Pascu-Victor/cpython.git python
+fi
+
+WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_PYTHON_SOURCE_DIR="$B/src/python" \
+    WOS_PYTHON_BUILD_DIR="$B/python-build" \
+    "$B/../scripts/build/build_python_for_wos.sh"
