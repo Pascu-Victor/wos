@@ -132,7 +132,7 @@ cmake -G Ninja \
  -DCOMPILER_RT_BUILD_BUILTINS=ON \
  -DCOMPILER_RT_BUILD_MEMPROF=OFF \
  -DCOMPILER_RT_BUILD_ORC=OFF \
- -DCOMPILER_RT_BUILD_PROFILE=OFF \
+ -DCOMPILER_RT_BUILD_PROFILE=ON \
  -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
  -DCOMPILER_RT_HAS_SAFESTACK=OFF \
  -DCOMPILER_RT_OS_DIR="" \
@@ -170,6 +170,11 @@ ln -fs $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.crtend-x86_64.a $HOST/lib
 ln -fs $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.asan_static-x86_64.a $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.asan_static.a
 ln -fs $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.asan-x86_64.a $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.asan.a
 ln -fs $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.asan_cxx-x86_64.a $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.asan_cxx.a
+if [ ! -f $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.profile-x86_64.a ]; then
+  echo "ERROR: compiler-rt did not install libclang_rt.profile-x86_64.a" >&2
+  exit 1
+fi
+ln -fs $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.profile-x86_64.a $HOST/lib/clang/22/lib/$TARGET_ARCH/libclang_rt.profile.a
 
 # 3. Bootstrap libcxx (headers only, needed by mlibc)
 
