@@ -35,6 +35,7 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF CACHE BOOL "Disable C++ modules" FORCE)
 
 option(WOS_UASAN "Enable AddressSanitizer instrumentation for WOS userspace modules" OFF)
 set(WOS_UASAN_RUNTIME_DIR "" CACHE PATH "Clang runtime directory containing WOS AddressSanitizer libraries")
+option(WOS_USERSPACE_COVERAGE "Enable LLVM source-based coverage instrumentation for WOS userspace modules" OFF)
 option(WOS_DYNAMIC_USERSPACE_PIE "Build dynamic WOS userspace executables as PIE" OFF)
 option(WOS_DYNAMIC_USERSPACE_NO_PLT "Use GOT calls instead of PLT stubs for dynamic WOS userspace executables" OFF)
 
@@ -209,6 +210,22 @@ if(WOS_UASAN)
     foreach(user_target IN LISTS WOS_USERSPACE_LOGGING_TARGETS)
         if(TARGET ${user_target} AND TARGET journal_lib)
             set_property(TARGET ${user_target} APPEND PROPERTY LINK_LIBRARIES journal_lib)
+        endif()
+    endforeach()
+endif()
+
+if(WOS_USERSPACE_COVERAGE)
+    foreach(user_target IN LISTS WOS_USERSPACE_TARGETS)
+        if(TARGET ${user_target})
+            set_target_properties(${user_target} PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
+            target_compile_options(${user_target} PRIVATE
+                "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-fprofile-instr-generate;-fcoverage-mapping;-mllvm;-runtime-counter-relocation;-fno-omit-frame-pointer;-fno-lto>"
+            )
+            target_link_options(${user_target} PRIVATE
+                -fprofile-instr-generate
+                -fno-lto
+            )
+            target_compile_definitions(${user_target} PRIVATE WOS_USERSPACE_COVERAGE=1)
         endif()
     endforeach()
 endif()

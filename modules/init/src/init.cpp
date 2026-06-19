@@ -140,6 +140,8 @@ auto main(int argc, char** argv) -> int {
         }
     }
 
+    configure_init_coverage_profile();
+
     ker::abi::vfs::mkdir("/var", 0755);
     ker::abi::vfs::mkdir("/var/log", 0755);
     ker::abi::vfs::mkdir("/var/log/journal", 0755);
