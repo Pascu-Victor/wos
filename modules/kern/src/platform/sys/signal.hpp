@@ -63,5 +63,6 @@ inline auto signal_frame_address_for_task(const sched::task::Task& task, uint64_
 void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& frame);
 void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, gates::InterruptFrame& frame);
 void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDelivery delivery);
+void sync_task_signal_mask_cache(sched::task::Task* task);
 
 }  // namespace ker::mod::sys::signal

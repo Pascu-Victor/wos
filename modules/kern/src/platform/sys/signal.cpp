@@ -59,6 +59,9 @@ constexpr uint64_t USER_RFLAGS_ALLOWED_MASK = USER_RFLAGS_CF | USER_RFLAGS_FIXED
                                               USER_RFLAGS_SF | USER_RFLAGS_TF | USER_RFLAGS_IF | USER_RFLAGS_DF | USER_RFLAGS_OF |
                                               USER_RFLAGS_RF | USER_RFLAGS_AC | USER_RFLAGS_ID;
 constexpr uint64_t USER_RFLAGS_REQUIRED_MASK = USER_RFLAGS_FIXED_ONE | USER_RFLAGS_IF;
+constexpr uint64_t WOS_TCB_SIGNAL_MASK_OFFSET = 0x38;
+constexpr uint64_t WOS_TCB_SIGNAL_MASK_SEQ_OFFSET = 0x40;
+constexpr uint64_t WOS_TCB_SIGNAL_MASK_VALID_OFFSET = 0x48;
 
 // Helper: read a uint64_t from a stack slot
 auto stack_read(const uint8_t* base, int offset) -> uint64_t { return *reinterpret_cast<const uint64_t*>(base + offset); }
@@ -231,6 +234,29 @@ void handle_signal_frame_fault(Task* task) {
 
 namespace ker::mod::sys::signal {
 
+void sync_task_signal_mask_cache(sched::task::Task* task) {
+    if (task == nullptr || task->pagemap == nullptr || task->thread == nullptr || task->thread->fsbase == 0) {
+        return;
+    }
+
+    uint64_t const TCB = task->thread->fsbase;
+    uint32_t invalid = 0;
+    uint32_t valid = 1;
+    uint64_t const MASK = task->sig_mask;
+    uint64_t const SEQ = ++task->sig_mask_seq;
+
+    if (!copy_to_task_user(*task, TCB + WOS_TCB_SIGNAL_MASK_VALID_OFFSET, &invalid, sizeof(invalid))) {
+        return;
+    }
+    if (!copy_to_task_user(*task, TCB + WOS_TCB_SIGNAL_MASK_OFFSET, &MASK, sizeof(MASK))) {
+        return;
+    }
+    if (!copy_to_task_user(*task, TCB + WOS_TCB_SIGNAL_MASK_SEQ_OFFSET, &SEQ, sizeof(SEQ))) {
+        return;
+    }
+    (void)copy_to_task_user(*task, TCB + WOS_TCB_SIGNAL_MASK_VALID_OFFSET, &valid, sizeof(valid));
+}
+
 // Called from syscall.asm after the deferred task switch check, before returning
 // to userspace. Handles both sigreturn (context restore) and signal delivery.
 //
@@ -261,6 +287,7 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
 
         // Restore signal mask
         task->sig_mask = frame.saved_mask;
+        sync_task_signal_mask_cache(task);
 
         // Restore GP registers to the on-stack positions
         for (int i = 0; i < 15; i++) {
@@ -302,6 +329,7 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
         if (SIGNO == WOS_SIGCHLD || SIGNO == WOS_SIGURG || SIGNO == WOS_SIGWINCH || SIGNO == WOS_SIGCONT) {
             if (task->sigsuspend_active) {
                 task->sig_mask = task->signal_frame_saved_mask();
+                sync_task_signal_mask_cache(task);
             }
             return 0;  // Ignore
         }
@@ -333,6 +361,7 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
         task->sig_pending &= ~(1ULL << IDX);
         if (task->sigsuspend_active) {
             task->sig_mask = task->signal_frame_saved_mask();
+            sync_task_signal_mask_cache(task);
         }
         return 0;
     }
@@ -388,6 +417,7 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
     if ((handler.flags & 0x40000000ULL) == 0U) {  // SA_NODEFER = 0x40000000
         task->sig_mask |= (1ULL << IDX);
     }
+    sync_task_signal_mask_cache(task);
 
     task->in_signal_handler = true;
     return 0;
@@ -425,6 +455,7 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
         if (SIGNO == WOS_SIGCHLD || SIGNO == WOS_SIGURG || SIGNO == WOS_SIGWINCH || SIGNO == WOS_SIGCONT) {
             if (task->sigsuspend_active) {
                 task->sig_mask = task->signal_frame_saved_mask();
+                sync_task_signal_mask_cache(task);
             }
             return;
         }
@@ -450,6 +481,7 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
         task->sig_pending &= ~(1ULL << IDX);
         if (task->sigsuspend_active) {
             task->sig_mask = task->signal_frame_saved_mask();
+            sync_task_signal_mask_cache(task);
         }
         return;
     }
@@ -491,6 +523,7 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
     if ((handler.flags & 0x40000000ULL) == 0U) {
         task->sig_mask |= (1ULL << IDX);
     }
+    sync_task_signal_mask_cache(task);
     task->in_signal_handler = true;
 }
 
@@ -558,6 +591,7 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
     if ((handler.flags & 0x40000000ULL) == 0U) {
         task->sig_mask |= (1ULL << IDX);
     }
+    sync_task_signal_mask_cache(task);
     task->in_signal_handler = true;
     task->context.regs = gpr;
     task->context.frame = frame;
@@ -603,6 +637,7 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
         if (SIGNO == WOS_SIGCHLD || SIGNO == WOS_SIGURG || SIGNO == WOS_SIGWINCH || SIGNO == WOS_SIGCONT) {
             if (task->sigsuspend_active) {
                 task->sig_mask = task->signal_frame_saved_mask();
+                sync_task_signal_mask_cache(task);
             }
             return;
         }
@@ -619,6 +654,7 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
         task->sig_pending &= ~(1ULL << IDX);
         if (task->sigsuspend_active) {
             task->sig_mask = task->signal_frame_saved_mask();
+            sync_task_signal_mask_cache(task);
         }
         return;
     }
@@ -657,6 +693,7 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
     if ((handler.flags & 0x40000000ULL) == 0U) {
         task->sig_mask |= (1ULL << IDX);
     }
+    sync_task_signal_mask_cache(task);
     task->in_signal_handler = true;
 }
 

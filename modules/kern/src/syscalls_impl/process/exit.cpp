@@ -67,10 +67,12 @@ void fill_rusage_for_waiter(ker::mod::sched::task::Task* waiter, ker::mod::sched
     }
     waiter->wait_rusage_phys_addr = PHYS;
     auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
-    ru->ru_utime_sec = static_cast<int64_t>(child->user_time_us / 1000000ULL);
-    ru->ru_utime_usec = static_cast<int64_t>(child->user_time_us % 1000000ULL);
-    ru->ru_stime_sec = static_cast<int64_t>(child->system_time_us / 1000000ULL);
-    ru->ru_stime_usec = static_cast<int64_t>(child->system_time_us % 1000000ULL);
+    uint64_t const USER_TIME_US = ker::mod::sched::task::task_rusage_user_time_us(*child);
+    uint64_t const SYSTEM_TIME_US = ker::mod::sched::task::task_rusage_system_time_us(*child);
+    ru->ru_utime_sec = static_cast<int64_t>(USER_TIME_US / 1000000ULL);
+    ru->ru_utime_usec = static_cast<int64_t>(USER_TIME_US % 1000000ULL);
+    ru->ru_stime_sec = static_cast<int64_t>(SYSTEM_TIME_US / 1000000ULL);
+    ru->ru_stime_usec = static_cast<int64_t>(SYSTEM_TIME_US % 1000000ULL);
     waiter->wait_rusage_user_addr = 0;
     waiter->wait_rusage_phys_addr = 0;
 }

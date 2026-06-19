@@ -27,6 +27,7 @@
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sched/threading.hpp"
+#include "platform/sys/signal.hpp"
 #include "release.hpp"
 #include "syscalls_impl/process/exec.hpp"
 #include "syscalls_impl/process/exit.hpp"
@@ -540,6 +541,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         child_thread->tls_phys_ptr = 0;
         child_thread->stack_phys_ptr = 0;
         child->thread = child_thread;
+        ker::mod::sys::signal::sync_task_signal_mask_cache(child);
     } else {
         child->thread = nullptr;
     }
@@ -831,18 +833,23 @@ auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr) -> uin
         uint64_t const UNBLOCKABLE = (1ULL << (WOS_SIGKILL - 1)) | (1ULL << (WOS_SIGSTOP - 1));
         set &= ~UNBLOCKABLE;
 
+        uint64_t new_mask = task->sig_mask;
         switch (how) {
             case 0:  // SIG_BLOCK
-                task->sig_mask |= set;
+                new_mask |= set;
                 break;
             case 1:  // SIG_UNBLOCK
-                task->sig_mask &= ~set;
+                new_mask &= ~set;
                 break;
             case 2:  // SIG_SETMASK
-                task->sig_mask = set;
+                new_mask = set;
                 break;
             default:
                 return static_cast<uint64_t>(-EINVAL);
+        }
+        if (new_mask != task->sig_mask) {
+            task->sig_mask = new_mask;
+            ker::mod::sys::signal::sync_task_signal_mask_cache(task);
         }
     }
 
@@ -882,6 +889,7 @@ auto wos_proc_sigsuspend(uint64_t set_ptr, ker::mod::cpu::GPRegs& gpr) -> uint64
     task->sigsuspend_saved_mask = task->sig_mask;
     task->sigsuspend_active = true;
     task->sig_mask = set;
+    ker::mod::sys::signal::sync_task_signal_mask_cache(task);
 
     if ((task->sig_pending & ~task->sig_mask) != 0) {
         return static_cast<uint64_t>(-EINTR);
@@ -1007,6 +1015,7 @@ auto wos_proc_clone_vm(const CloneVmArgs* args) -> uint64_t {
     child_thread->stack_base_virt = 0;
     child_thread->stack_lowest_backed = 0;
     child->thread = child_thread;
+    ker::mod::sys::signal::sync_task_signal_mask_cache(child);
 
     child->context.syscall_kernel_stack = KERNEL_RSP;
     auto* per_cpu = new cpu::PerCpu();
@@ -1121,6 +1130,7 @@ auto wos_proc_arch_prctl(int option, uint64_t arg2) -> uint64_t {
         case WOS_ARCH_SET_FS:
             task->thread->fsbase = arg2;
             ker::mod::cpu::wrfsbase(arg2);
+            ker::mod::sys::signal::sync_task_signal_mask_cache(task);
             return 0;
         case WOS_ARCH_GET_FS:
             if (arg2 == 0) {

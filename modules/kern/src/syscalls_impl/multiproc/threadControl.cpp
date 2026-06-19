@@ -12,6 +12,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/context_switch.hpp>
+#include <platform/sys/signal.hpp>
 #include <vfs/vfs.hpp>
 
 #include "abi/callnums/multiproc.h"
@@ -97,7 +98,11 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
     switch (op) {
         case abi::multiproc::threadControlOps::SET_TCB: {
             void* tcb = arg1;
-            return mod::smt::set_tcb(tcb);
+            uint64_t const RET = mod::smt::set_tcb(tcb);
+            if (RET == 0) {
+                mod::sys::signal::sync_task_signal_mask_cache(mod::sched::get_current_task());
+            }
+            return RET;
         }
 
         case abi::multiproc::threadControlOps::YIELD: {
@@ -144,6 +149,7 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
                 mod::sched::task::destroy_unpublished_user_thread(t);
                 return static_cast<uint64_t>(-EFAULT);
             }
+            mod::sys::signal::sync_task_signal_mask_cache(t);
 
             bool const POSTED = mod::sched::post_task_for_cpu(TARGET_CPU, t);
             if (!POSTED) {

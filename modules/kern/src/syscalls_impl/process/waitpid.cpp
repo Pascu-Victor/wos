@@ -25,10 +25,12 @@ void fill_rusage(uint64_t rusage_phys_addr, ker::mod::sched::task::Task* child) 
         return;
     }
     auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::get_virt_pointer(rusage_phys_addr));
-    ru->ru_utime_sec = static_cast<int64_t>(child->user_time_us / 1000000ULL);
-    ru->ru_utime_usec = static_cast<int64_t>(child->user_time_us % 1000000ULL);
-    ru->ru_stime_sec = static_cast<int64_t>(child->system_time_us / 1000000ULL);
-    ru->ru_stime_usec = static_cast<int64_t>(child->system_time_us % 1000000ULL);
+    uint64_t const USER_TIME_US = sched_task::task_rusage_user_time_us(*child);
+    uint64_t const SYSTEM_TIME_US = sched_task::task_rusage_system_time_us(*child);
+    ru->ru_utime_sec = static_cast<int64_t>(USER_TIME_US / 1000000ULL);
+    ru->ru_utime_usec = static_cast<int64_t>(USER_TIME_US % 1000000ULL);
+    ru->ru_stime_sec = static_cast<int64_t>(SYSTEM_TIME_US / 1000000ULL);
+    ru->ru_stime_usec = static_cast<int64_t>(SYSTEM_TIME_US % 1000000ULL);
 }
 
 // Sentinel value: waitingForPid == WAIT_ANY_CHILD means "wait for any child"

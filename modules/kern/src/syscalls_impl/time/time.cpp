@@ -9,6 +9,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/rtc/rtc.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sched/task.hpp>
 #include <platform/tsc/tsc.hpp>
 
 #include "abi/callnums/time.h"
@@ -34,6 +35,34 @@ constexpr uint64_t WOS_CLK_TCK = 100;
 
 // Convert microseconds to clock ticks (CLK_TCK = 100, so 1 tick = 10000 us)
 auto us_to_ticks(uint64_t us) -> uint64_t { return us / (1000000 / WOS_CLK_TCK); }
+
+auto task_cpu_time_ns(ker::mod::sched::task::Task* task) -> uint64_t {
+    if (task == nullptr) {
+        return 0;
+    }
+    return (task->user_time_us + task->system_time_us) * 1000ULL;
+}
+
+auto process_cpu_time_ns(ker::mod::sched::task::Task* current) -> uint64_t {
+    if (current == nullptr) {
+        return 0;
+    }
+
+    uint64_t const PROCESS_PID = ker::mod::sched::task::process_pid(*current);
+    uint64_t total_ns = 0;
+    uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < TASK_COUNT; ++i) {
+        auto* task = ker::mod::sched::get_active_task_at_safe(i);
+        if (task == nullptr) {
+            continue;
+        }
+        if (ker::mod::sched::task::same_thread_group(*task, PROCESS_PID)) {
+            total_ns += task_cpu_time_ns(task);
+        }
+        task->release();
+    }
+    return total_ns;
+}
 
 auto relative_timespec_to_us(const struct timespec& ts, uint64_t& out_us) -> bool {
     out_us = 0;
@@ -112,17 +141,19 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 uint64_t const EPOCH_NS = ker::mod::rtc::get_epoch_ns();
                 ts->tv_sec = static_cast<long>(EPOCH_NS / 1000000000ULL);
                 ts->tv_nsec = static_cast<long>(EPOCH_NS % 1000000000ULL);
+            } else if (CLOCK_ID == 2) {
+                auto* task = ker::mod::sched::get_current_task();
+                uint64_t const CPU_NS = process_cpu_time_ns(task);
+                ts->tv_sec = static_cast<long>(CPU_NS / 1000000000ULL);
+                ts->tv_nsec = static_cast<long>(CPU_NS % 1000000000ULL);
             } else if (CLOCK_ID == 3) {
                 // CLOCK_THREAD_CPUTIME_ID: kernel-tracked on-CPU time for this task.
                 // user_time_us + system_time_us are accumulated by the scheduler's
                 // timer tick handler (process_tasks) each time this task is current.
                 auto* task = ker::mod::sched::get_current_task();
-                uint64_t cpu_ns = 0;
-                if (task != nullptr) {
-                    cpu_ns = (task->user_time_us + task->system_time_us) * 1000ULL;
-                }
-                ts->tv_sec = static_cast<long>(cpu_ns / 1000000000ULL);
-                ts->tv_nsec = static_cast<long>(cpu_ns % 1000000000ULL);
+                uint64_t const CPU_NS = task_cpu_time_ns(task);
+                ts->tv_sec = static_cast<long>(CPU_NS / 1000000000ULL);
+                ts->tv_nsec = static_cast<long>(CPU_NS % 1000000000ULL);
             } else {
                 // CLOCK_MONOTONIC (and any other id): TSC nanoseconds since boot
                 uint64_t mono_ns = 0;
