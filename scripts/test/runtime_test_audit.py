@@ -36,7 +36,10 @@ TESTD_PASS_RE = re.compile(r"\[TESTD\]\s+(?P<index>\d+)/(?P<total>\d+)\s+PASS:\s
 TESTD_FAIL_RE = re.compile(r"\[TESTD\].*\bFAIL\b")
 TESTD_DONE_RE = re.compile(r"\[TESTD\]\s+DONE:\s+(?P<passed>\d+)\s+passed,\s+(?P<failed>\d+)\s+failed")
 
-USERLAND_CASE_RE = re.compile(r"^\s*(?:run_case|skip_case|require_exe)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b", re.MULTILINE)
+USERLAND_CASE_RE = re.compile(
+    r"^\s*(?:run_case|run_case_with_timeout|skip_case|require_exe)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b",
+    re.MULTILINE,
+)
 USERLAND_RUN_START_RE = re.compile(r"^WOS userland suite$")
 USERLAND_SUMMARY_START_RE = re.compile(r"^=== WOS USERLAND SUITE SUMMARY ===$")
 USERLAND_BLOCK_START_RE = re.compile(r"^(?:WOS userland suite|=== WOS USERLAND SUITE SUMMARY ===)$")

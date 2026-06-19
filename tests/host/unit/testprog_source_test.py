@@ -11,6 +11,8 @@ PERFBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "perfbench.cpp"
 COWBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "cowbench.cpp"
 MANDELBENCH_WKI_CPP = ROOT / "modules" / "testprog" / "src" / "mandelbench" / "mandelbench_wki.cpp"
 USERLAND_SUITE = ROOT / "configs" / "drive" / "srv" / "wos_userland_suite.sh"
+RUN_USERLAND_SUITE = ROOT / "scripts" / "bench" / "run_wos_userland_suite.sh"
+WOS_SSH = ROOT / "scripts" / "remote" / "wos_ssh.sh"
 
 
 def fail(message: str) -> None:
@@ -251,14 +253,105 @@ def test_netbench_io_is_deadline_bounded() -> None:
 
 def test_userland_suite_passes_netbench_timeout() -> None:
     source = USERLAND_SUITE.read_text()
-    require_tokens(source, ["NETBENCH_TIMEOUT_MS=\"${WOS_SUITE_NETBENCH_TIMEOUT_MS:-30000}\""], "suite netbench timeout default")
+    run_netbench_one = shell_function_body(source, "run_netbench_one")
+    case_netbench_loopback = shell_function_body(source, "case_netbench_loopback")
+    abort_netbench_case = shell_function_body(source, "abort_netbench_case")
+    require_tokens(
+        source,
+        [
+            "NETBENCH_TIMEOUT_MS=\"${WOS_SUITE_NETBENCH_TIMEOUT_MS:-30000}\"",
+            "SUITE_REVISION=\"case-watchdog-v5\"",
+            "SUITE_REVISION=%s",
+            "NETBENCH_CASE_TIMEOUT_SECONDS=\"${WOS_SUITE_NETBENCH_CASE_TIMEOUT_SECONDS:-120}\"",
+            "invalid WOS_SUITE_NETBENCH_CASE_TIMEOUT_SECONDS=%s; using 120",
+            "NETBENCH_CASE_TIMEOUT_SECONDS=%s",
+            "run_case_with_timeout netbench_loopback \"$NETBENCH_CASE_TIMEOUT_SECONDS\" case_netbench_loopback",
+        ],
+        "suite netbench timeout default",
+    )
     if source.count("--timeout-ms \"$NETBENCH_TIMEOUT_MS\"") < 3:
         fail("wos-userland-suite must pass --timeout-ms to the netbench server and both client modes")
+    require_tokens(
+        run_netbench_one,
+        [
+            "client_log=\"$WORK_DIR/netbench-$mode-client.log\"",
+            "server_status=\"$WORK_DIR/netbench-$mode-server.status\"",
+            "client_status=\"$WORK_DIR/netbench-$mode-client.status\"",
+            "NETBENCH_CHILD_PIDS=\"$server_pid $client_pid\"",
+            "while [ ! -f \"$client_status\" ] || [ ! -f \"$server_status\" ]",
+            "cleanup_netbench_children",
+            "if [ \"$timed_out\" -eq 1 ]; then",
+            "netbench %s client log retained at %s",
+            "netbench %s server log retained at %s",
+            "print_netbench_log \"netbench $mode client log\" \"$client_log\"",
+            "print_netbench_log \"netbench $mode server log\" \"$server_log\"",
+            "netbench %s timed out after %ss",
+        ],
+        "suite netbench bounded child handling",
+    )
+    cleanup_netbench_children = shell_function_body(source, "cleanup_netbench_children")
+    require_tokens(
+        cleanup_netbench_children,
+        [
+            "netbench_stop_pid \"$pid\"",
+            "sleep \"$TIMEOUT_KILL_GRACE_SECONDS\"",
+            "netbench_kill_pid \"$pid\"",
+            "netbench_wait_pid \"$pid\"",
+            "NETBENCH_CHILD_PIDS=",
+        ],
+        "suite netbench cleanup waits killed children",
+    )
+    require_order(
+        cleanup_netbench_children,
+        "netbench_kill_pid \"$pid\"",
+        "netbench_wait_pid \"$pid\"",
+        "netbench cleanup waits after kill",
+    )
+    require_order(
+        run_netbench_one,
+        "if [ \"$timed_out\" -eq 1 ]; then",
+        "print_netbench_log \"netbench $mode client log\" \"$client_log\"",
+        "suite netbench timeout skips child log replay",
+    )
+    if "cat \"$server_log\"" in run_netbench_one or "cat \"$client_log\"" in run_netbench_one:
+        fail("wos-userland-suite must not cat possibly empty netbench logs directly")
+    require_tokens(
+        run_netbench_one,
+        [
+            "server_rc_now=\"$(netbench_status \"$server_status\")\"\n            if [ \"$server_rc_now\" != \"0\" ]; then\n                cleanup_netbench_children",
+            "client_rc_now=\"$(netbench_status \"$client_status\")\"\n            if [ \"$client_rc_now\" != \"0\" ]; then\n                cleanup_netbench_children",
+        ],
+        "suite netbench asymmetric failure cleanup",
+    )
+    require_tokens(
+        case_netbench_loopback,
+        [
+            "trap abort_netbench_case TERM INT HUP",
+            "if run_netbench_one pingpong; then",
+            "run_netbench_one stream || rc=1",
+            "else",
+            "rc=1",
+            "cleanup_netbench_children",
+            "trap - TERM INT HUP",
+        ],
+        "suite netbench cleanup trap",
+    )
+    require_tokens(
+        abort_netbench_case,
+        [
+            "cleanup_netbench_children",
+            "trap - TERM INT HUP",
+            "exit 124",
+        ],
+        "suite netbench abort trap",
+    )
 
 
 def test_userland_suite_cases_are_watchdog_bounded() -> None:
     source = USERLAND_SUITE.read_text()
     run_case = shell_function_body(source, "run_case")
+    run_case_with_timeout = shell_function_body(source, "run_case_with_timeout")
+    status_file_value = shell_function_body(source, "status_file_value")
     require_tokens(
         source,
         [
@@ -272,38 +365,184 @@ def test_userland_suite_cases_are_watchdog_bounded() -> None:
         run_case,
         [
             "timeout_marker=\"$WORK_DIR/$name.timeout\"",
-            "rm -f \"$timeout_marker\"",
+            "case_status=\"$WORK_DIR/$name.status\"",
+            "rm -f \"$timeout_marker\" \"$case_status\"",
             "if [ \"$CASE_TIMEOUT_SECONDS\" -gt 0 ]",
-            "\"$@\" > \"$log\" 2>&1 &",
+            "printf '%s\\n' \"$?\" > \"$case_status\"",
+            ") > \"$log\" 2>&1 &",
             "case_pid=\"$!\"",
-            "cleanup_watchdog()",
-            "trap cleanup_watchdog TERM INT HUP",
-            "sleep \"$CASE_TIMEOUT_SECONDS\" &",
+            "trap 'exit 0' TERM INT HUP",
+            "watchdog_elapsed=0",
+            "while [ \"$watchdog_elapsed\" -lt \"$CASE_TIMEOUT_SECONDS\" ]",
+            "watchdog_elapsed=$((watchdog_elapsed + 1))",
             "kill -TERM \"-$case_pid\"",
             "kill \"$case_pid\"",
+            "if [ ! -f \"$case_status\" ]",
             "printf 'timeout after %ss\\n' \"$CASE_TIMEOUT_SECONDS\" > \"$timeout_marker\"",
-            "sleep \"$TIMEOUT_KILL_GRACE_SECONDS\" &",
+            "grace_elapsed=0",
+            "while [ \"$grace_elapsed\" -lt \"$TIMEOUT_KILL_GRACE_SECONDS\" ]",
+            "grace_elapsed=$((grace_elapsed + 1))",
             "kill -KILL \"-$case_pid\"",
             "kill -KILL \"$case_pid\"",
             "watchdog_pid=\"$!\"",
-            "wait \"$case_pid\"",
-            "kill -TERM \"-$watchdog_pid\"",
-            "kill \"$watchdog_pid\"",
+            "while [ ! -f \"$case_status\" ]",
+            "if [ -f \"$timeout_marker\" ]",
+            "rc=\"$(status_file_value \"$case_status\")\"",
+            "wait \"$case_pid\" 2>/dev/null || true",
             "wait \"$watchdog_pid\" 2>/dev/null || true",
+            "if [ ! -f \"$case_status\" ]; then\n            wait \"$case_pid\" 2>/dev/null || true\n        fi",
             "timed_out=1",
             "rc=124",
             "printf '\\nTIMEOUT %s after %ss\\n' \"$name\" \"$CASE_TIMEOUT_SECONDS\" >> \"$log\"",
+            "case log retained at %s after timeout",
+            "cat_log_file \"$log\"",
             "record_summary \"$name\" \"FAIL\" \"timeout=${CASE_TIMEOUT_SECONDS}s ${duration}s\"",
         ],
         "suite run_case watchdog path",
     )
-    require_order(run_case, "sleep \"$CASE_TIMEOUT_SECONDS\" &", "kill -TERM \"-$case_pid\"", "suite timeout TERM order")
+    if "cat \"$log\"" in run_case:
+        fail("wos-userland-suite must not cat possibly empty case logs directly")
+    require_tokens(
+        status_file_value,
+        [
+            "read -r status_value < \"$status_file\" || status_value=124",
+            "\"\"|*[!0-9]*)",
+            "printf '124\\n'",
+            "printf '%s\\n' \"$status_value\"",
+        ],
+        "suite status file sanitizing",
+    )
+    if "sleep \"$CASE_TIMEOUT_SECONDS\"" in run_case:
+        fail("suite watchdog must not rely on a full-timeout sleeper that has to be killed after passing cases")
+    if "kill -TERM \"-$watchdog_pid\"" in run_case or "kill \"$watchdog_pid\"" in run_case:
+        fail("suite watchdog must self-exit from the case status file instead of requiring signal cleanup")
+    require_order(run_case, "while [ \"$watchdog_elapsed\" -lt \"$CASE_TIMEOUT_SECONDS\" ]", "kill -TERM \"-$case_pid\"", "suite timeout TERM order")
     require_order(run_case, "kill -TERM \"-$case_pid\"", "printf 'timeout after %ss\\n'", "suite timeout marker order")
-    require_order(run_case, "printf 'timeout after %ss\\n'", "sleep \"$TIMEOUT_KILL_GRACE_SECONDS\" &", "suite timeout grace order")
-    require_order(run_case, "sleep \"$TIMEOUT_KILL_GRACE_SECONDS\" &", "kill -KILL \"-$case_pid\"", "suite timeout KILL order")
-    require_order(run_case, "wait \"$case_pid\"", "kill -TERM \"-$watchdog_pid\"", "suite watchdog cleanup order")
-    require_order(run_case, "if [ -f \"$timeout_marker\" ]", "rc=124", "suite timeout rc order")
+    require_order(run_case, "printf 'timeout after %ss\\n'", "while [ \"$grace_elapsed\" -lt \"$TIMEOUT_KILL_GRACE_SECONDS\" ]", "suite timeout grace order")
+    require_order(run_case, "while [ \"$grace_elapsed\" -lt \"$TIMEOUT_KILL_GRACE_SECONDS\" ]", "kill -KILL \"-$case_pid\"", "suite timeout KILL order")
+    require_order(run_case, "while [ ! -f \"$case_status\" ]", "wait \"$watchdog_pid\" 2>/dev/null || true", "suite watchdog wait order")
+    require_order(run_case, "if [ -f \"$timeout_marker\" ]", "printf '\\nTIMEOUT %s after %ss\\n'", "suite timeout marker accounting order")
+    require_order(run_case, "if [ \"$timed_out\" -eq 1 ]", "cat_log_file \"$log\"", "suite skips timeout log replay")
     require_order(run_case, "elif [ \"$timed_out\" -eq 1 ]", "record_summary \"$name\" \"FAIL\"", "suite timeout accounting order")
+    require_tokens(
+        run_case_with_timeout,
+        [
+            "old_case_timeout=\"$CASE_TIMEOUT_SECONDS\"",
+            "CASE_TIMEOUT_SECONDS=\"$timeout_seconds\"",
+            "run_case \"$name\" \"$@\"",
+            "CASE_TIMEOUT_SECONDS=\"$old_case_timeout\"",
+        ],
+        "suite per-case timeout override",
+    )
+
+
+def test_userland_suite_can_request_guest_shutdown() -> None:
+    source = USERLAND_SUITE.read_text()
+    wrapper = RUN_USERLAND_SUITE.read_text()
+    shutdown_body = shell_function_body(source, "request_suite_shutdown")
+    require_tokens(
+        source,
+        [
+            "SUITE_SHUTDOWN=\"${WOS_SUITE_SHUTDOWN:-0}\"",
+            "shutdown|poweroff)",
+            "SUITE_SHUTDOWN=poweroff",
+            "suite_rc=0",
+            "request_suite_shutdown",
+            "exit \"$suite_rc\"",
+        ],
+        "suite shutdown request configuration",
+    )
+    require_tokens(
+        shutdown_body,
+        [
+            "poweroff)",
+            "shutdown_cmd=/sbin/poweroff",
+            "halt)",
+            "shutdown_cmd=/sbin/halt",
+            "reboot)",
+            "shutdown_cmd=/sbin/reboot",
+            "REQUESTED_SHUTDOWN=%s",
+            "\"$shutdown_cmd\" -f",
+        ],
+        "suite shutdown command dispatch",
+    )
+    result_dir_pos = source.rfind("printf 'RESULT_DIR=%s\\n' \"$ARTIFACT_ROOT\"")
+    shutdown_call_pos = source.rfind("request_suite_shutdown")
+    exit_pos = source.rfind("exit \"$suite_rc\"")
+    if result_dir_pos < 0 or shutdown_call_pos < 0 or exit_pos < 0:
+        fail("suite shutdown tail markers not found")
+    if result_dir_pos >= shutdown_call_pos:
+        fail("suite must print artifact path before requesting shutdown")
+    if shutdown_call_pos >= exit_pos:
+        fail("suite must preserve result status after shutdown request")
+    require_tokens(
+        wrapper,
+        [
+            "--shutdown [poweroff|halt|reboot]",
+            "--sync-rootfs|--no-sync",
+            "--probe-timeout SECONDS",
+            "--timeout SECONDS",
+            "DEFAULT_NETBENCH_CASE_TIMEOUT_SECONDS=120",
+            "DEFAULT_PROBE_TIMEOUT=30",
+            "DEFAULT_REMOTE_TIMEOUT=7200",
+            "SHUTDOWN=\"\"",
+            "SYNC_ROOTFS=\"auto\"",
+            "CLUSTER_CONFIG=\"configs/cluster.json\"",
+            "SYNC_TIMEOUT=\"300\"",
+            "PROBE_TIMEOUT=\"$DEFAULT_PROBE_TIMEOUT\"",
+            "REMOTE_TIMEOUT=\"$DEFAULT_REMOTE_TIMEOUT\"",
+            "parse_nonnegative_seconds()",
+            "run_with_timeout()",
+            "timeout --kill-after=5s \"${seconds}s\" \"$@\"",
+            "has_env_assignment()",
+            "host_is_vm_alias()",
+            "should_sync_rootfs()",
+            "sync_suite_script()",
+            "local_suite_revision()",
+            "verify_remote_suite_revision()",
+            "suite_requested_shutdown_success()",
+            "grep '^SUITE_REVISION='",
+            "run_with_timeout \"$PROBE_TIMEOUT\"",
+            "Remote $REMOTE_SCRIPT is stale or missing SUITE_REVISION",
+            "WOS_SUITE_SHUTDOWN=$SHUTDOWN",
+            "WOS_SUITE_NETBENCH_CASE_TIMEOUT_SECONDS=$DEFAULT_NETBENCH_CASE_TIMEOUT_SECONDS",
+            "shutdown|poweroff)",
+            "--sync-timeout \"$SYNC_TIMEOUT\"",
+            "PROBE_TIMEOUT=\"$(parse_nonnegative_seconds \"--probe-timeout\" \"$2\")\"",
+            "REMOTE_TIMEOUT=\"$(parse_nonnegative_seconds \"--timeout\" \"$2\")\"",
+            "--filter configs/drive/srv/wos_userland_suite.sh",
+            "if should_sync_rootfs; then",
+            "sync_suite_script",
+            "verify_remote_suite_revision",
+            "run_with_timeout \"$REMOTE_TIMEOUT\"",
+            "\"${REMOTE_SCRIPTS}/wos_ssh.sh\" \"$HOST\" \"$REMOTE_CMD\" 2>&1",
+            "| tee \"$OUTPUT\"",
+            "STATUS=\"${PIPESTATUS[0]}\"",
+            "TIMEOUT after ${REMOTE_TIMEOUT}s",
+            "if [[ \"$STATUS\" -ne 0 && \"$STATUS\" -ne 124 ]] && suite_requested_shutdown_success; then",
+            "STATUS=0",
+            "awk -F= '/^RESULT_DIR=/ { value = $2 } END { print value }' \"$OUTPUT\"",
+        ],
+        "host userland suite wrapper shutdown flag",
+    )
+    if "sh -lc \"$REMOTE_CMD\"" in wrapper:
+        fail("host userland suite wrapper must pass the quoted remote command as one SSH command string")
+    if "RAW_RESULT=" in wrapper:
+        fail("host userland suite wrapper must stream remote output instead of buffering the SSH result")
+
+
+def test_wos_ssh_connect_path_is_bounded() -> None:
+    source = WOS_SSH.read_text()
+    require_tokens(
+        source,
+        [
+            "SSH_CONNECT_TIMEOUT=\"${WOS_SSH_CONNECT_TIMEOUT:-10}\"",
+            "-o ConnectTimeout=\"$SSH_CONNECT_TIMEOUT\"",
+            "-o ConnectionAttempts=1",
+            "-o BatchMode=yes",
+        ],
+        "wos ssh connection timeout",
+    )
 
 
 def test_perfbench_context_switch_counter_is_atomic() -> None:
@@ -738,6 +977,8 @@ def main() -> None:
     test_netbench_io_is_deadline_bounded()
     test_userland_suite_passes_netbench_timeout()
     test_userland_suite_cases_are_watchdog_bounded()
+    test_userland_suite_can_request_guest_shutdown()
+    test_wos_ssh_connect_path_is_bounded()
     test_perfbench_context_switch_counter_is_atomic()
     test_perfbench_parallel_workers_cleanup_before_failure_return()
     test_cowbench_child_wait_is_deadline_bounded()

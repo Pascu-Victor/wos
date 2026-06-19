@@ -14,10 +14,13 @@ shift
 
 REMOTE_USER="${WOS_SSH_USER:-root}"
 REMOTE_PORT="${WOS_SSH_PORT:-}"
+SSH_CONNECT_TIMEOUT="${WOS_SSH_CONNECT_TIMEOUT:-10}"
 
 SSH_ARGS=(
   -F /dev/null
   -o BatchMode=yes
+  -o ConnectTimeout="$SSH_CONNECT_TIMEOUT"
+  -o ConnectionAttempts=1
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null
   -o LogLevel=ERROR

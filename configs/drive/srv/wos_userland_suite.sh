@@ -13,6 +13,7 @@
 #   WOS_SUITE_KEEP_LARGE_WORK=1       # keep generated large *.bin files after successful runs
 #   WOS_SUITE_CASE_TIMEOUT_SECONDS=N   # override per-test timeout (0 disables)
 #   WOS_SUITE_TIMEOUT_KILL_GRACE_SECONDS=5
+#   WOS_SUITE_SHUTDOWN=poweroff|halt|reboot  # request shutdown after printing the summary
 
 # shellcheck disable=SC2329
 
@@ -28,6 +29,7 @@ timestamp() {
 }
 
 RUN_ID="${WOS_SUITE_RUN_ID:-$(timestamp)}"
+SUITE_REVISION="case-watchdog-v5"
 SCALE="${WOS_SUITE_SCALE:-full}"
 
 case "$SCALE" in
@@ -119,6 +121,7 @@ NETBENCH_ITERATIONS="${WOS_SUITE_NETBENCH_ITERATIONS:-$DEFAULT_NET_ITERATIONS}"
 NETBENCH_TOTAL_BYTES="${WOS_SUITE_NETBENCH_TOTAL_BYTES:-$DEFAULT_NET_TOTAL_BYTES}"
 NETBENCH_STARTUP_SECONDS="${WOS_SUITE_NETBENCH_STARTUP_SECONDS:-1}"
 NETBENCH_TIMEOUT_MS="${WOS_SUITE_NETBENCH_TIMEOUT_MS:-30000}"
+NETBENCH_CASE_TIMEOUT_SECONDS="${WOS_SUITE_NETBENCH_CASE_TIMEOUT_SECONDS:-120}"
 
 RUN_TESTD="${WOS_SUITE_RUN_TESTD:-1}"
 RUN_TESTPROG_PERF="${WOS_SUITE_RUN_TESTPROG_PERF:-$DEFAULT_RUN_TESTPROG_PERF}"
@@ -127,6 +130,7 @@ RUN_PERF_TRACE="${WOS_SUITE_RUN_PERF_TRACE:-1}"
 KEEP_LARGE_WORK="${WOS_SUITE_KEEP_LARGE_WORK:-0}"
 CASE_TIMEOUT_SECONDS="${WOS_SUITE_CASE_TIMEOUT_SECONDS:-$DEFAULT_CASE_TIMEOUT_SECONDS}"
 TIMEOUT_KILL_GRACE_SECONDS="${WOS_SUITE_TIMEOUT_KILL_GRACE_SECONDS:-5}"
+SUITE_SHUTDOWN="${WOS_SUITE_SHUTDOWN:-0}"
 
 case "$CASE_TIMEOUT_SECONDS" in
     ""|*[!0-9]*)
@@ -142,9 +146,58 @@ case "$TIMEOUT_KILL_GRACE_SECONDS" in
         ;;
 esac
 
+case "$NETBENCH_CASE_TIMEOUT_SECONDS" in
+    ""|*[!0-9]*)
+        printf 'invalid WOS_SUITE_NETBENCH_CASE_TIMEOUT_SECONDS=%s; using 120\n' "$NETBENCH_CASE_TIMEOUT_SECONDS"
+        NETBENCH_CASE_TIMEOUT_SECONDS=120
+        ;;
+esac
+
+case "$SUITE_SHUTDOWN" in
+    ""|0|false|False|FALSE|no|No|NO|none|None|NONE)
+        SUITE_SHUTDOWN=0
+        ;;
+    shutdown|poweroff)
+        SUITE_SHUTDOWN=poweroff
+        ;;
+    halt|reboot)
+        ;;
+    *)
+        printf 'invalid WOS_SUITE_SHUTDOWN=%s; shutdown request disabled\n' "$SUITE_SHUTDOWN"
+        SUITE_SHUTDOWN=0
+        ;;
+esac
+
 mkdir -p "$LOG_DIR" "$WORK_DIR"
 rm -f "$SUMMARY_FILE"
 ln -sfn "$ARTIFACT_ROOT" /tmp/wos-userland-suite-latest 2>/dev/null || true
+
+request_suite_shutdown() {
+    case "$SUITE_SHUTDOWN" in
+        0)
+            return 0
+            ;;
+        poweroff)
+            shutdown_cmd=/sbin/poweroff
+            ;;
+        halt)
+            shutdown_cmd=/sbin/halt
+            ;;
+        reboot)
+            shutdown_cmd=/sbin/reboot
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    printf 'REQUESTED_SHUTDOWN=%s\n' "$SUITE_SHUTDOWN"
+    if [ ! -x "$shutdown_cmd" ]; then
+        printf 'shutdown request skipped: missing %s\n' "$shutdown_cmd"
+        return 0
+    fi
+    "$shutdown_cmd" -f || printf 'shutdown request failed: %s -f rc=%s\n' "$shutdown_cmd" "$?"
+}
 
 record_summary() {
     printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$SUMMARY_FILE"
@@ -158,15 +211,40 @@ print_command() {
     printf '\n'
 }
 
+cat_log_file() {
+    log_file="$1"
+    if [ -s "$log_file" ]; then
+        cat "$log_file"
+    fi
+}
+
+status_file_value() {
+    status_file="$1"
+    if [ -f "$status_file" ]; then
+        read -r status_value < "$status_file" || status_value=124
+        case "$status_value" in
+            ""|*[!0-9]*)
+                printf '124\n'
+                ;;
+            *)
+                printf '%s\n' "$status_value"
+                ;;
+        esac
+    else
+        printf '124\n'
+    fi
+}
+
 run_case() {
     name="$1"
     shift
     log="$LOG_DIR/$name.log"
     timeout_marker="$WORK_DIR/$name.timeout"
+    case_status="$WORK_DIR/$name.status"
     start="$(date +%s 2>/dev/null || echo 0)"
     timed_out=0
 
-    rm -f "$timeout_marker"
+    rm -f "$timeout_marker" "$case_status"
 
     printf '\n=== RUN %s ===\n' "$name"
     print_command "$@"
@@ -181,42 +259,48 @@ run_case() {
         case "$-" in
             *m*) case_has_group=1 ;;
         esac
-        "$@" > "$log" 2>&1 &
+        (
+            "$@"
+            printf '%s\n' "$?" > "$case_status"
+        ) > "$log" 2>&1 &
         case_pid="$!"
         (
-            killed=0
-            timeout_sleep_pid=
-            grace_sleep_pid=
+            trap 'exit 0' TERM INT HUP
 
-            cleanup_watchdog() {
-                if [ -n "$timeout_sleep_pid" ]; then
-                    kill "$timeout_sleep_pid" >/dev/null 2>&1 || true
+            watchdog_elapsed=0
+            while [ "$watchdog_elapsed" -lt "$CASE_TIMEOUT_SECONDS" ]; do
+                if [ -f "$case_status" ]; then
+                    exit 0
                 fi
-                if [ -n "$grace_sleep_pid" ]; then
-                    kill "$grace_sleep_pid" >/dev/null 2>&1 || true
-                fi
+                sleep 1
+                watchdog_elapsed=$((watchdog_elapsed + 1))
+            done
+
+            if [ -f "$case_status" ]; then
                 exit 0
-            }
-
-            trap cleanup_watchdog TERM INT HUP
-
-            sleep "$CASE_TIMEOUT_SECONDS" &
-            timeout_sleep_pid="$!"
-            wait "$timeout_sleep_pid" || exit 0
-            timeout_sleep_pid=
-
-            if [ "$case_has_group" -eq 1 ] && kill -TERM "-$case_pid" >/dev/null 2>&1; then
-                killed=1
-            elif kill "$case_pid" >/dev/null 2>&1; then
-                killed=1
             fi
 
-            if [ "$killed" -eq 1 ]; then
+            if [ "$case_has_group" -eq 1 ]; then
+                kill -TERM "-$case_pid" >/dev/null 2>&1 || kill "$case_pid" >/dev/null 2>&1 || true
+            else
+                kill "$case_pid" >/dev/null 2>&1 || true
+            fi
+
+            if [ ! -f "$case_status" ]; then
                 printf 'timeout after %ss\n' "$CASE_TIMEOUT_SECONDS" > "$timeout_marker"
-                sleep "$TIMEOUT_KILL_GRACE_SECONDS" &
-                grace_sleep_pid="$!"
-                wait "$grace_sleep_pid" || exit 0
-                grace_sleep_pid=
+
+                grace_elapsed=0
+                while [ "$grace_elapsed" -lt "$TIMEOUT_KILL_GRACE_SECONDS" ]; do
+                    if [ -f "$case_status" ]; then
+                        exit 0
+                    fi
+                    sleep 1
+                    grace_elapsed=$((grace_elapsed + 1))
+                done
+
+                if [ -f "$case_status" ]; then
+                    exit 0
+                fi
 
                 if [ "$case_has_group" -eq 1 ]; then
                     kill -KILL "-$case_pid" >/dev/null 2>&1 || kill -KILL "$case_pid" >/dev/null 2>&1 || true
@@ -230,14 +314,22 @@ run_case() {
             set +m 2>/dev/null || true
         fi
 
-        wait "$case_pid"
-        rc="$?"
-        if [ "$case_has_group" -eq 1 ]; then
-            kill -TERM "-$watchdog_pid" >/dev/null 2>&1 || kill "$watchdog_pid" >/dev/null 2>&1 || true
-        else
-            kill "$watchdog_pid" >/dev/null 2>&1 || true
+        rc=124
+        while [ ! -f "$case_status" ]; do
+            if [ -f "$timeout_marker" ]; then
+                timed_out=1
+                break
+            fi
+            sleep 1
+        done
+        if [ -f "$case_status" ]; then
+            rc="$(status_file_value "$case_status")"
+            wait "$case_pid" 2>/dev/null || true
         fi
         wait "$watchdog_pid" 2>/dev/null || true
+        if [ ! -f "$case_status" ]; then
+            wait "$case_pid" 2>/dev/null || true
+        fi
 
         if [ -f "$timeout_marker" ]; then
             timed_out=1
@@ -249,7 +341,11 @@ run_case() {
         "$@" > "$log" 2>&1
         rc="$?"
     fi
-    cat "$log"
+    if [ "$timed_out" -eq 1 ]; then
+        printf 'case log retained at %s after timeout\n' "$log"
+    else
+        cat_log_file "$log"
+    fi
 
     end="$(date +%s 2>/dev/null || echo 0)"
     duration=0
@@ -271,6 +367,17 @@ run_case() {
         record_summary "$name" "FAIL" "rc=$rc ${duration}s"
     fi
     return 0
+}
+
+run_case_with_timeout() {
+    name="$1"
+    timeout_seconds="$2"
+    shift 2
+
+    old_case_timeout="$CASE_TIMEOUT_SECONDS"
+    CASE_TIMEOUT_SECONDS="$timeout_seconds"
+    run_case "$name" "$@"
+    CASE_TIMEOUT_SECONDS="$old_case_timeout"
 }
 
 skip_case() {
@@ -444,42 +551,150 @@ case_renderbench_duck() {
         --threads "$RENDER_THREADS"
 }
 
+netbench_stop_pid() {
+    pid="$1"
+    if [ -n "$pid" ]; then
+        kill "$pid" >/dev/null 2>&1 || true
+    fi
+}
+
+netbench_kill_pid() {
+    pid="$1"
+    if [ -n "$pid" ]; then
+        kill -KILL "$pid" >/dev/null 2>&1 || true
+    fi
+}
+
+netbench_wait_pid() {
+    pid="$1"
+    if [ -n "$pid" ]; then
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
+netbench_status() {
+    status_file_value "$1"
+}
+
+print_netbench_log() {
+    label="$1"
+    log_file="$2"
+    printf '\n--- %s ---\n' "$label"
+    if [ -s "$log_file" ]; then
+        cat "$log_file"
+    else
+        printf '(empty log)\n'
+    fi
+}
+
+NETBENCH_CHILD_PIDS=
+
+cleanup_netbench_children() {
+    for pid in $NETBENCH_CHILD_PIDS; do
+        netbench_stop_pid "$pid"
+    done
+    sleep "$TIMEOUT_KILL_GRACE_SECONDS"
+    for pid in $NETBENCH_CHILD_PIDS; do
+        netbench_kill_pid "$pid"
+    done
+    for pid in $NETBENCH_CHILD_PIDS; do
+        netbench_wait_pid "$pid"
+    done
+    NETBENCH_CHILD_PIDS=
+}
+
+abort_netbench_case() {
+    cleanup_netbench_children
+    trap - TERM INT HUP
+    exit 124
+}
+
 run_netbench_one() {
     mode="$1"
     server_log="$WORK_DIR/netbench-$mode-server.log"
-    rm -f "$server_log"
-    /usr/bin/testprog netbench-server --port "$NETBENCH_PORT" --sessions 1 --timeout-ms "$NETBENCH_TIMEOUT_MS" > "$server_log" 2>&1 &
+    client_log="$WORK_DIR/netbench-$mode-client.log"
+    server_status="$WORK_DIR/netbench-$mode-server.status"
+    client_status="$WORK_DIR/netbench-$mode-client.status"
+    rm -f "$server_log" "$client_log" "$server_status" "$client_status"
+    (
+        /usr/bin/testprog netbench-server --port "$NETBENCH_PORT" --sessions 1 --timeout-ms "$NETBENCH_TIMEOUT_MS"
+        printf '%s\n' "$?" > "$server_status"
+    ) > "$server_log" 2>&1 &
     server_pid="$!"
 
     sleep "$NETBENCH_STARTUP_SECONDS"
 
-    if [ "$mode" = "pingpong" ]; then
-        /usr/bin/testprog netbench-client \
-            --host 127.0.0.1 \
-            --port "$NETBENCH_PORT" \
-            --mode pingpong \
-            --payload-size "$NETBENCH_PAYLOAD_SIZE" \
-            --iterations "$NETBENCH_ITERATIONS" \
-            --timeout-ms "$NETBENCH_TIMEOUT_MS"
-        client_rc="$?"
-    else
-        /usr/bin/testprog netbench-client \
-            --host 127.0.0.1 \
-            --port "$NETBENCH_PORT" \
-            --mode stream \
-            --payload-size "$NETBENCH_PAYLOAD_SIZE" \
-            --total-bytes "$NETBENCH_TOTAL_BYTES" \
-            --timeout-ms "$NETBENCH_TIMEOUT_MS"
-        client_rc="$?"
+    (
+        if [ "$mode" = "pingpong" ]; then
+            /usr/bin/testprog netbench-client \
+                --host 127.0.0.1 \
+                --port "$NETBENCH_PORT" \
+                --mode pingpong \
+                --payload-size "$NETBENCH_PAYLOAD_SIZE" \
+                --iterations "$NETBENCH_ITERATIONS" \
+                --timeout-ms "$NETBENCH_TIMEOUT_MS"
+        else
+            /usr/bin/testprog netbench-client \
+                --host 127.0.0.1 \
+                --port "$NETBENCH_PORT" \
+                --mode stream \
+                --payload-size "$NETBENCH_PAYLOAD_SIZE" \
+                --total-bytes "$NETBENCH_TOTAL_BYTES" \
+                --timeout-ms "$NETBENCH_TIMEOUT_MS"
+        fi
+        printf '%s\n' "$?" > "$client_status"
+    ) > "$client_log" 2>&1 &
+    client_pid="$!"
+    NETBENCH_CHILD_PIDS="$server_pid $client_pid"
+
+    elapsed=0
+    timed_out=0
+    while [ ! -f "$client_status" ] || [ ! -f "$server_status" ]; do
+        if [ -f "$server_status" ] && [ ! -f "$client_status" ]; then
+            server_rc_now="$(netbench_status "$server_status")"
+            if [ "$server_rc_now" != "0" ]; then
+                cleanup_netbench_children
+                break
+            fi
+        fi
+        if [ -f "$client_status" ] && [ ! -f "$server_status" ]; then
+            client_rc_now="$(netbench_status "$client_status")"
+            if [ "$client_rc_now" != "0" ]; then
+                cleanup_netbench_children
+                break
+            fi
+        fi
+
+        if [ "$NETBENCH_CASE_TIMEOUT_SECONDS" -gt 0 ] && [ "$elapsed" -ge "$NETBENCH_CASE_TIMEOUT_SECONDS" ]; then
+            timed_out=1
+            cleanup_netbench_children
+            break
+        fi
+
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    if [ -f "$client_status" ]; then
+        netbench_wait_pid "$client_pid"
+    fi
+    if [ -f "$server_status" ]; then
+        netbench_wait_pid "$server_pid"
+    fi
+    NETBENCH_CHILD_PIDS=
+
+    client_rc="$(netbench_status "$client_status")"
+    server_rc="$(netbench_status "$server_status")"
+
+    if [ "$timed_out" -eq 1 ]; then
+        printf 'netbench %s timed out after %ss\n' "$mode" "$NETBENCH_CASE_TIMEOUT_SECONDS"
+        printf 'netbench %s client log retained at %s\n' "$mode" "$client_log"
+        printf 'netbench %s server log retained at %s\n' "$mode" "$server_log"
+        return 1
     fi
 
-    if [ "$client_rc" -ne 0 ]; then
-        kill "$server_pid" >/dev/null 2>&1 || true
-    fi
-    wait "$server_pid"
-    server_rc="$?"
-    printf '\n--- netbench %s server log ---\n' "$mode"
-    cat "$server_log"
+    print_netbench_log "netbench $mode client log" "$client_log"
+    print_netbench_log "netbench $mode server log" "$server_log"
 
     if [ "$client_rc" -ne 0 ] || [ "$server_rc" -ne 0 ]; then
         return 1
@@ -488,9 +703,15 @@ run_netbench_one() {
 }
 
 case_netbench_loopback() {
+    trap abort_netbench_case TERM INT HUP
     rc=0
-    run_netbench_one pingpong || rc=1
-    run_netbench_one stream || rc=1
+    if run_netbench_one pingpong; then
+        run_netbench_one stream || rc=1
+    else
+        rc=1
+    fi
+    cleanup_netbench_children
+    trap - TERM INT HUP
     return "$rc"
 }
 
@@ -525,6 +746,7 @@ case_perf_trace_vfs() {
 
 printf 'WOS userland suite\n'
 printf 'RUN_ID=%s\n' "$RUN_ID"
+printf 'SUITE_REVISION=%s\n' "$SUITE_REVISION"
 printf 'SCALE=%s\n' "$SCALE"
 printf 'RESULT_DIR=%s\n' "$ARTIFACT_ROOT"
 printf 'CASE_TIMEOUT_SECONDS=%s\n' "$CASE_TIMEOUT_SECONDS"
@@ -532,6 +754,7 @@ printf 'CAT_BEE_ITERATIONS=%s\n' "$BEE_ITERATIONS"
 printf 'DATA_MIB=%s\n' "$DATA_MIB"
 printf 'MANDELBENCH=%sx%s iter=%s repeat=%s workers=%s\n' "$MANDEL_WIDTH" "$MANDEL_HEIGHT" "$MANDEL_MAX_ITER" "$MANDEL_REPEAT" "$MANDEL_THREADS"
 printf 'RENDERBENCH=%sx%s spp=%s depth=%s scene=%s\n' "$RENDER_WIDTH" "$RENDER_HEIGHT" "$RENDER_SPP" "$RENDER_MAX_DEPTH" "$RENDER_SCENE"
+printf 'NETBENCH_CASE_TIMEOUT_SECONDS=%s\n' "$NETBENCH_CASE_TIMEOUT_SECONDS"
 
 if [ -f /srv/tests/validate.sh ]; then
     run_case shell_validate case_shell_validate
@@ -560,7 +783,7 @@ if require_exe testprog_smoke /usr/bin/testprog; then
         skip_case testprog_perf_suite "disabled by WOS_SUITE_RUN_TESTPROG_PERF=$RUN_TESTPROG_PERF"
     fi
     run_case mandelbench_large case_mandelbench
-    run_case netbench_loopback case_netbench_loopback
+    run_case_with_timeout netbench_loopback "$NETBENCH_CASE_TIMEOUT_SECONDS" case_netbench_loopback
 else
     skip_case_group "missing executable: /usr/bin/testprog" \
         make_large_file \
@@ -611,7 +834,11 @@ cat "$SUMMARY_FILE"
 printf '\nPASS=%s FAIL=%s SKIP=%s\n' "$PASS" "$FAIL" "$SKIP"
 printf 'RESULT_DIR=%s\n' "$ARTIFACT_ROOT"
 
+suite_rc=0
 if [ "$FAIL" -eq 0 ]; then
-    exit 0
+    suite_rc=0
+else
+    suite_rc=1
 fi
-exit 1
+request_suite_shutdown
+exit "$suite_rc"
