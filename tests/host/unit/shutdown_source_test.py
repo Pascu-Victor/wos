@@ -246,7 +246,9 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
             "ShutdownPhase::PREPARING",
             "prepare_shutdown()",
             "quiesce_kernel_threads",
-            "sched::request_kernel_threads_shutdown(KERNEL_THREAD_WAIT_US)",
+            "sched::request_kernel_threads_shutdown(timeout_us)",
+            "quiesce_kernel_threads(KERNEL_THREAD_WAIT_US)",
+            "quiesce_kernel_threads(0)",
             "return -EBUSY;",
             "return -EPERM;",
             "RB_ENABLE_CAD",
@@ -258,7 +260,7 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
             "current->yield_switch = false;",
             "current->wakeup_pending.store(false, std::memory_order_release);",
             "current->set_voluntary_blocked(false);",
-            "current->wait_channel = nullptr;",
+            "current->clear_wait_channel();",
             "ker::net::wki::wki_shutdown();",
             "TERM_WAIT_US",
             "KILL_WAIT_US",
@@ -279,7 +281,7 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
     require_tokens(mlibc_power, ["static inline int64_t prepare_shutdown()", "ops::PREPARE"], "mlibc power prepare wrapper")
     forbid_tokens(source, ['log::warn("system shutdown finalizer starting action=%lu"'], "normal finalizer start is not a warning")
     for first, second, context in [
-        ("quiesce_kernel_threads();", "teardown_processes();", "kernel threads quiesce before process teardown"),
+        ("quiesce_kernel_threads(KERNEL_THREAD_WAIT_US);", "teardown_processes();", "kernel threads quiesce before process teardown"),
         ("teardown_processes();", "ker::vfs::vfs_shutdown_sync();", "process teardown before vfs sync"),
         ("teardown_processes();", "ker::net::wki::wki_shutdown();", "process teardown before WKI shutdown"),
         ("ker::net::wki::wki_shutdown();", "ker::vfs::vfs_shutdown_sync();", "WKI shutdown before vfs sync"),
@@ -331,11 +333,12 @@ def test_kernel_thread_shutdown_is_scheduler_owned_not_ntp_specific() -> None:
         request_body,
         [
             "kernel_thread_shutdown_requested.store(true, std::memory_order_release);",
+            "bool const WAKE_TARGETS = timeout_us != 0;",
             "task->kernel_shutdown_requested.exchange(true, std::memory_order_acq_rel)",
             "task->wakeup_pending.store(true, std::memory_order_release);",
-            "kern_wake(task);",
+            "wake_kernel_thread_for_shutdown(task);",
             "count_kernel_thread_shutdown_targets(current)",
-            "kern_yield();",
+            "wait_for_kernel_shutdown_progress(current);",
         ],
         "scheduler request/wake/wait kernel-thread shutdown loop",
     )
