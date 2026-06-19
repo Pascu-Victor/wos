@@ -34,6 +34,7 @@
 #include "syscalls_impl/process/getppid.hpp"
 #include "syscalls_impl/process/waitpid.hpp"
 #include "syscalls_impl/shm/shm.hpp"
+#include "syscalls_impl/vmem/sys_vmem.hpp"
 #include "util/hostname.hpp"
 #include "util/smallvec.hpp"
 #include "vfs/file.hpp"
@@ -612,6 +613,19 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 
     child->fd_cloexec = parent->fd_cloexec;
 
+    if (!ker::syscall::vmem::clone_file_mmap_ranges_for_pagemap(parent->pagemap, child->pagemap)) {
+        release_cloned_fd_table_refs(child);
+        delete child->thread;
+        delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
+        ker::syscall::shm::shm_cleanup_for_task(child);
+        mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-mmap-clone-fail");
+        mm::phys::page_free(child->pagemap);
+        delete[] child->name;
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
+        delete child;
+        return finish_fork(-ENOMEM);
+    }
+
     // --- Enqueue child ---
     if (!sched::post_task_balanced(child)) {
         // Undo FD refcount increments
@@ -620,6 +634,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete child->thread;
         delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
         ker::syscall::shm::shm_cleanup_for_task(child);
+        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
         mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-post-task-fail");
         mm::phys::page_free(child->pagemap);
         delete[] child->name;
@@ -872,7 +887,7 @@ auto wos_proc_sigsuspend(uint64_t set_ptr, ker::mod::cpu::GPRegs& gpr) -> uint64
         return static_cast<uint64_t>(-EINTR);
     }
 
-    task->wait_channel = "sigsuspend";
+    task->set_wait_channel("sigsuspend", ker::mod::sched::task::WaitChannelKind::SIGSUSPEND);
     task->deferred_task_switch = true;
     return 0;
 }

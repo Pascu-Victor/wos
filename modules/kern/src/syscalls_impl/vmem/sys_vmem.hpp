@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <platform/mm/paging.hpp>
 
 namespace ker::syscall::vmem {
 struct FileMmapCacheStats {
@@ -26,5 +27,7 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
 // addr: address to map (for MAP_FIXED) or 0
 auto sys_vmem_map(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) -> uint64_t;
 auto file_mmap_cache_stats() -> FileMmapCacheStats;
+auto clone_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* src, ker::mod::mm::paging::PageTable* dst) -> bool;
+void release_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* pagemap);
 
 }  // namespace ker::syscall::vmem

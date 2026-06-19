@@ -9,6 +9,7 @@ enum class ops : uint64_t {
     ANON_FREE,
     PROTECT,
     MREMAP,
+    MSYNC,
 };
 
 // Protection flags (matching Linux mmap)

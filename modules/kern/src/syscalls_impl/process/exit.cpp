@@ -24,6 +24,7 @@
 #include "platform/smt/smt.hpp"
 #include "syscalls_impl/futex/futex.hpp"
 #include "syscalls_impl/shm/shm.hpp"
+#include "syscalls_impl/vmem/sys_vmem.hpp"
 #include "waitpid.hpp"
 
 namespace ker::syscall::process {
@@ -203,8 +204,8 @@ void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
     if (wake_parent) {
         reschedule_on_task_cpu(parent);
     } else if ((parent->sig_pending & ~parent->sig_mask & SIGCHLD_MASK) != 0 &&
-               parent->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING && parent->wait_channel != nullptr &&
-               std::strcmp(parent->wait_channel, "sigsuspend") == 0) {
+               parent->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING &&
+               parent->wait_channel_is(ker::mod::sched::task::WaitChannelKind::SIGSUSPEND)) {
         ker::mod::sched::wake_task_for_signal(parent);
     }
     parent->release();
@@ -236,7 +237,7 @@ void notify_tracer_after_exit_ready(ker::mod::sched::task::Task* child) {
 }
 
 void release_exiting_user_address_space(ker::mod::sched::task::Task* task) {
-    if (task == nullptr || task->is_thread || task->pagemap == nullptr) {
+    if (task == nullptr || task->type != ker::mod::sched::task::TaskType::PROCESS || task->is_thread || task->pagemap == nullptr) {
         return;
     }
     if (ker::mod::sched::task_has_live_pagemap_sibling(task)) {
@@ -252,6 +253,7 @@ void release_exiting_user_address_space(ker::mod::sched::task::Task* task) {
     // the thread object, kernel stack, and scratch area after the epoch guard.
     ker::mod::mm::virt::switch_to_kernel_pagemap();
     task->pagemap = nullptr;
+    ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(pagemap);
     ker::mod::mm::virt::destroy_user_space(pagemap, task->pid, task->name, "process-exit");
     ker::mod::mm::virt::release_pagemap(pagemap);
 }

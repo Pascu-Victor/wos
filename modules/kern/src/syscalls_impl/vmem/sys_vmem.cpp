@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -22,7 +23,9 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/mutex.hpp>
+#include <util/smallvec.hpp>
 #include <utility>
+#include <vfs/file.hpp>
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
@@ -103,6 +106,22 @@ struct FileMmapPageCacheEntry {
     uint64_t last_used = 0;
 };
 
+struct FileMmapRange {
+    ker::mod::mm::paging::PageTable* pagemap = nullptr;
+    uint64_t start = 0;
+    uint64_t length = 0;
+    uint64_t file_offset = 0;
+    ker::vfs::File* file = nullptr;
+};
+
+struct FileMmapSyncRange {
+    uint64_t mapping_start = 0;
+    uint64_t sync_start = 0;
+    uint64_t sync_end = 0;
+    uint64_t file_offset = 0;
+    ker::vfs::File* file = nullptr;
+};
+
 enum class FileMmapCacheInsertResult : uint8_t {
     INSERTED,
     DUPLICATE,
@@ -113,6 +132,8 @@ constexpr size_t FILE_MMAP_CACHE_PAGES = 512;
 std::array<FileMmapPageCacheEntry, FILE_MMAP_CACHE_PAGES> g_file_mmap_cache{};
 ker::mod::sys::Mutex g_file_mmap_cache_lock;
 std::atomic<uint64_t> g_file_mmap_cache_clock{0};
+ker::util::SmallVec<FileMmapRange, 32> g_file_mmap_ranges;
+ker::mod::sys::Mutex g_file_mmap_ranges_lock;
 
 auto file_mmap_key_equal(const FileMmapPageKey& lhs, const FileMmapPageKey& rhs) -> bool {
     return lhs.dev == rhs.dev && lhs.ino == rhs.ino && lhs.size == rhs.size && lhs.mtime_sec == rhs.mtime_sec &&
@@ -135,11 +156,25 @@ auto file_mmap_can_share(const ker::vfs::Stat& st, uint64_t prot) -> bool {
     return (prot & ker::abi::vmem::PROT_WRITE) == 0 && (st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG && st.st_ino != 0;
 }
 
+auto file_mmap_should_track(const ker::vfs::Stat& st, uint64_t flags) -> bool {
+    return (flags & ker::abi::vmem::MAP_SHARED) != 0 && (st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG;
+}
+
 auto is_prot_none(uint64_t prot) -> bool { return prot == ker::abi::vmem::PROT_NONE; }
 
 auto ranges_overlap(uint64_t start, uint64_t end, uint64_t other_start, uint64_t other_end) -> bool {
     return start < other_end && other_start < end;
 }
+
+auto checked_range_end(uint64_t start, uint64_t length, uint64_t* end_out) -> bool {
+    if (end_out == nullptr || length == 0 || start > UINT64_MAX - length) {
+        return false;
+    }
+    *end_out = start + length;
+    return true;
+}
+
+auto file_mmap_range_end(const FileMmapRange& range) -> uint64_t { return range.start + range.length; }
 
 struct OccupiedVmemRange {
     uint64_t start = 0;
@@ -535,6 +570,272 @@ auto file_mmap_cached_page(int fd, const ker::vfs::Stat& st, uint64_t file_offse
     return true;
 }
 
+auto present_leaf_entry(ker::mod::mm::paging::PageTable* pagemap, uint64_t vaddr) -> ker::mod::mm::paging::PageTableEntry* {
+    if (pagemap == nullptr) {
+        return nullptr;
+    }
+
+    auto* table = pagemap;
+    for (int level = 4; level > 1; --level) {
+        auto& entry = table->entries[page_table_index(vaddr, 12 + (9 * (level - 1)))];
+        if (entry.present == 0 || entry.pagesize != 0) {
+            return nullptr;
+        }
+        table = table_from_entry(entry);
+    }
+
+    auto& entry = table->entries[page_table_index(vaddr, ker::mod::mm::paging::PAGE_SHIFT)];
+    return entry.present != 0 ? &entry : nullptr;
+}
+
+auto collect_file_mmap_sync_ranges(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t length,
+                                   ker::util::SmallVec<FileMmapSyncRange, 8>& out) -> int {
+    uint64_t end = 0;
+    if (pagemap == nullptr || !checked_range_end(start, length, &end)) {
+        return -EINVAL;
+    }
+
+    g_file_mmap_ranges_lock.lock();
+    for (const auto& range : g_file_mmap_ranges) {
+        if (range.pagemap != pagemap || range.file == nullptr || range.length == 0) {
+            continue;
+        }
+
+        uint64_t const RANGE_END = file_mmap_range_end(range);
+        if (!ranges_overlap(start, end, range.start, RANGE_END)) {
+            continue;
+        }
+
+        FileMmapSyncRange sync_range{
+            .mapping_start = range.start,
+            .sync_start = std::max(start, range.start),
+            .sync_end = std::min(end, RANGE_END),
+            .file_offset = range.file_offset,
+            .file = range.file,
+        };
+        ker::vfs::vfs_retain_file(sync_range.file);
+        if (!out.push_back(sync_range)) {
+            ker::vfs::vfs_put_file(sync_range.file);
+            g_file_mmap_ranges_lock.unlock();
+            return -ENOMEM;
+        }
+    }
+    g_file_mmap_ranges_lock.unlock();
+    return 0;
+}
+
+auto write_file_mapping_bytes(ker::vfs::File* file, const uint8_t* data, size_t count, uint64_t offset) -> int {
+    if (file == nullptr || file->fops == nullptr || file->fops->vfs_write == nullptr) {
+        return -ENOSYS;
+    }
+
+    size_t written = 0;
+    while (written < count) {
+        uint64_t const CURRENT_OFFSET = offset + written;
+        if (CURRENT_OFFSET < offset) {
+            return -EOVERFLOW;
+        }
+
+        ssize_t const RET = file->fops->vfs_write(file, data + written, count - written, static_cast<size_t>(CURRENT_OFFSET));
+        if (RET < 0) {
+            return static_cast<int>(RET);
+        }
+        if (RET == 0) {
+            return -EIO;
+        }
+        written += std::min<size_t>(static_cast<size_t>(RET), count - written);
+    }
+
+    ker::vfs::vfs_cache_notify_file_changed(file);
+    return 0;
+}
+
+void release_file_mmap_sync_ranges(ker::util::SmallVec<FileMmapSyncRange, 8>& ranges, size_t first = 0) {
+    for (size_t i = first; i < ranges.size(); ++i) {
+        ker::vfs::vfs_put_file(ranges.at(i).file);
+    }
+}
+
+auto sync_file_mmap_range(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t length) -> int {
+    ker::util::SmallVec<FileMmapSyncRange, 8> ranges;
+    int const COLLECT_RET = collect_file_mmap_sync_ranges(pagemap, start, length, ranges);
+    if (COLLECT_RET < 0) {
+        release_file_mmap_sync_ranges(ranges);
+        return COLLECT_RET;
+    }
+
+    int result = 0;
+    for (size_t range_index = 0; range_index < ranges.size(); ++range_index) {
+        const auto& range = ranges.at(range_index);
+        uint64_t page_vaddr = page_align_down(range.sync_start);
+        while (page_vaddr < range.sync_end) {
+            uint64_t const PAGE_END = page_vaddr + ker::mod::mm::paging::PAGE_SIZE;
+            auto* entry = present_leaf_entry(pagemap, page_vaddr);
+            if (entry != nullptr && entry->dirty != 0) {
+                uint64_t const PAGE_START = page_vaddr;
+                uint64_t const WRITE_START = std::max(PAGE_START, range.sync_start);
+                uint64_t const WRITE_END = std::min(PAGE_END, range.sync_end);
+                if (WRITE_START < WRITE_END) {
+                    uint64_t const PHYS_PAGE = static_cast<uint64_t>(entry->frame) << ker::mod::mm::paging::PAGE_SHIFT;
+                    auto* const PAGE = reinterpret_cast<const uint8_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS_PAGE));
+                    uint64_t const PAGE_DELTA = WRITE_START - PAGE_START;
+                    uint64_t const FILE_DELTA = WRITE_START - range.mapping_start;
+                    uint64_t const FILE_OFFSET = range.file_offset + FILE_DELTA;
+                    if (FILE_OFFSET < range.file_offset) {
+                        result = -EOVERFLOW;
+                        break;
+                    }
+                    result =
+                        write_file_mapping_bytes(range.file, PAGE + PAGE_DELTA, static_cast<size_t>(WRITE_END - WRITE_START), FILE_OFFSET);
+                    if (result < 0) {
+                        break;
+                    }
+                }
+            }
+
+            if (PAGE_END <= page_vaddr) {
+                result = -EOVERFLOW;
+                break;
+            }
+            page_vaddr = PAGE_END;
+        }
+
+        ker::vfs::vfs_put_file(range.file);
+        if (result < 0) {
+            release_file_mmap_sync_ranges(ranges, range_index + 1);
+            return result;
+        }
+    }
+
+    return 0;
+}
+
+auto register_file_mmap_range(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t length, uint64_t file_offset,
+                              ker::vfs::File* file) -> bool {
+    if (pagemap == nullptr || file == nullptr || length == 0 || start > UINT64_MAX - length) {
+        return false;
+    }
+
+    FileMmapRange const RANGE{
+        .pagemap = pagemap,
+        .start = start,
+        .length = length,
+        .file_offset = file_offset,
+        .file = file,
+    };
+
+    g_file_mmap_ranges_lock.lock();
+    bool const OK = g_file_mmap_ranges.push_back(RANGE);
+    g_file_mmap_ranges_lock.unlock();
+    return OK;
+}
+
+auto register_file_mmap_range_from_fd(ker::mod::sched::task::Task* task, int fd, uint64_t start, uint64_t length, uint64_t file_offset)
+    -> int {
+    if (task == nullptr || task->pagemap == nullptr) {
+        return -ESRCH;
+    }
+
+    auto* file = ker::vfs::vfs_get_file_retain(task, fd);
+    if (file == nullptr) {
+        return -EBADF;
+    }
+
+    if (!register_file_mmap_range(task->pagemap, start, length, file_offset, file)) {
+        ker::vfs::vfs_put_file(file);
+        return -ENOMEM;
+    }
+    return 0;
+}
+
+auto unregister_one_file_mmap_overlap(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t end, bool* removed_any) -> int {
+    if (removed_any != nullptr) {
+        *removed_any = false;
+    }
+
+    g_file_mmap_ranges_lock.lock();
+    for (size_t i = 0; i < g_file_mmap_ranges.size(); ++i) {
+        auto& range = g_file_mmap_ranges.at(i);
+        if (range.pagemap != pagemap || range.length == 0) {
+            continue;
+        }
+
+        uint64_t const RANGE_END = file_mmap_range_end(range);
+        if (!ranges_overlap(start, end, range.start, RANGE_END)) {
+            continue;
+        }
+
+        uint64_t const OVERLAP_START = std::max(start, range.start);
+        uint64_t const OVERLAP_END = std::min(end, RANGE_END);
+        if (OVERLAP_START <= range.start && OVERLAP_END >= RANGE_END) {
+            auto* file = range.file;
+            (void)g_file_mmap_ranges.remove_at(i);
+            g_file_mmap_ranges_lock.unlock();
+            ker::vfs::vfs_put_file(file);
+            if (removed_any != nullptr) {
+                *removed_any = true;
+            }
+            return 0;
+        }
+
+        if (OVERLAP_START <= range.start) {
+            uint64_t const DELTA = OVERLAP_END - range.start;
+            range.start = OVERLAP_END;
+            range.length = RANGE_END - OVERLAP_END;
+            range.file_offset += DELTA;
+            g_file_mmap_ranges_lock.unlock();
+            if (removed_any != nullptr) {
+                *removed_any = true;
+            }
+            return 0;
+        }
+
+        if (OVERLAP_END >= RANGE_END) {
+            range.length = OVERLAP_START - range.start;
+            g_file_mmap_ranges_lock.unlock();
+            if (removed_any != nullptr) {
+                *removed_any = true;
+            }
+            return 0;
+        }
+
+        FileMmapRange right = range;
+        right.start = OVERLAP_END;
+        right.length = RANGE_END - OVERLAP_END;
+        right.file_offset = range.file_offset + (OVERLAP_END - range.start);
+        ker::vfs::vfs_retain_file(right.file);
+        if (!g_file_mmap_ranges.push_back(right)) {
+            ker::vfs::vfs_put_file(right.file);
+            g_file_mmap_ranges_lock.unlock();
+            return -ENOMEM;
+        }
+        range.length = OVERLAP_START - range.start;
+        g_file_mmap_ranges_lock.unlock();
+        if (removed_any != nullptr) {
+            *removed_any = true;
+        }
+        return 0;
+    }
+
+    g_file_mmap_ranges_lock.unlock();
+    return 0;
+}
+
+auto unregister_file_mmap_range(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t length) -> int {
+    uint64_t end = 0;
+    if (pagemap == nullptr || !checked_range_end(start, length, &end)) {
+        return -EINVAL;
+    }
+
+    for (;;) {
+        bool removed_any = false;
+        int const RET = unregister_one_file_mmap_overlap(pagemap, start, end, &removed_any);
+        if (RET < 0 || !removed_any) {
+            return RET;
+        }
+    }
+}
+
 auto get_anon_zero_page() -> void* {
     void* const EXISTING = g_anon_zero_page.load(std::memory_order_acquire);
     if (EXISTING != nullptr) {
@@ -688,6 +989,14 @@ auto prot_to_page_flags(uint64_t prot) -> uint64_t {
     return flags;
 }
 
+auto file_mapping_page_flags(uint64_t prot, uint64_t mmap_flags) -> uint64_t {
+    uint64_t flags = prot_to_page_flags(prot);
+    if ((mmap_flags & ker::abi::vmem::MAP_SHARED) != 0) {
+        flags |= ker::mod::mm::paging::PAGE_SHARED;
+    }
+    return flags;
+}
+
 auto anon_zero_page_flags(uint64_t prot) -> uint64_t {
     uint64_t flags = prot_to_page_flags(prot);
 
@@ -732,6 +1041,17 @@ void rollback_mapped_pages(ker::mod::sched::task::Task* task, uint64_t vaddr, ui
 void release_fixed_mmap_range(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size) {
     if (task == nullptr || task->pagemap == nullptr || size == 0) {
         return;
+    }
+
+    int const SYNC_RET = sync_file_mmap_range(task->pagemap, vaddr, size);
+    if (SYNC_RET < 0) {
+        log::warn("MAP_FIXED replacement sync failed: pid=%lu vaddr=0x%llx size=0x%llx ret=%d", task->pid,
+                  static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size), SYNC_RET);
+    }
+    int const UNREGISTER_RET = unregister_file_mmap_range(task->pagemap, vaddr, size);
+    if (UNREGISTER_RET < 0) {
+        log::warn("MAP_FIXED replacement unregister failed: pid=%lu vaddr=0x%llx size=0x%llx ret=%d", task->pid,
+                  static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size), UNREGISTER_RET);
     }
 
     (void)remove_shared_vmem_range(task, vaddr, size);
@@ -983,6 +1303,16 @@ auto anon_free(uint64_t addr, uint64_t size) -> uint64_t {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
+    int const SYNC_RET = sync_file_mmap_range(task->pagemap, addr, size);
+    if (SYNC_RET < 0) {
+        return static_cast<uint64_t>(SYNC_RET);
+    }
+
+    int const UNREGISTER_RET = unregister_file_mmap_range(task->pagemap, addr, size);
+    if (UNREGISTER_RET < 0) {
+        return static_cast<uint64_t>(UNREGISTER_RET);
+    }
+
     // Unmap pages
     uint64_t const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
     if (!remove_shared_vmem_range(task, addr, size)) {
@@ -1032,6 +1362,7 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
+    uint64_t const REQUESTED_SIZE = size;
     size = page_align_up(size);
     if (size == 0 || size > USER_SPACE_END - USER_SPACE_START) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
@@ -1055,8 +1386,9 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
     }
 
     bool const HAS_ADDRESS_RESERVATION = !IS_FIXED;
-    auto const PAGE_FLAGS = prot_to_page_flags(prot);
+    auto const PAGE_FLAGS = file_mapping_page_flags(prot, flags);
     auto const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
+    bool const TRACK_FILE_MAPPING = file_mmap_should_track(st, flags);
     if (IS_FIXED) {
         release_fixed_mmap_range(task, vaddr, size);
     }
@@ -1097,6 +1429,14 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
 
         if (cache_ok) {
             ker::mod::mm::virt::flush_page_map_batch(&map_batch);
+            if (TRACK_FILE_MAPPING) {
+                int const REGISTER_RET = register_file_mmap_range_from_fd(task, fd, vaddr, REQUESTED_SIZE, offset);
+                if (REGISTER_RET < 0) {
+                    rollback_mapped_pages(task, vaddr, mapped_pages);
+                    release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+                    return static_cast<uint64_t>(REGISTER_RET);
+                }
+            }
             release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
             advance_shared_mmap_cursor(task, vaddr, size);
             record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0, 0,
@@ -1163,6 +1503,15 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
         }
     }
 
+    if (TRACK_FILE_MAPPING && REQUESTED_SIZE > 0) {
+        int const REGISTER_RET = register_file_mmap_range_from_fd(task, fd, vaddr, REQUESTED_SIZE, offset);
+        if (REGISTER_RET < 0) {
+            rollback_mapped_pages(task, vaddr, mapped_pages);
+            release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+            return static_cast<uint64_t>(REGISTER_RET);
+        }
+    }
+
     release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
     advance_shared_mmap_cursor(task, vaddr, size);
     record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0, 0,
@@ -1186,6 +1535,74 @@ auto file_mmap_cache_stats() -> FileMmapCacheStats {
 
     stats.bytes = stats.pages * ker::mod::mm::paging::PAGE_SIZE;
     return stats;
+}
+
+auto clone_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* src, ker::mod::mm::paging::PageTable* dst) -> bool {
+    if (src == nullptr || dst == nullptr || src == dst) {
+        return true;
+    }
+
+    bool ok = true;
+    g_file_mmap_ranges_lock.lock();
+    size_t const INITIAL_COUNT = g_file_mmap_ranges.size();
+    for (size_t i = 0; i < INITIAL_COUNT; ++i) {
+        auto const& range = g_file_mmap_ranges.at(i);
+        if (range.pagemap != src || range.file == nullptr) {
+            continue;
+        }
+
+        FileMmapRange clone = range;
+        clone.pagemap = dst;
+        ker::vfs::vfs_retain_file(clone.file);
+        if (!g_file_mmap_ranges.push_back(clone)) {
+            ker::vfs::vfs_put_file(clone.file);
+            ok = false;
+            break;
+        }
+    }
+    g_file_mmap_ranges_lock.unlock();
+
+    if (!ok) {
+        release_file_mmap_ranges_for_pagemap(dst);
+    }
+    return ok;
+}
+
+void release_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* pagemap) {
+    if (pagemap == nullptr) {
+        return;
+    }
+
+    for (;;) {
+        FileMmapRange range{};
+        bool found = false;
+        g_file_mmap_ranges_lock.lock();
+        for (const auto& candidate : g_file_mmap_ranges) {
+            if (candidate.pagemap == pagemap) {
+                range = candidate;
+                found = true;
+                break;
+            }
+        }
+        g_file_mmap_ranges_lock.unlock();
+
+        if (!found) {
+            return;
+        }
+
+        int const SYNC_RET = sync_file_mmap_range(pagemap, range.start, range.length);
+        if (SYNC_RET < 0) {
+            log::warn("file mmap release sync failed: pagemap=%p start=0x%llx length=0x%llx ret=%d", static_cast<void*>(pagemap),
+                      static_cast<unsigned long long>(range.start), static_cast<unsigned long long>(range.length), SYNC_RET);
+        }
+
+        int const UNREGISTER_RET = unregister_file_mmap_range(pagemap, range.start, range.length);
+        if (UNREGISTER_RET < 0) {
+            log::warn("file mmap release unregister failed: pagemap=%p start=0x%llx length=0x%llx ret=%d", static_cast<void*>(pagemap),
+                      static_cast<unsigned long long>(range.start), static_cast<unsigned long long>(range.length), UNREGISTER_RET);
+            return;
+        }
+    }
 }
 
 auto anon_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint64_t flags) -> uint64_t {
@@ -1252,6 +1669,24 @@ auto anon_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint64
         return FREE_RESULT;
     }
     return NEW_ADDR;
+}
+
+auto mmap_msync(uint64_t addr, uint64_t size, uint64_t /*flags*/) -> uint64_t {
+    auto* task = get_current_task();
+    if (task == nullptr || task->pagemap == nullptr) {
+        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
+    }
+    if (addr == 0 || size == 0 || (addr % ker::mod::mm::paging::PAGE_SIZE) != 0) {
+        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+    }
+
+    size = page_align_up(size);
+    if (size == 0 || addr > USER_SPACE_END - size) {
+        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+    }
+
+    int const RET = sync_file_mmap_range(task->pagemap, addr, size);
+    return RET < 0 ? static_cast<uint64_t>(RET) : 0;
 }
 
 // Main syscall handler
@@ -1336,6 +1771,13 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
             // a3: new size
             // a4: flags
             return anon_mremap(a1, a2, a3, a4);
+        }
+
+        case ker::abi::vmem::ops::MSYNC: {
+            // a1: address
+            // a2: size
+            // a3: flags
+            return mmap_msync(a1, a2, a3);
         }
 
         default:

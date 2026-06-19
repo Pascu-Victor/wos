@@ -39,6 +39,7 @@
 #include "platform/mm/virt.hpp"
 #include "platform/sched/threading.hpp"
 #include "syscalls_impl/shm/shm.hpp"
+#include "syscalls_impl/vmem/sys_vmem.hpp"
 #include "vfs/stat.hpp"
 namespace ker::syscall::process {
 
@@ -1217,7 +1218,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         if (remote_result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
             task->deferred_task_switch = true;
             task->yield_switch = false;
-            task->wait_channel = "wki_execve_proxy";
+            task->set_wait_channel("wki_execve_proxy", ker::mod::sched::task::WaitChannelKind::WKI_EXECVE_PROXY);
             free_kernel_arg_env_once();
             return 0;
         }
@@ -1260,6 +1261,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     char* new_name = nullptr;
     auto cleanup_new_image = [&]() {
         if (new_pagemap != nullptr) {
+            ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(new_pagemap);
             mm::virt::destroy_user_space(new_pagemap, task->pid, new_name != nullptr ? new_name : task->name, "exec-new-image-cleanup");
             mm::phys::page_free(new_pagemap);
             new_pagemap = nullptr;
@@ -1708,6 +1710,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     ker::syscall::shm::shm_cleanup_for_task(task);
     if (old_pagemap != nullptr && old_pagemap != new_pagemap) {
         mm::virt::switch_to_kernel_pagemap();
+        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(old_pagemap);
         mm::virt::destroy_user_space(old_pagemap, task->pid, task->name, "exec-old-image");
         mm::phys::page_free(old_pagemap);
         old_pagemap = nullptr;
