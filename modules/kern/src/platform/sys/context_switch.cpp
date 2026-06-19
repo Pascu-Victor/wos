@@ -26,8 +26,8 @@
 #include "platform/sys/signal.hpp"
 
 namespace ker::mod::sys::context_switch {
-extern "C" void wos_kernel_thread_trampoline();                       // NOLINT(readability-identifier-naming)
 extern "C" void wos_kernel_idle_loop();                               // NOLINT(readability-identifier-naming)
+extern "C" void wos_kernel_thread_trampoline();                       // NOLINT(readability-identifier-naming)
 extern "C" [[noreturn]] void wos_enterIdleStack(uint64_t stack_top);  // NOLINT(readability-identifier-naming)
 extern "C" char __kernel_text_start[];                                // NOLINT(readability-identifier-naming)
 extern "C" char __kernel_text_end[];                                  // NOLINT(readability-identifier-naming)
@@ -56,6 +56,16 @@ inline auto stack_belongs_to_task(sched::task::Task* task, uint64_t rsp) -> bool
     }
     uint64_t const STACK_TOP = task->context.syscall_kernel_stack;
     return rsp > STACK_TOP - ker::mod::mm::KERNEL_STACK_SIZE && rsp <= STACK_TOP;
+}
+
+inline void panic_bad_handoff_stack(sched::task::Task* task, const char* reason) {
+    dbg::logger<"ctxswitch">::error(
+        "bad user handoff stack: reason=%s pid=%lu name=%s type=%u stack=0x%llx task=%p current=%p return=%p",
+        reason != nullptr ? reason : "?", task != nullptr ? task->pid : 0, (task != nullptr && task->name != nullptr) ? task->name : "?",
+        task != nullptr ? static_cast<unsigned>(task->type) : 0U,
+        task != nullptr ? static_cast<unsigned long long>(task->context.syscall_kernel_stack) : 0ULL, static_cast<void*>(task),
+        static_cast<void*>(sched::get_current_task()), static_cast<void*>(sched::get_return_task()));
+    hcf();
 }
 
 inline void validate_kernel_frame(const gates::InterruptFrame& frame, sched::task::Task* task, const char* path) {
@@ -104,15 +114,43 @@ inline void validate_kernel_frame(const gates::InterruptFrame& frame, sched::tas
     hcf();
 }
 
-inline auto is_kernel_thread_trampoline_frame(const gates::InterruptFrame& frame, const cpu::GPRegs& gpr, sched::task::Task* task) -> bool {
-    return task != nullptr && task->type == sched::task::TaskType::DAEMON && task->kthread_entry != nullptr &&
-           frame.cs == desc::gdt::GDT_KERN_CS && frame.rip == reinterpret_cast<uint64_t>(wos_kernel_thread_trampoline) &&
-           gpr.rdi == reinterpret_cast<uint64_t>(task->kthread_entry);
+inline void validate_user_frame(const gates::InterruptFrame& frame, sched::task::Task* task, const char* path) {
+    const bool TASK_BAD = task == nullptr || task->type != sched::task::TaskType::PROCESS || task->pagemap == nullptr;
+    const bool CS_BAD = frame.cs != desc::gdt::GDT_USER_CS;
+    const bool SS_BAD = frame.ss != desc::gdt::GDT_USER_DS;
+    const bool RIP_BAD = frame.rip >= 0x800000000000ULL;
+    const bool RSP_BAD = frame.rsp >= 0x800000000000ULL;
+    const bool FLAGS_BAD = (frame.flags & 0x2ULL) == 0;
+    const uint64_t RIP_PHYS = !TASK_BAD && !RIP_BAD ? mm::virt::translate(task->pagemap, frame.rip) : mm::virt::PADDR_INVALID;
+    const uint64_t RSP_PHYS = !TASK_BAD && !RSP_BAD ? mm::virt::translate(task->pagemap, frame.rsp) : mm::virt::PADDR_INVALID;
+    const bool RIP_UNMAPPED = RIP_PHYS == mm::virt::PADDR_INVALID || RIP_PHYS == 0;
+    const bool RSP_UNMAPPED = RSP_PHYS == mm::virt::PADDR_INVALID || RSP_PHYS == 0;
+    if (!TASK_BAD && !CS_BAD && !SS_BAD && !RIP_BAD && !RSP_BAD && !FLAGS_BAD && !RIP_UNMAPPED && !RSP_UNMAPPED) {
+        return;
+    }
+
+    dbg::logger<"ctxswitch">::error(
+        "bad user return frame: path=%s pid=%lu name=%s type=%u rip=0x%llx rsp=0x%llx cs=0x%llx ss=0x%llx flags=0x%llx "
+        "rip_phys=0x%llx rsp_phys=0x%llx task=%p",
+        path != nullptr ? path : "?", task != nullptr ? task->pid : 0, (task != nullptr && task->name != nullptr) ? task->name : "?",
+        task != nullptr ? static_cast<unsigned>(task->type) : 0U, static_cast<unsigned long long>(frame.rip),
+        static_cast<unsigned long long>(frame.rsp), static_cast<unsigned long long>(frame.cs), static_cast<unsigned long long>(frame.ss),
+        static_cast<unsigned long long>(frame.flags), static_cast<unsigned long long>(RIP_PHYS), static_cast<unsigned long long>(RSP_PHYS),
+        static_cast<void*>(task));
+    hcf();
 }
 
 inline auto is_idle_return_frame(const gates::InterruptFrame& frame, sched::task::Task* task) -> bool {
     return task != nullptr && task->type == sched::task::TaskType::IDLE && frame.cs == desc::gdt::GDT_KERN_CS &&
            frame.rip == reinterpret_cast<uint64_t>(wos_kernel_idle_loop);
+}
+
+inline auto is_first_run_kernel_thread_frame(const gates::InterruptFrame& frame, const cpu::GPRegs& gpr, sched::task::Task* task) -> bool {
+    return task != nullptr && task->type == sched::task::TaskType::DAEMON && task->kthread_entry != nullptr &&
+           frame.cs == desc::gdt::GDT_KERN_CS && frame.ss == desc::gdt::GDT_KERN_DS &&
+           frame.rip == reinterpret_cast<uint64_t>(wos_kernel_thread_trampoline) &&
+           gpr.rdi == reinterpret_cast<uint64_t>(task->kthread_entry) && frame.rsp == task->context.syscall_kernel_stack &&
+           valid_kernel_stack(frame.rsp);
 }
 
 auto interrupted_caller_from_rbp(uint64_t rbp) -> uint64_t {
@@ -201,7 +239,7 @@ auto defer_process_reschedule_to_syscall_exit() -> bool {
 
     task->yield_switch = true;
     task->deferred_task_switch = true;
-    task->wait_channel = "local_reschedule";
+    task->set_wait_channel("local_reschedule");
     return true;
 }
 
@@ -565,6 +603,73 @@ extern "C" __attribute__((no_sanitize("address", "undefined", "coverage"))) void
     hcf();
 }
 
+extern "C" __attribute__((no_sanitize("address", "undefined", "coverage"))) void wos_validate_deferred_return_frame(
+    cpu::GPRegs* gpr_ptr, gates::InterruptFrame* frame_ptr) {
+    (void)gpr_ptr;
+    auto* task = sched::get_return_task();
+    if (frame_ptr == nullptr) {
+        dbg::logger<"ctxswitch">::error("deferred return without frame: task=%p pid=%lu", static_cast<void*>(task),
+                                        task != nullptr ? task->pid : 0);
+        hcf();
+    }
+
+    if (frame_ptr->cs == desc::gdt::GDT_USER_CS) {
+        validate_user_frame(*frame_ptr, task, "deferred-final");
+        return;
+    }
+    if (frame_ptr->cs == desc::gdt::GDT_KERN_CS) {
+        validate_kernel_frame(*frame_ptr, task, "deferred-final");
+        return;
+    }
+
+    dbg::logger<"ctxswitch">::error(
+        "bad deferred return selector: pid=%lu name=%s cs=0x%llx ss=0x%llx rip=0x%llx rsp=0x%llx flags=0x%llx task=%p",
+        task != nullptr ? task->pid : 0, (task != nullptr && task->name != nullptr) ? task->name : "?",
+        static_cast<unsigned long long>(frame_ptr->cs), static_cast<unsigned long long>(frame_ptr->ss),
+        static_cast<unsigned long long>(frame_ptr->rip), static_cast<unsigned long long>(frame_ptr->rsp),
+        static_cast<unsigned long long>(frame_ptr->flags), static_cast<void*>(task));
+    hcf();
+}
+
+extern "C" __attribute__((no_sanitize("address", "undefined", "coverage"))) void wos_validate_kernel_thread_start(uint64_t stack_top,
+                                                                                                                  void (*entry)()) {
+    auto* task = sched::get_return_task();
+    const bool STACK_BAD = !valid_kernel_stack(stack_top);
+    const bool ENTRY_BAD = entry == nullptr || !is_kernel_text_pointer(reinterpret_cast<uint64_t>(entry));
+    const bool TASK_BAD = task == nullptr || task->type != sched::task::TaskType::DAEMON;
+    const bool OWNER_BAD = task != nullptr && stack_top != task->context.syscall_kernel_stack;
+    if (!STACK_BAD && !ENTRY_BAD && !TASK_BAD && !OWNER_BAD) {
+        return;
+    }
+
+    dbg::logger<"ctxswitch">::error(
+        "bad kernel thread start: pid=%lu name=%s stack=0x%llx task_stack=0x%llx entry=%p task=%p type=%u", task != nullptr ? task->pid : 0,
+        (task != nullptr && task->name != nullptr) ? task->name : "?", static_cast<unsigned long long>(stack_top),
+        task != nullptr ? static_cast<unsigned long long>(task->context.syscall_kernel_stack) : 0ULL, reinterpret_cast<void*>(entry),
+        static_cast<void*>(task), task != nullptr ? static_cast<unsigned>(task->type) : 0U);
+    hcf();
+}
+
+extern "C" __attribute__((no_sanitize("address", "undefined", "coverage"))) auto wos_user_handoff_stack_top() -> uint64_t {
+    auto* return_task = sched::get_return_task();
+    auto* current_task = sched::get_current_task();
+    if (return_task == nullptr || return_task == current_task) {
+        return 0;
+    }
+    if (return_task->type != sched::task::TaskType::PROCESS || return_task->pagemap == nullptr || return_task->thread == nullptr) {
+        panic_bad_handoff_stack(return_task, "bad-return-task");
+    }
+
+    uint64_t const STACK_TOP = return_task->context.syscall_kernel_stack;
+    if (!valid_kernel_stack(STACK_TOP)) {
+        panic_bad_handoff_stack(return_task, "bad-stack-top");
+    }
+    if (current_task != nullptr && STACK_TOP == current_task->context.syscall_kernel_stack) {
+        return 0;
+    }
+    return STACK_TOP;
+}
+
 #ifdef SCHED_DEBUG
 // Per-CPU interrupt timing stats (indexed by CPU id, max 16 CPUs)
 struct IrqStats {
@@ -603,7 +708,8 @@ void dump_irq_stats() {
 #endif  // SCHED_DEBUG
 
 extern "C" void wos_sched_timer(void* stack_ptr) {
-    uint64_t const IRQ_ACCOUNT_STARTED_US = ker::mod::time::get_us();
+    [[maybe_unused]] uint64_t const IRQ_ACCOUNT_STARTED_US =
+        (K_ENABLE_SCHED_HOT_LOGGING || K_ENABLE_SCHED_CPU_DUMP) ? ker::mod::time::get_us() : 0;
     apic::eoi();
     sched::note_scheduler_timer_interrupt();
 
@@ -649,29 +755,6 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
         apic::one_shot_timer(TICKS);
     } else {
         sched::note_scheduler_timer_disarm();
-    }
-
-    if (is_kernel_thread_trampoline_frame(*frame_ptr, *gpr_ptr, return_task)) {
-        uint64_t const IRQ_ACCOUNT_FINISHED_US = ker::mod::time::get_us();
-        sched::account_irq_time_us(IRQ_ACCOUNT_FINISHED_US >= IRQ_ACCOUNT_STARTED_US ? IRQ_ACCOUNT_FINISHED_US - IRQ_ACCOUNT_STARTED_US
-                                                                                     : 0);
-        uint64_t stack = frame_ptr->rsp;
-        if (!valid_kernel_stack(stack) && return_task != nullptr && valid_kernel_stack(return_task->context.syscall_kernel_stack)) {
-            dbg::logger<"ctxswitch">::warn("direct daemon start repaired rsp: pid=%lu name=%s frame_rsp=0x%llx stack=0x%llx",
-                                           return_task->pid, return_task->name != nullptr ? return_task->name : "?",
-                                           (unsigned long long)frame_ptr->rsp,
-                                           (unsigned long long)return_task->context.syscall_kernel_stack);
-            stack = return_task->context.syscall_kernel_stack;
-        }
-        if (!valid_kernel_stack(stack)) {
-            dbg::logger<"ctxswitch">::error(
-                "direct daemon start bad rsp: pid=%lu name=%s frame_rsp=0x%llx stack=0x%llx", return_task != nullptr ? return_task->pid : 0,
-                (return_task != nullptr && return_task->name != nullptr) ? return_task->name : "?", (unsigned long long)frame_ptr->rsp,
-                return_task != nullptr ? (unsigned long long)return_task->context.syscall_kernel_stack : 0ULL);
-            hcf();
-        }
-        wos_start_kernel_thread(stack, return_task->kthread_entry);
-        __builtin_unreachable();
     }
 
     if constexpr (K_ENABLE_SCHED_HOT_LOGGING || K_ENABLE_SCHED_CPU_DUMP) {
@@ -743,6 +826,11 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
         sched::dump_scheduler_trace_stats();
     }
 #endif  // SCHED_DEBUG
+
+    if (is_first_run_kernel_thread_frame(*frame_ptr, *gpr_ptr, return_task)) {
+        wos_start_kernel_thread(frame_ptr->rsp, return_task->kthread_entry);
+        __builtin_unreachable();
+    }
 }
 
 extern "C" void wos_jump_to_next_task_no_save(void* stack_ptr) {

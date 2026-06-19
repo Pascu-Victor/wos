@@ -58,7 +58,7 @@ void defer_socket_wait(Socket* sock) {
     if (sock != nullptr) {
         sock->owner_pid = current_task->pid;
     }
-    current_task->wait_channel = "tcp_wait";
+    current_task->set_wait_channel("tcp_wait");
 }
 
 // Simple ISS generator.
@@ -429,7 +429,7 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int /*unused*/) -> ssize_t {
     // Close the race where data arrives after the last readiness check.
     if (maybe_finish_recv()) {
         if (auto* current_task = ker::mod::sched::get_current_task(); current_task != nullptr) {
-            current_task->wait_channel = nullptr;
+            current_task->clear_wait_channel();
         }
         return completed;
     }

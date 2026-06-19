@@ -821,8 +821,8 @@ void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status
                 }
                 ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
             } else if ((parent->sig_pending & ~parent->sig_mask & (1ULL << (WKI_SIGCHLD_NUM - 1))) != 0 &&
-                       parent->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING && parent->wait_channel != nullptr &&
-                       std::strcmp(parent->wait_channel, "sigsuspend") == 0) {
+                       parent->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING &&
+                       parent->wait_channel_is(ker::mod::sched::task::WaitChannelKind::SIGSUSPEND)) {
                 ker::mod::sched::wake_task_for_signal(parent);
             }
             parent->release();

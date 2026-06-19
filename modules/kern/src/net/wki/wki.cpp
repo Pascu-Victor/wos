@@ -442,7 +442,7 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
         }
         auto* waiter_task = entry->task.load(std::memory_order_acquire);
         if (waiter_task != nullptr) {
-            waiter_task->wait_channel = "wki_wait";
+            waiter_task->set_wait_channel("wki_wait");
             if (waiter_task->type == mod::sched::task::TaskType::DAEMON && !is_timer_deferred_waiter(waiter_task)) {
                 mod::sched::kern_block();
             } else {

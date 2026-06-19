@@ -4,11 +4,14 @@ bits 64
 
 %assign GPREGS_SIZE 120
 %assign INTERRUPT_FRAME_SIZE 56
+%assign USER_IRET_FRAME_SIZE 40
 %assign IRETQ_KERNEL_FRAME_SIZE 24
 %assign IRETQ_KERNEL_FRAME_OFFSET GPREGS_SIZE + INTERRUPT_FRAME_SIZE
+%assign USER_RETURN_BLOCK_SIZE GPREGS_SIZE + USER_IRET_FRAME_SIZE
 %assign KERNEL_RETURN_BLOCK_SIZE GPREGS_SIZE + INTERRUPT_FRAME_SIZE + IRETQ_KERNEL_FRAME_SIZE
 
 extern wos_commit_handoff_task
+extern wos_user_handoff_stack_top
 
 ; Same-CPL iretq consumes only RIP/CS/RFLAGS, but the scheduler and panic
 ; diagnostics treat the memory below the saved RSP as GPRegs + InterruptFrame.
@@ -146,6 +149,155 @@ extern wos_commit_handoff_task
     iretq
 %endmacro
 
+%macro build_user_return_from_ptrs_late_commit 0
+    ; rdi = GPRegs*, rsi = InterruptFrame*
+    ;
+    ; Keep the scheduler's current_task pointer on the outgoing task until RSP
+    ; is already on the incoming task's kernel stack. Exiting tasks can have
+    ; their kernel stacks moved to the dead list before this iret tail finishes;
+    ; publishing the handoff while still on that dead stack makes later faults
+    ; look like the incoming task is executing on freed outgoing storage.
+    mov r12, rdi
+    mov r13, rsi
+
+    mov r14, rsp
+    and rsp, -16
+    call wos_user_handoff_stack_top
+    mov rsp, r14
+    test rax, rax
+    jz %%same_stack_return
+
+    ; Handoff to another user task: build the complete register/iret return
+    ; block on the incoming task's syscall kernel stack, switch RSP there, and
+    ; only then publish current_task.
+    sub rax, USER_RETURN_BLOCK_SIZE
+    mov r10, rax
+
+    %assign i 14
+    %rep 15
+        mov r11, [r12 + i * 8]
+        mov [r10 + i * 8], r11
+        %assign i i - 1
+    %endrep
+
+    mov r11, [r13 + 16]    ; RIP
+    mov [r10 + GPREGS_SIZE], r11
+    mov r11, [r13 + 24]    ; CS
+    mov [r10 + GPREGS_SIZE + 8], r11
+    mov r11, [r13 + 32]    ; RFLAGS
+    mov [r10 + GPREGS_SIZE + 16], r11
+    mov r11, [r13 + 40]    ; RSP
+    mov [r10 + GPREGS_SIZE + 24], r11
+    mov r11, [r13 + 48]    ; SS
+    mov [r10 + GPREGS_SIZE + 32], r11
+
+    mov rsp, r10
+
+    mov r14, rsp
+    and rsp, -16
+    call wos_commit_handoff_task
+    mov rsp, r14
+
+    ; Returning to userspace - set up data segment selectors. The base values
+    ; were installed by switch_to(); preserve them across selector loads.
+    push rax
+    push r8
+    push r9
+    mov ax, 0x1b
+    mov ds, ax
+    mov es, ax
+    rdfsbase r8
+    rdgsbase r9
+    mov fs, ax
+    mov gs, ax
+    wrfsbase r8
+    wrgsbase r9
+    pop r9
+    pop r8
+    pop rax
+
+    ; Swap from kernel GS base to the user's GS base prepared by switch_to().
+    swapgs
+
+    ; Restore GP registers from the copied block on the incoming stack, then
+    ; advance RSP to the iret frame that follows it.
+    mov r11, rsp
+    mov r15, [r11 + 0]
+    mov r14, [r11 + 8]
+    mov r13, [r11 + 16]
+    mov r12, [r11 + 24]
+    mov r10, [r11 + 40]
+    mov r9,  [r11 + 48]
+    mov r8,  [r11 + 56]
+    mov rbp, [r11 + 64]
+    mov rdi, [r11 + 72]
+    mov rsi, [r11 + 80]
+    mov rdx, [r11 + 88]
+    mov rcx, [r11 + 96]
+    mov rbx, [r11 + 104]
+    mov rax, [r11 + 112]
+    lea rsp, [r11 + GPREGS_SIZE]
+    mov r11, [r11 + 32]
+
+    iretq
+
+%%same_stack_return:
+    push qword [r13 + 48]    ; SS
+    push qword [r13 + 40]    ; RSP
+    push qword [r13 + 32]    ; RFLAGS
+    push qword [r13 + 24]    ; CS
+    push qword [r13 + 16]    ; RIP
+
+    ; Returning to userspace - set up data segment selectors. The base values
+    ; were installed by switch_to(); preserve them across selector loads.
+    push rax
+    push r8
+    push r9
+    mov ax, 0x1b
+    mov ds, ax
+    mov es, ax
+    rdfsbase r8
+    rdgsbase r9
+    mov fs, ax
+    mov gs, ax
+    wrfsbase r8
+    wrgsbase r9
+    pop r9
+    pop r8
+    pop rax
+
+    ; Commit immediately before the final swapgs/register restore/iret tail.
+    ; The stack below the prepared iret frame is scratch for the call.
+    mov r14, rsp
+    and rsp, -16
+    call wos_commit_handoff_task
+    mov rsp, r14
+
+    ; Swap from kernel GS base to the user's GS base prepared by switch_to().
+    swapgs
+
+    ; Restore GP registers from the normalized snapshot. Keep the pointer in
+    ; r11 until every other register has been restored, then restore r11 last.
+    mov r11, r12
+    mov r15, [r11 + 0]
+    mov r14, [r11 + 8]
+    mov r13, [r11 + 16]
+    mov r12, [r11 + 24]
+    mov r10, [r11 + 40]
+    mov r9,  [r11 + 48]
+    mov r8,  [r11 + 56]
+    mov rbp, [r11 + 64]
+    mov rdi, [r11 + 72]
+    mov rsi, [r11 + 80]
+    mov rdx, [r11 + 88]
+    mov rcx, [r11 + 96]
+    mov rbx, [r11 + 104]
+    mov rax, [r11 + 112]
+    mov r11, [r11 + 32]
+
+    iretq
+%endmacro
+
 %macro isr_swapgs 1
     cmp [rsp + 24], dword 8 ; Check if we're in userspace
     je .%1
@@ -182,6 +334,14 @@ wos_start_kernel_thread:
     ; Brand-new kernel threads do not have a previously interrupted kernel
     ; frame to resume. Start them by installing the stack directly, then jump
     ; into the normal trampoline with the entry function in rdi.
+    push rdi
+    push rsi
+    sub rsp, 8
+    call wos_validate_kernel_thread_start
+    add rsp, 8
+    pop rsi
+    pop rdi
+
     mov r12, rsi
     mov rsp, rdi
     call wos_commit_handoff_task
@@ -249,6 +409,8 @@ wos_asm_enter_usermode:
 
 extern wos_sched_timer
 extern wos_repair_timer_return_frame
+extern wos_validate_deferred_return_frame
+extern wos_validate_kernel_thread_start
 global task_switch_handler
 task_switch_handler:
     mov rdi, rsp
@@ -283,6 +445,8 @@ task_switch_handler:
 extern wos_jump_to_next_task_no_save
 global jump_to_next_task_no_save
 jump_to_next_task_no_save:
+    cli
+
     ; Push dummy interrupt frame FIRST (will be at higher addresses)
     ; Layout expected by C++: GPRegs at stack_ptr, InterruptFrame at stack_ptr + sizeof(GPRegs)
     push 0  ; SS
@@ -321,7 +485,7 @@ jump_to_next_task_no_save:
     cmp qword [rsi + 24], qword 0x23
     jne .kernel_return_jump
 
-    build_user_return_from_ptrs
+    build_user_return_from_ptrs_late_commit
 
 .kernel_return_jump:
     build_kernel_return_from_stack
@@ -342,6 +506,16 @@ global wos_deferred_task_switch_return
 wos_deferred_task_switch_return:
     ; rdi = GPRegs*, rsi = InterruptFrame*
     cli
+
+    ; This is the last boundary before consuming the saved frame to build an
+    ; iretq target. Keep rdi/rsi intact for the return macros.
+    push rdi
+    push rsi
+    sub rsp, 8
+    call wos_validate_deferred_return_frame
+    add rsp, 8
+    pop rsi
+    pop rdi
 
     ; Returning to a kernel-mode task is a same-CPL iretq. Build the return
     ; frame on the saved kernel stack so RSP is restored correctly.

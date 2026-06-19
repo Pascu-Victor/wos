@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 SCHEDULER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.cpp"
+TASK_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.hpp"
 CONTEXT_SWITCH_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "context_switch.cpp"
 THREADING_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.cpp"
 THREADING_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.hpp"
@@ -21,7 +22,7 @@ def fail(message: str) -> None:
 
 def function_body(source: str, name: str) -> str:
     match = re.search(
-        rf"\b(?:auto|void|Thread\*)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
+        rf"\b(?:auto|bool|void|Thread\*)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
         source,
         flags=re.DOTALL,
     )
@@ -92,6 +93,58 @@ def test_event_wake_cancel_preserves_current_task_wakeup_token() -> None:
     )
     if "task->wakeup_pending.store(false" in current_task_branch:
         fail("current-task event wakes must preserve wakeup_pending, even when deferred switch is cancelled")
+
+
+def test_wait_channel_policy_uses_typed_kinds() -> None:
+    source = SCHEDULER_CPP.read_text()
+    task_header = TASK_HPP.read_text()
+    low_latency_body = function_body(source, "is_low_latency_handoff_wait_channel")
+    futex_body = function_body(source, "is_futex_wait_channel")
+
+    require_tokens(
+        task_header,
+        [
+            "enum class WaitChannelKind : uint8_t",
+            "LOCAL_PIPE",
+            "LOCAL_PTY",
+            "WAITPID",
+            "FUTEX",
+            "SIGSUSPEND",
+            "WKI_EXECVE_PROXY",
+            "PTRACE",
+            "const char* wait_channel = nullptr;",
+            "WaitChannelKind wait_channel_kind{WaitChannelKind::NONE};",
+            "void set_wait_channel(const char* channel, WaitChannelKind kind = WaitChannelKind::GENERIC)",
+            "void clear_wait_channel()",
+            "auto wait_channel_is(WaitChannelKind kind) const -> bool",
+        ],
+        "typed wait-channel task state",
+    )
+    require_tokens(
+        low_latency_body,
+        [
+            "wait_channel == task::WaitChannelKind::LOCAL_PIPE",
+            "wait_channel == task::WaitChannelKind::LOCAL_PTY",
+            "wait_channel == task::WaitChannelKind::WAITPID",
+        ],
+        "low-latency handoff wait-channel policy",
+    )
+    require_tokens(
+        futex_body,
+        [
+            "wait_channel == task::WaitChannelKind::FUTEX",
+        ],
+        "futex wait-channel policy",
+    )
+    forbidden = [
+        "std::strcmp",
+        "strcmp",
+        "is_local_pipe_wait_channel",
+        "is_local_pty_wait_channel",
+    ]
+    for snippet in forbidden:
+        if snippet in low_latency_body or snippet in futex_body:
+            fail(f"scheduler wait-channel policy still uses string classification: {snippet}")
 
 
 def test_runtime_accounting_deltas_are_saturating() -> None:
@@ -204,7 +257,7 @@ def test_process_syscall_reschedules_defer_to_syscall_exit() -> None:
             "stack_belongs_to_task(task, rsp)",
             "task->yield_switch = true;",
             "task->deferred_task_switch = true;",
-            'task->wait_channel = "local_reschedule";',
+            'task->set_wait_channel("local_reschedule");',
         ],
         "process syscall local reschedule deferral guard",
     )
@@ -224,6 +277,7 @@ def test_process_syscall_reschedules_defer_to_syscall_exit() -> None:
 
 def main() -> None:
     test_event_wake_cancel_preserves_current_task_wakeup_token()
+    test_wait_channel_policy_uses_typed_kinds()
     test_runtime_accounting_deltas_are_saturating()
     test_user_thread_tcbs_publish_nonzero_tid_before_user_execution()
     test_process_syscall_reschedules_defer_to_syscall_exit()

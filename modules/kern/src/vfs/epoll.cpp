@@ -55,6 +55,21 @@ auto register_poll_waiter(File* file, uint64_t pid) -> bool {
     return false;
 }
 
+auto poll_wait_kind_for_file(File* file) -> ker::mod::sched::task::WaitChannelKind {
+    if (file == nullptr || file->fops == nullptr || file->fops->vfs_poll_wait_kind == nullptr) {
+        return ker::mod::sched::task::WaitChannelKind::GENERIC;
+    }
+    return file->fops->vfs_poll_wait_kind(file);
+}
+
+auto merge_poll_wait_kind(ker::mod::sched::task::WaitChannelKind current, ker::mod::sched::task::WaitChannelKind candidate)
+    -> ker::mod::sched::task::WaitChannelKind {
+    if (current == ker::mod::sched::task::WaitChannelKind::GENERIC || current == ker::mod::sched::task::WaitChannelKind::NONE) {
+        return candidate;
+    }
+    return current;
+}
+
 auto begin_poll_timeout(ker::mod::sched::task::Task* task, int timeout_ms) -> uint64_t {
     if (task == nullptr || timeout_ms <= 0) {
         return 0;
@@ -351,6 +366,7 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
         }
 
         bool can_block = (inst->count > 0);
+        auto poll_wait_kind = ker::mod::sched::task::WaitChannelKind::GENERIC;
         if (can_block) {
             for (auto& interest : inst->interests) {
                 if (!interest.active) {
@@ -358,6 +374,9 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
                 }
                 auto* f = vfs_get_file_retain(task, interest.fd);
                 bool const OK = (f != nullptr) && register_poll_waiter(f, task->pid);
+                if (OK) {
+                    poll_wait_kind = merge_poll_wait_kind(poll_wait_kind, poll_wait_kind_for_file(f));
+                }
                 if (f != nullptr) {
                     vfs_put_file(f);
                 }
@@ -402,7 +421,7 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
                 return recheck;
             }
 
-            ker::mod::sched::preemptible_syscall_park("epoll_wait", DEADLINE_US);
+            ker::mod::sched::preemptible_syscall_park("epoll_wait", poll_wait_kind, DEADLINE_US);
         } else {
             ker::mod::sched::kern_yield();
         }

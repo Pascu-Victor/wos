@@ -5,6 +5,10 @@
 #include <cstdint>
 #include <string_view>
 
+namespace ker::mod::sched::task {
+enum class WaitChannelKind : uint8_t;
+}  // namespace ker::mod::sched::task
+
 namespace ker::vfs {
 // Forward declaration
 struct File;
@@ -46,7 +50,8 @@ using vfs_readlink_fn = ssize_t (*)(struct File*, char*, size_t);             //
 using vfs_truncate_fn = int (*)(struct File*, off_t);                         // f, length
 using vfs_poll_check_fn = int (*)(struct File*, int);                         // f, events -> ready events
 using vfs_poll_register_waiter_fn = bool (*)(struct File*, uint64_t);         // f, pid
-using vfs_ioctl_fn = int (*)(struct File*, unsigned long, unsigned long);     // f, cmd, arg
+using vfs_poll_wait_kind_fn = mod::sched::task::WaitChannelKind (*)(struct File*);
+using vfs_ioctl_fn = int (*)(struct File*, unsigned long, unsigned long);  // f, cmd, arg
 
 struct FileOperations {
     vfs_open_fn vfs_open;
@@ -60,6 +65,7 @@ struct FileOperations {
     vfs_truncate_fn vfs_truncate;                          // For truncating file to given length
     vfs_poll_check_fn vfs_poll_check;                      // For checking poll readiness (nullptr = always ready)
     vfs_poll_register_waiter_fn vfs_poll_register_waiter;  // Register a task to be woken when readiness changes
+    vfs_poll_wait_kind_fn vfs_poll_wait_kind = nullptr;    // Scheduler wait kind for poll wake policy (nullptr = generic)
     vfs_ioctl_fn vfs_ioctl;                                // For device-specific ioctl (nullptr = -ENOTTY)
 };
 

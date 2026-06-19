@@ -1219,6 +1219,63 @@ TESTD_RUN(test_vfs_unlink_rename) {
 }
 TESTD_RUN_END(test_vfs_unlink_rename)
 
+TESTD_RUN(test_vfs_rename_cross_mount_exdev) {
+    const char* mountpoint = "/tmp/testd_rename_devfs_mount";
+    const char* src = "/tmp/testd_rename_cross_src.txt";
+    const char* dst = "/tmp/testd_rename_devfs_mount/cross_dst";
+
+    ker::abi::vfs::umount(mountpoint);
+    rmdir(mountpoint);
+    unlink(src);
+
+    int fd = open(src, O_CREAT | O_WRONLY | O_TRUNC, MODE_0644);
+    if (fd < 0) {
+        fail("vfs_rename_cross_create", "open source failed");
+        return;
+    }
+    close(fd);
+
+    if (mkdir(mountpoint, MODE_0755) != 0) {
+        unlink(src);
+        fail("vfs_rename_cross_mkdir", "mkdir mountpoint failed");
+        return;
+    }
+
+    int const MOUNT_RET = ker::abi::vfs::mount(nullptr, mountpoint, "devfs");
+    if (MOUNT_RET != 0) {
+        rmdir(mountpoint);
+        unlink(src);
+        fail("vfs_rename_cross_mount", "devfs mount failed");
+        return;
+    }
+
+    errno = 0;
+    if (rename(src, dst) == 0 || errno != EXDEV) {
+        int const SAVED_ERRNO = errno;
+        ker::abi::vfs::umount(mountpoint);
+        rmdir(mountpoint);
+        unlink(src);
+        errno = SAVED_ERRNO;
+        fail("vfs_rename_cross_exdev", "expected EXDEV");
+        return;
+    }
+    TESTD_PASS("vfs_rename_cross_exdev");
+
+    struct stat st{};
+    if (stat(src, &st) != 0) {
+        ker::abi::vfs::umount(mountpoint);
+        rmdir(mountpoint);
+        fail("vfs_rename_cross_src_preserved", "source missing after EXDEV");
+        return;
+    }
+    TESTD_PASS("vfs_rename_cross_src_preserved");
+
+    ker::abi::vfs::umount(mountpoint);
+    rmdir(mountpoint);
+    unlink(src);
+}
+TESTD_RUN_END(test_vfs_rename_cross_mount_exdev)
+
 TESTD_RUN(test_vfs_lstat_symlink) {
     const char* target = "/tmp/testd_lstat_target";
     const char* link = "/tmp/testd_lstat_link";
@@ -4034,6 +4091,7 @@ TESTD_RUN_END(test_journal_device_userspace_record)
     X(test_vfs_lseek)                             \
     X(test_vfs_mkdir_rmdir)                       \
     X(test_vfs_unlink_rename)                     \
+    X(test_vfs_rename_cross_mount_exdev)          \
     X(test_vfs_lstat_symlink)                     \
     X(test_vfs_shell_fsops_shape)                 \
     X(test_vfs_dup)                               \

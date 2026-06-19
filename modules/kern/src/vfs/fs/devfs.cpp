@@ -18,6 +18,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/dbg/journal.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/sched/task.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <string_view>
 #include <utility>
@@ -467,6 +468,15 @@ auto devfs_poll_register_waiter(File* f, uint64_t pid) -> bool {
     return devfs_file->device->char_ops->poll_register_waiter(f, pid);
 }
 
+auto devfs_poll_wait_kind(File* f) -> ker::mod::sched::task::WaitChannelKind {
+    auto* devfs_file = validate_devfs_file(f, "poll_wait_kind");
+    if (devfs_file == nullptr || devfs_file->device == nullptr || devfs_file->device->char_ops == nullptr ||
+        devfs_file->device->char_ops->poll_wait_kind == nullptr) {
+        return ker::mod::sched::task::WaitChannelKind::GENERIC;
+    }
+    return devfs_file->device->char_ops->poll_wait_kind(f);
+}
+
 FileOperations devfs_fops = {
     .vfs_open = nullptr,
     .vfs_close = devfs_close,
@@ -479,6 +489,7 @@ FileOperations devfs_fops = {
     .vfs_truncate = nullptr,
     .vfs_poll_check = devfs_poll_check,
     .vfs_poll_register_waiter = devfs_poll_register_waiter,
+    .vfs_poll_wait_kind = devfs_poll_wait_kind,
     .vfs_ioctl = devfs_ioctl,
 };
 

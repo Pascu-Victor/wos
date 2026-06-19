@@ -103,7 +103,7 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
         case abi::multiproc::threadControlOps::YIELD: {
             auto* task = mod::sched::get_current_task();
             if (task != nullptr) {
-                task->wait_channel = "sched_yield";
+                task->set_wait_channel("sched_yield");
                 task->yield_switch = true;
                 task->deferred_task_switch = true;
             }

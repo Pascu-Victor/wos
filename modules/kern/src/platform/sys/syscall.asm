@@ -6,6 +6,14 @@ global wos_asm_syscall_handler
 
 wos_asm_syscall_handler:
     swapgs
+    ; Validate the kernel scratch stack before writing any syscall-entry state
+    ; through %gs. If KERNEL_GS_BASE is stale, those writes corrupt whichever
+    ; object %gs happens to point at and make the later fault look unrelated.
+    cmp dword [gs:0x04], 0xffff8000
+    jb .bad_syscall_stack
+    cmp dword [gs:0x04], 0xffff9000
+    jae .bad_syscall_stack
+
     ; Save RCX and R11 IMMEDIATELY - they hold return RIP and RFLAGS
     ; These must be saved before any code can clobber them
     mov [gs:0x28], rcx ; save return RIP (syscall stores it in RCX)
@@ -169,9 +177,9 @@ wos_asm_syscall_handler:
 .bad_syscall_stack:
     ; gs:0x0 did not contain a kernel-half stack pointer.  Use an emergency
     ; stack before calling C so this path cannot corrupt the user red zone.
+    mov rsi, rsp
     lea rsp, [rel syscall_bad_stack_panic_stack_end]
-    mov rdi, rax
-    mov rsi, [gs:0x08]
+    mov rdi, [gs:0x00]
     mov rdx, [gs:0x10]
     extern wos_syscall_bad_stack_panic
     call wos_syscall_bad_stack_panic

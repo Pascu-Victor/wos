@@ -466,14 +466,14 @@ auto task_selftest_waitpid_block_state_clear_resets_fields() -> bool {
     task.wait_resume_rip_phys_addr = 6;
     task.wait_resume_rsp_user_addr = 7;
     task.wait_resume_rsp_phys_addr = 8;
-    task.wait_channel = "waitpid";
+    task.set_wait_channel("waitpid", WaitChannelKind::WAITPID);
 
     task_clear_waitpid_block_state(task);
 
     return task.waiting_for_pid == 0 && task.wait_status_user_addr == 0 && task.wait_status_phys_addr == 0 &&
            task.wait_rusage_user_addr == 0 && task.wait_rusage_phys_addr == 0 && task.wait_resume_rip_user_addr == 0 &&
            task.wait_resume_rip_phys_addr == 0 && task.wait_resume_rsp_user_addr == 0 && task.wait_resume_rsp_phys_addr == 0 &&
-           task.wait_channel == nullptr;
+           task.wait_channel == nullptr && task.wait_channel_kind == WaitChannelKind::NONE;
 }
 #endif
 

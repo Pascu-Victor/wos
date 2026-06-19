@@ -1239,7 +1239,7 @@ auto proxy_pipe_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offset
             return finish(-EINTR);
         }
 
-        task->wait_channel = "wki_proxy_pipe";
+        task->set_wait_channel("wki_proxy_pipe");
         proxy->blocked_reader.store(task, std::memory_order_release);
         proxy->lock.unlock_irqrestore(IRQF);
         s_ipc_lock.unlock_irqrestore(PENDING_IRQF);
@@ -2126,7 +2126,7 @@ auto register_poll_read_waiter(ker::vfs::File* file, bool* ready_now) -> bool {
     if (task == nullptr || file == nullptr || file->fops == nullptr || file->fops->vfs_poll_register_waiter == nullptr) {
         return false;
     }
-    task->wait_channel = "wki_pipe_pump_poll";
+    task->set_wait_channel("wki_pipe_pump_poll");
     if (!file->fops->vfs_poll_register_waiter(file, task->pid)) {
         return false;
     }
@@ -2167,7 +2167,7 @@ auto register_poll_write_waiter(ker::vfs::File* file, bool* ready_now) -> bool {
     if (task == nullptr || file == nullptr || file->fops == nullptr || file->fops->vfs_poll_register_waiter == nullptr) {
         return false;
     }
-    task->wait_channel = "wki_pipe_write_poll";
+    task->set_wait_channel("wki_pipe_write_poll");
     if (!file->fops->vfs_poll_register_waiter(file, task->pid)) {
         return false;
     }

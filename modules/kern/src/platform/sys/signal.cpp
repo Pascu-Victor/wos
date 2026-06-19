@@ -42,6 +42,23 @@ constexpr auto STACK_OFF_RCX = 0x60;
 constexpr auto STACK_OFF_RAX = 0x70;
 constexpr auto STACK_OFF_RETVAL = 0x78;
 constexpr uint64_t USER_ADDR_LIMIT = 0x0000800000000000ULL;
+constexpr uint64_t USER_RFLAGS_CF = 1ULL << 0;
+constexpr uint64_t USER_RFLAGS_FIXED_ONE = 1ULL << 1;
+constexpr uint64_t USER_RFLAGS_PF = 1ULL << 2;
+constexpr uint64_t USER_RFLAGS_AF = 1ULL << 4;
+constexpr uint64_t USER_RFLAGS_ZF = 1ULL << 6;
+constexpr uint64_t USER_RFLAGS_SF = 1ULL << 7;
+constexpr uint64_t USER_RFLAGS_TF = 1ULL << 8;
+constexpr uint64_t USER_RFLAGS_IF = 1ULL << 9;
+constexpr uint64_t USER_RFLAGS_DF = 1ULL << 10;
+constexpr uint64_t USER_RFLAGS_OF = 1ULL << 11;
+constexpr uint64_t USER_RFLAGS_RF = 1ULL << 16;
+constexpr uint64_t USER_RFLAGS_AC = 1ULL << 18;
+constexpr uint64_t USER_RFLAGS_ID = 1ULL << 21;
+constexpr uint64_t USER_RFLAGS_ALLOWED_MASK = USER_RFLAGS_CF | USER_RFLAGS_FIXED_ONE | USER_RFLAGS_PF | USER_RFLAGS_AF | USER_RFLAGS_ZF |
+                                              USER_RFLAGS_SF | USER_RFLAGS_TF | USER_RFLAGS_IF | USER_RFLAGS_DF | USER_RFLAGS_OF |
+                                              USER_RFLAGS_RF | USER_RFLAGS_AC | USER_RFLAGS_ID;
+constexpr uint64_t USER_RFLAGS_REQUIRED_MASK = USER_RFLAGS_FIXED_ONE | USER_RFLAGS_IF;
 
 // Helper: read a uint64_t from a stack slot
 auto stack_read(const uint8_t* base, int offset) -> uint64_t { return *reinterpret_cast<const uint64_t*>(base + offset); }
@@ -57,6 +74,14 @@ auto user_pointer_valid(uint64_t ptr) -> bool { return ptr != 0 && ptr < USER_AD
 
 auto user_signal_target_valid(const ker::mod::sched::task::Task::SigHandler& handler) -> bool {
     return user_pointer_valid(handler.handler) && user_pointer_valid(handler.restorer);
+}
+
+auto user_rflags_valid(uint64_t flags) -> bool {
+    return (flags & USER_RFLAGS_REQUIRED_MASK) == USER_RFLAGS_REQUIRED_MASK && (flags & ~USER_RFLAGS_ALLOWED_MASK) == 0;
+}
+
+auto signal_return_frame_valid(const ker::mod::sys::signal::SignalFrame& frame) -> bool {
+    return user_pointer_valid(frame.saved_rip) && user_pointer_valid(frame.saved_rsp) && user_rflags_valid(frame.saved_rflags);
 }
 
 auto live_syscall_user_rsp() -> uint64_t {
@@ -226,6 +251,10 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
         uint64_t const FRAME_START = USER_RSP - 8;  // back up to pretcode
         SignalFrame frame{};
         if (!read_signal_frame(*task, FRAME_START, frame)) {
+            ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);
+            __builtin_unreachable();
+        }
+        if (!signal_return_frame_valid(frame)) {
             ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);
             __builtin_unreachable();
         }
@@ -532,6 +561,103 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
     task->in_signal_handler = true;
     task->context.regs = gpr;
     task->context.frame = frame;
+}
+
+void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDelivery delivery) {
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS) {
+        return;
+    }
+
+    // A PROCESS can be resumed here with a saved kernel frame when it was
+    // preempted at a voluntary syscall wait point. Signal frames must only be
+    // built on a real user stack; the syscall/interrupt return paths will
+    // deliver the signal once the task reaches a user-mode return boundary.
+    if ((task->context.frame.cs & 0x3) != 0x3 || task->is_voluntary_blocked()) {
+        return;
+    }
+
+    if (task->in_signal_handler) {
+        return;
+    }
+
+    uint64_t const DELIVERABLE = task->sig_pending & ~task->sig_mask;
+    if (DELIVERABLE == 0) {
+        return;
+    }
+
+    int const SIGNO = __builtin_ctzll(DELIVERABLE) + 1;
+    auto const IDX = static_cast<unsigned>(SIGNO - 1);
+    auto& handler = task->sig_handlers.at(IDX);
+
+    if (delivery == DeferredSignalDelivery::USER_HANDLERS_ONLY && !is_user_signal_handler(handler)) {
+        return;
+    }
+    if (is_user_signal_handler(handler) && !user_signal_target_valid(handler)) {
+        task->sig_pending &= ~(1ULL << IDX);
+        ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);
+        __builtin_unreachable();
+    }
+
+    if (handler.handler == WOS_SIG_DFL) {
+        task->sig_pending &= ~(1ULL << IDX);
+        if (SIGNO == WOS_SIGCHLD || SIGNO == WOS_SIGURG || SIGNO == WOS_SIGWINCH || SIGNO == WOS_SIGCONT) {
+            if (task->sigsuspend_active) {
+                task->sig_mask = task->signal_frame_saved_mask();
+            }
+            return;
+        }
+        if (SIGNO == WOS_SIGSTOP || SIGNO == 20 || SIGNO == 21 || SIGNO == 22) {
+            task->set_voluntary_blocked(true);
+            return;
+        }
+
+        ker::syscall::process::wos_proc_exit_signal(SIGNO);
+        __builtin_unreachable();
+    }
+
+    if (handler.handler == WOS_SIG_IGN) {
+        task->sig_pending &= ~(1ULL << IDX);
+        if (task->sigsuspend_active) {
+            task->sig_mask = task->signal_frame_saved_mask();
+        }
+        return;
+    }
+
+    auto& gpr = task->context.regs;
+    auto& frame = task->context.frame;
+    uint64_t const FRAME_ADDR = signal_frame_address_for_task(*task, frame.rsp, handler.flags);
+    SignalFrame sigframe{};
+
+    sigframe.pretcode = handler.restorer;
+    sigframe.signo = static_cast<uint64_t>(SIGNO);
+    sigframe.saved_mask = signal_frame_saved_mask_value(*task);
+    sigframe.saved_rip = frame.rip;
+    sigframe.saved_rsp = frame.rsp;
+    sigframe.saved_rflags = frame.flags;
+    sigframe.saved_retval = gpr.rax;
+
+    const auto* regs_arr = reinterpret_cast<const uint64_t*>(&gpr);
+    for (int i = 0; i < 15; i++) {
+        sigframe.saved_regs.at(static_cast<size_t>(i)) = regs_arr[i];
+    }
+
+    if (!write_signal_frame(*task, FRAME_ADDR, sigframe)) {
+        handle_signal_frame_fault(task);
+        return;
+    }
+    consume_signal_frame_saved_mask(*task);
+    task->sig_pending &= ~(1ULL << IDX);
+
+    gpr.rdi = static_cast<uint64_t>(SIGNO);
+    frame.rip = handler.handler;
+    frame.rsp = FRAME_ADDR;
+    write_task_syscall_return(*task, FRAME_ADDR, handler.handler, frame.flags);
+
+    task->sig_mask |= handler.mask;
+    if ((handler.flags & 0x40000000ULL) == 0U) {
+        task->sig_mask |= (1ULL << IDX);
+    }
+    task->in_signal_handler = true;
 }
 
 }  // namespace ker::mod::sys::signal

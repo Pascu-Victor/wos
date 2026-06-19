@@ -3539,6 +3539,13 @@ void vfs_put_file(File* f) {
     }
 }
 
+void vfs_retain_file(File* f) {
+    if (f == nullptr) {
+        return;
+    }
+    f->refcount.fetch_add(1, std::memory_order_acq_rel);
+}
+
 auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int {
     if (task == nullptr || fd < 0) {
         return -EINVAL;
@@ -5275,6 +5282,10 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
         }
     }
 
+    if (old_mount != new_mount) {
+        return -EXDEV;
+    }
+
     if (old_mount->fs_type == FSType::FAT32 && new_mount->fs_type == FSType::FAT32 && old_mount == new_mount) {
         int const RET = ker::vfs::fat32::fat32_rename_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(old_mount->private_data),
                                                            strip_mount_prefix(old_mount, old_buf.data()),
@@ -5306,9 +5317,6 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
 
     if (old_mount->fs_type != FSType::TMPFS || new_mount->fs_type != FSType::TMPFS) {
         return -ENOSYS;
-    }
-    if (old_mount != new_mount) {
-        return -EXDEV;
     }
 
     // Helper lambda to strip mount prefix
@@ -6083,7 +6091,7 @@ auto pipe_begin_direct_write(File* pipe_file, PipeState* st, PipeDirectWriteWind
         perf_record_local_pipe_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::BLOCK_WRITE),
                                      ker::mod::perf::WkiPerfPhase::POINT, correlation, 0, PIPE_SPACE, callsite);
         if (REGISTERED) {
-            ker::mod::sched::preemptible_syscall_park("pipe_write");
+            ker::mod::sched::preemptible_syscall_park("pipe_write", ker::mod::sched::task::WaitChannelKind::LOCAL_PIPE);
         } else {
             ker::mod::sched::kern_yield();
         }
@@ -6351,7 +6359,7 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task,
             perf_record_local_pipe_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::BLOCK_READ),
                                          ker::mod::perf::WkiPerfPhase::POINT, CORRELATION, 0, PIPE_COUNT, CALLSITE);
             if (REGISTERED) {
-                ker::mod::sched::preemptible_syscall_park("pipe_read");
+                ker::mod::sched::preemptible_syscall_park("pipe_read", ker::mod::sched::task::WaitChannelKind::LOCAL_PIPE);
             } else {
                 ker::mod::sched::kern_yield();
             }
@@ -6416,7 +6424,7 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task,
                 perf_record_local_pipe_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::BLOCK_WRITE),
                                              ker::mod::perf::WkiPerfPhase::POINT, CORRELATION, 0, PIPE_SPACE, CALLSITE);
                 if (REGISTERED) {
-                    ker::mod::sched::preemptible_syscall_park("pipe_write");
+                    ker::mod::sched::preemptible_syscall_park("pipe_write", ker::mod::sched::task::WaitChannelKind::LOCAL_PIPE);
                 } else {
                     ker::mod::sched::kern_yield();
                 }
@@ -6472,7 +6480,7 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task,
             perf_record_local_pipe_event(static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalPipeOp::BLOCK_WRITE),
                                          ker::mod::perf::WkiPerfPhase::POINT, CORRELATION, 0, PIPE_SPACE, CALLSITE);
             if (REGISTERED) {
-                ker::mod::sched::preemptible_syscall_park("pipe_write");
+                ker::mod::sched::preemptible_syscall_park("pipe_write", ker::mod::sched::task::WaitChannelKind::LOCAL_PIPE);
             } else {
                 ker::mod::sched::kern_yield();
             }
@@ -6571,6 +6579,9 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task,
             st->lock.unlock_irqrestore(IRQF);
             return OK;
         },
+        .vfs_poll_wait_kind = [](File*) -> ker::mod::sched::task::WaitChannelKind {
+            return ker::mod::sched::task::WaitChannelKind::LOCAL_PIPE;
+        },
         .vfs_ioctl = nullptr,
     };
 
@@ -6609,6 +6620,9 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task,
             bool const OK = pipe_register_poll_waiter(st->write_poll_waiting, pid);
             st->lock.unlock_irqrestore(IRQF);
             return OK;
+        },
+        .vfs_poll_wait_kind = [](File*) -> ker::mod::sched::task::WaitChannelKind {
+            return ker::mod::sched::task::WaitChannelKind::LOCAL_PIPE;
         },
         .vfs_ioctl = nullptr,
     };

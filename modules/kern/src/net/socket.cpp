@@ -183,7 +183,7 @@ void socket_defer_wait(Socket* sock, const char* wait_channel) {
     if (sock != nullptr) {
         sock->owner_pid = current_task->pid;
     }
-    current_task->wait_channel = wait_channel;
+    current_task->set_wait_channel(wait_channel);
 }
 
 void socket_wake_waiters(Socket* sock) {

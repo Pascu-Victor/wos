@@ -174,6 +174,7 @@ auto vfs_is_socket_file(const File* f) -> bool;
 auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int;
 auto vfs_get_file(ker::mod::sched::task::Task* task, int fd) -> struct File*;
 auto vfs_get_file_retain(ker::mod::sched::task::Task* task, int fd) -> struct File*;
+void vfs_retain_file(struct File* f);
 void vfs_put_file(struct File* f);
 auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int;
 

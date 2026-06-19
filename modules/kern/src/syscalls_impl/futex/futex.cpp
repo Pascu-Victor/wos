@@ -192,7 +192,7 @@ int64_t futex_wait(const int* addr, int expected, const void* timeout) {
             return CURRENT_VALUE == expected;
         },
         [current_task, waiter, timeout, timeout_us, &previous_waiter]() {
-            current_task->wait_channel = "futex_wait";
+            current_task->set_wait_channel("futex_wait", ker::mod::sched::task::WaitChannelKind::FUTEX);
             current_task->wake_at_us = timeout != nullptr ? deadline_from_now_us(timeout_us) : 0;
             current_task->deferred_task_switch = true;
             previous_waiter = current_task->futex_waiter.exchange(waiter, std::memory_order_acq_rel);

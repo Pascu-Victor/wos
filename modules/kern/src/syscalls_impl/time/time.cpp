@@ -153,7 +153,7 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                     // (move to wait list). The timer tick wakeup scan will reschedule us
                     // once wake_at_us is reached.
                     task->wake_at_us = deadline_from_now_us(sleep_us);
-                    task->wait_channel = "nanosleep";
+                    task->set_wait_channel("nanosleep");
                     task->deferred_task_switch = true;
                     // Return 0 now - syscall exit path sees deferred_task_switch=true,
                     // moves task to wait list, switches to next task.

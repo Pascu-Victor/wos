@@ -57,6 +57,18 @@ enum class TaskState : uint8_t {
     DEAD = 2,     // Task fully dead, safe to reclaim memory after epoch grace period
 };
 
+enum class WaitChannelKind : uint8_t {
+    NONE,
+    GENERIC,
+    LOCAL_PIPE,
+    LOCAL_PTY,
+    WAITPID,
+    FUTEX,
+    SIGSUSPEND,
+    WKI_EXECVE_PROXY,
+    PTRACE,
+};
+
 struct Context {
     uint64_t syscall_kernel_stack;
     uint64_t syscall_scratch_area;  // Small scratch area for syscall handler (RIP, RSP, RFLAGS, DS, ES)
@@ -301,8 +313,18 @@ struct Task {
     uint64_t last_wake_us = 0;
     uint64_t perf_wait_callsite = 0;
 
-    // Wait channel: human-readable string describing why the task is blocked.
+    // Wait channel: human-readable string for diagnostics plus a typed policy key.
     const char* wait_channel = nullptr;
+    WaitChannelKind wait_channel_kind{WaitChannelKind::NONE};
+
+    void set_wait_channel(const char* channel, WaitChannelKind kind = WaitChannelKind::GENERIC) {
+        wait_channel = channel;
+        wait_channel_kind = channel != nullptr ? kind : WaitChannelKind::NONE;
+    }
+
+    void clear_wait_channel() { set_wait_channel(nullptr, WaitChannelKind::NONE); }
+
+    [[nodiscard]] auto wait_channel_is(WaitChannelKind kind) const -> bool { return wait_channel != nullptr && wait_channel_kind == kind; }
 
     // Published futex waiter node while this task is blocked in futex_wait().
     // Wake and abort/exit cleanup atomically clear this pointer; the path that
@@ -554,7 +576,7 @@ inline void task_clear_waitpid_block_state(Task& task) {
     task.wait_resume_rip_phys_addr = 0;
     task.wait_resume_rsp_user_addr = 0;
     task.wait_resume_rsp_phys_addr = 0;
-    task.wait_channel = nullptr;
+    task.clear_wait_channel();
 }
 
 #ifdef WOS_SELFTEST

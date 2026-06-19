@@ -27,6 +27,7 @@
 namespace ker::dev::pty {
 
 using log = ker::mod::dbg::logger<"pty">;
+using ker::mod::sched::task::WaitChannelKind;
 // Fairness cadence for long PTY write bursts. Yielding periodically prevents
 // a single writer from monopolizing CPU and improves terminal interactivity.
 static constexpr size_t PTY_WRITE_FAIR_YIELD_INTERVAL = 4096;
@@ -244,7 +245,8 @@ auto register_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) ->
     return waiters.push_back(pid);
 }
 
-auto block_current_task(ker::util::SmallVec<uint64_t, 2>& waiters, const char* wchan = nullptr) -> bool {
+auto block_current_task(ker::util::SmallVec<uint64_t, 2>& waiters, const char* wchan = nullptr,
+                        ker::mod::sched::task::WaitChannelKind wait_kind = ker::mod::sched::task::WaitChannelKind::GENERIC) -> bool {
     auto* current_task = ker::mod::sched::get_current_task();
     if (current_task == nullptr) {
         return false;
@@ -252,7 +254,7 @@ auto block_current_task(ker::util::SmallVec<uint64_t, 2>& waiters, const char* w
     if (!register_waiter(waiters, current_task->pid)) {
         return false;
     }
-    current_task->wait_channel = wchan;
+    current_task->set_wait_channel(wchan, wait_kind);
     return true;
 }
 
@@ -262,7 +264,7 @@ void wake_waiters(std::span<const uint64_t> waiters) {
         if (waiter == nullptr) {
             continue;
         }
-        ker::mod::sched::wake_task_from_event(waiter, ker::mod::sched::EventWakeDeferredSwitch::CANCEL);
+        ker::mod::sched::wake_task_from_event(waiter);
         waiter->release();
     }
 }
@@ -358,6 +360,8 @@ auto pty_poll_register_waiter(ker::vfs::File* file, uint64_t pid) -> bool {
     pair->lock.unlock_irqrestore(IRQF);
     return ok;
 }
+
+auto pty_poll_wait_kind(ker::vfs::File* /*file*/) -> WaitChannelKind { return WaitChannelKind::LOCAL_PTY; }
 
 enum class CprPrefixMatch : uint8_t {
     PREFIX,
@@ -606,7 +610,7 @@ ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
                 pair->lock.unlock_irqrestore(IRQF);
                 return finish(-EINTR);
             }
-            should_block = block_current_task(pair->master_read_waiters, "pty_master_read");
+            should_block = block_current_task(pair->master_read_waiters, "pty_master_read", WaitChannelKind::LOCAL_PTY);
         }
         pair->lock.unlock_irqrestore(IRQF);
         if (RD == 0) {
@@ -622,7 +626,7 @@ ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
                 continue;
             }
             if (should_block) {
-                ker::mod::sched::preemptible_syscall_park("pty_master_read");
+                ker::mod::sched::preemptible_syscall_park("pty_master_read", WaitChannelKind::LOCAL_PTY);
             } else {
                 ker::mod::sched::kern_yield();
             }
@@ -903,7 +907,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     bool const SLAVE_OPENED = pair->slave_opened > 0;
                     bool should_block = false;
                     if (WR == 0 && SLAVE_OPENED && processed == 0) {
-                        should_block = block_current_task(pair->master_write_waiters, "pty_master_write");
+                        should_block = block_current_task(pair->master_write_waiters, "pty_master_write", WaitChannelKind::LOCAL_PTY);
                     }
                     pair->lock.unlock_irqrestore(WR_IRQF);
                     if (WR != 0) {
@@ -919,7 +923,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                         return finish(-EINTR);
                     }
                     if (should_block) {
-                        ker::mod::sched::preemptible_syscall_park("pty_master_write");
+                        ker::mod::sched::preemptible_syscall_park("pty_master_write", WaitChannelKind::LOCAL_PTY);
                     } else {
                         ker::mod::sched::kern_yield();
                     }
@@ -1094,6 +1098,7 @@ CharDeviceOps master_ops = {
     .ioctl = master_ioctl,
     .poll_check = master_poll_check,
     .poll_register_waiter = pty_poll_register_waiter,
+    .poll_wait_kind = pty_poll_wait_kind,
 };
 
 // --- Slave-side device operations ---
@@ -1193,7 +1198,7 @@ ssize_t slave_read(ker::vfs::File* file, void* buf, size_t count) {
                 pair->lock.unlock_irqrestore(IRQF);
                 return finish(-EINTR);
             }
-            should_block = block_current_task(pair->slave_read_waiters, "pty_slave_read");
+            should_block = block_current_task(pair->slave_read_waiters, "pty_slave_read", WaitChannelKind::LOCAL_PTY);
         }
         pair->lock.unlock_irqrestore(IRQF);
         if (RD == 0) {
@@ -1209,7 +1214,7 @@ ssize_t slave_read(ker::vfs::File* file, void* buf, size_t count) {
                 continue;
             }
             if (should_block) {
-                ker::mod::sched::preemptible_syscall_park("pty_slave_read");
+                ker::mod::sched::preemptible_syscall_park("pty_slave_read", WaitChannelKind::LOCAL_PTY);
             } else {
                 ker::mod::sched::kern_yield();
             }
@@ -1285,7 +1290,7 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
                         break;
                     }
                     if (MASTER_OPENED && written == 0) {
-                        should_block = block_current_task(pair->slave_write_waiters, "pty_slave_write");
+                        should_block = block_current_task(pair->slave_write_waiters, "pty_slave_write", WaitChannelKind::LOCAL_PTY);
                     }
                     pair->lock.unlock_irqrestore(IRQF);
                     if (!MASTER_OPENED) {
@@ -1303,7 +1308,7 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
                     if (should_block) {
                         wake_master_readers(pair);
                         wake_both_pollers(pair);
-                        ker::mod::sched::preemptible_syscall_park("pty_slave_write");
+                        ker::mod::sched::preemptible_syscall_park("pty_slave_write", WaitChannelKind::LOCAL_PTY);
                     } else {
                         ker::mod::sched::kern_yield();
                     }
@@ -1367,7 +1372,7 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
                 bool const MASTER_OPENED = pair->master_opened > 0;
                 bool should_block = false;
                 if (WR == 0 && MASTER_OPENED && written == 0) {
-                    should_block = block_current_task(pair->slave_write_waiters, "pty_slave_write");
+                    should_block = block_current_task(pair->slave_write_waiters, "pty_slave_write", WaitChannelKind::LOCAL_PTY);
                 }
                 pair->lock.unlock_irqrestore(IRQF);
                 if (WR != 0) {
@@ -1391,7 +1396,7 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
                 if (should_block) {
                     wake_master_readers(pair);
                     wake_both_pollers(pair);
-                    ker::mod::sched::preemptible_syscall_park("pty_slave_write");
+                    ker::mod::sched::preemptible_syscall_park("pty_slave_write", WaitChannelKind::LOCAL_PTY);
                 } else {
                     ker::mod::sched::kern_yield();
                 }
@@ -1589,6 +1594,7 @@ CharDeviceOps slave_ops = {
     .ioctl = slave_ioctl,
     .poll_check = slave_poll_check,
     .poll_register_waiter = pty_poll_register_waiter,
+    .poll_wait_kind = pty_poll_wait_kind,
 };
 
 // --- ptmx device (singleton - opening allocates a new PTY pair) ---

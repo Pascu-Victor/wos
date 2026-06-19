@@ -453,11 +453,11 @@ inline void kern_yield_impl(uint64_t perf_callsite) {
     auto* task = get_current_task();
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
-        task->wait_channel = "kern_yield";
+        task->set_wait_channel("kern_yield");
         task->set_voluntary_blocked(true);
         if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
             task->set_voluntary_blocked(false);
-            task->wait_channel = nullptr;
+            task->clear_wait_channel();
             return;
         }
         request_local_timer_recheck();
@@ -467,7 +467,7 @@ inline void kern_yield_impl(uint64_t perf_callsite) {
     if (task != nullptr) {
         (void)task->wakeup_pending.exchange(false, std::memory_order_acquire);
         task->set_voluntary_blocked(false);
-        task->wait_channel = nullptr;
+        task->clear_wait_channel();
     }
     if (PAUSED_SYSCALL_ACCOUNTING) {
         resume_syscall_accounting();
@@ -490,13 +490,13 @@ inline void kern_block_impl(uint64_t perf_callsite) {
     auto* task = get_current_task();
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
-        task->wait_channel = "kern_block";
+        task->set_wait_channel("kern_block");
         task->wants_block = true;
         task->set_voluntary_blocked(true);
         if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
             task->wants_block = false;
             task->set_voluntary_blocked(false);
-            task->wait_channel = nullptr;
+            task->clear_wait_channel();
             return;
         }
         request_local_timer_recheck();
@@ -520,7 +520,7 @@ inline void kern_block_impl(uint64_t perf_callsite) {
         task->wake_at_us = 0;
         task->wants_block = false;
         task->set_voluntary_blocked(false);
-        task->wait_channel = nullptr;
+        task->clear_wait_channel();
     }
     if (PAUSED_SYSCALL_ACCOUNTING) {
         resume_syscall_accounting();
@@ -545,7 +545,7 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
     auto* task = get_current_task();
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
-        task->wait_channel = "kern_sleep";
+        task->set_wait_channel("kern_sleep");
         task->wake_at_us = saturating_deadline_us(ker::mod::time::get_us(), sleep_us);
         task->wants_block = true;
         task->set_voluntary_blocked(true);
@@ -553,7 +553,7 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
             task->wake_at_us = 0;
             task->wants_block = false;
             task->set_voluntary_blocked(false);
-            task->wait_channel = nullptr;
+            task->clear_wait_channel();
             return;
         }
         request_local_timer_recheck();
@@ -577,7 +577,7 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
         task->wake_at_us = 0;
         task->wants_block = false;
         task->set_voluntary_blocked(false);
-        task->wait_channel = nullptr;
+        task->clear_wait_channel();
     }
     if (PAUSED_SYSCALL_ACCOUNTING) {
         resume_syscall_accounting();
@@ -589,7 +589,8 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
 // safe point, then return to the same in-kernel loop after an event, signal, or
 // timeout wake. Unlike deferred_task_switch, this never returns to userspace
 // with a private retry code.
-inline void preemptible_syscall_park_impl(const char* wait_channel, uint64_t deadline_us, uint64_t perf_callsite) {
+inline void preemptible_syscall_park_impl(const char* wait_channel, task::WaitChannelKind wait_kind, uint64_t deadline_us,
+                                          uint64_t perf_callsite) {
     if (preempt_count() != 0) {
         note_preempt_disabled_block("preemptible_syscall_park", perf_callsite);
     }
@@ -597,7 +598,7 @@ inline void preemptible_syscall_park_impl(const char* wait_channel, uint64_t dea
     auto* task = get_current_task();
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
-        task->wait_channel = wait_channel;
+        task->set_wait_channel(wait_channel, wait_kind);
         task->wake_at_us = deadline_us;
         task->wants_block = true;
         task->set_voluntary_blocked(true);
@@ -605,7 +606,7 @@ inline void preemptible_syscall_park_impl(const char* wait_channel, uint64_t dea
             task->wake_at_us = 0;
             task->wants_block = false;
             task->set_voluntary_blocked(false);
-            task->wait_channel = nullptr;
+            task->clear_wait_channel();
             return;
         }
         request_local_timer_recheck();
@@ -629,11 +630,19 @@ inline void preemptible_syscall_park_impl(const char* wait_channel, uint64_t dea
         task->wake_at_us = 0;
         task->wants_block = false;
         task->set_voluntary_blocked(false);
-        task->wait_channel = nullptr;
+        task->clear_wait_channel();
     }
     if (PAUSED_SYSCALL_ACCOUNTING) {
         resume_syscall_accounting();
     }
+}
+
+inline void preemptible_syscall_park_impl(const char* wait_channel, uint64_t deadline_us, uint64_t perf_callsite) {
+    preemptible_syscall_park_impl(wait_channel, task::WaitChannelKind::GENERIC, deadline_us, perf_callsite);
+}
+
+inline void preemptible_syscall_park_impl(const char* wait_channel, task::WaitChannelKind wait_kind, uint64_t perf_callsite) {
+    preemptible_syscall_park_impl(wait_channel, wait_kind, 0, perf_callsite);
 }
 
 inline void preemptible_syscall_park_impl(const char* wait_channel, uint64_t perf_callsite) {
@@ -650,6 +659,9 @@ constexpr auto kern_block() { ker::mod::sched::kern_block_impl(WOS_PERF_CALLSITE
 constexpr auto kern_sleep_us(uint64_t sleep_us) { ker::mod::sched::kern_sleep_us_impl(sleep_us, WOS_PERF_CALLSITE()); }
 constexpr auto preemptible_syscall_park(const char* wait_channel, uint64_t deadline_us = 0) {
     ker::mod::sched::preemptible_syscall_park_impl(wait_channel, deadline_us, WOS_PERF_CALLSITE());
+}
+constexpr auto preemptible_syscall_park(const char* wait_channel, task::WaitChannelKind wait_kind, uint64_t deadline_us = 0) {
+    ker::mod::sched::preemptible_syscall_park_impl(wait_channel, wait_kind, deadline_us, WOS_PERF_CALLSITE());
 }
 
 }  // namespace ker::mod::sched

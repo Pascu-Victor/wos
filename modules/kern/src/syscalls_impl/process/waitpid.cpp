@@ -233,7 +233,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         }
         capture_wait_resume_debug(current_task, gpr);
 
-        current_task->wait_channel = "waitpid";
+        current_task->set_wait_channel("waitpid", sched_task::WaitChannelKind::WAITPID);
         current_task->deferred_task_switch = true;
         exited = claim_exited_child(current_task);
         if (exited != nullptr) {
@@ -332,7 +332,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         current_task->wait_rusage_phys_addr = 0;
     }
     capture_wait_resume_debug(current_task, gpr);
-    current_task->wait_channel = "waitpid";
+    current_task->set_wait_channel("waitpid", sched_task::WaitChannelKind::WAITPID);
 
     if (TRACE_WAIT) {
         current_task->deferred_task_switch = true;

@@ -78,6 +78,21 @@ auto register_poll_waiter(ker::vfs::File* file, uint64_t pid) -> bool {
     return false;
 }
 
+auto poll_wait_kind_for_file(ker::vfs::File* file) -> ker::mod::sched::task::WaitChannelKind {
+    if (file == nullptr || file->fops == nullptr || file->fops->vfs_poll_wait_kind == nullptr) {
+        return ker::mod::sched::task::WaitChannelKind::GENERIC;
+    }
+    return file->fops->vfs_poll_wait_kind(file);
+}
+
+auto merge_poll_wait_kind(ker::mod::sched::task::WaitChannelKind current, ker::mod::sched::task::WaitChannelKind candidate)
+    -> ker::mod::sched::task::WaitChannelKind {
+    if (current == ker::mod::sched::task::WaitChannelKind::GENERIC || current == ker::mod::sched::task::WaitChannelKind::NONE) {
+        return candidate;
+    }
+    return current;
+}
+
 auto begin_poll_timeout(ker::mod::sched::task::Task* task, int timeout_ms) -> uint64_t {
     if (task == nullptr || timeout_ms <= 0) {
         return 0;
@@ -158,8 +173,10 @@ auto run_socket_call(ker::vfs::File* file, ker::net::Socket* sock, int call_flag
             return fn();
         }
         char const* wait_channel = task->wait_channel != nullptr ? task->wait_channel : "sock_wait";
+        auto const WAIT_CHANNEL_KIND =
+            task->wait_channel != nullptr ? task->wait_channel_kind : ker::mod::sched::task::WaitChannelKind::GENERIC;
         if (current_task_has_deliverable_signal()) {
-            task->wait_channel = nullptr;
+            task->clear_wait_channel();
             return static_cast<T>(-EINTR);
         }
 
@@ -169,7 +186,7 @@ auto run_socket_call(ker::vfs::File* file, ker::net::Socket* sock, int call_flag
             return AFTER_DRAIN;
         }
 
-        ker::mod::sched::preemptible_syscall_park(wait_channel);
+        ker::mod::sched::preemptible_syscall_park(wait_channel, WAIT_CHANNEL_KIND);
         if (current_task_has_deliverable_signal()) {
             return static_cast<T>(-EINTR);
         }
@@ -1312,6 +1329,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 }
 
                 bool can_block = (nfds > 0);
+                auto poll_wait_kind = ker::mod::sched::task::WaitChannelKind::GENERIC;
                 if (can_block) {
                     for (size_t i = 0; i < nfds; i++) {
                         if (fds[i].fd < 0) {
@@ -1319,6 +1337,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                         }
                         auto* file = ker::vfs::vfs_get_file_retain(task, fds[i].fd);
                         bool const OK = (file != nullptr) && register_poll_waiter(file, task->pid);
+                        if (OK) {
+                            poll_wait_kind = merge_poll_wait_kind(poll_wait_kind, poll_wait_kind_for_file(file));
+                        }
                         if (file != nullptr) {
                             ker::vfs::vfs_put_file(file);
                         }
@@ -1364,7 +1385,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                         return static_cast<uint64_t>(recheck);
                     }
 
-                    ker::mod::sched::preemptible_syscall_park("poll", DEADLINE_US);
+                    ker::mod::sched::preemptible_syscall_park("poll", poll_wait_kind, DEADLINE_US);
                 } else {
                     ker::mod::sched::kern_yield();
                 }

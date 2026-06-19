@@ -292,7 +292,7 @@ auto record_signal_stop(Task& stopped, uint32_t signal) -> bool {
     stopped.ptrace_stopped = true;
     stopped.ptrace_stop_pending = true;
     stopped.ptrace_single_step = false;
-    stopped.wait_channel = "ptrace";
+    stopped.set_wait_channel("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
     stopped.ptrace_stop_uses_syscall_snapshot = false;
 
     auto* current = ker::mod::sched::get_current_task();
@@ -339,8 +339,8 @@ auto attach(Task& tracer, Task& target, bool seize) -> uint64_t {
     target.ptrace_stopped = !seize;
     target.ptrace_stop_pending = !seize;
     target.ptrace_stop_uses_syscall_snapshot = false;
-    target.wait_channel = target.ptrace_stopped ? "ptrace" : target.wait_channel;
     if (target.ptrace_stopped) {
+        target.set_wait_channel("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
         ker::mod::sched::debug_stop_task(&target);
         (void)capture_async_syscall_return_snapshot(target);
         wake_tracer_for_stop(target);
@@ -373,8 +373,8 @@ auto detach(Task& tracer, Task& target) -> uint64_t {
     target.ptrace_dr6 = 0;
     target.ptrace_dr7 = 0;
     clear_task_trap_flags(target);
-    if (target.wait_channel != nullptr && std::strcmp(target.wait_channel, "ptrace") == 0) {
-        target.wait_channel = nullptr;
+    if (target.wait_channel_is(ker::mod::sched::task::WaitChannelKind::PTRACE)) {
+        target.clear_wait_channel();
     }
     ker::mod::sched::reschedule_task_for_cpu(target.cpu, &target);
     return 0;
@@ -454,7 +454,7 @@ void publish_tracer_wait(Task& tracer, Task& target) {
     tracer.wait_resume_rip_phys_addr = 0;
     tracer.wait_resume_rsp_user_addr = 0;
     tracer.wait_resume_rsp_phys_addr = 0;
-    tracer.wait_channel = "ptrace_wait";
+    tracer.set_wait_channel("ptrace_wait", ker::mod::sched::task::WaitChannelKind::PTRACE);
 }
 
 void consume_exit_for_tracer(Task& tracer, Task& target) {
@@ -496,7 +496,7 @@ auto syscall_wait(Task& tracer, Task& target, uint64_t data) -> uint64_t {
             clear_tracer_wait_state(tracer);
             return as_error(EPERM);
         }
-        ker::mod::sched::preemptible_syscall_park("ptrace_wait");
+        ker::mod::sched::preemptible_syscall_park("ptrace_wait", ker::mod::sched::task::WaitChannelKind::PTRACE);
     }
 }
 
@@ -911,7 +911,7 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
                 target->ptrace_stopped = true;
                 target->ptrace_stop_pending = true;
                 target->ptrace_stop_uses_syscall_snapshot = false;
-                target->wait_channel = "ptrace";
+                target->set_wait_channel("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
                 ker::mod::sched::debug_stop_task(target);
                 (void)capture_async_syscall_return_snapshot(*target);
                 wake_tracer_for_stop(*target);
@@ -1066,7 +1066,7 @@ auto report_user_stop_common(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Interr
     task->ptrace_single_step = false;
     task->ptrace_stop_uses_syscall_snapshot = false;
     clear_task_trap_flags(*task);
-    task->wait_channel = "ptrace";
+    task->set_wait_channel("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
     ker::mod::sched::place_task_in_wait_queue(gpr, frame);
     wake_tracer_for_stop(*task);
     return true;
@@ -1111,11 +1111,11 @@ auto report_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum, bool exit
     task->ptrace_stopped = true;
     task->ptrace_stop_pending = true;
     task->ptrace_stop_uses_syscall_snapshot = false;
-    task->wait_channel = "ptrace";
+    task->set_wait_channel("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
     wake_tracer_for_stop(*task);
 
     while (task->ptrace_stopped) {
-        ker::mod::sched::preemptible_syscall_park("ptrace");
+        ker::mod::sched::preemptible_syscall_park("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
     }
     restore_syscall_stop_context(*task, gpr);
     return true;
@@ -1137,11 +1137,11 @@ auto report_fatal_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum) -> 
     task->ptrace_single_step = false;
     task->ptrace_syscall_in_stop = false;
     task->ptrace_stop_uses_syscall_snapshot = false;
-    task->wait_channel = "ptrace";
+    task->set_wait_channel("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
     wake_tracer_for_stop(*task);
 
     while (task->ptrace_stopped) {
-        ker::mod::sched::preemptible_syscall_park("ptrace");
+        ker::mod::sched::preemptible_syscall_park("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
     }
     restore_syscall_stop_context(*task, gpr);
     return true;

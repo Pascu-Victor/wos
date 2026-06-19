@@ -31,6 +31,11 @@ constexpr uint64_t WOS_SA_ONSTACK = 0x08000000;
 constexpr uint32_t WOS_SS_ONSTACK = 1;
 constexpr uint32_t WOS_SS_DISABLE = 2;
 
+enum class DeferredSignalDelivery : uint8_t {
+    FULL,
+    USER_HANDLERS_ONLY,
+};
+
 constexpr auto signal_frame_address(uint64_t user_rsp) -> uint64_t {
     return ((user_rsp - USER_RED_ZONE_SIZE - sizeof(SignalFrame)) & ~0xFULL) - 8;
 }
@@ -57,5 +62,6 @@ inline auto signal_frame_address_for_task(const sched::task::Task& task, uint64_
 // return directly to userspace via iretq.
 void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& frame);
 void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, gates::InterruptFrame& frame);
+void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDelivery delivery);
 
 }  // namespace ker::mod::sys::signal

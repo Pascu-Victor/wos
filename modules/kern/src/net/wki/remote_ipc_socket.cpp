@@ -263,7 +263,7 @@ auto proxy_socket_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offs
             proxy->lock.unlock_irqrestore(IRQF);
             return finish(-EINTR);
         }
-        task->wait_channel = "wki_proxy_sock";
+        task->set_wait_channel("wki_proxy_sock");
         proxy->blocked_reader.store(task, std::memory_order_release);
         proxy->lock.unlock_irqrestore(IRQF);
         ker::mod::sched::preemptible_syscall_park("wki_proxy_sock");
