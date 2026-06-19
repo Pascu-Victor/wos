@@ -156,6 +156,7 @@ struct PendingSyscall {
     uint64_t a5 = 0;
     uint64_t a6 = 0;
     timespec entered_at{};
+    timespec duration_started_at{};
 };
 
 void usage() {
@@ -225,6 +226,30 @@ auto current_realtime(const TraceOptions& options) -> timespec {
         (void)clock_gettime(CLOCK_REALTIME, &now);
     }
     return now;
+}
+
+auto current_monotonic() -> timespec {
+    timespec now{};
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    return now;
+}
+
+auto elapsed_us_since(const timespec& start, const timespec& end) -> long long {
+    long long sec = static_cast<long long>(end.tv_sec) - static_cast<long long>(start.tv_sec);
+    long long nsec = static_cast<long long>(end.tv_nsec) - static_cast<long long>(start.tv_nsec);
+    if (nsec < 0) {
+        --sec;
+        nsec += 1000000000LL;
+    }
+    if (sec < 0) {
+        return 0;
+    }
+    return (sec * 1000000LL) + (nsec / 1000LL);
+}
+
+auto format_duration_suffix(const timespec& start, const timespec& end) -> std::string {
+    long long const ELAPSED_US = elapsed_us_since(start, end);
+    return std::format(" <{}.{:06}>", ELAPSED_US / 1000000LL, ELAPSED_US % 1000000LL);
 }
 
 auto format_clock_timestamp(const timespec& ts, bool include_date, bool include_micros) -> std::string {
@@ -695,6 +720,8 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "lstat";
                 case ker::abi::vfs::ops::SYNC:
                     return "sync";
+                case ker::abi::vfs::ops::REALPATH:
+                    return "realpath";
             }
             break;
         case ker::abi::callnums::net:
@@ -816,6 +843,7 @@ auto should_decode_string(uint64_t callnum, uint64_t op, int arg_index) -> bool 
             case ker::abi::vfs::ops::READLINK:
             case ker::abi::vfs::ops::SYMLINK:
             case ker::abi::vfs::ops::STAT:
+            case ker::abi::vfs::ops::LSTAT:
             case ker::abi::vfs::ops::GETCWD:
             case ker::abi::vfs::ops::CHDIR:
             case ker::abi::vfs::ops::ACCESS:
@@ -827,6 +855,7 @@ auto should_decode_string(uint64_t callnum, uint64_t op, int arg_index) -> bool 
             case ker::abi::vfs::ops::LINK:
             case ker::abi::vfs::ops::PIVOT_ROOT:
             case ker::abi::vfs::ops::STATVFS:
+            case ker::abi::vfs::ops::REALPATH:
                 return arg_index == 0;
             case ker::abi::vfs::ops::FACCESSAT:
             case ker::abi::vfs::ops::UNLINKAT:
@@ -1110,6 +1139,7 @@ auto trace_loop(uint64_t pid, const TraceOptions& options, bool kill_on_setup_fa
                     .a5 = regs.r9,
                     .a6 = regs.r10,
                     .entered_at = current_realtime(options),
+                    .duration_started_at = current_monotonic(),
                 };
             }
         } else if (event.reason == ker::abi::ptrace::stop_reason::SYSCALL_EXIT) {
@@ -1117,8 +1147,10 @@ auto trace_loop(uint64_t pid, const TraceOptions& options, bool kill_on_setup_fa
                 auto const RESULT = static_cast<int64_t>(stop.regs.rax);
                 auto it = pending.find(event.tid);
                 if (it != pending.end() && it->second.valid) {
+                    timespec const EXITED_AT = current_monotonic();
                     emit_trace_line(options, output, pid, it->second.entered_at,
-                                    std::format("{} = {}", format_entry(pid, it->second), format_result(RESULT)));
+                                    std::format("{} = {}{}", format_entry(pid, it->second), format_result(RESULT),
+                                                format_duration_suffix(it->second.duration_started_at, EXITED_AT)));
                     if (options.follow_forks) {
                         uint64_t child_pid = 0;
                         if (fork_child_from_syscall_result(it->second, RESULT, child_pid)) {
