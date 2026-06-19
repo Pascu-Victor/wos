@@ -14,6 +14,7 @@
 #include <sys/callnums.h>
 #include <sys/process.h>
 #include <sys/wait.h>
+#include <time.h>  // NOLINT(modernize-deprecated-headers): POSIX clock_gettime/localtime declarations.
 #include <unistd.h>
 
 #include <abi/ptrace.hpp>
@@ -38,6 +39,18 @@ constexpr size_t MAX_STRING_LEN = 256;
 constexpr uint32_t STRACE_STARTUP_WAIT_RETRIES = 500;
 constexpr useconds_t STRACE_STARTUP_WAIT_POLL_US = 10 * 1000;
 
+enum class TimestampMode : uint8_t {
+    NONE,
+    TIME_SECONDS,
+    TIME_MICROS,
+    UNIX_MICROS,
+    DATE_MICROS,
+};
+
+struct TraceOptions {
+    TimestampMode timestamp = TimestampMode::NONE;
+};
+
 auto strace_path_arg() -> char* {
     static std::array<char, sizeof("/usr/bin/strace")> arg{"/usr/bin/strace"};
     return arg.data();
@@ -53,6 +66,53 @@ auto remote_command_flag_arg() -> char* {
     return arg.data();
 }
 
+auto timestamp_option_arg(TimestampMode mode) -> char* {
+    static std::array<char, sizeof("-t")> t_arg{"-t"};
+    static std::array<char, sizeof("-tt")> tt_arg{"-tt"};
+    static std::array<char, sizeof("-ttt")> ttt_arg{"-ttt"};
+    static std::array<char, sizeof("-tttt")> tttt_arg{"-tttt"};
+
+    switch (mode) {
+        case TimestampMode::NONE:
+            return nullptr;
+        case TimestampMode::TIME_SECONDS:
+            return t_arg.data();
+        case TimestampMode::TIME_MICROS:
+            return tt_arg.data();
+        case TimestampMode::UNIX_MICROS:
+            return ttt_arg.data();
+        case TimestampMode::DATE_MICROS:
+            return tttt_arg.data();
+    }
+    return nullptr;
+}
+
+auto parse_timestamp_option(std::string_view arg, TraceOptions& options) -> bool {
+    if (arg == "-t") {
+        options.timestamp = TimestampMode::TIME_SECONDS;
+        return true;
+    }
+    if (arg == "-tt") {
+        options.timestamp = TimestampMode::TIME_MICROS;
+        return true;
+    }
+    if (arg == "-ttt") {
+        options.timestamp = TimestampMode::UNIX_MICROS;
+        return true;
+    }
+    if (arg == "-tttt") {
+        options.timestamp = TimestampMode::DATE_MICROS;
+        return true;
+    }
+    return false;
+}
+
+void append_timestamp_option(std::vector<char*>& helper_argv, const TraceOptions& options) {
+    if (char* arg = timestamp_option_arg(options.timestamp); arg != nullptr) {
+        helper_argv.push_back(arg);
+    }
+}
+
 struct PendingSyscall {
     bool valid = false;
     uint64_t callnum = 0;
@@ -62,9 +122,10 @@ struct PendingSyscall {
     uint64_t a4 = 0;
     uint64_t a5 = 0;
     uint64_t a6 = 0;
+    timespec entered_at{};
 };
 
-void usage() { std::println(stderr, "usage: strace [-p pid] command [args...]"); }
+void usage() { std::println(stderr, "usage: strace [-t|-tt|-ttt|-tttt] [-p pid] command [args...]"); }
 
 auto command_basename(const char* path) -> std::string_view {
     if (path == nullptr) {
@@ -85,6 +146,59 @@ auto parse_pid_arg(const char* text, uint64_t& pid) -> bool {
     }
     pid = PARSED;
     return true;
+}
+
+auto timestamp_enabled(const TraceOptions& options) -> bool { return options.timestamp != TimestampMode::NONE; }
+
+auto current_realtime(const TraceOptions& options) -> timespec {
+    timespec now{};
+    if (timestamp_enabled(options)) {
+        (void)clock_gettime(CLOCK_REALTIME, &now);
+    }
+    return now;
+}
+
+auto format_clock_timestamp(const timespec& ts, bool include_date, bool include_micros) -> std::string {
+    auto const SECONDS = static_cast<time_t>(ts.tv_sec);
+    tm* local = localtime(&SECONDS);
+    if (local == nullptr) {
+        return include_micros ? std::format("{}.{:06}", static_cast<long long>(ts.tv_sec), ts.tv_nsec / 1000L)
+                              : std::format("{}", static_cast<long long>(ts.tv_sec));
+    }
+
+    if (include_date) {
+        if (include_micros) {
+            return std::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}", local->tm_year + 1900, local->tm_mon + 1, local->tm_mday,
+                               local->tm_hour, local->tm_min, local->tm_sec, ts.tv_nsec / 1000L);
+        }
+        return std::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", local->tm_year + 1900, local->tm_mon + 1, local->tm_mday, local->tm_hour,
+                           local->tm_min, local->tm_sec);
+    }
+
+    if (include_micros) {
+        return std::format("{:02}:{:02}:{:02}.{:06}", local->tm_hour, local->tm_min, local->tm_sec, ts.tv_nsec / 1000L);
+    }
+    return std::format("{:02}:{:02}:{:02}", local->tm_hour, local->tm_min, local->tm_sec);
+}
+
+auto format_timestamp_prefix(const TraceOptions& options, const timespec& timestamp) -> std::string {
+    switch (options.timestamp) {
+        case TimestampMode::NONE:
+            return {};
+        case TimestampMode::TIME_SECONDS:
+            return std::format("{} ", format_clock_timestamp(timestamp, false, false));
+        case TimestampMode::TIME_MICROS:
+            return std::format("{} ", format_clock_timestamp(timestamp, false, true));
+        case TimestampMode::UNIX_MICROS:
+            return std::format("{}.{:06} ", static_cast<long long>(timestamp.tv_sec), timestamp.tv_nsec / 1000L);
+        case TimestampMode::DATE_MICROS:
+            return std::format("{} ", format_clock_timestamp(timestamp, true, true));
+    }
+    return {};
+}
+
+void emit_trace_line(const TraceOptions& options, const timespec& timestamp, std::string_view line) {
+    std::println("{}{}", format_timestamp_prefix(options, timestamp), line);
 }
 
 auto ptrace_call(ker::abi::ptrace::request request, uint64_t pid, uint64_t addr, uint64_t data) -> int64_t {
@@ -519,6 +633,8 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "protect";
                 case ker::abi::vmem::ops::MREMAP:
                     return "mremap";
+                case ker::abi::vmem::ops::MSYNC:
+                    return "msync";
             }
             break;
         case ker::abi::callnums::debug:
@@ -639,9 +755,10 @@ auto target_is_proxy(uint64_t pid) -> bool {
 
 auto is_proxy_info(const ker::abi::ptrace::RemoteInfo& info) -> bool { return info.is_proxy != 0 && info.remote_pid != 0; }
 
-auto exec_strace_with_command(char** command_argv) -> int {
+auto exec_strace_with_command(char** command_argv, const TraceOptions& options) -> int {
     std::vector<char*> helper_argv;
     helper_argv.push_back(strace_path_arg());
+    append_timestamp_option(helper_argv, options);
     helper_argv.push_back(remote_command_flag_arg());
     for (char** arg = command_argv; arg != nullptr && *arg != nullptr; ++arg) {
         helper_argv.push_back(*arg);
@@ -653,7 +770,7 @@ auto exec_strace_with_command(char** command_argv) -> int {
     return 127;
 }
 
-auto exec_strace_remote_attach(const ker::abi::ptrace::RemoteInfo& info) -> int {
+auto exec_strace_remote_attach(const ker::abi::ptrace::RemoteInfo& info, const TraceOptions& options) -> int {
     if (!is_proxy_info(info)) {
         std::println(stderr, "strace: remote attach requested for a non-proxy target");
         return 1;
@@ -672,12 +789,12 @@ auto exec_strace_remote_attach(const ker::abi::ptrace::RemoteInfo& info) -> int 
     }
 
     std::string remote_pid = std::format("{}", info.remote_pid);
-    std::array<char*, 4> helper_argv = {
-        strace_path_arg(),
-        remote_attach_flag_arg(),
-        remote_pid.data(),
-        nullptr,
-    };
+    std::vector<char*> helper_argv;
+    helper_argv.push_back(strace_path_arg());
+    append_timestamp_option(helper_argv, options);
+    helper_argv.push_back(remote_attach_flag_arg());
+    helper_argv.push_back(remote_pid.data());
+    helper_argv.push_back(nullptr);
     execvp(strace_path_arg(), helper_argv.data());
     std::perror("strace: exec remote attach helper");
     return 127;
@@ -728,7 +845,7 @@ void reap_tracee_after_startup_failure(pid_t pid) {
 
 void detach_tracee_after_startup_failure(uint64_t pid) { (void)ptrace_call(ker::abi::ptrace::request::DETACH, pid, 0, 0); }
 
-auto trace_loop(uint64_t pid) -> int {
+auto trace_loop(uint64_t pid, const TraceOptions& options) -> int {
     std::unordered_map<uint64_t, PendingSyscall> pending;
     pending.reserve(8);
 
@@ -743,11 +860,11 @@ auto trace_loop(uint64_t pid) -> int {
 
         if ((stop.flags & ker::abi::ptrace::STOP_INFO_EXITED) != 0) {
             if (WIFEXITED(stop.wait_status)) {
-                std::println("+++ exited with {} +++", WEXITSTATUS(stop.wait_status));
+                emit_trace_line(options, current_realtime(options), std::format("+++ exited with {} +++", WEXITSTATUS(stop.wait_status)));
             } else if (WIFSIGNALED(stop.wait_status)) {
-                std::println("+++ killed by signal {} +++", WTERMSIG(stop.wait_status));
+                emit_trace_line(options, current_realtime(options), std::format("+++ killed by signal {} +++", WTERMSIG(stop.wait_status)));
             } else {
-                std::println("+++ exited with status {:#x} +++", stop.wait_status);
+                emit_trace_line(options, current_realtime(options), std::format("+++ exited with status {:#x} +++", stop.wait_status));
             }
             return 0;
         }
@@ -766,6 +883,7 @@ auto trace_loop(uint64_t pid) -> int {
                     .a4 = regs.r8,
                     .a5 = regs.r9,
                     .a6 = regs.r10,
+                    .entered_at = current_realtime(options),
                 };
             }
         } else if (event.reason == ker::abi::ptrace::stop_reason::SYSCALL_EXIT) {
@@ -773,14 +891,16 @@ auto trace_loop(uint64_t pid) -> int {
                 auto const RESULT = static_cast<int64_t>(stop.regs.rax);
                 auto it = pending.find(event.tid);
                 if (it != pending.end() && it->second.valid) {
-                    std::println("{} = {}", format_entry(pid, it->second), format_result(RESULT));
+                    emit_trace_line(options, it->second.entered_at,
+                                    std::format("{} = {}", format_entry(pid, it->second), format_result(RESULT)));
                     it->second.valid = false;
                 } else {
-                    std::println("{} = {}", callnum_name(event.message), format_result(RESULT));
+                    emit_trace_line(options, current_realtime(options),
+                                    std::format("{} = {}", callnum_name(event.message), format_result(RESULT)));
                 }
             }
         } else {
-            std::println("--- stopped by signal {} ---", event.signal);
+            emit_trace_line(options, current_realtime(options), std::format("--- stopped by signal {} ---", event.signal));
         }
     }
 }
@@ -805,11 +925,11 @@ auto launch_tracee(char** argv) -> int {
     return 127;
 }
 
-auto attach_and_trace(uint64_t pid, bool route_proxy) -> int {
+auto attach_and_trace(uint64_t pid, bool route_proxy, const TraceOptions& options) -> int {
     if (route_proxy) {
         ker::abi::ptrace::RemoteInfo info{};
         if (read_remote_info(pid, info) && is_proxy_info(info)) {
-            return exec_strace_remote_attach(info);
+            return exec_strace_remote_attach(info, options);
         }
     }
 
@@ -822,10 +942,10 @@ auto attach_and_trace(uint64_t pid, bool route_proxy) -> int {
         detach_tracee_after_startup_failure(pid);
         return 1;
     }
-    return trace_loop(pid);
+    return trace_loop(pid, options);
 }
 
-auto trace_command(char** argv) -> int {
+auto trace_command(char** argv, const TraceOptions& options) -> int {
     pid_t const CHILD = fork();
     if (CHILD < 0) {
         std::perror("strace: fork");
@@ -843,19 +963,19 @@ auto trace_command(char** argv) -> int {
         std::println(stderr, "strace: tracee became a WKI proxy before syscall tracing could start");
         return 1;
     }
-    return trace_loop(static_cast<uint64_t>(CHILD));
+    return trace_loop(static_cast<uint64_t>(CHILD), options);
 }
 
-auto route_remote_preferred(char** command_argv) -> int {
+auto route_remote_preferred(char** command_argv, const TraceOptions& options) -> int {
     int64_t const TARGET_RC = ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE);
     if (TARGET_RC < 0) {
         std::println(stderr, "strace: failed to set remote policy: {}", format_result(TARGET_RC));
         return 1;
     }
-    return exec_strace_with_command(command_argv);
+    return exec_strace_with_command(command_argv, options);
 }
 
-auto route_to_host(const char* hostname, char** command_argv) -> int {
+auto route_to_host(const char* hostname, char** command_argv, const TraceOptions& options) -> int {
     if (hostname == nullptr || hostname[0] == '\0') {
         usage();
         return 1;
@@ -865,17 +985,17 @@ auto route_to_host(const char* hostname, char** command_argv) -> int {
         std::println(stderr, "strace: failed to target '{}': {}", hostname, format_result(TARGET_RC));
         return 1;
     }
-    return exec_strace_with_command(command_argv);
+    return exec_strace_with_command(command_argv, options);
 }
 
-auto route_homeward(char** command_argv) -> int {
+auto route_homeward(char** command_argv, const TraceOptions& options) -> int {
     std::array<char, ker::abi::ptrace::RemoteInfo::TARGET_HOSTNAME_LEN> launcher = {};
     int64_t const LAUNCHER_LEN = ker::process::wki_launcher_node(launcher.data(), launcher.size());
     if (LAUNCHER_LEN <= 0 || launcher.front() == '\0') {
         std::println(stderr, "strace: failed to resolve launcher node");
         return 1;
     }
-    return route_to_host(launcher.data(), command_argv);
+    return route_to_host(launcher.data(), command_argv, options);
 }
 
 }  // namespace
@@ -886,69 +1006,87 @@ auto main(int argc, char** argv) -> int {
         return 1;
     }
 
-    if (std::string_view(argv[1]) == remote_attach_flag_arg()) {
-        if (argc != 3) {
+    TraceOptions options{};
+    int arg_index = 1;
+    for (; arg_index < argc; arg_index++) {
+        std::string_view const ARG = argv[arg_index];
+        if (ARG == "--") {
+            arg_index++;
+            break;
+        }
+        if (!parse_timestamp_option(ARG, options)) {
+            break;
+        }
+    }
+
+    if (arg_index >= argc) {
+        usage();
+        return 1;
+    }
+
+    if (std::string_view(argv[arg_index]) == remote_attach_flag_arg()) {
+        if (argc != arg_index + 2) {
             usage();
             return 1;
         }
         uint64_t pid = 0;
-        if (!parse_pid_arg(argv[2], pid)) {
-            std::println(stderr, "strace: invalid pid '{}'", argv[2]);
+        if (!parse_pid_arg(argv[arg_index + 1], pid)) {
+            std::println(stderr, "strace: invalid pid '{}'", argv[arg_index + 1]);
             return 1;
         }
-        return attach_and_trace(pid, false);
+        return attach_and_trace(pid, false, options);
     }
 
-    if (std::string_view(argv[1]) == remote_command_flag_arg()) {
-        if (argc < 3) {
+    if (std::string_view(argv[arg_index]) == remote_command_flag_arg()) {
+        if (argc < arg_index + 2) {
             usage();
             return 1;
         }
-        return trace_command(&argv[2]);
+        return trace_command(&argv[arg_index + 1], options);
     }
 
-    if (std::strcmp(argv[1], "-p") == 0) {
-        if (argc != 3) {
+    if (std::strcmp(argv[arg_index], "-p") == 0) {
+        if (argc != arg_index + 2) {
             usage();
             return 1;
         }
         uint64_t pid = 0;
-        if (!parse_pid_arg(argv[2], pid)) {
-            std::println(stderr, "strace: invalid pid '{}'", argv[2]);
+        if (!parse_pid_arg(argv[arg_index + 1], pid)) {
+            std::println(stderr, "strace: invalid pid '{}'", argv[arg_index + 1]);
             return 1;
         }
-        return attach_and_trace(pid, true);
+        return attach_and_trace(pid, true, options);
     }
 
-    std::string_view const WRAPPER = command_basename(argv[1]);
+    std::string_view const WRAPPER = command_basename(argv[arg_index]);
     if (WRAPPER == "locally") {
-        if (argc < 3) {
+        if (argc < arg_index + 2) {
             usage();
             return 1;
         }
-        return trace_command(&argv[2]);
+        return trace_command(&argv[arg_index + 1], options);
     }
     if (WRAPPER == "remotely") {
-        if (argc < 3) {
+        if (argc < arg_index + 2) {
             usage();
             return 1;
         }
-        return route_remote_preferred(&argv[2]);
+        return route_remote_preferred(&argv[arg_index + 1], options);
     }
     if (WRAPPER == "on") {
-        if (argc < 4) {
+        if (argc < arg_index + 3) {
             usage();
             return 1;
         }
-        return route_to_host(argv[2], &argv[3]);
+        return route_to_host(argv[arg_index + 1], &argv[arg_index + 2], options);
     }
     if (WRAPPER == "homeward") {
-        if (argc < 3) {
+        if (argc < arg_index + 2) {
             usage();
             return 1;
         }
-        return route_homeward(&argv[2]);
+        return route_homeward(&argv[arg_index + 1], options);
     }
 
-    return trace_command(&argv[1]);
+    return trace_command(&argv[arg_index], options);
 }
