@@ -55,6 +55,10 @@ auto stop_signal(const Task& task) -> uint32_t {
     return signal;
 }
 
+auto stop_wait_status(const Task& task) -> int32_t { return static_cast<int32_t>((stop_signal(task) << 8U) | STOP_STATUS_LOW); }
+
+auto target_exited(const Task& target) -> bool { return target.exit_notify_ready.load(std::memory_order_acquire) && target.has_exited; }
+
 auto process_id(const Task& task) -> uint64_t { return ker::mod::sched::task::process_pid(task); }
 
 auto can_trace(const Task& tracer, const Task& target) -> bool {
@@ -374,6 +378,126 @@ auto detach(Task& tracer, Task& target) -> uint64_t {
     }
     ker::mod::sched::reschedule_task_for_cpu(target.cpu, &target);
     return 0;
+}
+
+void resume_syscall_after_require(Task& target) {
+    bool const USE_STOP_SNAPSHOT = uses_stop_snapshot(target);
+    bool const WAS_STOPPED = target.ptrace_stopped;
+    target.ptrace_stopped = false;
+    target.ptrace_stop_pending = false;
+    target.ptrace_single_step = false;
+    target.ptrace_syscall_trace = true;
+    if (target.ptrace_stop_reason != abi::ptrace::stop_reason::SYSCALL_ENTER) {
+        target.ptrace_syscall_in_stop = false;
+    }
+    clear_task_trap_flags(target);
+    if (USE_STOP_SNAPSHOT) {
+        (void)publish_stop_snapshot_to_syscall_scratch(target);
+    }
+    target.ptrace_stop_uses_syscall_snapshot = false;
+    if (WAS_STOPPED) {
+        ker::mod::sched::reschedule_task_for_cpu(target.cpu, &target);
+    }
+}
+
+void fill_event(Task& target, abi::ptrace::Event& out) {
+    out.reason = target.ptrace_stop_reason;
+    out.signal = stop_signal(target);
+    out.reserved = 0;
+    out.tid = target.pid;
+    out.address = target.ptrace_stop_address;
+    out.message = target.ptrace_event_msg;
+}
+
+void fill_exit_stop_info(Task& target, abi::ptrace::StopInfo& out) {
+    std::memset(&out, 0, sizeof(out));
+    out.event.reason = abi::ptrace::stop_reason::EXIT;
+    out.event.tid = target.pid;
+    out.event.message = static_cast<uint64_t>(target.exit_status);
+    out.flags = abi::ptrace::STOP_INFO_EXITED;
+    out.wait_status = target.exit_status;
+}
+
+auto fill_stop_info(Task& target, uint64_t data) -> uint64_t {
+    auto* out = reinterpret_cast<abi::ptrace::StopInfo*>(data);
+    if (out == nullptr) {
+        return as_error(EFAULT);
+    }
+    if (target_exited(target)) {
+        fill_exit_stop_info(target, *out);
+        return 0;
+    }
+
+    std::memset(out, 0, sizeof(*out));
+    fill_event(target, out->event);
+    out->wait_status = stop_wait_status(target);
+    if (target.ptrace_stopped) {
+        fill_gprs(target, out->regs);
+        out->flags |= abi::ptrace::STOP_INFO_REGS_VALID;
+    }
+    return 0;
+}
+
+void clear_tracer_wait_state(Task& tracer) {
+    tracer.waitpid_publish_pending.store(false, std::memory_order_release);
+    ker::mod::sched::task::task_clear_waitpid_block_state(tracer);
+}
+
+void publish_tracer_wait(Task& tracer, Task& target) {
+    tracer.waitpid_publish_pending.store(false, std::memory_order_release);
+    tracer.waiting_for_pid = target.pid;
+    tracer.wait_status_user_addr = 0;
+    tracer.wait_status_phys_addr = 0;
+    tracer.wait_rusage_user_addr = 0;
+    tracer.wait_rusage_phys_addr = 0;
+    tracer.wait_resume_rip_user_addr = 0;
+    tracer.wait_resume_rip_phys_addr = 0;
+    tracer.wait_resume_rsp_user_addr = 0;
+    tracer.wait_resume_rsp_phys_addr = 0;
+    tracer.wait_channel = "ptrace_wait";
+}
+
+void consume_exit_for_tracer(Task& tracer, Task& target) {
+    if (!ker::mod::sched::task::task_waited_on(target) && ker::mod::sched::task::task_try_mark_waited_on(target)) {
+        ker::mod::sched::task::task_accumulate_waited_child_times(tracer, target);
+    }
+    clear_tracer_wait_state(tracer);
+}
+
+auto syscall_wait(Task& tracer, Task& target, uint64_t data) -> uint64_t {
+    if (reinterpret_cast<abi::ptrace::StopInfo*>(data) == nullptr) {
+        return as_error(EFAULT);
+    }
+
+    uint64_t ret = require_traced(tracer, target);
+    if (ret != 0) {
+        return ret;
+    }
+    if (target_exited(target)) {
+        consume_exit_for_tracer(tracer, target);
+        return fill_stop_info(target, data);
+    }
+
+    publish_tracer_wait(tracer, target);
+    resume_syscall_after_require(target);
+
+    for (;;) {
+        if (target_exited(target)) {
+            consume_exit_for_tracer(tracer, target);
+            return fill_stop_info(target, data);
+        }
+        if (target.ptrace_stopped) {
+            ret = fill_stop_info(target, data);
+            target.ptrace_stop_pending = false;
+            clear_tracer_wait_state(tracer);
+            return ret;
+        }
+        if (!target.ptrace_traced || target.ptrace_tracer_pid != tracer.pid) {
+            clear_tracer_wait_state(tracer);
+            return as_error(EPERM);
+        }
+        ker::mod::sched::preemptible_syscall_park("ptrace_wait");
+    }
 }
 
 auto read_regset(Task& target, uint64_t data) -> uint64_t {
@@ -776,23 +900,7 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
         case abi::ptrace::request::SYSCALL:
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
-                bool const USE_STOP_SNAPSHOT = uses_stop_snapshot(*target);
-                bool const WAS_STOPPED = target->ptrace_stopped;
-                target->ptrace_stopped = false;
-                target->ptrace_stop_pending = false;
-                target->ptrace_single_step = false;
-                target->ptrace_syscall_trace = true;
-                if (target->ptrace_stop_reason != abi::ptrace::stop_reason::SYSCALL_ENTER) {
-                    target->ptrace_syscall_in_stop = false;
-                }
-                clear_task_trap_flags(*target);
-                if (USE_STOP_SNAPSHOT) {
-                    (void)publish_stop_snapshot_to_syscall_scratch(*target);
-                }
-                target->ptrace_stop_uses_syscall_snapshot = false;
-                if (WAS_STOPPED) {
-                    ker::mod::sched::reschedule_task_for_cpu(target->cpu, target);
-                }
+                resume_syscall_after_require(*target);
             }
             break;
         case abi::ptrace::request::INTERRUPT:
@@ -880,11 +988,7 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
                 if (out == nullptr) {
                     ret = as_error(EFAULT);
                 } else {
-                    out->reason = target->ptrace_stop_reason;
-                    out->signal = stop_signal(*target);
-                    out->tid = target->pid;
-                    out->address = target->ptrace_stop_address;
-                    out->message = target->ptrace_event_msg;
+                    fill_event(*target, *out);
                 }
             }
             break;
@@ -908,6 +1012,9 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
             if (ret == 0) {
                 ret = set_hw_break(*target, data, false);
             }
+            break;
+        case abi::ptrace::request::SYSCALL_WAIT:
+            ret = syscall_wait(*tracer, *target, data);
             break;
         case abi::ptrace::request::GET_IMAGES:
             ret = require_traced(*tracer, *target);
@@ -1008,7 +1115,7 @@ auto report_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum, bool exit
     wake_tracer_for_stop(*task);
 
     while (task->ptrace_stopped) {
-        ker::mod::sched::kern_yield();
+        ker::mod::sched::preemptible_syscall_park("ptrace");
     }
     restore_syscall_stop_context(*task, gpr);
     return true;
@@ -1034,7 +1141,7 @@ auto report_fatal_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum) -> 
     wake_tracer_for_stop(*task);
 
     while (task->ptrace_stopped) {
-        ker::mod::sched::kern_yield();
+        ker::mod::sched::preemptible_syscall_park("ptrace");
     }
     restore_syscall_stop_context(*task, gpr);
     return true;

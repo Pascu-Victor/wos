@@ -32,6 +32,7 @@ enum class request : uint64_t {
     GET_REMOTE_INFO = 0x5705,
     SET_HW_BREAK = 0x5706,
     DEL_HW_BREAK = 0x5707,
+    SYSCALL_WAIT = 0x5708,
 };
 
 // NOLINTNEXTLINE(performance-enum-size)
@@ -134,6 +135,16 @@ struct Event {
     uint64_t message;
 };
 
+constexpr uint32_t STOP_INFO_REGS_VALID = 1U << 0;
+constexpr uint32_t STOP_INFO_EXITED = 1U << 1;
+
+struct StopInfo {
+    Event event;
+    X86_64GprState regs;
+    uint32_t flags;
+    int32_t wait_status;
+};
+
 struct RemoteInfo {
     constexpr static size_t TARGET_HOSTNAME_LEN = 64;
     uint32_t is_proxy;
@@ -154,6 +165,7 @@ struct HwBreak {
 };
 
 static_assert(sizeof(X86_64GprState) == 176);  // NOLINT
+static_assert(sizeof(StopInfo) == 224);        // NOLINT
 static_assert(sizeof(ImageRecord) == 296);     // NOLINT
 static_assert(sizeof(Event) == 40);            // NOLINT
 static_assert(sizeof(RemoteInfo) == 104);      // NOLINT

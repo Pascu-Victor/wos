@@ -54,6 +54,7 @@ auto remote_command_flag_arg() -> char* {
 }
 
 struct PendingSyscall {
+    bool valid = false;
     uint64_t callnum = 0;
     uint64_t a1 = 0;
     uint64_t a2 = 0;
@@ -90,27 +91,20 @@ auto ptrace_call(ker::abi::ptrace::request request, uint64_t pid, uint64_t addr,
     return ker::process::ptrace(static_cast<uint64_t>(request), pid, addr, data);
 }
 
-auto read_regs(uint64_t pid, ker::abi::ptrace::X86_64GprState& regs) -> bool {
-    ker::abi::ptrace::RegsetIo io{
-        .kind = ker::abi::ptrace::regset::X86_64_GPR,
-        .buffer = &regs,
-        .size = sizeof(regs),
-    };
-    return ptrace_call(ker::abi::ptrace::request::GETREGSET, pid, 0, reinterpret_cast<uint64_t>(&io)) >= 0;
-}
-
-auto read_mem(uint64_t pid, uint64_t addr, void* buffer, size_t size) -> bool {
+auto read_mem_partial(uint64_t pid, uint64_t addr, void* buffer, size_t size) -> size_t {
     ker::abi::ptrace::MemIo io{
         .address = addr,
         .buffer = buffer,
         .size = size,
         .transferred = 0,
     };
-    return ptrace_call(ker::abi::ptrace::request::READ_MEM, pid, 0, reinterpret_cast<uint64_t>(&io)) >= 0 && io.transferred == size;
+    (void)ptrace_call(ker::abi::ptrace::request::READ_MEM, pid, 0, reinterpret_cast<uint64_t>(&io));
+    return io.transferred <= size ? io.transferred : size;
 }
 
-auto read_event(uint64_t pid, ker::abi::ptrace::Event& event) -> bool {
-    return ptrace_call(ker::abi::ptrace::request::GETEVENTMSG, pid, 0, reinterpret_cast<uint64_t>(&event)) >= 0;
+auto syscall_wait(uint64_t pid, ker::abi::ptrace::StopInfo& info) -> bool {
+    std::memset(&info, 0, sizeof(info));
+    return ptrace_call(ker::abi::ptrace::request::SYSCALL_WAIT, pid, 0, reinterpret_cast<uint64_t>(&info)) >= 0;
 }
 
 auto read_remote_info(uint64_t pid, ker::abi::ptrace::RemoteInfo& info) -> bool {
@@ -123,18 +117,21 @@ auto read_c_string(uint64_t pid, uint64_t addr) -> std::string {
         return "NULL";
     }
 
-    std::string out;
-    out.reserve(MAX_STRING_LEN);
-    for (size_t i = 0; i < MAX_STRING_LEN; ++i) {
-        char ch = '\0';
-        if (!read_mem(pid, addr + i, &ch, sizeof(ch))) {
+    std::array<char, MAX_STRING_LEN> buffer{};
+    size_t used = 0;
+    while (used < buffer.size()) {
+        size_t const GOT = read_mem_partial(pid, addr + used, buffer.data() + used, buffer.size() - used);
+        if (GOT == 0) {
             break;
         }
-        if (ch == '\0') {
-            return out;
+
+        const auto* const NUL = static_cast<const char*>(std::memchr(buffer.data() + used, '\0', GOT));
+        if (NUL != nullptr) {
+            return {buffer.data(), static_cast<size_t>(NUL - buffer.data())};
         }
-        out.push_back(ch);
+        used += GOT;
     }
+    std::string out{buffer.data(), used};
     out += "...";
     return out;
 }
@@ -733,71 +730,57 @@ void detach_tracee_after_startup_failure(uint64_t pid) { (void)ptrace_call(ker::
 
 auto trace_loop(uint64_t pid) -> int {
     std::unordered_map<uint64_t, PendingSyscall> pending;
+    pending.reserve(8);
 
     (void)ptrace_call(ker::abi::ptrace::request::SETOPTIONS, pid, 0, TRACE_SYSGOOD_OPTION);
-    if (ptrace_call(ker::abi::ptrace::request::SYSCALL, pid, 0, 0) < 0) {
-        std::println(stderr, "strace: PTRACE_SYSCALL failed");
-        return 1;
-    }
 
     for (;;) {
-        int status = 0;
-        pid_t const WAITED = waitpid(static_cast<pid_t>(pid), &status, 0);
-        if (WAITED < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            std::perror("strace: waitpid");
+        ker::abi::ptrace::StopInfo stop{};
+        if (!syscall_wait(pid, stop)) {
+            std::println(stderr, "strace: PTRACE_SYSCALL_WAIT failed");
             return 1;
         }
-        if (WIFEXITED(status)) {
-            std::println("+++ exited with {} +++", WEXITSTATUS(status));
+
+        if ((stop.flags & ker::abi::ptrace::STOP_INFO_EXITED) != 0) {
+            if (WIFEXITED(stop.wait_status)) {
+                std::println("+++ exited with {} +++", WEXITSTATUS(stop.wait_status));
+            } else if (WIFSIGNALED(stop.wait_status)) {
+                std::println("+++ killed by signal {} +++", WTERMSIG(stop.wait_status));
+            } else {
+                std::println("+++ exited with status {:#x} +++", stop.wait_status);
+            }
             return 0;
-        }
-        if (WIFSIGNALED(status)) {
-            std::println("+++ killed by signal {} +++", WTERMSIG(status));
-            return 0;
-        }
-        if (!WIFSTOPPED(status)) {
-            continue;
         }
 
-        ker::abi::ptrace::Event event{};
-        (void)read_event(pid, event);
+        auto const& event = stop.event;
         if (event.reason == ker::abi::ptrace::stop_reason::SYSCALL_ENTER) {
-            if (!pending.contains(event.tid)) {
-                ker::abi::ptrace::X86_64GprState regs{};
-                if (read_regs(pid, regs)) {
-                    pending[event.tid] = PendingSyscall{
-                        .callnum = regs.rax,
-                        .a1 = regs.rdi,
-                        .a2 = regs.rsi,
-                        .a3 = regs.rdx,
-                        .a4 = regs.r8,
-                        .a5 = regs.r9,
-                        .a6 = regs.r10,
-                    };
-                }
+            auto it = pending.try_emplace(event.tid).first;
+            if (!it->second.valid && (stop.flags & ker::abi::ptrace::STOP_INFO_REGS_VALID) != 0) {
+                auto const& regs = stop.regs;
+                it->second = PendingSyscall{
+                    .valid = true,
+                    .callnum = regs.rax,
+                    .a1 = regs.rdi,
+                    .a2 = regs.rsi,
+                    .a3 = regs.rdx,
+                    .a4 = regs.r8,
+                    .a5 = regs.r9,
+                    .a6 = regs.r10,
+                };
             }
         } else if (event.reason == ker::abi::ptrace::stop_reason::SYSCALL_EXIT) {
-            ker::abi::ptrace::X86_64GprState regs{};
-            if (read_regs(pid, regs)) {
-                auto const RESULT = static_cast<int64_t>(regs.rax);
+            if ((stop.flags & ker::abi::ptrace::STOP_INFO_REGS_VALID) != 0) {
+                auto const RESULT = static_cast<int64_t>(stop.regs.rax);
                 auto it = pending.find(event.tid);
-                if (it != pending.end()) {
+                if (it != pending.end() && it->second.valid) {
                     std::println("{} = {}", format_entry(pid, it->second), format_result(RESULT));
-                    pending.erase(it);
+                    it->second.valid = false;
                 } else {
                     std::println("{} = {}", callnum_name(event.message), format_result(RESULT));
                 }
             }
         } else {
-            std::println("--- stopped by signal {} ---", WSTOPSIG(status));
-        }
-
-        if (ptrace_call(ker::abi::ptrace::request::SYSCALL, pid, 0, 0) < 0) {
-            std::println(stderr, "strace: resume failed");
-            return 1;
+            std::println("--- stopped by signal {} ---", event.signal);
         }
     }
 }
