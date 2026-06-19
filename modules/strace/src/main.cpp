@@ -21,6 +21,7 @@
 #include <array>
 #include <cerrno>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -49,6 +50,10 @@ enum class TimestampMode : uint8_t {
 
 struct TraceOptions {
     TimestampMode timestamp = TimestampMode::NONE;
+    bool follow_forks = false;
+    bool output_separately = false;
+    bool append_output = false;
+    std::string output_path;
 };
 
 auto strace_path_arg() -> char* {
@@ -63,6 +68,21 @@ auto remote_attach_flag_arg() -> char* {
 
 auto remote_command_flag_arg() -> char* {
     static std::array<char, sizeof("--wos-remote-command")> arg{"--wos-remote-command"};
+    return arg.data();
+}
+
+auto follow_forks_arg() -> char* {
+    static std::array<char, sizeof("-f")> arg{"-f"};
+    return arg.data();
+}
+
+auto output_separately_arg() -> char* {
+    static std::array<char, sizeof("--output-separately")> arg{"--output-separately"};
+    return arg.data();
+}
+
+auto output_arg() -> char* {
+    static std::array<char, sizeof("-o")> arg{"-o"};
     return arg.data();
 }
 
@@ -113,6 +133,19 @@ void append_timestamp_option(std::vector<char*>& helper_argv, const TraceOptions
     }
 }
 
+void append_trace_options(std::vector<char*>& helper_argv, const TraceOptions& options, char* output_path_arg) {
+    append_timestamp_option(helper_argv, options);
+    if (options.output_separately) {
+        helper_argv.push_back(output_separately_arg());
+    } else if (options.follow_forks) {
+        helper_argv.push_back(follow_forks_arg());
+    }
+    if (!options.output_path.empty()) {
+        helper_argv.push_back(output_arg());
+        helper_argv.push_back(output_path_arg);
+    }
+}
+
 struct PendingSyscall {
     bool valid = false;
     uint64_t callnum = 0;
@@ -125,7 +158,9 @@ struct PendingSyscall {
     timespec entered_at{};
 };
 
-void usage() { std::println(stderr, "usage: strace [-t|-tt|-ttt|-tttt] [-p pid] command [args...]"); }
+void usage() {
+    std::println(stderr, "usage: strace [-f|-ff|--output-separately] [-o file] [-t|-tt|-ttt|-tttt] [-p pid] command [args...]");
+}
 
 auto command_basename(const char* path) -> std::string_view {
     if (path == nullptr) {
@@ -146,6 +181,40 @@ auto parse_pid_arg(const char* text, uint64_t& pid) -> bool {
     }
     pid = PARSED;
     return true;
+}
+
+auto parse_trace_option(int argc, char** argv, int& arg_index, TraceOptions& options, bool& error) -> bool {
+    std::string_view const ARG = argv[arg_index];
+    if (parse_timestamp_option(ARG, options)) {
+        return true;
+    }
+    if (ARG == "-f") {
+        options.follow_forks = true;
+        return true;
+    }
+    if (ARG == "-ff" || ARG == "--output-separately") {
+        options.follow_forks = true;
+        options.output_separately = true;
+        return true;
+    }
+    if (ARG == "-o") {
+        if (arg_index + 1 >= argc) {
+            usage();
+            error = true;
+            return true;
+        }
+        options.output_path = argv[++arg_index];
+        return true;
+    }
+    if (ARG.starts_with("-o") && ARG.size() > 2) {
+        options.output_path = std::string(ARG.substr(2));
+        return true;
+    }
+    if (ARG.starts_with("--output=")) {
+        options.output_path = std::string(ARG.substr(sizeof("--output=") - 1));
+        return true;
+    }
+    return false;
 }
 
 auto timestamp_enabled(const TraceOptions& options) -> bool { return options.timestamp != TimestampMode::NONE; }
@@ -197,8 +266,65 @@ auto format_timestamp_prefix(const TraceOptions& options, const timespec& timest
     return {};
 }
 
-void emit_trace_line(const TraceOptions& options, const timespec& timestamp, std::string_view line) {
-    std::println("{}{}", format_timestamp_prefix(options, timestamp), line);
+struct TraceOutput {
+    FILE* stream = stdout;
+    bool close_stream = false;
+    bool valid = true;
+};
+
+auto output_file_path(const TraceOptions& options, uint64_t pid) -> std::string {
+    if (options.output_path.empty()) {
+        return {};
+    }
+    if (options.output_separately) {
+        return std::format("{}.{}", options.output_path, pid);
+    }
+    return options.output_path;
+}
+
+auto open_trace_output(uint64_t pid, const TraceOptions& options) -> TraceOutput {
+    std::string const PATH = output_file_path(options, pid);
+    if (PATH.empty()) {
+        return {};
+    }
+
+    if (!options.output_separately && !options.append_output) {
+        FILE* truncate = std::fopen(PATH.c_str(), "w");
+        if (truncate == nullptr) {
+            std::println(stderr, "strace: failed to open '{}': {}", PATH, std::strerror(errno));
+            return TraceOutput{.stream = nullptr, .close_stream = false, .valid = false};
+        }
+        std::fclose(truncate);
+    }
+
+    char const* mode = options.output_separately ? "w" : "a";
+    FILE* stream = std::fopen(PATH.c_str(), mode);
+    if (stream == nullptr) {
+        std::println(stderr, "strace: failed to open '{}': {}", PATH, std::strerror(errno));
+        return TraceOutput{.stream = nullptr, .close_stream = false, .valid = false};
+    }
+    setvbuf(stream, nullptr, _IOLBF, 0);
+    return TraceOutput{.stream = stream, .close_stream = true, .valid = true};
+}
+
+void close_trace_output(TraceOutput& output) {
+    if (output.close_stream && output.stream != nullptr) {
+        std::fclose(output.stream);
+    }
+    output.stream = stdout;
+    output.close_stream = false;
+}
+
+auto should_prefix_pid(const TraceOptions& options) -> bool {
+    return options.follow_forks && (options.output_path.empty() || !options.output_separately);
+}
+
+void emit_trace_line(const TraceOptions& options, TraceOutput& output, uint64_t pid, const timespec& timestamp, std::string_view line) {
+    std::string prefix = format_timestamp_prefix(options, timestamp);
+    if (should_prefix_pid(options)) {
+        prefix += std::format("[pid {}] ", pid);
+    }
+    std::println(output.stream, "{}{}", prefix, line);
 }
 
 auto ptrace_call(ker::abi::ptrace::request request, uint64_t pid, uint64_t addr, uint64_t data) -> int64_t {
@@ -756,9 +882,10 @@ auto target_is_proxy(uint64_t pid) -> bool {
 auto is_proxy_info(const ker::abi::ptrace::RemoteInfo& info) -> bool { return info.is_proxy != 0 && info.remote_pid != 0; }
 
 auto exec_strace_with_command(char** command_argv, const TraceOptions& options) -> int {
+    std::string output_path_arg = options.output_path;
     std::vector<char*> helper_argv;
     helper_argv.push_back(strace_path_arg());
-    append_timestamp_option(helper_argv, options);
+    append_trace_options(helper_argv, options, output_path_arg.empty() ? nullptr : output_path_arg.data());
     helper_argv.push_back(remote_command_flag_arg());
     for (char** arg = command_argv; arg != nullptr && *arg != nullptr; ++arg) {
         helper_argv.push_back(*arg);
@@ -789,9 +916,10 @@ auto exec_strace_remote_attach(const ker::abi::ptrace::RemoteInfo& info, const T
     }
 
     std::string remote_pid = std::format("{}", info.remote_pid);
+    std::string output_path_arg = options.output_path;
     std::vector<char*> helper_argv;
     helper_argv.push_back(strace_path_arg());
-    append_timestamp_option(helper_argv, options);
+    append_trace_options(helper_argv, options, output_path_arg.empty() ? nullptr : output_path_arg.data());
     helper_argv.push_back(remote_attach_flag_arg());
     helper_argv.push_back(remote_pid.data());
     helper_argv.push_back(nullptr);
@@ -845,7 +973,97 @@ void reap_tracee_after_startup_failure(pid_t pid) {
 
 void detach_tracee_after_startup_failure(uint64_t pid) { (void)ptrace_call(ker::abi::ptrace::request::DETACH, pid, 0, 0); }
 
-auto trace_loop(uint64_t pid, const TraceOptions& options) -> int {
+auto attach_and_trace(uint64_t pid, bool route_proxy, const TraceOptions& options) -> int;
+
+struct TraceState {
+    std::vector<pid_t> helper_pids;
+    int helper_status = 0;
+};
+
+auto helper_exit_code(int status) -> int {
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);
+    }
+    return 1;
+}
+
+void reap_follow_helpers(TraceState& state, bool block) {
+    for (size_t idx = 0; idx < state.helper_pids.size();) {
+        int status = 0;
+        pid_t const WAITED = waitpid(state.helper_pids.at(idx), &status, block ? 0 : WNOHANG);
+        if (WAITED == state.helper_pids.at(idx)) {
+            int const RC = helper_exit_code(status);
+            if (RC != 0 && state.helper_status == 0) {
+                state.helper_status = RC;
+            }
+            state.helper_pids.erase(state.helper_pids.begin() + static_cast<ptrdiff_t>(idx));
+            continue;
+        }
+        if (WAITED < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (state.helper_status == 0) {
+                state.helper_status = 1;
+            }
+            state.helper_pids.erase(state.helper_pids.begin() + static_cast<ptrdiff_t>(idx));
+            continue;
+        }
+        ++idx;
+    }
+}
+
+auto fork_child_from_syscall_result(const PendingSyscall& pending, int64_t result, uint64_t& child_pid) -> bool {
+    if (result <= 0 || static_cast<ker::abi::callnums>(pending.callnum) != ker::abi::callnums::process) {
+        return false;
+    }
+    if (static_cast<ker::abi::process::procmgmt_ops>(pending.a1) != ker::abi::process::procmgmt_ops::FORK) {
+        return false;
+    }
+    child_pid = static_cast<uint64_t>(result);
+    return true;
+}
+
+void spawn_follow_helper(TraceState& state, TraceOutput& output, uint64_t child_pid, const TraceOptions& options) {
+    if (child_pid == 0) {
+        return;
+    }
+    if (output.stream != nullptr) {
+        std::fflush(output.stream);
+    }
+
+    pid_t const HELPER = fork();
+    if (HELPER < 0) {
+        std::perror("strace: fork follow helper");
+        if (state.helper_status == 0) {
+            state.helper_status = 1;
+        }
+        return;
+    }
+    if (HELPER == 0) {
+        TraceOptions child_options = options;
+        child_options.append_output = !child_options.output_path.empty() && !child_options.output_separately;
+        int const RC = attach_and_trace(child_pid, false, child_options);
+        _exit(RC == 0 ? 0 : 1);
+    }
+    state.helper_pids.push_back(HELPER);
+}
+
+auto trace_loop(uint64_t pid, const TraceOptions& options, bool kill_on_setup_failure) -> int {
+    TraceOutput output = open_trace_output(pid, options);
+    if (!output.valid) {
+        if (kill_on_setup_failure) {
+            reap_tracee_after_startup_failure(static_cast<pid_t>(pid));
+        } else {
+            detach_tracee_after_startup_failure(pid);
+        }
+        return 1;
+    }
+
+    TraceState state{};
     std::unordered_map<uint64_t, PendingSyscall> pending;
     pending.reserve(8);
 
@@ -855,18 +1073,26 @@ auto trace_loop(uint64_t pid, const TraceOptions& options) -> int {
         ker::abi::ptrace::StopInfo stop{};
         if (!syscall_wait(pid, stop)) {
             std::println(stderr, "strace: PTRACE_SYSCALL_WAIT failed");
+            reap_follow_helpers(state, true);
+            close_trace_output(output);
             return 1;
         }
+        reap_follow_helpers(state, false);
 
         if ((stop.flags & ker::abi::ptrace::STOP_INFO_EXITED) != 0) {
             if (WIFEXITED(stop.wait_status)) {
-                emit_trace_line(options, current_realtime(options), std::format("+++ exited with {} +++", WEXITSTATUS(stop.wait_status)));
+                emit_trace_line(options, output, pid, current_realtime(options),
+                                std::format("+++ exited with {} +++", WEXITSTATUS(stop.wait_status)));
             } else if (WIFSIGNALED(stop.wait_status)) {
-                emit_trace_line(options, current_realtime(options), std::format("+++ killed by signal {} +++", WTERMSIG(stop.wait_status)));
+                emit_trace_line(options, output, pid, current_realtime(options),
+                                std::format("+++ killed by signal {} +++", WTERMSIG(stop.wait_status)));
             } else {
-                emit_trace_line(options, current_realtime(options), std::format("+++ exited with status {:#x} +++", stop.wait_status));
+                emit_trace_line(options, output, pid, current_realtime(options),
+                                std::format("+++ exited with status {:#x} +++", stop.wait_status));
             }
-            return 0;
+            reap_follow_helpers(state, true);
+            close_trace_output(output);
+            return state.helper_status;
         }
 
         auto const& event = stop.event;
@@ -891,16 +1117,22 @@ auto trace_loop(uint64_t pid, const TraceOptions& options) -> int {
                 auto const RESULT = static_cast<int64_t>(stop.regs.rax);
                 auto it = pending.find(event.tid);
                 if (it != pending.end() && it->second.valid) {
-                    emit_trace_line(options, it->second.entered_at,
+                    emit_trace_line(options, output, pid, it->second.entered_at,
                                     std::format("{} = {}", format_entry(pid, it->second), format_result(RESULT)));
+                    if (options.follow_forks) {
+                        uint64_t child_pid = 0;
+                        if (fork_child_from_syscall_result(it->second, RESULT, child_pid)) {
+                            spawn_follow_helper(state, output, child_pid, options);
+                        }
+                    }
                     it->second.valid = false;
                 } else {
-                    emit_trace_line(options, current_realtime(options),
+                    emit_trace_line(options, output, pid, current_realtime(options),
                                     std::format("{} = {}", callnum_name(event.message), format_result(RESULT)));
                 }
             }
         } else {
-            emit_trace_line(options, current_realtime(options), std::format("--- stopped by signal {} ---", event.signal));
+            emit_trace_line(options, output, pid, current_realtime(options), std::format("--- stopped by signal {} ---", event.signal));
         }
     }
 }
@@ -942,7 +1174,7 @@ auto attach_and_trace(uint64_t pid, bool route_proxy, const TraceOptions& option
         detach_tracee_after_startup_failure(pid);
         return 1;
     }
-    return trace_loop(pid, options);
+    return trace_loop(pid, options, false);
 }
 
 auto trace_command(char** argv, const TraceOptions& options) -> int {
@@ -963,7 +1195,7 @@ auto trace_command(char** argv, const TraceOptions& options) -> int {
         std::println(stderr, "strace: tracee became a WKI proxy before syscall tracing could start");
         return 1;
     }
-    return trace_loop(static_cast<uint64_t>(CHILD), options);
+    return trace_loop(static_cast<uint64_t>(CHILD), options, true);
 }
 
 auto route_remote_preferred(char** command_argv, const TraceOptions& options) -> int {
@@ -1008,14 +1240,18 @@ auto main(int argc, char** argv) -> int {
 
     TraceOptions options{};
     int arg_index = 1;
+    bool option_error = false;
     for (; arg_index < argc; arg_index++) {
         std::string_view const ARG = argv[arg_index];
         if (ARG == "--") {
             arg_index++;
             break;
         }
-        if (!parse_timestamp_option(ARG, options)) {
+        if (!parse_trace_option(argc, argv, arg_index, options, option_error)) {
             break;
+        }
+        if (option_error) {
+            return 1;
         }
     }
 
