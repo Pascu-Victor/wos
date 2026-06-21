@@ -54,18 +54,35 @@ set(WOS_BUSYBOX_INSTALL_DIR "${CMAKE_SOURCE_DIR}/toolchain/busybox-install" CACH
 set(WOS_DROPBEAR_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/dropbear-build" CACHE PATH "Dropbear build directory")
 set(WOS_MAKE_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/make-build" CACHE PATH "GNU make build directory")
 set(WOS_MAKE_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/make" CACHE PATH "GNU make source directory")
+set(WOS_ZLIB_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/zlib-build" CACHE PATH "zlib build directory")
+set(WOS_ZLIB_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/zlib" CACHE PATH "zlib source directory")
+set(WOS_OPENSSL_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/openssl-build" CACHE PATH "OpenSSL build directory")
+set(WOS_OPENSSL_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/openssl" CACHE PATH "OpenSSL source directory")
+set(WOS_CURL_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/curl-build" CACHE PATH "curl build directory")
+set(WOS_CURL_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/curl" CACHE PATH "curl source directory")
+set(WOS_GIT_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/git-build" CACHE PATH "Native WOS Git build directory")
+set(WOS_GIT_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/git" CACHE PATH "Git source directory")
 set(WOS_CLANG_FOR_WOS_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/clang-wos-build" CACHE PATH "Native WOS clang build directory")
 set(WOS_NINJA_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/ninja-build" CACHE PATH "Native WOS Ninja build directory")
+set(WOS_CMAKE_FOR_HOST_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/cmake-host-build" CACHE PATH "Host CMake build directory")
+set(WOS_CMAKE_FOR_HOST_INSTALL_DIR "${CMAKE_SOURCE_DIR}/toolchain/host" CACHE PATH "Host CMake install prefix")
 set(WOS_CMAKE_FOR_WOS_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/cmake-wos-build" CACHE PATH "Native WOS CMake build directory")
 set(WOS_PYTHON_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/python" CACHE PATH "CPython source directory")
 set(WOS_PYTHON_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/python-build" CACHE PATH "Native WOS Python build directory")
+set(WOS_NASM_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/nasm" CACHE PATH "NASM source directory")
+set(WOS_NASM_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/nasm-build" CACHE PATH "Native WOS NASM build directory")
 set(WOS_BOOT_DISK "${CMAKE_SOURCE_DIR}/disk.qcow2" CACHE FILEPATH "WOS boot disk image")
 set(WOS_ROOTFS_DISK "${CMAKE_SOURCE_DIR}/mountfs.qcow2" CACHE FILEPATH "WOS rootfs disk image")
 option(WOS_SKIP_LIBCXX_INSTALL "Skip the libc++ install target; useful when an isolated sysroot is pre-seeded" OFF)
 option(WOS_BUILD_CLANG_FOR_WOS "Build a native WOS clang/lld toolchain and stage it into the rootfs" ON)
 option(WOS_BUILD_NINJA_FOR_WOS "Build a native WOS Ninja and stage it into the rootfs" ON)
-option(WOS_BUILD_CMAKE_FOR_WOS "Build native WOS CMake tools and stage them into the rootfs" OFF)
-option(WOS_BUILD_PYTHON_FOR_WOS "Build native WOS Python and stage it into the rootfs" OFF)
+option(WOS_BUILD_CMAKE_FOR_HOST "Build host-side CMake from the WOS fork and install it into toolchain/host" ON)
+option(WOS_BUILD_CMAKE_FOR_WOS "Build native WOS CMake tools and stage them into the rootfs" ON)
+option(WOS_BUILD_PYTHON_FOR_WOS "Build native WOS Python and stage it into the rootfs" ON)
+option(WOS_BUILD_NASM_FOR_WOS "Build native WOS NASM and stage it into the rootfs" ON)
+option(WOS_BUILD_OPENSSL_FOR_WOS "Build static WOS OpenSSL libraries for curl and HTTPS-capable ports" ON)
+option(WOS_BUILD_CURL_FOR_WOS "Build native WOS curl and stage it into the rootfs" ON)
+option(WOS_BUILD_GIT_FOR_WOS "Build native WOS Git and stage it into the rootfs" ON)
 
 set(SYSROOT ${WOS_SYSROOT_PATH})
 set(MLIBC_BUILD_DIR ${WOS_MLIBC_BUILD_DIR})
@@ -206,6 +223,142 @@ add_custom_command(
 )
 add_custom_target(gnu_make DEPENDS ${GNU_MAKE_STAMP})
 
+# --- zlib_for_wos: static compression library for native Git ----------------
+file(GLOB_RECURSE ZLIB_FOR_WOS_SOURCES CONFIGURE_DEPENDS
+    ${WOS_ZLIB_SOURCE_DIR}/*
+)
+list(FILTER ZLIB_FOR_WOS_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
+set(ZLIB_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/zlib_for_wos.stamp)
+add_custom_command(
+    OUTPUT ${ZLIB_FOR_WOS_STAMP}
+    COMMAND ${CMAKE_COMMAND} -E env
+            WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+            WOS_ZLIB_BUILD_DIR=${WOS_ZLIB_BUILD_DIR}
+            WOS_ZLIB_SOURCE_DIR=${WOS_ZLIB_SOURCE_DIR}
+            ${WOS_BUILD_SCRIPTS_DIR}/build_zlib_for_wos.sh
+    COMMAND ${CMAKE_COMMAND} -E touch ${ZLIB_FOR_WOS_STAMP}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Building static zlib for WOS..."
+    DEPENDS
+        ${WOS_BUILD_SCRIPTS_DIR}/build_zlib_for_wos.sh
+        ${ZLIB_FOR_WOS_SOURCES}
+        ${MLIBC_STAMP}
+    USES_TERMINAL
+)
+add_custom_target(zlib_for_wos DEPENDS ${ZLIB_FOR_WOS_STAMP})
+
+# --- openssl_for_wos: static TLS libraries for curl ------------------------
+file(GLOB_RECURSE OPENSSL_FOR_WOS_SOURCES CONFIGURE_DEPENDS
+    ${WOS_OPENSSL_SOURCE_DIR}/*
+)
+list(FILTER OPENSSL_FOR_WOS_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
+set(OPENSSL_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/openssl_for_wos.stamp)
+add_custom_command(
+    OUTPUT ${OPENSSL_FOR_WOS_STAMP}
+    COMMAND ${CMAKE_COMMAND} -E env
+            WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+            WOS_OPENSSL_BUILD_DIR=${WOS_OPENSSL_BUILD_DIR}
+            WOS_OPENSSL_SOURCE_DIR=${WOS_OPENSSL_SOURCE_DIR}
+            ${WOS_BUILD_SCRIPTS_DIR}/build_openssl_for_wos.sh
+    COMMAND ${CMAKE_COMMAND} -E touch ${OPENSSL_FOR_WOS_STAMP}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Building static OpenSSL for WOS..."
+    DEPENDS
+        ${WOS_BUILD_SCRIPTS_DIR}/build_openssl_for_wos.sh
+        ${OPENSSL_FOR_WOS_SOURCES}
+        ${MLIBC_STAMP}
+    USES_TERMINAL
+)
+add_custom_target(openssl_for_wos DEPENDS ${OPENSSL_FOR_WOS_STAMP})
+
+# --- curl_for_wos: HTTPS client and static libcurl for Git -----------------
+file(GLOB_RECURSE CURL_FOR_WOS_SOURCES CONFIGURE_DEPENDS
+    ${WOS_CURL_SOURCE_DIR}/*
+)
+list(FILTER CURL_FOR_WOS_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
+set(CURL_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/curl_for_wos.stamp)
+set(WOS_CURL_FOR_WOS_ROOTFS_INPUTS)
+add_custom_command(
+    OUTPUT ${CURL_FOR_WOS_STAMP}
+    COMMAND ${CMAKE_COMMAND} -E env
+            WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+            WOS_CURL_BUILD_DIR=${WOS_CURL_BUILD_DIR}
+            WOS_CURL_SOURCE_DIR=${WOS_CURL_SOURCE_DIR}
+            ${WOS_BUILD_SCRIPTS_DIR}/build_curl_for_wos.sh
+    COMMAND ${CMAKE_COMMAND} -E touch ${CURL_FOR_WOS_STAMP}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Building native WOS curl..."
+    DEPENDS
+        ${WOS_BUILD_SCRIPTS_DIR}/build_curl_for_wos.sh
+        ${CURL_FOR_WOS_SOURCES}
+        ${ZLIB_FOR_WOS_STAMP}
+        ${OPENSSL_FOR_WOS_STAMP}
+        ${MLIBC_STAMP}
+    USES_TERMINAL
+)
+add_custom_target(curl_for_wos DEPENDS ${CURL_FOR_WOS_STAMP})
+add_dependencies(curl_for_wos zlib_for_wos openssl_for_wos)
+if(WOS_BUILD_CURL_FOR_WOS)
+    list(APPEND WOS_CURL_FOR_WOS_ROOTFS_INPUTS ${CURL_FOR_WOS_STAMP})
+endif()
+
+# --- git_for_wos: cross-compile Git to run inside WOS ----------------------
+file(GLOB_RECURSE GIT_FOR_WOS_SOURCES CONFIGURE_DEPENDS
+    ${WOS_GIT_SOURCE_DIR}/*
+)
+list(FILTER GIT_FOR_WOS_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
+set(GIT_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/git_for_wos.stamp)
+set(WOS_GIT_FOR_WOS_ROOTFS_INPUTS)
+if(WOS_BUILD_GIT_FOR_WOS)
+    add_custom_command(
+        OUTPUT ${GIT_FOR_WOS_STAMP}
+        COMMAND ${CMAKE_COMMAND} -E env
+                WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+                WOS_GIT_BUILD_DIR=${WOS_GIT_BUILD_DIR}
+                WOS_GIT_SOURCE_DIR=${WOS_GIT_SOURCE_DIR}
+                ${WOS_BUILD_SCRIPTS_DIR}/build_git_for_wos.sh
+        COMMAND ${CMAKE_COMMAND} -E touch ${GIT_FOR_WOS_STAMP}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Building native WOS Git..."
+        DEPENDS
+            ${WOS_BUILD_SCRIPTS_DIR}/build_git_for_wos.sh
+            ${GIT_FOR_WOS_SOURCES}
+            ${CURL_FOR_WOS_STAMP}
+            ${MLIBC_STAMP}
+        USES_TERMINAL
+    )
+    add_custom_target(git_for_wos DEPENDS ${GIT_FOR_WOS_STAMP})
+    add_dependencies(git_for_wos curl_for_wos)
+    list(APPEND WOS_GIT_FOR_WOS_ROOTFS_INPUTS ${GIT_FOR_WOS_STAMP})
+endif()
+
+# --- cmake_for_host: build WOS-aware CMake for the Linux host ---------------
+file(GLOB_RECURSE CMAKE_FOR_WOS_SOURCES CONFIGURE_DEPENDS
+    ${CMAKE_SOURCE_DIR}/toolchain/src/cmake/*
+)
+list(FILTER CMAKE_FOR_WOS_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
+set(CMAKE_FOR_HOST_STAMP ${CMAKE_BINARY_DIR}/stamps/cmake_for_host.stamp)
+set(WOS_CMAKE_FOR_HOST_DEPENDS)
+if(WOS_BUILD_CMAKE_FOR_HOST)
+    add_custom_command(
+        OUTPUT ${CMAKE_FOR_HOST_STAMP}
+        COMMAND ${CMAKE_COMMAND} -E env
+                WOS_CMAKE_FOR_HOST_BUILD_DIR=${WOS_CMAKE_FOR_HOST_BUILD_DIR}
+                WOS_CMAKE_FOR_HOST_INSTALL_DIR=${WOS_CMAKE_FOR_HOST_INSTALL_DIR}
+                ${WOS_BUILD_SCRIPTS_DIR}/build_cmake_for_host.sh
+        COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_FOR_HOST_STAMP}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Building host WOS-aware CMake tools..."
+        DEPENDS
+            ${WOS_BUILD_SCRIPTS_DIR}/build_cmake_for_host.sh
+            ${CMAKE_SOURCE_DIR}/toolchain/src/cmake/CMakeLists.txt
+            ${CMAKE_FOR_WOS_SOURCES}
+        USES_TERMINAL
+    )
+    add_custom_target(cmake_for_host DEPENDS ${CMAKE_FOR_HOST_STAMP})
+    list(APPEND WOS_CMAKE_FOR_HOST_DEPENDS ${CMAKE_FOR_HOST_STAMP})
+endif()
+
 # --- clang_for_wos: cross-compile clang/lld to run inside WOS ---------------
 file(GLOB_RECURSE CLANG_FOR_WOS_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_SOURCE_DIR}/toolchain/src/llvm-project/llvm/*
@@ -231,11 +384,15 @@ if(WOS_BUILD_CLANG_FOR_WOS)
             ${CMAKE_SOURCE_DIR}/toolchain/src/llvm-project/clang/CMakeLists.txt
             ${CMAKE_SOURCE_DIR}/toolchain/src/llvm-project/lld/CMakeLists.txt
             ${CLANG_FOR_WOS_SOURCES}
+            ${WOS_CMAKE_FOR_HOST_DEPENDS}
             ${MLIBC_STAMP}
             ${LIBCXX_STAMP}
         USES_TERMINAL
     )
     add_custom_target(clang_for_wos DEPENDS ${CLANG_FOR_WOS_STAMP})
+    if(WOS_BUILD_CMAKE_FOR_HOST)
+        add_dependencies(clang_for_wos cmake_for_host)
+    endif()
     list(APPEND WOS_CLANG_FOR_WOS_ROOTFS_INPUTS ${CLANG_FOR_WOS_STAMP})
 endif()
 
@@ -260,19 +417,19 @@ if(WOS_BUILD_NINJA_FOR_WOS)
             ${WOS_BUILD_SCRIPTS_DIR}/build_ninja_for_wos.sh
             ${CMAKE_SOURCE_DIR}/toolchain/src/ninja/CMakeLists.txt
             ${NINJA_FOR_WOS_SOURCES}
+            ${WOS_CMAKE_FOR_HOST_DEPENDS}
             ${MLIBC_STAMP}
             ${LIBCXX_STAMP}
         USES_TERMINAL
     )
     add_custom_target(ninja_for_wos DEPENDS ${NINJA_FOR_WOS_STAMP})
+    if(WOS_BUILD_CMAKE_FOR_HOST)
+        add_dependencies(ninja_for_wos cmake_for_host)
+    endif()
     list(APPEND WOS_NINJA_FOR_WOS_ROOTFS_INPUTS ${NINJA_FOR_WOS_STAMP})
 endif()
 
 # --- cmake_for_wos: cross-compile CMake to run inside WOS ------------------
-file(GLOB_RECURSE CMAKE_FOR_WOS_SOURCES CONFIGURE_DEPENDS
-    ${CMAKE_SOURCE_DIR}/toolchain/src/cmake/*
-)
-list(FILTER CMAKE_FOR_WOS_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
 set(CMAKE_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/cmake_for_wos.stamp)
 set(WOS_CMAKE_FOR_WOS_ROOTFS_INPUTS)
 if(WOS_BUILD_CMAKE_FOR_WOS)
@@ -289,11 +446,15 @@ if(WOS_BUILD_CMAKE_FOR_WOS)
             ${WOS_BUILD_SCRIPTS_DIR}/build_cmake_for_wos.sh
             ${CMAKE_SOURCE_DIR}/toolchain/src/cmake/CMakeLists.txt
             ${CMAKE_FOR_WOS_SOURCES}
+            ${WOS_CMAKE_FOR_HOST_DEPENDS}
             ${MLIBC_STAMP}
             ${LIBCXX_STAMP}
         USES_TERMINAL
     )
     add_custom_target(cmake_for_wos DEPENDS ${CMAKE_FOR_WOS_STAMP})
+    if(WOS_BUILD_CMAKE_FOR_HOST)
+        add_dependencies(cmake_for_wos cmake_for_host)
+    endif()
     list(APPEND WOS_CMAKE_FOR_WOS_ROOTFS_INPUTS ${CMAKE_FOR_WOS_STAMP})
 endif()
 
@@ -322,8 +483,37 @@ if(WOS_BUILD_PYTHON_FOR_WOS)
             ${LIBCXX_STAMP}
         USES_TERMINAL
     )
-    add_custom_target(python_for_wos DEPENDS ${PYTHON_FOR_WOS_STAMP})
+    add_custom_target(python_for_wos ALL DEPENDS ${PYTHON_FOR_WOS_STAMP})
     list(APPEND WOS_PYTHON_FOR_WOS_ROOTFS_INPUTS ${PYTHON_FOR_WOS_STAMP})
+endif()
+
+# --- nasm_for_wos: cross-compile NASM to run inside WOS --------------------
+file(GLOB_RECURSE NASM_FOR_WOS_SOURCES CONFIGURE_DEPENDS
+    ${WOS_NASM_SOURCE_DIR}/*
+)
+list(FILTER NASM_FOR_WOS_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
+list(FILTER NASM_FOR_WOS_SOURCES EXCLUDE REGEX "/(configure|config/config\\.h\\.in|autoconf/aclocal\\.m4|autoconf/clean\\.sh|autom4te\\.cache)(/|$)")
+set(NASM_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/nasm_for_wos.stamp)
+set(WOS_NASM_FOR_WOS_ROOTFS_INPUTS)
+if(WOS_BUILD_NASM_FOR_WOS)
+    add_custom_command(
+        OUTPUT ${NASM_FOR_WOS_STAMP}
+        COMMAND ${CMAKE_COMMAND} -E env
+                WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+                WOS_NASM_SOURCE_DIR=${WOS_NASM_SOURCE_DIR}
+                WOS_NASM_BUILD_DIR=${WOS_NASM_BUILD_DIR}
+                ${WOS_BUILD_SCRIPTS_DIR}/build_nasm_for_wos.sh
+        COMMAND ${CMAKE_COMMAND} -E touch ${NASM_FOR_WOS_STAMP}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Building native WOS NASM..."
+        DEPENDS
+            ${WOS_BUILD_SCRIPTS_DIR}/build_nasm_for_wos.sh
+            ${NASM_FOR_WOS_SOURCES}
+            ${MLIBC_STAMP}
+        USES_TERMINAL
+    )
+    add_custom_target(nasm_for_wos DEPENDS ${NASM_FOR_WOS_STAMP})
+    list(APPEND WOS_NASM_FOR_WOS_ROOTFS_INPUTS ${NASM_FOR_WOS_STAMP})
 endif()
 
 # --- mountfs_disk: create or delta-sync the XFS rootfs image ----------------
@@ -380,6 +570,9 @@ add_custom_command(
         ${WOS_NINJA_FOR_WOS_ROOTFS_INPUTS}
         ${WOS_CMAKE_FOR_WOS_ROOTFS_INPUTS}
         ${WOS_PYTHON_FOR_WOS_ROOTFS_INPUTS}
+        ${WOS_NASM_FOR_WOS_ROOTFS_INPUTS}
+        ${WOS_CURL_FOR_WOS_ROOTFS_INPUTS}
+        ${WOS_GIT_FOR_WOS_ROOTFS_INPUTS}
     USES_TERMINAL
 )
 add_custom_target(mountfs_disk DEPENDS ${WOS_ROOTFS_DISK} ${MOUNTFS_STAMP})
@@ -394,6 +587,15 @@ if(WOS_BUILD_CMAKE_FOR_WOS)
 endif()
 if(WOS_BUILD_PYTHON_FOR_WOS)
     add_dependencies(mountfs_disk python_for_wos)
+endif()
+if(WOS_BUILD_NASM_FOR_WOS)
+    add_dependencies(mountfs_disk nasm_for_wos)
+endif()
+if(WOS_BUILD_CURL_FOR_WOS)
+    add_dependencies(mountfs_disk curl_for_wos)
+endif()
+if(WOS_BUILD_GIT_FOR_WOS)
+    add_dependencies(mountfs_disk git_for_wos)
 endif()
 
 # --- boot_image: create the boot disk + initramfs --------------------------
@@ -431,7 +633,7 @@ add_custom_target(boot_image DEPENDS ${WOS_BOOT_DISK} ${INITRAMFS_OUTPUT} ${BOOT
 foreach(mod wos init testprog testd netd httpd perf top memacc journal wkictl powerctl renderbench sftpserver)
     add_dependencies(${mod} mlibc libcxx)
 endforeach()
-# busybox, dropbear, GNU make, Ninja, CMake, and Python are only needed for image creation, not compilation.
+# busybox, dropbear, GNU make, curl, Git, Ninja, CMake, Python, and NASM are only needed for image creation, not compilation.
 add_dependencies(boot_image busybox dropbear gnu_make)
 if(WOS_BUILD_NINJA_FOR_WOS)
     add_dependencies(boot_image ninja_for_wos)
@@ -441,6 +643,15 @@ if(WOS_BUILD_CMAKE_FOR_WOS)
 endif()
 if(WOS_BUILD_PYTHON_FOR_WOS)
     add_dependencies(boot_image python_for_wos)
+endif()
+if(WOS_BUILD_NASM_FOR_WOS)
+    add_dependencies(boot_image nasm_for_wos)
+endif()
+if(WOS_BUILD_CURL_FOR_WOS)
+    add_dependencies(boot_image curl_for_wos)
+endif()
+if(WOS_BUILD_GIT_FOR_WOS)
+    add_dependencies(boot_image git_for_wos)
 endif()
 
 # --- wos_full: top-level target that builds everything ---------------------
@@ -463,6 +674,21 @@ endif()
 if(WOS_BUILD_CMAKE_FOR_WOS)
     add_dependencies(wos_full cmake_for_wos)
 endif()
+if(WOS_BUILD_CMAKE_FOR_HOST)
+    add_dependencies(wos_full cmake_for_host)
+endif()
 if(WOS_BUILD_PYTHON_FOR_WOS)
     add_dependencies(wos_full python_for_wos)
+endif()
+if(WOS_BUILD_NASM_FOR_WOS)
+    add_dependencies(wos_full nasm_for_wos)
+endif()
+if(WOS_BUILD_OPENSSL_FOR_WOS)
+    add_dependencies(wos_full openssl_for_wos)
+endif()
+if(WOS_BUILD_CURL_FOR_WOS)
+    add_dependencies(wos_full curl_for_wos)
+endif()
+if(WOS_BUILD_GIT_FOR_WOS)
+    add_dependencies(wos_full git_for_wos)
 endif()

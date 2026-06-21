@@ -18,6 +18,9 @@ WOS_TOOLCHAIN_ROOT="$WOS_WORKSPACE_ROOT/toolchain"
 WOS_TARGET_ARCH="x86_64-pc-wos"
 WOS_HOST_TOOLS="$WOS_WORKSPACE_ROOT/tools/build/bin"
 WOS_BIN="$WOS_WORKSPACE_ROOT/bin"
+WOS_HOST_CMAKE="$WOS_TOOLCHAIN_ROOT/host/bin/cmake"
+WOS_HOST_CTEST="$WOS_TOOLCHAIN_ROOT/host/bin/ctest"
+WOS_HOST_CPACK="$WOS_TOOLCHAIN_ROOT/host/bin/cpack"
 
 # Remove a single path entry from a colon-separated PATH-like variable.
 wos_strip_path_entry() {
@@ -66,6 +69,19 @@ export WOS_WORKSPACE_ROOT
 export WOS_TOOLCHAIN_ROOT
 export WOS_TARGET_ARCH
 export WOS_BIN
+export WOS_HOST_CMAKE
+export WOS_HOST_CTEST
+export WOS_HOST_CPACK
+
+if [ -x "$WOS_HOST_CMAKE" ]; then
+    export WOS_CMAKE="$WOS_HOST_CMAKE"
+fi
+if [ -x "$WOS_HOST_CTEST" ]; then
+    export WOS_CTEST="$WOS_HOST_CTEST"
+fi
+if [ -x "$WOS_HOST_CPACK" ]; then
+    export WOS_CPACK="$WOS_HOST_CPACK"
+fi
 
 # Ninja status formatting
 export NINJA_STATUS="[%f/%t %e] "
@@ -107,6 +123,9 @@ if [ -t 1 ] && [ "${WOS_QUIET:-0}" != "1" ]; then
     echo "  CC:        $CC"
     echo "  CXX:       $CXX"
     echo "  Sysroot:   $WOS_SYSROOT"
+    if [ -n "${WOS_CMAKE:-}" ]; then
+        echo "  CMake:     $WOS_CMAKE"
+    fi
 fi
 
 # Function to reset environment
@@ -125,6 +144,12 @@ wos_env_reset() {
     unset WOS_TOOLCHAIN_ROOT
     unset WOS_TARGET_ARCH
     unset WOS_BIN
+    unset WOS_HOST_CMAKE
+    unset WOS_HOST_CTEST
+    unset WOS_HOST_CPACK
+    unset WOS_CMAKE
+    unset WOS_CTEST
+    unset WOS_CPACK
     unset WOS_SYSROOT
     unset WOS_CLANG_VERSION
     unset WOS_CLANG_LIB_DIR
@@ -147,6 +172,9 @@ wos_env_show() {
     echo "  WOS_BIN=$WOS_BIN"
     echo "  WOS_TARGET_ARCH=$WOS_TARGET_ARCH"
     echo "  WOS_SYSROOT=$WOS_SYSROOT"
+    echo "  WOS_CMAKE=${WOS_CMAKE:-}"
+    echo "  WOS_CTEST=${WOS_CTEST:-}"
+    echo "  WOS_CPACK=${WOS_CPACK:-}"
     echo "  CC=$CC"
     echo "  CXX=$CXX"
     echo "  LD=$LD"

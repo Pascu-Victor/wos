@@ -71,6 +71,7 @@ BUILD_TARGETS = [
     "busybox",
     "dropbear",
     "gnu_make",
+    "cmake_for_wos",
     "python_for_wos",
 ]
 
@@ -161,6 +162,7 @@ def configure_build(
         f"-DWOS_MAKE_BUILD_DIR={roots['make_build']}",
         f"-DWOS_CMAKE_FOR_WOS_BUILD_DIR={roots['cmake_build']}",
         f"-DWOS_PYTHON_BUILD_DIR={roots['python_build']}",
+        "-DWOS_BUILD_PYTHON_FOR_WOS=ON",
         "-DWOS_SKIP_LIBCXX_INSTALL=ON",
         *diagnostic_cmake_options(fast),
         *extra_cmake_options,

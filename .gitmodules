@@ -23,3 +23,11 @@
 [submodule "toolchain/src/ninja"]
 	path = toolchain/src/ninja
 	url = https://github.com/Pascu-Victor/ninja.git
+[submodule "toolchain/src/python"]
+	path = toolchain/src/python
+	url = https://github.com/Pascu-Victor/cpython.git
+	branch = wos-support
+[submodule "toolchain/src/nasm"]
+	path = toolchain/src/nasm
+	url = https://github.com/Pascu-Victor/nasm.git
+	branch = wos-support

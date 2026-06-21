@@ -7,6 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 source "$WORKSPACE_ROOT/tools/ccache_env.sh"
+export CCACHE_DIR="${CCACHE_DIR:-$WORKSPACE_ROOT/.cache/ccache}"
+mkdir -p "$CCACHE_DIR"
 wos_setup_ccache
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
 
@@ -57,8 +59,11 @@ patch_config_sub_for_wos() {
 }
 
 write_config_site() {
-    mkdir -p "$(dirname "$PYTHON_CONFIG_SITE")"
-    cat > "$PYTHON_CONFIG_SITE" <<'EOF'
+	local tmp_config_site
+
+	mkdir -p "$(dirname "$PYTHON_CONFIG_SITE")"
+	tmp_config_site="$(mktemp "$PYTHON_CONFIG_SITE.XXXXXX")"
+	cat > "$tmp_config_site" <<'EOF'
 ac_cv_file__dev_ptmx=no
 ac_cv_file__dev_ptc=no
 ac_cv_buggy_getaddrinfo=no
@@ -68,6 +73,42 @@ ac_cv_func_setgroups=no
 ac_cv_func_setpriority=no
 ac_cv_func_sched_rr_get_interval=no
 EOF
+
+	if [ ! -f "$PYTHON_CONFIG_SITE" ] || ! cmp -s "$tmp_config_site" "$PYTHON_CONFIG_SITE"; then
+		mv "$tmp_config_site" "$PYTHON_CONFIG_SITE"
+	else
+		rm -f "$tmp_config_site"
+	fi
+}
+
+python_target_config_is_wos() {
+	local makefile="$PYTHON_TARGET_BUILD/Makefile"
+
+	[ -f "$makefile" ] || return 1
+	grep -Eq '^HOST_GNU_TYPE[[:space:]]*=[[:space:]]*x86_64-pc-wos([[:space:]]|$)' "$makefile" || return 1
+	grep -Eq '^CC[[:space:]]*=.*clang' "$makefile" || return 1
+	grep -Eq '^CC[[:space:]]*=.*--target=x86_64-pc-wos' "$makefile" || return 1
+	! grep -Eq '^CC[[:space:]]*=[[:space:]]*gcc([[:space:]]|$)' "$makefile" || return 1
+	! grep -Eq '^LDSHARED[[:space:]]*=[[:space:]]*ld([[:space:]]|$)' "$makefile" || return 1
+}
+
+discard_stale_target_config() {
+	if [ ! -f "$PYTHON_TARGET_BUILD/Makefile" ]; then
+		return 0
+	fi
+
+	if python_target_config_is_wos; then
+		return 0
+	fi
+
+	echo "Discarding stale CPython target configure output; expected WOS clang, not host gcc/Linux."
+	rm -f \
+		"$PYTHON_TARGET_BUILD/Makefile" \
+		"$PYTHON_TARGET_BUILD/Makefile.pre" \
+		"$PYTHON_TARGET_BUILD/config.cache" \
+		"$PYTHON_TARGET_BUILD/config.log" \
+		"$PYTHON_TARGET_BUILD/config.status" \
+		"$PYTHON_TARGET_BUILD/pyconfig.h"
 }
 
 require_file "$HOST/bin/clang" "Run tools/host-toolchain.sh first."
@@ -108,34 +149,52 @@ require_file "$BUILD_PYTHON" "Build-host CPython did not produce $BUILD_PYTHON."
 
 write_config_site
 
+TARGET_CC="${WOS_CCACHE_PREFIX}$HOST/bin/clang --target=$TARGET_ARCH --sysroot=$TARGET_SYSROOT"
+TARGET_CXX="${WOS_CCACHE_PREFIX}$HOST/bin/clang++ --target=$TARGET_ARCH --sysroot=$TARGET_SYSROOT"
+TARGET_AR="$HOST/bin/llvm-ar"
+TARGET_RANLIB="$HOST/bin/llvm-ranlib"
+TARGET_STRIP="$HOST/bin/llvm-strip"
+TARGET_READELF="$HOST/bin/llvm-readelf"
+TARGET_PKG_CONFIG_LIBDIR="$TARGET_SYSROOT/lib/pkgconfig:$TARGET_SYSROOT/usr/lib/pkgconfig:$TARGET_SYSROOT/share/pkgconfig:$TARGET_SYSROOT/usr/share/pkgconfig"
 PYTHON_CFLAGS="--sysroot=$TARGET_SYSROOT -O2 -g -fno-sanitize=safe-stack -fno-stack-protector -fPIC -fPIE"
 PYTHON_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
 
-export CC="${WOS_CCACHE_PREFIX}$HOST/bin/clang --target=$TARGET_ARCH --sysroot=$TARGET_SYSROOT"
-export CXX="${WOS_CCACHE_PREFIX}$HOST/bin/clang++ --target=$TARGET_ARCH --sysroot=$TARGET_SYSROOT"
-export AR="$HOST/bin/llvm-ar"
-export RANLIB="$HOST/bin/llvm-ranlib"
-export STRIP="$HOST/bin/llvm-strip"
-export READELF="$HOST/bin/llvm-readelf"
-export CFLAGS="$PYTHON_CFLAGS"
-export CPPFLAGS="-I$TARGET_SYSROOT/include"
-export LDFLAGS="$PYTHON_LDFLAGS"
+discard_stale_target_config
 
-if [ ! -f "$PYTHON_TARGET_BUILD/Makefile" ] || [ "$PYTHON_SRC/configure" -nt "$PYTHON_TARGET_BUILD/Makefile" ] || [ "$PYTHON_CONFIG_SITE" -nt "$PYTHON_TARGET_BUILD/Makefile" ]; then
-    echo "Configuring CPython for WOS..."
-    (
-        cd "$PYTHON_TARGET_BUILD"
-        CONFIG_SITE="$PYTHON_CONFIG_SITE" \
-            "$PYTHON_SRC/configure" \
-                --build="$BUILD_TRIPLE" \
-                --host="$TARGET_ARCH" \
-                --prefix=/usr \
-                --exec-prefix=/usr \
-                --with-build-python="$BUILD_PYTHON" \
-                --without-ensurepip \
-                --disable-test-modules \
-                --disable-ipv6
-    )
+if [ ! -f "$PYTHON_TARGET_BUILD/Makefile" ] || [ "$PYTHON_SRC/configure" -nt "$PYTHON_TARGET_BUILD/Makefile" ] || [ "$PYTHON_CONFIG_SITE" -nt "$PYTHON_TARGET_BUILD/Makefile" ] || [ "$SCRIPT_DIR/build_python_for_wos.sh" -nt "$PYTHON_TARGET_BUILD/Makefile" ]; then
+	echo "Configuring CPython for WOS..."
+	(
+		cd "$PYTHON_TARGET_BUILD"
+		CC="$TARGET_CC" \
+            CXX="$TARGET_CXX" \
+            AR="$TARGET_AR" \
+            RANLIB="$TARGET_RANLIB" \
+            STRIP="$TARGET_STRIP" \
+            READELF="$TARGET_READELF" \
+            CFLAGS="$PYTHON_CFLAGS" \
+			CPPFLAGS="-I$TARGET_SYSROOT/include" \
+			LDFLAGS="$PYTHON_LDFLAGS" \
+			CONFIG_SITE="$PYTHON_CONFIG_SITE" \
+			PKG_CONFIG_LIBDIR="$TARGET_PKG_CONFIG_LIBDIR" \
+			PKG_CONFIG_SYSROOT_DIR="$TARGET_SYSROOT" \
+			PKG_CONFIG_PATH= \
+			"$PYTHON_SRC/configure" \
+				--build="$BUILD_TRIPLE" \
+				--host="$TARGET_ARCH" \
+				--prefix=/usr \
+				--exec-prefix=/usr \
+				--with-build-python="$BUILD_PYTHON" \
+				--without-ensurepip \
+				--without-remote-debug \
+				--disable-test-modules \
+				--disable-ipv6
+	)
+fi
+
+if ! python_target_config_is_wos; then
+    echo "ERROR: CPython target configure did not select WOS clang." >&2
+    echo "Inspect $PYTHON_TARGET_BUILD/config.log and $PYTHON_TARGET_BUILD/Makefile." >&2
+    exit 1
 fi
 
 if [ -f "$PYTHON_TARGET_BUILD/python" ]; then
@@ -149,8 +208,23 @@ if [ -f "$PYTHON_TARGET_BUILD/python" ]; then
     done
 fi
 
-make -C "$PYTHON_TARGET_BUILD" -j"$(nproc)" python
-make -C "$PYTHON_TARGET_BUILD" DESTDIR="$TARGET_SYSROOT" install
+make -C "$PYTHON_TARGET_BUILD" -j"$(nproc)" \
+    CC="$TARGET_CC" \
+    CXX="$TARGET_CXX" \
+    AR="$TARGET_AR" \
+    RANLIB="$TARGET_RANLIB" \
+    STRIP="$TARGET_STRIP" \
+    READELF="$TARGET_READELF" \
+    python
+make -C "$PYTHON_TARGET_BUILD" \
+    CC="$TARGET_CC" \
+    CXX="$TARGET_CXX" \
+    AR="$TARGET_AR" \
+    RANLIB="$TARGET_RANLIB" \
+    STRIP="$TARGET_STRIP" \
+    READELF="$TARGET_READELF" \
+    DESTDIR="$TARGET_SYSROOT" \
+    install
 
 if [ ! -e "$TARGET_SYSROOT/bin/python3" ]; then
     for candidate in "$TARGET_SYSROOT"/bin/python3.*; do

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build the WOS target toolchain: sysroot, compiler-rt, mlibc, libc++, busybox,
-# dropbear, GNU make, and Ninja.
+# dropbear, GNU make, Ninja, CMake, NASM, OpenSSL, curl, and Git.
 # Requires host-toolchain.sh to have been run first.
 #
 # Layout:
@@ -55,6 +55,10 @@ export CXX="$HOST/bin/clang++"
 export LD="$HOST/bin/ld.lld"
 export PATH=$HOST/bin:$OLD_PATH
 export LD_LIBRARY_PATH="$HOST/lib"
+
+if [ "${WOS_BUILD_CMAKE_FOR_HOST:-1}" != "0" ]; then
+    "$WORKSPACE_ROOT/scripts/build/build_cmake_for_host.sh"
+fi
 
 # 1. Create target directories and empty CRT files
 mkdir -p $SYSROOT/bin $SYSROOT/lib $SYSROOT/include/abi-bits
@@ -199,13 +203,19 @@ cmake -G Ninja \
  -DCMAKE_CROSSCOMPILING=True \
  -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi' \
  -DLIBCXX_CXX_ABI=libcxxabi \
+ -DLIBCXX_ENABLE_SHARED=OFF \
+ -DLIBCXX_ENABLE_STATIC=OFF \
+ -DLIBCXX_ENABLE_ABI_LINKER_SCRIPT=OFF \
+ -DLIBCXX_INSTALL_LIBRARY=OFF \
  -DLIBCXX_USE_COMPILER_RT=On \
  -DLIBCXX_HAS_PTHREAD_API=On \
  -DLIBCXX_HAS_PTHREAD_LIB=On \
  -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
  -DLIBCXX_INCLUDE_TESTS=OFF \
+ -DLIBCXX_INSTALL_MODULES=OFF \
  -DLIBCXXABI_ENABLE_STATIC=OFF \
  -DLIBCXXABI_ENABLE_SHARED=ON \
+ -DLIBCXXABI_INSTALL_LIBRARY=OFF \
  -DLIBCXX_INSTALL_HEADERS=ON \
  -DLIBCXXABI_INCLUDE_TESTS=OFF \
  -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
@@ -218,9 +228,7 @@ cmake -G Ninja \
  -DLIBCXX_ENABLE_LOCALIZATION=OFF \
  $B/src/llvm-project/runtimes
 
-ninja && ninja install
-
-cp -r $B/libcxx-bootstrap/include/* $SYSROOT/include/
+ninja install-cxx-headers install-cxxabi-headers
 
 # 4. Build mlibc
 
@@ -270,6 +278,7 @@ mkdir -p $B/libcxx-build
 cd $B/libcxx-build
 cmake -G Ninja \
  "${WOS_CCACHE_CMAKE_ARGS[@]}" \
+ -ULIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL \
  -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;libunwind' \
  -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
  -DLIBCXXABI_USE_COMPILER_RT=On \
@@ -467,9 +476,24 @@ WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_NINJA_BUILD_DIR="$B/ninja-build" \
     "$B/../scripts/build/build_ninja_for_wos.sh"
 
-# 10. Build CPython for WOS userspace
+# 10. Build CMake for WOS userspace
 cd "$B/src"
-PYTHON_GIT_BRANCH="${WOS_PYTHON_GIT_BRANCH:-main}"
+if [ ! -f cmake/CMakeLists.txt ]; then
+    if [ -d "$WORKSPACE_ROOT/.git" ]; then
+        git -C "$WORKSPACE_ROOT" submodule update --init toolchain/src/cmake || true
+    fi
+fi
+if [ ! -f cmake/CMakeLists.txt ]; then
+    git clone --branch=wos-support https://github.com/Pascu-Victor/CMake.git cmake
+fi
+
+WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_CMAKE_FOR_WOS_BUILD_DIR="$B/cmake-wos-build" \
+    "$B/../scripts/build/build_cmake_for_wos.sh"
+
+# 11. Build CPython for WOS userspace
+cd "$B/src"
+PYTHON_GIT_BRANCH="${WOS_PYTHON_GIT_BRANCH:-wos-support}"
 if [ ! -f python/configure ]; then
     if [ -d "$WORKSPACE_ROOT/.git" ]; then
         git -C "$WORKSPACE_ROOT" submodule update --init --depth=1 toolchain/src/python || true
@@ -483,3 +507,42 @@ WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_PYTHON_SOURCE_DIR="$B/src/python" \
     WOS_PYTHON_BUILD_DIR="$B/python-build" \
     "$B/../scripts/build/build_python_for_wos.sh"
+
+# 12. Build NASM for WOS userspace
+cd "$B/src"
+NASM_GIT_BRANCH="${WOS_NASM_GIT_BRANCH:-wos-support}"
+if [ ! -f nasm/configure.ac ]; then
+    if [ -d "$WORKSPACE_ROOT/.git" ]; then
+        git -C "$WORKSPACE_ROOT" submodule update --init --depth=1 toolchain/src/nasm || true
+    fi
+fi
+if [ ! -f nasm/configure.ac ]; then
+    git clone --depth=1 --branch "$NASM_GIT_BRANCH" https://github.com/Pascu-Victor/nasm.git nasm
+fi
+
+WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_NASM_SOURCE_DIR="$B/src/nasm" \
+    WOS_NASM_BUILD_DIR="$B/nasm-build" \
+    "$B/../scripts/build/build_nasm_for_wos.sh"
+
+# 13. Build zlib, OpenSSL, and curl for WOS userspace
+WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_ZLIB_SOURCE_DIR="$B/src/zlib" \
+    WOS_ZLIB_BUILD_DIR="$B/zlib-build" \
+    "$B/../scripts/build/build_zlib_for_wos.sh"
+
+WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_OPENSSL_SOURCE_DIR="$B/src/openssl" \
+    WOS_OPENSSL_BUILD_DIR="$B/openssl-build" \
+    "$B/../scripts/build/build_openssl_for_wos.sh"
+
+WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_CURL_SOURCE_DIR="$B/src/curl" \
+    WOS_CURL_BUILD_DIR="$B/curl-build" \
+    "$B/../scripts/build/build_curl_for_wos.sh"
+
+# 14. Build Git for WOS userspace
+WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_GIT_SOURCE_DIR="$B/src/git" \
+    WOS_GIT_BUILD_DIR="$B/git-build" \
+    "$B/../scripts/build/build_git_for_wos.sh"

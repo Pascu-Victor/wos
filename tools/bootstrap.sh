@@ -15,8 +15,12 @@ echo "=== Phase 1: Host toolchain (clang/lld) ==="
 "$SCRIPT_DIR/host-toolchain.sh"
 
 echo ""
-echo "=== Phase 2: WOS target toolchain ==="
-"$SCRIPT_DIR/wos-toolchain.sh"
+echo "=== Phase 2: Host CMake with WOS platform support ==="
+"$WORKSPACE_ROOT/scripts/build/build_cmake_for_host.sh"
+
+echo ""
+echo "=== Phase 3: WOS target toolchain ==="
+WOS_BUILD_CMAKE_FOR_HOST=0 "$SCRIPT_DIR/wos-toolchain.sh"
 
 echo ""
 echo "=== Bootstrap complete ==="

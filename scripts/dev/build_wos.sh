@@ -3,9 +3,19 @@
 # checks decide when regeneration is actually needed.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
 BUILD_DIR="${WOS_BUILD_DIR:-build}"
 GENERATOR="${WOS_CMAKE_GENERATOR:-Ninja}"
 TARGET="${WOS_BUILD_TARGET:-wos_full}"
+CMAKE_BIN="${WOS_CMAKE:-}"
+if [ -z "$CMAKE_BIN" ] && [ -x "$WORKSPACE_ROOT/toolchain/host/bin/cmake" ]; then
+    CMAKE_BIN="$WORKSPACE_ROOT/toolchain/host/bin/cmake"
+fi
+if [ -z "$CMAKE_BIN" ]; then
+    CMAKE_BIN="cmake"
+fi
 EXTRA_CMAKE_ARGS=()
 if [[ -n "${WOS_CMAKE_ARGS:-}" ]]; then
     # shellcheck disable=SC2206
@@ -20,7 +30,7 @@ elif [ "$GENERATOR" = "Ninja" ] && [ ! -f "$BUILD_DIR/build.ninja" ]; then
 fi
 
 if [ "$needs_configure" -eq 1 ] || [ "${#EXTRA_CMAKE_ARGS[@]}" -gt 0 ]; then
-    cmake -B "$BUILD_DIR" -G"$GENERATOR" "${EXTRA_CMAKE_ARGS[@]}" .
+    "$CMAKE_BIN" -B "$BUILD_DIR" -G"$GENERATOR" "${EXTRA_CMAKE_ARGS[@]}" .
 fi
 
-cmake --build "$BUILD_DIR" --target "$TARGET"
+"$CMAKE_BIN" --build "$BUILD_DIR" --target "$TARGET"
