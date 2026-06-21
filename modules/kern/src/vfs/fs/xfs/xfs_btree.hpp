@@ -183,8 +183,11 @@ struct XfsInobtTraits {
     using Rec = XfsInobtRec;
     struct IRec {
         xfs_agino_t startino;
+        uint16_t holemask;
+        uint8_t count;
         uint32_t freecount;
         uint64_t free_mask;  // 64-bit free inode bitmask
+        bool sparse_format;
     };
 
     static constexpr XfsBtreeType TYPE = XfsBtreeType::SHORT;
@@ -208,16 +211,29 @@ struct XfsInobtTraits {
     static void init_key_from_rec(Key* key, const Rec* rec) { key->ir_startino = rec->ir_startino; }
 
     static auto decode_rec(const Rec* rec) -> IRec {
+        uint16_t const HOLEMASK = rec->ir_u.sp.ir_holemask.to_cpu();
+        uint8_t const COUNT = rec->ir_u.sp.ir_count;
+        bool const SPARSE_FORMAT = HOLEMASK != 0 || COUNT != 0;
+        uint32_t const FREECOUNT = SPARSE_FORMAT ? rec->ir_u.sp.ir_freecount : rec->ir_u.f.ir_freecount.to_cpu();
         return {
             .startino = rec->ir_startino.to_cpu(),
-            .freecount = rec->ir_u.f.ir_freecount.to_cpu(),
+            .holemask = SPARSE_FORMAT ? HOLEMASK : static_cast<uint16_t>(0),
+            .count = SPARSE_FORMAT ? COUNT : static_cast<uint8_t>(64),
+            .freecount = FREECOUNT,
             .free_mask = rec->ir_free.to_cpu(),
+            .sparse_format = SPARSE_FORMAT,
         };
     }
 
     static void encode_rec(Rec* rec, const IRec& irec) {
         rec->ir_startino = Be32::from_cpu(irec.startino);
-        rec->ir_u.f.ir_freecount = Be32::from_cpu(irec.freecount);
+        if (irec.sparse_format) {
+            rec->ir_u.sp.ir_holemask = Be16::from_cpu(irec.holemask);
+            rec->ir_u.sp.ir_count = irec.count;
+            rec->ir_u.sp.ir_freecount = static_cast<uint8_t>(irec.freecount);
+        } else {
+            rec->ir_u.f.ir_freecount = Be32::from_cpu(irec.freecount);
+        }
         rec->ir_free = Be64::from_cpu(irec.free_mask);
     }
 };

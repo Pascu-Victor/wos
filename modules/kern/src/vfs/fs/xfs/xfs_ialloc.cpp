@@ -18,6 +18,7 @@
 #include <util/crc32c.hpp>
 #include <utility>
 #include <vfs/buffer_cache.hpp>
+#include <vfs/fs/xfs/xfs_alloc.hpp>
 #include <vfs/fs/xfs/xfs_btree.hpp>
 
 #include "net/endian.hpp"
@@ -30,6 +31,168 @@ namespace ker::vfs::xfs {
 namespace {
 
 constexpr uint32_t XFS_INODES_PER_CHUNK = 64;
+constexpr uint16_t XFS_INOBT_HOLEMASK_FULL = 0;
+constexpr uint64_t XFS_INOBT_ALL_FREE = ~uint64_t{0};
+constexpr uint32_t XFS_DINODE_NULL_UNLINKED = 0xFFFFFFFFU;
+
+auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) -> xfs_ino_t;
+
+auto xfs_has_sparse_inodes(const XfsMountContext* mount) -> bool {
+    return mount != nullptr && (mount->feat_incompat & XFS_SB_FEAT_INCOMPAT_SPINODES) != 0;
+}
+
+auto inode_chunk_blocks(const XfsMountContext* mount) -> xfs_extlen_t {
+    if (mount == nullptr || mount->inodes_per_block == 0) {
+        return 0;
+    }
+    uint32_t const BLOCKS = (XFS_INODES_PER_CHUNK + mount->inodes_per_block - 1) / mount->inodes_per_block;
+    return BLOCKS == 0 ? 1 : BLOCKS;
+}
+
+void log_agi_state(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agino_t newino, bool update_newino) {
+    XfsPerAG const* pag = &mount->per_ag[agno];
+    uint64_t const AG_START_BLOCK = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
+    BufHead* agi_bh = xfs_buf_read(mount, AG_START_BLOCK);
+    if (agi_bh == nullptr) {
+        return;
+    }
+
+    auto agi_offset = static_cast<size_t>(mount->sect_size * 2);
+    auto* agi = reinterpret_cast<XfsAgi*>(agi_bh->data + agi_offset);
+    agi->agi_count = Be32::from_cpu(pag->agi_count);
+    agi->agi_root = Be32::from_cpu(pag->agi_root);
+    agi->agi_level = Be32::from_cpu(pag->agi_level);
+    agi->agi_freecount = Be32::from_cpu(pag->agi_freecount);
+    if (update_newino) {
+        agi->agi_newino = Be32::from_cpu(newino);
+    }
+    agi->agi_free_root = Be32::from_cpu(pag->agi_free_root);
+    agi->agi_free_level = Be32::from_cpu(pag->agi_free_level);
+    agi->agi_crc = Be32{0};
+    uint32_t crc = util::crc32c_block_with_cksum(agi, mount->sect_size, XFS_AGI_CRC_OFF);
+    __builtin_memcpy(&agi->agi_crc, &crc, sizeof(crc));
+    xfs_trans_log_buf(tp, agi_bh, static_cast<uint32_t>(agi_offset), static_cast<uint32_t>(sizeof(XfsAgi)));
+    brelse(agi_bh);
+}
+
+void init_free_dinode(XfsMountContext* mount, XfsDinode* dip, xfs_ino_t ino) {
+    __builtin_memset(dip, 0, mount->inode_size);
+    dip->di_magic = Be16::from_cpu(XFS_DINODE_MAGIC);
+    dip->di_version = 3;
+    dip->di_format = static_cast<uint8_t>(XFS_DINODE_FMT_EXTENTS);
+    dip->di_next_unlinked = Be32::from_cpu(XFS_DINODE_NULL_UNLINKED);
+    dip->di_ino = Be64::from_cpu(ino);
+    __builtin_memcpy(&dip->di_uuid, &mount->uuid, sizeof(XfsUuidT));
+
+    dip->di_crc = 0;
+    uint32_t const CRC = util::crc32c_block_with_cksum(dip, mount->inode_size, XFS_DINODE_CRC_OFF);
+    dip->di_crc = CRC;
+}
+
+auto init_inode_chunk(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agino_t startino) -> int {
+    uint32_t initialized = 0;
+    while (initialized < XFS_INODES_PER_CHUNK) {
+        xfs_agino_t const AGINO = startino + initialized;
+        xfs_agblock_t const AGBNO = AGINO / mount->inodes_per_block;
+        xfs_fsblock_t const FSBNO = xfs_agbno_to_fsbno(agno, AGBNO, mount->ag_blk_log);
+
+        BufHead* bh = xfs_buf_read(mount, FSBNO);
+        if (bh == nullptr) {
+            return -EIO;
+        }
+
+        while (initialized < XFS_INODES_PER_CHUNK && ((startino + initialized) / mount->inodes_per_block) == AGBNO) {
+            xfs_agino_t const CUR_AGINO = startino + initialized;
+            size_t const OFFSET = static_cast<size_t>(CUR_AGINO % mount->inodes_per_block) * mount->inode_size;
+            if (OFFSET + mount->inode_size > bh->size) {
+                brelse(bh);
+                return -EIO;
+            }
+
+            auto* dip = reinterpret_cast<XfsDinode*>(bh->data + OFFSET);
+            xfs_ino_t const INO = (static_cast<xfs_ino_t>(agno) << mount->agino_log) | CUR_AGINO;
+            init_free_dinode(mount, dip, INO);
+            initialized++;
+        }
+
+        xfs_trans_log_buf_full(tp, bh);
+        brelse(bh);
+    }
+
+    return 0;
+}
+
+auto allocate_inode_chunk(XfsMountContext* mount, XfsTransaction* tp) -> xfs_ino_t {
+    xfs_extlen_t const CHUNK_BLOCKS = inode_chunk_blocks(mount);
+    if (CHUNK_BLOCKS == 0) {
+        return NULLFSINO;
+    }
+
+    XfsAllocReq req{};
+    req.agno = NULLAGNUMBER;
+    req.minlen = CHUNK_BLOCKS;
+    req.maxlen = CHUNK_BLOCKS;
+    req.alignment = CHUNK_BLOCKS;
+
+    XfsAllocResult result{};
+    int rc = xfs_alloc_extent(mount, tp, req, &result);
+    if (rc != 0 || result.len != CHUNK_BLOCKS || result.agno >= mount->ag_count) {
+        return NULLFSINO;
+    }
+
+    xfs_agino_t const STARTINO = result.agbno * mount->inodes_per_block;
+    if ((STARTINO & (XFS_INODES_PER_CHUNK - 1)) != 0) {
+        mod::dbg::logger<"xfs">::error("xfs_ialloc: allocated unaligned inode chunk ag=%u agbno=%u startino=%u", result.agno, result.agbno,
+                                       STARTINO);
+        return NULLFSINO;
+    }
+
+    rc = init_inode_chunk(mount, tp, result.agno, STARTINO);
+    if (rc != 0) {
+        return NULLFSINO;
+    }
+
+    XfsPerAG* pag = &mount->per_ag[result.agno];
+    XfsInobtTraits::IRec rec{};
+    rec.startino = STARTINO;
+    rec.holemask = XFS_INOBT_HOLEMASK_FULL;
+    rec.count = XFS_INODES_PER_CHUNK;
+    rec.freecount = XFS_INODES_PER_CHUNK;
+    rec.free_mask = XFS_INOBT_ALL_FREE;
+    rec.sparse_format = xfs_has_sparse_inodes(mount);
+
+    XfsBtreeCursor<XfsInobtTraits> ino_cur;
+    ino_cur.mount = mount;
+    ino_cur.agno = result.agno;
+    uint64_t new_ino_root = pag->agi_root;
+    auto new_ino_level = static_cast<uint8_t>(pag->agi_level);
+    rc = xfs_btree_insert(&ino_cur, tp, rec, pag->agi_root, pag->agi_level, &new_ino_root, &new_ino_level);
+    if (rc != 0) {
+        return NULLFSINO;
+    }
+    pag->agi_root = static_cast<xfs_agblock_t>(new_ino_root);
+    pag->agi_level = new_ino_level;
+
+    if (xfs_has_finobt(mount) && pag->agi_free_root != 0) {
+        XfsBtreeCursor<XfsFinobtTraits> fi_cur;
+        fi_cur.mount = mount;
+        fi_cur.agno = result.agno;
+        uint64_t new_fi_root = pag->agi_free_root;
+        auto new_fi_level = static_cast<uint8_t>(pag->agi_free_level);
+        rc = xfs_btree_insert(&fi_cur, tp, rec, pag->agi_free_root, pag->agi_free_level, &new_fi_root, &new_fi_level);
+        if (rc != 0) {
+            return NULLFSINO;
+        }
+        pag->agi_free_root = static_cast<xfs_agblock_t>(new_fi_root);
+        pag->agi_free_level = new_fi_level;
+    }
+
+    pag->agi_count += XFS_INODES_PER_CHUNK;
+    pag->agi_freecount += XFS_INODES_PER_CHUNK;
+    log_agi_state(mount, tp, result.agno, STARTINO, true);
+
+    return ialloc_ag(mount, tp, result.agno);
+}
 
 // Find the first set bit (least significant) in a 64-bit value
 auto ffs64(uint64_t val) -> int {
@@ -144,21 +307,7 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
 
                 // 5. Update AGI counters
                 pag->agi_freecount--;
-
-                uint64_t const AG_START_BLOCK = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
-                BufHead* agi_bh = xfs_buf_read(mount, AG_START_BLOCK);
-                if (agi_bh != nullptr) {
-                    auto agi_offset = static_cast<size_t>(mount->sect_size * 2);
-                    auto* agi = reinterpret_cast<XfsAgi*>(agi_bh->data + agi_offset);
-                    agi->agi_freecount = Be32::from_cpu(pag->agi_freecount);
-                    agi->agi_newino = Be32::from_cpu(AGINO);
-                    // Recompute CRC
-                    agi->agi_crc = Be32{0};
-                    uint32_t crc = util::crc32c_block_with_cksum(agi, mount->sect_size, XFS_AGI_CRC_OFF);
-                    __builtin_memcpy(&agi->agi_crc, &crc, sizeof(crc));
-                    xfs_trans_log_buf(tp, agi_bh, static_cast<uint32_t>(agi_offset), static_cast<uint32_t>(sizeof(XfsAgi)));
-                    brelse(agi_bh);
-                }
+                log_agi_state(mount, tp, agno, AGINO, true);
 
                 // 6. On-disk inode initialization happens via xfs_inode_write() at commit
 #ifdef XFS_DEBUG
@@ -190,6 +339,11 @@ auto xfs_ialloc(XfsMountContext* mount, XfsTransaction* tp, [[maybe_unused]] uin
         if (INO != NULLFSINO) {
             return INO;
         }
+    }
+
+    xfs_ino_t const GROWN_INO = allocate_inode_chunk(mount, tp);
+    if (GROWN_INO != NULLFSINO) {
+        return GROWN_INO;
     }
 
     mod::dbg::logger<"xfs">::error("xfs_ialloc: no free inodes available in any AG");
@@ -311,20 +465,7 @@ auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int
 
     // 6. Update AGI counters
     pag->agi_freecount++;
-
-    uint64_t const AG_START_BLOCK = xfs_agbno_to_fsbno(AGNO, 0, mount->ag_blk_log);
-    BufHead* agi_bh = xfs_buf_read(mount, AG_START_BLOCK);
-    if (agi_bh != nullptr) {
-        auto agi_offset = static_cast<size_t>(mount->sect_size * 2);
-        auto* agi = reinterpret_cast<XfsAgi*>(agi_bh->data + agi_offset);
-        agi->agi_freecount = Be32::from_cpu(pag->agi_freecount);
-        // Recompute CRC
-        agi->agi_crc = Be32{0};
-        uint32_t crc = util::crc32c_block_with_cksum(agi, mount->sect_size, XFS_AGI_CRC_OFF);
-        __builtin_memcpy(&agi->agi_crc, &crc, sizeof(crc));
-        xfs_trans_log_buf(tp, agi_bh, static_cast<uint32_t>(agi_offset), static_cast<uint32_t>(sizeof(XfsAgi)));
-        brelse(agi_bh);
-    }
+    log_agi_state(mount, tp, AGNO, 0, false);
 #ifdef XFS_DEBUG
     mod::dbg::logger<"xfs">::debug("xfs_ifree: freed inode %lu", static_cast<unsigned long>(ino));
 #endif
