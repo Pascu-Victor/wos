@@ -266,8 +266,14 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
 
 auto tcp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssize_t {
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
-    if (cb == nullptr || (cb->state != TcpState::ESTABLISHED && cb->state != TcpState::CLOSE_WAIT)) {
-        return -1;
+    if (cb == nullptr) {
+        return -ENOTCONN;
+    }
+    if (cb->state == TcpState::SYN_SENT) {
+        return -EINPROGRESS;
+    }
+    if (cb->state != TcpState::ESTABLISHED && cb->state != TcpState::CLOSE_WAIT) {
+        return -ENOTCONN;
     }
 
     // Update owner_pid so wake_socket() wakes the correct task after fork.
@@ -289,8 +295,9 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssiz
         cb->lock.lock();
 
         if (cb->state != TcpState::ESTABLISHED && cb->state != TcpState::CLOSE_WAIT) {
+            auto const RESULT = cb->state == TcpState::SYN_SENT ? -EINPROGRESS : -ENOTCONN;
             cb->lock.unlock();
-            return (sent > 0) ? static_cast<ssize_t>(sent) : -1;
+            return (sent > 0) ? static_cast<ssize_t>(sent) : RESULT;
         }
 
         // Send in MSS-sized chunks
@@ -612,6 +619,23 @@ int tcp_setsockopt_op(Socket* sock, int /*unused*/, int optname, const void* opt
 }
 
 int tcp_getsockopt_op(Socket* sock, int /*unused*/, int optname, void* optval, size_t* optlen) {
+    if (optname == 4 && optval != nullptr && optlen != nullptr && *optlen >= sizeof(int)) {  // SO_ERROR
+        int value = 0;
+        auto* cb = static_cast<TcpCB*>(sock->proto_data);
+        if (cb != nullptr) {
+            uint64_t const FLAGS = cb->lock.lock_irqsave();
+            if (cb->state == TcpState::SYN_SENT) {
+                value = EINPROGRESS;
+            } else if (cb->state == TcpState::CLOSED && sock->state == SocketState::CONNECTING) {
+                value = ECONNREFUSED;
+            }
+            cb->lock.unlock_irqrestore(FLAGS);
+        }
+        std::memcpy(optval, &value, sizeof(value));
+        *optlen = sizeof(int);
+        return 0;
+    }
+
     if (optname == 8 && optval != nullptr && optlen != nullptr && *optlen >= sizeof(int)) {  // SO_RCVBUF
         int value = static_cast<int>(sock->rcvbuf.capacity);
         std::memcpy(optval, &value, sizeof(value));
@@ -642,7 +666,7 @@ int tcp_poll_check_op(Socket* sock, int events) {
             uint64_t const FLAGS = cb->lock.lock_irqsave();
             bool const CAN_SEND = cb->state == TcpState::ESTABLISHED || cb->state == TcpState::CLOSE_WAIT;
             bool const HAS_SEND_CREDIT = CAN_SEND && tcp_send_available_bytes(cb) > 0;
-            bool const REPORT_ERROR_READY = !CAN_SEND;
+            bool const REPORT_ERROR_READY = cb->state == TcpState::CLOSED;
             cb->lock.unlock_irqrestore(FLAGS);
             if (HAS_SEND_CREDIT || REPORT_ERROR_READY) {
                 ready |= 4;

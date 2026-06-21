@@ -461,6 +461,9 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     parse_syn_options(cb, hdr, true);
 
                     cb->state = TcpState::ESTABLISHED;
+                    if (cb->socket != nullptr) {
+                        cb->socket->state = SocketState::CONNECTED;
+                    }
                     tcp_send_ack(cb);
 
                     wake_socket(cb->socket);
