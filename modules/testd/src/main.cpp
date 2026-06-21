@@ -1279,6 +1279,7 @@ TESTD_RUN_END(test_vfs_rename_cross_mount_exdev)
 TESTD_RUN(test_vfs_lstat_symlink) {
     const char* target = "/tmp/testd_lstat_target";
     const char* link = "/tmp/testd_lstat_link";
+    const char* link_slash = "/tmp/testd_lstat_link/";
 
     unlink(link);
     rmdir(target);
@@ -1303,6 +1304,22 @@ TESTD_RUN(test_vfs_lstat_symlink) {
         unlink(link);
         rmdir(target);
         fail("vfs_lstat_stat_follow", "stat did not follow symlink");
+        return;
+    }
+    if (lstat(link_slash, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        unlink(link);
+        rmdir(target);
+        fail("vfs_lstat_trailing_slash", "lstat with trailing slash did not follow directory symlink");
+        return;
+    }
+    std::array<char, 128> link_buf{};
+    errno = 0;
+    if (readlink(link_slash, link_buf.data(), link_buf.size()) >= 0 || errno != EINVAL) {
+        int const SAVED_ERRNO = errno;
+        unlink(link);
+        rmdir(target);
+        errno = SAVED_ERRNO;
+        fail("vfs_readlink_trailing_slash", "readlink with trailing slash returned symlink target");
         return;
     }
     if (rmdir(target) != 0) {

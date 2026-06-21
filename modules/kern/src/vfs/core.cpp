@@ -4752,6 +4752,25 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
         return -ENOENT;
     }
 
+    if (path_requires_directory(path)) {
+        std::array<char, MAX_PATH_LEN> resolved{};
+        int const RESOLVE_RET = resolve_symlinks(abs_path.data(), resolved.data(), resolved.size(), true, true);
+        if (RESOLVE_RET < 0) {
+            return RESOLVE_RET;
+        }
+
+        Stat st{};
+        int const STAT_RET = vfs_stat_resolved(resolved.data(), &st);
+        if (STAT_RET < 0) {
+            return STAT_RET;
+        }
+        if ((st.st_mode & S_IFMT) != S_IFDIR) {
+            return -ENOTDIR;
+        }
+
+        return readlink_resolved(resolved.data(), buf, bufsize);
+    }
+
     return readlink_resolved(abs_path.data(), buf, bufsize);
 }
 
@@ -4878,6 +4897,7 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     }
 
     bool const REQUIRE_DIRECTORY = resolve_task_path && path_requires_directory(path);
+    bool const EFFECTIVE_FOLLOW_FINAL_SYMLINK = follow_final_symlink || REQUIRE_DIRECTORY;
     bool is_wki_entry = false;
     if (resolve_task_path) {
         // WOSLINK detection: compute canonical pre-rewrite path to detect /wki
@@ -4931,7 +4951,7 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
 
     if (!REMOTE_MOUNT) {
         char resolved[MAX_PATH_LEN];  // NOLINT
-        int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy, follow_final_symlink);
+        int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy, EFFECTIVE_FOLLOW_FINAL_SYMLINK);
         if (RESOLVE_RET == -ELOOP) {
             return -ELOOP;
         }
@@ -4978,7 +4998,7 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     const char* fs_path = strip_mount_prefix(mount, pathBuffer);
     if (!is_wki_entry) {
         int const CACHED_RESULT =
-            metadata_cache_lookup(pathBuffer, mount->fs_type, mount->dev_id, follow_final_symlink, REQUIRE_DIRECTORY, statbuf);
+            metadata_cache_lookup(pathBuffer, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, statbuf);
         if (CACHED_RESULT != -EAGAIN) {
             log_loader_path_event(CACHED_RESULT == 0 ? "stat-cache-hit" : "stat-cache-negative-hit", path, pathBuffer, mount,
                                   CACHED_RESULT);
@@ -5108,7 +5128,7 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     }
 
     if (!is_wki_entry && !synthetic_stat) {
-        metadata_cache_store(pathBuffer, mount->fs_type, mount->dev_id, follow_final_symlink, REQUIRE_DIRECTORY, result, statbuf);
+        metadata_cache_store(pathBuffer, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, result, statbuf);
     }
 
     log_loader_path_event(result == 0 ? "stat-ok" : "stat-failed", path, pathBuffer, mount, result);

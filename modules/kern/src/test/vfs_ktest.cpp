@@ -1,5 +1,6 @@
 #include <bits/ssize_t.h>
 
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -380,6 +381,29 @@ KTEST(VFS, LstatDoesNotFollowFinalTmpfsSymlink) {
     KEXPECT_NE(ker::vfs::vfs_stat(LINK, &st), 0);
 
     KEXPECT_EQ(ker::vfs::vfs_unlink(LINK), 0);
+}
+
+KTEST(VFS, LstatTrailingSlashFollowsTmpfsSymlinkToDirectory) {
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* TARGET = "/tmp/ktest_lstat_slash_target";
+    constexpr const char* LINK = "/tmp/ktest_lstat_slash_link";
+    constexpr const char* LINK_WITH_SLASH = "/tmp/ktest_lstat_slash_link/";
+
+    ker::vfs::vfs_unlink(LINK);
+    ker::vfs::vfs_rmdir(TARGET);
+    KEXPECT_EQ(ker::vfs::vfs_mkdir(TARGET, 0755), 0);
+    KEXPECT_EQ(ker::vfs::vfs_symlink(TARGET, LINK), 0);
+
+    ker::vfs::Stat st{};
+    KEXPECT_EQ(ker::vfs::vfs_lstat(LINK_WITH_SLASH, &st), 0);
+    KEXPECT_TRUE((st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFDIR);
+
+    std::array<char, 128> linkbuf{};
+    KEXPECT_EQ(ker::vfs::vfs_readlink(LINK_WITH_SLASH, linkbuf.data(), linkbuf.size()), -EINVAL);
+
+    KEXPECT_EQ(ker::vfs::vfs_unlink(LINK), 0);
+    KEXPECT_EQ(ker::vfs::vfs_rmdir(TARGET), 0);
 }
 
 KTEST(VFS, RealpathFastPathFollowsSimpleSymlink) {
