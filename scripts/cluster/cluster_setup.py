@@ -1052,6 +1052,8 @@ LIVE_SYNC_PROTECTED_ACCESS_PATHS = {
     "/usr/lib/ld.so",
     "/usr/lib/libc.so",
 }
+SYNC_KIND_FILE = "file"
+SYNC_KIND_SYMLINK = "symlink"
 
 
 @dataclass(frozen=True)
@@ -1059,13 +1061,20 @@ class SyncItem:
     remote_path: str
     local_path: Path
     source_path: Path
+    kind: str
     size: int
     mode: int
-    digest: str
+    digest: str = ""
+    link_target: str = ""
 
     def signature(self) -> dict:
+        if self.kind == SYNC_KIND_SYMLINK:
+            return {
+                "kind": SYNC_KIND_SYMLINK,
+                "target": self.link_target,
+            }
         return {
-            "kind": "file",
+            "kind": SYNC_KIND_FILE,
             "sha256": self.digest,
             "size": self.size,
             "mode": self.mode,
@@ -1338,18 +1347,34 @@ def make_sync_item(remote_path: str, local_path: Path, source_path: Path) -> Syn
         st = local_path.lstat()
     except FileNotFoundError:
         return None
-    # Rootfs symlinks are part of image creation; the in-tree SFTP server does
-    # not implement SSH_FXP_SYMLINK, so live sync handles regular files only.
-    if not stat.S_ISREG(st.st_mode):
-        return None
-    return SyncItem(
-        remote_path=remote_path,
-        local_path=local_path,
-        source_path=source_path,
-        size=st.st_size,
-        mode=stat.S_IMODE(st.st_mode),
-        digest=file_sha256(local_path),
-    )
+
+    if stat.S_ISREG(st.st_mode):
+        return SyncItem(
+            remote_path=remote_path,
+            local_path=local_path,
+            source_path=source_path,
+            kind=SYNC_KIND_FILE,
+            size=st.st_size,
+            mode=stat.S_IMODE(st.st_mode),
+            digest=file_sha256(local_path),
+        )
+
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            link_target = os.readlink(local_path)
+        except OSError:
+            return None
+        return SyncItem(
+            remote_path=remote_path,
+            local_path=local_path,
+            source_path=source_path,
+            kind=SYNC_KIND_SYMLINK,
+            size=0,
+            mode=0,
+            link_target=link_target,
+        )
+
+    return None
 
 
 def add_item(items: dict[str, SyncItem], item: SyncItem | None):
@@ -1368,6 +1393,15 @@ def collect_live_sync_items(repo: Path, staging: Path) -> list[SyncItem]:
         dirs.sort()
         files.sort()
         root_path = Path(root)
+        for name in list(dirs):
+            local_path = root_path / name
+            if not local_path.is_symlink():
+                continue
+            rel = local_path.relative_to(staging).as_posix()
+            remote_path = f"/{rel}"
+            source_path = source_hints.get(remote_path, local_path)
+            add_item(items, make_sync_item(remote_path, local_path, source_path))
+            dirs.remove(name)
         for name in files:
             local_path = root_path / name
             rel = local_path.relative_to(staging).as_posix()
@@ -1384,6 +1418,14 @@ def collect_live_sync_items(repo: Path, staging: Path) -> list[SyncItem]:
             dirs.sort()
             files.sort()
             root_path = Path(root)
+            for name in list(dirs):
+                local_path = root_path / name
+                if not local_path.is_symlink():
+                    continue
+                rel = local_path.relative_to(source_root).as_posix()
+                remote_path = f"/usr/{subdir}/{rel}"
+                add_item(items, make_sync_item(remote_path, local_path, local_path))
+                dirs.remove(name)
             for name in files:
                 local_path = root_path / name
                 rel = local_path.relative_to(source_root).as_posix()
@@ -1583,7 +1625,11 @@ def upload_sync_chunk(
         lines.append(f"-mkdir {sftp_quote(directory)}")
 
     for item in chunk:
-        lines.append(f"put -p {sftp_quote(str(item.local_path))} {sftp_quote(item.remote_path)}")
+        if item.kind == SYNC_KIND_SYMLINK:
+            lines.append(f"-rm {sftp_quote(item.remote_path)}")
+            lines.append(f"symlink {sftp_quote(item.link_target)} {sftp_quote(item.remote_path)}")
+        else:
+            lines.append(f"put -p {sftp_quote(str(item.local_path))} {sftp_quote(item.remote_path)}")
 
     first_path = chunk[0].remote_path if chunk else "<empty>"
     last_path = chunk[-1].remote_path if chunk else "<empty>"
@@ -1593,7 +1639,7 @@ def upload_sync_chunk(
         user,
         port,
         (
-            f"upload {len(chunk)} file(s), {format_bytes(sum(item.size for item in chunk))} "
+            f"sync {len(chunk)} item(s), {format_bytes(sum(item.size for item in chunk))} "
             f"from {first_path} through {last_path}"
         ),
         timeout=sftp_timeout,
@@ -1649,6 +1695,7 @@ def sync_host(
                         "type": "file_done",
                         "host": hostname,
                         "path": item.remote_path,
+                        "kind": item.kind,
                         "bytes": item.size,
                     }
                 )
@@ -1735,6 +1782,8 @@ class LiveSyncTui:
             state.done_bytes += event["bytes"]
             state.current = event["path"]
             self.recent.append(f"{host}  put  {event['path']}")
+            if event.get("kind") == SYNC_KIND_SYMLINK:
+                self.recent[-1] = f"{host}  ln   {event['path']}"
             self.recent = self.recent[-200:]
         elif event_type == "host_done" and state:
             state.phase = "done"
@@ -1774,11 +1823,13 @@ class LiveSyncTui:
         done_bytes = sum(host.done_bytes for host in self.hosts.values())
         total_files = sum(host.total_files for host in self.hosts.values())
         done_files = sum(host.done_files for host in self.hosts.values())
+        progress_done = done_bytes if total_bytes > 0 else done_files
+        progress_total = total_bytes if total_bytes > 0 else total_files
 
         lines = [
             "WOS live rootfs sync",
-            f"{progress_bar(done_bytes, total_bytes, min(42, max(12, cols - 44)))}  "
-            f"{done_files}/{total_files} files  {format_bytes(done_bytes)}/{format_bytes(total_bytes)}",
+            f"{progress_bar(progress_done, progress_total, min(42, max(12, cols - 44)))}  "
+            f"{done_files}/{total_files} items  {format_bytes(done_bytes)}/{format_bytes(total_bytes)}",
             "",
         ]
 
@@ -1794,9 +1845,11 @@ class LiveSyncTui:
                 detail = f"{state.skipped_files} unchanged"
             else:
                 detail = ""
+            progress_done = state.done_bytes if state.total_bytes > 0 else state.done_files
+            progress_total = state.total_bytes if state.total_bytes > 0 else state.total_files
             prefix = (
                 f"{hostname:<{host_col}} {phase:<8} "
-                f"{progress_bar(state.done_bytes, state.total_bytes, bar_width)} "
+                f"{progress_bar(progress_done, progress_total, bar_width)} "
                 f"{state.done_files:>4}/{state.total_files:<4} "
                 f"{format_bytes(state.done_bytes):>9}/{format_bytes(state.total_bytes):<9} "
             )
@@ -1856,7 +1909,7 @@ def sync_live_rootfs(
 
         if not use_tui:
             print(
-                f"Syncing {len(selected_items)} candidate files to "
+                f"Syncing {len(selected_items)} candidate item(s) to "
                 f"{len(hostnames)} WOS node(s)"
                 + (f" with filter {filter_arg!r}" if filter_arg else "")
                 + "..."
@@ -1882,7 +1935,7 @@ def sync_live_rootfs(
     for summary in summaries:
         if summary.ok:
             print(
-                f"{summary.hostname}: uploaded {summary.uploaded_files} file(s), "
+                f"{summary.hostname}: synced {summary.uploaded_files} item(s), "
                 f"{format_bytes(summary.uploaded_bytes)}; "
                 f"{summary.skipped_files} unchanged"
             )

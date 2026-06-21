@@ -666,6 +666,50 @@ auto stat_entry(std::string_view path, std::string_view name) -> DirEntry {
     return entry;
 }
 
+// Some SFTP clients upload to a partial path and then rename over an existing
+// symlink. If that symlink is dangling, retry by replacing the link itself.
+auto retry_rename_over_symlink(const std::string& old_path, const std::string& new_path, int original_error) -> int {
+    switch (original_error) {
+        case EEXIST:
+        case EISDIR:
+        case ELOOP:
+        case ENOENT:
+        case ENOTDIR:
+            break;
+        default:
+            return original_error;
+    }
+
+    struct stat old_st{};
+    struct stat new_st{};
+    if (lstat(old_path.c_str(), &old_st) != 0 || lstat(new_path.c_str(), &new_st) != 0) {
+        return original_error;
+    }
+    if ((!S_ISREG(old_st.st_mode) && !S_ISLNK(old_st.st_mode)) || !S_ISLNK(new_st.st_mode)) {
+        return original_error;
+    }
+
+    std::array<char, PATH_MAX> target{};
+    ssize_t target_len = readlink(new_path.c_str(), target.data(), target.size() - 1);
+    std::string old_target;
+    if (target_len >= 0) {
+        old_target.assign(target.data(), static_cast<size_t>(target_len));
+    }
+
+    if (unlink(new_path.c_str()) != 0) {
+        return original_error;
+    }
+    if (rename(old_path.c_str(), new_path.c_str()) == 0) {
+        return 0;
+    }
+
+    int const RETRY_ERROR = errno;
+    if (!old_target.empty()) {
+        (void)symlink(old_target.c_str(), new_path.c_str());
+    }
+    return RETRY_ERROR;
+}
+
 auto apply_path_attrs(const std::string& path, const Attributes& attrs) -> int {
     if ((attrs.flags & SSH_FILEXFER_ATTR_PERMISSIONS) != 0 && chmod(path.c_str(), static_cast<mode_t>(attrs.permissions)) != 0) {
         return errno;
@@ -902,7 +946,7 @@ class Server {
                 handle_readlink(id, reader);
                 break;
             case SSH_FXP_SYMLINK:
-                send_status(id, SSH_FX_OP_UNSUPPORTED);
+                handle_symlink(id, reader);
                 break;
             case SSH_FXP_EXTENDED:
                 handle_extended(id, reader);
@@ -1267,7 +1311,12 @@ class Server {
             return;
         }
         if (rename(old_path.c_str(), new_path.c_str()) != 0) {
-            send_errno(id, errno);
+            int err = retry_rename_over_symlink(old_path, new_path, errno);
+            if (err != 0) {
+                send_errno(id, err);
+                return;
+            }
+            send_status(id, SSH_FX_OK);
             return;
         }
         send_status(id, SSH_FX_OK);
@@ -1291,6 +1340,21 @@ class Server {
         entry.longname = target_path;
         std::array<DirEntry, 1> entries = {std::move(entry)};
         send_name(id, std::span<const DirEntry>(entries.data(), entries.size()));
+    }
+
+    void handle_symlink(uint32_t id, PacketReader& reader) {
+        std::string target_path = reader.string();
+        std::string link_path = reader.string();
+        if (!reader.ok || has_nul(target_path) || has_nul(link_path)) {
+            send_status(id, SSH_FX_BAD_MESSAGE);
+            return;
+        }
+
+        if (symlink(target_path.c_str(), link_path.c_str()) != 0) {
+            send_errno(id, errno);
+            return;
+        }
+        send_status(id, SSH_FX_OK);
     }
 
     void handle_extended(uint32_t id, PacketReader& reader) {
