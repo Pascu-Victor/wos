@@ -37,7 +37,7 @@ if [ -e "$DISK" ]; then
 fi
 
 # Create disk
-DISK_SIZE="4G"
+DISK_SIZE="40G"
 echo "Creating QCOW2 image ($DISK_SIZE)"
 mkdir -p "$(dirname "$DISK")"
 qemu-img create -f qcow2 "$DISK" "$DISK_SIZE"
@@ -53,10 +53,10 @@ trap 'rm -rf "$STAGING"' EXIT
 
 rootfs_stage_tree "$CWD" "$STAGING"
 
-# Stage a tarball with root:root ownership and correct permissions
+# Stage a tarball with root:root ownership and correct permissions.
 chmod 700 "$STAGING/root/.ssh"
 test -f "$STAGING/root/.ssh/authorized_keys" && chmod 600 "$STAGING/root/.ssh/authorized_keys"
-fakeroot sh -c "chown -R 0:0 '$STAGING' && tar cf '$STAGING.tar' --numeric-owner -C '$STAGING' ."
+tar cf "$STAGING.tar" --owner=0 --group=0 --numeric-owner -C "$STAGING" .
 
 echo "Creating GPT partition and XFS filesystem"
 guestfish --rw -a "$DISK" <<_EOF_

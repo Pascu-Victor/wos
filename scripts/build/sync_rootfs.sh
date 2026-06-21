@@ -31,10 +31,10 @@ if [ "$ROOTFS_CHANGED" -eq 0 ]; then
     exit 0
 fi
 
-# Stage a tarball with root:root ownership and correct permissions
+# Stage a tarball with root:root ownership and correct permissions.
 chmod 700 "$STAGING/root/.ssh"
 test -f "$STAGING/root/.ssh/authorized_keys" && chmod 600 "$STAGING/root/.ssh/authorized_keys"
-fakeroot sh -c "chown -R 0:0 '$STAGING' && tar cf '$STAGING.tar' --numeric-owner -C '$STAGING' ."
+tar cf "$STAGING.tar" --owner=0 --group=0 --numeric-owner -C "$STAGING" .
 
 rootfs_remove_old_managed_paths "$DISK"
 
