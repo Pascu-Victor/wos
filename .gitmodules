@@ -31,3 +31,7 @@
 	path = toolchain/src/nasm
 	url = https://github.com/Pascu-Victor/nasm.git
 	branch = wos-support
+[submodule "toolchain/src/clang-tidy-cache"]
+	path = toolchain/src/clang-tidy-cache
+	url = https://github.com/williamfligor/clang-tidy-cache.git
+	branch = master
