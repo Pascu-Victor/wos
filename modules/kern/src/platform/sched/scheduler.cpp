@@ -130,6 +130,8 @@ inline auto is_gc_protected_idle_task(const task::Task* task) -> bool {
     return task != nullptr && task->type == task::TaskType::IDLE && task->pid == 0;
 }
 
+inline auto is_dead_gc_candidate_task(const task::Task* task) -> bool { return task != nullptr && !is_gc_protected_idle_task(task); }
+
 inline auto restore_gc_protected_idle_task(task::Task* task) -> bool {
     if (task == nullptr) {
         return false;
@@ -1137,10 +1139,13 @@ void commit_handoff_task_at_return_boundary() {
         return;
     }
 
-    if (outgoing != nullptr && outgoing != task && outgoing->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE &&
+    if (is_dead_gc_candidate_task(outgoing) && outgoing != task &&
+        outgoing->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE &&
         !outgoing->gc_queued.load(std::memory_order_acquire)) {
         insert_into_dead_list(outgoing);
     }
+
+    sys::signal::exit_current_on_pending_fatal_default_signal();
 }
 
 void clear_handoff_task(task::Task* task) {
@@ -1847,6 +1852,9 @@ void wake_cpu(uint64_t cpu_no, WakeCpuMode mode) {
     if (wake_ipi_vector == 0) {
         return;
     }
+    if (cpu_no >= smt::get_core_count()) {
+        return;
+    }
     if (cpu_no == cpu::current_cpu()) {
         return;
     }
@@ -2384,7 +2392,7 @@ void remove_current_task() {
         return task;
     });
 
-    if (task_to_gc != nullptr) {
+    if (is_dead_gc_candidate_task(task_to_gc)) {
         insert_into_dead_list(task_to_gc);
     }
 }
@@ -3180,7 +3188,7 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
         return next;
     });
 
-    if (exiting_task != nullptr) {
+    if (is_dead_gc_candidate_task(exiting_task)) {
         insert_into_dead_list(exiting_task);
     }
 
@@ -3782,7 +3790,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             return next;
         });
 
-        if (current_task->state.load(std::memory_order_acquire) == task::TaskState::DEAD &&
+        if (is_dead_gc_candidate_task(current_task) && current_task->state.load(std::memory_order_acquire) == task::TaskState::DEAD &&
             !current_task->gc_queued.load(std::memory_order_acquire)) {
             insert_into_dead_list(current_task);
         }
@@ -3948,6 +3956,21 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Inter
 // ============================================================================
 
 void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
+    if (task == nullptr || run_queues == nullptr) {
+        return;
+    }
+
+    uint64_t const NCPUS_RESCHED = smt::get_core_count();
+    if (NCPUS_RESCHED == 0) {
+        return;
+    }
+    if (cpu_no >= NCPUS_RESCHED) {
+        cpu_no = get_least_loaded_cpu();
+        if (cpu_no >= NCPUS_RESCHED) {
+            return;
+        }
+    }
+
 #ifdef SCHED_DEBUG
     // DIAGNOSTIC: Always log reschedule attempts
     dbg::log("RESCHED: PID %x -> CPU %d (heapIdx=%d, schedQ=%d, curCpu=%d)", task->pid, static_cast<int>(cpu_no), task->heap_index,
@@ -3969,30 +3992,33 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
     // it (possibly in a syscall). Don't move it - let the timer preempt it naturally.
     bool is_current_on_some_cpu = false;
     uint64_t current_cpu_of_task = UINT64_MAX;
+    uint64_t found_owner_cpu = UINT64_MAX;
     bool found_and_removed = false;
 
     // Fast path: task's last CPU
     uint64_t const LAST_CPU = task->cpu;
-    uint64_t const NCPUS_RESCHED = smt::get_core_count();
     if (LAST_CPU < NCPUS_RESCHED) {
-        run_queues->with_lock_void(LAST_CPU,
-                                   [task, &is_current_on_some_cpu, &current_cpu_of_task, &found_and_removed, LAST_CPU](RunQueue* rq) {
-                                       if (runqueue_task_is_reserved_locked(rq, task)) {
-                                           is_current_on_some_cpu = true;
-                                           current_cpu_of_task = LAST_CPU;
-                                           task->cpu = LAST_CPU;
-                                           found_and_removed = true;
-                                           return;
-                                       }
-                                       if (wait_list_remove_locked(rq, task)) {
-                                           found_and_removed = true;
-                                       }
-                                       if (rq->runnable_heap.contains(task)) {
-                                           remove_from_sums(rq, task);
-                                           rq->runnable_heap.remove(task);
-                                           found_and_removed = true;
-                                       }
-                                   });
+        run_queues->with_lock_void(
+            LAST_CPU, [task, &is_current_on_some_cpu, &current_cpu_of_task, &found_owner_cpu, &found_and_removed, LAST_CPU](RunQueue* rq) {
+                if (runqueue_task_is_reserved_locked(rq, task)) {
+                    is_current_on_some_cpu = true;
+                    current_cpu_of_task = LAST_CPU;
+                    found_owner_cpu = LAST_CPU;
+                    task->cpu = LAST_CPU;
+                    found_and_removed = true;
+                    return;
+                }
+                if (wait_list_remove_locked(rq, task)) {
+                    found_owner_cpu = LAST_CPU;
+                    found_and_removed = true;
+                }
+                if (rq->runnable_heap.contains(task)) {
+                    remove_from_sums(rq, task);
+                    rq->runnable_heap.remove(task);
+                    found_owner_cpu = LAST_CPU;
+                    found_and_removed = true;
+                }
+            });
     }
 
     // Rare recovery path: task->cpu is the authoritative owner for runnable,
@@ -4006,36 +4032,39 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
                 if (search_cpu == LAST_CPU) {
                     continue;  // already checked
                 }
-                run_queues->with_lock_void(
-                    search_cpu, [task, &is_current_on_some_cpu, &current_cpu_of_task, &found_and_removed, search_cpu](RunQueue* rq) {
-                        if (found_and_removed || is_current_on_some_cpu) {
-                            return;
-                        }
-                        if (runqueue_task_is_reserved_locked(rq, task)) {
-                            is_current_on_some_cpu = true;
-                            current_cpu_of_task = search_cpu;
-                            task->cpu = search_cpu;
+                run_queues->with_lock_void(search_cpu, [task, &is_current_on_some_cpu, &current_cpu_of_task, &found_owner_cpu,
+                                                        &found_and_removed, search_cpu](RunQueue* rq) {
+                    if (found_and_removed || is_current_on_some_cpu) {
+                        return;
+                    }
+                    if (runqueue_task_is_reserved_locked(rq, task)) {
+                        is_current_on_some_cpu = true;
+                        current_cpu_of_task = search_cpu;
+                        found_owner_cpu = search_cpu;
+                        task->cpu = search_cpu;
 #ifdef SCHED_DEBUG
-                            dbg::log("RESCHED: PID %x is currentTask on CPU %d", task->pid, static_cast<int>(search_cpu));
+                        dbg::log("RESCHED: PID %x is currentTask on CPU %d", task->pid, static_cast<int>(search_cpu));
 #endif
-                            return;
-                        }
-                        if (wait_list_remove_locked(rq, task)) {
-                            found_and_removed = true;
+                        return;
+                    }
+                    if (wait_list_remove_locked(rq, task)) {
+                        found_owner_cpu = search_cpu;
+                        found_and_removed = true;
 #ifdef SCHED_DEBUG
-                            dbg::log("RESCHED: PID %x removed from CPU %d wait_list", task->pid, static_cast<int>(search_cpu));
+                        dbg::log("RESCHED: PID %x removed from CPU %d wait_list", task->pid, static_cast<int>(search_cpu));
 #endif
-                        }
-                        if (rq->runnable_heap.contains(task)) {
+                    }
+                    if (rq->runnable_heap.contains(task)) {
 #ifdef SCHED_DEBUG
-                            dbg::log("RESCHED: PID %x found in CPU %d heap (idx=%d), removing", task->pid, static_cast<int>(search_cpu),
-                                     task->heap_index);
+                        dbg::log("RESCHED: PID %x found in CPU %d heap (idx=%d), removing", task->pid, static_cast<int>(search_cpu),
+                                 task->heap_index);
 #endif
-                            remove_from_sums(rq, task);
-                            rq->runnable_heap.remove(task);
-                            found_and_removed = true;
-                        }
-                    });
+                        remove_from_sums(rq, task);
+                        rq->runnable_heap.remove(task);
+                        found_owner_cpu = search_cpu;
+                        found_and_removed = true;
+                    }
+                });
             }
         }
     }
@@ -4108,7 +4137,12 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
     }
 
     if (task->cpu_pinned) {
-        cpu_no = task->cpu;  // Ignore requested CPU - keep on pinned CPU
+        uint64_t pinned_cpu = task->cpu;
+        if (pinned_cpu >= NCPUS_RESCHED) {
+            pinned_cpu = found_owner_cpu < NCPUS_RESCHED ? found_owner_cpu : cpu_no;
+            task->cpu = pinned_cpu;
+        }
+        cpu_no = pinned_cpu;  // Ignore requested CPU - keep on pinned CPU
     } else {
         task->cpu = cpu_no;
     }
@@ -4491,12 +4525,17 @@ void insert_into_dead_list(task::Task* task) {
     }
 
     if (is_gc_protected_idle_task(task)) {
+        task::TaskState const PRE_STATE = task->state.load(std::memory_order_acquire);
+        uint64_t const PRE_DEATH_EPOCH = task->death_epoch.load(std::memory_order_acquire);
+        bool const PRE_GC_QUEUED = task->gc_queued.load(std::memory_order_acquire);
+        auto const PRE_QUEUE = task->sched_queue;
         if (restore_gc_protected_idle_task(task)) {
             dbg::logger<"sched">::error(
-                "repaired idle task after dead GC enqueue attempt: task=%p name=%s cpu=%lu state=%u queue=%d stack=0x%lx "
-                "scratch=0x%lx thread=%p pagemap=%p",
-                task, task_name_for_log(task), task->cpu, task_state_for_log(task), task_queue_for_log(task),
-                task->context.syscall_kernel_stack, task->context.syscall_scratch_area, task->thread, task->pagemap);
+                "repaired idle task after dead GC enqueue attempt: task=%p name=%s cpu=%lu pre_state=%u pre_queue=%d "
+                "pre_death_epoch=%lu pre_gc_queued=%u stack=0x%lx scratch=0x%lx thread=%p pagemap=%p",
+                task, task_name_for_log(task), task->cpu, static_cast<unsigned>(PRE_STATE), static_cast<int>(PRE_QUEUE), PRE_DEATH_EPOCH,
+                PRE_GC_QUEUED ? 1U : 0U, task->context.syscall_kernel_stack, task->context.syscall_scratch_area, task->thread,
+                task->pagemap);
         }
         return;
     }

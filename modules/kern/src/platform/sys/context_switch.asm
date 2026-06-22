@@ -435,7 +435,7 @@ task_switch_handler:
     cmp qword [rsi + 24], qword 0x23
     jne .kernel_return
 
-    build_user_return_from_ptrs
+    build_user_return_from_ptrs_late_commit
 
 .kernel_return:
     build_kernel_return_from_ptrs

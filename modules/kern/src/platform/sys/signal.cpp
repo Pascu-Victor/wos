@@ -7,6 +7,7 @@
 #include "platform/asm/cpu.hpp"
 #include "platform/interrupt/gates.hpp"
 #include "platform/mm/addr.hpp"
+#include "platform/mm/mm.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/scheduler.hpp"
@@ -270,6 +271,23 @@ auto is_job_control_stop_signal(int signo) -> bool {
     return signo == WOS_SIGSTOP || signo == WOS_SIGTSTP || signo == WOS_SIGTTIN || signo == WOS_SIGTTOU;
 }
 
+auto default_signal_is_ignored(int signo) -> bool {
+    return signo == WOS_SIGCHLD || signo == WOS_SIGURG || signo == WOS_SIGWINCH || signo == WOS_SIGCONT;
+}
+
+auto task_owns_current_kernel_stack(Task* task) -> bool {
+    if (task == nullptr || task->context.syscall_kernel_stack < ker::mod::mm::KERNEL_STACK_SIZE) {
+        return false;
+    }
+
+    uint64_t rsp = 0;
+    asm volatile("mov %%rsp, %0" : "=r"(rsp));
+
+    uint64_t const STACK_TOP = task->context.syscall_kernel_stack;
+    uint64_t const STACK_BASE = STACK_TOP - ker::mod::mm::KERNEL_STACK_SIZE;
+    return rsp > STACK_BASE && rsp <= STACK_TOP;
+}
+
 auto job_control_stop_status(int signo) -> int32_t { return static_cast<int32_t>((static_cast<uint32_t>(signo) << 8U) | STOP_STATUS_LOW); }
 
 auto waitpid_waiter_matches_stopped_child(Task& waiter, Task& stopped) -> bool {
@@ -361,10 +379,10 @@ auto apply_job_control_stop(Task* task, int signo, bool park_current) -> bool {
     return true;
 }
 
-auto handle_non_user_signal_action(Task* task, int signo, unsigned idx, const Task::SigHandler& handler, bool park_current) -> bool {
+auto handle_handoff_non_user_signal_action(Task* task, int signo, unsigned idx, const Task::SigHandler& handler) -> bool {
     if (handler.handler == WOS_SIG_DFL) {
-        task->sig_pending &= ~(1ULL << idx);
-        if (signo == WOS_SIGCHLD || signo == WOS_SIGURG || signo == WOS_SIGWINCH || signo == WOS_SIGCONT) {
+        if (default_signal_is_ignored(signo)) {
+            task->sig_pending &= ~(1ULL << idx);
             if (task->sigsuspend_active) {
                 task->sig_mask = task->signal_frame_saved_mask();
                 sync_task_signal_mask_cache(task);
@@ -372,11 +390,14 @@ auto handle_non_user_signal_action(Task* task, int signo, unsigned idx, const Ta
             return true;
         }
         if (is_job_control_stop_signal(signo)) {
-            return apply_job_control_stop(task, signo, park_current);
+            task->sig_pending &= ~(1ULL << idx);
+            return apply_job_control_stop(task, signo, false);
         }
 
-        ker::syscall::process::wos_proc_exit_signal(signo);
-        __builtin_unreachable();
+        // Handoff return can run while current_task is still the outgoing stack
+        // owner. Leave fatal default signals pending so the task exits from its
+        // own current-task context instead of terminating the outgoing/idle task.
+        return true;
     }
 
     if (handler.handler == WOS_SIG_IGN) {
@@ -392,6 +413,30 @@ auto handle_non_user_signal_action(Task* task, int signo, unsigned idx, const Ta
 }
 
 }  // namespace
+
+void exit_current_on_pending_fatal_default_signal() {
+    auto* task = sched::get_current_task();
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->in_signal_handler || task->has_exited ||
+        task->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE || !task_owns_current_kernel_stack(task)) {
+        return;
+    }
+
+    uint64_t const DELIVERABLE = task->sig_pending & ~task->sig_mask;
+    if (DELIVERABLE == 0) {
+        return;
+    }
+
+    int const SIGNO = __builtin_ctzll(DELIVERABLE) + 1;
+    auto const IDX = static_cast<unsigned>(SIGNO - 1);
+    auto& handler = task->sig_handlers.at(IDX);
+    if (handler.handler != WOS_SIG_DFL || default_signal_is_ignored(SIGNO) || is_job_control_stop_signal(SIGNO)) {
+        return;
+    }
+
+    task->sig_pending &= ~(1ULL << IDX);
+    ker::syscall::process::wos_proc_exit_signal(SIGNO);
+    __builtin_unreachable();
+}
 
 // Called from syscall.asm after the deferred task switch check, before returning
 // to userspace. Handles both sigreturn (context restore) and signal delivery.
@@ -675,13 +720,13 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
     auto const IDX = static_cast<unsigned>(SIGNO - 1);
     auto& handler = task->sig_handlers.at(IDX);
 
-    if (handle_non_user_signal_action(task, SIGNO, IDX, handler, false)) {
+    if (handle_handoff_non_user_signal_action(task, SIGNO, IDX, handler)) {
         return;
     }
     if (!user_signal_target_valid(handler)) {
         task->sig_pending &= ~(1ULL << IDX);
-        ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);
-        __builtin_unreachable();
+        task->sig_pending |= (1ULL << (WOS_SIGSEGV - 1));
+        return;
     }
 
     uint64_t const FRAME_ADDR = signal_frame_address_for_task(*task, frame.rsp, handler.flags);

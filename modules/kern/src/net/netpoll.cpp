@@ -283,13 +283,14 @@ auto napi_schedule(NapiStruct* napi) -> bool {
     // Wake the worker thread.
     if (napi->worker != nullptr) {
         ker::mod::sched::kern_wake(napi->worker);
-        if (napi->worker->cpu == ker::mod::cpu::current_cpu()) {
+        uint64_t const WORKER_CPU = napi->worker->cpu;
+        if (WORKER_CPU == ker::mod::cpu::current_cpu()) {
             // Same-CPU: wake_cpu() is a no-op, so arm the APIC timer for an
             // immediate scheduling pass instead of waiting up to 1ms for the
             // next quantum tick.
             ker::mod::sys::context_switch::request_reschedule();
         } else {
-            ker::mod::sched::wake_cpu(napi->worker->cpu);
+            ker::mod::sched::wake_cpu(WORKER_CPU);
         }
     }
 
@@ -350,7 +351,8 @@ auto napi_poll_struct_inline_budget(NapiStruct* napi, int budget) -> int {
         napi->state.compare_exchange_strong(exp, NapiState::SCHEDULED, std::memory_order_acq_rel, std::memory_order_acquire);
         napi->has_work.store(true, std::memory_order_release);
         if (napi->worker != nullptr) {
-            ker::mod::sched::wake_cpu(napi->worker->cpu);
+            uint64_t const WORKER_CPU = napi->worker->cpu;
+            ker::mod::sched::wake_cpu(WORKER_CPU);
         }
     } else {
         // Driver already called napi_complete() and re-enabled IRQs.
