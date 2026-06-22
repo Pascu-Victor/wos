@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <dev/block_device.hpp>
+#include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_format.hpp>
@@ -89,6 +90,10 @@ struct XfsMountContext {
 
     // Per-AG state array (ag_count elements, heap-allocated)
     XfsPerAG* per_ag;
+
+    // Serializes metadata transactions and AG btree/counter mutations. This is
+    // a sleeping mutex because XFS metadata paths can issue disk I/O.
+    mod::sys::Mutex metadata_lock;
 
     // Filesystem UUIDs
     XfsUuidT uuid;

@@ -35,6 +35,7 @@ struct BacklogSnapshot {
 struct BacklogQueue {
     std::atomic<PacketBuffer*> head{nullptr};
     std::atomic<uint64_t> depth{0};
+    std::atomic<bool> consumer_active{false};
     std::array<std::byte, 48> pad{};  // avoid false sharing
     ker::mod::sched::task::Task* handler = nullptr;
     std::atomic<bool> handler_active{false};

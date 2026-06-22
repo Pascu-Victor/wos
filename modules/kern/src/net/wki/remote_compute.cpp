@@ -693,6 +693,7 @@ auto try_complete_proxy_wait(ker::mod::sched::task::Task* waiter, ker::mod::sche
     write_proxy_wait_status(waiter, wait_status);
     clear_proxy_wait_result_state(waiter);
     waiter->waiting_for_pid = 0;
+    waiter->wait_options = 0;
     return true;
 }
 
@@ -2148,25 +2149,38 @@ void wki_proxy_task_blocked(ker::mod::sched::task::Task* task) {
 // Submitter Side - Cancel
 // ===============================================================================
 
-void wki_task_cancel(uint32_t task_id, int signum) {
+auto wki_task_cancel(uint32_t task_id, int signum) -> bool {
     SubmittedIpcCleanup cleanup = {};
+    bool const TEARDOWN_EXPORTS = signum == WKI_SIGKILL_NUM || signum == WKI_SIGTERM_NUM;
     s_compute_lock.lock();
     SubmittedTask* task = find_submitted_task(task_id);
     if (task == nullptr) {
         s_compute_lock.unlock();
-        return;
+        return false;
     }
 
     uint16_t const TARGET_NODE = task->target_node;
-    cleanup = submitted_ipc_cleanup_snapshot_locked(task);
+    if (TEARDOWN_EXPORTS) {
+        cleanup = submitted_ipc_cleanup_snapshot_locked(task);
+    }
     s_compute_lock.unlock();
 
     TaskCancelPayload cancel = {};
     cancel.task_id = task_id;
     cancel.signum = signum;
 
-    wki_send(TARGET_NODE, WKI_CHAN_RESOURCE, MsgType::TASK_CANCEL, &cancel, sizeof(cancel));
-    cleanup_submitted_ipc_exports(cleanup);
+    int const SEND_RET = wki_send(TARGET_NODE, WKI_CHAN_RESOURCE, MsgType::TASK_CANCEL, &cancel, sizeof(cancel));
+    if (SEND_RET != WKI_OK) {
+        return false;
+    }
+
+    // SIGINT is not proof that a remote interactive task will exit.  Keep the
+    // submitter-side PTY/stdio exports alive so a remote shell can handle
+    // Ctrl-C and return to its prompt instead of dropping the SSH session.
+    if (TEARDOWN_EXPORTS) {
+        cleanup_submitted_ipc_exports(cleanup);
+    }
+    return true;
 }
 
 // ===============================================================================
@@ -2223,11 +2237,9 @@ auto wki_proxy_task_forward_signal(ker::mod::sched::task::Task* task, int signum
 #ifdef WKI_DEBUG
     ker::mod::dbg::log("[WKI] Forwarding signal %d to remote task_id=%u (proxy pid=0x%lx)", signum, PROXY_TID, task->pid);
 #endif
-    wki_task_cancel(PROXY_TID, signum);
-
     // The proxy task will be cleaned up when TASK_COMPLETE arrives
     // (or if the peer is fenced, the fencing cleanup will handle it)
-    return true;
+    return wki_task_cancel(PROXY_TID, signum);
 }
 
 auto wki_proxy_task_find_by_remote_pid_safe(uint64_t remote_pid) -> ker::mod::sched::task::Task* {

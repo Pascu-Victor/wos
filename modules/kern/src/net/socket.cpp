@@ -20,6 +20,19 @@ namespace {
 constexpr int SOCK_STREAM_TYPE = 1;
 constexpr int SOCK_DGRAM_TYPE = 2;
 constexpr int SOCK_RAW_TYPE = 3;
+
+void ring_write_unpublished(RingBuffer* ring, const uint8_t* src, size_t len) {
+    if (len == 0) {
+        return;
+    }
+    size_t const FIRST = std::min(len, ring->capacity - ring->write_pos);
+    ker::util::copy_fast(ring->data + ring->write_pos, src, FIRST);
+    size_t const SECOND = len - FIRST;
+    if (SECOND > 0) {
+        ker::util::copy_fast(ring->data, src + FIRST, SECOND);
+    }
+    ring->write_pos = (ring->write_pos + len) % ring->capacity;
+}
 }  // namespace
 
 auto RingBuffer::write(const void* buf, size_t len) -> ssize_t {
@@ -32,18 +45,33 @@ auto RingBuffer::write(const void* buf, size_t len) -> ssize_t {
         return 0;
     }
     const auto* src = static_cast<const uint8_t*>(buf);
-    // Copy in at most two chunks to handle ring wrap-around.
-    size_t const FIRST = std::min(TO_WRITE, capacity - write_pos);
-    ker::util::copy_fast(data + write_pos, src, FIRST);
-    size_t const SECOND = TO_WRITE - FIRST;
-    if (SECOND > 0) {
-        ker::util::copy_fast(data, src + FIRST, SECOND);
-    }
-    write_pos = (write_pos + TO_WRITE) % capacity;
+    ring_write_unpublished(this, src, TO_WRITE);
     // Release: all writes to data[] happen-before this increment,
     // so the consumer's acquire-load of used will see the fresh bytes.
     used.fetch_add(TO_WRITE, std::memory_order_release);
     return static_cast<ssize_t>(TO_WRITE);
+}
+
+auto RingBuffer::write_pair(const void* first_buf, size_t first_len, const void* second_buf, size_t second_len) -> ssize_t {
+    if ((first_buf == nullptr && first_len != 0) || (second_buf == nullptr && second_len != 0) || first_len > capacity ||
+        second_len > capacity - first_len) {
+        return 0;
+    }
+
+    size_t const TOTAL = first_len + second_len;
+    if (TOTAL == 0) {
+        return 0;
+    }
+
+    size_t const CUR = used.load(std::memory_order_acquire);
+    if (TOTAL > capacity - CUR) {
+        return 0;
+    }
+
+    ring_write_unpublished(this, static_cast<const uint8_t*>(first_buf), first_len);
+    ring_write_unpublished(this, static_cast<const uint8_t*>(second_buf), second_len);
+    used.fetch_add(TOTAL, std::memory_order_release);
+    return static_cast<ssize_t>(TOTAL);
 }
 
 auto RingBuffer::read(void* buf, size_t len) -> ssize_t {

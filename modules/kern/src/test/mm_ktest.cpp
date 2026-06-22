@@ -235,14 +235,25 @@ KTEST(MM, OwnedFrameTrackingMapUnmapPrivateNormalPage) {
 
     virt::OwnedFrameStatsSnapshot after_map{};
     virt::get_owned_frame_stats_snapshot(after_map);
-    KEXPECT_TRUE(after_map.track_added >= before.track_added + 1);
-    KEXPECT_TRUE(after_map.entries >= before.entries + 1);
+    if (after_map.capacity == 0) {
+        KEXPECT_EQ(after_map.entries, before.entries);
+        KEXPECT_TRUE(after_map.track_attempts >= before.track_attempts + 1);
+        KEXPECT_TRUE(after_map.track_skipped >= before.track_skipped + 1);
+    } else {
+        KEXPECT_TRUE(after_map.track_added >= before.track_added + 1);
+        KEXPECT_TRUE(after_map.entries >= before.entries + 1);
+    }
 
     virt::unmap_page(root, TEST_VADDR);
 
     virt::OwnedFrameStatsSnapshot after_unmap{};
     virt::get_owned_frame_stats_snapshot(after_unmap);
-    KEXPECT_TRUE(after_unmap.untrack_removed >= after_map.untrack_removed + 1);
+    if (after_map.capacity == 0) {
+        KEXPECT_EQ(after_unmap.entries, after_map.entries);
+        KEXPECT_TRUE(after_unmap.untrack_missed >= after_map.untrack_missed + 1);
+    } else {
+        KEXPECT_TRUE(after_unmap.untrack_removed >= after_map.untrack_removed + 1);
+    }
 
     virt::destroy_user_space(root, 0, "mm_ktest", "owned-frame");
     virt::release_pagemap(root);

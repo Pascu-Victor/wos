@@ -13,6 +13,7 @@
 #include <net/netif.hpp>
 #include <net/netpoll.hpp>
 #include <net/packet.hpp>
+#include <net/proto/ipv4.hpp>
 #include <net/route.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
@@ -43,11 +44,22 @@ struct TcpBinding {
 std::array<TcpBinding, MAX_TCP_BINDINGS> tcp_bindings = {};
 ker::mod::sys::Spinlock tcp_bind_lock;
 
-uint16_t tcp_ephemeral_port = 49152;
+constexpr uint16_t TCP_EPHEMERAL_PORT_FIRST = 49152;
+constexpr uint16_t TCP_EPHEMERAL_PORT_LAST = 65535;
+constexpr uint32_t TCP_EPHEMERAL_PORT_COUNT =
+    static_cast<uint32_t>(TCP_EPHEMERAL_PORT_LAST) - static_cast<uint32_t>(TCP_EPHEMERAL_PORT_FIRST) + 1U;
+
+uint16_t tcp_ephemeral_port = TCP_EPHEMERAL_PORT_FIRST;
+bool tcp_ephemeral_seeded = false;
 
 constexpr int TCP_SHUT_RD = 0;
 constexpr int TCP_SHUT_WR = 1;
 constexpr int TCP_SHUT_RDWR = 2;
+constexpr int POLLIN = 0x0001;
+constexpr int POLLOUT = 0x0004;
+constexpr int POLLERR = 0x0008;
+constexpr int POLLHUP = 0x0010;
+constexpr int POLLRDHUP = 0x2000;
 
 void defer_socket_wait(Socket* sock) {
     auto* current_task = ker::mod::sched::get_current_task();
@@ -61,17 +73,120 @@ void defer_socket_wait(Socket* sock) {
     current_task->set_wait_channel("tcp_wait");
 }
 
-// Simple ISS generator.
-uint32_t iss_counter = 0x12345678;
-auto generate_iss() -> uint32_t {
-    iss_counter += 64000;
-    iss_counter ^= (iss_counter << 13);
-    iss_counter ^= (iss_counter >> 17);
-    iss_counter ^= (iss_counter << 5);
-    return iss_counter;
+std::atomic<uint32_t> iss_counter{0x12345678};
+uint64_t iss_secret = 0;
+bool iss_secret_seeded = false;
+
+auto tcp_mix64(uint64_t seed) -> uint64_t {
+    seed ^= seed >> 33U;
+    seed *= 0xff51afd7ed558ccdULL;
+    seed ^= seed >> 33U;
+    seed *= 0xc4ceb9fe1a85ec53ULL;
+    seed ^= seed >> 33U;
+    return seed;
 }
 
-auto alloc_ephemeral_port() -> uint16_t { return tcp_ephemeral_port++; }
+void seed_tcp_iss_secret_once() {
+    if (iss_secret_seeded) {
+        return;
+    }
+    uint64_t seed = ker::mod::time::get_us();
+    seed ^= reinterpret_cast<uintptr_t>(&iss_counter) >> 4U;
+    seed ^= reinterpret_cast<uintptr_t>(&tcb_hash) >> 7U;
+    iss_secret = tcp_mix64(seed);
+    iss_secret_seeded = true;
+}
+
+auto tcp_iss_tuple_hash(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> uint32_t {
+    uint64_t tuple = (static_cast<uint64_t>(local_ip) << 32U) | remote_ip;
+    tuple ^= (static_cast<uint64_t>(local_port) << 48U) | (static_cast<uint64_t>(remote_port) << 16U);
+    return static_cast<uint32_t>(tcp_mix64(tuple ^ iss_secret));
+}
+
+auto tcp_read_eof_state(TcpState state) -> bool {
+    switch (state) {
+        case TcpState::CLOSE_WAIT:
+        case TcpState::CLOSED:
+        case TcpState::TIME_WAIT:
+        case TcpState::CLOSING:
+        case TcpState::LAST_ACK:
+            return true;
+        default:
+            return false;
+    }
+}
+
+auto tcp_hup_state(TcpState state) -> bool {
+    switch (state) {
+        case TcpState::CLOSED:
+        case TcpState::TIME_WAIT:
+        case TcpState::CLOSING:
+        case TcpState::LAST_ACK:
+            return true;
+        default:
+            return false;
+    }
+}
+
+auto tcp_ephemeral_port_from_seed(uint64_t seed) -> uint16_t {
+    seed ^= seed >> 33U;
+    seed *= 0xff51afd7ed558ccdULL;
+    seed ^= seed >> 33U;
+    seed *= 0xc4ceb9fe1a85ec53ULL;
+    seed ^= seed >> 33U;
+    return static_cast<uint16_t>(TCP_EPHEMERAL_PORT_FIRST + (seed % TCP_EPHEMERAL_PORT_COUNT));
+}
+
+void seed_tcp_ephemeral_port_once() {
+    if (tcp_ephemeral_seeded) {
+        return;
+    }
+    uint64_t seed = ker::mod::time::get_us();
+    seed ^= static_cast<uint64_t>(iss_counter.load(std::memory_order_relaxed)) << 17U;
+    seed ^= reinterpret_cast<uintptr_t>(&tcp_ephemeral_port) >> 4U;
+    tcp_ephemeral_port = tcp_ephemeral_port_from_seed(seed);
+    tcp_ephemeral_seeded = true;
+}
+
+auto alloc_ephemeral_port() -> uint16_t {
+    seed_tcp_ephemeral_port_once();
+    uint16_t const PORT = tcp_ephemeral_port;
+    tcp_ephemeral_port =
+        tcp_ephemeral_port == TCP_EPHEMERAL_PORT_LAST ? TCP_EPHEMERAL_PORT_FIRST : static_cast<uint16_t>(tcp_ephemeral_port + 1);
+    return PORT;
+}
+
+void maybe_send_recv_window_update(TcpCB* cb, Socket* sock) {
+    if (cb == nullptr || sock == nullptr) {
+        return;
+    }
+
+    PacketBuffer* ack_pkt = nullptr;
+    uint32_t ack_local = 0;
+    uint32_t ack_remote = 0;
+
+    uint64_t const FLAGS = cb->lock.lock_irqsave();
+    uint32_t const OLD_WND = cb->rcv_wnd;
+    cb->rcv_wnd = tcp_receive_window_space(cb, sock);
+    uint32_t const WND_GROWTH = cb->rcv_wnd > OLD_WND ? cb->rcv_wnd - OLD_WND : 0;
+    uint32_t const UPDATE_THRESHOLD = std::max<uint32_t>(static_cast<uint32_t>(cb->rcv_mss) * 2U, cb->rcv_wnd / 4U);
+    bool const SHOULD_UPDATE_WINDOW = cb->rcv_wnd > OLD_WND && (OLD_WND == 0 || OLD_WND < cb->rcv_mss || WND_GROWTH >= UPDATE_THRESHOLD);
+    if (SHOULD_UPDATE_WINDOW) {
+        ack_pkt = tcp_build_ack(cb, &ack_local, &ack_remote);
+        if (ack_pkt == nullptr) {
+            cb->ack_pending = true;
+            tcp_timer_arm(cb);
+        }
+    }
+    cb->lock.unlock_irqrestore(FLAGS);
+
+    if (ack_pkt != nullptr && ipv4_tx(ack_pkt, ack_local, ack_remote, 6, 64) < 0) {
+        uint64_t const RETRY_FLAGS = cb->lock.lock_irqsave();
+        cb->ack_pending = true;
+        tcp_timer_arm(cb);
+        cb->lock.unlock_irqrestore(RETRY_FLAGS);
+    }
+}
 
 int tcp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
     uint16_t port = 0;
@@ -236,7 +351,7 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
     sock->remote_v4.port = port;
 
     // Generate ISS and send SYN
-    cb->iss = generate_iss();
+    cb->iss = tcp_generate_iss(cb->local_ip, cb->local_port, cb->remote_ip, cb->remote_port);
     cb->snd_una = cb->iss;
     cb->snd_nxt = cb->iss + 1;
     cb->rcv_wnd = sock->rcvbuf.capacity;
@@ -372,18 +487,7 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int /*unused*/) -> ssize_t {
         if (sock->rcvbuf.available() > 0) {
             ssize_t const N = sock->rcvbuf.read(buf, len);
             if (N > 0) {
-                uint32_t const OLD_WND = cb->rcv_wnd;
-                cb->rcv_wnd = tcp_receive_window_space(cb, sock);
-                uint32_t const WND_GROWTH = cb->rcv_wnd > OLD_WND ? cb->rcv_wnd - OLD_WND : 0;
-                uint32_t const UPDATE_THRESHOLD = std::max<uint32_t>(static_cast<uint32_t>(cb->rcv_mss) * 2U, cb->rcv_wnd / 4U);
-                bool const SHOULD_UPDATE_WINDOW =
-                    cb->rcv_wnd > OLD_WND && (OLD_WND == 0 || OLD_WND < cb->rcv_mss || WND_GROWTH >= UPDATE_THRESHOLD);
-                if (SHOULD_UPDATE_WINDOW) {
-                    if (!tcp_send_ack(cb)) {
-                        cb->ack_pending = true;
-                        tcp_timer_arm(cb);
-                    }
-                }
+                maybe_send_recv_window_update(cb, sock);
             }
             completed = N;
             return true;
@@ -648,31 +752,43 @@ int tcp_poll_check_op(Socket* sock, int events) {
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
     int ready = 0;
 
-    if ((events & 1) != 0) {  // POLLIN
-        if (sock->rcvbuf.available() > 0) {
-            ready |= 1;
+    if (cb == nullptr) {
+        return POLLERR | POLLHUP;
+    }
+
+    uint64_t const FLAGS = cb->lock.lock_irqsave();
+    TcpState const STATE = cb->state;
+    bool const READ_EOF = tcp_read_eof_state(STATE);
+    bool const FULL_HUP = tcp_hup_state(STATE);
+    bool const CONNECT_FAILED = STATE == TcpState::CLOSED && sock->state == SocketState::CONNECTING;
+
+    if ((events & POLLIN) != 0) {
+        if (sock->rcvbuf.available() > 0 || READ_EOF) {
+            ready |= POLLIN;
         }
-        if (cb != nullptr && cb->state == TcpState::LISTEN && sock->aq_count > 0) {
-            ready |= 1;
-        }
-        if (cb != nullptr && (cb->state == TcpState::CLOSE_WAIT || cb->state == TcpState::CLOSED)) {
-            ready |= 1;
+        if (STATE == TcpState::LISTEN && sock->aq_count > 0) {
+            ready |= POLLIN;
         }
     }
-    if ((events & 4) != 0) {  // POLLOUT
-        if (cb == nullptr) {
-            ready |= 4;
-        } else {
-            uint64_t const FLAGS = cb->lock.lock_irqsave();
-            bool const CAN_SEND = cb->state == TcpState::ESTABLISHED || cb->state == TcpState::CLOSE_WAIT;
-            bool const HAS_SEND_CREDIT = CAN_SEND && tcp_send_available_bytes(cb) > 0;
-            bool const REPORT_ERROR_READY = cb->state == TcpState::CLOSED;
-            cb->lock.unlock_irqrestore(FLAGS);
-            if (HAS_SEND_CREDIT || REPORT_ERROR_READY) {
-                ready |= 4;
-            }
+    if ((events & POLLRDHUP) != 0 && READ_EOF) {
+        ready |= POLLRDHUP;
+    }
+    if ((events & POLLOUT) != 0) {
+        bool const CAN_SEND = STATE == TcpState::ESTABLISHED || STATE == TcpState::CLOSE_WAIT;
+        bool const HAS_SEND_CREDIT = CAN_SEND && tcp_send_available_bytes(cb) > 0;
+        if (HAS_SEND_CREDIT || CONNECT_FAILED) {
+            ready |= POLLOUT;
         }
     }
+
+    if (CONNECT_FAILED) {
+        ready |= POLLERR;
+    }
+    if (FULL_HUP) {
+        ready |= POLLHUP;
+    }
+
+    cb->lock.unlock_irqrestore(FLAGS);
     return ready;
 }
 
@@ -696,6 +812,13 @@ SocketProtoOps tcp_ops = {
 auto get_tcp_proto_ops() -> SocketProtoOps* { return &tcp_ops; }
 
 auto tcp_now_ms() -> uint64_t { return ker::mod::time::get_us() / 1000; }
+
+auto tcp_generate_iss(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> uint32_t {
+    seed_tcp_iss_secret_once();
+    auto const CLOCK = static_cast<uint32_t>(ker::mod::time::get_us() / 4U);
+    uint32_t const SERIAL = iss_counter.fetch_add(64000U, std::memory_order_relaxed);
+    return CLOCK + SERIAL + tcp_iss_tuple_hash(local_ip, local_port, remote_ip, remote_port);
+}
 
 auto tcp_alloc_cb() -> TcpCB* {
     auto* cb = new TcpCB();
@@ -873,6 +996,48 @@ auto tcp_listener_snapshot(TcpListenerSnapshot* out, size_t max) -> size_t {
                 row.owner_pid = sock->owner_pid;
                 row.accept_queue = sock->aq_count;
                 row.backlog = sock->backlog;
+                row.rcvbuf_used = sock->rcvbuf.available();
+                row.rcvbuf_capacity = sock->rcvbuf.capacity;
+            }
+        }
+        bucket.lock.unlock();
+        if (count >= max) {
+            break;
+        }
+    }
+    return count;
+}
+
+auto tcp_conn_snapshot(TcpConnSnapshot* out, size_t max) -> size_t {
+    if (out == nullptr || max == 0) {
+        return 0;
+    }
+
+    size_t count = 0;
+    for (auto& bucket : tcb_hash) {
+        bucket.lock.lock();
+        for (TcpCB const* cb = bucket.head; cb != nullptr && count < max; cb = cb->hash_next) {
+            if (cb->state == TcpState::LISTEN) {
+                continue;
+            }
+
+            auto& row = out[count++];
+            row.local_ip = cb->local_ip;
+            row.local_port = cb->local_port;
+            row.remote_ip = cb->remote_ip;
+            row.remote_port = cb->remote_port;
+            row.state = static_cast<uint8_t>(cb->state);
+            row.rcv_nxt = cb->rcv_nxt;
+            row.rcv_wnd = cb->rcv_wnd;
+            row.snd_una = cb->snd_una;
+            row.snd_nxt = cb->snd_nxt;
+            row.snd_wnd = cb->snd_wnd;
+            row.ooo_bytes = cb->ooo_bytes.load(std::memory_order_acquire);
+            row.refcount = cb->refcnt.load(std::memory_order_acquire);
+            row.sack_permitted = cb->sack_permitted;
+            Socket const* sock = cb->socket;
+            if (sock != nullptr) {
+                row.owner_pid = sock->owner_pid;
                 row.rcvbuf_used = sock->rcvbuf.available();
                 row.rcvbuf_capacity = sock->rcvbuf.capacity;
             }

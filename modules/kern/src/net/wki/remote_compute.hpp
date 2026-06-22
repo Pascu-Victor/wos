@@ -219,7 +219,7 @@ void wki_proxy_task_blocked(ker::mod::sched::task::Task* task);
 auto wki_task_wait(uint32_t task_id, int32_t* exit_status, uint64_t timeout_us) -> int;
 
 // Submitter side: cancel a submitted task with the specified signal semantics.
-void wki_task_cancel(uint32_t task_id, int signum);
+auto wki_task_cancel(uint32_t task_id, int signum) -> bool;
 
 // Load reporting: send current load to all peers.
 // Called periodically from wki_peer_timer_tick().

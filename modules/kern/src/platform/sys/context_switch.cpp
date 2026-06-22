@@ -42,6 +42,9 @@ constexpr bool K_ENABLE_SCHED_VALIDATE_CONTEXT = true;
 constexpr bool K_ENABLE_SCHED_VALIDATE_CONTEXT = false;
 #endif
 
+constexpr uint64_t USER_ADDR_LIMIT = 0x0000800000000000ULL;
+constexpr uint64_t USER_RFLAGS_FIXED_ONE = 1ULL << 1;
+
 inline auto valid_kernel_stack(uint64_t rsp) -> bool { return rsp >= 0xffff800000000000ULL && rsp < 0xffff900000000000ULL; }
 
 inline auto is_kernel_text_pointer(uint64_t rip) -> bool {
@@ -56,6 +59,20 @@ inline auto stack_belongs_to_task(sched::task::Task* task, uint64_t rsp) -> bool
     }
     uint64_t const STACK_TOP = task->context.syscall_kernel_stack;
     return rsp > STACK_TOP - ker::mod::mm::KERNEL_STACK_SIZE && rsp <= STACK_TOP;
+}
+
+inline auto valid_user_resume_scalar(uint64_t value) -> bool { return value != 0 && value < USER_ADDR_LIMIT; }
+
+inline auto valid_user_rflags(uint64_t flags) -> bool { return (flags & USER_RFLAGS_FIXED_ONE) != 0; }
+
+inline auto stack_region_contains(sched::task::Task* task, uint64_t addr, size_t size) -> bool {
+    if (task == nullptr || !valid_kernel_stack(task->context.syscall_kernel_stack) || size == 0) {
+        return false;
+    }
+    uint64_t const STACK_TOP = task->context.syscall_kernel_stack;
+    uint64_t const STACK_BASE = STACK_TOP - ker::mod::mm::KERNEL_STACK_SIZE;
+    uint64_t const END = addr + static_cast<uint64_t>(size);
+    return END >= addr && addr >= STACK_BASE && END <= STACK_TOP;
 }
 
 inline void panic_bad_handoff_stack(sched::task::Task* task, const char* reason) {
@@ -143,6 +160,21 @@ inline void validate_user_frame(const gates::InterruptFrame& frame, sched::task:
 inline auto is_idle_return_frame(const gates::InterruptFrame& frame, sched::task::Task* task) -> bool {
     return task != nullptr && task->type == sched::task::TaskType::IDLE && frame.cs == desc::gdt::GDT_KERN_CS &&
            frame.rip == reinterpret_cast<uint64_t>(wos_kernel_idle_loop);
+}
+
+inline auto is_user_return_frame(const gates::InterruptFrame& frame) -> bool { return (frame.cs & 0x3ULL) == 0x3ULL; }
+
+inline void check_pending_signals_for_return(cpu::GPRegs& gpr, gates::InterruptFrame& frame) {
+    if (!is_user_return_frame(frame)) {
+        return;
+    }
+
+    auto* return_task = sched::get_return_task();
+    if (return_task == sched::get_current_task()) {
+        sys::signal::check_pending_signals_interrupt(gpr, frame);
+    } else {
+        sys::signal::check_pending_signals_handoff(return_task, gpr, frame);
+    }
 }
 
 inline auto is_first_run_kernel_thread_frame(const gates::InterruptFrame& frame, const cpu::GPRegs& gpr, sched::task::Task* task) -> bool {
@@ -262,6 +294,135 @@ auto defer_process_reschedule_to_syscall_exit() -> bool {
 }  // namespace
 
 auto can_request_local_reschedule() -> bool { return current_stack_allows_local_reschedule(); }
+
+auto repair_stale_process_syscall_resume(sched::task::Task* task) -> bool {
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->is_voluntary_blocked() ||
+        task->context.syscall_scratch_area == 0 || task->deferred_task_switch || task->wants_block || task->wait_channel != nullptr) {
+        return false;
+    }
+
+    bool const HAS_VALID_USER_FRAME = task->context.frame.cs == desc::gdt::GDT_USER_CS &&
+                                      task->context.frame.ss == desc::gdt::GDT_USER_DS &&
+                                      valid_user_resume_scalar(task->context.frame.rip) &&
+                                      valid_user_resume_scalar(task->context.frame.rsp) && valid_user_rflags(task->context.frame.flags);
+    if (HAS_VALID_USER_FRAME) {
+        return false;
+    }
+
+    auto* scratch = reinterpret_cast<cpu::PerCpu*>(task->context.syscall_scratch_area);
+    if (scratch->syscall_stack != task->context.syscall_kernel_stack || !valid_kernel_stack(scratch->syscall_stack) ||
+        !valid_user_resume_scalar(scratch->syscall_ret_rip) || !valid_user_resume_scalar(scratch->user_rsp) ||
+        !valid_user_rflags(scratch->syscall_ret_flags)) {
+        return false;
+    }
+
+    uint64_t const REGS_ADDR = scratch->syscall_stack - sizeof(uint64_t) - sizeof(cpu::GPRegs);
+    uint64_t const RETVAL_ADDR = scratch->syscall_stack - sizeof(uint64_t);
+    if (!stack_region_contains(task, REGS_ADDR, sizeof(cpu::GPRegs)) || !stack_region_contains(task, RETVAL_ADDR, sizeof(uint64_t))) {
+        return false;
+    }
+
+    uint64_t const OLD_CS = task->context.frame.cs;
+    auto const* saved_regs = reinterpret_cast<const cpu::GPRegs*>(REGS_ADDR);
+    auto const* return_value = reinterpret_cast<const uint64_t*>(RETVAL_ADDR);
+    task->context.regs = *saved_regs;
+    task->context.regs.rax = *return_value;
+    task->context.regs.rcx = scratch->syscall_ret_rip;
+    task->context.regs.r11 = scratch->syscall_ret_flags;
+
+    task->context.frame.int_num = 0;
+    task->context.frame.err_code = 0;
+    task->context.frame.rip = scratch->syscall_ret_rip;
+    task->context.frame.cs = desc::gdt::GDT_USER_CS;
+    task->context.frame.flags = scratch->syscall_ret_flags;
+    task->context.frame.rsp = scratch->user_rsp;
+    task->context.frame.ss = desc::gdt::GDT_USER_DS;
+    task->set_voluntary_blocked(false);
+
+    static std::atomic<uint64_t> repair_count{0};
+    uint64_t const N = repair_count.fetch_add(1, std::memory_order_relaxed);
+    if (N < 16) {
+        dbg::logger<"ctxswitch">::warn(
+            "repaired process syscall resume frame: pid=%lu name=%s old_cs=0x%llx rip=0x%llx rsp=0x%llx retval=0x%llx", task->pid,
+            task->name != nullptr ? task->name : "?", static_cast<unsigned long long>(OLD_CS),
+            static_cast<unsigned long long>(task->context.frame.rip), static_cast<unsigned long long>(task->context.frame.rsp),
+            static_cast<unsigned long long>(*return_value));
+    }
+
+    return true;
+}
+
+#ifdef WOS_SELFTEST
+auto context_switch_selftest_repair_stale_process_syscall_resume() -> bool {
+    auto* stack = static_cast<uint8_t*>(mm::phys::page_alloc(mm::KERNEL_STACK_SIZE, "ctxswitch_stale_syscall_ktest"));
+    if (stack == nullptr) {
+        return false;
+    }
+
+    uint64_t const STACK_TOP = reinterpret_cast<uint64_t>(stack) + mm::KERNEL_STACK_SIZE;
+    uint64_t const REGS_ADDR = STACK_TOP - sizeof(uint64_t) - sizeof(cpu::GPRegs);
+    uint64_t const RETVAL_ADDR = STACK_TOP - sizeof(uint64_t);
+
+    auto* saved_regs = reinterpret_cast<cpu::GPRegs*>(REGS_ADDR);
+    *saved_regs = {};
+    saved_regs->rdi = 0x1111;
+    saved_regs->rsi = 0x2222;
+    saved_regs->rax = 0x3333;
+
+    auto* return_value = reinterpret_cast<uint64_t*>(RETVAL_ADDR);
+    *return_value = 0x12345678ULL;
+
+    cpu::PerCpu scratch{};
+    scratch.syscall_stack = STACK_TOP;
+    scratch.user_rsp = 0x00007fff'ffffe000ULL;
+    scratch.syscall_ret_rip = 0x00000000'00401000ULL;
+    scratch.syscall_ret_flags = 0x246;
+
+    sched::task::Task task{};
+    task.name = "ctxswitch-ktest";
+    task.pid = 42;
+    task.type = sched::task::TaskType::PROCESS;
+    task.context.syscall_kernel_stack = STACK_TOP;
+    task.context.syscall_scratch_area = reinterpret_cast<uint64_t>(&scratch);
+    task.context.frame.cs = desc::gdt::GDT_KERN_CS;
+    task.context.frame.ss = desc::gdt::GDT_KERN_DS;
+    task.context.regs.rdi = 0xaaaa;
+    task.set_voluntary_blocked(false);
+
+    bool const STALE_REPAIRED = repair_stale_process_syscall_resume(&task);
+    bool const STALE_OK = STALE_REPAIRED && task.context.frame.cs == desc::gdt::GDT_USER_CS &&
+                          task.context.frame.ss == desc::gdt::GDT_USER_DS && task.context.frame.rip == scratch.syscall_ret_rip &&
+                          task.context.frame.rsp == scratch.user_rsp && task.context.frame.flags == scratch.syscall_ret_flags &&
+                          task.context.regs.rdi == saved_regs->rdi && task.context.regs.rsi == saved_regs->rsi &&
+                          task.context.regs.rax == *return_value && task.context.regs.rcx == scratch.syscall_ret_rip &&
+                          task.context.regs.r11 == scratch.syscall_ret_flags && !task.is_voluntary_blocked();
+
+    saved_regs->rdi = 0x4444;
+    saved_regs->rsi = 0x5555;
+    saved_regs->rax = 0x6666;
+    *return_value = 0x87654321ULL;
+    scratch.user_rsp = 0x00007fff'ffffd000ULL;
+    scratch.syscall_ret_rip = 0x00000000'00402000ULL;
+    scratch.syscall_ret_flags = 0x246;
+
+    task.context.frame.cs = desc::gdt::GDT_USER_CS;
+    task.context.frame.ss = desc::gdt::GDT_USER_DS;
+    task.context.frame.rip = 0;
+    task.context.frame.rsp = scratch.user_rsp;
+    task.context.frame.flags = scratch.syscall_ret_flags;
+    task.context.regs.rdi = 0xbbbb;
+
+    bool const INVALID_REPAIRED = repair_stale_process_syscall_resume(&task);
+    bool const INVALID_OK = INVALID_REPAIRED && task.context.frame.rip == scratch.syscall_ret_rip &&
+                            task.context.frame.rsp == scratch.user_rsp && task.context.regs.rdi == saved_regs->rdi &&
+                            task.context.regs.rsi == saved_regs->rsi && task.context.regs.rax == *return_value &&
+                            task.context.regs.rcx == scratch.syscall_ret_rip && task.context.regs.r11 == scratch.syscall_ret_flags &&
+                            !task.is_voluntary_blocked();
+
+    mm::phys::page_free(stack);
+    return STALE_OK && INVALID_OK;
+}
+#endif
 
 // Debug helper: update per-CPU task pointer for panic inspection
 // NOTE: The old DEBUG_TASK_PTR_BASE (0xffff800000500000) conflicted with kernel page tables!
@@ -439,6 +600,11 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
         return false;
     }
 
+    if (!valid_kernel_stack(next_task->context.syscall_kernel_stack)) {
+        dbg::log("switchTo: FAIL - PID %x invalid kernel stack 0x%lx", next_task->pid, next_task->context.syscall_kernel_stack);
+        return false;
+    }
+
     // === POINT OF NO RETURN ===
     // After this point, we MUST complete the context switch.
     // The epoch guard in processTasks ensures the task struct and its resources
@@ -449,6 +615,7 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
 
     // Update debug task pointer for panic inspection
     update_debug_task_ptr(next_task, REAL_CPU_ID);
+    desc::gdt::set_rsp0(reinterpret_cast<uint64_t*>(next_task->context.syscall_kernel_stack), REAL_CPU_ID);
 
     // Now safe to modify interrupt frame and registers.
     if (next_task->type == sched::task::TaskType::DAEMON && !valid_kernel_stack(next_task->context.frame.rsp) &&
@@ -463,6 +630,9 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
     // The live GPRegs block sits immediately before the live InterruptFrame on
     // the timer stack. Copy registers first so the return frame is the last
     // thing written before validation and return assembly consumes it.
+    if (next_task->type == sched::task::TaskType::PROCESS && !next_task->is_voluntary_blocked()) {
+        static_cast<void>(repair_stale_process_syscall_resume(next_task));
+    }
     gpr = next_task->context.regs;
 
     frame.rip = next_task->context.frame.rip;
@@ -734,12 +904,8 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
 
     sched::process_tasks(*gpr_ptr, *frame_ptr);
 
+    check_pending_signals_for_return(*gpr_ptr, *frame_ptr);
     auto* return_task = sched::get_return_task();
-    if (return_task == sched::get_current_task()) {
-        sys::signal::check_pending_signals_interrupt(*gpr_ptr, *frame_ptr);
-    } else {
-        sys::signal::check_pending_signals_handoff(return_task, *gpr_ptr, *frame_ptr);
-    }
     validate_kernel_frame(*frame_ptr, return_task, "timer-return");
 
     if (is_idle_return_frame(*frame_ptr, return_task)) {
@@ -840,12 +1006,8 @@ extern "C" void wos_jump_to_next_task_no_save(void* stack_ptr) {
     auto* frame_ptr = reinterpret_cast<gates::InterruptFrame*>(reinterpret_cast<uint8_t*>(stack_ptr) + sizeof(cpu::GPRegs));
 
     sched::jump_to_next_task(*gpr_ptr, *frame_ptr);
+    check_pending_signals_for_return(*gpr_ptr, *frame_ptr);
     auto* return_task = sched::get_return_task();
-    if (return_task == sched::get_current_task()) {
-        sys::signal::check_pending_signals_interrupt(*gpr_ptr, *frame_ptr);
-    } else {
-        sys::signal::check_pending_signals_handoff(return_task, *gpr_ptr, *frame_ptr);
-    }
     validate_kernel_frame(*frame_ptr, return_task, "exit-return");
 }
 

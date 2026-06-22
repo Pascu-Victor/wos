@@ -62,6 +62,18 @@ sudo scripts/bench/setup_host_kvm_trace_caps.sh
 Some kernels also require a permissive `kernel.perf_event_paranoid` setting
 or mounted `tracefs`/`debugfs` before KVM tracepoints can be recorded.
 
+## Cross-OS showcase step
+
+`scripts/bench/run_cross_os_benchmark_suite.py` runs a lightweight showcase
+step before the heavier mandel/render benchmarks unless `--skip-showcase` is
+passed. On WOS this calls `/root/run-wos-showcase` (also symlinked as
+`/run-wos-showcase`), installed into the XFS rootfs from
+`configs/rootfs/root/wos-showcase/`. The scripts demonstrate `wkictl` placement
+wrappers, `forward +path -path`, VFS probes, and small benchmark commands. On
+Linux the paired runner uses SSH/SFTP and a tiny TCP helper instead of WOS IPC.
+
+Use `--showcase-scale quick|full|stress` to tune the workload size.
+
 ## Cross-OS host schedstat probe
 
 The same suite can add a distinct host-side schedstat step that samples QEMU

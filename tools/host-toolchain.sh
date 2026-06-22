@@ -66,10 +66,16 @@ ln -sf clang cc
 ln -sf clang++ c++
 ln -sf llvm-ar ar
 
-# 4. Build clang-tidy-cache into the local host tools directory
-cd $B/src/clang-tidy-cache
-env -u CC -u CXX -u LD -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS \
-    CGO_ENABLED=0 \
-    go build -o $B/host/bin/clang-tidy-cache .
+# 4. Build clang-tidy-cache into the local host tools directory when Go is
+# available. The compiler/sysroot bootstrap does not require this helper, and
+# WOS does not ship a Go toolchain yet.
+if command -v go >/dev/null 2>&1; then
+    cd $B/src/clang-tidy-cache
+    env -u CC -u CXX -u LD -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS \
+        CGO_ENABLED=0 \
+        go build -o $B/host/bin/clang-tidy-cache .
+else
+    echo "Skipping clang-tidy-cache: go not found"
+fi
 
 echo "Host toolchain built successfully at $B/host"

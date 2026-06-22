@@ -8,6 +8,9 @@ ROOT = Path(__file__).resolve().parents[3]
 SCHEDULER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.cpp"
 TASK_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.hpp"
 CONTEXT_SWITCH_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "context_switch.cpp"
+CONTEXT_SWITCH_ASM = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "context_switch.asm"
+GDT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "interrupt" / "gdt.cpp"
+GDT_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "interrupt" / "gdt.hpp"
 THREADING_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.cpp"
 THREADING_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.hpp"
 TASK_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.cpp"
@@ -69,6 +72,7 @@ def test_event_wake_cancel_preserves_current_task_wakeup_token() -> None:
         [
             "bool const CANCEL_DEFERRED_SWITCH = event_wake_cancels_deferred_switch(deferred_switch)",
             "task->deferred_task_switch = false",
+            "task->wakeup_pending.store(true, std::memory_order_release)",
             "reschedule_task_for_cpu(cpu, task)",
         ],
         "event wake cancellation mode",
@@ -78,6 +82,12 @@ def test_event_wake_cancel_preserves_current_task_wakeup_token() -> None:
         "task->deferred_task_switch = false",
         "reschedule_task_for_cpu(cpu, task)",
         "deferred switch must be cleared before the reschedule decision",
+    )
+    require_order(
+        wake_body,
+        "task->wakeup_pending.store(true, std::memory_order_release)",
+        "reschedule_task_for_cpu(cpu, task)",
+        "event wakes must publish a wake token before the reschedule decision",
     )
     if "CurrentTaskWakeupPending" in source:
         fail("current-task event wakes must not select a mode that clears wakeup_pending")
@@ -145,6 +155,60 @@ def test_wait_channel_policy_uses_typed_kinds() -> None:
     for snippet in forbidden:
         if snippet in low_latency_body or snippet in futex_body:
             fail(f"scheduler wait-channel policy still uses string classification: {snippet}")
+
+
+def test_real_idle_tasks_never_enter_dead_gc() -> None:
+    source = SCHEDULER_CPP.read_text()
+    idle_guard_body = function_body(source, "is_gc_protected_idle_task")
+    idle_restore_body = function_body(source, "restore_gc_protected_idle_task")
+    dead_list_body = function_body(source, "insert_into_dead_list")
+
+    require_tokens(
+        idle_guard_body,
+        [
+            "task->type == task::TaskType::IDLE",
+            "task->pid == 0",
+        ],
+        "real idle task GC guard",
+    )
+
+    require_tokens(
+        idle_restore_body,
+        [
+            "auto restore_gc_protected_idle_task(task::Task* task) -> bool",
+            "bool const NEEDS_RESTORE",
+            "task->state.store(task::TaskState::ACTIVE, std::memory_order_release)",
+            "task->death_epoch.store(0, std::memory_order_release)",
+            "task->gc_queued.store(false, std::memory_order_release)",
+            "task->sched_queue = task::Task::sched_queue::NONE",
+            "return true",
+        ],
+        "real idle task liveness repair",
+    )
+
+    require_tokens(
+        dead_list_body,
+        [
+            "is_gc_protected_idle_task(task)",
+            "if (restore_gc_protected_idle_task(task))",
+            "repaired idle task after dead GC enqueue attempt",
+            "task->gc_queued.compare_exchange_strong",
+            "rq->dead_list.push(task)",
+        ],
+        "dead-list idle task protection",
+    )
+    require_order(
+        dead_list_body,
+        "is_gc_protected_idle_task(task)",
+        "if (restore_gc_protected_idle_task(task))",
+        "real idle task liveness must be restored before reporting a repaired idle task",
+    )
+    require_order(
+        dead_list_body,
+        "if (restore_gc_protected_idle_task(task))",
+        "task->gc_queued.compare_exchange_strong",
+        "real idle task must be rejected before it can be GC queued",
+    )
 
 
 def test_runtime_accounting_deltas_are_saturating() -> None:
@@ -275,12 +339,112 @@ def test_process_syscall_reschedules_defer_to_syscall_exit() -> None:
     )
 
 
+def test_context_switch_updates_tss_rsp0_to_task_stack() -> None:
+    context_source = CONTEXT_SWITCH_CPP.read_text()
+    scheduler_source = SCHEDULER_CPP.read_text()
+    gdt_header = GDT_HPP.read_text()
+    gdt_source = GDT_CPP.read_text()
+    switch_body = function_body(context_source, "switch_to")
+    deferred_body = function_body(scheduler_source, "deferred_task_switch")
+    set_rsp0_body = function_body(gdt_source, "set_rsp0")
+
+    require_tokens(
+        gdt_header,
+        ["void set_rsp0(const uint64_t* stack_pointer, uint64_t cpu_id);"],
+        "TSS RSP0 update API declaration",
+    )
+    require_tokens(
+        set_rsp0_body,
+        [
+            "if (cpu_id >= MAX_CPUS || stack_pointer == nullptr)",
+            "per_cpu_gdt.at(cpu_id).tss_data.rsp[0] =",
+            "reinterpret_cast<uint64_t>(stack_pointer);",
+        ],
+        "TSS RSP0 update helper",
+    )
+    require_tokens(
+        switch_body,
+        [
+            "if (!valid_kernel_stack(next_task->context.syscall_kernel_stack))",
+            "uint64_t const REAL_CPU_ID = cpu::current_cpu();",
+            "desc::gdt::set_rsp0(reinterpret_cast<uint64_t*>(next_task->context.syscall_kernel_stack), REAL_CPU_ID);",
+        ],
+        "context switch TSS RSP0 update",
+    )
+    require_order(
+        switch_body,
+        "if (!valid_kernel_stack(next_task->context.syscall_kernel_stack))",
+        "// === POINT OF NO RETURN ===",
+        "context switch must validate the task kernel stack before commit",
+    )
+    require_order(
+        switch_body,
+        "uint64_t const REAL_CPU_ID = cpu::current_cpu();",
+        "desc::gdt::set_rsp0(reinterpret_cast<uint64_t*>(next_task->context.syscall_kernel_stack), REAL_CPU_ID);",
+        "context switch must update the current CPU TSS RSP0 after choosing the CPU id",
+    )
+    require_tokens(
+        deferred_body,
+        [
+            "uint64_t const REAL_CPU_ID = cpu::current_cpu();",
+            "sys::context_switch::install_task_cpu_bases(next_task, REAL_CPU_ID);",
+            "desc::gdt::set_rsp0(reinterpret_cast<uint64_t*>(next_task->context.syscall_kernel_stack), REAL_CPU_ID);",
+            "mm::virt::switch_pagemap(next_task);",
+        ],
+        "deferred context switch TSS RSP0 update",
+    )
+    require_order(
+        deferred_body,
+        "sys::context_switch::install_task_cpu_bases(next_task, REAL_CPU_ID);",
+        "desc::gdt::set_rsp0(reinterpret_cast<uint64_t*>(next_task->context.syscall_kernel_stack), REAL_CPU_ID);",
+        "deferred context switch must update TSS RSP0 after installing task CPU bases",
+    )
+    require_order(
+        deferred_body,
+        "desc::gdt::set_rsp0(reinterpret_cast<uint64_t*>(next_task->context.syscall_kernel_stack), REAL_CPU_ID);",
+        "mm::virt::switch_pagemap(next_task);",
+        "deferred context switch must update TSS RSP0 before user faults can enter the new pagemap",
+    )
+
+
+def test_deferred_user_switch_commits_after_stack_handoff() -> None:
+    asm_source = CONTEXT_SWITCH_ASM.read_text()
+    marker = "wos_deferred_task_switch_return:"
+    start = asm_source.find(marker)
+    if start < 0:
+        fail("missing deferred task switch return assembly")
+    end = asm_source.find("%macro", start)
+    if end < 0:
+        end = len(asm_source)
+    deferred_body = asm_source[start:end]
+
+    require_tokens(
+        deferred_body,
+        [
+            "call wos_validate_deferred_return_frame",
+            "build_user_return_from_ptrs_late_commit",
+            "build_kernel_return_from_ptrs",
+        ],
+        "deferred switch return handoff path",
+    )
+    if "build_user_return_from_ptrs\n" in deferred_body:
+        fail("deferred user switch must not publish current_task before switching to the target task stack")
+    require_order(
+        deferred_body,
+        "call wos_validate_deferred_return_frame",
+        "build_user_return_from_ptrs_late_commit",
+        "deferred switch must validate the frame before the late user handoff",
+    )
+
+
 def main() -> None:
     test_event_wake_cancel_preserves_current_task_wakeup_token()
     test_wait_channel_policy_uses_typed_kinds()
     test_runtime_accounting_deltas_are_saturating()
     test_user_thread_tcbs_publish_nonzero_tid_before_user_execution()
     test_process_syscall_reschedules_defer_to_syscall_exit()
+    test_context_switch_updates_tss_rsp0_to_task_stack()
+    test_deferred_user_switch_commits_after_stack_handoff()
     print("scheduler wake-token and runtime accounting invariants hold")
 
 

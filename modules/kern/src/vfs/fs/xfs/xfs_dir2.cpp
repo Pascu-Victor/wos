@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <util/crc32c.hpp>
@@ -111,11 +112,31 @@ auto dir2_sf_header_size_if_valid(const uint8_t* data, size_t data_size, size_t*
     return true;
 }
 
-// Fill an XfsDirEntry from a data entry
-void fill_dir_entry(const XfsMountContext* ctx, const XfsDir2DataEntry* dep, XfsDirEntry* entry) {
+auto sf_entry_stored_offset(const XfsDir2SfEntry* sfep) -> uint16_t {
+    return (static_cast<uint16_t>(sfep->offset.at(0)) << 8U) | static_cast<uint16_t>(sfep->offset.at(1));
+}
+
+auto sf_entry_iteration_cookie(const XfsDir2SfEntry* sfep, uint64_t ordinal, uint64_t last_cookie) -> uint64_t {
+    constexpr uint64_t SF_OFFSET_COOKIE_SHIFT = 16;
+    uint64_t const STORED_OFFSET = sf_entry_stored_offset(sfep);
+    uint64_t candidate = XFS_READDIR_COOKIE_BASE + (STORED_OFFSET << SF_OFFSET_COOKIE_SHIFT) + ordinal;
+    if (candidate <= last_cookie) {
+        candidate = last_cookie + 1;
+    }
+    return candidate;
+}
+
+auto data_entry_cookie(const XfsMountContext* ctx, xfs_dir2_db_t db, size_t offset) -> uint64_t {
+    uint64_t const BYTE_OFF = (static_cast<uint64_t>(db) << (ctx->block_log + ctx->dir_blk_log)) + offset;
+    return XFS_READDIR_COOKIE_BASE + (BYTE_OFF >> XFS_DIR2_DATA_ALIGN_LOG);
+}
+
+// Fill an XfsDirEntry from a data entry.
+void fill_dir_entry(const XfsMountContext* ctx, const XfsDir2DataEntry* dep, XfsDirEntry* entry, uint64_t cookie = 0) {
     entry->ino = dir2_data_entry_ino(dep);
     entry->ftype = dir2_data_entry_ftype(ctx, dep);
     entry->namelen = dep->namelen;
+    entry->cookie = cookie;
     __builtin_memcpy(entry->name.data(), xfs_dir2_data_entry_name(dep), dep->namelen);
     entry->name.at(dep->namelen) = '\0';
 }
@@ -455,6 +476,7 @@ auto dir2_sf_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
     entry.ino = dp->ino;
     entry.ftype = XFS_DIR3_FT_DIR;
     entry.namelen = 1;
+    entry.cookie = 0;
     entry.name.at(0) = '.';
     entry.name.at(1) = '\0';
     int rc = fn(&entry, user_ctx);
@@ -466,6 +488,7 @@ auto dir2_sf_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
     entry.ino = xfs_dir2_sf_get_parent(hdr);
     entry.ftype = XFS_DIR3_FT_DIR;
     entry.namelen = 2;
+    entry.cookie = 1;
     entry.name.at(0) = '.';
     entry.name.at(1) = '.';
     entry.name.at(2) = '\0';
@@ -479,6 +502,8 @@ auto dir2_sf_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
     bool const HAS_FTYPE = xfs_has_ftype(ctx);
     const uint8_t* ptr = data + hdr_size;
     uint8_t const COUNT = hdr->count;
+    uint64_t last_cookie = XFS_READDIR_COOKIE_BASE - 1;
+    uint64_t ordinal = 0;
 
     for (uint8_t i = 0; i < COUNT; i++) {
         if (ptr >= data + DATA_SIZE) {
@@ -498,6 +523,12 @@ auto dir2_sf_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
         entry.ino = sf_get_ino(hdr, ino_ptr);
         entry.ftype = ftype;
         entry.namelen = ENTRY_NAMELEN;
+        // Prefer the stored shortform offset so cookies survive compaction when
+        // earlier entries are removed. Repair duplicate/nonmonotonic tags with
+        // the current ordinal so one getdents walk still advances strictly.
+        entry.cookie = sf_entry_iteration_cookie(sfep, ordinal, last_cookie);
+        last_cookie = entry.cookie;
+        ordinal++;
         __builtin_memcpy(entry.name.data(), xfs_dir2_sf_entry_name(sfep), ENTRY_NAMELEN);
         entry.name.at(ENTRY_NAMELEN) = '\0';
 
@@ -655,7 +686,7 @@ auto dir2_block_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
         }
 
         const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + offset);
-        fill_dir_entry(ctx, dep, &entry);
+        fill_dir_entry(ctx, dep, &entry, data_entry_cookie(ctx, 0, offset));
 
         rc = fn(&entry, user_ctx);
         if (rc != 0) {
@@ -715,7 +746,7 @@ auto dir2_scan_data_block(XfsInode* dp, xfs_dir2_db_t db, XfsDirIterFn fn, void*
             break;  // corrupt or past end
         }
 
-        fill_dir_entry(ctx, dep, &entry);
+        fill_dir_entry(ctx, dep, &entry, data_entry_cookie(ctx, db, offset));
         rc = fn(&entry, user_ctx);
         if (rc != 0) {
             brelse(bh);
@@ -808,7 +839,7 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
 
         if (!found) {
             brelse(leaf_bh);
-            return -ENOENT;
+            goto linear_scan;
         }
 
         // Back up to first with this hash
@@ -850,7 +881,7 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
         }
 
         brelse(leaf_bh);
-        return -ENOENT;
+        goto linear_scan;
     }
 
 linear_scan:
@@ -1019,6 +1050,77 @@ struct XfsDir3LeafHdr {
 static_assert(sizeof(XfsDir3LeafHdr) == 64);
 
 constexpr size_t XFS_DA3_CRC_OFF = __builtin_offsetof(XfsDa3Blkinfo, crc);
+
+auto dir2_buf_read_dir_block(XfsMountContext* ctx, xfs_fsblock_t disk_block) -> BufHead* {
+    uint32_t const FBS = 1U << ctx->dir_blk_log;
+    return (FBS == 1) ? xfs_buf_read(ctx, disk_block) : xfs_buf_read_multi(ctx, disk_block, FBS);
+}
+
+auto dir2_device_blkno(const XfsMountContext* ctx, xfs_fsblock_t disk_block) -> uint64_t {
+    auto const AGNO = xfs_ag_number(disk_block, ctx->ag_blk_log);
+    auto const AGBNO = xfs_ag_block(disk_block, ctx->ag_blk_log);
+    uint64_t const LINEAR = (static_cast<uint64_t>(AGNO) * ctx->ag_blocks) + AGBNO;
+    size_t const RATIO = ctx->block_size / ctx->device->block_size;
+    return LINEAR * RATIO;
+}
+
+void dir2_init_data_header(XfsInode* dp, xfs_fsblock_t disk_block, uint32_t magic, uint8_t* block) {
+    auto* hdr = reinterpret_cast<XfsDir3DataHdr*>(block);
+    hdr->hdr.magic = Be32::from_cpu(magic);
+    hdr->hdr.blkno = Be64::from_cpu(dir2_device_blkno(dp->mount, disk_block));
+    hdr->hdr.owner = Be64::from_cpu(dp->ino);
+    __builtin_memcpy(&hdr->hdr.uuid, &dp->mount->uuid, sizeof(XfsUuidT));
+}
+
+void dir2_init_leaf_header(XfsInode* dp, xfs_fsblock_t disk_block, XfsDir3LeafHdr* hdr, size_t count, size_t stale) {
+    hdr->info.hdr.forw = Be32::from_cpu(0);
+    hdr->info.hdr.back = Be32::from_cpu(0);
+    hdr->info.hdr.magic = Be16::from_cpu(static_cast<uint16_t>(XFS_DIR3_LEAF_MAGIC));
+    hdr->info.hdr.pad = Be16{0};
+    hdr->info.blkno = Be64::from_cpu(dir2_device_blkno(dp->mount, disk_block));
+    hdr->info.owner = Be64::from_cpu(dp->ino);
+    __builtin_memcpy(&hdr->info.uuid, &dp->mount->uuid, sizeof(XfsUuidT));
+    hdr->count = Be16::from_cpu(static_cast<uint16_t>(count));
+    hdr->stale = Be16::from_cpu(static_cast<uint16_t>(stale));
+    hdr->pad32 = Be32{0};
+}
+
+auto dir2_alloc_mapped_dir_block(XfsInode* dp, XfsTransaction* tp, xfs_fileoff_t file_block, xfs_fsblock_t* disk_block_out) -> int {
+    XfsMountContext* ctx = dp->mount;
+    xfs_agnumber_t const PREF_AG = xfs_ino_ag(dp->ino, ctx->agino_log);
+    uint32_t const FBS = 1U << ctx->dir_blk_log;
+
+    XfsAllocReq req{};
+    req.agno = PREF_AG;
+    req.agbno = 0;
+    req.minlen = FBS;
+    req.maxlen = FBS;
+    req.alignment = 0;
+
+    XfsAllocResult alloc_result{};
+    int rc = xfs_alloc_extent(ctx, tp, req, &alloc_result);
+    if (rc != 0) {
+        return rc;
+    }
+
+    xfs_fsblock_t const DISK_BLOCK = xfs_agbno_to_fsbno(alloc_result.agno, alloc_result.agbno, ctx->ag_blk_log);
+    XfsBmbtIrec new_extent{};
+    new_extent.br_startoff = file_block;
+    new_extent.br_startblock = DISK_BLOCK;
+    new_extent.br_blockcount = alloc_result.len;
+    new_extent.br_unwritten = false;
+
+    rc = xfs_bmap_add_extent(dp, tp, new_extent);
+    if (rc != 0) {
+        return rc;
+    }
+
+    dp->nblocks += alloc_result.len;
+    dp->dirty = true;
+    xfs_trans_log_inode(tp, dp);
+    *disk_block_out = DISK_BLOCK;
+    return 0;
+}
 
 auto dir2_data_block_count(const XfsInode* dp) -> uint64_t {
     XfsMountContext const* ctx = dp->mount;
@@ -1341,6 +1443,26 @@ auto dir2_leaf_prepare_stale_insert(const XfsDir3LeafHdr* hdr, xfs_dahash_t hash
     return 0;
 }
 
+auto dir2_leaf_ensure_stale_slot(XfsMountContext const* ctx, XfsDir3LeafHdr* hdr) -> int {
+    uint16_t const STALE_COUNT = hdr->stale.to_cpu();
+    if (STALE_COUNT != 0) {
+        return 0;
+    }
+
+    uint16_t const LEAF_COUNT = hdr->count.to_cpu();
+    size_t const CAPACITY = (ctx->dir_blk_size - sizeof(XfsDir3LeafHdr)) / sizeof(XfsDir2LeafEntry);
+    if (LEAF_COUNT >= CAPACITY || CAPACITY > UINT16_MAX) {
+        return -ENOSPC;
+    }
+
+    auto* lep = dir2_leaf_entries(hdr);
+    lep[LEAF_COUNT].hashval = Be32::from_cpu(UINT32_MAX);
+    lep[LEAF_COUNT].address = Be32::from_cpu(XFS_DIR2_NULL_DATAPTR);
+    hdr->count = Be16::from_cpu(static_cast<uint16_t>(LEAF_COUNT + 1));
+    hdr->stale = Be16::from_cpu(1);
+    return 0;
+}
+
 void dir2_leaf_reuse_stale_entry(XfsDir3LeafHdr* hdr, xfs_dahash_t hash, xfs_dir2_dataptr_t dataptr, int stale_idx, int insert_pos) {
     auto* lep = dir2_leaf_entries(hdr);
     uint16_t const STALE_COUNT = hdr->stale.to_cpu();
@@ -1466,6 +1588,42 @@ auto dir2_leaf_node_find_free_region(XfsInode* dp, size_t need_len, BufHead** da
     }
 
     return -ENOSPC;
+}
+
+auto dir2_leaf_alloc_data_block(XfsInode* dp, XfsTransaction* tp, BufHead** data_bhp, xfs_dir2_db_t* dbp, size_t* free_offp,
+                                size_t* free_lenp) -> int {
+    XfsMountContext* ctx = dp->mount;
+    size_t const DATA_START = sizeof(XfsDir3DataHdr);
+    size_t const DATA_END = ctx->dir_blk_size;
+    auto const NEW_DB = static_cast<xfs_dir2_db_t>(dir2_data_block_count(dp));
+
+    xfs_fsblock_t disk_block = 0;
+    int const RC = dir2_alloc_mapped_dir_block(dp, tp, dir2_db_to_fsbno(ctx, NEW_DB), &disk_block);
+    if (RC != 0) {
+        return RC;
+    }
+
+    BufHead* bh = dir2_buf_read_dir_block(ctx, disk_block);
+    if (bh == nullptr) {
+        return -EIO;
+    }
+
+    uint8_t* block = bh->data;
+    __builtin_memset(block, 0, DATA_END);
+    dir2_init_data_header(dp, disk_block, XFS_DIR3_DATA_MAGIC, block);
+    dir2_make_data_free(ctx, block, DATA_START, DATA_END, DATA_START, DATA_END - DATA_START);
+    dir2_recompute_data_crc(block, DATA_END);
+    xfs_trans_log_buf_full(tp, bh);
+
+    dp->size = (static_cast<uint64_t>(NEW_DB) + 1ULL) * static_cast<uint64_t>(ctx->dir_blk_size);
+    dp->dirty = true;
+    xfs_trans_log_inode(tp, dp);
+
+    *data_bhp = bh;
+    *dbp = NEW_DB;
+    *free_offp = DATA_START;
+    *free_lenp = DATA_END - DATA_START;
+    return 0;
 }
 
 // Add a name to a shortform directory (inline in inode data fork).
@@ -1809,6 +1967,7 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
     dp->data_fork.extents.list[0].br_blockcount = FBS;
     dp->data_fork.extents.list[0].br_unwritten = false;
     dp->data_fork.extents.count = 1;
+    dp->data_fork.extents.capacity = 1;
     dp->nextents = 1;
     dp->nblocks = FBS;
     dp->size = BLKSIZE;
@@ -1818,6 +1977,124 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
     mod::dbg::log("[xfs] dir sf->block conversion complete: ino=%lu blk=%lu entries=%d", static_cast<unsigned long>(dp->ino),
                   static_cast<unsigned long>(disk_block), total_entries);
 #endif
+    return 0;
+}
+
+auto dir2_block_to_leaf(XfsInode* dp, XfsTransaction* tp) -> int {
+    XfsMountContext* ctx = dp->mount;
+    size_t const BLKSIZE = ctx->dir_blk_size;
+    size_t const DATA_START = sizeof(XfsDir3DataHdr);
+
+    BufHead* block_bh = nullptr;
+    int rc = dir2_read_block(dp, 0, &block_bh);
+    if (rc != 0) {
+        return rc;
+    }
+
+    uint8_t* block = block_bh->data;
+    auto* data_hdr = reinterpret_cast<XfsDir3DataHdr*>(block);
+    if (data_hdr->hdr.magic.to_cpu() != XFS_DIR3_BLOCK_MAGIC) {
+        brelse(block_bh);
+        return -EINVAL;
+    }
+
+    auto* btp = reinterpret_cast<XfsDir2BlockTail*>(block + BLKSIZE - sizeof(XfsDir2BlockTail));
+    uint32_t const LEAF_COUNT = btp->count.to_cpu();
+    size_t const LEAF_BYTES = static_cast<size_t>(LEAF_COUNT) * sizeof(XfsDir2LeafEntry);
+    if (LEAF_BYTES > BLKSIZE - DATA_START - sizeof(XfsDir2BlockTail)) {
+        brelse(block_bh);
+        return -EINVAL;
+    }
+
+    size_t const OLD_LEAF_START = BLKSIZE - sizeof(XfsDir2BlockTail) - LEAF_BYTES;
+    if (OLD_LEAF_START < DATA_START) {
+        brelse(block_bh);
+        return -EINVAL;
+    }
+
+    size_t const LEAF_CAPACITY = (BLKSIZE - sizeof(XfsDir3LeafHdr)) / sizeof(XfsDir2LeafEntry);
+    if (LEAF_COUNT >= LEAF_CAPACITY || LEAF_CAPACITY > UINT16_MAX) {
+        brelse(block_bh);
+        return -ENOSPC;
+    }
+
+    auto* leaf_copy = new (std::nothrow) XfsDir2LeafEntry[LEAF_CAPACITY];
+    if (leaf_copy == nullptr) {
+        brelse(block_bh);
+        return -ENOMEM;
+    }
+
+    const auto* old_leaf = reinterpret_cast<const XfsDir2LeafEntry*>(block + OLD_LEAF_START);
+    for (uint32_t i = 0; i < LEAF_COUNT; i++) {
+        leaf_copy[i] = old_leaf[i];
+    }
+    for (size_t i = LEAF_COUNT; i < LEAF_CAPACITY; i++) {
+        leaf_copy[i].hashval = Be32::from_cpu(UINT32_MAX);
+        leaf_copy[i].address = Be32::from_cpu(XFS_DIR2_NULL_DATAPTR);
+    }
+
+    xfs_fsblock_t new_data_disk = 0;
+    rc = dir2_alloc_mapped_dir_block(dp, tp, dir2_db_to_fsbno(ctx, 1), &new_data_disk);
+    if (rc != 0) {
+        delete[] leaf_copy;
+        brelse(block_bh);
+        return rc;
+    }
+
+    BufHead* new_data_bh = dir2_buf_read_dir_block(ctx, new_data_disk);
+    if (new_data_bh == nullptr) {
+        delete[] leaf_copy;
+        brelse(block_bh);
+        return -EIO;
+    }
+
+    uint8_t* new_data = new_data_bh->data;
+    __builtin_memset(new_data, 0, BLKSIZE);
+    dir2_init_data_header(dp, new_data_disk, XFS_DIR3_DATA_MAGIC, new_data);
+    dir2_make_data_free(ctx, new_data, DATA_START, BLKSIZE, DATA_START, BLKSIZE - DATA_START);
+    dir2_recompute_data_crc(new_data, BLKSIZE);
+    xfs_trans_log_buf_full(tp, new_data_bh);
+    bwrite(new_data_bh);
+    brelse(new_data_bh);
+
+    xfs_fileoff_t const LEAF_FSBNO = XFS_DIR2_LEAF_OFFSET >> ctx->block_log;
+    xfs_fsblock_t leaf_disk = 0;
+    rc = dir2_alloc_mapped_dir_block(dp, tp, LEAF_FSBNO, &leaf_disk);
+    if (rc != 0) {
+        delete[] leaf_copy;
+        brelse(block_bh);
+        return rc;
+    }
+
+    BufHead* leaf_bh = dir2_buf_read_dir_block(ctx, leaf_disk);
+    if (leaf_bh == nullptr) {
+        delete[] leaf_copy;
+        brelse(block_bh);
+        return -EIO;
+    }
+
+    uint8_t* leaf_block = leaf_bh->data;
+    __builtin_memset(leaf_block, 0, BLKSIZE);
+    auto* leaf_hdr = reinterpret_cast<XfsDir3LeafHdr*>(leaf_block);
+    dir2_init_leaf_header(dp, leaf_disk, leaf_hdr, LEAF_CAPACITY, LEAF_CAPACITY - LEAF_COUNT);
+    __builtin_memcpy(dir2_leaf_entries(leaf_hdr), leaf_copy, LEAF_CAPACITY * sizeof(XfsDir2LeafEntry));
+    dir2_recompute_leaf_crc(leaf_block, BLKSIZE);
+    xfs_trans_log_buf_full(tp, leaf_bh);
+    bwrite(leaf_bh);
+    brelse(leaf_bh);
+
+    data_hdr->hdr.magic = Be32::from_cpu(XFS_DIR3_DATA_MAGIC);
+    dir2_make_data_free(ctx, block, DATA_START, BLKSIZE, OLD_LEAF_START, BLKSIZE - OLD_LEAF_START);
+    dir2_recompute_data_crc(block, BLKSIZE);
+    xfs_trans_log_buf_full(tp, block_bh);
+    bwrite(block_bh);
+    brelse(block_bh);
+
+    dp->size = 2ULL * static_cast<uint64_t>(ctx->dir_blk_size);
+    dp->dirty = true;
+    xfs_trans_log_inode(tp, dp);
+
+    delete[] leaf_copy;
     return 0;
 }
 
@@ -2087,10 +2364,23 @@ auto dir2_leaf_node_addname(XfsInode* dp, const char* name, uint16_t namelen, xf
     auto* leaf_hdr = reinterpret_cast<XfsDir3LeafHdr*>(leaf_bh->data);
     int stale_idx = -1;
     int insert_pos = 0;
-    rc = dir2_leaf_prepare_stale_insert(leaf_hdr, HASH, &stale_idx, &insert_pos);
+    bool update_leaf = true;
+    rc = dir2_leaf_ensure_stale_slot(ctx, leaf_hdr);
+    if (rc == -ENOSPC) {
+        update_leaf = false;
+        rc = 0;
+    }
     if (rc != 0) {
         brelse(leaf_bh);
         return rc;
+    }
+
+    if (update_leaf) {
+        rc = dir2_leaf_prepare_stale_insert(leaf_hdr, HASH, &stale_idx, &insert_pos);
+        if (rc != 0) {
+            brelse(leaf_bh);
+            return rc;
+        }
     }
 
     BufHead* data_bh = nullptr;
@@ -2098,6 +2388,9 @@ auto dir2_leaf_node_addname(XfsInode* dp, const char* name, uint16_t namelen, xf
     size_t free_off = 0;
     size_t free_len = 0;
     rc = dir2_leaf_node_find_free_region(dp, NEED_LEN, &data_bh, &db, &free_off, &free_len);
+    if (rc == -ENOSPC) {
+        rc = dir2_leaf_alloc_data_block(dp, tp, &data_bh, &db, &free_off, &free_len);
+    }
     if (rc != 0) {
         brelse(leaf_bh);
         return rc;
@@ -2111,9 +2404,11 @@ auto dir2_leaf_node_addname(XfsInode* dp, const char* name, uint16_t namelen, xf
     xfs_trans_log_buf_full(tp, data_bh);
 
     xfs_dir2_dataptr_t const DATAPTR = dir2_db_off_to_dataptr(ctx, db, free_off);
-    dir2_leaf_reuse_stale_entry(leaf_hdr, HASH, DATAPTR, stale_idx, insert_pos);
-    dir2_recompute_leaf_crc(leaf_bh->data, ctx->dir_blk_size);
-    xfs_trans_log_buf_full(tp, leaf_bh);
+    if (update_leaf) {
+        dir2_leaf_reuse_stale_entry(leaf_hdr, HASH, DATAPTR, stale_idx, insert_pos);
+        dir2_recompute_leaf_crc(leaf_bh->data, ctx->dir_blk_size);
+        xfs_trans_log_buf_full(tp, leaf_bh);
+    }
 
     brelse(data_bh);
     brelse(leaf_bh);
@@ -2478,18 +2773,14 @@ auto dir2_leaf_node_removename(XfsInode* dp, const char* name, uint16_t namelen,
     auto* leaf_hdr = reinterpret_cast<XfsDir3LeafHdr*>(leaf_bh->data);
     int leaf_idx = -1;
     rc = dir2_leaf_find_dataptr(leaf_hdr, HASH, DATAPTR, &leaf_idx);
-    if (rc != 0) {
-        brelse(leaf_bh);
-        brelse(data_bh);
-        return -ENOSYS;
+    if (rc == 0) {
+        auto* lep = dir2_leaf_entries(leaf_hdr);
+        lep[leaf_idx].address = Be32::from_cpu(XFS_DIR2_NULL_DATAPTR);
+        uint16_t const STALE_COUNT = leaf_hdr->stale.to_cpu();
+        leaf_hdr->stale = Be16::from_cpu(static_cast<uint16_t>(STALE_COUNT + 1));
+        dir2_recompute_leaf_crc(leaf_bh->data, ctx->dir_blk_size);
+        xfs_trans_log_buf_full(tp, leaf_bh);
     }
-
-    auto* lep = dir2_leaf_entries(leaf_hdr);
-    lep[leaf_idx].address = Be32::from_cpu(XFS_DIR2_NULL_DATAPTR);
-    uint16_t const STALE_COUNT = leaf_hdr->stale.to_cpu();
-    leaf_hdr->stale = Be16::from_cpu(static_cast<uint16_t>(STALE_COUNT + 1));
-    dir2_recompute_leaf_crc(leaf_bh->data, ctx->dir_blk_size);
-    xfs_trans_log_buf_full(tp, leaf_bh);
 
     uint8_t* data_block = data_bh->data;
     size_t const DATA_START = sizeof(XfsDir3DataHdr);
@@ -2545,6 +2836,12 @@ auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
         case XFS_DINODE_FMT_BTREE: {
             if (dir2_is_single_block_dir(dp)) {
                 rc = dir2_block_addname(dp, name, namelen, ino, ftype, tp);
+                if (rc == -ENOSPC) {
+                    rc = dir2_block_to_leaf(dp, tp);
+                    if (rc == 0) {
+                        rc = dir2_leaf_node_addname(dp, name, namelen, ino, ftype, tp);
+                    }
+                }
             } else {
                 rc = dir2_leaf_node_addname(dp, name, namelen, ino, ftype, tp);
             }
@@ -2661,6 +2958,75 @@ auto xfs_selftest_dentry_cache_shortform() -> bool {
     XfsDentryCacheStats after_invalidate{};
     xfs_dentry_cache_stats(after_invalidate);
     return after_invalidate.misses > after_hit.misses && after_invalidate.invalidations > after_hit.invalidations;
+}
+
+auto xfs_selftest_shortform_readdir_cookies_are_monotonic() -> bool {
+    XfsMountContext mount{};
+    mount.inode_size = 512;
+    mount.feat_incompat = XFS_SB_FEAT_INCOMPAT_FTYPE;
+
+    std::array<uint8_t, 192> data{};
+    auto* hdr = reinterpret_cast<XfsDir2SfHdr*>(data.data());
+    hdr->count = 4;
+    hdr->i8count = 0;
+    hdr->parent.at(3) = 7;
+
+    uint8_t* p = data.data() + xfs_dir2_sf_hdr_size(hdr);
+    auto append_entry = [&](const char* name, uint16_t stored_offset, uint32_t ino) {
+        auto const name_len = static_cast<uint8_t>(std::strlen(name));
+        p[0] = name_len;
+        p[1] = static_cast<uint8_t>(stored_offset >> 8U);
+        p[2] = static_cast<uint8_t>(stored_offset & 0xffU);
+        std::memcpy(p + 3, name, name_len);
+        size_t cursor = 3 + name_len;
+        p[cursor++] = XFS_DIR3_FT_REG_FILE;
+        p[cursor++] = static_cast<uint8_t>((ino >> 24U) & 0xffU);
+        p[cursor++] = static_cast<uint8_t>((ino >> 16U) & 0xffU);
+        p[cursor++] = static_cast<uint8_t>((ino >> 8U) & 0xffU);
+        p[cursor++] = static_cast<uint8_t>(ino & 0xffU);
+        p += cursor;
+    };
+
+    // A rename sequence like Git index-pack's tmp_pack/tmp_rev/tmp_idx
+    // finalization can leave duplicate shortform offset tags while the entries
+    // are still ordered correctly in the in-memory data fork.
+    append_entry("pack.keep", 4, 41);
+    append_entry("pack.pack", 5, 42);
+    append_entry("pack.rev", 5, 43);
+    append_entry("pack.idx", 5, 44);
+
+    XfsInode dir{};
+    dir.ino = 100;
+    dir.mount = &mount;
+    dir.mode = 0040755;
+    dir.data_fork.format = XFS_DINODE_FMT_LOCAL;
+    dir.data_fork.local.data = data.data();
+    dir.data_fork.local.size = static_cast<size_t>(p - data.data());
+    dir.size = dir.data_fork.local.size;
+
+    struct CookieCheck {
+        uint64_t last_cookie = 0;
+        size_t real_entries = 0;
+        bool ok = true;
+    } check{};
+
+    auto callback = [](const XfsDirEntry* entry, void* raw) -> int {
+        auto* state = static_cast<CookieCheck*>(raw);
+        if ((entry->namelen == 1 && std::strcmp(entry->name.data(), ".") == 0) ||
+            (entry->namelen == 2 && std::strcmp(entry->name.data(), "..") == 0)) {
+            return 0;
+        }
+        if (entry->cookie <= state->last_cookie) {
+            state->ok = false;
+            return 1;
+        }
+        state->last_cookie = entry->cookie;
+        state->real_entries++;
+        return 0;
+    };
+
+    int const RC = xfs_dir_iterate(&dir, callback, &check);
+    return RC == 0 && check.ok && check.real_entries == 4;
 }
 #endif
 

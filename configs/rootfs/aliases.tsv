@@ -1,5 +1,6 @@
 # action<TAB>source<TAB>target[<TAB>mode for copy-mode]
 copy	configs/rootfs/etc/services	/etc/services
+copy	configs/rootfs/etc/resolv.conf	/etc/resolv.conf
 copy	build/modules/testprog/testprog	/usr/bin/testprog
 copy	build/modules/testd/testd	/usr/bin/testd
 copy	build/modules/perf/perf	/usr/bin/perf
@@ -38,6 +39,8 @@ symlink	/usr/bin/dropbearmulti	/usr/bin/dropbearkey
 symlink	/usr/bin/dropbearmulti	/usr/bin/scp
 copy	toolchain/sysroot/bin/make	/usr/bin/make
 symlink	/usr/bin/make	/usr/bin/gmake
+copy	toolchain/sysroot/bin/bash	/usr/bin/bash
+copy	toolchain/sysroot/bin/bashbug	/usr/bin/bashbug
 copy	toolchain/sysroot/bin/curl	/usr/bin/curl
 copy	toolchain/sysroot/etc/ssl/certs/ca-certificates.crt	/etc/ssl/certs/ca-certificates.crt
 symlink	certs/ca-certificates.crt	/etc/ssl/cert.pem

@@ -2,6 +2,7 @@
 #include <platform/sched/run_heap.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sys/context_switch.hpp>
 #include <test/ktest.hpp>
 
 // ---------------------------------------------------------------------------
@@ -60,6 +61,10 @@ KTEST(Sched, SaturatingDeadlineUs) {
 }
 
 KTEST(SchedulerRuntime, RuntimeDeltaSaturates) { KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_runtime_delta_saturates()); }
+
+KTEST(ContextSwitch, RepairsStaleProcessSyscallResume) {
+    KEXPECT_TRUE(ker::mod::sys::context_switch::context_switch_selftest_repair_stale_process_syscall_resume());
+}
 
 // ---------------------------------------------------------------------------
 // RunHeap ordering test - push tasks with known deadlines, verify min-order.

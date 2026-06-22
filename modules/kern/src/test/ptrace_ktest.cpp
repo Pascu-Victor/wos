@@ -1,6 +1,7 @@
 #include <abi/ptrace.hpp>
 #include <cstddef>
 #include <cstdint>
+#include <platform/debug/ptrace.hpp>
 #include <test/ktest.hpp>
 
 KTEST(PtraceAbi, RequestNumbers) {
@@ -33,4 +34,12 @@ KTEST(PtraceAbi, RemoteInfoOffsets) {
     KEXPECT_EQ(offsetof(ker::abi::ptrace::RemoteInfo, target_node), static_cast<size_t>(24));
     KEXPECT_EQ(offsetof(ker::abi::ptrace::RemoteInfo, remote_pid), static_cast<size_t>(32));
     KEXPECT_EQ(offsetof(ker::abi::ptrace::RemoteInfo, target_hostname), static_cast<size_t>(40));
+}
+
+KTEST(PtraceExit, NonParentTracerDoesNotConsumeParentWaitStatus) {
+    KEXPECT_TRUE(ker::mod::debug::ptrace::ptrace_selftest_nonparent_exit_observer_preserves_parent_wait_status());
+}
+
+KTEST(PtraceExit, ParentTracerConsumesWaitStatus) {
+    KEXPECT_TRUE(ker::mod::debug::ptrace::ptrace_selftest_parent_exit_observer_consumes_wait_status());
 }

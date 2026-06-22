@@ -15,6 +15,29 @@ namespace ker::net::proto {
 
 using log = ker::mod::dbg::logger<"tcp">;
 
+namespace {
+constexpr size_t TCP_SYN_OPTIONS_LEN = 12;
+constexpr size_t TCP_ACK_SACK_OPTIONS_LEN = 12;
+
+auto write_sack_option_locked(const TcpCB* cb, uint8_t* options, size_t capacity) -> size_t {
+    if (cb == nullptr || options == nullptr || capacity < TCP_ACK_SACK_OPTIONS_LEN || !cb->sack_permitted || cb->ooo_head == nullptr) {
+        return 0;
+    }
+
+    const auto* seg = cb->ooo_head;
+    uint32_t const LEFT_EDGE = htonl(seg->seq);
+    uint32_t const RIGHT_EDGE = htonl(seg->seq + static_cast<uint32_t>(seg->len));
+
+    options[0] = TCP_OPTION_NOP;
+    options[1] = TCP_OPTION_NOP;
+    options[2] = TCP_OPTION_SACK;
+    options[3] = TCP_OPTION_SACK_1_BLOCK_LEN;
+    std::memcpy(options + 4, &LEFT_EDGE, sizeof(LEFT_EDGE));
+    std::memcpy(options + 8, &RIGHT_EDGE, sizeof(RIGHT_EDGE));
+    return TCP_ACK_SACK_OPTIONS_LEN;
+}
+}  // namespace
+
 bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
     auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
@@ -54,18 +77,22 @@ bool tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) {
     const uint32_t SEQ = cb->snd_nxt - (((flags & TCP_SYN) != 0) ? 1U : 0U);
 
     // SYN options: MSS + WSCALE.
-    std::array<uint8_t, 8> options{};
+    std::array<uint8_t, TCP_SYN_OPTIONS_LEN> options{};
     size_t opts_len = 0;
     if ((flags & TCP_SYN) != 0) {
-        options.at(0) = 2;  // MSS kind
-        options.at(1) = 4;  // MSS length
+        options.at(0) = TCP_OPTION_MSS;
+        options.at(1) = TCP_OPTION_MSS_LEN;
         uint16_t const MSS = htons(cb->rcv_mss);
         std::memcpy(options.data() + 2, &MSS, sizeof(MSS));
-        options.at(4) = 1;               // NOP
-        options.at(5) = 3;               // WSCALE kind
-        options.at(6) = 3;               // WSCALE length
-        options.at(7) = cb->rcv_wscale;  // shift count
-        opts_len = 8;
+        options.at(4) = TCP_OPTION_SACK_PERMITTED;
+        options.at(5) = TCP_OPTION_SACK_PERMITTED_LEN;
+        options.at(6) = TCP_OPTION_NOP;
+        options.at(7) = TCP_OPTION_WSCALE;
+        options.at(8) = TCP_OPTION_WSCALE_LEN;
+        options.at(9) = cb->rcv_wscale;
+        options.at(10) = TCP_OPTION_EOL;
+        options.at(11) = TCP_OPTION_EOL;
+        opts_len = TCP_SYN_OPTIONS_LEN;
     }
 
     size_t const HDR_LEN = sizeof(TcpHeader) + opts_len;
@@ -195,13 +222,20 @@ auto tcp_build_ack(TcpCB* cb, uint32_t* out_local, uint32_t* out_remote) -> Pack
         return nullptr;
     }
 
-    auto* payload = pkt->put(sizeof(TcpHeader));
+    std::array<uint8_t, TCP_ACK_SACK_OPTIONS_LEN> options{};
+    size_t const OPTS_LEN = write_sack_option_locked(cb, options.data(), options.size());
+    size_t const HDR_LEN = sizeof(TcpHeader) + OPTS_LEN;
+    auto* payload = pkt->put(HDR_LEN);
+    if (OPTS_LEN > 0) {
+        std::memcpy(payload + sizeof(TcpHeader), options.data(), OPTS_LEN);
+    }
+
     auto* hdr = reinterpret_cast<TcpHeader*>(payload);
     hdr->src_port = htons(cb->local_port);
     hdr->dst_port = htons(cb->remote_port);
     hdr->seq = htonl(cb->snd_nxt);
     hdr->ack = htonl(cb->rcv_nxt);
-    hdr->data_offset = (sizeof(TcpHeader) / 4) << 4;
+    hdr->data_offset = static_cast<uint8_t>((HDR_LEN / 4) << 4);
     hdr->flags = TCP_ACK;
     hdr->window = cb->ws_enabled ? htons(static_cast<uint16_t>(cb->rcv_wnd >> cb->rcv_wscale))
                                  : htons(static_cast<uint16_t>(cb->rcv_wnd > 65535 ? 65535 : cb->rcv_wnd));

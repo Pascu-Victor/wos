@@ -115,12 +115,33 @@ def test_napi_inline_poll_rearms_on_races_and_budget_exhaustion() -> None:
 
 def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
     source = BACKLOG_CPP.read_text()
+    header = (ROOT / "modules" / "kern" / "src" / "net" / "backlog.hpp").read_text()
+
+    require_tokens(
+        header,
+        [
+            "std::atomic<bool> consumer_active{false}",
+        ],
+        "backlog per-queue consumer guard",
+    )
+    require_tokens(
+        source,
+        [
+            "try_acquire_backlog_consumer",
+            "q.consumer_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)",
+            "release_backlog_consumer",
+            "q.consumer_active.store(false, std::memory_order_release)",
+        ],
+        "backlog consumer guard helpers",
+    )
 
     handler_body = function_body(source, "backlog_handler_loop")
     require_order(
         handler_body,
         [
+            "if (!try_acquire_backlog_consumer(q))",
             "q.head.exchange(nullptr, std::memory_order_acquire)",
+            "release_backlog_consumer(q)",
             "q.handler_active.store(false, std::memory_order_seq_cst)",
             "q.head.load(std::memory_order_acquire) != nullptr",
             "q.handler_active.store(true, std::memory_order_relaxed)",
@@ -129,6 +150,15 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
             "q.handler_active.store(true, std::memory_order_relaxed)",
         ],
         "backlog handler clear/recheck lost-wake guard",
+    )
+    require_order(
+        handler_body,
+        [
+            "q.depth.fetch_sub(packet_list_count(batch), std::memory_order_relaxed)",
+            "process_backlog_batch(batch)",
+            "release_backlog_consumer(q)",
+        ],
+        "backlog handler releases consumer after batch",
     )
 
     enqueue_body = function_body(source, "backlog_enqueue")
@@ -149,10 +179,22 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
         inline_body,
         [
             "ready.load(std::memory_order_acquire)",
+            "if (!try_acquire_backlog_consumer(q))",
             "q.head.exchange(nullptr, std::memory_order_acquire)",
+            "release_backlog_consumer(q)",
             "q.depth.fetch_sub(static_cast<uint64_t>(queue_drained), std::memory_order_relaxed)",
+            "process_backlog_batch(batch)",
         ],
         "backlog inline drain acquire ownership guard",
+    )
+    require_order(
+        inline_body,
+        [
+            "q.depth.fetch_sub(static_cast<uint64_t>(queue_drained), std::memory_order_relaxed)",
+            "process_backlog_batch(batch)",
+            "release_backlog_consumer(q)",
+        ],
+        "backlog inline drain releases consumer after batch",
     )
 
 

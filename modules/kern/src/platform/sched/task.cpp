@@ -518,6 +518,9 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->has_run = false;     // Task hasn't run yet, context.frame contains initial setup
     this->exit_status = 0;     // Initialize exit status
     this->has_exited = false;  // Task hasn't exited yet
+    this->jobctl_stopped.store(false, std::memory_order_relaxed);
+    this->jobctl_stop_pending.store(false, std::memory_order_relaxed);
+    this->jobctl_stop_signal = 0;
     this->exit_notify_ready.store(false, std::memory_order_relaxed);
     task_clear_waited_on(*this);
     this->zombie_resources_reclaiming.store(false, std::memory_order_relaxed);
@@ -534,6 +537,7 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
 
     // Waitpid state
     this->waiting_for_pid = 0;
+    this->wait_options = 0;
     this->wait_status_user_addr = 0;
     this->wait_status_phys_addr = 0;
     this->wait_rusage_user_addr = 0;
@@ -929,10 +933,14 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->yield_switch = false;
     t->set_voluntary_blocked(false);
     t->waiting_for_pid = 0;
+    t->wait_options = 0;
     t->wait_status_user_addr = 0;
     t->wait_status_phys_addr = 0;
     t->wait_rusage_user_addr = 0;
     t->wait_rusage_phys_addr = 0;
+    t->jobctl_stopped.store(false, std::memory_order_relaxed);
+    t->jobctl_stop_pending.store(false, std::memory_order_relaxed);
+    t->jobctl_stop_signal = 0;
     t->vruntime = 0;
     t->vdeadline = 0;
     t->sched_weight = parent->sched_weight;

@@ -219,6 +219,7 @@ std::atomic<uint64_t> page_table_pool_rejects{0};       // NOLINT(cppcoreguideli
 constexpr size_t OWNED_FRAME_TABLE_CAPACITY = 131072;
 constexpr size_t OWNED_FRAME_SHARD_COUNT = 64;
 constexpr size_t OWNED_FRAME_PROBE_LIMIT = 16;
+constexpr bool OWNED_FRAME_TRACKING_ENABLED = false;
 static_assert((OWNED_FRAME_TABLE_CAPACITY & (OWNED_FRAME_TABLE_CAPACITY - 1)) == 0);
 static_assert((OWNED_FRAME_SHARD_COUNT & (OWNED_FRAME_SHARD_COUNT - 1)) == 0);
 static_assert(OWNED_FRAME_TABLE_CAPACITY % OWNED_FRAME_SHARD_COUNT == 0);
@@ -395,6 +396,14 @@ auto owned_frame_is_private_candidate(PageTable* pagemap, vaddr_t vaddr, paddr_t
 }
 
 void owned_frame_insert_private_mapping(PageTable* pagemap, vaddr_t vaddr, uint64_t phys_addr) {
+    if constexpr (!OWNED_FRAME_TRACKING_ENABLED) {
+        (void)pagemap;
+        (void)vaddr;
+        (void)phys_addr;
+        owned_frame_stats.track_skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
     auto& table = owned_frame_table;
     size_t const HASH = owned_frame_hash(phys_addr);
     size_t const SHARD = owned_frame_shard_index(HASH);
@@ -415,15 +424,15 @@ void owned_frame_insert_private_mapping(PageTable* pagemap, vaddr_t vaddr, uint6
 
         uint64_t const PAGE_VADDR = vaddr & ~(paging::PAGE_SIZE - 1);
         if (entry.pagemap == pagemap && entry.vaddr == PAGE_VADDR) {
-            lock.unlock_irqrestore(IRQ_FLAGS);
             owned_frame_stats.track_replaced.fetch_add(1, std::memory_order_relaxed);
+            lock.unlock_irqrestore(IRQ_FLAGS);
             return;
         }
 
         entry = {};
         table.tracked.fetch_sub(1, std::memory_order_relaxed);
-        lock.unlock_irqrestore(IRQ_FLAGS);
         owned_frame_stats.track_conflicts.fetch_add(1, std::memory_order_relaxed);
+        lock.unlock_irqrestore(IRQ_FLAGS);
         return;
     }
 
@@ -432,13 +441,13 @@ void owned_frame_insert_private_mapping(PageTable* pagemap, vaddr_t vaddr, uint6
         first_empty->pagemap = pagemap;
         first_empty->vaddr = vaddr & ~(paging::PAGE_SIZE - 1);
         table.tracked.fetch_add(1, std::memory_order_relaxed);
-        lock.unlock_irqrestore(IRQ_FLAGS);
         owned_frame_stats.track_added.fetch_add(1, std::memory_order_relaxed);
+        lock.unlock_irqrestore(IRQ_FLAGS);
         return;
     }
 
-    lock.unlock_irqrestore(IRQ_FLAGS);
     owned_frame_stats.track_probe_failures.fetch_add(1, std::memory_order_relaxed);
+    lock.unlock_irqrestore(IRQ_FLAGS);
 }
 
 void owned_frame_track_private_mapping(PageTable* pagemap, vaddr_t vaddr, paddr_t paddr, uint64_t flags) {
@@ -474,10 +483,15 @@ void owned_frame_untrack_mapping(PageTable* pagemap, vaddr_t vaddr, paddr_t padd
         return;
     }
 
+    owned_frame_stats.untrack_attempts.fetch_add(1, std::memory_order_relaxed);
+    if constexpr (!OWNED_FRAME_TRACKING_ENABLED) {
+        (void)vaddr;
+        owned_frame_stats.untrack_missed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
     uint64_t const PHYS_ADDR = paddr & ~(paging::PAGE_SIZE - 1);
     uint64_t const PAGE_VADDR = vaddr & ~(paging::PAGE_SIZE - 1);
-    owned_frame_stats.untrack_attempts.fetch_add(1, std::memory_order_relaxed);
-
     auto& table = owned_frame_table;
     size_t const HASH = owned_frame_hash(PHYS_ADDR);
     size_t const SHARD = owned_frame_shard_index(HASH);
@@ -494,20 +508,20 @@ void owned_frame_untrack_mapping(PageTable* pagemap, vaddr_t vaddr, paddr_t padd
         if (entry.pagemap == pagemap && entry.vaddr == PAGE_VADDR) {
             entry = {};
             table.tracked.fetch_sub(1, std::memory_order_relaxed);
-            lock.unlock_irqrestore(IRQ_FLAGS);
             owned_frame_stats.untrack_removed.fetch_add(1, std::memory_order_relaxed);
+            lock.unlock_irqrestore(IRQ_FLAGS);
             return;
         }
 
         entry = {};
         table.tracked.fetch_sub(1, std::memory_order_relaxed);
-        lock.unlock_irqrestore(IRQ_FLAGS);
         owned_frame_stats.track_conflicts.fetch_add(1, std::memory_order_relaxed);
+        lock.unlock_irqrestore(IRQ_FLAGS);
         return;
     }
 
-    lock.unlock_irqrestore(IRQ_FLAGS);
     owned_frame_stats.untrack_missed.fetch_add(1, std::memory_order_relaxed);
+    lock.unlock_irqrestore(IRQ_FLAGS);
 }
 
 void owned_frame_untrack_leaf(PageTable* pagemap, vaddr_t vaddr, const PageTableEntry& entry) {
@@ -538,6 +552,10 @@ void owned_frame_purge_pagemap(PageTable* pagemap) {
     }
 
     owned_frame_stats.purge_calls.fetch_add(1, std::memory_order_relaxed);
+    if constexpr (!OWNED_FRAME_TRACKING_ENABLED) {
+        return;
+    }
+
     uint64_t removed = 0;
     auto& table = owned_frame_table;
     for (size_t shard = 0; shard < OWNED_FRAME_SHARD_COUNT; ++shard) {
@@ -1173,7 +1191,7 @@ void get_page_table_pool_stats_snapshot(PageTablePoolStatsSnapshot& out) {
 
 void get_owned_frame_stats_snapshot(OwnedFrameStatsSnapshot& out) {
     out = {
-        .capacity = OWNED_FRAME_TABLE_CAPACITY,
+        .capacity = OWNED_FRAME_TRACKING_ENABLED ? OWNED_FRAME_TABLE_CAPACITY : 0,
         .entries = owned_frame_table.tracked.load(std::memory_order_relaxed),
         .track_attempts = owned_frame_stats.track_attempts.load(std::memory_order_relaxed),
         .track_added = owned_frame_stats.track_added.load(std::memory_order_relaxed),
@@ -1852,9 +1870,6 @@ void map_same_page_range(PageTable* page_table, const vaddr_t VADDR, const paddr
         map_page_batched(&batch, CURRENT_VADDR, PADDR, FLAGS);
     }
     flush_page_map_batch(&batch);
-    if (PAGE_COUNT > 1) {
-        owned_frame_untrack_mapping(page_table, VADDR + (LAST_PAGE * paging::PAGE_SIZE), PADDR);
-    }
 }
 
 void reserve_page_range(PageTable* page_table, const vaddr_t VADDR, const uint64_t PAGE_COUNT) {

@@ -1,5 +1,6 @@
 #include "signal.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 
@@ -31,6 +32,12 @@ constexpr int WOS_SIGCHLD = 17;
 constexpr int WOS_SIGURG = 23;
 constexpr int WOS_SIGWINCH = 28;
 constexpr int WOS_SIGCONT = 18;
+constexpr int WOS_SIGTSTP = 20;
+constexpr int WOS_SIGTTIN = 21;
+constexpr int WOS_SIGTTOU = 22;
+constexpr uint64_t WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
+constexpr int WOS_WSTOPPED = 2;
+constexpr int STOP_STATUS_LOW = 0x7f;
 
 // Stack offsets for the pushed GP registers in syscall.asm (pushq macro).
 // After pushq, RSP points to r15. Offsets from RSP:
@@ -257,6 +264,135 @@ void sync_task_signal_mask_cache(sched::task::Task* task) {
     (void)copy_to_task_user(*task, TCB + WOS_TCB_SIGNAL_MASK_VALID_OFFSET, &valid, sizeof(valid));
 }
 
+namespace {
+
+auto is_job_control_stop_signal(int signo) -> bool {
+    return signo == WOS_SIGSTOP || signo == WOS_SIGTSTP || signo == WOS_SIGTTIN || signo == WOS_SIGTTOU;
+}
+
+auto job_control_stop_status(int signo) -> int32_t { return static_cast<int32_t>((static_cast<uint32_t>(signo) << 8U) | STOP_STATUS_LOW); }
+
+auto waitpid_waiter_matches_stopped_child(Task& waiter, Task& stopped) -> bool {
+    return waiter.waiting_for_pid == stopped.pid || waiter.waiting_for_pid == WAIT_ANY_CHILD;
+}
+
+auto waitpid_waiter_context_can_be_completed(Task& waiter) -> bool {
+    return !waiter.deferred_task_switch && !waiter.waitpid_publish_pending.load(std::memory_order_acquire);
+}
+
+void clear_waitpid_wait_state(Task& waiter) {
+    waiter.waitpid_publish_pending.store(false, std::memory_order_release);
+    ker::mod::sched::task::task_clear_waitpid_block_state(waiter);
+}
+
+auto complete_waitpid_stop_waiter(Task& waiter, Task& stopped, int signo) -> bool {
+    if (!waitpid_waiter_matches_stopped_child(waiter, stopped)) {
+        return false;
+    }
+    if ((waiter.wait_options & WOS_WSTOPPED) == 0 || !waitpid_waiter_context_can_be_completed(waiter)) {
+        return false;
+    }
+
+    if (waiter.wait_status_user_addr != 0 && waiter.pagemap != nullptr) {
+        uint64_t const PHYS = ker::mod::mm::virt::translate(waiter.pagemap, waiter.wait_status_user_addr);
+        if (PHYS != 0 && PHYS != ker::mod::mm::virt::PADDR_INVALID) {
+            auto* status = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
+            *status = job_control_stop_status(signo);
+        }
+    }
+
+    uint64_t const WAITER_LOCK_FLAGS = stopped.exit_waiters_lock.lock_irqsave();
+    (void)stopped.awaitee_on_exit.remove(waiter.pid);
+    stopped.exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
+
+    waiter.context.regs.rax = stopped.pid;
+    clear_waitpid_wait_state(waiter);
+    waiter.deferred_task_switch = false;
+    waiter.set_voluntary_blocked(false);
+    waiter.wants_block = false;
+    stopped.jobctl_stop_pending.store(false, std::memory_order_release);
+    ker::mod::sched::reschedule_task_for_cpu(waiter.cpu, &waiter);
+    return true;
+}
+
+void notify_parent_of_job_control_stop(Task& stopped, int signo) {
+    if (stopped.parent_pid == 0) {
+        return;
+    }
+
+    auto* parent = ker::mod::sched::find_task_by_pid_safe(stopped.parent_pid);
+    if (parent == nullptr) {
+        return;
+    }
+
+    parent->sig_pending |= (1ULL << (WOS_SIGCHLD - 1));
+    bool const COMPLETED_WAIT = complete_waitpid_stop_waiter(*parent, stopped, signo);
+    if (!COMPLETED_WAIT) {
+        ker::mod::sched::wake_task_for_signal(parent);
+    }
+    parent->release();
+}
+
+void park_current_job_control_stop(Task& task) {
+    while (task.jobctl_stopped.load(std::memory_order_acquire) && !task.has_exited) {
+        sched::preemptible_syscall_park("job_stop", sched::task::WaitChannelKind::GENERIC);
+    }
+}
+
+auto apply_job_control_stop(Task* task, int signo, bool park_current) -> bool {
+    if (task == nullptr) {
+        return true;
+    }
+
+    task->jobctl_stop_signal = static_cast<uint32_t>(signo);
+    task->jobctl_stopped.store(true, std::memory_order_release);
+    task->jobctl_stop_pending.store(true, std::memory_order_release);
+    task->set_wait_channel("job_stop", sched::task::WaitChannelKind::GENERIC);
+    task->set_voluntary_blocked(true);
+    notify_parent_of_job_control_stop(*task, signo);
+
+    if (park_current && sched::get_current_task() == task) {
+        park_current_job_control_stop(*task);
+    } else if (sched::get_current_task() == task) {
+        task->deferred_task_switch = true;
+    } else {
+        static_cast<void>(sched::debug_stop_task(task));
+    }
+    return true;
+}
+
+auto handle_non_user_signal_action(Task* task, int signo, unsigned idx, const Task::SigHandler& handler, bool park_current) -> bool {
+    if (handler.handler == WOS_SIG_DFL) {
+        task->sig_pending &= ~(1ULL << idx);
+        if (signo == WOS_SIGCHLD || signo == WOS_SIGURG || signo == WOS_SIGWINCH || signo == WOS_SIGCONT) {
+            if (task->sigsuspend_active) {
+                task->sig_mask = task->signal_frame_saved_mask();
+                sync_task_signal_mask_cache(task);
+            }
+            return true;
+        }
+        if (is_job_control_stop_signal(signo)) {
+            return apply_job_control_stop(task, signo, park_current);
+        }
+
+        ker::syscall::process::wos_proc_exit_signal(signo);
+        __builtin_unreachable();
+    }
+
+    if (handler.handler == WOS_SIG_IGN) {
+        task->sig_pending &= ~(1ULL << idx);
+        if (task->sigsuspend_active) {
+            task->sig_mask = task->signal_frame_saved_mask();
+            sync_task_signal_mask_cache(task);
+        }
+        return true;
+    }
+
+    return false;
+}
+
+}  // namespace
+
 // Called from syscall.asm after the deferred task switch check, before returning
 // to userspace. Handles both sigreturn (context restore) and signal delivery.
 //
@@ -334,14 +470,8 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
             return 0;  // Ignore
         }
         // Uncatchable stop signal
-        if (SIGNO == WOS_SIGSTOP) {
-            task->set_voluntary_blocked(true);
-            return 0;
-        }
-        // Job control stop signals: default action is to stop the process
-        if (SIGNO == 20 || SIGNO == 21 || SIGNO == 22) {  // SIGTSTP, SIGTTIN, SIGTTOU
-            // Block the task so the scheduler won't run it until SIGCONT
-            task->set_voluntary_blocked(true);
+        if (is_job_control_stop_signal(SIGNO)) {
+            static_cast<void>(apply_job_control_stop(task, SIGNO, true));
             return 0;
         }
         // Default terminate semantics for normal fatal signals.
@@ -459,12 +589,8 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
             }
             return;
         }
-        if (SIGNO == WOS_SIGSTOP) {
-            task->set_voluntary_blocked(true);
-            return;
-        }
-        if (SIGNO == 20 || SIGNO == 21 || SIGNO == 22) {
-            task->set_voluntary_blocked(true);
+        if (is_job_control_stop_signal(SIGNO)) {
+            static_cast<void>(apply_job_control_stop(task, SIGNO, false));
             return;
         }
         if (SIGNO == WOS_SIGHUP || SIGNO == WOS_SIGINT || SIGNO == WOS_SIGQUIT || SIGNO == WOS_SIGTERM || SIGNO == WOS_SIGKILL ||
@@ -549,7 +675,7 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
     auto const IDX = static_cast<unsigned>(SIGNO - 1);
     auto& handler = task->sig_handlers.at(IDX);
 
-    if (!is_user_signal_handler(handler)) {
+    if (handle_non_user_signal_action(task, SIGNO, IDX, handler, false)) {
         return;
     }
     if (!user_signal_target_valid(handler)) {
@@ -641,8 +767,8 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
             }
             return;
         }
-        if (SIGNO == WOS_SIGSTOP || SIGNO == 20 || SIGNO == 21 || SIGNO == 22) {
-            task->set_voluntary_blocked(true);
+        if (is_job_control_stop_signal(SIGNO)) {
+            static_cast<void>(apply_job_control_stop(task, SIGNO, false));
             return;
         }
 

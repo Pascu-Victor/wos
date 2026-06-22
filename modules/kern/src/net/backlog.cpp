@@ -91,6 +91,13 @@ void process_backlog_batch(PacketBuffer* batch) {
     }
 }
 
+auto try_acquire_backlog_consumer(BacklogQueue& q) -> bool {
+    bool expected = false;
+    return q.consumer_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+void release_backlog_consumer(BacklogQueue& q) { q.consumer_active.store(false, std::memory_order_release); }
+
 // Handler thread entry point (one per CPU). DAEMON type, pinned.
 void backlog_handler_loop(uint64_t cpu_idx) {
     for (;;) {
@@ -103,10 +110,17 @@ void backlog_handler_loop(uint64_t cpu_idx) {
         }
         auto& q = queues[cpu_idx];
 
+        if (!try_acquire_backlog_consumer(q)) {
+            ker::mod::sched::kern_yield();
+            continue;
+        }
+
         // Atomic drain: grab entire list in one shot (MPSC consumer).
         PacketBuffer* batch = q.head.exchange(nullptr, std::memory_order_acquire);
 
         if (batch == nullptr) {
+            release_backlog_consumer(q);
+
             // Store false and re-check for race between exchange and store.
             q.handler_active.store(false, std::memory_order_seq_cst);
 
@@ -122,6 +136,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
 
         q.depth.fetch_sub(packet_list_count(batch), std::memory_order_relaxed);
         process_backlog_batch(batch);
+        release_backlog_consumer(q);
     }
 }
 
@@ -237,8 +252,13 @@ auto backlog_drain_all_pending_inline() -> int {
     int drained = 0;
     for (uint64_t cpu_idx = 0; cpu_idx < num_cpus; ++cpu_idx) {
         auto& q = queues[cpu_idx];
+        if (!try_acquire_backlog_consumer(q)) {
+            continue;
+        }
+
         PacketBuffer* batch = q.head.exchange(nullptr, std::memory_order_acquire);
         if (batch == nullptr) {
+            release_backlog_consumer(q);
             continue;
         }
 
@@ -252,6 +272,7 @@ auto backlog_drain_all_pending_inline() -> int {
 
         q.depth.fetch_sub(static_cast<uint64_t>(queue_drained), std::memory_order_relaxed);
         process_backlog_batch(batch);
+        release_backlog_consumer(q);
     }
 
     return drained;

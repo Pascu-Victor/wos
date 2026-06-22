@@ -143,14 +143,14 @@ struct PtyPair {
     // This prevents the embedded waiter SmallVecs from being freed while a
     // devfs File wrapper can still reach the pair during poll/retry paths.
     std::atomic<uint32_t> refcount{1};
-    int index;                // PTY number (for /dev/pts/N)
-    bool allocated;           // In use
-    bool slave_locked;        // TIOCSPTLCK lock (must be unlocked before slave can be opened)
-    bool freeing = false;     // Set under lock by first closer to prevent double-free
-    int slave_opened;         // Slave open refcount (0 = closed)
-    int master_opened;        // Master open refcount (0 = closed)
-    Winsize winsize;          // Terminal dimensions
-    int foreground_pgrp = 0;  // Foreground process group (TIOCGPGRP/TIOCSPGRP)
+    int index;                     // PTY number (for /dev/pts/N)
+    bool allocated;                // In use
+    bool slave_locked;             // TIOCSPTLCK lock (must be unlocked before slave can be opened)
+    bool freeing = false;          // Set under lock by first closer to prevent double-free
+    int slave_opened;              // Slave open refcount (0 = closed)
+    int master_opened;             // Master open refcount (0 = closed)
+    Winsize winsize;               // Terminal dimensions
+    uint64_t foreground_pgrp = 0;  // Foreground process group (TIOCGPGRP/TIOCSPGRP)
 
     KTermios termios;         // Terminal attributes (line discipline settings)
     mod::sys::Spinlock lock;  // Protects termios, canonical state, and ring buffers

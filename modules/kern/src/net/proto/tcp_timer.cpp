@@ -427,7 +427,7 @@ void tcp_timer_tick(uint64_t now_ms) {
                     }
 
                     rcb->rto_ms = rcb->rto_ms * 2;
-                    rcb->rto_ms = std::min<uint64_t>(rcb->rto_ms, 60000);
+                    rcb->rto_ms = std::min<uint64_t>(rcb->rto_ms, TCP_RTO_MAX_MS);
                     rcb->retransmit_deadline = tcp_deadline_after_ms(now_ms, rcb->rto_ms);
                 }
             }

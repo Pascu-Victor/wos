@@ -155,4 +155,12 @@ void init_descriptors(uint64_t* stack_pointer, uint64_t cpu_id) {
     load_gdt(reinterpret_cast<uint64_t>(&per_cpu_gdt.at(cpu_id).ptr));
     load_tss(GDT_ENTRY_TSS * 8);
 }
+
+void set_rsp0(const uint64_t* stack_pointer, uint64_t cpu_id) {
+    if (cpu_id >= MAX_CPUS || stack_pointer == nullptr) {
+        return;
+    }
+    per_cpu_gdt.at(cpu_id).tss_data.rsp[0] =
+        reinterpret_cast<uint64_t>(stack_pointer);  // NOLINT(cppcoreguidelines-pro-bounds-constant-array-index)
+}
 }  // namespace ker::mod::desc::gdt

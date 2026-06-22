@@ -7,6 +7,7 @@
         "busybox_install": "ktest-data/busybox-install",
         "dropbear_build": "ktest-data/dropbear-build",
         "make_build": "ktest-data/make-build",
+        "bash_build": "ktest-data/bash-build",
         "cmake_build": "ktest-data/cmake-wos-build",
         "python_build": "ktest-data/python-build"
     },

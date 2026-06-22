@@ -1502,8 +1502,7 @@ TESTD_RUN(test_vfs_readdir) {
 }
 TESTD_RUN_END(test_vfs_readdir)
 
-TESTD_RUN(test_vfs_readdir_unlink_progress) {
-    const char* dir_path = "/tmp/testd_readdir_unlink";
+bool run_readdir_unlink_progress_case(const char* dir_path, const char* fail_name) {
     for (int i = 0; i < 8; ++i) {
         std::array<char, 64> path{};
         (void)testd_format_to_array(path, "%s/f%d", dir_path, i);
@@ -1511,8 +1510,8 @@ TESTD_RUN(test_vfs_readdir_unlink_progress) {
     }
     rmdir(dir_path);
     if (mkdir(dir_path, MODE_0755) != 0) {
-        fail("vfs_readdir_unlink_mkdir", "mkdir failed");
-        return;
+        fail(fail_name, "mkdir failed");
+        return false;
     }
 
     for (int i = 0; i < 8; ++i) {
@@ -1520,40 +1519,57 @@ TESTD_RUN(test_vfs_readdir_unlink_progress) {
         (void)testd_format_to_array(path, "%s/f%d", dir_path, i);
         int fd = open(path.data(), O_CREAT | O_WRONLY | O_TRUNC, MODE_0644);
         if (fd < 0) {
-            fail("vfs_readdir_unlink_seed", "open seed failed");
-            return;
+            fail(fail_name, "open seed failed");
+            return false;
         }
         close(fd);
     }
 
     DIR* dir = opendir(dir_path);
     if (dir == nullptr) {
-        fail("vfs_readdir_unlink_open", "opendir failed");
-        return;
+        fail(fail_name, "opendir failed");
+        return false;
     }
 
     struct dirent* ent = nullptr;
     while ((ent = readdir(dir)) != nullptr) {
-        if (std::strcmp(ent->d_name, ".") == 0 || std::strcmp(ent->d_name, "..") == 0) {
+        bool const IS_DOT = ent->d_name[0] == '.' && ent->d_name[1] == '\0';
+        bool const IS_DOTDOT = ent->d_name[0] == '.' && ent->d_name[1] == '.' && ent->d_name[2] == '\0';
+        if (IS_DOT || IS_DOTDOT) {
             continue;
         }
         std::array<char, 64> path{};
         (void)testd_format_to_array(path, "%s/%s", dir_path, ent->d_name);
         if (unlink(path.data()) != 0) {
             closedir(dir);
-            fail("vfs_readdir_unlink_remove", "unlink during readdir failed");
-            return;
+            fail(fail_name, "unlink during readdir failed");
+            return false;
         }
     }
     closedir(dir);
 
     if (rmdir(dir_path) != 0) {
-        fail("vfs_readdir_unlink_rmdir", "directory not empty after streamed unlink");
+        fail(fail_name, "directory not empty after streamed unlink");
+        return false;
+    }
+    return true;
+}
+
+TESTD_RUN(test_vfs_readdir_unlink_progress) {
+    if (!run_readdir_unlink_progress_case("/tmp/testd_readdir_unlink", "vfs_readdir_unlink_progress")) {
         return;
     }
     TESTD_PASS("vfs_readdir_unlink_progress");
 }
 TESTD_RUN_END(test_vfs_readdir_unlink_progress)
+
+TESTD_RUN(test_vfs_readdir_unlink_progress_rootfs) {
+    if (!run_readdir_unlink_progress_case("/testd_readdir_unlink_rootfs", "vfs_readdir_unlink_progress_rootfs")) {
+        return;
+    }
+    TESTD_PASS("vfs_readdir_unlink_progress_rootfs");
+}
+TESTD_RUN_END(test_vfs_readdir_unlink_progress_rootfs)
 
 TESTD_RUN(test_vfs_directory_requirements) {
     const char* file = "/tmp/testd_not_dir.txt";
@@ -4115,6 +4131,7 @@ TESTD_RUN_END(test_journal_device_userspace_record)
     X(test_vfs_dup2)                              \
     X(test_vfs_readdir)                           \
     X(test_vfs_readdir_unlink_progress)           \
+    X(test_vfs_readdir_unlink_progress_rootfs)    \
     X(test_vfs_directory_requirements)            \
     X(test_vfs_rename_file_parent_enotdir)        \
     X(test_vfs_access)                            \

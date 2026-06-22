@@ -60,8 +60,36 @@ auto ptrace_stop_status(const ker::mod::sched::task::Task& task) -> int32_t {
     return static_cast<int32_t>((signal << 8U) | STOP_STATUS_LOW);
 }
 
+auto job_stop_status(const ker::mod::sched::task::Task& task) -> int32_t {
+    uint32_t signal = task.jobctl_stop_signal != 0 ? task.jobctl_stop_signal : 19;
+    return static_cast<int32_t>((signal << 8U) | STOP_STATUS_LOW);
+}
+
 auto is_ptrace_wait_target(const ker::mod::sched::task::Task& waiter, const ker::mod::sched::task::Task& target) -> bool {
     return target.ptrace_traced && target.ptrace_tracer_pid == waiter.pid;
+}
+
+auto consume_job_stop_if_waitable(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* target, int32_t* status,
+                                  int32_t options) -> bool {
+    if (waiter == nullptr || target == nullptr || (options & WOS_WSTOPPED) == 0) {
+        return false;
+    }
+    if (target->parent_pid != waiter->pid || target->is_thread || target->has_exited ||
+        !target->jobctl_stopped.load(std::memory_order_acquire) || !target->jobctl_stop_pending.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (status != nullptr) {
+        *status = job_stop_status(*target);
+    }
+    target->jobctl_stop_pending.store(false, std::memory_order_release);
+    waiter->waiting_for_pid = 0;
+    waiter->wait_options = 0;
+    waiter->wait_status_user_addr = 0;
+    waiter->wait_status_phys_addr = 0;
+    waiter->wait_rusage_user_addr = 0;
+    waiter->wait_rusage_phys_addr = 0;
+    clear_wait_resume_debug(waiter);
+    return true;
 }
 
 auto consume_ptrace_stop_if_waitable(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* target, int32_t* status,
@@ -80,6 +108,7 @@ auto consume_ptrace_stop_if_waitable(ker::mod::sched::task::Task* waiter, ker::m
     }
     target->ptrace_stop_pending = false;
     waiter->waiting_for_pid = 0;
+    waiter->wait_options = 0;
     waiter->wait_status_user_addr = 0;
     waiter->wait_status_phys_addr = 0;
     waiter->wait_rusage_user_addr = 0;
@@ -98,6 +127,22 @@ auto claim_exited_child(ker::mod::sched::task::Task* parent) -> ker::mod::sched:
     for (uint32_t i = 0; i < COUNT; i++) {
         auto* child = ker::mod::sched::get_active_task_at(i);
         if (is_unwaited_child(parent, child) && is_waitable_exit(child) && sched_task::task_try_mark_waited_on(*child)) {
+            return child;
+        }
+    }
+
+    return nullptr;
+}
+
+auto consume_stopped_child(ker::mod::sched::task::Task* parent, int32_t* status, int32_t options) -> ker::mod::sched::task::Task* {
+    if ((options & WOS_WSTOPPED) == 0) {
+        return nullptr;
+    }
+
+    uint32_t const COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < COUNT; i++) {
+        auto* child = ker::mod::sched::get_active_task_at(i);
+        if (consume_job_stop_if_waitable(parent, child, status, options)) {
             return child;
         }
     }
@@ -178,12 +223,14 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     if (pid <= 0) {
         current_task->waitpid_publish_pending.store(true, std::memory_order_release);
         current_task->waiting_for_pid = WAIT_ANY_CHILD;
+        current_task->wait_options = options;
 
         // Check for already-exited children
         auto* exited = claim_exited_child(current_task);
         if (exited != nullptr) {
             clear_waitpid_publish_pending(current_task);
             current_task->waiting_for_pid = 0;
+            current_task->wait_options = 0;
             sched_task::task_accumulate_waited_child_times(*current_task, *exited);
             if (status != nullptr) {
                 *status = exited->exit_status;
@@ -200,12 +247,21 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             return exited->pid;
         }
 
+        auto* stopped = consume_stopped_child(current_task, status, options);
+        if (stopped != nullptr) {
+            clear_waitpid_publish_pending(current_task);
+            current_task->waiting_for_pid = 0;
+            current_task->wait_options = 0;
+            return stopped->pid;
+        }
+
         // No direct child remains waitable.  POSIX waitpid(-1/0) must fail
         // with ECHILD here; otherwise shells can block forever after their
         // last pipeline child has already exited and been consumed.
         if (!has_unwaited_child(current_task)) {
             clear_waitpid_publish_pending(current_task);
             current_task->waiting_for_pid = 0;
+            current_task->wait_options = 0;
             return static_cast<uint64_t>(-ECHILD);
         }
 
@@ -213,6 +269,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         if ((options & WOS_WNOHANG) != 0) {
             clear_waitpid_publish_pending(current_task);
             current_task->waiting_for_pid = 0;
+            current_task->wait_options = 0;
             return 0;
         }
 
@@ -255,7 +312,16 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             current_task->wait_rusage_phys_addr = 0;
             clear_wait_resume_debug(current_task);
             current_task->waiting_for_pid = 0;
+            current_task->wait_options = 0;
             return exited->pid;
+        }
+        stopped = consume_stopped_child(current_task, status, options);
+        if (stopped != nullptr) {
+            clear_waitpid_publish_pending(current_task);
+            current_task->deferred_task_switch = false;
+            current_task->waiting_for_pid = 0;
+            current_task->wait_options = 0;
+            return stopped->pid;
         }
         return 0;
     }
@@ -308,6 +374,9 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     if (consume_ptrace_stop_if_waitable(current_task, target_task, status, options)) {
         return pid;
     }
+    if (consume_job_stop_if_waitable(current_task, target_task, status, options)) {
+        return pid;
+    }
 
     if ((options & WOS_WNOHANG) != 0) {
         return 0;
@@ -317,6 +386,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     // waiter list. Once the child can see our PID, it may wake us immediately.
     current_task->waitpid_publish_pending.store(true, std::memory_order_release);
     current_task->waiting_for_pid = pid;
+    current_task->wait_options = options;
     if (status != nullptr) {
         current_task->wait_status_user_addr = reinterpret_cast<uint64_t>(status);
         uint64_t const PHYS = ker::mod::mm::virt::translate(current_task->pagemap, reinterpret_cast<uint64_t>(status));
@@ -343,6 +413,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
                 clear_waitpid_publish_pending(current_task);
                 current_task->deferred_task_switch = false;
                 current_task->waiting_for_pid = 0;
+                current_task->wait_options = 0;
                 current_task->wait_status_user_addr = 0;
                 current_task->wait_status_phys_addr = 0;
                 current_task->wait_rusage_user_addr = 0;
@@ -361,11 +432,19 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
                 fill_rusage(PHYS, target_task);
             }
             current_task->waiting_for_pid = 0;
+            current_task->wait_options = 0;
             current_task->wait_status_user_addr = 0;
             current_task->wait_status_phys_addr = 0;
             current_task->wait_rusage_user_addr = 0;
             current_task->wait_rusage_phys_addr = 0;
             clear_wait_resume_debug(current_task);
+            return pid;
+        }
+        if (consume_job_stop_if_waitable(current_task, target_task, status, options)) {
+            clear_waitpid_publish_pending(current_task);
+            current_task->deferred_task_switch = false;
+            current_task->waiting_for_pid = 0;
+            current_task->wait_options = 0;
             return pid;
         }
         return 0;
@@ -379,6 +458,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         clear_waitpid_publish_pending(current_task);
         if (!sched_task::task_try_mark_waited_on(*target_task)) {
             current_task->waiting_for_pid = 0;
+            current_task->wait_options = 0;
             current_task->wait_status_user_addr = 0;
             current_task->wait_status_phys_addr = 0;
             current_task->wait_rusage_user_addr = 0;
@@ -395,11 +475,19 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             fill_rusage(PHYS, target_task);
         }
         current_task->waiting_for_pid = 0;
+        current_task->wait_options = 0;
         current_task->wait_status_user_addr = 0;
         current_task->wait_status_phys_addr = 0;
         current_task->wait_rusage_user_addr = 0;
         current_task->wait_rusage_phys_addr = 0;
         clear_wait_resume_debug(current_task);
+        return pid;
+    }
+    if (consume_job_stop_if_waitable(current_task, target_task, status, options)) {
+        target_task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
+        clear_waitpid_publish_pending(current_task);
+        current_task->waiting_for_pid = 0;
+        current_task->wait_options = 0;
         return pid;
     }
 
@@ -408,6 +496,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         target_task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
         clear_waitpid_publish_pending(current_task);
         current_task->waiting_for_pid = 0;
+        current_task->wait_options = 0;
         current_task->wait_status_user_addr = 0;
         current_task->wait_status_phys_addr = 0;
         current_task->wait_rusage_user_addr = 0;

@@ -32,6 +32,19 @@ constexpr uint8_t TCP_PSH = 0x08;
 constexpr uint8_t TCP_ACK = 0x10;
 constexpr uint8_t TCP_URG = 0x20;
 
+constexpr uint8_t TCP_OPTION_EOL = 0;
+constexpr uint8_t TCP_OPTION_NOP = 1;
+constexpr uint8_t TCP_OPTION_MSS = 2;
+constexpr uint8_t TCP_OPTION_WSCALE = 3;
+constexpr uint8_t TCP_OPTION_SACK_PERMITTED = 4;
+constexpr uint8_t TCP_OPTION_SACK = 5;
+constexpr uint8_t TCP_OPTION_MSS_LEN = 4;
+constexpr uint8_t TCP_OPTION_WSCALE_LEN = 3;
+constexpr uint8_t TCP_OPTION_SACK_PERMITTED_LEN = 2;
+constexpr uint8_t TCP_OPTION_SACK_1_BLOCK_LEN = 10;
+constexpr size_t TCP_OPTION_LEN_OFFSET = 1;
+constexpr size_t TCP_OPTION_DATA_OFFSET = 2;
+
 enum class TcpState : uint8_t {
     CLOSED,
     LISTEN,
@@ -66,6 +79,9 @@ struct TcpOutOfOrderSegment {
 constexpr uint8_t TCP_KEEPALIVE_PROBES_DEFAULT = 9;
 constexpr uint64_t TCP_KEEPALIVE_IDLE_MS_DEFAULT = 7200000;  // 2 hours
 constexpr uint64_t TCP_KEEPALIVE_INTVL_MS_DEFAULT = 75000;   // 75 seconds
+constexpr uint64_t TCP_RTO_MIN_MS = 200;
+constexpr uint64_t TCP_RTO_MAX_MS = 60000;
+constexpr uint64_t TCP_RTO_INITIAL_MS = 1000;
 // Per-send syscall burst before returning a partial count; not an in-flight cap.
 constexpr uint32_t TCP_SEND_BURST_BYTES = 1024U * 1024U;
 
@@ -96,9 +112,10 @@ struct TcpCB {
     uint8_t rcv_wscale = 0;   // shift we advertise in SYN/SYN-ACK
     uint8_t snd_wscale = 0;   // shift peer advertised (parsed from SYN/SYN-ACK)
     bool ws_enabled = false;  // true once both sides have negotiated scaling
+    bool sack_permitted = false;
 
     // RTT estimation.
-    uint64_t rto_ms = 200;   // retransmit timeout (ms) - starts at 200 ms floor
+    uint64_t rto_ms = TCP_RTO_INITIAL_MS;
     uint64_t srtt_ms = 0;    // smoothed RTT
     uint64_t rttvar_ms = 0;  // RTT variance
 
@@ -161,6 +178,7 @@ inline auto tcp_hash_listener(uint16_t lp) -> uint32_t { return static_cast<uint
 
 constexpr size_t MAX_TCP_BINDINGS = 128;
 constexpr size_t TCP_LISTENER_SNAPSHOT_MAX = 64;
+constexpr size_t TCP_CONN_SNAPSHOT_MAX = 128;
 
 struct TcpListenerSnapshot {
     uint32_t local_ip = 0;
@@ -175,6 +193,25 @@ struct TcpListenerSnapshot {
     uint32_t refcount = 0;
 };
 
+struct TcpConnSnapshot {
+    uint32_t local_ip = 0;
+    uint32_t remote_ip = 0;
+    uint16_t local_port = 0;
+    uint16_t remote_port = 0;
+    uint8_t state = 0;
+    uint64_t owner_pid = 0;
+    size_t rcvbuf_used = 0;
+    size_t rcvbuf_capacity = 0;
+    uint32_t rcv_nxt = 0;
+    uint32_t rcv_wnd = 0;
+    uint32_t snd_una = 0;
+    uint32_t snd_nxt = 0;
+    uint32_t snd_wnd = 0;
+    size_t ooo_bytes = 0;
+    uint32_t refcount = 0;
+    bool sack_permitted = false;
+};
+
 void tcp_rx(NetDevice* dev, PacketBuffer* pkt, IPv4Address src_ip, IPv4Address dst_ip);
 void tcp_timer_tick(uint64_t now_ms);
 [[noreturn]] void tcp_timer_thread();
@@ -186,6 +223,7 @@ void tcp_timer_arm(TcpCB* cb);
 void tcp_timer_disarm(TcpCB* cb);
 auto get_tcp_proto_ops() -> SocketProtoOps*;
 
+auto tcp_generate_iss(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> uint32_t;
 auto tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) -> bool;
 void tcp_send_rst(IPv4Address src_ip, IPv4Address dst_ip, uint16_t src_port, uint16_t dst_port, uint32_t seq, uint32_t ack, uint8_t flags);
 auto tcp_send_ack(TcpCB* cb) -> bool;
@@ -208,6 +246,7 @@ void tcp_cb_release(TcpCB* cb);
 auto tcp_find_cb(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> TcpCB*;
 auto tcp_find_listener(uint32_t local_ip, uint16_t local_port) -> TcpCB*;
 auto tcp_listener_snapshot(TcpListenerSnapshot* out, size_t max) -> size_t;
+auto tcp_conn_snapshot(TcpConnSnapshot* out, size_t max) -> size_t;
 
 inline auto tcp_seq_before(uint32_t a, uint32_t b) -> bool { return static_cast<int32_t>(a - b) < 0; }
 inline auto tcp_seq_after(uint32_t a, uint32_t b) -> bool { return tcp_seq_before(b, a); }

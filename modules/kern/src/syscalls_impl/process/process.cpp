@@ -408,7 +408,11 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->is_elf_buffer_shared = false;
     child->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
     child->waiting_for_pid = 0;
+    child->wait_options = 0;
     child->wait_status_phys_addr = 0;
+    child->jobctl_stopped.store(false, std::memory_order_relaxed);
+    child->jobctl_stop_pending.store(false, std::memory_order_relaxed);
+    child->jobctl_stop_signal = 0;
 
     // EEVDF scheduling fields - start fresh
     child->vruntime = 0;
@@ -853,6 +857,21 @@ auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr) -> uin
         }
     }
 
+    return 0;
+}
+
+auto wos_proc_sigpending(uint64_t set_ptr) -> uint64_t {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+    if (set_ptr == 0) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+
+    auto* set = reinterpret_cast<uint64_t*>(set_ptr);
+    std::memset(set, 0, 1024 / 8);
+    set[0] = task->sig_pending & task->sig_mask;
     return 0;
 }
 
@@ -1362,6 +1381,9 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         case abi::process::procmgmt_ops::SIGPROCMASK: {
             return wos_proc_sigprocmask(static_cast<int>(a2), a3, a4);
         }
+        case abi::process::procmgmt_ops::SIGPENDING: {
+            return wos_proc_sigpending(a2);
+        }
         case abi::process::procmgmt_ops::SIGSUSPEND: {
             return wos_proc_sigsuspend(a2, gpr);
         }
@@ -1408,6 +1430,38 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         case abi::process::procmgmt_ops::GETEGID: {
             auto* task = ker::mod::sched::get_current_task();
             return (task != nullptr) ? task->egid : 0;
+        }
+        case abi::process::procmgmt_ops::GETRESUID: {
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            auto* ruid = reinterpret_cast<uint32_t*>(a2);
+            auto* euid = reinterpret_cast<uint32_t*>(a3);
+            auto* suid = reinterpret_cast<uint32_t*>(a4);
+            if (ruid == nullptr || euid == nullptr || suid == nullptr) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            *ruid = task->uid;
+            *euid = task->euid;
+            *suid = task->suid;
+            return 0;
+        }
+        case abi::process::procmgmt_ops::GETRESGID: {
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            auto* rgid = reinterpret_cast<uint32_t*>(a2);
+            auto* egid = reinterpret_cast<uint32_t*>(a3);
+            auto* sgid = reinterpret_cast<uint32_t*>(a4);
+            if (rgid == nullptr || egid == nullptr || sgid == nullptr) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            *rgid = task->gid;
+            *egid = task->egid;
+            *sgid = task->sgid;
+            return 0;
         }
         case abi::process::procmgmt_ops::GETGROUPS: {
             return wos_proc_getgroups(static_cast<size_t>(a2), reinterpret_cast<uint32_t*>(a3));

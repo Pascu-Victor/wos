@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
+import re
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
+TCP_CPP = ROOT / "modules" / "kern" / "src" / "net" / "proto" / "tcp.cpp"
 TCP_FILES = [
-    ROOT / "modules" / "kern" / "src" / "net" / "proto" / "tcp.cpp",
+    TCP_CPP,
     ROOT / "modules" / "kern" / "src" / "net" / "proto" / "tcp_input.cpp",
     ROOT / "modules" / "kern" / "src" / "net" / "proto" / "tcp_output.cpp",
     ROOT / "modules" / "kern" / "src" / "net" / "proto" / "tcp_timer.cpp",
@@ -14,6 +16,69 @@ TCP_FILES = [
 
 def fail(message: str) -> None:
     raise AssertionError(message)
+
+
+def function_body(source: str, name: str) -> str:
+    match = re.search(
+        rf"\b(?:auto|int|void|bool)\s+{re.escape(name)}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>*]+)?\s*\{{",
+        source,
+    )
+    if match is None:
+        fail(f"missing function {name}")
+
+    depth = 1
+    pos = match.end()
+    while pos < len(source) and depth > 0:
+        if source[pos] == "{":
+            depth += 1
+        elif source[pos] == "}":
+            depth -= 1
+        pos += 1
+    if depth != 0:
+        fail(f"unterminated function {name}")
+    return source[match.end() : pos - 1]
+
+
+def require_order(source: str, tokens: list[str], context: str) -> None:
+    cursor = 0
+    for token in tokens:
+        found = source.find(token, cursor)
+        if found < 0:
+            fail(f"{context}: missing ordered token {token}")
+        cursor = found + len(token)
+
+
+def require_recv_window_ack_is_locked(problems: list[str]) -> None:
+    source = TCP_CPP.read_text()
+    recv = function_body(source, "tcp_recv")
+    helper = function_body(source, "maybe_send_recv_window_update")
+
+    if "tcp_send_ack(cb)" in recv:
+        problems.append("tcp_recv must not build receive-window ACKs without cb->lock")
+
+    require_order(
+        recv,
+        [
+            "sock->rcvbuf.read(buf, len)",
+            "if (N > 0)",
+            "maybe_send_recv_window_update(cb, sock)",
+        ],
+        "tcp_recv window update handoff",
+    )
+    require_order(
+        helper,
+        [
+            "cb->lock.lock_irqsave()",
+            "cb->rcv_wnd = tcp_receive_window_space(cb, sock)",
+            "tcp_build_ack(cb, &ack_local, &ack_remote)",
+            "cb->lock.unlock_irqrestore(FLAGS)",
+            "ipv4_tx(ack_pkt, ack_local, ack_remote, 6, 64)",
+            "cb->lock.lock_irqsave()",
+            "cb->ack_pending = true",
+            "tcp_timer_arm(cb)",
+        ],
+        "locked recv-window ACK snapshot",
+    )
 
 
 def main() -> None:
@@ -43,9 +108,11 @@ def main() -> None:
         if token not in timer_source:
             problems.append(f"tcp_timer.cpp missing saturating deadline use: {token}")
 
+    require_recv_window_ack_is_locked(problems)
+
     if problems:
         fail("; ".join(problems))
-    print("TCP timer deadlines use saturating arithmetic")
+    print("TCP timer/window source invariants hold")
 
 
 if __name__ == "__main__":

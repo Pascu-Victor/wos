@@ -1130,6 +1130,37 @@ void proxy_mark_pipe_closed(ProxyIpcState* proxy, uint32_t resource_id) {
     wki_ipc_proxy_wake_poll_waiters(proxy);
 }
 
+auto mark_ipc_pty_write_closed_or_pending(uint16_t peer_node, uint32_t resource_id, uint64_t expected_bytes = 0,
+                                          bool has_expected_bytes = false) -> bool {
+    ProxyIpcState* proxy = nullptr;
+    bool export_exists = false;
+
+    uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+    if (peer_node != WKI_NODE_INVALID) {
+        proxy = find_proxy_by_endpoint_locked(peer_node, resource_id);
+    }
+    if (proxy == nullptr) {
+        auto* exp = find_export_by_resource_id(resource_id);
+        export_exists = exp != nullptr && exp->active && exp->file != nullptr;
+    }
+    s_ipc_lock.unlock_irqrestore(IRQF);
+
+    if (proxy != nullptr) {
+        proxy_mark_pipe_closed(proxy, resource_id);
+        proxy_release(proxy);
+        return true;
+    }
+
+    if (export_exists && mark_export_pipe_write_closed(resource_id, expected_bytes, has_expected_bytes)) {
+        return true;
+    }
+
+    if (peer_node == WKI_NODE_INVALID) {
+        return false;
+    }
+    return mark_pending_pipe_write_closed(peer_node, resource_id);
+}
+
 void wake_proxy_reader(ProxyIpcState* proxy) {
     if (proxy == nullptr) {
         return;
@@ -1562,32 +1593,59 @@ auto proxy_pipe_close(ker::vfs::File* f) -> int {
     return 0;
 }
 
+auto proxy_poll_has_read_side(ker::vfs::File* f, ProxyIpcState* proxy) -> bool {
+    if (proxy != nullptr && proxy->res_type == ResourceType::IPC_PTY) {
+        return true;
+    }
+    return f != nullptr && f->fops != nullptr && f->fops->vfs_write == nullptr;
+}
+
+auto proxy_poll_has_write_side(ker::vfs::File* f, ProxyIpcState* proxy) -> bool {
+    if (proxy != nullptr && proxy->res_type == ResourceType::IPC_PTY) {
+        return true;
+    }
+    return f == nullptr || f->fops == nullptr || f->fops->vfs_write != nullptr;
+}
+
 auto proxy_pipe_poll_check(ker::vfs::File* f, int events) -> int {
     auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
     if (proxy == nullptr) {
         return 0;
     }
+    bool const HAS_READ_SIDE = proxy_poll_has_read_side(f, proxy);
+    bool const HAS_WRITE_SIDE = proxy_poll_has_write_side(f, proxy);
     if (!proxy->active.load(std::memory_order_acquire)) {
-        if (f->fops != nullptr && f->fops->vfs_write == nullptr) {
-            return dev::pty::POLLHUP;
+        int ready = 0;
+        if (HAS_READ_SIDE) {
+            ready |= dev::pty::POLLHUP;
         }
-        return dev::pty::POLLERR;
+        if (HAS_WRITE_SIDE) {
+            ready |= dev::pty::POLLERR;
+        }
+        return ready;
     }
 
     int ready = 0;
-    uint32_t const HEAD = proxy->ring_head.load(std::memory_order_acquire);
-    uint32_t const TAIL = proxy->ring_tail.load(std::memory_order_acquire);
-    uint32_t const AVAIL = HEAD - TAIL;
-    bool const WR_CLOSED = proxy->write_closed.load(std::memory_order_acquire) != 0U;
-    bool has_pending_data = false;
+    if (HAS_READ_SIDE) {
+        uint32_t const HEAD = proxy->ring_head.load(std::memory_order_acquire);
+        uint32_t const TAIL = proxy->ring_tail.load(std::memory_order_acquire);
+        uint32_t const AVAIL = HEAD - TAIL;
+        bool has_pending_data = false;
+        bool pending_closed_without_data = false;
 
-    uint64_t const PENDING_IRQF = s_ipc_lock.lock_irqsave();
-    if (auto* pending = find_pending_pipe_delivery_locked(proxy->home_node, proxy->resource_id); pending != nullptr) {
-        has_pending_data = !pending->chunks.empty();
-    }
-    s_ipc_lock.unlock_irqrestore(PENDING_IRQF);
+        uint64_t const PENDING_IRQF = s_ipc_lock.lock_irqsave();
+        if (auto* pending = find_pending_pipe_delivery_locked(proxy->home_node, proxy->resource_id); pending != nullptr) {
+            has_pending_data = !pending->chunks.empty();
+            pending_closed_without_data = pending->write_closed && pending->chunks.empty();
+        }
+        s_ipc_lock.unlock_irqrestore(PENDING_IRQF);
 
-    if (f->fops != nullptr && f->fops->vfs_write == nullptr) {
+        if (pending_closed_without_data && consume_pending_pipe_closed(proxy->home_node, proxy->resource_id)) {
+            proxy_mark_pipe_closed(proxy, proxy->resource_id);
+        }
+
+        bool const WR_CLOSED = proxy->write_closed.load(std::memory_order_acquire) != 0U;
+
         // Read end
         if (((events & dev::pty::POLLIN) != 0) && (AVAIL > 0 || has_pending_data || WR_CLOSED)) {
             ready |= dev::pty::POLLIN;
@@ -1595,7 +1653,8 @@ auto proxy_pipe_poll_check(ker::vfs::File* f, int events) -> int {
         if (WR_CLOSED && AVAIL == 0 && !has_pending_data) {
             ready |= dev::pty::POLLHUP;
         }
-    } else {
+    }
+    if (HAS_WRITE_SIDE) {
         // Write end — always writable (sends via wire message)
         if ((events & dev::pty::POLLOUT) != 0) {
             ready |= dev::pty::POLLOUT;
@@ -4104,6 +4163,116 @@ auto wki_ipc_selftest_inactive_proxy_poll_is_terminal() -> int {
     return 0;
 }
 
+auto wki_ipc_selftest_pty_proxy_poll_is_bidirectional() -> int {
+    ProxyIpcState proxy{};
+    proxy.active.store(true, std::memory_order_release);
+    proxy.res_type = ResourceType::IPC_PTY;
+
+    std::array<uint8_t, 8> ring{};
+    proxy.ring_buf = ring.data();
+    proxy.ring_capacity = static_cast<uint32_t>(ring.size());
+    proxy.ring_head.store(1, std::memory_order_release);
+    proxy.ring_tail.store(0, std::memory_order_release);
+
+    ker::vfs::File pty_file{};
+    pty_file.private_data = &proxy;
+    pty_file.fops = &g_proxy_pty_fops;
+
+    int const DATA_READY = proxy_pipe_poll_check(&pty_file, dev::pty::POLLIN | dev::pty::POLLOUT);
+    if ((DATA_READY & dev::pty::POLLIN) == 0 || (DATA_READY & dev::pty::POLLOUT) == 0) {
+        return -EIO;
+    }
+
+    proxy.ring_head.store(0, std::memory_order_release);
+    proxy.ring_tail.store(0, std::memory_order_release);
+    proxy.write_closed.store(1, std::memory_order_release);
+
+    int const EOF_READY = proxy_pipe_poll_check(&pty_file, dev::pty::POLLIN);
+    if ((EOF_READY & dev::pty::POLLIN) == 0 || (EOF_READY & dev::pty::POLLHUP) == 0) {
+        return -EIO;
+    }
+
+    proxy.active.store(false, std::memory_order_release);
+
+    int const INACTIVE_READY = proxy_pipe_poll_check(&pty_file, dev::pty::POLLIN | dev::pty::POLLOUT);
+    if ((INACTIVE_READY & dev::pty::POLLHUP) == 0 || (INACTIVE_READY & dev::pty::POLLERR) == 0) {
+        return -EIO;
+    }
+
+    return 0;
+}
+
+auto wki_ipc_selftest_pty_close_without_export_queues_pending() -> int {
+    constexpr uint16_t HOME_NODE = 0x7A31;
+    constexpr uint32_t RESOURCE_ID = 0x7A310001U;
+
+    auto clear_pending = [&] {
+        PendingPipeDelivery* pending = nullptr;
+        uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+        pending = take_pending_pipe_delivery_locked(HOME_NODE, RESOURCE_ID);
+        s_ipc_lock.unlock_irqrestore(IRQF);
+        free_pending_pipe_delivery(pending);
+    };
+
+    clear_pending();
+    if (!mark_ipc_pty_write_closed_or_pending(HOME_NODE, RESOURCE_ID, 0, true)) {
+        clear_pending();
+        return -EIO;
+    }
+
+    bool const CLOSED = consume_pending_pipe_closed(HOME_NODE, RESOURCE_ID);
+    clear_pending();
+    return CLOSED ? 0 : -EIO;
+}
+
+auto wki_ipc_selftest_pending_close_promotes_on_poll() -> int {
+    constexpr uint16_t HOME_NODE = 0x7A32;
+    constexpr uint32_t RESOURCE_ID = 0x7A320001U;
+
+    auto clear_pending = [&] {
+        PendingPipeDelivery* pending = nullptr;
+        uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+        pending = take_pending_pipe_delivery_locked(HOME_NODE, RESOURCE_ID);
+        s_ipc_lock.unlock_irqrestore(IRQF);
+        free_pending_pipe_delivery(pending);
+    };
+
+    clear_pending();
+    if (!mark_pending_pipe_write_closed(HOME_NODE, RESOURCE_ID)) {
+        clear_pending();
+        return -ENOMEM;
+    }
+
+    ProxyIpcState proxy{};
+    proxy.active.store(true, std::memory_order_release);
+    proxy.res_type = ResourceType::IPC_PIPE;
+    proxy.home_node = HOME_NODE;
+    proxy.resource_id = RESOURCE_ID;
+
+    std::array<uint8_t, 8> ring{};
+    proxy.ring_buf = ring.data();
+    proxy.ring_capacity = static_cast<uint32_t>(ring.size());
+
+    ker::vfs::File read_file{};
+    read_file.private_data = &proxy;
+    read_file.fops = &g_proxy_pipe_read_fops;
+
+    int const READY = proxy_pipe_poll_check(&read_file, dev::pty::POLLIN);
+    bool const CLOSED = proxy.write_closed.load(std::memory_order_acquire) != 0U;
+    bool pending_left = false;
+    {
+        uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+        pending_left = find_pending_pipe_delivery_locked(HOME_NODE, RESOURCE_ID) != nullptr;
+        s_ipc_lock.unlock_irqrestore(IRQF);
+    }
+
+    clear_pending();
+    if ((READY & dev::pty::POLLHUP) == 0 || (READY & dev::pty::POLLIN) == 0 || !CLOSED || pending_left) {
+        return -EIO;
+    }
+    return 0;
+}
+
 auto wki_ipc_selftest_epoll_close_releases_lookup_ref() -> int {
     constexpr uint32_t RESOURCE_ID = 0x7E7E;
 
@@ -5234,8 +5403,9 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             has_expected_bytes = true;
         }
 
-        // PTY payloads use the pipe data path, so close must follow the ordered write backlog.
-        if (!mark_export_pipe_write_closed(resource_id, expected_bytes, has_expected_bytes)) {
+        // PTY payloads use the pipe data path, so close must follow the ordered write backlog or
+        // become a pending EOF marker if the matching endpoint has not arrived yet.
+        if (!mark_ipc_pty_write_closed_or_pending(hdr->src_node, resource_id, expected_bytes, has_expected_bytes)) {
             ker::mod::dbg::logger<"wki">::warn("IPC PTY close queue failed: resource_id=%u", resource_id);
         }
         return;

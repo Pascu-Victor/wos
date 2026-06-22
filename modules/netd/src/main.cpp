@@ -68,6 +68,8 @@ constexpr int MAX_NAK_RESTARTS = 3;  // restart from DISCOVER on NAK
 constexpr uint32_t RENEWAL_FAILURE_LOG_INTERVAL = 10;
 constexpr uint32_t DHCP_RENEWAL_RETRY_SECS = 60;
 constexpr uint32_t USEC_PER_SEC = 1000000;
+constexpr size_t MAX_DNS_SERVERS = 3;
+constexpr auto RESOLVER_OPTIONS = "options timeout:2 attempts:4\n";
 
 #ifndef SO_BINDTODEVICE
 constexpr int SO_BINDTODEVICE = 25;
@@ -100,7 +102,9 @@ struct DhcpLease {
     uint32_t subnet_mask;  // host order
     uint32_t router;       // host order
     uint32_t dns;          // host order
-    uint32_t lease_time;   // seconds
+    std::array<uint32_t, MAX_DNS_SERVERS> dns_servers;
+    size_t dns_count;
+    uint32_t lease_time;  // seconds
     std::array<char, 256> domain_name;
     std::array<char, 256> search_domains;
 };
@@ -140,6 +144,50 @@ void ip_to_str(uint32_t ip_host, char* buf, size_t len) {
     struct in_addr a{};
     a.s_addr = htonl(ip_host);
     inet_ntop(AF_INET, &a, buf, static_cast<socklen_t>(len));
+}
+
+void remember_dns_server(DhcpLease& lease, uint32_t dns_host) {
+    if (dns_host == 0) {
+        return;
+    }
+
+    for (size_t i = 0; i < lease.dns_count; i++) {
+        if (lease.dns_servers[i] == dns_host) {
+            return;
+        }
+    }
+
+    if (lease.dns_count >= lease.dns_servers.size()) {
+        return;
+    }
+
+    lease.dns_servers[lease.dns_count++] = dns_host;
+    if (lease.dns == 0) {
+        lease.dns = dns_host;
+    }
+}
+
+auto has_dns_servers(const DhcpLease& lease) -> bool { return lease.dns_count != 0 || lease.dns != 0; }
+
+auto same_dns_servers(const DhcpLease& a, const DhcpLease& b) -> bool {
+    if (a.dns_count != b.dns_count) {
+        return false;
+    }
+    if (a.dns_count == 0 || b.dns_count == 0) {
+        return a.dns == b.dns;
+    }
+    for (size_t i = 0; i < a.dns_count; i++) {
+        if (a.dns_servers[i] != b.dns_servers[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void copy_dns_servers(DhcpLease& dest, const DhcpLease& src) {
+    dest.dns = src.dns;
+    dest.dns_servers = src.dns_servers;
+    dest.dns_count = src.dns_count;
 }
 
 void copy_dhcp_string(std::span<char> dest, const uint8_t* data, size_t len) {
@@ -339,7 +387,14 @@ void write_resolv_conf(const DhcpLease& lease) {
     }
 
     fputs("# Managed by netd via DHCP\n", file);
-    if (lease.dns != 0) {
+    fputs(RESOLVER_OPTIONS, file);
+    if (lease.dns_count != 0) {
+        for (size_t i = 0; i < lease.dns_count; i++) {
+            std::array<char, 16> dns_str{};
+            ip_to_str(lease.dns_servers[i], dns_str.data(), dns_str.size());
+            fprintf(file, "nameserver %s\n", dns_str.data());
+        }
+    } else if (lease.dns != 0) {
         std::array<char, 16> dns_str{};
         ip_to_str(lease.dns, dns_str.data(), dns_str.size());
         fprintf(file, "nameserver %s\n", dns_str.data());
@@ -509,8 +564,8 @@ auto parse_reply(const uint8_t* data, size_t len, uint32_t expected_xid, DhcpLea
                 }
                 break;
             case OPT_DNS:
-                if (OLEN >= 4) {
-                    lease->dns = load_network_u32(opt);
+                for (size_t offset = 0; offset + sizeof(uint32_t) <= OLEN; offset += sizeof(uint32_t)) {
+                    remember_dns_server(*lease, load_network_u32(opt + offset));
                 }
                 break;
             case OPT_DOMAIN_NAME:
@@ -872,8 +927,8 @@ nak_restart:
                 if (ack_lease.router != 0) {
                     lease.router = ack_lease.router;
                 }
-                if (ack_lease.dns != 0) {
-                    lease.dns = ack_lease.dns;
+                if (has_dns_servers(ack_lease)) {
+                    copy_dns_servers(lease, ack_lease);
                 }
                 if (ack_lease.lease_time != 0) {
                     lease.lease_time = ack_lease.lease_time;
@@ -925,9 +980,16 @@ request_failed:
         ip_to_str(lease.your_ip, ip_str.data(), ip_str.size());
         ip_to_str(lease.subnet_mask, mask_str.data(), mask_str.size());
         ip_to_str(lease.router, gw_str.data(), gw_str.size());
-        ip_to_str(lease.dns, dns_str.data(), dns_str.size());
+        if (lease.dns_count != 0) {
+            ip_to_str(lease.dns_servers[0], dns_str.data(), dns_str.size());
+        } else {
+            ip_to_str(lease.dns, dns_str.data(), dns_str.size());
+        }
         logger::info("netd: %s configured: ip=%s mask=%s gw=%s dns=%s lease=%us", ifname, ip_str.data(), mask_str.data(), gw_str.data(),
                      dns_str.data(), lease.lease_time);
+        if (lease.dns_count > 1) {
+            logger::info("netd: resolver has %zu DNS servers", lease.dns_count);
+        }
         if (lease.search_domains[0] != '\0') {
             logger::info("netd: resolver search domains: %s", lease.search_domains.data());
         } else if (lease.domain_name[0] != '\0') {
@@ -987,8 +1049,8 @@ request_failed:
                 lease.router = renew_lease.router;
                 network_changed = true;
             }
-            if (renew_lease.dns != 0 && renew_lease.dns != lease.dns) {
-                lease.dns = renew_lease.dns;
+            if (has_dns_servers(renew_lease) && !same_dns_servers(renew_lease, lease)) {
+                copy_dns_servers(lease, renew_lease);
                 resolver_changed = true;
             }
             if (renew_lease.lease_time != 0) {

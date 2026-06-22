@@ -44,5 +44,8 @@ enum class procmgmt_ops : uint64_t {
     PRCTL,          // 36
     ARCH_PRCTL,     // 37
     SIGALTSTACK,    // 38
+    GETRESUID,      // 39
+    GETRESGID,      // 40
+    SIGPENDING,     // 41
 };
 }  // namespace ker::abi::process

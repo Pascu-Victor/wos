@@ -298,6 +298,8 @@ auto find_task_by_pid_safe(uint64_t pid) -> task::Task*;  // Find task by PID wi
 auto task_has_live_pagemap_sibling(task::Task* subject) -> bool;
 void set_task_nice(task::Task* task, int nice);               // Update task weight safely on its run queue
 auto signal_process_group(uint64_t pgid, int sig) -> size_t;  // Send signal to all live tasks in a process group
+auto signal_controlling_tty(int controlling_tty, int sig) -> size_t;
+auto signal_controlling_tty_wki_proxies(int controlling_tty, int sig) -> size_t;
 auto signal_visible_processes_except(uint64_t excluded_pid, uint64_t excluded_owner_pid, int sig) -> size_t;
 void wake_task_for_signal(task::Task* task);  // Make a signaled blocked task runnable so signal delivery can occur
 [[nodiscard]] auto kernel_threads_shutdown_requested() -> bool;

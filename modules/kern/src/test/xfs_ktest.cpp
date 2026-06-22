@@ -92,6 +92,10 @@ KTEST(XFS, TruncateZeroResetsStaleDataFork) {
 
 KTEST(XFS, DentryCacheHitsAndInvalidates) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_dentry_cache_shortform()); }
 
+KTEST(XFS, ShortformReaddirCookiesProgressAcrossDuplicateOffsets) {
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_shortform_readdir_cookies_are_monotonic());
+}
+
 // ---------------------------------------------------------------------------
 // xfs_mount() error path: corrupt magic (all zeros) must return != 0
 // ---------------------------------------------------------------------------

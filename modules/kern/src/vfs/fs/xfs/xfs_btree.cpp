@@ -12,7 +12,6 @@
 
 #include "xfs_btree.hpp"
 
-#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +33,16 @@ namespace {
 auto valid_btree_level(int level) -> bool { return level >= 0 && level < XFS_BTREE_MAXLEVELS; }
 
 auto valid_btree_depth(uint8_t nlevels) -> bool { return nlevels > 0 && nlevels <= XFS_BTREE_MAXLEVELS; }
+
+template <typename Traits>
+auto btree_node_max_keys(uint32_t block_size) -> int {
+    return static_cast<int>((block_size - Traits::HDR_LEN) / (Traits::KEY_LEN + Traits::PTR_LEN));
+}
+
+template <typename Traits>
+auto btree_node_ptr_off(uint32_t block_size, size_t n) -> size_t {
+    return Traits::HDR_LEN + (static_cast<size_t>(btree_node_max_keys<Traits>(block_size)) * Traits::KEY_LEN) + (n * Traits::PTR_LEN);
+}
 
 }  // namespace
 
@@ -76,12 +85,9 @@ auto XfsBtreeCursor<Traits>::rec_at(int idx) const -> const Rec* {
 
 template <typename Traits>
 auto XfsBtreeCursor<Traits>::ptr_at(int level, int idx) const -> uint64_t {
-    // Pointers are stored after all keys in an internal node.
-    // Layout: [header][key0][key1]...[keyN][ptr0][ptr1]...[ptrN]
-    int const NRECS = numrecs(level);
-    const uint8_t* base = level_at(level).bp->data + Traits::HDR_LEN;
-    const uint8_t* ptr_base = base + (static_cast<size_t>(NRECS) * Traits::KEY_LEN);
-    const uint8_t* ptr_addr = ptr_base + (static_cast<size_t>(idx - 1) * Traits::PTR_LEN);
+    // XFS stores node pointers after the maximum key array, not after the
+    // current bb_numrecs key count.
+    const uint8_t* ptr_addr = level_at(level).bp->data + btree_node_ptr_off<Traits>(mount->block_size, static_cast<size_t>(idx - 1));
 
     if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
         Be32 val{};
@@ -446,20 +452,12 @@ auto XfsBtreeCursor<Traits>::key_at_mut(int level, int idx) -> Key* {
 
 template <typename Traits>
 auto XfsBtreeCursor<Traits>::ptr_addr(int level, int idx) -> uint8_t* {
-    int const NRECS = numrecs(level);
-    uint8_t* base = level_at(level).bp->data + Traits::HDR_LEN;
-    uint8_t* ptr_base = base + (static_cast<size_t>(NRECS) * Traits::KEY_LEN);
-    return ptr_base + (static_cast<size_t>(idx - 1) * Traits::PTR_LEN);
+    return level_at(level).bp->data + btree_node_ptr_off<Traits>(mount->block_size, static_cast<size_t>(idx - 1));
 }
 
 template <typename Traits>
 void XfsBtreeCursor<Traits>::set_ptr(int level, int idx, uint64_t blockno) {
-    // Pointers are after keys. But we need to compute based on the current numrecs
-    // which includes the pointers area layout. We access the raw pointer slot directly.
-    int const NRECS = numrecs(level);
-    uint8_t* base = level_at(level).bp->data + Traits::HDR_LEN;
-    uint8_t* ptr_base = base + (static_cast<size_t>(NRECS) * Traits::KEY_LEN);
-    uint8_t* p = ptr_base + (static_cast<size_t>(idx - 1) * Traits::PTR_LEN);
+    uint8_t* p = level_at(level).bp->data + btree_node_ptr_off<Traits>(mount->block_size, static_cast<size_t>(idx - 1));
 
     if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
         Be32 val = Be32::from_cpu(static_cast<uint32_t>(blockno));
@@ -540,7 +538,7 @@ auto btree_max_recs_leaf(uint32_t block_size) -> int {
 // Compute max keys+ptrs per internal block
 template <typename Traits>
 auto btree_max_keys_node(uint32_t block_size) -> int {
-    return static_cast<int>((block_size - Traits::HDR_LEN) / (Traits::KEY_LEN + Traits::PTR_LEN));
+    return btree_node_max_keys<Traits>(block_size);
 }
 
 // Helper: byte offset from block start to the N-th key (0-based) in a btree block.
@@ -553,8 +551,8 @@ auto btree_key_off(size_t n) -> size_t {
 // Helper: byte offset from block start to the N-th pointer (0-based) in an
 // internal node that currently holds `nrecs` keys.
 template <typename Traits>
-auto btree_ptr_off(size_t nrecs, size_t n) -> size_t {
-    return Traits::HDR_LEN + (nrecs * Traits::KEY_LEN) + (n * Traits::PTR_LEN);
+auto btree_ptr_off(uint32_t block_size, size_t n) -> size_t {
+    return btree_node_ptr_off<Traits>(block_size, n);
 }
 
 // Update the CRC field of a btree block.
@@ -702,8 +700,8 @@ void btree_set_rightsib(BufHead* bp, uint64_t sib) {
 // Write a btree child pointer at position idx (1-based) in an internal node,
 // using an explicit nrecs value for the layout calculation.
 template <typename Traits>
-void btree_write_ptr(uint8_t* block_data, int nrecs_for_layout, int idx, uint64_t blockno) {
-    uint8_t* p = block_data + btree_ptr_off<Traits>(static_cast<size_t>(nrecs_for_layout), static_cast<size_t>(idx - 1));
+void btree_write_ptr(uint8_t* block_data, uint32_t block_size, int idx, uint64_t blockno) {
+    uint8_t* p = block_data + btree_ptr_off<Traits>(block_size, static_cast<size_t>(idx - 1));
     if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
         Be32 val = Be32::from_cpu(static_cast<uint32_t>(blockno));
         __builtin_memcpy(p, &val, 4);
@@ -741,29 +739,19 @@ auto btree_split_internal(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int l
     uint8_t* left_data = left_bp->data;
     uint8_t* right_data = right_bp->data;
 
-    // Compute the promoted key (first key of right half, i.e. key at index mid)
-    typename Traits::Key promoted_key;
-    __builtin_memcpy(&promoted_key, left_data + btree_key_off<Traits>(static_cast<size_t>(MID)), Traits::KEY_LEN);
-
     // Copy keys [mid+1..nr] => right block keys [1..nr-mid]
     int const RIGHT_NR = NR - MID;
     __builtin_memcpy(right_data + Traits::HDR_LEN, left_data + btree_key_off<Traits>(static_cast<size_t>(MID)),
                      static_cast<size_t>(RIGHT_NR) * Traits::KEY_LEN);
 
-    // Copy pointers [mid+1..nr] => right block pointers [1..nr-mid]
-    // Pointers in the left block use old layout (nr keys)
-    const uint8_t* left_ptr_base = left_data + btree_ptr_off<Traits>(static_cast<size_t>(NR), 0);
-    // Right block pointers start after its right_nr keys
-    uint8_t* right_ptr_base = right_data + btree_ptr_off<Traits>(static_cast<size_t>(RIGHT_NR), 0);
+    // Copy pointers [mid+1..nr] => right block pointers [1..nr-mid].
+    const uint8_t* left_ptr_base = left_data + btree_ptr_off<Traits>(cur->mount->block_size, 0);
+    uint8_t* right_ptr_base = right_data + btree_ptr_off<Traits>(cur->mount->block_size, 0);
     __builtin_memcpy(right_ptr_base, left_ptr_base + (static_cast<size_t>(MID) * Traits::PTR_LEN),
                      static_cast<size_t>(RIGHT_NR) * Traits::PTR_LEN);
 
-    // Compact left-side pointers to follow the new (shorter) key array.
-    // They currently sit at HDR_LEN + nr*KEY_LEN; they need to be at HDR_LEN + mid*KEY_LEN.
-    uint8_t* new_left_ptr_base = left_data + btree_ptr_off<Traits>(static_cast<size_t>(MID), 0);
-    if (new_left_ptr_base != left_ptr_base) {
-        std::memmove(new_left_ptr_base, left_ptr_base, static_cast<size_t>(MID) * Traits::PTR_LEN);
-    }
+    btree_set_numrecs_raw<Traits>(left_data, MID);
+    btree_set_numrecs_raw<Traits>(right_data, RIGHT_NR);
 
     // Fixup sibling chain
     uint64_t const OLD_RIGHT_SIB = [&]() -> uint64_t {
@@ -808,54 +796,48 @@ auto btree_split_internal(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int l
     if (insert_pos <= MID + 1) {
         // Insert into left half
         int const LEFT_NR_CUR = MID;
+        uint8_t* lp_base = left_data + btree_ptr_off<Traits>(cur->mount->block_size, 0);
         // Step 1: shift keys right to make room at insert_pos-1 (0-based)
         if (insert_pos <= LEFT_NR_CUR) {
             std::memmove(left_data + btree_key_off<Traits>(static_cast<size_t>(insert_pos)),
                          left_data + btree_key_off<Traits>(static_cast<size_t>(insert_pos - 1)),
                          static_cast<size_t>(LEFT_NR_CUR - insert_pos + 1) * Traits::KEY_LEN);
         }
-        // Step 2: relocate ptr array to new base (key section grew by one KEY_LEN)
-        auto const LNC = static_cast<size_t>(LEFT_NR_CUR);
-        uint8_t const* lp_base_old = left_data + btree_ptr_off<Traits>(LNC, 0);
-        uint8_t* lp_base_new = left_data + btree_ptr_off<Traits>(LNC + 1, 0);
-        std::memmove(lp_base_new, lp_base_old, LNC * Traits::PTR_LEN);
-        // Step 3: shift ptrs within the new location to make room at insert_pos-1 (0-based)
+        // Step 2: shift ptrs to make room at insert_pos-1 (0-based)
         if (insert_pos <= LEFT_NR_CUR) {
-            std::memmove(lp_base_new + (static_cast<size_t>(insert_pos) * Traits::PTR_LEN),
-                         lp_base_new + (static_cast<size_t>(insert_pos - 1) * Traits::PTR_LEN),
+            std::memmove(lp_base + (static_cast<size_t>(insert_pos) * Traits::PTR_LEN),
+                         lp_base + (static_cast<size_t>(insert_pos - 1) * Traits::PTR_LEN),
                          static_cast<size_t>(LEFT_NR_CUR - insert_pos + 1) * Traits::PTR_LEN);
         }
-        // Step 4: write new key and ptr
+        // Step 3: write new key and ptr
         __builtin_memcpy(left_data + btree_key_off<Traits>(static_cast<size_t>(insert_pos - 1)), &insert_key, Traits::KEY_LEN);
-        btree_write_ptr<Traits>(left_data, LEFT_NR_CUR + 1, insert_pos, insert_ptr);
+        btree_write_ptr<Traits>(left_data, cur->mount->block_size, insert_pos, insert_ptr);
         btree_set_numrecs_raw<Traits>(left_data, LEFT_NR_CUR + 1);
     } else {
         // Insert into right half
-        int const RIGHT_INSERT = insert_pos - MID - 1;  // 1-based in right block
+        int const RIGHT_INSERT = insert_pos - MID;  // 1-based in right block
         int const RIGHT_NR_CUR = RIGHT_NR;
+        uint8_t* rp_base = right_data + btree_ptr_off<Traits>(cur->mount->block_size, 0);
         // Step 1: shift keys right in right block
         if (RIGHT_INSERT <= RIGHT_NR_CUR) {
             std::memmove(right_data + btree_key_off<Traits>(static_cast<size_t>(RIGHT_INSERT)),
                          right_data + btree_key_off<Traits>(static_cast<size_t>(RIGHT_INSERT - 1)),
                          static_cast<size_t>(RIGHT_NR_CUR - RIGHT_INSERT + 1) * Traits::KEY_LEN);
         }
-        // Step 2: relocate ptr array (key section grew by one KEY_LEN)
-        auto const RNC = static_cast<size_t>(RIGHT_NR_CUR);
-        uint8_t const* rp_base_old = right_data + btree_ptr_off<Traits>(RNC, 0);
-        uint8_t* rp_base_new = right_data + btree_ptr_off<Traits>(RNC + 1, 0);
-        std::memmove(rp_base_new, rp_base_old, RNC * Traits::PTR_LEN);
-        // Step 3: shift ptrs within new location to make room at right_insert-1 (0-based)
+        // Step 2: shift ptrs to make room at right_insert-1 (0-based)
         if (RIGHT_INSERT <= RIGHT_NR_CUR) {
-            std::memmove(rp_base_new + (static_cast<size_t>(RIGHT_INSERT) * Traits::PTR_LEN),
-                         rp_base_new + (static_cast<size_t>(RIGHT_INSERT - 1) * Traits::PTR_LEN),
+            std::memmove(rp_base + (static_cast<size_t>(RIGHT_INSERT) * Traits::PTR_LEN),
+                         rp_base + (static_cast<size_t>(RIGHT_INSERT - 1) * Traits::PTR_LEN),
                          static_cast<size_t>(RIGHT_NR_CUR - RIGHT_INSERT + 1) * Traits::PTR_LEN);
         }
-        // Step 4: write new key and ptr
+        // Step 3: write new key and ptr
         __builtin_memcpy(right_data + btree_key_off<Traits>(static_cast<size_t>(RIGHT_INSERT - 1)), &insert_key, Traits::KEY_LEN);
-        btree_write_ptr<Traits>(right_data, RIGHT_NR_CUR + 1, RIGHT_INSERT, insert_ptr);
+        btree_write_ptr<Traits>(right_data, cur->mount->block_size, RIGHT_INSERT, insert_ptr);
         btree_set_numrecs_raw<Traits>(right_data, RIGHT_NR_CUR + 1);
-        btree_set_numrecs_raw<Traits>(left_data, MID);
     }
+
+    typename Traits::Key promoted_key;
+    __builtin_memcpy(&promoted_key, right_data + Traits::HDR_LEN, Traits::KEY_LEN);
 
     btree_update_crc<Traits>(left_bp);
     btree_update_crc<Traits>(right_bp);
@@ -905,8 +887,8 @@ auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
         __builtin_memcpy(nr_data + btree_key_off<Traits>(1), &new_key, Traits::KEY_LEN);
 
         // Two pointers (layout: after 2 keys)
-        btree_write_ptr<Traits>(nr_data, 2, 1, root_block);
-        btree_write_ptr<Traits>(nr_data, 2, 2, new_ptr);
+        btree_write_ptr<Traits>(nr_data, cur->mount->block_size, 1, root_block);
+        btree_write_ptr<Traits>(nr_data, cur->mount->block_size, 2, new_ptr);
 
         btree_set_numrecs_raw<Traits>(nr_data, 2);
         btree_update_crc<Traits>(new_root_bp);
@@ -932,6 +914,8 @@ auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
     if (PARENT_NR < MAX_KEYS) {
         uint8_t* p_data = parent_bp->data;
 
+        uint8_t* ptr_base = p_data + btree_ptr_off<Traits>(cur->mount->block_size, 0);
+
         // Shift keys [insert_pos..parent_nr] => [insert_pos+1..parent_nr+1]
         if (INSERT_POS <= PARENT_NR) {
             std::memmove(p_data + btree_key_off<Traits>(static_cast<size_t>(INSERT_POS)),
@@ -940,18 +924,13 @@ auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
         }
         __builtin_memcpy(p_data + btree_key_off<Traits>(static_cast<size_t>(INSERT_POS - 1)), &new_key, Traits::KEY_LEN);
 
-        // Move pointer section to new position (one extra key slot)
-        auto const PNR = static_cast<size_t>(PARENT_NR);
-        uint8_t const* old_ptr_base = p_data + btree_ptr_off<Traits>(PNR, 0);
-        uint8_t* new_ptr_base = p_data + btree_ptr_off<Traits>(PNR + 1, 0);
-        std::memmove(new_ptr_base, old_ptr_base, static_cast<size_t>(PARENT_NR) * Traits::PTR_LEN);
         // Shift pointers within the new location to make room
         if (INSERT_POS <= PARENT_NR) {
-            std::memmove(new_ptr_base + (static_cast<size_t>(INSERT_POS) * Traits::PTR_LEN),
-                         new_ptr_base + (static_cast<size_t>(INSERT_POS - 1) * Traits::PTR_LEN),
+            std::memmove(ptr_base + (static_cast<size_t>(INSERT_POS) * Traits::PTR_LEN),
+                         ptr_base + (static_cast<size_t>(INSERT_POS - 1) * Traits::PTR_LEN),
                          static_cast<size_t>(PARENT_NR - INSERT_POS + 1) * Traits::PTR_LEN);
         }
-        btree_write_ptr<Traits>(p_data, PARENT_NR + 1, INSERT_POS, new_ptr);
+        btree_write_ptr<Traits>(p_data, cur->mount->block_size, INSERT_POS, new_ptr);
 
         cur->set_numrecs(lev, PARENT_NR + 1);
         btree_update_crc<Traits>(parent_bp);
@@ -988,21 +967,15 @@ auto btree_remove_from_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
                      static_cast<size_t>(PARENT_NR - REMOVE_POS) * Traits::KEY_LEN);
     }
 
-    // Shift pointers left (old layout based on parent_nr keys)
-    uint8_t* old_ptr_base = p_data + btree_ptr_off<Traits>(static_cast<size_t>(PARENT_NR), 0);
+    // Shift pointers left.
+    uint8_t* ptr_base = p_data + btree_ptr_off<Traits>(cur->mount->block_size, 0);
     if (REMOVE_POS < PARENT_NR) {
-        std::memmove(old_ptr_base + (static_cast<size_t>(REMOVE_POS - 1) * Traits::PTR_LEN),
-                     old_ptr_base + (static_cast<size_t>(REMOVE_POS) * Traits::PTR_LEN),
+        std::memmove(ptr_base + (static_cast<size_t>(REMOVE_POS - 1) * Traits::PTR_LEN),
+                     ptr_base + (static_cast<size_t>(REMOVE_POS) * Traits::PTR_LEN),
                      static_cast<size_t>(PARENT_NR - REMOVE_POS) * Traits::PTR_LEN);
     }
 
     int const NEW_NR = PARENT_NR - 1;
-    // Compact pointers to follow the shorter key array
-    uint8_t* new_ptr_base = p_data + btree_ptr_off<Traits>(static_cast<size_t>(NEW_NR), 0);
-    if (new_ptr_base != old_ptr_base && NEW_NR > 0) {
-        std::memmove(new_ptr_base, old_ptr_base, static_cast<size_t>(NEW_NR) * Traits::PTR_LEN);
-    }
-
     cur->set_numrecs(lev, NEW_NR);
 
     if (NEW_NR == 0) {
@@ -1195,7 +1168,7 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
         cur->level_at(0).ptr = insert_ptr;
     } else {
         // Insert into right half
-        int const RIGHT_INSERT = insert_ptr - MID - 1;  // 1-based in right block
+        int const RIGHT_INSERT = insert_ptr - MID;  // 1-based in right block
         uint8_t* base = right_data + Traits::HDR_LEN;
         if (RIGHT_INSERT <= RIGHT_NR) {
             std::memmove(base + (static_cast<size_t>(RIGHT_INSERT) * Traits::REC_LEN),
@@ -1205,11 +1178,6 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
         __builtin_memcpy(base + (static_cast<size_t>(RIGHT_INSERT - 1) * Traits::REC_LEN), &new_rec, Traits::REC_LEN);
         btree_set_numrecs_raw<Traits>(right_data, RIGHT_NR + 1);
         cur->level_at(0).ptr = RIGHT_INSERT;
-        // Swap the cursor's leaf buffer to the right block
-        brelse(cur->level_at(0).bp);
-        right_bp->refcount.fetch_add(1, std::memory_order_relaxed);
-        cur->level_at(0).bp = right_bp;
-        left_data = left_bp->data;  // keep left_data valid for key extraction below
     }
 
     btree_update_crc<Traits>(left_bp);

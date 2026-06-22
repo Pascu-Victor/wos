@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -45,6 +46,7 @@ namespace {
 
 constexpr size_t ICACHE_BUCKETS = 1024;
 constexpr size_t ICACHE_HASH_MASK = ICACHE_BUCKETS - 1;
+constexpr uint64_t ALLOC_LOOKUP_WARN_INTERVAL = 4096;
 
 struct IcacheBucket {
     XfsInode* head{};
@@ -53,6 +55,7 @@ struct IcacheBucket {
 
 std::array<IcacheBucket, ICACHE_BUCKETS> icache;
 bool icache_inited = false;
+std::atomic<uint64_t> alloc_lookup_failure_count{0};
 
 auto icache_hash(const XfsMountContext* mount, xfs_ino_t ino) -> size_t {
     auto const MOUNT_BITS = reinterpret_cast<uintptr_t>(mount) >> 6;
@@ -573,14 +576,17 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
     perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::INODE_CACHE_MISS, PERF_CACHE_STARTED_US, 0, 1);
 
     int const ALLOCATED = xfs_inode_allocated(mount, ino);
-    if (ALLOCATED <= 0) {
-        if (ALLOCATED < 0) {
-            mod::dbg::logger<"xfs">::warn("xfs_inode_read: allocation lookup failed for inode %lu rc=%d", static_cast<unsigned long>(ino),
-                                          ALLOCATED);
-        } else {
-            mod::dbg::logger<"xfs">::debug("xfs_inode_read: inode %lu is marked free", static_cast<unsigned long>(ino));
+    if (ALLOCATED == 0) {
+        mod::dbg::logger<"xfs">::debug("xfs_inode_read: inode %lu is marked free", static_cast<unsigned long>(ino));
+        return finish_inode_fetch(nullptr, -ENOENT);
+    }
+    if (ALLOCATED < 0) {
+        uint64_t const COUNT = alloc_lookup_failure_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((COUNT % ALLOC_LOOKUP_WARN_INTERVAL) == 1) {
+            mod::dbg::logger<"xfs">::warn(
+                "xfs_inode_read: allocation lookup failed for inode %lu rc=%d; validating dinode directly (count=%lu)",
+                static_cast<unsigned long>(ino), ALLOCATED, COUNT);
         }
-        return finish_inode_fetch(nullptr, ALLOCATED < 0 ? ALLOCATED : -ENOENT);
     }
 
     // Not in cache - read from disk

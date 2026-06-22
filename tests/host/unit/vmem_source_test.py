@@ -5,7 +5,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-VMEM_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vmem" / "sys_vmem.cpp"
+SYS_VMEM_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vmem" / "sys_vmem.cpp"
+VIRT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "virt.opt.cpp"
 
 
 def fail(message: str) -> None:
@@ -52,7 +53,7 @@ def require_order(source: str, first: str, second: str, context: str) -> None:
 
 
 def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
-    source = VMEM_CPP.read_text()
+    source = SYS_VMEM_CPP.read_text()
     reserve_body = function_body(source, "reserve_free_mmap_range")
     anon_body = function_body(source, "anon_allocate")
     file_body = function_body(source, "file_allocate")
@@ -108,9 +109,70 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
     )
 
 
+def test_owned_frame_tracking_is_disabled_off_the_fault_path() -> None:
+    source = VIRT_CPP.read_text()
+    insert_body = function_body(source, "owned_frame_insert_private_mapping")
+    untrack_body = function_body(source, "owned_frame_untrack_mapping")
+    purge_body = function_body(source, "owned_frame_purge_pagemap")
+    snapshot_body = function_body(source, "get_owned_frame_stats_snapshot")
+
+    require_tokens(source, ["constexpr bool OWNED_FRAME_TRACKING_ENABLED = false;"], "owned frame tracking switch")
+    require_tokens(
+        insert_body,
+        [
+            "if constexpr (!OWNED_FRAME_TRACKING_ENABLED)",
+            "owned_frame_stats.track_skipped.fetch_add(1, std::memory_order_relaxed);",
+            "return;",
+        ],
+        "owned frame insert disabled path",
+    )
+    require_order(
+        insert_body,
+        "if constexpr (!OWNED_FRAME_TRACKING_ENABLED)",
+        "auto& table = owned_frame_table",
+        "owned frame insert must skip shard locks while disabled",
+    )
+
+    require_tokens(
+        untrack_body,
+        [
+            "owned_frame_stats.untrack_attempts.fetch_add(1, std::memory_order_relaxed);",
+            "if constexpr (!OWNED_FRAME_TRACKING_ENABLED)",
+            "owned_frame_stats.untrack_missed.fetch_add(1, std::memory_order_relaxed);",
+            "return;",
+        ],
+        "owned frame untrack disabled path",
+    )
+    require_order(
+        untrack_body,
+        "if constexpr (!OWNED_FRAME_TRACKING_ENABLED)",
+        "auto& table = owned_frame_table",
+        "owned frame untrack must skip shard locks while disabled",
+    )
+
+    require_order(
+        purge_body,
+        "owned_frame_stats.purge_calls.fetch_add(1, std::memory_order_relaxed);",
+        "if constexpr (!OWNED_FRAME_TRACKING_ENABLED)",
+        "owned frame purge must preserve the call counter before returning",
+    )
+    require_order(
+        purge_body,
+        "if constexpr (!OWNED_FRAME_TRACKING_ENABLED)",
+        "auto& table = owned_frame_table",
+        "owned frame purge must skip table scans while disabled",
+    )
+    require_tokens(
+        snapshot_body,
+        [".capacity = OWNED_FRAME_TRACKING_ENABLED ? OWNED_FRAME_TABLE_CAPACITY : 0,"],
+        "owned frame stats snapshot disabled capacity",
+    )
+
+
 def main() -> None:
     test_nonfixed_mmap_address_selection_is_reserved_before_mapping()
-    print("vmem mmap reservation invariants hold")
+    test_owned_frame_tracking_is_disabled_off_the_fault_path()
+    print("vmem mmap and owned-frame invariants hold")
 
 
 if __name__ == "__main__":

@@ -236,6 +236,7 @@ struct Task {
 
     // Waitpid state: when this task is waiting for another task to exit.
     uint64_t waiting_for_pid{};            // PID we're waiting for (for waitpid return value)
+    int32_t wait_options{};                // waitpid option bits active for the current block
     uint64_t wait_status_user_addr{};      // Userspace virtual address of status variable (for waitpid)
     uint64_t wait_status_phys_addr{};      // Last translated physical address (debug; may change after COW)
     uint64_t wait_rusage_user_addr{};      // Userspace virtual address of rusage struct (for wait3/wait4)
@@ -395,6 +396,9 @@ struct Task {
 
     // Exit status of this process (set when process exits, used by waitpid).
     int exit_status{};
+    std::atomic<bool> jobctl_stopped{false};
+    std::atomic<bool> jobctl_stop_pending{false};
+    uint32_t jobctl_stop_signal = 0;
     uint32_t preempt_disable_depth = 0;
     uint32_t sched_weight{};   // 1024 = default (nice 0)
     uint32_t slice_ns{};       // Time slice in nanoseconds
@@ -595,6 +599,7 @@ inline void task_accumulate_waited_child_times(Task& parent, const Task& child) 
 
 inline void task_clear_waitpid_block_state(Task& task) {
     task.waiting_for_pid = 0;
+    task.wait_options = 0;
     task.wait_status_user_addr = 0;
     task.wait_status_phys_addr = 0;
     task.wait_rusage_user_addr = 0;

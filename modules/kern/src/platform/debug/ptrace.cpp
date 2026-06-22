@@ -259,6 +259,7 @@ void complete_trace_wait(Task& tracer, Task& stopped) {
 
     tracer.context.regs.rax = stopped.pid;
     tracer.waiting_for_pid = 0;
+    tracer.wait_options = 0;
     tracer.wait_status_user_addr = 0;
     tracer.wait_status_phys_addr = 0;
     tracer.wait_rusage_user_addr = 0;
@@ -324,6 +325,35 @@ auto require_traced(Task& tracer, Task& target) -> uint64_t {
     return 0;
 }
 
+void clear_trace_state_and_wake(Task& target) {
+    if (uses_stop_snapshot(target)) {
+        (void)publish_stop_snapshot_to_syscall_scratch(target);
+    }
+    bool const WAS_STOPPED = target.ptrace_stopped;
+    target.ptrace_traced = false;
+    target.ptrace_tracer_pid = 0;
+    target.ptrace_options = 0;
+    target.ptrace_event_msg = 0;
+    target.ptrace_stop_reason = abi::ptrace::stop_reason::NONE;
+    target.ptrace_stop_signal = 0;
+    target.ptrace_stopped = false;
+    target.ptrace_stop_pending = false;
+    target.ptrace_single_step = false;
+    target.ptrace_syscall_trace = false;
+    target.ptrace_syscall_in_stop = false;
+    target.ptrace_stop_uses_syscall_snapshot = false;
+    target.ptrace_dr_addr = {};
+    target.ptrace_dr6 = 0;
+    target.ptrace_dr7 = 0;
+    clear_task_trap_flags(target);
+    if (target.wait_channel_is(ker::mod::sched::task::WaitChannelKind::PTRACE)) {
+        target.clear_wait_channel();
+    }
+    if (WAS_STOPPED || target.sched_queue == Task::sched_queue::WAITING) {
+        ker::mod::sched::reschedule_task_for_cpu(target.cpu, &target);
+    }
+}
+
 auto attach(Task& tracer, Task& target, bool seize) -> uint64_t {
     if (!can_trace(tracer, target)) {
         return as_error(EPERM);
@@ -354,29 +384,7 @@ auto detach(Task& tracer, Task& target) -> uint64_t {
     if (ERR != 0) {
         return ERR;
     }
-    if (uses_stop_snapshot(target)) {
-        (void)publish_stop_snapshot_to_syscall_scratch(target);
-    }
-    target.ptrace_traced = false;
-    target.ptrace_tracer_pid = 0;
-    target.ptrace_options = 0;
-    target.ptrace_event_msg = 0;
-    target.ptrace_stop_reason = abi::ptrace::stop_reason::NONE;
-    target.ptrace_stop_signal = 0;
-    target.ptrace_stopped = false;
-    target.ptrace_stop_pending = false;
-    target.ptrace_single_step = false;
-    target.ptrace_syscall_trace = false;
-    target.ptrace_syscall_in_stop = false;
-    target.ptrace_stop_uses_syscall_snapshot = false;
-    target.ptrace_dr_addr = {};
-    target.ptrace_dr6 = 0;
-    target.ptrace_dr7 = 0;
-    clear_task_trap_flags(target);
-    if (target.wait_channel_is(ker::mod::sched::task::WaitChannelKind::PTRACE)) {
-        target.clear_wait_channel();
-    }
-    ker::mod::sched::reschedule_task_for_cpu(target.cpu, &target);
+    clear_trace_state_and_wake(target);
     return 0;
 }
 
@@ -458,7 +466,8 @@ void publish_tracer_wait(Task& tracer, Task& target) {
 }
 
 void consume_exit_for_tracer(Task& tracer, Task& target) {
-    if (!ker::mod::sched::task::task_waited_on(target) && ker::mod::sched::task::task_try_mark_waited_on(target)) {
+    bool const TRACER_IS_PARENT = target.parent_pid == tracer.pid;
+    if (TRACER_IS_PARENT && !ker::mod::sched::task::task_waited_on(target) && ker::mod::sched::task::task_try_mark_waited_on(target)) {
         ker::mod::sched::task::task_accumulate_waited_child_times(tracer, target);
     }
     clear_tracer_wait_state(tracer);
@@ -1034,6 +1043,23 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
     return ret;
 }
 
+void detach_tracees_for_tracer_exit(uint64_t tracer_pid) {
+    if (tracer_pid == 0) {
+        return;
+    }
+
+    uint32_t const COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < COUNT; i++) {
+        auto* target = ker::mod::sched::get_active_task_at(i);
+        if (target == nullptr || !target->ptrace_traced || target->ptrace_tracer_pid != tracer_pid) {
+            continue;
+        }
+
+        log::debug("trace detach on tracer exit tracer=%lu target=%lu", tracer_pid, target->pid);
+        clear_trace_state_and_wake(*target);
+    }
+}
+
 namespace {
 
 auto report_user_stop_common(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame, abi::ptrace::stop_reason reason,
@@ -1148,5 +1174,37 @@ auto report_fatal_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum) -> 
 }
 
 auto report_signal_stop(ker::mod::sched::task::Task& task, uint32_t signal) -> bool { return record_signal_stop(task, signal); }
+
+#ifdef WOS_SELFTEST
+auto ptrace_selftest_nonparent_exit_observer_preserves_parent_wait_status() -> bool {
+    Task tracer{};
+    Task target{};
+
+    tracer.pid = 0x7001;
+    target.pid = 0x7002;
+    tracer.waiting_for_pid = target.pid;
+    target.parent_pid = 0x7003;
+    ker::mod::sched::task::task_clear_waited_on(target);
+
+    consume_exit_for_tracer(tracer, target);
+
+    return !ker::mod::sched::task::task_waited_on(target) && tracer.waiting_for_pid == 0;
+}
+
+auto ptrace_selftest_parent_exit_observer_consumes_wait_status() -> bool {
+    Task tracer{};
+    Task target{};
+
+    tracer.pid = 0x7011;
+    target.pid = 0x7012;
+    tracer.waiting_for_pid = target.pid;
+    target.parent_pid = tracer.pid;
+    ker::mod::sched::task::task_clear_waited_on(target);
+
+    consume_exit_for_tracer(tracer, target);
+
+    return ker::mod::sched::task::task_waited_on(target) && tracer.waiting_for_pid == 0;
+}
+#endif
 
 }  // namespace ker::mod::debug::ptrace

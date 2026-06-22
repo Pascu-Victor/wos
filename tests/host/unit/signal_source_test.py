@@ -6,7 +6,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 SIGNAL_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "signal.cpp"
-SCHEDULER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.cpp"
+CONTEXT_SWITCH_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "context_switch.cpp"
+PROCESS_CALLNUMS = ROOT / "modules" / "kern" / "src" / "abi" / "callnums" / "process.h"
+PROCESS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "process.cpp"
+WOS_PROCESS_H = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "sys" / "process.h"
+WOS_SYSDEPS_CPP = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "generic" / "sysdeps.cpp"
+WOS_MLIBC_CALLNUMS = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "callnums" / "process.h"
+WOS_SYSDEPS_H = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "mlibc" / "sysdeps.hpp"
+STRACE_MAIN = ROOT / "modules" / "strace" / "src" / "main.cpp"
 
 
 def fail(message: str) -> None:
@@ -15,7 +22,7 @@ def fail(message: str) -> None:
 
 def function_body(source: str, name: str) -> str:
     match = re.search(
-        rf"(?:\b(?:auto|void)|extern\s+\"C\"\s+auto)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
+        rf"(?:\b(?:auto|void)|extern\s+\"C\"\s+(?:auto|void))\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
         source,
         flags=re.DOTALL,
     )
@@ -97,7 +104,6 @@ def test_syscall_signal_delivery_updates_live_gs_scratch() -> None:
 
 def test_signal_targets_are_user_canonical_on_all_delivery_paths() -> None:
     signal_source = SIGNAL_CPP.read_text()
-    scheduler_source = SCHEDULER_CPP.read_text()
 
     require_tokens(
         signal_source,
@@ -108,9 +114,10 @@ def test_signal_targets_are_user_canonical_on_all_delivery_paths() -> None:
         "direct syscall/interrupt signal target validation",
     )
     require_tokens(
-        scheduler_source,
+        signal_source,
         [
-            "inline auto user_signal_target_valid(task::Task::SigHandler const& handler) -> bool",
+            "auto user_signal_target_valid(const ker::mod::sched::task::Task::SigHandler& handler) -> bool",
+            "if (delivery == DeferredSignalDelivery::USER_HANDLERS_ONLY && !is_user_signal_handler(handler))",
             "if (is_user_signal_handler(handler) && !user_signal_target_valid(handler))",
             "ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);",
         ],
@@ -118,7 +125,129 @@ def test_signal_targets_are_user_canonical_on_all_delivery_paths() -> None:
     )
 
 
+def test_interrupt_signal_delivery_is_gated_by_user_return_frame() -> None:
+    context_source = CONTEXT_SWITCH_CPP.read_text()
+    helper_body = function_body(context_source, "check_pending_signals_for_return")
+    timer_body = function_body(context_source, "wos_sched_timer")
+    exit_body = function_body(context_source, "wos_jump_to_next_task_no_save")
+
+    require_tokens(
+        context_source,
+        [
+            "inline auto is_user_return_frame(const gates::InterruptFrame& frame) -> bool",
+            "inline void check_pending_signals_for_return(cpu::GPRegs& gpr, gates::InterruptFrame& frame)",
+        ],
+        "context-switch signal return helper",
+    )
+    require_tokens(
+        helper_body,
+        [
+            "if (!is_user_return_frame(frame))",
+            "auto* return_task = sched::get_return_task();",
+            "sys::signal::check_pending_signals_interrupt(gpr, frame);",
+            "sys::signal::check_pending_signals_handoff(return_task, gpr, frame);",
+        ],
+        "return-frame signal gate",
+    )
+    require_order(
+        helper_body,
+        "if (!is_user_return_frame(frame))",
+        "auto* return_task = sched::get_return_task();",
+        "kernel return frames must be rejected before querying scheduler current/return task state",
+    )
+    require_tokens(
+        timer_body,
+        [
+            "sched::process_tasks(*gpr_ptr, *frame_ptr);",
+            "check_pending_signals_for_return(*gpr_ptr, *frame_ptr);",
+            'validate_kernel_frame(*frame_ptr, return_task, "timer-return");',
+        ],
+        "timer return signal gate",
+    )
+    require_tokens(
+        exit_body,
+        [
+            "sched::jump_to_next_task(*gpr_ptr, *frame_ptr);",
+            "check_pending_signals_for_return(*gpr_ptr, *frame_ptr);",
+            'validate_kernel_frame(*frame_ptr, return_task, "exit-return");',
+        ],
+        "exit return signal gate",
+    )
+    for body, context in [(timer_body, "timer"), (exit_body, "exit")]:
+        if "check_pending_signals_interrupt(*gpr_ptr, *frame_ptr)" in body:
+            fail(f"{context} return path must not call interrupt signal delivery before the frame-mode gate")
+
+
+def test_sigpending_is_wired_through_wos_sysdeps() -> None:
+    process_callnums = PROCESS_CALLNUMS.read_text()
+    process_source = PROCESS_CPP.read_text()
+    wos_mlibc_callnums = WOS_MLIBC_CALLNUMS.read_text()
+    wos_sysdeps_header = WOS_SYSDEPS_H.read_text()
+    wos_process_header = WOS_PROCESS_H.read_text()
+    wos_sysdeps = WOS_SYSDEPS_CPP.read_text()
+    strace_source = STRACE_MAIN.read_text()
+
+    require_tokens(
+        process_callnums,
+        [
+            "SIGPENDING,     // 41",
+        ],
+        "process syscall ABI exposes appended SIGPENDING op",
+    )
+    require_tokens(
+        process_source,
+        [
+            "auto wos_proc_sigpending(uint64_t set_ptr) -> uint64_t",
+            "std::memset(set, 0, 1024 / 8);",
+            "set[0] = task->sig_pending & task->sig_mask;",
+            "case abi::process::procmgmt_ops::SIGPENDING:",
+            "return wos_proc_sigpending(a2);",
+        ],
+        "kernel sigpending syscall",
+    )
+    require_tokens(
+        wos_mlibc_callnums,
+        [
+            "SIGPENDING,    // 41",
+        ],
+        "mlibc syscall ABI copy exposes appended SIGPENDING op",
+    )
+    require_tokens(
+        wos_sysdeps_header,
+        [
+            "Sigpending,",
+        ],
+        "wos mlibc sysdep tag list advertises sigpending",
+    )
+    require_tokens(
+        wos_process_header,
+        [
+            "inline int64_t sigpending(void *set)",
+            "(uint64_t)abi::process::procmgmt_ops::SIGPENDING",
+        ],
+        "wos mlibc sigpending syscall wrapper",
+    )
+    require_tokens(
+        wos_sysdeps,
+        [
+            "int Sysdeps<Sigpending>::operator()(sigset_t *set)",
+            "ker::process::sigpending((void *)set)",
+        ],
+        "wos mlibc sigpending sysdep",
+    )
+    require_tokens(
+        strace_source,
+        [
+            "case ker::abi::process::procmgmt_ops::SIGPENDING:",
+            'return "sigpending";',
+        ],
+        "strace process syscall name table",
+    )
+
+
 if __name__ == "__main__":
     test_syscall_signal_delivery_updates_live_gs_scratch()
     test_signal_targets_are_user_canonical_on_all_delivery_paths()
+    test_interrupt_signal_delivery_is_gated_by_user_return_frame()
+    test_sigpending_is_wired_through_wos_sysdeps()
     print("signal syscall return invariants hold")

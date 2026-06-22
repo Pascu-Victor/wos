@@ -10,6 +10,7 @@
 #include <net/wki/wki.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/debug/ptrace.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
@@ -174,6 +175,7 @@ auto complete_exit_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::ta
     write_wait_status_for_waiter(waiter, child->exit_status);
     fill_rusage_for_waiter(waiter, child);
     waiter->waiting_for_pid = 0;
+    waiter->wait_options = 0;
     return true;
 }
 
@@ -224,8 +226,9 @@ void notify_tracer_after_exit_ready(ker::mod::sched::task::Task* child) {
     }
 
     bool wake_tracer = false;
-    if (!sched_task::task_waited_on(*child) && waiter_matches_child(tracer, child)) {
-        if (waiter_context_can_be_completed(tracer)) {
+    if (waiter_matches_child(tracer, child)) {
+        bool const TRACER_IS_PARENT = child->parent_pid == tracer->pid;
+        if (TRACER_IS_PARENT && !sched_task::task_waited_on(*child) && waiter_context_can_be_completed(tracer)) {
             wake_tracer = complete_exit_wait(tracer, child, "exit-ptrace");
         } else {
             wake_tracer = true;
@@ -317,6 +320,8 @@ void wos_proc_exit_with_wait_status(int status, int wait_status) {
                current_task->name != nullptr ? current_task->name : "?", status, current_task->is_thread, current_task->owner_pid,
                static_cast<void*>(current_task->pagemap));
 #endif
+    ker::mod::debug::ptrace::detach_tracees_for_tracer_exit(current_task->pid);
+
     // Reparent all children of this process to init (PID 1), so init can reap them.
     // Threads do not own children directly - skip reparenting for thread exits.
     if (!current_task->is_thread) {
@@ -411,6 +416,7 @@ void wos_proc_exit_with_wait_status(int status, int wait_status) {
 #endif
                     fill_rusage_for_waiter(waiting_task, current_task);
                     waiting_task->waiting_for_pid = 0;
+                    waiting_task->wait_options = 0;
                 }
 
                 // Reschedule the waiting task on its last-known CPU to avoid cross-CPU migration

@@ -103,4 +103,5 @@ static_assert(offsetof(Gdt, tss) == 40);
 static_assert(offsetof(Gdt, ptr) == 56);
 
 void init_descriptors(uint64_t* stack_pointer, uint64_t cpu_id);
+void set_rsp0(const uint64_t* stack_pointer, uint64_t cpu_id);
 }  // namespace ker::mod::desc::gdt

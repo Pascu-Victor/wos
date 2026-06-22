@@ -26,14 +26,6 @@ using log = ker::mod::dbg::logger<"tcp">;
 
 namespace {
 constexpr auto TCP_IPV4_TTL = static_cast<uint8_t>(IPV4_DEFAULT_TTL);
-constexpr uint8_t TCP_OPTION_EOL = 0;
-constexpr uint8_t TCP_OPTION_NOP = 1;
-constexpr uint8_t TCP_OPTION_MSS = 2;
-constexpr uint8_t TCP_OPTION_WSCALE = 3;
-constexpr uint8_t TCP_OPTION_MSS_LEN = 4;
-constexpr uint8_t TCP_OPTION_WSCALE_LEN = 3;
-constexpr size_t TCP_OPTION_LEN_OFFSET = 1;
-constexpr size_t TCP_OPTION_DATA_OFFSET = 2;
 constexpr size_t TCP_OOO_MAX_BYTES = static_cast<size_t>(1024U) * 1024U;
 constexpr size_t TCP_OOO_MAX_SEGMENTS = 512;
 
@@ -68,6 +60,8 @@ void parse_syn_options(TcpCB* cb, const TcpHeader* hdr, bool refresh_receive_wsc
         }
         if (opts[i] == TCP_OPTION_MSS && OPT_LEN == TCP_OPTION_MSS_LEN) {
             cb->snd_mss = read_be16_unaligned(opts + i + TCP_OPTION_DATA_OFFSET);
+        } else if (opts[i] == TCP_OPTION_SACK_PERMITTED && OPT_LEN == TCP_OPTION_SACK_PERMITTED_LEN) {
+            cb->sack_permitted = true;
         } else if (opts[i] == TCP_OPTION_WSCALE && OPT_LEN == TCP_OPTION_WSCALE_LEN) {
             cb->snd_wscale = opts[i + TCP_OPTION_DATA_OFFSET];
             cb->ws_enabled = true;
@@ -124,6 +118,64 @@ void drain_retransmit_queue(TcpCB* cb) {
 #endif
 }
 
+void update_rto_from_sample_locked(TcpCB* cb, uint64_t rtt_ms) {
+    if (cb == nullptr) {
+        return;
+    }
+    if (rtt_ms == 0) {
+        rtt_ms = 1;
+    }
+
+    if (cb->srtt_ms == 0) {
+        cb->srtt_ms = rtt_ms;
+        cb->rttvar_ms = rtt_ms / 2;
+    } else {
+        int64_t const DELTA = static_cast<int64_t>(rtt_ms) - static_cast<int64_t>(cb->srtt_ms);
+        cb->srtt_ms = cb->srtt_ms + (DELTA / 8);
+        int64_t const ABS_DELTA = DELTA < 0 ? -DELTA : DELTA;
+        cb->rttvar_ms = cb->rttvar_ms + ((ABS_DELTA - static_cast<int64_t>(cb->rttvar_ms)) / 4);
+    }
+
+    cb->rto_ms = cb->srtt_ms + (4 * cb->rttvar_ms);
+    cb->rto_ms = std::max<uint64_t>(cb->rto_ms, TCP_RTO_MIN_MS);
+    cb->rto_ms = std::min<uint64_t>(cb->rto_ms, TCP_RTO_MAX_MS);
+}
+
+void retire_acked_retransmits_locked(TcpCB* cb, uint32_t seg_ack, uint64_t now_ms, bool update_rtt) {
+    if (cb == nullptr) {
+        return;
+    }
+
+    bool rtt_sampled = false;
+    while (cb->retransmit_head != nullptr) {
+        auto* entry = cb->retransmit_head;
+        uint32_t const ENTRY_END = entry->seq + static_cast<uint32_t>(entry->len);
+        if (tcp_seq_after(ENTRY_END, seg_ack)) {
+            break;
+        }
+
+        if (update_rtt && !rtt_sampled && entry->retries == 0) {
+            update_rto_from_sample_locked(cb, now_ms - entry->send_time_ms);
+            rtt_sampled = true;
+        }
+
+        cb->retransmit_head = entry->next;
+        if (cb->retransmit_head == nullptr) {
+            cb->retransmit_tail = nullptr;
+        }
+        if (entry->pkt != nullptr) {
+            pkt_free(entry->pkt);
+        }
+        delete entry;
+    }
+
+    if (cb->retransmit_head != nullptr) {
+        cb->retransmit_deadline = tcp_deadline_after_ms(now_ms, cb->rto_ms);
+    } else {
+        cb->retransmit_deadline = 0;
+    }
+}
+
 auto queue_in_order_payload(TcpCB* cb, Socket* sock, const uint8_t* payload, size_t payload_len) -> bool {
     if (cb == nullptr || sock == nullptr || payload == nullptr || payload_len == 0) {
         return false;
@@ -156,6 +208,28 @@ auto queue_in_order_payload(TcpCB* cb, Socket* sock, const uint8_t* payload, siz
 }
 
 auto tcp_seq_end(uint32_t seq, size_t len) -> uint32_t { return seq + static_cast<uint32_t>(len); }
+
+auto consume_fin_if_in_sequence(TcpCB* cb, uint32_t seg_seq, size_t payload_len) -> bool {
+    if (cb == nullptr) {
+        return false;
+    }
+
+    uint32_t const FIN_SEQ = tcp_seq_end(seg_seq, payload_len);
+    if (FIN_SEQ != cb->rcv_nxt) {
+        tcp_refresh_receive_window(cb);
+        return false;
+    }
+
+    cb->rcv_nxt = FIN_SEQ + 1;
+    tcp_refresh_receive_window(cb);
+    return true;
+}
+
+struct TcpPayloadReceiveResult {
+    bool accepted = false;
+    bool drained_ooo = false;
+    bool queued_out_of_order = false;
+};
 
 auto count_out_of_order_segments(const TcpCB* cb) -> size_t {
     size_t count = 0;
@@ -294,6 +368,75 @@ auto drain_out_of_order_payload(TcpCB* cb, Socket* sock) -> bool {
     return progressed;
 }
 
+auto receive_segment_payload(TcpCB* cb, Socket* sock, const uint8_t* payload, size_t payload_len, uint32_t seg_seq)
+    -> TcpPayloadReceiveResult {
+    TcpPayloadReceiveResult result{};
+    if (cb == nullptr || sock == nullptr || payload == nullptr || payload_len == 0) {
+        return result;
+    }
+
+    uint32_t const SEG_END = tcp_seq_end(seg_seq, payload_len);
+    if (!tcp_seq_after(SEG_END, cb->rcv_nxt)) {
+        tcp_refresh_receive_window(cb);
+        return result;
+    }
+
+    if (tcp_seq_before(seg_seq, cb->rcv_nxt)) {
+        auto const TRIM = static_cast<size_t>(cb->rcv_nxt - seg_seq);
+        if (TRIM >= payload_len) {
+            tcp_refresh_receive_window(cb);
+            return result;
+        }
+        payload += TRIM;
+        payload_len -= TRIM;
+        seg_seq = cb->rcv_nxt;
+    }
+
+    if (seg_seq == cb->rcv_nxt) {
+        if (queue_in_order_payload(cb, sock, payload, payload_len)) {
+            result.accepted = true;
+            result.drained_ooo = drain_out_of_order_payload(cb, sock);
+        }
+        return result;
+    }
+
+    if (tcp_seq_after(seg_seq, cb->rcv_nxt)) {
+        result.queued_out_of_order = queue_out_of_order_payload(cb, payload, payload_len, seg_seq);
+    }
+    return result;
+}
+
+auto discard_orphaned_payload(TcpCB* cb, size_t payload_len, uint32_t seg_seq) -> bool {
+    if (cb == nullptr || payload_len == 0) {
+        return false;
+    }
+
+    uint32_t const SEG_END = tcp_seq_end(seg_seq, payload_len);
+    if (!tcp_seq_after(SEG_END, cb->rcv_nxt)) {
+        tcp_refresh_receive_window(cb);
+        return false;
+    }
+
+    if (tcp_seq_before(seg_seq, cb->rcv_nxt)) {
+        auto const TRIM = static_cast<size_t>(cb->rcv_nxt - seg_seq);
+        if (TRIM >= payload_len) {
+            tcp_refresh_receive_window(cb);
+            return false;
+        }
+        payload_len -= TRIM;
+        seg_seq = cb->rcv_nxt;
+    }
+
+    if (seg_seq != cb->rcv_nxt) {
+        tcp_refresh_receive_window(cb);
+        return false;
+    }
+
+    cb->rcv_nxt += static_cast<uint32_t>(payload_len);
+    tcp_refresh_receive_window(cb);
+    return true;
+}
+
 // Handle SYN on a listening socket.
 void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, IPv4Address src_ip, IPv4Address dst_ip) {
     Socket const* listen_sock = listener->socket;
@@ -337,8 +480,7 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, IPv4Address src_ip
     child_cb->rcv_wnd = child->rcvbuf.capacity;
     child_cb->rcv_wscale = tcp_wscale_for_buf(child->rcvbuf.capacity);
 
-    child_cb->iss = ntohl(hdr->seq) ^ 0xDEADBEEF;
-    child_cb->iss += tcp_now_ms();
+    child_cb->iss = tcp_generate_iss(child_cb->local_ip, child_cb->local_port, child_cb->remote_ip, child_cb->remote_port);
     child_cb->snd_una = child_cb->iss;
     child_cb->snd_nxt = child_cb->iss + 1;
     // SYN window is not scaled (RFC 1323).
@@ -398,48 +540,8 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
         if (ACK_ADVANCES && VALID_ACK) {
             cb->snd_una = seg_ack;
 
-            bool rtt_sampled = false;
             uint64_t const NOW = tcp_now_ms();
-            while (cb->retransmit_head != nullptr) {
-                auto* entry = cb->retransmit_head;
-                uint32_t const ENTRY_END = entry->seq + static_cast<uint32_t>(entry->len);
-                if (!tcp_seq_after(ENTRY_END, seg_ack)) {
-                    if (!rtt_sampled && entry->retries == 0) {
-                        uint64_t rtt = NOW - entry->send_time_ms;
-                        if (rtt == 0) {
-                            rtt = 1;
-                        }
-                        if (cb->srtt_ms == 0) {
-                            cb->srtt_ms = rtt;
-                            cb->rttvar_ms = rtt / 2;
-                        } else {
-                            int64_t const DELTA = static_cast<int64_t>(rtt) - static_cast<int64_t>(cb->srtt_ms);
-                            cb->srtt_ms = cb->srtt_ms + (DELTA / 8);
-                            int64_t const ABS_DELTA = DELTA < 0 ? -DELTA : DELTA;
-                            cb->rttvar_ms = cb->rttvar_ms + ((ABS_DELTA - static_cast<int64_t>(cb->rttvar_ms)) / 4);
-                        }
-                        cb->rto_ms = cb->srtt_ms + (4 * cb->rttvar_ms);
-                        cb->rto_ms = std::max<uint64_t>(cb->rto_ms, 50ULL);
-                        cb->rto_ms = std::min<uint64_t>(cb->rto_ms, 60000);
-                        rtt_sampled = true;
-                    }
-
-                    cb->retransmit_head = entry->next;
-                    if (cb->retransmit_head == nullptr) {
-                        cb->retransmit_tail = nullptr;
-                    }
-                    if (entry->pkt != nullptr) {
-                        pkt_free(entry->pkt);
-                    }
-                    delete entry;
-                } else {
-                    break;
-                }
-            }
-
-            if (cb->retransmit_head != nullptr) {
-                cb->retransmit_deadline = tcp_deadline_after_ms(NOW, cb->rto_ms);
-            }
+            retire_acked_retransmits_locked(cb, seg_ack, NOW, true);
 
             cb->ack_pending = false;
             deferred_wake = true;
@@ -456,17 +558,19 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     cb->rcv_nxt = SEG_SEQ + 1;
                     cb->snd_una = seg_ack;
                     cb->snd_wnd = seg_wnd;
-                    cb->lock.unlock_irqrestore(cb_lock_flags);
-
+                    retire_acked_retransmits_locked(cb, seg_ack, tcp_now_ms(), true);
                     parse_syn_options(cb, hdr, true);
 
                     cb->state = TcpState::ESTABLISHED;
                     if (cb->socket != nullptr) {
                         cb->socket->state = SocketState::CONNECTED;
                     }
+                    Socket* socket_to_wake = cb->socket;
+                    cb->lock.unlock_irqrestore(cb_lock_flags);
+
                     tcp_send_ack(cb);
 
-                    wake_socket(cb->socket);
+                    wake_socket(socket_to_wake);
 
                     // Lock already dropped above.
                     tcp_cb_release(cb);
@@ -498,23 +602,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     cb->state = TcpState::ESTABLISHED;
                     cb->snd_una = seg_ack;
 
-                    // Drop SYN-ACK retransmit entries after handshake.
-                    while (cb->retransmit_head != nullptr) {
-                        auto* entry = cb->retransmit_head;
-                        uint32_t const ENTRY_END = entry->seq + static_cast<uint32_t>(entry->len);
-                        if (!tcp_seq_after(ENTRY_END, seg_ack)) {
-                            cb->retransmit_head = entry->next;
-                            if (cb->retransmit_head == nullptr) {
-                                cb->retransmit_tail = nullptr;
-                            }
-                            if (entry->pkt != nullptr) {
-                                pkt_free(entry->pkt);
-                            }
-                            delete entry;
-                        } else {
-                            break;
-                        }
-                    }
+                    retire_acked_retransmits_locked(cb, seg_ack, tcp_now_ms(), true);
                     cb->snd_wnd = static_cast<uint32_t>(seg_wnd) << cb->snd_wscale;
 
                     // Release cb->lock before tcp_find_listener (takes tcb_list_lock).
@@ -560,13 +648,12 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
                     if (payload_len > 0 && child_sock != nullptr) {
                         cb_lock_flags = cb->lock.lock_irqsave();
-                        if (SEG_SEQ == cb->rcv_nxt) {
-                            if (queue_in_order_payload(cb, child_sock, payload, payload_len)) {
-                                static_cast<void>(drain_out_of_order_payload(cb, child_sock));
-                                deferred_wake = true;
-                            }
-                            build_deferred_ack();
+                        TcpPayloadReceiveResult const PAYLOAD_RESULT =
+                            receive_segment_payload(cb, child_sock, payload, payload_len, SEG_SEQ);
+                        if (PAYLOAD_RESULT.accepted) {
+                            deferred_wake = true;
                         }
+                        build_deferred_ack();
                         cb->lock.unlock_irqrestore(cb_lock_flags);
                         if (deferred_ack != nullptr) {
                             if (ipv4_tx(deferred_ack, defer_local, defer_remote, IPPROTO_TCP, TCP_IPV4_TTL) < 0) {
@@ -618,15 +705,14 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
             process_stream_ack();
 
-            if (payload_len > 0 && SEG_SEQ == cb->rcv_nxt) {
-                bool accepted_payload = false;
-                bool drained_ooo = false;
+            if (payload_len > 0) {
+                TcpPayloadReceiveResult payload_result{};
                 if (cb->socket != nullptr) {
-                    if (queue_in_order_payload(cb, cb->socket, payload, payload_len)) {
-                        accepted_payload = true;
-                        drained_ooo = drain_out_of_order_payload(cb, cb->socket);
+                    payload_result = receive_segment_payload(cb, cb->socket, payload, payload_len, SEG_SEQ);
+                    if (payload_result.accepted) {
                         deferred_wake = true;
-                    } else {
+                    }
+                    if (!payload_result.accepted && !payload_result.queued_out_of_order && SEG_SEQ == cb->rcv_nxt) {
                         log::warn("rcvbuf full port=%u avail=%zu cap=%zu pktlen=%zu", cb->local_port, cb->socket->rcvbuf.available(),
                                   cb->socket->rcvbuf.capacity, payload_len);
                     }
@@ -636,7 +722,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 // on the delayed-ACK timer here can stall the peer if the timer
                 // worker is not scheduled quickly enough under early boot/load.
                 const bool ACK_IMMEDIATELY = (flags & TCP_PSH) != 0 || payload_len < cb->rcv_mss;
-                bool should_ack_now = !accepted_payload || drained_ooo || ACK_IMMEDIATELY;
+                bool should_ack_now = !payload_result.accepted || payload_result.drained_ooo || ACK_IMMEDIATELY;
                 if (!should_ack_now) {
                     should_ack_now = ++cb->segs_pending_ack >= 2;
                 }
@@ -652,19 +738,6 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     cb->delayed_ack_deadline = tcp_deadline_after_ms(tcp_now_ms(), 40);
                     tcp_timer_arm(cb);
                 }
-            } else if (payload_len > 0) {
-                // Duplicate or out-of-order data still needs an ACK carrying
-                // the current rcv_nxt. Without this, a lost delayed ACK leaves
-                // the peer retransmitting a segment we already consumed.
-                if (cb->socket != nullptr) {
-                    tcp_refresh_receive_window(cb);
-                    if (tcp_seq_after(SEG_SEQ, cb->rcv_nxt)) {
-                        static_cast<void>(queue_out_of_order_payload(cb, payload, payload_len, SEG_SEQ));
-                    }
-                }
-                cb->segs_pending_ack = 0;
-                cb->delayed_ack_deadline = 0;
-                build_deferred_ack();
             } else if (payload_len == 0 && (flags & TCP_ACK) != 0 && tcp_seq_before(SEG_SEQ, cb->rcv_nxt)) {
                 // Keepalive probe
                 build_deferred_ack();
@@ -672,13 +745,14 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
             // FIN: ACK immediately and cancel delayed ACK.
             if ((flags & TCP_FIN) != 0) {
-                cb->rcv_nxt = SEG_SEQ + static_cast<uint32_t>(payload_len) + 1;
                 cb->segs_pending_ack = 0;
                 cb->delayed_ack_deadline = 0;
-                cb->keepalive_deadline = 0;
+                if (consume_fin_if_in_sequence(cb, SEG_SEQ, payload_len)) {
+                    cb->keepalive_deadline = 0;
+                    cb->state = TcpState::CLOSE_WAIT;
+                    deferred_wake = true;
+                }
                 build_deferred_ack();
-                cb->state = TcpState::CLOSE_WAIT;
-                deferred_wake = true;
             }
             break;
         }
@@ -701,6 +775,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
         }
 
         case TcpState::FIN_WAIT_1: {
+            bool our_fin_acked = false;
             if ((flags & TCP_RST) != 0) {
                 drain_retransmit_queue(cb);
                 cb->state = TcpState::CLOSED;
@@ -714,57 +789,45 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     cb->snd_una = seg_ack;
                     cb->snd_wnd = static_cast<uint32_t>(seg_wnd) << cb->snd_wscale;
 
-                    while (cb->retransmit_head != nullptr) {
-                        auto* entry = cb->retransmit_head;
-                        uint32_t const ENTRY_END = entry->seq + static_cast<uint32_t>(entry->len);
-                        if (!tcp_seq_after(ENTRY_END, seg_ack)) {
-                            cb->retransmit_head = entry->next;
-                            if (cb->retransmit_head == nullptr) {
-                                cb->retransmit_tail = nullptr;
-                            }
-                            if (entry->pkt != nullptr) {
-                                pkt_free(entry->pkt);
-                            }
-                            delete entry;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    if (cb->retransmit_head != nullptr) {
-                        cb->retransmit_deadline = tcp_deadline_after_ms(tcp_now_ms(), cb->rto_ms);
-                    }
+                    retire_acked_retransmits_locked(cb, seg_ack, tcp_now_ms(), true);
 
                     // Full ACK includes our FIN.
                     if (seg_ack == cb->snd_nxt) {
-                        if ((flags & TCP_FIN) != 0) {
-                            cb->rcv_nxt = SEG_SEQ + static_cast<uint32_t>(payload_len) + 1;
-                            build_deferred_ack();
-                            drain_retransmit_queue(cb);
-                            cb->state = TcpState::TIME_WAIT;
-                            cb->time_wait_deadline = tcp_deadline_after_ms(tcp_now_ms(), 10000);
-                            tcp_timer_arm(cb);
-                            deferred_wake = true;
-                        } else {
+                        our_fin_acked = true;
+                        if ((flags & TCP_FIN) == 0) {
                             cb->state = TcpState::FIN_WAIT_2;
                             deferred_wake = true;
                         }
                     }
                 }
             }
-            if ((flags & TCP_FIN) != 0 && cb->state == TcpState::FIN_WAIT_1) {
-                cb->rcv_nxt = SEG_SEQ + static_cast<uint32_t>(payload_len) + 1;
-                build_deferred_ack();
-                cb->state = TcpState::CLOSING;
-                deferred_wake = true;
-            }
-            if (payload_len > 0 && cb->socket != nullptr) {
-                if (SEG_SEQ == cb->rcv_nxt) {
-                    if (queue_in_order_payload(cb, cb->socket, payload, payload_len)) {
+            if (payload_len > 0) {
+                if (cb->socket != nullptr) {
+                    TcpPayloadReceiveResult const PAYLOAD_RESULT = receive_segment_payload(cb, cb->socket, payload, payload_len, SEG_SEQ);
+                    if (PAYLOAD_RESULT.accepted) {
                         deferred_wake = true;
                     }
-                    build_deferred_ack();
+                } else {
+                    static_cast<void>(discard_orphaned_payload(cb, payload_len, SEG_SEQ));
                 }
+                build_deferred_ack();
+            }
+            if ((flags & TCP_FIN) != 0 && cb->state == TcpState::FIN_WAIT_1) {
+                if (consume_fin_if_in_sequence(cb, SEG_SEQ, payload_len)) {
+                    if (our_fin_acked) {
+                        drain_retransmit_queue(cb);
+                        cb->state = TcpState::TIME_WAIT;
+                        cb->time_wait_deadline = tcp_deadline_after_ms(tcp_now_ms(), 10000);
+                        tcp_timer_arm(cb);
+                    } else {
+                        cb->state = TcpState::CLOSING;
+                    }
+                    deferred_wake = true;
+                } else if (our_fin_acked) {
+                    cb->state = TcpState::FIN_WAIT_2;
+                    deferred_wake = true;
+                }
+                build_deferred_ack();
             }
             break;
         }
@@ -794,27 +857,34 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 return;
             }
 
-            if (payload_len > 0 && cb->socket != nullptr) {
-                if (SEG_SEQ == cb->rcv_nxt) {
-                    if (queue_in_order_payload(cb, cb->socket, payload, payload_len)) {
+            if (payload_len > 0) {
+                if (cb->socket != nullptr) {
+                    TcpPayloadReceiveResult const PAYLOAD_RESULT = receive_segment_payload(cb, cb->socket, payload, payload_len, SEG_SEQ);
+                    if (PAYLOAD_RESULT.accepted) {
                         deferred_wake = true;
                     }
-                    build_deferred_ack();
+                } else {
+                    static_cast<void>(discard_orphaned_payload(cb, payload_len, SEG_SEQ));
                 }
+                build_deferred_ack();
             }
             if ((flags & TCP_FIN) != 0) {
-                cb->rcv_nxt = SEG_SEQ + static_cast<uint32_t>(payload_len) + 1;
+                if (consume_fin_if_in_sequence(cb, SEG_SEQ, payload_len)) {
+                    drain_retransmit_queue(cb);
+                    cb->state = TcpState::TIME_WAIT;
+                    cb->time_wait_deadline = tcp_deadline_after_ms(tcp_now_ms(), 10000);
+                    tcp_timer_arm(cb);
+                    deferred_wake = true;
+                }
                 build_deferred_ack();
-                drain_retransmit_queue(cb);
-                cb->state = TcpState::TIME_WAIT;
-                cb->time_wait_deadline = tcp_deadline_after_ms(tcp_now_ms(), 10000);
-                tcp_timer_arm(cb);
-                deferred_wake = true;
             }
             break;
         }
 
         case TcpState::CLOSING: {
+            if ((flags & TCP_FIN) != 0) {
+                build_deferred_ack();
+            }
             if ((flags & TCP_ACK) != 0 && seg_ack == cb->snd_nxt) {
                 drain_retransmit_queue(cb);
                 cb->state = TcpState::TIME_WAIT;
@@ -826,12 +896,24 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
         }
 
         case TcpState::LAST_ACK: {
+            if ((flags & TCP_FIN) != 0) {
+                build_deferred_ack();
+            }
             if ((flags & TCP_ACK) != 0 && seg_ack == cb->snd_nxt) {
+                PacketBuffer* closing_ack = deferred_ack;
+                uint32_t const CLOSING_ACK_LOCAL = defer_local;
+                uint32_t const CLOSING_ACK_REMOTE = defer_remote;
+                deferred_ack = nullptr;
+                defer_ack_pending = false;
+
                 cb->state = TcpState::CLOSED;
                 if (cb->socket != nullptr) {
                     cb->socket->proto_data = nullptr;
                 }
                 cb->lock.unlock_irqrestore(cb_lock_flags);
+                if (closing_ack != nullptr) {
+                    static_cast<void>(ipv4_tx(closing_ack, CLOSING_ACK_LOCAL, CLOSING_ACK_REMOTE, IPPROTO_TCP, TCP_IPV4_TTL));
+                }
                 tcp_free_cb(cb);
                 tcp_cb_release(cb);
                 return;

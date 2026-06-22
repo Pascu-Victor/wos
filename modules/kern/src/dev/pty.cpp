@@ -644,11 +644,21 @@ ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
 // --- Line discipline helpers ---
 
 // Send signal to a foreground process group snapshot.
-void pty_signal_pgrp(int foreground_pgrp, int sig) {
-    if (foreground_pgrp <= 0) {
+void pty_signal_pgrp(int controlling_tty, uint64_t foreground_pgrp, int sig) {
+    if (foreground_pgrp != 0) {
+        if (ker::mod::sched::signal_process_group(foreground_pgrp, sig) != 0) {
+            return;
+        }
+
+        // A WKI-forwarded terminal can proxy TIOCSPGRP from the remote node,
+        // leaving the local PTY with a remote pgid that has no local task
+        // match.  In that case, only forward to local WKI proxy tasks; do not
+        // signal the whole local SSH/dropbear controlling-tty session.
+        static_cast<void>(ker::mod::sched::signal_controlling_tty_wki_proxies(controlling_tty, sig));
         return;
     }
-    ker::mod::sched::signal_process_group(static_cast<uint64_t>(foreground_pgrp), sig);
+
+    static_cast<void>(ker::mod::sched::signal_controlling_tty(controlling_tty, sig));
 }
 
 // Echo a single byte to s2m, applying output post-processing
@@ -764,7 +774,8 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
         // Signal generation (c_lflag ISIG)
         if ((pair->termios.c_lflag & TIOS_ISIG) != 0U) {
             if (ch == pair->termios.c_cc[CC_VINTR] && pair->termios.c_cc[CC_VINTR] != 0) {
-                int const SIGNAL_PGRP = pair->foreground_pgrp;
+                uint64_t const SIGNAL_PGRP = pair->foreground_pgrp;
+                int const SIGNAL_TTY = pair->index;
                 if ((pair->termios.c_lflag & TIOS_ECHO) != 0U) {
                     pty_echo_ctrl(pair, ch);
                     pty_echo_byte(pair, '\n');
@@ -774,14 +785,15 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     pair->canon_len = 0;
                 }
                 pair->lock.unlock_irqrestore(IRQF);
-                pty_signal_pgrp(SIGNAL_PGRP, SIG_INT);
+                pty_signal_pgrp(SIGNAL_TTY, SIGNAL_PGRP, SIG_INT);
                 if (!from_replay) {
                     processed++;
                 }
                 continue;
             }
             if (ch == pair->termios.c_cc[CC_VQUIT] && pair->termios.c_cc[CC_VQUIT] != 0) {
-                int const SIGNAL_PGRP = pair->foreground_pgrp;
+                uint64_t const SIGNAL_PGRP = pair->foreground_pgrp;
+                int const SIGNAL_TTY = pair->index;
                 if ((pair->termios.c_lflag & TIOS_ECHO) != 0U) {
                     pty_echo_ctrl(pair, ch);
                     pty_echo_byte(pair, '\n');
@@ -791,20 +803,21 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     pair->canon_len = 0;
                 }
                 pair->lock.unlock_irqrestore(IRQF);
-                pty_signal_pgrp(SIGNAL_PGRP, SIG_QUIT);
+                pty_signal_pgrp(SIGNAL_TTY, SIGNAL_PGRP, SIG_QUIT);
                 if (!from_replay) {
                     processed++;
                 }
                 continue;
             }
             if (ch == pair->termios.c_cc[CC_VSUSP] && pair->termios.c_cc[CC_VSUSP] != 0) {
-                int const SIGNAL_PGRP = pair->foreground_pgrp;
+                uint64_t const SIGNAL_PGRP = pair->foreground_pgrp;
+                int const SIGNAL_TTY = pair->index;
                 if ((pair->termios.c_lflag & TIOS_ECHO) != 0U) {
                     pty_echo_ctrl(pair, ch);
                     pty_echo_byte(pair, '\n');
                 }
                 pair->lock.unlock_irqrestore(IRQF);
-                pty_signal_pgrp(SIGNAL_PGRP, SIG_TSTP);
+                pty_signal_pgrp(SIGNAL_TTY, SIGNAL_PGRP, SIG_TSTP);
                 if (!from_replay) {
                     processed++;
                 }
@@ -1124,7 +1137,7 @@ int slave_open(ker::vfs::File* file) {
     if (pair->foreground_pgrp == 0) {
         auto* task = ker::mod::sched::get_current_task();
         if (task != nullptr) {
-            pair->foreground_pgrp = static_cast<int>((task->pgid != 0) ? task->pgid : task->pid);
+            pair->foreground_pgrp = (task->pgid != 0) ? task->pgid : task->pid;
         }
     }
     pair->lock.unlock_irqrestore(irqf);
@@ -1472,7 +1485,7 @@ int slave_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
             auto* task = ker::mod::sched::get_current_task();
             if (task != nullptr) {
                 task->controlling_tty = pair->index;
-                pair->foreground_pgrp = static_cast<int>((task->pgid != 0) ? task->pgid : task->pid);
+                pair->foreground_pgrp = (task->pgid != 0) ? task->pgid : task->pid;
             }
             return 0;
         }
@@ -1487,9 +1500,9 @@ int slave_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
             if (arg == 0) {
                 return -EFAULT;
             }
-            auto* out = reinterpret_cast<int*>(arg);
+            auto* out = reinterpret_cast<int64_t*>(arg);
             uint64_t const IRQF = pair->lock.lock_irqsave();
-            *out = pair->foreground_pgrp;
+            *out = static_cast<int64_t>(pair->foreground_pgrp);
             pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }
@@ -1497,9 +1510,9 @@ int slave_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
             if (arg == 0) {
                 return -EFAULT;
             }
-            const auto* in = reinterpret_cast<const int*>(arg);
+            const auto* in = reinterpret_cast<const int64_t*>(arg);
             uint64_t const IRQF = pair->lock.lock_irqsave();
-            pair->foreground_pgrp = *in;
+            pair->foreground_pgrp = *in > 0 ? static_cast<uint64_t>(*in) : 0;
             pair->lock.unlock_irqrestore(IRQF);
             return 0;
         }

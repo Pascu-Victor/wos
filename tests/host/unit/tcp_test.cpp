@@ -246,7 +246,8 @@ TEST(TcpCB, DefaultState) {
     EXPECT_EQ(cb.rcv_nxt, 0u);
     EXPECT_EQ(cb.snd_mss, 536u);
     EXPECT_EQ(cb.rcv_mss, 1460u);
-    EXPECT_EQ(cb.rto_ms, 200u);
+    EXPECT_EQ(cb.rto_ms, TCP_RTO_INITIAL_MS);
+    EXPECT_EQ(TCP_RTO_INITIAL_MS, 1000u);
     EXPECT_FALSE(cb.ws_enabled);
     EXPECT_FALSE(cb.keepalive_enabled);
     EXPECT_EQ(cb.retransmit_head, nullptr);

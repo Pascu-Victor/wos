@@ -552,6 +552,12 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "getgid";
                 case ker::abi::process::procmgmt_ops::GETEGID:
                     return "getegid";
+                case ker::abi::process::procmgmt_ops::GETRESUID:
+                    return "getresuid";
+                case ker::abi::process::procmgmt_ops::GETRESGID:
+                    return "getresgid";
+                case ker::abi::process::procmgmt_ops::SIGPENDING:
+                    return "sigpending";
                 case ker::abi::process::procmgmt_ops::GETGROUPS:
                     return "getgroups";
                 case ker::abi::process::procmgmt_ops::SETUID:

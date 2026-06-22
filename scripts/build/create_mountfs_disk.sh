@@ -36,14 +36,15 @@ if [ -e "$DISK" ]; then
     rm "$DISK"
 fi
 
-# Create disk
-DISK_SIZE="40G"
+# Create disk. Native WOS builds need enough space for the LLVM source tree,
+# bootstrap toolchains, and CMake/Ninja build trees inside the guest.
+DISK_SIZE="120G"
 echo "Creating QCOW2 image ($DISK_SIZE)"
 mkdir -p "$(dirname "$DISK")"
 qemu-img create -f qcow2 "$DISK" "$DISK_SIZE"
 
 PART_START_SECTOR=2048
-PART_SIZE_MIB=3500
+PART_SIZE_MIB=102400
 SECTOR_SIZE=512
 PART_END_SECTOR=$((PART_START_SECTOR + (PART_SIZE_MIB * 1024 * 1024 / SECTOR_SIZE) - 1))
 

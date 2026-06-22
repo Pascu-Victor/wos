@@ -103,6 +103,83 @@ inline auto is_kernel_text_pointer(uint64_t rip) -> bool {
     return rip >= TEXT_START && rip < TEXT_END;
 }
 
+inline auto task_type_for_log(const task::Task* task) -> uint32_t {
+    return task != nullptr ? static_cast<uint32_t>(task->type) : UINT32_MAX;
+}
+
+inline auto task_state_for_log(const task::Task* task) -> uint32_t {
+    return task != nullptr ? static_cast<uint32_t>(task->state.load(std::memory_order_acquire)) : UINT32_MAX;
+}
+
+inline auto task_queue_for_log(const task::Task* task) -> int32_t { return task != nullptr ? static_cast<int32_t>(task->sched_queue) : -1; }
+
+inline auto task_name_for_log(const task::Task* task) -> const char* {
+    return (task != nullptr && task->name != nullptr) ? task->name : "?";
+}
+
+inline auto has_kernel_scheduler_context(const task::Task* task) -> bool {
+    return task != nullptr && task->context.syscall_kernel_stack != 0 && task->context.syscall_scratch_area != 0;
+}
+
+inline auto is_publishable_idle_task(const task::Task* task) -> bool {
+    return task != nullptr && task->type == task::TaskType::IDLE && task->pid == 0 && task->thread == nullptr &&
+           task->pagemap == mm::virt::get_kernel_pagemap() && has_kernel_scheduler_context(task);
+}
+
+inline auto is_gc_protected_idle_task(const task::Task* task) -> bool {
+    return task != nullptr && task->type == task::TaskType::IDLE && task->pid == 0;
+}
+
+inline auto restore_gc_protected_idle_task(task::Task* task) -> bool {
+    if (task == nullptr) {
+        return false;
+    }
+
+    bool const NEEDS_RESTORE = task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE ||
+                               task->death_epoch.load(std::memory_order_acquire) != 0 || task->gc_queued.load(std::memory_order_acquire) ||
+                               task->sched_queue == task::Task::sched_queue::DEAD_GC;
+    if (!NEEDS_RESTORE) {
+        return false;
+    }
+
+    task->state.store(task::TaskState::ACTIVE, std::memory_order_release);
+    task->death_epoch.store(0, std::memory_order_release);
+    task->gc_queued.store(false, std::memory_order_release);
+    task->sched_queue = task::Task::sched_queue::NONE;
+    return true;
+}
+
+inline auto is_publishable_runnable_task(const task::Task* task) -> bool {
+    if (task == nullptr || task->type == task::TaskType::IDLE || !has_kernel_scheduler_context(task)) {
+        return false;
+    }
+
+    task::TaskState const STATE = task->state.load(std::memory_order_acquire);
+    if (STATE == task::TaskState::DEAD || STATE == task::TaskState::EXITING || task->gc_queued.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    if (task->type == task::TaskType::PROCESS) {
+        return task->pid != 0 && task->thread != nullptr && task->pagemap != nullptr;
+    }
+
+    if (task->type == task::TaskType::DAEMON) {
+        return task->pid != 0 && task->pagemap == mm::virt::get_kernel_pagemap();
+    }
+
+    return false;
+}
+
+void log_rejected_task_publication(const char* reason, uint64_t cpu_no, const task::Task* task) {
+    dbg::logger<"sched">::error(
+        "rejecting task publication: reason=%s cpu=%lu task=%p name=%s pid=%lu type=%u state=%u queue=%d stack=0x%lx scratch=0x%lx "
+        "thread=%p pagemap=%p",
+        reason != nullptr ? reason : "?", cpu_no, static_cast<const void*>(task), task_name_for_log(task), task != nullptr ? task->pid : 0,
+        task_type_for_log(task), task_state_for_log(task), task_queue_for_log(task),
+        task != nullptr ? task->context.syscall_kernel_stack : 0, task != nullptr ? task->context.syscall_scratch_area : 0,
+        task != nullptr ? static_cast<void*>(task->thread) : nullptr, task != nullptr ? static_cast<void*>(task->pagemap) : nullptr);
+}
+
 inline void validate_kernel_resume_target(task::Task* task, const char* path) {
     if (task == nullptr) {
         return;
@@ -396,6 +473,96 @@ inline bool is_low_latency_handoff_wait_channel(task::WaitChannelKind wait_chann
 }
 
 inline bool is_futex_wait_channel(task::WaitChannelKind wait_channel) { return wait_channel == task::WaitChannelKind::FUTEX; }
+
+inline bool is_waitpid_wait_channel(task::WaitChannelKind wait_channel) { return wait_channel == task::WaitChannelKind::WAITPID; }
+
+inline auto effective_process_group_id(const task::Task& task) -> uint64_t { return task.pgid != 0 ? task.pgid : task::process_pid(task); }
+
+inline constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
+inline constexpr int WOS_WSTOPPED = 2;
+inline constexpr int STOP_STATUS_LOW = 0x7f;
+
+inline auto job_control_stop_status(const task::Task& task) -> int32_t {
+    uint32_t const SIGNAL = task.jobctl_stop_signal != 0 ? task.jobctl_stop_signal : 19;
+    return static_cast<int32_t>((SIGNAL << 8U) | STOP_STATUS_LOW);
+}
+
+inline auto waitpid_job_stop_waitable(const task::Task* waiter, const task::Task* target) -> bool {
+    return waiter != nullptr && target != nullptr && (waiter->wait_options & WOS_WSTOPPED) != 0 && target->parent_pid == waiter->pid &&
+           !target->is_thread && !target->has_exited && target->jobctl_stopped.load(std::memory_order_acquire) &&
+           target->jobctl_stop_pending.load(std::memory_order_acquire) &&
+           (waiter->waiting_for_pid == WAIT_ANY_CHILD || waiter->waiting_for_pid == target->pid);
+}
+
+inline auto complete_waitpid_job_stop_if_waitable(task::Task* waiter, task::Task* target) -> bool {
+    if (!waitpid_job_stop_waitable(waiter, target)) {
+        return false;
+    }
+
+    waiter->context.regs.rax = target->pid;
+    if (waiter->wait_status_user_addr != 0 && waiter->pagemap != nullptr) {
+        uint64_t const STATUS_PHYS = mm::virt::translate(waiter->pagemap, waiter->wait_status_user_addr);
+        if (STATUS_PHYS != mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
+            auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(STATUS_PHYS));
+            *status_ptr = job_control_stop_status(*target);
+        }
+    }
+    target->jobctl_stop_pending.store(false, std::memory_order_release);
+    waiter->waitpid_publish_pending.store(false, std::memory_order_release);
+    task::task_clear_waitpid_block_state(*waiter);
+    return true;
+}
+
+inline auto waitpid_has_job_stop_ready(task::Task* waiter) -> bool {
+    if (waiter == nullptr || waiter->waiting_for_pid == 0 || (waiter->wait_options & WOS_WSTOPPED) == 0) {
+        return false;
+    }
+
+    if (waiter->waiting_for_pid != WAIT_ANY_CHILD) {
+        auto* target = find_task_by_pid(waiter->waiting_for_pid);
+        return waitpid_job_stop_waitable(waiter, target);
+    }
+
+    uint32_t const COUNT = get_active_task_count();
+    for (uint32_t i = 0; i < COUNT; i++) {
+        auto* child = get_active_task_at(i);
+        if (waitpid_job_stop_waitable(waiter, child)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline void unlink_specific_waitpid_waiter(task::Task* waiter) {
+    if (waiter == nullptr) {
+        return;
+    }
+
+    uint64_t const WAIT_TARGET = waiter->waiting_for_pid;
+    if (WAIT_TARGET == 0 || WAIT_TARGET == WAIT_ANY_CHILD) {
+        return;
+    }
+
+    auto* target = find_task_by_pid_safe(WAIT_TARGET);
+    if (target == nullptr) {
+        return;
+    }
+
+    uint64_t const WAITER_LOCK_FLAGS = target->exit_waiters_lock.lock_irqsave();
+    (void)target->awaitee_on_exit.remove(waiter->pid);
+    target->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
+    target->release();
+}
+
+inline void interrupt_waitpid_block_for_signal(task::Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+
+    task->context.regs.rax = static_cast<uint64_t>(-EINTR);
+    unlink_specific_waitpid_waiter(task);
+    task::task_clear_waitpid_block_state(*task);
+}
 
 inline void note_task_wakeup(task::Task* task, uint64_t now_us, task::WaitChannelKind wait_channel) {
     if (task->last_sleep_start_us != 0 && now_us > task->last_sleep_start_us) {
@@ -1340,6 +1507,63 @@ void release_cpu_reservation(uint64_t cpu_no) {
 }
 
 bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_reservation) {
+    auto release_reservation_if_needed = [&]() {
+        if (release_reservation && run_queues != nullptr && cpu_no < smt::get_core_count()) {
+            release_cpu_reservation(cpu_no);
+        }
+    };
+
+    if (task == nullptr) {
+        log_rejected_task_publication("null task", cpu_no, task);
+        release_reservation_if_needed();
+        return false;
+    }
+
+    if (run_queues == nullptr || cpu_no >= smt::get_core_count()) {
+        log_rejected_task_publication("invalid target cpu", cpu_no, task);
+        release_reservation_if_needed();
+        return false;
+    }
+
+    if (task->type == task::TaskType::IDLE) {
+        if (!is_publishable_idle_task(task)) {
+            log_rejected_task_publication("invalid idle task", cpu_no, task);
+            release_reservation_if_needed();
+            return false;
+        }
+
+        task->cpu = cpu_no;
+        if (task->start_time_us == 0) {
+            task->start_time_us = time::get_us();
+        }
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+
+        task::Task* existing_idle = nullptr;
+        run_queues->with_lock_void(cpu_no, [task, &existing_idle](RunQueue* rq) {
+            existing_idle = rq->idle_task;
+            if (existing_idle == nullptr || existing_idle == task) {
+                rq->idle_task = task;
+                task->sched_queue = task::Task::sched_queue::NONE;
+            }
+        });
+
+        if (existing_idle != nullptr && existing_idle != task) {
+            dbg::logger<"sched">::error("refusing to replace idle task: cpu=%lu existing=%p new=%p", cpu_no,
+                                        static_cast<void*>(existing_idle), static_cast<void*>(task));
+            release_reservation_if_needed();
+            return false;
+        }
+
+        release_reservation_if_needed();
+        return true;
+    }
+
+    if (!is_publishable_runnable_task(task)) {
+        log_rejected_task_publication("invalid runnable task", cpu_no, task);
+        release_reservation_if_needed();
+        return false;
+    }
+
 #ifdef SCHED_DEBUG
     dbg::log("POST: PID %x '%s' -> CPU %d (heapIdx=%d, from CPU %d)", task->pid, (task->name != nullptr) ? task->name : "?",
              static_cast<int>(cpu_no), task->heap_index, static_cast<int>(cpu::current_cpu()));
@@ -1354,17 +1578,6 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
     }
 
     __atomic_thread_fence(__ATOMIC_RELEASE);
-
-    if (task->type == task::TaskType::IDLE) {
-        run_queues->with_lock_void(cpu_no, [task](RunQueue* rq) {
-            rq->idle_task = task;
-            task->sched_queue = task::Task::sched_queue::NONE;
-        });
-        if (release_reservation) {
-            release_cpu_reservation(cpu_no);
-        }
-        return true;
-    }
 
     if (task->pid > 0) {
         pid_table_insert(task);
@@ -1382,9 +1595,7 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
         }
     });
 
-    if (release_reservation) {
-        release_cpu_reservation(cpu_no);
-    }
+    release_reservation_if_needed();
 
     if (cpu_no == cpu::current_cpu()) {
         request_local_reschedule();
@@ -1453,16 +1664,28 @@ void arm_idle_timer_locked(RunQueue* rq) {
     }
 
     task::Task* idle_task = nullptr;
+    task::Task* current_task = nullptr;
+    task::Task* handoff_task = nullptr;
     run_queues->this_cpu_locked_void([&](RunQueue* locked_rq) {
         idle_task = locked_rq->idle_task;
-        if (idle_task != nullptr) {
+        current_task = locked_rq->current_task;
+        handoff_task = locked_rq->handoff_task;
+        if (is_publishable_idle_task(idle_task)) {
             reserve_handoff_task_locked(locked_rq, idle_task, time::get_us());
         }
     });
 
-    if (idle_task == nullptr || idle_task->type != task::TaskType::IDLE || idle_task->context.syscall_kernel_stack == 0) {
-        dbg::logger<"sched">::error("enter_idle_loop without idle task: rq=%p idle=%p", static_cast<void*>(rq),
-                                    static_cast<void*>(idle_task));
+    if (!is_publishable_idle_task(idle_task)) {
+        dbg::logger<"sched">::error(
+            "enter_idle_loop without valid idle task: rq=%p idle=%p name=%s pid=%lu type=%u state=%u queue=%d stack=0x%lx "
+            "scratch=0x%lx thread=%p pagemap=%p current=%p handoff=%p",
+            static_cast<void*>(rq), static_cast<void*>(idle_task), task_name_for_log(idle_task), idle_task != nullptr ? idle_task->pid : 0,
+            task_type_for_log(idle_task), task_state_for_log(idle_task), task_queue_for_log(idle_task),
+            idle_task != nullptr ? idle_task->context.syscall_kernel_stack : 0,
+            idle_task != nullptr ? idle_task->context.syscall_scratch_area : 0,
+            idle_task != nullptr ? static_cast<void*>(idle_task->thread) : nullptr,
+            idle_task != nullptr ? static_cast<void*>(idle_task->pagemap) : nullptr, static_cast<void*>(current_task),
+            static_cast<void*>(handoff_task));
         hcf();
     }
 
@@ -1791,6 +2014,11 @@ auto post_task_waiting(task::Task* task) -> bool {
 }
 
 auto post_task_balanced(task::Task* task) -> bool {
+    if (task == nullptr) {
+        log_rejected_task_publication("null balanced task", cpu::current_cpu(), task);
+        return false;
+    }
+
     // D17: Try remote placement if WKI is active and task is a user process
     if (wki_try_remote_placement_fn != nullptr && task->type == task::TaskType::PROCESS) {
         if (wki_try_remote_placement_fn(task)) {
@@ -2336,6 +2564,10 @@ void wake_task_from_event_on_cpu(task::Task* task, uint64_t target_cpu, EventWak
     if (CANCEL_DEFERRED_SWITCH) {
         task->deferred_task_switch = false;
     }
+    // Preserve event-before-park wakeups even if the task is runnable/current
+    // when reschedule observes it. Wait loops tolerate this as a spurious wake
+    // and recheck readiness before sleeping again.
+    task->wakeup_pending.store(true, std::memory_order_release);
     uint64_t cpu = target_cpu;
     if (cpu >= smt::get_core_count()) {
         cpu = get_least_loaded_cpu();
@@ -3221,33 +3453,16 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
 
     bool const IS_YIELD = current_task->yield_switch;
     current_task->yield_switch = false;
-    static constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
-
-    auto unlink_specific_waitpid_waiter = [&]() {
-        uint64_t const WAIT_TARGET = current_task->waiting_for_pid;
-        if (WAIT_TARGET == 0 || WAIT_TARGET == WAIT_ANY_CHILD) {
-            return;
-        }
-
-        auto* target = find_task_by_pid(WAIT_TARGET);
-        if (target == nullptr) {
-            return;
-        }
-
-        uint64_t const WAITER_LOCK_FLAGS = target->exit_waiters_lock.lock_irqsave();
-        (void)target->awaitee_on_exit.remove(current_task->pid);
-        target->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
-    };
 
     // Signal race check: if a deliverable signal is already pending, do not
     // move this task to wait queue; resume userspace with EINTR.
     bool skip_wait_queue = false;
     if (!IS_YIELD && current_task->wki_proxy_task_id == 0) {
-        if (current_task->has_interrupting_signal_pending()) {
+        bool const WAITPID_STOP_READY =
+            is_waitpid_wait_channel(current_task->wait_channel_kind) && waitpid_has_job_stop_ready(current_task);
+        if (current_task->has_interrupting_signal_pending() && !WAITPID_STOP_READY) {
             skip_wait_queue = true;
-            current_task->context.regs.rax = static_cast<uint64_t>(-EINTR);
-            unlink_specific_waitpid_waiter();
-            task::task_clear_waitpid_block_state(*current_task);
+            interrupt_waitpid_block_for_signal(current_task);
         }
     }
     current_task->deferred_task_switch = false;
@@ -3292,6 +3507,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                     current_task->wait_rusage_phys_addr = 0;
                 }
                 current_task->waiting_for_pid = 0;
+                current_task->wait_options = 0;
                 return true;
             };
 
@@ -3324,6 +3540,16 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                     }
                 }
             }
+            if (!skip_wait_queue) {
+                uint32_t const COUNT = get_active_task_count();
+                for (uint32_t i = 0; i < COUNT; i++) {
+                    auto* child = get_active_task_at(i);
+                    if (complete_waitpid_job_stop_if_waitable(current_task, child)) {
+                        skip_wait_queue = true;
+                        break;
+                    }
+                }
+            }
         } else {
             // Wait-for-specific-PID
             auto* target = find_task_by_pid(current_task->waiting_for_pid);
@@ -3347,7 +3573,11 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                     current_task->wait_status_phys_addr = 0;
                 }
                 current_task->waiting_for_pid = 0;
+                current_task->wait_options = 0;
                 target->ptrace_stop_pending = false;
+            }
+            if (!skip_wait_queue && complete_waitpid_job_stop_if_waitable(current_task, target)) {
+                skip_wait_queue = true;
             }
             if (target != nullptr && target->exit_notify_ready.load(std::memory_order_acquire) && target->has_exited) {
                 skip_wait_queue = true;
@@ -3386,6 +3616,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                     current_task->wait_rusage_phys_addr = 0;
                 }
                 current_task->waiting_for_pid = 0;
+                current_task->wait_options = 0;
             }
         }
     }
@@ -3432,6 +3663,10 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         if (IS_YIELD || skip_wait_queue || woke) {
             if (is_futex_wait_channel(current_task->wait_channel_kind) && current_task->has_interrupting_signal_pending()) {
                 current_task->context.regs.rax = static_cast<uint64_t>(-EINTR);
+            }
+            if (is_waitpid_wait_channel(current_task->wait_channel_kind) && current_task->has_interrupting_signal_pending() &&
+                !waitpid_has_job_stop_ready(current_task)) {
+                interrupt_waitpid_block_for_signal(current_task);
             }
 
             // A signal or concurrent wake can abort a futex block after the
@@ -3593,9 +3828,14 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     record_local_proc_first_run(next_task, WOS_PERF_CALLSITE());
     next_task->has_run = true;
 
+    if (next_task->type == task::TaskType::PROCESS && !next_task->is_voluntary_blocked()) {
+        static_cast<void>(sys::context_switch::repair_stale_process_syscall_resume(next_task));
+    }
+
     // Set up GS/FS for next task
     uint64_t const REAL_CPU_ID = cpu::current_cpu();
     sys::context_switch::install_task_cpu_bases(next_task, REAL_CPU_ID);
+    desc::gdt::set_rsp0(reinterpret_cast<uint64_t*>(next_task->context.syscall_kernel_stack), REAL_CPU_ID);
 
     mm::virt::switch_pagemap(next_task);
 
@@ -4087,6 +4327,20 @@ void wake_task_for_signal(task::Task* task) {
         return;
     }
 
+    constexpr uint64_t SIGCONT_MASK = 1ULL << (18 - 1);
+    constexpr uint64_t SIGKILL_MASK = 1ULL << (9 - 1);
+    uint64_t const PENDING = task->sig_pending;
+    if ((PENDING & (SIGCONT_MASK | SIGKILL_MASK)) != 0U && task->jobctl_stopped.load(std::memory_order_acquire)) {
+        task->jobctl_stopped.store(false, std::memory_order_release);
+        if ((PENDING & SIGCONT_MASK) != 0U) {
+            task->jobctl_stop_pending.store(false, std::memory_order_release);
+        }
+        task->set_voluntary_blocked(false);
+        task->wants_block = false;
+        task->wake_at_us = 0;
+        task->clear_wait_channel();
+    }
+
     // Nudge the task's current CPU immediately so hlt/deferred paths react fast.
     // For same-CPU delivery we cannot self-IPI, so arm the local timer instead.
     if (task->cpu == cpu::current_cpu()) {
@@ -4101,10 +4355,14 @@ void wake_task_for_signal(task::Task* task) {
     if (task->sched_queue == task::Task::sched_queue::WAITING || task->deferred_task_switch || task->is_voluntary_blocked()) {
         bool const HAS_FUTEX_WAITER = task->futex_waiter.load(std::memory_order_acquire) != nullptr;
         bool const MAY_INTERRUPT_FUTEX = is_futex_wait_channel(task->wait_channel_kind) || HAS_FUTEX_WAITER;
-        bool const HAS_INTERRUPTING_SIGNAL = MAY_INTERRUPT_FUTEX && task->has_interrupting_signal_pending();
-        bool const INTERRUPTS_WAIT =
-            task->wait_channel_is(task::WaitChannelKind::SIGSUSPEND) || (MAY_INTERRUPT_FUTEX && HAS_INTERRUPTING_SIGNAL);
-        if (INTERRUPTS_WAIT) {
+        bool const MAY_INTERRUPT_WAITPID = is_waitpid_wait_channel(task->wait_channel_kind);
+        bool const WAITPID_STOP_READY = MAY_INTERRUPT_WAITPID && waitpid_has_job_stop_ready(task);
+        bool const HAS_INTERRUPTING_SIGNAL = (MAY_INTERRUPT_FUTEX || MAY_INTERRUPT_WAITPID) && task->has_interrupting_signal_pending();
+        bool const INTERRUPTS_WAIT = task->wait_channel_is(task::WaitChannelKind::SIGSUSPEND) ||
+                                     (MAY_INTERRUPT_FUTEX && HAS_INTERRUPTING_SIGNAL) || (MAY_INTERRUPT_WAITPID && HAS_INTERRUPTING_SIGNAL);
+        if (MAY_INTERRUPT_WAITPID && HAS_INTERRUPTING_SIGNAL && !WAITPID_STOP_READY) {
+            interrupt_waitpid_block_for_signal(task);
+        } else if (INTERRUPTS_WAIT && !WAITPID_STOP_READY) {
             task->context.regs.rax = static_cast<uint64_t>(-EINTR);
         }
         if (HAS_FUTEX_WAITER && HAS_INTERRUPTING_SIGNAL) {
@@ -4129,7 +4387,7 @@ auto signal_process_group(uint64_t pgid, int sig) -> size_t {
         auto* t = get_active_task_at_safe(i);
         if (t != nullptr) {
             bool const ALIVE = t->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE && !t->has_exited;
-            if (t->pgid == pgid && ALIVE) {
+            if (effective_process_group_id(*t) == pgid && ALIVE) {
                 ++matched;
                 if (sig != 0) {
                     bool const FORWARDED = ker::net::wki::wki_proxy_task_forward_signal(t, sig);
@@ -4141,6 +4399,57 @@ auto signal_process_group(uint64_t pgid, int sig) -> size_t {
             }
             t->release();
         }
+    }
+    return matched;
+}
+
+auto signal_controlling_tty(int controlling_tty, int sig) -> size_t {
+    if (controlling_tty < 0 || sig < 0 || std::cmp_greater(sig, task::Task::MAX_SIGNALS)) {
+        return 0;
+    }
+    uint64_t const MASK = sig > 0 ? (1ULL << (sig - 1)) : 0;
+    size_t matched = 0;
+    uint32_t const COUNT = get_active_task_count();
+    for (uint32_t i = 0; i < COUNT; i++) {
+        auto* t = get_active_task_at_safe(i);
+        if (t == nullptr) {
+            continue;
+        }
+        bool const ALIVE = t->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE && !t->has_exited;
+        if (ALIVE && t->type == task::TaskType::PROCESS && t->controlling_tty == controlling_tty) {
+            ++matched;
+            if (sig != 0) {
+                bool const FORWARDED = ker::net::wki::wki_proxy_task_forward_signal(t, sig);
+                if (!FORWARDED) {
+                    t->sig_pending |= MASK;
+                    wake_task_for_signal(t);
+                }
+            }
+        }
+        t->release();
+    }
+    return matched;
+}
+
+auto signal_controlling_tty_wki_proxies(int controlling_tty, int sig) -> size_t {
+    if (controlling_tty < 0 || sig < 0 || std::cmp_greater(sig, task::Task::MAX_SIGNALS)) {
+        return 0;
+    }
+
+    size_t matched = 0;
+    uint32_t const COUNT = get_active_task_count();
+    for (uint32_t i = 0; i < COUNT; i++) {
+        auto* t = get_active_task_at_safe(i);
+        if (t == nullptr) {
+            continue;
+        }
+        bool const ALIVE = t->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE && !t->has_exited;
+        if (ALIVE && t->type == task::TaskType::PROCESS && t->controlling_tty == controlling_tty && t->wki_proxy_task_id != 0) {
+            if (sig == 0 || ker::net::wki::wki_proxy_task_forward_signal(t, sig)) {
+                ++matched;
+            }
+        }
+        t->release();
     }
     return matched;
 }
@@ -4178,6 +4487,17 @@ auto signal_visible_processes_except(uint64_t excluded_pid, uint64_t excluded_ow
 
 void insert_into_dead_list(task::Task* task) {
     if (task == nullptr) {
+        return;
+    }
+
+    if (is_gc_protected_idle_task(task)) {
+        if (restore_gc_protected_idle_task(task)) {
+            dbg::logger<"sched">::error(
+                "repaired idle task after dead GC enqueue attempt: task=%p name=%s cpu=%lu state=%u queue=%d stack=0x%lx "
+                "scratch=0x%lx thread=%p pagemap=%p",
+                task, task_name_for_log(task), task->cpu, task_state_for_log(task), task_queue_for_log(task),
+                task->context.syscall_kernel_stack, task->context.syscall_scratch_area, task->thread, task->pagemap);
+        }
         return;
     }
 

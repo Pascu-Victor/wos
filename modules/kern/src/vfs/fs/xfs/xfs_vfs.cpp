@@ -65,6 +65,29 @@ struct XfsFileData {
     XfsInode* inode;  // reference-counted inode
 };
 
+class XfsMetadataGuard {
+   public:
+    explicit XfsMetadataGuard(XfsMountContext* ctx, bool active = true) : ctx(active ? ctx : nullptr) {
+        if (this->ctx != nullptr) {
+            this->ctx->metadata_lock.lock();
+        }
+    }
+
+    ~XfsMetadataGuard() {
+        if (ctx != nullptr) {
+            ctx->metadata_lock.unlock();
+        }
+    }
+
+    XfsMetadataGuard(const XfsMetadataGuard&) = delete;
+    XfsMetadataGuard(XfsMetadataGuard&&) = delete;
+    auto operator=(const XfsMetadataGuard&) -> XfsMetadataGuard& = delete;
+    auto operator=(XfsMetadataGuard&&) -> XfsMetadataGuard& = delete;
+
+   private:
+    XfsMountContext* ctx;
+};
+
 auto perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp op) -> uint64_t {
     return ker::mod::perf::is_wki_scope_recording_enabled(ker::mod::perf::WkiPerfScope::LOCAL_XFS, static_cast<uint8_t>(op))
                ? ker::mod::time::get_us()
@@ -218,20 +241,6 @@ auto xfs_block_read_with_retry(dev::BlockDevice* bdev, uint64_t block_no, size_t
     return rc;
 }
 
-auto direct_full_block_write(XfsMountContext* ctx, xfs_fsblock_t disk_block, const uint8_t* src, size_t bytes) -> bool {
-    if (ctx == nullptr || ctx->device == nullptr || src == nullptr || bytes == 0 || (bytes & (ctx->block_size - 1)) != 0) {
-        return false;
-    }
-
-    uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(ctx, disk_block);
-    size_t const DEV_COUNT = bytes / ctx->device->block_size;
-    discard_bdev_range(ctx->device, DEV_BLOCK, DEV_COUNT);
-    uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::DIRECT_WRITE);
-    int const RC = dev::block_write(ctx->device, DEV_BLOCK, DEV_COUNT, src);
-    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::DIRECT_WRITE, STARTED_US, RC, bytes);
-    return RC == 0;
-}
-
 auto xfs_fsb_to_dev_count(XfsMountContext* ctx, xfs_filblks_t fsb_count) -> size_t {
     return static_cast<size_t>(fsb_count) * (ctx->block_size / ctx->device->block_size);
 }
@@ -359,11 +368,10 @@ auto xfs_vfs_close(File* f) -> int {
     auto* xfd = static_cast<XfsFileData*>(f->private_data);
     if (xfd != nullptr) {
         if (xfd->inode != nullptr) {
+            XfsMetadataGuard metadata_guard(xfd->mount);
             {
                 ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
-                int const DATA_RET = sync_inode_data_buffers(xfd->mount, xfd->inode, xfd->inode->size);
-                int const INODE_RET = xfs_commit_dirty_inode(xfd->mount, xfd->inode);
-                close_result = (DATA_RET != 0) ? DATA_RET : INODE_RET;
+                close_result = xfs_commit_dirty_inode(xfd->mount, xfd->inode);
             }
             xfs_inode_release(xfd->inode);
         }
@@ -725,7 +733,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
 
         size_t const DIRECT_BYTES = remaining_bytes & ~(ctx->block_size - 1);
         if (DIRECT_BYTES > 0) {
-            if (!direct_full_block_write(ctx, current_disk_block, src + current_src_offset, DIRECT_BYTES)) {
+            if (!buffered_write(current_disk_block, 0, DIRECT_BYTES, current_src_offset)) {
                 return false;
             }
             remaining_bytes -= DIRECT_BYTES;
@@ -971,6 +979,7 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
         return -EBADF;
     }
 
+    XfsMetadataGuard metadata_guard(xfd->mount);
     ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
     return xfs_vfs_write_locked(f, buf, count, offset);
 }
@@ -1014,17 +1023,20 @@ auto xfs_vfs_isatty(File* /*f*/) -> bool { return false; }
 
 struct ReaddirCtx {
     DirEntry* entry;       // output entry to fill
-    size_t target_index;   // which entry we want
-    size_t current_index;  // current iteration counter
+    size_t target_cookie;  // next stable cookie requested by VFS
+    size_t target_index;   // legacy dense index requested by direct callers
+    size_t current_index;
+    bool use_cookie;
     bool found;
 };
 
 auto readdir_callback(const XfsDirEntry* xde, void* ctx_ptr) -> int {
     auto* rctx = static_cast<ReaddirCtx*>(ctx_ptr);
-    if (rctx->current_index == rctx->target_index) {
+    bool const MATCH = rctx->use_cookie ? xde->cookie >= rctx->target_cookie : rctx->current_index == rctx->target_index;
+    if (MATCH) {
         // Fill the VFS DirEntry
         rctx->entry->d_ino = xde->ino;
-        rctx->entry->d_off = static_cast<uint64_t>(rctx->target_index + 1);
+        rctx->entry->d_off = (rctx->current_index < 2 && !rctx->use_cookie) ? rctx->current_index + 1 : xde->cookie + 1;
         rctx->entry->d_reclen = sizeof(DirEntry);
 
         // Convert XFS ftype to VFS d_type
@@ -1082,8 +1094,10 @@ auto xfs_vfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
 
     ReaddirCtx ctx{};
     ctx.entry = entry;
+    ctx.target_cookie = index;
     ctx.target_index = index;
     ctx.current_index = 0;
+    ctx.use_cookie = index >= XFS_READDIR_COOKIE_BASE;
     ctx.found = false;
 
     int const RET = xfs_dir_iterate(xfd->inode, readdir_callback, &ctx);
@@ -1142,6 +1156,7 @@ auto xfs_vfs_truncate(File* f, off_t length) -> int {
         return -EINVAL;
     }
 
+    XfsMetadataGuard metadata_guard(ctx);
     ker::mod::sys::MutexGuard guard(ip->io_lock);
 
     // For now, only support truncating to 0 (common case) or extending.
@@ -1233,6 +1248,7 @@ auto xfs_write_append(File* f, const void* buf, size_t count, size_t* offset_out
         return -EBADF;
     }
 
+    XfsMetadataGuard metadata_guard(xfd->mount);
     ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
     auto const OFFSET = static_cast<size_t>(xfd->inode->size);
     ssize_t const RET = xfs_vfs_write_locked(f, buf, count, OFFSET);
@@ -1250,6 +1266,7 @@ auto xfs_fsync(File* f) -> int {
     if (xfd == nullptr || xfd->inode == nullptr) {
         return -EBADF;
     }
+    XfsMetadataGuard metadata_guard(xfd->mount);
     ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
     int const DATA_RET = sync_inode_data_buffers(xfd->mount, xfd->inode, xfd->inode->size);
     int const INODE_RET = xfs_commit_dirty_inode(xfd->mount, xfd->inode);
@@ -1261,6 +1278,7 @@ auto xfs_sync_mount(XfsMountContext* ctx) -> int {
         return -EINVAL;
     }
 
+    XfsMetadataGuard metadata_guard(ctx);
     int const INODE_RET = xfs_icache_sync_dirty(ctx);
     int const BLOCK_RET = sync_blockdev(ctx->device);
     return (INODE_RET != 0) ? INODE_RET : BLOCK_RET;
@@ -1277,6 +1295,9 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     if (ctx == nullptr) {
         return nullptr;
     }
+
+    bool const MUTATING_OPEN = ((flags & (O_CREAT_FLAG | O_TRUNC_FLAG)) != 0) && !ctx->read_only;
+    XfsMetadataGuard metadata_guard(ctx, MUTATING_OPEN);
 
     auto* ip = walk_path(ctx, fs_path);
 
@@ -1605,6 +1626,7 @@ auto xfs_chmod_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
         return -EROFS;
     }
 
+    XfsMetadataGuard metadata_guard(ctx);
     auto* ip = walk_path(ctx, fs_path);
     if (ip == nullptr) {
         return -ENOENT;
@@ -1638,6 +1660,7 @@ auto xfs_fchmod(File* f, int mode) -> int {
         return -EROFS;
     }
 
+    XfsMetadataGuard metadata_guard(xfd->mount);
     static constexpr uint16_t XFS_IFMT = 0xF000;
     static constexpr uint16_t XFS_PERM_MASK = 07777;
     auto* ip = xfd->inode;
@@ -1664,6 +1687,8 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
     if (ctx->read_only) {
         return -EROFS;
     }
+
+    XfsMetadataGuard metadata_guard(ctx);
 
     // Already exists?
     XfsInode* existing = walk_path(ctx, fs_path);
@@ -1874,6 +1899,8 @@ auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx) -> int {
         return -EBUSY;
     }
 
+    XfsMetadataGuard metadata_guard(ctx);
+
     XfsInode* parent_ip = nullptr;
     const char* name = nullptr;
     uint16_t namelen = 0;
@@ -1946,6 +1973,8 @@ auto xfs_rename_path(const char* old_fs_path, const char* new_fs_path, XfsMountC
     if (ctx->read_only) {
         return -EROFS;
     }
+
+    XfsMetadataGuard metadata_guard(ctx);
 
     XfsInode* old_parent = nullptr;
     const char* old_name = nullptr;
@@ -2056,6 +2085,8 @@ auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx) -> int {
     if (ctx->read_only) {
         return -EROFS;
     }
+
+    XfsMetadataGuard metadata_guard(ctx);
 
     // Find the parent directory and extract the filename
     const char* last_slash = nullptr;

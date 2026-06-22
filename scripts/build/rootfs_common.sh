@@ -231,7 +231,7 @@ rootfs_stage_etc() {
     mkdir -p "$ROOTFS_STAGING/etc/dropbear"
 
     cat > "$ROOTFS_STAGING/etc/passwd" <<'EOF'
-root:x:0:0:root:/root:/bin/sh
+root:x:0:0:root:/root:/bin/bash
 EOF
 
     cat > "$ROOTFS_STAGING/etc/group" <<'EOF'
@@ -242,9 +242,17 @@ EOF
 export USER="${USER:-root}"
 export HOSTNAME="${HOSTNAME:-wos}"
 export HOME="${HOME:-/root}"
+export SHELL="${SHELL:-/bin/bash}"
 export TERM="${TERM:-xterm-256color}"
 export PS1="$USER@$HOSTNAME:\w\$ "
 export ENV="/etc/profile"
+EOF
+
+    cat > "$ROOTFS_STAGING/etc/shells" <<'EOF'
+/bin/bash
+/usr/bin/bash
+/bin/sh
+/usr/bin/sh
 EOF
 
     cat > "$ROOTFS_STAGING/etc/filesystems" <<'EOF'

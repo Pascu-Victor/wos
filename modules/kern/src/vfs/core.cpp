@@ -5701,20 +5701,10 @@ auto vfs_pread(int fd, void* buf, size_t count, off_t offset) -> ssize_t {
         vfs_put_file(f);
         return -ENOSYS;
     }
-    // Read at given offset without modifying file position
+    // Positional reads are often random-access probes over files that were
+    // just written (for example Git pack verification). Keep them out of the
+    // stream cache so cached EOF/island state cannot affect pread semantics.
     f->positional_read_depth.fetch_add(1, std::memory_order_acq_rel);
-    bool const USE_STREAM_CACHE = (f->open_flags & ker::vfs::O_NO_CACHE) == 0;
-    ssize_t cached_result = 0;
-    if (USE_STREAM_CACHE && vfs_stream_cache_try_read(f, buf, count, static_cast<uint64_t>(offset), nullptr, &cached_result)) {
-        cached_result = clamp_io_count(cached_result, count);
-        f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
-        vfs_put_file(f);
-        return cached_result;
-    }
-    if (USE_STREAM_CACHE) {
-        g_vfs_stream_misses.fetch_add(1, std::memory_order_relaxed);
-    }
-
     auto result = clamp_io_count(f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset)), count);
     f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
     vfs_put_file(f);
@@ -5730,17 +5720,6 @@ auto vfs_pread_file(File* f, void* buf, size_t count, off_t offset) -> ssize_t {
     }
 
     f->positional_read_depth.fetch_add(1, std::memory_order_acq_rel);
-    bool const USE_STREAM_CACHE = (f->open_flags & ker::vfs::O_NO_CACHE) == 0;
-    ssize_t cached_result = 0;
-    if (USE_STREAM_CACHE && vfs_stream_cache_try_read(f, buf, count, static_cast<uint64_t>(offset), nullptr, &cached_result)) {
-        cached_result = clamp_io_count(cached_result, count);
-        f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
-        return cached_result;
-    }
-    if (USE_STREAM_CACHE) {
-        g_vfs_stream_misses.fetch_add(1, std::memory_order_relaxed);
-    }
-
     auto result = clamp_io_count(f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset)), count);
     f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
     return result;

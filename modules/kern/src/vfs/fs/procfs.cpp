@@ -2901,6 +2901,55 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, listener.refcount);
         append_char(p, end, '\n');
     }
+    if (LISTENER_COUNT == listeners.size()) {
+        append_sconst(p, end, "tcp_listener_truncated max=");
+        append_dec64(p, end, listeners.size());
+        append_char(p, end, '\n');
+    }
+
+    std::array<ker::net::proto::TcpConnSnapshot, ker::net::proto::TCP_CONN_SNAPSHOT_MAX> tcp_conns{};
+    size_t const TCP_CONN_COUNT = ker::net::proto::tcp_conn_snapshot(tcp_conns.data(), tcp_conns.size());
+    for (size_t i = 0; i < TCP_CONN_COUNT; ++i) {
+        const auto& conn = tcp_conns.at(i);
+        append_sconst(p, end, "tcp_conn local=");
+        append_ipv4(p, end, conn.local_ip);
+        append_char(p, end, ':');
+        append_dec64(p, end, conn.local_port);
+        append_sconst(p, end, " remote=");
+        append_ipv4(p, end, conn.remote_ip);
+        append_char(p, end, ':');
+        append_dec64(p, end, conn.remote_port);
+        append_sconst(p, end, " state=");
+        append_sconst(p, end, tcp_state_name(conn.state));
+        append_sconst(p, end, " owner_pid=");
+        append_dec64(p, end, conn.owner_pid);
+        append_sconst(p, end, " rcvbuf_used=");
+        append_dec64(p, end, conn.rcvbuf_used);
+        append_sconst(p, end, " rcvbuf_capacity=");
+        append_dec64(p, end, conn.rcvbuf_capacity);
+        append_sconst(p, end, " rcv_nxt=");
+        append_dec64(p, end, conn.rcv_nxt);
+        append_sconst(p, end, " rcv_wnd=");
+        append_dec64(p, end, conn.rcv_wnd);
+        append_sconst(p, end, " snd_una=");
+        append_dec64(p, end, conn.snd_una);
+        append_sconst(p, end, " snd_nxt=");
+        append_dec64(p, end, conn.snd_nxt);
+        append_sconst(p, end, " snd_wnd=");
+        append_dec64(p, end, conn.snd_wnd);
+        append_sconst(p, end, " ooo_bytes=");
+        append_dec64(p, end, conn.ooo_bytes);
+        append_sconst(p, end, " sack=");
+        append_bool01(p, end, conn.sack_permitted);
+        append_sconst(p, end, " refcnt=");
+        append_dec64(p, end, conn.refcount);
+        append_char(p, end, '\n');
+    }
+    if (TCP_CONN_COUNT == tcp_conns.size()) {
+        append_sconst(p, end, "tcp_conn_truncated max=");
+        append_dec64(p, end, tcp_conns.size());
+        append_char(p, end, '\n');
+    }
 
     ker::net::wki::WkiIpcPerfSnapshot ipc{};
     ker::net::wki::wki_ipc_get_perf_snapshot(ipc);

@@ -137,7 +137,7 @@ KTEST(VFS, OpenFileFstatSnapshotHitsAndInvalidates) {
     KEXPECT_EQ(ker::vfs::vfs_unlink(PATH), 0);
 }
 
-KTEST(VFS, StreamCacheRepeatedPreadRecordsHits) {
+KTEST(VFS, PreadBypassesStreamCacheAndPreservesOffset) {
     ker::vfs::vfs_mkdir("/tmp", 0755);
 
     constexpr const char* PATH = "/tmp/ktest_stream_counter";
@@ -161,12 +161,13 @@ KTEST(VFS, StreamCacheRepeatedPreadRecordsHits) {
     KEXPECT_EQ(ker::vfs::vfs_pread_file(rf, buf, sizeof(buf), 0), static_cast<ssize_t>(sizeof(buf)));
     KEXPECT_EQ(ker::vfs::vfs_pread_file(rf, buf, sizeof(buf), 0), static_cast<ssize_t>(sizeof(buf)));
     KEXPECT_TRUE(std::memcmp(buf, DATA, sizeof(buf)) == 0);
+    KEXPECT_EQ(rf->pos, 0);
 
     ker::vfs::VfsCachePerfSnapshot after{};
     ker::vfs::vfs_get_cache_perf_snapshot(after);
-    KEXPECT_TRUE(after.stream_backend_reads > before.stream_backend_reads);
-    KEXPECT_TRUE(after.stream_hits > before.stream_hits);
-    KEXPECT_TRUE(after.stream_copied_bytes >= before.stream_copied_bytes + sizeof(buf));
+    KEXPECT_EQ(after.stream_backend_reads, before.stream_backend_reads);
+    KEXPECT_EQ(after.stream_hits, before.stream_hits);
+    KEXPECT_EQ(after.stream_copied_bytes, before.stream_copied_bytes);
 
     ker::vfs::vfs_put_file(rf);
     KEXPECT_EQ(ker::vfs::vfs_unlink(PATH), 0);

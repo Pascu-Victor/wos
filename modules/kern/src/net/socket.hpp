@@ -76,6 +76,7 @@ struct RingBuffer {
     std::atomic<size_t> used{0};  // shared; acquire/release ordered
 
     auto write(const void* buf, size_t len) -> ssize_t;
+    auto write_pair(const void* first_buf, size_t first_len, const void* second_buf, size_t second_len) -> ssize_t;
     auto read(void* buf, size_t len) -> ssize_t;
     auto available() const -> size_t { return used.load(std::memory_order_acquire); }
     auto free_space() const -> size_t { return capacity - used.load(std::memory_order_acquire); }

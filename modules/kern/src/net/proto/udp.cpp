@@ -12,6 +12,7 @@
 #include <net/netif.hpp>
 #include <net/proto/ipv4.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <utility>
 
 #include "net/netdevice.hpp"
 #include "net/packet.hpp"
@@ -22,6 +23,7 @@ namespace ker::net::proto {
 namespace {
 constexpr size_t MAX_UDP_SOCKETS = 128;
 constexpr uint16_t UDP_EPHEMERAL_PORT_FIRST = 49152;
+constexpr uint16_t UDP_EPHEMERAL_PORT_LAST = 65535;
 constexpr auto UDP_IPV4_TTL = static_cast<uint8_t>(IPV4_DEFAULT_TTL);
 constexpr int SO_REUSEADDR = 2;
 constexpr int SO_RCVBUF = 8;
@@ -36,6 +38,13 @@ struct UdpBinding {
     uint32_t local_ip = 0;
     uint16_t local_port = 0;
 };
+
+struct UdpRecvRecord {
+    uint16_t payload_len = 0;
+    uint16_t src_port = 0;
+    uint32_t src_ip = 0;
+} __attribute__((packed));
+static_assert(sizeof(UdpRecvRecord) == 8);
 
 std::array<UdpBinding, MAX_UDP_SOCKETS> udp_bindings{};
 ker::mod::sys::Spinlock udp_lock;
@@ -61,6 +70,65 @@ auto alloc_binding() -> UdpBinding* {
         }
     }
     return nullptr;
+}
+
+auto next_udp_ephemeral_port() -> uint16_t {
+    uint16_t const PORT = udp_ephemeral_port;
+    udp_ephemeral_port =
+        udp_ephemeral_port == UDP_EPHEMERAL_PORT_LAST ? UDP_EPHEMERAL_PORT_FIRST : static_cast<uint16_t>(udp_ephemeral_port + 1);
+    return PORT;
+}
+
+auto alloc_ephemeral_port_locked(uint32_t ip) -> uint16_t {
+    constexpr uint32_t PORT_COUNT = static_cast<uint32_t>(UDP_EPHEMERAL_PORT_LAST) - static_cast<uint32_t>(UDP_EPHEMERAL_PORT_FIRST) + 1U;
+    for (uint32_t attempt = 0; attempt < PORT_COUNT; attempt++) {
+        uint16_t const PORT = next_udp_ephemeral_port();
+        if (find_binding(ip, PORT) == nullptr) {
+            return PORT;
+        }
+    }
+    return 0;
+}
+
+auto bind_udp_socket_locked(Socket* sock, uint32_t ip, uint16_t port) -> int {
+    if (sock == nullptr) {
+        return -1;
+    }
+
+    if (port == 0) {
+        port = alloc_ephemeral_port_locked(ip);
+        if (port == 0) {
+            return -1;
+        }
+    }
+
+    if (!sock->reuse_port && find_binding(ip, port) != nullptr) {
+        return -1;
+    }
+
+    auto* binding = alloc_binding();
+    if (binding == nullptr) {
+        return -1;
+    }
+
+    binding->sock = sock;
+    binding->local_ip = ip;
+    binding->local_port = port;
+
+    sock->local_v4.addr = ip;
+    sock->local_v4.port = port;
+    sock->state = SocketState::BOUND;
+    return 0;
+}
+
+auto ensure_udp_bound_locked(Socket* sock) -> int {
+    if (sock == nullptr) {
+        return -1;
+    }
+    if (sock->local_v4.port != 0) {
+        return 0;
+    }
+    return bind_udp_socket_locked(sock, sock->local_v4.addr, 0);
 }
 
 auto binding_accepts_dev(const UdpBinding* binding, NetDevice const* dev) -> bool {
@@ -94,6 +162,8 @@ auto first_ipv4_or_any(NetDevice* dev) -> IPv4Address {
     return nif->ipv4_addrs.front().addr;
 }
 
+auto udp_recvfrom(Socket* sock, void* buf, size_t len, int flags, void* addr_raw, size_t* addr_len) -> ssize_t;
+
 int udp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
     uint16_t port = 0;
     uint32_t ip = 0;
@@ -102,32 +172,9 @@ int udp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
     }
 
     udp_lock.lock();
-
-    // Check if already bound
-    if (!sock->reuse_port) {
-        auto* existing = find_binding(ip, port);
-        if (existing != nullptr) {
-            udp_lock.unlock();
-            return -1;  // EADDRINUSE
-        }
-    }
-
-    auto* binding = alloc_binding();
-    if (binding == nullptr) {
-        udp_lock.unlock();
-        return -1;
-    }
-
-    binding->sock = sock;
-    binding->local_ip = ip;
-    binding->local_port = port;
-
-    sock->local_v4.addr = ip;
-    sock->local_v4.port = port;
-    sock->state = SocketState::BOUND;
-
+    int const RESULT = bind_udp_socket_locked(sock, ip, port);
     udp_lock.unlock();
-    return 0;
+    return RESULT;
 }
 
 int udp_listen(Socket* /*unused*/, int /*unused*/) { return -1; }  // UDP doesn't listen
@@ -146,14 +193,12 @@ int udp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
     // Auto-bind if not bound
     if (sock->local_v4.port == 0) {
         udp_lock.lock();
-        auto* binding = alloc_binding();
-        if (binding != nullptr) {
-            binding->sock = sock;
-            binding->local_ip = 0;
-            binding->local_port = udp_ephemeral_port++;
-            sock->local_v4.port = binding->local_port;
-        }
+        int const BIND_RET = ensure_udp_bound_locked(sock);
         udp_lock.unlock();
+        if (BIND_RET < 0) {
+            return BIND_RET;
+        }
+        sock->state = SocketState::CONNECTED;
     }
 
     return 0;
@@ -184,15 +229,7 @@ auto udp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssiz
                                                                                                    : static_cast<ssize_t>(-1);
 }
 
-auto udp_recv(Socket* sock, void* buf, size_t len, int /*unused*/) -> ssize_t {
-    if (sock->rcvbuf.available() == 0) {
-        if (!sock->nonblock) {
-            socket_defer_wait(sock, "udp_wait");
-        }
-        return -EAGAIN;
-    }
-    return sock->rcvbuf.read(buf, len);
-}
+auto udp_recv(Socket* sock, void* buf, size_t len, int /*unused*/) -> ssize_t { return udp_recvfrom(sock, buf, len, 0, nullptr, nullptr); }
 
 auto udp_sendto(Socket* sock, const void* buf, size_t len, int /*unused*/, const void* addr_raw, size_t addr_len) -> ssize_t {
     uint16_t port = 0;
@@ -204,14 +241,11 @@ auto udp_sendto(Socket* sock, const void* buf, size_t len, int /*unused*/, const
     // Auto-bind if not bound
     if (sock->local_v4.port == 0) {
         udp_lock.lock();
-        auto* binding = alloc_binding();
-        if (binding != nullptr) {
-            binding->sock = sock;
-            binding->local_ip = 0;
-            binding->local_port = udp_ephemeral_port++;
-            sock->local_v4.port = binding->local_port;
-        }
+        int const BIND_RET = ensure_udp_bound_locked(sock);
         udp_lock.unlock();
+        if (BIND_RET < 0) {
+            return BIND_RET;
+        }
     }
 
     auto* pkt = pkt_alloc_tx();
@@ -243,21 +277,56 @@ auto udp_sendto(Socket* sock, const void* buf, size_t len, int /*unused*/, const
 }
 
 auto udp_recvfrom(Socket* sock, void* buf, size_t len, int /*unused*/, void* addr_raw, size_t* addr_len) -> ssize_t {
-    if (sock->rcvbuf.available() == 0) {
+    if (sock->rcvbuf.available() < sizeof(UdpRecvRecord)) {
         if (!sock->nonblock) {
             socket_defer_wait(sock, "udp_wait");
         }
         return -EAGAIN;
     }
 
+    UdpRecvRecord record{};
+    ssize_t const HDR_N = sock->rcvbuf.read(&record, sizeof(record));
+    if (std::cmp_not_equal(HDR_N, sizeof(record))) {
+        return -EIO;
+    }
+
+    size_t const PAYLOAD_LEN = record.payload_len;
+    if (PAYLOAD_LEN > sock->rcvbuf.capacity) {
+        return -EIO;
+    }
+    if (sock->rcvbuf.available() < PAYLOAD_LEN) {
+        return -EIO;
+    }
+
+    size_t const TO_COPY = std::min(len, PAYLOAD_LEN);
     if (addr_raw != nullptr && addr_len != nullptr) {
         std::memset(addr_raw, 0, *addr_len);
         if (*addr_len >= SOCKADDR_V4_MIN_LEN) {
-            socket_fill_sockaddr_v4(addr_raw, *addr_len, nullptr, sock->remote_v4.addr, sock->remote_v4.port);
+            socket_fill_sockaddr_v4(addr_raw, *addr_len, nullptr, record.src_ip, record.src_port);
         }
         *addr_len = SOCKADDR_V4_LEN;
     }
-    return sock->rcvbuf.read(buf, len);
+
+    sock->remote_v4.addr = record.src_ip;
+    sock->remote_v4.port = record.src_port;
+
+    ssize_t const N = sock->rcvbuf.read(buf, TO_COPY);
+    if (std::cmp_not_equal(N, TO_COPY)) {
+        return -EIO;
+    }
+
+    std::array<uint8_t, 256> discard{};
+    size_t remaining = PAYLOAD_LEN - TO_COPY;
+    while (remaining > 0) {
+        size_t const CHUNK = std::min(remaining, discard.size());
+        ssize_t const DISCARDED = sock->rcvbuf.read(discard.data(), CHUNK);
+        if (DISCARDED <= 0) {
+            return -EIO;
+        }
+        remaining -= static_cast<size_t>(DISCARDED);
+    }
+
+    return N;
 }
 
 void udp_close(Socket* sock) {
@@ -322,7 +391,7 @@ int udp_getsockopt(Socket* sock, int /*unused*/, int optname, void* optval, size
 }
 int udp_poll_check(Socket* sock, int events) {
     int ready = 0;
-    if ((events & POLLIN) != 0 && sock->rcvbuf.available() > 0) {
+    if ((events & POLLIN) != 0 && sock->rcvbuf.available() >= sizeof(UdpRecvRecord)) {
         ready |= POLLIN;
     }
     if ((events & POLLOUT) != 0) {
@@ -386,15 +455,18 @@ void udp_rx(NetDevice* dev, PacketBuffer* pkt, IPv4Address src_ip, IPv4Address d
     }
 
     if (binding != nullptr && binding->sock != nullptr) {
-        // Deliver to socket receive buffer
-        ssize_t const WRITTEN = binding->sock->rcvbuf.write(pkt->data, pkt->len);
-        if (WRITTEN > 0) {
-            wake_sock = binding->sock;
-        }
+        auto* sock = binding->sock;
+        if (sock->rcvbuf.free_space() >= sizeof(UdpRecvRecord) + DATA_LEN) {
+            UdpRecvRecord record{};
+            record.payload_len = static_cast<uint16_t>(DATA_LEN);
+            record.src_port = SRC_PORT;
+            record.src_ip = src_ip;
 
-        // Store sender info for recvfrom
-        binding->sock->remote_v4.addr = src_ip;
-        binding->sock->remote_v4.port = SRC_PORT;
+            ssize_t const WRITTEN = sock->rcvbuf.write_pair(&record, sizeof(record), pkt->data, DATA_LEN);
+            if (std::cmp_equal(WRITTEN, sizeof(UdpRecvRecord) + DATA_LEN)) {
+                wake_sock = sock;
+            }
+        }
     }
     udp_lock.unlock();
 

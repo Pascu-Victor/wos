@@ -31,6 +31,7 @@ namespace ker::vfs::xfs {
 namespace {
 
 constexpr uint32_t XFS_INODES_PER_CHUNK = 64;
+constexpr uint32_t XFS_INODES_PER_HOLEMASK_BIT = 4;
 constexpr uint16_t XFS_INOBT_HOLEMASK_FULL = 0;
 constexpr uint64_t XFS_INOBT_ALL_FREE = ~uint64_t{0};
 constexpr uint32_t XFS_DINODE_NULL_UNLINKED = 0xFFFFFFFFU;
@@ -47,6 +48,28 @@ auto inode_chunk_blocks(const XfsMountContext* mount) -> xfs_extlen_t {
     }
     uint32_t const BLOCKS = (XFS_INODES_PER_CHUNK + mount->inodes_per_block - 1) / mount->inodes_per_block;
     return BLOCKS == 0 ? 1 : BLOCKS;
+}
+
+auto inobt_record_contains(const XfsInobtTraits::IRec& rec, xfs_agino_t agino) -> bool {
+    if (agino < rec.startino) {
+        return false;
+    }
+    xfs_agino_t const BIT = agino - rec.startino;
+    if (BIT >= XFS_INODES_PER_CHUNK) {
+        return false;
+    }
+    if (!rec.sparse_format) {
+        return true;
+    }
+    uint32_t const HOLE_BIT = BIT / XFS_INODES_PER_HOLEMASK_BIT;
+    return (rec.holemask & (static_cast<uint16_t>(1U) << HOLE_BIT)) == 0;
+}
+
+auto inobt_free_mask_for_bit(uint32_t bit) -> uint64_t {
+    if (bit >= XFS_INODES_PER_CHUNK) {
+        return 0;
+    }
+    return static_cast<uint64_t>(1) << bit;
 }
 
 void log_agi_state(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agino_t newino, bool update_newino) {
@@ -194,36 +217,16 @@ auto allocate_inode_chunk(XfsMountContext* mount, XfsTransaction* tp) -> xfs_ino
     return ialloc_ag(mount, tp, result.agno);
 }
 
-// Find the first set bit (least significant) in a 64-bit value
-auto ffs64(uint64_t val) -> int {
-    if (val == 0) {
+auto first_free_inode_bit(uint64_t free_mask) -> int {
+    if (free_mask == 0) {
         return -1;
     }
-    int bit = 0;
-    if ((val & 0xFFFFFFFF) == 0) {
-        bit += 32;
-        val >>= 32;
+    for (uint32_t bit = 0; bit < XFS_INODES_PER_CHUNK; bit++) {
+        if ((free_mask & inobt_free_mask_for_bit(bit)) != 0) {
+            return static_cast<int>(bit);
+        }
     }
-    if ((val & 0xFFFF) == 0) {
-        bit += 16;
-        val >>= 16;
-    }
-    if ((val & 0xFF) == 0) {
-        bit += 8;
-        val >>= 8;
-    }
-    if ((val & 0xF) == 0) {
-        bit += 4;
-        val >>= 4;
-    }
-    if ((val & 0x3) == 0) {
-        bit += 2;
-        val >>= 2;
-    }
-    if ((val & 0x1) == 0) {
-        bit += 1;
-    }
-    return bit;
+    return -1;
 }
 
 // Try to allocate an inode from a specific AG
@@ -262,13 +265,13 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
 
         if (rec.freecount > 0 && rec.free_mask != 0) {
             // Found a chunk with free inodes
-            int const BIT = ffs64(rec.free_mask);
+            int const BIT = first_free_inode_bit(rec.free_mask);
             if (BIT >= 0 && std::cmp_less(BIT, XFS_INODES_PER_CHUNK)) {
                 xfs_agino_t const AGINO = rec.startino + static_cast<xfs_agino_t>(BIT);
                 xfs_ino_t const INO = (static_cast<xfs_ino_t>(agno) << mount->agino_log) | AGINO;
 
                 // 1. Clear the bit in ir_free and decrement ir_freecount
-                rec.free_mask &= ~(static_cast<uint64_t>(1) << BIT);
+                rec.free_mask &= ~inobt_free_mask_for_bit(static_cast<uint32_t>(BIT));
                 rec.freecount--;
 
                 // 2-3. Update the inobt record on disk
@@ -363,27 +366,29 @@ auto xfs_inode_allocated(XfsMountContext* mount, xfs_ino_t ino) -> int {
     }
 
     XfsPerAG* pag = &mount->per_ag[AGNO];
-    xfs_agino_t const CHUNK_START = AGINO & ~static_cast<xfs_agino_t>(XFS_INODES_PER_CHUNK - 1);
-    uint32_t const BIT = AGINO - CHUNK_START;
 
     XfsBtreeCursor<XfsInobtTraits> cur;
     cur.mount = mount;
     cur.agno = AGNO;
 
     XfsInobtTraits::IRec target{};
-    target.startino = CHUNK_START;
+    target.startino = AGINO;
 
-    int const RC = xfs_btree_lookup(&cur, pag->agi_root, pag->agi_level, target, XfsBtreeLookup::GE);
+    int const RC = xfs_btree_lookup(&cur, pag->agi_root, pag->agi_level, target, XfsBtreeLookup::LE);
     if (RC != 0) {
+        if (RC == -ENOENT) {
+            return 0;
+        }
         return -EIO;
     }
 
     XfsInobtTraits::IRec const REC = xfs_btree_get_rec(&cur);
-    if (REC.startino != CHUNK_START) {
-        return -EIO;
+    if (!inobt_record_contains(REC, AGINO)) {
+        return 0;
     }
 
-    uint64_t const INODE_BIT = static_cast<uint64_t>(1) << BIT;
+    uint32_t const BIT = AGINO - REC.startino;
+    uint64_t const INODE_BIT = inobt_free_mask_for_bit(BIT);
     return (REC.free_mask & INODE_BIT) == 0 ? 1 : 0;
 }
 
@@ -425,7 +430,7 @@ auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int
         return -EIO;
     }
 
-    const uint64_t INODE_BIT = static_cast<uint64_t>(1) << BIT;
+    uint64_t const INODE_BIT = inobt_free_mask_for_bit(BIT);
     if ((rec.free_mask & INODE_BIT) != 0) {
         mod::dbg::logger<"xfs">::warn("xfs_ifree: inode %lu already free (ag=%u agino=%u chunk_start=%u freecount=%u)",
                                       static_cast<unsigned long>(ino), AGNO, AGINO, CHUNK_START, rec.freecount);

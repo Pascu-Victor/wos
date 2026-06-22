@@ -22,6 +22,9 @@ namespace ker::vfs::xfs {
 // Directory constants
 // ============================================================================
 
+// Cookies above this value are opaque XFS readdir cursors; lower values remain
+// available for legacy dense-index callers that bypass VFS d_off handling.
+constexpr uint64_t XFS_READDIR_COOKIE_BASE = 1ULL << 32U;
 constexpr uint32_t XFS_DIR2_DATA_ALIGN_LOG = 3;
 constexpr uint32_t XFS_DIR2_DATA_ALIGN = (1U << XFS_DIR2_DATA_ALIGN_LOG);
 constexpr uint64_t XFS_DIR2_SPACE_SIZE = (1ULL << 35);          // 32 GB per space
@@ -44,6 +47,7 @@ struct XfsDirEntry {
     xfs_ino_t ino;               // inode number
     uint8_t ftype;               // file type (XFS_DIR3_FT_*)
     uint16_t namelen;            // name length
+    uint64_t cookie;             // opaque VFS readdir cursor for this entry
     std::array<char, 256> name;  // null-terminated name
 };
 
@@ -89,6 +93,7 @@ void xfs_dentry_cache_stats(XfsDentryCacheStats& out);
 
 #ifdef WOS_SELFTEST
 auto xfs_selftest_dentry_cache_shortform() -> bool;
+auto xfs_selftest_shortform_readdir_cookies_are_monotonic() -> bool;
 #endif
 
 // ============================================================================

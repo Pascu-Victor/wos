@@ -54,6 +54,8 @@ set(WOS_BUSYBOX_INSTALL_DIR "${CMAKE_SOURCE_DIR}/toolchain/busybox-install" CACH
 set(WOS_DROPBEAR_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/dropbear-build" CACHE PATH "Dropbear build directory")
 set(WOS_MAKE_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/make-build" CACHE PATH "GNU make build directory")
 set(WOS_MAKE_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/make" CACHE PATH "GNU make source directory")
+set(WOS_BASH_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/bash-build" CACHE PATH "Bash build directory")
+set(WOS_BASH_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/bash" CACHE PATH "Bash source directory")
 set(WOS_ZLIB_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/zlib-build" CACHE PATH "zlib build directory")
 set(WOS_ZLIB_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/zlib" CACHE PATH "zlib source directory")
 set(WOS_OPENSSL_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/openssl-build" CACHE PATH "OpenSSL build directory")
@@ -80,6 +82,7 @@ option(WOS_BUILD_CMAKE_FOR_HOST "Build host-side CMake from the WOS fork and ins
 option(WOS_BUILD_CMAKE_FOR_WOS "Build native WOS CMake tools and stage them into the rootfs" ON)
 option(WOS_BUILD_PYTHON_FOR_WOS "Build native WOS Python and stage it into the rootfs" ON)
 option(WOS_BUILD_NASM_FOR_WOS "Build native WOS NASM and stage it into the rootfs" ON)
+option(WOS_BUILD_BASH_FOR_WOS "Build native WOS Bash and stage it into the rootfs" ON)
 option(WOS_BUILD_OPENSSL_FOR_WOS "Build static WOS OpenSSL libraries for curl and HTTPS-capable ports" ON)
 option(WOS_BUILD_CURL_FOR_WOS "Build native WOS curl and stage it into the rootfs" ON)
 option(WOS_BUILD_GIT_FOR_WOS "Build native WOS Git and stage it into the rootfs" ON)
@@ -222,6 +225,34 @@ add_custom_command(
     USES_TERMINAL
 )
 add_custom_target(gnu_make DEPENDS ${GNU_MAKE_STAMP})
+
+# --- bash_for_wos: cross-compile Bash to run inside WOS ---------------------
+file(GLOB_RECURSE BASH_FOR_WOS_SOURCES CONFIGURE_DEPENDS
+    ${WOS_BASH_SOURCE_DIR}/*
+)
+list(FILTER BASH_FOR_WOS_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
+set(BASH_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/bash_for_wos.stamp)
+set(WOS_BASH_FOR_WOS_ROOTFS_INPUTS)
+if(WOS_BUILD_BASH_FOR_WOS)
+    add_custom_command(
+        OUTPUT ${BASH_FOR_WOS_STAMP}
+        COMMAND ${CMAKE_COMMAND} -E env
+                WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+                WOS_BASH_BUILD_DIR=${WOS_BASH_BUILD_DIR}
+                WOS_BASH_SOURCE_DIR=${WOS_BASH_SOURCE_DIR}
+                ${WOS_BUILD_SCRIPTS_DIR}/build_bash_for_wos.sh
+        COMMAND ${CMAKE_COMMAND} -E touch ${BASH_FOR_WOS_STAMP}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Building native WOS Bash..."
+        DEPENDS
+            ${WOS_BUILD_SCRIPTS_DIR}/build_bash_for_wos.sh
+            ${BASH_FOR_WOS_SOURCES}
+            ${MLIBC_STAMP}
+        USES_TERMINAL
+    )
+    add_custom_target(bash_for_wos DEPENDS ${BASH_FOR_WOS_STAMP})
+    list(APPEND WOS_BASH_FOR_WOS_ROOTFS_INPUTS ${BASH_FOR_WOS_STAMP})
+endif()
 
 # --- zlib_for_wos: static compression library for native Git ----------------
 file(GLOB_RECURSE ZLIB_FOR_WOS_SOURCES CONFIGURE_DEPENDS
@@ -571,6 +602,7 @@ add_custom_command(
         ${WOS_CMAKE_FOR_WOS_ROOTFS_INPUTS}
         ${WOS_PYTHON_FOR_WOS_ROOTFS_INPUTS}
         ${WOS_NASM_FOR_WOS_ROOTFS_INPUTS}
+        ${WOS_BASH_FOR_WOS_ROOTFS_INPUTS}
         ${WOS_CURL_FOR_WOS_ROOTFS_INPUTS}
         ${WOS_GIT_FOR_WOS_ROOTFS_INPUTS}
     USES_TERMINAL
@@ -590,6 +622,9 @@ if(WOS_BUILD_PYTHON_FOR_WOS)
 endif()
 if(WOS_BUILD_NASM_FOR_WOS)
     add_dependencies(mountfs_disk nasm_for_wos)
+endif()
+if(WOS_BUILD_BASH_FOR_WOS)
+    add_dependencies(mountfs_disk bash_for_wos)
 endif()
 if(WOS_BUILD_CURL_FOR_WOS)
     add_dependencies(mountfs_disk curl_for_wos)
@@ -633,7 +668,7 @@ add_custom_target(boot_image DEPENDS ${WOS_BOOT_DISK} ${INITRAMFS_OUTPUT} ${BOOT
 foreach(mod wos init testprog testd netd httpd perf top memacc journal wkictl powerctl renderbench sftpserver)
     add_dependencies(${mod} mlibc libcxx)
 endforeach()
-# busybox, dropbear, GNU make, curl, Git, Ninja, CMake, Python, and NASM are only needed for image creation, not compilation.
+# busybox, dropbear, GNU make, Bash, curl, Git, Ninja, CMake, Python, and NASM are only needed for image creation, not compilation.
 add_dependencies(boot_image busybox dropbear gnu_make)
 if(WOS_BUILD_NINJA_FOR_WOS)
     add_dependencies(boot_image ninja_for_wos)
@@ -646,6 +681,9 @@ if(WOS_BUILD_PYTHON_FOR_WOS)
 endif()
 if(WOS_BUILD_NASM_FOR_WOS)
     add_dependencies(boot_image nasm_for_wos)
+endif()
+if(WOS_BUILD_BASH_FOR_WOS)
+    add_dependencies(boot_image bash_for_wos)
 endif()
 if(WOS_BUILD_CURL_FOR_WOS)
     add_dependencies(boot_image curl_for_wos)
@@ -682,6 +720,9 @@ if(WOS_BUILD_PYTHON_FOR_WOS)
 endif()
 if(WOS_BUILD_NASM_FOR_WOS)
     add_dependencies(wos_full nasm_for_wos)
+endif()
+if(WOS_BUILD_BASH_FOR_WOS)
+    add_dependencies(wos_full bash_for_wos)
 endif()
 if(WOS_BUILD_OPENSSL_FOR_WOS)
     add_dependencies(wos_full openssl_for_wos)
