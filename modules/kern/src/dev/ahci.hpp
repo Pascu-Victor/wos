@@ -195,6 +195,8 @@ struct FisDmaSetup {
 } __attribute__((packed));
 static_assert(sizeof(FisDmaSetup) == 28);
 
+constexpr size_t HBA_MAX_PORTS = 32;
+
 // HBA Memory Registers
 struct HbaPort {
     uint32_t clb;        // 0x00, command list base address, 1K-byte aligned
@@ -240,9 +242,10 @@ struct HbaMem {
     uint8_t vendor[0x100 - 0xA0];  // NOLINT
 
     // 0x100 - 0x10FF, Port control registers
-    HbaPort ports[1];  // 1 ~ 32 NOLINT
+    HbaPort ports[HBA_MAX_PORTS];  // NOLINT(cppcoreguidelines-avoid-c-arrays): AHCI MMIO register layout.
 } __attribute__((packed));
-static_assert(sizeof(HbaMem) == 384);
+static_assert(offsetof(HbaMem, ports) == 0x100);
+static_assert(sizeof(HbaMem) == 0x100 + (HBA_MAX_PORTS * sizeof(HbaPort)));
 
 // Command header structure
 struct HbaCmdHeader {
@@ -297,10 +300,8 @@ struct HbaCmdTbl {
     // 0x50
     uint8_t rsv[48];  // Reserved NOLINT
 
-    // 0x80
-    HbaPrdtEntry prdt_entry[1];  // Physical region descriptor table entries, 0 ~ 65535  NOLINT
 } __attribute__((packed));
-static_assert(sizeof(HbaCmdTbl) == 144);
+static_assert(sizeof(HbaCmdTbl) == 128);
 
 // Received FIS structure
 struct HbaFis {

@@ -88,11 +88,12 @@ const ker::net::wki::RemotableOps S_REMOTABLE_OPS = {
 };
 
 volatile HbaMem* hba_mem = nullptr;
-constexpr size_t MAX_PORTS = 32;
+constexpr size_t MAX_PORTS = HBA_MAX_PORTS;
 constexpr size_t COMMAND_SLOT_COUNT = 32;
 constexpr size_t CLB_SIZE = 1024;
 constexpr size_t FIS_RECEIVE_SIZE = 256;
 constexpr uint32_t SECTOR_SIZE = 512;
+constexpr size_t COMMAND_TABLE_PRDT_ENTRY_COUNT = 8192;
 std::array<AHCIDevice, MAX_PORTS> devices{};
 size_t device_count = 0;
 
@@ -112,6 +113,13 @@ std::array<ker::mod::sys::Spinlock, MAX_PORTS> port_locks{};
 // Software-level tracking of which command slots are in use
 // This prevents the race where we release the lock but hardware hasn't updated ci yet
 std::array<std::atomic<uint32_t>, MAX_PORTS> port_slots_in_use{};
+
+constexpr auto command_table_size(size_t prdt_entries) -> size_t { return sizeof(HbaCmdTbl) + (prdt_entries * sizeof(HbaPrdtEntry)); }
+
+auto command_table_prdt_entries(HbaCmdTbl* table) -> HbaPrdtEntry* {
+    auto* bytes = reinterpret_cast<uint8_t*>(table);
+    return reinterpret_cast<HbaPrdtEntry*>(bytes + sizeof(HbaCmdTbl));
+}
 
 auto valid_port(int portno) -> bool { return portno >= 0 && std::cmp_less(portno, MAX_PORTS); }
 auto port_index(int portno) -> size_t { return static_cast<size_t>(portno); }
@@ -231,10 +239,10 @@ void port_rebase(volatile HbaPort* port, size_t portno) {
     // Command table size = 256*32 = 8K per port
     auto* cmdheader = reinterpret_cast<HbaCmdHeader*>(clb_virt);
     for (size_t i = 0; i < COMMAND_SLOT_COUNT; i++) {
-        // Command table: 128B fixed header + 8192 × 16B PRDT entries = 131200 bytes.
+        // Command table: 128B fixed header + 8192 x 16B PRDT entries = 131200 bytes.
         // 8192 entries × 4KB/page = 32MB per command (ATA sector count is 16-bit = 32MB max).
-        constexpr size_t CTB_SIZE = 128 + (8192 * sizeof(HbaPrdtEntry));
-        cmdheader[i].prdtl = 8192;
+        constexpr size_t CTB_SIZE = command_table_size(COMMAND_TABLE_PRDT_ENTRY_COUNT);
+        cmdheader[i].prdtl = static_cast<uint16_t>(COMMAND_TABLE_PRDT_ENTRY_COUNT);
         auto* ctb_virt = new (std::nothrow) uint8_t[CTB_SIZE];
         if (ctb_virt == nullptr) {
             log::error("failed to allocate CTB kernel allocation");
@@ -331,17 +339,16 @@ auto read_write_disk(volatile HbaPort* port, int portno, uint32_t startl, uint32
     // Each PRDT entry must stay within a single mapped page span. The old code
     // assumed page-aligned buffers and advanced in fixed 4 KiB steps, which
     // breaks for callers like remote VFS that DMA into resp_buf + header.
-    constexpr size_t MAX_PRDT = 8192;
-
     uint64_t const TOTAL_BYTES = static_cast<uint64_t>(count) * SECTOR_SIZE;
     auto buf_virt = reinterpret_cast<uint64_t>(buf);
     uint64_t const FIRST_PAGE_OFF = buf_virt & (ker::mod::mm::paging::PAGE_SIZE - 1);
     auto prdt_entries =
         static_cast<size_t>((FIRST_PAGE_OFF + TOTAL_BYTES + ker::mod::mm::paging::PAGE_SIZE - 1) / ker::mod::mm::paging::PAGE_SIZE);
-    prdt_entries = std::min(prdt_entries, MAX_PRDT);
+    prdt_entries = std::min(prdt_entries, COMMAND_TABLE_PRDT_ENTRY_COUNT);
 
     auto* cmdtbl = reinterpret_cast<HbaCmdTbl*>(memory.ctb_virt.at(slot));
-    std::memset(cmdtbl, 0, sizeof(HbaCmdTbl) + ((prdt_entries - 1) * sizeof(HbaPrdtEntry)));
+    std::memset(cmdtbl, 0, command_table_size(prdt_entries));
+    auto* prdt = command_table_prdt_entries(cmdtbl);
 
     uint64_t remaining_bytes = TOTAL_BYTES;
     size_t actual_prdt_entries = 0;
@@ -356,10 +363,10 @@ auto read_write_disk(volatile HbaPort* port, int portno, uint32_t startl, uint32
         uint64_t const PAGE_OFF = buf_virt & (ker::mod::mm::paging::PAGE_SIZE - 1);
         uint64_t const BYTES_THIS_ENTRY = std::min<uint64_t>(remaining_bytes, ker::mod::mm::paging::PAGE_SIZE - PAGE_OFF);
 
-        cmdtbl->prdt_entry[actual_prdt_entries].dba = static_cast<uint32_t>(PHYS & UINT32_MAX);
-        cmdtbl->prdt_entry[actual_prdt_entries].dbau = static_cast<uint32_t>((PHYS >> 32) & UINT32_MAX);
-        cmdtbl->prdt_entry[actual_prdt_entries].dbc = static_cast<uint32_t>(BYTES_THIS_ENTRY - 1);
-        cmdtbl->prdt_entry[actual_prdt_entries].i = 1;
+        prdt[actual_prdt_entries].dba = static_cast<uint32_t>(PHYS & UINT32_MAX);
+        prdt[actual_prdt_entries].dbau = static_cast<uint32_t>((PHYS >> 32) & UINT32_MAX);
+        prdt[actual_prdt_entries].dbc = static_cast<uint32_t>(BYTES_THIS_ENTRY - 1);
+        prdt[actual_prdt_entries].i = 1;
 
         buf_virt += BYTES_THIS_ENTRY;
         remaining_bytes -= BYTES_THIS_ENTRY;
@@ -556,7 +563,7 @@ auto flush_disk(volatile HbaPort* port, int portno) -> bool {
     cmdheader->prdtl = 0;  // No data transfer
 
     auto* cmdtbl = reinterpret_cast<HbaCmdTbl*>(memory.ctb_virt.at(slot));
-    std::memset(cmdtbl, 0, sizeof(HbaCmdTbl));
+    std::memset(cmdtbl, 0, command_table_size(0));
 
     auto* cmdfis = reinterpret_cast<FisRegH2D*>(&cmdtbl->cfis);
     cmdfis->fis_type = FIS_TYPE_REG_H2D;
@@ -708,13 +715,14 @@ auto identify_disk(volatile HbaPort* port, int portno) -> uint64_t {
     cmdheader->prdtl = 1;
 
     auto* cmdtbl = reinterpret_cast<HbaCmdTbl*>(memory.ctb_virt.at(slot));
-    std::memset(cmdtbl, 0, sizeof(HbaCmdTbl));
+    std::memset(cmdtbl, 0, command_table_size(1));
+    auto* prdt = command_table_prdt_entries(cmdtbl);
 
     // Single PRDT entry for 512 bytes
-    cmdtbl->prdt_entry[0].dba = static_cast<uint32_t>(BUF_PHYS & UINT32_MAX);
-    cmdtbl->prdt_entry[0].dbau = static_cast<uint32_t>((BUF_PHYS >> 32) & UINT32_MAX);
-    cmdtbl->prdt_entry[0].dbc = SECTOR_SIZE - 1;  // 512 bytes
-    cmdtbl->prdt_entry[0].i = 1;
+    prdt[0].dba = static_cast<uint32_t>(BUF_PHYS & UINT32_MAX);
+    prdt[0].dbau = static_cast<uint32_t>((BUF_PHYS >> 32) & UINT32_MAX);
+    prdt[0].dbc = SECTOR_SIZE - 1;  // 512 bytes
+    prdt[0].i = 1;
 
     auto* cmdfis = reinterpret_cast<FisRegH2D*>(&cmdtbl->cfis);
     cmdfis->fis_type = FIS_TYPE_REG_H2D;
@@ -870,7 +878,7 @@ auto ahci_init() -> int {
     // Probe and initialize ports
     uint32_t const PORT_IMPLEMENTED = mmio_read32(hba_mem->pi);
     for (size_t i = 0; i < MAX_PORTS; i++) {
-        if (((PORT_IMPLEMENTED & (1 << i)) != 0U)) {
+        if (((PORT_IMPLEMENTED & (1U << i)) != 0U)) {
             ahci_log("ahci_init: Rebasing port ");
             ahci_log_hex(i);
             ahci_log("\n");
