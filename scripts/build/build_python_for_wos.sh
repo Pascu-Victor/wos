@@ -72,6 +72,7 @@ ac_cv_func_getrandom=no
 ac_cv_func_setgroups=no
 ac_cv_func_setpriority=no
 ac_cv_func_sched_rr_get_interval=no
+ac_cv_have_decl_PR_SET_VMA_ANON_NAME=no
 EOF
 
 	if [ ! -f "$PYTHON_CONFIG_SITE" ] || ! cmp -s "$tmp_config_site" "$PYTHON_CONFIG_SITE"; then
@@ -90,6 +91,8 @@ python_target_config_is_wos() {
 	grep -Eq '^CC[[:space:]]*=.*--target=x86_64-pc-wos' "$makefile" || return 1
 	! grep -Eq '^CC[[:space:]]*=[[:space:]]*gcc([[:space:]]|$)' "$makefile" || return 1
 	! grep -Eq '^LDSHARED[[:space:]]*=[[:space:]]*ld([[:space:]]|$)' "$makefile" || return 1
+	[ -f "$PYTHON_TARGET_BUILD/pyconfig.h" ] || return 1
+	! grep -Eq '^#define[[:space:]]+_Py_HAVE_PR_SET_VMA_ANON_NAME[[:space:]]+1' "$PYTHON_TARGET_BUILD/pyconfig.h" || return 1
 }
 
 discard_stale_target_config() {
