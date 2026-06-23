@@ -900,6 +900,12 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
         // It's big-endian
         leaf_count = (static_cast<uint16_t>(leaf_data[sizeof(XfsDa3Blkinfo)]) << 8) | leaf_data[sizeof(XfsDa3Blkinfo) + 1];
 
+        size_t const LEAF_CAPACITY = (ctx->dir_blk_size - LEAF_HDR_SIZE) / sizeof(XfsDir2LeafEntry);
+        if (leaf_count > LEAF_CAPACITY) {
+            brelse(leaf_bh);
+            goto linear_scan;
+        }
+
         const auto* lep = reinterpret_cast<const XfsDir2LeafEntry*>(leaf_entries_base);
 
         // Binary search for hash
@@ -923,7 +929,7 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
 
         if (!found) {
             brelse(leaf_bh);
-            goto linear_scan;
+            return -ENOENT;
         }
 
         // Back up to first with this hash
@@ -965,7 +971,7 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
         }
 
         brelse(leaf_bh);
-        goto linear_scan;
+        return -ENOENT;
     }
 
 linear_scan:
