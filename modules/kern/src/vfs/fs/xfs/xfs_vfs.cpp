@@ -550,11 +550,10 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         t0 = ker::mod::tsc::get_ns();
 #endif
         if (BLOCK_OFF == 0 && (chunk & (ctx->block_size - 1)) == 0) {
-            // Full-block read. Dirty smaller cache entries must remain
-            // authoritative: a larger multi-block buffer has a different cache
-            // key, so it would otherwise miss freshly buffered writes.
+            // Full-block read. Large reads use direct I/O, then overlay any
+            // dirty cached intervals so overlapping size-keyed buffers remain
+            // authoritative over the disk snapshot.
             size_t const FSB_COUNT = chunk >> ctx->block_log;
-            size_t const DEV_BLOCKS_PER_FSB = xfs_fsb_to_dev_count(ctx, 1);
 
             auto read_cached_blocks = [&]() -> bool {
                 bool ok = true;
@@ -576,8 +575,6 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             if (!read_from_cache) {
                 dev_block = xfs_fsblock_to_dev_block(ctx, DISK_BLOCK);
                 dev_count = xfs_fsb_to_dev_count(ctx, static_cast<xfs_filblks_t>(FSB_COUNT));
-                read_from_cache =
-                    DEV_BLOCKS_PER_FSB == 0 || has_dirty_bdev_aligned_spans(ctx->device, dev_block, dev_count, DEV_BLOCKS_PER_FSB);
             }
 
 #ifdef XFS_BENCH
@@ -602,6 +599,12 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 }
                 perf_accounted_us +=
                     perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, 0, chunk);
+                uint64_t const PERF_COPY_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY);
+                bool const OVERLAYED = copy_dirty_bdev_range(ctx->device, dev_block, dev_count, dst + total_read);
+                if (OVERLAYED) {
+                    perf_accounted_us +=
+                        perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
+                }
             }
         } else {
             // Partial or unaligned - fall back to single cached block.

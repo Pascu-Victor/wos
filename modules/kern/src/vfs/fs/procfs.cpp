@@ -2383,9 +2383,26 @@ auto generate_memacc_alloc_totals(char* buf, size_t bufsz) -> size_t {
     append_memacc_dec(p, end, "clean_bytes", BCACHE.clean_bytes);
     append_memacc_dec(p, end, "dirty_bytes", BCACHE.dirty_bytes);
     append_memacc_dec(p, end, "max_bytes", BCACHE.max_bytes);
+    append_memacc_dec(p, end, "dirty_bdevs", BCACHE.dirty_bdevs);
+    append_memacc_dec(p, end, "dirty_target_bytes", BCACHE.dirty_target_bytes);
+    append_memacc_dec(p, end, "dirty_hard_bytes", BCACHE.dirty_hard_bytes);
+    append_memacc_dec(p, end, "dirty_waiters", BCACHE.dirty_waiters);
     append_memacc_dec(p, end, "hits", BCACHE.hits);
     append_memacc_dec(p, end, "misses", BCACHE.misses);
     append_char(p, end, '\n');
+
+    std::array<ker::vfs::BufferCacheBdevStats, 16> bcache_bdevs{};
+    size_t const BCACHE_BDEVS = ker::vfs::buffer_cache_bdev_stats(bcache_bdevs.data(), bcache_bdevs.size());
+    size_t const BCACHE_BDEV_ROWS = std::min(BCACHE_BDEVS, bcache_bdevs.size());
+    for (size_t i = 0; i < BCACHE_BDEV_ROWS; ++i) {
+        auto const& row = bcache_bdevs.at(i);
+        append_sconst(p, end, "buffer_cache_bdev");
+        append_memacc_str(p, end, "name", row.name);
+        append_memacc_dec(p, end, "dirty_buffers", row.dirty_buffers);
+        append_memacc_dec(p, end, "dirty_bytes", row.dirty_bytes);
+        append_memacc_dec(p, end, "oldest_dirty_epoch", row.oldest_dirty_epoch);
+        append_char(p, end, '\n');
+    }
 
     ker::vfs::VfsCachePerfSnapshot vfs_cache{};
     ker::vfs::vfs_get_cache_perf_snapshot(vfs_cache);
@@ -2664,6 +2681,8 @@ auto generate_memacc_reclaim_buffer_cache(char* buf, size_t bufsz) -> size_t {
     append_memacc_dec(p, end, "buffers", BCACHE.total_buffers);
     append_memacc_dec(p, end, "dirty_buffers", BCACHE.dirty_buffers);
     append_memacc_dec(p, end, "default_target_bytes", 0);
+    append_memacc_dec(p, end, "dirty_target_bytes", BCACHE.dirty_target_bytes);
+    append_memacc_dec(p, end, "dirty_hard_bytes", BCACHE.dirty_hard_bytes);
     append_char(p, end, '\n');
     *p = '\0';
     return static_cast<size_t>(p - buf);

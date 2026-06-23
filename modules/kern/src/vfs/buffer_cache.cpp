@@ -11,6 +11,7 @@
 
 #include "buffer_cache.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -23,6 +24,9 @@
 #include <platform/mm/phys.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sched/task.hpp>
+#include <platform/sched/workqueue.hpp>
+#include <util/smallvec.hpp>
 
 #include "dev/block_device.hpp"
 #include "platform/sys/spinlock.hpp"
@@ -205,11 +209,51 @@ uint64_t stat_hits = 0;
 uint64_t stat_misses = 0;
 std::atomic<uint64_t> next_writeback_epoch{1};
 std::atomic<uint64_t> next_dirty_epoch{1};
-std::atomic<bool> dirty_throttle_active{false};
+std::atomic<bool> dirty_writeback_queued{false};
+std::atomic<bool> dirty_writeback_wq_creating{false};
 
 bool cache_initialized = false;
 
-constexpr size_t DIRTY_THROTTLE_HIGH_MULTIPLIER = 4;
+constexpr size_t DIRTY_HARD_LIMIT_MULTIPLIER = 4;
+constexpr size_t DIRTY_WRITEBACK_BUDGET = 128;
+constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = 16;
+constexpr size_t DIRTY_WAKE_BATCH = 32;
+
+struct DirtyBdevState {
+    dev::BlockDevice* bdev{};
+    BufHead* tree_root{};
+    BufHead* list_head{};
+    BufHead* list_tail{};
+    size_t dirty_buffers{};
+    size_t dirty_bytes{};
+};
+
+struct DirtyWritebackFilter {
+    dev::BlockDevice* bdev{};
+    uint64_t block_no{};
+    size_t count{};
+    bool use_range{};
+};
+
+struct DirtyWritebackResult {
+    bool wrote{};
+    bool busy{};
+    int status{};
+};
+
+struct DirtyWakeList {
+    std::array<uint64_t, DIRTY_WAKE_BATCH> pids{};
+    size_t count{};
+};
+
+ker::util::SmallVec<DirtyBdevState*, 8> dirty_bdev_states;
+ker::util::SmallVec<uint64_t, 8> dirty_waiters;
+bool dirty_index_degraded = false;
+ker::mod::sched::Workqueue* dirty_writeback_wq = nullptr;
+
+void clear_buffer_dirty_locked(BufHead* bh);
+void dirty_writeback_worker(void* unused);
+ker::mod::sched::WorkItem dirty_writeback_work{.fn = dirty_writeback_worker, .arg = nullptr, .next = nullptr};
 constexpr size_t HOT_EVICT_SCAN_BUDGET = 512;
 constexpr size_t HOT_EVICT_MAX_VICTIMS = 64;
 
@@ -226,11 +270,13 @@ auto perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp op) -> uint64_t {
 
 auto perf_xfs_started_us() -> uint64_t { return ker::mod::perf::is_local_xfs_recording_enabled() ? ker::mod::time::get_us() : 0; }
 
-auto dirty_throttle_high_bytes_locked() -> size_t {
-    if (cache_max_bytes > SIZE_MAX / DIRTY_THROTTLE_HIGH_MULTIPLIER) {
+auto dirty_target_bytes_locked() -> size_t { return cache_max_bytes; }
+
+auto dirty_hard_limit_bytes_locked() -> size_t {
+    if (cache_max_bytes > SIZE_MAX / DIRTY_HARD_LIMIT_MULTIPLIER) {
         return SIZE_MAX;
     }
-    return cache_max_bytes * DIRTY_THROTTLE_HIGH_MULTIPLIER;
+    return cache_max_bytes * DIRTY_HARD_LIMIT_MULTIPLIER;
 }
 
 auto perf_elapsed_since_us(uint64_t started_us) -> uint32_t {
@@ -304,8 +350,7 @@ void free_writeback_snapshot(WritebackSnapshot& snapshot) {
 
 void free_unlinked_buffer(BufHead* bh) {
     if ((bh->flags & BH_DIRTY) != 0) {
-        cache_dirty_buffers--;
-        cache_dirty_bytes -= bh->size;
+        clear_buffer_dirty_locked(bh);
     }
     cache_total_bytes -= bh->size;
     cache_total_buffers--;
@@ -384,6 +429,12 @@ auto alloc_buffer_with_size(dev::BlockDevice* bdev, uint64_t block_no, size_t si
     bh->lru_prev = nullptr;
     bh->lru_next = nullptr;
     bh->hash_next = nullptr;
+    bh->dirty_prev = nullptr;
+    bh->dirty_next = nullptr;
+    bh->dirty_left = nullptr;
+    bh->dirty_right = nullptr;
+    bh->dirty_parent = nullptr;
+    bh->dirty_subtree_last_block = 0;
 
     cache_total_bytes += size;
     cache_total_buffers++;
@@ -470,18 +521,418 @@ auto block_ranges_overlap(uint64_t a_block_no, size_t a_count, uint64_t b_block_
     return a_block_no <= B_LAST && b_block_no <= A_LAST;
 }
 
-auto buffers_overlap(const BufHead* a, const BufHead* b) -> bool {
-    if (a == nullptr || b == nullptr || a == b || a->bdev != b->bdev) {
-        return false;
-    }
-    return block_ranges_overlap(a->block_no, buffer_block_count(a), b->block_no, buffer_block_count(b));
-}
-
 auto buffer_overlaps_range(const BufHead* bh, dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> bool {
     if (bh == nullptr || bh->bdev != bdev) {
         return false;
     }
     return block_ranges_overlap(bh->block_no, buffer_block_count(bh), block_no, count);
+}
+
+auto dirty_buffer_last_block(const BufHead* bh) -> uint64_t { return block_range_last_block(bh->block_no, buffer_block_count(bh)); }
+
+auto dirty_priority_mix(uint64_t value) -> uint64_t {
+    value ^= value >> 33U;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33U;
+    value *= 0xc4ceb9fe1a85ec53ULL;
+    value ^= value >> 33U;
+    return value == 0 ? 1 : value;
+}
+
+auto dirty_priority(const BufHead* bh) -> uint64_t {
+    auto value = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bh));
+    value ^= bh->block_no;
+    value ^= static_cast<uint64_t>(bh->size) << 17U;
+    value ^= static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bh->bdev)) >> 4U;
+    return dirty_priority_mix(value);
+}
+
+auto dirty_tree_less(const BufHead* lhs, const BufHead* rhs) -> bool {
+    uint64_t const LHS_LAST = dirty_buffer_last_block(lhs);
+    uint64_t const RHS_LAST = dirty_buffer_last_block(rhs);
+    if (lhs->block_no != rhs->block_no) {
+        return lhs->block_no < rhs->block_no;
+    }
+    if (LHS_LAST != RHS_LAST) {
+        return LHS_LAST < RHS_LAST;
+    }
+    if (lhs->size != rhs->size) {
+        return lhs->size < rhs->size;
+    }
+    return reinterpret_cast<uintptr_t>(lhs) < reinterpret_cast<uintptr_t>(rhs);
+}
+
+auto dirty_child_max_last(const BufHead* bh) -> uint64_t { return bh != nullptr ? bh->dirty_subtree_last_block : 0; }
+
+void dirty_recompute(BufHead* bh) {
+    if (bh == nullptr) {
+        return;
+    }
+    uint64_t max_last = dirty_buffer_last_block(bh);
+    max_last = std::max(max_last, dirty_child_max_last(bh->dirty_left));
+    max_last = std::max(max_last, dirty_child_max_last(bh->dirty_right));
+    bh->dirty_subtree_last_block = max_last;
+}
+
+void dirty_recompute_upwards(BufHead* bh) {
+    while (bh != nullptr) {
+        dirty_recompute(bh);
+        bh = bh->dirty_parent;
+    }
+}
+
+void dirty_replace_child(DirtyBdevState* state, BufHead* old_child, BufHead* new_child) {
+    BufHead* parent = old_child->dirty_parent;
+    if (parent == nullptr) {
+        state->tree_root = new_child;
+    } else if (parent->dirty_left == old_child) {
+        parent->dirty_left = new_child;
+    } else {
+        parent->dirty_right = new_child;
+    }
+    if (new_child != nullptr) {
+        new_child->dirty_parent = parent;
+    }
+}
+
+void dirty_rotate_left(DirtyBdevState* state, BufHead* node) {
+    BufHead* pivot = node->dirty_right;
+    if (pivot == nullptr) {
+        return;
+    }
+
+    node->dirty_right = pivot->dirty_left;
+    if (pivot->dirty_left != nullptr) {
+        pivot->dirty_left->dirty_parent = node;
+    }
+
+    dirty_replace_child(state, node, pivot);
+    pivot->dirty_left = node;
+    node->dirty_parent = pivot;
+
+    dirty_recompute(node);
+    dirty_recompute(pivot);
+    dirty_recompute_upwards(pivot->dirty_parent);
+}
+
+void dirty_rotate_right(DirtyBdevState* state, BufHead* node) {
+    BufHead* pivot = node->dirty_left;
+    if (pivot == nullptr) {
+        return;
+    }
+
+    node->dirty_left = pivot->dirty_right;
+    if (pivot->dirty_right != nullptr) {
+        pivot->dirty_right->dirty_parent = node;
+    }
+
+    dirty_replace_child(state, node, pivot);
+    pivot->dirty_right = node;
+    node->dirty_parent = pivot;
+
+    dirty_recompute(node);
+    dirty_recompute(pivot);
+    dirty_recompute_upwards(pivot->dirty_parent);
+}
+
+auto find_dirty_bdev_state_locked(dev::BlockDevice* bdev) -> DirtyBdevState* {
+    for (auto* state : dirty_bdev_states) {
+        if (state != nullptr && state->bdev == bdev) {
+            return state;
+        }
+    }
+    return nullptr;
+}
+
+auto find_or_create_dirty_bdev_state_locked(dev::BlockDevice* bdev) -> DirtyBdevState* {
+    DirtyBdevState* state = find_dirty_bdev_state_locked(bdev);
+    if (state != nullptr) {
+        return state;
+    }
+
+    state = new DirtyBdevState{};
+    if (state == nullptr) {
+        return nullptr;
+    }
+    state->bdev = bdev;
+    if (!dirty_bdev_states.push_back(state)) {
+        delete state;
+        return nullptr;
+    }
+    return state;
+}
+
+void dirty_list_insert(DirtyBdevState* state, BufHead* bh) {
+    bh->dirty_prev = state->list_tail;
+    bh->dirty_next = nullptr;
+    if (state->list_tail != nullptr) {
+        state->list_tail->dirty_next = bh;
+    } else {
+        state->list_head = bh;
+    }
+    state->list_tail = bh;
+}
+
+void dirty_list_remove(DirtyBdevState* state, BufHead* bh) {
+    if (bh->dirty_prev != nullptr) {
+        bh->dirty_prev->dirty_next = bh->dirty_next;
+    } else if (state->list_head == bh) {
+        state->list_head = bh->dirty_next;
+    }
+    if (bh->dirty_next != nullptr) {
+        bh->dirty_next->dirty_prev = bh->dirty_prev;
+    } else if (state->list_tail == bh) {
+        state->list_tail = bh->dirty_prev;
+    }
+    bh->dirty_prev = nullptr;
+    bh->dirty_next = nullptr;
+}
+
+void dirty_tree_insert(DirtyBdevState* state, BufHead* bh) {
+    bh->dirty_left = nullptr;
+    bh->dirty_right = nullptr;
+    bh->dirty_parent = nullptr;
+    bh->dirty_subtree_last_block = dirty_buffer_last_block(bh);
+
+    if (state->tree_root == nullptr) {
+        state->tree_root = bh;
+        return;
+    }
+
+    BufHead* parent = nullptr;
+    BufHead* cur = state->tree_root;
+    while (cur != nullptr) {
+        parent = cur;
+        if (dirty_tree_less(bh, cur)) {
+            cur = cur->dirty_left;
+        } else {
+            cur = cur->dirty_right;
+        }
+    }
+
+    bh->dirty_parent = parent;
+    if (dirty_tree_less(bh, parent)) {
+        parent->dirty_left = bh;
+    } else {
+        parent->dirty_right = bh;
+    }
+    dirty_recompute_upwards(parent);
+
+    while (bh->dirty_parent != nullptr && dirty_priority(bh) < dirty_priority(bh->dirty_parent)) {
+        if (bh->dirty_parent->dirty_left == bh) {
+            dirty_rotate_right(state, bh->dirty_parent);
+        } else {
+            dirty_rotate_left(state, bh->dirty_parent);
+        }
+    }
+}
+
+void dirty_tree_remove(DirtyBdevState* state, BufHead* bh) {
+    while (bh->dirty_left != nullptr || bh->dirty_right != nullptr) {
+        if (bh->dirty_right == nullptr || (bh->dirty_left != nullptr && dirty_priority(bh->dirty_left) < dirty_priority(bh->dirty_right))) {
+            dirty_rotate_right(state, bh);
+        } else {
+            dirty_rotate_left(state, bh);
+        }
+    }
+
+    BufHead* parent = bh->dirty_parent;
+    if (parent == nullptr) {
+        state->tree_root = nullptr;
+    } else if (parent->dirty_left == bh) {
+        parent->dirty_left = nullptr;
+    } else if (parent->dirty_right == bh) {
+        parent->dirty_right = nullptr;
+    }
+    bh->dirty_parent = nullptr;
+    bh->dirty_subtree_last_block = 0;
+    dirty_recompute_upwards(parent);
+}
+
+auto dirty_index_insert_locked(BufHead* bh) -> bool {
+    DirtyBdevState* state = find_or_create_dirty_bdev_state_locked(bh->bdev);
+    if (state == nullptr) {
+        dirty_index_degraded = true;
+        return false;
+    }
+
+    dirty_list_insert(state, bh);
+    dirty_tree_insert(state, bh);
+    state->dirty_buffers++;
+    state->dirty_bytes += bh->size;
+    bh->flags |= BH_DIRTY_INDEXED;
+    return true;
+}
+
+void dirty_index_remove_locked(BufHead* bh) {
+    if ((bh->flags & BH_DIRTY_INDEXED) == 0) {
+        return;
+    }
+
+    DirtyBdevState* state = find_dirty_bdev_state_locked(bh->bdev);
+    if (state != nullptr) {
+        dirty_tree_remove(state, bh);
+        dirty_list_remove(state, bh);
+        if (state->dirty_buffers != 0) {
+            state->dirty_buffers--;
+        }
+        if (state->dirty_bytes >= bh->size) {
+            state->dirty_bytes -= bh->size;
+        } else {
+            state->dirty_bytes = 0;
+        }
+    }
+    bh->flags &= ~BH_DIRTY_INDEXED;
+}
+
+auto dirty_tree_overlaps(const BufHead* root, uint64_t block_no, size_t count) -> bool {
+    if (root == nullptr || count == 0) {
+        return false;
+    }
+    uint64_t const QUERY_LAST = block_range_last_block(block_no, count);
+    const BufHead* cur = root;
+    while (cur != nullptr) {
+        if (cur->dirty_left != nullptr && cur->dirty_left->dirty_subtree_last_block >= block_no) {
+            cur = cur->dirty_left;
+            continue;
+        }
+        if (cur->block_no <= QUERY_LAST && dirty_buffer_last_block(cur) >= block_no) {
+            return true;
+        }
+        if (cur->block_no > QUERY_LAST) {
+            return false;
+        }
+        cur = cur->dirty_right;
+    }
+    return false;
+}
+
+auto dirty_state_oldest_epoch_locked(const DirtyBdevState* state) -> uint64_t {
+    uint64_t oldest = 0;
+    if (state == nullptr) {
+        return oldest;
+    }
+    for (BufHead* bh = state->list_head; bh != nullptr; bh = bh->dirty_next) {
+        if ((bh->flags & BH_DIRTY) == 0) {
+            continue;
+        }
+        if (oldest == 0 || bh->dirty_epoch < oldest) {
+            oldest = bh->dirty_epoch;
+        }
+    }
+    return oldest;
+}
+
+auto dirty_bdev_count_locked() -> size_t {
+    size_t count = 0;
+    for (auto* state : dirty_bdev_states) {
+        if (state != nullptr && state->dirty_buffers != 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+auto dirty_filter_matches(const BufHead* bh, const DirtyWritebackFilter& filter) -> bool {
+    if (bh == nullptr || (bh->flags & BH_DIRTY) == 0) {
+        return false;
+    }
+    if (filter.bdev != nullptr && bh->bdev != filter.bdev) {
+        return false;
+    }
+    if (filter.use_range && !buffer_overlaps_range(bh, filter.bdev, filter.block_no, filter.count)) {
+        return false;
+    }
+    return true;
+}
+
+auto dirty_filter_may_have_match_locked(const DirtyWritebackFilter& filter) -> bool {
+    if (cache_dirty_buffers == 0) {
+        return false;
+    }
+    if (dirty_index_degraded || filter.bdev == nullptr || !filter.use_range) {
+        return true;
+    }
+    DirtyBdevState* state = find_dirty_bdev_state_locked(filter.bdev);
+    return state != nullptr && dirty_tree_overlaps(state->tree_root, filter.block_no, filter.count);
+}
+
+void dirty_consider_candidate(BufHead* bh, const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive, BufHead*& best) {
+    if (!dirty_filter_matches(bh, filter) || bh->dirty_epoch <= min_epoch_exclusive) {
+        return;
+    }
+    if (best == nullptr || bh->dirty_epoch < best->dirty_epoch || (bh->dirty_epoch == best->dirty_epoch && dirty_tree_less(bh, best))) {
+        best = bh;
+    }
+}
+
+auto find_oldest_matching_dirty_buffer_locked(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive) -> BufHead* {
+    if (!dirty_filter_may_have_match_locked(filter)) {
+        return nullptr;
+    }
+
+    BufHead* best = nullptr;
+    if (dirty_index_degraded) {
+        for (auto* bucket_head : hash_buckets) {
+            for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
+                dirty_consider_candidate(bh, filter, min_epoch_exclusive, best);
+            }
+        }
+        return best;
+    }
+
+    for (auto* state : dirty_bdev_states) {
+        if (state == nullptr || state->dirty_buffers == 0) {
+            continue;
+        }
+        if (filter.bdev != nullptr && state->bdev != filter.bdev) {
+            continue;
+        }
+        if (filter.use_range && !dirty_tree_overlaps(state->tree_root, filter.block_no, filter.count)) {
+            continue;
+        }
+        for (BufHead* bh = state->list_head; bh != nullptr; bh = bh->dirty_next) {
+            dirty_consider_candidate(bh, filter, min_epoch_exclusive, best);
+        }
+    }
+    return best;
+}
+
+void clear_buffer_dirty_locked(BufHead* bh) {
+    if (bh == nullptr || (bh->flags & BH_DIRTY) == 0) {
+        return;
+    }
+    dirty_index_remove_locked(bh);
+    bh->flags &= ~BH_DIRTY;
+    cache_dirty_buffers--;
+    cache_dirty_bytes -= bh->size;
+}
+
+void collect_dirty_waiters_locked(DirtyWakeList& wake_list) {
+    if (cache_dirty_bytes > dirty_target_bytes_locked()) {
+        return;
+    }
+    while (!dirty_waiters.empty() && wake_list.count < wake_list.pids.size()) {
+        wake_list.pids.at(wake_list.count++) = dirty_waiters.at(0);
+        static_cast<void>(dirty_waiters.remove_at(0));
+    }
+}
+
+void wake_dirty_waiters(const DirtyWakeList& wake_list) {
+    for (size_t i = 0; i < wake_list.count; ++i) {
+        static_cast<void>(ker::mod::sched::wake_task_by_pid_from_event(wake_list.pids.at(i)));
+    }
+}
+
+void register_current_dirty_waiter_locked() {
+    if (!ker::mod::sched::can_query_current_task()) {
+        return;
+    }
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr || task->pid == 0 || dirty_waiters.contains(task->pid)) {
+        return;
+    }
+    static_cast<void>(dirty_waiters.push_back(task->pid));
 }
 
 auto allocate_dirty_epoch() -> uint64_t {
@@ -525,41 +976,8 @@ auto mark_buffer_dirty_locked(BufHead* bh) -> bool {
     bh->flags |= BH_DIRTY;
     cache_dirty_buffers++;
     cache_dirty_bytes += bh->size;
+    static_cast<void>(dirty_index_insert_locked(bh));
     return true;
-}
-
-auto has_older_overlapping_dirty_buffer_locked(const BufHead* target) -> bool {
-    for (auto* bucket_head : hash_buckets) {
-        for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
-            if ((bh->flags & BH_DIRTY) == 0 || !buffers_overlap(target, bh)) {
-                continue;
-            }
-            if (bh->dirty_epoch < target->dirty_epoch) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-void clear_writeback_for_bdev(dev::BlockDevice* bdev, uint64_t epoch) {
-    for (auto* bucket_head : hash_buckets) {
-        for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
-            if (bh->bdev == bdev && bh->writeback_epoch == epoch) {
-                clear_buffer_writeback(bh);
-            }
-        }
-    }
-}
-
-void clear_writeback_for_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint64_t epoch) {
-    for (auto* bucket_head : hash_buckets) {
-        for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
-            if (bh->writeback_epoch == epoch && buffer_overlaps_range(bh, bdev, block_no, count)) {
-                clear_buffer_writeback(bh);
-            }
-        }
-    }
 }
 
 auto write_buffer_snapshot_for_epoch(BufHead* bh, uint64_t writeback_dirty_epoch, uint64_t owned_writeback_epoch) -> int {
@@ -575,17 +993,144 @@ auto write_buffer_snapshot_for_epoch(BufHead* bh, uint64_t writeback_dirty_epoch
 
     int const RC = write_block_to_disk(bh, snapshot.data);
     free_writeback_snapshot(snapshot);
+    DirtyWakeList wake_list{};
     uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
     if (RC == 0 && (bh->flags & BH_DIRTY) != 0 && bh->dirty_epoch == writeback_dirty_epoch) {
-        bh->flags &= ~BH_DIRTY;
-        cache_dirty_buffers--;
-        cache_dirty_bytes -= bh->size;
+        clear_buffer_dirty_locked(bh);
+        collect_dirty_waiters_locked(wake_list);
     }
     if (owns_writeback_epoch(bh, owned_writeback_epoch)) {
         clear_buffer_writeback(bh);
     }
     cache_lock.unlock_irqrestore(IRQFLAGS);
+    wake_dirty_waiters(wake_list);
     return RC;
+}
+
+auto writeback_dirty_one(const DirtyWritebackFilter& filter) -> DirtyWritebackResult {
+    DirtyWritebackResult result{};
+    uint64_t const WRITEBACK_EPOCH = allocate_writeback_epoch();
+    uint64_t writeback_dirty_epoch = 0;
+    BufHead* bh = nullptr;
+
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    bh = find_oldest_matching_dirty_buffer_locked(filter, 0);
+    if (bh == nullptr) {
+        cache_lock.unlock_irqrestore(IRQFLAGS);
+        return result;
+    }
+    if ((bh->flags & BH_WRITEBACK) != 0) {
+        result.busy = true;
+        cache_lock.unlock_irqrestore(IRQFLAGS);
+        return result;
+    }
+
+    mark_buffer_writeback(bh, WRITEBACK_EPOCH);
+    writeback_dirty_epoch = bh->writeback_dirty_epoch;
+    bh->refcount.fetch_add(1, std::memory_order_relaxed);
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+
+    result.status = write_buffer_snapshot_for_epoch(bh, writeback_dirty_epoch, WRITEBACK_EPOCH);
+    result.wrote = true;
+    brelse(bh);
+    return result;
+}
+
+auto writeback_dirty_budgeted(const DirtyWritebackFilter& filter, size_t budget) -> int {
+    int result = 0;
+    for (size_t i = 0; i < budget; ++i) {
+        DirtyWritebackResult const WB = writeback_dirty_one(filter);
+        if (WB.wrote) {
+            if (WB.status != 0) {
+                result = WB.status;
+                break;
+            }
+            continue;
+        }
+        if (WB.busy) {
+            ker::mod::sched::kern_yield();
+            continue;
+        }
+        break;
+    }
+    return result;
+}
+
+auto dirty_bytes_above_target_locked() -> bool { return cache_dirty_bytes > dirty_target_bytes_locked(); }
+
+auto ensure_dirty_writeback_wq() -> ker::mod::sched::Workqueue* {
+    if (dirty_writeback_wq != nullptr) {
+        return dirty_writeback_wq;
+    }
+    if (!ker::mod::sched::has_run_queues()) {
+        return nullptr;
+    }
+
+    bool expected = false;
+    if (!dirty_writeback_wq_creating.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        return dirty_writeback_wq;
+    }
+
+    auto* wq = ker::mod::sched::Workqueue::create("bcache_wb");
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    if (dirty_writeback_wq == nullptr) {
+        dirty_writeback_wq = wq;
+    }
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    dirty_writeback_wq_creating.store(false, std::memory_order_release);
+    return dirty_writeback_wq;
+}
+
+auto request_dirty_writeback() -> bool {
+    auto* wq = ensure_dirty_writeback_wq();
+    if (wq == nullptr) {
+        return false;
+    }
+
+    bool expected = false;
+    if (dirty_writeback_queued.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        wq->enqueue(&dirty_writeback_work);
+    }
+    return true;
+}
+
+void dirty_writeback_worker(void* unused) {
+    (void)unused;
+    size_t write_count = 0;
+    while (true) {
+        uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+        bool const NEEDS_WRITEBACK = dirty_bytes_above_target_locked();
+        cache_lock.unlock_irqrestore(IRQFLAGS);
+        if (!NEEDS_WRITEBACK) {
+            break;
+        }
+
+        DirtyWritebackResult const WB = writeback_dirty_one({});
+        if (WB.wrote) {
+            if (WB.status != 0) {
+                break;
+            }
+            write_count++;
+            if ((write_count % DIRTY_WRITEBACK_BUDGET) == 0) {
+                ker::mod::sched::kern_yield();
+            }
+            continue;
+        }
+        if (WB.busy) {
+            ker::mod::sched::kern_yield();
+            continue;
+        }
+        break;
+    }
+
+    dirty_writeback_queued.store(false, std::memory_order_release);
+
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    bool const STILL_DIRTY = dirty_bytes_above_target_locked();
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    if (STILL_DIRTY) {
+        static_cast<void>(request_dirty_writeback());
+    }
 }
 
 }  // anonymous namespace
@@ -604,6 +1149,10 @@ void buffer_cache_init() {
     cache_total_buffers = 0;
     cache_dirty_buffers = 0;
     cache_dirty_bytes = 0;
+    dirty_bdev_states.clear();
+    dirty_waiters.clear();
+    dirty_index_degraded = false;
+    dirty_writeback_queued.store(false, std::memory_order_release);
     stat_hits = 0;
     stat_misses = 0;
     cache_initialized = true;
@@ -908,85 +1457,31 @@ auto sync_blockdev(dev::BlockDevice* bdev) -> int {
     uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::SYNC_BLOCKDEV);
     int result = 0;
 
-    uint64_t irqflags = cache_lock.lock_irqsave();
+    DirtyWritebackFilter filter{};
+    filter.bdev = bdev;
 
-    // Walk all hash buckets collecting dirty buffers for this device.
-    // We bump refcount so they stay alive while we write with the lock dropped.
-    // Use a fixed-size batch to avoid dynamic allocation.
-    constexpr size_t BATCH_SIZE = 64;
-    std::array<BufHead*, BATCH_SIZE> batch{};
-    std::array<uint64_t, BATCH_SIZE> batch_dirty_epochs{};
-    size_t batch_count = 0;
-    bool more = true;
-    uint64_t const WRITEBACK_EPOCH = allocate_writeback_epoch();
-
-    while (more) {
-        batch_count = 0;
-        more = false;
-        bool saw_foreign_writeback = false;
-
-        for (auto* bucket_head : hash_buckets) {
-            for (BufHead* bh = bucket_head; bh != nullptr && batch_count < BATCH_SIZE; bh = bh->hash_next) {
-                if (bh->bdev != bdev || (bh->flags & BH_DIRTY) == 0) {
-                    continue;
-                }
-                if ((bh->flags & BH_WRITEBACK) != 0) {
-                    saw_foreign_writeback = saw_foreign_writeback || bh->writeback_epoch != WRITEBACK_EPOCH;
-                    continue;
-                }
-                if (has_older_overlapping_dirty_buffer_locked(bh)) {
-                    more = true;
-                    continue;
-                }
-                {
-                    mark_buffer_writeback(bh, WRITEBACK_EPOCH);
-                    bh->refcount.fetch_add(1, std::memory_order_relaxed);
-                    batch_dirty_epochs[batch_count] =
-                        bh->writeback_dirty_epoch;  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-                    batch[batch_count++] = bh;      // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-                }
-            }
-            // If the batch is full, there may be more dirty buffers
-            if (batch_count >= BATCH_SIZE) {
-                more = true;
+    bool wrote_dirty = false;
+    bool waited_for_writeback = false;
+    while (true) {
+        DirtyWritebackResult const WB = writeback_dirty_one(filter);
+        if (WB.wrote) {
+            wrote_dirty = true;
+            if (WB.status != 0) {
+                result = WB.status;
                 break;
             }
+            continue;
         }
-        if (saw_foreign_writeback) {
-            more = true;
-        }
-
-        cache_lock.unlock_irqrestore(irqflags);
-
-        // Write each dirty buffer with lock released
-        for (size_t i = 0; i < batch_count; i++) {
-            auto* bh = batch[i];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-            int const RC = write_buffer_snapshot_for_epoch(bh, batch_dirty_epochs[i],
-                                                           0);  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-            if (RC != 0) {
-                result = RC;
-            }
-            brelse(bh);
-        }
-
-        if (batch_count == 0 && saw_foreign_writeback) {
+        if (WB.busy) {
+            waited_for_writeback = true;
             ker::mod::sched::kern_yield();
+            continue;
         }
-        if (batch_count == 0 && !saw_foreign_writeback) {
-            more = false;
-        }
-
-        if (more) {
-            irqflags = cache_lock.lock_irqsave();
-        }
+        break;
     }
 
-    irqflags = cache_lock.lock_irqsave();
-    clear_writeback_for_bdev(bdev, WRITEBACK_EPOCH);
-    cache_lock.unlock_irqrestore(irqflags);
-
     // Flush the device if it supports it
-    if (bdev->flush != nullptr) {
+    if ((wrote_dirty || waited_for_writeback) && bdev->flush != nullptr) {
         uint64_t const FLUSH_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_FLUSH);
         int const RC = dev::block_flush(bdev);
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_FLUSH, FLUSH_STARTED_US, RC, 0);
@@ -1014,59 +1509,88 @@ auto has_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t coun
         return false;
     }
 
-    for (auto* bucket_head : hash_buckets) {
-        for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
-            if (buffer_overlaps_range(bh, bdev, block_no, count) && (bh->flags & BH_DIRTY) != 0) {
-                cache_lock.unlock_irqrestore(IRQFLAGS);
-                return true;
+    if (dirty_index_degraded) {
+        for (auto* bucket_head : hash_buckets) {
+            for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
+                if (buffer_overlaps_range(bh, bdev, block_no, count) && (bh->flags & BH_DIRTY) != 0) {
+                    cache_lock.unlock_irqrestore(IRQFLAGS);
+                    return true;
+                }
             }
         }
-    }
-
-    cache_lock.unlock_irqrestore(IRQFLAGS);
-    return false;
-}
-
-auto has_dirty_bdev_aligned_spans(dev::BlockDevice* bdev, uint64_t block_no, size_t count, size_t span_blocks) -> bool {
-    if (bdev == nullptr || bdev->block_size == 0 || count == 0 || span_blocks == 0) {
-        return false;
-    }
-
-    if (!cache_initialized) {
-        return false;
-    }
-
-    size_t const SPAN_SIZE = span_blocks * bdev->block_size;
-    if (SPAN_SIZE == 0 || SPAN_SIZE / bdev->block_size != span_blocks) {
-        return has_dirty_bdev_range(bdev, block_no, count);
-    }
-
-    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
-    if (cache_dirty_buffers == 0) {
         cache_lock.unlock_irqrestore(IRQFLAGS);
         return false;
     }
 
-    uint64_t block = block_no;
-    size_t remaining = count;
-    while (remaining != 0) {
-        BufHead* bh = hash_lookup(bdev, block, SPAN_SIZE);
-        if (bh != nullptr && (bh->flags & BH_DIRTY) != 0) {
-            cache_lock.unlock_irqrestore(IRQFLAGS);
-            return true;
-        }
-        if (remaining <= span_blocks) {
-            break;
-        }
-        remaining -= span_blocks;
-        if (block > UINT64_MAX - static_cast<uint64_t>(span_blocks)) {
-            break;
-        }
-        block += static_cast<uint64_t>(span_blocks);
+    DirtyBdevState* state = find_dirty_bdev_state_locked(bdev);
+    bool const DIRTY = state != nullptr && dirty_tree_overlaps(state->tree_root, block_no, count);
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    return DIRTY;
+}
+
+auto copy_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst) -> bool {
+    if (bdev == nullptr || bdev->block_size == 0 || count == 0 || dst == nullptr || !cache_initialized) {
+        return false;
+    }
+    if (count > SIZE_MAX / bdev->block_size) {
+        return false;
     }
 
+    DirtyWritebackFilter filter{};
+    filter.bdev = bdev;
+    filter.block_no = block_no;
+    filter.count = count;
+    filter.use_range = true;
+
+    bool copied = false;
+    uint64_t min_epoch = 0;
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    while (true) {
+        BufHead* bh = find_oldest_matching_dirty_buffer_locked(filter, min_epoch);
+        if (bh == nullptr) {
+            break;
+        }
+        min_epoch = bh->dirty_epoch;
+
+        uint64_t const BUF_LAST = dirty_buffer_last_block(bh);
+        uint64_t const RANGE_LAST = block_range_last_block(block_no, count);
+        uint64_t const COPY_FIRST = std::max(bh->block_no, block_no);
+        uint64_t const COPY_LAST = std::min(BUF_LAST, RANGE_LAST);
+        if (COPY_FIRST > COPY_LAST) {
+            continue;
+        }
+
+        size_t const BLOCK_SIZE = bdev->block_size;
+        auto const COPY_BLOCKS = static_cast<size_t>(COPY_LAST - COPY_FIRST + 1);
+        size_t copy_bytes = COPY_BLOCKS * BLOCK_SIZE;
+        size_t const SRC_OFF = static_cast<size_t>(COPY_FIRST - bh->block_no) * BLOCK_SIZE;
+        size_t const DST_OFF = static_cast<size_t>(COPY_FIRST - block_no) * BLOCK_SIZE;
+        size_t const DST_SIZE = count * BLOCK_SIZE;
+        if (SRC_OFF >= bh->size || DST_OFF >= DST_SIZE) {
+            continue;
+        }
+        copy_bytes = std::min(copy_bytes, bh->size - SRC_OFF);
+        copy_bytes = std::min(copy_bytes, DST_SIZE - DST_OFF);
+        std::memcpy(dst + DST_OFF, bh->data + SRC_OFF, copy_bytes);
+        copied = true;
+    }
     cache_lock.unlock_irqrestore(IRQFLAGS);
-    return false;
+    return copied;
+}
+
+void kick_dirty_buffer_cache_writeback(dev::BlockDevice* bdev) {
+    if (bdev == nullptr || !cache_initialized) {
+        return;
+    }
+
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    DirtyBdevState* state = find_dirty_bdev_state_locked(bdev);
+    bool const SHOULD_WRITEBACK =
+        cache_dirty_bytes > dirty_target_bytes_locked() && (dirty_index_degraded || (state != nullptr && state->dirty_buffers != 0));
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    if (SHOULD_WRITEBACK) {
+        static_cast<void>(request_dirty_writeback());
+    }
 }
 
 void throttle_dirty_buffer_cache(dev::BlockDevice* bdev) {
@@ -1074,21 +1598,32 @@ void throttle_dirty_buffer_cache(dev::BlockDevice* bdev) {
         return;
     }
 
-    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
-    bool const SHOULD_THROTTLE = cache_dirty_bytes > dirty_throttle_high_bytes_locked();
-    cache_lock.unlock_irqrestore(IRQFLAGS);
-    if (!SHOULD_THROTTLE) {
+    kick_dirty_buffer_cache_writeback(bdev);
+
+    uint64_t irqflags = cache_lock.lock_irqsave();
+    bool should_wait = cache_dirty_bytes > dirty_hard_limit_bytes_locked();
+    cache_lock.unlock_irqrestore(irqflags);
+    if (!should_wait) {
         return;
     }
 
-    bool expected = false;
-    if (!dirty_throttle_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    DirtyWritebackFilter fallback_filter{};
+
+    while (true) {
+        irqflags = cache_lock.lock_irqsave();
+        if (cache_dirty_bytes <= dirty_target_bytes_locked()) {
+            cache_lock.unlock_irqrestore(irqflags);
+            return;
+        }
+        register_current_dirty_waiter_locked();
+        cache_lock.unlock_irqrestore(irqflags);
+
+        bool const HAVE_WORKER = request_dirty_writeback();
+        if (!HAVE_WORKER) {
+            static_cast<void>(writeback_dirty_budgeted(fallback_filter, DIRTY_HARD_FALLBACK_BUDGET));
+        }
         ker::mod::sched::kern_yield();
-        return;
     }
-
-    static_cast<void>(sync_blockdev(bdev));
-    dirty_throttle_active.store(false, std::memory_order_release);
 }
 
 auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> int {
@@ -1105,84 +1640,31 @@ auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) ->
 
     int result = 0;
     bool wrote_dirty = false;
-    uint64_t irqflags = cache_lock.lock_irqsave();
-    if (cache_dirty_buffers == 0) {
-        cache_lock.unlock_irqrestore(irqflags);
-        return 0;
-    }
-
-    constexpr size_t BATCH_SIZE = 64;
-    std::array<BufHead*, BATCH_SIZE> batch{};
-    std::array<uint64_t, BATCH_SIZE> batch_dirty_epochs{};
-    size_t batch_count = 0;
-    bool more = true;
     bool waited_for_foreign_writeback = false;
-    uint64_t const WRITEBACK_EPOCH = allocate_writeback_epoch();
 
-    while (more) {
-        batch_count = 0;
-        more = false;
-        bool saw_foreign_writeback = false;
+    DirtyWritebackFilter filter{};
+    filter.bdev = bdev;
+    filter.block_no = block_no;
+    filter.count = count;
+    filter.use_range = true;
 
-        for (auto* bucket_head : hash_buckets) {
-            for (BufHead* bh = bucket_head; bh != nullptr && batch_count < BATCH_SIZE; bh = bh->hash_next) {
-                if (!buffer_overlaps_range(bh, bdev, block_no, count) || (bh->flags & BH_DIRTY) == 0) {
-                    continue;
-                }
-                if ((bh->flags & BH_WRITEBACK) != 0) {
-                    saw_foreign_writeback = saw_foreign_writeback || bh->writeback_epoch != WRITEBACK_EPOCH;
-                    continue;
-                }
-                if (has_older_overlapping_dirty_buffer_locked(bh)) {
-                    more = true;
-                    continue;
-                }
-                {
-                    mark_buffer_writeback(bh, WRITEBACK_EPOCH);
-                    bh->refcount.fetch_add(1, std::memory_order_relaxed);
-                    batch_dirty_epochs[batch_count] =
-                        bh->writeback_dirty_epoch;  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-                    batch[batch_count++] = bh;      // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-                }
-            }
-            if (batch_count >= BATCH_SIZE) {
-                more = true;
+    while (true) {
+        DirtyWritebackResult const WB = writeback_dirty_one(filter);
+        if (WB.wrote) {
+            wrote_dirty = true;
+            if (WB.status != 0) {
+                result = WB.status;
                 break;
             }
+            continue;
         }
-        if (saw_foreign_writeback) {
+        if (WB.busy) {
             waited_for_foreign_writeback = true;
-            more = true;
-        }
-
-        cache_lock.unlock_irqrestore(irqflags);
-
-        for (size_t i = 0; i < batch_count; i++) {
-            auto* bh = batch[i];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-            wrote_dirty = true;
-            int const RC = write_buffer_snapshot_for_epoch(bh, batch_dirty_epochs[i],
-                                                           0);  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-            if (RC != 0) {
-                result = RC;
-            }
-            brelse(bh);
-        }
-
-        if (batch_count == 0 && saw_foreign_writeback) {
             ker::mod::sched::kern_yield();
+            continue;
         }
-        if (batch_count == 0 && !saw_foreign_writeback) {
-            more = false;
-        }
-
-        if (more) {
-            irqflags = cache_lock.lock_irqsave();
-        }
+        break;
     }
-
-    irqflags = cache_lock.lock_irqsave();
-    clear_writeback_for_bdev_range(bdev, block_no, count, WRITEBACK_EPOCH);
-    cache_lock.unlock_irqrestore(irqflags);
 
     if ((wrote_dirty || waited_for_foreign_writeback) && bdev->flush != nullptr) {
         int const RC = dev::block_flush(bdev);
@@ -1276,10 +1758,35 @@ auto buffer_cache_stats() -> BufferCacheStats {
     s.dirty_bytes = cache_dirty_bytes;
     s.clean_bytes = cache_total_bytes >= cache_dirty_bytes ? cache_total_bytes - cache_dirty_bytes : 0;
     s.max_bytes = cache_max_bytes;
+    s.dirty_bdevs = dirty_bdev_count_locked();
+    s.dirty_target_bytes = dirty_target_bytes_locked();
+    s.dirty_hard_bytes = dirty_hard_limit_bytes_locked();
+    s.dirty_waiters = dirty_waiters.size();
     s.hits = stat_hits;
     s.misses = stat_misses;
     cache_lock.unlock_irqrestore(IRQFLAGS);
     return s;
+}
+
+auto buffer_cache_bdev_stats(BufferCacheBdevStats* out, size_t capacity) -> size_t {
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    size_t total = 0;
+    for (auto* state : dirty_bdev_states) {
+        if (state == nullptr || state->dirty_buffers == 0) {
+            continue;
+        }
+        if (out != nullptr && total < capacity) {
+            BufferCacheBdevStats& row = out[total];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+            row.bdev = state->bdev;
+            row.name = state->bdev != nullptr ? state->bdev->name.data() : nullptr;
+            row.dirty_buffers = state->dirty_buffers;
+            row.dirty_bytes = state->dirty_bytes;
+            row.oldest_dirty_epoch = dirty_state_oldest_epoch_locked(state);
+        }
+        total++;
+    }
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    return total;
 }
 
 auto reclaim_clean_buffer_cache(size_t target_bytes) -> BufferCacheReclaimStats {

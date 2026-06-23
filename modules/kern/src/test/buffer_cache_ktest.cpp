@@ -1,3 +1,4 @@
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -444,7 +445,7 @@ KTEST(BufferCache, SizeMismatchCoexist) {
     ker::vfs::invalidate_bdev(&dev);
 }
 
-KTEST(BufferCache, AlignedSpanDirtyCheckFindsExactDirtySpan) {
+KTEST(BufferCache, DirtyRangeIndexFindsAndOverlaysDirtySpan) {
     ker::dev::BlockDevice dev = make_null_bdev();
     ker::vfs::invalidate_bdev(&dev);
 
@@ -456,8 +457,14 @@ KTEST(BufferCache, AlignedSpanDirtyCheckFindsExactDirtySpan) {
     ker::vfs::brelse(mb);
 
     KEXPECT_TRUE(ker::vfs::has_dirty_bdev_range(&dev, BLK + 4, 1));
-    KEXPECT_TRUE(ker::vfs::has_dirty_bdev_aligned_spans(&dev, BLK, 16, 8));
-    KEXPECT_FALSE(ker::vfs::has_dirty_bdev_aligned_spans(&dev, BLK + 8, 8, 8));
+    KEXPECT_TRUE(ker::vfs::has_dirty_bdev_range(&dev, BLK, 16));
+    KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, BLK + 8, 8));
+
+    std::array<uint8_t, 16 * 512> read_buf{};
+    KEXPECT_TRUE(ker::vfs::copy_dirty_bdev_range(&dev, BLK, 16, read_buf.data()));
+    KEXPECT_EQ(read_buf[0], static_cast<uint8_t>(0xCC));
+    KEXPECT_EQ(read_buf[(8 * 512) - 1], static_cast<uint8_t>(0xCC));
+    KEXPECT_EQ(read_buf[8 * 512], static_cast<uint8_t>(0));
 
     ker::vfs::invalidate_bdev(&dev);
 }

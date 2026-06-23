@@ -18,6 +18,7 @@ constexpr uint32_t BH_VALID = (1U << 1);            // Buffer contains valid dat
 constexpr uint32_t BH_LOCKED = (1U << 2);           // Buffer is locked for I/O
 constexpr uint32_t BH_WRITEBACK = (1U << 3);        // Buffer is being written back
 constexpr uint32_t BH_DATA_PAGE_ALLOC = (1U << 4);  // Buffer data was allocated through the page allocator
+constexpr uint32_t BH_DIRTY_INDEXED = (1U << 5);    // Buffer is present in the dirty range index
 
 // Buffer head - represents a single cached block from a block device.
 // Analogous to Linux struct buffer_head / simplified xfs_buf.
@@ -38,6 +39,16 @@ struct BufHead {
 
     // Hash chain pointers (protected by cache lock)
     BufHead* hash_next{};
+
+    // Dirty index links (protected by cache lock). Dirty buffers are indexed
+    // per block device by their actual interval, independent of the exact
+    // hash key used for overlapping single-block vs multi-block cache entries.
+    BufHead* dirty_prev{};
+    BufHead* dirty_next{};
+    BufHead* dirty_left{};
+    BufHead* dirty_right{};
+    BufHead* dirty_parent{};
+    uint64_t dirty_subtree_last_block{};
 };
 
 // Buffer cache configuration
@@ -87,18 +98,21 @@ auto sync_blockdev(dev::BlockDevice* bdev) -> int;
 // Return true if any dirty cached buffer overlaps a device block range.
 auto has_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> bool;
 
-// Return true if any dirty cached buffer with an exact repeated aligned span is
-// present inside a device block range. This is a fast path for filesystems that
-// buffer dirty data in fixed-size filesystem-block buffers before considering a
-// larger direct read.
-auto has_dirty_bdev_aligned_spans(dev::BlockDevice* bdev, uint64_t block_no, size_t count, size_t span_blocks) -> bool;
+// Overlay dirty cached buffers that overlap a device block range onto an
+// already-read destination buffer. Dirty buffers are applied in dirty_epoch
+// order so newer overlapping cache entries remain authoritative.
+auto copy_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst) -> bool;
 
 // Write dirty buffers overlapping a device block range to disk.
 // Returns 0 on success, negative errno on failure.
 auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> int;
 
-// Apply dirty-cache pressure for a block device if global dirty bytes exceed
-// the cache high-water mark. This may block on writeback.
+// Request background dirty-cache writeback if dirty bytes exceed the target.
+// This never waits for writeback to complete.
+void kick_dirty_buffer_cache_writeback(dev::BlockDevice* bdev);
+
+// Apply dirty-cache pressure for a block device. Writers only wait after the
+// hard dirty limit is exceeded; below that this only kicks background writeback.
 void throttle_dirty_buffer_cache(dev::BlockDevice* bdev);
 
 // Invalidate unreferenced cached buffers for a device (e.g. on unmount).
@@ -120,10 +134,24 @@ struct BufferCacheStats {
     size_t clean_bytes;
     size_t dirty_bytes;
     size_t max_bytes;
+    size_t dirty_bdevs;
+    size_t dirty_target_bytes;
+    size_t dirty_hard_bytes;
+    size_t dirty_waiters;
     uint64_t hits;
     uint64_t misses;
 };
 auto buffer_cache_stats() -> BufferCacheStats;
+
+struct BufferCacheBdevStats {
+    dev::BlockDevice* bdev;
+    const char* name;
+    size_t dirty_buffers;
+    size_t dirty_bytes;
+    uint64_t oldest_dirty_epoch;
+};
+
+auto buffer_cache_bdev_stats(BufferCacheBdevStats* out, size_t capacity) -> size_t;
 
 struct BufferCacheReclaimStats {
     size_t before_bytes;
