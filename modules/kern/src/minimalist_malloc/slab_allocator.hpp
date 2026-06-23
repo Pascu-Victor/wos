@@ -102,29 +102,36 @@ void Slab<slab_size, memory_size>::init(Slab* prev) {
 
 template <size_t slab_size, size_t memory_size>
 auto Slab<slab_size, memory_size>::alloc_unlocked() -> void* {
-    assert(header.magic == MAGIC);
-    assert(header.size == slab_size);
+    Slab* slab = this;
+    while (slab != nullptr) {
+        assert(slab->header.magic == MAGIC);
+        assert(slab->header.size == slab_size);
 
-    auto block_index = static_cast<size_t>(-1);
-    if (header.free_blocks) {
-        block_index = header.mem_map.find_unused(header.next_fit_block);
-        if (BITMAP_NO_BITS_LEFT != block_index) {
-            return alloc_in_current_slab(block_index);
+        auto block_index = static_cast<size_t>(-1);
+        if (slab->header.free_blocks) {
+            block_index = slab->header.mem_map.find_unused(slab->header.next_fit_block);
+            if (BITMAP_NO_BITS_LEFT != block_index) {
+                return slab->alloc_in_current_slab(block_index);
+            }
         }
-    }
-    if (header.next) {
+
+        if (slab->header.next == nullptr) {
+            return slab->alloc_in_new_slab();
+        }
+
         // Validate before following the pointer — misaligned means page-reuse UAF.
-        auto next_addr = reinterpret_cast<uintptr_t>(header.next);
+        auto next_addr = reinterpret_cast<uintptr_t>(slab->header.next);
         const bool INVALID_DATA = (next_addr & 0xfULL) != 0 || ((next_addr < 0xffff800000000000ULL || next_addr >= 0xffff900000000000ULL) &&
                                                                 (next_addr < 0xffffffff80000000ULL || next_addr >= 0xffffffffc0000000ULL));
         if (INVALID_DATA) {
             ker::mod::dbg::log("slab UAF: header.next=0x%llx slab=%p free_blocks=%zu magic=0x%x size=%u",
-                               static_cast<unsigned long long>(next_addr), this, header.free_blocks, header.magic, header.size);
+                               static_cast<unsigned long long>(next_addr), slab, slab->header.free_blocks, slab->header.magic,
+                               slab->header.size);
             ker::mod::dbg::panic_handler("slab: corrupt header.next — freed slab page reused");
         }
-        return header.next->alloc_unlocked();
+        slab = slab->header.next;
     }
-    return alloc_in_new_slab();
+    return nullptr;
 }
 
 template <size_t slab_size, size_t memory_size>
@@ -254,8 +261,7 @@ auto Slab<slab_size, memory_size>::alloc_in_new_slab() -> void* {
     }
     new_slab->init(this);
     header.next = new_slab;
-    // Call alloc_unlocked since we already hold the lock
-    return new_slab->alloc_unlocked();
+    return new_slab->alloc_in_current_slab(0);
 }
 
 template <size_t slab_size, size_t memory_size>
