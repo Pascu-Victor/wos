@@ -220,6 +220,13 @@ auto bmbt_valid_irec(const XfsBmbtIrec& rec) -> bool {
 
 auto bmbt_file_end_exclusive(const XfsBmbtIrec& rec) -> xfs_fileoff_t { return rec.br_startoff + rec.br_blockcount; }
 
+void set_hole_result(XfsBmapResult* result, xfs_filblks_t blockcount) {
+    result->is_hole = true;
+    result->startblock = NULLFSBLOCK;
+    result->blockcount = blockcount;
+    result->unwritten = false;
+}
+
 auto bmbt_extent_list_is_ordered(const XfsBmbtIrec* list, uint32_t count) -> bool {
     if (count != 0 && list == nullptr) {
         return false;
@@ -242,6 +249,33 @@ auto extent_can_merge_left(const XfsBmbtIrec& left, const XfsBmbtIrec& right) ->
     }
     return left.br_startoff + left.br_blockcount == right.br_startoff && left.br_startblock + left.br_blockcount == right.br_startblock &&
            left.br_unwritten == right.br_unwritten;
+}
+
+auto transaction_has_inode_item(const XfsTransaction* tp, const XfsInode* ip) -> bool {
+    if (tp == nullptr || ip == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < tp->item_count; i++) {
+        XfsTransItem const& item = tp->items.at(static_cast<size_t>(i));
+        if (item.type == XfsLogItemType::INODE && item.inode.ip == ip) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto ensure_inode_logged(XfsTransaction* tp, XfsInode* ip) -> int {
+    if (tp == nullptr || ip == nullptr) {
+        return -EINVAL;
+    }
+    if (transaction_has_inode_item(tp, ip)) {
+        return 0;
+    }
+    if (tp->item_count >= XFS_TRANS_MAX_ITEMS) {
+        return -EFBIG;
+    }
+    xfs_trans_log_inode(tp, ip);
+    return transaction_has_inode_item(tp, ip) ? 0 : -EFBIG;
 }
 
 auto insert_or_merge_extent(const XfsBmbtIrec* old_list, uint32_t old_count, const XfsBmbtIrec& new_ext, XfsBmbtIrec* out_list,
@@ -435,7 +469,7 @@ auto build_bmbt_tree(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec* extent
         return -EIO;
     }
 
-    uint32_t const LEAF_COUNT = (extent_count + LEAF_CAPACITY - 1) / LEAF_CAPACITY;
+    uint32_t const LEAF_COUNT = 1U + ((extent_count - 1U) / LEAF_CAPACITY);
     uint32_t const NODE_CAPACITY = bmbt_node_max_keys(ip->mount);
     if (LEAF_COUNT == 0 || (LEAF_COUNT > 1 && LEAF_COUNT > NODE_CAPACITY)) {
         return -EFBIG;
@@ -595,12 +629,9 @@ auto bmap_lookup_extents(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* 
     const XfsIforkExtents& ext = ip->data_fork.extents;
 
     if (ext.count == 0) {
-        result->is_hole = true;
-        result->startblock = NULLFSBLOCK;
         // No extents at all - the entire address space is a hole.  Return a
         // large blockcount so the caller can allocate in large batches.
-        result->blockcount = ~static_cast<xfs_filblks_t>(0);
-        result->unwritten = false;
+        set_hole_result(result, ~static_cast<xfs_filblks_t>(0));
         return 0;
     }
 
@@ -633,18 +664,14 @@ auto bmap_lookup_extents(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* 
         result->is_hole = false;
     } else {
         // file_block falls in a hole between extents
-        result->is_hole = true;
-        result->startblock = NULLFSBLOCK;
-        result->unwritten = false;
-
         // Compute the size of the hole (distance to next extent)
         // lo now points to the first extent starting after file_block
         if (std::cmp_less(lo, ext.count)) {
-            result->blockcount = ext.list[lo].br_startoff - file_block;
+            set_hole_result(result, ext.list[lo].br_startoff - file_block);
         } else {
             // Past the last extent - unbounded hole to EOF.  Return a large
             // blockcount so callers can allocate in large batches.
-            result->blockcount = ~static_cast<xfs_filblks_t>(0);
+            set_hole_result(result, ~static_cast<xfs_filblks_t>(0));
         }
     }
 
@@ -671,10 +698,7 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
     uint16_t const NUMRECS = bmdr->bb_numrecs.to_cpu();
 
     if (NUMRECS == 0) {
-        result->is_hole = true;
-        result->startblock = NULLFSBLOCK;
-        result->blockcount = ~static_cast<xfs_filblks_t>(0);
-        result->unwritten = false;
+        set_hole_result(result, ~static_cast<xfs_filblks_t>(0));
         return 0;
     }
 
@@ -754,15 +778,12 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
             result->unwritten = IREC.br_unwritten;
             result->is_hole = false;
         } else {
-            result->is_hole = true;
-            result->startblock = NULLFSBLOCK;
-            result->unwritten = false;
             if (lo <= NR) {
                 const auto* rec = cur.rec_at(lo);
                 XfsBmbtIrec const NEXT = xfs_bmbt_rec_unpack(rec);
-                result->blockcount = NEXT.br_startoff > file_block ? NEXT.br_startoff - file_block : 1;
+                set_hole_result(result, NEXT.br_startoff > file_block ? NEXT.br_startoff - file_block : 1);
             } else {
-                result->blockcount = ~static_cast<xfs_filblks_t>(0);
+                set_hole_result(result, ~static_cast<xfs_filblks_t>(0));
             }
         }
         return 0;
@@ -781,10 +802,20 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
 
     int rc = xfs_btree_lookup(&cur, CHILD_BLOCK, LEVEL, target, XfsBtreeLookup::LE);
     if (rc == -ENOENT) {
-        result->is_hole = true;
-        result->startblock = NULLFSBLOCK;
-        result->blockcount = 1;
-        result->unwritten = false;
+        XfsBtreeCursor<XfsBmbtTraits> next_cur;
+        next_cur.mount = mount;
+        next_cur.nlevels = LEVEL;
+        next_cur.owner = ip->ino;
+
+        int const NEXT_RC = xfs_btree_lookup(&next_cur, CHILD_BLOCK, LEVEL, target, XfsBtreeLookup::GE);
+        if (NEXT_RC == 0) {
+            XfsBmbtIrec const NEXT = xfs_btree_get_rec(&next_cur);
+            set_hole_result(result, NEXT.br_startoff > file_block ? NEXT.br_startoff - file_block : 1);
+        } else if (NEXT_RC == -ENOENT) {
+            set_hole_result(result, ~static_cast<xfs_filblks_t>(0));
+        } else {
+            return NEXT_RC;
+        }
         return 0;
     }
     if (rc != 0) {
@@ -801,16 +832,15 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
         result->unwritten = IREC.br_unwritten;
         result->is_hole = false;
     } else {
-        result->is_hole = true;
-        result->startblock = NULLFSBLOCK;
-        result->unwritten = false;
         // Distance to next extent
         rc = xfs_btree_increment(&cur);
         if (rc == 0) {
             XfsBmbtIrec const NEXT = xfs_btree_get_rec(&cur);
-            result->blockcount = NEXT.br_startoff - file_block;
+            set_hole_result(result, NEXT.br_startoff > file_block ? NEXT.br_startoff - file_block : 1);
+        } else if (rc == -ENOENT) {
+            set_hole_result(result, ~static_cast<xfs_filblks_t>(0));
         } else {
-            result->blockcount = 1;
+            return rc;
         }
     }
 
@@ -948,6 +978,10 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
                       static_cast<unsigned long>(ip->ino));
         return -EOPNOTSUPP;
     }
+    int rc = ensure_inode_logged(tp, ip);
+    if (rc != 0) {
+        return rc;
+    }
 
     XfsBmbtIrec* old_extents = nullptr;
     uint32_t old_count = 0;
@@ -995,7 +1029,7 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
     }
 
     uint32_t new_count = 0;
-    int rc = insert_or_merge_extent(old_extents, old_count, new_ext, new_extents, &new_count);
+    rc = insert_or_merge_extent(old_extents, old_count, new_ext, new_extents, &new_count);
     if (WAS_BTREE) {
         delete[] old_extents;
         old_extents = nullptr;
@@ -1344,13 +1378,18 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
     if (LEAF_CAPACITY <= INLINE_CAPACITY) {
         return cleanup(false);
     }
+    auto extent_startoff = [](uint32_t idx) -> xfs_fileoff_t { return (static_cast<xfs_fileoff_t>(idx) + 1) * 2; };
+    auto expected_metadata_blocks = [LEAF_CAPACITY](uint32_t extent_count) -> uint64_t {
+        uint32_t const LEAF_COUNT = 1U + ((extent_count - 1U) / LEAF_CAPACITY);
+        return LEAF_COUNT + (LEAF_COUNT > 1 ? 1U : 0U);
+    };
 
     for (uint32_t i = 0; i < INLINE_CAPACITY + 1; i++) {
         XfsTransaction* tp = xfs_trans_alloc(&mount);
         if (tp == nullptr) {
             return cleanup(false);
         }
-        XfsBmbtIrec const REC{.br_startoff = static_cast<xfs_fileoff_t>(i) * 2,
+        XfsBmbtIrec const REC{.br_startoff = extent_startoff(i),
                               .br_startblock = static_cast<xfs_fsblock_t>(1000 + (i * 3)),
                               .br_blockcount = 1,
                               .br_unwritten = false};
@@ -1359,12 +1398,14 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
         if (RC != 0) {
             return cleanup(false);
         }
-        if (i + 1 == INLINE_CAPACITY && (inode.data_fork.format != XFS_DINODE_FMT_EXTENTS || inode.nextents != INLINE_CAPACITY)) {
+        if (i + 1 == INLINE_CAPACITY &&
+            (inode.data_fork.format != XFS_DINODE_FMT_EXTENTS || inode.nextents != INLINE_CAPACITY || inode.nblocks != 0)) {
             return cleanup(false);
         }
     }
 
-    if (inode.data_fork.format != XFS_DINODE_FMT_BTREE || inode.nextents != INLINE_CAPACITY + 1) {
+    if (inode.data_fork.format != XFS_DINODE_FMT_BTREE || inode.nextents != INLINE_CAPACITY + 1 ||
+        inode.nblocks != expected_metadata_blocks(INLINE_CAPACITY + 1)) {
         return cleanup(false);
     }
     if (inode.data_fork.btree.level != 1 || inode.data_fork.btree.numrecs != 1) {
@@ -1387,6 +1428,11 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
             return cleanup(false);
         }
     }
+    XfsBmapResult promoted_leading_hole{};
+    if (xfs_bmap_lookup(&inode, 0, &promoted_leading_hole) != 0 || !promoted_leading_hole.is_hole ||
+        promoted_leading_hole.blockcount != extent_startoff(0)) {
+        return cleanup(false);
+    }
 
     uint32_t const TARGET_EXTENTS = LEAF_CAPACITY + 2;
     for (uint32_t i = INLINE_CAPACITY + 1; i < TARGET_EXTENTS; i++) {
@@ -1394,18 +1440,19 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
         if (tp == nullptr) {
             return cleanup(false);
         }
-        XfsBmbtIrec const REC{.br_startoff = static_cast<xfs_fileoff_t>(i) * 2,
+        XfsBmbtIrec const REC{.br_startoff = extent_startoff(i),
                               .br_startblock = static_cast<xfs_fsblock_t>(1000 + (i * 3)),
                               .br_blockcount = 1,
                               .br_unwritten = false};
         int const RC = xfs_bmap_add_extent(&inode, tp, REC);
         xfs_trans_cancel(tp);
-        if (RC != 0 || inode.data_fork.format != XFS_DINODE_FMT_BTREE || inode.nextents != i + 1) {
+        if (RC != 0 || inode.data_fork.format != XFS_DINODE_FMT_BTREE || inode.nextents != i + 1 ||
+            inode.nblocks != expected_metadata_blocks(i + 1)) {
             return cleanup(false);
         }
     }
 
-    if (inode.data_fork.btree.level != 2 || inode.data_fork.btree.numrecs != 1) {
+    if (inode.data_fork.btree.level != 2 || inode.data_fork.btree.numrecs != 1 || inode.nblocks != 3) {
         return cleanup(false);
     }
     Be64 internal_root_ptr{};
@@ -1425,6 +1472,10 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
     if (INTERNAL_MAGIC != XFS_BMAP_CRC_MAGIC || INTERNAL_LEVEL != 1 || INTERNAL_RECS != 2) {
         return cleanup(false);
     }
+    XfsBmapResult leading_hole{};
+    if (xfs_bmap_lookup(&inode, 0, &leading_hole) != 0 || !leading_hole.is_hole || leading_hole.blockcount != extent_startoff(0)) {
+        return cleanup(false);
+    }
 
     uint32_t const EXPECTED_EXTENTS = TARGET_EXTENTS;
     auto* listed = new (std::nothrow) XfsBmbtIrec[EXPECTED_EXTENTS];
@@ -1442,7 +1493,7 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
     }
 
     for (uint32_t i = 0; i < EXPECTED_EXTENTS; i++) {
-        auto const EXPECTED_OFF = static_cast<xfs_fileoff_t>(i) * 2;
+        auto const EXPECTED_OFF = extent_startoff(i);
         xfs_fsblock_t const EXPECTED_BLOCK = 1000 + (i * 3);
         if (listed[i].br_startoff != EXPECTED_OFF || listed[i].br_startblock != EXPECTED_BLOCK || listed[i].br_blockcount != 1) {
             return cleanup_listed(false);
@@ -1454,7 +1505,9 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
             return cleanup_listed(false);
         }
         XfsBmapResult hole{};
-        if (xfs_bmap_lookup(&inode, EXPECTED_OFF + 1, &hole) != 0 || !hole.is_hole) {
+        xfs_filblks_t const EXPECTED_HOLE_BLOCKS =
+            i + 1 < EXPECTED_EXTENTS ? extent_startoff(i + 1) - (EXPECTED_OFF + 1) : ~static_cast<xfs_filblks_t>(0);
+        if (xfs_bmap_lookup(&inode, EXPECTED_OFF + 1, &hole) != 0 || !hole.is_hole || hole.blockcount != EXPECTED_HOLE_BLOCKS) {
             return cleanup_listed(false);
         }
     }
