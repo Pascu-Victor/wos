@@ -64,6 +64,8 @@ KTEST(XFS, BmapInsertMergeCases) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_bmap
 
 KTEST(XFS, BmapSyntheticBtreeLookup) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_bmap_synthetic_btree_lookup()); }
 
+KTEST(XFS, BmapExtentPromotion) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_bmap_extent_promotion()); }
+
 KTEST(XFS, SmallHoleWriteAllocatesOnlyNeededBlocks) {
     constexpr size_t BLOCK_SIZE = 4096;
     constexpr uint32_t BLOCK_LOG = 12;

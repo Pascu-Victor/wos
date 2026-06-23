@@ -51,7 +51,8 @@ struct BufHead {
     uint64_t dirty_subtree_last_block{};
 };
 
-// Buffer cache configuration
+// Buffer cache configuration. This is the minimum/default cap; the live kernel
+// scales the cache up at init when enough physical memory is available.
 constexpr size_t BUFFER_CACHE_DEFAULT_SIZE = static_cast<size_t>(64) * 1024 * 1024;  // 64 MB
 constexpr size_t BUFFER_CACHE_HASH_BUCKETS = 4096;
 

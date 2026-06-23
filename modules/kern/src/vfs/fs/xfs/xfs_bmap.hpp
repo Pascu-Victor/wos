@@ -49,5 +49,6 @@ auto xfs_bmap_free_btree_blocks(XfsInode* ip, XfsTransaction* tp, uint32_t* free
 
 auto xfs_selftest_bmap_insert_merge_cases() -> bool;
 auto xfs_selftest_bmap_synthetic_btree_lookup() -> bool;
+auto xfs_selftest_bmap_extent_promotion() -> bool;
 
 }  // namespace ker::vfs::xfs

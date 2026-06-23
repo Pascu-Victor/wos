@@ -401,6 +401,12 @@ auto build_bmbt_tree(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec* extent
     if (LEAF_COUNT == 0 || (LEAF_COUNT > 1 && LEAF_COUNT > NODE_CAPACITY)) {
         return -EFBIG;
     }
+    uint32_t const REQUIRED_METADATA_BLOCKS = LEAF_COUNT + (LEAF_COUNT > 1 ? 1U : 0U);
+    uint32_t const AVAILABLE_TRANSACTION_ITEMS =
+        tp->item_count >= XFS_TRANS_MAX_ITEMS ? 0U : static_cast<uint32_t>(XFS_TRANS_MAX_ITEMS - tp->item_count);
+    if (REQUIRED_METADATA_BLOCKS > AVAILABLE_TRANSACTION_ITEMS) {
+        return -EFBIG;
+    }
 
     auto* leaf_blocks = new (std::nothrow) xfs_fsblock_t[LEAF_COUNT];
     auto** leaf_bufs = new (std::nothrow) BufHead*[LEAF_COUNT];
@@ -1119,6 +1125,30 @@ auto bmap_selftest_read(ker::dev::BlockDevice* dev, uint64_t /*block*/, size_t c
 
 auto bmap_selftest_write(ker::dev::BlockDevice* /*dev*/, uint64_t /*block*/, size_t /*count*/, const void* /*buffer*/) -> int { return 0; }
 
+void bmap_selftest_init_free_root(XfsMountContext* mount, xfs_agblock_t root_agbno, uint32_t magic, xfs_agblock_t free_start,
+                                  xfs_extlen_t free_len) {
+    BufHead* root = xfs_buf_get(mount, xfs_agbno_to_fsbno(0, root_agbno, mount->ag_blk_log));
+    if (root == nullptr) {
+        return;
+    }
+
+    __builtin_memset(root->data, 0, root->size);
+    auto* hdr = reinterpret_cast<XfsBtreeSblock*>(root->data);
+    hdr->bb_magic = Be32::from_cpu(magic);
+    hdr->bb_level = Be16::from_cpu(0);
+    hdr->bb_numrecs = Be16::from_cpu(1);
+    hdr->bb_leftsib = Be32::from_cpu(NULLAGBLOCK);
+    hdr->bb_rightsib = Be32::from_cpu(NULLAGBLOCK);
+    hdr->bb_blkno = Be64::from_cpu(static_cast<uint64_t>(root_agbno) * (mount->block_size / mount->sect_size));
+    hdr->bb_owner = Be32::from_cpu(0);
+    hdr->bb_uuid = mount->uuid;
+
+    auto* rec = reinterpret_cast<XfsAllocRec*>(root->data + XFS_BTREE_SBLOCK_CRC_LEN);
+    rec->ar_startblock = Be32::from_cpu(free_start);
+    rec->ar_blockcount = Be32::from_cpu(free_len);
+    brelse(root);
+}
+
 }  // namespace
 
 auto xfs_selftest_bmap_synthetic_btree_lookup() -> bool {
@@ -1215,6 +1245,125 @@ auto xfs_selftest_bmap_synthetic_btree_lookup() -> bool {
     }
 
     return finish(true);
+}
+
+auto xfs_selftest_bmap_extent_promotion() -> bool {
+    ker::dev::BlockDevice dev{};
+    dev.block_size = 512;
+    dev.total_blocks = 4096;
+    dev.read_blocks = bmap_selftest_read;
+    dev.write_blocks = bmap_selftest_write;
+
+    XfsPerAG pag{};
+    pag.agno = 0;
+    pag.agf_length = 4096;
+    pag.agf_bno_root = 1;
+    pag.agf_cnt_root = 2;
+    pag.agf_bno_level = 1;
+    pag.agf_cnt_level = 1;
+    pag.agf_freeblks = 256;
+    pag.agf_longest = 256;
+    pag.agf_flcount = 4;
+
+    XfsMountContext mount{};
+    mount.device = &dev;
+    mount.block_size = 512;
+    mount.block_log = 9;
+    mount.total_blocks = 4096;
+    mount.inode_size = 512;
+    mount.ag_count = 1;
+    mount.ag_blocks = 4096;
+    mount.ag_blk_log = 12;
+    mount.sect_size = 512;
+    mount.sect_log = 9;
+    mount.per_ag = &pag;
+
+    bmap_selftest_init_free_root(&mount, pag.agf_bno_root, XFS_ABTB_CRC_MAGIC, 100, 256);
+    bmap_selftest_init_free_root(&mount, pag.agf_cnt_root, XFS_ABTC_CRC_MAGIC, 100, 256);
+
+    XfsInode inode{};
+    inode.ino = 84;
+    inode.agno = 0;
+    inode.mount = &mount;
+    inode.data_fork.format = XFS_DINODE_FMT_LOCAL;
+    inode.data_fork.local.data = nullptr;
+    inode.data_fork.local.size = 0;
+
+    auto cleanup = [&](bool ok) -> bool {
+        if (inode.data_fork.format == XFS_DINODE_FMT_EXTENTS) {
+            delete[] inode.data_fork.extents.list;
+            inode.data_fork.extents.list = nullptr;
+        } else if (inode.data_fork.format == XFS_DINODE_FMT_BTREE) {
+            delete[] inode.data_fork.btree.root;
+            inode.data_fork.btree.root = nullptr;
+        }
+        invalidate_bdev(&dev);
+        return ok;
+    };
+
+    constexpr uint32_t INLINE_CAPACITY = 21;
+    for (uint32_t i = 0; i < INLINE_CAPACITY + 1; i++) {
+        XfsTransaction* tp = xfs_trans_alloc(&mount);
+        if (tp == nullptr) {
+            return cleanup(false);
+        }
+        XfsBmbtIrec const REC{.br_startoff = static_cast<xfs_fileoff_t>(i) * 2,
+                              .br_startblock = static_cast<xfs_fsblock_t>(1000 + (i * 3)),
+                              .br_blockcount = 1,
+                              .br_unwritten = false};
+        int const RC = xfs_bmap_add_extent(&inode, tp, REC);
+        xfs_trans_cancel(tp);
+        if (RC != 0) {
+            return cleanup(false);
+        }
+        if (i + 1 == INLINE_CAPACITY && (inode.data_fork.format != XFS_DINODE_FMT_EXTENTS || inode.nextents != INLINE_CAPACITY)) {
+            return cleanup(false);
+        }
+    }
+
+    if (inode.data_fork.format != XFS_DINODE_FMT_BTREE || inode.nextents != INLINE_CAPACITY + 1) {
+        return cleanup(false);
+    }
+
+    XfsTransaction* tp = xfs_trans_alloc(&mount);
+    if (tp == nullptr) {
+        return cleanup(false);
+    }
+    XfsBmbtIrec const POST_PROMOTION_REC{.br_startoff = static_cast<xfs_fileoff_t>((INLINE_CAPACITY + 1) * 2),
+                                         .br_startblock = 2000,
+                                         .br_blockcount = 1,
+                                         .br_unwritten = false};
+    int rc = xfs_bmap_add_extent(&inode, tp, POST_PROMOTION_REC);
+    xfs_trans_cancel(tp);
+    if (rc != 0 || inode.data_fork.format != XFS_DINODE_FMT_BTREE || inode.nextents != INLINE_CAPACITY + 2) {
+        return cleanup(false);
+    }
+
+    std::array<XfsBmbtIrec, INLINE_CAPACITY + 2> listed{};
+    int const LISTED = xfs_bmap_list_extents(&inode, listed.data(), listed.size());
+    if (std::cmp_not_equal(LISTED, listed.size())) {
+        return cleanup(false);
+    }
+
+    for (uint32_t i = 0; i < listed.size(); i++) {
+        auto const EXPECTED_OFF = static_cast<xfs_fileoff_t>(i) * 2;
+        xfs_fsblock_t const EXPECTED_BLOCK = i == INLINE_CAPACITY + 1 ? POST_PROMOTION_REC.br_startblock : 1000 + (i * 3);
+        if (listed[i].br_startoff != EXPECTED_OFF || listed[i].br_startblock != EXPECTED_BLOCK || listed[i].br_blockcount != 1) {
+            return cleanup(false);
+        }
+
+        XfsBmapResult mapped{};
+        if (xfs_bmap_lookup(&inode, EXPECTED_OFF, &mapped) != 0 || mapped.is_hole || mapped.startblock != EXPECTED_BLOCK ||
+            mapped.blockcount != 1) {
+            return cleanup(false);
+        }
+        XfsBmapResult hole{};
+        if (xfs_bmap_lookup(&inode, EXPECTED_OFF + 1, &hole) != 0 || !hole.is_hole) {
+            return cleanup(false);
+        }
+    }
+
+    return cleanup(true);
 }
 
 }  // namespace ker::vfs::xfs

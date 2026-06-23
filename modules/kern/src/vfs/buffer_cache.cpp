@@ -218,6 +218,8 @@ constexpr size_t DIRTY_HARD_LIMIT_MULTIPLIER = 4;
 constexpr size_t DIRTY_WRITEBACK_BUDGET = 128;
 constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = 16;
 constexpr size_t DIRTY_WAKE_BATCH = 32;
+constexpr size_t BUFFER_CACHE_MEMORY_DIVISOR = 32;
+constexpr size_t BUFFER_CACHE_MAX_SIZE = static_cast<size_t>(512) * 1024 * 1024;
 
 struct DirtyBdevState {
     dev::BlockDevice* bdev{};
@@ -357,6 +359,18 @@ void free_unlinked_buffer(BufHead* bh) {
 
     free_buffer_data(bh);
     delete bh;
+}
+
+auto choose_buffer_cache_max_bytes() -> size_t {
+    uint64_t const TOTAL_MEM = ker::mod::mm::phys::get_total_mem_bytes();
+    if (TOTAL_MEM == 0) {
+        return BUFFER_CACHE_DEFAULT_SIZE;
+    }
+
+    uint64_t const SCALED = TOTAL_MEM / BUFFER_CACHE_MEMORY_DIVISOR;
+    uint64_t const CLAMPED = std::clamp<uint64_t>(SCALED, BUFFER_CACHE_DEFAULT_SIZE, BUFFER_CACHE_MAX_SIZE);
+    auto const SIZE_MAX_U64 = static_cast<uint64_t>(SIZE_MAX);
+    return static_cast<size_t>(std::min<uint64_t>(CLAMPED, SIZE_MAX_U64));
 }
 
 // Free a buffer's resources completely (removes from hash + LRU).
@@ -1143,6 +1157,7 @@ void buffer_cache_init() {
     if (cache_initialized) {
         return;
     }
+    cache_max_bytes = choose_buffer_cache_max_bytes();
     hash_buckets.fill(nullptr);
     lru_init();
     cache_total_bytes = 0;
