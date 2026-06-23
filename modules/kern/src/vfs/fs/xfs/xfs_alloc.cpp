@@ -30,6 +30,14 @@ namespace ker::vfs::xfs {
 
 namespace {
 
+constexpr xfs_agblock_t XFS_AG_RESERVED_MAX = 4;
+
+void log_agf_free_space_roots(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno);
+
+auto agfl_bno_usable(const XfsMountContext* mount, xfs_agblock_t bno) -> bool {
+    return bno != NULLAGBLOCK && bno < mount->ag_blocks && bno > XFS_AG_RESERVED_MAX;
+}
+
 // Minimum number of blocks the AGFL should hold before we perform allocations
 // that may trigger btree splits.  Each split consumes at most one AGFL block,
 // and a two-level tree can have at most two simultaneous splits (leaf + root),
@@ -133,6 +141,116 @@ void agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
 }
 
 // Try to allocate from a specific AG using the cntbt (by-count tree)
+auto alloc_ag_by_hint(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, const XfsAllocReq& req, XfsAllocResult* result)
+    -> int {
+    if (req.agbno == NULLAGBLOCK || req.agbno <= XFS_AG_RESERVED_MAX) {
+        return -ENOSPC;
+    }
+
+    XfsPerAG* pag = &mount->per_ag[agno];
+    if (pag->agf_freeblks < req.minlen) {
+        return -ENOSPC;
+    }
+    if (pag->agf_flcount < XFS_AGFL_MIN) {
+        agfl_refill(mount, tp, agno);
+    }
+
+    XfsBtreeCursor<XfsBnobtTraits> bno_cur;
+    bno_cur.mount = mount;
+    bno_cur.agno = agno;
+    XfsBnobtTraits::IRec const BNO_TARGET{.startblock = req.agbno, .blockcount = 0};
+    int rc = xfs_btree_lookup(&bno_cur, pag->agf_bno_root, pag->agf_bno_level, BNO_TARGET, XfsBtreeLookup::LE);
+    if (rc != 0) {
+        return -ENOSPC;
+    }
+
+    XfsBnobtTraits::IRec const FOUND = xfs_btree_get_rec(&bno_cur);
+    xfs_agblock_t const FOUND_END = FOUND.startblock + FOUND.blockcount;
+    if (req.agbno < FOUND.startblock || req.agbno >= FOUND_END) {
+        return -ENOSPC;
+    }
+
+    xfs_extlen_t alloc_len = std::min(req.maxlen, static_cast<xfs_extlen_t>(FOUND_END - req.agbno));
+    if (alloc_len < req.minlen) {
+        return -ENOSPC;
+    }
+
+    rc = xfs_btree_delete(&bno_cur, tp);
+    if (rc != 0) {
+        return rc;
+    }
+
+    XfsBtreeCursor<XfsCntbtTraits> cnt_cur;
+    cnt_cur.mount = mount;
+    cnt_cur.agno = agno;
+    XfsCntbtTraits::IRec const CNT_TARGET{.startblock = FOUND.startblock, .blockcount = FOUND.blockcount};
+    rc = xfs_btree_lookup(&cnt_cur, pag->agf_cnt_root, pag->agf_cnt_level, CNT_TARGET, XfsBtreeLookup::EQ);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = xfs_btree_delete(&cnt_cur, tp);
+    if (rc != 0) {
+        return rc;
+    }
+
+    if (req.agbno > FOUND.startblock) {
+        xfs_extlen_t const LEFT_LEN = req.agbno - FOUND.startblock;
+        uint64_t new_bno_root = pag->agf_bno_root;
+        uint8_t new_bno_lvl = pag->agf_bno_level;
+        uint64_t new_cnt_root = pag->agf_cnt_root;
+        uint8_t new_cnt_lvl = pag->agf_cnt_level;
+
+        XfsBnobtTraits::IRec const LEFT_BNO{.startblock = FOUND.startblock, .blockcount = LEFT_LEN};
+        rc = xfs_btree_insert(&bno_cur, tp, LEFT_BNO, pag->agf_bno_root, pag->agf_bno_level, &new_bno_root, &new_bno_lvl);
+        if (rc != 0) {
+            return rc;
+        }
+        pag->agf_bno_root = static_cast<xfs_agblock_t>(new_bno_root);
+        pag->agf_bno_level = new_bno_lvl;
+
+        XfsCntbtTraits::IRec const LEFT_CNT{.startblock = FOUND.startblock, .blockcount = LEFT_LEN};
+        rc = xfs_btree_insert(&cnt_cur, tp, LEFT_CNT, pag->agf_cnt_root, pag->agf_cnt_level, &new_cnt_root, &new_cnt_lvl);
+        if (rc != 0) {
+            return rc;
+        }
+        pag->agf_cnt_root = static_cast<xfs_agblock_t>(new_cnt_root);
+        pag->agf_cnt_level = new_cnt_lvl;
+    }
+
+    xfs_agblock_t const ALLOC_END = req.agbno + alloc_len;
+    if (ALLOC_END < FOUND_END) {
+        xfs_extlen_t const RIGHT_LEN = FOUND_END - ALLOC_END;
+        uint64_t new_bno_root = pag->agf_bno_root;
+        uint8_t new_bno_lvl = pag->agf_bno_level;
+        uint64_t new_cnt_root = pag->agf_cnt_root;
+        uint8_t new_cnt_lvl = pag->agf_cnt_level;
+
+        XfsBnobtTraits::IRec const RIGHT_BNO{.startblock = ALLOC_END, .blockcount = RIGHT_LEN};
+        rc = xfs_btree_insert(&bno_cur, tp, RIGHT_BNO, pag->agf_bno_root, pag->agf_bno_level, &new_bno_root, &new_bno_lvl);
+        if (rc != 0) {
+            return rc;
+        }
+        pag->agf_bno_root = static_cast<xfs_agblock_t>(new_bno_root);
+        pag->agf_bno_level = new_bno_lvl;
+
+        XfsCntbtTraits::IRec const RIGHT_CNT{.startblock = ALLOC_END, .blockcount = RIGHT_LEN};
+        rc = xfs_btree_insert(&cnt_cur, tp, RIGHT_CNT, pag->agf_cnt_root, pag->agf_cnt_level, &new_cnt_root, &new_cnt_lvl);
+        if (rc != 0) {
+            return rc;
+        }
+        pag->agf_cnt_root = static_cast<xfs_agblock_t>(new_cnt_root);
+        pag->agf_cnt_level = new_cnt_lvl;
+    }
+
+    pag->agf_freeblks -= alloc_len;
+    log_agf_free_space_roots(mount, tp, agno);
+
+    result->agno = agno;
+    result->agbno = req.agbno;
+    result->len = alloc_len;
+    return 0;
+}
+
 auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, const XfsAllocReq& req, XfsAllocResult* result)
     -> int {
     XfsPerAG* pag = &mount->per_ag[agno];
@@ -367,6 +485,12 @@ auto xfs_alloc_extent(XfsMountContext* mount, XfsTransaction* tp, const XfsAlloc
 
     // Try preferred AG first
     if (req.agno != NULLAGNUMBER && req.agno < mount->ag_count) {
+        if (req.agbno != 0) {
+            int const HINT_RC = alloc_ag_by_hint(mount, tp, req.agno, req, result);
+            if (HINT_RC == 0) {
+                return 0;
+            }
+        }
         int const RC = alloc_ag_by_size(mount, tp, req.agno, req, result);
         if (RC == 0) {
             return 0;
@@ -396,6 +520,11 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
     }
     if (len == 0) {
         return -EINVAL;
+    }
+    if (agbno == NULLAGBLOCK || agbno >= mount->ag_blocks || len > mount->ag_blocks - agbno || agbno <= XFS_AG_RESERVED_MAX) {
+        mod::dbg::log("[xfs free] rejecting reserved/corrupt extent agno=%u agbno=%u len=%u ag_blocks=%u", agno, agbno, len,
+                      mount->ag_blocks);
+        return -EIO;
     }
 
     XfsPerAG* pag = &mount->per_ag[agno];
@@ -561,12 +690,12 @@ auto xfs_alloc_get_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
     // This matches Linux's xfs_verify_agbno check in xfs_alloc_get_freelist().
     while (pag->agf_flcount > 0) {
         uint32_t const BNO_RAW = agfl_bno[pag->agf_flfirst].to_cpu();
-        if (BNO_RAW != 0xFFFFFFFFU && BNO_RAW < mount->ag_blocks) {
+        if (agfl_bno_usable(mount, BNO_RAW)) {
             // Valid entry found.
             break;
         }
-        mod::dbg::log("[xfs agfl] get_freelist: agno=%u skipping corrupt slot[%u]=%u (fllast=%u flcount=%u)\n", agno, pag->agf_flfirst,
-                      BNO_RAW, pag->agf_fllast, pag->agf_flcount);
+        mod::dbg::log("[xfs agfl] get_freelist: agno=%u skipping reserved/corrupt slot[%u]=%u (fllast=%u flcount=%u)\n", agno,
+                      pag->agf_flfirst, BNO_RAW, pag->agf_fllast, pag->agf_flcount);
         pag->agf_flfirst = (pag->agf_flfirst + 1) % AGFL_SZ;
         pag->agf_flcount--;
     }
@@ -593,12 +722,13 @@ auto xfs_alloc_put_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
         return -EINVAL;
     }
 
-    if (bno <= 4) {
+    if (!agfl_bno_usable(mount, bno)) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wframe-address"
-        mod::dbg::log("[xfs agfl] put_freelist: SUSPICIOUS agno=%u bno=%u caller=%p caller2=%p\n", agno, bno, __builtin_return_address(0),
-                      __builtin_return_address(1));
+        mod::dbg::log("[xfs agfl] put_freelist: rejecting reserved/corrupt agno=%u bno=%u ag_blocks=%u caller=%p caller2=%p\n", agno, bno,
+                      mount->ag_blocks, __builtin_return_address(0), __builtin_return_address(1));
 #pragma clang diagnostic pop
+        return -EIO;
     }
 
     XfsPerAG* pag = &mount->per_ag[agno];
@@ -625,11 +755,6 @@ auto xfs_alloc_put_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
     }
 
     auto* agfl_bno = reinterpret_cast<Be32*>(reinterpret_cast<uint8_t*>(agfl) + sizeof(XfsAgfl));
-
-    if (bno == 0xFFFFFFFFU || bno >= mount->ag_blocks) {
-        mod::dbg::log("[xfs agfl] put_freelist: agno=%u BAD bno=%u flfirst=%u fllast=%u flcount=%u\n", agno, bno, pag->agf_flfirst,
-                      pag->agf_fllast, pag->agf_flcount);
-    }
 
     // Advance tail and write the block number.
     if (pag->agf_flcount == 0) {

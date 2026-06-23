@@ -6,6 +6,7 @@
 
 #include "platform/asm/cpu.hpp"
 #include "platform/interrupt/gates.hpp"
+#include "platform/interrupt/gdt.hpp"
 #include "platform/mm/addr.hpp"
 #include "platform/mm/mm.hpp"
 #include "platform/mm/paging.hpp"
@@ -263,6 +264,48 @@ void sync_task_signal_mask_cache(sched::task::Task* task) {
         return;
     }
     (void)copy_to_task_user(*task, TCB + WOS_TCB_SIGNAL_MASK_VALID_OFFSET, &valid, sizeof(valid));
+}
+
+auto restore_deferred_sigreturn(sched::task::Task* task) -> DeferredSigreturnResult {
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || !task->do_sigreturn) {
+        return DeferredSigreturnResult::NONE;
+    }
+
+    task->do_sigreturn = false;
+
+    uint64_t const USER_RSP = task->context.frame.rsp;
+    if (USER_RSP < sizeof(uint64_t)) {
+        handle_signal_frame_fault(task);
+        return DeferredSigreturnResult::FAULT;
+    }
+
+    uint64_t const FRAME_START = USER_RSP - sizeof(uint64_t);
+    SignalFrame frame{};
+    if (!read_signal_frame(*task, FRAME_START, frame) || !signal_return_frame_valid(frame)) {
+        handle_signal_frame_fault(task);
+        return DeferredSigreturnResult::FAULT;
+    }
+
+    task->sig_mask = frame.saved_mask;
+    sync_task_signal_mask_cache(task);
+
+    auto* regs_arr = reinterpret_cast<uint64_t*>(&task->context.regs);
+    for (int i = 0; i < 15; i++) {
+        regs_arr[i] = frame.saved_regs.at(static_cast<size_t>(i));
+    }
+    task->context.regs.rax = frame.saved_retval;
+
+    task->context.frame.int_num = 0;
+    task->context.frame.err_code = 0;
+    task->context.frame.rip = frame.saved_rip;
+    task->context.frame.cs = desc::gdt::GDT_USER_CS;
+    task->context.frame.flags = frame.saved_rflags;
+    task->context.frame.rsp = frame.saved_rsp;
+    task->context.frame.ss = desc::gdt::GDT_USER_DS;
+    write_task_syscall_return(*task, frame.saved_rsp, frame.saved_rip, frame.saved_rflags);
+
+    task->in_signal_handler = false;
+    return DeferredSigreturnResult::RESTORED;
 }
 
 namespace {

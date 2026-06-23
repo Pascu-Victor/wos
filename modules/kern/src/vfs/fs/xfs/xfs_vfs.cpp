@@ -55,6 +55,9 @@ constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
 // Each transaction covers one contiguous extent allocation, so the actual
 // number of transactions for a sequential write is (total_blocks / batch).
 constexpr xfs_extlen_t XFS_WRITE_BATCH_BLOCKS = 65536;  // up to 256 MiB per transaction
+constexpr size_t XFS_STREAM_PREALLOC_TRIGGER_BYTES = size_t{512} * 1024;
+constexpr xfs_extlen_t XFS_STREAM_PREALLOC_BLOCKS = 1024;  // 4 MiB
+constexpr uint32_t XFS_STREAM_PREALLOC_EXTENT_MARGIN = 8;
 
 // ============================================================================
 // Per-open-file state
@@ -149,12 +152,75 @@ auto xfs_current_timestamp(const XfsInode* ip) -> uint64_t {
     return xfs_encode_epoch_timestamp(ker::mod::time::get_epoch_ns(), BIGTIME);
 }
 
-auto xfs_hole_write_alloc_blocks(size_t block_off, size_t remaining_bytes, xfs_filblks_t hole_blocks, size_t block_size, uint32_t block_log)
-    -> xfs_extlen_t {
+auto xfs_data_fork_record_capacity(const XfsInode* ip) -> uint32_t {
+    if (ip == nullptr || ip->mount == nullptr || ip->mount->inode_size <= XFS_DINODE_SIZE_V3) {
+        return 0;
+    }
+
+    size_t fork_size = ip->mount->inode_size - XFS_DINODE_SIZE_V3;
+    if (ip->forkoff != 0) {
+        fork_size = static_cast<size_t>(ip->forkoff) << 3U;
+        if (XFS_DINODE_SIZE_V3 + fork_size > ip->mount->inode_size) {
+            return 0;
+        }
+    }
+
+    size_t const CAPACITY = fork_size / sizeof(XfsBmbtRec);
+    return CAPACITY > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(CAPACITY);
+}
+
+auto xfs_has_inline_extent_pressure(const XfsInode* ip) -> bool {
+    if (ip == nullptr || ip->data_fork.format != XFS_DINODE_FMT_EXTENTS) {
+        return false;
+    }
+
+    uint32_t const CAPACITY = xfs_data_fork_record_capacity(ip);
+    if (CAPACITY == 0) {
+        return false;
+    }
+
+    uint32_t const COUNT = ip->data_fork.extents.count;
+    return COUNT >= CAPACITY || CAPACITY - COUNT <= XFS_STREAM_PREALLOC_EXTENT_MARGIN;
+}
+
+auto xfs_hole_write_alloc_blocks(size_t write_pos, size_t block_off, size_t remaining_bytes, xfs_filblks_t hole_blocks, size_t block_size,
+                                 uint32_t block_log, bool extent_pressure) -> xfs_extlen_t {
     size_t const BLOCKS_NEEDED = (block_off + remaining_bytes + block_size - 1) >> block_log;
-    auto alloc_blocks = static_cast<xfs_extlen_t>(std::min(hole_blocks, static_cast<xfs_filblks_t>(BLOCKS_NEEDED)));
+    auto desired_blocks = static_cast<xfs_filblks_t>(BLOCKS_NEEDED);
+    bool const SHOULD_PREALLOC = write_pos >= XFS_STREAM_PREALLOC_TRIGGER_BYTES || extent_pressure;
+    if (SHOULD_PREALLOC && hole_blocks > desired_blocks) {
+        desired_blocks = std::max(desired_blocks, static_cast<xfs_filblks_t>(XFS_STREAM_PREALLOC_BLOCKS));
+    }
+    auto alloc_blocks = static_cast<xfs_extlen_t>(std::min(hole_blocks, desired_blocks));
     alloc_blocks = std::min(alloc_blocks, XFS_WRITE_BATCH_BLOCKS);
     return alloc_blocks == 0 ? 1 : alloc_blocks;
+}
+
+void xfs_set_sequential_alloc_hint(XfsInode* ip, XfsMountContext* ctx, xfs_fileoff_t file_block, XfsAllocReq* req) {
+    if (ip == nullptr || ctx == nullptr || req == nullptr || ip->data_fork.format != XFS_DINODE_FMT_EXTENTS) {
+        return;
+    }
+
+    XfsIforkExtents const& extents = ip->data_fork.extents;
+    if (extents.list == nullptr || extents.count == 0) {
+        return;
+    }
+
+    for (uint32_t i = extents.count; i > 0; --i) {
+        XfsBmbtIrec const& ext = extents.list[i - 1];
+        if (ext.br_startoff + ext.br_blockcount != file_block) {
+            continue;
+        }
+
+        xfs_fsblock_t const NEXT_FSB = ext.br_startblock + ext.br_blockcount;
+        xfs_agnumber_t const AGNO = xfs_ag_number(NEXT_FSB, ctx->ag_blk_log);
+        xfs_agblock_t const AGBNO = xfs_ag_block(NEXT_FSB, ctx->ag_blk_log);
+        if (AGNO < ctx->ag_count && AGBNO < ctx->ag_blocks) {
+            req->agno = AGNO;
+            req->agbno = AGBNO;
+        }
+        return;
+    }
 }
 
 auto xfs_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks) -> bool { return old_size != 0 || nblocks != 0; }
@@ -185,8 +251,8 @@ void perf_record_xfs_slow_event(ker::mod::perf::WkiPerfLocalXfsOp op, int32_t st
                                      ker::mod::perf::next_wki_trace_correlation(), status, latency_us, callsite);
 }
 
-auto xfs_commit_dirty_inode(XfsMountContext* ctx, XfsInode* ip) -> int {
-    if (ctx == nullptr || ip == nullptr || ctx->read_only || !ip->dirty) {
+auto xfs_commit_dirty_inode(XfsMountContext* ctx, XfsInode* ip, bool trim_eof_prealloc = false) -> int {
+    if (ctx == nullptr || ip == nullptr || ctx->read_only || (!ip->dirty && !trim_eof_prealloc)) {
         return 0;
     }
 
@@ -195,6 +261,19 @@ auto xfs_commit_dirty_inode(XfsMountContext* ctx, XfsInode* ip) -> int {
     if (tp == nullptr) {
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ILOG, STARTED_US, -ENOMEM, 0);
         return -ENOMEM;
+    }
+    if (trim_eof_prealloc && !xfs_inode_isdir(ip)) {
+        int const TRIM_RET = xfs_inode_trim_data_to_size(ip, tp, ip->size);
+        if (TRIM_RET != 0) {
+            xfs_trans_cancel(tp);
+            perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ILOG, STARTED_US, TRIM_RET, 0);
+            return TRIM_RET;
+        }
+    }
+    if (!ip->dirty) {
+        xfs_trans_cancel(tp);
+        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ILOG, STARTED_US, 0, 0);
+        return 0;
     }
     xfs_trans_log_inode(tp, ip);
     int const RET = xfs_trans_commit(tp);
@@ -371,7 +450,7 @@ auto xfs_vfs_close(File* f) -> int {
             XfsMetadataGuard metadata_guard(xfd->mount);
             {
                 ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
-                close_result = xfs_commit_dirty_inode(xfd->mount, xfd->inode);
+                close_result = xfs_commit_dirty_inode(xfd->mount, xfd->inode, true);
             }
             xfs_inode_release(xfd->inode);
         }
@@ -797,8 +876,9 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
 #endif
             // Hole: batch-allocate as many contiguous blocks as we can.
             size_t const REMAINING_BYTES = count - total_written;
-            xfs_extlen_t const HOLE_BLOCKS =
-                xfs_hole_write_alloc_blocks(BLOCK_OFF, REMAINING_BYTES, bmap.blockcount, ctx->block_size, ctx->block_log);
+            bool const EXTENT_PRESSURE = xfs_has_inline_extent_pressure(ip);
+            xfs_extlen_t const HOLE_BLOCKS = xfs_hole_write_alloc_blocks(WRITE_POS, BLOCK_OFF, REMAINING_BYTES, bmap.blockcount,
+                                                                         ctx->block_size, ctx->block_log, EXTENT_PRESSURE);
 
 #ifdef XFS_BENCH
             t0 = ker::mod::tsc::get_ns();
@@ -819,6 +899,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
             req.minlen = 1;
             req.maxlen = HOLE_BLOCKS;
             req.alignment = 0;
+            xfs_set_sequential_alloc_hint(ip, ctx, file_block, &req);
 
             XfsAllocResult alloc_result{};
             ret = xfs_alloc_extent(ctx, tp, req, &alloc_result);
@@ -1167,8 +1248,6 @@ auto xfs_vfs_truncate(File* f, off_t length) -> int {
     XfsMetadataGuard metadata_guard(ctx);
     ker::mod::sys::MutexGuard guard(ip->io_lock);
 
-    // For now, only support truncating to 0 (common case) or extending.
-    // Shrinking to an arbitrary size would require freeing blocks.
     auto new_size = static_cast<uint64_t>(length);
 
     uint64_t const OLD_SIZE = ip->size;
@@ -1195,6 +1274,23 @@ auto xfs_vfs_truncate(File* f, off_t length) -> int {
             return TRUNC_RET;
         }
         ip->size = 0;
+        xfs_trans_log_inode(tp, ip);
+        int const RET = xfs_trans_commit(tp);
+        return (RET == 0) ? 0 : -EIO;
+    }
+
+    if (new_size < OLD_SIZE) {
+        XfsTransaction* tp = xfs_trans_alloc(ctx);
+        if (tp == nullptr) {
+            return -ENOMEM;
+        }
+        int const TRIM_RET = xfs_inode_trim_data_to_size(ip, tp, new_size);
+        if (TRIM_RET != 0) {
+            xfs_trans_cancel(tp);
+            return TRIM_RET;
+        }
+        ip->size = new_size;
+        ip->dirty = true;
         xfs_trans_log_inode(tp, ip);
         int const RET = xfs_trans_commit(tp);
         return (RET == 0) ? 0 : -EIO;
@@ -1239,7 +1335,7 @@ auto get_xfs_fops() -> FileOperations* { return &xfs_fops; }
 #ifdef WOS_SELFTEST
 auto xfs_selftest_hole_write_alloc_blocks(size_t block_off, size_t remaining_bytes, xfs_filblks_t hole_blocks, size_t block_size,
                                           uint32_t block_log) -> xfs_extlen_t {
-    return xfs_hole_write_alloc_blocks(block_off, remaining_bytes, hole_blocks, block_size, block_log);
+    return xfs_hole_write_alloc_blocks(0, block_off, remaining_bytes, hole_blocks, block_size, block_log, false);
 }
 
 auto xfs_selftest_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks) -> bool {
@@ -1372,6 +1468,17 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
             return nullptr;
         }
 
+        XfsInode new_inode{};
+        new_inode.ino = NEW_INO;
+        new_inode.mount = ctx;
+        new_inode.agno = xfs_ino_ag(NEW_INO, ctx->agino_log);
+        new_inode.agino = xfs_ag_ino(NEW_INO, ctx->agino_log);
+        new_inode.mode = INODE_MODE;
+        new_inode.nlink = 1;
+        new_inode.data_fork.format = XFS_DINODE_FMT_EXTENTS;
+        xfs_stamp_new_inode(&new_inode);
+        xfs_trans_log_inode(tp, &new_inode);
+
         // Add directory entry
         int rc = xfs_dir_addname(parent_ip, filename, filename_len, NEW_INO, XFS_DIR3_FT_REG_FILE, tp);
         if (rc != 0) {
@@ -1390,25 +1497,6 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         ip = xfs_inode_read(ctx, NEW_INO);
         if (ip == nullptr) {
             return nullptr;
-        }
-
-        // Initialize the new inode's in-memory state
-        ip->mode = INODE_MODE;
-        ip->size = 0;
-        ip->nlink = 1;
-        ip->nblocks = 0;
-        ip->data_fork.format = XFS_DINODE_FMT_EXTENTS;
-        ip->data_fork.extents.list = nullptr;
-        ip->data_fork.extents.count = 0;
-        ip->nextents = 0;
-        xfs_stamp_new_inode(ip);
-        ip->dirty = true;
-
-        // Commit the new inode's core fields to disk so they persist.
-        XfsTransaction* tp2 = xfs_trans_alloc(ctx);
-        if (tp2 != nullptr) {
-            xfs_trans_log_inode(tp2, ip);
-            xfs_trans_commit(tp2);
         }
     }
 
@@ -1770,35 +1858,11 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
         return -ENOSPC;
     }
 
-    // Add entry in parent
-    int rc = xfs_dir_addname(parent_ip, dirname, dirname_len, NEW_INO, XFS_DIR3_FT_DIR, tp);
-    if (rc != 0) {
-        xfs_trans_cancel(tp);
-        xfs_inode_release(parent_ip);
-        return rc;
-    }
-
-    rc = xfs_trans_commit(tp);
-    xfs_inode_release(parent_ip);
-    if (rc != 0) {
-        return rc;
-    }
-
-    // Initialize the new directory inode with a minimal shortform header
-    XfsInode* new_ip = xfs_inode_read(ctx, NEW_INO);
-    if (new_ip == nullptr) {
-        return -EIO;
-    }
-
     // Build minimal shortform directory: count=0, parent=parent_ino
     bool const USE_I8 = (PARENT_INO > 0xFFFFFFFFULL);
     size_t const INO_BYTES = USE_I8 ? 8 : 4;
     size_t const SF_SIZE = 2 + INO_BYTES;
-    auto* sf_data = new (std::nothrow) uint8_t[SF_SIZE];
-    if (sf_data == nullptr) {
-        xfs_inode_release(new_ip);
-        return -ENOMEM;
-    }
+    std::array<uint8_t, 10> sf_data{};
     sf_data[0] = 0;               // count
     sf_data[1] = USE_I8 ? 1 : 0;  // i8count
     if (USE_I8) {
@@ -1812,23 +1876,33 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
         }
     }
 
-    new_ip->mode = INODE_MODE;
-    new_ip->size = SF_SIZE;
-    new_ip->nlink = 2;  // . and parent ref
-    new_ip->nblocks = 0;
-    new_ip->nextents = 0;
-    new_ip->data_fork.format = XFS_DINODE_FMT_LOCAL;
-    new_ip->data_fork.local.data = sf_data;
-    new_ip->data_fork.local.size = static_cast<uint32_t>(SF_SIZE);
-    xfs_stamp_new_inode(new_ip);
-    new_ip->dirty = true;
+    XfsInode new_inode{};
+    new_inode.ino = NEW_INO;
+    new_inode.mount = ctx;
+    new_inode.agno = xfs_ino_ag(NEW_INO, ctx->agino_log);
+    new_inode.agino = xfs_ag_ino(NEW_INO, ctx->agino_log);
+    new_inode.mode = INODE_MODE;
+    new_inode.size = SF_SIZE;
+    new_inode.nlink = 2;  // . and parent ref
+    new_inode.data_fork.format = XFS_DINODE_FMT_LOCAL;
+    new_inode.data_fork.local.data = sf_data.data();
+    new_inode.data_fork.local.size = SF_SIZE;
+    xfs_stamp_new_inode(&new_inode);
+    xfs_trans_log_inode(tp, &new_inode);
 
-    XfsTransaction* tp2 = xfs_trans_alloc(ctx);
-    if (tp2 != nullptr) {
-        xfs_trans_log_inode(tp2, new_ip);
-        xfs_trans_commit(tp2);
+    // Add entry in parent
+    int rc = xfs_dir_addname(parent_ip, dirname, dirname_len, NEW_INO, XFS_DIR3_FT_DIR, tp);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        xfs_inode_release(parent_ip);
+        return rc;
     }
-    xfs_inode_release(new_ip);
+
+    rc = xfs_trans_commit(tp);
+    xfs_inode_release(parent_ip);
+    if (rc != 0) {
+        return rc;
+    }
     return 0;
 }
 

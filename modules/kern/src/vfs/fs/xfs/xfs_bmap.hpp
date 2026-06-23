@@ -35,11 +35,16 @@ auto xfs_bmap_lookup(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* resu
 auto xfs_bmap_list_extents(XfsInode* ip, XfsBmbtIrec* extents, uint32_t max_extents) -> int;
 
 // Add a new extent mapping to the inode's data fork.
-// Currently supports EXTENTS format only (inserts into the sorted extent list).
+// Inserts into the sorted extent list, promoting EXTENTS forks to BTREE when
+// inline fork capacity is exhausted.
 // The caller must have already allocated the physical blocks and must commit
 // the transaction after calling this.
 // Returns 0 on success, negative errno on failure.
 struct XfsTransaction;
 auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& new_extent) -> int;
+
+// Free bmbt metadata blocks belonging to a BTREE-format data fork. Data
+// extents themselves are not freed here.
+auto xfs_bmap_free_btree_blocks(XfsInode* ip, XfsTransaction* tp, uint32_t* freed_blocks = nullptr) -> int;
 
 }  // namespace ker::vfs::xfs

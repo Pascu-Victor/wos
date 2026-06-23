@@ -11,10 +11,10 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Werror -fno-sanitize=safe
 
 # Include paths
 include_directories(
-    ${CMAKE_SOURCE_DIR}/modules/defines
-    ${CMAKE_SOURCE_DIR}/modules/kern/src
-    ${CMAKE_SOURCE_DIR}/modules/kern/src/abi
-    ${CMAKE_SOURCE_DIR}/modules/stdlib/src
+    ${WOS_MODULES_DIR}/defines
+    ${WOS_MODULES_DIR}/kern/src
+    ${WOS_MODULES_DIR}/kern/src/abi
+    ${WOS_MODULES_DIR}/stdlib/src
 )
 
 # Source files

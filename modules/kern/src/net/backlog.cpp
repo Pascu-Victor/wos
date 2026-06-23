@@ -5,12 +5,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <net/address.hpp>
 #include <net/endian.hpp>
 #include <net/net_trace.hpp>
 #include <net/packet.hpp>
 #include <net/proto/ethernet.hpp>
 #include <net/proto/ipv4.hpp>
 #include <net/proto/ipv6.hpp>
+#include <net/wki/wire.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -41,17 +43,27 @@ void promote_latency_sensitive_daemon(ker::mod::sched::task::Task* task) {
     ker::mod::sched::set_task_nice(task, NET_LATENCY_DAEMON_NICE);
 }
 
-auto packet_list_count(const PacketBuffer* batch) -> uint64_t {
-    uint64_t count = 0;
-    while (batch != nullptr) {
-        ++count;
-        batch = batch->next;
+auto packet_is_wki_ethernet_frame(const PacketBuffer* pkt) -> bool {
+    if (pkt == nullptr || pkt->len < sizeof(proto::EthernetHeader)) {
+        return false;
     }
-    return count;
+
+    const auto* eth = reinterpret_cast<const proto::EthernetHeader*>(pkt->data);
+    uint16_t const ETHERTYPE = ntohs(eth->ethertype);
+    return ETHERTYPE == proto::ETH_TYPE_WKI || ETHERTYPE == proto::ETH_TYPE_WKI_ROCE;
 }
 
-void process_backlog_batch(PacketBuffer* batch) {
-    // Reverse LIFO->FIFO to preserve packet ordering.
+void append_packet(PacketBuffer*& head, PacketBuffer*& tail, PacketBuffer* pkt) {
+    pkt->next = nullptr;
+    if (tail != nullptr) {
+        tail->next = pkt;
+    } else {
+        head = pkt;
+    }
+    tail = pkt;
+}
+
+auto reverse_packet_list(PacketBuffer* batch) -> PacketBuffer* {
     PacketBuffer* reversed = nullptr;
     while (batch != nullptr) {
         PacketBuffer* next = batch->next;
@@ -59,36 +71,71 @@ void process_backlog_batch(PacketBuffer* batch) {
         reversed = batch;
         batch = next;
     }
+    return reversed;
+}
 
-    // Process each packet through the protocol stack.
-    while (reversed != nullptr) {
-        PacketBuffer* next = reversed->next;
-        reversed->next = nullptr;
-        NET_TRACE_TICK();
-        if (is_loopback_dev(reversed->dev)) {
-            if (reversed->len > 0) {
-                uint8_t const VERSION = (reversed->data[0] >> 4) & 0xF;
-                if (VERSION == 4) {
-                    proto::ipv4_rx(reversed->dev, reversed);
-                    reversed = next;
-                    continue;
-                }
-                if (VERSION == 6) {
-                    proto::ipv6_rx(reversed->dev, reversed);
-                    reversed = next;
-                    continue;
-                }
-            }
-            pkt_free(reversed);
-            reversed = next;
-            continue;
+void split_backlog_batch(PacketBuffer* batch, PacketBuffer*& normal_head, PacketBuffer*& wki_head) {
+    PacketBuffer* normal_tail = nullptr;
+    PacketBuffer* wki_tail = nullptr;
+
+    while (batch != nullptr) {
+        PacketBuffer* next = batch->next;
+        if (packet_is_wki_ethernet_frame(batch)) {
+            append_packet(wki_head, wki_tail, batch);
+        } else {
+            append_packet(normal_head, normal_tail, batch);
         }
-        if (reversed->dev != nullptr && reversed->dev->wki_rx_forward != nullptr) {
-            reversed->dev->wki_rx_forward(reversed->dev, reversed);
-        }
-        proto::eth_rx(reversed->dev, reversed);
-        reversed = next;
+        batch = next;
     }
+}
+
+void process_backlog_packet(PacketBuffer* pkt) {
+    if (pkt == nullptr) {
+        return;
+    }
+
+    NET_TRACE_TICK();
+    if (is_loopback_dev(pkt->dev)) {
+        if (pkt->len > 0) {
+            uint8_t const VERSION = (pkt->data[0] >> 4) & 0xF;
+            if (VERSION == 4) {
+                proto::ipv4_rx(pkt->dev, pkt);
+                return;
+            }
+            if (VERSION == 6) {
+                proto::ipv6_rx(pkt->dev, pkt);
+                return;
+            }
+        }
+        pkt_free(pkt);
+        return;
+    }
+    if (pkt->dev != nullptr && pkt->dev->wki_rx_forward != nullptr) {
+        pkt->dev->wki_rx_forward(pkt->dev, pkt);
+    }
+    proto::eth_rx(pkt->dev, pkt);
+}
+
+void process_packet_list(PacketBuffer* batch) {
+    while (batch != nullptr) {
+        PacketBuffer* next = batch->next;
+        batch->next = nullptr;
+        process_backlog_packet(batch);
+        batch = next;
+    }
+}
+
+auto prepare_backlog_batch(PacketBuffer* batch, BacklogQueue& q, PacketBuffer*& normal_head, PacketBuffer*& wki_head) -> int {
+    int queue_drained = 0;
+    PacketBuffer* cursor = batch;
+    while (cursor != nullptr) {
+        ++queue_drained;
+        cursor = cursor->next;
+    }
+
+    q.depth.fetch_sub(static_cast<uint64_t>(queue_drained), std::memory_order_relaxed);
+    split_backlog_batch(reverse_packet_list(batch), normal_head, wki_head);
+    return queue_drained;
 }
 
 auto try_acquire_backlog_consumer(BacklogQueue& q) -> bool {
@@ -101,10 +148,6 @@ void release_backlog_consumer(BacklogQueue& q) { q.consumer_active.store(false, 
 // Handler thread entry point (one per CPU). DAEMON type, pinned.
 void backlog_handler_loop(uint64_t cpu_idx) {
     for (;;) {
-        // Re-read current CPU each iteration: the scheduler may migrate this
-        // handler thread, so we must always drain the queue for whichever CPU
-        // we're actually running on right now.
-        cpu_idx = ker::mod::cpu::current_cpu();
         if (cpu_idx >= num_cpus) {
             cpu_idx = 0;
         }
@@ -134,17 +177,25 @@ void backlog_handler_loop(uint64_t cpu_idx) {
             continue;
         }
 
-        q.depth.fetch_sub(packet_list_count(batch), std::memory_order_relaxed);
-        process_backlog_batch(batch);
+        PacketBuffer* normal_head = nullptr;
+        PacketBuffer* wki_head = nullptr;
+        static_cast<void>(prepare_backlog_batch(batch, q, normal_head, wki_head));
+
+        process_packet_list(normal_head);
         release_backlog_consumer(q);
+        process_packet_list(wki_head);
     }
 }
 
 [[noreturn]] void backlog_handler_entry() {
-    // Starting CPU - passed as initial hint but re-read each iteration in the loop.
     uint64_t const MY_CPU = ker::mod::cpu::current_cpu();
     backlog_handler_loop(MY_CPU);
     __builtin_unreachable();
+}
+
+auto mix_hash(uint32_t h, uint32_t value) -> uint32_t {
+    h ^= value + 0x9e3779b9U + (h << 6U) + (h >> 2U);
+    return h;
 }
 
 }  // namespace
@@ -235,13 +286,23 @@ auto backlog_flow_hash(PacketBuffer* pkt, uint64_t num_cpus) -> uint64_t {
         return h % num_cpus;
     }
 
-    // Non-IPv4: hash source MAC
-    const auto& src = eth->src;
-    uint32_t mac_hash = static_cast<uint32_t>(src.at(0)) | (static_cast<uint32_t>(src.at(1)) << 8) |
-                        (static_cast<uint32_t>(src.at(2)) << 16) | (static_cast<uint32_t>(src.at(3)) << 24);
-    mac_hash ^= static_cast<uint32_t>(src.at(4)) | (static_cast<uint32_t>(src.at(5)) << 8);
-    mac_hash *= 0x9e3779b9U;
-    return mac_hash % num_cpus;
+    auto h = static_cast<uint32_t>(ETHERTYPE);
+    for (size_t i = 0; i < proto::MacAddress::SIZE_BYTES; ++i) {
+        h = mix_hash(h, static_cast<uint32_t>(eth->src.at(i)));
+        h = mix_hash(h, static_cast<uint32_t>(eth->dst.at(i)));
+    }
+
+    if ((ETHERTYPE == proto::ETH_TYPE_WKI || ETHERTYPE == proto::ETH_TYPE_WKI_ROCE) &&
+        pkt->len >= sizeof(proto::EthernetHeader) + sizeof(wki::WkiHeader)) {
+        const auto* hdr = reinterpret_cast<const wki::WkiHeader*>(pkt->data + sizeof(proto::EthernetHeader));
+        h = mix_hash(h, static_cast<uint32_t>(hdr->src_node));
+        h = mix_hash(h, static_cast<uint32_t>(hdr->dst_node));
+        h = mix_hash(h, static_cast<uint32_t>(hdr->channel_id));
+    }
+
+    h *= 0x9e3779b9U;
+    h ^= h >> 16U;
+    return h % num_cpus;
 }
 
 auto backlog_drain_all_pending_inline() -> int {
@@ -262,17 +323,14 @@ auto backlog_drain_all_pending_inline() -> int {
             continue;
         }
 
-        int queue_drained = 0;
-        PacketBuffer* cursor = batch;
-        while (cursor != nullptr) {
-            ++queue_drained;
-            cursor = cursor->next;
-        }
-        drained += queue_drained;
+        PacketBuffer* normal_head = nullptr;
+        PacketBuffer* wki_head = nullptr;
+        int const QUEUE_DRAINED = prepare_backlog_batch(batch, q, normal_head, wki_head);
+        drained += QUEUE_DRAINED;
 
-        q.depth.fetch_sub(static_cast<uint64_t>(queue_drained), std::memory_order_relaxed);
-        process_backlog_batch(batch);
+        process_packet_list(normal_head);
         release_backlog_consumer(q);
+        process_packet_list(wki_head);
     }
 
     return drained;
@@ -295,6 +353,7 @@ void backlog_get_snapshot(BacklogSnapshot& out) {
         row.cpu = i;
         row.queued = q.depth.load(std::memory_order_relaxed);
         row.handler_active = q.handler_active.load(std::memory_order_acquire);
+        row.consumer_active = q.consumer_active.load(std::memory_order_acquire);
         if (q.handler != nullptr) {
             row.handler_pid = q.handler->pid;
             row.handler_cpu = q.handler->cpu;

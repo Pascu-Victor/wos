@@ -958,6 +958,61 @@ inline void remove_from_sums(RunQueue* rq, task::Task* t) {
     rq->cached_load_process.fetch_sub(task_load_for_incoming(t, task::TaskType::PROCESS), std::memory_order_relaxed);
 }
 
+inline auto remove_from_heap_by_scan_locked(RunQueue* rq, task::Task* task) -> bool {
+    if (rq == nullptr || task == nullptr) {
+        return false;
+    }
+
+    for (uint32_t idx = 0; idx < rq->runnable_heap.size; ++idx) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+        if (rq->runnable_heap.entries[static_cast<size_t>(idx)] != task) {
+            continue;
+        }
+
+        task->heap_index = static_cast<int32_t>(idx);
+        remove_from_sums(rq, task);
+        return rq->runnable_heap.remove(task);
+    }
+
+    return false;
+}
+
+inline auto valid_exit_switch_candidate(task::Task const* candidate, task::Task const* exiting_task) -> bool {
+    if (candidate == nullptr || candidate == exiting_task) {
+        return false;
+    }
+    if (candidate->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
+        return false;
+    }
+    if (candidate->type == task::TaskType::IDLE) {
+        return false;
+    }
+    return candidate->type != task::TaskType::PROCESS || (candidate->thread != nullptr && candidate->pagemap != nullptr);
+}
+
+inline auto pick_exit_switch_candidate_locked(RunQueue* rq, task::Task* exiting_task) -> task::Task* {
+    if (rq == nullptr) {
+        return nullptr;
+    }
+
+    while (rq->runnable_heap.size != 0) {
+        int64_t const AVG = compute_avg_vruntime(rq);
+        auto* candidate = rq->runnable_heap.pick_best_eligible(AVG);
+        if (valid_exit_switch_candidate(candidate, exiting_task)) {
+            return candidate;
+        }
+
+        if (!remove_from_heap_by_scan_locked(rq, candidate)) {
+            return nullptr;
+        }
+        if (candidate != nullptr) {
+            candidate->sched_queue = task::Task::sched_queue::NONE;
+        }
+    }
+
+    return nullptr;
+}
+
 inline bool process_has_kernel_resume_frame(const task::Task* t) {
     return t != nullptr && t->type == task::TaskType::PROCESS && (t->context.frame.cs & 0x3ULL) == 0;
 }
@@ -3167,9 +3222,8 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
     task::Task* next_task = run_queues->this_cpu_locked([exiting_task](RunQueue* rq) -> task::Task* {
         // Remove exiting task from wherever it is
         if (exiting_task != nullptr) {
-            if (exiting_task->sched_queue == task::Task::sched_queue::RUNNABLE && rq->runnable_heap.contains(exiting_task)) {
-                remove_from_sums(rq, exiting_task);
-                rq->runnable_heap.remove(exiting_task);
+            while (remove_from_heap_by_scan_locked(rq, exiting_task)) {
+                // Scrub stale duplicate heap membership before picking a successor.
             }
             // The intrusive wait list owns schedNext, so detach by actual
             // membership rather than trusting sched_queue to still be accurate.
@@ -3178,11 +3232,10 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
         }
 
         // Pick next task from heap
-        if (rq->runnable_heap.size == 0) {
+        auto* next = pick_exit_switch_candidate_locked(rq, exiting_task);
+        if (next == nullptr) {
             return nullptr;
         }
-        int64_t const AVG = compute_avg_vruntime(rq);
-        auto* next = rq->runnable_heap.pick_best_eligible(AVG);
         reserve_handoff_task_locked(rq, next, time::get_us());
         return next;
     });
@@ -3841,8 +3894,10 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     record_local_proc_first_run(next_task, WOS_PERF_CALLSITE());
     next_task->has_run = true;
 
+    bool restored_deferred_sigreturn = false;
     if (next_task->type == task::TaskType::PROCESS && !next_task->is_voluntary_blocked()) {
         static_cast<void>(sys::context_switch::repair_stale_process_syscall_resume(next_task));
+        restored_deferred_sigreturn = sys::signal::restore_deferred_sigreturn(next_task) == sys::signal::DeferredSigreturnResult::RESTORED;
     }
 
     // Set up GS/FS for next task
@@ -3879,10 +3934,12 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     asm volatile("cli" ::: "memory");
 
     validate_kernel_resume_target(next_task, "deferred-resume-next");
-    if (next_task == get_current_task()) {
-        sys::signal::check_pending_signals_deferred(next_task, sys::signal::DeferredSignalDelivery::FULL);
-    } else if (next_task == get_return_task()) {
-        sys::signal::check_pending_signals_deferred(next_task, sys::signal::DeferredSignalDelivery::USER_HANDLERS_ONLY);
+    if (!restored_deferred_sigreturn) {
+        if (next_task == get_current_task()) {
+            sys::signal::check_pending_signals_deferred(next_task, sys::signal::DeferredSignalDelivery::FULL);
+        } else if (next_task == get_return_task()) {
+            sys::signal::check_pending_signals_deferred(next_task, sys::signal::DeferredSignalDelivery::USER_HANDLERS_ONLY);
+        }
     }
 
     // Restore incoming task's FPU/SSE/AVX state (PROCESS tasks only).

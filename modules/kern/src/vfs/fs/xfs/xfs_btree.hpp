@@ -297,6 +297,9 @@ class XfsBtreeCursor {
     // For AG btrees: which AG and its start block
     xfs_agnumber_t agno{};
 
+    // For long-form inode-owned btrees, such as bmbt.
+    uint64_t owner{};
+
     XfsBtreeCursor() {
         for (auto& l : levels) {
             l.bp = nullptr;

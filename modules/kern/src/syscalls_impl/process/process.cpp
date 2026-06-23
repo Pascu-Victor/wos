@@ -1358,7 +1358,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
     switch (op) {
         case abi::process::procmgmt_ops::EXIT:
             wos_proc_exit(static_cast<int>(a2));
-            return 0;  // Should not reach here
+            __builtin_unreachable();
         case abi::process::procmgmt_ops::EXEC: {
             return wos_proc_exec(reinterpret_cast<const char*>(a2), reinterpret_cast<const char* const*>(a3),
                                  reinterpret_cast<const char* const*>(a4));

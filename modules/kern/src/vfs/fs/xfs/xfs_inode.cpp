@@ -80,6 +80,26 @@ auto perf_elapsed_since_us(uint64_t started_us) -> uint32_t {
     return ELAPSED_US > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(ELAPSED_US);
 }
 
+auto extent_record_capacity(size_t fork_size) -> uint32_t {
+    size_t const CAPACITY = fork_size / sizeof(XfsBmbtRec);
+    return CAPACITY > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(CAPACITY);
+}
+
+auto data_fork_size_for_write(const XfsInode* ip, size_t inode_core_size) -> size_t {
+    if (ip == nullptr || ip->mount == nullptr || ip->mount->inode_size <= inode_core_size) {
+        return 0;
+    }
+    size_t const INODE_TOTAL = ip->mount->inode_size;
+    if (ip->forkoff == 0) {
+        return INODE_TOTAL - inode_core_size;
+    }
+    size_t const ATTR_FORK_START = inode_core_size + (static_cast<size_t>(ip->forkoff) << 3U);
+    if (ATTR_FORK_START < inode_core_size || ATTR_FORK_START > INODE_TOTAL) {
+        return 0;
+    }
+    return ATTR_FORK_START - inode_core_size;
+}
+
 void perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp op, uint64_t started_us, int32_t status, uint64_t bytes) {
     if (started_us == 0) {
         return;
@@ -285,7 +305,7 @@ auto free_inode_extent_records(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIr
 }
 
 auto free_inode_data_extents(XfsInode* ip, XfsTransaction* tp) -> int {
-    if (ip == nullptr || ip->nblocks == 0 || ip->data_fork.format == XFS_DINODE_FMT_LOCAL) {
+    if (ip == nullptr || ip->data_fork.format == XFS_DINODE_FMT_LOCAL) {
         return 0;
     }
 
@@ -299,22 +319,26 @@ auto free_inode_data_extents(XfsInode* ip, XfsTransaction* tp) -> int {
     if (ip->data_fork.format != XFS_DINODE_FMT_BTREE) {
         return 0;
     }
-    if (ip->nextents == 0) {
-        return 0;
+
+    int rc = 0;
+    if (ip->nextents != 0) {
+        auto* extents = new (std::nothrow) XfsBmbtIrec[ip->nextents];
+        if (extents == nullptr) {
+            return -ENOMEM;
+        }
+
+        rc = xfs_bmap_list_extents(ip, extents, ip->nextents);
+        if (rc >= 0) {
+            rc = free_inode_extent_records(ip, tp, extents, static_cast<uint32_t>(rc));
+        }
+
+        delete[] extents;
+        if (rc < 0) {
+            return rc;
+        }
     }
 
-    auto* extents = new (std::nothrow) XfsBmbtIrec[ip->nextents];
-    if (extents == nullptr) {
-        return -ENOMEM;
-    }
-
-    int rc = xfs_bmap_list_extents(ip, extents, ip->nextents);
-    if (rc >= 0) {
-        rc = free_inode_extent_records(ip, tp, extents, static_cast<uint32_t>(rc));
-    }
-
-    delete[] extents;
-    return rc;
+    return xfs_bmap_free_btree_blocks(ip, tp);
 }
 
 auto inactivate_unlinked_inode(XfsInode* ip) -> int {
@@ -451,9 +475,17 @@ auto parse_ifork(XfsIfork* fork, uint8_t fmt, const uint8_t* data_ptr, size_t da
         }
 
         case XFS_DINODE_FMT_EXTENTS: {
+            uint32_t const CAPACITY = extent_record_capacity(data_size);
+            if (nextents > CAPACITY) {
+                mod::dbg::log("[xfs] inode fork extents exceed inline capacity: nextents=%u capacity=%u data_size=%lu", nextents, CAPACITY,
+                              static_cast<unsigned long>(data_size));
+                return -EFBIG;
+            }
             fork->extents.count = nextents;
+            fork->extents.capacity = nextents;
             if (nextents == 0) {
                 fork->extents.list = nullptr;
+                fork->extents.capacity = 0;
                 break;
             }
             fork->extents.list = new (std::nothrow) XfsBmbtIrec[nextents];
@@ -609,6 +641,64 @@ auto xfs_inode_truncate_data(XfsInode* ip, XfsTransaction* tp) -> int {
     return 0;
 }
 
+auto xfs_inode_trim_data_to_size(XfsInode* ip, XfsTransaction* tp, uint64_t new_size) -> int {
+    if (ip == nullptr || ip->mount == nullptr || tp == nullptr) {
+        return -EINVAL;
+    }
+    if (ip->data_fork.format != XFS_DINODE_FMT_EXTENTS || ip->data_fork.extents.count == 0) {
+        return 0;
+    }
+
+    XfsIforkExtents& extents = ip->data_fork.extents;
+    if (extents.list == nullptr) {
+        return -EIO;
+    }
+
+    auto* mount = ip->mount;
+    auto const KEEP_BLOCKS = static_cast<xfs_fileoff_t>((new_size + mount->block_size - 1) >> mount->block_log);
+    uint64_t freed_blocks = 0;
+
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < extents.count; ++i) {
+        XfsBmbtIrec rec = extents.list[i];
+        xfs_fileoff_t const REC_END = rec.br_startoff + rec.br_blockcount;
+        if (rec.br_startoff >= KEEP_BLOCKS) {
+            int const RC = free_inode_data_extent(ip, tp, rec.br_startblock, rec.br_blockcount);
+            if (RC != 0) {
+                return RC;
+            }
+            freed_blocks += rec.br_blockcount;
+            continue;
+        }
+
+        if (REC_END > KEEP_BLOCKS) {
+            auto const KEEP_LEN = static_cast<xfs_filblks_t>(KEEP_BLOCKS - rec.br_startoff);
+            xfs_filblks_t const FREE_LEN = rec.br_blockcount - KEEP_LEN;
+            xfs_fsblock_t const FREE_START = rec.br_startblock + KEEP_LEN;
+            int const RC = free_inode_data_extent(ip, tp, FREE_START, FREE_LEN);
+            if (RC != 0) {
+                return RC;
+            }
+            rec.br_blockcount = KEEP_LEN;
+            freed_blocks += FREE_LEN;
+        }
+
+        if (rec.br_blockcount != 0) {
+            extents.list[out++] = rec;
+        }
+    }
+
+    if (freed_blocks == 0) {
+        return 0;
+    }
+
+    extents.count = out;
+    ip->nextents = out;
+    ip->nblocks = ip->nblocks > freed_blocks ? ip->nblocks - freed_blocks : 0;
+    ip->dirty = true;
+    return 0;
+}
+
 auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
     uint64_t const PERF_FETCH_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::INODE_FETCH);
     auto finish_inode_fetch = [&](XfsInode* result, int32_t status) -> XfsInode* {
@@ -749,6 +839,14 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
     size_t const INODE_TOTAL = mount->inode_size;
     size_t const DATA_FORK_START = INODE_CORE_SIZE;
     size_t const ATTR_FORK_START = (dip->di_forkoff != 0) ? xfs_dinode_attr_fork_off(dip) : INODE_TOTAL;
+    if (INODE_CORE_SIZE > INODE_TOTAL || ATTR_FORK_START < DATA_FORK_START || ATTR_FORK_START > INODE_TOTAL) {
+        mod::dbg::log("[xfs] inode %lu: invalid fork geometry core=%lu attr=%lu total=%lu", static_cast<unsigned long>(ino),
+                      static_cast<unsigned long>(INODE_CORE_SIZE), static_cast<unsigned long>(ATTR_FORK_START),
+                      static_cast<unsigned long>(INODE_TOTAL));
+        brelse(bh);
+        delete ip;
+        return finish_inode_fetch(nullptr, -EINVAL);
+    }
     size_t const DATA_FORK_SIZE = ATTR_FORK_START - DATA_FORK_START;
     size_t const ATTR_FORK_SIZE = INODE_TOTAL - ATTR_FORK_START;
 
@@ -886,6 +984,14 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
     }
 
     auto* dip = reinterpret_cast<XfsDinode*>(bh->data + OFFSET);
+    __builtin_memset(dip, 0, mount->inode_size);
+
+    dip->di_magic = Be16::from_cpu(XFS_DINODE_MAGIC);
+    dip->di_version = 3;
+    dip->di_metatype = Be16::from_cpu(0);
+    dip->di_next_unlinked = Be32::from_cpu(UINT32_MAX);
+    dip->di_ino = Be64::from_cpu(ip->ino);
+    __builtin_memcpy(&dip->di_uuid, &mount->uuid, sizeof(XfsUuidT));
 
     // Serialize core fields back to on-disk format
     dip->di_mode = Be16::from_cpu(ip->mode);
@@ -919,16 +1025,38 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
 
     // Serialize data fork
     size_t const INODE_CORE_SIZE = xfs_dinode_size(dip->di_version);
+    size_t const DATA_FORK_SIZE = data_fork_size_for_write(ip, INODE_CORE_SIZE);
+    if (INODE_CORE_SIZE > mount->inode_size ||
+        (DATA_FORK_SIZE == 0 && (ip->data_fork.format != XFS_DINODE_FMT_EXTENTS || ip->data_fork.extents.count != 0))) {
+        brelse(bh);
+        return -EFBIG;
+    }
     uint8_t* fork_data = bh->data + OFFSET + INODE_CORE_SIZE;
+    __builtin_memset(fork_data, 0, mount->inode_size - INODE_CORE_SIZE);
 
     switch (ip->data_fork.format) {
         case XFS_DINODE_FMT_LOCAL:
+            if (ip->data_fork.local.size > DATA_FORK_SIZE) {
+                brelse(bh);
+                return -EFBIG;
+            }
             if (ip->data_fork.local.data != nullptr && ip->data_fork.local.size > 0) {
                 __builtin_memcpy(fork_data, ip->data_fork.local.data, ip->data_fork.local.size);
             }
             break;
 
         case XFS_DINODE_FMT_EXTENTS: {
+            uint32_t const CAPACITY = extent_record_capacity(DATA_FORK_SIZE);
+            if (ip->data_fork.extents.count > CAPACITY) {
+                mod::dbg::log("[xfs] inode %lu: %u extents exceed inline capacity %u", static_cast<unsigned long>(ip->ino),
+                              ip->data_fork.extents.count, CAPACITY);
+                brelse(bh);
+                return -EFBIG;
+            }
+            if (ip->data_fork.extents.count != 0 && ip->data_fork.extents.list == nullptr) {
+                brelse(bh);
+                return -EIO;
+            }
             auto* recs = reinterpret_cast<XfsBmbtRec*>(fork_data);
             for (uint32_t i = 0; i < ip->data_fork.extents.count; i++) {
                 recs[i] = xfs_bmbt_rec_pack(ip->data_fork.extents.list[i]);
@@ -938,6 +1066,10 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
 
         case XFS_DINODE_FMT_BTREE:
             // Copy the btree root data back
+            if (ip->data_fork.btree.root_size > DATA_FORK_SIZE) {
+                brelse(bh);
+                return -EFBIG;
+            }
             if (ip->data_fork.btree.root != nullptr && ip->data_fork.btree.root_size > 0) {
                 __builtin_memcpy(fork_data, ip->data_fork.btree.root, ip->data_fork.btree.root_size);
             }
@@ -951,16 +1083,34 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
     if (ip->has_attr_fork && ip->forkoff > 0) {
         dip->di_aformat = static_cast<int8_t>(ip->attr_fork.format);
         size_t const ATTR_FORK_OFFSET = static_cast<size_t>(ip->forkoff) << 3;
+        if (INODE_CORE_SIZE + ATTR_FORK_OFFSET > mount->inode_size) {
+            brelse(bh);
+            return -EFBIG;
+        }
         uint8_t* attr_data = fork_data + ATTR_FORK_OFFSET;
+        size_t const ATTR_FORK_SIZE = mount->inode_size - INODE_CORE_SIZE - ATTR_FORK_OFFSET;
 
         switch (ip->attr_fork.format) {
             case XFS_DINODE_FMT_LOCAL:
+                if (ip->attr_fork.local.size > ATTR_FORK_SIZE) {
+                    brelse(bh);
+                    return -EFBIG;
+                }
                 if (ip->attr_fork.local.data != nullptr && ip->attr_fork.local.size > 0) {
                     __builtin_memcpy(attr_data, ip->attr_fork.local.data, ip->attr_fork.local.size);
                 }
                 break;
 
             case XFS_DINODE_FMT_EXTENTS: {
+                uint32_t const CAPACITY = extent_record_capacity(ATTR_FORK_SIZE);
+                if (ip->attr_fork.extents.count > CAPACITY) {
+                    brelse(bh);
+                    return -EFBIG;
+                }
+                if (ip->attr_fork.extents.count != 0 && ip->attr_fork.extents.list == nullptr) {
+                    brelse(bh);
+                    return -EIO;
+                }
                 auto* recs = reinterpret_cast<XfsBmbtRec*>(attr_data);
                 for (uint32_t i = 0; i < ip->attr_fork.extents.count; i++) {
                     recs[i] = xfs_bmbt_rec_pack(ip->attr_fork.extents.list[i]);
@@ -969,6 +1119,10 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
             }
 
             case XFS_DINODE_FMT_BTREE:
+                if (ip->attr_fork.btree.root_size > ATTR_FORK_SIZE) {
+                    brelse(bh);
+                    return -EFBIG;
+                }
                 if (ip->attr_fork.btree.root != nullptr && ip->attr_fork.btree.root_size > 0) {
                     __builtin_memcpy(attr_data, ip->attr_fork.btree.root, ip->attr_fork.btree.root_size);
                 }

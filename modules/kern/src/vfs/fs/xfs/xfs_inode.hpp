@@ -132,6 +132,10 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int;
 // Caller must hold the inode's I/O lock and commit the supplied transaction.
 auto xfs_inode_truncate_data(XfsInode* ip, XfsTransaction* tp) -> int;
 
+// Free whole blocks past new_size for inline extent-format regular files.
+// Caller must hold the inode's I/O lock and log/commit the supplied transaction.
+auto xfs_inode_trim_data_to_size(XfsInode* ip, XfsTransaction* tp, uint64_t new_size) -> int;
+
 // Initialize the inode cache (call once at mount time).
 void xfs_icache_init();
 

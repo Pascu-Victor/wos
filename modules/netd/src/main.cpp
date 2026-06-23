@@ -70,6 +70,8 @@ constexpr uint32_t DHCP_RENEWAL_RETRY_SECS = 60;
 constexpr uint32_t USEC_PER_SEC = 1000000;
 constexpr size_t MAX_DNS_SERVERS = 3;
 constexpr auto RESOLVER_OPTIONS = "options timeout:2 attempts:4\n";
+constexpr auto RESOLV_CONF_PATH = "/etc/resolv.conf";
+constexpr auto RESOLV_CONF_TMP_PATH = "/etc/resolv.conf.tmp";
 
 #ifndef SO_BINDTODEVICE
 constexpr int SO_BINDTODEVICE = 25;
@@ -380,7 +382,7 @@ auto decode_domain_search_option(std::span<char> dest, const uint8_t* data, size
 }
 
 void write_resolv_conf(const DhcpLease& lease) {
-    FILE* file = fopen("/etc/resolv.conf", "w");
+    FILE* file = fopen(RESOLV_CONF_TMP_PATH, "w");
     if (file == nullptr) {
         logger::warn("netd: failed to update /etc/resolv.conf: %d", errno);
         return;
@@ -406,7 +408,20 @@ void write_resolv_conf(const DhcpLease& lease) {
         fprintf(file, "domain %s\n", lease.domain_name.data());
     }
 
-    fclose(file);
+    bool ok = ferror(file) == 0;
+    if (fclose(file) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        logger::warn("netd: failed to write %s: %d", RESOLV_CONF_TMP_PATH, errno);
+        unlink(RESOLV_CONF_TMP_PATH);
+        return;
+    }
+
+    if (rename(RESOLV_CONF_TMP_PATH, RESOLV_CONF_PATH) != 0) {
+        logger::warn("netd: failed to replace %s: %d", RESOLV_CONF_PATH, errno);
+        unlink(RESOLV_CONF_TMP_PATH);
+    }
 }
 
 auto build_discover(DhcpPacket* pkt, std::span<const uint8_t, 6> mac, uint32_t xid, const char* hostname, const char* fqdn) -> size_t {

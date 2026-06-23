@@ -129,6 +129,8 @@ struct TcpCB {
     TcpOutOfOrderSegment* ooo_head = nullptr;
     size_t ooo_allocated_bytes = 0;
     std::atomic<size_t> ooo_bytes{0};
+    bool ooo_fin_pending = false;
+    uint32_t ooo_fin_seq = 0;
     uint64_t ooo_ack_deadline = 0;
     uint8_t ooo_ack_probes = 0;
 

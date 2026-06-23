@@ -104,8 +104,12 @@ template <size_t slab_size, size_t memory_size>
 auto Slab<slab_size, memory_size>::alloc_unlocked() -> void* {
     Slab* slab = this;
     while (slab != nullptr) {
-        assert(slab->header.magic == MAGIC);
-        assert(slab->header.size == slab_size);
+        if (slab->header.magic != MAGIC || slab->header.size != slab_size) {
+            ker::mod::dbg::log("slab: corrupt header slab=%p magic=0x%x size=%u expected_size=%zu free_blocks=%zu prev=%p next=%p", slab,
+                               slab->header.magic, slab->header.size, slab_size, slab->header.free_blocks, slab->header.prev,
+                               slab->header.next);
+            ker::mod::dbg::panic_handler("slab: corrupt slab header");
+        }
 
         auto block_index = static_cast<size_t>(-1);
         if (slab->header.free_blocks) {
@@ -300,32 +304,11 @@ void Slab<slab_size, memory_size>::free_from_current_slab(size_t block_index) {
     header.next_fit_block = block_index;
     header.free_blocks++;
 
-    // If slab is completely free and it's not the first slab, return it to OS
-    if ((header.free_blocks == MAX_BLOCKS) && (header.prev)) {
-        // detach from list and free pages
-        if (header.next) {
-            // Unlink from middle
-            header.next->header.prev = header.prev;
-            header.prev->header.next = header.next;
-        } else {
-            // Tail slab, simple unlink
-            header.prev->header.next = nullptr;
-        }
-#ifdef SLAB_DEBUG
-        ker::mod::dbg::log("slab: freeing empty slab %p (size=%d)", this, static_cast<unsigned long>(slab_size));
-#endif
-        // free diagnostic arrays if allocated
-        if (header.last_free_caller) {
-            free_memory_to_os(header.last_free_caller, sizeof(uintptr_t) * MAX_BLOCKS);
-            header.last_free_caller = nullptr;
-        }
-        if (header.free_count) {
-            free_memory_to_os(header.free_count, sizeof(unsigned int) * MAX_BLOCKS);
-            header.free_count = nullptr;
-        }
-        free_memory_to_os(this, sizeof(Slab));
-        // The slab committed suicide, don't ever use it again!
-    }
+    // Keep empty slabs attached to their size class. The small-allocation fast
+    // path can defer frees in per-CPU magazines; retaining the slab page avoids
+    // handing a page back to the buddy allocator while stale small-allocation
+    // pointers may still be diagnosed or flushed later. A future shrinker can
+    // reclaim fully empty slabs at a quiescent point.
 }
 
 template <size_t slab_size, size_t memory_size>

@@ -20,13 +20,25 @@ constexpr size_t TCP_SYN_OPTIONS_LEN = 12;
 constexpr size_t TCP_ACK_SACK_OPTIONS_LEN = 12;
 
 auto write_sack_option_locked(const TcpCB* cb, uint8_t* options, size_t capacity) -> size_t {
-    if (cb == nullptr || options == nullptr || capacity < TCP_ACK_SACK_OPTIONS_LEN || !cb->sack_permitted || cb->ooo_head == nullptr) {
+    if (cb == nullptr || options == nullptr || capacity < TCP_ACK_SACK_OPTIONS_LEN || !cb->sack_permitted) {
         return 0;
     }
 
-    const auto* seg = cb->ooo_head;
-    uint32_t const LEFT_EDGE = htonl(seg->seq);
-    uint32_t const RIGHT_EDGE = htonl(seg->seq + static_cast<uint32_t>(seg->len));
+    uint32_t left_edge = 0;
+    uint32_t right_edge = 0;
+    if (cb->ooo_head != nullptr) {
+        const auto* seg = cb->ooo_head;
+        left_edge = seg->seq;
+        right_edge = seg->seq + static_cast<uint32_t>(seg->len);
+    } else if (cb->ooo_fin_pending) {
+        left_edge = cb->ooo_fin_seq;
+        right_edge = cb->ooo_fin_seq + 1;
+    } else {
+        return 0;
+    }
+
+    uint32_t const LEFT_EDGE = htonl(left_edge);
+    uint32_t const RIGHT_EDGE = htonl(right_edge);
 
     options[0] = TCP_OPTION_NOP;
     options[1] = TCP_OPTION_NOP;

@@ -3,12 +3,36 @@ cmake_minimum_required(VERSION 3.20)
 set(CMAKE_C_COMPILER_WORKS ON)
 set(CMAKE_CXX_COMPILER_WORKS ON)
 
-# Set paths to host tools and target sysroot
-set(HOST_PATH ${CMAKE_SOURCE_DIR}/toolchain/host)
-set(WOS_SYSROOT_PATH "${CMAKE_SOURCE_DIR}/toolchain/sysroot" CACHE PATH "WOS target sysroot")
+# Set paths to host tools and target sysroot. This file is used both from the
+# repo root and directly via `cmake -S modules`, so derive paths from this file.
+get_filename_component(WOS_REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+set(WOS_MODULES_DIR "${CMAKE_CURRENT_LIST_DIR}")
+set(HOST_PATH ${WOS_REPO_ROOT}/toolchain/host)
+set(WOS_NATIVE_SYSTEM_BUILD OFF CACHE BOOL "Build modules with the native WOS system toolchain")
+if((DEFINED ENV{WOS_NATIVE_HOST} AND "$ENV{WOS_NATIVE_HOST}" STREQUAL "1") OR CMAKE_HOST_SYSTEM_NAME STREQUAL "WOS")
+    set(WOS_NATIVE_SYSTEM_BUILD ON CACHE BOOL "Build modules with the native WOS system toolchain" FORCE)
+endif()
+
+if(WOS_NATIVE_SYSTEM_BUILD)
+    set(WOS_DEFAULT_SYSROOT_PATH "/")
+else()
+    set(WOS_DEFAULT_SYSROOT_PATH "${WOS_REPO_ROOT}/toolchain/sysroot")
+endif()
+set(WOS_SYSROOT_PATH "${WOS_DEFAULT_SYSROOT_PATH}" CACHE PATH "WOS target sysroot")
+if(WOS_NATIVE_SYSTEM_BUILD AND WOS_SYSROOT_PATH STREQUAL "${WOS_REPO_ROOT}/toolchain/sysroot")
+    set(WOS_SYSROOT_PATH "/" CACHE PATH "WOS target sysroot" FORCE)
+endif()
 set(SYSROOT_PATH ${WOS_SYSROOT_PATH})
-set(CMAKE_C_COMPILER "${HOST_PATH}/bin/clang" CACHE INTERNAL "Path to clang")
-set(CMAKE_CXX_COMPILER "${HOST_PATH}/bin/clang++" CACHE INTERNAL "Path to clang++")
+if(WOS_NATIVE_SYSTEM_BUILD)
+    find_program(WOS_SYSTEM_C_COMPILER NAMES clang cc REQUIRED)
+    find_program(WOS_SYSTEM_CXX_COMPILER NAMES clang++ c++ REQUIRED)
+    find_program(WOS_SYSTEM_LINKER NAMES ld.lld lld REQUIRED)
+    set(CMAKE_C_COMPILER "${WOS_SYSTEM_C_COMPILER}" CACHE FILEPATH "Path to native WOS C compiler" FORCE)
+    set(CMAKE_CXX_COMPILER "${WOS_SYSTEM_CXX_COMPILER}" CACHE FILEPATH "Path to native WOS C++ compiler" FORCE)
+else()
+    set(CMAKE_C_COMPILER "${HOST_PATH}/bin/clang" CACHE INTERNAL "Path to clang" FORCE)
+    set(CMAKE_CXX_COMPILER "${HOST_PATH}/bin/clang++" CACHE INTERNAL "Path to clang++" FORCE)
+endif()
 set(CMAKE_LINKER_TYPE "LLD")
 option(WOS_USE_CCACHE "Use ccache/cccache as a compiler launcher when available" ON)
 set(WOS_CCACHE_PROGRAM "" CACHE FILEPATH "Path to ccache/cccache")
@@ -20,12 +44,15 @@ if(WOS_USE_CCACHE AND WOS_CCACHE_PROGRAM)
     set(CMAKE_CXX_COMPILER_LAUNCHER "${WOS_CCACHE_PROGRAM}" CACHE STRING "C++ compiler launcher" FORCE)
 endif()
 
-# Configure sysroot for cross-compilation
+# Configure sysroot for cross-compilation. Native WOS builds still use `/` as
+# the sysroot but should not force CMake's find logic into the checked-out tree.
 set(CMAKE_SYSROOT "${SYSROOT_PATH}")
-set(CMAKE_FIND_ROOT_PATH "${SYSROOT_PATH}")
-set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
-set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
-set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+if(NOT WOS_NATIVE_SYSTEM_BUILD)
+    set(CMAKE_FIND_ROOT_PATH "${SYSROOT_PATH}")
+    set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+    set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+    set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 project(wos_modules C CXX ASM_NASM)
@@ -39,14 +66,23 @@ option(WOS_USERSPACE_COVERAGE "Enable LLVM source-based coverage instrumentation
 option(WOS_DYNAMIC_USERSPACE_PIE "Build dynamic WOS userspace executables as PIE" OFF)
 option(WOS_DYNAMIC_USERSPACE_NO_PLT "Use GOT calls instead of PLT stubs for dynamic WOS userspace executables" OFF)
 
+set(WOS_SYSROOT_COMPILE_OPTIONS "--sysroot=${SYSROOT_PATH}")
+if(WOS_NATIVE_SYSTEM_BUILD)
+    set(WOS_CXX_STDLIB_INCLUDE "/usr/include/c++/v1")
+    set(WOS_STDLIB_LINK_DIR "/usr/lib")
+else()
+    set(WOS_CXX_STDLIB_INCLUDE "${SYSROOT_PATH}/include/c++/v1")
+    set(WOS_STDLIB_LINK_DIR "${SYSROOT_PATH}/lib")
+endif()
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options(
     # Common flags for C and C++
-    "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-O3;-g;-flto;-fdiagnostics-color=always;-fno-stack-protector;-fno-stack-check;-fno-sanitize=safe-stack;-pipe;-Wall;-Wextra;-pedantic;-Wno-gnu-anonymous-struct;-Wno-c99-extensions;-Wno-zero-length-array;-m64;-march=native;-Wformat;-Wformat-security;-Werror=format-security;--sysroot=${SYSROOT_PATH};-fno-omit-frame-pointer>"
+    "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-O3;-g;-flto;-fdiagnostics-color=always;-fno-stack-protector;-fno-stack-check;-fno-sanitize=safe-stack;-pipe;-Wall;-Wextra;-pedantic;-Wno-gnu-anonymous-struct;-Wno-c99-extensions;-Wno-zero-length-array;-m64;-march=native;-Wformat;-Wformat-security;-Werror=format-security;${WOS_SYSROOT_COMPILE_OPTIONS};-fno-omit-frame-pointer>"
     # C-specific flags
     "$<$<COMPILE_LANGUAGE:C>:-std=gnu11>"
     # C++-specific flags
-    "$<$<COMPILE_LANGUAGE:CXX>:-std=c++23;-isystem;${SYSROOT_PATH}/include/c++/v1>"
+    "$<$<COMPILE_LANGUAGE:CXX>:-std=c++23;-isystem;${WOS_CXX_STDLIB_INCLUDE}>"
     # NASM flags
     "$<$<COMPILE_LANGUAGE:ASM_NASM>:-g;-Wall;-felf64;-Isrc;-w-reloc-abs-qword;-w-reloc-rel-dword>"
 )
@@ -55,14 +91,18 @@ add_compile_options(
 set(WOS_BASE_LINK_OPTIONS
     "--sysroot=${SYSROOT_PATH}"
     "-fuse-ld=lld"
-    "-L${SYSROOT_PATH}/lib"
+    "-L${WOS_STDLIB_LINK_DIR}"
     "-std=c++23"
     "-flto"
 )
 add_link_options(${WOS_BASE_LINK_OPTIONS})
 
-# Set the linker to use from host tools
-set(CMAKE_LINKER "${HOST_PATH}/bin/ld.lld" CACHE INTERNAL "Path to lld linker")
+# Set the linker to use from the selected toolchain
+if(WOS_NATIVE_SYSTEM_BUILD)
+    set(CMAKE_LINKER "${WOS_SYSTEM_LINKER}" CACHE FILEPATH "Path to native WOS lld linker" FORCE)
+else()
+    set(CMAKE_LINKER "${HOST_PATH}/bin/ld.lld" CACHE INTERNAL "Path to lld linker" FORCE)
+endif()
 
 #set target
 set(TARGET wos_modules)
@@ -172,7 +212,7 @@ function(wos_make_target_dynamic_user_executable user_target)
         list(REMOVE_ITEM existing_link_options
             "-static"
             "-Wl,--no-dynamic-linker"
-            "-Wl,-T,${CMAKE_SOURCE_DIR}/modules/init/service.ld"
+            "-Wl,-T,${WOS_MODULES_DIR}/init/service.ld"
         )
         if(WOS_DYNAMIC_USERSPACE_PIE)
             list(REMOVE_ITEM existing_link_options "-no-pie")

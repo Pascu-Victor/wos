@@ -2812,6 +2812,8 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, row.handler_cpu);
         append_sconst(p, end, " active=");
         append_bool01(p, end, row.handler_active);
+        append_sconst(p, end, " consumer=");
+        append_bool01(p, end, row.consumer_active);
         append_char(p, end, '\n');
     }
 

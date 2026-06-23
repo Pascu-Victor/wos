@@ -19,6 +19,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/signal.hpp>
+#include <util/hcf.hpp>
 #include <vfs/vfs.hpp>
 
 #include "platform/sched/task.hpp"
@@ -286,10 +287,11 @@ void cleanup_signal_handlers_for_exit(ker::mod::sched::task::Task* task) {
 
 namespace {
 
-void wos_proc_exit_with_wait_status(int status, int wait_status) {
+[[noreturn]] void wos_proc_exit_with_wait_status(int status, int wait_status) {
     auto* current_task = ker::mod::sched::get_current_task();
     if (current_task == nullptr) {
-        return;
+        log::error("process exit without current task: status=%d wait_status=%d", status, wait_status);
+        hcf();
     }
     uint32_t const EXIT_CORR = ker::mod::perf::next_wki_trace_correlation();
     uint64_t const EXIT_STARTED_US = ker::mod::time::get_us();
@@ -489,12 +491,12 @@ void wos_proc_exit_with_wait_status(int status, int wait_status) {
 
 }  // namespace
 
-void wos_proc_exit(int status) {
+[[noreturn]] void wos_proc_exit(int status) {
     // Store normal process exits in POSIX waitpid format.
     wos_proc_exit_with_wait_status(status, (status & 0xff) << 8);
 }
 
-void wos_proc_exit_signal(int signo) {
+[[noreturn]] void wos_proc_exit_signal(int signo) {
     // A shell turns WIFSIGNALED(status)/WTERMSIG(status) into "$? = 128 + signo".
     wos_proc_exit_with_wait_status(128 + signo, signo & 0x7f);
 }

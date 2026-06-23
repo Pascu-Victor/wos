@@ -145,6 +145,29 @@ auto init_inode_chunk(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     return 0;
 }
 
+auto init_allocated_dinode(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int {
+    auto const AGNO = static_cast<xfs_agnumber_t>(ino >> mount->agino_log);
+    auto const AGINO = static_cast<xfs_agino_t>(ino & ((1ULL << mount->agino_log) - 1));
+    xfs_agblock_t const AGBNO = AGINO / mount->inodes_per_block;
+    xfs_fsblock_t const FSBNO = xfs_agbno_to_fsbno(AGNO, AGBNO, mount->ag_blk_log);
+    size_t const OFFSET = static_cast<size_t>(AGINO % mount->inodes_per_block) * mount->inode_size;
+
+    BufHead* bh = xfs_buf_read(mount, FSBNO);
+    if (bh == nullptr) {
+        return -EIO;
+    }
+    if (OFFSET + mount->inode_size > bh->size) {
+        brelse(bh);
+        return -EIO;
+    }
+
+    auto* dip = reinterpret_cast<XfsDinode*>(bh->data + OFFSET);
+    init_free_dinode(mount, dip, ino);
+    xfs_trans_log_buf(tp, bh, static_cast<uint32_t>(OFFSET), static_cast<uint32_t>(mount->inode_size));
+    brelse(bh);
+    return 0;
+}
+
 auto allocate_inode_chunk(XfsMountContext* mount, XfsTransaction* tp) -> xfs_ino_t {
     xfs_extlen_t const CHUNK_BLOCKS = inode_chunk_blocks(mount);
     if (CHUNK_BLOCKS == 0) {
@@ -312,7 +335,11 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
                 pag->agi_freecount--;
                 log_agi_state(mount, tp, agno, AGINO, true);
 
-                // 6. On-disk inode initialization happens via xfs_inode_write() at commit
+                // 6. Ensure the inode buffer has a valid dinode core before
+                // any directory entry can point at it.
+                if (init_allocated_dinode(mount, tp, INO) != 0) {
+                    return NULLFSINO;
+                }
 #ifdef XFS_DEBUG
                 mod::dbg::log("[xfs ialloc] allocated inode %lu (AG %u agino %u)\n", static_cast<unsigned long>(ino), agno, agino);
 #endif

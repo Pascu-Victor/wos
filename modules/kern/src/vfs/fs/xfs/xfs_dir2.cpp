@@ -1148,6 +1148,34 @@ auto dir2_device_blkno(const XfsMountContext* ctx, xfs_fsblock_t disk_block) -> 
     return LINEAR * RATIO;
 }
 
+void dir2_set_sequential_alloc_hint(XfsInode* dp, xfs_fileoff_t file_block, XfsAllocReq* req) {
+    if (dp == nullptr || dp->mount == nullptr || req == nullptr || dp->data_fork.format != XFS_DINODE_FMT_EXTENTS) {
+        return;
+    }
+
+    XfsIforkExtents const& extents = dp->data_fork.extents;
+    if (extents.list == nullptr || extents.count == 0) {
+        return;
+    }
+
+    XfsMountContext const* ctx = dp->mount;
+    for (uint32_t i = extents.count; i > 0; --i) {
+        XfsBmbtIrec const& ext = extents.list[i - 1];
+        if (ext.br_startoff + ext.br_blockcount != file_block) {
+            continue;
+        }
+
+        xfs_fsblock_t const NEXT_FSB = ext.br_startblock + ext.br_blockcount;
+        xfs_agnumber_t const AGNO = xfs_ag_number(NEXT_FSB, ctx->ag_blk_log);
+        xfs_agblock_t const AGBNO = xfs_ag_block(NEXT_FSB, ctx->ag_blk_log);
+        if (AGNO < ctx->ag_count && AGBNO < ctx->ag_blocks) {
+            req->agno = AGNO;
+            req->agbno = AGBNO;
+        }
+        return;
+    }
+}
+
 void dir2_init_data_header(XfsInode* dp, xfs_fsblock_t disk_block, uint32_t magic, uint8_t* block) {
     auto* hdr = reinterpret_cast<XfsDir3DataHdr*>(block);
     hdr->hdr.magic = Be32::from_cpu(magic);
@@ -1180,6 +1208,7 @@ auto dir2_alloc_mapped_dir_block(XfsInode* dp, XfsTransaction* tp, xfs_fileoff_t
     req.minlen = FBS;
     req.maxlen = FBS;
     req.alignment = 0;
+    dir2_set_sequential_alloc_hint(dp, file_block, &req);
 
     XfsAllocResult alloc_result{};
     int rc = xfs_alloc_extent(ctx, tp, req, &alloc_result);

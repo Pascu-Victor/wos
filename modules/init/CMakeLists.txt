@@ -42,7 +42,7 @@ target_link_options(${TARGET} PRIVATE
     "-static"
     "-mcmodel=small"
     "-Wl,-z,now"        # bind-now: resolve all PLT entries at load time
-    "-Wl,-T,${CMAKE_SOURCE_DIR}/modules/init/service.ld"
+    "-Wl,-T,${WOS_MODULES_DIR}/init/service.ld"
 )
 
 target_link_libraries(${TARGET} PRIVATE

@@ -707,7 +707,8 @@ struct VfsDup2ReplaceResult {
     File* existing = nullptr;
 };
 
-auto vfs_replace_fd_for_dup2_locked(ker::mod::sched::task::Task* task, int newfd, File* file) -> VfsDup2ReplaceResult {
+auto vfs_replace_fd_for_dup2_locked(ker::mod::sched::task::Task* task, int newfd, File* file, bool cloexec = false)
+    -> VfsDup2ReplaceResult {
     auto* existing = reinterpret_cast<File*>(task->fd_table.lookup(static_cast<uint64_t>(newfd)));
 #ifdef WOS_SELFTEST
     if (g_vfs_selftest_force_dup2_insert_failure.load(std::memory_order_relaxed)) {
@@ -716,7 +717,11 @@ auto vfs_replace_fd_for_dup2_locked(ker::mod::sched::task::Task* task, int newfd
 #endif
     bool const INSERTED = task->fd_table.insert(static_cast<uint64_t>(newfd), file);
     if (INSERTED) {
-        task->clear_fd_cloexec(static_cast<unsigned>(newfd));
+        if (cloexec) {
+            task->set_fd_cloexec(static_cast<unsigned>(newfd));
+        } else {
+            task->clear_fd_cloexec(static_cast<unsigned>(newfd));
+        }
     }
     return VfsDup2ReplaceResult{.inserted = INSERTED, .existing = existing};
 }
@@ -5729,10 +5734,13 @@ auto vfs_dup(int oldfd) -> int {
     return NEWFD;
 }
 
-auto vfs_dup2(int oldfd, int newfd) -> int {
+auto vfs_dup2(int oldfd, int newfd, int flags) -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return -ESRCH;
+    }
+    if ((flags & ~ker::vfs::O_CLOEXEC) != 0) {
+        return -EINVAL;
     }
     if (newfd < 0 || std::cmp_greater_equal(newfd, ker::mod::sched::task::Task::FD_TABLE_SIZE)) {
         return -EBADF;
@@ -5743,11 +5751,14 @@ auto vfs_dup2(int oldfd, int newfd) -> int {
     }
     if (oldfd == newfd) {
         vfs_put_file(f);
+        if (flags != 0) {
+            return -EINVAL;
+        }
         return newfd;
     }
 
     uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-    VfsDup2ReplaceResult const REPLACE = vfs_replace_fd_for_dup2_locked(task, newfd, f);
+    VfsDup2ReplaceResult const REPLACE = vfs_replace_fd_for_dup2_locked(task, newfd, f, (flags & ker::vfs::O_CLOEXEC) != 0);
     task->fd_table_lock.unlock_irqrestore(IRQF);
 
     if (!REPLACE.inserted) {
@@ -7165,13 +7176,17 @@ auto vfs_sendfile_to_pipe(File* outfile, File* infile, off_t* source_offset, siz
 }  // namespace
 
 namespace {
-auto vfs_pipe_for_task(ker::mod::sched::task::Task* task,
-                       int pipefd[2]) -> int {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
+                       int flags = 0) -> int {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     if (pipefd == nullptr) {
         return -EINVAL;
     }
     if (task == nullptr) {
         return -ESRCH;
+    }
+    constexpr int PIPE_SUPPORTED_FLAGS = ker::vfs::O_CLOEXEC | O_NONBLOCK;
+    if ((flags & ~PIPE_SUPPORTED_FLAGS) != 0) {
+        return -EINVAL;
     }
 
     // Keep a moderate default capacity so simple producer/consumer pipelines do
@@ -7570,7 +7585,9 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task,
         pipe_destroy_unregistered_state(ps);
         return -ENOMEM;
     }
-    pipe_init_file(rf, ps, &pipe_read_fops, 0);
+    int const READ_OPEN_FLAGS = (flags & O_NONBLOCK) != 0 ? O_NONBLOCK : 0;
+    int const WRITE_OPEN_FLAGS = 1 | ((flags & O_NONBLOCK) != 0 ? O_NONBLOCK : 0);
+    pipe_init_file(rf, ps, &pipe_read_fops, READ_OPEN_FLAGS);
 
     // Create write-end File
 #ifdef WOS_SELFTEST
@@ -7586,7 +7603,7 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task,
         pipe_destroy_unregistered_state(ps);
         return -ENOMEM;
     }
-    pipe_init_file(wf, ps, &pipe_write_fops, 1);
+    pipe_init_file(wf, ps, &pipe_write_fops, WRITE_OPEN_FLAGS);
 
 #ifdef WOS_SELFTEST
     if (pipe_selftest_should_fail(PipeSelftestFailStage::READ_FD)) {
@@ -7622,6 +7639,13 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task,
         return WFD;
     }
 
+    if ((flags & ker::vfs::O_CLOEXEC) != 0) {
+        uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
+        task->set_fd_cloexec(static_cast<unsigned>(RFD));
+        task->set_fd_cloexec(static_cast<unsigned>(WFD));
+        task->fd_table_lock.unlock_irqrestore(IRQF);
+    }
+
     pipefd[0] = RFD;
     pipefd[1] = WFD;
     pipe_register_state(ps);
@@ -7629,8 +7653,8 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task,
 }
 }  // namespace
 
-auto vfs_pipe(int pipefd[2]) -> int {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
-    return vfs_pipe_for_task(ker::mod::sched::get_current_task(), pipefd);
+auto vfs_pipe(int pipefd[2], int flags) -> int {  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    return vfs_pipe_for_task(ker::mod::sched::get_current_task(), pipefd, flags);
 }
 
 auto vfs_pipe_reserve_capacity(File* file, size_t capacity) -> bool {
@@ -7792,6 +7816,34 @@ auto vfs_selftest_pipe_failure_unwinds() -> bool {
          after_success_cleanup.capacity_bytes == before_success.capacity_bytes;
 
     return ok;
+}
+
+auto vfs_selftest_pipe_flags() -> bool {
+    ker::mod::sched::task::Task task{};
+    std::array<int, 2> pipefd{-1, -1};
+
+    bool ok = vfs_pipe_for_task(&task, pipefd.data(), 2) == -EINVAL && pipefd[0] == -1 && pipefd[1] == -1 && task.fd_table.empty();
+
+    LocalPipePerfSnapshot before{};
+    LocalPipePerfSnapshot after{};
+    vfs_get_local_pipe_perf_snapshot(before);
+    int const RET = vfs_pipe_for_task(&task, pipefd.data(), ker::vfs::O_CLOEXEC | O_NONBLOCK);
+    vfs_get_local_pipe_perf_snapshot(after);
+
+    auto* read_file = static_cast<File*>(task.fd_table.lookup(static_cast<uint64_t>(pipefd[0])));
+    auto* write_file = static_cast<File*>(task.fd_table.lookup(static_cast<uint64_t>(pipefd[1])));
+    ok = ok && RET == 0 && pipefd[0] >= 0 && pipefd[1] >= 0 && read_file != nullptr && write_file != nullptr &&
+         task.get_fd_cloexec(static_cast<unsigned>(pipefd[0])) && task.get_fd_cloexec(static_cast<unsigned>(pipefd[1])) &&
+         (read_file->open_flags & O_NONBLOCK) != 0 && (write_file->open_flags & O_NONBLOCK) != 0 &&
+         (read_file->open_flags & ker::vfs::O_CLOEXEC) == 0 && (write_file->open_flags & ker::vfs::O_CLOEXEC) == 0 &&
+         after.active_pipes == before.active_pipes + 1 && after.capacity_bytes == before.capacity_bytes + PIPE_DEFAULT_CAPACITY;
+
+    bool const CLOSED_READ = pipefd[0] >= 0 && pipe_close_fake_task_fd(task, pipefd[0]);
+    bool const CLOSED_WRITE = pipefd[1] >= 0 && pipe_close_fake_task_fd(task, pipefd[1]);
+    LocalPipePerfSnapshot cleanup{};
+    vfs_get_local_pipe_perf_snapshot(cleanup);
+    return ok && CLOSED_READ && CLOSED_WRITE && task.fd_table.empty() && cleanup.active_pipes == before.active_pipes &&
+           cleanup.capacity_bytes == before.capacity_bytes;
 }
 #endif
 
@@ -8392,12 +8444,18 @@ auto vfs_selftest_dup2_replace_preserves_newfd_on_failure() -> bool {
          task.get_fd_cloexec(FD) && g_vfs_selftest_close_count.load(std::memory_order_relaxed) == 1;
     vfs_put_file(failed_replacement);
 
+    auto* cloexec_replacement = vfs_selftest_make_file();
+    VfsDup2ReplaceResult const CLOEXEC = vfs_replace_fd_for_dup2_locked(&task, FD, cloexec_replacement, true);
+    ok = ok && CLOEXEC.inserted && CLOEXEC.existing == replacement && task.fd_table.lookup(FD) == static_cast<void*>(cloexec_replacement) &&
+         task.get_fd_cloexec(FD);
+    vfs_put_file(CLOEXEC.existing);
+
     auto* still_open = reinterpret_cast<File*>(task.fd_table.remove(FD));
     task.clear_fd_cloexec(FD);
-    ok = ok && still_open == replacement;
+    ok = ok && still_open == cloexec_replacement;
     vfs_put_file(still_open);
 
-    return ok && g_vfs_selftest_close_count.load(std::memory_order_relaxed) == 3;
+    return ok && g_vfs_selftest_close_count.load(std::memory_order_relaxed) == 4;
 }
 
 auto vfs_selftest_fd_allocation_caps_cloexec_range() -> bool {

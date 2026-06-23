@@ -21,6 +21,7 @@ struct BacklogQueueSnapshot {
     uint64_t handler_pid = 0;
     uint64_t handler_cpu = 0;
     bool handler_active = false;
+    bool consumer_active = false;
 };
 
 struct BacklogSnapshot {

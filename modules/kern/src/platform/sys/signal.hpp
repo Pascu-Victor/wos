@@ -36,6 +36,12 @@ enum class DeferredSignalDelivery : uint8_t {
     USER_HANDLERS_ONLY,
 };
 
+enum class DeferredSigreturnResult : uint8_t {
+    NONE,
+    RESTORED,
+    FAULT,
+};
+
 constexpr auto signal_frame_address(uint64_t user_rsp) -> uint64_t {
     return ((user_rsp - USER_RED_ZONE_SIZE - sizeof(SignalFrame)) & ~0xFULL) - 8;
 }
@@ -63,6 +69,7 @@ inline auto signal_frame_address_for_task(const sched::task::Task& task, uint64_
 void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& frame);
 void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, gates::InterruptFrame& frame);
 void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDelivery delivery);
+auto restore_deferred_sigreturn(sched::task::Task* task) -> DeferredSigreturnResult;
 void exit_current_on_pending_fatal_default_signal();
 void sync_task_signal_mask_cache(sched::task::Task* task);
 

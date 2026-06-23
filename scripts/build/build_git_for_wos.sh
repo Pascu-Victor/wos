@@ -103,6 +103,33 @@ copy_source_to_workdir() {
     )
 }
 
+patch_installed_git_scripts() {
+    local submodule="$TARGET_SYSROOT/libexec/git-core/git-submodule"
+
+    python3 - "$submodule" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+old = '"cmd_$(echo $command | sed -e s/-/_/g)" "$@"'
+new = '''case "$command" in
+set-branch)
+\tcmd_set_branch "$@"
+\t;;
+set-url)
+\tcmd_set_url "$@"
+\t;;
+*)
+\t"cmd_$command" "$@"
+\t;;
+esac'''
+if old not in text and new not in text:
+    raise SystemExit(f"unable to find git-submodule dispatcher in {path}")
+path.write_text(text.replace(old, new))
+PY
+}
+
 require_file "$HOST/bin/clang" "Run tools/host-toolchain.sh first."
 require_file "$HOST/bin/llvm-ar" "Run tools/host-toolchain.sh first."
 require_file "$HOST/bin/llvm-ranlib" "Run tools/host-toolchain.sh first."
@@ -170,6 +197,7 @@ GIT_MAKE_FLAGS=(
 )
 
 make -C "$GIT_WORK" -j"$(nproc)" "${GIT_MAKE_FLAGS[@]}" "DESTDIR=$TARGET_SYSROOT" install
+patch_installed_git_scripts
 
 require_file "$TARGET_SYSROOT/bin/git" "Git install did not produce $TARGET_SYSROOT/bin/git."
 require_file "$TARGET_SYSROOT/libexec/git-core/git" "Git install did not produce $TARGET_SYSROOT/libexec/git-core/git."

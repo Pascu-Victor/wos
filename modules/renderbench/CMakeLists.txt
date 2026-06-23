@@ -9,11 +9,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -flto -Wall -Wextra -Werror -fno-sanitize=safe-stack")
 
 include_directories(
-    ${CMAKE_SOURCE_DIR}/modules/defines
-    ${CMAKE_SOURCE_DIR}/modules/kern/src
-    ${CMAKE_SOURCE_DIR}/modules/kern/src/abi
-    ${CMAKE_SOURCE_DIR}/modules/stdlib/src
-    ${CMAKE_SOURCE_DIR}/modules/testprog/src
+    ${WOS_MODULES_DIR}/defines
+    ${WOS_MODULES_DIR}/kern/src
+    ${WOS_MODULES_DIR}/kern/src/abi
+    ${WOS_MODULES_DIR}/stdlib/src
+    ${WOS_MODULES_DIR}/testprog/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
@@ -21,8 +21,8 @@ add_executable(renderbench
     src/main.cpp
     src/render_core.cpp
     src/render_protocol.cpp
-    ${CMAKE_SOURCE_DIR}/modules/testprog/src/mandelbench/lodepng.cpp
-    ${CMAKE_SOURCE_DIR}/modules/testprog/src/mandelbench/tinycthread.cpp
+    ${WOS_MODULES_DIR}/testprog/src/mandelbench/lodepng.cpp
+    ${WOS_MODULES_DIR}/testprog/src/mandelbench/tinycthread.cpp
 )
 
 set_target_properties(renderbench PROPERTIES

@@ -44,6 +44,15 @@ auto btree_node_ptr_off(uint32_t block_size, size_t n) -> size_t {
     return Traits::HDR_LEN + (static_cast<size_t>(btree_node_max_keys<Traits>(block_size)) * Traits::KEY_LEN) + (n * Traits::PTR_LEN);
 }
 
+template <typename Traits>
+auto btree_owner(const XfsBtreeCursor<Traits>* cur) -> uint64_t {
+    if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
+        return cur->agno;
+    } else {
+        return cur->owner;
+    }
+}
+
 }  // namespace
 
 // ============================================================================
@@ -728,7 +737,7 @@ auto btree_split_internal(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int l
     int const MID = NR / 2;            // left keeps [1..mid], right gets [mid+1..nr]
 
     // Determine owner for new block (AG number for SHORT, inode for LONG)
-    uint64_t const OWNER = (Traits::TYPE == XfsBtreeType::SHORT) ? cur->agno : 0;
+    uint64_t const OWNER = btree_owner(cur);
 
     BufHead* right_bp = nullptr;
     uint64_t const RIGHT_BLOCKNO = btree_alloc_new_block<Traits>(cur->mount, tp, cur->agno, static_cast<uint8_t>(lev), OWNER, &right_bp);
@@ -862,7 +871,7 @@ auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
 
         // Need a new root one level above the current root.
         BufHead const* old_root_bp = cur->level_at(nlevels - 1).bp;
-        uint64_t const OWNER = (Traits::TYPE == XfsBtreeType::SHORT) ? cur->agno : 0;
+        uint64_t const OWNER = btree_owner(cur);
 
         BufHead* new_root_bp = nullptr;
         uint64_t const NEW_ROOT_BLOCKNO = btree_alloc_new_block<Traits>(cur->mount, tp, cur->agno, nlevels, OWNER, &new_root_bp);
@@ -1099,7 +1108,7 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
     BufHead* left_bp = cur->level_at(0).bp;
     int const MID = NR / 2;  // left keeps [1..mid], right gets [mid+1..nr]
 
-    uint64_t const OWNER = (Traits::TYPE == XfsBtreeType::SHORT) ? cur->agno : 0;
+    uint64_t const OWNER = btree_owner(cur);
     BufHead* right_bp = nullptr;
     uint64_t const RIGHT_BLOCKNO = btree_alloc_new_block<Traits>(cur->mount, tp, cur->agno, 0, OWNER, &right_bp);
     if (right_bp == nullptr) {

@@ -92,6 +92,7 @@ wos_find_original_path_tool() {
 # clang/lld in the system image, so do not require or prepend toolchain/host.
 if [ "$WOS_NATIVE_HOST" -eq 1 ]; then
     WOS_TOOLCHAIN_MODE="system"
+    WOS_SYSROOT="/"
     WOS_CC="$(wos_find_original_path_tool clang || true)"
     WOS_CXX="$(wos_find_original_path_tool clang++ || true)"
     WOS_LD="$(wos_find_original_path_tool ld.lld || true)"
@@ -107,6 +108,7 @@ if [ "$WOS_NATIVE_HOST" -eq 1 ]; then
     WOS_HOST_CPACK="$(wos_find_original_path_tool cpack || true)"
 else
     WOS_TOOLCHAIN_MODE="workspace"
+    WOS_SYSROOT="$WOS_TOOLCHAIN_ROOT/sysroot"
     WOS_CC="$WOS_HOST_TOOLCHAIN_BIN/clang"
     WOS_CXX="$WOS_HOST_TOOLCHAIN_BIN/clang++"
     WOS_LD="$WOS_HOST_TOOLCHAIN_BIN/ld.lld"
@@ -169,12 +171,17 @@ else
 fi
 
 # Compiler flags for WOS development
-export CFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/sysroot -std=c23"
-export CXXFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/sysroot -std=c++23"
-export LDFLAGS="--sysroot=$WOS_TOOLCHAIN_ROOT/sysroot"
+export CFLAGS="--sysroot=$WOS_SYSROOT -std=c23"
+if [ "$WOS_NATIVE_HOST" -eq 1 ]; then
+    export CXXFLAGS="--sysroot=$WOS_SYSROOT -std=c++23 -isystem /usr/include/c++/v1"
+    export LDFLAGS="--sysroot=$WOS_SYSROOT -L/usr/lib"
+else
+    export CXXFLAGS="--sysroot=$WOS_SYSROOT -std=c++23 -isystem $WOS_SYSROOT/include/c++/v1"
+    export LDFLAGS="--sysroot=$WOS_SYSROOT"
+fi
 
 # Additional useful variables
-export WOS_SYSROOT="$WOS_TOOLCHAIN_ROOT/sysroot"
+export WOS_SYSROOT
 _wos_clang_resource_dir="$("$CC" --target="$WOS_TARGET_ARCH" -print-resource-dir 2>/dev/null || true)"
 if [ -n "$_wos_clang_resource_dir" ]; then
     WOS_CLANG_RESOURCE_DIR="$_wos_clang_resource_dir"

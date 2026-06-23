@@ -376,7 +376,7 @@ void tcp_timer_tick(uint64_t now_ms) {
         }
 
         if (rcb->ooo_ack_deadline != 0 && now_ms >= rcb->ooo_ack_deadline && rcb->state == TcpState::ESTABLISHED) {
-            if (rcb->ooo_head == nullptr) {
+            if (rcb->ooo_head == nullptr && !rcb->ooo_fin_pending) {
                 rcb->ooo_ack_deadline = 0;
                 rcb->ooo_ack_probes = 0;
             } else if (deferred_count < MAX_DEFERRED_RETRANSMITS) {

@@ -91,7 +91,7 @@ auto vfs_pivot_root(const char* new_root, const char* put_old) -> int;
 
 // FD duplication
 auto vfs_dup(int oldfd) -> int;
-auto vfs_dup2(int oldfd, int newfd) -> int;
+auto vfs_dup2(int oldfd, int newfd, int flags = 0) -> int;
 
 // Working directory
 auto vfs_getcwd(char* buf, size_t size) -> int;
@@ -126,7 +126,7 @@ auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int;
 auto vfs_ftruncate(int fd, off_t length) -> int;
 
 // Pipe
-auto vfs_pipe(int pipefd[2]) -> int;  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+auto vfs_pipe(int pipefd[2], int flags = 0) -> int;  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 auto vfs_pipe_reserve_capacity(File* file, size_t capacity) -> bool;
 
 struct LocalPipePerfSnapshot {
@@ -225,6 +225,7 @@ void vfs_cache_notify_acknowledge_file(File* file);
 auto vfs_selftest_fd_install_failure_closes_file() -> bool;
 auto vfs_selftest_dup2_replace_preserves_newfd_on_failure() -> bool;
 auto vfs_selftest_pipe_failure_unwinds() -> bool;
+auto vfs_selftest_pipe_flags() -> bool;
 auto vfs_selftest_fd_allocation_caps_cloexec_range() -> bool;
 #endif
 

@@ -63,7 +63,7 @@ if(WOS_KCOV_SOURCE_FRIENDLY AND NOT WOS_KCOV)
 endif()
 
 # Internal flags
-set(CMAKE_LINK_FLAGS "LINKER:-m,elf_x86_64" "SHELL:-nostdlib" "SHELL:-z max-page-size=0x1000" "SHELL:-Wl,-T,${CMAKE_SOURCE_DIR}/modules/kern/linker.ld")
+set(CMAKE_LINK_FLAGS "LINKER:-m,elf_x86_64" "SHELL:-nostdlib" "SHELL:-z max-page-size=0x1000" "SHELL:-Wl,-T,${WOS_MODULES_DIR}/kern/linker.ld")
 
 # Include directories
 
@@ -412,7 +412,7 @@ target_include_directories(${KERNEL} PRIVATE
     # compiler find headers under modules/stdlib/src (for example
     # <std/...>) which collides with the toolchain libc++ headers.
     # Instead, add only the small public include sets the kernel needs.
-    ${CMAKE_SOURCE_DIR}/modules
+    ${WOS_MODULES_DIR}
 )
 
 # Add external headers as SYSTEM so their C headers (e.g. extern/clang/stddef.h)

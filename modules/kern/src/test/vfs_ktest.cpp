@@ -27,6 +27,8 @@ KTEST(VFS, Dup2ReplacePreservesNewfdOnFailure) { KEXPECT_TRUE(ker::vfs::vfs_self
 
 KTEST(VFS, PipeFailureUnwindsAllStages) { KEXPECT_TRUE(ker::vfs::vfs_selftest_pipe_failure_unwinds()); }
 
+KTEST(VFS, PipeFlags) { KEXPECT_TRUE(ker::vfs::vfs_selftest_pipe_flags()); }
+
 KTEST(VFS, FdAllocationCapsCloexecRange) { KEXPECT_TRUE(ker::vfs::vfs_selftest_fd_allocation_caps_cloexec_range()); }
 
 KTEST(VFS, CreateAndStat) {

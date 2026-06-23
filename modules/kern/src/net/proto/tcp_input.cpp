@@ -239,6 +239,8 @@ auto count_out_of_order_segments(const TcpCB* cb) -> size_t {
     return count;
 }
 
+auto has_out_of_order_state(const TcpCB* cb) -> bool { return cb != nullptr && (cb->ooo_head != nullptr || cb->ooo_fin_pending); }
+
 void clear_out_of_order_ack_probe(TcpCB* cb) {
     if (cb == nullptr) {
         return;
@@ -249,7 +251,7 @@ void clear_out_of_order_ack_probe(TcpCB* cb) {
 }
 
 void arm_out_of_order_ack_probe(TcpCB* cb) {
-    if (cb == nullptr || cb->ooo_head == nullptr || cb->ooo_ack_deadline != 0) {
+    if (!has_out_of_order_state(cb) || cb->ooo_ack_deadline != 0) {
         return;
     }
 
@@ -259,7 +261,7 @@ void arm_out_of_order_ack_probe(TcpCB* cb) {
 }
 
 void restart_out_of_order_ack_probe(TcpCB* cb) {
-    if (cb == nullptr || cb->ooo_head == nullptr) {
+    if (!has_out_of_order_state(cb)) {
         clear_out_of_order_ack_probe(cb);
         return;
     }
@@ -269,8 +271,20 @@ void restart_out_of_order_ack_probe(TcpCB* cb) {
 }
 
 void clear_out_of_order_ack_probe_if_empty(TcpCB* cb) {
-    if (cb != nullptr && cb->ooo_head == nullptr) {
+    if (!has_out_of_order_state(cb)) {
         clear_out_of_order_ack_probe(cb);
+    }
+}
+
+void clear_stale_out_of_order_fin(TcpCB* cb) {
+    if (cb == nullptr || !cb->ooo_fin_pending) {
+        return;
+    }
+
+    if (!tcp_seq_after(cb->ooo_fin_seq + 1, cb->rcv_nxt)) {
+        cb->ooo_fin_pending = false;
+        cb->ooo_fin_seq = 0;
+        clear_out_of_order_ack_probe_if_empty(cb);
     }
 }
 
@@ -382,6 +396,52 @@ auto queue_out_of_order_payload(TcpCB* cb, const uint8_t* payload, size_t payloa
     return true;
 }
 
+auto queue_out_of_order_fin(TcpCB* cb, uint32_t seg_seq, size_t payload_len) -> bool {
+    if (cb == nullptr || cb->socket == nullptr) {
+        return false;
+    }
+
+    uint32_t const FIN_SEQ = tcp_seq_end(seg_seq, payload_len);
+    if (!tcp_seq_after(FIN_SEQ, cb->rcv_nxt)) {
+        clear_stale_out_of_order_fin(cb);
+        tcp_refresh_receive_window(cb);
+        return false;
+    }
+
+    uint32_t const WINDOW_END = cb->rcv_nxt + tcp_receive_window_space(cb, cb->socket);
+    if (tcp_seq_after(FIN_SEQ + 1, WINDOW_END)) {
+        tcp_refresh_receive_window(cb);
+        return false;
+    }
+
+    if (!cb->ooo_fin_pending || tcp_seq_before(FIN_SEQ, cb->ooo_fin_seq)) {
+        cb->ooo_fin_pending = true;
+        cb->ooo_fin_seq = FIN_SEQ;
+    }
+
+    tcp_refresh_receive_window(cb);
+    arm_out_of_order_ack_probe(cb);
+    return true;
+}
+
+auto consume_out_of_order_fin_if_in_sequence(TcpCB* cb) -> bool {
+    if (cb == nullptr || !cb->ooo_fin_pending) {
+        return false;
+    }
+
+    if (cb->ooo_fin_seq != cb->rcv_nxt) {
+        clear_stale_out_of_order_fin(cb);
+        return false;
+    }
+
+    cb->ooo_fin_pending = false;
+    cb->ooo_fin_seq = 0;
+    cb->rcv_nxt++;
+    tcp_refresh_receive_window(cb);
+    clear_out_of_order_ack_probe_if_empty(cb);
+    return true;
+}
+
 auto drain_out_of_order_payload(TcpCB* cb, Socket* sock) -> bool {
     if (cb == nullptr || sock == nullptr) {
         return false;
@@ -402,6 +462,7 @@ auto drain_out_of_order_payload(TcpCB* cb, Socket* sock) -> bool {
         drop_out_of_order_segment(cb, seg);
         discard_stale_out_of_order_segments(cb);
     }
+    clear_stale_out_of_order_fin(cb);
     clear_out_of_order_ack_probe_if_empty(cb);
     return progressed;
 }
@@ -434,7 +495,7 @@ auto receive_segment_payload(TcpCB* cb, Socket* sock, const uint8_t* payload, si
         if (queue_in_order_payload(cb, sock, payload, payload_len)) {
             result.accepted = true;
             result.drained_ooo = drain_out_of_order_payload(cb, sock);
-            if (!result.drained_ooo && cb->ooo_head != nullptr) {
+            if (!result.drained_ooo && has_out_of_order_state(cb)) {
                 restart_out_of_order_ack_probe(cb);
             }
         }
@@ -758,6 +819,12 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                                   cb->socket->rcvbuf.capacity, payload_len);
                     }
                 }
+                if (consume_out_of_order_fin_if_in_sequence(cb)) {
+                    cb->keepalive_deadline = 0;
+                    cb->state = TcpState::CLOSE_WAIT;
+                    deferred_wake = true;
+                    build_deferred_ack();
+                }
                 // Interactive streams such as SSH commonly send tiny PSH
                 // records during key exchange. ACK those immediately; relying
                 // on the delayed-ACK timer here can stall the peer if the timer
@@ -792,6 +859,8 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     cb->keepalive_deadline = 0;
                     cb->state = TcpState::CLOSE_WAIT;
                     deferred_wake = true;
+                } else {
+                    static_cast<void>(queue_out_of_order_fin(cb, SEG_SEQ, payload_len));
                 }
                 build_deferred_ack();
             }

@@ -191,7 +191,8 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
         case ops::DUP2: {
             int const OLDFD = static_cast<int>(a1);
             int const NEWFD = static_cast<int>(a2);
-            return static_cast<int64_t>(ker::vfs::vfs_dup2(OLDFD, NEWFD));
+            int const FLAGS = static_cast<int>(a3);
+            return static_cast<int64_t>(ker::vfs::vfs_dup2(OLDFD, NEWFD, FLAGS));
         }
         case ops::GETCWD: {
             auto* buf = reinterpret_cast<char*>(a1);
@@ -232,8 +233,9 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
         }
         case ops::PIPE: {
             auto* pipefd = reinterpret_cast<int*>(a1);
+            int const FLAGS = static_cast<int>(a2);
             std::array<int, 2> kernel_pipefd = {-1, -1};
-            int const RET = ker::vfs::vfs_pipe(kernel_pipefd.data());
+            int const RET = ker::vfs::vfs_pipe(kernel_pipefd.data(), FLAGS);
             if (RET < 0) {
                 return static_cast<int64_t>(RET);
             }
