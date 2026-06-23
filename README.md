@@ -16,49 +16,75 @@ WOS aims to create a modern, efficient, and seamless multitasking system that sc
 ## Getting Started
 
 Clone the repo
+
 ```
 git clone --recurse-submodules
 ```
 
 ### Building
 
-Build llvm
+Build toolchain for host and target
+
 ```
-cd tools
-./build_llvm.sh
+./tools/bootstrap.sh
 ```
 
 Build wos
+
 ```
 cd ..
-cmake -GNinja -B build .
+cmake -GNinja -B build -DCMAKE_BUILD_TYPE=Release .
 cmake --build build
 ```
 
 ### Running
 
 start via terminal
+
 - will set up the configured WOS cluster topology and launch the VMs
+
 ```
 wos-cluster --launch
 ```
 
 - to start VM0 paused with a GDB stub on port 1234
+
 ```
 wos-cluster --launch --debug-node 0
 ```
 
 - in a separate terminal
+
 ```
 gdb build/modules/kern/wos
 target remote localhost:1234
 continue
 ```
 
+### Access
+
+set up a public key for ssh access to the VMs
+
+```
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519
+```
+
+the public key will be copied by the cluster setup script to the VMs for passwordless access
+
+accessing the VMs via ssh
+
+```
+ssh -i ~/.ssh/id_ed25519 root@<vm-ip>
+```
 
 ## License
+
 See LICENSE.md
 
 ## Contact
 
 For inquiries, please open an issue in this repository.
+
+```
+
+```
