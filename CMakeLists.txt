@@ -2,9 +2,16 @@ cmake_minimum_required(VERSION 3.20)
 
 include(ExternalProject)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "WOS build type" FORCE)
+endif()
+set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+
 option(WOS_BUILD_LINUX_BENCHMARKS "Build Linux host benchmark binaries alongside WOS artifacts" OFF)
 option(WOS_USE_CCACHE "Use ccache/cccache as a compiler launcher when available" ON)
 set(WOS_CCACHE_PROGRAM "" CACHE FILEPATH "Path to ccache/cccache")
+set(WOS_TOOLS_BUILD_TYPE Release CACHE STRING "Build type for host-side WOS tools")
+set_property(CACHE WOS_TOOLS_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
 
 if(WOS_USE_CCACHE AND NOT WOS_CCACHE_PROGRAM)
     find_program(WOS_CCACHE_PROGRAM NAMES ccache cccache)
@@ -19,9 +26,8 @@ ExternalProject_Add(wos_tools_build
     SOURCE_DIR ${CMAKE_SOURCE_DIR}/tools
     BINARY_DIR ${CMAKE_BINARY_DIR}/tools
     CMAKE_ARGS
-        -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_BUILD_TYPE=${WOS_TOOLS_BUILD_TYPE}
         -DWOS_BUILD_LINUX_BENCHMARKS=${WOS_BUILD_LINUX_BENCHMARKS}
         ${WOS_TOOLS_CCACHE_CMAKE_ARGS}
     INSTALL_COMMAND ""

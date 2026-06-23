@@ -3667,6 +3667,12 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         if (current_task->wki_proxy_task_id != 0 && current_task->wait_channel_is(task::WaitChannelKind::WKI_EXECVE_PROXY)) {
             woke = false;
         }
+        if (woke && !skip_wait_queue && is_waitpid_wait_channel(current_task->wait_channel_kind) && current_task->waiting_for_pid != 0) {
+            // A stale or unrelated wake must not make blocking waitpid() return
+            // the syscall placeholder 0. Real wait completions clear
+            // waiting_for_pid or set skip_wait_queue before this point.
+            woke = false;
+        }
 
         if (IS_YIELD || skip_wait_queue || woke) {
             if (is_futex_wait_channel(current_task->wait_channel_kind) && current_task->has_interrupting_signal_pending()) {

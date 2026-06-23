@@ -46,6 +46,8 @@ namespace {
 
 constexpr size_t ICACHE_BUCKETS = 1024;
 constexpr size_t ICACHE_HASH_MASK = ICACHE_BUCKETS - 1;
+constexpr size_t ICACHE_IDLE_RETAIN_LIMIT = 65536;
+constexpr size_t ICACHE_RECLAIM_BATCH = 256;
 constexpr uint64_t ALLOC_LOOKUP_WARN_INTERVAL = 4096;
 
 struct IcacheBucket {
@@ -56,6 +58,7 @@ struct IcacheBucket {
 std::array<IcacheBucket, ICACHE_BUCKETS> icache;
 bool icache_inited = false;
 std::atomic<uint64_t> alloc_lookup_failure_count{0};
+std::atomic<size_t> icache_idle_count{0};
 
 auto icache_hash(const XfsMountContext* mount, xfs_ino_t ino) -> size_t {
     auto const MOUNT_BITS = reinterpret_cast<uintptr_t>(mount) >> 6;
@@ -91,6 +94,15 @@ void perf_record_xfs_count(ker::mod::perf::WkiPerfLocalXfsOp op, uint64_t bytes 
     ker::mod::perf::record_local_xfs_summary(op, status, 0, false, bytes);
 }
 
+void icache_decrement_idle_count() {
+    size_t current = icache_idle_count.load(std::memory_order_relaxed);
+    while (current != 0) {
+        if (icache_idle_count.compare_exchange_weak(current, current - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
 // Look up an inode in the cache.  Returns with bucket locked and refcount
 // incremented if found.  If the matching inode is in final inactivation,
 // returns nullptr and sets unavailable so the caller will not read a second
@@ -108,7 +120,11 @@ auto icache_lookup_locked(const XfsMountContext* mount, xfs_ino_t ino, size_t bu
                 }
                 return nullptr;
             }
+            bool const WAS_IDLE = ip->refcount == 0;
             ip->refcount++;
+            if (WAS_IDLE) {
+                icache_decrement_idle_count();
+            }
             return ip;
         }
         ip = ip->hash_next;
@@ -168,6 +184,41 @@ void free_inode(XfsInode* ip) {
         free_ifork(&ip->attr_fork);
     }
     delete ip;
+}
+
+void reclaim_idle_inodes() {
+    if (icache_idle_count.load(std::memory_order_relaxed) <= ICACHE_IDLE_RETAIN_LIMIT) {
+        return;
+    }
+
+    std::array<XfsInode*, ICACHE_RECLAIM_BATCH> victims{};
+    size_t victim_count = 0;
+
+    for (auto& bucket : icache) {
+        uint64_t const FLAGS = bucket.lock.lock_irqsave();
+        XfsInode** pp = &bucket.head;
+        while (*pp != nullptr && victim_count < victims.size() &&
+               icache_idle_count.load(std::memory_order_relaxed) > ICACHE_IDLE_RETAIN_LIMIT) {
+            XfsInode* ip = *pp;
+            if (ip->refcount == 0 && ip->nlink != 0 && !ip->dirty && !ip->inactivation_started) {
+                *pp = ip->hash_next;
+                ip->hash_next = nullptr;
+                icache_decrement_idle_count();
+                victims.at(victim_count++) = ip;
+                continue;
+            }
+            pp = &ip->hash_next;
+        }
+        bucket.lock.unlock_irqrestore(FLAGS);
+
+        if (victim_count == victims.size() || icache_idle_count.load(std::memory_order_relaxed) <= ICACHE_IDLE_RETAIN_LIMIT) {
+            break;
+        }
+    }
+
+    for (size_t i = 0; i < victim_count; ++i) {
+        free_inode(victims.at(i));
+    }
 }
 
 auto inode_fsblock_to_dev_block(XfsMountContext* ctx, xfs_fsblock_t fsbno) -> uint64_t {
@@ -343,7 +394,11 @@ auto collect_cached_mount_inodes(const XfsMountContext* mount, XfsInode** inodes
         uint64_t const FLAGS = bucket.lock.lock_irqsave();
         for (XfsInode* ip = bucket.head; ip != nullptr && count < capacity; ip = ip->hash_next) {
             if (ip->mount == mount && !ip->inactivation_started) {
+                bool const WAS_IDLE = ip->refcount == 0;
                 ip->refcount++;
+                if (WAS_IDLE) {
+                    icache_decrement_idle_count();
+                }
                 inodes[count++] = ip;  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
             }
         }
@@ -468,19 +523,30 @@ void xfs_icache_init() {
 
 void xfs_icache_purge(XfsMountContext* mount) {
     for (auto& i : icache) {
+        XfsInode* purge_list = nullptr;
         uint64_t const FLAGS = i.lock.lock_irqsave();
         XfsInode** pp = &i.head;
         while (*pp != nullptr) {
             XfsInode* ip = *pp;
             if (ip->mount == mount) {
                 *pp = ip->hash_next;
-                ip->hash_next = nullptr;
-                free_inode(ip);
+                ip->hash_next = purge_list;
+                purge_list = ip;
+                if (ip->refcount == 0 && !ip->inactivation_started) {
+                    icache_decrement_idle_count();
+                }
             } else {
                 pp = &ip->hash_next;
             }
         }
         i.lock.unlock_irqrestore(FLAGS);
+
+        while (purge_list != nullptr) {
+            XfsInode* ip = purge_list;
+            purge_list = ip->hash_next;
+            ip->hash_next = nullptr;
+            free_inode(ip);
+        }
     }
 }
 
@@ -765,6 +831,11 @@ void xfs_inode_release(XfsInode* ip) {
     size_t const BUCKET = icache_hash(ip->mount, ip->ino);
     uint64_t flags = icache.at(BUCKET).lock.lock_irqsave();
 
+    if (ip->refcount <= 0) {
+        icache.at(BUCKET).lock.unlock_irqrestore(flags);
+        return;
+    }
+
     ip->refcount--;
     if (ip->refcount <= 0) {
         bool const NEEDS_INACTIVATION = (ip->nlink == 0 && !ip->inactivation_started);
@@ -774,6 +845,17 @@ void xfs_inode_release(XfsInode* ip) {
             static_cast<void>(inactivate_unlinked_inode(ip));
             flags = icache.at(BUCKET).lock.lock_irqsave();
         }
+
+        if (ip->nlink != 0) {
+            ip->refcount = 0;
+            size_t const IDLE_COUNT = icache_idle_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            icache.at(BUCKET).lock.unlock_irqrestore(flags);
+            if (IDLE_COUNT > ICACHE_IDLE_RETAIN_LIMIT) {
+                reclaim_idle_inodes();
+            }
+            return;
+        }
+
         icache_remove_locked(ip, BUCKET);
         icache.at(BUCKET).lock.unlock_irqrestore(flags);
         free_inode(ip);

@@ -2211,6 +2211,69 @@ TESTD_RUN(test_pty_blocking_read_wake) {
 }
 TESTD_RUN_END(test_pty_blocking_read_wake)
 
+TESTD_RUN(test_pty_cr_progress_write_coalesced) {
+    int const MASTER_FD = open("/dev/ptmx", O_RDWR);
+    if (MASTER_FD < 0) {
+        fail("pty_cr_progress_open_master", "open /dev/ptmx failed");
+        return;
+    }
+
+    unsigned int pty_num = 0;
+    if (ioctl(MASTER_FD, TIOCGPTN, &pty_num) != 0) {
+        close(MASTER_FD);
+        fail("pty_cr_progress_tiocgptn", "TIOCGPTN failed");
+        return;
+    }
+
+    int unlock = 0;
+    if (ioctl(MASTER_FD, TIOCSPTLCK, &unlock) != 0) {
+        close(MASTER_FD);
+        fail("pty_cr_progress_unlock", "TIOCSPTLCK failed");
+        return;
+    }
+
+    std::array<char, 32> slave_path{};
+    (void)testd_format_to_array(slave_path, "/dev/pts/%u", pty_num);
+    int const SLAVE_FD = open(slave_path.data(), O_RDWR);
+    if (SLAVE_FD < 0) {
+        close(MASTER_FD);
+        fail("pty_cr_progress_open_slave", "open slave failed");
+        return;
+    }
+
+    pid_t const PID = fork();
+    if (PID < 0) {
+        close(SLAVE_FD);
+        close(MASTER_FD);
+        fail("pty_cr_progress_fork", "fork failed");
+        return;
+    }
+
+    constexpr std::string_view MSG = "Updating files: 20% (33438/167187)\r";
+    if (PID == 0) {
+        close(MASTER_FD);
+        usleep(50000);
+        ssize_t const NW = write(SLAVE_FD, MSG.data(), MSG.size());
+        close(SLAVE_FD);
+        _exit(std::cmp_equal(NW, MSG.size()) ? 0 : 1);
+    }
+
+    close(SLAVE_FD);
+    std::array<char, 128> buf{};
+    ssize_t const NR = read_once_timeout(MASTER_FD, buf.data(), buf.size(), REMOTE_IPC_TIMEOUT_MS);
+    close(MASTER_FD);
+
+    int status = 0;
+    bool const WAIT_RET = waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS);
+    if (std::cmp_not_equal(NR, MSG.size()) || std::string_view(buf.data(), static_cast<size_t>(NR)) != MSG || !WAIT_RET ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("pty_cr_progress_write_coalesced", "first PTY read split CR-ended progress update");
+        return;
+    }
+    TESTD_PASS("pty_cr_progress_write_coalesced");
+}
+TESTD_RUN_END(test_pty_cr_progress_write_coalesced)
+
 // ---------------------------------------------------------------------------
 // B4: Process management
 // ---------------------------------------------------------------------------
@@ -4151,6 +4214,7 @@ TESTD_RUN_END(test_journal_device_userspace_record)
     X(test_epoll_pipe_timeout_and_wake)           \
     X(test_epoll_pipe_hup_on_writer_close)        \
     X(test_pty_blocking_read_wake)                \
+    X(test_pty_cr_progress_write_coalesced)       \
     X(test_getpid_getppid)                        \
     X(test_getcwd_chdir)                          \
     X(test_fork_exit)                             \

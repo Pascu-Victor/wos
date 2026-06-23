@@ -444,6 +444,24 @@ KTEST(BufferCache, SizeMismatchCoexist) {
     ker::vfs::invalidate_bdev(&dev);
 }
 
+KTEST(BufferCache, AlignedSpanDirtyCheckFindsExactDirtySpan) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    ker::vfs::invalidate_bdev(&dev);
+
+    const uint64_t BLK = 1000;
+    ker::vfs::BufHead* mb = ker::vfs::bget_multi(&dev, BLK, 8);
+    KREQUIRE_NE(mb, nullptr);
+    memset(mb->data, 0xCC, mb->size);
+    ker::vfs::bdirty(mb);
+    ker::vfs::brelse(mb);
+
+    KEXPECT_TRUE(ker::vfs::has_dirty_bdev_range(&dev, BLK + 4, 1));
+    KEXPECT_TRUE(ker::vfs::has_dirty_bdev_aligned_spans(&dev, BLK, 16, 8));
+    KEXPECT_FALSE(ker::vfs::has_dirty_bdev_aligned_spans(&dev, BLK + 8, 8, 8));
+
+    ker::vfs::invalidate_bdev(&dev);
+}
+
 KTEST(BufferCache, SyncBlockdevWritesOverlappingDirtyBuffersOldestFirst) {
     ker::dev::BlockDevice dev = make_null_bdev();
     RecordingWriteState io{};

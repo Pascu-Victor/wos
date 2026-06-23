@@ -58,6 +58,13 @@ patch_config_sub_for_wos() {
     fi
 }
 
+host_env() {
+	env -u CC -u CXX -u AR -u RANLIB -u STRIP \
+		-u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS \
+		-u CONFIG_SITE -u CPATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH \
+		-u LIBRARY_PATH "$@"
+}
+
 write_config_site() {
 	local tmp_config_site
 
@@ -67,12 +74,22 @@ write_config_site() {
 ac_cv_file__dev_ptmx=no
 ac_cv_file__dev_ptc=no
 ac_cv_buggy_getaddrinfo=no
+ac_cv_func_close_range=no
+ac_cv_func_closefrom=no
 ac_cv_func_getentropy=no
 ac_cv_func_getrandom=no
+ac_cv_getrandom_syscall=no
+ac_cv_func_posix_spawn_file_actions_addclosefrom_np=no
+ac_cv_func_process_vm_readv=no
+ac_cv_header_linux_auxvec_h=no
+ac_cv_header_linux_random_h=no
+ac_cv_header_sys_pidfd_h=no
+ac_cv_header_sys_random_h=no
 ac_cv_func_setgroups=no
 ac_cv_func_setpriority=no
 ac_cv_func_sched_rr_get_interval=no
 ac_cv_have_decl_PR_SET_VMA_ANON_NAME=no
+py_cv_module__remote_debugging=n/a
 EOF
 
 	if [ ! -f "$PYTHON_CONFIG_SITE" ] || ! cmp -s "$tmp_config_site" "$PYTHON_CONFIG_SITE"; then
@@ -84,6 +101,7 @@ EOF
 
 python_target_config_is_wos() {
 	local makefile="$PYTHON_TARGET_BUILD/Makefile"
+	local pyconfig="$PYTHON_TARGET_BUILD/pyconfig.h"
 
 	[ -f "$makefile" ] || return 1
 	grep -Eq '^HOST_GNU_TYPE[[:space:]]*=[[:space:]]*x86_64-pc-wos([[:space:]]|$)' "$makefile" || return 1
@@ -91,8 +109,38 @@ python_target_config_is_wos() {
 	grep -Eq '^CC[[:space:]]*=.*--target=x86_64-pc-wos' "$makefile" || return 1
 	! grep -Eq '^CC[[:space:]]*=[[:space:]]*gcc([[:space:]]|$)' "$makefile" || return 1
 	! grep -Eq '^LDSHARED[[:space:]]*=[[:space:]]*ld([[:space:]]|$)' "$makefile" || return 1
-	[ -f "$PYTHON_TARGET_BUILD/pyconfig.h" ] || return 1
-	! grep -Eq '^#define[[:space:]]+_Py_HAVE_PR_SET_VMA_ANON_NAME[[:space:]]+1' "$PYTHON_TARGET_BUILD/pyconfig.h" || return 1
+	[ -f "$pyconfig" ] || return 1
+	! grep -Eq '^MODULE__REMOTE_DEBUGGING_STATE[[:space:]]*=[[:space:]]*yes([[:space:]]|$)' "$makefile" || return 1
+
+	local disallowed_define
+	for disallowed_define in \
+		HAVE_CLOSE_RANGE \
+		HAVE_CLOSEFROM \
+		HAVE_GETRANDOM \
+		HAVE_GETRANDOM_SYSCALL \
+		HAVE_LINUX_AUXVEC_H \
+		HAVE_LINUX_RANDOM_H \
+		HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP \
+		HAVE_PROCESS_VM_READV \
+		HAVE_SYS_PIDFD_H \
+		HAVE_SYS_RANDOM_H \
+		PY_HAVE_PERF_TRAMPOLINE \
+		_Py_HAVE_PR_SET_VMA_ANON_NAME; do
+		! grep -Eq "^#define[[:space:]]+$disallowed_define[[:space:]]+1" "$pyconfig" || return 1
+	done
+}
+
+prune_disabled_extension_artifacts() {
+	if [ ! -f "$PYTHON_TARGET_BUILD/Makefile" ]; then
+		return 0
+	fi
+
+	if grep -Eq '^MODULE__REMOTE_DEBUGGING_STATE[[:space:]]*=[[:space:]]*n/a([[:space:]]|$)' "$PYTHON_TARGET_BUILD/Makefile"; then
+		find "$PYTHON_TARGET_BUILD/Modules" -maxdepth 1 -type f -name '_remote_debugging*.so' -delete 2>/dev/null || true
+		find "$TARGET_SYSROOT/lib" "$TARGET_SYSROOT/usr/lib" \
+			-path '*/python*/lib-dynload/_remote_debugging*.so' \
+			-type f -delete 2>/dev/null || true
+	fi
 }
 
 discard_stale_target_config() {
@@ -134,19 +182,21 @@ if [ ! -e "$TARGET_SYSROOT/usr" ]; then
     ln -s . "$TARGET_SYSROOT/usr"
 fi
 
-if [ ! -f "$PYTHON_HOST_BUILD/Makefile" ] || [ "$PYTHON_SRC/configure" -nt "$PYTHON_HOST_BUILD/Makefile" ]; then
+if [ ! -f "$PYTHON_HOST_BUILD/Makefile" ] || [ "$PYTHON_SRC/configure" -nt "$PYTHON_HOST_BUILD/Makefile" ] || [ "$SCRIPT_DIR/build_python_for_wos.sh" -nt "$PYTHON_HOST_BUILD/Makefile" ]; then
     echo "Configuring build-host CPython..."
+    if [ -f "$PYTHON_HOST_BUILD/Makefile" ]; then
+        host_env make -C "$PYTHON_HOST_BUILD" clean >/dev/null 2>&1 || true
+    fi
     (
         cd "$PYTHON_HOST_BUILD"
-        env -u CC -u CXX -u AR -u RANLIB -u STRIP -u CFLAGS -u CXXFLAGS -u LDFLAGS \
-            "$PYTHON_SRC/configure" \
-                --prefix="$PYTHON_HOST_BUILD/install" \
-                --without-ensurepip \
-                --disable-test-modules
+        host_env "$PYTHON_SRC/configure" \
+            --prefix="$PYTHON_HOST_BUILD/install" \
+            --without-ensurepip \
+            --disable-test-modules
     )
 fi
 
-make -C "$PYTHON_HOST_BUILD" -j"$(nproc)" python
+host_env make -C "$PYTHON_HOST_BUILD" -j"$(nproc)" python
 BUILD_PYTHON="$PYTHON_HOST_BUILD/python"
 require_file "$BUILD_PYTHON" "Build-host CPython did not produce $BUILD_PYTHON."
 
@@ -199,6 +249,7 @@ if ! python_target_config_is_wos; then
     echo "Inspect $PYTHON_TARGET_BUILD/config.log and $PYTHON_TARGET_BUILD/Makefile." >&2
     exit 1
 fi
+prune_disabled_extension_artifacts
 
 if [ -f "$PYTHON_TARGET_BUILD/python" ]; then
     for lib in "$TARGET_SYSROOT"/lib/libc.so "$TARGET_SYSROOT"/lib/libc++.so \

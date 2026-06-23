@@ -489,6 +489,12 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
     }
 
     // --- Check for deliverable signals ---
+    // The task model tracks one active userspace signal frame. Match the
+    // interrupt/deferred paths and defer nested handlers until sigreturn.
+    if (task->in_signal_handler) {
+        return 0;
+    }
+
     uint64_t const DELIVERABLE = task->sig_pending & ~task->sig_mask;
     if (DELIVERABLE == 0) {
         return 0;
@@ -595,7 +601,7 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
     sync_task_signal_mask_cache(task);
 
     task->in_signal_handler = true;
-    return 0;
+    return 1;  // Return via iretq so handler entry uses the full GP restore path.
 }
 
 void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& frame) {

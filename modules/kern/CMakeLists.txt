@@ -9,11 +9,14 @@ set(KERNEL wos)
 # ---------------------------------------------------------------------------
 option(WOS_KCFI                    "Enable Clang Kernel Control-Flow Integrity"                         OFF)
 option(WOS_KUBSAN                  "Enable Kernel UndefinedBehaviorSanitizer"                           OFF)
+option(WOS_KERNEL_UBSAN_TRAP       "Enable runtime-free trap-mode kernel UBSan/integer/bounds checks"   OFF)
 option(WOS_KASAN                   "Enable Kernel AddressSanitizer (requires shadow map)"               OFF)
 option(WOS_KCOV                    "Enable kernel coverage instrumentation (for Syzkaller)"             OFF)
 option(WOS_KCOV_NO_PRUNE           "Disable KCOV coverage pruning to instrument all eligible trace-pc blocks" ON)
 option(WOS_KCOV_SOURCE_FRIENDLY    "Tune KCOV-enabled kernel codegen for source-level coverage fidelity" OFF)
 option(WOS_KCOV_PANIC_TRACE        "Record a recent-PC ring for panic dumps using KCOV callbacks"       OFF)
+option(WOS_KERNEL_STRICT_WARNINGS  "Enable strict kernel warning audit flags with Werror"               OFF)
+option(WOS_KERNEL_EVERYTHING_WARNINGS "Enable Clang -Weverything kernel warning audit flags"            OFF)
 option(WOS_SELFTEST                "Enable kernel self-test mode (--selftest cmdline flag)"             OFF)
 option(WOS_NET_TRACE               "Enable network hot-path cycle-count trace spans"                    OFF)
 option(WOS_NET_PACKET_DEBUG        "Track packet buffer allocation provenance and TX-refusal snapshots" OFF)
@@ -23,6 +26,20 @@ option(WOS_KMALLOC_DEBUG_INFO      "Track kmalloc allocation call sites/tags for
 option(WOS_MEMACC_FULL_DEFAULT     "Compile and default-enable full memacc allocation provenance"       OFF)
 option(WOS_MM_RECLAIM_MAGIC_PROBES "Probe UNKNOWN reclaim frames for allocator magic in diagnostic builds" OFF)
 option(WOS_MM_PROVENANCE_PERF_CONTROL "Disable expensive MM provenance diagnostics for control builds"  ON)
+set(WOS_KERNEL_LIBCXX_HARDENING_MODE fast CACHE STRING "Kernel libc++ hardening mode: none, fast, extensive, debug")
+set_property(CACHE WOS_KERNEL_LIBCXX_HARDENING_MODE PROPERTY STRINGS none fast extensive debug)
+
+set(WOS_KERNEL_LIBCXX_HARDENING_MODES none fast extensive debug)
+if(NOT "${WOS_KERNEL_LIBCXX_HARDENING_MODE}" IN_LIST WOS_KERNEL_LIBCXX_HARDENING_MODES)
+    message(FATAL_ERROR
+        "Unsupported WOS_KERNEL_LIBCXX_HARDENING_MODE='${WOS_KERNEL_LIBCXX_HARDENING_MODE}'. "
+        "Use one of: none, fast, extensive, debug.")
+endif()
+string(TOUPPER "${WOS_KERNEL_LIBCXX_HARDENING_MODE}" WOS_KERNEL_LIBCXX_HARDENING_MODE_UPPER)
+
+if(WOS_KUBSAN AND WOS_KERNEL_UBSAN_TRAP)
+    message(FATAL_ERROR "WOS_KUBSAN and WOS_KERNEL_UBSAN_TRAP are separate UBSan profiles; enable only one")
+endif()
 
 if(WOS_MM_PROVENANCE_PERF_CONTROL)
     set(WOS_MEMACC_FULL_DEFAULT OFF CACHE BOOL "Compile and default-enable full memacc allocation provenance" FORCE)
@@ -66,12 +83,128 @@ endif()
 # Add executable
 add_executable(${KERNEL} ${CFILES} ${ASFILES} ${NASMFILES} ${CXXFILES})
 
-# Kernel-specific compile options: freestanding, no exceptions, no RTTI.
+set(WOS_KERNEL_C_CXX_OPTIONS
+    -ffreestanding
+    -fno-builtin
+    -m64
+    -mno-red-zone
+    -mno-mmx
+    -mno-sse
+    -mno-sse2
+    -mno-avx
+    -msoft-float
+    -fno-omit-frame-pointer
+    -fno-optimize-sibling-calls
+    -fno-delete-null-pointer-checks
+    -fno-strict-aliasing
+    -fstrict-flex-arrays=3
+    -ftrivial-auto-var-init=pattern
+    -fdiagnostics-color=always
+    -fdiagnostics-show-option
+    -pipe
+    -mcmodel=kernel
+    -fno-stack-protector
+    -fno-stack-check
+    -fno-lto
+    -fno-sanitize=safe-stack
+)
+if(NOT WOS_KERNEL_UBSAN_TRAP)
+    list(APPEND WOS_KERNEL_C_CXX_OPTIONS
+        -fno-strict-overflow
+        -fwrapv
+        -fwrapv-pointer
+    )
+endif()
+
+set(WOS_KERNEL_CXX_OPTIONS
+    -fno-exceptions
+    -fno-rtti
+    -fno-threadsafe-statics
+    -fno-use-cxa-atexit
+    -fno-c++-static-destructors
+    -Wglobal-constructors
+    -Wexit-time-destructors
+    -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_${WOS_KERNEL_LIBCXX_HARDENING_MODE_UPPER}
+)
+
+# Kernel-specific compile options: freestanding, no hosted C++ runtime, no red zone.
 target_compile_options(${KERNEL} PRIVATE
-    $<$<COMPILE_LANGUAGE:C>:-fno-exceptions;-mcmodel=kernel;-mno-sse;-mno-red-zone;-fno-stack-protector;-fno-stack-check;-fno-lto;-fno-sanitize=safe-stack>
-    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions;-fno-rtti;-mcmodel=kernel;-mno-sse;-mno-red-zone;-fno-stack-protector;-fno-stack-check;-fno-lto;-fno-sanitize=safe-stack>
+    "$<$<COMPILE_LANGUAGE:C>:${WOS_KERNEL_C_CXX_OPTIONS};-fno-exceptions>"
+    "$<$<COMPILE_LANGUAGE:CXX>:${WOS_KERNEL_C_CXX_OPTIONS};${WOS_KERNEL_CXX_OPTIONS}>"
 )
 target_link_options(${KERNEL} PRIVATE -static -Wl,--no-dynamic-linker -fno-lto)
+
+set(WOS_KERNEL_STRICT_C_CXX_WARNING_OPTIONS
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Werror
+    -Wconversion
+    -Wsign-conversion
+    -Wimplicit-int-conversion
+    -Wimplicit-int-float-conversion
+    -Wshorten-64-to-32
+    -Wfloat-conversion
+    -Wdouble-promotion
+    -Wshadow-all
+    -Wundef
+    -Wunreachable-code-aggressive
+    -Wuninitialized
+    -Wconditional-uninitialized
+    -Wreturn-type
+    -Wmissing-noreturn
+    -Wcast-align
+    -Wcast-qual
+    -Wnull-dereference
+    -Wformat=2
+    -Wformat-security
+    -Werror=format-security
+    -Wswitch
+    -Wswitch-enum
+    -Wimplicit-fallthrough
+    -Wextra-semi
+    -Wcomma
+    -Wunsafe-buffer-usage
+)
+set(WOS_KERNEL_STRICT_CXX_WARNING_OPTIONS
+    -Wold-style-cast
+    -Wzero-as-null-pointer-constant
+    -Wnon-virtual-dtor
+    -Woverloaded-virtual
+    -Winconsistent-missing-override
+    -Wsuggest-override
+    -Wreorder-ctor
+    -Wextra-semi-stmt
+    -Wrange-loop-analysis
+    -Wmove
+    -Wself-move
+    -Wredundant-move
+    -Wpessimizing-move
+    -Wthread-safety
+)
+set(WOS_KERNEL_EVERYTHING_WARNING_OPTIONS
+    -Weverything
+    -Wno-c++98-compat
+    -Wno-c++98-compat-pedantic
+    -Wno-pre-c++20-compat
+    -Wno-pre-c++20-compat-pedantic
+    -Wno-padded
+)
+
+if(WOS_KERNEL_STRICT_WARNINGS)
+    target_compile_options(${KERNEL} PRIVATE
+        "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:${WOS_KERNEL_STRICT_C_CXX_WARNING_OPTIONS}>"
+        "$<$<COMPILE_LANGUAGE:CXX>:${WOS_KERNEL_STRICT_CXX_WARNING_OPTIONS}>"
+    )
+    message(STATUS "[WOS] Kernel strict warning profile enabled")
+endif()
+
+if(WOS_KERNEL_EVERYTHING_WARNINGS)
+    target_compile_options(${KERNEL} PRIVATE
+        "$<$<COMPILE_LANGUAGE:CXX>:${WOS_KERNEL_EVERYTHING_WARNING_OPTIONS}>"
+    )
+    message(STATUS "[WOS] Kernel -Weverything warning audit profile enabled")
+endif()
 
 # ---------------------------------------------------------------------------
 # Sanitizer flags (applied on top of the base kernel options)
@@ -86,12 +219,20 @@ if(WOS_KCFI)
 endif()
 
 if(WOS_KUBSAN)
-    # Use trap mode: UBSan calls __ubsan_handle_* which we implement in sanitizer/ubsan.cpp
+    # Report/panic mode: UBSan calls __ubsan_handle_* implemented in sanitizer/ubsan.cpp.
     target_compile_options(${KERNEL} PRIVATE
         $<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-fsanitize=undefined;-fno-sanitize-recover=all;-fno-sanitize=function,vptr>
     )
     target_compile_definitions(${KERNEL} PRIVATE WOS_KUBSAN=1)
     message(STATUS "[WOS] KUBSan enabled")
+endif()
+
+if(WOS_KERNEL_UBSAN_TRAP)
+    target_compile_options(${KERNEL} PRIVATE
+        $<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-fsanitize=undefined;-fsanitize=integer;-fsanitize=implicit-conversion;-fsanitize=bounds;-fsanitize=local-bounds;-fsanitize=nullability;-fsanitize=float-divide-by-zero;-fsanitize=float-cast-overflow;-fno-sanitize=function,vptr;-fno-sanitize-recover=all;-fsanitize-trap=all;-fno-sanitize-merge>
+    )
+    target_compile_definitions(${KERNEL} PRIVATE WOS_KERNEL_UBSAN_TRAP=1)
+    message(STATUS "[WOS] Kernel UBSan trap profile enabled")
 endif()
 
 if(WOS_KASAN)

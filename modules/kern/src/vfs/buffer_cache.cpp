@@ -205,8 +205,11 @@ uint64_t stat_hits = 0;
 uint64_t stat_misses = 0;
 std::atomic<uint64_t> next_writeback_epoch{1};
 std::atomic<uint64_t> next_dirty_epoch{1};
+std::atomic<bool> dirty_throttle_active{false};
 
 bool cache_initialized = false;
+
+constexpr size_t DIRTY_THROTTLE_HIGH_MULTIPLIER = 4;
 
 struct WritebackSnapshot {
     uint8_t* data = nullptr;
@@ -220,6 +223,13 @@ auto perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp op) -> uint64_t {
 }
 
 auto perf_xfs_started_us() -> uint64_t { return ker::mod::perf::is_local_xfs_recording_enabled() ? ker::mod::time::get_us() : 0; }
+
+auto dirty_throttle_high_bytes_locked() -> size_t {
+    if (cache_max_bytes > SIZE_MAX / DIRTY_THROTTLE_HIGH_MULTIPLIER) {
+        return SIZE_MAX;
+    }
+    return cache_max_bytes * DIRTY_THROTTLE_HIGH_MULTIPLIER;
+}
 
 auto perf_elapsed_since_us(uint64_t started_us) -> uint32_t {
     uint64_t const NOW_US = ker::mod::time::get_us();
@@ -1004,6 +1014,70 @@ auto has_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t coun
 
     cache_lock.unlock_irqrestore(IRQFLAGS);
     return false;
+}
+
+auto has_dirty_bdev_aligned_spans(dev::BlockDevice* bdev, uint64_t block_no, size_t count, size_t span_blocks) -> bool {
+    if (bdev == nullptr || bdev->block_size == 0 || count == 0 || span_blocks == 0) {
+        return false;
+    }
+
+    if (!cache_initialized) {
+        return false;
+    }
+
+    size_t const SPAN_SIZE = span_blocks * bdev->block_size;
+    if (SPAN_SIZE == 0 || SPAN_SIZE / bdev->block_size != span_blocks) {
+        return has_dirty_bdev_range(bdev, block_no, count);
+    }
+
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    if (cache_dirty_buffers == 0) {
+        cache_lock.unlock_irqrestore(IRQFLAGS);
+        return false;
+    }
+
+    uint64_t block = block_no;
+    size_t remaining = count;
+    while (remaining != 0) {
+        BufHead* bh = hash_lookup(bdev, block, SPAN_SIZE);
+        if (bh != nullptr && (bh->flags & BH_DIRTY) != 0) {
+            cache_lock.unlock_irqrestore(IRQFLAGS);
+            return true;
+        }
+        if (remaining <= span_blocks) {
+            break;
+        }
+        remaining -= span_blocks;
+        if (block > UINT64_MAX - static_cast<uint64_t>(span_blocks)) {
+            break;
+        }
+        block += static_cast<uint64_t>(span_blocks);
+    }
+
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    return false;
+}
+
+void throttle_dirty_buffer_cache(dev::BlockDevice* bdev) {
+    if (bdev == nullptr || !cache_initialized) {
+        return;
+    }
+
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    bool const SHOULD_THROTTLE = cache_dirty_bytes > dirty_throttle_high_bytes_locked();
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    if (!SHOULD_THROTTLE) {
+        return;
+    }
+
+    bool expected = false;
+    if (!dirty_throttle_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        ker::mod::sched::kern_yield();
+        return;
+    }
+
+    static_cast<void>(sync_blockdev(bdev));
+    dirty_throttle_active.store(false, std::memory_order_release);
 }
 
 auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> int {

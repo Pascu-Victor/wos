@@ -93,6 +93,30 @@ void unregister_napi(NapiStruct* napi) {
     g_registry_lock.unlock();
 }
 
+void poke_napi_worker_cpu(ker::mod::sched::task::Task* worker) {
+    if (worker == nullptr) {
+        return;
+    }
+
+    uint64_t const WORKER_CPU = worker->cpu;
+    if (WORKER_CPU == ker::mod::cpu::current_cpu()) {
+        ker::mod::sys::context_switch::request_reschedule();
+        return;
+    }
+
+    ker::mod::sched::wake_cpu(WORKER_CPU);
+}
+
+void wake_napi_worker(NapiStruct* napi) {
+    if (napi == nullptr || napi->worker == nullptr) {
+        return;
+    }
+
+    auto* worker = napi->worker;
+    ker::mod::sched::kern_wake(worker);
+    poke_napi_worker_cpu(worker);
+}
+
 // Worker thread main loop
 [[noreturn]] void napi_worker_loop(NapiStruct* napi) {
     for (;;) {
@@ -282,16 +306,7 @@ auto napi_schedule(NapiStruct* napi) -> bool {
 
     // Wake the worker thread.
     if (napi->worker != nullptr) {
-        ker::mod::sched::kern_wake(napi->worker);
-        uint64_t const WORKER_CPU = napi->worker->cpu;
-        if (WORKER_CPU == ker::mod::cpu::current_cpu()) {
-            // Same-CPU: wake_cpu() is a no-op, so arm the APIC timer for an
-            // immediate scheduling pass instead of waiting up to 1ms for the
-            // next quantum tick.
-            ker::mod::sys::context_switch::request_reschedule();
-        } else {
-            ker::mod::sched::wake_cpu(WORKER_CPU);
-        }
+        wake_napi_worker(napi);
     }
 
     return true;
@@ -351,8 +366,7 @@ auto napi_poll_struct_inline_budget(NapiStruct* napi, int budget) -> int {
         napi->state.compare_exchange_strong(exp, NapiState::SCHEDULED, std::memory_order_acq_rel, std::memory_order_acquire);
         napi->has_work.store(true, std::memory_order_release);
         if (napi->worker != nullptr) {
-            uint64_t const WORKER_CPU = napi->worker->cpu;
-            ker::mod::sched::wake_cpu(WORKER_CPU);
+            wake_napi_worker(napi);
         }
     } else {
         // Driver already called napi_complete() and re-enabled IRQs.

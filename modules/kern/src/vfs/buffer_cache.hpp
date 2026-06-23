@@ -87,9 +87,19 @@ auto sync_blockdev(dev::BlockDevice* bdev) -> int;
 // Return true if any dirty cached buffer overlaps a device block range.
 auto has_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> bool;
 
+// Return true if any dirty cached buffer with an exact repeated aligned span is
+// present inside a device block range. This is a fast path for filesystems that
+// buffer dirty data in fixed-size filesystem-block buffers before considering a
+// larger direct read.
+auto has_dirty_bdev_aligned_spans(dev::BlockDevice* bdev, uint64_t block_no, size_t count, size_t span_blocks) -> bool;
+
 // Write dirty buffers overlapping a device block range to disk.
 // Returns 0 on success, negative errno on failure.
 auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> int;
+
+// Apply dirty-cache pressure for a block device if global dirty bytes exceed
+// the cache high-water mark. This may block on writeback.
+void throttle_dirty_buffer_cache(dev::BlockDevice* bdev);
 
 // Invalidate unreferenced cached buffers for a device (e.g. on unmount).
 // Referenced buffers are left cached so callers holding BufHead pointers do

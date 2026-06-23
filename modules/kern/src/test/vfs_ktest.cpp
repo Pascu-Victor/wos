@@ -401,7 +401,7 @@ KTEST(VFS, LstatTrailingSlashFollowsTmpfsSymlinkToDirectory) {
     KEXPECT_TRUE((st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFDIR);
 
     std::array<char, 128> linkbuf{};
-    KEXPECT_EQ(ker::vfs::vfs_readlink(LINK_WITH_SLASH, linkbuf.data(), linkbuf.size()), -EINVAL);
+    KEXPECT_EQ(ker::vfs::vfs_readlink(LINK_WITH_SLASH, linkbuf.data(), linkbuf.size()), static_cast<ssize_t>(-EINVAL));
 
     KEXPECT_EQ(ker::vfs::vfs_unlink(LINK), 0);
     KEXPECT_EQ(ker::vfs::vfs_rmdir(TARGET), 0);

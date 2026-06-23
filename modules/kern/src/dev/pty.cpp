@@ -338,11 +338,6 @@ void wake_both_pollers(PtyPair* pair) {
     wake_slave_pollers(pair);
 }
 
-void wake_master_output_available(PtyPair* pair) {
-    wake_master_readers(pair);
-    wake_master_pollers(pair);
-}
-
 auto pty_poll_register_waiter(ker::vfs::File* file, uint64_t pid) -> bool {
     auto* pair = pair_from_file(file);
     auto* device = device_from_file(file);
@@ -1268,161 +1263,113 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
     }
 
     size_t written = 0;
+    // Enqueue bounded batches under the PTY lock so short CR-ended progress
+    // updates do not become visible to the PTY master halfway through the line.
+    bool master_output_ready = false;
+    auto publish_master_output = [&]() {
+        if (!master_output_ready) {
+            return;
+        }
+        wake_master_readers(pair);
+        wake_both_pollers(pair);
+        master_output_ready = false;
+    };
 
-    for (size_t i = 0; i < count; i++) {
-        uint8_t ch = 0;
-        if (!read_call_buffer_byte(buf, i, &ch)) {
+    std::array<uint8_t, PTY_WRITE_FAIR_YIELD_INTERVAL> input_chunk{};
+    size_t i = 0;
+    while (i < count) {
+        bool hit_fault = false;
+        bool hit_full = false;
+        size_t staged = 0;
+        while (staged < input_chunk.size() && staged < (count - i)) {
+            if (!read_call_buffer_byte(buf, i + staged, &input_chunk.at(staged))) {
+                hit_fault = true;
+                break;
+            }
+            staged++;
+        }
+
+        if (staged == 0 && hit_fault) {
             if (written == 0) {
                 return finish(-EFAULT);
             }
             break;
         }
 
-        // Output post-processing (OPOST)
-        bool const EXPAND_NEWLINE =
-            ((pair->termios.c_oflag & TIOS_OPOST) != 0U) && ((pair->termios.c_oflag & TIOS_ONLCR) != 0U) && ch == '\n';
-        if (EXPAND_NEWLINE) {
-            if ((OPEN_FLAGS & 04000) != 0) {
-                uint64_t const IRQF = pair->lock.lock_irqsave();
-                bool const HAS_SPACE = pair->s2m.space() >= 2;
-                pair->lock.unlock_irqrestore(IRQF);
-                if (!HAS_SPACE) {
-                    if (written == 0) {
-                        return finish(-EAGAIN);
-                    }
-                    break;
-                }
-            } else {
-                while (true) {
-                    uint64_t const IRQF = pair->lock.lock_irqsave();
-                    bool const HAS_SPACE = pair->s2m.space() >= 2;
-                    bool const MASTER_OPENED = pair->master_opened > 0;
-                    bool should_block = false;
-                    if (HAS_SPACE) {
-                        pair->lock.unlock_irqrestore(IRQF);
-                        break;
-                    }
-                    if (MASTER_OPENED && written == 0) {
-                        should_block = block_current_task(pair->slave_write_waiters, "pty_slave_write", WaitChannelKind::LOCAL_PTY);
-                    }
-                    pair->lock.unlock_irqrestore(IRQF);
-                    if (!MASTER_OPENED) {
-                        if (written > 0) {
-                            goto wake_and_return;
-                        }
-                        return finish(-EIO);
-                    }
-                    if (written != 0) {
-                        goto wake_and_return;
-                    }
-                    if (current_task_has_deliverable_signal()) {
-                        return finish(-EINTR);
-                    }
-                    if (should_block) {
-                        wake_master_readers(pair);
-                        wake_both_pollers(pair);
-                        ker::mod::sched::preemptible_syscall_park("pty_slave_write", WaitChannelKind::LOCAL_PTY);
-                    } else {
-                        ker::mod::sched::kern_yield();
-                    }
-                    if (current_task_has_deliverable_signal()) {
-                        return finish(-EINTR);
-                    }
-                }
-            }
-
-            constexpr std::array<uint8_t, 2> CRLF = {'\r', '\n'};
-            uint64_t const IRQF = pair->lock.lock_irqsave();
-            bool const WAS_EMPTY = pair->s2m.available() == 0;
-            size_t const WR = pair->s2m.write(CRLF.data(), CRLF.size());
+        uint64_t const IRQF = pair->lock.lock_irqsave();
+        bool const MASTER_OPENED = pair->master_opened > 0;
+        if (!MASTER_OPENED) {
             pair->lock.unlock_irqrestore(IRQF);
-            if (WR != 0 && (WAS_EMPTY || written == 0)) {
-                wake_master_output_available(pair);
+            if (written > 0) {
+                goto wake_and_return;
             }
+            return finish(-EIO);
+        }
 
-            if (WR != CRLF.size()) {
-                if (written == 0) {
-                    return finish(-EAGAIN);
-                }
+        size_t committed = 0;
+        while (committed < staged) {
+            uint8_t const CH = input_chunk.at(committed);
+            bool const EXPAND_NEWLINE =
+                ((pair->termios.c_oflag & TIOS_OPOST) != 0U) && ((pair->termios.c_oflag & TIOS_ONLCR) != 0U) && CH == '\n';
+            size_t const NEED_SPACE = EXPAND_NEWLINE ? 2U : 1U;
+            if (pair->s2m.space() < NEED_SPACE) {
+                hit_full = true;
                 break;
             }
 
-            written++;
+            if (EXPAND_NEWLINE) {
+                constexpr std::array<uint8_t, 2> CRLF = {'\r', '\n'};
+                static_cast<void>(pair->s2m.write(CRLF.data(), CRLF.size()));
+            } else {
+                static_cast<void>(pair->s2m.write(&CH, 1));
+            }
 
-            // Prevent long-running writers from starving the scheduler when output
-            // arrives faster than the SSH/network side can consume it.
-            if ((written % PTY_WRITE_FAIR_YIELD_INTERVAL) == 0) {
-                if (current_task_has_deliverable_signal()) {
-                    goto wake_and_return;
-                }
+            committed++;
+        }
+
+        bool should_block = false;
+        if (hit_full && written == 0 && committed == 0 && (OPEN_FLAGS & 04000) == 0) {
+            should_block = block_current_task(pair->slave_write_waiters, "pty_slave_write", WaitChannelKind::LOCAL_PTY);
+        }
+        pair->lock.unlock_irqrestore(IRQF);
+
+        if (committed > 0) {
+            i += committed;
+            written += committed;
+            master_output_ready = true;
+        }
+
+        if (hit_full) {
+            if (written > 0) {
+                break;
+            }
+            if ((OPEN_FLAGS & 04000) != 0) {
+                return finish(-EAGAIN);
+            }
+            if (current_task_has_deliverable_signal()) {
+                return finish(-EINTR);
+            }
+            if (should_block) {
+                wake_master_readers(pair);
+                wake_both_pollers(pair);
+                ker::mod::sched::preemptible_syscall_park("pty_slave_write", WaitChannelKind::LOCAL_PTY);
+            } else {
                 ker::mod::sched::kern_yield();
-                if (current_task_has_deliverable_signal()) {
-                    goto wake_and_return;
-                }
+            }
+            if (current_task_has_deliverable_signal()) {
+                return finish(-EINTR);
             }
             continue;
         }
 
-        if ((OPEN_FLAGS & 04000) != 0) {
-            uint64_t const IRQF = pair->lock.lock_irqsave();
-            bool const WAS_EMPTY = pair->s2m.available() == 0;
-            size_t const WR = pair->s2m.write(&ch, 1);
-            pair->lock.unlock_irqrestore(IRQF);
-            if (WR != 0 && (WAS_EMPTY || written == 0)) {
-                wake_master_output_available(pair);
-            }
-            if (WR == 0) {
-                if (written == 0) {
-                    return finish(-EAGAIN);
-                }
-                break;
-            }
-        } else {
-            while (true) {
-                uint64_t const IRQF = pair->lock.lock_irqsave();
-                bool const WAS_EMPTY = pair->s2m.available() == 0;
-                size_t const WR = pair->s2m.write(&ch, 1);
-                bool const MASTER_OPENED = pair->master_opened > 0;
-                bool should_block = false;
-                if (WR == 0 && MASTER_OPENED && written == 0) {
-                    should_block = block_current_task(pair->slave_write_waiters, "pty_slave_write", WaitChannelKind::LOCAL_PTY);
-                }
-                pair->lock.unlock_irqrestore(IRQF);
-                if (WR != 0) {
-                    if (WAS_EMPTY || written == 0) {
-                        wake_master_output_available(pair);
-                    }
-                    break;
-                }
-                if (!MASTER_OPENED) {
-                    if (written > 0) {
-                        goto wake_and_return;
-                    }
-                    return finish(-EIO);
-                }
-                if (written != 0) {
-                    goto wake_and_return;
-                }
-                if (current_task_has_deliverable_signal()) {
-                    return finish(-EINTR);
-                }
-                if (should_block) {
-                    wake_master_readers(pair);
-                    wake_both_pollers(pair);
-                    ker::mod::sched::preemptible_syscall_park("pty_slave_write", WaitChannelKind::LOCAL_PTY);
-                } else {
-                    ker::mod::sched::kern_yield();
-                }
-                if (current_task_has_deliverable_signal()) {
-                    return finish(-EINTR);
-                }
-            }
+        if (hit_fault) {
+            break;
         }
-        written++;
 
         // Prevent long-running writers from starving the scheduler when output
         // arrives faster than the SSH/network side can consume it.
-        if ((written % PTY_WRITE_FAIR_YIELD_INTERVAL) == 0) {
+        if (committed == PTY_WRITE_FAIR_YIELD_INTERVAL) {
+            publish_master_output();
             if (current_task_has_deliverable_signal()) {
                 goto wake_and_return;
             }
@@ -1437,8 +1384,7 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
         return finish(-EAGAIN);
     }
 wake_and_return:
-    wake_master_readers(pair);
-    wake_both_pollers(pair);
+    publish_master_output();
     return finish(static_cast<ssize_t>(written));
 }
 

@@ -26,6 +26,7 @@ import node_setup  # noqa: E402
 
 DIAGNOSTIC_CMAKE_OPTIONS = [
     "-DCMAKE_BUILD_TYPE=Debug",
+    "-DWOS_KERNEL_LIBCXX_HARDENING_MODE=debug",
     "-DWOS_KCFI=ON",
     "-DWOS_KUBSAN=ON",
     "-DWOS_KASAN=ON",
@@ -45,14 +46,26 @@ DIAGNOSTIC_CMAKE_OPTIONS = [
 
 FAST_CMAKE_OPTION_OVERRIDES = {
     "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+    "WOS_KERNEL_LIBCXX_HARDENING_MODE": "fast",
     "WOS_KCOV_SOURCE_FRIENDLY": "OFF",
 }
 
+UBTRAP_CMAKE_OPTION_OVERRIDES = {
+    "WOS_KUBSAN": "OFF",
+    "WOS_KERNEL_UBSAN_TRAP": "ON",
+}
 
-def diagnostic_cmake_options(fast: bool) -> list[str]:
-    if not fast:
+def diagnostic_cmake_options(fast: bool, ubtrap: bool) -> list[str]:
+    overrides: dict[str, str] = {}
+    if fast:
+        overrides.update(FAST_CMAKE_OPTION_OVERRIDES)
+    if ubtrap:
+        overrides.update(UBTRAP_CMAKE_OPTION_OVERRIDES)
+
+    if not overrides:
         return list(DIAGNOSTIC_CMAKE_OPTIONS)
 
+    seen_options: set[str] = set()
     options = []
     for option in DIAGNOSTIC_CMAKE_OPTIONS:
         if not option.startswith("-D"):
@@ -62,7 +75,12 @@ def diagnostic_cmake_options(fast: bool) -> list[str]:
         if not separator:
             options.append(option)
             continue
-        options.append(f"-D{name}={FAST_CMAKE_OPTION_OVERRIDES.get(name, value)}")
+        seen_options.add(name)
+        options.append(f"-D{name}={overrides.get(name, value)}")
+
+    for name, value in overrides.items():
+        if name not in seen_options:
+            options.append(f"-D{name}={value}")
     return options
 
 BUILD_TARGETS = [
@@ -149,6 +167,7 @@ def configure_build(
     extra_cmake_options: list[str],
     generator: str,
     fast: bool,
+    ubtrap: bool,
 ):
     cmd = [
         "cmake",
@@ -168,7 +187,7 @@ def configure_build(
         "-DWOS_BUILD_BASH_FOR_WOS=ON",
         "-DWOS_BUILD_PYTHON_FOR_WOS=ON",
         "-DWOS_SKIP_LIBCXX_INSTALL=ON",
-        *diagnostic_cmake_options(fast),
+        *diagnostic_cmake_options(fast, ubtrap),
         *extra_cmake_options,
     ]
     run_command(cmd)
@@ -239,6 +258,11 @@ def main() -> int:
         action="store_true",
         help="Use RelWithDebInfo and disable KCOV source-friendly codegen for faster selftest runs",
     )
+    parser.add_argument(
+        "--ubtrap",
+        action="store_true",
+        help="Use runtime-free trap-mode kernel UBSan instead of report-mode KUBSan",
+    )
     parser.add_argument("--no-build", action="store_true", help="Skip configure/build")
     parser.add_argument("--no-package", action="store_true", help="Skip disk packaging")
     parser.add_argument("--no-launch", action="store_true", help="Set up topology but do not launch")
@@ -281,7 +305,7 @@ def main() -> int:
 
     if not args.no_build:
         seed_isolated_sysroot(roots["sysroot"], args.reset_sysroot)
-        configure_build(build_dir, roots, args.cmake_option, args.generator, args.fast)
+        configure_build(build_dir, roots, args.cmake_option, args.generator, args.fast, args.ubtrap)
         build_artifacts(build_dir)
     if args.build_only:
         return 0

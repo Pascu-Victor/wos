@@ -554,26 +554,9 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             // authoritative: a larger multi-block buffer has a different cache
             // key, so it would otherwise miss freshly buffered writes.
             size_t const FSB_COUNT = chunk >> ctx->block_log;
-            uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(ctx, DISK_BLOCK);
-            size_t const DEV_COUNT = xfs_fsb_to_dev_count(ctx, static_cast<xfs_filblks_t>(FSB_COUNT));
-            bool const HAS_DIRTY_OVERLAP = has_dirty_bdev_range(ctx->device, DEV_BLOCK, DEV_COUNT);
-            bool const PREFER_DIRECT_READ = !HAS_DIRTY_OVERLAP && chunk >= XFS_DIRECT_READ_MIN_BYTES;
-            BufHead* cache_bp = nullptr;
-            if (!HAS_DIRTY_OVERLAP && !PREFER_DIRECT_READ) {
-                cache_bp = (FSB_COUNT <= 1) ? xfs_buf_read(ctx, DISK_BLOCK) : xfs_buf_read_multi(ctx, DISK_BLOCK, FSB_COUNT);
-            }
-#ifdef XFS_BENCH
-            acc_io += ker::mod::tsc::get_ns() - t0;
-#endif
-            if (cache_bp != nullptr) {
-                perf_accounted_us +=
-                    perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, 0, chunk);
-                uint64_t const PERF_COPY_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY);
-                std::memcpy(dst + total_read, cache_bp->data, chunk);
-                perf_accounted_us +=
-                    perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
-                brelse(cache_bp);
-            } else if (HAS_DIRTY_OVERLAP) {
+            size_t const DEV_BLOCKS_PER_FSB = xfs_fsb_to_dev_count(ctx, 1);
+
+            auto read_cached_blocks = [&]() -> bool {
                 bool ok = true;
                 for (size_t i = 0; i < FSB_COUNT; ++i) {
                     BufHead* bp = xfs_buf_read(ctx, DISK_BLOCK + static_cast<xfs_fsblock_t>(i));
@@ -584,16 +567,34 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                     std::memcpy(dst + total_read + (i << ctx->block_log), bp->data, ctx->block_size);
                     brelse(bp);
                 }
+                return ok;
+            };
+
+            bool read_from_cache = chunk < XFS_DIRECT_READ_MIN_BYTES;
+            uint64_t dev_block = 0;
+            size_t dev_count = 0;
+            if (!read_from_cache) {
+                dev_block = xfs_fsblock_to_dev_block(ctx, DISK_BLOCK);
+                dev_count = xfs_fsb_to_dev_count(ctx, static_cast<xfs_filblks_t>(FSB_COUNT));
+                read_from_cache =
+                    DEV_BLOCKS_PER_FSB == 0 || has_dirty_bdev_aligned_spans(ctx->device, dev_block, dev_count, DEV_BLOCKS_PER_FSB);
+            }
+
+#ifdef XFS_BENCH
+            acc_io += ker::mod::tsc::get_ns() - t0;
+#endif
+            if (read_from_cache) {
+                bool const OK = read_cached_blocks();
                 perf_accounted_us += perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US,
-                                                                   ok ? 0 : -EIO, ok ? chunk : 0);
-                if (!ok) {
+                                                                   OK ? 0 : -EIO, OK ? chunk : 0);
+                if (!OK) {
                     return finish_read((total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO);
                 }
                 uint64_t const PERF_COPY_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY);
                 perf_accounted_us +=
                     perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
             } else {
-                int const RC = xfs_block_read_with_retry(ctx->device, DEV_BLOCK, DEV_COUNT, dst + total_read);
+                int const RC = xfs_block_read_with_retry(ctx->device, dev_block, dev_count, dst + total_read);
                 if (RC != 0) {
                     perf_accounted_us +=
                         perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, RC, chunk);
@@ -939,6 +940,8 @@ write_done:
         ip->size = offset + total_written;
         ip->dirty = true;
     }
+
+    throttle_dirty_buffer_cache(ctx->device);
 
 #ifdef XFS_BENCH
     s_wr_ns_bmap.fetch_add(acc_bmap, std::memory_order_relaxed);

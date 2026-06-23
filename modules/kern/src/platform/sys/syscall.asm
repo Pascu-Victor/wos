@@ -125,9 +125,10 @@ wos_asm_syscall_handler:
     jmp .sysret_halt
 
 .signal_iret_return:
-    ; sigreturn must restore RCX and R11 as ordinary user GPRs.  SYSRET
-    ; consumes RCX/R11 for the return RIP/RFLAGS, so build an IRETQ frame
-    ; below the saved GPRegs block and restore the registers manually.
+    ; Signal delivery and sigreturn need the complete saved GP register block
+    ; restored before userspace runs. SYSRET consumes RCX/R11 for the return
+    ; RIP/RFLAGS, so build an IRETQ frame below the saved GPRegs block and
+    ; restore the registers manually.
     mov r10, [gs:0x28] ; restored user RIP
     mov r11, [gs:0x30] ; restored user RFLAGS
     mov r12, [gs:0x08] ; restored user RSP

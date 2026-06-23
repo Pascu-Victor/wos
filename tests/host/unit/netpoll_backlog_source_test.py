@@ -74,16 +74,35 @@ def test_napi_worker_and_scheduler_lost_wake_guards() -> None:
         "NAPI worker livelock yield guard",
     )
 
+    poke_body = function_body(source, "poke_napi_worker_cpu")
+    require_tokens(
+        poke_body,
+        [
+            "worker->cpu",
+            "ker::mod::cpu::current_cpu()",
+            "ker::mod::sys::context_switch::request_reschedule()",
+            "ker::mod::sched::wake_cpu(WORKER_CPU)",
+        ],
+        "NAPI same-CPU worker reschedule poke",
+    )
+
+    wake_body = function_body(source, "wake_napi_worker")
+    require_tokens(
+        wake_body,
+        [
+            "ker::mod::sched::kern_wake(worker)",
+            "poke_napi_worker_cpu(worker)",
+        ],
+        "NAPI worker wake helper",
+    )
+
     schedule_body = function_body(source, "napi_schedule")
     require_tokens(
         schedule_body,
         [
             "compare_exchange_strong(expected, NapiState::SCHEDULED, std::memory_order_acq_rel, std::memory_order_acquire)",
             "napi->has_work.store(true, std::memory_order_release)",
-            "ker::mod::sched::kern_wake(napi->worker)",
-            "napi->worker->cpu == ker::mod::cpu::current_cpu()",
-            "ker::mod::sys::context_switch::request_reschedule()",
-            "ker::mod::sched::wake_cpu(napi->worker->cpu)",
+            "wake_napi_worker(napi)",
         ],
         "NAPI scheduler wake/reschedule guard",
     )
@@ -98,7 +117,7 @@ def test_napi_inline_poll_rearms_on_races_and_budget_exhaustion() -> None:
             "compare_exchange_strong(expected, NapiState::POLLING, std::memory_order_acq_rel, std::memory_order_acquire)",
             "napi->state.compare_exchange_strong(exp, NapiState::SCHEDULED, std::memory_order_acq_rel, std::memory_order_acquire)",
             "napi->has_work.store(true, std::memory_order_release)",
-            "ker::mod::sched::wake_cpu(napi->worker->cpu)",
+            "wake_napi_worker(napi)",
         ],
         "NAPI inline budget exhaustion rearm",
     )
