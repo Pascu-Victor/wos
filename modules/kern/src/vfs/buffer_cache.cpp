@@ -210,6 +210,8 @@ std::atomic<bool> dirty_throttle_active{false};
 bool cache_initialized = false;
 
 constexpr size_t DIRTY_THROTTLE_HIGH_MULTIPLIER = 4;
+constexpr size_t HOT_EVICT_SCAN_BUDGET = 512;
+constexpr size_t HOT_EVICT_MAX_VICTIMS = 64;
 
 struct WritebackSnapshot {
     uint8_t* data = nullptr;
@@ -328,8 +330,12 @@ auto is_reclaimable_clean_buffer(const BufHead* bh) -> bool {
     return bh->refcount.load(std::memory_order_relaxed) == 0 && (bh->flags & BLOCKING_FLAGS) == 0;
 }
 
-auto find_reclaimable_lru_buffer() -> BufHead* {
+auto find_reclaimable_lru_buffer(size_t scan_budget = SIZE_MAX) -> BufHead* {
+    size_t scanned = 0;
     for (BufHead* cur = lru_tail(); cur != nullptr && cur != &lru_sentinel; cur = cur->lru_prev) {
+        if (scanned++ >= scan_budget) {
+            break;
+        }
         if (is_reclaimable_clean_buffer(cur)) {  // NOLINT(clang-analyzer-cplusplus.NewDelete): victims are unlinked before delete.
             return cur;
         }
@@ -339,12 +345,17 @@ auto find_reclaimable_lru_buffer() -> BufHead* {
 
 // Try to evict unreferenced clean buffers until we are below the max cache size.
 void evict_lru() {
-    while (cache_total_bytes > cache_max_bytes) {
-        BufHead* victim = find_reclaimable_lru_buffer();
+    size_t victims = 0;
+    while (cache_total_bytes > cache_max_bytes && victims < HOT_EVICT_MAX_VICTIMS) {
+        // This runs under cache_lock in the buffer allocation hot path. When
+        // the cache is dirty-heavy, an exhaustive clean-victim search can turn
+        // every miss into a full LRU walk.
+        BufHead* victim = find_reclaimable_lru_buffer(HOT_EVICT_SCAN_BUDGET);
         if (victim == nullptr) {
-            break;  // Nothing to evict
+            break;  // No clean victim found within the hot-path scan budget.
         }
         free_buffer(victim);
+        victims++;
     }
 }
 
