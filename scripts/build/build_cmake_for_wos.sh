@@ -15,7 +15,7 @@ wos_setup_ccache
 wos_setup_ccache_cmake_args
 
 B="$WORKSPACE_ROOT/toolchain"
-HOST="$B/host"
+HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
 TARGET_SYSROOT="${WOS_SYSROOT_PATH:-$B/sysroot}"
 CMAKE_SRC="$B/src/cmake"
 CMAKE_BUILD="${WOS_CMAKE_FOR_WOS_BUILD_DIR:-$B/cmake-wos-build}"

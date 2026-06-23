@@ -15,7 +15,7 @@ wos_setup_ccache
 wos_setup_ccache_cmake_args
 
 B="$WORKSPACE_ROOT/toolchain"
-HOST="$B/host"
+HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
 TARGET_SYSROOT="${WOS_SYSROOT_PATH:-$B/sysroot}"
 NINJA_SRC="$B/src/ninja"
 NINJA_BUILD="${WOS_NINJA_BUILD_DIR:-$B/ninja-build}"

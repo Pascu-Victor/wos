@@ -5,6 +5,7 @@
 #
 # Layout:
 #   toolchain/host/    - host LLVM binaries (clang, lld, llvm-ar, etc.)
+#                       or WOS_HOST_TOOLCHAIN_ROOT when overridden
 #   toolchain/sysroot/ - WOS target libraries and headers only
 set -euo pipefail
 
@@ -22,8 +23,9 @@ cd "$WORKSPACE_ROOT"
 B="$WORKSPACE_ROOT/toolchain"
 OLD_PATH=$PATH
 TARGET_ARCH=x86_64-pc-wos
-HOST=$B/host
+HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
 SYSROOT=$B/sysroot
+export WOS_HOST_TOOLCHAIN_ROOT="$HOST"
 export NINJA_STATUS="[%f/%t %e] "
 
 meson_setup_rerunnable() {
@@ -45,7 +47,7 @@ meson_setup_rerunnable() {
 
 if [ ! -x "$HOST/bin/clang" ]; then
     echo "ERROR: Host toolchain not found at $HOST/bin/clang"
-    echo "Run tools/host-toolchain.sh first."
+    echo "Run tools/host-toolchain.sh first, or run tools/bootstrap.sh on WOS to create a system-toolchain shim."
     exit 1
 fi
 

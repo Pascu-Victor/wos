@@ -15,7 +15,7 @@ wos_setup_ccache
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
 
 B="$WORKSPACE_ROOT/toolchain"
-HOST="$B/host"
+HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
 TARGET_ARCH="${WOS_TARGET_ARCH:-x86_64-pc-wos}"
 TARGET_SYSROOT="${WOS_SYSROOT_PATH:-$B/sysroot}"
 NASM_SRC="${WOS_NASM_SOURCE_DIR:-$B/src/nasm}"
