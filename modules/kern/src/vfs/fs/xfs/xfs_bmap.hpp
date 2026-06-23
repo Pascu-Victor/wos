@@ -47,4 +47,7 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
 // extents themselves are not freed here.
 auto xfs_bmap_free_btree_blocks(XfsInode* ip, XfsTransaction* tp, uint32_t* freed_blocks = nullptr) -> int;
 
+auto xfs_selftest_bmap_insert_merge_cases() -> bool;
+auto xfs_selftest_bmap_synthetic_btree_lookup() -> bool;
+
 }  // namespace ker::vfs::xfs

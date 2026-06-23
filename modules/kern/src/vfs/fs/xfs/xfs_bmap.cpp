@@ -16,9 +16,11 @@
 #include "xfs_bmap.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <dev/block_device.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <util/crc32c.hpp>
@@ -113,19 +115,29 @@ auto bmbt_alloc_block(XfsInode* ip, XfsTransaction* tp, uint16_t level, BufHead*
     *out_bh = nullptr;
     *out_fsb = NULLFSBLOCK;
 
-    xfs_agblock_t agbno = NULLAGBLOCK;
-    int const RC = xfs_alloc_get_freelist(ip->mount, tp, ip->agno, &agbno);
+    XfsAllocReq req{};
+    req.agno = ip->agno;
+    req.agbno = 0;
+    req.minlen = 1;
+    req.maxlen = 1;
+    req.alignment = 0;
+
+    XfsAllocResult alloc{};
+    int const RC = xfs_alloc_extent(ip->mount, tp, req, &alloc);
     if (RC != 0) {
         return RC;
     }
-    if (agbno == NULLAGBLOCK || agbno >= ip->mount->ag_blocks) {
+    if (alloc.agno >= ip->mount->ag_count || alloc.agbno == NULLAGBLOCK || alloc.agbno >= ip->mount->ag_blocks || alloc.len != 1) {
+        if (alloc.agno < ip->mount->ag_count && alloc.agbno != NULLAGBLOCK && alloc.agbno < ip->mount->ag_blocks && alloc.len != 0) {
+            static_cast<void>(xfs_free_extent(ip->mount, tp, alloc.agno, alloc.agbno, alloc.len));
+        }
         return -EIO;
     }
 
-    xfs_fsblock_t const FSB = xfs_agbno_to_fsbno(ip->agno, agbno, ip->mount->ag_blk_log);
-    BufHead* bh = xfs_buf_read(ip->mount, FSB);
+    xfs_fsblock_t const FSB = xfs_agbno_to_fsbno(alloc.agno, alloc.agbno, ip->mount->ag_blk_log);
+    BufHead* bh = xfs_buf_get(ip->mount, FSB);
     if (bh == nullptr) {
-        static_cast<void>(xfs_alloc_put_freelist(ip->mount, tp, ip->agno, agbno));
+        static_cast<void>(xfs_free_extent(ip->mount, tp, alloc.agno, alloc.agbno, 1));
         return -EIO;
     }
 
@@ -147,7 +159,7 @@ auto bmbt_alloc_block(XfsInode* ip, XfsTransaction* tp, uint16_t level, BufHead*
 }
 
 auto bmbt_return_block(XfsMountContext* mount, XfsTransaction* tp, xfs_fsblock_t fsb) -> int {
-    if (mount == nullptr || fsb == NULLFSBLOCK) {
+    if (mount == nullptr || tp == nullptr || fsb == NULLFSBLOCK) {
         return -EINVAL;
     }
     xfs_agnumber_t const AGNO = xfs_ag_number(fsb, mount->ag_blk_log);
@@ -155,17 +167,51 @@ auto bmbt_return_block(XfsMountContext* mount, XfsTransaction* tp, xfs_fsblock_t
     if (AGNO >= mount->ag_count || AGBNO >= mount->ag_blocks) {
         return -EIO;
     }
-    return xfs_alloc_put_freelist(mount, tp, AGNO, AGBNO);
+    return xfs_free_extent(mount, tp, AGNO, AGBNO, 1);
+}
+
+auto bmbt_valid_irec(const XfsBmbtIrec& rec) -> bool {
+    constexpr xfs_fileoff_t MAX_STARTOFF = 0x3FFFFFFFFFFFFFULL;
+    constexpr xfs_fsblock_t MAX_STARTBLOCK = 0xFFFFFFFFFFFFFULL;
+    constexpr xfs_filblks_t MAX_BLOCKCOUNT = 0x1FFFFFULL;
+
+    if (rec.br_blockcount == 0 || rec.br_blockcount > MAX_BLOCKCOUNT || rec.br_startoff > MAX_STARTOFF ||
+        rec.br_startblock == NULLFSBLOCK || rec.br_startblock > MAX_STARTBLOCK) {
+        return false;
+    }
+
+    return rec.br_blockcount <= (MAX_STARTOFF - rec.br_startoff) + 1 && rec.br_blockcount <= (MAX_STARTBLOCK - rec.br_startblock) + 1;
+}
+
+auto bmbt_file_end_exclusive(const XfsBmbtIrec& rec) -> xfs_fileoff_t { return rec.br_startoff + rec.br_blockcount; }
+
+auto bmbt_extent_list_is_ordered(const XfsBmbtIrec* list, uint32_t count) -> bool {
+    if (count != 0 && list == nullptr) {
+        return false;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (!bmbt_valid_irec(list[i])) {
+            return false;
+        }
+        if (i != 0 && bmbt_file_end_exclusive(list[i - 1]) > list[i].br_startoff) {
+            return false;
+        }
+    }
+    return true;
 }
 
 auto extent_can_merge_left(const XfsBmbtIrec& left, const XfsBmbtIrec& right) -> bool {
+    constexpr xfs_filblks_t MAX_BLOCKCOUNT = 0x1FFFFFULL;
+    if (left.br_blockcount > MAX_BLOCKCOUNT - right.br_blockcount) {
+        return false;
+    }
     return left.br_startoff + left.br_blockcount == right.br_startoff && left.br_startblock + left.br_blockcount == right.br_startblock &&
            left.br_unwritten == right.br_unwritten;
 }
 
 auto insert_or_merge_extent(const XfsBmbtIrec* old_list, uint32_t old_count, const XfsBmbtIrec& new_ext, XfsBmbtIrec* out_list,
                             uint32_t* out_count) -> int {
-    if (out_list == nullptr || out_count == nullptr || (old_count != 0 && old_list == nullptr)) {
+    if (out_list == nullptr || out_count == nullptr || !bmbt_valid_irec(new_ext) || !bmbt_extent_list_is_ordered(old_list, old_count)) {
         return -EINVAL;
     }
 
@@ -177,6 +223,9 @@ auto insert_or_merge_extent(const XfsBmbtIrec* old_list, uint32_t old_count, con
 
     XfsBmbtIrec pending = new_ext;
     uint32_t written = insert_at;
+    if (written > 0 && bmbt_file_end_exclusive(out_list[written - 1]) > pending.br_startoff) {
+        return -EIO;
+    }
     if (written > 0 && extent_can_merge_left(out_list[written - 1], pending)) {
         out_list[written - 1].br_blockcount += pending.br_blockcount;
     } else {
@@ -185,6 +234,9 @@ auto insert_or_merge_extent(const XfsBmbtIrec* old_list, uint32_t old_count, con
 
     for (uint32_t i = insert_at; i < old_count; i++) {
         XfsBmbtIrec rec = old_list[i];
+        if (written > 0 && bmbt_file_end_exclusive(out_list[written - 1]) > rec.br_startoff) {
+            return -EIO;
+        }
         if (written > 0 && extent_can_merge_left(out_list[written - 1], rec)) {
             out_list[written - 1].br_blockcount += rec.br_blockcount;
             continue;
@@ -231,6 +283,10 @@ auto bmbt_free_subtree(XfsMountContext* mount, XfsTransaction* tp, xfs_fsblock_t
         brelse(bh);
         return -EIO;
     }
+    if (nlevels > XFS_BTREE_MAXLEVELS || hdr->bb_level.to_cpu() != static_cast<uint16_t>(nlevels - 1)) {
+        brelse(bh);
+        return -EIO;
+    }
 
     uint16_t const NUMRECS = hdr->bb_numrecs.to_cpu();
     if (nlevels > 1) {
@@ -244,12 +300,19 @@ auto bmbt_free_subtree(XfsMountContext* mount, XfsTransaction* tp, xfs_fsblock_t
             Be64 ptr_val{};
             __builtin_memcpy(&ptr_val, bh->data + bmbt_node_ptr_offset(mount, i), sizeof(ptr_val));
             xfs_fsblock_t const CHILD = ptr_val.to_cpu();
+            if (CHILD == NULLFSBLOCK) {
+                brelse(bh);
+                return -EIO;
+            }
             int const RC = bmbt_free_subtree(mount, tp, CHILD, static_cast<uint8_t>(nlevels - 1), freed);
             if (RC != 0) {
                 brelse(bh);
                 return RC;
             }
         }
+    } else if (NUMRECS > bmbt_leaf_max_recs(mount)) {
+        brelse(bh);
+        return -EIO;
     }
 
     brelse(bh);
@@ -570,6 +633,15 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
         return 0;
     }
 
+    if (LEVEL == 0 || LEVEL > XFS_BTREE_MAXLEVELS || NUMRECS > data_fork_bmdr_capacity(ip)) {
+        return -EIO;
+    }
+    size_t const MIN_ROOT_SIZE =
+        sizeof(XfsBmdrBlock) + (static_cast<size_t>(NUMRECS) * sizeof(XfsBmbtKey)) + (static_cast<size_t>(NUMRECS) * sizeof(Be64));
+    if (bt.root_size < MIN_ROOT_SIZE) {
+        return -EIO;
+    }
+
     // Keys start after the bmdr_block header (4 bytes)
     const uint8_t* keys_base = bt.root + sizeof(XfsBmdrBlock);
     // Pointers start after all keys
@@ -604,6 +676,7 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
         XfsBtreeCursor<XfsBmbtTraits> cur;
         cur.mount = mount;
         cur.nlevels = 1;
+        cur.owner = ip->ino;
 
         int const RC = cur.read_block(0, CHILD_BLOCK);
         if (RC != 0) {
@@ -642,8 +715,14 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
         } else {
             result->is_hole = true;
             result->startblock = NULLFSBLOCK;
-            result->blockcount = 1;
             result->unwritten = false;
+            if (lo <= NR) {
+                const auto* rec = cur.rec_at(lo);
+                XfsBmbtIrec const NEXT = xfs_bmbt_rec_unpack(rec);
+                result->blockcount = NEXT.br_startoff > file_block ? NEXT.br_startoff - file_block : 1;
+            } else {
+                result->blockcount = ~static_cast<xfs_filblks_t>(0);
+            }
         }
         return 0;
     }
@@ -653,6 +732,7 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
     XfsBtreeCursor<XfsBmbtTraits> cur;
     cur.mount = mount;
     cur.nlevels = LEVEL;  // depth from this child down
+    cur.owner = ip->ino;
 
     // Target for lookup
     XfsBmbtIrec target{};
@@ -758,6 +838,14 @@ auto xfs_bmap_list_extents(XfsInode* ip, XfsBmbtIrec* extents, uint32_t max_exte
         if (NUMRECS == 0) {
             return 0;
         }
+        if (LEVEL == 0 || LEVEL > XFS_BTREE_MAXLEVELS || NUMRECS > data_fork_bmdr_capacity(ip)) {
+            return -EIO;
+        }
+        size_t const MIN_ROOT_SIZE =
+            sizeof(XfsBmdrBlock) + (static_cast<size_t>(NUMRECS) * sizeof(XfsBmbtKey)) + (static_cast<size_t>(NUMRECS) * sizeof(Be64));
+        if (bt.root_size < MIN_ROOT_SIZE) {
+            return -EIO;
+        }
 
         // Get the leftmost child pointer (first key, first ptr)
         const uint8_t* ptrs_base = bt.root + sizeof(XfsBmdrBlock) + (static_cast<size_t>(NUMRECS) * sizeof(XfsBmbtKey));
@@ -768,6 +856,7 @@ auto xfs_bmap_list_extents(XfsInode* ip, XfsBmbtIrec* extents, uint32_t max_exte
         // Use a cursor positioned at the very beginning
         XfsBtreeCursor<XfsBmbtTraits> cur;
         cur.mount = ip->mount;
+        cur.owner = ip->ino;
 
         XfsBmbtIrec target{};
         target.br_startoff = 0;  // start from the very beginning
@@ -808,23 +897,13 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
     if (ip == nullptr || tp == nullptr) {
         return -EINVAL;
     }
-
-    // Only support EXTENTS format for now (most common for small/medium files).
-    // An empty file (LOCAL format with 0 extents) can be promoted to EXTENTS.
-    if (ip->data_fork.format == XFS_DINODE_FMT_LOCAL) {
-        // Promote to EXTENTS format - free inline data if any
-        if (ip->data_fork.local.data != nullptr) {
-            delete[] ip->data_fork.local.data;
-            ip->data_fork.local.data = nullptr;
-            ip->data_fork.local.size = 0;
-        }
-        ip->data_fork.format = XFS_DINODE_FMT_EXTENTS;
-        ip->data_fork.extents.list = nullptr;
-        ip->data_fork.extents.count = 0;
-        ip->data_fork.extents.capacity = 0;
+    if (!bmbt_valid_irec(new_ext)) {
+        return -EINVAL;
     }
 
-    if (ip->data_fork.format != XFS_DINODE_FMT_EXTENTS && ip->data_fork.format != XFS_DINODE_FMT_BTREE) {
+    bool const WAS_LOCAL = ip->data_fork.format == XFS_DINODE_FMT_LOCAL;
+    bool const WAS_BTREE = ip->data_fork.format == XFS_DINODE_FMT_BTREE;
+    if (!WAS_LOCAL && ip->data_fork.format != XFS_DINODE_FMT_EXTENTS && !WAS_BTREE) {
         mod::dbg::log("[xfs] bmap_add_extent: unsupported fork format %d for inode %lu", ip->data_fork.format,
                       static_cast<unsigned long>(ip->ino));
         return -EOPNOTSUPP;
@@ -832,7 +911,6 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
 
     XfsBmbtIrec* old_extents = nullptr;
     uint32_t old_count = 0;
-    bool const WAS_BTREE = ip->data_fork.format == XFS_DINODE_FMT_BTREE;
 
     if (WAS_BTREE) {
         old_count = ip->nextents;
@@ -852,7 +930,7 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
             }
             old_count = static_cast<uint32_t>(LIST_RC);
         }
-    } else {
+    } else if (!WAS_LOCAL) {
         XfsIforkExtents& ext = ip->data_fork.extents;
         old_extents = ext.list;
         old_count = ext.count;
@@ -893,27 +971,42 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
 
     uint32_t const INLINE_CAPACITY = data_fork_record_capacity(ip);
     if (!WAS_BTREE && new_count <= INLINE_CAPACITY) {
-        XfsIforkExtents& ext = ip->data_fork.extents;
-        if (new_count > ext.capacity) {
-            uint32_t new_cap = ext.capacity == 0 ? 4 : ext.capacity * 2;
+        uint32_t old_capacity = 0;
+        if (!WAS_LOCAL) {
+            old_capacity = ip->data_fork.extents.capacity;
+        }
+
+        XfsBmbtIrec* target_list = WAS_LOCAL ? nullptr : ip->data_fork.extents.list;
+        uint32_t target_capacity = old_capacity;
+        if (new_count > target_capacity) {
+            uint32_t new_cap = target_capacity == 0 ? 4 : target_capacity * 2;
             new_cap = std::max(new_cap, new_count);
             auto* new_list = new (std::nothrow) XfsBmbtIrec[new_cap];
             if (new_list == nullptr) {
                 delete[] new_extents;
                 return -ENOMEM;
             }
-            delete[] ext.list;
-            ext.list = new_list;
-            ext.capacity = new_cap;
+            if (!WAS_LOCAL) {
+                delete[] ip->data_fork.extents.list;
+            }
+            target_list = new_list;
+            target_capacity = new_cap;
         }
-        if (new_count != 0 && ext.list == nullptr) {
+        if (new_count != 0 && target_list == nullptr) {
             delete[] new_extents;
             return -EIO;
         }
         for (uint32_t i = 0; i < new_count; i++) {
-            ext.list[i] = new_extents[i];
+            target_list[i] = new_extents[i];
         }
-        ext.count = new_count;
+
+        if (WAS_LOCAL) {
+            delete[] ip->data_fork.local.data;
+            ip->data_fork.format = XFS_DINODE_FMT_EXTENTS;
+        }
+        ip->data_fork.extents.list = target_list;
+        ip->data_fork.extents.count = new_count;
+        ip->data_fork.extents.capacity = target_capacity;
         ip->nextents = new_count;
         ip->dirty = true;
         xfs_trans_log_inode(tp, ip);
@@ -943,7 +1036,9 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
         }
     }
 
-    if (!WAS_BTREE) {
+    if (WAS_LOCAL) {
+        delete[] ip->data_fork.local.data;
+    } else if (!WAS_BTREE) {
         delete[] ip->data_fork.extents.list;
     } else {
         delete[] old_root;
@@ -974,6 +1069,152 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
 
 auto xfs_bmap_free_btree_blocks(XfsInode* ip, XfsTransaction* tp, uint32_t* freed_blocks) -> int {
     return bmbt_free_fork_blocks(ip, tp, freed_blocks);
+}
+
+auto xfs_selftest_bmap_insert_merge_cases() -> bool {
+    std::array<XfsBmbtIrec, 2> old_split{{
+        {.br_startoff = 0, .br_startblock = 100, .br_blockcount = 2, .br_unwritten = false},
+        {.br_startoff = 4, .br_startblock = 104, .br_blockcount = 2, .br_unwritten = false},
+    }};
+    std::array<XfsBmbtIrec, 3> merged{};
+    uint32_t merged_count = 0;
+    XfsBmbtIrec const BRIDGE{.br_startoff = 2, .br_startblock = 102, .br_blockcount = 2, .br_unwritten = false};
+    if (insert_or_merge_extent(old_split.data(), 2, BRIDGE, merged.data(), &merged_count) != 0) {
+        return false;
+    }
+    if (merged_count != 1 || merged[0].br_startoff != 0 || merged[0].br_startblock != 100 || merged[0].br_blockcount != 6) {
+        return false;
+    }
+
+    std::array<XfsBmbtIrec, 21> old_many{};
+    for (uint32_t i = 0; i < 21; i++) {
+        old_many[i] = {.br_startoff = static_cast<xfs_fileoff_t>(i * 2),
+                       .br_startblock = static_cast<xfs_fsblock_t>(1000 + (i * 3)),
+                       .br_blockcount = 1,
+                       .br_unwritten = false};
+    }
+    std::array<XfsBmbtIrec, 22> expanded{};
+    uint32_t expanded_count = 0;
+    XfsBmbtIrec const DISJOINT{.br_startoff = 41, .br_startblock = 4096, .br_blockcount = 1, .br_unwritten = false};
+    if (insert_or_merge_extent(old_many.data(), 21, DISJOINT, expanded.data(), &expanded_count) != 0) {
+        return false;
+    }
+    if (expanded_count != 22) {
+        return false;
+    }
+    for (uint32_t i = 1; i < expanded_count; i++) {
+        if (expanded[i - 1].br_startoff >= expanded[i].br_startoff) {
+            return false;
+        }
+    }
+    return true;
+}
+
+namespace {
+
+auto bmap_selftest_read(ker::dev::BlockDevice* dev, uint64_t /*block*/, size_t count, void* buffer) -> int {
+    __builtin_memset(buffer, 0, count * dev->block_size);
+    return 0;
+}
+
+auto bmap_selftest_write(ker::dev::BlockDevice* /*dev*/, uint64_t /*block*/, size_t /*count*/, const void* /*buffer*/) -> int { return 0; }
+
+}  // namespace
+
+auto xfs_selftest_bmap_synthetic_btree_lookup() -> bool {
+    ker::dev::BlockDevice dev{};
+    dev.block_size = 512;
+    dev.total_blocks = 4096;
+    dev.read_blocks = bmap_selftest_read;
+    dev.write_blocks = bmap_selftest_write;
+
+    XfsMountContext mount{};
+    mount.device = &dev;
+    mount.block_size = 512;
+    mount.block_log = 9;
+    mount.total_blocks = 4096;
+    mount.inode_size = 512;
+    mount.ag_count = 1;
+    mount.ag_blocks = 4096;
+    mount.ag_blk_log = 12;
+    mount.sect_size = 512;
+    mount.sect_log = 9;
+
+    constexpr xfs_ino_t INO = 42;
+    constexpr xfs_fsblock_t LEAF_FSB = 7;
+    BufHead* leaf = xfs_buf_get(&mount, LEAF_FSB);
+    if (leaf == nullptr) {
+        return false;
+    }
+    __builtin_memset(leaf->data, 0, leaf->size);
+    auto* hdr = reinterpret_cast<XfsBtreeLblock*>(leaf->data);
+    hdr->bb_magic = Be32::from_cpu(XFS_BMAP_CRC_MAGIC);
+    hdr->bb_level = Be16::from_cpu(0);
+    hdr->bb_numrecs = Be16::from_cpu(3);
+    hdr->bb_leftsib = Be64::from_cpu(NULLFSBLOCK);
+    hdr->bb_rightsib = Be64::from_cpu(NULLFSBLOCK);
+    hdr->bb_blkno = Be64::from_cpu(LEAF_FSB);
+    hdr->bb_owner = Be64::from_cpu(INO);
+    hdr->bb_uuid = mount.uuid;
+
+    auto* recs = reinterpret_cast<XfsBmbtRec*>(leaf->data + XFS_BTREE_LBLOCK_CRC_LEN);
+    std::array<XfsBmbtIrec, 3> const RECORDS{{
+        {.br_startoff = 0, .br_startblock = 100, .br_blockcount = 2, .br_unwritten = false},
+        {.br_startoff = 5, .br_startblock = 200, .br_blockcount = 3, .br_unwritten = false},
+        {.br_startoff = 12, .br_startblock = 300, .br_blockcount = 1, .br_unwritten = true},
+    }};
+    for (uint32_t i = 0; i < 3; i++) {
+        recs[i] = xfs_bmbt_rec_pack(RECORDS[i]);
+    }
+    bmbt_update_crc(leaf);
+    brelse(leaf);
+
+    constexpr size_t ROOT_SIZE = sizeof(XfsBmdrBlock) + sizeof(XfsBmbtKey) + sizeof(Be64);
+    std::array<uint8_t, ROOT_SIZE> root{};
+    fill_bmdr_root(root.data(), 1, 1, RECORDS.data(), &LEAF_FSB);
+
+    XfsInode inode{};
+    inode.ino = INO;
+    inode.mount = &mount;
+    inode.data_fork.format = XFS_DINODE_FMT_BTREE;
+    inode.data_fork.btree.level = 1;
+    inode.data_fork.btree.numrecs = 1;
+    inode.data_fork.btree.root = root.data();
+    inode.data_fork.btree.root_size = root.size();
+    inode.nextents = 3;
+
+    auto finish = [&](bool ok) -> bool {
+        invalidate_bdev(&dev);
+        return ok;
+    };
+
+    XfsBmapResult result{};
+    if (xfs_bmap_lookup(&inode, 0, &result) != 0 || result.is_hole || result.startblock != 100 || result.blockcount != 2) {
+        return finish(false);
+    }
+    if (xfs_bmap_lookup(&inode, 2, &result) != 0 || !result.is_hole || result.blockcount != 3) {
+        return finish(false);
+    }
+    if (xfs_bmap_lookup(&inode, 6, &result) != 0 || result.is_hole || result.startblock != 201 || result.blockcount != 2) {
+        return finish(false);
+    }
+    if (xfs_bmap_lookup(&inode, 12, &result) != 0 || result.is_hole || result.startblock != 300 || !result.unwritten) {
+        return finish(false);
+    }
+
+    std::array<XfsBmbtIrec, 3> listed{};
+    int const LISTED = xfs_bmap_list_extents(&inode, listed.data(), 3);
+    if (LISTED != 3) {
+        return finish(false);
+    }
+    for (uint32_t i = 0; i < 3; i++) {
+        if (listed[i].br_startoff != RECORDS[i].br_startoff || listed[i].br_startblock != RECORDS[i].br_startblock ||
+            listed[i].br_blockcount != RECORDS[i].br_blockcount || listed[i].br_unwritten != RECORDS[i].br_unwritten) {
+            return finish(false);
+        }
+    }
+
+    return finish(true);
 }
 
 }  // namespace ker::vfs::xfs
