@@ -104,6 +104,14 @@ void wake_socket_timer(Socket* sock) {
     static_cast<void>(ker::mod::sched::wake_task_by_pid_from_event(PID));
 }
 
+auto ooo_ack_probe_interval_ms(uint8_t probes_sent) -> uint64_t {
+    uint64_t interval = TCP_OOO_ACK_PROBE_INITIAL_MS;
+    for (uint8_t i = 0; i < probes_sent && interval < TCP_OOO_ACK_PROBE_MAX_MS; ++i) {
+        interval = std::min<uint64_t>(interval * 2, TCP_OOO_ACK_PROBE_MAX_MS);
+    }
+    return interval;
+}
+
 }  // namespace
 
 void tcp_timer_arm(TcpCB* cb) {
@@ -124,6 +132,9 @@ void tcp_timer_arm(TcpCB* cb) {
     }
     if (cb->delayed_ack_deadline != 0) {
         deadline = std::min(deadline, cb->delayed_ack_deadline);
+    }
+    if (cb->ooo_ack_deadline != 0) {
+        deadline = std::min(deadline, cb->ooo_ack_deadline);
     }
     if (cb->keepalive_deadline != 0) {
         deadline = std::min(deadline, cb->keepalive_deadline);
@@ -252,6 +263,9 @@ void tcp_timer_tick(uint64_t now_ms) {
         if (cb->delayed_ack_deadline != 0 && now_ms >= cb->delayed_ack_deadline && cb->state == TcpState::ESTABLISHED) {
             needs_work = true;
         }
+        if (cb->ooo_ack_deadline != 0 && now_ms >= cb->ooo_ack_deadline && cb->state == TcpState::ESTABLISHED) {
+            needs_work = true;
+        }
         if (cb->keepalive_deadline != 0 && now_ms >= cb->keepalive_deadline && cb->state == TcpState::ESTABLISHED) {
             needs_work = true;
         }
@@ -269,6 +283,9 @@ void tcp_timer_tick(uint64_t now_ms) {
         }
         if (cb->delayed_ack_deadline != 0) {
             next_earliest = std::min(next_earliest, cb->delayed_ack_deadline);
+        }
+        if (cb->ooo_ack_deadline != 0) {
+            next_earliest = std::min(next_earliest, cb->ooo_ack_deadline);
         }
         if (cb->keepalive_deadline != 0) {
             next_earliest = std::min(next_earliest, cb->keepalive_deadline);
@@ -358,6 +375,37 @@ void tcp_timer_tick(uint64_t now_ms) {
             }
         }
 
+        if (rcb->ooo_ack_deadline != 0 && now_ms >= rcb->ooo_ack_deadline && rcb->state == TcpState::ESTABLISHED) {
+            if (rcb->ooo_head == nullptr) {
+                rcb->ooo_ack_deadline = 0;
+                rcb->ooo_ack_probes = 0;
+            } else if (deferred_count < MAX_DEFERRED_RETRANSMITS) {
+                uint32_t ack_local = 0;
+                uint32_t ack_remote = 0;
+                auto* ack_pkt = tcp_build_ack(rcb, &ack_local, &ack_remote);
+                if (ack_pkt != nullptr) {
+                    tcp_cb_acquire(rcb);
+                    deferred.at(deferred_count++) = {
+                        .pkt = ack_pkt,
+                        .local_ip = ack_local,
+                        .remote_ip = ack_remote,
+                        .seq_end = 0,
+                        .cb = nullptr,
+                        .ack_cb = rcb,
+                    };
+                } else {
+                    rcb->ack_pending = true;
+                }
+
+                rcb->ooo_ack_probes++;
+                if (rcb->ooo_ack_probes < TCP_OOO_ACK_PROBE_MAX_COUNT) {
+                    rcb->ooo_ack_deadline = tcp_deadline_after_ms(now_ms, ooo_ack_probe_interval_ms(rcb->ooo_ack_probes));
+                } else {
+                    rcb->ooo_ack_deadline = 0;
+                }
+            }
+        }
+
         // Keepalive probe.
         if (rcb->keepalive_deadline != 0 && now_ms >= rcb->keepalive_deadline && rcb->state == TcpState::ESTABLISHED &&
             deferred_count < MAX_DEFERRED_RETRANSMITS) {
@@ -434,7 +482,7 @@ void tcp_timer_tick(uint64_t now_ms) {
         }
 
         bool const STILL_ACTIVE = rcb->retransmit_head != nullptr || rcb->ack_pending || rcb->delayed_ack_deadline != 0 ||
-                                  rcb->keepalive_deadline != 0 || rcb->state == TcpState::TIME_WAIT ||
+                                  rcb->ooo_ack_deadline != 0 || rcb->keepalive_deadline != 0 || rcb->state == TcpState::TIME_WAIT ||
                                   (rcb->state == TcpState::FIN_WAIT_2 && rcb->socket == nullptr);
         if (!STILL_ACTIVE) {
             tcp_timer_disarm(rcb);

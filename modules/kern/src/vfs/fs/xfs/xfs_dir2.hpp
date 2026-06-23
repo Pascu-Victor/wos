@@ -90,9 +90,11 @@ struct XfsDentryCacheStats {
 };
 
 void xfs_dentry_cache_stats(XfsDentryCacheStats& out);
+void xfs_dentry_cache_purge_mount(XfsMountContext* mount);
 
 #ifdef WOS_SELFTEST
 auto xfs_selftest_dentry_cache_shortform() -> bool;
+auto xfs_selftest_dentry_cache_keeps_unrelated_dir_hot() -> bool;
 auto xfs_selftest_shortform_readdir_cookies_are_monotonic() -> bool;
 #endif
 

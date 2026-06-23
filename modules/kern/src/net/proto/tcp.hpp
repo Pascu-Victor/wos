@@ -82,6 +82,9 @@ constexpr uint64_t TCP_KEEPALIVE_INTVL_MS_DEFAULT = 75000;   // 75 seconds
 constexpr uint64_t TCP_RTO_MIN_MS = 200;
 constexpr uint64_t TCP_RTO_MAX_MS = 60000;
 constexpr uint64_t TCP_RTO_INITIAL_MS = 1000;
+constexpr uint64_t TCP_OOO_ACK_PROBE_INITIAL_MS = 200;
+constexpr uint64_t TCP_OOO_ACK_PROBE_MAX_MS = 1000;
+constexpr uint8_t TCP_OOO_ACK_PROBE_MAX_COUNT = 64;
 // Per-send syscall burst before returning a partial count; not an in-flight cap.
 constexpr uint32_t TCP_SEND_BURST_BYTES = 1024U * 1024U;
 
@@ -126,6 +129,8 @@ struct TcpCB {
     TcpOutOfOrderSegment* ooo_head = nullptr;
     size_t ooo_allocated_bytes = 0;
     std::atomic<size_t> ooo_bytes{0};
+    uint64_t ooo_ack_deadline = 0;
+    uint8_t ooo_ack_probes = 0;
 
     uint64_t time_wait_deadline = 0;
 

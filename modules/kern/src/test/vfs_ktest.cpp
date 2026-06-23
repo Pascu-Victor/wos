@@ -96,6 +96,39 @@ KTEST(VFS, MetadataCacheRepeatedStatRecordsHit) {
     KEXPECT_EQ(ker::vfs::vfs_unlink(PATH), 0);
 }
 
+KTEST(VFS, MetadataCachePathMutationKeepsSiblingStatHot) {
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* HOT_PATH = "/tmp/ktest_meta_hot_sibling";
+    constexpr const char* CHURN_PATH = "/tmp/ktest_meta_churn_sibling";
+    ker::vfs::vfs_unlink(HOT_PATH);
+    ker::vfs::vfs_unlink(CHURN_PATH);
+
+    ker::vfs::File* hot = ker::vfs::vfs_open_file(HOT_PATH, ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(hot, nullptr);
+    ker::vfs::vfs_put_file(hot);
+
+    ker::vfs::Stat st{};
+    KEXPECT_EQ(ker::vfs::vfs_stat(HOT_PATH, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_stat(HOT_PATH, &st), 0);
+
+    ker::vfs::VfsCachePerfSnapshot before{};
+    ker::vfs::vfs_get_cache_perf_snapshot(before);
+
+    ker::vfs::File* churn = ker::vfs::vfs_open_file(CHURN_PATH, ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(churn, nullptr);
+    ker::vfs::vfs_put_file(churn);
+
+    KEXPECT_EQ(ker::vfs::vfs_stat(HOT_PATH, &st), 0);
+
+    ker::vfs::VfsCachePerfSnapshot after{};
+    ker::vfs::vfs_get_cache_perf_snapshot(after);
+    KEXPECT_TRUE(after.metadata_hits >= before.metadata_hits + 1);
+
+    KEXPECT_EQ(ker::vfs::vfs_unlink(CHURN_PATH), 0);
+    KEXPECT_EQ(ker::vfs::vfs_unlink(HOT_PATH), 0);
+}
+
 KTEST(VFS, OpenFileFstatSnapshotHitsAndInvalidates) {
     ker::vfs::vfs_mkdir("/tmp", 0755);
 

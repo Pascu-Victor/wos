@@ -10,6 +10,7 @@
 //   perf wki-report           Remote/WKI summary statistics
 //   perf local-report         Local pipe/process summary statistics
 //   perf vmem-report          Local mmap/cache/COW summary statistics
+//   perf checkout-report      Git checkout/reset bottleneck summary
 //   perf all-report           Combined WKI and local summary statistics
 //   perf run      [--time=boot|unix-ns|iso] <cmd> [args] Trace cmd+descendants, save to perf.data
 //   perf show-map             Show PID->name/cmdline map from perf.data
@@ -74,6 +75,7 @@ constexpr int EXEC_FAILURE_EXIT_CODE = 127;
 constexpr int DEFAULT_WKI_TRACE_EVENTS = 200;
 constexpr int DEFAULT_WKI_TAIL_ROWS = 15;
 constexpr int DEFAULT_WKI_LAUNCH_ROWS = 20;
+constexpr int DEFAULT_CHECKOUT_ROWS = 12;
 constexpr uint64_t PERF_PAGE_SIZE = 4096;
 constexpr int BOOT_TIME_COLUMN_WIDTH = 18;
 constexpr int UNIX_TIME_COLUMN_WIDTH = 19;
@@ -106,6 +108,7 @@ constexpr std::string_view KWKISTAT_PATH = "/proc/kwkistat";
 constexpr std::string_view KIPCSTAT_PATH = "/proc/kipcstat";
 constexpr std::string_view KCPUSTAT_PATH = "/proc/kcpustat";
 constexpr std::string_view KCONTSTAT_PATH = "/proc/kcontstat";
+constexpr std::string_view MEMACC_ALLOC_TOTALS_PATH = "/proc/memacc/alloc_totals";
 constexpr std::string_view DEV_NODES_ROOT = "/dev/nodes";
 constexpr std::string_view SECTION_HEADER = "--- SECTION";
 constexpr std::string_view SECTION_TIMEBASE = "--- SECTION TIMEBASE ---\n";
@@ -116,6 +119,10 @@ constexpr std::string_view SECTION_WKI_SUMMARY = "--- SECTION WKI_SUMMARY ---\n"
 constexpr std::string_view SECTION_WKI_SUMMARY_END = "--- END WKI_SUMMARY ---\n";
 constexpr std::string_view SECTION_IPC_STATS = "--- SECTION IPC_STATS ---\n";
 constexpr std::string_view SECTION_IPC_STATS_END = "--- END IPC_STATS ---\n";
+constexpr std::string_view SECTION_CONTSTAT = "--- SECTION CONTSTAT ---\n";
+constexpr std::string_view SECTION_CONTSTAT_END = "--- END CONTSTAT ---\n";
+constexpr std::string_view SECTION_MEMACC_ALLOC_TOTALS = "--- SECTION MEMACC_ALLOC_TOTALS ---\n";
+constexpr std::string_view SECTION_MEMACC_ALLOC_TOTALS_END = "--- END MEMACC_ALLOC_TOTALS ---\n";
 constexpr std::string_view SECTION_PROC_MAP = "--- SECTION PROC_MAP ---\n";
 constexpr std::string_view SECTION_PROC_MAP_END = "--- END PROC_MAP ---\n";
 constexpr std::string_view SECTION_PEER_MAP = "--- SECTION PEER_MAP ---\n";
@@ -397,6 +404,16 @@ struct CpuRow {
     char state{};
     double cpu_pct{};
     bool in_group{};
+};
+
+struct KeyValueRow {
+    std::string record;
+    std::unordered_map<std::string, std::string> kv;
+};
+
+struct CheckoutSummaryRows {
+    std::string source;
+    std::vector<WkiSummaryRow> rows;
 };
 
 auto parse_timebase_offset(std::string_view buffer, bool sectioned) -> std::optional<int64_t>;
@@ -1010,6 +1027,30 @@ auto write_section_ipc_stats(int fd) -> ssize_t {
     return static_cast<ssize_t>(stats->size());
 }
 
+auto write_section_contstat(int fd) -> ssize_t {
+    auto stats = read_file(KCONTSTAT_PATH, CPUSTAT_READ_CAPACITY);
+    if (!stats.has_value() || stats->empty()) {
+        return 0;
+    }
+
+    write_all(fd, SECTION_CONTSTAT);
+    write_all(fd, *stats);
+    write_all(fd, SECTION_CONTSTAT_END);
+    return static_cast<ssize_t>(stats->size());
+}
+
+auto write_section_memacc_alloc_totals(int fd) -> ssize_t {
+    auto stats = read_file(MEMACC_ALLOC_TOTALS_PATH, CPUSTAT_READ_CAPACITY);
+    if (!stats.has_value() || stats->empty()) {
+        return 0;
+    }
+
+    write_all(fd, SECTION_MEMACC_ALLOC_TOTALS);
+    write_all(fd, *stats);
+    write_all(fd, SECTION_MEMACC_ALLOC_TOTALS_END);
+    return static_cast<ssize_t>(stats->size());
+}
+
 void write_section_peer_map(int fd) {
     auto peers = collect_live_wki_peer_map();
     if (peers.empty()) {
@@ -1036,12 +1077,15 @@ void save_perf_data() {
     ssize_t event_bytes = write_section_events(FD.get());
     ssize_t const SUMMARY_BYTES = write_section_wki_summary(FD.get());
     ssize_t const IPC_BYTES = write_section_ipc_stats(FD.get());
+    ssize_t const CONTSTAT_BYTES = write_section_contstat(FD.get());
+    ssize_t const MEMACC_BYTES = write_section_memacc_alloc_totals(FD.get());
+    ssize_t const DIAG_BYTES = CONTSTAT_BYTES + MEMACC_BYTES;
 
-    if (event_bytes <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0) {
+    if (event_bytes <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0 && DIAG_BYTES <= 0) {
         std::println("perf: ring buffer empty - PROC_MAP saved, no events");
     } else {
-        std::println("perf: saved to {} ({} event bytes, {} summary bytes, {} IPC bytes)", PERF_DATA_FILE, event_bytes, SUMMARY_BYTES,
-                     IPC_BYTES);
+        std::println("perf: saved to {} ({} event bytes, {} summary bytes, {} IPC bytes, {} diag bytes)", PERF_DATA_FILE, event_bytes,
+                     SUMMARY_BYTES, IPC_BYTES, DIAG_BYTES);
     }
 }
 
@@ -1199,6 +1243,9 @@ void cmd_record(int ms, const char* filter = nullptr) {
     write_all(data_fd.get(), SECTION_EVENTS_END);
     ssize_t const SUMMARY_BYTES = write_section_wki_summary(data_fd.get());
     ssize_t const IPC_BYTES = write_section_ipc_stats(data_fd.get());
+    ssize_t const CONTSTAT_BYTES = write_section_contstat(data_fd.get());
+    ssize_t const MEMACC_BYTES = write_section_memacc_alloc_totals(data_fd.get());
+    ssize_t const DIAG_BYTES = CONTSTAT_BYTES + MEMACC_BYTES;
     write_section_peer_map(data_fd.get());
 
     // Write proc map: current live processes plus any tracked ones that exited.
@@ -1221,11 +1268,11 @@ void cmd_record(int ms, const char* filter = nullptr) {
     }
     write_all(data_fd.get(), SECTION_PROC_MAP_END);
 
-    if (total_event_bytes <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0) {
+    if (total_event_bytes <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0 && DIAG_BYTES <= 0) {
         std::println("perf: ring buffer empty - PROC_MAP saved, no events");
     } else {
-        std::println("perf: saved to {} ({} event bytes, {} summary bytes, {} IPC bytes)", PERF_DATA_FILE, total_event_bytes, SUMMARY_BYTES,
-                     IPC_BYTES);
+        std::println("perf: saved to {} ({} event bytes, {} summary bytes, {} IPC bytes, {} diag bytes)", PERF_DATA_FILE, total_event_bytes,
+                     SUMMARY_BYTES, IPC_BYTES, DIAG_BYTES);
     }
 }
 
@@ -1400,6 +1447,108 @@ auto parse_wki_summary_section(std::string_view buffer, bool sectioned) -> std::
     }
 
     return rows;
+}
+
+auto hex_value(char ch) -> int {
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return ch - 'a' + 10;
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return ch - 'A' + 10;
+    }
+    return -1;
+}
+
+auto percent_decode(std::string_view value) -> std::string {
+    std::string out;
+    out.reserve(value.size());
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (value.at(i) == '%' && i + 2 < value.size()) {
+            int const HI = hex_value(value.at(i + 1));
+            int const LO = hex_value(value.at(i + 2));
+            if (HI >= 0 && LO >= 0) {
+                out.push_back(static_cast<char>((HI << 4U) | LO));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(value.at(i));
+    }
+    return out;
+}
+
+auto parse_key_value_rows(std::string_view text) -> std::vector<KeyValueRow> {
+    std::vector<KeyValueRow> rows;
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        std::string_view const LINE = next_line(text, pos);
+        if (LINE.empty()) {
+            continue;
+        }
+
+        std::size_t token_start = 0;
+        std::size_t token_end = LINE.find(' ');
+        KeyValueRow row;
+        std::string_view const FIRST_TOKEN = LINE.substr(0, token_end);
+        if (!FIRST_TOKEN.contains('=')) {
+            row.record = std::string(FIRST_TOKEN);
+            token_start = token_end == std::string_view::npos ? LINE.size() : token_end + 1;
+        }
+
+        while (token_start < LINE.size()) {
+            token_end = LINE.find(' ', token_start);
+            if (token_end == std::string_view::npos) {
+                token_end = LINE.size();
+            }
+            std::string_view const TOKEN = LINE.substr(token_start, token_end - token_start);
+            std::size_t const EQ = TOKEN.find('=');
+            if (EQ != std::string_view::npos && EQ > 0) {
+                row.kv.emplace(std::string(TOKEN.substr(0, EQ)), percent_decode(TOKEN.substr(EQ + 1)));
+            }
+            token_start = token_end + 1;
+        }
+
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+
+auto get_row_string(const KeyValueRow& row, std::string_view key) -> std::string_view {
+    auto const IT = row.kv.find(std::string(key));
+    return IT == row.kv.end() ? std::string_view{} : std::string_view(IT->second);
+}
+
+auto get_row_u64(const KeyValueRow& row, std::string_view key) -> uint64_t {
+    std::string_view const VALUE = get_row_string(row, key);
+    if (VALUE.empty() || VALUE == "-") {
+        return 0;
+    }
+    int base = PARSE_BASE_DECIMAL;
+    if (VALUE.size() > 2 && VALUE.at(0) == '0' && (VALUE.at(1) == 'x' || VALUE.at(1) == 'X')) {
+        base = 16;
+    }
+    return parse_u64(VALUE, base);
+}
+
+auto find_row_by_record(const std::vector<KeyValueRow>& rows, std::string_view record) -> const KeyValueRow* {
+    for (const auto& row : rows) {
+        if (row.record == record) {
+            return &row;
+        }
+    }
+    return nullptr;
+}
+
+auto find_row_by_key(const std::vector<KeyValueRow>& rows, std::string_view key, std::string_view value) -> const KeyValueRow* {
+    for (const auto& row : rows) {
+        if (get_row_string(row, key) == value) {
+            return &row;
+        }
+    }
+    return nullptr;
 }
 
 auto parse_ipc_stats_line(std::string_view line, IpcStatsSnapshot& out) -> bool {
@@ -2616,6 +2765,38 @@ struct WkiLoadedText {
     bool sectioned{};
 };
 
+auto section_body(std::string_view buffer, std::string_view header, std::string_view footer) -> std::optional<std::string_view> {
+    std::size_t const HEADER_POS = buffer.find(header);
+    if (HEADER_POS == std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    std::size_t const BODY_START = HEADER_POS + header.size();
+    std::size_t const BODY_END = buffer.find(footer, BODY_START);
+    if (BODY_END == std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    return buffer.substr(BODY_START, BODY_END - BODY_START);
+}
+
+auto load_perf_data_section(std::string_view header, std::string_view footer) -> std::optional<std::string> {
+    if (access(PERF_DATA_FILE.begin(), R_OK) != 0) {
+        return std::nullopt;
+    }
+
+    auto saved = read_file(PERF_DATA_FILE);
+    if (!saved.has_value() || saved->empty()) {
+        return std::nullopt;
+    }
+
+    auto body = section_body(*saved, header, footer);
+    if (!body.has_value()) {
+        return std::nullopt;
+    }
+    return std::string(*body);
+}
+
 auto event_section_view(std::string_view view, bool sectioned) -> std::string_view {
     if (!sectioned) {
         return view;
@@ -3055,6 +3236,15 @@ auto format_mib_per_s(uint64_t bytes, uint64_t total_us) -> std::string {
     return format_hundredths(scaled);
 }
 
+auto ratio_percent(uint64_t numerator, uint64_t denominator) -> double {
+    if (denominator == 0) {
+        return 0.0;
+    }
+    return (static_cast<double>(numerator) * 100.0) / static_cast<double>(denominator);
+}
+
+auto xfs_total_ms(const WkiSummaryRow& row) -> uint64_t { return (row.total_us + 500U) / 1000U; }
+
 auto row_jitter_us(const WkiSummaryRow& row) -> uint64_t {
     if (row.p50_us != 0 && row.p99_us >= row.p50_us) {
         return row.p99_us - row.p50_us;
@@ -3485,6 +3675,250 @@ void cmd_vmem_report(WkiTraceFilter filter) {
         std::println("{:<18}  {:>7}  {:>6}  {:>11}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}", row.op, row.calls, row.errors,
                      format_scaled_bytes(row.bytes), PAGES, row.avg_us, row.p50_us, row.p99_us, row.p999_us, row.max_us);
     }
+}
+
+auto local_xfs_rows_from_summary(std::vector<WkiSummaryRow> rows) -> std::vector<WkiSummaryRow> {
+    std::erase_if(rows, [](const WkiSummaryRow& row) { return row.scope != "local_xfs"; });
+    return rows;
+}
+
+auto load_checkout_xfs_rows() -> CheckoutSummaryRows {
+    if (access(PERF_DATA_FILE.begin(), R_OK) == 0) {
+        auto saved = read_file(PERF_DATA_FILE);
+        if (saved.has_value() && !saved->empty()) {
+            bool const SECTIONED = std::string_view(*saved).starts_with(SECTION_HEADER);
+            auto rows = local_xfs_rows_from_summary(parse_wki_summary_section(*saved, SECTIONED));
+            if (rows.empty()) {
+                rows = build_wki_summary_from_events(collect_wki_events(*saved, SECTIONED), WkiTraceFilter{}, WkiDataView::LOCAL);
+                rows = local_xfs_rows_from_summary(std::move(rows));
+            }
+            if (!rows.empty()) {
+                return CheckoutSummaryRows{.source = std::string(PERF_DATA_FILE), .rows = std::move(rows)};
+            }
+        }
+    }
+
+    auto live = read_file(KWKISTAT_PATH, PERF_DRAIN_CAPACITY);
+    if (!live.has_value() || live->empty()) {
+        return {};
+    }
+
+    return CheckoutSummaryRows{
+        .source = std::string(KWKISTAT_PATH),
+        .rows = local_xfs_rows_from_summary(parse_wki_summary_section(*live, false)),
+    };
+}
+
+auto find_xfs_row(const std::vector<WkiSummaryRow>& rows, std::string_view op) -> const WkiSummaryRow* {
+    for (const auto& row : rows) {
+        if (row.op == op) {
+            return &row;
+        }
+    }
+    return nullptr;
+}
+
+void print_checkout_xfs_table(const CheckoutSummaryRows& loaded, int limit) {
+    if (loaded.rows.empty()) {
+        std::println("=== perf checkout-report xfs ========================================");
+        std::println("perf: no local_xfs summary rows found in {} or {}", PERF_DATA_FILE, KWKISTAT_PATH);
+        std::println("hint: capture checkout with `perf record <ms> --filter=xfs,container` or `perf run --filter=xfs,container <cmd>`");
+        return;
+    }
+
+    std::vector<WkiSummaryRow> rows = loaded.rows;
+    std::ranges::sort(rows, [](const WkiSummaryRow& lhs, const WkiSummaryRow& rhs) {
+        if (lhs.total_us != rhs.total_us) {
+            return lhs.total_us > rhs.total_us;
+        }
+        if (lhs.p99_us != rhs.p99_us) {
+            return lhs.p99_us > rhs.p99_us;
+        }
+        if (lhs.max_us != rhs.max_us) {
+            return lhs.max_us > rhs.max_us;
+        }
+        return lhs.calls > rhs.calls;
+    });
+
+    std::println("=== perf checkout-report xfs [{}] ==================================", loaded.source);
+    std::println("{:<18}  {:>9}  {:>6}  {:>11}  {:>10}  {:>9}  {:>9}  {:>9}  {:>9}", "OP", "CALLS", "ERR", "BYTES", "TOTAL(ms)", "AVG(us)",
+                 "P99(us)", "MAX(us)", "MiB/s");
+    std::println("{:->18}  {:->9}  {:->6}  {:->11}  {:->10}  {:->9}  {:->9}  {:->9}  {:->9}", "", "", "", "", "", "", "", "", "");
+    for (int i = 0; std::cmp_less(i, rows.size()) && i < limit; ++i) {
+        const auto& row = rows.at(static_cast<std::size_t>(i));
+        std::println("{:<18}  {:>9}  {:>6}  {:>11}  {:>10}  {:>9}  {:>9}  {:>9}  {:>9}", row.op, row.calls, row.errors,
+                     format_scaled_bytes(row.bytes), xfs_total_ms(row), row.avg_us, row.p99_us, row.max_us,
+                     format_mib_per_s(row.bytes, row.total_us));
+    }
+}
+
+void print_checkout_focus_rows(const CheckoutSummaryRows& loaded) {
+    if (loaded.rows.empty()) {
+        return;
+    }
+
+    constexpr std::array<std::string_view, 17> FOCUS_OPS{{
+        "inode_fetch",
+        "inode_cache_miss",
+        "inode_unavailable",
+        "buf_get_miss",
+        "buf_read_miss",
+        "buf_disk_read",
+        "buf_disk_write",
+        "buf_dirty",
+        "buf_flush",
+        "sync_blockdev",
+        "write_bmap",
+        "write_alloc",
+        "write_ilog",
+        "write_io",
+        "read_bmap",
+        "read_io",
+        "read_gap",
+    }};
+
+    std::println("");
+    std::println("=== checkout key counters ===========================================");
+    std::println("{:<18}  {:>9}  {:>11}  {:>10}  {:>9}  {:>9}  {:>11}", "OP", "CALLS", "BYTES", "TOTAL(ms)", "AVG(us)", "P99(us)",
+                 "MAX(us)");
+    std::println("{:->18}  {:->9}  {:->11}  {:->10}  {:->9}  {:->9}  {:->11}", "", "", "", "", "", "", "");
+
+    int printed = 0;
+    for (std::string_view op : FOCUS_OPS) {
+        const WkiSummaryRow* row = find_xfs_row(loaded.rows, op);
+        if (row == nullptr || row->calls == 0) {
+            continue;
+        }
+        std::println("{:<18}  {:>9}  {:>11}  {:>10}  {:>9}  {:>9}  {:>11}", row->op, row->calls, format_scaled_bytes(row->bytes),
+                     xfs_total_ms(*row), row->avg_us, row->p99_us, row->max_us);
+        printed++;
+    }
+
+    if (printed == 0) {
+        std::println("no checkout focus counters were present in {}", loaded.source);
+    }
+}
+
+auto load_diag_text(std::string_view section_header, std::string_view section_footer, std::string_view live_path,
+                    std::size_t initial_capacity = CPUSTAT_READ_CAPACITY) -> std::optional<WkiLoadedText> {
+    auto saved = load_perf_data_section(section_header, section_footer);
+    if (saved.has_value() && !saved->empty()) {
+        return WkiLoadedText{.source = std::string(PERF_DATA_FILE), .buffer = std::move(*saved), .sectioned = true};
+    }
+
+    auto live = read_file(live_path, initial_capacity);
+    if (!live.has_value() || live->empty()) {
+        return std::nullopt;
+    }
+    return WkiLoadedText{.source = std::string(live_path), .buffer = std::move(*live), .sectioned = false};
+}
+
+void print_checkout_cache_state() {
+    auto loaded = load_diag_text(SECTION_MEMACC_ALLOC_TOTALS, SECTION_MEMACC_ALLOC_TOTALS_END, MEMACC_ALLOC_TOTALS_PATH);
+    std::println("");
+    std::println("=== checkout cache and dirty state ==================================");
+    if (!loaded.has_value()) {
+        std::println("perf: no memacc allocator/cache snapshot found in {} or {}", PERF_DATA_FILE, MEMACC_ALLOC_TOTALS_PATH);
+        return;
+    }
+
+    auto rows = parse_key_value_rows(loaded->buffer);
+    std::println("source: {}", loaded->source);
+
+    if (const KeyValueRow* bcache = find_row_by_record(rows, "buffer_cache"); bcache != nullptr) {
+        uint64_t const HITS = get_row_u64(*bcache, "hits");
+        uint64_t const MISSES = get_row_u64(*bcache, "misses");
+        uint64_t const DIRTY_BYTES = get_row_u64(*bcache, "dirty_bytes");
+        uint64_t const DIRTY_TARGET = get_row_u64(*bcache, "dirty_target_bytes");
+        uint64_t const DIRTY_HARD = get_row_u64(*bcache, "dirty_hard_bytes");
+        std::println("buffer_cache: total={} clean={} dirty={} buffers={} dirty_buffers={} hit={:.1f}%",
+                     format_scaled_bytes(get_row_u64(*bcache, "total_bytes")), format_scaled_bytes(get_row_u64(*bcache, "clean_bytes")),
+                     format_scaled_bytes(DIRTY_BYTES), get_row_u64(*bcache, "buffers"), get_row_u64(*bcache, "dirty_buffers"),
+                     ratio_percent(HITS, HITS + MISSES));
+        std::println("dirty limits: target={} ({:.1f}%) hard={} ({:.1f}%) waiters={} dirty_bdevs={}", format_scaled_bytes(DIRTY_TARGET),
+                     ratio_percent(DIRTY_BYTES, DIRTY_TARGET), format_scaled_bytes(DIRTY_HARD), ratio_percent(DIRTY_BYTES, DIRTY_HARD),
+                     get_row_u64(*bcache, "dirty_waiters"), get_row_u64(*bcache, "dirty_bdevs"));
+    } else {
+        std::println("buffer_cache: unavailable");
+    }
+
+    int dirty_bdevs = 0;
+    for (const auto& row : rows) {
+        if (row.record != "buffer_cache_bdev") {
+            continue;
+        }
+        uint64_t const DIRTY_BYTES = get_row_u64(row, "dirty_bytes");
+        uint64_t const DIRTY_BUFFERS = get_row_u64(row, "dirty_buffers");
+        if (DIRTY_BYTES == 0 && DIRTY_BUFFERS == 0) {
+            continue;
+        }
+        std::println("dirty bdev: name={} dirty={} dirty_buffers={} oldest_epoch={}", get_row_string(row, "name"),
+                     format_scaled_bytes(DIRTY_BYTES), DIRTY_BUFFERS, get_row_u64(row, "oldest_dirty_epoch"));
+        dirty_bdevs++;
+    }
+    if (dirty_bdevs == 0) {
+        std::println("dirty bdev: none");
+    }
+
+    if (const KeyValueRow* vfs_cache = find_row_by_record(rows, "vfs_cache"); vfs_cache != nullptr) {
+        uint64_t const META_HITS = get_row_u64(*vfs_cache, "metadata_hits");
+        uint64_t const META_MISSES = get_row_u64(*vfs_cache, "metadata_misses");
+        uint64_t const FSTAT_HITS = get_row_u64(*vfs_cache, "fstat_snapshot_hits");
+        uint64_t const FSTAT_MISSES = get_row_u64(*vfs_cache, "fstat_snapshot_misses");
+        std::println("vfs_cache: metadata hits={} misses={} stores={} hit={:.1f}%  fstat hits={} misses={} stores={} hit={:.1f}%",
+                     META_HITS, META_MISSES, get_row_u64(*vfs_cache, "metadata_stores"), ratio_percent(META_HITS, META_HITS + META_MISSES),
+                     FSTAT_HITS, FSTAT_MISSES, get_row_u64(*vfs_cache, "fstat_snapshot_stores"),
+                     ratio_percent(FSTAT_HITS, FSTAT_HITS + FSTAT_MISSES));
+        std::println("vfs_stream: hits={} misses={} backend_reads={} backend={} copied={}", get_row_u64(*vfs_cache, "stream_hits"),
+                     get_row_u64(*vfs_cache, "stream_misses"), get_row_u64(*vfs_cache, "stream_backend_reads"),
+                     format_scaled_bytes(get_row_u64(*vfs_cache, "stream_backend_bytes")),
+                     format_scaled_bytes(get_row_u64(*vfs_cache, "stream_copied_bytes")));
+    } else {
+        std::println("vfs_cache: unavailable");
+    }
+
+    if (const KeyValueRow* dentry = find_row_by_record(rows, "xfs_dentry_cache"); dentry != nullptr) {
+        uint64_t const HITS = get_row_u64(*dentry, "hits");
+        uint64_t const MISSES = get_row_u64(*dentry, "misses");
+        std::println("xfs_dentry_cache: hits={} misses={} stores={} invalidations={} hit={:.1f}%", HITS, MISSES,
+                     get_row_u64(*dentry, "stores"), get_row_u64(*dentry, "invalidations"), ratio_percent(HITS, HITS + MISSES));
+    } else {
+        std::println("xfs_dentry_cache: unavailable");
+    }
+}
+
+void print_checkout_fd_state() {
+    auto loaded = load_diag_text(SECTION_CONTSTAT, SECTION_CONTSTAT_END, KCONTSTAT_PATH);
+    std::println("");
+    std::println("=== checkout fd churn ===============================================");
+    if (!loaded.has_value()) {
+        std::println("perf: no container snapshot found in {} or {}", PERF_DATA_FILE, KCONTSTAT_PATH);
+        return;
+    }
+
+    auto rows = parse_key_value_rows(loaded->buffer);
+    const KeyValueRow* fd_table = find_row_by_key(rows, "subsys", "fd_table");
+    if (fd_table == nullptr) {
+        std::println("fd_table: no aggregate activity in {}", loaded->source);
+        return;
+    }
+
+    std::println("source: {}", loaded->source);
+    std::println("fd_table: inserts={} removes={} resizes={} oom={} peak={} current={}", get_row_u64(*fd_table, "inserts"),
+                 get_row_u64(*fd_table, "removes"), get_row_u64(*fd_table, "resizes"), get_row_u64(*fd_table, "oom"),
+                 get_row_u64(*fd_table, "peak"), get_row_u64(*fd_table, "current"));
+}
+
+void cmd_checkout_report(int limit) {
+    if (limit < 1) {
+        limit = DEFAULT_CHECKOUT_ROWS;
+    }
+
+    CheckoutSummaryRows xfs_rows = load_checkout_xfs_rows();
+    print_checkout_xfs_table(xfs_rows, limit);
+    print_checkout_focus_rows(xfs_rows);
+    print_checkout_cache_state();
+    print_checkout_fd_state();
 }
 
 void cmd_wki_tail(int limit, const WkiTraceFilter& filter, const WkiDisplayOptions& display_options, WkiDataView view) {
@@ -4127,6 +4561,9 @@ void cmd_run(int argc, char** argv) {
         write_all(data_fd.get(), SECTION_EVENTS_END);
         ssize_t const SUMMARY_BYTES = write_section_wki_summary(data_fd.get());
         ssize_t const IPC_BYTES = write_section_ipc_stats(data_fd.get());
+        ssize_t const CONTSTAT_BYTES = write_section_contstat(data_fd.get());
+        ssize_t const MEMACC_BYTES = write_section_memacc_alloc_totals(data_fd.get());
+        ssize_t const DIAG_BYTES = CONTSTAT_BYTES + MEMACC_BYTES;
         write_section_peer_map(data_fd.get());
         write_all(data_fd.get(), SECTION_PROC_MAP);
 
@@ -4149,11 +4586,11 @@ void cmd_run(int argc, char** argv) {
 
         write_all(data_fd.get(), SECTION_PROC_MAP_END);
 
-        if (total_event_bytes <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0) {
+        if (total_event_bytes <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0 && DIAG_BYTES <= 0) {
             std::println("perf: ring buffer empty - PROC_MAP saved, no events");
         } else {
-            std::println("perf: saved to {} ({} event bytes, {} summary bytes, {} IPC bytes)", PERF_DATA_FILE, total_event_bytes,
-                         SUMMARY_BYTES, IPC_BYTES);
+            std::println("perf: saved to {} ({} event bytes, {} summary bytes, {} IPC bytes, {} diag bytes)", PERF_DATA_FILE,
+                         total_event_bytes, SUMMARY_BYTES, IPC_BYTES, DIAG_BYTES);
         }
     } else {
         std::println("perf: cannot write {}", PERF_DATA_FILE);
@@ -4235,6 +4672,7 @@ int run_wki_report_command(int argc, char** argv);
 int run_local_report_command(int argc, char** argv);
 int run_all_report_command(int argc, char** argv);
 int run_vmem_report_command(int argc, char** argv);
+int run_checkout_report_command(int argc, char** argv);
 int run_wki_launch_command(int argc, char** argv);
 int run_wki_tail_command(int argc, char** argv);
 int run_local_tail_command(int argc, char** argv);
@@ -4248,7 +4686,7 @@ int run_run_command(int argc, char** argv);
 int run_show_map_command(int argc, char** argv);
 int run_help_command(int argc, char** argv);
 
-constexpr std::array<CommandSpec, 23> COMMANDS = {{
+constexpr std::array<CommandSpec, 24> COMMANDS = {{
     {.name = "stat", .args = "[ms=1000]", .summary = "CPU% per process over a sampling window", .handler = run_stat_command},
     {.name = "record",
      .args = "[ms=1000] [--filter=<filters>]",
@@ -4275,6 +4713,10 @@ constexpr std::array<CommandSpec, 23> COMMANDS = {{
      .args = "[filters]",
      .summary = "Local vmem mmap/COW/cache summary statistics",
      .handler = run_vmem_report_command},
+    {.name = "checkout-report",
+     .args = "[n=12]",
+     .summary = "Git checkout/reset XFS, cache, dirty-writeback, and FD diagnostics",
+     .handler = run_checkout_report_command},
     {.name = "wki-launch",
      .args = "[n=20] [--time=FMT] [--peer-ids]",
      .summary = "Remote launch stage timings",
@@ -4481,6 +4923,21 @@ int run_vmem_report_command(int argc, char** argv) {
         filter.scope = "local_vmem";
     }
     cmd_vmem_report(filter);
+    return 0;
+}
+
+int run_checkout_report_command(int argc, char** argv) {
+    int rows = DEFAULT_CHECKOUT_ROWS;
+    for (int i = 2; i < argc; ++i) {
+        std::string_view const ARG(argv[i]);
+        if (!ARG.empty() && ARG.front() != '-') {
+            rows = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
+        } else {
+            std::println("perf checkout-report: unrecognized argument '{}'", argv[i]);
+            return 1;
+        }
+    }
+    cmd_checkout_report(rows);
     return 0;
 }
 

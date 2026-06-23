@@ -91,9 +91,12 @@ constexpr size_t PIPE_DEFAULT_CAPACITY = 256UL * 1024UL;
 constexpr size_t PIPE_DIRECT_MAX_CAPACITY = 256UL * 1024UL;
 constexpr size_t METADATA_CACHE_SET_COUNT = 256;
 constexpr size_t METADATA_CACHE_WAYS = 4;
+constexpr size_t METADATA_INVALIDATION_SET_COUNT = 512;
+constexpr size_t METADATA_INVALIDATION_WAYS = 4;
 constexpr size_t SYMLINK_CACHE_SET_COUNT = 512;
 constexpr size_t SYMLINK_CACHE_WAYS = 4;
 static_assert((METADATA_CACHE_SET_COUNT & (METADATA_CACHE_SET_COUNT - 1)) == 0);
+static_assert((METADATA_INVALIDATION_SET_COUNT & (METADATA_INVALIDATION_SET_COUNT - 1)) == 0);
 static_assert((SYMLINK_CACHE_SET_COUNT & (SYMLINK_CACHE_SET_COUNT - 1)) == 0);
 
 struct MetadataCacheEntry {
@@ -103,6 +106,7 @@ struct MetadataCacheEntry {
     uint64_t epoch = 0;
     uint64_t last_used = 0;
     uint64_t dev_id = 0;
+    uint64_t invalidation_generation = 0;
     size_t path_len = 0;
     int result = 0;
     FSType fs_type = FSType::TMPFS;
@@ -122,6 +126,7 @@ struct SymlinkCacheEntry {
     uint64_t epoch = 0;
     uint64_t last_used = 0;
     uint64_t dev_id = 0;
+    uint64_t invalidation_generation = 0;
     size_t path_len = 0;
     size_t target_len = 0;
     ssize_t result = 0;
@@ -133,14 +138,33 @@ struct SymlinkCacheSet {
     std::array<SymlinkCacheEntry, SYMLINK_CACHE_WAYS> ways{};
 };
 
+struct MetadataInvalidationEntry {
+    uint64_t path_hash = 0;
+    uint64_t generation = 0;
+    bool valid = false;
+};
+
+struct MetadataInvalidationSet {
+    std::array<MetadataInvalidationEntry, METADATA_INVALIDATION_WAYS> ways{};
+};
+
 std::array<MetadataCacheSet, METADATA_CACHE_SET_COUNT> g_metadata_cache{};
 ker::mod::sys::Mutex g_metadata_cache_lock;
+// Path metadata/readlink caches use path-scoped invalidation generations.
+// g_metadata_cache_epoch remains the conservative public epoch consumed by
+// fstat snapshots and XFS dentry freshness.
+std::atomic<uint64_t> g_metadata_cache_generation{1};
 std::atomic<uint64_t> g_metadata_cache_epoch{1};
 std::atomic<uint64_t> g_metadata_cache_clock{0};
 
 std::array<SymlinkCacheSet, SYMLINK_CACHE_SET_COUNT> g_symlink_cache{};
 ker::mod::sys::Mutex g_symlink_cache_lock;
 std::atomic<uint64_t> g_symlink_cache_clock{0};
+
+std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT> g_metadata_subtree_invalidations{};
+std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT> g_metadata_exact_invalidations{};
+ker::mod::sys::Mutex g_metadata_invalidation_lock;
+std::atomic<uint64_t> g_metadata_invalidation_generation{1};
 
 std::atomic<uint64_t> g_vfs_metadata_hits{0};
 std::atomic<uint64_t> g_vfs_metadata_misses{0};
@@ -197,13 +221,169 @@ auto metadata_hash_path(const char* path, size_t len, bool follow_final_symlink,
     return hash == 0 ? 1 : hash;
 }
 
+auto metadata_invalidation_hash_path(const char* path, size_t len) -> uint64_t {
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= static_cast<unsigned char>(path[i]);
+        hash *= 1099511628211ULL;
+    }
+    return hash == 0 ? 1 : hash;
+}
+
+auto metadata_normalized_path_len(const char* path) -> size_t {
+    if (path == nullptr || path[0] != '/') {
+        return 0;
+    }
+    size_t len = std::strlen(path);
+    while (len > 1 && path[len - 1] == '/') {
+        --len;
+    }
+    return len;
+}
+
+auto metadata_parent_path_len(const char* path, size_t path_len) -> size_t {
+    if (path == nullptr || path_len == 0 || path[0] != '/') {
+        return 0;
+    }
+    if (path_len <= 1) {
+        return 1;
+    }
+
+    size_t slash = path_len - 1;
+    while (slash > 0 && path[slash] != '/') {
+        --slash;
+    }
+    return slash == 0 ? 1 : slash;
+}
+
+void metadata_invalidation_clear_locked() {
+    for (auto& set : g_metadata_subtree_invalidations) {
+        for (auto& entry : set.ways) {
+            entry.valid = false;
+        }
+    }
+    for (auto& set : g_metadata_exact_invalidations) {
+        for (auto& entry : set.ways) {
+            entry.valid = false;
+        }
+    }
+}
+
+void metadata_cache_bump_generation_locked() {
+    g_metadata_cache_generation.fetch_add(1, std::memory_order_acq_rel);
+    metadata_invalidation_clear_locked();
+}
+
+auto metadata_invalidation_store_locked(std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT>& table, uint64_t path_hash,
+                                        uint64_t generation) -> bool {
+    auto& set = table.at(path_hash & (METADATA_INVALIDATION_SET_COUNT - 1));
+    MetadataInvalidationEntry* free_entry = nullptr;
+    for (auto& entry : set.ways) {
+        if (entry.valid && entry.path_hash == path_hash) {
+            entry.generation = generation;
+            return true;
+        }
+        if (!entry.valid && free_entry == nullptr) {
+            free_entry = &entry;
+        }
+    }
+    if (free_entry == nullptr) {
+        return false;
+    }
+    free_entry->path_hash = path_hash;
+    free_entry->generation = generation;
+    free_entry->valid = true;
+    return true;
+}
+
+void metadata_invalidation_store_or_reset_locked(std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT>& table,
+                                                 uint64_t path_hash, uint64_t generation) {
+    if (metadata_invalidation_store_locked(table, path_hash, generation)) {
+        return;
+    }
+
+    metadata_cache_bump_generation_locked();
+    static_cast<void>(metadata_invalidation_store_locked(table, path_hash, generation));
+}
+
+auto metadata_invalidation_generation_for_hash_locked(const std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT>& table,
+                                                      uint64_t path_hash) -> uint64_t {
+    auto const& set = table.at(path_hash & (METADATA_INVALIDATION_SET_COUNT - 1));
+    for (auto const& entry : set.ways) {
+        if (entry.valid && entry.path_hash == path_hash) {
+            return entry.generation;
+        }
+    }
+    return 0;
+}
+
+void metadata_cache_note_one_path_changed_locked(const char* path) {
+    size_t const PATH_LEN = metadata_normalized_path_len(path);
+    if (PATH_LEN == 0) {
+        return;
+    }
+    if (PATH_LEN == 1) {
+        metadata_cache_bump_generation_locked();
+        return;
+    }
+
+    uint64_t const PATH_GENERATION = g_metadata_invalidation_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    uint64_t const PATH_HASH = metadata_invalidation_hash_path(path, PATH_LEN);
+    metadata_invalidation_store_or_reset_locked(g_metadata_subtree_invalidations, PATH_HASH, PATH_GENERATION);
+
+    size_t const PARENT_LEN = metadata_parent_path_len(path, PATH_LEN);
+    if (PARENT_LEN == 0) {
+        return;
+    }
+    uint64_t const PARENT_GENERATION = g_metadata_invalidation_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    uint64_t const PARENT_HASH = metadata_invalidation_hash_path(path, PARENT_LEN);
+    metadata_invalidation_store_or_reset_locked(g_metadata_exact_invalidations, PARENT_HASH, PARENT_GENERATION);
+}
+
+void metadata_cache_note_path_changed(const char* old_path, const char* new_path) {
+    if (old_path == nullptr && new_path == nullptr) {
+        return;
+    }
+
+    g_metadata_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
+    g_metadata_invalidation_lock.lock();
+    metadata_cache_note_one_path_changed_locked(old_path);
+    if (new_path != nullptr && (old_path == nullptr || std::strcmp(old_path, new_path) != 0)) {
+        metadata_cache_note_one_path_changed_locked(new_path);
+    }
+    g_metadata_invalidation_lock.unlock();
+}
+
+auto metadata_path_invalidated_since(const char* path, size_t path_len, uint64_t seen_generation) -> bool {
+    if (path == nullptr || path_len == 0 || path[0] != '/') {
+        return true;
+    }
+
+    bool invalidated = false;
+    g_metadata_invalidation_lock.lock();
+
+    uint64_t const EXACT_HASH = metadata_invalidation_hash_path(path, path_len);
+    invalidated = metadata_invalidation_generation_for_hash_locked(g_metadata_exact_invalidations, EXACT_HASH) > seen_generation;
+
+    size_t prefix_len = 1;
+    while (!invalidated && prefix_len < path_len) {
+        ++prefix_len;
+        while (prefix_len < path_len && path[prefix_len] != '/') {
+            ++prefix_len;
+        }
+        uint64_t const PREFIX_HASH = metadata_invalidation_hash_path(path, prefix_len);
+        invalidated = metadata_invalidation_generation_for_hash_locked(g_metadata_subtree_invalidations, PREFIX_HASH) > seen_generation;
+    }
+
+    g_metadata_invalidation_lock.unlock();
+    return invalidated;
+}
+
 auto metadata_cacheable_fs(FSType fs_type) -> bool {
     return fs_type == FSType::TMPFS || fs_type == FSType::FAT32 || fs_type == FSType::XFS;
 }
 
 auto metadata_cacheable_result(int result) -> bool { return result == 0 || result == -ENOENT; }
-
-void metadata_cache_bump_epoch() { g_metadata_cache_epoch.fetch_add(1, std::memory_order_acq_rel); }
 
 auto symlink_cacheable_fs(FSType fs_type) -> bool { return fs_type == FSType::TMPFS || fs_type == FSType::FAT32 || fs_type == FSType::XFS; }
 
@@ -264,7 +444,7 @@ auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bo
         return -EAGAIN;
     }
 
-    uint64_t const EPOCH = g_metadata_cache_epoch.load(std::memory_order_acquire);
+    uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
     uint64_t const HASH = metadata_hash_path(path, PATH_LEN, follow_final_symlink, require_directory, fs_type, dev_id);
     auto& set = g_metadata_cache.at(HASH & (METADATA_CACHE_SET_COUNT - 1));
 
@@ -275,6 +455,10 @@ auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bo
             continue;
         }
         if (std::memcmp(entry.path.data(), path, PATH_LEN + 1) != 0) {
+            continue;
+        }
+        if (metadata_path_invalidated_since(entry.path.data(), entry.path_len, entry.invalidation_generation)) {
+            entry.valid = false;
             continue;
         }
 
@@ -306,7 +490,8 @@ void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, boo
         return;
     }
 
-    uint64_t const EPOCH = g_metadata_cache_epoch.load(std::memory_order_acquire);
+    uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
+    uint64_t const INVALIDATION_GENERATION = g_metadata_invalidation_generation.load(std::memory_order_acquire);
     uint64_t const HASH = metadata_hash_path(path, PATH_LEN, follow_final_symlink, require_directory, fs_type, dev_id);
     uint64_t const USE_STAMP = g_metadata_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
     auto& set = g_metadata_cache.at(HASH & (METADATA_CACHE_SET_COUNT - 1));
@@ -336,6 +521,7 @@ void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, boo
     victim->epoch = EPOCH;
     victim->last_used = USE_STAMP;
     victim->dev_id = dev_id;
+    victim->invalidation_generation = INVALIDATION_GENERATION;
     victim->path_len = PATH_LEN;
     victim->result = result;
     victim->fs_type = fs_type;
@@ -365,7 +551,7 @@ auto symlink_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, cha
         return false;
     }
 
-    uint64_t const EPOCH = g_metadata_cache_epoch.load(std::memory_order_acquire);
+    uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
     uint64_t const HASH = symlink_hash_path(path, PATH_LEN, fs_type, dev_id);
     auto& set = g_symlink_cache.at(HASH & (SYMLINK_CACHE_SET_COUNT - 1));
 
@@ -376,6 +562,10 @@ auto symlink_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, cha
             continue;
         }
         if (std::memcmp(entry.path.data(), path, PATH_LEN + 1) != 0) {
+            continue;
+        }
+        if (metadata_path_invalidated_since(entry.path.data(), entry.path_len, entry.invalidation_generation)) {
+            entry.valid = false;
             continue;
         }
 
@@ -417,7 +607,8 @@ void symlink_cache_store(const char* path, FSType fs_type, uint64_t dev_id, ssiz
         }
     }
 
-    uint64_t const EPOCH = g_metadata_cache_epoch.load(std::memory_order_acquire);
+    uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
+    uint64_t const INVALIDATION_GENERATION = g_metadata_invalidation_generation.load(std::memory_order_acquire);
     uint64_t const HASH = symlink_hash_path(path, PATH_LEN, fs_type, dev_id);
     uint64_t const USE_STAMP = g_symlink_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
     auto& set = g_symlink_cache.at(HASH & (SYMLINK_CACHE_SET_COUNT - 1));
@@ -450,6 +641,7 @@ void symlink_cache_store(const char* path, FSType fs_type, uint64_t dev_id, ssiz
     victim->epoch = EPOCH;
     victim->last_used = USE_STAMP;
     victim->dev_id = dev_id;
+    victim->invalidation_generation = INVALIDATION_GENERATION;
     victim->path_len = PATH_LEN;
     victim->target_len = target_len;
     victim->result = result;
@@ -1803,14 +1995,14 @@ void cache_notify_register_open_file_impl(File* file) {
 
 void cache_notify_invalidate_path_impl(const char* vfs_path) {
     if (vfs_path != nullptr) {
-        metadata_cache_bump_epoch();
+        metadata_cache_note_path_changed(vfs_path, nullptr);
     }
     cache_notify_invalidate_path_local(vfs_path);
 }
 
 void cache_notify_path_changed_impl(const char* old_vfs_path, const char* new_vfs_path) {
     if (old_vfs_path != nullptr || new_vfs_path != nullptr) {
-        metadata_cache_bump_epoch();
+        metadata_cache_note_path_changed(old_vfs_path, new_vfs_path);
     }
     bool old_became_dirty = false;
     bool new_became_dirty = false;
@@ -3685,7 +3877,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
         return TRUNCATE_RET;
     }
     if ((backend_flags & ker::vfs::O_CREAT) != 0) {
-        metadata_cache_bump_epoch();
+        metadata_cache_note_path_changed(path_buffer.data(), nullptr);
     }
     if ((flags & ker::vfs::O_NO_CACHE) != 0) {
         vfs_cache_notify_path_changed(f->vfs_path, nullptr);
@@ -8137,7 +8329,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
         f->open_flags = flags;
         f->fd_flags = 0;
         if ((backend_flags & ker::vfs::O_CREAT) != 0) {
-            metadata_cache_bump_epoch();
+            metadata_cache_note_path_changed(pathBuffer, nullptr);
         }
         if ((flags & ker::vfs::O_NO_CACHE) != 0) {
             vfs_cache_notify_path_changed(f->vfs_path, nullptr);

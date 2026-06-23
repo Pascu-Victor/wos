@@ -20,6 +20,7 @@
 #include <vfs/buffer_cache.hpp>
 
 #include "dev/block_device.hpp"
+#include "vfs/fs/xfs/xfs_dir2.hpp"
 #include "vfs/fs/xfs/xfs_format.hpp"
 #include "vfs/fs/xfs/xfs_inode.hpp"
 #include "vfs/fs/xfs/xfs_vfs.hpp"
@@ -380,6 +381,7 @@ void xfs_unmount(XfsMountContext* ctx) {
     }
 
     xfs_icache_purge(ctx);
+    xfs_dentry_cache_purge_mount(ctx);
 
     // Invalidate cached buffers
     invalidate_bdev(ctx->device);

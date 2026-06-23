@@ -29,7 +29,22 @@
 namespace ker::mod::sys {
 namespace {
 constexpr int WOS_SIGSYS = 31;
+
+auto sysret_bad_return_reason(uint64_t reason) -> const char* {
+    switch (reason) {
+        case 1:
+            return "rcx-mismatch";
+        case 2:
+            return "bad-user-rip";
+        case 3:
+            return "bad-user-rsp";
+        case 4:
+            return "bad-user-rflags";
+        default:
+            return "unknown";
+    }
 }
+}  // namespace
 
 extern "C" auto syscall_handler(cpu::GPRegs* regs) -> uint64_t {
     sched::begin_syscall_accounting();
@@ -172,6 +187,35 @@ extern "C" [[noreturn]] void wos_sysret_corrupt_panic(uint64_t actual_rcx, uint6
         "  gs:0x10 (cpuId):        0x%lx\n"
         "  Halting.\n",
         actual_rcx, expected_rcx, user_rsp, CPU_ID, gs_kern_stack, gs_saved_rip, gs_cpu_id);
+    for (;;) {
+        asm volatile("hlt");
+    }
+}
+
+extern "C" [[noreturn]] void wos_sysret_bad_return_panic(uint64_t saved_rcx, uint64_t scratch_rip, uint64_t user_rsp, uint64_t user_rflags,
+                                                         uint64_t reason) {
+    uint64_t const CPU_ID = cpu::current_cpu();
+
+    // NOLINTNEXTLINE(misc-const-correctness)
+    uint64_t gs_kern_stack = 0;
+    asm volatile("movq %%gs:0x0, %0" : "=r"(gs_kern_stack));
+
+    // NOLINTNEXTLINE(misc-const-correctness)
+    uint64_t gs_cpu_id = 0;
+    asm volatile("movq %%gs:0x10, %0" : "=r"(gs_cpu_id));
+
+    dbg::emergency_log(
+        "\n!!! BAD SYSRET RETURN TARGET DETECTED !!!\n"
+        "  Reason:         %s (%lu)\n"
+        "  Saved RCX:      0x%lx\n"
+        "  Scratch RIP:    0x%lx\n"
+        "  User RSP:       0x%lx\n"
+        "  User RFLAGS:    0x%lx\n"
+        "  CPU: %lu\n"
+        "  gs:0x00 (kernel stack): 0x%lx\n"
+        "  gs:0x10 (cpuId):        0x%lx\n"
+        "  Halting before returning to userspace.\n",
+        sysret_bad_return_reason(reason), reason, saved_rcx, scratch_rip, user_rsp, user_rflags, CPU_ID, gs_kern_stack, gs_cpu_id);
     for (;;) {
         asm volatile("hlt");
     }

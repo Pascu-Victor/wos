@@ -24,7 +24,6 @@
 #include <vfs/fs/xfs/xfs_alloc.hpp>
 #include <vfs/fs/xfs/xfs_bmap.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
-#include <vfs/vfs.hpp>
 
 #include "net/endian.hpp"
 #include "vfs/fs/xfs/xfs_format.hpp"
@@ -143,7 +142,10 @@ void fill_dir_entry(const XfsMountContext* ctx, const XfsDir2DataEntry* dep, Xfs
 
 constexpr size_t XFS_DENTRY_CACHE_SET_COUNT = 1024;
 constexpr size_t XFS_DENTRY_CACHE_WAYS = 4;
+constexpr size_t XFS_DENTRY_GENERATION_SET_COUNT = 1024;
+constexpr size_t XFS_DENTRY_GENERATION_WAYS = 4;
 static_assert((XFS_DENTRY_CACHE_SET_COUNT & (XFS_DENTRY_CACHE_SET_COUNT - 1)) == 0);
+static_assert((XFS_DENTRY_GENERATION_SET_COUNT & (XFS_DENTRY_GENERATION_SET_COUNT - 1)) == 0);
 
 struct XfsDentryCacheEntry {
     std::array<char, 256> name{};
@@ -151,7 +153,6 @@ struct XfsDentryCacheEntry {
     XfsMountContext* mount{};
     xfs_ino_t parent_ino{};
     uint64_t hash{};
-    uint64_t vfs_epoch{};
     uint64_t dir_generation{};
     uint64_t last_used{};
     uint16_t namelen{};
@@ -163,16 +164,31 @@ struct XfsDentryCacheSet {
     std::array<XfsDentryCacheEntry, XFS_DENTRY_CACHE_WAYS> ways{};
 };
 
+struct XfsDentryGenerationEntry {
+    XfsMountContext* mount{};
+    xfs_ino_t parent_ino{};
+    uint64_t hash{};
+    uint64_t generation{};
+    uint64_t last_used{};
+    bool valid{};
+};
+
+struct XfsDentryGenerationSet {
+    std::array<XfsDentryGenerationEntry, XFS_DENTRY_GENERATION_WAYS> ways{};
+};
+
 std::array<XfsDentryCacheSet, XFS_DENTRY_CACHE_SET_COUNT> g_xfs_dentry_cache{};
+std::array<XfsDentryGenerationSet, XFS_DENTRY_GENERATION_SET_COUNT> g_xfs_dentry_generations{};
 ker::mod::sys::Spinlock g_xfs_dentry_cache_lock;
 std::atomic<uint64_t> g_xfs_dentry_cache_clock{0};
-std::atomic<uint64_t> g_xfs_dentry_generation{1};
+std::atomic<uint64_t> g_xfs_dentry_generation_clock{0};
+std::atomic<uint64_t> g_xfs_dentry_next_generation{1};
 std::atomic<uint64_t> g_xfs_dentry_hits{0};
 std::atomic<uint64_t> g_xfs_dentry_misses{0};
 std::atomic<uint64_t> g_xfs_dentry_stores{0};
 std::atomic<uint64_t> g_xfs_dentry_invalidations{0};
 
-auto xfs_dentry_hash_name(XfsMountContext* mount, xfs_ino_t parent_ino, const char* name, uint16_t namelen) -> uint64_t {
+auto xfs_dentry_hash_dir(XfsMountContext* mount, xfs_ino_t parent_ino) -> uint64_t {
     uint64_t hash = 1469598103934665603ULL;
     auto const MOUNT_VALUE = reinterpret_cast<uintptr_t>(mount);
     for (int shift = 0; shift < 64; shift += 8) {
@@ -183,6 +199,11 @@ auto xfs_dentry_hash_name(XfsMountContext* mount, xfs_ino_t parent_ino, const ch
         hash ^= static_cast<uint8_t>((parent_ino >> shift) & 0xffU);
         hash *= 1099511628211ULL;
     }
+    return hash == 0 ? 1 : hash;
+}
+
+auto xfs_dentry_hash_name(XfsMountContext* mount, xfs_ino_t parent_ino, const char* name, uint16_t namelen) -> uint64_t {
+    uint64_t hash = xfs_dentry_hash_dir(mount, parent_ino);
     for (uint16_t i = 0; i < namelen; ++i) {
         hash ^= static_cast<unsigned char>(name[i]);
         hash *= 1099511628211ULL;
@@ -192,20 +213,51 @@ auto xfs_dentry_hash_name(XfsMountContext* mount, xfs_ino_t parent_ino, const ch
     return hash == 0 ? 1 : hash;
 }
 
+auto xfs_dentry_next_generation_value() -> uint64_t { return g_xfs_dentry_next_generation.fetch_add(1, std::memory_order_relaxed) + 1; }
+
+auto xfs_dentry_cache_dir_generation_locked(XfsMountContext* mount, xfs_ino_t parent_ino) -> uint64_t {
+    uint64_t const HASH = xfs_dentry_hash_dir(mount, parent_ino);
+    uint64_t const USE_STAMP = g_xfs_dentry_generation_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto& set = g_xfs_dentry_generations.at(HASH & (XFS_DENTRY_GENERATION_SET_COUNT - 1));
+
+    XfsDentryGenerationEntry* victim = &set.ways.front();
+    for (auto& candidate : set.ways) {
+        if (candidate.valid && candidate.hash == HASH && candidate.mount == mount && candidate.parent_ino == parent_ino) {
+            candidate.last_used = USE_STAMP;
+            return candidate.generation;
+        }
+        if (!candidate.valid) {
+            victim = &candidate;
+            break;
+        }
+        if (candidate.last_used < victim->last_used) {
+            victim = &candidate;
+        }
+    }
+
+    uint64_t const GENERATION = xfs_dentry_next_generation_value();
+    victim->mount = mount;
+    victim->parent_ino = parent_ino;
+    victim->hash = HASH;
+    victim->generation = GENERATION;
+    victim->last_used = USE_STAMP;
+    victim->valid = true;
+    return GENERATION;
+}
+
 auto xfs_dentry_cache_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry, int* result) -> bool {
     if (dp == nullptr || dp->mount == nullptr || name == nullptr || entry == nullptr || result == nullptr || namelen >= 256) {
         return false;
     }
 
-    uint64_t const VFS_EPOCH = ker::vfs::vfs_cache_epoch_snapshot();
-    uint64_t const DIR_GENERATION = g_xfs_dentry_generation.load(std::memory_order_acquire);
     uint64_t const HASH = xfs_dentry_hash_name(dp->mount, dp->ino, name, namelen);
     auto& set = g_xfs_dentry_cache.at(HASH & (XFS_DENTRY_CACHE_SET_COUNT - 1));
 
     uint64_t const IRQF = g_xfs_dentry_cache_lock.lock_irqsave();
+    uint64_t const DIR_GENERATION = xfs_dentry_cache_dir_generation_locked(dp->mount, dp->ino);
     for (auto& candidate : set.ways) {
         if (!candidate.valid || candidate.hash != HASH || candidate.mount != dp->mount || candidate.parent_ino != dp->ino ||
-            candidate.namelen != namelen || candidate.vfs_epoch != VFS_EPOCH || candidate.dir_generation != DIR_GENERATION) {
+            candidate.namelen != namelen || candidate.dir_generation != DIR_GENERATION) {
             continue;
         }
         if (std::memcmp(candidate.name.data(), name, namelen) != 0) {
@@ -234,22 +286,22 @@ void xfs_dentry_cache_store(XfsInode* dp, const char* name, uint16_t namelen, in
         return;
     }
 
-    uint64_t const VFS_EPOCH = ker::vfs::vfs_cache_epoch_snapshot();
-    uint64_t const DIR_GENERATION = g_xfs_dentry_generation.load(std::memory_order_acquire);
     uint64_t const HASH = xfs_dentry_hash_name(dp->mount, dp->ino, name, namelen);
     uint64_t const USE_STAMP = g_xfs_dentry_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
     auto& set = g_xfs_dentry_cache.at(HASH & (XFS_DENTRY_CACHE_SET_COUNT - 1));
 
     uint64_t const IRQF = g_xfs_dentry_cache_lock.lock_irqsave();
+    uint64_t const DIR_GENERATION = xfs_dentry_cache_dir_generation_locked(dp->mount, dp->ino);
     XfsDentryCacheEntry* victim = &set.ways.front();
     for (auto& candidate : set.ways) {
         if (candidate.valid && candidate.hash == HASH && candidate.mount == dp->mount && candidate.parent_ino == dp->ino &&
-            candidate.namelen == namelen && candidate.vfs_epoch == VFS_EPOCH && candidate.dir_generation == DIR_GENERATION &&
+            candidate.namelen == namelen && candidate.dir_generation == DIR_GENERATION &&
             std::memcmp(candidate.name.data(), name, namelen) == 0) {
             victim = &candidate;
             break;
         }
-        if (!candidate.valid || candidate.vfs_epoch != VFS_EPOCH || candidate.dir_generation != DIR_GENERATION) {
+        if (!candidate.valid ||
+            (candidate.mount == dp->mount && candidate.parent_ino == dp->ino && candidate.dir_generation != DIR_GENERATION)) {
             victim = &candidate;
             break;
         }
@@ -263,7 +315,6 @@ void xfs_dentry_cache_store(XfsInode* dp, const char* name, uint16_t namelen, in
     victim->mount = dp->mount;
     victim->parent_ino = dp->ino;
     victim->hash = HASH;
-    victim->vfs_epoch = VFS_EPOCH;
     victim->dir_generation = DIR_GENERATION;
     victim->last_used = USE_STAMP;
     victim->namelen = namelen;
@@ -274,8 +325,41 @@ void xfs_dentry_cache_store(XfsInode* dp, const char* name, uint16_t namelen, in
     g_xfs_dentry_stores.fetch_add(1, std::memory_order_relaxed);
 }
 
-void xfs_dentry_cache_invalidate() {
-    g_xfs_dentry_generation.fetch_add(1, std::memory_order_acq_rel);
+void xfs_dentry_cache_invalidate_dir(XfsInode* dp) {
+    if (dp == nullptr || dp->mount == nullptr) {
+        return;
+    }
+
+    uint64_t const HASH = xfs_dentry_hash_dir(dp->mount, dp->ino);
+    uint64_t const USE_STAMP = g_xfs_dentry_generation_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint64_t const IRQF = g_xfs_dentry_cache_lock.lock_irqsave();
+    auto& set = g_xfs_dentry_generations.at(HASH & (XFS_DENTRY_GENERATION_SET_COUNT - 1));
+
+    XfsDentryGenerationEntry* victim = &set.ways.front();
+    for (auto& candidate : set.ways) {
+        if (candidate.valid && candidate.hash == HASH && candidate.mount == dp->mount && candidate.parent_ino == dp->ino) {
+            candidate.generation = xfs_dentry_next_generation_value();
+            candidate.last_used = USE_STAMP;
+            g_xfs_dentry_cache_lock.unlock_irqrestore(IRQF);
+            g_xfs_dentry_invalidations.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (!candidate.valid) {
+            victim = &candidate;
+            break;
+        }
+        if (candidate.last_used < victim->last_used) {
+            victim = &candidate;
+        }
+    }
+
+    victim->mount = dp->mount;
+    victim->parent_ino = dp->ino;
+    victim->hash = HASH;
+    victim->generation = xfs_dentry_next_generation_value();
+    victim->last_used = USE_STAMP;
+    victim->valid = true;
+    g_xfs_dentry_cache_lock.unlock_irqrestore(IRQF);
     g_xfs_dentry_invalidations.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -2852,7 +2936,7 @@ auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
             return -EINVAL;
     }
     if (rc == 0) {
-        xfs_dentry_cache_invalidate();
+        xfs_dentry_cache_invalidate_dir(dp);
     }
     return rc;
 }
@@ -2887,7 +2971,7 @@ auto xfs_dir_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTra
             return -EINVAL;
     }
     if (rc == 0) {
-        xfs_dentry_cache_invalidate();
+        xfs_dentry_cache_invalidate_dir(dp);
     }
     return rc;
 }
@@ -2899,13 +2983,34 @@ void xfs_dentry_cache_stats(XfsDentryCacheStats& out) {
     out.invalidations = g_xfs_dentry_invalidations.load(std::memory_order_relaxed);
 }
 
-#ifdef WOS_SELFTEST
-auto xfs_selftest_dentry_cache_shortform() -> bool {
-    XfsMountContext mount{};
-    mount.inode_size = 512;
-    mount.feat_incompat = XFS_SB_FEAT_INCOMPAT_FTYPE;
+void xfs_dentry_cache_purge_mount(XfsMountContext* mount) {
+    if (mount == nullptr) {
+        return;
+    }
 
-    std::array<uint8_t, 32> data{};
+    uint64_t const IRQF = g_xfs_dentry_cache_lock.lock_irqsave();
+    for (auto& set : g_xfs_dentry_cache) {
+        for (auto& candidate : set.ways) {
+            if (candidate.valid && candidate.mount == mount) {
+                candidate.valid = false;
+            }
+        }
+    }
+    for (auto& set : g_xfs_dentry_generations) {
+        for (auto& candidate : set.ways) {
+            if (candidate.valid && candidate.mount == mount) {
+                candidate.valid = false;
+            }
+        }
+    }
+    g_xfs_dentry_cache_lock.unlock_irqrestore(IRQF);
+    g_xfs_dentry_invalidations.fetch_add(1, std::memory_order_relaxed);
+}
+
+#ifdef WOS_SELFTEST
+void xfs_selftest_make_shortform_one_entry_dir(XfsMountContext* mount, XfsInode* dir, std::array<uint8_t, 32>& data, xfs_ino_t dir_ino,
+                                               xfs_ino_t child_ino) {
+    data.fill(0);
     auto* hdr = reinterpret_cast<XfsDir2SfHdr*>(data.data());
     hdr->count = 1;
     hdr->i8count = 0;
@@ -2919,19 +3024,30 @@ auto xfs_selftest_dentry_cache_shortform() -> bool {
     std::memcpy(xfs_dir2_sf_entry_name(sfep), "foo", 3);
     uint8_t* ino_ptr = xfs_dir2_sf_entry_name(sfep) + 3;
     *ino_ptr++ = XFS_DIR3_FT_REG_FILE;
-    ino_ptr[0] = 0;
-    ino_ptr[1] = 0;
-    ino_ptr[2] = 0;
-    ino_ptr[3] = 42;
+    auto child_ino32 = static_cast<uint32_t>(child_ino);
+    ino_ptr[0] = static_cast<uint8_t>((child_ino32 >> 24U) & 0xffU);
+    ino_ptr[1] = static_cast<uint8_t>((child_ino32 >> 16U) & 0xffU);
+    ino_ptr[2] = static_cast<uint8_t>((child_ino32 >> 8U) & 0xffU);
+    ino_ptr[3] = static_cast<uint8_t>(child_ino32 & 0xffU);
 
+    dir->ino = dir_ino;
+    dir->mount = mount;
+    dir->mode = 0040755;
+    dir->data_fork.format = XFS_DINODE_FMT_LOCAL;
+    dir->data_fork.local.data = data.data();
+    dir->data_fork.local.size = static_cast<size_t>((ino_ptr + 4) - data.data());
+    dir->size = dir->data_fork.local.size;
+}
+
+auto xfs_selftest_dentry_cache_shortform() -> bool {
+    XfsMountContext mount{};
+    mount.inode_size = 512;
+    mount.feat_incompat = XFS_SB_FEAT_INCOMPAT_FTYPE;
+    xfs_dentry_cache_purge_mount(&mount);
+
+    std::array<uint8_t, 32> data{};
     XfsInode dir{};
-    dir.ino = 100;
-    dir.mount = &mount;
-    dir.mode = 0040755;
-    dir.data_fork.format = XFS_DINODE_FMT_LOCAL;
-    dir.data_fork.local.data = data.data();
-    dir.data_fork.local.size = static_cast<size_t>((ino_ptr + 4) - data.data());
-    dir.size = dir.data_fork.local.size;
+    xfs_selftest_make_shortform_one_entry_dir(&mount, &dir, data, 100, 42);
 
     XfsDentryCacheStats before{};
     xfs_dentry_cache_stats(before);
@@ -2950,7 +3066,7 @@ auto xfs_selftest_dentry_cache_shortform() -> bool {
         return false;
     }
 
-    xfs_dentry_cache_invalidate();
+    xfs_dentry_cache_invalidate_dir(&dir);
     if (xfs_dir_lookup(&dir, "foo", 3, &entry) != 0) {
         return false;
     }
@@ -2958,6 +3074,48 @@ auto xfs_selftest_dentry_cache_shortform() -> bool {
     XfsDentryCacheStats after_invalidate{};
     xfs_dentry_cache_stats(after_invalidate);
     return after_invalidate.misses > after_hit.misses && after_invalidate.invalidations > after_hit.invalidations;
+}
+
+auto xfs_selftest_dentry_cache_keeps_unrelated_dir_hot() -> bool {
+    XfsMountContext mount{};
+    mount.inode_size = 512;
+    mount.feat_incompat = XFS_SB_FEAT_INCOMPAT_FTYPE;
+    xfs_dentry_cache_purge_mount(&mount);
+
+    std::array<uint8_t, 32> dir_a_data{};
+    std::array<uint8_t, 32> dir_b_data{};
+    XfsInode dir_a{};
+    XfsInode dir_b{};
+    xfs_selftest_make_shortform_one_entry_dir(&mount, &dir_a, dir_a_data, 100, 42);
+    xfs_selftest_make_shortform_one_entry_dir(&mount, &dir_b, dir_b_data, 200, 84);
+
+    XfsDirEntry entry{};
+    if (xfs_dir_lookup(&dir_a, "foo", 3, &entry) != 0 || entry.ino != 42) {
+        return false;
+    }
+    if (xfs_dir_lookup(&dir_b, "foo", 3, &entry) != 0 || entry.ino != 84) {
+        return false;
+    }
+
+    XfsDentryCacheStats before_invalidate{};
+    xfs_dentry_cache_stats(before_invalidate);
+    xfs_dentry_cache_invalidate_dir(&dir_a);
+
+    if (xfs_dir_lookup(&dir_b, "foo", 3, &entry) != 0 || entry.ino != 84) {
+        return false;
+    }
+    XfsDentryCacheStats after_unrelated_lookup{};
+    xfs_dentry_cache_stats(after_unrelated_lookup);
+    if (after_unrelated_lookup.hits <= before_invalidate.hits) {
+        return false;
+    }
+
+    if (xfs_dir_lookup(&dir_a, "foo", 3, &entry) != 0 || entry.ino != 42) {
+        return false;
+    }
+    XfsDentryCacheStats after_mutated_lookup{};
+    xfs_dentry_cache_stats(after_mutated_lookup);
+    return after_mutated_lookup.misses > after_unrelated_lookup.misses;
 }
 
 auto xfs_selftest_shortform_readdir_cookies_are_monotonic() -> bool {

@@ -2519,6 +2519,10 @@ auto request_kernel_threads_shutdown(uint64_t timeout_us) -> KernelThreadShutdow
     auto* current = get_current_task();
     bool const WAKE_TARGETS = timeout_us != 0;
     KernelThreadShutdownResult result{};
+    if (!WAKE_TARGETS) {
+        return result;
+    }
+
     uint32_t const COUNT = get_active_task_count();
     for (uint32_t i = 0; i < COUNT; ++i) {
         auto* task = get_active_task_at_safe(i);
@@ -2532,12 +2536,7 @@ auto request_kernel_threads_shutdown(uint64_t timeout_us) -> KernelThreadShutdow
                 ++result.requested;
             }
             task->wakeup_pending.store(true, std::memory_order_release);
-            // POWER_OP_PREPARE uses timeout_us == 0 from init. Keep that path
-            // a pure nonblocking request; the finalizer calls back with a real
-            // timeout and performs the synchronous wake/wait pass.
-            if (WAKE_TARGETS) {
-                wake_kernel_thread_for_shutdown(task);
-            }
+            wake_kernel_thread_for_shutdown(task);
         }
         task->release();
     }

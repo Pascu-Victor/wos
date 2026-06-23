@@ -1098,6 +1098,8 @@ auto xfs_vfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
         return -ENOTDIR;
     }
 
+    XfsMetadataGuard metadata_guard(xfd->mount);
+
     ReaddirCtx ctx{};
     ctx.entry = entry;
     ctx.target_cookie = index;
@@ -1302,8 +1304,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         return nullptr;
     }
 
-    bool const MUTATING_OPEN = ((flags & (O_CREAT_FLAG | O_TRUNC_FLAG)) != 0) && !ctx->read_only;
-    XfsMetadataGuard metadata_guard(ctx, MUTATING_OPEN);
+    XfsMetadataGuard metadata_guard(ctx);
 
     auto* ip = walk_path(ctx, fs_path);
 
@@ -1557,6 +1558,8 @@ auto xfs_stat(const char* fs_path, ker::vfs::Stat* statbuf, XfsMountContext* ctx
         return -EINVAL;
     }
 
+    XfsMetadataGuard metadata_guard(ctx);
+
     auto* ip = walk_path(ctx, fs_path);
     if (ip == nullptr) {
         return -ENOENT;
@@ -1576,6 +1579,8 @@ auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int {
     if (xfd == nullptr || xfd->inode == nullptr) {
         return -EBADF;
     }
+
+    XfsMetadataGuard metadata_guard(xfd->mount);
 
     std::memset(statbuf, 0, sizeof(ker::vfs::Stat));
     fill_stat(xfd->inode, statbuf);

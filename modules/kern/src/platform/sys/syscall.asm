@@ -88,11 +88,36 @@ wos_asm_syscall_handler:
     call check_pending_signals
     cli
     test rax, rax
+    setnz r12b
+    ; Validate the userspace return target before either SYSRET or the signal
+    ; IRET path consumes the live per-CPU scratch fields.  SYSRET in particular
+    ; faults badly if handed a kernel-half RIP or nonsense RSP.
+    mov r10, [gs:0x28]
+    test r10, r10
+    jz .sysret_bad_target_rip
+    cmp r10, [rel syscall_user_addr_limit]
+    jae .sysret_bad_target_rip
+    mov r10, [gs:0x08]
+    test r10, r10
+    jz .sysret_bad_target_rsp
+    cmp r10, [rel syscall_user_addr_limit]
+    jae .sysret_bad_target_rsp
+    mov r10, [gs:0x30]
+    test r10, 0x2
+    jz .sysret_bad_target_flags
+    test r12b, r12b
     jne .signal_iret_return
 
     ; restore usermode segment ds and es
     mov ds, [gs:0x18]
     mov es, [gs:0x20]
+
+    ; The saved RCX slot is the normal SYSRET return RIP.  Keep this check
+    ; before popq so diagnostics can still read the complete GPRegs block
+    ; without clobbering userspace-visible registers.
+    mov r10, [rsp + 96]
+    cmp r10, [gs:0x28]
+    jne .sysret_rcx_corrupt_prepop
 
     popq
     pop rax
@@ -122,6 +147,32 @@ wos_asm_syscall_handler:
     ; should not return, but halt just in case
 .sysret_halt:
     hlt
+    jmp .sysret_halt
+
+.sysret_rcx_corrupt_prepop:
+    mov r8, 1
+    jmp .sysret_bad_return
+
+.sysret_bad_target_rip:
+    mov r8, 2
+    jmp .sysret_bad_return
+
+.sysret_bad_target_rsp:
+    mov r8, 3
+    jmp .sysret_bad_return
+
+.sysret_bad_target_flags:
+    mov r8, 4
+    jmp .sysret_bad_return
+
+.sysret_bad_return:
+    extern wos_sysret_bad_return_panic
+    mov rdi, [rsp + 96]  ; arg1 = saved RCX/user RCX from GPRegs block
+    mov rsi, [gs:0x28]   ; arg2 = scratch return RIP
+    mov rdx, [gs:0x08]   ; arg3 = scratch user RSP
+    mov rcx, [gs:0x30]   ; arg4 = scratch user RFLAGS
+    ; arg5 = reason code already in r8
+    call wos_sysret_bad_return_panic
     jmp .sysret_halt
 
 .signal_iret_return:
@@ -199,3 +250,5 @@ syscall_kernel_stack_min:
     dq 0xffff800000000000
 syscall_kernel_stack_max:
     dq 0xffff900000000000
+syscall_user_addr_limit:
+    dq 0x0000800000000000

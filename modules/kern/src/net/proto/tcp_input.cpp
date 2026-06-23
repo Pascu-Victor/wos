@@ -239,6 +239,41 @@ auto count_out_of_order_segments(const TcpCB* cb) -> size_t {
     return count;
 }
 
+void clear_out_of_order_ack_probe(TcpCB* cb) {
+    if (cb == nullptr) {
+        return;
+    }
+
+    cb->ooo_ack_deadline = 0;
+    cb->ooo_ack_probes = 0;
+}
+
+void arm_out_of_order_ack_probe(TcpCB* cb) {
+    if (cb == nullptr || cb->ooo_head == nullptr || cb->ooo_ack_deadline != 0) {
+        return;
+    }
+
+    cb->ooo_ack_probes = 0;
+    cb->ooo_ack_deadline = tcp_deadline_after_ms(tcp_now_ms(), TCP_OOO_ACK_PROBE_INITIAL_MS);
+    tcp_timer_arm(cb);
+}
+
+void restart_out_of_order_ack_probe(TcpCB* cb) {
+    if (cb == nullptr || cb->ooo_head == nullptr) {
+        clear_out_of_order_ack_probe(cb);
+        return;
+    }
+
+    clear_out_of_order_ack_probe(cb);
+    arm_out_of_order_ack_probe(cb);
+}
+
+void clear_out_of_order_ack_probe_if_empty(TcpCB* cb) {
+    if (cb != nullptr && cb->ooo_head == nullptr) {
+        clear_out_of_order_ack_probe(cb);
+    }
+}
+
 void drop_out_of_order_segment(TcpCB* cb, TcpOutOfOrderSegment* seg) {
     if (cb == nullptr || seg == nullptr) {
         return;
@@ -278,6 +313,7 @@ void discard_stale_out_of_order_segments(TcpCB* cb) {
         }
         break;
     }
+    clear_out_of_order_ack_probe_if_empty(cb);
 }
 
 auto queue_out_of_order_payload(TcpCB* cb, const uint8_t* payload, size_t payload_len, uint32_t seq) -> bool {
@@ -342,6 +378,7 @@ auto queue_out_of_order_payload(TcpCB* cb, const uint8_t* payload, size_t payloa
     cb->ooo_allocated_bytes += payload_len;
     cb->ooo_bytes.fetch_add(payload_len, std::memory_order_release);
     tcp_refresh_receive_window(cb);
+    arm_out_of_order_ack_probe(cb);
     return true;
 }
 
@@ -365,6 +402,7 @@ auto drain_out_of_order_payload(TcpCB* cb, Socket* sock) -> bool {
         drop_out_of_order_segment(cb, seg);
         discard_stale_out_of_order_segments(cb);
     }
+    clear_out_of_order_ack_probe_if_empty(cb);
     return progressed;
 }
 
@@ -396,6 +434,9 @@ auto receive_segment_payload(TcpCB* cb, Socket* sock, const uint8_t* payload, si
         if (queue_in_order_payload(cb, sock, payload, payload_len)) {
             result.accepted = true;
             result.drained_ooo = drain_out_of_order_payload(cb, sock);
+            if (!result.drained_ooo && cb->ooo_head != nullptr) {
+                restart_out_of_order_ack_probe(cb);
+            }
         }
         return result;
     }
