@@ -422,6 +422,9 @@ auto build_bmbt_tree(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec* extent
     if (ip == nullptr || ip->mount == nullptr || tp == nullptr || extents == nullptr || out == nullptr || extent_count == 0) {
         return -EINVAL;
     }
+    if (!bmbt_extent_list_is_ordered(extents, extent_count)) {
+        return -EINVAL;
+    }
     uint32_t const BMDR_CAPACITY = data_fork_bmdr_capacity(ip);
     if (BMDR_CAPACITY == 0) {
         return -EFBIG;
@@ -1337,6 +1340,11 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
     if (INLINE_CAPACITY == 0) {
         return cleanup(false);
     }
+    uint32_t const LEAF_CAPACITY = bmbt_leaf_max_recs(&mount);
+    if (LEAF_CAPACITY <= INLINE_CAPACITY) {
+        return cleanup(false);
+    }
+
     for (uint32_t i = 0; i < INLINE_CAPACITY + 1; i++) {
         XfsTransaction* tp = xfs_trans_alloc(&mount);
         if (tp == nullptr) {
@@ -1380,21 +1388,45 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
         }
     }
 
-    XfsTransaction* tp = xfs_trans_alloc(&mount);
-    if (tp == nullptr) {
+    uint32_t const TARGET_EXTENTS = LEAF_CAPACITY + 2;
+    for (uint32_t i = INLINE_CAPACITY + 1; i < TARGET_EXTENTS; i++) {
+        XfsTransaction* tp = xfs_trans_alloc(&mount);
+        if (tp == nullptr) {
+            return cleanup(false);
+        }
+        XfsBmbtIrec const REC{.br_startoff = static_cast<xfs_fileoff_t>(i) * 2,
+                              .br_startblock = static_cast<xfs_fsblock_t>(1000 + (i * 3)),
+                              .br_blockcount = 1,
+                              .br_unwritten = false};
+        int const RC = xfs_bmap_add_extent(&inode, tp, REC);
+        xfs_trans_cancel(tp);
+        if (RC != 0 || inode.data_fork.format != XFS_DINODE_FMT_BTREE || inode.nextents != i + 1) {
+            return cleanup(false);
+        }
+    }
+
+    if (inode.data_fork.btree.level != 2 || inode.data_fork.btree.numrecs != 1) {
         return cleanup(false);
     }
-    XfsBmbtIrec const POST_PROMOTION_REC{.br_startoff = static_cast<xfs_fileoff_t>((INLINE_CAPACITY + 1) * 2),
-                                         .br_startblock = 2000,
-                                         .br_blockcount = 1,
-                                         .br_unwritten = false};
-    int rc = xfs_bmap_add_extent(&inode, tp, POST_PROMOTION_REC);
-    xfs_trans_cancel(tp);
-    if (rc != 0 || inode.data_fork.format != XFS_DINODE_FMT_BTREE || inode.nextents != INLINE_CAPACITY + 2) {
+    Be64 internal_root_ptr{};
+    __builtin_memcpy(&internal_root_ptr, bmdr_ptr_addr(inode.data_fork.btree.root, BMDR_MAXRECS, 0), sizeof(internal_root_ptr));
+    if (internal_root_ptr.to_cpu() == NULLFSBLOCK) {
+        return cleanup(false);
+    }
+    BufHead* internal_root = xfs_buf_read(&mount, internal_root_ptr.to_cpu());
+    if (internal_root == nullptr) {
+        return cleanup(false);
+    }
+    auto* internal_hdr = reinterpret_cast<XfsBtreeLblock*>(internal_root->data);
+    uint32_t const INTERNAL_MAGIC = internal_hdr->bb_magic.to_cpu();
+    uint16_t const INTERNAL_LEVEL = internal_hdr->bb_level.to_cpu();
+    uint16_t const INTERNAL_RECS = internal_hdr->bb_numrecs.to_cpu();
+    brelse(internal_root);
+    if (INTERNAL_MAGIC != XFS_BMAP_CRC_MAGIC || INTERNAL_LEVEL != 1 || INTERNAL_RECS != 2) {
         return cleanup(false);
     }
 
-    uint32_t const EXPECTED_EXTENTS = INLINE_CAPACITY + 2;
+    uint32_t const EXPECTED_EXTENTS = TARGET_EXTENTS;
     auto* listed = new (std::nothrow) XfsBmbtIrec[EXPECTED_EXTENTS];
     if (listed == nullptr) {
         return cleanup(false);
@@ -1411,7 +1443,7 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
 
     for (uint32_t i = 0; i < EXPECTED_EXTENTS; i++) {
         auto const EXPECTED_OFF = static_cast<xfs_fileoff_t>(i) * 2;
-        xfs_fsblock_t const EXPECTED_BLOCK = i == INLINE_CAPACITY + 1 ? POST_PROMOTION_REC.br_startblock : 1000 + (i * 3);
+        xfs_fsblock_t const EXPECTED_BLOCK = 1000 + (i * 3);
         if (listed[i].br_startoff != EXPECTED_OFF || listed[i].br_startblock != EXPECTED_BLOCK || listed[i].br_blockcount != 1) {
             return cleanup_listed(false);
         }

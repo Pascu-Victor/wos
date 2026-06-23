@@ -146,6 +146,11 @@ auto waiter_matches_child(ker::mod::sched::task::Task* waiter, ker::mod::sched::
     return waiter != nullptr && child != nullptr && (waiter->waiting_for_pid == WAIT_ANY_CHILD || waiter->waiting_for_pid == child->pid);
 }
 
+auto waiter_is_blocked_on_different_waitpid_child(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) -> bool {
+    return waiter != nullptr && child != nullptr && waiter->waiting_for_pid != 0 && waiter->waiting_for_pid != WAIT_ANY_CHILD &&
+           waiter->waiting_for_pid != child->pid;
+}
+
 auto waiter_context_can_be_completed(ker::mod::sched::task::Task* waiter) -> bool {
     return waiter != nullptr && !waiter->deferred_task_switch && !waiter->waitpid_publish_pending.load(std::memory_order_acquire);
 }
@@ -193,7 +198,9 @@ void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
     parent->sig_pending |= SIGCHLD_MASK;
 
     bool wake_parent = false;
-    if (!sched_task::task_waited_on(*child)) {
+    if (waiter_is_blocked_on_different_waitpid_child(parent, child)) {
+        wake_parent = false;
+    } else if (!sched_task::task_waited_on(*child)) {
         if (waiter_matches_child(parent, child) && waiter_context_can_be_completed(parent)) {
             wake_parent =
                 complete_exit_wait(parent, child, parent->waiting_for_pid == WAIT_ANY_CHILD ? "exit-any" : "exit-specific-parent");

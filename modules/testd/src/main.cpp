@@ -1762,6 +1762,129 @@ TESTD_RUN(test_pipe_eof_on_writer_close) {
 }
 TESTD_RUN_END(test_pipe_eof_on_writer_close)
 
+TESTD_RUN(test_pipe_cloexec_exec_eof) {
+    std::array<int, 2> fds = {-1, -1};
+    if (pipe2(fds.data(), O_CLOEXEC) != 0) {
+        fail("pipe_cloexec_create", "pipe2 failed");
+        return;
+    }
+    TESTD_PASS("pipe_cloexec_create");
+
+    int const READ_FD_FLAGS = fcntl(fds[0], F_GETFD, 0);
+    int const WRITE_FD_FLAGS = fcntl(fds[1], F_GETFD, 0);
+    if (READ_FD_FLAGS < 0 || WRITE_FD_FLAGS < 0 || (READ_FD_FLAGS & FD_CLOEXEC) == 0 || (WRITE_FD_FLAGS & FD_CLOEXEC) == 0) {
+        close(fds[0]);
+        close(fds[1]);
+        fail("pipe_cloexec_flags", "pipe2 did not set FD_CLOEXEC");
+        return;
+    }
+    TESTD_PASS("pipe_cloexec_flags");
+
+    pid_t const CLOEXEC_PID = fork();
+    if (CLOEXEC_PID < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        fail("pipe_cloexec_fork", "fork failed");
+        return;
+    }
+    if (CLOEXEC_PID == 0) {
+        auto sleep_path = std::to_array("/bin/sleep");
+        auto sleep_arg = std::to_array("1");
+        std::array<char*, 3> argv = {
+            sleep_path.data(),
+            sleep_arg.data(),
+            nullptr,
+        };
+        execve(sleep_path.data(), argv.data(), nullptr);
+        _exit(RH_EXIT_EXEC_FAILED);
+    }
+
+    close(fds[1]);
+    usleep(100000);
+    std::array<char, 1> buf{};
+    ssize_t const CLOEXEC_READ = read_once_timeout(fds[0], buf.data(), buf.size(), 500);
+    if (CLOEXEC_READ != 0) {
+        int status = 0;
+        (void)kill(CLOEXEC_PID, SIGKILL);
+        (void)waitpid_timeout(CLOEXEC_PID, &status, CHILD_KILL_GRACE_MS);
+        close(fds[0]);
+        fail("pipe_cloexec_exec_eof", "expected EOF after exec");
+        return;
+    }
+    TESTD_PASS("pipe_cloexec_exec_eof");
+
+    int status = 0;
+    pid_t const EARLY = waitpid(CLOEXEC_PID, &status, WNOHANG);
+    if (EARLY != 0) {
+        close(fds[0]);
+        fail("pipe_cloexec_child_running", "sleep child exited before timeout");
+        return;
+    }
+    close(fds[0]);
+    TESTD_PASS("pipe_cloexec_child_running");
+
+    if (!waitpid_timeout(CLOEXEC_PID, &status, REMOTE_IPC_TIMEOUT_MS) || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail("pipe_cloexec_child_exit", "sleep child did not exit cleanly");
+        return;
+    }
+    TESTD_PASS("pipe_cloexec_child_exit");
+
+    if (pipe(fds.data()) != 0) {
+        fail("pipe_inherit_create", "pipe failed");
+        return;
+    }
+    TESTD_PASS("pipe_inherit_create");
+
+    (void)fcntl(fds[0], F_SETFD, 0);
+    (void)fcntl(fds[1], F_SETFD, 0);
+    pid_t const INHERIT_PID = fork();
+    if (INHERIT_PID < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        fail("pipe_inherit_fork", "fork failed");
+        return;
+    }
+    if (INHERIT_PID == 0) {
+        auto sleep_path = std::to_array("/bin/sleep");
+        auto sleep_arg = std::to_array("1");
+        std::array<char*, 3> argv = {
+            sleep_path.data(),
+            sleep_arg.data(),
+            nullptr,
+        };
+        execve(sleep_path.data(), argv.data(), nullptr);
+        _exit(RH_EXIT_EXEC_FAILED);
+    }
+
+    close(fds[1]);
+    usleep(100000);
+    ssize_t const INHERIT_READ = read_once_timeout(fds[0], buf.data(), buf.size(), 100);
+    int const INHERIT_ERRNO = errno;
+    if (INHERIT_READ >= 0 || INHERIT_ERRNO != ETIMEDOUT) {
+        (void)kill(INHERIT_PID, SIGKILL);
+        (void)waitpid_timeout(INHERIT_PID, &status, CHILD_KILL_GRACE_MS);
+        close(fds[0]);
+        fail("pipe_inherit_holds_eof", "inherited write end did not suppress EOF");
+        return;
+    }
+    TESTD_PASS("pipe_inherit_holds_eof");
+
+    if (!waitpid_timeout(INHERIT_PID, &status, REMOTE_IPC_TIMEOUT_MS) || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        close(fds[0]);
+        fail("pipe_inherit_child_exit", "sleep child did not exit cleanly");
+        return;
+    }
+
+    ssize_t const FINAL_READ = read_once_timeout(fds[0], buf.data(), buf.size(), 500);
+    close(fds[0]);
+    if (FINAL_READ != 0) {
+        fail("pipe_inherit_final_eof", "expected EOF after inheriting child exit");
+        return;
+    }
+    TESTD_PASS("pipe_inherit_final_eof");
+}
+TESTD_RUN_END(test_pipe_cloexec_exec_eof)
+
 TESTD_RUN(test_pipe_blocking_read_wake) {
     std::array<int, 2> fds = {-1, -1};
     if (pipe(fds.data()) != 0) {
@@ -2329,6 +2452,83 @@ TESTD_RUN(test_waitpid_exit_before_park_race) {
     TESTD_PASS("waitpid_exit_before_park_race");
 }
 TESTD_RUN_END(test_waitpid_exit_before_park_race)
+
+TESTD_RUN(test_waitpid_specific_ignores_unrelated_child_exit) {
+    std::array<int, 2> unblock_pipe = {-1, -1};
+    if (pipe(unblock_pipe.data()) != 0) {
+        fail("waitpid_specific_unrelated_pipe", "pipe failed");
+        return;
+    }
+
+    pid_t const TARGET = fork();
+    if (TARGET < 0) {
+        close(unblock_pipe[0]);
+        close(unblock_pipe[1]);
+        fail("waitpid_specific_unrelated_target_fork", "target fork failed");
+        return;
+    }
+    if (TARGET == 0) {
+        close(unblock_pipe[1]);
+        char byte = 0;
+        ssize_t const NR = read(unblock_pipe[0], &byte, 1);
+        close(unblock_pipe[0]);
+        _exit(NR == 1 ? 63 : 64);
+    }
+
+    pid_t const NOISE = fork();
+    if (NOISE < 0) {
+        kill(TARGET, SIGKILL);
+        close(unblock_pipe[0]);
+        close(unblock_pipe[1]);
+        fail("waitpid_specific_unrelated_noise_fork", "noise fork failed");
+        return;
+    }
+    if (NOISE == 0) {
+        close(unblock_pipe[0]);
+        close(unblock_pipe[1]);
+        _exit(17);
+    }
+
+    pid_t const RELEASER = fork();
+    if (RELEASER < 0) {
+        kill(TARGET, SIGKILL);
+        kill(NOISE, SIGKILL);
+        close(unblock_pipe[0]);
+        close(unblock_pipe[1]);
+        fail("waitpid_specific_unrelated_releaser_fork", "releaser fork failed");
+        return;
+    }
+    if (RELEASER == 0) {
+        close(unblock_pipe[0]);
+        usleep(100 * USEC_PER_MSEC);
+        char const BYTE = 0x51;
+        ssize_t const NW = write(unblock_pipe[1], &BYTE, 1);
+        close(unblock_pipe[1]);
+        _exit(NW == 1 ? 0 : 1);
+    }
+
+    close(unblock_pipe[0]);
+    close(unblock_pipe[1]);
+
+    int status = 0;
+    pid_t const WAITED = waitpid(TARGET, &status, 0);
+    if (WAITED != TARGET || !WIFEXITED(status) || WEXITSTATUS(status) != 63) {
+        kill(TARGET, SIGKILL);
+        kill(RELEASER, SIGKILL);
+        int cleanup_status = 0;
+        (void)waitpid_timeout(TARGET, &cleanup_status, CHILD_KILL_GRACE_MS);
+        (void)waitpid_timeout(NOISE, &cleanup_status, CHILD_KILL_GRACE_MS);
+        (void)waitpid_timeout(RELEASER, &cleanup_status, CHILD_KILL_GRACE_MS);
+        fail("waitpid_specific_unrelated_child_exit", "waitpid(target) returned before the target child exited");
+        return;
+    }
+
+    int cleanup_status = 0;
+    (void)waitpid_timeout(NOISE, &cleanup_status, REMOTE_IPC_TIMEOUT_MS);
+    (void)waitpid_timeout(RELEASER, &cleanup_status, REMOTE_IPC_TIMEOUT_MS);
+    TESTD_PASS("waitpid_specific_ignores_unrelated_child_exit");
+}
+TESTD_RUN_END(test_waitpid_specific_ignores_unrelated_child_exit)
 
 TESTD_RUN(test_waitpid_any_exit_before_park_race) {
     constexpr int ITERATIONS = 64;
@@ -4181,71 +4381,73 @@ TESTD_RUN(test_journal_device_userspace_record) {
 TESTD_RUN_END(test_journal_device_userspace_record)
 
 // NOLINTBEGIN(cppcoreguidelines-macro-usage)
-#define TESTD_TESTS(X)                            \
-    X(test_vfs_open_write_read_close)             \
-    X(test_vfs_stat)                              \
-    X(test_vfs_lseek)                             \
-    X(test_vfs_mkdir_rmdir)                       \
-    X(test_vfs_unlink_rename)                     \
-    X(test_vfs_rename_cross_mount_exdev)          \
-    X(test_vfs_lstat_symlink)                     \
-    X(test_vfs_shell_fsops_shape)                 \
-    X(test_vfs_dup)                               \
-    X(test_vfs_dup2)                              \
-    X(test_vfs_readdir)                           \
-    X(test_vfs_readdir_unlink_progress)           \
-    X(test_vfs_readdir_unlink_progress_rootfs)    \
-    X(test_vfs_directory_requirements)            \
-    X(test_vfs_rename_file_parent_enotdir)        \
-    X(test_vfs_access)                            \
-    X(test_chmod)                                 \
-    X(test_truncate)                              \
-    X(test_pipe_basic)                            \
-    X(test_pipe_eof_on_writer_close)              \
-    X(test_pipe_blocking_read_wake)               \
-    X(test_pipe_lost_wake_race_many)              \
-    X(test_threads_mutex_trylock_busy)            \
-    X(test_threads_mutex_contended_lock_wake)     \
-    X(test_threads_condition_timedwait_timeout)   \
-    X(test_threads_condition_broadcast_wakes_all) \
-    X(test_nanosleep_rejects_invalid_nsec)        \
-    X(test_poll_pipe_timeout_and_wake)            \
-    X(test_poll_pipe_hup_on_writer_close)         \
-    X(test_epoll_pipe_timeout_and_wake)           \
-    X(test_epoll_pipe_hup_on_writer_close)        \
-    X(test_pty_blocking_read_wake)                \
-    X(test_pty_cr_progress_write_coalesced)       \
-    X(test_getpid_getppid)                        \
-    X(test_getcwd_chdir)                          \
-    X(test_fork_exit)                             \
-    X(test_waitpid_exit_before_park_race)         \
-    X(test_waitpid_any_exit_before_park_race)     \
-    X(test_waitpid_any_multi_child_drain)         \
-    X(test_fork_pipe_byte)                        \
-    X(test_fork_pipe_communication)               \
-    X(test_fork_multiple)                         \
-    X(test_mmap_anon)                             \
-    X(test_file_write_read)                       \
-    X(test_mmap_file)                             \
-    X(test_tcp_loopback)                          \
-    X(test_tcp_nonblocking_connect_refused)       \
-    X(test_journal_device_userspace_record)       \
-    X(test_wki_target_policy_syscalls)            \
-    X(test_wki_vfs_rule_syscalls)                 \
-    X(test_remote_ipc_pipe_child_write)           \
-    X(test_remote_ipc_pipe_parent_write)          \
-    X(test_remote_ipc_pty_child_write)            \
-    X(test_remote_ipc_pty_ioctl)                  \
-    X(test_remote_ipc_socket_child_write)         \
-    X(test_remote_ipc_socket_control_ops)         \
-    X(test_remote_ipc_poll_wait_pipe_readable)    \
-    X(test_remote_ipc_poll_wait_pipe_hup)         \
-    X(test_remote_ipc_poll_pipe_preclosed_hup)    \
-    X(test_remote_ipc_poll_pipe_read_then_hup)    \
-    X(test_remote_ipc_epoll_wait_pipe_readable)   \
-    X(test_remote_ipc_epoll_wait_pipe_hup)        \
-    X(test_remote_ipc_epoll_pipe_preclosed_hup)   \
-    X(test_remote_ipc_epoll_pipe_read_then_hup)   \
+#define TESTD_TESTS(X)                                    \
+    X(test_vfs_open_write_read_close)                     \
+    X(test_vfs_stat)                                      \
+    X(test_vfs_lseek)                                     \
+    X(test_vfs_mkdir_rmdir)                               \
+    X(test_vfs_unlink_rename)                             \
+    X(test_vfs_rename_cross_mount_exdev)                  \
+    X(test_vfs_lstat_symlink)                             \
+    X(test_vfs_shell_fsops_shape)                         \
+    X(test_vfs_dup)                                       \
+    X(test_vfs_dup2)                                      \
+    X(test_vfs_readdir)                                   \
+    X(test_vfs_readdir_unlink_progress)                   \
+    X(test_vfs_readdir_unlink_progress_rootfs)            \
+    X(test_vfs_directory_requirements)                    \
+    X(test_vfs_rename_file_parent_enotdir)                \
+    X(test_vfs_access)                                    \
+    X(test_chmod)                                         \
+    X(test_truncate)                                      \
+    X(test_pipe_basic)                                    \
+    X(test_pipe_eof_on_writer_close)                      \
+    X(test_pipe_cloexec_exec_eof)                         \
+    X(test_pipe_blocking_read_wake)                       \
+    X(test_pipe_lost_wake_race_many)                      \
+    X(test_threads_mutex_trylock_busy)                    \
+    X(test_threads_mutex_contended_lock_wake)             \
+    X(test_threads_condition_timedwait_timeout)           \
+    X(test_threads_condition_broadcast_wakes_all)         \
+    X(test_nanosleep_rejects_invalid_nsec)                \
+    X(test_poll_pipe_timeout_and_wake)                    \
+    X(test_poll_pipe_hup_on_writer_close)                 \
+    X(test_epoll_pipe_timeout_and_wake)                   \
+    X(test_epoll_pipe_hup_on_writer_close)                \
+    X(test_pty_blocking_read_wake)                        \
+    X(test_pty_cr_progress_write_coalesced)               \
+    X(test_getpid_getppid)                                \
+    X(test_getcwd_chdir)                                  \
+    X(test_fork_exit)                                     \
+    X(test_waitpid_exit_before_park_race)                 \
+    X(test_waitpid_specific_ignores_unrelated_child_exit) \
+    X(test_waitpid_any_exit_before_park_race)             \
+    X(test_waitpid_any_multi_child_drain)                 \
+    X(test_fork_pipe_byte)                                \
+    X(test_fork_pipe_communication)                       \
+    X(test_fork_multiple)                                 \
+    X(test_mmap_anon)                                     \
+    X(test_file_write_read)                               \
+    X(test_mmap_file)                                     \
+    X(test_tcp_loopback)                                  \
+    X(test_tcp_nonblocking_connect_refused)               \
+    X(test_journal_device_userspace_record)               \
+    X(test_wki_target_policy_syscalls)                    \
+    X(test_wki_vfs_rule_syscalls)                         \
+    X(test_remote_ipc_pipe_child_write)                   \
+    X(test_remote_ipc_pipe_parent_write)                  \
+    X(test_remote_ipc_pty_child_write)                    \
+    X(test_remote_ipc_pty_ioctl)                          \
+    X(test_remote_ipc_socket_child_write)                 \
+    X(test_remote_ipc_socket_control_ops)                 \
+    X(test_remote_ipc_poll_wait_pipe_readable)            \
+    X(test_remote_ipc_poll_wait_pipe_hup)                 \
+    X(test_remote_ipc_poll_pipe_preclosed_hup)            \
+    X(test_remote_ipc_poll_pipe_read_then_hup)            \
+    X(test_remote_ipc_epoll_wait_pipe_readable)           \
+    X(test_remote_ipc_epoll_wait_pipe_hup)                \
+    X(test_remote_ipc_epoll_pipe_preclosed_hup)           \
+    X(test_remote_ipc_epoll_pipe_read_then_hup)           \
     X(test_remote_ipc_epoll_ctl_add)
 // NOLINTEND(cppcoreguidelines-macro-usage)
 constexpr auto K_TESTS = std::array{

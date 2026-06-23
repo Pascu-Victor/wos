@@ -103,6 +103,32 @@ copy_source_to_workdir() {
     )
 }
 
+patch_git_source_for_wos() {
+    local run_command="$GIT_WORK/run-command.c"
+
+    python3 - "$run_command" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+replacements = {
+    "pipe(fdin)": ("pipe2(fdin, O_CLOEXEC)", 2),
+    "pipe(fdout)": ("pipe2(fdout, O_CLOEXEC)", 2),
+    "pipe(fderr)": ("pipe2(fderr, O_CLOEXEC)", 1),
+    "pipe(notify_pipe)": ("pipe2(notify_pipe, O_CLOEXEC)", 1),
+}
+
+for old, (new, expected_count) in replacements.items():
+    count = text.count(old)
+    if count != expected_count:
+        raise SystemExit(f"expected {expected_count} occurrences of {old!r} in {path}, found {count}")
+    text = text.replace(old, new)
+
+path.write_text(text)
+PY
+}
+
 patch_installed_git_scripts() {
     local submodule="$TARGET_SYSROOT/libexec/git-core/git-submodule"
 
@@ -146,6 +172,7 @@ require_file "$TARGET_SYSROOT/lib/libcrypto.a" "Run scripts/build/build_openssl_
 
 GIT_SOURCE_DIR="$(resolve_git_source)"
 copy_source_to_workdir "$GIT_SOURCE_DIR"
+patch_git_source_for_wos
 
 mkdir -p "$TARGET_SYSROOT/bin" "$TARGET_SYSROOT/libexec" "$TARGET_SYSROOT/share"
 if [ ! -e "$TARGET_SYSROOT/usr" ]; then
