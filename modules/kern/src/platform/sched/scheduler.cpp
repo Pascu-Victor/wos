@@ -3612,44 +3612,18 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             }
         } else {
             // Wait-for-specific-PID
-            auto* target = find_task_by_pid(current_task->waiting_for_pid);
-            if (target == nullptr) {
-                skip_wait_queue = true;
-                current_task->context.regs.rax = static_cast<uint64_t>(-ECHILD);
-                task::task_clear_waitpid_block_state(*current_task);
-            }
-            if (target != nullptr && target->ptrace_traced && target->ptrace_tracer_pid == current_task->pid && target->ptrace_stopped &&
-                target->ptrace_stop_pending) {
-                skip_wait_queue = true;
-                current_task->context.regs.rax = target->pid;
-                if (current_task->wait_status_user_addr != 0 && current_task->pagemap != nullptr) {
-                    uint64_t const STATUS_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_status_user_addr);
-                    if (STATUS_PHYS != mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
-                        uint32_t signal = target->ptrace_stop_signal != 0 ? target->ptrace_stop_signal : 5;
-                        if ((target->ptrace_stop_reason == ker::abi::ptrace::stop_reason::SYSCALL_ENTER ||
-                             target->ptrace_stop_reason == ker::abi::ptrace::stop_reason::SYSCALL_EXIT) &&
-                            (target->ptrace_options & 0x00000001U) != 0) {
-                            signal |= 0x80U;
-                        }
-                        auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(STATUS_PHYS));
-                        *status_ptr = static_cast<int32_t>((signal << 8U) | 0x7fU);
-                    }
-                    current_task->wait_status_user_addr = 0;
-                    current_task->wait_status_phys_addr = 0;
+            uint64_t const WAIT_TARGET = current_task->waiting_for_pid;
+            auto complete_exited_specific_wait = [&](task::Task* target, const char* path) -> bool {
+                if (target == nullptr || target->pid != WAIT_TARGET || !target->exit_notify_ready.load(std::memory_order_acquire) ||
+                    !target->has_exited) {
+                    return false;
                 }
-                current_task->waiting_for_pid = 0;
-                current_task->wait_options = 0;
-                target->ptrace_stop_pending = false;
-            }
-            if (!skip_wait_queue && complete_waitpid_job_stop_if_waitable(current_task, target)) {
-                skip_wait_queue = true;
-            }
-            if (target != nullptr && target->exit_notify_ready.load(std::memory_order_acquire) && target->has_exited) {
+
                 skip_wait_queue = true;
                 if (task::task_try_mark_waited_on(*target)) {
                     task::task_accumulate_waited_child_times(*current_task, *target);
                     current_task->context.regs.rax = target->pid;
-                    validate_wait_resume_mapping(current_task, target, "sched-specific");
+                    validate_wait_resume_mapping(current_task, target, path);
                     if (current_task->wait_status_user_addr != 0 && current_task->pagemap != nullptr) {
                         uint64_t const STATUS_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_status_user_addr);
                         if (STATUS_PHYS != mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
@@ -3682,6 +3656,60 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                 }
                 current_task->waiting_for_pid = 0;
                 current_task->wait_options = 0;
+                return true;
+            };
+
+            auto* target = find_task_by_pid(WAIT_TARGET);
+            if (target == nullptr) {
+                uint64_t const CORE_COUNT = smt::get_core_count();
+                for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT && !skip_wait_queue; ++cpu_no) {
+                    size_t const DEAD_COUNT = get_dead_task_count(cpu_no);
+                    for (size_t i = 0; i < DEAD_COUNT; ++i) {
+                        auto* dead = get_dead_task_at_safe(cpu_no, i);
+                        if (dead == nullptr) {
+                            continue;
+                        }
+                        bool const REAPED = complete_exited_specific_wait(dead, "sched-specific-dead");
+                        dead->release();
+                        if (REAPED) {
+                            break;
+                        }
+                    }
+                }
+                if (!skip_wait_queue) {
+                    skip_wait_queue = true;
+                    current_task->context.regs.rax = static_cast<uint64_t>(-ECHILD);
+                    task::task_clear_waitpid_block_state(*current_task);
+                }
+            }
+            if (target != nullptr && target->ptrace_traced && target->ptrace_tracer_pid == current_task->pid && target->ptrace_stopped &&
+                target->ptrace_stop_pending) {
+                skip_wait_queue = true;
+                current_task->context.regs.rax = target->pid;
+                if (current_task->wait_status_user_addr != 0 && current_task->pagemap != nullptr) {
+                    uint64_t const STATUS_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_status_user_addr);
+                    if (STATUS_PHYS != mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
+                        uint32_t signal = target->ptrace_stop_signal != 0 ? target->ptrace_stop_signal : 5;
+                        if ((target->ptrace_stop_reason == ker::abi::ptrace::stop_reason::SYSCALL_ENTER ||
+                             target->ptrace_stop_reason == ker::abi::ptrace::stop_reason::SYSCALL_EXIT) &&
+                            (target->ptrace_options & 0x00000001U) != 0) {
+                            signal |= 0x80U;
+                        }
+                        auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(STATUS_PHYS));
+                        *status_ptr = static_cast<int32_t>((signal << 8U) | 0x7fU);
+                    }
+                    current_task->wait_status_user_addr = 0;
+                    current_task->wait_status_phys_addr = 0;
+                }
+                current_task->waiting_for_pid = 0;
+                current_task->wait_options = 0;
+                target->ptrace_stop_pending = false;
+            }
+            if (!skip_wait_queue && complete_waitpid_job_stop_if_waitable(current_task, target)) {
+                skip_wait_queue = true;
+            }
+            if (!skip_wait_queue) {
+                static_cast<void>(complete_exited_specific_wait(target, "sched-specific"));
             }
         }
     }
