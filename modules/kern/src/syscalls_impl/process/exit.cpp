@@ -152,7 +152,19 @@ auto waiter_is_blocked_on_different_waitpid_child(ker::mod::sched::task::Task* w
 }
 
 auto waiter_context_can_be_completed(ker::mod::sched::task::Task* waiter) -> bool {
-    return waiter != nullptr && !waiter->deferred_task_switch && !waiter->waitpid_publish_pending.load(std::memory_order_acquire);
+    if (waiter == nullptr || waiter->deferred_task_switch) {
+        return false;
+    }
+    if (!waiter->waitpid_publish_pending.load(std::memory_order_acquire)) {
+        return true;
+    }
+
+    // A waiter that has already reached the scheduler wait list has a stable
+    // saved syscall context even if the publish-pending flag was stranded by a
+    // wake race. Completing it here avoids losing blocked SIGCHLD wait-any
+    // notifications.
+    return waiter->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING &&
+           waiter->wait_channel_is(ker::mod::sched::task::WaitChannelKind::WAITPID);
 }
 
 auto drain_exit_waiters_for_notify(ker::mod::sched::task::Task* exiting, ExitWaiterBatch& waiting_pids) -> size_t {
@@ -180,8 +192,13 @@ auto complete_exit_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::ta
     validate_waiter_resume_for_exit(waiter, child, path);
     write_wait_status_for_waiter(waiter, child->exit_status);
     fill_rusage_for_waiter(waiter, child);
+    waiter->waitpid_publish_pending.store(false, std::memory_order_release);
     waiter->waiting_for_pid = 0;
     waiter->wait_options = 0;
+    waiter->wait_resume_rip_user_addr = 0;
+    waiter->wait_resume_rip_phys_addr = 0;
+    waiter->wait_resume_rsp_user_addr = 0;
+    waiter->wait_resume_rsp_phys_addr = 0;
     return true;
 }
 

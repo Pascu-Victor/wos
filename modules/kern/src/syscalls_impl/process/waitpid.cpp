@@ -3,6 +3,7 @@
 #include <abi/ptrace.hpp>
 #include <atomic>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
@@ -10,6 +11,7 @@
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/smt/smt.hpp>
 
 #include "platform/asm/cpu.hpp"
 
@@ -40,6 +42,12 @@ constexpr int WOS_WSTOPPED = 2;
 constexpr int STOP_STATUS_LOW = 0x7f;
 
 void clear_wait_resume_debug(ker::mod::sched::task::Task* task);
+void clear_waitpid_publish_pending(ker::mod::sched::task::Task* task);
+
+struct ClaimedExitedChild {
+    ker::mod::sched::task::Task* task{nullptr};
+    bool release_ref{false};
+};
 
 auto is_waitable_exit(const ker::mod::sched::task::Task* task) -> bool {
     return task != nullptr && task->exit_notify_ready.load(std::memory_order_acquire) && task->has_exited;
@@ -122,16 +130,69 @@ auto consume_ptrace_stop_if_waitable(ker::mod::sched::task::Task* waiter, ker::m
 // intentionally rejects DEAD/EXITING tasks. Use the registry pointer directly:
 // a matching unwaited child cannot be reclaimed until this parent marks it
 // waited_on.
-auto claim_exited_child(ker::mod::sched::task::Task* parent) -> ker::mod::sched::task::Task* {
+auto claim_exited_child(ker::mod::sched::task::Task* parent) -> ClaimedExitedChild {
     uint32_t const COUNT = ker::mod::sched::get_active_task_count();
     for (uint32_t i = 0; i < COUNT; i++) {
         auto* child = ker::mod::sched::get_active_task_at(i);
         if (is_unwaited_child(parent, child) && is_waitable_exit(child) && sched_task::task_try_mark_waited_on(*child)) {
-            return child;
+            return {.task = child, .release_ref = false};
         }
     }
 
-    return nullptr;
+    uint64_t const CORE_COUNT = ker::mod::smt::get_core_count();
+    for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
+        size_t const DEAD_COUNT = ker::mod::sched::get_dead_task_count(cpu_no);
+        for (size_t i = 0; i < DEAD_COUNT; ++i) {
+            auto* child = ker::mod::sched::get_dead_task_at_safe(cpu_no, i);
+            if (child == nullptr) {
+                continue;
+            }
+            if (is_unwaited_child(parent, child) && is_waitable_exit(child) && sched_task::task_try_mark_waited_on(*child)) {
+                return {.task = child, .release_ref = true};
+            }
+            child->release();
+        }
+    }
+
+    return {};
+}
+
+void release_claimed_child(ClaimedExitedChild claimed) {
+    if (claimed.release_ref && claimed.task != nullptr) {
+        claimed.task->release();
+    }
+}
+
+auto consume_claimed_exit(ker::mod::sched::task::Task* waiter, ClaimedExitedChild claimed, int32_t* status, uint64_t rusage_vaddr)
+    -> uint64_t {
+    auto* exited = claimed.task;
+    if (waiter == nullptr || exited == nullptr) {
+        release_claimed_child(claimed);
+        return static_cast<uint64_t>(-ECHILD);
+    }
+
+    clear_waitpid_publish_pending(waiter);
+    waiter->deferred_task_switch = false;
+    waiter->waiting_for_pid = 0;
+    waiter->wait_options = 0;
+    sched_task::task_accumulate_waited_child_times(*waiter, *exited);
+    if (status != nullptr) {
+        *status = exited->exit_status;
+    }
+    if (rusage_vaddr != 0) {
+        uint64_t const PHYS = ker::mod::mm::virt::translate(waiter->pagemap, rusage_vaddr);
+        fill_rusage(PHYS, exited);
+    }
+    waiter->wait_status_user_addr = 0;
+    waiter->wait_status_phys_addr = 0;
+    waiter->wait_rusage_user_addr = 0;
+    waiter->wait_rusage_phys_addr = 0;
+    clear_wait_resume_debug(waiter);
+    waiter->clear_wait_channel();
+
+    uint64_t const PID = exited->pid;
+    release_claimed_child(claimed);
+    return PID;
 }
 
 auto consume_stopped_child(ker::mod::sched::task::Task* parent, int32_t* status, int32_t options) -> ker::mod::sched::task::Task* {
@@ -156,6 +217,21 @@ auto has_unwaited_child(ker::mod::sched::task::Task* parent) -> bool {
         auto* child = ker::mod::sched::get_active_task_at(i);
         if (is_unwaited_child(parent, child)) {
             return true;
+        }
+    }
+    uint64_t const CORE_COUNT = ker::mod::smt::get_core_count();
+    for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
+        size_t const DEAD_COUNT = ker::mod::sched::get_dead_task_count(cpu_no);
+        for (size_t i = 0; i < DEAD_COUNT; ++i) {
+            auto* child = ker::mod::sched::get_dead_task_at_safe(cpu_no, i);
+            if (child == nullptr) {
+                continue;
+            }
+            bool const MATCHED = is_unwaited_child(parent, child);
+            child->release();
+            if (MATCHED) {
+                return true;
+            }
         }
     }
     return false;
@@ -226,25 +302,9 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         current_task->wait_options = options;
 
         // Check for already-exited children
-        auto* exited = claim_exited_child(current_task);
-        if (exited != nullptr) {
-            clear_waitpid_publish_pending(current_task);
-            current_task->waiting_for_pid = 0;
-            current_task->wait_options = 0;
-            sched_task::task_accumulate_waited_child_times(*current_task, *exited);
-            if (status != nullptr) {
-                *status = exited->exit_status;
-            }
-            if (rusage_vaddr != 0) {
-                uint64_t const PHYS = ker::mod::mm::virt::translate(current_task->pagemap, rusage_vaddr);
-                fill_rusage(PHYS, exited);
-            }
-            current_task->wait_status_user_addr = 0;
-            current_task->wait_status_phys_addr = 0;
-            current_task->wait_rusage_user_addr = 0;
-            current_task->wait_rusage_phys_addr = 0;
-            clear_wait_resume_debug(current_task);
-            return exited->pid;
+        auto exited = claim_exited_child(current_task);
+        if (exited.task != nullptr) {
+            return consume_claimed_exit(current_task, exited, status, rusage_vaddr);
         }
 
         auto* stopped = consume_stopped_child(current_task, status, options);
@@ -295,25 +355,8 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         current_task->set_wait_channel("waitpid", sched_task::WaitChannelKind::WAITPID);
         current_task->deferred_task_switch = true;
         exited = claim_exited_child(current_task);
-        if (exited != nullptr) {
-            clear_waitpid_publish_pending(current_task);
-            current_task->deferred_task_switch = false;
-            sched_task::task_accumulate_waited_child_times(*current_task, *exited);
-            if (status != nullptr) {
-                *status = exited->exit_status;
-            }
-            if (rusage_vaddr != 0) {
-                uint64_t const PHYS = ker::mod::mm::virt::translate(current_task->pagemap, rusage_vaddr);
-                fill_rusage(PHYS, exited);
-            }
-            current_task->wait_status_user_addr = 0;
-            current_task->wait_status_phys_addr = 0;
-            current_task->wait_rusage_user_addr = 0;
-            current_task->wait_rusage_phys_addr = 0;
-            clear_wait_resume_debug(current_task);
-            current_task->waiting_for_pid = 0;
-            current_task->wait_options = 0;
-            return exited->pid;
+        if (exited.task != nullptr) {
+            return consume_claimed_exit(current_task, exited, status, rusage_vaddr);
         }
         stopped = consume_stopped_child(current_task, status, options);
         if (stopped != nullptr) {
