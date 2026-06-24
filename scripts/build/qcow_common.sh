@@ -56,6 +56,14 @@ wos_qcow_log_has_corruption() {
         "$log_file"
 }
 
+wos_qcow_log_has_guestfs_error() {
+    local log_file="$1"
+
+    grep -Eiq \
+        '(^|[[:space:]])(libguestfs|guestfish): error:|[*]stdin[*]:[0-9]+: libguestfs: error:' \
+        "$log_file"
+}
+
 wos_qcow_print_evidence() {
     local log_file="$1"
     local pattern="$2"
@@ -209,6 +217,12 @@ wos_qcow_run() {
 
     log_file=$(mktemp)
     if "$@" > "$log_file" 2>&1; then
+        if wos_qcow_log_has_guestfs_error "$log_file"; then
+            cat "$log_file" >&2
+            wos_qcow_report_failure "$operation" "$disk" "$log_file"
+            rm -f "$log_file"
+            return 1
+        fi
         cat "$log_file"
         rm -f "$log_file"
         return 0
