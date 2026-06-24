@@ -246,6 +246,7 @@ export SHELL="${SHELL:-/bin/bash}"
 export TERM="${TERM:-xterm-256color}"
 export PS1="$USER@$HOSTNAME:\w\$ "
 export ENV="/etc/profile"
+export CMAKE_GENERATOR="${CMAKE_GENERATOR:-Ninja}"
 EOF
 
     cat > "$ROOTFS_STAGING/etc/shells" <<'EOF'
