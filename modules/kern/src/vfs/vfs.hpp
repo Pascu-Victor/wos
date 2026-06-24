@@ -147,6 +147,7 @@ struct LocalPipePerfSnapshot {
 
 void vfs_get_local_pipe_perf_snapshot(LocalPipePerfSnapshot& out);
 void vfs_reset_local_pipe_perf_counters();
+auto vfs_generate_local_pipe_diag(char* buf, size_t bufsz) -> size_t;
 
 struct VfsCachePerfSnapshot {
     uint64_t metadata_hits{};

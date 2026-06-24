@@ -39,6 +39,7 @@ enum class ProcNodeType : uint8_t {
     WKI_DIR,              // /proc/wki
     WKI_PEERS_FILE,       // /proc/wki/peers -> WKI topology rows
     WKI_NETDIAG_FILE,     // /proc/wki/netdiag -> network packet/listener/channel diagnostics
+    WKI_PIPES_FILE,       // /proc/wki/pipes -> local pipe owner diagnostics
     MEMACC_DIR,           // /proc/memacc
     MEMACC_TRACK_DIR,     // /proc/memacc/track
     MEMACC_RECLAIM_DIR,   // /proc/memacc/reclaim

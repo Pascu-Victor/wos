@@ -483,6 +483,14 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             std::memcpy(buf->d_name.data(), "netdiag", 8);
             return 0;
         }
+        if (count == 4) {
+            buf->d_ino = 23;
+            buf->d_off = 5;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "pipes", 6);
+            return 0;
+        }
         return -ENOENT;
     }
 
@@ -3723,7 +3731,7 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         bool const IS_KPERF = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KWKISTAT_FILE ||
                                pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCONTSTAT_FILE ||
                                pfd->node.type == ProcNodeType::KIPCSTAT_FILE || pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE ||
-                               pfd->node.type == ProcNodeType::CPU_STAT_FILE);
+                               pfd->node.type == ProcNodeType::WKI_PIPES_FILE || pfd->node.type == ProcNodeType::CPU_STAT_FILE);
         bool const IS_MEMACC =
             (pfd->node.type == ProcNodeType::MEMACC_SUMMARY_FILE || pfd->node.type == ProcNodeType::MEMACC_ZONES_FILE ||
              pfd->node.type == ProcNodeType::MEMACC_PROCS_FILE || pfd->node.type == ProcNodeType::MEMACC_DEAD_FILE ||
@@ -3809,6 +3817,9 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 break;
             case ProcNodeType::WKI_NETDIAG_FILE:
                 pfd->content_len = generate_wki_netdiag(pfd->content, MAX_KPERF_BUF);
+                break;
+            case ProcNodeType::WKI_PIPES_FILE:
+                pfd->content_len = ker::vfs::vfs_generate_local_pipe_diag(pfd->content, MAX_KPERF_BUF);
                 break;
             case ProcNodeType::MEMACC_SUMMARY_FILE:
                 pfd->content_len = generate_memacc_summary(pfd->content, MAX_MEMACC_BUF);
@@ -4475,6 +4486,11 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     // /proc/wki/netdiag
     if (strcmp(path, "wki/netdiag") == 0) {
         return make_file(ProcNodeType::WKI_NETDIAG_FILE, 0, false);
+    }
+
+    // /proc/wki/pipes
+    if (strcmp(path, "wki/pipes") == 0) {
+        return make_file(ProcNodeType::WKI_PIPES_FILE, 0, false);
     }
 
     // /proc/memacc structured memory accounting diagnostics

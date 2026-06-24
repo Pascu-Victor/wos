@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -6706,6 +6707,31 @@ struct PipeDirectWriteWindow {
     size_t capacity;
 };
 
+void pipe_diag_append(char* buf, size_t bufsz, size_t& len, bool& truncated, const char* fmt, ...) __attribute__((format(printf, 5, 6)));
+
+void pipe_diag_append(char* buf, size_t bufsz, size_t& len, bool& truncated, const char* fmt, ...) {
+    if (len >= bufsz) {
+        truncated = true;
+        return;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    int const WRITTEN = std::vsnprintf(buf + len, bufsz - len, fmt, args);
+    va_end(args);
+    if (WRITTEN < 0) {
+        return;
+    }
+
+    auto const USED = static_cast<size_t>(WRITTEN);
+    if (USED >= bufsz - len) {
+        len = bufsz - 1;
+        truncated = true;
+        return;
+    }
+    len += USED;
+}
+
 #ifdef WOS_SELFTEST
 enum class PipeSelftestFailStage : int {
     NONE = 0,
@@ -7731,6 +7757,141 @@ void vfs_get_local_pipe_perf_snapshot(LocalPipePerfSnapshot& out) {
 
     snapshot.approx_alloc_bytes = (snapshot.active_pipes * sizeof(PipeState)) + snapshot.capacity_bytes;
     out = snapshot;
+}
+
+auto vfs_generate_local_pipe_diag(char* buf, size_t bufsz) -> size_t {
+    if (buf == nullptr || bufsz == 0) {
+        return 0;
+    }
+
+    size_t len = 0;
+    bool output_truncated = false;
+
+    struct PipeOwnerRecord {
+        PipeState* state{};
+        uint64_t pid{};
+        uint64_t fd{};
+        uint64_t file_refs{};
+        int flags{};
+        bool cloexec{};
+        bool write_end{};
+    };
+
+    constexpr size_t MAX_OWNER_RECORDS = 2048;
+    auto* owners = new PipeOwnerRecord[MAX_OWNER_RECORDS];
+    if (owners == nullptr) {
+        pipe_diag_append(buf, bufsz, len, output_truncated, "%s", "error=ENOMEM\n");
+        return len;
+    }
+
+    size_t owner_count = 0;
+    bool owner_truncated = false;
+    uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < TASK_COUNT; ++i) {
+        auto* task = ker::mod::sched::get_active_task_at_safe(i);
+        if (task == nullptr) {
+            continue;
+        }
+
+        uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
+        task->fd_table.for_each([&](uint64_t fd, void* value) -> void {
+            if (value == nullptr) {
+                return;
+            }
+            auto* file = static_cast<File*>(value);
+            bool const IS_READ_END = g_pipe_read_fops_ptr != nullptr && file->fops == g_pipe_read_fops_ptr;
+            bool const IS_WRITE_END = g_pipe_write_fops_ptr != nullptr && file->fops == g_pipe_write_fops_ptr;
+            if (!IS_READ_END && !IS_WRITE_END) {
+                return;
+            }
+            if (owner_count >= MAX_OWNER_RECORDS) {
+                owner_truncated = true;
+                return;
+            }
+            owners[owner_count++] = PipeOwnerRecord{
+                .state = static_cast<PipeState*>(file->private_data),
+                .pid = task->pid,
+                .fd = fd,
+                .file_refs = static_cast<uint64_t>(file->refcount.load(std::memory_order_relaxed)),
+                .flags = file->open_flags,
+                .cloexec = task->get_fd_cloexec(static_cast<unsigned>(fd)),
+                .write_end = IS_WRITE_END,
+            };
+        });
+        task->fd_table_lock.unlock_irqrestore(IRQF);
+        task->release();
+    }
+
+    pipe_diag_append(buf, bufsz, len, output_truncated, "owner_records=%llu owner_truncated=%u\n",
+                     static_cast<unsigned long long>(owner_count), owner_truncated ? 1U : 0U);
+
+    uint64_t const STATES_IRQF = g_pipe_states_lock.lock_irqsave();
+    for (auto* st : g_pipe_states) {
+        if (st == nullptr) {
+            continue;
+        }
+
+        size_t read_fds = 0;
+        size_t write_fds = 0;
+        for (size_t i = 0; i < owner_count; ++i) {
+            if (owners[i].state != st) {
+                continue;
+            }
+            if (owners[i].write_end) {
+                write_fds++;
+            } else {
+                read_fds++;
+            }
+        }
+
+        size_t capacity = 0;
+        size_t buffered = 0;
+        size_t reader_waiters = 0;
+        size_t writer_waiters = 0;
+        size_t poll_waiters = 0;
+        bool read_closed = false;
+        bool write_closed = false;
+        bool direct_write = false;
+        int open_ends = 0;
+        uint64_t const PIPE_IRQF = st->lock.lock_irqsave();
+        capacity = st->capacity;
+        buffered = st->count;
+        reader_waiters = st->readers_waiting.size();
+        writer_waiters = st->writers_waiting.size();
+        poll_waiters = st->read_poll_waiting.size() + st->write_poll_waiting.size();
+        read_closed = st->read_closed;
+        write_closed = st->write_closed;
+        direct_write = st->direct_write_active;
+        open_ends = st->open_ends.load(std::memory_order_relaxed);
+        st->lock.unlock_irqrestore(PIPE_IRQF);
+
+        pipe_diag_append(buf, bufsz, len, output_truncated,
+                         "pipe=%p open_ends=%d capacity=%llu buffered=%llu read_closed=%u write_closed=%u direct=%u reader_waiters=%llu "
+                         "writer_waiters=%llu poll_waiters=%llu read_fds=%llu write_fds=%llu\n",
+                         static_cast<void*>(st), open_ends, static_cast<unsigned long long>(capacity),
+                         static_cast<unsigned long long>(buffered), read_closed ? 1U : 0U, write_closed ? 1U : 0U, direct_write ? 1U : 0U,
+                         static_cast<unsigned long long>(reader_waiters), static_cast<unsigned long long>(writer_waiters),
+                         static_cast<unsigned long long>(poll_waiters), static_cast<unsigned long long>(read_fds),
+                         static_cast<unsigned long long>(write_fds));
+
+        for (size_t i = 0; i < owner_count; ++i) {
+            if (owners[i].state != st) {
+                continue;
+            }
+            pipe_diag_append(buf, bufsz, len, output_truncated, " owner pid=%llu fd=%llu kind=%s cloexec=%u flags=0x%x file_refs=%llu\n",
+                             static_cast<unsigned long long>(owners[i].pid), static_cast<unsigned long long>(owners[i].fd),
+                             owners[i].write_end ? "write" : "read", owners[i].cloexec ? 1U : 0U, owners[i].flags,
+                             static_cast<unsigned long long>(owners[i].file_refs));
+        }
+    }
+    g_pipe_states_lock.unlock_irqrestore(STATES_IRQF);
+
+    delete[] owners;
+
+    if (output_truncated && len < bufsz - 1) {
+        pipe_diag_append(buf, bufsz, len, output_truncated, "%s", "output_truncated=1\n");
+    }
+    return len;
 }
 
 void vfs_reset_local_pipe_perf_counters() {
