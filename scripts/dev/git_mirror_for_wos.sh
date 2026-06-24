@@ -18,10 +18,11 @@ usage() {
 Usage:
   scripts/dev/git_mirror_for_wos.sh list
   scripts/dev/git_mirror_for_wos.sh mirror [--remote-only]
+  scripts/dev/git_mirror_for_wos.sh snapshot
   scripts/dev/git_mirror_for_wos.sh serve-http [--bind ADDR] [--port PORT]
   scripts/dev/git_mirror_for_wos.sh print-wos-config http HOST [PORT]
   scripts/dev/git_mirror_for_wos.sh print-wos-config file PATH
-  scripts/dev/git_mirror_for_wos.sh sync-file-mirror [WOS_HOST] [REMOTE_PATH]
+  scripts/dev/git_mirror_for_wos.sh sync-file-mirror [--allow-non-temp] [WOS_HOST] [REMOTE_PATH]
 
 Defaults:
   mirror root   $MIRROR_ROOT
@@ -45,11 +46,17 @@ Notes:
   prepared host checkout does not immediately re-download everything from
   GitHub. Pass --remote-only to force GitHub remotes.
 
+  snapshot creates shallow bare repositories for the current checkout and the
+  exact checked-out submodule commits. Use this for WOS clone/submodule
+  workflow testing when full Git history is unnecessary or too large.
+
   serve-http exposes repositories as:
     http://HOST:PORT/cgi-bin/git/OWNER/REPO.git
 
   If WOS cannot reach the host HTTP port, use sync-file-mirror and the file
-  rewrite printed at the end. That still avoids GitHub completely.
+  rewrite printed at the end. That still avoids GitHub completely. By default
+  sync-file-mirror only replaces paths under /tmp or /var/tmp; pass
+  --allow-non-temp for large mirrors that need persistent WOS disk space.
 EOF
 }
 
@@ -201,6 +208,64 @@ cmd_mirror() {
     done < <(repo_urls)
 }
 
+snapshot_one() {
+    local url="$1"
+    local source="$2"
+    local sha="$3"
+    local ref="$4"
+    local github_path target
+
+    github_path="$(normalize_github_path "$url")"
+    target="$REPOS_ROOT/$github_path"
+    mkdir -p "$(dirname "$target")"
+    rm -rf -- "$target"
+
+    echo "Snapshotting $github_path at $sha"
+    git init --bare "$target" >/dev/null
+    git -C "$target" fetch --depth=1 "$source" "$sha:$ref"
+    git -C "$target" symbolic-ref HEAD "$ref"
+    git -C "$target" config uploadpack.allowReachableSHA1InWant true
+    git -C "$target" update-server-info
+}
+
+cmd_snapshot() {
+    while (($# > 0)); do
+        case "$1" in
+            -h|--help)
+                usage
+                return 0
+                ;;
+            *)
+                die "unknown snapshot option: $1"
+                ;;
+        esac
+        shift
+    done
+
+    need_cmd git
+    mkdir -p "$REPOS_ROOT"
+
+    local top_url top_branch top_ref top_sha
+    top_url="$(top_level_url)"
+    top_branch="$(git -C "$WORKSPACE_ROOT" branch --show-current)"
+    top_ref="refs/heads/${top_branch:-wos-snapshot}"
+    top_sha="$(git -C "$WORKSPACE_ROOT" rev-parse HEAD)"
+    snapshot_one "$top_url" "$WORKSPACE_ROOT" "$top_sha" "$top_ref"
+
+    while IFS= read -r name; do
+        local path url sha
+
+        path="$(git -C "$WORKSPACE_ROOT" config -f .gitmodules --get "submodule.$name.path")"
+        url="$(git -C "$WORKSPACE_ROOT" config -f .gitmodules --get "submodule.$name.url")"
+        if [ ! -d "$WORKSPACE_ROOT/$path" ]; then
+            die "submodule path is missing: $path"
+        fi
+        sha="$(git -C "$WORKSPACE_ROOT/$path" rev-parse HEAD)"
+        snapshot_one "${url%.git}.git" "$WORKSPACE_ROOT/$path" "$sha" refs/heads/wos-snapshot
+    done < <(git -C "$WORKSPACE_ROOT" config -f .gitmodules --get-regexp '^submodule\..*\.path$' |
+        sed -E 's/^submodule\.([^.]*)\.path .*/\1/')
+}
+
 write_cgi_wrapper() {
     local cgi_dir="$HTTP_ROOT/cgi-bin"
     mkdir -p "$cgi_dir"
@@ -280,6 +345,30 @@ EOF
 }
 
 cmd_sync_file_mirror() {
+    local allow_non_temp=0
+    while (($# > 0)); do
+        case "$1" in
+            --allow-non-temp)
+                allow_non_temp=1
+                ;;
+            -h|--help)
+                usage
+                return 0
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                die "unknown sync-file-mirror option: $1"
+                ;;
+            *)
+                break
+                ;;
+        esac
+        shift
+    done
+
     local wos_host="${1:-$DEFAULT_WOS_HOST}"
     local wos_path="${2:-$DEFAULT_WOS_PATH}"
     local remote_parent
@@ -288,36 +377,56 @@ cmd_sync_file_mirror() {
     case "$wos_path" in
         /tmp/*|/var/tmp/*)
             ;;
+        /*)
+            if [ "$allow_non_temp" -ne 1 ]; then
+                die "refusing to replace non-temporary WOS path: $wos_path (pass --allow-non-temp to override)"
+            fi
+            case "$wos_path" in
+                /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/mnt|/oldroot|/proc|/root|/run|/sbin|/sys|/tmp|/usr|/var)
+                    die "refusing to replace broad WOS path: $wos_path"
+                    ;;
+            esac
+            ;;
         *)
-            die "refusing to replace non-temporary WOS path: $wos_path"
+            die "remote WOS path must be absolute: $wos_path"
             ;;
     esac
 
     need_cmd ssh
     need_cmd scp
+    need_cmd tar
     [ -d "$REPOS_ROOT" ] || die "repo root does not exist: $REPOS_ROOT; run mirror first"
 
     remote_parent="$(dirname "$wos_path")"
-    remote_copied_path="$remote_parent/$(basename "$REPOS_ROOT")"
+    remote_copied_path="$wos_path.copying"
+    local remote_archive_path="$wos_path.tar.copying"
+    local quoted_remote_copied_path
+    local quoted_remote_archive_path
+    printf -v quoted_remote_copied_path '%q' "$remote_copied_path"
+    printf -v quoted_remote_archive_path '%q' "$remote_archive_path"
+    local archive
+    archive="$(mktemp "$MIRROR_ROOT/sync.XXXXXX.tar")"
+    trap 'if [ -n "${archive:-}" ]; then rm -f -- "$archive"; fi; trap - RETURN' RETURN
+
     echo "Copying $REPOS_ROOT to $wos_host:$wos_path"
-    ssh "$wos_host" sh -s -- "$wos_path" "$remote_copied_path" <<'EOF'
+    ssh "$wos_host" sh -s -- "$wos_path" "$remote_copied_path" "$remote_archive_path" <<'EOF'
 set -e
 wos_path="$1"
 remote_copied_path="$2"
+remote_archive_path="$3"
 rm -rf -- "$wos_path"
-if [ "$remote_copied_path" != "$wos_path" ]; then
-    rm -rf -- "$remote_copied_path"
-fi
+rm -rf -- "$remote_copied_path"
+rm -f -- "$remote_archive_path"
 mkdir -p -- "$(dirname "$wos_path")"
 EOF
-    scp -O -r "$REPOS_ROOT" "$wos_host:$remote_parent/"
+    tar -C "$REPOS_ROOT" -cf "$archive" .
+    scp -O "$archive" "$wos_host:$remote_archive_path"
+    ssh "$wos_host" "mkdir -p -- $quoted_remote_copied_path && tar xf $quoted_remote_archive_path -C $quoted_remote_copied_path && rm -f -- $quoted_remote_archive_path"
     ssh "$wos_host" sh -s -- "$wos_path" "$remote_copied_path" <<'EOF'
 set -e
 wos_path="$1"
 remote_copied_path="$2"
-if [ "$remote_copied_path" != "$wos_path" ]; then
-    mv -- "$remote_copied_path" "$wos_path"
-fi
+mv -- "$remote_copied_path" "$wos_path"
 EOF
     echo
     echo "Run this inside WOS:"
@@ -336,6 +445,9 @@ main() {
             ;;
         mirror)
             cmd_mirror "$@"
+            ;;
+        snapshot)
+            cmd_snapshot "$@"
             ;;
         serve-http)
             cmd_serve_http "$@"

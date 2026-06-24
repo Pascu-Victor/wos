@@ -535,6 +535,287 @@ inline auto waitpid_has_job_stop_ready(task::Task* waiter) -> bool {
     return false;
 }
 
+inline void interrupt_waitpid_block_for_signal(task::Task* task);
+
+inline auto waitpid_child_matches_waiter(const task::Task* waiter, const task::Task* child) -> bool {
+    if (waiter == nullptr || child == nullptr || child->is_thread) {
+        return false;
+    }
+    if (waiter->waiting_for_pid != WAIT_ANY_CHILD && waiter->waiting_for_pid != child->pid) {
+        return false;
+    }
+    return child->parent_pid == waiter->pid || (child->ptrace_traced && child->ptrace_tracer_pid == waiter->pid);
+}
+
+inline auto waitpid_child_is_unwaited(const task::Task* waiter, const task::Task* child) -> bool {
+    return waitpid_child_matches_waiter(waiter, child) && !task::task_waited_on(*child);
+}
+
+inline auto waitpid_child_is_waitable_exit(const task::Task* child) -> bool {
+    return child != nullptr && child->exit_notify_ready.load(std::memory_order_acquire) && child->has_exited;
+}
+
+inline void clear_waitpid_output_addrs(task::Task* waiter) {
+    if (waiter == nullptr) {
+        return;
+    }
+    waiter->wait_status_user_addr = 0;
+    waiter->wait_status_phys_addr = 0;
+    waiter->wait_rusage_user_addr = 0;
+    waiter->wait_rusage_phys_addr = 0;
+}
+
+inline void write_waitpid_status(task::Task* waiter, int32_t status) {
+    if (waiter == nullptr || waiter->wait_status_user_addr == 0 || waiter->pagemap == nullptr) {
+        return;
+    }
+    uint64_t const STATUS_PHYS = mm::virt::translate(waiter->pagemap, waiter->wait_status_user_addr);
+    if (STATUS_PHYS == mm::virt::PADDR_INVALID || STATUS_PHYS == 0) {
+        return;
+    }
+    auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(STATUS_PHYS));
+    *status_ptr = status;
+}
+
+inline void fill_waitpid_rusage(task::Task* waiter, const task::Task* child) {
+    if (waiter == nullptr || child == nullptr || waiter->wait_rusage_user_addr == 0 || waiter->pagemap == nullptr) {
+        return;
+    }
+    uint64_t const RUSAGE_PHYS = mm::virt::translate(waiter->pagemap, waiter->wait_rusage_user_addr);
+    if (RUSAGE_PHYS == mm::virt::PADDR_INVALID || RUSAGE_PHYS == 0) {
+        return;
+    }
+    auto* ru = reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(RUSAGE_PHYS));
+    uint64_t const USER_TIME_US = task::task_rusage_user_time_us(*child);
+    uint64_t const SYSTEM_TIME_US = task::task_rusage_system_time_us(*child);
+    ru->ru_utime_sec = static_cast<int64_t>(USER_TIME_US / 1000000ULL);
+    ru->ru_utime_usec = static_cast<int64_t>(USER_TIME_US % 1000000ULL);
+    ru->ru_stime_sec = static_cast<int64_t>(SYSTEM_TIME_US / 1000000ULL);
+    ru->ru_stime_usec = static_cast<int64_t>(SYSTEM_TIME_US % 1000000ULL);
+}
+
+inline void finish_waitpid_scheduler_result(task::Task* waiter) {
+    if (waiter == nullptr) {
+        return;
+    }
+    waiter->waitpid_publish_pending.store(false, std::memory_order_release);
+    waiter->deferred_task_switch = false;
+    waiter->set_voluntary_blocked(false);
+    waiter->wants_block = false;
+    waiter->wake_at_us = 0;
+    task::task_clear_waitpid_block_state(*waiter);
+}
+
+inline auto complete_waitpid_exit_for_scheduler(task::Task* waiter, task::Task* child, const char* path) -> bool {
+    if (!waitpid_child_is_unwaited(waiter, child) || !waitpid_child_is_waitable_exit(child)) {
+        return false;
+    }
+    if (!task::task_try_mark_waited_on(*child)) {
+        return false;
+    }
+    task::task_accumulate_waited_child_times(*waiter, *child);
+    waiter->context.regs.rax = child->pid;
+    validate_wait_resume_mapping(waiter, child, path);
+    write_waitpid_status(waiter, child->exit_status);
+    fill_waitpid_rusage(waiter, child);
+    clear_waitpid_output_addrs(waiter);
+    finish_waitpid_scheduler_result(waiter);
+    return true;
+}
+
+inline auto complete_waitpid_ptrace_stop_for_scheduler(task::Task* waiter, task::Task* target) -> bool {
+    if (waiter == nullptr || target == nullptr || !target->ptrace_traced || target->ptrace_tracer_pid != waiter->pid ||
+        !target->ptrace_stopped || !target->ptrace_stop_pending) {
+        return false;
+    }
+
+    uint32_t signal = target->ptrace_stop_signal != 0 ? target->ptrace_stop_signal : 5;
+    if ((target->ptrace_stop_reason == ker::abi::ptrace::stop_reason::SYSCALL_ENTER ||
+         target->ptrace_stop_reason == ker::abi::ptrace::stop_reason::SYSCALL_EXIT) &&
+        (target->ptrace_options & 0x00000001U) != 0) {
+        signal |= 0x80U;
+    }
+
+    waiter->context.regs.rax = target->pid;
+    write_waitpid_status(waiter, static_cast<int32_t>((signal << 8U) | STOP_STATUS_LOW));
+    target->ptrace_stop_pending = false;
+    clear_waitpid_output_addrs(waiter);
+    finish_waitpid_scheduler_result(waiter);
+    return true;
+}
+
+inline auto waitpid_has_unwaited_child_for_scheduler(task::Task* waiter) -> bool {
+    if (waiter == nullptr) {
+        return false;
+    }
+
+    uint32_t const ACTIVE_COUNT = get_active_task_count();
+    for (uint32_t i = 0; i < ACTIVE_COUNT; ++i) {
+        auto* child = get_active_task_at_safe(i);
+        if (child == nullptr) {
+            continue;
+        }
+        bool const MATCH = waitpid_child_is_unwaited(waiter, child);
+        child->release();
+        if (MATCH) {
+            return true;
+        }
+    }
+
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
+        size_t const DEAD_COUNT = get_dead_task_count(cpu_no);
+        for (size_t i = 0; i < DEAD_COUNT; ++i) {
+            auto* child = get_dead_task_at_safe(cpu_no, i);
+            if (child == nullptr) {
+                continue;
+            }
+            bool const MATCH = waitpid_child_is_unwaited(waiter, child);
+            child->release();
+            if (MATCH) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+inline auto complete_waitpid_any_for_scheduler(task::Task* waiter) -> bool {
+    uint32_t const ACTIVE_COUNT = get_active_task_count();
+    for (uint32_t i = 0; i < ACTIVE_COUNT; ++i) {
+        auto* child = get_active_task_at_safe(i);
+        if (child == nullptr) {
+            continue;
+        }
+        bool const COMPLETED = complete_waitpid_exit_for_scheduler(waiter, child, "wake-any-active");
+        child->release();
+        if (COMPLETED) {
+            return true;
+        }
+    }
+
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
+        size_t const DEAD_COUNT = get_dead_task_count(cpu_no);
+        for (size_t i = 0; i < DEAD_COUNT; ++i) {
+            auto* child = get_dead_task_at_safe(cpu_no, i);
+            if (child == nullptr) {
+                continue;
+            }
+            bool const COMPLETED = complete_waitpid_exit_for_scheduler(waiter, child, "wake-any-dead");
+            child->release();
+            if (COMPLETED) {
+                return true;
+            }
+        }
+    }
+
+    if (!waitpid_has_unwaited_child_for_scheduler(waiter)) {
+        waiter->context.regs.rax = static_cast<uint64_t>(-ECHILD);
+        clear_waitpid_output_addrs(waiter);
+        finish_waitpid_scheduler_result(waiter);
+        return true;
+    }
+    return false;
+}
+
+inline auto complete_waitpid_specific_for_scheduler(task::Task* waiter) -> bool {
+    uint64_t const WAIT_TARGET = waiter != nullptr ? waiter->waiting_for_pid : 0;
+    if (WAIT_TARGET == 0 || WAIT_TARGET == WAIT_ANY_CHILD) {
+        return false;
+    }
+
+    auto complete_missing_child = [waiter]() -> bool {
+        waiter->context.regs.rax = static_cast<uint64_t>(-ECHILD);
+        clear_waitpid_output_addrs(waiter);
+        finish_waitpid_scheduler_result(waiter);
+        return true;
+    };
+
+    if (auto* target = find_task_by_pid_safe(WAIT_TARGET); target != nullptr) {
+        if (!waitpid_child_matches_waiter(waiter, target) || task::task_waited_on(*target)) {
+            target->release();
+            return complete_missing_child();
+        }
+        if (complete_waitpid_ptrace_stop_for_scheduler(waiter, target) ||
+            complete_waitpid_exit_for_scheduler(waiter, target, "wake-specific-active") ||
+            complete_waitpid_job_stop_if_waitable(waiter, target)) {
+            target->release();
+            return true;
+        }
+        target->release();
+        return false;
+    }
+
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
+        size_t const DEAD_COUNT = get_dead_task_count(cpu_no);
+        for (size_t i = 0; i < DEAD_COUNT; ++i) {
+            auto* child = get_dead_task_at_safe(cpu_no, i);
+            if (child == nullptr) {
+                continue;
+            }
+            if (child->pid != WAIT_TARGET) {
+                child->release();
+                continue;
+            }
+
+            bool const MATCH = waitpid_child_matches_waiter(waiter, child);
+            bool const COMPLETED = complete_waitpid_exit_for_scheduler(waiter, child, "wake-specific-dead");
+            bool const ALREADY_WAITED = task::task_waited_on(*child);
+            child->release();
+            if (COMPLETED) {
+                return true;
+            }
+            if (!MATCH || ALREADY_WAITED) {
+                return complete_missing_child();
+            }
+            return false;
+        }
+    }
+
+    return complete_missing_child();
+}
+
+inline auto complete_or_preserve_waitpid_block(task::Task* waiter) -> bool {
+    if (waiter == nullptr || !waiter->wait_channel_is(task::WaitChannelKind::WAITPID) || waiter->waiting_for_pid == 0) {
+        return true;
+    }
+
+    if (waitpid_has_job_stop_ready(waiter)) {
+        if (waiter->waiting_for_pid == WAIT_ANY_CHILD) {
+            uint32_t const ACTIVE_COUNT = get_active_task_count();
+            for (uint32_t i = 0; i < ACTIVE_COUNT; ++i) {
+                auto* child = get_active_task_at_safe(i);
+                if (child == nullptr) {
+                    continue;
+                }
+                bool const COMPLETED = complete_waitpid_job_stop_if_waitable(waiter, child);
+                child->release();
+                if (COMPLETED) {
+                    return true;
+                }
+            }
+        } else if (auto* target = find_task_by_pid_safe(waiter->waiting_for_pid); target != nullptr) {
+            bool const COMPLETED = complete_waitpid_job_stop_if_waitable(waiter, target);
+            target->release();
+            if (COMPLETED) {
+                return true;
+            }
+        }
+    }
+
+    if (waiter->has_interrupting_signal_pending()) {
+        interrupt_waitpid_block_for_signal(waiter);
+        return true;
+    }
+
+    if (waiter->waiting_for_pid == WAIT_ANY_CHILD) {
+        return complete_waitpid_any_for_scheduler(waiter);
+    }
+    return complete_waitpid_specific_for_scheduler(waiter);
+}
+
 inline void unlink_specific_waitpid_waiter(task::Task* waiter) {
     if (waiter == nullptr) {
         return;
@@ -1148,6 +1429,10 @@ void requeue_woken_outgoing_task_locked(RunQueue* rq, task::Task* outgoing, uint
     }
 
     task::WaitChannelKind const WAIT_CHANNEL = outgoing->wait_channel_kind;
+    if (is_waitpid_wait_channel(WAIT_CHANNEL) && outgoing->waiting_for_pid != 0) {
+        return;
+    }
+
     wait_list_remove_all_locked(rq, outgoing);
     outgoing->wants_block = false;
     outgoing->wake_at_us = 0;
@@ -4208,6 +4493,23 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
             } else {
                 wake_cpu(current_cpu_of_task);
             }
+        }
+        return;
+    }
+
+    if (is_waitpid_wait_channel(task->wait_channel_kind) && task->waiting_for_pid != 0 && !complete_or_preserve_waitpid_block(task)) {
+        if (found_and_removed) {
+            uint64_t owner_cpu = found_owner_cpu;
+            if (owner_cpu >= NCPUS_RESCHED) {
+                owner_cpu = task->cpu < NCPUS_RESCHED ? task->cpu : cpu_no;
+            }
+            run_queues->with_lock_void(owner_cpu, [task](RunQueue* rq) {
+                if (runqueue_task_is_reserved_locked(rq, task) || rq->runnable_heap.contains(task) || wait_list_contains_locked(rq, task)) {
+                    return;
+                }
+                task->sched_queue = task::Task::sched_queue::WAITING;
+                wait_list_push_locked(rq, task);
+            });
         }
         return;
     }
