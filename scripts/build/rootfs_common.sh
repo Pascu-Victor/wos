@@ -1,6 +1,9 @@
 #!/bin/bash
 # Shared rootfs staging helpers for create_mountfs_disk.sh and sync_rootfs.sh.
 
+# shellcheck source=scripts/build/qcow_common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/qcow_common.sh"
+
 ROOTFS_REPO=""
 ROOTFS_STAGING=""
 ROOTFS_MANAGED_TMP=""
@@ -407,20 +410,34 @@ rootfs_stage_tree() {
 
 rootfs_remove_old_managed_paths() {
     local disk="$1"
+    local new_managed="${2:-}"
     local managed_tmp
+    local stale_tmp
     local cmd_tmp
+    local read_log
+    local read_status
     local path_count
+    local path_list
 
     managed_tmp=$(mktemp)
+    stale_tmp=$(mktemp)
     cmd_tmp=$(mktemp)
+    read_log=$(mktemp)
 
-    if guestfish --ro -a "$disk" > /dev/null 2>&1 <<EOF
+    if guestfish --ro -a "$disk" > "$read_log" 2>&1 <<EOF
 run
 mount /dev/sda1 /
 download /etc/wos-managed-paths $managed_tmp
 EOF
     then
-        path_count=$(grep -cve '^[[:space:]]*$' "$managed_tmp" || true)
+        if [ -n "$new_managed" ] && [ -f "$new_managed" ]; then
+            grep -Fvx -f "$new_managed" "$managed_tmp" > "$stale_tmp" || true
+            path_list="$stale_tmp"
+        else
+            path_list="$managed_tmp"
+        fi
+
+        path_count=$(grep -cve '^[[:space:]]*$' "$path_list" || true)
         if [ "$path_count" -gt 0 ]; then
             {
                 echo "run"
@@ -436,12 +453,19 @@ EOF
                 while IFS= read -r path; do
                     [ -n "$path" ] || continue
                     printf 'glob rm-rf %s\n' "$path"
-                done < "$managed_tmp"
+                done < "$path_list"
                 echo "sync"
             } > "$cmd_tmp"
-            guestfish --rw -a "$disk" < "$cmd_tmp"
+            wos_qcow_guestfish "remove stale managed rootfs paths from qcow image" "$disk" --rw -a "$disk" < "$cmd_tmp"
+        fi
+    else
+        read_status=$?
+        if wos_qcow_log_has_lock "$read_log" || wos_qcow_log_has_corruption "$read_log"; then
+            wos_qcow_report_failure "read managed rootfs paths from qcow image" "$disk" "$read_log"
+            rm -f "$managed_tmp" "$stale_tmp" "$cmd_tmp" "$read_log"
+            return "$read_status"
         fi
     fi
 
-    rm -f "$managed_tmp" "$cmd_tmp"
+    rm -f "$managed_tmp" "$stale_tmp" "$cmd_tmp" "$read_log"
 }

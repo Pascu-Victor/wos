@@ -623,6 +623,7 @@ add_custom_command(
     COMMENT "Syncing rootfs disk..."
     DEPENDS
         ${WOS_BUILD_SCRIPTS_DIR}/create_mountfs_disk.sh
+        ${WOS_BUILD_SCRIPTS_DIR}/qcow_common.sh
         ${WOS_BUILD_SCRIPTS_DIR}/rootfs_common.sh
         ${WOS_BUILD_SCRIPTS_DIR}/sync_rootfs.sh
         ${CMAKE_SOURCE_DIR}/configs/system.conf
@@ -687,6 +688,7 @@ add_custom_command(
     DEPENDS
         ${WOS_BUILD_SCRIPTS_DIR}/make_image.sh
         ${WOS_BUILD_SCRIPTS_DIR}/make_initramfs.sh
+        ${WOS_BUILD_SCRIPTS_DIR}/qcow_common.sh
         ${CMAKE_SOURCE_DIR}/configs/disks.conf
         ${CMAKE_SOURCE_DIR}/configs/netdevs.conf
         ${CMAKE_SOURCE_DIR}/configs/system.conf

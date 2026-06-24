@@ -18,11 +18,14 @@ if [ ! -f "$DISK" ]; then
     exit 1
 fi
 
+wos_qcow_validate_for_update "$DISK" "sync rootfs delta into qcow image"
+
 echo "Syncing rootfs delta into $DISK..."
 
 # Build a staging directory with only the files that need updating
 STAGING=$(mktemp -d)
-trap 'rm -rf "$STAGING"' EXIT
+STAGING_TAR="$STAGING.tar"
+trap 'rm -rf "$STAGING"; rm -f "$STAGING_TAR"' EXIT
 
 rootfs_stage_tree "$CWD" "$STAGING"
 
@@ -34,18 +37,18 @@ fi
 # Stage a tarball with root:root ownership and correct permissions.
 chmod 700 "$STAGING/root/.ssh"
 test -f "$STAGING/root/.ssh/authorized_keys" && chmod 600 "$STAGING/root/.ssh/authorized_keys"
-tar cf "$STAGING.tar" --owner=0 --group=0 --numeric-owner -C "$STAGING" .
+tar cf "$STAGING_TAR" --owner=0 --group=0 --numeric-owner -C "$STAGING" .
 
-rootfs_remove_old_managed_paths "$DISK"
+rootfs_remove_old_managed_paths "$DISK" "$STAGING/etc/wos-managed-paths"
 
 # Use guestfish to copy updated files into the existing disk
-guestfish --rw -a "$DISK" <<_EOF_
+wos_qcow_guestfish "sync rootfs delta into qcow image" "$DISK" --rw -a "$DISK" <<_EOF_
 run
 mount /dev/sda1 /
-tar-in $STAGING.tar /
+tar-in $STAGING_TAR /
 sync
 _EOF_
 
-rm -f "$STAGING.tar"
+rm -f "$STAGING_TAR"
 
 echo "  rootfs sync: delta update complete"

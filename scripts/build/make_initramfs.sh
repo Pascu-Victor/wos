@@ -12,6 +12,9 @@ INITRAMFS_OUT="$BUILD_DIR/initramfs.cpio"
 ROOTFS_DISK="${WOS_ROOTFS_DISK:-mountfs.qcow2}"
 READELF="${WOS_READELF:-}"
 
+# shellcheck source=scripts/build/qcow_common.sh
+source "$CWD/scripts/build/qcow_common.sh"
+
 if [ ! -f "$INIT_BINARY" ]; then
     echo "ERROR: init binary not found at $INIT_BINARY"
     echo "Run cmake build first."
@@ -139,7 +142,8 @@ sync_rootfs_etc_tables() {
         return 0
     fi
 
-    guestfish --rw -a "$ROOTFS_DISK" <<EOF
+    wos_qcow_validate_for_update "$ROOTFS_DISK" "sync initramfs /etc tables into rootfs qcow image"
+    wos_qcow_guestfish "sync initramfs /etc tables into rootfs qcow image" "$ROOTFS_DISK" --rw -a "$ROOTFS_DISK" <<EOF
 run
 mount /dev/sda1 /
 mkdir-p /etc

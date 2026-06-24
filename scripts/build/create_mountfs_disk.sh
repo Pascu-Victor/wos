@@ -32,6 +32,7 @@ DISK="${WOS_ROOTFS_DISK:-mountfs.qcow2}"
 source "$CWD/scripts/build/rootfs_common.sh"
 
 if [ -e "$DISK" ]; then
+    wos_qcow_guard_replace "$DISK" "replace rootfs qcow image"
     echo "Removing existing $DISK..."
     rm "$DISK"
 fi
@@ -60,7 +61,7 @@ test -f "$STAGING/root/.ssh/authorized_keys" && chmod 600 "$STAGING/root/.ssh/au
 tar cf "$STAGING.tar" --owner=0 --group=0 --numeric-owner -C "$STAGING" .
 
 echo "Creating GPT partition and XFS filesystem"
-guestfish --rw -a "$DISK" <<_EOF_
+wos_qcow_guestfish "create partitioned XFS rootfs qcow image" "$DISK" --rw -a "$DISK" <<_EOF_
 run
 part-init /dev/sda gpt
 part-add /dev/sda p $PART_START_SECTOR $PART_END_SECTOR
@@ -78,7 +79,7 @@ echo ""
 echo "XFS rootfs disk created successfully: $DISK"
 echo "Contents:"
 
-guestfish --ro -a "$DISK" <<_EOF_
+wos_qcow_guestfish "list created rootfs qcow image contents" "$DISK" --ro -a "$DISK" <<_EOF_
 run
 mount /dev/sda1 /
 ls /

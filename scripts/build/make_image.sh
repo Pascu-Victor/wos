@@ -11,6 +11,10 @@ BUILD_DIR="${WOS_BUILD_DIR:-build}"
 BOOT_DISK="${WOS_BOOT_DISK:-disk.qcow2}"
 KERNEL_BINARY="$BUILD_DIR/modules/kern/wos"
 INITRAMFS_OUT="$BUILD_DIR/initramfs.cpio"
+
+# shellcheck source=scripts/build/qcow_common.sh
+source "$CWD/scripts/build/qcow_common.sh"
+
 if [[ "$KERNEL_BINARY" = /* ]]; then
     KERNEL_COPY="$KERNEL_BINARY"
 else
@@ -23,6 +27,7 @@ else
 fi
 
 if [ -e "$BOOT_DISK" ]; then
+    wos_qcow_guard_replace "$BOOT_DISK" "replace boot qcow image"
     rm "$BOOT_DISK"
 fi
 
@@ -30,7 +35,7 @@ fi
 # This assigns the final PARTUUID for the boot partition.
 mkdir -p "$(dirname "$BOOT_DISK")"
 qemu-img create -f qcow2 "$BOOT_DISK" 1G
-guestfish --rw -a "$BOOT_DISK" <<_EOF_
+wos_qcow_guestfish "create partitioned boot qcow image" "$BOOT_DISK" --rw -a "$BOOT_DISK" <<_EOF_
 run
 part-init /dev/sda gpt
 part-add /dev/sda p 2048 1845247
@@ -60,7 +65,7 @@ fi
 trap 'test -z "$TMP_LIMINE_CONF" || rm -f "$TMP_LIMINE_CONF"' EXIT
 
 # Phase 3: Populate the boot partition with kernel, bootloader, and initramfs.
-guestfish --rw -a "$BOOT_DISK" <<_EOF_
+wos_qcow_guestfish "populate boot qcow image" "$BOOT_DISK" --rw -a "$BOOT_DISK" <<_EOF_
 run
 mount /dev/sda1 /
 mkdir /EFI
