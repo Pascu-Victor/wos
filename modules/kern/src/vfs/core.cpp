@@ -7837,6 +7837,7 @@ auto vfs_generate_local_pipe_diag(char* buf, size_t bufsz) -> size_t {
             continue;
         }
 
+        constexpr size_t MAX_DIAG_WAITERS = 16;
         size_t read_fds = 0;
         size_t write_fds = 0;
         for (size_t i = 0; i < owner_count; ++i) {
@@ -7855,20 +7856,48 @@ auto vfs_generate_local_pipe_diag(char* buf, size_t bufsz) -> size_t {
         size_t reader_waiters = 0;
         size_t writer_waiters = 0;
         size_t poll_waiters = 0;
+        size_t read_poll_waiters = 0;
+        size_t write_poll_waiters = 0;
         bool read_closed = false;
         bool write_closed = false;
         bool direct_write = false;
         int open_ends = 0;
+        std::array<uint64_t, MAX_DIAG_WAITERS> reader_waiter_pids{};
+        std::array<uint64_t, MAX_DIAG_WAITERS> writer_waiter_pids{};
+        std::array<uint64_t, MAX_DIAG_WAITERS> read_poll_waiter_pids{};
+        std::array<uint64_t, MAX_DIAG_WAITERS> write_poll_waiter_pids{};
+        size_t reader_waiter_diag_count = 0;
+        size_t writer_waiter_diag_count = 0;
+        size_t read_poll_waiter_diag_count = 0;
+        size_t write_poll_waiter_diag_count = 0;
         uint64_t const PIPE_IRQF = st->lock.lock_irqsave();
         capacity = st->capacity;
         buffered = st->count;
         reader_waiters = st->readers_waiting.size();
         writer_waiters = st->writers_waiting.size();
-        poll_waiters = st->read_poll_waiting.size() + st->write_poll_waiting.size();
+        read_poll_waiters = st->read_poll_waiting.size();
+        write_poll_waiters = st->write_poll_waiting.size();
+        poll_waiters = read_poll_waiters + write_poll_waiters;
         read_closed = st->read_closed;
         write_closed = st->write_closed;
         direct_write = st->direct_write_active;
         open_ends = st->open_ends.load(std::memory_order_relaxed);
+        reader_waiter_diag_count = std::min(reader_waiters, MAX_DIAG_WAITERS);
+        writer_waiter_diag_count = std::min(writer_waiters, MAX_DIAG_WAITERS);
+        read_poll_waiter_diag_count = std::min(read_poll_waiters, MAX_DIAG_WAITERS);
+        write_poll_waiter_diag_count = std::min(write_poll_waiters, MAX_DIAG_WAITERS);
+        for (size_t i = 0; i < reader_waiter_diag_count; ++i) {
+            reader_waiter_pids[i] = st->readers_waiting.at(i);
+        }
+        for (size_t i = 0; i < writer_waiter_diag_count; ++i) {
+            writer_waiter_pids[i] = st->writers_waiting.at(i);
+        }
+        for (size_t i = 0; i < read_poll_waiter_diag_count; ++i) {
+            read_poll_waiter_pids[i] = st->read_poll_waiting.at(i);
+        }
+        for (size_t i = 0; i < write_poll_waiter_diag_count; ++i) {
+            write_poll_waiter_pids[i] = st->write_poll_waiting.at(i);
+        }
         st->lock.unlock_irqrestore(PIPE_IRQF);
 
         pipe_diag_append(buf, bufsz, len, output_truncated,
@@ -7879,6 +7908,25 @@ auto vfs_generate_local_pipe_diag(char* buf, size_t bufsz) -> size_t {
                          static_cast<unsigned long long>(reader_waiters), static_cast<unsigned long long>(writer_waiters),
                          static_cast<unsigned long long>(poll_waiters), static_cast<unsigned long long>(read_fds),
                          static_cast<unsigned long long>(write_fds));
+
+        auto append_waiters = [&](const char* label, const std::array<uint64_t, MAX_DIAG_WAITERS>& pids, size_t shown, size_t total) {
+            if (total == 0) {
+                return;
+            }
+            pipe_diag_append(buf, bufsz, len, output_truncated, " waiters %s", label);
+            for (size_t i = 0; i < shown; ++i) {
+                pipe_diag_append(buf, bufsz, len, output_truncated, " %llu", static_cast<unsigned long long>(pids[i]));
+            }
+            if (shown < total) {
+                pipe_diag_append(buf, bufsz, len, output_truncated, " ...(+%llu)", static_cast<unsigned long long>(total - shown));
+            }
+            pipe_diag_append(buf, bufsz, len, output_truncated, "%s", "\n");
+        };
+
+        append_waiters("read", reader_waiter_pids, reader_waiter_diag_count, reader_waiters);
+        append_waiters("write", writer_waiter_pids, writer_waiter_diag_count, writer_waiters);
+        append_waiters("read_poll", read_poll_waiter_pids, read_poll_waiter_diag_count, read_poll_waiters);
+        append_waiters("write_poll", write_poll_waiter_pids, write_poll_waiter_diag_count, write_poll_waiters);
 
         for (size_t i = 0; i < owner_count; ++i) {
             if (owners[i].state != st) {
