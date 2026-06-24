@@ -880,6 +880,24 @@ void dirty_consider_candidate(BufHead* bh, const DirtyWritebackFilter& filter, u
     }
 }
 
+void dirty_tree_consider_overlapping(BufHead* root, const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive, BufHead*& best) {
+    if (root == nullptr || !filter.use_range || filter.bdev == nullptr) {
+        return;
+    }
+
+    uint64_t const QUERY_LAST = block_range_last_block(filter.block_no, filter.count);
+
+    if (root->dirty_left != nullptr && root->dirty_left->dirty_subtree_last_block >= filter.block_no) {
+        dirty_tree_consider_overlapping(root->dirty_left, filter, min_epoch_exclusive, best);
+    }
+
+    dirty_consider_candidate(root, filter, min_epoch_exclusive, best);
+
+    if (root->block_no <= QUERY_LAST) {
+        dirty_tree_consider_overlapping(root->dirty_right, filter, min_epoch_exclusive, best);
+    }
+}
+
 auto find_oldest_matching_dirty_buffer_locked(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive) -> BufHead* {
     if (!dirty_filter_may_have_match_locked(filter)) {
         return nullptr;
@@ -892,6 +910,15 @@ auto find_oldest_matching_dirty_buffer_locked(const DirtyWritebackFilter& filter
                 dirty_consider_candidate(bh, filter, min_epoch_exclusive, best);
             }
         }
+        return best;
+    }
+
+    if (filter.bdev != nullptr && filter.use_range) {
+        DirtyBdevState* state = find_dirty_bdev_state_locked(filter.bdev);
+        if (state == nullptr || state->dirty_buffers == 0 || !dirty_tree_overlaps(state->tree_root, filter.block_no, filter.count)) {
+            return nullptr;
+        }
+        dirty_tree_consider_overlapping(state->tree_root, filter, min_epoch_exclusive, best);
         return best;
     }
 

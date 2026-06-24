@@ -7266,6 +7266,9 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
         if (st == nullptr) {
             return finish(-EBADF);
         }
+        if (count == 0) {
+            return finish(0);
+        }
 
         for (;;) {
             PipeWakeList pending_writers{};
@@ -7351,6 +7354,9 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
         auto* st = static_cast<PipeState*>(f->private_data);
         if (st == nullptr) {
             return finish(-EBADF);
+        }
+        if (count == 0) {
+            return finish(0);
         }
 
         for (;;) {
@@ -7998,6 +8004,9 @@ auto vfs_selftest_pipe_flags() -> bool {
          (read_file->open_flags & O_NONBLOCK) != 0 && (write_file->open_flags & O_NONBLOCK) != 0 &&
          (read_file->open_flags & ker::vfs::O_CLOEXEC) == 0 && (write_file->open_flags & ker::vfs::O_CLOEXEC) == 0 &&
          after.active_pipes == before.active_pipes + 1 && after.capacity_bytes == before.capacity_bytes + PIPE_DEFAULT_CAPACITY;
+    char dummy = 0;
+    ok = ok && read_file->fops->vfs_read(read_file, &dummy, 0, 0) == 0;
+    ok = ok && write_file->fops->vfs_write(write_file, &dummy, 0, 0) == 0;
 
     bool const CLOSED_READ = pipefd[0] >= 0 && pipe_close_fake_task_fd(task, pipefd[0]);
     bool const CLOSED_WRITE = pipefd[1] >= 0 && pipe_close_fake_task_fd(task, pipefd[1]);

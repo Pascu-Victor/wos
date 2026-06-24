@@ -9,7 +9,14 @@ get_filename_component(WOS_REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 set(WOS_MODULES_DIR "${CMAKE_CURRENT_LIST_DIR}")
 set(HOST_PATH ${WOS_REPO_ROOT}/toolchain/host)
 set(WOS_NATIVE_SYSTEM_BUILD OFF CACHE BOOL "Build modules with the native WOS system toolchain")
-if((DEFINED ENV{WOS_NATIVE_HOST} AND "$ENV{WOS_NATIVE_HOST}" STREQUAL "1") OR CMAKE_HOST_SYSTEM_NAME STREQUAL "WOS")
+execute_process(
+    COMMAND uname -s
+    OUTPUT_VARIABLE WOS_HOST_UNAME
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if((DEFINED ENV{WOS_NATIVE_HOST} AND "$ENV{WOS_NATIVE_HOST}" STREQUAL "1") OR CMAKE_HOST_SYSTEM_NAME STREQUAL "WOS" OR
+   WOS_HOST_UNAME STREQUAL "WOS")
     set(WOS_NATIVE_SYSTEM_BUILD ON CACHE BOOL "Build modules with the native WOS system toolchain" FORCE)
 endif()
 
@@ -33,7 +40,9 @@ else()
     set(CMAKE_C_COMPILER "${HOST_PATH}/bin/clang" CACHE INTERNAL "Path to clang" FORCE)
     set(CMAKE_CXX_COMPILER "${HOST_PATH}/bin/clang++" CACHE INTERNAL "Path to clang++" FORCE)
 endif()
-set(CMAKE_LINKER_TYPE "LLD")
+if(NOT WOS_NATIVE_SYSTEM_BUILD)
+    set(CMAKE_LINKER_TYPE "LLD")
+endif()
 option(WOS_USE_CCACHE "Use ccache/cccache as a compiler launcher when available" ON)
 set(WOS_CCACHE_PROGRAM "" CACHE FILEPATH "Path to ccache/cccache")
 if(WOS_USE_CCACHE AND NOT WOS_CCACHE_PROGRAM)
