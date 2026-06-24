@@ -1887,6 +1887,58 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
     }
 
     uint32_t const EXPECTED_EXTENTS = DEEP_TARGET_EXTENTS;
+    auto reload_deep_inode = [&]() -> bool {
+        XfsInode* reloaded = xfs_inode_read(&mount, inode.ino);
+        if (reloaded == nullptr) {
+            return false;
+        }
+
+        auto finish_reload = [&](bool ok) -> bool {
+            xfs_inode_release(reloaded);
+            xfs_icache_purge(&mount);
+            return ok;
+        };
+
+        if (reloaded->data_fork.format != XFS_DINODE_FMT_BTREE || reloaded->nextents != EXPECTED_EXTENTS ||
+            reloaded->nblocks != expected_metadata_blocks(EXPECTED_EXTENTS) ||
+            reloaded->data_fork.btree.level != expected_bmdr_level(EXPECTED_EXTENTS) || reloaded->data_fork.btree.numrecs != 1) {
+            return finish_reload(false);
+        }
+
+        auto* reloaded_extents = new (std::nothrow) XfsBmbtIrec[EXPECTED_EXTENTS];
+        if (reloaded_extents == nullptr) {
+            return finish_reload(false);
+        }
+        auto finish_reload_extents = [&](bool ok) -> bool {
+            delete[] reloaded_extents;
+            return finish_reload(ok);
+        };
+
+        int const RELOADED_COUNT = xfs_bmap_list_extents(reloaded, reloaded_extents, EXPECTED_EXTENTS);
+        if (std::cmp_not_equal(RELOADED_COUNT, EXPECTED_EXTENTS)) {
+            return finish_reload_extents(false);
+        }
+        for (uint32_t i = 0; i < EXPECTED_EXTENTS; i++) {
+            auto const EXPECTED_OFF = extent_startoff(i);
+            xfs_fsblock_t const EXPECTED_BLOCK = 1000 + (i * 3);
+            if (reloaded_extents[i].br_startoff != EXPECTED_OFF || reloaded_extents[i].br_startblock != EXPECTED_BLOCK ||
+                reloaded_extents[i].br_blockcount != 1 || reloaded_extents[i].br_unwritten) {
+                return finish_reload_extents(false);
+            }
+
+            XfsBmapResult mapped{};
+            if (xfs_bmap_lookup(reloaded, EXPECTED_OFF, &mapped) != 0 || mapped.is_hole || mapped.startblock != EXPECTED_BLOCK ||
+                mapped.blockcount != 1) {
+                return finish_reload_extents(false);
+            }
+        }
+
+        return finish_reload_extents(true);
+    };
+    if (!reload_deep_inode()) {
+        return cleanup(false);
+    }
+
     auto* listed = new (std::nothrow) XfsBmbtIrec[EXPECTED_EXTENTS];
     if (listed == nullptr) {
         return cleanup(false);
