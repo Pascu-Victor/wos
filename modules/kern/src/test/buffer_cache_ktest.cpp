@@ -469,6 +469,82 @@ KTEST(BufferCache, DirtyRangeIndexFindsAndOverlaysDirtySpan) {
     ker::vfs::invalidate_bdev(&dev);
 }
 
+KTEST(BufferCache, BreadHitOverlaysDirtyMultiAlias) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    ker::vfs::invalidate_bdev(&dev);
+
+    const uint64_t BLK = 1200;
+
+    ker::vfs::BufHead* clean_single = ker::vfs::bread(&dev, BLK + 3);
+    KREQUIRE_NE(clean_single, nullptr);
+    KEXPECT_EQ(clean_single->data[0], static_cast<uint8_t>(0));
+    ker::vfs::brelse(clean_single);
+
+    ker::vfs::BufHead* dirty_multi = ker::vfs::bget_multi(&dev, BLK, 8);
+    KREQUIRE_NE(dirty_multi, nullptr);
+    memset(dirty_multi->data, 0x5A, dirty_multi->size);
+    ker::vfs::bdirty(dirty_multi);
+    ker::vfs::brelse(dirty_multi);
+
+    ker::vfs::BufHead* reread_single = ker::vfs::bread(&dev, BLK + 3);
+    KREQUIRE_NE(reread_single, nullptr);
+    KEXPECT_EQ(reread_single->data[0], static_cast<uint8_t>(0x5A));
+    KEXPECT_EQ(reread_single->data[reread_single->size - 1], static_cast<uint8_t>(0x5A));
+    ker::vfs::brelse(reread_single);
+    ker::vfs::invalidate_bdev(&dev);
+}
+
+KTEST(BufferCache, BreadMultiMissOverlaysDirtySingleAlias) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    ker::vfs::invalidate_bdev(&dev);
+
+    const uint64_t BLK = 1300;
+    const size_t RATIO = 8;
+
+    ker::vfs::BufHead* dirty_single = ker::vfs::bread(&dev, BLK + 4);
+    KREQUIRE_NE(dirty_single, nullptr);
+    memset(dirty_single->data, 0xC3, dirty_single->size);
+    ker::vfs::bdirty(dirty_single);
+    ker::vfs::brelse(dirty_single);
+
+    ker::vfs::BufHead* reread_multi = ker::vfs::bread_multi(&dev, BLK, RATIO);
+    KREQUIRE_NE(reread_multi, nullptr);
+    KEXPECT_EQ(reread_multi->data[0], static_cast<uint8_t>(0));
+    KEXPECT_EQ(reread_multi->data[(4 * 512)], static_cast<uint8_t>(0xC3));
+    KEXPECT_EQ(reread_multi->data[(5 * 512) - 1], static_cast<uint8_t>(0xC3));
+    KEXPECT_EQ(reread_multi->data[(5 * 512)], static_cast<uint8_t>(0));
+    ker::vfs::brelse(reread_multi);
+    ker::vfs::invalidate_bdev(&dev);
+}
+
+KTEST(BufferCache, BreadMultiHitOverlaysDirtySingleAlias) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    ker::vfs::invalidate_bdev(&dev);
+
+    const uint64_t BLK = 1400;
+    const size_t RATIO = 8;
+
+    ker::vfs::BufHead* clean_multi = ker::vfs::bread_multi(&dev, BLK, RATIO);
+    KREQUIRE_NE(clean_multi, nullptr);
+    KEXPECT_EQ(clean_multi->data[0], static_cast<uint8_t>(0));
+    ker::vfs::brelse(clean_multi);
+
+    ker::vfs::BufHead* dirty_single = ker::vfs::bread(&dev, BLK + 2);
+    KREQUIRE_NE(dirty_single, nullptr);
+    memset(dirty_single->data, 0x7E, dirty_single->size);
+    ker::vfs::bdirty(dirty_single);
+    ker::vfs::brelse(dirty_single);
+
+    ker::vfs::BufHead* reread_multi = ker::vfs::bread_multi(&dev, BLK, RATIO);
+    KREQUIRE_NE(reread_multi, nullptr);
+    KEXPECT_EQ(reread_multi->data[0], static_cast<uint8_t>(0));
+    KEXPECT_EQ(reread_multi->data[(2 * 512)], static_cast<uint8_t>(0x7E));
+    KEXPECT_EQ(reread_multi->data[(3 * 512) - 1], static_cast<uint8_t>(0x7E));
+    KEXPECT_EQ(reread_multi->data[(3 * 512)], static_cast<uint8_t>(0));
+    ker::vfs::brelse(reread_multi);
+    ker::vfs::invalidate_bdev(&dev);
+}
+
 KTEST(BufferCache, SyncBlockdevWritesOverlappingDirtyBuffersOldestFirst) {
     ker::dev::BlockDevice dev = make_null_bdev();
     RecordingWriteState io{};

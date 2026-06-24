@@ -392,20 +392,82 @@ auto bmbt_free_subtree(XfsMountContext* mount, XfsTransaction* tp, xfs_fsblock_t
     return RC;
 }
 
-auto bmbt_free_root_bytes(XfsInode* ip, XfsTransaction* tp, const uint8_t* root, size_t root_size, uint32_t* freed) -> int {
-    if (freed != nullptr) {
-        *freed = 0;
+auto bmbt_count_subtree(XfsMountContext* mount, xfs_fsblock_t root_block, uint8_t nlevels, uint32_t* count) -> int {
+    if (mount == nullptr || root_block == NULLFSBLOCK || nlevels == 0 || count == nullptr) {
+        return -EINVAL;
     }
-    if (ip == nullptr || ip->mount == nullptr || tp == nullptr || root == nullptr || root_size < sizeof(XfsBmdrBlock)) {
-        return 0;
+
+    BufHead* bh = xfs_buf_read(mount, root_block);
+    if (bh == nullptr) {
+        return -EIO;
     }
+
+    const auto* hdr = reinterpret_cast<const XfsBtreeLblock*>(bh->data);
+    if (hdr->bb_magic.to_cpu() != XFS_BMAP_CRC_MAGIC) {
+        brelse(bh);
+        return -EIO;
+    }
+    if (nlevels > XFS_BTREE_MAXLEVELS || hdr->bb_level.to_cpu() != static_cast<uint16_t>(nlevels - 1)) {
+        brelse(bh);
+        return -EIO;
+    }
+
+    uint16_t const NUMRECS = hdr->bb_numrecs.to_cpu();
+    if (nlevels > 1) {
+        uint32_t const NODE_CAPACITY = bmbt_node_max_keys(mount);
+        if (NUMRECS > NODE_CAPACITY) {
+            brelse(bh);
+            return -EIO;
+        }
+
+        for (uint16_t i = 0; i < NUMRECS; i++) {
+            Be64 ptr_val{};
+            __builtin_memcpy(&ptr_val, bh->data + bmbt_node_ptr_offset(mount, i), sizeof(ptr_val));
+            xfs_fsblock_t const CHILD = ptr_val.to_cpu();
+            if (CHILD == NULLFSBLOCK) {
+                brelse(bh);
+                return -EIO;
+            }
+            int const RC = bmbt_count_subtree(mount, CHILD, static_cast<uint8_t>(nlevels - 1), count);
+            if (RC != 0) {
+                brelse(bh);
+                return RC;
+            }
+        }
+    } else if (NUMRECS > bmbt_leaf_max_recs(mount)) {
+        brelse(bh);
+        return -EIO;
+    }
+
+    brelse(bh);
+    if (*count == UINT32_MAX) {
+        return -EFBIG;
+    }
+    (*count)++;
+    return 0;
+}
+
+auto bmbt_count_root_bytes(XfsInode* ip, const uint8_t* root, size_t root_size, uint32_t* count) -> int {
+    if (count != nullptr) {
+        *count = 0;
+    }
+    if (count == nullptr) {
+        return -EINVAL;
+    }
+    if (ip == nullptr || ip->mount == nullptr) {
+        return -EINVAL;
+    }
+    if (root == nullptr || root_size < sizeof(XfsBmdrBlock)) {
+        return -EIO;
+    }
+
     const auto* bmdr = reinterpret_cast<const XfsBmdrBlock*>(root);
     uint16_t const LEVEL = bmdr->bb_level.to_cpu();
     uint16_t const NUMRECS = bmdr->bb_numrecs.to_cpu();
-    if (LEVEL == 0 || NUMRECS == 0) {
+    if (NUMRECS == 0) {
         return 0;
     }
-    if (LEVEL > XFS_BTREE_MAXLEVELS) {
+    if (LEVEL == 0 || LEVEL > XFS_BTREE_MAXLEVELS) {
         return -EIO;
     }
 
@@ -417,7 +479,51 @@ auto bmbt_free_root_bytes(XfsInode* ip, XfsTransaction* tp, const uint8_t* root,
     for (uint16_t i = 0; i < NUMRECS; i++) {
         Be64 ptr_val{};
         __builtin_memcpy(&ptr_val, bmdr_ptr_addr(root, root_maxrecs, i), sizeof(ptr_val));
-        int const RC = bmbt_free_subtree(ip->mount, tp, ptr_val.to_cpu(), static_cast<uint8_t>(LEVEL), freed);
+        xfs_fsblock_t const CHILD = ptr_val.to_cpu();
+        if (CHILD == NULLFSBLOCK) {
+            return -EIO;
+        }
+        int const RC = bmbt_count_subtree(ip->mount, CHILD, static_cast<uint8_t>(LEVEL), count);
+        if (RC != 0) {
+            return RC;
+        }
+    }
+    return 0;
+}
+
+auto bmbt_free_root_bytes(XfsInode* ip, XfsTransaction* tp, const uint8_t* root, size_t root_size, uint32_t* freed) -> int {
+    if (freed != nullptr) {
+        *freed = 0;
+    }
+    if (ip == nullptr || ip->mount == nullptr || tp == nullptr) {
+        return -EINVAL;
+    }
+    if (root == nullptr || root_size < sizeof(XfsBmdrBlock)) {
+        return -EIO;
+    }
+    const auto* bmdr = reinterpret_cast<const XfsBmdrBlock*>(root);
+    uint16_t const LEVEL = bmdr->bb_level.to_cpu();
+    uint16_t const NUMRECS = bmdr->bb_numrecs.to_cpu();
+    if (NUMRECS == 0) {
+        return 0;
+    }
+    if (LEVEL == 0 || LEVEL > XFS_BTREE_MAXLEVELS) {
+        return -EIO;
+    }
+
+    uint32_t root_maxrecs = 0;
+    int rc = bmdr_root_layout(ip, root_size, NUMRECS, &root_maxrecs);
+    if (rc != 0) {
+        return rc;
+    }
+    for (uint16_t i = 0; i < NUMRECS; i++) {
+        Be64 ptr_val{};
+        __builtin_memcpy(&ptr_val, bmdr_ptr_addr(root, root_maxrecs, i), sizeof(ptr_val));
+        xfs_fsblock_t const CHILD = ptr_val.to_cpu();
+        if (CHILD == NULLFSBLOCK) {
+            return -EIO;
+        }
+        int const RC = bmbt_free_subtree(ip->mount, tp, CHILD, static_cast<uint8_t>(LEVEL), freed);
         if (RC != 0) {
             return RC;
         }
@@ -734,6 +840,9 @@ auto bmap_lookup_btree(XfsInode* ip, xfs_fileoff_t file_block, XfsBmapResult* re
     Be64 ptr_val{};
     __builtin_memcpy(&ptr_val, bmdr_ptr_addr(bt.root, root_maxrecs, static_cast<uint16_t>(keyno)), sizeof(Be64));
     uint64_t const CHILD_BLOCK = ptr_val.to_cpu();
+    if (CHILD_BLOCK == NULLFSBLOCK) {
+        return -EIO;
+    }
 
     if (LEVEL == 1) {
         // Child is a leaf - we can read it directly and do the lookup
@@ -899,8 +1008,8 @@ auto xfs_bmap_list_extents(XfsInode* ip, XfsBmbtIrec* extents, uint32_t max_exte
     if (ip->data_fork.format == XFS_DINODE_FMT_BTREE) {
         // Walk the btree from leftmost leaf to rightmost, collecting records
         const XfsIforkBtree& bt = ip->data_fork.btree;
-        if (bt.root == nullptr) {
-            return 0;
+        if (bt.root == nullptr || bt.root_size < sizeof(XfsBmdrBlock)) {
+            return -EINVAL;
         }
 
         const auto* bmdr = reinterpret_cast<const XfsBmdrBlock*>(bt.root);
@@ -922,6 +1031,9 @@ auto xfs_bmap_list_extents(XfsInode* ip, XfsBmbtIrec* extents, uint32_t max_exte
         Be64 ptr_val{};
         __builtin_memcpy(&ptr_val, bmdr_ptr_addr(bt.root, root_maxrecs, 0), sizeof(Be64));
         uint64_t const CHILD_BLOCK = ptr_val.to_cpu();
+        if (CHILD_BLOCK == NULLFSBLOCK) {
+            return -EIO;
+        }
 
         // Use a cursor positioned at the very beginning
         XfsBtreeCursor<XfsBmbtTraits> cur;
@@ -1043,6 +1155,23 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
         return -EIO;
     }
 
+    uint32_t old_metadata_blocks = 0;
+    uint8_t* old_root = nullptr;
+    size_t old_root_size = 0;
+    if (WAS_BTREE) {
+        old_root = ip->data_fork.btree.root;
+        old_root_size = ip->data_fork.btree.root_size;
+        rc = bmbt_count_root_bytes(ip, old_root, old_root_size, &old_metadata_blocks);
+        if (rc != 0) {
+            delete[] new_extents;
+            return rc;
+        }
+        if (ip->nblocks < old_metadata_blocks) {
+            delete[] new_extents;
+            return -EIO;
+        }
+    }
+
     uint32_t const INLINE_CAPACITY = data_fork_record_capacity(ip);
     if (!WAS_BTREE && new_count <= INLINE_CAPACITY) {
         uint32_t old_capacity = 0;
@@ -1095,13 +1224,17 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
         return rc;
     }
 
-    uint32_t old_metadata_blocks = 0;
-    uint8_t* old_root = nullptr;
-    size_t old_root_size = 0;
+    uint64_t const ACCOUNTED_BLOCKS = WAS_BTREE ? ip->nblocks - old_metadata_blocks : ip->nblocks;
+    if (ACCOUNTED_BLOCKS > UINT64_MAX - new_root.metadata_blocks) {
+        static_cast<void>(bmbt_free_root_bytes(ip, tp, new_root.root, new_root.root_size, nullptr));
+        free_bmbt_root(&new_root);
+        delete[] new_extents;
+        return -EFBIG;
+    }
+    uint64_t const FINAL_NBLOCKS = ACCOUNTED_BLOCKS + new_root.metadata_blocks;
+
     if (WAS_BTREE) {
-        old_root = ip->data_fork.btree.root;
-        old_root_size = ip->data_fork.btree.root_size;
-        rc = bmbt_free_root_bytes(ip, tp, old_root, old_root_size, &old_metadata_blocks);
+        rc = bmbt_free_root_bytes(ip, tp, old_root, old_root_size, nullptr);
         if (rc != 0) {
             static_cast<void>(bmbt_free_root_bytes(ip, tp, new_root.root, new_root.root_size, nullptr));
             free_bmbt_root(&new_root);
@@ -1124,15 +1257,7 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
     ip->data_fork.btree.root = new_root.root;
     ip->data_fork.btree.root_size = new_root.root_size;
     ip->nextents = new_count;
-    if (WAS_BTREE) {
-        if (ip->nblocks >= old_metadata_blocks) {
-            ip->nblocks = ip->nblocks - old_metadata_blocks + new_root.metadata_blocks;
-        } else {
-            ip->nblocks += new_root.metadata_blocks;
-        }
-    } else {
-        ip->nblocks += new_root.metadata_blocks;
-    }
+    ip->nblocks = FINAL_NBLOCKS;
     ip->dirty = true;
     xfs_trans_log_inode(tp, ip);
 
@@ -1428,11 +1553,75 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
             return cleanup(false);
         }
     }
+
+    auto corrupt_promoted_root_rejected = [&]() -> bool {
+        auto* saved_root = inode.data_fork.btree.root;
+        size_t const SAVED_ROOT_SIZE = inode.data_fork.btree.root_size;
+        auto* corrupt_root = new (std::nothrow) uint8_t[SAVED_ROOT_SIZE];
+        if (corrupt_root == nullptr) {
+            return false;
+        }
+        __builtin_memcpy(corrupt_root, saved_root, SAVED_ROOT_SIZE);
+        Be64 null_child = Be64::from_cpu(NULLFSBLOCK);
+        __builtin_memcpy(bmdr_ptr_addr(corrupt_root, BMDR_MAXRECS, 0), &null_child, sizeof(null_child));
+
+        inode.data_fork.btree.root = corrupt_root;
+        inode.data_fork.btree.root_size = SAVED_ROOT_SIZE;
+
+        XfsBmapResult ignored_lookup{};
+        std::array<XfsBmbtIrec, 1> ignored_list{};
+        uint32_t counted_blocks = 1234;
+        bool const OK = xfs_bmap_lookup(&inode, extent_startoff(0), &ignored_lookup) == -EIO &&
+                        xfs_bmap_list_extents(&inode, ignored_list.data(), ignored_list.size()) == -EIO &&
+                        bmbt_count_root_bytes(&inode, corrupt_root, SAVED_ROOT_SIZE, &counted_blocks) == -EIO && counted_blocks == 0;
+
+        inode.data_fork.btree.root = saved_root;
+        inode.data_fork.btree.root_size = SAVED_ROOT_SIZE;
+        delete[] corrupt_root;
+        return OK;
+    };
+    if (!corrupt_promoted_root_rejected()) {
+        return cleanup(false);
+    }
+
+    uint32_t malformed_count = 1234;
+    if (bmbt_count_root_bytes(&inode, nullptr, 0, &malformed_count) != -EIO || malformed_count != 0) {
+        return cleanup(false);
+    }
+    XfsTransaction* malformed_free_tp = xfs_trans_alloc(&mount);
+    if (malformed_free_tp == nullptr) {
+        return cleanup(false);
+    }
+    uint32_t malformed_freed = 1234;
+    int const MALFORMED_FREE_RC = bmbt_free_root_bytes(&inode, malformed_free_tp, nullptr, 0, &malformed_freed);
+    xfs_trans_cancel(malformed_free_tp);
+    if (MALFORMED_FREE_RC != -EIO || malformed_freed != 0) {
+        return cleanup(false);
+    }
+
     XfsBmapResult promoted_leading_hole{};
     if (xfs_bmap_lookup(&inode, 0, &promoted_leading_hole) != 0 || !promoted_leading_hole.is_hole ||
         promoted_leading_hole.blockcount != extent_startoff(0)) {
         return cleanup(false);
     }
+
+    uint64_t const PROMOTED_NBLOCKS = inode.nblocks;
+    inode.nblocks = PROMOTED_NBLOCKS - 1;
+    XfsTransaction* bad_accounting_tp = xfs_trans_alloc(&mount);
+    if (bad_accounting_tp == nullptr) {
+        return cleanup(false);
+    }
+    XfsBmbtIrec const ACCOUNTING_PROBE{.br_startoff = extent_startoff(INLINE_CAPACITY + 1),
+                                       .br_startblock = static_cast<xfs_fsblock_t>(1000 + ((INLINE_CAPACITY + 1) * 3)),
+                                       .br_blockcount = 1,
+                                       .br_unwritten = false};
+    int const BAD_ACCOUNTING_RC = xfs_bmap_add_extent(&inode, bad_accounting_tp, ACCOUNTING_PROBE);
+    xfs_trans_cancel(bad_accounting_tp);
+    if (BAD_ACCOUNTING_RC != -EIO || inode.data_fork.format != XFS_DINODE_FMT_BTREE || inode.nextents != INLINE_CAPACITY + 1 ||
+        inode.nblocks != PROMOTED_NBLOCKS - 1) {
+        return cleanup(false);
+    }
+    inode.nblocks = PROMOTED_NBLOCKS;
 
     uint32_t const TARGET_EXTENTS = LEAF_CAPACITY + 2;
     for (uint32_t i = INLINE_CAPACITY + 1; i < TARGET_EXTENTS; i++) {

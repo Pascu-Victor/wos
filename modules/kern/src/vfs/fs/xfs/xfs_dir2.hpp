@@ -71,8 +71,9 @@ auto xfs_dir_iterate(XfsInode* dp, XfsDirIterFn fn, void* ctx) -> int;
 // dp: directory inode, name/namelen: entry name, ino: target inode number,
 // ftype: XFS_DIR3_FT_* file type, tp: enclosing transaction.
 // Returns 0 on success, negative errno on failure.
-// Supports shortform and block-format directories.  Leaf/node directories can
-// add entries when existing free data space and a stale leaf slot are reusable.
+// Supports shortform and block-format directories. Leaf/node directories can
+// reuse leaf slots while available and fall back to data-block scans for
+// entries appended after the current single-leaf index is saturated.
 struct XfsTransaction;
 auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t ino, uint8_t ftype, XfsTransaction* tp) -> int;
 

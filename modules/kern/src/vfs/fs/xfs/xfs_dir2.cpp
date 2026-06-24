@@ -905,6 +905,7 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
             brelse(leaf_bh);
             goto linear_scan;
         }
+        bool const LEAF_INDEX_FULL = leaf_count >= LEAF_CAPACITY;
 
         const auto* lep = reinterpret_cast<const XfsDir2LeafEntry*>(leaf_entries_base);
 
@@ -929,6 +930,9 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
 
         if (!found) {
             brelse(leaf_bh);
+            if (LEAF_INDEX_FULL) {
+                goto linear_scan;
+            }
             return -ENOENT;
         }
 
@@ -971,6 +975,9 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
         }
 
         brelse(leaf_bh);
+        if (LEAF_INDEX_FULL) {
+            goto linear_scan;
+        }
         return -ENOENT;
     }
 
@@ -1582,6 +1589,16 @@ auto dir2_leaf_ensure_stale_slot(XfsMountContext const* ctx, XfsDir3LeafHdr* hdr
     return 0;
 }
 
+auto dir2_leaf_can_index_new_entry(XfsMountContext const* ctx, const XfsDir3LeafHdr* hdr) -> bool {
+    if (hdr->stale.to_cpu() != 0) {
+        return true;
+    }
+
+    uint16_t const LEAF_COUNT = hdr->count.to_cpu();
+    size_t const CAPACITY = (ctx->dir_blk_size - sizeof(XfsDir3LeafHdr)) / sizeof(XfsDir2LeafEntry);
+    return CAPACITY <= UINT16_MAX && LEAF_COUNT < CAPACITY;
+}
+
 void dir2_leaf_reuse_stale_entry(XfsDir3LeafHdr* hdr, xfs_dahash_t hash, xfs_dir2_dataptr_t dataptr, int stale_idx, int insert_pos) {
     auto* lep = dir2_leaf_entries(hdr);
     uint16_t const STALE_COUNT = hdr->stale.to_cpu();
@@ -2119,7 +2136,12 @@ auto dir2_block_to_leaf(XfsInode* dp, XfsTransaction* tp) -> int {
 
     auto* btp = reinterpret_cast<XfsDir2BlockTail*>(block + BLKSIZE - sizeof(XfsDir2BlockTail));
     uint32_t const LEAF_COUNT = btp->count.to_cpu();
+    uint32_t const STALE_COUNT = btp->stale.to_cpu();
     size_t const LEAF_BYTES = static_cast<size_t>(LEAF_COUNT) * sizeof(XfsDir2LeafEntry);
+    if (STALE_COUNT > LEAF_COUNT) {
+        brelse(block_bh);
+        return -EINVAL;
+    }
     if (LEAF_BYTES > BLKSIZE - DATA_START - sizeof(XfsDir2BlockTail)) {
         brelse(block_bh);
         return -EINVAL;
@@ -2132,7 +2154,7 @@ auto dir2_block_to_leaf(XfsInode* dp, XfsTransaction* tp) -> int {
     }
 
     size_t const LEAF_CAPACITY = (BLKSIZE - sizeof(XfsDir3LeafHdr)) / sizeof(XfsDir2LeafEntry);
-    if (LEAF_COUNT >= LEAF_CAPACITY || LEAF_CAPACITY > UINT16_MAX) {
+    if (LEAF_COUNT > LEAF_CAPACITY || LEAF_CAPACITY > UINT16_MAX) {
         brelse(block_bh);
         return -ENOSPC;
     }
@@ -2146,10 +2168,6 @@ auto dir2_block_to_leaf(XfsInode* dp, XfsTransaction* tp) -> int {
     const auto* old_leaf = reinterpret_cast<const XfsDir2LeafEntry*>(block + OLD_LEAF_START);
     for (uint32_t i = 0; i < LEAF_COUNT; i++) {
         leaf_copy[i] = old_leaf[i];
-    }
-    for (size_t i = LEAF_COUNT; i < LEAF_CAPACITY; i++) {
-        leaf_copy[i].hashval = Be32::from_cpu(UINT32_MAX);
-        leaf_copy[i].address = Be32::from_cpu(XFS_DIR2_NULL_DATAPTR);
     }
 
     xfs_fsblock_t new_data_disk = 0;
@@ -2195,8 +2213,8 @@ auto dir2_block_to_leaf(XfsInode* dp, XfsTransaction* tp) -> int {
     uint8_t* leaf_block = leaf_bh->data;
     __builtin_memset(leaf_block, 0, BLKSIZE);
     auto* leaf_hdr = reinterpret_cast<XfsDir3LeafHdr*>(leaf_block);
-    dir2_init_leaf_header(dp, leaf_disk, leaf_hdr, LEAF_CAPACITY, LEAF_CAPACITY - LEAF_COUNT);
-    __builtin_memcpy(dir2_leaf_entries(leaf_hdr), leaf_copy, LEAF_CAPACITY * sizeof(XfsDir2LeafEntry));
+    dir2_init_leaf_header(dp, leaf_disk, leaf_hdr, LEAF_COUNT, STALE_COUNT);
+    __builtin_memcpy(dir2_leaf_entries(leaf_hdr), leaf_copy, LEAF_BYTES);
     dir2_recompute_leaf_crc(leaf_block, BLKSIZE);
     xfs_trans_log_buf_full(tp, leaf_bh);
     bwrite(leaf_bh);
@@ -2483,24 +2501,7 @@ auto dir2_leaf_node_addname(XfsInode* dp, const char* name, uint16_t namelen, xf
     auto* leaf_hdr = reinterpret_cast<XfsDir3LeafHdr*>(leaf_bh->data);
     int stale_idx = -1;
     int insert_pos = 0;
-    bool update_leaf = true;
-    rc = dir2_leaf_ensure_stale_slot(ctx, leaf_hdr);
-    if (rc == -ENOSPC) {
-        update_leaf = false;
-        rc = 0;
-    }
-    if (rc != 0) {
-        brelse(leaf_bh);
-        return rc;
-    }
-
-    if (update_leaf) {
-        rc = dir2_leaf_prepare_stale_insert(leaf_hdr, HASH, &stale_idx, &insert_pos);
-        if (rc != 0) {
-            brelse(leaf_bh);
-            return rc;
-        }
-    }
+    bool const UPDATE_LEAF = dir2_leaf_can_index_new_entry(ctx, leaf_hdr);
 
     BufHead* data_bh = nullptr;
     xfs_dir2_db_t db = 0;
@@ -2515,6 +2516,19 @@ auto dir2_leaf_node_addname(XfsInode* dp, const char* name, uint16_t namelen, xf
         return rc;
     }
 
+    xfs_dir2_dataptr_t const DATAPTR = dir2_db_off_to_dataptr(ctx, db, free_off);
+    if (UPDATE_LEAF) {
+        rc = dir2_leaf_ensure_stale_slot(ctx, leaf_hdr);
+        if (rc == 0) {
+            rc = dir2_leaf_prepare_stale_insert(leaf_hdr, HASH, &stale_idx, &insert_pos);
+        }
+        if (rc != 0) {
+            brelse(data_bh);
+            brelse(leaf_bh);
+            return rc;
+        }
+    }
+
     uint8_t* data_block = data_bh->data;
     size_t const DATA_START = sizeof(XfsDir3DataHdr);
     size_t const DATA_END = ctx->dir_blk_size;
@@ -2522,8 +2536,7 @@ auto dir2_leaf_node_addname(XfsInode* dp, const char* name, uint16_t namelen, xf
     dir2_recompute_data_crc(data_block, ctx->dir_blk_size);
     xfs_trans_log_buf_full(tp, data_bh);
 
-    xfs_dir2_dataptr_t const DATAPTR = dir2_db_off_to_dataptr(ctx, db, free_off);
-    if (update_leaf) {
+    if (UPDATE_LEAF) {
         dir2_leaf_reuse_stale_entry(leaf_hdr, HASH, DATAPTR, stale_idx, insert_pos);
         dir2_recompute_leaf_crc(leaf_bh->data, ctx->dir_blk_size);
         xfs_trans_log_buf_full(tp, leaf_bh);

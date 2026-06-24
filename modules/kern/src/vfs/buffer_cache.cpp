@@ -1194,6 +1194,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
         lru_touch(bh);
         stat_hits++;
         cache_lock.unlock_irqrestore(irqflags);
+        static_cast<void>(copy_dirty_bdev_range(bdev, block_no, 1, bh->data));
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, bdev->block_size);
         return bh;
     }
@@ -1231,6 +1232,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
         cache_lock.unlock_irqrestore(irqflags);
         return nullptr;
     }
+    static_cast<void>(copy_dirty_bdev_range(bdev, block_no, 1, bh->data));
 
     irqflags = cache_lock.lock_irqsave();
     BufHead* existing = hash_lookup(bdev, block_no, bdev->block_size);
@@ -1239,6 +1241,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
         lru_touch(existing);
         free_buffer(bh);
         cache_lock.unlock_irqrestore(irqflags);
+        static_cast<void>(copy_dirty_bdev_range(bdev, block_no, 1, existing->data));
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, bdev->block_size);
         return existing;
     }
@@ -1277,6 +1280,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
         lru_touch(bh);
         stat_hits++;
         cache_lock.unlock_irqrestore(irqflags);
+        static_cast<void>(copy_dirty_bdev_range(bdev, block_no, count, bh->data));
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, TOTAL_SIZE);
         return bh;
     }
@@ -1309,6 +1313,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
         return nullptr;
     }
     bh->flags |= BH_VALID;
+    static_cast<void>(copy_dirty_bdev_range(bdev, block_no, count, bh->data));
 
     irqflags = cache_lock.lock_irqsave();
     BufHead* existing = hash_lookup(bdev, block_no, TOTAL_SIZE);
@@ -1317,6 +1322,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
         lru_touch(existing);
         free_buffer(bh);
         cache_lock.unlock_irqrestore(irqflags);
+        static_cast<void>(copy_dirty_bdev_range(bdev, block_no, count, existing->data));
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, TOTAL_SIZE);
         return existing;
     }
