@@ -24,6 +24,7 @@
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_alloc.hpp>
 #include <vfs/fs/xfs/xfs_bmap.hpp>
+#include <vfs/fs/xfs/xfs_btree.hpp>
 #include <vfs/fs/xfs/xfs_ialloc.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
 
@@ -83,6 +84,50 @@ auto perf_elapsed_since_us(uint64_t started_us) -> uint32_t {
 auto extent_record_capacity(size_t fork_size) -> uint32_t {
     size_t const CAPACITY = fork_size / sizeof(XfsBmbtRec);
     return CAPACITY > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(CAPACITY);
+}
+
+auto bmdr_record_capacity(size_t fork_size) -> uint32_t {
+    if (fork_size < sizeof(XfsBmdrBlock)) {
+        return 0;
+    }
+    size_t const CAPACITY = (fork_size - sizeof(XfsBmdrBlock)) / (sizeof(XfsBmbtKey) + sizeof(Be64));
+    return CAPACITY > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(CAPACITY);
+}
+
+auto bmdr_root_min_size(uint32_t maxrecs, uint16_t numrecs) -> size_t {
+    if (numrecs > maxrecs) {
+        return SIZE_MAX;
+    }
+    return sizeof(XfsBmdrBlock) + (static_cast<size_t>(maxrecs) * sizeof(XfsBmbtKey)) + (static_cast<size_t>(numrecs) * sizeof(Be64));
+}
+
+auto validate_bmdr_root(const uint8_t* root, size_t root_size, uint32_t nextents) -> int {
+    if (root == nullptr || root_size < sizeof(XfsBmdrBlock)) {
+        return -EIO;
+    }
+
+    uint32_t const MAXRECS = bmdr_record_capacity(root_size);
+    if (MAXRECS == 0) {
+        return -EIO;
+    }
+
+    const auto* bmdr = reinterpret_cast<const XfsBmdrBlock*>(root);
+    uint16_t const LEVEL = bmdr->bb_level.to_cpu();
+    uint16_t const NUMRECS = bmdr->bb_numrecs.to_cpu();
+    if (NUMRECS > MAXRECS) {
+        return -EIO;
+    }
+    size_t const MIN_SIZE = bmdr_root_min_size(MAXRECS, NUMRECS);
+    if (MIN_SIZE == SIZE_MAX || root_size < MIN_SIZE) {
+        return -EIO;
+    }
+    if (nextents != 0 && (NUMRECS == 0 || LEVEL == 0 || LEVEL > XFS_BTREE_MAXLEVELS)) {
+        return -EIO;
+    }
+    if (nextents == 0 && NUMRECS != 0 && (LEVEL == 0 || LEVEL > XFS_BTREE_MAXLEVELS)) {
+        return -EIO;
+    }
+    return 0;
 }
 
 auto data_fork_size_for_write(const XfsInode* ip, size_t inode_core_size) -> size_t {
@@ -503,8 +548,9 @@ auto parse_ifork(XfsIfork* fork, uint8_t fmt, const uint8_t* data_ptr, size_t da
 
         case XFS_DINODE_FMT_BTREE: {
             // The fork contains a bmdr_block header + keys + pointers
-            if (data_size < sizeof(XfsBmdrBlock)) {
-                return -EINVAL;
+            int const VALID_ROOT = validate_bmdr_root(data_ptr, data_size, nextents);
+            if (VALID_ROOT != 0) {
+                return VALID_ROOT;
             }
             const auto* bmdr = reinterpret_cast<const XfsBmdrBlock*>(data_ptr);
             fork->btree.level = bmdr->bb_level.to_cpu();
@@ -1095,9 +1141,11 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
                 brelse(bh);
                 return -EFBIG;
             }
-            if (ip->data_fork.btree.root != nullptr && ip->data_fork.btree.root_size > 0) {
-                __builtin_memcpy(fork_data, ip->data_fork.btree.root, ip->data_fork.btree.root_size);
+            if (validate_bmdr_root(ip->data_fork.btree.root, ip->data_fork.btree.root_size, ip->nextents) != 0) {
+                brelse(bh);
+                return -EIO;
             }
+            __builtin_memcpy(fork_data, ip->data_fork.btree.root, ip->data_fork.btree.root_size);
             break;
 
         default:

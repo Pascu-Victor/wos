@@ -1973,6 +1973,27 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
         }
     }
 
+    auto malformed_promoted_write_rejected = [&]() -> bool {
+        uint8_t* const SAVED_ROOT = inode.data_fork.btree.root;
+        size_t const SAVED_ROOT_SIZE = inode.data_fork.btree.root_size;
+        inode.data_fork.btree.root = nullptr;
+        inode.data_fork.btree.root_size = 0;
+        XfsTransaction* tp = xfs_trans_alloc(&mount);
+        if (tp == nullptr) {
+            inode.data_fork.btree.root = SAVED_ROOT;
+            inode.data_fork.btree.root_size = SAVED_ROOT_SIZE;
+            return false;
+        }
+        int const RC = xfs_inode_write(&inode, tp);
+        xfs_trans_cancel(tp);
+        inode.data_fork.btree.root = SAVED_ROOT;
+        inode.data_fork.btree.root_size = SAVED_ROOT_SIZE;
+        return RC == -EIO;
+    };
+    if (!malformed_promoted_write_rejected()) {
+        return cleanup_listed(false);
+    }
+
     return cleanup_listed(true);
 }
 
