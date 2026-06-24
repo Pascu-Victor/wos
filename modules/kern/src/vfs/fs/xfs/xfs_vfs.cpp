@@ -55,6 +55,7 @@ constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
 // Each transaction covers one contiguous extent allocation, so the actual
 // number of transactions for a sequential write is (total_blocks / batch).
 constexpr xfs_extlen_t XFS_WRITE_BATCH_BLOCKS = 65536;  // up to 256 MiB per transaction
+constexpr size_t XFS_BUFFERED_WRITE_BATCH_MAX_BYTES = size_t{256} * 1024;
 constexpr size_t XFS_STREAM_PREALLOC_TRIGGER_BYTES = size_t{512} * 1024;
 constexpr xfs_extlen_t XFS_STREAM_PREALLOC_BLOCKS = 1024;  // 4 MiB
 constexpr uint32_t XFS_STREAM_PREALLOC_EXTENT_MARGIN = 8;
@@ -774,10 +775,39 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
         size_t current_src_offset = src_offset;
         bool ok = true;
 
+        size_t const MAX_BATCH_BLOCKS = std::max<size_t>(1, XFS_BUFFERED_WRITE_BATCH_MAX_BYTES >> ctx->block_log);
+
         while (remaining_bytes > 0) {
+            if (block_off == 0 && remaining_bytes >= ctx->block_size) {
+                size_t full_blocks = remaining_bytes >> ctx->block_log;
+                while (full_blocks > 0) {
+                    size_t const BATCH_BLOCKS = std::min(full_blocks, MAX_BATCH_BLOCKS);
+                    uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(ctx, current_disk_block);
+                    size_t const DEV_COUNT = xfs_fsb_to_dev_count(ctx, static_cast<xfs_filblks_t>(BATCH_BLOCKS));
+                    BufHead* bp = bget_multi(ctx->device, DEV_BLOCK, DEV_COUNT);
+                    if (bp == nullptr) {
+                        ok = false;
+                        break;
+                    }
+
+                    size_t const BATCH_BYTES = BATCH_BLOCKS << ctx->block_log;
+                    std::memcpy(bp->data, src + current_src_offset, BATCH_BYTES);
+                    bdirty(bp);
+                    brelse(bp);
+
+                    remaining_bytes -= BATCH_BYTES;
+                    current_src_offset += BATCH_BYTES;
+                    current_disk_block += static_cast<xfs_fsblock_t>(BATCH_BLOCKS);
+                    full_blocks -= BATCH_BLOCKS;
+                }
+                if (!ok) {
+                    break;
+                }
+                continue;
+            }
+
             size_t const CHUNK = std::min(ctx->block_size - block_off, remaining_bytes);
-            BufHead* bp =
-                (block_off == 0 && CHUNK == ctx->block_size) ? xfs_buf_get(ctx, current_disk_block) : xfs_buf_read(ctx, current_disk_block);
+            BufHead* bp = xfs_buf_read(ctx, current_disk_block);
             if (bp == nullptr) {
                 ok = false;
                 break;
