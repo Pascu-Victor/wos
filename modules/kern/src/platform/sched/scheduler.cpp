@@ -3613,6 +3613,11 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         } else {
             // Wait-for-specific-PID
             auto* target = find_task_by_pid(current_task->waiting_for_pid);
+            if (target == nullptr) {
+                skip_wait_queue = true;
+                current_task->context.regs.rax = static_cast<uint64_t>(-ECHILD);
+                task::task_clear_waitpid_block_state(*current_task);
+            }
             if (target != nullptr && target->ptrace_traced && target->ptrace_tracer_pid == current_task->pid && target->ptrace_stopped &&
                 target->ptrace_stop_pending) {
                 skip_wait_queue = true;

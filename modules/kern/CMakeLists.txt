@@ -68,15 +68,25 @@ set(CMAKE_LINK_FLAGS "LINKER:-m,elf_x86_64" "SHELL:-nostdlib" "SHELL:-z max-page
 # Include directories
 
 # Find source files
-file(GLOB_RECURSE CFILES CONFIGURE_DEPENDS src/*.c)
-file(GLOB_RECURSE ASFILES CONFIGURE_DEPENDS src/*.S)
-file(GLOB_RECURSE NASMFILES CONFIGURE_DEPENDS src/*.asm)
-file(GLOB_RECURSE CXXFILES CONFIGURE_DEPENDS src/*.cpp)
+set(WOS_KERNEL_GLOB_OPTIONS)
+if(NOT WOS_NATIVE_SYSTEM_BUILD)
+    list(APPEND WOS_KERNEL_GLOB_OPTIONS CONFIGURE_DEPENDS)
+endif()
+
+function(wos_kernel_glob_recurse output_var)
+    file(GLOB_RECURSE WOS_KERNEL_GLOB_RECURSE_OUTPUT ${WOS_KERNEL_GLOB_OPTIONS} ${ARGN})
+    set(${output_var} ${WOS_KERNEL_GLOB_RECURSE_OUTPUT} PARENT_SCOPE)
+endfunction()
+
+wos_kernel_glob_recurse(CFILES src/*.c)
+wos_kernel_glob_recurse(ASFILES src/*.S)
+wos_kernel_glob_recurse(NASMFILES src/*.asm)
+wos_kernel_glob_recurse(CXXFILES src/*.cpp)
 
 # Exclude test sources unless self-test mode is explicitly enabled.
 # GLOB_RECURSE picks up src/test/*.cpp; strip them in production builds.
 if(NOT WOS_SELFTEST)
-    file(GLOB_RECURSE KTEST_SRCS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/test/*.cpp)
+    wos_kernel_glob_recurse(KTEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/test/*.cpp)
     list(REMOVE_ITEM CXXFILES ${KTEST_SRCS})
 endif()
 
