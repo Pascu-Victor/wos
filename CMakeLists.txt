@@ -12,6 +12,22 @@ option(WOS_USE_CCACHE "Use ccache/cccache as a compiler launcher when available"
 set(WOS_CCACHE_PROGRAM "" CACHE FILEPATH "Path to ccache/cccache")
 set(WOS_TOOLS_BUILD_TYPE Release CACHE STRING "Build type for host-side WOS tools")
 set_property(CACHE WOS_TOOLS_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+set(WOS_NATIVE_SYSTEM_BUILD OFF CACHE BOOL "Build modules with the native WOS system toolchain")
+execute_process(
+    COMMAND uname -s
+    OUTPUT_VARIABLE WOS_HOST_UNAME
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if((DEFINED ENV{WOS_NATIVE_HOST} AND "$ENV{WOS_NATIVE_HOST}" STREQUAL "1") OR CMAKE_HOST_SYSTEM_NAME STREQUAL "WOS" OR
+   WOS_HOST_UNAME STREQUAL "WOS")
+    set(WOS_NATIVE_SYSTEM_BUILD ON CACHE BOOL "Build modules with the native WOS system toolchain" FORCE)
+endif()
+
+set(WOS_PORT_BUILD_DEFAULT ON)
+if(WOS_NATIVE_SYSTEM_BUILD)
+    set(WOS_PORT_BUILD_DEFAULT OFF)
+endif()
 
 if(WOS_USE_CCACHE AND NOT WOS_CCACHE_PROGRAM)
     find_program(WOS_CCACHE_PROGRAM NAMES ccache cccache)
@@ -82,16 +98,16 @@ set(WOS_NASM_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/nasm-build" CACHE PATH "Na
 set(WOS_BOOT_DISK "${CMAKE_SOURCE_DIR}/disk.qcow2" CACHE FILEPATH "WOS boot disk image")
 set(WOS_ROOTFS_DISK "${CMAKE_SOURCE_DIR}/mountfs.qcow2" CACHE FILEPATH "WOS rootfs disk image")
 option(WOS_SKIP_LIBCXX_INSTALL "Skip the libc++ install target; useful when an isolated sysroot is pre-seeded" OFF)
-option(WOS_BUILD_CLANG_FOR_WOS "Build a native WOS clang/lld toolchain and stage it into the rootfs" ON)
-option(WOS_BUILD_NINJA_FOR_WOS "Build a native WOS Ninja and stage it into the rootfs" ON)
-option(WOS_BUILD_CMAKE_FOR_HOST "Build host-side CMake from the WOS fork and install it into toolchain/host" ON)
-option(WOS_BUILD_CMAKE_FOR_WOS "Build native WOS CMake tools and stage them into the rootfs" ON)
-option(WOS_BUILD_PYTHON_FOR_WOS "Build native WOS Python and stage it into the rootfs" ON)
-option(WOS_BUILD_NASM_FOR_WOS "Build native WOS NASM and stage it into the rootfs" ON)
-option(WOS_BUILD_BASH_FOR_WOS "Build native WOS Bash and stage it into the rootfs" ON)
-option(WOS_BUILD_OPENSSL_FOR_WOS "Build static WOS OpenSSL libraries for curl and HTTPS-capable ports" ON)
-option(WOS_BUILD_CURL_FOR_WOS "Build native WOS curl and stage it into the rootfs" ON)
-option(WOS_BUILD_GIT_FOR_WOS "Build native WOS Git and stage it into the rootfs" ON)
+option(WOS_BUILD_CLANG_FOR_WOS "Build a native WOS clang/lld toolchain and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
+option(WOS_BUILD_NINJA_FOR_WOS "Build a native WOS Ninja and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
+option(WOS_BUILD_CMAKE_FOR_HOST "Build host-side CMake from the WOS fork and install it into toolchain/host" ${WOS_PORT_BUILD_DEFAULT})
+option(WOS_BUILD_CMAKE_FOR_WOS "Build native WOS CMake tools and stage them into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
+option(WOS_BUILD_PYTHON_FOR_WOS "Build native WOS Python and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
+option(WOS_BUILD_NASM_FOR_WOS "Build native WOS NASM and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
+option(WOS_BUILD_BASH_FOR_WOS "Build native WOS Bash and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
+option(WOS_BUILD_OPENSSL_FOR_WOS "Build static WOS OpenSSL libraries for curl and HTTPS-capable ports" ${WOS_PORT_BUILD_DEFAULT})
+option(WOS_BUILD_CURL_FOR_WOS "Build native WOS curl and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
+option(WOS_BUILD_GIT_FOR_WOS "Build native WOS Git and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 
 set(SYSROOT ${WOS_SYSROOT_PATH})
 set(MLIBC_BUILD_DIR ${WOS_MLIBC_BUILD_DIR})
