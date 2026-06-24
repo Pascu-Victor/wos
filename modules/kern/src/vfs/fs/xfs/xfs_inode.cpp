@@ -921,6 +921,31 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
     return finish_inode_fetch(ip, 0);
 }
 
+auto xfs_inode_cache_new(XfsInode* ip) -> int {
+    if (ip == nullptr || ip->mount == nullptr || ip->ino == NULLFSINO) {
+        return -EINVAL;
+    }
+
+    xfs_icache_init();
+
+    size_t const BUCKET = icache_hash(ip->mount, ip->ino);
+    uint64_t const FLAGS = icache.at(BUCKET).lock.lock_irqsave();
+    for (XfsInode* existing = icache.at(BUCKET).head; existing != nullptr; existing = existing->hash_next) {
+        if (existing->mount == ip->mount && existing->ino == ip->ino) {
+            icache.at(BUCKET).lock.unlock_irqrestore(FLAGS);
+            return -EEXIST;
+        }
+    }
+
+    ip->refcount = 1;
+    ip->hash_next = nullptr;
+    ip->inactivation_started = false;
+    ip->dirty = false;
+    icache_insert_locked(ip, BUCKET);
+    icache.at(BUCKET).lock.unlock_irqrestore(FLAGS);
+    return 0;
+}
+
 void xfs_inode_release(XfsInode* ip) {
     if (ip == nullptr) {
         return;

@@ -1438,21 +1438,27 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
             return nullptr;
         }
 
-        XfsInode new_inode{};
-        new_inode.ino = NEW_INO;
-        new_inode.mount = ctx;
-        new_inode.agno = xfs_ino_ag(NEW_INO, ctx->agino_log);
-        new_inode.agino = xfs_ag_ino(NEW_INO, ctx->agino_log);
-        new_inode.mode = INODE_MODE;
-        new_inode.nlink = 1;
-        new_inode.data_fork.format = XFS_DINODE_FMT_EXTENTS;
-        xfs_stamp_new_inode(&new_inode);
-        xfs_trans_log_inode(tp, &new_inode);
+        auto* new_inode = new (std::nothrow) XfsInode{};
+        if (new_inode == nullptr) {
+            xfs_trans_cancel(tp);
+            xfs_inode_release(parent_ip);
+            return nullptr;
+        }
+        new_inode->ino = NEW_INO;
+        new_inode->mount = ctx;
+        new_inode->agno = xfs_ino_ag(NEW_INO, ctx->agino_log);
+        new_inode->agino = xfs_ag_ino(NEW_INO, ctx->agino_log);
+        new_inode->mode = INODE_MODE;
+        new_inode->nlink = 1;
+        new_inode->data_fork.format = XFS_DINODE_FMT_EXTENTS;
+        xfs_stamp_new_inode(new_inode);
+        xfs_trans_log_inode(tp, new_inode);
 
         // Add directory entry
         int rc = xfs_dir_addname(parent_ip, filename, filename_len, NEW_INO, XFS_DIR3_FT_REG_FILE, tp);
         if (rc != 0) {
             xfs_trans_cancel(tp);
+            delete new_inode;
             xfs_inode_release(parent_ip);
             return nullptr;
         }
@@ -1460,13 +1466,24 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         rc = xfs_trans_commit(tp);
         xfs_inode_release(parent_ip);
         if (rc != 0) {
+            delete new_inode;
             return nullptr;
         }
 
-        // Now read the newly created inode
-        ip = xfs_inode_read(ctx, NEW_INO);
-        if (ip == nullptr) {
-            return nullptr;
+        // The transaction has just written this inode.  Cache and use the
+        // in-memory copy instead of immediately re-reading it from disk.
+        rc = xfs_inode_cache_new(new_inode);
+        if (rc == 0) {
+            ip = new_inode;
+        } else {
+            delete new_inode;
+            if (rc != -EEXIST) {
+                return nullptr;
+            }
+            ip = xfs_inode_read(ctx, NEW_INO);
+            if (ip == nullptr) {
+                return nullptr;
+            }
         }
     }
 

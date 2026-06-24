@@ -117,6 +117,12 @@ struct XfsInode {
 // same pointer with incremented refcount.
 auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode*;
 
+// Insert a newly-created inode into the cache with one active reference.
+// The inode must already be committed to disk and must not already have a cache
+// entry for (mount, ino).  On success, ownership transfers to the inode cache
+// and the caller owns the active reference.
+auto xfs_inode_cache_new(XfsInode* ip) -> int;
+
 // Release a reference to an inode. When refcount drops to 0, linked inodes
 // remain cached for reuse; unlinked inodes are physically freed at that final
 // inactivation point.
