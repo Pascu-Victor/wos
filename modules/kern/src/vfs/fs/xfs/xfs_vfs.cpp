@@ -797,6 +797,35 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
         return ok;
     };
 
+    auto direct_full_block_write = [&](xfs_fsblock_t disk_block, size_t bytes, size_t src_offset) -> bool {
+        if (bytes == 0) {
+            return true;
+        }
+        if ((bytes & (ctx->block_size - 1)) != 0) {
+            return false;
+        }
+
+        auto const FSB_COUNT = static_cast<xfs_filblks_t>(bytes >> ctx->block_log);
+        uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(ctx, disk_block);
+        size_t const DEV_COUNT = xfs_fsb_to_dev_count(ctx, FSB_COUNT);
+        int const SYNC_RC = sync_bdev_range(ctx->device, DEV_BLOCK, DEV_COUNT);
+        if (SYNC_RC != 0) {
+            log::warn("direct write sync failed on %s fsb=%lu dev_block=%lu dev_count=%zu rc=%d", ctx->device->name.data(),
+                      static_cast<unsigned long>(disk_block), static_cast<unsigned long>(DEV_BLOCK), DEV_COUNT, SYNC_RC);
+            return false;
+        }
+
+        int const RC = dev::block_write(ctx->device, DEV_BLOCK, DEV_COUNT, src + src_offset);
+        if (RC != 0) {
+            log::warn("direct write failed on %s fsb=%lu dev_block=%lu dev_count=%zu rc=%d", ctx->device->name.data(),
+                      static_cast<unsigned long>(disk_block), static_cast<unsigned long>(DEV_BLOCK), DEV_COUNT, RC);
+            return false;
+        }
+
+        discard_bdev_range(ctx->device, DEV_BLOCK, DEV_COUNT);
+        return true;
+    };
+
     auto write_extent_data = [&](xfs_fsblock_t disk_block, size_t initial_block_off, size_t bytes, size_t src_offset) -> bool {
         size_t remaining_bytes = bytes;
         size_t block_off = initial_block_off;
@@ -816,7 +845,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
 
         size_t const DIRECT_BYTES = remaining_bytes & ~(ctx->block_size - 1);
         if (DIRECT_BYTES > 0) {
-            if (!buffered_write(current_disk_block, 0, DIRECT_BYTES, current_src_offset)) {
+            if (!direct_full_block_write(current_disk_block, DIRECT_BYTES, current_src_offset)) {
                 return false;
             }
             remaining_bytes -= DIRECT_BYTES;
