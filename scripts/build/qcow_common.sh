@@ -1,6 +1,45 @@
 #!/bin/bash
 # Shared qcow2/libguestfs diagnostics for WOS image build scripts.
 
+WOS_QCOW_LIBGUESTFS_PREPARED="${WOS_QCOW_LIBGUESTFS_PREPARED:-0}"
+WOS_QCOW_OWN_LIBGUESTFS_TMPDIR="${WOS_QCOW_OWN_LIBGUESTFS_TMPDIR:-}"
+WOS_QCOW_OWN_LIBGUESTFS_CACHEDIR="${WOS_QCOW_OWN_LIBGUESTFS_CACHEDIR:-}"
+
+wos_qcow_prepare_libguestfs_env() {
+    local base
+
+    if [ "$WOS_QCOW_LIBGUESTFS_PREPARED" -eq 1 ]; then
+        return 0
+    fi
+
+    base="${WOS_LIBGUESTFS_ROOT:-${TMPDIR:-/tmp}}"
+    mkdir -p "$base"
+
+    if [ -z "${LIBGUESTFS_TMPDIR:-}" ]; then
+        WOS_QCOW_OWN_LIBGUESTFS_TMPDIR=$(mktemp -d "$base/wos-libguestfs-tmp.XXXXXX")
+        export LIBGUESTFS_TMPDIR="$WOS_QCOW_OWN_LIBGUESTFS_TMPDIR"
+    fi
+
+    if [ -z "${LIBGUESTFS_CACHEDIR:-}" ]; then
+        WOS_QCOW_OWN_LIBGUESTFS_CACHEDIR=$(mktemp -d "$base/wos-libguestfs-cache.XXXXXX")
+        export LIBGUESTFS_CACHEDIR="$WOS_QCOW_OWN_LIBGUESTFS_CACHEDIR"
+    fi
+
+    WOS_QCOW_LIBGUESTFS_PREPARED=1
+}
+
+wos_qcow_cleanup_libguestfs_env() {
+    if [ -n "$WOS_QCOW_OWN_LIBGUESTFS_TMPDIR" ]; then
+        rm -rf "$WOS_QCOW_OWN_LIBGUESTFS_TMPDIR"
+        WOS_QCOW_OWN_LIBGUESTFS_TMPDIR=""
+    fi
+
+    if [ -n "$WOS_QCOW_OWN_LIBGUESTFS_CACHEDIR" ]; then
+        rm -rf "$WOS_QCOW_OWN_LIBGUESTFS_CACHEDIR"
+        WOS_QCOW_OWN_LIBGUESTFS_CACHEDIR=""
+    fi
+}
+
 wos_qcow_log_has_lock() {
     local log_file="$1"
 
@@ -165,6 +204,8 @@ wos_qcow_run() {
     local status
 
     shift 2
+
+    wos_qcow_prepare_libguestfs_env
 
     log_file=$(mktemp)
     if "$@" > "$log_file" 2>&1; then

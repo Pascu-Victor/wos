@@ -424,6 +424,8 @@ rootfs_remove_old_managed_paths() {
     cmd_tmp=$(mktemp)
     read_log=$(mktemp)
 
+    wos_qcow_prepare_libguestfs_env
+
     if guestfish --ro -a "$disk" > "$read_log" 2>&1 <<EOF
 run
 mount /dev/sda1 /

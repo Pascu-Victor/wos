@@ -15,6 +15,16 @@ INITRAMFS_OUT="$BUILD_DIR/initramfs.cpio"
 # shellcheck source=scripts/build/qcow_common.sh
 source "$CWD/scripts/build/qcow_common.sh"
 
+TMP_LIMINE_CONF=""
+
+cleanup() {
+    test -z "$TMP_LIMINE_CONF" || rm -f "$TMP_LIMINE_CONF"
+    wos_qcow_cleanup_libguestfs_env
+}
+
+wos_qcow_prepare_libguestfs_env
+trap cleanup EXIT
+
 if [[ "$KERNEL_BINARY" = /* ]]; then
     KERNEL_COPY="$KERNEL_BINARY"
 else
@@ -47,7 +57,6 @@ _EOF_
 bash "$CWD/scripts/build/make_initramfs.sh"
 
 LIMINE_CONF="$CWD/modules/kern/limine.conf"
-TMP_LIMINE_CONF=""
 if [ "${WOS_KERNEL_CMDLINE+x}" ]; then
     TMP_LIMINE_CONF="$(mktemp)"
     cat > "$TMP_LIMINE_CONF" <<_EOF_
@@ -62,7 +71,6 @@ timeout: 0
 _EOF_
     LIMINE_CONF="$TMP_LIMINE_CONF"
 fi
-trap 'test -z "$TMP_LIMINE_CONF" || rm -f "$TMP_LIMINE_CONF"' EXIT
 
 # Phase 3: Populate the boot partition with kernel, bootloader, and initramfs.
 wos_qcow_guestfish "populate boot qcow image" "$BOOT_DISK" --rw -a "$BOOT_DISK" <<_EOF_

@@ -15,6 +15,8 @@ READELF="${WOS_READELF:-}"
 # shellcheck source=scripts/build/qcow_common.sh
 source "$CWD/scripts/build/qcow_common.sh"
 
+wos_qcow_prepare_libguestfs_env
+
 if [ ! -f "$INIT_BINARY" ]; then
     echo "ERROR: init binary not found at $INIT_BINARY"
     echo "Run cmake build first."
@@ -157,7 +159,7 @@ EOF
 
 # Create temporary directory for initramfs contents
 INITRAMFS_DIR=$(mktemp -d)
-trap 'rm -rf "$INITRAMFS_DIR"' EXIT
+trap 'rm -rf "$INITRAMFS_DIR"; wos_qcow_cleanup_libguestfs_env' EXIT
 
 # Create directory structure
 mkdir -p "$INITRAMFS_DIR/sbin"

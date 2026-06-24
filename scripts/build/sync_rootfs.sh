@@ -13,6 +13,8 @@ DISK="${WOS_ROOTFS_DISK:-mountfs.qcow2}"
 # shellcheck disable=SC1091
 source "$CWD/scripts/build/rootfs_common.sh"
 
+wos_qcow_prepare_libguestfs_env
+
 if [ ! -f "$DISK" ]; then
     echo "ERROR: $DISK does not exist. Run scripts/build/create_mountfs_disk.sh first."
     exit 1
@@ -25,7 +27,7 @@ echo "Syncing rootfs delta into $DISK..."
 # Build a staging directory with only the files that need updating
 STAGING=$(mktemp -d)
 STAGING_TAR="$STAGING.tar"
-trap 'rm -rf "$STAGING"; rm -f "$STAGING_TAR"' EXIT
+trap 'rm -rf "$STAGING"; rm -f "$STAGING_TAR"; wos_qcow_cleanup_libguestfs_env' EXIT
 
 rootfs_stage_tree "$CWD" "$STAGING"
 
