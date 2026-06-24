@@ -220,7 +220,7 @@ void tcp_timer_tick(uint64_t now_ms) {
 
     timer_lock_acquire();
     TcpCB** pp = &timer_head;
-    while (*pp != nullptr && batch_count < MAX_BATCH) {
+    while (*pp != nullptr) {
         TcpCB* cb = *pp;
 
         uint64_t deadline = UINT64_MAX;
@@ -270,7 +270,7 @@ void tcp_timer_tick(uint64_t now_ms) {
             needs_work = true;
         }
 
-        if (needs_work) {
+        if (needs_work && batch_count < MAX_BATCH) {
             tcp_cb_acquire(cb);
             batch.at(batch_count++) = cb;
         }

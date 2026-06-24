@@ -81,6 +81,26 @@ def require_recv_window_ack_is_locked(problems: list[str]) -> None:
     )
 
 
+def require_timer_scan_covers_full_list(problems: list[str]) -> None:
+    timer_source = (ROOT / "modules" / "kern" / "src" / "net" / "proto" / "tcp_timer.cpp").read_text()
+    timer_tick = function_body(timer_source, "tcp_timer_tick")
+
+    if "while (*pp != nullptr && batch_count < MAX_BATCH)" in timer_tick:
+        problems.append("tcp_timer_tick must scan the whole timer list even when the work batch is full")
+
+    require_order(
+        timer_tick,
+        [
+            "while (*pp != nullptr)",
+            "bool needs_work = false",
+            "if (needs_work && batch_count < MAX_BATCH)",
+            "next_earliest = std::min(next_earliest, cb->retransmit_deadline)",
+            "timer_earliest.store(next_earliest, std::memory_order_relaxed)",
+        ],
+        "full TCP timer list scan with bounded work batch",
+    )
+
+
 def main() -> None:
     forbidden = [
         "tcp_now_ms() +",
@@ -109,6 +129,7 @@ def main() -> None:
             problems.append(f"tcp_timer.cpp missing saturating deadline use: {token}")
 
     require_recv_window_ack_is_locked(problems)
+    require_timer_scan_covers_full_list(problems)
 
     if problems:
         fail("; ".join(problems))
