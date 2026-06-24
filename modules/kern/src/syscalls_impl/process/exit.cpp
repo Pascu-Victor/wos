@@ -193,12 +193,11 @@ auto complete_exit_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::ta
     write_wait_status_for_waiter(waiter, child->exit_status);
     fill_rusage_for_waiter(waiter, child);
     waiter->waitpid_publish_pending.store(false, std::memory_order_release);
-    waiter->waiting_for_pid = 0;
-    waiter->wait_options = 0;
-    waiter->wait_resume_rip_user_addr = 0;
-    waiter->wait_resume_rip_phys_addr = 0;
-    waiter->wait_resume_rsp_user_addr = 0;
-    waiter->wait_resume_rsp_phys_addr = 0;
+    waiter->deferred_task_switch = false;
+    waiter->set_voluntary_blocked(false);
+    waiter->wants_block = false;
+    waiter->wake_at_us = 0;
+    sched_task::task_clear_waitpid_block_state(*waiter);
     return true;
 }
 
@@ -428,21 +427,11 @@ namespace {
                 // values would be overwritten by deferred_task_switch's context save anyway.
                 // In that case, deferred_task_switch() will detect hasExited==true and set rax
                 // correctly before re-scheduling the task (see scheduler.cpp deferred_task_switch).
-                bool completed_wait = false;
-                if (waiter_context_can_be_completed(waiting_task) && waiter_matches_child(waiting_task, current_task)) {
-                    completed_wait = sched_task::task_try_mark_waited_on(*current_task);
-                }
-                if (completed_wait) {
-                    sched_task::task_accumulate_waited_child_times(*waiting_task, *current_task);
-                    waiting_task->context.regs.rax = current_task->pid;
-                    validate_waiter_resume_for_exit(waiting_task, current_task, "exit-specific");
-                    write_wait_status_for_waiter(waiting_task, current_task->exit_status);
+                if (waiter_context_can_be_completed(waiting_task) && waiter_matches_child(waiting_task, current_task) &&
+                    complete_exit_wait(waiting_task, current_task, "exit-specific")) {
 #ifdef EXIT_DEBUG
                     log::debug("set exit status %d for waiting task PID %x", current_task->exit_status, WAITING_PID);
 #endif
-                    fill_rusage_for_waiter(waiting_task, current_task);
-                    waiting_task->waiting_for_pid = 0;
-                    waiting_task->wait_options = 0;
                 }
 
                 // Reschedule the waiting task on its last-known CPU to avoid cross-CPU migration

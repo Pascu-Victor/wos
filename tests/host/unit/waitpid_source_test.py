@@ -202,20 +202,25 @@ def require_exit_completion_respects_publish_fence(exit_cpp: str) -> None:
     for token in [
         "waiter_matches_child(parent, child) && waiter_context_can_be_completed(parent)",
         "TRACER_IS_PARENT && !sched_task::task_waited_on(*child) && waiter_context_can_be_completed(tracer)",
-        "if (waiter_context_can_be_completed(waiting_task) && waiter_matches_child(waiting_task, current_task))",
+        "if (waiter_context_can_be_completed(waiting_task) && waiter_matches_child(waiting_task, current_task) &&\n                    complete_exit_wait(waiting_task, current_task, \"exit-specific\"))",
     ]:
         if token not in exit_cpp:
             fail(f"exit notification direct completion is not guarded by publish fence: {token}")
     complete_body = function_body(exit_cpp, "complete_exit_wait")
     for snippet in [
         "sched_task::task_try_mark_waited_on(*child)",
+        "waiter->waitpid_publish_pending.store(false, std::memory_order_release)",
+        "waiter->deferred_task_switch = false",
+        "waiter->set_voluntary_blocked(false)",
+        "waiter->wants_block = false",
+        "sched_task::task_clear_waitpid_block_state(*waiter)",
         "return false",
         "return true",
     ]:
         if snippet not in complete_body:
             fail(f"complete_exit_wait must claim waited_on before writing waiter context: {snippet}")
-    if "completed_wait = sched_task::task_try_mark_waited_on(*current_task)" not in exit_cpp:
-        fail("awaitee_on_exit path must claim waited_on only when direct completion is safe")
+    if "complete_exit_wait(waiting_task, current_task, \"exit-specific\")" not in exit_cpp:
+        fail("awaitee_on_exit path must use the common waitpid completion helper")
     if "current_task->waited_on" in exit_cpp:
         fail("awaitee_on_exit path must not mark waited_on for deferred waiters")
 
