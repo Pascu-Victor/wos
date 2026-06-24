@@ -3734,6 +3734,9 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                 !waitpid_has_job_stop_ready(current_task)) {
                 interrupt_waitpid_block_for_signal(current_task);
             }
+            current_task->wants_block = false;
+            current_task->wake_at_us = 0;
+            finish_wait_metadata_for_runqueue(current_task);
 
             // A signal or concurrent wake can abort a futex block after the
             // waiter node has already been published. Defer detaching it

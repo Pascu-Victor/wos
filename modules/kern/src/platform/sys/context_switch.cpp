@@ -271,7 +271,7 @@ auto defer_process_reschedule_to_syscall_exit() -> bool {
 
     task->yield_switch = true;
     task->deferred_task_switch = true;
-    task->set_wait_channel("local_reschedule");
+    task->clear_wait_channel();
     return true;
 }
 
