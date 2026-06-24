@@ -58,21 +58,11 @@ wos_asm_syscall_handler:
     ; save return value
     mov [rsp+0x78], rax
 
-    ; Signal return must restore the saved user frame before any deferred
-    ; reschedule can park or resume the task through a different path.  Pending
-    ; signal delivery also wants the full IRET restore path, so let the common
-    ; signal hook take first refusal after the syscall body has updated task
-    ; state.
-    extern check_pending_signals
-    mov rdi, rsp            ; raw stack pointer (bottom of pushed GPRegs)
-    call check_pending_signals
-    cli
-    test rax, rax
-    setnz r12b
-    jne .signal_checked
-
-    ; Check if we need to perform a deferred task switch
-    ; Get current task from scheduler
+    ; Check if we need to perform a deferred task switch before delivering
+    ; pending signals.  Blocking syscalls such as waitpid use a zero syscall
+    ; return only as the deferred-switch placeholder; SIGCHLD delivery must not
+    ; bypass the handoff and leak that placeholder to userspace.
+    ; Get current task from scheduler.
     extern wos_get_current_task
     extern WOS_DEFERRED_TASK_SWITCH_OFFSET
     call wos_get_current_task
@@ -96,6 +86,7 @@ wos_asm_syscall_handler:
 
 .no_deferred_switch:
     ; Check for pending signals before returning to userspace
+    extern check_pending_signals
     mov rdi, rsp            ; raw stack pointer (bottom of pushed GPRegs)
     call check_pending_signals
     cli

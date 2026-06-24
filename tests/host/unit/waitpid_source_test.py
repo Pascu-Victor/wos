@@ -9,6 +9,7 @@ TASK_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.cpp"
 WAITPID_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "waitpid.cpp"
 EXIT_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "exit.cpp"
 SCHEDULER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.cpp"
+SYSCALL_ASM = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "syscall.asm"
 
 
 def fail(message: str) -> None:
@@ -138,6 +139,16 @@ def require_deferred_switch_clears_after_context_save(scheduler_cpp: str) -> Non
         fail("deferred_task_switch must clear waitpid_publish_pending after context save and before waitpid recheck")
 
 
+def require_syscall_epilogue_honors_deferred_before_signals(syscall_asm: str) -> None:
+    save_ret = syscall_asm.find("mov [rsp+0x78], rax")
+    deferred_check = syscall_asm.find("WOS_DEFERRED_TASK_SWITCH_OFFSET", save_ret)
+    signal_check = syscall_asm.find("call check_pending_signals", save_ret)
+    if save_ret < 0 or deferred_check < 0 or signal_check < 0:
+        fail("syscall epilogue is missing return save, deferred switch check, or signal check")
+    if deferred_check > signal_check:
+        fail("syscall epilogue must honor deferred_task_switch before pending signal delivery")
+
+
 def require_interrupted_waitpid_cleans_stale_wait_state(task_hpp: str, task_cpp: str, scheduler_cpp: str, exit_cpp: str) -> None:
     for snippet in [
         "task_clear_waitpid_block_state",
@@ -146,7 +157,7 @@ def require_interrupted_waitpid_cleans_stale_wait_state(task_hpp: str, task_cpp:
         "task.wait_rusage_user_addr = 0",
         "task.wait_resume_rip_user_addr = 0",
         "task.wait_resume_rsp_user_addr = 0",
-        "task.wait_channel = nullptr",
+        "task.clear_wait_channel()",
     ]:
         if snippet not in task_hpp:
             fail(f"Task waitpid abort helper must clear stale wait state: {snippet}")
@@ -154,17 +165,24 @@ def require_interrupted_waitpid_cleans_stale_wait_state(task_hpp: str, task_cpp:
         fail("KTEST helper must cover waitpid abort state clearing")
 
     body = function_body(scheduler_cpp, "deferred_task_switch")
-    signal_abort = braced_block_after(body, "if (current_task->has_interrupting_signal_pending())")
+    abort_helper = function_body(scheduler_cpp, "interrupt_waitpid_block_for_signal")
+    unlink_helper = function_body(scheduler_cpp, "unlink_specific_waitpid_waiter")
+    signal_abort = braced_block_after(body, "if (current_task->has_interrupting_signal_pending() && !WAITPID_STOP_READY)")
     for snippet in [
-        "current_task->context.regs.rax = static_cast<uint64_t>(-EINTR)",
-        "unlink_specific_waitpid_waiter()",
-        "task::task_clear_waitpid_block_state(*current_task)",
+        "interrupt_waitpid_block_for_signal(current_task)",
     ]:
         if snippet not in signal_abort:
-            fail(f"deferred signal abort must clean stale waitpid state: {snippet}")
-    if "target->awaitee_on_exit.remove(current_task->pid)" not in body:
+            fail(f"deferred signal abort must call waitpid cleanup helper: {snippet}")
+    for snippet in [
+        "task->context.regs.rax = static_cast<uint64_t>(-EINTR)",
+        "unlink_specific_waitpid_waiter(task)",
+        "task::task_clear_waitpid_block_state(*task)",
+    ]:
+        if snippet not in abort_helper:
+            fail(f"waitpid signal abort helper must clean stale waitpid state: {snippet}")
+    if "target->awaitee_on_exit.remove(waiter->pid)" not in unlink_helper:
         fail("specific waitpid signal abort must unlink the task from the child's exit waiter list")
-    order_signal = body.find("if (current_task->has_interrupting_signal_pending())")
+    order_signal = body.find("if (current_task->has_interrupting_signal_pending() && !WAITPID_STOP_READY)")
     deferred_clear = body.find("current_task->deferred_task_switch = false")
     if order_signal < 0 or deferred_clear < 0 or deferred_clear < order_signal:
         fail("deferred_task_switch must keep deferred_task_switch true until signal-abort cleanup is complete")
@@ -176,14 +194,14 @@ def require_interrupted_waitpid_cleans_stale_wait_state(task_hpp: str, task_cpp:
 def require_exit_completion_respects_publish_fence(exit_cpp: str) -> None:
     helper = function_body(exit_cpp, "waiter_context_can_be_completed")
     for snippet in [
-        "!waiter->deferred_task_switch",
+        "waiter->deferred_task_switch",
         "!waiter->waitpid_publish_pending.load(std::memory_order_acquire)",
     ]:
         if snippet not in helper:
             fail(f"waiter completion helper is missing publish-fence snippet: {snippet}")
     for token in [
         "waiter_matches_child(parent, child) && waiter_context_can_be_completed(parent)",
-        "if (waiter_context_can_be_completed(tracer))",
+        "TRACER_IS_PARENT && !sched_task::task_waited_on(*child) && waiter_context_can_be_completed(tracer)",
         "if (waiter_context_can_be_completed(waiting_task) && waiter_matches_child(waiting_task, current_task))",
     ]:
         if token not in exit_cpp:
@@ -228,10 +246,12 @@ def main() -> None:
     scheduler_cpp = SCHEDULER_CPP.read_text()
     require_task_has_publish_fence(task_hpp, task_cpp)
     waitpid_cpp = WAITPID_CPP.read_text()
+    syscall_asm = SYSCALL_ASM.read_text()
     require_waited_on_is_atomic_claim(task_hpp, task_cpp, waitpid_cpp, exit_cpp, scheduler_cpp)
     require_wait_any_publish_recheck(waitpid_cpp)
     require_specific_wait_publish_recheck(waitpid_cpp)
     require_deferred_switch_clears_after_context_save(scheduler_cpp)
+    require_syscall_epilogue_honors_deferred_before_signals(syscall_asm)
     require_interrupted_waitpid_cleans_stale_wait_state(task_hpp, task_cpp, scheduler_cpp, exit_cpp)
     require_exit_completion_respects_publish_fence(exit_cpp)
     require_exit_waiter_notify_drains_all_batches(exit_cpp)
