@@ -639,9 +639,10 @@ auto bmbt_free_fork_blocks(XfsInode* ip, XfsTransaction* tp, uint32_t* freed) ->
 
 void fill_bmdr_root(uint8_t* root, uint32_t maxrecs, uint16_t level, uint16_t numrecs, const XfsBmbtIrec* first_recs,
                     const xfs_fsblock_t* ptrs) {
-    auto* bmdr = reinterpret_cast<XfsBmdrBlock*>(root);
-    bmdr->bb_level = Be16::from_cpu(level);
-    bmdr->bb_numrecs = Be16::from_cpu(numrecs);
+    XfsBmdrBlock bmdr{};
+    bmdr.bb_level = Be16::from_cpu(level);
+    bmdr.bb_numrecs = Be16::from_cpu(numrecs);
+    __builtin_memcpy(root, &bmdr, sizeof(bmdr));
 
     for (uint16_t i = 0; i < numrecs; i++) {
         XfsBmbtKey key{};
@@ -801,7 +802,12 @@ auto build_bmbt_tree(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec* extent
     }
 
     constexpr uint16_t BMDR_RECS = 1;
-    size_t const ROOT_SIZE = bmdr_root_min_size(BMDR_CAPACITY, BMDR_RECS);
+    size_t const MIN_ROOT_SIZE = bmdr_root_min_size(BMDR_CAPACITY, BMDR_RECS);
+    size_t const ROOT_SIZE = data_fork_payload_size(ip);
+    if (MIN_ROOT_SIZE == SIZE_MAX || ROOT_SIZE < MIN_ROOT_SIZE) {
+        cleanup_levels();
+        return -EIO;
+    }
     auto* root = new (std::nothrow) uint8_t[ROOT_SIZE];
     if (root == nullptr) {
         cleanup_levels();
@@ -1672,8 +1678,10 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
         return cleanup(false);
     }
     uint32_t const BMDR_MAXRECS = data_fork_bmdr_capacity(&inode);
-    size_t const EXPECTED_ROOT_SIZE = bmdr_root_min_size(BMDR_MAXRECS, 1);
-    if (BMDR_MAXRECS == 0 || inode.data_fork.btree.root_size < EXPECTED_ROOT_SIZE || inode.data_fork.btree.root == nullptr) {
+    size_t const EXPECTED_MIN_ROOT_SIZE = bmdr_root_min_size(BMDR_MAXRECS, 1);
+    size_t const EXPECTED_ROOT_SIZE = data_fork_payload_size(&inode);
+    if (BMDR_MAXRECS == 0 || EXPECTED_MIN_ROOT_SIZE == SIZE_MAX || EXPECTED_ROOT_SIZE < EXPECTED_MIN_ROOT_SIZE ||
+        inode.data_fork.btree.root_size != EXPECTED_ROOT_SIZE || inode.data_fork.btree.root == nullptr) {
         return cleanup(false);
     }
     Be64 promoted_child{};
@@ -1767,6 +1775,23 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
         return OK;
     };
     if (!corrupt_promoted_root_rejected()) {
+        return cleanup(false);
+    }
+
+    auto truncated_promoted_write_rejected = [&]() -> bool {
+        size_t const SAVED_ROOT_SIZE = inode.data_fork.btree.root_size;
+        inode.data_fork.btree.root_size = sizeof(XfsBmdrBlock) + sizeof(XfsBmbtKey) + sizeof(Be64);
+        XfsTransaction* tp = xfs_trans_alloc(&mount);
+        if (tp == nullptr) {
+            inode.data_fork.btree.root_size = SAVED_ROOT_SIZE;
+            return false;
+        }
+        int const RC = xfs_inode_write(&inode, tp);
+        xfs_trans_cancel(tp);
+        inode.data_fork.btree.root_size = SAVED_ROOT_SIZE;
+        return RC == -EIO;
+    };
+    if (!truncated_promoted_write_rejected()) {
         return cleanup(false);
     }
 

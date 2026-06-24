@@ -101,12 +101,12 @@ auto bmdr_root_min_size(uint32_t maxrecs, uint16_t numrecs) -> size_t {
     return sizeof(XfsBmdrBlock) + (static_cast<size_t>(maxrecs) * sizeof(XfsBmbtKey)) + (static_cast<size_t>(numrecs) * sizeof(Be64));
 }
 
-auto validate_bmdr_root(const uint8_t* root, size_t root_size, uint32_t nextents) -> int {
+auto validate_bmdr_root(const uint8_t* root, size_t root_size, size_t fork_size, uint32_t nextents) -> int {
     if (root == nullptr || root_size < sizeof(XfsBmdrBlock)) {
         return -EIO;
     }
 
-    uint32_t const MAXRECS = bmdr_record_capacity(root_size);
+    uint32_t const MAXRECS = bmdr_record_capacity(fork_size);
     if (MAXRECS == 0) {
         return -EIO;
     }
@@ -548,7 +548,7 @@ auto parse_ifork(XfsIfork* fork, uint8_t fmt, const uint8_t* data_ptr, size_t da
 
         case XFS_DINODE_FMT_BTREE: {
             // The fork contains a bmdr_block header + keys + pointers
-            int const VALID_ROOT = validate_bmdr_root(data_ptr, data_size, nextents);
+            int const VALID_ROOT = validate_bmdr_root(data_ptr, data_size, data_size, nextents);
             if (VALID_ROOT != 0) {
                 return VALID_ROOT;
             }
@@ -1141,7 +1141,7 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
                 brelse(bh);
                 return -EFBIG;
             }
-            if (validate_bmdr_root(ip->data_fork.btree.root, ip->data_fork.btree.root_size, ip->nextents) != 0) {
+            if (validate_bmdr_root(ip->data_fork.btree.root, ip->data_fork.btree.root_size, DATA_FORK_SIZE, ip->nextents) != 0) {
                 brelse(bh);
                 return -EIO;
             }
