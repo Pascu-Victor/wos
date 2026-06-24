@@ -13,6 +13,7 @@
 #include <net/netpoll.hpp>
 #include <net/packet.hpp>
 #include <net/proto/ethernet.hpp>
+#include <net/proto/ipv4.hpp>
 #include <net/wki/remotable.hpp>
 #include <net/wki/wire.hpp>
 #include <new>
@@ -115,6 +116,50 @@ auto active_tx_pair_count(const VirtIONetDevice* dev) -> uint8_t {
         return 0;
     }
     return std::min<uint8_t>(std::max<uint8_t>(dev->num_queue_pairs, SINGLE_QUEUE_PAIRS), VIRTIO_NET_MAX_QUEUE_PAIRS);
+}
+
+auto mix_tx_hash(uint32_t hash, uint32_t value) -> uint32_t {
+    hash ^= value + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+    return hash;
+}
+
+auto tx_pair_for_packet(const VirtIONetDevice* dev, const ker::net::PacketBuffer* pkt) -> uint8_t {
+    uint8_t const PAIR_COUNT = active_tx_pair_count(dev);
+    if (PAIR_COUNT <= 1 || pkt == nullptr || pkt->data == nullptr || pkt->len < ker::net::proto::ETH_HLEN) {
+        return 0;
+    }
+
+    const auto* eth = reinterpret_cast<const ker::net::proto::EthernetHeader*>(pkt->data);
+    uint16_t const ETHERTYPE = ker::net::ntohs(eth->ethertype);
+    uint32_t hash = ETHERTYPE;
+
+    if (ETHERTYPE == ker::net::proto::ETH_TYPE_IPV4 && pkt->len >= ker::net::proto::ETH_HLEN + sizeof(ker::net::proto::IPv4Header)) {
+        const auto* ip = reinterpret_cast<const ker::net::proto::IPv4Header*>(pkt->data + ker::net::proto::ETH_HLEN);
+        uint8_t const IHL = static_cast<uint8_t>(ip->ihl_version & 0x0FU) * 4U;
+        hash = ip->src_addr ^ ip->dst_addr ^ static_cast<uint32_t>(ip->protocol);
+        if ((ip->protocol == ker::net::proto::IPPROTO_TCP || ip->protocol == ker::net::proto::IPPROTO_UDP) &&
+            pkt->len >= ker::net::proto::ETH_HLEN + IHL + 4U) {
+            const auto* ports = reinterpret_cast<const uint16_t*>(pkt->data + ker::net::proto::ETH_HLEN + IHL);
+            hash ^= (static_cast<uint32_t>(ports[0]) << 16U) | static_cast<uint32_t>(ports[1]);
+        }
+    } else {
+        for (size_t i = 0; i < ker::net::proto::MacAddress::SIZE_BYTES; ++i) {
+            hash = mix_tx_hash(hash, static_cast<uint32_t>(eth->src.at(i)));
+            hash = mix_tx_hash(hash, static_cast<uint32_t>(eth->dst.at(i)));
+        }
+
+        if ((ETHERTYPE == ker::net::proto::ETH_TYPE_WKI || ETHERTYPE == ker::net::proto::ETH_TYPE_WKI_ROCE) &&
+            pkt->len >= ker::net::proto::ETH_HLEN + sizeof(ker::net::wki::WkiHeader)) {
+            const auto* hdr = reinterpret_cast<const ker::net::wki::WkiHeader*>(pkt->data + ker::net::proto::ETH_HLEN);
+            hash = mix_tx_hash(hash, static_cast<uint32_t>(hdr->src_node));
+            hash = mix_tx_hash(hash, static_cast<uint32_t>(hdr->dst_node));
+            hash = mix_tx_hash(hash, static_cast<uint32_t>(hdr->channel_id));
+        }
+    }
+
+    hash *= 0x9e3779b9U;
+    hash ^= hash >> 16U;
+    return static_cast<uint8_t>(hash % PAIR_COUNT);
 }
 
 auto virtio_net_hdr_size_for_features(uint32_t features) -> uint8_t {
@@ -634,7 +679,7 @@ auto virtio_net_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* 
     }
 
     bool const WKI_CONTROL = is_wki_control_liveness_frame(pkt);
-    auto start_pair = static_cast<uint8_t>(dev->tx_rr.fetch_add(1, std::memory_order_relaxed) % PAIR_COUNT);
+    auto start_pair = tx_pair_for_packet(dev, pkt);
     TxAttemptResult result = virtio_net_try_xmit_active_pairs(netdev, dev, pkt, start_pair);
     if (result == TxAttemptResult::SENT) {
         return 0;
@@ -648,7 +693,7 @@ auto virtio_net_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* 
     if (WKI_CONTROL) {
         for (uint8_t retry = 0; retry < WKI_CONTROL_TX_RETRY_POLLS; retry++) {
             ker::net::napi_poll_all_pending();
-            start_pair = static_cast<uint8_t>(dev->tx_rr.fetch_add(1, std::memory_order_relaxed) % PAIR_COUNT);
+            start_pair = tx_pair_for_packet(dev, pkt);
             result = virtio_net_try_xmit_active_pairs(netdev, dev, pkt, start_pair);
             if (result == TxAttemptResult::SENT) {
                 return 0;
