@@ -337,6 +337,101 @@ void free_bmbt_root(BmbtRootBuild* root) {
     root->metadata_blocks = 0;
 }
 
+struct BmbtLevelBuild {
+    xfs_fsblock_t* blocks{};
+    XfsBmbtIrec* first_recs{};
+    BufHead** bufs{};
+    uint32_t count{};
+};
+
+void free_bmbt_level_arrays(BmbtLevelBuild* level) {
+    if (level == nullptr) {
+        return;
+    }
+    delete[] level->blocks;
+    delete[] level->first_recs;
+    delete[] level->bufs;
+    level->blocks = nullptr;
+    level->first_recs = nullptr;
+    level->bufs = nullptr;
+    level->count = 0;
+}
+
+auto bmbt_ceil_div(uint32_t value, uint32_t divisor) -> uint32_t {
+    if (value == 0 || divisor == 0) {
+        return 0;
+    }
+    return 1U + ((value - 1U) / divisor);
+}
+
+auto bmbt_tree_metadata_blocks(uint32_t extent_count, uint32_t leaf_capacity, uint32_t node_capacity, uint32_t* blocks_out,
+                               uint16_t* bmdr_level_out) -> int {
+    if (blocks_out != nullptr) {
+        *blocks_out = 0;
+    }
+    if (bmdr_level_out != nullptr) {
+        *bmdr_level_out = 0;
+    }
+    if (extent_count == 0 || leaf_capacity == 0 || node_capacity == 0) {
+        return -EINVAL;
+    }
+
+    uint32_t level_blocks = bmbt_ceil_div(extent_count, leaf_capacity);
+    uint32_t total_blocks = level_blocks;
+    uint16_t bmdr_level = 1;
+
+    while (level_blocks > 1) {
+        if (bmdr_level >= XFS_BTREE_MAXLEVELS) {
+            return -EFBIG;
+        }
+        level_blocks = bmbt_ceil_div(level_blocks, node_capacity);
+        if (UINT32_MAX - total_blocks < level_blocks) {
+            return -EFBIG;
+        }
+        total_blocks += level_blocks;
+        bmdr_level++;
+    }
+
+    if (blocks_out != nullptr) {
+        *blocks_out = total_blocks;
+    }
+    if (bmdr_level_out != nullptr) {
+        *bmdr_level_out = bmdr_level;
+    }
+    return 0;
+}
+
+auto bmbt_prepare_level(BmbtLevelBuild* level, uint32_t count) -> int {
+    if (level == nullptr || count == 0) {
+        return -EINVAL;
+    }
+
+    level->blocks = new (std::nothrow) xfs_fsblock_t[count];
+    level->first_recs = new (std::nothrow) XfsBmbtIrec[count];
+    level->bufs = new (std::nothrow) BufHead*[count];
+    if (level->blocks == nullptr || level->first_recs == nullptr || level->bufs == nullptr) {
+        free_bmbt_level_arrays(level);
+        return -ENOMEM;
+    }
+
+    level->count = count;
+    for (uint32_t i = 0; i < count; i++) {
+        level->blocks[i] = NULLFSBLOCK;
+        level->first_recs[i] = {};
+        level->bufs[i] = nullptr;
+    }
+    return 0;
+}
+
+void bmbt_set_siblings(BufHead* bh, xfs_fsblock_t left, xfs_fsblock_t right) {
+    if (bh == nullptr) {
+        return;
+    }
+    auto* hdr = reinterpret_cast<XfsBtreeLblock*>(bh->data);
+    hdr->bb_leftsib = Be64::from_cpu(left);
+    hdr->bb_rightsib = Be64::from_cpu(right);
+}
+
 auto bmbt_free_subtree(XfsMountContext* mount, XfsTransaction* tp, xfs_fsblock_t root_block, uint8_t nlevels, uint32_t* freed) -> int {
     if (mount == nullptr || tp == nullptr || root_block == NULLFSBLOCK || nlevels == 0) {
         return -EINVAL;
@@ -574,160 +669,173 @@ auto build_bmbt_tree(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec* extent
     if (LEAF_CAPACITY == 0) {
         return -EIO;
     }
-
-    uint32_t const LEAF_COUNT = 1U + ((extent_count - 1U) / LEAF_CAPACITY);
     uint32_t const NODE_CAPACITY = bmbt_node_max_keys(ip->mount);
-    if (LEAF_COUNT == 0 || (LEAF_COUNT > 1 && LEAF_COUNT > NODE_CAPACITY)) {
-        return -EFBIG;
+    if (NODE_CAPACITY == 0) {
+        return -EIO;
     }
-    uint32_t const REQUIRED_METADATA_BLOCKS = LEAF_COUNT + (LEAF_COUNT > 1 ? 1U : 0U);
+
+    uint32_t required_metadata_blocks = 0;
+    uint16_t bmdr_level = 0;
+    int rc = bmbt_tree_metadata_blocks(extent_count, LEAF_CAPACITY, NODE_CAPACITY, &required_metadata_blocks, &bmdr_level);
+    if (rc != 0) {
+        return rc;
+    }
     uint32_t const AVAILABLE_TRANSACTION_ITEMS =
         tp->item_count >= XFS_TRANS_MAX_ITEMS ? 0U : static_cast<uint32_t>(XFS_TRANS_MAX_ITEMS - tp->item_count);
-    if (REQUIRED_METADATA_BLOCKS > AVAILABLE_TRANSACTION_ITEMS) {
+    if (required_metadata_blocks > AVAILABLE_TRANSACTION_ITEMS) {
         return -EFBIG;
     }
 
-    auto* leaf_blocks = new (std::nothrow) xfs_fsblock_t[LEAF_COUNT];
-    auto** leaf_bufs = new (std::nothrow) BufHead*[LEAF_COUNT];
-    if (leaf_blocks == nullptr || leaf_bufs == nullptr) {
-        delete[] leaf_blocks;
-        delete[] leaf_bufs;
-        return -ENOMEM;
-    }
-    for (uint32_t i = 0; i < LEAF_COUNT; i++) {
-        leaf_blocks[i] = NULLFSBLOCK;
-        leaf_bufs[i] = nullptr;
-    }
+    std::array<BmbtLevelBuild, XFS_BTREE_MAXLEVELS> levels{};
+    uint16_t built_levels = 0;
 
-    auto cleanup_leaf_blocks = [&]() {
-        for (uint32_t i = 0; i < LEAF_COUNT; i++) {
-            if (leaf_bufs[i] != nullptr) {
-                brelse(leaf_bufs[i]);
-                leaf_bufs[i] = nullptr;
+    auto cleanup_levels = [&]() {
+        for (uint16_t level = 0; level < built_levels; level++) {
+            BmbtLevelBuild& built = levels[level];
+            for (uint32_t i = 0; i < built.count; i++) {
+                if (built.bufs != nullptr && built.bufs[i] != nullptr) {
+                    brelse(built.bufs[i]);
+                    built.bufs[i] = nullptr;
+                }
+                if (built.blocks != nullptr && built.blocks[i] != NULLFSBLOCK) {
+                    static_cast<void>(bmbt_return_block(ip->mount, tp, built.blocks[i]));
+                    built.blocks[i] = NULLFSBLOCK;
+                }
             }
-            if (leaf_blocks[i] != NULLFSBLOCK) {
-                static_cast<void>(bmbt_return_block(ip->mount, tp, leaf_blocks[i]));
-                leaf_blocks[i] = NULLFSBLOCK;
-            }
+            free_bmbt_level_arrays(&built);
         }
+        built_levels = 0;
     };
+
+    auto release_level_arrays = [&]() {
+        for (uint16_t level = 0; level < built_levels; level++) {
+            free_bmbt_level_arrays(&levels[level]);
+        }
+        built_levels = 0;
+    };
+
+    uint32_t const LEAF_COUNT = bmbt_ceil_div(extent_count, LEAF_CAPACITY);
+    rc = bmbt_prepare_level(levels.data(), LEAF_COUNT);
+    if (rc != 0) {
+        return rc;
+    }
+    built_levels = 1;
 
     uint32_t extent_index = 0;
     for (uint32_t leaf = 0; leaf < LEAF_COUNT; leaf++) {
-        int rc = bmbt_alloc_block(ip, tp, 0, &leaf_bufs[leaf], &leaf_blocks[leaf]);
+        rc = bmbt_alloc_block(ip, tp, 0, &levels[0].bufs[leaf], &levels[0].blocks[leaf]);
         if (rc != 0) {
-            cleanup_leaf_blocks();
-            delete[] leaf_blocks;
-            delete[] leaf_bufs;
+            cleanup_levels();
             return rc;
         }
 
         uint32_t const RECS = std::min<uint32_t>(LEAF_CAPACITY, extent_count - extent_index);
-        auto* hdr = reinterpret_cast<XfsBtreeLblock*>(leaf_bufs[leaf]->data);
+        auto* hdr = reinterpret_cast<XfsBtreeLblock*>(levels[0].bufs[leaf]->data);
         hdr->bb_numrecs = Be16::from_cpu(static_cast<uint16_t>(RECS));
-        if (leaf > 0) {
-            hdr->bb_leftsib = Be64::from_cpu(leaf_blocks[leaf - 1]);
-        }
-        if (leaf + 1 < LEAF_COUNT) {
-            // Filled after the next block has been allocated.
-            hdr->bb_rightsib = Be64::from_cpu(NULLFSBLOCK);
-        }
+        levels[0].first_recs[leaf] = extents[extent_index];
 
-        auto* recs = reinterpret_cast<XfsBmbtRec*>(leaf_bufs[leaf]->data + XFS_BTREE_LBLOCK_CRC_LEN);
+        auto* recs = reinterpret_cast<XfsBmbtRec*>(levels[0].bufs[leaf]->data + XFS_BTREE_LBLOCK_CRC_LEN);
         for (uint32_t r = 0; r < RECS; r++) {
             recs[r] = xfs_bmbt_rec_pack(extents[extent_index++]);
         }
 
+        xfs_fsblock_t const LEFT = leaf == 0 ? NULLFSBLOCK : levels[0].blocks[leaf - 1];
         if (leaf > 0) {
-            auto* prev_hdr = reinterpret_cast<XfsBtreeLblock*>(leaf_bufs[leaf - 1]->data);
-            prev_hdr->bb_rightsib = Be64::from_cpu(leaf_blocks[leaf]);
+            bmbt_set_siblings(levels[0].bufs[leaf - 1], leaf == 1 ? NULLFSBLOCK : levels[0].blocks[leaf - 2], levels[0].blocks[leaf]);
         }
+        bmbt_set_siblings(levels[0].bufs[leaf], LEFT, NULLFSBLOCK);
     }
 
-    BufHead* root_bh = nullptr;
-    xfs_fsblock_t root_block = NULLFSBLOCK;
-    uint16_t bmdr_level = 1;
-    xfs_fsblock_t bmdr_ptr = leaf_blocks[0];
-    uint32_t metadata_blocks = LEAF_COUNT;
-
-    if (LEAF_COUNT > 1) {
-        int const RC = bmbt_alloc_block(ip, tp, 1, &root_bh, &root_block);
-        if (RC != 0) {
-            cleanup_leaf_blocks();
-            delete[] leaf_blocks;
-            delete[] leaf_bufs;
-            return RC;
+    uint16_t source_level = 0;
+    while (levels[source_level].count > 1) {
+        if (source_level + 1 >= XFS_BTREE_MAXLEVELS) {
+            cleanup_levels();
+            return -EFBIG;
         }
 
-        auto* root_hdr = reinterpret_cast<XfsBtreeLblock*>(root_bh->data);
-        root_hdr->bb_numrecs = Be16::from_cpu(static_cast<uint16_t>(LEAF_COUNT));
-        for (uint32_t i = 0; i < LEAF_COUNT; i++) {
-            uint32_t const FIRST_INDEX = i * LEAF_CAPACITY;
-            if (FIRST_INDEX >= extent_count) {
-                cleanup_leaf_blocks();
-                brelse(root_bh);
-                static_cast<void>(bmbt_return_block(ip->mount, tp, root_block));
-                delete[] leaf_blocks;
-                delete[] leaf_bufs;
-                return -EIO;
+        BmbtLevelBuild& child_level = levels[source_level];
+        BmbtLevelBuild& parent_level = levels[source_level + 1];
+        uint32_t const PARENT_COUNT = bmbt_ceil_div(child_level.count, NODE_CAPACITY);
+        rc = bmbt_prepare_level(&parent_level, PARENT_COUNT);
+        if (rc != 0) {
+            cleanup_levels();
+            return rc;
+        }
+        built_levels++;
+
+        uint32_t child_index = 0;
+        auto const PARENT_BLOCK_LEVEL = static_cast<uint16_t>(source_level + 1);
+        for (uint32_t parent = 0; parent < PARENT_COUNT; parent++) {
+            rc = bmbt_alloc_block(ip, tp, PARENT_BLOCK_LEVEL, &parent_level.bufs[parent], &parent_level.blocks[parent]);
+            if (rc != 0) {
+                cleanup_levels();
+                return rc;
             }
 
-            uint8_t* key_addr = root_bh->data + XFS_BTREE_LBLOCK_CRC_LEN + (static_cast<size_t>(i) * sizeof(XfsBmbtKey));
-            XfsBmbtKey key{};
-            key.br_startoff = Be64::from_cpu(extents[FIRST_INDEX].br_startoff);
-            __builtin_memcpy(key_addr, &key, sizeof(key));
+            uint32_t const FIRST_CHILD = child_index;
+            uint32_t const RECS = std::min<uint32_t>(NODE_CAPACITY, child_level.count - child_index);
+            auto* hdr = reinterpret_cast<XfsBtreeLblock*>(parent_level.bufs[parent]->data);
+            hdr->bb_numrecs = Be16::from_cpu(static_cast<uint16_t>(RECS));
+            parent_level.first_recs[parent] = child_level.first_recs[FIRST_CHILD];
 
-            Be64 ptr = Be64::from_cpu(leaf_blocks[i]);
-            __builtin_memcpy(root_bh->data + bmbt_node_ptr_offset(ip->mount, i), &ptr, sizeof(ptr));
+            for (uint32_t r = 0; r < RECS; r++) {
+                XfsBmbtKey key{};
+                key.br_startoff = Be64::from_cpu(child_level.first_recs[child_index].br_startoff);
+                __builtin_memcpy(parent_level.bufs[parent]->data + XFS_BTREE_LBLOCK_CRC_LEN + (static_cast<size_t>(r) * sizeof(XfsBmbtKey)),
+                                 &key, sizeof(key));
+
+                Be64 ptr = Be64::from_cpu(child_level.blocks[child_index]);
+                __builtin_memcpy(parent_level.bufs[parent]->data + bmbt_node_ptr_offset(ip->mount, r), &ptr, sizeof(ptr));
+                child_index++;
+            }
+
+            xfs_fsblock_t const LEFT = parent == 0 ? NULLFSBLOCK : parent_level.blocks[parent - 1];
+            if (parent > 0) {
+                bmbt_set_siblings(parent_level.bufs[parent - 1], parent == 1 ? NULLFSBLOCK : parent_level.blocks[parent - 2],
+                                  parent_level.blocks[parent]);
+            }
+            bmbt_set_siblings(parent_level.bufs[parent], LEFT, NULLFSBLOCK);
         }
-        bmbt_update_crc(root_bh);
 
-        bmdr_level = 2;
-        bmdr_ptr = root_block;
-        metadata_blocks++;
+        source_level++;
     }
 
     constexpr uint16_t BMDR_RECS = 1;
     size_t const ROOT_SIZE = bmdr_root_min_size(BMDR_CAPACITY, BMDR_RECS);
     auto* root = new (std::nothrow) uint8_t[ROOT_SIZE];
     if (root == nullptr) {
-        cleanup_leaf_blocks();
-        if (root_bh != nullptr) {
-            brelse(root_bh);
-            root_bh = nullptr;
-        }
-        if (root_block != NULLFSBLOCK) {
-            static_cast<void>(bmbt_return_block(ip->mount, tp, root_block));
-        }
-        delete[] leaf_blocks;
-        delete[] leaf_bufs;
+        cleanup_levels();
         return -ENOMEM;
     }
     __builtin_memset(root, 0, ROOT_SIZE);
 
-    XfsBmbtIrec const FIRST = extents[0];
-    fill_bmdr_root(root, BMDR_CAPACITY, bmdr_level, BMDR_RECS, &FIRST, &bmdr_ptr);
-
-    for (uint32_t i = 0; i < LEAF_COUNT; i++) {
-        bmbt_update_crc(leaf_bufs[i]);
-        xfs_trans_log_buf_full(tp, leaf_bufs[i]);
-        brelse(leaf_bufs[i]);
-        leaf_bufs[i] = nullptr;
+    BmbtLevelBuild const& external_root = levels[source_level];
+    if (external_root.count != 1 || bmdr_level != built_levels) {
+        delete[] root;
+        cleanup_levels();
+        return -EIO;
     }
-    if (root_bh != nullptr) {
-        xfs_trans_log_buf_full(tp, root_bh);
-        brelse(root_bh);
-        root_bh = nullptr;
+    XfsBmbtIrec const FIRST = external_root.first_recs[0];
+    xfs_fsblock_t const BMDR_PTR = external_root.blocks[0];
+    fill_bmdr_root(root, BMDR_CAPACITY, bmdr_level, BMDR_RECS, &FIRST, &BMDR_PTR);
+
+    for (uint16_t level = 0; level < built_levels; level++) {
+        BmbtLevelBuild& built = levels[level];
+        for (uint32_t i = 0; i < built.count; i++) {
+            bmbt_update_crc(built.bufs[i]);
+            xfs_trans_log_buf_full(tp, built.bufs[i]);
+            brelse(built.bufs[i]);
+            built.bufs[i] = nullptr;
+        }
     }
 
     out->root = root;
     out->root_size = ROOT_SIZE;
     out->level = bmdr_level;
     out->numrecs = BMDR_RECS;
-    out->metadata_blocks = metadata_blocks;
+    out->metadata_blocks = required_metadata_blocks;
 
-    delete[] leaf_blocks;
-    delete[] leaf_bufs;
+    release_level_arrays();
     return 0;
 }
 
@@ -1465,9 +1573,12 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
     mount.block_log = 9;
     mount.total_blocks = 4096;
     mount.inode_size = 512;
+    mount.inodes_per_block = 1;
+    mount.inopb_log = 0;
     mount.ag_count = 1;
     mount.ag_blocks = 4096;
     mount.ag_blk_log = 12;
+    mount.agino_log = 12;
     mount.sect_size = 512;
     mount.sect_log = 9;
     mount.per_ag = &pag;
@@ -1478,12 +1589,16 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
     XfsInode inode{};
     inode.ino = 84;
     inode.agno = 0;
+    inode.agino = 84;
     inode.mount = &mount;
+    inode.mode = 0100644;
+    inode.nlink = 1;
     inode.data_fork.format = XFS_DINODE_FMT_LOCAL;
     inode.data_fork.local.data = nullptr;
     inode.data_fork.local.size = 0;
 
     auto cleanup = [&](bool ok) -> bool {
+        xfs_icache_purge(&mount);
         if (inode.data_fork.format == XFS_DINODE_FMT_EXTENTS) {
             delete[] inode.data_fork.extents.list;
             inode.data_fork.extents.list = nullptr;
@@ -1503,10 +1618,26 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
     if (LEAF_CAPACITY <= INLINE_CAPACITY) {
         return cleanup(false);
     }
+    uint32_t const NODE_CAPACITY = bmbt_node_max_keys(&mount);
+    if (NODE_CAPACITY <= 1) {
+        return cleanup(false);
+    }
     auto extent_startoff = [](uint32_t idx) -> xfs_fileoff_t { return (static_cast<xfs_fileoff_t>(idx) + 1) * 2; };
-    auto expected_metadata_blocks = [LEAF_CAPACITY](uint32_t extent_count) -> uint64_t {
-        uint32_t const LEAF_COUNT = 1U + ((extent_count - 1U) / LEAF_CAPACITY);
-        return LEAF_COUNT + (LEAF_COUNT > 1 ? 1U : 0U);
+    auto expected_metadata_blocks = [LEAF_CAPACITY, NODE_CAPACITY](uint32_t extent_count) -> uint64_t {
+        uint32_t blocks = 0;
+        uint16_t level = 0;
+        if (bmbt_tree_metadata_blocks(extent_count, LEAF_CAPACITY, NODE_CAPACITY, &blocks, &level) != 0) {
+            return UINT64_MAX;
+        }
+        return blocks;
+    };
+    auto expected_bmdr_level = [LEAF_CAPACITY, NODE_CAPACITY](uint32_t extent_count) -> uint16_t {
+        uint32_t blocks = 0;
+        uint16_t level = 0;
+        if (bmbt_tree_metadata_blocks(extent_count, LEAF_CAPACITY, NODE_CAPACITY, &blocks, &level) != 0) {
+            return 0;
+        }
+        return level;
     };
 
     for (uint32_t i = 0; i < INLINE_CAPACITY + 1; i++) {
@@ -1519,8 +1650,12 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
                               .br_blockcount = 1,
                               .br_unwritten = false};
         int const RC = xfs_bmap_add_extent(&inode, tp, REC);
-        xfs_trans_cancel(tp);
         if (RC != 0) {
+            xfs_trans_cancel(tp);
+            return cleanup(false);
+        }
+        int const COMMIT_RC = xfs_trans_commit(tp);
+        if (COMMIT_RC != 0) {
             return cleanup(false);
         }
         if (i + 1 == INLINE_CAPACITY &&
@@ -1552,6 +1687,57 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
         if (compact_slot.to_cpu() == promoted_child.to_cpu()) {
             return cleanup(false);
         }
+    }
+
+    auto reload_promoted_inode = [&]() -> bool {
+        XfsInode* reloaded = xfs_inode_read(&mount, inode.ino);
+        if (reloaded == nullptr) {
+            return false;
+        }
+
+        auto finish_reload = [&](bool ok) -> bool {
+            xfs_inode_release(reloaded);
+            xfs_icache_purge(&mount);
+            return ok;
+        };
+
+        if (reloaded->data_fork.format != XFS_DINODE_FMT_BTREE || reloaded->nextents != INLINE_CAPACITY + 1 ||
+            reloaded->nblocks != expected_metadata_blocks(INLINE_CAPACITY + 1)) {
+            return finish_reload(false);
+        }
+
+        auto* reloaded_extents = new (std::nothrow) XfsBmbtIrec[INLINE_CAPACITY + 1];
+        if (reloaded_extents == nullptr) {
+            return finish_reload(false);
+        }
+        auto finish_reload_extents = [&](bool ok) -> bool {
+            delete[] reloaded_extents;
+            return finish_reload(ok);
+        };
+
+        int const RELOADED_COUNT = xfs_bmap_list_extents(reloaded, reloaded_extents, INLINE_CAPACITY + 1);
+        if (std::cmp_not_equal(RELOADED_COUNT, INLINE_CAPACITY + 1)) {
+            return finish_reload_extents(false);
+        }
+        for (uint32_t i = 0; i < INLINE_CAPACITY + 1; i++) {
+            xfs_fileoff_t const EXPECTED_OFF = extent_startoff(i);
+            xfs_fsblock_t const EXPECTED_BLOCK = 1000 + (i * 3);
+            if (reloaded_extents[i].br_startoff != EXPECTED_OFF || reloaded_extents[i].br_startblock != EXPECTED_BLOCK ||
+                reloaded_extents[i].br_blockcount != 1 || reloaded_extents[i].br_unwritten) {
+                return finish_reload_extents(false);
+            }
+
+            XfsBmapResult mapped{};
+            if (xfs_bmap_lookup(reloaded, EXPECTED_OFF, &mapped) != 0 || mapped.is_hole || mapped.startblock != EXPECTED_BLOCK ||
+                mapped.blockcount != 1) {
+                return finish_reload_extents(false);
+            }
+        }
+
+        return finish_reload_extents(true);
+    };
+    if (!reload_promoted_inode()) {
+        return cleanup(false);
     }
 
     auto corrupt_promoted_root_rejected = [&]() -> bool {
@@ -1634,9 +1820,13 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
                               .br_blockcount = 1,
                               .br_unwritten = false};
         int const RC = xfs_bmap_add_extent(&inode, tp, REC);
-        xfs_trans_cancel(tp);
         if (RC != 0 || inode.data_fork.format != XFS_DINODE_FMT_BTREE || inode.nextents != i + 1 ||
             inode.nblocks != expected_metadata_blocks(i + 1)) {
+            xfs_trans_cancel(tp);
+            return cleanup(false);
+        }
+        int const COMMIT_RC = xfs_trans_commit(tp);
+        if (COMMIT_RC != 0) {
             return cleanup(false);
         }
     }
@@ -1666,7 +1856,37 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
         return cleanup(false);
     }
 
-    uint32_t const EXPECTED_EXTENTS = TARGET_EXTENTS;
+    uint32_t const DEEP_TARGET_EXTENTS = (LEAF_CAPACITY * NODE_CAPACITY) + 2;
+    if (expected_metadata_blocks(DEEP_TARGET_EXTENTS) >= XFS_TRANS_MAX_ITEMS) {
+        return cleanup(false);
+    }
+    for (uint32_t i = TARGET_EXTENTS; i < DEEP_TARGET_EXTENTS; i++) {
+        XfsTransaction* tp = xfs_trans_alloc(&mount);
+        if (tp == nullptr) {
+            return cleanup(false);
+        }
+        XfsBmbtIrec const REC{.br_startoff = extent_startoff(i),
+                              .br_startblock = static_cast<xfs_fsblock_t>(1000 + (i * 3)),
+                              .br_blockcount = 1,
+                              .br_unwritten = false};
+        int const RC = xfs_bmap_add_extent(&inode, tp, REC);
+        if (RC != 0 || inode.data_fork.format != XFS_DINODE_FMT_BTREE || inode.nextents != i + 1 ||
+            inode.nblocks != expected_metadata_blocks(i + 1)) {
+            xfs_trans_cancel(tp);
+            return cleanup(false);
+        }
+        int const COMMIT_RC = xfs_trans_commit(tp);
+        if (COMMIT_RC != 0) {
+            return cleanup(false);
+        }
+    }
+
+    if (inode.data_fork.btree.level != expected_bmdr_level(DEEP_TARGET_EXTENTS) ||
+        inode.nblocks != expected_metadata_blocks(DEEP_TARGET_EXTENTS)) {
+        return cleanup(false);
+    }
+
+    uint32_t const EXPECTED_EXTENTS = DEEP_TARGET_EXTENTS;
     auto* listed = new (std::nothrow) XfsBmbtIrec[EXPECTED_EXTENTS];
     if (listed == nullptr) {
         return cleanup(false);
