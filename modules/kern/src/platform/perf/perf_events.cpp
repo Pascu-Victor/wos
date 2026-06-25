@@ -56,6 +56,21 @@ struct WkiPerfSummaryBucket {
 std::array<WkiPerfSummaryBucket, WKI_PERF_SUMMARY_BUCKETS> g_wki_summary{};
 ker::mod::sys::Spinlock g_wki_summary_lock;
 
+constexpr size_t LOCAL_XFS_SUMMARY_BUCKETS = static_cast<size_t>(WkiPerfLocalXfsOp::READ_GAP) + 1;
+
+struct LocalXfsSummaryBucket {
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> errors{0};
+    std::atomic<uint64_t> retries{0};
+    std::atomic<uint64_t> bytes{0};
+    std::atomic<uint64_t> latency_samples{0};
+    std::atomic<uint64_t> total_latency_us{0};
+    std::atomic<uint32_t> max_latency_us{0};
+    std::array<std::atomic<uint32_t>, WKI_PERF_HIST_BUCKETS> latency_hist{};
+};
+
+std::array<LocalXfsSummaryBucket, LOCAL_XFS_SUMMARY_BUCKETS> g_local_xfs_summary{};
+
 void perf_push_event(PerfCpuRing& ring, const PerfEvent& evt) {
     uint64_t const SLOT = ring.head & PERF_RING_MASK;
     ring.events[SLOT] = evt;
@@ -125,6 +140,15 @@ auto wki_hist_bucket_value(size_t bucket) -> uint32_t {
     return 1U << static_cast<uint32_t>(bucket);
 }
 
+void atomic_max_u32(std::atomic<uint32_t>& target, uint32_t value) {
+    uint32_t current = target.load(std::memory_order_relaxed);
+    while (value > current) {
+        if (target.compare_exchange_weak(current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
 auto wki_hist_percentile(const std::array<uint32_t, WKI_PERF_HIST_BUCKETS>& hist, uint64_t total, uint32_t numer, uint32_t denom)
     -> uint32_t {
     if (total == 0 || denom == 0) {
@@ -145,6 +169,51 @@ auto wki_hist_percentile(const std::array<uint32_t, WKI_PERF_HIST_BUCKETS>& hist
     }
 
     return wki_hist_bucket_value(hist.size() - 1);
+}
+
+void reset_local_xfs_summary() {
+    for (auto& bucket : g_local_xfs_summary) {
+        bucket.calls.store(0, std::memory_order_relaxed);
+        bucket.errors.store(0, std::memory_order_relaxed);
+        bucket.retries.store(0, std::memory_order_relaxed);
+        bucket.bytes.store(0, std::memory_order_relaxed);
+        bucket.latency_samples.store(0, std::memory_order_relaxed);
+        bucket.total_latency_us.store(0, std::memory_order_relaxed);
+        bucket.max_latency_us.store(0, std::memory_order_relaxed);
+        for (auto& hist_bucket : bucket.latency_hist) {
+            hist_bucket.store(0, std::memory_order_relaxed);
+        }
+    }
+}
+
+auto local_xfs_summary_snapshot(size_t op) -> WkiPerfSummarySnapshot {
+    const auto& bucket = g_local_xfs_summary.at(op);
+    std::array<uint32_t, WKI_PERF_HIST_BUCKETS> hist{};
+    for (size_t i = 0; i < hist.size(); ++i) {
+        hist.at(i) = bucket.latency_hist.at(i).load(std::memory_order_relaxed);
+    }
+
+    uint64_t const LATENCY_SAMPLES = bucket.latency_samples.load(std::memory_order_relaxed);
+    return WkiPerfSummarySnapshot{
+        .scope = static_cast<uint8_t>(WkiPerfScope::LOCAL_XFS),
+        .op = static_cast<uint8_t>(op),
+        .peer = 0,
+        .channel = 0,
+        .reserved = 0,
+        .calls = bucket.calls.load(std::memory_order_relaxed),
+        .errors = bucket.errors.load(std::memory_order_relaxed),
+        .retries = bucket.retries.load(std::memory_order_relaxed),
+        .bytes = bucket.bytes.load(std::memory_order_relaxed),
+        .total_latency_us = bucket.total_latency_us.load(std::memory_order_relaxed),
+        .latency_samples = LATENCY_SAMPLES,
+        .max_latency_us = bucket.max_latency_us.load(std::memory_order_relaxed),
+        .p50_us = wki_hist_percentile(hist, LATENCY_SAMPLES, 50, 100),
+        .p95_us = wki_hist_percentile(hist, LATENCY_SAMPLES, 95, 100),
+        .p99_us = wki_hist_percentile(hist, LATENCY_SAMPLES, 99, 100),
+        .p999_us = wki_hist_percentile(hist, LATENCY_SAMPLES, 999, 1000),
+        .p9999_us = wki_hist_percentile(hist, LATENCY_SAMPLES, 9999, 10000),
+        .p99999_us = wki_hist_percentile(hist, LATENCY_SAMPLES, 99999, 100000),
+    };
 }
 
 auto wki_phase_flags(WkiPerfPhase phase) -> uint8_t {
@@ -678,6 +747,7 @@ void init() {
         bucket.max_latency_us = 0;
         bucket.latency_hist.fill(0);
     }
+    reset_local_xfs_summary();
 }
 
 bool is_enabled() { return g_enabled.load(std::memory_order_acquire); }
@@ -713,6 +783,7 @@ void reset_rings() {
         bucket.max_latency_us = 0;
         bucket.latency_hist.fill(0);
     }
+    reset_local_xfs_summary();
     g_wki_trace_correlation.store(1, std::memory_order_release);
     g_wki_summary_lock.unlock_irqrestore(saved);
 }
@@ -1059,7 +1130,31 @@ void record_wki_summary(WkiPerfScope scope, uint8_t op, uint16_t peer, uint16_t 
 }
 
 void record_local_xfs_summary(WkiPerfLocalXfsOp op, int32_t status, uint32_t latency_us, bool has_latency, uint64_t bytes) {
-    record_wki_summary(WkiPerfScope::LOCAL_XFS, static_cast<uint8_t>(op), 0, 0, status, latency_us, has_latency, 0, bytes);
+    if (!g_enabled.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    auto const OP = static_cast<uint8_t>(op);
+    auto mask = g_event_mask.load(std::memory_order_relaxed);
+    if (!wki_should_record(mask, WkiPerfScope::LOCAL_XFS, OP)) {
+        return;
+    }
+    if (OP == 0 || OP >= g_local_xfs_summary.size()) {
+        return;
+    }
+
+    auto& bucket = g_local_xfs_summary.at(OP);
+    bucket.calls.fetch_add(1, std::memory_order_relaxed);
+    if (status < 0) {
+        bucket.errors.fetch_add(1, std::memory_order_relaxed);
+    }
+    bucket.bytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (has_latency) {
+        bucket.latency_samples.fetch_add(1, std::memory_order_relaxed);
+        bucket.total_latency_us.fetch_add(latency_us, std::memory_order_relaxed);
+        atomic_max_u32(bucket.max_latency_us, latency_us);
+        bucket.latency_hist.at(wki_hist_bucket(latency_us)).fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void record_local_irq_summary(WkiPerfLocalIrqOp op, uint16_t vector, uint16_t kind, int32_t status, uint32_t latency_us, bool has_latency) {
@@ -1071,8 +1166,15 @@ size_t get_wki_summary_snapshots(WkiPerfSummarySnapshot* dst, size_t max) {
         return 0;
     }
 
-    auto saved = g_wki_summary_lock.lock_irqsave();
     size_t total = 0;
+    for (size_t op = 1; op < g_local_xfs_summary.size() && total < max; ++op) {
+        if (g_local_xfs_summary.at(op).calls.load(std::memory_order_relaxed) == 0) {
+            continue;
+        }
+        dst[total++] = local_xfs_summary_snapshot(op);
+    }
+
+    auto saved = g_wki_summary_lock.lock_irqsave();
     for (const auto& bucket : g_wki_summary) {
         if (!bucket.used || total >= max) {
             continue;
