@@ -32,7 +32,39 @@ namespace {
 
 constexpr xfs_agblock_t XFS_AG_RESERVED_MAX = 4;
 
-void log_agf_free_space_roots(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno);
+auto log_agf_free_space_roots(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) -> int;
+
+auto ag0_sector_offset(const XfsMountContext* mount, size_t sector, size_t required_bytes, size_t* offset_out) -> int {
+    if (offset_out != nullptr) {
+        *offset_out = 0;
+    }
+    if (mount == nullptr || mount->sect_size == 0 || mount->block_size == 0 || required_bytes == 0) {
+        return -EINVAL;
+    }
+    if (required_bytes > mount->sect_size || sector > SIZE_MAX / mount->sect_size) {
+        return -EIO;
+    }
+
+    size_t const OFFSET = sector * static_cast<size_t>(mount->sect_size);
+    if (OFFSET > mount->block_size || required_bytes > mount->block_size - OFFSET) {
+        return -EIO;
+    }
+    if (offset_out != nullptr) {
+        *offset_out = OFFSET;
+    }
+    return 0;
+}
+
+auto agf_sector_offset(const XfsMountContext* mount, size_t* offset_out) -> int {
+    if (mount == nullptr || mount->sect_size < sizeof(XfsAgf)) {
+        return -EIO;
+    }
+    return ag0_sector_offset(mount, 1, mount->sect_size, offset_out);
+}
+
+auto agfl_sector_offset(const XfsMountContext* mount, size_t* offset_out) -> int {
+    return ag0_sector_offset(mount, 3, mount != nullptr ? static_cast<size_t>(mount->sect_size) : 0, offset_out);
+}
 
 auto agfl_bno_usable(const XfsMountContext* mount, xfs_agblock_t bno) -> bool {
     return bno != NULLAGBLOCK && bno < mount->ag_blocks && bno > XFS_AG_RESERVED_MAX;
@@ -124,8 +156,12 @@ void agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
         uint64_t const AG0 = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
         BufHead* agf_bh = xfs_buf_read(mount, AG0);
         if (agf_bh != nullptr) {
-            size_t const AGF_OFF = mount->sect_size;
-            auto* agf = reinterpret_cast<XfsAgf*>(agf_bh->data + AGF_OFF);
+            size_t agf_off = 0;
+            if (agf_sector_offset(mount, &agf_off) != 0) {
+                brelse(agf_bh);
+                break;
+            }
+            auto* agf = reinterpret_cast<XfsAgf*>(agf_bh->data + agf_off);
             agf->agf_freeblks = Be32::from_cpu(pag->agf_freeblks);
             agf->agf_bno_root = Be32::from_cpu(pag->agf_bno_root);
             agf->agf_cnt_root = Be32::from_cpu(pag->agf_cnt_root);
@@ -134,7 +170,7 @@ void agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
             agf->agf_crc = Be32{0};
             uint32_t crc = util::crc32c_block_with_cksum(agf, mount->sect_size, XFS_AGF_CRC_OFF);
             __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
-            xfs_trans_log_buf(tp, agf_bh, static_cast<uint32_t>(AGF_OFF), static_cast<uint32_t>(sizeof(XfsAgf)));
+            xfs_trans_log_buf(tp, agf_bh, static_cast<uint32_t>(agf_off), static_cast<uint32_t>(sizeof(XfsAgf)));
             brelse(agf_bh);
         }
     }
@@ -143,6 +179,10 @@ void agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
 // Try to allocate from a specific AG using the cntbt (by-count tree)
 auto alloc_ag_by_hint(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, const XfsAllocReq& req, XfsAllocResult* result)
     -> int {
+    size_t ignored_agf_offset = 0;
+    if (agf_sector_offset(mount, &ignored_agf_offset) != 0) {
+        return -EIO;
+    }
     if (req.agbno == NULLAGBLOCK || req.agbno <= XFS_AG_RESERVED_MAX) {
         return -ENOSPC;
     }
@@ -243,7 +283,10 @@ auto alloc_ag_by_hint(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     }
 
     pag->agf_freeblks -= alloc_len;
-    log_agf_free_space_roots(mount, tp, agno);
+    int const LOG_RC = log_agf_free_space_roots(mount, tp, agno);
+    if (LOG_RC != 0) {
+        return LOG_RC;
+    }
 
     result->agno = agno;
     result->agbno = req.agbno;
@@ -253,6 +296,11 @@ auto alloc_ag_by_hint(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
 
 auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, const XfsAllocReq& req, XfsAllocResult* result)
     -> int {
+    size_t agf_offset = 0;
+    if (agf_sector_offset(mount, &agf_offset) != 0) {
+        return -EIO;
+    }
+
     XfsPerAG* pag = &mount->per_ag[agno];
 
     // Quick check: does this AG have enough free blocks?
@@ -394,8 +442,7 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     uint64_t const AG_START_BLOCK = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
     BufHead* agf_bh = xfs_buf_read(mount, AG_START_BLOCK);
     if (agf_bh != nullptr) {
-        size_t const AGF_OFFSET = mount->sect_size;
-        auto* agf = reinterpret_cast<XfsAgf*>(agf_bh->data + AGF_OFFSET);
+        auto* agf = reinterpret_cast<XfsAgf*>(agf_bh->data + agf_offset);
         agf->agf_freeblks = Be32::from_cpu(pag->agf_freeblks);
         agf->agf_bno_root = Be32::from_cpu(pag->agf_bno_root);
         agf->agf_cnt_root = Be32::from_cpu(pag->agf_cnt_root);
@@ -406,7 +453,7 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
         uint32_t crc = util::crc32c_block_with_cksum(agf, mount->sect_size, XFS_AGF_CRC_OFF);
         __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
         // ---- 5. Log the AGF buffer ----
-        xfs_trans_log_buf(tp, agf_bh, static_cast<uint32_t>(AGF_OFFSET), static_cast<uint32_t>(sizeof(XfsAgf)));
+        xfs_trans_log_buf(tp, agf_bh, static_cast<uint32_t>(agf_offset), static_cast<uint32_t>(sizeof(XfsAgf)));
         brelse(agf_bh);
     }
 
@@ -419,16 +466,20 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     return 0;
 }
 
-void log_agf_free_space_roots(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) {
+auto log_agf_free_space_roots(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) -> int {
+    size_t agf_offset = 0;
+    if (agf_sector_offset(mount, &agf_offset) != 0) {
+        return -EIO;
+    }
+
     XfsPerAG const* pag = &mount->per_ag[agno];
     uint64_t const AG_START_BLOCK = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
     BufHead* agf_bh = xfs_buf_read(mount, AG_START_BLOCK);
     if (agf_bh == nullptr) {
-        return;
+        return -EIO;
     }
 
-    size_t const AGF_OFFSET = mount->sect_size;
-    auto* agf = reinterpret_cast<XfsAgf*>(agf_bh->data + AGF_OFFSET);
+    auto* agf = reinterpret_cast<XfsAgf*>(agf_bh->data + agf_offset);
     agf->agf_freeblks = Be32::from_cpu(pag->agf_freeblks);
     agf->agf_bno_root = Be32::from_cpu(pag->agf_bno_root);
     agf->agf_cnt_root = Be32::from_cpu(pag->agf_cnt_root);
@@ -437,8 +488,9 @@ void log_agf_free_space_roots(XfsMountContext* mount, XfsTransaction* tp, xfs_ag
     agf->agf_crc = Be32{0};
     uint32_t crc = util::crc32c_block_with_cksum(agf, mount->sect_size, XFS_AGF_CRC_OFF);
     __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
-    xfs_trans_log_buf(tp, agf_bh, static_cast<uint32_t>(AGF_OFFSET), static_cast<uint32_t>(sizeof(XfsAgf)));
+    xfs_trans_log_buf(tp, agf_bh, static_cast<uint32_t>(agf_offset), static_cast<uint32_t>(sizeof(XfsAgf)));
     brelse(agf_bh);
+    return 0;
 }
 
 auto delete_free_extent_record(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agblock_t startblock,
@@ -621,7 +673,10 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
     // Update AGF free block count and possibly new btree roots
     pag->agf_freeblks += len;
 
-    log_agf_free_space_roots(mount, tp, agno);
+    int const LOG_RC = log_agf_free_space_roots(mount, tp, agno);
+    if (LOG_RC != 0) {
+        return LOG_RC;
+    }
 
 #ifdef XFS_DEBUG
     mod::dbg::log("[xfs free] freed AG %u block %u len %u (merged to block %u len %u)\n", agno, agbno, len, merged_start, merged_len);
@@ -645,17 +700,22 @@ namespace {
 
 // Write the updated AGF fields (flfirst, fllast, flcount) back to the on-disk
 // AGF and log the buffer.  Recomputes the AGF CRC.
-void log_agf_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, BufHead* ag0_bh) {
+auto log_agf_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, BufHead* ag0_bh) -> int {
+    size_t agf_off = 0;
+    if (agf_sector_offset(mount, &agf_off) != 0) {
+        return -EIO;
+    }
+
     XfsPerAG const* pag = &mount->per_ag[agno];
-    size_t const AGF_OFF = mount->sect_size;
-    auto* agf = reinterpret_cast<XfsAgf*>(ag0_bh->data + AGF_OFF);
+    auto* agf = reinterpret_cast<XfsAgf*>(ag0_bh->data + agf_off);
     agf->agf_flfirst = Be32::from_cpu(pag->agf_flfirst);
     agf->agf_fllast = Be32::from_cpu(pag->agf_fllast);
     agf->agf_flcount = Be32::from_cpu(pag->agf_flcount);
     agf->agf_crc = Be32{0};
     uint32_t crc = util::crc32c_block_with_cksum(agf, mount->sect_size, XFS_AGF_CRC_OFF);
     __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
-    xfs_trans_log_buf(tp, ag0_bh, static_cast<uint32_t>(AGF_OFF), static_cast<uint32_t>(sizeof(XfsAgf)));
+    xfs_trans_log_buf(tp, ag0_bh, static_cast<uint32_t>(agf_off), static_cast<uint32_t>(sizeof(XfsAgf)));
+    return 0;
 }
 
 }  // anonymous namespace
@@ -669,6 +729,10 @@ auto xfs_alloc_get_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
     if (pag->agf_flcount == 0) {
         return -ENOSPC;
     }
+    size_t agfl_off = 0;
+    if (agfl_sector_offset(mount, &agfl_off) != 0 || xfs_agfl_size(mount) == 0) {
+        return -EIO;
+    }
 
     uint64_t const AG0 = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
     BufHead* bh = xfs_buf_read(mount, AG0);
@@ -676,8 +740,7 @@ auto xfs_alloc_get_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
         return -EIO;
     }
 
-    size_t const AGFL_OFF = static_cast<size_t>(mount->sect_size) * 3UL;
-    auto* agfl = reinterpret_cast<XfsAgfl*>(bh->data + AGFL_OFF);
+    auto* agfl = reinterpret_cast<XfsAgfl*>(bh->data + agfl_off);
     if (agfl->agfl_magicnum.to_cpu() != XFS_AGFL_MAGIC) {
         brelse(bh);
         return -EIO;
@@ -702,8 +765,11 @@ auto xfs_alloc_get_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
 
     if (pag->agf_flcount == 0) {
         // All slots were corrupt or the list was already empty.
-        log_agf_freelist(mount, tp, agno, bh);
+        int const LOG_RC = log_agf_freelist(mount, tp, agno, bh);
         brelse(bh);
+        if (LOG_RC != 0) {
+            return LOG_RC;
+        }
         return -ENOSPC;
     }
 
@@ -712,8 +778,11 @@ auto xfs_alloc_get_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
     pag->agf_flfirst = (pag->agf_flfirst + 1) % AGFL_SZ;
     pag->agf_flcount--;
 
-    log_agf_freelist(mount, tp, agno, bh);
+    int const LOG_RC = log_agf_freelist(mount, tp, agno, bh);
     brelse(bh);
+    if (LOG_RC != 0) {
+        return LOG_RC;
+    }
     return 0;
 }
 
@@ -732,6 +801,10 @@ auto xfs_alloc_put_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
     }
 
     XfsPerAG* pag = &mount->per_ag[agno];
+    size_t agfl_off = 0;
+    if (agfl_sector_offset(mount, &agfl_off) != 0 || xfs_agfl_size(mount) == 0) {
+        return -EIO;
+    }
 
     // If the AGFL is full, fall back to returning the block to the free space
     // trees.  This path is safe: xfs_alloc_put_freelist is only called from
@@ -747,8 +820,7 @@ auto xfs_alloc_put_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
         return -EIO;
     }
 
-    size_t const AGFL_OFF2 = static_cast<size_t>(mount->sect_size) * 3UL;
-    auto* agfl = reinterpret_cast<XfsAgfl*>(bh->data + AGFL_OFF2);
+    auto* agfl = reinterpret_cast<XfsAgfl*>(bh->data + agfl_off);
     if (agfl->agfl_magicnum.to_cpu() != XFS_AGFL_MAGIC) {
         brelse(bh);
         return xfs_free_extent(mount, tp, agno, bno, 1);
@@ -768,12 +840,15 @@ auto xfs_alloc_put_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
     pag->agf_flcount++;
 
     // Log the modified slot in the AGFL sector.
-    size_t const SLOT_OFF = AGFL_OFF2 + sizeof(XfsAgfl) + (static_cast<size_t>(pag->agf_fllast) * sizeof(uint32_t));
+    size_t const SLOT_OFF = agfl_off + sizeof(XfsAgfl) + (static_cast<size_t>(pag->agf_fllast) * sizeof(uint32_t));
     xfs_trans_log_buf(tp, bh, static_cast<uint32_t>(SLOT_OFF), static_cast<uint32_t>(sizeof(uint32_t)));
 
     // Also update and log the AGF (fllast, flcount changed).
-    log_agf_freelist(mount, tp, agno, bh);
+    int const LOG_RC = log_agf_freelist(mount, tp, agno, bh);
     brelse(bh);
+    if (LOG_RC != 0) {
+        return LOG_RC;
+    }
     return 0;
 }
 

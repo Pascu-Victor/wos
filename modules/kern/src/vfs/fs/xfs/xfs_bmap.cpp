@@ -1437,6 +1437,59 @@ auto bmap_selftest_read(ker::dev::BlockDevice* dev, uint64_t /*block*/, size_t c
 
 auto bmap_selftest_write(ker::dev::BlockDevice* /*dev*/, uint64_t /*block*/, size_t /*count*/, const void* /*buffer*/) -> int { return 0; }
 
+auto bmap_selftest_init_ag0(XfsMountContext* mount) -> bool {
+    if (mount == nullptr || mount->per_ag == nullptr || mount->sect_size == 0 ||
+        mount->block_size < (static_cast<uint32_t>(mount->sect_size) * 4U) || mount->sect_size < sizeof(XfsAgf) ||
+        mount->sect_size < sizeof(XfsAgfl) + sizeof(Be32)) {
+        return false;
+    }
+
+    BufHead* ag0 = xfs_buf_get(mount, xfs_agbno_to_fsbno(0, 0, mount->ag_blk_log));
+    if (ag0 == nullptr) {
+        return false;
+    }
+    __builtin_memset(ag0->data, 0, ag0->size);
+
+    XfsPerAG const& pag = mount->per_ag[0];
+    auto* agf = reinterpret_cast<XfsAgf*>(ag0->data + mount->sect_size);
+    agf->agf_magicnum = Be32::from_cpu(XFS_AGF_MAGIC);
+    agf->agf_versionnum = Be32::from_cpu(1);
+    agf->agf_seqno = Be32::from_cpu(0);
+    agf->agf_length = Be32::from_cpu(pag.agf_length);
+    agf->agf_bno_root = Be32::from_cpu(pag.agf_bno_root);
+    agf->agf_cnt_root = Be32::from_cpu(pag.agf_cnt_root);
+    agf->agf_bno_level = Be32::from_cpu(pag.agf_bno_level);
+    agf->agf_cnt_level = Be32::from_cpu(pag.agf_cnt_level);
+    agf->agf_flfirst = Be32::from_cpu(pag.agf_flfirst);
+    agf->agf_fllast = Be32::from_cpu(pag.agf_fllast);
+    agf->agf_flcount = Be32::from_cpu(pag.agf_flcount);
+    agf->agf_freeblks = Be32::from_cpu(pag.agf_freeblks);
+    agf->agf_longest = Be32::from_cpu(pag.agf_longest);
+    agf->agf_uuid = mount->uuid;
+    agf->agf_crc = Be32{0};
+    uint32_t agf_crc = util::crc32c_block_with_cksum(agf, mount->sect_size, XFS_AGF_CRC_OFF);
+    __builtin_memcpy(&agf->agf_crc, &agf_crc, sizeof(agf_crc));
+
+    auto* agfl = reinterpret_cast<XfsAgfl*>(ag0->data + (static_cast<size_t>(mount->sect_size) * 3UL));
+    agfl->agfl_magicnum = Be32::from_cpu(XFS_AGFL_MAGIC);
+    agfl->agfl_seqno = Be32::from_cpu(0);
+    agfl->agfl_uuid = mount->uuid;
+    auto* agfl_bno = reinterpret_cast<Be32*>(reinterpret_cast<uint8_t*>(agfl) + sizeof(XfsAgfl));
+    uint32_t const AGFL_SIZE = xfs_agfl_size(mount);
+    for (uint32_t i = 0; i < AGFL_SIZE; i++) {
+        agfl_bno[i] = Be32::from_cpu(NULLAGBLOCK);
+    }
+    for (uint32_t i = 0; i < pag.agf_flcount && i < AGFL_SIZE; i++) {
+        agfl_bno[i] = Be32::from_cpu(static_cast<xfs_agblock_t>(50 + i));
+    }
+    agfl->agfl_crc = Be32{0};
+    uint32_t agfl_crc = util::crc32c_block_with_cksum(agfl, mount->sect_size, XFS_AGFL_CRC_OFF);
+    __builtin_memcpy(&agfl->agfl_crc, &agfl_crc, sizeof(agfl_crc));
+
+    brelse(ag0);
+    return true;
+}
+
 void bmap_selftest_init_free_root(XfsMountContext* mount, xfs_agblock_t root_agbno, uint32_t magic, xfs_agblock_t free_start,
                                   xfs_extlen_t free_len) {
     BufHead* root = xfs_buf_get(mount, xfs_agbno_to_fsbno(0, root_agbno, mount->ag_blk_log));
@@ -1562,38 +1615,47 @@ auto xfs_selftest_bmap_synthetic_btree_lookup() -> bool {
 
 auto xfs_selftest_bmap_extent_promotion() -> bool {
     ker::dev::BlockDevice dev{};
-    dev.block_size = 512;
-    dev.total_blocks = 4096;
+    constexpr uint32_t SELFTEST_BLOCK_SIZE = 1024;
+    constexpr uint32_t SELFTEST_SECTOR_SIZE = 256;
+    constexpr uint32_t SELFTEST_AG_BLOCKS = 4096;
+    dev.block_size = SELFTEST_SECTOR_SIZE;
+    dev.total_blocks = static_cast<uint64_t>(SELFTEST_AG_BLOCKS) * (SELFTEST_BLOCK_SIZE / SELFTEST_SECTOR_SIZE);
     dev.read_blocks = bmap_selftest_read;
     dev.write_blocks = bmap_selftest_write;
 
     XfsPerAG pag{};
     pag.agno = 0;
-    pag.agf_length = 4096;
+    pag.agf_length = SELFTEST_AG_BLOCKS;
     pag.agf_bno_root = 1;
     pag.agf_cnt_root = 2;
     pag.agf_bno_level = 1;
     pag.agf_cnt_level = 1;
     pag.agf_freeblks = 256;
     pag.agf_longest = 256;
+    pag.agf_flfirst = 0;
+    pag.agf_fllast = 3;
     pag.agf_flcount = 4;
 
     XfsMountContext mount{};
     mount.device = &dev;
-    mount.block_size = 512;
-    mount.block_log = 9;
-    mount.total_blocks = 4096;
+    mount.block_size = SELFTEST_BLOCK_SIZE;
+    mount.block_log = 10;
+    mount.total_blocks = SELFTEST_AG_BLOCKS;
     mount.inode_size = 512;
     mount.inodes_per_block = 1;
     mount.inopb_log = 0;
     mount.ag_count = 1;
-    mount.ag_blocks = 4096;
+    mount.ag_blocks = SELFTEST_AG_BLOCKS;
     mount.ag_blk_log = 12;
     mount.agino_log = 12;
-    mount.sect_size = 512;
-    mount.sect_log = 9;
+    mount.sect_size = SELFTEST_SECTOR_SIZE;
+    mount.sect_log = 8;
     mount.per_ag = &pag;
 
+    if (!bmap_selftest_init_ag0(&mount)) {
+        invalidate_bdev(&dev);
+        return false;
+    }
     bmap_selftest_init_free_root(&mount, pag.agf_bno_root, XFS_ABTB_CRC_MAGIC, 100, 256);
     bmap_selftest_init_free_root(&mount, pag.agf_cnt_root, XFS_ABTC_CRC_MAGIC, 100, 256);
 
