@@ -483,6 +483,7 @@ inline auto effective_process_group_id(const task::Task& task) -> uint64_t { ret
 inline constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
 inline constexpr int WOS_WSTOPPED = 2;
 inline constexpr int STOP_STATUS_LOW = 0x7f;
+inline constexpr uint64_t SIGCHLD_MASK = 1ULL << (17 - 1);
 
 inline auto job_control_stop_status(const task::Task& task) -> int32_t {
     uint32_t const SIGNAL = task.jobctl_stop_signal != 0 ? task.jobctl_stop_signal : 19;
@@ -555,6 +556,20 @@ inline auto waitpid_child_is_waitable_exit(const task::Task* child) -> bool {
     return child != nullptr && child->exit_notify_ready.load(std::memory_order_acquire) && child->has_exited;
 }
 
+inline auto registered_waitpid_matches_child(const task::Task* waiter, const task::Task* child) -> bool {
+    if (waiter == nullptr || child == nullptr || child->is_thread || waiter->waiting_for_pid == 0) {
+        return false;
+    }
+    if (waiter->waiting_for_pid == child->pid) {
+        return true;
+    }
+    return waiter->waiting_for_pid == WAIT_ANY_CHILD && waitpid_child_matches_waiter(waiter, child);
+}
+
+__attribute__((no_sanitize("address"))) auto pid_table_find_lifetime_ref(uint64_t pid) -> task::Task*;
+inline auto waitpid_has_registered_unwaited_child(task::Task* waiter) -> bool;
+inline auto waitpid_specific_target_registered(task::Task* waiter, uint64_t pid) -> bool;
+
 inline void clear_waitpid_output_addrs(task::Task* waiter) {
     if (waiter == nullptr) {
         return;
@@ -608,6 +623,23 @@ inline void finish_waitpid_scheduler_result(task::Task* waiter) {
 
 inline auto complete_waitpid_exit_for_scheduler(task::Task* waiter, task::Task* child, const char* path) -> bool {
     if (!waitpid_child_is_unwaited(waiter, child) || !waitpid_child_is_waitable_exit(child)) {
+        return false;
+    }
+    if (!task::task_try_mark_waited_on(*child)) {
+        return false;
+    }
+    task::task_accumulate_waited_child_times(*waiter, *child);
+    waiter->context.regs.rax = child->pid;
+    validate_wait_resume_mapping(waiter, child, path);
+    write_waitpid_status(waiter, child->exit_status);
+    fill_waitpid_rusage(waiter, child);
+    clear_waitpid_output_addrs(waiter);
+    finish_waitpid_scheduler_result(waiter);
+    return true;
+}
+
+inline auto complete_registered_waitpid_exit_for_scheduler(task::Task* waiter, task::Task* child, const char* path) -> bool {
+    if (!registered_waitpid_matches_child(waiter, child) || task::task_waited_on(*child) || !waitpid_child_is_waitable_exit(child)) {
         return false;
     }
     if (!task::task_try_mark_waited_on(*child)) {
@@ -710,7 +742,7 @@ inline auto complete_waitpid_any_for_scheduler(task::Task* waiter) -> bool {
         }
     }
 
-    if (!waitpid_has_unwaited_child_for_scheduler(waiter)) {
+    if (!waitpid_has_unwaited_child_for_scheduler(waiter) && !waitpid_has_registered_unwaited_child(waiter)) {
         waiter->context.regs.rax = static_cast<uint64_t>(-ECHILD);
         clear_waitpid_output_addrs(waiter);
         finish_waitpid_scheduler_result(waiter);
@@ -733,6 +765,10 @@ inline auto complete_waitpid_specific_for_scheduler(task::Task* waiter) -> bool 
     };
 
     if (auto* target = find_task_by_pid_safe(WAIT_TARGET); target != nullptr) {
+        if (complete_registered_waitpid_exit_for_scheduler(waiter, target, "wake-specific-registered-active")) {
+            target->release();
+            return true;
+        }
         if (!waitpid_child_matches_waiter(waiter, target) || task::task_waited_on(*target)) {
             target->release();
             return complete_missing_child();
@@ -740,6 +776,23 @@ inline auto complete_waitpid_specific_for_scheduler(task::Task* waiter) -> bool 
         if (complete_waitpid_ptrace_stop_for_scheduler(waiter, target) ||
             complete_waitpid_exit_for_scheduler(waiter, target, "wake-specific-active") ||
             complete_waitpid_job_stop_if_waitable(waiter, target)) {
+            target->release();
+            return true;
+        }
+        target->release();
+        return false;
+    }
+
+    if (auto* target = pid_table_find_lifetime_ref(WAIT_TARGET); target != nullptr) {
+        if (complete_registered_waitpid_exit_for_scheduler(waiter, target, "wake-specific-registered-lifetime")) {
+            target->release();
+            return true;
+        }
+        if (!waitpid_child_matches_waiter(waiter, target) || task::task_waited_on(*target)) {
+            target->release();
+            return complete_missing_child();
+        }
+        if (complete_waitpid_exit_for_scheduler(waiter, target, "wake-specific-lifetime")) {
             target->release();
             return true;
         }
@@ -761,7 +814,8 @@ inline auto complete_waitpid_specific_for_scheduler(task::Task* waiter) -> bool 
             }
 
             bool const MATCH = waitpid_child_matches_waiter(waiter, child);
-            bool const COMPLETED = complete_waitpid_exit_for_scheduler(waiter, child, "wake-specific-dead");
+            bool const COMPLETED = complete_registered_waitpid_exit_for_scheduler(waiter, child, "wake-specific-registered-dead") ||
+                                   complete_waitpid_exit_for_scheduler(waiter, child, "wake-specific-dead");
             bool const ALREADY_WAITED = task::task_waited_on(*child);
             child->release();
             if (COMPLETED) {
@@ -772,6 +826,10 @@ inline auto complete_waitpid_specific_for_scheduler(task::Task* waiter) -> bool 
             }
             return false;
         }
+    }
+
+    if (waitpid_specific_target_registered(waiter, WAIT_TARGET)) {
+        return false;
     }
 
     return complete_missing_child();
@@ -814,6 +872,56 @@ inline auto complete_or_preserve_waitpid_block(task::Task* waiter) -> bool {
         return complete_waitpid_any_for_scheduler(waiter);
     }
     return complete_waitpid_specific_for_scheduler(waiter);
+}
+
+inline void complete_parent_waitpid_after_dead_enqueue(task::Task* child) {
+    if (child == nullptr || child->is_thread) {
+        return;
+    }
+
+    auto try_complete_waiter = [child](task::Task* waiter, const char* path) -> bool {
+        if (waiter == nullptr || waiter->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE ||
+            waiter->sched_queue != task::Task::sched_queue::WAITING || waiter->deferred_task_switch ||
+            !waiter->wait_channel_is(task::WaitChannelKind::WAITPID) || waiter->waiting_for_pid == 0 ||
+            !registered_waitpid_matches_child(waiter, child)) {
+            return false;
+        }
+
+        if (!complete_registered_waitpid_exit_for_scheduler(waiter, child, path)) {
+            return false;
+        }
+
+        uint64_t target_cpu = waiter->cpu;
+        if (target_cpu >= smt::get_core_count()) {
+            target_cpu = get_least_loaded_cpu();
+        }
+        reschedule_task_for_cpu(target_cpu, waiter);
+        return true;
+    };
+
+    if (child->parent_pid != 0) {
+        auto* parent = find_task_by_pid_safe(child->parent_pid);
+        if (parent != nullptr) {
+            bool const COMPLETED = try_complete_waiter(parent, "dead-list-parent-waitpid");
+            parent->release();
+            if (COMPLETED) {
+                return;
+            }
+        }
+    }
+
+    uint32_t const ACTIVE_COUNT = get_active_task_count();
+    for (uint32_t i = 0; i < ACTIVE_COUNT; ++i) {
+        auto* waiter = get_active_task_at_safe(i);
+        if (waiter == nullptr) {
+            continue;
+        }
+        bool const COMPLETED = try_complete_waiter(waiter, "dead-list-registered-waitpid");
+        waiter->release();
+        if (COMPLETED) {
+            return;
+        }
+    }
 }
 
 inline void unlink_specific_waitpid_waiter(task::Task* waiter) {
@@ -999,6 +1107,49 @@ auto pid_table_insert(task::Task* t) -> bool {
     return false;  // Table full - MAX_PIDS concurrent processes exceeded
 }
 
+inline auto waitpid_has_registered_unwaited_child(task::Task* waiter) -> bool {
+    if (waiter == nullptr) {
+        return false;
+    }
+
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    for (uint32_t i = 0; i < active_task_count; ++i) {
+        auto* child = active_task_slot(i);
+        if (waitpid_child_is_unwaited(waiter, child)) {
+            global_task_registry_lock.unlock_irqrestore(FLAGS);
+            return true;
+        }
+    }
+    global_task_registry_lock.unlock_irqrestore(FLAGS);
+    return false;
+}
+
+inline auto waitpid_specific_target_registered(task::Task* waiter, uint64_t pid) -> bool {
+    if (waiter == nullptr || pid == 0) {
+        return false;
+    }
+
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    uint32_t const SLOT = pid_hash(pid);
+    for (uint32_t i = 0; i < MAX_PIDS; i++) {
+        uint32_t const IDX = (SLOT + i) & (MAX_PIDS - 1);
+        auto& entry = pid_slot(IDX);
+        if (entry.pid == 0) {
+            global_task_registry_lock.unlock_irqrestore(FLAGS);
+            return false;
+        }
+        if (entry.pid != pid) {
+            continue;
+        }
+
+        bool const PRESENT = waitpid_child_is_unwaited(waiter, entry.task);
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        return PRESENT;
+    }
+    global_task_registry_lock.unlock_irqrestore(FLAGS);
+    return false;
+}
+
 __attribute__((no_sanitize("address"))) auto pid_table_find_internal(uint64_t pid, bool acquire) -> task::Task* {
     if (pid == 0) {
         return nullptr;
@@ -1028,6 +1179,32 @@ __attribute__((no_sanitize("address"))) auto pid_table_find_internal(uint64_t pi
 }
 
 __attribute__((no_sanitize("address"))) auto pid_table_find(uint64_t pid) -> task::Task* { return pid_table_find_internal(pid, false); }
+
+__attribute__((no_sanitize("address"))) auto pid_table_find_lifetime_ref(uint64_t pid) -> task::Task* {
+    if (pid == 0) {
+        return nullptr;
+    }
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    uint32_t const SLOT = pid_hash(pid);
+    for (uint32_t i = 0; i < MAX_PIDS; i++) {
+        uint32_t const IDX = (SLOT + i) & (MAX_PIDS - 1);
+        auto& entry = pid_slot(IDX);
+        if (entry.pid == 0) {
+            global_task_registry_lock.unlock_irqrestore(FLAGS);
+            return nullptr;
+        }
+        if (entry.pid == pid) {
+            task::Task* t = entry.task;
+            if (t != nullptr && !t->try_acquire_lifetime_ref()) {
+                t = nullptr;
+            }
+            global_task_registry_lock.unlock_irqrestore(FLAGS);
+            return t;
+        }
+    }
+    global_task_registry_lock.unlock_irqrestore(FLAGS);
+    return nullptr;
+}
 
 void pid_table_remove(uint64_t pid) {
     if (pid == 0) {
@@ -3030,13 +3207,16 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
     // like ping can wake from a blocking recvfrom().
     PendingWakeList signal_wake{};
     PendingWakeList futex_timeout_cleanup{};
+    PendingWakeList waitpid_repair{};
     uint32_t signal_wake_count = 0;
     uint32_t futex_timeout_cleanup_count = 0;
+    uint32_t waitpid_repair_count = 0;
     {
         uint64_t const NOW_US = time::get_us();
-        run_queues->this_cpu_locked_void([NOW_US, &signal_wake, &signal_wake_count, &futex_timeout_cleanup,
-                                          &futex_timeout_cleanup_count](RunQueue* rq) {
-            if (rq->next_wait_deadline_us == 0 || NOW_US < rq->next_wait_deadline_us) {
+        run_queues->this_cpu_locked_void([NOW_US, &signal_wake, &signal_wake_count, &futex_timeout_cleanup, &futex_timeout_cleanup_count,
+                                          &waitpid_repair, &waitpid_repair_count](RunQueue* rq) {
+            bool const TIMED_SCAN = rq->next_wait_deadline_us != 0 && NOW_US >= rq->next_wait_deadline_us;
+            if (!TIMED_SCAN && rq->wait_list.head == nullptr) {
                 return;
             }
 
@@ -3047,9 +3227,10 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             task::Task* t = rq->wait_list.head;
             while (t != nullptr && wake_count < PENDING_WAKE_LIMIT) {
                 scan_iterations++;
-                if (t->wake_at_us != 0 && NOW_US >= t->wake_at_us) {
+                if (TIMED_SCAN && t->wake_at_us != 0 && NOW_US >= t->wake_at_us) {
                     pending_wake_slot(to_wake, wake_count++) = t;
-                } else if (t->itimer_real_expire_us != 0 && NOW_US >= t->itimer_real_expire_us && signal_wake_count < PENDING_WAKE_LIMIT) {
+                } else if (TIMED_SCAN && t->itimer_real_expire_us != 0 && NOW_US >= t->itimer_real_expire_us &&
+                           signal_wake_count < PENDING_WAKE_LIMIT) {
                     t->sig_pending |= (1ULL << (14 - 1));  // SIGALRM = 14
                     if (t->itimer_real_interval_us != 0) {
                         t->itimer_real_expire_us = saturating_deadline_us(NOW_US, t->itimer_real_interval_us);
@@ -3057,6 +3238,10 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                         t->itimer_real_expire_us = 0;
                     }
                     pending_wake_slot(signal_wake, signal_wake_count++) = t;
+                }
+                if (waitpid_repair_count < PENDING_WAKE_LIMIT && t->wait_channel_is(task::WaitChannelKind::WAITPID) &&
+                    t->waiting_for_pid != 0 && (t->sig_pending & SIGCHLD_MASK) != 0 && t->try_acquire()) {
+                    pending_wake_slot(waitpid_repair, waitpid_repair_count++) = t;
                 }
                 t = t->sched_next;
             }
@@ -3103,6 +3288,15 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
     }
     for (uint32_t i = 0; i < futex_timeout_cleanup_count; ++i) {
         ker::syscall::futex::futex_wait_cleanup_for_task(pending_wake_slot(futex_timeout_cleanup, i));
+    }
+    for (uint32_t i = 0; i < waitpid_repair_count; ++i) {
+        task::Task* waiter = pending_wake_slot(waitpid_repair, i);
+        uint64_t target_cpu = waiter->cpu;
+        if (target_cpu >= smt::get_core_count()) {
+            target_cpu = get_least_loaded_cpu();
+        }
+        reschedule_task_for_cpu(target_cpu, waiter);
+        waiter->release();
     }
     for (uint32_t i = 0; i < signal_wake_count; ++i) {
         wake_task_for_signal(pending_wake_slot(signal_wake, i));
@@ -3999,6 +4193,11 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         }
     }
 
+    if (!skip_wait_queue && is_waitpid_wait_channel(current_task->wait_channel_kind) && current_task->waiting_for_pid != 0) {
+        (void)current_task->wakeup_pending.exchange(false, std::memory_order_acquire);
+        skip_wait_queue = complete_or_preserve_waitpid_block(current_task);
+    }
+
     bool notify_wki_proxy_blocked = false;
     task::Task* futex_abort_cleanup_task = nullptr;
 
@@ -4744,7 +4943,7 @@ auto get_dead_task_at_safe(uint64_t cpu_no, size_t index) -> task::Task* {
             if (cur_index != index) {
                 continue;
             }
-            if (!cur->try_acquire()) {
+            if (!cur->try_acquire_lifetime_ref()) {
                 return nullptr;
             }
             return cur;
@@ -4981,6 +5180,7 @@ void insert_into_dead_list(task::Task* task) {
 
     task->sched_queue = task::Task::sched_queue::DEAD_GC;
     run_queues->with_lock_void(0, [task](RunQueue* rq) { rq->dead_list.push(task); });
+    complete_parent_waitpid_after_dead_enqueue(task);
 }
 
 namespace {

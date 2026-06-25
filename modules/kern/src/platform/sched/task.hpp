@@ -549,6 +549,19 @@ struct Task {
         return false;
     }
 
+    // Acquire a lifetime reference while the caller already owns a registry or
+    // dead-list lock. Unlike try_acquire(), this intentionally allows EXITING
+    // and DEAD tasks so waitpid can consume zombies before scheduler GC.
+    bool try_acquire_lifetime_ref() {
+        uint32_t count = ref_count.load(std::memory_order_acquire);
+        while (count > 0) {
+            if (ref_count.compare_exchange_weak(count, count + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Release a reference to this task
     void release() { ref_count.fetch_sub(1, std::memory_order_acq_rel); }
 

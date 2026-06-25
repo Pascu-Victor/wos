@@ -167,6 +167,11 @@ auto waiter_context_can_be_completed(ker::mod::sched::task::Task* waiter) -> boo
            waiter->wait_channel_is(ker::mod::sched::task::WaitChannelKind::WAITPID);
 }
 
+auto waiter_has_stranded_specific_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) -> bool {
+    return waiter != nullptr && child != nullptr && waiter->waiting_for_pid == child->pid &&
+           waiter->wait_channel_is(ker::mod::sched::task::WaitChannelKind::WAITPID);
+}
+
 auto drain_exit_waiters_for_notify(ker::mod::sched::task::Task* exiting, ExitWaiterBatch& waiting_pids) -> size_t {
     if (exiting == nullptr) {
         return 0;
@@ -216,7 +221,9 @@ void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
     bool wake_parent = false;
     if (waiter_is_blocked_on_different_waitpid_child(parent, child)) {
         wake_parent = false;
-    } else if (!sched_task::task_waited_on(*child)) {
+    } else if (sched_task::task_waited_on(*child)) {
+        wake_parent = waiter_has_stranded_specific_wait(parent, child);
+    } else {
         if (waiter_matches_child(parent, child) && waiter_context_can_be_completed(parent)) {
             wake_parent =
                 complete_exit_wait(parent, child, parent->waiting_for_pid == WAIT_ANY_CHILD ? "exit-any" : "exit-specific-parent");
