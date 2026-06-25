@@ -63,8 +63,6 @@ constexpr size_t XFS_BUFFERED_WRITE_BATCH_MAX_BYTES = size_t{4} * 1024 * 1024;
 constexpr size_t XFS_DIRTY_THROTTLE_INTERVAL_BYTES = size_t{4} * 1024 * 1024;
 constexpr size_t XFS_STREAM_PREALLOC_TRIGGER_BYTES = size_t{512} * 1024;
 constexpr xfs_extlen_t XFS_STREAM_PREALLOC_BLOCKS = 1024;  // 4 MiB
-constexpr size_t XFS_APPEND_PREALLOC_TRIGGER_BYTES = size_t{16} * 1024;
-constexpr xfs_extlen_t XFS_APPEND_PREALLOC_BLOCKS = 16;  // 64 KiB
 constexpr uint32_t XFS_STREAM_PREALLOC_EXTENT_MARGIN = 8;
 constexpr size_t XFS_PARENT_PATH_CACHE_PATH_MAX = 512;
 constexpr size_t XFS_PARENT_PATH_CACHE_SET_COUNT = 1024;
@@ -226,13 +224,11 @@ auto xfs_has_inline_extent_pressure(const XfsInode* ip) -> bool {
 }
 
 auto xfs_hole_write_alloc_blocks(size_t write_pos, size_t block_off, size_t remaining_bytes, xfs_filblks_t hole_blocks, size_t block_size,
-                                 uint32_t block_log, bool extent_pressure, bool sequential_append) -> xfs_extlen_t {
+                                 uint32_t block_log, bool extent_pressure, bool /*sequential_append*/) -> xfs_extlen_t {
     size_t const BLOCKS_NEEDED = (block_off + remaining_bytes + block_size - 1) >> block_log;
     auto desired_blocks = static_cast<xfs_filblks_t>(BLOCKS_NEEDED);
     if ((write_pos >= XFS_STREAM_PREALLOC_TRIGGER_BYTES || extent_pressure) && hole_blocks > desired_blocks) {
         desired_blocks = std::max(desired_blocks, static_cast<xfs_filblks_t>(XFS_STREAM_PREALLOC_BLOCKS));
-    } else if (sequential_append && write_pos >= XFS_APPEND_PREALLOC_TRIGGER_BYTES && hole_blocks > desired_blocks) {
-        desired_blocks = std::max(desired_blocks, static_cast<xfs_filblks_t>(XFS_APPEND_PREALLOC_BLOCKS));
     }
     auto alloc_blocks = static_cast<xfs_extlen_t>(std::min(hole_blocks, desired_blocks));
     alloc_blocks = std::min(alloc_blocks, XFS_WRITE_BATCH_BLOCKS);

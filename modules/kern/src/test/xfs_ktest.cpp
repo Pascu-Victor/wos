@@ -81,15 +81,18 @@ KTEST(XFS, SmallHoleWriteAllocatesOnlyNeededBlocks) {
                static_cast<ker::vfs::xfs::xfs_extlen_t>(2));
 }
 
-KTEST(XFS, SequentialAppendPreallocatesModestRun) {
+KTEST(XFS, SequentialAppendDefersSpeculativePreallocUntilStream) {
     constexpr size_t BLOCK_SIZE = 4096;
     constexpr uint32_t BLOCK_LOG = 12;
-    constexpr size_t APPEND_POS = size_t{16} * 1024;
+    constexpr size_t SMALL_APPEND_POS = size_t{16} * 1024;
+    constexpr size_t STREAM_APPEND_POS = size_t{512} * 1024;
     constexpr ker::vfs::xfs::xfs_filblks_t UNBOUNDED_HOLE = ~static_cast<ker::vfs::xfs::xfs_filblks_t>(0);
 
-    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(0, 4096, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG, APPEND_POS, true),
-               static_cast<ker::vfs::xfs::xfs_extlen_t>(16));
-    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(0, 4096, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG, APPEND_POS, false),
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(0, 4096, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG, SMALL_APPEND_POS, true),
+               static_cast<ker::vfs::xfs::xfs_extlen_t>(1));
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(0, 4096, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG, STREAM_APPEND_POS, true),
+               static_cast<ker::vfs::xfs::xfs_extlen_t>(1024));
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(0, 4096, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG, SMALL_APPEND_POS, false),
                static_cast<ker::vfs::xfs::xfs_extlen_t>(1));
 }
 
