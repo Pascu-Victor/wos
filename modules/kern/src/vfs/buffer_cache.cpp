@@ -217,6 +217,8 @@ bool cache_initialized = false;
 constexpr size_t DIRTY_HARD_LIMIT_TARGET_MULTIPLIER = 2;
 constexpr size_t DIRTY_WRITEBACK_BUDGET = 128;
 constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = DIRTY_WRITEBACK_BUDGET;
+constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BUFFERS = 128;
+constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BYTES = size_t{256} * 1024;
 constexpr size_t DIRTY_WAKE_BATCH = 32;
 constexpr size_t DIRTY_TARGET_DIVISOR = 2;
 constexpr size_t DIRTY_THROTTLE_RESUME_NUMERATOR = 3;
@@ -245,11 +247,23 @@ struct DirtyWritebackResult {
     bool busy{};
     int status{};
     uint64_t dirty_epoch{};
+    size_t buffers{};
 };
 
 struct DirtyWakeList {
     std::array<uint64_t, DIRTY_WAKE_BATCH> pids{};
     size_t count{};
+};
+
+struct DirtyWritebackRun {
+    std::array<BufHead*, DIRTY_WRITEBACK_RUN_MAX_BUFFERS> buffers{};
+    std::array<uint64_t, DIRTY_WRITEBACK_RUN_MAX_BUFFERS> dirty_epochs{};
+    dev::BlockDevice* bdev{};
+    uint64_t block_no{};
+    size_t block_count{};
+    size_t bytes{};
+    size_t count{};
+    uint64_t writeback_epoch{};
 };
 
 ker::util::SmallVec<DirtyBdevState*, 8> dirty_bdev_states;
@@ -514,16 +528,20 @@ auto read_block_from_disk(BufHead* bh) -> int {
     return RC;
 }
 
+auto write_blocks_to_disk(dev::BlockDevice* bdev, uint64_t block_no, size_t block_count, const uint8_t* data, size_t bytes) -> int {
+    uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISK_WRITE);
+    int const RC = dev::block_write(bdev, block_no, block_count, data);
+    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISK_WRITE, STARTED_US, RC, bytes);
+    return RC;
+}
+
 // Write a stable buffer-data snapshot to disk.
 auto write_block_to_disk(BufHead* bh, const uint8_t* data) -> int {
     size_t block_count = bh->size / bh->bdev->block_size;
     if (block_count == 0) {
         block_count = 1;
     }
-    uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISK_WRITE);
-    int const RC = dev::block_write(bh->bdev, bh->block_no, block_count, data);
-    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISK_WRITE, STARTED_US, RC, bh->size);
-    return RC;
+    return write_blocks_to_disk(bh->bdev, bh->block_no, block_count, data, bh->size);
 }
 
 auto buffer_block_count(const BufHead* bh) -> size_t {
@@ -1174,34 +1192,146 @@ auto write_buffer_snapshot_for_epoch(BufHead* bh, uint64_t writeback_dirty_epoch
     return RC;
 }
 
-auto writeback_dirty_one_after(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive, uint64_t max_epoch_inclusive = UINT64_MAX)
-    -> DirtyWritebackResult {
-    DirtyWritebackResult result{};
-    uint64_t const WRITEBACK_EPOCH = allocate_writeback_epoch();
-    uint64_t writeback_dirty_epoch = 0;
-    BufHead* bh = nullptr;
+auto dirty_writeback_run_can_append_locked(const DirtyWritebackRun& run, const BufHead* bh, const DirtyWritebackFilter& filter,
+                                           uint64_t min_epoch_exclusive, uint64_t max_epoch_inclusive) -> bool {
+    if (bh == nullptr || !dirty_filter_matches(bh, filter) || bh->dirty_epoch <= min_epoch_exclusive ||
+        bh->dirty_epoch > max_epoch_inclusive || (bh->flags & BH_WRITEBACK) != 0 || has_older_overlapping_dirty_buffer_locked(bh) ||
+        bh->bdev == nullptr || bh->bdev->block_size == 0 || bh->data == nullptr || bh->size == 0 ||
+        (bh->size % bh->bdev->block_size) != 0) {
+        return false;
+    }
 
-    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
-    bh = find_writeback_candidate_locked(filter, min_epoch_exclusive, max_epoch_inclusive);
+    size_t const BLOCK_COUNT = bh->size / bh->bdev->block_size;
+    if (BLOCK_COUNT == 0) {
+        return false;
+    }
+    if (run.count == 0) {
+        return true;
+    }
+    if (run.count >= run.buffers.size() || bh->bdev != run.bdev || run.block_count > UINT64_MAX - run.block_no) {
+        return false;
+    }
+    uint64_t const NEXT_BLOCK = run.block_no + static_cast<uint64_t>(run.block_count);
+    return bh->block_no == NEXT_BLOCK && run.bytes < DIRTY_WRITEBACK_RUN_MAX_BYTES &&
+           bh->size <= DIRTY_WRITEBACK_RUN_MAX_BYTES - run.bytes && run.block_count <= SIZE_MAX - BLOCK_COUNT;
+}
+
+void dirty_writeback_run_append_locked(DirtyWritebackRun& run, BufHead* bh, uint64_t writeback_epoch) {
+    if (run.count == 0) {
+        run.bdev = bh->bdev;
+        run.block_no = bh->block_no;
+        run.writeback_epoch = writeback_epoch;
+    }
+
+    size_t const BLOCK_COUNT = bh->size / bh->bdev->block_size;
+    mark_buffer_writeback(bh, writeback_epoch);
+    run.buffers.at(run.count) = bh;
+    run.dirty_epochs.at(run.count) = bh->writeback_dirty_epoch;
+    run.block_count += BLOCK_COUNT;
+    run.bytes += bh->size;
+    run.count++;
+    bh->refcount.fetch_add(1, std::memory_order_relaxed);
+}
+
+auto collect_dirty_writeback_run_locked(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive, uint64_t max_epoch_inclusive,
+                                        DirtyWritebackRun& run) -> DirtyWritebackResult {
+    DirtyWritebackResult result{};
+    BufHead* bh = find_writeback_candidate_locked(filter, min_epoch_exclusive, max_epoch_inclusive);
     if (bh == nullptr) {
-        cache_lock.unlock_irqrestore(IRQFLAGS);
         return result;
     }
     if ((bh->flags & BH_WRITEBACK) != 0) {
         result.busy = true;
-        cache_lock.unlock_irqrestore(IRQFLAGS);
         return result;
     }
 
-    mark_buffer_writeback(bh, WRITEBACK_EPOCH);
-    writeback_dirty_epoch = bh->writeback_dirty_epoch;
-    result.dirty_epoch = writeback_dirty_epoch;
-    bh->refcount.fetch_add(1, std::memory_order_relaxed);
+    uint64_t const WRITEBACK_EPOCH = allocate_writeback_epoch();
+    if (!dirty_writeback_run_can_append_locked(run, bh, filter, min_epoch_exclusive, max_epoch_inclusive)) {
+        return result;
+    }
+    dirty_writeback_run_append_locked(run, bh, WRITEBACK_EPOCH);
+
+    for (BufHead* next = bh->dirty_next; next != nullptr; next = next->dirty_next) {
+        if (!dirty_writeback_run_can_append_locked(run, next, filter, min_epoch_exclusive, max_epoch_inclusive)) {
+            break;
+        }
+        dirty_writeback_run_append_locked(run, next, WRITEBACK_EPOCH);
+    }
+
+    result.wrote = true;
+    result.buffers = run.count;
+    result.dirty_epoch = run.dirty_epochs.at(0);
+    return result;
+}
+
+auto make_writeback_run_snapshot(const DirtyWritebackRun& run) -> WritebackSnapshot {
+    WritebackSnapshot snapshot{};
+    snapshot.data = allocate_buffer_data(run.bytes, snapshot.flags);
+    if (snapshot.data == nullptr) {
+        return snapshot;
+    }
+
+    size_t offset = 0;
+    for (size_t i = 0; i < run.count; ++i) {
+        const BufHead* bh = run.buffers.at(i);
+        memcpy(snapshot.data + offset, bh->data, bh->size);
+        offset += bh->size;
+    }
+    return snapshot;
+}
+
+void finish_dirty_writeback_run(DirtyWritebackRun& run, int rc) {
+    DirtyWakeList wake_list{};
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    for (size_t i = 0; i < run.count; ++i) {
+        BufHead* bh = run.buffers.at(i);
+        if (bh == nullptr) {
+            continue;
+        }
+        if (rc == 0 && (bh->flags & BH_DIRTY) != 0 && bh->dirty_epoch == run.dirty_epochs.at(i)) {
+            clear_buffer_dirty_locked(bh);
+        }
+        if (owns_writeback_epoch(bh, run.writeback_epoch)) {
+            clear_buffer_writeback(bh);
+        }
+    }
+    if (rc == 0) {
+        collect_dirty_waiters_locked(wake_list);
+    }
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    wake_dirty_waiters(wake_list);
+}
+
+auto write_dirty_run_snapshot(DirtyWritebackRun& run) -> int {
+    WritebackSnapshot snapshot = make_writeback_run_snapshot(run);
+    if (snapshot.data == nullptr) {
+        finish_dirty_writeback_run(run, -ENOMEM);
+        return -ENOMEM;
+    }
+
+    int const RC = write_blocks_to_disk(run.bdev, run.block_no, run.block_count, snapshot.data, run.bytes);
+    free_writeback_snapshot(snapshot);
+    finish_dirty_writeback_run(run, RC);
+    return RC;
+}
+
+auto writeback_dirty_one_after(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive, uint64_t max_epoch_inclusive = UINT64_MAX)
+    -> DirtyWritebackResult {
+    DirtyWritebackRun run{};
+
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    DirtyWritebackResult result = collect_dirty_writeback_run_locked(filter, min_epoch_exclusive, max_epoch_inclusive, run);
     cache_lock.unlock_irqrestore(IRQFLAGS);
 
-    result.status = write_buffer_snapshot_for_epoch(bh, writeback_dirty_epoch, WRITEBACK_EPOCH);
-    result.wrote = true;
-    brelse(bh);
+    if (!result.wrote) {
+        return result;
+    }
+
+    result.status = write_dirty_run_snapshot(run);
+    result.dirty_epoch = result.status == 0 ? run.dirty_epochs.at(0) : run.dirty_epochs.at(run.count - 1);
+    for (size_t i = 0; i < run.count; ++i) {
+        brelse(run.buffers.at(i));
+    }
     return result;
 }
 
@@ -1211,10 +1341,12 @@ auto writeback_dirty_budgeted(const DirtyWritebackFilter& filter, size_t budget)
     int result = 0;
     uint64_t min_epoch = 0;
     uint64_t const MAX_EPOCH = max_matching_dirty_epoch(filter);
-    for (size_t i = 0; i < budget; ++i) {
+    size_t written_buffers = 0;
+    while (written_buffers < budget) {
         DirtyWritebackResult const WB = writeback_dirty_one_after(filter, min_epoch, MAX_EPOCH);
         if (WB.wrote) {
             min_epoch = WB.dirty_epoch;
+            written_buffers += std::max(WB.buffers, static_cast<size_t>(1));
             if (WB.status != 0) {
                 result = WB.status;
             }
@@ -1358,7 +1490,7 @@ void dirty_writeback_worker(void* unused) {
             if (WB.status != 0) {
                 break;
             }
-            write_count++;
+            write_count += std::max(WB.buffers, static_cast<size_t>(1));
             if ((write_count % DIRTY_WRITEBACK_BUDGET) == 0) {
                 ker::mod::sched::kern_yield();
             }

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -61,7 +62,7 @@ auto recording_write(ker::dev::BlockDevice* dev, uint64_t block, size_t count, c
     if (FAIL_THIS_WRITE) {
         return -1;
     }
-    memcpy(state->last_write, buffer, BYTE_COUNT);
+    memcpy(state->last_write, buffer, std::min(BYTE_COUNT, sizeof(state->last_write)));
     return 0;
 }
 
@@ -677,13 +678,17 @@ KTEST(BufferCache, SyncBlockdevFailedWritesProgressAcrossBatches) {
     }
 
     KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), -1);
-    KEXPECT_EQ(io.write_calls, DIRTY_COUNT);
+    KREQUIRE_EQ(io.write_calls, static_cast<size_t>(1));
+    KEXPECT_EQ(io.write_blocks[0], FIRST_BLOCK);
+    KEXPECT_EQ(io.write_counts[0], DIRTY_COUNT);
     KEXPECT_TRUE(ker::vfs::has_dirty_bdev_range(&dev, FIRST_BLOCK, DIRTY_COUNT));
 
     io.fail_writes = false;
     io.write_calls = 0;
     KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), 0);
-    KEXPECT_EQ(io.write_calls, DIRTY_COUNT);
+    KREQUIRE_EQ(io.write_calls, static_cast<size_t>(1));
+    KEXPECT_EQ(io.write_blocks[0], FIRST_BLOCK);
+    KEXPECT_EQ(io.write_counts[0], DIRTY_COUNT);
     KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, FIRST_BLOCK, DIRTY_COUNT));
     ker::vfs::invalidate_bdev(&dev);
 }
@@ -725,13 +730,17 @@ KTEST(BufferCache, SyncRangeFailedWritesProgressAcrossBatches) {
     }
 
     KEXPECT_EQ(ker::vfs::sync_bdev_range(&dev, FIRST_BLOCK, DIRTY_COUNT), -1);
-    KEXPECT_EQ(io.write_calls, DIRTY_COUNT);
+    KREQUIRE_EQ(io.write_calls, static_cast<size_t>(1));
+    KEXPECT_EQ(io.write_blocks[0], FIRST_BLOCK);
+    KEXPECT_EQ(io.write_counts[0], DIRTY_COUNT);
     KEXPECT_TRUE(ker::vfs::has_dirty_bdev_range(&dev, FIRST_BLOCK, DIRTY_COUNT));
 
     io.fail_writes = false;
     io.write_calls = 0;
     KEXPECT_EQ(ker::vfs::sync_bdev_range(&dev, FIRST_BLOCK, DIRTY_COUNT), 0);
-    KEXPECT_EQ(io.write_calls, DIRTY_COUNT);
+    KREQUIRE_EQ(io.write_calls, static_cast<size_t>(1));
+    KEXPECT_EQ(io.write_blocks[0], FIRST_BLOCK);
+    KEXPECT_EQ(io.write_counts[0], DIRTY_COUNT);
     KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, FIRST_BLOCK, DIRTY_COUNT));
     ker::vfs::invalidate_bdev(&dev);
 }
