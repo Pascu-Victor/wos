@@ -4319,48 +4319,17 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
             continue;  // Re-resolve after substitution
         }
 
-        // Only tmpfs and XFS support symlinks currently
-        if (mount->fs_type != FSType::TMPFS && mount->fs_type != FSType::XFS) {
+        // The prefix pass above already checked the final XFS component via
+        // readlink_resolved(). Avoid immediately reopening the same path for
+        // another negative readlink probe on common non-symlink files.
+        if (mount->fs_type == FSType::XFS) {
             return 0;
         }
 
-        // XFS: resolve symlinks via xfs_readlink
-        if (mount->fs_type == FSType::XFS) {
-            std::array<char, MAX_PATH_LEN> linkbuf{};
-            ssize_t const LINK_LEN = readlink_resolved(resolved_buf, linkbuf.data(), linkbuf.size() - 1);
-            if (LINK_LEN <= 0) {
-                return 0;  // Not a symlink or error
-            }
-            linkbuf[static_cast<size_t>(LINK_LEN)] = '\0';
-            if (linkbuf[0] == '/') {
-                if (std::cmp_greater_equal(LINK_LEN, bufsize)) {
-                    return -ENAMETOOLONG;
-                }
-                std::memcpy(resolved_buf, linkbuf.data(), static_cast<size_t>(LINK_LEN) + 1);
-                int const RR = reapply_root_prefix(resolved_buf, bufsize);
-                if (RR < 0) {
-                    return RR;
-                }
-            } else {
-                size_t last_slash = 0;
-                bool found_slash = false;
-                for (size_t i = 0; resolved_buf[i] != '\0'; ++i) {
-                    if (resolved_buf[i] == '/') {
-                        last_slash = i;
-                        found_slash = true;
-                    }
-                }
-                size_t const PREFIX_LEN = found_slash ? last_slash + 1 : 0;
-                if (PREFIX_LEN + static_cast<size_t>(LINK_LEN) >= bufsize) {
-                    return -ENAMETOOLONG;
-                }
-                std::array<char, MAX_PATH_LEN> new_path{};
-                std::memcpy(new_path.data(), resolved_buf, PREFIX_LEN);
-                std::memcpy(new_path.data() + PREFIX_LEN, linkbuf.data(), static_cast<size_t>(LINK_LEN));
-                new_path[PREFIX_LEN + static_cast<size_t>(LINK_LEN)] = '\0';
-                std::memcpy(resolved_buf, new_path.data(), PREFIX_LEN + static_cast<size_t>(LINK_LEN) + 1);
-            }
-            continue;
+        // The remaining legacy final-node walk is only for tmpfs. Other local
+        // final symlinks are resolved by the prefix pass above.
+        if (mount->fs_type != FSType::TMPFS) {
+            return 0;
         }
 
         // Strip mount prefix to get fs-relative path
