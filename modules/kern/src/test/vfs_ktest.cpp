@@ -29,6 +29,8 @@ KTEST(VFS, PipeFailureUnwindsAllStages) { KEXPECT_TRUE(ker::vfs::vfs_selftest_pi
 
 KTEST(VFS, PipeFlags) { KEXPECT_TRUE(ker::vfs::vfs_selftest_pipe_flags()); }
 
+KTEST(VFS, AnonymousFstatSnapshotHits) { KEXPECT_TRUE(ker::vfs::vfs_selftest_anonymous_fstat_snapshot_hits()); }
+
 KTEST(VFS, FdAllocationCapsCloexecRange) { KEXPECT_TRUE(ker::vfs::vfs_selftest_fd_allocation_caps_cloexec_range()); }
 
 KTEST(VFS, CreateAndStat) {

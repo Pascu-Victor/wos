@@ -981,9 +981,20 @@ auto symlink_cacheable_fs(FSType fs_type) -> bool { return fs_type == FSType::TM
 
 auto symlink_cacheable_result(ssize_t result) -> bool { return result >= 0 || result == -EINVAL || result == -ENOSYS || result == -ENOENT; }
 
-auto file_stat_snapshot_cacheable(const File* file) -> bool {
-    if (file == nullptr || file->vfs_path == nullptr || (file->open_flags & ker::vfs::O_NO_CACHE) != 0) {
+auto file_stat_snapshot_anonymous_cacheable(const File* file) -> bool {
+    if (file == nullptr || file->vfs_path != nullptr || (file->open_flags & ker::vfs::O_NO_CACHE) != 0) {
         return false;
+    }
+    return file->fs_type == FSType::SOCKET ||
+           (file->fs_type == FSType::TMPFS && file->fops != nullptr && file->fops != ker::vfs::tmpfs::get_tmpfs_fops());
+}
+
+auto file_stat_snapshot_cacheable(const File* file) -> bool {
+    if (file == nullptr || (file->open_flags & ker::vfs::O_NO_CACHE) != 0) {
+        return false;
+    }
+    if (file->vfs_path == nullptr) {
+        return file_stat_snapshot_anonymous_cacheable(file);
     }
     return metadata_cacheable_fs(file->fs_type);
 }
@@ -1006,6 +1017,17 @@ auto file_stat_snapshot_mode_cacheable(mode_t mode) -> bool {
     return TYPE == static_cast<mode_t>(S_IFREG) || TYPE == static_cast<mode_t>(S_IFDIR);
 }
 
+auto file_stat_snapshot_result_cacheable(const File* file, mode_t mode) -> bool {
+    if (file_stat_snapshot_mode_cacheable(mode)) {
+        return true;
+    }
+    if (!file_stat_snapshot_anonymous_cacheable(file)) {
+        return false;
+    }
+    mode_t const TYPE = mode & static_cast<mode_t>(S_IFMT);
+    return TYPE == static_cast<mode_t>(S_IFIFO) || TYPE == static_cast<mode_t>(S_IFSOCK);
+}
+
 struct MetadataSnapshotStamp {
     uint64_t cache_generation = 0;
     uint64_t invalidation_generation = 0;
@@ -1025,8 +1047,17 @@ void file_stat_snapshot_invalidate(File* file) {
 }
 
 void file_stat_snapshot_store(File* file, const Stat& statbuf, MetadataSnapshotStamp stamp) {
-    if (!file_stat_snapshot_cacheable(file) || !file_stat_snapshot_mode_cacheable(statbuf.st_mode)) {
+    if (!file_stat_snapshot_cacheable(file) || !file_stat_snapshot_result_cacheable(file, statbuf.st_mode)) {
         file_stat_snapshot_invalidate(file);
+        return;
+    }
+    if (file->vfs_path == nullptr) {
+        file->stat_cache = statbuf;
+        file->stat_cache_generation = 0;
+        file->stat_cache_invalidation_generation = 0;
+        file->stat_cache_path_len = 0;
+        file->stat_cache_valid = true;
+        g_vfs_fstat_snapshot_stores.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     size_t const PATH_LEN = metadata_normalized_path_len(file->vfs_path);
@@ -1043,8 +1074,13 @@ void file_stat_snapshot_store(File* file, const Stat& statbuf, MetadataSnapshotS
 }
 
 auto file_stat_snapshot_current(File* file) -> bool {
-    return file_stat_snapshot_cacheable(file) && file->stat_cache_valid &&
-           file->stat_cache_generation == g_metadata_cache_generation.load(std::memory_order_acquire) && file->stat_cache_path_len != 0 &&
+    if (!file_stat_snapshot_cacheable(file) || !file->stat_cache_valid) {
+        return false;
+    }
+    if (file->vfs_path == nullptr) {
+        return true;
+    }
+    return file->stat_cache_generation == g_metadata_cache_generation.load(std::memory_order_acquire) && file->stat_cache_path_len != 0 &&
            !metadata_path_invalidated_since(file->vfs_path, file->stat_cache_path_len, file->stat_cache_invalidation_generation);
 }
 
@@ -1058,6 +1094,11 @@ auto file_stat_snapshot_lookup(File* file, Stat* statbuf) -> bool {
         g_vfs_fstat_snapshot_miss_empty.fetch_add(1, std::memory_order_relaxed);
         g_vfs_fstat_snapshot_misses.fetch_add(1, std::memory_order_relaxed);
         return false;
+    }
+    if (file->vfs_path == nullptr) {
+        *statbuf = file->stat_cache;
+        g_vfs_fstat_snapshot_hits.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
     if (file->stat_cache_generation != g_metadata_cache_generation.load(std::memory_order_acquire)) {
         g_vfs_fstat_snapshot_miss_generation.fetch_add(1, std::memory_order_relaxed);
@@ -8882,6 +8923,36 @@ auto vfs_selftest_pipe_flags() -> bool {
     vfs_get_local_pipe_perf_snapshot(cleanup);
     return ok && CLOSED_READ && CLOSED_WRITE && task.fd_table.empty() && cleanup.active_pipes == before.active_pipes &&
            cleanup.capacity_bytes == before.capacity_bytes;
+}
+
+auto vfs_selftest_anonymous_fstat_snapshot_hits() -> bool {
+    ker::mod::sched::task::Task task{};
+    std::array<int, 2> pipefd{-1, -1};
+    if (vfs_pipe_for_task(&task, pipefd.data()) != 0) {
+        return false;
+    }
+
+    auto* read_file = static_cast<File*>(task.fd_table.lookup(static_cast<uint64_t>(pipefd[0])));
+    bool ok = read_file != nullptr && read_file->vfs_path == nullptr;
+
+    VfsCachePerfSnapshot before{};
+    VfsCachePerfSnapshot after_first{};
+    VfsCachePerfSnapshot after_second{};
+    Stat st{};
+    vfs_get_cache_perf_snapshot(before);
+
+    ok = ok && vfs_fstat_file(read_file, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFIFO);
+    vfs_get_cache_perf_snapshot(after_first);
+
+    ok = ok && vfs_fstat_file(read_file, &st) == 0;
+    vfs_get_cache_perf_snapshot(after_second);
+
+    ok = ok && after_first.fstat_snapshot_stores > before.fstat_snapshot_stores &&
+         after_second.fstat_snapshot_hits > after_first.fstat_snapshot_hits;
+
+    bool const CLOSED_READ = pipefd[0] >= 0 && pipe_close_fake_task_fd(task, pipefd[0]);
+    bool const CLOSED_WRITE = pipefd[1] >= 0 && pipe_close_fake_task_fd(task, pipefd[1]);
+    return ok && CLOSED_READ && CLOSED_WRITE && task.fd_table.empty();
 }
 #endif
 
