@@ -828,6 +828,36 @@ KTEST(BufferCache, SyncBlockdevCoalescesContiguousDirtyRunsUpToFourMiB) {
     ker::vfs::invalidate_bdev(&dev);
 }
 
+KTEST(BufferCache, SyncBlockdevCoalescesManySmallDirtyBuffers) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    dev.total_blocks = 4096;
+    LargeCountingWriteState io{};
+    dev.write_blocks = large_counting_write;
+    dev.private_data = &io;
+    ker::vfs::invalidate_bdev(&dev);
+
+    constexpr uint64_t FIRST_BLOCK = 0;
+    constexpr size_t BLOCKS_PER_DIRTY_BUFFER = 8;
+    constexpr size_t DIRTY_BUFFER_COUNT = 256;
+    constexpr size_t TOTAL_BLOCKS = BLOCKS_PER_DIRTY_BUFFER * DIRTY_BUFFER_COUNT;
+
+    for (size_t i = 0; i < DIRTY_BUFFER_COUNT; ++i) {
+        uint64_t const BLOCK = FIRST_BLOCK + (i * BLOCKS_PER_DIRTY_BUFFER);
+        ker::vfs::BufHead* bh = ker::vfs::bget_multi(&dev, BLOCK, BLOCKS_PER_DIRTY_BUFFER);
+        KREQUIRE_NE(bh, nullptr);
+        memset(bh->data, static_cast<int>(0x30U + (i & 0x3FU)), bh->size);
+        ker::vfs::bdirty(bh);
+        ker::vfs::brelse(bh);
+    }
+
+    KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), 0);
+    KREQUIRE_EQ(io.write_calls, static_cast<size_t>(1));
+    KEXPECT_EQ(io.write_blocks[0], FIRST_BLOCK);
+    KEXPECT_EQ(io.write_counts[0], TOTAL_BLOCKS);
+    KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, FIRST_BLOCK, TOTAL_BLOCKS));
+    ker::vfs::invalidate_bdev(&dev);
+}
+
 KTEST(BufferCache, SyncRangeCoalescesContiguousDirtyRunsByBlockOrder) {
     ker::dev::BlockDevice dev = make_null_bdev();
     RecordingWriteState io{};

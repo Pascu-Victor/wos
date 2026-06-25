@@ -220,9 +220,9 @@ std::atomic<bool> dirty_writeback_wq_creating{false};
 bool cache_initialized = false;
 
 constexpr size_t DIRTY_HARD_LIMIT_TARGET_MULTIPLIER = 2;
-constexpr size_t DIRTY_WRITEBACK_BUDGET = 128;
+constexpr size_t DIRTY_WRITEBACK_BUDGET = 1024;
 constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = DIRTY_WRITEBACK_BUDGET;
-constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BUFFERS = 128;
+constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BUFFERS = 256;
 constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BYTES = size_t{4} * 1024 * 1024;
 constexpr size_t DIRTY_WAKE_BATCH = 32;
 constexpr size_t DIRTY_COPY_COVERAGE_MAX_INTERVALS = 64;
