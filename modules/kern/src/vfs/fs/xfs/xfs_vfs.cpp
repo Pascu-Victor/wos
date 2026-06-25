@@ -61,6 +61,8 @@ constexpr size_t XFS_BUFFERED_WRITE_BATCH_MAX_BYTES = size_t{256} * 1024;
 constexpr size_t XFS_DIRTY_THROTTLE_INTERVAL_BYTES = size_t{4} * 1024 * 1024;
 constexpr size_t XFS_STREAM_PREALLOC_TRIGGER_BYTES = size_t{512} * 1024;
 constexpr xfs_extlen_t XFS_STREAM_PREALLOC_BLOCKS = 1024;  // 4 MiB
+constexpr size_t XFS_APPEND_PREALLOC_TRIGGER_BYTES = size_t{16} * 1024;
+constexpr xfs_extlen_t XFS_APPEND_PREALLOC_BLOCKS = 64;  // 256 KiB
 constexpr uint32_t XFS_STREAM_PREALLOC_EXTENT_MARGIN = 8;
 
 // ============================================================================
@@ -204,12 +206,13 @@ auto xfs_has_inline_extent_pressure(const XfsInode* ip) -> bool {
 }
 
 auto xfs_hole_write_alloc_blocks(size_t write_pos, size_t block_off, size_t remaining_bytes, xfs_filblks_t hole_blocks, size_t block_size,
-                                 uint32_t block_log, bool extent_pressure) -> xfs_extlen_t {
+                                 uint32_t block_log, bool extent_pressure, bool sequential_append) -> xfs_extlen_t {
     size_t const BLOCKS_NEEDED = (block_off + remaining_bytes + block_size - 1) >> block_log;
     auto desired_blocks = static_cast<xfs_filblks_t>(BLOCKS_NEEDED);
-    bool const SHOULD_PREALLOC = write_pos >= XFS_STREAM_PREALLOC_TRIGGER_BYTES || extent_pressure;
-    if (SHOULD_PREALLOC && hole_blocks > desired_blocks) {
+    if ((write_pos >= XFS_STREAM_PREALLOC_TRIGGER_BYTES || extent_pressure) && hole_blocks > desired_blocks) {
         desired_blocks = std::max(desired_blocks, static_cast<xfs_filblks_t>(XFS_STREAM_PREALLOC_BLOCKS));
+    } else if (sequential_append && write_pos >= XFS_APPEND_PREALLOC_TRIGGER_BYTES && hole_blocks > desired_blocks) {
+        desired_blocks = std::max(desired_blocks, static_cast<xfs_filblks_t>(XFS_APPEND_PREALLOC_BLOCKS));
     }
     auto alloc_blocks = static_cast<xfs_extlen_t>(std::min(hole_blocks, desired_blocks));
     alloc_blocks = std::min(alloc_blocks, XFS_WRITE_BATCH_BLOCKS);
@@ -927,8 +930,10 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
             // Hole: batch-allocate as many contiguous blocks as we can.
             size_t const REMAINING_BYTES = count - total_written;
             bool const EXTENT_PRESSURE = xfs_has_inline_extent_pressure(ip);
-            xfs_extlen_t const HOLE_BLOCKS = xfs_hole_write_alloc_blocks(WRITE_POS, BLOCK_OFF, REMAINING_BYTES, bmap.blockcount,
-                                                                         ctx->block_size, ctx->block_log, EXTENT_PRESSURE);
+            bool const SEQUENTIAL_APPEND = WRITE_POS == ip->size && WRITE_POS != 0;
+            xfs_extlen_t const HOLE_BLOCKS =
+                xfs_hole_write_alloc_blocks(WRITE_POS, BLOCK_OFF, REMAINING_BYTES, bmap.blockcount, ctx->block_size, ctx->block_log,
+                                            EXTENT_PRESSURE, SEQUENTIAL_APPEND);
 
 #ifdef XFS_BENCH
             t0 = ker::mod::tsc::get_ns();
@@ -1394,8 +1399,8 @@ auto get_xfs_fops() -> FileOperations* { return &xfs_fops; }
 
 #ifdef WOS_SELFTEST
 auto xfs_selftest_hole_write_alloc_blocks(size_t block_off, size_t remaining_bytes, xfs_filblks_t hole_blocks, size_t block_size,
-                                          uint32_t block_log) -> xfs_extlen_t {
-    return xfs_hole_write_alloc_blocks(0, block_off, remaining_bytes, hole_blocks, block_size, block_log, false);
+                                          uint32_t block_log, size_t write_pos, bool sequential_append) -> xfs_extlen_t {
+    return xfs_hole_write_alloc_blocks(write_pos, block_off, remaining_bytes, hole_blocks, block_size, block_log, false, sequential_append);
 }
 
 auto xfs_selftest_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks) -> bool {
