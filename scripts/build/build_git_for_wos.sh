@@ -105,13 +105,16 @@ copy_source_to_workdir() {
 
 patch_git_source_for_wos() {
     local run_command="$GIT_WORK/run-command.c"
+    local parallel_checkout="$GIT_WORK/parallel-checkout.c"
 
-    python3 - "$run_command" <<'PY'
+    python3 - "$run_command" "$parallel_checkout" <<'PY'
 from pathlib import Path
 import sys
 
-path = Path(sys.argv[1])
-text = path.read_text()
+run_command = Path(sys.argv[1])
+parallel_checkout = Path(sys.argv[2])
+
+text = run_command.read_text()
 replacements = {
     "pipe(fdin)": ("pipe2(fdin, O_CLOEXEC)", 2),
     "pipe(fdout)": ("pipe2(fdout, O_CLOEXEC)", 2),
@@ -122,10 +125,24 @@ replacements = {
 for old, (new, expected_count) in replacements.items():
     count = text.count(old)
     if count != expected_count:
-        raise SystemExit(f"expected {expected_count} occurrences of {old!r} in {path}, found {count}")
+        raise SystemExit(f"expected {expected_count} occurrences of {old!r} in {run_command}, found {count}")
     text = text.replace(old, new)
 
-path.write_text(text)
+run_command.write_text(text)
+
+text = parallel_checkout.read_text()
+replacements = {
+    "static const int DEFAULT_THRESHOLD_FOR_PARALLELISM = 100;": "static const int DEFAULT_THRESHOLD_FOR_PARALLELISM = 0;",
+    "static const int DEFAULT_NUM_WORKERS = 1;": "static const int DEFAULT_NUM_WORKERS = 0;",
+}
+
+for old, new in replacements.items():
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"expected one occurrence of {old!r} in {parallel_checkout}, found {count}")
+    text = text.replace(old, new)
+
+parallel_checkout.write_text(text)
 PY
 }
 
