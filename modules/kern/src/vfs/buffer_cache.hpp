@@ -19,6 +19,7 @@ constexpr uint32_t BH_LOCKED = (1U << 2);           // Buffer is locked for I/O
 constexpr uint32_t BH_WRITEBACK = (1U << 3);        // Buffer is being written back
 constexpr uint32_t BH_DATA_PAGE_ALLOC = (1U << 4);  // Buffer data was allocated through the page allocator
 constexpr uint32_t BH_DIRTY_INDEXED = (1U << 5);    // Buffer is present in the dirty range index
+constexpr uint32_t BH_RANGE_INDEXED = (1U << 6);    // Buffer is present in the cached range index
 
 // Buffer head - represents a single cached block from a block device.
 // Analogous to Linux struct buffer_head / simplified xfs_buf.
@@ -49,6 +50,14 @@ struct BufHead {
     BufHead* dirty_right{};
     BufHead* dirty_parent{};
     uint64_t dirty_subtree_last_block{};
+
+    // Cached range index links (protected by cache lock). This indexes clean
+    // and dirty buffers by device block span so exact-size cache misses can
+    // still reuse overlapping cached aliases safely.
+    BufHead* range_left{};
+    BufHead* range_right{};
+    BufHead* range_parent{};
+    uint64_t range_subtree_last_block{};
 };
 
 // Buffer cache configuration. This is the minimum/default cap; the live kernel

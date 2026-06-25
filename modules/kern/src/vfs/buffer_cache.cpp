@@ -56,6 +56,9 @@ auto hash_key(const dev::BlockDevice* bdev, uint64_t block_no, size_t size) -> s
     return static_cast<size_t>(h % BUFFER_CACHE_HASH_BUCKETS);
 }
 
+void range_index_insert_locked(BufHead* bh);
+void range_index_remove_locked(BufHead* bh);
+
 // Returns true if ptr looks like a valid kernel heap or static pointer.
 // Used to detect hash chain corruption before it spreads to live entries.
 bool is_valid_bufhead_ptr(const BufHead* ptr) {
@@ -122,9 +125,11 @@ void hash_insert(BufHead* bh) {
     }
     bh->hash_next = old_head;
     hash_bucket_at(IDX) = bh;
+    range_index_insert_locked(bh);
 }
 
 void hash_remove(BufHead* bh) {
+    range_index_remove_locked(bh);
     size_t const IDX = hash_key(bh->bdev, bh->block_no, bh->size);
     // Validate bh->hash_next before propagating — if it is garbage it would
     // corrupt the live predecessor's hash_next and cause the crash we've seen.
@@ -236,6 +241,13 @@ struct DirtyBdevState {
     size_t dirty_bytes{};
 };
 
+struct RangeBdevState {
+    dev::BlockDevice* bdev{};
+    BufHead* tree_root{};
+    size_t buffers{};
+    size_t bytes{};
+};
+
 struct DirtyWritebackFilter {
     dev::BlockDevice* bdev{};
     uint64_t block_no{};
@@ -273,11 +285,19 @@ struct DirtyCoverageInterval {
 };
 
 ker::util::SmallVec<DirtyBdevState*, 8> dirty_bdev_states;
+ker::util::SmallVec<RangeBdevState*, 8> range_bdev_states;
 ker::util::SmallVec<uint64_t, 8> dirty_waiters;
 bool dirty_index_degraded = false;
+bool range_index_degraded = false;
 ker::mod::sched::Workqueue* dirty_writeback_wq = nullptr;
 
 void clear_buffer_dirty_locked(BufHead* bh);
+auto copy_dirty_bdev_range_locked(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst, uint64_t min_epoch_exclusive)
+    -> bool;
+void dirty_coverage_add(std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS>& intervals, size_t& interval_count,
+                        DirtyCoverageInterval interval, bool& overflow);
+auto dirty_coverage_complete(const std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS>& intervals, size_t interval_count,
+                             uint64_t block_no, size_t count) -> bool;
 void dirty_writeback_worker(void* unused);
 ker::mod::sched::WorkItem dirty_writeback_work{.fn = dirty_writeback_worker, .arg = nullptr, .next = nullptr};
 constexpr size_t HOT_EVICT_SCAN_BUDGET = 512;
@@ -390,6 +410,7 @@ void free_writeback_snapshot(WritebackSnapshot& snapshot) {
 }
 
 void free_unlinked_buffer(BufHead* bh) {
+    range_index_remove_locked(bh);
     if ((bh->flags & BH_DIRTY) != 0) {
         clear_buffer_dirty_locked(bh);
     }
@@ -488,6 +509,10 @@ auto alloc_buffer_with_size(dev::BlockDevice* bdev, uint64_t block_no, size_t si
     bh->dirty_right = nullptr;
     bh->dirty_parent = nullptr;
     bh->dirty_subtree_last_block = 0;
+    bh->range_left = nullptr;
+    bh->range_right = nullptr;
+    bh->range_parent = nullptr;
+    bh->range_subtree_last_block = 0;
 
     cache_total_bytes += size;
     cache_total_buffers++;
@@ -592,6 +617,396 @@ auto dirty_buffers_overlap(const BufHead* lhs, const BufHead* rhs) -> bool {
         return false;
     }
     return block_ranges_overlap(lhs->block_no, buffer_block_count(lhs), rhs->block_no, buffer_block_count(rhs));
+}
+
+auto range_buffer_last_block(const BufHead* bh) -> uint64_t { return block_range_last_block(bh->block_no, buffer_block_count(bh)); }
+
+auto range_priority_mix(uint64_t value) -> uint64_t {
+    value ^= value >> 33U;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33U;
+    value *= 0xc4ceb9fe1a85ec53ULL;
+    value ^= value >> 33U;
+    return value == 0 ? 1 : value;
+}
+
+auto range_priority(const BufHead* bh) -> uint64_t {
+    auto value = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bh));
+    value ^= bh->block_no;
+    value ^= static_cast<uint64_t>(bh->size) << 17U;
+    value ^= static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bh->bdev)) >> 4U;
+    return range_priority_mix(value);
+}
+
+auto range_tree_less(const BufHead* lhs, const BufHead* rhs) -> bool {
+    uint64_t const LHS_LAST = range_buffer_last_block(lhs);
+    uint64_t const RHS_LAST = range_buffer_last_block(rhs);
+    if (lhs->block_no != rhs->block_no) {
+        return lhs->block_no < rhs->block_no;
+    }
+    if (LHS_LAST != RHS_LAST) {
+        return LHS_LAST < RHS_LAST;
+    }
+    if (lhs->size != rhs->size) {
+        return lhs->size < rhs->size;
+    }
+    return reinterpret_cast<uintptr_t>(lhs) < reinterpret_cast<uintptr_t>(rhs);
+}
+
+auto range_child_max_last(const BufHead* bh) -> uint64_t { return bh != nullptr ? bh->range_subtree_last_block : 0; }
+
+void range_recompute(BufHead* bh) {
+    if (bh == nullptr) {
+        return;
+    }
+    uint64_t max_last = range_buffer_last_block(bh);
+    max_last = std::max(max_last, range_child_max_last(bh->range_left));
+    max_last = std::max(max_last, range_child_max_last(bh->range_right));
+    bh->range_subtree_last_block = max_last;
+}
+
+void range_recompute_upwards(BufHead* bh) {
+    while (bh != nullptr) {
+        range_recompute(bh);
+        bh = bh->range_parent;
+    }
+}
+
+void range_replace_child(RangeBdevState* state, BufHead* old_child, BufHead* new_child) {
+    BufHead* parent = old_child->range_parent;
+    if (parent == nullptr) {
+        state->tree_root = new_child;
+    } else if (parent->range_left == old_child) {
+        parent->range_left = new_child;
+    } else {
+        parent->range_right = new_child;
+    }
+    if (new_child != nullptr) {
+        new_child->range_parent = parent;
+    }
+}
+
+void range_rotate_left(RangeBdevState* state, BufHead* node) {
+    BufHead* pivot = node->range_right;
+    if (pivot == nullptr) {
+        return;
+    }
+
+    node->range_right = pivot->range_left;
+    if (pivot->range_left != nullptr) {
+        pivot->range_left->range_parent = node;
+    }
+
+    range_replace_child(state, node, pivot);
+    pivot->range_left = node;
+    node->range_parent = pivot;
+
+    range_recompute(node);
+    range_recompute(pivot);
+    range_recompute_upwards(pivot->range_parent);
+}
+
+void range_rotate_right(RangeBdevState* state, BufHead* node) {
+    BufHead* pivot = node->range_left;
+    if (pivot == nullptr) {
+        return;
+    }
+
+    node->range_left = pivot->range_right;
+    if (pivot->range_right != nullptr) {
+        pivot->range_right->range_parent = node;
+    }
+
+    range_replace_child(state, node, pivot);
+    pivot->range_right = node;
+    node->range_parent = pivot;
+
+    range_recompute(node);
+    range_recompute(pivot);
+    range_recompute_upwards(pivot->range_parent);
+}
+
+auto find_range_bdev_state_locked(dev::BlockDevice* bdev) -> RangeBdevState* {
+    for (auto* state : range_bdev_states) {
+        if (state != nullptr && state->bdev == bdev) {
+            return state;
+        }
+    }
+    return nullptr;
+}
+
+auto find_or_create_range_bdev_state_locked(dev::BlockDevice* bdev) -> RangeBdevState* {
+    RangeBdevState* state = find_range_bdev_state_locked(bdev);
+    if (state != nullptr) {
+        return state;
+    }
+
+    state = new RangeBdevState{};
+    if (state == nullptr) {
+        return nullptr;
+    }
+    state->bdev = bdev;
+    if (!range_bdev_states.push_back(state)) {
+        delete state;
+        return nullptr;
+    }
+    return state;
+}
+
+void range_tree_insert(RangeBdevState* state, BufHead* bh) {
+    bh->range_left = nullptr;
+    bh->range_right = nullptr;
+    bh->range_parent = nullptr;
+    bh->range_subtree_last_block = range_buffer_last_block(bh);
+
+    if (state->tree_root == nullptr) {
+        state->tree_root = bh;
+        return;
+    }
+
+    BufHead* parent = nullptr;
+    BufHead* cur = state->tree_root;
+    while (cur != nullptr) {
+        parent = cur;
+        if (range_tree_less(bh, cur)) {
+            cur = cur->range_left;
+        } else {
+            cur = cur->range_right;
+        }
+    }
+
+    bh->range_parent = parent;
+    if (range_tree_less(bh, parent)) {
+        parent->range_left = bh;
+    } else {
+        parent->range_right = bh;
+    }
+    range_recompute_upwards(parent);
+
+    while (bh->range_parent != nullptr && range_priority(bh) < range_priority(bh->range_parent)) {
+        if (bh->range_parent->range_left == bh) {
+            range_rotate_right(state, bh->range_parent);
+        } else {
+            range_rotate_left(state, bh->range_parent);
+        }
+    }
+}
+
+void range_tree_remove(RangeBdevState* state, BufHead* bh) {
+    while (bh->range_left != nullptr || bh->range_right != nullptr) {
+        if (bh->range_right == nullptr || (bh->range_left != nullptr && range_priority(bh->range_left) < range_priority(bh->range_right))) {
+            range_rotate_right(state, bh);
+        } else {
+            range_rotate_left(state, bh);
+        }
+    }
+
+    BufHead* parent = bh->range_parent;
+    if (parent == nullptr) {
+        state->tree_root = nullptr;
+    } else if (parent->range_left == bh) {
+        parent->range_left = nullptr;
+    } else if (parent->range_right == bh) {
+        parent->range_right = nullptr;
+    }
+    bh->range_parent = nullptr;
+    bh->range_subtree_last_block = 0;
+    range_recompute_upwards(parent);
+}
+
+void range_index_insert_locked(BufHead* bh) {
+    if (bh == nullptr || bh->bdev == nullptr || (bh->flags & BH_RANGE_INDEXED) != 0) {
+        return;
+    }
+
+    RangeBdevState* state = find_or_create_range_bdev_state_locked(bh->bdev);
+    if (state == nullptr) {
+        range_index_degraded = true;
+        return;
+    }
+
+    range_tree_insert(state, bh);
+    state->buffers++;
+    state->bytes += bh->size;
+    bh->flags |= BH_RANGE_INDEXED;
+}
+
+void range_index_remove_locked(BufHead* bh) {
+    if (bh == nullptr || (bh->flags & BH_RANGE_INDEXED) == 0) {
+        return;
+    }
+
+    RangeBdevState* state = find_range_bdev_state_locked(bh->bdev);
+    if (state != nullptr) {
+        range_tree_remove(state, bh);
+        if (state->buffers != 0) {
+            state->buffers--;
+        }
+        if (state->bytes >= bh->size) {
+            state->bytes -= bh->size;
+        } else {
+            state->bytes = 0;
+        }
+    }
+    bh->flags &= ~BH_RANGE_INDEXED;
+}
+
+auto range_tree_overlaps(const BufHead* root, uint64_t block_no, size_t count) -> bool {
+    if (root == nullptr || count == 0) {
+        return false;
+    }
+    uint64_t const QUERY_LAST = block_range_last_block(block_no, count);
+    const BufHead* cur = root;
+    while (cur != nullptr) {
+        if (cur->range_left != nullptr && cur->range_left->range_subtree_last_block >= block_no) {
+            cur = cur->range_left;
+            continue;
+        }
+        if (cur->block_no <= QUERY_LAST && range_buffer_last_block(cur) >= block_no) {
+            return true;
+        }
+        if (cur->block_no > QUERY_LAST) {
+            return false;
+        }
+        cur = cur->range_right;
+    }
+    return false;
+}
+
+auto cached_buffer_copy_coverage(BufHead* bh, dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst,
+                                 std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS>& coverage, size_t& coverage_count,
+                                 bool& coverage_overflow) -> bool {
+    if (bh == nullptr || bh->bdev != bdev || bh->data == nullptr || (bh->flags & BH_VALID) == 0 ||
+        bh->refcount.load(std::memory_order_relaxed) != 0 || !buffer_overlaps_range(bh, bdev, block_no, count)) {
+        return false;
+    }
+
+    uint64_t const BUF_LAST = range_buffer_last_block(bh);
+    uint64_t const RANGE_LAST = block_range_last_block(block_no, count);
+    uint64_t const COPY_FIRST = std::max(bh->block_no, block_no);
+    uint64_t const COPY_LAST = std::min(BUF_LAST, RANGE_LAST);
+    if (COPY_FIRST > COPY_LAST) {
+        return false;
+    }
+
+    size_t const BLOCK_SIZE = bdev->block_size;
+    auto const COPY_BLOCKS = static_cast<size_t>(COPY_LAST - COPY_FIRST + 1);
+    size_t copy_bytes = COPY_BLOCKS * BLOCK_SIZE;
+    size_t const SRC_OFF = static_cast<size_t>(COPY_FIRST - bh->block_no) * BLOCK_SIZE;
+    size_t const DST_OFF = static_cast<size_t>(COPY_FIRST - block_no) * BLOCK_SIZE;
+    size_t const DST_SIZE = count * BLOCK_SIZE;
+    if (SRC_OFF >= bh->size || DST_OFF >= DST_SIZE) {
+        return false;
+    }
+    copy_bytes = std::min(copy_bytes, bh->size - SRC_OFF);
+    copy_bytes = std::min(copy_bytes, DST_SIZE - DST_OFF);
+    if (copy_bytes == 0) {
+        return false;
+    }
+
+    std::memcpy(dst + DST_OFF, bh->data + SRC_OFF, copy_bytes);
+    uint64_t const COVERED_FIRST = block_no + (DST_OFF / BLOCK_SIZE);
+    uint64_t const COVERED_LAST = COVERED_FIRST + ((copy_bytes - 1) / BLOCK_SIZE);
+    dirty_coverage_add(coverage, coverage_count, DirtyCoverageInterval{.first = COVERED_FIRST, .last = COVERED_LAST}, coverage_overflow);
+    return !coverage_overflow;
+}
+
+void range_copy_cached_overlaps_locked(BufHead* root, dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst,
+                                       std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS>& coverage,
+                                       size_t& coverage_count, bool& copied, bool& coverage_overflow) {
+    if (root == nullptr || coverage_overflow) {
+        return;
+    }
+    uint64_t const QUERY_LAST = block_range_last_block(block_no, count);
+
+    if (root->range_left != nullptr && root->range_left->range_subtree_last_block >= block_no) {
+        range_copy_cached_overlaps_locked(root->range_left, bdev, block_no, count, dst, coverage, coverage_count, copied,
+                                          coverage_overflow);
+    }
+
+    bool const DID_COPY = cached_buffer_copy_coverage(root, bdev, block_no, count, dst, coverage, coverage_count, coverage_overflow);
+    copied = copied || DID_COPY;
+
+    if (root->block_no <= QUERY_LAST) {
+        range_copy_cached_overlaps_locked(root->range_right, bdev, block_no, count, dst, coverage, coverage_count, copied,
+                                          coverage_overflow);
+    }
+}
+
+auto copy_cached_bdev_range_if_complete(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst) -> bool {
+    if (bdev == nullptr || bdev->block_size == 0 || count == 0 || dst == nullptr || !cache_initialized || range_index_degraded) {
+        return false;
+    }
+    if (count > SIZE_MAX / bdev->block_size) {
+        return false;
+    }
+
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    RangeBdevState* state = find_range_bdev_state_locked(bdev);
+    if (state == nullptr || state->buffers == 0 || !range_tree_overlaps(state->tree_root, block_no, count)) {
+        cache_lock.unlock_irqrestore(IRQFLAGS);
+        return false;
+    }
+
+    bool copied = false;
+    bool coverage_overflow = false;
+    std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS> coverage{};
+    size_t coverage_count = 0;
+    range_copy_cached_overlaps_locked(state->tree_root, bdev, block_no, count, dst, coverage, coverage_count, copied, coverage_overflow);
+    bool const COMPLETE = copied && !coverage_overflow && dirty_coverage_complete(coverage, coverage_count, block_no, count);
+    if (COMPLETE && cache_dirty_buffers != 0) {
+        static_cast<void>(copy_dirty_bdev_range_locked(bdev, block_no, count, dst, 0));
+    }
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    return COMPLETE;
+}
+
+auto range_find_clean_overlapping_alias_locked(BufHead* root, const BufHead* source) -> BufHead* {
+    if (root == nullptr || source == nullptr) {
+        return nullptr;
+    }
+    uint64_t const SOURCE_LAST = range_buffer_last_block(source);
+    if (root->range_left != nullptr && root->range_left->range_subtree_last_block >= source->block_no) {
+        if (BufHead* found = range_find_clean_overlapping_alias_locked(root->range_left, source)) {
+            return found;
+        }
+    }
+
+    uint32_t constexpr BLOCKING_FLAGS = BH_DIRTY | BH_WRITEBACK;
+    if (root != source && root->bdev == source->bdev && (root->flags & BLOCKING_FLAGS) == 0 &&
+        root->refcount.load(std::memory_order_relaxed) == 0 &&
+        block_ranges_overlap(root->block_no, buffer_block_count(root), source->block_no, buffer_block_count(source))) {
+        return root;
+    }
+
+    if (root->block_no <= SOURCE_LAST) {
+        return range_find_clean_overlapping_alias_locked(root->range_right, source);
+    }
+    return nullptr;
+}
+
+void discard_clean_overlapping_aliases_locked(BufHead* source) {
+    if (source == nullptr || source->bdev == nullptr || range_index_degraded || (source->flags & BH_RANGE_INDEXED) == 0) {
+        return;
+    }
+
+    RangeBdevState* state = find_range_bdev_state_locked(source->bdev);
+    if (state == nullptr || state->buffers <= 1) {
+        return;
+    }
+
+    uint64_t discarded_bytes = 0;
+    while (BufHead* alias = range_find_clean_overlapping_alias_locked(state->tree_root, source)) {
+        discarded_bytes += alias->size;
+        free_buffer(alias);
+        state = find_range_bdev_state_locked(source->bdev);
+        if (state == nullptr || state->buffers <= 1) {
+            break;
+        }
+    }
+    if (discarded_bytes != 0) {
+        perf_record_xfs_count(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISCARD, discarded_bytes);
+    }
 }
 
 auto dirty_priority_mix(uint64_t value) -> uint64_t {
@@ -1179,6 +1594,7 @@ auto owns_writeback_epoch(const BufHead* bh, uint64_t epoch) -> bool {
 
 auto mark_buffer_dirty_locked(BufHead* bh) -> bool {
     bh->dirty_epoch = allocate_dirty_epoch();
+    discard_clean_overlapping_aliases_locked(bh);
     if ((bh->flags & BH_DIRTY) != 0) {
         return false;
     }
@@ -1694,8 +2110,10 @@ void buffer_cache_init() {
     cache_dirty_buffers = 0;
     cache_dirty_bytes = 0;
     dirty_bdev_states.clear();
+    range_bdev_states.clear();
     dirty_waiters.clear();
     dirty_index_degraded = false;
+    range_index_degraded = false;
     dirty_writeback_queued.store(false, std::memory_order_release);
     stat_hits = 0;
     stat_misses = 0;
@@ -1754,7 +2172,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     }
     perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_MISS, PERF_STARTED_US, 0, bdev->block_size);
 
-    if (copy_dirty_bdev_range_if_complete(bdev, block_no, 1, bh->data)) {
+    if (copy_cached_bdev_range_if_complete(bdev, block_no, 1, bh->data) || copy_dirty_bdev_range_if_complete(bdev, block_no, 1, bh->data)) {
         bh->flags |= BH_VALID;
     } else {
         int const RC = read_block_from_disk(bh);
@@ -1837,7 +2255,8 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
     }
     perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_MISS, PERF_STARTED_US, 0, TOTAL_SIZE);
 
-    if (copy_dirty_bdev_range_if_complete(bdev, block_no, count, bh->data)) {
+    if (copy_cached_bdev_range_if_complete(bdev, block_no, count, bh->data) ||
+        copy_dirty_bdev_range_if_complete(bdev, block_no, count, bh->data)) {
         bh->flags |= BH_VALID;
     } else {
         // Read from disk outside the lock
