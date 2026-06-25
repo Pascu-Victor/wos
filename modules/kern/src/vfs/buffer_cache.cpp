@@ -1826,10 +1826,8 @@ void throttle_dirty_buffer_cache(dev::BlockDevice* bdev) {
         register_current_dirty_waiter_locked();
         cache_lock.unlock_irqrestore(irqflags);
 
-        bool const HAVE_WORKER = request_dirty_writeback();
-        if (!HAVE_WORKER) {
-            static_cast<void>(writeback_dirty_budgeted(fallback_filter, DIRTY_HARD_FALLBACK_BUDGET));
-        }
+        static_cast<void>(request_dirty_writeback());
+        static_cast<void>(writeback_dirty_budgeted(fallback_filter, DIRTY_HARD_FALLBACK_BUDGET));
         ker::mod::sched::kern_yield();
     }
 }
