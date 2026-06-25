@@ -101,7 +101,10 @@ constexpr size_t METADATA_CACHE_SET_COUNT = 4096;
 constexpr size_t METADATA_CACHE_WAYS = 8;
 constexpr size_t METADATA_INVALIDATION_SET_COUNT = 2048;
 constexpr size_t METADATA_INVALIDATION_WAYS = 4;
-constexpr size_t SYMLINK_CACHE_SET_COUNT = 512;
+// Source-tree opens/stat calls repeatedly prove that hot ancestor directories
+// are not symlinks. Keep enough negative readlink entries to cover that working
+// set without turning every path walk into backend XFS opens.
+constexpr size_t SYMLINK_CACHE_SET_COUNT = 2048;
 constexpr size_t SYMLINK_CACHE_WAYS = 4;
 static_assert((METADATA_CACHE_SET_COUNT & (METADATA_CACHE_SET_COUNT - 1)) == 0);
 static_assert((METADATA_INVALIDATION_SET_COUNT & (METADATA_INVALIDATION_SET_COUNT - 1)) == 0);
