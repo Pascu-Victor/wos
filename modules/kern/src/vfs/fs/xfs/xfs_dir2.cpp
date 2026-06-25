@@ -218,9 +218,12 @@ void fill_dir_entry(const XfsMountContext* ctx, const XfsDir2DataEntry* dep, Xfs
     entry->name.at(dep->namelen) = '\0';
 }
 
-constexpr size_t XFS_DENTRY_CACHE_SET_COUNT = 1024;
+// Large source checkouts and compiler tree scans revisit far more than 4096
+// directory names. Keep this fixed-size and bounded while reducing set churn
+// in hot XFS path walks.
+constexpr size_t XFS_DENTRY_CACHE_SET_COUNT = 4096;
 constexpr size_t XFS_DENTRY_CACHE_WAYS = 4;
-constexpr size_t XFS_DENTRY_GENERATION_SET_COUNT = 1024;
+constexpr size_t XFS_DENTRY_GENERATION_SET_COUNT = 4096;
 constexpr size_t XFS_DENTRY_GENERATION_WAYS = 4;
 static_assert((XFS_DENTRY_CACHE_SET_COUNT & (XFS_DENTRY_CACHE_SET_COUNT - 1)) == 0);
 static_assert((XFS_DENTRY_GENERATION_SET_COUNT & (XFS_DENTRY_GENERATION_SET_COUNT - 1)) == 0);
