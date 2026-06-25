@@ -29,6 +29,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/runtime_test_audit_test.py
 )
 add_test(
+    NAME toolchain_bootstrap_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/toolchain_bootstrap_source_test.py
+)
+add_test(
     NAME testd_manifest_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/testd_manifest_test.py
 )
@@ -239,6 +243,7 @@ set_tests_properties(
     cluster_setup_test
     ktest_manifest_test
     runtime_test_audit_test
+    toolchain_bootstrap_source_test
     testd_manifest_test
     testprog_source_test
     httpd_source_test

@@ -102,6 +102,7 @@ UNIT_TESTS=(
     cluster_setup_test
     ktest_manifest_test
     runtime_test_audit_test
+    toolchain_bootstrap_source_test
     testd_manifest_test
     testprog_source_test
     httpd_source_test
