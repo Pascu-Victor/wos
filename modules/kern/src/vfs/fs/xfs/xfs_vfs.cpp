@@ -77,11 +77,12 @@ class XfsMetadataGuard {
     explicit XfsMetadataGuard(XfsMountContext* ctx, bool active = true) : ctx(active ? ctx : nullptr) {
         if (this->ctx != nullptr) {
             this->ctx->metadata_lock.lock();
+            locked = true;
         }
     }
 
     ~XfsMetadataGuard() {
-        if (ctx != nullptr) {
+        if (ctx != nullptr && locked) {
             ctx->metadata_lock.unlock();
         }
     }
@@ -91,8 +92,23 @@ class XfsMetadataGuard {
     auto operator=(const XfsMetadataGuard&) -> XfsMetadataGuard& = delete;
     auto operator=(XfsMetadataGuard&&) -> XfsMetadataGuard& = delete;
 
+    void lock() {
+        if (ctx != nullptr && !locked) {
+            ctx->metadata_lock.lock();
+            locked = true;
+        }
+    }
+
+    void unlock() {
+        if (ctx != nullptr && locked) {
+            ctx->metadata_lock.unlock();
+            locked = false;
+        }
+    }
+
    private:
     XfsMountContext* ctx;
+    bool locked = false;
 };
 
 auto perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp op) -> uint64_t {
@@ -254,6 +270,20 @@ void perf_record_xfs_slow_event(ker::mod::perf::WkiPerfLocalXfsOp op, int32_t st
                                      static_cast<uint8_t>(op), ker::mod::perf::WkiPerfPhase::END, 0, BYTES_KIB,
                                      ker::mod::perf::next_wki_trace_correlation(), status, latency_us, callsite);
 }
+
+class XfsMetadataUnlockedScope {
+   public:
+    explicit XfsMetadataUnlockedScope(XfsMetadataGuard& guard) : guard(guard) { guard.unlock(); }
+    ~XfsMetadataUnlockedScope() { guard.lock(); }
+
+    XfsMetadataUnlockedScope(const XfsMetadataUnlockedScope&) = delete;
+    XfsMetadataUnlockedScope(XfsMetadataUnlockedScope&&) = delete;
+    auto operator=(const XfsMetadataUnlockedScope&) -> XfsMetadataUnlockedScope& = delete;
+    auto operator=(XfsMetadataUnlockedScope&&) -> XfsMetadataUnlockedScope& = delete;
+
+   private:
+    XfsMetadataGuard& guard;
+};
 
 auto xfs_commit_dirty_inode(XfsMountContext* ctx, XfsInode* ip, bool trim_eof_prealloc = false) -> int {
     if (ctx == nullptr || ip == nullptr || ctx->read_only || (!ip->dirty && !trim_eof_prealloc)) {
@@ -731,7 +761,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     return finish_read(static_cast<ssize_t>(total_read));
 }
 
-auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset) -> ssize_t {
+auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset, XfsMetadataGuard& metadata_guard) -> ssize_t {
     if (f == nullptr || buf == nullptr) {
         return -EINVAL;
     }
@@ -984,8 +1014,13 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
                 uint64_t const PERF_IO_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_IO);
                 if (SLICE_BYTES > 0) {
                     size_t const SLICE_BLOCK_OFF = SLICE_START - EXTENT_START;
-                    bool const WROTE = write_extent_data(DISK_BLOCK + (SLICE_BLOCK_OFF >> ctx->block_log),
-                                                         SLICE_BLOCK_OFF & (ctx->block_size - 1), SLICE_BYTES, SLICE_START - offset, true);
+                    bool wrote = false;
+                    {
+                        XfsMetadataUnlockedScope unlocked(metadata_guard);
+                        wrote = write_extent_data(DISK_BLOCK + (SLICE_BLOCK_OFF >> ctx->block_log), SLICE_BLOCK_OFF & (ctx->block_size - 1),
+                                                  SLICE_BYTES, SLICE_START - offset, true);
+                    }
+                    bool const WROTE = wrote;
                     if (!WROTE) {
 #ifdef XFS_BENCH
                         acc_io += ker::mod::tsc::get_ns() - t0;
@@ -1016,7 +1051,12 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
             t0 = ker::mod::tsc::get_ns();
 #endif
             uint64_t const PERF_IO_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_IO);
-            bool const WROTE = write_extent_data(DISK_BLOCK, BLOCK_OFF, CHUNK, total_written, false);
+            bool wrote = false;
+            {
+                XfsMetadataUnlockedScope unlocked(metadata_guard);
+                wrote = write_extent_data(DISK_BLOCK, BLOCK_OFF, CHUNK, total_written, false);
+            }
+            bool const WROTE = wrote;
             if (!WROTE) {
 #ifdef XFS_BENCH
                 acc_io += ker::mod::tsc::get_ns() - t0;
@@ -1088,7 +1128,7 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
 
     XfsMetadataGuard metadata_guard(xfd->mount);
     ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
-    return xfs_vfs_write_locked(f, buf, count, offset);
+    return xfs_vfs_write_locked(f, buf, count, offset, metadata_guard);
 }
 
 auto xfs_vfs_lseek(File* f, off_t offset, int whence) -> off_t {
@@ -1375,7 +1415,7 @@ auto xfs_write_append(File* f, const void* buf, size_t count, size_t* offset_out
     XfsMetadataGuard metadata_guard(xfd->mount);
     ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
     auto const OFFSET = static_cast<size_t>(xfd->inode->size);
-    ssize_t const RET = xfs_vfs_write_locked(f, buf, count, OFFSET);
+    ssize_t const RET = xfs_vfs_write_locked(f, buf, count, OFFSET, metadata_guard);
     if (RET >= 0 && offset_out != nullptr) {
         *offset_out = OFFSET;
     }
