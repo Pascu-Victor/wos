@@ -770,7 +770,8 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
         return result;
     };
 
-    auto buffered_write = [&](xfs_fsblock_t disk_block, size_t initial_block_off, size_t bytes, size_t src_offset) -> bool {
+    auto buffered_write = [&](xfs_fsblock_t disk_block, size_t initial_block_off, size_t bytes, size_t src_offset,
+                              bool fresh_allocation) -> bool {
         uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUFFERED_WRITE);
         size_t remaining_bytes = bytes;
         size_t block_off = initial_block_off;
@@ -819,12 +820,17 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
             }
 
             size_t const CHUNK = std::min(ctx->block_size - block_off, remaining_bytes);
-            BufHead* bp = xfs_buf_read(ctx, current_disk_block);
+            BufHead* bp = fresh_allocation ? xfs_buf_get(ctx, current_disk_block) : xfs_buf_read(ctx, current_disk_block);
             if (bp == nullptr) {
                 ok = false;
                 break;
             }
 
+            // Freshly allocated partial blocks have no meaningful old contents.
+            // Zero the full filesystem block so unwritten bytes stay hole-like.
+            if (fresh_allocation) {
+                std::memset(bp->data, 0, ctx->block_size);
+            }
             std::memcpy(bp->data + block_off, src + current_src_offset, CHUNK);
             bdirty(bp);
             brelse(bp);
@@ -840,8 +846,9 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
         return ok;
     };
 
-    auto write_extent_data = [&](xfs_fsblock_t disk_block, size_t initial_block_off, size_t bytes, size_t src_offset) -> bool {
-        return buffered_write(disk_block, initial_block_off, bytes, src_offset);
+    auto write_extent_data = [&](xfs_fsblock_t disk_block, size_t initial_block_off, size_t bytes, size_t src_offset,
+                                 bool fresh_allocation) -> bool {
+        return buffered_write(disk_block, initial_block_off, bytes, src_offset, fresh_allocation);
     };
 
 #ifdef XFS_BENCH
@@ -978,7 +985,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
                 if (SLICE_BYTES > 0) {
                     size_t const SLICE_BLOCK_OFF = SLICE_START - EXTENT_START;
                     bool const WROTE = write_extent_data(DISK_BLOCK + (SLICE_BLOCK_OFF >> ctx->block_log),
-                                                         SLICE_BLOCK_OFF & (ctx->block_size - 1), SLICE_BYTES, SLICE_START - offset);
+                                                         SLICE_BLOCK_OFF & (ctx->block_size - 1), SLICE_BYTES, SLICE_START - offset, true);
                     if (!WROTE) {
 #ifdef XFS_BENCH
                         acc_io += ker::mod::tsc::get_ns() - t0;
@@ -1009,7 +1016,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
             t0 = ker::mod::tsc::get_ns();
 #endif
             uint64_t const PERF_IO_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_IO);
-            bool const WROTE = write_extent_data(DISK_BLOCK, BLOCK_OFF, CHUNK, total_written);
+            bool const WROTE = write_extent_data(DISK_BLOCK, BLOCK_OFF, CHUNK, total_written, false);
             if (!WROTE) {
 #ifdef XFS_BENCH
                 acc_io += ker::mod::tsc::get_ns() - t0;
