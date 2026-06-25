@@ -1006,12 +1006,29 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
                 break;
             }
 
+            // Write the data blocks covered by this allocation, using direct
+            // full-block I/O while keeping partial head/tail blocks buffered.
+            uint64_t const SIZE_BEFORE_ALLOC = ip->size;
+            bool const DIRTY_BEFORE_ALLOC = ip->dirty;
+            size_t const EXTENT_BYTES = static_cast<size_t>(alloc_result.len) << ctx->block_log;
+            size_t const WRITE_END = offset + count;
+            size_t const EXTENT_START = static_cast<size_t>(file_block) << ctx->block_log;
+            size_t const EXTENT_END = EXTENT_START + EXTENT_BYTES;
+
+            // Compute the slice of this extent actually covered by [offset, offset+count).
+            size_t const SLICE_START = std::max(EXTENT_START, offset + total_written);
+            size_t const SLICE_END = std::min(EXTENT_END, WRITE_END);
+            size_t const SLICE_BYTES = (SLICE_END > SLICE_START) ? (SLICE_END - SLICE_START) : 0;
+
             ip->nblocks += alloc_result.len;
+            if (SLICE_BYTES > 0 && SLICE_END > ip->size) {
+                ip->size = SLICE_END;
+            }
             ip->dirty = true;
 
-            // Log inode into this allocation transaction so the inode commit
-            // is piggybacked onto the alloc commit - avoids a second journal
-            // write at the end of the write syscall.
+            // Log inode into this allocation transaction so extent updates and
+            // EOF growth share one journal commit for create/write/close-heavy
+            // workloads.
             xfs_trans_log_inode(tp, ip);
 
             ret = xfs_trans_commit(tp);
@@ -1025,19 +1042,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
                 break;
             }
 
-            // Write the data blocks covered by this allocation, using direct
-            // full-block I/O while keeping partial head/tail blocks buffered.
             {
-                size_t const EXTENT_BYTES = static_cast<size_t>(alloc_result.len) << ctx->block_log;
-                size_t const WRITE_END = offset + count;
-                size_t const EXTENT_START = static_cast<size_t>(file_block) << ctx->block_log;
-                size_t const EXTENT_END = EXTENT_START + EXTENT_BYTES;
-
-                // Compute the slice of this extent actually covered by [offset, offset+count)
-                size_t const SLICE_START = std::max(EXTENT_START, offset + total_written);
-                size_t const SLICE_END = std::min(EXTENT_END, WRITE_END);
-                size_t const SLICE_BYTES = (SLICE_END > SLICE_START) ? (SLICE_END - SLICE_START) : 0;
-
 #ifdef XFS_BENCH
                 t0 = ker::mod::tsc::get_ns();
 #endif
@@ -1052,6 +1057,9 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
                     }
                     bool const WROTE = wrote;
                     if (!WROTE) {
+                        ip->size = SIZE_BEFORE_ALLOC;
+                        ip->dirty = DIRTY_BEFORE_ALLOC || ip->dirty;
+                        static_cast<void>(xfs_commit_dirty_inode(ctx, ip, true));
 #ifdef XFS_BENCH
                         acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
