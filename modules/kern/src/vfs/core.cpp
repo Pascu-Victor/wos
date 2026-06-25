@@ -95,11 +95,11 @@ constexpr size_t PIPE_DIRECT_MAX_CAPACITY = 256UL * 1024UL;
 constexpr uint64_t ADVISORY_RANGE_EOF = UINT64_MAX;
 // CMake/Ninja tree scans touch enough distinct paths that the old 1024-entry
 // metadata cache thrashed mostly on set conflicts. Keep this static and bounded:
-// 8192 entries is still small compared with guest memory while covering the hot
-// configure/build metadata working set much better.
-constexpr size_t METADATA_CACHE_SET_COUNT = 1024;
+// 32768 entries is still modest compared with guest memory while covering large
+// checkout/configure/build metadata working sets much better.
+constexpr size_t METADATA_CACHE_SET_COUNT = 4096;
 constexpr size_t METADATA_CACHE_WAYS = 8;
-constexpr size_t METADATA_INVALIDATION_SET_COUNT = 512;
+constexpr size_t METADATA_INVALIDATION_SET_COUNT = 2048;
 constexpr size_t METADATA_INVALIDATION_WAYS = 4;
 constexpr size_t SYMLINK_CACHE_SET_COUNT = 512;
 constexpr size_t SYMLINK_CACHE_WAYS = 4;
