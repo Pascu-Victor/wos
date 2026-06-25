@@ -214,7 +214,7 @@ std::atomic<bool> dirty_writeback_wq_creating{false};
 
 bool cache_initialized = false;
 
-constexpr size_t DIRTY_HARD_LIMIT_MULTIPLIER = 2;
+constexpr size_t DIRTY_HARD_LIMIT_TARGET_MULTIPLIER = 2;
 constexpr size_t DIRTY_WRITEBACK_BUDGET = 128;
 constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = 16;
 constexpr size_t DIRTY_WAKE_BATCH = 32;
@@ -282,17 +282,14 @@ auto dirty_target_bytes_locked() -> size_t {
 }
 
 auto dirty_hard_limit_bytes_locked() -> size_t {
-    if (cache_max_bytes > SIZE_MAX / DIRTY_HARD_LIMIT_MULTIPLIER) {
+    size_t const TARGET = dirty_target_bytes_locked();
+    if (TARGET > SIZE_MAX / DIRTY_HARD_LIMIT_TARGET_MULTIPLIER) {
         return SIZE_MAX;
     }
-    return cache_max_bytes * DIRTY_HARD_LIMIT_MULTIPLIER;
+    return TARGET * DIRTY_HARD_LIMIT_TARGET_MULTIPLIER;
 }
 
-auto dirty_throttle_resume_bytes_locked() -> size_t {
-    size_t const TARGET = dirty_target_bytes_locked();
-    size_t const HARD = dirty_hard_limit_bytes_locked();
-    return std::max(TARGET, HARD / 2);
-}
+auto dirty_throttle_resume_bytes_locked() -> size_t { return dirty_target_bytes_locked(); }
 
 auto perf_elapsed_since_us(uint64_t started_us) -> uint32_t {
     uint64_t const NOW_US = ker::mod::time::get_us();
