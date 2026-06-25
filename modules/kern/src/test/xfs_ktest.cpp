@@ -93,6 +93,17 @@ KTEST(XFS, SequentialAppendPreallocatesModestRun) {
                static_cast<ker::vfs::xfs::xfs_extlen_t>(1));
 }
 
+KTEST(XFS, MappedAppendSkipsReadOnlyAtCleanBlockBoundary) {
+    constexpr size_t BLOCK_SIZE = 4096;
+
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_mapped_append_can_zero_without_read(0, 0, BLOCK_SIZE));
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_mapped_append_can_zero_without_read(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE));
+    KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_mapped_append_can_zero_without_read(BLOCK_SIZE - 1, BLOCK_SIZE - 1, BLOCK_SIZE));
+    KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_mapped_append_can_zero_without_read(BLOCK_SIZE, BLOCK_SIZE - 1, BLOCK_SIZE));
+    KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_mapped_append_can_zero_without_read(BLOCK_SIZE, BLOCK_SIZE * 2, BLOCK_SIZE));
+    KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_mapped_append_can_zero_without_read(BLOCK_SIZE, BLOCK_SIZE, 0));
+}
+
 KTEST(XFS, HoleWriteStillCapsLargeAllocations) {
     constexpr size_t BLOCK_SIZE = 4096;
     constexpr uint32_t BLOCK_LOG = 12;

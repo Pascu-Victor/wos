@@ -219,6 +219,13 @@ auto xfs_hole_write_alloc_blocks(size_t write_pos, size_t block_off, size_t rema
     return alloc_blocks == 0 ? 1 : alloc_blocks;
 }
 
+auto xfs_mapped_append_can_zero_without_read(size_t write_pos, uint64_t file_size, size_t block_size) -> bool {
+    if (block_size == 0 || write_pos != file_size) {
+        return false;
+    }
+    return (write_pos % block_size) == 0;
+}
+
 void xfs_set_sequential_alloc_hint(XfsInode* ip, XfsMountContext* ctx, xfs_fileoff_t file_block, XfsAllocReq* req) {
     if (ip == nullptr || ctx == nullptr || req == nullptr || ip->data_fork.format != XFS_DINODE_FMT_EXTENTS) {
         return;
@@ -1051,6 +1058,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
 
             size_t const EXTENT_BYTES = (static_cast<size_t>(bmap.blockcount) * ctx->block_size) - BLOCK_OFF;
             size_t const CHUNK = std::min(EXTENT_BYTES, count - total_written);
+            bool const APPEND_BLOCK_HAS_NO_OLD_BYTES = xfs_mapped_append_can_zero_without_read(WRITE_POS, ip->size, ctx->block_size);
 
 #ifdef XFS_BENCH
             t0 = ker::mod::tsc::get_ns();
@@ -1059,7 +1067,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
             bool wrote = false;
             {
                 XfsMetadataUnlockedScope unlocked(metadata_guard);
-                wrote = write_extent_data(DISK_BLOCK, BLOCK_OFF, CHUNK, total_written, false);
+                wrote = write_extent_data(DISK_BLOCK, BLOCK_OFF, CHUNK, total_written, APPEND_BLOCK_HAS_NO_OLD_BYTES);
             }
             bool const WROTE = wrote;
             if (!WROTE) {
@@ -1405,6 +1413,10 @@ auto xfs_selftest_hole_write_alloc_blocks(size_t block_off, size_t remaining_byt
 
 auto xfs_selftest_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks) -> bool {
     return xfs_truncate_zero_resets_data(old_size, nblocks);
+}
+
+auto xfs_selftest_mapped_append_can_zero_without_read(size_t write_pos, uint64_t file_size, size_t block_size) -> bool {
+    return xfs_mapped_append_can_zero_without_read(write_pos, file_size, block_size);
 }
 #endif
 
