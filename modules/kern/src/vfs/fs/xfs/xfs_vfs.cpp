@@ -1611,7 +1611,6 @@ auto xfs_find_parent_and_name(const char* fs_path, XfsMountContext* ctx, XfsInod
 
 auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ctx) -> File* {
     constexpr int O_CREAT_FLAG = 0100;
-    constexpr int O_TRUNC_FLAG = 01000;
 
     if (ctx == nullptr) {
         return nullptr;
@@ -1730,62 +1729,6 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         if (ctx->read_only) {
             xfs_inode_release(ip);
             return nullptr;
-        }
-    }
-
-    // Handle O_TRUNC on regular files
-    if ((flags & O_TRUNC_FLAG) != 0 && xfs_inode_isreg(ip) && !ctx->read_only) {
-        ker::mod::sys::MutexGuard guard(ip->io_lock);
-#ifdef XFS_DEBUG
-        mod::dbg::log("[xfs] O_TRUNC: ino=%lu old_size=%lu -> 0", static_cast<unsigned long>(ip->ino),
-                      static_cast<unsigned long>(ip->size));
-#endif
-        uint64_t const OLD_SIZE = ip->size;
-        if (xfs_truncate_zero_resets_data(OLD_SIZE, ip->nblocks)) {
-            if (OLD_SIZE != 0) {
-                int const DISCARD_RET = discard_inode_data_buffers(ctx, ip, OLD_SIZE);
-                if (DISCARD_RET < 0) {
-                    xfs_inode_release(ip);
-                    return nullptr;
-                }
-            }
-
-            XfsTransaction* tp = xfs_trans_alloc(ctx);
-            if (tp == nullptr) {
-                xfs_inode_release(ip);
-                return nullptr;
-            }
-            int const TRUNC_RET = xfs_inode_truncate_data(ip, tp);
-            if (TRUNC_RET != 0) {
-                xfs_trans_cancel(tp);
-                xfs_inode_release(ip);
-                return nullptr;
-            }
-            ip->size = 0;
-            xfs_trans_log_inode(tp, ip);
-            int const TRC = xfs_trans_commit(tp);
-#ifdef XFS_DEBUG
-            mod::dbg::log("[xfs] O_TRUNC: free-data commit rc=%d", TRC);
-#endif
-            if (TRC != 0) {
-                xfs_inode_release(ip);
-                return nullptr;
-            }
-        } else {
-            ip->size = 0;
-            ip->dirty = true;
-            XfsTransaction* tp = xfs_trans_alloc(ctx);
-            if (tp != nullptr) {
-                xfs_trans_log_inode(tp, ip);
-                int const TRC = xfs_trans_commit(tp);
-#ifdef XFS_DEBUG
-                mod::dbg::log("[xfs] O_TRUNC: commit rc=%d", TRC);
-#endif
-                if (TRC != 0) {
-                    xfs_inode_release(ip);
-                    return nullptr;
-                }
-            }
         }
     }
 
