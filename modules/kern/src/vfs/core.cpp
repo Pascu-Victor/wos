@@ -2689,6 +2689,18 @@ void stream_invalidate_file(File* file) {
     g_stream_cache_lock.unlock();
 }
 
+auto stream_cache_read_eligible(const File* file) -> bool {
+    if (file == nullptr || file->vfs_path == nullptr || (file->open_flags & ker::vfs::O_NO_CACHE) != 0) {
+        return false;
+    }
+    if ((file->open_flags & 3) != 0) {
+        return false;
+    }
+
+    return file->fs_type == FSType::TMPFS || file->fs_type == FSType::FAT32 || file->fs_type == FSType::REMOTE ||
+           file->fs_type == FSType::XFS;
+}
+
 void stream_invalidate_scope_locked(FSType fs_type, const void* scope_key) {
     if (scope_key == nullptr) {
         return;
@@ -4675,7 +4687,7 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
         return -EINVAL;
     }
 
-    bool const USE_STREAM_CACHE = (f->open_flags & ker::vfs::O_NO_CACHE) == 0;
+    bool const USE_STREAM_CACHE = stream_cache_read_eligible(f);
     ssize_t cached_result = 0;
     if (USE_STREAM_CACHE && vfs_stream_cache_try_read(f, buf, count, static_cast<uint64_t>(f->pos), actual_size, &cached_result)) {
         cached_result = clamp_io_count(cached_result, count);
@@ -8913,6 +8925,43 @@ auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool {
     vfs_put_file(file);
     ok = ok && vfs_unlink(PATH) == 0;
     return ok;
+}
+
+auto vfs_selftest_stream_cache_read_eligibility() -> bool {
+    char path[] = "/tmp/ktest_stream_cache_read_eligibility";
+
+    File xfs_read{};
+    xfs_read.fs_type = FSType::XFS;
+    xfs_read.vfs_path = path;
+
+    File xfs_write{};
+    xfs_write.fs_type = FSType::XFS;
+    xfs_write.vfs_path = path;
+    xfs_write.open_flags = 1;
+
+    File xfs_no_cache{};
+    xfs_no_cache.fs_type = FSType::XFS;
+    xfs_no_cache.vfs_path = path;
+    xfs_no_cache.open_flags = ker::vfs::O_NO_CACHE;
+
+    File anonymous_pipe{};
+    anonymous_pipe.fs_type = FSType::TMPFS;
+
+    File devfs_read{};
+    devfs_read.fs_type = FSType::DEVFS;
+    devfs_read.vfs_path = path;
+
+    File remote_read{};
+    remote_read.fs_type = FSType::REMOTE;
+    remote_read.vfs_path = path;
+
+    bool const LOCAL_REGULAR_ALLOWED = stream_cache_read_eligible(&xfs_read);
+    bool const WRITABLE_REJECTED = !stream_cache_read_eligible(&xfs_write);
+    bool const NO_CACHE_REJECTED = !stream_cache_read_eligible(&xfs_no_cache);
+    bool const ANONYMOUS_REJECTED = !stream_cache_read_eligible(&anonymous_pipe);
+    bool const DEVFS_REJECTED = !stream_cache_read_eligible(&devfs_read);
+    bool const REMOTE_ALLOWED = stream_cache_read_eligible(&remote_read);
+    return LOCAL_REGULAR_ALLOWED && WRITABLE_REJECTED && NO_CACHE_REJECTED && ANONYMOUS_REJECTED && DEVFS_REJECTED && REMOTE_ALLOWED;
 }
 #endif
 
