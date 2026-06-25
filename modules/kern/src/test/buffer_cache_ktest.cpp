@@ -788,6 +788,32 @@ KTEST(BufferCache, SyncBlockdevCoalescesContiguousDirtyRunsUpToOneMiB) {
     ker::vfs::invalidate_bdev(&dev);
 }
 
+KTEST(BufferCache, SyncRangeCoalescesContiguousDirtyRunsByBlockOrder) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    RecordingWriteState io{};
+    dev.write_blocks = recording_write;
+    dev.private_data = &io;
+    ker::vfs::invalidate_bdev(&dev);
+
+    constexpr uint64_t FIRST_BLOCK = 1000;
+    constexpr std::array<uint64_t, 4> DIRTY_ORDER{FIRST_BLOCK, FIRST_BLOCK + 2, FIRST_BLOCK + 1, FIRST_BLOCK + 3};
+
+    for (size_t i = 0; i < DIRTY_ORDER.size(); ++i) {
+        ker::vfs::BufHead* bh = ker::vfs::bget(&dev, DIRTY_ORDER.at(i));
+        KREQUIRE_NE(bh, nullptr);
+        bh->data[0] = static_cast<uint8_t>(0x90U + i);
+        ker::vfs::bdirty(bh);
+        ker::vfs::brelse(bh);
+    }
+
+    KEXPECT_EQ(ker::vfs::sync_bdev_range(&dev, FIRST_BLOCK, DIRTY_ORDER.size()), 0);
+    KREQUIRE_EQ(io.write_calls, static_cast<size_t>(1));
+    KEXPECT_EQ(io.write_blocks[0], FIRST_BLOCK);
+    KEXPECT_EQ(io.write_counts[0], DIRTY_ORDER.size());
+    KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, FIRST_BLOCK, DIRTY_ORDER.size()));
+    ker::vfs::invalidate_bdev(&dev);
+}
+
 KTEST(BufferCache, RangeOperationsHandleLastBlockWithoutWrapping) {
     ker::dev::BlockDevice dev = make_null_bdev();
     ker::vfs::invalidate_bdev(&dev);

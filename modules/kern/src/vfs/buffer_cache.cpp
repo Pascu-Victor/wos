@@ -972,6 +972,25 @@ void dirty_tree_consider_overlapping(BufHead* root, const DirtyWritebackFilter& 
     }
 }
 
+void dirty_tree_consider_starting_at(BufHead* root, uint64_t block_no, const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive,
+                                     uint64_t max_epoch_inclusive, BufHead*& best) {
+    if (root == nullptr) {
+        return;
+    }
+
+    if (root->block_no >= block_no) {
+        dirty_tree_consider_starting_at(root->dirty_left, block_no, filter, min_epoch_exclusive, max_epoch_inclusive, best);
+    }
+
+    if (root->block_no == block_no) {
+        dirty_consider_candidate(root, filter, min_epoch_exclusive, max_epoch_inclusive, best);
+    }
+
+    if (root->block_no <= block_no) {
+        dirty_tree_consider_starting_at(root->dirty_right, block_no, filter, min_epoch_exclusive, max_epoch_inclusive, best);
+    }
+}
+
 auto find_oldest_matching_dirty_buffer_locked(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive,
                                               uint64_t max_epoch_inclusive = UINT64_MAX) -> BufHead* {
     if (!dirty_filter_may_have_match_locked(filter)) {
@@ -1222,6 +1241,26 @@ auto dirty_writeback_run_can_append_locked(const DirtyWritebackRun& run, const B
            bh->size <= DIRTY_WRITEBACK_RUN_MAX_BYTES - run.bytes && run.block_count <= SIZE_MAX - BLOCK_COUNT;
 }
 
+auto find_next_contiguous_dirty_buffer_locked(const DirtyWritebackRun& run, const DirtyWritebackFilter& filter,
+                                              uint64_t min_epoch_exclusive, uint64_t max_epoch_inclusive) -> BufHead* {
+    if (dirty_index_degraded || run.count == 0 || run.bdev == nullptr || run.block_count > UINT64_MAX - run.block_no) {
+        return nullptr;
+    }
+
+    DirtyBdevState* state = find_dirty_bdev_state_locked(run.bdev);
+    if (state == nullptr || state->dirty_buffers == 0) {
+        return nullptr;
+    }
+
+    uint64_t const NEXT_BLOCK = run.block_no + static_cast<uint64_t>(run.block_count);
+    BufHead* best = nullptr;
+    dirty_tree_consider_starting_at(state->tree_root, NEXT_BLOCK, filter, min_epoch_exclusive, max_epoch_inclusive, best);
+    if (!dirty_writeback_run_can_append_locked(run, best, filter, min_epoch_exclusive, max_epoch_inclusive)) {
+        return nullptr;
+    }
+    return best;
+}
+
 void dirty_writeback_run_append_locked(DirtyWritebackRun& run, BufHead* bh, uint64_t writeback_epoch) {
     if (run.count == 0) {
         run.bdev = bh->bdev;
@@ -1257,17 +1296,31 @@ auto collect_dirty_writeback_run_locked(const DirtyWritebackFilter& filter, uint
     }
     dirty_writeback_run_append_locked(run, bh, WRITEBACK_EPOCH);
 
-    for (BufHead* next = bh->dirty_next; next != nullptr; next = next->dirty_next) {
-        if (!dirty_writeback_run_can_append_locked(run, next, filter, min_epoch_exclusive, max_epoch_inclusive)) {
-            break;
+    if (dirty_index_degraded) {
+        for (BufHead* next = bh->dirty_next; next != nullptr; next = next->dirty_next) {
+            if (!dirty_writeback_run_can_append_locked(run, next, filter, min_epoch_exclusive, max_epoch_inclusive)) {
+                break;
+            }
+            dirty_writeback_run_append_locked(run, next, WRITEBACK_EPOCH);
         }
-        dirty_writeback_run_append_locked(run, next, WRITEBACK_EPOCH);
+    } else {
+        while (BufHead* next = find_next_contiguous_dirty_buffer_locked(run, filter, min_epoch_exclusive, max_epoch_inclusive)) {
+            dirty_writeback_run_append_locked(run, next, WRITEBACK_EPOCH);
+        }
     }
 
     result.wrote = true;
     result.buffers = run.count;
     result.dirty_epoch = run.dirty_epochs.at(0);
     return result;
+}
+
+auto dirty_writeback_run_max_dirty_epoch(const DirtyWritebackRun& run) -> uint64_t {
+    uint64_t max_epoch = 0;
+    for (size_t i = 0; i < run.count; ++i) {
+        max_epoch = std::max(max_epoch, run.dirty_epochs.at(i));
+    }
+    return max_epoch;
 }
 
 auto make_writeback_run_snapshot(const DirtyWritebackRun& run) -> WritebackSnapshot {
@@ -1334,7 +1387,7 @@ auto writeback_dirty_one_after(const DirtyWritebackFilter& filter, uint64_t min_
     }
 
     result.status = write_dirty_run_snapshot(run);
-    result.dirty_epoch = result.status == 0 ? run.dirty_epochs.at(0) : run.dirty_epochs.at(run.count - 1);
+    result.dirty_epoch = result.status == 0 ? run.dirty_epochs.at(0) : dirty_writeback_run_max_dirty_epoch(run);
     for (size_t i = 0; i < run.count; ++i) {
         brelse(run.buffers.at(i));
     }
