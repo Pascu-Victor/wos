@@ -264,6 +264,13 @@ void xfs_set_sequential_alloc_hint(XfsInode* ip, XfsMountContext* ctx, xfs_fileo
 
 auto xfs_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks) -> bool { return old_size != 0 || nblocks != 0; }
 
+auto xfs_close_should_trim_prealloc(int open_flags) -> bool {
+    if ((open_flags & 3) != 0) {
+        return true;
+    }
+    return (open_flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0;
+}
+
 void xfs_stamp_new_inode(XfsInode* ip) {
     if (ip == nullptr) {
         return;
@@ -503,7 +510,7 @@ auto xfs_vfs_close(File* f) -> int {
             XfsMetadataGuard metadata_guard(xfd->mount);
             {
                 ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
-                close_result = xfs_commit_dirty_inode(xfd->mount, xfd->inode, true);
+                close_result = xfs_commit_dirty_inode(xfd->mount, xfd->inode, xfs_close_should_trim_prealloc(f->open_flags));
             }
             xfs_inode_release(xfd->inode);
         }
@@ -1440,6 +1447,8 @@ auto xfs_selftest_hole_write_alloc_blocks(size_t block_off, size_t remaining_byt
 auto xfs_selftest_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks) -> bool {
     return xfs_truncate_zero_resets_data(old_size, nblocks);
 }
+
+auto xfs_selftest_close_should_trim_prealloc(int open_flags) -> bool { return xfs_close_should_trim_prealloc(open_flags); }
 
 auto xfs_selftest_mapped_append_can_zero_without_read(size_t write_pos, uint64_t file_size, size_t block_size) -> bool {
     return xfs_mapped_append_can_zero_without_read(write_pos, file_size, block_size);
