@@ -714,19 +714,25 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 perf_accounted_us +=
                     perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
             } else {
-                int const RC = xfs_block_read_with_retry(ctx->device, dev_block, dev_count, dst + total_read);
-                if (RC != 0) {
-                    perf_accounted_us +=
-                        perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, RC, chunk);
-                    return finish_read((total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO);
-                }
-                perf_accounted_us +=
-                    perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, 0, chunk);
                 uint64_t const PERF_COPY_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY);
-                bool const OVERLAYED = copy_dirty_bdev_range(ctx->device, dev_block, dev_count, dst + total_read);
-                if (OVERLAYED) {
+                bool const COPIED_DIRTY = copy_dirty_bdev_range_if_complete(ctx->device, dev_block, dev_count, dst + total_read);
+                if (COPIED_DIRTY) {
                     perf_accounted_us +=
                         perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
+                } else {
+                    int const RC = xfs_block_read_with_retry(ctx->device, dev_block, dev_count, dst + total_read);
+                    if (RC != 0) {
+                        perf_accounted_us +=
+                            perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, RC, chunk);
+                        return finish_read((total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO);
+                    }
+                    perf_accounted_us +=
+                        perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, 0, chunk);
+                    bool const OVERLAYED = copy_dirty_bdev_range(ctx->device, dev_block, dev_count, dst + total_read);
+                    if (OVERLAYED) {
+                        perf_accounted_us +=
+                            perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
+                    }
                 }
             }
         } else {

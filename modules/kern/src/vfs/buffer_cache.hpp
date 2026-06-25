@@ -104,6 +104,10 @@ auto has_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t coun
 // order so newer overlapping cache entries remain authoritative.
 auto copy_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst) -> bool;
 
+// Copy dirty cached buffers only when they fully cover a device block range.
+// Returns false without guaranteeing dst contents when coverage is partial.
+auto copy_dirty_bdev_range_if_complete(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst) -> bool;
+
 // Write dirty buffers overlapping a device block range to disk.
 // Returns 0 on success, negative errno on failure.
 auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> int;

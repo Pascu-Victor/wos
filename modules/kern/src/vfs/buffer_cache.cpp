@@ -220,6 +220,7 @@ constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = DIRTY_WRITEBACK_BUDGET;
 constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BUFFERS = 128;
 constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BYTES = size_t{256} * 1024;
 constexpr size_t DIRTY_WAKE_BATCH = 32;
+constexpr size_t DIRTY_COPY_COVERAGE_MAX_INTERVALS = 64;
 constexpr size_t DIRTY_TARGET_DIVISOR = 2;
 constexpr size_t DIRTY_THROTTLE_RESUME_NUMERATOR = 3;
 constexpr size_t DIRTY_THROTTLE_RESUME_DENOMINATOR = 4;
@@ -264,6 +265,11 @@ struct DirtyWritebackRun {
     size_t bytes{};
     size_t count{};
     uint64_t writeback_epoch{};
+};
+
+struct DirtyCoverageInterval {
+    uint64_t first{};
+    uint64_t last{};
 };
 
 ker::util::SmallVec<DirtyBdevState*, 8> dirty_bdev_states;
@@ -1403,6 +1409,110 @@ auto copy_dirty_bdev_range_locked(dev::BlockDevice* bdev, uint64_t block_no, siz
     return copied;
 }
 
+auto dirty_intervals_touch_or_overlap(const DirtyCoverageInterval& lhs, const DirtyCoverageInterval& rhs) -> bool {
+    bool const LHS_BEFORE = lhs.last != UINT64_MAX && lhs.last + 1 < rhs.first;
+    bool const RHS_BEFORE = rhs.last != UINT64_MAX && rhs.last + 1 < lhs.first;
+    return !LHS_BEFORE && !RHS_BEFORE;
+}
+
+void dirty_coverage_add(std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS>& intervals, size_t& interval_count,
+                        DirtyCoverageInterval interval, bool& overflow) {
+    if (overflow || interval.first > interval.last) {
+        return;
+    }
+
+    for (size_t i = 0; i < interval_count;) {
+        if (!dirty_intervals_touch_or_overlap(intervals.at(i), interval)) {
+            i++;
+            continue;
+        }
+        interval.first = std::min(interval.first, intervals.at(i).first);
+        interval.last = std::max(interval.last, intervals.at(i).last);
+        intervals.at(i) = intervals.at(interval_count - 1);
+        interval_count--;
+    }
+
+    if (interval_count >= intervals.size()) {
+        overflow = true;
+        return;
+    }
+
+    intervals.at(interval_count++) = interval;
+}
+
+auto dirty_coverage_complete(const std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS>& intervals, size_t interval_count,
+                             uint64_t block_no, size_t count) -> bool {
+    uint64_t const RANGE_LAST = block_range_last_block(block_no, count);
+    for (size_t i = 0; i < interval_count; ++i) {
+        if (intervals.at(i).first <= block_no && intervals.at(i).last >= RANGE_LAST) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto copy_dirty_bdev_range_if_complete_locked(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst) -> bool {
+    if (dirty_index_degraded) {
+        return false;
+    }
+
+    DirtyWritebackFilter filter{};
+    filter.bdev = bdev;
+    filter.block_no = block_no;
+    filter.count = count;
+    filter.use_range = true;
+
+    bool copied = false;
+    bool coverage_overflow = false;
+    uint64_t min_epoch = 0;
+    std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS> coverage{};
+    size_t coverage_count = 0;
+
+    while (true) {
+        BufHead* bh = find_oldest_matching_dirty_buffer_locked(filter, min_epoch);
+        if (bh == nullptr) {
+            break;
+        }
+        min_epoch = bh->dirty_epoch;
+
+        uint64_t const BUF_LAST = dirty_buffer_last_block(bh);
+        uint64_t const RANGE_LAST = block_range_last_block(block_no, count);
+        uint64_t const COPY_FIRST = std::max(bh->block_no, block_no);
+        uint64_t const COPY_LAST = std::min(BUF_LAST, RANGE_LAST);
+        if (COPY_FIRST > COPY_LAST) {
+            continue;
+        }
+
+        size_t const BLOCK_SIZE = bdev->block_size;
+        auto const COPY_BLOCKS = static_cast<size_t>(COPY_LAST - COPY_FIRST + 1);
+        size_t copy_bytes = COPY_BLOCKS * BLOCK_SIZE;
+        size_t const SRC_OFF = static_cast<size_t>(COPY_FIRST - bh->block_no) * BLOCK_SIZE;
+        size_t const DST_OFF = static_cast<size_t>(COPY_FIRST - block_no) * BLOCK_SIZE;
+        size_t const DST_SIZE = count * BLOCK_SIZE;
+        if (SRC_OFF >= bh->size || DST_OFF >= DST_SIZE) {
+            continue;
+        }
+        copy_bytes = std::min(copy_bytes, bh->size - SRC_OFF);
+        copy_bytes = std::min(copy_bytes, DST_SIZE - DST_OFF);
+        if (copy_bytes == 0) {
+            continue;
+        }
+
+        std::memcpy(dst + DST_OFF, bh->data + SRC_OFF, copy_bytes);
+        copied = true;
+
+        uint64_t const COVERED_FIRST = block_no + (DST_OFF / BLOCK_SIZE);
+        uint64_t const COVERED_LAST = COVERED_FIRST + ((copy_bytes - 1) / BLOCK_SIZE);
+        dirty_coverage_add(coverage, coverage_count, DirtyCoverageInterval{.first = COVERED_FIRST, .last = COVERED_LAST},
+                           coverage_overflow);
+        if (coverage_overflow) {
+            return false;
+        }
+    }
+
+    return copied && dirty_coverage_complete(coverage, coverage_count, block_no, count);
+}
+
 auto copy_dirty_bdev_range_after_epoch(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst, uint64_t min_epoch_exclusive)
     -> bool {
     if (bdev == nullptr || bdev->block_size == 0 || count == 0 || dst == nullptr || !cache_initialized) {
@@ -1591,14 +1701,18 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     }
     perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_MISS, PERF_STARTED_US, 0, bdev->block_size);
 
-    int const RC = read_block_from_disk(bh);
-    if (RC != 0) {
-        irqflags = cache_lock.lock_irqsave();
-        free_buffer(bh);
-        cache_lock.unlock_irqrestore(irqflags);
-        return nullptr;
+    if (copy_dirty_bdev_range_if_complete(bdev, block_no, 1, bh->data)) {
+        bh->flags |= BH_VALID;
+    } else {
+        int const RC = read_block_from_disk(bh);
+        if (RC != 0) {
+            irqflags = cache_lock.lock_irqsave();
+            free_buffer(bh);
+            cache_lock.unlock_irqrestore(irqflags);
+            return nullptr;
+        }
+        static_cast<void>(copy_dirty_bdev_range(bdev, block_no, 1, bh->data));
     }
-    static_cast<void>(copy_dirty_bdev_range(bdev, block_no, 1, bh->data));
 
     irqflags = cache_lock.lock_irqsave();
     BufHead* existing = hash_lookup(bdev, block_no, bdev->block_size);
@@ -1670,16 +1784,20 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
     }
     perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_MISS, PERF_STARTED_US, 0, TOTAL_SIZE);
 
-    // Read from disk outside the lock
-    int const RC = read_blocks_with_retry(bdev, block_no, count, bh->data);
-    if (RC != 0) {
-        irqflags = cache_lock.lock_irqsave();
-        free_buffer(bh);
-        cache_lock.unlock_irqrestore(irqflags);
-        return nullptr;
+    if (copy_dirty_bdev_range_if_complete(bdev, block_no, count, bh->data)) {
+        bh->flags |= BH_VALID;
+    } else {
+        // Read from disk outside the lock
+        int const RC = read_blocks_with_retry(bdev, block_no, count, bh->data);
+        if (RC != 0) {
+            irqflags = cache_lock.lock_irqsave();
+            free_buffer(bh);
+            cache_lock.unlock_irqrestore(irqflags);
+            return nullptr;
+        }
+        bh->flags |= BH_VALID;
+        static_cast<void>(copy_dirty_bdev_range(bdev, block_no, count, bh->data));
     }
-    bh->flags |= BH_VALID;
-    static_cast<void>(copy_dirty_bdev_range(bdev, block_no, count, bh->data));
 
     irqflags = cache_lock.lock_irqsave();
     BufHead* existing = hash_lookup(bdev, block_no, TOTAL_SIZE);
@@ -1924,6 +2042,20 @@ auto has_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t coun
 
 auto copy_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst) -> bool {
     return copy_dirty_bdev_range_after_epoch(bdev, block_no, count, dst, 0);
+}
+
+auto copy_dirty_bdev_range_if_complete(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst) -> bool {
+    if (bdev == nullptr || bdev->block_size == 0 || count == 0 || dst == nullptr || !cache_initialized) {
+        return false;
+    }
+    if (count > SIZE_MAX / bdev->block_size) {
+        return false;
+    }
+
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    bool const COPIED = cache_dirty_buffers != 0 && copy_dirty_bdev_range_if_complete_locked(bdev, block_no, count, dst);
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    return COPIED;
 }
 
 void kick_dirty_buffer_cache_writeback(dev::BlockDevice* bdev) {

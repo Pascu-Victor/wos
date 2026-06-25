@@ -31,6 +31,19 @@ struct RecordingWriteState {
     uint8_t write_first_bytes[128]{};
 };
 
+struct RecordingReadState {
+    size_t read_calls = 0;
+};
+
+auto recording_read(ker::dev::BlockDevice* dev, uint64_t /*block*/, size_t count, void* buffer) -> int {
+    auto* state = static_cast<RecordingReadState*>(dev->private_data);
+    if (state != nullptr) {
+        state->read_calls++;
+    }
+    memset(buffer, 0, count * dev->block_size);
+    return 0;
+}
+
 struct RedirtyingWriteState {
     ker::vfs::BufHead* bh = nullptr;
     size_t write_calls = 0;
@@ -467,6 +480,40 @@ KTEST(BufferCache, DirtyRangeIndexFindsAndOverlaysDirtySpan) {
     KEXPECT_EQ(read_buf[(8 * 512) - 1], static_cast<uint8_t>(0xCC));
     KEXPECT_EQ(read_buf[8 * 512], static_cast<uint8_t>(0));
 
+    ker::vfs::invalidate_bdev(&dev);
+}
+
+KTEST(BufferCache, BreadMultiMissCopiesCompleteDirtyRangeWithoutDeviceRead) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    RecordingReadState reads{};
+    dev.read_blocks = recording_read;
+    dev.private_data = &reads;
+    ker::vfs::invalidate_bdev(&dev);
+
+    constexpr uint64_t BLK = 1100;
+    constexpr size_t COUNT = 4;
+    for (size_t i = 0; i < COUNT; ++i) {
+        ker::vfs::BufHead* dirty = ker::vfs::bget(&dev, BLK + i);
+        KREQUIRE_NE(dirty, nullptr);
+        memset(dirty->data, static_cast<int>(0x30 + i), dirty->size);
+        ker::vfs::bdirty(dirty);
+        ker::vfs::brelse(dirty);
+    }
+
+    std::array<uint8_t, COUNT * 512> copied{};
+    KEXPECT_TRUE(ker::vfs::copy_dirty_bdev_range_if_complete(&dev, BLK, COUNT, copied.data()));
+    for (size_t i = 0; i < COUNT; ++i) {
+        KEXPECT_EQ(copied.at(i * 512), static_cast<uint8_t>(0x30 + i));
+    }
+
+    ker::vfs::BufHead* reread = ker::vfs::bread_multi(&dev, BLK, COUNT);
+    KREQUIRE_NE(reread, nullptr);
+    KEXPECT_EQ(reads.read_calls, static_cast<size_t>(0));
+    for (size_t i = 0; i < COUNT; ++i) {
+        KEXPECT_EQ(reread->data[i * 512], static_cast<uint8_t>(0x30 + i));
+    }
+
+    ker::vfs::brelse(reread);
     ker::vfs::invalidate_bdev(&dev);
 }
 
