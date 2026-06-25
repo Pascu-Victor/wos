@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -65,6 +66,10 @@ constexpr xfs_extlen_t XFS_STREAM_PREALLOC_BLOCKS = 1024;  // 4 MiB
 constexpr size_t XFS_APPEND_PREALLOC_TRIGGER_BYTES = size_t{16} * 1024;
 constexpr xfs_extlen_t XFS_APPEND_PREALLOC_BLOCKS = 16;  // 64 KiB
 constexpr uint32_t XFS_STREAM_PREALLOC_EXTENT_MARGIN = 8;
+constexpr size_t XFS_PARENT_PATH_CACHE_PATH_MAX = 512;
+constexpr size_t XFS_PARENT_PATH_CACHE_SET_COUNT = 1024;
+constexpr size_t XFS_PARENT_PATH_CACHE_WAYS = 4;
+static_assert((XFS_PARENT_PATH_CACHE_SET_COUNT & (XFS_PARENT_PATH_CACHE_SET_COUNT - 1)) == 0);
 
 // ============================================================================
 // Per-open-file state
@@ -73,6 +78,20 @@ constexpr uint32_t XFS_STREAM_PREALLOC_EXTENT_MARGIN = 8;
 struct XfsFileData {
     XfsMountContext* mount;
     XfsInode* inode;  // reference-counted inode
+};
+
+struct XfsParentPathCacheEntry {
+    XfsMountContext* mount{};
+    std::array<char, XFS_PARENT_PATH_CACHE_PATH_MAX> path{};
+    size_t path_len{};
+    xfs_ino_t ino{};
+    uint64_t hash{};
+    uint64_t last_used{};
+    bool valid{};
+};
+
+struct XfsParentPathCacheSet {
+    std::array<XfsParentPathCacheEntry, XFS_PARENT_PATH_CACHE_WAYS> ways{};
 };
 
 class XfsMetadataGuard {
@@ -310,6 +329,96 @@ class XfsMetadataUnlockedScope {
    private:
     XfsMetadataGuard& guard;
 };
+
+std::array<XfsParentPathCacheSet, XFS_PARENT_PATH_CACHE_SET_COUNT> g_xfs_parent_path_cache{};
+ker::mod::sys::Mutex g_xfs_parent_path_cache_lock;
+std::atomic<uint64_t> g_xfs_parent_path_cache_clock{0};
+
+auto xfs_parent_path_cache_hash(XfsMountContext* ctx, const char* path, size_t path_len) -> uint64_t {
+    uint64_t hash = 1469598103934665603ULL ^ reinterpret_cast<uintptr_t>(ctx);
+    for (size_t i = 0; i < path_len; ++i) {
+        hash ^= static_cast<unsigned char>(path[i]);
+        hash *= 1099511628211ULL;
+    }
+    hash ^= hash >> 33U;
+    hash *= 0xff51afd7ed558ccdULL;
+    hash ^= hash >> 33U;
+    return hash == 0 ? 1 : hash;
+}
+
+auto xfs_parent_path_cache_lookup_ino(XfsMountContext* ctx, const char* path, size_t path_len, xfs_ino_t* ino_out) -> bool {
+    if (ctx == nullptr || path == nullptr || ino_out == nullptr || path_len == 0 || path_len >= XFS_PARENT_PATH_CACHE_PATH_MAX) {
+        return false;
+    }
+
+    uint64_t const HASH = xfs_parent_path_cache_hash(ctx, path, path_len);
+    auto& set = g_xfs_parent_path_cache[HASH & (XFS_PARENT_PATH_CACHE_SET_COUNT - 1)];
+
+    ker::mod::sys::MutexGuard guard(g_xfs_parent_path_cache_lock);
+    for (auto& entry : set.ways) {
+        if (!entry.valid || entry.mount != ctx || entry.hash != HASH || entry.path_len != path_len) {
+            continue;
+        }
+        if (std::memcmp(entry.path.data(), path, path_len + 1) != 0) {
+            continue;
+        }
+        entry.last_used = g_xfs_parent_path_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+        *ino_out = entry.ino;
+        return true;
+    }
+    return false;
+}
+
+void xfs_parent_path_cache_store(XfsMountContext* ctx, const char* path, size_t path_len, xfs_ino_t ino) {
+    if (ctx == nullptr || path == nullptr || ino == NULLFSINO || path_len == 0 || path_len >= XFS_PARENT_PATH_CACHE_PATH_MAX) {
+        return;
+    }
+
+    uint64_t const HASH = xfs_parent_path_cache_hash(ctx, path, path_len);
+    uint64_t const USE_STAMP = g_xfs_parent_path_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto& set = g_xfs_parent_path_cache[HASH & (XFS_PARENT_PATH_CACHE_SET_COUNT - 1)];
+
+    ker::mod::sys::MutexGuard guard(g_xfs_parent_path_cache_lock);
+    XfsParentPathCacheEntry* victim = &set.ways.front();
+    for (auto& entry : set.ways) {
+        if (entry.valid && entry.mount == ctx && entry.hash == HASH && entry.path_len == path_len &&
+            std::memcmp(entry.path.data(), path, path_len + 1) == 0) {
+            victim = &entry;
+            break;
+        }
+        if (!entry.valid) {
+            victim = &entry;
+            break;
+        }
+        if (entry.last_used < victim->last_used) {
+            victim = &entry;
+        }
+    }
+
+    victim->path.fill('\0');
+    std::memcpy(victim->path.data(), path, path_len + 1);
+    victim->mount = ctx;
+    victim->path_len = path_len;
+    victim->ino = ino;
+    victim->hash = HASH;
+    victim->last_used = USE_STAMP;
+    victim->valid = true;
+}
+
+void xfs_parent_path_cache_purge_all_for_mount(XfsMountContext* ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+
+    ker::mod::sys::MutexGuard guard(g_xfs_parent_path_cache_lock);
+    for (auto& set : g_xfs_parent_path_cache) {
+        for (auto& entry : set.ways) {
+            if (entry.valid && entry.mount == ctx) {
+                entry.valid = false;
+            }
+        }
+    }
+}
 
 auto xfs_commit_dirty_inode(XfsMountContext* ctx, XfsInode* ip, bool trim_eof_prealloc = false) -> int {
     if (ctx == nullptr || ip == nullptr || ctx->read_only || (!ip->dirty && !trim_eof_prealloc)) {
@@ -1438,6 +1547,8 @@ FileOperations xfs_fops = {
 
 auto get_xfs_fops() -> FileOperations* { return &xfs_fops; }
 
+void xfs_parent_path_cache_purge_mount(XfsMountContext* ctx) { xfs_parent_path_cache_purge_all_for_mount(ctx); }
+
 #ifdef WOS_SELFTEST
 auto xfs_selftest_hole_write_alloc_blocks(size_t block_off, size_t remaining_bytes, xfs_filblks_t hole_blocks, size_t block_size,
                                           uint32_t block_log, size_t write_pos, bool sequential_append) -> xfs_extlen_t {
@@ -1455,6 +1566,26 @@ auto xfs_selftest_mapped_append_can_zero_without_read(size_t write_pos, uint64_t
 }
 
 auto xfs_selftest_direct_read_batch_max_bytes(size_t block_size) -> size_t { return xfs_direct_read_batch_max_bytes(block_size); }
+
+auto xfs_selftest_parent_path_cache() -> bool {
+    XfsMountContext mount_a{};
+    XfsMountContext mount_b{};
+    constexpr const char* PATH = "toolchain/src/llvm-project";
+    size_t const PATH_LEN = std::strlen(PATH);
+    constexpr xfs_ino_t INO = 42;
+
+    xfs_parent_path_cache_purge_all_for_mount(&mount_a);
+    xfs_parent_path_cache_purge_all_for_mount(&mount_b);
+
+    xfs_ino_t ino = NULLFSINO;
+    bool ok = !xfs_parent_path_cache_lookup_ino(&mount_a, PATH, PATH_LEN, &ino);
+    xfs_parent_path_cache_store(&mount_a, PATH, PATH_LEN, INO);
+    ok = ok && xfs_parent_path_cache_lookup_ino(&mount_a, PATH, PATH_LEN, &ino) && ino == INO;
+    ok = ok && !xfs_parent_path_cache_lookup_ino(&mount_b, PATH, PATH_LEN, &ino);
+    xfs_parent_path_cache_purge_all_for_mount(&mount_a);
+    ok = ok && !xfs_parent_path_cache_lookup_ino(&mount_a, PATH, PATH_LEN, &ino);
+    return ok;
+}
 #endif
 
 auto xfs_write_append(File* f, const void* buf, size_t count, size_t* offset_out) -> ssize_t {
@@ -1597,7 +1728,21 @@ auto xfs_find_parent_and_name(const char* fs_path, XfsMountContext* ctx, XfsInod
         }
         std::memcpy(static_cast<char*>(parent_path), fs_path, parent_len);
         parent_path[parent_len] = '\0';
-        parent_ip = walk_path(ctx, static_cast<const char*>(parent_path));
+        xfs_ino_t cached_parent_ino = NULLFSINO;
+        auto const* parent_path_chars = static_cast<const char*>(parent_path);
+        if (xfs_parent_path_cache_lookup_ino(ctx, parent_path_chars, parent_len, &cached_parent_ino)) {
+            parent_ip = xfs_inode_read(ctx, cached_parent_ino);
+            if (parent_ip != nullptr && !xfs_inode_isdir(parent_ip)) {
+                xfs_inode_release(parent_ip);
+                parent_ip = nullptr;
+            }
+        }
+        if (parent_ip == nullptr) {
+            parent_ip = walk_path(ctx, parent_path_chars);
+            if (parent_ip != nullptr && xfs_inode_isdir(parent_ip)) {
+                xfs_parent_path_cache_store(ctx, parent_path_chars, parent_len, parent_ip->ino);
+            }
+        }
         name = last_slash + 1;
     }
 
@@ -2246,6 +2391,9 @@ auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx) -> int {
     xfs_trans_log_inode(tp, dir_ip);
 
     rc = xfs_trans_commit(tp);
+    if (rc == 0) {
+        xfs_parent_path_cache_purge_all_for_mount(ctx);
+    }
     xfs_inode_release(dir_ip);
     xfs_inode_release(parent_ip);
     return (rc == 0) ? 0 : -EIO;
@@ -2349,6 +2497,9 @@ auto xfs_rename_path(const char* old_fs_path, const char* new_fs_path, XfsMountC
     xfs_trans_log_inode(tp, new_parent);
 
     rc = xfs_trans_commit(tp);
+    if (rc == 0) {
+        xfs_parent_path_cache_purge_all_for_mount(ctx);
+    }
     if (displaced != nullptr) {
         xfs_inode_release(displaced);
     }

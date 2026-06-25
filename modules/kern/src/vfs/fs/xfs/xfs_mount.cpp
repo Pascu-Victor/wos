@@ -397,6 +397,7 @@ void xfs_unmount(XfsMountContext* ctx) {
 
     xfs_icache_purge(ctx);
     xfs_dentry_cache_purge_mount(ctx);
+    xfs_parent_path_cache_purge_mount(ctx);
 
     // Invalidate cached buffers
     invalidate_bdev(ctx->device);

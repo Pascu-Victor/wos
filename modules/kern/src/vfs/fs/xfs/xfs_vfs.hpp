@@ -44,6 +44,9 @@ auto xfs_fsync(File* f) -> int;
 // Commit dirty mount metadata and flush the backing block device.
 auto xfs_sync_mount(XfsMountContext* ctx) -> int;
 
+// Drop path-derived caches associated with an XFS mount.
+void xfs_parent_path_cache_purge_mount(XfsMountContext* ctx);
+
 // Collect stable direct block extents for an already-open regular file used as
 // swap backing. The caller owns the returned array and must delete[] it.
 auto xfs_collect_swap_extents(File* f, ker::mod::mm::swap::SwapExtent** extents_out, size_t* extent_count_out) -> int;
@@ -55,6 +58,7 @@ auto xfs_selftest_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks)
 auto xfs_selftest_close_should_trim_prealloc(int open_flags) -> bool;
 auto xfs_selftest_mapped_append_can_zero_without_read(size_t write_pos, uint64_t file_size, size_t block_size) -> bool;
 auto xfs_selftest_direct_read_batch_max_bytes(size_t block_size) -> size_t;
+auto xfs_selftest_parent_path_cache() -> bool;
 #endif
 
 // Filesystem statistics (statvfs).
