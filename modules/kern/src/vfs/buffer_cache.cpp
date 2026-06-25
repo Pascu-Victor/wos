@@ -216,9 +216,11 @@ bool cache_initialized = false;
 
 constexpr size_t DIRTY_HARD_LIMIT_TARGET_MULTIPLIER = 2;
 constexpr size_t DIRTY_WRITEBACK_BUDGET = 128;
-constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = 16;
+constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = DIRTY_WRITEBACK_BUDGET;
 constexpr size_t DIRTY_WAKE_BATCH = 32;
 constexpr size_t DIRTY_TARGET_DIVISOR = 2;
+constexpr size_t DIRTY_THROTTLE_RESUME_NUMERATOR = 3;
+constexpr size_t DIRTY_THROTTLE_RESUME_DENOMINATOR = 4;
 constexpr size_t BUFFER_CACHE_MEMORY_DIVISOR = 32;
 constexpr size_t BUFFER_CACHE_MAX_SIZE = static_cast<size_t>(512) * 1024 * 1024;
 
@@ -289,7 +291,14 @@ auto dirty_hard_limit_bytes_locked() -> size_t {
     return TARGET * DIRTY_HARD_LIMIT_TARGET_MULTIPLIER;
 }
 
-auto dirty_throttle_resume_bytes_locked() -> size_t { return dirty_target_bytes_locked(); }
+auto dirty_throttle_resume_bytes_locked() -> size_t {
+    size_t const TARGET = dirty_target_bytes_locked();
+    size_t const HARD = dirty_hard_limit_bytes_locked();
+    if (HARD <= TARGET) {
+        return TARGET;
+    }
+    return TARGET + (((HARD - TARGET) * DIRTY_THROTTLE_RESUME_NUMERATOR) / DIRTY_THROTTLE_RESUME_DENOMINATOR);
+}
 
 auto perf_elapsed_since_us(uint64_t started_us) -> uint32_t {
     uint64_t const NOW_US = ker::mod::time::get_us();
