@@ -1259,45 +1259,6 @@ void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, boo
     g_metadata_cache_lock.unlock();
 }
 
-void metadata_cache_drop_path_entries(const char* path, FSType fs_type, uint64_t dev_id) {
-    if (path == nullptr || !metadata_cacheable_fs(fs_type)) {
-        return;
-    }
-
-    size_t const PATH_LEN = std::strlen(path);
-    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
-        return;
-    }
-
-    bool dropped = false;
-    g_metadata_cache_lock.lock();
-    for (uint8_t follow_value = 0; follow_value < 2; ++follow_value) {
-        for (uint8_t directory_value = 0; directory_value < 2; ++directory_value) {
-            bool const FOLLOW_FINAL_SYMLINK = follow_value != 0;
-            bool const REQUIRE_DIRECTORY = directory_value != 0;
-            uint64_t const HASH = metadata_hash_path(path, PATH_LEN, FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, fs_type, dev_id);
-            auto& set = g_metadata_cache.at(HASH & (METADATA_CACHE_SET_COUNT - 1));
-            for (auto& entry : set.ways) {
-                if (!entry.valid || entry.hash != HASH || entry.path_len != PATH_LEN || entry.fs_type != fs_type ||
-                    entry.dev_id != dev_id || entry.follow_final_symlink != FOLLOW_FINAL_SYMLINK ||
-                    entry.require_directory != REQUIRE_DIRECTORY) {
-                    continue;
-                }
-                if (std::memcmp(entry.path.data(), path, PATH_LEN + 1) != 0) {
-                    continue;
-                }
-                entry.valid = false;
-                dropped = true;
-            }
-        }
-    }
-    g_metadata_cache_lock.unlock();
-
-    if (dropped) {
-        g_metadata_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
-    }
-}
-
 auto symlink_hash_path(const char* path, size_t len, FSType fs_type, uint64_t dev_id) -> uint64_t {
     uint64_t hash = 1469598103934665603ULL;
     for (size_t i = 0; i < len; ++i) {
@@ -2832,10 +2793,6 @@ void cache_notify_file_data_changed_impl(File* file) {
 
     if (file->vfs_path != nullptr && metadata_cacheable_fs(file->fs_type)) {
         metadata_cache_note_file_data_changed(file->vfs_path, file->fs_type);
-        MountRef mount_ref = find_mount_point(file->vfs_path);
-        MountPoint const* mount = mount_ref.get();
-        uint64_t const DEV_ID = (mount != nullptr) ? mount->dev_id : 0;
-        metadata_cache_drop_path_entries(file->vfs_path, file->fs_type, DEV_ID);
     }
 
     if (cache_notify_invalidate_path_local(file->vfs_path)) {
@@ -8953,6 +8910,37 @@ auto vfs_selftest_anonymous_fstat_snapshot_hits() -> bool {
     bool const CLOSED_READ = pipefd[0] >= 0 && pipe_close_fake_task_fd(task, pipefd[0]);
     bool const CLOSED_WRITE = pipefd[1] >= 0 && pipe_close_fake_task_fd(task, pipefd[1]);
     return ok && CLOSED_READ && CLOSED_WRITE && task.fd_table.empty();
+}
+
+auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_file_data_stat_invalidation";
+    constexpr char FIRST[] = "abc";
+    constexpr char SECOND[] = "defgh";
+    vfs_unlink(PATH);
+
+    auto* file = vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (file == nullptr || file->fops == nullptr || file->fops->vfs_write == nullptr) {
+        return false;
+    }
+
+    bool ok = file->fops->vfs_write(file, FIRST, sizeof(FIRST) - 1, 0) == static_cast<ssize_t>(sizeof(FIRST) - 1);
+    cache_notify_file_data_changed_impl(file);
+
+    Stat st{};
+    ok = ok && vfs_stat(PATH, &st) == 0 && st.st_size == static_cast<off_t>(sizeof(FIRST) - 1);
+    ok = ok && vfs_stat(PATH, &st) == 0 && st.st_size == static_cast<off_t>(sizeof(FIRST) - 1);
+
+    constexpr size_t SECOND_OFFSET = sizeof(FIRST) - 1;
+    ok = ok && file->fops->vfs_write(file, SECOND, sizeof(SECOND) - 1, SECOND_OFFSET) == static_cast<ssize_t>(sizeof(SECOND) - 1);
+    cache_notify_file_data_changed_impl(file);
+
+    ok = ok && vfs_stat(PATH, &st) == 0 && st.st_size == static_cast<off_t>((sizeof(FIRST) - 1) + (sizeof(SECOND) - 1));
+
+    vfs_put_file(file);
+    ok = ok && vfs_unlink(PATH) == 0;
+    return ok;
 }
 #endif
 

@@ -31,6 +31,8 @@ KTEST(VFS, PipeFlags) { KEXPECT_TRUE(ker::vfs::vfs_selftest_pipe_flags()); }
 
 KTEST(VFS, AnonymousFstatSnapshotHits) { KEXPECT_TRUE(ker::vfs::vfs_selftest_anonymous_fstat_snapshot_hits()); }
 
+KTEST(VFS, FileDataWriteInvalidatesPathStat) { KEXPECT_TRUE(ker::vfs::vfs_selftest_file_data_write_invalidates_path_stat()); }
+
 KTEST(VFS, FdAllocationCapsCloexecRange) { KEXPECT_TRUE(ker::vfs::vfs_selftest_fd_allocation_caps_cloexec_range()); }
 
 KTEST(VFS, CreateAndStat) {
