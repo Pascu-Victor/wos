@@ -63,7 +63,7 @@ constexpr size_t XFS_DIRTY_THROTTLE_INTERVAL_BYTES = size_t{4} * 1024 * 1024;
 constexpr size_t XFS_STREAM_PREALLOC_TRIGGER_BYTES = size_t{512} * 1024;
 constexpr xfs_extlen_t XFS_STREAM_PREALLOC_BLOCKS = 1024;  // 4 MiB
 constexpr size_t XFS_APPEND_PREALLOC_TRIGGER_BYTES = size_t{16} * 1024;
-constexpr xfs_extlen_t XFS_APPEND_PREALLOC_BLOCKS = 64;  // 256 KiB
+constexpr xfs_extlen_t XFS_APPEND_PREALLOC_BLOCKS = 16;  // 64 KiB
 constexpr uint32_t XFS_STREAM_PREALLOC_EXTENT_MARGIN = 8;
 
 // ============================================================================

@@ -88,7 +88,7 @@ KTEST(XFS, SequentialAppendPreallocatesModestRun) {
     constexpr ker::vfs::xfs::xfs_filblks_t UNBOUNDED_HOLE = ~static_cast<ker::vfs::xfs::xfs_filblks_t>(0);
 
     KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(0, 4096, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG, APPEND_POS, true),
-               static_cast<ker::vfs::xfs::xfs_extlen_t>(64));
+               static_cast<ker::vfs::xfs::xfs_extlen_t>(16));
     KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(0, 4096, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG, APPEND_POS, false),
                static_cast<ker::vfs::xfs::xfs_extlen_t>(1));
 }
