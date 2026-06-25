@@ -727,8 +727,8 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                     perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
             } else {
                 uint64_t const PERF_COPY_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY);
-                bool const COPIED_DIRTY = copy_dirty_bdev_range_if_complete(ctx->device, dev_block, dev_count, dst + total_read);
-                if (COPIED_DIRTY) {
+                bool const COPIED_CACHED = copy_cached_bdev_range_if_complete(ctx->device, dev_block, dev_count, dst + total_read);
+                if (COPIED_CACHED) {
                     perf_accounted_us +=
                         perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
                 } else {

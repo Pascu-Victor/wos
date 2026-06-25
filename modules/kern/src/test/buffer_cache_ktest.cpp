@@ -585,6 +585,12 @@ KTEST(BufferCache, BreadMissCopiesCleanMultiAliasAfterWriteback) {
     KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), 0);
     KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, BLK, 8));
 
+    std::array<uint8_t, 2 * 512> copied{};
+    KEXPECT_TRUE(ker::vfs::copy_cached_bdev_range_if_complete(&dev, BLK + 2, 2, copied.data()));
+    KEXPECT_EQ(copied.at(0), static_cast<uint8_t>(0x61));
+    KEXPECT_EQ(copied.at(copied.size() - 1), static_cast<uint8_t>(0x61));
+    KEXPECT_EQ(reads.read_calls, static_cast<size_t>(1));
+
     ker::vfs::BufHead* reread_single = ker::vfs::bread(&dev, BLK + 3);
     KREQUIRE_NE(reread_single, nullptr);
     KEXPECT_EQ(reads.read_calls, static_cast<size_t>(1));

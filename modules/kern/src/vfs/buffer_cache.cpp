@@ -933,7 +933,7 @@ void range_copy_cached_overlaps_locked(BufHead* root, dev::BlockDevice* bdev, ui
     }
 }
 
-auto copy_cached_bdev_range_if_complete(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst) -> bool {
+auto copy_cached_bdev_range_if_complete_internal(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst) -> bool {
     if (bdev == nullptr || bdev->block_size == 0 || count == 0 || dst == nullptr || !cache_initialized || range_index_degraded) {
         return false;
     }
@@ -2172,7 +2172,8 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     }
     perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_MISS, PERF_STARTED_US, 0, bdev->block_size);
 
-    if (copy_cached_bdev_range_if_complete(bdev, block_no, 1, bh->data) || copy_dirty_bdev_range_if_complete(bdev, block_no, 1, bh->data)) {
+    if (copy_cached_bdev_range_if_complete_internal(bdev, block_no, 1, bh->data) ||
+        copy_dirty_bdev_range_if_complete(bdev, block_no, 1, bh->data)) {
         bh->flags |= BH_VALID;
     } else {
         int const RC = read_block_from_disk(bh);
@@ -2255,7 +2256,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
     }
     perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_MISS, PERF_STARTED_US, 0, TOTAL_SIZE);
 
-    if (copy_cached_bdev_range_if_complete(bdev, block_no, count, bh->data) ||
+    if (copy_cached_bdev_range_if_complete_internal(bdev, block_no, count, bh->data) ||
         copy_dirty_bdev_range_if_complete(bdev, block_no, count, bh->data)) {
         bh->flags |= BH_VALID;
     } else {
@@ -2528,6 +2529,10 @@ auto copy_dirty_bdev_range_if_complete(dev::BlockDevice* bdev, uint64_t block_no
     bool const COPIED = cache_dirty_buffers != 0 && copy_dirty_bdev_range_if_complete_locked(bdev, block_no, count, dst);
     cache_lock.unlock_irqrestore(IRQFLAGS);
     return COPIED;
+}
+
+auto copy_cached_bdev_range_if_complete(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst) -> bool {
+    return copy_cached_bdev_range_if_complete_internal(bdev, block_no, count, dst);
 }
 
 void kick_dirty_buffer_cache_writeback(dev::BlockDevice* bdev) {
