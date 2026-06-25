@@ -107,6 +107,10 @@ KTEST(XFS, ShortformReaddirCookiesProgressAcrossDuplicateOffsets) {
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_shortform_readdir_cookies_are_monotonic());
 }
 
+KTEST(XFS, ShortformReaddirCookiesResumeAfterRemovals) {
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_shortform_readdir_resume_after_removals());
+}
+
 // ---------------------------------------------------------------------------
 // xfs_mount() error path: corrupt magic (all zeros) must return != 0
 // ---------------------------------------------------------------------------
