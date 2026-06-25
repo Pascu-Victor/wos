@@ -1155,44 +1155,50 @@ auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bo
 
     uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
     uint64_t const HASH = metadata_hash_path(path, PATH_LEN, follow_final_symlink, require_directory, fs_type, dev_id);
-    auto& set = g_metadata_cache.at(HASH & (METADATA_CACHE_SET_COUNT - 1));
+    auto& set = g_metadata_cache[HASH & (METADATA_CACHE_SET_COUNT - 1)];
 
     bool saw_valid = false;
     bool saw_stale_generation = false;
     bool saw_invalidated = false;
-    g_metadata_cache_lock.lock();
-    for (auto& entry : set.ways) {
-        if (!entry.valid) {
-            continue;
-        }
-        saw_valid = true;
-        if (entry.hash != HASH || entry.path_len != PATH_LEN || entry.fs_type != fs_type || entry.dev_id != dev_id ||
-            entry.follow_final_symlink != follow_final_symlink || entry.require_directory != require_directory) {
-            continue;
-        }
-        if (std::memcmp(entry.path.data(), path, PATH_LEN + 1) != 0) {
-            continue;
-        }
-        if (entry.epoch != EPOCH) {
-            saw_stale_generation = true;
-            continue;
-        }
-        if (metadata_path_invalidated_since(entry.path.data(), entry.path_len, entry.invalidation_generation)) {
-            entry.valid = false;
-            saw_invalidated = true;
-            continue;
-        }
+    bool cache_hit = false;
+    int cache_result = -EAGAIN;
+    {
+        ker::mod::sys::MutexGuard guard(g_metadata_cache_lock);
+        for (auto& entry : set.ways) {
+            if (!entry.valid) {
+                continue;
+            }
+            saw_valid = true;
+            if (entry.hash != HASH || entry.path_len != PATH_LEN || entry.fs_type != fs_type || entry.dev_id != dev_id ||
+                entry.follow_final_symlink != follow_final_symlink || entry.require_directory != require_directory) {
+                continue;
+            }
+            if (std::memcmp(entry.path.data(), path, PATH_LEN + 1) != 0) {
+                continue;
+            }
+            if (entry.epoch != EPOCH) {
+                saw_stale_generation = true;
+                continue;
+            }
+            if (metadata_path_invalidated_since(entry.path.data(), entry.path_len, entry.invalidation_generation)) {
+                entry.valid = false;
+                saw_invalidated = true;
+                continue;
+            }
 
-        entry.last_used = g_metadata_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
-        int const RESULT = entry.result;
-        if (RESULT == 0) {
-            *statbuf = entry.stat;
+            entry.last_used = g_metadata_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+            cache_result = entry.result;
+            if (cache_result == 0) {
+                *statbuf = entry.stat;
+            }
+            cache_hit = true;
+            break;
         }
-        g_metadata_cache_lock.unlock();
-        g_vfs_metadata_hits.fetch_add(1, std::memory_order_relaxed);
-        return RESULT;
     }
-    g_metadata_cache_lock.unlock();
+    if (cache_hit) {
+        g_vfs_metadata_hits.fetch_add(1, std::memory_order_relaxed);
+        return cache_result;
+    }
     g_vfs_metadata_misses.fetch_add(1, std::memory_order_relaxed);
     if (saw_invalidated) {
         g_vfs_metadata_miss_invalidated.fetch_add(1, std::memory_order_relaxed);
@@ -1224,42 +1230,43 @@ void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, boo
     uint64_t const INVALIDATION_GENERATION = g_metadata_invalidation_generation.load(std::memory_order_acquire);
     uint64_t const HASH = metadata_hash_path(path, PATH_LEN, follow_final_symlink, require_directory, fs_type, dev_id);
     uint64_t const USE_STAMP = g_metadata_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
-    auto& set = g_metadata_cache.at(HASH & (METADATA_CACHE_SET_COUNT - 1));
+    auto& set = g_metadata_cache[HASH & (METADATA_CACHE_SET_COUNT - 1)];
 
-    g_metadata_cache_lock.lock();
-    MetadataCacheEntry* victim = &set.ways.front();
-    for (auto& entry : set.ways) {
-        if (entry.valid && entry.epoch == EPOCH && entry.hash == HASH && entry.path_len == PATH_LEN && entry.fs_type == fs_type &&
-            entry.dev_id == dev_id && entry.follow_final_symlink == follow_final_symlink && entry.require_directory == require_directory &&
-            std::memcmp(entry.path.data(), path, PATH_LEN + 1) == 0) {
-            victim = &entry;
-            break;
+    {
+        ker::mod::sys::MutexGuard guard(g_metadata_cache_lock);
+        MetadataCacheEntry* victim = &set.ways.front();
+        for (auto& entry : set.ways) {
+            if (entry.valid && entry.epoch == EPOCH && entry.hash == HASH && entry.path_len == PATH_LEN && entry.fs_type == fs_type &&
+                entry.dev_id == dev_id && entry.follow_final_symlink == follow_final_symlink &&
+                entry.require_directory == require_directory && std::memcmp(entry.path.data(), path, PATH_LEN + 1) == 0) {
+                victim = &entry;
+                break;
+            }
+            if (!entry.valid || entry.epoch != EPOCH) {
+                victim = &entry;
+                break;
+            }
+            if (entry.last_used < victim->last_used) {
+                victim = &entry;
+            }
         }
-        if (!entry.valid || entry.epoch != EPOCH) {
-            victim = &entry;
-            break;
-        }
-        if (entry.last_used < victim->last_used) {
-            victim = &entry;
-        }
+
+        victim->path.fill('\0');
+        std::memcpy(victim->path.data(), path, PATH_LEN + 1);
+        victim->stat = (result == 0) ? *statbuf : Stat{};
+        victim->hash = HASH;
+        victim->epoch = EPOCH;
+        victim->last_used = USE_STAMP;
+        victim->dev_id = dev_id;
+        victim->invalidation_generation = INVALIDATION_GENERATION;
+        victim->path_len = PATH_LEN;
+        victim->result = result;
+        victim->fs_type = fs_type;
+        victim->follow_final_symlink = follow_final_symlink;
+        victim->require_directory = require_directory;
+        victim->valid = true;
     }
-
-    victim->path.fill('\0');
-    std::memcpy(victim->path.data(), path, PATH_LEN + 1);
-    victim->stat = (result == 0) ? *statbuf : Stat{};
-    victim->hash = HASH;
-    victim->epoch = EPOCH;
-    victim->last_used = USE_STAMP;
-    victim->dev_id = dev_id;
-    victim->invalidation_generation = INVALIDATION_GENERATION;
-    victim->path_len = PATH_LEN;
-    victim->result = result;
-    victim->fs_type = fs_type;
-    victim->follow_final_symlink = follow_final_symlink;
-    victim->require_directory = require_directory;
-    victim->valid = true;
     g_vfs_metadata_stores.fetch_add(1, std::memory_order_relaxed);
-    g_metadata_cache_lock.unlock();
 }
 
 auto symlink_hash_path(const char* path, size_t len, FSType fs_type, uint64_t dev_id) -> uint64_t {
@@ -1283,35 +1290,41 @@ auto symlink_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, cha
 
     uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
     uint64_t const HASH = symlink_hash_path(path, PATH_LEN, fs_type, dev_id);
-    auto& set = g_symlink_cache.at(HASH & (SYMLINK_CACHE_SET_COUNT - 1));
+    auto& set = g_symlink_cache[HASH & (SYMLINK_CACHE_SET_COUNT - 1)];
 
-    g_symlink_cache_lock.lock();
-    for (auto& entry : set.ways) {
-        if (!entry.valid || entry.epoch != EPOCH || entry.hash != HASH || entry.path_len != PATH_LEN || entry.fs_type != fs_type ||
-            entry.dev_id != dev_id) {
-            continue;
-        }
-        if (std::memcmp(entry.path.data(), path, PATH_LEN + 1) != 0) {
-            continue;
-        }
-        if (metadata_path_invalidated_since(entry.path.data(), entry.path_len, entry.invalidation_generation)) {
-            entry.valid = false;
-            continue;
-        }
+    bool cache_hit = false;
+    ssize_t cache_result = 0;
+    {
+        ker::mod::sys::MutexGuard guard(g_symlink_cache_lock);
+        for (auto& entry : set.ways) {
+            if (!entry.valid || entry.epoch != EPOCH || entry.hash != HASH || entry.path_len != PATH_LEN || entry.fs_type != fs_type ||
+                entry.dev_id != dev_id) {
+                continue;
+            }
+            if (std::memcmp(entry.path.data(), path, PATH_LEN + 1) != 0) {
+                continue;
+            }
+            if (metadata_path_invalidated_since(entry.path.data(), entry.path_len, entry.invalidation_generation)) {
+                entry.valid = false;
+                continue;
+            }
 
-        entry.last_used = g_symlink_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
-        ssize_t result = entry.result;
-        if (result > 0) {
-            size_t const TO_COPY = std::min<size_t>(entry.target_len, bufsize);
-            std::memcpy(buf, entry.target.data(), TO_COPY);
-            result = static_cast<ssize_t>(TO_COPY);
+            entry.last_used = g_symlink_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+            cache_result = entry.result;
+            if (cache_result > 0) {
+                size_t const TO_COPY = std::min<size_t>(entry.target_len, bufsize);
+                std::memcpy(buf, entry.target.data(), TO_COPY);
+                cache_result = static_cast<ssize_t>(TO_COPY);
+            }
+            cache_hit = true;
+            break;
         }
-        g_symlink_cache_lock.unlock();
-        *out_result = result;
+    }
+    if (cache_hit) {
+        *out_result = cache_result;
         g_vfs_symlink_hits.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
-    g_symlink_cache_lock.unlock();
     g_vfs_symlink_misses.fetch_add(1, std::memory_order_relaxed);
     return false;
 }
@@ -1341,44 +1354,45 @@ void symlink_cache_store(const char* path, FSType fs_type, uint64_t dev_id, ssiz
     uint64_t const INVALIDATION_GENERATION = g_metadata_invalidation_generation.load(std::memory_order_acquire);
     uint64_t const HASH = symlink_hash_path(path, PATH_LEN, fs_type, dev_id);
     uint64_t const USE_STAMP = g_symlink_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
-    auto& set = g_symlink_cache.at(HASH & (SYMLINK_CACHE_SET_COUNT - 1));
+    auto& set = g_symlink_cache[HASH & (SYMLINK_CACHE_SET_COUNT - 1)];
 
-    g_symlink_cache_lock.lock();
-    SymlinkCacheEntry* victim = &set.ways.front();
-    for (auto& entry : set.ways) {
-        if (entry.valid && entry.epoch == EPOCH && entry.hash == HASH && entry.path_len == PATH_LEN && entry.fs_type == fs_type &&
-            entry.dev_id == dev_id && std::memcmp(entry.path.data(), path, PATH_LEN + 1) == 0) {
-            victim = &entry;
-            break;
+    {
+        ker::mod::sys::MutexGuard guard(g_symlink_cache_lock);
+        SymlinkCacheEntry* victim = &set.ways.front();
+        for (auto& entry : set.ways) {
+            if (entry.valid && entry.epoch == EPOCH && entry.hash == HASH && entry.path_len == PATH_LEN && entry.fs_type == fs_type &&
+                entry.dev_id == dev_id && std::memcmp(entry.path.data(), path, PATH_LEN + 1) == 0) {
+                victim = &entry;
+                break;
+            }
+            if (!entry.valid || entry.epoch != EPOCH) {
+                victim = &entry;
+                break;
+            }
+            if (entry.last_used < victim->last_used) {
+                victim = &entry;
+            }
         }
-        if (!entry.valid || entry.epoch != EPOCH) {
-            victim = &entry;
-            break;
-        }
-        if (entry.last_used < victim->last_used) {
-            victim = &entry;
-        }
-    }
 
-    victim->path.fill('\0');
-    victim->target.fill('\0');
-    std::memcpy(victim->path.data(), path, PATH_LEN + 1);
-    if (target_len > 0) {
-        std::memcpy(victim->target.data(), target, target_len);
-        victim->target[target_len] = '\0';
+        victim->path.fill('\0');
+        victim->target.fill('\0');
+        std::memcpy(victim->path.data(), path, PATH_LEN + 1);
+        if (target_len > 0) {
+            std::memcpy(victim->target.data(), target, target_len);
+            victim->target[target_len] = '\0';
+        }
+        victim->hash = HASH;
+        victim->epoch = EPOCH;
+        victim->last_used = USE_STAMP;
+        victim->dev_id = dev_id;
+        victim->invalidation_generation = INVALIDATION_GENERATION;
+        victim->path_len = PATH_LEN;
+        victim->target_len = target_len;
+        victim->result = result;
+        victim->fs_type = fs_type;
+        victim->valid = true;
     }
-    victim->hash = HASH;
-    victim->epoch = EPOCH;
-    victim->last_used = USE_STAMP;
-    victim->dev_id = dev_id;
-    victim->invalidation_generation = INVALIDATION_GENERATION;
-    victim->path_len = PATH_LEN;
-    victim->target_len = target_len;
-    victim->result = result;
-    victim->fs_type = fs_type;
-    victim->valid = true;
     g_vfs_symlink_stores.fetch_add(1, std::memory_order_relaxed);
-    g_symlink_cache_lock.unlock();
 }
 
 auto vfs_destroy_file(File* f) -> int {
