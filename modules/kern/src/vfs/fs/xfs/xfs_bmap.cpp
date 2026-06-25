@@ -364,6 +364,10 @@ auto bmbt_ceil_div(uint32_t value, uint32_t divisor) -> uint32_t {
     return 1U + ((value - 1U) / divisor);
 }
 
+// Rebuilding a bmbt logs more than the new bmbt blocks: the inode buffer is
+// written during commit, and allocation/freeing can touch AG free-space blocks.
+constexpr uint32_t BMBT_REBUILD_TRANSACTION_HEADROOM = 8;
+
 auto bmbt_tree_metadata_blocks(uint32_t extent_count, uint32_t leaf_capacity, uint32_t node_capacity, uint32_t* blocks_out,
                                uint16_t* bmdr_level_out) -> int {
     if (blocks_out != nullptr) {
@@ -683,7 +687,8 @@ auto build_bmbt_tree(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec* extent
     }
     uint32_t const AVAILABLE_TRANSACTION_ITEMS =
         tp->item_count >= XFS_TRANS_MAX_ITEMS ? 0U : static_cast<uint32_t>(XFS_TRANS_MAX_ITEMS - tp->item_count);
-    if (required_metadata_blocks > AVAILABLE_TRANSACTION_ITEMS) {
+    if (required_metadata_blocks > AVAILABLE_TRANSACTION_ITEMS ||
+        AVAILABLE_TRANSACTION_ITEMS - required_metadata_blocks < BMBT_REBUILD_TRANSACTION_HEADROOM) {
         return -EFBIG;
     }
 
@@ -1881,11 +1886,17 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
         return cleanup(false);
     }
 
-    uint32_t const DEEP_TARGET_EXTENTS = (LEAF_CAPACITY * NODE_CAPACITY) + 2;
-    if (expected_metadata_blocks(DEEP_TARGET_EXTENTS) >= XFS_TRANS_MAX_ITEMS) {
+    // A level-3 tree needs almost the full transaction item array with this
+    // compact geometry, before inode and AG free-space bookkeeping.  Exercise a
+    // multi-leaf level-2 tree here and leave deeper rebuilds to a larger
+    // transaction reservation.
+    uint32_t const RELOAD_TARGET_EXTENTS = (LEAF_CAPACITY * 4U) + 2U;
+    uint64_t const RELOAD_METADATA_BLOCKS = expected_metadata_blocks(RELOAD_TARGET_EXTENTS);
+    if (RELOAD_TARGET_EXTENTS <= TARGET_EXTENTS || RELOAD_METADATA_BLOCKS == UINT64_MAX ||
+        RELOAD_METADATA_BLOCKS + BMBT_REBUILD_TRANSACTION_HEADROOM >= XFS_TRANS_MAX_ITEMS) {
         return cleanup(false);
     }
-    for (uint32_t i = TARGET_EXTENTS; i < DEEP_TARGET_EXTENTS; i++) {
+    for (uint32_t i = TARGET_EXTENTS; i < RELOAD_TARGET_EXTENTS; i++) {
         XfsTransaction* tp = xfs_trans_alloc(&mount);
         if (tp == nullptr) {
             return cleanup(false);
@@ -1906,12 +1917,11 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
         }
     }
 
-    if (inode.data_fork.btree.level != expected_bmdr_level(DEEP_TARGET_EXTENTS) ||
-        inode.nblocks != expected_metadata_blocks(DEEP_TARGET_EXTENTS)) {
+    if (inode.data_fork.btree.level != expected_bmdr_level(RELOAD_TARGET_EXTENTS) || inode.nblocks != RELOAD_METADATA_BLOCKS) {
         return cleanup(false);
     }
 
-    uint32_t const EXPECTED_EXTENTS = DEEP_TARGET_EXTENTS;
+    uint32_t const EXPECTED_EXTENTS = RELOAD_TARGET_EXTENTS;
     auto reload_deep_inode = [&]() -> bool {
         XfsInode* reloaded = xfs_inode_read(&mount, inode.ino);
         if (reloaded == nullptr) {

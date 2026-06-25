@@ -39,10 +39,6 @@ void xfs_trans_log_buf(XfsTransaction* tp, BufHead* bp, uint32_t offset, uint32_
     if (tp == nullptr || bp == nullptr) {
         return;
     }
-    if (tp->item_count >= XFS_TRANS_MAX_ITEMS) {
-        mod::dbg::log("[xfs trans] too many items in transaction\n");
-        return;
-    }
 
     // Check if this buffer (or a different buffer for the same disk block)
     // is already logged in this transaction.
@@ -84,6 +80,11 @@ void xfs_trans_log_buf(XfsTransaction* tp, BufHead* bp, uint32_t offset, uint32_
         }
     }
 
+    if (tp->item_count >= XFS_TRANS_MAX_ITEMS) {
+        mod::dbg::log("[xfs trans] too many items in transaction\n");
+        return;
+    }
+
     // The transaction takes its own reference on the buffer.  This
     // prevents use-after-free when other holders (e.g. btree cursors)
     // call brelse() before the transaction commits.
@@ -108,10 +109,6 @@ void xfs_trans_log_inode(XfsTransaction* tp, XfsInode* ip) {
     if (tp == nullptr || ip == nullptr) {
         return;
     }
-    if (tp->item_count >= XFS_TRANS_MAX_ITEMS) {
-        mod::dbg::log("[xfs trans] too many items in transaction\n");
-        return;
-    }
 
     // Check if already logged
     for (int i = 0; i < tp->item_count; i++) {
@@ -119,6 +116,11 @@ void xfs_trans_log_inode(XfsTransaction* tp, XfsInode* ip) {
         if (item.type == XfsLogItemType::INODE && item.inode.ip == ip) {
             return;  // already tracked
         }
+    }
+
+    if (tp->item_count >= XFS_TRANS_MAX_ITEMS) {
+        mod::dbg::log("[xfs trans] too many items in transaction\n");
+        return;
     }
 
     XfsTransItem& item = tp->items.at(static_cast<size_t>(tp->item_count++));
