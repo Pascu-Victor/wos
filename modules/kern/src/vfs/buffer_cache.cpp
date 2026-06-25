@@ -218,6 +218,7 @@ constexpr size_t DIRTY_HARD_LIMIT_MULTIPLIER = 4;
 constexpr size_t DIRTY_WRITEBACK_BUDGET = 128;
 constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = 16;
 constexpr size_t DIRTY_WAKE_BATCH = 32;
+constexpr size_t DIRTY_TARGET_DIVISOR = 2;
 constexpr size_t BUFFER_CACHE_MEMORY_DIVISOR = 32;
 constexpr size_t BUFFER_CACHE_MAX_SIZE = static_cast<size_t>(512) * 1024 * 1024;
 
@@ -272,7 +273,12 @@ auto perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp op) -> uint64_t {
 
 auto perf_xfs_started_us() -> uint64_t { return ker::mod::perf::is_local_xfs_recording_enabled() ? ker::mod::time::get_us() : 0; }
 
-auto dirty_target_bytes_locked() -> size_t { return cache_max_bytes; }
+auto dirty_target_bytes_locked() -> size_t {
+    if (cache_max_bytes <= ker::mod::mm::paging::PAGE_SIZE) {
+        return cache_max_bytes;
+    }
+    return std::max(cache_max_bytes / DIRTY_TARGET_DIVISOR, static_cast<size_t>(ker::mod::mm::paging::PAGE_SIZE));
+}
 
 auto dirty_hard_limit_bytes_locked() -> size_t {
     if (cache_max_bytes > SIZE_MAX / DIRTY_HARD_LIMIT_MULTIPLIER) {
