@@ -51,6 +51,7 @@ namespace {
 
 constexpr uint32_t XFS_SLOW_TRACE_US = 2048;
 constexpr size_t XFS_DIRECT_READ_MIN_BYTES = size_t{64} * 1024;
+constexpr size_t XFS_DIRECT_READ_BATCH_MAX_BYTES = size_t{1024} * 1024;
 constexpr uint64_t XFS_NSEC_PER_SEC = 1000000000ULL;
 constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
 // Maximum blocks to allocate per metadata transaction.
@@ -224,6 +225,14 @@ auto xfs_mapped_append_can_zero_without_read(size_t write_pos, uint64_t file_siz
         return false;
     }
     return (write_pos % block_size) == 0;
+}
+
+auto xfs_direct_read_batch_max_bytes(size_t block_size) -> size_t {
+    if (block_size == 0) {
+        return XFS_DIRECT_READ_BATCH_MAX_BYTES;
+    }
+    size_t const MAX_BLOCKS = std::max<size_t>(1, XFS_DIRECT_READ_BATCH_MAX_BYTES / block_size);
+    return MAX_BLOCKS * block_size;
 }
 
 void xfs_set_sequential_alloc_hint(XfsInode* ip, XfsMountContext* ctx, xfs_fileoff_t file_block, XfsAllocReq* req) {
@@ -635,10 +644,13 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         }
 
         if (BLOCK_OFF == 0 && (chunk & (ctx->block_size - 1)) == 0) {
+            size_t const READ_BATCH_MAX_BYTES = xfs_direct_read_batch_max_bytes(ctx->block_size);
+            chunk = std::min(chunk, READ_BATCH_MAX_BYTES);
             auto const START_AG = static_cast<xfs_agnumber_t>(DISK_BLOCK >> ctx->ag_blk_log);
-            while (chunk < remaining) {
+            while (chunk < remaining && chunk < READ_BATCH_MAX_BYTES) {
                 size_t const CURRENT_BLOCKS = chunk >> ctx->block_log;
-                size_t const REMAINING_FULL_BLOCKS = (remaining - chunk) >> ctx->block_log;
+                size_t const BATCH_REMAINING = std::min(remaining, READ_BATCH_MAX_BYTES);
+                size_t const REMAINING_FULL_BLOCKS = (BATCH_REMAINING - chunk) >> ctx->block_log;
                 if (CURRENT_BLOCKS == 0 || REMAINING_FULL_BLOCKS == 0) {
                     break;
                 }
@@ -1424,6 +1436,8 @@ auto xfs_selftest_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks)
 auto xfs_selftest_mapped_append_can_zero_without_read(size_t write_pos, uint64_t file_size, size_t block_size) -> bool {
     return xfs_mapped_append_can_zero_without_read(write_pos, file_size, block_size);
 }
+
+auto xfs_selftest_direct_read_batch_max_bytes(size_t block_size) -> size_t { return xfs_direct_read_batch_max_bytes(block_size); }
 #endif
 
 auto xfs_write_append(File* f, const void* buf, size_t count, size_t* offset_out) -> ssize_t {

@@ -104,6 +104,12 @@ KTEST(XFS, MappedAppendSkipsReadOnlyAtCleanBlockBoundary) {
     KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_mapped_append_can_zero_without_read(BLOCK_SIZE, BLOCK_SIZE, 0));
 }
 
+KTEST(XFS, DirectReadBatchIsBoundedAndBlockAligned) {
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_direct_read_batch_max_bytes(4096), static_cast<size_t>(1024 * 1024));
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_direct_read_batch_max_bytes(512), static_cast<size_t>(1024 * 1024));
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_direct_read_batch_max_bytes(3 * 1024 * 1024), static_cast<size_t>(3 * 1024 * 1024));
+}
+
 KTEST(XFS, HoleWriteStillCapsLargeAllocations) {
     constexpr size_t BLOCK_SIZE = 4096;
     constexpr uint32_t BLOCK_LOG = 12;
