@@ -29,6 +29,12 @@ if(WOS_NATIVE_SYSTEM_BUILD)
     set(WOS_PORT_BUILD_DEFAULT OFF)
 endif()
 
+set(WOS_BUILD_WOSDBG_DEFAULT ON)
+if(WOS_NATIVE_SYSTEM_BUILD)
+    set(WOS_BUILD_WOSDBG_DEFAULT OFF)
+endif()
+option(WOS_BUILD_WOSDBG "Build the Qt6-based wosdbg host tool" ${WOS_BUILD_WOSDBG_DEFAULT})
+
 if(WOS_USE_CCACHE AND NOT WOS_CCACHE_PROGRAM)
     find_program(WOS_CCACHE_PROGRAM NAMES ccache cccache)
 endif()
@@ -45,6 +51,7 @@ ExternalProject_Add(wos_tools_build
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
         -DCMAKE_BUILD_TYPE=${WOS_TOOLS_BUILD_TYPE}
         -DWOS_BUILD_LINUX_BENCHMARKS=${WOS_BUILD_LINUX_BENCHMARKS}
+        -DWOS_BUILD_WOSDBG=${WOS_BUILD_WOSDBG}
         ${WOS_TOOLS_CCACHE_CMAKE_ARGS}
     INSTALL_COMMAND ""
     USES_TERMINAL_CONFIGURE TRUE
@@ -93,6 +100,8 @@ set(WOS_CMAKE_FOR_HOST_INSTALL_DIR "${CMAKE_SOURCE_DIR}/toolchain/host" CACHE PA
 set(WOS_CMAKE_FOR_WOS_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/cmake-wos-build" CACHE PATH "Native WOS CMake build directory")
 set(WOS_PYTHON_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/python" CACHE PATH "CPython source directory")
 set(WOS_PYTHON_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/python-build" CACHE PATH "Native WOS Python build directory")
+set(WOS_MESON_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/meson" CACHE PATH "Meson source directory")
+set(WOS_MESON_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/meson-build" CACHE PATH "Native WOS Meson staging directory")
 set(WOS_NASM_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/nasm" CACHE PATH "NASM source directory")
 set(WOS_NASM_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/nasm-build" CACHE PATH "Native WOS NASM build directory")
 set(WOS_BOOT_DISK "${CMAKE_SOURCE_DIR}/disk.qcow2" CACHE FILEPATH "WOS boot disk image")
@@ -103,6 +112,7 @@ option(WOS_BUILD_NINJA_FOR_WOS "Build a native WOS Ninja and stage it into the r
 option(WOS_BUILD_CMAKE_FOR_HOST "Build host-side CMake from the WOS fork and install it into toolchain/host" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_CMAKE_FOR_WOS "Build native WOS CMake tools and stage them into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_PYTHON_FOR_WOS "Build native WOS Python and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
+option(WOS_BUILD_MESON_FOR_WOS "Stage native WOS Meson into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_NASM_FOR_WOS "Build native WOS NASM and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_BASH_FOR_WOS "Build native WOS Bash and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_OPENSSL_FOR_WOS "Build static WOS OpenSSL libraries for curl and HTTPS-capable ports" ${WOS_PORT_BUILD_DEFAULT})
@@ -555,6 +565,42 @@ if(WOS_BUILD_PYTHON_FOR_WOS)
     list(APPEND WOS_PYTHON_FOR_WOS_ROOTFS_INPUTS ${PYTHON_FOR_WOS_STAMP})
 endif()
 
+# --- meson_for_wos: stage Meson to run inside WOS --------------------------
+set(MESON_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/meson_for_wos.stamp)
+set(WOS_MESON_FOR_WOS_ROOTFS_INPUTS)
+if(WOS_BUILD_MESON_FOR_WOS)
+    wos_collect_external_sources(MESON_FOR_WOS_SOURCES
+        ${WOS_MESON_SOURCE_DIR}/*
+    )
+    set(WOS_MESON_FOR_WOS_DEPENDS
+        ${WOS_BUILD_SCRIPTS_DIR}/build_meson_for_wos.sh
+        ${MESON_FOR_WOS_SOURCES}
+        ${MLIBC_STAMP}
+        ${LIBCXX_STAMP}
+    )
+    if(WOS_BUILD_PYTHON_FOR_WOS)
+        list(APPEND WOS_MESON_FOR_WOS_DEPENDS ${PYTHON_FOR_WOS_STAMP})
+    endif()
+    add_custom_command(
+        OUTPUT ${MESON_FOR_WOS_STAMP}
+        COMMAND ${CMAKE_COMMAND} -E env
+                WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+                WOS_MESON_SOURCE_DIR=${WOS_MESON_SOURCE_DIR}
+                WOS_MESON_BUILD_DIR=${WOS_MESON_BUILD_DIR}
+                ${WOS_BUILD_SCRIPTS_DIR}/build_meson_for_wos.sh
+        COMMAND ${CMAKE_COMMAND} -E touch ${MESON_FOR_WOS_STAMP}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Staging native WOS Meson..."
+        DEPENDS ${WOS_MESON_FOR_WOS_DEPENDS}
+        USES_TERMINAL
+    )
+    add_custom_target(meson_for_wos DEPENDS ${MESON_FOR_WOS_STAMP})
+    if(WOS_BUILD_PYTHON_FOR_WOS)
+        add_dependencies(meson_for_wos python_for_wos)
+    endif()
+    list(APPEND WOS_MESON_FOR_WOS_ROOTFS_INPUTS ${MESON_FOR_WOS_STAMP})
+endif()
+
 # --- nasm_for_wos: cross-compile NASM to run inside WOS --------------------
 set(NASM_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/nasm_for_wos.stamp)
 set(WOS_NASM_FOR_WOS_ROOTFS_INPUTS)
@@ -638,6 +684,7 @@ add_custom_command(
         ${WOS_NINJA_FOR_WOS_ROOTFS_INPUTS}
         ${WOS_CMAKE_FOR_WOS_ROOTFS_INPUTS}
         ${WOS_PYTHON_FOR_WOS_ROOTFS_INPUTS}
+        ${WOS_MESON_FOR_WOS_ROOTFS_INPUTS}
         ${WOS_NASM_FOR_WOS_ROOTFS_INPUTS}
         ${WOS_BASH_FOR_WOS_ROOTFS_INPUTS}
         ${WOS_CURL_FOR_WOS_ROOTFS_INPUTS}
@@ -656,6 +703,9 @@ if(WOS_BUILD_CMAKE_FOR_WOS)
 endif()
 if(WOS_BUILD_PYTHON_FOR_WOS)
     add_dependencies(mountfs_disk python_for_wos)
+endif()
+if(WOS_BUILD_MESON_FOR_WOS)
+    add_dependencies(mountfs_disk meson_for_wos)
 endif()
 if(WOS_BUILD_NASM_FOR_WOS)
     add_dependencies(mountfs_disk nasm_for_wos)
@@ -708,7 +758,7 @@ if(NOT WOS_NATIVE_SYSTEM_BUILD)
         add_dependencies(${mod} mlibc libcxx)
     endforeach()
 endif()
-# busybox, dropbear, GNU make, Bash, curl, Git, Ninja, CMake, Python, and NASM are only needed for image creation, not compilation.
+# busybox, dropbear, GNU make, Bash, curl, Git, Ninja, CMake, Python, Meson, and NASM are only needed for image creation, not compilation.
 add_dependencies(boot_image busybox dropbear gnu_make)
 if(WOS_BUILD_NINJA_FOR_WOS)
     add_dependencies(boot_image ninja_for_wos)
@@ -718,6 +768,9 @@ if(WOS_BUILD_CMAKE_FOR_WOS)
 endif()
 if(WOS_BUILD_PYTHON_FOR_WOS)
     add_dependencies(boot_image python_for_wos)
+endif()
+if(WOS_BUILD_MESON_FOR_WOS)
+    add_dependencies(boot_image meson_for_wos)
 endif()
 if(WOS_BUILD_NASM_FOR_WOS)
     add_dependencies(boot_image nasm_for_wos)
@@ -757,6 +810,9 @@ if(WOS_BUILD_CMAKE_FOR_HOST)
 endif()
 if(WOS_BUILD_PYTHON_FOR_WOS)
     add_dependencies(wos_full python_for_wos)
+endif()
+if(WOS_BUILD_MESON_FOR_WOS)
+    add_dependencies(wos_full meson_for_wos)
 endif()
 if(WOS_BUILD_NASM_FOR_WOS)
     add_dependencies(wos_full nasm_for_wos)

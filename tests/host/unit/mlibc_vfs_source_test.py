@@ -103,6 +103,44 @@ def test_mlibc_vfs_wrappers_pass_fd_creation_flags_to_kernel() -> None:
     )
 
 
+def test_pselect_empty_fd_sets_do_not_call_epoll_with_zero_maxevents() -> None:
+    sysdeps = WOS_SYSDEPS_CPP.read_text()
+    pselect_body = function_body(
+        sysdeps,
+        r"int\s+Sysdeps<Pselect>::operator\(\)\(\s*int\s+num_fds,\s*fd_set\s+\*read_set,\s*fd_set\s+\*write_set,\s*fd_set\s+\*except_set,\s*const\s+struct\s+timespec\s+\*timeout,\s*const\s+sigset_t\s+\*sigmask,\s*int\s+\*num_events\s*\)",
+    )
+    require_tokens(
+        pselect_body,
+        [
+            "if (num_fds < 0)",
+            "int watched_fds = 0;",
+            "watched_fds++;",
+            "if (watched_fds == 0)",
+            "pselect_sleep_for_timeout_ms(timeout_ms, sigmask)",
+            "*num_events = 0;",
+            "int max = watched_fds < 64 ? watched_fds : 64;",
+            "ker::abi::vfs::epoll_pwait_vfs(epfd, out_events, max, timeout_ms)",
+        ],
+        "WOS mlibc pselect empty-fd handling",
+    )
+    if "int max = num_fds < 64 ? num_fds : 64;" in pselect_body:
+        fail("WOS mlibc pselect must not derive epoll maxevents from num_fds")
+
+    wait_body = function_body(sysdeps, r"int\s+pselect_sleep_for_timeout_ms\(int\s+timeout_ms,\s*const\s+sigset_t\s+\*sigmask\)")
+    require_tokens(
+        wait_body,
+        [
+            "if (timeout_ms == 0)",
+            "if (timeout_ms < 0)",
+            "ker::process::sigsuspend(wait_mask)",
+            "ker::abi::sys_time_ops::nanosleep",
+            "ker::process::sigprocmask(SIG_SETMASK, sigmask, &old_mask)",
+            "ker::process::sigprocmask(SIG_SETMASK, &old_mask, nullptr)",
+        ],
+        "WOS mlibc pselect empty wait helper",
+    )
+
+
 def test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards() -> None:
     syscall_source = KERNEL_SYS_VFS_CPP.read_text()
     require_tokens(
@@ -147,5 +185,6 @@ def test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards() -> None:
 if __name__ == "__main__":
     test_git_helper_pipe_cloexec_patch_is_preserved_by_mlibc()
     test_mlibc_vfs_wrappers_pass_fd_creation_flags_to_kernel()
+    test_pselect_empty_fd_sets_do_not_call_epoll_with_zero_maxevents()
     test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards()
     print("WOS mlibc VFS source invariants hold")

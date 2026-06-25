@@ -57,6 +57,7 @@ copy	toolchain/sysroot/bin/nasm	/usr/bin/nasm
 copy	toolchain/sysroot/bin/ndisasm	/usr/bin/ndisasm
 copy	toolchain/sysroot/bin/python3	/usr/bin/python3
 copy	toolchain/sysroot/bin/python	/usr/bin/python
+copy	toolchain/sysroot/bin/meson	/usr/bin/meson
 copy	toolchain/sysroot/bin/clang	/usr/bin/clang
 copy	toolchain/sysroot/bin/ld.lld	/usr/bin/ld.lld
 copy	toolchain/sysroot/bin/lld	/usr/bin/lld

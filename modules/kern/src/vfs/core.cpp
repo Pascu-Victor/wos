@@ -19,7 +19,9 @@
 #include <net/wki/remote_vfs.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/addr.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/power/power.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -90,6 +92,7 @@ constexpr int STREAM_PREMATURE_EOF_RETRIES = 3;
 constexpr size_t PIPE_WAKE_BATCH = 32;
 constexpr size_t PIPE_DEFAULT_CAPACITY = 256UL * 1024UL;
 constexpr size_t PIPE_DIRECT_MAX_CAPACITY = 256UL * 1024UL;
+constexpr uint64_t ADVISORY_RANGE_EOF = UINT64_MAX;
 // CMake/Ninja tree scans touch enough distinct paths that the old 1024-entry
 // metadata cache thrashed mostly on set conflicts. Keep this static and bounded:
 // 8192 entries is still small compared with guest memory while covering the hot
@@ -153,6 +156,70 @@ struct MetadataInvalidationSet {
     std::array<MetadataInvalidationEntry, METADATA_INVALIDATION_WAYS> ways{};
 };
 
+struct VfsFlockAbi {
+    int16_t l_type = 0;
+    int16_t l_whence = 0;
+    off_t l_start = 0;
+    off_t l_len = 0;
+    int32_t l_pid = 0;
+};
+static_assert(sizeof(VfsFlockAbi) == 32);
+
+constexpr int F_GETLK_CMD = 5;
+constexpr int F_SETLK_CMD = 6;
+constexpr int F_SETLKW_CMD = 7;
+constexpr int F_OFD_GETLK_CMD = 36;
+constexpr int F_OFD_SETLK_CMD = 37;
+constexpr int F_OFD_SETLKW_CMD = 38;
+constexpr int WOS_FLOCK_CMD = 0x5753464c;  // Private mlibc flock() request: 'WSFL'.
+constexpr int16_t F_RDLCK_TYPE = 0;
+constexpr int16_t F_WRLCK_TYPE = 1;
+constexpr int16_t F_UNLCK_TYPE = 2;
+constexpr int LOCK_SH_VALUE = 1;
+constexpr int LOCK_EX_VALUE = 2;
+constexpr int LOCK_NB_VALUE = 4;
+constexpr int LOCK_UN_VALUE = 8;
+constexpr int SEEK_SET_VALUE = 0;
+constexpr int SEEK_CUR_VALUE = 1;
+constexpr int SEEK_END_VALUE = 2;
+
+enum class AdvisoryLockFamily : uint8_t {
+    RECORD,
+    FLOCK,
+};
+
+enum class AdvisoryOwnerKind : uint8_t {
+    PROCESS,
+    OPEN_FILE,
+};
+
+enum class AdvisoryLockType : uint8_t {
+    READ,
+    WRITE,
+};
+
+struct AdvisoryFileKey {
+    uint64_t dev = 0;
+    uint64_t ino = 0;
+    uint64_t path_hash = 0;
+    const File* anonymous_file = nullptr;
+    FSType fs_type = FSType::TMPFS;
+    std::array<char, MAX_PATH_LEN> path{};
+    bool has_inode = false;
+    bool has_path = false;
+};
+
+struct AdvisoryLock {
+    AdvisoryFileKey key{};
+    AdvisoryLockFamily family = AdvisoryLockFamily::RECORD;
+    AdvisoryOwnerKind owner_kind = AdvisoryOwnerKind::PROCESS;
+    uint64_t owner_pid = 0;
+    const File* owner_file = nullptr;
+    AdvisoryLockType type = AdvisoryLockType::READ;
+    uint64_t start = 0;
+    uint64_t end = ADVISORY_RANGE_EOF;
+};
+
 std::array<MetadataCacheSet, METADATA_CACHE_SET_COUNT> g_metadata_cache{};
 ker::mod::sys::Mutex g_metadata_cache_lock;
 // Path metadata/readlink caches use path-scoped invalidation generations.
@@ -170,6 +237,8 @@ std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT> g_metadata_
 std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT> g_metadata_exact_invalidations{};
 ker::mod::sys::Mutex g_metadata_invalidation_lock;
 std::atomic<uint64_t> g_metadata_invalidation_generation{1};
+std::deque<AdvisoryLock> g_advisory_locks;
+ker::mod::sys::Mutex g_advisory_lock_mutex;
 
 std::atomic<uint64_t> g_vfs_metadata_hits{0};
 std::atomic<uint64_t> g_vfs_metadata_misses{0};
@@ -244,6 +313,492 @@ auto metadata_invalidation_hash_path(const char* path, size_t len) -> uint64_t {
         hash *= 1099511628211ULL;
     }
     return hash == 0 ? 1 : hash;
+}
+
+auto advisory_hash_path(const char* path) -> uint64_t {
+    if (path == nullptr) {
+        return 0;
+    }
+    uint64_t hash = 1469598103934665603ULL;
+    for (const char* p = path; *p != '\0'; ++p) {
+        hash ^= static_cast<unsigned char>(*p);
+        hash *= 1099511628211ULL;
+    }
+    return hash == 0 ? 1 : hash;
+}
+
+auto advisory_user_copy(uint64_t user_addr, void* kernel_buf, size_t size, bool to_user) -> int {
+    if (size == 0) {
+        return 0;
+    }
+    if (user_addr == 0 || kernel_buf == nullptr) {
+        return -EFAULT;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr || task->pagemap == nullptr) {
+        return -EFAULT;
+    }
+
+    auto* kernel_bytes = static_cast<uint8_t*>(kernel_buf);
+    for (size_t i = 0; i < size; ++i) {
+        uint64_t const PHYS = ker::mod::mm::virt::translate(task->pagemap, user_addr + i);
+        if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
+            return -EFAULT;
+        }
+        auto* user_byte = reinterpret_cast<uint8_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
+        if (to_user) {
+            *user_byte = kernel_bytes[i];
+        } else {
+            kernel_bytes[i] = *user_byte;
+        }
+    }
+    return 0;
+}
+
+auto advisory_copy_from_user(uint64_t user_addr, VfsFlockAbi& lock) -> int {
+    return advisory_user_copy(user_addr, &lock, sizeof(lock), false);
+}
+
+auto advisory_copy_to_user(uint64_t user_addr, const VfsFlockAbi& lock) -> int {
+    auto copy = lock;
+    return advisory_user_copy(user_addr, &copy, sizeof(copy), true);
+}
+
+auto advisory_build_key(File* file, AdvisoryFileKey& key, Stat* stat_out = nullptr, bool allow_backend_stat = true) -> int {
+    if (file == nullptr) {
+        return -EBADF;
+    }
+
+    key = {};
+    key.fs_type = file->fs_type;
+    key.anonymous_file = file;
+    if (file->vfs_path != nullptr) {
+        size_t const PATH_LEN = std::strlen(file->vfs_path);
+        if (PATH_LEN >= key.path.size()) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(key.path.data(), file->vfs_path, PATH_LEN + 1);
+        key.path_hash = advisory_hash_path(key.path.data());
+        key.has_path = true;
+    }
+
+    if (!allow_backend_stat) {
+        if (stat_out != nullptr) {
+            *stat_out = {};
+        }
+        return 0;
+    }
+
+    Stat st{};
+    int const STAT_RET = vfs_fstat_file(file, &st);
+    if (STAT_RET == 0) {
+        if (stat_out != nullptr) {
+            *stat_out = st;
+        }
+        if (file->fs_type != FSType::REMOTE && st.st_ino != 0) {
+            key.dev = st.st_dev;
+            key.ino = st.st_ino;
+            key.has_inode = true;
+        }
+    } else if (stat_out != nullptr) {
+        return STAT_RET;
+    }
+    return 0;
+}
+
+auto advisory_keys_equal(const AdvisoryFileKey& left, const AdvisoryFileKey& right) -> bool {
+    if (left.has_inode && right.has_inode) {
+        return left.dev == right.dev && left.ino == right.ino;
+    }
+    if (left.has_path && right.has_path) {
+        return left.fs_type == right.fs_type && left.path_hash == right.path_hash && std::strcmp(left.path.data(), right.path.data()) == 0;
+    }
+    return left.anonymous_file != nullptr && left.anonymous_file == right.anonymous_file;
+}
+
+auto advisory_same_owner(const AdvisoryLock& lock, AdvisoryOwnerKind owner_kind, uint64_t owner_pid, const File* owner_file) -> bool {
+    if (lock.owner_kind != owner_kind) {
+        return false;
+    }
+    if (owner_kind == AdvisoryOwnerKind::PROCESS) {
+        return lock.owner_pid == owner_pid;
+    }
+    return lock.owner_file == owner_file;
+}
+
+auto advisory_ranges_overlap(uint64_t left_start, uint64_t left_end, uint64_t right_start, uint64_t right_end) -> bool {
+    return left_start < right_end && right_start < left_end;
+}
+
+auto advisory_ranges_touch_or_overlap(uint64_t left_start, uint64_t left_end, uint64_t right_start, uint64_t right_end) -> bool {
+    return left_start <= right_end && right_start <= left_end;
+}
+
+auto advisory_locks_conflict(const AdvisoryLock& held, const AdvisoryLock& requested) -> bool {
+    if (held.family != requested.family) {
+        return false;
+    }
+    if (!advisory_keys_equal(held.key, requested.key)) {
+        return false;
+    }
+    if (advisory_same_owner(held, requested.owner_kind, requested.owner_pid, requested.owner_file)) {
+        return false;
+    }
+    if (!advisory_ranges_overlap(held.start, held.end, requested.start, requested.end)) {
+        return false;
+    }
+    return held.type == AdvisoryLockType::WRITE || requested.type == AdvisoryLockType::WRITE;
+}
+
+void advisory_remove_lock_at(size_t index) {
+    auto it = g_advisory_locks.begin();
+    for (size_t i = 0; i < index; ++i) {
+        ++it;
+    }
+    g_advisory_locks.erase(it);
+}
+
+void advisory_unlock_owned_range_locked(const AdvisoryFileKey& key, AdvisoryLockFamily family, AdvisoryOwnerKind owner_kind,
+                                        uint64_t owner_pid, const File* owner_file, uint64_t start, uint64_t end) {
+    for (size_t i = 0; i < g_advisory_locks.size();) {
+        AdvisoryLock& lock = g_advisory_locks.at(i);
+        if (lock.family != family || !advisory_keys_equal(lock.key, key) || !advisory_same_owner(lock, owner_kind, owner_pid, owner_file) ||
+            !advisory_ranges_overlap(lock.start, lock.end, start, end)) {
+            ++i;
+            continue;
+        }
+
+        if (start <= lock.start && end >= lock.end) {
+            advisory_remove_lock_at(i);
+            continue;
+        }
+        if (start <= lock.start) {
+            lock.start = end;
+            ++i;
+            continue;
+        }
+        if (end >= lock.end) {
+            lock.end = start;
+            ++i;
+            continue;
+        }
+
+        AdvisoryLock right = lock;
+        right.start = end;
+        lock.end = start;
+        g_advisory_locks.push_back(right);
+        ++i;
+    }
+}
+
+void advisory_insert_owned_lock_locked(AdvisoryLock lock) {
+    advisory_unlock_owned_range_locked(lock.key, lock.family, lock.owner_kind, lock.owner_pid, lock.owner_file, lock.start, lock.end);
+
+    for (size_t i = 0; i < g_advisory_locks.size();) {
+        AdvisoryLock& existing = g_advisory_locks.at(i);
+        if (existing.family != lock.family || !advisory_keys_equal(existing.key, lock.key) ||
+            !advisory_same_owner(existing, lock.owner_kind, lock.owner_pid, lock.owner_file) || existing.type != lock.type ||
+            !advisory_ranges_touch_or_overlap(existing.start, existing.end, lock.start, lock.end)) {
+            ++i;
+            continue;
+        }
+
+        lock.start = std::min(lock.start, existing.start);
+        lock.end = std::max(lock.end, existing.end);
+        advisory_remove_lock_at(i);
+    }
+
+    g_advisory_locks.push_back(lock);
+}
+
+auto advisory_find_conflict_locked(const AdvisoryLock& requested, AdvisoryLock* conflict_out = nullptr) -> bool {
+    for (const auto& held : g_advisory_locks) {
+        if (!advisory_locks_conflict(held, requested)) {
+            continue;
+        }
+        if (conflict_out != nullptr) {
+            *conflict_out = held;
+        }
+        return true;
+    }
+    return false;
+}
+
+auto advisory_process_has_locks_locked(uint64_t pid) -> bool {
+    for (const auto& lock : g_advisory_locks) {
+        if (lock.owner_kind == AdvisoryOwnerKind::PROCESS && lock.owner_pid == pid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto advisory_process_has_inode_locks_locked(uint64_t pid) -> bool {
+    for (const auto& lock : g_advisory_locks) {
+        if (lock.owner_kind == AdvisoryOwnerKind::PROCESS && lock.owner_pid == pid && lock.key.has_inode) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void advisory_release_process_locks_by_key_locked(uint64_t pid, const AdvisoryFileKey& key) {
+    for (size_t i = 0; i < g_advisory_locks.size();) {
+        const AdvisoryLock& lock = g_advisory_locks.at(i);
+        if (lock.owner_kind == AdvisoryOwnerKind::PROCESS && lock.owner_pid == pid && advisory_keys_equal(lock.key, key)) {
+            advisory_remove_lock_at(i);
+            continue;
+        }
+        ++i;
+    }
+}
+
+auto advisory_to_lock_type(int16_t flock_type, AdvisoryLockType& out) -> int {
+    switch (flock_type) {
+        case F_RDLCK_TYPE:
+            out = AdvisoryLockType::READ;
+            return 0;
+        case F_WRLCK_TYPE:
+            out = AdvisoryLockType::WRITE;
+            return 0;
+        default:
+            return -EINVAL;
+    }
+}
+
+auto advisory_range_from_flock(const VfsFlockAbi& flock, File* file, const Stat& stat, uint64_t& start, uint64_t& end) -> int {
+    constexpr auto ADVISORY_RANGE_EOF_WIDE = static_cast<__int128>(ADVISORY_RANGE_EOF);
+    __int128 base = 0;
+    switch (flock.l_whence) {
+        case SEEK_SET_VALUE:
+            base = 0;
+            break;
+        case SEEK_CUR_VALUE:
+            base = file != nullptr ? file->pos : 0;
+            break;
+        case SEEK_END_VALUE:
+            base = stat.st_size;
+            break;
+        default:
+            return -EINVAL;
+    }
+
+    __int128 range_start = base + static_cast<__int128>(flock.l_start);
+    __int128 range_end = 0;
+    if (flock.l_len == 0) {
+        range_end = ADVISORY_RANGE_EOF_WIDE;
+    } else if (flock.l_len > 0) {
+        range_end = range_start + static_cast<__int128>(flock.l_len);
+    } else {
+        range_end = range_start;
+        range_start += static_cast<__int128>(flock.l_len);
+    }
+
+    if (range_start < 0 || range_end < 0 || range_end < range_start || range_start > ADVISORY_RANGE_EOF_WIDE) {
+        return -EINVAL;
+    }
+    start = static_cast<uint64_t>(range_start);
+    if (range_end > ADVISORY_RANGE_EOF_WIDE) {
+        end = ADVISORY_RANGE_EOF;
+    } else {
+        end = static_cast<uint64_t>(range_end);
+    }
+    return start < end ? 0 : -EINVAL;
+}
+
+auto advisory_set_lock(File* file, uint64_t owner_pid, AdvisoryOwnerKind owner_kind, AdvisoryLockFamily family, const VfsFlockAbi& flock,
+                       bool wait) -> int {
+    AdvisoryLockType lock_type{};
+    if (flock.l_type != F_UNLCK_TYPE) {
+        if (int const TYPE_RET = advisory_to_lock_type(flock.l_type, lock_type); TYPE_RET < 0) {
+            return TYPE_RET;
+        }
+    }
+
+    Stat stat{};
+    bool const NEEDS_STAT_FOR_RANGE = flock.l_whence == SEEK_END_VALUE;
+    bool const ALLOW_BACKEND_STAT = file->fs_type != FSType::REMOTE || NEEDS_STAT_FOR_RANGE;
+    AdvisoryFileKey key{};
+    if (int const KEY_RET = advisory_build_key(file, key, NEEDS_STAT_FOR_RANGE ? &stat : nullptr, ALLOW_BACKEND_STAT); KEY_RET < 0) {
+        return KEY_RET;
+    }
+
+    uint64_t start = 0;
+    uint64_t end = ADVISORY_RANGE_EOF;
+    if (int const RANGE_RET = advisory_range_from_flock(flock, file, stat, start, end); RANGE_RET < 0) {
+        return RANGE_RET;
+    }
+
+    const File* owner_file = owner_kind == AdvisoryOwnerKind::OPEN_FILE ? file : nullptr;
+    if (flock.l_type == F_UNLCK_TYPE) {
+        g_advisory_lock_mutex.lock();
+        advisory_unlock_owned_range_locked(key, family, owner_kind, owner_pid, owner_file, start, end);
+        g_advisory_lock_mutex.unlock();
+        return 0;
+    }
+
+    AdvisoryLock requested{};
+    requested.key = key;
+    requested.family = family;
+    requested.owner_kind = owner_kind;
+    requested.owner_pid = owner_pid;
+    requested.owner_file = owner_file;
+    requested.type = lock_type;
+    requested.start = start;
+    requested.end = end;
+
+    for (;;) {
+        g_advisory_lock_mutex.lock();
+        bool const HAS_CONFLICT = advisory_find_conflict_locked(requested);
+        if (!HAS_CONFLICT) {
+            advisory_insert_owned_lock_locked(requested);
+            g_advisory_lock_mutex.unlock();
+            return 0;
+        }
+        g_advisory_lock_mutex.unlock();
+
+        if (!wait) {
+            return -EAGAIN;
+        }
+
+        auto* task = ker::mod::sched::get_current_task();
+        if (task != nullptr && task->has_interrupting_signal_pending()) {
+            return -EINTR;
+        }
+        ker::mod::sched::kern_yield();
+    }
+}
+
+auto advisory_get_lock(File* file, uint64_t owner_pid, AdvisoryOwnerKind owner_kind, AdvisoryLockFamily family, VfsFlockAbi& flock) -> int {
+    AdvisoryLockType lock_type{};
+    if (flock.l_type == F_UNLCK_TYPE) {
+        flock.l_pid = 0;
+        return 0;
+    }
+    if (int const TYPE_RET = advisory_to_lock_type(flock.l_type, lock_type); TYPE_RET < 0) {
+        return TYPE_RET;
+    }
+
+    Stat stat{};
+    bool const NEEDS_STAT_FOR_RANGE = flock.l_whence == SEEK_END_VALUE;
+    bool const ALLOW_BACKEND_STAT = file->fs_type != FSType::REMOTE || NEEDS_STAT_FOR_RANGE;
+    AdvisoryFileKey key{};
+    if (int const KEY_RET = advisory_build_key(file, key, NEEDS_STAT_FOR_RANGE ? &stat : nullptr, ALLOW_BACKEND_STAT); KEY_RET < 0) {
+        return KEY_RET;
+    }
+
+    uint64_t start = 0;
+    uint64_t end = ADVISORY_RANGE_EOF;
+    if (int const RANGE_RET = advisory_range_from_flock(flock, file, stat, start, end); RANGE_RET < 0) {
+        return RANGE_RET;
+    }
+
+    AdvisoryLock requested{};
+    requested.key = key;
+    requested.family = family;
+    requested.owner_kind = owner_kind;
+    requested.owner_pid = owner_pid;
+    requested.owner_file = owner_kind == AdvisoryOwnerKind::OPEN_FILE ? file : nullptr;
+    requested.type = lock_type;
+    requested.start = start;
+    requested.end = end;
+
+    AdvisoryLock conflict{};
+    g_advisory_lock_mutex.lock();
+    bool const HAS_CONFLICT = advisory_find_conflict_locked(requested, &conflict);
+    g_advisory_lock_mutex.unlock();
+
+    if (!HAS_CONFLICT) {
+        flock.l_type = F_UNLCK_TYPE;
+        flock.l_pid = 0;
+        return 0;
+    }
+
+    flock.l_type = conflict.type == AdvisoryLockType::READ ? F_RDLCK_TYPE : F_WRLCK_TYPE;
+    flock.l_whence = SEEK_SET_VALUE;
+    flock.l_start = static_cast<off_t>(std::min<uint64_t>(conflict.start, static_cast<uint64_t>(INT64_MAX)));
+    flock.l_len = conflict.end == ADVISORY_RANGE_EOF ? 0 : static_cast<off_t>(conflict.end - conflict.start);
+    flock.l_pid = conflict.owner_kind == AdvisoryOwnerKind::PROCESS ? static_cast<int32_t>(conflict.owner_pid) : -1;
+    return 0;
+}
+
+auto advisory_flock(File* file, int options) -> int {
+    if ((options & ~(LOCK_SH_VALUE | LOCK_EX_VALUE | LOCK_NB_VALUE | LOCK_UN_VALUE)) != 0) {
+        return -EINVAL;
+    }
+    int const MODE_COUNT =
+        ((options & LOCK_SH_VALUE) != 0 ? 1 : 0) + ((options & LOCK_EX_VALUE) != 0 ? 1 : 0) + ((options & LOCK_UN_VALUE) != 0 ? 1 : 0);
+    if (MODE_COUNT != 1) {
+        return -EINVAL;
+    }
+
+    VfsFlockAbi flock{};
+    if ((options & LOCK_UN_VALUE) != 0) {
+        flock.l_type = F_UNLCK_TYPE;
+    } else if ((options & LOCK_EX_VALUE) != 0) {
+        flock.l_type = F_WRLCK_TYPE;
+    } else {
+        flock.l_type = F_RDLCK_TYPE;
+    }
+    flock.l_whence = SEEK_SET_VALUE;
+    flock.l_start = 0;
+    flock.l_len = 0;
+
+    bool const WAIT = (options & LOCK_NB_VALUE) == 0;
+    return advisory_set_lock(file, 0, AdvisoryOwnerKind::OPEN_FILE, AdvisoryLockFamily::FLOCK, flock, WAIT);
+}
+
+void advisory_release_file_owner_locks(const File* file) {
+    if (file == nullptr) {
+        return;
+    }
+    g_advisory_lock_mutex.lock();
+    for (size_t i = 0; i < g_advisory_locks.size();) {
+        const AdvisoryLock& lock = g_advisory_locks.at(i);
+        if (lock.owner_kind == AdvisoryOwnerKind::OPEN_FILE && lock.owner_file == file) {
+            advisory_remove_lock_at(i);
+            continue;
+        }
+        ++i;
+    }
+    g_advisory_lock_mutex.unlock();
+}
+
+void advisory_release_process_locks_for_file(uint64_t pid, File* file) {
+    if (file == nullptr) {
+        return;
+    }
+
+    g_advisory_lock_mutex.lock();
+    bool const HAS_PROCESS_LOCKS = advisory_process_has_locks_locked(pid);
+    g_advisory_lock_mutex.unlock();
+    if (!HAS_PROCESS_LOCKS) {
+        return;
+    }
+
+    AdvisoryFileKey cheap_key{};
+    if (advisory_build_key(file, cheap_key, nullptr, false) < 0) {
+        return;
+    }
+
+    g_advisory_lock_mutex.lock();
+    advisory_release_process_locks_by_key_locked(pid, cheap_key);
+    bool const NEEDS_INODE_RELEASE = file->fs_type != FSType::REMOTE && advisory_process_has_inode_locks_locked(pid);
+    g_advisory_lock_mutex.unlock();
+
+    if (!NEEDS_INODE_RELEASE) {
+        return;
+    }
+
+    AdvisoryFileKey inode_key{};
+    if (advisory_build_key(file, inode_key) < 0) {
+        return;
+    }
+
+    g_advisory_lock_mutex.lock();
+    advisory_release_process_locks_by_key_locked(pid, inode_key);
+    g_advisory_lock_mutex.unlock();
 }
 
 auto metadata_normalized_path_len(const char* path) -> size_t {
@@ -757,6 +1312,7 @@ auto vfs_destroy_file(File* f) -> int {
     int close_result = 0;
     stream_detach_file(f);
     cache_notify_detach_file(f);
+    advisory_release_file_owner_locks(f);
     if ((f->fops != nullptr) && (f->fops->vfs_close != nullptr)) {
         close_result = f->fops->vfs_close(f);
     }
@@ -4026,6 +4582,8 @@ auto vfs_close(int fd) -> int {
         return -EBADF;
     }
 
+    advisory_release_process_locks_for_file(ker::mod::sched::task::process_pid(*t), f);
+
     ker::mod::perf::record_container_stat(0, t->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
                                           static_cast<int64_t>(FD_COUNT), 0, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 
@@ -5897,6 +6455,7 @@ auto vfs_dup2(int oldfd, int newfd, int flags) -> int {
     }
 
     if (REPLACE.existing != nullptr) {
+        advisory_release_process_locks_for_file(ker::mod::sched::task::process_pid(*task), REPLACE.existing);
         vfs_put_file(REPLACE.existing);
     }
     return newfd;
@@ -6769,6 +7328,40 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
             f->open_flags = static_cast<int>(arg);
             vfs_put_file(f);
             return 0;
+        case F_GETLK_CMD:
+        case F_OFD_GETLK_CMD: {
+            VfsFlockAbi flock{};
+            int ret = advisory_copy_from_user(arg, flock);
+            if (ret == 0) {
+                AdvisoryOwnerKind const OWNER_KIND = cmd == F_OFD_GETLK_CMD ? AdvisoryOwnerKind::OPEN_FILE : AdvisoryOwnerKind::PROCESS;
+                ret = advisory_get_lock(f, ker::mod::sched::task::process_pid(*task), OWNER_KIND, AdvisoryLockFamily::RECORD, flock);
+            }
+            if (ret == 0) {
+                ret = advisory_copy_to_user(arg, flock);
+            }
+            vfs_put_file(f);
+            return ret;
+        }
+        case F_SETLK_CMD:
+        case F_SETLKW_CMD:
+        case F_OFD_SETLK_CMD:
+        case F_OFD_SETLKW_CMD: {
+            VfsFlockAbi flock{};
+            int ret = advisory_copy_from_user(arg, flock);
+            if (ret == 0) {
+                AdvisoryOwnerKind const OWNER_KIND =
+                    (cmd == F_OFD_SETLK_CMD || cmd == F_OFD_SETLKW_CMD) ? AdvisoryOwnerKind::OPEN_FILE : AdvisoryOwnerKind::PROCESS;
+                bool const WAIT = cmd == F_SETLKW_CMD || cmd == F_OFD_SETLKW_CMD;
+                ret = advisory_set_lock(f, ker::mod::sched::task::process_pid(*task), OWNER_KIND, AdvisoryLockFamily::RECORD, flock, WAIT);
+            }
+            vfs_put_file(f);
+            return ret;
+        }
+        case WOS_FLOCK_CMD: {
+            int const RET = advisory_flock(f, static_cast<int>(arg));
+            vfs_put_file(f);
+            return RET;
+        }
         case 1030: {  // F_DUPFD_CLOEXEC - dup to fd >= arg, set close-on-exec
             if (arg >= ker::mod::sched::task::Task::FD_TABLE_SIZE) {
                 vfs_put_file(f);

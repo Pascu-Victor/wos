@@ -85,6 +85,24 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(WOS_BUILD_LINUX_BENCHMARKS "Build Linux MPI benchmark binaries with the host compiler" OFF)
 
+set(WOS_TOOLS_NATIVE_WOS_BUILD OFF)
+execute_process(
+    COMMAND uname -s
+    OUTPUT_VARIABLE WOS_TOOLS_HOST_UNAME
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(WOS_NATIVE_SYSTEM_BUILD OR (DEFINED ENV{WOS_NATIVE_HOST} AND "$ENV{WOS_NATIVE_HOST}" STREQUAL "1") OR
+   CMAKE_HOST_SYSTEM_NAME STREQUAL "WOS" OR WOS_TOOLS_HOST_UNAME STREQUAL "WOS")
+    set(WOS_TOOLS_NATIVE_WOS_BUILD ON)
+endif()
+
+set(WOS_BUILD_WOSDBG_DEFAULT ON)
+if(WOS_TOOLS_NATIVE_WOS_BUILD)
+    set(WOS_BUILD_WOSDBG_DEFAULT OFF)
+endif()
+option(WOS_BUILD_WOSDBG "Build the Qt6-based wosdbg debugger tools" ${WOS_BUILD_WOSDBG_DEFAULT})
+
 # Enable color output for clang
 add_compile_options(-fdiagnostics-color=always)
 
@@ -102,6 +120,10 @@ foreach(SUBDIR ${SUBDIRS})
         # Skip build directories
         if(NOT ${SUBDIR} STREQUAL "build")
             if("${SUBDIR}" STREQUAL "benchmarks" AND NOT WOS_BUILD_LINUX_BENCHMARKS)
+                continue()
+            endif()
+            if("${SUBDIR}" STREQUAL "wosdbg" AND NOT WOS_BUILD_WOSDBG)
+                message(STATUS "Skipping subdirectory: ${SUBDIR} (WOS_BUILD_WOSDBG=OFF)")
                 continue()
             endif()
             if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${SUBDIR}/CMakeLists.txt)

@@ -143,6 +143,7 @@ UNIT_TESTS=(
     wki_remote_compute_source_test
     wki_remote_vfs_source_test
     vfs_mount_lifetime_source_test
+    vfs_advisory_lock_source_test
     wki_wire_test
     wki_routing_test
     data_struct_test

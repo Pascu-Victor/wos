@@ -22,6 +22,7 @@ auto report_signal_stop(ker::mod::sched::task::Task& task, uint32_t signal) -> b
 void detach_tracees_for_tracer_exit(uint64_t tracer_pid);
 
 #ifdef WOS_SELFTEST
+auto ptrace_selftest_syscall_snapshot_patches_live_sysret_state() -> bool;
 auto ptrace_selftest_nonparent_exit_observer_preserves_parent_wait_status() -> bool;
 auto ptrace_selftest_parent_exit_observer_consumes_wait_status() -> bool;
 #endif

@@ -36,6 +36,10 @@ KTEST(PtraceAbi, RemoteInfoOffsets) {
     KEXPECT_EQ(offsetof(ker::abi::ptrace::RemoteInfo, target_hostname), static_cast<size_t>(40));
 }
 
+KTEST(PtraceSyscallStop, PublishesLiveSysretState) {
+    KEXPECT_TRUE(ker::mod::debug::ptrace::ptrace_selftest_syscall_snapshot_patches_live_sysret_state());
+}
+
 KTEST(PtraceExit, NonParentTracerDoesNotConsumeParentWaitStatus) {
     KEXPECT_TRUE(ker::mod::debug::ptrace::ptrace_selftest_nonparent_exit_observer_preserves_parent_wait_status());
 }

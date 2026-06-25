@@ -15,9 +15,13 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/mm.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#ifdef WOS_SELFTEST
+#include <platform/mm/phys.hpp>
+#endif
 
 #include "platform/asm/cpu.hpp"
 
@@ -40,6 +44,8 @@ constexpr uint64_t X86_DR7_RW_MASK = 0x3;
 constexpr uint64_t X86_DR7_RESERVED_ONES = 1ULL << 10;
 constexpr uint64_t PTRACE_O_TRACESYSGOOD = 0x00000001;
 constexpr uint32_t WOS_SIGSYS = 31;
+constexpr uint64_t KERNEL_STACK_MIN = 0xffff800000000000ULL;
+constexpr uint64_t KERNEL_STACK_MAX = 0xffff900000000000ULL;
 
 auto as_error(int err) -> uint64_t { return static_cast<uint64_t>(-err); }
 
@@ -124,6 +130,18 @@ auto copy_task_memory(Task& target, uint64_t target_addr, void* user_buffer, siz
 
 auto is_user_canonical(uint64_t value) -> bool { return value != 0 && value < 0x0000'8000'0000'0000ULL; }
 
+auto is_kernel_stack(uint64_t value) -> bool { return value >= KERNEL_STACK_MIN && value < KERNEL_STACK_MAX; }
+
+auto stack_region_contains(const Task& target, uint64_t addr, size_t size) -> bool {
+    if (!is_kernel_stack(target.context.syscall_kernel_stack) || size == 0) {
+        return false;
+    }
+    uint64_t const STACK_TOP = target.context.syscall_kernel_stack;
+    uint64_t const STACK_BASE = STACK_TOP - ker::mod::mm::KERNEL_STACK_SIZE;
+    uint64_t const END = addr + static_cast<uint64_t>(size);
+    return END >= addr && addr >= STACK_BASE && END <= STACK_TOP;
+}
+
 auto uses_stop_snapshot(const Task& target) -> bool {
     return target.ptrace_stopped && (is_syscall_stop(target.ptrace_stop_reason) || target.ptrace_stop_uses_syscall_snapshot);
 }
@@ -135,14 +153,38 @@ auto syscall_scratch(Task& target) -> ker::mod::cpu::PerCpu* {
     return reinterpret_cast<ker::mod::cpu::PerCpu*>(target.context.syscall_scratch_area);
 }
 
+void normalize_syscall_snapshot(Task& target) {
+    target.ptrace_syscall_regs.rcx = target.ptrace_syscall_frame.rip;
+    target.ptrace_syscall_regs.r11 = target.ptrace_syscall_frame.flags;
+}
+
+auto live_syscall_saved_regs(Task& target, const ker::mod::cpu::PerCpu& scratch) -> ker::mod::cpu::GPRegs* {
+    if (scratch.syscall_stack != target.context.syscall_kernel_stack || !is_kernel_stack(scratch.syscall_stack)) {
+        return nullptr;
+    }
+
+    uint64_t const REGS_ADDR = scratch.syscall_stack - sizeof(uint64_t) - sizeof(ker::mod::cpu::GPRegs);
+    uint64_t const RETVAL_ADDR = scratch.syscall_stack - sizeof(uint64_t);
+    if (!stack_region_contains(target, REGS_ADDR, sizeof(ker::mod::cpu::GPRegs)) ||
+        !stack_region_contains(target, RETVAL_ADDR, sizeof(uint64_t))) {
+        return nullptr;
+    }
+    return reinterpret_cast<ker::mod::cpu::GPRegs*>(REGS_ADDR);
+}
+
 auto publish_stop_snapshot_to_syscall_scratch(Task& target) -> bool {
     auto* scratch = syscall_scratch(target);
     if (scratch == nullptr) {
         return false;
     }
+    normalize_syscall_snapshot(target);
     scratch->user_rsp = target.ptrace_syscall_frame.rsp;
     scratch->syscall_ret_rip = target.ptrace_syscall_frame.rip;
     scratch->syscall_ret_flags = target.ptrace_syscall_frame.flags;
+    if (auto* regs = live_syscall_saved_regs(target, *scratch); regs != nullptr) {
+        regs->rcx = target.ptrace_syscall_frame.rip;
+        regs->r11 = target.ptrace_syscall_frame.flags;
+    }
     return true;
 }
 
@@ -798,6 +840,7 @@ void capture_syscall_stop_context(Task& task, ker::mod::cpu::GPRegs& gpr) {
 }
 
 void restore_syscall_stop_context(Task& task, ker::mod::cpu::GPRegs& gpr) {
+    normalize_syscall_snapshot(task);
     gpr = task.ptrace_syscall_regs;
 
     uint64_t const RETURN_RIP = task.ptrace_syscall_frame.rip;
@@ -1176,6 +1219,49 @@ auto report_fatal_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum) -> 
 auto report_signal_stop(ker::mod::sched::task::Task& task, uint32_t signal) -> bool { return record_signal_stop(task, signal); }
 
 #ifdef WOS_SELFTEST
+auto ptrace_selftest_syscall_snapshot_patches_live_sysret_state() -> bool {
+    auto* stack = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc(ker::mod::mm::KERNEL_STACK_SIZE, "ptrace_sysret_state_ktest"));
+    if (stack == nullptr) {
+        return false;
+    }
+
+    uint64_t const STACK_TOP = reinterpret_cast<uint64_t>(stack) + ker::mod::mm::KERNEL_STACK_SIZE;
+    uint64_t const REGS_ADDR = STACK_TOP - sizeof(uint64_t) - sizeof(ker::mod::cpu::GPRegs);
+    auto* saved_regs = reinterpret_cast<ker::mod::cpu::GPRegs*>(REGS_ADDR);
+    *saved_regs = {};
+    saved_regs->rcx = 0x0000000000401000ULL;
+    saved_regs->r11 = 0x202;
+
+    ker::mod::cpu::PerCpu scratch{};
+    scratch.syscall_stack = STACK_TOP;
+    scratch.user_rsp = 0x00007fffffffe000ULL;
+    scratch.syscall_ret_rip = saved_regs->rcx;
+    scratch.syscall_ret_flags = saved_regs->r11;
+
+    Task target{};
+    target.type = ker::mod::sched::task::TaskType::PROCESS;
+    target.context.syscall_kernel_stack = STACK_TOP;
+    target.context.syscall_scratch_area = reinterpret_cast<uint64_t>(&scratch);
+    target.ptrace_stopped = true;
+    target.ptrace_stop_reason = abi::ptrace::stop_reason::SYSCALL_ENTER;
+    target.ptrace_syscall_regs = {};
+    target.ptrace_syscall_regs.rcx = saved_regs->rcx;
+    target.ptrace_syscall_regs.r11 = saved_regs->r11;
+    target.ptrace_syscall_frame.rip = 0x0000000000402000ULL;
+    target.ptrace_syscall_frame.rsp = 0x00007fffffffd000ULL;
+    target.ptrace_syscall_frame.flags = 0x246;
+
+    bool const PUBLISHED = publish_stop_snapshot_to_syscall_scratch(target);
+    bool const OK = PUBLISHED && scratch.syscall_ret_rip == target.ptrace_syscall_frame.rip &&
+                    scratch.user_rsp == target.ptrace_syscall_frame.rsp && scratch.syscall_ret_flags == target.ptrace_syscall_frame.flags &&
+                    saved_regs->rcx == target.ptrace_syscall_frame.rip && saved_regs->r11 == target.ptrace_syscall_frame.flags &&
+                    target.ptrace_syscall_regs.rcx == target.ptrace_syscall_frame.rip &&
+                    target.ptrace_syscall_regs.r11 == target.ptrace_syscall_frame.flags;
+
+    ker::mod::mm::phys::page_free(stack);
+    return OK;
+}
+
 auto ptrace_selftest_nonparent_exit_observer_preserves_parent_wait_status() -> bool {
     Task tracer{};
     Task target{};
