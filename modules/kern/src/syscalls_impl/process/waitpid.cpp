@@ -50,7 +50,16 @@ struct ClaimedExitedChild {
 };
 
 auto is_waitable_exit(const ker::mod::sched::task::Task* task) -> bool {
-    return task != nullptr && task->exit_notify_ready.load(std::memory_order_acquire) && task->has_exited;
+    if (task == nullptr) {
+        return false;
+    }
+
+    // exit_notify_ready publishes the normal waitable-exit point. A task that
+    // has reached the final DEAD state is also waitable: preserving a waitpid
+    // block on a dead-listed direct child can strand the parent forever.
+    bool const EXIT_READY = task->exit_notify_ready.load(std::memory_order_acquire);
+    auto const STATE = task->state.load(std::memory_order_acquire);
+    return EXIT_READY || STATE == ker::mod::sched::task::TaskState::DEAD;
 }
 
 auto is_unwaited_child(const ker::mod::sched::task::Task* parent, const ker::mod::sched::task::Task* child) -> bool {
@@ -75,6 +84,14 @@ auto job_stop_status(const ker::mod::sched::task::Task& task) -> int32_t {
 
 auto is_ptrace_wait_target(const ker::mod::sched::task::Task& waiter, const ker::mod::sched::task::Task& target) -> bool {
     return target.ptrace_traced && target.ptrace_tracer_pid == waiter.pid;
+}
+
+auto is_unwaited_specific_wait_target(const ker::mod::sched::task::Task* waiter, const ker::mod::sched::task::Task* child, uint64_t pid)
+    -> bool {
+    if (waiter == nullptr || child == nullptr || child->is_thread || child->pid != pid || sched_task::task_waited_on(*child)) {
+        return false;
+    }
+    return child->parent_pid == waiter->pid || is_ptrace_wait_target(*waiter, *child);
 }
 
 auto consume_job_stop_if_waitable(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* target, int32_t* status,
@@ -148,6 +165,39 @@ auto claim_exited_child(ker::mod::sched::task::Task* parent) -> ClaimedExitedChi
                 continue;
             }
             if (is_unwaited_child(parent, child) && is_waitable_exit(child) && sched_task::task_try_mark_waited_on(*child)) {
+                return {.task = child, .release_ref = true};
+            }
+            child->release();
+        }
+    }
+
+    return {};
+}
+
+auto claim_specific_exited_child(ker::mod::sched::task::Task* waiter, uint64_t pid) -> ClaimedExitedChild {
+    if (waiter == nullptr || pid == 0) {
+        return {};
+    }
+
+    uint32_t const COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < COUNT; i++) {
+        auto* child = ker::mod::sched::get_active_task_at(i);
+        if (is_unwaited_specific_wait_target(waiter, child, pid) && is_waitable_exit(child) &&
+            sched_task::task_try_mark_waited_on(*child)) {
+            return {.task = child, .release_ref = false};
+        }
+    }
+
+    uint64_t const CORE_COUNT = ker::mod::smt::get_core_count();
+    for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
+        size_t const DEAD_COUNT = ker::mod::sched::get_dead_task_count(cpu_no);
+        for (size_t i = 0; i < DEAD_COUNT; ++i) {
+            auto* child = ker::mod::sched::get_dead_task_at_safe(cpu_no, i);
+            if (child == nullptr) {
+                continue;
+            }
+            if (is_unwaited_specific_wait_target(waiter, child, pid) && is_waitable_exit(child) &&
+                sched_task::task_try_mark_waited_on(*child)) {
                 return {.task = child, .release_ref = true};
             }
             child->release();
@@ -375,9 +425,15 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     log::debug("PID %x waiting for PID %x", current_task->pid, pid);
 #endif
 
+    auto const TARGET_PID = static_cast<uint64_t>(pid);
+    auto claimed_target = claim_specific_exited_child(current_task, TARGET_PID);
+    if (claimed_target.task != nullptr) {
+        return consume_claimed_exit(current_task, claimed_target, status, rusage_vaddr);
+    }
+
     // Use zombie-visible lookup. A matching unwaited child cannot be reclaimed
     // while its parent is alive and has not consumed the exit status.
-    auto* target_task = ker::mod::sched::find_task_by_pid(pid);
+    auto* target_task = ker::mod::sched::find_task_by_pid(TARGET_PID);
     if (target_task == nullptr) {
 #ifdef WAITPID_DEBUG
         log::debug("target task PID %x not found", pid);
@@ -411,14 +467,14 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         current_task->wait_rusage_user_addr = 0;
         current_task->wait_rusage_phys_addr = 0;
         clear_wait_resume_debug(current_task);
-        return pid;  // Return the PID of the exited process
+        return TARGET_PID;  // Return the PID of the exited process
     }
 
     if (consume_ptrace_stop_if_waitable(current_task, target_task, status, options)) {
-        return pid;
+        return TARGET_PID;
     }
     if (consume_job_stop_if_waitable(current_task, target_task, status, options)) {
-        return pid;
+        return TARGET_PID;
     }
 
     if ((options & WOS_WNOHANG) != 0) {
@@ -428,7 +484,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     // Prepare the current task's wait state before publishing ourselves on the child's
     // waiter list. Once the child can see our PID, it may wake us immediately.
     current_task->waitpid_publish_pending.store(true, std::memory_order_release);
-    current_task->waiting_for_pid = pid;
+    current_task->waiting_for_pid = TARGET_PID;
     current_task->wait_options = options;
     if (status != nullptr) {
         current_task->wait_status_user_addr = reinterpret_cast<uint64_t>(status);
@@ -481,14 +537,14 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             current_task->wait_rusage_user_addr = 0;
             current_task->wait_rusage_phys_addr = 0;
             clear_wait_resume_debug(current_task);
-            return pid;
+            return TARGET_PID;
         }
         if (consume_job_stop_if_waitable(current_task, target_task, status, options)) {
             clear_waitpid_publish_pending(current_task);
             current_task->deferred_task_switch = false;
             current_task->waiting_for_pid = 0;
             current_task->wait_options = 0;
-            return pid;
+            return TARGET_PID;
         }
         return 0;
     }
@@ -524,14 +580,14 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         current_task->wait_rusage_user_addr = 0;
         current_task->wait_rusage_phys_addr = 0;
         clear_wait_resume_debug(current_task);
-        return pid;
+        return TARGET_PID;
     }
     if (consume_job_stop_if_waitable(current_task, target_task, status, options)) {
         target_task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
         clear_waitpid_publish_pending(current_task);
         current_task->waiting_for_pid = 0;
         current_task->wait_options = 0;
-        return pid;
+        return TARGET_PID;
     }
 
     // Add the current task's PID to the target task's awaitee list

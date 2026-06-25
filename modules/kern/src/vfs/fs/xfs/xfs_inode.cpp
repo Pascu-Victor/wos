@@ -17,6 +17,7 @@
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/phys.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -47,7 +48,9 @@ namespace {
 
 constexpr size_t ICACHE_BUCKETS = 1024;
 constexpr size_t ICACHE_HASH_MASK = ICACHE_BUCKETS - 1;
-constexpr size_t ICACHE_IDLE_RETAIN_LIMIT = 65536;
+constexpr size_t ICACHE_IDLE_RETAIN_MIN = 65536;
+constexpr size_t ICACHE_IDLE_RETAIN_MAX = 524288;
+constexpr uint64_t ICACHE_IDLE_RETAIN_BYTES_PER_INODE = 32ULL * 1024ULL;
 constexpr size_t ICACHE_RECLAIM_BATCH = 256;
 constexpr uint64_t ALLOC_LOOKUP_WARN_INTERVAL = 4096;
 
@@ -60,11 +63,29 @@ std::array<IcacheBucket, ICACHE_BUCKETS> icache;
 bool icache_inited = false;
 std::atomic<uint64_t> alloc_lookup_failure_count{0};
 std::atomic<size_t> icache_idle_count{0};
+std::atomic<size_t> icache_idle_retain_limit_cached{0};
 
 auto icache_hash(const XfsMountContext* mount, xfs_ino_t ino) -> size_t {
     auto const MOUNT_BITS = reinterpret_cast<uintptr_t>(mount) >> 6;
     auto const MIXED = (ino * 2654435761ULL) ^ static_cast<uint64_t>(MOUNT_BITS);
     return static_cast<size_t>(MIXED & ICACHE_HASH_MASK);
+}
+
+auto icache_idle_retain_limit() -> size_t {
+    size_t cached = icache_idle_retain_limit_cached.load(std::memory_order_acquire);
+    if (cached != 0) {
+        return cached;
+    }
+
+    uint64_t const TOTAL_MEM = ker::mod::mm::phys::get_total_mem_bytes();
+    uint64_t scaled = TOTAL_MEM / ICACHE_IDLE_RETAIN_BYTES_PER_INODE;
+    if (scaled == 0) {
+        scaled = ICACHE_IDLE_RETAIN_MIN;
+    }
+    uint64_t const RETAIN_LIMIT = std::clamp<uint64_t>(scaled, ICACHE_IDLE_RETAIN_MIN, ICACHE_IDLE_RETAIN_MAX);
+    cached = static_cast<size_t>(std::min<uint64_t>(RETAIN_LIMIT, static_cast<uint64_t>(SIZE_MAX)));
+    icache_idle_retain_limit_cached.store(cached, std::memory_order_release);
+    return cached;
 }
 
 auto perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp op) -> uint64_t {
@@ -252,7 +273,8 @@ void free_inode(XfsInode* ip) {
 }
 
 void reclaim_idle_inodes() {
-    if (icache_idle_count.load(std::memory_order_relaxed) <= ICACHE_IDLE_RETAIN_LIMIT) {
+    size_t const RETAIN_LIMIT = icache_idle_retain_limit();
+    if (icache_idle_count.load(std::memory_order_relaxed) <= RETAIN_LIMIT) {
         return;
     }
 
@@ -262,8 +284,7 @@ void reclaim_idle_inodes() {
     for (auto& bucket : icache) {
         uint64_t const FLAGS = bucket.lock.lock_irqsave();
         XfsInode** pp = &bucket.head;
-        while (*pp != nullptr && victim_count < victims.size() &&
-               icache_idle_count.load(std::memory_order_relaxed) > ICACHE_IDLE_RETAIN_LIMIT) {
+        while (*pp != nullptr && victim_count < victims.size() && icache_idle_count.load(std::memory_order_relaxed) > RETAIN_LIMIT) {
             XfsInode* ip = *pp;
             if (ip->refcount == 0 && ip->nlink != 0 && !ip->dirty && !ip->inactivation_started) {
                 *pp = ip->hash_next;
@@ -276,7 +297,7 @@ void reclaim_idle_inodes() {
         }
         bucket.lock.unlock_irqrestore(FLAGS);
 
-        if (victim_count == victims.size() || icache_idle_count.load(std::memory_order_relaxed) <= ICACHE_IDLE_RETAIN_LIMIT) {
+        if (victim_count == victims.size() || icache_idle_count.load(std::memory_order_relaxed) <= RETAIN_LIMIT) {
             break;
         }
     }
@@ -1019,7 +1040,7 @@ void xfs_inode_release(XfsInode* ip) {
             ip->refcount = 0;
             size_t const IDLE_COUNT = icache_idle_count.fetch_add(1, std::memory_order_relaxed) + 1;
             icache.at(BUCKET).lock.unlock_irqrestore(flags);
-            if (IDLE_COUNT > ICACHE_IDLE_RETAIN_LIMIT) {
+            if (IDLE_COUNT > icache_idle_retain_limit()) {
                 reclaim_idle_inodes();
             }
             return;

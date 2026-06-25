@@ -169,6 +169,12 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
             if (task == nullptr) {
                 return 0;
             }
+            if (task->exit_in_progress) {
+                for (;;) {
+                    asm volatile("hlt");
+                }
+            }
+            task->exit_in_progress = true;
             release_thread_fd_refs(task);
             task->has_exited = true;
             task->exit_status = 0;

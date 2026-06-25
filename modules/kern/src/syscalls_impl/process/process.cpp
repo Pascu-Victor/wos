@@ -394,6 +394,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->cpu = cpu::current_cpu();
     child->has_run = false;
     child->exit_status = 0;
+    child->exit_in_progress = false;
     child->has_exited = false;
     child->exit_notify_ready.store(false, std::memory_order_relaxed);
     sched::task::task_clear_waited_on(*child);

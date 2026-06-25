@@ -553,17 +553,26 @@ inline auto waitpid_child_is_unwaited(const task::Task* waiter, const task::Task
 }
 
 inline auto waitpid_child_is_waitable_exit(const task::Task* child) -> bool {
-    return child != nullptr && child->exit_notify_ready.load(std::memory_order_acquire) && child->has_exited;
+    if (child == nullptr) {
+        return false;
+    }
+
+    // exit_notify_ready publishes the normal waitable-exit point. A task that
+    // has reached the final DEAD state is also waitable: preserving a waitpid
+    // block on a dead-listed direct child can strand the parent forever.
+    bool const EXIT_READY = child->exit_notify_ready.load(std::memory_order_acquire);
+    task::TaskState const STATE = child->state.load(std::memory_order_acquire);
+    return EXIT_READY || STATE == task::TaskState::DEAD;
 }
 
 inline auto registered_waitpid_matches_child(const task::Task* waiter, const task::Task* child) -> bool {
     if (waiter == nullptr || child == nullptr || child->is_thread || waiter->waiting_for_pid == 0) {
         return false;
     }
-    if (waiter->waiting_for_pid == child->pid) {
-        return true;
+    if (!waitpid_child_matches_waiter(waiter, child)) {
+        return false;
     }
-    return waiter->waiting_for_pid == WAIT_ANY_CHILD && waitpid_child_matches_waiter(waiter, child);
+    return waiter->waiting_for_pid == WAIT_ANY_CHILD || waiter->waiting_for_pid == child->pid;
 }
 
 __attribute__((no_sanitize("address"))) auto pid_table_find_lifetime_ref(uint64_t pid) -> task::Task*;
@@ -879,16 +888,15 @@ inline void complete_parent_waitpid_after_dead_enqueue(task::Task* child) {
         return;
     }
 
-    auto try_complete_waiter = [child](task::Task* waiter, const char* path) -> bool {
+    auto nudge_waiter = [child](task::Task* waiter, const char* path) -> bool {
         if (waiter == nullptr || waiter->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE ||
-            waiter->sched_queue != task::Task::sched_queue::WAITING || waiter->deferred_task_switch ||
             !waiter->wait_channel_is(task::WaitChannelKind::WAITPID) || waiter->waiting_for_pid == 0 ||
             !registered_waitpid_matches_child(waiter, child)) {
             return false;
         }
 
-        if (!complete_registered_waitpid_exit_for_scheduler(waiter, child, path)) {
-            return false;
+        if (waiter->sched_queue == task::Task::sched_queue::WAITING && !waiter->deferred_task_switch) {
+            (void)complete_registered_waitpid_exit_for_scheduler(waiter, child, path);
         }
 
         uint64_t target_cpu = waiter->cpu;
@@ -902,9 +910,9 @@ inline void complete_parent_waitpid_after_dead_enqueue(task::Task* child) {
     if (child->parent_pid != 0) {
         auto* parent = find_task_by_pid_safe(child->parent_pid);
         if (parent != nullptr) {
-            bool const COMPLETED = try_complete_waiter(parent, "dead-list-parent-waitpid");
+            bool const NUDGED = nudge_waiter(parent, "dead-list-parent-waitpid");
             parent->release();
-            if (COMPLETED) {
+            if (NUDGED) {
                 return;
             }
         }
@@ -916,9 +924,9 @@ inline void complete_parent_waitpid_after_dead_enqueue(task::Task* child) {
         if (waiter == nullptr) {
             continue;
         }
-        bool const COMPLETED = try_complete_waiter(waiter, "dead-list-registered-waitpid");
+        bool const NUDGED = nudge_waiter(waiter, "dead-list-registered-waitpid");
         waiter->release();
-        if (COMPLETED) {
+        if (NUDGED) {
             return;
         }
     }
@@ -4006,194 +4014,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     }
     current_task->deferred_task_switch = false;
 
-    // Race check: for blocking waits, verify target hasn't already exited
-    if (!IS_YIELD && current_task->waiting_for_pid != 0) {
-        if (current_task->waiting_for_pid == WAIT_ANY_CHILD) {
-            auto try_reap_wait_any_child = [&](task::Task* child, const char* path) -> bool {
-                if (child == nullptr || child->is_thread || child->parent_pid != current_task->pid ||
-                    !child->exit_notify_ready.load(std::memory_order_acquire) || !child->has_exited || task::task_waited_on(*child)) {
-                    return false;
-                }
-                if (!task::task_try_mark_waited_on(*child)) {
-                    return false;
-                }
-
-                skip_wait_queue = true;
-                task::task_accumulate_waited_child_times(*current_task, *child);
-                current_task->context.regs.rax = child->pid;
-                validate_wait_resume_mapping(current_task, child, path);
-                if (current_task->wait_status_user_addr != 0 && current_task->pagemap != nullptr) {
-                    uint64_t const STATUS_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_status_user_addr);
-                    if (STATUS_PHYS != mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
-                        auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(STATUS_PHYS));
-                        *status_ptr = child->exit_status;
-                    }
-                    current_task->wait_status_user_addr = 0;
-                    current_task->wait_status_phys_addr = 0;
-                }
-                if (current_task->wait_rusage_user_addr != 0 && current_task->pagemap != nullptr) {
-                    uint64_t const RUSAGE_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_rusage_user_addr);
-                    if (RUSAGE_PHYS != mm::virt::PADDR_INVALID && RUSAGE_PHYS != 0) {
-                        auto* ru = reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(RUSAGE_PHYS));
-                        uint64_t const USER_TIME_US = task::task_rusage_user_time_us(*child);
-                        uint64_t const SYSTEM_TIME_US = task::task_rusage_system_time_us(*child);
-                        ru->ru_utime_sec = static_cast<int64_t>(USER_TIME_US / 1000000ULL);
-                        ru->ru_utime_usec = static_cast<int64_t>(USER_TIME_US % 1000000ULL);
-                        ru->ru_stime_sec = static_cast<int64_t>(SYSTEM_TIME_US / 1000000ULL);
-                        ru->ru_stime_usec = static_cast<int64_t>(SYSTEM_TIME_US % 1000000ULL);
-                    }
-                    current_task->wait_rusage_user_addr = 0;
-                    current_task->wait_rusage_phys_addr = 0;
-                }
-                current_task->waiting_for_pid = 0;
-                current_task->wait_options = 0;
-                return true;
-            };
-
-            // Wait-for-any-child: scan for an exited child of this task.
-            // Zombie children stay in the active registry while the parent is
-            // alive, but the safe accessor refuses DEAD/EXITING tasks.  The
-            // deferred-switch race check must still see those zombies or a
-            // parent can be parked forever after its child already exited.
-            uint32_t const COUNT = get_active_task_count();
-            for (uint32_t i = 0; i < COUNT; i++) {
-                auto* child = get_active_task_at(i);
-                if (try_reap_wait_any_child(child, "sched-any")) {
-                    break;
-                }
-            }
-            if (!skip_wait_queue) {
-                uint64_t const CORE_COUNT = smt::get_core_count();
-                for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT && !skip_wait_queue; ++cpu_no) {
-                    size_t const DEAD_COUNT = get_dead_task_count(cpu_no);
-                    for (size_t i = 0; i < DEAD_COUNT; ++i) {
-                        auto* child = get_dead_task_at_safe(cpu_no, i);
-                        if (child == nullptr) {
-                            continue;
-                        }
-                        bool const REAPED = try_reap_wait_any_child(child, "sched-any-dead");
-                        child->release();
-                        if (REAPED) {
-                            break;
-                        }
-                    }
-                }
-            }
-            if (!skip_wait_queue) {
-                uint32_t const COUNT = get_active_task_count();
-                for (uint32_t i = 0; i < COUNT; i++) {
-                    auto* child = get_active_task_at(i);
-                    if (complete_waitpid_job_stop_if_waitable(current_task, child)) {
-                        skip_wait_queue = true;
-                        break;
-                    }
-                }
-            }
-        } else {
-            // Wait-for-specific-PID
-            uint64_t const WAIT_TARGET = current_task->waiting_for_pid;
-            auto complete_exited_specific_wait = [&](task::Task* target, const char* path) -> bool {
-                if (target == nullptr || target->pid != WAIT_TARGET || !target->exit_notify_ready.load(std::memory_order_acquire) ||
-                    !target->has_exited) {
-                    return false;
-                }
-
-                skip_wait_queue = true;
-                if (task::task_try_mark_waited_on(*target)) {
-                    task::task_accumulate_waited_child_times(*current_task, *target);
-                    current_task->context.regs.rax = target->pid;
-                    validate_wait_resume_mapping(current_task, target, path);
-                    if (current_task->wait_status_user_addr != 0 && current_task->pagemap != nullptr) {
-                        uint64_t const STATUS_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_status_user_addr);
-                        if (STATUS_PHYS != mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
-                            auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(STATUS_PHYS));
-                            *status_ptr = target->exit_status;
-                        }
-                        current_task->wait_status_user_addr = 0;
-                        current_task->wait_status_phys_addr = 0;
-                    }
-                    if (current_task->wait_rusage_user_addr != 0 && current_task->pagemap != nullptr) {
-                        uint64_t const RUSAGE_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_rusage_user_addr);
-                        if (RUSAGE_PHYS != mm::virt::PADDR_INVALID && RUSAGE_PHYS != 0) {
-                            auto* ru = reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(RUSAGE_PHYS));
-                            uint64_t const USER_TIME_US = task::task_rusage_user_time_us(*target);
-                            uint64_t const SYSTEM_TIME_US = task::task_rusage_system_time_us(*target);
-                            ru->ru_utime_sec = static_cast<int64_t>(USER_TIME_US / 1000000ULL);
-                            ru->ru_utime_usec = static_cast<int64_t>(USER_TIME_US % 1000000ULL);
-                            ru->ru_stime_sec = static_cast<int64_t>(SYSTEM_TIME_US / 1000000ULL);
-                            ru->ru_stime_usec = static_cast<int64_t>(SYSTEM_TIME_US % 1000000ULL);
-                        }
-                        current_task->wait_rusage_user_addr = 0;
-                        current_task->wait_rusage_phys_addr = 0;
-                    }
-                } else {
-                    current_task->context.regs.rax = static_cast<uint64_t>(-ECHILD);
-                    current_task->wait_status_user_addr = 0;
-                    current_task->wait_status_phys_addr = 0;
-                    current_task->wait_rusage_user_addr = 0;
-                    current_task->wait_rusage_phys_addr = 0;
-                }
-                current_task->waiting_for_pid = 0;
-                current_task->wait_options = 0;
-                return true;
-            };
-
-            auto* target = find_task_by_pid(WAIT_TARGET);
-            if (target == nullptr) {
-                uint64_t const CORE_COUNT = smt::get_core_count();
-                for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT && !skip_wait_queue; ++cpu_no) {
-                    size_t const DEAD_COUNT = get_dead_task_count(cpu_no);
-                    for (size_t i = 0; i < DEAD_COUNT; ++i) {
-                        auto* dead = get_dead_task_at_safe(cpu_no, i);
-                        if (dead == nullptr) {
-                            continue;
-                        }
-                        bool const REAPED = complete_exited_specific_wait(dead, "sched-specific-dead");
-                        dead->release();
-                        if (REAPED) {
-                            break;
-                        }
-                    }
-                }
-                if (!skip_wait_queue) {
-                    skip_wait_queue = true;
-                    current_task->context.regs.rax = static_cast<uint64_t>(-ECHILD);
-                    task::task_clear_waitpid_block_state(*current_task);
-                }
-            }
-            if (target != nullptr && target->ptrace_traced && target->ptrace_tracer_pid == current_task->pid && target->ptrace_stopped &&
-                target->ptrace_stop_pending) {
-                skip_wait_queue = true;
-                current_task->context.regs.rax = target->pid;
-                if (current_task->wait_status_user_addr != 0 && current_task->pagemap != nullptr) {
-                    uint64_t const STATUS_PHYS = mm::virt::translate(current_task->pagemap, current_task->wait_status_user_addr);
-                    if (STATUS_PHYS != mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
-                        uint32_t signal = target->ptrace_stop_signal != 0 ? target->ptrace_stop_signal : 5;
-                        if ((target->ptrace_stop_reason == ker::abi::ptrace::stop_reason::SYSCALL_ENTER ||
-                             target->ptrace_stop_reason == ker::abi::ptrace::stop_reason::SYSCALL_EXIT) &&
-                            (target->ptrace_options & 0x00000001U) != 0) {
-                            signal |= 0x80U;
-                        }
-                        auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(STATUS_PHYS));
-                        *status_ptr = static_cast<int32_t>((signal << 8U) | 0x7fU);
-                    }
-                    current_task->wait_status_user_addr = 0;
-                    current_task->wait_status_phys_addr = 0;
-                }
-                current_task->waiting_for_pid = 0;
-                current_task->wait_options = 0;
-                target->ptrace_stop_pending = false;
-            }
-            if (!skip_wait_queue && complete_waitpid_job_stop_if_waitable(current_task, target)) {
-                skip_wait_queue = true;
-            }
-            if (!skip_wait_queue) {
-                static_cast<void>(complete_exited_specific_wait(target, "sched-specific"));
-            }
-        }
-    }
-
-    if (!skip_wait_queue && is_waitpid_wait_channel(current_task->wait_channel_kind) && current_task->waiting_for_pid != 0) {
+    if (!IS_YIELD && !skip_wait_queue && is_waitpid_wait_channel(current_task->wait_channel_kind) && current_task->waiting_for_pid != 0) {
         (void)current_task->wakeup_pending.exchange(false, std::memory_order_acquire);
         skip_wait_queue = complete_or_preserve_waitpid_block(current_task);
     }
@@ -5136,6 +4957,10 @@ void insert_into_dead_list(task::Task* task) {
                 PRE_GC_QUEUED ? 1U : 0U, task->context.syscall_kernel_stack, task->context.syscall_scratch_area, task->thread,
                 task->pagemap);
         }
+        return;
+    }
+
+    if (task->state.load(std::memory_order_acquire) != task::TaskState::DEAD) {
         return;
     }
 

@@ -2867,9 +2867,9 @@ void wki_remote_compute_check_completions() {
             // RunningRemoteTask holds a ref until completion is reported.
             completed = true;
         } else if (task->exit_notify_ready.load(std::memory_order_acquire) && task->has_exited) {
-            // wos_proc_exit() sets has_exited before closing fds. Wait for
-            // exit_notify_ready so remote stdout/stderr proxy closes cannot be
-            // overtaken by TASK_COMPLETE.
+            // Wait for the same waitpid-visible point as local parents so
+            // remote stdout/stderr proxy closes cannot be overtaken by
+            // TASK_COMPLETE.
             exit_status = normalize_local_exit_status_for_wire(task->exit_status);
             completed = true;
         }

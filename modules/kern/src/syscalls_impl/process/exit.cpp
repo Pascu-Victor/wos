@@ -143,7 +143,13 @@ void reschedule_on_task_cpu(ker::mod::sched::task::Task* task) {
 }
 
 auto waiter_matches_child(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) -> bool {
-    return waiter != nullptr && child != nullptr && (waiter->waiting_for_pid == WAIT_ANY_CHILD || waiter->waiting_for_pid == child->pid);
+    if (waiter == nullptr || child == nullptr || child->is_thread || waiter->waiting_for_pid == 0) {
+        return false;
+    }
+    if (child->parent_pid != waiter->pid && (!child->ptrace_traced || child->ptrace_tracer_pid != waiter->pid)) {
+        return false;
+    }
+    return waiter->waiting_for_pid == WAIT_ANY_CHILD || waiter->waiting_for_pid == child->pid;
 }
 
 auto waiter_is_blocked_on_different_waitpid_child(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) -> bool {
@@ -328,25 +334,27 @@ namespace {
     record_local_proc_event(current_task, ker::mod::perf::WkiPerfLocalProcOp::EXIT, ker::mod::perf::WkiPerfPhase::BEGIN, EXIT_CORR, status,
                             0, WOS_PERF_CALLSITE());
 
-    // CRITICAL: Atomically transition to EXITING state.
-    // This prevents other CPUs from scheduling this task while we're cleaning up.
-    // If this fails, another CPU already started our exit (shouldn't happen).
-    if (!current_task->transition_state(ker::mod::sched::task::TaskState::ACTIVE, ker::mod::sched::task::TaskState::EXITING)) {
-        // Already exiting - this shouldn't happen but handle it gracefully
+    // Mark this task as committed to exit, but keep it schedulable until after
+    // descriptor teardown.  vfs_close() can synchronously commit dirty file
+    // state and may park at scheduler-safe wait points; an EXITING task is not
+    // requeued by normal wake paths, so moving to EXITING before that cleanup
+    // can strand the child and preserve a parent's waitpid() forever.
+    //
+    // Do not set has_exited here: other subsystems use it as a zombie/dead
+    // predicate.  exit_in_progress only suppresses re-entrant exit attempts
+    // while cleanup is still allowed to block.
+    if (current_task->exit_in_progress) {
         for (;;) {
             asm volatile("hlt");
         }
     }
-
-    // Memory barrier to ensure state change is visible to all CPUs
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    current_task->exit_in_progress = true;
 
 #ifdef EXIT_DEBUG
     log::debug("task PID %x exiting with status %d", current_task->pid, status);
 #endif
 
     current_task->exit_status = wait_status;
-    current_task->has_exited = true;
 #ifdef EXIT_DEBUG
     log::trace("wos_proc_exit: pid=%lu name=%s status=%d thread=%d owner=%lu pagemap=%p", current_task->pid,
                current_task->name != nullptr ? current_task->name : "?", status, current_task->is_thread, current_task->owner_pid,
@@ -399,6 +407,19 @@ namespace {
             current_task->elf_buffer_size = 0;
         }
     }
+
+    // From this point forward the task must not block or return to userspace:
+    // user address-space teardown, waiter notification, and final GC handoff all
+    // assume it has left the ordinary ACTIVE scheduling domain.
+    if (!current_task->transition_state(ker::mod::sched::task::TaskState::ACTIVE, ker::mod::sched::task::TaskState::EXITING)) {
+        for (;;) {
+            asm volatile("hlt");
+        }
+    }
+
+    // Memory barrier to ensure state change is visible to all CPUs.
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    current_task->has_exited = true;
 
     // A waitable zombie keeps only status/accounting/PID metadata. It must not
     // pin the exiting process's user address space while waiting for the parent

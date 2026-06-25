@@ -515,8 +515,9 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->parent_pid = 0;        // Initialize to 0 (no parent by default, will be set by exec or fork)
     this->elf_buffer = nullptr;  // No ELF buffer by default
     this->elf_buffer_size = 0;
-    this->has_run = false;     // Task hasn't run yet, context.frame contains initial setup
-    this->exit_status = 0;     // Initialize exit status
+    this->has_run = false;  // Task hasn't run yet, context.frame contains initial setup
+    this->exit_status = 0;  // Initialize exit status
+    this->exit_in_progress = false;
     this->has_exited = false;  // Task hasn't exited yet
     this->jobctl_stopped.store(false, std::memory_order_relaxed);
     this->jobctl_stop_pending.store(false, std::memory_order_relaxed);
@@ -922,6 +923,7 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
 
     // Scheduling defaults
     t->has_run = false;
+    t->exit_in_progress = false;
     t->has_exited = false;
     t->exit_notify_ready.store(false, std::memory_order_relaxed);
     t->exit_status = 0;

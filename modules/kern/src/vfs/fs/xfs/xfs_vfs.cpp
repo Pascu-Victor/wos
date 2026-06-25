@@ -56,6 +56,7 @@ constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
 // number of transactions for a sequential write is (total_blocks / batch).
 constexpr xfs_extlen_t XFS_WRITE_BATCH_BLOCKS = 65536;  // up to 256 MiB per transaction
 constexpr size_t XFS_BUFFERED_WRITE_BATCH_MAX_BYTES = size_t{256} * 1024;
+constexpr size_t XFS_DIRTY_THROTTLE_INTERVAL_BYTES = size_t{4} * 1024 * 1024;
 constexpr size_t XFS_STREAM_PREALLOC_TRIGGER_BYTES = size_t{512} * 1024;
 constexpr xfs_extlen_t XFS_STREAM_PREALLOC_BLOCKS = 1024;  // 4 MiB
 constexpr uint32_t XFS_STREAM_PREALLOC_EXTENT_MARGIN = 8;
@@ -773,9 +774,17 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
         size_t block_off = initial_block_off;
         xfs_fsblock_t current_disk_block = disk_block;
         size_t current_src_offset = src_offset;
+        size_t bytes_since_pressure_check = 0;
         bool ok = true;
 
         size_t const MAX_BATCH_BLOCKS = std::max<size_t>(1, XFS_BUFFERED_WRITE_BATCH_MAX_BYTES >> ctx->block_log);
+        auto account_dirty_write = [&](size_t bytes_written) {
+            bytes_since_pressure_check += bytes_written;
+            if (bytes_since_pressure_check >= XFS_DIRTY_THROTTLE_INTERVAL_BYTES) {
+                throttle_dirty_buffer_cache(ctx->device);
+                bytes_since_pressure_check = 0;
+            }
+        };
 
         while (remaining_bytes > 0) {
             if (block_off == 0 && remaining_bytes >= ctx->block_size) {
@@ -794,6 +803,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
                     std::memcpy(bp->data, src + current_src_offset, BATCH_BYTES);
                     bdirty(bp);
                     brelse(bp);
+                    account_dirty_write(BATCH_BYTES);
 
                     remaining_bytes -= BATCH_BYTES;
                     current_src_offset += BATCH_BYTES;
@@ -816,6 +826,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset)
             std::memcpy(bp->data + block_off, src + current_src_offset, CHUNK);
             bdirty(bp);
             brelse(bp);
+            account_dirty_write(CHUNK);
 
             remaining_bytes -= CHUNK;
             current_src_offset += CHUNK;

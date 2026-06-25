@@ -214,7 +214,7 @@ std::atomic<bool> dirty_writeback_wq_creating{false};
 
 bool cache_initialized = false;
 
-constexpr size_t DIRTY_HARD_LIMIT_MULTIPLIER = 4;
+constexpr size_t DIRTY_HARD_LIMIT_MULTIPLIER = 2;
 constexpr size_t DIRTY_WRITEBACK_BUDGET = 128;
 constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = 16;
 constexpr size_t DIRTY_WAKE_BATCH = 32;
@@ -285,6 +285,12 @@ auto dirty_hard_limit_bytes_locked() -> size_t {
         return SIZE_MAX;
     }
     return cache_max_bytes * DIRTY_HARD_LIMIT_MULTIPLIER;
+}
+
+auto dirty_throttle_resume_bytes_locked() -> size_t {
+    size_t const TARGET = dirty_target_bytes_locked();
+    size_t const HARD = dirty_hard_limit_bytes_locked();
+    return std::max(TARGET, HARD / 2);
 }
 
 auto perf_elapsed_since_us(uint64_t started_us) -> uint32_t {
@@ -956,7 +962,7 @@ void clear_buffer_dirty_locked(BufHead* bh) {
 }
 
 void collect_dirty_waiters_locked(DirtyWakeList& wake_list) {
-    if (cache_dirty_bytes > dirty_target_bytes_locked()) {
+    if (cache_dirty_bytes > dirty_throttle_resume_bytes_locked()) {
         return;
     }
     while (!dirty_waiters.empty() && wake_list.count < wake_list.pids.size()) {
@@ -1406,11 +1412,16 @@ void bdirty(BufHead* bh) {
 
     uint64_t const PERF_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DIRTY);
     bool became_dirty = false;
+    bool should_writeback = false;
     uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
     became_dirty = mark_buffer_dirty_locked(bh);
+    should_writeback = dirty_bytes_above_target_locked();
     cache_lock.unlock_irqrestore(IRQFLAGS);
     if (became_dirty) {
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DIRTY, PERF_STARTED_US, 0, bh->size);
+    }
+    if (should_writeback) {
+        static_cast<void>(request_dirty_writeback());
     }
 }
 
@@ -1662,10 +1673,11 @@ void throttle_dirty_buffer_cache(dev::BlockDevice* bdev) {
     }
 
     DirtyWritebackFilter fallback_filter{};
+    fallback_filter.bdev = bdev;
 
     while (true) {
         irqflags = cache_lock.lock_irqsave();
-        if (cache_dirty_bytes <= dirty_target_bytes_locked()) {
+        if (cache_dirty_bytes <= dirty_throttle_resume_bytes_locked()) {
             cache_lock.unlock_irqrestore(irqflags);
             return;
         }

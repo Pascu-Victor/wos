@@ -435,6 +435,7 @@ struct Task {
     // not a user-visible process row in /proc root.
     bool wki_proxy_task = false;
 
+    bool exit_in_progress{};
     bool has_exited{};
     // Set after exit cleanup finishes; waitpid may reap only after this.
     std::atomic<bool> exit_notify_ready{false};
