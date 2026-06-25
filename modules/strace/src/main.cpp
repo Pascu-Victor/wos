@@ -794,6 +794,10 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "mremap";
                 case ker::abi::vmem::ops::MSYNC:
                     return "msync";
+                case ker::abi::vmem::ops::SWAPON:
+                    return "swapon";
+                case ker::abi::vmem::ops::SWAPOFF:
+                    return "swapoff";
             }
             break;
         case ker::abi::callnums::debug:

@@ -1034,10 +1034,6 @@ __attribute__((no_sanitize("address"))) void dump_page_allocations_oom() {
     io::serial::write(u64_to_dec_no_alloc(total_wait_count, oom_dump_buffer.data(), oom_dump_buffer.size()));
     io::serial::write("\n");
 
-    // Scheduler queues use zero dynamic allocations (array-backed heap + intrusive lists)
-    uint64_t const TOTAL_SCHED_LIST_BYTES = 0;
-    io::serial::write("    Scheduler list memory: 0 bytes (zero-alloc EEVDF)\n");
-
     io::serial::write("\nThread Tracking:\n");
     uint64_t const ACTIVE_THREAD_COUNT = sched::threading::get_active_thread_count();
     // std::list<Thread*> node: prev + next + data = 24 bytes each
@@ -1077,7 +1073,7 @@ __attribute__((no_sanitize("address"))) void dump_page_allocations_oom() {
     io::serial::write(u64_to_dec_no_alloc(THREAD_OBJECTS_MEMORY, oom_dump_buffer.data(), oom_dump_buffer.size()));
     io::serial::write(" bytes\n");
 
-    uint64_t const TOTAL_KERNEL_DYNAMIC = TOTAL_SCHED_LIST_BYTES + TASK_OBJECTS_MEMORY + THREAD_OBJECTS_MEMORY;
+    uint64_t const TOTAL_KERNEL_DYNAMIC = TASK_OBJECTS_MEMORY + THREAD_OBJECTS_MEMORY;
     io::serial::write("\n  Total estimated kernel dynamic allocations: ");
     io::serial::write(u64_to_dec_no_alloc(TOTAL_KERNEL_DYNAMIC / BYTES_PER_KB, oom_dump_buffer.data(), oom_dump_buffer.size()));
     io::serial::write(" KB\n\n");

@@ -1,5 +1,6 @@
 #include "smt.hpp"
 
+#include <bits/ssize_t.h>
 #include <extern/limine.h>
 
 #include <array>
@@ -268,14 +269,22 @@ void non_primary_cpu_init(limine_mp_info* smp_info) {
 void create_init_tasks(boot::HandoverModules& mod_struct, uint64_t kernel_rsp) {
     // Try loading /sbin/init from tmpfs (unpacked from CPIO initramfs)
     auto* init_node = ker::vfs::tmpfs::tmpfs_walk_path("sbin/init", false);
-    if (init_node != nullptr && init_node->type == ker::vfs::tmpfs::TmpNodeType::FILE && init_node->data != nullptr) {
-        dbg::log("Loading init from tmpfs (/sbin/init, %u bytes)", static_cast<unsigned>(init_node->size));
-        // Override modules with the tmpfs init binary
-        mod_struct.count = 1;
-        mod_struct.modules[0].name = "/sbin/init";
-        mod_struct.modules[0].entry = init_node->data;
-        mod_struct.modules[0].size = init_node->size;
-        mod_struct.modules[0].cmdline = "/sbin/init";
+    if (init_node != nullptr && init_node->type == ker::vfs::tmpfs::TmpNodeType::FILE && init_node->size > 0) {
+        auto* init_image = new char[init_node->size];
+        ker::vfs::File init_file{};
+        init_file.private_data = init_node;
+        ssize_t const INIT_READ = ker::vfs::tmpfs::tmpfs_read(&init_file, init_image, init_node->size, 0);
+        if (init_image != nullptr && INIT_READ >= 0 && static_cast<size_t>(INIT_READ) == init_node->size) {
+            dbg::log("Loading init from tmpfs (/sbin/init, %u bytes)", static_cast<unsigned>(init_node->size));
+            // Override modules with the tmpfs init binary
+            mod_struct.count = 1;
+            mod_struct.modules[0].name = "/sbin/init";
+            mod_struct.modules[0].entry = init_image;
+            mod_struct.modules[0].size = init_node->size;
+            mod_struct.modules[0].cmdline = "/sbin/init";
+        } else {
+            delete[] init_image;
+        }
     }
 
     for (uint64_t i = 0; i < mod_struct.count; i++) {

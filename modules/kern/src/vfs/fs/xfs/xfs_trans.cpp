@@ -26,7 +26,7 @@ auto xfs_trans_alloc(XfsMountContext* mount) -> XfsTransaction* {
         return nullptr;
     }
     if (mount->read_only) {
-        mod::dbg::log("[xfs trans] cannot allocate transaction on read-only mount\n");
+        mod::dbg::log("[xfs trans] cannot allocate transaction on read-only mount");
         return nullptr;
     }
 
@@ -81,7 +81,7 @@ void xfs_trans_log_buf(XfsTransaction* tp, BufHead* bp, uint32_t offset, uint32_
     }
 
     if (tp->item_count >= XFS_TRANS_MAX_ITEMS) {
-        mod::dbg::log("[xfs trans] too many items in transaction\n");
+        mod::dbg::log("[xfs trans] too many items in transaction");
         return;
     }
 
@@ -119,7 +119,7 @@ void xfs_trans_log_inode(XfsTransaction* tp, XfsInode* ip) {
     }
 
     if (tp->item_count >= XFS_TRANS_MAX_ITEMS) {
-        mod::dbg::log("[xfs trans] too many items in transaction\n");
+        mod::dbg::log("[xfs trans] too many items in transaction");
         return;
     }
 
@@ -143,7 +143,7 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
         if (item.type == XfsLogItemType::INODE && item.inode.ip != nullptr) {
             int const WRC = xfs_inode_write(item.inode.ip, tp);
             if (WRC != 0) {
-                mod::dbg::log("[xfs trans] inode %lu write-back failed: %d\n", static_cast<unsigned long>(item.inode.ip->ino), WRC);
+                mod::dbg::log("[xfs trans] inode %lu write-back failed: %d", static_cast<unsigned long>(item.inode.ip->ino), WRC);
             }
         }
     }
@@ -154,7 +154,7 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
     if (LOG_RC != 0 && LOG_RC != -EINVAL) {
         // Log write failure is not fatal if the log isn't active (read-only
         // or no log area), but is serious otherwise.
-        mod::dbg::log("[xfs trans] log write failed: %d\n", LOG_RC);
+        mod::dbg::log("[xfs trans] log write failed: %d", LOG_RC);
     }
 
     // Phase 3: Mark all dirty metadata buffers as dirty in the cache.

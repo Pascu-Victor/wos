@@ -13,8 +13,10 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/swap.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <util/smallvec.hpp>
 #include <vfs/file.hpp>
 #include <vfs/stat.hpp>
 
@@ -58,6 +60,7 @@ void copy_name(std::array<char, ker::vfs::tmpfs::TMPFS_NAME_MAX>& dst, const cha
 namespace ker::vfs::tmpfs {
 
 constexpr size_t DEFAULT_TMPFS_BLOCK_SIZE = 4096;
+static_assert(DEFAULT_TMPFS_BLOCK_SIZE == ker::mod::mm::paging::PAGE_SIZE);
 constexpr size_t INITIAL_CHILDREN_CAPACITY = 8;
 constexpr int O_CREAT = 0100;  // octal = 64 decimal = 0x40 hex
 constexpr uint64_t TMPFS_MIN_FREE_RESERVE_BYTES = 16ULL * 1024ULL * 1024ULL;
@@ -66,8 +69,10 @@ constexpr uint64_t TMPFS_FREE_RESERVE_DIVISOR = 8;
 constexpr uint64_t NS_PER_SEC = 1000000000ULL;
 
 namespace {
-TmpNode* root_node = nullptr;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-ker::mod::sys::Spinlock tmpfs_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+TmpNode* root_node = nullptr;                   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock tmpfs_lock;             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Mutex tmpfs_node_registry_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::util::SmallVec<TmpNode*, 64> tmpfs_nodes;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 }  // namespace
 
 // --- Internal helpers ---
@@ -100,22 +105,6 @@ void touch_modified(TmpNode* node) {
     node->ctime = NOW;
 }
 
-auto tmpfs_capacity_for_size(size_t size, size_t& out_capacity) -> bool {
-    if (size == 0) {
-        out_capacity = 0;
-        return true;
-    }
-    size_t cap = DEFAULT_TMPFS_BLOCK_SIZE;
-    while (cap < size) {
-        if (cap > static_cast<size_t>(-1) / 2) {
-            return false;
-        }
-        cap *= 2;
-    }
-    out_capacity = cap;
-    return true;
-}
-
 auto tmpfs_free_reserve_bytes() -> uint64_t {
     uint64_t const TOTAL = ker::mod::mm::phys::get_total_mem_bytes();
     if (TOTAL == 0) {
@@ -129,74 +118,303 @@ auto tmpfs_free_reserve_bytes() -> uint64_t {
     return reserve;
 }
 
-auto tmpfs_allocator_request_bytes(size_t capacity, uint64_t& out_request) -> bool {
-    constexpr uint64_t PAGE_SIZE = ker::mod::mm::paging::PAGE_SIZE;
-    auto const CAP = static_cast<uint64_t>(capacity);
-    if (CAP > static_cast<uint64_t>(-1) - PAGE_SIZE) {
-        return false;
-    }
-    out_request = CAP + PAGE_SIZE;
-    return true;
-}
-
-auto tmpfs_can_grow_capacity(size_t capacity) -> bool {
+auto tmpfs_can_allocate_page() -> bool {
     if (ker::mod::mm::phys::get_total_mem_bytes() == 0) {
         return true;
     }
-
-    uint64_t request_bytes = 0;
-    if (!tmpfs_allocator_request_bytes(capacity, request_bytes)) {
-        return false;
-    }
-    return ker::mod::mm::phys::page_alloc_can_satisfy(request_bytes, tmpfs_free_reserve_bytes());
+    return ker::mod::mm::phys::page_alloc_can_satisfy(ker::mod::mm::paging::PAGE_SIZE, tmpfs_free_reserve_bytes());
 }
 
-auto tmpfs_write_count_fits(const TmpNode* n, size_t offset, size_t count) -> bool {
-    if (count == 0) {
-        return true;
-    }
-    if (offset > static_cast<size_t>(-1) - count) {
+auto page_count_for_size(size_t size, size_t* out_pages) -> bool {
+    if (out_pages == nullptr) {
         return false;
     }
-
-    size_t const NEED = offset + count;
-    if (NEED <= n->capacity) {
+    if (size == 0) {
+        *out_pages = 0;
         return true;
     }
-
-    size_t new_cap = 0;
-    if (!tmpfs_capacity_for_size(NEED, new_cap)) {
+    if (size > static_cast<size_t>(-1) - (DEFAULT_TMPFS_BLOCK_SIZE - 1)) {
         return false;
     }
-    return tmpfs_can_grow_capacity(new_cap);
+    *out_pages = (size + DEFAULT_TMPFS_BLOCK_SIZE - 1) / DEFAULT_TMPFS_BLOCK_SIZE;
+    return true;
 }
 
-auto tmpfs_largest_write_count(const TmpNode* n, size_t offset, size_t count, size_t& out_count, size_t& out_capacity) -> bool {
-    size_t low = 0;
-    size_t high = count;
+auto parse_decimal(const char*& p, uint64_t* out) -> bool {
+    if (out == nullptr || *p < '0' || *p > '9') {
+        return false;
+    }
+    uint64_t value = 0;
+    while (*p >= '0' && *p <= '9') {
+        auto const DIGIT = static_cast<uint64_t>(*p - '0');
+        if (value > (UINT64_MAX - DIGIT) / 10) {
+            return false;
+        }
+        value = (value * 10) + DIGIT;
+        ++p;
+    }
+    *out = value;
+    return true;
+}
 
-    while (low < high) {
-        size_t const MID = low + ((high - low + 1) / 2);
-        if (tmpfs_write_count_fits(n, offset, MID)) {
-            low = MID;
-        } else {
-            high = MID - 1;
+auto parse_size_value(const char* text, size_t* out_bytes) -> bool {
+    if (text == nullptr || out_bytes == nullptr) {
+        return false;
+    }
+    const char* p = text;
+    uint64_t value = 0;
+    if (!parse_decimal(p, &value)) {
+        return false;
+    }
+
+    uint64_t multiplier = 1;
+    if (*p == 'K' || *p == 'k') {
+        multiplier = 1024ULL;
+        ++p;
+    } else if (*p == 'M' || *p == 'm') {
+        multiplier = 1024ULL * 1024ULL;
+        ++p;
+    } else if (*p == 'G' || *p == 'g') {
+        multiplier = 1024ULL * 1024ULL * 1024ULL;
+        ++p;
+    } else if (*p == '%') {
+        uint64_t const TOTAL = ker::mod::mm::phys::get_total_mem_bytes();
+        if (value > 100) {
+            return false;
+        }
+        *out_bytes = static_cast<size_t>((TOTAL / 100ULL) * value);
+        ++p;
+        return *p == '\0';
+    }
+
+    if (*p != '\0' || value > UINT64_MAX / multiplier) {
+        return false;
+    }
+    uint64_t const BYTES = value * multiplier;
+    if (BYTES > static_cast<uint64_t>(static_cast<size_t>(-1))) {
+        return false;
+    }
+    *out_bytes = static_cast<size_t>(BYTES);
+    return true;
+}
+
+auto parse_mount_options(const char* options, bool root_compat, size_t* out_max_bytes) -> int {
+    if (out_max_bytes == nullptr) {
+        return -EINVAL;
+    }
+    *out_max_bytes = root_compat ? 0 : static_cast<size_t>(ker::mod::mm::phys::get_total_mem_bytes() / 2);
+    if (options == nullptr || options[0] == '\0') {
+        return 0;
+    }
+
+    const char* cursor = options;
+    while (*cursor != '\0') {
+        while (*cursor == ',' || *cursor == ' ' || *cursor == '\t') {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        const char* const START = cursor;
+        while (*cursor != '\0' && *cursor != ',') {
+            ++cursor;
+        }
+        auto const LEN = static_cast<size_t>(cursor - START);
+        if (LEN == 0 || (LEN == 8 && std::strncmp(START, "defaults", LEN) == 0)) {
+            continue;
+        }
+        constexpr size_t SIZE_PREFIX_LEN = 5;
+        if (LEN > SIZE_PREFIX_LEN && std::strncmp(START, "size=", SIZE_PREFIX_LEN) == 0) {
+            std::array<char, 32> value{};
+            size_t const VALUE_LEN = LEN - SIZE_PREFIX_LEN;
+            if (VALUE_LEN == 0 || VALUE_LEN >= value.size()) {
+                return -EINVAL;
+            }
+            std::memcpy(value.data(), START + SIZE_PREFIX_LEN, VALUE_LEN);
+            value[VALUE_LEN] = '\0';
+            size_t bytes = 0;
+            if (!parse_size_value(value.data(), &bytes)) {
+                return -EINVAL;
+            }
+            *out_max_bytes = bytes;
+            continue;
+        }
+        return -EINVAL;
+    }
+    return 0;
+}
+
+void register_tmp_node(TmpNode* node) {
+    if (node == nullptr) {
+        return;
+    }
+    ker::mod::sys::MutexGuard guard(tmpfs_node_registry_lock);
+    static_cast<void>(tmpfs_nodes.push_back(node));
+}
+
+void unregister_tmp_node(TmpNode* node) {
+    if (node == nullptr) {
+        return;
+    }
+    ker::mod::sys::MutexGuard guard(tmpfs_node_registry_lock);
+    static_cast<void>(tmpfs_nodes.remove(node));
+}
+
+auto mount_try_charge(TmpNode* node) -> bool {
+    if (node == nullptr || node->mount == nullptr || node->mount->max_bytes == 0) {
+        return true;
+    }
+    auto* mount = node->mount;
+    ker::mod::sys::MutexGuard guard(mount->accounting_lock);
+    if (mount->used_bytes > mount->max_bytes || mount->max_bytes - mount->used_bytes < DEFAULT_TMPFS_BLOCK_SIZE) {
+        return false;
+    }
+    mount->used_bytes += DEFAULT_TMPFS_BLOCK_SIZE;
+    return true;
+}
+
+void mount_uncharge(TmpNode* node) {
+    if (node == nullptr || node->mount == nullptr || node->mount->max_bytes == 0) {
+        return;
+    }
+    auto* mount = node->mount;
+    ker::mod::sys::MutexGuard guard(mount->accounting_lock);
+    mount->used_bytes = (mount->used_bytes >= DEFAULT_TMPFS_BLOCK_SIZE) ? mount->used_bytes - DEFAULT_TMPFS_BLOCK_SIZE : 0;
+}
+
+void node_set_mount_recursive(TmpNode* node, TmpfsMount* mount) {
+    if (node == nullptr) {
+        return;
+    }
+    node->mount = mount;
+    for (size_t i = 0; i < node->children_count; ++i) {
+        node_set_mount_recursive(node->children[i], mount);
+    }
+}
+
+auto ensure_page_descriptors(TmpNode* node, size_t required_pages) -> bool {
+    if (node == nullptr || required_pages <= node->page_count) {
+        return true;
+    }
+    auto* pages = new TmpPage[required_pages];
+    if (pages == nullptr) {
+        return false;
+    }
+    for (size_t i = 0; i < node->page_count; ++i) {
+        pages[i] = node->pages[i];
+    }
+    delete[] node->pages;
+    node->pages = pages;
+    node->page_count = required_pages;
+    return true;
+}
+
+void release_page_locked(TmpNode* node, TmpPage& page, bool uncharge) {
+    if (page.state == TmpPageState::RESIDENT && page.data != nullptr) {
+        ker::mod::mm::phys::page_free(page.data);
+    } else if (page.state == TmpPageState::SWAPPED && ker::mod::mm::swap::slot_valid(page.swap_slot)) {
+        static_cast<void>(ker::mod::mm::swap::free_slot(page.swap_slot));
+    }
+    page.state = TmpPageState::HOLE;
+    page.data = nullptr;
+    page.swap_slot = ker::mod::mm::swap::invalid_slot();
+    if (uncharge && node != nullptr && node->charged_pages != 0) {
+        node->charged_pages--;
+        mount_uncharge(node);
+    }
+}
+
+auto evict_page_locked(TmpNode* node, size_t index) -> int {
+    if (node == nullptr || index >= node->page_count) {
+        return -EINVAL;
+    }
+    TmpPage& page = node->pages[index];
+    if (page.state != TmpPageState::RESIDENT || page.data == nullptr) {
+        return -EAGAIN;
+    }
+    ker::mod::mm::swap::SwapSlot slot{};
+    int ret = ker::mod::mm::swap::allocate_slot(&slot);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = ker::mod::mm::swap::write_slot(slot, page.data);
+    if (ret < 0) {
+        static_cast<void>(ker::mod::mm::swap::free_slot(slot));
+        return ret;
+    }
+    ker::mod::mm::phys::page_free(page.data);
+    page.data = nullptr;
+    page.swap_slot = slot;
+    page.state = TmpPageState::SWAPPED;
+    return 0;
+}
+
+auto reclaim_from_node_locked(TmpNode* node, size_t target_pages, size_t skip_index = static_cast<size_t>(-1)) -> size_t {
+    if (node == nullptr || target_pages == 0 || !ker::mod::mm::swap::swap_available()) {
+        return 0;
+    }
+    size_t reclaimed = 0;
+    for (size_t i = 0; i < node->page_count && reclaimed < target_pages; ++i) {
+        if (i == skip_index) {
+            continue;
+        }
+        if (evict_page_locked(node, i) == 0) {
+            reclaimed++;
         }
     }
+    return reclaimed;
+}
 
-    if (low == 0) {
-        out_count = 0;
-        out_capacity = n->capacity;
-        return false;
+auto allocate_resident_page(TmpNode* node, size_t page_index) -> void* {
+    if (!tmpfs_can_allocate_page()) {
+        static_cast<void>(reclaim_from_node_locked(node, 1, page_index));
     }
+    void* page = ker::mod::mm::phys::page_alloc_may_fail(DEFAULT_TMPFS_BLOCK_SIZE, "tmpfs_page");
+    if (page != nullptr) {
+        return page;
+    }
+    static_cast<void>(reclaim_from_node_locked(node, 4, page_index));
+    return ker::mod::mm::phys::page_alloc_may_fail(DEFAULT_TMPFS_BLOCK_SIZE, "tmpfs_page");
+}
 
-    out_count = low;
-    size_t const NEED = offset + low;
-    if (NEED <= n->capacity) {
-        out_capacity = n->capacity;
-        return true;
+auto ensure_page_resident_locked(TmpNode* node, size_t page_index, TmpPage** out_page) -> int {
+    if (node == nullptr || out_page == nullptr) {
+        return -EINVAL;
     }
-    return tmpfs_capacity_for_size(NEED, out_capacity);
+    if (!ensure_page_descriptors(node, page_index + 1)) {
+        return -ENOMEM;
+    }
+    TmpPage& page = node->pages[page_index];
+    if (page.state == TmpPageState::RESIDENT) {
+        *out_page = &page;
+        return 0;
+    }
+    if (page.state == TmpPageState::HOLE && !mount_try_charge(node)) {
+        return -ENOSPC;
+    }
+    void* data = allocate_resident_page(node, page_index);
+    if (data == nullptr) {
+        if (page.state == TmpPageState::HOLE) {
+            mount_uncharge(node);
+        }
+        return -ENOSPC;
+    }
+    if (page.state == TmpPageState::SWAPPED) {
+        int const RET = ker::mod::mm::swap::read_slot(page.swap_slot, data);
+        if (RET < 0) {
+            ker::mod::mm::phys::page_free(data);
+            return RET;
+        }
+        static_cast<void>(ker::mod::mm::swap::free_slot(page.swap_slot));
+    } else {
+        std::memset(data, 0, DEFAULT_TMPFS_BLOCK_SIZE);
+        node->charged_pages++;
+    }
+    page.state = TmpPageState::RESIDENT;
+    page.data = data;
+    page.swap_slot = ker::mod::mm::swap::invalid_slot();
+    *out_page = &page;
+    return 0;
 }
 
 // Grow the children slot array of a directory node if needed.
@@ -245,82 +463,84 @@ auto tmpfs_write_locked(TmpNode* n, const void* buf, size_t count, size_t offset
     if (count == 0) {
         return 0;
     }
-    size_t write_count = count;
-    size_t need = 0;
-    if (offset > static_cast<size_t>(-1) - write_count) {
-        size_t new_cap = 0;
-        if (!tmpfs_largest_write_count(n, offset, write_count, write_count, new_cap)) {
-            return -EFBIG;
-        }
+    if (n == nullptr || buf == nullptr) {
+        return -EINVAL;
     }
-    need = offset + write_count;
-    if (need > n->capacity) {
-        size_t new_cap = 0;
-        if (!tmpfs_capacity_for_size(need, new_cap)) {
-            return -EFBIG;
-        }
-        if (!tmpfs_can_grow_capacity(new_cap)) {
-            // A too-large write should still commit the prefix that can fit.
-            if (!tmpfs_largest_write_count(n, offset, write_count, write_count, new_cap)) {
-                return -ENOSPC;
-            }
-            need = offset + write_count;
-        }
+    if (offset > static_cast<size_t>(-1) - count) {
+        return -EFBIG;
+    }
 
-        if (need > n->capacity) {
-            char* nd = new char[new_cap];
-            if (nd == nullptr) {
-                if (offset >= n->capacity) {
-                    return -ENOSPC;
-                }
-                write_count = std::min(write_count, n->capacity - offset);
-                need = offset + write_count;
-            } else {
-                if (n->data != nullptr) {
-                    std::memcpy(nd, n->data, n->size);
-                }
-                delete[] n->data;
-                n->data = nd;
-                n->capacity = new_cap;
+    auto const* src = static_cast<const uint8_t*>(buf);
+    size_t total_written = 0;
+    while (total_written < count) {
+        size_t const POS = offset + total_written;
+        size_t const PAGE_INDEX = POS / DEFAULT_TMPFS_BLOCK_SIZE;
+        size_t const PAGE_OFF = POS % DEFAULT_TMPFS_BLOCK_SIZE;
+        size_t const CHUNK = std::min(count - total_written, DEFAULT_TMPFS_BLOCK_SIZE - PAGE_OFF);
+
+        TmpPage* page = nullptr;
+        int const RET = ensure_page_resident_locked(n, PAGE_INDEX, &page);
+        if (RET < 0) {
+            if (total_written != 0) {
+                break;
             }
+            return RET;
         }
+        std::memcpy(static_cast<uint8_t*>(page->data) + PAGE_OFF, src + total_written, CHUNK);
+        total_written += CHUNK;
     }
-    std::memcpy(n->data + offset, buf, write_count);
-    n->size = std::max(need, n->size);
+
+    size_t const NEED = offset + total_written;
+    n->size = std::max(NEED, n->size);
     touch_modified(n);
-    return static_cast<ssize_t>(write_count);
+    return static_cast<ssize_t>(total_written);
 }
 
 auto tmpfs_resize_locked(TmpNode* n, size_t new_size) -> int {
-    size_t new_cap = 0;
-    if (!tmpfs_capacity_for_size(new_size, new_cap)) {
+    if (n == nullptr) {
+        return -EINVAL;
+    }
+    size_t new_pages = 0;
+    if (!page_count_for_size(new_size, &new_pages)) {
         return -EFBIG;
     }
-    if (new_cap != n->capacity) {
-        if (new_cap == 0) {
-            delete[] n->data;
-            n->data = nullptr;
-            n->capacity = 0;
-            n->size = 0;
-            touch_modified(n);
-            return 0;
+
+    if (new_size < n->size && new_pages != 0 && (new_size % DEFAULT_TMPFS_BLOCK_SIZE) != 0 && new_pages <= n->page_count) {
+        TmpPage& existing_tail = n->pages[new_pages - 1];
+        if (existing_tail.state != TmpPageState::HOLE) {
+            TmpPage* tail = nullptr;
+            int const RET = ensure_page_resident_locked(n, new_pages - 1, &tail);
+            if (RET < 0) {
+                return RET;
+            }
+            size_t const TAIL_OFF = new_size % DEFAULT_TMPFS_BLOCK_SIZE;
+            std::memset(static_cast<uint8_t*>(tail->data) + TAIL_OFF, 0, DEFAULT_TMPFS_BLOCK_SIZE - TAIL_OFF);
         }
-        if (new_cap > n->capacity && !tmpfs_can_grow_capacity(new_cap)) {
-            return -ENOSPC;
-        }
-        char* nd = new char[new_cap];
-        if (nd == nullptr) {
-            return -ENOSPC;
-        }
-        if (n->data != nullptr) {
-            std::memcpy(nd, n->data, std::min(n->size, new_size));
-        }
-        delete[] n->data;
-        n->data = nd;
-        n->capacity = new_cap;
     }
-    if (new_size > n->size) {
-        std::memset(n->data + n->size, 0, new_size - n->size);
+
+    if (new_pages != n->page_count) {
+        if (new_pages == 0) {
+            for (size_t i = 0; i < n->page_count; ++i) {
+                release_page_locked(n, n->pages[i], true);
+            }
+            delete[] n->pages;
+            n->pages = nullptr;
+            n->page_count = 0;
+        } else {
+            auto* pages = new TmpPage[new_pages];
+            if (pages == nullptr) {
+                return -ENOMEM;
+            }
+            for (size_t i = 0; i < std::min(new_pages, n->page_count); ++i) {
+                pages[i] = n->pages[i];
+            }
+            for (size_t i = new_pages; i < n->page_count; ++i) {
+                release_page_locked(n, n->pages[i], true);
+            }
+            delete[] n->pages;
+            n->pages = pages;
+            n->page_count = new_pages;
+        }
     }
     n->size = new_size;
     touch_modified(n);
@@ -336,6 +556,7 @@ auto create_root_node_internal() -> TmpNode* {
     node->type = TmpNodeType::DIRECTORY;
     node->mode = 0755;
     stamp_new_node(node);
+    register_tmp_node(node);
     return node;
 }
 }  // namespace
@@ -344,7 +565,12 @@ void tmpfs_free_node(TmpNode* node) {
     if (node == nullptr) {
         return;
     }
-    delete[] node->data;
+    ker::mod::sys::MutexGuard guard(node->io_lock);
+    unregister_tmp_node(node);
+    for (size_t i = 0; i < node->page_count; ++i) {
+        release_page_locked(node, node->pages[i], true);
+    }
+    delete[] node->pages;
     delete[] node->symlink_target;
     delete[] node->children;
     delete node;
@@ -382,8 +608,10 @@ auto tmpfs_mkdir(TmpNode* parent, const char* name) -> TmpNode* {
     auto* node = new TmpNode;
     copy_name(node->name, name);
     node->type = TmpNodeType::DIRECTORY;
+    node->mount = parent->mount;
     node->mode = 0755;
     stamp_new_node(node);
+    register_tmp_node(node);
     add_child(parent, node);
     return node;
 }
@@ -399,8 +627,10 @@ auto tmpfs_create_file(TmpNode* parent, const char* name, uint32_t create_mode) 
     auto* node = new TmpNode;
     copy_name(node->name, name);
     node->type = TmpNodeType::FILE;
+    node->mount = parent->mount;
     node->mode = create_mode & 07777;
     stamp_new_node(node);
+    register_tmp_node(node);
     add_child(parent, node);
     return node;
 }
@@ -416,6 +646,7 @@ auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target)
     auto* node = new TmpNode;
     copy_name(node->name, name);
     node->type = TmpNodeType::SYMLINK;
+    node->mount = parent->mount;
     node->mode = 0777;
     stamp_new_node(node);
     // Allocate and copy the symlink target
@@ -424,7 +655,12 @@ auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target)
         target_len++;
     }
     node->symlink_target = new char[target_len + 1];
+    if (node->symlink_target == nullptr) {
+        delete node;
+        return nullptr;
+    }
     std::memcpy(node->symlink_target, target, target_len + 1);
+    register_tmp_node(node);
     add_child(parent, node);
     return node;
 }
@@ -572,6 +808,130 @@ auto create_root_node() -> TmpNode* { return create_root_node_internal(); }
 
 auto get_root_node() -> TmpNode* { return root_node; }
 
+namespace {
+void free_tree(TmpNode* node) {
+    if (node == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < node->children_count; ++i) {
+        free_tree(node->children[i]);
+        node->children[i] = nullptr;
+    }
+    node->children_count = 0;
+    node->children_live_count = 0;
+    tmpfs_free_node(node);
+}
+}  // namespace
+
+auto create_mount_context(TmpNode* root, const char* options, bool root_compat, int* error_out) -> TmpfsMount* {
+    if (error_out != nullptr) {
+        *error_out = 0;
+    }
+    if (root == nullptr) {
+        if (error_out != nullptr) {
+            *error_out = -EINVAL;
+        }
+        return nullptr;
+    }
+    size_t max_bytes = 0;
+    int const OPTIONS_RET = parse_mount_options(options, root_compat, &max_bytes);
+    if (OPTIONS_RET < 0) {
+        if (error_out != nullptr) {
+            *error_out = OPTIONS_RET;
+        }
+        return nullptr;
+    }
+    auto* mount = new TmpfsMount;
+    if (mount == nullptr) {
+        if (error_out != nullptr) {
+            *error_out = -ENOMEM;
+        }
+        return nullptr;
+    }
+    mount->root = root;
+    mount->max_bytes = max_bytes;
+    mount->used_bytes = 0;
+    mount->root_compat = root_compat;
+    node_set_mount_recursive(root, mount);
+    return mount;
+}
+
+void destroy_mount_context(TmpfsMount* mount) {
+    if (mount == nullptr) {
+        return;
+    }
+    if (!mount->root_compat) {
+        free_tree(mount->root);
+    } else if (mount->root != nullptr) {
+        node_set_mount_recursive(mount->root, nullptr);
+    }
+    delete mount;
+}
+
+auto mount_root(TmpfsMount* mount) -> TmpNode* { return mount != nullptr ? mount->root : get_root_node(); }
+
+auto tmpfs_statvfs(TmpfsMount* mount, ker::vfs::Statvfs* buf) -> int {
+    if (buf == nullptr) {
+        return -EINVAL;
+    }
+    std::memset(buf, 0, sizeof(*buf));
+    size_t max_bytes = 0;
+    size_t used_bytes = 0;
+    if (mount != nullptr) {
+        ker::mod::sys::MutexGuard guard(mount->accounting_lock);
+        max_bytes = mount->max_bytes;
+        used_bytes = mount->used_bytes;
+    }
+    if (max_bytes == 0) {
+        max_bytes = static_cast<size_t>(ker::mod::mm::phys::get_total_mem_bytes());
+        used_bytes = max_bytes - std::min<size_t>(max_bytes, static_cast<size_t>(ker::mod::mm::phys::get_free_mem_bytes()));
+    }
+    size_t const FREE_BYTES = (used_bytes < max_bytes) ? max_bytes - used_bytes : 0;
+    buf->f_bsize = DEFAULT_TMPFS_BLOCK_SIZE;
+    buf->f_frsize = DEFAULT_TMPFS_BLOCK_SIZE;
+    buf->f_blocks = max_bytes / DEFAULT_TMPFS_BLOCK_SIZE;
+    buf->f_bfree = FREE_BYTES / DEFAULT_TMPFS_BLOCK_SIZE;
+    buf->f_bavail = buf->f_bfree;
+    buf->f_files = buf->f_blocks;
+    buf->f_ffree = buf->f_bfree;
+    buf->f_favail = buf->f_bfree;
+    buf->f_namemax = TMPFS_NAME_MAX - 1;
+    return 0;
+}
+
+auto tmpfs_reclaim_pages(size_t target_pages) -> size_t {
+    if (target_pages == 0 || !ker::mod::mm::swap::swap_available()) {
+        return 0;
+    }
+    size_t reclaimed = 0;
+    size_t index = 0;
+    while (reclaimed < target_pages) {
+        TmpNode* node = nullptr;
+        bool done = false;
+        tmpfs_node_registry_lock.lock();
+        if (index < tmpfs_nodes.size()) {
+            node = tmpfs_nodes.at(index++);
+            if (node != nullptr && !node->io_lock.try_lock()) {
+                node = nullptr;
+            }
+        } else {
+            done = true;
+        }
+        tmpfs_node_registry_lock.unlock();
+        if (done) {
+            break;
+        }
+        if (node == nullptr) {
+            continue;
+        }
+        if (node->type == TmpNodeType::FILE) {
+            reclaimed += reclaim_from_node_locked(node, target_pages - reclaimed);
+        }
+        node->io_lock.unlock();
+    }
+    return reclaimed;
+}
+
 // --- File-level operations ---
 
 auto create_root_file(TmpNode* root) -> ker::vfs::File* {
@@ -669,8 +1029,12 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ke
     }
 
     if ((flags & ker::vfs::O_TRUNC) != 0 && node->type == TmpNodeType::FILE) {
-        ker::mod::sys::MutexGuard guard(node->io_lock);
-        int const TRUNCATE_RET = tmpfs_resize_locked(node, 0);
+        int truncate_ret = 0;
+        {
+            ker::mod::sys::MutexGuard guard(node->io_lock);
+            truncate_ret = tmpfs_resize_locked(node, 0);
+        }
+        int const TRUNCATE_RET = truncate_ret;
         if (TRUNCATE_RET < 0) {
             uint32_t const PREV = node->open_count.fetch_sub(1, std::memory_order_acq_rel);
             if (PREV == 1 && node->unlinked) {
@@ -696,6 +1060,9 @@ auto tmpfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     if ((f == nullptr) || (f->private_data == nullptr)) {
         return -EBADF;
     }
+    if (buf == nullptr && count != 0) {
+        return -EINVAL;
+    }
     auto* n = static_cast<TmpNode*>(f->private_data);
     ker::mod::sys::MutexGuard guard(n->io_lock);
     if (offset >= n->size) {
@@ -703,7 +1070,25 @@ auto tmpfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     }
     size_t to_read = n->size - offset;
     to_read = std::min(to_read, count);
-    std::memcpy(buf, n->data + offset, to_read);
+    auto* dst = static_cast<uint8_t*>(buf);
+    size_t total = 0;
+    while (total < to_read) {
+        size_t const POS = offset + total;
+        size_t const PAGE_INDEX = POS / DEFAULT_TMPFS_BLOCK_SIZE;
+        size_t const PAGE_OFF = POS % DEFAULT_TMPFS_BLOCK_SIZE;
+        size_t const CHUNK = std::min(to_read - total, DEFAULT_TMPFS_BLOCK_SIZE - PAGE_OFF);
+        if (PAGE_INDEX >= n->page_count || n->pages[PAGE_INDEX].state == TmpPageState::HOLE) {
+            std::memset(dst + total, 0, CHUNK);
+        } else {
+            TmpPage* page = nullptr;
+            int const RET = ensure_page_resident_locked(n, PAGE_INDEX, &page);
+            if (RET < 0) {
+                return total != 0 ? static_cast<ssize_t>(total) : RET;
+            }
+            std::memcpy(dst + total, static_cast<uint8_t*>(page->data) + PAGE_OFF, CHUNK);
+        }
+        total += CHUNK;
+    }
     return static_cast<ssize_t>(to_read);
 }
 
@@ -737,6 +1122,49 @@ auto tmpfs_get_size(ker::vfs::File* f) -> size_t {
     auto* n = static_cast<TmpNode*>(f->private_data);
     ker::mod::sys::MutexGuard guard(n->io_lock);
     return n->size;
+}
+
+auto tmpfs_copy_file_contents(TmpNode* dst, TmpNode* src) -> int {
+    if (dst == nullptr || src == nullptr || dst->type != TmpNodeType::FILE || src->type != TmpNodeType::FILE) {
+        return -EINVAL;
+    }
+    if (dst == src) {
+        return 0;
+    }
+    TmpNode* first = dst < src ? dst : src;
+    TmpNode* second = dst < src ? src : dst;
+    ker::mod::sys::MutexGuard first_guard(first->io_lock);
+    ker::mod::sys::MutexGuard second_guard(second->io_lock);
+
+    int ret = tmpfs_resize_locked(dst, 0);
+    if (ret < 0) {
+        return ret;
+    }
+    if (src->size == 0) {
+        return 0;
+    }
+    if (!ensure_page_descriptors(dst, src->page_count)) {
+        return -ENOMEM;
+    }
+    for (size_t i = 0; i < src->page_count; ++i) {
+        if (src->pages[i].state == TmpPageState::HOLE) {
+            continue;
+        }
+        TmpPage* src_page = nullptr;
+        ret = ensure_page_resident_locked(src, i, &src_page);
+        if (ret < 0) {
+            return ret;
+        }
+        TmpPage* dst_page = nullptr;
+        ret = ensure_page_resident_locked(dst, i, &dst_page);
+        if (ret < 0) {
+            return ret;
+        }
+        std::memcpy(dst_page->data, src_page->data, DEFAULT_TMPFS_BLOCK_SIZE);
+    }
+    dst->size = src->size;
+    touch_modified(dst);
+    return 0;
 }
 
 // --- FileOperations callbacks ---

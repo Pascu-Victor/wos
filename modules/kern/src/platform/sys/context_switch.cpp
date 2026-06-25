@@ -632,6 +632,7 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
     // thing written before validation and return assembly consumes it.
     if (next_task->type == sched::task::TaskType::PROCESS && !next_task->is_voluntary_blocked()) {
         static_cast<void>(repair_stale_process_syscall_resume(next_task));
+        static_cast<void>(sys::signal::restore_deferred_sigreturn(next_task));
     }
     gpr = next_task->context.regs;
 

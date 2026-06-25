@@ -1,9 +1,11 @@
 #include "initramfs.hpp"
 
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
+#include <vfs/file.hpp>
 #include <vfs/fs/tmpfs.hpp>
 
 namespace ker::vfs::initramfs {
@@ -168,12 +170,9 @@ auto unpack_initramfs(const void* data, size_t size) -> int {
                 if (parent != nullptr) {
                     auto* fnode = tmpfs::tmpfs_create_file(parent, leaf.data(), static_cast<uint32_t>(MODE) & 07777);
                     if (fnode != nullptr && FILESIZE > 0) {
-                        fnode->data = new char[FILESIZE];
-                        if (fnode->data != nullptr) {
-                            std::memcpy(fnode->data, file_data, static_cast<size_t>(FILESIZE));
-                            fnode->size = static_cast<size_t>(FILESIZE);
-                            fnode->capacity = static_cast<size_t>(FILESIZE);
-                        }
+                        File file{};
+                        file.private_data = fnode;
+                        static_cast<void>(tmpfs::tmpfs_write(&file, file_data, static_cast<size_t>(FILESIZE), 0));
                     }
                     entry_count++;
                     log::debug("file %s (%u bytes)", stripped, static_cast<unsigned>(FILESIZE));

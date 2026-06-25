@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <platform/mm/swap.hpp>
 #include <platform/sys/mutex.hpp>
 
 #include "../file_operations.hpp"
@@ -16,11 +17,24 @@ namespace ker::vfs::tmpfs {
 constexpr size_t TMPFS_NAME_MAX = 256;
 
 enum class TmpNodeType : uint8_t { FILE, DIRECTORY, SYMLINK };
+enum class TmpPageState : uint8_t { HOLE, RESIDENT, SWAPPED };
+
+struct TmpfsMount;
+
+struct TmpPage {
+    TmpPageState state = TmpPageState::HOLE;
+    void* data = nullptr;
+    ker::mod::mm::swap::SwapSlot swap_slot{};
+};
 
 struct TmpNode {
-    char* data = nullptr;                     // File content buffer (files only)
-    size_t size = 0;                          // Current data size
-    size_t capacity = 0;                      // Allocated buffer capacity
+    size_t size = 0;           // Current data size
+    TmpPage* pages = nullptr;  // Sparse file page descriptors
+    // Descriptor count; holes may be implicit past this.
+    size_t page_count = 0;
+    // Materialized pages charged to the mount.
+    size_t charged_pages = 0;
+    TmpfsMount* mount = nullptr;
     std::array<char, TMPFS_NAME_MAX> name{};  // Owned name copy
     TmpNodeType type = TmpNodeType::FILE;
     TmpNode* parent = nullptr;     // Back-pointer for ".." navigation
@@ -46,6 +60,14 @@ struct TmpNode {
     bool unlinked = false;  // true once removed from parent directory
 };
 
+struct TmpfsMount {
+    TmpNode* root = nullptr;
+    size_t max_bytes = 0;  // 0 means compatibility/unlimited root tmpfs.
+    size_t used_bytes = 0;
+    ker::mod::sys::Mutex accounting_lock;
+    bool root_compat = false;
+};
+
 // Free a TmpNode and its owned buffers. Call only when open_count == 0.
 void tmpfs_free_node(TmpNode* node);
 
@@ -60,6 +82,11 @@ void register_tmpfs();
 // Root node access (used by initramfs unpacker)
 auto create_root_node() -> TmpNode*;
 auto get_root_node() -> TmpNode*;
+auto create_mount_context(TmpNode* root, const char* options, bool root_compat, int* error_out = nullptr) -> TmpfsMount*;
+void destroy_mount_context(TmpfsMount* mount);
+auto mount_root(TmpfsMount* mount) -> TmpNode*;
+auto tmpfs_statvfs(TmpfsMount* mount, ker::vfs::Statvfs* buf) -> int;
+auto tmpfs_reclaim_pages(std::size_t target_pages) -> std::size_t;
 
 // Node operations
 auto tmpfs_lookup(TmpNode* dir, const char* name) -> TmpNode*;
@@ -85,6 +112,7 @@ auto tmpfs_read(ker::vfs::File* f, void* buf, std::size_t count, std::size_t off
 auto tmpfs_write(ker::vfs::File* f, const void* buf, std::size_t count, std::size_t offset) -> ssize_t;
 auto tmpfs_write_append(ker::vfs::File* f, const void* buf, std::size_t count, std::size_t* offset_out) -> ssize_t;
 auto tmpfs_get_size(ker::vfs::File* f) -> std::size_t;
+auto tmpfs_copy_file_contents(TmpNode* dst, TmpNode* src) -> int;
 
 // FileOperations callback wrappers
 auto tmpfs_fops_read(ker::vfs::File* f, void* buf, std::size_t count, std::size_t offset) -> ssize_t;

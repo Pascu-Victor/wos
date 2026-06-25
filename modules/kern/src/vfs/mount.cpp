@@ -244,6 +244,9 @@ void destroy_mount_private_data(MountPoint* mount) {
         case FSType::XFS:
             ker::vfs::xfs::xfs_unmount(static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
             break;
+        case FSType::TMPFS:
+            ker::vfs::tmpfs::destroy_mount_context(static_cast<ker::vfs::tmpfs::TmpfsMount*>(mount->private_data));
+            break;
         default:
             break;
     }
@@ -459,7 +462,8 @@ auto mounted_block_device_overlaps(const ker::dev::BlockDevice* device) -> bool 
     return false;
 }
 
-auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device) -> int {
+auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data) -> int {
+    (void)flags;
     if (path == nullptr || fstype == nullptr) {
         vfs_debug_log("mount_filesystem: invalid arguments\n");
         return -EINVAL;
@@ -550,12 +554,17 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         mount->fops = ker::vfs::fat32::get_fat32_fops();
     } else if (std::strcmp(fstype, "tmpfs") == 0) {
         // tmpfs filesystem
-        mount->private_data =
-            (std::strcmp(resolved.data(), "/") == 0) ? ker::vfs::tmpfs::get_root_node() : ker::vfs::tmpfs::create_root_node();
+        bool const ROOT_COMPAT = std::strcmp(resolved.data(), "/") == 0;
+        auto* root = ROOT_COMPAT ? ker::vfs::tmpfs::get_root_node() : ker::vfs::tmpfs::create_root_node();
+        int tmpfs_error = 0;
+        mount->private_data = ker::vfs::tmpfs::create_mount_context(root, data, ROOT_COMPAT, &tmpfs_error);
         if (mount->private_data == nullptr) {
             vfs_debug_log("mount_filesystem: tmpfs root allocation failed\n");
+            if (!ROOT_COMPAT) {
+                ker::vfs::tmpfs::tmpfs_free_node(root);
+            }
             destroy_mount(mount);
-            return -ENOMEM;
+            return tmpfs_error != 0 ? tmpfs_error : -ENOMEM;
         }
         mount->fops = ker::vfs::tmpfs::get_tmpfs_fops();
     } else if (std::strcmp(fstype, "devfs") == 0) {

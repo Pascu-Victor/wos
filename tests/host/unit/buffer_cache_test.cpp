@@ -572,6 +572,34 @@ TEST_F(BufferCacheTest, ConcurrentBreadMultiDeduplicatesExactSpan) {
     EXPECT_TRUE(data_ok);
 }
 
+TEST_F(BufferCacheTest, SizeMismatchCoexistKeepsNewerMultiBlockDirtyData) {
+    constexpr uint64_t BLOCK_NO = 600;
+    constexpr size_t BLOCK_COUNT = 8;
+
+    BufHead* single = bget(&dev, BLOCK_NO);
+    ASSERT_NE(single, nullptr);
+    memset(single->data, 0xBB, single->size);
+    bdirty(single);
+    brelse(single);
+
+    BufHead* multi = bget_multi(&dev, BLOCK_NO, BLOCK_COUNT);
+    ASSERT_NE(multi, nullptr);
+    ASSERT_EQ(multi->size, BLOCK_COUNT * dev.block_size);
+    for (size_t i = 0; i < multi->size; ++i) {
+        multi->data[i] = static_cast<uint8_t>(i & 0xFFU);
+    }
+    bdirty(multi);
+    brelse(multi);
+
+    BufHead* reread = bread_multi(&dev, BLOCK_NO, BLOCK_COUNT);
+    ASSERT_NE(reread, nullptr);
+    ASSERT_EQ(reread->size, BLOCK_COUNT * dev.block_size);
+    for (size_t i = 0; i < reread->size; ++i) {
+        ASSERT_EQ(reread->data[i], static_cast<uint8_t>(i & 0xFFU));
+    }
+    brelse(reread);
+}
+
 // ---------------------------------------------------------------------------
 // Dirty range sync: an overlapping range must find a dirty multi-block buffer,
 // write its full span, clear the dirty state, and flush exactly when needed.

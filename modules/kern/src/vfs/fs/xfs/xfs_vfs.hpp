@@ -13,6 +13,7 @@
 #include <bits/ssize_t.h>
 
 #include <dev/block_device.hpp>
+#include <platform/mm/swap.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
 #include <vfs/fs/xfs/xfs_mount.hpp>
@@ -43,6 +44,10 @@ auto xfs_fsync(File* f) -> int;
 // Commit dirty mount metadata and flush the backing block device.
 auto xfs_sync_mount(XfsMountContext* ctx) -> int;
 
+// Collect stable direct block extents for an already-open regular file used as
+// swap backing. The caller owns the returned array and must delete[] it.
+auto xfs_collect_swap_extents(File* f, ker::mod::mm::swap::SwapExtent** extents_out, size_t* extent_count_out) -> int;
+
 #ifdef WOS_SELFTEST
 auto xfs_selftest_hole_write_alloc_blocks(size_t block_off, size_t remaining_bytes, xfs_filblks_t hole_blocks, size_t block_size,
                                           uint32_t block_log) -> xfs_extlen_t;
@@ -60,6 +65,9 @@ auto xfs_fchmod(File* f, int mode) -> int;
 
 // Create a directory by filesystem-relative path.
 auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int;
+
+// Create an inline symlink by filesystem-relative path.
+auto xfs_symlink_path(const char* target, const char* fs_path, XfsMountContext* ctx) -> int;
 
 // Remove a file by filesystem-relative path.
 // Returns 0 on success, negative errno on failure.

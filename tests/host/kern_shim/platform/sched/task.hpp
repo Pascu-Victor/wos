@@ -9,6 +9,7 @@ namespace ker::mod::sched::task {
 
 struct Task {
     uint64_t id = 0;
+    uint64_t pid = 0;
 };
 
 }  // namespace ker::mod::sched::task

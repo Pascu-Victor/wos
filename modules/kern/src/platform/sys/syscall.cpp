@@ -90,7 +90,7 @@ extern "C" auto syscall_handler(cpu::GPRegs* regs) -> uint64_t {
             result = ker::syscall::time::sys_time_get(A1, reinterpret_cast<void*>(A2), reinterpret_cast<void*>(A3));
             break;
         case abi::callnums::VFS:
-            result = ker::syscall::vfs::sys_vfs(A1, A2, A3, A4, A5);
+            result = ker::syscall::vfs::sys_vfs(A1, A2, A3, A4, A5, A6);
             break;
         case abi::callnums::NET:
             result = ker::syscall::net::sys_net(A1, A2, A3, A4, A5, A6);

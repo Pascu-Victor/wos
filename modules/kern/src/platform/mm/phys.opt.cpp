@@ -35,6 +35,10 @@ namespace {
 uint64_t kernel_cr3 = 0;
 }  // anonymous namespace
 
+namespace ker::vfs::tmpfs {
+auto tmpfs_reclaim_pages(size_t target_pages) -> size_t;
+}
+
 namespace ker::mod::mm::phys {
 
 namespace {
@@ -1426,6 +1430,9 @@ auto page_alloc_with_reclaim_impl(uint64_t size, std::string_view name, Returned
         }
         uint32_t const RECLAIMED = sched::reclaim_memory_pressure();
         if (RECLAIMED == 0) {
+            if (ker::vfs::tmpfs::tmpfs_reclaim_pages(32) != 0) {
+                continue;
+            }
             sched::request_gc_memory_pressure();
             sched::kern_yield_impl(reinterpret_cast<uint64_t>(caller_addr));
         }

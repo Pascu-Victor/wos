@@ -2163,6 +2163,59 @@ void request_local_reschedule() {
     }
 }
 
+auto deferred_return_needs_local_timer_locked(RunQueue* rq, task::Task* return_task) -> bool {
+    if (rq == nullptr) {
+        return false;
+    }
+
+    bool const RETURN_IS_IDLE = return_task == nullptr || return_task->type == task::TaskType::IDLE;
+    if (RETURN_IS_IDLE) {
+        return rq->runnable_heap.size != 0 || rq->next_wait_deadline_us != 0;
+    }
+
+    if (return_task->is_voluntary_blocked() || return_task->wants_block) {
+        return true;
+    }
+
+    if (rq->runnable_heap.size > 1) {
+        return true;
+    }
+
+    if (rq->runnable_heap.size == 1 && !rq->runnable_heap.contains(return_task)) {
+        return true;
+    }
+
+    return rq->next_wait_deadline_us != 0 || return_task->itimer_real_expire_us != 0;
+}
+
+void arm_local_timer_after_deferred_switch(task::Task* return_task) {
+    if (run_queues == nullptr) {
+        return;
+    }
+
+    bool arm_timer = false;
+    run_queues->this_cpu_locked_void([return_task, &arm_timer](RunQueue* rq) {
+        if (rq == nullptr) {
+            return;
+        }
+
+        // A syscall-exit deferred switch consumes the local reschedule request
+        // without taking the timer IRQ path that normally clears this bit.
+        rq->resched_timer_pending.store(false, std::memory_order_release);
+        arm_timer = deferred_return_needs_local_timer_locked(rq, return_task);
+        if (arm_timer) {
+            rq->resched_timer_pending.store(true, std::memory_order_release);
+        }
+    });
+
+    if (!arm_timer) {
+        return;
+    }
+
+    note_local_reschedule_timer_poke();
+    apic::one_shot_timer(1);
+}
+
 void arm_idle_timer_locked(RunQueue* rq) {
     uint64_t const DEADLINE_US = rq->next_wait_deadline_us;
     if (DEADLINE_US == 0) {
@@ -4216,6 +4269,8 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         // We are returning through syscall.asm's normal epilogue, not through
         // wos_deferred_task_switch_return(), so publish deferred wait results
         // back to the live syscall stack as well as Task::context.
+        clear_handoff_task(current_task);
+        arm_local_timer_after_deferred_switch(current_task);
         *gpr_ptr = current_task->context.regs;
         *return_value_slot = current_task->context.regs.rax;
         record_local_proc_first_run(current_task, WOS_PERF_CALLSITE());
@@ -4289,6 +4344,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     }
     sys::context_switch::restore_debug_registers_for_task(next_task);
 
+    arm_local_timer_after_deferred_switch(next_task);
     wos_deferred_task_switch_return(&next_task->context.regs, &next_task->context.frame);
     __builtin_unreachable();
 }

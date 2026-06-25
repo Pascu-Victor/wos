@@ -242,6 +242,7 @@ struct DirtyWritebackResult {
     bool wrote{};
     bool busy{};
     int status{};
+    uint64_t dirty_epoch{};
 };
 
 struct DirtyWakeList {
@@ -556,6 +557,13 @@ auto buffer_overlaps_range(const BufHead* bh, dev::BlockDevice* bdev, uint64_t b
 
 auto dirty_buffer_last_block(const BufHead* bh) -> uint64_t { return block_range_last_block(bh->block_no, buffer_block_count(bh)); }
 
+auto dirty_buffers_overlap(const BufHead* lhs, const BufHead* rhs) -> bool {
+    if (lhs == nullptr || rhs == nullptr || lhs == rhs || lhs->bdev != rhs->bdev) {
+        return false;
+    }
+    return block_ranges_overlap(lhs->block_no, buffer_block_count(lhs), rhs->block_no, buffer_block_count(rhs));
+}
+
 auto dirty_priority_mix(uint64_t value) -> uint64_t {
     value ^= value >> 33U;
     value *= 0xff51afd7ed558ccdULL;
@@ -833,6 +841,28 @@ auto dirty_tree_overlaps(const BufHead* root, uint64_t block_no, size_t count) -
     return false;
 }
 
+auto dirty_tree_has_older_overlapping(const BufHead* root, const BufHead* target) -> bool {
+    if (root == nullptr || target == nullptr) {
+        return false;
+    }
+
+    uint64_t const TARGET_LAST = dirty_buffer_last_block(target);
+    if (root->dirty_left != nullptr && root->dirty_left->dirty_subtree_last_block >= target->block_no) {
+        if (dirty_tree_has_older_overlapping(root->dirty_left, target)) {
+            return true;
+        }
+    }
+
+    if (dirty_buffers_overlap(root, target) && root->dirty_epoch < target->dirty_epoch) {
+        return true;
+    }
+
+    if (root->block_no <= TARGET_LAST) {
+        return dirty_tree_has_older_overlapping(root->dirty_right, target);
+    }
+    return false;
+}
+
 auto dirty_state_oldest_epoch_locked(const DirtyBdevState* state) -> uint64_t {
     uint64_t oldest = 0;
     if (state == nullptr) {
@@ -883,8 +913,9 @@ auto dirty_filter_may_have_match_locked(const DirtyWritebackFilter& filter) -> b
     return state != nullptr && dirty_tree_overlaps(state->tree_root, filter.block_no, filter.count);
 }
 
-void dirty_consider_candidate(BufHead* bh, const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive, BufHead*& best) {
-    if (!dirty_filter_matches(bh, filter) || bh->dirty_epoch <= min_epoch_exclusive) {
+void dirty_consider_candidate(BufHead* bh, const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive, uint64_t max_epoch_inclusive,
+                              BufHead*& best) {
+    if (!dirty_filter_matches(bh, filter) || bh->dirty_epoch <= min_epoch_exclusive || bh->dirty_epoch > max_epoch_inclusive) {
         return;
     }
     if (best == nullptr || bh->dirty_epoch < best->dirty_epoch || (bh->dirty_epoch == best->dirty_epoch && dirty_tree_less(bh, best))) {
@@ -892,7 +923,8 @@ void dirty_consider_candidate(BufHead* bh, const DirtyWritebackFilter& filter, u
     }
 }
 
-void dirty_tree_consider_overlapping(BufHead* root, const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive, BufHead*& best) {
+void dirty_tree_consider_overlapping(BufHead* root, const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive,
+                                     uint64_t max_epoch_inclusive, BufHead*& best) {
     if (root == nullptr || !filter.use_range || filter.bdev == nullptr) {
         return;
     }
@@ -900,17 +932,18 @@ void dirty_tree_consider_overlapping(BufHead* root, const DirtyWritebackFilter& 
     uint64_t const QUERY_LAST = block_range_last_block(filter.block_no, filter.count);
 
     if (root->dirty_left != nullptr && root->dirty_left->dirty_subtree_last_block >= filter.block_no) {
-        dirty_tree_consider_overlapping(root->dirty_left, filter, min_epoch_exclusive, best);
+        dirty_tree_consider_overlapping(root->dirty_left, filter, min_epoch_exclusive, max_epoch_inclusive, best);
     }
 
-    dirty_consider_candidate(root, filter, min_epoch_exclusive, best);
+    dirty_consider_candidate(root, filter, min_epoch_exclusive, max_epoch_inclusive, best);
 
     if (root->block_no <= QUERY_LAST) {
-        dirty_tree_consider_overlapping(root->dirty_right, filter, min_epoch_exclusive, best);
+        dirty_tree_consider_overlapping(root->dirty_right, filter, min_epoch_exclusive, max_epoch_inclusive, best);
     }
 }
 
-auto find_oldest_matching_dirty_buffer_locked(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive) -> BufHead* {
+auto find_oldest_matching_dirty_buffer_locked(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive,
+                                              uint64_t max_epoch_inclusive = UINT64_MAX) -> BufHead* {
     if (!dirty_filter_may_have_match_locked(filter)) {
         return nullptr;
     }
@@ -919,7 +952,7 @@ auto find_oldest_matching_dirty_buffer_locked(const DirtyWritebackFilter& filter
     if (dirty_index_degraded) {
         for (auto* bucket_head : hash_buckets) {
             for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
-                dirty_consider_candidate(bh, filter, min_epoch_exclusive, best);
+                dirty_consider_candidate(bh, filter, min_epoch_exclusive, max_epoch_inclusive, best);
             }
         }
         return best;
@@ -930,7 +963,7 @@ auto find_oldest_matching_dirty_buffer_locked(const DirtyWritebackFilter& filter
         if (state == nullptr || state->dirty_buffers == 0 || !dirty_tree_overlaps(state->tree_root, filter.block_no, filter.count)) {
             return nullptr;
         }
-        dirty_tree_consider_overlapping(state->tree_root, filter, min_epoch_exclusive, best);
+        dirty_tree_consider_overlapping(state->tree_root, filter, min_epoch_exclusive, max_epoch_inclusive, best);
         return best;
     }
 
@@ -945,10 +978,85 @@ auto find_oldest_matching_dirty_buffer_locked(const DirtyWritebackFilter& filter
             continue;
         }
         for (BufHead* bh = state->list_head; bh != nullptr; bh = bh->dirty_next) {
-            dirty_consider_candidate(bh, filter, min_epoch_exclusive, best);
+            dirty_consider_candidate(bh, filter, min_epoch_exclusive, max_epoch_inclusive, best);
         }
     }
     return best;
+}
+
+auto max_matching_dirty_epoch_locked(const DirtyWritebackFilter& filter) -> uint64_t {
+    uint64_t max_epoch = 0;
+
+    if (dirty_index_degraded) {
+        for (auto* bucket_head : hash_buckets) {
+            for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
+                if (dirty_filter_matches(bh, filter)) {
+                    max_epoch = std::max(max_epoch, bh->dirty_epoch);
+                }
+            }
+        }
+        return max_epoch;
+    }
+
+    for (auto* state : dirty_bdev_states) {
+        if (state == nullptr || state->dirty_buffers == 0) {
+            continue;
+        }
+        if (filter.bdev != nullptr && state->bdev != filter.bdev) {
+            continue;
+        }
+        if (filter.use_range && !dirty_tree_overlaps(state->tree_root, filter.block_no, filter.count)) {
+            continue;
+        }
+        for (BufHead* bh = state->list_head; bh != nullptr; bh = bh->dirty_next) {
+            if (dirty_filter_matches(bh, filter)) {
+                max_epoch = std::max(max_epoch, bh->dirty_epoch);
+            }
+        }
+    }
+    return max_epoch;
+}
+
+auto max_matching_dirty_epoch(const DirtyWritebackFilter& filter) -> uint64_t {
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    uint64_t const MAX_EPOCH = max_matching_dirty_epoch_locked(filter);
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    return MAX_EPOCH;
+}
+
+auto has_older_overlapping_dirty_buffer_locked(const BufHead* target) -> bool {
+    if (target == nullptr || (target->flags & BH_DIRTY) == 0) {
+        return false;
+    }
+
+    if (dirty_index_degraded) {
+        for (auto* bucket_head : hash_buckets) {
+            for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
+                if ((bh->flags & BH_DIRTY) != 0 && dirty_buffers_overlap(bh, target) && bh->dirty_epoch < target->dirty_epoch) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    DirtyBdevState* state = find_dirty_bdev_state_locked(target->bdev);
+    return state != nullptr && dirty_tree_has_older_overlapping(state->tree_root, target);
+}
+
+auto find_writeback_candidate_locked(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive, uint64_t max_epoch_inclusive)
+    -> BufHead* {
+    uint64_t search_min_epoch = min_epoch_exclusive;
+    while (true) {
+        BufHead* bh = find_oldest_matching_dirty_buffer_locked(filter, search_min_epoch, max_epoch_inclusive);
+        if (bh == nullptr) {
+            return nullptr;
+        }
+        if (!has_older_overlapping_dirty_buffer_locked(bh)) {
+            return bh;
+        }
+        search_min_epoch = bh->dirty_epoch;
+    }
 }
 
 void clear_buffer_dirty_locked(BufHead* bh) {
@@ -1060,14 +1168,15 @@ auto write_buffer_snapshot_for_epoch(BufHead* bh, uint64_t writeback_dirty_epoch
     return RC;
 }
 
-auto writeback_dirty_one(const DirtyWritebackFilter& filter) -> DirtyWritebackResult {
+auto writeback_dirty_one_after(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive, uint64_t max_epoch_inclusive = UINT64_MAX)
+    -> DirtyWritebackResult {
     DirtyWritebackResult result{};
     uint64_t const WRITEBACK_EPOCH = allocate_writeback_epoch();
     uint64_t writeback_dirty_epoch = 0;
     BufHead* bh = nullptr;
 
     uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
-    bh = find_oldest_matching_dirty_buffer_locked(filter, 0);
+    bh = find_writeback_candidate_locked(filter, min_epoch_exclusive, max_epoch_inclusive);
     if (bh == nullptr) {
         cache_lock.unlock_irqrestore(IRQFLAGS);
         return result;
@@ -1080,6 +1189,7 @@ auto writeback_dirty_one(const DirtyWritebackFilter& filter) -> DirtyWritebackRe
 
     mark_buffer_writeback(bh, WRITEBACK_EPOCH);
     writeback_dirty_epoch = bh->writeback_dirty_epoch;
+    result.dirty_epoch = writeback_dirty_epoch;
     bh->refcount.fetch_add(1, std::memory_order_relaxed);
     cache_lock.unlock_irqrestore(IRQFLAGS);
 
@@ -1089,14 +1199,18 @@ auto writeback_dirty_one(const DirtyWritebackFilter& filter) -> DirtyWritebackRe
     return result;
 }
 
+auto writeback_dirty_one(const DirtyWritebackFilter& filter) -> DirtyWritebackResult { return writeback_dirty_one_after(filter, 0); }
+
 auto writeback_dirty_budgeted(const DirtyWritebackFilter& filter, size_t budget) -> int {
     int result = 0;
+    uint64_t min_epoch = 0;
+    uint64_t const MAX_EPOCH = max_matching_dirty_epoch(filter);
     for (size_t i = 0; i < budget; ++i) {
-        DirtyWritebackResult const WB = writeback_dirty_one(filter);
+        DirtyWritebackResult const WB = writeback_dirty_one_after(filter, min_epoch, MAX_EPOCH);
         if (WB.wrote) {
+            min_epoch = WB.dirty_epoch;
             if (WB.status != 0) {
                 result = WB.status;
-                break;
             }
             continue;
         }
@@ -1107,6 +1221,81 @@ auto writeback_dirty_budgeted(const DirtyWritebackFilter& filter, size_t budget)
         break;
     }
     return result;
+}
+
+auto copy_dirty_bdev_range_locked(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst, uint64_t min_epoch_exclusive)
+    -> bool {
+    DirtyWritebackFilter filter{};
+    filter.bdev = bdev;
+    filter.block_no = block_no;
+    filter.count = count;
+    filter.use_range = true;
+
+    bool copied = false;
+    uint64_t min_epoch = min_epoch_exclusive;
+    while (true) {
+        BufHead* bh = find_oldest_matching_dirty_buffer_locked(filter, min_epoch);
+        if (bh == nullptr) {
+            break;
+        }
+        min_epoch = bh->dirty_epoch;
+
+        uint64_t const BUF_LAST = dirty_buffer_last_block(bh);
+        uint64_t const RANGE_LAST = block_range_last_block(block_no, count);
+        uint64_t const COPY_FIRST = std::max(bh->block_no, block_no);
+        uint64_t const COPY_LAST = std::min(BUF_LAST, RANGE_LAST);
+        if (COPY_FIRST > COPY_LAST) {
+            continue;
+        }
+
+        size_t const BLOCK_SIZE = bdev->block_size;
+        auto const COPY_BLOCKS = static_cast<size_t>(COPY_LAST - COPY_FIRST + 1);
+        size_t copy_bytes = COPY_BLOCKS * BLOCK_SIZE;
+        size_t const SRC_OFF = static_cast<size_t>(COPY_FIRST - bh->block_no) * BLOCK_SIZE;
+        size_t const DST_OFF = static_cast<size_t>(COPY_FIRST - block_no) * BLOCK_SIZE;
+        size_t const DST_SIZE = count * BLOCK_SIZE;
+        if (SRC_OFF >= bh->size || DST_OFF >= DST_SIZE) {
+            continue;
+        }
+        copy_bytes = std::min(copy_bytes, bh->size - SRC_OFF);
+        copy_bytes = std::min(copy_bytes, DST_SIZE - DST_OFF);
+        std::memcpy(dst + DST_OFF, bh->data + SRC_OFF, copy_bytes);
+        copied = true;
+    }
+    return copied;
+}
+
+auto copy_dirty_bdev_range_after_epoch(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst, uint64_t min_epoch_exclusive)
+    -> bool {
+    if (bdev == nullptr || bdev->block_size == 0 || count == 0 || dst == nullptr || !cache_initialized) {
+        return false;
+    }
+    if (count > SIZE_MAX / bdev->block_size) {
+        return false;
+    }
+
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    bool const COPIED = copy_dirty_bdev_range_locked(bdev, block_no, count, dst, min_epoch_exclusive);
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    return COPIED;
+}
+
+auto copy_dirty_bdev_range_for_cached_buffer(BufHead* bh, uint64_t block_no, size_t count) -> bool {
+    if (bh == nullptr || bh->bdev == nullptr || bh->bdev->block_size == 0 || count == 0 || bh->data == nullptr || !cache_initialized) {
+        return false;
+    }
+    if (count > SIZE_MAX / bh->bdev->block_size) {
+        return false;
+    }
+
+    uint64_t min_epoch = 0;
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    if ((bh->flags & BH_DIRTY) != 0) {
+        min_epoch = bh->dirty_epoch;
+    }
+    bool const COPIED = copy_dirty_bdev_range_locked(bh->bdev, block_no, count, bh->data, min_epoch);
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    return COPIED;
 }
 
 auto dirty_bytes_above_target_locked() -> bool { return cache_dirty_bytes > dirty_target_bytes_locked(); }
@@ -1233,7 +1422,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
         lru_touch(bh);
         stat_hits++;
         cache_lock.unlock_irqrestore(irqflags);
-        static_cast<void>(copy_dirty_bdev_range(bdev, block_no, 1, bh->data));
+        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer(bh, block_no, 1));
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, bdev->block_size);
         return bh;
     }
@@ -1280,7 +1469,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
         lru_touch(existing);
         free_buffer(bh);
         cache_lock.unlock_irqrestore(irqflags);
-        static_cast<void>(copy_dirty_bdev_range(bdev, block_no, 1, existing->data));
+        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer(existing, block_no, 1));
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, bdev->block_size);
         return existing;
     }
@@ -1319,7 +1508,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
         lru_touch(bh);
         stat_hits++;
         cache_lock.unlock_irqrestore(irqflags);
-        static_cast<void>(copy_dirty_bdev_range(bdev, block_no, count, bh->data));
+        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer(bh, block_no, count));
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, TOTAL_SIZE);
         return bh;
     }
@@ -1361,7 +1550,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
         lru_touch(existing);
         free_buffer(bh);
         cache_lock.unlock_irqrestore(irqflags);
-        static_cast<void>(copy_dirty_bdev_range(bdev, block_no, count, existing->data));
+        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer(existing, block_no, count));
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, TOTAL_SIZE);
         return existing;
     }
@@ -1527,13 +1716,15 @@ auto sync_blockdev(dev::BlockDevice* bdev) -> int {
 
     bool wrote_dirty = false;
     bool waited_for_writeback = false;
+    uint64_t min_epoch = 0;
+    uint64_t const MAX_EPOCH = max_matching_dirty_epoch(filter);
     while (true) {
-        DirtyWritebackResult const WB = writeback_dirty_one(filter);
+        DirtyWritebackResult const WB = writeback_dirty_one_after(filter, min_epoch, MAX_EPOCH);
         if (WB.wrote) {
             wrote_dirty = true;
+            min_epoch = WB.dirty_epoch;
             if (WB.status != 0) {
                 result = WB.status;
-                break;
             }
             continue;
         }
@@ -1594,53 +1785,7 @@ auto has_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t coun
 }
 
 auto copy_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst) -> bool {
-    if (bdev == nullptr || bdev->block_size == 0 || count == 0 || dst == nullptr || !cache_initialized) {
-        return false;
-    }
-    if (count > SIZE_MAX / bdev->block_size) {
-        return false;
-    }
-
-    DirtyWritebackFilter filter{};
-    filter.bdev = bdev;
-    filter.block_no = block_no;
-    filter.count = count;
-    filter.use_range = true;
-
-    bool copied = false;
-    uint64_t min_epoch = 0;
-    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
-    while (true) {
-        BufHead* bh = find_oldest_matching_dirty_buffer_locked(filter, min_epoch);
-        if (bh == nullptr) {
-            break;
-        }
-        min_epoch = bh->dirty_epoch;
-
-        uint64_t const BUF_LAST = dirty_buffer_last_block(bh);
-        uint64_t const RANGE_LAST = block_range_last_block(block_no, count);
-        uint64_t const COPY_FIRST = std::max(bh->block_no, block_no);
-        uint64_t const COPY_LAST = std::min(BUF_LAST, RANGE_LAST);
-        if (COPY_FIRST > COPY_LAST) {
-            continue;
-        }
-
-        size_t const BLOCK_SIZE = bdev->block_size;
-        auto const COPY_BLOCKS = static_cast<size_t>(COPY_LAST - COPY_FIRST + 1);
-        size_t copy_bytes = COPY_BLOCKS * BLOCK_SIZE;
-        size_t const SRC_OFF = static_cast<size_t>(COPY_FIRST - bh->block_no) * BLOCK_SIZE;
-        size_t const DST_OFF = static_cast<size_t>(COPY_FIRST - block_no) * BLOCK_SIZE;
-        size_t const DST_SIZE = count * BLOCK_SIZE;
-        if (SRC_OFF >= bh->size || DST_OFF >= DST_SIZE) {
-            continue;
-        }
-        copy_bytes = std::min(copy_bytes, bh->size - SRC_OFF);
-        copy_bytes = std::min(copy_bytes, DST_SIZE - DST_OFF);
-        std::memcpy(dst + DST_OFF, bh->data + SRC_OFF, copy_bytes);
-        copied = true;
-    }
-    cache_lock.unlock_irqrestore(IRQFLAGS);
-    return copied;
+    return copy_dirty_bdev_range_after_epoch(bdev, block_no, count, dst, 0);
 }
 
 void kick_dirty_buffer_cache_writeback(dev::BlockDevice* bdev) {
@@ -1707,6 +1852,7 @@ auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) ->
     int result = 0;
     bool wrote_dirty = false;
     bool waited_for_foreign_writeback = false;
+    uint64_t min_epoch = 0;
 
     DirtyWritebackFilter filter{};
     filter.bdev = bdev;
@@ -1714,13 +1860,14 @@ auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) ->
     filter.count = count;
     filter.use_range = true;
 
+    uint64_t const MAX_EPOCH = max_matching_dirty_epoch(filter);
     while (true) {
-        DirtyWritebackResult const WB = writeback_dirty_one(filter);
+        DirtyWritebackResult const WB = writeback_dirty_one_after(filter, min_epoch, MAX_EPOCH);
         if (WB.wrote) {
             wrote_dirty = true;
+            min_epoch = WB.dirty_epoch;
             if (WB.status != 0) {
                 result = WB.status;
-                break;
             }
             continue;
         }

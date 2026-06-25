@@ -24,6 +24,7 @@
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/memacc.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/swap.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/task.hpp>
@@ -1333,18 +1334,20 @@ auto generate_meminfo(char* buf, size_t bufsz) -> size_t {
         }
         task->release();
     }
+    ker::mod::mm::swap::SwapStats swap_stats{};
+    ker::mod::mm::swap::get_stats(&swap_stats);
 
     append_kb_line("MemTotal", TOTAL);
     append_kb_line("MemFree", FREE);
     append_kb_line("MemAvailable", AVAILABLE);
     append_kb_line("Buffers", BUFFERS);
     append_kb_line("Cached", CACHED);
-    append_kb_line("SwapCached", 0);
+    append_kb_line("SwapCached", swap_stats.cached_bytes);
     append_kb_line("Dirty", BCACHE.dirty_bytes);
     append_kb_line("Writeback", 0);
     append_kb_line("PageTables", page_table_bytes);
-    append_kb_line("SwapTotal", 0);
-    append_kb_line("SwapFree", 0);
+    append_kb_line("SwapTotal", swap_stats.total_bytes);
+    append_kb_line("SwapFree", swap_stats.free_bytes);
 
     buf[off] = '\0';
     return off;

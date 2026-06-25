@@ -2355,7 +2355,7 @@ auto path_requires_directory(const char* path) -> bool {
 
 auto tmpfs_root_for_mount(const MountPoint* mount) -> ker::vfs::tmpfs::TmpNode* {
     if (mount != nullptr && mount->fs_type == FSType::TMPFS && mount->private_data != nullptr) {
-        return static_cast<ker::vfs::tmpfs::TmpNode*>(mount->private_data);
+        return ker::vfs::tmpfs::mount_root(static_cast<ker::vfs::tmpfs::TmpfsMount*>(mount->private_data));
     }
     return ker::vfs::tmpfs::get_root_node();
 }
@@ -4609,7 +4609,15 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int {
         return -ENOENT;
     }
 
-    // Only tmpfs supports symlinks
+    if (mount->fs_type == FSType::XFS) {
+        const char* fs_path = strip_mount_prefix(mount, abs_linkpath.data());
+        int const RET = ker::vfs::xfs::xfs_symlink_path(target, fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+        if (RET == 0) {
+            vfs_cache_notify_path_changed(abs_linkpath.data(), nullptr);
+        }
+        return RET;
+    }
+
     if (mount->fs_type != FSType::TMPFS) {
         return -ENOSYS;
     }
@@ -5665,18 +5673,7 @@ auto vfs_statvfs(const char* path, Statvfs* buf) -> int {
         case FSType::FAT32:
             return ker::vfs::fat32::fat32_statvfs(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), buf);
         case FSType::TMPFS: {
-            uint64_t const TOTAL_BLOCKS = ker::mod::mm::phys::get_total_mem_bytes() / 4096;
-            uint64_t const FREE_BLOCKS = ker::mod::mm::phys::get_free_mem_bytes() / 4096;
-            buf->f_bsize = 4096;
-            buf->f_frsize = 4096;
-            buf->f_blocks = TOTAL_BLOCKS;
-            buf->f_bfree = FREE_BLOCKS;
-            buf->f_bavail = FREE_BLOCKS;
-            buf->f_files = TOTAL_BLOCKS;
-            buf->f_ffree = FREE_BLOCKS;
-            buf->f_favail = FREE_BLOCKS;
-            buf->f_namemax = 255;
-            return 0;
+            return ker::vfs::tmpfs::tmpfs_statvfs(static_cast<ker::vfs::tmpfs::TmpfsMount*>(mount->private_data), buf);
         }
         case FSType::DEVFS:
         case FSType::PROCFS:
@@ -5727,6 +5724,11 @@ auto vfs_fstatvfs(int fd, Statvfs* buf) -> int {
                     vfs_put_file(file);
                     return RESULT;
                 }
+                case FSType::TMPFS: {
+                    int const RESULT = ker::vfs::tmpfs::tmpfs_statvfs(static_cast<ker::vfs::tmpfs::TmpfsMount*>(mount->private_data), buf);
+                    vfs_put_file(file);
+                    return RESULT;
+                }
                 default:
                     break;
             }
@@ -5736,17 +5738,7 @@ auto vfs_fstatvfs(int fd, Statvfs* buf) -> int {
     // Fallback: synthesise by fs_type on the file itself
     switch (file->fs_type) {
         case FSType::TMPFS: {
-            uint64_t const TOTAL_BLOCKS = ker::mod::mm::phys::get_total_mem_bytes() / 4096;
-            uint64_t const FREE_BLOCKS = ker::mod::mm::phys::get_free_mem_bytes() / 4096;
-            buf->f_bsize = 4096;
-            buf->f_frsize = 4096;
-            buf->f_blocks = TOTAL_BLOCKS;
-            buf->f_bfree = FREE_BLOCKS;
-            buf->f_bavail = FREE_BLOCKS;
-            buf->f_files = TOTAL_BLOCKS;
-            buf->f_ffree = FREE_BLOCKS;
-            buf->f_favail = FREE_BLOCKS;
-            buf->f_namemax = 255;
+            ker::vfs::tmpfs::tmpfs_statvfs(nullptr, buf);
             vfs_put_file(file);
             return 0;
         }
@@ -8279,7 +8271,7 @@ auto probe_block_device_fstype(ker::dev::BlockDevice* bdev) -> const char* {
 
 }  // namespace
 
-auto vfs_mount(const char* source, const char* target, const char* fstype) -> int {
+auto vfs_mount(const char* source, const char* target, const char* fstype, unsigned long flags, const char* data) -> int {
     if (ker::mod::power::shutdown_in_progress()) {
         return -ESHUTDOWN;
     }
@@ -8412,7 +8404,7 @@ auto vfs_mount(const char* source, const char* target, const char* fstype) -> in
     // Create mount point directory in tmpfs if needed
     vfs_mkdir(target, 0755);
 
-    return mount_filesystem(target, effective_fstype, bdev);
+    return mount_filesystem(target, effective_fstype, bdev, flags, data);
 }
 
 void init() {
@@ -9149,16 +9141,15 @@ auto vfs_link(const char* oldpath, const char* newpath) -> int {
         if (dst == nullptr) {
             return -ENOMEM;
         }
-        if (src_node->data != nullptr && src_node->size > 0) {
-            dst->data = new char[src_node->size];
-            std::memcpy(dst->data, src_node->data, src_node->size);
-            dst->size = src_node->size;
-            dst->capacity = src_node->size;
+        int const COPY_RET = ker::vfs::tmpfs::tmpfs_copy_file_contents(dst, src_node);
+        if (COPY_RET < 0) {
+            return COPY_RET;
         }
         dst->uid = src_node->uid;
         dst->gid = src_node->gid;
     }
 
+    vfs_cache_notify_path_changed(new_buf.data(), nullptr);
     return 0;
 }
 

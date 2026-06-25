@@ -14,6 +14,8 @@
 #include <cstring>
 #include <new>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/paging.hpp>
+#include <platform/mm/swap.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/mutex.hpp>
@@ -1399,6 +1401,72 @@ auto xfs_sync_mount(XfsMountContext* ctx) -> int {
     return (INODE_RET != 0) ? INODE_RET : BLOCK_RET;
 }
 
+auto xfs_collect_swap_extents(File* f, ker::mod::mm::swap::SwapExtent** extents_out, size_t* extent_count_out) -> int {
+    if (f == nullptr || extents_out == nullptr || extent_count_out == nullptr) {
+        return -EINVAL;
+    }
+    *extents_out = nullptr;
+    *extent_count_out = 0;
+
+    auto* xfd = static_cast<XfsFileData*>(f->private_data);
+    if (xfd == nullptr || xfd->mount == nullptr || xfd->inode == nullptr) {
+        return -EBADF;
+    }
+    XfsMountContext* ctx = xfd->mount;
+    XfsInode* ip = xfd->inode;
+    if (ctx->read_only || ctx->device == nullptr || !xfs_inode_isreg(ip) || ctx->block_size != ker::mod::mm::paging::PAGE_SIZE ||
+        dev::block_device_is_read_only(ctx->device) || ctx->device->block_size == 0 ||
+        ker::mod::mm::paging::PAGE_SIZE % ctx->device->block_size != 0) {
+        return -EINVAL;
+    }
+
+    XfsMetadataGuard metadata_guard(ctx);
+    ker::mod::sys::MutexGuard io_guard(ip->io_lock);
+    uint64_t const PAGE_COUNT = ip->size / ker::mod::mm::paging::PAGE_SIZE;
+    if (PAGE_COUNT == 0 || PAGE_COUNT > SIZE_MAX) {
+        return -EINVAL;
+    }
+
+    auto* extents = new ker::mod::mm::swap::SwapExtent[static_cast<size_t>(PAGE_COUNT)];
+    if (extents == nullptr) {
+        return -ENOMEM;
+    }
+
+    size_t extent_count = 0;
+    xfs_fileoff_t file_block = 0;
+    while (file_block < PAGE_COUNT) {
+        XfsBmapResult bmap{};
+        int const RET = xfs_bmap_lookup(ip, file_block, &bmap);
+        if (RET < 0) {
+            delete[] extents;
+            return RET;
+        }
+        if (bmap.blockcount == 0 || bmap.is_hole || bmap.unwritten || bmap.startblock == NULLFSBLOCK) {
+            delete[] extents;
+            return -EINVAL;
+        }
+
+        auto const REMAINING = static_cast<xfs_filblks_t>(PAGE_COUNT - file_block);
+        xfs_filblks_t const SPAN = std::min(bmap.blockcount, REMAINING);
+        uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(ctx, bmap.startblock);
+        if (extent_count > 0) {
+            auto& prev = extents[extent_count - 1];
+            uint64_t const PREV_BLOCKS = prev.page_count * (ker::mod::mm::paging::PAGE_SIZE / prev.device->block_size);
+            if (prev.device == ctx->device && prev.start_block + PREV_BLOCKS == DEV_BLOCK) {
+                prev.page_count += SPAN;
+                file_block += SPAN;
+                continue;
+            }
+        }
+        extents[extent_count++] = ker::mod::mm::swap::SwapExtent{.device = ctx->device, .start_block = DEV_BLOCK, .page_count = SPAN};
+        file_block += SPAN;
+    }
+
+    *extents_out = extents;
+    *extent_count_out = extent_count;
+    return 0;
+}
+
 // ============================================================================
 // Open path
 // ============================================================================
@@ -2000,6 +2068,101 @@ auto count_real_entries(const XfsDirEntry* entry, void* ctx) -> int {
 }
 
 }  // anonymous namespace
+
+auto xfs_symlink_path(const char* target, const char* fs_path, XfsMountContext* ctx) -> int {
+    if (target == nullptr || fs_path == nullptr || ctx == nullptr) {
+        return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
+    }
+    if (fs_path[0] == '\0' || (fs_path[0] == '/' && fs_path[1] == '\0')) {
+        return -EEXIST;
+    }
+
+    size_t target_len = 0;
+    while (target[target_len] != '\0') {
+        ++target_len;
+    }
+
+    size_t const INLINE_CAPACITY = ctx->inode_size > XFS_DINODE_SIZE_V3 ? ctx->inode_size - XFS_DINODE_SIZE_V3 : 0;
+    if (target_len > INLINE_CAPACITY) {
+        return -ENAMETOOLONG;
+    }
+
+    XfsMetadataGuard metadata_guard(ctx);
+
+    XfsInode* parent_ip = nullptr;
+    const char* name = nullptr;
+    uint16_t namelen = 0;
+    int rc = xfs_find_parent_and_name(fs_path, ctx, &parent_ip, &name, &namelen);
+    if (rc != 0) {
+        return rc;
+    }
+
+    XfsDirEntry existing{};
+    rc = xfs_dir_lookup(parent_ip, name, namelen, &existing);
+    if (rc == 0) {
+        xfs_inode_release(parent_ip);
+        return -EEXIST;
+    }
+    if (rc != -ENOENT) {
+        xfs_inode_release(parent_ip);
+        return rc;
+    }
+
+    auto* target_data = new (std::nothrow) uint8_t[target_len == 0 ? 1 : target_len];
+    if (target_data == nullptr) {
+        xfs_inode_release(parent_ip);
+        return -ENOMEM;
+    }
+    if (target_len != 0) {
+        std::memcpy(target_data, target, target_len);
+    }
+
+    XfsTransaction* tp = xfs_trans_alloc(ctx);
+    if (tp == nullptr) {
+        delete[] target_data;
+        xfs_inode_release(parent_ip);
+        return -ENOMEM;
+    }
+
+    constexpr uint16_t SYMLINK_MODE = 0120000 | 0777;
+    xfs_ino_t const NEW_INO = xfs_ialloc(ctx, tp, SYMLINK_MODE);
+    if (NEW_INO == NULLFSINO) {
+        xfs_trans_cancel(tp);
+        delete[] target_data;
+        xfs_inode_release(parent_ip);
+        return -ENOSPC;
+    }
+
+    XfsInode new_inode{};
+    new_inode.ino = NEW_INO;
+    new_inode.mount = ctx;
+    new_inode.agno = xfs_ino_ag(NEW_INO, ctx->agino_log);
+    new_inode.agino = xfs_ag_ino(NEW_INO, ctx->agino_log);
+    new_inode.mode = SYMLINK_MODE;
+    new_inode.size = target_len;
+    new_inode.nlink = 1;
+    new_inode.data_fork.format = XFS_DINODE_FMT_LOCAL;
+    new_inode.data_fork.local.data = target_data;
+    new_inode.data_fork.local.size = target_len;
+    xfs_stamp_new_inode(&new_inode);
+    xfs_trans_log_inode(tp, &new_inode);
+
+    rc = xfs_dir_addname(parent_ip, name, namelen, NEW_INO, XFS_DIR3_FT_SYMLINK, tp);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        delete[] target_data;
+        xfs_inode_release(parent_ip);
+        return rc;
+    }
+
+    rc = xfs_trans_commit(tp);
+    delete[] target_data;
+    xfs_inode_release(parent_ip);
+    return (rc == 0) ? 0 : -EIO;
+}
 
 auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx) -> int {
     if (fs_path == nullptr || ctx == nullptr) {

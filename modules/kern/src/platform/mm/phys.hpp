@@ -122,6 +122,7 @@ auto page_alloc_full_overwrite_page_with_reclaim(std::string_view name = "full_o
                                                  uint32_t retry_count = PAGE_ALLOC_RECLAIM_RETRY_DEFAULT) -> void*;
 auto page_alloc_huge(uint64_t size) -> void*;  // Try the optional huge page zone, if enabled.
 void page_free(void* page);
+auto can_wait_for_reclaim() -> bool;
 auto page_split_to_order0(void* page) -> bool;
 auto page_mark_kind(void* page, PageKind kind) -> bool;
 auto page_kind_get(void* page) -> PageKind;

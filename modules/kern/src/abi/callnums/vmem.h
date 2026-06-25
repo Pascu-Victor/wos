@@ -10,6 +10,8 @@ enum class ops : uint64_t {
     PROTECT,
     MREMAP,
     MSYNC,
+    SWAPON,
+    SWAPOFF,
 };
 
 // Protection flags (matching Linux mmap)

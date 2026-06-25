@@ -12,7 +12,10 @@ struct RunQueueStats {
 };
 
 inline auto get_current_task() -> task::Task* { return nullptr; }
+inline auto can_query_current_task() -> bool { return false; }
 inline auto get_run_queue_stats(uint64_t) -> RunQueueStats { return {}; }
+inline auto has_run_queues() -> bool { return false; }
+inline auto wake_task_by_pid_from_event(uint64_t) -> bool { return false; }
 inline void kern_yield() {}
 inline void kern_block() {}
 inline void kern_wake(task::Task*) {}

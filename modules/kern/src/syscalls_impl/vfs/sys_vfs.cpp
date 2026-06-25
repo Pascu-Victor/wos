@@ -45,7 +45,7 @@ auto copy_value_to_user(T* user_ptr, T value) -> int {
 }
 }  // namespace
 
-auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -> int64_t {
+auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) -> int64_t {
     ops op = static_cast<ops>(op_raw);
     switch (op) {
         case ops::OPEN: {
@@ -132,7 +132,9 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             const auto* source = reinterpret_cast<const char*>(a1);
             const auto* target = reinterpret_cast<const char*>(a2);
             const auto* fstype = reinterpret_cast<const char*>(a3);
-            int const RET = ker::vfs::vfs_mount(source, target, fstype);
+            unsigned long const FLAGS = static_cast<unsigned long>(a4);
+            const auto* data = reinterpret_cast<const char*>(a5);
+            int const RET = ker::vfs::vfs_mount(source, target, fstype, FLAGS, data);
             return static_cast<int64_t>(RET);
         }
         case ops::MKDIR: {

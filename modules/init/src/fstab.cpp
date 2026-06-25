@@ -4,6 +4,7 @@
 #include <bits/ssize_t.h>
 #include <sys/logging.h>
 #include <sys/vfs.h>
+#include <sys/vmem.h>
 
 #include <array>
 #include <cstddef>
@@ -49,12 +50,21 @@ auto mount_required_tmpfs_at(uint64_t cpuno, const char* path) -> bool {
 
 void mount_filesystems() {
     uint64_t const CPUNO = ker::multiproc::currentThreadId();
-    bool const REQUIRED_TMPFS_MOUNTED = mount_required_tmpfs_at(CPUNO, REQUIRED_TMP_PATH);
-    bool const REQUIRED_RUNFS_MOUNTED = mount_required_tmpfs_at(CPUNO, REQUIRED_RUN_PATH);
+    bool required_tmpfs_mounted = false;
+    bool required_runfs_mounted = false;
+    auto ensure_required_tmpfs = [&]() {
+        if (!required_tmpfs_mounted) {
+            required_tmpfs_mounted = mount_required_tmpfs_at(CPUNO, REQUIRED_TMP_PATH);
+        }
+        if (!required_runfs_mounted) {
+            required_runfs_mounted = mount_required_tmpfs_at(CPUNO, REQUIRED_RUN_PATH);
+        }
+    };
 
     int const FSTAB_FD = ker::abi::vfs::open("/etc/fstab", 0, 0);
     if (FSTAB_FD < 0) {
         init_log::info("init[%llu]: no /etc/fstab found, skipping fstab mounts", static_cast<unsigned long long>(CPUNO));
+        ensure_required_tmpfs();
         return;
     }
 
@@ -64,6 +74,7 @@ void mount_filesystems() {
 
     if (BYTES_READ <= 0) {
         init_log::info("init[%llu]: /etc/fstab is empty", static_cast<unsigned long long>(CPUNO));
+        ensure_required_tmpfs();
         return;
     }
 
@@ -93,6 +104,7 @@ void mount_filesystems() {
             std::array<char, FIELD_MAX> device{};
             std::array<char, FIELD_MAX> mountpoint{};
             std::array<char, FIELD_MAX> fstype{};
+            std::array<char, FIELD_MAX> options{};
 
             // Parse device field
             bool const HAS_DEVICE = parse_field(p, device);
@@ -113,12 +125,19 @@ void mount_filesystems() {
             // Parse fstype field
             bool const HAS_FSTYPE = parse_field(p, fstype);
 
+            while (*p == ' ' || *p == '\t') {
+                p++;
+            }
+            bool const HAS_OPTIONS = parse_field(p, options);
+
             if (HAS_DEVICE && HAS_MOUNTPOINT && HAS_FSTYPE) {
-                if (((REQUIRED_TMPFS_MOUNTED && is_required_tmp_mountpoint(mountpoint.data())) ||
-                     (REQUIRED_RUNFS_MOUNTED && std::strcmp(mountpoint.data(), REQUIRED_RUN_PATH) == 0))) {
-                    if (std::strcmp(fstype.data(), REQUIRED_TMP_FSTYPE) != 0) {
-                        init_log::warn("init[%llu]: ignoring /etc/fstab entry for %s (%s); required tmpfs is already mounted",
-                                       static_cast<unsigned long long>(CPUNO), mountpoint.data(), fstype.data());
+                if (std::strcmp(fstype.data(), "swap") == 0) {
+                    int64_t const RET = ker::vmem::swapon(device.data(), 0);
+                    if (RET == 0) {
+                        init_log::info("init[%llu]: enabled swap on %s", static_cast<unsigned long long>(CPUNO), device.data());
+                    } else {
+                        init_log::error("init[%llu]: failed to enable swap on %s: error %ld", static_cast<unsigned long long>(CPUNO),
+                                        device.data(), static_cast<long>(RET));
                     }
                     continue;
                 }
@@ -127,10 +146,17 @@ void mount_filesystems() {
                 ker::abi::vfs::mkdir(mountpoint.data(), DIR_MODE);
 
                 // Mount filesystem
-                int const RET = ker::abi::vfs::mount(device.data(), mountpoint.data(), fstype.data());
+                const char* mount_options = HAS_OPTIONS ? options.data() : nullptr;
+                int const RET = ker::abi::vfs::mount(device.data(), mountpoint.data(), fstype.data(), 0, mount_options);
                 if (RET == 0) {
                     init_log::info("init[%llu]: mounted %s at %s (%s)", static_cast<unsigned long long>(CPUNO), device.data(),
                                    mountpoint.data(), fstype.data());
+                    if (std::strcmp(fstype.data(), REQUIRED_TMP_FSTYPE) == 0 && is_required_tmp_mountpoint(mountpoint.data())) {
+                        required_tmpfs_mounted = true;
+                    }
+                    if (std::strcmp(fstype.data(), REQUIRED_TMP_FSTYPE) == 0 && std::strcmp(mountpoint.data(), REQUIRED_RUN_PATH) == 0) {
+                        required_runfs_mounted = true;
+                    }
                 } else {
                     init_log::error("init[%llu]: failed to mount %s at %s (%s): error %d", static_cast<unsigned long long>(CPUNO),
                                     device.data(), mountpoint.data(), fstype.data(), RET);
@@ -144,4 +170,6 @@ void mount_filesystems() {
         }
         line_start = line_end + 1;
     }
+
+    ensure_required_tmpfs();
 }

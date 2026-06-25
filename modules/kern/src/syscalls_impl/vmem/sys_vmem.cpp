@@ -18,6 +18,7 @@
 #include <platform/mm/addr.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/swap.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -2062,6 +2063,12 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
             // a3: flags
             return mmap_msync(a1, a2, a3);
         }
+
+        case ker::abi::vmem::ops::SWAPON:
+            return static_cast<uint64_t>(ker::mod::mm::swap::swapon_path(reinterpret_cast<const char*>(a1), static_cast<int>(a2)));
+
+        case ker::abi::vmem::ops::SWAPOFF:
+            return static_cast<uint64_t>(ker::mod::mm::swap::swapoff_path(reinterpret_cast<const char*>(a1)));
 
         default:
             log::warn("invalid operation %llu", op);

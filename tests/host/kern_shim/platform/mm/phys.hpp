@@ -21,5 +21,6 @@ inline auto page_alloc(uint64_t size, std::string_view = "anonymous") -> void* {
 inline void page_free(void* page) { std::free(page); }
 
 inline auto get_free_mem_pages() -> uint64_t { return 1024 * 1024; }
+inline auto get_total_mem_bytes() -> uint64_t { return get_free_mem_pages() * 4096ULL; }
 
 }  // namespace ker::mod::mm::phys
