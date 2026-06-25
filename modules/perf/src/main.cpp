@@ -3722,7 +3722,7 @@ void print_checkout_xfs_table(const CheckoutSummaryRows& loaded, int limit) {
     if (loaded.rows.empty()) {
         std::println("=== perf checkout-report xfs ========================================");
         std::println("perf: no local_xfs summary rows found in {} or {}", PERF_DATA_FILE, KWKISTAT_PATH);
-        std::println("hint: capture checkout with `perf record <ms> --filter=xfs,container` or `perf run --filter=xfs,container <cmd>`");
+        std::println("hint: capture checkout with `perf record <ms> --filter=xfs` or `perf run --filter=xfs <cmd>`");
         return;
     }
 
