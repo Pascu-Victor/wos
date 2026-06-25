@@ -1185,6 +1185,45 @@ void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, boo
     g_metadata_cache_lock.unlock();
 }
 
+void metadata_cache_drop_path_entries(const char* path, FSType fs_type, uint64_t dev_id) {
+    if (path == nullptr || !metadata_cacheable_fs(fs_type)) {
+        return;
+    }
+
+    size_t const PATH_LEN = std::strlen(path);
+    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
+        return;
+    }
+
+    bool dropped = false;
+    g_metadata_cache_lock.lock();
+    for (uint8_t follow_value = 0; follow_value < 2; ++follow_value) {
+        for (uint8_t directory_value = 0; directory_value < 2; ++directory_value) {
+            bool const FOLLOW_FINAL_SYMLINK = follow_value != 0;
+            bool const REQUIRE_DIRECTORY = directory_value != 0;
+            uint64_t const HASH = metadata_hash_path(path, PATH_LEN, FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, fs_type, dev_id);
+            auto& set = g_metadata_cache.at(HASH & (METADATA_CACHE_SET_COUNT - 1));
+            for (auto& entry : set.ways) {
+                if (!entry.valid || entry.hash != HASH || entry.path_len != PATH_LEN || entry.fs_type != fs_type ||
+                    entry.dev_id != dev_id || entry.follow_final_symlink != FOLLOW_FINAL_SYMLINK ||
+                    entry.require_directory != REQUIRE_DIRECTORY) {
+                    continue;
+                }
+                if (std::memcmp(entry.path.data(), path, PATH_LEN + 1) != 0) {
+                    continue;
+                }
+                entry.valid = false;
+                dropped = true;
+            }
+        }
+    }
+    g_metadata_cache_lock.unlock();
+
+    if (dropped) {
+        g_metadata_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
+    }
+}
+
 auto symlink_hash_path(const char* path, size_t len, FSType fs_type, uint64_t dev_id) -> uint64_t {
     uint64_t hash = 1469598103934665603ULL;
     for (size_t i = 0; i < len; ++i) {
@@ -2704,6 +2743,29 @@ void cache_notify_file_changed_impl(File* file) {
         return;
     }
     cache_notify_path_changed_impl(file->vfs_path, nullptr);
+}
+
+void cache_notify_file_data_changed_impl(File* file) {
+    if (file == nullptr) {
+        return;
+    }
+
+    stream_invalidate_file(file);
+    file_stat_snapshot_invalidate(file);
+    if (file->fs_type == FSType::DEVFS) {
+        return;
+    }
+
+    if (file->vfs_path != nullptr && metadata_cacheable_fs(file->fs_type)) {
+        MountRef mount_ref = find_mount_point(file->vfs_path);
+        MountPoint const* mount = mount_ref.get();
+        uint64_t const DEV_ID = (mount != nullptr) ? mount->dev_id : 0;
+        metadata_cache_drop_path_entries(file->vfs_path, file->fs_type, DEV_ID);
+    }
+
+    if (cache_notify_invalidate_path_local(file->vfs_path)) {
+        ker::net::wki::wki_remote_vfs_notify_path_changed(file->vfs_path, nullptr);
+    }
 }
 
 auto cache_notify_file_dirty_impl(File* file) -> bool {
@@ -4670,7 +4732,9 @@ auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ss
     }
     result = clamp_io_count(result, count);
     if (result >= 0) {
-        vfs_cache_notify_file_changed(f);
+        if (result > 0) {
+            cache_notify_file_data_changed_impl(f);
+        }
         if (TMPFS_APPEND || XFS_APPEND) {
             f->pos = static_cast<off_t>(append_offset + static_cast<size_t>(result));
         } else {
@@ -6645,8 +6709,8 @@ auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t 
         return -ENOSYS;
     }
     auto result = clamp_io_count(f->fops->vfs_write(f, buf, count, static_cast<size_t>(offset)), count);
-    if (result >= 0) {
-        vfs_cache_notify_file_changed(f);
+    if (result > 0) {
+        cache_notify_file_data_changed_impl(f);
     }
     vfs_put_file(f);
     return result;
