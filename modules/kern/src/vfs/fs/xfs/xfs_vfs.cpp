@@ -426,7 +426,7 @@ auto discard_inode_data_buffers(XfsMountContext* ctx, XfsInode* ip, uint64_t byt
 
 auto walk_path(XfsMountContext* ctx, const char* path) -> XfsInode* {
     // Start at the root inode
-    XfsInode* ip = xfs_inode_read(ctx, ctx->root_ino);
+    XfsInode* ip = xfs_root_inode_read(ctx);
     if (ip == nullptr) {
         return nullptr;
     }
@@ -1583,7 +1583,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
 
         if (last_slash == nullptr || last_slash == fs_path) {
             // File is in the root directory
-            parent_ip = xfs_inode_read(ctx, ctx->root_ino);
+            parent_ip = xfs_root_inode_read(ctx);
             filename = (last_slash == fs_path) ? fs_path + 1 : fs_path;
         } else {
             // Extract parent path
@@ -1990,7 +1990,7 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
     uint16_t dirname_len = 0;
 
     if (last_slash == nullptr || last_slash == fs_path) {
-        parent_ip = xfs_inode_read(ctx, ctx->root_ino);
+        parent_ip = xfs_root_inode_read(ctx);
         dirname = (last_slash == fs_path) ? fs_path + 1 : fs_path;
     } else {
         auto parent_len = static_cast<size_t>(last_slash - fs_path);
@@ -2105,7 +2105,7 @@ auto xfs_find_parent_and_name(const char* fs_path, XfsMountContext* ctx, XfsInod
     const char* name = nullptr;
 
     if (last_slash == nullptr || last_slash == fs_path) {
-        parent_ip = xfs_inode_read(ctx, ctx->root_ino);
+        parent_ip = xfs_root_inode_read(ctx);
         name = (last_slash == fs_path) ? fs_path + 1 : fs_path;
     } else {
         auto parent_len = static_cast<size_t>(last_slash - fs_path);
@@ -2462,7 +2462,7 @@ auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx) -> int {
 
     if (last_slash == nullptr || last_slash == fs_path) {
         // File is in the root directory
-        parent_ip = xfs_inode_read(ctx, ctx->root_ino);
+        parent_ip = xfs_root_inode_read(ctx);
         filename = (last_slash == fs_path) ? fs_path + 1 : fs_path;
     } else {
         // Extract parent path

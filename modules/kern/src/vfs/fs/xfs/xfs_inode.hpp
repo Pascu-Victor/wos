@@ -117,6 +117,11 @@ struct XfsInode {
 // same pointer with incremented refcount.
 auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode*;
 
+// Return a new active reference to the mounted root inode.  Uses the pinned
+// mount reference when present, falling back to a normal inode read during
+// early setup paths.
+auto xfs_root_inode_read(XfsMountContext* mount) -> XfsInode*;
+
 // Insert a newly-created inode into the cache with one active reference.
 // The inode must already be committed to disk and must not already have a cache
 // entry for (mount, ino).  On success, ownership transfers to the inode cache

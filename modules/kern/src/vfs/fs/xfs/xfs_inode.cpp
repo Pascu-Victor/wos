@@ -218,6 +218,23 @@ auto icache_lookup_locked(const XfsMountContext* mount, xfs_ino_t ino, size_t bu
     return nullptr;
 }
 
+auto retain_active_cached_inode(XfsInode* ip) -> XfsInode* {
+    if (ip == nullptr || ip->mount == nullptr || ip->ino == NULLFSINO) {
+        return nullptr;
+    }
+
+    size_t const BUCKET = icache_hash(ip->mount, ip->ino);
+    uint64_t const FLAGS = icache.at(BUCKET).lock.lock_irqsave();
+    if (ip->refcount <= 0 || ip->inactivation_started) {
+        icache.at(BUCKET).lock.unlock_irqrestore(FLAGS);
+        return nullptr;
+    }
+
+    ip->refcount++;
+    icache.at(BUCKET).lock.unlock_irqrestore(FLAGS);
+    return ip;
+}
+
 // Insert an inode into the cache.  Caller must hold bucket lock.
 void icache_insert_locked(XfsInode* ip, size_t bucket) {
     ip->hash_next = icache.at(bucket).head;
@@ -986,6 +1003,16 @@ auto xfs_inode_read(XfsMountContext* mount, xfs_ino_t ino) -> XfsInode* {
     icache.at(BUCKET).lock.unlock_irqrestore(flags);
 
     return finish_inode_fetch(ip, 0);
+}
+
+auto xfs_root_inode_read(XfsMountContext* mount) -> XfsInode* {
+    if (mount == nullptr) {
+        return nullptr;
+    }
+    if (mount->root_inode == nullptr) {
+        return xfs_inode_read(mount, mount->root_ino);
+    }
+    return retain_active_cached_inode(mount->root_inode);
 }
 
 auto xfs_inode_cache_new(XfsInode* ip) -> int {

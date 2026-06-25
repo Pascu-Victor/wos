@@ -353,6 +353,15 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
         }
     }
 
+    ctx->root_inode = xfs_inode_read(ctx, ctx->root_ino);
+    if (ctx->root_inode == nullptr) {
+        mod::dbg::log("[xfs] failed to read root inode %lu", static_cast<unsigned long>(ctx->root_ino));
+        xfs_icache_purge(ctx);
+        delete[] ctx->per_ag;
+        delete ctx;
+        return -EINVAL;
+    }
+
     ctx->mounted = true;
     *ctx_out = ctx;
 
@@ -378,6 +387,12 @@ void xfs_unmount(XfsMountContext* ctx) {
 
     if (!ctx->read_only) {
         (void)xfs_sync_mount(ctx);
+    }
+
+    if (ctx->root_inode != nullptr) {
+        XfsInode* root_inode = ctx->root_inode;
+        ctx->root_inode = nullptr;
+        xfs_inode_release(root_inode);
     }
 
     xfs_icache_purge(ctx);

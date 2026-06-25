@@ -22,6 +22,8 @@
 // NOLINTBEGIN(cppcoreguidelines-pro-type-member-init)
 namespace ker::vfs::xfs {
 
+struct XfsInode;
+
 // Per-AG in-memory state (read from AGF + AGI at mount time)
 struct XfsPerAG {
     xfs_agnumber_t agno;
@@ -58,6 +60,7 @@ struct XfsMountContext {
     uint8_t block_log;          // log2(block_size)
     uint64_t total_blocks;      // total data blocks (sb_dblocks)
     xfs_ino_t root_ino;         // root directory inode number
+    XfsInode* root_inode;       // pinned root inode reference for path starts
     uint16_t inode_size;        // on-disk inode size (bytes)
     uint8_t inode_log;          // log2(inode_size)
     uint16_t inodes_per_block;  // inodes per filesystem block
