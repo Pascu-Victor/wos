@@ -403,6 +403,17 @@ void xfs_dentry_cache_store(XfsInode* dp, const char* name, uint16_t namelen, in
     g_xfs_dentry_stores.fetch_add(1, std::memory_order_relaxed);
 }
 
+void xfs_dentry_cache_store_added_name(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t ino, uint8_t ftype) {
+    XfsDirEntry entry{};
+    entry.ino = ino;
+    entry.ftype = ftype;
+    entry.namelen = namelen;
+    entry.cookie = 0;
+    std::memcpy(entry.name.data(), name, namelen);
+    entry.name.at(namelen) = '\0';
+    xfs_dentry_cache_store(dp, name, namelen, 0, &entry);
+}
+
 void xfs_dentry_cache_invalidate_dir(XfsInode* dp) {
     if (dp == nullptr || dp->mount == nullptr) {
         return;
@@ -3059,7 +3070,7 @@ auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
             return -EINVAL;
     }
     if (rc == 0) {
-        xfs_dentry_cache_invalidate_dir(dp);
+        xfs_dentry_cache_store_added_name(dp, name, namelen, ino, ftype);
     }
     return rc;
 }
@@ -3239,6 +3250,77 @@ auto xfs_selftest_dentry_cache_keeps_unrelated_dir_hot() -> bool {
     XfsDentryCacheStats after_mutated_lookup{};
     xfs_dentry_cache_stats(after_mutated_lookup);
     return after_mutated_lookup.misses > after_unrelated_lookup.misses;
+}
+
+auto xfs_selftest_dentry_cache_add_keeps_sibling_hot() -> bool {
+    XfsMountContext mount{};
+    mount.inode_size = 512;
+    mount.feat_incompat = XFS_SB_FEAT_INCOMPAT_FTYPE;
+    xfs_dentry_cache_purge_mount(&mount);
+
+    std::array<uint8_t, 32> data{};
+    XfsInode dir{};
+    xfs_selftest_make_shortform_one_entry_dir(&mount, &dir, data, 100, 42);
+
+    auto* heap_data = new uint8_t[dir.data_fork.local.size];
+    if (heap_data == nullptr) {
+        return false;
+    }
+    std::memcpy(heap_data, dir.data_fork.local.data, dir.data_fork.local.size);
+    dir.data_fork.local.data = heap_data;
+
+    auto cleanup = [&dir]() {
+        delete[] dir.data_fork.local.data;
+        dir.data_fork.local.data = nullptr;
+    };
+
+    XfsDirEntry entry{};
+    if (xfs_dir_lookup(&dir, "foo", 3, &entry) != 0 || entry.ino != 42) {
+        cleanup();
+        return false;
+    }
+    if (xfs_dir_lookup(&dir, "foo", 3, &entry) != 0 || entry.ino != 42) {
+        cleanup();
+        return false;
+    }
+
+    XfsDentryCacheStats before_add{};
+    xfs_dentry_cache_stats(before_add);
+
+    XfsTransaction tp{};
+    tp.mount = &mount;
+    if (xfs_dir_addname(&dir, "bar", 3, 84, XFS_DIR3_FT_REG_FILE, &tp) != 0) {
+        cleanup();
+        return false;
+    }
+
+    XfsDentryCacheStats after_add{};
+    xfs_dentry_cache_stats(after_add);
+    if (after_add.invalidations != before_add.invalidations || after_add.stores < before_add.stores + 2) {
+        cleanup();
+        return false;
+    }
+
+    if (xfs_dir_lookup(&dir, "foo", 3, &entry) != 0 || entry.ino != 42) {
+        cleanup();
+        return false;
+    }
+    XfsDentryCacheStats after_sibling_lookup{};
+    xfs_dentry_cache_stats(after_sibling_lookup);
+    if (after_sibling_lookup.hits <= after_add.hits) {
+        cleanup();
+        return false;
+    }
+
+    if (xfs_dir_lookup(&dir, "bar", 3, &entry) != 0 || entry.ino != 84 || entry.ftype != XFS_DIR3_FT_REG_FILE) {
+        cleanup();
+        return false;
+    }
+    XfsDentryCacheStats after_added_lookup{};
+    xfs_dentry_cache_stats(after_added_lookup);
+    bool const OK = after_added_lookup.hits > after_sibling_lookup.hits;
+    cleanup();
+    return OK;
 }
 
 auto xfs_selftest_shortform_readdir_cookies_are_monotonic() -> bool {

@@ -96,6 +96,7 @@ void xfs_dentry_cache_purge_mount(XfsMountContext* mount);
 #ifdef WOS_SELFTEST
 auto xfs_selftest_dentry_cache_shortform() -> bool;
 auto xfs_selftest_dentry_cache_keeps_unrelated_dir_hot() -> bool;
+auto xfs_selftest_dentry_cache_add_keeps_sibling_hot() -> bool;
 auto xfs_selftest_shortform_readdir_cookies_are_monotonic() -> bool;
 auto xfs_selftest_shortform_readdir_resume_after_removals() -> bool;
 #endif
