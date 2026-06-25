@@ -5,7 +5,7 @@
 // Design:
 //   - Hash table indexed by (bdev, block_no) for O(1) lookup.
 //   - LRU doubly-linked list for eviction of unreferenced buffers.
-//   - Configurable maximum cache size (default 64 MB).
+//   - Configurable maximum cache size (64 MB minimum, RAM-scaled at init).
 //   - All operations protected by a single spinlock (sufficient for the
 //     current single-threaded I/O path; can be sharded later).
 
@@ -229,8 +229,10 @@ constexpr size_t DIRTY_COPY_COVERAGE_MAX_INTERVALS = 64;
 constexpr size_t DIRTY_TARGET_DIVISOR = 2;
 constexpr size_t DIRTY_THROTTLE_RESUME_NUMERATOR = 3;
 constexpr size_t DIRTY_THROTTLE_RESUME_DENOMINATOR = 4;
-constexpr size_t BUFFER_CACHE_MEMORY_DIVISOR = 32;
-constexpr size_t BUFFER_CACHE_MAX_SIZE = static_cast<size_t>(512) * 1024 * 1024;
+// Keep dirty throttling close to Linux's default shape: background writeback at
+// about 10% of RAM, hard foreground throttling at about 20%, capped for safety.
+constexpr size_t BUFFER_CACHE_MEMORY_DIVISOR = 5;
+constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{4} * 1024 * 1024 * 1024;
 
 struct DirtyBdevState {
     dev::BlockDevice* bdev{};
