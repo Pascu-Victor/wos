@@ -3869,10 +3869,19 @@ void print_checkout_cache_state() {
                      META_HITS, META_MISSES, get_row_u64(*vfs_cache, "metadata_stores"), ratio_percent(META_HITS, META_HITS + META_MISSES),
                      FSTAT_HITS, FSTAT_MISSES, get_row_u64(*vfs_cache, "fstat_snapshot_stores"),
                      ratio_percent(FSTAT_HITS, FSTAT_HITS + FSTAT_MISSES));
-        std::println("vfs_stream: hits={} misses={} backend_reads={} backend={} copied={}", get_row_u64(*vfs_cache, "stream_hits"),
-                     get_row_u64(*vfs_cache, "stream_misses"), get_row_u64(*vfs_cache, "stream_backend_reads"),
-                     format_scaled_bytes(get_row_u64(*vfs_cache, "stream_backend_bytes")),
-                     format_scaled_bytes(get_row_u64(*vfs_cache, "stream_copied_bytes")));
+        std::println(
+            "vfs_metadata_miss: empty={} invalidated={} stale_generation={} conflict={} path_invalidations={} generation_resets={}",
+            get_row_u64(*vfs_cache, "metadata_miss_empty"), get_row_u64(*vfs_cache, "metadata_miss_invalidated"),
+            get_row_u64(*vfs_cache, "metadata_miss_stale_generation"), get_row_u64(*vfs_cache, "metadata_miss_conflict"),
+            get_row_u64(*vfs_cache, "metadata_path_invalidations"), get_row_u64(*vfs_cache, "metadata_generation_resets"));
+        std::println("vfs_fstat_miss: uncacheable={} empty={} generation={} invalidated={}",
+                     get_row_u64(*vfs_cache, "fstat_snapshot_miss_uncacheable"), get_row_u64(*vfs_cache, "fstat_snapshot_miss_empty"),
+                     get_row_u64(*vfs_cache, "fstat_snapshot_miss_generation"), get_row_u64(*vfs_cache, "fstat_snapshot_miss_invalidated"));
+        std::println("vfs_stream: hits={} misses={} backend_reads={} backend={} copied={} invalidate_empty_skips={}",
+                     get_row_u64(*vfs_cache, "stream_hits"), get_row_u64(*vfs_cache, "stream_misses"),
+                     get_row_u64(*vfs_cache, "stream_backend_reads"), format_scaled_bytes(get_row_u64(*vfs_cache, "stream_backend_bytes")),
+                     format_scaled_bytes(get_row_u64(*vfs_cache, "stream_copied_bytes")),
+                     get_row_u64(*vfs_cache, "stream_invalidate_empty_skips"));
     } else {
         std::println("vfs_cache: unavailable");
     }

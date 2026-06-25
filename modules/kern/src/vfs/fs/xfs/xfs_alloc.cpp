@@ -70,18 +70,20 @@ auto agfl_bno_usable(const XfsMountContext* mount, xfs_agblock_t bno) -> bool {
     return bno != NULLAGBLOCK && bno < mount->ag_blocks && bno > XFS_AG_RESERVED_MAX;
 }
 
-// Minimum number of blocks the AGFL should hold before we perform allocations
-// that may trigger btree splits.  Each split consumes at most one AGFL block,
-// and a two-level tree can have at most two simultaneous splits (leaf + root),
-// so 4 is a safe minimum.
-constexpr uint32_t XFS_AGFL_MIN = 4;
+// Minimum number of blocks the AGFL should hold before mutating free-space
+// btrees. Free/alloc paths can touch both bnobt and cntbt, and each tree can
+// split up to its maximum depth.
+constexpr uint32_t XFS_AGFL_MIN = static_cast<uint32_t>(2 * XFS_BTREE_MAXLEVELS);
 
 // Top up the AGFL for the given AG to at least XFS_AGFL_MIN blocks.
 // Called at the start of alloc_ag_by_size when the AGFL is running low,
 // BEFORE any cursor is opened on the free space trees.  This is the only
 // safe point to do this - once a cursor is open and a split is in progress,
 // calling xfs_alloc_extent would re-enter and corrupt the tree.
-void agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) {
+auto agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) -> int {
+    if (mount == nullptr || tp == nullptr || agno >= mount->ag_count) {
+        return -EINVAL;
+    }
     XfsPerAG* pag = &mount->per_ag[agno];
 
     while (pag->agf_flcount < XFS_AGFL_MIN && pag->agf_freeblks > 0) {
@@ -91,18 +93,19 @@ void agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
         cur.agno = agno;
         XfsCntbtTraits::IRec const TARGET{.blockcount = 1, .startblock = 0};
         if (xfs_btree_lookup(&cur, pag->agf_cnt_root, pag->agf_cnt_level, TARGET, XfsBtreeLookup::GE) != 0) {
-            break;
+            return 0;
         }
         XfsCntbtTraits::IRec const FOUND = xfs_btree_get_rec(&cur);
         if (FOUND.blockcount == 0) {
-            break;
+            return 0;
         }
 
         // Delete from cntbt
         uint64_t new_cnt_root = pag->agf_cnt_root;
         uint8_t new_cnt_lvl = pag->agf_cnt_level;
-        if (xfs_btree_delete(&cur, tp) != 0) {
-            break;
+        int rc = xfs_btree_delete(&cur, tp);
+        if (rc != 0) {
+            return rc;
         }
         // Note: btree_delete may shrink the root; pick up updated root after
         // the delete via the cursor's updated nlevels/levels - but the pag
@@ -113,11 +116,13 @@ void agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
         bno_cur.mount = mount;
         bno_cur.agno = agno;
         XfsBnobtTraits::IRec const BNO_TARGET{.startblock = FOUND.startblock, .blockcount = 0};
-        if (xfs_btree_lookup(&bno_cur, pag->agf_bno_root, pag->agf_bno_level, BNO_TARGET, XfsBtreeLookup::GE) != 0) {
-            break;
+        rc = xfs_btree_lookup(&bno_cur, pag->agf_bno_root, pag->agf_bno_level, BNO_TARGET, XfsBtreeLookup::GE);
+        if (rc != 0) {
+            return rc;
         }
-        if (xfs_btree_delete(&bno_cur, tp) != 0) {
-            break;
+        rc = xfs_btree_delete(&bno_cur, tp);
+        if (rc != 0) {
+            return rc;
         }
 
         xfs_extlen_t const EXT_LEN = FOUND.blockcount;
@@ -133,33 +138,42 @@ void agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
             uint8_t new_bno_lvl = pag->agf_bno_level;
 
             XfsBnobtTraits::IRec const REM_BNO{.startblock = REM_START, .blockcount = REM_LEN};
-            if (xfs_btree_insert(&bno_cur, tp, REM_BNO, pag->agf_bno_root, pag->agf_bno_level, &new_bno_root, &new_bno_lvl) != 0) {
-                break;
+            rc = xfs_btree_insert(&bno_cur, tp, REM_BNO, pag->agf_bno_root, pag->agf_bno_level, &new_bno_root, &new_bno_lvl);
+            if (rc != 0) {
+                return rc;
             }
             pag->agf_bno_root = static_cast<xfs_agblock_t>(new_bno_root);
             pag->agf_bno_level = new_bno_lvl;
 
             XfsCntbtTraits::IRec const REM_CNT{.startblock = REM_START, .blockcount = REM_LEN};
-            if (xfs_btree_insert(&cur, tp, REM_CNT, pag->agf_cnt_root, pag->agf_cnt_level, &new_cnt_root, &new_cnt_lvl) != 0) {
-                break;
+            rc = xfs_btree_insert(&cur, tp, REM_CNT, pag->agf_cnt_root, pag->agf_cnt_level, &new_cnt_root, &new_cnt_lvl);
+            if (rc != 0) {
+                return rc;
             }
             pag->agf_cnt_root = static_cast<xfs_agblock_t>(new_cnt_root);
             pag->agf_cnt_level = new_cnt_lvl;
         }
 
+        if (!agfl_bno_usable(mount, STOLEN)) {
+            return -EIO;
+        }
         pag->agf_freeblks--;
 
         // Push the stolen block to the AGFL
-        xfs_alloc_put_freelist(mount, tp, agno, STOLEN);
+        rc = xfs_alloc_put_freelist(mount, tp, agno, STOLEN);
+        if (rc != 0) {
+            return rc;
+        }
 
         // Write updated AGF (roots, levels, freeblks) to disk
         uint64_t const AG0 = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
         BufHead* agf_bh = xfs_buf_read(mount, AG0);
         if (agf_bh != nullptr) {
             size_t agf_off = 0;
-            if (agf_sector_offset(mount, &agf_off) != 0) {
+            rc = agf_sector_offset(mount, &agf_off);
+            if (rc != 0) {
                 brelse(agf_bh);
-                break;
+                return rc;
             }
             auto* agf = reinterpret_cast<XfsAgf*>(agf_bh->data + agf_off);
             agf->agf_freeblks = Be32::from_cpu(pag->agf_freeblks);
@@ -172,8 +186,11 @@ void agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
             __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
             xfs_trans_log_buf(tp, agf_bh, static_cast<uint32_t>(agf_off), static_cast<uint32_t>(sizeof(XfsAgf)));
             brelse(agf_bh);
+        } else {
+            return -EIO;
         }
     }
+    return 0;
 }
 
 // Try to allocate from a specific AG using the cntbt (by-count tree)
@@ -192,7 +209,10 @@ auto alloc_ag_by_hint(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
         return -ENOSPC;
     }
     if (pag->agf_flcount < XFS_AGFL_MIN) {
-        agfl_refill(mount, tp, agno);
+        int const REFILL_RC = agfl_refill(mount, tp, agno);
+        if (REFILL_RC != 0) {
+            return REFILL_RC;
+        }
     }
 
     XfsBtreeCursor<XfsBnobtTraits> bno_cur;
@@ -311,7 +331,10 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     // Ensure the AGFL has enough blocks to cover any btree splits that may
     // occur during this allocation, without re-entering xfs_alloc_extent.
     if (pag->agf_flcount < XFS_AGFL_MIN) {
-        agfl_refill(mount, tp, agno);
+        int const REFILL_RC = agfl_refill(mount, tp, agno);
+        if (REFILL_RC != 0) {
+            return REFILL_RC;
+        }
     }
 
     // Look up the cntbt for the smallest extent >= minlen
@@ -580,6 +603,12 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
     }
 
     XfsPerAG* pag = &mount->per_ag[agno];
+    if (pag->agf_flcount < XFS_AGFL_MIN) {
+        int const REFILL_RC = agfl_refill(mount, tp, agno);
+        if (REFILL_RC != 0) {
+            return REFILL_RC;
+        }
+    }
 
     xfs_agblock_t merged_start = agbno;
     xfs_extlen_t merged_len = len;

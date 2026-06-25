@@ -153,6 +153,12 @@ struct VfsCachePerfSnapshot {
     uint64_t metadata_hits{};
     uint64_t metadata_misses{};
     uint64_t metadata_stores{};
+    uint64_t metadata_miss_empty{};
+    uint64_t metadata_miss_invalidated{};
+    uint64_t metadata_miss_stale_generation{};
+    uint64_t metadata_miss_conflict{};
+    uint64_t metadata_path_invalidations{};
+    uint64_t metadata_generation_resets{};
     uint64_t symlink_hits{};
     uint64_t symlink_misses{};
     uint64_t symlink_stores{};
@@ -161,9 +167,14 @@ struct VfsCachePerfSnapshot {
     uint64_t stream_backend_reads{};
     uint64_t stream_backend_bytes{};
     uint64_t stream_copied_bytes{};
+    uint64_t stream_invalidate_empty_skips{};
     uint64_t fstat_snapshot_hits{};
     uint64_t fstat_snapshot_misses{};
     uint64_t fstat_snapshot_stores{};
+    uint64_t fstat_snapshot_miss_uncacheable{};
+    uint64_t fstat_snapshot_miss_empty{};
+    uint64_t fstat_snapshot_miss_generation{};
+    uint64_t fstat_snapshot_miss_invalidated{};
 };
 
 void vfs_get_cache_perf_snapshot(VfsCachePerfSnapshot& out);

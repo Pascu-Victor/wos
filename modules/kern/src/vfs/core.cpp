@@ -90,8 +90,12 @@ constexpr int STREAM_PREMATURE_EOF_RETRIES = 3;
 constexpr size_t PIPE_WAKE_BATCH = 32;
 constexpr size_t PIPE_DEFAULT_CAPACITY = 256UL * 1024UL;
 constexpr size_t PIPE_DIRECT_MAX_CAPACITY = 256UL * 1024UL;
-constexpr size_t METADATA_CACHE_SET_COUNT = 256;
-constexpr size_t METADATA_CACHE_WAYS = 4;
+// CMake/Ninja tree scans touch enough distinct paths that the old 1024-entry
+// metadata cache thrashed mostly on set conflicts. Keep this static and bounded:
+// 8192 entries is still small compared with guest memory while covering the hot
+// configure/build metadata working set much better.
+constexpr size_t METADATA_CACHE_SET_COUNT = 1024;
+constexpr size_t METADATA_CACHE_WAYS = 8;
 constexpr size_t METADATA_INVALIDATION_SET_COUNT = 512;
 constexpr size_t METADATA_INVALIDATION_WAYS = 4;
 constexpr size_t SYMLINK_CACHE_SET_COUNT = 512;
@@ -152,8 +156,8 @@ struct MetadataInvalidationSet {
 std::array<MetadataCacheSet, METADATA_CACHE_SET_COUNT> g_metadata_cache{};
 ker::mod::sys::Mutex g_metadata_cache_lock;
 // Path metadata/readlink caches use path-scoped invalidation generations.
-// g_metadata_cache_epoch remains the conservative public epoch consumed by
-// fstat snapshots and XFS dentry freshness.
+// g_metadata_cache_epoch remains the conservative public epoch exposed for
+// diagnostics and external cache consumers that need a simple global token.
 std::atomic<uint64_t> g_metadata_cache_generation{1};
 std::atomic<uint64_t> g_metadata_cache_epoch{1};
 std::atomic<uint64_t> g_metadata_cache_clock{0};
@@ -170,6 +174,12 @@ std::atomic<uint64_t> g_metadata_invalidation_generation{1};
 std::atomic<uint64_t> g_vfs_metadata_hits{0};
 std::atomic<uint64_t> g_vfs_metadata_misses{0};
 std::atomic<uint64_t> g_vfs_metadata_stores{0};
+std::atomic<uint64_t> g_vfs_metadata_miss_empty{0};
+std::atomic<uint64_t> g_vfs_metadata_miss_invalidated{0};
+std::atomic<uint64_t> g_vfs_metadata_miss_stale_generation{0};
+std::atomic<uint64_t> g_vfs_metadata_miss_conflict{0};
+std::atomic<uint64_t> g_vfs_metadata_path_invalidations{0};
+std::atomic<uint64_t> g_vfs_metadata_generation_resets{0};
 std::atomic<uint64_t> g_vfs_symlink_hits{0};
 std::atomic<uint64_t> g_vfs_symlink_misses{0};
 std::atomic<uint64_t> g_vfs_symlink_stores{0};
@@ -178,9 +188,14 @@ std::atomic<uint64_t> g_vfs_stream_misses{0};
 std::atomic<uint64_t> g_vfs_stream_backend_reads{0};
 std::atomic<uint64_t> g_vfs_stream_backend_bytes{0};
 std::atomic<uint64_t> g_vfs_stream_copied_bytes{0};
+std::atomic<uint64_t> g_vfs_stream_invalidate_empty_skips{0};
 std::atomic<uint64_t> g_vfs_fstat_snapshot_hits{0};
 std::atomic<uint64_t> g_vfs_fstat_snapshot_misses{0};
 std::atomic<uint64_t> g_vfs_fstat_snapshot_stores{0};
+std::atomic<uint64_t> g_vfs_fstat_snapshot_miss_uncacheable{0};
+std::atomic<uint64_t> g_vfs_fstat_snapshot_miss_empty{0};
+std::atomic<uint64_t> g_vfs_fstat_snapshot_miss_generation{0};
+std::atomic<uint64_t> g_vfs_fstat_snapshot_miss_invalidated{0};
 
 auto open_flags_require_fs_write(int flags) -> bool {
     int const ACCMODE = flags & 3;
@@ -272,6 +287,7 @@ void metadata_invalidation_clear_locked() {
 
 void metadata_cache_bump_generation_locked() {
     g_metadata_cache_generation.fetch_add(1, std::memory_order_acq_rel);
+    g_vfs_metadata_generation_resets.fetch_add(1, std::memory_order_relaxed);
     metadata_invalidation_clear_locked();
 }
 
@@ -323,6 +339,7 @@ void metadata_cache_note_one_path_changed_locked(const char* path) {
     if (PATH_LEN == 0) {
         return;
     }
+    g_vfs_metadata_path_invalidations.fetch_add(1, std::memory_order_relaxed);
     if (PATH_LEN == 1) {
         metadata_cache_bump_generation_locked();
         return;
@@ -391,7 +408,8 @@ auto symlink_cacheable_fs(FSType fs_type) -> bool { return fs_type == FSType::TM
 auto symlink_cacheable_result(ssize_t result) -> bool { return result >= 0 || result == -EINVAL || result == -ENOSYS || result == -ENOENT; }
 
 auto file_stat_snapshot_cacheable(const File* file) -> bool {
-    if (file == nullptr || file->is_directory || (file->open_flags & (ker::vfs::O_NO_CACHE | ker::vfs::O_TRUNC | ker::vfs::O_CREAT)) != 0) {
+    if (file == nullptr || file->vfs_path == nullptr || file->is_directory ||
+        (file->open_flags & (ker::vfs::O_NO_CACHE | ker::vfs::O_TRUNC | ker::vfs::O_CREAT)) != 0) {
         return false;
     }
     if ((file->open_flags & 3) != 0) {
@@ -400,22 +418,67 @@ auto file_stat_snapshot_cacheable(const File* file) -> bool {
     return metadata_cacheable_fs(file->fs_type);
 }
 
-void file_stat_snapshot_store(File* file, const Stat& statbuf) {
+struct MetadataSnapshotStamp {
+    uint64_t cache_generation = 0;
+    uint64_t invalidation_generation = 0;
+};
+
+auto metadata_snapshot_stamp() -> MetadataSnapshotStamp {
+    return MetadataSnapshotStamp{
+        .cache_generation = g_metadata_cache_generation.load(std::memory_order_acquire),
+        .invalidation_generation = g_metadata_invalidation_generation.load(std::memory_order_acquire),
+    };
+}
+
+void file_stat_snapshot_invalidate(File* file) {
+    if (file != nullptr) {
+        file->stat_cache_valid = false;
+    }
+}
+
+void file_stat_snapshot_store(File* file, const Stat& statbuf, MetadataSnapshotStamp stamp) {
     if (!file_stat_snapshot_cacheable(file) || (statbuf.st_mode & S_IFMT) != S_IFREG) {
+        file_stat_snapshot_invalidate(file);
+        return;
+    }
+    size_t const PATH_LEN = metadata_normalized_path_len(file->vfs_path);
+    if (PATH_LEN == 0) {
+        file_stat_snapshot_invalidate(file);
         return;
     }
     file->stat_cache = statbuf;
-    file->stat_cache_epoch = g_metadata_cache_epoch.load(std::memory_order_acquire);
+    file->stat_cache_generation = stamp.cache_generation;
+    file->stat_cache_invalidation_generation = stamp.invalidation_generation;
+    file->stat_cache_path_len = PATH_LEN;
     file->stat_cache_valid = true;
     g_vfs_fstat_snapshot_stores.fetch_add(1, std::memory_order_relaxed);
 }
 
+auto file_stat_snapshot_current(File* file) -> bool {
+    return file_stat_snapshot_cacheable(file) && file->stat_cache_valid &&
+           file->stat_cache_generation == g_metadata_cache_generation.load(std::memory_order_acquire) && file->stat_cache_path_len != 0 &&
+           !metadata_path_invalidated_since(file->vfs_path, file->stat_cache_path_len, file->stat_cache_invalidation_generation);
+}
+
 auto file_stat_snapshot_lookup(File* file, Stat* statbuf) -> bool {
-    if (file == nullptr || statbuf == nullptr || !file->stat_cache_valid || !file_stat_snapshot_cacheable(file)) {
+    if (file == nullptr || statbuf == nullptr || !file_stat_snapshot_cacheable(file)) {
+        g_vfs_fstat_snapshot_miss_uncacheable.fetch_add(1, std::memory_order_relaxed);
         g_vfs_fstat_snapshot_misses.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    if (file->stat_cache_epoch != g_metadata_cache_epoch.load(std::memory_order_acquire)) {
+    if (!file->stat_cache_valid) {
+        g_vfs_fstat_snapshot_miss_empty.fetch_add(1, std::memory_order_relaxed);
+        g_vfs_fstat_snapshot_misses.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (file->stat_cache_generation != g_metadata_cache_generation.load(std::memory_order_acquire)) {
+        g_vfs_fstat_snapshot_miss_generation.fetch_add(1, std::memory_order_relaxed);
+        g_vfs_fstat_snapshot_misses.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (file->stat_cache_path_len == 0 ||
+        metadata_path_invalidated_since(file->vfs_path, file->stat_cache_path_len, file->stat_cache_invalidation_generation)) {
+        g_vfs_fstat_snapshot_miss_invalidated.fetch_add(1, std::memory_order_relaxed);
         g_vfs_fstat_snapshot_misses.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -424,14 +487,27 @@ auto file_stat_snapshot_lookup(File* file, Stat* statbuf) -> bool {
     return true;
 }
 
+auto file_stat_snapshot_refresh_from_backend(File* file, Stat* statbuf) -> int {
+    if (file == nullptr || statbuf == nullptr) {
+        return -EINVAL;
+    }
+    MetadataSnapshotStamp const STAMP = metadata_snapshot_stamp();
+    int const RESULT = vfs_stream_cache_get_file_stat(file, statbuf);
+    if (RESULT == 0) {
+        file_stat_snapshot_store(file, *statbuf, STAMP);
+    }
+    return RESULT;
+}
+
 void file_stat_snapshot_refresh(File* file) {
     if (!file_stat_snapshot_cacheable(file)) {
         return;
     }
-    Stat statbuf{};
-    if (vfs_stream_cache_get_file_stat(file, &statbuf) == 0) {
-        file_stat_snapshot_store(file, statbuf);
+    if (file_stat_snapshot_current(file)) {
+        return;
     }
+    Stat statbuf{};
+    static_cast<void>(file_stat_snapshot_refresh_from_backend(file, &statbuf));
 }
 
 auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bool follow_final_symlink, bool require_directory,
@@ -449,17 +525,29 @@ auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bo
     uint64_t const HASH = metadata_hash_path(path, PATH_LEN, follow_final_symlink, require_directory, fs_type, dev_id);
     auto& set = g_metadata_cache.at(HASH & (METADATA_CACHE_SET_COUNT - 1));
 
+    bool saw_valid = false;
+    bool saw_stale_generation = false;
+    bool saw_invalidated = false;
     g_metadata_cache_lock.lock();
     for (auto& entry : set.ways) {
-        if (!entry.valid || entry.epoch != EPOCH || entry.hash != HASH || entry.path_len != PATH_LEN || entry.fs_type != fs_type ||
-            entry.dev_id != dev_id || entry.follow_final_symlink != follow_final_symlink || entry.require_directory != require_directory) {
+        if (!entry.valid) {
+            continue;
+        }
+        saw_valid = true;
+        if (entry.hash != HASH || entry.path_len != PATH_LEN || entry.fs_type != fs_type || entry.dev_id != dev_id ||
+            entry.follow_final_symlink != follow_final_symlink || entry.require_directory != require_directory) {
             continue;
         }
         if (std::memcmp(entry.path.data(), path, PATH_LEN + 1) != 0) {
             continue;
         }
+        if (entry.epoch != EPOCH) {
+            saw_stale_generation = true;
+            continue;
+        }
         if (metadata_path_invalidated_since(entry.path.data(), entry.path_len, entry.invalidation_generation)) {
             entry.valid = false;
+            saw_invalidated = true;
             continue;
         }
 
@@ -474,6 +562,15 @@ auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bo
     }
     g_metadata_cache_lock.unlock();
     g_vfs_metadata_misses.fetch_add(1, std::memory_order_relaxed);
+    if (saw_invalidated) {
+        g_vfs_metadata_miss_invalidated.fetch_add(1, std::memory_order_relaxed);
+    } else if (saw_stale_generation) {
+        g_vfs_metadata_miss_stale_generation.fetch_add(1, std::memory_order_relaxed);
+    } else if (!saw_valid) {
+        g_vfs_metadata_miss_empty.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_vfs_metadata_miss_conflict.fetch_add(1, std::memory_order_relaxed);
+    }
     return -EAGAIN;
 }
 
@@ -1840,8 +1937,10 @@ auto stream_attach_file(File* file) -> StreamReaderAttachment* {
     bool have_notify_snapshot = cache_notify_try_copy_snapshot(file, &identity, &freshness, &can_reuse_detached, &retain_full_file);
 
     if (!have_notify_snapshot) {
-        if (vfs_stream_cache_get_file_stat(file, &st) != 0) {
-            return nullptr;
+        if (!file_stat_snapshot_lookup(file, &st)) {
+            if (file_stat_snapshot_refresh_from_backend(file, &st) != 0) {
+                return nullptr;
+            }
         }
 
         if (stream_build_identity(file, st, &identity, &freshness, &can_reuse_detached, &retain_full_file) != 0) {
@@ -1933,6 +2032,14 @@ void stream_invalidate_file(File* file) {
         return;
     }
 
+    g_stream_cache_lock.lock();
+    bool const STREAM_CACHE_EMPTY = g_stream_cache.empty();
+    g_stream_cache_lock.unlock();
+    if (STREAM_CACHE_EMPTY) {
+        g_vfs_stream_invalidate_empty_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
     Stat st = {};
     if (vfs_stream_cache_get_file_stat(file, &st) != 0) {
         return;
@@ -1988,8 +2095,10 @@ void cache_notify_register_open_file_impl(File* file) {
     }
 
     Stat st = {};
-    if (vfs_stream_cache_get_file_stat(file, &st) != 0) {
-        return;
+    if (!file_stat_snapshot_lookup(file, &st)) {
+        if (file_stat_snapshot_refresh_from_backend(file, &st) != 0) {
+            return;
+        }
     }
 
     if (stream_build_identity(file, st, &identity, &freshness, &can_reuse_detached, &retain_full_file) != 0) {
@@ -4919,6 +5028,12 @@ void vfs_get_cache_perf_snapshot(VfsCachePerfSnapshot& out) {
     out.metadata_hits = g_vfs_metadata_hits.load(std::memory_order_relaxed);
     out.metadata_misses = g_vfs_metadata_misses.load(std::memory_order_relaxed);
     out.metadata_stores = g_vfs_metadata_stores.load(std::memory_order_relaxed);
+    out.metadata_miss_empty = g_vfs_metadata_miss_empty.load(std::memory_order_relaxed);
+    out.metadata_miss_invalidated = g_vfs_metadata_miss_invalidated.load(std::memory_order_relaxed);
+    out.metadata_miss_stale_generation = g_vfs_metadata_miss_stale_generation.load(std::memory_order_relaxed);
+    out.metadata_miss_conflict = g_vfs_metadata_miss_conflict.load(std::memory_order_relaxed);
+    out.metadata_path_invalidations = g_vfs_metadata_path_invalidations.load(std::memory_order_relaxed);
+    out.metadata_generation_resets = g_vfs_metadata_generation_resets.load(std::memory_order_relaxed);
     out.symlink_hits = g_vfs_symlink_hits.load(std::memory_order_relaxed);
     out.symlink_misses = g_vfs_symlink_misses.load(std::memory_order_relaxed);
     out.symlink_stores = g_vfs_symlink_stores.load(std::memory_order_relaxed);
@@ -4927,9 +5042,14 @@ void vfs_get_cache_perf_snapshot(VfsCachePerfSnapshot& out) {
     out.stream_backend_reads = g_vfs_stream_backend_reads.load(std::memory_order_relaxed);
     out.stream_backend_bytes = g_vfs_stream_backend_bytes.load(std::memory_order_relaxed);
     out.stream_copied_bytes = g_vfs_stream_copied_bytes.load(std::memory_order_relaxed);
+    out.stream_invalidate_empty_skips = g_vfs_stream_invalidate_empty_skips.load(std::memory_order_relaxed);
     out.fstat_snapshot_hits = g_vfs_fstat_snapshot_hits.load(std::memory_order_relaxed);
     out.fstat_snapshot_misses = g_vfs_fstat_snapshot_misses.load(std::memory_order_relaxed);
     out.fstat_snapshot_stores = g_vfs_fstat_snapshot_stores.load(std::memory_order_relaxed);
+    out.fstat_snapshot_miss_uncacheable = g_vfs_fstat_snapshot_miss_uncacheable.load(std::memory_order_relaxed);
+    out.fstat_snapshot_miss_empty = g_vfs_fstat_snapshot_miss_empty.load(std::memory_order_relaxed);
+    out.fstat_snapshot_miss_generation = g_vfs_fstat_snapshot_miss_generation.load(std::memory_order_relaxed);
+    out.fstat_snapshot_miss_invalidated = g_vfs_fstat_snapshot_miss_invalidated.load(std::memory_order_relaxed);
 }
 
 auto vfs_readlink_resolved(const char* path, char* buf, size_t bufsize) -> ssize_t {
@@ -5349,10 +5469,18 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
         return 0;
     }
 
+    MetadataSnapshotStamp const STAT_STAMP = metadata_snapshot_stamp();
+    auto finish_stat = [&](int result) -> int {
+        if (result == 0) {
+            file_stat_snapshot_store(file, *statbuf, STAT_STAMP);
+        }
+        return result;
+    };
+
     std::memset(statbuf, 0, sizeof(Stat));
 
     if (file->fops == nullptr && file->private_data == nullptr && file->is_directory && file->vfs_path != nullptr) {
-        return fill_synthetic_mount_dir_stat(file->vfs_path, statbuf);
+        return finish_stat(fill_synthetic_mount_dir_stat(file->vfs_path, statbuf));
     }
 
     MountRef fstat_mount_ref = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path) : MountRef{};
@@ -5366,7 +5494,7 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
                 // Return minimal stat for pseudo-TMPFS (pipes, epoll)
                 statbuf->st_mode = S_IFIFO;
                 statbuf->st_blksize = 4096;
-                return 0;
+                return finish_stat(0);
             }
             auto* node = static_cast<ker::vfs::tmpfs::TmpNode*>(file->private_data);
             if (node == nullptr) {
@@ -5393,14 +5521,14 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
                     break;
             }
             fill_tmpfs_stat_timestamps(node, statbuf);
-            return 0;
+            return finish_stat(0);
         }
         case FSType::FAT32: {
             int const R = ker::vfs::fat32::fat32_fstat(file, statbuf);
             if (R == 0) {
                 statbuf->st_dev = FSTAT_DEV_ID;
             }
-            return R;
+            return finish_stat(R);
         }
         case FSType::DEVFS: {
             auto* node = ker::vfs::devfs::devfs_file_node(file);
@@ -5424,7 +5552,7 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
                 statbuf->st_mode = S_IFCHR | ((node != nullptr) ? node->mode : 0666);
             }
             fill_devfs_stat_timestamps(node, statbuf);
-            return 0;
+            return finish_stat(0);
         }
         case FSType::SOCKET: {
             statbuf->st_dev = FSTAT_DEV_ID;
@@ -5437,12 +5565,12 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
             statbuf->st_size = 0;
             statbuf->st_blksize = 4096;
             statbuf->st_blocks = 0;
-            return 0;
+            return finish_stat(0);
         }
         case FSType::REMOTE: {
             int const RET = ker::net::wki::wki_remote_vfs_fstat(file, statbuf);
             if (RET == 0) {
-                return 0;
+                return finish_stat(0);
             }
 
             // Fall back to a synthetic stat if path-based remote metadata lookup fails.
@@ -5461,18 +5589,18 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
                 statbuf->st_mode = S_IFREG | 0644;
                 statbuf->st_size = 0;
             }
-            return 0;
+            return finish_stat(0);
         }
         case FSType::PROCFS: {
             int const R = ker::vfs::procfs::procfs_fill_stat(file, statbuf, FSTAT_DEV_ID);
-            return R;
+            return finish_stat(R);
         }
         case FSType::XFS: {
             int const R = ker::vfs::xfs::xfs_fstat(file, statbuf);
             if (R == 0) {
                 statbuf->st_dev = FSTAT_DEV_ID;
             }
-            return R;
+            return finish_stat(R);
         }
         default:
             return -ENOSYS;

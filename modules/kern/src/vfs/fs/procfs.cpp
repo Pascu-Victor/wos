@@ -2418,6 +2418,12 @@ auto generate_memacc_alloc_totals(char* buf, size_t bufsz) -> size_t {
     append_memacc_dec(p, end, "metadata_hits", vfs_cache.metadata_hits);
     append_memacc_dec(p, end, "metadata_misses", vfs_cache.metadata_misses);
     append_memacc_dec(p, end, "metadata_stores", vfs_cache.metadata_stores);
+    append_memacc_dec(p, end, "metadata_miss_empty", vfs_cache.metadata_miss_empty);
+    append_memacc_dec(p, end, "metadata_miss_invalidated", vfs_cache.metadata_miss_invalidated);
+    append_memacc_dec(p, end, "metadata_miss_stale_generation", vfs_cache.metadata_miss_stale_generation);
+    append_memacc_dec(p, end, "metadata_miss_conflict", vfs_cache.metadata_miss_conflict);
+    append_memacc_dec(p, end, "metadata_path_invalidations", vfs_cache.metadata_path_invalidations);
+    append_memacc_dec(p, end, "metadata_generation_resets", vfs_cache.metadata_generation_resets);
     append_memacc_dec(p, end, "symlink_hits", vfs_cache.symlink_hits);
     append_memacc_dec(p, end, "symlink_misses", vfs_cache.symlink_misses);
     append_memacc_dec(p, end, "symlink_stores", vfs_cache.symlink_stores);
@@ -2426,9 +2432,14 @@ auto generate_memacc_alloc_totals(char* buf, size_t bufsz) -> size_t {
     append_memacc_dec(p, end, "stream_backend_reads", vfs_cache.stream_backend_reads);
     append_memacc_dec(p, end, "stream_backend_bytes", vfs_cache.stream_backend_bytes);
     append_memacc_dec(p, end, "stream_copied_bytes", vfs_cache.stream_copied_bytes);
+    append_memacc_dec(p, end, "stream_invalidate_empty_skips", vfs_cache.stream_invalidate_empty_skips);
     append_memacc_dec(p, end, "fstat_snapshot_hits", vfs_cache.fstat_snapshot_hits);
     append_memacc_dec(p, end, "fstat_snapshot_misses", vfs_cache.fstat_snapshot_misses);
     append_memacc_dec(p, end, "fstat_snapshot_stores", vfs_cache.fstat_snapshot_stores);
+    append_memacc_dec(p, end, "fstat_snapshot_miss_uncacheable", vfs_cache.fstat_snapshot_miss_uncacheable);
+    append_memacc_dec(p, end, "fstat_snapshot_miss_empty", vfs_cache.fstat_snapshot_miss_empty);
+    append_memacc_dec(p, end, "fstat_snapshot_miss_generation", vfs_cache.fstat_snapshot_miss_generation);
+    append_memacc_dec(p, end, "fstat_snapshot_miss_invalidated", vfs_cache.fstat_snapshot_miss_invalidated);
     append_char(p, end, '\n');
 
     ker::vfs::xfs::XfsDentryCacheStats xfs_dentry{};

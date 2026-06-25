@@ -62,11 +62,12 @@ struct File {
     // Optional VFS-core cache-notify attachment for O_NOTIFY_CACHE_CHANGE.
     void* cache_notify_attachment = nullptr;
 
-    // Immutable open-time stat snapshot.  VFS uses this only while the global
-    // metadata epoch still matches, so path/file mutations cannot observe stale
-    // fstat data.
+    // Immutable per-open stat snapshot.  VFS uses this only while metadata
+    // invalidation state still proves the opened path has not changed.
     Stat stat_cache{};
-    uint64_t stat_cache_epoch = 0;
+    uint64_t stat_cache_generation = 0;
+    uint64_t stat_cache_invalidation_generation = 0;
+    size_t stat_cache_path_len = 0;
     bool stat_cache_valid = false;
 
     // Hint for filesystem backends that this file is currently being serviced
