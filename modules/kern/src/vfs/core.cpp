@@ -956,6 +956,25 @@ auto metadata_cacheable_fs(FSType fs_type) -> bool {
     return fs_type == FSType::TMPFS || fs_type == FSType::FAT32 || fs_type == FSType::XFS;
 }
 
+void metadata_cache_note_file_data_changed(const char* path, FSType fs_type) {
+    if (path == nullptr || !metadata_cacheable_fs(fs_type)) {
+        return;
+    }
+
+    size_t const PATH_LEN = metadata_normalized_path_len(path);
+    if (PATH_LEN == 0) {
+        return;
+    }
+
+    g_metadata_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
+    uint64_t const PATH_GENERATION = g_metadata_invalidation_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    uint64_t const PATH_HASH = metadata_invalidation_hash_path(path, PATH_LEN);
+
+    g_metadata_invalidation_lock.lock();
+    metadata_invalidation_store_or_reset_locked(g_metadata_exact_invalidations, PATH_HASH, PATH_GENERATION);
+    g_metadata_invalidation_lock.unlock();
+}
+
 auto metadata_cacheable_result(int result) -> bool { return result == 0 || result == -ENOENT; }
 
 auto symlink_cacheable_fs(FSType fs_type) -> bool { return fs_type == FSType::TMPFS || fs_type == FSType::FAT32 || fs_type == FSType::XFS; }
@@ -963,14 +982,28 @@ auto symlink_cacheable_fs(FSType fs_type) -> bool { return fs_type == FSType::TM
 auto symlink_cacheable_result(ssize_t result) -> bool { return result >= 0 || result == -EINVAL || result == -ENOSYS || result == -ENOENT; }
 
 auto file_stat_snapshot_cacheable(const File* file) -> bool {
-    if (file == nullptr || file->vfs_path == nullptr || file->is_directory ||
-        (file->open_flags & (ker::vfs::O_NO_CACHE | ker::vfs::O_TRUNC | ker::vfs::O_CREAT)) != 0) {
+    if (file == nullptr || file->vfs_path == nullptr || (file->open_flags & ker::vfs::O_NO_CACHE) != 0) {
+        return false;
+    }
+    return metadata_cacheable_fs(file->fs_type);
+}
+
+auto file_stat_snapshot_prefetchable(const File* file) -> bool {
+    if (!file_stat_snapshot_cacheable(file)) {
+        return false;
+    }
+    if ((file->open_flags & (ker::vfs::O_TRUNC | ker::vfs::O_CREAT)) != 0) {
         return false;
     }
     if ((file->open_flags & 3) != 0) {
         return false;
     }
-    return metadata_cacheable_fs(file->fs_type);
+    return true;
+}
+
+auto file_stat_snapshot_mode_cacheable(mode_t mode) -> bool {
+    mode_t const TYPE = mode & static_cast<mode_t>(S_IFMT);
+    return TYPE == static_cast<mode_t>(S_IFREG) || TYPE == static_cast<mode_t>(S_IFDIR);
 }
 
 struct MetadataSnapshotStamp {
@@ -992,7 +1025,7 @@ void file_stat_snapshot_invalidate(File* file) {
 }
 
 void file_stat_snapshot_store(File* file, const Stat& statbuf, MetadataSnapshotStamp stamp) {
-    if (!file_stat_snapshot_cacheable(file) || (statbuf.st_mode & S_IFMT) != S_IFREG) {
+    if (!file_stat_snapshot_cacheable(file) || !file_stat_snapshot_mode_cacheable(statbuf.st_mode)) {
         file_stat_snapshot_invalidate(file);
         return;
     }
@@ -1055,7 +1088,7 @@ auto file_stat_snapshot_refresh_from_backend(File* file, Stat* statbuf) -> int {
 }
 
 void file_stat_snapshot_refresh(File* file) {
-    if (!file_stat_snapshot_cacheable(file)) {
+    if (!file_stat_snapshot_prefetchable(file)) {
         return;
     }
     if (file_stat_snapshot_current(file)) {
@@ -2757,6 +2790,7 @@ void cache_notify_file_data_changed_impl(File* file) {
     }
 
     if (file->vfs_path != nullptr && metadata_cacheable_fs(file->fs_type)) {
+        metadata_cache_note_file_data_changed(file->vfs_path, file->fs_type);
         MountRef mount_ref = find_mount_point(file->vfs_path);
         MountPoint const* mount = mount_ref.get();
         uint64_t const DEV_ID = (mount != nullptr) ? mount->dev_id : 0;
