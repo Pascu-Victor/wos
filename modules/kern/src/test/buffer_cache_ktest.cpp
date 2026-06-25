@@ -759,8 +759,9 @@ KTEST(BufferCache, SyncBlockdevFailedWritesProgressAcrossBatches) {
     ker::vfs::invalidate_bdev(&dev);
 }
 
-KTEST(BufferCache, SyncBlockdevCoalescesContiguousDirtyRunsUpToOneMiB) {
+KTEST(BufferCache, SyncBlockdevCoalescesContiguousDirtyRunsUpToFourMiB) {
     ker::dev::BlockDevice dev = make_null_bdev();
+    dev.total_blocks = 16384;
     LargeCountingWriteState io{};
     dev.write_blocks = large_counting_write;
     dev.private_data = &io;
@@ -768,7 +769,7 @@ KTEST(BufferCache, SyncBlockdevCoalescesContiguousDirtyRunsUpToOneMiB) {
 
     constexpr uint64_t FIRST_BLOCK = 0;
     constexpr size_t BLOCKS_PER_DIRTY_BUFFER = 256;
-    constexpr size_t DIRTY_BUFFER_COUNT = 8;
+    constexpr size_t DIRTY_BUFFER_COUNT = 32;
     constexpr size_t TOTAL_BLOCKS = BLOCKS_PER_DIRTY_BUFFER * DIRTY_BUFFER_COUNT;
 
     for (size_t i = 0; i < DIRTY_BUFFER_COUNT; ++i) {

@@ -58,7 +58,7 @@ constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
 // Each transaction covers one contiguous extent allocation, so the actual
 // number of transactions for a sequential write is (total_blocks / batch).
 constexpr xfs_extlen_t XFS_WRITE_BATCH_BLOCKS = 65536;  // up to 256 MiB per transaction
-constexpr size_t XFS_BUFFERED_WRITE_BATCH_MAX_BYTES = size_t{1024} * 1024;
+constexpr size_t XFS_BUFFERED_WRITE_BATCH_MAX_BYTES = size_t{4} * 1024 * 1024;
 constexpr size_t XFS_DIRTY_THROTTLE_INTERVAL_BYTES = size_t{4} * 1024 * 1024;
 constexpr size_t XFS_STREAM_PREALLOC_TRIGGER_BYTES = size_t{512} * 1024;
 constexpr xfs_extlen_t XFS_STREAM_PREALLOC_BLOCKS = 1024;  // 4 MiB
