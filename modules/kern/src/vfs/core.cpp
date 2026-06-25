@@ -83,7 +83,8 @@ constexpr size_t STREAM_CHUNK_SIZE = 65536;
 constexpr size_t STREAM_ENTRY_BYTE_CAP = size_t{8} * 1024 * 1024;
 constexpr size_t STREAM_DETACHED_REUSE_MAX = size_t{8} * 1024 * 1024;
 constexpr size_t STREAM_DETACHED_PARTIAL_REUSE_MAX = size_t{256} * 1024;
-constexpr size_t STREAM_LOCAL_SMALL_FILE_RETAIN_MAX = size_t{128} * 1024;
+constexpr size_t STREAM_LOCAL_SMALL_FILE_RETAIN_MAX = size_t{2} * 1024 * 1024;
+constexpr size_t STREAM_DETACHED_GLOBAL_BYTE_CAP = size_t{256} * 1024 * 1024;
 constexpr size_t STREAM_MAX_ACTIVE_ISLANDS = 4;
 constexpr uint64_t STREAM_DETACHED_TTL_US = 5000000;
 constexpr uint64_t STREAM_LOCAL_SMALL_FILE_DETACHED_TTL_US = 60000000;
@@ -2086,6 +2087,44 @@ auto stream_entry_should_keep_detached(const StreamCacheEntry* entry, uint64_t n
     return PREFIX_BYTES > 0 && std::cmp_less_equal(PREFIX_BYTES, STREAM_DETACHED_PARTIAL_REUSE_MAX);
 }
 
+auto stream_total_cached_bytes_locked() -> size_t {
+    size_t total = 0;
+    for (const auto& entry : g_stream_cache) {
+        if (entry == nullptr) {
+            continue;
+        }
+        if (entry->cached_bytes > SIZE_MAX - total) {
+            return SIZE_MAX;
+        }
+        total += entry->cached_bytes;
+    }
+    return total;
+}
+
+void stream_enforce_detached_global_cap_locked() {
+    size_t total = stream_total_cached_bytes_locked();
+    while (total > STREAM_DETACHED_GLOBAL_BYTE_CAP) {
+        auto candidate = g_stream_cache.end();
+        uint64_t oldest_used_us = UINT64_MAX;
+        for (auto it = g_stream_cache.begin(); it != g_stream_cache.end(); ++it) {
+            StreamCacheEntry* entry = it->get();
+            if (entry == nullptr || entry->cached_bytes == 0 || entry->pinned_detached || stream_entry_has_readers(entry)) {
+                continue;
+            }
+            if (candidate == g_stream_cache.end() || entry->last_used_us < oldest_used_us) {
+                candidate = it;
+                oldest_used_us = entry->last_used_us;
+            }
+        }
+        if (candidate == g_stream_cache.end()) {
+            break;
+        }
+        size_t const CACHED_BYTES = (*candidate)->cached_bytes;
+        total = CACHED_BYTES <= total ? total - CACHED_BYTES : 0;
+        g_stream_cache.erase(candidate);
+    }
+}
+
 void stream_gc_locked(uint64_t now_us) {
     for (auto entry_it = g_stream_cache.begin(); entry_it != g_stream_cache.end();) {
         auto* entry = entry_it->get();
@@ -2106,6 +2145,7 @@ void stream_gc_locked(uint64_t now_us) {
         }
         ++entry_it;
     }
+    stream_enforce_detached_global_cap_locked();
 }
 
 auto stream_find_entry_locked(const StreamCacheIdentity& identity) -> StreamCacheEntry* {
@@ -8976,6 +9016,26 @@ auto vfs_selftest_stream_cache_read_eligibility() -> bool {
     bool const DEVFS_REJECTED = !stream_cache_read_eligible(&devfs_read);
     bool const REMOTE_ALLOWED = stream_cache_read_eligible(&remote_read);
     return LOCAL_REGULAR_ALLOWED && WRITABLE_REJECTED && NO_CACHE_REJECTED && ANONYMOUS_REJECTED && DEVFS_REJECTED && REMOTE_ALLOWED;
+}
+
+auto vfs_selftest_stream_cache_local_detached_ttl() -> bool {
+    StreamCacheEntry local{};
+    local.identity.fs_type = FSType::XFS;
+    local.retain_full_file = true;
+    local.freshness.size = static_cast<off_t>(STREAM_LOCAL_SMALL_FILE_RETAIN_MAX);
+
+    StreamCacheEntry local_too_large{};
+    local_too_large.identity.fs_type = FSType::XFS;
+    local_too_large.retain_full_file = true;
+    local_too_large.freshness.size = static_cast<off_t>(STREAM_LOCAL_SMALL_FILE_RETAIN_MAX + 1);
+
+    StreamCacheEntry remote{};
+    remote.identity.fs_type = FSType::REMOTE;
+    remote.retain_full_file = true;
+    remote.freshness.size = static_cast<off_t>(STREAM_LOCAL_SMALL_FILE_RETAIN_MAX);
+
+    return stream_detached_ttl_us(&local) == STREAM_LOCAL_SMALL_FILE_DETACHED_TTL_US &&
+           stream_detached_ttl_us(&local_too_large) == STREAM_DETACHED_TTL_US && stream_detached_ttl_us(&remote) == STREAM_DETACHED_TTL_US;
 }
 #endif
 
