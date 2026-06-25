@@ -4858,6 +4858,43 @@ auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path
     return STATUS;
 }
 
+// Consumer side: create a symlink on the remote server
+auto wki_remote_vfs_symlink(void* mount_private_data, const char* target, const char* fs_relative_path) -> int {
+    auto* state = static_cast<ProxyVfsState*>(mount_private_data);
+    if (state == nullptr || !state->active || target == nullptr || fs_relative_path == nullptr) {
+        return -EINVAL;
+    }
+
+    // Server expects: {target_len:u16, target[], link_len:u16, link[]}
+    std::array<uint8_t, 1028> req_stack{};
+    constexpr size_t SERVER_TARGET_MAX = 511;
+    size_t const TARGET_LEN = strlen(target);
+    size_t const LINK_LEN = strlen(fs_relative_path);
+    if (TARGET_LEN > SERVER_TARGET_MAX || LINK_LEN > UINT16_MAX || TARGET_LEN + LINK_LEN > req_stack.size() - 4U) {
+        return -ENAMETOOLONG;
+    }
+
+    auto target_len = static_cast<uint16_t>(TARGET_LEN);
+    auto link_len = static_cast<uint16_t>(LINK_LEN);
+    auto req_data_len = static_cast<uint16_t>(4 + target_len + link_len);
+    uint8_t* req_data = req_stack.data();
+
+    memcpy(req_data, &target_len, sizeof(uint16_t));
+    if (target_len > 0) {
+        memcpy(req_data + 2, target, target_len);
+    }
+    memcpy(req_data + 2 + target_len, &link_len, sizeof(uint16_t));
+    if (link_len > 0) {
+        memcpy(req_data + 4 + target_len, fs_relative_path, link_len);
+    }
+
+    int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_SYMLINK, req_data, req_data_len, nullptr, 0);
+    if (STATUS == 0) {
+        invalidate_readlink_cache(state);
+    }
+    return STATUS;
+}
+
 // Consumer side: unlink a file on the remote server
 auto wki_remote_vfs_unlink(void* mount_private_data, const char* fs_relative_path) -> int {
     auto* state = static_cast<ProxyVfsState*>(mount_private_data);

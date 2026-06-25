@@ -244,6 +244,9 @@ auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int;
 // Consumer side: called from vfs_mkdir() for FSType::REMOTE mounts
 auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path, int mode) -> int;
 
+// Consumer side: called from vfs_symlink() for FSType::REMOTE mounts
+auto wki_remote_vfs_symlink(void* mount_private_data, const char* target, const char* fs_relative_path) -> int;
+
 // Consumer side: called from vfs_unlink() for FSType::REMOTE mounts [V2 A9]
 auto wki_remote_vfs_unlink(void* mount_private_data, const char* fs_relative_path) -> int;
 

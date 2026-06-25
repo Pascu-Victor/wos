@@ -4609,6 +4609,15 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int {
         return -ENOENT;
     }
 
+    if (mount->fs_type == FSType::REMOTE) {
+        const char* fs_path = strip_mount_prefix(mount, abs_linkpath.data());
+        int const RET = ker::net::wki::wki_remote_vfs_symlink(mount->private_data, target, fs_path);
+        if (RET == 0) {
+            vfs_cache_notify_path_changed(abs_linkpath.data(), nullptr);
+        }
+        return RET;
+    }
+
     if (mount->fs_type == FSType::XFS) {
         const char* fs_path = strip_mount_prefix(mount, abs_linkpath.data());
         int const RET = ker::vfs::xfs::xfs_symlink_path(target, fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));

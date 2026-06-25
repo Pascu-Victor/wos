@@ -91,6 +91,7 @@ def test_metadata_mutators_are_serialized() -> None:
         "xfs_chmod_path": "XfsMetadataGuard metadata_guard(ctx);",
         "xfs_fchmod": "XfsMetadataGuard metadata_guard(xfd->mount);",
         "xfs_mkdir_path": "XfsMetadataGuard metadata_guard(ctx);",
+        "xfs_symlink_path": "XfsMetadataGuard metadata_guard(ctx);",
         "xfs_rmdir_path": "XfsMetadataGuard metadata_guard(ctx);",
         "xfs_rename_path": "XfsMetadataGuard metadata_guard(ctx);",
         "xfs_unlink_path": "XfsMetadataGuard metadata_guard(ctx);",
