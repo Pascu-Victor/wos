@@ -1555,6 +1555,60 @@ auto xfs_collect_swap_extents(File* f, ker::mod::mm::swap::SwapExtent** extents_
 // Open path
 // ============================================================================
 
+namespace {
+
+auto xfs_find_parent_and_name(const char* fs_path, XfsMountContext* ctx, XfsInode** parent_out, const char** name_out,
+                              uint16_t* namelen_out) -> int {
+    const char* last_slash = nullptr;
+    for (const char* p = fs_path; *p != '\0'; p++) {
+        if (*p == '/') {
+            last_slash = p;
+        }
+    }
+
+    XfsInode* parent_ip = nullptr;
+    const char* name = nullptr;
+
+    if (last_slash == nullptr || last_slash == fs_path) {
+        parent_ip = xfs_root_inode_read(ctx);
+        name = (last_slash == fs_path) ? fs_path + 1 : fs_path;
+    } else {
+        auto parent_len = static_cast<size_t>(last_slash - fs_path);
+        char parent_path[512] = {};  // NOLINT
+        if (parent_len >= sizeof(parent_path)) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(static_cast<char*>(parent_path), fs_path, parent_len);
+        parent_path[parent_len] = '\0';
+        parent_ip = walk_path(ctx, static_cast<const char*>(parent_path));
+        name = last_slash + 1;
+    }
+
+    if (parent_ip == nullptr) {
+        return -ENOENT;
+    }
+    if (!xfs_inode_isdir(parent_ip)) {
+        xfs_inode_release(parent_ip);
+        return -ENOTDIR;
+    }
+
+    uint16_t namelen = 0;
+    for (const char* p = name; *p != '\0'; p++) {
+        namelen++;
+    }
+    if (namelen == 0) {
+        xfs_inode_release(parent_ip);
+        return -EINVAL;
+    }
+
+    *parent_out = parent_ip;
+    *name_out = name;
+    *namelen_out = namelen;
+    return 0;
+}
+
+}  // namespace
+
 auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ctx) -> File* {
     constexpr int O_CREAT_FLAG = 0100;
     constexpr int O_TRUNC_FLAG = 01000;
@@ -1565,59 +1619,43 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
 
     XfsMetadataGuard metadata_guard(ctx);
 
-    auto* ip = walk_path(ctx, fs_path);
+    XfsInode* ip = nullptr;
+    bool used_create_lookup = false;
+    bool create_missing = false;
+    XfsInode* create_parent_ip = nullptr;
+    const char* create_filename = nullptr;
+    uint16_t create_filename_len = 0;
 
-    if (ip == nullptr && (flags & O_CREAT_FLAG) != 0 && !ctx->read_only) {
-        // File doesn't exist and O_CREAT is set - create it.
-        // Find the parent directory and the filename component.
-        const char* last_slash = nullptr;
-        for (const char* p = fs_path; *p != '\0'; p++) {
-            if (*p == '/') {
-                last_slash = p;
-            }
-        }
-
-        XfsInode* parent_ip = nullptr;
-        const char* filename = nullptr;
-        uint16_t filename_len = 0;
-
-        if (last_slash == nullptr || last_slash == fs_path) {
-            // File is in the root directory
-            parent_ip = xfs_root_inode_read(ctx);
-            filename = (last_slash == fs_path) ? fs_path + 1 : fs_path;
-        } else {
-            // Extract parent path
-            auto const PARENT_LEN = static_cast<size_t>(last_slash - fs_path);
-            char parent_path[512] = {};  // NOLINT
-            if (PARENT_LEN >= sizeof(parent_path)) {
+    if ((flags & O_CREAT_FLAG) != 0 && !ctx->read_only) {
+        int parent_ret = xfs_find_parent_and_name(fs_path, ctx, &create_parent_ip, &create_filename, &create_filename_len);
+        if (parent_ret == 0) {
+            used_create_lookup = true;
+            XfsDirEntry existing{};
+            int const LOOKUP_RET = xfs_dir_lookup(create_parent_ip, create_filename, create_filename_len, &existing);
+            if (LOOKUP_RET == 0) {
+                xfs_inode_release(create_parent_ip);
+                create_parent_ip = nullptr;
+                ip = xfs_inode_read(ctx, existing.ino);
+            } else if (LOOKUP_RET == -ENOENT) {
+                create_missing = true;
+            } else if (LOOKUP_RET != -ENOENT) {
+                xfs_inode_release(create_parent_ip);
                 return nullptr;
             }
-            std::memcpy(static_cast<char*>(parent_path), fs_path, PARENT_LEN);
-            parent_path[PARENT_LEN] = '\0';
-            parent_ip = walk_path(ctx, static_cast<const char*>(parent_path));
-            filename = last_slash + 1;
-        }
-
-        if (parent_ip == nullptr || !xfs_inode_isdir(parent_ip)) {
-            if (parent_ip != nullptr) {
-                xfs_inode_release(parent_ip);
-            }
+        } else if (parent_ret != -EINVAL) {
             return nullptr;
         }
+    }
 
-        filename_len = 0;
-        for (const char* p = filename; *p != '\0'; p++) {
-            filename_len++;
-        }
-        if (filename_len == 0) {
-            xfs_inode_release(parent_ip);
-            return nullptr;
-        }
+    if (!used_create_lookup) {
+        ip = walk_path(ctx, fs_path);
+    }
 
+    if (create_missing) {
         // Allocate a new inode
         XfsTransaction* tp = xfs_trans_alloc(ctx);
         if (tp == nullptr) {
-            xfs_inode_release(parent_ip);
+            xfs_inode_release(create_parent_ip);
             return nullptr;
         }
 
@@ -1627,14 +1665,14 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         xfs_ino_t const NEW_INO = xfs_ialloc(ctx, tp, INODE_MODE);
         if (NEW_INO == NULLFSINO) {
             xfs_trans_cancel(tp);
-            xfs_inode_release(parent_ip);
+            xfs_inode_release(create_parent_ip);
             return nullptr;
         }
 
         auto* new_inode = new (std::nothrow) XfsInode{};
         if (new_inode == nullptr) {
             xfs_trans_cancel(tp);
-            xfs_inode_release(parent_ip);
+            xfs_inode_release(create_parent_ip);
             return nullptr;
         }
         new_inode->ino = NEW_INO;
@@ -1648,16 +1686,17 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         xfs_trans_log_inode(tp, new_inode);
 
         // Add directory entry
-        int rc = xfs_dir_addname(parent_ip, filename, filename_len, NEW_INO, XFS_DIR3_FT_REG_FILE, tp);
+        int rc = xfs_dir_addname(create_parent_ip, create_filename, create_filename_len, NEW_INO, XFS_DIR3_FT_REG_FILE, tp);
         if (rc != 0) {
             xfs_trans_cancel(tp);
             delete new_inode;
-            xfs_inode_release(parent_ip);
+            xfs_inode_release(create_parent_ip);
             return nullptr;
         }
 
         rc = xfs_trans_commit(tp);
-        xfs_inode_release(parent_ip);
+        xfs_inode_release(create_parent_ip);
+        create_parent_ip = nullptr;
         if (rc != 0) {
             delete new_inode;
             return nullptr;
@@ -1969,54 +2008,34 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
 
     XfsMetadataGuard metadata_guard(ctx);
 
-    // Already exists?
-    XfsInode* existing = walk_path(ctx, fs_path);
-    if (existing != nullptr) {
-        bool const IS_DIR = xfs_inode_isdir(existing);
-        xfs_inode_release(existing);
-        return IS_DIR ? -EEXIST : -ENOTDIR;
-    }
-
-    // Find parent directory and new name
-    const char* last_slash = nullptr;
-    for (const char* p = fs_path; *p != '\0'; p++) {
-        if (*p == '/') {
-            last_slash = p;
-        }
-    }
-
     XfsInode* parent_ip = nullptr;
     const char* dirname = nullptr;
     uint16_t dirname_len = 0;
-
-    if (last_slash == nullptr || last_slash == fs_path) {
-        parent_ip = xfs_root_inode_read(ctx);
-        dirname = (last_slash == fs_path) ? fs_path + 1 : fs_path;
-    } else {
-        auto parent_len = static_cast<size_t>(last_slash - fs_path);
-        char parent_path[512] = {};  // NOLINT
-        if (parent_len >= sizeof(parent_path)) {
-            return -ENAMETOOLONG;
+    int parent_ret = xfs_find_parent_and_name(fs_path, ctx, &parent_ip, &dirname, &dirname_len);
+    if (parent_ret != 0) {
+        if (parent_ret == -EINVAL) {
+            XfsInode* existing = walk_path(ctx, fs_path);
+            if (existing != nullptr) {
+                bool const IS_DIR = xfs_inode_isdir(existing);
+                xfs_inode_release(existing);
+                return IS_DIR ? -EEXIST : -ENOTDIR;
+            }
         }
-        std::memcpy(static_cast<char*>(parent_path), fs_path, parent_len);
-        parent_path[parent_len] = '\0';
-        parent_ip = walk_path(ctx, static_cast<const char*>(parent_path));
-        dirname = last_slash + 1;
-    }
-
-    if (parent_ip == nullptr || !xfs_inode_isdir(parent_ip)) {
-        if (parent_ip != nullptr) {
-            xfs_inode_release(parent_ip);
+        if (parent_ret == -ENOTDIR) {
+            return -ENOENT;
         }
-        return -ENOENT;
+        return parent_ret;
     }
 
-    for (const char* p = dirname; *p != '\0'; p++) {
-        dirname_len++;
-    }
-    if (dirname_len == 0) {
+    XfsDirEntry existing{};
+    int const LOOKUP_RET = xfs_dir_lookup(parent_ip, dirname, dirname_len, &existing);
+    if (LOOKUP_RET == 0) {
         xfs_inode_release(parent_ip);
-        return -EINVAL;
+        return existing.ftype == XFS_DIR3_FT_DIR ? -EEXIST : -ENOTDIR;
+    }
+    if (LOOKUP_RET != -ENOENT) {
+        xfs_inode_release(parent_ip);
+        return LOOKUP_RET;
     }
 
     // Save before parent_ip is released
@@ -2091,56 +2110,6 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
 // ============================================================================
 
 namespace {
-
-auto xfs_find_parent_and_name(const char* fs_path, XfsMountContext* ctx, XfsInode** parent_out, const char** name_out,
-                              uint16_t* namelen_out) -> int {
-    const char* last_slash = nullptr;
-    for (const char* p = fs_path; *p != '\0'; p++) {
-        if (*p == '/') {
-            last_slash = p;
-        }
-    }
-
-    XfsInode* parent_ip = nullptr;
-    const char* name = nullptr;
-
-    if (last_slash == nullptr || last_slash == fs_path) {
-        parent_ip = xfs_root_inode_read(ctx);
-        name = (last_slash == fs_path) ? fs_path + 1 : fs_path;
-    } else {
-        auto parent_len = static_cast<size_t>(last_slash - fs_path);
-        char parent_path[512] = {};  // NOLINT
-        if (parent_len >= sizeof(parent_path)) {
-            return -ENAMETOOLONG;
-        }
-        std::memcpy(static_cast<char*>(parent_path), fs_path, parent_len);
-        parent_path[parent_len] = '\0';
-        parent_ip = walk_path(ctx, static_cast<const char*>(parent_path));
-        name = last_slash + 1;
-    }
-
-    if (parent_ip == nullptr) {
-        return -ENOENT;
-    }
-    if (!xfs_inode_isdir(parent_ip)) {
-        xfs_inode_release(parent_ip);
-        return -ENOTDIR;
-    }
-
-    uint16_t namelen = 0;
-    for (const char* p = name; *p != '\0'; p++) {
-        namelen++;
-    }
-    if (namelen == 0) {
-        xfs_inode_release(parent_ip);
-        return -EINVAL;
-    }
-
-    *parent_out = parent_ip;
-    *name_out = name;
-    *namelen_out = namelen;
-    return 0;
-}
 
 auto count_real_entries(const XfsDirEntry* entry, void* ctx) -> int {
     auto* count = static_cast<int*>(ctx);
