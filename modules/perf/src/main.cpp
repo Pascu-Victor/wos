@@ -22,6 +22,7 @@
 #include <bits/ssize_t.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <signal.h>  // NOLINT(modernize-deprecated-headers,misc-include-cleaner): WOS signal constants live here.
 #include <sys/process.h>
 #include <time.h>  // NOLINT(modernize-deprecated-headers): POSIX clock_gettime/nanosleep are declared here.
 #include <unistd.h>
@@ -69,6 +70,7 @@ constexpr int PROC_STAT_SKIP_FIELDS = 8;
 constexpr int PROC_WAIT_NOHANG = 1;
 constexpr char EXITED_STATE = 'Z';
 constexpr int DRAIN_INTERVAL_MS = 250;
+constexpr int PERF_RUN_CANCEL_KILL_AFTER_MS = 2000;
 constexpr int EVENT_MIN_TOKEN_COUNT = 4;
 constexpr int EVENT_EXTENDED_TOKEN_COUNT = 6;
 constexpr int HOTSPOT_ROW_LIMIT = 10;
@@ -133,6 +135,50 @@ constexpr std::string_view REALTIME_OFFSET_NS_KEY = "realtime_offset_ns=";
 constexpr std::string_view UNKNOWN_CALLSITE = "?";
 constexpr std::string_view COMM_FIELD_PREFIX = " comm=";
 constexpr std::string_view CMD_FIELD_PREFIX = " cmd=";
+
+// NOLINTNEXTLINE(misc-include-cleaner): WOS signal constants are provided by signal.h.
+constexpr std::array<int, 4> PERF_RUN_FORWARD_SIGNALS{SIGINT, SIGTERM, SIGHUP, SIGQUIT};
+volatile sig_atomic_t g_perf_run_signal = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+using SignalHandler = void (*)(int);
+
+struct PerfRunSignalHandlers {
+    std::array<SignalHandler, PERF_RUN_FORWARD_SIGNALS.size()> previous{};
+    bool installed = false;
+};
+
+void handle_perf_run_signal(int signum) {
+    if (g_perf_run_signal == 0) {
+        g_perf_run_signal = signum;
+    }
+}
+
+void install_perf_run_signal_handlers(PerfRunSignalHandlers& handlers) {
+    g_perf_run_signal = 0;
+    for (std::size_t i = 0; i < PERF_RUN_FORWARD_SIGNALS.size(); ++i) {
+        handlers.previous.at(i) = ::signal(PERF_RUN_FORWARD_SIGNALS.at(i), handle_perf_run_signal);
+    }
+    handlers.installed = true;
+}
+
+void restore_perf_run_signal_handlers(PerfRunSignalHandlers& handlers) {
+    if (!handlers.installed) {
+        return;
+    }
+    for (std::size_t i = 0; i < PERF_RUN_FORWARD_SIGNALS.size(); ++i) {
+        if (handlers.previous.at(i) != SIG_ERR) {
+            ::signal(PERF_RUN_FORWARD_SIGNALS.at(i), handlers.previous.at(i));
+        }
+    }
+    handlers.installed = false;
+    g_perf_run_signal = 0;
+}
+
+auto consume_perf_run_signal() -> int {
+    int const SIGNUM = static_cast<int>(g_perf_run_signal);
+    g_perf_run_signal = 0;
+    return SIGNUM;
+}
 
 class ScopedFd {
    public:
@@ -4433,6 +4479,9 @@ void cmd_run(int argc, char** argv) {
     int64_t target_pgid = child_pid;
     std::println("perf run: tracing pgid={} cmd={}", target_pgid, exec_path);
 
+    PerfRunSignalHandlers signal_handlers{};
+    install_perf_run_signal_handlers(signal_handlers);
+
     std::vector<TrackedProc> tracked;
     auto upsert_tracked = [&](const StatInfo& stat) {
         for (auto& proc : tracked) {
@@ -4465,6 +4514,9 @@ void cmd_run(int argc, char** argv) {
     bool command_exited = false;
     bool last_group_alive = false;
     int64_t last_proc_scan_ms = 0;
+    bool cancel_forwarded = false;
+    bool cancel_escalated = false;
+    int64_t cancel_forwarded_ms = 0;
 
     auto scan_target_group = [&]() {
         bool any_alive = false;
@@ -4494,8 +4546,28 @@ void cmd_run(int argc, char** argv) {
         }
 
         int64_t const LOOP_NOW_MS = now_ms();
+        int const FORWARD_SIGNAL = consume_perf_run_signal();
+        if (FORWARD_SIGNAL != 0 && !command_exited) {
+            if (!cancel_forwarded) {
+                std::println("perf run: forwarding signal {} to pgid {}", FORWARD_SIGNAL, target_pgid);
+                (void)ker::process::kill(-target_pgid, FORWARD_SIGNAL);
+                cancel_forwarded = true;
+                cancel_forwarded_ms = LOOP_NOW_MS;
+            } else if (!cancel_escalated) {
+                std::println("perf run: traced group still alive after cancel; sending SIGKILL to pgid {}", target_pgid);
+                (void)ker::process::kill(-target_pgid, SIGKILL);  // NOLINT(misc-include-cleaner)
+                cancel_escalated = true;
+            }
+        }
         if (command_exited || LOOP_NOW_MS - last_proc_scan_ms >= PERF_RUN_PROC_SCAN_INTERVAL_MS) {
             scan_target_group();
+        }
+
+        if (cancel_forwarded && !cancel_escalated && last_group_alive &&
+            LOOP_NOW_MS - cancel_forwarded_ms >= PERF_RUN_CANCEL_KILL_AFTER_MS) {
+            std::println("perf run: traced group still alive after cancel; sending SIGKILL to pgid {}", target_pgid);
+            (void)ker::process::kill(-target_pgid, SIGKILL);  // NOLINT(misc-include-cleaner)
+            cancel_escalated = true;
         }
 
         if (command_exited && !last_group_alive) {
@@ -4520,6 +4592,7 @@ void cmd_run(int argc, char** argv) {
     elapsed_ms = std::max<int64_t>(elapsed_ms, 1);
 
     set_recording_enabled(false);
+    restore_perf_run_signal_handlers(signal_handlers);
     auto after = collect_main_stats();
     std::vector<CpuRow> rows;
 
