@@ -34,6 +34,41 @@ namespace {
 
 constexpr size_t XFS_LOG_STACK_BODY_MAX_BYTES = 4096;
 
+auto xfs_log_serialize_body(const XfsTransItem* items, int item_count, uint8_t* body_buf, size_t body_capacity) -> int {
+    if (items == nullptr || body_buf == nullptr || item_count < 0) {
+        return -EINVAL;
+    }
+
+    size_t pos = 0;
+    for (int i = 0; i < item_count; i++) {
+        if (items[i].type == XfsLogItemType::BUFFER && items[i].buf.dirty) {
+            uint64_t blk = items[i].buf.bp->block_no;
+            uint32_t off = items[i].buf.offset;
+            uint32_t len = items[i].buf.len;
+            size_t const ITEM_BYTES = 8 + 4 + 4 + static_cast<size_t>(len);
+            if (pos > body_capacity || ITEM_BYTES > body_capacity - pos) {
+                return -EOVERFLOW;
+            }
+            __builtin_memcpy(body_buf + pos, &blk, 8);
+            pos += 8;
+            __builtin_memcpy(body_buf + pos, &off, 4);
+            pos += 4;
+            __builtin_memcpy(body_buf + pos, &len, 4);
+            pos += 4;
+            __builtin_memcpy(body_buf + pos, items[i].buf.bp->data + off, len);
+            pos += len;
+        } else if (items[i].type == XfsLogItemType::INODE && items[i].inode.ip != nullptr) {
+            if (pos > body_capacity || 8 > body_capacity - pos) {
+                return -EOVERFLOW;
+            }
+            uint64_t ino = items[i].inode.ip->ino;
+            __builtin_memcpy(body_buf + pos, &ino, 8);
+            pos += 8;
+        }
+    }
+    return 0;
+}
+
 // Scan the log to find head and tail positions.
 // Returns 0 on success, fills head/tail_cycle/block fields in the log struct.
 auto xfs_log_find_head_tail(XfsLog* log) -> int {
@@ -420,6 +455,31 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     uint32_t cur_block = (HEAD + 1) % log->log_blocks;
     uint32_t body_offset = 0;
 
+    if (DATA_BLOCKS == 1) {
+        uint64_t const DATA_DISK_BLOCK = log->log_start + cur_block;
+        BufHead* data_bh = xfs_buf_get(mount, DATA_DISK_BLOCK);
+        if (data_bh == nullptr) {
+            return -EIO;
+        }
+        __builtin_memset(data_bh->data, 0, BLOCK_SIZE);
+        int const SERIALIZE_RC = xfs_log_serialize_body(items, item_count, data_bh->data, BLOCK_SIZE);
+        if (SERIALIZE_RC != 0) {
+            brelse(data_bh);
+            return SERIALIZE_RC;
+        }
+        bdirty(data_bh);
+        brelse(data_bh);
+        cur_block = (cur_block + 1) % log->log_blocks;
+        log->tail_block = HEAD;
+        log->tail_cycle = log->head_cycle;
+        log->head_block = cur_block;
+        if (cur_block < HEAD) {
+            log->head_cycle++;
+        }
+        log->clean = false;
+        return 0;
+    }
+
     if (DATA_BLOCKS != 0 && BLOCK_SIZE > SIZE_MAX / DATA_BLOCKS) {
         return -EOVERFLOW;
     }
@@ -437,26 +497,12 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
         return -ENOMEM;
     }
 
-    // Serialize log items into body buffer
-    uint32_t pos = 0;
-    for (int i = 0; i < item_count; i++) {
-        if (items[i].type == XfsLogItemType::BUFFER && items[i].buf.dirty) {
-            uint64_t blk = items[i].buf.bp->block_no;
-            uint32_t off = items[i].buf.offset;
-            uint32_t len = items[i].buf.len;
-            __builtin_memcpy(body_buf + pos, &blk, 8);
-            pos += 8;
-            __builtin_memcpy(body_buf + pos, &off, 4);
-            pos += 4;
-            __builtin_memcpy(body_buf + pos, &len, 4);
-            pos += 4;
-            __builtin_memcpy(body_buf + pos, items[i].buf.bp->data + off, len);
-            pos += len;
-        } else if (items[i].type == XfsLogItemType::INODE && items[i].inode.ip != nullptr) {
-            uint64_t ino = items[i].inode.ip->ino;
-            __builtin_memcpy(body_buf + pos, &ino, 8);
-            pos += 8;
+    int const SERIALIZE_RC = xfs_log_serialize_body(items, item_count, body_buf, BODY_BUFFER_BYTES);
+    if (SERIALIZE_RC != 0) {
+        if (heap_body_buf) {
+            delete[] body_buf;
         }
+        return SERIALIZE_RC;
     }
 
     // Write body data block by block
