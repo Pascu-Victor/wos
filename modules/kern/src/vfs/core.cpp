@@ -282,6 +282,7 @@ struct StreamFreshnessStamp;
 void stream_detach_file(File* file);
 void stream_invalidate_file(File* file);
 void cache_notify_detach_file(File* file);
+void cache_notify_file_data_changed_impl(File* file);
 void stream_invalidate_identity_locked(const StreamCacheIdentity& identity);
 void stream_gc_locked(uint64_t now_us);
 auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t start_offset, size_t* actual_size, ssize_t* result) -> bool;
@@ -1511,7 +1512,7 @@ auto apply_open_truncation(File* f, int flags) -> int {
 
     int const RET = f->fops->vfs_truncate(f, 0);
     if (RET == 0) {
-        vfs_cache_notify_file_changed(f);
+        cache_notify_file_data_changed_impl(f);
     }
     return RET;
 }
