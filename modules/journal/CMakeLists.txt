@@ -48,7 +48,7 @@ target_link_options(journal_lib PRIVATE
 target_link_libraries(journal_lib PRIVATE c)
 
 add_custom_command(TARGET journal_lib POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${WOS_SYSROOT_LIB_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:journal_lib>" "${WOS_SYSROOT_LIB_DIR}/libjournal.so"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${WOS_STDLIB_LINK_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:journal_lib>" "${WOS_STDLIB_LINK_DIR}/libjournal.so"
     COMMENT "Installing libjournal.so into sysroot"
 )
