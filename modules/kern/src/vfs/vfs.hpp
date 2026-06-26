@@ -242,6 +242,7 @@ auto vfs_selftest_pipe_flags() -> bool;
 auto vfs_selftest_anonymous_fstat_snapshot_hits() -> bool;
 auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool;
 auto vfs_selftest_open_create_metadata_hint() -> bool;
+auto vfs_selftest_fcntl_setfl_preserves_open_policy_flags() -> bool;
 auto vfs_selftest_stream_cache_read_eligibility() -> bool;
 auto vfs_selftest_stream_cache_local_detached_ttl() -> bool;
 auto vfs_selftest_fd_allocation_caps_cloexec_range() -> bool;

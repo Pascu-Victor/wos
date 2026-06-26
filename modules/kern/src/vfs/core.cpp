@@ -276,6 +276,12 @@ auto open_flags_require_fs_write(int flags) -> bool {
     return ACCMODE == 1 || ACCMODE == 2 || (flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0;
 }
 
+auto fcntl_setfl_flags(int current_flags, uint64_t requested_raw) -> int {
+    constexpr int MUTABLE_STATUS_FLAGS = ker::vfs::O_APPEND | O_NONBLOCK;
+    int const REQUESTED_FLAGS = static_cast<int>(requested_raw);
+    return (current_flags & ~MUTABLE_STATUS_FLAGS) | (REQUESTED_FLAGS & MUTABLE_STATUS_FLAGS);
+}
+
 struct StreamCacheIdentity;
 struct StreamFreshnessStamp;
 
@@ -7556,7 +7562,7 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
             return RESULT;
         }
         case 4:  // F_SETFL
-            f->open_flags = static_cast<int>(arg);
+            f->open_flags = fcntl_setfl_flags(f->open_flags, arg);
             vfs_put_file(f);
             return 0;
         case F_GETLK_CMD:
@@ -9092,6 +9098,22 @@ auto vfs_selftest_open_create_metadata_hint() -> bool {
            open_create_should_invalidate_metadata(&unknown_backend, ker::vfs::O_CREAT) &&
            !open_create_should_invalidate_metadata(&existing_file, ker::vfs::O_CREAT) &&
            open_create_should_invalidate_metadata(&created_file, ker::vfs::O_CREAT);
+}
+
+auto vfs_selftest_fcntl_setfl_preserves_open_policy_flags() -> bool {
+    constexpr int IMMUTABLE_FLAGS = 2 | ker::vfs::O_CREAT | ker::vfs::O_TRUNC | ker::vfs::O_DIRECTORY | ker::vfs::O_CLOEXEC |
+                                    ker::vfs::O_NOTIFY_CACHE_CHANGE | ker::vfs::O_NO_CACHE | ker::vfs::O_LOCAL | ker::vfs::O_ALWAYS_CACHE;
+    int const NONBLOCK_ONLY = fcntl_setfl_flags(IMMUTABLE_FLAGS | ker::vfs::O_APPEND, O_NONBLOCK);
+    bool ok = (NONBLOCK_ONLY & IMMUTABLE_FLAGS) == IMMUTABLE_FLAGS && (NONBLOCK_ONLY & O_NONBLOCK) != 0 &&
+              (NONBLOCK_ONLY & ker::vfs::O_APPEND) == 0;
+
+    int const APPEND_ONLY = fcntl_setfl_flags(NONBLOCK_ONLY, ker::vfs::O_APPEND);
+    ok = ok && (APPEND_ONLY & IMMUTABLE_FLAGS) == IMMUTABLE_FLAGS && (APPEND_ONLY & ker::vfs::O_APPEND) != 0 &&
+         (APPEND_ONLY & O_NONBLOCK) == 0;
+
+    int const STATUS_CLEARED = fcntl_setfl_flags(APPEND_ONLY, 0);
+    return ok && (STATUS_CLEARED & IMMUTABLE_FLAGS) == IMMUTABLE_FLAGS && (STATUS_CLEARED & ker::vfs::O_APPEND) == 0 &&
+           (STATUS_CLEARED & O_NONBLOCK) == 0;
 }
 
 auto vfs_selftest_stream_cache_read_eligibility() -> bool {
