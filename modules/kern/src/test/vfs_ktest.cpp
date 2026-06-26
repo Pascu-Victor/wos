@@ -37,6 +37,10 @@ KTEST(VFS, FilePathStorage) { KEXPECT_TRUE(ker::vfs::vfs_selftest_file_path_stor
 
 KTEST(VFS, FileDataWriteInvalidatesPathStat) { KEXPECT_TRUE(ker::vfs::vfs_selftest_file_data_write_invalidates_path_stat()); }
 
+KTEST(VFS, FileDataWriteSkipsUncachedPathInvalidation) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_file_data_write_skips_uncached_path_invalidation());
+}
+
 KTEST(VFS, FileMetadataChangeInvalidatesPathStat) { KEXPECT_TRUE(ker::vfs::vfs_selftest_file_metadata_change_invalidates_path_stat()); }
 
 KTEST(VFS, OpenCreateMetadataHint) { KEXPECT_TRUE(ker::vfs::vfs_selftest_open_create_metadata_hint()); }

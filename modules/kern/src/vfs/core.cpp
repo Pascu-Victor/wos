@@ -987,6 +987,50 @@ auto metadata_cache_note_exact_path_changed(const char* path) -> bool {
     return true;
 }
 
+auto metadata_cache_has_path_variant(const char* path, size_t path_len, FSType fs_type, uint64_t dev_id, bool follow_final_symlink,
+                                     bool require_directory) -> bool {
+    uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
+    uint64_t const HASH = metadata_hash_path(path, path_len, follow_final_symlink, require_directory, fs_type, dev_id);
+    auto& set = g_metadata_cache[HASH & (METADATA_CACHE_SET_COUNT - 1)];
+
+    ker::mod::sys::MutexGuard guard(set.lock);
+    for (auto& entry : set.ways) {
+        if (!entry.valid || entry.epoch != EPOCH || entry.hash != HASH || entry.path_len != path_len || entry.fs_type != fs_type ||
+            entry.dev_id != dev_id || entry.follow_final_symlink != follow_final_symlink || entry.require_directory != require_directory) {
+            continue;
+        }
+        if (std::memcmp(entry.path.data(), path, path_len + 1) != 0) {
+            continue;
+        }
+        if (metadata_path_invalidated_since(entry.path.data(), entry.path_len, entry.invalidation_generation)) {
+            entry.valid = false;
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+auto metadata_cache_has_file_data_observation(File* file) -> bool {
+    if (file == nullptr || file->vfs_path == nullptr) {
+        return true;
+    }
+
+    size_t const PATH_LEN = metadata_normalized_path_len(file->vfs_path);
+    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
+        return true;
+    }
+
+    MountRef mount_ref = find_mount_point(file->vfs_path);
+    MountPoint const* mount = mount_ref.get();
+    if (mount == nullptr || !metadata_cacheable_fs(mount->fs_type)) {
+        return true;
+    }
+
+    return metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, mount->fs_type, mount->dev_id, true, false) ||
+           metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, mount->fs_type, mount->dev_id, false, false);
+}
+
 void metadata_cache_note_file_data_changed(File* file) {
     if (file == nullptr || file->vfs_path == nullptr || !metadata_cacheable_fs(file->fs_type)) {
         return;
@@ -994,6 +1038,10 @@ void metadata_cache_note_file_data_changed(File* file) {
 
     uint64_t const OBSERVED_EPOCH = g_metadata_observation_epoch.load(std::memory_order_acquire);
     if (file->metadata_data_invalidation_observation_epoch == OBSERVED_EPOCH) {
+        return;
+    }
+    if (!metadata_cache_has_file_data_observation(file)) {
+        file->metadata_data_invalidation_observation_epoch = OBSERVED_EPOCH;
         return;
     }
 
@@ -9235,6 +9283,55 @@ auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool {
     cache_notify_file_data_changed_impl(file);
 
     ok = ok && vfs_stat(PATH, &st) == 0 && st.st_size == static_cast<off_t>((sizeof(FIRST) - 1) + (sizeof(SECOND) - 1));
+
+    vfs_put_file(file);
+    ok = ok && vfs_unlink(PATH) == 0;
+    return ok;
+}
+
+auto vfs_selftest_file_data_write_skips_uncached_path_invalidation() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_file_data_uncached_path_invalidation";
+    constexpr const char* UNRELATED = "/tmp/ktest_file_data_unrelated_missing_observation";
+    constexpr char FIRST[] = "abc";
+    constexpr char SECOND[] = "def";
+    constexpr char THIRD[] = "ghi";
+    vfs_unlink(PATH);
+
+    auto* file = vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (file == nullptr || file->fops == nullptr || file->fops->vfs_write == nullptr) {
+        return false;
+    }
+
+    bool ok = file->fops->vfs_write(file, FIRST, sizeof(FIRST) - 1, 0) == static_cast<ssize_t>(sizeof(FIRST) - 1);
+    cache_notify_file_data_changed_impl(file);
+
+    VfsCachePerfSnapshot before_unrelated{};
+    VfsCachePerfSnapshot after_unrelated{};
+    VfsCachePerfSnapshot after_uncached_write{};
+    Stat st{};
+    vfs_get_cache_perf_snapshot(before_unrelated);
+    metadata_cache_store(UNRELATED, FSType::TMPFS, 0, true, false, -ENOENT, nullptr);
+    vfs_get_cache_perf_snapshot(after_unrelated);
+    ok = ok && after_unrelated.metadata_stores > before_unrelated.metadata_stores;
+
+    constexpr size_t SECOND_OFFSET = sizeof(FIRST) - 1;
+    ok = ok && file->fops->vfs_write(file, SECOND, sizeof(SECOND) - 1, SECOND_OFFSET) == static_cast<ssize_t>(sizeof(SECOND) - 1);
+    cache_notify_file_data_changed_impl(file);
+    vfs_get_cache_perf_snapshot(after_uncached_write);
+    ok = ok && after_uncached_write.metadata_path_invalidations == after_unrelated.metadata_path_invalidations;
+
+    VfsCachePerfSnapshot after_path_stat{};
+    VfsCachePerfSnapshot after_cached_write{};
+    ok = ok && vfs_stat(PATH, &st) == 0 && st.st_size == static_cast<off_t>((sizeof(FIRST) - 1) + (sizeof(SECOND) - 1));
+    vfs_get_cache_perf_snapshot(after_path_stat);
+
+    constexpr size_t THIRD_OFFSET = SECOND_OFFSET + sizeof(SECOND) - 1;
+    ok = ok && file->fops->vfs_write(file, THIRD, sizeof(THIRD) - 1, THIRD_OFFSET) == static_cast<ssize_t>(sizeof(THIRD) - 1);
+    cache_notify_file_data_changed_impl(file);
+    vfs_get_cache_perf_snapshot(after_cached_write);
+    ok = ok && after_cached_write.metadata_path_invalidations > after_path_stat.metadata_path_invalidations;
 
     vfs_put_file(file);
     ok = ok && vfs_unlink(PATH) == 0;

@@ -243,6 +243,7 @@ auto vfs_selftest_anonymous_fstat_snapshot_hits() -> bool;
 auto vfs_selftest_remote_fstat_snapshot_cacheable() -> bool;
 auto vfs_selftest_file_path_storage() -> bool;
 auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool;
+auto vfs_selftest_file_data_write_skips_uncached_path_invalidation() -> bool;
 auto vfs_selftest_file_metadata_change_invalidates_path_stat() -> bool;
 auto vfs_selftest_open_create_metadata_hint() -> bool;
 auto vfs_selftest_fcntl_setfl_preserves_open_policy_flags() -> bool;
