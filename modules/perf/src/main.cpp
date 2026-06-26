@@ -922,6 +922,12 @@ auto collect_stats() -> std::vector<StatInfo> {
     return stats;
 }
 
+auto collect_main_stats() -> std::vector<StatInfo> {
+    std::vector<StatInfo> stats;
+    for_each_process_main_stat([&](const StatInfo& info, std::string_view) { stats.push_back(info); });
+    return stats;
+}
+
 auto read_cmdline(uint64_t pid) -> std::string {
     auto raw = read_file(build_proc_path(pid, PROC_CMDLINE_SUFFIX), PROC_READ_CAPACITY);
     if (!raw.has_value() || raw->empty()) {
@@ -4402,7 +4408,7 @@ void cmd_run(int argc, char** argv) {
     char* const* exec_argv = new_argv.data();
     const char* exec_path = exec_argv[0];
 
-    auto before = collect_stats();
+    auto before = collect_main_stats();
     int64_t const START_MS = now_ms();
     set_recording_enabled(true, filter);
 
@@ -4514,7 +4520,7 @@ void cmd_run(int argc, char** argv) {
     elapsed_ms = std::max<int64_t>(elapsed_ms, 1);
 
     set_recording_enabled(false);
-    auto after = collect_stats();
+    auto after = collect_main_stats();
     std::vector<CpuRow> rows;
 
     for (const auto& proc : tracked) {
@@ -4608,7 +4614,7 @@ void cmd_run(int argc, char** argv) {
         write_section_peer_map(data_fd.get());
         write_all(data_fd.get(), SECTION_PROC_MAP);
 
-        for_each_process_stat([&](const StatInfo& stat, std::string_view) {
+        for_each_process_main_stat([&](const StatInfo& stat, std::string_view) {
             write_all(data_fd.get(), proc_map_line(stat.pid, stat.comm, read_cmdline(stat.pid)));
         });
 
