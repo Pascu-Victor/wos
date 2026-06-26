@@ -246,6 +246,7 @@ constexpr size_t DIRTY_HARD_LIMIT_TARGET_MULTIPLIER = 2;
 constexpr size_t DIRTY_WRITEBACK_BUDGET = 1024;
 constexpr size_t DIRTY_WRITEBACK_YIELD_BYTES = size_t{16} * 1024 * 1024;
 constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = DIRTY_WRITEBACK_BUDGET;
+constexpr size_t DIRTY_HARD_FALLBACK_BYTES = DIRTY_WRITEBACK_YIELD_BYTES;
 constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BUFFERS = 1024;
 constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BYTES = size_t{16} * 1024 * 1024;
 constexpr size_t DIRTY_WAKE_BATCH = 32;
@@ -1899,16 +1900,18 @@ auto writeback_dirty_one_after(const DirtyWritebackFilter& filter, uint64_t min_
 
 auto writeback_dirty_one(const DirtyWritebackFilter& filter) -> DirtyWritebackResult { return writeback_dirty_one_after(filter, 0); }
 
-auto writeback_dirty_budgeted(const DirtyWritebackFilter& filter, size_t budget) -> int {
+auto writeback_dirty_budgeted(const DirtyWritebackFilter& filter, size_t buffer_budget, size_t byte_budget) -> int {
     int result = 0;
     uint64_t min_epoch = 0;
     uint64_t const MAX_EPOCH = max_matching_dirty_epoch(filter);
     size_t written_buffers = 0;
-    while (written_buffers < budget) {
+    size_t written_bytes = 0;
+    while (written_buffers < buffer_budget && written_bytes < byte_budget) {
         DirtyWritebackResult const WB = writeback_dirty_one_after(filter, min_epoch, MAX_EPOCH);
         if (WB.wrote) {
             min_epoch = WB.dirty_epoch;
             written_buffers += std::max(WB.buffers, static_cast<size_t>(1));
+            written_bytes += WB.bytes;
             if (WB.status != 0) {
                 result = WB.status;
             }
@@ -2710,7 +2713,7 @@ void throttle_dirty_buffer_cache(dev::BlockDevice* bdev) {
             continue;
         }
 
-        static_cast<void>(writeback_dirty_budgeted(fallback_filter, DIRTY_HARD_FALLBACK_BUDGET));
+        static_cast<void>(writeback_dirty_budgeted(fallback_filter, DIRTY_HARD_FALLBACK_BUDGET, DIRTY_HARD_FALLBACK_BYTES));
         ker::mod::sched::kern_yield();
     }
 }
