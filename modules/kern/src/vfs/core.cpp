@@ -94,11 +94,11 @@ constexpr size_t PIPE_WAKE_BATCH = 32;
 constexpr size_t PIPE_DEFAULT_CAPACITY = 256UL * 1024UL;
 constexpr size_t PIPE_DIRECT_MAX_CAPACITY = 256UL * 1024UL;
 constexpr uint64_t ADVISORY_RANGE_EOF = UINT64_MAX;
-// CMake/Ninja tree scans touch enough distinct paths that the old 1024-entry
-// metadata cache thrashed mostly on set conflicts. Keep this static and bounded:
-// 65536 entries is still modest compared with guest memory while covering large
-// checkout/configure/build metadata working sets much better.
-constexpr size_t METADATA_CACHE_SET_COUNT = 8192;
+// CMake/Ninja tree scans touch enough distinct paths that small metadata caches
+// thrash mostly on set conflicts. Keep this static and bounded: 131072 entries
+// gives LLVM-sized checkout/configure/build scans enough room without increasing
+// the per-lookup way scan.
+constexpr size_t METADATA_CACHE_SET_COUNT = 16384;
 constexpr size_t METADATA_CACHE_WAYS = 8;
 constexpr size_t METADATA_INVALIDATION_SET_COUNT = 8192;
 constexpr size_t METADATA_INVALIDATION_WAYS = 4;
