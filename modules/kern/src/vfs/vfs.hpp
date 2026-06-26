@@ -172,6 +172,10 @@ struct VfsCachePerfSnapshot {
     uint64_t fstat_snapshot_misses{};
     uint64_t fstat_snapshot_stores{};
     uint64_t fstat_snapshot_miss_uncacheable{};
+    uint64_t fstat_snapshot_miss_bad_args{};
+    uint64_t fstat_snapshot_miss_no_cache{};
+    uint64_t fstat_snapshot_miss_pathless{};
+    uint64_t fstat_snapshot_miss_fs{};
     uint64_t fstat_snapshot_miss_empty{};
     uint64_t fstat_snapshot_miss_generation{};
     uint64_t fstat_snapshot_miss_invalidated{};

@@ -269,6 +269,10 @@ std::atomic<uint64_t> g_vfs_fstat_snapshot_hits{0};
 std::atomic<uint64_t> g_vfs_fstat_snapshot_misses{0};
 std::atomic<uint64_t> g_vfs_fstat_snapshot_stores{0};
 std::atomic<uint64_t> g_vfs_fstat_snapshot_miss_uncacheable{0};
+std::atomic<uint64_t> g_vfs_fstat_snapshot_miss_bad_args{0};
+std::atomic<uint64_t> g_vfs_fstat_snapshot_miss_no_cache{0};
+std::atomic<uint64_t> g_vfs_fstat_snapshot_miss_pathless{0};
+std::atomic<uint64_t> g_vfs_fstat_snapshot_miss_fs{0};
 std::atomic<uint64_t> g_vfs_fstat_snapshot_miss_empty{0};
 std::atomic<uint64_t> g_vfs_fstat_snapshot_miss_generation{0};
 std::atomic<uint64_t> g_vfs_fstat_snapshot_miss_invalidated{0};
@@ -1093,6 +1097,23 @@ auto file_stat_snapshot_cacheable(const File* file) -> bool {
     return file_stat_snapshot_path_cacheable_fs(file->fs_type);
 }
 
+void file_stat_snapshot_record_uncacheable_miss(const File* file, const Stat* statbuf) {
+    g_vfs_fstat_snapshot_miss_uncacheable.fetch_add(1, std::memory_order_relaxed);
+    if (file == nullptr || statbuf == nullptr) {
+        g_vfs_fstat_snapshot_miss_bad_args.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if ((file->open_flags & ker::vfs::O_NO_CACHE) != 0) {
+        g_vfs_fstat_snapshot_miss_no_cache.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (file->vfs_path == nullptr) {
+        g_vfs_fstat_snapshot_miss_pathless.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_vfs_fstat_snapshot_miss_fs.fetch_add(1, std::memory_order_relaxed);
+}
+
 auto file_stat_snapshot_prefetchable(const File* file) -> bool {
     if (!file_stat_snapshot_cacheable(file)) {
         return false;
@@ -1193,7 +1214,7 @@ auto file_stat_snapshot_current(File* file) -> bool {
 
 auto file_stat_snapshot_lookup(File* file, Stat* statbuf) -> bool {
     if (file == nullptr || statbuf == nullptr || !file_stat_snapshot_cacheable(file)) {
-        g_vfs_fstat_snapshot_miss_uncacheable.fetch_add(1, std::memory_order_relaxed);
+        file_stat_snapshot_record_uncacheable_miss(file, statbuf);
         g_vfs_fstat_snapshot_misses.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -5972,6 +5993,10 @@ void vfs_get_cache_perf_snapshot(VfsCachePerfSnapshot& out) {
     out.fstat_snapshot_misses = g_vfs_fstat_snapshot_misses.load(std::memory_order_relaxed);
     out.fstat_snapshot_stores = g_vfs_fstat_snapshot_stores.load(std::memory_order_relaxed);
     out.fstat_snapshot_miss_uncacheable = g_vfs_fstat_snapshot_miss_uncacheable.load(std::memory_order_relaxed);
+    out.fstat_snapshot_miss_bad_args = g_vfs_fstat_snapshot_miss_bad_args.load(std::memory_order_relaxed);
+    out.fstat_snapshot_miss_no_cache = g_vfs_fstat_snapshot_miss_no_cache.load(std::memory_order_relaxed);
+    out.fstat_snapshot_miss_pathless = g_vfs_fstat_snapshot_miss_pathless.load(std::memory_order_relaxed);
+    out.fstat_snapshot_miss_fs = g_vfs_fstat_snapshot_miss_fs.load(std::memory_order_relaxed);
     out.fstat_snapshot_miss_empty = g_vfs_fstat_snapshot_miss_empty.load(std::memory_order_relaxed);
     out.fstat_snapshot_miss_generation = g_vfs_fstat_snapshot_miss_generation.load(std::memory_order_relaxed);
     out.fstat_snapshot_miss_invalidated = g_vfs_fstat_snapshot_miss_invalidated.load(std::memory_order_relaxed);

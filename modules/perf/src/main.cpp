@@ -3948,6 +3948,9 @@ void print_checkout_cache_state() {
         std::println("vfs_fstat_miss: uncacheable={} empty={} generation={} invalidated={}",
                      get_row_u64(*vfs_cache, "fstat_snapshot_miss_uncacheable"), get_row_u64(*vfs_cache, "fstat_snapshot_miss_empty"),
                      get_row_u64(*vfs_cache, "fstat_snapshot_miss_generation"), get_row_u64(*vfs_cache, "fstat_snapshot_miss_invalidated"));
+        std::println("vfs_fstat_uncacheable: bad_args={} no_cache={} pathless={} fs={}",
+                     get_row_u64(*vfs_cache, "fstat_snapshot_miss_bad_args"), get_row_u64(*vfs_cache, "fstat_snapshot_miss_no_cache"),
+                     get_row_u64(*vfs_cache, "fstat_snapshot_miss_pathless"), get_row_u64(*vfs_cache, "fstat_snapshot_miss_fs"));
         std::println("vfs_stream: hits={} misses={} backend_reads={} backend={} copied={} invalidate_empty_skips={}",
                      get_row_u64(*vfs_cache, "stream_hits"), get_row_u64(*vfs_cache, "stream_misses"),
                      get_row_u64(*vfs_cache, "stream_backend_reads"), format_scaled_bytes(get_row_u64(*vfs_cache, "stream_backend_bytes")),

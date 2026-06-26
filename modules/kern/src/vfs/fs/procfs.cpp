@@ -2440,6 +2440,10 @@ auto generate_memacc_alloc_totals(char* buf, size_t bufsz) -> size_t {
     append_memacc_dec(p, end, "fstat_snapshot_misses", vfs_cache.fstat_snapshot_misses);
     append_memacc_dec(p, end, "fstat_snapshot_stores", vfs_cache.fstat_snapshot_stores);
     append_memacc_dec(p, end, "fstat_snapshot_miss_uncacheable", vfs_cache.fstat_snapshot_miss_uncacheable);
+    append_memacc_dec(p, end, "fstat_snapshot_miss_bad_args", vfs_cache.fstat_snapshot_miss_bad_args);
+    append_memacc_dec(p, end, "fstat_snapshot_miss_no_cache", vfs_cache.fstat_snapshot_miss_no_cache);
+    append_memacc_dec(p, end, "fstat_snapshot_miss_pathless", vfs_cache.fstat_snapshot_miss_pathless);
+    append_memacc_dec(p, end, "fstat_snapshot_miss_fs", vfs_cache.fstat_snapshot_miss_fs);
     append_memacc_dec(p, end, "fstat_snapshot_miss_empty", vfs_cache.fstat_snapshot_miss_empty);
     append_memacc_dec(p, end, "fstat_snapshot_miss_generation", vfs_cache.fstat_snapshot_miss_generation);
     append_memacc_dec(p, end, "fstat_snapshot_miss_invalidated", vfs_cache.fstat_snapshot_miss_invalidated);
