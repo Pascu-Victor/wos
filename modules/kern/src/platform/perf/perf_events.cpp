@@ -280,6 +280,15 @@ auto wki_should_record(uint16_t mask, WkiPerfScope scope, uint8_t op) -> bool {
     }
 }
 
+auto container_stat_should_record_event(PerfSubsystem subsystem, uint8_t flags) -> bool {
+    if (subsystem != PerfSubsystem::FD_TABLE) {
+        return true;
+    }
+
+    constexpr uint8_t FD_TABLE_DETAIL_FLAGS = PERF_FLAG_CT_RESIZE | PERF_FLAG_CT_OOM | PERF_FLAG_CT_SPILL | PERF_FLAG_CT_LOOKUP;
+    return (flags & FD_TABLE_DETAIL_FLAGS) != 0;
+}
+
 }  // namespace
 
 const char* subsystem_name(PerfSubsystem s) {
@@ -993,6 +1002,9 @@ void record_container_stat(uint32_t cpu, uint64_t pid, PerfSubsystem subsystem, 
     bool const DO_RECORD = g_enabled.load(std::memory_order_acquire) && ((mask & PERF_MASK_CONTAINER) != 0);
 
     if (!DO_RECORD) {
+        return;
+    }
+    if (!container_stat_should_record_event(subsystem, flags)) {
         return;
     }
 
