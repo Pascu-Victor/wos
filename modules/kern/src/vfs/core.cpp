@@ -1313,6 +1313,18 @@ void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, boo
     g_vfs_metadata_stores.fetch_add(1, std::memory_order_relaxed);
 }
 
+auto metadata_cache_proves_final_not_symlink(const char* path, FSType fs_type, uint64_t dev_id) -> bool {
+    Stat cached{};
+    int const CACHED_RESULT = metadata_cache_lookup(path, fs_type, dev_id, false, false, &cached, false);
+    if (CACHED_RESULT == -ENOENT) {
+        return true;
+    }
+    if (CACHED_RESULT != 0) {
+        return false;
+    }
+    return (cached.st_mode & static_cast<mode_t>(S_IFMT)) != static_cast<mode_t>(S_IFLNK);
+}
+
 auto symlink_hash_path(const char* path, size_t len, FSType fs_type, uint64_t dev_id) -> uint64_t {
     uint64_t hash = 1469598103934665603ULL;
     for (size_t i = 0; i < len; ++i) {
@@ -4618,16 +4630,20 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     MountPoint const* mount = mount_ref.get();
     bool const REMOTE_MOUNT = (mount != nullptr && mount->fs_type == FSType::REMOTE);
 
+    bool const SKIP_FINAL_SYMLINK_PROBE = mount != nullptr && !REMOTE_MOUNT && !PATH_REQUIRES_DIRECTORY && !FLAGS_REQUIRE_DIRECTORY &&
+                                          metadata_cache_proves_final_not_symlink(path_buffer.data(), mount->fs_type, mount->dev_id);
+
     if (!REMOTE_MOUNT) {
-        char resolved[MAX_PATH_LEN];  // NOLINT
-        int const RESOLVE_RET = resolve_symlinks(path_buffer.data(), resolved, MAX_PATH_LEN, !OPEN_LOCAL);
+        std::array<char, MAX_PATH_LEN> resolved{};
+        int const RESOLVE_RET =
+            resolve_symlinks(path_buffer.data(), resolved.data(), resolved.size(), !OPEN_LOCAL, !SKIP_FINAL_SYMLINK_PROBE);
         if (RESOLVE_RET == -ELOOP) {
             log::warn("vfs_open: too many symlink levels");
             return -ELOOP;
         }
         if (RESOLVE_RET == 0) {
             // Use the resolved path
-            std::memcpy(path_buffer.data(), resolved, MAX_PATH_LEN);
+            std::memcpy(path_buffer.data(), resolved.data(), resolved.size());
         }
         log_loader_path_event("symlink-resolved", raw_path.data(), path_buffer.data(), nullptr, RESOLVE_RET);
     } else {
