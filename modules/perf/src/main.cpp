@@ -63,6 +63,7 @@ constexpr int64_t NANOSECONDS_PER_MICROSECOND = 1000;
 constexpr int64_t NANOSECONDS_PER_MILLISECOND = 1000000;
 constexpr int64_t NANOSECONDS_PER_SECOND = 1000000000;
 constexpr int SLEEP_SLICE_MS = 10;
+constexpr int PERF_RUN_PROC_SCAN_INTERVAL_MS = 100;
 constexpr int PARSE_BASE_DECIMAL = 10;
 constexpr int PROC_STAT_SKIP_FIELDS = 8;
 constexpr int PROC_WAIT_NOHANG = 1;
@@ -4438,6 +4439,24 @@ void cmd_run(int argc, char** argv) {
     int64_t last_drain_ms = now_ms();
     ssize_t total_event_bytes = 0;
     bool command_exited = false;
+    bool last_group_alive = false;
+    int64_t last_proc_scan_ms = 0;
+
+    auto scan_target_group = [&]() {
+        bool any_alive = false;
+        for_each_process_stat([&](const StatInfo& stat, std::string_view) {
+            if (std::cmp_equal(stat.pgid, target_pgid)) {
+                upsert_tracked(stat);
+                if (stat.state != EXITED_STATE) {
+                    any_alive = true;
+                }
+            }
+        });
+        last_group_alive = any_alive;
+        last_proc_scan_ms = now_ms();
+    };
+
+    scan_target_group();
 
     for (;;) {
         for (;;) {
@@ -4450,17 +4469,12 @@ void cmd_run(int argc, char** argv) {
             }
         }
 
-        bool any_alive = false;
-        for_each_process_stat([&](const StatInfo& stat, std::string_view) {
-            if (std::cmp_equal(stat.pgid, target_pgid)) {
-                upsert_tracked(stat);
-                if (stat.state != EXITED_STATE) {
-                    any_alive = true;
-                }
-            }
-        });
+        int64_t const LOOP_NOW_MS = now_ms();
+        if (command_exited || LOOP_NOW_MS - last_proc_scan_ms >= PERF_RUN_PROC_SCAN_INTERVAL_MS) {
+            scan_target_group();
+        }
 
-        if (command_exited && !any_alive) {
+        if (command_exited && !last_group_alive) {
             break;
         }
 
