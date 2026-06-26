@@ -2362,7 +2362,7 @@ auto stream_scope_key_for_mount(const MountPoint* mount) -> const void* {
     if (mount == nullptr) {
         return nullptr;
     }
-    if (mount->fs_type == FSType::REMOTE) {
+    if (mount->fs_type == FSType::REMOTE || mount->fs_type == FSType::XFS) {
         return mount->private_data;
     }
     return mount;
@@ -2465,12 +2465,6 @@ auto stream_build_identity(File* file, const Stat& statbuf, StreamCacheIdentity*
         return -EINVAL;
     }
 
-    auto mount_ref = find_mount_point(file->vfs_path);
-    MountPoint const* mount = mount_ref.get();
-    if (mount == nullptr) {
-        return -ENOENT;
-    }
-
     const auto MODE = static_cast<mode_t>(statbuf.st_mode & S_IFMT);
     if (MODE != S_IFREG) {
         return -ENOTSUP;
@@ -2479,36 +2473,54 @@ auto stream_build_identity(File* file, const Stat& statbuf, StreamCacheIdentity*
         return -EACCES;
     }
 
-    identity->scope_key = stream_scope_key_for_mount(mount);
-    identity->fs_type = mount->fs_type;
-    identity->ino = statbuf.st_ino;
+    FSType identity_fs_type = file->fs_type;
+    const void* scope_key = nullptr;
     identity->remote_path_hash = 0;
     identity->remote_owner_node = 0;
     identity->remote_resource_id = 0;
 
-    if (mount->fs_type == FSType::REMOTE) {
-        const char* fs_path = strip_mount_prefix(mount, file->vfs_path);
-        identity->remote_path_hash = stream_hash_path(fs_path);
-        auto const* state = static_cast<const ker::net::wki::ProxyVfsState*>(mount->private_data);
-        if (state != nullptr) {
-            identity->remote_owner_node = state->owner_node;
-            identity->remote_resource_id = state->resource_id;
+    if (file->fs_type == FSType::XFS) {
+        scope_key = ker::vfs::xfs::xfs_file_mount_context(file);
+        if (scope_key == nullptr) {
+            return -ENOSYS;
+        }
+    } else {
+        auto mount_ref = find_mount_point(file->vfs_path);
+        MountPoint const* mount = mount_ref.get();
+        if (mount == nullptr) {
+            return -ENOENT;
+        }
+        identity_fs_type = mount->fs_type;
+        scope_key = stream_scope_key_for_mount(mount);
+
+        if (mount->fs_type == FSType::REMOTE) {
+            const char* fs_path = strip_mount_prefix(mount, file->vfs_path);
+            identity->remote_path_hash = stream_hash_path(fs_path);
+            auto const* state = static_cast<const ker::net::wki::ProxyVfsState*>(mount->private_data);
+            if (state != nullptr) {
+                identity->remote_owner_node = state->owner_node;
+                identity->remote_resource_id = state->resource_id;
+            }
         }
     }
+
+    identity->scope_key = scope_key;
+    identity->fs_type = identity_fs_type;
+    identity->ino = statbuf.st_ino;
 
     bool const REMOTE_IDENTITY_VALID =
         identity->remote_path_hash != 0 &&
         ((identity->remote_owner_node != 0 && identity->remote_resource_id != 0) || identity->scope_key != nullptr);
     bool const LOCAL_IDENTITY_VALID = identity->scope_key != nullptr && identity->ino != 0;
-    bool const IDENTITY_VALID = (mount->fs_type == FSType::REMOTE) ? REMOTE_IDENTITY_VALID : LOCAL_IDENTITY_VALID;
+    bool const IDENTITY_VALID = (identity_fs_type == FSType::REMOTE) ? REMOTE_IDENTITY_VALID : LOCAL_IDENTITY_VALID;
     if (!IDENTITY_VALID) {
         return -ENOSYS;
     }
 
-    bool const HAS_REUSABLE_FRESHNESS = (mount->fs_type == FSType::REMOTE) ? statbuf.st_size > 0 : stream_stat_has_freshness(statbuf);
+    bool const HAS_REUSABLE_FRESHNESS = (identity_fs_type == FSType::REMOTE) ? statbuf.st_size > 0 : stream_stat_has_freshness(statbuf);
 
     if (stamp != nullptr) {
-        *stamp = stream_capture_freshness(statbuf, mount->fs_type);
+        *stamp = stream_capture_freshness(statbuf, identity_fs_type);
     }
     if (can_reuse_detached != nullptr) {
         *can_reuse_detached = HAS_REUSABLE_FRESHNESS;

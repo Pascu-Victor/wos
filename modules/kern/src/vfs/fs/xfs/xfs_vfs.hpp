@@ -35,6 +35,9 @@ auto xfs_stat(const char* fs_path, ker::vfs::Stat* statbuf, XfsMountContext* ctx
 // Fstat an open file descriptor.
 auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int;
 
+// Return the mount context backing an open XFS file.
+auto xfs_file_mount_context(File* f) -> XfsMountContext*;
+
 // Atomically append to an open file and return the starting append offset.
 auto xfs_write_append(File* f, const void* buf, size_t count, size_t* offset_out) -> ssize_t;
 

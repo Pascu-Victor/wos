@@ -2153,6 +2153,14 @@ auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int {
     return 0;
 }
 
+auto xfs_file_mount_context(File* f) -> XfsMountContext* {
+    if (f == nullptr) {
+        return nullptr;
+    }
+    auto* xfd = static_cast<XfsFileData*>(f->private_data);
+    return xfd != nullptr ? xfd->mount : nullptr;
+}
+
 auto xfs_statvfs(XfsMountContext* ctx, ker::vfs::Statvfs* buf) -> int {
     if (ctx == nullptr || buf == nullptr) {
         return -EINVAL;
