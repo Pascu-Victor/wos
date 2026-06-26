@@ -1022,7 +1022,7 @@ auto file_stat_snapshot_anonymous_cacheable(const File* file) -> bool {
     if (file == nullptr || file->vfs_path != nullptr || (file->open_flags & ker::vfs::O_NO_CACHE) != 0) {
         return false;
     }
-    return file->fs_type == FSType::SOCKET ||
+    return file->fs_type == FSType::SOCKET || file->fs_type == FSType::DEVFS ||
            (file->fs_type == FSType::TMPFS && file->fops != nullptr && file->fops != ker::vfs::tmpfs::get_tmpfs_fops());
 }
 
@@ -9044,6 +9044,25 @@ auto vfs_selftest_anonymous_fstat_snapshot_hits() -> bool {
 
     ok = ok && after_first.fstat_snapshot_stores > before.fstat_snapshot_stores &&
          after_second.fstat_snapshot_hits > after_first.fstat_snapshot_hits;
+
+    auto* devfs_file = ker::vfs::devfs::devfs_open_path("/dev", 0, 0);
+    ok = ok && devfs_file != nullptr && devfs_file->vfs_path == nullptr;
+    if (devfs_file != nullptr) {
+        VfsCachePerfSnapshot before_devfs{};
+        VfsCachePerfSnapshot after_devfs_first{};
+        VfsCachePerfSnapshot after_devfs_second{};
+        vfs_get_cache_perf_snapshot(before_devfs);
+
+        ok = ok && vfs_fstat_file(devfs_file, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFDIR);
+        vfs_get_cache_perf_snapshot(after_devfs_first);
+
+        ok = ok && vfs_fstat_file(devfs_file, &st) == 0;
+        vfs_get_cache_perf_snapshot(after_devfs_second);
+
+        ok = ok && after_devfs_first.fstat_snapshot_stores > before_devfs.fstat_snapshot_stores &&
+             after_devfs_second.fstat_snapshot_hits > after_devfs_first.fstat_snapshot_hits;
+        vfs_put_file(devfs_file);
+    }
 
     bool const CLOSED_READ = pipefd[0] >= 0 && pipe_close_fake_task_fd(task, pipefd[0]);
     bool const CLOSED_WRITE = pipefd[1] >= 0 && pipe_close_fake_task_fd(task, pipefd[1]);
