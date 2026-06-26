@@ -51,7 +51,7 @@ using log = ker::mod::dbg::logger<"xfs">;
 namespace {
 
 constexpr uint32_t XFS_SLOW_TRACE_US = 2048;
-constexpr size_t XFS_DIRECT_READ_MIN_BYTES = size_t{64} * 1024;
+constexpr size_t XFS_DIRECT_READ_MIN_BYTES = size_t{4} * 1024;
 constexpr size_t XFS_DIRECT_READ_BATCH_MAX_BYTES = size_t{1024} * 1024;
 constexpr uint64_t XFS_NSEC_PER_SEC = 1000000000ULL;
 constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
