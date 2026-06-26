@@ -28,7 +28,7 @@ set_target_properties(${TARGET} PROPERTIES LINK_OPTIONS "")
 target_link_options(${TARGET} PRIVATE
     "--sysroot=${CMAKE_SYSROOT}"
     "-fuse-ld=lld"
-    "-L${CMAKE_SYSROOT}/lib"
+    "-L${WOS_SYSROOT_LIB_DIR}"
     "-static"
     "-Wl,--no-pie"
     "-mcmodel=small"

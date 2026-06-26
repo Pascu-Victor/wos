@@ -35,7 +35,7 @@ set_target_properties(httpd PROPERTIES LINK_OPTIONS "")
 target_link_options(httpd PRIVATE
     "--sysroot=${CMAKE_SYSROOT}"
     "-fuse-ld=lld"
-    "-L${CMAKE_SYSROOT}/lib"
+    "-L${WOS_SYSROOT_LIB_DIR}"
     "-Wl,-z,now"
 )
 

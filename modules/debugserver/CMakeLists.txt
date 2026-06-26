@@ -26,7 +26,7 @@ set_target_properties(debugserver PROPERTIES LINK_OPTIONS "")
 target_link_options(debugserver PRIVATE
     "--sysroot=${CMAKE_SYSROOT}"
     "-fuse-ld=lld"
-    "-L${CMAKE_SYSROOT}/lib"
+    "-L${WOS_SYSROOT_LIB_DIR}"
     "-Wl,-z,now"
 )
 

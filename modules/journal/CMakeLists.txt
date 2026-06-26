@@ -25,7 +25,7 @@ set_target_properties(journal PROPERTIES LINK_OPTIONS "")
 target_link_options(journal PRIVATE
     "--sysroot=${CMAKE_SYSROOT}"
     "-fuse-ld=lld"
-    "-L${CMAKE_SYSROOT}/lib"
+    "-L${WOS_SYSROOT_LIB_DIR}"
     "-Wl,-z,now"
 )
 
@@ -41,13 +41,14 @@ set_target_properties(journal_lib PROPERTIES LINK_OPTIONS "")
 target_link_options(journal_lib PRIVATE
     "--sysroot=${CMAKE_SYSROOT}"
     "-fuse-ld=lld"
-    "-L${CMAKE_SYSROOT}/lib"
+    "-L${WOS_SYSROOT_LIB_DIR}"
     "-Wl,-z,now"
 )
 
 target_link_libraries(journal_lib PRIVATE c)
 
 add_custom_command(TARGET journal_lib POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:journal_lib>" "${CMAKE_SYSROOT}/lib/libjournal.so"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${WOS_SYSROOT_LIB_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:journal_lib>" "${WOS_SYSROOT_LIB_DIR}/libjournal.so"
     COMMENT "Installing libjournal.so into sysroot"
 )
