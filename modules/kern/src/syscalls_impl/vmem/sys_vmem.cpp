@@ -807,7 +807,7 @@ auto write_file_mapping_bytes(ker::vfs::File* file, const uint8_t* data, size_t 
         written += std::min<size_t>(static_cast<size_t>(RET), count - written);
     }
 
-    ker::vfs::vfs_cache_notify_file_changed(file);
+    ker::vfs::vfs_cache_notify_file_data_changed(file);
     return 0;
 }
 

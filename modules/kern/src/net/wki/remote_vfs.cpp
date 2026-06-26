@@ -3207,7 +3207,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 
             ssize_t const BYTES_WRITTEN = local_file->fops->vfs_write(local_file, write_data, write_len, static_cast<size_t>(offset));
             if (BYTES_WRITTEN >= 0) {
-                ker::vfs::vfs_cache_notify_file_changed(local_file);
+                ker::vfs::vfs_cache_notify_file_data_changed(local_file);
             }
 
             // Response: {written:u32} = 4 bytes
@@ -3914,7 +3914,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             if (local_file != nullptr) {
                 ret = local_file->fops->vfs_truncate(local_file, static_cast<off_t>(length));
                 if (ret == 0) {
-                    ker::vfs::vfs_cache_notify_file_changed(local_file);
+                    ker::vfs::vfs_cache_notify_file_data_changed(local_file);
                 }
             }
 
@@ -4251,7 +4251,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 
             ssize_t const BYTES_WRITTEN = local_file->fops->vfs_write(local_file, write_src, len, static_cast<size_t>(offset));
             if (BYTES_WRITTEN >= 0) {
-                ker::vfs::vfs_cache_notify_file_changed(local_file);
+                ker::vfs::vfs_cache_notify_file_data_changed(local_file);
             }
 
             // Response: {bytes_written:u32} = 4 bytes

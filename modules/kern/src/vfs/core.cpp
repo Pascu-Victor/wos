@@ -5810,6 +5810,8 @@ void vfs_cache_notify_path_changed(const char* old_vfs_path, const char* new_vfs
 
 void vfs_cache_notify_file_changed(File* file) { cache_notify_file_changed_impl(file); }
 
+void vfs_cache_notify_file_data_changed(File* file) { cache_notify_file_data_changed_impl(file); }
+
 auto vfs_cache_notify_file_dirty(File* file) -> bool { return cache_notify_file_dirty_impl(file); }
 
 void vfs_cache_notify_acknowledge_file(File* file) { cache_notify_acknowledge_file_impl(file); }

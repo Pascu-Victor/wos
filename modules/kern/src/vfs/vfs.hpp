@@ -230,6 +230,7 @@ void vfs_cache_notify_register_open_file(File* file);
 void vfs_cache_notify_invalidate_path(const char* vfs_path);
 void vfs_cache_notify_path_changed(const char* old_vfs_path, const char* new_vfs_path);
 void vfs_cache_notify_file_changed(File* file);
+void vfs_cache_notify_file_data_changed(File* file);
 auto vfs_cache_notify_file_dirty(File* file) -> bool;
 void vfs_cache_notify_acknowledge_file(File* file);
 
