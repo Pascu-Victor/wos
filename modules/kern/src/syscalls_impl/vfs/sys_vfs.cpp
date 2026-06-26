@@ -61,6 +61,25 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             }
             return static_cast<int64_t>(FD);
         }
+        case ops::OPENAT: {
+            int const DIRFD = static_cast<int>(a1);
+            const auto* pathname = reinterpret_cast<const char*>(a2);
+            if (pathname == nullptr) {
+                return -EFAULT;
+            }
+            int const FLAGS = static_cast<int>(a3);
+            int const MODE = static_cast<int>(a4);
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return -ESRCH;
+            }
+            std::array<char, 512> resolved{};
+            int const RES = ker::vfs::vfs_resolve_dirfd(task, DIRFD, pathname, resolved.data(), resolved.size());
+            if (RES < 0) {
+                return static_cast<int64_t>(RES);
+            }
+            return static_cast<int64_t>(ker::vfs::vfs_open(resolved.data(), FLAGS, MODE));
+        }
         case ops::READ: {
             int const FD = static_cast<int>(a1);
             void* buf = reinterpret_cast<void*>(a2);
@@ -181,6 +200,33 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto* statbuf = reinterpret_cast<ker::vfs::Stat*>(a2);
             int const RET = ker::vfs::vfs_fstat(FD, statbuf);
             return static_cast<int64_t>(RET);
+        }
+        case ops::STATAT: {
+            constexpr int AT_SYMLINK_NOFOLLOW_FLAG = 0x100;
+            constexpr int AT_EMPTY_PATH_FLAG = 0x1000;
+            int const DIRFD = static_cast<int>(a1);
+            const auto* pathname = reinterpret_cast<const char*>(a2);
+            auto* statbuf = reinterpret_cast<ker::vfs::Stat*>(a3);
+            int const FLAGS = static_cast<int>(a4);
+            if (pathname == nullptr || statbuf == nullptr) {
+                return -EFAULT;
+            }
+            if ((FLAGS & AT_EMPTY_PATH_FLAG) != 0 && pathname[0] == '\0') {
+                return static_cast<int64_t>(ker::vfs::vfs_fstat(DIRFD, statbuf));
+            }
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return -ESRCH;
+            }
+            std::array<char, 512> resolved{};
+            int const RES = ker::vfs::vfs_resolve_dirfd(task, DIRFD, pathname, resolved.data(), resolved.size());
+            if (RES < 0) {
+                return static_cast<int64_t>(RES);
+            }
+            if ((FLAGS & AT_SYMLINK_NOFOLLOW_FLAG) != 0) {
+                return static_cast<int64_t>(ker::vfs::vfs_lstat(resolved.data(), statbuf));
+            }
+            return static_cast<int64_t>(ker::vfs::vfs_stat(resolved.data(), statbuf));
         }
         case ops::UMOUNT: {
             const auto* target = reinterpret_cast<const char*>(a1);

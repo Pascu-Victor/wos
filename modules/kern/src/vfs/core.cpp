@@ -5206,8 +5206,9 @@ auto vfs_resolve_dirfd(ker::mod::sched::task::Task* task, int dirfd, const char*
         return -ENAMETOOLONG;
     }
 
-    std::memcpy(resolved, base, base_len);
-    resolved[base_len] = '\0';
+    for (size_t i = 0; i < base_len; ++i) {
+        resolved[i] = base[i];
+    }
     resolved[base_len] = '/';
     std::memcpy(resolved + base_len + 1, pathname, PATH_LEN + 1);
     return 0;

@@ -56,6 +56,8 @@ enum class ops : uint64_t {
     LSTAT,                 // 48
     SYNC,                  // 49
     REALPATH,              // 50
+    OPENAT,                // 51
+    STATAT,                // 52
 };
 
 }  // namespace ker::abi::vfs
