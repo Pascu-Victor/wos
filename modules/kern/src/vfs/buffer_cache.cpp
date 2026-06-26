@@ -244,6 +244,7 @@ bool cache_initialized = false;
 
 constexpr size_t DIRTY_HARD_LIMIT_TARGET_MULTIPLIER = 2;
 constexpr size_t DIRTY_WRITEBACK_BUDGET = 1024;
+constexpr size_t DIRTY_WRITEBACK_YIELD_BYTES = size_t{16} * 1024 * 1024;
 constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = DIRTY_WRITEBACK_BUDGET;
 constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BUFFERS = 1024;
 constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BYTES = size_t{16} * 1024 * 1024;
@@ -287,6 +288,7 @@ struct DirtyWritebackResult {
     int status{};
     uint64_t dirty_epoch{};
     size_t buffers{};
+    size_t bytes{};
 };
 
 struct DirtyWakeList {
@@ -1811,6 +1813,7 @@ auto collect_dirty_writeback_run_locked(const DirtyWritebackFilter& filter, uint
 
     result.wrote = true;
     result.buffers = run.count;
+    result.bytes = run.bytes;
     result.dirty_epoch = run.dirty_epochs.at(0);
     return result;
 }
@@ -2139,7 +2142,8 @@ auto request_dirty_writeback() -> bool {
 
 void dirty_writeback_worker(void* unused) {
     (void)unused;
-    size_t write_count = 0;
+    size_t buffers_since_yield = 0;
+    size_t bytes_since_yield = 0;
     while (true) {
         uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
         bool const NEEDS_WRITEBACK = dirty_bytes_above_target_locked();
@@ -2153,8 +2157,11 @@ void dirty_writeback_worker(void* unused) {
             if (WB.status != 0) {
                 break;
             }
-            write_count += std::max(WB.buffers, static_cast<size_t>(1));
-            if ((write_count % DIRTY_WRITEBACK_BUDGET) == 0) {
+            buffers_since_yield += std::max(WB.buffers, static_cast<size_t>(1));
+            bytes_since_yield += WB.bytes;
+            if (buffers_since_yield >= DIRTY_WRITEBACK_BUDGET || bytes_since_yield >= DIRTY_WRITEBACK_YIELD_BYTES) {
+                buffers_since_yield = 0;
+                bytes_since_yield = 0;
                 ker::mod::sched::kern_yield();
             }
             continue;
