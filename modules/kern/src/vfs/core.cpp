@@ -1878,6 +1878,13 @@ auto cache_notify_invalidate_path_local(const char* vfs_path) -> bool {
         return false;
     }
 
+    g_cache_notify_lock.lock();
+    bool const NO_NOTIFY_ENTRIES = g_cache_notify_entries.empty();
+    g_cache_notify_lock.unlock();
+    if (NO_NOTIFY_ENTRIES) {
+        return false;
+    }
+
     uint64_t const PATH_HASH = stream_hash_path(vfs_path);
     if (PATH_HASH == 0) {
         return false;
