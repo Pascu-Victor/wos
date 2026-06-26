@@ -13,8 +13,10 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/addr.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/swap.hpp>
 #include <platform/perf/perf_events.hpp>
@@ -52,7 +54,7 @@ namespace {
 
 constexpr uint32_t XFS_SLOW_TRACE_US = 2048;
 constexpr size_t XFS_DIRECT_READ_MIN_BYTES = size_t{4} * 1024;
-constexpr size_t XFS_DIRECT_READ_BATCH_MAX_BYTES = size_t{16} * 1024 * 1024;
+constexpr size_t XFS_DIRECT_READ_BATCH_MAX_BYTES = size_t{2} * 1024 * 1024;
 constexpr uint64_t XFS_NSEC_PER_SEC = 1000000000ULL;
 constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
 // Maximum blocks to allocate per metadata transaction.
@@ -254,6 +256,13 @@ auto xfs_direct_read_batch_max_bytes(size_t block_size) -> size_t {
     }
     size_t const MAX_BLOCKS = std::max<size_t>(1, XFS_DIRECT_READ_BATCH_MAX_BYTES / block_size);
     return MAX_BLOCKS * block_size;
+}
+
+auto xfs_direct_read_target_dma_safe(const void* buffer) -> bool {
+    if (buffer == nullptr) {
+        return false;
+    }
+    return reinterpret_cast<uint64_t>(buffer) >= ker::mod::mm::addr::get_hhdm_offset();
 }
 
 void xfs_set_sequential_alloc_hint(XfsInode* ip, XfsMountContext* ctx, xfs_fileoff_t file_block, XfsAllocReq* req) {
@@ -912,6 +921,16 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             };
 
             bool read_from_cache = chunk < XFS_DIRECT_READ_MIN_BYTES;
+            std::unique_ptr<uint8_t[]> direct_bounce{};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+            uint8_t* direct_dst = dst + total_read;
+            if (!read_from_cache && !xfs_direct_read_target_dma_safe(direct_dst)) {
+                direct_bounce.reset(new (std::nothrow) uint8_t[chunk]);
+                if (direct_bounce == nullptr) {
+                    read_from_cache = true;
+                } else {
+                    direct_dst = direct_bounce.get();
+                }
+            }
             uint64_t dev_block = 0;
             size_t dev_count = 0;
             if (!read_from_cache) {
@@ -939,7 +958,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                     perf_accounted_us +=
                         perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
                 } else {
-                    int const RC = xfs_block_read_with_retry(ctx->device, dev_block, dev_count, dst + total_read);
+                    int const RC = xfs_block_read_with_retry(ctx->device, dev_block, dev_count, direct_dst);
                     if (RC != 0) {
                         perf_accounted_us +=
                             perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, RC, chunk);
@@ -947,8 +966,13 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                     }
                     perf_accounted_us +=
                         perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, 0, chunk);
-                    bool const OVERLAYED = copy_dirty_bdev_range(ctx->device, dev_block, dev_count, dst + total_read);
+                    bool const OVERLAYED = copy_dirty_bdev_range(ctx->device, dev_block, dev_count, direct_dst);
                     if (OVERLAYED) {
+                        perf_accounted_us +=
+                            perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
+                    }
+                    if (direct_bounce != nullptr) {
+                        std::memcpy(dst + total_read, direct_dst, chunk);
                         perf_accounted_us +=
                             perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
                     }
