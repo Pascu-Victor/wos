@@ -147,7 +147,7 @@ void init() {
         return;
     }
     constexpr uint8_t OP_ENABLE_DLAB = 0x80;
-    constexpr uint8_t DIVISOR_LO = 0x03;  // 38400 baud
+    constexpr uint8_t DIVISOR_LO = 0x01;  // 115200 baud
     constexpr uint8_t DIVISOR_HI = 0x00;
     constexpr uint8_t LINE_CTRL_8N1 = 0x03;
     constexpr uint8_t FIFO_CTRL_ENABLE = 0xC7;
