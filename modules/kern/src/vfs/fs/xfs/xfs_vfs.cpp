@@ -356,7 +356,7 @@ auto xfs_parent_path_cache_lookup_ino(XfsMountContext* ctx, const char* path, si
         if (!entry.valid || entry.mount != ctx || entry.hash != HASH || entry.path_len != path_len) {
             continue;
         }
-        if (std::memcmp(entry.path.data(), path, path_len + 1) != 0) {
+        if (std::memcmp(entry.path.data(), path, path_len) != 0) {
             continue;
         }
         entry.last_used = g_xfs_parent_path_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -379,7 +379,7 @@ void xfs_parent_path_cache_store(XfsMountContext* ctx, const char* path, size_t 
     XfsParentPathCacheEntry* victim = &set.ways.front();
     for (auto& entry : set.ways) {
         if (entry.valid && entry.mount == ctx && entry.hash == HASH && entry.path_len == path_len &&
-            std::memcmp(entry.path.data(), path, path_len + 1) == 0) {
+            std::memcmp(entry.path.data(), path, path_len) == 0) {
             victim = &entry;
             break;
         }
@@ -393,7 +393,7 @@ void xfs_parent_path_cache_store(XfsMountContext* ctx, const char* path, size_t 
     }
 
     victim->path.fill('\0');
-    std::memcpy(victim->path.data(), path, path_len + 1);
+    std::memcpy(victim->path.data(), path, path_len);
     victim->mount = ctx;
     victim->path_len = path_len;
     victim->ino = ino;
@@ -1725,6 +1725,7 @@ auto xfs_selftest_parent_path_cache() -> bool {
     XfsMountContext mount_a{};
     XfsMountContext mount_b{};
     constexpr const char* PATH = "toolchain/src/llvm-project";
+    constexpr const char* CHILD_PATH = "toolchain/src/llvm-project/llvm/lib/IR";
     size_t const PATH_LEN = std::strlen(PATH);
     constexpr xfs_ino_t INO = 42;
 
@@ -1735,6 +1736,7 @@ auto xfs_selftest_parent_path_cache() -> bool {
     bool ok = !xfs_parent_path_cache_lookup_ino(&mount_a, PATH, PATH_LEN, &ino);
     xfs_parent_path_cache_store(&mount_a, PATH, PATH_LEN, INO);
     ok = ok && xfs_parent_path_cache_lookup_ino(&mount_a, PATH, PATH_LEN, &ino) && ino == INO;
+    ok = ok && xfs_parent_path_cache_lookup_ino(&mount_a, CHILD_PATH, PATH_LEN, &ino) && ino == INO;
     ok = ok && !xfs_parent_path_cache_lookup_ino(&mount_b, PATH, PATH_LEN, &ino);
     xfs_parent_path_cache_purge_all_for_mount(&mount_a);
     ok = ok && !xfs_parent_path_cache_lookup_ino(&mount_a, PATH, PATH_LEN, &ino);
@@ -1876,15 +1878,12 @@ auto xfs_find_parent_and_name(const char* fs_path, XfsMountContext* ctx, XfsInod
         name = (last_slash == fs_path) ? fs_path + 1 : fs_path;
     } else {
         auto parent_len = static_cast<size_t>(last_slash - fs_path);
-        char parent_path[512] = {};  // NOLINT
-        if (parent_len >= sizeof(parent_path)) {
+        constexpr size_t PARENT_PATH_CAPACITY = 512;
+        if (parent_len >= PARENT_PATH_CAPACITY) {
             return -ENAMETOOLONG;
         }
-        std::memcpy(static_cast<char*>(parent_path), fs_path, parent_len);
-        parent_path[parent_len] = '\0';
         xfs_ino_t cached_parent_ino = NULLFSINO;
-        auto const* parent_path_chars = static_cast<const char*>(parent_path);
-        if (xfs_parent_path_cache_lookup_ino(ctx, parent_path_chars, parent_len, &cached_parent_ino)) {
+        if (xfs_parent_path_cache_lookup_ino(ctx, fs_path, parent_len, &cached_parent_ino)) {
             parent_ip = xfs_inode_read(ctx, cached_parent_ino);
             if (parent_ip != nullptr && !xfs_inode_isdir(parent_ip)) {
                 xfs_inode_release(parent_ip);
@@ -1892,6 +1891,10 @@ auto xfs_find_parent_and_name(const char* fs_path, XfsMountContext* ctx, XfsInod
             }
         }
         if (parent_ip == nullptr) {
+            char parent_path[PARENT_PATH_CAPACITY] = {};  // NOLINT
+            std::memcpy(static_cast<char*>(parent_path), fs_path, parent_len);
+            parent_path[parent_len] = '\0';
+            auto const* parent_path_chars = static_cast<const char*>(parent_path);
             parent_ip = walk_path(ctx, parent_path_chars);
             if (parent_ip != nullptr && xfs_inode_isdir(parent_ip)) {
                 xfs_parent_path_cache_store(ctx, parent_path_chars, parent_len, parent_ip->ino);
