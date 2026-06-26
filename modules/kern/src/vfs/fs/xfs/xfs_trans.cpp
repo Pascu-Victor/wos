@@ -170,12 +170,8 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
         }
     }
 
-    auto* mount = tp->mount;
     tp->committed = true;
     delete tp;
-    if (mount != nullptr) {
-        kick_dirty_buffer_cache_writeback(mount->device);
-    }
     return RC;
 }
 
