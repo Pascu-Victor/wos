@@ -1000,6 +1000,13 @@ void metadata_cache_note_file_data_changed(File* file) {
     }
 }
 
+void metadata_cache_mark_file_data_observed(File* file) {
+    if (file == nullptr) {
+        return;
+    }
+    file->metadata_data_invalidation_observation_epoch = g_metadata_observation_epoch.load(std::memory_order_acquire);
+}
+
 void metadata_cache_note_path_data_changed(const char* path, FSType fs_type) {
     if (path == nullptr || (!metadata_cacheable_fs(fs_type) && fs_type != FSType::DEVFS)) {
         return;
@@ -4786,6 +4793,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     }
     if (open_create_should_invalidate_metadata(f, backend_flags)) {
         metadata_cache_note_path_changed(path_buffer.data(), nullptr);
+        metadata_cache_mark_file_data_observed(f);
     }
     if ((flags & ker::vfs::O_NO_CACHE) != 0) {
         vfs_cache_notify_path_changed(f->vfs_path, nullptr);
@@ -9744,6 +9752,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
         f->fd_flags = 0;
         if (open_create_should_invalidate_metadata(f, backend_flags)) {
             metadata_cache_note_path_changed(pathBuffer, nullptr);
+            metadata_cache_mark_file_data_observed(f);
         }
         if ((flags & ker::vfs::O_NO_CACHE) != 0) {
             vfs_cache_notify_path_changed(f->vfs_path, nullptr);
