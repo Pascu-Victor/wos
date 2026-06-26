@@ -1144,7 +1144,7 @@ void file_stat_snapshot_refresh(File* file) {
 }
 
 auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bool follow_final_symlink, bool require_directory,
-                           Stat* statbuf) -> int {
+                           Stat* statbuf, bool record_miss = true) -> int {
     if (path == nullptr || statbuf == nullptr || !metadata_cacheable_fs(fs_type)) {
         return -EAGAIN;
     }
@@ -1200,15 +1200,17 @@ auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bo
         g_vfs_metadata_hits.fetch_add(1, std::memory_order_relaxed);
         return cache_result;
     }
-    g_vfs_metadata_misses.fetch_add(1, std::memory_order_relaxed);
-    if (saw_invalidated) {
-        g_vfs_metadata_miss_invalidated.fetch_add(1, std::memory_order_relaxed);
-    } else if (saw_stale_generation) {
-        g_vfs_metadata_miss_stale_generation.fetch_add(1, std::memory_order_relaxed);
-    } else if (!saw_valid) {
-        g_vfs_metadata_miss_empty.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        g_vfs_metadata_miss_conflict.fetch_add(1, std::memory_order_relaxed);
+    if (record_miss) {
+        g_vfs_metadata_misses.fetch_add(1, std::memory_order_relaxed);
+        if (saw_invalidated) {
+            g_vfs_metadata_miss_invalidated.fetch_add(1, std::memory_order_relaxed);
+        } else if (saw_stale_generation) {
+            g_vfs_metadata_miss_stale_generation.fetch_add(1, std::memory_order_relaxed);
+        } else if (!saw_valid) {
+            g_vfs_metadata_miss_empty.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_vfs_metadata_miss_conflict.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     return -EAGAIN;
 }
@@ -5975,6 +5977,16 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     auto mount_ref = find_mount_point(pathBuffer);
     MountPoint const* mount = mount_ref.get();
     bool const REMOTE_MOUNT = (mount != nullptr && mount->fs_type == FSType::REMOTE);
+
+    if (mount != nullptr && !REMOTE_MOUNT && !is_wki_entry) {
+        int const CACHED_RESULT = metadata_cache_lookup(pathBuffer, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK,
+                                                        REQUIRE_DIRECTORY, statbuf, false);
+        if (CACHED_RESULT != -EAGAIN) {
+            log_loader_path_event(CACHED_RESULT == 0 ? "stat-cache-hit-pre-symlink" : "stat-cache-negative-hit-pre-symlink", path,
+                                  pathBuffer, mount, CACHED_RESULT);
+            return CACHED_RESULT;
+        }
+    }
 
     if (!REMOTE_MOUNT) {
         char resolved[MAX_PATH_LEN];  // NOLINT

@@ -96,12 +96,17 @@ KTEST(VFS, MetadataCacheRepeatedStatRecordsHit) {
 
     ker::vfs::Stat st{};
     KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
+
+    ker::vfs::VfsCachePerfSnapshot after_first{};
+    ker::vfs::vfs_get_cache_perf_snapshot(after_first);
+
     KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
 
     ker::vfs::VfsCachePerfSnapshot after{};
     ker::vfs::vfs_get_cache_perf_snapshot(after);
     KEXPECT_TRUE(after.metadata_stores > before.metadata_stores);
     KEXPECT_TRUE(after.metadata_hits > before.metadata_hits);
+    KEXPECT_EQ(after.symlink_hits, after_first.symlink_hits);
 
     KEXPECT_EQ(ker::vfs::vfs_unlink(PATH), 0);
 }
