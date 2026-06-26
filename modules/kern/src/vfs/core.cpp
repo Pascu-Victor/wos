@@ -292,6 +292,7 @@ void stream_invalidate_file(File* file);
 void cache_notify_detach_file(File* file);
 void cache_notify_file_data_changed_impl(File* file);
 void cache_notify_file_metadata_changed_impl(File* file);
+auto cache_notify_file_dirty_impl(File* file) -> bool;
 void stream_invalidate_identity_locked(const StreamCacheIdentity& identity);
 void stream_gc_locked(uint64_t now_us);
 auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t start_offset, size_t* actual_size, ssize_t* result) -> bool;
@@ -1030,7 +1031,9 @@ auto file_stat_snapshot_anonymous_cacheable(const File* file) -> bool {
            (file->fs_type == FSType::TMPFS && file->fops != nullptr && file->fops != ker::vfs::tmpfs::get_tmpfs_fops());
 }
 
-auto file_stat_snapshot_path_cacheable_fs(FSType fs_type) -> bool { return metadata_cacheable_fs(fs_type) || fs_type == FSType::DEVFS; }
+auto file_stat_snapshot_path_cacheable_fs(FSType fs_type) -> bool {
+    return metadata_cacheable_fs(fs_type) || fs_type == FSType::DEVFS || fs_type == FSType::REMOTE;
+}
 
 auto file_stat_snapshot_cacheable(const File* file) -> bool {
     if (file == nullptr || (file->open_flags & ker::vfs::O_NO_CACHE) != 0) {
@@ -1130,6 +1133,9 @@ auto file_stat_snapshot_current(File* file) -> bool {
     if (!file_stat_snapshot_cacheable(file) || !file->stat_cache_valid) {
         return false;
     }
+    if (cache_notify_file_dirty_impl(file)) {
+        return false;
+    }
     if (file->vfs_path == nullptr) {
         return true;
     }
@@ -1140,6 +1146,12 @@ auto file_stat_snapshot_current(File* file) -> bool {
 auto file_stat_snapshot_lookup(File* file, Stat* statbuf) -> bool {
     if (file == nullptr || statbuf == nullptr || !file_stat_snapshot_cacheable(file)) {
         g_vfs_fstat_snapshot_miss_uncacheable.fetch_add(1, std::memory_order_relaxed);
+        g_vfs_fstat_snapshot_misses.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (cache_notify_file_dirty_impl(file)) {
+        file_stat_snapshot_invalidate(file);
+        g_vfs_fstat_snapshot_miss_invalidated.fetch_add(1, std::memory_order_relaxed);
         g_vfs_fstat_snapshot_misses.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -9104,6 +9116,36 @@ auto vfs_selftest_anonymous_fstat_snapshot_hits() -> bool {
     bool const CLOSED_READ = pipefd[0] >= 0 && pipe_close_fake_task_fd(task, pipefd[0]);
     bool const CLOSED_WRITE = pipefd[1] >= 0 && pipe_close_fake_task_fd(task, pipefd[1]);
     return ok && CLOSED_READ && CLOSED_WRITE && task.fd_table.empty();
+}
+
+auto vfs_selftest_remote_fstat_snapshot_cacheable() -> bool {
+    constexpr const char PATH[] = "/remote/ktest-fstat-snapshot";
+
+    File file{};
+    file.fs_type = FSType::REMOTE;
+    file.vfs_path = PATH;
+
+    Stat st{};
+    st.st_mode = S_IFREG | 0644;
+    st.st_size = 12345;
+    st.st_dev = 7;
+
+    VfsCachePerfSnapshot before{};
+    VfsCachePerfSnapshot after_store{};
+    VfsCachePerfSnapshot after_lookup{};
+    vfs_get_cache_perf_snapshot(before);
+
+    file_stat_snapshot_store(&file, st, metadata_snapshot_stamp());
+    vfs_get_cache_perf_snapshot(after_store);
+
+    Stat out{};
+    bool const HIT = file_stat_snapshot_lookup(&file, &out);
+    vfs_get_cache_perf_snapshot(after_lookup);
+
+    return HIT && out.st_size == st.st_size && out.st_dev == st.st_dev && (out.st_mode & S_IFMT) == S_IFREG &&
+           after_store.fstat_snapshot_stores > before.fstat_snapshot_stores &&
+           after_lookup.fstat_snapshot_hits > after_store.fstat_snapshot_hits &&
+           after_lookup.fstat_snapshot_miss_uncacheable == before.fstat_snapshot_miss_uncacheable;
 }
 
 auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool {
