@@ -74,8 +74,9 @@ static_assert((XFS_PARENT_PATH_CACHE_SET_COUNT & (XFS_PARENT_PATH_CACHE_SET_COUN
 // ============================================================================
 
 struct XfsFileData {
-    XfsMountContext* mount;
-    XfsInode* inode;  // reference-counted inode
+    XfsMountContext* mount{};
+    XfsInode* inode{};  // reference-counted inode
+    bool may_have_eof_prealloc{};
 };
 
 struct XfsParentPathCacheEntry {
@@ -282,11 +283,14 @@ void xfs_set_sequential_alloc_hint(XfsInode* ip, XfsMountContext* ctx, xfs_fileo
 
 auto xfs_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks) -> bool { return old_size != 0 || nblocks != 0; }
 
-auto xfs_close_should_trim_prealloc(int open_flags) -> bool {
+auto xfs_close_should_trim_prealloc(int open_flags, bool created_by_open, bool may_have_eof_prealloc) -> bool {
     if ((open_flags & 3) != 0) {
-        return true;
+        return may_have_eof_prealloc || !created_by_open;
     }
-    return (open_flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0;
+    if ((open_flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) == 0) {
+        return false;
+    }
+    return may_have_eof_prealloc || !created_by_open;
 }
 
 auto xfs_inode_has_eof_prealloc(const XfsInode* ip) -> bool {
@@ -683,7 +687,8 @@ auto xfs_vfs_close(File* f) -> int {
             XfsMetadataGuard metadata_guard(xfd->mount);
             {
                 ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
-                close_result = xfs_commit_dirty_inode(xfd->mount, xfd->inode, xfs_close_should_trim_prealloc(f->open_flags));
+                bool const TRIM_PREALLOC = xfs_close_should_trim_prealloc(f->open_flags, f->created_by_open, xfd->may_have_eof_prealloc);
+                close_result = xfs_commit_dirty_inode(xfd->mount, xfd->inode, TRIM_PREALLOC);
             }
             xfs_inode_release(xfd->inode);
         }
@@ -1208,6 +1213,11 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
             size_t const SLICE_START = std::max(EXTENT_START, offset + total_written);
             size_t const SLICE_END = std::min(EXTENT_END, WRITE_END);
             size_t const SLICE_BYTES = (SLICE_END > SLICE_START) ? (SLICE_END - SLICE_START) : 0;
+            auto const WRITTEN_EOF_BLOCKS =
+                static_cast<xfs_fileoff_t>((SLICE_END + static_cast<size_t>(ctx->block_size - 1)) >> ctx->block_log);
+            if (file_block + alloc_result.len > WRITTEN_EOF_BLOCKS) {
+                xfd->may_have_eof_prealloc = true;
+            }
 
             ip->nblocks += alloc_result.len;
             if (SLICE_BYTES > 0 && SLICE_END > ip->size) {
@@ -1658,7 +1668,9 @@ auto xfs_selftest_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks)
     return xfs_truncate_zero_resets_data(old_size, nblocks);
 }
 
-auto xfs_selftest_close_should_trim_prealloc(int open_flags) -> bool { return xfs_close_should_trim_prealloc(open_flags); }
+auto xfs_selftest_close_should_trim_prealloc(int open_flags, bool created_by_open, bool may_have_eof_prealloc) -> bool {
+    return xfs_close_should_trim_prealloc(open_flags, created_by_open, may_have_eof_prealloc);
+}
 
 auto xfs_selftest_inode_has_eof_prealloc() -> bool {
     constexpr size_t BLOCK_SIZE = 4096;

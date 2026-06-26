@@ -184,6 +184,8 @@ KTEST(XFS, ReadOnlyCloseSkipsPreallocTrim) {
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_close_should_trim_prealloc(ker::vfs::O_TRUNC));
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_close_should_trim_prealloc(1));
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_close_should_trim_prealloc(2));
+    KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_close_should_trim_prealloc(ker::vfs::O_CREAT | 1, true, false));
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_close_should_trim_prealloc(ker::vfs::O_CREAT | 1, true, true));
 }
 
 KTEST(XFS, CloseTrimDetectsActualEofPrealloc) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_inode_has_eof_prealloc()); }
