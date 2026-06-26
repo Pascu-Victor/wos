@@ -935,6 +935,9 @@ auto metadata_path_invalidated_since(const char* path, size_t path_len, uint64_t
     if (path == nullptr || path_len == 0 || path[0] != '/') {
         return true;
     }
+    if (seen_generation == g_metadata_invalidation_generation.load(std::memory_order_acquire)) {
+        return false;
+    }
 
     bool invalidated = false;
     g_metadata_invalidation_lock.lock();
