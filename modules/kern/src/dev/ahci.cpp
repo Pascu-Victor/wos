@@ -57,6 +57,7 @@ constexpr uint8_t HBA_PORT_DET_PRESENT = 3;
 
 constexpr uint32_t HBA_GHC_AE = 0x80000000;  // AHCI Enable
 constexpr uint32_t HBA_GHC_IE = 0x00000002;  // Interrupt Enable
+constexpr uint64_t AHCI_WAIT_YIELD_INTERVAL = 4096;
 
 // Global state
 namespace {
@@ -123,6 +124,14 @@ auto command_table_prdt_entries(HbaCmdTbl* table) -> HbaPrdtEntry* {
 
 auto valid_port(int portno) -> bool { return portno >= 0 && std::cmp_less(portno, MAX_PORTS); }
 auto port_index(int portno) -> size_t { return static_cast<size_t>(portno); }
+
+void wait_for_completion_relax(uint64_t iteration) {
+    if ((iteration & (AHCI_WAIT_YIELD_INTERVAL - 1)) == 0 && ker::mod::sched::has_run_queues()) {
+        ker::mod::sched::kern_yield();
+        return;
+    }
+    asm volatile("pause");
+}
 
 // Stop command engine on a port
 void stop_cmd(volatile HbaPort* port) {
@@ -453,8 +462,7 @@ auto read_write_disk(volatile HbaPort* port, int portno, uint32_t startl, uint32
             port_slots.fetch_and(~(1U << slot), std::memory_order_release);
             return false;
         }
-        // Yield to other threads/allow interrupts during long waits
-        asm volatile("pause");
+        wait_for_completion_relax(wait_iter);
     }
 
     // Check again
@@ -589,6 +597,7 @@ auto flush_disk(volatile HbaPort* port, int portno) -> bool {
     port_lock.unlock();
 
     // Wait for completion
+    uint64_t wait_iter = 0;
     while (true) {
         if ((mmio_read32(port->ci) & (1U << slot)) == 0) {
             break;
@@ -598,7 +607,7 @@ auto flush_disk(volatile HbaPort* port, int portno) -> bool {
             port_slots.fetch_and(~(1U << slot), std::memory_order_release);
             return false;
         }
-        asm volatile("pause");
+        wait_for_completion_relax(++wait_iter);
     }
 
     if ((mmio_read32(port->is) & HBA_PX_IS_TFES) != 0U) {
@@ -749,6 +758,7 @@ auto identify_disk(volatile HbaPort* port, int portno) -> uint64_t {
     port_lock.unlock();
 
     // Wait for completion
+    uint64_t wait_iter = 0;
     while (true) {
         if ((mmio_read32(port->ci) & (1U << slot)) == 0) {
             break;
@@ -759,7 +769,7 @@ auto identify_disk(volatile HbaPort* port, int portno) -> uint64_t {
             port_slots.fetch_and(~(1U << slot), std::memory_order_release);
             return 0;
         }
-        asm volatile("pause");
+        wait_for_completion_relax(++wait_iter);
     }
 
     if ((mmio_read32(port->is) & HBA_PX_IS_TFES) != 0U) {
