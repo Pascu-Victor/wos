@@ -209,6 +209,20 @@ KTEST(RadixTree, FindFirstUnset) {
     KEXPECT_EQ(tree.find_first_unset(0), 3ULL);
 }
 
+KTEST(RadixTree, FindFirstUnsetBelowLimit) {
+    ker::util::RadixTree<uint64_t> tree;
+    for (uint64_t key = 0; key < 130; ++key) {
+        KREQUIRE_TRUE(tree.insert(key, key + 1));
+    }
+
+    KEXPECT_EQ(tree.find_first_unset_below(0, 130), UINT64_MAX);
+    KEXPECT_EQ(tree.find_first_unset_below(0, 131), 130ULL);
+    KEXPECT_EQ(tree.remove(17), 18ULL);
+    KEXPECT_EQ(tree.find_first_unset_below(0, 130), 17ULL);
+    KEXPECT_EQ(tree.find_first_unset_below(18, 130), UINT64_MAX);
+    KEXPECT_EQ(tree.find_first_unset_below(130, 130), UINT64_MAX);
+}
+
 KTEST(RadixTree, SizeTracking) {
     ker::util::RadixTree<uint64_t> tree;
     KEXPECT_EQ(tree.size(), 0UL);

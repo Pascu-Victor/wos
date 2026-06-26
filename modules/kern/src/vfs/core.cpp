@@ -1520,12 +1520,7 @@ auto vfs_find_free_fd_below_limit_locked(ker::mod::sched::task::Task* task, uint
         return UINT64_MAX;
     }
 
-    for (uint64_t slot = start; slot < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++slot) {
-        if (task->fd_table.lookup(slot) == nullptr) {
-            return slot;
-        }
-    }
-    return UINT64_MAX;
+    return task->fd_table.find_first_unset_below(start, ker::mod::sched::task::Task::FD_TABLE_SIZE);
 }
 
 auto clamp_io_count(ssize_t result, size_t requested) -> ssize_t {

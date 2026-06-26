@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -178,13 +179,27 @@ class RadixTree {
     // Find first key >= start_key where value == T{} (unset).
     // Returns the key, or UINT64_MAX if none found within current capacity.
     [[nodiscard]] uint64_t find_first_unset(uint64_t start_key = 0) const {
-        uint64_t const CAP = capacity_at_depth(m_depth);
-        for (uint64_t k = start_key; k < CAP; ++k) {
-            if (lookup(k) == T{}) {
-                return k;
-            }
+        return find_first_unset_below(start_key, capacity_at_depth(m_depth));
+    }
+
+    // Find first key in [start_key, limit) where value == T{}.
+    // Ranges beyond the allocated depth are implicitly unset.
+    [[nodiscard]] uint64_t find_first_unset_below(uint64_t start_key, uint64_t limit) const {
+        if (start_key >= limit) {
+            return UINT64_MAX;
         }
-        return UINT64_MAX;
+
+        uint64_t const CAP = capacity_at_depth(m_depth);
+        if (m_root == nullptr || start_key >= CAP) {
+            return start_key;
+        }
+
+        uint64_t const SEARCH_LIMIT = std::min(limit, CAP);
+        uint64_t const FOUND = find_first_unset_in_node(m_root, m_depth, 0, start_key, SEARCH_LIMIT);
+        if (FOUND != UINT64_MAX) {
+            return FOUND;
+        }
+        return CAP < limit ? CAP : UINT64_MAX;
     }
 
     // Iterate all set entries. Callback: void(uint64_t key, T value)
@@ -276,6 +291,13 @@ class RadixTree {
         return cap;
     }
 
+    static uint64_t saturating_add(uint64_t lhs, uint64_t rhs) {
+        if (lhs > UINT64_MAX - rhs) {
+            return UINT64_MAX;
+        }
+        return lhs + rhs;
+    }
+
     Node* alloc_interior_node() {
         void* storage = ker::mod::mm::dyn::kmalloc::malloc(sizeof(Node));
         if (storage == nullptr) {
@@ -353,6 +375,56 @@ class RadixTree {
                 }
             }
         }
+    }
+
+    uint64_t find_first_unset_in_node(const Node* node, unsigned level, uint64_t prefix, uint64_t start_key, uint64_t limit) const {
+        if (start_key >= limit) {
+            return UINT64_MAX;
+        }
+        if (node == nullptr) {
+            uint64_t const CANDIDATE = std::max(prefix, start_key);
+            return CANDIDATE < limit ? CANDIDATE : UINT64_MAX;
+        }
+
+        if (level == 1) {
+            uint64_t const START_IDX = (start_key > prefix) ? std::min<uint64_t>(start_key - prefix, FANOUT) : 0;
+            uint64_t const END_IDX = (limit > prefix) ? std::min<uint64_t>(limit - prefix, FANOUT) : 0;
+            for (uint64_t idx = START_IDX; idx < END_IDX; ++idx) {
+                if (value_at(node, static_cast<unsigned>(idx)) == T{}) {
+                    return prefix + idx;
+                }
+            }
+            return UINT64_MAX;
+        }
+
+        uint64_t const CHILD_CAP = capacity_at_depth(level - 1);
+        if (CHILD_CAP == 0) {
+            return UINT64_MAX;
+        }
+
+        uint64_t const REL_START = (start_key > prefix) ? start_key - prefix : 0;
+        uint64_t const START_IDX = std::min<uint64_t>(REL_START / CHILD_CAP, FANOUT);
+        for (uint64_t idx = START_IDX; idx < FANOUT; ++idx) {
+            if (idx > (UINT64_MAX - prefix) / CHILD_CAP) {
+                break;
+            }
+            uint64_t const CHILD_PREFIX = prefix + (idx * CHILD_CAP);
+            if (CHILD_PREFIX >= limit) {
+                break;
+            }
+
+            uint64_t const CHILD_END = saturating_add(CHILD_PREFIX, CHILD_CAP);
+            if (CHILD_END <= start_key) {
+                continue;
+            }
+
+            const Node* child = child_at(node, static_cast<unsigned>(idx));
+            uint64_t const FOUND = find_first_unset_in_node(child, level - 1, CHILD_PREFIX, start_key, limit);
+            if (FOUND != UINT64_MAX) {
+                return FOUND;
+            }
+        }
+        return UINT64_MAX;
     }
 };
 
