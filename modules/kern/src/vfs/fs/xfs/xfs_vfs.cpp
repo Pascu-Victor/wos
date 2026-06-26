@@ -2644,6 +2644,7 @@ auto xfs_rename_path(const char* old_fs_path, const char* new_fs_path, XfsMountC
         xfs_inode_release(old_parent);
         return rc;
     }
+    bool purge_parent_path_cache = old_de.ftype == XFS_DIR3_FT_DIR;
 
     XfsInode* new_parent = nullptr;
     const char* new_name = nullptr;
@@ -2666,6 +2667,7 @@ auto xfs_rename_path(const char* old_fs_path, const char* new_fs_path, XfsMountC
     XfsDirEntry new_de{};
     XfsInode* displaced = nullptr;
     if (xfs_dir_lookup(new_parent, new_name, new_namelen, &new_de) == 0) {
+        purge_parent_path_cache = purge_parent_path_cache || new_de.ftype == XFS_DIR3_FT_DIR;
         rc = xfs_dir_removename(new_parent, new_name, new_namelen, tp);
         if (rc != 0) {
             xfs_trans_cancel(tp);
@@ -2714,7 +2716,7 @@ auto xfs_rename_path(const char* old_fs_path, const char* new_fs_path, XfsMountC
     xfs_trans_log_inode(tp, new_parent);
 
     rc = xfs_trans_commit(tp);
-    if (rc == 0) {
+    if (rc == 0 && purge_parent_path_cache) {
         xfs_parent_path_cache_purge_all_for_mount(ctx);
     }
     if (displaced != nullptr) {
