@@ -2393,9 +2393,11 @@ auto vfs_stream_cache_get_file_stat(File* file, Stat* statbuf) -> int {
 
     std::memset(statbuf, 0, sizeof(Stat));
 
-    MountRef sc_mount_ref = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path) : MountRef{};
-    MountPoint const* sc_mount = sc_mount_ref.get();
-    uint32_t const SC_DEV_ID = (sc_mount != nullptr) ? sc_mount->dev_id : 0;
+    auto stream_stat_dev_id = [&]() -> uint32_t {
+        MountRef sc_mount_ref = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path) : MountRef{};
+        MountPoint const* sc_mount = sc_mount_ref.get();
+        return sc_mount != nullptr ? sc_mount->dev_id : 0;
+    };
 
     switch (file->fs_type) {
         case FSType::TMPFS: {
@@ -2407,6 +2409,7 @@ auto vfs_stream_cache_get_file_stat(File* file, Stat* statbuf) -> int {
             if (node == nullptr) {
                 return -EBADF;
             }
+            uint32_t const SC_DEV_ID = stream_stat_dev_id();
             statbuf->st_dev = SC_DEV_ID;
             statbuf->st_ino = reinterpret_cast<ino_t>(node);
             statbuf->st_nlink = 1;
@@ -2433,7 +2436,7 @@ auto vfs_stream_cache_get_file_stat(File* file, Stat* statbuf) -> int {
         case FSType::FAT32: {
             int const R = ker::vfs::fat32::fat32_fstat(file, statbuf);
             if (R == 0) {
-                statbuf->st_dev = SC_DEV_ID;
+                statbuf->st_dev = stream_stat_dev_id();
             }
             return R;
         }
@@ -2444,16 +2447,12 @@ auto vfs_stream_cache_get_file_stat(File* file, Stat* statbuf) -> int {
         case FSType::REMOTE: {
             int const R = ker::net::wki::wki_remote_vfs_fstat(file, statbuf);
             if (R == 0 && statbuf->st_dev == 0) {
-                statbuf->st_dev = SC_DEV_ID;
+                statbuf->st_dev = stream_stat_dev_id();
             }
             return R;
         }
         case FSType::XFS: {
-            int const R = ker::vfs::xfs::xfs_fstat(file, statbuf);
-            if (R == 0) {
-                statbuf->st_dev = SC_DEV_ID;
-            }
-            return R;
+            return ker::vfs::xfs::xfs_fstat(file, statbuf);
         }
         default:
             return -ENOSYS;
