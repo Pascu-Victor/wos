@@ -1236,9 +1236,9 @@ static_assert(sizeof(XfsDir3LeafHdr) == 64);
 
 constexpr size_t XFS_DA3_CRC_OFF = __builtin_offsetof(XfsDa3Blkinfo, crc);
 
-auto dir2_buf_read_dir_block(XfsMountContext* ctx, xfs_fsblock_t disk_block) -> BufHead* {
+auto dir2_buf_get_dir_block(XfsMountContext* ctx, xfs_fsblock_t disk_block) -> BufHead* {
     uint32_t const FBS = 1U << ctx->dir_blk_log;
-    return (FBS == 1) ? xfs_buf_read(ctx, disk_block) : xfs_buf_read_multi(ctx, disk_block, FBS);
+    return (FBS == 1) ? xfs_buf_get(ctx, disk_block) : xfs_buf_get_multi(ctx, disk_block, FBS);
 }
 
 auto dir2_device_blkno(const XfsMountContext* ctx, xfs_fsblock_t disk_block) -> uint64_t {
@@ -1827,7 +1827,7 @@ auto dir2_leaf_alloc_data_block(XfsInode* dp, XfsTransaction* tp, BufHead** data
         return RC;
     }
 
-    BufHead* bh = dir2_buf_read_dir_block(ctx, disk_block);
+    BufHead* bh = dir2_buf_get_dir_block(ctx, disk_block);
     if (bh == nullptr) {
         return -EIO;
     }
@@ -2049,13 +2049,7 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
 
     xfs_fsblock_t const DISK_BLOCK = xfs_agbno_to_fsbno(alloc_result.agno, alloc_result.agbno, ctx->ag_blk_log);
 
-    // Read the block (to get a buffer to write into)
-    BufHead* bh = nullptr;
-    if (FBS == 1) {
-        bh = xfs_buf_read(ctx, DISK_BLOCK);
-    } else {
-        bh = xfs_buf_read_multi(ctx, DISK_BLOCK, FBS);
-    }
+    BufHead* bh = (FBS == 1) ? xfs_buf_get(ctx, DISK_BLOCK) : xfs_buf_get_multi(ctx, DISK_BLOCK, FBS);
     if (bh == nullptr) {
         delete[] recs;
         return -EIO;
@@ -2267,7 +2261,7 @@ auto dir2_block_to_leaf(XfsInode* dp, XfsTransaction* tp) -> int {
         return rc;
     }
 
-    BufHead* new_data_bh = dir2_buf_read_dir_block(ctx, new_data_disk);
+    BufHead* new_data_bh = dir2_buf_get_dir_block(ctx, new_data_disk);
     if (new_data_bh == nullptr) {
         delete[] leaf_copy;
         brelse(block_bh);
@@ -2292,7 +2286,7 @@ auto dir2_block_to_leaf(XfsInode* dp, XfsTransaction* tp) -> int {
         return rc;
     }
 
-    BufHead* leaf_bh = dir2_buf_read_dir_block(ctx, leaf_disk);
+    BufHead* leaf_bh = dir2_buf_get_dir_block(ctx, leaf_disk);
     if (leaf_bh == nullptr) {
         delete[] leaf_copy;
         brelse(block_bh);

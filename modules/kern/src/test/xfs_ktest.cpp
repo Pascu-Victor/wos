@@ -32,12 +32,32 @@ auto xfs_null_read(ker::dev::BlockDevice* dev, uint64_t /*blk*/, size_t count, v
 
 auto xfs_null_write(ker::dev::BlockDevice* /*dev*/, uint64_t /*blk*/, size_t /*count*/, const void* /*buf*/) -> int { return 0; }
 
+struct XfsReadCounter {
+    size_t calls = 0;
+};
+
+auto xfs_counting_read(ker::dev::BlockDevice* dev, uint64_t /*blk*/, size_t count, void* buf) -> int {
+    auto* counter = static_cast<XfsReadCounter*>(dev->private_data);
+    if (counter != nullptr) {
+        counter->calls++;
+    }
+    std::memset(buf, 0, count * dev->block_size);
+    return 0;
+}
+
 auto make_xfs_null_bdev() -> ker::dev::BlockDevice {
     ker::dev::BlockDevice d{};
     d.block_size = 512;
     d.total_blocks = 1024;
     d.read_blocks = xfs_null_read;
     d.write_blocks = xfs_null_write;
+    return d;
+}
+
+auto make_xfs_counting_bdev(XfsReadCounter* counter) -> ker::dev::BlockDevice {
+    ker::dev::BlockDevice d = make_xfs_null_bdev();
+    d.read_blocks = xfs_counting_read;
+    d.private_data = counter;
     return d;
 }
 
@@ -111,6 +131,28 @@ KTEST(XFS, DirectReadBatchIsBoundedAndBlockAligned) {
     KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_direct_read_batch_max_bytes(4096), static_cast<size_t>(1024 * 1024));
     KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_direct_read_batch_max_bytes(512), static_cast<size_t>(1024 * 1024));
     KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_direct_read_batch_max_bytes(3 * 1024 * 1024), static_cast<size_t>(3 * 1024 * 1024));
+}
+
+KTEST(XFS, BufGetMultiSkipsDeviceRead) {
+    XfsReadCounter counter{};
+    ker::dev::BlockDevice dev = make_xfs_counting_bdev(&counter);
+    ker::vfs::invalidate_bdev(&dev);
+
+    ker::vfs::xfs::XfsMountContext ctx{};
+    ctx.device = &dev;
+    ctx.block_size = 4096;
+    ctx.block_log = 12;
+    ctx.ag_blocks = 1024;
+    ctx.ag_blk_log = 10;
+
+    constexpr size_t COUNT = 2;
+    ker::vfs::BufHead* bh = ker::vfs::xfs::xfs_buf_get_multi(&ctx, ker::vfs::xfs::xfs_agbno_to_fsbno(0, 8, ctx.ag_blk_log), COUNT);
+    KREQUIRE_NE(bh, nullptr);
+    KEXPECT_EQ(counter.calls, static_cast<size_t>(0));
+    KEXPECT_EQ(bh->size, COUNT * ctx.block_size);
+
+    ker::vfs::brelse(bh);
+    ker::vfs::invalidate_bdev(&dev);
 }
 
 KTEST(XFS, HoleWriteStillCapsLargeAllocations) {

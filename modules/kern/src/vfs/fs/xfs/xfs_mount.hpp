@@ -127,6 +127,10 @@ auto xfs_buf_read_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) 
 // Use for newly allocated blocks that will be fully overwritten.
 auto xfs_buf_get(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead*;
 
+// Get `count` contiguous XFS filesystem blocks without reading from disk.
+// Use for newly allocated ranges that will be fully overwritten.
+auto xfs_buf_get_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) -> BufHead*;
+
 // Unmount - flush dirty buffers, close journal, free mount context.
 void xfs_unmount(XfsMountContext* ctx);
 

@@ -99,6 +99,21 @@ auto xfs_buf_get(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead* {
     return bget_multi(ctx->device, DEV_BLOCK, RATIO);
 }
 
+auto xfs_buf_get_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) -> BufHead* {
+    auto agno = static_cast<xfs_agnumber_t>(xfs_block >> ctx->ag_blk_log);
+    auto agbno = static_cast<xfs_agblock_t>(xfs_block & ((1ULL << ctx->ag_blk_log) - 1));
+    uint64_t const LINEAR_BLOCK = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
+
+    size_t const DEV_BLK_SIZE = ctx->device->block_size;
+    size_t const RATIO = ctx->block_size / DEV_BLK_SIZE;
+    uint64_t const DEV_BLOCK = LINEAR_BLOCK * RATIO;
+    size_t const DEV_COUNT = count * RATIO;
+    if (DEV_COUNT <= 1) {
+        return bget(ctx->device, DEV_BLOCK);
+    }
+    return bget_multi(ctx->device, DEV_BLOCK, DEV_COUNT);
+}
+
 namespace {
 
 // Read the AGF for a given AG and populate per_ag fields.

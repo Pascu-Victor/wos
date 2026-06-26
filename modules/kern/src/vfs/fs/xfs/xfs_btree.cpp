@@ -669,7 +669,7 @@ auto btree_alloc_new_block(XfsMountContext* mount, XfsTransaction* tp, xfs_agnum
     }
 
     uint64_t const ABS_BLOCK = xfs_agbno_to_fsbno(agno, agbno, mount->ag_blk_log);
-    BufHead* bh = xfs_buf_read(mount, ABS_BLOCK);
+    BufHead* bh = xfs_buf_get(mount, ABS_BLOCK);
     if (bh == nullptr) {
         xfs_alloc_put_freelist(mount, tp, agno, agbno);
         *out_bh = nullptr;
