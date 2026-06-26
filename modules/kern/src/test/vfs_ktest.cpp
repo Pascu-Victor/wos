@@ -185,6 +185,30 @@ KTEST(VFS, OpenFileFstatSnapshotHitsAndInvalidates) {
     KEXPECT_EQ(ker::vfs::vfs_unlink(PATH), 0);
 }
 
+KTEST(VFS, DevfsFstatSnapshotHits) {
+    constexpr const char PATH[] = "/dev/ktest-devfs";
+    ker::vfs::File file{};
+    file.fs_type = ker::vfs::FSType::DEVFS;
+    file.vfs_path = PATH;
+
+    ker::vfs::VfsCachePerfSnapshot before{};
+    ker::vfs::VfsCachePerfSnapshot after_first{};
+    ker::vfs::VfsCachePerfSnapshot after_second{};
+    ker::vfs::Stat st{};
+    ker::vfs::vfs_get_cache_perf_snapshot(before);
+
+    KEXPECT_EQ(ker::vfs::vfs_fstat_file(&file, &st), 0);
+    KEXPECT_EQ(st.st_mode & static_cast<mode_t>(ker::vfs::S_IFMT), static_cast<mode_t>(ker::vfs::S_IFCHR));
+    ker::vfs::vfs_get_cache_perf_snapshot(after_first);
+
+    KEXPECT_EQ(ker::vfs::vfs_fstat_file(&file, &st), 0);
+    ker::vfs::vfs_get_cache_perf_snapshot(after_second);
+
+    KEXPECT_TRUE(after_first.fstat_snapshot_stores > before.fstat_snapshot_stores);
+    KEXPECT_EQ(after_second.fstat_snapshot_miss_uncacheable, before.fstat_snapshot_miss_uncacheable);
+    KEXPECT_TRUE(after_second.fstat_snapshot_hits > after_first.fstat_snapshot_hits);
+}
+
 KTEST(VFS, PreadBypassesStreamCacheAndPreservesOffset) {
     ker::vfs::vfs_mkdir("/tmp", 0755);
 

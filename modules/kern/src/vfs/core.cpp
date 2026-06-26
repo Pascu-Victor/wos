@@ -993,6 +993,8 @@ auto file_stat_snapshot_anonymous_cacheable(const File* file) -> bool {
            (file->fs_type == FSType::TMPFS && file->fops != nullptr && file->fops != ker::vfs::tmpfs::get_tmpfs_fops());
 }
 
+auto file_stat_snapshot_path_cacheable_fs(FSType fs_type) -> bool { return metadata_cacheable_fs(fs_type) || fs_type == FSType::DEVFS; }
+
 auto file_stat_snapshot_cacheable(const File* file) -> bool {
     if (file == nullptr || (file->open_flags & ker::vfs::O_NO_CACHE) != 0) {
         return false;
@@ -1000,7 +1002,7 @@ auto file_stat_snapshot_cacheable(const File* file) -> bool {
     if (file->vfs_path == nullptr) {
         return file_stat_snapshot_anonymous_cacheable(file);
     }
-    return metadata_cacheable_fs(file->fs_type);
+    return file_stat_snapshot_path_cacheable_fs(file->fs_type);
 }
 
 auto file_stat_snapshot_prefetchable(const File* file) -> bool {
@@ -1021,9 +1023,18 @@ auto file_stat_snapshot_mode_cacheable(mode_t mode) -> bool {
     return TYPE == static_cast<mode_t>(S_IFREG) || TYPE == static_cast<mode_t>(S_IFDIR);
 }
 
+auto file_stat_snapshot_devfs_mode_cacheable(mode_t mode) -> bool {
+    mode_t const TYPE = mode & static_cast<mode_t>(S_IFMT);
+    return TYPE == static_cast<mode_t>(S_IFCHR) || TYPE == static_cast<mode_t>(S_IFBLK) || TYPE == static_cast<mode_t>(S_IFDIR) ||
+           TYPE == static_cast<mode_t>(S_IFLNK);
+}
+
 auto file_stat_snapshot_result_cacheable(const File* file, mode_t mode) -> bool {
     if (file_stat_snapshot_mode_cacheable(mode)) {
         return true;
+    }
+    if (file != nullptr && file->fs_type == FSType::DEVFS) {
+        return file_stat_snapshot_devfs_mode_cacheable(mode);
     }
     if (!file_stat_snapshot_anonymous_cacheable(file)) {
         return false;
