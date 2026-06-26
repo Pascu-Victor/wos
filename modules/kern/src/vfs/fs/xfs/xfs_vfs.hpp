@@ -69,7 +69,7 @@ auto xfs_selftest_mapped_append_can_zero_without_read(size_t write_pos, uint64_t
 auto xfs_selftest_direct_read_batch_max_bytes(size_t block_size) -> size_t;
 auto xfs_selftest_direct_fresh_write_discards_cache() -> bool;
 auto xfs_selftest_mapped_direct_overwrite_requires_uncached_range() -> bool;
-auto xfs_selftest_fresh_full_write_uses_buffer_cache() -> bool;
+auto xfs_selftest_fresh_full_write_can_bypass_buffer_cache() -> bool;
 auto xfs_selftest_parent_path_cache() -> bool;
 #endif
 

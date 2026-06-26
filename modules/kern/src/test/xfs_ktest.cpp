@@ -199,7 +199,7 @@ KTEST(XFS, CloseTrimDetectsActualEofPrealloc) { KEXPECT_TRUE(ker::vfs::xfs::xfs_
 
 KTEST(XFS, DirectFreshWriteDropsDirtyCacheAlias) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_direct_fresh_write_discards_cache()); }
 
-KTEST(XFS, FreshFullWriteUsesBufferCache) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_fresh_full_write_uses_buffer_cache()); }
+KTEST(XFS, FreshFullWriteCanBypassBufferCache) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_fresh_full_write_can_bypass_buffer_cache()); }
 
 KTEST(XFS, DentryCacheHitsAndInvalidates) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_dentry_cache_shortform()); }
 

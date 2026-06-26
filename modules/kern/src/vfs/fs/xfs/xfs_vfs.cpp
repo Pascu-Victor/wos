@@ -557,9 +557,7 @@ auto xfs_mapped_full_overwrite_can_write_direct(XfsMountContext* ctx, xfs_fsbloc
 }
 
 auto xfs_full_block_write_can_write_direct(XfsMountContext* ctx, xfs_fsblock_t fsbno, size_t bytes, bool fresh_allocation) -> bool {
-    if (fresh_allocation) {
-        return false;
-    }
+    (void)fresh_allocation;
     return xfs_mapped_full_overwrite_can_write_direct(ctx, fsbno, bytes);
 }
 
@@ -1827,7 +1825,7 @@ auto xfs_selftest_mapped_direct_overwrite_requires_uncached_range() -> bool {
     return xfs_mapped_full_overwrite_can_write_direct(&ctx, FSB, FS_BLOCK_SIZE);
 }
 
-auto xfs_selftest_fresh_full_write_uses_buffer_cache() -> bool {
+auto xfs_selftest_fresh_full_write_can_bypass_buffer_cache() -> bool {
     constexpr size_t DEVICE_BLOCK_SIZE = 512;
     constexpr size_t FS_BLOCK_SIZE = 4096;
     constexpr xfs_fsblock_t FSB = 16;
@@ -1843,8 +1841,20 @@ auto xfs_selftest_fresh_full_write_uses_buffer_cache() -> bool {
     ctx.ag_blocks = 1024;
     ctx.ag_blk_log = 10;
 
-    return !xfs_full_block_write_can_write_direct(&ctx, FSB, FS_BLOCK_SIZE, true) &&
-           xfs_full_block_write_can_write_direct(&ctx, FSB, FS_BLOCK_SIZE, false);
+    if (!xfs_full_block_write_can_write_direct(&ctx, FSB, FS_BLOCK_SIZE, true)) {
+        return false;
+    }
+
+    uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(&ctx, FSB);
+    size_t const DEV_COUNT = xfs_fsb_to_dev_count(&ctx, 1);
+    BufHead* cached = bget_multi(&dev, DEV_BLOCK, DEV_COUNT);
+    if (cached == nullptr) {
+        return false;
+    }
+    brelse(cached);
+    bool const CACHED_FRESH_BLOCKS_DIRECT = xfs_full_block_write_can_write_direct(&ctx, FSB, FS_BLOCK_SIZE, true);
+    invalidate_bdev(&dev);
+    return !CACHED_FRESH_BLOCKS_DIRECT;
 }
 
 auto xfs_selftest_parent_path_cache() -> bool {
