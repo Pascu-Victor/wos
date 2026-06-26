@@ -46,8 +46,9 @@ extern "C" auto __asan_region_is_poisoned(uintptr_t beg, size_t size) -> uintptr
 
 namespace {
 
-constexpr size_t ICACHE_BUCKETS = 1024;
+constexpr size_t ICACHE_BUCKETS = 16384;
 constexpr size_t ICACHE_HASH_MASK = ICACHE_BUCKETS - 1;
+static_assert((ICACHE_BUCKETS & (ICACHE_BUCKETS - 1)) == 0);
 constexpr size_t ICACHE_IDLE_RETAIN_MIN = 65536;
 constexpr size_t ICACHE_IDLE_RETAIN_MAX = 524288;
 constexpr uint64_t ICACHE_IDLE_RETAIN_BYTES_PER_INODE = 32ULL * 1024ULL;
