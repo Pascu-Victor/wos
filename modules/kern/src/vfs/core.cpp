@@ -291,6 +291,7 @@ void stream_detach_file(File* file);
 void stream_invalidate_file(File* file);
 void cache_notify_detach_file(File* file);
 void cache_notify_file_data_changed_impl(File* file);
+void cache_notify_file_metadata_changed_impl(File* file);
 void stream_invalidate_identity_locked(const StreamCacheIdentity& identity);
 void stream_gc_locked(uint64_t now_us);
 auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t start_offset, size_t* actual_size, ssize_t* result) -> bool;
@@ -2975,6 +2976,15 @@ void cache_notify_file_data_changed_impl(File* file) {
     if (cache_notify_invalidate_path_local(file->vfs_path)) {
         ker::net::wki::wki_remote_vfs_notify_path_changed(file->vfs_path, nullptr);
     }
+}
+
+void cache_notify_file_metadata_changed_impl(File* file) {
+    if (file == nullptr) {
+        return;
+    }
+
+    file_stat_snapshot_invalidate(file);
+    cache_notify_path_data_changed_impl(file->vfs_path, file->fs_type);
 }
 
 auto cache_notify_file_dirty_impl(File* file) -> bool {
@@ -7391,7 +7401,7 @@ auto vfs_fchmod(int fd, int mode) -> int {
                 return -EBADF;
             }
             node->mode = static_cast<uint32_t>(mode) & 07777;
-            cache_notify_file_data_changed_impl(f);
+            cache_notify_file_metadata_changed_impl(f);
             vfs_put_file(f);
             return 0;
         }
@@ -7402,7 +7412,7 @@ auto vfs_fchmod(int fd, int mode) -> int {
         case FSType::XFS: {
             int const RESULT = ker::vfs::xfs::xfs_fchmod(f, mode);
             if (RESULT == 0) {
-                cache_notify_file_data_changed_impl(f);
+                cache_notify_file_metadata_changed_impl(f);
             }
             vfs_put_file(f);
             return RESULT;
@@ -9121,6 +9131,38 @@ auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool {
     cache_notify_file_data_changed_impl(file);
 
     ok = ok && vfs_stat(PATH, &st) == 0 && st.st_size == static_cast<off_t>((sizeof(FIRST) - 1) + (sizeof(SECOND) - 1));
+
+    vfs_put_file(file);
+    ok = ok && vfs_unlink(PATH) == 0;
+    return ok;
+}
+
+auto vfs_selftest_file_metadata_change_invalidates_path_stat() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_file_metadata_stat_invalidation";
+    vfs_unlink(PATH);
+
+    auto* file = vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (file == nullptr || file->fs_type != FSType::TMPFS || file->private_data == nullptr) {
+        return false;
+    }
+
+    Stat st{};
+    bool ok = vfs_stat(PATH, &st) == 0 && (st.st_mode & 07777) == 0644;
+    ok = ok && vfs_stat(PATH, &st) == 0 && (st.st_mode & 07777) == 0644;
+
+    auto* node = static_cast<ker::vfs::tmpfs::TmpNode*>(file->private_data);
+    node->mode = 0755;
+
+    VfsCachePerfSnapshot before{};
+    VfsCachePerfSnapshot after{};
+    vfs_get_cache_perf_snapshot(before);
+    cache_notify_file_metadata_changed_impl(file);
+    vfs_get_cache_perf_snapshot(after);
+
+    ok = ok && after.stream_invalidate_empty_skips == before.stream_invalidate_empty_skips;
+    ok = ok && vfs_stat(PATH, &st) == 0 && (st.st_mode & 07777) == 0755;
 
     vfs_put_file(file);
     ok = ok && vfs_unlink(PATH) == 0;
