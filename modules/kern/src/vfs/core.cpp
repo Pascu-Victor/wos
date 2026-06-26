@@ -100,7 +100,7 @@ constexpr uint64_t ADVISORY_RANGE_EOF = UINT64_MAX;
 // checkout/configure/build metadata working sets much better.
 constexpr size_t METADATA_CACHE_SET_COUNT = 4096;
 constexpr size_t METADATA_CACHE_WAYS = 8;
-constexpr size_t METADATA_INVALIDATION_SET_COUNT = 2048;
+constexpr size_t METADATA_INVALIDATION_SET_COUNT = 8192;
 constexpr size_t METADATA_INVALIDATION_WAYS = 4;
 // Source-tree opens/stat calls repeatedly prove that hot ancestor directories
 // are not symlinks. Keep enough negative readlink entries to cover that working
