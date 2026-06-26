@@ -865,6 +865,24 @@ auto emit_proc_stat(Func& func, std::string_view name, std::string_view path) ->
 }
 
 template <typename Func>
+void for_each_process_main_stat(Func func) {
+    ScopedDir const DIR(opendir("/proc"));
+    if (!DIR.valid()) {
+        return;
+    }
+
+    dirent const* entry = nullptr;
+    while ((entry = readdir(DIR.get())) != nullptr) {
+        std::string_view const NAME{&entry->d_name[0]};
+        if (!is_all_digits(NAME)) {
+            continue;
+        }
+
+        (void)emit_proc_stat(func, NAME, build_proc_path(NAME, PROC_STAT_SUFFIX));
+    }
+}
+
+template <typename Func>
 void for_each_process_stat(Func func) {
     ScopedDir const DIR(opendir("/proc"));
     if (!DIR.valid()) {
@@ -4444,7 +4462,7 @@ void cmd_run(int argc, char** argv) {
 
     auto scan_target_group = [&]() {
         bool any_alive = false;
-        for_each_process_stat([&](const StatInfo& stat, std::string_view) {
+        for_each_process_main_stat([&](const StatInfo& stat, std::string_view) {
             if (std::cmp_equal(stat.pgid, target_pgid)) {
                 upsert_tracked(stat);
                 if (stat.state != EXITED_STATE) {
