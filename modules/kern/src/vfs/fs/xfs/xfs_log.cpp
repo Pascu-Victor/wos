@@ -69,6 +69,37 @@ auto xfs_log_serialize_body(const XfsTransItem* items, int item_count, uint8_t* 
     return 0;
 }
 
+auto xfs_log_write_header_bytes(const XlogRecHeader& hdr, uint8_t* dst, uint32_t block_size) -> int {
+    if (dst == nullptr || block_size == 0) {
+        return -EINVAL;
+    }
+
+    __builtin_memset(dst, 0, block_size);
+    size_t write_len = sizeof(XlogRecHeader);
+    write_len = std::min<size_t>(write_len, block_size);
+    __builtin_memcpy(dst, &hdr, write_len);
+
+    auto* on_disk_hdr = reinterpret_cast<XlogRecHeader*>(dst);
+    on_disk_hdr->h_crc = 0;
+    uint32_t const HDR_CRC = util::crc32c_compute(dst, write_len);
+    on_disk_hdr->h_crc = HDR_CRC;  // little-endian on disk
+    return 0;
+}
+
+void xfs_log_advance_head(XfsLog* log, uint32_t old_head, uint32_t new_head) {
+    if (log == nullptr) {
+        return;
+    }
+
+    log->tail_block = old_head;
+    log->tail_cycle = log->head_cycle;
+    log->head_block = new_head;
+    if (new_head < old_head) {
+        log->head_cycle++;
+    }
+    log->clean = false;
+}
+
 // Scan the log to find head and tail positions.
 // Returns 0 on success, fills head/tail_cycle/block fields in the log struct.
 auto xfs_log_find_head_tail(XfsLog* log) -> int {
@@ -426,34 +457,49 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     hdr.h_fs_uuid = mount->uuid;
     hdr.h_size = Be32::from_cpu(BLOCK_SIZE);
 
+    uint64_t const HDR_DISK_BLOCK = log->log_start + HEAD;
+    uint32_t cur_block = (HEAD + 1) % log->log_blocks;
+    uint32_t body_offset = 0;
+
+    if (DATA_BLOCKS == 1 && HEAD <= log->log_blocks - TOTAL_BLOCKS) {
+        BufHead* record_bh = xfs_buf_get_multi(mount, HDR_DISK_BLOCK, TOTAL_BLOCKS);
+        if (record_bh == nullptr) {
+            return -EIO;
+        }
+
+        int rc = xfs_log_write_header_bytes(hdr, record_bh->data, BLOCK_SIZE);
+        if (rc == 0) {
+            uint8_t* body_dst = record_bh->data + BLOCK_SIZE;
+            __builtin_memset(body_dst, 0, BLOCK_SIZE);
+            rc = xfs_log_serialize_body(items, item_count, body_dst, BLOCK_SIZE);
+        }
+        if (rc != 0) {
+            brelse(record_bh);
+            return rc;
+        }
+
+        bdirty(record_bh);
+        brelse(record_bh);
+        cur_block = (HEAD + TOTAL_BLOCKS) % log->log_blocks;
+        xfs_log_advance_head(log, HEAD, cur_block);
+        return 0;
+    }
+
     // Write header block - use xfs_buf_get (not xfs_buf_read) since we
     // immediately zero and overwrite the entire block; no need to read from disk.
-    uint64_t const HDR_DISK_BLOCK = log->log_start + HEAD;
     BufHead* hdr_bh = xfs_buf_get(mount, HDR_DISK_BLOCK);
     if (hdr_bh == nullptr) {
         return -EIO;
     }
 
-    // Zero the block and write the header (header is 1052B, but we write
-    // just the first XLOG_HEADER_SIZE=512 bytes per the on-disk format;
-    // the h_cycle_data array extends beyond but is part of the same struct)
-    __builtin_memset(hdr_bh->data, 0, BLOCK_SIZE);
-    size_t write_len = sizeof(XlogRecHeader);
-    write_len = std::min<size_t>(write_len, BLOCK_SIZE);
-    __builtin_memcpy(hdr_bh->data, &hdr, write_len);
-
-    // Compute CRC over the header
-    auto* on_disk_hdr = reinterpret_cast<XlogRecHeader*>(hdr_bh->data);
-    on_disk_hdr->h_crc = 0;
-    uint32_t const HDR_CRC = util::crc32c_compute(hdr_bh->data, write_len);
-    on_disk_hdr->h_crc = HDR_CRC;  // little-endian on disk
+    int const HEADER_RC = xfs_log_write_header_bytes(hdr, hdr_bh->data, BLOCK_SIZE);
+    if (HEADER_RC != 0) {
+        brelse(hdr_bh);
+        return HEADER_RC;
+    }
 
     bdirty(hdr_bh);
     brelse(hdr_bh);
-
-    // Write body data blocks
-    uint32_t cur_block = (HEAD + 1) % log->log_blocks;
-    uint32_t body_offset = 0;
 
     if (DATA_BLOCKS == 1) {
         uint64_t const DATA_DISK_BLOCK = log->log_start + cur_block;
@@ -470,13 +516,7 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
         bdirty(data_bh);
         brelse(data_bh);
         cur_block = (cur_block + 1) % log->log_blocks;
-        log->tail_block = HEAD;
-        log->tail_cycle = log->head_cycle;
-        log->head_block = cur_block;
-        if (cur_block < HEAD) {
-            log->head_cycle++;
-        }
-        log->clean = false;
+        xfs_log_advance_head(log, HEAD, cur_block);
         return 0;
     }
 
@@ -534,13 +574,7 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     }
 
     // Advance the log head
-    log->tail_block = HEAD;
-    log->tail_cycle = log->head_cycle;
-    log->head_block = cur_block;
-    if (cur_block < HEAD) {
-        log->head_cycle++;
-    }
-    log->clean = false;
+    xfs_log_advance_head(log, HEAD, cur_block);
 
     return 0;
 }
