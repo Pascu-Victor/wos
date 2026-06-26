@@ -2161,6 +2161,29 @@ auto xfs_file_mount_context(File* f) -> XfsMountContext* {
     return xfd != nullptr ? xfd->mount : nullptr;
 }
 
+auto xfs_file_regular_identity(File* f, XfsMountContext** mount_out, uint64_t* ino_out) -> bool {
+    if (mount_out != nullptr) {
+        *mount_out = nullptr;
+    }
+    if (ino_out != nullptr) {
+        *ino_out = 0;
+    }
+    if (f == nullptr) {
+        return false;
+    }
+    auto* xfd = static_cast<XfsFileData*>(f->private_data);
+    if (xfd == nullptr || xfd->mount == nullptr || xfd->inode == nullptr || !xfs_inode_isreg(xfd->inode)) {
+        return false;
+    }
+    if (mount_out != nullptr) {
+        *mount_out = xfd->mount;
+    }
+    if (ino_out != nullptr) {
+        *ino_out = xfd->inode->ino;
+    }
+    return true;
+}
+
 auto xfs_statvfs(XfsMountContext* ctx, ker::vfs::Statvfs* buf) -> int {
     if (ctx == nullptr || buf == nullptr) {
         return -EINVAL;

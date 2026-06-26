@@ -38,6 +38,9 @@ auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int;
 // Return the mount context backing an open XFS file.
 auto xfs_file_mount_context(File* f) -> XfsMountContext*;
 
+// Return the stream-cache identity pieces for an open regular XFS file.
+auto xfs_file_regular_identity(File* f, XfsMountContext** mount_out, uint64_t* ino_out) -> bool;
+
 // Atomically append to an open file and return the starting append offset.
 auto xfs_write_append(File* f, const void* buf, size_t count, size_t* offset_out) -> ssize_t;
 

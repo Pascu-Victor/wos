@@ -2368,6 +2368,24 @@ auto stream_scope_key_for_mount(const MountPoint* mount) -> const void* {
     return mount;
 }
 
+auto stream_build_xfs_open_identity(File* file, StreamCacheIdentity* identity) -> bool {
+    if (file == nullptr || identity == nullptr || file->fs_type != FSType::XFS) {
+        return false;
+    }
+
+    ker::vfs::xfs::XfsMountContext* mount = nullptr;
+    uint64_t ino = 0;
+    if (!ker::vfs::xfs::xfs_file_regular_identity(file, &mount, &ino) || mount == nullptr || ino == 0) {
+        return false;
+    }
+
+    *identity = {};
+    identity->scope_key = mount;
+    identity->fs_type = FSType::XFS;
+    identity->ino = static_cast<ino_t>(ino);
+    return true;
+}
+
 void fill_tmpfs_stat_timestamps(const ker::vfs::tmpfs::TmpNode* node, Stat* statbuf) {
     if (node == nullptr || statbuf == nullptr) {
         return;
@@ -2749,14 +2767,16 @@ void stream_invalidate_file(File* file) {
         return;
     }
 
-    Stat st = {};
-    if (vfs_stream_cache_get_file_stat(file, &st) != 0) {
-        return;
-    }
-
     StreamCacheIdentity identity = {};
-    if (stream_build_identity(file, st, &identity, nullptr, nullptr, nullptr) != 0) {
-        return;
+    if (!stream_build_xfs_open_identity(file, &identity)) {
+        Stat st = {};
+        if (vfs_stream_cache_get_file_stat(file, &st) != 0) {
+            return;
+        }
+
+        if (stream_build_identity(file, st, &identity, nullptr, nullptr, nullptr) != 0) {
+            return;
+        }
     }
 
     g_stream_cache_lock.lock();
