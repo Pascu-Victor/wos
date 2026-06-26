@@ -73,6 +73,9 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (task == nullptr) {
                 return -ESRCH;
             }
+            if (DIRFD == ker::vfs::AT_FDCWD) {
+                return static_cast<int64_t>(ker::vfs::vfs_open(pathname, FLAGS, MODE));
+            }
             std::array<char, 512> resolved{};
             int const RES = ker::vfs::vfs_resolve_dirfd(task, DIRFD, pathname, resolved.data(), resolved.size());
             if (RES < 0) {
@@ -218,6 +221,12 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (task == nullptr) {
                 return -ESRCH;
             }
+            if (DIRFD == ker::vfs::AT_FDCWD) {
+                if ((FLAGS & AT_SYMLINK_NOFOLLOW_FLAG) != 0) {
+                    return static_cast<int64_t>(ker::vfs::vfs_lstat(pathname, statbuf));
+                }
+                return static_cast<int64_t>(ker::vfs::vfs_stat(pathname, statbuf));
+            }
             std::array<char, 512> resolved{};
             int const RES = ker::vfs::vfs_resolve_dirfd(task, DIRFD, pathname, resolved.data(), resolved.size());
             if (RES < 0) {
@@ -344,6 +353,9 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (task == nullptr) {
                 return -ESRCH;
             }
+            if (DIRFD == ker::vfs::AT_FDCWD) {
+                return static_cast<int64_t>(ker::vfs::vfs_access(pathname, MODE));
+            }
             std::array<char, 512> resolved{};
             int const RES = ker::vfs::vfs_resolve_dirfd(task, DIRFD, pathname, resolved.data(), resolved.size());
             if (RES < 0) {
@@ -358,6 +370,12 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
                 return -ESRCH;
+            }
+            if (DIRFD == ker::vfs::AT_FDCWD) {
+                if ((FLAGS & 0x200) != 0) {  // AT_REMOVEDIR
+                    return static_cast<int64_t>(ker::vfs::vfs_rmdir(pathname));
+                }
+                return static_cast<int64_t>(ker::vfs::vfs_unlink(pathname));
             }
             std::array<char, 512> resolved{};
             int const RES = ker::vfs::vfs_resolve_dirfd(task, DIRFD, pathname, resolved.data(), resolved.size());
@@ -377,6 +395,9 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
                 return -ESRCH;
+            }
+            if (OLDDIRFD == ker::vfs::AT_FDCWD && NEWDIRFD == ker::vfs::AT_FDCWD) {
+                return static_cast<int64_t>(ker::vfs::vfs_rename(oldpath, newpath));
             }
             std::array<char, 512> resolved_old{};
             std::array<char, 512> resolved_new{};
