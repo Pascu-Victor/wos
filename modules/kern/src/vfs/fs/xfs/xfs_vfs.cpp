@@ -545,6 +545,13 @@ auto xfs_mapped_full_overwrite_can_write_direct(XfsMountContext* ctx, xfs_fsbloc
     return !has_cached_bdev_range(ctx->device, DEV_BLOCK, DEV_COUNT);
 }
 
+auto xfs_full_block_write_can_write_direct(XfsMountContext* ctx, xfs_fsblock_t fsbno, size_t bytes, bool fresh_allocation) -> bool {
+    if (fresh_allocation) {
+        return false;
+    }
+    return xfs_mapped_full_overwrite_can_write_direct(ctx, fsbno, bytes);
+}
+
 auto xfs_fsb_to_dev_count(XfsMountContext* ctx, xfs_filblks_t fsb_count) -> size_t {
     return static_cast<size_t>(fsb_count) * (ctx->block_size / ctx->device->block_size);
 }
@@ -1026,7 +1033,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
                     size_t const BATCH_BLOCKS = std::min(full_blocks, MAX_BATCH_BLOCKS);
                     size_t const BATCH_BYTES = BATCH_BLOCKS << ctx->block_log;
                     bool const DIRECT_FULL_WRITE =
-                        fresh_allocation || xfs_mapped_full_overwrite_can_write_direct(ctx, current_disk_block, BATCH_BYTES);
+                        xfs_full_block_write_can_write_direct(ctx, current_disk_block, BATCH_BYTES, fresh_allocation);
                     if (DIRECT_FULL_WRITE) {
                         int const RC = xfs_direct_write_full_blocks(ctx, current_disk_block, src + current_src_offset, BATCH_BYTES);
                         if (RC != 0) {
@@ -1786,6 +1793,26 @@ auto xfs_selftest_mapped_direct_overwrite_requires_uncached_range() -> bool {
     }
 
     return xfs_mapped_full_overwrite_can_write_direct(&ctx, FSB, FS_BLOCK_SIZE);
+}
+
+auto xfs_selftest_fresh_full_write_uses_buffer_cache() -> bool {
+    constexpr size_t DEVICE_BLOCK_SIZE = 512;
+    constexpr size_t FS_BLOCK_SIZE = 4096;
+    constexpr xfs_fsblock_t FSB = 16;
+
+    dev::BlockDevice dev{};
+    dev.block_size = DEVICE_BLOCK_SIZE;
+    dev.total_blocks = 1024;
+
+    XfsMountContext ctx{};
+    ctx.device = &dev;
+    ctx.block_size = FS_BLOCK_SIZE;
+    ctx.block_log = 12;
+    ctx.ag_blocks = 1024;
+    ctx.ag_blk_log = 10;
+
+    return !xfs_full_block_write_can_write_direct(&ctx, FSB, FS_BLOCK_SIZE, true) &&
+           xfs_full_block_write_can_write_direct(&ctx, FSB, FS_BLOCK_SIZE, false);
 }
 
 auto xfs_selftest_parent_path_cache() -> bool {
