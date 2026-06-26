@@ -7340,7 +7340,7 @@ auto vfs_fchmod(int fd, int mode) -> int {
                 return -EBADF;
             }
             node->mode = static_cast<uint32_t>(mode) & 07777;
-            vfs_cache_notify_file_changed(f);
+            cache_notify_file_data_changed_impl(f);
             vfs_put_file(f);
             return 0;
         }
@@ -7351,7 +7351,7 @@ auto vfs_fchmod(int fd, int mode) -> int {
         case FSType::XFS: {
             int const RESULT = ker::vfs::xfs::xfs_fchmod(f, mode);
             if (RESULT == 0) {
-                vfs_cache_notify_file_changed(f);
+                cache_notify_file_data_changed_impl(f);
             }
             vfs_put_file(f);
             return RESULT;
@@ -7440,7 +7440,7 @@ auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int {
             if (std::cmp_not_equal(group, -1)) {
                 node->gid = group;
             }
-            vfs_cache_notify_file_changed(f);
+            cache_notify_file_data_changed_impl(f);
             vfs_put_file(f);
             return 0;
         }
