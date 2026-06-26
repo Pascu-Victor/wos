@@ -128,6 +128,7 @@ struct MetadataCacheEntry {
 };
 
 struct MetadataCacheSet {
+    ker::mod::sys::Mutex lock;
     std::array<MetadataCacheEntry, METADATA_CACHE_WAYS> ways{};
 };
 
@@ -147,6 +148,7 @@ struct SymlinkCacheEntry {
 };
 
 struct SymlinkCacheSet {
+    ker::mod::sys::Mutex lock;
     std::array<SymlinkCacheEntry, SYMLINK_CACHE_WAYS> ways{};
 };
 
@@ -225,7 +227,6 @@ struct AdvisoryLock {
 };
 
 std::array<MetadataCacheSet, METADATA_CACHE_SET_COUNT> g_metadata_cache{};
-ker::mod::sys::Mutex g_metadata_cache_lock;
 // Path metadata/readlink caches use path-scoped invalidation generations.
 // g_metadata_cache_epoch remains the conservative public epoch exposed for
 // diagnostics and external cache consumers that need a simple global token.
@@ -235,7 +236,6 @@ std::atomic<uint64_t> g_metadata_cache_clock{0};
 std::atomic<uint64_t> g_metadata_observation_epoch{1};
 
 std::array<SymlinkCacheSet, SYMLINK_CACHE_SET_COUNT> g_symlink_cache{};
-ker::mod::sys::Mutex g_symlink_cache_lock;
 std::atomic<uint64_t> g_symlink_cache_clock{0};
 
 std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT> g_metadata_subtree_invalidations{};
@@ -1209,7 +1209,7 @@ auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bo
     bool cache_hit = false;
     int cache_result = -EAGAIN;
     {
-        ker::mod::sys::MutexGuard guard(g_metadata_cache_lock);
+        ker::mod::sys::MutexGuard guard(set.lock);
         for (auto& entry : set.ways) {
             if (!entry.valid) {
                 continue;
@@ -1281,7 +1281,7 @@ void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, boo
     auto& set = g_metadata_cache[HASH & (METADATA_CACHE_SET_COUNT - 1)];
 
     {
-        ker::mod::sys::MutexGuard guard(g_metadata_cache_lock);
+        ker::mod::sys::MutexGuard guard(set.lock);
         MetadataCacheEntry* victim = &set.ways.front();
         for (auto& entry : set.ways) {
             if (entry.valid && entry.epoch == EPOCH && entry.hash == HASH && entry.path_len == PATH_LEN && entry.fs_type == fs_type &&
@@ -1344,7 +1344,7 @@ auto symlink_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, cha
     bool cache_hit = false;
     ssize_t cache_result = 0;
     {
-        ker::mod::sys::MutexGuard guard(g_symlink_cache_lock);
+        ker::mod::sys::MutexGuard guard(set.lock);
         for (auto& entry : set.ways) {
             if (!entry.valid || entry.epoch != EPOCH || entry.hash != HASH || entry.path_len != PATH_LEN || entry.fs_type != fs_type ||
                 entry.dev_id != dev_id) {
@@ -1406,7 +1406,7 @@ void symlink_cache_store(const char* path, FSType fs_type, uint64_t dev_id, ssiz
     auto& set = g_symlink_cache[HASH & (SYMLINK_CACHE_SET_COUNT - 1)];
 
     {
-        ker::mod::sys::MutexGuard guard(g_symlink_cache_lock);
+        ker::mod::sys::MutexGuard guard(set.lock);
         SymlinkCacheEntry* victim = &set.ways.front();
         for (auto& entry : set.ways) {
             if (entry.valid && entry.epoch == EPOCH && entry.hash == HASH && entry.path_len == PATH_LEN && entry.fs_type == fs_type &&
