@@ -2591,12 +2591,16 @@ void throttle_dirty_buffer_cache(dev::BlockDevice* bdev) {
         return;
     }
 
-    kick_dirty_buffer_cache_writeback(bdev);
-
     uint64_t irqflags = cache_lock.lock_irqsave();
-    bool should_wait = cache_dirty_bytes > dirty_hard_limit_bytes_locked();
+    DirtyBdevState* state = find_dirty_bdev_state_locked(bdev);
+    bool const SHOULD_REQUEST_WRITEBACK =
+        cache_dirty_bytes > dirty_target_bytes_locked() && (dirty_index_degraded || (state != nullptr && state->dirty_buffers != 0));
+    bool const SHOULD_WAIT = cache_dirty_bytes > dirty_hard_limit_bytes_locked();
     cache_lock.unlock_irqrestore(irqflags);
-    if (!should_wait) {
+    if (SHOULD_REQUEST_WRITEBACK) {
+        static_cast<void>(request_dirty_writeback());
+    }
+    if (!SHOULD_WAIT) {
         return;
     }
 
