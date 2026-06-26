@@ -61,6 +61,7 @@ constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
 constexpr xfs_extlen_t XFS_WRITE_BATCH_BLOCKS = 65536;  // up to 256 MiB per transaction
 constexpr size_t XFS_BUFFERED_WRITE_BATCH_MAX_BYTES = size_t{4} * 1024 * 1024;
 constexpr size_t XFS_DIRTY_THROTTLE_INTERVAL_BYTES = size_t{4} * 1024 * 1024;
+constexpr size_t XFS_DIRECT_FRESH_PARTIAL_MAX_BYTES = 4096;
 constexpr size_t XFS_STREAM_PREALLOC_TRIGGER_BYTES = size_t{512} * 1024;
 constexpr xfs_extlen_t XFS_STREAM_PREALLOC_BLOCKS = 1024;  // 4 MiB
 constexpr uint32_t XFS_STREAM_PREALLOC_EXTENT_MARGIN = 8;
@@ -506,6 +507,18 @@ auto xfs_direct_write_fresh_blocks(XfsMountContext* ctx, xfs_fsblock_t fsbno, co
         discard_bdev_range(ctx->device, DEV_BLOCK, DEV_COUNT);
     }
     return RC;
+}
+
+auto xfs_direct_write_fresh_partial_block(XfsMountContext* ctx, xfs_fsblock_t fsbno, size_t block_off, const uint8_t* src, size_t bytes)
+    -> int {
+    if (ctx == nullptr || src == nullptr || ctx->block_size == 0 || block_off >= ctx->block_size || bytes == 0 ||
+        bytes > ctx->block_size - block_off || ctx->block_size > XFS_DIRECT_FRESH_PARTIAL_MAX_BYTES) {
+        return -EINVAL;
+    }
+
+    std::array<uint8_t, XFS_DIRECT_FRESH_PARTIAL_MAX_BYTES> block{};
+    std::memcpy(block.data() + block_off, src, bytes);
+    return xfs_direct_write_fresh_blocks(ctx, fsbno, block.data(), ctx->block_size);
 }
 
 auto xfs_fsb_to_dev_count(XfsMountContext* ctx, xfs_filblks_t fsb_count) -> size_t {
@@ -1021,21 +1034,27 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
             }
 
             size_t const CHUNK = std::min(ctx->block_size - block_off, remaining_bytes);
-            BufHead* bp = fresh_allocation ? xfs_buf_get(ctx, current_disk_block) : xfs_buf_read(ctx, current_disk_block);
-            if (bp == nullptr) {
-                ok = false;
-                break;
-            }
+            if (fresh_allocation && ctx->block_size <= XFS_DIRECT_FRESH_PARTIAL_MAX_BYTES) {
+                int const RC = xfs_direct_write_fresh_partial_block(ctx, current_disk_block, block_off, src + current_src_offset, CHUNK);
+                if (RC != 0) {
+                    ok = false;
+                    break;
+                }
+            } else {
+                BufHead* bp = fresh_allocation ? xfs_buf_get(ctx, current_disk_block) : xfs_buf_read(ctx, current_disk_block);
+                if (bp == nullptr) {
+                    ok = false;
+                    break;
+                }
 
-            // Freshly allocated partial blocks have no meaningful old contents.
-            // Zero the full filesystem block so unwritten bytes stay hole-like.
-            if (fresh_allocation) {
-                std::memset(bp->data, 0, ctx->block_size);
+                if (fresh_allocation) {
+                    std::memset(bp->data, 0, ctx->block_size);
+                }
+                std::memcpy(bp->data + block_off, src + current_src_offset, CHUNK);
+                bdirty(bp);
+                brelse(bp);
+                account_dirty_write(CHUNK);
             }
-            std::memcpy(bp->data + block_off, src + current_src_offset, CHUNK);
-            bdirty(bp);
-            brelse(bp);
-            account_dirty_write(CHUNK);
 
             remaining_bytes -= CHUNK;
             current_src_offset += CHUNK;
@@ -1150,7 +1169,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
             }
 
             // Write the data blocks covered by this allocation, using direct
-            // full-block I/O while keeping partial head/tail blocks buffered.
+            // I/O for fresh full blocks and bounded fresh partial blocks.
             uint64_t const SIZE_BEFORE_ALLOC = ip->size;
             bool const DIRTY_BEFORE_ALLOC = ip->dirty;
             size_t const EXTENT_BYTES = static_cast<size_t>(alloc_result.len) << ctx->block_log;
@@ -1624,6 +1643,9 @@ auto xfs_selftest_direct_fresh_write_discards_cache() -> bool {
     constexpr size_t DEVICE_BLOCK_SIZE = 512;
     constexpr size_t FS_BLOCK_SIZE = 4096;
     constexpr xfs_fsblock_t FSB = 8;
+    constexpr xfs_fsblock_t PARTIAL_FSB = 9;
+    constexpr size_t PARTIAL_OFF = 17;
+    constexpr size_t PARTIAL_BYTES = 123;
 
     XfsDirectWriteSelftestState state{};
     dev::BlockDevice dev{};
@@ -1661,8 +1683,42 @@ auto xfs_selftest_direct_fresh_write_discards_cache() -> bool {
     int const RC = xfs_direct_write_fresh_blocks(&ctx, FSB, src.data(), src.size());
     bool const OK = RC == 0 && state.write_calls == 1 && state.last_block == DEV_BLOCK && state.last_count == DEV_COUNT &&
                     std::memcmp(state.last_data.data(), src.data(), src.size()) == 0 && !has_dirty_bdev_range(&dev, DEV_BLOCK, DEV_COUNT);
+    if (!OK) {
+        invalidate_bdev(&dev);
+        return false;
+    }
+
+    uint64_t const PARTIAL_DEV_BLOCK = xfs_fsblock_to_dev_block(&ctx, PARTIAL_FSB);
+    BufHead* partial_stale = bget_multi(&dev, PARTIAL_DEV_BLOCK, DEV_COUNT);
+    if (partial_stale == nullptr) {
+        invalidate_bdev(&dev);
+        return false;
+    }
+    std::memset(partial_stale->data, 0x5A, partial_stale->size);
+    bdirty(partial_stale);
+    brelse(partial_stale);
+    if (!has_dirty_bdev_range(&dev, PARTIAL_DEV_BLOCK, DEV_COUNT)) {
+        invalidate_bdev(&dev);
+        return false;
+    }
+
+    state = {};
+    std::array<uint8_t, PARTIAL_BYTES> partial_src{};
+    for (size_t i = 0; i < partial_src.size(); ++i) {
+        partial_src.at(i) = static_cast<uint8_t>(0x80U | (i & 0x7FU));
+    }
+
+    int const PARTIAL_RC = xfs_direct_write_fresh_partial_block(&ctx, PARTIAL_FSB, PARTIAL_OFF, partial_src.data(), partial_src.size());
+    bool partial_ok = PARTIAL_RC == 0 && state.write_calls == 1 && state.last_block == PARTIAL_DEV_BLOCK && state.last_count == DEV_COUNT &&
+                      !has_dirty_bdev_range(&dev, PARTIAL_DEV_BLOCK, DEV_COUNT);
+    for (size_t i = 0; partial_ok && i < state.last_data.size(); ++i) {
+        uint8_t const EXPECTED =
+            (i >= PARTIAL_OFF && i < PARTIAL_OFF + PARTIAL_BYTES) ? partial_src.at(i - PARTIAL_OFF) : static_cast<uint8_t>(0);
+        partial_ok = state.last_data.at(i) == EXPECTED;
+    }
+
     invalidate_bdev(&dev);
-    return OK;
+    return partial_ok;
 }
 
 auto xfs_selftest_parent_path_cache() -> bool {
