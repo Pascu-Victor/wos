@@ -474,6 +474,27 @@ auto is_reclaimable_clean_buffer(const BufHead* bh) -> bool {
     return bh->refcount.load(std::memory_order_relaxed) == 0 && (bh->flags & BLOCKING_FLAGS) == 0;
 }
 
+auto buffer_tree_priority_mix(uint64_t value) -> uint64_t {
+    value ^= value >> 33U;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33U;
+    value *= 0xc4ceb9fe1a85ec53ULL;
+    value ^= value >> 33U;
+    return value == 0 ? 1 : value;
+}
+
+auto buffer_tree_priority_for(const BufHead* bh) -> uint64_t {
+    auto value = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bh));
+    value ^= bh->block_no;
+    value ^= static_cast<uint64_t>(bh->size) << 17U;
+    value ^= static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bh->bdev)) >> 4U;
+    return buffer_tree_priority_mix(value);
+}
+
+auto buffer_tree_priority(const BufHead* bh) -> uint64_t {
+    return bh->tree_priority != 0 ? bh->tree_priority : buffer_tree_priority_for(bh);
+}
+
 auto find_reclaimable_lru_buffer(size_t scan_budget = SIZE_MAX) -> BufHead* {
     size_t scanned = 0;
     for (BufHead* cur = lru_tail(); cur != nullptr && cur != &lru_sentinel;) {
@@ -529,6 +550,7 @@ auto alloc_buffer_with_size(dev::BlockDevice* bdev, uint64_t block_no, size_t si
     bh->refcount.store(1, std::memory_order_relaxed);
     bh->flags = initial_flags | data_flags;
     bh->size = size;
+    bh->tree_priority = buffer_tree_priority_for(bh);
     bh->writeback_epoch = 0;
     bh->dirty_epoch = 0;
     bh->writeback_dirty_epoch = 0;
@@ -652,23 +674,6 @@ auto dirty_buffers_overlap(const BufHead* lhs, const BufHead* rhs) -> bool {
 }
 
 auto range_buffer_last_block(const BufHead* bh) -> uint64_t { return block_range_last_block(bh->block_no, buffer_block_count(bh)); }
-
-auto range_priority_mix(uint64_t value) -> uint64_t {
-    value ^= value >> 33U;
-    value *= 0xff51afd7ed558ccdULL;
-    value ^= value >> 33U;
-    value *= 0xc4ceb9fe1a85ec53ULL;
-    value ^= value >> 33U;
-    return value == 0 ? 1 : value;
-}
-
-auto range_priority(const BufHead* bh) -> uint64_t {
-    auto value = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bh));
-    value ^= bh->block_no;
-    value ^= static_cast<uint64_t>(bh->size) << 17U;
-    value ^= static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bh->bdev)) >> 4U;
-    return range_priority_mix(value);
-}
 
 auto range_tree_less(const BufHead* lhs, const BufHead* rhs) -> bool {
     uint64_t const LHS_LAST = range_buffer_last_block(lhs);
@@ -815,7 +820,7 @@ void range_tree_insert(RangeBdevState* state, BufHead* bh) {
     }
     range_recompute_upwards(parent);
 
-    while (bh->range_parent != nullptr && range_priority(bh) < range_priority(bh->range_parent)) {
+    while (bh->range_parent != nullptr && buffer_tree_priority(bh) < buffer_tree_priority(bh->range_parent)) {
         if (bh->range_parent->range_left == bh) {
             range_rotate_right(state, bh->range_parent);
         } else {
@@ -826,7 +831,8 @@ void range_tree_insert(RangeBdevState* state, BufHead* bh) {
 
 void range_tree_remove(RangeBdevState* state, BufHead* bh) {
     while (bh->range_left != nullptr || bh->range_right != nullptr) {
-        if (bh->range_right == nullptr || (bh->range_left != nullptr && range_priority(bh->range_left) < range_priority(bh->range_right))) {
+        if (bh->range_right == nullptr ||
+            (bh->range_left != nullptr && buffer_tree_priority(bh->range_left) < buffer_tree_priority(bh->range_right))) {
             range_rotate_right(state, bh);
         } else {
             range_rotate_left(state, bh);
@@ -1041,23 +1047,6 @@ void discard_clean_overlapping_aliases_locked(BufHead* source) {
     }
 }
 
-auto dirty_priority_mix(uint64_t value) -> uint64_t {
-    value ^= value >> 33U;
-    value *= 0xff51afd7ed558ccdULL;
-    value ^= value >> 33U;
-    value *= 0xc4ceb9fe1a85ec53ULL;
-    value ^= value >> 33U;
-    return value == 0 ? 1 : value;
-}
-
-auto dirty_priority(const BufHead* bh) -> uint64_t {
-    auto value = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bh));
-    value ^= bh->block_no;
-    value ^= static_cast<uint64_t>(bh->size) << 17U;
-    value ^= static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bh->bdev)) >> 4U;
-    return dirty_priority_mix(value);
-}
-
 auto dirty_tree_less(const BufHead* lhs, const BufHead* rhs) -> bool {
     uint64_t const LHS_LAST = dirty_buffer_last_block(lhs);
     uint64_t const RHS_LAST = dirty_buffer_last_block(rhs);
@@ -1229,7 +1218,7 @@ void dirty_tree_insert(DirtyBdevState* state, BufHead* bh) {
     }
     dirty_recompute_upwards(parent);
 
-    while (bh->dirty_parent != nullptr && dirty_priority(bh) < dirty_priority(bh->dirty_parent)) {
+    while (bh->dirty_parent != nullptr && buffer_tree_priority(bh) < buffer_tree_priority(bh->dirty_parent)) {
         if (bh->dirty_parent->dirty_left == bh) {
             dirty_rotate_right(state, bh->dirty_parent);
         } else {
@@ -1240,7 +1229,8 @@ void dirty_tree_insert(DirtyBdevState* state, BufHead* bh) {
 
 void dirty_tree_remove(DirtyBdevState* state, BufHead* bh) {
     while (bh->dirty_left != nullptr || bh->dirty_right != nullptr) {
-        if (bh->dirty_right == nullptr || (bh->dirty_left != nullptr && dirty_priority(bh->dirty_left) < dirty_priority(bh->dirty_right))) {
+        if (bh->dirty_right == nullptr ||
+            (bh->dirty_left != nullptr && buffer_tree_priority(bh->dirty_left) < buffer_tree_priority(bh->dirty_right))) {
             dirty_rotate_right(state, bh);
         } else {
             dirty_rotate_left(state, bh);

@@ -34,6 +34,7 @@ struct BufHead {
     uint64_t dirty_epoch{};            // Incremented whenever data is marked dirty
     uint64_t writeback_dirty_epoch{};  // Dirty epoch captured by in-progress writeback
     size_t size{};                     // Size of buffer in bytes (== bdev->block_size)
+    uint64_t tree_priority{};          // Stable priority shared by range and dirty indexes
 
     // LRU doubly-linked list pointers (protected by cache lock)
     BufHead* lru_prev{};
