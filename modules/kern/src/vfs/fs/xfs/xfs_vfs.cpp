@@ -392,8 +392,8 @@ void xfs_parent_path_cache_store(XfsMountContext* ctx, const char* path, size_t 
         }
     }
 
-    victim->path.fill('\0');
     std::memcpy(victim->path.data(), path, path_len);
+    victim->path.at(path_len) = '\0';
     victim->mount = ctx;
     victim->path_len = path_len;
     victim->ino = ino;

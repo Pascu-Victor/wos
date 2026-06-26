@@ -398,8 +398,8 @@ void xfs_dentry_cache_store(XfsInode* dp, const char* name, uint16_t namelen, in
         }
     }
 
-    victim->name.fill('\0');
     std::memcpy(victim->name.data(), name, namelen);
+    victim->name.at(namelen) = '\0';
     victim->mount = dp->mount;
     victim->parent_ino = dp->ino;
     victim->hash = HASH;
