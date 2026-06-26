@@ -967,20 +967,10 @@ auto metadata_cacheable_fs(FSType fs_type) -> bool {
 
 void metadata_cache_note_observation_store() { g_metadata_observation_epoch.fetch_add(1, std::memory_order_acq_rel); }
 
-void metadata_cache_note_file_data_changed(File* file) {
-    if (file == nullptr || file->vfs_path == nullptr || !metadata_cacheable_fs(file->fs_type)) {
-        return;
-    }
-
-    const char* path = file->vfs_path;
+auto metadata_cache_note_exact_path_changed(const char* path) -> bool {
     size_t const PATH_LEN = metadata_normalized_path_len(path);
     if (PATH_LEN == 0) {
-        return;
-    }
-
-    uint64_t const OBSERVED_EPOCH = g_metadata_observation_epoch.load(std::memory_order_acquire);
-    if (file->metadata_data_invalidation_observation_epoch == OBSERVED_EPOCH) {
-        return;
+        return false;
     }
 
     g_metadata_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -990,8 +980,30 @@ void metadata_cache_note_file_data_changed(File* file) {
     g_metadata_invalidation_lock.lock();
     metadata_invalidation_store_or_reset_locked(g_metadata_exact_invalidations, PATH_HASH, PATH_GENERATION);
     g_metadata_invalidation_lock.unlock();
+    return true;
+}
 
-    file->metadata_data_invalidation_observation_epoch = OBSERVED_EPOCH;
+void metadata_cache_note_file_data_changed(File* file) {
+    if (file == nullptr || file->vfs_path == nullptr || !metadata_cacheable_fs(file->fs_type)) {
+        return;
+    }
+
+    uint64_t const OBSERVED_EPOCH = g_metadata_observation_epoch.load(std::memory_order_acquire);
+    if (file->metadata_data_invalidation_observation_epoch == OBSERVED_EPOCH) {
+        return;
+    }
+
+    if (metadata_cache_note_exact_path_changed(file->vfs_path)) {
+        file->metadata_data_invalidation_observation_epoch = OBSERVED_EPOCH;
+    }
+}
+
+void metadata_cache_note_path_data_changed(const char* path, FSType fs_type) {
+    if (path == nullptr || (!metadata_cacheable_fs(fs_type) && fs_type != FSType::DEVFS)) {
+        return;
+    }
+
+    static_cast<void>(metadata_cache_note_exact_path_changed(path));
 }
 
 auto metadata_cacheable_result(int result) -> bool { return result == 0 || result == -ENOENT; }
@@ -2897,6 +2909,13 @@ void cache_notify_path_changed_impl(const char* old_vfs_path, const char* new_vf
     // revalidates and stores a fresh snapshot.
     if (old_became_dirty || new_became_dirty) {
         ker::net::wki::wki_remote_vfs_notify_path_changed(old_vfs_path, new_vfs_path);
+    }
+}
+
+void cache_notify_path_data_changed_impl(const char* vfs_path, FSType fs_type) {
+    metadata_cache_note_path_data_changed(vfs_path, fs_type);
+    if (cache_notify_invalidate_path_local(vfs_path)) {
+        ker::net::wki::wki_remote_vfs_notify_path_changed(vfs_path, nullptr);
     }
 }
 
@@ -7296,7 +7315,7 @@ auto vfs_chmod(const char* path, int mode) -> int {
                 return -ENOENT;
             }
             node->mode = static_cast<uint32_t>(mode) & 07777;
-            vfs_cache_notify_path_changed(path_buffer.data(), nullptr);
+            cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type);
             return 0;
         }
         case FSType::DEVFS: {
@@ -7305,7 +7324,7 @@ auto vfs_chmod(const char* path, int mode) -> int {
                 return -ENOENT;
             }
             node->mode = static_cast<uint32_t>(mode) & 07777;
-            vfs_cache_notify_path_changed(path_buffer.data(), nullptr);
+            cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type);
             return 0;
         }
         case FSType::FAT32:
@@ -7313,7 +7332,7 @@ auto vfs_chmod(const char* path, int mode) -> int {
         case FSType::XFS: {
             int const RET = ker::vfs::xfs::xfs_chmod_path(fs_path, mode, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
             if (RET == 0) {
-                vfs_cache_notify_path_changed(path_buffer.data(), nullptr);
+                cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type);
             }
             return RET;
         }
@@ -7392,7 +7411,7 @@ auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
             if (std::cmp_not_equal(group, -1)) {
                 node->gid = group;
             }
-            vfs_cache_notify_path_changed(path_buffer.data(), nullptr);
+            cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type);
             return 0;
         }
         case FSType::DEVFS: {
@@ -7406,7 +7425,7 @@ auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
             if (std::cmp_not_equal(group, -1)) {
                 node->gid = group;
             }
-            vfs_cache_notify_path_changed(path_buffer.data(), nullptr);
+            cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type);
             return 0;
         }
         case FSType::FAT32:
