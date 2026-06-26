@@ -232,6 +232,7 @@ ker::mod::sys::Mutex g_metadata_cache_lock;
 std::atomic<uint64_t> g_metadata_cache_generation{1};
 std::atomic<uint64_t> g_metadata_cache_epoch{1};
 std::atomic<uint64_t> g_metadata_cache_clock{0};
+std::atomic<uint64_t> g_metadata_observation_epoch{1};
 
 std::array<SymlinkCacheSet, SYMLINK_CACHE_SET_COUNT> g_symlink_cache{};
 ker::mod::sys::Mutex g_symlink_cache_lock;
@@ -963,13 +964,21 @@ auto metadata_cacheable_fs(FSType fs_type) -> bool {
     return fs_type == FSType::TMPFS || fs_type == FSType::FAT32 || fs_type == FSType::XFS;
 }
 
-void metadata_cache_note_file_data_changed(const char* path, FSType fs_type) {
-    if (path == nullptr || !metadata_cacheable_fs(fs_type)) {
+void metadata_cache_note_observation_store() { g_metadata_observation_epoch.fetch_add(1, std::memory_order_acq_rel); }
+
+void metadata_cache_note_file_data_changed(File* file) {
+    if (file == nullptr || file->vfs_path == nullptr || !metadata_cacheable_fs(file->fs_type)) {
         return;
     }
 
+    const char* path = file->vfs_path;
     size_t const PATH_LEN = metadata_normalized_path_len(path);
     if (PATH_LEN == 0) {
+        return;
+    }
+
+    uint64_t const OBSERVED_EPOCH = g_metadata_observation_epoch.load(std::memory_order_acquire);
+    if (file->metadata_data_invalidation_observation_epoch == OBSERVED_EPOCH) {
         return;
     }
 
@@ -980,6 +989,8 @@ void metadata_cache_note_file_data_changed(const char* path, FSType fs_type) {
     g_metadata_invalidation_lock.lock();
     metadata_invalidation_store_or_reset_locked(g_metadata_exact_invalidations, PATH_HASH, PATH_GENERATION);
     g_metadata_invalidation_lock.unlock();
+
+    file->metadata_data_invalidation_observation_epoch = OBSERVED_EPOCH;
 }
 
 auto metadata_cacheable_result(int result) -> bool { return result == 0 || result == -ENOENT; }
@@ -1088,6 +1099,7 @@ void file_stat_snapshot_store(File* file, const Stat& statbuf, MetadataSnapshotS
     file->stat_cache_invalidation_generation = stamp.invalidation_generation;
     file->stat_cache_path_len = PATH_LEN;
     file->stat_cache_valid = true;
+    metadata_cache_note_observation_store();
     g_vfs_fstat_snapshot_stores.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -1283,6 +1295,7 @@ void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, boo
         victim->require_directory = require_directory;
         victim->valid = true;
     }
+    metadata_cache_note_observation_store();
     g_vfs_metadata_stores.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -2902,9 +2915,7 @@ void cache_notify_file_data_changed_impl(File* file) {
         return;
     }
 
-    if (file->vfs_path != nullptr && metadata_cacheable_fs(file->fs_type)) {
-        metadata_cache_note_file_data_changed(file->vfs_path, file->fs_type);
-    }
+    metadata_cache_note_file_data_changed(file);
 
     if (cache_notify_invalidate_path_local(file->vfs_path)) {
         ker::net::wki::wki_remote_vfs_notify_path_changed(file->vfs_path, nullptr);

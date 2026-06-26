@@ -70,6 +70,10 @@ struct File {
     size_t stat_cache_path_len = 0;
     bool stat_cache_valid = false;
 
+    // Last global metadata-observation epoch covered by this file's data-write
+    // invalidation. Repeated writes can reuse it until stat caches are stored.
+    uint64_t metadata_data_invalidation_observation_epoch = 0;
+
     // Hint for filesystem backends that this file is currently being serviced
     // through vfs_pread(), so sequential prefetch/read-ahead should be avoided.
     std::atomic<uint32_t> positional_read_depth{0};
