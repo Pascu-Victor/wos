@@ -1299,7 +1299,6 @@ void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, boo
             }
         }
 
-        victim->path.fill('\0');
         std::memcpy(victim->path.data(), path, PATH_LEN + 1);
         victim->stat = (result == 0) ? *statbuf : Stat{};
         victim->hash = HASH;
@@ -1423,8 +1422,6 @@ void symlink_cache_store(const char* path, FSType fs_type, uint64_t dev_id, ssiz
             }
         }
 
-        victim->path.fill('\0');
-        victim->target.fill('\0');
         std::memcpy(victim->path.data(), path, PATH_LEN + 1);
         if (target_len > 0) {
             std::memcpy(victim->target.data(), target, target_len);
