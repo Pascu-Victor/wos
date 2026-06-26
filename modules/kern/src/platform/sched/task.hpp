@@ -62,6 +62,97 @@ struct LazyVmemRange {
 };
 using LazyVmemRangeVec = ker::util::SmallVec<LazyVmemRange, 8>;
 
+template <size_t Capacity>
+class FixedFdTable {
+   public:
+    FixedFdTable() = default;
+
+    FixedFdTable(const FixedFdTable&) = delete;
+    auto operator=(const FixedFdTable&) -> FixedFdTable& = delete;
+
+    FixedFdTable(FixedFdTable&&) = delete;
+    auto operator=(FixedFdTable&&) -> FixedFdTable& = delete;
+
+    [[nodiscard]] auto insert(uint64_t key, void* value) -> bool {
+        if (key >= Capacity) {
+            return false;
+        }
+
+        void*& slot = slot_at(static_cast<size_t>(key));
+        if (slot == nullptr && value != nullptr) {
+            ++m_size;
+        } else if (slot != nullptr && value == nullptr) {
+            --m_size;
+        }
+        slot = value;
+        return true;
+    }
+
+    auto remove(uint64_t key) -> void* {
+        if (key >= Capacity) {
+            return nullptr;
+        }
+
+        void*& slot = slot_at(static_cast<size_t>(key));
+        void* const old = slot;
+        if (old != nullptr) {
+            slot = nullptr;
+            --m_size;
+        }
+        return old;
+    }
+
+    [[nodiscard]] auto lookup(uint64_t key) const -> void* {
+        if (key >= Capacity) {
+            return nullptr;
+        }
+        return slot_at(static_cast<size_t>(key));
+    }
+
+    [[nodiscard]] auto find_first_unset_below(uint64_t start_key, uint64_t limit) const -> uint64_t {
+        if (start_key >= limit || start_key >= Capacity) {
+            return UINT64_MAX;
+        }
+
+        uint64_t const SEARCH_LIMIT = limit < Capacity ? limit : Capacity;
+        for (uint64_t key = start_key; key < SEARCH_LIMIT; ++key) {
+            if (slot_at(static_cast<size_t>(key)) == nullptr) {
+                return key;
+            }
+        }
+        return UINT64_MAX;
+    }
+
+    template <typename Fn>
+    void for_each(const Fn& fn) const {
+        for (size_t i = 0; i < Capacity; ++i) {
+            void* const value = slot_at(i);
+            if (value != nullptr) {
+                fn(static_cast<uint64_t>(i), value);
+            }
+        }
+    }
+
+    [[nodiscard]] auto size() const -> size_t { return m_size; }
+    [[nodiscard]] auto empty() const -> bool { return m_size == 0; }
+
+   private:
+    [[nodiscard]] auto slot_at(size_t index) -> void*& {
+        // Capacity-bound callers validate keys before indexing the table.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+        return m_slots[index];
+    }
+
+    [[nodiscard]] auto slot_at(size_t index) const -> void* {
+        // Capacity-bound callers validate keys before indexing the table.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+        return m_slots[index];
+    }
+
+    std::array<void*, Capacity> m_slots{};
+    size_t m_size{};
+};
+
 enum class TaskType : uint8_t {
     DAEMON,
     PROCESS,
@@ -170,6 +261,7 @@ struct Task {
     using PathBuffer = std::array<char, CWD_MAX>;
     using ExePathBuffer = std::array<char, EXE_PATH_MAX>;
     using HostnameBuffer = std::array<char, WKI_TARGET_HOSTNAME_MAX>;
+    using FdTable = FixedFdTable<FD_TABLE_SIZE>;
     static constexpr uint32_t WKI_TARGET_FLAG_STRICT = 1U << 0;
     static constexpr uint32_t WKI_TARGET_FLAG_LOCAL = 1U << 1;      // pin task to local node (skip remote placement)
     static constexpr uint32_t WKI_TARGET_FLAG_NOINHERIT = 1U << 2;  // don't propagate wki_target to child processes
@@ -357,9 +449,8 @@ struct Task {
     alignas(8) std::atomic<uint64_t> death_epoch{0};  // Epoch when task became DEAD
 
     // File descriptor table for the task (per-process model).
-    // Sparse radix storage backs ordinary fd allocation, which is capped at
-    // FD_TABLE_SIZE so per-fd CLOEXEC state remains representable.
-    ker::util::RadixTree<void*> fd_table;
+    // Fixed descriptor storage keeps hot open/close paths allocation-free.
+    FdTable fd_table;
 
     // Per-fd close-on-exec bitmap (POSIX FD_CLOEXEC is per-fd, not per-file).
     FdCloexecBitmap fd_cloexec{};
