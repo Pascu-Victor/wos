@@ -189,6 +189,8 @@ KTEST(XFS, DentryCacheInvalidationKeepsUnrelatedDirectoryHot) {
 
 KTEST(XFS, DentryCacheAddKeepsSiblingHot) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_dentry_cache_add_keeps_sibling_hot()); }
 
+KTEST(XFS, DentryCacheRemoveKeepsSiblingHot) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_dentry_cache_remove_keeps_sibling_hot()); }
+
 KTEST(XFS, ParentPathCacheHitsAndPurges) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_parent_path_cache()); }
 
 KTEST(XFS, ShortformReaddirCookiesProgressAcrossDuplicateOffsets) {

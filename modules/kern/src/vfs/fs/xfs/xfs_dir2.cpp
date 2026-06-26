@@ -417,6 +417,7 @@ void xfs_dentry_cache_store_added_name(XfsInode* dp, const char* name, uint16_t 
     xfs_dentry_cache_store(dp, name, namelen, 0, &entry);
 }
 
+#ifdef WOS_SELFTEST
 void xfs_dentry_cache_invalidate_dir(XfsInode* dp) {
     if (dp == nullptr || dp->mount == nullptr) {
         return;
@@ -454,6 +455,7 @@ void xfs_dentry_cache_invalidate_dir(XfsInode* dp) {
     g_xfs_dentry_cache_lock.unlock_irqrestore(IRQF);
     g_xfs_dentry_invalidations.fetch_add(1, std::memory_order_relaxed);
 }
+#endif
 
 // Get directory block number from dataptr
 auto dir2_dataptr_to_db(const XfsMountContext* ctx, xfs_dir2_dataptr_t dp) -> xfs_dir2_db_t {
@@ -3102,7 +3104,7 @@ auto xfs_dir_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTra
             return -EINVAL;
     }
     if (rc == 0) {
-        xfs_dentry_cache_invalidate_dir(dp);
+        xfs_dentry_cache_store(dp, name, namelen, -ENOENT, nullptr);
     }
     return rc;
 }
@@ -3316,6 +3318,85 @@ auto xfs_selftest_dentry_cache_add_keeps_sibling_hot() -> bool {
     XfsDentryCacheStats after_added_lookup{};
     xfs_dentry_cache_stats(after_added_lookup);
     bool const OK = after_added_lookup.hits > after_sibling_lookup.hits;
+    cleanup();
+    return OK;
+}
+
+auto xfs_selftest_dentry_cache_remove_keeps_sibling_hot() -> bool {
+    XfsMountContext mount{};
+    mount.inode_size = 512;
+    mount.feat_incompat = XFS_SB_FEAT_INCOMPAT_FTYPE;
+    xfs_dentry_cache_purge_mount(&mount);
+
+    std::array<uint8_t, 32> data{};
+    XfsInode dir{};
+    xfs_selftest_make_shortform_one_entry_dir(&mount, &dir, data, 100, 42);
+
+    auto* heap_data = new uint8_t[dir.data_fork.local.size];
+    if (heap_data == nullptr) {
+        return false;
+    }
+    std::memcpy(heap_data, dir.data_fork.local.data, dir.data_fork.local.size);
+    dir.data_fork.local.data = heap_data;
+
+    auto cleanup = [&dir]() {
+        delete[] dir.data_fork.local.data;
+        dir.data_fork.local.data = nullptr;
+    };
+
+    XfsDirEntry entry{};
+    if (xfs_dir_lookup(&dir, "foo", 3, &entry) != 0 || entry.ino != 42) {
+        cleanup();
+        return false;
+    }
+    if (xfs_dir_lookup(&dir, "foo", 3, &entry) != 0 || entry.ino != 42) {
+        cleanup();
+        return false;
+    }
+
+    XfsTransaction add_tp{};
+    add_tp.mount = &mount;
+    if (xfs_dir_addname(&dir, "bar", 3, 84, XFS_DIR3_FT_REG_FILE, &add_tp) != 0) {
+        cleanup();
+        return false;
+    }
+    if (xfs_dir_lookup(&dir, "bar", 3, &entry) != 0 || entry.ino != 84) {
+        cleanup();
+        return false;
+    }
+
+    XfsDentryCacheStats before_remove{};
+    xfs_dentry_cache_stats(before_remove);
+
+    XfsTransaction remove_tp{};
+    remove_tp.mount = &mount;
+    if (xfs_dir_removename(&dir, "bar", 3, &remove_tp) != 0) {
+        cleanup();
+        return false;
+    }
+
+    XfsDentryCacheStats after_remove{};
+    xfs_dentry_cache_stats(after_remove);
+    if (after_remove.invalidations != before_remove.invalidations || after_remove.stores <= before_remove.stores) {
+        cleanup();
+        return false;
+    }
+
+    if (xfs_dir_lookup(&dir, "foo", 3, &entry) != 0 || entry.ino != 42) {
+        cleanup();
+        return false;
+    }
+    XfsDentryCacheStats after_sibling_lookup{};
+    xfs_dentry_cache_stats(after_sibling_lookup);
+    if (after_sibling_lookup.hits <= after_remove.hits) {
+        cleanup();
+        return false;
+    }
+
+    int const REMOVED_LOOKUP = xfs_dir_lookup(&dir, "bar", 3, &entry);
+    XfsDentryCacheStats after_removed_lookup{};
+    xfs_dentry_cache_stats(after_removed_lookup);
+    bool const OK = REMOVED_LOOKUP == -ENOENT && after_removed_lookup.hits > after_sibling_lookup.hits;
     cleanup();
     return OK;
 }
