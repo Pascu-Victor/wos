@@ -7471,7 +7471,7 @@ auto vfs_ftruncate(int fd, off_t length) -> int {
     }
     int const RET = f->fops->vfs_truncate(f, length);
     if (RET == 0) {
-        vfs_cache_notify_file_changed(f);
+        cache_notify_file_data_changed_impl(f);
     }
     vfs_put_file(f);
     return RET;
