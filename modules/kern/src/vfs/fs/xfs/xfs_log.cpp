@@ -12,6 +12,7 @@
 #include "xfs_log.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +31,8 @@
 namespace ker::vfs::xfs {
 
 namespace {
+
+constexpr size_t XFS_LOG_STACK_BODY_MAX_BYTES = 4096;
 
 // Scan the log to find head and tail positions.
 // Returns 0 on success, fills head/tail_cycle/block fields in the log struct.
@@ -417,8 +420,19 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     uint32_t cur_block = (HEAD + 1) % log->log_blocks;
     uint32_t body_offset = 0;
 
-    // Temporary buffer for assembling body data
-    auto* body_buf = new (std::nothrow) uint8_t[static_cast<size_t>(DATA_BLOCKS) * BLOCK_SIZE];
+    if (DATA_BLOCKS != 0 && BLOCK_SIZE > SIZE_MAX / DATA_BLOCKS) {
+        return -EOVERFLOW;
+    }
+
+    size_t const BODY_BUFFER_BYTES = static_cast<size_t>(DATA_BLOCKS) * BLOCK_SIZE;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): serialized before any byte is read.
+    std::array<uint8_t, XFS_LOG_STACK_BODY_MAX_BYTES> stack_body_buf;
+    auto* body_buf = stack_body_buf.data();
+    bool heap_body_buf = false;
+    if (BODY_BUFFER_BYTES > stack_body_buf.size()) {
+        body_buf = new (std::nothrow) uint8_t[BODY_BUFFER_BYTES];
+        heap_body_buf = true;
+    }
     if (body_buf == nullptr) {
         return -ENOMEM;
     }
@@ -451,7 +465,9 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
         // Use xfs_buf_get - we zero+overwrite the full block, no read needed.
         BufHead* data_bh = xfs_buf_get(mount, DATA_DISK_BLOCK);
         if (data_bh == nullptr) {
-            delete[] body_buf;
+            if (heap_body_buf) {
+                delete[] body_buf;
+            }
             return -EIO;
         }
 
@@ -467,7 +483,9 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
         cur_block = (cur_block + 1) % log->log_blocks;
     }
 
-    delete[] body_buf;
+    if (heap_body_buf) {
+        delete[] body_buf;
+    }
 
     // Advance the log head
     log->tail_block = HEAD;
