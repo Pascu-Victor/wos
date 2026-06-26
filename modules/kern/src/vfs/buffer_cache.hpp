@@ -108,6 +108,9 @@ auto sync_blockdev(dev::BlockDevice* bdev) -> int;
 // Return true if any dirty cached buffer overlaps a device block range.
 auto has_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> bool;
 
+// Return true if any cached buffer overlaps a device block range.
+auto has_cached_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> bool;
+
 // Overlay dirty cached buffers that overlap a device block range onto an
 // already-read destination buffer. Dirty buffers are applied in dirty_epoch
 // order so newer overlapping cache entries remain authoritative.

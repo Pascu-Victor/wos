@@ -492,6 +492,9 @@ KTEST(BufferCache, DirtyRangeIndexFindsAndOverlaysDirtySpan) {
     KEXPECT_TRUE(ker::vfs::has_dirty_bdev_range(&dev, BLK + 4, 1));
     KEXPECT_TRUE(ker::vfs::has_dirty_bdev_range(&dev, BLK, 16));
     KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, BLK + 8, 8));
+    KEXPECT_TRUE(ker::vfs::has_cached_bdev_range(&dev, BLK + 4, 1));
+    KEXPECT_TRUE(ker::vfs::has_cached_bdev_range(&dev, BLK, 8));
+    KEXPECT_FALSE(ker::vfs::has_cached_bdev_range(&dev, BLK + 8, 8));
 
     std::array<uint8_t, 16 * 512> read_buf{};
     KEXPECT_TRUE(ker::vfs::copy_dirty_bdev_range(&dev, BLK, 16, read_buf.data()));

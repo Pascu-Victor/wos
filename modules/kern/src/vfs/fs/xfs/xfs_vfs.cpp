@@ -486,7 +486,7 @@ auto xfs_block_read_with_retry(dev::BlockDevice* bdev, uint64_t block_no, size_t
     return rc;
 }
 
-auto xfs_direct_write_fresh_blocks(XfsMountContext* ctx, xfs_fsblock_t fsbno, const uint8_t* src, size_t bytes) -> int {
+auto xfs_direct_write_full_blocks(XfsMountContext* ctx, xfs_fsblock_t fsbno, const uint8_t* src, size_t bytes) -> int {
     if (ctx == nullptr || ctx->device == nullptr || src == nullptr || bytes == 0 || ctx->block_size == 0 || ctx->device->block_size == 0) {
         return -EINVAL;
     }
@@ -509,6 +509,22 @@ auto xfs_direct_write_fresh_blocks(XfsMountContext* ctx, xfs_fsblock_t fsbno, co
     return RC;
 }
 
+auto xfs_mapped_full_overwrite_can_write_direct(XfsMountContext* ctx, xfs_fsblock_t fsbno, size_t bytes) -> bool {
+    if (ctx == nullptr || ctx->device == nullptr || bytes == 0 || ctx->block_size == 0 || ctx->device->block_size == 0) {
+        return false;
+    }
+
+    bool const INVALID_BLOCK_RATIO = ctx->block_size < ctx->device->block_size || (ctx->block_size % ctx->device->block_size) != 0;
+    bool const INVALID_WRITE_SIZE = (bytes % ctx->block_size) != 0 || (bytes % ctx->device->block_size) != 0;
+    if (INVALID_BLOCK_RATIO || INVALID_WRITE_SIZE) {
+        return false;
+    }
+
+    uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(ctx, fsbno);
+    size_t const DEV_COUNT = bytes / ctx->device->block_size;
+    return !has_cached_bdev_range(ctx->device, DEV_BLOCK, DEV_COUNT);
+}
+
 auto xfs_direct_write_fresh_partial_block(XfsMountContext* ctx, xfs_fsblock_t fsbno, size_t block_off, const uint8_t* src, size_t bytes)
     -> int {
     if (ctx == nullptr || src == nullptr || ctx->block_size == 0 || block_off >= ctx->block_size || bytes == 0 ||
@@ -518,7 +534,7 @@ auto xfs_direct_write_fresh_partial_block(XfsMountContext* ctx, xfs_fsblock_t fs
 
     std::array<uint8_t, XFS_DIRECT_FRESH_PARTIAL_MAX_BYTES> block{};
     std::memcpy(block.data() + block_off, src, bytes);
-    return xfs_direct_write_fresh_blocks(ctx, fsbno, block.data(), ctx->block_size);
+    return xfs_direct_write_full_blocks(ctx, fsbno, block.data(), ctx->block_size);
 }
 
 auto xfs_fsb_to_dev_count(XfsMountContext* ctx, xfs_filblks_t fsb_count) -> size_t {
@@ -1001,8 +1017,10 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
                 while (full_blocks > 0) {
                     size_t const BATCH_BLOCKS = std::min(full_blocks, MAX_BATCH_BLOCKS);
                     size_t const BATCH_BYTES = BATCH_BLOCKS << ctx->block_log;
-                    if (fresh_allocation) {
-                        int const RC = xfs_direct_write_fresh_blocks(ctx, current_disk_block, src + current_src_offset, BATCH_BYTES);
+                    bool const DIRECT_FULL_WRITE =
+                        fresh_allocation || xfs_mapped_full_overwrite_can_write_direct(ctx, current_disk_block, BATCH_BYTES);
+                    if (DIRECT_FULL_WRITE) {
+                        int const RC = xfs_direct_write_full_blocks(ctx, current_disk_block, src + current_src_offset, BATCH_BYTES);
                         if (RC != 0) {
                             ok = false;
                             break;
@@ -1680,7 +1698,7 @@ auto xfs_selftest_direct_fresh_write_discards_cache() -> bool {
         src.at(i) = static_cast<uint8_t>(i & 0xFFU);
     }
 
-    int const RC = xfs_direct_write_fresh_blocks(&ctx, FSB, src.data(), src.size());
+    int const RC = xfs_direct_write_full_blocks(&ctx, FSB, src.data(), src.size());
     bool const OK = RC == 0 && state.write_calls == 1 && state.last_block == DEV_BLOCK && state.last_count == DEV_COUNT &&
                     std::memcmp(state.last_data.data(), src.data(), src.size()) == 0 && !has_dirty_bdev_range(&dev, DEV_BLOCK, DEV_COUNT);
     if (!OK) {
@@ -1719,6 +1737,45 @@ auto xfs_selftest_direct_fresh_write_discards_cache() -> bool {
 
     invalidate_bdev(&dev);
     return partial_ok;
+}
+
+auto xfs_selftest_mapped_direct_overwrite_requires_uncached_range() -> bool {
+    constexpr size_t DEVICE_BLOCK_SIZE = 512;
+    constexpr size_t FS_BLOCK_SIZE = 4096;
+    constexpr xfs_fsblock_t FSB = 12;
+
+    XfsDirectWriteSelftestState state{};
+    dev::BlockDevice dev{};
+    dev.block_size = DEVICE_BLOCK_SIZE;
+    dev.total_blocks = 1024;
+    dev.write_blocks = xfs_direct_write_selftest_write;
+    dev.private_data = &state;
+
+    XfsMountContext ctx{};
+    ctx.device = &dev;
+    ctx.block_size = FS_BLOCK_SIZE;
+    ctx.block_log = 12;
+    ctx.ag_blocks = 1024;
+    ctx.ag_blk_log = 10;
+
+    uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(&ctx, FSB);
+    size_t const DEV_COUNT = xfs_fsb_to_dev_count(&ctx, 1);
+    if (!xfs_mapped_full_overwrite_can_write_direct(&ctx, FSB, FS_BLOCK_SIZE)) {
+        return false;
+    }
+
+    BufHead* cached = bget_multi(&dev, DEV_BLOCK, DEV_COUNT);
+    if (cached == nullptr) {
+        return false;
+    }
+    brelse(cached);
+    bool const CACHED_BLOCKS_DIRECT = xfs_mapped_full_overwrite_can_write_direct(&ctx, FSB, FS_BLOCK_SIZE);
+    invalidate_bdev(&dev);
+    if (CACHED_BLOCKS_DIRECT) {
+        return false;
+    }
+
+    return xfs_mapped_full_overwrite_can_write_direct(&ctx, FSB, FS_BLOCK_SIZE);
 }
 
 auto xfs_selftest_parent_path_cache() -> bool {

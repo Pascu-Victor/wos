@@ -133,6 +133,10 @@ KTEST(XFS, DirectReadBatchIsBoundedAndBlockAligned) {
     KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_direct_read_batch_max_bytes(3 * 1024 * 1024), static_cast<size_t>(3 * 1024 * 1024));
 }
 
+KTEST(XFS, MappedDirectOverwriteRequiresUncachedRange) {
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_mapped_direct_overwrite_requires_uncached_range());
+}
+
 KTEST(XFS, BufGetMultiSkipsDeviceRead) {
     XfsReadCounter counter{};
     ker::dev::BlockDevice dev = make_xfs_counting_bdev(&counter);

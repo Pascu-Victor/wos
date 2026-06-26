@@ -2518,6 +2518,37 @@ auto has_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t coun
     return DIRTY;
 }
 
+auto has_cached_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> bool {
+    if (bdev == nullptr || count == 0) {
+        return false;
+    }
+
+    if (!cache_initialized) {
+        return false;
+    }
+
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    bool cached = false;
+    if (range_index_degraded) {
+        for (auto* bucket_head : hash_buckets) {
+            for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
+                if (buffer_overlaps_range(bh, bdev, block_no, count)) {
+                    cached = true;
+                    break;
+                }
+            }
+            if (cached) {
+                break;
+            }
+        }
+    } else {
+        RangeBdevState* state = find_range_bdev_state_locked(bdev);
+        cached = state != nullptr && state->buffers != 0 && range_tree_overlaps(state->tree_root, block_no, count);
+    }
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    return cached;
+}
+
 auto copy_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst) -> bool {
     return copy_dirty_bdev_range_after_epoch(bdev, block_no, count, dst, 0);
 }
