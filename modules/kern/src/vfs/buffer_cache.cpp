@@ -249,6 +249,7 @@ constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BUFFERS = 1024;
 constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BYTES = size_t{16} * 1024 * 1024;
 constexpr size_t DIRTY_WAKE_BATCH = 32;
 constexpr size_t DIRTY_COPY_COVERAGE_MAX_INTERVALS = 64;
+constexpr uint64_t DIRTY_THROTTLE_PARK_TIMEOUT_US = uint64_t{10} * 1000;
 constexpr size_t DIRTY_TARGET_DIVISOR = 2;
 constexpr size_t DIRTY_THROTTLE_RESUME_NUMERATOR = 3;
 constexpr size_t DIRTY_THROTTLE_RESUME_DENOMINATOR = 4;
@@ -1626,15 +1627,18 @@ void wake_dirty_waiters(const DirtyWakeList& wake_list) {
     }
 }
 
-void register_current_dirty_waiter_locked() {
+auto register_current_dirty_waiter_locked() -> bool {
     if (!ker::mod::sched::can_query_current_task()) {
-        return;
+        return false;
     }
     auto* task = ker::mod::sched::get_current_task();
-    if (task == nullptr || task->pid == 0 || dirty_waiters.contains(task->pid)) {
-        return;
+    if (task == nullptr || task->pid == 0 || task->type != ker::mod::sched::task::TaskType::PROCESS) {
+        return false;
     }
-    static_cast<void>(dirty_waiters.push_back(task->pid));
+    if (dirty_waiters.contains(task->pid)) {
+        return true;
+    }
+    return dirty_waiters.push_back(task->pid);
 }
 
 auto allocate_dirty_epoch() -> uint64_t {
@@ -2688,10 +2692,17 @@ void throttle_dirty_buffer_cache(dev::BlockDevice* bdev) {
             cache_lock.unlock_irqrestore(irqflags);
             return;
         }
-        register_current_dirty_waiter_locked();
+        bool const CAN_PARK = register_current_dirty_waiter_locked();
         cache_lock.unlock_irqrestore(irqflags);
 
-        static_cast<void>(request_dirty_writeback());
+        bool const WRITEBACK_REQUESTED = request_dirty_writeback();
+        if (CAN_PARK && WRITEBACK_REQUESTED) {
+            uint64_t const NOW_US = ker::mod::time::get_us();
+            uint64_t const DEADLINE_US = ker::mod::sched::saturating_deadline_us(NOW_US, DIRTY_THROTTLE_PARK_TIMEOUT_US);
+            ker::mod::sched::preemptible_syscall_park("dirty_bcache", DEADLINE_US);
+            continue;
+        }
+
         static_cast<void>(writeback_dirty_budgeted(fallback_filter, DIRTY_HARD_FALLBACK_BUDGET));
         ker::mod::sched::kern_yield();
     }
