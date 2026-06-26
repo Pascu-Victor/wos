@@ -57,13 +57,6 @@ auto xfs_log_serialize_body(const XfsTransItem* items, int item_count, uint8_t* 
             pos += 4;
             __builtin_memcpy(body_buf + pos, items[i].buf.bp->data + off, len);
             pos += len;
-        } else if (items[i].type == XfsLogItemType::INODE && items[i].inode.ip != nullptr) {
-            if (pos > body_capacity || 8 > body_capacity - pos) {
-                return -EOVERFLOW;
-            }
-            uint64_t ino = items[i].inode.ip->ino;
-            __builtin_memcpy(body_buf + pos, &ino, 8);
-            pos += 8;
         }
     }
     return 0;
@@ -398,15 +391,14 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     XfsLog* log = active_log;
 
     // Compute total body size: for each buffer item, store block_no (8B) +
-    // offset (4B) + len (4B) + data (len B).  Inode items store ino (8B).
+    // offset (4B) + len (4B) + data (len B). INODE transaction items are
+    // commit-time inputs only: xfs_inode_write() logs their concrete inode
+    // buffers before this point, and recovery replays those buffer records.
     uint32_t body_size = 0;
     uint32_t num_logops = 0;
     for (int i = 0; i < item_count; i++) {
         if (items[i].type == XfsLogItemType::BUFFER && items[i].buf.dirty) {
             body_size += 8 + 4 + 4 + items[i].buf.len;
-            num_logops++;
-        } else if (items[i].type == XfsLogItemType::INODE) {
-            body_size += 8;
             num_logops++;
         }
     }
