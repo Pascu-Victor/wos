@@ -180,6 +180,9 @@ void lru_remove(BufHead* bh) {
 
 // Insert at head (most recently used)
 void lru_touch(BufHead* bh) {
+    if (bh->lru_prev == &lru_sentinel) {
+        return;
+    }
     // Remove if already on list
     if (bh->lru_prev != nullptr || bh->lru_next != nullptr) {
         lru_remove(bh);
