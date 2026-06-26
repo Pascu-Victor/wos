@@ -63,9 +63,6 @@ auto recording_write(ker::dev::BlockDevice* dev, uint64_t block, size_t count, c
         return 0;
     }
     size_t const BYTE_COUNT = count * dev->block_size;
-    if (BYTE_COUNT > sizeof(state->last_write)) {
-        return -1;
-    }
     size_t const CALL_INDEX = state->write_calls++;
     state->last_write_block = block;
     state->last_write_count = count;

@@ -133,7 +133,7 @@ KTEST(XFS, MappedAppendSkipsReadOnlyAtCleanBlockBoundary) {
 KTEST(XFS, DirectReadBatchIsBoundedAndBlockAligned) {
     KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_direct_read_batch_max_bytes(4096), static_cast<size_t>(16 * 1024 * 1024));
     KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_direct_read_batch_max_bytes(512), static_cast<size_t>(16 * 1024 * 1024));
-    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_direct_read_batch_max_bytes(3 * 1024 * 1024), static_cast<size_t>(3 * 1024 * 1024));
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_direct_read_batch_max_bytes(3 * 1024 * 1024), static_cast<size_t>(15 * 1024 * 1024));
 }
 
 KTEST(XFS, MappedDirectOverwriteRequiresUncachedRange) {

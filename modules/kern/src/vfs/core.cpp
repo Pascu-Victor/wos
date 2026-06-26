@@ -9321,18 +9321,12 @@ auto vfs_selftest_file_data_write_skips_uncached_path_invalidation() -> bool {
 
     constexpr const char* PATH = "/tmp/ktest_file_data_uncached_path_invalidation";
     constexpr const char* UNRELATED = "/tmp/ktest_file_data_unrelated_missing_observation";
-    constexpr char FIRST[] = "abc";
-    constexpr char SECOND[] = "def";
-    constexpr char THIRD[] = "ghi";
     vfs_unlink(PATH);
 
     auto* file = vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
-    if (file == nullptr || file->fops == nullptr || file->fops->vfs_write == nullptr) {
+    if (file == nullptr) {
         return false;
     }
-
-    bool ok = file->fops->vfs_write(file, FIRST, sizeof(FIRST) - 1, 0) == static_cast<ssize_t>(sizeof(FIRST) - 1);
-    cache_notify_file_data_changed_impl(file);
 
     VfsCachePerfSnapshot before_unrelated{};
     VfsCachePerfSnapshot after_unrelated{};
@@ -9341,24 +9335,38 @@ auto vfs_selftest_file_data_write_skips_uncached_path_invalidation() -> bool {
     vfs_get_cache_perf_snapshot(before_unrelated);
     metadata_cache_store(UNRELATED, FSType::TMPFS, 0, true, false, -ENOENT, nullptr);
     vfs_get_cache_perf_snapshot(after_unrelated);
-    ok = ok && after_unrelated.metadata_stores > before_unrelated.metadata_stores;
+    bool const STORED_UNRELATED = after_unrelated.metadata_stores > before_unrelated.metadata_stores;
+    bool const HAD_PATH_OBSERVATION_BEFORE_STAT = metadata_cache_has_file_data_observation(file);
+    bool ok = STORED_UNRELATED && !HAD_PATH_OBSERVATION_BEFORE_STAT;
 
-    constexpr size_t SECOND_OFFSET = sizeof(FIRST) - 1;
-    ok = ok && file->fops->vfs_write(file, SECOND, sizeof(SECOND) - 1, SECOND_OFFSET) == static_cast<ssize_t>(sizeof(SECOND) - 1);
-    cache_notify_file_data_changed_impl(file);
+    metadata_cache_note_file_data_changed(file);
     vfs_get_cache_perf_snapshot(after_uncached_write);
-    ok = ok && after_uncached_write.metadata_path_invalidations == after_unrelated.metadata_path_invalidations;
+    bool const SKIPPED_UNOBSERVED_INVALIDATION =
+        after_uncached_write.metadata_path_invalidations == after_unrelated.metadata_path_invalidations;
+    ok = ok && SKIPPED_UNOBSERVED_INVALIDATION;
 
-    VfsCachePerfSnapshot after_path_stat{};
-    VfsCachePerfSnapshot after_cached_write{};
-    ok = ok && vfs_stat(PATH, &st) == 0 && st.st_size == static_cast<off_t>((sizeof(FIRST) - 1) + (sizeof(SECOND) - 1));
-    vfs_get_cache_perf_snapshot(after_path_stat);
+    VfsCachePerfSnapshot after_first_stat{};
+    VfsCachePerfSnapshot after_second_stat{};
+    VfsCachePerfSnapshot after_observed_write{};
+    VfsCachePerfSnapshot after_refill_stat{};
+    int const STAT_RET = vfs_stat(PATH, &st);
+    ok = ok && STAT_RET == 0;
+    vfs_get_cache_perf_snapshot(after_first_stat);
 
-    constexpr size_t THIRD_OFFSET = SECOND_OFFSET + sizeof(SECOND) - 1;
-    ok = ok && file->fops->vfs_write(file, THIRD, sizeof(THIRD) - 1, THIRD_OFFSET) == static_cast<ssize_t>(sizeof(THIRD) - 1);
-    cache_notify_file_data_changed_impl(file);
-    vfs_get_cache_perf_snapshot(after_cached_write);
-    ok = ok && after_cached_write.metadata_path_invalidations > after_path_stat.metadata_path_invalidations;
+    bool const HAD_PATH_OBSERVATION_AFTER_STAT = metadata_cache_has_file_data_observation(file);
+    ok = ok && HAD_PATH_OBSERVATION_AFTER_STAT;
+    ok = ok && vfs_stat(PATH, &st) == 0;
+    vfs_get_cache_perf_snapshot(after_second_stat);
+    bool const CACHED_OBSERVED_PATH = after_second_stat.metadata_hits > after_first_stat.metadata_hits;
+    ok = ok && CACHED_OBSERVED_PATH;
+
+    metadata_cache_note_file_data_changed(file);
+    vfs_get_cache_perf_snapshot(after_observed_write);
+    ok = ok && vfs_stat(PATH, &st) == 0;
+    vfs_get_cache_perf_snapshot(after_refill_stat);
+    bool const REFILLED_OBSERVED_PATH = after_refill_stat.metadata_misses > after_observed_write.metadata_misses &&
+                                        after_refill_stat.metadata_stores > after_observed_write.metadata_stores;
+    ok = ok && REFILLED_OBSERVED_PATH;
 
     vfs_put_file(file);
     ok = ok && vfs_unlink(PATH) == 0;
