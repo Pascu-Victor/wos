@@ -2002,22 +2002,22 @@ auto copy_dirty_bdev_range_after_epoch(dev::BlockDevice* bdev, uint64_t block_no
     return COPIED;
 }
 
-auto copy_dirty_bdev_range_for_cached_buffer(BufHead* bh, uint64_t block_no, size_t count) -> bool {
+auto copy_dirty_bdev_range_for_cached_buffer_locked(BufHead* bh, uint64_t block_no, size_t count) -> bool {
     if (bh == nullptr || bh->bdev == nullptr || bh->bdev->block_size == 0 || count == 0 || bh->data == nullptr || !cache_initialized) {
         return false;
     }
     if (count > SIZE_MAX / bh->bdev->block_size) {
         return false;
     }
+    if (cache_dirty_buffers == 0 || (((bh->flags & BH_DIRTY) != 0) && cache_dirty_buffers == 1)) {
+        return false;
+    }
 
     uint64_t min_epoch = 0;
-    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
     if ((bh->flags & BH_DIRTY) != 0) {
         min_epoch = bh->dirty_epoch;
     }
-    bool const COPIED = copy_dirty_bdev_range_locked(bh->bdev, block_no, count, bh->data, min_epoch);
-    cache_lock.unlock_irqrestore(IRQFLAGS);
-    return COPIED;
+    return copy_dirty_bdev_range_locked(bh->bdev, block_no, count, bh->data, min_epoch);
 }
 
 auto dirty_bytes_above_target_locked() -> bool { return cache_dirty_bytes > dirty_target_bytes_locked(); }
@@ -2145,8 +2145,8 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
         bh->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(bh);
         stat_hits++;
+        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer_locked(bh, block_no, 1));
         cache_lock.unlock_irqrestore(irqflags);
-        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer(bh, block_no, 1));
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, bdev->block_size);
         return bh;
     }
@@ -2197,8 +2197,8 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
         existing->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(existing);
         free_buffer(bh);
+        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer_locked(existing, block_no, 1));
         cache_lock.unlock_irqrestore(irqflags);
-        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer(existing, block_no, 1));
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, bdev->block_size);
         return existing;
     }
@@ -2236,8 +2236,8 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
         bh->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(bh);
         stat_hits++;
+        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer_locked(bh, block_no, count));
         cache_lock.unlock_irqrestore(irqflags);
-        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer(bh, block_no, count));
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, TOTAL_SIZE);
         return bh;
     }
@@ -2283,8 +2283,8 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
         existing->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(existing);
         free_buffer(bh);
+        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer_locked(existing, block_no, count));
         cache_lock.unlock_irqrestore(irqflags);
-        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer(existing, block_no, count));
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, TOTAL_SIZE);
         return existing;
     }
