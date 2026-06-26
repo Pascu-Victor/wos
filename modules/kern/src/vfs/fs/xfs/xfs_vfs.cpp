@@ -1923,6 +1923,35 @@ auto xfs_find_parent_and_name(const char* fs_path, XfsMountContext* ctx, XfsInod
     return 0;
 }
 
+auto xfs_lookup_with_cached_parent(const char* fs_path, XfsMountContext* ctx, XfsInode** ip_out) -> int {
+    if (ip_out == nullptr) {
+        return -EINVAL;
+    }
+    *ip_out = nullptr;
+    if (fs_path == nullptr || fs_path[0] == '\0' || (fs_path[0] == '/' && fs_path[1] == '\0')) {
+        *ip_out = xfs_root_inode_read(ctx);
+        return (*ip_out != nullptr) ? 0 : -ENOENT;
+    }
+
+    XfsInode* parent_ip = nullptr;
+    const char* filename = nullptr;
+    uint16_t filename_len = 0;
+    int const PARENT_RET = xfs_find_parent_and_name(fs_path, ctx, &parent_ip, &filename, &filename_len);
+    if (PARENT_RET != 0) {
+        return PARENT_RET == -ENAMETOOLONG ? -EAGAIN : PARENT_RET;
+    }
+
+    XfsDirEntry entry{};
+    int const LOOKUP_RET = xfs_dir_lookup(parent_ip, filename, filename_len, &entry);
+    xfs_inode_release(parent_ip);
+    if (LOOKUP_RET != 0) {
+        return LOOKUP_RET;
+    }
+
+    *ip_out = xfs_inode_read(ctx, entry.ino);
+    return (*ip_out != nullptr) ? 0 : -ENOENT;
+}
+
 }  // namespace
 
 auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ctx) -> File* {
@@ -1963,7 +1992,10 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     }
 
     if (!used_create_lookup) {
-        ip = walk_path(ctx, fs_path);
+        int const CACHED_OPEN_RET = xfs_lookup_with_cached_parent(fs_path, ctx, &ip);
+        if (CACHED_OPEN_RET == -EAGAIN) {
+            ip = walk_path(ctx, fs_path);
+        }
     }
 
     if (create_missing) {
