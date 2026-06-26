@@ -7,6 +7,7 @@
 [submodule "toolchain/src/mlibc"]
 	path = toolchain/src/mlibc
 	url = https://github.com/Pascu-Victor/mlibc.git
+	branch = wos-support
 [submodule "toolchain/src/dropbear"]
 	path = toolchain/src/dropbear
 	url = https://github.com/Pascu-Victor/dropbear.git
