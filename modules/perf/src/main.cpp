@@ -3951,6 +3951,10 @@ void print_checkout_cache_state() {
         std::println("vfs_fstat_uncacheable: bad_args={} no_cache={} pathless={} fs={}",
                      get_row_u64(*vfs_cache, "fstat_snapshot_miss_bad_args"), get_row_u64(*vfs_cache, "fstat_snapshot_miss_no_cache"),
                      get_row_u64(*vfs_cache, "fstat_snapshot_miss_pathless"), get_row_u64(*vfs_cache, "fstat_snapshot_miss_fs"));
+        uint64_t const SYMLINK_HITS = get_row_u64(*vfs_cache, "symlink_hits");
+        uint64_t const SYMLINK_MISSES = get_row_u64(*vfs_cache, "symlink_misses");
+        std::println("vfs_symlink: hits={} misses={} stores={} hit={:.1f}%", SYMLINK_HITS, SYMLINK_MISSES,
+                     get_row_u64(*vfs_cache, "symlink_stores"), ratio_percent(SYMLINK_HITS, SYMLINK_HITS + SYMLINK_MISSES));
         std::println("vfs_stream: hits={} misses={} backend_reads={} backend={} copied={} invalidate_empty_skips={}",
                      get_row_u64(*vfs_cache, "stream_hits"), get_row_u64(*vfs_cache, "stream_misses"),
                      get_row_u64(*vfs_cache, "stream_backend_reads"), format_scaled_bytes(get_row_u64(*vfs_cache, "stream_backend_bytes")),
