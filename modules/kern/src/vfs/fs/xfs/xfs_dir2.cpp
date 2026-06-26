@@ -242,7 +242,9 @@ struct XfsDentryCacheEntry {
 };
 
 struct XfsDentryCacheSet {
+    ker::mod::sys::Spinlock lock;
     std::array<XfsDentryCacheEntry, XFS_DENTRY_CACHE_WAYS> ways{};
+    uint64_t clock{};
 };
 
 struct XfsDentryGenerationEntry {
@@ -255,14 +257,13 @@ struct XfsDentryGenerationEntry {
 };
 
 struct XfsDentryGenerationSet {
+    ker::mod::sys::Spinlock lock;
     std::array<XfsDentryGenerationEntry, XFS_DENTRY_GENERATION_WAYS> ways{};
+    uint64_t clock{};
 };
 
 std::array<XfsDentryCacheSet, XFS_DENTRY_CACHE_SET_COUNT> g_xfs_dentry_cache{};
 std::array<XfsDentryGenerationSet, XFS_DENTRY_GENERATION_SET_COUNT> g_xfs_dentry_generations{};
-ker::mod::sys::Spinlock g_xfs_dentry_cache_lock;
-std::atomic<uint64_t> g_xfs_dentry_cache_clock{0};
-std::atomic<uint64_t> g_xfs_dentry_generation_clock{0};
 std::atomic<uint64_t> g_xfs_dentry_next_generation{1};
 std::atomic<uint64_t> g_xfs_dentry_hits{0};
 std::atomic<uint64_t> g_xfs_dentry_misses{0};
@@ -296,14 +297,12 @@ auto xfs_dentry_hash_name(XfsMountContext* mount, xfs_ino_t parent_ino, const ch
 
 auto xfs_dentry_next_generation_value() -> uint64_t { return g_xfs_dentry_next_generation.fetch_add(1, std::memory_order_relaxed) + 1; }
 
-auto xfs_dentry_cache_dir_generation_locked(XfsMountContext* mount, xfs_ino_t parent_ino) -> uint64_t {
-    uint64_t const HASH = xfs_dentry_hash_dir(mount, parent_ino);
-    uint64_t const USE_STAMP = g_xfs_dentry_generation_clock.fetch_add(1, std::memory_order_relaxed) + 1;
-    auto& set = g_xfs_dentry_generations.at(HASH & (XFS_DENTRY_GENERATION_SET_COUNT - 1));
-
+auto xfs_dentry_cache_dir_generation_locked(XfsDentryGenerationSet& set, XfsMountContext* mount, xfs_ino_t parent_ino, uint64_t hash)
+    -> uint64_t {
+    uint64_t const USE_STAMP = ++set.clock;
     XfsDentryGenerationEntry* victim = &set.ways.front();
     for (auto& candidate : set.ways) {
-        if (candidate.valid && candidate.hash == HASH && candidate.mount == mount && candidate.parent_ino == parent_ino) {
+        if (candidate.valid && candidate.hash == hash && candidate.mount == mount && candidate.parent_ino == parent_ino) {
             candidate.last_used = USE_STAMP;
             return candidate.generation;
         }
@@ -319,7 +318,7 @@ auto xfs_dentry_cache_dir_generation_locked(XfsMountContext* mount, xfs_ino_t pa
     uint64_t const GENERATION = xfs_dentry_next_generation_value();
     victim->mount = mount;
     victim->parent_ino = parent_ino;
-    victim->hash = HASH;
+    victim->hash = hash;
     victim->generation = GENERATION;
     victim->last_used = USE_STAMP;
     victim->valid = true;
@@ -332,10 +331,13 @@ auto xfs_dentry_cache_lookup(XfsInode* dp, const char* name, uint16_t namelen, X
     }
 
     uint64_t const HASH = xfs_dentry_hash_name(dp->mount, dp->ino, name, namelen);
+    uint64_t const DIR_HASH = xfs_dentry_hash_dir(dp->mount, dp->ino);
+    auto& generation_set = g_xfs_dentry_generations.at(DIR_HASH & (XFS_DENTRY_GENERATION_SET_COUNT - 1));
     auto& set = g_xfs_dentry_cache.at(HASH & (XFS_DENTRY_CACHE_SET_COUNT - 1));
 
-    uint64_t const IRQF = g_xfs_dentry_cache_lock.lock_irqsave();
-    uint64_t const DIR_GENERATION = xfs_dentry_cache_dir_generation_locked(dp->mount, dp->ino);
+    uint64_t const GENERATION_IRQF = generation_set.lock.lock_irqsave();
+    uint64_t const DIR_GENERATION = xfs_dentry_cache_dir_generation_locked(generation_set, dp->mount, dp->ino, DIR_HASH);
+    uint64_t const CACHE_IRQF = set.lock.lock_irqsave();
     for (auto& candidate : set.ways) {
         if (!candidate.valid || candidate.hash != HASH || candidate.mount != dp->mount || candidate.parent_ino != dp->ino ||
             candidate.namelen != namelen || candidate.dir_generation != DIR_GENERATION) {
@@ -345,16 +347,18 @@ auto xfs_dentry_cache_lookup(XfsInode* dp, const char* name, uint16_t namelen, X
             continue;
         }
 
-        candidate.last_used = g_xfs_dentry_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+        candidate.last_used = ++set.clock;
         *result = candidate.result;
         if (candidate.result == 0) {
             *entry = candidate.entry;
         }
-        g_xfs_dentry_cache_lock.unlock_irqrestore(IRQF);
+        set.lock.unlock_irqrestore(CACHE_IRQF);
+        generation_set.lock.unlock_irqrestore(GENERATION_IRQF);
         g_xfs_dentry_hits.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
-    g_xfs_dentry_cache_lock.unlock_irqrestore(IRQF);
+    set.lock.unlock_irqrestore(CACHE_IRQF);
+    generation_set.lock.unlock_irqrestore(GENERATION_IRQF);
     g_xfs_dentry_misses.fetch_add(1, std::memory_order_relaxed);
     return false;
 }
@@ -368,11 +372,14 @@ void xfs_dentry_cache_store(XfsInode* dp, const char* name, uint16_t namelen, in
     }
 
     uint64_t const HASH = xfs_dentry_hash_name(dp->mount, dp->ino, name, namelen);
-    uint64_t const USE_STAMP = g_xfs_dentry_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint64_t const DIR_HASH = xfs_dentry_hash_dir(dp->mount, dp->ino);
+    auto& generation_set = g_xfs_dentry_generations.at(DIR_HASH & (XFS_DENTRY_GENERATION_SET_COUNT - 1));
     auto& set = g_xfs_dentry_cache.at(HASH & (XFS_DENTRY_CACHE_SET_COUNT - 1));
 
-    uint64_t const IRQF = g_xfs_dentry_cache_lock.lock_irqsave();
-    uint64_t const DIR_GENERATION = xfs_dentry_cache_dir_generation_locked(dp->mount, dp->ino);
+    uint64_t const GENERATION_IRQF = generation_set.lock.lock_irqsave();
+    uint64_t const DIR_GENERATION = xfs_dentry_cache_dir_generation_locked(generation_set, dp->mount, dp->ino, DIR_HASH);
+    uint64_t const CACHE_IRQF = set.lock.lock_irqsave();
+    uint64_t const USE_STAMP = ++set.clock;
     XfsDentryCacheEntry* victim = &set.ways.front();
     for (auto& candidate : set.ways) {
         if (candidate.valid && candidate.hash == HASH && candidate.mount == dp->mount && candidate.parent_ino == dp->ino &&
@@ -402,7 +409,8 @@ void xfs_dentry_cache_store(XfsInode* dp, const char* name, uint16_t namelen, in
     victim->result = result;
     victim->entry = (result == 0) ? *entry : XfsDirEntry{};
     victim->valid = true;
-    g_xfs_dentry_cache_lock.unlock_irqrestore(IRQF);
+    set.lock.unlock_irqrestore(CACHE_IRQF);
+    generation_set.lock.unlock_irqrestore(GENERATION_IRQF);
     g_xfs_dentry_stores.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -424,16 +432,16 @@ void xfs_dentry_cache_invalidate_dir(XfsInode* dp) {
     }
 
     uint64_t const HASH = xfs_dentry_hash_dir(dp->mount, dp->ino);
-    uint64_t const USE_STAMP = g_xfs_dentry_generation_clock.fetch_add(1, std::memory_order_relaxed) + 1;
-    uint64_t const IRQF = g_xfs_dentry_cache_lock.lock_irqsave();
     auto& set = g_xfs_dentry_generations.at(HASH & (XFS_DENTRY_GENERATION_SET_COUNT - 1));
 
+    uint64_t const IRQF = set.lock.lock_irqsave();
+    uint64_t const USE_STAMP = ++set.clock;
     XfsDentryGenerationEntry* victim = &set.ways.front();
     for (auto& candidate : set.ways) {
         if (candidate.valid && candidate.hash == HASH && candidate.mount == dp->mount && candidate.parent_ino == dp->ino) {
             candidate.generation = xfs_dentry_next_generation_value();
             candidate.last_used = USE_STAMP;
-            g_xfs_dentry_cache_lock.unlock_irqrestore(IRQF);
+            set.lock.unlock_irqrestore(IRQF);
             g_xfs_dentry_invalidations.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -452,7 +460,7 @@ void xfs_dentry_cache_invalidate_dir(XfsInode* dp) {
     victim->generation = xfs_dentry_next_generation_value();
     victim->last_used = USE_STAMP;
     victim->valid = true;
-    g_xfs_dentry_cache_lock.unlock_irqrestore(IRQF);
+    set.lock.unlock_irqrestore(IRQF);
     g_xfs_dentry_invalidations.fetch_add(1, std::memory_order_relaxed);
 }
 #endif
@@ -3121,22 +3129,24 @@ void xfs_dentry_cache_purge_mount(XfsMountContext* mount) {
         return;
     }
 
-    uint64_t const IRQF = g_xfs_dentry_cache_lock.lock_irqsave();
     for (auto& set : g_xfs_dentry_cache) {
+        uint64_t const IRQF = set.lock.lock_irqsave();
         for (auto& candidate : set.ways) {
             if (candidate.valid && candidate.mount == mount) {
                 candidate.valid = false;
             }
         }
+        set.lock.unlock_irqrestore(IRQF);
     }
     for (auto& set : g_xfs_dentry_generations) {
+        uint64_t const IRQF = set.lock.lock_irqsave();
         for (auto& candidate : set.ways) {
             if (candidate.valid && candidate.mount == mount) {
                 candidate.valid = false;
             }
         }
+        set.lock.unlock_irqrestore(IRQF);
     }
-    g_xfs_dentry_cache_lock.unlock_irqrestore(IRQF);
     g_xfs_dentry_invalidations.fetch_add(1, std::memory_order_relaxed);
 }
 
