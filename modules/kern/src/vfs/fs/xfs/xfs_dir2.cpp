@@ -2174,12 +2174,9 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
     uint32_t const CRC = util::crc32c_block_with_cksum(block, BLKSIZE, 4);  // crc at offset 4 in XfsDir3BlkHdr
     hdr3->hdr.crc = Be32::from_cpu(CRC);
 
-    // Write the block to disk IMMEDIATELY.  dir2_block_addname (which runs
-    // in the same transaction, before commit) will re-read this block from
-    // disk.  Since multi-block buffers aren't cached, logging the buffer in
-    // the transaction is insufficient - we must ensure the data is on disk
-    // before the addname read.
-    bwrite(bh);
+    // The transaction owns a reference until commit, so the follow-up
+    // dir2_block_addname read in this same transaction can reuse the cached
+    // exact-span buffer. Commit dirties it only after the log write.
     brelse(bh);
 
     delete[] leaves;
@@ -2284,7 +2281,6 @@ auto dir2_block_to_leaf(XfsInode* dp, XfsTransaction* tp) -> int {
     dir2_make_data_free(ctx, new_data, DATA_START, BLKSIZE, DATA_START, BLKSIZE - DATA_START);
     dir2_recompute_data_crc(new_data, BLKSIZE);
     xfs_trans_log_buf_full(tp, new_data_bh);
-    bwrite(new_data_bh);
     brelse(new_data_bh);
 
     xfs_fileoff_t const LEAF_FSBNO = XFS_DIR2_LEAF_OFFSET >> ctx->block_log;
@@ -2310,14 +2306,12 @@ auto dir2_block_to_leaf(XfsInode* dp, XfsTransaction* tp) -> int {
     __builtin_memcpy(dir2_leaf_entries(leaf_hdr), leaf_copy, LEAF_BYTES);
     dir2_recompute_leaf_crc(leaf_block, BLKSIZE);
     xfs_trans_log_buf_full(tp, leaf_bh);
-    bwrite(leaf_bh);
     brelse(leaf_bh);
 
     data_hdr->hdr.magic = Be32::from_cpu(XFS_DIR3_DATA_MAGIC);
     dir2_make_data_free(ctx, block, DATA_START, BLKSIZE, OLD_LEAF_START, BLKSIZE - OLD_LEAF_START);
     dir2_recompute_data_crc(block, BLKSIZE);
     xfs_trans_log_buf_full(tp, block_bh);
-    bwrite(block_bh);
     brelse(block_bh);
 
     dp->size = 2ULL * static_cast<uint64_t>(ctx->dir_blk_size);
