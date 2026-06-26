@@ -244,7 +244,6 @@ std::atomic<bool> dirty_writeback_wq_creating{false};
 
 bool cache_initialized = false;
 
-constexpr size_t DIRTY_HARD_LIMIT_TARGET_MULTIPLIER = 2;
 constexpr size_t DIRTY_WRITEBACK_BUDGET = 1024;
 constexpr size_t DIRTY_WRITEBACK_YIELD_BYTES = size_t{16} * 1024 * 1024;
 constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = DIRTY_WRITEBACK_BUDGET;
@@ -470,10 +469,13 @@ auto choose_dirty_target_bytes_for_total(uint64_t total_mem, size_t max_bytes) -
 }
 
 auto choose_dirty_hard_limit_bytes(size_t target_bytes, size_t max_bytes) -> size_t {
-    if (target_bytes > SIZE_MAX / DIRTY_HARD_LIMIT_TARGET_MULTIPLIER) {
+    if (target_bytes == 0) {
+        return 0;
+    }
+    if (max_bytes == 0) {
         return max_bytes;
     }
-    return std::min(target_bytes * DIRTY_HARD_LIMIT_TARGET_MULTIPLIER, max_bytes);
+    return max_bytes;
 }
 
 // Free a buffer's resources completely (removes from hash + LRU).

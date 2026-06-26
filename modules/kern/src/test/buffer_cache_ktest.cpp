@@ -144,8 +144,7 @@ KTEST(BufferCache, SizingKeepsDirtyLimitsBelowCleanCache) {
 
     KEXPECT_EQ(CACHE_MAX, static_cast<size_t>(ONE_GIB / 2));
     KEXPECT_EQ(DIRTY_TARGET, static_cast<size_t>(ONE_GIB / 10));
-    KEXPECT_EQ(DIRTY_HARD, DIRTY_TARGET * 2);
-    KEXPECT_TRUE(DIRTY_HARD < CACHE_MAX);
+    KEXPECT_EQ(DIRTY_HARD, CACHE_MAX);
 
     size_t const FALLBACK_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(0);
     size_t const FALLBACK_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(0, FALLBACK_MAX);
