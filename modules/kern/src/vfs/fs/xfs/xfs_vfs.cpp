@@ -65,7 +65,7 @@ constexpr size_t XFS_STREAM_PREALLOC_TRIGGER_BYTES = size_t{2} * 1024 * 1024;
 constexpr xfs_extlen_t XFS_STREAM_PREALLOC_BLOCKS = 1024;  // 4 MiB
 constexpr uint32_t XFS_STREAM_PREALLOC_EXTENT_MARGIN = 8;
 constexpr size_t XFS_PARENT_PATH_CACHE_PATH_MAX = 512;
-constexpr size_t XFS_PARENT_PATH_CACHE_SET_COUNT = 1024;
+constexpr size_t XFS_PARENT_PATH_CACHE_SET_COUNT = 4096;
 constexpr size_t XFS_PARENT_PATH_CACHE_WAYS = 4;
 static_assert((XFS_PARENT_PATH_CACHE_SET_COUNT & (XFS_PARENT_PATH_CACHE_SET_COUNT - 1)) == 0);
 
