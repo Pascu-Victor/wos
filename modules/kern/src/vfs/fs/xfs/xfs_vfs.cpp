@@ -1969,6 +1969,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     XfsInode* ip = nullptr;
     bool used_create_lookup = false;
     bool create_missing = false;
+    bool created_by_open = false;
     XfsInode* create_parent_ip = nullptr;
     const char* create_filename = nullptr;
     uint16_t create_filename_len = 0;
@@ -2051,6 +2052,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
             delete new_inode;
             return nullptr;
         }
+        created_by_open = true;
 
         // The transaction has just written this inode.  Cache and use the
         // in-memory copy instead of immediately re-reading it from disk.
@@ -2102,6 +2104,8 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     f->refcount = 1;
     f->open_flags = flags;
     f->fd_flags = 0;
+    f->open_create_result_known = (flags & O_CREAT_FLAG) != 0;
+    f->created_by_open = created_by_open;
     f->vfs_path = nullptr;
     f->dir_fs_count = static_cast<size_t>(-1);
 

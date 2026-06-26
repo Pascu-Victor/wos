@@ -1516,6 +1516,16 @@ auto apply_open_truncation(File* f, int flags) -> int {
     return RET;
 }
 
+auto open_create_should_invalidate_metadata(const File* file, int flags) -> bool {
+    if ((flags & ker::vfs::O_CREAT) == 0) {
+        return false;
+    }
+    if (file == nullptr || !file->open_create_result_known) {
+        return true;
+    }
+    return file->created_by_open;
+}
+
 auto vfs_take_fd_locked(ker::mod::sched::task::Task* task, int fd) -> File* {
     if (task == nullptr || fd < 0) {
         return nullptr;
@@ -4732,7 +4742,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
         vfs_destroy_file(f);
         return TRUNCATE_RET;
     }
-    if ((backend_flags & ker::vfs::O_CREAT) != 0) {
+    if (open_create_should_invalidate_metadata(f, backend_flags)) {
         metadata_cache_note_path_changed(path_buffer.data(), nullptr);
     }
     if ((flags & ker::vfs::O_NO_CACHE) != 0) {
@@ -9046,6 +9056,22 @@ auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool {
     return ok;
 }
 
+auto vfs_selftest_open_create_metadata_hint() -> bool {
+    File unknown_backend{};
+    File existing_file{};
+    existing_file.open_create_result_known = true;
+
+    File created_file{};
+    created_file.open_create_result_known = true;
+    created_file.created_by_open = true;
+
+    return !open_create_should_invalidate_metadata(&created_file, 0) &&
+           open_create_should_invalidate_metadata(nullptr, ker::vfs::O_CREAT) &&
+           open_create_should_invalidate_metadata(&unknown_backend, ker::vfs::O_CREAT) &&
+           !open_create_should_invalidate_metadata(&existing_file, ker::vfs::O_CREAT) &&
+           open_create_should_invalidate_metadata(&created_file, ker::vfs::O_CREAT);
+}
+
 auto vfs_selftest_stream_cache_read_eligibility() -> bool {
     char path[] = "/tmp/ktest_stream_cache_read_eligibility";
 
@@ -9637,7 +9663,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
         f->dir_fs_count = static_cast<size_t>(-1);
         f->open_flags = flags;
         f->fd_flags = 0;
-        if ((backend_flags & ker::vfs::O_CREAT) != 0) {
+        if (open_create_should_invalidate_metadata(f, backend_flags)) {
             metadata_cache_note_path_changed(pathBuffer, nullptr);
         }
         if ((flags & ker::vfs::O_NO_CACHE) != 0) {
