@@ -599,6 +599,9 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     size_t mount_count_after_insert = 0;
     mount_lock.lock();
     mount->dev_id = next_dev_id++;
+    if (mount->fs_type == FSType::XFS && mount->private_data != nullptr) {
+        static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data)->dev_id = mount->dev_id;
+    }
     if (!mounts.push_back(mount)) {
         mount_lock.unlock();
         vfs_debug_log("mount_filesystem: mount table full (OOM)\n");

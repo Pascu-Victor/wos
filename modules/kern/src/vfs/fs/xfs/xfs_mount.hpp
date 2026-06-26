@@ -54,6 +54,7 @@ struct XfsPerAG {
 // Mount context - one per mounted XFS filesystem
 struct XfsMountContext {
     dev::BlockDevice* device;  // Underlying block device
+    uint32_t dev_id;           // VFS synthetic st_dev for this mounted instance
 
     // --- Parsed superblock geometry ---
     uint32_t block_size;        // filesystem block size (bytes)

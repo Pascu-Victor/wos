@@ -2080,7 +2080,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
 namespace {
 
 void fill_stat(XfsInode* ip, ker::vfs::Stat* st) {
-    st->st_dev = 0;
+    st->st_dev = ip->mount->dev_id;
     st->st_ino = ip->ino;
     st->st_nlink = ip->nlink;
     st->st_mode = ip->mode;

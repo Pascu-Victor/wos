@@ -6213,12 +6213,15 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
         return finish_stat(fill_synthetic_mount_dir_stat(file->vfs_path, statbuf));
     }
 
-    MountRef fstat_mount_ref = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path) : MountRef{};
-    MountPoint const* fstat_mount = fstat_mount_ref.get();
-    uint32_t const FSTAT_DEV_ID = (fstat_mount != nullptr) ? fstat_mount->dev_id : 0;
+    auto fstat_dev_id = [&]() -> uint32_t {
+        MountRef fstat_mount_ref = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path) : MountRef{};
+        MountPoint const* fstat_mount = fstat_mount_ref.get();
+        return fstat_mount != nullptr ? fstat_mount->dev_id : 0;
+    };
 
     switch (file->fs_type) {
         case FSType::TMPFS: {
+            uint32_t const FSTAT_DEV_ID = fstat_dev_id();
             // Pipes and epoll reuse FSType::TMPFS but private_data is not a TmpNode
             if (file->fops != ker::vfs::tmpfs::get_tmpfs_fops()) {
                 // Return minimal stat for pseudo-TMPFS (pipes, epoll)
@@ -6256,11 +6259,12 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
         case FSType::FAT32: {
             int const R = ker::vfs::fat32::fat32_fstat(file, statbuf);
             if (R == 0) {
-                statbuf->st_dev = FSTAT_DEV_ID;
+                statbuf->st_dev = fstat_dev_id();
             }
             return finish_stat(R);
         }
         case FSType::DEVFS: {
+            uint32_t const FSTAT_DEV_ID = fstat_dev_id();
             auto* node = ker::vfs::devfs::devfs_file_node(file);
             statbuf->st_dev = FSTAT_DEV_ID;
             statbuf->st_ino = (node != nullptr) ? reinterpret_cast<ino_t>(node) : 1;
@@ -6285,7 +6289,7 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
             return finish_stat(0);
         }
         case FSType::SOCKET: {
-            statbuf->st_dev = FSTAT_DEV_ID;
+            statbuf->st_dev = fstat_dev_id();
             statbuf->st_ino = 1;
             statbuf->st_nlink = 1;
             statbuf->st_mode = S_IFSOCK | 0666;
@@ -6304,6 +6308,7 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
             }
 
             // Fall back to a synthetic stat if path-based remote metadata lookup fails.
+            uint32_t const FSTAT_DEV_ID = fstat_dev_id();
             statbuf->st_dev = FSTAT_DEV_ID;
             statbuf->st_ino = 1;
             statbuf->st_nlink = 1;
@@ -6322,14 +6327,11 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
             return finish_stat(0);
         }
         case FSType::PROCFS: {
-            int const R = ker::vfs::procfs::procfs_fill_stat(file, statbuf, FSTAT_DEV_ID);
+            int const R = ker::vfs::procfs::procfs_fill_stat(file, statbuf, fstat_dev_id());
             return finish_stat(R);
         }
         case FSType::XFS: {
             int const R = ker::vfs::xfs::xfs_fstat(file, statbuf);
-            if (R == 0) {
-                statbuf->st_dev = FSTAT_DEV_ID;
-            }
             return finish_stat(R);
         }
         default:
