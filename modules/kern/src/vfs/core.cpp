@@ -5979,7 +5979,7 @@ auto vfs_mkdir(const char* path, int mode) -> int {
         int const R = ker::vfs::xfs::xfs_mkdir_path(fs_path, mode, xctx);
         // mkdir -p calls mkdir on existing dirs; treat EEXIST as success
         int const RESULT = (R == -EEXIST) ? 0 : R;
-        if (RESULT == 0) {
+        if (R == 0) {
             vfs_cache_notify_path_changed(abs_path.data(), nullptr);
         }
         return RESULT;
@@ -5988,7 +5988,7 @@ auto vfs_mkdir(const char* path, int mode) -> int {
     if (mount->fs_type == FSType::REMOTE) {
         int const R = ker::net::wki::wki_remote_vfs_mkdir(mount->private_data, fs_path, mode);
         int const RESULT = (R == -EEXIST) ? 0 : R;
-        if (RESULT == 0) {
+        if (R == 0) {
             vfs_cache_notify_path_changed(abs_path.data(), nullptr);
         }
         return RESULT;
