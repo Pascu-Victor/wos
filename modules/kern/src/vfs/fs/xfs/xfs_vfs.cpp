@@ -2222,7 +2222,11 @@ auto xfs_stat(const char* fs_path, ker::vfs::Stat* statbuf, XfsMountContext* ctx
 
     XfsMetadataGuard metadata_guard(ctx);
 
-    auto* ip = walk_path(ctx, fs_path);
+    XfsInode* ip = nullptr;
+    int const LOOKUP_RET = xfs_lookup_with_cached_parent(fs_path, ctx, &ip);
+    if (LOOKUP_RET == -EAGAIN || LOOKUP_RET == -EINVAL) {
+        ip = walk_path(ctx, fs_path);
+    }
     if (ip == nullptr) {
         return -ENOENT;
     }
