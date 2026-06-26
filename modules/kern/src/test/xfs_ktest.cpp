@@ -105,7 +105,7 @@ KTEST(XFS, SequentialAppendDefersSpeculativePreallocUntilStream) {
     constexpr size_t BLOCK_SIZE = 4096;
     constexpr uint32_t BLOCK_LOG = 12;
     constexpr size_t SMALL_APPEND_POS = size_t{16} * 1024;
-    constexpr size_t STREAM_APPEND_POS = size_t{512} * 1024;
+    constexpr size_t STREAM_APPEND_POS = size_t{2} * 1024 * 1024;
     constexpr ker::vfs::xfs::xfs_filblks_t UNBOUNDED_HOLE = ~static_cast<ker::vfs::xfs::xfs_filblks_t>(0);
 
     KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(0, 4096, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG, SMALL_APPEND_POS, true),
