@@ -1469,6 +1469,44 @@ void symlink_cache_store(const char* path, FSType fs_type, uint64_t dev_id, ssiz
     g_vfs_symlink_stores.fetch_add(1, std::memory_order_relaxed);
 }
 
+void vfs_file_clear_path(File* file) {
+    if (file == nullptr) {
+        return;
+    }
+    if (file->vfs_path_heap_allocated) {
+        delete[] file->vfs_path;
+    }
+    file->vfs_path = nullptr;
+    file->vfs_path_heap_allocated = false;
+    file->vfs_path_inline.at(0) = '\0';
+}
+
+auto vfs_file_set_path(File* file, const char* path) -> bool {
+    if (file == nullptr) {
+        return false;
+    }
+    vfs_file_clear_path(file);
+    if (path == nullptr) {
+        return true;
+    }
+
+    size_t const PATH_LEN = std::strlen(path);
+    if (PATH_LEN + 1 <= file->vfs_path_inline.size()) {
+        std::memcpy(file->vfs_path_inline.data(), path, PATH_LEN + 1);
+        file->vfs_path = file->vfs_path_inline.data();
+        return true;
+    }
+
+    auto* path_copy = new char[PATH_LEN + 1];
+    if (path_copy == nullptr) {
+        return false;
+    }
+    std::memcpy(path_copy, path, PATH_LEN + 1);
+    file->vfs_path = path_copy;
+    file->vfs_path_heap_allocated = true;
+    return true;
+}
+
 auto vfs_destroy_file(File* f) -> int {
     if (f == nullptr) {
         return 0;
@@ -1481,7 +1519,7 @@ auto vfs_destroy_file(File* f) -> int {
     if ((f->fops != nullptr) && (f->fops->vfs_close != nullptr)) {
         close_result = f->fops->vfs_close(f);
     }
-    delete[] f->vfs_path;
+    vfs_file_clear_path(f);
     f->private_data = nullptr;
     delete f;
     return close_result;
@@ -4150,7 +4188,7 @@ void release_open_file(File* file) {
         file->fops->vfs_close(file);
     }
 
-    delete[] file->vfs_path;
+    vfs_file_clear_path(file);
     delete file;
 }
 
@@ -4771,15 +4809,8 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     }
     log_loader_path_event("open-ok", raw_path.data(), path_buffer.data(), mount, 0);
 
-    // Store the absolute VFS path for mount-overlay directory listing
-    size_t const PATH_LEN = std::strlen(path_buffer.data());
-    auto* path_copy = new char[PATH_LEN + 1];
-    if (path_copy != nullptr) {
-        std::memcpy(path_copy, path_buffer.data(), PATH_LEN + 1);
-        f->vfs_path = path_copy;
-    } else {
-        f->vfs_path = nullptr;
-    }
+    // Store the absolute VFS path for mount-overlay directory listing.
+    static_cast<void>(vfs_file_set_path(f, path_buffer.data()));
     f->dir_fs_count = static_cast<size_t>(-1);
     f->open_flags = flags;
     f->fd_flags = 0;  // fd_flags on File is legacy; CLOEXEC is per-fd in task bitmap
@@ -4801,7 +4832,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
             int const PERM_RET = vfs_check_permission(node->mode, node->uid, node->gid, required_access);
             if (PERM_RET < 0) {
                 // Permission denied - clean up and return
-                delete[] f->vfs_path;
+                vfs_file_clear_path(f);
                 delete f;
                 return PERM_RET;
             }
@@ -9148,6 +9179,37 @@ auto vfs_selftest_remote_fstat_snapshot_cacheable() -> bool {
            after_lookup.fstat_snapshot_miss_uncacheable == before.fstat_snapshot_miss_uncacheable;
 }
 
+auto vfs_selftest_file_path_storage() -> bool {
+    File file{};
+    constexpr const char SHORT_PATH[] = "/tmp/short-vfs-path";
+
+    bool ok = vfs_file_set_path(&file, SHORT_PATH);
+    ok = ok && file.vfs_path == file.vfs_path_inline.data() && !file.vfs_path_heap_allocated && std::strcmp(file.vfs_path, SHORT_PATH) == 0;
+
+    vfs_file_clear_path(&file);
+    ok = ok && file.vfs_path == nullptr && !file.vfs_path_heap_allocated && file.vfs_path_inline.at(0) == '\0';
+
+    std::array<char, File::INLINE_VFS_PATH_CAPACITY + 8> long_path{};
+    long_path.at(0) = '/';
+    for (size_t i = 1; i + 1 < long_path.size(); ++i) {
+        long_path.at(i) = 'a';
+    }
+    long_path.back() = '\0';
+
+    ok = ok && vfs_file_set_path(&file, long_path.data());
+    ok = ok && file.vfs_path != nullptr && file.vfs_path != file.vfs_path_inline.data() && file.vfs_path_heap_allocated &&
+         std::strcmp(file.vfs_path, long_path.data()) == 0;
+
+    vfs_file_clear_path(&file);
+
+    constexpr const char LITERAL_PATH[] = "/tmp/non-owned-literal";
+    file.vfs_path = LITERAL_PATH;
+    file.vfs_path_heap_allocated = false;
+    vfs_file_clear_path(&file);
+
+    return ok && file.vfs_path == nullptr && !file.vfs_path_heap_allocated;
+}
+
 auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool {
     vfs_mkdir("/tmp", 0755);
 
@@ -9826,14 +9888,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
 
     // Store the absolute VFS path for mount-overlay directory listing
     if (f != nullptr) {
-        size_t const PL = std::strlen(pathBuffer);
-        auto* pc = new char[PL + 1];
-        if (pc != nullptr) {
-            std::memcpy(pc, pathBuffer, PL + 1);
-            f->vfs_path = pc;
-        } else {
-            f->vfs_path = nullptr;
-        }
+        static_cast<void>(vfs_file_set_path(f, pathBuffer));
         f->dir_fs_count = static_cast<size_t>(-1);
         f->open_flags = flags;
         f->fd_flags = 0;

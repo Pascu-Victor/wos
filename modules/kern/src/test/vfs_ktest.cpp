@@ -33,6 +33,8 @@ KTEST(VFS, AnonymousFstatSnapshotHits) { KEXPECT_TRUE(ker::vfs::vfs_selftest_ano
 
 KTEST(VFS, RemoteFstatSnapshotCacheable) { KEXPECT_TRUE(ker::vfs::vfs_selftest_remote_fstat_snapshot_cacheable()); }
 
+KTEST(VFS, FilePathStorage) { KEXPECT_TRUE(ker::vfs::vfs_selftest_file_path_storage()); }
+
 KTEST(VFS, FileDataWriteInvalidatesPathStat) { KEXPECT_TRUE(ker::vfs::vfs_selftest_file_data_write_invalidates_path_stat()); }
 
 KTEST(VFS, FileMetadataChangeInvalidatesPathStat) { KEXPECT_TRUE(ker::vfs::vfs_selftest_file_metadata_change_invalidates_path_stat()); }

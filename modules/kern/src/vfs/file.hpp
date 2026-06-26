@@ -2,6 +2,7 @@
 
 #include <sys/types.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -42,6 +43,8 @@ enum class FSType : uint8_t {
 };
 
 struct File {
+    static constexpr size_t INLINE_VFS_PATH_CAPACITY = 256;
+
     int fd{};  // numeric descriptor
     void* private_data{};
     FileOperations* fops{};
@@ -56,8 +59,10 @@ struct File {
     bool created_by_open = false;
 
     // Mount-overlay directory listing support
-    const char* vfs_path{};  // Absolute VFS path (heap-allocated, set by vfs_open)
+    const char* vfs_path{};  // Absolute VFS path, set by VFS open helpers
     size_t dir_fs_count{};   // Cached FS readdir entry count ((size_t)-1 = unknown)
+    std::array<char, INLINE_VFS_PATH_CAPACITY> vfs_path_inline{};
+    bool vfs_path_heap_allocated = false;
 
     // Optional VFS-core streamed-read cache attachment.
     void* stream_cache_attachment = nullptr;
