@@ -90,7 +90,9 @@ struct XfsParentPathCacheEntry {
 };
 
 struct XfsParentPathCacheSet {
+    ker::mod::sys::Mutex lock;
     std::array<XfsParentPathCacheEntry, XFS_PARENT_PATH_CACHE_WAYS> ways{};
+    uint64_t clock{};
 };
 
 class XfsMetadataGuard {
@@ -328,8 +330,6 @@ class XfsMetadataUnlockedScope {
 };
 
 std::array<XfsParentPathCacheSet, XFS_PARENT_PATH_CACHE_SET_COUNT> g_xfs_parent_path_cache{};
-ker::mod::sys::Mutex g_xfs_parent_path_cache_lock;
-std::atomic<uint64_t> g_xfs_parent_path_cache_clock{0};
 
 auto xfs_parent_path_cache_hash(XfsMountContext* ctx, const char* path, size_t path_len) -> uint64_t {
     uint64_t hash = 1469598103934665603ULL ^ reinterpret_cast<uintptr_t>(ctx);
@@ -351,7 +351,7 @@ auto xfs_parent_path_cache_lookup_ino(XfsMountContext* ctx, const char* path, si
     uint64_t const HASH = xfs_parent_path_cache_hash(ctx, path, path_len);
     auto& set = g_xfs_parent_path_cache[HASH & (XFS_PARENT_PATH_CACHE_SET_COUNT - 1)];
 
-    ker::mod::sys::MutexGuard guard(g_xfs_parent_path_cache_lock);
+    ker::mod::sys::MutexGuard guard(set.lock);
     for (auto& entry : set.ways) {
         if (!entry.valid || entry.mount != ctx || entry.hash != HASH || entry.path_len != path_len) {
             continue;
@@ -359,7 +359,7 @@ auto xfs_parent_path_cache_lookup_ino(XfsMountContext* ctx, const char* path, si
         if (std::memcmp(entry.path.data(), path, path_len) != 0) {
             continue;
         }
-        entry.last_used = g_xfs_parent_path_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+        entry.last_used = ++set.clock;
         *ino_out = entry.ino;
         return true;
     }
@@ -372,10 +372,10 @@ void xfs_parent_path_cache_store(XfsMountContext* ctx, const char* path, size_t 
     }
 
     uint64_t const HASH = xfs_parent_path_cache_hash(ctx, path, path_len);
-    uint64_t const USE_STAMP = g_xfs_parent_path_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
     auto& set = g_xfs_parent_path_cache[HASH & (XFS_PARENT_PATH_CACHE_SET_COUNT - 1)];
 
-    ker::mod::sys::MutexGuard guard(g_xfs_parent_path_cache_lock);
+    ker::mod::sys::MutexGuard guard(set.lock);
+    uint64_t const USE_STAMP = ++set.clock;
     XfsParentPathCacheEntry* victim = &set.ways.front();
     for (auto& entry : set.ways) {
         if (entry.valid && entry.mount == ctx && entry.hash == HASH && entry.path_len == path_len &&
@@ -407,8 +407,8 @@ void xfs_parent_path_cache_purge_all_for_mount(XfsMountContext* ctx) {
         return;
     }
 
-    ker::mod::sys::MutexGuard guard(g_xfs_parent_path_cache_lock);
     for (auto& set : g_xfs_parent_path_cache) {
+        ker::mod::sys::MutexGuard guard(set.lock);
         for (auto& entry : set.ways) {
             if (entry.valid && entry.mount == ctx) {
                 entry.valid = false;
