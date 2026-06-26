@@ -728,6 +728,10 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "sync";
                 case ker::abi::vfs::ops::REALPATH:
                     return "realpath";
+                case ker::abi::vfs::ops::OPENAT:
+                    return "openat";
+                case ker::abi::vfs::ops::STATAT:
+                    return "statat";
             }
             break;
         case ker::abi::callnums::net:
