@@ -188,6 +188,13 @@ KTEST(XFS, ReadOnlyCloseSkipsPreallocTrim) {
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_close_should_trim_prealloc(ker::vfs::O_CREAT | 1, true, true));
 }
 
+KTEST(XFS, CleanFreshCreateCloseSkipsCommit) {
+    KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_close_should_commit_inode(false, ker::vfs::O_CREAT | 1, true, false));
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_close_should_commit_inode(true, ker::vfs::O_CREAT | 1, true, false));
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_close_should_commit_inode(false, ker::vfs::O_CREAT | 1, true, true));
+    KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_close_should_commit_inode(false, 0, false, false));
+}
+
 KTEST(XFS, CloseTrimDetectsActualEofPrealloc) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_inode_has_eof_prealloc()); }
 
 KTEST(XFS, DirectFreshWriteDropsDirtyCacheAlias) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_direct_fresh_write_discards_cache()); }

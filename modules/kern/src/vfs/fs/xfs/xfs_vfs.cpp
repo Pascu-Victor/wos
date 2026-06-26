@@ -77,6 +77,7 @@ struct XfsFileData {
     XfsMountContext* mount{};
     XfsInode* inode{};  // reference-counted inode
     bool may_have_eof_prealloc{};
+    bool close_may_need_inode_commit{};
 };
 
 struct XfsParentPathCacheEntry {
@@ -291,6 +292,11 @@ auto xfs_close_should_trim_prealloc(int open_flags, bool created_by_open, bool m
         return false;
     }
     return may_have_eof_prealloc || !created_by_open;
+}
+
+auto xfs_close_should_commit_inode(bool close_may_need_inode_commit, int open_flags, bool created_by_open, bool may_have_eof_prealloc)
+    -> bool {
+    return close_may_need_inode_commit || xfs_close_should_trim_prealloc(open_flags, created_by_open, may_have_eof_prealloc);
 }
 
 auto xfs_inode_has_eof_prealloc(const XfsInode* ip) -> bool {
@@ -684,10 +690,12 @@ auto xfs_vfs_close(File* f) -> int {
     auto* xfd = static_cast<XfsFileData*>(f->private_data);
     if (xfd != nullptr) {
         if (xfd->inode != nullptr) {
-            XfsMetadataGuard metadata_guard(xfd->mount);
-            {
+            bool const TRIM_PREALLOC = xfs_close_should_trim_prealloc(f->open_flags, f->created_by_open, xfd->may_have_eof_prealloc);
+            bool const COMMIT_NEEDED = xfs_close_should_commit_inode(xfd->close_may_need_inode_commit, f->open_flags, f->created_by_open,
+                                                                     xfd->may_have_eof_prealloc);
+            if (COMMIT_NEEDED) {
+                XfsMetadataGuard metadata_guard(xfd->mount);
                 ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
-                bool const TRIM_PREALLOC = xfs_close_should_trim_prealloc(f->open_flags, f->created_by_open, xfd->may_have_eof_prealloc);
                 close_result = xfs_commit_dirty_inode(xfd->mount, xfd->inode, TRIM_PREALLOC);
             }
             xfs_inode_release(xfd->inode);
@@ -1314,6 +1322,9 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
 
 write_done:
     if (total_written == 0) {
+        if (ip->dirty) {
+            xfd->close_may_need_inode_commit = true;
+        }
         return finish_write(write_error != 0 ? write_error : -EIO);
     }
 
@@ -1321,6 +1332,9 @@ write_done:
     if (offset + total_written > ip->size) {
         ip->size = offset + total_written;
         ip->dirty = true;
+    }
+    if (ip->dirty) {
+        xfd->close_may_need_inode_commit = true;
     }
 
     throttle_dirty_buffer_cache(ctx->device);
@@ -1670,6 +1684,11 @@ auto xfs_selftest_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks)
 
 auto xfs_selftest_close_should_trim_prealloc(int open_flags, bool created_by_open, bool may_have_eof_prealloc) -> bool {
     return xfs_close_should_trim_prealloc(open_flags, created_by_open, may_have_eof_prealloc);
+}
+
+auto xfs_selftest_close_should_commit_inode(bool close_may_need_inode_commit, int open_flags, bool created_by_open,
+                                            bool may_have_eof_prealloc) -> bool {
+    return xfs_close_should_commit_inode(close_may_need_inode_commit, open_flags, created_by_open, may_have_eof_prealloc);
 }
 
 auto xfs_selftest_inode_has_eof_prealloc() -> bool {
