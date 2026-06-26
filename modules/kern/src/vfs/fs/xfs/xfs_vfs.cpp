@@ -2745,56 +2745,17 @@ auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx) -> int {
 
     XfsMetadataGuard metadata_guard(ctx);
 
-    // Find the parent directory and extract the filename
-    const char* last_slash = nullptr;
-    for (const char* p = fs_path; *p != '\0'; p++) {
-        if (*p == '/') {
-            last_slash = p;
-        }
-    }
-
     XfsInode* parent_ip = nullptr;
     const char* filename = nullptr;
     uint16_t filename_len = 0;
-
-    if (last_slash == nullptr || last_slash == fs_path) {
-        // File is in the root directory
-        parent_ip = xfs_root_inode_read(ctx);
-        filename = (last_slash == fs_path) ? fs_path + 1 : fs_path;
-    } else {
-        // Extract parent path
-        auto const PARENT_LEN = static_cast<size_t>(last_slash - fs_path);
-        char parent_path[512] = {};  // NOLINT
-        if (PARENT_LEN >= sizeof(parent_path)) {
-            return -ENAMETOOLONG;
-        }
-        std::memcpy(static_cast<char*>(parent_path), fs_path, PARENT_LEN);
-        parent_path[PARENT_LEN] = '\0';
-        parent_ip = walk_path(ctx, static_cast<const char*>(parent_path));
-        filename = last_slash + 1;
-    }
-
-    if (parent_ip == nullptr) {
-        return -ENOENT;
-    }
-
-    if (!xfs_inode_isdir(parent_ip)) {
-        xfs_inode_release(parent_ip);
-        return -ENOTDIR;
-    }
-
-    // Calculate filename length
-    for (const char* p = filename; *p != '\0'; p++) {
-        filename_len++;
-    }
-    if (filename_len == 0) {
-        xfs_inode_release(parent_ip);
-        return -EINVAL;
+    int rc = xfs_find_parent_and_name(fs_path, ctx, &parent_ip, &filename, &filename_len);
+    if (rc != 0) {
+        return rc;
     }
 
     // Look up the entry to be deleted (must verify it exists and is a regular file)
     XfsDirEntry de{};
-    int rc = xfs_dir_lookup(parent_ip, filename, filename_len, &de);
+    rc = xfs_dir_lookup(parent_ip, filename, filename_len, &de);
     if (rc != 0) {
         xfs_inode_release(parent_ip);
         return rc;
