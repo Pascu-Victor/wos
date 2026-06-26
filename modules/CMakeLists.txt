@@ -8,6 +8,18 @@ set(CMAKE_CXX_COMPILER_WORKS ON)
 get_filename_component(WOS_REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 set(WOS_MODULES_DIR "${CMAKE_CURRENT_LIST_DIR}")
 set(HOST_PATH ${WOS_REPO_ROOT}/toolchain/host)
+set(WOS_REPO_SYSROOT_PATH "${WOS_REPO_ROOT}/toolchain/sysroot")
+set(WOS_NATIVE_INSTALLED_SYSROOT_PATH "/")
+
+set(WOS_REPO_SYSROOT_READY OFF)
+if(EXISTS "${WOS_REPO_SYSROOT_PATH}/lib/libc.a" AND
+   EXISTS "${WOS_REPO_SYSROOT_PATH}/lib/libc++.a" AND
+   EXISTS "${WOS_REPO_SYSROOT_PATH}/lib/libc++abi.a" AND
+   EXISTS "${WOS_REPO_SYSROOT_PATH}/lib/libunwind.a" AND
+   EXISTS "${WOS_REPO_SYSROOT_PATH}/include/c++/v1")
+    set(WOS_REPO_SYSROOT_READY ON)
+endif()
+
 set(WOS_NATIVE_SYSTEM_BUILD OFF CACHE BOOL "Build modules with the native WOS system toolchain")
 execute_process(
     COMMAND uname -s
@@ -20,14 +32,19 @@ if((DEFINED ENV{WOS_NATIVE_HOST} AND "$ENV{WOS_NATIVE_HOST}" STREQUAL "1") OR CM
     set(WOS_NATIVE_SYSTEM_BUILD ON CACHE BOOL "Build modules with the native WOS system toolchain" FORCE)
 endif()
 
-if(WOS_NATIVE_SYSTEM_BUILD)
-    set(WOS_DEFAULT_SYSROOT_PATH "/")
+option(WOS_NATIVE_USE_INSTALLED_SYSROOT
+       "For native WOS builds, prefer the installed / sysroot over the repo toolchain/sysroot"
+       OFF)
+
+if(WOS_NATIVE_SYSTEM_BUILD AND (WOS_NATIVE_USE_INSTALLED_SYSROOT OR NOT WOS_REPO_SYSROOT_READY))
+    set(WOS_DEFAULT_SYSROOT_PATH "${WOS_NATIVE_INSTALLED_SYSROOT_PATH}")
 else()
-    set(WOS_DEFAULT_SYSROOT_PATH "${WOS_REPO_ROOT}/toolchain/sysroot")
+    set(WOS_DEFAULT_SYSROOT_PATH "${WOS_REPO_SYSROOT_PATH}")
 endif()
 set(WOS_SYSROOT_PATH "${WOS_DEFAULT_SYSROOT_PATH}" CACHE PATH "WOS target sysroot")
-if(WOS_NATIVE_SYSTEM_BUILD AND WOS_SYSROOT_PATH STREQUAL "${WOS_REPO_ROOT}/toolchain/sysroot")
-    set(WOS_SYSROOT_PATH "/" CACHE PATH "WOS target sysroot" FORCE)
+if(WOS_NATIVE_SYSTEM_BUILD AND NOT WOS_NATIVE_USE_INSTALLED_SYSROOT AND WOS_REPO_SYSROOT_READY AND
+   WOS_SYSROOT_PATH STREQUAL "${WOS_NATIVE_INSTALLED_SYSROOT_PATH}")
+    set(WOS_SYSROOT_PATH "${WOS_REPO_SYSROOT_PATH}" CACHE PATH "WOS target sysroot" FORCE)
 endif()
 set(SYSROOT_PATH ${WOS_SYSROOT_PATH})
 set(WOS_SYSROOT_LIB_DIR "${SYSROOT_PATH}")
@@ -55,10 +72,10 @@ if(WOS_USE_CCACHE AND WOS_CCACHE_PROGRAM)
     set(CMAKE_CXX_COMPILER_LAUNCHER "${WOS_CCACHE_PROGRAM}" CACHE STRING "C++ compiler launcher" FORCE)
 endif()
 
-# Configure sysroot for cross-compilation. Native WOS builds still use `/` as
-# the sysroot but should not force CMake's find logic into the checked-out tree.
+# Configure sysroot for cross-compilation. Native WOS builds can also reuse the
+# checked-out repo sysroot when it is populated with the required runtime libs.
 set(CMAKE_SYSROOT "${SYSROOT_PATH}")
-if(NOT WOS_NATIVE_SYSTEM_BUILD)
+if(NOT WOS_NATIVE_SYSTEM_BUILD OR NOT WOS_SYSROOT_PATH STREQUAL "${WOS_NATIVE_INSTALLED_SYSROOT_PATH}")
     set(CMAKE_FIND_ROOT_PATH "${SYSROOT_PATH}")
     set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
     set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
@@ -78,7 +95,7 @@ option(WOS_DYNAMIC_USERSPACE_PIE "Build dynamic WOS userspace executables as PIE
 option(WOS_DYNAMIC_USERSPACE_NO_PLT "Use GOT calls instead of PLT stubs for dynamic WOS userspace executables" OFF)
 
 set(WOS_SYSROOT_COMPILE_OPTIONS "--sysroot=${SYSROOT_PATH}")
-if(WOS_NATIVE_SYSTEM_BUILD)
+if(WOS_NATIVE_SYSTEM_BUILD AND WOS_SYSROOT_PATH STREQUAL "${WOS_NATIVE_INSTALLED_SYSROOT_PATH}")
     set(WOS_CXX_STDLIB_INCLUDE "/usr/include/c++/v1")
     set(WOS_STDLIB_LINK_DIR "/usr/lib")
 else()
