@@ -183,6 +183,8 @@ KTEST(XFS, ReadOnlyCloseSkipsPreallocTrim) {
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_close_should_trim_prealloc(2));
 }
 
+KTEST(XFS, CloseTrimDetectsActualEofPrealloc) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_inode_has_eof_prealloc()); }
+
 KTEST(XFS, DirectFreshWriteDropsDirtyCacheAlias) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_direct_fresh_write_discards_cache()); }
 
 KTEST(XFS, DentryCacheHitsAndInvalidates) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_dentry_cache_shortform()); }

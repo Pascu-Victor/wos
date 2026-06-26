@@ -288,6 +288,26 @@ auto xfs_close_should_trim_prealloc(int open_flags) -> bool {
     return (open_flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0;
 }
 
+auto xfs_inode_has_eof_prealloc(const XfsInode* ip) -> bool {
+    if (ip == nullptr || ip->mount == nullptr || ip->mount->block_size == 0 || ip->data_fork.format != XFS_DINODE_FMT_EXTENTS ||
+        ip->data_fork.extents.count == 0) {
+        return false;
+    }
+    if (ip->data_fork.extents.list == nullptr) {
+        return true;
+    }
+
+    auto const KEEP_BLOCKS =
+        static_cast<xfs_fileoff_t>((ip->size + static_cast<uint64_t>(ip->mount->block_size - 1)) >> ip->mount->block_log);
+    for (uint32_t i = 0; i < ip->data_fork.extents.count; ++i) {
+        XfsBmbtIrec const& rec = ip->data_fork.extents.list[i];
+        if (rec.br_startoff >= KEEP_BLOCKS || rec.br_blockcount > KEEP_BLOCKS - rec.br_startoff) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void xfs_stamp_new_inode(XfsInode* ip) {
     if (ip == nullptr) {
         return;
@@ -417,7 +437,8 @@ void xfs_parent_path_cache_purge_all_for_mount(XfsMountContext* ctx) {
 }
 
 auto xfs_commit_dirty_inode(XfsMountContext* ctx, XfsInode* ip, bool trim_eof_prealloc = false) -> int {
-    if (ctx == nullptr || ip == nullptr || ctx->read_only || (!ip->dirty && !trim_eof_prealloc)) {
+    bool const SHOULD_TRIM = ip != nullptr && trim_eof_prealloc && !xfs_inode_isdir(ip) && xfs_inode_has_eof_prealloc(ip);
+    if (ctx == nullptr || ip == nullptr || ctx->read_only || (!ip->dirty && !SHOULD_TRIM)) {
         return 0;
     }
 
@@ -427,7 +448,7 @@ auto xfs_commit_dirty_inode(XfsMountContext* ctx, XfsInode* ip, bool trim_eof_pr
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ILOG, STARTED_US, -ENOMEM, 0);
         return -ENOMEM;
     }
-    if (trim_eof_prealloc && !xfs_inode_isdir(ip)) {
+    if (SHOULD_TRIM) {
         int const TRIM_RET = xfs_inode_trim_data_to_size(ip, tp, ip->size);
         if (TRIM_RET != 0) {
             xfs_trans_cancel(tp);
@@ -1630,6 +1651,48 @@ auto xfs_selftest_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks)
 }
 
 auto xfs_selftest_close_should_trim_prealloc(int open_flags) -> bool { return xfs_close_should_trim_prealloc(open_flags); }
+
+auto xfs_selftest_inode_has_eof_prealloc() -> bool {
+    constexpr size_t BLOCK_SIZE = 4096;
+    constexpr uint32_t BLOCK_LOG = 12;
+
+    XfsMountContext ctx{};
+    ctx.block_size = BLOCK_SIZE;
+    ctx.block_log = BLOCK_LOG;
+
+    XfsInode ip{};
+    ip.mount = &ctx;
+    ip.data_fork.format = XFS_DINODE_FMT_EXTENTS;
+    ip.data_fork.extents.count = 1;
+
+    XfsBmbtIrec exact[]{{.br_startoff = 0, .br_startblock = 100, .br_blockcount = 2, .br_unwritten = false}};
+    ip.size = 2 * BLOCK_SIZE;
+    ip.data_fork.extents.list = exact;
+    if (xfs_inode_has_eof_prealloc(&ip)) {
+        return false;
+    }
+
+    ip.size = BLOCK_SIZE + 1;
+    if (xfs_inode_has_eof_prealloc(&ip)) {
+        return false;
+    }
+
+    XfsBmbtIrec tail[]{{.br_startoff = 0, .br_startblock = 100, .br_blockcount = 4, .br_unwritten = false}};
+    ip.size = 2 * BLOCK_SIZE;
+    ip.data_fork.extents.list = tail;
+    if (!xfs_inode_has_eof_prealloc(&ip)) {
+        return false;
+    }
+
+    XfsBmbtIrec after[]{{.br_startoff = 4, .br_startblock = 104, .br_blockcount = 1, .br_unwritten = false}};
+    ip.data_fork.extents.list = after;
+    if (!xfs_inode_has_eof_prealloc(&ip)) {
+        return false;
+    }
+
+    ip.data_fork.extents.list = nullptr;
+    return xfs_inode_has_eof_prealloc(&ip);
+}
 
 auto xfs_selftest_mapped_append_can_zero_without_read(size_t write_pos, uint64_t file_size, size_t block_size) -> bool {
     return xfs_mapped_append_can_zero_without_read(write_pos, file_size, block_size);
