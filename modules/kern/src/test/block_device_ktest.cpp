@@ -10,7 +10,7 @@ namespace {
 namespace phys = ker::mod::mm::phys;
 
 constexpr size_t BLOCK_SIZE = 512;
-constexpr size_t IO_BYTES = 4 * 1024 * 1024;
+constexpr size_t IO_BYTES = 16 * 1024 * 1024;
 constexpr size_t IO_BLOCKS = IO_BYTES / BLOCK_SIZE;
 
 struct BlockIoChunkState {
@@ -59,7 +59,7 @@ auto alloc_io_buffer() -> uint8_t* { return static_cast<uint8_t*>(phys::page_all
 
 }  // namespace
 
-KTEST(BlockDevice, FourMiBReadStaysSingleDriverRequest) {
+KTEST(BlockDevice, SixteenMiBReadStaysSingleDriverRequest) {
     BlockIoChunkState state{};
     ker::dev::BlockDevice dev = make_chunking_bdev(&state);
 
@@ -74,7 +74,7 @@ KTEST(BlockDevice, FourMiBReadStaysSingleDriverRequest) {
     phys::page_free(buffer);
 }
 
-KTEST(BlockDevice, FourMiBWriteStaysSingleDriverRequest) {
+KTEST(BlockDevice, SixteenMiBWriteStaysSingleDriverRequest) {
     BlockIoChunkState state{};
     ker::dev::BlockDevice dev = make_chunking_bdev(&state);
 

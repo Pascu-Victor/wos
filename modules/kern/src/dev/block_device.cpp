@@ -21,7 +21,7 @@ using log = ker::mod::dbg::logger<"bdev">;
 // Block device registry
 namespace {
 constexpr auto BDEV_INLINE_ALLOC_COUNT = 8;
-constexpr size_t MAX_BLOCK_IO_BYTES = size_t{4} * 1024 * 1024;
+constexpr size_t MAX_BLOCK_IO_BYTES = size_t{16} * 1024 * 1024;
 ker::util::SmallVec<BlockDevice*, BDEV_INLINE_ALLOC_COUNT> block_devices;
 ker::util::SmallVec<Device, BDEV_INLINE_ALLOC_COUNT> block_dev_nodes;
 
