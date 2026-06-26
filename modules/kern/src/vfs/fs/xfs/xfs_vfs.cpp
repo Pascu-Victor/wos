@@ -226,10 +226,11 @@ auto xfs_has_inline_extent_pressure(const XfsInode* ip) -> bool {
 }
 
 auto xfs_hole_write_alloc_blocks(size_t write_pos, size_t block_off, size_t remaining_bytes, xfs_filblks_t hole_blocks, size_t block_size,
-                                 uint32_t block_log, bool extent_pressure, bool /*sequential_append*/) -> xfs_extlen_t {
+                                 uint32_t block_log, bool extent_pressure, bool sequential_append) -> xfs_extlen_t {
     size_t const BLOCKS_NEEDED = (block_off + remaining_bytes + block_size - 1) >> block_log;
     auto desired_blocks = static_cast<xfs_filblks_t>(BLOCKS_NEEDED);
-    if ((write_pos >= XFS_STREAM_PREALLOC_TRIGGER_BYTES || extent_pressure) && hole_blocks > desired_blocks) {
+    bool const STREAM_PREALLOC = sequential_append && write_pos >= XFS_STREAM_PREALLOC_TRIGGER_BYTES;
+    if ((STREAM_PREALLOC || extent_pressure) && hole_blocks > desired_blocks) {
         desired_blocks = std::max(desired_blocks, static_cast<xfs_filblks_t>(XFS_STREAM_PREALLOC_BLOCKS));
     }
     auto alloc_blocks = static_cast<xfs_extlen_t>(std::min(hole_blocks, desired_blocks));

@@ -114,6 +114,9 @@ KTEST(XFS, SequentialAppendDefersSpeculativePreallocUntilStream) {
                static_cast<ker::vfs::xfs::xfs_extlen_t>(1024));
     KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(0, 4096, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG, SMALL_APPEND_POS, false),
                static_cast<ker::vfs::xfs::xfs_extlen_t>(1));
+    KEXPECT_EQ(
+        ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(0, 4096, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG, STREAM_APPEND_POS, false),
+        static_cast<ker::vfs::xfs::xfs_extlen_t>(1));
 }
 
 KTEST(XFS, MappedAppendSkipsReadOnlyAtCleanBlockBoundary) {
