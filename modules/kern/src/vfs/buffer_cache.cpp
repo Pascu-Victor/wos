@@ -1526,6 +1526,19 @@ auto max_matching_dirty_epoch_locked(const DirtyWritebackFilter& filter) -> uint
         return max_epoch;
     }
 
+    if (!filter.use_range) {
+        if (filter.bdev != nullptr) {
+            DirtyBdevState* state = find_dirty_bdev_state_locked(filter.bdev);
+            return (state != nullptr && state->list_tail != nullptr) ? state->list_tail->dirty_epoch : 0;
+        }
+        for (auto* state : dirty_bdev_states) {
+            if (state != nullptr && state->list_tail != nullptr) {
+                max_epoch = std::max(max_epoch, state->list_tail->dirty_epoch);
+            }
+        }
+        return max_epoch;
+    }
+
     for (auto* state : dirty_bdev_states) {
         if (state == nullptr || state->dirty_buffers == 0) {
             continue;
