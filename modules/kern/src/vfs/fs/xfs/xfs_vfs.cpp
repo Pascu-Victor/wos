@@ -485,6 +485,29 @@ auto xfs_block_read_with_retry(dev::BlockDevice* bdev, uint64_t block_no, size_t
     return rc;
 }
 
+auto xfs_direct_write_fresh_blocks(XfsMountContext* ctx, xfs_fsblock_t fsbno, const uint8_t* src, size_t bytes) -> int {
+    if (ctx == nullptr || ctx->device == nullptr || src == nullptr || bytes == 0 || ctx->block_size == 0 || ctx->device->block_size == 0) {
+        return -EINVAL;
+    }
+
+    bool const INVALID_BLOCK_RATIO = ctx->block_size < ctx->device->block_size || (ctx->block_size % ctx->device->block_size) != 0;
+    bool const INVALID_WRITE_SIZE = (bytes % ctx->block_size) != 0 || (bytes % ctx->device->block_size) != 0;
+    if (INVALID_BLOCK_RATIO || INVALID_WRITE_SIZE) {
+        return -EINVAL;
+    }
+
+    uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(ctx, fsbno);
+    size_t const DEV_COUNT = bytes / ctx->device->block_size;
+
+    uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::DIRECT_WRITE);
+    int const RC = dev::block_write(ctx->device, DEV_BLOCK, DEV_COUNT, src);
+    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::DIRECT_WRITE, STARTED_US, RC, bytes);
+    if (RC == 0) {
+        discard_bdev_range(ctx->device, DEV_BLOCK, DEV_COUNT);
+    }
+    return RC;
+}
+
 auto xfs_fsb_to_dev_count(XfsMountContext* ctx, xfs_filblks_t fsb_count) -> size_t {
     return static_cast<size_t>(fsb_count) * (ctx->block_size / ctx->device->block_size);
 }
@@ -964,19 +987,27 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
                 size_t full_blocks = remaining_bytes >> ctx->block_log;
                 while (full_blocks > 0) {
                     size_t const BATCH_BLOCKS = std::min(full_blocks, MAX_BATCH_BLOCKS);
-                    uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(ctx, current_disk_block);
-                    size_t const DEV_COUNT = xfs_fsb_to_dev_count(ctx, static_cast<xfs_filblks_t>(BATCH_BLOCKS));
-                    BufHead* bp = bget_multi(ctx->device, DEV_BLOCK, DEV_COUNT);
-                    if (bp == nullptr) {
-                        ok = false;
-                        break;
-                    }
-
                     size_t const BATCH_BYTES = BATCH_BLOCKS << ctx->block_log;
-                    std::memcpy(bp->data, src + current_src_offset, BATCH_BYTES);
-                    bdirty(bp);
-                    brelse(bp);
-                    account_dirty_write(BATCH_BYTES);
+                    if (fresh_allocation) {
+                        int const RC = xfs_direct_write_fresh_blocks(ctx, current_disk_block, src + current_src_offset, BATCH_BYTES);
+                        if (RC != 0) {
+                            ok = false;
+                            break;
+                        }
+                    } else {
+                        uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(ctx, current_disk_block);
+                        size_t const DEV_COUNT = xfs_fsb_to_dev_count(ctx, static_cast<xfs_filblks_t>(BATCH_BLOCKS));
+                        BufHead* bp = bget_multi(ctx->device, DEV_BLOCK, DEV_COUNT);
+                        if (bp == nullptr) {
+                            ok = false;
+                            break;
+                        }
+
+                        std::memcpy(bp->data, src + current_src_offset, BATCH_BYTES);
+                        bdirty(bp);
+                        brelse(bp);
+                        account_dirty_write(BATCH_BYTES);
+                    }
 
                     remaining_bytes -= BATCH_BYTES;
                     current_src_offset += BATCH_BYTES;
@@ -1539,6 +1570,32 @@ FileOperations xfs_fops = {
     .vfs_ioctl = nullptr,
 };
 
+#ifdef WOS_SELFTEST
+struct XfsDirectWriteSelftestState {
+    size_t write_calls{};
+    uint64_t last_block{};
+    size_t last_count{};
+    std::array<uint8_t, 4096> last_data{};
+};
+
+auto xfs_direct_write_selftest_write(dev::BlockDevice* bdev, uint64_t block, size_t count, const void* buffer) -> int {
+    if (bdev == nullptr || buffer == nullptr || bdev->block_size == 0 || count > 4096 / bdev->block_size) {
+        return -EIO;
+    }
+
+    auto* state = static_cast<XfsDirectWriteSelftestState*>(bdev->private_data);
+    if (state == nullptr) {
+        return -EIO;
+    }
+
+    state->write_calls++;
+    state->last_block = block;
+    state->last_count = count;
+    std::memcpy(state->last_data.data(), buffer, count * bdev->block_size);
+    return 0;
+}
+#endif
+
 }  // anonymous namespace
 
 auto get_xfs_fops() -> FileOperations* { return &xfs_fops; }
@@ -1562,6 +1619,51 @@ auto xfs_selftest_mapped_append_can_zero_without_read(size_t write_pos, uint64_t
 }
 
 auto xfs_selftest_direct_read_batch_max_bytes(size_t block_size) -> size_t { return xfs_direct_read_batch_max_bytes(block_size); }
+
+auto xfs_selftest_direct_fresh_write_discards_cache() -> bool {
+    constexpr size_t DEVICE_BLOCK_SIZE = 512;
+    constexpr size_t FS_BLOCK_SIZE = 4096;
+    constexpr xfs_fsblock_t FSB = 8;
+
+    XfsDirectWriteSelftestState state{};
+    dev::BlockDevice dev{};
+    dev.block_size = DEVICE_BLOCK_SIZE;
+    dev.total_blocks = 1024;
+    dev.write_blocks = xfs_direct_write_selftest_write;
+    dev.private_data = &state;
+
+    XfsMountContext ctx{};
+    ctx.device = &dev;
+    ctx.block_size = FS_BLOCK_SIZE;
+    ctx.block_log = 12;
+    ctx.ag_blocks = 1024;
+    ctx.ag_blk_log = 10;
+
+    uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(&ctx, FSB);
+    size_t const DEV_COUNT = xfs_fsb_to_dev_count(&ctx, 1);
+    BufHead* stale = bget_multi(&dev, DEV_BLOCK, DEV_COUNT);
+    if (stale == nullptr) {
+        return false;
+    }
+    std::memset(stale->data, 0xA5, stale->size);
+    bdirty(stale);
+    brelse(stale);
+    if (!has_dirty_bdev_range(&dev, DEV_BLOCK, DEV_COUNT)) {
+        invalidate_bdev(&dev);
+        return false;
+    }
+
+    std::array<uint8_t, FS_BLOCK_SIZE> src{};
+    for (size_t i = 0; i < src.size(); ++i) {
+        src.at(i) = static_cast<uint8_t>(i & 0xFFU);
+    }
+
+    int const RC = xfs_direct_write_fresh_blocks(&ctx, FSB, src.data(), src.size());
+    bool const OK = RC == 0 && state.write_calls == 1 && state.last_block == DEV_BLOCK && state.last_count == DEV_COUNT &&
+                    std::memcmp(state.last_data.data(), src.data(), src.size()) == 0 && !has_dirty_bdev_range(&dev, DEV_BLOCK, DEV_COUNT);
+    invalidate_bdev(&dev);
+    return OK;
+}
 
 auto xfs_selftest_parent_path_cache() -> bool {
     XfsMountContext mount_a{};

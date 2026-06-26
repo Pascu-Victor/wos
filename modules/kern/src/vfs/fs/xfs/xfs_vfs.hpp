@@ -58,6 +58,7 @@ auto xfs_selftest_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks)
 auto xfs_selftest_close_should_trim_prealloc(int open_flags) -> bool;
 auto xfs_selftest_mapped_append_can_zero_without_read(size_t write_pos, uint64_t file_size, size_t block_size) -> bool;
 auto xfs_selftest_direct_read_batch_max_bytes(size_t block_size) -> size_t;
+auto xfs_selftest_direct_fresh_write_discards_cache() -> bool;
 auto xfs_selftest_parent_path_cache() -> bool;
 #endif
 
