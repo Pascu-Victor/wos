@@ -9637,9 +9637,12 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
     auto mount_ref = find_mount_point(pathBuffer);
     MountPoint const* mount = mount_ref.get();
     bool const REMOTE_MOUNT = mount != nullptr && mount->fs_type == FSType::REMOTE;
+    bool const SKIP_FINAL_SYMLINK_PROBE = mount != nullptr && !REMOTE_MOUNT && !PATH_REQUIRES_DIRECTORY && !FLAGS_REQUIRE_DIRECTORY &&
+                                          metadata_cache_proves_final_not_symlink(pathBuffer, mount->fs_type, mount->dev_id);
     if (!REMOTE_MOUNT) {
         char resolved[MAX_PATH_LEN];  // NOLINT
-        int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy && !OPEN_LOCAL);
+        int const RESOLVE_RET =
+            resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy && !OPEN_LOCAL, !SKIP_FINAL_SYMLINK_PROBE);
         if (RESOLVE_RET == 0) {
             std::memcpy(pathBuffer, resolved, MAX_PATH_LEN);
         }
