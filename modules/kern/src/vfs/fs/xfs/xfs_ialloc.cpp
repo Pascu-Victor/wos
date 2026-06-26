@@ -119,10 +119,11 @@ auto init_inode_chunk(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
         xfs_agblock_t const AGBNO = AGINO / mount->inodes_per_block;
         xfs_fsblock_t const FSBNO = xfs_agbno_to_fsbno(agno, AGBNO, mount->ag_blk_log);
 
-        BufHead* bh = xfs_buf_read(mount, FSBNO);
+        BufHead* bh = xfs_buf_get(mount, FSBNO);
         if (bh == nullptr) {
             return -EIO;
         }
+        __builtin_memset(bh->data, 0, bh->size);
 
         while (initialized < XFS_INODES_PER_CHUNK && ((startino + initialized) / mount->inodes_per_block) == AGBNO) {
             xfs_agino_t const CUR_AGINO = startino + initialized;
