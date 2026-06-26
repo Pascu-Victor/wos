@@ -2719,6 +2719,14 @@ void discard_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count)
     uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
     uint64_t discarded_bytes = 0;
 
+    if (!range_index_degraded) {
+        RangeBdevState* state = find_range_bdev_state_locked(bdev);
+        if (state == nullptr || state->buffers == 0 || !range_tree_overlaps(state->tree_root, block_no, count)) {
+            cache_lock.unlock_irqrestore(IRQFLAGS);
+            return;
+        }
+    }
+
     for (auto& hash_bucket : hash_buckets) {
         BufHead** pp = &hash_bucket;
         while (*pp != nullptr) {
