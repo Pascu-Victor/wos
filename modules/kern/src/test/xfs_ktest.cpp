@@ -201,6 +201,10 @@ KTEST(XFS, DirectFreshWriteDropsDirtyCacheAlias) { KEXPECT_TRUE(ker::vfs::xfs::x
 
 KTEST(XFS, FreshFullWriteCanBypassBufferCache) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_fresh_full_write_can_bypass_buffer_cache()); }
 
+KTEST(XFS, FreshPartialWriteBypassesBufferCache) {
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_fresh_partial_write_zeroes_and_discards_cache());
+}
+
 KTEST(XFS, DentryCacheHitsAndInvalidates) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_dentry_cache_shortform()); }
 
 KTEST(XFS, DentryCacheInvalidationKeepsUnrelatedDirectoryHot) {
