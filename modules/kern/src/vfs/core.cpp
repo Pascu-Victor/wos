@@ -162,6 +162,8 @@ struct MetadataInvalidationEntry {
 
 struct MetadataInvalidationSet {
     std::array<MetadataInvalidationEntry, METADATA_INVALIDATION_WAYS> ways{};
+    // If the set fills, invalidate the whole hash set instead of the whole cache.
+    uint64_t overflow_generation = 0;
 };
 
 struct VfsFlockAbi {
@@ -841,11 +843,13 @@ auto metadata_parent_path_len(const char* path, size_t path_len) -> size_t {
 
 void metadata_invalidation_clear_locked() {
     for (auto& set : g_metadata_subtree_invalidations) {
+        set.overflow_generation = 0;
         for (auto& entry : set.ways) {
             entry.valid = false;
         }
     }
     for (auto& set : g_metadata_exact_invalidations) {
+        set.overflow_generation = 0;
         for (auto& entry : set.ways) {
             entry.valid = false;
         }
@@ -858,47 +862,39 @@ void metadata_cache_bump_generation_locked() {
     metadata_invalidation_clear_locked();
 }
 
-auto metadata_invalidation_store_locked(std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT>& table, uint64_t path_hash,
-                                        uint64_t generation) -> bool {
+void metadata_invalidation_store_locked(std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT>& table, uint64_t path_hash,
+                                        uint64_t generation) {
     auto& set = table.at(path_hash & (METADATA_INVALIDATION_SET_COUNT - 1));
     MetadataInvalidationEntry* free_entry = nullptr;
     for (auto& entry : set.ways) {
         if (entry.valid && entry.path_hash == path_hash) {
             entry.generation = generation;
-            return true;
+            return;
         }
         if (!entry.valid && free_entry == nullptr) {
             free_entry = &entry;
         }
     }
     if (free_entry == nullptr) {
-        return false;
-    }
-    free_entry->path_hash = path_hash;
-    free_entry->generation = generation;
-    free_entry->valid = true;
-    return true;
-}
-
-void metadata_invalidation_store_or_reset_locked(std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT>& table,
-                                                 uint64_t path_hash, uint64_t generation) {
-    if (metadata_invalidation_store_locked(table, path_hash, generation)) {
+        set.overflow_generation = std::max(set.overflow_generation, generation);
         return;
     }
 
-    metadata_cache_bump_generation_locked();
-    static_cast<void>(metadata_invalidation_store_locked(table, path_hash, generation));
+    free_entry->path_hash = path_hash;
+    free_entry->generation = generation;
+    free_entry->valid = true;
 }
 
 auto metadata_invalidation_generation_for_hash_locked(const std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT>& table,
                                                       uint64_t path_hash) -> uint64_t {
     auto const& set = table.at(path_hash & (METADATA_INVALIDATION_SET_COUNT - 1));
+    uint64_t generation = set.overflow_generation;
     for (auto const& entry : set.ways) {
         if (entry.valid && entry.path_hash == path_hash) {
-            return entry.generation;
+            generation = std::max(generation, entry.generation);
         }
     }
-    return 0;
+    return generation;
 }
 
 void metadata_cache_note_one_path_changed_locked(const char* path) {
@@ -914,7 +910,7 @@ void metadata_cache_note_one_path_changed_locked(const char* path) {
 
     uint64_t const PATH_GENERATION = g_metadata_invalidation_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     uint64_t const PATH_HASH = metadata_invalidation_hash_path(path, PATH_LEN);
-    metadata_invalidation_store_or_reset_locked(g_metadata_subtree_invalidations, PATH_HASH, PATH_GENERATION);
+    metadata_invalidation_store_locked(g_metadata_subtree_invalidations, PATH_HASH, PATH_GENERATION);
 
     size_t const PARENT_LEN = metadata_parent_path_len(path, PATH_LEN);
     if (PARENT_LEN == 0) {
@@ -922,7 +918,7 @@ void metadata_cache_note_one_path_changed_locked(const char* path) {
     }
     uint64_t const PARENT_GENERATION = g_metadata_invalidation_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     uint64_t const PARENT_HASH = metadata_invalidation_hash_path(path, PARENT_LEN);
-    metadata_invalidation_store_or_reset_locked(g_metadata_exact_invalidations, PARENT_HASH, PARENT_GENERATION);
+    metadata_invalidation_store_locked(g_metadata_exact_invalidations, PARENT_HASH, PARENT_GENERATION);
 }
 
 void metadata_cache_note_path_changed(const char* old_path, const char* new_path) {
@@ -984,7 +980,7 @@ auto metadata_cache_note_exact_path_changed(const char* path) -> bool {
     uint64_t const PATH_HASH = metadata_invalidation_hash_path(path, PATH_LEN);
 
     g_metadata_invalidation_lock.lock();
-    metadata_invalidation_store_or_reset_locked(g_metadata_exact_invalidations, PATH_HASH, PATH_GENERATION);
+    metadata_invalidation_store_locked(g_metadata_exact_invalidations, PATH_HASH, PATH_GENERATION);
     g_metadata_invalidation_lock.unlock();
     return true;
 }
