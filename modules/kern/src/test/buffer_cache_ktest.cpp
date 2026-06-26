@@ -135,6 +135,26 @@ auto test_hash_key(const ker::dev::BlockDevice* bdev, uint64_t block_no, size_t 
 
 }  // namespace
 
+KTEST(BufferCache, SizingKeepsDirtyLimitsBelowCleanCache) {
+    constexpr uint64_t ONE_GIB = uint64_t{1024} * 1024 * 1024;
+
+    size_t const CACHE_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(ONE_GIB);
+    size_t const DIRTY_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(ONE_GIB, CACHE_MAX);
+    size_t const DIRTY_HARD = ker::vfs::buffer_cache_selftest_choose_dirty_hard_bytes(DIRTY_TARGET, CACHE_MAX);
+
+    KEXPECT_EQ(CACHE_MAX, static_cast<size_t>(ONE_GIB / 2));
+    KEXPECT_EQ(DIRTY_TARGET, static_cast<size_t>(ONE_GIB / 10));
+    KEXPECT_EQ(DIRTY_HARD, DIRTY_TARGET * 2);
+    KEXPECT_TRUE(DIRTY_HARD < CACHE_MAX);
+
+    size_t const FALLBACK_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(0);
+    size_t const FALLBACK_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(0, FALLBACK_MAX);
+    size_t const FALLBACK_HARD = ker::vfs::buffer_cache_selftest_choose_dirty_hard_bytes(FALLBACK_TARGET, FALLBACK_MAX);
+    KEXPECT_EQ(FALLBACK_MAX, ker::vfs::BUFFER_CACHE_DEFAULT_SIZE);
+    KEXPECT_EQ(FALLBACK_TARGET, ker::vfs::BUFFER_CACHE_DEFAULT_SIZE / 2);
+    KEXPECT_EQ(FALLBACK_HARD, ker::vfs::BUFFER_CACHE_DEFAULT_SIZE);
+}
+
 KTEST(BufferCache, BreadHit) {
     ker::dev::BlockDevice dev = make_null_bdev();
     ker::vfs::invalidate_bdev(&dev);

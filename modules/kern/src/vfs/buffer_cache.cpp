@@ -232,6 +232,8 @@ size_t cache_max_bytes = BUFFER_CACHE_DEFAULT_SIZE;
 size_t cache_total_buffers = 0;
 size_t cache_dirty_buffers = 0;
 size_t cache_dirty_bytes = 0;
+size_t dirty_target_bytes = BUFFER_CACHE_DEFAULT_SIZE / 2;
+size_t dirty_hard_limit_bytes = BUFFER_CACHE_DEFAULT_SIZE;
 
 uint64_t stat_hits = 0;
 uint64_t stat_misses = 0;
@@ -255,9 +257,10 @@ constexpr uint64_t DIRTY_THROTTLE_PARK_TIMEOUT_US = uint64_t{10} * 1000;
 constexpr size_t DIRTY_TARGET_DIVISOR = 2;
 constexpr size_t DIRTY_THROTTLE_RESUME_NUMERATOR = 3;
 constexpr size_t DIRTY_THROTTLE_RESUME_DENOMINATOR = 4;
-// Keep dirty throttling close to Linux's default shape: background writeback at
-// about 10% of RAM, hard foreground throttling at about 20%, capped for safety.
-constexpr size_t BUFFER_CACHE_MEMORY_DIVISOR = 5;
+// Let clean cache grow beyond dirty limits, closer to Linux's page cache shape,
+// while keeping dirty throttling at roughly 10%/20% of RAM.
+constexpr size_t BUFFER_CACHE_MEMORY_DIVISOR = 2;
+constexpr size_t DIRTY_TARGET_MEMORY_DIVISOR = 10;
 constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{4} * 1024 * 1024 * 1024;
 
 struct DirtyBdevState {
@@ -345,20 +348,9 @@ auto perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp op) -> uint64_t {
 
 auto perf_xfs_started_us() -> uint64_t { return ker::mod::perf::is_local_xfs_recording_enabled() ? ker::mod::time::get_us() : 0; }
 
-auto dirty_target_bytes_locked() -> size_t {
-    if (cache_max_bytes <= ker::mod::mm::paging::PAGE_SIZE) {
-        return cache_max_bytes;
-    }
-    return std::max(cache_max_bytes / DIRTY_TARGET_DIVISOR, static_cast<size_t>(ker::mod::mm::paging::PAGE_SIZE));
-}
+auto dirty_target_bytes_locked() -> size_t { return std::min(dirty_target_bytes, cache_max_bytes); }
 
-auto dirty_hard_limit_bytes_locked() -> size_t {
-    size_t const TARGET = dirty_target_bytes_locked();
-    if (TARGET > SIZE_MAX / DIRTY_HARD_LIMIT_TARGET_MULTIPLIER) {
-        return SIZE_MAX;
-    }
-    return TARGET * DIRTY_HARD_LIMIT_TARGET_MULTIPLIER;
-}
+auto dirty_hard_limit_bytes_locked() -> size_t { return std::min(dirty_hard_limit_bytes, cache_max_bytes); }
 
 auto dirty_throttle_resume_bytes_locked() -> size_t {
     size_t const TARGET = dirty_target_bytes_locked();
@@ -450,16 +442,38 @@ void free_unlinked_buffer(BufHead* bh) {
     delete bh;
 }
 
-auto choose_buffer_cache_max_bytes() -> size_t {
-    uint64_t const TOTAL_MEM = ker::mod::mm::phys::get_total_mem_bytes();
-    if (TOTAL_MEM == 0) {
+auto clamp_u64_to_size(uint64_t value) -> size_t {
+    auto const SIZE_MAX_U64 = static_cast<uint64_t>(SIZE_MAX);
+    return static_cast<size_t>(std::min<uint64_t>(value, SIZE_MAX_U64));
+}
+
+auto choose_buffer_cache_max_bytes_for_total(uint64_t total_mem) -> size_t {
+    if (total_mem == 0) {
         return BUFFER_CACHE_DEFAULT_SIZE;
     }
 
-    uint64_t const SCALED = TOTAL_MEM / BUFFER_CACHE_MEMORY_DIVISOR;
+    uint64_t const SCALED = total_mem / BUFFER_CACHE_MEMORY_DIVISOR;
     uint64_t const CLAMPED = std::clamp<uint64_t>(SCALED, BUFFER_CACHE_DEFAULT_SIZE, BUFFER_CACHE_MAX_SIZE);
-    auto const SIZE_MAX_U64 = static_cast<uint64_t>(SIZE_MAX);
-    return static_cast<size_t>(std::min<uint64_t>(CLAMPED, SIZE_MAX_U64));
+    return clamp_u64_to_size(CLAMPED);
+}
+
+auto choose_dirty_target_bytes_for_total(uint64_t total_mem, size_t max_bytes) -> size_t {
+    if (max_bytes <= ker::mod::mm::paging::PAGE_SIZE) {
+        return max_bytes;
+    }
+
+    auto const FALLBACK = static_cast<uint64_t>(max_bytes / DIRTY_TARGET_DIVISOR);
+    uint64_t const SCALED = total_mem == 0 ? FALLBACK : total_mem / DIRTY_TARGET_MEMORY_DIVISOR;
+    uint64_t const MIN_TARGET = std::min<uint64_t>(ker::mod::mm::paging::PAGE_SIZE, max_bytes);
+    uint64_t const CLAMPED = std::clamp<uint64_t>(SCALED, MIN_TARGET, max_bytes);
+    return clamp_u64_to_size(CLAMPED);
+}
+
+auto choose_dirty_hard_limit_bytes(size_t target_bytes, size_t max_bytes) -> size_t {
+    if (target_bytes > SIZE_MAX / DIRTY_HARD_LIMIT_TARGET_MULTIPLIER) {
+        return max_bytes;
+    }
+    return std::min(target_bytes * DIRTY_HARD_LIMIT_TARGET_MULTIPLIER, max_bytes);
 }
 
 // Free a buffer's resources completely (removes from hash + LRU).
@@ -2196,7 +2210,10 @@ void buffer_cache_init() {
     if (cache_initialized) {
         return;
     }
-    cache_max_bytes = choose_buffer_cache_max_bytes();
+    uint64_t const TOTAL_MEM = ker::mod::mm::phys::get_total_mem_bytes();
+    cache_max_bytes = choose_buffer_cache_max_bytes_for_total(TOTAL_MEM);
+    dirty_target_bytes = choose_dirty_target_bytes_for_total(TOTAL_MEM, cache_max_bytes);
+    dirty_hard_limit_bytes = choose_dirty_hard_limit_bytes(dirty_target_bytes, cache_max_bytes);
     hash_buckets.fill(nullptr);
     lru_init();
     cache_total_bytes = 0;
@@ -2912,5 +2929,19 @@ auto reclaim_clean_buffer_cache(size_t target_bytes) -> BufferCacheReclaimStats 
     cache_lock.unlock_irqrestore(IRQFLAGS);
     return stats;
 }
+
+#ifdef WOS_SELFTEST
+auto buffer_cache_selftest_choose_cache_max_bytes(uint64_t total_mem) -> size_t {
+    return choose_buffer_cache_max_bytes_for_total(total_mem);
+}
+
+auto buffer_cache_selftest_choose_dirty_target_bytes(uint64_t total_mem, size_t max_bytes) -> size_t {
+    return choose_dirty_target_bytes_for_total(total_mem, max_bytes);
+}
+
+auto buffer_cache_selftest_choose_dirty_hard_bytes(size_t target_bytes, size_t max_bytes) -> size_t {
+    return choose_dirty_hard_limit_bytes(target_bytes, max_bytes);
+}
+#endif
 
 }  // namespace ker::vfs

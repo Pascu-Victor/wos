@@ -189,4 +189,10 @@ struct BufferCacheReclaimStats {
 // target_bytes. Dirty or referenced buffers are never written or discarded.
 auto reclaim_clean_buffer_cache(size_t target_bytes) -> BufferCacheReclaimStats;
 
+#ifdef WOS_SELFTEST
+auto buffer_cache_selftest_choose_cache_max_bytes(uint64_t total_mem) -> size_t;
+auto buffer_cache_selftest_choose_dirty_target_bytes(uint64_t total_mem, size_t max_bytes) -> size_t;
+auto buffer_cache_selftest_choose_dirty_hard_bytes(size_t target_bytes, size_t max_bytes) -> size_t;
+#endif
+
 }  // namespace ker::vfs
