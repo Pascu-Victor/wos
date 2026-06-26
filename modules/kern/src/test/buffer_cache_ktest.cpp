@@ -369,6 +369,28 @@ KTEST(BufferCache, LRUEviction) {
     ker::vfs::invalidate_bdev(&dev);
 }
 
+KTEST(BufferCache, HitMarksReferencedBufferForSecondChance) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    ker::vfs::invalidate_bdev(&dev);
+
+    ker::vfs::BufHead* referenced = ker::vfs::bget(&dev, 1200);
+    KREQUIRE_NE(referenced, nullptr);
+    ker::vfs::brelse(referenced);
+
+    ker::vfs::BufHead* newer = ker::vfs::bget(&dev, 1201);
+    KREQUIRE_NE(newer, nullptr);
+    ker::vfs::brelse(newer);
+
+    KEXPECT_EQ(referenced->flags & ker::vfs::BH_LRU_REFERENCED, static_cast<uint32_t>(0));
+    ker::vfs::BufHead* hit = ker::vfs::bread(&dev, 1200);
+    KREQUIRE_NE(hit, nullptr);
+    KEXPECT_EQ(hit, referenced);
+    KEXPECT_NE(hit->flags & ker::vfs::BH_LRU_REFERENCED, static_cast<uint32_t>(0));
+    ker::vfs::brelse(hit);
+
+    ker::vfs::invalidate_bdev(&dev);
+}
+
 // ---------------------------------------------------------------------------
 // Multi-block (bget_multi / bread_multi) tests
 // These mirror the XFS write → mmap-read path:

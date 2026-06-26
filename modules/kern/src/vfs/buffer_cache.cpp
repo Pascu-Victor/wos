@@ -178,21 +178,41 @@ void lru_remove(BufHead* bh) {
     lru_count--;
 }
 
-// Insert at head (most recently used)
-void lru_touch(BufHead* bh) {
-    if (bh->lru_prev == &lru_sentinel) {
-        return;
-    }
-    // Remove if already on list
-    if (bh->lru_prev != nullptr || bh->lru_next != nullptr) {
-        lru_remove(bh);
-    }
+void lru_insert_head(BufHead* bh) {
     // Insert after sentinel (= head)
     bh->lru_next = lru_sentinel.lru_next;
     bh->lru_prev = &lru_sentinel;
     lru_sentinel.lru_next->lru_prev = bh;
     lru_sentinel.lru_next = bh;
     lru_count++;
+}
+
+void lru_move_to_head(BufHead* bh) {
+    if (bh->lru_prev == &lru_sentinel) {
+        return;
+    }
+    if (bh->lru_prev != nullptr || bh->lru_next != nullptr) {
+        lru_remove(bh);
+    }
+    lru_insert_head(bh);
+}
+
+// Newly cached buffers are inserted at the head. Existing hit buffers use a
+// second-chance bit so hot cache hits avoid relinking the global LRU list.
+void lru_touch(BufHead* bh) {
+    if (bh->lru_prev == nullptr && bh->lru_next == nullptr) {
+        lru_insert_head(bh);
+        return;
+    }
+    if (bh->lru_prev == &lru_sentinel) {
+        return;
+    }
+    bh->flags |= BH_LRU_REFERENCED;
+}
+
+void lru_second_chance(BufHead* bh) {
+    bh->flags &= ~BH_LRU_REFERENCED;
+    lru_move_to_head(bh);
 }
 
 // Get the least-recently-used buffer (tail of the list, just before sentinel)
@@ -456,13 +476,20 @@ auto is_reclaimable_clean_buffer(const BufHead* bh) -> bool {
 
 auto find_reclaimable_lru_buffer(size_t scan_budget = SIZE_MAX) -> BufHead* {
     size_t scanned = 0;
-    for (BufHead* cur = lru_tail(); cur != nullptr && cur != &lru_sentinel; cur = cur->lru_prev) {
+    for (BufHead* cur = lru_tail(); cur != nullptr && cur != &lru_sentinel;) {
         if (scanned++ >= scan_budget) {
             break;
         }
+        BufHead* prev = cur->lru_prev;
         if (is_reclaimable_clean_buffer(cur)) {  // NOLINT(clang-analyzer-cplusplus.NewDelete): victims are unlinked before delete.
+            if ((cur->flags & BH_LRU_REFERENCED) != 0) {
+                lru_second_chance(cur);
+                cur = prev;
+                continue;
+            }
             return cur;
         }
+        cur = prev;
     }
     return nullptr;
 }
