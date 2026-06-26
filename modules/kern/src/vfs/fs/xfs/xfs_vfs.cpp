@@ -2424,6 +2424,8 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int 
     if (rc != 0) {
         return rc;
     }
+    size_t const DIR_PATH_LEN = std::strlen(fs_path);
+    xfs_parent_path_cache_store(ctx, fs_path, DIR_PATH_LEN, NEW_INO);
     return 0;
 }
 
