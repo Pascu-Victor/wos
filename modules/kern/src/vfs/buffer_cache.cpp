@@ -53,7 +53,7 @@ auto hash_key(const dev::BlockDevice* bdev, uint64_t block_no, size_t size) -> s
     h ^= static_cast<uint64_t>(size);
     h *= 0x517cc1b727220a95ULL;
     h ^= (h >> 32);
-    return static_cast<size_t>(h % BUFFER_CACHE_HASH_BUCKETS);
+    return static_cast<size_t>(h) & (BUFFER_CACHE_HASH_BUCKETS - 1);
 }
 
 void range_index_insert_locked(BufHead* bh);
