@@ -1188,6 +1188,14 @@ void dirty_list_remove(DirtyBdevState* state, BufHead* bh) {
     bh->dirty_next = nullptr;
 }
 
+void dirty_list_move_tail(DirtyBdevState* state, BufHead* bh) {
+    if (state == nullptr || bh == nullptr || state->list_tail == bh) {
+        return;
+    }
+    dirty_list_remove(state, bh);
+    dirty_list_insert(state, bh);
+}
+
 void dirty_tree_insert(DirtyBdevState* state, BufHead* bh) {
     bh->dirty_left = nullptr;
     bh->dirty_right = nullptr;
@@ -1428,6 +1436,25 @@ void dirty_tree_consider_starting_at(BufHead* root, uint64_t block_no, const Dir
     }
 }
 
+auto first_matching_dirty_from_ordered_list_locked(DirtyBdevState* state, const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive,
+                                                   uint64_t max_epoch_inclusive) -> BufHead* {
+    if (state == nullptr || filter.use_range) {
+        return nullptr;
+    }
+    for (BufHead* bh = state->list_head; bh != nullptr; bh = bh->dirty_next) {
+        if (bh->dirty_epoch <= min_epoch_exclusive) {
+            continue;
+        }
+        if (bh->dirty_epoch > max_epoch_inclusive) {
+            return nullptr;
+        }
+        if (dirty_filter_matches(bh, filter)) {
+            return bh;
+        }
+    }
+    return nullptr;
+}
+
 auto find_oldest_matching_dirty_buffer_locked(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive,
                                               uint64_t max_epoch_inclusive = UINT64_MAX) -> BufHead* {
     if (!dirty_filter_may_have_match_locked(filter)) {
@@ -1439,6 +1466,21 @@ auto find_oldest_matching_dirty_buffer_locked(const DirtyWritebackFilter& filter
         for (auto* bucket_head : hash_buckets) {
             for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
                 dirty_consider_candidate(bh, filter, min_epoch_exclusive, max_epoch_inclusive, best);
+            }
+        }
+        return best;
+    }
+
+    if (!filter.use_range) {
+        BufHead* best = nullptr;
+        if (filter.bdev != nullptr) {
+            return first_matching_dirty_from_ordered_list_locked(find_dirty_bdev_state_locked(filter.bdev), filter, min_epoch_exclusive,
+                                                                 max_epoch_inclusive);
+        }
+        for (auto* state : dirty_bdev_states) {
+            BufHead* candidate = first_matching_dirty_from_ordered_list_locked(state, filter, min_epoch_exclusive, max_epoch_inclusive);
+            if (best == nullptr || (candidate != nullptr && candidate->dirty_epoch < best->dirty_epoch)) {
+                best = candidate;
             }
         }
         return best;
@@ -1618,6 +1660,9 @@ auto mark_buffer_dirty_locked(BufHead* bh) -> bool {
     bh->dirty_epoch = allocate_dirty_epoch();
     discard_clean_overlapping_aliases_locked(bh);
     if ((bh->flags & BH_DIRTY) != 0) {
+        if ((bh->flags & BH_DIRTY_INDEXED) != 0) {
+            dirty_list_move_tail(find_dirty_bdev_state_locked(bh->bdev), bh);
+        }
         return false;
     }
 
