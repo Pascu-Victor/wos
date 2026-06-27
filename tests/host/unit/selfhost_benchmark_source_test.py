@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 SELFHOST_RUNNER = ROOT / "scripts" / "bench" / "run_wos_selfhost_build.sh"
 SELFHOST_COMPARE = ROOT / "scripts" / "bench" / "compare_wos_selfhost_reports.py"
+SELFHOST_CLUSTER = ROOT / "configs" / "cluster_selfhost.json"
 ROOTFS_ALIASES = ROOT / "configs" / "rootfs" / "aliases.tsv"
 
 
@@ -33,7 +34,7 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             "wos-local",
             "Direct GitHub cloning is the default",
             "benchmark validates source availability and buildability, not Git history",
-            "bin/wos-cluster --launch --no-setup",
+            "bin/wos-cluster --config configs/cluster_selfhost.json --launch --no-setup",
             "bin/wos-ktest --no-setup",
             "clone_cmd=(git clone)",
             "run_timed_event \"clone\" \"wos_repo\"",
@@ -66,6 +67,26 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
         ],
         "WOS self-host benchmark acceptance flow",
     )
+
+
+def test_selfhost_cluster_profile_is_single_large_vm() -> None:
+    config = json.loads(SELFHOST_CLUSTER.read_text())
+    zones = config["zones"]
+    global_zone = zones[0]
+
+    if global_zone["id"] != "GLOBAL":
+        fail("self-host cluster profile must keep GLOBAL zone first")
+
+    vm = global_zone["vm"]
+    if vm["memory"] != "32G" or vm["cpus"] != 32:
+        fail("self-host cluster profile must expose one large VM")
+
+    node_zones = [zone for zone in zones if zone["id"] != "GLOBAL"]
+    if [zone["nodes"] for zone in node_zones] != [1, 1]:
+        fail("self-host cluster profile must launch only node 0")
+
+    if vm["disk0"] != "disk.qcow2" or vm["disk1"] != "mountfs.qcow2":
+        fail("self-host cluster profile must use the normal WOS disks")
 
 
 def test_selfhost_runner_verifies_toolchain_kernel_and_utilities() -> None:

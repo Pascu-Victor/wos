@@ -52,7 +52,7 @@ benchmark validates source availability and buildability, not Git history
 traversal throughput.
 
 For rootless WOS runtime setup, launch first with:
-  bin/wos-cluster --launch --no-setup
+  bin/wos-cluster --config configs/cluster_selfhost.json --launch --no-setup
 or:
   bin/wos-ktest --no-setup
 EOF
