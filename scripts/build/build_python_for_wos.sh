@@ -13,6 +13,7 @@ wos_setup_ccache
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
 WOS_BUILD_JOBS="$(wos_build_jobs)"
 WOS_MAKE_JOBS="$(wos_make_jobs)"
+WOS_MAKE_JOBSERVER_ARG="$(wos_make_jobserver_arg "$WOS_MAKE_JOBS")"
 
 B="$WORKSPACE_ROOT/toolchain"
 HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
@@ -254,7 +255,7 @@ if [ ! -f "$PYTHON_HOST_BUILD/Makefile" ] || [ "$PYTHON_SRC/configure" -nt "$PYT
     )
 fi
 
-host_env make -C "$PYTHON_HOST_BUILD" -j"$WOS_MAKE_JOBS" python
+host_env make ${WOS_MAKE_JOBSERVER_ARG:+"$WOS_MAKE_JOBSERVER_ARG"} -C "$PYTHON_HOST_BUILD" -j"$WOS_MAKE_JOBS" python
 BUILD_PYTHON="$PYTHON_HOST_BUILD/python"
 require_file "$BUILD_PYTHON" "Build-host CPython did not produce $BUILD_PYTHON."
 
@@ -325,7 +326,7 @@ if [ -f "$PYTHON_TARGET_BUILD/python" ]; then
     done
 fi
 
-make -C "$PYTHON_TARGET_BUILD" -j"$WOS_MAKE_JOBS" \
+wos_make "$WOS_MAKE_JOBS" -C "$PYTHON_TARGET_BUILD" \
     CC="$TARGET_CC" \
     CXX="$TARGET_CXX" \
     AR="$TARGET_AR" \

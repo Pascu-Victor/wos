@@ -242,7 +242,7 @@ if [ -f "$BASH_WORK/bash" ]; then
     done
 fi
 
-make -C "$BASH_WORK" -j"$WOS_MAKE_JOBS" bash bashbug
+wos_make "$WOS_MAKE_JOBS" -C "$BASH_WORK" bash bashbug
 
 # Upstream install also builds optional example loadable builtins. WOS only
 # stages the runtime shell, so install the required outputs directly.

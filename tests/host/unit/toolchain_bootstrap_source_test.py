@@ -233,6 +233,10 @@ def test_wos_build_jobs_helper_has_self_hostable_fallbacks() -> None:
             "wos_make_jobs() {",
             'local jobs="${WOS_MAKE_JOBS:-}"',
             "WOS_MAKE_JOBS must be a positive integer",
+            "wos_make_jobserver_arg() {",
+            "--jobserver-style=pipe",
+            "wos_make() {",
+            'make "$jobserver_arg" -j"$jobs" "$@"',
             "wos_ninja_jobs() {",
             'local jobs="${WOS_NINJA_JOBS:-}"',
             "WOS_NINJA_JOBS must be a positive integer",
@@ -299,11 +303,25 @@ def test_gnu_make_port_build_scripts_use_make_job_helper() -> None:
         source = script.read_text()
         require_tokens(
             source,
-            ['WOS_MAKE_JOBS="$(wos_make_jobs)"'],
+            [
+                'WOS_MAKE_JOBS="$(wos_make_jobs)"',
+                'wos_make "$WOS_MAKE_JOBS"',
+            ],
             f"{script.relative_to(ROOT)} shared GNU Make job helper",
         )
         if re.search(r"(?:host_env\s+)?make\b[^\n]*-j\"\$WOS_BUILD_JOBS\"", source):
             fail(f"{script.relative_to(ROOT)} must use WOS_MAKE_JOBS for GNU Make parallelism")
+        if re.search(r"\bmake\b(?:(?!WOS_MAKE_JOBSERVER_ARG).)*-j\"\$WOS_MAKE_JOBS\"", source):
+            fail(f"{script.relative_to(ROOT)} must use wos_make or the WOS GNU Make jobserver arg")
+        if "host_env make" in source:
+            require_tokens(
+                source,
+                [
+                    'WOS_MAKE_JOBSERVER_ARG="$(wos_make_jobserver_arg "$WOS_MAKE_JOBS")"',
+                    'host_env make ${WOS_MAKE_JOBSERVER_ARG:+"$WOS_MAKE_JOBSERVER_ARG"}',
+                ],
+                f"{script.relative_to(ROOT)} host GNU Make jobserver compatibility",
+            )
 
 
 def test_ninja_port_build_scripts_use_ninja_job_helper() -> None:
@@ -394,7 +412,7 @@ def test_gnu_make_script_handles_native_wos_autoconf_probes() -> None:
             '"${GNU_MAKE_CONFIGURE_CACHE_ARGS[@]}"',
             "GNU_MAKE_BUILD_ARGS=()",
             "GNU_MAKE_BUILD_ARGS=(MAKEINFO=true)",
-            'make -C "$MAKE_BUILD" -j"$WOS_MAKE_JOBS" "${GNU_MAKE_BUILD_ARGS[@]}"',
+            'wos_make "$WOS_MAKE_JOBS" -C "$MAKE_BUILD" "${GNU_MAKE_BUILD_ARGS[@]}"',
         ],
         "GNU make native WOS Autoconf probe handling",
     )
@@ -569,10 +587,10 @@ def test_busybox_and_dropbear_scripts_honor_host_toolchain_override() -> None:
     require_tokens(
         busybox,
         [
-            'make -C "$BB_BUILD" -j"$WOS_MAKE_JOBS" \\',
+            'wos_make "$WOS_MAKE_JOBS" -C "$BB_BUILD" \\',
             'install >/tmp/busybox_install.log 2>&1',
         ],
-        "BusyBox WOS install uses serialized GNU Make policy",
+        "BusyBox WOS install uses GNU Make jobserver policy",
     )
     require_tokens(
         dropbear,
@@ -688,7 +706,7 @@ def test_wos_tls_build_is_self_hostable_without_perl() -> None:
             "--enable-static",
             "--disable-tests",
             "--disable-asm",
-            "make -C \"$TLS_WORK\" -j\"$WOS_MAKE_JOBS\"",
+            "wos_make \"$WOS_MAKE_JOBS\" -C \"$TLS_WORK\"",
             "prefix= \\",
             "exec_prefix= \\",
             "includedir=/include \\",

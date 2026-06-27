@@ -268,7 +268,7 @@ GIT_MAKE_FLAGS=(
     "WOS_SKIP_TEST_ARTIFACTS=YesPlease"
 )
 
-make -C "$GIT_WORK" -j"$WOS_MAKE_JOBS" "${GIT_MAKE_FLAGS[@]}" "DESTDIR=$TARGET_SYSROOT" install
+wos_make "$WOS_MAKE_JOBS" -C "$GIT_WORK" "${GIT_MAKE_FLAGS[@]}" "DESTDIR=$TARGET_SYSROOT" install
 patch_installed_git_scripts
 
 require_file "$TARGET_SYSROOT/bin/git" "Git install did not produce $TARGET_SYSROOT/bin/git."

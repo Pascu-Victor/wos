@@ -110,7 +110,7 @@ fi
 # Build dropbearmulti (combined binary like busybox). Don't pass CFLAGS on the
 # make command line: bundled libtommath appends Dropbear-specific include paths
 # via its own Makefile, and command-line CFLAGS suppress those additions.
-make -C "$DB_BUILD" -j"$WOS_MAKE_JOBS" STATIC=0 PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 dropbearmulti
+wos_make "$WOS_MAKE_JOBS" -C "$DB_BUILD" STATIC=0 PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 dropbearmulti
 
 # Install into sysroot
 cp "$DB_BUILD/dropbearmulti" "$TARGET_SYSROOT/bin/dropbearmulti"

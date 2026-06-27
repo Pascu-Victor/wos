@@ -193,7 +193,7 @@ if [ -f "$BB_BUILD/busybox" ]; then
 fi
 
 # Build busybox
-make -C "$BB_BUILD" -j"$WOS_MAKE_JOBS" \
+wos_make "$WOS_MAKE_JOBS" -C "$BB_BUILD" \
     CC="$BB_CC" \
     AR="$BB_AR" \
     STRIP="$BB_STRIP" \
@@ -208,7 +208,7 @@ make -C "$BB_BUILD" -j"$WOS_MAKE_JOBS" \
 # Install the generated BusyBox runtime tree for rootfs packaging.
 rm -rf "$BB_INSTALL"
 mkdir -p "$BB_INSTALL"
-if ! make -C "$BB_BUILD" -j"$WOS_MAKE_JOBS" \
+if ! wos_make "$WOS_MAKE_JOBS" -C "$BB_BUILD" \
     CC="$BB_CC" \
     AR="$BB_AR" \
     STRIP="$BB_STRIP" \

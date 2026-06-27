@@ -242,7 +242,7 @@ fi
         --disable-asm
 )
 
-make -C "$TLS_WORK" -j"$WOS_MAKE_JOBS"
+wos_make "$WOS_MAKE_JOBS" -C "$TLS_WORK"
 make -C "$TLS_WORK" \
     prefix= \
     exec_prefix= \

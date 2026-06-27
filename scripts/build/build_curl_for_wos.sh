@@ -224,7 +224,7 @@ export ac_cv_header_stdatomic_h=no
         --disable-docs
 )
 
-make -C "$CURL_WORK" -j"$WOS_MAKE_JOBS"
+wos_make "$WOS_MAKE_JOBS" -C "$CURL_WORK"
 make -C "$CURL_WORK" \
     prefix= \
     exec_prefix= \

@@ -119,7 +119,7 @@ if [ ! -f "$ZLIB_BUILD/Makefile" ] || [ "$ZLIB_SOURCE_DIR/configure" -nt "$ZLIB_
     )
 fi
 
-make -C "$ZLIB_BUILD" -j"$WOS_MAKE_JOBS" libz.a
+wos_make "$WOS_MAKE_JOBS" -C "$ZLIB_BUILD" libz.a
 make -C "$ZLIB_BUILD" \
     prefix= \
     exec_prefix= \

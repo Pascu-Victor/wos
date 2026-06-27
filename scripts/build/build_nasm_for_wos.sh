@@ -238,7 +238,7 @@ if [ -f "$NASM_BUILD/nasm" ]; then
     done
 fi
 
-make -C "$NASM_BUILD" -j"$WOS_MAKE_JOBS" nasm ndisasm
+wos_make "$WOS_MAKE_JOBS" -C "$NASM_BUILD" nasm ndisasm
 
 install -m 755 "$NASM_BUILD/nasm" "$TARGET_SYSROOT/bin/nasm"
 install -m 755 "$NASM_BUILD/ndisasm" "$TARGET_SYSROOT/bin/ndisasm"

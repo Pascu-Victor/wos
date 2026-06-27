@@ -257,7 +257,7 @@ if [ -f "$MAKE_BUILD/make" ]; then
     done
 fi
 
-make -C "$MAKE_BUILD" -j"$WOS_MAKE_JOBS" "${GNU_MAKE_BUILD_ARGS[@]}"
+wos_make "$WOS_MAKE_JOBS" -C "$MAKE_BUILD" "${GNU_MAKE_BUILD_ARGS[@]}"
 
 install -m 755 "$MAKE_BUILD/make" "$TARGET_SYSROOT/bin/make"
 ln -sfn make "$TARGET_SYSROOT/bin/gmake"

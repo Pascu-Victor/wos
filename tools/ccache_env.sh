@@ -320,6 +320,37 @@ wos_make_jobs() {
     wos_build_jobs
 }
 
+wos_make_jobserver_arg() {
+    local jobs="${1:-${WOS_MAKE_JOBS:-}}"
+
+    case "$jobs" in
+        ''|*[!0-9]*|0)
+            echo "ERROR: GNU Make jobs must be a positive integer, got '$jobs'" >&2
+            return 1
+            ;;
+        1)
+            return 0
+            ;;
+    esac
+
+    if [ "$(uname -s 2>/dev/null || printf unknown)" = "WOS" ]; then
+        printf '%s\n' "--jobserver-style=pipe"
+    fi
+}
+
+wos_make() {
+    local jobs="$1"
+    shift
+
+    local jobserver_arg
+    jobserver_arg="$(wos_make_jobserver_arg "$jobs")"
+    if [ -n "$jobserver_arg" ]; then
+        make "$jobserver_arg" -j"$jobs" "$@"
+    else
+        make -j"$jobs" "$@"
+    fi
+}
+
 wos_ninja_jobs() {
     local jobs="${WOS_NINJA_JOBS:-}"
 
