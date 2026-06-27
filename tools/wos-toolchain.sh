@@ -268,7 +268,7 @@ cmake -G Ninja \
  -DLIBCXX_ENABLE_LOCALIZATION=OFF \
  $B/src/llvm-project/runtimes
 
-ninja install-cxx-headers install-cxxabi-headers
+ninja -j"$WOS_NINJA_JOBS" install-cxx-headers install-cxxabi-headers
 
 # 4. Build mlibc
 

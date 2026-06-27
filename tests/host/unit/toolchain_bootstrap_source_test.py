@@ -341,6 +341,15 @@ def test_ninja_port_build_scripts_use_ninja_job_helper() -> None:
         if present:
             fail(f"{script.relative_to(ROOT)} must use WOS_NINJA_JOBS for Ninja/CMake parallelism")
 
+    bootstrap = WOS_TOOLCHAIN.read_text()
+    require_tokens(
+        bootstrap,
+        ['ninja -j"$WOS_NINJA_JOBS" install-cxx-headers install-cxxabi-headers'],
+        "bootstrap libc++ header install parallelism",
+    )
+    if "ninja install-cxx-headers install-cxxabi-headers" in bootstrap:
+        fail("bootstrap libc++ header install must use WOS_NINJA_JOBS")
+
 
 def test_wos_tar_invocations_use_busybox_compatible_long_options() -> None:
     for script in WOS_BUSYBOX_TAR_USERS:
