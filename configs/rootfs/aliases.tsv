@@ -50,6 +50,8 @@ copy	toolchain/sysroot/bin/scalar	/usr/bin/scalar
 symlink	/usr/bin/git	/usr/bin/git-receive-pack
 symlink	/usr/bin/git	/usr/bin/git-upload-archive
 symlink	/usr/bin/git	/usr/bin/git-upload-pack
+copy	toolchain/sysroot/libexec/git-core	/libexec/git-core
+copy	toolchain/sysroot/share/git-core	/share/git-core
 copy	toolchain/sysroot/libexec/git-core	/usr/libexec/git-core
 copy	toolchain/sysroot/share/git-core	/usr/share/git-core
 copy	toolchain/sysroot/bin/ninja	/usr/bin/ninja

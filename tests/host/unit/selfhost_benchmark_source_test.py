@@ -180,6 +180,20 @@ def test_rootfs_stages_self_hosting_tablegen_tools() -> None:
     )
 
 
+def test_rootfs_stages_git_helpers_at_configured_runtime_paths() -> None:
+    aliases = ROOTFS_ALIASES.read_text()
+    require_tokens(
+        aliases,
+        [
+            "copy\ttoolchain/sysroot/libexec/git-core\t/libexec/git-core",
+            "copy\ttoolchain/sysroot/share/git-core\t/share/git-core",
+            "copy\ttoolchain/sysroot/libexec/git-core\t/usr/libexec/git-core",
+            "copy\ttoolchain/sysroot/share/git-core\t/usr/share/git-core",
+        ],
+        "WOS rootfs Git runtime helper staging",
+    )
+
+
 def test_selfhost_runner_mirror_is_optional_not_default() -> None:
     source = SELFHOST_RUNNER.read_text()
     require_tokens(
@@ -329,6 +343,7 @@ if __name__ == "__main__":
     test_selfhost_runner_preflights_wos_only_self_host_tools()
     test_selfhost_runner_scrubs_inherited_toolchain_environment()
     test_rootfs_stages_self_hosting_tablegen_tools()
+    test_rootfs_stages_git_helpers_at_configured_runtime_paths()
     test_selfhost_runner_mirror_is_optional_not_default()
     test_selfhost_runner_records_detailed_historical_timings()
     test_selfhost_runner_keeps_remote_and_scratch_handling_guarded()
