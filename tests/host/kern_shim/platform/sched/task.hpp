@@ -7,9 +7,28 @@
 
 namespace ker::mod::sched::task {
 
+enum class TaskType : uint8_t {
+    DAEMON,
+    PROCESS,
+    IDLE,
+};
+
+enum class WaitChannelKind : uint8_t {
+    NONE,
+    GENERIC,
+    LOCAL_PIPE,
+    LOCAL_PTY,
+    WAITPID,
+    FUTEX,
+    SIGSUSPEND,
+    WKI_EXECVE_PROXY,
+    PTRACE,
+};
+
 struct Task {
     uint64_t id = 0;
     uint64_t pid = 0;
+    TaskType type = TaskType::DAEMON;
 };
 
 }  // namespace ker::mod::sched::task

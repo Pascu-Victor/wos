@@ -218,6 +218,67 @@ void fill_dir_entry(const XfsMountContext* ctx, const XfsDir2DataEntry* dep, Xfs
     entry->name.at(dep->namelen) = '\0';
 }
 
+auto dir2_data_entry_at_if_valid(const XfsMountContext* ctx, const uint8_t* block, size_t offset, size_t data_end,
+                                 const XfsDir2DataEntry** dep_out, size_t* dep_size_out) -> bool {
+    if (ctx == nullptr || block == nullptr || offset > UINT16_MAX || offset + sizeof(XfsDir2DataEntry) > data_end) {
+        return false;
+    }
+
+    const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + offset);
+    size_t const DEP_SIZE = dir2_data_entsize(ctx, dep->namelen);
+    if (dep->namelen == 0 || DEP_SIZE == 0 || offset + DEP_SIZE > data_end) {
+        return false;
+    }
+
+    const auto* tag = reinterpret_cast<const Be16*>(block + offset + DEP_SIZE - sizeof(Be16));
+    if (tag->to_cpu() != static_cast<uint16_t>(offset)) {
+        return false;
+    }
+
+    if (dep_out != nullptr) {
+        *dep_out = dep;
+    }
+    if (dep_size_out != nullptr) {
+        *dep_size_out = DEP_SIZE;
+    }
+    return true;
+}
+
+auto dir2_block_linear_lookup(const XfsMountContext* ctx, const uint8_t* block, size_t data_start, size_t data_end, const char* name,
+                              uint16_t namelen, XfsDirEntry* entry) -> int {
+    size_t offset = data_start;
+    while (offset < data_end) {
+        if (offset + sizeof(XfsDir2DataUnused) > data_end) {
+            break;
+        }
+
+        const auto* unused = reinterpret_cast<const XfsDir2DataUnused*>(block + offset);
+        if (unused->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
+            uint16_t const FREE_LEN = unused->length.to_cpu();
+            if (FREE_LEN == 0 || offset + FREE_LEN > data_end) {
+                break;
+            }
+            offset += FREE_LEN;
+            continue;
+        }
+
+        const XfsDir2DataEntry* dep = nullptr;
+        size_t dep_size = 0;
+        if (!dir2_data_entry_at_if_valid(ctx, block, offset, data_end, &dep, &dep_size)) {
+            break;
+        }
+
+        if (dep->namelen == namelen && __builtin_memcmp(xfs_dir2_data_entry_name(dep), name, namelen) == 0) {
+            fill_dir_entry(ctx, dep, entry);
+            return 0;
+        }
+
+        offset += dep_size;
+    }
+
+    return -ENOENT;
+}
+
 // Large source checkouts and compiler tree scans revisit far more than 4096
 // directory names. Keep this fixed-size and bounded while reducing set churn
 // in hot XFS path walks.
@@ -757,9 +818,20 @@ auto dir2_block_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirE
     uint32_t const LEAF_COUNT = btp->count.to_cpu();
     (void)btp->stale;  // stale count unused in read-only lookup
 
+    size_t const DATA_START = sizeof(XfsDir3DataHdr);
+    size_t const LEAF_BYTES = static_cast<size_t>(LEAF_COUNT) * sizeof(XfsDir2LeafEntry);
+    if (LEAF_BYTES > BLKSIZE - DATA_START - sizeof(XfsDir2BlockTail)) {
+        brelse(bh);
+        return -EINVAL;
+    }
+    size_t const DATA_END = BLKSIZE - sizeof(XfsDir2BlockTail) - LEAF_BYTES;
+    if (DATA_END <= DATA_START) {
+        brelse(bh);
+        return -EINVAL;
+    }
+
     // Leaf entries are just before the tail
-    const auto* blp = reinterpret_cast<const XfsDir2LeafEntry*>(reinterpret_cast<const uint8_t*>(btp) -
-                                                                (static_cast<size_t>(LEAF_COUNT) * sizeof(XfsDir2LeafEntry)));
+    const auto* blp = reinterpret_cast<const XfsDir2LeafEntry*>(block + DATA_END);
 
     // Hash the name and binary search the leaf array
     xfs_dahash_t const HASH = xfs_da_hashname(reinterpret_cast<const uint8_t*>(name), namelen);
@@ -784,8 +856,9 @@ auto dir2_block_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirE
     }
 
     if (!found) {
+        int const FALLBACK = dir2_block_linear_lookup(ctx, block, DATA_START, DATA_END, name, namelen, entry);
         brelse(bh);
-        return -ENOENT;
+        return FALLBACK;
     }
 
     // Back up to the first entry with this hash
@@ -804,12 +877,11 @@ auto dir2_block_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirE
             continue;  // stale
         }
 
-        uint32_t const OFF = dir2_dataptr_to_off(ctx, ADDR);
-        if (OFF + sizeof(XfsDir2DataEntry) > BLKSIZE) {
+        size_t const OFF = dir2_dataptr_to_off(ctx, ADDR);
+        const XfsDir2DataEntry* dep = nullptr;
+        if (OFF < DATA_START || !dir2_data_entry_at_if_valid(ctx, block, OFF, DATA_END, &dep, nullptr)) {
             continue;
         }
-
-        const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + OFF);
 
         if (dep->namelen == namelen && __builtin_memcmp(xfs_dir2_data_entry_name(dep), name, namelen) == 0) {
             fill_dir_entry(ctx, dep, entry);
@@ -818,8 +890,9 @@ auto dir2_block_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirE
         }
     }
 
+    int const FALLBACK = dir2_block_linear_lookup(ctx, block, DATA_START, DATA_END, name, namelen, entry);
     brelse(bh);
-    return -ENOENT;
+    return FALLBACK;
 }
 
 auto dir2_block_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
@@ -837,6 +910,13 @@ auto dir2_block_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
     const uint8_t* block = bh->data;
     size_t const BLKSIZE = ctx->dir_blk_size;
 
+    const auto* hdr = reinterpret_cast<const XfsDir3DataHdr*>(block);
+    uint32_t const MAGIC = hdr->hdr.magic.to_cpu();
+    if (MAGIC != XFS_DIR3_BLOCK_MAGIC) {
+        brelse(bh);
+        return -EINVAL;
+    }
+
     // Block tail
     const auto* btp = reinterpret_cast<const XfsDir2BlockTail*>(block + BLKSIZE - sizeof(XfsDir2BlockTail));
     uint32_t const LEAF_COUNT = btp->count.to_cpu();
@@ -846,28 +926,35 @@ auto dir2_block_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
     mod::dbg::log("[xfs] dir2_block_iterate: ino=%lu magic=0x%x leaf_count=%u", static_cast<unsigned long>(dp->ino),
                   dbg_hdr->hdr.magic.to_cpu(), LEAF_COUNT);
 #endif
-    // Data entries start after the v3 header
     size_t const DATA_START = sizeof(XfsDir3DataHdr);
-    // Data entries end before the leaf entries
-    const uint8_t* leaf_start = reinterpret_cast<const uint8_t*>(btp) - (static_cast<size_t>(LEAF_COUNT) * sizeof(XfsDir2LeafEntry));
-    auto data_end = static_cast<size_t>(leaf_start - block);
+    size_t const LEAF_BYTES = static_cast<size_t>(LEAF_COUNT) * sizeof(XfsDir2LeafEntry);
+    if (LEAF_BYTES > BLKSIZE - DATA_START - sizeof(XfsDir2BlockTail)) {
+        brelse(bh);
+        return -EINVAL;
+    }
+    size_t const DATA_END = BLKSIZE - sizeof(XfsDir2BlockTail) - LEAF_BYTES;
 
     size_t offset = DATA_START;
     XfsDirEntry entry{};
 
-    while (offset < data_end) {
+    while (offset < DATA_END) {
         // Check for free space entry
         const auto* unused = reinterpret_cast<const XfsDir2DataUnused*>(block + offset);
         if (unused->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
             uint16_t const FREE_LEN = unused->length.to_cpu();
-            if (FREE_LEN == 0 || FREE_LEN > data_end - offset) {
+            if (FREE_LEN == 0 || FREE_LEN > DATA_END - offset) {
                 break;
             }
             offset += FREE_LEN;
             continue;
         }
 
-        const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + offset);
+        const XfsDir2DataEntry* dep = nullptr;
+        size_t dep_size = 0;
+        if (!dir2_data_entry_at_if_valid(ctx, block, offset, DATA_END, &dep, &dep_size)) {
+            break;
+        }
+
         fill_dir_entry(ctx, dep, &entry, data_entry_cookie(ctx, 0, offset));
 
         rc = fn(&entry, user_ctx);
@@ -876,7 +963,7 @@ auto dir2_block_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
             return 0;
         }
 
-        offset += dir2_data_entsize(ctx, dep->namelen);
+        offset += dep_size;
     }
 
     brelse(bh);
@@ -1368,6 +1455,20 @@ auto dir2_leaf_entries(const XfsDir3LeafHdr* hdr) -> const XfsDir2LeafEntry* {
     return reinterpret_cast<const XfsDir2LeafEntry*>(reinterpret_cast<const uint8_t*>(hdr) + sizeof(XfsDir3LeafHdr));
 }
 
+auto dir2_leaf_capacity(const XfsMountContext* ctx) -> size_t {
+    return (ctx->dir_blk_size - sizeof(XfsDir3LeafHdr)) / sizeof(XfsDir2LeafEntry);
+}
+
+auto dir2_count_stale_leaf_entries(const XfsDir2LeafEntry* entries, size_t count) -> size_t {
+    size_t stale = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].address.to_cpu() == XFS_DIR2_NULL_DATAPTR) {
+            stale++;
+        }
+    }
+    return stale;
+}
+
 auto dir2_read_leaf_block(XfsInode* dp, BufHead** bhp) -> int {
     if (bhp == nullptr) {
         return -EINVAL;
@@ -1399,7 +1500,7 @@ auto dir2_read_leaf_block(XfsInode* dp, BufHead** bhp) -> int {
         return -ENOSYS;
     }
 
-    size_t const CAPACITY = (ctx->dir_blk_size - sizeof(XfsDir3LeafHdr)) / sizeof(XfsDir2LeafEntry);
+    size_t const CAPACITY = dir2_leaf_capacity(ctx);
     if (hdr->count.to_cpu() > CAPACITY) {
         brelse(bh);
         return -EINVAL;
@@ -1667,17 +1768,37 @@ auto dir2_leaf_prepare_stale_insert(const XfsDir3LeafHdr* hdr, xfs_dahash_t hash
     return 0;
 }
 
+auto dir2_leaf_preflight_index_slot(XfsMountContext const* ctx, const XfsDir3LeafHdr* hdr) -> int {
+    uint16_t const LEAF_COUNT = hdr->count.to_cpu();
+    uint16_t const STALE_COUNT = hdr->stale.to_cpu();
+    size_t const CAPACITY = dir2_leaf_capacity(ctx);
+    if (CAPACITY > UINT16_MAX || LEAF_COUNT > CAPACITY) {
+        return -EINVAL;
+    }
+
+    const auto* lep = dir2_leaf_entries(hdr);
+    size_t const ACTUAL_STALE = dir2_count_stale_leaf_entries(lep, LEAF_COUNT);
+    if (ACTUAL_STALE != static_cast<size_t>(STALE_COUNT)) {
+        return -EINVAL;
+    }
+    if (ACTUAL_STALE != 0 || LEAF_COUNT < CAPACITY) {
+        return 0;
+    }
+    return -ENOSPC;
+}
+
 auto dir2_leaf_ensure_stale_slot(XfsMountContext const* ctx, XfsDir3LeafHdr* hdr) -> int {
+    int const PREFLIGHT = dir2_leaf_preflight_index_slot(ctx, hdr);
+    if (PREFLIGHT != 0) {
+        return PREFLIGHT;
+    }
+
     uint16_t const STALE_COUNT = hdr->stale.to_cpu();
     if (STALE_COUNT != 0) {
         return 0;
     }
 
     uint16_t const LEAF_COUNT = hdr->count.to_cpu();
-    size_t const CAPACITY = (ctx->dir_blk_size - sizeof(XfsDir3LeafHdr)) / sizeof(XfsDir2LeafEntry);
-    if (LEAF_COUNT >= CAPACITY || CAPACITY > UINT16_MAX) {
-        return -ENOSPC;
-    }
 
     auto* lep = dir2_leaf_entries(hdr);
     lep[LEAF_COUNT].hashval = Be32::from_cpu(UINT32_MAX);
@@ -1685,16 +1806,6 @@ auto dir2_leaf_ensure_stale_slot(XfsMountContext const* ctx, XfsDir3LeafHdr* hdr
     hdr->count = Be16::from_cpu(static_cast<uint16_t>(LEAF_COUNT + 1));
     hdr->stale = Be16::from_cpu(1);
     return 0;
-}
-
-auto dir2_leaf_can_index_new_entry(XfsMountContext const* ctx, const XfsDir3LeafHdr* hdr) -> bool {
-    if (hdr->stale.to_cpu() != 0) {
-        return true;
-    }
-
-    uint16_t const LEAF_COUNT = hdr->count.to_cpu();
-    size_t const CAPACITY = (ctx->dir_blk_size - sizeof(XfsDir3LeafHdr)) / sizeof(XfsDir2LeafEntry);
-    return CAPACITY <= UINT16_MAX && LEAF_COUNT < CAPACITY;
 }
 
 void dir2_leaf_reuse_stale_entry(XfsDir3LeafHdr* hdr, xfs_dahash_t hash, xfs_dir2_dataptr_t dataptr, int stale_idx, int insert_pos) {
@@ -2351,9 +2462,14 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
     // Block tail is at the very end of the block
     auto* btp = reinterpret_cast<XfsDir2BlockTail*>(block + BLKSIZE - sizeof(XfsDir2BlockTail));
     uint32_t leaf_count = btp->count.to_cpu();
+    size_t const LEAF_BYTES = static_cast<size_t>(leaf_count) * sizeof(XfsDir2LeafEntry);
+    if (LEAF_BYTES > BLKSIZE - sizeof(XfsDir3DataHdr) - sizeof(XfsDir2BlockTail)) {
+        brelse(bh);
+        return -EINVAL;
+    }
 
     // Leaf entries are just before the tail
-    uint8_t* leaf_start = block + BLKSIZE - sizeof(XfsDir2BlockTail) - (static_cast<size_t>(leaf_count) * sizeof(XfsDir2LeafEntry));
+    uint8_t* leaf_start = block + BLKSIZE - sizeof(XfsDir2BlockTail) - LEAF_BYTES;
 
     // Scan data area for a free space entry large enough
     size_t const DATA_START = sizeof(XfsDir3DataHdr);
@@ -2389,6 +2505,50 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
     if (!found_free) {
         brelse(bh);
         return -ENOSPC;  // block full - would need conversion to leaf format
+    }
+
+    auto* blp = reinterpret_cast<XfsDir2LeafEntry*>(leaf_start);
+    uint32_t const STALE_COUNT = btp->stale.to_cpu();
+    size_t const ACTUAL_STALE = dir2_count_stale_leaf_entries(blp, leaf_count);
+    if (static_cast<size_t>(STALE_COUNT) != ACTUAL_STALE) {
+        brelse(bh);
+        return -EINVAL;
+    }
+
+    // Add a leaf entry for the new name.  Precompute the sorted slot before
+    // mutating the data area so readdir cannot expose an unindexed entry.
+    xfs_dahash_t const HASH = xfs_da_hashname(reinterpret_cast<const uint8_t*>(name), namelen);
+    int stale_idx = -1;
+    int insert_pos = 0;
+    if (STALE_COUNT == 0) {
+        size_t const NEW_LEAF_BYTES = (static_cast<size_t>(leaf_count) + 1) * sizeof(XfsDir2LeafEntry);
+        size_t const NEW_LEAF_START = BLKSIZE - sizeof(XfsDir2BlockTail) - NEW_LEAF_BYTES;
+        if (found_offset + NEED_LEN > NEW_LEAF_START) {
+            brelse(bh);
+            return -ENOSPC;
+        }
+    } else {
+        for (int i = 0; std::cmp_less(i, leaf_count); i++) {
+            if (blp[i].address.to_cpu() != XFS_DIR2_NULL_DATAPTR && blp[i].hashval.to_cpu() <= HASH) {
+                insert_pos = i + 1;
+            }
+        }
+
+        int best_dist = static_cast<int>(leaf_count) + 1;
+        for (int i = 0; std::cmp_less(i, leaf_count); i++) {
+            if (blp[i].address.to_cpu() == XFS_DIR2_NULL_DATAPTR) {
+                int const DIST = (i >= insert_pos) ? (i - insert_pos) : (insert_pos - i);
+                if (DIST < best_dist) {
+                    best_dist = DIST;
+                    stale_idx = i;
+                }
+            }
+        }
+
+        if (stale_idx < 0) {
+            brelse(bh);
+            return -EINVAL;
+        }
     }
 
     // Write the new data entry at found_offset
@@ -2433,69 +2593,33 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
         *unused_tag = Be16::from_cpu(static_cast<uint16_t>(ENTRY_END));
     }
 
-    // Add a leaf entry for the new name
-    xfs_dahash_t const HASH = xfs_da_hashname(reinterpret_cast<const uint8_t*>(name), namelen);
-
     // Compute the dataptr for this entry
     // dataptr = (byte_offset_in_dir_block) >> XFS_DIR2_DATA_ALIGN_LOG
     auto dataptr = static_cast<uint32_t>(found_offset >> XFS_DIR2_DATA_ALIGN_LOG);
 
     // We need to insert a new leaf entry into the sorted leaf array.
     // First, check if we can reclaim a stale entry.
-    auto* blp = reinterpret_cast<XfsDir2LeafEntry*>(leaf_start);
-    uint32_t const STALE_COUNT = btp->stale.to_cpu();
-
     if (STALE_COUNT > 0) {
-        // Find a stale entry to reuse - find one nearest the correct sorted position
-        int insert_pos = 0;
-        for (int i = 0; std::cmp_less(i, leaf_count); i++) {
-            if (blp[i].address.to_cpu() != XFS_DIR2_NULL_DATAPTR && blp[i].hashval.to_cpu() <= HASH) {
-                insert_pos = i + 1;
+        // If the stale entry is before our insert position, shift entries down
+        if (stale_idx < insert_pos) {
+            insert_pos--;
+            for (int i = stale_idx; i < insert_pos; i++) {
+                blp[i] = blp[i + 1];
+            }
+        } else if (stale_idx > insert_pos) {
+            // Shift entries up
+            for (int i = stale_idx; i > insert_pos; i--) {
+                blp[i] = blp[i - 1];
             }
         }
-
-        // Find nearest stale entry
-        int stale_idx = -1;
-        int best_dist = static_cast<int>(leaf_count);
-        for (int i = 0; std::cmp_less(i, leaf_count); i++) {
-            if (blp[i].address.to_cpu() == XFS_DIR2_NULL_DATAPTR) {
-                int const DIST = (i >= insert_pos) ? (i - insert_pos) : (insert_pos - i);
-                if (DIST < best_dist) {
-                    best_dist = DIST;
-                    stale_idx = i;
-                }
-            }
-        }
-
-        if (stale_idx >= 0) {
-            // If the stale entry is before our insert position, shift entries down
-            if (stale_idx < insert_pos) {
-                insert_pos--;
-                for (int i = stale_idx; i < insert_pos; i++) {
-                    blp[i] = blp[i + 1];
-                }
-            } else if (stale_idx > insert_pos) {
-                // Shift entries up
-                for (int i = stale_idx; i > insert_pos; i--) {
-                    blp[i] = blp[i - 1];
-                }
-            }
-            blp[insert_pos].hashval = Be32::from_cpu(HASH);
-            blp[insert_pos].address = Be32::from_cpu(dataptr);
-            btp->stale = Be32::from_cpu(STALE_COUNT - 1);
-        }
+        blp[insert_pos].hashval = Be32::from_cpu(HASH);
+        blp[insert_pos].address = Be32::from_cpu(dataptr);
+        btp->stale = Be32::from_cpu(STALE_COUNT - 1);
     } else {
         // No stale entries - grow the leaf area by shifting it down one slot.
         // This consumes sizeof(XfsDir2LeafEntry) bytes from the free space.
         size_t const NEW_LEAF_BYTES = (static_cast<size_t>(leaf_count) + 1) * sizeof(XfsDir2LeafEntry);
         size_t const NEW_LEAF_START = BLKSIZE - sizeof(XfsDir2BlockTail) - NEW_LEAF_BYTES;
-
-        // Verify there's enough free space between data entries and the new leaf area
-        if (found_offset + NEED_LEN > NEW_LEAF_START) {
-            // Not enough room for both the data entry and the expanded leaf array
-            brelse(bh);
-            return -ENOSPC;
-        }
 
         // Move the existing leaf array down by one entry
         auto* new_blp = reinterpret_cast<XfsDir2LeafEntry*>(block + NEW_LEAF_START);
@@ -2588,7 +2712,14 @@ auto dir2_leaf_node_addname(XfsInode* dp, const char* name, uint16_t namelen, xf
     auto* leaf_hdr = reinterpret_cast<XfsDir3LeafHdr*>(leaf_bh->data);
     int stale_idx = -1;
     int insert_pos = 0;
-    bool const UPDATE_LEAF = dir2_leaf_can_index_new_entry(ctx, leaf_hdr);
+    bool update_leaf = true;
+    rc = dir2_leaf_preflight_index_slot(ctx, leaf_hdr);
+    if (rc == -ENOSPC) {
+        update_leaf = false;
+    } else if (rc != 0) {
+        brelse(leaf_bh);
+        return rc;
+    }
 
     BufHead* data_bh = nullptr;
     xfs_dir2_db_t db = 0;
@@ -2604,7 +2735,7 @@ auto dir2_leaf_node_addname(XfsInode* dp, const char* name, uint16_t namelen, xf
     }
 
     xfs_dir2_dataptr_t const DATAPTR = dir2_db_off_to_dataptr(ctx, db, free_off);
-    if (UPDATE_LEAF) {
+    if (update_leaf) {
         rc = dir2_leaf_ensure_stale_slot(ctx, leaf_hdr);
         if (rc == 0) {
             rc = dir2_leaf_prepare_stale_insert(leaf_hdr, HASH, &stale_idx, &insert_pos);
@@ -2623,7 +2754,7 @@ auto dir2_leaf_node_addname(XfsInode* dp, const char* name, uint16_t namelen, xf
     dir2_recompute_data_crc(data_block, ctx->dir_blk_size);
     xfs_trans_log_buf_full(tp, data_bh);
 
-    if (UPDATE_LEAF) {
+    if (update_leaf) {
         dir2_leaf_reuse_stale_entry(leaf_hdr, HASH, DATAPTR, stale_idx, insert_pos);
         dir2_recompute_leaf_crc(leaf_bh->data, ctx->dir_blk_size);
         xfs_trans_log_buf_full(tp, leaf_bh);

@@ -321,10 +321,12 @@ def test_process_syscall_reschedules_defer_to_syscall_exit() -> None:
             "stack_belongs_to_task(task, rsp)",
             "task->yield_switch = true;",
             "task->deferred_task_switch = true;",
-            'task->set_wait_channel("local_reschedule");',
+            "task->clear_wait_channel();",
         ],
         "process syscall local reschedule deferral guard",
     )
+    if 'task->set_wait_channel("local_reschedule");' in helper_body:
+        fail("process syscall local reschedule yields must not leave a wait-channel marker")
     require_order(
         request_body,
         "defer_process_reschedule_to_syscall_exit()",
@@ -336,6 +338,12 @@ def test_process_syscall_reschedules_defer_to_syscall_exit() -> None:
         "task->is_voluntary_blocked()",
         "task->yield_switch = true;",
         "voluntary hlt paths must not be converted to syscall-exit yields",
+    )
+    require_order(
+        helper_body,
+        "task->deferred_task_switch = true;",
+        "task->clear_wait_channel();",
+        "deferred syscall-exit yields must clear stale wait metadata after marking the switch",
     )
 
 

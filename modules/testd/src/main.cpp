@@ -779,6 +779,10 @@ auto waitpid_timeout(pid_t pid, int* status, int timeout_ms) -> bool {
         if (RET == pid) {
             return true;
         }
+        if (RET > 0) {
+            errno = ECHILD;
+            return false;
+        }
         if (RET < 0 && errno != EINTR) {
             return false;
         }
@@ -795,6 +799,10 @@ auto waitpid_timeout(pid_t pid, int* status, int timeout_ms) -> bool {
         pid_t const RET = waitpid(pid, status, WNOHANG);
         if (RET == pid) {
             errno = ETIMEDOUT;
+            return false;
+        }
+        if (RET > 0) {
+            errno = ECHILD;
             return false;
         }
         if (RET < 0 && errno != EINTR) {
@@ -2511,8 +2519,8 @@ TESTD_RUN(test_waitpid_specific_ignores_unrelated_child_exit) {
     close(unblock_pipe[1]);
 
     int status = 0;
-    pid_t const WAITED = waitpid(TARGET, &status, 0);
-    if (WAITED != TARGET || !WIFEXITED(status) || WEXITSTATUS(status) != 63) {
+    bool const WAIT_RET = waitpid_timeout(TARGET, &status, REMOTE_IPC_TIMEOUT_MS);
+    if (!WAIT_RET || !WIFEXITED(status) || WEXITSTATUS(status) != 63) {
         kill(TARGET, SIGKILL);
         kill(RELEASER, SIGKILL);
         int cleanup_status = 0;

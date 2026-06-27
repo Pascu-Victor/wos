@@ -29,19 +29,26 @@ def find_matching_brace(source: str, brace: int) -> int:
 
 
 def function_body(source: str, name: str) -> str:
-    candidates = [
-        source.find(f"auto {name}("),
-        source.find(f"void {name}("),
-        source.find(f"extern \"C\" void {name}("),
-    ]
-    start = min((candidate for candidate in candidates if candidate >= 0), default=-1)
-    if start < 0:
-        fail(f"{name} function not found")
-    brace = source.find("{", start)
-    if brace < 0:
-        fail(f"{name} function has no body")
-    end = find_matching_brace(source, brace)
-    return source[brace + 1 : end]
+    starts: set[int] = set()
+    for needle in [
+        f"auto {name}(",
+        f"inline auto {name}(",
+        f"void {name}(",
+        f"inline void {name}(",
+        f"extern \"C\" void {name}(",
+    ]:
+        candidate = source.find(needle)
+        while candidate >= 0:
+            starts.add(candidate)
+            candidate = source.find(needle, candidate + 1)
+    for start in sorted(starts):
+        close = source.find(")", start)
+        brace = source.find("{", close)
+        semicolon = source.find(";", close)
+        if close >= 0 and brace >= 0 and (semicolon < 0 or brace < semicolon):
+            end = find_matching_brace(source, brace)
+            return source[brace + 1 : end]
+    fail(f"{name} function not found")
 
 
 def braced_block_after(source: str, token: str) -> str:
@@ -79,14 +86,15 @@ def require_waited_on_is_atomic_claim(task_hpp: str, task_cpp: str, waitpid_cpp:
     combined = "\n".join([waitpid_cpp, exit_cpp, scheduler_cpp])
     if "waited_on = true" in combined or "waited_on = false" in combined:
         fail("process reaping paths must not write waited_on directly")
-    for snippet in [
-        "sched_task::task_try_mark_waited_on(*target_task)",
-        "sched_task::task_try_mark_waited_on(*child)",
-        "task::task_try_mark_waited_on(*target)",
-        "task::task_try_mark_waited_on(*child)",
-    ]:
-        if snippet not in combined:
-            fail(f"waitpid/deferred reaping paths must claim waited_on before completion: {snippet}")
+    required_claim_sites = {
+        "waitpid syscall direct target": (waitpid_cpp, "sched_task::task_try_mark_waited_on(*target_task)"),
+        "waitpid syscall child scan": (waitpid_cpp, "sched_task::task_try_mark_waited_on(*child)"),
+        "exit direct completion": (exit_cpp, "sched_task::task_try_mark_waited_on(*child)"),
+        "scheduler deferred completion": (scheduler_cpp, "task::task_try_mark_waited_on(*child)"),
+    }
+    for label, (source, snippet) in required_claim_sites.items():
+        if snippet not in source:
+            fail(f"{label} must claim waited_on before completion: {snippet}")
 
 
 def require_wait_any_publish_recheck(waitpid_cpp: str) -> None:
@@ -113,7 +121,7 @@ def require_wait_any_publish_recheck(waitpid_cpp: str) -> None:
 def require_specific_wait_publish_recheck(waitpid_cpp: str) -> None:
     body = function_body(waitpid_cpp, "wos_proc_waitpid")
     publish = body.find("waitpid_publish_pending.store(true, std::memory_order_release)", body.find("if ((options & WOS_WNOHANG) != 0)"))
-    target = body.find("current_task->waiting_for_pid = pid")
+    target = body.find("current_task->waiting_for_pid = TARGET_PID")
     if publish < 0 or target < 0 or publish > target:
         fail("specific wait path must publish the fence before exposing waiting_for_pid")
 
@@ -132,7 +140,7 @@ def require_deferred_switch_clears_after_context_save(scheduler_cpp: str) -> Non
     body = function_body(scheduler_cpp, "deferred_task_switch")
     context_save = body.find('validate_user_resume_target(current_task, "deferred-save-current")')
     clear = body.find("waitpid_publish_pending.store(false, std::memory_order_release)")
-    race_check = body.find("// Race check: for blocking waits")
+    race_check = body.find("complete_or_preserve_waitpid_block(current_task)")
     if context_save < 0 or clear < 0 or race_check < 0:
         fail("deferred_task_switch is missing context-save, publish-clear, or waitpid race-check markers")
     if not (context_save < clear < race_check):

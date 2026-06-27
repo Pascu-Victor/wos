@@ -56,11 +56,14 @@ def main() -> None:
     require_order(
         close_body,
         [
+            "bool const COMMIT_NEEDED = xfs_close_should_commit_inode",
+            "if (COMMIT_NEEDED)",
+            "XfsMetadataGuard metadata_guard(xfd->mount)",
             "MutexGuard guard(xfd->inode->io_lock)",
-            "xfs_commit_dirty_inode(xfd->mount, xfd->inode)",
+            "xfs_commit_dirty_inode(xfd->mount, xfd->inode, TRIM_PREALLOC)",
             "xfs_inode_release(xfd->inode)",
         ],
-        "close must commit dirty inode metadata before releasing the cached inode",
+        "close must commit dirty inode metadata and trim EOF preallocation before releasing the cached inode",
     )
 
     require_order(

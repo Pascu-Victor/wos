@@ -566,6 +566,7 @@ def require_process_waitpid_tests_are_deadline_bounded(source: str) -> None:
     specific_wait_tests = {
         "test_fork_exit": "waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)",
         "test_waitpid_exit_before_park_race": "waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)",
+        "test_waitpid_specific_ignores_unrelated_child_exit": "waitpid_timeout(TARGET, &status, REMOTE_IPC_TIMEOUT_MS)",
         "test_fork_multiple": "waitpid_timeout(pids[i], &status, REMOTE_IPC_TIMEOUT_MS)",
     }
     any_wait_tests = {
@@ -583,6 +584,7 @@ def require_process_waitpid_tests_are_deadline_bounded(source: str) -> None:
 
     forbidden = [
         "waitpid(PID, &status, 0)",
+        "waitpid(TARGET, &status, 0)",
         "waitpid(pids[i], &status, 0)",
         "waitpid(-1, &status, 0)",
     ]
@@ -764,6 +766,7 @@ RAW_IO_TEST_ALLOWLIST = {
     "test_pipe_lost_wake_race_many",
     "test_poll_pipe_timeout_and_wake",
     "test_pty_blocking_read_wake",
+    "test_pty_cr_progress_write_coalesced",
     "test_remote_ipc_epoll_ctl_add",
     "test_remote_ipc_epoll_pipe_read_then_hup",
     "test_remote_ipc_epoll_wait_pipe_readable",
@@ -777,6 +780,7 @@ RAW_IO_TEST_ALLOWLIST = {
     "test_vfs_open_write_read_close",
     "test_vfs_stat",
     "test_vfs_unlink_rename",
+    "test_waitpid_specific_ignores_unrelated_child_exit",
 }
 
 

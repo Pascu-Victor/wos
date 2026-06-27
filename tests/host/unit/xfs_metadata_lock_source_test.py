@@ -78,7 +78,6 @@ def test_metadata_lock_precedes_inode_locks() -> None:
         ("xfs_vfs_truncate", "XfsMetadataGuard metadata_guard(ctx);", "MutexGuard guard(ip->io_lock)"),
         ("xfs_write_append", "XfsMetadataGuard metadata_guard(xfd->mount);", "MutexGuard guard(xfd->inode->io_lock)"),
         ("xfs_fsync", "XfsMetadataGuard metadata_guard(xfd->mount);", "MutexGuard guard(xfd->inode->io_lock)"),
-        ("xfs_open_path", "XfsMetadataGuard metadata_guard(ctx, MUTATING_OPEN);", "MutexGuard guard(ip->io_lock)"),
     ]
     for name, guard, inode_lock in checks:
         require_order(function_body(source, name), [guard, inode_lock], f"{name} metadata/inode lock order")
@@ -92,6 +91,7 @@ def test_metadata_mutators_are_serialized() -> None:
         "xfs_fchmod": "XfsMetadataGuard metadata_guard(xfd->mount);",
         "xfs_mkdir_path": "XfsMetadataGuard metadata_guard(ctx);",
         "xfs_symlink_path": "XfsMetadataGuard metadata_guard(ctx);",
+        "xfs_open_path": "XfsMetadataGuard metadata_guard(ctx);",
         "xfs_rmdir_path": "XfsMetadataGuard metadata_guard(ctx);",
         "xfs_rename_path": "XfsMetadataGuard metadata_guard(ctx);",
         "xfs_unlink_path": "XfsMetadataGuard metadata_guard(ctx);",

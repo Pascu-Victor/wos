@@ -25,35 +25,63 @@ def require_absent(source: str, token: str, context: str) -> None:
 
 def main() -> None:
     source = XFS_VFS.read_text()
-    write_extent_start = source.find("auto write_extent_data = ")
-    write_loop_end = source.find("#ifdef XFS_BENCH", write_extent_start)
-    if write_extent_start < 0 or write_loop_end < 0:
-        fail("could not isolate write_extent_data body")
-    write_extent_body = source[write_extent_start:write_loop_end]
+    write_start = source.find("auto xfs_vfs_write_locked(")
+    write_end = source.find("auto xfs_vfs_write(File* f", write_start)
+    if write_start < 0 or write_end < 0:
+        fail("could not isolate xfs_vfs_write_locked body")
+    write_body = source[write_start:write_end]
 
-    read_overlap_start = source.find("bool const HAS_DIRTY_OVERLAP")
-    read_overlap_end = source.find("} else {", read_overlap_start)
-    if read_overlap_start < 0 or read_overlap_end < 0:
-        fail("could not isolate dirty-overlap read handling")
-    read_overlap_body = source[read_overlap_start:read_overlap_end]
+    buffered_start = write_body.find("auto buffered_write = ")
+    buffered_end = write_body.find("auto write_extent_data = ", buffered_start)
+    if buffered_start < 0 or buffered_end < 0:
+        fail("could not isolate buffered_write body")
+    buffered_body = write_body[buffered_start:buffered_end]
 
-    require_absent(source, "auto direct_full_block_write(", "regular file writes must not bypass dirty buffer cache")
-    require_absent(write_extent_body, "dev::block_write(", "regular file write extent path")
-    require_absent(write_extent_body, "discard_bdev_range(", "regular file write extent path")
+    read_overlay_start = source.find("// Full-block read. Large reads use direct I/O")
+    read_overlay_end = source.find("// Partial or unaligned", read_overlay_start)
+    if read_overlay_start < 0 or read_overlay_end < 0:
+        fail("could not isolate full-block read overlay handling")
+    read_overlay_body = source[read_overlay_start:read_overlay_end]
+
+    require_absent(write_body, "dev::block_write(", "regular file write extent path")
+    require_absent(write_body, "discard_bdev_range(", "regular file write extent path")
+    require_absent(write_body, "xfs_direct_write_full_blocks", "regular file write extent path")
+    require_absent(write_body, "xfs_direct_write_zeroed_partial_block", "regular file write extent path")
+    require_absent(write_body, "xfs_full_block_write_can_write_direct", "regular file write extent path")
     require(
-        write_extent_body,
-        "buffered_write(current_disk_block, 0, DIRECT_BYTES, current_src_offset)",
+        buffered_body,
+        "BufHead* bp = bget_multi(ctx->device, DEV_BLOCK, DEV_COUNT)",
         "full-block regular file writes must stay buffered",
     )
     require(
-        read_overlap_body,
-        "bool const HAS_DIRTY_OVERLAP = has_dirty_bdev_range(ctx->device, DEV_BLOCK, DEV_COUNT)",
-        "full-block reads must detect dirty buffered writes",
+        buffered_body,
+        "std::memcpy(bp->data, src + current_src_offset, BATCH_BYTES)",
+        "full-block regular file writes must copy into cache",
     )
     require(
-        read_overlap_body,
-        "BufHead* bp = xfs_buf_read(ctx, DISK_BLOCK + static_cast<xfs_fsblock_t>(i))",
-        "dirty-overlap reads must use per-block cached buffers",
+        buffered_body,
+        "bdirty(bp)",
+        "full-block regular file writes must dirty cached buffers",
+    )
+    require(
+        buffered_body,
+        "BufHead* bp = fresh_allocation ? xfs_buf_get(ctx, current_disk_block) : xfs_buf_read(ctx, current_disk_block)",
+        "fresh partial regular-file writes must avoid reading old data",
+    )
+    require(
+        buffered_body,
+        "std::memset(bp->data, 0, ctx->block_size)",
+        "fresh partial regular-file writes must zero unwritten bytes",
+    )
+    require(
+        read_overlay_body,
+        "copy_cached_bdev_range_if_complete(ctx->device, dev_block, dev_count, dst + total_read)",
+        "full-block reads must reuse complete cached ranges",
+    )
+    require(
+        read_overlay_body,
+        "copy_dirty_bdev_range(ctx->device, dev_block, dev_count, direct_dst)",
+        "direct reads must overlay dirty buffered writes",
     )
     print("XFS write buffering invariants hold")
 

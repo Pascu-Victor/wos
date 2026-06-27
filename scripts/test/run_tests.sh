@@ -122,8 +122,17 @@ UNIT_TESTS=(
     sftp_timeout_source_test
     netpoll_backlog_source_test
     virtio_net_source_test
+    block_device_source_test
+    buffer_cache_source_test
     udp_bind_device_source_test
+    mlibc_dns_source_test
+    mlibc_vfs_source_test
+    netd_dns_source_test
+    socket_ring_source_test
     tcp_deadline_source_test
+    tcp_ephemeral_source_test
+    tcp_fin_source_test
+    tcp_retransmit_source_test
     poll_deadline_source_test
     futex_source_test
     waitpid_source_test
@@ -145,6 +154,16 @@ UNIT_TESTS=(
     wki_remote_vfs_source_test
     vfs_mount_lifetime_source_test
     vfs_advisory_lock_source_test
+    xfs_metadata_lock_source_test
+    xfs_close_source_test
+    xfs_btree_source_test
+    xfs_dir_growth_source_test
+    xfs_ialloc_source_test
+    xfs_inode_source_test
+    xfs_read_source_test
+    xfs_write_source_test
+    vfs_pread_source_test
+    tmpfs_swap_source_test
     wki_wire_test
     wki_routing_test
     data_struct_test

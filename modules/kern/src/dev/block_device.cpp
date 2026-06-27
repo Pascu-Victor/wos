@@ -52,6 +52,16 @@ auto block_range_end(BlockDevice const* bdev) -> uint64_t {
     }
     return bdev->total_blocks == 0 ? 0 : bdev->total_blocks - 1;
 }
+
+auto normalize_io_result(int rc) -> int {
+    if (rc == 0) {
+        return 0;
+    }
+    if (rc == -1) {
+        return -EIO;
+    }
+    return (rc < 0) ? rc : -rc;
+}
 }  // namespace
 
 auto block_device_register(BlockDevice* bdev) -> int {
@@ -140,18 +150,18 @@ auto block_device_find_by_name(const char* name) -> BlockDevice* {
 
 auto block_read(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -> int {
     if (bdev == nullptr || buffer == nullptr) {
-        return -1;
+        return -EINVAL;
     }
 
     if (block > bdev->total_blocks || count > bdev->total_blocks - block) {
         log::warn("block_read: read past end of device: block=%lu count=%lu total=%lu caller=%p", static_cast<unsigned long>(block),
                   static_cast<unsigned long>(count), static_cast<unsigned long>(bdev->total_blocks), __builtin_return_address(0));
-        return -1;
+        return -EINVAL;
     }
 
     if (bdev->read_blocks == nullptr) {
         log::error("block_read: read_blocks not implemented");
-        return -1;
+        return -ENOSYS;
     }
 
     if (count == 0) {
@@ -160,7 +170,7 @@ auto block_read(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -
 
     if (bdev->block_size == 0) {
         log::error("block_read: invalid zero block size for %s", bdev->name.data());
-        return -1;
+        return -EINVAL;
     }
 
     auto* out = static_cast<uint8_t*>(buffer);
@@ -172,7 +182,7 @@ auto block_read(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -
         size_t const CHUNK_BLOCKS = std::min(remaining, MAX_BLOCKS);
         int const RC = bdev->read_blocks(bdev, current_block, CHUNK_BLOCKS, out);
         if (RC != 0) {
-            return RC;
+            return normalize_io_result(RC);
         }
 
         remaining -= CHUNK_BLOCKS;
@@ -185,7 +195,7 @@ auto block_read(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -
 
 auto block_write(BlockDevice* bdev, uint64_t block, size_t count, const void* buffer) -> int {
     if (bdev == nullptr || buffer == nullptr) {
-        return -1;
+        return -EINVAL;
     }
 
     if (block_device_is_read_only(bdev)) {
@@ -195,12 +205,12 @@ auto block_write(BlockDevice* bdev, uint64_t block, size_t count, const void* bu
     if (block > bdev->total_blocks || count > bdev->total_blocks - block) {
         log::warn("block_write: write past end of device: block=%lu count=%lu total=%lu caller=%p", static_cast<unsigned long>(block),
                   static_cast<unsigned long>(count), static_cast<unsigned long>(bdev->total_blocks), __builtin_return_address(0));
-        return -1;
+        return -EINVAL;
     }
 
     if (bdev->write_blocks == nullptr) {
         log::error("block_write: write_blocks not implemented");
-        return -1;
+        return -ENOSYS;
     }
 
     if (count == 0) {
@@ -209,7 +219,7 @@ auto block_write(BlockDevice* bdev, uint64_t block, size_t count, const void* bu
 
     if (bdev->block_size == 0) {
         log::error("block_write: invalid zero block size for %s", bdev->name.data());
-        return -1;
+        return -EINVAL;
     }
 
     auto const* in = static_cast<uint8_t const*>(buffer);
@@ -221,7 +231,7 @@ auto block_write(BlockDevice* bdev, uint64_t block, size_t count, const void* bu
         size_t const CHUNK_BLOCKS = std::min(remaining, MAX_BLOCKS);
         int const RC = bdev->write_blocks(bdev, current_block, CHUNK_BLOCKS, in);
         if (RC != 0) {
-            return RC;
+            return normalize_io_result(RC);
         }
 
         remaining -= CHUNK_BLOCKS;
@@ -234,14 +244,14 @@ auto block_write(BlockDevice* bdev, uint64_t block, size_t count, const void* bu
 
 auto block_flush(BlockDevice* bdev) -> int {
     if (bdev == nullptr) {
-        return -1;
+        return -EINVAL;
     }
 
     if (bdev->flush == nullptr) {
         return 0;  // No-op if not implemented
     }
 
-    return bdev->flush(bdev);
+    return normalize_io_result(bdev->flush(bdev));
 }
 
 auto block_device_count() -> size_t { return block_devices.size(); }
@@ -269,7 +279,7 @@ namespace {
 // Read function for partition block devices: offsets LBA by partition start
 auto partition_read(BlockDevice* dev, uint64_t block, size_t count, void* buffer) -> int {
     if (dev == nullptr || dev->parent_disk == nullptr) {
-        return -1;
+        return -EINVAL;
     }
     return block_read(dev->parent_disk, dev->partition_start_lba + block, count, buffer);
 }
@@ -277,14 +287,14 @@ auto partition_read(BlockDevice* dev, uint64_t block, size_t count, void* buffer
 // Write function for partition block devices: offsets LBA by partition start
 auto partition_write(BlockDevice* dev, uint64_t block, size_t count, const void* buffer) -> int {
     if (dev == nullptr || dev->parent_disk == nullptr) {
-        return -1;
+        return -EINVAL;
     }
     return block_write(dev->parent_disk, dev->partition_start_lba + block, count, buffer);
 }
 
 auto partition_flush(BlockDevice* dev) -> int {
     if (dev == nullptr || dev->parent_disk == nullptr) {
-        return -1;
+        return -EINVAL;
     }
     return block_flush(dev->parent_disk);
 }

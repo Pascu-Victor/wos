@@ -108,13 +108,16 @@ def test_perf_run_waits_for_descendant_process_group() -> None:
             "ker::process::setpgid(child_pid, child_pid)",
             "int64_t target_pgid = child_pid",
             "std::cmp_equal(stat.pgid, target_pgid)",
+            "last_group_alive = any_alive",
             "command_exited = true",
-            "if (command_exited && !any_alive)",
+            "if (command_exited && !last_group_alive)",
             "set_recording_enabled(false)",
         ],
         "perf run process-group tracing",
     )
     if "if (command_exited || !any_alive)" in cmd_run_body:
+        fail("perf run must not stop recording while same-PGID descendants are still alive")
+    if "if (command_exited || !last_group_alive)" in cmd_run_body:
         fail("perf run must not stop recording while same-PGID descendants are still alive")
 
 

@@ -109,6 +109,14 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/virtio_net_source_test.py
 )
 add_test(
+    NAME block_device_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_device_source_test.py
+)
+add_test(
+    NAME buffer_cache_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/buffer_cache_source_test.py
+)
+add_test(
     NAME udp_bind_device_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/udp_bind_device_source_test.py
 )
@@ -117,12 +125,28 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/mlibc_dns_source_test.py
 )
 add_test(
+    NAME mlibc_vfs_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/mlibc_vfs_source_test.py
+)
+add_test(
     NAME netd_dns_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/netd_dns_source_test.py
 )
 add_test(
+    NAME socket_ring_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/socket_ring_source_test.py
+)
+add_test(
     NAME tcp_deadline_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tcp_deadline_source_test.py
+)
+add_test(
+    NAME tcp_ephemeral_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tcp_ephemeral_source_test.py
+)
+add_test(
+    NAME tcp_fin_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tcp_fin_source_test.py
 )
 add_test(
     NAME tcp_retransmit_source_test
@@ -217,6 +241,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_metadata_lock_source_test.py
 )
 add_test(
+    NAME xfs_close_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_close_source_test.py
+)
+add_test(
     NAME xfs_btree_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_btree_source_test.py
 )
@@ -225,8 +253,16 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_dir_growth_source_test.py
 )
 add_test(
+    NAME xfs_ialloc_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_ialloc_source_test.py
+)
+add_test(
     NAME xfs_inode_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_inode_source_test.py
+)
+add_test(
+    NAME xfs_read_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_read_source_test.py
 )
 add_test(
     NAME xfs_write_source_test
@@ -271,10 +307,16 @@ set_tests_properties(
     sftp_timeout_source_test
     netpoll_backlog_source_test
     virtio_net_source_test
+    block_device_source_test
+    buffer_cache_source_test
     udp_bind_device_source_test
     mlibc_dns_source_test
+    mlibc_vfs_source_test
     netd_dns_source_test
+    socket_ring_source_test
     tcp_deadline_source_test
+    tcp_ephemeral_source_test
+    tcp_fin_source_test
     tcp_retransmit_source_test
     poll_deadline_source_test
     futex_source_test
@@ -298,8 +340,12 @@ set_tests_properties(
     vfs_mount_lifetime_source_test
     vfs_advisory_lock_source_test
     xfs_metadata_lock_source_test
+    xfs_close_source_test
+    xfs_btree_source_test
     xfs_dir_growth_source_test
+    xfs_ialloc_source_test
     xfs_inode_source_test
+    xfs_read_source_test
     xfs_write_source_test
     vfs_pread_source_test
     vmem_source_test

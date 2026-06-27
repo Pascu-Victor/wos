@@ -85,8 +85,9 @@ def test_inactive_proxy_poll_reports_terminal_readiness() -> None:
 
     pipe_required = [
         "!proxy->active.load(std::memory_order_acquire)",
-        "return dev::pty::POLLHUP",
-        "return dev::pty::POLLERR",
+        "ready |= dev::pty::POLLHUP",
+        "ready |= dev::pty::POLLERR",
+        "return ready",
     ]
     socket_required = [
         "!proxy->active.load(std::memory_order_acquire)",

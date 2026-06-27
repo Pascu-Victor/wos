@@ -9,6 +9,8 @@ WOS_VFS_H = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include"
 WOS_SYSDEPS_CPP = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "generic" / "sysdeps.cpp"
 KERNEL_SYS_VFS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vfs" / "sys_vfs.cpp"
 KERNEL_VFS_CORE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "core.cpp"
+KERNEL_FILE_OPS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "file_operations.hpp"
+MLIBC_DIRENT_H = ROOT / "toolchain" / "src" / "mlibc" / "options" / "posix" / "include" / "dirent.h"
 GIT_BUILD_SCRIPT = ROOT / "scripts" / "build" / "build_git_for_wos.sh"
 
 
@@ -38,6 +40,37 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
     missing = [token for token in tokens if token not in source]
     if missing:
         fail(f"{context}: missing {', '.join(missing)}")
+
+
+def parse_kernel_dt_constants(source: str) -> dict[str, int]:
+    matches = re.findall(r"constexpr\s+uint8_t\s+(DT_[A-Z0-9_]+)\s*=\s*(0x[0-9A-Fa-f]+|\d+);", source)
+    return {name: int(value, 0) for name, value in matches}
+
+
+def parse_mlibc_dt_constants(source: str) -> dict[str, int]:
+    matches = re.findall(r"^#define\s+(DT_[A-Z0-9_]+)\s+(0x[0-9A-Fa-f]+|\d+)$", source, flags=re.MULTILINE)
+    return {name: int(value, 0) for name, value in matches}
+
+
+def test_kernel_dirent_types_match_mlibc_public_abi() -> None:
+    kernel_constants = parse_kernel_dt_constants(KERNEL_FILE_OPS_HPP.read_text())
+    mlibc_constants = parse_mlibc_dt_constants(MLIBC_DIRENT_H.read_text())
+    expected = {
+        "DT_UNKNOWN": 0,
+        "DT_FIFO": 1,
+        "DT_CHR": 2,
+        "DT_DIR": 4,
+        "DT_BLK": 6,
+        "DT_REG": 8,
+        "DT_LNK": 10,
+        "DT_SOCK": 12,
+        "DT_WOSLINK": 0x80,
+    }
+    for name, value in expected.items():
+        if kernel_constants.get(name) != value:
+            fail(f"kernel {name} must be {value}, got {kernel_constants.get(name)}")
+        if mlibc_constants.get(name) != value:
+            fail(f"mlibc {name} must be {value}, got {mlibc_constants.get(name)}")
 
 
 def test_git_helper_pipe_cloexec_patch_is_preserved_by_mlibc() -> None:
@@ -182,9 +215,67 @@ def test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards() -> None:
     )
 
 
+def test_kernel_dirfd_resolution_returns_task_visible_paths() -> None:
+    vfs_core = KERNEL_VFS_CORE_CPP.read_text()
+    body = function_body(
+        vfs_core,
+        r"auto\s+vfs_resolve_dirfd\(ker::mod::sched::task::Task\*\s+task,\s*int\s+dirfd,\s*const\s+char\*\s+pathname,\s*char\*\s+resolved,\s*size_t\s+resolved_size\)\s*->\s*int",
+    )
+    require_tokens(
+        body,
+        [
+            "if (pathname[0] == '/')",
+            "if (dirfd == AT_FDCWD)",
+            "base = task->cwd.data();",
+            "auto* file = vfs_get_file_retain(task, dirfd);",
+            "strip_task_root_prefix(task, file->vfs_path, resolved, resolved_size, nullptr)",
+            "base = resolved;",
+        ],
+        "kernel dirfd path resolution",
+    )
+    if "std::memcpy(resolved, file->vfs_path" in body:
+        fail("dirfd resolution must not feed a backing vfs_path back into public VFS APIs")
+
+
+def test_metadata_cache_store_uses_pre_backend_stat_generation() -> None:
+    vfs_core = KERNEL_VFS_CORE_CPP.read_text()
+    store_body = function_body(
+        vfs_core,
+        r"void\s+metadata_cache_store\(const\s+char\*\s+path,\s*FSType\s+fs_type,\s*uint64_t\s+dev_id,\s*bool\s+follow_final_symlink,\s*bool\s+require_directory,\s*int\s+result,\s*const\s+Stat\*\s+statbuf,\s*MetadataSnapshotStamp\s+stamp\)",
+    )
+    require_tokens(
+        store_body,
+        [
+            "if (stamp.cache_generation != EPOCH || metadata_path_invalidated_since(path, PATH_LEN, stamp.invalidation_generation))",
+            "victim->invalidation_generation = stamp.invalidation_generation;",
+        ],
+        "metadata cache stale stat race guard",
+    )
+
+    stat_body = function_body(
+        vfs_core,
+        r"static\s+auto\s+vfs_stat_impl\(const\s+char\*\s+path,\s*ker::vfs::Stat\*\s+statbuf,\s*bool\s+resolve_task_path,\s*bool\s+apply_task_policy,\s*bool\s+follow_final_symlink\)\s*->\s*int",
+    )
+    require_tokens(
+        stat_body,
+        [
+            "MetadataSnapshotStamp const STAT_STAMP = metadata_snapshot_stamp();",
+            "metadata_cache_store(pathBuffer, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, result, statbuf,",
+            "STAT_STAMP);",
+        ],
+        "vfs_stat metadata cache observation stamp",
+    )
+
+    if "KTEST(VFS, MetadataCacheRejectsStaleNegativeStore)" not in (ROOT / "modules" / "kern" / "src" / "test" / "vfs_ktest.cpp").read_text():
+        fail("vfs_ktest must cover stale negative metadata stores")
+
+
 if __name__ == "__main__":
+    test_kernel_dirent_types_match_mlibc_public_abi()
     test_git_helper_pipe_cloexec_patch_is_preserved_by_mlibc()
     test_mlibc_vfs_wrappers_pass_fd_creation_flags_to_kernel()
     test_pselect_empty_fd_sets_do_not_call_epoll_with_zero_maxevents()
     test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards()
+    test_kernel_dirfd_resolution_returns_task_visible_paths()
+    test_metadata_cache_store_uses_pre_backend_stat_generation()
     print("WOS mlibc VFS source invariants hold")

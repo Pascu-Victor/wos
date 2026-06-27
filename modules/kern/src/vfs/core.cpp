@@ -1347,7 +1347,7 @@ auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bo
 }
 
 void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, bool follow_final_symlink, bool require_directory, int result,
-                          const Stat* statbuf) {
+                          const Stat* statbuf, MetadataSnapshotStamp stamp) {
     if (path == nullptr || !metadata_cacheable_fs(fs_type) || !metadata_cacheable_result(result)) {
         return;
     }
@@ -1361,7 +1361,10 @@ void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, boo
     }
 
     uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
-    uint64_t const INVALIDATION_GENERATION = g_metadata_invalidation_generation.load(std::memory_order_acquire);
+    if (stamp.cache_generation != EPOCH || metadata_path_invalidated_since(path, PATH_LEN, stamp.invalidation_generation)) {
+        return;
+    }
+
     uint64_t const HASH = metadata_hash_path(path, PATH_LEN, follow_final_symlink, require_directory, fs_type, dev_id);
     auto& set = g_metadata_cache[HASH & (METADATA_CACHE_SET_COUNT - 1)];
 
@@ -1391,7 +1394,7 @@ void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, boo
         victim->epoch = EPOCH;
         victim->last_used = USE_STAMP;
         victim->dev_id = dev_id;
-        victim->invalidation_generation = INVALIDATION_GENERATION;
+        victim->invalidation_generation = stamp.invalidation_generation;
         victim->path_len = PATH_LEN;
         victim->result = result;
         victim->fs_type = fs_type;
@@ -5183,12 +5186,11 @@ auto vfs_resolve_dirfd(ker::mod::sched::task::Task* task, int dirfd, const char*
             vfs_put_file(file);
             return -EBADF;
         }
-        size_t const BASE_LEN = std::strlen(file->vfs_path);
-        if (BASE_LEN >= resolved_size) {
+        int const STRIP_RET = strip_task_root_prefix(task, file->vfs_path, resolved, resolved_size, nullptr);
+        if (STRIP_RET < 0) {
             vfs_put_file(file);
-            return -ENAMETOOLONG;
+            return STRIP_RET;
         }
-        std::memcpy(resolved, file->vfs_path, BASE_LEN + 1);
         vfs_put_file(file);
         base = resolved;
     }
@@ -6291,6 +6293,7 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
 
     int result = -ENOSYS;
     bool synthetic_stat = false;
+    MetadataSnapshotStamp const STAT_STAMP = metadata_snapshot_stamp();
 
     switch (mount->fs_type) {
         case FSType::TMPFS: {
@@ -6408,7 +6411,8 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     }
 
     if (!is_wki_entry && !synthetic_stat) {
-        metadata_cache_store(pathBuffer, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, result, statbuf);
+        metadata_cache_store(pathBuffer, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, result, statbuf,
+                             STAT_STAMP);
     }
 
     log_loader_path_event(result == 0 ? "stat-ok" : "stat-failed", path, pathBuffer, mount, result);
@@ -9333,7 +9337,7 @@ auto vfs_selftest_file_data_write_skips_uncached_path_invalidation() -> bool {
     VfsCachePerfSnapshot after_uncached_write{};
     Stat st{};
     vfs_get_cache_perf_snapshot(before_unrelated);
-    metadata_cache_store(UNRELATED, FSType::TMPFS, 0, true, false, -ENOENT, nullptr);
+    metadata_cache_store(UNRELATED, FSType::TMPFS, 0, true, false, -ENOENT, nullptr, metadata_snapshot_stamp());
     vfs_get_cache_perf_snapshot(after_unrelated);
     bool const STORED_UNRELATED = after_unrelated.metadata_stores > before_unrelated.metadata_stores;
     bool const HAD_PATH_OBSERVATION_BEFORE_STAT = metadata_cache_has_file_data_observation(file);
@@ -9419,6 +9423,17 @@ auto vfs_selftest_open_create_metadata_hint() -> bool {
            open_create_should_invalidate_metadata(&unknown_backend, ker::vfs::O_CREAT) &&
            !open_create_should_invalidate_metadata(&existing_file, ker::vfs::O_CREAT) &&
            open_create_should_invalidate_metadata(&created_file, ker::vfs::O_CREAT);
+}
+
+auto vfs_selftest_metadata_cache_rejects_stale_negative_store() -> bool {
+    constexpr const char* PATH = "/tmp/ktest_metadata_stale_negative_store";
+    Stat st{};
+
+    MetadataSnapshotStamp const STALE_STAMP = metadata_snapshot_stamp();
+    metadata_cache_note_path_changed(PATH, nullptr);
+    metadata_cache_store(PATH, FSType::TMPFS, 0, true, false, -ENOENT, nullptr, STALE_STAMP);
+
+    return metadata_cache_lookup(PATH, FSType::TMPFS, 0, true, false, &st) == -EAGAIN;
 }
 
 auto vfs_selftest_fcntl_setfl_preserves_open_policy_flags() -> bool {

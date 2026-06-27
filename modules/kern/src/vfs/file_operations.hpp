@@ -26,13 +26,13 @@ struct DirEntry {
 
 // Directory entry types
 constexpr uint8_t DT_UNKNOWN = 0;
-constexpr uint8_t DT_REG = 1;   // Regular file
-constexpr uint8_t DT_DIR = 2;   // Directory
-constexpr uint8_t DT_CHR = 3;   // Character device
-constexpr uint8_t DT_BLK = 4;   // Block device
-constexpr uint8_t DT_FIFO = 5;  // FIFO
-constexpr uint8_t DT_SOCK = 6;  // Socket
-constexpr uint8_t DT_LNK = 7;   // Symbolic link
+constexpr uint8_t DT_FIFO = 1;   // FIFO
+constexpr uint8_t DT_CHR = 2;    // Character device
+constexpr uint8_t DT_DIR = 4;    // Directory
+constexpr uint8_t DT_BLK = 6;    // Block device
+constexpr uint8_t DT_REG = 8;    // Regular file
+constexpr uint8_t DT_LNK = 10;   // Symbolic link
+constexpr uint8_t DT_SOCK = 12;  // Socket
 
 // WOS extension: WOSLINK flag - OR'd with DT_DIR to mark transparent VFS
 // directories that tools should not recurse into (recursion prevention).

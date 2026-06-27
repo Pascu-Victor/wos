@@ -45,6 +45,8 @@ KTEST(VFS, FileMetadataChangeInvalidatesPathStat) { KEXPECT_TRUE(ker::vfs::vfs_s
 
 KTEST(VFS, OpenCreateMetadataHint) { KEXPECT_TRUE(ker::vfs::vfs_selftest_open_create_metadata_hint()); }
 
+KTEST(VFS, MetadataCacheRejectsStaleNegativeStore) { KEXPECT_TRUE(ker::vfs::vfs_selftest_metadata_cache_rejects_stale_negative_store()); }
+
 KTEST(VFS, FcntlSetflPreservesOpenPolicyFlags) { KEXPECT_TRUE(ker::vfs::vfs_selftest_fcntl_setfl_preserves_open_policy_flags()); }
 
 KTEST(VFS, StreamCacheReadEligibility) { KEXPECT_TRUE(ker::vfs::vfs_selftest_stream_cache_read_eligibility()); }

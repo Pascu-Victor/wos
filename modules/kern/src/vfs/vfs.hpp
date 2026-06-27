@@ -250,6 +250,7 @@ auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool;
 auto vfs_selftest_file_data_write_skips_uncached_path_invalidation() -> bool;
 auto vfs_selftest_file_metadata_change_invalidates_path_stat() -> bool;
 auto vfs_selftest_open_create_metadata_hint() -> bool;
+auto vfs_selftest_metadata_cache_rejects_stale_negative_store() -> bool;
 auto vfs_selftest_fcntl_setfl_preserves_open_policy_flags() -> bool;
 auto vfs_selftest_stream_cache_read_eligibility() -> bool;
 auto vfs_selftest_stream_cache_local_detached_ttl() -> bool;

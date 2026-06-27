@@ -106,6 +106,13 @@ def run_command(cmd: list[str], env: dict[str, str] | None = None):
     subprocess.run(cmd, cwd=ROOT, env=env, check=True)
 
 
+def isolated_build_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in ("CFLAGS", "CXXFLAGS", "LDFLAGS"):
+        env.pop(name, None)
+    return env
+
+
 def load_config(path: Path) -> tuple[dict, dict]:
     raw = node_setup.load_json_config(path)
     return raw, node_setup.normalize_node_spec(raw)
@@ -184,17 +191,22 @@ def configure_build(
         f"-DWOS_BASH_BUILD_DIR={roots['bash_build']}",
         f"-DWOS_CMAKE_FOR_WOS_BUILD_DIR={roots['cmake_build']}",
         f"-DWOS_PYTHON_BUILD_DIR={roots['python_build']}",
+        "-DCMAKE_C_FLAGS:STRING=",
+        "-DCMAKE_CXX_FLAGS:STRING=",
+        "-DCMAKE_EXE_LINKER_FLAGS:STRING=",
+        "-DCMAKE_SHARED_LINKER_FLAGS:STRING=",
+        "-DCMAKE_MODULE_LINKER_FLAGS:STRING=",
         "-DWOS_BUILD_BASH_FOR_WOS=ON",
         "-DWOS_BUILD_PYTHON_FOR_WOS=ON",
         "-DWOS_SKIP_LIBCXX_INSTALL=ON",
         *diagnostic_cmake_options(fast, ubtrap),
         *extra_cmake_options,
     ]
-    run_command(cmd)
+    run_command(cmd, env=isolated_build_env())
 
 
 def build_artifacts(build_dir: Path):
-    run_command(["cmake", "--build", str(build_dir), "--target", *BUILD_TARGETS])
+    run_command(["cmake", "--build", str(build_dir), "--target", *BUILD_TARGETS], env=isolated_build_env())
 
 
 def package_disks(spec: dict, build_dir: Path, roots: dict[str, Path], kernel_cmdline: str):

@@ -543,8 +543,10 @@ def require_selftest_build_toggle() -> None:
     source = KTEST_CMAKE.read_text()
     required_tokens = [
         "option(WOS_SELFTEST",
+        "function(wos_kernel_glob_recurse output_var)",
+        "file(GLOB_RECURSE WOS_KERNEL_GLOB_RECURSE_OUTPUT ${WOS_KERNEL_GLOB_OPTIONS} ${ARGN})",
         "if(NOT WOS_SELFTEST)",
-        "file(GLOB_RECURSE KTEST_SRCS",
+        "wos_kernel_glob_recurse(KTEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/test/*.cpp)",
         "list(REMOVE_ITEM CXXFILES ${KTEST_SRCS})",
     ]
     missing = [token for token in required_tokens if token not in source]

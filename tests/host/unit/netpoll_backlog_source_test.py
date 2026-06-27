@@ -146,12 +146,15 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
     require_tokens(
         source,
         [
+            "prepare_backlog_batch",
+            "q.depth.fetch_sub(static_cast<uint64_t>(queue_drained), std::memory_order_relaxed)",
+            "split_backlog_batch(reverse_packet_list(batch), normal_head, wki_head)",
             "try_acquire_backlog_consumer",
             "q.consumer_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)",
             "release_backlog_consumer",
             "q.consumer_active.store(false, std::memory_order_release)",
         ],
-        "backlog consumer guard helpers",
+        "backlog consumer guard and batch preparation helpers",
     )
 
     handler_body = function_body(source, "backlog_handler_loop")
@@ -173,11 +176,12 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
     require_order(
         handler_body,
         [
-            "q.depth.fetch_sub(packet_list_count(batch), std::memory_order_relaxed)",
-            "process_backlog_batch(batch)",
+            "static_cast<void>(prepare_backlog_batch(batch, q, normal_head, wki_head))",
+            "process_packet_list(normal_head)",
             "release_backlog_consumer(q)",
+            "process_packet_list(wki_head)",
         ],
-        "backlog handler releases consumer after batch",
+        "backlog handler releases consumer before WKI post-processing",
     )
 
     enqueue_body = function_body(source, "backlog_enqueue")
@@ -201,19 +205,21 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
             "if (!try_acquire_backlog_consumer(q))",
             "q.head.exchange(nullptr, std::memory_order_acquire)",
             "release_backlog_consumer(q)",
-            "q.depth.fetch_sub(static_cast<uint64_t>(queue_drained), std::memory_order_relaxed)",
-            "process_backlog_batch(batch)",
+            "prepare_backlog_batch(batch, q, normal_head, wki_head)",
+            "process_packet_list(normal_head)",
+            "process_packet_list(wki_head)",
         ],
         "backlog inline drain acquire ownership guard",
     )
     require_order(
         inline_body,
         [
-            "q.depth.fetch_sub(static_cast<uint64_t>(queue_drained), std::memory_order_relaxed)",
-            "process_backlog_batch(batch)",
+            "int const QUEUE_DRAINED = prepare_backlog_batch(batch, q, normal_head, wki_head)",
+            "process_packet_list(normal_head)",
             "release_backlog_consumer(q)",
+            "process_packet_list(wki_head)",
         ],
-        "backlog inline drain releases consumer after batch",
+        "backlog inline drain releases consumer before WKI post-processing",
     )
 
 

@@ -34,27 +34,6 @@ def function_body(source: str, name: str) -> str:
     return source[match.end() : pos - 1]
 
 
-def braced_block_after(source: str, token: str) -> str:
-    start = source.find(token)
-    if start < 0:
-        fail(f"missing block token {token}")
-    brace = source.find("{", start)
-    if brace < 0:
-        fail(f"missing opening brace after {token}")
-
-    depth = 1
-    pos = brace + 1
-    while pos < len(source) and depth > 0:
-        if source[pos] == "{":
-            depth += 1
-        elif source[pos] == "}":
-            depth -= 1
-        pos += 1
-    if depth != 0:
-        fail(f"unterminated block after {token}")
-    return source[brace + 1 : pos - 1]
-
-
 def require_tokens(source: str, tokens: list[str], context: str) -> None:
     missing = [token for token in tokens if token not in source]
     if missing:
@@ -131,34 +110,28 @@ def test_strace_startup_wait_is_deadline_bounded() -> None:
     )
 
 
-def test_strace_trace_loop_retries_interrupted_waits() -> None:
+def test_strace_trace_loop_uses_ptrace_syscall_wait() -> None:
     source = STRACE_CPP.read_text()
     trace_body = function_body(source, "trace_loop")
     require_tokens(
         trace_body,
         [
-            "waitpid(static_cast<pid_t>(pid), &status, 0)",
-        ],
-        "strace steady trace wait",
-    )
-    wait_error_body = braced_block_after(trace_body, "if (WAITED < 0)")
-    require_tokens(
-        wait_error_body,
-        [
-            "if (errno == EINTR)",
-            "continue;",
-            'std::perror("strace: waitpid")',
+            "ker::abi::ptrace::StopInfo stop{}",
+            "syscall_wait(pid, stop)",
+            'std::println(stderr, "strace: PTRACE_SYSCALL_WAIT failed")',
+            "reap_follow_helpers(state, true)",
+            "close_trace_output(output)",
             "return 1",
         ],
-        "strace steady trace wait error handling",
+        "strace steady ptrace wait",
     )
-    if "WNOHANG" in trace_body:
-        fail("strace steady trace wait should remain blocking; only EINTR should retry")
+    if "waitpid(" in trace_body or "WNOHANG" in trace_body:
+        fail("strace steady trace loop should use ptrace SYSCALL_WAIT, not raw waitpid polling")
 
 
 def main() -> None:
     test_strace_startup_wait_is_deadline_bounded()
-    test_strace_trace_loop_retries_interrupted_waits()
+    test_strace_trace_loop_uses_ptrace_syscall_wait()
     print("strace startup waits are deadline bounded")
 
 
