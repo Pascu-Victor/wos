@@ -7,6 +7,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -272,7 +273,7 @@ TEST_F(BufferCacheTest, FailedBwriteMarksCleanBufferDirtyForRetry) {
     bh->data[0] = 0x7E;
 
     EXPECT_FALSE(has_dirty_bdev_range(&dev, BLOCK_NO, 1));
-    EXPECT_EQ(bwrite(bh), -1);
+    EXPECT_EQ(bwrite(bh), -EIO);
     EXPECT_EQ(io.write_calls, 1u);
     EXPECT_TRUE(has_dirty_bdev_range(&dev, BLOCK_NO, 1));
     brelse(bh);
@@ -714,7 +715,7 @@ TEST_F(BufferCacheTest, FailedOlderOverlappingWriteBlocksNewerAliasUntilRetry) {
     bdirty(newer_single);
     brelse(newer_single);
 
-    EXPECT_EQ(sync_blockdev(&dev), -1);
+    EXPECT_EQ(sync_blockdev(&dev), -EIO);
     ASSERT_EQ(io.write_calls, 1u);
     EXPECT_EQ(io.write_blocks[0], block_no);
     EXPECT_EQ(io.write_counts[0], 2u);
@@ -825,23 +826,25 @@ TEST_F(BufferCacheTest, SyncBlockdevFailedWritesProgressAcrossBatches) {
 
     constexpr uint64_t FIRST_BLOCK = 500;
     constexpr size_t DIRTY_COUNT = 70;
+    constexpr size_t DIRTY_STRIDE = 2;
+    constexpr size_t DIRTY_SPAN = (DIRTY_COUNT - 1) * DIRTY_STRIDE + 1;
     for (size_t i = 0; i < DIRTY_COUNT; ++i) {
-        BufHead* bh = bget(&dev, FIRST_BLOCK + i);
+        BufHead* bh = bget(&dev, FIRST_BLOCK + static_cast<uint64_t>(i * DIRTY_STRIDE));
         ASSERT_NE(bh, nullptr);
         bh->data[0] = static_cast<uint8_t>(i);
         bdirty(bh);
         brelse(bh);
     }
 
-    EXPECT_EQ(sync_blockdev(&dev), -1);
+    EXPECT_EQ(sync_blockdev(&dev), -EIO);
     EXPECT_EQ(io.write_calls, DIRTY_COUNT);
-    EXPECT_TRUE(has_dirty_bdev_range(&dev, FIRST_BLOCK, DIRTY_COUNT));
+    EXPECT_TRUE(has_dirty_bdev_range(&dev, FIRST_BLOCK, DIRTY_SPAN));
 
     io.fail_writes = false;
     io.write_calls = 0;
     EXPECT_EQ(sync_blockdev(&dev), 0);
     EXPECT_EQ(io.write_calls, DIRTY_COUNT);
-    EXPECT_FALSE(has_dirty_bdev_range(&dev, FIRST_BLOCK, DIRTY_COUNT));
+    EXPECT_FALSE(has_dirty_bdev_range(&dev, FIRST_BLOCK, DIRTY_SPAN));
     dev.private_data = nullptr;
 }
 
@@ -1039,23 +1042,25 @@ TEST_F(BufferCacheTest, SyncRangeFailedWritesProgressAcrossBatches) {
 
     constexpr uint64_t FIRST_BLOCK = 700;
     constexpr size_t DIRTY_COUNT = 70;
+    constexpr size_t DIRTY_STRIDE = 2;
+    constexpr size_t DIRTY_SPAN = (DIRTY_COUNT - 1) * DIRTY_STRIDE + 1;
     for (size_t i = 0; i < DIRTY_COUNT; ++i) {
-        BufHead* bh = bget(&dev, FIRST_BLOCK + i);
+        BufHead* bh = bget(&dev, FIRST_BLOCK + static_cast<uint64_t>(i * DIRTY_STRIDE));
         ASSERT_NE(bh, nullptr);
         bh->data[0] = static_cast<uint8_t>(0x80U + i);
         bdirty(bh);
         brelse(bh);
     }
 
-    EXPECT_EQ(sync_bdev_range(&dev, FIRST_BLOCK, DIRTY_COUNT), -1);
+    EXPECT_EQ(sync_bdev_range(&dev, FIRST_BLOCK, DIRTY_SPAN), -EIO);
     EXPECT_EQ(io.write_calls, DIRTY_COUNT);
-    EXPECT_TRUE(has_dirty_bdev_range(&dev, FIRST_BLOCK, DIRTY_COUNT));
+    EXPECT_TRUE(has_dirty_bdev_range(&dev, FIRST_BLOCK, DIRTY_SPAN));
 
     io.fail_writes = false;
     io.write_calls = 0;
-    EXPECT_EQ(sync_bdev_range(&dev, FIRST_BLOCK, DIRTY_COUNT), 0);
+    EXPECT_EQ(sync_bdev_range(&dev, FIRST_BLOCK, DIRTY_SPAN), 0);
     EXPECT_EQ(io.write_calls, DIRTY_COUNT);
-    EXPECT_FALSE(has_dirty_bdev_range(&dev, FIRST_BLOCK, DIRTY_COUNT));
+    EXPECT_FALSE(has_dirty_bdev_range(&dev, FIRST_BLOCK, DIRTY_SPAN));
     dev.private_data = nullptr;
 }
 

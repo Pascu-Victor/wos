@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -220,7 +221,7 @@ KTEST(BufferCache, FailedBwriteMarksCleanBufferDirtyForRetry) {
     bh->data[0] = 0x7E;
 
     KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, BLOCK_NO, 1));
-    KEXPECT_EQ(ker::vfs::bwrite(bh), -1);
+    KEXPECT_EQ(ker::vfs::bwrite(bh), -EIO);
     KEXPECT_EQ(io.write_calls, static_cast<size_t>(1));
     KEXPECT_TRUE(ker::vfs::has_dirty_bdev_range(&dev, BLOCK_NO, 1));
     ker::vfs::brelse(bh);
@@ -769,7 +770,7 @@ KTEST(BufferCache, FailedOlderOverlappingWriteBlocksNewerAliasUntilRetry) {
     ker::vfs::bdirty(newer_single);
     ker::vfs::brelse(newer_single);
 
-    KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), -1);
+    KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), -EIO);
     KREQUIRE_EQ(io.write_calls, static_cast<size_t>(1));
     KEXPECT_EQ(io.write_blocks[0], block_no);
     KEXPECT_EQ(io.write_counts[0], static_cast<size_t>(2));
@@ -823,7 +824,7 @@ KTEST(BufferCache, SyncBlockdevFailedWritesProgressAcrossBatches) {
         ker::vfs::brelse(bh);
     }
 
-    KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), -1);
+    KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), -EIO);
     KREQUIRE_EQ(io.write_calls, static_cast<size_t>(1));
     KEXPECT_EQ(io.write_blocks[0], FIRST_BLOCK);
     KEXPECT_EQ(io.write_counts[0], DIRTY_COUNT);
@@ -961,7 +962,7 @@ KTEST(BufferCache, SyncRangeFailedWritesProgressAcrossBatches) {
         ker::vfs::brelse(bh);
     }
 
-    KEXPECT_EQ(ker::vfs::sync_bdev_range(&dev, FIRST_BLOCK, DIRTY_COUNT), -1);
+    KEXPECT_EQ(ker::vfs::sync_bdev_range(&dev, FIRST_BLOCK, DIRTY_COUNT), -EIO);
     KREQUIRE_EQ(io.write_calls, static_cast<size_t>(1));
     KEXPECT_EQ(io.write_blocks[0], FIRST_BLOCK);
     KEXPECT_EQ(io.write_counts[0], DIRTY_COUNT);

@@ -2,6 +2,7 @@
 // Host shim for dev/block_device.hpp — minimal BlockDevice stub for buffer_cache tests.
 
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 
@@ -34,6 +35,7 @@ struct BlockDevice {
 
     void* private_data = nullptr;
     uint32_t capabilities = 0;
+    bool read_only = false;
     ker::net::wki::RemotableOps const* remotable = nullptr;
 
     bool is_partition = false;
@@ -50,25 +52,59 @@ inline auto block_device_unregister(BlockDevice*) -> int { return 0; }
 inline auto block_device_find(unsigned, unsigned) -> BlockDevice* { return nullptr; }
 inline auto block_device_find_by_name(const char*) -> BlockDevice* { return nullptr; }
 
-inline auto block_read(BlockDevice* dev, uint64_t block, size_t count, void* buffer) -> int {
-    if (dev == nullptr || dev->read_blocks == nullptr) {
-        return -1;
+inline auto normalize_io_result(int rc) -> int {
+    if (rc == 0) {
+        return 0;
     }
-    return dev->read_blocks(dev, block, count, buffer);
+    if (rc == -1) {
+        return -EIO;
+    }
+    return rc < 0 ? rc : -rc;
+}
+
+inline auto block_read(BlockDevice* dev, uint64_t block, size_t count, void* buffer) -> int {
+    if (dev == nullptr || buffer == nullptr) {
+        return -EINVAL;
+    }
+    if (dev->read_blocks == nullptr) {
+        return -ENOSYS;
+    }
+    if (count == 0) {
+        return 0;
+    }
+    if (dev->block_size == 0) {
+        return -EINVAL;
+    }
+    return normalize_io_result(dev->read_blocks(dev, block, count, buffer));
 }
 
 inline auto block_write(BlockDevice* dev, uint64_t block, size_t count, const void* buffer) -> int {
-    if (dev == nullptr || dev->write_blocks == nullptr) {
-        return -1;
+    if (dev == nullptr || buffer == nullptr) {
+        return -EINVAL;
     }
-    return dev->write_blocks(dev, block, count, buffer);
+    if (dev->read_only) {
+        return -EROFS;
+    }
+    if (dev->write_blocks == nullptr) {
+        return -ENOSYS;
+    }
+    if (count == 0) {
+        return 0;
+    }
+    if (dev->block_size == 0) {
+        return -EINVAL;
+    }
+    return normalize_io_result(dev->write_blocks(dev, block, count, buffer));
 }
 
 inline auto block_flush(BlockDevice* dev) -> int {
-    if (dev == nullptr || dev->flush == nullptr) {
+    if (dev == nullptr) {
+        return -EINVAL;
+    }
+    if (dev->flush == nullptr) {
         return 0;
     }
-    return dev->flush(dev);
+    return normalize_io_result(dev->flush(dev));
 }
 
 }  // namespace ker::dev
