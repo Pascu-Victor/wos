@@ -411,9 +411,11 @@ void dump_scheduler_trace_stats();
 void dump_scheduler_cpu_states();
 
 // Active task enumeration (for procfs)
+using ActiveTaskPredicate = bool (*)(task::Task* task, void* context);
 auto get_active_task_count() -> uint32_t;
 auto get_active_task_at(uint32_t index) -> task::Task*;
 auto get_active_task_at_safe(uint32_t index) -> task::Task*;
+auto find_active_task_lifetime_ref_if(ActiveTaskPredicate predicate, void* context) -> task::Task*;
 auto debug_find_task_by_kernel_stack(uint64_t rsp) -> task::Task*;
 auto debug_find_dead_task_by_kernel_stack(uint64_t rsp) -> task::Task*;
 auto get_dead_task_count(uint64_t cpu_no) -> size_t;

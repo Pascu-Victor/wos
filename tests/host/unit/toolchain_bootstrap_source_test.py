@@ -23,6 +23,8 @@ WOS_TLS_BUILD = ROOT / "scripts" / "build" / "build_openssl_for_wos.sh"
 WOS_PYTHON_BUILD = ROOT / "scripts" / "build" / "build_python_for_wos.sh"
 MLIBC_STDIO = ROOT / "toolchain" / "src" / "mlibc" / "options" / "ansi" / "generic" / "stdio.cpp"
 MLIBC_SSCANF_TEST = ROOT / "toolchain" / "src" / "mlibc" / "tests" / "ansi" / "sscanf.c"
+MLIBC_NAMESER = ROOT / "toolchain" / "src" / "mlibc" / "options" / "bsd" / "generic" / "arpa-nameser.cpp"
+MLIBC_RESOLV = ROOT / "toolchain" / "src" / "mlibc" / "options" / "glibc" / "generic" / "resolv.cpp"
 WOS_JOB_HELPER_USERS = [
     ROOT / "scripts" / "build" / "build_bash_for_wos.sh",
     WOS_BUSYBOX_BUILD,
@@ -214,6 +216,20 @@ def test_wos_build_jobs_helper_has_self_hostable_fallbacks() -> None:
             'for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do',
             "wos_refresh_file_mtime()",
             'tmp="$file.wos-mtime.$$"',
+            "wos_prefetch_meson_subprojects()",
+            'WOS_MESON_SUBPROJECT_FETCH_RETRIES',
+            'WOS_MESON_SUBPROJECT_FETCH_RETRY_DELAY',
+            'wos_fetch_meson_git_subproject "$source_dir" "$subproject"',
+            'wos_remove_tree "$source_dir/subprojects/$subproject"',
+            "wos_fetch_meson_git_subproject()",
+            'url="$(wos_wrap_value "$wrap" url)"',
+            'revision="$(wos_wrap_value "$wrap" revision)"',
+            'local low_speed_limit="${WOS_GIT_HTTP_LOW_SPEED_LIMIT:-1}"',
+            'local low_speed_time="${WOS_GIT_HTTP_LOW_SPEED_TIME:-60}"',
+            'GIT_HTTP_LOW_SPEED_LIMIT="$low_speed_limit"',
+            'GIT_HTTP_LOW_SPEED_TIME="$low_speed_time"',
+            'git -C "$dest" fetch --depth 1 origin "$revision"',
+            'wos_copy_tree_entries_excluding "$package_dir" "$dest"',
             "wos_make_jobs() {",
             'local jobs="${WOS_MAKE_JOBS:-}"',
             "WOS_MAKE_JOBS must be a positive integer",
@@ -225,6 +241,42 @@ def test_wos_build_jobs_helper_has_self_hostable_fallbacks() -> None:
             "wos_build_jobs",
         ],
         "shared WOS build job helper",
+    )
+
+
+def test_mlibc_wrap_dependencies_are_prefetched_with_retries() -> None:
+    bootstrap = WOS_TOOLCHAIN.read_text()
+    build_script = WOS_MLIBC_BUILD.read_text()
+    helper = CCACHE_ENV.read_text()
+    require_tokens(
+        helper,
+        [
+            "wos_prefetch_meson_subprojects()",
+            "failed to fetch Meson subproject",
+            'wos_fetch_meson_git_subproject "$source_dir" "$subproject"',
+            'wos_remove_tree "$source_dir/subprojects/$subproject"',
+            'GIT_HTTP_LOW_SPEED_LIMIT="$low_speed_limit"',
+            'GIT_HTTP_LOW_SPEED_TIME="$low_speed_time"',
+            'git -C "$dest" fetch --depth 1 origin "$revision"',
+            'wos_copy_tree_entries_excluding "$package_dir" "$dest"',
+        ],
+        "Meson subproject retry helper",
+    )
+    require_tokens(
+        bootstrap,
+        [
+            'wos_prefetch_meson_subprojects "$B/src/mlibc" freestnd-c-hdrs freestnd-cxx-hdrs frigg',
+            'meson_setup_rerunnable "$B/mlibc-build"',
+        ],
+        "bootstrap mlibc Meson dependency prefetch",
+    )
+    require_tokens(
+        build_script,
+        [
+            'wos_prefetch_meson_subprojects "$MLIBC_SRC" freestnd-c-hdrs freestnd-cxx-hdrs frigg',
+            'meson setup --prefix="$TARGET_SYSROOT"',
+        ],
+        "incremental mlibc Meson dependency prefetch",
     )
 
 
@@ -804,6 +856,35 @@ def test_mlibc_scanf_float_zero_counts_as_conversion() -> None:
     )
 
 
+def test_mlibc_nameser_parser_does_not_panic_on_dns_packets() -> None:
+    nameser = MLIBC_NAMESER.read_text()
+    require_tokens(
+        nameser,
+        [
+            "int ns_initparse(const unsigned char *msg, int msglen, ns_msg *handle)",
+            "int ns_parserr(ns_msg *handle, ns_sect section, int rrnum, ns_rr *rr)",
+            "int ns_name_uncompress(",
+            "bool has_bytes(const unsigned char *ptr, const unsigned char *eom, size_t count)",
+            "handle->_sections[section] = ptr;",
+            "if ((label & NS_CMPRSFLGS) == NS_CMPRSFLGS)",
+            "return fail_parse();",
+        ],
+        "mlibc DNS nameser parser",
+    )
+    if '__ensure(!"Not implemented")' in nameser:
+        fail("mlibc nameser parser must reject malformed DNS packets instead of panicking")
+
+    resolv = MLIBC_RESOLV.read_text()
+    require_tokens(
+        resolv,
+        [
+            "int dn_expand(",
+            "return ns_name_uncompress(msg, eomorig, comp_dn, exp_dn, static_cast<size_t>(length));",
+        ],
+        "mlibc dn_expand DNS decompression wrapper",
+    )
+
+
 if __name__ == "__main__":
     test_compiler_rt_runs_real_cmake_checks_without_forced_response_files()
     test_compiler_rt_sanitizers_are_built_after_mlibc()
@@ -831,4 +912,5 @@ if __name__ == "__main__":
     test_wos_tls_build_is_self_hostable_without_perl()
     test_wos_python_ssl_build_handles_libressl_sigalg_gap()
     test_mlibc_scanf_float_zero_counts_as_conversion()
+    test_mlibc_nameser_parser_does_not_panic_on_dns_packets()
     print("WOS toolchain bootstrap source invariants hold")

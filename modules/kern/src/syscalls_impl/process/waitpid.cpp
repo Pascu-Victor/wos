@@ -49,6 +49,15 @@ struct ClaimedExitedChild {
     bool release_ref{false};
 };
 
+struct ParentWaitScan {
+    ker::mod::sched::task::Task* parent{nullptr};
+};
+
+struct SpecificWaitScan {
+    ker::mod::sched::task::Task* waiter{nullptr};
+    uint64_t pid{0};
+};
+
 auto is_waitable_exit(const ker::mod::sched::task::Task* task) -> bool {
     if (task == nullptr) {
         return false;
@@ -92,6 +101,30 @@ auto is_unwaited_specific_wait_target(const ker::mod::sched::task::Task* waiter,
         return false;
     }
     return child->parent_pid == waiter->pid || is_ptrace_wait_target(*waiter, *child);
+}
+
+auto active_waitable_unwaited_child(ker::mod::sched::task::Task* child, void* raw_ctx) -> bool {
+    auto* ctx = static_cast<ParentWaitScan*>(raw_ctx);
+    return ctx != nullptr && is_unwaited_child(ctx->parent, child) && is_waitable_exit(child);
+}
+
+auto active_unwaited_child(ker::mod::sched::task::Task* child, void* raw_ctx) -> bool {
+    auto* ctx = static_cast<ParentWaitScan*>(raw_ctx);
+    return ctx != nullptr && is_unwaited_child(ctx->parent, child);
+}
+
+auto active_waitable_specific_child(ker::mod::sched::task::Task* child, void* raw_ctx) -> bool {
+    auto* ctx = static_cast<SpecificWaitScan*>(raw_ctx);
+    return ctx != nullptr && is_unwaited_specific_wait_target(ctx->waiter, child, ctx->pid) && is_waitable_exit(child);
+}
+
+auto active_stopped_child(ker::mod::sched::task::Task* child, void* raw_ctx) -> bool {
+    auto* ctx = static_cast<ParentWaitScan*>(raw_ctx);
+    if (ctx == nullptr || ctx->parent == nullptr || child == nullptr) {
+        return false;
+    }
+    return child->parent_pid == ctx->parent->pid && !child->is_thread && !child->has_exited &&
+           child->jobctl_stopped.load(std::memory_order_acquire) && child->jobctl_stop_pending.load(std::memory_order_acquire);
 }
 
 auto consume_job_stop_if_waitable(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* target, int32_t* status,
@@ -148,12 +181,16 @@ auto consume_ptrace_stop_if_waitable(ker::mod::sched::task::Task* waiter, ker::m
 // a matching unwaited child cannot be reclaimed until this parent marks it
 // waited_on.
 auto claim_exited_child(ker::mod::sched::task::Task* parent) -> ClaimedExitedChild {
-    uint32_t const COUNT = ker::mod::sched::get_active_task_count();
-    for (uint32_t i = 0; i < COUNT; i++) {
-        auto* child = ker::mod::sched::get_active_task_at(i);
-        if (is_unwaited_child(parent, child) && is_waitable_exit(child) && sched_task::task_try_mark_waited_on(*child)) {
-            return {.task = child, .release_ref = false};
+    ParentWaitScan ctx{.parent = parent};
+    for (;;) {
+        auto* child = ker::mod::sched::find_active_task_lifetime_ref_if(active_waitable_unwaited_child, &ctx);
+        if (child == nullptr) {
+            break;
         }
+        if (sched_task::task_try_mark_waited_on(*child)) {
+            return {.task = child, .release_ref = true};
+        }
+        child->release();
     }
 
     uint64_t const CORE_COUNT = ker::mod::smt::get_core_count();
@@ -179,13 +216,16 @@ auto claim_specific_exited_child(ker::mod::sched::task::Task* waiter, uint64_t p
         return {};
     }
 
-    uint32_t const COUNT = ker::mod::sched::get_active_task_count();
-    for (uint32_t i = 0; i < COUNT; i++) {
-        auto* child = ker::mod::sched::get_active_task_at(i);
-        if (is_unwaited_specific_wait_target(waiter, child, pid) && is_waitable_exit(child) &&
-            sched_task::task_try_mark_waited_on(*child)) {
-            return {.task = child, .release_ref = false};
+    SpecificWaitScan ctx{.waiter = waiter, .pid = pid};
+    for (;;) {
+        auto* child = ker::mod::sched::find_active_task_lifetime_ref_if(active_waitable_specific_child, &ctx);
+        if (child == nullptr) {
+            break;
         }
+        if (sched_task::task_try_mark_waited_on(*child)) {
+            return {.task = child, .release_ref = true};
+        }
+        child->release();
     }
 
     uint64_t const CORE_COUNT = ker::mod::smt::get_core_count();
@@ -245,29 +285,34 @@ auto consume_claimed_exit(ker::mod::sched::task::Task* waiter, ClaimedExitedChil
     return PID;
 }
 
-auto consume_stopped_child(ker::mod::sched::task::Task* parent, int32_t* status, int32_t options) -> ker::mod::sched::task::Task* {
+auto consume_stopped_child(ker::mod::sched::task::Task* parent, int32_t* status, int32_t options) -> uint64_t {
     if ((options & WOS_WSTOPPED) == 0) {
-        return nullptr;
+        return 0;
     }
 
-    uint32_t const COUNT = ker::mod::sched::get_active_task_count();
-    for (uint32_t i = 0; i < COUNT; i++) {
-        auto* child = ker::mod::sched::get_active_task_at(i);
-        if (consume_job_stop_if_waitable(parent, child, status, options)) {
-            return child;
+    ParentWaitScan ctx{.parent = parent};
+    for (;;) {
+        auto* child = ker::mod::sched::find_active_task_lifetime_ref_if(active_stopped_child, &ctx);
+        if (child == nullptr) {
+            break;
+        }
+        uint64_t const PID = child->pid;
+        bool const CONSUMED = consume_job_stop_if_waitable(parent, child, status, options);
+        child->release();
+        if (CONSUMED) {
+            return PID;
         }
     }
 
-    return nullptr;
+    return 0;
 }
 
 auto has_unwaited_child(ker::mod::sched::task::Task* parent) -> bool {
-    uint32_t const COUNT = ker::mod::sched::get_active_task_count();
-    for (uint32_t i = 0; i < COUNT; i++) {
-        auto* child = ker::mod::sched::get_active_task_at(i);
-        if (is_unwaited_child(parent, child)) {
-            return true;
-        }
+    ParentWaitScan ctx{.parent = parent};
+    auto* active_child = ker::mod::sched::find_active_task_lifetime_ref_if(active_unwaited_child, &ctx);
+    if (active_child != nullptr) {
+        active_child->release();
+        return true;
     }
     uint64_t const CORE_COUNT = ker::mod::smt::get_core_count();
     for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
@@ -347,6 +392,23 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
 
     // --- Handle pid == -1 or pid == 0: wait for ANY child ---
     if (pid <= 0) {
+        if ((options & WOS_WNOHANG) != 0) {
+            auto exited = claim_exited_child(current_task);
+            if (exited.task != nullptr) {
+                return consume_claimed_exit(current_task, exited, status, rusage_vaddr);
+            }
+
+            uint64_t const STOPPED_PID = consume_stopped_child(current_task, status, options);
+            if (STOPPED_PID != 0) {
+                return STOPPED_PID;
+            }
+
+            if (!has_unwaited_child(current_task)) {
+                return static_cast<uint64_t>(-ECHILD);
+            }
+            return 0;
+        }
+
         current_task->waitpid_publish_pending.store(true, std::memory_order_release);
         current_task->waiting_for_pid = WAIT_ANY_CHILD;
         current_task->wait_options = options;
@@ -357,12 +419,12 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             return consume_claimed_exit(current_task, exited, status, rusage_vaddr);
         }
 
-        auto* stopped = consume_stopped_child(current_task, status, options);
-        if (stopped != nullptr) {
+        uint64_t stopped_pid = consume_stopped_child(current_task, status, options);
+        if (stopped_pid != 0) {
             clear_waitpid_publish_pending(current_task);
             current_task->waiting_for_pid = 0;
             current_task->wait_options = 0;
-            return stopped->pid;
+            return stopped_pid;
         }
 
         // No direct child remains waitable.  POSIX waitpid(-1/0) must fail
@@ -373,14 +435,6 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             current_task->waiting_for_pid = 0;
             current_task->wait_options = 0;
             return static_cast<uint64_t>(-ECHILD);
-        }
-
-        // WNOHANG: return 0 immediately if no exited child
-        if ((options & WOS_WNOHANG) != 0) {
-            clear_waitpid_publish_pending(current_task);
-            current_task->waiting_for_pid = 0;
-            current_task->wait_options = 0;
-            return 0;
         }
 
         // No exited child yet - block until SIGCHLD wakes us
@@ -408,13 +462,13 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         if (exited.task != nullptr) {
             return consume_claimed_exit(current_task, exited, status, rusage_vaddr);
         }
-        stopped = consume_stopped_child(current_task, status, options);
-        if (stopped != nullptr) {
+        stopped_pid = consume_stopped_child(current_task, status, options);
+        if (stopped_pid != 0) {
             clear_waitpid_publish_pending(current_task);
             current_task->deferred_task_switch = false;
             current_task->waiting_for_pid = 0;
             current_task->wait_options = 0;
-            return stopped->pid;
+            return stopped_pid;
         }
         return 0;
     }

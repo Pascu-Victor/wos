@@ -45,6 +45,8 @@ using log = ker::mod::dbg::logger<"virt">;
 constexpr uint64_t LARGE_PAGE_2M_BYTES = paging::PAGE_SIZE * paging::PAGE_TABLE_ENTRIES;
 constexpr uint64_t LARGE_PAGE_1G_BYTES = LARGE_PAGE_2M_BYTES * paging::PAGE_TABLE_ENTRIES;
 
+sys::Spinlock cow_pte_lock;
+
 auto perf_clamp_u32(uint64_t value) -> uint32_t { return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value); }
 
 auto perf_clamp_i32(uint64_t value) -> int32_t {
@@ -681,126 +683,191 @@ void flush_user_mapping_if_current(PageTable* pagemap, vaddr_t vaddr, bool reloa
     invlpg(vaddr);
 }
 
+enum class UserWriteFaultStatus : uint8_t {
+    HANDLED,
+    NEED_LAZY_BACKING,
+    NOT_WRITABLE,
+};
+
+auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserWriteFaultStatus {
+    if (task == nullptr || task->pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
+        return UserWriteFaultStatus::NOT_WRITABLE;
+    }
+
+    PageTable* const PAGEMAP = task->pagemap;
+    uint64_t const VADDR = vaddr;
+    uint64_t const IDX4 = index_of(VADDR, 4);
+    uint64_t const IDX3 = index_of(VADDR, 3);
+    uint64_t const IDX2 = index_of(VADDR, 2);
+    uint64_t const IDX1 = index_of(VADDR, 1);
+
+    void* old_virt = nullptr;
+    paddr_t old_phys = 0;
+    phys::PageLookupHint cow_lookup{};
+    uint32_t refcount = 0;
+    bool old_is_zero_page = false;
+    perf::WkiPerfLocalVmemOp cow_op = perf::WkiPerfLocalVmemOp::COW_COPY;
+    uint64_t cow_started_us = 0;
+    bool initial_path_promoted = false;
+
+    {
+        uint64_t const LOCK_FLAGS = cow_pte_lock.lock_irqsave();
+
+        PageTableEntry& pml4e = entry_at(PAGEMAP, IDX4);
+        if (!pml4e.present) {
+            cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+            return UserWriteFaultStatus::NEED_LAZY_BACKING;
+        }
+
+        auto* pml3 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml4e.frame << paging::PAGE_SHIFT));
+        PageTableEntry& pml3e = entry_at(pml3, IDX3);
+        if (!pml3e.present || pml3e.pagesize != 0) {
+            cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+            return UserWriteFaultStatus::NEED_LAZY_BACKING;
+        }
+
+        auto* pml2 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml3e.frame << paging::PAGE_SHIFT));
+        PageTableEntry& pml2e = entry_at(pml2, IDX2);
+        if (!pml2e.present || pml2e.pagesize != 0) {
+            cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+            return UserWriteFaultStatus::NEED_LAZY_BACKING;
+        }
+
+        auto* pml1 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml2e.frame << paging::PAGE_SHIFT));
+        PageTableEntry& pte = entry_at(pml1, IDX1);
+        if (!pte.present) {
+            cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+            return UserWriteFaultStatus::NEED_LAZY_BACKING;
+        }
+
+        uint64_t raw = pte_raw(pte);
+        bool const SYNTHETIC_ANON_COW = (raw & (paging::PAGE_COW | paging::PAGE_WRITE)) == 0U && (raw & paging::PAGE_USER) != 0U &&
+                                        writable_anonymous_range_contains(task, VADDR);
+        if (SYNTHETIC_ANON_COW) {
+            owned_frame_untrack_leaf(PAGEMAP, VADDR, pte);
+            raw |= paging::PAGE_COW;
+            pte = pte_from_raw(raw);
+        }
+
+        if ((raw & paging::PAGE_COW) == 0U) {
+            if ((raw & paging::PAGE_WRITE) == 0U || (raw & paging::PAGE_USER) == 0U) {
+                cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+                return UserWriteFaultStatus::NOT_WRITABLE;
+            }
+
+            bool const PATH_PROMOTED = promote_user_write_path(pml4e, pml3e, pml2e);
+            cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+            flush_user_mapping_if_current(PAGEMAP, VADDR, PATH_PROMOTED);
+            return UserWriteFaultStatus::HANDLED;
+        }
+
+        cow_started_us = time::get_us();
+        initial_path_promoted = promote_user_write_path(pml4e, pml3e, pml2e);
+
+        old_phys = pte.frame << paging::PAGE_SHIFT;
+        old_virt = reinterpret_cast<void*>(addr::get_virt_pointer(old_phys));
+        refcount = phys::page_ref_get(old_virt, &cow_lookup);
+        old_is_zero_page = perf::is_local_vmem_zero_page(old_virt);
+        if (old_is_zero_page) {
+            cow_op = perf::WkiPerfLocalVmemOp::COW_ZERO;
+        } else if (refcount <= 1) {
+            cow_op = perf::WkiPerfLocalVmemOp::COW_PROMOTE;
+        }
+
+        if (refcount <= 1) {
+            raw &= ~paging::PAGE_COW;
+            raw |= paging::PAGE_WRITE;
+            pte = pte_from_raw(raw);
+            owned_frame_track_private_mapping(PAGEMAP, VADDR, old_phys, raw);
+            cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+            flush_user_mapping_if_current(PAGEMAP, VADDR, initial_path_promoted);
+            record_cow_perf_event(task, cow_op, VADDR, refcount, cow_started_us);
+            return UserWriteFaultStatus::HANDLED;
+        }
+
+        // Pin the old frame while the PTE lock still proves this mapping's
+        // PTE reference exists. Allocation and memcpy below intentionally run
+        // outside the lock; the commit path rechecks the same frame under lock.
+        phys::page_ref_inc(old_virt, &cow_lookup);
+        cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+    }
+
+    bool const DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE = !old_is_zero_page;
+    void* new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);
+    if (new_page == nullptr) {
+        phys::page_ref_dec(old_virt, &cow_lookup);
+        log::error("COW fault: OOM allocating new page for vaddr 0x%x", VADDR);
+        hcf();
+        return UserWriteFaultStatus::NOT_WRITABLE;
+    }
+
+    if (DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE) {
+        std::memcpy(new_page, old_virt, paging::PAGE_SIZE);
+    }
+
+    bool installed_private_page = false;
+    bool final_path_promoted = false;
+    {
+        uint64_t const LOCK_FLAGS = cow_pte_lock.lock_irqsave();
+        PageTableEntry& pml4e = entry_at(PAGEMAP, IDX4);
+        if (pml4e.present) {
+            auto* pml3 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml4e.frame << paging::PAGE_SHIFT));
+            PageTableEntry& pml3e = entry_at(pml3, IDX3);
+            if (pml3e.present && pml3e.pagesize == 0) {
+                auto* pml2 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml3e.frame << paging::PAGE_SHIFT));
+                PageTableEntry& pml2e = entry_at(pml2, IDX2);
+                if (pml2e.present && pml2e.pagesize == 0) {
+                    auto* pml1 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml2e.frame << paging::PAGE_SHIFT));
+                    PageTableEntry& pte = entry_at(pml1, IDX1);
+                    uint64_t raw_now = pte.present ? pte_raw(pte) : 0;
+                    paddr_t const CURRENT_PHYS = pte.present ? (pte.frame << paging::PAGE_SHIFT) : 0;
+                    if ((raw_now & paging::PAGE_COW) != 0U && CURRENT_PHYS == old_phys) {
+                        final_path_promoted = promote_user_write_path(pml4e, pml3e, pml2e);
+                        auto new_phys = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(new_page)));
+                        raw_now &= ~paging::PAGE_COW;
+                        raw_now |= paging::PAGE_WRITE;
+                        raw_now &= ~(0xFFFFFFFFFFULL << 12);
+                        raw_now |= (new_phys & ~0xFFFULL);
+                        pte = pte_from_raw(raw_now);
+                        owned_frame_track_fresh_normal_mapping(PAGEMAP, VADDR, new_phys, raw_now);
+                        installed_private_page = true;
+                    }
+                }
+            }
+        }
+        cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+    }
+
+    if (!installed_private_page) {
+        phys::page_ref_dec(new_page);
+        phys::page_ref_dec(old_virt, &cow_lookup);
+        flush_user_mapping_if_current(PAGEMAP, VADDR, initial_path_promoted);
+        record_cow_perf_event(task, cow_op, VADDR, refcount, cow_started_us);
+        return UserWriteFaultStatus::HANDLED;
+    }
+
+    flush_user_mapping_if_current(PAGEMAP, VADDR, initial_path_promoted || final_path_promoted);
+    phys::page_ref_dec(old_virt, &cow_lookup);
+    phys::page_ref_dec(old_virt, &cow_lookup);
+    record_cow_perf_event(task, cow_op, VADDR, refcount, cow_started_us);
+    return UserWriteFaultStatus::HANDLED;
+}
+
 auto ensure_user_page_writable_for_task(sched::task::Task* task, vaddr_t vaddr) -> bool {
     if (task == nullptr || task->pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
         return false;
     }
 
     for (unsigned attempt = 0; attempt < 2; ++attempt) {
-        PageTable* pml4 = task->pagemap;
-        uint64_t const VADDR = vaddr;
-        uint64_t const IDX4 = index_of(VADDR, 4);
-        uint64_t const IDX3 = index_of(VADDR, 3);
-        uint64_t const IDX2 = index_of(VADDR, 2);
-        uint64_t const IDX1 = index_of(VADDR, 1);
-
-        PageTableEntry& pml4e = entry_at(pml4, IDX4);
-        if (!pml4e.present) {
-            goto maybe_lazy_backing;
-        }
-
-        {
-            auto* pml3 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml4e.frame << paging::PAGE_SHIFT));
-            PageTableEntry& pml3e = entry_at(pml3, IDX3);
-            if (!pml3e.present || pml3e.pagesize != 0) {
-                goto maybe_lazy_backing;
-            }
-
-            auto* pml2 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml3e.frame << paging::PAGE_SHIFT));
-            PageTableEntry& pml2e = entry_at(pml2, IDX2);
-            if (!pml2e.present || pml2e.pagesize != 0) {
-                goto maybe_lazy_backing;
-            }
-
-            auto* pml1 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml2e.frame << paging::PAGE_SHIFT));
-            PageTableEntry& pte = entry_at(pml1, IDX1);
-            if (!pte.present) {
-                goto maybe_lazy_backing;
-            }
-
-            uint64_t raw = pte_raw(pte);
-            bool const SYNTHETIC_ANON_COW = (raw & (paging::PAGE_COW | paging::PAGE_WRITE)) == 0U && (raw & paging::PAGE_USER) != 0U &&
-                                            writable_anonymous_range_contains(task, VADDR);
-            if (SYNTHETIC_ANON_COW) {
-                owned_frame_untrack_leaf(task->pagemap, VADDR, pte);
-                raw |= paging::PAGE_COW;
-                pte = pte_from_raw(raw);
-            }
-            if ((raw & paging::PAGE_COW) == 0U) {
-                if ((raw & paging::PAGE_WRITE) == 0U || (raw & paging::PAGE_USER) == 0U) {
-                    return false;
-                }
-                bool const PATH_PROMOTED = promote_user_write_path(pml4e, pml3e, pml2e);
-                flush_user_mapping_if_current(task->pagemap, VADDR, PATH_PROMOTED);
+        switch (resolve_user_write_mapping(task, vaddr)) {
+            case UserWriteFaultStatus::HANDLED:
                 return true;
-            }
-
-            uint64_t const COW_STARTED_US = time::get_us();
-            bool const PATH_PROMOTED = promote_user_write_path(pml4e, pml3e, pml2e);
-
-            paddr_t const OLD_PHYS = pte.frame << paging::PAGE_SHIFT;
-            void* old_virt = reinterpret_cast<void*>(addr::get_virt_pointer(OLD_PHYS));
-
-            phys::PageLookupHint cow_lookup{};
-            uint32_t const REFCOUNT = phys::page_ref_get(old_virt, &cow_lookup);
-            bool const OLD_IS_ZERO_PAGE = perf::is_local_vmem_zero_page(old_virt);
-            perf::WkiPerfLocalVmemOp cow_op = perf::WkiPerfLocalVmemOp::COW_COPY;
-            if (OLD_IS_ZERO_PAGE) {
-                cow_op = perf::WkiPerfLocalVmemOp::COW_ZERO;
-            } else if (REFCOUNT <= 1) {
-                cow_op = perf::WkiPerfLocalVmemOp::COW_PROMOTE;
-            }
-
-            if (REFCOUNT <= 1) {
-                raw &= ~paging::PAGE_COW;
-                raw |= paging::PAGE_WRITE;
-                pte = pte_from_raw(raw);
-                owned_frame_track_private_mapping(task->pagemap, VADDR, OLD_PHYS, raw);
-                flush_user_mapping_if_current(task->pagemap, VADDR, PATH_PROMOTED);
-                record_cow_perf_event(task, cow_op, VADDR, REFCOUNT, COW_STARTED_US);
-                return true;
-            }
-
-            phys::page_ref_inc(old_virt, &cow_lookup);
-
-            bool const DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE = !OLD_IS_ZERO_PAGE;
-            void* new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);
-            if (new_page == nullptr) {
-                phys::page_ref_dec(old_virt, &cow_lookup);
-                log::error("COW fault: OOM allocating new page for vaddr 0x%x", VADDR);
-                hcf();
+            case UserWriteFaultStatus::NOT_WRITABLE:
                 return false;
-            }
-
-            if (DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE) {
-                std::memcpy(new_page, old_virt, paging::PAGE_SIZE);
-            }
-
-            uint64_t const RAW_NOW = pte_raw(pte);
-            if ((RAW_NOW & paging::PAGE_COW) == 0U) {
-                phys::page_ref_dec(new_page);
-                phys::page_ref_dec(old_virt, &cow_lookup);
-                flush_user_mapping_if_current(task->pagemap, VADDR, PATH_PROMOTED);
-                record_cow_perf_event(task, cow_op, VADDR, REFCOUNT, COW_STARTED_US);
-                return true;
-            }
-
-            auto new_phys = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(new_page)));
-            raw &= ~paging::PAGE_COW;
-            raw |= paging::PAGE_WRITE;
-            raw &= ~(0xFFFFFFFFFFULL << 12);
-            raw |= (new_phys & ~0xFFFULL);
-            pte = pte_from_raw(raw);
-            owned_frame_track_fresh_normal_mapping(task->pagemap, VADDR, new_phys, raw);
-            flush_user_mapping_if_current(task->pagemap, VADDR, PATH_PROMOTED);
-
-            phys::page_ref_dec(old_virt, &cow_lookup);
-            phys::page_ref_dec(old_virt, &cow_lookup);
-            record_cow_perf_event(task, cow_op, VADDR, REFCOUNT, COW_STARTED_US);
-            return true;
+            case UserWriteFaultStatus::NEED_LAZY_BACKING:
+                break;
         }
 
-    maybe_lazy_backing:
         paging::PageFault const WRITE_FAULT = paging::create_page_fault(1ULL << paging::error_flags::WRITE, true);
         if (!handle_lazy_vmem_fault(task, vaddr, WRITE_FAULT)) {
             return false;
@@ -1275,7 +1342,6 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
     // Guard: only handle addresses in the user-space half of the canonical
     // address space to ensure we never touch kernel page-table entries.
     if ((PAGEFAULT.writable != 0U) && (control_register < 0x0000800000000000ULL)) {
-        // Walk page tables to find the faulting PTE
         auto* current_task = sched::get_current_task();
         if (current_task == nullptr || current_task->pagemap == nullptr) {
             log::error("COW fault: no current task or pagemap");
@@ -1283,154 +1349,11 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
             return false;
         }
 
-        paging::PageTable* pml4 = current_task->pagemap;
-        uint64_t const VADDR = control_register;
-
-        // Walk the 4 levels to find the PML1 entry
-        const uint64_t IDX4 = (VADDR >> 39) & 0x1FF;
-        const uint64_t IDX3 = (VADDR >> 30) & 0x1FF;
-        const uint64_t IDX2 = (VADDR >> 21) & 0x1FF;
-        const uint64_t IDX1 = (VADDR >> 12) & 0x1FF;
-
-        PageTableEntry& pml4e = entry_at(pml4, IDX4);
-        if (!pml4e.present) {
-            goto not_cow;
-        }
-        {
-            auto* pml3 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml4e.frame << paging::PAGE_SHIFT));
-            PageTableEntry& pml3e = entry_at(pml3, IDX3);
-            if (!pml3e.present) {
-                goto not_cow;
-            }
-            auto* pml2 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml3e.frame << paging::PAGE_SHIFT));
-            PageTableEntry& pml2e = entry_at(pml2, IDX2);
-            if (!pml2e.present) {
-                goto not_cow;
-            }
-            auto* pml1 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml2e.frame << paging::PAGE_SHIFT));
-
-            paging::PageTableEntry& pte = entry_at(pml1, IDX1);
-            if (!pte.present) {
-                goto not_cow;
-            }
-
-            uint64_t raw = pte_raw(pte);
-            bool const SYNTHETIC_ANON_COW = (raw & (paging::PAGE_COW | paging::PAGE_WRITE)) == 0U && (raw & paging::PAGE_USER) != 0U &&
-                                            writable_anonymous_range_contains(current_task, VADDR);
-            if (SYNTHETIC_ANON_COW) {
-                owned_frame_untrack_leaf(current_task->pagemap, VADDR, pte);
-                raw |= paging::PAGE_COW;
-                pte = pte_from_raw(raw);
-            }
-            if ((raw & paging::PAGE_COW) == 0U) {
-                if ((raw & paging::PAGE_WRITE) != 0U && (raw & paging::PAGE_USER) != 0U) {
-                    bool const PATH_PROMOTED = promote_user_write_path(pml4e, pml3e, pml2e);
-                    if (PATH_PROMOTED) {
-                        wrcr3(rdcr3());
-                    } else {
-                        invlpg(VADDR);
-                    }
-                    return true;
-                }
-                goto not_cow;
-            }
-
-            uint64_t const COW_STARTED_US = time::get_us();
-            bool const PATH_PROMOTED = promote_user_write_path(pml4e, pml3e, pml2e);
-
-            // This is a COW page - handle it
-            paddr_t const OLD_PHYS = pte.frame << paging::PAGE_SHIFT;
-            void* old_virt = reinterpret_cast<void*>(addr::get_virt_pointer(OLD_PHYS));
-
-            phys::PageLookupHint cow_lookup{};
-            uint32_t const REFCOUNT = phys::page_ref_get(old_virt, &cow_lookup);
-            bool const OLD_IS_ZERO_PAGE = perf::is_local_vmem_zero_page(old_virt);
-            perf::WkiPerfLocalVmemOp cow_op = perf::WkiPerfLocalVmemOp::COW_COPY;
-            if (OLD_IS_ZERO_PAGE) {
-                cow_op = perf::WkiPerfLocalVmemOp::COW_ZERO;
-            } else if (REFCOUNT <= 1) {
-                cow_op = perf::WkiPerfLocalVmemOp::COW_PROMOTE;
-            }
-
-            if (REFCOUNT <= 1) {
-                // We're the sole owner - just make it writable and clear COW
-                raw &= ~paging::PAGE_COW;
-                raw |= paging::PAGE_WRITE;
-                pte = pte_from_raw(raw);
-                owned_frame_track_private_mapping(current_task->pagemap, VADDR, OLD_PHYS, raw);
-                if (PATH_PROMOTED) {
-                    wrcr3(rdcr3());
-                } else {
-                    invlpg(VADDR);
-                }
-                record_cow_perf_event(current_task, cow_op, VADDR, REFCOUNT, COW_STARTED_US);
-                return true;
-            }
-
-            // Pin old_virt so it cannot be freed by a concurrent COW handler on
-            // another CPU between our refcount read and the memcpy below.  Without
-            // this, a racing handler could decrement the refcount to 0, freeing
-            // and zeroing the page, so our memcpy would copy zeros instead of the
-            // real content (causing e.g. RELR relocations to produce garbage VAs).
-            phys::page_ref_inc(old_virt, &cow_lookup);
-
-            bool const DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE = !OLD_IS_ZERO_PAGE;
-
-            // Multiple owners - allocate a private page. Zero-page COW depends
-            // on the default zeroing allocator. Non-zero COW can use the narrow
-            // full-overwrite helper because old_virt is pinned, memcpy writes
-            // the whole page, and the PTE is not updated until after the copy
-            // and racing-COW recheck below.
-            void* new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);
-            if (new_page == nullptr) {
-                phys::page_ref_dec(old_virt, &cow_lookup);  // release pin
-                log::error("COW fault: OOM allocating new page for vaddr 0x%x", VADDR);
-                hcf();
-                return false;
-            }
-
-            if (DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE) {
-                std::memcpy(new_page, old_virt, paging::PAGE_SIZE);  // safe: old page is pinned
-            }
-
-            // Re-read the PTE: if PAGE_COW is already gone, another CPU handled
-            // this fault while we were copying.  Discard our copy; the other
-            // handler's mapping is already live.
-            uint64_t const RAW_NOW = pte_raw(pte);
-            if ((RAW_NOW & paging::PAGE_COW) == 0U) {
-                phys::page_ref_dec(new_page);               // discard unused allocation
-                phys::page_ref_dec(old_virt, &cow_lookup);  // release pin only (PTE ref transferred by the other handler)
-                if (PATH_PROMOTED) {
-                    wrcr3(rdcr3());
-                }
-                record_cow_perf_event(current_task, cow_op, VADDR, REFCOUNT, COW_STARTED_US);
-                return true;
-            }
-
-            // Map new page as writable, clear COW
-            auto new_phys = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(new_page)));
-            raw &= ~paging::PAGE_COW;
-            raw |= paging::PAGE_WRITE;
-            // Replace frame bits
-            raw &= ~(0xFFFFFFFFFFULL << 12);  // clear frame field
-            raw |= (new_phys & ~0xFFFULL);    // set new frame
-            pte = pte_from_raw(raw);
-            owned_frame_track_fresh_normal_mapping(current_task->pagemap, VADDR, new_phys, raw);
-            if (PATH_PROMOTED) {
-                wrcr3(rdcr3());
-            } else {
-                invlpg(VADDR);
-            }
-
-            // Release pin and our PTE reference to old_virt (two decrements).
-            phys::page_ref_dec(old_virt, &cow_lookup);  // release pin (paired with pageRefInc above)
-            phys::page_ref_dec(old_virt, &cow_lookup);  // release PTE reference (old_virt no longer mapped here)
-            record_cow_perf_event(current_task, cow_op, VADDR, REFCOUNT, COW_STARTED_US);
+        if (resolve_user_write_mapping(current_task, control_register) == UserWriteFaultStatus::HANDLED) {
             return true;
         }
     }
 
-not_cow:
     // Not a COW fault - let the caller handle it (userspace crash / kernel panic).
     return false;
 }

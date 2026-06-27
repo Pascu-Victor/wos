@@ -244,7 +244,11 @@ def test_selfhost_runner_keeps_remote_and_scratch_handling_guarded() -> None:
         source,
         [
             "shell_quote()",
-            'remote_command="env"',
+            'remote_env="env"',
+            'remote_command="payload=\\${TMPDIR:-/tmp}/wos-selfhost-build.\\$\\$.sh"',
+            'remote_command+="; cat > \\"\\$payload\\" || exit \\$?"',
+            'remote_command+="; $remote_env bash \\"\\$payload\\""',
+            'remote_command+="; rm -f \\"\\$payload\\""',
             'selfhost_payload | "$WOS_SSH" "$host" "$remote_command"',
             "/tmp|/tmp/|/var/tmp|/var/tmp/)",
             "/root/wos-selfhost-*|/home/*/wos-selfhost-*)",

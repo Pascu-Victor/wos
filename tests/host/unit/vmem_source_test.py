@@ -169,10 +169,78 @@ def test_owned_frame_tracking_is_disabled_off_the_fault_path() -> None:
     )
 
 
+def test_cow_write_resolution_serializes_pte_reference_consumption() -> None:
+    source = VIRT_CPP.read_text()
+    resolver_body = function_body(source, "resolve_user_write_mapping")
+    ensure_body = function_body(source, "ensure_user_page_writable_for_task")
+    fault_body = function_body(source, "pagefault_handler")
+
+    require_tokens(
+        source,
+        [
+            "sys::Spinlock cow_pte_lock;",
+            "enum class UserWriteFaultStatus",
+            "auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserWriteFaultStatus",
+        ],
+        "COW write resolver surface",
+    )
+    require_tokens(
+        resolver_body,
+        [
+            "cow_pte_lock.lock_irqsave()",
+            "phys::page_ref_inc(old_virt, &cow_lookup);",
+            "void* new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);",
+            "CURRENT_PHYS == old_phys",
+            "installed_private_page = true;",
+            "phys::page_ref_dec(old_virt, &cow_lookup);\n    phys::page_ref_dec(old_virt, &cow_lookup);",
+        ],
+        "COW resolver locking and refcount protocol",
+    )
+    require_order(
+        resolver_body,
+        "phys::page_ref_inc(old_virt, &cow_lookup);",
+        "bool const DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE = !old_is_zero_page;",
+        "COW resolver must pin the old frame before allocating outside the PTE lock",
+    )
+    require_order(
+        resolver_body,
+        "void* new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);",
+        "CURRENT_PHYS == old_phys",
+        "COW resolver must allocate/copy before the locked same-frame commit check",
+    )
+    require_order(
+        resolver_body,
+        "CURRENT_PHYS == old_phys",
+        "pte = pte_from_raw(raw_now);",
+        "COW resolver must recheck the old frame before consuming the PTE reference",
+    )
+    if source.count("alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE)") != 1:
+        fail("COW destination allocation must be centralized in resolve_user_write_mapping")
+
+    require_tokens(
+        ensure_body,
+        [
+            "switch (resolve_user_write_mapping(task, vaddr))",
+            "case UserWriteFaultStatus::NEED_LAZY_BACKING:",
+            "handle_lazy_vmem_fault(task, vaddr, WRITE_FAULT)",
+        ],
+        "syscall copy COW path must share the serialized resolver",
+    )
+    require_tokens(
+        fault_body,
+        [
+            "resolve_user_write_mapping(current_task, control_register) == UserWriteFaultStatus::HANDLED",
+            "return true;",
+        ],
+        "page fault COW path must share the serialized resolver",
+    )
+
+
 def main() -> None:
     test_nonfixed_mmap_address_selection_is_reserved_before_mapping()
     test_owned_frame_tracking_is_disabled_off_the_fault_path()
-    print("vmem mmap and owned-frame invariants hold")
+    test_cow_write_resolution_serializes_pte_reference_consumption()
+    print("vmem mmap, owned-frame, and COW invariants hold")
 
 
 if __name__ == "__main__":

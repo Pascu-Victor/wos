@@ -490,6 +490,10 @@ inline auto job_control_stop_status(const task::Task& task) -> int32_t {
     return static_cast<int32_t>((SIGNAL << 8U) | STOP_STATUS_LOW);
 }
 
+inline auto active_waitpid_unwaited_child(task::Task* child, void* raw_waiter) -> bool;
+inline auto active_waitpid_waitable_exit_child(task::Task* child, void* raw_waiter) -> bool;
+inline auto active_waitpid_job_stop_child(task::Task* child, void* raw_waiter) -> bool;
+
 inline auto waitpid_job_stop_waitable(const task::Task* waiter, const task::Task* target) -> bool {
     return waiter != nullptr && target != nullptr && (waiter->wait_options & WOS_WSTOPPED) != 0 && target->parent_pid == waiter->pid &&
            !target->is_thread && !target->has_exited && target->jobctl_stopped.load(std::memory_order_acquire) &&
@@ -526,12 +530,10 @@ inline auto waitpid_has_job_stop_ready(task::Task* waiter) -> bool {
         return waitpid_job_stop_waitable(waiter, target);
     }
 
-    uint32_t const COUNT = get_active_task_count();
-    for (uint32_t i = 0; i < COUNT; i++) {
-        auto* child = get_active_task_at(i);
-        if (waitpid_job_stop_waitable(waiter, child)) {
-            return true;
-        }
+    auto* child = find_active_task_lifetime_ref_if(active_waitpid_job_stop_child, waiter);
+    if (child != nullptr) {
+        child->release();
+        return true;
     }
     return false;
 }
@@ -563,6 +565,19 @@ inline auto waitpid_child_is_waitable_exit(const task::Task* child) -> bool {
     bool const EXIT_READY = child->exit_notify_ready.load(std::memory_order_acquire);
     task::TaskState const STATE = child->state.load(std::memory_order_acquire);
     return EXIT_READY || STATE == task::TaskState::DEAD;
+}
+
+inline auto active_waitpid_unwaited_child(task::Task* child, void* raw_waiter) -> bool {
+    return waitpid_child_is_unwaited(static_cast<task::Task*>(raw_waiter), child);
+}
+
+inline auto active_waitpid_waitable_exit_child(task::Task* child, void* raw_waiter) -> bool {
+    auto* waiter = static_cast<task::Task*>(raw_waiter);
+    return waitpid_child_is_unwaited(waiter, child) && waitpid_child_is_waitable_exit(child);
+}
+
+inline auto active_waitpid_job_stop_child(task::Task* child, void* raw_waiter) -> bool {
+    return waitpid_job_stop_waitable(static_cast<task::Task*>(raw_waiter), child);
 }
 
 inline auto registered_waitpid_matches_child(const task::Task* waiter, const task::Task* child) -> bool {
@@ -690,17 +705,10 @@ inline auto waitpid_has_unwaited_child_for_scheduler(task::Task* waiter) -> bool
         return false;
     }
 
-    uint32_t const ACTIVE_COUNT = get_active_task_count();
-    for (uint32_t i = 0; i < ACTIVE_COUNT; ++i) {
-        auto* child = get_active_task_at_safe(i);
-        if (child == nullptr) {
-            continue;
-        }
-        bool const MATCH = waitpid_child_is_unwaited(waiter, child);
-        child->release();
-        if (MATCH) {
-            return true;
-        }
+    auto* active_child = find_active_task_lifetime_ref_if(active_waitpid_unwaited_child, waiter);
+    if (active_child != nullptr) {
+        active_child->release();
+        return true;
     }
 
     uint64_t const CORE_COUNT = smt::get_core_count();
@@ -722,11 +730,10 @@ inline auto waitpid_has_unwaited_child_for_scheduler(task::Task* waiter) -> bool
 }
 
 inline auto complete_waitpid_any_for_scheduler(task::Task* waiter) -> bool {
-    uint32_t const ACTIVE_COUNT = get_active_task_count();
-    for (uint32_t i = 0; i < ACTIVE_COUNT; ++i) {
-        auto* child = get_active_task_at_safe(i);
+    for (;;) {
+        auto* child = find_active_task_lifetime_ref_if(active_waitpid_waitable_exit_child, waiter);
         if (child == nullptr) {
-            continue;
+            break;
         }
         bool const COMPLETED = complete_waitpid_exit_for_scheduler(waiter, child, "wake-any-active");
         child->release();
@@ -851,11 +858,10 @@ inline auto complete_or_preserve_waitpid_block(task::Task* waiter) -> bool {
 
     if (waitpid_has_job_stop_ready(waiter)) {
         if (waiter->waiting_for_pid == WAIT_ANY_CHILD) {
-            uint32_t const ACTIVE_COUNT = get_active_task_count();
-            for (uint32_t i = 0; i < ACTIVE_COUNT; ++i) {
-                auto* child = get_active_task_at_safe(i);
+            for (;;) {
+                auto* child = find_active_task_lifetime_ref_if(active_waitpid_job_stop_child, waiter);
                 if (child == nullptr) {
-                    continue;
+                    break;
                 }
                 bool const COMPLETED = complete_waitpid_job_stop_if_waitable(waiter, child);
                 child->release();
@@ -1007,8 +1013,9 @@ inline uint64_t compute_bursty_preempt_guard_us(const task::Task* task) {
     return std::clamp<uint64_t>(SCALED_GUARD, SCHED_BURSTY_PREEMPT_BASE_US, SCHED_BURSTY_PREEMPT_MAX_US);
 }
 
-// Active PID tracking for fast process-group iteration (avoids scanning 16M-entry hash table)
-constexpr uint32_t MAX_ACTIVE_TASKS = 2048;
+// Active PID tracking for fast process-group and wait-any iteration (avoids scanning 16M-entry hash table).
+// Large self-host builds can keep thousands of waited zombies visible until the GC worker catches up.
+constexpr uint32_t MAX_ACTIVE_TASKS = 65536;
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 std::array<task::Task*, MAX_ACTIVE_TASKS> active_task_list = {nullptr};
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
@@ -1052,9 +1059,9 @@ inline auto pid_slot(uint32_t index) -> PidHashEntry& {
     return pid_table[static_cast<size_t>(index)];
 }
 
-void active_list_insert(task::Task* t) {
+auto active_list_insert(task::Task* t) -> bool {
     if (t == nullptr) {
-        return;
+        return false;
     }
     uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
     for (uint32_t i = 0; i < active_task_count; ++i) {
@@ -1062,13 +1069,16 @@ void active_list_insert(task::Task* t) {
         if (existing == t || (existing != nullptr && existing->pid == t->pid)) {
             active_task_slot(i) = t;
             global_task_registry_lock.unlock_irqrestore(FLAGS);
-            return;
+            return true;
         }
     }
     if (active_task_count < MAX_ACTIVE_TASKS) {
         active_task_slot(active_task_count++) = t;
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        return true;
     }
     global_task_registry_lock.unlock_irqrestore(FLAGS);
+    return false;
 }
 
 void active_list_remove(uint64_t pid) {
@@ -2110,8 +2120,17 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
     __atomic_thread_fence(__ATOMIC_RELEASE);
 
     if (task->pid > 0) {
-        pid_table_insert(task);
-        active_list_insert(task);
+        if (!pid_table_insert(task)) {
+            log_rejected_task_publication("pid registry full", cpu_no, task);
+            release_reservation_if_needed();
+            return false;
+        }
+        if (!active_list_insert(task)) {
+            pid_table_remove(task->pid);
+            log_rejected_task_publication("active registry full", cpu_no, task);
+            release_reservation_if_needed();
+            return false;
+        }
     }
 
     run_queues->with_lock_void(cpu_no, [task](RunQueue* rq) {
@@ -2555,8 +2574,13 @@ auto post_task_waiting(task::Task* task) -> bool {
     __atomic_thread_fence(__ATOMIC_RELEASE);
 
     if (NEEDS_REGISTRATION && task->pid > 0) {
-        pid_table_insert(task);
-        active_list_insert(task);
+        if (!pid_table_insert(task)) {
+            return false;
+        }
+        if (!active_list_insert(task)) {
+            pid_table_remove(task->pid);
+            return false;
+        }
     }
 
     bool parked = false;
@@ -4739,6 +4763,27 @@ auto get_active_task_at_safe(uint32_t index) -> task::Task* {
     }
     global_task_registry_lock.unlock_irqrestore(FLAGS);
     return task;
+}
+
+auto find_active_task_lifetime_ref_if(ActiveTaskPredicate predicate, void* context) -> task::Task* {
+    if (predicate == nullptr) {
+        return nullptr;
+    }
+
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    for (uint32_t i = 0; i < active_task_count; ++i) {
+        task::Task* task = active_task_slot(i);
+        if (task == nullptr || !predicate(task, context)) {
+            continue;
+        }
+        if (!task->try_acquire_lifetime_ref()) {
+            continue;
+        }
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        return task;
+    }
+    global_task_registry_lock.unlock_irqrestore(FLAGS);
+    return nullptr;
 }
 
 auto debug_find_task_by_kernel_stack(uint64_t rsp) -> task::Task* {

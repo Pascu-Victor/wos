@@ -69,6 +69,8 @@ export PATH="$HOST/bin:$PATH"
 export LD_LIBRARY_PATH="$HOST/lib"
 export NINJA_STATUS="[%f/%t %e] "
 
+wos_prefetch_meson_subprojects "$MLIBC_SRC" freestnd-c-hdrs freestnd-cxx-hdrs frigg
+
 if [ -f "$MLIBC_BUILD/build.ninja" ]; then
     # Reconfigure existing build with the requested buildtype and source list.
     meson setup --reconfigure --buildtype="$MESON_BUILDTYPE" "$MLIBC_BUILD" "$MLIBC_SRC"

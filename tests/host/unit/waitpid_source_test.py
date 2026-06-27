@@ -9,6 +9,7 @@ TASK_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.cpp"
 WAITPID_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "waitpid.cpp"
 EXIT_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "exit.cpp"
 SCHEDULER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.cpp"
+SCHEDULER_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.hpp"
 SYSCALL_ASM = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "syscall.asm"
 
 
@@ -100,9 +101,30 @@ def require_waited_on_is_atomic_claim(task_hpp: str, task_cpp: str, waitpid_cpp:
 def require_wait_any_publish_recheck(waitpid_cpp: str) -> None:
     body = function_body(waitpid_cpp, "wos_proc_waitpid")
     wait_any = braced_block_after(body, "if (pid <= 0)")
+    wnohang_branch = wait_any.find("if ((options & WOS_WNOHANG) != 0)")
     first_publish = wait_any.find("waitpid_publish_pending.store(true, std::memory_order_release)")
-    first_wait_target = wait_any.find("current_task->waiting_for_pid = WAIT_ANY_CHILD")
-    first_scan = wait_any.find("claim_exited_child(current_task)")
+    if wnohang_branch < 0 or first_publish < 0 or wnohang_branch > first_publish:
+        fail("wait-any WNOHANG path must run before publishing blocking wait state")
+
+    wnohang = braced_block_after(wait_any, "if ((options & WOS_WNOHANG) != 0)")
+    for snippet in [
+        "claim_exited_child(current_task)",
+        "consume_stopped_child(current_task, status, options)",
+        "has_unwaited_child(current_task)",
+        "return 0",
+    ]:
+        if snippet not in wnohang:
+            fail(f"wait-any WNOHANG path is missing nonblocking scan snippet: {snippet}")
+    for forbidden in [
+        "waitpid_publish_pending.store(true, std::memory_order_release)",
+        "current_task->waiting_for_pid = WAIT_ANY_CHILD",
+        "current_task->deferred_task_switch = true",
+    ]:
+        if forbidden in wnohang:
+            fail(f"wait-any WNOHANG path must not publish a wait target: {forbidden}")
+
+    first_wait_target = wait_any.find("current_task->waiting_for_pid = WAIT_ANY_CHILD", first_publish)
+    first_scan = wait_any.find("claim_exited_child(current_task)", first_publish)
     if first_publish < 0 or first_wait_target < 0 or first_scan < 0:
         fail("wait-any path is missing publish fence, wait target, or exited-child scan")
     if not (first_publish < first_wait_target < first_scan):
@@ -114,7 +136,7 @@ def require_wait_any_publish_recheck(waitpid_cpp: str) -> None:
         fail("wait-any path is missing the post-publication exit recheck")
     if deferred > second_scan:
         fail("wait-any post-publication recheck must run after deferred_task_switch is set")
-    if wait_any.count("clear_waitpid_publish_pending(current_task)") < 4:
+    if wait_any.count("clear_waitpid_publish_pending(current_task)") < 3:
         fail("wait-any immediate-return paths must clear the publish fence")
 
 
@@ -252,11 +274,49 @@ def require_exit_waiter_notify_drains_all_batches(exit_cpp: str) -> None:
         fail("exit waitpid notifier must not stop after one fixed-size snapshot")
 
 
+def require_waitpid_uses_stable_active_scans(scheduler_hpp: str, scheduler_cpp: str, waitpid_cpp: str) -> None:
+    for snippet in [
+        "using ActiveTaskPredicate = bool (*)(task::Task* task, void* context)",
+        "find_active_task_lifetime_ref_if(ActiveTaskPredicate predicate, void* context)",
+    ]:
+        if snippet not in scheduler_hpp:
+            fail(f"scheduler must expose stable active-task scan API for waitpid: {snippet}")
+
+    for snippet in [
+        "constexpr uint32_t MAX_ACTIVE_TASKS = 65536",
+        "auto active_list_insert(task::Task* t) -> bool",
+        "log_rejected_task_publication(\"active registry full\", cpu_no, task)",
+        "pid_table_remove(task->pid)",
+        "find_active_task_lifetime_ref_if(ActiveTaskPredicate predicate, void* context)",
+    ]:
+        if snippet not in scheduler_cpp:
+            fail(f"scheduler must not silently publish PID-only tasks: {snippet}")
+
+    for snippet in [
+        "find_active_task_lifetime_ref_if(active_waitable_unwaited_child, &ctx)",
+        "find_active_task_lifetime_ref_if(active_waitable_specific_child, &ctx)",
+        "find_active_task_lifetime_ref_if(active_unwaited_child, &ctx)",
+        "return {.task = child, .release_ref = true}",
+    ]:
+        if snippet not in waitpid_cpp:
+            fail(f"waitpid syscall active scans must use lifetime-ref stable scans: {snippet}")
+
+    scheduler_required = [
+        "find_active_task_lifetime_ref_if(active_waitpid_waitable_exit_child, waiter)",
+        "find_active_task_lifetime_ref_if(active_waitpid_unwaited_child, waiter)",
+        "find_active_task_lifetime_ref_if(active_waitpid_job_stop_child, waiter)",
+    ]
+    for snippet in scheduler_required:
+        if snippet not in scheduler_cpp:
+            fail(f"scheduler waitpid repair must use stable active scans: {snippet}")
+
+
 def main() -> None:
     task_hpp = TASK_HPP.read_text()
     task_cpp = TASK_CPP.read_text()
     exit_cpp = EXIT_CPP.read_text()
     scheduler_cpp = SCHEDULER_CPP.read_text()
+    scheduler_hpp = SCHEDULER_HPP.read_text()
     require_task_has_publish_fence(task_hpp, task_cpp)
     waitpid_cpp = WAITPID_CPP.read_text()
     syscall_asm = SYSCALL_ASM.read_text()
@@ -268,6 +328,7 @@ def main() -> None:
     require_interrupted_waitpid_cleans_stale_wait_state(task_hpp, task_cpp, scheduler_cpp, exit_cpp)
     require_exit_completion_respects_publish_fence(exit_cpp)
     require_exit_waiter_notify_drains_all_batches(exit_cpp)
+    require_waitpid_uses_stable_active_scans(scheduler_hpp, scheduler_cpp, waitpid_cpp)
     print("waitpid publish/exit notification source invariants hold")
 
 

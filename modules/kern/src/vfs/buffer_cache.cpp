@@ -249,7 +249,8 @@ constexpr size_t DIRTY_WRITEBACK_YIELD_BYTES = size_t{16} * 1024 * 1024;
 constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = DIRTY_WRITEBACK_BUDGET;
 constexpr size_t DIRTY_HARD_FALLBACK_BYTES = DIRTY_WRITEBACK_YIELD_BYTES;
 constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BUFFERS = 1024;
-constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BYTES = size_t{16} * 1024 * 1024;
+constexpr size_t BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES = size_t{2} * 1024 * 1024;
+constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BYTES = BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES;
 constexpr size_t DIRTY_WAKE_BATCH = 32;
 constexpr size_t DIRTY_COPY_COVERAGE_MAX_INTERVALS = 64;
 constexpr uint64_t DIRTY_THROTTLE_PARK_TIMEOUT_US = uint64_t{10} * 1000;
@@ -257,10 +258,11 @@ constexpr size_t DIRTY_TARGET_DIVISOR = 2;
 constexpr size_t DIRTY_THROTTLE_RESUME_NUMERATOR = 3;
 constexpr size_t DIRTY_THROTTLE_RESUME_DENOMINATOR = 4;
 // Let clean cache grow beyond dirty limits, closer to Linux's page cache shape,
-// while keeping dirty throttling at roughly 10%/20% of RAM.
-constexpr size_t BUFFER_CACHE_MEMORY_DIVISOR = 2;
-constexpr size_t DIRTY_TARGET_MEMORY_DIVISOR = 10;
-constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{4} * 1024 * 1024 * 1024;
+// while keeping dirty throttling below the point where WOS's non-reclaimable
+// kernel allocations lose large contiguous ranges under file-heavy workloads.
+constexpr size_t BUFFER_CACHE_MEMORY_DIVISOR = 4;
+constexpr size_t DIRTY_TARGET_MEMORY_DIVISOR = 20;
+constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{1} * 1024 * 1024 * 1024;
 
 struct DirtyBdevState {
     dev::BlockDevice* bdev{};
@@ -331,8 +333,9 @@ auto dirty_coverage_complete(const std::array<DirtyCoverageInterval, DIRTY_COPY_
                              uint64_t block_no, size_t count) -> bool;
 void dirty_writeback_worker(void* unused);
 ker::mod::sched::WorkItem dirty_writeback_work{.fn = dirty_writeback_worker, .arg = nullptr, .next = nullptr};
-constexpr size_t HOT_EVICT_SCAN_BUDGET = 512;
-constexpr size_t HOT_EVICT_MAX_VICTIMS = 64;
+constexpr size_t HOT_EVICT_SCAN_BUDGET = 8192;
+constexpr size_t HOT_EVICT_MAX_VICTIMS = 4096;
+constexpr size_t HOT_EVICT_MAX_BYTES = size_t{16} * 1024 * 1024;
 
 struct WritebackSnapshot {
     uint8_t* data = nullptr;
@@ -382,6 +385,9 @@ void perf_record_xfs_count(ker::mod::perf::WkiPerfLocalXfsOp op, uint64_t bytes 
 
 auto allocate_buffer_data(size_t size, uint32_t& flags) -> uint8_t* {
     flags &= ~BH_DATA_PAGE_ALLOC;
+    if (size > BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES) {
+        return nullptr;
+    }
     if (size >= ker::mod::mm::paging::PAGE_SIZE && (size % ker::mod::mm::paging::PAGE_SIZE) == 0) {
         auto* page_data = ker::mod::mm::phys::page_alloc(size, "buffer_cache");
         if (page_data == nullptr) {
@@ -475,7 +481,10 @@ auto choose_dirty_hard_limit_bytes(size_t target_bytes, size_t max_bytes) -> siz
     if (max_bytes == 0) {
         return max_bytes;
     }
-    return max_bytes;
+    if (target_bytes > max_bytes / 2) {
+        return max_bytes;
+    }
+    return std::min(max_bytes, target_bytes * 2);
 }
 
 // Free a buffer's resources completely (removes from hash + LRU).
@@ -515,7 +524,7 @@ auto buffer_tree_priority(const BufHead* bh) -> uint64_t {
     return bh->tree_priority != 0 ? bh->tree_priority : buffer_tree_priority_for(bh);
 }
 
-auto find_reclaimable_lru_buffer(size_t scan_budget = SIZE_MAX) -> BufHead* {
+auto find_reclaimable_lru_buffer(size_t scan_budget = SIZE_MAX, bool honor_second_chance = true) -> BufHead* {
     size_t scanned = 0;
     for (BufHead* cur = lru_tail(); cur != nullptr && cur != &lru_sentinel;) {
         if (scanned++ >= scan_budget) {
@@ -523,7 +532,7 @@ auto find_reclaimable_lru_buffer(size_t scan_budget = SIZE_MAX) -> BufHead* {
         }
         BufHead* prev = cur->lru_prev;
         if (is_reclaimable_clean_buffer(cur)) {  // NOLINT(clang-analyzer-cplusplus.NewDelete): victims are unlinked before delete.
-            if ((cur->flags & BH_LRU_REFERENCED) != 0) {
+            if (honor_second_chance && (cur->flags & BH_LRU_REFERENCED) != 0) {
                 lru_second_chance(cur);
                 cur = prev;
                 continue;
@@ -545,29 +554,43 @@ auto cache_allocation_would_exceed_limit_locked(size_t incoming_bytes) -> bool {
     return cache_total_bytes > cache_max_bytes - incoming_bytes;
 }
 
-// Keep cache misses from paying down all historical clean-cache debt. A cold
-// miss only reclaims roughly the buffer it is about to add; broader reclaim is
-// handled by explicit reclaim/sync paths.
+auto reclaim_clean_cache_locked(size_t target_bytes, size_t byte_budget, size_t victim_budget, size_t scan_budget, bool honor_second_chance)
+    -> BufferCacheReclaimStats {
+    BufferCacheReclaimStats stats{};
+    stats.before_bytes = cache_total_bytes;
+    while (cache_total_bytes > target_bytes && stats.freed_bytes < byte_budget && stats.freed_buffers < victim_budget) {
+        BufHead* victim = find_reclaimable_lru_buffer(scan_budget, honor_second_chance);
+        if (victim == nullptr) {
+            break;
+        }
+        stats.freed_buffers++;
+        stats.freed_bytes += victim->size;
+        free_buffer(victim);
+    }
+    stats.after_bytes = cache_total_bytes;
+    return stats;
+}
+
+void reclaim_clean_cache_over_limit_locked() {
+    if (cache_total_bytes <= cache_max_bytes) {
+        return;
+    }
+    static_cast<void>(
+        reclaim_clean_cache_locked(cache_max_bytes, HOT_EVICT_MAX_BYTES, HOT_EVICT_MAX_VICTIMS, HOT_EVICT_SCAN_BUDGET, false));
+}
+
+// Cache misses must keep the logical cache close to its cap. WOS does not yet
+// have Linux-style global page-cache reclaim, so leaving old clean-cache debt
+// resident can starve later contiguous kernel allocations and slow tree scans.
 void evict_lru_for_allocation(size_t incoming_bytes) {
     if (!cache_allocation_would_exceed_limit_locked(incoming_bytes)) {
         return;
     }
 
-    size_t victims = 0;
-    size_t reclaimed_bytes = 0;
-    while (cache_allocation_would_exceed_limit_locked(incoming_bytes) && reclaimed_bytes < incoming_bytes &&
-           victims < HOT_EVICT_MAX_VICTIMS) {
-        // This runs under cache_lock in the buffer allocation hot path. When
-        // the cache is dirty-heavy, an exhaustive clean-victim search can turn
-        // every miss into a full LRU walk.
-        BufHead* victim = find_reclaimable_lru_buffer(HOT_EVICT_SCAN_BUDGET);
-        if (victim == nullptr) {
-            break;  // No clean victim found within the hot-path scan budget.
-        }
-        reclaimed_bytes += victim->size;
-        free_buffer(victim);
-        victims++;
-    }
+    size_t const TARGET_BYTES = incoming_bytes >= cache_max_bytes ? 0 : cache_max_bytes - incoming_bytes;
+    size_t const OVERAGE = cache_total_bytes > TARGET_BYTES ? cache_total_bytes - TARGET_BYTES : 0;
+    size_t const BYTE_BUDGET = std::clamp(OVERAGE, incoming_bytes, HOT_EVICT_MAX_BYTES);
+    static_cast<void>(reclaim_clean_cache_locked(TARGET_BYTES, BYTE_BUDGET, HOT_EVICT_MAX_VICTIMS, HOT_EVICT_SCAN_BUDGET, false));
 }
 
 auto alloc_detached_buffer_with_size(dev::BlockDevice* bdev, uint64_t block_no, size_t size, uint32_t initial_flags) -> BufHead* {
@@ -1949,6 +1972,11 @@ auto writeback_dirty_one_after(const DirtyWritebackFilter& filter, uint64_t min_
     for (size_t i = 0; i < run.count; ++i) {
         brelse(run.buffers.at(i));
     }
+    if (result.status == 0) {
+        uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+        reclaim_clean_cache_over_limit_locked();
+        cache_lock.unlock_irqrestore(IRQFLAGS);
+    }
     return result;
 }
 
@@ -2975,17 +3003,7 @@ auto reclaim_clean_buffer_cache(size_t target_bytes) -> BufferCacheReclaimStats 
     }
 
     uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
-    stats.before_bytes = cache_total_bytes;
-    while (cache_total_bytes > target_bytes) {
-        BufHead* victim = find_reclaimable_lru_buffer();
-        if (victim == nullptr) {
-            break;
-        }
-        stats.freed_buffers++;
-        stats.freed_bytes += victim->size;
-        free_buffer(victim);
-    }
-    stats.after_bytes = cache_total_bytes;
+    stats = reclaim_clean_cache_locked(target_bytes, SIZE_MAX, SIZE_MAX, SIZE_MAX, false);
     cache_lock.unlock_irqrestore(IRQFLAGS);
     return stats;
 }

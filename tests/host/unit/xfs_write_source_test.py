@@ -43,6 +43,16 @@ def main() -> None:
         fail("could not isolate full-block read overlay handling")
     read_overlay_body = source[read_overlay_start:read_overlay_end]
 
+    require(
+        source,
+        "constexpr size_t XFS_BUFFERED_WRITE_BATCH_MAX_BYTES = size_t{2} * 1024 * 1024;",
+        "XFS buffered writes must stay under the buffer-cache contiguous allocation cap",
+    )
+    require(
+        source,
+        "constexpr size_t XFS_DIRTY_THROTTLE_INTERVAL_BYTES = XFS_BUFFERED_WRITE_BATCH_MAX_BYTES;",
+        "dirty throttling must run once per buffered write batch",
+    )
     require_absent(write_body, "dev::block_write(", "regular file write extent path")
     require_absent(write_body, "discard_bdev_range(", "regular file write extent path")
     require_absent(write_body, "xfs_direct_write_full_blocks", "regular file write extent path")

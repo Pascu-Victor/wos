@@ -294,6 +294,8 @@ export CFLAGS="--sysroot=$SYSROOT -std=c23 -fno-sanitize=safe-stack "
 export CXXFLAGS="--sysroot=$SYSROOT -std=c++23 -fno-sanitize=safe-stack "
 export LDFLAGS="--sysroot=$SYSROOT"
 
+wos_prefetch_meson_subprojects "$B/src/mlibc" freestnd-c-hdrs freestnd-cxx-hdrs frigg
+
 mkdir -p $B/mlibc-build
 meson_setup_rerunnable "$B/mlibc-build" --prefix=$SYSROOT \
   --sysconfdir=etc \

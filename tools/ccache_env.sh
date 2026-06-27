@@ -129,6 +129,123 @@ wos_refresh_file_mtime() {
     mv "$tmp" "$file"
 }
 
+wos_prefetch_meson_subprojects() {
+    local source_dir="$1"
+    shift
+
+    local attempts="${WOS_MESON_SUBPROJECT_FETCH_RETRIES:-3}"
+    local delay="${WOS_MESON_SUBPROJECT_FETCH_RETRY_DELAY:-5}"
+    case "$attempts" in
+        ''|*[!0-9]*|0)
+            echo "ERROR: WOS_MESON_SUBPROJECT_FETCH_RETRIES must be a positive integer, got '$attempts'" >&2
+            return 1
+            ;;
+    esac
+    case "$delay" in
+        ''|*[!0-9]*)
+            echo "ERROR: WOS_MESON_SUBPROJECT_FETCH_RETRY_DELAY must be a non-negative integer, got '$delay'" >&2
+            return 1
+            ;;
+    esac
+
+    local subproject
+    local attempt
+    for subproject in "$@"; do
+        attempt=1
+        while true; do
+            if wos_fetch_meson_git_subproject "$source_dir" "$subproject"; then
+                break
+            fi
+            if [ "$attempt" -ge "$attempts" ]; then
+                echo "ERROR: failed to fetch Meson subproject '$subproject' after $attempts attempts" >&2
+                return 1
+            fi
+            echo "Retrying Meson subproject '$subproject' after failed attempt $attempt/$attempts..."
+            wos_remove_tree "$source_dir/subprojects/$subproject"
+            attempt=$((attempt + 1))
+            if [ "$delay" -gt 0 ]; then
+                sleep "$delay"
+            fi
+        done
+    done
+}
+
+wos_wrap_value() {
+    local wrap="$1"
+    local key="$2"
+
+    sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*//p" "$wrap" | sed -n '1p'
+}
+
+wos_fetch_meson_git_subproject() {
+    local source_dir="$1"
+    local subproject="$2"
+    local wrap="$source_dir/subprojects/$subproject.wrap"
+    local dest="$source_dir/subprojects/$subproject"
+    local url
+    local revision
+    local patch_directory
+    local package_dir
+    local current
+    local low_speed_limit="${WOS_GIT_HTTP_LOW_SPEED_LIMIT:-1}"
+    local low_speed_time="${WOS_GIT_HTTP_LOW_SPEED_TIME:-60}"
+
+    if [ ! -f "$wrap" ]; then
+        echo "ERROR: missing Meson wrap file: $wrap" >&2
+        return 1
+    fi
+
+    url="$(wos_wrap_value "$wrap" url)"
+    revision="$(wos_wrap_value "$wrap" revision)"
+    patch_directory="$(wos_wrap_value "$wrap" patch_directory)"
+    if [ -z "$url" ] || [ -z "$revision" ]; then
+        echo "ERROR: Meson wrap '$wrap' must provide url and revision" >&2
+        return 1
+    fi
+    case "$low_speed_limit" in
+        ''|*[!0-9]*)
+            echo "ERROR: WOS_GIT_HTTP_LOW_SPEED_LIMIT must be a non-negative integer, got '$low_speed_limit'" >&2
+            return 1
+            ;;
+    esac
+    case "$low_speed_time" in
+        ''|*[!0-9]*|0)
+            echo "ERROR: WOS_GIT_HTTP_LOW_SPEED_TIME must be a positive integer, got '$low_speed_time'" >&2
+            return 1
+            ;;
+    esac
+
+    if [ -d "$dest/.git" ]; then
+        current="$(git -C "$dest" rev-parse HEAD 2>/dev/null || true)"
+        if [ "$current" = "$revision" ]; then
+            if [ -n "$patch_directory" ]; then
+                package_dir="$source_dir/subprojects/packagefiles/$patch_directory"
+                if [ -d "$package_dir" ]; then
+                    wos_copy_tree_entries_excluding "$package_dir" "$dest"
+                fi
+            fi
+            return 0
+        fi
+    fi
+
+    wos_remove_tree "$dest"
+    git init "$dest"
+    git -C "$dest" remote add origin "$url"
+    GIT_HTTP_LOW_SPEED_LIMIT="$low_speed_limit" \
+        GIT_HTTP_LOW_SPEED_TIME="$low_speed_time" \
+        git -C "$dest" fetch --depth 1 origin "$revision"
+    git -C "$dest" checkout --detach FETCH_HEAD
+
+    if [ -n "$patch_directory" ]; then
+        package_dir="$source_dir/subprojects/packagefiles/$patch_directory"
+        if [ ! -d "$package_dir" ]; then
+            echo "ERROR: missing Meson packagefiles directory: $package_dir" >&2
+            return 1
+        fi
+        wos_copy_tree_entries_excluding "$package_dir" "$dest"
+    fi
+}
+
 wos_ccache_prefix() {
     if [ -n "${WOS_CCACHE:-}" ]; then
         printf '%s ' "$WOS_CCACHE"
