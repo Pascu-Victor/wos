@@ -13,6 +13,8 @@ if [ -z "${CCACHE_DIR:-}" ]; then
 fi
 wos_setup_ccache
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
+WOS_BUILD_JOBS="$(wos_build_jobs)"
+WOS_MAKE_JOBS="$(wos_make_jobs)"
 
 B="$WORKSPACE_ROOT/toolchain"
 HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
@@ -73,9 +75,10 @@ download_bash_source() {
     fi
 
     echo "$BASH_TARBALL_SHA256  $archive" | sha256sum -c - >&2
-    rm -rf "$tmp_dest" "$dest"
+    wos_remove_tree "$tmp_dest"
+    wos_remove_tree "$dest"
     mkdir -p "$tmp_dest"
-    tar -xzf "$archive" -C "$tmp_dest" --strip-components=1
+    tar -xzf "$archive" -C "$tmp_dest" --strip-components 1
     mv "$tmp_dest" "$dest"
 }
 
@@ -92,7 +95,7 @@ resolve_bash_source() {
         return 0
     fi
 
-    if [ -d "$BASH_SRC" ] && [ -n "$(find "$BASH_SRC" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    if [ -d "$BASH_SRC" ] && wos_dir_has_entries "$BASH_SRC"; then
         echo "ERROR: Bash source at $BASH_SRC does not contain configure." >&2
         echo "Use a Bash release tree or clear the directory so the release tarball can be downloaded." >&2
         exit 1
@@ -105,15 +108,9 @@ resolve_bash_source() {
 copy_source_to_workdir() {
     local source_dir="$1"
 
-    rm -rf "$BASH_WORK"
+    wos_remove_tree "$BASH_WORK"
     mkdir -p "$BASH_WORK"
-    (
-        cd "$source_dir"
-        tar --exclude='./.git' --exclude='./.github' -cf - .
-    ) | (
-        cd "$BASH_WORK"
-        tar -xf -
-    )
+    wos_copy_tree_entries_excluding "$source_dir" "$BASH_WORK" ".git" ".github"
 }
 
 patch_config_sub_for_wos() {
@@ -245,7 +242,7 @@ if [ -f "$BASH_WORK/bash" ]; then
     done
 fi
 
-make -C "$BASH_WORK" -j"$(nproc)" bash bashbug
+make -C "$BASH_WORK" -j"$WOS_MAKE_JOBS" bash bashbug
 
 # Upstream install also builds optional example loadable builtins. WOS only
 # stages the runtime shell, so install the required outputs directly.

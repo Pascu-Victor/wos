@@ -19,6 +19,54 @@ Do not add new public scripts at the top level of this directory. Add the
 implementation under the appropriate category and expose it with a `bin/`
 symlink only if it is meant to be part of the user-facing command surface.
 
+## WOS self-host build benchmark
+
+`scripts/bench/run_wos_selfhost_build.sh` runs the clone/submodule/bootstrap/
+configure/build flow either inside an already-launched WOS VM or on Linux. It
+defaults to cloning `https://github.com/Pascu-Victor/wos.git`, building the
+`wos_full` target with Qt/wosdbg disabled, and writing
+`selfhost-report.tsv`. It also writes `selfhost-detail.tsv` for the current
+run and appends the same detailed rows to `<workdir>-history.tsv` by default.
+Those detailed rows include root WOS repository fetch time, per-submodule
+update time, configure time, build time, mode, commit, target, job count, and
+shallow/full-history mode. Use `--history-file <path>` to put the append-only
+history somewhere else. The intent is to see whether self-hosting changes move
+the whole clone/build process in the right direction instead of only improving
+one local step.
+
+WOS mode defaults to `/root/wos-selfhost-bench` so the checkout and build land
+on the XFS rootfs rather than `/tmp` tmpfs. The default clone is shallow
+because the benchmark needs current source and submodule contents to build, not
+full Git history.
+
+Rootless WOS launches can reuse an existing topology with either:
+
+```sh
+bin/wos-cluster --launch --no-setup
+bin/wos-ktest --no-setup
+```
+
+Then collect comparable reports:
+
+```sh
+scripts/bench/run_wos_selfhost_build.sh wos --host wos-0 --jobs "$(nproc)"
+scripts/bench/run_wos_selfhost_build.sh linux --workdir /tmp/wos-selfhost-linux --jobs "$(nproc)"
+```
+
+When running the script from an existing WOS shell, use `wos-local`; this is
+the same WOS benchmark payload without the outer SSH hop.
+
+Pass `--full-history` to measure a full-history recursive clone instead.
+
+Compare clone/build/total timing with:
+
+```sh
+scripts/bench/compare_wos_selfhost_reports.py \
+  --wos /root/wos-selfhost-bench/selfhost-report.tsv \
+  --linux /tmp/wos-selfhost-linux/selfhost-report.tsv \
+  --json-output benchmarks/results/wos-selfhost-comparison.json
+```
+
 ## Cross-OS host KVM tracing
 
 `scripts/bench/run_cross_os_benchmark_suite.py` can optionally wrap each

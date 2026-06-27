@@ -25,8 +25,9 @@ if((DEFINED ENV{WOS_NATIVE_HOST} AND "$ENV{WOS_NATIVE_HOST}" STREQUAL "1") OR CM
 endif()
 
 set(WOS_PORT_BUILD_DEFAULT ON)
+set(WOS_BUILD_CMAKE_FOR_HOST_DEFAULT ${WOS_PORT_BUILD_DEFAULT})
 if(WOS_NATIVE_SYSTEM_BUILD)
-    set(WOS_PORT_BUILD_DEFAULT OFF)
+    set(WOS_BUILD_CMAKE_FOR_HOST_DEFAULT OFF)
 endif()
 
 set(WOS_BUILD_WOSDBG_DEFAULT ON)
@@ -109,13 +110,13 @@ set(WOS_ROOTFS_DISK "${CMAKE_SOURCE_DIR}/mountfs.qcow2" CACHE FILEPATH "WOS root
 option(WOS_SKIP_LIBCXX_INSTALL "Skip the libc++ install target; useful when an isolated sysroot is pre-seeded" OFF)
 option(WOS_BUILD_CLANG_FOR_WOS "Build a native WOS clang/lld toolchain and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_NINJA_FOR_WOS "Build a native WOS Ninja and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
-option(WOS_BUILD_CMAKE_FOR_HOST "Build host-side CMake from the WOS fork and install it into toolchain/host" ${WOS_PORT_BUILD_DEFAULT})
+option(WOS_BUILD_CMAKE_FOR_HOST "Build host-side CMake from the WOS fork and install it into toolchain/host" ${WOS_BUILD_CMAKE_FOR_HOST_DEFAULT})
 option(WOS_BUILD_CMAKE_FOR_WOS "Build native WOS CMake tools and stage them into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_PYTHON_FOR_WOS "Build native WOS Python and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_MESON_FOR_WOS "Stage native WOS Meson into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_NASM_FOR_WOS "Build native WOS NASM and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_BASH_FOR_WOS "Build native WOS Bash and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
-option(WOS_BUILD_OPENSSL_FOR_WOS "Build static WOS OpenSSL libraries for curl and HTTPS-capable ports" ${WOS_PORT_BUILD_DEFAULT})
+option(WOS_BUILD_OPENSSL_FOR_WOS "Build static WOS OpenSSL-compatible TLS libraries for curl and HTTPS-capable ports" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_CURL_FOR_WOS "Build native WOS curl and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_GIT_FOR_WOS "Build native WOS Git and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 
@@ -326,7 +327,7 @@ if(WOS_BUILD_CURL_FOR_WOS OR WOS_BUILD_GIT_FOR_WOS)
     add_custom_target(zlib_for_wos DEPENDS ${ZLIB_FOR_WOS_STAMP})
 endif()
 
-# --- openssl_for_wos: static TLS libraries for curl ------------------------
+# --- openssl_for_wos: static OpenSSL-compatible TLS libraries for curl ------
 set(OPENSSL_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/openssl_for_wos.stamp)
 if(WOS_BUILD_OPENSSL_FOR_WOS OR WOS_BUILD_CURL_FOR_WOS OR WOS_BUILD_GIT_FOR_WOS)
     wos_collect_external_sources(OPENSSL_FOR_WOS_SOURCES
@@ -341,7 +342,7 @@ if(WOS_BUILD_OPENSSL_FOR_WOS OR WOS_BUILD_CURL_FOR_WOS OR WOS_BUILD_GIT_FOR_WOS)
                 ${WOS_BUILD_SCRIPTS_DIR}/build_openssl_for_wos.sh
         COMMAND ${CMAKE_COMMAND} -E touch ${OPENSSL_FOR_WOS_STAMP}
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        COMMENT "Building static OpenSSL for WOS..."
+        COMMENT "Building static OpenSSL-compatible TLS libraries for WOS..."
         DEPENDS
             ${WOS_BUILD_SCRIPTS_DIR}/build_openssl_for_wos.sh
             ${OPENSSL_FOR_WOS_SOURCES}

@@ -14,9 +14,11 @@ if [ -z "${CCACHE_DIR:-}" ]; then
 fi
 wos_setup_ccache
 wos_setup_ccache_cmake_args
+WOS_BUILD_JOBS="$(wos_build_jobs)"
+WOS_NINJA_JOBS="$(wos_ninja_jobs)"
 
 B="$WORKSPACE_ROOT/toolchain"
-HOST="$B/host"
+HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
 TARGET_SYSROOT="${WOS_SYSROOT_PATH:-$B/sysroot}"
 CLANG_BUILD="${WOS_CLANG_FOR_WOS_BUILD_DIR:-$B/clang-wos-build}"
 LLVM_SRC="$B/src/llvm-project/llvm"
@@ -135,7 +137,7 @@ cmake -S "$LLVM_SRC" -B "$CLANG_BUILD" -G Ninja \
     -DDEFAULT_SYSROOT=/usr \
     -DC_INCLUDE_DIRS=/usr/include
 
-cmake --build "$CLANG_BUILD" --parallel "$(nproc)" --target \
+cmake --build "$CLANG_BUILD" --parallel "$WOS_NINJA_JOBS" --target \
     clang \
     lld \
     llvm-ar \
@@ -144,7 +146,9 @@ cmake --build "$CLANG_BUILD" --parallel "$(nproc)" --target \
     llvm-objcopy \
     llvm-strip \
     llvm-readelf \
-    llvm-objdump
+    llvm-objdump \
+    llvm-tblgen \
+    clang-tblgen
 
 install_tool() {
     local tool="$1"
@@ -180,6 +184,8 @@ install_tool llvm-objcopy
 install_tool llvm-strip
 install_tool llvm-readelf
 install_tool llvm-objdump
+install_tool llvm-tblgen
+install_tool clang-tblgen
 
 ln -sfn clang "$TARGET_SYSROOT/bin/clang++"
 ln -sfn clang "$TARGET_SYSROOT/bin/clang-$CLANG_VERSION"

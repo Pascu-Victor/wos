@@ -6,11 +6,17 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$WORKSPACE_ROOT/tools/ccache_env.sh"
+if [ -z "${CCACHE_DIR:-}" ]; then
+    export CCACHE_DIR="${TMPDIR:-/tmp}/wos-busybox-ccache"
+    mkdir -p "$CCACHE_DIR"
+fi
 wos_setup_ccache
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
+WOS_BUILD_JOBS="$(wos_build_jobs)"
+WOS_MAKE_JOBS="$(wos_make_jobs)"
 
-B=$(pwd)/toolchain
-HOST="$B/host"
+B="$WORKSPACE_ROOT/toolchain"
+HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
 TARGET_SYSROOT="${WOS_SYSROOT_PATH:-$B/sysroot}"
 BB_BUILD="${WOS_BUSYBOX_BUILD_DIR:-$B/busybox-build}"
 BB_INSTALL="${WOS_BUSYBOX_INSTALL_DIR:-$B/busybox-install}"
@@ -31,7 +37,70 @@ BB_STRIP="$HOST/bin/llvm-strip"
 BB_RANLIB="$HOST/bin/llvm-ranlib"
 BB_OBJCOPY="$HOST/bin/llvm-objcopy"
 BB_NM="$HOST/bin/llvm-nm"
-BB_HOSTCC="${WOS_CCACHE_PREFIX}gcc"
+strip_path_entry() {
+    local input="$1"
+    local remove="$2"
+    local out=""
+    local part
+    local -a parts
+
+    IFS=':' read -r -a parts <<< "$input"
+    for part in "${parts[@]}"; do
+        if [ -n "$part" ] && [ "$part" != "$remove" ]; then
+            if [ -n "$out" ]; then
+                out="$out:$part"
+            else
+                out="$part"
+            fi
+        fi
+    done
+
+    printf '%s' "$out"
+}
+
+native_host_path() {
+    local search_path="${WOS_ORIGINAL_PATH:-$PATH}"
+
+    search_path="$(strip_path_entry "$search_path" "$WORKSPACE_ROOT/bin")"
+    search_path="$(strip_path_entry "$search_path" "$WORKSPACE_ROOT/toolchain/host/bin")"
+    search_path="$(strip_path_entry "$search_path" "$WORKSPACE_ROOT/tools/build/bin")"
+    printf '%s' "$search_path"
+}
+
+find_native_host_tool() {
+    local tool="$1"
+    local search_path
+
+    search_path="$(native_host_path)"
+    PATH="$search_path" command -v "$tool" 2>/dev/null
+}
+
+if [ -n "${HOSTCC:-}" ]; then
+    case "$HOSTCC" in
+        */*|*" "*)
+            BB_NATIVE_HOSTCC="$HOSTCC"
+            ;;
+        *)
+            BB_NATIVE_HOSTCC="$(find_native_host_tool "$HOSTCC" || true)"
+            if [ -z "$BB_NATIVE_HOSTCC" ]; then
+                BB_NATIVE_HOSTCC="$HOSTCC"
+            fi
+            ;;
+    esac
+else
+    BB_NATIVE_HOSTCC="$(find_native_host_tool cc || true)"
+    if [ -z "$BB_NATIVE_HOSTCC" ]; then
+        BB_NATIVE_HOSTCC="$(find_native_host_tool clang || true)"
+    fi
+    if [ -z "$BB_NATIVE_HOSTCC" ]; then
+        BB_NATIVE_HOSTCC="$(find_native_host_tool gcc || true)"
+    fi
+fi
+if [ -z "$BB_NATIVE_HOSTCC" ]; then
+    echo "ERROR: no native host C compiler found for BusyBox host tools" >&2
+    exit 1
+fi
+BB_HOSTCC="${WOS_CCACHE_PREFIX}$BB_NATIVE_HOSTCC"
 BB_CFLAGS="--sysroot=$TARGET_SYSROOT -fPIC -fno-sanitize=safe-stack -fno-stack-protector -Wno-string-plus-int"
 BB_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld"
 
@@ -124,7 +193,7 @@ if [ -f "$BB_BUILD/busybox" ]; then
 fi
 
 # Build busybox
-make -C "$BB_BUILD" -j"$(nproc)" \
+make -C "$BB_BUILD" -j"$WOS_MAKE_JOBS" \
     CC="$BB_CC" \
     AR="$BB_AR" \
     STRIP="$BB_STRIP" \
@@ -139,7 +208,7 @@ make -C "$BB_BUILD" -j"$(nproc)" \
 # Install the generated BusyBox runtime tree for rootfs packaging.
 rm -rf "$BB_INSTALL"
 mkdir -p "$BB_INSTALL"
-if ! make -C "$BB_BUILD" \
+if ! make -C "$BB_BUILD" -j"$WOS_MAKE_JOBS" \
     CC="$BB_CC" \
     AR="$BB_AR" \
     STRIP="$BB_STRIP" \

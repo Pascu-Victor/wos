@@ -6,11 +6,18 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$WORKSPACE_ROOT/tools/ccache_env.sh"
+if [ -z "${CCACHE_DIR:-}" ]; then
+    export CCACHE_DIR="${TMPDIR:-/tmp}/wos-dropbear-ccache"
+    mkdir -p "$CCACHE_DIR"
+fi
 wos_setup_ccache
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
+WOS_BUILD_JOBS="$(wos_build_jobs)"
+WOS_MAKE_JOBS="$(wos_make_jobs)"
 
-B=$(pwd)/toolchain
-HOST="$B/host"
+B="$WORKSPACE_ROOT/toolchain"
+HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
+TARGET_ARCH="${WOS_TARGET_ARCH:-x86_64-pc-wos}"
 TARGET_SYSROOT="${WOS_SYSROOT_PATH:-$B/sysroot}"
 DB_SRC="$B/src/dropbear"
 DB_BUILD="${WOS_DROPBEAR_BUILD_DIR:-$B/dropbear-build}"
@@ -23,7 +30,7 @@ fi
 
 # Cross-compilation environment - host tools, target sysroot
 DROPBEAR_CFLAGS="--sysroot=$TARGET_SYSROOT -O3 -g -fno-sanitize=safe-stack -fno-stack-protector -I$TARGET_SYSROOT/include"
-export CC="${WOS_CCACHE_PREFIX}$HOST/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
+export CC="${WOS_CCACHE_PREFIX}$HOST/bin/clang --target=$TARGET_ARCH --sysroot=$TARGET_SYSROOT"
 export AR="$HOST/bin/llvm-ar"
 export RANLIB="$HOST/bin/llvm-ranlib"
 export STRIP="$HOST/bin/llvm-strip"
@@ -65,9 +72,14 @@ fi
 # Configure if not yet configured
 if [ ! -f "$DB_BUILD/Makefile" ]; then
     echo "Configuring dropbear for WOS..."
+    DROPBEAR_CONFIGURE_BUILD_ARGS=()
+    if [ "$(uname -s 2>/dev/null || printf unknown)" = "WOS" ]; then
+        DROPBEAR_CONFIGURE_BUILD_ARGS=(--build="$TARGET_ARCH")
+    fi
     cd "$DB_BUILD"
     "$DB_SRC/configure" \
-        --host=x86_64-pc-wos \
+        "${DROPBEAR_CONFIGURE_BUILD_ARGS[@]}" \
+        --host="$TARGET_ARCH" \
         --prefix="$TARGET_SYSROOT" \
         --enable-bundled-libtom \
         --disable-zlib \
@@ -98,7 +110,7 @@ fi
 # Build dropbearmulti (combined binary like busybox). Don't pass CFLAGS on the
 # make command line: bundled libtommath appends Dropbear-specific include paths
 # via its own Makefile, and command-line CFLAGS suppress those additions.
-make -C "$DB_BUILD" -j"$(nproc)" STATIC=0 PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 dropbearmulti
+make -C "$DB_BUILD" -j"$WOS_MAKE_JOBS" STATIC=0 PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 dropbearmulti
 
 # Install into sysroot
 cp "$DB_BUILD/dropbearmulti" "$TARGET_SYSROOT/bin/dropbearmulti"

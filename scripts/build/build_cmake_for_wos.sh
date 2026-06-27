@@ -13,6 +13,8 @@ if [ -z "${CCACHE_DIR:-}" ]; then
 fi
 wos_setup_ccache
 wos_setup_ccache_cmake_args
+WOS_BUILD_JOBS="$(wos_build_jobs)"
+WOS_NINJA_JOBS="$(wos_ninja_jobs)"
 
 B="$WORKSPACE_ROOT/toolchain"
 HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
@@ -47,10 +49,10 @@ require_file "$TARGET_SYSROOT/lib/libc.so" "Build mlibc before building native C
 require_file "$TARGET_SYSROOT/lib/libc++.so" "Build libc++ before building native CMake."
 require_file "$TARGET_SYSROOT/lib/Scrt1.o" "Build mlibc startup objects before building native CMake."
 
-mkdir -p "$CMAKE_BUILD" "$TARGET_SYSROOT/bin" "$TARGET_SYSROOT/share"
-
-TARGET_C_FLAGS="--sysroot=$TARGET_SYSROOT -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -fdiagnostics-color=always"
-TARGET_CXX_FLAGS="$TARGET_C_FLAGS -std=c++23 -isystem $TARGET_SYSROOT/include/c++/v1"
+TARGET_COMMON_FLAGS="--sysroot=$TARGET_SYSROOT -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -fdiagnostics-color=always"
+TARGET_C_INCLUDE_FLAGS="-isystem $HOST/lib/clang/22/include -isystem $TARGET_SYSROOT/include"
+TARGET_C_FLAGS="$TARGET_COMMON_FLAGS $TARGET_C_INCLUDE_FLAGS"
+TARGET_CXX_FLAGS="$TARGET_COMMON_FLAGS -std=c++23 -isystem $TARGET_SYSROOT/include/c++/v1 $TARGET_C_INCLUDE_FLAGS"
 TARGET_LINK_FLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
 TARGET_CXX_STANDARD_LIBRARIES="-lc++ -lc++abi -lunwind -lm -lpthread -ldl -lrt -lc"
 
@@ -58,11 +60,41 @@ if [ "$WOS_CMAKE_FOR_WOS_LAZY_BINDING" != "0" ]; then
     TARGET_LINK_FLAGS="$TARGET_LINK_FLAGS -Wl,-z,lazy"
 fi
 
+mkdir -p "$CMAKE_BUILD" "$TARGET_SYSROOT/bin" "$TARGET_SYSROOT/share"
+
+if [ -d "$CMAKE_BUILD/CMakeFiles" ] && [ ! -f "$CMAKE_BUILD/CMakeCache.txt" ]; then
+    echo "Native CMake build tree is missing CMakeCache.txt; resetting"
+    wos_remove_tree "$CMAKE_BUILD"
+    mkdir -p "$CMAKE_BUILD"
+fi
+
+if [ -f "$CMAKE_BUILD/CMakeCache.txt" ]; then
+    cached_cxx="$(sed -n 's/^CMAKE_CXX_COMPILER:[^=]*=//p' "$CMAKE_BUILD/CMakeCache.txt")"
+    cached_cxx_flags="$(sed -n 's/^CMAKE_CXX_FLAGS:[^=]*=//p' "$CMAKE_BUILD/CMakeCache.txt")"
+    reset_cmake_cache=0
+    if [ -n "$cached_cxx" ] && [ "$cached_cxx" != "$HOST/bin/clang++" ]; then
+        echo "Native CMake cache uses $cached_cxx; resetting for $HOST/bin/clang++"
+        reset_cmake_cache=1
+    fi
+    case " $cached_cxx_flags " in
+        *" -isystem $TARGET_SYSROOT/include "*)
+            ;;
+        *)
+            echo "Native CMake cache lacks target sysroot C headers; resetting"
+            reset_cmake_cache=1
+            ;;
+    esac
+    if [ "$reset_cmake_cache" != "0" ]; then
+        wos_remove_tree "$CMAKE_BUILD"
+        mkdir -p "$CMAKE_BUILD"
+    fi
+fi
+
 cmake -S "$CMAKE_SRC" -B "$CMAKE_BUILD" -G Ninja \
     "${WOS_CCACHE_CMAKE_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_MODULE_PATH="$CMAKE_SRC/Modules" \
-    -DCMAKE_INSTALL_PREFIX="$TARGET_SYSROOT/usr" \
+    -DCMAKE_INSTALL_PREFIX="$TARGET_SYSROOT" \
     -DCMAKE_INSTALL_RPATH="/usr/lib" \
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
     -DCMAKE_C_COMPILER="$HOST/bin/clang" \
@@ -100,8 +132,8 @@ cmake -S "$CMAKE_SRC" -B "$CMAKE_BUILD" -G Ninja \
     -DBUILD_QtDialog=OFF \
     -DCMake_BUILD_DEVELOPER_REFERENCE=OFF
 
-cmake --build "$CMAKE_BUILD" --parallel "$(nproc)" --target cmake ctest cpack
-cmake --install "$CMAKE_BUILD" --prefix "$TARGET_SYSROOT/usr"
+cmake --build "$CMAKE_BUILD" --parallel "$WOS_NINJA_JOBS" --target cmake ctest cpack
+cmake --install "$CMAKE_BUILD" --prefix "$TARGET_SYSROOT"
 
 for tool in cmake ctest cpack; do
     require_file "$TARGET_SYSROOT/bin/$tool" "CMake install did not produce $tool."

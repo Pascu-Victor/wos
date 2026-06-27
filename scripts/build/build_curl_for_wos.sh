@@ -13,6 +13,8 @@ if [ -z "${CCACHE_DIR:-}" ]; then
 fi
 wos_setup_ccache
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
+WOS_BUILD_JOBS="$(wos_build_jobs)"
+WOS_MAKE_JOBS="$(wos_make_jobs)"
 
 B="$WORKSPACE_ROOT/toolchain"
 HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
@@ -25,6 +27,17 @@ CURL_VERSION="${WOS_CURL_VERSION:-8.20.0}"
 CURL_TARBALL_URL="${WOS_CURL_TARBALL_URL:-https://curl.se/download/curl-$CURL_VERSION.tar.xz}"
 CURL_TARBALL_SHA256="${WOS_CURL_TARBALL_SHA256:-63fe2dc148ba0ceae89922ef838f7e5c946272c2e78b7c59fab4b79d3ce2b896}"
 WOS_CURL_STRIP="${WOS_CURL_STRIP:-0}"
+HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
+CURL_CONFIGURE_BUILD_ARGS=()
+CURL_CONFIGURE_CACHE_ARGS=()
+if [ "$HOST_SYSTEM" = "WOS" ]; then
+    CURL_CONFIGURE_BUILD_ARGS=(--build="$TARGET_ARCH")
+    CURL_CONFIGURE_CACHE_ARGS=(
+        ac_cv_path_GREP=/usr/bin/grep
+        "ac_cv_path_EGREP=/usr/bin/grep -E"
+        "ac_cv_path_FGREP=/usr/bin/grep -F"
+    )
+fi
 
 export PATH="$HOST/bin:$PATH"
 export LD_LIBRARY_PATH="$HOST/lib"
@@ -59,9 +72,10 @@ download_curl_source() {
     fi
 
     echo "$CURL_TARBALL_SHA256  $archive" | sha256sum -c - >&2
-    rm -rf "$tmp_dest" "$dest"
+    wos_remove_tree "$tmp_dest"
+    wos_remove_tree "$dest"
     mkdir -p "$tmp_dest"
-    tar -xJf "$archive" -C "$tmp_dest" --strip-components=1
+    tar -xJf "$archive" -C "$tmp_dest" --strip-components 1
     mv "$tmp_dest" "$dest"
 }
 
@@ -78,7 +92,7 @@ resolve_curl_source() {
         return 0
     fi
 
-    if [ -d "$CURL_SRC" ] && [ -n "$(find "$CURL_SRC" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    if [ -d "$CURL_SRC" ] && wos_dir_has_entries "$CURL_SRC"; then
         echo "ERROR: curl source at $CURL_SRC does not contain configure." >&2
         echo "Use a curl release tree or clear the directory so the release tarball can be downloaded." >&2
         exit 1
@@ -91,15 +105,9 @@ resolve_curl_source() {
 copy_source_to_workdir() {
     local source_dir="$1"
 
-    rm -rf "$CURL_WORK"
+    wos_remove_tree "$CURL_WORK"
     mkdir -p "$CURL_WORK"
-    (
-        cd "$source_dir"
-        tar --exclude='./.git' --exclude='./.github' -cf - .
-    ) | (
-        cd "$CURL_WORK"
-        tar -xf -
-    )
+    wos_copy_tree_entries_excluding "$source_dir" "$CURL_WORK" ".git" ".github"
 }
 
 patch_config_sub_for_wos() {
@@ -186,8 +194,16 @@ export ac_cv_header_stdatomic_h=no
 (
     cd "$CURL_WORK"
     ./configure \
+        "${CURL_CONFIGURE_CACHE_ARGS[@]}" \
+        "${CURL_CONFIGURE_BUILD_ARGS[@]}" \
         --host="$TARGET_ARCH" \
-        --prefix=/usr \
+        --prefix= \
+        --bindir=/bin \
+        --libdir=/lib \
+        --includedir=/include \
+        --datarootdir=/share \
+        --datadir=/share \
+        --mandir=/share/man \
         --disable-shared \
         --enable-static \
         --with-openssl="$TARGET_SYSROOT" \
@@ -208,8 +224,18 @@ export ac_cv_header_stdatomic_h=no
         --disable-docs
 )
 
-make -C "$CURL_WORK" -j"$(nproc)"
-make -C "$CURL_WORK" DESTDIR="$TARGET_SYSROOT" install
+make -C "$CURL_WORK" -j"$WOS_MAKE_JOBS"
+make -C "$CURL_WORK" \
+    prefix= \
+    exec_prefix= \
+    bindir=/bin \
+    libdir=/lib \
+    includedir=/include \
+    datarootdir=/share \
+    datadir=/share \
+    mandir=/share/man \
+    DESTDIR="$TARGET_SYSROOT" \
+    install
 
 require_file "$TARGET_SYSROOT/bin/curl" "curl install did not produce $TARGET_SYSROOT/bin/curl."
 require_file "$TARGET_SYSROOT/bin/curl-config" "curl install did not produce $TARGET_SYSROOT/bin/curl-config."

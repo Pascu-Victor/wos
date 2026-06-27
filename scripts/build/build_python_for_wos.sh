@@ -11,6 +11,8 @@ export CCACHE_DIR="${CCACHE_DIR:-$WORKSPACE_ROOT/.cache/ccache}"
 mkdir -p "$CCACHE_DIR"
 wos_setup_ccache
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
+WOS_BUILD_JOBS="$(wos_build_jobs)"
+WOS_MAKE_JOBS="$(wos_make_jobs)"
 
 B="$WORKSPACE_ROOT/toolchain"
 HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
@@ -21,7 +23,9 @@ PYTHON_BUILD="${WOS_PYTHON_BUILD_DIR:-$B/python-build}"
 PYTHON_HOST_BUILD="${WOS_PYTHON_HOST_BUILD_DIR:-$PYTHON_BUILD/build-python}"
 PYTHON_TARGET_BUILD="$PYTHON_BUILD/target"
 PYTHON_CONFIG_SITE="${WOS_PYTHON_CONFIG_SITE:-$PYTHON_BUILD/config.site}"
+PYTHON_LIBRESSL_SIGALGS_COMPAT_HEADER="${WOS_PYTHON_LIBRESSL_SIGALGS_COMPAT_HEADER:-$PYTHON_BUILD/libressl_sigalgs_compat.h}"
 WOS_PYTHON_STRIP="${WOS_PYTHON_STRIP:-0}"
+HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
 
 export PATH="$HOST/bin:$PATH"
 export LD_LIBRARY_PATH="$HOST/lib"
@@ -99,6 +103,41 @@ EOF
 	fi
 }
 
+write_libressl_sigalgs_compat_header() {
+	local header="$1"
+	local opensslv="$TARGET_SYSROOT/include/openssl/opensslv.h"
+	local tmp_header
+
+	if [ ! -f "$opensslv" ] || ! grep -q 'LIBRESSL_VERSION_NUMBER' "$opensslv"; then
+		return 1
+	fi
+
+	mkdir -p "$(dirname "$header")"
+	tmp_header="$(mktemp "$header.XXXXXX")"
+	cat > "$tmp_header" <<'EOF'
+#ifndef WOS_LIBRESSL_SIGALGS_COMPAT_H
+#define WOS_LIBRESSL_SIGALGS_COMPAT_H 1
+
+/*
+ * LibreSSL exposes enough OpenSSL-compatible TLS APIs for CPython _ssl, but
+ * not OpenSSL's signature-algorithm setter helpers.  CPython only uses these
+ * in optional methods, so make those calls fail cleanly instead of failing the
+ * whole target build on an implicit declaration.
+ */
+#define SSL_CTX_set1_client_sigalgs_list(ctx, sigalgslist) (0)
+#define SSL_CTX_set1_sigalgs_list(ctx, sigalgslist) (0)
+
+#endif
+EOF
+
+	if [ ! -f "$header" ] || ! cmp -s "$tmp_header" "$header"; then
+		mv "$tmp_header" "$header"
+	else
+		rm -f "$tmp_header"
+	fi
+	return 0
+}
+
 python_target_config_is_wos() {
 	local makefile="$PYTHON_TARGET_BUILD/Makefile"
 	local pyconfig="$PYTHON_TARGET_BUILD/pyconfig.h"
@@ -107,6 +146,8 @@ python_target_config_is_wos() {
 	grep -Eq '^HOST_GNU_TYPE[[:space:]]*=[[:space:]]*x86_64-pc-wos([[:space:]]|$)' "$makefile" || return 1
 	grep -Eq '^CC[[:space:]]*=.*clang' "$makefile" || return 1
 	grep -Eq '^CC[[:space:]]*=.*--target=x86_64-pc-wos' "$makefile" || return 1
+	grep -Fq -- "-isystem $HOST/lib/clang/22/include" "$makefile" || return 1
+	grep -Fq -- "-isystem $TARGET_SYSROOT/include" "$makefile" || return 1
 	! grep -Eq '^CC[[:space:]]*=[[:space:]]*gcc([[:space:]]|$)' "$makefile" || return 1
 	! grep -Eq '^LDSHARED[[:space:]]*=[[:space:]]*ld([[:space:]]|$)' "$makefile" || return 1
 	[ -f "$pyconfig" ] || return 1
@@ -175,7 +216,21 @@ require_file "$TARGET_SYSROOT/lib/libc++.so" "Build libc++ before building Pytho
 require_file "$TARGET_SYSROOT/lib/Scrt1.o" "Build mlibc startup objects before building Python."
 
 patch_config_sub_for_wos "$PYTHON_SRC/config.sub"
-BUILD_TRIPLE="$("$PYTHON_SRC/config.guess")"
+if [ "$HOST_SYSTEM" = "WOS" ]; then
+	BUILD_TRIPLE="$TARGET_ARCH"
+else
+	BUILD_TRIPLE="$("$PYTHON_SRC/config.guess")"
+fi
+PYTHON_HOST_CONFIGURE_BUILD_ARGS=()
+PYTHON_CONFIGURE_CACHE_ARGS=()
+if [ "$HOST_SYSTEM" = "WOS" ]; then
+	PYTHON_HOST_CONFIGURE_BUILD_ARGS=(--build="$BUILD_TRIPLE")
+	PYTHON_CONFIGURE_CACHE_ARGS=(
+		ac_cv_path_GREP=/usr/bin/grep
+		"ac_cv_path_EGREP=/usr/bin/grep -E"
+		"ac_cv_path_FGREP=/usr/bin/grep -F"
+	)
+fi
 
 mkdir -p "$PYTHON_HOST_BUILD" "$PYTHON_TARGET_BUILD" "$TARGET_SYSROOT/bin"
 if [ ! -e "$TARGET_SYSROOT/usr" ]; then
@@ -190,13 +245,16 @@ if [ ! -f "$PYTHON_HOST_BUILD/Makefile" ] || [ "$PYTHON_SRC/configure" -nt "$PYT
     (
         cd "$PYTHON_HOST_BUILD"
         host_env "$PYTHON_SRC/configure" \
+            "${PYTHON_CONFIGURE_CACHE_ARGS[@]}" \
+            "${PYTHON_HOST_CONFIGURE_BUILD_ARGS[@]}" \
             --prefix="$PYTHON_HOST_BUILD/install" \
             --without-ensurepip \
-            --disable-test-modules
+            --disable-test-modules \
+            --disable-ipv6
     )
 fi
 
-host_env make -C "$PYTHON_HOST_BUILD" -j"$(nproc)" python
+host_env make -C "$PYTHON_HOST_BUILD" -j"$WOS_MAKE_JOBS" python
 BUILD_PYTHON="$PYTHON_HOST_BUILD/python"
 require_file "$BUILD_PYTHON" "Build-host CPython did not produce $BUILD_PYTHON."
 
@@ -210,6 +268,10 @@ TARGET_STRIP="$HOST/bin/llvm-strip"
 TARGET_READELF="$HOST/bin/llvm-readelf"
 TARGET_PKG_CONFIG_LIBDIR="$TARGET_SYSROOT/lib/pkgconfig:$TARGET_SYSROOT/usr/lib/pkgconfig:$TARGET_SYSROOT/share/pkgconfig:$TARGET_SYSROOT/usr/share/pkgconfig"
 PYTHON_CFLAGS="--sysroot=$TARGET_SYSROOT -O2 -g -fno-sanitize=safe-stack -fno-stack-protector -fPIC -fPIE"
+PYTHON_CPPFLAGS="-isystem $HOST/lib/clang/22/include -isystem $TARGET_SYSROOT/include"
+if write_libressl_sigalgs_compat_header "$PYTHON_LIBRESSL_SIGALGS_COMPAT_HEADER"; then
+	PYTHON_CPPFLAGS="$PYTHON_CPPFLAGS -include $PYTHON_LIBRESSL_SIGALGS_COMPAT_HEADER"
+fi
 PYTHON_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
 
 discard_stale_target_config
@@ -225,13 +287,14 @@ if [ ! -f "$PYTHON_TARGET_BUILD/Makefile" ] || [ "$PYTHON_SRC/configure" -nt "$P
             STRIP="$TARGET_STRIP" \
             READELF="$TARGET_READELF" \
             CFLAGS="$PYTHON_CFLAGS" \
-			CPPFLAGS="-I$TARGET_SYSROOT/include" \
+			CPPFLAGS="$PYTHON_CPPFLAGS" \
 			LDFLAGS="$PYTHON_LDFLAGS" \
 			CONFIG_SITE="$PYTHON_CONFIG_SITE" \
 			PKG_CONFIG_LIBDIR="$TARGET_PKG_CONFIG_LIBDIR" \
 			PKG_CONFIG_SYSROOT_DIR="$TARGET_SYSROOT" \
 			PKG_CONFIG_PATH= \
 			"$PYTHON_SRC/configure" \
+				"${PYTHON_CONFIGURE_CACHE_ARGS[@]}" \
 				--build="$BUILD_TRIPLE" \
 				--host="$TARGET_ARCH" \
 				--prefix=/usr \
@@ -262,7 +325,7 @@ if [ -f "$PYTHON_TARGET_BUILD/python" ]; then
     done
 fi
 
-make -C "$PYTHON_TARGET_BUILD" -j"$(nproc)" \
+make -C "$PYTHON_TARGET_BUILD" -j"$WOS_MAKE_JOBS" \
     CC="$TARGET_CC" \
     CXX="$TARGET_CXX" \
     AR="$TARGET_AR" \
@@ -277,6 +340,8 @@ make -C "$PYTHON_TARGET_BUILD" \
     RANLIB="$TARGET_RANLIB" \
     STRIP="$TARGET_STRIP" \
     READELF="$TARGET_READELF" \
+    prefix= \
+    exec_prefix= \
     DESTDIR="$TARGET_SYSROOT" \
     install
 

@@ -14,6 +14,8 @@ if [ -z "${CCACHE_DIR:-}" ]; then
 fi
 wos_setup_ccache
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
+WOS_BUILD_JOBS="$(wos_build_jobs)"
+WOS_MAKE_JOBS="$(wos_make_jobs)"
 
 B="$WORKSPACE_ROOT/toolchain"
 HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
@@ -60,9 +62,10 @@ download_git_source() {
     fi
 
     echo "$GIT_TARBALL_SHA256  $archive" | sha256sum -c - >&2
-    rm -rf "$tmp_dest" "$dest"
+    wos_remove_tree "$tmp_dest"
+    wos_remove_tree "$dest"
     mkdir -p "$tmp_dest"
-    tar -xJf "$archive" -C "$tmp_dest" --strip-components=1
+    tar -xJf "$archive" -C "$tmp_dest" --strip-components 1
     mv "$tmp_dest" "$dest"
 }
 
@@ -79,7 +82,7 @@ resolve_git_source() {
         return 0
     fi
 
-    if [ -d "$GIT_SRC" ] && [ -n "$(find "$GIT_SRC" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    if [ -d "$GIT_SRC" ] && wos_dir_has_entries "$GIT_SRC"; then
         echo "ERROR: Git source at $GIT_SRC does not contain Makefile." >&2
         echo "Use a Git release tree or clear the directory so the release tarball can be downloaded." >&2
         exit 1
@@ -92,27 +95,25 @@ resolve_git_source() {
 copy_source_to_workdir() {
     local source_dir="$1"
 
-    rm -rf "$GIT_WORK"
+    wos_remove_tree "$GIT_WORK"
     mkdir -p "$GIT_WORK"
-    (
-        cd "$source_dir"
-        tar --exclude='./.git' --exclude='./.github' -cf - .
-    ) | (
-        cd "$GIT_WORK"
-        tar -xf -
-    )
+    wos_copy_tree_entries_excluding "$source_dir" "$GIT_WORK" ".git" ".github"
 }
 
 patch_git_source_for_wos() {
     local run_command="$GIT_WORK/run-command.c"
     local parallel_checkout="$GIT_WORK/parallel-checkout.c"
+    local makefile="$GIT_WORK/Makefile"
+    local templates_makefile="$GIT_WORK/templates/Makefile"
 
-    python3 - "$run_command" "$parallel_checkout" <<'PY'
+    python3 - "$run_command" "$parallel_checkout" "$makefile" "$templates_makefile" <<'PY'
 from pathlib import Path
 import sys
 
 run_command = Path(sys.argv[1])
 parallel_checkout = Path(sys.argv[2])
+makefile = Path(sys.argv[3])
+templates_makefile = Path(sys.argv[4])
 
 text = run_command.read_text()
 replacements = {
@@ -143,6 +144,32 @@ for old, new in replacements.items():
     text = text.replace(old, new)
 
 parallel_checkout.write_text(text)
+
+text = makefile.read_text()
+replacements = {
+    "all:: $(FUZZ_OBJS)": "ifndef WOS_SKIP_TEST_ARTIFACTS\nall:: $(FUZZ_OBJS)\nendif",
+    "all:: $(TEST_PROGRAMS) $(test_bindir_programs) $(UNIT_TEST_PROGS) $(CLAR_TEST_PROG)": (
+        "ifndef WOS_SKIP_TEST_ARTIFACTS\n"
+        "all:: $(TEST_PROGRAMS) $(test_bindir_programs) $(UNIT_TEST_PROGS) $(CLAR_TEST_PROG)\n"
+        "endif"
+    ),
+}
+
+for old, new in replacements.items():
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"expected one occurrence of {old!r} in {makefile}, found {count}")
+    text = text.replace(old, new)
+
+makefile.write_text(text)
+
+text = templates_makefile.read_text()
+old = "\t(cd blt && $(TAR) cf - .) | \\\n\t(cd '$(DESTDIR_SQ)$(template_instdir_SQ)' && umask 022 && $(TAR) xof -)"
+new = "\tcp -a blt/. '$(DESTDIR_SQ)$(template_instdir_SQ)'"
+count = text.count(old)
+if count != 1:
+    raise SystemExit(f"expected one Git templates tar install pipeline in {templates_makefile}, found {count}")
+templates_makefile.write_text(text.replace(old, new))
 PY
 }
 
@@ -197,7 +224,7 @@ if [ ! -e "$TARGET_SYSROOT/usr" ]; then
 fi
 
 TARGET_CC="${WOS_CCACHE_PREFIX}$HOST/bin/clang --target=$TARGET_ARCH --sysroot=$TARGET_SYSROOT"
-GIT_CFLAGS="--sysroot=$TARGET_SYSROOT -O2 -g -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -I$TARGET_SYSROOT/include"
+GIT_CFLAGS="--sysroot=$TARGET_SYSROOT -O2 -g -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -I. -Icompat/regex -I$TARGET_SYSROOT/include"
 GIT_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
 GIT_EXTLIBS="$TARGET_SYSROOT/lib/libz.a -lpthread -lrt -ldl -lm -lc"
 GIT_CURL_CFLAGS="-I$TARGET_SYSROOT/include -DCURL_STATICLIB"
@@ -205,10 +232,10 @@ GIT_CURL_LDFLAGS="$TARGET_SYSROOT/lib/libcurl.a $TARGET_SYSROOT/lib/libssl.a $TA
 
 GIT_MAKE_FLAGS=(
     "uname_S=WOS"
-    "prefix=/usr"
-    "bindir=/usr/bin"
-    "gitexecdir=/usr/libexec/git-core"
-    "template_dir=/usr/share/git-core/templates"
+    "prefix="
+    "bindir=/bin"
+    "gitexecdir=/libexec/git-core"
+    "template_dir=/share/git-core/templates"
     "sysconfdir=/etc"
     "CC=$TARGET_CC"
     "AR=$HOST/bin/llvm-ar"
@@ -238,9 +265,10 @@ GIT_MAKE_FLAGS=(
     "NO_IPV6=YesPlease"
     "NO_REGEX=NeedsStartEnd"
     "NO_TRUSTABLE_FILEMODE=YesPlease"
+    "WOS_SKIP_TEST_ARTIFACTS=YesPlease"
 )
 
-make -C "$GIT_WORK" -j"$(nproc)" "${GIT_MAKE_FLAGS[@]}" "DESTDIR=$TARGET_SYSROOT" install
+make -C "$GIT_WORK" -j"$WOS_MAKE_JOBS" "${GIT_MAKE_FLAGS[@]}" "DESTDIR=$TARGET_SYSROOT" install
 patch_installed_git_scripts
 
 require_file "$TARGET_SYSROOT/bin/git" "Git install did not produce $TARGET_SYSROOT/bin/git."

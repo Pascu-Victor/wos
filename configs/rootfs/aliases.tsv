@@ -68,6 +68,8 @@ copy	toolchain/sysroot/bin/llvm-objcopy	/usr/bin/llvm-objcopy
 copy	toolchain/sysroot/bin/llvm-strip	/usr/bin/llvm-strip
 copy	toolchain/sysroot/bin/llvm-readelf	/usr/bin/llvm-readelf
 copy	toolchain/sysroot/bin/llvm-objdump	/usr/bin/llvm-objdump
+copy	toolchain/sysroot/bin/llvm-tblgen	/usr/bin/llvm-tblgen
+copy	toolchain/sysroot/bin/clang-tblgen	/usr/bin/clang-tblgen
 copy	toolchain/sysroot/bin/x86_64-pc-wos.cfg	/usr/bin/x86_64-pc-wos.cfg
 copy	toolchain/sysroot/lib/clang	/usr/lib/clang
 copy	toolchain/sysroot/bin/cmake	/usr/bin/cmake

@@ -12,6 +12,8 @@ if [ -z "${CCACHE_DIR:-}" ]; then
 fi
 wos_setup_ccache
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
+WOS_BUILD_JOBS="$(wos_build_jobs)"
+WOS_MAKE_JOBS="$(wos_make_jobs)"
 
 B="$WORKSPACE_ROOT/toolchain"
 HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
@@ -22,6 +24,7 @@ MAKE_SRC="${WOS_MAKE_SOURCE_DIR:-$B/src/make}"
 MAKE_VERSION="${WOS_GNU_MAKE_VERSION:-4.4.1}"
 MAKE_TARBALL_URL="${WOS_GNU_MAKE_TARBALL_URL:-https://ftp.gnu.org/gnu/make/make-$MAKE_VERSION.tar.gz}"
 MAKE_TARBALL_SHA256="${WOS_GNU_MAKE_TARBALL_SHA256:-dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3}"
+HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
 
 require_file() {
     local path="$1"
@@ -53,9 +56,10 @@ download_make_source() {
     fi
 
     echo "$MAKE_TARBALL_SHA256  $archive" | sha256sum -c - >&2
-    rm -rf "$tmp_dest" "$dest"
+    wos_remove_tree "$tmp_dest"
+    wos_remove_tree "$dest"
     mkdir -p "$tmp_dest"
-    tar -xzf "$archive" -C "$tmp_dest" --strip-components=1
+    tar -xzf "$archive" -C "$tmp_dest" --strip-components 1
     mv "$tmp_dest" "$dest"
 }
 
@@ -72,7 +76,7 @@ resolve_make_source() {
         return 0
     fi
 
-    if [ -d "$MAKE_SRC" ] && [ -n "$(find "$MAKE_SRC" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    if [ -d "$MAKE_SRC" ] && wos_dir_has_entries "$MAKE_SRC"; then
         echo "ERROR: GNU make source at $MAKE_SRC does not contain configure or bootstrap." >&2
         echo "Use a GNU make release tree or regenerate the Autotools files there." >&2
         exit 1
@@ -118,6 +122,60 @@ patch_config_sub_for_wos() {
     fi
 }
 
+rewrite_file_for_mtime() {
+    local path="$1"
+    local tmp="$path.wos-mtime.$$"
+
+    if [ ! -f "$path" ]; then
+        return 0
+    fi
+
+    cp "$path" "$tmp"
+    mv "$tmp" "$path"
+}
+
+refresh_make_release_generated_files() {
+    local source_dir="$1"
+    local file
+    local generated_files=(
+        aclocal.m4
+        configure
+        src/config.h.in
+        Makefile.in
+        lib/Makefile.in
+        doc/Makefile.in
+        po/Makefile.in.in
+        po/Makefile.in
+    )
+
+    # WOS BusyBox touch currently does not advance existing mtimes. Rewrite the
+    # release-generated files instead so Automake maintainer rules stay idle.
+    sleep 1
+    for file in "${generated_files[@]}"; do
+        rewrite_file_for_mtime "$source_dir/$file"
+    done
+}
+
+refresh_make_build_generated_files() {
+    local build_dir="$1"
+    local file
+    local generated_files=(
+        config.status
+        Makefile
+        lib/Makefile
+        doc/Makefile
+        po/Makefile.in
+        po/Makefile
+        src/config.h
+        src/stamp-h1
+    )
+
+    sleep 1
+    for file in "${generated_files[@]}"; do
+        rewrite_file_for_mtime "$build_dir/$file"
+    done
+}
+
 require_file "$HOST/bin/clang" "Run tools/host-toolchain.sh first."
 require_file "$HOST/bin/clang++" "Run tools/host-toolchain.sh first."
 require_file "$HOST/bin/ld.lld" "Run tools/host-toolchain.sh first."
@@ -131,6 +189,9 @@ require_file "$TARGET_SYSROOT/lib/Scrt1.o" "Build mlibc startup objects before b
 MAKE_SOURCE_DIR="$(resolve_make_source)"
 ensure_make_configure "$MAKE_SOURCE_DIR"
 patch_config_sub_for_wos "$MAKE_SOURCE_DIR"
+if [ "$HOST_SYSTEM" = "WOS" ]; then
+    refresh_make_release_generated_files "$MAKE_SOURCE_DIR"
+fi
 
 GNU_MAKE_CFLAGS="--sysroot=$TARGET_SYSROOT -O2 -g -fno-sanitize=safe-stack -fno-stack-protector"
 GNU_MAKE_CXXFLAGS="$GNU_MAKE_CFLAGS -std=c++23 -isystem $TARGET_SYSROOT/include/c++/v1"
@@ -147,17 +208,42 @@ export LDFLAGS="$GNU_MAKE_LDFLAGS"
 
 mkdir -p "$MAKE_BUILD" "$TARGET_SYSROOT/bin"
 
-if [ ! -f "$MAKE_BUILD/Makefile" ] || [ "$MAKE_SOURCE_DIR/configure" -nt "$MAKE_BUILD/Makefile" ]; then
+if [ "$HOST_SYSTEM" = "WOS" ] && { [ ! -x "$MAKE_BUILD/make" ] || [ ! -f "$MAKE_BUILD/config.status" ]; }; then
+    rm -f "$MAKE_BUILD/Makefile"
+fi
+
+if [ ! -f "$MAKE_BUILD/Makefile" ] || [ ! -f "$MAKE_BUILD/config.status" ] || [ "$MAKE_SOURCE_DIR/configure" -nt "$MAKE_BUILD/Makefile" ]; then
     echo "Configuring GNU make for WOS..."
+    GNU_MAKE_CONFIGURE_BUILD_ARGS=()
+    GNU_MAKE_CONFIGURE_CACHE_ARGS=()
+    if [ "$HOST_SYSTEM" = "WOS" ]; then
+        GNU_MAKE_CONFIGURE_BUILD_ARGS=(--build="$TARGET_ARCH")
+        GNU_MAKE_CONFIGURE_CACHE_ARGS=(
+            ac_cv_path_GREP=/usr/bin/grep
+            "ac_cv_path_EGREP=/usr/bin/grep -E"
+            "ac_cv_path_FGREP=/usr/bin/grep -F"
+        )
+    fi
     (
         cd "$MAKE_BUILD"
         "$MAKE_SOURCE_DIR/configure" \
+            "${GNU_MAKE_CONFIGURE_CACHE_ARGS[@]}" \
+            "${GNU_MAKE_CONFIGURE_BUILD_ARGS[@]}" \
             --host="$TARGET_ARCH" \
             --prefix="$TARGET_SYSROOT" \
             --disable-nls \
             --disable-load \
             --without-guile
     )
+fi
+
+if [ "$HOST_SYSTEM" = "WOS" ]; then
+    refresh_make_build_generated_files "$MAKE_BUILD"
+fi
+
+GNU_MAKE_BUILD_ARGS=()
+if [ "$HOST_SYSTEM" = "WOS" ]; then
+    GNU_MAKE_BUILD_ARGS=(MAKEINFO=true)
 fi
 
 if [ -f "$MAKE_BUILD/make" ]; then
@@ -171,7 +257,7 @@ if [ -f "$MAKE_BUILD/make" ]; then
     done
 fi
 
-make -C "$MAKE_BUILD" -j"$(nproc)"
+make -C "$MAKE_BUILD" -j"$WOS_MAKE_JOBS" "${GNU_MAKE_BUILD_ARGS[@]}"
 
 install -m 755 "$MAKE_BUILD/make" "$TARGET_SYSROOT/bin/make"
 ln -sfn make "$TARGET_SYSROOT/bin/gmake"

@@ -5,7 +5,79 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
+BOOTSTRAP = ROOT / "tools" / "bootstrap.sh"
+CCACHE_ENV = ROOT / "tools" / "ccache_env.sh"
+ROOT_CMAKE = ROOT / "CMakeLists.txt"
 WOS_TOOLCHAIN = ROOT / "tools" / "wos-toolchain.sh"
+WOS_CLANG_BUILD = ROOT / "scripts" / "build" / "build_clang_for_wos.sh"
+WOS_BUSYBOX_BUILD = ROOT / "scripts" / "build" / "build_busybox.sh"
+WOS_CMAKE_BUILD = ROOT / "scripts" / "build" / "build_cmake_for_wos.sh"
+WOS_CURL_BUILD = ROOT / "scripts" / "build" / "build_curl_for_wos.sh"
+WOS_DROPBEAR_BUILD = ROOT / "scripts" / "build" / "build_dropbear.sh"
+WOS_GIT_BUILD = ROOT / "scripts" / "build" / "build_git_for_wos.sh"
+WOS_MESON_BUILD = ROOT / "scripts" / "build" / "build_meson_for_wos.sh"
+WOS_MLIBC_BUILD = ROOT / "scripts" / "build" / "build_mlibc.sh"
+WOS_NASM_BUILD = ROOT / "scripts" / "build" / "build_nasm_for_wos.sh"
+WOS_NINJA_BUILD = ROOT / "scripts" / "build" / "build_ninja_for_wos.sh"
+WOS_TLS_BUILD = ROOT / "scripts" / "build" / "build_openssl_for_wos.sh"
+WOS_PYTHON_BUILD = ROOT / "scripts" / "build" / "build_python_for_wos.sh"
+MLIBC_STDIO = ROOT / "toolchain" / "src" / "mlibc" / "options" / "ansi" / "generic" / "stdio.cpp"
+MLIBC_SSCANF_TEST = ROOT / "toolchain" / "src" / "mlibc" / "tests" / "ansi" / "sscanf.c"
+WOS_JOB_HELPER_USERS = [
+    ROOT / "scripts" / "build" / "build_bash_for_wos.sh",
+    WOS_BUSYBOX_BUILD,
+    WOS_CLANG_BUILD,
+    ROOT / "scripts" / "build" / "build_cmake_for_host.sh",
+    ROOT / "scripts" / "build" / "build_cmake_for_wos.sh",
+    ROOT / "scripts" / "build" / "build_curl_for_wos.sh",
+    WOS_DROPBEAR_BUILD,
+    ROOT / "scripts" / "build" / "build_git_for_wos.sh",
+    ROOT / "scripts" / "build" / "build_make.sh",
+    WOS_MLIBC_BUILD,
+    WOS_NASM_BUILD,
+    WOS_NINJA_BUILD,
+    WOS_TLS_BUILD,
+    WOS_PYTHON_BUILD,
+    ROOT / "scripts" / "build" / "build_zlib_for_wos.sh",
+    WOS_TOOLCHAIN,
+]
+WOS_MAKE_JOB_HELPER_USERS = [
+    ROOT / "scripts" / "build" / "build_bash_for_wos.sh",
+    WOS_BUSYBOX_BUILD,
+    ROOT / "scripts" / "build" / "build_curl_for_wos.sh",
+    WOS_DROPBEAR_BUILD,
+    ROOT / "scripts" / "build" / "build_git_for_wos.sh",
+    ROOT / "scripts" / "build" / "build_make.sh",
+    WOS_NASM_BUILD,
+    WOS_TLS_BUILD,
+    WOS_PYTHON_BUILD,
+    ROOT / "scripts" / "build" / "build_zlib_for_wos.sh",
+]
+WOS_NINJA_JOB_HELPER_USERS = [
+    WOS_CLANG_BUILD,
+    ROOT / "scripts" / "build" / "build_cmake_for_host.sh",
+    WOS_CMAKE_BUILD,
+    WOS_MLIBC_BUILD,
+    WOS_NINJA_BUILD,
+    WOS_TOOLCHAIN,
+]
+WOS_BUSYBOX_TAR_USERS = [
+    ROOT / "scripts" / "build" / "build_bash_for_wos.sh",
+    ROOT / "scripts" / "build" / "build_curl_for_wos.sh",
+    ROOT / "scripts" / "build" / "build_git_for_wos.sh",
+    ROOT / "scripts" / "build" / "build_make.sh",
+    WOS_MESON_BUILD,
+    WOS_NASM_BUILD,
+    WOS_TLS_BUILD,
+    ROOT / "scripts" / "build" / "build_zlib_for_wos.sh",
+]
+WOS_SOURCE_COPY_USERS = [
+    ROOT / "scripts" / "build" / "build_bash_for_wos.sh",
+    ROOT / "scripts" / "build" / "build_curl_for_wos.sh",
+    ROOT / "scripts" / "build" / "build_git_for_wos.sh",
+    WOS_MESON_BUILD,
+    WOS_TLS_BUILD,
+]
 
 
 def fail(message: str) -> None:
@@ -63,7 +135,7 @@ def test_compiler_rt_sanitizers_are_built_after_mlibc() -> None:
         source,
         [
             "build_compiler_rt OFF",
-            "ninja && ninja install",
+            'ninja -j"$COMPILER_RT_NINJA_JOBS" && ninja -j"$COMPILER_RT_NINJA_JOBS" install',
             "build_compiler_rt ON",
             'if [ "$require_sanitizers" = "ON" ]; then',
         ],
@@ -84,6 +156,8 @@ def test_native_wos_compiler_rt_does_not_link_with_workspace_sysroot() -> None:
         source,
         [
             'COMPILER_RT_CMAKE_SYSROOT_ARGS=("-DCMAKE_SYSROOT=$SYSROOT")',
+            'WOS_NINJA_JOBS="$(wos_ninja_jobs)"',
+            'COMPILER_RT_NINJA_JOBS="$WOS_NINJA_JOBS"',
             'if [ "$HOST_SYSTEM" = "WOS" ]; then',
             'COMPILER_RT_CMAKE_SYSROOT_ARGS=("-DCMAKE_SYSROOT_COMPILE=$SYSROOT")',
             "unset LDFLAGS\nbuild_compiler_rt OFF",
@@ -93,8 +167,668 @@ def test_native_wos_compiler_rt_does_not_link_with_workspace_sysroot() -> None:
     )
 
 
+def test_native_wos_build_defaults_keep_target_ports_enabled() -> None:
+    source = ROOT_CMAKE.read_text()
+    require_tokens(
+        source,
+        [
+            "set(WOS_PORT_BUILD_DEFAULT ON)",
+            "set(WOS_BUILD_CMAKE_FOR_HOST_DEFAULT ${WOS_PORT_BUILD_DEFAULT})",
+            "if(WOS_NATIVE_SYSTEM_BUILD)\n    set(WOS_BUILD_CMAKE_FOR_HOST_DEFAULT OFF)\nendif()",
+            'option(WOS_BUILD_WOSDBG "Build the Qt6-based wosdbg host tool" ${WOS_BUILD_WOSDBG_DEFAULT})',
+            'option(WOS_BUILD_CLANG_FOR_WOS "Build a native WOS clang/lld toolchain and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})',
+            'option(WOS_BUILD_CMAKE_FOR_HOST "Build host-side CMake from the WOS fork and install it into toolchain/host" ${WOS_BUILD_CMAKE_FOR_HOST_DEFAULT})',
+            'option(WOS_BUILD_CMAKE_FOR_WOS "Build native WOS CMake tools and stage them into the rootfs" ${WOS_PORT_BUILD_DEFAULT})',
+            'option(WOS_BUILD_GIT_FOR_WOS "Build native WOS Git and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})',
+        ],
+        "native WOS self-hosting build defaults",
+    )
+
+    if "set(WOS_PORT_BUILD_DEFAULT OFF)" in source:
+        fail("native WOS builds must keep target port/toolchain targets enabled by default")
+
+
+def test_wos_build_jobs_helper_has_self_hostable_fallbacks() -> None:
+    source = CCACHE_ENV.read_text()
+    require_tokens(
+        source,
+        [
+            'export CCACHE_DIR="${TMPDIR:-/tmp}/wos-ccache"',
+            "wos_build_jobs() {",
+            'local jobs="${WOS_BUILD_JOBS:-}"',
+            "WOS_BUILD_JOBS must be a positive integer",
+            "command -v nproc",
+            "command -v getconf",
+            "getconf _NPROCESSORS_ONLN",
+            "command -v python3",
+            "os.cpu_count() or 1",
+            "jobs=1",
+            "wos_remove_tree()",
+            'local attempts="${WOS_REMOVE_TREE_RETRIES:-5}"',
+            "refusing to remove unsafe path",
+            "WOS_REMOVE_TREE_RETRIES must be a positive integer",
+            "wos_copy_tree_entries_excluding()",
+            'for entry in "$source_dir"/* "$source_dir"/.[!.]* "$source_dir"/..?*; do',
+            'cp -a "$entry" "$dest_dir/"',
+            "wos_dir_has_entries()",
+            'for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do',
+            "wos_refresh_file_mtime()",
+            'tmp="$file.wos-mtime.$$"',
+            "wos_make_jobs() {",
+            'local jobs="${WOS_MAKE_JOBS:-}"',
+            "WOS_MAKE_JOBS must be a positive integer",
+            "wos_ninja_jobs() {",
+            'local jobs="${WOS_NINJA_JOBS:-}"',
+            "WOS_NINJA_JOBS must be a positive integer",
+            'uname -s 2>/dev/null || printf unknown',
+            '= "WOS" ]',
+            "wos_build_jobs",
+        ],
+        "shared WOS build job helper",
+    )
+
+
+def test_wos_port_build_scripts_use_shared_job_helper() -> None:
+    for script in WOS_JOB_HELPER_USERS:
+        source = script.read_text()
+        require_tokens(
+            source,
+            ['WOS_BUILD_JOBS="$(wos_build_jobs)"'],
+            f"{script.relative_to(ROOT)} shared WOS build job helper",
+        )
+        forbidden = ["$(nproc)", "`nproc`"]
+        present = [token for token in forbidden if token in source]
+        if present:
+            fail(f"{script.relative_to(ROOT)} must not assume Linux nproc directly: {', '.join(present)}")
+
+
+def test_gnu_make_port_build_scripts_use_make_job_helper() -> None:
+    for script in WOS_MAKE_JOB_HELPER_USERS:
+        source = script.read_text()
+        require_tokens(
+            source,
+            ['WOS_MAKE_JOBS="$(wos_make_jobs)"'],
+            f"{script.relative_to(ROOT)} shared GNU Make job helper",
+        )
+        if re.search(r"(?:host_env\s+)?make\b[^\n]*-j\"\$WOS_BUILD_JOBS\"", source):
+            fail(f"{script.relative_to(ROOT)} must use WOS_MAKE_JOBS for GNU Make parallelism")
+
+
+def test_ninja_port_build_scripts_use_ninja_job_helper() -> None:
+    for script in WOS_NINJA_JOB_HELPER_USERS:
+        source = script.read_text()
+        require_tokens(
+            source,
+            ['WOS_NINJA_JOBS="$(wos_ninja_jobs)"'],
+            f"{script.relative_to(ROOT)} shared Ninja job helper",
+        )
+        forbidden = [
+            'ninja -j"$WOS_BUILD_JOBS"',
+            'ninja -C "$MLIBC_BUILD" -j"$WOS_BUILD_JOBS"',
+            '--parallel "$WOS_BUILD_JOBS"',
+        ]
+        present = [token for token in forbidden if token in source]
+        if present:
+            fail(f"{script.relative_to(ROOT)} must use WOS_NINJA_JOBS for Ninja/CMake parallelism")
+
+
+def test_wos_tar_invocations_use_busybox_compatible_long_options() -> None:
+    for script in WOS_BUSYBOX_TAR_USERS:
+        source = script.read_text()
+        forbidden = ["--strip-components=", "--exclude=", "--exclude ", "-print -quit"]
+        present = [token for token in forbidden if token in source]
+        if present:
+            fail(
+                f"{script.relative_to(ROOT)} must avoid BusyBox tar long-option forms "
+                f"that are fragile in WOS wrapper copy/extract paths: {', '.join(present)}"
+            )
+
+
+def test_wos_source_copy_wrappers_avoid_busybox_tar_pipelines() -> None:
+    for script in WOS_SOURCE_COPY_USERS:
+        source = script.read_text()
+        require_tokens(
+            source,
+            [
+                "wos_remove_tree",
+                "wos_copy_tree_entries_excluding",
+            ],
+            f"{script.relative_to(ROOT)} source copy helper",
+        )
+        forbidden = ["tar --exclude", "tar \\\n", "cp -a \"$source_dir/.\""]
+        present = [token for token in forbidden if token in source]
+        if present:
+            fail(
+                f"{script.relative_to(ROOT)} must avoid tar-copy pipelines and whole-tree "
+                f"copy/remove patterns in WOS source staging: {', '.join(present)}"
+            )
+
+
+def test_gnu_make_script_passes_build_triplet_on_wos() -> None:
+    source = (ROOT / "scripts" / "build" / "build_make.sh").read_text()
+    require_tokens(
+        source,
+        [
+            'TARGET_ARCH="${WOS_TARGET_ARCH:-x86_64-pc-wos}"',
+            'HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"',
+            'GNU_MAKE_CONFIGURE_BUILD_ARGS=()',
+            'if [ "$HOST_SYSTEM" = "WOS" ]; then',
+            'GNU_MAKE_CONFIGURE_BUILD_ARGS=(--build="$TARGET_ARCH")',
+            '"${GNU_MAKE_CONFIGURE_BUILD_ARGS[@]}"',
+            '--host="$TARGET_ARCH"',
+        ],
+        "GNU make WOS configure build triplet",
+    )
+
+
+def test_gnu_make_script_handles_native_wos_autoconf_probes() -> None:
+    source = (ROOT / "scripts" / "build" / "build_make.sh").read_text()
+    require_tokens(
+        source,
+        [
+            "rewrite_file_for_mtime()",
+            "refresh_make_release_generated_files()",
+            "refresh_make_build_generated_files()",
+            "sleep 1",
+            'if [ "$HOST_SYSTEM" = "WOS" ]; then\n    refresh_make_release_generated_files "$MAKE_SOURCE_DIR"\nfi',
+            'if [ "$HOST_SYSTEM" = "WOS" ]; then\n    refresh_make_build_generated_files "$MAKE_BUILD"\nfi',
+            'if [ "$HOST_SYSTEM" = "WOS" ] && { [ ! -x "$MAKE_BUILD/make" ] || [ ! -f "$MAKE_BUILD/config.status" ]; }; then',
+            'rm -f "$MAKE_BUILD/Makefile"',
+            '[ ! -f "$MAKE_BUILD/config.status" ]',
+            "GNU_MAKE_CONFIGURE_CACHE_ARGS=()",
+            "ac_cv_path_GREP=/usr/bin/grep",
+            '"ac_cv_path_EGREP=/usr/bin/grep -E"',
+            '"ac_cv_path_FGREP=/usr/bin/grep -F"',
+            '"${GNU_MAKE_CONFIGURE_CACHE_ARGS[@]}"',
+            "GNU_MAKE_BUILD_ARGS=()",
+            "GNU_MAKE_BUILD_ARGS=(MAKEINFO=true)",
+            'make -C "$MAKE_BUILD" -j"$WOS_MAKE_JOBS" "${GNU_MAKE_BUILD_ARGS[@]}"',
+        ],
+        "GNU make native WOS Autoconf probe handling",
+    )
+
+
+def test_nasm_script_uses_release_tarball_without_self_hosted_autogen() -> None:
+    source = WOS_NASM_BUILD.read_text()
+    require_tokens(
+        source,
+        [
+            'NASM_VERSION="${WOS_NASM_VERSION:-3.02rc9}"',
+            "https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.xz",
+            "1802d091f4b2c1b3f61ab9d9fca323b8da7674c1ced7d5b770e77604d9c7925b",
+            "download_nasm_source()",
+            "resolve_nasm_source()",
+            "seed_nasm_generated_files()",
+            'local fallback_src="$B/src/nasm-$NASM_VERSION"',
+            'tar -xJf "$archive" -C "$tmp_dest" --strip-components 1',
+            'NASM_SOURCE_DIR="$(resolve_nasm_source)"',
+            'require_file "$NASM_SOURCE_DIR/configure"',
+            'patch_config_sub_for_wos "$NASM_SOURCE_DIR/autoconf/helpers/config.sub"',
+            'HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"',
+            'if [ "$HOST_SYSTEM" = "WOS" ]; then',
+            'BUILD_TRIPLE="$TARGET_ARCH"',
+            'BUILD_TRIPLE="$("$NASM_SOURCE_DIR/autoconf/helpers/config.guess")"',
+            '[ "$(cat "$NASM_BUILD/source.path")" != "$NASM_SOURCE_DIR" ]',
+            'wos_remove_tree "$NASM_BUILD"',
+            'printf \'%s\\n\' "$NASM_SOURCE_DIR" > "$NASM_BUILD/source.path"',
+            '"$NASM_SOURCE_DIR/configure" \\',
+            "x86/insns.xda",
+            "asm/directiv.h",
+            'cp -p "$NASM_SOURCE_DIR/$file" "$NASM_BUILD/$file"',
+            'wos_refresh_file_mtime "$NASM_BUILD/$file"',
+            "sleep 1",
+            "editors/nasmtok.json",
+            'export CPPFLAGS=""',
+            'grep -F -- "-I$TARGET_SYSROOT/include" "$NASM_BUILD/Makefile"',
+            'rm -f "$NASM_BUILD/Makefile" "$NASM_BUILD/config.status"',
+            "seed_nasm_generated_files",
+        ],
+        "NASM WOS release source fallback",
+    )
+
+    forbidden = ["./autogen.sh", "Generating NASM configure script", 'CPPFLAGS="-I$TARGET_SYSROOT/include"']
+    present = [token for token in forbidden if token in source]
+    if present:
+        fail("NASM WOS build must not require self-hosted Automake/autogen: " + ", ".join(present))
+
+
+def test_cpython_script_uses_target_build_triplet_on_native_wos() -> None:
+    source = WOS_PYTHON_BUILD.read_text()
+    require_tokens(
+        source,
+        [
+            'TARGET_ARCH="${WOS_TARGET_ARCH:-x86_64-pc-wos}"',
+            'HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"',
+            'patch_config_sub_for_wos "$PYTHON_SRC/config.sub"',
+            'if [ "$HOST_SYSTEM" = "WOS" ]; then',
+            'BUILD_TRIPLE="$TARGET_ARCH"',
+            'BUILD_TRIPLE="$("$PYTHON_SRC/config.guess")"',
+            'PYTHON_HOST_CONFIGURE_BUILD_ARGS=()',
+            'PYTHON_CONFIGURE_CACHE_ARGS=()',
+            'PYTHON_HOST_CONFIGURE_BUILD_ARGS=(--build="$BUILD_TRIPLE")',
+            "ac_cv_path_GREP=/usr/bin/grep",
+            '"ac_cv_path_EGREP=/usr/bin/grep -E"',
+            '"ac_cv_path_FGREP=/usr/bin/grep -F"',
+            '"${PYTHON_CONFIGURE_CACHE_ARGS[@]}"',
+            '"${PYTHON_HOST_CONFIGURE_BUILD_ARGS[@]}"',
+            "--disable-ipv6",
+            'grep -Fq -- "-isystem $HOST/lib/clang/22/include" "$makefile"',
+            'grep -Fq -- "-isystem $TARGET_SYSROOT/include" "$makefile"',
+            'PYTHON_CPPFLAGS="-isystem $HOST/lib/clang/22/include -isystem $TARGET_SYSROOT/include"',
+            '--build="$BUILD_TRIPLE"',
+            '--host="$TARGET_ARCH"',
+        ],
+        "CPython native WOS build triplet handling",
+    )
+
+
+def test_cpython_install_avoids_sysroot_usr_symlink() -> None:
+    source = WOS_PYTHON_BUILD.read_text()
+    require_tokens(
+        source,
+        [
+            "--prefix=/usr",
+            "--exec-prefix=/usr",
+            "prefix= \\",
+            "exec_prefix= \\",
+            'DESTDIR="$TARGET_SYSROOT"',
+            'require_file "$TARGET_SYSROOT/bin/python3"',
+        ],
+        "CPython native WOS install path",
+    )
+
+
+def test_native_wos_bootstrap_keeps_host_toolchain_shim_discoverable() -> None:
+    source = BOOTSTRAP.read_text()
+    require_tokens(
+        source,
+        [
+            'local compat_root="$WORKSPACE_ROOT/toolchain/host"',
+            'WOS_HOST_TOOLCHAIN_ROOT="$WORKSPACE_ROOT/toolchain/wos-host-shim"',
+            'ln -sfn "$(basename "$shim_root")" host',
+            'elif [ ! -x "$compat_root/bin/clang" ]; then',
+            "llvm-tblgen clang-tblgen",
+            "Host toolchain compatibility path",
+        ],
+        "native WOS bootstrap host-toolchain compatibility shim",
+    )
+
+
+def test_wos_toolchain_uses_shared_busybox_and_dropbear_build_scripts() -> None:
+    source = WOS_TOOLCHAIN.read_text()
+    require_tokens(
+        source,
+        [
+            'WOS_HOST_TOOLCHAIN_ROOT="$HOST" \\',
+            'WOS_BUSYBOX_BUILD_DIR="$B/busybox-build" \\',
+            'WOS_BUSYBOX_INSTALL_DIR="$B/busybox-install" \\',
+            '"$B/../scripts/build/build_busybox.sh"',
+            'WOS_DROPBEAR_BUILD_DIR="$B/dropbear-build" \\',
+            '"$B/../scripts/build/build_dropbear.sh"',
+        ],
+        "WOS target toolchain BusyBox/Dropbear script delegation",
+    )
+
+    forbidden = [
+        'HOSTCC="${WOS_CCACHE_PREFIX}/usr/bin/clang"',
+        "cp $B/busybox-build/busybox $SYSROOT/bin/busybox",
+        "autoconf && autoheader",
+        "cp $B/dropbear-build/dropbearmulti $SYSROOT/bin/dropbearmulti",
+    ]
+    present = [token for token in forbidden if token in source]
+    if present:
+        fail("WOS target toolchain must not keep stale inline BusyBox/Dropbear build logic: " + ", ".join(present))
+
+
+def test_native_wos_clang_port_stages_tablegen_for_next_self_host() -> None:
+    source = WOS_CLANG_BUILD.read_text()
+    require_tokens(
+        source,
+        [
+            'HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"',
+            "llvm-tblgen \\",
+            "clang-tblgen",
+            "install_tool llvm-tblgen",
+            "install_tool clang-tblgen",
+            '-DLLVM_TABLEGEN="$HOST/bin/llvm-tblgen"',
+            '-DCLANG_TABLEGEN="$HOST/bin/clang-tblgen"',
+        ],
+        "native WOS clang tablegen staging",
+    )
+
+
+def test_busybox_and_dropbear_scripts_honor_host_toolchain_override() -> None:
+    busybox = WOS_BUSYBOX_BUILD.read_text()
+    dropbear = WOS_DROPBEAR_BUILD.read_text()
+    require_tokens(
+        busybox,
+        [
+            'export CCACHE_DIR="${TMPDIR:-/tmp}/wos-busybox-ccache"',
+            'B="$WORKSPACE_ROOT/toolchain"',
+            'HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"',
+            "native_host_path() {",
+            "find_native_host_tool() {",
+            'BB_NATIVE_HOSTCC="$(find_native_host_tool cc || true)"',
+            'BB_HOSTCC="${WOS_CCACHE_PREFIX}$BB_NATIVE_HOSTCC"',
+            'BB_INSTALL="${WOS_BUSYBOX_INSTALL_DIR:-$B/busybox-install}"',
+        ],
+        "BusyBox WOS build script host-toolchain override",
+    )
+    require_tokens(
+        busybox,
+        [
+            'make -C "$BB_BUILD" -j"$WOS_MAKE_JOBS" \\',
+            'install >/tmp/busybox_install.log 2>&1',
+        ],
+        "BusyBox WOS install uses serialized GNU Make policy",
+    )
+    require_tokens(
+        dropbear,
+        [
+            'export CCACHE_DIR="${TMPDIR:-/tmp}/wos-dropbear-ccache"',
+            'B="$WORKSPACE_ROOT/toolchain"',
+            'HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"',
+            'TARGET_ARCH="${WOS_TARGET_ARCH:-x86_64-pc-wos}"',
+            'DB_BUILD="${WOS_DROPBEAR_BUILD_DIR:-$B/dropbear-build}"',
+            'DROPBEAR_CONFIGURE_BUILD_ARGS=()',
+            'uname -s 2>/dev/null || printf unknown',
+            'DROPBEAR_CONFIGURE_BUILD_ARGS=(--build="$TARGET_ARCH")',
+            '"${DROPBEAR_CONFIGURE_BUILD_ARGS[@]}"',
+            '--host="$TARGET_ARCH"',
+        ],
+        "Dropbear WOS build script host-toolchain override",
+    )
+
+
+def test_mlibc_script_honors_host_toolchain_override_and_job_helper() -> None:
+    source = WOS_MLIBC_BUILD.read_text()
+    require_tokens(
+        source,
+        [
+            'B="$WORKSPACE_ROOT/toolchain"',
+            'HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"',
+            'WOS_BUILD_JOBS="$(wos_build_jobs)"',
+            'WOS_NINJA_JOBS="$(wos_ninja_jobs)"',
+            'ninja -C "$MLIBC_BUILD" -j"$WOS_NINJA_JOBS"',
+            'ninja -C "$MLIBC_BUILD" -j"$WOS_NINJA_JOBS" install',
+        ],
+        "mlibc WOS build script host-toolchain and job helper",
+    )
+
+
+def test_ninja_script_uses_target_header_stack() -> None:
+    source = WOS_NINJA_BUILD.read_text()
+    require_tokens(
+        source,
+        [
+            'HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"',
+            'TARGET_CXX_FLAGS="--sysroot=$TARGET_SYSROOT',
+            "-isystem $TARGET_SYSROOT/include/c++/v1",
+            "-isystem $HOST/lib/clang/22/include",
+            "-isystem $TARGET_SYSROOT/include",
+            'cached_cxx="$(sed -n \'s/^CMAKE_CXX_COMPILER:[^=]*=//p\' "$NINJA_BUILD/CMakeCache.txt")"',
+            'if [ -n "$cached_cxx" ] && [ "$cached_cxx" != "$HOST/bin/clang++" ]; then',
+            'rm -rf "$NINJA_BUILD"',
+        ],
+        "Ninja WOS build script target header stack",
+    )
+
+
+def test_cmake_script_uses_target_header_stack() -> None:
+    source = WOS_CMAKE_BUILD.read_text()
+    require_tokens(
+        source,
+        [
+            'HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"',
+            'TARGET_C_INCLUDE_FLAGS="-isystem $HOST/lib/clang/22/include -isystem $TARGET_SYSROOT/include"',
+            'TARGET_C_FLAGS="$TARGET_COMMON_FLAGS $TARGET_C_INCLUDE_FLAGS"',
+            'TARGET_CXX_FLAGS="$TARGET_COMMON_FLAGS -std=c++23 -isystem $TARGET_SYSROOT/include/c++/v1 $TARGET_C_INCLUDE_FLAGS"',
+            'cached_cxx="$(sed -n \'s/^CMAKE_CXX_COMPILER:[^=]*=//p\' "$CMAKE_BUILD/CMakeCache.txt")"',
+            'cached_cxx_flags="$(sed -n \'s/^CMAKE_CXX_FLAGS:[^=]*=//p\' "$CMAKE_BUILD/CMakeCache.txt")"',
+            'if [ -n "$cached_cxx" ] && [ "$cached_cxx" != "$HOST/bin/clang++" ]; then',
+            '*" -isystem $TARGET_SYSROOT/include "*)',
+            'if [ -d "$CMAKE_BUILD/CMakeFiles" ] && [ ! -f "$CMAKE_BUILD/CMakeCache.txt" ]; then',
+            'wos_remove_tree "$CMAKE_BUILD"',
+            '-DCMAKE_INSTALL_PREFIX="$TARGET_SYSROOT"',
+            'cmake --install "$CMAKE_BUILD" --prefix "$TARGET_SYSROOT"',
+        ],
+        "CMake WOS build script target header stack",
+    )
+
+
+def test_wos_tls_build_is_self_hostable_without_perl() -> None:
+    source = WOS_TLS_BUILD.read_text()
+    require_tokens(
+        source,
+        [
+            "LIBRESSL_VERSION=\"${WOS_LIBRESSL_VERSION:-4.3.2}\"",
+            "https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-$LIBRESSL_VERSION.tar.gz",
+            "edf01aee24c65d69e6a9efcb9d44bcda682ff9d4f3bbbd95e794e1dfa90847b5",
+            "download_libressl_source",
+            "resolve_tls_source",
+            "patch_config_sub_for_wos \"$TLS_WORK/config.sub\"",
+            "patch_arc4random_for_wos \"$TLS_WORK/crypto/compat/arc4random.h\"",
+            "refresh_libressl_release_generated_files",
+            "sed -i 's/| fiwix\\* | mlibc\\* )/| fiwix* | mlibc* | wos* )/'",
+            "defined(__WOS__)",
+            "#include \"arc4random_netbsd.h\"",
+            "aclocal.m4",
+            "apps/openssl/Makefile.in",
+            "sleep 2",
+            'wos_refresh_file_mtime "$TLS_WORK/$file"',
+            "-D__WOS__=1",
+            'HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"',
+            "TLS_CONFIGURE_BUILD_ARGS=()",
+            "TLS_CONFIGURE_CACHE_ARGS=()",
+            'TLS_CONFIGURE_BUILD_ARGS=(--build="$TARGET_ARCH")',
+            "ac_cv_path_GREP=/usr/bin/grep",
+            '"ac_cv_path_EGREP=/usr/bin/grep -E"',
+            '"ac_cv_path_FGREP=/usr/bin/grep -F"',
+            '"${TLS_CONFIGURE_CACHE_ARGS[@]}"',
+            '"${TLS_CONFIGURE_BUILD_ARGS[@]}"',
+            "remove_cross_libtool_archives",
+            "$TARGET_SYSROOT/lib/libssl.la",
+            "./configure \\",
+            "--host=\"$TARGET_ARCH\"",
+            "--prefix=",
+            "--libdir=/lib",
+            "--disable-shared",
+            "--enable-static",
+            "--disable-tests",
+            "--disable-asm",
+            "make -C \"$TLS_WORK\" -j\"$WOS_MAKE_JOBS\"",
+            "prefix= \\",
+            "exec_prefix= \\",
+            "includedir=/include \\",
+            "pkgconfigdir=/lib/pkgconfig \\",
+            "DESTDIR=\"$TARGET_SYSROOT\" \\",
+            "require_file \"$TARGET_SYSROOT/lib/libssl.a\"",
+            "require_file \"$TARGET_SYSROOT/lib/libcrypto.a\"",
+            "require_file \"$TARGET_SYSROOT/include/openssl/ssl.h\"",
+        ],
+        "WOS self-hosted TLS build path",
+    )
+
+    forbidden = [
+        "command -v perl",
+        "perl Configure",
+        "OPENSSL_TARBALL_URL",
+        "OPENSSL_TARBALL_SHA256",
+        "--prefix=/usr",
+        "--libdir=/usr/lib",
+        "DESTDIR=\"$TARGET_SYSROOT\" install",
+    ]
+    present = [token for token in forbidden if token in source]
+    if present:
+        fail("WOS TLS build path must avoid Perl/OpenSSL Configure dependency: " + ", ".join(present))
+
+
+def test_zlib_install_avoids_sysroot_usr_symlink() -> None:
+    source = (ROOT / "scripts" / "build" / "build_zlib_for_wos.sh").read_text()
+    require_tokens(
+        source,
+        [
+            '"$ZLIB_SOURCE_DIR/configure" --prefix= --static',
+            "prefix= \\",
+            "exec_prefix= \\",
+            "libdir=/lib \\",
+            "includedir=/include \\",
+            "pkgconfigdir=/lib/pkgconfig \\",
+            'DESTDIR="$TARGET_SYSROOT" \\',
+            "install",
+        ],
+        "zlib WOS install path avoids sysroot /usr symlink",
+    )
+
+    forbidden = ['"$ZLIB_SOURCE_DIR/configure" --prefix=/usr --static', 'DESTDIR="$TARGET_SYSROOT" install']
+    present = [token for token in forbidden if token in source]
+    if present:
+        fail("zlib WOS install must avoid installing through the sysroot /usr symlink: " + ", ".join(present))
+
+
+def test_wos_curl_build_uses_native_triplet_and_real_sysroot_install() -> None:
+    source = WOS_CURL_BUILD.read_text()
+    require_tokens(
+        source,
+        [
+            'HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"',
+            "CURL_CONFIGURE_BUILD_ARGS=()",
+            "CURL_CONFIGURE_CACHE_ARGS=()",
+            'CURL_CONFIGURE_BUILD_ARGS=(--build="$TARGET_ARCH")',
+            "ac_cv_path_GREP=/usr/bin/grep",
+            '"ac_cv_path_EGREP=/usr/bin/grep -E"',
+            '"ac_cv_path_FGREP=/usr/bin/grep -F"',
+            '"${CURL_CONFIGURE_CACHE_ARGS[@]}"',
+            '"${CURL_CONFIGURE_BUILD_ARGS[@]}"',
+            '--host="$TARGET_ARCH"',
+            "--prefix=",
+            "--bindir=/bin",
+            "--libdir=/lib",
+            "--includedir=/include",
+            "prefix= \\",
+            "exec_prefix= \\",
+            "bindir=/bin \\",
+            "libdir=/lib \\",
+            "includedir=/include \\",
+            'DESTDIR="$TARGET_SYSROOT" \\',
+            'require_file "$TARGET_SYSROOT/bin/curl"',
+            'require_file "$TARGET_SYSROOT/lib/libcurl.a"',
+        ],
+        "curl native WOS build triplet and install path",
+    )
+
+    forbidden = ["--prefix=/usr", 'DESTDIR="$TARGET_SYSROOT" install']
+    present = [token for token in forbidden if token in source]
+    if present:
+        fail("curl WOS install must avoid installing through the sysroot /usr symlink: " + ", ".join(present))
+
+
+def test_wos_git_install_avoids_sysroot_usr_symlink() -> None:
+    source = WOS_GIT_BUILD.read_text()
+    require_tokens(
+        source,
+        [
+            '"prefix="',
+            '"bindir=/bin"',
+            '"gitexecdir=/libexec/git-core"',
+            '"template_dir=/share/git-core/templates"',
+            '"sysconfdir=/etc"',
+            'GIT_CFLAGS="--sysroot=$TARGET_SYSROOT -O2 -g -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -I. -Icompat/regex -I$TARGET_SYSROOT/include"',
+            '"NO_REGEX=NeedsStartEnd"',
+            '"WOS_SKIP_TEST_ARTIFACTS=YesPlease"',
+            "all:: $(FUZZ_OBJS)",
+            "all:: $(TEST_PROGRAMS) $(test_bindir_programs) $(UNIT_TEST_PROGS) $(CLAR_TEST_PROG)",
+            "ifndef WOS_SKIP_TEST_ARTIFACTS",
+            "templates_makefile",
+            "$(TAR) cf -",
+            "cp -a blt/.",
+            '"DESTDIR=$TARGET_SYSROOT"',
+            'require_file "$TARGET_SYSROOT/bin/git"',
+            'require_file "$TARGET_SYSROOT/libexec/git-core/git"',
+            'require_file "$TARGET_SYSROOT/share/git-core/templates"',
+        ],
+        "Git WOS install path avoids sysroot /usr symlink",
+    )
+
+    forbidden = [
+        '"prefix=/usr"',
+        '"bindir=/usr/bin"',
+        '"gitexecdir=/usr/libexec/git-core"',
+        '"template_dir=/usr/share/git-core/templates"',
+    ]
+    present = [token for token in forbidden if token in source]
+    if present:
+        fail("Git WOS install must avoid installing through the sysroot /usr symlink: " + ", ".join(present))
+
+
+def test_wos_python_ssl_build_handles_libressl_sigalg_gap() -> None:
+    source = WOS_PYTHON_BUILD.read_text()
+    require_tokens(
+        source,
+        [
+            "PYTHON_LIBRESSL_SIGALGS_COMPAT_HEADER",
+            "write_libressl_sigalgs_compat_header()",
+            "LIBRESSL_VERSION_NUMBER",
+            "#define SSL_CTX_set1_client_sigalgs_list(ctx, sigalgslist) (0)",
+            "#define SSL_CTX_set1_sigalgs_list(ctx, sigalgslist) (0)",
+            'PYTHON_CPPFLAGS="$PYTHON_CPPFLAGS -include $PYTHON_LIBRESSL_SIGALGS_COMPAT_HEADER"',
+            'CPPFLAGS="$PYTHON_CPPFLAGS"',
+        ],
+        "CPython _ssl LibreSSL compatibility patch",
+    )
+
+
+def test_mlibc_scanf_float_zero_counts_as_conversion() -> None:
+    source = MLIBC_STDIO.read_text()
+    require_tokens(
+        source,
+        [
+            "if (c == '0') {\n\t\t\t\t\thandler.consume();\n\t\t\t\t\t++count;",
+            "if (c == 'x' || c == 'X') {\n\t\t\t\t\t\tdivisor = 16;\n\t\t\t\t\t\tbase = 16;",
+            "\t\t\t\t\t\tcount = 0;",
+            "NOMATCH_CHECK(count == 0);",
+        ],
+        "mlibc scanf floating zero handling",
+    )
+
+    tests = MLIBC_SSCANF_TEST.read_text()
+    require_tokens(
+        tests,
+        [
+            'assert(sscanf("0", "%lg", &double_value) == 1);',
+            'assert(sscanf("-0", "%lg", &double_value) == 1);',
+            'assert(sscanf("+0", "%lg", &double_value) == 1);',
+            'assert(sscanf("0e0", "%lg", &double_value) == 1);',
+        ],
+        "mlibc scanf floating zero regression tests",
+    )
+
+
 if __name__ == "__main__":
     test_compiler_rt_runs_real_cmake_checks_without_forced_response_files()
     test_compiler_rt_sanitizers_are_built_after_mlibc()
     test_native_wos_compiler_rt_does_not_link_with_workspace_sysroot()
+    test_native_wos_build_defaults_keep_target_ports_enabled()
+    test_wos_build_jobs_helper_has_self_hostable_fallbacks()
+    test_wos_port_build_scripts_use_shared_job_helper()
+    test_gnu_make_port_build_scripts_use_make_job_helper()
+    test_ninja_port_build_scripts_use_ninja_job_helper()
+    test_wos_tar_invocations_use_busybox_compatible_long_options()
+    test_wos_source_copy_wrappers_avoid_busybox_tar_pipelines()
+    test_gnu_make_script_passes_build_triplet_on_wos()
+    test_gnu_make_script_handles_native_wos_autoconf_probes()
+    test_nasm_script_uses_release_tarball_without_self_hosted_autogen()
+    test_cpython_script_uses_target_build_triplet_on_native_wos()
+    test_cpython_install_avoids_sysroot_usr_symlink()
+    test_native_wos_bootstrap_keeps_host_toolchain_shim_discoverable()
+    test_wos_toolchain_uses_shared_busybox_and_dropbear_build_scripts()
+    test_native_wos_clang_port_stages_tablegen_for_next_self_host()
+    test_busybox_and_dropbear_scripts_honor_host_toolchain_override()
+    test_mlibc_script_honors_host_toolchain_override_and_job_helper()
+    test_ninja_script_uses_target_header_stack()
+    test_cmake_script_uses_target_header_stack()
+    test_zlib_install_avoids_sysroot_usr_symlink()
+    test_wos_tls_build_is_self_hostable_without_perl()
+    test_wos_python_ssl_build_handles_libressl_sigalg_gap()
+    test_mlibc_scanf_float_zero_counts_as_conversion()
     print("WOS toolchain bootstrap source invariants hold")

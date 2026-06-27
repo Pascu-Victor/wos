@@ -13,6 +13,8 @@ if [ -z "${CCACHE_DIR:-}" ]; then
 fi
 wos_setup_ccache
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
+WOS_BUILD_JOBS="$(wos_build_jobs)"
+WOS_MAKE_JOBS="$(wos_make_jobs)"
 
 B="$WORKSPACE_ROOT/toolchain"
 HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
@@ -57,9 +59,10 @@ download_zlib_source() {
     fi
 
     echo "$ZLIB_TARBALL_SHA256  $archive" | sha256sum -c - >&2
-    rm -rf "$tmp_dest" "$dest"
+    wos_remove_tree "$tmp_dest"
+    wos_remove_tree "$dest"
     mkdir -p "$tmp_dest"
-    tar -xzf "$archive" -C "$tmp_dest" --strip-components=1
+    tar -xzf "$archive" -C "$tmp_dest" --strip-components 1
     mv "$tmp_dest" "$dest"
 }
 
@@ -76,7 +79,7 @@ resolve_zlib_source() {
         return 0
     fi
 
-    if [ -d "$ZLIB_SRC" ] && [ -n "$(find "$ZLIB_SRC" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    if [ -d "$ZLIB_SRC" ] && wos_dir_has_entries "$ZLIB_SRC"; then
         echo "ERROR: zlib source at $ZLIB_SRC does not contain configure." >&2
         echo "Use a zlib release tree or clear the directory so the release tarball can be downloaded." >&2
         exit 1
@@ -112,12 +115,22 @@ if [ ! -f "$ZLIB_BUILD/Makefile" ] || [ "$ZLIB_SOURCE_DIR/configure" -nt "$ZLIB_
     echo "Configuring zlib for WOS..."
     (
         cd "$ZLIB_BUILD"
-        "$ZLIB_SOURCE_DIR/configure" --prefix=/usr --static
+        "$ZLIB_SOURCE_DIR/configure" --prefix= --static
     )
 fi
 
-make -C "$ZLIB_BUILD" -j"$(nproc)" libz.a
-make -C "$ZLIB_BUILD" DESTDIR="$TARGET_SYSROOT" install
+make -C "$ZLIB_BUILD" -j"$WOS_MAKE_JOBS" libz.a
+make -C "$ZLIB_BUILD" \
+    prefix= \
+    exec_prefix= \
+    libdir=/lib \
+    sharedlibdir=/lib \
+    includedir=/include \
+    mandir=/share/man \
+    man3dir=/share/man/man3 \
+    pkgconfigdir=/lib/pkgconfig \
+    DESTDIR="$TARGET_SYSROOT" \
+    install
 
 require_file "$TARGET_SYSROOT/lib/libz.a" "zlib install did not produce $TARGET_SYSROOT/lib/libz.a."
 require_file "$TARGET_SYSROOT/include/zlib.h" "zlib install did not produce $TARGET_SYSROOT/include/zlib.h."

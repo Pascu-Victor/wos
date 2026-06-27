@@ -15,6 +15,8 @@ WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$WORKSPACE_ROOT/tools/ccache_env.sh"
 wos_setup_ccache
 wos_setup_ccache_cmake_args
+WOS_BUILD_JOBS="$(wos_build_jobs)"
+WOS_NINJA_JOBS="$(wos_ninja_jobs)"
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
 WOS_MESON_COMPILER_PREFIX="$(wos_meson_compiler_prefix)"
 
@@ -31,6 +33,7 @@ export WOS_HOST_TOOLCHAIN_ROOT="$HOST"
 export NINJA_STATUS="[%f/%t %e] "
 
 COMPILER_RT_CMAKE_SYSROOT_ARGS=("-DCMAKE_SYSROOT=$SYSROOT")
+COMPILER_RT_NINJA_JOBS="$WOS_NINJA_JOBS"
 if [ "$HOST_SYSTEM" = "WOS" ]; then
     COMPILER_RT_CMAKE_SYSROOT_ARGS=("-DCMAKE_SYSROOT_COMPILE=$SYSROOT")
 fi
@@ -140,7 +143,7 @@ build_compiler_rt() {
      -DWOS=ON \
      $B/src/llvm-project/compiler-rt
 
-    ninja && ninja install
+    ninja -j"$COMPILER_RT_NINJA_JOBS" && ninja -j"$COMPILER_RT_NINJA_JOBS" install
     install_compiler_rt_resource_dir "$build_sanitizers"
 }
 
@@ -196,7 +199,7 @@ meson_setup_rerunnable "$B/mlibc-headers" --prefix=$SYSROOT \
     -Db_staticpic=disabled \
     $B/src/mlibc
 cd $B/mlibc-headers
-ninja install
+ninja -j"$WOS_NINJA_JOBS" install
 
 # Create minimal CRT files for compiler-rt build (these will be replaced by mlibc later)
 touch empty.c
@@ -307,7 +310,7 @@ meson_setup_rerunnable "$B/mlibc-build" --prefix=$SYSROOT \
   -Db_sanitize=none \
   $B/src/mlibc
 cd $B/mlibc-build
-ninja && ninja install
+ninja -j"$WOS_NINJA_JOBS" && ninja -j"$WOS_NINJA_JOBS" install
 
 # 5. Finish compiler-rt now that mlibc installed the libraries ASAN links to.
 unset LDFLAGS
@@ -367,7 +370,7 @@ cmake -G Ninja \
  -DWOS=ON \
  $B/src/llvm-project/runtimes
 
-ninja && ninja install
+ninja -j"$WOS_NINJA_JOBS" && ninja -j"$WOS_NINJA_JOBS" install
 
 # Generate Clang config file for WOS target triple
 # Must be after all library builds (mlibc, libc++) but before userspace binaries
@@ -381,121 +384,20 @@ CFGEOF
 cd $B/src
 [ ! -d busybox ] && git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/busybox.git
 
-mkdir -p $B/busybox-build
-cd $B/busybox-build
-
-# Cross-compilation variables
-TARGET_SYSROOT="$SYSROOT"
-BB_CC="${WOS_CCACHE_PREFIX}$HOST/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
-BB_AR="$HOST/bin/llvm-ar"
-BB_STRIP="$HOST/bin/llvm-strip"
-BB_RANLIB="$HOST/bin/llvm-ranlib"
-BB_OBJCOPY="$HOST/bin/llvm-objcopy"
-BB_NM="$HOST/bin/llvm-nm"
-BB_HOSTCC="${WOS_CCACHE_PREFIX}gcc"
-BB_CFLAGS="--sysroot=$TARGET_SYSROOT -fno-sanitize=safe-stack -fno-stack-protector"
-BB_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld"
-
-if [ -f $B/src/busybox/configs/wos_defconfig ]; then
-    make -C $B/src/busybox O=$B/busybox-build \
-        CROSS_COMPILE="$HOST/bin/" \
-        CC="$BB_CC" \
-        AR="$BB_AR" \
-        STRIP="$BB_STRIP" \
-        RANLIB="$BB_RANLIB" \
-        OBJCOPY="$BB_OBJCOPY" \
-        NM="$BB_NM" \
-        HOSTCC="$BB_HOSTCC" \
-        CFLAGS="$BB_CFLAGS" \
-        LDFLAGS="$BB_LDFLAGS" \
-        HOSTCC="${WOS_CCACHE_PREFIX}/usr/bin/clang" \
-        KCONFIG_ALLCONFIG=$B/src/busybox/configs/wos_defconfig \
-        allnoconfig
-else
-    make -C $B/src/busybox O=$B/busybox-build \
-        CROSS_COMPILE="$HOST/bin/" \
-        CC="$BB_CC" \
-        AR="$BB_AR" \
-        STRIP="$BB_STRIP" \
-        RANLIB="$BB_RANLIB" \
-        OBJCOPY="$BB_OBJCOPY" \
-        NM="$BB_NM" \
-        HOSTCC="$BB_HOSTCC" \
-        CFLAGS="$BB_CFLAGS" \
-        LDFLAGS="$BB_LDFLAGS" \
-        HOSTCC="${WOS_CCACHE_PREFIX}/usr/bin/clang" \
-        defconfig
-fi
-
-make -C $B/busybox-build -j$(nproc) \
-    CROSS_COMPILE="$HOST/bin/" \
-    CC="$BB_CC" \
-    AR="$BB_AR" \
-    STRIP="$BB_STRIP" \
-    RANLIB="$BB_RANLIB" \
-    OBJCOPY="$BB_OBJCOPY" \
-    NM="$BB_NM" \
-    HOSTCC="$BB_HOSTCC" \
-    CFLAGS="$BB_CFLAGS" \
-    LDFLAGS="$BB_LDFLAGS" \
-    HOSTCC="${WOS_CCACHE_PREFIX}/usr/bin/clang" \
-    busybox
-
-cp $B/busybox-build/busybox $SYSROOT/bin/busybox
-echo "Busybox installed to $SYSROOT/bin/busybox"
+WOS_HOST_TOOLCHAIN_ROOT="$HOST" \
+    WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_BUSYBOX_BUILD_DIR="$B/busybox-build" \
+    WOS_BUSYBOX_INSTALL_DIR="$B/busybox-install" \
+    "$B/../scripts/build/build_busybox.sh"
 
 # 8. Build Dropbear SSH for WOS userspace
 cd $B/src
 [ ! -d dropbear ] && git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/dropbear.git
 
-mkdir -p $B/dropbear-build
-cd $B/dropbear-build
-
-cat > localoptions.h <<'EOF'
-#define DROPBEAR_SFTPSERVER 1
-#define SFTPSERVER_PATH "/usr/libexec/sftp-server"
-#define DROPBEAR_PATH_SSH_PROGRAM "/usr/bin/dbclient"
-#define DROPBEAR_SMALL_CODE 0
-#define DEFAULT_RECV_WINDOW (1024 * 1024)
-#define RECV_MAX_PAYLOAD_LEN (128 * 1024)
-#define TRANS_MAX_PAYLOAD_LEN (64 * 1024)
-EOF
-
-TARGET_SYSROOT="$SYSROOT"
-DROPBEAR_CFLAGS="--sysroot=$TARGET_SYSROOT -O3 -g -fno-sanitize=safe-stack -fno-stack-protector -I$TARGET_SYSROOT/include"
-export CC="${WOS_CCACHE_PREFIX}$HOST/bin/clang --target=x86_64-pc-wos --sysroot=$TARGET_SYSROOT"
-export AR="$HOST/bin/llvm-ar"
-export RANLIB="$HOST/bin/llvm-ranlib"
-export STRIP="$HOST/bin/llvm-strip"
-export CFLAGS="$DROPBEAR_CFLAGS"
-export LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib"
-
-if [ ! -f "$B/src/dropbear/configure" ]; then
-    (cd $B/src/dropbear && autoconf && autoheader)
-fi
-
-if ! grep -q 'wos\*' "$B/src/dropbear/src/config.sub" 2>/dev/null; then
-    sed -i 's/| fiwix\* | mlibc\* | cos\* | mbr\* )/| fiwix* | mlibc* | cos* | mbr* | wos* )/' \
-        "$B/src/dropbear/src/config.sub"
-fi
-
-$B/src/dropbear/configure \
-    --host=x86_64-pc-wos \
-    --prefix="$TARGET_SYSROOT" \
-    --enable-bundled-libtom \
-    --disable-zlib \
-    --disable-pam \
-    --disable-wtmp \
-    --disable-utmp \
-    --disable-utmpx \
-    --disable-lastlog \
-    --disable-syslog \
-    --disable-harden
-
-make -j$(nproc) PROGRAMS="dropbear dbclient dropbearkey scp" MULTI=1 dropbearmulti
-
-cp $B/dropbear-build/dropbearmulti $SYSROOT/bin/dropbearmulti
-echo "Dropbear installed to $SYSROOT/bin/dropbearmulti"
+WOS_HOST_TOOLCHAIN_ROOT="$HOST" \
+    WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_DROPBEAR_BUILD_DIR="$B/dropbear-build" \
+    "$B/../scripts/build/build_dropbear.sh"
 
 # 9. Build GNU make for WOS userspace
 WOS_SYSROOT_PATH="$SYSROOT" \

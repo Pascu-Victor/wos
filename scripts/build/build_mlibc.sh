@@ -16,9 +16,11 @@ WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$WORKSPACE_ROOT/tools/ccache_env.sh"
 wos_setup_ccache
 WOS_MESON_COMPILER_PREFIX="$(wos_meson_compiler_prefix)"
+WOS_BUILD_JOBS="$(wos_build_jobs)"
+WOS_NINJA_JOBS="$(wos_ninja_jobs)"
 
-B=$(pwd)/toolchain
-HOST="$B/host"
+B="$WORKSPACE_ROOT/toolchain"
+HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
 TARGET_SYSROOT="${WOS_SYSROOT_PATH:-$B/sysroot}"
 MLIBC_BUILD="${WOS_MLIBC_BUILD_DIR:-$B/mlibc-build}"
 MLIBC_SRC="$B/src/mlibc"
@@ -88,6 +90,6 @@ else
         "$MLIBC_BUILD" "$MLIBC_SRC"
 fi
 
-ninja -C "$MLIBC_BUILD"
-ninja -C "$MLIBC_BUILD" install
+ninja -C "$MLIBC_BUILD" -j"$WOS_NINJA_JOBS"
+ninja -C "$MLIBC_BUILD" -j"$WOS_NINJA_JOBS" install
 sync

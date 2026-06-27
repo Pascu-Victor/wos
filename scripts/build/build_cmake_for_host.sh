@@ -14,6 +14,8 @@ if [ -z "${CCACHE_DIR:-}" ]; then
 fi
 wos_setup_ccache
 wos_setup_ccache_cmake_args
+WOS_BUILD_JOBS="$(wos_build_jobs)"
+WOS_NINJA_JOBS="$(wos_ninja_jobs)"
 
 B="$WORKSPACE_ROOT/toolchain"
 HOST="$B/host"
@@ -137,7 +139,7 @@ env -u CC -u CXX -u LD -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS \
         -DCMake_BUILD_DEVELOPER_REFERENCE=OFF
 
 env -u CC -u CXX -u LD -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS \
-    cmake --build "$CMAKE_BUILD" --parallel "$(nproc)" --target cmake ctest cpack
+    cmake --build "$CMAKE_BUILD" --parallel "$WOS_NINJA_JOBS" --target cmake ctest cpack
 env -u CC -u CXX -u LD -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS \
     cmake --install "$CMAKE_BUILD" --prefix "$CMAKE_INSTALL"
 

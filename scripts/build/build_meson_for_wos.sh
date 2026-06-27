@@ -7,6 +7,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+source "$WORKSPACE_ROOT/tools/ccache_env.sh"
+
 B="$WORKSPACE_ROOT/toolchain"
 TARGET_SYSROOT="${WOS_SYSROOT_PATH:-$B/sysroot}"
 MESON_SRC="${WOS_MESON_SOURCE_DIR:-$B/src/meson}"
@@ -51,9 +53,10 @@ download_meson_source() {
     fi
 
     echo "$MESON_TARBALL_SHA256  $archive" | sha256sum -c - >&2
-    rm -rf "$tmp_dest" "$dest"
+    wos_remove_tree "$tmp_dest"
+    wos_remove_tree "$dest"
     mkdir -p "$tmp_dest"
-    tar -xzf "$archive" -C "$tmp_dest" --strip-components=1
+    tar -xzf "$archive" -C "$tmp_dest" --strip-components 1
     mv "$tmp_dest" "$dest"
 }
 
@@ -70,7 +73,7 @@ resolve_meson_source() {
         return 0
     fi
 
-    if [ -d "$MESON_SRC" ] && [ -n "$(find "$MESON_SRC" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    if [ -d "$MESON_SRC" ] && wos_dir_has_entries "$MESON_SRC"; then
         echo "ERROR: Meson source at $MESON_SRC does not contain meson.py and mesonbuild/." >&2
         echo "Use the Pascu-Victor/meson source tree or clear the directory so the pinned snapshot can be downloaded." >&2
         exit 1
@@ -83,23 +86,18 @@ resolve_meson_source() {
 copy_source_to_workdir() {
     local source_dir="$1"
 
-    rm -rf "$MESON_WORK"
+    wos_remove_tree "$MESON_WORK"
     mkdir -p "$MESON_WORK"
-    (
-        cd "$source_dir"
-        tar \
-            --exclude='./.git' \
-            --exclude='./.github' \
-            --exclude='./ci' \
-            --exclude='./docs' \
-            --exclude='./manual tests' \
-            --exclude='./test cases' \
-            --exclude='./unittests' \
-            -cf - .
-    ) | (
-        cd "$MESON_WORK"
-        tar -xf -
-    )
+    wos_copy_tree_entries_excluding \
+        "$source_dir" \
+        "$MESON_WORK" \
+        ".git" \
+        ".github" \
+        "ci" \
+        "docs" \
+        "manual tests" \
+        "test cases" \
+        "unittests"
 }
 
 patch_meson_source_for_wos() {
@@ -187,8 +185,13 @@ find_python_site_packages() {
 install_meson_package() {
     local site_packages="$1"
     local dist_info="$site_packages/meson-$MESON_VERSION.dist-info"
+    local old_dist_info
 
-    rm -rf "$site_packages/mesonbuild" "$site_packages"/meson-*.dist-info
+    wos_remove_tree "$site_packages/mesonbuild"
+    for old_dist_info in "$site_packages"/meson-*.dist-info; do
+        [ -e "$old_dist_info" ] || continue
+        wos_remove_tree "$old_dist_info"
+    done
     cp -a "$MESON_WORK/mesonbuild" "$site_packages/mesonbuild"
 
     mkdir -p "$dist_info"

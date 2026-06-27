@@ -105,6 +105,7 @@ setup_wos_host_toolchain_shim() {
     local shim_root="$1"
     local shim_bin="$shim_root/bin"
     local shim_lib="$shim_root/lib"
+    local compat_root="$WORKSPACE_ROOT/toolchain/host"
     local clang_path
     local clangxx_path
     local resource_dir
@@ -138,14 +139,28 @@ setup_wos_host_toolchain_shim() {
     ln -sfn clang "$shim_bin/cc"
     ln -sfn clang++ "$shim_bin/c++"
 
-    for tool in ld.lld llvm-ar llvm-ranlib llvm-strip llvm-objcopy llvm-nm llvm-readelf; do
+    for tool in ld.lld llvm-ar llvm-ranlib llvm-strip llvm-objcopy llvm-nm llvm-readelf llvm-objdump llvm-tblgen clang-tblgen; do
         tool_path="$(find_system_tool "$tool")"
         ln -sfn "$tool_path" "$shim_bin/$tool"
     done
     ln -sfn llvm-ar "$shim_bin/ar"
 
+    if [ -L "$compat_root" ]; then
+        ln -sfn "$(basename "$shim_root")" "$compat_root"
+    elif [ ! -e "$compat_root" ]; then
+        (
+            cd "$WORKSPACE_ROOT/toolchain"
+            ln -sfn "$(basename "$shim_root")" host
+        )
+    elif [ ! -x "$compat_root/bin/clang" ]; then
+        echo "ERROR: $compat_root exists but does not provide bin/clang for native WOS bootstrap." >&2
+        echo "Remove or fix it so build scripts can use the WOS host-toolchain shim." >&2
+        exit 1
+    fi
+
     echo "Using WOS system clang: $clang_path"
     echo "Host toolchain shim: $shim_root"
+    echo "Host toolchain compatibility path: $compat_root"
 }
 
 if [ "$WOS_BOOTSTRAP_HOST_SYSTEM" = "WOS" ]; then
