@@ -34,7 +34,7 @@ Options:
                          (defaults: wos=$DEFAULT_WOS_WORKDIR, linux=$DEFAULT_LINUX_WORKDIR)
   --build-dir NAME        Build directory inside the checkout (default: $DEFAULT_BUILD_DIR)
   --target NAME           CMake target to build (default: $DEFAULT_TARGET)
-  --jobs N                Parallel build jobs passed to cmake --build
+  --jobs N                Parallel build jobs for clone, bootstrap, and build
   --skip-bootstrap        Skip ./tools/bootstrap.sh, useful only for iteration
   --keep-workdir          Refuse to replace an existing checkout in workdir
   --history-file PATH     Append detailed timing rows here
@@ -381,7 +381,14 @@ bootstrap_toolchain() {
 
     (
         cd "$checkout"
-        ./tools/bootstrap.sh
+        if [ -n "$jobs" ]; then
+            WOS_BUILD_JOBS="$jobs" \
+                WOS_NINJA_JOBS="$jobs" \
+                WOS_MAKE_JOBS="$jobs" \
+                ./tools/bootstrap.sh
+        else
+            ./tools/bootstrap.sh
+        fi
     )
 }
 
