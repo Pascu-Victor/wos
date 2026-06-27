@@ -1385,6 +1385,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                         return static_cast<uint64_t>(recheck);
                     }
 
+                    if (current_task_has_deliverable_signal()) {
+                        clear_poll_timeout(task);
+                        return static_cast<uint64_t>(-EINTR);
+                    }
+
                     ker::mod::sched::preemptible_syscall_park("poll", poll_wait_kind, DEADLINE_US);
                 } else {
                     ker::mod::sched::kern_yield();

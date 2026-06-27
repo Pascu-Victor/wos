@@ -613,6 +613,13 @@ inline void preemptible_syscall_park_impl(const char* wait_channel, task::WaitCh
             task->clear_wait_channel();
             return;
         }
+        if (task->has_interrupting_signal_pending()) {
+            task->wake_at_us = 0;
+            task->wants_block = false;
+            task->set_voluntary_blocked(false);
+            task->clear_wait_channel();
+            return;
+        }
         request_local_timer_recheck();
     }
     bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();

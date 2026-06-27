@@ -6,6 +6,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 EPOLL_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "epoll.cpp"
 SYS_NET_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "net" / "sys_net.cpp"
+EXIT_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "exit.cpp"
+SCHEDULER_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.hpp"
 
 
 def fail(message: str) -> None:
@@ -28,6 +30,24 @@ def function_body(source: str, name: str) -> str:
             if depth == 0:
                 return source[brace + 1 : pos]
     fail(f"{name} function body is unterminated")
+
+
+def body_after_marker(source: str, marker: str) -> str:
+    start = source.find(marker)
+    if start < 0:
+        fail(f"marker not found: {marker}")
+    brace = source.find("{", start)
+    if brace < 0:
+        fail(f"function body not found after marker: {marker}")
+    depth = 0
+    for pos in range(brace, len(source)):
+        if source[pos] == "{":
+            depth += 1
+        elif source[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[brace + 1 : pos]
+    fail(f"function body after marker is unterminated: {marker}")
 
 
 def require_order(source: str, *snippets: str) -> None:
@@ -76,10 +96,89 @@ def require_poll_deadline_is_saturating(path: Path) -> None:
         fail(f"{path.relative_to(ROOT)} still uses wrapping poll deadline arithmetic: {present[0]}")
 
 
+def require_poll_waits_are_signal_interruptible() -> None:
+    epoll_source = EPOLL_CPP.read_text()
+    epoll_body = function_body(epoll_source, "epoll_pwait")
+    if "task->sig_pending & ~task->sig_mask" in epoll_body:
+        fail("epoll_pwait bypasses signal disposition checks")
+    require_order(
+        epoll_body,
+        "if (task->has_interrupting_signal_pending())",
+        "bool can_block = (inst->count > 0)",
+        "if (task->has_interrupting_signal_pending())",
+        'ker::mod::sched::preemptible_syscall_park("epoll_wait", poll_wait_kind, DEADLINE_US)',
+    )
+
+    poll_source = SYS_NET_CPP.read_text()
+    poll_start = poll_source.find("case ker::abi::net::ops::POLL:")
+    poll_end = poll_source.find("\n        default:", poll_start)
+    if poll_start < 0 or poll_end < 0:
+        fail("poll syscall case not found")
+    poll_body = poll_source[poll_start:poll_end]
+    require_order(
+        poll_body,
+        "if (current_task_has_deliverable_signal())",
+        "bool can_block = (nfds > 0)",
+        "if (current_task_has_deliverable_signal())",
+        'ker::mod::sched::preemptible_syscall_park("poll", poll_wait_kind, DEADLINE_US)',
+    )
+
+
+def require_preemptible_parking_rechecks_signals() -> None:
+    scheduler_source = SCHEDULER_HPP.read_text()
+    park_body = body_after_marker(
+        scheduler_source,
+        "inline void preemptible_syscall_park_impl(const char* wait_channel, task::WaitChannelKind wait_kind, uint64_t deadline_us",
+    )
+    require_order(
+        park_body,
+        "task->set_wait_channel(wait_channel, wait_kind)",
+        "if (task->wakeup_pending.exchange(false, std::memory_order_acquire))",
+        "if (task->has_interrupting_signal_pending())",
+        "request_local_timer_recheck()",
+    )
+    signal_check = park_body.find("if (task->has_interrupting_signal_pending())")
+    recheck = park_body.find("request_local_timer_recheck()", signal_check)
+    if signal_check < 0 or recheck < 0:
+        fail("preemptible park signal recheck not found")
+    signal_block = park_body[signal_check:recheck]
+    for snippet in [
+        "task->wake_at_us = 0",
+        "task->wants_block = false",
+        "task->set_voluntary_blocked(false)",
+        "task->clear_wait_channel()",
+        "return",
+    ]:
+        if snippet not in signal_block:
+            fail(f"preemptible park signal recheck does not clear wait state: {snippet}")
+
+
+def require_sigchld_wakes_interruptible_waits() -> None:
+    exit_source = EXIT_CPP.read_text()
+    notify_body = body_after_marker(exit_source, "void notify_parent_after_exit_ready")
+    if "parent->sig_pending & ~parent->sig_mask & SIGCHLD_MASK" in notify_body:
+        fail("SIGCHLD notification bypasses signal disposition checks")
+    require_order(
+        notify_body,
+        "parent->sig_pending |= SIGCHLD_MASK",
+        "bool wake_parent = false",
+        "bool signal_wake_parent = false",
+        "task_can_be_interrupted_by_signal(parent)",
+        "parent->has_interrupting_signal_pending()",
+        "if (wake_parent)",
+        "reschedule_on_task_cpu(parent)",
+        "else if (signal_wake_parent)",
+        "ker::mod::sched::wake_task_for_signal(parent)",
+    )
+
+
 def main() -> None:
     require_poll_deadline_is_saturating(EPOLL_CPP)
     require_poll_deadline_is_saturating(SYS_NET_CPP)
-    print("poll and epoll timeout deadlines use saturating arithmetic")
+    require_poll_waits_are_signal_interruptible()
+    require_preemptible_parking_rechecks_signals()
+    require_sigchld_wakes_interruptible_waits()
+    print("poll and epoll waits use saturating deadlines and signal-safe parking")
 
 
 if __name__ == "__main__":

@@ -178,6 +178,11 @@ auto waiter_has_stranded_specific_wait(ker::mod::sched::task::Task* waiter, ker:
            waiter->wait_channel_is(ker::mod::sched::task::WaitChannelKind::WAITPID);
 }
 
+auto task_can_be_interrupted_by_signal(ker::mod::sched::task::Task* task) -> bool {
+    return task != nullptr && (task->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING || task->deferred_task_switch ||
+                               task->is_voluntary_blocked());
+}
+
 auto drain_exit_waiters_for_notify(ker::mod::sched::task::Task* exiting, ExitWaiterBatch& waiting_pids) -> size_t {
     if (exiting == nullptr) {
         return 0;
@@ -225,6 +230,7 @@ void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
     parent->sig_pending |= SIGCHLD_MASK;
 
     bool wake_parent = false;
+    bool signal_wake_parent = false;
     if (waiter_is_blocked_on_different_waitpid_child(parent, child)) {
         wake_parent = false;
     } else if (sched_task::task_waited_on(*child)) {
@@ -233,20 +239,20 @@ void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
         if (waiter_matches_child(parent, child) && waiter_context_can_be_completed(parent)) {
             wake_parent =
                 complete_exit_wait(parent, child, parent->waiting_for_pid == WAIT_ANY_CHILD ? "exit-any" : "exit-specific-parent");
-        } else if ((waiter_matches_child(parent, child) && parent->is_voluntary_blocked()) || parent->deferred_task_switch ||
-                   parent->is_voluntary_blocked()) {
+        } else if (waiter_matches_child(parent, child) && (parent->deferred_task_switch || parent->is_voluntary_blocked())) {
             // The deferred switch path will re-check waitability after it saves
-            // the parent's syscall context.  This is also how unrelated blocking
-            // syscalls notice SIGCHLD promptly.
+            // the parent's syscall context.
             wake_parent = true;
         }
     }
 
+    if (!wake_parent && task_can_be_interrupted_by_signal(parent) && parent->has_interrupting_signal_pending()) {
+        signal_wake_parent = true;
+    }
+
     if (wake_parent) {
         reschedule_on_task_cpu(parent);
-    } else if ((parent->sig_pending & ~parent->sig_mask & SIGCHLD_MASK) != 0 &&
-               parent->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING &&
-               parent->wait_channel_is(ker::mod::sched::task::WaitChannelKind::SIGSUSPEND)) {
+    } else if (signal_wake_parent) {
         ker::mod::sched::wake_task_for_signal(parent);
     }
     parent->release();

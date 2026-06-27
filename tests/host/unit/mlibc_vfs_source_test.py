@@ -42,6 +42,15 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
         fail(f"{context}: missing {', '.join(missing)}")
 
 
+def require_order(source: str, tokens: list[str], context: str) -> None:
+    cursor = -1
+    for token in tokens:
+        index = source.find(token, cursor + 1)
+        if index < 0:
+            fail(f"{context}: missing ordered token {token}")
+        cursor = index
+
+
 def parse_kernel_dt_constants(source: str) -> dict[str, int]:
     matches = re.findall(r"constexpr\s+uint8_t\s+(DT_[A-Z0-9_]+)\s*=\s*(0x[0-9A-Fa-f]+|\d+);", source)
     return {name: int(value, 0) for name, value in matches}
@@ -174,6 +183,64 @@ def test_pselect_empty_fd_sets_do_not_call_epoll_with_zero_maxevents() -> None:
     )
 
 
+def test_pselect_and_epoll_pwait_honor_temporary_signal_masks() -> None:
+    sysdeps = WOS_SYSDEPS_CPP.read_text()
+    apply_body = function_body(
+        sysdeps,
+        r"int\s+apply_wait_signal_mask\(const\s+sigset_t\s+\*sigmask,\s*sigset_t\s+\*old_mask,\s*bool\s+\*restore_mask\)",
+    )
+    require_tokens(
+        apply_body,
+        [
+            "if (!sigmask)",
+            "*restore_mask = false",
+            "ker::process::sigprocmask(SIG_SETMASK, sigmask, old_mask)",
+            "*restore_mask = true",
+        ],
+        "WOS mlibc wait signal-mask apply helper",
+    )
+    restore_body = function_body(sysdeps, r"int\s+restore_wait_signal_mask\(const\s+sigset_t\s+\*old_mask,\s*bool\s+restore_mask\)")
+    require_tokens(
+        restore_body,
+        [
+            "if (!restore_mask)",
+            "ker::process::sigprocmask(SIG_SETMASK, old_mask, nullptr)",
+        ],
+        "WOS mlibc wait signal-mask restore helper",
+    )
+
+    pselect_body = function_body(
+        sysdeps,
+        r"int\s+Sysdeps<Pselect>::operator\(\)\(\s*int\s+num_fds,\s*fd_set\s+\*read_set,\s*fd_set\s+\*write_set,\s*fd_set\s+\*except_set,\s*const\s+struct\s+timespec\s+\*timeout,\s*const\s+sigset_t\s+\*sigmask,\s*int\s+\*num_events\s*\)",
+    )
+    require_order(
+        pselect_body,
+        [
+            "int max = watched_fds < 64 ? watched_fds : 64;",
+            "apply_wait_signal_mask(sigmask, &old_mask, &restore_mask)",
+            "ker::abi::vfs::epoll_pwait_vfs(epfd, out_events, max, timeout_ms)",
+            "restore_wait_signal_mask(&old_mask, restore_mask)",
+        ],
+        "WOS mlibc pselect fd wait signal-mask handling",
+    )
+
+    epoll_body = function_body(
+        sysdeps,
+        r"int\s+Sysdeps<EpollPwait>::operator\(\)\(\s*int\s+epfd,\s*epoll_event\s+\*ev,\s*int\s+n,\s*int\s+timeout,\s*const\s+sigset_t\s+\*sigmask,\s*int\s+\*raised\s*\)",
+    )
+    require_order(
+        epoll_body,
+        [
+            "apply_wait_signal_mask(sigmask, &old_mask, &restore_mask)",
+            "ker::abi::vfs::epoll_pwait_vfs(epfd, ev, n, timeout)",
+            "restore_wait_signal_mask(&old_mask, restore_mask)",
+        ],
+        "WOS mlibc epoll_pwait signal-mask handling",
+    )
+    if "(void)sigmask" in epoll_body:
+        fail("WOS mlibc epoll_pwait must not discard the temporary signal mask")
+
+
 def test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards() -> None:
     syscall_source = KERNEL_SYS_VFS_CPP.read_text()
     require_tokens(
@@ -275,6 +342,7 @@ if __name__ == "__main__":
     test_git_helper_pipe_cloexec_patch_is_preserved_by_mlibc()
     test_mlibc_vfs_wrappers_pass_fd_creation_flags_to_kernel()
     test_pselect_empty_fd_sets_do_not_call_epoll_with_zero_maxevents()
+    test_pselect_and_epoll_pwait_honor_temporary_signal_masks()
     test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards()
     test_kernel_dirfd_resolution_returns_task_visible_paths()
     test_metadata_cache_store_uses_pre_backend_stat_generation()

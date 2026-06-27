@@ -358,8 +358,7 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
             return 0;
         }
 
-        uint64_t const DELIVERABLE = task->sig_pending & ~task->sig_mask;
-        if (DELIVERABLE != 0) {
+        if (task->has_interrupting_signal_pending()) {
             clear_poll_timeout(task);
             vfs_put_file(epfile);
             return -EINTR;
@@ -419,6 +418,12 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
                 clear_poll_timeout(task);
                 vfs_put_file(epfile);
                 return recheck;
+            }
+
+            if (task->has_interrupting_signal_pending()) {
+                clear_poll_timeout(task);
+                vfs_put_file(epfile);
+                return -EINTR;
             }
 
             ker::mod::sched::preemptible_syscall_park("epoll_wait", poll_wait_kind, DEADLINE_US);
