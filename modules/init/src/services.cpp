@@ -22,6 +22,7 @@
 
 namespace {
 constexpr int BACKGROUND_SERVICE_NICE = 10;
+constexpr int INTERACTIVE_SERVICE_NICE = -5;
 constexpr size_t PIPE_READ = 0;
 constexpr size_t PIPE_WRITE = 1;
 constexpr uint32_t DROPBEAR_KEYGEN_TIMEOUT_MS = 30000;
@@ -344,11 +345,11 @@ void start_dropbear() {
         init_log::error("init[%llu]: failed to spawn dropbear", static_cast<unsigned long long>(CPUNO));
     } else {
         register_service("dropbear", DROPBEAR_PID, ServiceKind::NETWORK);
-        int64_t const PRIO_RC = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(DROPBEAR_PID), BACKGROUND_SERVICE_NICE);
+        int64_t const PRIO_RC = ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(DROPBEAR_PID), INTERACTIVE_SERVICE_NICE);
         init_log::info("init[%llu]: dropbear spawned as PID %llu", static_cast<unsigned long long>(CPUNO),
                        static_cast<unsigned long long>(DROPBEAR_PID));
         if (PRIO_RC < 0) {
-            init_log::warn("init[%llu]: failed to lower dropbear priority (%lld)", static_cast<unsigned long long>(CPUNO),
+            init_log::warn("init[%llu]: failed to raise dropbear priority (%lld)", static_cast<unsigned long long>(CPUNO),
                            static_cast<long long>(PRIO_RC));
         }
     }

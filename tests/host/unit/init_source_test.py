@@ -132,6 +132,30 @@ def test_network_startup_poll_is_deadline_bounded() -> None:
     )
 
 
+def test_dropbear_uses_interactive_priority() -> None:
+    source = SERVICES_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "constexpr int INTERACTIVE_SERVICE_NICE = -5",
+        ],
+        "dropbear interactive priority constant",
+    )
+    dropbear_body = function_body(source, "start_dropbear")
+    require_tokens(
+        dropbear_body,
+        [
+            'register_service("dropbear", DROPBEAR_PID, ServiceKind::NETWORK)',
+            "ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(DROPBEAR_PID), INTERACTIVE_SERVICE_NICE)",
+            "dropbear spawned as PID %llu",
+            "failed to raise dropbear priority",
+        ],
+        "dropbear service registration",
+    )
+    if "BACKGROUND_SERVICE_NICE" in dropbear_body:
+        fail("dropbear must not be lowered to background priority; SSH is the benchmark control channel")
+
+
 def test_pivot_root_retries_transient_busy_mount_refs() -> None:
     source = INIT_CPP.read_text()
     require_tokens(
@@ -155,6 +179,7 @@ def test_pivot_root_retries_transient_busy_mount_refs() -> None:
 def main() -> None:
     test_pivot_root_retries_transient_busy_mount_refs()
     test_dropbear_keygen_wait_is_deadline_bounded()
+    test_dropbear_uses_interactive_priority()
     test_network_startup_poll_is_deadline_bounded()
     print("init dropbear key generation and network readiness waits are deadline bounded")
 
