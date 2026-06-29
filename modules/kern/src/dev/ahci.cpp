@@ -535,10 +535,11 @@ auto read_write_disk(volatile HbaPort* port, int portno, uint32_t startl, uint32
     return true;
 }
 
-// Keep ordinary ATA DMA commands capped to 2 MiB. Larger requests are legal in
-// the command fields, but QEMU's AHCI/IDE path aborts multi-megabyte writes in
-// practice, and smaller commands also bound recovery cost after an I/O error.
-constexpr uint32_t AHCI_MAX_SECTORS_PER_CMD = 4096;
+// Keep ordinary ATA DMA commands capped to 512 KiB. Larger requests are legal in
+// the command fields, but QEMU's AHCI/IDE path has proven fragile around
+// multi-megabyte writes in practice, and smaller commands also bound recovery
+// cost after an I/O error.
+constexpr uint32_t AHCI_MAX_SECTORS_PER_CMD = 1024;
 
 // Read sectors from disk - splits large requests into per-command chunks
 auto read_disk(volatile HbaPort* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, uint8_t* buf) -> bool {

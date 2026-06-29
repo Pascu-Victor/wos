@@ -100,7 +100,7 @@ def main() -> None:
     )
     require(
         ahci_source,
-        "constexpr uint32_t AHCI_MAX_SECTORS_PER_CMD = 4096;",
+        "constexpr uint32_t AHCI_MAX_SECTORS_PER_CMD = 1024;",
         "AHCI must split large ordinary ATA DMA transfers into conservative commands",
     )
     require_absent(
