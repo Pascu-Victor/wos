@@ -91,6 +91,7 @@ constexpr uint64_t STREAM_LOCAL_SMALL_FILE_DETACHED_TTL_US = 60000000;
 constexpr uint64_t STREAM_SPLIT_DISTANCE_BYTES = uint64_t{2} * 1024 * 1024;
 constexpr int STREAM_PREMATURE_EOF_RETRIES = 3;
 constexpr size_t PIPE_WAKE_BATCH = 32;
+constexpr size_t PIPE_WAITER_INLINE_CAPACITY = PIPE_WAKE_BATCH * 2;
 constexpr size_t PIPE_DEFAULT_CAPACITY = 256UL * 1024UL;
 constexpr size_t PIPE_DIRECT_MAX_CAPACITY = 256UL * 1024UL;
 constexpr uint64_t ADVISORY_RANGE_EOF = UINT64_MAX;
@@ -2978,8 +2979,11 @@ auto stream_cache_read_eligible(const File* file) -> bool {
         return false;
     }
 
-    return file->fs_type == FSType::TMPFS || file->fs_type == FSType::FAT32 || file->fs_type == FSType::REMOTE ||
-           file->fs_type == FSType::XFS;
+    // Keep local XFS out of the stream cache. Build tools frequently read
+    // files while another process is still generating them; a fresh stat size
+    // can then race ahead of XFS-readable data and make a valid short read look
+    // like a cache-level premature EOF.
+    return file->fs_type == FSType::TMPFS || file->fs_type == FSType::FAT32 || file->fs_type == FSType::REMOTE;
 }
 
 void stream_invalidate_scope_locked(FSType fs_type, const void* scope_key) {
@@ -3640,6 +3644,8 @@ auto build_wki_host_path(const char* hostname, const char* suffix, char* out, si
     return 0;
 }
 
+inline constexpr bool ENABLE_LOADER_PATH_TRACE = false;
+
 auto is_loader_debug_path(const char* path) -> bool {
     if (path == nullptr) {
         return false;
@@ -3648,6 +3654,9 @@ auto is_loader_debug_path(const char* path) -> bool {
 }
 
 void log_loader_path_event(const char* stage, const char* raw_path, const char* resolved_path, const MountPoint* mount, int rc) {
+    if constexpr (!ENABLE_LOADER_PATH_TRACE) {
+        return;
+    }
     if (!is_loader_debug_path(raw_path) && !is_loader_debug_path(resolved_path)) {
         return;
     }
@@ -4918,7 +4927,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
         return TRUNCATE_RET;
     }
     if (open_create_should_invalidate_metadata(f, backend_flags)) {
-        metadata_cache_note_path_changed(path_buffer.data(), nullptr);
+        vfs_cache_notify_path_changed(path_buffer.data(), nullptr);
         metadata_cache_mark_file_data_observed(f);
     }
     if ((flags & ker::vfs::O_NO_CACHE) != 0) {
@@ -7787,6 +7796,7 @@ namespace {
 FileOperations* g_pipe_read_fops_ptr = nullptr;
 FileOperations* g_pipe_write_fops_ptr = nullptr;
 using PipeWakeList = std::array<uint64_t, PIPE_WAKE_BATCH>;
+using PipeWaiterList = ker::util::SmallVec<uint64_t, PIPE_WAITER_INLINE_CAPACITY>;
 struct PipeState {
     char* buf;
     size_t capacity;
@@ -7801,12 +7811,13 @@ struct PipeState {
     std::atomic<int> open_ends{2};
     ker::mod::sys::Spinlock lock;
 
-    // Wait queues for blocking pipe I/O
-    ker::util::SmallVec<uint64_t, 2> readers_waiting;
-    ker::util::SmallVec<uint64_t, 2> writers_waiting;
+    // Wait queues for blocking pipe I/O. Keep a 32-job make jobserver's pipe
+    // waiters inline so registration does not allocate under the pipe lock.
+    PipeWaiterList readers_waiting;
+    PipeWaiterList writers_waiting;
 
-    ker::util::SmallVec<uint64_t, 2> read_poll_waiting;
-    ker::util::SmallVec<uint64_t, 2> write_poll_waiting;
+    PipeWaiterList read_poll_waiting;
+    PipeWaiterList write_poll_waiting;
 };
 
 std::deque<PipeState*> g_pipe_states;
@@ -7944,7 +7955,7 @@ void pipe_init_file(File* file, PipeState* state, FileOperations* fops, int open
     file->dir_fs_count = 0;
 }
 
-auto pipe_register_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
+auto pipe_register_waiter(PipeWaiterList& waiters, uint64_t pid) -> bool {
     for (unsigned long waiter : waiters) {
         if (waiter == pid) {
             return true;
@@ -7953,9 +7964,7 @@ auto pipe_register_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pi
     return waiters.push_back(pid);
 }
 
-auto pipe_register_poll_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
-    return pipe_register_waiter(waiters, pid);
-}
+auto pipe_register_poll_waiter(PipeWaiterList& waiters, uint64_t pid) -> bool { return pipe_register_waiter(waiters, pid); }
 
 auto perf_current_pid() -> uint64_t {
     auto* task = ker::mod::sched::get_current_task();
@@ -8020,7 +8029,7 @@ void perf_record_local_pipe_stage(ker::mod::perf::WkiPerfLocalPipeOp op, uint32_
     perf_record_local_pipe_summary(OP, status, ELAPSED_US, bytes);
 }
 
-void pipe_collect_waiters_locked(ker::util::SmallVec<uint64_t, 2>& waiters, PipeWakeList& pending, size_t* pending_count) {
+void pipe_collect_waiters_locked(PipeWaiterList& waiters, PipeWakeList& pending, size_t* pending_count) {
     size_t copied = 0;
     while (copied < pending.size() && !waiters.empty()) {
         pending[copied++] = waiters.at(0);
@@ -9480,13 +9489,13 @@ auto vfs_selftest_stream_cache_read_eligibility() -> bool {
     remote_read.fs_type = FSType::REMOTE;
     remote_read.vfs_path = path;
 
-    bool const LOCAL_REGULAR_ALLOWED = stream_cache_read_eligible(&xfs_read);
+    bool const LOCAL_REGULAR_REJECTED = !stream_cache_read_eligible(&xfs_read);
     bool const WRITABLE_REJECTED = !stream_cache_read_eligible(&xfs_write);
     bool const NO_CACHE_REJECTED = !stream_cache_read_eligible(&xfs_no_cache);
     bool const ANONYMOUS_REJECTED = !stream_cache_read_eligible(&anonymous_pipe);
     bool const DEVFS_REJECTED = !stream_cache_read_eligible(&devfs_read);
     bool const REMOTE_ALLOWED = stream_cache_read_eligible(&remote_read);
-    return LOCAL_REGULAR_ALLOWED && WRITABLE_REJECTED && NO_CACHE_REJECTED && ANONYMOUS_REJECTED && DEVFS_REJECTED && REMOTE_ALLOWED;
+    return LOCAL_REGULAR_REJECTED && WRITABLE_REJECTED && NO_CACHE_REJECTED && ANONYMOUS_REJECTED && DEVFS_REJECTED && REMOTE_ALLOWED;
 }
 
 auto vfs_selftest_stream_cache_local_detached_ttl() -> bool {
@@ -10040,7 +10049,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
         f->open_flags = flags;
         f->fd_flags = 0;
         if (open_create_should_invalidate_metadata(f, backend_flags)) {
-            metadata_cache_note_path_changed(pathBuffer, nullptr);
+            vfs_cache_notify_path_changed(pathBuffer, nullptr);
             metadata_cache_mark_file_data_observed(f);
         }
         if ((flags & ker::vfs::O_NO_CACHE) != 0) {

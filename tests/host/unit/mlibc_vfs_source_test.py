@@ -282,6 +282,33 @@ def test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards() -> None:
     )
 
 
+def test_kernel_pipe_waiters_cover_32_job_make_without_spinlock_growth() -> None:
+    vfs_core = KERNEL_VFS_CORE_CPP.read_text()
+    require_tokens(
+        vfs_core,
+        [
+            "constexpr size_t PIPE_WAKE_BATCH = 32;",
+            "constexpr size_t PIPE_WAITER_INLINE_CAPACITY = PIPE_WAKE_BATCH * 2;",
+            "using PipeWaiterList = ker::util::SmallVec<uint64_t, PIPE_WAITER_INLINE_CAPACITY>;",
+            "PipeWaiterList readers_waiting;",
+            "PipeWaiterList writers_waiting;",
+            "PipeWaiterList read_poll_waiting;",
+            "PipeWaiterList write_poll_waiting;",
+            "auto pipe_register_waiter(PipeWaiterList& waiters, uint64_t pid) -> bool",
+            "void pipe_collect_waiters_locked(PipeWaiterList& waiters, PipeWakeList& pending, size_t* pending_count)",
+        ],
+        "kernel pipe waiter inline capacity",
+    )
+    for token in [
+        "SmallVec<uint64_t, 2> readers_waiting",
+        "SmallVec<uint64_t, 2> writers_waiting",
+        "SmallVec<uint64_t, 2> read_poll_waiting",
+        "SmallVec<uint64_t, 2> write_poll_waiting",
+    ]:
+        if token in vfs_core:
+            fail(f"kernel pipe waiter list regressed to tiny inline storage: {token}")
+
+
 def test_kernel_dirfd_resolution_returns_task_visible_paths() -> None:
     vfs_core = KERNEL_VFS_CORE_CPP.read_text()
     body = function_body(
@@ -337,6 +364,48 @@ def test_metadata_cache_store_uses_pre_backend_stat_generation() -> None:
         fail("vfs_ktest must cover stale negative metadata stores")
 
 
+def test_open_create_uses_central_cache_notify_path() -> None:
+    vfs_core = KERNEL_VFS_CORE_CPP.read_text()
+    tmpfs = (ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "tmpfs.cpp").read_text()
+
+    for pattern, context in [
+        (r"auto\s+vfs_open\(std::string_view\s+path,\s*int\s+flags,\s*int\s+mode\)\s*->\s*int", "vfs_open"),
+        (
+            r"static\s+auto\s+vfs_open_file_impl\(const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*bool\s+resolve_task_path,\s*bool\s+apply_task_policy\)\s*->\s*File\*",
+            "vfs_open_file_impl",
+        ),
+    ]:
+        body = function_body(vfs_core, pattern)
+        require_tokens(
+            body,
+            [
+                "if (open_create_should_invalidate_metadata(f, backend_flags))",
+                "vfs_cache_notify_path_changed(",
+                "metadata_cache_mark_file_data_observed(f)",
+            ],
+            context,
+        )
+        create_block = body[body.find("if (open_create_should_invalidate_metadata(f, backend_flags))") :]
+        create_block = create_block[: create_block.find("vfs_cache_notify_register_open_file(f)")]
+        if "metadata_cache_note_path_changed" in create_block:
+            fail(f"{context} must not bypass central cache notify for O_CREAT")
+
+    tmpfs_open = function_body(
+        tmpfs,
+        r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode\)\s*->\s*ker::vfs::File\*",
+    )
+    require_tokens(
+        tmpfs_open,
+        [
+            "bool created_by_open = false;",
+            "created_by_open = node != nullptr;",
+            "f->open_create_result_known = (flags & O_CREAT) != 0;",
+            "f->created_by_open = created_by_open;",
+        ],
+        "tmpfs open-create result hints",
+    )
+
+
 if __name__ == "__main__":
     test_kernel_dirent_types_match_mlibc_public_abi()
     test_git_helper_pipe_cloexec_patch_is_preserved_by_mlibc()
@@ -344,6 +413,8 @@ if __name__ == "__main__":
     test_pselect_empty_fd_sets_do_not_call_epoll_with_zero_maxevents()
     test_pselect_and_epoll_pwait_honor_temporary_signal_masks()
     test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards()
+    test_kernel_pipe_waiters_cover_32_job_make_without_spinlock_growth()
     test_kernel_dirfd_resolution_returns_task_visible_paths()
     test_metadata_cache_store_uses_pre_backend_stat_generation()
+    test_open_create_uses_central_cache_notify_path()
     print("WOS mlibc VFS source invariants hold")

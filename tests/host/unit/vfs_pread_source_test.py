@@ -78,9 +78,50 @@ def test_ktest_covers_pread_contract() -> None:
         fail("pread KTEST is missing expected assertions: " + ", ".join(missing))
 
 
+def test_local_xfs_reads_bypass_stream_cache() -> None:
+    source = CORE_CPP.read_text()
+    body = function_body(source, "stream_cache_read_eligible")
+
+    if "file->fs_type == FSType::XFS" in body:
+        fail("local XFS reads must not enter the VFS stream cache")
+    if "file->fs_type == FSType::REMOTE" not in body:
+        fail("remote VFS reads should remain stream-cache eligible")
+
+    selftest_body = function_body(source, "vfs_selftest_stream_cache_read_eligibility")
+    required = [
+        "bool const LOCAL_REGULAR_REJECTED = !stream_cache_read_eligible(&xfs_read)",
+        "bool const REMOTE_ALLOWED = stream_cache_read_eligible(&remote_read)",
+        "return LOCAL_REGULAR_REJECTED &&",
+    ]
+    missing = [token for token in required if token not in selftest_body]
+    if missing:
+        fail("stream-cache eligibility selftest is missing expected assertions: " + ", ".join(missing))
+
+
+def test_loader_path_trace_is_compile_time_disabled_by_default() -> None:
+    source = CORE_CPP.read_text()
+    required = [
+        "inline constexpr bool ENABLE_LOADER_PATH_TRACE = false;",
+        "void log_loader_path_event(",
+        "if constexpr (!ENABLE_LOADER_PATH_TRACE) {",
+        'log::info("loader-path:',
+    ]
+    missing = [token for token in required if token not in source]
+    if missing:
+        fail("loader-path trace guard is missing expected tokens: " + ", ".join(missing))
+
+    function_start = source.find("void log_loader_path_event(")
+    guard = source.find("if constexpr (!ENABLE_LOADER_PATH_TRACE)", function_start)
+    log_call = source.find('log::info("loader-path:', function_start)
+    if function_start < 0 or guard < 0 or log_call < 0 or not (function_start < guard < log_call):
+        fail("loader-path INFO logging must stay behind the compile-time trace guard")
+
+
 def main() -> None:
     test_pread_paths_bypass_stream_cache()
     test_ktest_covers_pread_contract()
+    test_local_xfs_reads_bypass_stream_cache()
+    test_loader_path_trace_is_compile_time_disabled_by_default()
     print("VFS pread source invariants hold")
 
 

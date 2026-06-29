@@ -981,6 +981,7 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ke
     }
 
     TmpNode* node = nullptr;
+    bool created_by_open = false;
 
     tmpfs_lock.lock();
     if (last_slash == nullptr) {
@@ -988,6 +989,7 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ke
         node = tmpfs_lookup(root, rel_path);
         if (node == nullptr && (flags & O_CREAT) != 0) {
             node = tmpfs_create_file(root, rel_path, static_cast<uint32_t>(mode) & 07777);
+            created_by_open = node != nullptr;
         }
     } else {
         // Multi-component path (e.g., "etc/fstab")
@@ -1016,6 +1018,7 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ke
             node = tmpfs_lookup(parent, final_name);
             if (node == nullptr && (flags & O_CREAT) != 0) {
                 node = tmpfs_create_file(parent, final_name, static_cast<uint32_t>(mode) & 07777);
+                created_by_open = node != nullptr;
             }
         }
     }
@@ -1051,6 +1054,8 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ke
     f->is_directory = (node->type == TmpNodeType::DIRECTORY);
     f->fs_type = FSType::TMPFS;
     f->refcount = 1;
+    f->open_create_result_known = (flags & O_CREAT) != 0;
+    f->created_by_open = created_by_open;
     return f;
 }
 
