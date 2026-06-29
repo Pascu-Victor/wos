@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 PHYS_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "phys.opt.cpp"
 PHYS_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "phys.hpp"
+PAGE_ALLOC_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "page_alloc.cpp"
 MM_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "mm_ktest.cpp"
 
 
@@ -28,7 +29,7 @@ def find_matching_brace(source: str, brace: int) -> int:
 
 def function_body(source: str, name: str) -> str:
     match = re.search(
-        rf"\b(?:auto|void)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
+        rf"\b(?:auto|bool|void|uint64_t|void\*)\s+(?:[A-Za-z0-9_:]+::)?{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
         source,
         flags=re.DOTALL,
     )
@@ -126,10 +127,76 @@ def test_selftest_and_ktest_cover_boot_reservation_edges() -> None:
     )
 
 
+def test_buddy_free_list_repair_rebuilds_from_flags() -> None:
+    source = PAGE_ALLOC_CPP.read_text()
+    free_body = function_body(source, "free_allocated_block")
+    alloc_body = function_body(source, "alloc")
+
+    require_tokens(
+        source,
+        [
+            "void rebuild_free_lists_from_flags(PageAllocator* alloc, const char* reason)",
+            "for (auto*& list_head : alloc->free_list)",
+            "link_free_block_unchecked(alloc, ORDER, block);",
+            "auto remove_free_block_with_repair(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block, const char* reason)",
+            "rebuild_free_lists_from_flags(alloc, reason);",
+            "free_block_is_reachable(alloc, order, block)",
+        ],
+        "buddy allocator free-list repair",
+    )
+    if "drop_corrupt_free_list_head" in source:
+        fail("buddy allocator must rebuild corrupt free lists instead of orphaning flagged free heads")
+    require_order(
+        free_body,
+        [
+            "insert_free_block(alloc, k, free_block);",
+            "alloc->free_count += BLOCK_SIZE;",
+        ],
+        "free_count must be updated after rebuilt/coalesced free-head publication",
+    )
+    require_tokens(
+        alloc_body,
+        [
+            "rebuild_free_lists_from_flags(this, \"alloc corrupt head\")",
+            "remove_free_block_with_repair(this, k, block, \"alloc unlink\")",
+            "repaired_free_lists = true;",
+            "k = ORDER;",
+        ],
+        "allocation must retry after free-list rebuild",
+    )
+
+
+def test_direct_page_free_rejects_refcounted_blocks() -> None:
+    source = PAGE_ALLOC_CPP.read_text()
+    helper_body = function_body(source, "allocated_block_has_direct_free_refs")
+    free_body = function_body(source, "free")
+
+    require_tokens(
+        helper_body,
+        [
+            "uint32_t const BLOCK_SIZE = 1U << order;",
+            "alloc->page_refcounts[page_idx + i].load(std::memory_order_acquire) != 1",
+        ],
+        "direct page_free refcount guard helper",
+    )
+    require_tokens(
+        free_body,
+        [
+            "allocated_block_has_direct_free_refs(this, page_idx, ORDER)",
+            "page_alloc: rejecting direct free of refcounted block",
+            "return 0;",
+            "return free_allocated_block(this, page_idx, ORDER);",
+        ],
+        "direct page_free refcount guard",
+    )
+
+
 def main() -> None:
     test_internal_reservation_requires_nonzero_base_and_spare_page()
     test_per_cpu_cache_reservation_uses_selector_not_raw_memmap_base()
     test_selftest_and_ktest_cover_boot_reservation_edges()
+    test_buddy_free_list_repair_rebuilds_from_flags()
+    test_direct_page_free_rejects_refcounted_blocks()
     print("physical memory source invariants hold")
 
 

@@ -66,8 +66,23 @@ def braced_block_after(source: str, token: str) -> str:
 def require_task_has_publish_fence(task_hpp: str, task_cpp: str) -> None:
     if "std::atomic<bool> waitpid_publish_pending{false}" not in task_hpp:
         fail("Task is missing waitpid_publish_pending atomic fence")
+    if "std::atomic<bool> waitpid_completion_claimed{false}" not in task_hpp:
+        fail("Task is missing waitpid completion single-winner atomic")
+    if "uint64_t waitpid_last_repair_us{}" not in task_hpp:
+        fail("Task is missing waitpid fallback repair backoff timestamp")
+    for snippet in [
+        "task_try_claim_waitpid_completion",
+        "task_release_waitpid_completion_claim",
+        "compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)",
+        "task.waitpid_last_repair_us = 0",
+        "task.waitpid_completion_claimed.store(false, std::memory_order_release)",
+    ]:
+        if snippet not in task_hpp:
+            fail(f"Task waitpid completion claim helper is missing snippet: {snippet}")
     if task_cpp.count("waitpid_publish_pending.store(false, std::memory_order_relaxed)") < 2:
         fail("Task initialization paths must clear waitpid_publish_pending")
+    if task_cpp.count("waitpid_completion_claimed.store(false, std::memory_order_relaxed)") < 2:
+        fail("Task initialization paths must clear waitpid_completion_claimed")
 
 
 def require_waited_on_is_atomic_claim(task_hpp: str, task_cpp: str, waitpid_cpp: str, exit_cpp: str, scheduler_cpp: str) -> None:
@@ -101,6 +116,17 @@ def require_waited_on_is_atomic_claim(task_hpp: str, task_cpp: str, waitpid_cpp:
 def require_wait_any_publish_recheck(waitpid_cpp: str) -> None:
     body = function_body(waitpid_cpp, "wos_proc_waitpid")
     wait_any = braced_block_after(body, "if (pid <= 0)")
+    cleanup = function_body(waitpid_cpp, "clear_waitpid_syscall_state")
+    for snippet in [
+        "clear_waitpid_publish_pending(task)",
+        "task->deferred_task_switch = false",
+        "sched_task::task_clear_waitpid_block_state(*task)",
+    ]:
+        if snippet not in cleanup:
+            fail(f"waitpid syscall cleanup helper must clear blocking state and claim: {snippet}")
+    if "clear_waitpid_syscall_state(waiter)" not in function_body(waitpid_cpp, "consume_claimed_exit"):
+        fail("direct waitpid child consumption must use the central syscall cleanup helper")
+
     wnohang_branch = wait_any.find("if ((options & WOS_WNOHANG) != 0)")
     first_publish = wait_any.find("waitpid_publish_pending.store(true, std::memory_order_release)")
     if wnohang_branch < 0 or first_publish < 0 or wnohang_branch > first_publish:
@@ -136,8 +162,19 @@ def require_wait_any_publish_recheck(waitpid_cpp: str) -> None:
         fail("wait-any path is missing the post-publication exit recheck")
     if deferred > second_scan:
         fail("wait-any post-publication recheck must run after deferred_task_switch is set")
-    if wait_any.count("clear_waitpid_publish_pending(current_task)") < 3:
-        fail("wait-any immediate-return paths must clear the publish fence")
+    second_no_child = wait_any.find("if (!has_unwaited_child(current_task))", second_scan)
+    fallthrough_block = wait_any.find("return 0", second_scan)
+    if second_no_child < 0 or fallthrough_block < 0 or not (second_scan < second_no_child < fallthrough_block):
+        fail("wait-any deferred path must recheck for terminal ECHILD before blocking")
+    post_deferred_no_child = braced_block_after(wait_any[second_no_child:], "if (!has_unwaited_child(current_task))")
+    for snippet in [
+        "clear_waitpid_syscall_state(current_task)",
+        "return static_cast<uint64_t>(-ECHILD)",
+    ]:
+        if snippet not in post_deferred_no_child:
+            fail(f"wait-any terminal race recheck must clean state and return ECHILD: {snippet}")
+    if wait_any.count("clear_waitpid_syscall_state(current_task)") < 4:
+        fail("wait-any immediate-return paths must use central cleanup")
 
 
 def require_specific_wait_publish_recheck(waitpid_cpp: str) -> None:
@@ -187,7 +224,9 @@ def require_interrupted_waitpid_cleans_stale_wait_state(task_hpp: str, task_cpp:
         "task.wait_rusage_user_addr = 0",
         "task.wait_resume_rip_user_addr = 0",
         "task.wait_resume_rsp_user_addr = 0",
+        "task.waitpid_last_repair_us = 0",
         "task.clear_wait_channel()",
+        "task.waitpid_completion_claimed.store(false, std::memory_order_release)",
     ]:
         if snippet not in task_hpp:
             fail(f"Task waitpid abort helper must clear stale wait state: {snippet}")
@@ -225,12 +264,17 @@ def require_exit_completion_respects_publish_fence(exit_cpp: str) -> None:
     helper = function_body(exit_cpp, "waiter_context_can_be_completed")
     for snippet in [
         "waiter->deferred_task_switch",
+        "waiter->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING",
+        "waiter->wait_channel_is(ker::mod::sched::task::WaitChannelKind::WAITPID)",
         "!waiter->waitpid_publish_pending.load(std::memory_order_acquire)",
     ]:
         if snippet not in helper:
             fail(f"waiter completion helper is missing publish-fence snippet: {snippet}")
+    if "if (!waiter->waitpid_publish_pending.load(std::memory_order_acquire))" in helper:
+        fail("exit completion must not directly complete a waiter before it reaches the wait queue")
     for token in [
         "waiter_matches_child(parent, child) && waiter_context_can_be_completed(parent)",
+        "parent->wait_channel_is(ker::mod::sched::task::WaitChannelKind::WAITPID)",
         "TRACER_IS_PARENT && !sched_task::task_waited_on(*child) && waiter_context_can_be_completed(tracer)",
         "if (waiter_context_can_be_completed(waiting_task) && waiter_matches_child(waiting_task, current_task) &&\n                    complete_exit_wait(waiting_task, current_task, \"exit-specific\"))",
     ]:
@@ -238,6 +282,9 @@ def require_exit_completion_respects_publish_fence(exit_cpp: str) -> None:
             fail(f"exit notification direct completion is not guarded by publish fence: {token}")
     complete_body = function_body(exit_cpp, "complete_exit_wait")
     for snippet in [
+        "sched_task::task_try_claim_waitpid_completion(*waiter)",
+        "!waiter_matches_child(waiter, child) || !waiter_context_can_be_completed(waiter)",
+        "sched_task::task_release_waitpid_completion_claim(*waiter)",
         "sched_task::task_try_mark_waited_on(*child)",
         "waiter->waitpid_publish_pending.store(false, std::memory_order_release)",
         "waiter->deferred_task_switch = false",
@@ -253,6 +300,54 @@ def require_exit_completion_respects_publish_fence(exit_cpp: str) -> None:
         fail("awaitee_on_exit path must use the common waitpid completion helper")
     if "current_task->waited_on" in exit_cpp:
         fail("awaitee_on_exit path must not mark waited_on for deferred waiters")
+
+
+def require_scheduler_waitpid_completion_claims_waiter(task_hpp: str, waitpid_cpp: str, scheduler_cpp: str) -> None:
+    for snippet in [
+        "waitpid_completion_claimed.store(false, std::memory_order_release)",
+    ]:
+        if snippet not in waitpid_cpp:
+            fail(f"blocking waitpid setup must reset completion claim: {snippet}")
+
+    for name in [
+        "complete_waitpid_exit_for_scheduler",
+        "complete_registered_waitpid_exit_for_scheduler",
+        "complete_waitpid_ptrace_stop_for_scheduler",
+        "complete_waitpid_job_stop_if_waitable",
+    ]:
+        body = function_body(scheduler_cpp, name)
+        if "task::task_try_claim_waitpid_completion(*waiter)" not in body:
+            fail(f"{name} must claim waiter completion before publishing a waitpid result")
+        if "task::task_release_waitpid_completion_claim(*waiter)" not in body:
+            fail(f"{name} must release the waiter completion claim on failed revalidation")
+
+    any_body = function_body(scheduler_cpp, "complete_waitpid_any_for_scheduler")
+    for snippet in [
+        "task::task_try_claim_waitpid_completion(*waiter)",
+        "waiter->waiting_for_pid != WAIT_ANY_CHILD",
+        "task::task_release_waitpid_completion_claim(*waiter)",
+        "waiter->context.regs.rax = static_cast<uint64_t>(-ECHILD)",
+    ]:
+        if snippet not in any_body:
+            fail(f"wait-any ECHILD completion must be claim-protected: {snippet}")
+
+    specific_body = function_body(scheduler_cpp, "complete_waitpid_specific_for_scheduler")
+    for snippet in [
+        "task::task_try_claim_waitpid_completion(*waiter)",
+        "waiter->waiting_for_pid != WAIT_TARGET",
+        "task::task_release_waitpid_completion_claim(*waiter)",
+        "waiter->context.regs.rax = static_cast<uint64_t>(-ECHILD)",
+    ]:
+        if snippet not in specific_body:
+            fail(f"specific waitpid ECHILD completion must be claim-protected: {snippet}")
+
+    preserve_body = function_body(scheduler_cpp, "complete_or_preserve_waitpid_block")
+    for snippet in [
+        "waiter->waitpid_completion_claimed.load(std::memory_order_acquire)",
+        "return waiter->waiting_for_pid == 0;",
+    ]:
+        if snippet not in preserve_body:
+            fail(f"waitpid preserve path must not publish a still-blocked waiter while another completion owns it: {snippet}")
 
 
 def require_exit_waiter_notify_drains_all_batches(exit_cpp: str) -> None:
@@ -278,6 +373,8 @@ def require_waitpid_uses_stable_active_scans(scheduler_hpp: str, scheduler_cpp: 
     for snippet in [
         "using ActiveTaskPredicate = bool (*)(task::Task* task, void* context)",
         "find_active_task_lifetime_ref_if(ActiveTaskPredicate predicate, void* context)",
+        "using DeadTaskPredicate = bool (*)(task::Task* task, void* context)",
+        "find_dead_task_lifetime_ref_if(DeadTaskPredicate predicate, void* context)",
     ]:
         if snippet not in scheduler_hpp:
             fail(f"scheduler must expose stable active-task scan API for waitpid: {snippet}")
@@ -288,6 +385,8 @@ def require_waitpid_uses_stable_active_scans(scheduler_hpp: str, scheduler_cpp: 
         "log_rejected_task_publication(\"active registry full\", cpu_no, task)",
         "pid_table_remove(task->pid)",
         "find_active_task_lifetime_ref_if(ActiveTaskPredicate predicate, void* context)",
+        "find_dead_task_lifetime_ref_if(DeadTaskPredicate predicate, void* context)",
+        "cur->try_acquire_lifetime_ref()",
     ]:
         if snippet not in scheduler_cpp:
             fail(f"scheduler must not silently publish PID-only tasks: {snippet}")
@@ -296,6 +395,9 @@ def require_waitpid_uses_stable_active_scans(scheduler_hpp: str, scheduler_cpp: 
         "find_active_task_lifetime_ref_if(active_waitable_unwaited_child, &ctx)",
         "find_active_task_lifetime_ref_if(active_waitable_specific_child, &ctx)",
         "find_active_task_lifetime_ref_if(active_unwaited_child, &ctx)",
+        "find_dead_task_lifetime_ref_if(active_waitable_unwaited_child, &ctx)",
+        "find_dead_task_lifetime_ref_if(active_waitable_specific_child, &ctx)",
+        "find_dead_task_lifetime_ref_if(active_unwaited_child, &ctx)",
         "return {.task = child, .release_ref = true}",
     ]:
         if snippet not in waitpid_cpp:
@@ -305,10 +407,23 @@ def require_waitpid_uses_stable_active_scans(scheduler_hpp: str, scheduler_cpp: 
         "find_active_task_lifetime_ref_if(active_waitpid_waitable_exit_child, waiter)",
         "find_active_task_lifetime_ref_if(active_waitpid_unwaited_child, waiter)",
         "find_active_task_lifetime_ref_if(active_waitpid_job_stop_child, waiter)",
+        "find_dead_task_lifetime_ref_if(active_waitpid_waitable_exit_child, waiter)",
+        "find_dead_task_lifetime_ref_if(active_waitpid_unwaited_child, waiter)",
+        "find_dead_task_lifetime_ref_if(dead_waitpid_specific_target, waiter)",
+        "child->try_acquire_lifetime_ref()",
+        "entry.task->try_acquire_lifetime_ref()",
     ]
     for snippet in scheduler_required:
         if snippet not in scheduler_cpp:
             fail(f"scheduler waitpid repair must use stable active scans: {snippet}")
+
+    waitpid_forbidden = [
+        "get_dead_task_count(cpu_no)",
+        "get_dead_task_at_safe(cpu_no, i)",
+    ]
+    for snippet in waitpid_forbidden:
+        if snippet in waitpid_cpp:
+            fail(f"waitpid syscall must not index-walk dead lists: {snippet}")
 
 
 def main() -> None:
@@ -328,6 +443,7 @@ def main() -> None:
     require_interrupted_waitpid_cleans_stale_wait_state(task_hpp, task_cpp, scheduler_cpp, exit_cpp)
     require_exit_completion_respects_publish_fence(exit_cpp)
     require_exit_waiter_notify_drains_all_batches(exit_cpp)
+    require_scheduler_waitpid_completion_claims_waiter(task_hpp, waitpid_cpp, scheduler_cpp)
     require_waitpid_uses_stable_active_scans(scheduler_hpp, scheduler_cpp, waitpid_cpp)
     print("waitpid publish/exit notification source invariants hold")
 

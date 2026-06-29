@@ -489,6 +489,8 @@ auto task_selftest_waitpid_block_state_clear_resets_fields() -> bool {
     task.wait_resume_rip_phys_addr = 6;
     task.wait_resume_rsp_user_addr = 7;
     task.wait_resume_rsp_phys_addr = 8;
+    task.waitpid_last_repair_us = 9;
+    task.waitpid_completion_claimed.store(true, std::memory_order_relaxed);
     task.set_wait_channel("waitpid", WaitChannelKind::WAITPID);
 
     task_clear_waitpid_block_state(task);
@@ -496,7 +498,8 @@ auto task_selftest_waitpid_block_state_clear_resets_fields() -> bool {
     return task.waiting_for_pid == 0 && task.wait_status_user_addr == 0 && task.wait_status_phys_addr == 0 &&
            task.wait_rusage_user_addr == 0 && task.wait_rusage_phys_addr == 0 && task.wait_resume_rip_user_addr == 0 &&
            task.wait_resume_rip_phys_addr == 0 && task.wait_resume_rsp_user_addr == 0 && task.wait_resume_rsp_phys_addr == 0 &&
-           task.wait_channel == nullptr && task.wait_channel_kind == WaitChannelKind::NONE;
+           task.waitpid_last_repair_us == 0 && task.wait_channel == nullptr && task.wait_channel_kind == WaitChannelKind::NONE &&
+           !task.waitpid_completion_claimed.load(std::memory_order_acquire);
 }
 #endif
 
@@ -527,6 +530,8 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->zombie_resources_reclaiming.store(false, std::memory_order_relaxed);
     this->zombie_resources_reclaimed.store(false, std::memory_order_relaxed);
     this->waitpid_publish_pending.store(false, std::memory_order_relaxed);
+    this->waitpid_last_repair_us = 0;
+    this->waitpid_completion_claimed.store(false, std::memory_order_relaxed);
     this->deferred_task_switch = false;  // No deferred switch by default
     this->yield_switch = false;
     this->kthread_entry = nullptr;
@@ -928,6 +933,8 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->exit_notify_ready.store(false, std::memory_order_relaxed);
     t->exit_status = 0;
     task_clear_waited_on(*t);
+    t->waitpid_last_repair_us = 0;
+    t->waitpid_completion_claimed.store(false, std::memory_order_relaxed);
     t->zombie_resources_reclaiming.store(false, std::memory_order_relaxed);
     t->zombie_resources_reclaimed.store(false, std::memory_order_relaxed);
     t->waitpid_publish_pending.store(false, std::memory_order_relaxed);

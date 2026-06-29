@@ -103,6 +103,8 @@ struct RunQueue {
     std::atomic<uint64_t> load_balance_pushes;
     std::atomic<uint32_t> cached_load_default;
     std::atomic<uint32_t> cached_load_process;
+    std::atomic<uint32_t> cached_current_load_default;
+    std::atomic<uint32_t> cached_current_load_process;
     std::atomic<uint32_t> placement_reservations;
     std::atomic<bool> resched_timer_pending;
 
@@ -164,6 +166,8 @@ struct RunQueue {
           load_balance_pushes(0),
           cached_load_default(0),
           cached_load_process(0),
+          cached_current_load_default(0),
+          cached_current_load_process(0),
           placement_reservations(0),
           resched_timer_pending(false),
           daemon_load_penalty(0) {
@@ -240,9 +244,19 @@ struct SchedulerCpuState {
     uint32_t current_preempt_depth;
     bool current_preempt_pending;
     uint64_t current_preempt_max_us;
+    bool resched_timer_pending;
     bool is_idle;
     uint64_t runnable_count;
     uint64_t wait_queue_count;
+    uint64_t scheduler_timer_interrupts;
+    uint64_t scheduler_timer_arms;
+    uint64_t scheduler_timer_disarms;
+    uint64_t wake_ipis_sent;
+    uint64_t wake_ipis_coalesced;
+    uint64_t local_reschedule_requests;
+    uint64_t local_reschedule_timer_pokes;
+    uint64_t last_tick_us;
+    uint64_t next_wait_deadline_us;
 };
 
 struct CpuAccountingSnapshot {
@@ -410,8 +424,9 @@ auto get_scheduler_cpu_state(uint64_t cpu_no) -> SchedulerCpuState;
 void dump_scheduler_trace_stats();
 void dump_scheduler_cpu_states();
 
-// Active task enumeration (for procfs)
+// Task enumeration helpers. Returned lifetime refs must be released by callers.
 using ActiveTaskPredicate = bool (*)(task::Task* task, void* context);
+using DeadTaskPredicate = bool (*)(task::Task* task, void* context);
 auto get_active_task_count() -> uint32_t;
 auto get_active_task_at(uint32_t index) -> task::Task*;
 auto get_active_task_at_safe(uint32_t index) -> task::Task*;
@@ -420,6 +435,7 @@ auto debug_find_task_by_kernel_stack(uint64_t rsp) -> task::Task*;
 auto debug_find_dead_task_by_kernel_stack(uint64_t rsp) -> task::Task*;
 auto get_dead_task_count(uint64_t cpu_no) -> size_t;
 auto get_dead_task_at_safe(uint64_t cpu_no, size_t index) -> task::Task*;
+auto find_dead_task_lifetime_ref_if(DeadTaskPredicate predicate, void* context) -> task::Task*;
 
 // Return up to maxEntries dead task PIDs and their refcounts for diagnostics,
 // starting at `startIndex` into the dead list. Returns the number of entries written.

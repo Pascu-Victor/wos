@@ -6,9 +6,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 SCHEDULER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.cpp"
+SCHEDULER_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.hpp"
 TASK_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.hpp"
 CONTEXT_SWITCH_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "context_switch.cpp"
 CONTEXT_SWITCH_ASM = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "context_switch.asm"
+PROCFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.cpp"
+PROCFS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.hpp"
 GDT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "interrupt" / "gdt.cpp"
 GDT_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "interrupt" / "gdt.hpp"
 THREADING_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.cpp"
@@ -17,6 +20,9 @@ TASK_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.cpp"
 EXEC_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "exec.cpp"
 THREAD_CONTROL_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "multiproc" / "threadControl.cpp"
 SCHEDULER_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "scheduler_ktest.cpp"
+NET_BACKLOG_CPP = ROOT / "modules" / "kern" / "src" / "net" / "backlog.cpp"
+NETPOLL_CPP = ROOT / "modules" / "kern" / "src" / "net" / "netpoll.cpp"
+WKI_REMOTE_IPC_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_ipc.cpp"
 
 
 def fail(message: str) -> None:
@@ -25,7 +31,7 @@ def fail(message: str) -> None:
 
 def function_body(source: str, name: str) -> str:
     match = re.search(
-        rf"\b(?:auto|bool|void|Thread\*)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
+        rf"\b(?:\[\[nodiscard\]\]\s+)?(?:inline\s+)?(?:auto|bool|void|Thread\*|uint32_t)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
         source,
         flags=re.DOTALL,
     )
@@ -93,11 +99,12 @@ def test_event_wake_cancel_preserves_current_task_wakeup_token() -> None:
         fail("current-task event wakes must not select a mode that clears wakeup_pending")
 
     current_task_branch = reschedule_body[reschedule_body.find("if (is_current_on_some_cpu)") :]
-    current_task_branch = current_task_branch[: current_task_branch.find("uint64_t const NOW_US")]
+    current_task_branch = current_task_branch[: current_task_branch.find("if (is_waitpid_wait_channel")]
     require_tokens(
         current_task_branch,
         [
             "task->wakeup_pending.store(true, std::memory_order_release)",
+            "wake_cpu(current_cpu_of_task, WakeCpuMode::FORCE)",
         ],
         "reschedule current-task wake token handling",
     )
@@ -155,6 +162,46 @@ def test_wait_channel_policy_uses_typed_kinds() -> None:
     for snippet in forbidden:
         if snippet in low_latency_body or snippet in futex_body:
             fail(f"scheduler wait-channel policy still uses string classification: {snippet}")
+
+
+def test_higher_priority_wakeup_bypasses_only_priority_holdoff_guards() -> None:
+    source = SCHEDULER_CPP.read_text()
+    net_latency_sources = "\n".join([NET_BACKLOG_CPP.read_text(), NETPOLL_CPP.read_text(), WKI_REMOTE_IPC_CPP.read_text()])
+    helper_body = function_body(source, "is_higher_priority_process_contender")
+
+    require_tokens(
+        helper_body,
+        [
+            "current != nullptr",
+            "contender != nullptr",
+            "current->type == task::TaskType::PROCESS",
+            "contender->type == task::TaskType::PROCESS",
+            "contender->sched_nice < current->sched_nice",
+        ],
+        "higher-priority process contender helper",
+    )
+    require_tokens(
+        source,
+        [
+            "bool const HIGHER_PRIORITY_PREEMPT = is_higher_priority_process_contender(current_task, next);",
+            "next->vdeadline >= current_task->vdeadline && !HIGHER_PRIORITY_PREEMPT",
+            "next->just_woke && !HIGHER_PRIORITY_PREEMPT && RUN_DURATION_US < SCHED_MIN_GRANULARITY_US",
+            "bool const LOWER_PRIORITY_PROCESS_PREEMPT",
+            "bool const LOWER_WEIGHT_PREEMPT",
+            "bool const BURSTY_PROCESS_WAKEUP_PREEMPT",
+        ],
+        "higher-priority wakeup preemption guard",
+    )
+    require_tokens(
+        net_latency_sources,
+        [
+            "NET_LATENCY_DAEMON_NICE = -5",
+            "WKI_LATENCY_DAEMON_NICE = -5",
+            "set_task_nice(task, NET_LATENCY_DAEMON_NICE)",
+            "set_task_nice(task, WKI_LATENCY_DAEMON_NICE)",
+        ],
+        "latency-sensitive DAEMON nice configuration",
+    )
 
 
 def test_real_idle_tasks_never_enter_dead_gc() -> None:
@@ -305,6 +352,66 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
     )
 
 
+def test_execve_publishes_new_context_before_old_image_teardown() -> None:
+    source = EXEC_CPP.read_text()
+    body = function_body(source, "wos_proc_execve_impl")
+
+    require_tokens(
+        body,
+        [
+            "auto* old_pagemap_to_destroy = old_pagemap;",
+            "auto* old_thread_to_destroy = old_thread;",
+            "task->pagemap = new_pagemap;",
+            "task->thread = new_thread;",
+            "mm::virt::release_pagemap(old_pagemap_to_destroy);",
+            "mm::virt::release_pagemap(new_pagemap);",
+        ],
+        "execve replacement context publication",
+    )
+    require_order(
+        body,
+        "task->pagemap = new_pagemap;",
+        "ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(old_pagemap_to_destroy);",
+        "execve must stop publishing the old pagemap before old-image teardown can block",
+    )
+    require_order(
+        body,
+        "task->thread = new_thread;",
+        "mod::sched::threading::destroy_thread(old_thread_to_destroy);",
+        "execve must stop publishing the old thread before destroying it",
+    )
+
+    forbidden = [
+        "mm::phys::page_free(old_pagemap)",
+        "mm::phys::page_free(new_pagemap)",
+        "mm::virt::switch_to_kernel_pagemap();\n        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(old_pagemap",
+    ]
+    present = [token for token in forbidden if token in body]
+    if present:
+        fail(f"execve can republish or directly free a live pagemap during image replacement: {present[0]}")
+
+
+def test_pagemap_sibling_check_includes_dead_publishers() -> None:
+    source = SCHEDULER_CPP.read_text()
+    body = function_body(source, "task_has_live_pagemap_sibling")
+
+    require_tokens(
+        body,
+        [
+            "auto* const PAGEMAP = subject->pagemap;",
+            "global_task_registry_lock.lock_irqsave()",
+            "other == nullptr || other == subject || other->pagemap != PAGEMAP",
+            "return true;",
+            "run_queues->with_lock(cpu_no",
+            "rq->dead_list.head",
+            "cur != subject && cur->pagemap == PAGEMAP",
+        ],
+        "pagemap sibling check must include all published task metadata",
+    )
+    if "TaskState::DEAD" in body:
+        fail("exit-time pagemap sibling check must not ignore dead tasks that still publish the pagemap")
+
+
 def test_process_syscall_reschedules_defer_to_syscall_exit() -> None:
     source = CONTEXT_SWITCH_CPP.read_text()
     helper_body = function_body(source, "defer_process_reschedule_to_syscall_exit")
@@ -344,6 +451,461 @@ def test_process_syscall_reschedules_defer_to_syscall_exit() -> None:
         "task->deferred_task_switch = true;",
         "task->clear_wait_channel();",
         "deferred syscall-exit yields must clear stale wait metadata after marking the switch",
+    )
+
+
+def test_scheduler_timer_disarm_clears_pending_reschedule_token() -> None:
+    source = SCHEDULER_CPP.read_text()
+    interrupt_body = function_body(source, "note_scheduler_timer_interrupt")
+    disarm_body = function_body(source, "note_scheduler_timer_disarm")
+    wake_body = function_body(source, "wake_cpu")
+    request_body = function_body(source, "request_local_reschedule")
+
+    require_tokens(
+        interrupt_body,
+        [
+            "rq->scheduler_timer_interrupts.fetch_add(1, std::memory_order_relaxed);",
+            "rq->resched_timer_pending.store(false, std::memory_order_release);",
+        ],
+        "timer interrupt pending-token consumption",
+    )
+    require_tokens(
+        disarm_body,
+        [
+            "rq->resched_timer_pending.store(false, std::memory_order_release);",
+            "rq->scheduler_timer_disarms.fetch_add(1, std::memory_order_relaxed);",
+        ],
+        "timer disarm pending-token clearing",
+    )
+    require_order(
+        disarm_body,
+        "rq->resched_timer_pending.store(false, std::memory_order_release);",
+        "rq->scheduler_timer_disarms.fetch_add(1, std::memory_order_relaxed);",
+        "timer disarm must clear stale pending state before publishing the disarm counter",
+    )
+    require_tokens(
+        wake_body,
+        [
+            "rq->resched_timer_pending.exchange(true, std::memory_order_acq_rel)",
+            "rq->wake_ipis_coalesced.fetch_add(1, std::memory_order_relaxed);",
+        ],
+        "remote wake coalescing depends on non-stale pending token",
+    )
+    require_tokens(
+        request_body,
+        [
+            "rq->resched_timer_pending.exchange(true, std::memory_order_acq_rel)",
+            "rq->resched_timer_pending.store(false, std::memory_order_release);",
+        ],
+        "local wake coalescing depends on non-stale pending token",
+    )
+
+
+def test_scheduler_cpu_dump_is_cmdline_gated_and_reports_reschedule_state() -> None:
+    context_source = CONTEXT_SWITCH_CPP.read_text()
+    scheduler_source = SCHEDULER_CPP.read_text()
+    scheduler_header = SCHEDULER_HPP.read_text()
+    cmdline_body = function_body(context_source, "cmdline_has_token")
+    enabled_body = function_body(context_source, "scheduler_cpu_dump_enabled")
+    timer_body = function_body(context_source, "wos_sched_timer")
+    state_body = function_body(scheduler_source, "get_scheduler_cpu_state")
+    dump_body = function_body(scheduler_source, "dump_scheduler_cpu_states")
+
+    require_tokens(
+        context_source,
+        [
+            "#include <platform/init/limine_requests.hpp>",
+            "std::atomic<int> sched_cpu_dump_enabled{-1};",
+        ],
+        "scheduler CPU dump cmdline cache",
+    )
+    require_tokens(
+        cmdline_body,
+        [
+            "while (*cursor == ' ' || *cursor == '\\t' || *cursor == '\\n')",
+            "std::memcmp(START, token, TOKEN_LEN) == 0",
+        ],
+        "scheduler CPU dump exact cmdline token parser",
+    )
+    require_tokens(
+        enabled_body,
+        [
+            "sched_cpu_dump_enabled.load(std::memory_order_acquire)",
+            'cmdline_has_token(ker::init::get_kernel_cmdline(), "sched.cpu_dump")',
+            "sched_cpu_dump_enabled.store(ENABLED ? 1 : 0, std::memory_order_release);",
+        ],
+        "scheduler CPU dump opt-in gate",
+    )
+    require_tokens(
+        timer_body,
+        [
+            "scheduler_cpu_dump_enabled()",
+            "cpu::current_cpu() == 0",
+            "TICKS % SCHED_CPU_DUMP_PERIOD_TICKS",
+            "sched::dump_scheduler_cpu_states();",
+        ],
+        "scheduler CPU dump timer hook",
+    )
+    require_tokens(
+        scheduler_header,
+        [
+            "bool resched_timer_pending;",
+            "uint64_t scheduler_timer_interrupts;",
+            "uint64_t scheduler_timer_arms;",
+            "uint64_t scheduler_timer_disarms;",
+            "uint64_t wake_ipis_sent;",
+            "uint64_t wake_ipis_coalesced;",
+            "uint64_t local_reschedule_requests;",
+            "uint64_t local_reschedule_timer_pokes;",
+            "uint64_t last_tick_us;",
+            "uint64_t next_wait_deadline_us;",
+        ],
+        "scheduler CPU state diagnostic fields",
+    )
+    require_tokens(
+        state_body,
+        [
+            "state.resched_timer_pending = rq->resched_timer_pending.load(std::memory_order_acquire);",
+            "state.scheduler_timer_interrupts = rq->scheduler_timer_interrupts.load(std::memory_order_relaxed);",
+            "state.scheduler_timer_arms = rq->scheduler_timer_arms.load(std::memory_order_relaxed);",
+            "state.scheduler_timer_disarms = rq->scheduler_timer_disarms.load(std::memory_order_relaxed);",
+            "state.wake_ipis_sent = rq->wake_ipis_sent.load(std::memory_order_relaxed);",
+            "state.wake_ipis_coalesced = rq->wake_ipis_coalesced.load(std::memory_order_relaxed);",
+            "state.local_reschedule_requests = rq->local_reschedule_requests.load(std::memory_order_relaxed);",
+            "state.local_reschedule_timer_pokes = rq->local_reschedule_timer_pokes.load(std::memory_order_relaxed);",
+            "state.last_tick_us = rq->last_tick_us;",
+            "state.next_wait_deadline_us = rq->next_wait_deadline_us;",
+        ],
+        "scheduler CPU state runqueue diagnostic snapshot",
+    )
+    require_tokens(
+        dump_body,
+        [
+            "preempt=%u/%u",
+            "preempt_max_us=%lu",
+            "pending=%u",
+            "timer=%lu/%lu/%lu",
+            "wake=%lu/%lu",
+            "local=%lu/%lu",
+            "last_tick=%lu",
+            "wait_deadline=%lu",
+        ],
+        "scheduler CPU dump diagnostic fields",
+    )
+
+
+def test_placement_load_counts_current_task() -> None:
+    source = SCHEDULER_CPP.read_text()
+    header = SCHEDULER_HPP.read_text()
+    current_load_body = function_body(source, "current_task_load_for_incoming")
+    update_current_body = function_body(source, "update_current_load_cache")
+    publish_body = function_body(source, "publish_current_task")
+    publish_runnable_body = function_body(source, "publish_runnable_task_locked")
+    cached_body = function_body(source, "cached_effective_load_for_cpu")
+
+    require_tokens(
+        header,
+        [
+            "std::atomic<uint32_t> cached_current_load_default;",
+            "std::atomic<uint32_t> cached_current_load_process;",
+            "cached_current_load_default(0)",
+            "cached_current_load_process(0)",
+        ],
+        "runqueue current-task placement load cache",
+    )
+    require_tokens(
+        current_load_body,
+        [
+            "task == nullptr || task->type == task::TaskType::IDLE",
+            "task->is_voluntary_blocked()",
+            "task->wants_block",
+            "task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE",
+            "return task_load_for_incoming(task, incoming_type);",
+        ],
+        "current-task placement load filter",
+    )
+    require_tokens(
+        update_current_body,
+        [
+            "rq->runnable_heap.contains(task)",
+            "rq->cached_current_load_default.store(0, std::memory_order_relaxed)",
+            "rq->cached_current_load_process.store(0, std::memory_order_relaxed)",
+            "current_task_load_for_incoming(task, task::TaskType::DAEMON)",
+            "current_task_load_for_incoming(task, task::TaskType::PROCESS)",
+        ],
+        "current-task placement cache must avoid double-counting heap-contained current tasks",
+    )
+    require_tokens(
+        publish_body,
+        [
+            "rq->current_task = task;",
+            "update_current_load_cache(rq, task);",
+        ],
+        "current-task publication cache update",
+    )
+    if len(re.findall(r"\brq->current_task\s*=(?!=)", source)) != 1:
+        fail("current_task assignments must go through publish_current_task so placement load stays current")
+    require_tokens(
+        publish_runnable_body,
+        [
+            "rq->current_task == t",
+            "update_current_load_cache(rq, t);",
+        ],
+        "runnable publication must refresh current-task placement cache",
+    )
+    require_tokens(
+        cached_body,
+        [
+            "rq->cached_current_load_process.load(std::memory_order_relaxed)",
+            "rq->cached_current_load_default.load(std::memory_order_relaxed)",
+            "rq->placement_reservations.load(std::memory_order_relaxed) * FULL_LOAD",
+        ],
+        "cached placement load must include running current task",
+    )
+
+
+def test_cpu_accounting_snapshot_projects_live_current_runtime() -> None:
+    source = SCHEDULER_CPP.read_text()
+    add_body = function_body(source, "add_runtime_delta_to_cpu_snapshot")
+    kernel_mode_body = function_body(source, "task_in_kernel_mode_for_cpu_snapshot")
+    snapshot_body = function_body(source, "cpu_accounting_snapshot_locked")
+    exported_body = function_body(source, "get_cpu_accounting_snapshot")
+
+    require_tokens(
+        add_body,
+        [
+            "snapshot.idle_us += delta_us;",
+            "snapshot.system_us += delta_us;",
+            "snapshot.nice_us += delta_us;",
+            "snapshot.user_us += delta_us;",
+        ],
+        "live CPU accounting projection buckets",
+    )
+    require_tokens(
+        kernel_mode_body,
+        [
+            "task->type != task::TaskType::PROCESS",
+            "task->is_voluntary_blocked()",
+            "task->context.frame.cs != desc::gdt::GDT_USER_CS",
+        ],
+        "live CPU accounting user/kernel classification",
+    )
+    require_tokens(
+        snapshot_body,
+        [
+            "rq->cpu_user_us.load(std::memory_order_relaxed)",
+            "now_us <= rq->last_tick_us",
+            "auto const* current = rq->current_task;",
+            "now_us - rq->last_tick_us",
+            "!current->is_voluntary_blocked()",
+            "add_runtime_delta_to_cpu_snapshot(snapshot, current, LIVE_DELTA_US, task_in_kernel_mode_for_cpu_snapshot(current), CHARGE_RUNNING_TIME);",
+        ],
+        "live CPU accounting snapshot projection",
+    )
+    require_tokens(
+        exported_body,
+        [
+            "uint64_t const NOW_US = time::get_us();",
+            "cpu_accounting_snapshot_locked(rq, NOW_US)",
+        ],
+        "exported CPU accounting snapshot must include unticked current runtime",
+    )
+
+
+def test_procfs_exposes_scheduler_cpu_state_snapshot() -> None:
+    source = PROCFS_CPP.read_text()
+    header = PROCFS_HPP.read_text()
+    body = function_body(source, "generate_kcpustate")
+
+    require_tokens(
+        header,
+        [
+            "KCPUSTATE_FILE",
+            "/proc/kcpustate -> per-CPU scheduler current/runqueue state",
+        ],
+        "procfs scheduler CPU state node",
+    )
+    require_tokens(
+        source,
+        [
+            "pfd->node.type == ProcNodeType::KCPUSTATE_FILE",
+            "case ProcNodeType::KCPUSTATE_FILE:",
+            "generate_kcpustate(pfd->content, MAX_KPERF_BUF)",
+            'strcmp(path, "kcpustate")',
+        ],
+        "procfs scheduler CPU state wiring",
+    )
+    require_tokens(
+        body,
+        [
+            "ker::mod::sched::get_scheduler_cpu_state(c)",
+            "cpu_state",
+            '"idle"',
+            '"runq"',
+            '"waitq"',
+            '"cur_pid"',
+            '"cur_name"',
+            '"cur_type"',
+            '"cur_vblk"',
+            '"cur_wblk"',
+            '"cur_pinned"',
+            '"preempt_depth"',
+            '"preempt_pending"',
+            '"preempt_max_us"',
+        ],
+        "procfs scheduler CPU state fields",
+    )
+
+
+def test_procfs_status_exposes_waitpid_exit_debug_state() -> None:
+    source = PROCFS_CPP.read_text()
+    body = function_body(source, "generate_status")
+
+    require_tokens(
+        body,
+        [
+            "WaitpidCompletionClaimed",
+            "task->waitpid_completion_claimed.load(std::memory_order_acquire)",
+            "WaitpidLastRepairUs",
+            "task->waitpid_last_repair_us",
+            "ExitInProgress",
+            "task->exit_in_progress ? \"1\" : \"0\"",
+            "ExitNotifyReady",
+            "task->exit_notify_ready.load(std::memory_order_acquire)",
+            "WaitedOn",
+            "task->waited_on.load(std::memory_order_acquire)",
+            "WakeupPending",
+            "task->wakeup_pending.load(std::memory_order_acquire)",
+        ],
+        "procfs waitpid/exit diagnostic state",
+    )
+
+
+def test_handoff_waitpid_wake_queues_out_of_lock_repair() -> None:
+    source = SCHEDULER_CPP.read_text()
+    requeue_body = function_body(source, "requeue_woken_outgoing_task_locked")
+    commit_body = function_body(source, "commit_handoff_task_at_return_boundary")
+
+    require_tokens(
+        source,
+        ["task::Task*& waitpid_repair_task"],
+        "handoff waitpid wake repair parameter",
+    )
+    require_tokens(
+        requeue_body,
+        [
+            "outgoing->wakeup_pending.exchange(false, std::memory_order_acquire)",
+            "is_waitpid_wait_channel(WAIT_CHANNEL) && outgoing->waiting_for_pid != 0",
+            "outgoing->try_acquire()",
+            "waitpid_repair_task = outgoing",
+        ],
+        "handoff waitpid wake must preserve a repair reference",
+    )
+    require_tokens(
+        commit_body,
+        [
+            "task::Task* waitpid_repair_task = nullptr;",
+            "requeue_woken_outgoing_task_locked(rq, outgoing, NOW_US, waitpid_repair_task);",
+            "if (waitpid_repair_task != nullptr)",
+            "reschedule_task_for_cpu(target_cpu, waitpid_repair_task);",
+            "waitpid_repair_task->release();",
+        ],
+        "handoff waitpid wake repair must run after runqueue unlock",
+    )
+    require_order(
+        commit_body,
+        "run_queues->this_cpu_locked_void",
+        "if (waitpid_repair_task != nullptr)",
+        "waitpid handoff repair must run outside the runqueue lock callback",
+    )
+
+
+def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> None:
+    source = SCHEDULER_CPP.read_text()
+    repair_due_body = function_body(source, "waitpid_repair_due")
+    wait_deadline_body = function_body(source, "task_wait_deadline_us")
+    timer_body = function_body(source, "process_tasks")
+    reschedule_body = function_body(source, "reschedule_task_for_cpu")
+
+    require_tokens(
+        source,
+        ["WAITPID_REPAIR_FALLBACK_MIN_US = 50'000ULL"],
+        "waitpid fallback repair threshold",
+    )
+    require_tokens(
+        repair_due_body,
+        [
+            "waiter->wait_channel_is(task::WaitChannelKind::WAITPID)",
+            "waiter->waiting_for_pid == 0",
+            "bool const SIGCHLD_PENDING = (waiter->sig_pending & SIGCHLD_MASK) != 0;",
+            "SIGCHLD_PENDING && waiter->waitpid_last_repair_us == 0",
+            "waiter->waitpid_last_repair_us != 0 ? waiter->waitpid_last_repair_us : waiter->last_sleep_start_us",
+            "now_us - LAST_REPAIR_US >= WAITPID_REPAIR_FALLBACK_MIN_US",
+        ],
+        "waitpid fallback repair predicate",
+    )
+    require_tokens(
+        wait_deadline_body,
+        [
+            "t->wait_channel_is(task::WaitChannelKind::WAITPID)",
+            "t->waiting_for_pid != 0",
+            "t->waitpid_last_repair_us != 0 ? t->waitpid_last_repair_us : t->last_sleep_start_us",
+            "LAST_REPAIR_US + WAITPID_REPAIR_FALLBACK_MIN_US",
+            "min_nonzero_deadline(min_nonzero_deadline(t->wake_at_us, t->itimer_real_expire_us), waitpid_repair_deadline_us)",
+        ],
+        "waitpid repair must arm wait-list deadline without timed wake",
+    )
+    require_tokens(
+        timer_body,
+        [
+            "uint64_t const WAIT_SCAN_NOW_US = time::get_us();",
+            "while (t != nullptr)",
+            "TIMED_SCAN && wake_count < PENDING_WAKE_LIMIT",
+            "waitpid_repair_due(t, WAIT_SCAN_NOW_US) && t->try_acquire()",
+            "t->waitpid_last_repair_us = WAIT_SCAN_NOW_US;",
+            "if (complete_or_preserve_waitpid_block(waiter))",
+            "reschedule_task_for_cpu(target_cpu, waiter);",
+            "waiter->release();",
+        ],
+        "timer waitpid fallback repair flow",
+    )
+    require_order(
+        timer_body,
+        "t->waitpid_last_repair_us = WAIT_SCAN_NOW_US;",
+        "recompute_wait_deadline_locked(rq);",
+        "unresolved waitpid repairs must update their backoff before deadline recompute",
+    )
+    require_order(
+        timer_body,
+        "if (complete_or_preserve_waitpid_block(waiter))",
+        "reschedule_task_for_cpu(target_cpu, waiter);",
+        "waitpid fallback repair must only wake after the wait resolves",
+    )
+    repair_completion_body = timer_body[timer_body.find("for (uint32_t i = 0; i < waitpid_repair_count; ++i)") :]
+    if "waiter->waitpid_last_repair_us = WAIT_SCAN_NOW_US;" in repair_completion_body:
+        fail("waitpid repair backoff must be stamped while holding the runqueue lock")
+
+    waitpid_requeue_start = reschedule_body.find(
+        "if (is_waitpid_wait_channel(task->wait_channel_kind) && task->waiting_for_pid != 0 && !complete_or_preserve_waitpid_block(task))"
+    )
+    waitpid_requeue_end = reschedule_body.find("// Insert into target CPU", waitpid_requeue_start)
+    if waitpid_requeue_start < 0 or waitpid_requeue_end < 0:
+        fail("waitpid preserve requeue branch not found")
+    waitpid_requeue_body = reschedule_body[waitpid_requeue_start:waitpid_requeue_end]
+    require_tokens(
+        waitpid_requeue_body,
+        [
+            "if (task->last_sleep_start_us == 0)",
+            "task->last_sleep_start_us = time::get_us();",
+            "wait_list_push_locked(rq, task);",
+        ],
+        "waitpid preserve requeue must keep fallback repair armed",
+    )
+    require_order(
+        waitpid_requeue_body,
+        "task->last_sleep_start_us = time::get_us();",
+        "wait_list_push_locked(rq, task);",
+        "waitpid requeue must restore the sleep timestamp before publishing to the wait list",
     )
 
 
@@ -445,14 +1007,128 @@ def test_deferred_user_switch_commits_after_stack_handoff() -> None:
     )
 
 
+def test_voluntary_blocked_current_cannot_hide_runnable_peer() -> None:
+    source = SCHEDULER_CPP.read_text()
+    exclude_body = function_body(source, "pick_best_eligible_excluding_locked")
+    switch_pick_body = function_body(source, "pick_best_eligible_for_switch_locked")
+
+    require_tokens(
+        exclude_body,
+        [
+            "for (uint32_t idx = 0; idx < rq->runnable_heap.size; ++idx)",
+            "task::Task* candidate = run_heap_entry(rq->runnable_heap, idx)",
+            "candidate == excluded",
+            "int64_t const LAG = avg_vruntime - candidate->vruntime",
+            "return best_eligible != nullptr ? best_eligible : best_any",
+        ],
+        "voluntary-block alternate runnable selection",
+    )
+    require_tokens(
+        switch_pick_body,
+        [
+            "task::Task* next = rq->runnable_heap.pick_best_eligible(avg_vruntime)",
+            "next == current_task",
+            "current_task->is_voluntary_blocked()",
+            "rq->runnable_heap.size > 1",
+            "pick_best_eligible_excluding_locked(rq, avg_vruntime, current_task)",
+        ],
+        "voluntary-block current-task switch selection",
+    )
+    timer_body = source[source.find("// ---- Running task path: update EEVDF bookkeeping, maybe preempt ----") :]
+    require_tokens(
+        timer_body,
+        [
+            "auto* next = pick_best_eligible_for_switch_locked(rq, AVG, current_task)",
+            "if (next == nullptr || next == current_task)",
+        ],
+        "timer path must not let a voluntary-blocked current task hide runnable peers",
+    )
+
+
+def test_runnable_publication_requires_successful_heap_insert() -> None:
+    source = SCHEDULER_CPP.read_text()
+    publish_body = function_body(source, "publish_runnable_task_locked")
+    post_body = function_body(source, "post_task_for_cpu_impl")
+
+    require_tokens(
+        publish_body,
+        [
+            "rq->runnable_heap.contains(t)",
+            "repair_stale_wait_membership_locked(rq, t)",
+            "t->heap_index >= 0",
+            'dbg::panic_handler("scheduler: runnable publish refused with stale heap index")',
+            "if (!rq->runnable_heap.insert(t))",
+            'dbg::panic_handler("scheduler: runnable heap full")',
+            "add_to_sums(rq, t);",
+            "t->sched_queue = task::Task::sched_queue::RUNNABLE;",
+        ],
+        "runnable publication helper",
+    )
+    require_order(
+        publish_body,
+        "if (!rq->runnable_heap.insert(t))",
+        "add_to_sums(rq, t);",
+        "runnable publication must account only after a successful insert",
+    )
+    require_order(
+        publish_body,
+        "add_to_sums(rq, t);",
+        "t->sched_queue = task::Task::sched_queue::RUNNABLE;",
+        "runnable state must be published after heap accounting",
+    )
+    if source.count("runnable_heap.insert(") != 1:
+        fail("runqueue insertion must go through publish_runnable_task_locked")
+    require_tokens(
+        source,
+        [
+            'publish_runnable_task_locked(rq, outgoing, "requeue-woken-outgoing")',
+            'publish_runnable_task_locked(our_rq, stolen, "work-steal")',
+            'publish_runnable_task_locked(rq, task, "post-task")',
+            'publish_runnable_task_locked(target_rq, task, "move-target")',
+            'publish_runnable_task_locked(owner_rq, task, "move-rollback")',
+            'publish_runnable_task_locked(rq, task, "kernel-thread-shutdown")',
+            'publish_runnable_task_locked(rq, w, "timer-wake")',
+            'publish_runnable_task_locked(rq, current_task, "proxy-block-wake")',
+            'publish_runnable_task_locked(rq, task, "reschedule")',
+        ],
+        "runnable publication call sites",
+    )
+    require_tokens(
+        post_body,
+        [
+            "bool posted = false;",
+            "posted = publish_runnable_task_locked(rq, task, \"post-task\")",
+            "if (!posted)",
+            "active_list_remove(task->pid)",
+            "pid_table_remove(task->pid)",
+            'log_rejected_task_publication("runnable heap insert failed", cpu_no, task)',
+            "return false;",
+        ],
+        "new task publication failure rollback",
+    )
+
+
 def main() -> None:
     test_event_wake_cancel_preserves_current_task_wakeup_token()
     test_wait_channel_policy_uses_typed_kinds()
+    test_higher_priority_wakeup_bypasses_only_priority_holdoff_guards()
     test_runtime_accounting_deltas_are_saturating()
     test_user_thread_tcbs_publish_nonzero_tid_before_user_execution()
+    test_execve_publishes_new_context_before_old_image_teardown()
+    test_pagemap_sibling_check_includes_dead_publishers()
     test_process_syscall_reschedules_defer_to_syscall_exit()
+    test_scheduler_timer_disarm_clears_pending_reschedule_token()
+    test_scheduler_cpu_dump_is_cmdline_gated_and_reports_reschedule_state()
+    test_placement_load_counts_current_task()
+    test_cpu_accounting_snapshot_projects_live_current_runtime()
+    test_procfs_exposes_scheduler_cpu_state_snapshot()
+    test_procfs_status_exposes_waitpid_exit_debug_state()
+    test_handoff_waitpid_wake_queues_out_of_lock_repair()
+    test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld()
     test_context_switch_updates_tss_rsp0_to_task_stack()
     test_deferred_user_switch_commits_after_stack_handoff()
+    test_voluntary_blocked_current_cannot_hide_runnable_peer()
+    test_runnable_publication_requires_successful_heap_insert()
     print("scheduler wake-token and runtime accounting invariants hold")
 
 

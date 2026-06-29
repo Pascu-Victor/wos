@@ -5,8 +5,10 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <platform/asm/msr.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -702,7 +704,6 @@ constexpr uint64_t APIC_TIMER_MAX_COUNT = 0xFFFFFFFFULL;
 std::atomic<uint64_t> timer_tick_count{0};
 
 constexpr bool K_ENABLE_SCHED_HOT_LOGGING = false;
-constexpr bool K_ENABLE_SCHED_CPU_DUMP = false;
 
 constexpr auto TIMER_FRAME_USER_CS = desc::gdt::GDT_USER_CS;
 constexpr auto TIMER_FRAME_KERNEL_CS = desc::gdt::GDT_KERN_CS;
@@ -719,6 +720,45 @@ struct HotTaskTracker {
 
 [[maybe_unused]]
 std::array<HotTaskTracker, 16> hot_task_trackers;
+
+std::atomic<int> sched_cpu_dump_enabled{-1};
+
+auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
+    if (cmdline == nullptr || token == nullptr || token[0] == '\0') {
+        return false;
+    }
+
+    size_t const TOKEN_LEN = std::strlen(token);
+    const char* cursor = cmdline;
+    while (*cursor != '\0') {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n') {
+            cursor++;
+        }
+
+        const char* const START = cursor;
+        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t' && *cursor != '\n') {
+            cursor++;
+        }
+
+        auto const ARG_LEN = static_cast<size_t>(cursor - START);
+        if (ARG_LEN == TOKEN_LEN && std::memcmp(START, token, TOKEN_LEN) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+auto scheduler_cpu_dump_enabled() -> bool {
+    int const CACHED = sched_cpu_dump_enabled.load(std::memory_order_acquire);
+    if (CACHED >= 0) {
+        return CACHED != 0;
+    }
+
+    bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "sched.cpu_dump");
+    sched_cpu_dump_enabled.store(ENABLED ? 1 : 0, std::memory_order_release);
+    return ENABLED;
+}
 
 [[maybe_unused]]
 inline auto hot_task_tracker_slot(uint64_t cpu_no) -> HotTaskTracker& {
@@ -879,8 +919,7 @@ void dump_irq_stats() {
 #endif  // SCHED_DEBUG
 
 extern "C" void wos_sched_timer(void* stack_ptr) {
-    [[maybe_unused]] uint64_t const IRQ_ACCOUNT_STARTED_US =
-        (K_ENABLE_SCHED_HOT_LOGGING || K_ENABLE_SCHED_CPU_DUMP) ? ker::mod::time::get_us() : 0;
+    [[maybe_unused]] uint64_t const IRQ_ACCOUNT_STARTED_US = K_ENABLE_SCHED_HOT_LOGGING ? ker::mod::time::get_us() : 0;
     apic::eoi();
     sched::note_scheduler_timer_interrupt();
 
@@ -924,43 +963,40 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
         sched::note_scheduler_timer_disarm();
     }
 
-    if constexpr (K_ENABLE_SCHED_HOT_LOGGING || K_ENABLE_SCHED_CPU_DUMP) {
+    if constexpr (K_ENABLE_SCHED_HOT_LOGGING) {
         uint64_t const CPU_NO = cpu::current_cpu();
-        if constexpr (K_ENABLE_SCHED_HOT_LOGGING) {
-            if (CPU_NO < hot_task_trackers.size()) {
-                auto& tracker = hot_task_tracker_slot(CPU_NO);
-                uint64_t const CURRENT_PID = return_task != nullptr ? return_task->pid : 0;
+        if (CPU_NO < hot_task_trackers.size()) {
+            auto& tracker = hot_task_tracker_slot(CPU_NO);
+            uint64_t const CURRENT_PID = return_task != nullptr ? return_task->pid : 0;
 
-                if (CURRENT_PID != 0 && CURRENT_PID == tracker.last_pid) {
-                    tracker.streak++;
-                } else {
-                    tracker.last_pid = CURRENT_PID;
-                    tracker.streak = CURRENT_PID != 0 ? 1 : 0;
-                }
-
-                if (return_task != nullptr && return_task->type != sched::task::TaskType::IDLE && tracker.streak != 0 &&
-                    (tracker.streak % HOT_TASK_STREAK_TICKS) == 0) {
-                    auto stats = sched::get_run_queue_stats(CPU_NO);
-                    dbg::log("schedhot: cpu%lu pid=%lu(%s) streak=%lu type=%u vblk=%u wblk=%u pinned=%u runq=%lu waitq=%lu cs=0x%x",
-                             static_cast<unsigned long>(CPU_NO), static_cast<unsigned long>(return_task->pid),
-                             return_task->name != nullptr ? return_task->name : "?", static_cast<unsigned long>(tracker.streak),
-                             static_cast<unsigned>(return_task->type), return_task->is_voluntary_blocked() ? 1U : 0U,
-                             return_task->wants_block ? 1U : 0U, return_task->cpu_pinned ? 1U : 0U,
-                             static_cast<unsigned long>(stats.active_task_count), static_cast<unsigned long>(stats.wait_queue_count),
-                             static_cast<unsigned>(frame_ptr->cs));
-                }
-
-                uint64_t const IRQ_ACCOUNT_FINISHED_US = ker::mod::time::get_us();
-                sched::account_irq_time_us(
-                    IRQ_ACCOUNT_FINISHED_US >= IRQ_ACCOUNT_STARTED_US ? IRQ_ACCOUNT_FINISHED_US - IRQ_ACCOUNT_STARTED_US : 0);
+            if (CURRENT_PID != 0 && CURRENT_PID == tracker.last_pid) {
+                tracker.streak++;
+            } else {
+                tracker.last_pid = CURRENT_PID;
+                tracker.streak = CURRENT_PID != 0 ? 1 : 0;
             }
-        }
 
-        if constexpr (K_ENABLE_SCHED_CPU_DUMP) {
-            if (CPU_NO == 0 && (TICKS % SCHED_CPU_DUMP_PERIOD_TICKS) == (SCHED_CPU_DUMP_PERIOD_TICKS - 1)) {
-                sched::dump_scheduler_cpu_states();
+            if (return_task != nullptr && return_task->type != sched::task::TaskType::IDLE && tracker.streak != 0 &&
+                (tracker.streak % HOT_TASK_STREAK_TICKS) == 0) {
+                auto stats = sched::get_run_queue_stats(CPU_NO);
+                dbg::log("schedhot: cpu%lu pid=%lu(%s) streak=%lu type=%u vblk=%u wblk=%u pinned=%u runq=%lu waitq=%lu cs=0x%x",
+                         static_cast<unsigned long>(CPU_NO), static_cast<unsigned long>(return_task->pid),
+                         return_task->name != nullptr ? return_task->name : "?", static_cast<unsigned long>(tracker.streak),
+                         static_cast<unsigned>(return_task->type), return_task->is_voluntary_blocked() ? 1U : 0U,
+                         return_task->wants_block ? 1U : 0U, return_task->cpu_pinned ? 1U : 0U,
+                         static_cast<unsigned long>(stats.active_task_count), static_cast<unsigned long>(stats.wait_queue_count),
+                         static_cast<unsigned>(frame_ptr->cs));
             }
+
+            uint64_t const IRQ_ACCOUNT_FINISHED_US = ker::mod::time::get_us();
+            sched::account_irq_time_us(IRQ_ACCOUNT_FINISHED_US >= IRQ_ACCOUNT_STARTED_US ? IRQ_ACCOUNT_FINISHED_US - IRQ_ACCOUNT_STARTED_US
+                                                                                         : 0);
         }
+    }
+
+    if (scheduler_cpu_dump_enabled() && cpu::current_cpu() == 0 &&
+        (TICKS % SCHED_CPU_DUMP_PERIOD_TICKS) == (SCHED_CPU_DUMP_PERIOD_TICKS - 1)) {
+        sched::dump_scheduler_cpu_states();
     }
 
 #ifdef SCHED_DEBUG

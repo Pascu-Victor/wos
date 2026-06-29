@@ -236,10 +236,45 @@ def test_cow_write_resolution_serializes_pte_reference_consumption() -> None:
     )
 
 
+def test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free() -> None:
+    source = VIRT_CPP.read_text()
+    release_body = function_body(source, "try_release_page_table_to_pool")
+    release_pagemap_body = function_body(source, "release_pagemap")
+
+    require_tokens(
+        release_body,
+        [
+            "for (size_t i = 0; i < pool.count; ++i)",
+            "pool.pages.at(i) == table",
+            "duplicate page-table pool release",
+            "return true;",
+            "raced duplicate page-table pool release",
+            "zero_page_table_for_pool(table);",
+        ],
+        "page-table pool duplicate release guard",
+    )
+    require_order(
+        release_body,
+        "pool.pages.at(i) == table",
+        "zero_page_table_for_pool(table);",
+        "page-table pool duplicate detection must run before zeroing/reinserting",
+    )
+    require_tokens(
+        release_pagemap_body,
+        [
+            "if (try_release_page_table_to_pool(pagemap))",
+            "return;",
+            "phys::page_free(pagemap);",
+        ],
+        "release_pagemap pool handoff",
+    )
+
+
 def main() -> None:
     test_nonfixed_mmap_address_selection_is_reserved_before_mapping()
     test_owned_frame_tracking_is_disabled_off_the_fault_path()
     test_cow_write_resolution_serializes_pte_reference_consumption()
+    test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free()
     print("vmem mmap, owned-frame, and COW invariants hold")
 
 

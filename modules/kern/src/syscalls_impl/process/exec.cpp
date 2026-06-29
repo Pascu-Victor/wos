@@ -1263,7 +1263,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         if (new_pagemap != nullptr) {
             ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(new_pagemap);
             mm::virt::destroy_user_space(new_pagemap, task->pid, new_name != nullptr ? new_name : task->name, "exec-new-image-cleanup");
-            mm::phys::page_free(new_pagemap);
+            mm::virt::release_pagemap(new_pagemap);
             new_pagemap = nullptr;
         }
         if (new_thread != nullptr) {
@@ -1702,28 +1702,37 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     }
     end_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, COMMIT_STAGE, 0, 0, WOS_PERF_CALLSITE());
 
+    auto* old_pagemap_to_destroy = old_pagemap;
+    auto* old_thread_to_destroy = old_thread;
+    old_pagemap = nullptr;
+    old_thread = nullptr;
+
+    // Publish the new execution context before old-image teardown. The release
+    // paths below may block or yield, so scheduler/procfs observers must never
+    // see task->pagemap/task->thread pointing at storage that is being freed.
+    task->pagemap = new_pagemap;
+    task->thread = new_thread;
+
+    auto phys_pagemap = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(new_pagemap)));
+    asm volatile("mov %0, %%cr3" : : "r"(phys_pagemap) : "memory");
+
     // execve() replaces the current image in-place, so the old address space
     // and thread backing storage must be reclaimed now rather than deferred to
     // task GC. Otherwise each successful exec leaks another user stack/TLS set
     // plus the old pagemap's user pages.
     LocalProcStage const DESTROY_OLD_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::DESTROY_OLD, 0, WOS_PERF_CALLSITE());
     ker::syscall::shm::shm_cleanup_for_task(task);
-    if (old_pagemap != nullptr && old_pagemap != new_pagemap) {
-        mm::virt::switch_to_kernel_pagemap();
-        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(old_pagemap);
-        mm::virt::destroy_user_space(old_pagemap, task->pid, task->name, "exec-old-image");
-        mm::phys::page_free(old_pagemap);
-        old_pagemap = nullptr;
+    if (old_pagemap_to_destroy != nullptr && old_pagemap_to_destroy != new_pagemap) {
+        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(old_pagemap_to_destroy);
+        mm::virt::destroy_user_space(old_pagemap_to_destroy, task->pid, task->name, "exec-old-image");
+        mm::virt::release_pagemap(old_pagemap_to_destroy);
     }
-    if (old_thread != nullptr && old_thread != new_thread) {
-        old_thread->tls_phys_ptr = 0;
-        old_thread->stack_phys_ptr = 0;
-        mod::sched::threading::destroy_thread(old_thread);
+    if (old_thread_to_destroy != nullptr && old_thread_to_destroy != new_thread) {
+        old_thread_to_destroy->tls_phys_ptr = 0;
+        old_thread_to_destroy->stack_phys_ptr = 0;
+        mod::sched::threading::destroy_thread(old_thread_to_destroy);
     }
     end_local_proc_stage(task, perf::WkiPerfLocalProcOp::DESTROY_OLD, DESTROY_OLD_STAGE, 0, 0, WOS_PERF_CALLSITE());
-
-    task->pagemap = new_pagemap;
-    task->thread = new_thread;
 
     // --- Update the sysret return path so it lands at the new binary ---
     //
@@ -1760,9 +1769,6 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     record_local_proc_event(task, perf::WkiPerfLocalProcOp::EXECVE, perf::WkiPerfPhase::END, EXEC_CORR, 0, EXEC_US, WOS_PERF_CALLSITE());
     perf::record_wki_summary(perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(perf::WkiPerfLocalProcOp::EXECVE), 0, 0, 0, EXEC_US, true,
                              0, static_cast<uint64_t>(FILE_SIZE));
-
-    // Compute physical pagemap address before we enter the critical section
-    auto phys_pagemap = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(new_pagemap)));
 
     // === CRITICAL SECTION: No function calls below this point! ===
     // Any function call (including dbg::log) would use the kernel stack

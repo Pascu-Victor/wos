@@ -317,19 +317,42 @@ auto try_release_page_table_to_pool(PageTable* table) -> bool {
         return false;
     }
 
-    zero_page_table_for_pool(table);
-
     auto& pool = page_table_pool;
     uint64_t const FLAGS = pool.lock.lock_irqsave();
+    for (size_t i = 0; i < pool.count; ++i) {
+        if (pool.pages.at(i) == table) {
+            pool.lock.unlock_irqrestore(FLAGS);
+            page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
+            log::critical("duplicate page-table pool release page=%p", table);
+            return true;
+        }
+    }
     if (pool.count >= pool.pages.size()) {
         pool.lock.unlock_irqrestore(FLAGS);
         page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    pool.lock.unlock_irqrestore(FLAGS);
 
+    zero_page_table_for_pool(table);
+
+    uint64_t const INSERT_FLAGS = pool.lock.lock_irqsave();
+    for (size_t i = 0; i < pool.count; ++i) {
+        if (pool.pages.at(i) == table) {
+            pool.lock.unlock_irqrestore(INSERT_FLAGS);
+            page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
+            log::critical("raced duplicate page-table pool release page=%p", table);
+            return true;
+        }
+    }
+    if (pool.count >= pool.pages.size()) {
+        pool.lock.unlock_irqrestore(INSERT_FLAGS);
+        page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     pool.pages[pool.count] = table;
     ++pool.count;
-    pool.lock.unlock_irqrestore(FLAGS);
+    pool.lock.unlock_irqrestore(INSERT_FLAGS);
     page_table_pool_releases.fetch_add(1, std::memory_order_relaxed);
     return true;
 }

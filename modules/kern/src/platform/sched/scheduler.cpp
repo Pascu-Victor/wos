@@ -484,6 +484,7 @@ inline constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
 inline constexpr int WOS_WSTOPPED = 2;
 inline constexpr int STOP_STATUS_LOW = 0x7f;
 inline constexpr uint64_t SIGCHLD_MASK = 1ULL << (17 - 1);
+inline constexpr uint64_t WAITPID_REPAIR_FALLBACK_MIN_US = 50'000ULL;
 
 inline auto job_control_stop_status(const task::Task& task) -> int32_t {
     uint32_t const SIGNAL = task.jobctl_stop_signal != 0 ? task.jobctl_stop_signal : 19;
@@ -502,7 +503,11 @@ inline auto waitpid_job_stop_waitable(const task::Task* waiter, const task::Task
 }
 
 inline auto complete_waitpid_job_stop_if_waitable(task::Task* waiter, task::Task* target) -> bool {
+    if (waiter == nullptr || !task::task_try_claim_waitpid_completion(*waiter)) {
+        return false;
+    }
     if (!waitpid_job_stop_waitable(waiter, target)) {
+        task::task_release_waitpid_completion_claim(*waiter);
         return false;
     }
 
@@ -567,6 +572,18 @@ inline auto waitpid_child_is_waitable_exit(const task::Task* child) -> bool {
     return EXIT_READY || STATE == task::TaskState::DEAD;
 }
 
+inline auto waitpid_repair_due(const task::Task* waiter, uint64_t now_us) -> bool {
+    if (waiter == nullptr || !waiter->wait_channel_is(task::WaitChannelKind::WAITPID) || waiter->waiting_for_pid == 0) {
+        return false;
+    }
+    bool const SIGCHLD_PENDING = (waiter->sig_pending & SIGCHLD_MASK) != 0;
+    if (SIGCHLD_PENDING && waiter->waitpid_last_repair_us == 0) {
+        return true;
+    }
+    uint64_t const LAST_REPAIR_US = waiter->waitpid_last_repair_us != 0 ? waiter->waitpid_last_repair_us : waiter->last_sleep_start_us;
+    return LAST_REPAIR_US != 0 && now_us > LAST_REPAIR_US && now_us - LAST_REPAIR_US >= WAITPID_REPAIR_FALLBACK_MIN_US;
+}
+
 inline auto active_waitpid_unwaited_child(task::Task* child, void* raw_waiter) -> bool {
     return waitpid_child_is_unwaited(static_cast<task::Task*>(raw_waiter), child);
 }
@@ -578,6 +595,12 @@ inline auto active_waitpid_waitable_exit_child(task::Task* child, void* raw_wait
 
 inline auto active_waitpid_job_stop_child(task::Task* child, void* raw_waiter) -> bool {
     return waitpid_job_stop_waitable(static_cast<task::Task*>(raw_waiter), child);
+}
+
+inline auto dead_waitpid_specific_target(task::Task* child, void* raw_waiter) -> bool {
+    auto* waiter = static_cast<task::Task*>(raw_waiter);
+    return waiter != nullptr && child != nullptr && waiter->waiting_for_pid != 0 && waiter->waiting_for_pid != WAIT_ANY_CHILD &&
+           child->pid == waiter->waiting_for_pid;
 }
 
 inline auto registered_waitpid_matches_child(const task::Task* waiter, const task::Task* child) -> bool {
@@ -646,10 +669,15 @@ inline void finish_waitpid_scheduler_result(task::Task* waiter) {
 }
 
 inline auto complete_waitpid_exit_for_scheduler(task::Task* waiter, task::Task* child, const char* path) -> bool {
+    if (waiter == nullptr || !task::task_try_claim_waitpid_completion(*waiter)) {
+        return false;
+    }
     if (!waitpid_child_is_unwaited(waiter, child) || !waitpid_child_is_waitable_exit(child)) {
+        task::task_release_waitpid_completion_claim(*waiter);
         return false;
     }
     if (!task::task_try_mark_waited_on(*child)) {
+        task::task_release_waitpid_completion_claim(*waiter);
         return false;
     }
     task::task_accumulate_waited_child_times(*waiter, *child);
@@ -663,10 +691,15 @@ inline auto complete_waitpid_exit_for_scheduler(task::Task* waiter, task::Task* 
 }
 
 inline auto complete_registered_waitpid_exit_for_scheduler(task::Task* waiter, task::Task* child, const char* path) -> bool {
+    if (waiter == nullptr || !task::task_try_claim_waitpid_completion(*waiter)) {
+        return false;
+    }
     if (!registered_waitpid_matches_child(waiter, child) || task::task_waited_on(*child) || !waitpid_child_is_waitable_exit(child)) {
+        task::task_release_waitpid_completion_claim(*waiter);
         return false;
     }
     if (!task::task_try_mark_waited_on(*child)) {
+        task::task_release_waitpid_completion_claim(*waiter);
         return false;
     }
     task::task_accumulate_waited_child_times(*waiter, *child);
@@ -680,8 +713,12 @@ inline auto complete_registered_waitpid_exit_for_scheduler(task::Task* waiter, t
 }
 
 inline auto complete_waitpid_ptrace_stop_for_scheduler(task::Task* waiter, task::Task* target) -> bool {
-    if (waiter == nullptr || target == nullptr || !target->ptrace_traced || target->ptrace_tracer_pid != waiter->pid ||
-        !target->ptrace_stopped || !target->ptrace_stop_pending) {
+    if (waiter == nullptr || !task::task_try_claim_waitpid_completion(*waiter)) {
+        return false;
+    }
+    if (target == nullptr || !target->ptrace_traced || target->ptrace_tracer_pid != waiter->pid || !target->ptrace_stopped ||
+        !target->ptrace_stop_pending) {
+        task::task_release_waitpid_completion_claim(*waiter);
         return false;
     }
 
@@ -711,20 +748,10 @@ inline auto waitpid_has_unwaited_child_for_scheduler(task::Task* waiter) -> bool
         return true;
     }
 
-    uint64_t const CORE_COUNT = smt::get_core_count();
-    for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
-        size_t const DEAD_COUNT = get_dead_task_count(cpu_no);
-        for (size_t i = 0; i < DEAD_COUNT; ++i) {
-            auto* child = get_dead_task_at_safe(cpu_no, i);
-            if (child == nullptr) {
-                continue;
-            }
-            bool const MATCH = waitpid_child_is_unwaited(waiter, child);
-            child->release();
-            if (MATCH) {
-                return true;
-            }
-        }
+    auto* dead_child = find_dead_task_lifetime_ref_if(active_waitpid_unwaited_child, waiter);
+    if (dead_child != nullptr) {
+        dead_child->release();
+        return true;
     }
     return false;
 }
@@ -736,29 +763,43 @@ inline auto complete_waitpid_any_for_scheduler(task::Task* waiter) -> bool {
             break;
         }
         bool const COMPLETED = complete_waitpid_exit_for_scheduler(waiter, child, "wake-any-active");
+        bool const CLAIM_IN_PROGRESS =
+            !COMPLETED && waiter->waiting_for_pid != 0 && waiter->waitpid_completion_claimed.load(std::memory_order_acquire);
         child->release();
         if (COMPLETED) {
             return true;
         }
+        if (CLAIM_IN_PROGRESS) {
+            return false;
+        }
     }
 
-    uint64_t const CORE_COUNT = smt::get_core_count();
-    for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
-        size_t const DEAD_COUNT = get_dead_task_count(cpu_no);
-        for (size_t i = 0; i < DEAD_COUNT; ++i) {
-            auto* child = get_dead_task_at_safe(cpu_no, i);
-            if (child == nullptr) {
-                continue;
-            }
-            bool const COMPLETED = complete_waitpid_exit_for_scheduler(waiter, child, "wake-any-dead");
-            child->release();
-            if (COMPLETED) {
-                return true;
-            }
+    for (;;) {
+        auto* child = find_dead_task_lifetime_ref_if(active_waitpid_waitable_exit_child, waiter);
+        if (child == nullptr) {
+            break;
+        }
+        bool const COMPLETED = complete_waitpid_exit_for_scheduler(waiter, child, "wake-any-dead");
+        bool const WAITER_DONE = waiter->waiting_for_pid == 0;
+        bool const CLAIM_IN_PROGRESS = !COMPLETED && !WAITER_DONE && waiter->waitpid_completion_claimed.load(std::memory_order_acquire);
+        child->release();
+        if (COMPLETED || WAITER_DONE) {
+            return true;
+        }
+        if (CLAIM_IN_PROGRESS) {
+            return false;
         }
     }
 
     if (!waitpid_has_unwaited_child_for_scheduler(waiter) && !waitpid_has_registered_unwaited_child(waiter)) {
+        if (!task::task_try_claim_waitpid_completion(*waiter)) {
+            return waiter->waiting_for_pid == 0;
+        }
+        if (waiter->waiting_for_pid != WAIT_ANY_CHILD || waitpid_has_unwaited_child_for_scheduler(waiter) ||
+            waitpid_has_registered_unwaited_child(waiter)) {
+            task::task_release_waitpid_completion_claim(*waiter);
+            return waiter->waiting_for_pid == 0;
+        }
         waiter->context.regs.rax = static_cast<uint64_t>(-ECHILD);
         clear_waitpid_output_addrs(waiter);
         finish_waitpid_scheduler_result(waiter);
@@ -773,7 +814,14 @@ inline auto complete_waitpid_specific_for_scheduler(task::Task* waiter) -> bool 
         return false;
     }
 
-    auto complete_missing_child = [waiter]() -> bool {
+    auto complete_missing_child = [waiter, WAIT_TARGET]() -> bool {
+        if (!task::task_try_claim_waitpid_completion(*waiter)) {
+            return waiter->waiting_for_pid == 0;
+        }
+        if (waiter->waiting_for_pid != WAIT_TARGET) {
+            task::task_release_waitpid_completion_claim(*waiter);
+            return waiter->waiting_for_pid == 0;
+        }
         waiter->context.regs.rax = static_cast<uint64_t>(-ECHILD);
         clear_waitpid_output_addrs(waiter);
         finish_waitpid_scheduler_result(waiter);
@@ -816,32 +864,25 @@ inline auto complete_waitpid_specific_for_scheduler(task::Task* waiter) -> bool 
         return false;
     }
 
-    uint64_t const CORE_COUNT = smt::get_core_count();
-    for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
-        size_t const DEAD_COUNT = get_dead_task_count(cpu_no);
-        for (size_t i = 0; i < DEAD_COUNT; ++i) {
-            auto* child = get_dead_task_at_safe(cpu_no, i);
-            if (child == nullptr) {
-                continue;
-            }
-            if (child->pid != WAIT_TARGET) {
-                child->release();
-                continue;
-            }
-
-            bool const MATCH = waitpid_child_matches_waiter(waiter, child);
-            bool const COMPLETED = complete_registered_waitpid_exit_for_scheduler(waiter, child, "wake-specific-registered-dead") ||
-                                   complete_waitpid_exit_for_scheduler(waiter, child, "wake-specific-dead");
-            bool const ALREADY_WAITED = task::task_waited_on(*child);
-            child->release();
-            if (COMPLETED) {
-                return true;
-            }
-            if (!MATCH || ALREADY_WAITED) {
-                return complete_missing_child();
-            }
+    auto* dead_target = find_dead_task_lifetime_ref_if(dead_waitpid_specific_target, waiter);
+    if (dead_target != nullptr) {
+        bool const MATCH = waitpid_child_matches_waiter(waiter, dead_target);
+        bool const COMPLETED = complete_registered_waitpid_exit_for_scheduler(waiter, dead_target, "wake-specific-registered-dead") ||
+                               complete_waitpid_exit_for_scheduler(waiter, dead_target, "wake-specific-dead");
+        bool const ALREADY_WAITED = task::task_waited_on(*dead_target);
+        bool const WAITER_DONE = waiter->waiting_for_pid == 0;
+        bool const CLAIM_IN_PROGRESS = !COMPLETED && !WAITER_DONE && waiter->waitpid_completion_claimed.load(std::memory_order_acquire);
+        dead_target->release();
+        if (COMPLETED || WAITER_DONE) {
+            return true;
+        }
+        if (CLAIM_IN_PROGRESS) {
             return false;
         }
+        if (!MATCH || ALREADY_WAITED) {
+            return complete_missing_child();
+        }
+        return false;
     }
 
     if (waitpid_specific_target_registered(waiter, WAIT_TARGET)) {
@@ -854,6 +895,9 @@ inline auto complete_waitpid_specific_for_scheduler(task::Task* waiter) -> bool 
 inline auto complete_or_preserve_waitpid_block(task::Task* waiter) -> bool {
     if (waiter == nullptr || !waiter->wait_channel_is(task::WaitChannelKind::WAITPID) || waiter->waiting_for_pid == 0) {
         return true;
+    }
+    if (waiter->waitpid_completion_claimed.load(std::memory_order_acquire)) {
+        return waiter->waiting_for_pid == 0;
     }
 
     if (waitpid_has_job_stop_ready(waiter)) {
@@ -992,6 +1036,11 @@ inline bool is_bursty_voluntary_block_contender(const task::Task* task, uint64_t
 
 inline bool is_lower_weight_contender(const task::Task* current, const task::Task* contender) {
     return contender->sched_weight < current->sched_weight;
+}
+
+inline bool is_higher_priority_process_contender(const task::Task* current, const task::Task* contender) {
+    return current != nullptr && contender != nullptr && current->type == task::TaskType::PROCESS &&
+           contender->type == task::TaskType::PROCESS && contender->sched_nice < current->sched_nice;
 }
 
 inline uint64_t compute_lower_weight_preempt_guard_us(const task::Task* current, const task::Task* contender) {
@@ -1134,8 +1183,20 @@ inline auto waitpid_has_registered_unwaited_child(task::Task* waiter) -> bool {
     for (uint32_t i = 0; i < active_task_count; ++i) {
         auto* child = active_task_slot(i);
         if (waitpid_child_is_unwaited(waiter, child)) {
-            global_task_registry_lock.unlock_irqrestore(FLAGS);
-            return true;
+            if (child != nullptr && child->try_acquire_lifetime_ref()) {
+                child->release();
+                global_task_registry_lock.unlock_irqrestore(FLAGS);
+                return true;
+            }
+            continue;
+        }
+        if (waitpid_job_stop_waitable(waiter, child)) {
+            if (child != nullptr && child->try_acquire_lifetime_ref()) {
+                child->release();
+                global_task_registry_lock.unlock_irqrestore(FLAGS);
+                return true;
+            }
+            continue;
         }
     }
     global_task_registry_lock.unlock_irqrestore(FLAGS);
@@ -1160,7 +1221,11 @@ inline auto waitpid_specific_target_registered(task::Task* waiter, uint64_t pid)
             continue;
         }
 
-        bool const PRESENT = waitpid_child_is_unwaited(waiter, entry.task);
+        bool const PRESENT =
+            waitpid_child_is_unwaited(waiter, entry.task) && entry.task != nullptr && entry.task->try_acquire_lifetime_ref();
+        if (PRESENT) {
+            entry.task->release();
+        }
         global_task_registry_lock.unlock_irqrestore(FLAGS);
         return PRESENT;
     }
@@ -1416,6 +1481,37 @@ inline uint32_t task_load_for_incoming(task::Task const* task, task::TaskType in
     return FULL_LOAD;
 }
 
+inline uint32_t current_task_load_for_incoming(task::Task const* task, task::TaskType incoming_type) {
+    if (task == nullptr || task->type == task::TaskType::IDLE || task->is_voluntary_blocked() || task->wants_block) {
+        return 0;
+    }
+    if (task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
+        return 0;
+    }
+    return task_load_for_incoming(task, incoming_type);
+}
+
+inline void update_current_load_cache(RunQueue* rq, task::Task* task) {
+    if (rq == nullptr) {
+        return;
+    }
+    if (task != nullptr && rq->runnable_heap.contains(task)) {
+        rq->cached_current_load_default.store(0, std::memory_order_relaxed);
+        rq->cached_current_load_process.store(0, std::memory_order_relaxed);
+        return;
+    }
+    rq->cached_current_load_default.store(current_task_load_for_incoming(task, task::TaskType::DAEMON), std::memory_order_relaxed);
+    rq->cached_current_load_process.store(current_task_load_for_incoming(task, task::TaskType::PROCESS), std::memory_order_relaxed);
+}
+
+inline void publish_current_task(RunQueue* rq, task::Task* task) {
+    if (rq == nullptr) {
+        return;
+    }
+    rq->current_task = task;
+    update_current_load_cache(rq, task);
+}
+
 // Add a task's EEVDF contribution to the run queue aggregate sums.
 // Call AFTER setting task->vruntime and inserting into the heap.
 inline void add_to_sums(RunQueue* rq, task::Task* t) {
@@ -1464,6 +1560,52 @@ inline auto valid_exit_switch_candidate(task::Task const* candidate, task::Task 
         return false;
     }
     return candidate->type != task::TaskType::PROCESS || (candidate->thread != nullptr && candidate->pagemap != nullptr);
+}
+
+inline auto pick_best_eligible_excluding_locked(RunQueue* rq, int64_t avg_vruntime, task::Task const* excluded) -> task::Task* {
+    if (rq == nullptr || excluded == nullptr || rq->runnable_heap.size == 0) {
+        return nullptr;
+    }
+
+    task::Task* best_eligible = nullptr;
+    int64_t best_eligible_deadline = 0;
+    task::Task* best_any = nullptr;
+    int64_t best_any_deadline = 0;
+
+    for (uint32_t idx = 0; idx < rq->runnable_heap.size; ++idx) {
+        task::Task* candidate = run_heap_entry(rq->runnable_heap, idx);
+        if (candidate == nullptr || candidate == excluded) {
+            continue;
+        }
+
+        if (best_any == nullptr || candidate->vdeadline < best_any_deadline) {
+            best_any = candidate;
+            best_any_deadline = candidate->vdeadline;
+        }
+
+        int64_t const LAG = avg_vruntime - candidate->vruntime;
+        if (LAG >= 0 && (best_eligible == nullptr || candidate->vdeadline < best_eligible_deadline)) {
+            best_eligible = candidate;
+            best_eligible_deadline = candidate->vdeadline;
+        }
+    }
+
+    return best_eligible != nullptr ? best_eligible : best_any;
+}
+
+inline auto pick_best_eligible_for_switch_locked(RunQueue* rq, int64_t avg_vruntime, task::Task const* current_task) -> task::Task* {
+    if (rq == nullptr || rq->runnable_heap.size == 0) {
+        return nullptr;
+    }
+
+    task::Task* next = rq->runnable_heap.pick_best_eligible(avg_vruntime);
+    if (next == current_task && current_task != nullptr && current_task->is_voluntary_blocked() && rq->runnable_heap.size > 1) {
+        task::Task* alternate = pick_best_eligible_excluding_locked(rq, avg_vruntime, current_task);
+        if (alternate != nullptr) {
+            return alternate;
+        }
+    }
+    return next;
 }
 
 inline auto pick_exit_switch_candidate_locked(RunQueue* rq, task::Task* exiting_task) -> task::Task* {
@@ -1522,7 +1664,17 @@ inline auto task_wait_deadline_us(task::Task const* t) -> uint64_t {
     if (t == nullptr) {
         return 0;
     }
-    return min_nonzero_deadline(t->wake_at_us, t->itimer_real_expire_us);
+
+    uint64_t waitpid_repair_deadline_us = 0;
+    if (t->wait_channel_is(task::WaitChannelKind::WAITPID) && t->waiting_for_pid != 0) {
+        uint64_t const LAST_REPAIR_US = t->waitpid_last_repair_us != 0 ? t->waitpid_last_repair_us : t->last_sleep_start_us;
+        if (LAST_REPAIR_US != 0) {
+            waitpid_repair_deadline_us =
+                LAST_REPAIR_US > UINT64_MAX - WAITPID_REPAIR_FALLBACK_MIN_US ? UINT64_MAX : LAST_REPAIR_US + WAITPID_REPAIR_FALLBACK_MIN_US;
+        }
+    }
+
+    return min_nonzero_deadline(min_nonzero_deadline(t->wake_at_us, t->itimer_real_expire_us), waitpid_repair_deadline_us);
 }
 
 inline auto wait_list_contains_locked(RunQueue* rq, task::Task const* t) -> bool {
@@ -1595,6 +1747,43 @@ inline void repair_stale_wait_membership_locked(RunQueue* rq, task::Task* t) {
     finish_wait_metadata_for_runqueue(t);
 }
 
+[[nodiscard]] inline auto publish_runnable_task_locked(RunQueue* rq, task::Task* t, const char* reason) -> bool {
+    if (rq == nullptr || t == nullptr) {
+        return false;
+    }
+
+    if (rq->runnable_heap.contains(t)) {
+        repair_stale_wait_membership_locked(rq, t);
+        if (rq->current_task == t) {
+            update_current_load_cache(rq, t);
+        }
+        return true;
+    }
+
+    if (t->heap_index >= 0) {
+        dbg::logger<"sched">::error("runnable publish refused: reason=%s pid=%lu name=%s cpu=%lu heap_index=%d queue=%d",
+                                    reason != nullptr ? reason : "?", t->pid, task_name_for_log(t), t->cpu, t->heap_index,
+                                    static_cast<int>(t->sched_queue));
+        dbg::panic_handler("scheduler: runnable publish refused with stale heap index");
+        return false;
+    }
+
+    if (!rq->runnable_heap.insert(t)) {
+        dbg::logger<"sched">::error("runnable heap full: reason=%s pid=%lu name=%s cpu=%lu size=%u cap=%u",
+                                    reason != nullptr ? reason : "?", t->pid, task_name_for_log(t), t->cpu, rq->runnable_heap.size,
+                                    PER_CPU_HEAP_CAP);
+        dbg::panic_handler("scheduler: runnable heap full");
+        return false;
+    }
+
+    add_to_sums(rq, t);
+    t->sched_queue = task::Task::sched_queue::RUNNABLE;
+    if (rq->current_task == t) {
+        update_current_load_cache(rq, t);
+    }
+    return true;
+}
+
 inline auto runqueue_task_is_reserved_locked(RunQueue* rq, task::Task const* task) -> bool {
     return rq != nullptr && task != nullptr && (rq->current_task == task || rq->handoff_task == task);
 }
@@ -1612,7 +1801,7 @@ inline void reserve_handoff_task_locked(RunQueue* rq, task::Task* task, uint64_t
 
 inline auto compute_wakeup_floor_vruntime(RunQueue* rq, task::Task* t, uint64_t now_us, task::WaitChannelKind wait_channel) -> int64_t;
 
-void requeue_woken_outgoing_task_locked(RunQueue* rq, task::Task* outgoing, uint64_t now_us) {
+void requeue_woken_outgoing_task_locked(RunQueue* rq, task::Task* outgoing, uint64_t now_us, task::Task*& waitpid_repair_task) {
     if (rq == nullptr || outgoing == nullptr || outgoing->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
         return;
     }
@@ -1625,6 +1814,9 @@ void requeue_woken_outgoing_task_locked(RunQueue* rq, task::Task* outgoing, uint
 
     task::WaitChannelKind const WAIT_CHANNEL = outgoing->wait_channel_kind;
     if (is_waitpid_wait_channel(WAIT_CHANNEL) && outgoing->waiting_for_pid != 0) {
+        if (waitpid_repair_task == nullptr && outgoing->try_acquire()) {
+            waitpid_repair_task = outgoing;
+        }
         return;
     }
 
@@ -1632,7 +1824,6 @@ void requeue_woken_outgoing_task_locked(RunQueue* rq, task::Task* outgoing, uint
     outgoing->wants_block = false;
     outgoing->wake_at_us = 0;
     finish_wait_metadata_for_runqueue(outgoing);
-    outgoing->sched_queue = task::Task::sched_queue::RUNNABLE;
     outgoing->just_woke = !is_low_latency_handoff_wait_channel(WAIT_CHANNEL);
 
     if (rq->runnable_heap.contains(outgoing)) {
@@ -1643,9 +1834,7 @@ void requeue_woken_outgoing_task_locked(RunQueue* rq, task::Task* outgoing, uint
     outgoing->vruntime = std::max(outgoing->vruntime, compute_wakeup_floor_vruntime(rq, outgoing, now_us, WAIT_CHANNEL));
     outgoing->vdeadline = vdeadline_from_slice(outgoing->vruntime, outgoing->slice_ns, outgoing->sched_weight);
     outgoing->slice_used_ns = 0;
-    if (rq->runnable_heap.insert(outgoing)) {
-        add_to_sums(rq, outgoing);
-    }
+    (void)publish_runnable_task_locked(rq, outgoing, "requeue-woken-outgoing");
 }
 
 void commit_handoff_task_at_return_boundary() {
@@ -1655,6 +1844,7 @@ void commit_handoff_task_at_return_boundary() {
 
     task::Task* outgoing = nullptr;
     task::Task* task = nullptr;
+    task::Task* waitpid_repair_task = nullptr;
     uint64_t const NOW_US = time::get_us();
     run_queues->this_cpu_locked_void([&](RunQueue* rq) {
         task = rq->handoff_task;
@@ -1664,14 +1854,26 @@ void commit_handoff_task_at_return_boundary() {
 
         outgoing = rq->current_task;
         task->cpu = cpu::current_cpu();
-        rq->current_task = task;
+        publish_current_task(rq, task);
         debug_task_slot(cpu::current_cpu()) = task;
         rq->handoff_task = nullptr;
-        requeue_woken_outgoing_task_locked(rq, outgoing, NOW_US);
+        requeue_woken_outgoing_task_locked(rq, outgoing, NOW_US, waitpid_repair_task);
     });
 
     if (task == nullptr) {
+        if (waitpid_repair_task != nullptr) {
+            waitpid_repair_task->release();
+        }
         return;
+    }
+
+    if (waitpid_repair_task != nullptr) {
+        uint64_t target_cpu = waitpid_repair_task->cpu;
+        if (target_cpu >= smt::get_core_count()) {
+            target_cpu = get_least_loaded_cpu();
+        }
+        reschedule_task_for_cpu(target_cpu, waitpid_repair_task);
+        waitpid_repair_task->release();
     }
 
     if (is_dead_gc_candidate_task(outgoing) && outgoing != task &&
@@ -1783,6 +1985,9 @@ inline auto cpu_mask_contains(uint64_t mask, uint64_t cpu_no) -> bool { return c
 
 auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
     if (run_queues == nullptr) {
+        return false;
+    }
+    if (our_rq == nullptr || our_rq->runnable_heap.size >= PER_CPU_HEAP_CAP) {
         return false;
     }
     const uint64_t N = smt::get_core_count();
@@ -1911,14 +2116,12 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
                 stolen->vruntime = our_rq->min_vruntime;
                 stolen->vdeadline += DIFF;
             }
-            stolen->sched_queue = task::Task::sched_queue::RUNNABLE;
-            if (!our_rq->runnable_heap.insert(stolen)) {
+            if (!publish_runnable_task_locked(our_rq, stolen, "work-steal")) {
                 // Insert refused (double-insert guard fired) - task is already
                 // in some heap due to a concurrent reschedule.  Don't count
                 // this as a successful steal; let the normal scheduler pick it.
                 return false;
             }
-            add_to_sums(our_rq, stolen);
             return true;
         }
     }
@@ -1971,6 +2174,8 @@ inline uint32_t cached_effective_load_for_cpu(uint64_t cpu_no, task::TaskType in
 
     uint32_t load = (incoming_type == task::TaskType::PROCESS ? rq->cached_load_process.load(std::memory_order_relaxed)
                                                               : rq->cached_load_default.load(std::memory_order_relaxed));
+    load += (incoming_type == task::TaskType::PROCESS ? rq->cached_current_load_process.load(std::memory_order_relaxed)
+                                                      : rq->cached_current_load_default.load(std::memory_order_relaxed));
     load += rq->placement_reservations.load(std::memory_order_relaxed) * FULL_LOAD;
 
     if (incoming_type == task::TaskType::PROCESS) {
@@ -2133,18 +2338,24 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
         }
     }
 
-    run_queues->with_lock_void(cpu_no, [task](RunQueue* rq) {
+    bool posted = false;
+    run_queues->with_lock_void(cpu_no, [task, &posted](RunQueue* rq) {
         task->vruntime = (rq->min_vruntime > 0) ? rq->min_vruntime : 0;
         task->vdeadline = vdeadline_from_slice(task->vruntime, task->slice_ns, task->sched_weight);
         task->slice_used_ns = 0;
-        task->sched_queue = task::Task::sched_queue::RUNNABLE;
-
-        if (rq->runnable_heap.insert(task)) {
-            add_to_sums(rq, task);
-        }
+        posted = publish_runnable_task_locked(rq, task, "post-task");
     });
 
     release_reservation_if_needed();
+
+    if (!posted) {
+        if (task->pid > 0) {
+            active_list_remove(task->pid);
+            pid_table_remove(task->pid);
+        }
+        log_rejected_task_publication("runnable heap insert failed", cpu_no, task);
+        return false;
+    }
 
     if (cpu_no == cpu::current_cpu()) {
         request_local_reschedule();
@@ -2374,6 +2585,63 @@ void account_cpu_runtime_delta(RunQueue* rq, task::Task* task, uint64_t delta_us
     } else {
         rq->cpu_user_us.fetch_add(delta_us, std::memory_order_relaxed);
     }
+}
+
+void add_runtime_delta_to_cpu_snapshot(CpuAccountingSnapshot& snapshot, task::Task const* task, uint64_t delta_us, bool in_kernel_mode,
+                                       bool charge_running_time) {
+    if (delta_us == 0) {
+        return;
+    }
+
+    if (task == nullptr || task->type == task::TaskType::IDLE || !charge_running_time) {
+        snapshot.idle_us += delta_us;
+        return;
+    }
+
+    if (in_kernel_mode) {
+        snapshot.system_us += delta_us;
+        return;
+    }
+
+    if (task->sched_nice > 0) {
+        snapshot.nice_us += delta_us;
+    } else {
+        snapshot.user_us += delta_us;
+    }
+}
+
+auto task_in_kernel_mode_for_cpu_snapshot(task::Task const* task) -> bool {
+    if (task == nullptr || task->type != task::TaskType::PROCESS || task->is_voluntary_blocked()) {
+        return true;
+    }
+    return task->context.frame.cs != desc::gdt::GDT_USER_CS;
+}
+
+auto cpu_accounting_snapshot_locked(RunQueue* rq, uint64_t now_us) -> CpuAccountingSnapshot {
+    if (rq == nullptr) {
+        return CpuAccountingSnapshot{};
+    }
+
+    CpuAccountingSnapshot snapshot{
+        .user_us = rq->cpu_user_us.load(std::memory_order_relaxed),
+        .nice_us = rq->cpu_nice_us.load(std::memory_order_relaxed),
+        .system_us = rq->cpu_system_us.load(std::memory_order_relaxed),
+        .idle_us = rq->cpu_idle_us.load(std::memory_order_relaxed),
+        .iowait_us = rq->cpu_iowait_us.load(std::memory_order_relaxed),
+        .irq_us = rq->cpu_irq_us.load(std::memory_order_relaxed),
+        .softirq_us = rq->cpu_softirq_us.load(std::memory_order_relaxed),
+        .steal_us = rq->cpu_steal_us.load(std::memory_order_relaxed),
+    };
+
+    if (now_us <= rq->last_tick_us) {
+        return snapshot;
+    }
+
+    auto const* current = rq->current_task;
+    uint64_t const LIVE_DELTA_US = now_us - rq->last_tick_us;
+    bool const CHARGE_RUNNING_TIME = current != nullptr && current->type != task::TaskType::IDLE && !current->is_voluntary_blocked();
+    add_runtime_delta_to_cpu_snapshot(snapshot, current, LIVE_DELTA_US, task_in_kernel_mode_for_cpu_snapshot(current), CHARGE_RUNNING_TIME);
+    return snapshot;
 }
 
 void account_task_runtime_delta(task::Task* task, uint64_t now_us, uint64_t delta_us, bool in_kernel_mode, bool charge_running_time);
@@ -2804,9 +3072,7 @@ auto move_task_owner_to_cpu(task::Task* task, uint64_t target_cpu, bool pin_to_t
             int64_t const FAIR_VRUNTIME = std::max(target_rq->min_vruntime, compute_avg_vruntime(target_rq));
             task->vruntime = std::max(task->vruntime, FAIR_VRUNTIME);
             task->vdeadline = vdeadline_from_slice(task->vruntime, task->slice_ns, task->sched_weight);
-            task->sched_queue = task::Task::sched_queue::RUNNABLE;
-            if (target_rq->runnable_heap.insert(task)) {
-                add_to_sums(target_rq, task);
+            if (publish_runnable_task_locked(target_rq, task, "move-target")) {
                 result.moved = true;
                 result.runnable = true;
                 return;
@@ -2814,9 +3080,7 @@ auto move_task_owner_to_cpu(task::Task* task, uint64_t target_cpu, bool pin_to_t
 
             task->cpu = OWNER_CPU;
             task->cpu_pinned = WAS_PINNED;
-            if (owner_rq->runnable_heap.insert(task)) {
-                add_to_sums(owner_rq, task);
-            }
+            (void)publish_runnable_task_locked(owner_rq, task, "move-rollback");
         });
 
     if (result.moved && result.runnable) {
@@ -3097,9 +3361,7 @@ void wake_kernel_thread_for_shutdown(task::Task* task) {
         task->vruntime = std::max(task->vruntime, compute_wakeup_floor_vruntime(rq, task, time::get_us(), task::WaitChannelKind::GENERIC));
         task->vdeadline = vdeadline_from_slice(task->vruntime, task->slice_ns, task->sched_weight);
         task->slice_used_ns = 0;
-        task->sched_queue = task::Task::sched_queue::RUNNABLE;
-        if (rq->runnable_heap.insert(task)) {
-            add_to_sums(rq, task);
+        if (publish_runnable_task_locked(rq, task, "kernel-thread-shutdown")) {
             should_poke = true;
         }
     });
@@ -3296,11 +3558,11 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
     uint32_t signal_wake_count = 0;
     uint32_t futex_timeout_cleanup_count = 0;
     uint32_t waitpid_repair_count = 0;
+    uint64_t const WAIT_SCAN_NOW_US = time::get_us();
     {
-        uint64_t const NOW_US = time::get_us();
-        run_queues->this_cpu_locked_void([NOW_US, &signal_wake, &signal_wake_count, &futex_timeout_cleanup, &futex_timeout_cleanup_count,
-                                          &waitpid_repair, &waitpid_repair_count](RunQueue* rq) {
-            bool const TIMED_SCAN = rq->next_wait_deadline_us != 0 && NOW_US >= rq->next_wait_deadline_us;
+        run_queues->this_cpu_locked_void([WAIT_SCAN_NOW_US, &signal_wake, &signal_wake_count, &futex_timeout_cleanup,
+                                          &futex_timeout_cleanup_count, &waitpid_repair, &waitpid_repair_count](RunQueue* rq) {
+            bool const TIMED_SCAN = rq->next_wait_deadline_us != 0 && WAIT_SCAN_NOW_US >= rq->next_wait_deadline_us;
             if (!TIMED_SCAN && rq->wait_list.head == nullptr) {
                 return;
             }
@@ -3310,22 +3572,22 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             uint32_t wake_count = 0;
             uint64_t scan_iterations = 0;
             task::Task* t = rq->wait_list.head;
-            while (t != nullptr && wake_count < PENDING_WAKE_LIMIT) {
+            while (t != nullptr) {
                 scan_iterations++;
-                if (TIMED_SCAN && t->wake_at_us != 0 && NOW_US >= t->wake_at_us) {
+                if (TIMED_SCAN && wake_count < PENDING_WAKE_LIMIT && t->wake_at_us != 0 && WAIT_SCAN_NOW_US >= t->wake_at_us) {
                     pending_wake_slot(to_wake, wake_count++) = t;
-                } else if (TIMED_SCAN && t->itimer_real_expire_us != 0 && NOW_US >= t->itimer_real_expire_us &&
+                } else if (TIMED_SCAN && t->itimer_real_expire_us != 0 && WAIT_SCAN_NOW_US >= t->itimer_real_expire_us &&
                            signal_wake_count < PENDING_WAKE_LIMIT) {
                     t->sig_pending |= (1ULL << (14 - 1));  // SIGALRM = 14
                     if (t->itimer_real_interval_us != 0) {
-                        t->itimer_real_expire_us = saturating_deadline_us(NOW_US, t->itimer_real_interval_us);
+                        t->itimer_real_expire_us = saturating_deadline_us(WAIT_SCAN_NOW_US, t->itimer_real_interval_us);
                     } else {
                         t->itimer_real_expire_us = 0;
                     }
                     pending_wake_slot(signal_wake, signal_wake_count++) = t;
                 }
-                if (waitpid_repair_count < PENDING_WAKE_LIMIT && t->wait_channel_is(task::WaitChannelKind::WAITPID) &&
-                    t->waiting_for_pid != 0 && (t->sig_pending & SIGCHLD_MASK) != 0 && t->try_acquire()) {
+                if (waitpid_repair_count < PENDING_WAKE_LIMIT && waitpid_repair_due(t, WAIT_SCAN_NOW_US) && t->try_acquire()) {
+                    t->waitpid_last_repair_us = WAIT_SCAN_NOW_US;
                     pending_wake_slot(waitpid_repair, waitpid_repair_count++) = t;
                 }
                 t = t->sched_next;
@@ -3348,11 +3610,11 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                     pending_wake_slot(futex_timeout_cleanup, futex_timeout_cleanup_count++) = w;
                 }
                 perf::record_wake(static_cast<uint32_t>(cpu::current_cpu()), w->pid, WAKE_AT_US, perf_wake_flags(WAKE_AT_US, false, false),
-                                  observed_sleep_us(w, NOW_US), perf_wait_callsite(w), w->wait_channel);
+                                  observed_sleep_us(w, WAIT_SCAN_NOW_US), perf_wait_callsite(w), w->wait_channel);
                 w->wake_at_us = 0;
                 w->wants_block = false;  // Clear any pending block from kern_block()
-                int64_t const WAKE_FLOOR = compute_wakeup_floor_vruntime(rq, w, NOW_US, w->wait_channel_kind);
-                note_task_wakeup(w, NOW_US, w->wait_channel_kind);
+                int64_t const WAKE_FLOOR = compute_wakeup_floor_vruntime(rq, w, WAIT_SCAN_NOW_US, w->wait_channel_kind);
+                note_task_wakeup(w, WAIT_SCAN_NOW_US, w->wait_channel_kind);
                 if (rq->runnable_heap.contains(w)) {
                     repair_stale_wait_membership_locked(rq, w);
                     continue;
@@ -3360,10 +3622,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                 w->vruntime = w->vruntime > WAKE_FLOOR ? w->vruntime : WAKE_FLOOR;
                 w->vdeadline = vdeadline_from_slice(w->vruntime, w->slice_ns, w->sched_weight);
                 w->slice_used_ns = 0;
-                w->sched_queue = task::Task::sched_queue::RUNNABLE;
-                if (rq->runnable_heap.insert(w)) {
-                    add_to_sums(rq, w);
-                }
+                (void)publish_runnable_task_locked(rq, w, "timer-wake");
             }
             if (wake_count != 0) {
                 rq->timer_expired_wakeups.fetch_add(wake_count, std::memory_order_relaxed);
@@ -3376,11 +3635,13 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
     }
     for (uint32_t i = 0; i < waitpid_repair_count; ++i) {
         task::Task* waiter = pending_wake_slot(waitpid_repair, i);
-        uint64_t target_cpu = waiter->cpu;
-        if (target_cpu >= smt::get_core_count()) {
-            target_cpu = get_least_loaded_cpu();
+        if (complete_or_preserve_waitpid_block(waiter)) {
+            uint64_t target_cpu = waiter->cpu;
+            if (target_cpu >= smt::get_core_count()) {
+                target_cpu = get_least_loaded_cpu();
+            }
+            reschedule_task_for_cpu(target_cpu, waiter);
         }
-        reschedule_task_for_cpu(target_cpu, waiter);
         waiter->release();
     }
     for (uint32_t i = 0; i < signal_wake_count; ++i) {
@@ -3634,7 +3895,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
         if (rq->runnable_heap.size == 0) {
             return nullptr;
         }
-        auto* next = rq->runnable_heap.pick_best_eligible(AVG);
+        auto* next = pick_best_eligible_for_switch_locked(rq, AVG, current_task);
         if (next == nullptr || next == current_task) {
             return nullptr;
         }
@@ -3674,6 +3935,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                                              : UINT64_MAX;  // 0 = unset: allow preemption
         bool const LOWER_PRIORITY_PROCESS_PREEMPT = current_task->type == task::TaskType::PROCESS &&
                                                     next->type == task::TaskType::PROCESS && next->sched_nice > current_task->sched_nice;
+        bool const HIGHER_PRIORITY_PREEMPT = is_higher_priority_process_contender(current_task, next);
         bool const LOWER_WEIGHT_PREEMPT = current_task->type == task::TaskType::PROCESS && is_lower_weight_contender(current_task, next);
         bool const BURSTY_PROCESS_WAKEUP_PREEMPT =
             current_task->type == task::TaskType::PROCESS &&
@@ -3699,7 +3961,8 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
         }
         if (!current_task->is_voluntary_blocked() && current_task->slice_used_ns < current_task->slice_ns &&
             rq->runnable_heap.contains(current_task) &&
-            (next->vdeadline >= current_task->vdeadline || (next->just_woke && RUN_DURATION_US < SCHED_MIN_GRANULARITY_US))) {
+            ((next->vdeadline >= current_task->vdeadline && !HIGHER_PRIORITY_PREEMPT) ||
+             (next->just_woke && !HIGHER_PRIORITY_PREEMPT && RUN_DURATION_US < SCHED_MIN_GRANULARITY_US))) {
             return nullptr;
         }
 
@@ -3756,7 +4019,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
 
     if (!sys::context_switch::switch_to(gpr, frame, next_task)) {
         clear_handoff_task(next_task);
-        rq->current_task = original_task;
+        publish_current_task(rq, original_task);
         debug_task_slot(cpu::current_cpu()) = original_task;
     } else {
         record_local_proc_first_run(next_task, WOS_PERF_CALLSITE());
@@ -3882,14 +4145,14 @@ void start_scheduler() {
         auto* t = rq->runnable_heap.pick_best_eligible(AVG);
         if (t != nullptr && t->type != task::TaskType::IDLE && (t->type == task::TaskType::DAEMON || t->thread != nullptr)) {
             t->cpu = cpu::current_cpu();
-            rq->current_task = t;
+            publish_current_task(rq, t);
         }
         return t;
     });
 
     if (first_task == nullptr || first_task->type == task::TaskType::IDLE) {
         // Set idle task as current while waiting
-        rq->current_task = rq->idle_task;
+        publish_current_task(rq, rq->idle_task);
         scheduler_task_context_ready_mask.fetch_or(1ULL << cpu::current_cpu(), std::memory_order_acq_rel);
 
         for (;;) {
@@ -3920,7 +4183,7 @@ void start_scheduler() {
                 }
 
                 candidate->cpu = cpu::current_cpu();
-                rq->current_task = candidate;
+                publish_current_task(rq, candidate);
                 return candidate;
             });
 
@@ -3938,7 +4201,7 @@ void start_scheduler() {
     record_local_proc_first_run(first_task, WOS_PERF_CALLSITE());
     first_task->has_run = true;
     first_task->cpu = cpu::current_cpu();
-    rq->current_task = first_task;
+    publish_current_task(rq, first_task);
 
     // Set up GS/FS MSRs for the first task
     uint64_t const REAL_CPU_ID = cpu::current_cpu();
@@ -4227,7 +4490,6 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                     current_task->wants_block = false;
                     current_task->wake_at_us = 0;
                     finish_wait_metadata_for_runqueue(current_task);
-                    current_task->sched_queue = task::Task::sched_queue::RUNNABLE;
                     current_task->just_woke = !is_low_latency_handoff_wait_channel(WAIT_KIND);
                     if (rq->runnable_heap.contains(current_task)) {
                         repair_stale_wait_membership_locked(rq, current_task);
@@ -4237,9 +4499,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                         current_task->vdeadline =
                             vdeadline_from_slice(current_task->vruntime, current_task->slice_ns, current_task->sched_weight);
                         current_task->slice_used_ns = 0;
-                        if (rq->runnable_heap.insert(current_task)) {
-                            add_to_sums(rq, current_task);
-                        }
+                        (void)publish_runnable_task_locked(rq, current_task, "proxy-block-wake");
                     }
                 }
             }
@@ -4591,7 +4851,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
             if (current_cpu_of_task == cpu::current_cpu()) {
                 request_local_reschedule();
             } else {
-                wake_cpu(current_cpu_of_task);
+                wake_cpu(current_cpu_of_task, WakeCpuMode::FORCE);
             }
         }
         return;
@@ -4608,6 +4868,9 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
                     return;
                 }
                 task->sched_queue = task::Task::sched_queue::WAITING;
+                if (task->last_sleep_start_us == 0) {
+                    task->last_sleep_start_us = time::get_us();
+                }
                 wait_list_push_locked(rq, task);
             });
         }
@@ -4683,7 +4946,6 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         }
         task->vdeadline = vdeadline_from_slice(task->vruntime, task->slice_ns, task->sched_weight);
         task->slice_used_ns = 0;
-        task->sched_queue = task::Task::sched_queue::RUNNABLE;
         // Clear any pending block request and timeout deadline - we're explicitly
         // waking this task.  If wake_at_us is left set, a timed
         // preemptible_syscall_park() can resume after hlt, see the stale
@@ -4691,9 +4953,7 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         task->wants_block = false;
         task->wake_at_us = 0;
 
-        if (rq->runnable_heap.insert(task)) {
-            add_to_sums(rq, task);
-        }
+        (void)publish_runnable_task_locked(rq, task, "reschedule");
     });
 
     // Poke the target CPU so the newly-rescheduled task runs promptly.
@@ -4732,12 +4992,32 @@ auto task_has_live_pagemap_sibling(task::Task* subject) -> bool {
         if (other == nullptr || other == subject || other->pagemap != PAGEMAP) {
             continue;
         }
-        if (other->state.load(std::memory_order_acquire) != task::TaskState::DEAD) {
-            global_task_registry_lock.unlock_irqrestore(FLAGS);
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        return true;
+    }
+    global_task_registry_lock.unlock_irqrestore(FLAGS);
+
+    if (run_queues == nullptr) {
+        return false;
+    }
+
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
+        bool const FOUND = run_queues->with_lock(cpu_no, [subject, PAGEMAP](RunQueue* rq) -> bool {
+            if (rq == nullptr) {
+                return false;
+            }
+            for (task::Task* cur = rq->dead_list.head; cur != nullptr; cur = cur->sched_next) {
+                if (cur != subject && cur->pagemap == PAGEMAP) {
+                    return true;
+                }
+            }
+            return false;
+        });
+        if (FOUND) {
             return true;
         }
     }
-    global_task_registry_lock.unlock_irqrestore(FLAGS);
     return false;
 }
 
@@ -4783,6 +5063,36 @@ auto find_active_task_lifetime_ref_if(ActiveTaskPredicate predicate, void* conte
         return task;
     }
     global_task_registry_lock.unlock_irqrestore(FLAGS);
+    return nullptr;
+}
+
+auto find_dead_task_lifetime_ref_if(DeadTaskPredicate predicate, void* context) -> task::Task* {
+    if (predicate == nullptr || run_queues == nullptr) {
+        return nullptr;
+    }
+
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
+        auto* found = run_queues->with_lock(cpu_no, [predicate, context](RunQueue* rq) -> task::Task* {
+            if (rq == nullptr) {
+                return nullptr;
+            }
+            for (task::Task* cur = rq->dead_list.head; cur != nullptr; cur = cur->sched_next) {
+                if (!predicate(cur, context)) {
+                    continue;
+                }
+                if (!cur->try_acquire_lifetime_ref()) {
+                    continue;
+                }
+                return cur;
+            }
+            return nullptr;
+        });
+        if (found != nullptr) {
+            return found;
+        }
+    }
+
     return nullptr;
 }
 
@@ -6017,6 +6327,7 @@ void note_scheduler_timer_disarm() {
     if (rq == nullptr) {
         return;
     }
+    rq->resched_timer_pending.store(false, std::memory_order_release);
     rq->scheduler_timer_disarms.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -6166,22 +6477,9 @@ auto get_cpu_accounting_snapshot(uint64_t cpu_no) -> CpuAccountingSnapshot {
         return snapshot;
     }
 
-    return run_queues->with_lock(cpu_no, [](RunQueue* rq) -> CpuAccountingSnapshot {
-        if (rq == nullptr) {
-            return CpuAccountingSnapshot{};
-        }
-
-        return CpuAccountingSnapshot{
-            .user_us = rq->cpu_user_us.load(std::memory_order_relaxed),
-            .nice_us = rq->cpu_nice_us.load(std::memory_order_relaxed),
-            .system_us = rq->cpu_system_us.load(std::memory_order_relaxed),
-            .idle_us = rq->cpu_idle_us.load(std::memory_order_relaxed),
-            .iowait_us = rq->cpu_iowait_us.load(std::memory_order_relaxed),
-            .irq_us = rq->cpu_irq_us.load(std::memory_order_relaxed),
-            .softirq_us = rq->cpu_softirq_us.load(std::memory_order_relaxed),
-            .steal_us = rq->cpu_steal_us.load(std::memory_order_relaxed),
-        };
-    });
+    uint64_t const NOW_US = time::get_us();
+    return run_queues->with_lock(cpu_no,
+                                 [NOW_US](RunQueue* rq) -> CpuAccountingSnapshot { return cpu_accounting_snapshot_locked(rq, NOW_US); });
 }
 
 namespace {
@@ -6343,6 +6641,16 @@ auto get_scheduler_cpu_state(uint64_t cpu_no) -> SchedulerCpuState {
         state.is_idle = rq->is_idle.load(std::memory_order_acquire);
         state.runnable_count = rq->runnable_heap.size;
         state.wait_queue_count = rq->wait_list.count;
+        state.resched_timer_pending = rq->resched_timer_pending.load(std::memory_order_acquire);
+        state.scheduler_timer_interrupts = rq->scheduler_timer_interrupts.load(std::memory_order_relaxed);
+        state.scheduler_timer_arms = rq->scheduler_timer_arms.load(std::memory_order_relaxed);
+        state.scheduler_timer_disarms = rq->scheduler_timer_disarms.load(std::memory_order_relaxed);
+        state.wake_ipis_sent = rq->wake_ipis_sent.load(std::memory_order_relaxed);
+        state.wake_ipis_coalesced = rq->wake_ipis_coalesced.load(std::memory_order_relaxed);
+        state.local_reschedule_requests = rq->local_reschedule_requests.load(std::memory_order_relaxed);
+        state.local_reschedule_timer_pokes = rq->local_reschedule_timer_pokes.load(std::memory_order_relaxed);
+        state.last_tick_us = rq->last_tick_us;
+        state.next_wait_deadline_us = rq->next_wait_deadline_us;
 
         auto* current = rq->current_task;
         if (current != nullptr) {
@@ -6406,11 +6714,19 @@ void dump_scheduler_cpu_states() {
     uint64_t const CORE_COUNT = smt::get_core_count();
     for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
         auto state = get_scheduler_cpu_state(cpu_no);
-        dbg::log("schedcpu: cpu%lu idle=%u runq=%lu waitq=%lu cur=%lu(%s) type=%u vblk=%u wblk=%u pinned=%u",
-                 static_cast<unsigned long>(state.cpu_no), state.is_idle ? 1U : 0U, static_cast<unsigned long>(state.runnable_count),
-                 static_cast<unsigned long>(state.wait_queue_count), static_cast<unsigned long>(state.current_pid), state.current_name,
-                 static_cast<unsigned>(state.current_type), state.current_voluntary_block ? 1U : 0U, state.current_wants_block ? 1U : 0U,
-                 state.current_cpu_pinned ? 1U : 0U);
+        dbg::log(
+            "schedcpu: cpu%lu idle=%u runq=%lu waitq=%lu cur=%lu(%s) type=%u vblk=%u wblk=%u pinned=%u preempt=%u/%u "
+            "preempt_max_us=%lu pending=%u timer=%lu/%lu/%lu wake=%lu/%lu local=%lu/%lu last_tick=%lu wait_deadline=%lu",
+            static_cast<unsigned long>(state.cpu_no), state.is_idle ? 1U : 0U, static_cast<unsigned long>(state.runnable_count),
+            static_cast<unsigned long>(state.wait_queue_count), static_cast<unsigned long>(state.current_pid), state.current_name,
+            static_cast<unsigned>(state.current_type), state.current_voluntary_block ? 1U : 0U, state.current_wants_block ? 1U : 0U,
+            state.current_cpu_pinned ? 1U : 0U, state.current_preempt_depth, state.current_preempt_pending ? 1U : 0U,
+            static_cast<unsigned long>(state.current_preempt_max_us), state.resched_timer_pending ? 1U : 0U,
+            static_cast<unsigned long>(state.scheduler_timer_interrupts), static_cast<unsigned long>(state.scheduler_timer_arms),
+            static_cast<unsigned long>(state.scheduler_timer_disarms), static_cast<unsigned long>(state.wake_ipis_sent),
+            static_cast<unsigned long>(state.wake_ipis_coalesced), static_cast<unsigned long>(state.local_reschedule_requests),
+            static_cast<unsigned long>(state.local_reschedule_timer_pokes), static_cast<unsigned long>(state.last_tick_us),
+            static_cast<unsigned long>(state.next_wait_deadline_us));
     }
 }
 

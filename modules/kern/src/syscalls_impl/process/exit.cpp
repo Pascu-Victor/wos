@@ -161,16 +161,13 @@ auto waiter_context_can_be_completed(ker::mod::sched::task::Task* waiter) -> boo
     if (waiter == nullptr || waiter->deferred_task_switch) {
         return false;
     }
-    if (!waiter->waitpid_publish_pending.load(std::memory_order_acquire)) {
-        return true;
-    }
 
-    // A waiter that has already reached the scheduler wait list has a stable
-    // saved syscall context even if the publish-pending flag was stranded by a
-    // wake race. Completing it here avoids losing blocked SIGCHLD wait-any
-    // notifications.
+    // Only a parked waitpid waiter has a stable saved syscall context that the
+    // exit path can complete. While the parent is still in the deferred-switch
+    // window, the scheduler owns the final recheck and result publication.
     return waiter->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING &&
-           waiter->wait_channel_is(ker::mod::sched::task::WaitChannelKind::WAITPID);
+           waiter->wait_channel_is(ker::mod::sched::task::WaitChannelKind::WAITPID) &&
+           !waiter->waitpid_publish_pending.load(std::memory_order_acquire);
 }
 
 auto waiter_has_stranded_specific_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) -> bool {
@@ -200,7 +197,18 @@ auto drain_exit_waiters_for_notify(ker::mod::sched::task::Task* exiting, ExitWai
 }
 
 auto complete_exit_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child, const char* path) -> bool {
-    if (child == nullptr || !sched_task::task_try_mark_waited_on(*child)) {
+    if (waiter == nullptr || child == nullptr) {
+        return false;
+    }
+    if (!sched_task::task_try_claim_waitpid_completion(*waiter)) {
+        return false;
+    }
+    if (!waiter_matches_child(waiter, child) || !waiter_context_can_be_completed(waiter)) {
+        sched_task::task_release_waitpid_completion_claim(*waiter);
+        return false;
+    }
+    if (!sched_task::task_try_mark_waited_on(*child)) {
+        sched_task::task_release_waitpid_completion_claim(*waiter);
         return false;
     }
     sched_task::task_accumulate_waited_child_times(*waiter, *child);
@@ -239,7 +247,8 @@ void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
         if (waiter_matches_child(parent, child) && waiter_context_can_be_completed(parent)) {
             wake_parent =
                 complete_exit_wait(parent, child, parent->waiting_for_pid == WAIT_ANY_CHILD ? "exit-any" : "exit-specific-parent");
-        } else if (waiter_matches_child(parent, child) && (parent->deferred_task_switch || parent->is_voluntary_blocked())) {
+        } else if (waiter_matches_child(parent, child) && (parent->deferred_task_switch || parent->is_voluntary_blocked() ||
+                                                           parent->wait_channel_is(ker::mod::sched::task::WaitChannelKind::WAITPID))) {
             // The deferred switch path will re-check waitability after it saves
             // the parent's syscall context.
             wake_parent = true;

@@ -101,28 +101,15 @@ auto free_head_is_valid(const PageAllocator* alloc, PageAllocator::FreeBlock* bl
     return alloc->page_flags[page_idx] == (PageAllocator::FLAG_FREE_HEAD | static_cast<uint8_t>(order));
 }
 
-void drop_corrupt_free_list_head(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block) {
-    dbg::emergency_log("page_alloc: dropping corrupt free-list head order=%lu ptr=0x%lx zone_base=0x%lx\n", static_cast<uint64_t>(order),
-                       reinterpret_cast<uint64_t>(block), alloc->base);
-    alloc->free_list[static_cast<size_t>(order)] = nullptr;
-}
-
 auto free_list_head(PageAllocator* alloc, int order) -> PageAllocator::FreeBlock*& { return alloc->free_list[static_cast<size_t>(order)]; }
 
-void insert_free_block(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block) {
+void link_free_block_unchecked(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block) {
     auto& head = free_list_head(alloc, order);
-    if (head != nullptr) {
-        uint32_t head_idx = 0;
-        if (!free_head_is_valid(alloc, head, order, head_idx)) {
-            drop_corrupt_free_list_head(alloc, order, head);
-            head = nullptr;
-        } else {
-            head->prev = block;
-        }
-    }
-
     block->prev = nullptr;
     block->next = head;
+    if (head != nullptr) {
+        head->prev = block;
+    }
     head = block;
 }
 
@@ -175,6 +162,96 @@ auto remove_free_block(PageAllocator* alloc, int order, PageAllocator::FreeBlock
     return true;
 }
 
+void rebuild_free_lists_from_flags(PageAllocator* alloc, const char* reason) {
+    dbg::emergency_log("page_alloc: rebuilding free lists reason=%s zone_base=0x%lx\n", reason != nullptr ? reason : "?", alloc->base);
+
+    for (auto*& list_head : alloc->free_list) {
+        list_head = nullptr;
+    }
+
+    uint64_t linked_free_pages = 0;
+    uint64_t cached_order0_pages = 0;
+    uint32_t page_idx = 0;
+    while (page_idx < alloc->total_pages) {
+        uint8_t const FLAGS = alloc->page_flags[page_idx];
+        if (FLAGS == PageAllocator::FLAG_CACHED_ORDER0) {
+            cached_order0_pages++;
+            page_idx++;
+            continue;
+        }
+        if ((FLAGS & 0xC0) != PageAllocator::FLAG_FREE_HEAD) {
+            page_idx++;
+            continue;
+        }
+
+        int const ORDER = FLAGS & 0x1F;
+        if (ORDER < 0 || ORDER > PageAllocator::MAX_ORDER) {
+            dbg::emergency_log("page_alloc: rebuild skipping invalid free head order=%lu page=%lu\n", static_cast<uint64_t>(ORDER),
+                               static_cast<uint64_t>(page_idx));
+            alloc->page_flags[page_idx] = PageAllocator::FLAG_FREE_INTERIOR;
+            page_idx++;
+            continue;
+        }
+
+        uint32_t const BLOCK_SIZE = 1U << ORDER;
+        if (page_idx + BLOCK_SIZE > alloc->total_pages) {
+            dbg::emergency_log("page_alloc: rebuild skipping out-of-range free head order=%lu page=%lu total=%lu\n",
+                               static_cast<uint64_t>(ORDER), static_cast<uint64_t>(page_idx), static_cast<uint64_t>(alloc->total_pages));
+            alloc->page_flags[page_idx] = PageAllocator::FLAG_FREE_INTERIOR;
+            page_idx++;
+            continue;
+        }
+
+        auto* block = reinterpret_cast<PageAllocator::FreeBlock*>(page_to_ptr(alloc->base, page_idx));
+        link_free_block_unchecked(alloc, ORDER, block);
+        linked_free_pages += BLOCK_SIZE;
+        page_idx += BLOCK_SIZE;
+    }
+
+    uint64_t const TOTAL_FREE_PAGES = linked_free_pages + cached_order0_pages;
+    alloc->cached_order0_count = cached_order0_pages > alloc->total_pages ? alloc->total_pages : static_cast<uint32_t>(cached_order0_pages);
+    alloc->free_count = TOTAL_FREE_PAGES > alloc->total_pages ? alloc->total_pages : static_cast<uint32_t>(TOTAL_FREE_PAGES);
+}
+
+auto free_block_is_reachable(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block) -> bool {
+    uint32_t visited = 0;
+    for (auto* cur = free_list_head(alloc, order); cur != nullptr && visited <= alloc->total_pages; cur = cur->next) {
+        uint32_t cur_idx = 0;
+        if (!free_head_is_valid(alloc, cur, order, cur_idx)) {
+            return false;
+        }
+        if (cur == block) {
+            return true;
+        }
+        visited++;
+    }
+    return false;
+}
+
+void insert_free_block(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block) {
+    auto& head = free_list_head(alloc, order);
+    if (head != nullptr) {
+        uint32_t head_idx = 0;
+        if (!free_head_is_valid(alloc, head, order, head_idx)) {
+            rebuild_free_lists_from_flags(alloc, "insert corrupt head");
+            if (free_block_is_reachable(alloc, order, block)) {
+                return;
+            }
+        }
+    }
+
+    link_free_block_unchecked(alloc, order, block);
+}
+
+auto remove_free_block_with_repair(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block, const char* reason) -> bool {
+    if (remove_free_block(alloc, order, block)) {
+        return true;
+    }
+    rebuild_free_lists_from_flags(alloc, reason);
+    uint32_t rebuilt_idx = 0;
+    return free_head_is_valid(alloc, block, order, rebuilt_idx) && remove_free_block(alloc, order, block);
+}
+
 auto page_has_live_tracked_alloc_magic(PageAllocator* alloc, uint32_t page_idx, PageKind tracked_kind, uint64_t magic) -> bool {
     PageKind const KIND = decode_page_kind(alloc->page_kinds[page_idx].load(std::memory_order_acquire));
     if (KIND != tracked_kind && KIND != PageKind::UNKNOWN) {
@@ -214,6 +291,16 @@ auto order0_free_head_is_reusable(PageAllocator* alloc, PageAllocator::FreeBlock
     return true;
 }
 
+auto allocated_block_has_direct_free_refs(PageAllocator* alloc, uint32_t page_idx, int order) -> bool {
+    uint32_t const BLOCK_SIZE = 1U << order;
+    for (uint32_t i = 0; i < BLOCK_SIZE; ++i) {
+        if (alloc->page_refcounts[page_idx + i].load(std::memory_order_acquire) != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
 auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order) -> uint64_t {
     if (order < 0 || order > PageAllocator::MAX_ORDER) {
         return 0;
@@ -236,8 +323,6 @@ auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order) ->
 #endif
     }
 
-    alloc->free_count += BLOCK_SIZE;
-
     // Coalesce with buddies.
     int k = order;
     while (k < PageAllocator::MAX_ORDER) {
@@ -253,7 +338,7 @@ auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order) ->
 
         // Remove buddy from its free list.
         auto* buddy_block = reinterpret_cast<PageAllocator::FreeBlock*>(page_to_ptr(alloc->base, BUDDY_IDX));
-        if (!remove_free_block(alloc, k, buddy_block)) {
+        if (!remove_free_block_with_repair(alloc, k, buddy_block, "free coalesce unlink")) {
             break;
         }
 
@@ -272,6 +357,7 @@ auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order) ->
     // Prepend to the free list.
     auto* free_block = reinterpret_cast<PageAllocator::FreeBlock*>(page_to_ptr(alloc->base, page_idx));
     insert_free_block(alloc, k, free_block);
+    alloc->free_count += BLOCK_SIZE;
     return FREED_BYTES;
 }
 
@@ -414,6 +500,7 @@ void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
     int k = ORDER;
     uint32_t page_idx = 0;
     FreeBlock* block = nullptr;
+    bool repaired_free_lists = false;
     while (k <= MAX_ORDER) {
         block = free_list[static_cast<size_t>(k)];
         if (block == nullptr) {
@@ -422,15 +509,25 @@ void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
         }
 
         if (!free_head_is_valid(this, block, k, page_idx)) {
-            drop_corrupt_free_list_head(this, k, block);
-            k++;
+            if (repaired_free_lists) {
+                k++;
+                continue;
+            }
+            rebuild_free_lists_from_flags(this, "alloc corrupt head");
+            repaired_free_lists = true;
+            k = ORDER;
             continue;
         }
 
         // Pop head of free_list[k].
-        if (!remove_free_block(this, k, block)) {
-            drop_corrupt_free_list_head(this, k, block);
-            k++;
+        if (!remove_free_block_with_repair(this, k, block, "alloc unlink")) {
+            if (repaired_free_lists) {
+                k++;
+                block = nullptr;
+                continue;
+            }
+            repaired_free_lists = true;
+            k = ORDER;
             block = nullptr;
             continue;
         }
@@ -482,17 +579,21 @@ void* PageAllocator::alloc_order0(uint64_t caller) {
     (void)caller;
 #endif
 
-    auto* const BLOCK = free_list[0];
-    if (BLOCK == nullptr) {
+    auto* block = free_list[0];
+    if (block == nullptr) {
         return nullptr;
     }
 
     uint32_t page_idx = 0;
-    if (!order0_free_head_is_reusable(this, BLOCK, page_idx)) {
-        return nullptr;
+    if (!order0_free_head_is_reusable(this, block, page_idx)) {
+        rebuild_free_lists_from_flags(this, "alloc_order0 corrupt head");
+        block = free_list[0];
+        if (block == nullptr || !order0_free_head_is_reusable(this, block, page_idx)) {
+            return nullptr;
+        }
     }
 
-    if (!remove_free_block(this, 0, BLOCK)) {
+    if (!remove_free_block_with_repair(this, 0, block, "alloc_order0 unlink")) {
         return nullptr;
     }
 
@@ -508,17 +609,21 @@ void* PageAllocator::alloc_order0(uint64_t caller) {
 
 void* PageAllocator::claim_free_order0_for_cache(uint32_t& out_page_idx) {
     out_page_idx = 0;
-    auto* const BLOCK = free_list[0];
-    if (BLOCK == nullptr) {
+    auto* block = free_list[0];
+    if (block == nullptr) {
         return nullptr;
     }
 
     uint32_t page_idx = 0;
-    if (!order0_free_head_is_reusable(this, BLOCK, page_idx)) {
-        return nullptr;
+    if (!order0_free_head_is_reusable(this, block, page_idx)) {
+        rebuild_free_lists_from_flags(this, "cache claim corrupt head");
+        block = free_list[0];
+        if (block == nullptr || !order0_free_head_is_reusable(this, block, page_idx)) {
+            return nullptr;
+        }
     }
 
-    if (!remove_free_block(this, 0, BLOCK)) {
+    if (!remove_free_block_with_repair(this, 0, block, "cache claim unlink")) {
         return nullptr;
     }
 
@@ -659,6 +764,11 @@ uint64_t PageAllocator::free(void* ptr) {
     int const ORDER = FLAGS & 0x1F;
     if (ORDER > MAX_ORDER) {
         dbg::emergency_log("page_alloc: rejecting free with invalid order=%lu ptr=0x%lx\n", static_cast<uint64_t>(ORDER),
+                           reinterpret_cast<uint64_t>(ptr));
+        return 0;
+    }
+    if (!allocated_block_has_direct_free_refs(this, page_idx, ORDER)) {
+        dbg::emergency_log("page_alloc: rejecting direct free of refcounted block order=%lu ptr=0x%lx\n", static_cast<uint64_t>(ORDER),
                            reinterpret_cast<uint64_t>(ptr));
         return 0;
     }
