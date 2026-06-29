@@ -37,6 +37,14 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/selfhost_benchmark_source_test.py
 )
 add_test(
+    NAME modules_cmake_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/modules_cmake_source_test.py
+)
+add_test(
+    NAME qcow_common_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/qcow_common_source_test.py
+)
+add_test(
     NAME testd_manifest_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/testd_manifest_test.py
 )
@@ -241,6 +249,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_metadata_lock_source_test.py
 )
 add_test(
+    NAME xfs_metadata_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_metadata_source_test.py
+)
+add_test(
     NAME xfs_close_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_close_source_test.py
 )
@@ -289,6 +301,8 @@ set_tests_properties(
     runtime_test_audit_test
     toolchain_bootstrap_source_test
     selfhost_benchmark_source_test
+    modules_cmake_source_test
+    qcow_common_source_test
     testd_manifest_test
     testprog_source_test
     httpd_source_test
@@ -340,6 +354,7 @@ set_tests_properties(
     vfs_mount_lifetime_source_test
     vfs_advisory_lock_source_test
     xfs_metadata_lock_source_test
+    xfs_metadata_source_test
     xfs_close_source_test
     xfs_btree_source_test
     xfs_dir_growth_source_test

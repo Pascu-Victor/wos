@@ -47,5 +47,6 @@ enum class procmgmt_ops : uint64_t {
     GETRESUID,      // 39
     GETRESGID,      // 40
     SIGPENDING,     // 41
+    GETPRIORITY,    // 42
 };
 }  // namespace ker::abi::process

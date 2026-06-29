@@ -27,6 +27,8 @@ TLS_WORK="$TLS_BUILD/work"
 LIBRESSL_VERSION="${WOS_LIBRESSL_VERSION:-4.3.2}"
 LIBRESSL_TARBALL_URL="${WOS_LIBRESSL_TARBALL_URL:-https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-$LIBRESSL_VERSION.tar.gz}"
 LIBRESSL_TARBALL_SHA256="${WOS_LIBRESSL_TARBALL_SHA256:-edf01aee24c65d69e6a9efcb9d44bcda682ff9d4f3bbbd95e794e1dfa90847b5}"
+LIBRESSL_TARBALL_URLS="${WOS_LIBRESSL_TARBALL_URLS:-$LIBRESSL_TARBALL_URL}"
+LIBRESSL_DOWNLOAD_ATTEMPTS="${WOS_LIBRESSL_DOWNLOAD_ATTEMPTS:-${WOS_SOURCE_DOWNLOAD_ATTEMPTS:-3}}"
 
 export PATH="$HOST/bin:$PATH"
 export LD_LIBRARY_PATH="$HOST/lib"
@@ -55,9 +57,7 @@ download_libressl_source() {
             echo "Populate $TLS_SRC with a LibreSSL portable release tree or install curl." >&2
             exit 1
         fi
-        echo "Downloading LibreSSL $LIBRESSL_VERSION source..." >&2
-        curl -L "$LIBRESSL_TARBALL_URL" -o "$archive.tmp"
-        mv "$archive.tmp" "$archive"
+        wos_download_file "LibreSSL $LIBRESSL_VERSION source" "$archive" "$LIBRESSL_TARBALL_URLS" "$LIBRESSL_DOWNLOAD_ATTEMPTS"
     fi
 
     echo "$LIBRESSL_TARBALL_SHA256  $archive" | sha256sum -c - >&2
@@ -243,7 +243,7 @@ fi
 )
 
 wos_make "$WOS_MAKE_JOBS" -C "$TLS_WORK"
-make -C "$TLS_WORK" \
+wos_make "$WOS_MAKE_JOBS" -C "$TLS_WORK" \
     prefix= \
     exec_prefix= \
     libdir=/lib \

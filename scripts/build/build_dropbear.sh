@@ -73,11 +73,31 @@ fi
 if [ ! -f "$DB_BUILD/Makefile" ]; then
     echo "Configuring dropbear for WOS..."
     DROPBEAR_CONFIGURE_BUILD_ARGS=()
+    DROPBEAR_CONFIGURE_CACHE_ARGS=()
     if [ "$(uname -s 2>/dev/null || printf unknown)" = "WOS" ]; then
         DROPBEAR_CONFIGURE_BUILD_ARGS=(--build="$TARGET_ARCH")
+        DROPBEAR_CONFIGURE_CACHE_ARGS=(
+            ac_cv_func_memcmp_working=yes
+            ac_cv_func_endutent=no
+            ac_cv_func_endutxent=no
+            ac_cv_func_getusershell=no
+            ac_cv_func_getutent=no
+            ac_cv_func_getutxent=no
+            ac_cv_func_getutid=no
+            ac_cv_func_getutxid=no
+            ac_cv_func_getutline=no
+            ac_cv_func_getutxline=no
+            ac_cv_func_pututline=no
+            ac_cv_func_pututxline=no
+            ac_cv_func_setutent=no
+            ac_cv_func_setutxent=no
+            ac_cv_func_utmpname=no
+            ac_cv_func_utmpxname=no
+        )
     fi
     cd "$DB_BUILD"
     "$DB_SRC/configure" \
+        "${DROPBEAR_CONFIGURE_CACHE_ARGS[@]}" \
         "${DROPBEAR_CONFIGURE_BUILD_ARGS[@]}" \
         --host="$TARGET_ARCH" \
         --prefix="$TARGET_SYSROOT" \

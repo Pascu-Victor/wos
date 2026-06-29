@@ -129,6 +129,111 @@ wos_refresh_file_mtime() {
     mv "$tmp" "$file"
 }
 
+wos_download_file() {
+    local label="$1"
+    local dest="$2"
+    local urls="$3"
+    local attempts="${4:-${WOS_SOURCE_DOWNLOAD_ATTEMPTS:-3}}"
+    local delay="${WOS_SOURCE_DOWNLOAD_RETRY_DELAY:-2}"
+    local connect_timeout="${WOS_SOURCE_DOWNLOAD_CONNECT_TIMEOUT:-20}"
+    local low_speed_limit="${WOS_SOURCE_DOWNLOAD_LOW_SPEED_LIMIT:-1}"
+    local low_speed_time="${WOS_SOURCE_DOWNLOAD_LOW_SPEED_TIME:-60}"
+    local url
+    local attempt
+    local status
+    local distdir="${WOS_SOURCE_DISTDIR:-}"
+    local candidate
+    local basename
+
+    case "$attempts" in
+        ''|*[!0-9]*|0)
+            echo "ERROR: download attempts must be a positive integer for $label, got '$attempts'" >&2
+            return 1
+            ;;
+    esac
+    case "$delay" in
+        ''|*[!0-9]*)
+            echo "ERROR: WOS_SOURCE_DOWNLOAD_RETRY_DELAY must be a non-negative integer, got '$delay'" >&2
+            return 1
+            ;;
+    esac
+    case "$connect_timeout" in
+        ''|*[!0-9]*|0)
+            echo "ERROR: WOS_SOURCE_DOWNLOAD_CONNECT_TIMEOUT must be a positive integer, got '$connect_timeout'" >&2
+            return 1
+            ;;
+    esac
+    case "$low_speed_limit" in
+        ''|*[!0-9]*)
+            echo "ERROR: WOS_SOURCE_DOWNLOAD_LOW_SPEED_LIMIT must be a non-negative integer, got '$low_speed_limit'" >&2
+            return 1
+            ;;
+    esac
+    case "$low_speed_time" in
+        ''|*[!0-9]*|0)
+            echo "ERROR: WOS_SOURCE_DOWNLOAD_LOW_SPEED_TIME must be a positive integer, got '$low_speed_time'" >&2
+            return 1
+            ;;
+    esac
+    if [ -z "$urls" ]; then
+        echo "ERROR: no download URL configured for $label" >&2
+        return 1
+    fi
+
+    if [ -n "$distdir" ]; then
+        basename="${dest##*/}"
+        for candidate in "$distdir/$basename"; do
+            if [ -f "$candidate" ]; then
+                echo "Using cached $label from $candidate" >&2
+                cp "$candidate" "$dest.tmp"
+                mv "$dest.tmp" "$dest"
+                return 0
+            fi
+        done
+
+        for url in $urls; do
+            basename="${url##*/}"
+            candidate="$distdir/$basename"
+            if [ -f "$candidate" ]; then
+                echo "Using cached $label from $candidate" >&2
+                cp "$candidate" "$dest.tmp"
+                mv "$dest.tmp" "$dest"
+                return 0
+            fi
+        done
+    fi
+
+    for url in $urls; do
+        attempt=1
+        while [ "$attempt" -le "$attempts" ]; do
+            if ! command -v curl >/dev/null 2>&1; then
+                echo "ERROR: curl is unavailable while downloading $label." >&2
+                return 1
+            fi
+            echo "Downloading $label from $url (attempt $attempt/$attempts)..." >&2
+            if curl -fL \
+                --connect-timeout "$connect_timeout" \
+                --speed-limit "$low_speed_limit" \
+                --speed-time "$low_speed_time" \
+                "$url" -o "$dest.tmp"; then
+                mv "$dest.tmp" "$dest"
+                return 0
+            fi
+            status=$?
+            rm -f "$dest.tmp"
+            echo "warning: failed to download $url (status $status)" >&2
+            if [ "$attempt" -lt "$attempts" ] && [ "$delay" -gt 0 ]; then
+                sleep "$delay"
+            fi
+            attempt=$((attempt + 1))
+        done
+    done
+
+    echo "ERROR: failed to download $label." >&2
+    echo "Tried: $urls" >&2
+    return 1
+}
+
 wos_prefetch_meson_subprojects() {
     local source_dir="$1"
     shift
@@ -218,13 +323,18 @@ wos_fetch_meson_git_subproject() {
     if [ -d "$dest/.git" ]; then
         current="$(git -C "$dest" rev-parse HEAD 2>/dev/null || true)"
         if [ "$current" = "$revision" ]; then
-            if [ -n "$patch_directory" ]; then
-                package_dir="$source_dir/subprojects/packagefiles/$patch_directory"
-                if [ -d "$package_dir" ]; then
-                    wos_copy_tree_entries_excluding "$package_dir" "$dest"
+            if ! git -C "$dest" checkout -f HEAD >/dev/null 2>&1 ||
+                ! git -C "$dest" diff-index --quiet HEAD --; then
+                echo "warning: Meson subproject checkout at $dest is incomplete; refetching" >&2
+            else
+                if [ -n "$patch_directory" ]; then
+                    package_dir="$source_dir/subprojects/packagefiles/$patch_directory"
+                    if [ -d "$package_dir" ]; then
+                        wos_copy_tree_entries_excluding "$package_dir" "$dest"
+                    fi
                 fi
+                return 0
             fi
-            return 0
         fi
     fi
 
@@ -233,8 +343,13 @@ wos_fetch_meson_git_subproject() {
     git -C "$dest" remote add origin "$url"
     GIT_HTTP_LOW_SPEED_LIMIT="$low_speed_limit" \
         GIT_HTTP_LOW_SPEED_TIME="$low_speed_time" \
-        git -C "$dest" fetch --depth 1 origin "$revision"
+        git -C "$dest" fetch --depth 1 origin "$revision" || return 1
     git -C "$dest" checkout --detach FETCH_HEAD
+
+    if ! git -C "$dest" diff-index --quiet HEAD --; then
+        echo "ERROR: Meson subproject checkout at $dest is incomplete after fetch" >&2
+        return 1
+    fi
 
     if [ -n "$patch_directory" ]; then
         package_dir="$source_dir/subprojects/packagefiles/$patch_directory"
@@ -274,7 +389,26 @@ wos_build_jobs() {
         esac
     fi
 
-    if command -v nproc >/dev/null 2>&1; then
+    if [ -z "$jobs" ] && [ -n "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]; then
+        jobs="$CMAKE_BUILD_PARALLEL_LEVEL"
+    fi
+
+    if [ "$(uname -s 2>/dev/null || printf unknown)" = "WOS" ] && [ -r /proc/stat ]; then
+        local cpu_count=0
+        local cpu_label
+        while read -r cpu_label _; do
+            case "$cpu_label" in
+                cpu[0-9]*)
+                    cpu_count=$((cpu_count + 1))
+                    ;;
+            esac
+        done </proc/stat
+        if [ "$cpu_count" -gt 0 ]; then
+            jobs="$cpu_count"
+        fi
+    fi
+
+    if [ -z "$jobs" ] && command -v nproc >/dev/null 2>&1; then
         jobs="$(nproc 2>/dev/null || true)"
     fi
     if [ -z "$jobs" ] && command -v getconf >/dev/null 2>&1; then
@@ -312,16 +446,12 @@ wos_make_jobs() {
         esac
     fi
 
-    if [ "$(uname -s 2>/dev/null || printf unknown)" = "WOS" ]; then
-        printf '1\n'
-        return 0
-    fi
-
     wos_build_jobs
 }
 
 wos_make_jobserver_arg() {
     local jobs="${1:-${WOS_MAKE_JOBS:-}}"
+    local style="${WOS_MAKE_JOBSERVER_STYLE:-}"
 
     case "$jobs" in
         ''|*[!0-9]*|0)
@@ -333,8 +463,20 @@ wos_make_jobserver_arg() {
             ;;
     esac
 
-    if [ "$(uname -s 2>/dev/null || printf unknown)" = "WOS" ]; then
-        printf '%s\n' "--jobserver-style=pipe"
+    if [ -z "$style" ] && [ "$(uname -s 2>/dev/null || printf unknown)" = "WOS" ]; then
+        style=pipe
+    fi
+
+    if [ -n "$style" ]; then
+        case "$style" in
+            pipe|fifo)
+                printf '%s\n' "--jobserver-style=$style"
+                ;;
+            *)
+                echo "ERROR: WOS_MAKE_JOBSERVER_STYLE must be pipe or fifo, got '$style'" >&2
+                return 1
+                ;;
+        esac
     fi
 }
 
@@ -365,11 +507,6 @@ wos_ninja_jobs() {
                 return 0
                 ;;
         esac
-    fi
-
-    if [ "$(uname -s 2>/dev/null || printf unknown)" = "WOS" ]; then
-        printf '1\n'
-        return 0
     fi
 
     wos_build_jobs

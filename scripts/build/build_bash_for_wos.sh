@@ -26,6 +26,8 @@ BASH_WORK="$BASH_BUILD/work"
 BASH_VERSION="${WOS_BASH_VERSION:-5.3}"
 BASH_TARBALL_URL="${WOS_BASH_TARBALL_URL:-https://ftp.gnu.org/gnu/bash/bash-$BASH_VERSION.tar.gz}"
 BASH_TARBALL_SHA256="${WOS_BASH_TARBALL_SHA256:-0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba}"
+BASH_TARBALL_URLS="${WOS_BASH_TARBALL_URLS:-$BASH_TARBALL_URL}"
+BASH_DOWNLOAD_ATTEMPTS="${WOS_BASH_DOWNLOAD_ATTEMPTS:-${WOS_SOURCE_DOWNLOAD_ATTEMPTS:-3}}"
 WOS_BASH_STRIP="${WOS_BASH_STRIP:-0}"
 
 export PATH="$HOST/bin:$PATH"
@@ -69,9 +71,7 @@ download_bash_source() {
             echo "Populate $BASH_SRC with a Bash release tree or install curl." >&2
             exit 1
         fi
-        echo "Downloading Bash $BASH_VERSION source..." >&2
-        curl -L "$BASH_TARBALL_URL" -o "$archive.tmp"
-        mv "$archive.tmp" "$archive"
+        wos_download_file "Bash $BASH_VERSION source" "$archive" "$BASH_TARBALL_URLS" "$BASH_DOWNLOAD_ATTEMPTS"
     fi
 
     echo "$BASH_TARBALL_SHA256  $archive" | sha256sum -c - >&2
@@ -151,6 +151,27 @@ patch_shobj_conf_for_wos() {
     fi
 }
 
+detect_bash_build_triple() {
+    local config_guess="$1"
+    local build_triple
+    local host_system
+
+    if build_triple="$(sh "$config_guess")"; then
+        printf '%s\n' "$build_triple"
+        return 0
+    fi
+
+    host_system="$(uname -s 2>/dev/null || printf unknown)"
+    if [ "$host_system" = "WOS" ]; then
+        echo "Bash config.guess does not recognise WOS; using $TARGET_ARCH as build triplet." >&2
+        printf '%s\n' "$TARGET_ARCH"
+        return 0
+    fi
+
+    echo "ERROR: Bash config.guess failed for host system $host_system." >&2
+    return 1
+}
+
 write_config_site() {
     local tmp_config_site
 
@@ -192,7 +213,7 @@ patch_config_sub_for_wos "$BASH_WORK/support/config.sub"
 patch_shobj_conf_for_wos "$BASH_WORK/support/shobj-conf"
 write_config_site
 
-BUILD_TRIPLE="$(sh "$BASH_WORK/support/config.guess")"
+BUILD_TRIPLE="$(detect_bash_build_triple "$BASH_WORK/support/config.guess")"
 
 mkdir -p "$TARGET_SYSROOT/bin" "$TARGET_SYSROOT/lib"
 if [ ! -e "$TARGET_SYSROOT/usr" ]; then

@@ -104,6 +104,8 @@ UNIT_TESTS=(
     runtime_test_audit_test
     toolchain_bootstrap_source_test
     selfhost_benchmark_source_test
+    modules_cmake_source_test
+    qcow_common_source_test
     testd_manifest_test
     testprog_source_test
     httpd_source_test
@@ -155,6 +157,7 @@ UNIT_TESTS=(
     vfs_mount_lifetime_source_test
     vfs_advisory_lock_source_test
     xfs_metadata_lock_source_test
+    xfs_metadata_source_test
     xfs_close_source_test
     xfs_btree_source_test
     xfs_dir_growth_source_test

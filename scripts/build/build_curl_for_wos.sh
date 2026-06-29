@@ -26,6 +26,8 @@ CURL_WORK="$CURL_BUILD/work"
 CURL_VERSION="${WOS_CURL_VERSION:-8.20.0}"
 CURL_TARBALL_URL="${WOS_CURL_TARBALL_URL:-https://curl.se/download/curl-$CURL_VERSION.tar.xz}"
 CURL_TARBALL_SHA256="${WOS_CURL_TARBALL_SHA256:-63fe2dc148ba0ceae89922ef838f7e5c946272c2e78b7c59fab4b79d3ce2b896}"
+CURL_TARBALL_URLS="${WOS_CURL_TARBALL_URLS:-$CURL_TARBALL_URL}"
+CURL_DOWNLOAD_ATTEMPTS="${WOS_CURL_DOWNLOAD_ATTEMPTS:-${WOS_SOURCE_DOWNLOAD_ATTEMPTS:-3}}"
 WOS_CURL_STRIP="${WOS_CURL_STRIP:-0}"
 HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
 CURL_CONFIGURE_BUILD_ARGS=()
@@ -53,6 +55,11 @@ require_file() {
     fi
 }
 
+download_curl_tarball() {
+    local archive="$1"
+    wos_download_file "curl $CURL_VERSION source" "$archive" "$CURL_TARBALL_URLS" "$CURL_DOWNLOAD_ATTEMPTS"
+}
+
 download_curl_source() {
     local dest="$1"
     local archive_dir="$CURL_BUILD/src"
@@ -66,9 +73,7 @@ download_curl_source() {
             echo "Populate $CURL_SRC with a curl release tree or install curl." >&2
             exit 1
         fi
-        echo "Downloading curl $CURL_VERSION source..." >&2
-        curl -L "$CURL_TARBALL_URL" -o "$archive.tmp"
-        mv "$archive.tmp" "$archive"
+        download_curl_tarball "$archive"
     fi
 
     echo "$CURL_TARBALL_SHA256  $archive" | sha256sum -c - >&2
@@ -104,10 +109,23 @@ resolve_curl_source() {
 
 copy_source_to_workdir() {
     local source_dir="$1"
+    local metadata
 
     wos_remove_tree "$CURL_WORK"
     mkdir -p "$CURL_WORK"
-    wos_copy_tree_entries_excluding "$source_dir" "$CURL_WORK" ".git" ".github"
+    wos_copy_tree_entries_excluding "$source_dir" "$CURL_WORK" ".git" ".github" "tests"
+    if [ -d "$source_dir/tests" ]; then
+        mkdir -p "$CURL_WORK/tests"
+        wos_copy_tree_entries_excluding "$source_dir/tests" "$CURL_WORK/tests" "data"
+        if [ -d "$source_dir/tests/data" ]; then
+            mkdir -p "$CURL_WORK/tests/data"
+            for metadata in Makefile.am Makefile.in; do
+                if [ -f "$source_dir/tests/data/$metadata" ]; then
+                    cp "$source_dir/tests/data/$metadata" "$CURL_WORK/tests/data/"
+                fi
+            done
+        fi
+    fi
 }
 
 patch_config_sub_for_wos() {
@@ -177,15 +195,19 @@ if [ ! -e "$TARGET_SYSROOT/usr" ]; then
 fi
 stage_ca_bundle
 
-CURL_CFLAGS="--sysroot=$TARGET_SYSROOT -O2 -g -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector"
-CURL_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
+CURL_TARGET_FLAGS="--target=$TARGET_ARCH --sysroot=$TARGET_SYSROOT"
+CURL_CFLAGS="$CURL_TARGET_FLAGS -O2 -g -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector"
+CURL_CPPFLAGS="$CURL_TARGET_FLAGS -I$TARGET_SYSROOT/include"
+CURL_LDFLAGS="$CURL_TARGET_FLAGS -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
 
-export CC="${WOS_CCACHE_PREFIX}$HOST/bin/clang --target=$TARGET_ARCH --sysroot=$TARGET_SYSROOT"
+# curl's libtool parses the compile command itself and misclassifies a CC value
+# with embedded target/sysroot flags as a library object. Keep CC to one path.
+export CC="$HOST/bin/clang"
 export AR="$HOST/bin/llvm-ar"
 export RANLIB="$HOST/bin/llvm-ranlib"
 export STRIP="$HOST/bin/llvm-strip"
 export CFLAGS="$CURL_CFLAGS"
-export CPPFLAGS="-I$TARGET_SYSROOT/include"
+export CPPFLAGS="$CURL_CPPFLAGS"
 export LDFLAGS="$CURL_LDFLAGS"
 export LIBS="-lssl -lcrypto -lz -lpthread -ldl"
 export PKG_CONFIG=false
@@ -225,7 +247,7 @@ export ac_cv_header_stdatomic_h=no
 )
 
 wos_make "$WOS_MAKE_JOBS" -C "$CURL_WORK"
-make -C "$CURL_WORK" \
+wos_make "$WOS_MAKE_JOBS" -C "$CURL_WORK" \
     prefix= \
     exec_prefix= \
     bindir=/bin \

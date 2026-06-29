@@ -96,9 +96,11 @@ option(WOS_DYNAMIC_USERSPACE_NO_PLT "Use GOT calls instead of PLT stubs for dyna
 
 set(WOS_SYSROOT_COMPILE_OPTIONS "--sysroot=${SYSROOT_PATH}")
 if(WOS_NATIVE_SYSTEM_BUILD AND WOS_SYSROOT_PATH STREQUAL "${WOS_NATIVE_INSTALLED_SYSROOT_PATH}")
+    set(WOS_C_STDLIB_INCLUDE "/usr/include")
     set(WOS_CXX_STDLIB_INCLUDE "/usr/include/c++/v1")
     set(WOS_STDLIB_LINK_DIR "/usr/lib")
 else()
+    set(WOS_C_STDLIB_INCLUDE "${SYSROOT_PATH}/include")
     set(WOS_CXX_STDLIB_INCLUDE "${SYSROOT_PATH}/include/c++/v1")
     set(WOS_STDLIB_LINK_DIR "${WOS_SYSROOT_LIB_DIR}")
 endif()
@@ -109,8 +111,11 @@ add_compile_options(
     "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-O3;-g;-flto;-fdiagnostics-color=always;-fno-stack-protector;-fno-stack-check;-fno-sanitize=safe-stack;-pipe;-Wall;-Wextra;-pedantic;-Wno-gnu-anonymous-struct;-Wno-c99-extensions;-Wno-zero-length-array;-m64;-march=native;-Wformat;-Wformat-security;-Werror=format-security;${WOS_SYSROOT_COMPILE_OPTIONS};-fno-omit-frame-pointer>"
     # C-specific flags
     "$<$<COMPILE_LANGUAGE:C>:-std=gnu11>"
+    "$<$<COMPILE_LANGUAGE:C>:SHELL:-isystem ${WOS_C_STDLIB_INCLUDE}>"
     # C++-specific flags
-    "$<$<COMPILE_LANGUAGE:CXX>:-std=c++23;-isystem;${WOS_CXX_STDLIB_INCLUDE}>"
+    "$<$<COMPILE_LANGUAGE:CXX>:-std=c++23>"
+    "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-isystem ${WOS_CXX_STDLIB_INCLUDE}>"
+    "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-isystem ${WOS_C_STDLIB_INCLUDE}>"
     # NASM flags
     "$<$<COMPILE_LANGUAGE:ASM_NASM>:-g;-Wall;-felf64;-Isrc;-w-reloc-abs-qword;-w-reloc-rel-dword>"
 )

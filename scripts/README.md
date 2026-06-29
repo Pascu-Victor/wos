@@ -27,7 +27,7 @@ defaults to cloning `https://github.com/Pascu-Victor/wos.git`, building the
 `wos_full` target with Qt/wosdbg disabled, and writing
 `selfhost-report.tsv`. It also writes `selfhost-detail.tsv` for the current
 run and appends the same detailed rows to `<workdir>-history.tsv` by default.
-Those detailed rows include root WOS repository fetch time, per-submodule
+Those detailed rows include root WOS repository fetch time, recursive submodule
 update time, configure time, build time, mode, commit, target, job count, and
 shallow/full-history mode. Use `--history-file <path>` to put the append-only
 history somewhere else. The intent is to see whether self-hosting changes move
@@ -37,7 +37,25 @@ one local step.
 WOS mode defaults to `/root/wos-selfhost-bench` so the checkout and build land
 on the XFS rootfs rather than `/tmp` tmpfs. The default clone is shallow
 because the benchmark needs current source and submodule contents to build, not
-full Git history.
+full Git history. The default job count is 32.
+
+For patched iteration without paying GitHub download time, prefer a shallow
+bare mirror over a copied source tree:
+
+```sh
+scripts/dev/git_mirror_for_wos.sh snapshot --worktree
+scripts/dev/git_mirror_for_wos.sh sync-file-mirror wos-0 /tmp/wos-git-repos
+scripts/bench/run_wos_selfhost_build.sh wos --host wos-0 --jobs 32 --mirror-file /tmp/wos-git-repos
+```
+
+This keeps the benchmark's source acquisition as a depth-1 Git clone inside WOS
+while avoiding a full live-workspace copy. `snapshot --worktree` captures the
+current non-ignored worktree in a temporary synthetic commit without changing
+the real index. Do not copy the live workspace into the VM for debug runs.
+`--source-cache <path>` can still point at an already-staged depth-1 checkout
+that contains initialized shallow submodules, but that skips clone timing and
+is not the acceptance path measurement. Exported source trees are refused so a
+debug run does not silently become a full workspace copy.
 
 Rootless WOS launches can reuse an existing topology with either:
 
@@ -49,8 +67,8 @@ bin/wos-ktest --no-setup
 Then collect comparable reports:
 
 ```sh
-scripts/bench/run_wos_selfhost_build.sh wos --host wos-0 --jobs "$(nproc)"
-scripts/bench/run_wos_selfhost_build.sh linux --workdir /tmp/wos-selfhost-linux --jobs "$(nproc)"
+scripts/bench/run_wos_selfhost_build.sh wos --host wos-0 --jobs 32
+scripts/bench/run_wos_selfhost_build.sh linux --workdir /tmp/wos-selfhost-linux --jobs 32
 ```
 
 When running the script from an existing WOS shell, use `wos-local`; this is

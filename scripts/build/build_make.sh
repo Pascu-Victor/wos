@@ -24,6 +24,8 @@ MAKE_SRC="${WOS_MAKE_SOURCE_DIR:-$B/src/make}"
 MAKE_VERSION="${WOS_GNU_MAKE_VERSION:-4.4.1}"
 MAKE_TARBALL_URL="${WOS_GNU_MAKE_TARBALL_URL:-https://ftp.gnu.org/gnu/make/make-$MAKE_VERSION.tar.gz}"
 MAKE_TARBALL_SHA256="${WOS_GNU_MAKE_TARBALL_SHA256:-dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3}"
+MAKE_TARBALL_URLS="${WOS_GNU_MAKE_TARBALL_URLS:-$MAKE_TARBALL_URL}"
+MAKE_DOWNLOAD_ATTEMPTS="${WOS_GNU_MAKE_DOWNLOAD_ATTEMPTS:-${WOS_SOURCE_DOWNLOAD_ATTEMPTS:-3}}"
 HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
 
 require_file() {
@@ -50,9 +52,7 @@ download_make_source() {
             echo "Populate $MAKE_SRC with a GNU make release tree or install curl." >&2
             exit 1
         fi
-        echo "Downloading GNU make $MAKE_VERSION source..." >&2
-        curl -L "$MAKE_TARBALL_URL" -o "$archive.tmp"
-        mv "$archive.tmp" "$archive"
+        wos_download_file "GNU make $MAKE_VERSION source" "$archive" "$MAKE_TARBALL_URLS" "$MAKE_DOWNLOAD_ATTEMPTS"
     fi
 
     echo "$MAKE_TARBALL_SHA256  $archive" | sha256sum -c - >&2
@@ -222,6 +222,7 @@ if [ ! -f "$MAKE_BUILD/Makefile" ] || [ ! -f "$MAKE_BUILD/config.status" ] || [ 
             ac_cv_path_GREP=/usr/bin/grep
             "ac_cv_path_EGREP=/usr/bin/grep -E"
             "ac_cv_path_FGREP=/usr/bin/grep -F"
+            ac_cv_func_mempcpy=yes
         )
     fi
     (

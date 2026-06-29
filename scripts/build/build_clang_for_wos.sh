@@ -16,6 +16,13 @@ wos_setup_ccache
 wos_setup_ccache_cmake_args
 WOS_BUILD_JOBS="$(wos_build_jobs)"
 WOS_NINJA_JOBS="$(wos_ninja_jobs)"
+WOS_LLVM_PARALLEL_LINK_JOBS="${WOS_LLVM_PARALLEL_LINK_JOBS:-$WOS_NINJA_JOBS}"
+case "$WOS_LLVM_PARALLEL_LINK_JOBS" in
+    ''|*[!0-9]*|0)
+        echo "ERROR: WOS_LLVM_PARALLEL_LINK_JOBS must be a positive integer, got '$WOS_LLVM_PARALLEL_LINK_JOBS'" >&2
+        exit 1
+        ;;
+esac
 
 B="$WORKSPACE_ROOT/toolchain"
 HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
@@ -118,7 +125,7 @@ cmake -S "$LLVM_SRC" -B "$CLANG_BUILD" -G Ninja \
     -DLLVM_ENABLE_OCAMLDOC=OFF \
     -DLLVM_BUILD_LLVM_DYLIB=OFF \
     -DLLVM_LINK_LLVM_DYLIB=OFF \
-    -DLLVM_PARALLEL_LINK_JOBS=1 \
+    -DLLVM_PARALLEL_LINK_JOBS="$WOS_LLVM_PARALLEL_LINK_JOBS" \
     -DCLANG_LINK_CLANG_DYLIB=OFF \
     -DCLANG_BUILD_EXAMPLES=OFF \
     -DCLANG_INCLUDE_TESTS=OFF \

@@ -17,6 +17,8 @@ MESON_WORK="$MESON_BUILD/work"
 MESON_COMMIT="${WOS_MESON_COMMIT:-b300d9578fe62c721afbf4e5c4672ad0c94cb96c}"
 MESON_TARBALL_URL="${WOS_MESON_TARBALL_URL:-https://github.com/Pascu-Victor/meson/archive/$MESON_COMMIT.tar.gz}"
 MESON_TARBALL_SHA256="${WOS_MESON_TARBALL_SHA256:-afd1b4b8debff255cdf793f46a059559d9f1c3d14549371f34a9c008bf797620}"
+MESON_TARBALL_URLS="${WOS_MESON_TARBALL_URLS:-$MESON_TARBALL_URL}"
+MESON_DOWNLOAD_ATTEMPTS="${WOS_MESON_DOWNLOAD_ATTEMPTS:-${WOS_SOURCE_DOWNLOAD_ATTEMPTS:-3}}"
 MESON_VERSION=""
 
 require_file() {
@@ -43,13 +45,7 @@ download_meson_source() {
             echo "Populate $MESON_SRC from https://github.com/Pascu-Victor/meson." >&2
             exit 1
         fi
-        echo "Downloading Meson source from Pascu-Victor/meson..." >&2
-        if ! curl -fL "$MESON_TARBALL_URL" -o "$archive.tmp"; then
-            rm -f "$archive.tmp"
-            echo "ERROR: failed to download $MESON_TARBALL_URL" >&2
-            exit 1
-        fi
-        mv "$archive.tmp" "$archive"
+        wos_download_file "Meson $MESON_COMMIT source" "$archive" "$MESON_TARBALL_URLS" "$MESON_DOWNLOAD_ATTEMPTS"
     fi
 
     echo "$MESON_TARBALL_SHA256  $archive" | sha256sum -c - >&2

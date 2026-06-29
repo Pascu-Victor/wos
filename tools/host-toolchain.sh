@@ -10,6 +10,7 @@ WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$WORKSPACE_ROOT/tools/ccache_env.sh"
 wos_setup_ccache
 wos_setup_ccache_cmake_args
+WOS_NINJA_JOBS="$(wos_ninja_jobs)"
 
 cd "$WORKSPACE_ROOT"
 
@@ -58,7 +59,7 @@ cmake -U'Python3_*' -U'_Python3_*' -G Ninja \
  -DLLVM_INCLUDE_BENCHMARKS=OFF \
  -DLLVM_INCLUDE_DOCS=OFF \
  $B/src/llvm-project/llvm
-ninja install
+ninja -j"$WOS_NINJA_JOBS" install
 
 # 3. Create symlinks for easier use
 cd $B/host/bin

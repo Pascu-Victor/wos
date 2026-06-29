@@ -52,6 +52,7 @@ static constexpr uint64_t WOS_CLONE_UNTRACED = 0x00800000;
 static constexpr uint64_t WOS_PERSONALITY_QUERY = 0xffffffff;
 static constexpr uint64_t WOS_PERSONALITY_QUERY_ALL_BITS = ~0ULL;
 static constexpr int WOS_PRIO_PROCESS = 0;
+static constexpr int WOS_PRIO_KERNEL_ENCODE_BIAS = 20;
 static constexpr int WOS_PR_SET_PDEATHSIG = 1;
 static constexpr int WOS_PR_GET_PDEATHSIG = 2;
 static constexpr int WOS_PR_GET_DUMPABLE = 3;
@@ -1275,6 +1276,33 @@ auto wos_proc_setpriority(int which, int64_t who, int prio) -> uint64_t {
     return 0;
 }
 
+auto wos_proc_getpriority(int which, int64_t who) -> uint64_t {
+    if (which != WOS_PRIO_PROCESS) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
+
+    auto* self = mod::sched::get_current_task();
+    if (self == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+
+    if (who == 0) {
+        who = static_cast<int64_t>(self->pid);
+    }
+    if (who < 0) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
+
+    auto* target = mod::sched::find_task_by_pid_safe(static_cast<uint64_t>(who));
+    if (target == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+
+    int const ENCODED_NICE = static_cast<int>(target->sched_nice) + WOS_PRIO_KERNEL_ENCODE_BIAS;
+    target->release();
+    return static_cast<uint64_t>(ENCODED_NICE);
+}
+
 auto wos_proc_setwkitarget(const char* hostname, size_t len, uint32_t flags) -> uint64_t {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
@@ -1658,6 +1686,9 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         }
         case abi::process::procmgmt_ops::SETPRIORITY: {
             return wos_proc_setpriority(static_cast<int>(a2), static_cast<int64_t>(a3), static_cast<int>(a4));
+        }
+        case abi::process::procmgmt_ops::GETPRIORITY: {
+            return wos_proc_getpriority(static_cast<int>(a2), static_cast<int64_t>(a3));
         }
         case abi::process::procmgmt_ops::SETWKITARGET: {
             return wos_proc_setwkitarget(reinterpret_cast<const char*>(a2), static_cast<size_t>(a3), static_cast<uint32_t>(a4));

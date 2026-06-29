@@ -25,6 +25,8 @@ ZLIB_SRC="${WOS_ZLIB_SOURCE_DIR:-$B/src/zlib}"
 ZLIB_VERSION="${WOS_ZLIB_VERSION:-1.3.1}"
 ZLIB_TARBALL_URL="${WOS_ZLIB_TARBALL_URL:-https://zlib.net/fossils/zlib-$ZLIB_VERSION.tar.gz}"
 ZLIB_TARBALL_SHA256="${WOS_ZLIB_TARBALL_SHA256:-9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23}"
+ZLIB_TARBALL_URLS="${WOS_ZLIB_TARBALL_URLS:-$ZLIB_TARBALL_URL}"
+ZLIB_DOWNLOAD_ATTEMPTS="${WOS_ZLIB_DOWNLOAD_ATTEMPTS:-${WOS_SOURCE_DOWNLOAD_ATTEMPTS:-3}}"
 
 export PATH="$HOST/bin:$PATH"
 export LD_LIBRARY_PATH="$HOST/lib"
@@ -53,9 +55,7 @@ download_zlib_source() {
             echo "Populate $ZLIB_SRC with a zlib release tree or install curl." >&2
             exit 1
         fi
-        echo "Downloading zlib $ZLIB_VERSION source..." >&2
-        curl -L "$ZLIB_TARBALL_URL" -o "$archive.tmp"
-        mv "$archive.tmp" "$archive"
+        wos_download_file "zlib $ZLIB_VERSION source" "$archive" "$ZLIB_TARBALL_URLS" "$ZLIB_DOWNLOAD_ATTEMPTS"
     fi
 
     echo "$ZLIB_TARBALL_SHA256  $archive" | sha256sum -c - >&2
@@ -120,7 +120,7 @@ if [ ! -f "$ZLIB_BUILD/Makefile" ] || [ "$ZLIB_SOURCE_DIR/configure" -nt "$ZLIB_
 fi
 
 wos_make "$WOS_MAKE_JOBS" -C "$ZLIB_BUILD" libz.a
-make -C "$ZLIB_BUILD" \
+wos_make "$WOS_MAKE_JOBS" -C "$ZLIB_BUILD" \
     prefix= \
     exec_prefix= \
     libdir=/lib \

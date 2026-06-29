@@ -70,6 +70,66 @@ host_env() {
 		-u LIBRARY_PATH "$@"
 }
 
+python_source_version() {
+	local patchlevel="$PYTHON_SRC/Include/patchlevel.h"
+	local major
+	local minor
+
+	require_file "$patchlevel" "CPython source is missing Include/patchlevel.h."
+	major="$(sed -n 's/^#define[[:space:]]\+PY_MAJOR_VERSION[[:space:]]\+\([0-9][0-9]*\).*/\1/p' "$patchlevel" | head -n 1)"
+	minor="$(sed -n 's/^#define[[:space:]]\+PY_MINOR_VERSION[[:space:]]\+\([0-9][0-9]*\).*/\1/p' "$patchlevel" | head -n 1)"
+	if [ -z "$major" ] || [ -z "$minor" ]; then
+		echo "ERROR: could not determine CPython source version from $patchlevel" >&2
+		return 1
+	fi
+	printf '%s.%s\n' "$major" "$minor"
+}
+
+python_interpreter_matches_source() {
+	local interpreter="$1"
+	local expected_version="$2"
+
+	"$interpreter" - "$expected_version" <<'PY' >/dev/null 2>&1
+import sys
+
+expected = tuple(int(part) for part in sys.argv[1].split("."))
+raise SystemExit(sys.version_info[:2] != expected)
+PY
+}
+
+find_compatible_build_python() {
+	local expected_version
+	local explicit="${WOS_PYTHON_BUILD_PYTHON:-}"
+	local candidate
+	local resolved
+
+	expected_version="$(python_source_version)"
+	if [ -n "$explicit" ]; then
+		resolved="$(command -v "$explicit" 2>/dev/null || true)"
+		if [ -z "$resolved" ]; then
+			echo "ERROR: WOS_PYTHON_BUILD_PYTHON=$explicit is not executable" >&2
+			return 1
+		fi
+		if ! python_interpreter_matches_source "$resolved" "$expected_version"; then
+			echo "ERROR: WOS_PYTHON_BUILD_PYTHON=$resolved is not Python $expected_version" >&2
+			return 1
+		fi
+		printf '%s\n' "$resolved"
+		return 0
+	fi
+
+	for candidate in "python$expected_version" python3.16 python3 python; do
+		resolved="$(command -v "$candidate" 2>/dev/null || true)"
+		[ -n "$resolved" ] || continue
+		if python_interpreter_matches_source "$resolved" "$expected_version"; then
+			printf '%s\n' "$resolved"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
 write_config_site() {
 	local tmp_config_site
 
@@ -149,6 +209,9 @@ python_target_config_is_wos() {
 	grep -Eq '^CC[[:space:]]*=.*--target=x86_64-pc-wos' "$makefile" || return 1
 	grep -Fq -- "-isystem $HOST/lib/clang/22/include" "$makefile" || return 1
 	grep -Fq -- "-isystem $TARGET_SYSROOT/include" "$makefile" || return 1
+	if [ -n "${BUILD_PYTHON:-}" ]; then
+		grep -Fq "PYTHON_FOR_FREEZE=$BUILD_PYTHON" "$makefile" || return 1
+	fi
 	! grep -Eq '^CC[[:space:]]*=[[:space:]]*gcc([[:space:]]|$)' "$makefile" || return 1
 	! grep -Eq '^LDSHARED[[:space:]]*=[[:space:]]*ld([[:space:]]|$)' "$makefile" || return 1
 	[ -f "$pyconfig" ] || return 1
@@ -238,26 +301,43 @@ if [ ! -e "$TARGET_SYSROOT/usr" ]; then
     ln -s . "$TARGET_SYSROOT/usr"
 fi
 
-if [ ! -f "$PYTHON_HOST_BUILD/Makefile" ] || [ "$PYTHON_SRC/configure" -nt "$PYTHON_HOST_BUILD/Makefile" ] || [ "$SCRIPT_DIR/build_python_for_wos.sh" -nt "$PYTHON_HOST_BUILD/Makefile" ]; then
-    echo "Configuring build-host CPython..."
-    if [ -f "$PYTHON_HOST_BUILD/Makefile" ]; then
-        host_env make -C "$PYTHON_HOST_BUILD" clean >/dev/null 2>&1 || true
-    fi
-    (
-        cd "$PYTHON_HOST_BUILD"
-        host_env "$PYTHON_SRC/configure" \
-            "${PYTHON_CONFIGURE_CACHE_ARGS[@]}" \
-            "${PYTHON_HOST_CONFIGURE_BUILD_ARGS[@]}" \
-            --prefix="$PYTHON_HOST_BUILD/install" \
-            --without-ensurepip \
-            --disable-test-modules \
-            --disable-ipv6
-    )
+BUILD_PYTHON=""
+EXTERNAL_BUILD_PYTHON=""
+if [ "$HOST_SYSTEM" = "WOS" ] || [ -n "${WOS_PYTHON_BUILD_PYTHON:-}" ]; then
+	if ! EXTERNAL_BUILD_PYTHON="$(find_compatible_build_python)"; then
+		if [ -n "${WOS_PYTHON_BUILD_PYTHON:-}" ]; then
+			exit 1
+		fi
+		EXTERNAL_BUILD_PYTHON=""
+	fi
 fi
 
-host_env make ${WOS_MAKE_JOBSERVER_ARG:+"$WOS_MAKE_JOBSERVER_ARG"} -C "$PYTHON_HOST_BUILD" -j"$WOS_MAKE_JOBS" python
-BUILD_PYTHON="$PYTHON_HOST_BUILD/python"
-require_file "$BUILD_PYTHON" "Build-host CPython did not produce $BUILD_PYTHON."
+if [ -n "$EXTERNAL_BUILD_PYTHON" ]; then
+	echo "Using existing build Python $EXTERNAL_BUILD_PYTHON for CPython build helpers"
+	BUILD_PYTHON="$EXTERNAL_BUILD_PYTHON"
+else
+		if [ ! -f "$PYTHON_HOST_BUILD/Makefile" ] || [ "$PYTHON_SRC/configure" -nt "$PYTHON_HOST_BUILD/Makefile" ] || [ "$SCRIPT_DIR/build_python_for_wos.sh" -nt "$PYTHON_HOST_BUILD/Makefile" ]; then
+			echo "Configuring build-host CPython..."
+			if [ -f "$PYTHON_HOST_BUILD/Makefile" ]; then
+				host_env make ${WOS_MAKE_JOBSERVER_ARG:+"$WOS_MAKE_JOBSERVER_ARG"} -j"$WOS_MAKE_JOBS" -C "$PYTHON_HOST_BUILD" clean >/dev/null 2>&1 || true
+			fi
+		(
+			cd "$PYTHON_HOST_BUILD"
+			host_env "$PYTHON_SRC/configure" \
+				"${PYTHON_CONFIGURE_CACHE_ARGS[@]}" \
+				"${PYTHON_HOST_CONFIGURE_BUILD_ARGS[@]}" \
+				--prefix="$PYTHON_HOST_BUILD/install" \
+				--without-ensurepip \
+				--disable-test-modules \
+				--disable-ipv6
+		)
+	fi
+
+	echo "Building build-host CPython with WOS_MAKE_JOBS=$WOS_MAKE_JOBS..."
+	host_env make ${WOS_MAKE_JOBSERVER_ARG:+"$WOS_MAKE_JOBSERVER_ARG"} -C "$PYTHON_HOST_BUILD" -j"$WOS_MAKE_JOBS" python
+	BUILD_PYTHON="$PYTHON_HOST_BUILD/python"
+	require_file "$BUILD_PYTHON" "Build-host CPython did not produce $BUILD_PYTHON."
+fi
 
 write_config_site
 
@@ -326,6 +406,7 @@ if [ -f "$PYTHON_TARGET_BUILD/python" ]; then
     done
 fi
 
+echo "Building target CPython with WOS_MAKE_JOBS=$WOS_MAKE_JOBS..."
 wos_make "$WOS_MAKE_JOBS" -C "$PYTHON_TARGET_BUILD" \
     CC="$TARGET_CC" \
     CXX="$TARGET_CXX" \
@@ -334,7 +415,8 @@ wos_make "$WOS_MAKE_JOBS" -C "$PYTHON_TARGET_BUILD" \
     STRIP="$TARGET_STRIP" \
     READELF="$TARGET_READELF" \
     python
-make -C "$PYTHON_TARGET_BUILD" \
+echo "Installing target CPython with WOS_MAKE_JOBS=$WOS_MAKE_JOBS..."
+wos_make "$WOS_MAKE_JOBS" -C "$PYTHON_TARGET_BUILD" \
     CC="$TARGET_CC" \
     CXX="$TARGET_CXX" \
     AR="$TARGET_AR" \

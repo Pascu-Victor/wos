@@ -27,6 +27,8 @@ GIT_WORK="$GIT_BUILD/work"
 GIT_VERSION="${WOS_GIT_VERSION:-2.54.0}"
 GIT_TARBALL_URL="${WOS_GIT_TARBALL_URL:-https://www.kernel.org/pub/software/scm/git/git-$GIT_VERSION.tar.xz}"
 GIT_TARBALL_SHA256="${WOS_GIT_TARBALL_SHA256:-f689162364c10de79ef89aa8dbf48731eb057e34edbbd20aca510ce0154681a3}"
+GIT_TARBALL_URLS="${WOS_GIT_TARBALL_URLS:-$GIT_TARBALL_URL}"
+GIT_DOWNLOAD_ATTEMPTS="${WOS_GIT_DOWNLOAD_ATTEMPTS:-${WOS_SOURCE_DOWNLOAD_ATTEMPTS:-3}}"
 WOS_GIT_STRIP="${WOS_GIT_STRIP:-0}"
 
 export PATH="$HOST/bin:$PATH"
@@ -56,9 +58,7 @@ download_git_source() {
             echo "Populate $GIT_SRC with a Git release tree or install curl." >&2
             exit 1
         fi
-        echo "Downloading Git $GIT_VERSION source..." >&2
-        curl -L "$GIT_TARBALL_URL" -o "$archive.tmp"
-        mv "$archive.tmp" "$archive"
+        wos_download_file "Git $GIT_VERSION source" "$archive" "$GIT_TARBALL_URLS" "$GIT_DOWNLOAD_ATTEMPTS"
     fi
 
     echo "$GIT_TARBALL_SHA256  $archive" | sha256sum -c - >&2

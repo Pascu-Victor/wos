@@ -27,8 +27,8 @@
             "name": "lan",
             "nodes": 1,
             "nic_model": "virtio-net-pci",
-            "nic_queues": 2,
-            "vhost": false,
+            "nic_queues": 4,
+            "vhost": true,
             "netdev_driver": "dhcp",
             "bridge": {
                 "ip": "10.10.0.100/24",

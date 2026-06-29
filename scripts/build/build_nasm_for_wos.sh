@@ -26,6 +26,8 @@ NASM_BUILD="${WOS_NASM_BUILD_DIR:-$B/nasm-build}"
 NASM_VERSION="${WOS_NASM_VERSION:-3.02rc9}"
 NASM_TARBALL_URL="${WOS_NASM_TARBALL_URL:-https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.xz}"
 NASM_TARBALL_SHA256="${WOS_NASM_TARBALL_SHA256:-1802d091f4b2c1b3f61ab9d9fca323b8da7674c1ced7d5b770e77604d9c7925b}"
+NASM_TARBALL_URLS="${WOS_NASM_TARBALL_URLS:-$NASM_TARBALL_URL}"
+NASM_DOWNLOAD_ATTEMPTS="${WOS_NASM_DOWNLOAD_ATTEMPTS:-${WOS_SOURCE_DOWNLOAD_ATTEMPTS:-3}}"
 WOS_NASM_STRIP="${WOS_NASM_STRIP:-0}"
 
 export PATH="$HOST/bin:$PATH"
@@ -75,9 +77,7 @@ download_nasm_source() {
             echo "Populate $NASM_SRC with a NASM release tree or install curl." >&2
             exit 1
         fi
-        echo "Downloading NASM $NASM_VERSION source..." >&2
-        curl -L "$NASM_TARBALL_URL" -o "$archive.tmp"
-        mv "$archive.tmp" "$archive"
+        wos_download_file "NASM $NASM_VERSION source" "$archive" "$NASM_TARBALL_URLS" "$NASM_DOWNLOAD_ATTEMPTS"
     fi
 
     echo "$NASM_TARBALL_SHA256  $archive" | sha256sum -c - >&2
