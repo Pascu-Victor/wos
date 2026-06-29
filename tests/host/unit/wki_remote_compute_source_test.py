@@ -79,14 +79,25 @@ def test_proxy_wait_completion_respects_waitpid_publish_fence() -> None:
 
     completion = function_body(source, "try_complete_proxy_wait")
     for snippet in [
+        "proxy_matches_waiter(waiter, proxy)",
         "proxy_waiter_context_can_be_completed(waiter)",
+        "ker::mod::sched::task::task_try_claim_waitpid_completion(*waiter)",
+        "ker::mod::sched::task::task_release_waitpid_completion_claim(*waiter)",
         "ker::mod::sched::task::task_try_mark_waited_on(*proxy)",
         "write_proxy_wait_status(waiter, wait_status)",
-        "clear_proxy_wait_result_state(waiter)",
-        "waiter->waiting_for_pid = 0",
+        "waiter->waitpid_publish_pending.store(false, std::memory_order_release)",
+        "ker::mod::sched::task::task_clear_waitpid_block_state(*waiter)",
     ]:
         if snippet not in completion:
             fail(f"proxy wait completion must use the fenced single-result helper: {snippet}")
+
+    match_body = function_body(source, "proxy_matches_waiter")
+    for snippet in [
+        "proxy->parent_pid != waiter->pid",
+        "waiter->waiting_for_pid == WAIT_ANY_CHILD || waiter->waiting_for_pid == proxy->pid",
+    ]:
+        if snippet not in match_body:
+            fail(f"proxy wait completion must reject stale specific waiters: {snippet}")
 
     wake_body = function_body(source, "wake_proxy_waiters")
     if "try_complete_proxy_wait(waiting_task, proxy, WAIT_STATUS)" not in wake_body:
@@ -100,6 +111,8 @@ def test_proxy_wait_completion_respects_waitpid_publish_fence() -> None:
 
     if "wki_remote_compute_selftest_proxy_wait_completion_respects_publish_fence" not in source:
         fail("remote-compute KTEST selftest must cover proxy wait publish fencing")
+    if "REJECTED_STALE_SPECIFIC_WAIT" not in source:
+        fail("remote-compute KTEST selftest must cover stale specific waiters")
 
 
 def test_task_wait_consumes_completed_submitted_row() -> None:

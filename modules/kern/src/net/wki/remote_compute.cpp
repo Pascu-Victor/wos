@@ -50,6 +50,7 @@ namespace {
 
 constexpr uint32_t WKI_LATENCY_DAEMON_SLICE_NS = 2'000'000;
 constexpr int WKI_LATENCY_DAEMON_NICE = -5;
+constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
 
 void promote_latency_sensitive_daemon(ker::mod::sched::task::Task* task) {
     if (task == nullptr || task->type != ker::mod::sched::task::TaskType::DAEMON) {
@@ -651,17 +652,6 @@ auto proxy_waiter_context_can_be_completed(ker::mod::sched::task::Task* waiter) 
     return waiter != nullptr && !waiter->deferred_task_switch && !waiter->waitpid_publish_pending.load(std::memory_order_acquire);
 }
 
-void clear_proxy_wait_result_state(ker::mod::sched::task::Task* waiter) {
-    if (waiter == nullptr) {
-        return;
-    }
-
-    waiter->wait_status_user_addr = 0;
-    waiter->wait_status_phys_addr = 0;
-    waiter->wait_rusage_user_addr = 0;
-    waiter->wait_rusage_phys_addr = 0;
-}
-
 void write_proxy_wait_status(ker::mod::sched::task::Task* waiter, int32_t wait_status) {
     if (waiter == nullptr || waiter->wait_status_user_addr == 0 || waiter->pagemap == nullptr) {
         if (waiter != nullptr) {
@@ -680,20 +670,34 @@ void write_proxy_wait_status(ker::mod::sched::task::Task* waiter, int32_t wait_s
     waiter->wait_status_phys_addr = 0;
 }
 
+auto proxy_matches_waiter(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* proxy) -> bool {
+    if (waiter == nullptr || proxy == nullptr || proxy->is_thread || proxy->parent_pid != waiter->pid) {
+        return false;
+    }
+    return waiter->waiting_for_pid == WAIT_ANY_CHILD || waiter->waiting_for_pid == proxy->pid;
+}
+
 auto try_complete_proxy_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* proxy, int32_t wait_status) -> bool {
-    if (proxy == nullptr || !proxy_waiter_context_can_be_completed(waiter)) {
+    if (!proxy_matches_waiter(waiter, proxy) || !proxy_waiter_context_can_be_completed(waiter)) {
+        return false;
+    }
+    if (!ker::mod::sched::task::task_try_claim_waitpid_completion(*waiter)) {
+        return false;
+    }
+    if (!proxy_matches_waiter(waiter, proxy) || !proxy_waiter_context_can_be_completed(waiter)) {
+        ker::mod::sched::task::task_release_waitpid_completion_claim(*waiter);
         return false;
     }
     if (!ker::mod::sched::task::task_try_mark_waited_on(*proxy)) {
+        ker::mod::sched::task::task_release_waitpid_completion_claim(*waiter);
         return false;
     }
 
     ker::mod::sched::task::task_accumulate_waited_child_times(*waiter, *proxy);
     waiter->context.regs.rax = proxy->pid;
     write_proxy_wait_status(waiter, wait_status);
-    clear_proxy_wait_result_state(waiter);
-    waiter->waiting_for_pid = 0;
-    waiter->wait_options = 0;
+    waiter->waitpid_publish_pending.store(false, std::memory_order_release);
+    ker::mod::sched::task::task_clear_waitpid_block_state(*waiter);
     return true;
 }
 
@@ -808,7 +812,6 @@ void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status
         if (parent != nullptr) {
             parent->sig_pending |= (1ULL << (WKI_SIGCHLD_NUM - 1));
 
-            static constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
             if (parent->waiting_for_pid == WAIT_ANY_CHILD && try_complete_proxy_wait(parent, proxy, WAIT_STATUS)) {
                 uint64_t cpu = parent->cpu;
                 if (cpu >= ker::mod::smt::get_core_count()) {
@@ -2617,9 +2620,13 @@ auto wki_remote_compute_selftest_cleanup_marks_unready_proxy_failure() -> bool {
 
 auto wki_remote_compute_selftest_proxy_wait_completion_respects_publish_fence() -> bool {
     ker::mod::sched::task::Task waiter{};
+    ker::mod::sched::task::Task stale_waiter{};
     ker::mod::sched::task::Task proxy{};
 
+    waiter.pid = 0x7A21;
+    stale_waiter.pid = waiter.pid;
     proxy.pid = 0x7A22;
+    proxy.parent_pid = waiter.pid;
     ker::mod::sched::task::task_clear_waited_on(proxy);
 
     waiter.context.regs.rax = 0xBAD0;
@@ -2635,7 +2642,14 @@ auto wki_remote_compute_selftest_proxy_wait_completion_respects_publish_fence() 
     bool const COMPLETED_AFTER_PUBLISH = try_complete_proxy_wait(&waiter, &proxy, 0x1234) && ker::mod::sched::task::task_waited_on(proxy) &&
                                          waiter.context.regs.rax == proxy.pid && waiter.waiting_for_pid == 0;
 
-    return BLOCKED_WHILE_PUBLISHING && COMPLETED_AFTER_PUBLISH;
+    ker::mod::sched::task::task_clear_waited_on(proxy);
+    stale_waiter.context.regs.rax = 0xCAFE;
+    stale_waiter.waiting_for_pid = proxy.pid + 1;
+    bool const REJECTED_STALE_SPECIFIC_WAIT = !try_complete_proxy_wait(&stale_waiter, &proxy, 0x1234) &&
+                                              !ker::mod::sched::task::task_waited_on(proxy) && stale_waiter.context.regs.rax == 0xCAFE &&
+                                              stale_waiter.waiting_for_pid == proxy.pid + 1;
+
+    return BLOCKED_WHILE_PUBLISHING && COMPLETED_AFTER_PUBLISH && REJECTED_STALE_SPECIFIC_WAIT;
 }
 
 auto wki_remote_compute_selftest_task_wait_consumes_completed_row() -> bool {
