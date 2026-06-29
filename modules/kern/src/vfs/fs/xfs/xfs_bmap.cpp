@@ -1175,8 +1175,11 @@ auto xfs_bmap_list_extents(XfsInode* ip, XfsBmbtIrec* extents, uint32_t max_exte
             extents[count] = xfs_btree_get_rec(&cur);
             count++;
             rc = xfs_btree_increment(&cur);
+            if (rc == -ENOENT) {
+                break;
+            }
             if (rc != 0) {
-                break;  // no more records
+                return rc;
             }
         }
 

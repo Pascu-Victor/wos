@@ -246,8 +246,8 @@ bool cache_initialized = false;
 
 constexpr size_t DIRTY_WRITEBACK_BUDGET = 1024;
 constexpr size_t DIRTY_WRITEBACK_YIELD_BYTES = size_t{16} * 1024 * 1024;
-constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = DIRTY_WRITEBACK_BUDGET;
-constexpr size_t DIRTY_HARD_FALLBACK_BYTES = DIRTY_WRITEBACK_YIELD_BYTES;
+constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = DIRTY_WRITEBACK_BUDGET * 4;
+constexpr size_t DIRTY_HARD_FALLBACK_BYTES = size_t{64} * 1024 * 1024;
 constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BUFFERS = 1024;
 constexpr size_t BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES = size_t{2} * 1024 * 1024;
 constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BYTES = BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES;
@@ -470,7 +470,8 @@ auto choose_dirty_target_bytes_for_total(uint64_t total_mem, size_t max_bytes) -
     auto const FALLBACK = static_cast<uint64_t>(max_bytes / DIRTY_TARGET_DIVISOR);
     uint64_t const SCALED = total_mem == 0 ? FALLBACK : total_mem / DIRTY_TARGET_MEMORY_DIVISOR;
     uint64_t const MIN_TARGET = std::min<uint64_t>(ker::mod::mm::paging::PAGE_SIZE, max_bytes);
-    uint64_t const CLAMPED = std::clamp<uint64_t>(SCALED, MIN_TARGET, max_bytes);
+    uint64_t const MAX_TARGET = std::max<uint64_t>(MIN_TARGET, max_bytes / DIRTY_TARGET_DIVISOR);
+    uint64_t const CLAMPED = std::clamp<uint64_t>(SCALED, MIN_TARGET, MAX_TARGET);
     return clamp_u64_to_size(CLAMPED);
 }
 
@@ -1666,13 +1667,17 @@ auto has_older_overlapping_dirty_buffer_locked(const BufHead* target) -> bool {
     return state != nullptr && dirty_tree_has_older_overlapping(state->tree_root, target);
 }
 
-auto find_writeback_candidate_locked(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive, uint64_t max_epoch_inclusive)
-    -> BufHead* {
+auto find_writeback_candidate_locked(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive, uint64_t max_epoch_inclusive,
+                                     bool skip_writeback) -> BufHead* {
     uint64_t search_min_epoch = min_epoch_exclusive;
     while (true) {
         BufHead* bh = find_oldest_matching_dirty_buffer_locked(filter, search_min_epoch, max_epoch_inclusive);
         if (bh == nullptr) {
             return nullptr;
+        }
+        if (skip_writeback && (bh->flags & BH_WRITEBACK) != 0) {
+            search_min_epoch = bh->dirty_epoch;
+            continue;
         }
         if (!has_older_overlapping_dirty_buffer_locked(bh)) {
             return bh;
@@ -1859,9 +1864,9 @@ void dirty_writeback_run_append_locked(DirtyWritebackRun& run, BufHead* bh, uint
 }
 
 auto collect_dirty_writeback_run_locked(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive, uint64_t max_epoch_inclusive,
-                                        DirtyWritebackRun& run) -> DirtyWritebackResult {
+                                        DirtyWritebackRun& run, bool skip_writeback) -> DirtyWritebackResult {
     DirtyWritebackResult result{};
-    BufHead* bh = find_writeback_candidate_locked(filter, min_epoch_exclusive, max_epoch_inclusive);
+    BufHead* bh = find_writeback_candidate_locked(filter, min_epoch_exclusive, max_epoch_inclusive, skip_writeback);
     if (bh == nullptr) {
         return result;
     }
@@ -1869,7 +1874,6 @@ auto collect_dirty_writeback_run_locked(const DirtyWritebackFilter& filter, uint
         result.busy = true;
         return result;
     }
-
     uint64_t const WRITEBACK_EPOCH = allocate_writeback_epoch();
     if (!dirty_writeback_run_can_append_locked(run, bh, filter, min_epoch_exclusive, max_epoch_inclusive)) {
         return result;
@@ -1942,9 +1946,45 @@ void finish_dirty_writeback_run(DirtyWritebackRun& run, int rc) {
     wake_dirty_waiters(wake_list);
 }
 
+auto write_dirty_run_buffers_individually(DirtyWritebackRun& run) -> int {
+    int result = 0;
+    DirtyWakeList wake_list{};
+    for (size_t i = 0; i < run.count; ++i) {
+        BufHead* bh = run.buffers.at(i);
+        if (bh == nullptr) {
+            continue;
+        }
+
+        int rc = -ENOMEM;
+        WritebackSnapshot snapshot = make_writeback_snapshot(bh);
+        if (snapshot.data != nullptr) {
+            rc = write_block_to_disk(bh, snapshot.data);
+            free_writeback_snapshot(snapshot);
+        }
+        if (rc != 0 && result == 0) {
+            result = rc;
+        }
+
+        uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+        if (rc == 0 && (bh->flags & BH_DIRTY) != 0 && bh->dirty_epoch == run.dirty_epochs.at(i)) {
+            clear_buffer_dirty_locked(bh);
+            collect_dirty_waiters_locked(wake_list);
+        }
+        if (owns_writeback_epoch(bh, run.writeback_epoch)) {
+            clear_buffer_writeback(bh);
+        }
+        cache_lock.unlock_irqrestore(IRQFLAGS);
+    }
+    wake_dirty_waiters(wake_list);
+    return result;
+}
+
 auto write_dirty_run_snapshot(DirtyWritebackRun& run) -> int {
     WritebackSnapshot snapshot = make_writeback_run_snapshot(run);
     if (snapshot.data == nullptr) {
+        if (run.count > 1) {
+            return write_dirty_run_buffers_individually(run);
+        }
         finish_dirty_writeback_run(run, -ENOMEM);
         return -ENOMEM;
     }
@@ -1955,12 +1995,12 @@ auto write_dirty_run_snapshot(DirtyWritebackRun& run) -> int {
     return RC;
 }
 
-auto writeback_dirty_one_after(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive, uint64_t max_epoch_inclusive = UINT64_MAX)
-    -> DirtyWritebackResult {
+auto writeback_dirty_one_after(const DirtyWritebackFilter& filter, uint64_t min_epoch_exclusive, uint64_t max_epoch_inclusive = UINT64_MAX,
+                               bool skip_writeback = false) -> DirtyWritebackResult {
     DirtyWritebackRun run{};
 
     uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
-    DirtyWritebackResult result = collect_dirty_writeback_run_locked(filter, min_epoch_exclusive, max_epoch_inclusive, run);
+    DirtyWritebackResult result = collect_dirty_writeback_run_locked(filter, min_epoch_exclusive, max_epoch_inclusive, run, skip_writeback);
     cache_lock.unlock_irqrestore(IRQFLAGS);
 
     if (!result.wrote) {
@@ -1980,7 +2020,9 @@ auto writeback_dirty_one_after(const DirtyWritebackFilter& filter, uint64_t min_
     return result;
 }
 
-auto writeback_dirty_one(const DirtyWritebackFilter& filter) -> DirtyWritebackResult { return writeback_dirty_one_after(filter, 0); }
+auto writeback_dirty_one(const DirtyWritebackFilter& filter) -> DirtyWritebackResult {
+    return writeback_dirty_one_after(filter, 0, UINT64_MAX, true);
+}
 
 auto writeback_dirty_budgeted(const DirtyWritebackFilter& filter, size_t buffer_budget, size_t byte_budget) -> int {
     int result = 0;
@@ -1989,7 +2031,7 @@ auto writeback_dirty_budgeted(const DirtyWritebackFilter& filter, size_t buffer_
     size_t written_buffers = 0;
     size_t written_bytes = 0;
     while (written_buffers < buffer_budget && written_bytes < byte_budget) {
-        DirtyWritebackResult const WB = writeback_dirty_one_after(filter, min_epoch, MAX_EPOCH);
+        DirtyWritebackResult const WB = writeback_dirty_one_after(filter, min_epoch, MAX_EPOCH, true);
         if (WB.wrote) {
             min_epoch = WB.dirty_epoch;
             written_buffers += std::max(WB.buffers, static_cast<size_t>(1));
@@ -2810,15 +2852,23 @@ void throttle_dirty_buffer_cache(dev::BlockDevice* bdev) {
         bool const CAN_PARK = register_current_dirty_waiter_locked();
         cache_lock.unlock_irqrestore(irqflags);
 
-        bool const WRITEBACK_REQUESTED = request_dirty_writeback();
-        if (CAN_PARK && WRITEBACK_REQUESTED) {
+        static_cast<void>(request_dirty_writeback());
+        static_cast<void>(writeback_dirty_budgeted(fallback_filter, DIRTY_HARD_FALLBACK_BUDGET, DIRTY_HARD_FALLBACK_BYTES));
+
+        irqflags = cache_lock.lock_irqsave();
+        bool const DRAINED_TO_RESUME = cache_dirty_bytes <= dirty_throttle_resume_bytes_locked();
+        cache_lock.unlock_irqrestore(irqflags);
+        if (DRAINED_TO_RESUME) {
+            return;
+        }
+
+        if (CAN_PARK) {
             uint64_t const NOW_US = ker::mod::time::get_us();
             uint64_t const DEADLINE_US = ker::mod::sched::saturating_deadline_us(NOW_US, DIRTY_THROTTLE_PARK_TIMEOUT_US);
             ker::mod::sched::preemptible_syscall_park("dirty_bcache", DEADLINE_US);
             continue;
         }
 
-        static_cast<void>(writeback_dirty_budgeted(fallback_filter, DIRTY_HARD_FALLBACK_BUDGET, DIRTY_HARD_FALLBACK_BYTES));
         ker::mod::sched::kern_yield();
     }
 }

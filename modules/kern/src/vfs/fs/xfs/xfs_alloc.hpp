@@ -36,6 +36,10 @@ auto xfs_alloc_extent(XfsMountContext* mount, XfsTransaction* tp, const XfsAlloc
 // Returns 0 on success.
 auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agblock_t agbno, xfs_extlen_t len) -> int;
 
+// Validate that a range is currently allocated, without mutating free-space
+// metadata. Returns 0 if the range does not overlap any known free extent.
+auto xfs_validate_allocated_extent(XfsMountContext* mount, xfs_agnumber_t agno, xfs_agblock_t agbno, xfs_extlen_t len) -> int;
+
 // Number of block slots in the AGFL bno array for this filesystem.
 inline auto xfs_agfl_size(const XfsMountContext* ctx) -> uint32_t {
     return static_cast<uint32_t>((ctx->sect_size - sizeof(XfsAgfl)) / sizeof(uint32_t));

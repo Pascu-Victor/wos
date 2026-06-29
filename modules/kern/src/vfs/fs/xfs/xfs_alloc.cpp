@@ -586,8 +586,60 @@ auto xfs_alloc_extent(XfsMountContext* mount, XfsTransaction* tp, const XfsAlloc
     return -ENOSPC;
 }
 
+auto xfs_validate_allocated_extent(XfsMountContext* mount, xfs_agnumber_t agno, xfs_agblock_t agbno, xfs_extlen_t len) -> int {
+    if (mount == nullptr || mount->per_ag == nullptr) {
+        return -EINVAL;
+    }
+    if (agno >= mount->ag_count || len == 0) {
+        return -EINVAL;
+    }
+    if (agbno == NULLAGBLOCK || agbno >= mount->ag_blocks || len > mount->ag_blocks - agbno || agbno <= XFS_AG_RESERVED_MAX) {
+        mod::dbg::log("[xfs free] rejecting reserved/corrupt extent agno=%u agbno=%u len=%u ag_blocks=%u", agno, agbno, len,
+                      mount->ag_blocks);
+        return -EIO;
+    }
+
+    XfsPerAG* pag = &mount->per_ag[agno];
+
+    XfsBtreeCursor<XfsBnobtTraits> prev_cur;
+    prev_cur.mount = mount;
+    prev_cur.agno = agno;
+    XfsBnobtTraits::IRec const PREV_TARGET{.startblock = agbno, .blockcount = 0};
+    int rc = xfs_btree_lookup(&prev_cur, pag->agf_bno_root, pag->agf_bno_level, PREV_TARGET, XfsBtreeLookup::LE);
+    if (rc == 0) {
+        XfsBnobtTraits::IRec const PREV_REC = xfs_btree_get_rec(&prev_cur);
+        xfs_agblock_t const PREV_END = PREV_REC.startblock + PREV_REC.blockcount;
+        if (PREV_END > agbno) {
+            mod::dbg::log("[xfs free] extent overlaps previous free record agno=%u agbno=%u len=%u prev_start=%u prev_len=%u", agno, agbno,
+                          len, PREV_REC.startblock, PREV_REC.blockcount);
+            return -EIO;
+        }
+    } else if (rc != -ENOENT) {
+        return rc;
+    }
+
+    xfs_agblock_t const FREE_END = agbno + len;
+    XfsBtreeCursor<XfsBnobtTraits> next_cur;
+    next_cur.mount = mount;
+    next_cur.agno = agno;
+    XfsBnobtTraits::IRec const NEXT_TARGET{.startblock = FREE_END, .blockcount = 0};
+    rc = xfs_btree_lookup(&next_cur, pag->agf_bno_root, pag->agf_bno_level, NEXT_TARGET, XfsBtreeLookup::GE);
+    if (rc == 0) {
+        XfsBnobtTraits::IRec const NEXT_REC = xfs_btree_get_rec(&next_cur);
+        if (NEXT_REC.startblock < FREE_END) {
+            mod::dbg::log("[xfs free] extent overlaps next free record agno=%u agbno=%u len=%u next_start=%u next_len=%u", agno, agbno, len,
+                          NEXT_REC.startblock, NEXT_REC.blockcount);
+            return -EIO;
+        }
+    } else if (rc != -ENOENT) {
+        return rc;
+    }
+
+    return 0;
+}
+
 auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agblock_t agbno, xfs_extlen_t len) -> int {
-    if (mount == nullptr) {
+    if (mount == nullptr || mount->per_ag == nullptr) {
         return -EINVAL;
     }
     if (agno >= mount->ag_count) {
@@ -603,13 +655,6 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
     }
 
     XfsPerAG* pag = &mount->per_ag[agno];
-    if (pag->agf_flcount < XFS_AGFL_MIN) {
-        int const REFILL_RC = agfl_refill(mount, tp, agno);
-        if (REFILL_RC != 0) {
-            return REFILL_RC;
-        }
-    }
-
     xfs_agblock_t merged_start = agbno;
     xfs_extlen_t merged_len = len;
 
@@ -624,6 +669,8 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
         prev_rec = xfs_btree_get_rec(&prev_cur);
         xfs_agblock_t const PREV_END = prev_rec.startblock + prev_rec.blockcount;
         if (PREV_END > agbno) {
+            mod::dbg::log("[xfs free] extent overlaps previous free record agno=%u agbno=%u len=%u prev_start=%u prev_len=%u", agno, agbno,
+                          len, prev_rec.startblock, prev_rec.blockcount);
             return -EIO;
         }
         if (PREV_END == agbno) {
@@ -646,6 +693,8 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
     if (rc == 0) {
         next_rec = xfs_btree_get_rec(&next_cur);
         if (next_rec.startblock < FREE_END) {
+            mod::dbg::log("[xfs free] extent overlaps next free record agno=%u agbno=%u len=%u next_start=%u next_len=%u", agno, agbno, len,
+                          next_rec.startblock, next_rec.blockcount);
             return -EIO;
         }
         if (next_rec.startblock == FREE_END) {
@@ -654,6 +703,13 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
         }
     } else if (rc != -ENOENT) {
         return rc;
+    }
+
+    if (pag->agf_flcount < XFS_AGFL_MIN) {
+        int const REFILL_RC = agfl_refill(mount, tp, agno);
+        if (REFILL_RC != 0) {
+            return REFILL_RC;
+        }
     }
 
     if (merge_prev) {
@@ -745,6 +801,15 @@ auto log_agf_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
     xfs_trans_log_buf(tp, ag0_bh, static_cast<uint32_t>(agf_off), static_cast<uint32_t>(sizeof(XfsAgf)));
     return 0;
+}
+
+void update_agfl_crc(XfsMountContext* mount, XfsAgfl* agfl) {
+    if (mount == nullptr || agfl == nullptr) {
+        return;
+    }
+    agfl->agfl_crc = Be32{0};
+    uint32_t crc = util::crc32c_block_with_cksum(agfl, mount->sect_size, XFS_AGFL_CRC_OFF);
+    __builtin_memcpy(&agfl->agfl_crc, &crc, sizeof(crc));
 }
 
 }  // anonymous namespace
@@ -868,9 +933,8 @@ auto xfs_alloc_put_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
     agfl_bno[pag->agf_fllast] = Be32::from_cpu(bno);
     pag->agf_flcount++;
 
-    // Log the modified slot in the AGFL sector.
-    size_t const SLOT_OFF = agfl_off + sizeof(XfsAgfl) + (static_cast<size_t>(pag->agf_fllast) * sizeof(uint32_t));
-    xfs_trans_log_buf(tp, bh, static_cast<uint32_t>(SLOT_OFF), static_cast<uint32_t>(sizeof(uint32_t)));
+    update_agfl_crc(mount, agfl);
+    xfs_trans_log_buf(tp, bh, static_cast<uint32_t>(agfl_off), static_cast<uint32_t>(mount->sect_size));
 
     // Also update and log the AGF (fllast, flcount changed).
     int const LOG_RC = log_agf_freelist(mount, tp, agno, bh);

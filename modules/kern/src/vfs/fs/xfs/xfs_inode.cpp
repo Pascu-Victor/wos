@@ -22,6 +22,7 @@
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <util/crc32c.hpp>
+#include <utility>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_alloc.hpp>
 #include <vfs/fs/xfs/xfs_bmap.hpp>
@@ -336,16 +337,105 @@ auto inode_fsb_to_dev_count(XfsMountContext* ctx, xfs_filblks_t fsb_count) -> si
     return static_cast<size_t>(fsb_count) * (ctx->block_size / ctx->device->block_size);
 }
 
+auto inode_data_extent_record_valid(const XfsBmbtIrec& rec) -> bool {
+    constexpr xfs_fileoff_t MAX_STARTOFF = 0x3FFFFFFFFFFFFFULL;
+    constexpr xfs_fsblock_t MAX_STARTBLOCK = 0xFFFFFFFFFFFFFULL;
+    constexpr xfs_filblks_t MAX_BLOCKCOUNT = 0x1FFFFFULL;
+
+    if (rec.br_blockcount == 0 || rec.br_blockcount > MAX_BLOCKCOUNT || rec.br_startoff > MAX_STARTOFF ||
+        rec.br_startblock == NULLFSBLOCK || rec.br_startblock > MAX_STARTBLOCK) {
+        return false;
+    }
+
+    return rec.br_blockcount <= (MAX_STARTOFF - rec.br_startoff) + 1 && rec.br_blockcount <= (MAX_STARTBLOCK - rec.br_startblock) + 1;
+}
+
+auto validate_inode_data_extent(XfsInode* ip, xfs_fsblock_t startblock, xfs_filblks_t blockcount) -> int {
+    if (ip == nullptr || ip->mount == nullptr) {
+        return -EINVAL;
+    }
+    if (startblock == NULLFSBLOCK || blockcount == 0) {
+        return -EIO;
+    }
+
+    auto* mount = ip->mount;
+    xfs_agnumber_t agno = xfs_ag_number(startblock, mount->ag_blk_log);
+    xfs_agblock_t agbno = xfs_ag_block(startblock, mount->ag_blk_log);
+    xfs_filblks_t remaining = blockcount;
+
+    while (remaining > 0) {
+        if (agno >= mount->ag_count || agbno >= mount->ag_blocks) {
+            mod::dbg::logger<"xfs">::error(
+                "xfs inode extent validation failed ino=%lu startblock=%lu blockcount=%lu agno=%u agbno=%u remaining=%lu",
+                static_cast<unsigned long>(ip->ino), static_cast<unsigned long>(startblock), static_cast<unsigned long>(blockcount), agno,
+                agbno, static_cast<unsigned long>(remaining));
+            return -EIO;
+        }
+
+        auto const AG_REMAINING = static_cast<xfs_filblks_t>(mount->ag_blocks - agbno);
+        xfs_filblks_t const SPAN = std::min(remaining, AG_REMAINING);
+        if (SPAN == 0 || SPAN > static_cast<xfs_filblks_t>(UINT32_MAX)) {
+            return -EIO;
+        }
+
+        int const RC = xfs_validate_allocated_extent(mount, agno, agbno, static_cast<xfs_extlen_t>(SPAN));
+        if (RC != 0) {
+            mod::dbg::logger<"xfs">::error(
+                "xfs inode extent overlaps free space ino=%lu startblock=%lu blockcount=%lu agno=%u agbno=%u span=%lu rc=%d",
+                static_cast<unsigned long>(ip->ino), static_cast<unsigned long>(startblock), static_cast<unsigned long>(blockcount), agno,
+                agbno, static_cast<unsigned long>(SPAN), RC);
+            return RC;
+        }
+
+        remaining -= SPAN;
+        agno++;
+        agbno = 0;
+    }
+
+    return 0;
+}
+
+auto validate_inode_extent_records(XfsInode* ip, const XfsBmbtIrec* extents, uint32_t count) -> int {
+    if (extents == nullptr && count != 0) {
+        return -EIO;
+    }
+
+    xfs_fileoff_t previous_end = 0;
+    bool have_previous = false;
+    for (uint32_t i = 0; i < count; i++) {
+        XfsBmbtIrec const& rec = extents[i];
+        if (!inode_data_extent_record_valid(rec)) {
+            mod::dbg::logger<"xfs">::error("xfs inode extent record invalid ino=%lu index=%u startoff=%lu startblock=%lu blockcount=%lu",
+                                           static_cast<unsigned long>(ip != nullptr ? ip->ino : 0), i,
+                                           static_cast<unsigned long>(rec.br_startoff), static_cast<unsigned long>(rec.br_startblock),
+                                           static_cast<unsigned long>(rec.br_blockcount));
+            return -EIO;
+        }
+        if (have_previous && rec.br_startoff < previous_end) {
+            mod::dbg::logger<"xfs">::error("xfs inode extent records overlap logically ino=%lu index=%u startoff=%lu previous_end=%lu",
+                                           static_cast<unsigned long>(ip != nullptr ? ip->ino : 0), i,
+                                           static_cast<unsigned long>(rec.br_startoff), static_cast<unsigned long>(previous_end));
+            return -EIO;
+        }
+
+        int const RC = validate_inode_data_extent(ip, rec.br_startblock, rec.br_blockcount);
+        if (RC != 0) {
+            return RC;
+        }
+
+        previous_end = rec.br_startoff + rec.br_blockcount;
+        have_previous = true;
+    }
+
+    return 0;
+}
+
 auto free_inode_data_extent(XfsInode* ip, XfsTransaction* tp, xfs_fsblock_t startblock, xfs_filblks_t blockcount) -> int {
     if (ip == nullptr || ip->mount == nullptr || tp == nullptr || startblock == NULLFSBLOCK || blockcount == 0) {
         return 0;
     }
 
     auto* mount = ip->mount;
-    if (mount->device != nullptr) {
-        discard_bdev_range(mount->device, inode_fsblock_to_dev_block(mount, startblock), inode_fsb_to_dev_count(mount, blockcount));
-    }
-
     xfs_agnumber_t agno = xfs_ag_number(startblock, mount->ag_blk_log);
     xfs_agblock_t agbno = xfs_ag_block(startblock, mount->ag_blk_log);
     xfs_filblks_t remaining = blockcount;
@@ -369,6 +459,10 @@ auto free_inode_data_extent(XfsInode* ip, XfsTransaction* tp, xfs_fsblock_t star
         remaining -= SPAN;
         agno++;
         agbno = 0;
+    }
+
+    if (mount->device != nullptr) {
+        discard_bdev_range(mount->device, inode_fsblock_to_dev_block(mount, startblock), inode_fsb_to_dev_count(mount, blockcount));
     }
 
     return 0;
@@ -397,6 +491,10 @@ auto free_inode_data_extents(XfsInode* ip, XfsTransaction* tp) -> int {
         if (ip->data_fork.extents.count != 0 && ip->data_fork.extents.list == nullptr) {
             return -EIO;
         }
+        int const VALID_RC = validate_inode_extent_records(ip, ip->data_fork.extents.list, ip->data_fork.extents.count);
+        if (VALID_RC != 0) {
+            return VALID_RC;
+        }
         return free_inode_extent_records(ip, tp, ip->data_fork.extents.list, ip->data_fork.extents.count);
     }
 
@@ -406,12 +504,25 @@ auto free_inode_data_extents(XfsInode* ip, XfsTransaction* tp) -> int {
 
     int rc = 0;
     if (ip->nextents != 0) {
-        auto* extents = new (std::nothrow) XfsBmbtIrec[ip->nextents];
+        if (ip->nextents == UINT32_MAX) {
+            return -EFBIG;
+        }
+        uint32_t const LIST_CAPACITY = ip->nextents + 1;
+        auto* extents = new (std::nothrow) XfsBmbtIrec[LIST_CAPACITY];
         if (extents == nullptr) {
             return -ENOMEM;
         }
 
-        rc = xfs_bmap_list_extents(ip, extents, ip->nextents);
+        rc = xfs_bmap_list_extents(ip, extents, LIST_CAPACITY);
+        if (rc >= 0) {
+            if (std::cmp_not_equal(rc, ip->nextents)) {
+                mod::dbg::logger<"xfs">::error("xfs inode btree extent count mismatch ino=%lu expected=%u listed=%d",
+                                               static_cast<unsigned long>(ip->ino), ip->nextents, rc);
+                rc = -EIO;
+            } else {
+                rc = validate_inode_extent_records(ip, extents, static_cast<uint32_t>(rc));
+            }
+        }
         if (rc >= 0) {
             rc = free_inode_extent_records(ip, tp, extents, static_cast<uint32_t>(rc));
         }
@@ -1041,7 +1152,9 @@ auto xfs_inode_cache_new(XfsInode* ip) -> int {
     return 0;
 }
 
-void xfs_inode_release(XfsInode* ip) {
+namespace {
+
+void release_inode_reference(XfsInode* ip, bool metadata_locked) {
     if (ip == nullptr) {
         return;
     }
@@ -1057,11 +1170,27 @@ void xfs_inode_release(XfsInode* ip) {
     ip->refcount--;
     if (ip->refcount <= 0) {
         bool const NEEDS_INACTIVATION = (ip->nlink == 0 && !ip->inactivation_started);
+        int inactivation_rc = 0;
         if (NEEDS_INACTIVATION) {
             ip->inactivation_started = true;
             icache.at(BUCKET).lock.unlock_irqrestore(flags);
-            static_cast<void>(inactivate_unlinked_inode(ip));
+            if (!metadata_locked && ip->mount != nullptr) {
+                ip->mount->metadata_lock.lock();
+            }
+            ip->io_lock.lock();
+            inactivation_rc = inactivate_unlinked_inode(ip);
+            ip->io_lock.unlock();
+            if (!metadata_locked && ip->mount != nullptr) {
+                ip->mount->metadata_lock.unlock();
+            }
             flags = icache.at(BUCKET).lock.lock_irqsave();
+        }
+
+        if (inactivation_rc != 0 && ip->nlink == 0) {
+            ip->inactivation_started = false;
+            ip->refcount = 0;
+            icache.at(BUCKET).lock.unlock_irqrestore(flags);
+            return;
         }
 
         if (ip->nlink != 0) {
@@ -1082,6 +1211,12 @@ void xfs_inode_release(XfsInode* ip) {
 
     icache.at(BUCKET).lock.unlock_irqrestore(flags);
 }
+
+}  // namespace
+
+void xfs_inode_release(XfsInode* ip) { release_inode_reference(ip, false); }
+
+void xfs_inode_release_metadata_locked(XfsInode* ip) { release_inode_reference(ip, true); }
 
 auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
     if (ip == nullptr || ip->mount == nullptr) {

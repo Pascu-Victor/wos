@@ -339,6 +339,16 @@ void xfs_stamp_new_inode(XfsInode* ip) {
     ip->crtime = NOW;
 }
 
+void xfs_stamp_inode_data_change(XfsInode* ip) {
+    if (ip == nullptr) {
+        return;
+    }
+    uint64_t const NOW = xfs_current_timestamp(ip);
+    ip->mtime = NOW;
+    ip->ctime = NOW;
+    ip->dirty = true;
+}
+
 void perf_record_xfs_slow_event(ker::mod::perf::WkiPerfLocalXfsOp op, int32_t status, uint32_t latency_us, uint64_t bytes,
                                 uint64_t callsite) {
     if (status >= 0 && latency_us < XFS_SLOW_TRACE_US) {
@@ -353,20 +363,6 @@ void perf_record_xfs_slow_event(ker::mod::perf::WkiPerfLocalXfsOp op, int32_t st
                                      static_cast<uint8_t>(op), ker::mod::perf::WkiPerfPhase::END, 0, BYTES_KIB,
                                      ker::mod::perf::next_wki_trace_correlation(), status, latency_us, callsite);
 }
-
-class XfsMetadataUnlockedScope {
-   public:
-    explicit XfsMetadataUnlockedScope(XfsMetadataGuard& guard) : guard(guard) { guard.unlock(); }
-    ~XfsMetadataUnlockedScope() { guard.lock(); }
-
-    XfsMetadataUnlockedScope(const XfsMetadataUnlockedScope&) = delete;
-    XfsMetadataUnlockedScope(XfsMetadataUnlockedScope&&) = delete;
-    auto operator=(const XfsMetadataUnlockedScope&) -> XfsMetadataUnlockedScope& = delete;
-    auto operator=(XfsMetadataUnlockedScope&&) -> XfsMetadataUnlockedScope& = delete;
-
-   private:
-    XfsMetadataGuard& guard;
-};
 
 std::array<XfsParentPathCacheSet, XFS_PARENT_PATH_CACHE_SET_COUNT> g_xfs_parent_path_cache{};
 
@@ -969,7 +965,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     return finish_read(static_cast<ssize_t>(total_read));
 }
 
-auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset, XfsMetadataGuard& metadata_guard) -> ssize_t {
+auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset, bool& throttle_after_unlock) -> ssize_t {
     if (f == nullptr || buf == nullptr) {
         return -EINVAL;
     }
@@ -997,6 +993,10 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
     size_t total_written = 0;
     int write_error = 0;
     uint64_t const PERF_WRITE_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::WRITE);
+    auto defer_dirty_throttle = [&]() {
+        kick_dirty_buffer_cache_writeback(ctx->device);
+        throttle_after_unlock = true;
+    };
     auto finish_write = [&](ssize_t result) -> ssize_t {
         uint64_t const BYTES = result > 0 ? static_cast<uint64_t>(result) : static_cast<uint64_t>(total_written);
         int32_t const STATUS = result < 0 ? static_cast<int32_t>(result) : 0;
@@ -1022,7 +1022,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
         auto account_dirty_write = [&](size_t bytes_written) {
             bytes_since_pressure_check += bytes_written;
             if (bytes_since_pressure_check >= XFS_DIRTY_THROTTLE_INTERVAL_BYTES) {
-                throttle_dirty_buffer_cache(ctx->device);
+                defer_dirty_throttle();
                 bytes_since_pressure_check = 0;
             }
         };
@@ -1232,13 +1232,8 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
                 uint64_t const PERF_IO_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_IO);
                 if (SLICE_BYTES > 0) {
                     size_t const SLICE_BLOCK_OFF = SLICE_START - EXTENT_START;
-                    bool wrote = false;
-                    {
-                        XfsMetadataUnlockedScope unlocked(metadata_guard);
-                        wrote = write_extent_data(DISK_BLOCK + (SLICE_BLOCK_OFF >> ctx->block_log), SLICE_BLOCK_OFF & (ctx->block_size - 1),
-                                                  SLICE_BYTES, SLICE_START - offset, true);
-                    }
-                    bool const WROTE = wrote;
+                    bool const WROTE = write_extent_data(DISK_BLOCK + (SLICE_BLOCK_OFF >> ctx->block_log),
+                                                         SLICE_BLOCK_OFF & (ctx->block_size - 1), SLICE_BYTES, SLICE_START - offset, true);
                     if (!WROTE) {
                         ip->size = SIZE_BEFORE_ALLOC;
                         ip->dirty = DIRTY_BEFORE_ALLOC || ip->dirty;
@@ -1273,12 +1268,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
             t0 = ker::mod::tsc::get_ns();
 #endif
             uint64_t const PERF_IO_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_IO);
-            bool wrote = false;
-            {
-                XfsMetadataUnlockedScope unlocked(metadata_guard);
-                wrote = write_extent_data(DISK_BLOCK, BLOCK_OFF, CHUNK, total_written, APPEND_BLOCK_HAS_NO_OLD_BYTES);
-            }
-            bool const WROTE = wrote;
+            bool const WROTE = write_extent_data(DISK_BLOCK, BLOCK_OFF, CHUNK, total_written, APPEND_BLOCK_HAS_NO_OLD_BYTES);
             if (!WROTE) {
 #ifdef XFS_BENCH
                 acc_io += ker::mod::tsc::get_ns() - t0;
@@ -1304,16 +1294,14 @@ write_done:
         return finish_write(write_error != 0 ? write_error : -EIO);
     }
 
-    // Update file size if we wrote past the end
-    if (offset + total_written > ip->size) {
-        ip->size = offset + total_written;
-        ip->dirty = true;
-    }
+    // Update file size if we wrote past the end.
+    ip->size = std::max<uint64_t>(ip->size, offset + total_written);
+    xfs_stamp_inode_data_change(ip);
     if (ip->dirty) {
         xfd->close_may_need_inode_commit = true;
     }
 
-    throttle_dirty_buffer_cache(ctx->device);
+    defer_dirty_throttle();
 
 #ifdef XFS_BENCH
     s_wr_ns_bmap.fetch_add(acc_bmap, std::memory_order_relaxed);
@@ -1354,9 +1342,17 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
         return -EBADF;
     }
 
-    XfsMetadataGuard metadata_guard(xfd->mount);
-    ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
-    return xfs_vfs_write_locked(f, buf, count, offset, metadata_guard);
+    bool throttle_after_unlock = false;
+    ssize_t ret = 0;
+    {
+        XfsMetadataGuard metadata_guard(xfd->mount);
+        ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
+        ret = xfs_vfs_write_locked(f, buf, count, offset, throttle_after_unlock);
+    }
+    if (throttle_after_unlock) {
+        throttle_dirty_buffer_cache(xfd->mount->device);
+    }
+    return ret;
 }
 
 auto xfs_vfs_lseek(File* f, off_t offset, int whence) -> off_t {
@@ -1562,6 +1558,7 @@ auto xfs_vfs_truncate(File* f, off_t length) -> int {
             return TRUNC_RET;
         }
         ip->size = 0;
+        xfs_stamp_inode_data_change(ip);
         xfs_trans_log_inode(tp, ip);
         int const RET = xfs_trans_commit(tp);
         return (RET == 0) ? 0 : -EIO;
@@ -1578,7 +1575,7 @@ auto xfs_vfs_truncate(File* f, off_t length) -> int {
             return TRIM_RET;
         }
         ip->size = new_size;
-        ip->dirty = true;
+        xfs_stamp_inode_data_change(ip);
         xfs_trans_log_inode(tp, ip);
         int const RET = xfs_trans_commit(tp);
         return (RET == 0) ? 0 : -EIO;
@@ -1586,7 +1583,7 @@ auto xfs_vfs_truncate(File* f, off_t length) -> int {
 
     // Update the inode size
     ip->size = new_size;
-    ip->dirty = true;
+    xfs_stamp_inode_data_change(ip);
 
     XfsTransaction* tp = xfs_trans_alloc(ctx);
     if (tp == nullptr) {
@@ -1721,14 +1718,22 @@ auto xfs_write_append(File* f, const void* buf, size_t count, size_t* offset_out
         return -EBADF;
     }
 
-    XfsMetadataGuard metadata_guard(xfd->mount);
-    ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
-    auto const OFFSET = static_cast<size_t>(xfd->inode->size);
-    ssize_t const RET = xfs_vfs_write_locked(f, buf, count, OFFSET, metadata_guard);
-    if (RET >= 0 && offset_out != nullptr) {
-        *offset_out = OFFSET;
+    bool throttle_after_unlock = false;
+    size_t offset = 0;
+    ssize_t ret = 0;
+    {
+        XfsMetadataGuard metadata_guard(xfd->mount);
+        ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
+        offset = static_cast<size_t>(xfd->inode->size);
+        ret = xfs_vfs_write_locked(f, buf, count, offset, throttle_after_unlock);
     }
-    return RET;
+    if (throttle_after_unlock) {
+        throttle_dirty_buffer_cache(xfd->mount->device);
+    }
+    if (ret >= 0 && offset_out != nullptr) {
+        *offset_out = offset;
+    }
+    return ret;
 }
 
 auto xfs_fsync(File* f) -> int {
@@ -1830,7 +1835,11 @@ auto xfs_collect_swap_extents(File* f, ker::mod::mm::swap::SwapExtent** extents_
 namespace {
 
 auto xfs_find_parent_and_name(const char* fs_path, XfsMountContext* ctx, XfsInode** parent_out, const char** name_out,
-                              uint16_t* namelen_out) -> int {
+                              uint16_t* namelen_out, bool* cache_hit_out = nullptr, bool allow_parent_cache = true) -> int {
+    if (cache_hit_out != nullptr) {
+        *cache_hit_out = false;
+    }
+
     const char* last_slash = nullptr;
     for (const char* p = fs_path; *p != '\0'; p++) {
         if (*p == '/') {
@@ -1851,11 +1860,13 @@ auto xfs_find_parent_and_name(const char* fs_path, XfsMountContext* ctx, XfsInod
             return -ENAMETOOLONG;
         }
         xfs_ino_t cached_parent_ino = NULLFSINO;
-        if (xfs_parent_path_cache_lookup_ino(ctx, fs_path, parent_len, &cached_parent_ino)) {
+        if (allow_parent_cache && xfs_parent_path_cache_lookup_ino(ctx, fs_path, parent_len, &cached_parent_ino)) {
             parent_ip = xfs_inode_read(ctx, cached_parent_ino);
-            if (parent_ip != nullptr && !xfs_inode_isdir(parent_ip)) {
+            if (parent_ip != nullptr && (!xfs_inode_isdir(parent_ip) || parent_ip->nlink == 0)) {
                 xfs_inode_release(parent_ip);
                 parent_ip = nullptr;
+            } else if (parent_ip != nullptr && cache_hit_out != nullptr) {
+                *cache_hit_out = true;
             }
         }
         if (parent_ip == nullptr) {
@@ -1907,7 +1918,8 @@ auto xfs_lookup_with_cached_parent(const char* fs_path, XfsMountContext* ctx, Xf
     XfsInode* parent_ip = nullptr;
     const char* filename = nullptr;
     uint16_t filename_len = 0;
-    int const PARENT_RET = xfs_find_parent_and_name(fs_path, ctx, &parent_ip, &filename, &filename_len);
+    bool parent_cache_hit = false;
+    int const PARENT_RET = xfs_find_parent_and_name(fs_path, ctx, &parent_ip, &filename, &filename_len, &parent_cache_hit);
     if (PARENT_RET != 0) {
         return PARENT_RET == -ENAMETOOLONG ? -EAGAIN : PARENT_RET;
     }
@@ -1916,6 +1928,9 @@ auto xfs_lookup_with_cached_parent(const char* fs_path, XfsMountContext* ctx, Xf
     int const LOOKUP_RET = xfs_dir_lookup(parent_ip, filename, filename_len, &entry);
     xfs_inode_release(parent_ip);
     if (LOOKUP_RET != 0) {
+        if (LOOKUP_RET == -ENOENT && parent_cache_hit) {
+            return -EAGAIN;
+        }
         return LOOKUP_RET;
     }
 
@@ -1943,18 +1958,30 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     uint16_t create_filename_len = 0;
 
     if ((flags & O_CREAT_FLAG) != 0 && !ctx->read_only) {
-        int parent_ret = xfs_find_parent_and_name(fs_path, ctx, &create_parent_ip, &create_filename, &create_filename_len);
+        bool create_parent_cache_hit = false;
+        int parent_ret =
+            xfs_find_parent_and_name(fs_path, ctx, &create_parent_ip, &create_filename, &create_filename_len, &create_parent_cache_hit);
         if (parent_ret == 0) {
             used_create_lookup = true;
             XfsDirEntry existing{};
-            int const LOOKUP_RET = xfs_dir_lookup(create_parent_ip, create_filename, create_filename_len, &existing);
-            if (LOOKUP_RET == 0) {
+            int lookup_ret = xfs_dir_lookup(create_parent_ip, create_filename, create_filename_len, &existing);
+            if (lookup_ret == -ENOENT && create_parent_cache_hit) {
+                xfs_inode_release(create_parent_ip);
+                create_parent_ip = nullptr;
+                parent_ret =
+                    xfs_find_parent_and_name(fs_path, ctx, &create_parent_ip, &create_filename, &create_filename_len, nullptr, false);
+                if (parent_ret != 0) {
+                    return nullptr;
+                }
+                lookup_ret = xfs_dir_lookup(create_parent_ip, create_filename, create_filename_len, &existing);
+            }
+            if (lookup_ret == 0) {
                 xfs_inode_release(create_parent_ip);
                 create_parent_ip = nullptr;
                 ip = xfs_inode_read(ctx, existing.ino);
-            } else if (LOOKUP_RET == -ENOENT) {
+            } else if (lookup_ret == -ENOENT) {
                 create_missing = true;
-            } else if (LOOKUP_RET != -ENOENT) {
+            } else if (lookup_ret != -ENOENT) {
                 xfs_inode_release(create_parent_ip);
                 return nullptr;
             }
@@ -2592,8 +2619,8 @@ auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx) -> int {
     if (rc == 0) {
         xfs_parent_path_cache_purge_all_for_mount(ctx);
     }
-    xfs_inode_release(dir_ip);
-    xfs_inode_release(parent_ip);
+    xfs_inode_release_metadata_locked(dir_ip);
+    xfs_inode_release_metadata_locked(parent_ip);
     return (rc == 0) ? 0 : -EIO;
 }
 
@@ -2701,10 +2728,10 @@ auto xfs_rename_path(const char* old_fs_path, const char* new_fs_path, XfsMountC
         xfs_parent_path_cache_purge_all_for_mount(ctx);
     }
     if (displaced != nullptr) {
-        xfs_inode_release(displaced);
+        xfs_inode_release_metadata_locked(displaced);
     }
-    xfs_inode_release(new_parent);
-    xfs_inode_release(old_parent);
+    xfs_inode_release_metadata_locked(new_parent);
+    xfs_inode_release_metadata_locked(old_parent);
     return (rc == 0) ? 0 : -EIO;
 }
 
@@ -2782,9 +2809,9 @@ auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx) -> int {
     rc = xfs_trans_commit(tp);
 
     if (target_ip != nullptr) {
-        xfs_inode_release(target_ip);
+        xfs_inode_release_metadata_locked(target_ip);
     }
-    xfs_inode_release(parent_ip);
+    xfs_inode_release_metadata_locked(parent_ip);
 
     return (rc == 0) ? 0 : -EIO;
 }

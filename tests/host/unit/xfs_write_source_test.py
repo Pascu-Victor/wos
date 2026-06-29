@@ -53,6 +53,53 @@ def main() -> None:
         "constexpr size_t XFS_DIRTY_THROTTLE_INTERVAL_BYTES = XFS_BUFFERED_WRITE_BATCH_MAX_BYTES;",
         "dirty throttling must run once per buffered write batch",
     )
+    require(
+        source,
+        "void xfs_stamp_inode_data_change(XfsInode* ip)",
+        "XFS must provide a shared data-change timestamp helper",
+    )
+    require(
+        source,
+        "ip->mtime = NOW;\n    ip->ctime = NOW;\n    ip->dirty = true;",
+        "XFS data changes must advance mtime/ctime and mark inode dirty",
+    )
+    require(
+        write_body,
+        "xfs_stamp_inode_data_change(ip);",
+        "regular file writes must refresh timestamps even without size growth",
+    )
+    require(
+        write_body,
+        "bool& throttle_after_unlock",
+        "locked XFS write path must report deferred dirty throttling to its caller",
+    )
+    require(
+        write_body,
+        "kick_dirty_buffer_cache_writeback(ctx->device);",
+        "locked XFS write path may only kick dirty writeback while holding XFS locks",
+    )
+    require(
+        write_body,
+        "throttle_after_unlock = true;",
+        "locked XFS write path must defer blocking dirty throttling until locks are released",
+    )
+    require_absent(
+        write_body,
+        "throttle_dirty_buffer_cache(ctx->device)",
+        "locked XFS write path must not park in dirty throttling while holding metadata/io locks",
+    )
+    require_absent(
+        write_body,
+        "XfsMetadataGuard",
+        "locked XFS write helper is shared by callers that already hold the mount metadata lock",
+    )
+    require_absent(
+        source,
+        "XfsMetadataUnlockedScope",
+        "XFS writes must not drop and reacquire the mount metadata lock while inode io_lock is held",
+    )
+    if source.count("throttle_dirty_buffer_cache(xfd->mount->device);") < 2:
+        fail("XFS write and append wrappers must run deferred dirty throttling after write locks are released")
     require_absent(write_body, "dev::block_write(", "regular file write extent path")
     require_absent(write_body, "discard_bdev_range(", "regular file write extent path")
     require_absent(write_body, "xfs_direct_write_full_blocks", "regular file write extent path")
@@ -93,6 +140,13 @@ def main() -> None:
         "copy_dirty_bdev_range(ctx->device, dev_block, dev_count, direct_dst)",
         "direct reads must overlay dirty buffered writes",
     )
+    truncate_start = source.find("auto xfs_vfs_truncate(File* f")
+    truncate_end = source.find("// ============================================================================\n// FileOperations vtable", truncate_start)
+    if truncate_start < 0 or truncate_end < 0:
+        fail("could not isolate xfs_vfs_truncate body")
+    truncate_body = source[truncate_start:truncate_end]
+    if truncate_body.count("xfs_stamp_inode_data_change(ip);") < 3:
+        fail("all XFS truncate mutation branches must refresh mtime/ctime")
     print("XFS write buffering invariants hold")
 
 

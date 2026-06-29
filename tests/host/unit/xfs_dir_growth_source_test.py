@@ -51,7 +51,13 @@ def main() -> None:
     source = DIR2.read_text()
     block_lookup = function_body(source, "auto dir2_block_lookup")
     block_iterate = function_body(source, "auto dir2_block_iterate")
+    leaf_lookup = function_body(source, "auto dir2_leaf_node_lookup")
+    leaf_scan = function_body(source, "auto dir2_scan_data_block")
+    leaf_find_data = function_body(source, "auto dir2_leaf_node_find_data_entry")
+    leaf_find_free = function_body(source, "auto dir2_leaf_node_find_free_region")
+    free_region = function_body(source, "auto dir2_find_free_region")
     block_add = function_body(source, "auto dir2_block_addname")
+    block_remove = function_body(source, "auto dir2_block_removename")
     leaf_add = function_body(source, "auto dir2_leaf_node_addname")
 
     require(
@@ -60,6 +66,13 @@ def main() -> None:
         "bounded data-entry validator",
     )
     require(source, "tag->to_cpu() != static_cast<uint16_t>(offset)", "data entry tag validation")
+    require(
+        source,
+        "auto dir2_data_unused_at_if_valid(const uint8_t* block, size_t offset, size_t data_end, uint16_t* free_len_out)",
+        "bounded free-record validator",
+    )
+    require(source, "FREE_LEN < sizeof(XfsDir2DataUnused)", "free-record minimum length validation")
+    require(source, "(FREE_LEN & (XFS_DIR2_DATA_ALIGN - 1)) != 0", "free-record alignment validation")
     require(source, "auto dir2_block_linear_lookup(const XfsMountContext* ctx, const uint8_t* block, size_t data_start, size_t data_end", "block linear lookup fallback")
     require(
         block_lookup,
@@ -76,6 +89,36 @@ def main() -> None:
         block_iterate,
         "if (!dir2_data_entry_at_if_valid(ctx, block, offset, DATA_END, &dep, &dep_size))",
         "block readdir bounded data-entry validation",
+    )
+    require(
+        leaf_scan,
+        "if (!dir2_data_entry_at_if_valid(ctx, block, offset, BLKSIZE, &dep, &dep_size))",
+        "leaf/node readdir bounded data-entry validation",
+    )
+    require(
+        leaf_lookup,
+        "dir2_data_entry_at_if_valid(ctx, data_bh->data, OFF, ctx->dir_blk_size, &dep, nullptr)",
+        "leaf-index lookup validates dataptr target",
+    )
+    require(
+        leaf_lookup,
+        "if (!dir2_data_entry_at_if_valid(ctx, block, offset, BLKSIZE, &dep, &dep_size))",
+        "leaf linear lookup bounded data-entry validation",
+    )
+    require(
+        leaf_find_data,
+        "if (!dir2_data_entry_at_if_valid(ctx, block, off, DATA_END, &dep, &dep_size))",
+        "leaf removal data search validates data entries",
+    )
+    require(
+        free_region,
+        "if (dir2_data_unused_at_if_valid(block, off, data_end, &candidate_free_len))",
+        "generic free-space search validates free records",
+    )
+    require(
+        leaf_find_free,
+        "if (dir2_find_free_region(ctx, block, DATA_START, DATA_END, need_len, &free_off, &free_len))",
+        "leaf free-space search uses validated free-region helper",
     )
     require(source, "auto dir2_block_to_leaf(XfsInode* dp, XfsTransaction* tp) -> int", "block-to-leaf converter")
     require(source, "data_hdr->hdr.magic = Be32::from_cpu(XFS_DIR3_DATA_MAGIC)", "old block converted to data magic")
@@ -121,6 +164,18 @@ def main() -> None:
         block_add,
         "if (found_offset + NEED_LEN > NEW_LEAF_START) {\n            brelse(bh);\n            return -ENOSPC;\n        }",
         "block add non-mutating ENOSPC return",
+    )
+    require(block_add, "uint16_t found_free_len = 0;", "block add stores validated free length")
+    require(block_add, "uint16_t const OLD_FREE_LEN = found_free_len;", "block add reuses validated free length")
+    require(
+        block_remove,
+        "if (OFF < DATA_START || !dir2_data_entry_at_if_valid(ctx, block, OFF, DATA_END, &dep, &dep_size))",
+        "block remove validates leaf dataptr target",
+    )
+    require(
+        block_remove,
+        "if (dir2_data_unused_at_if_valid(block, off, DATA_END, &free_len))",
+        "block remove validates free records while coalescing",
     )
     require_order(
         block_add,

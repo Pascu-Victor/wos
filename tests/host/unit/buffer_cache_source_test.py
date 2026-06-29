@@ -115,6 +115,35 @@ def main() -> None:
         "dirty hard limit must be bounded to about twice the dirty target",
     )
 
+    dirty_target_body = function_body(source, "choose_dirty_target_bytes_for_total")
+    require_order(
+        dirty_target_body,
+        [
+            "uint64_t const MIN_TARGET",
+            "uint64_t const MAX_TARGET = std::max<uint64_t>(MIN_TARGET, max_bytes / DIRTY_TARGET_DIVISOR)",
+            "std::clamp<uint64_t>(SCALED, MIN_TARGET, MAX_TARGET)",
+        ],
+        "dirty target must stay below the hard limit on large-memory VMs",
+    )
+
+    candidate_body = function_body(source, "find_writeback_candidate_locked")
+    require_order(
+        candidate_body,
+        [
+            "if (skip_writeback && (bh->flags & BH_WRITEBACK) != 0)",
+            "search_min_epoch = bh->dirty_epoch",
+            "continue",
+            "if (!has_older_overlapping_dirty_buffer_locked(bh))",
+        ],
+        "dirty writeback scan must not let one in-flight buffer block independent later writeback",
+    )
+    background_one_body = function_body(source, "writeback_dirty_one")
+    require(
+        background_one_body,
+        "return writeback_dirty_one_after(filter, 0, UINT64_MAX, true)",
+        "background dirty writeback should skip in-flight buffers",
+    )
+
     evict_body = function_body(source, "evict_lru_for_allocation")
     require_order(
         evict_body,
@@ -150,6 +179,46 @@ def main() -> None:
             "reclaim_clean_cache_over_limit_locked()",
         ],
         "successful dirty writeback should shrink clean cache after releasing writeback refs",
+    )
+
+    require(source, "write_dirty_run_buffers_individually", "dirty writeback allocation fallback")
+    fallback_body = function_body(source, "write_dirty_run_buffers_individually")
+    require_order(
+        fallback_body,
+        [
+            "WritebackSnapshot snapshot = make_writeback_snapshot(bh)",
+            "rc = write_block_to_disk(bh, snapshot.data)",
+            "bh->dirty_epoch == run.dirty_epochs.at(i)",
+            "clear_buffer_dirty_locked(bh)",
+            "owns_writeback_epoch(bh, run.writeback_epoch)",
+            "clear_buffer_writeback(bh)",
+            "wake_dirty_waiters(wake_list)",
+        ],
+        "dirty writeback fallback must write smaller snapshots without losing dirty epoch protection",
+    )
+    run_snapshot_body = function_body(source, "write_dirty_run_snapshot")
+    require_order(
+        run_snapshot_body,
+        [
+            "if (snapshot.data == nullptr)",
+            "if (run.count > 1)",
+            "return write_dirty_run_buffers_individually(run)",
+            "finish_dirty_writeback_run(run, -ENOMEM)",
+        ],
+        "dirty writeback must fall back before abandoning a multi-buffer run",
+    )
+
+    throttle_body = function_body(source, "throttle_dirty_buffer_cache")
+    require_order(
+        throttle_body,
+        [
+            "static_cast<void>(request_dirty_writeback())",
+            "writeback_dirty_budgeted(fallback_filter, DIRTY_HARD_FALLBACK_BUDGET, DIRTY_HARD_FALLBACK_BYTES)",
+            "bool const DRAINED_TO_RESUME",
+            "if (CAN_PARK)",
+            'ker::mod::sched::preemptible_syscall_park("dirty_bcache", DEADLINE_US)',
+        ],
+        "hard dirty throttle must make foreground writers assist writeback before parking",
     )
 
     account_body = function_body(source, "account_buffer_locked")

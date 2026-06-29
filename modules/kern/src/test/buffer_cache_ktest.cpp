@@ -13,6 +13,10 @@
 
 namespace {
 
+constexpr size_t DEFAULT_BLOCK_SIZE = 512;
+constexpr size_t WRITEBACK_RUN_MAX_BYTES = size_t{2} * 1024 * 1024;
+constexpr size_t WRITEBACK_RUN_MAX_BLOCKS = WRITEBACK_RUN_MAX_BYTES / DEFAULT_BLOCK_SIZE;
+
 auto null_read(ker::dev::BlockDevice* dev, uint64_t /*block*/, size_t count, void* buffer) -> int {
     memset(buffer, 0, count * dev->block_size);
     return 0;
@@ -114,7 +118,7 @@ auto redirtying_write(ker::dev::BlockDevice* dev, uint64_t /*block*/, size_t cou
 
 auto make_null_bdev() -> ker::dev::BlockDevice {
     ker::dev::BlockDevice d{};
-    d.block_size = 512;
+    d.block_size = DEFAULT_BLOCK_SIZE;
     d.total_blocks = 2048;
     d.read_blocks = null_read;
     d.write_blocks = null_write;
@@ -135,14 +139,15 @@ auto test_hash_key(const ker::dev::BlockDevice* bdev, uint64_t block_no, size_t 
 
 KTEST(BufferCache, SizingKeepsDirtyLimitsBelowCleanCache) {
     constexpr uint64_t ONE_GIB = uint64_t{1024} * 1024 * 1024;
+    constexpr uint64_t THIRTY_TWO_GIB = uint64_t{32} * ONE_GIB;
 
     size_t const CACHE_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(ONE_GIB);
     size_t const DIRTY_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(ONE_GIB, CACHE_MAX);
     size_t const DIRTY_HARD = ker::vfs::buffer_cache_selftest_choose_dirty_hard_bytes(DIRTY_TARGET, CACHE_MAX);
 
-    KEXPECT_EQ(CACHE_MAX, static_cast<size_t>(ONE_GIB / 2));
-    KEXPECT_EQ(DIRTY_TARGET, static_cast<size_t>(ONE_GIB / 10));
-    KEXPECT_EQ(DIRTY_HARD, CACHE_MAX);
+    KEXPECT_EQ(CACHE_MAX, static_cast<size_t>(ONE_GIB / 4));
+    KEXPECT_EQ(DIRTY_TARGET, static_cast<size_t>(ONE_GIB / 20));
+    KEXPECT_EQ(DIRTY_HARD, DIRTY_TARGET * 2);
 
     size_t const FALLBACK_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(0);
     size_t const FALLBACK_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(0, FALLBACK_MAX);
@@ -150,6 +155,13 @@ KTEST(BufferCache, SizingKeepsDirtyLimitsBelowCleanCache) {
     KEXPECT_EQ(FALLBACK_MAX, ker::vfs::BUFFER_CACHE_DEFAULT_SIZE);
     KEXPECT_EQ(FALLBACK_TARGET, ker::vfs::BUFFER_CACHE_DEFAULT_SIZE / 2);
     KEXPECT_EQ(FALLBACK_HARD, ker::vfs::BUFFER_CACHE_DEFAULT_SIZE);
+
+    size_t const LARGE_CACHE_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(THIRTY_TWO_GIB);
+    size_t const LARGE_DIRTY_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(THIRTY_TWO_GIB, LARGE_CACHE_MAX);
+    size_t const LARGE_DIRTY_HARD = ker::vfs::buffer_cache_selftest_choose_dirty_hard_bytes(LARGE_DIRTY_TARGET, LARGE_CACHE_MAX);
+    KEXPECT_EQ(LARGE_CACHE_MAX, static_cast<size_t>(ONE_GIB));
+    KEXPECT_EQ(LARGE_DIRTY_TARGET, static_cast<size_t>(ONE_GIB / 2));
+    KEXPECT_EQ(LARGE_DIRTY_HARD, static_cast<size_t>(ONE_GIB));
 }
 
 KTEST(BufferCache, BreadHit) {
@@ -840,7 +852,7 @@ KTEST(BufferCache, SyncBlockdevFailedWritesProgressAcrossBatches) {
     ker::vfs::invalidate_bdev(&dev);
 }
 
-KTEST(BufferCache, SyncBlockdevCoalescesContiguousDirtyRunsUpToFourMiB) {
+KTEST(BufferCache, SyncBlockdevCoalescesContiguousDirtyRunsAtWritebackCap) {
     ker::dev::BlockDevice dev = make_null_bdev();
     dev.total_blocks = 16384;
     LargeCountingWriteState io{};
@@ -852,6 +864,7 @@ KTEST(BufferCache, SyncBlockdevCoalescesContiguousDirtyRunsUpToFourMiB) {
     constexpr size_t BLOCKS_PER_DIRTY_BUFFER = 256;
     constexpr size_t DIRTY_BUFFER_COUNT = 32;
     constexpr size_t TOTAL_BLOCKS = BLOCKS_PER_DIRTY_BUFFER * DIRTY_BUFFER_COUNT;
+    static_assert(TOTAL_BLOCKS == WRITEBACK_RUN_MAX_BLOCKS * 2);
 
     for (size_t i = 0; i < DIRTY_BUFFER_COUNT; ++i) {
         uint64_t const BLOCK = FIRST_BLOCK + (i * BLOCKS_PER_DIRTY_BUFFER);
@@ -863,14 +876,16 @@ KTEST(BufferCache, SyncBlockdevCoalescesContiguousDirtyRunsUpToFourMiB) {
     }
 
     KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), 0);
-    KREQUIRE_EQ(io.write_calls, static_cast<size_t>(1));
+    KREQUIRE_EQ(io.write_calls, static_cast<size_t>(2));
     KEXPECT_EQ(io.write_blocks[0], FIRST_BLOCK);
-    KEXPECT_EQ(io.write_counts[0], TOTAL_BLOCKS);
+    KEXPECT_EQ(io.write_counts[0], WRITEBACK_RUN_MAX_BLOCKS);
+    KEXPECT_EQ(io.write_blocks[1], FIRST_BLOCK + WRITEBACK_RUN_MAX_BLOCKS);
+    KEXPECT_EQ(io.write_counts[1], TOTAL_BLOCKS - WRITEBACK_RUN_MAX_BLOCKS);
     KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, FIRST_BLOCK, TOTAL_BLOCKS));
     ker::vfs::invalidate_bdev(&dev);
 }
 
-KTEST(BufferCache, SyncBlockdevCoalescesManySmallDirtyBuffers) {
+KTEST(BufferCache, SyncBlockdevCoalescesManySmallDirtyBuffersAtWritebackCap) {
     ker::dev::BlockDevice dev = make_null_bdev();
     dev.total_blocks = 8192;
     LargeCountingWriteState io{};
@@ -882,6 +897,7 @@ KTEST(BufferCache, SyncBlockdevCoalescesManySmallDirtyBuffers) {
     constexpr size_t BLOCKS_PER_DIRTY_BUFFER = 8;
     constexpr size_t DIRTY_BUFFER_COUNT = 1024;
     constexpr size_t TOTAL_BLOCKS = BLOCKS_PER_DIRTY_BUFFER * DIRTY_BUFFER_COUNT;
+    static_assert(TOTAL_BLOCKS == WRITEBACK_RUN_MAX_BLOCKS * 2);
 
     for (size_t i = 0; i < DIRTY_BUFFER_COUNT; ++i) {
         uint64_t const BLOCK = FIRST_BLOCK + (i * BLOCKS_PER_DIRTY_BUFFER);
@@ -893,9 +909,11 @@ KTEST(BufferCache, SyncBlockdevCoalescesManySmallDirtyBuffers) {
     }
 
     KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), 0);
-    KREQUIRE_EQ(io.write_calls, static_cast<size_t>(1));
+    KREQUIRE_EQ(io.write_calls, static_cast<size_t>(2));
     KEXPECT_EQ(io.write_blocks[0], FIRST_BLOCK);
-    KEXPECT_EQ(io.write_counts[0], TOTAL_BLOCKS);
+    KEXPECT_EQ(io.write_counts[0], WRITEBACK_RUN_MAX_BLOCKS);
+    KEXPECT_EQ(io.write_blocks[1], FIRST_BLOCK + WRITEBACK_RUN_MAX_BLOCKS);
+    KEXPECT_EQ(io.write_counts[1], TOTAL_BLOCKS - WRITEBACK_RUN_MAX_BLOCKS);
     KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, FIRST_BLOCK, TOTAL_BLOCKS));
     ker::vfs::invalidate_bdev(&dev);
 }

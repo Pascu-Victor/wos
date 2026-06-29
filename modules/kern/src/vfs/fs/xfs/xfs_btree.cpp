@@ -53,6 +53,20 @@ auto btree_owner(const XfsBtreeCursor<Traits>* cur) -> uint64_t {
     }
 }
 
+constexpr xfs_agblock_t XFS_AG_BTREE_RESERVED_MAX = 4;
+
+template <typename Traits>
+auto btree_should_preserve_empty_ag_block(const XfsBtreeCursor<Traits>* cur, xfs_agblock_t agbno) -> bool {
+    if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
+        static_cast<void>(cur);
+        return agbno <= XFS_AG_BTREE_RESERVED_MAX;
+    } else {
+        static_cast<void>(cur);
+        static_cast<void>(agbno);
+        return false;
+    }
+}
+
 }  // namespace
 
 // ============================================================================
@@ -481,6 +495,46 @@ auto checked_key_at_mut(XfsBtreeCursor<Traits>* cur, int level, int idx, typenam
     return 0;
 }
 
+// Update the CRC field of a btree block.
+template <typename Traits>
+void btree_update_crc(BufHead* bp) {
+    if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
+        auto* hdr = reinterpret_cast<XfsBtreeSblock*>(bp->data);
+        hdr->bb_crc = 0;
+        uint32_t crc = util::crc32c_block_with_cksum(bp->data, bp->size, offsetof(XfsBtreeSblock, bb_crc));
+        __builtin_memcpy(&hdr->bb_crc, &crc, sizeof(crc));
+    } else {
+        auto* hdr = reinterpret_cast<XfsBtreeLblock*>(bp->data);
+        hdr->bb_crc = 0;
+        uint32_t crc = util::crc32c_block_with_cksum(bp->data, bp->size, offsetof(XfsBtreeLblock, bb_crc));
+        __builtin_memcpy(&hdr->bb_crc, &crc, sizeof(crc));
+    }
+}
+
+template <typename Traits>
+auto btree_propagate_first_key(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int child_level, const typename Traits::Key& key) -> int {
+    if (cur == nullptr || tp == nullptr || child_level < 0 || child_level >= cur->nlevels) {
+        return -EINVAL;
+    }
+
+    for (int lev = child_level + 1; lev < cur->nlevels; lev++) {
+        int const PARENT_PTR = cur->level_at(lev).ptr;
+        typename Traits::Key* pkey = nullptr;
+        int const KEY_RC = checked_key_at_mut(cur, lev, PARENT_PTR, &pkey);
+        if (KEY_RC != 0) {
+            return KEY_RC;
+        }
+        __builtin_memcpy(pkey, &key, Traits::KEY_LEN);
+        btree_update_crc<Traits>(cur->level_at(lev).bp);
+        xfs_trans_log_buf_full(tp, cur->level_at(lev).bp);
+        if (PARENT_PTR != 1) {
+            break;
+        }
+    }
+
+    return 0;
+}
+
 }  // anonymous namespace
 
 template <typename Traits>
@@ -533,10 +587,6 @@ auto xfs_btree_update(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
     Traits::encode_rec(&new_rec, irec);
     __builtin_memcpy(rec, &new_rec, Traits::REC_LEN);
 
-    // Log the modified record
-    auto rec_offset = static_cast<uint32_t>(reinterpret_cast<uint8_t*>(rec) - cur->level_at(0).bp->data);
-    xfs_trans_log_buf(tp, cur->level_at(0).bp, rec_offset, static_cast<uint32_t>(Traits::REC_LEN));
-
     // Update the key at parent levels if the first record was modified
     if (PTR == 1) {
         typename Traits::Key key;
@@ -549,14 +599,16 @@ auto xfs_btree_update(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
                 return KEY_RC;
             }
             __builtin_memcpy(pkey, &key, Traits::KEY_LEN);
-            auto key_off = static_cast<uint32_t>(reinterpret_cast<uint8_t*>(pkey) - cur->level_at(lev).bp->data);
-            xfs_trans_log_buf(tp, cur->level_at(lev).bp, key_off, static_cast<uint32_t>(Traits::KEY_LEN));
+            btree_update_crc<Traits>(cur->level_at(lev).bp);
+            xfs_trans_log_buf_full(tp, cur->level_at(lev).bp);
             if (PARENT_PTR != 1) {
                 break;  // only propagate if we changed the leftmost key
             }
         }
     }
 
+    btree_update_crc<Traits>(cur->level_at(0).bp);
+    xfs_trans_log_buf_full(tp, cur->level_at(0).bp);
     return 0;
 }
 
@@ -590,22 +642,6 @@ auto btree_key_off(size_t n) -> size_t {
 template <typename Traits>
 auto btree_ptr_off(uint32_t block_size, size_t n) -> size_t {
     return btree_node_ptr_off<Traits>(block_size, n);
-}
-
-// Update the CRC field of a btree block.
-template <typename Traits>
-void btree_update_crc(BufHead* bp) {
-    if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
-        auto* hdr = reinterpret_cast<XfsBtreeSblock*>(bp->data);
-        hdr->bb_crc = 0;
-        uint32_t crc = util::crc32c_block_with_cksum(bp->data, bp->size, offsetof(XfsBtreeSblock, bb_crc));
-        __builtin_memcpy(&hdr->bb_crc, &crc, sizeof(crc));
-    } else {
-        auto* hdr = reinterpret_cast<XfsBtreeLblock*>(bp->data);
-        hdr->bb_crc = 0;
-        uint32_t crc = util::crc32c_block_with_cksum(bp->data, bp->size, offsetof(XfsBtreeLblock, bb_crc));
-        __builtin_memcpy(&hdr->bb_crc, &crc, sizeof(crc));
-    }
 }
 
 // Set numrecs directly in the on-disk header without going through the cursor.
@@ -879,6 +915,16 @@ auto btree_split_internal(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int l
     typename Traits::Key promoted_key;
     __builtin_memcpy(&promoted_key, right_data + Traits::HDR_LEN, Traits::KEY_LEN);
 
+    if (insert_pos == 1 && lev + 1 < cur->nlevels) {
+        typename Traits::Key left_first_key;
+        __builtin_memcpy(&left_first_key, left_data + Traits::HDR_LEN, Traits::KEY_LEN);
+        int const FIRST_KEY_RC = btree_propagate_first_key<Traits>(cur, tp, lev, left_first_key);
+        if (FIRST_KEY_RC != 0) {
+            brelse(right_bp);
+            return FIRST_KEY_RC;
+        }
+    }
+
     btree_update_crc<Traits>(left_bp);
     btree_update_crc<Traits>(right_bp);
     xfs_trans_log_buf_full(tp, left_bp);
@@ -1036,7 +1082,9 @@ auto btree_remove_from_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
         auto par_agbno = static_cast<xfs_agblock_t>(ABS_BLOCK % cur->mount->ag_blocks);
         btree_update_crc<Traits>(parent_bp);
         xfs_trans_log_buf_full(tp, parent_bp);
-        xfs_alloc_put_freelist(cur->mount, tp, cur->agno, par_agbno);
+        if (!btree_should_preserve_empty_ag_block<Traits>(cur, par_agbno)) {
+            xfs_alloc_put_freelist(cur->mount, tp, cur->agno, par_agbno);
+        }
         return btree_remove_from_parent<Traits>(cur, tp, lev + 1);
     }
 
@@ -1121,7 +1169,7 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
         cur->set_numrecs(0, NR + 1);
         cur->level_at(0).ptr = insert_ptr;
 
-        // Log the entire modified region
+        btree_update_crc<Traits>(cur->level_at(0).bp);
         xfs_trans_log_buf_full(tp, cur->level_at(0).bp);
 
         // Update parent keys if we inserted at position 1
@@ -1136,6 +1184,7 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
                     return KEY_RC;
                 }
                 __builtin_memcpy(pkey, &key, Traits::KEY_LEN);
+                btree_update_crc<Traits>(cur->level_at(lev).bp);
                 xfs_trans_log_buf_full(tp, cur->level_at(lev).bp);
                 if (PP != 1) {
                     break;
@@ -1230,15 +1279,25 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
         cur->level_at(0).ptr = RIGHT_INSERT;
     }
 
+    // Derive the first key of the right block before releasing the buffer.
+    Key right_first_key;
+    Traits::init_key_from_rec(&right_first_key, reinterpret_cast<const Rec*>(right_data + Traits::HDR_LEN));
+
+    if (insert_ptr == 1 && cur->nlevels > 1) {
+        Key left_first_key;
+        Traits::init_key_from_rec(&left_first_key, reinterpret_cast<const Rec*>(left_data + Traits::HDR_LEN));
+        int const FIRST_KEY_RC = btree_propagate_first_key<Traits>(cur, tp, 0, left_first_key);
+        if (FIRST_KEY_RC != 0) {
+            brelse(right_bp);
+            return FIRST_KEY_RC;
+        }
+    }
+
     btree_update_crc<Traits>(left_bp);
     btree_update_crc<Traits>(right_bp);
     xfs_trans_log_buf_full(tp, left_bp);
     xfs_trans_log_buf_full(tp, right_bp);
     brelse(right_bp);
-
-    // Derive the first key of the right block to propagate upward
-    Key right_first_key;
-    Traits::init_key_from_rec(&right_first_key, reinterpret_cast<const Rec*>(right_data + Traits::HDR_LEN));
 
     // Propagate the split upward
     return btree_insert_into_parent<Traits>(cur, tp, 1, right_first_key, RIGHT_BLOCKNO, root_block, nlevels, new_root, new_nlevels);
@@ -1267,7 +1326,7 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
     }
     cur->set_numrecs(0, NR - 1);
 
-    // Log the entire modified leaf
+    btree_update_crc<Traits>(cur->level_at(0).bp);
     xfs_trans_log_buf_full(tp, cur->level_at(0).bp);
 
     // Update parent keys if we deleted the first record
@@ -1282,6 +1341,7 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
                 return KEY_RC;
             }
             __builtin_memcpy(pkey, &key, Traits::KEY_LEN);
+            btree_update_crc<Traits>(cur->level_at(lev).bp);
             xfs_trans_log_buf_full(tp, cur->level_at(lev).bp);
             if (PP != 1) {
                 break;
@@ -1345,7 +1405,9 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
 
         uint64_t const ABS_LEAF = leaf_bp->block_no / (cur->mount->block_size / cur->mount->sect_size);
         auto leaf_agbno = static_cast<xfs_agblock_t>(ABS_LEAF % cur->mount->ag_blocks);
-        xfs_alloc_put_freelist(cur->mount, tp, cur->agno, leaf_agbno);
+        if (!btree_should_preserve_empty_ag_block<Traits>(cur, leaf_agbno)) {
+            xfs_alloc_put_freelist(cur->mount, tp, cur->agno, leaf_agbno);
+        }
 
         // Remove the corresponding key/pointer from the parent
         return btree_remove_from_parent<Traits>(cur, tp, 1);

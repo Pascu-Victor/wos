@@ -244,6 +244,29 @@ auto dir2_data_entry_at_if_valid(const XfsMountContext* ctx, const uint8_t* bloc
     return true;
 }
 
+auto dir2_data_unused_at_if_valid(const uint8_t* block, size_t offset, size_t data_end, uint16_t* free_len_out) -> bool {
+    if (block == nullptr || offset > UINT16_MAX || offset + sizeof(XfsDir2DataUnused) > data_end) {
+        return false;
+    }
+
+    const auto* unused = reinterpret_cast<const XfsDir2DataUnused*>(block + offset);
+    uint16_t const FREE_LEN = unused->length.to_cpu();
+    if (unused->freetag.to_cpu() != XFS_DIR2_DATA_FREE_TAG || FREE_LEN < sizeof(XfsDir2DataUnused) ||
+        (FREE_LEN & (XFS_DIR2_DATA_ALIGN - 1)) != 0 || offset + FREE_LEN > data_end) {
+        return false;
+    }
+
+    const auto* tag = reinterpret_cast<const Be16*>(block + offset + FREE_LEN - sizeof(Be16));
+    if (tag->to_cpu() != static_cast<uint16_t>(offset)) {
+        return false;
+    }
+
+    if (free_len_out != nullptr) {
+        *free_len_out = FREE_LEN;
+    }
+    return true;
+}
+
 auto dir2_block_linear_lookup(const XfsMountContext* ctx, const uint8_t* block, size_t data_start, size_t data_end, const char* name,
                               uint16_t namelen, XfsDirEntry* entry) -> int {
     size_t offset = data_start;
@@ -252,13 +275,9 @@ auto dir2_block_linear_lookup(const XfsMountContext* ctx, const uint8_t* block, 
             break;
         }
 
-        const auto* unused = reinterpret_cast<const XfsDir2DataUnused*>(block + offset);
-        if (unused->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
-            uint16_t const FREE_LEN = unused->length.to_cpu();
-            if (FREE_LEN == 0 || offset + FREE_LEN > data_end) {
-                break;
-            }
-            offset += FREE_LEN;
+        uint16_t free_len = 0;
+        if (dir2_data_unused_at_if_valid(block, offset, data_end, &free_len)) {
+            offset += free_len;
             continue;
         }
 
@@ -939,13 +958,9 @@ auto dir2_block_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
 
     while (offset < DATA_END) {
         // Check for free space entry
-        const auto* unused = reinterpret_cast<const XfsDir2DataUnused*>(block + offset);
-        if (unused->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
-            uint16_t const FREE_LEN = unused->length.to_cpu();
-            if (FREE_LEN == 0 || FREE_LEN > DATA_END - offset) {
-                break;
-            }
-            offset += FREE_LEN;
+        uint16_t free_len = 0;
+        if (dir2_data_unused_at_if_valid(block, offset, DATA_END, &free_len)) {
+            offset += free_len;
             continue;
         }
 
@@ -1000,19 +1015,16 @@ auto dir2_scan_data_block(XfsInode* dp, xfs_dir2_db_t db, XfsDirIterFn fn, void*
     XfsDirEntry entry{};
 
     while (offset + sizeof(XfsDir2DataUnused) <= BLKSIZE) {
-        const auto* unused = reinterpret_cast<const XfsDir2DataUnused*>(block + offset);
-        if (unused->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
-            uint16_t const FREE_LEN = unused->length.to_cpu();
-            if (FREE_LEN == 0 || offset + FREE_LEN > BLKSIZE) {
-                break;
-            }
-            offset += FREE_LEN;
+        uint16_t free_len = 0;
+        if (dir2_data_unused_at_if_valid(block, offset, BLKSIZE, &free_len)) {
+            offset += free_len;
             continue;
         }
 
-        const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + offset);
-        if (dep->namelen == 0 || offset + dir2_data_entsize(ctx, dep->namelen) > BLKSIZE) {
-            break;  // corrupt or past end
+        const XfsDir2DataEntry* dep = nullptr;
+        size_t dep_size = 0;
+        if (!dir2_data_entry_at_if_valid(ctx, block, offset, BLKSIZE, &dep, &dep_size)) {
+            break;
         }
 
         fill_dir_entry(ctx, dep, &entry, data_entry_cookie(ctx, db, offset));
@@ -1022,7 +1034,7 @@ auto dir2_scan_data_block(XfsInode* dp, xfs_dir2_db_t db, XfsDirIterFn fn, void*
             return 1;  // caller requested stop
         }
 
-        offset += dir2_data_entsize(ctx, dep->namelen);
+        offset += dep_size;
     }
 
     brelse(bh);
@@ -1147,8 +1159,8 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
                 continue;
             }
 
-            if (OFF + sizeof(XfsDir2DataEntry) <= ctx->dir_blk_size) {
-                const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(data_bh->data + OFF);
+            const XfsDir2DataEntry* dep = nullptr;
+            if (dir2_data_entry_at_if_valid(ctx, data_bh->data, OFF, ctx->dir_blk_size, &dep, nullptr)) {
                 if (dep->namelen == namelen && __builtin_memcmp(xfs_dir2_data_entry_name(dep), name, namelen) == 0) {
                     fill_dir_entry(ctx, dep, entry);
                     brelse(data_bh);
@@ -1187,18 +1199,15 @@ linear_scan:
             size_t offset = sizeof(XfsDir3DataHdr);
 
             while (offset + sizeof(XfsDir2DataUnused) <= BLKSIZE) {
-                const auto* unused = reinterpret_cast<const XfsDir2DataUnused*>(block + offset);
-                if (unused->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
-                    uint16_t const FREE_LEN = unused->length.to_cpu();
-                    if (FREE_LEN == 0 || offset + FREE_LEN > BLKSIZE) {
-                        break;
-                    }
-                    offset += FREE_LEN;
+                uint16_t free_len = 0;
+                if (dir2_data_unused_at_if_valid(block, offset, BLKSIZE, &free_len)) {
+                    offset += free_len;
                     continue;
                 }
 
-                const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + offset);
-                if (dep->namelen == 0) {
+                const XfsDir2DataEntry* dep = nullptr;
+                size_t dep_size = 0;
+                if (!dir2_data_entry_at_if_valid(ctx, block, offset, BLKSIZE, &dep, &dep_size)) {
                     break;
                 }
 
@@ -1208,7 +1217,7 @@ linear_scan:
                     return 0;
                 }
 
-                offset += dir2_data_entsize(ctx, dep->namelen);
+                offset += dep_size;
             }
             brelse(data_bh);
         }
@@ -1545,14 +1554,9 @@ void dir2_rebuild_data_bestfree(const XfsMountContext* ctx, uint8_t* block, size
             break;
         }
 
-        const auto* unused = reinterpret_cast<const XfsDir2DataUnused*>(block + off);
-        if (unused->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
-            uint16_t const FREE_LEN = unused->length.to_cpu();
-            if (FREE_LEN == 0 || off + FREE_LEN > data_end) {
-                break;
-            }
-
-            BestFreeSlot const CUR{.off = static_cast<uint16_t>(off), .len = FREE_LEN};
+        uint16_t free_len = 0;
+        if (dir2_data_unused_at_if_valid(block, off, data_end, &free_len)) {
+            BestFreeSlot const CUR{.off = static_cast<uint16_t>(off), .len = free_len};
             for (int idx = 0; idx < 3; idx++) {
                 if (CUR.len > best.at(static_cast<size_t>(idx)).len) {
                     for (int j = 2; j > idx; j--) {
@@ -1563,16 +1567,16 @@ void dir2_rebuild_data_bestfree(const XfsMountContext* ctx, uint8_t* block, size
                 }
             }
 
-            off += FREE_LEN;
+            off += free_len;
             continue;
         }
 
-        const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + off);
-        size_t const DEP_SIZE = dir2_data_entsize(ctx, dep->namelen);
-        if (dep->namelen == 0 || DEP_SIZE == 0 || off + DEP_SIZE > data_end) {
+        const XfsDir2DataEntry* dep = nullptr;
+        size_t dep_size = 0;
+        if (!dir2_data_entry_at_if_valid(ctx, block, off, data_end, &dep, &dep_size)) {
             break;
         }
-        off += DEP_SIZE;
+        off += dep_size;
     }
 
     for (int i = 0; i < 3; i++) {
@@ -1601,32 +1605,27 @@ void dir2_make_data_free(const XfsMountContext* ctx, uint8_t* block, size_t data
             break;
         }
 
-        const auto* ent = reinterpret_cast<const XfsDir2DataUnused*>(block + off);
-        if (ent->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
-            uint16_t const FREE_LEN = ent->length.to_cpu();
-            if (FREE_LEN == 0 || off + FREE_LEN > data_end) {
-                break;
-            }
-
-            if (off + FREE_LEN == entry_off) {
+        uint16_t free_len = 0;
+        if (dir2_data_unused_at_if_valid(block, off, data_end, &free_len)) {
+            if (off + free_len == entry_off) {
                 prev_free_off = off;
-                prev_free_len = FREE_LEN;
+                prev_free_len = free_len;
                 prev_found = true;
             } else if (off == entry_off + entry_size) {
-                next_free_len = FREE_LEN;
+                next_free_len = free_len;
                 next_found = true;
             }
 
-            off += FREE_LEN;
+            off += free_len;
             continue;
         }
 
-        const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + off);
-        size_t const DEP_SIZE = dir2_data_entsize(ctx, dep->namelen);
-        if (dep->namelen == 0 || DEP_SIZE == 0 || off + DEP_SIZE > data_end) {
+        const XfsDir2DataEntry* dep = nullptr;
+        size_t dep_size = 0;
+        if (!dir2_data_entry_at_if_valid(ctx, block, off, data_end, &dep, &dep_size)) {
             break;
         }
-        off += DEP_SIZE;
+        off += dep_size;
     }
 
     size_t merged_off = entry_off;
@@ -1656,27 +1655,23 @@ auto dir2_find_free_region(const XfsMountContext* ctx, const uint8_t* block, siz
             break;
         }
 
-        const auto* unused = reinterpret_cast<const XfsDir2DataUnused*>(block + off);
-        if (unused->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
-            uint16_t const FREE_LEN = unused->length.to_cpu();
-            if (FREE_LEN == 0 || off + FREE_LEN > data_end) {
-                break;
-            }
-            if (FREE_LEN >= need_len) {
+        uint16_t candidate_free_len = 0;
+        if (dir2_data_unused_at_if_valid(block, off, data_end, &candidate_free_len)) {
+            if (candidate_free_len >= need_len) {
                 *free_off = off;
-                *free_len = FREE_LEN;
+                *free_len = candidate_free_len;
                 return true;
             }
-            off += FREE_LEN;
+            off += candidate_free_len;
             continue;
         }
 
-        const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + off);
-        size_t const DEP_SIZE = dir2_data_entsize(ctx, dep->namelen);
-        if (dep->namelen == 0 || DEP_SIZE == 0 || off + DEP_SIZE > data_end) {
+        const XfsDir2DataEntry* dep = nullptr;
+        size_t dep_size = 0;
+        if (!dir2_data_entry_at_if_valid(ctx, block, off, data_end, &dep, &dep_size)) {
             break;
         }
-        off += DEP_SIZE;
+        off += dep_size;
     }
 
     return false;
@@ -1858,19 +1853,15 @@ auto dir2_leaf_node_find_data_entry(XfsInode* dp, const char* name, uint16_t nam
 
         size_t off = DATA_START;
         while (off + sizeof(XfsDir2DataUnused) <= DATA_END) {
-            const auto* unused = reinterpret_cast<const XfsDir2DataUnused*>(block + off);
-            if (unused->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
-                uint16_t const FREE_LEN = unused->length.to_cpu();
-                if (FREE_LEN == 0 || off + FREE_LEN > DATA_END) {
-                    break;
-                }
-                off += FREE_LEN;
+            uint16_t free_len = 0;
+            if (dir2_data_unused_at_if_valid(block, off, DATA_END, &free_len)) {
+                off += free_len;
                 continue;
             }
 
-            const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + off);
-            size_t const DEP_SIZE = dir2_data_entsize(ctx, dep->namelen);
-            if (dep->namelen == 0 || DEP_SIZE == 0 || off + DEP_SIZE > DATA_END) {
+            const XfsDir2DataEntry* dep = nullptr;
+            size_t dep_size = 0;
+            if (!dir2_data_entry_at_if_valid(ctx, block, off, DATA_END, &dep, &dep_size)) {
                 break;
             }
 
@@ -1878,11 +1869,11 @@ auto dir2_leaf_node_find_data_entry(XfsInode* dp, const char* name, uint16_t nam
                 *data_bhp = bh;
                 *dbp = db;
                 *entry_offp = off;
-                *entry_sizep = DEP_SIZE;
+                *entry_sizep = dep_size;
                 return 0;
             }
 
-            off += DEP_SIZE;
+            off += dep_size;
         }
 
         brelse(bh);
@@ -2477,29 +2468,28 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
 
     size_t offset = DATA_START;
     size_t found_offset = 0;
+    uint16_t found_free_len = 0;
     bool found_free = false;
 
     while (offset < DATA_END) {
-        const auto* unused = reinterpret_cast<const XfsDir2DataUnused*>(block + offset);
-        if (unused->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
-            uint16_t const FREE_LEN = unused->length.to_cpu();
-            if (FREE_LEN == 0 || offset + FREE_LEN > DATA_END) {
-                break;
-            }
-            if (FREE_LEN >= NEED_LEN) {
+        uint16_t free_len = 0;
+        if (dir2_data_unused_at_if_valid(block, offset, DATA_END, &free_len)) {
+            if (free_len >= NEED_LEN) {
                 found_offset = offset;
+                found_free_len = free_len;
                 found_free = true;
                 break;
             }
-            offset += FREE_LEN;
+            offset += free_len;
             continue;
         }
 
-        const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + offset);
-        if (dep->namelen == 0) {
+        const XfsDir2DataEntry* dep = nullptr;
+        size_t dep_size = 0;
+        if (!dir2_data_entry_at_if_valid(ctx, block, offset, DATA_END, &dep, &dep_size)) {
             break;
         }
-        offset += dir2_data_entsize(ctx, dep->namelen);
+        offset += dep_size;
     }
 
     if (!found_free) {
@@ -2552,8 +2542,7 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
     }
 
     // Write the new data entry at found_offset
-    const auto* old_unused = reinterpret_cast<const XfsDir2DataUnused*>(block + found_offset);
-    uint16_t const OLD_FREE_LEN = old_unused->length.to_cpu();
+    uint16_t const OLD_FREE_LEN = found_free_len;
 
     auto* dep = reinterpret_cast<XfsDir2DataEntry*>(block + found_offset);
     dep->inumber = Be64::from_cpu(ino);
@@ -2939,21 +2928,17 @@ auto dir2_block_removename(XfsInode* dp, const char* name, uint16_t namelen, Xfs
                 continue;  // stale
             }
 
-            uint32_t const OFF = dir2_dataptr_to_off(ctx, ADDR);
-            if (OFF < DATA_START || OFF + sizeof(XfsDir2DataEntry) > DATA_END) {
-                continue;
-            }
-
-            const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + OFF);
-            size_t const DEP_SIZE = dir2_data_entsize(ctx, dep->namelen);
-            if (dep->namelen == 0 || DEP_SIZE == 0 || OFF + DEP_SIZE > DATA_END) {
+            size_t const OFF = dir2_dataptr_to_off(ctx, ADDR);
+            const XfsDir2DataEntry* dep = nullptr;
+            size_t dep_size = 0;
+            if (OFF < DATA_START || !dir2_data_entry_at_if_valid(ctx, block, OFF, DATA_END, &dep, &dep_size)) {
                 continue;
             }
 
             if (dep->namelen == namelen && __builtin_memcmp(xfs_dir2_data_entry_name(dep), name, namelen) == 0) {
                 match_idx = i;
                 entry_off = OFF;
-                entry_size = DEP_SIZE;
+                entry_size = dep_size;
                 break;
             }
         }
@@ -2992,32 +2977,27 @@ auto dir2_block_removename(XfsInode* dp, const char* name, uint16_t namelen, Xfs
                 break;
             }
 
-            const auto* ent = reinterpret_cast<const XfsDir2DataUnused*>(block + off);
-            if (ent->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
-                uint16_t const FREE_LEN = ent->length.to_cpu();
-                if (FREE_LEN == 0 || off + FREE_LEN > DATA_END) {
-                    break;
-                }
-
-                if (off + FREE_LEN == entry_off) {
+            uint16_t free_len = 0;
+            if (dir2_data_unused_at_if_valid(block, off, DATA_END, &free_len)) {
+                if (off + free_len == entry_off) {
                     prev_free_off = off;
-                    prev_free_len = FREE_LEN;
+                    prev_free_len = free_len;
                     prev_found = true;
                 } else if (off == entry_off + entry_size) {
-                    next_free_len = FREE_LEN;
+                    next_free_len = free_len;
                     next_found = true;
                 }
 
-                off += FREE_LEN;
+                off += free_len;
                 continue;
             }
 
-            const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + off);
-            size_t const DEP_SIZE = dir2_data_entsize(ctx, dep->namelen);
-            if (dep->namelen == 0 || DEP_SIZE == 0 || off + DEP_SIZE > DATA_END) {
+            const XfsDir2DataEntry* dep = nullptr;
+            size_t dep_size = 0;
+            if (!dir2_data_entry_at_if_valid(ctx, block, off, DATA_END, &dep, &dep_size)) {
                 break;
             }
-            off += DEP_SIZE;
+            off += dep_size;
         }
     }
 
@@ -3052,14 +3032,9 @@ auto dir2_block_removename(XfsInode* dp, const char* name, uint16_t namelen, Xfs
                 break;
             }
 
-            const auto* ent = reinterpret_cast<const XfsDir2DataUnused*>(block + off);
-            if (ent->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
-                uint16_t const FREE_LEN = ent->length.to_cpu();
-                if (FREE_LEN == 0 || off + FREE_LEN > DATA_END) {
-                    break;
-                }
-
-                BestFreeSlot const CUR{.off = static_cast<uint16_t>(off), .len = FREE_LEN};
+            uint16_t free_len = 0;
+            if (dir2_data_unused_at_if_valid(block, off, DATA_END, &free_len)) {
+                BestFreeSlot const CUR{.off = static_cast<uint16_t>(off), .len = free_len};
                 for (int idx = 0; idx < 3; idx++) {
                     if (CUR.len > best.at(static_cast<size_t>(idx)).len) {
                         for (int j = 2; j > idx; j--) {
@@ -3070,16 +3045,16 @@ auto dir2_block_removename(XfsInode* dp, const char* name, uint16_t namelen, Xfs
                     }
                 }
 
-                off += FREE_LEN;
+                off += free_len;
                 continue;
             }
 
-            const auto* dep = reinterpret_cast<const XfsDir2DataEntry*>(block + off);
-            size_t const DEP_SIZE = dir2_data_entsize(ctx, dep->namelen);
-            if (dep->namelen == 0 || DEP_SIZE == 0 || off + DEP_SIZE > DATA_END) {
+            const XfsDir2DataEntry* dep = nullptr;
+            size_t dep_size = 0;
+            if (!dir2_data_entry_at_if_valid(ctx, block, off, DATA_END, &dep, &dep_size)) {
                 break;
             }
-            off += DEP_SIZE;
+            off += dep_size;
         }
     }
 

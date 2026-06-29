@@ -133,6 +133,11 @@ auto xfs_inode_cache_new(XfsInode* ip) -> int;
 // inactivation point.
 void xfs_inode_release(XfsInode* ip);
 
+// Release a reference while the caller already holds mount->metadata_lock.
+// This avoids recursively taking the mount-wide metadata mutex when dropping
+// the final reference to a zero-link inode from unlink/rmdir/rename paths.
+void xfs_inode_release_metadata_locked(XfsInode* ip);
+
 // Write back a dirty inode to disk.  Serializes the in-memory XfsInode back
 // to the on-disk XfsDinode, recomputes CRC, and logs through the transaction.
 // Returns 0 on success, negative errno on failure.

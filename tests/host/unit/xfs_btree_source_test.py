@@ -89,6 +89,28 @@ def main() -> None:
     if "insert_ptr - MID - 1" in leaf_split:
         fail("leaf split right-half insertion must not shift one slot too far left")
 
+    require(source, "constexpr xfs_agblock_t XFS_AG_BTREE_RESERVED_MAX = 4;", "reserved AG btree block cutoff")
+    require(
+        source,
+        "auto btree_should_preserve_empty_ag_block(const XfsBtreeCursor<Traits>* cur, xfs_agblock_t agbno) -> bool",
+        "reserved AG btree block preservation helper",
+    )
+    require(
+        source,
+        "return agbno <= XFS_AG_BTREE_RESERVED_MAX;",
+        "short-form AG btree reserved block preservation",
+    )
+    require(
+        source,
+        "if (!btree_should_preserve_empty_ag_block<Traits>(cur, par_agbno)) {\n            xfs_alloc_put_freelist(cur->mount, tp, cur->agno, par_agbno);\n        }\n        return btree_remove_from_parent<Traits>(cur, tp, lev + 1);",
+        "empty internal delete must remove parent pointer without recycling reserved AG blocks",
+    )
+    require(
+        source,
+        "if (!btree_should_preserve_empty_ag_block<Traits>(cur, leaf_agbno)) {\n            xfs_alloc_put_freelist(cur->mount, tp, cur->agno, leaf_agbno);\n        }\n\n        // Remove the corresponding key/pointer from the parent",
+        "empty leaf delete must remove parent pointer without recycling reserved AG blocks",
+    )
+
 
 if __name__ == "__main__":
     main()
