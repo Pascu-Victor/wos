@@ -684,6 +684,18 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz, bool thread_view) ->
     append(task->is_voluntary_blocked() ? "1" : "0");
     append("\nWaitingForPid:\t");
     append_int(task->waiting_for_pid);
+    append("\nWaitpidCompletionClaimed:\t");
+    append(task->waitpid_completion_claimed.load(std::memory_order_acquire) ? "1" : "0");
+    append("\nWaitpidLastRepairUs:\t");
+    append_int(task->waitpid_last_repair_us);
+    append("\nExitInProgress:\t");
+    append(task->exit_in_progress ? "1" : "0");
+    append("\nExitNotifyReady:\t");
+    append(task->exit_notify_ready.load(std::memory_order_acquire) ? "1" : "0");
+    append("\nWaitedOn:\t");
+    append(task->waited_on.load(std::memory_order_acquire) ? "1" : "0");
+    append("\nWakeupPending:\t");
+    append(task->wakeup_pending.load(std::memory_order_acquire) ? "1" : "0");
 
     // Signals
     append("\nSigPnd:\t");
@@ -3706,6 +3718,40 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
     return static_cast<size_t>(p - buf);
 }
 
+// Generate content for /proc/kcpustate
+// Shows a locked snapshot of each CPU's current task and queue state.
+auto generate_kcpustate(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+
+    uint64_t cpu_count = ker::mod::smt::get_core_count();
+    if (cpu_count == 0) {
+        cpu_count = 1;
+    }
+
+    for (uint64_t c = 0; c < cpu_count; ++c) {
+        auto state = ker::mod::sched::get_scheduler_cpu_state(c);
+        append_sconst(p, end, "cpu_state");
+        append_memacc_dec(p, end, "cpu", state.cpu_no);
+        append_memacc_bool(p, end, "idle", state.is_idle);
+        append_memacc_dec(p, end, "runq", state.runnable_count);
+        append_memacc_dec(p, end, "waitq", state.wait_queue_count);
+        append_memacc_dec(p, end, "cur_pid", state.current_pid);
+        append_memacc_str(p, end, "cur_name", state.current_name);
+        append_memacc_str(p, end, "cur_type", task_type_name(static_cast<ker::mod::sched::task::TaskType>(state.current_type)));
+        append_memacc_bool(p, end, "cur_vblk", state.current_voluntary_block);
+        append_memacc_bool(p, end, "cur_wblk", state.current_wants_block);
+        append_memacc_bool(p, end, "cur_pinned", state.current_cpu_pinned);
+        append_memacc_dec(p, end, "preempt_depth", state.current_preempt_depth);
+        append_memacc_bool(p, end, "preempt_pending", state.current_preempt_pending);
+        append_memacc_dec(p, end, "preempt_max_us", state.current_preempt_max_us);
+        append_char(p, end, '\n');
+    }
+
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
 // Generate content for /proc/version
 auto generate_version(char* buf, size_t bufsz) -> size_t {
     size_t off = 0;
@@ -3747,9 +3793,10 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         constexpr size_t MAX_MEMACC_BUF = 262144;
         bool const IS_MAPS = pfd->node.type == ProcNodeType::MAPS_FILE;
         bool const IS_KPERF = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KWKISTAT_FILE ||
-                               pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCONTSTAT_FILE ||
-                               pfd->node.type == ProcNodeType::KIPCSTAT_FILE || pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE ||
-                               pfd->node.type == ProcNodeType::WKI_PIPES_FILE || pfd->node.type == ProcNodeType::CPU_STAT_FILE);
+                               pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCPUSTATE_FILE ||
+                               pfd->node.type == ProcNodeType::KCONTSTAT_FILE || pfd->node.type == ProcNodeType::KIPCSTAT_FILE ||
+                               pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE || pfd->node.type == ProcNodeType::WKI_PIPES_FILE ||
+                               pfd->node.type == ProcNodeType::CPU_STAT_FILE);
         bool const IS_MEMACC =
             (pfd->node.type == ProcNodeType::MEMACC_SUMMARY_FILE || pfd->node.type == ProcNodeType::MEMACC_ZONES_FILE ||
              pfd->node.type == ProcNodeType::MEMACC_PROCS_FILE || pfd->node.type == ProcNodeType::MEMACC_DEAD_FILE ||
@@ -3811,6 +3858,9 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 break;
             case ProcNodeType::KCPUSTAT_FILE:
                 pfd->content_len = generate_kcpustat(pfd->content, MAX_KPERF_BUF);
+                break;
+            case ProcNodeType::KCPUSTATE_FILE:
+                pfd->content_len = generate_kcpustate(pfd->content, MAX_KPERF_BUF);
                 break;
             case ProcNodeType::KPERFCTL_FILE:
                 pfd->content_len = generate_kperfctl(pfd->content, MAX_PROCFS_BUF);
@@ -4474,6 +4524,11 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     // /proc/kcpustat - per-CPU aggregate scheduler statistics
     if (strcmp(path, "kcpustat") == 0) {
         return make_file(ProcNodeType::KCPUSTAT_FILE, 0, false);
+    }
+
+    // /proc/kcpustate - per-CPU scheduler current/runqueue state
+    if (strcmp(path, "kcpustate") == 0) {
+        return make_file(ProcNodeType::KCPUSTATE_FILE, 0, false);
     }
 
     // /proc/kperfctl - write "enable"/"disable" to start/stop perf recording
