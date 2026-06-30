@@ -19,7 +19,15 @@ include_directories(
 
 # Source files
 set(SOURCES
+    src/args.cpp
+    src/commands.cpp
+    src/data.cpp
     src/main.cpp
+    src/map.cpp
+    src/run.cpp
+    src/sched.cpp
+    src/support.cpp
+    src/wki.cpp
 )
 
 # Create executable
