@@ -50,6 +50,36 @@ def main() -> None:
     )
     require(
         source,
+        "constexpr xfs_extlen_t XFS_WRITE_ALLOC_TRANSACTION_BLOCKS = 16384;",
+        "large XFS hole writes must split metadata allocation transactions before transaction log headroom is exhausted",
+    )
+    require(
+        source,
+        "alloc_blocks = std::min(alloc_blocks, XFS_WRITE_ALLOC_TRANSACTION_BLOCKS);",
+        "XFS hole allocation helper must enforce the metadata transaction block cap",
+    )
+    require(
+        source,
+        "auto xfs_write_alloc_min_blocks(xfs_extlen_t max_blocks, bool extent_pressure, bool sequential_append) -> xfs_extlen_t",
+        "XFS write allocation must compute a contiguous allocation floor for streaming writes",
+    )
+    require(
+        source,
+        "return std::max<xfs_extlen_t>(1, std::min(max_blocks, XFS_STREAM_PREALLOC_BLOCKS));",
+        "XFS streaming writes must prefer the stream preallocation run before falling back to tiny extents",
+    )
+    require(
+        source,
+        "if (xfs_bmap_lookup(ip, file_block - 1, &prev) != 0 || prev.is_hole || prev.startblock == NULLFSBLOCK)",
+        "XFS sequential allocation hints must work after BMBT promotion",
+    )
+    require(
+        source,
+        "xfs_set_alloc_hint_from_fsb(ctx, NEXT_FSB, req);",
+        "XFS sequential allocation hints must target the physical block after the previous logical block",
+    )
+    require(
+        source,
         "constexpr size_t XFS_DIRTY_THROTTLE_INTERVAL_BYTES = XFS_BUFFERED_WRITE_BATCH_MAX_BYTES;",
         "dirty throttling must run once per buffered write batch",
     )
@@ -77,6 +107,21 @@ def main() -> None:
         write_body,
         "kick_dirty_buffer_cache_writeback(ctx->device);",
         "locked XFS write path may only kick dirty writeback while holding XFS locks",
+    )
+    require(
+        write_body,
+        "req.minlen = xfs_write_alloc_min_blocks(req.maxlen, EXTENT_PRESSURE, SEQUENTIAL_APPEND);",
+        "regular file writes must ask for contiguous stream extents before falling back",
+    )
+    require(
+        write_body,
+        "if (ret != -ENOSPC || req.minlen == 1)",
+        "regular file writes must only reduce allocation minlen on ENOSPC",
+    )
+    require(
+        write_body,
+        "req.minlen = NEXT_MINLEN;",
+        "regular file writes must retry fragmented files with smaller allocation floors",
     )
     require(
         write_body,

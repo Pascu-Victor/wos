@@ -57,10 +57,11 @@ constexpr size_t XFS_DIRECT_READ_MIN_BYTES = size_t{4} * 1024;
 constexpr size_t XFS_DIRECT_READ_BATCH_MAX_BYTES = size_t{2} * 1024 * 1024;
 constexpr uint64_t XFS_NSEC_PER_SEC = 1000000000ULL;
 constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
-// Maximum blocks to allocate per metadata transaction.
-// Each transaction covers one contiguous extent allocation, so the actual
-// number of transactions for a sequential write is (total_blocks / batch).
-constexpr xfs_extlen_t XFS_WRITE_BATCH_BLOCKS = 65536;  // up to 256 MiB per transaction
+// Maximum blocks to allocate per metadata transaction. Large user writes are
+// still copied in buffered I/O batches below, but the extent allocation itself
+// must leave enough log item headroom for AG free-space updates, bmap updates,
+// and inode writeback during commit.
+constexpr xfs_extlen_t XFS_WRITE_ALLOC_TRANSACTION_BLOCKS = 16384;  // up to 64 MiB at 4 KiB blocks
 constexpr size_t XFS_BUFFERED_WRITE_BATCH_MAX_BYTES = size_t{2} * 1024 * 1024;
 constexpr size_t XFS_DIRTY_THROTTLE_INTERVAL_BYTES = XFS_BUFFERED_WRITE_BATCH_MAX_BYTES;
 constexpr size_t XFS_STREAM_PREALLOC_TRIGGER_BYTES = size_t{2} * 1024 * 1024;
@@ -238,8 +239,25 @@ auto xfs_hole_write_alloc_blocks(size_t write_pos, size_t block_off, size_t rema
         desired_blocks = std::max(desired_blocks, static_cast<xfs_filblks_t>(XFS_STREAM_PREALLOC_BLOCKS));
     }
     auto alloc_blocks = static_cast<xfs_extlen_t>(std::min(hole_blocks, desired_blocks));
-    alloc_blocks = std::min(alloc_blocks, XFS_WRITE_BATCH_BLOCKS);
+    alloc_blocks = std::min(alloc_blocks, XFS_WRITE_ALLOC_TRANSACTION_BLOCKS);
     return alloc_blocks == 0 ? 1 : alloc_blocks;
+}
+
+auto xfs_write_alloc_min_blocks(xfs_extlen_t max_blocks, bool extent_pressure, bool sequential_append) -> xfs_extlen_t {
+    if (max_blocks <= 1) {
+        return 1;
+    }
+    if (!extent_pressure && !sequential_append) {
+        return 1;
+    }
+    return std::max<xfs_extlen_t>(1, std::min(max_blocks, XFS_STREAM_PREALLOC_BLOCKS));
+}
+
+auto xfs_write_alloc_next_min_blocks(xfs_extlen_t min_blocks) -> xfs_extlen_t {
+    if (min_blocks <= 1) {
+        return 1;
+    }
+    return std::max<xfs_extlen_t>(1, min_blocks / 2);
 }
 
 auto xfs_mapped_append_can_zero_without_read(size_t write_pos, uint64_t file_size, size_t block_size) -> bool {
@@ -264,31 +282,34 @@ auto xfs_direct_read_target_dma_safe(const void* buffer) -> bool {
     return reinterpret_cast<uint64_t>(buffer) >= ker::mod::mm::addr::get_hhdm_offset();
 }
 
+void xfs_set_alloc_hint_from_fsb(XfsMountContext* ctx, xfs_fsblock_t fsb, XfsAllocReq* req) {
+    if (ctx == nullptr || req == nullptr || fsb == NULLFSBLOCK) {
+        return;
+    }
+
+    xfs_agnumber_t const AGNO = xfs_ag_number(fsb, ctx->ag_blk_log);
+    xfs_agblock_t const AGBNO = xfs_ag_block(fsb, ctx->ag_blk_log);
+    if (AGNO < ctx->ag_count && AGBNO < ctx->ag_blocks) {
+        req->agno = AGNO;
+        req->agbno = AGBNO;
+    }
+}
+
 void xfs_set_sequential_alloc_hint(XfsInode* ip, XfsMountContext* ctx, xfs_fileoff_t file_block, XfsAllocReq* req) {
-    if (ip == nullptr || ctx == nullptr || req == nullptr || ip->data_fork.format != XFS_DINODE_FMT_EXTENTS) {
+    if (ip == nullptr || ctx == nullptr || req == nullptr || file_block == 0) {
         return;
     }
 
-    XfsIforkExtents const& extents = ip->data_fork.extents;
-    if (extents.list == nullptr || extents.count == 0) {
+    XfsBmapResult prev{};
+    if (xfs_bmap_lookup(ip, file_block - 1, &prev) != 0 || prev.is_hole || prev.startblock == NULLFSBLOCK) {
         return;
     }
 
-    for (uint32_t i = extents.count; i > 0; --i) {
-        XfsBmbtIrec const& ext = extents.list[i - 1];
-        if (ext.br_startoff + ext.br_blockcount != file_block) {
-            continue;
-        }
-
-        xfs_fsblock_t const NEXT_FSB = ext.br_startblock + ext.br_blockcount;
-        xfs_agnumber_t const AGNO = xfs_ag_number(NEXT_FSB, ctx->ag_blk_log);
-        xfs_agblock_t const AGBNO = xfs_ag_block(NEXT_FSB, ctx->ag_blk_log);
-        if (AGNO < ctx->ag_count && AGBNO < ctx->ag_blocks) {
-            req->agno = AGNO;
-            req->agbno = AGBNO;
-        }
+    xfs_fsblock_t const NEXT_FSB = prev.startblock + 1;
+    if (NEXT_FSB <= prev.startblock) {
         return;
     }
+    xfs_set_alloc_hint_from_fsb(ctx, NEXT_FSB, req);
 }
 
 auto xfs_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks) -> bool { return old_size != 0 || nblocks != 0; }
@@ -1154,13 +1175,24 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
             XfsAllocReq req{};
             req.agno = PREF_AG;
             req.agbno = 0;
-            req.minlen = 1;
             req.maxlen = HOLE_BLOCKS;
+            req.minlen = xfs_write_alloc_min_blocks(req.maxlen, EXTENT_PRESSURE, SEQUENTIAL_APPEND);
             req.alignment = 0;
             xfs_set_sequential_alloc_hint(ip, ctx, file_block, &req);
 
             XfsAllocResult alloc_result{};
-            ret = xfs_alloc_extent(ctx, tp, req, &alloc_result);
+            while (true) {
+                ret = xfs_alloc_extent(ctx, tp, req, &alloc_result);
+                if (ret != -ENOSPC || req.minlen == 1) {
+                    break;
+                }
+                xfs_extlen_t const NEXT_MINLEN = xfs_write_alloc_next_min_blocks(req.minlen);
+                if (NEXT_MINLEN >= req.minlen) {
+                    req.minlen = 1;
+                } else {
+                    req.minlen = NEXT_MINLEN;
+                }
+            }
             if (ret != 0) {
                 xfs_trans_cancel(tp);
                 perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ALLOC, PERF_ALLOC_STARTED_US, ret, 0);
@@ -1623,6 +1655,10 @@ void xfs_parent_path_cache_purge_mount(XfsMountContext* ctx) { xfs_parent_path_c
 auto xfs_selftest_hole_write_alloc_blocks(size_t block_off, size_t remaining_bytes, xfs_filblks_t hole_blocks, size_t block_size,
                                           uint32_t block_log, size_t write_pos, bool sequential_append) -> xfs_extlen_t {
     return xfs_hole_write_alloc_blocks(write_pos, block_off, remaining_bytes, hole_blocks, block_size, block_log, false, sequential_append);
+}
+
+auto xfs_selftest_write_alloc_min_blocks(xfs_extlen_t max_blocks, bool extent_pressure, bool sequential_append) -> xfs_extlen_t {
+    return xfs_write_alloc_min_blocks(max_blocks, extent_pressure, sequential_append);
 }
 
 auto xfs_selftest_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks) -> bool {

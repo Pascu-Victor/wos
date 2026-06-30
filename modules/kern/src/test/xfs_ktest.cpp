@@ -162,10 +162,22 @@ KTEST(XFS, HoleWriteStillCapsLargeAllocations) {
     constexpr size_t BLOCK_SIZE = 4096;
     constexpr uint32_t BLOCK_LOG = 12;
     constexpr size_t BIG_WRITE_BYTES = size_t{512} * 1024 * 1024;
+    constexpr ker::vfs::xfs::xfs_extlen_t MAX_TRANSACTION_BLOCKS = 16384;
     constexpr ker::vfs::xfs::xfs_filblks_t UNBOUNDED_HOLE = ~static_cast<ker::vfs::xfs::xfs_filblks_t>(0);
 
     KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_hole_write_alloc_blocks(0, BIG_WRITE_BYTES, UNBOUNDED_HOLE, BLOCK_SIZE, BLOCK_LOG),
-               static_cast<ker::vfs::xfs::xfs_extlen_t>(65536));
+               MAX_TRANSACTION_BLOCKS);
+}
+
+KTEST(XFS, StreamWritesPreferContiguousAllocationRuns) {
+    constexpr ker::vfs::xfs::xfs_extlen_t STREAM_BLOCKS = 1024;
+    constexpr ker::vfs::xfs::xfs_extlen_t SMALL_RUN = 32;
+    constexpr ker::vfs::xfs::xfs_extlen_t LARGE_RUN = 16384;
+
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_write_alloc_min_blocks(LARGE_RUN), static_cast<ker::vfs::xfs::xfs_extlen_t>(1));
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_write_alloc_min_blocks(LARGE_RUN, true), STREAM_BLOCKS);
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_write_alloc_min_blocks(LARGE_RUN, false, true), STREAM_BLOCKS);
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_write_alloc_min_blocks(SMALL_RUN, false, true), SMALL_RUN);
 }
 
 KTEST(XFS, TruncateZeroResetsStaleDataFork) {

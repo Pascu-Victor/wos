@@ -60,6 +60,8 @@ auto xfs_collect_swap_extents(File* f, ker::mod::mm::swap::SwapExtent** extents_
 #ifdef WOS_SELFTEST
 auto xfs_selftest_hole_write_alloc_blocks(size_t block_off, size_t remaining_bytes, xfs_filblks_t hole_blocks, size_t block_size,
                                           uint32_t block_log, size_t write_pos = 0, bool sequential_append = false) -> xfs_extlen_t;
+auto xfs_selftest_write_alloc_min_blocks(xfs_extlen_t max_blocks, bool extent_pressure = false, bool sequential_append = false)
+    -> xfs_extlen_t;
 auto xfs_selftest_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks) -> bool;
 auto xfs_selftest_close_should_trim_prealloc(int open_flags, bool created_by_open = false, bool may_have_eof_prealloc = false) -> bool;
 auto xfs_selftest_close_should_commit_inode(bool close_may_need_inode_commit, int open_flags, bool created_by_open = false,

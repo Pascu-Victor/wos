@@ -21,6 +21,20 @@
 
 namespace ker::vfs::xfs {
 
+namespace {
+
+void xfs_trans_mark_overflowed(XfsTransaction* tp) {
+    if (tp == nullptr) {
+        return;
+    }
+    if (!tp->overflowed) {
+        mod::dbg::log("[xfs trans] too many items in transaction (%d max)", XFS_TRANS_MAX_ITEMS);
+    }
+    tp->overflowed = true;
+}
+
+}  // namespace
+
 auto xfs_trans_alloc(XfsMountContext* mount) -> XfsTransaction* {
     if (mount == nullptr) {
         return nullptr;
@@ -37,6 +51,9 @@ auto xfs_trans_alloc(XfsMountContext* mount) -> XfsTransaction* {
 
 void xfs_trans_log_buf(XfsTransaction* tp, BufHead* bp, uint32_t offset, uint32_t len) {
     if (tp == nullptr || bp == nullptr) {
+        return;
+    }
+    if (tp->overflowed) {
         return;
     }
 
@@ -81,7 +98,7 @@ void xfs_trans_log_buf(XfsTransaction* tp, BufHead* bp, uint32_t offset, uint32_
     }
 
     if (tp->item_count >= XFS_TRANS_MAX_ITEMS) {
-        mod::dbg::log("[xfs trans] too many items in transaction");
+        xfs_trans_mark_overflowed(tp);
         return;
     }
 
@@ -109,6 +126,9 @@ void xfs_trans_log_inode(XfsTransaction* tp, XfsInode* ip) {
     if (tp == nullptr || ip == nullptr) {
         return;
     }
+    if (tp->overflowed) {
+        return;
+    }
 
     // Check if already logged
     for (int i = 0; i < tp->item_count; i++) {
@@ -119,7 +139,7 @@ void xfs_trans_log_inode(XfsTransaction* tp, XfsInode* ip) {
     }
 
     if (tp->item_count >= XFS_TRANS_MAX_ITEMS) {
-        mod::dbg::log("[xfs trans] too many items in transaction");
+        xfs_trans_mark_overflowed(tp);
         return;
     }
 
@@ -135,6 +155,11 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
     if (tp->committed || tp->cancelled) {
         return -EINVAL;
     }
+    if (tp->overflowed) {
+        mod::dbg::log("[xfs trans] refusing to commit overfull transaction");
+        xfs_trans_cancel(tp);
+        return -EFBIG;
+    }
 
     // Phase 1: Write dirty inodes back to their buffers so the buffer
     // data is up-to-date before we write the log record.
@@ -144,8 +169,15 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
             int const WRC = xfs_inode_write(item.inode.ip, tp);
             if (WRC != 0) {
                 mod::dbg::log("[xfs trans] inode %lu write-back failed: %d", static_cast<unsigned long>(item.inode.ip->ino), WRC);
+                xfs_trans_cancel(tp);
+                return WRC;
             }
         }
+    }
+    if (tp->overflowed) {
+        mod::dbg::log("[xfs trans] refusing to commit transaction after inode write-back overflow");
+        xfs_trans_cancel(tp);
+        return -EFBIG;
     }
 
     // Phase 2: Write-ahead log - serialize all buffer modifications to the
