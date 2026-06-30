@@ -4519,7 +4519,10 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
             }
             auto* pfd = static_cast<ker::vfs::procfs::ProcFileData*>(f->private_data);
             bool const IS_SYMLINK = (pfd != nullptr && (pfd->node.type == ker::vfs::procfs::ProcNodeType::SELF_LINK ||
-                                                        pfd->node.type == ker::vfs::procfs::ProcNodeType::EXE_LINK));
+                                                        pfd->node.type == ker::vfs::procfs::ProcNodeType::EXE_LINK ||
+                                                        pfd->node.type == ker::vfs::procfs::ProcNodeType::CWD_LINK ||
+                                                        pfd->node.type == ker::vfs::procfs::ProcNodeType::ROOT_LINK ||
+                                                        pfd->node.type == ker::vfs::procfs::ProcNodeType::FD_LINK));
             if (!IS_SYMLINK) {
                 ker::vfs::procfs::get_procfs_fops()->vfs_close(f);
                 delete f;

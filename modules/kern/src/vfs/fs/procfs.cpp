@@ -245,12 +245,117 @@ auto find_task_in_group_safe(uint64_t group_pid, uint64_t tid) -> ProcTask* {
     return task;
 }
 
+auto task_fd_file_retain(ProcTask* task, uint64_t fd) -> File* {
+    if (task == nullptr || fd >= ker::mod::sched::task::Task::FD_TABLE_SIZE) {
+        return nullptr;
+    }
+    return ker::vfs::vfs_get_file_retain(task, static_cast<int>(fd));
+}
+
+auto task_fd_exists(uint64_t pid, uint64_t fd) -> bool {
+    auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
+    if (task == nullptr) {
+        return false;
+    }
+    auto* file = task_fd_file_retain(task, fd);
+    if (file != nullptr) {
+        ker::vfs::vfs_put_file(file);
+    }
+    task->release();
+    return file != nullptr;
+}
+
+auto task_fd_at(uint64_t pid, size_t index, uint64_t& fd_out) -> bool {
+    auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
+    if (task == nullptr) {
+        return false;
+    }
+
+    size_t seen = 0;
+    bool found = false;
+    uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
+    for (uint64_t fd = 0; fd < ker::mod::sched::task::Task::FD_TABLE_SIZE; ++fd) {
+        if (task->fd_table.lookup(fd) == nullptr) {
+            continue;
+        }
+        if (seen == index) {
+            fd_out = fd;
+            found = true;
+            break;
+        }
+        seen++;
+    }
+    task->fd_table_lock.unlock_irqrestore(IRQF);
+    task->release();
+    return found;
+}
+
+auto parse_fd_component(const char* s, uint64_t& fd_out) -> bool {
+    if (s == nullptr || s[0] == '\0') {
+        return false;
+    }
+    uint64_t fd = 0;
+    for (const char* p = s; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+        auto const DIGIT = static_cast<uint64_t>(*p - '0');
+        if (fd > (UINT64_MAX - DIGIT) / 10) {
+            return false;
+        }
+        fd = (fd * 10) + DIGIT;
+    }
+    if (fd >= ker::mod::sched::task::Task::FD_TABLE_SIZE) {
+        return false;
+    }
+    fd_out = fd;
+    return true;
+}
+
+auto procfs_copy_link_target(const char* target, char* buf, size_t bufsz) -> ssize_t {
+    if (target == nullptr) {
+        return -ENOENT;
+    }
+    size_t len = std::strlen(target);
+    len = std::min(len, bufsz);
+    for (size_t i = 0; i < len; ++i) {
+        buf[i] = target[i];
+    }
+    return static_cast<ssize_t>(len);
+}
+
+auto procfs_copy_task_visible_path(const ProcTask& task, const char* path, char* buf, size_t bufsz) -> ssize_t {
+    if (path == nullptr || path[0] == '\0') {
+        return -ENOENT;
+    }
+
+    const char* target = path;
+    size_t const ROOT_LEN = std::strlen(task.root.data());
+    size_t const PATH_LEN = std::strlen(path);
+    if (ROOT_LEN > 1 && PATH_LEN >= ROOT_LEN && std::strncmp(path, task.root.data(), ROOT_LEN) == 0 &&
+        (path[ROOT_LEN] == '\0' || path[ROOT_LEN] == '/')) {
+        target = path + ROOT_LEN;
+        if (target[0] == '\0') {
+            target = "/";
+        }
+    }
+    return procfs_copy_link_target(target, buf, bufsz);
+}
+
 void fill_numeric_dirent(DirEntry* buf, size_t count, uint64_t pid) {
     buf->d_ino = pid + 100;
     buf->d_off = count + 1;
     buf->d_reclen = sizeof(DirEntry);
     buf->d_type = DT_DIR;
     int_to_str(pid, buf->d_name.data(), buf->d_name.size());
+}
+
+void fill_fd_dirent(DirEntry* buf, size_t count, uint64_t fd) {
+    buf->d_ino = 100000 + fd;
+    buf->d_off = count + 1;
+    buf->d_reclen = sizeof(DirEntry);
+    buf->d_type = DT_LNK;
+    int_to_str(fd, buf->d_name.data(), buf->d_name.size());
 }
 
 auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
@@ -371,8 +476,9 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
 
     if (pfd->node.type == ProcNodeType::PID_DIR || pfd->node.type == ProcNodeType::TASK_TID_DIR) {
         // /proc/<pid> and /proc/<pid>/task/<tid>: index 2 = "stat", 3 = "status", 4 = "statm",
-        // 5 = "cmdline", 6 = "exe", 7 = "wki_launcher", 8 = "wki_runner", 9 = "wki_remote_pid",
-        // 10 = "maps". Top-level process dirs additionally expose "task" at index 11.
+        // 5 = "cmdline", 6 = "exe", 7 = "cwd", 8 = "root", 9 = "fd", 10 = "wki_launcher",
+        // 11 = "wki_runner", 12 = "wki_remote_pid", 13 = "maps". Top-level process dirs
+        // additionally expose "task" at index 14.
         if (count == 2) {
             buf->d_ino = 10;
             buf->d_off = 3;
@@ -414,46 +520,79 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             return 0;
         }
         if (count == 7) {
-            buf->d_ino = 15;
+            buf->d_ino = 24;
             buf->d_off = 8;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_LNK;
+            std::memcpy(buf->d_name.data(), "cwd", 4);
+            return 0;
+        }
+        if (count == 8) {
+            buf->d_ino = 25;
+            buf->d_off = 9;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_LNK;
+            std::memcpy(buf->d_name.data(), "root", 5);
+            return 0;
+        }
+        if (count == 9) {
+            buf->d_ino = 26;
+            buf->d_off = 10;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_DIR;
+            std::memcpy(buf->d_name.data(), "fd", 3);
+            return 0;
+        }
+        if (count == 10) {
+            buf->d_ino = 15;
+            buf->d_off = 11;
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "wki_launcher", 13);
             return 0;
         }
-        if (count == 8) {
+        if (count == 11) {
             buf->d_ino = 16;
-            buf->d_off = 9;
+            buf->d_off = 12;
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "wki_runner", 11);
             return 0;
         }
-        if (count == 9) {
+        if (count == 12) {
             buf->d_ino = 17;
-            buf->d_off = 10;
+            buf->d_off = 13;
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "wki_remote_pid", 15);
             return 0;
         }
-        if (count == 10) {
+        if (count == 13) {
             buf->d_ino = 18;
-            buf->d_off = 11;
+            buf->d_off = 14;
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "maps", 5);
             return 0;
         }
-        if (pfd->node.type == ProcNodeType::PID_DIR && count == 11) {
+        if (pfd->node.type == ProcNodeType::PID_DIR && count == 14) {
             buf->d_ino = 19;
-            buf->d_off = 12;
+            buf->d_off = 15;
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_DIR;
             std::memcpy(buf->d_name.data(), "task", 5);
             return 0;
         }
         return -ENOENT;  // No more entries
+    }
+
+    if (pfd->node.type == ProcNodeType::FD_DIR) {
+        uint64_t fd = 0;
+        if (!task_fd_at(pfd->node.pid, count - 2, fd)) {
+            return -ENOENT;
+        }
+        fill_fd_dirent(buf, count, fd);
+        return 0;
     }
 
     if (pfd->node.type == ProcNodeType::TASK_DIR) {
@@ -4219,11 +4358,12 @@ auto procfs_lseek(File* f, off_t offset, int whence) -> off_t {
 }
 
 auto procfs_readlink(File* f, char* buf, size_t bufsz) -> ssize_t {
-    if (f == nullptr || f->private_data == nullptr) {
+    if (f == nullptr || f->private_data == nullptr || buf == nullptr) {
         return -EINVAL;
     }
     auto* pfd = static_cast<ProcFileData*>(f->private_data);
-    if (pfd->node.type != ProcNodeType::EXE_LINK && pfd->node.type != ProcNodeType::SELF_LINK) {
+    if (pfd->node.type != ProcNodeType::EXE_LINK && pfd->node.type != ProcNodeType::SELF_LINK && pfd->node.type != ProcNodeType::CWD_LINK &&
+        pfd->node.type != ProcNodeType::ROOT_LINK && pfd->node.type != ProcNodeType::FD_LINK) {
         return -EINVAL;
     }
 
@@ -4247,15 +4387,53 @@ auto procfs_readlink(File* f, char* buf, size_t bufsz) -> ssize_t {
         return static_cast<ssize_t>(len);
     }
 
-    // EXE_LINK
-    auto* task = ker::mod::sched::find_task_by_pid(pfd->node.pid);
+    auto* task = ker::mod::sched::find_task_by_pid_safe(pfd->node.pid);
     if (task == nullptr) {
         return -ESRCH;
     }
-    size_t len = strlen(task->exe_path.data());
-    len = std::min(len, bufsz);
-    memcpy(buf, task->exe_path.data(), len);
-    return static_cast<ssize_t>(len);
+
+    if (pfd->node.type == ProcNodeType::EXE_LINK) {
+        ssize_t const RET = procfs_copy_link_target(task->exe_path.data(), buf, bufsz);
+        task->release();
+        return RET;
+    }
+    if (pfd->node.type == ProcNodeType::CWD_LINK) {
+        ssize_t const RET = procfs_copy_link_target(task->cwd.data(), buf, bufsz);
+        task->release();
+        return RET;
+    }
+    if (pfd->node.type == ProcNodeType::ROOT_LINK) {
+        ssize_t const RET = procfs_copy_link_target(task->root.data(), buf, bufsz);
+        task->release();
+        return RET;
+    }
+
+    auto* file = task_fd_file_retain(task, pfd->node.fd);
+    if (file == nullptr) {
+        task->release();
+        return -ENOENT;
+    }
+
+    ssize_t ret = 0;
+    if (file->vfs_path != nullptr && file->vfs_path[0] != '\0') {
+        ret = procfs_copy_task_visible_path(*task, file->vfs_path, buf, bufsz);
+    } else {
+        std::array<char, 64> fallback{};
+        if (ker::vfs::vfs_is_pipe_file(file)) {
+            std::snprintf(fallback.data(), fallback.size(), "pipe:[%llu]", static_cast<unsigned long long>(pfd->node.fd));
+        } else if (ker::vfs::vfs_is_socket_file(file)) {
+            std::snprintf(fallback.data(), fallback.size(), "socket:[%llu]", static_cast<unsigned long long>(pfd->node.fd));
+        } else if (ker::vfs::vfs_is_epoll_file(file)) {
+            std::snprintf(fallback.data(), fallback.size(), "anon_inode:[eventpoll]");
+        } else {
+            std::snprintf(fallback.data(), fallback.size(), "anon_inode:[%llu]", static_cast<unsigned long long>(pfd->node.fd));
+        }
+        ret = procfs_copy_link_target(fallback.data(), buf, bufsz);
+    }
+
+    ker::vfs::vfs_put_file(file);
+    task->release();
+    return ret;
 }
 
 FileOperations procfs_fops_instance = {
@@ -4347,7 +4525,9 @@ auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id) -> int {
 
     if (f->is_directory) {
         statbuf->st_mode = S_IFDIR | 0555;
-    } else if (pfd->node.type == ProcNodeType::EXE_LINK || pfd->node.type == ProcNodeType::SELF_LINK) {
+    } else if (pfd->node.type == ProcNodeType::EXE_LINK || pfd->node.type == ProcNodeType::SELF_LINK ||
+               pfd->node.type == ProcNodeType::CWD_LINK || pfd->node.type == ProcNodeType::ROOT_LINK ||
+               pfd->node.type == ProcNodeType::FD_LINK) {
         statbuf->st_mode = S_IFLNK | 0777;
     } else if (pfd->node.type == ProcNodeType::KPERFCTL_FILE || pfd->node.type == ProcNodeType::MEMACC_TRACK_PAGE_CALLERS_FILE ||
                pfd->node.type == ProcNodeType::MEMACC_TRACK_KMALLOC_DEBUG_FILE ||
@@ -4383,10 +4563,11 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     auto* task = ker::mod::sched::get_current_task();
     uint64_t const SELF_PID = (task != nullptr) ? ker::mod::sched::task::process_pid(*task) : 0;
 
-    auto make_file = [](ProcNodeType type, uint64_t pid, bool is_dir, bool thread_view = false) -> File* {
+    auto make_file = [](ProcNodeType type, uint64_t pid, bool is_dir, bool thread_view = false, uint64_t fd = 0) -> File* {
         auto* pfd = new ProcFileData;
         pfd->node.type = type;
         pfd->node.pid = pid;
+        pfd->node.fd = fd;
         pfd->node.thread_view = thread_view;
         pfd->content = nullptr;
         pfd->content_len = 0;
@@ -4408,6 +4589,13 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
         }
         task->release();
         return true;
+    };
+    auto make_fd_link = [&](uint64_t pid, const char* fd_text) -> File* {
+        uint64_t fd = 0;
+        if (!parse_fd_component(fd_text, fd) || !task_fd_exists(pid, fd)) {
+            return nullptr;
+        }
+        return make_file(ProcNodeType::FD_LINK, pid, false, false, fd);
     };
     auto open_task_subpath = [&](uint64_t group_pid, const char* subpath) -> File* {
         if (subpath == nullptr || *subpath == '\0') {
@@ -4448,6 +4636,18 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
         const char* task_sub = slash + 1;
         if (strcmp(task_sub, "exe") == 0) {
             return make_file(ProcNodeType::EXE_LINK, TID_VALUE, false);
+        }
+        if (strcmp(task_sub, "cwd") == 0) {
+            return make_file(ProcNodeType::CWD_LINK, TID_VALUE, false);
+        }
+        if (strcmp(task_sub, "root") == 0) {
+            return make_file(ProcNodeType::ROOT_LINK, TID_VALUE, false);
+        }
+        if (strcmp(task_sub, "fd") == 0) {
+            return make_file(ProcNodeType::FD_DIR, TID_VALUE, true);
+        }
+        if (strncmp(task_sub, "fd/", 3) == 0) {
+            return make_fd_link(TID_VALUE, task_sub + 3);
         }
         if (strcmp(task_sub, "status") == 0) {
             return make_file(ProcNodeType::STATUS_FILE, TID_VALUE, false, true);
@@ -4627,6 +4827,21 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     if (strcmp(path, "self/exe") == 0) {
         return make_file(ProcNodeType::EXE_LINK, SELF_PID, false);
     }
+    // /proc/self/cwd
+    if (strcmp(path, "self/cwd") == 0) {
+        return make_file(ProcNodeType::CWD_LINK, SELF_PID, false);
+    }
+    // /proc/self/root
+    if (strcmp(path, "self/root") == 0) {
+        return make_file(ProcNodeType::ROOT_LINK, SELF_PID, false);
+    }
+    // /proc/self/fd[/<fd>]
+    if (strcmp(path, "self/fd") == 0) {
+        return make_file(ProcNodeType::FD_DIR, SELF_PID, true);
+    }
+    if (strncmp(path, "self/fd/", 8) == 0) {
+        return make_fd_link(SELF_PID, path + 8);
+    }
     // /proc/self/status
     if (strcmp(path, "self/status") == 0) {
         return make_file(ProcNodeType::STATUS_FILE, SELF_PID, false);
@@ -4719,6 +4934,18 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     }
     if (strcmp(sub, "exe") == 0) {
         return make_file(ProcNodeType::EXE_LINK, static_cast<uint64_t>(PID), false);
+    }
+    if (strcmp(sub, "cwd") == 0) {
+        return make_file(ProcNodeType::CWD_LINK, static_cast<uint64_t>(PID), false);
+    }
+    if (strcmp(sub, "root") == 0) {
+        return make_file(ProcNodeType::ROOT_LINK, static_cast<uint64_t>(PID), false);
+    }
+    if (strcmp(sub, "fd") == 0) {
+        return make_file(ProcNodeType::FD_DIR, static_cast<uint64_t>(PID), true);
+    }
+    if (strncmp(sub, "fd/", 3) == 0) {
+        return make_fd_link(static_cast<uint64_t>(PID), sub + 3);
     }
     if (strcmp(sub, "status") == 0) {
         return make_file(ProcNodeType::STATUS_FILE, static_cast<uint64_t>(PID), false);

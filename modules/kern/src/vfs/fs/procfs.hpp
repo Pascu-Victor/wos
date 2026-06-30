@@ -16,6 +16,10 @@ enum class ProcNodeType : uint8_t {
     TASK_TID_DIR,         // /proc/<pid>/task/<tid>
     SELF_LINK,            // /proc/self -> /proc/<pid>
     EXE_LINK,             // /proc/<pid>/exe -> exe_path
+    CWD_LINK,             // /proc/<pid>/cwd -> cwd
+    ROOT_LINK,            // /proc/<pid>/root -> root
+    FD_DIR,               // /proc/<pid>/fd
+    FD_LINK,              // /proc/<pid>/fd/<fd> -> open file path
     STATUS_FILE,          // /proc/<pid>/status
     MOUNTS_FILE,          // /proc/mounts
     STAT_FILE,            // /proc/<pid>/stat
@@ -63,6 +67,7 @@ enum class ProcNodeType : uint8_t {
 struct ProcNode {
     ProcNodeType type;
     uint64_t pid;  // process ID, task ID, or thread-group ID depending on node type
+    uint64_t fd;
     bool thread_view;
 };
 
