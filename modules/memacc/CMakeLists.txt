@@ -15,7 +15,17 @@ include_directories(
     ${WOS_MODULES_DIR}/stdlib/src
 )
 
-add_executable(memacc src/main.cpp)
+set(SOURCES
+    src/commands.cpp
+    src/main.cpp
+    src/options.cpp
+    src/processes.cpp
+    src/procfs_io.cpp
+    src/reports.cpp
+    src/rows.cpp
+)
+
+add_executable(memacc ${SOURCES})
 
 set_target_properties(memacc PROPERTIES
     LINK_FLAGS "-Wl,-z,now -Wl,--no-dynamic-linker"

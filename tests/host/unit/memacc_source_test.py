@@ -5,7 +5,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-MEMACC_CPP = ROOT / "modules" / "memacc" / "src" / "main.cpp"
+MEMACC_IO_CPP = ROOT / "modules" / "memacc" / "src" / "procfs_io.cpp"
+MEMACC_IO_HPP = ROOT / "modules" / "memacc" / "src" / "procfs_io.hpp"
 
 
 def fail(message: str) -> None:
@@ -41,9 +42,10 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
 
 
 def test_memacc_reads_are_byte_capped() -> None:
-    source = MEMACC_CPP.read_text()
+    source = MEMACC_IO_CPP.read_text()
+    header = MEMACC_IO_HPP.read_text()
     require_tokens(
-        source,
+        header,
         [
             "READ_CHUNK_CAPACITY",
             "MEMACC_READ_LIMIT",
