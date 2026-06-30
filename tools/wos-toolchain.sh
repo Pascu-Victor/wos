@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build the WOS target toolchain: sysroot, compiler-rt, mlibc, libc++, busybox,
-# dropbear, GNU make, Ninja, CMake, Python, Meson, NASM, OpenSSL, curl, and Git.
+# dropbear, GNU make, Bash, Ninja, CMake, Python, Meson, NASM, OpenSSL, curl,
+# Git, and native WOS clang/lld.
 # Requires host-toolchain.sh to have been run first.
 #
 # Layout:
@@ -412,8 +413,16 @@ WOS_SYSROOT_PATH="$SYSROOT" \
     "$B/../scripts/build/build_make.sh"
 echo "=== Phase 9 complete: GNU make ==="
 
-# 10. Build Ninja for WOS userspace
-echo "=== Phase 10: Ninja for WOS userspace ==="
+# 10. Build Bash for WOS userspace
+echo "=== Phase 10: Bash for WOS userspace ==="
+WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_BASH_SOURCE_DIR="$B/src/bash" \
+    WOS_BASH_BUILD_DIR="$B/bash-build" \
+    "$B/../scripts/build/build_bash_for_wos.sh"
+echo "=== Phase 10 complete: Bash ==="
+
+# 11. Build Ninja for WOS userspace
+echo "=== Phase 11: Ninja for WOS userspace ==="
 cd "$B/src"
 if [ ! -f ninja/CMakeLists.txt ]; then
     if [ -d "$WORKSPACE_ROOT/.git" ]; then
@@ -427,10 +436,10 @@ fi
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_NINJA_BUILD_DIR="$B/ninja-build" \
     "$B/../scripts/build/build_ninja_for_wos.sh"
-echo "=== Phase 10 complete: Ninja ==="
+echo "=== Phase 11 complete: Ninja ==="
 
-# 11. Build CMake for WOS userspace
-echo "=== Phase 11: CMake for WOS userspace ==="
+# 12. Build CMake for WOS userspace
+echo "=== Phase 12: CMake for WOS userspace ==="
 cd "$B/src"
 if [ ! -f cmake/CMakeLists.txt ]; then
     if [ -d "$WORKSPACE_ROOT/.git" ]; then
@@ -444,10 +453,10 @@ fi
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_CMAKE_FOR_WOS_BUILD_DIR="$B/cmake-wos-build" \
     "$B/../scripts/build/build_cmake_for_wos.sh"
-echo "=== Phase 11 complete: CMake ==="
+echo "=== Phase 12 complete: CMake ==="
 
-# 12. Build CPython for WOS userspace
-echo "=== Phase 12: CPython for WOS userspace ==="
+# 13. Build CPython for WOS userspace
+echo "=== Phase 13: CPython for WOS userspace ==="
 cd "$B/src"
 PYTHON_GIT_BRANCH="${WOS_PYTHON_GIT_BRANCH:-wos-support}"
 if [ ! -f python/configure ]; then
@@ -463,18 +472,18 @@ WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_PYTHON_SOURCE_DIR="$B/src/python" \
     WOS_PYTHON_BUILD_DIR="$B/python-build" \
     "$B/../scripts/build/build_python_for_wos.sh"
-echo "=== Phase 12 complete: CPython ==="
+echo "=== Phase 13 complete: CPython ==="
 
-# 13. Stage Meson for WOS userspace
-echo "=== Phase 13: Meson for WOS userspace ==="
+# 14. Stage Meson for WOS userspace
+echo "=== Phase 14: Meson for WOS userspace ==="
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_MESON_SOURCE_DIR="$B/src/meson" \
     WOS_MESON_BUILD_DIR="$B/meson-build" \
     "$B/../scripts/build/build_meson_for_wos.sh"
-echo "=== Phase 13 complete: Meson ==="
+echo "=== Phase 14 complete: Meson ==="
 
-# 14. Build NASM for WOS userspace
-echo "=== Phase 14: NASM for WOS userspace ==="
+# 15. Build NASM for WOS userspace
+echo "=== Phase 15: NASM for WOS userspace ==="
 cd "$B/src"
 NASM_GIT_BRANCH="${WOS_NASM_GIT_BRANCH:-wos-support}"
 if [ ! -f nasm/configure.ac ]; then
@@ -490,10 +499,10 @@ WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_NASM_SOURCE_DIR="$B/src/nasm" \
     WOS_NASM_BUILD_DIR="$B/nasm-build" \
     "$B/../scripts/build/build_nasm_for_wos.sh"
-echo "=== Phase 14 complete: NASM ==="
+echo "=== Phase 15 complete: NASM ==="
 
-# 15. Build zlib, OpenSSL, and curl for WOS userspace
-echo "=== Phase 15: zlib, OpenSSL, and curl for WOS userspace ==="
+# 16. Build zlib, OpenSSL, and curl for WOS userspace
+echo "=== Phase 16: zlib, OpenSSL, and curl for WOS userspace ==="
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_ZLIB_SOURCE_DIR="$B/src/zlib" \
     WOS_ZLIB_BUILD_DIR="$B/zlib-build" \
@@ -508,12 +517,19 @@ WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_CURL_SOURCE_DIR="$B/src/curl" \
     WOS_CURL_BUILD_DIR="$B/curl-build" \
     "$B/../scripts/build/build_curl_for_wos.sh"
-echo "=== Phase 15 complete: zlib, OpenSSL, and curl ==="
+echo "=== Phase 16 complete: zlib, OpenSSL, and curl ==="
 
-# 16. Build Git for WOS userspace
-echo "=== Phase 16: Git for WOS userspace ==="
+# 17. Build Git for WOS userspace
+echo "=== Phase 17: Git for WOS userspace ==="
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_GIT_SOURCE_DIR="$B/src/git" \
     WOS_GIT_BUILD_DIR="$B/git-build" \
     "$B/../scripts/build/build_git_for_wos.sh"
-echo "=== Phase 16 complete: Git ==="
+echo "=== Phase 17 complete: Git ==="
+
+# 18. Build clang/lld for WOS userspace
+echo "=== Phase 18: clang/lld for WOS userspace ==="
+WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_CLANG_FOR_WOS_BUILD_DIR="$B/clang-wos-build" \
+    "$B/../scripts/build/build_clang_for_wos.sh"
+echo "=== Phase 18 complete: clang/lld ==="
