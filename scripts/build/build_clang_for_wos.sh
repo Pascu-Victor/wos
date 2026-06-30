@@ -228,7 +228,10 @@ collect_wos_llvm_bin_outputs() {
     ' "$build_ninja" | sort -u
 }
 
-mapfile -t WOS_LLVM_BIN_OUTPUTS < <(collect_wos_llvm_bin_outputs)
+WOS_LLVM_BIN_OUTPUTS_LIST="$(mktemp)"
+trap 'rm -f "$WOS_LLVM_BIN_OUTPUTS_LIST"' EXIT
+collect_wos_llvm_bin_outputs > "$WOS_LLVM_BIN_OUTPUTS_LIST"
+mapfile -t WOS_LLVM_BIN_OUTPUTS < "$WOS_LLVM_BIN_OUTPUTS_LIST"
 if [ "${#WOS_LLVM_BIN_OUTPUTS[@]}" -eq 0 ]; then
     echo "ERROR: no native WOS LLVM tool outputs were discovered in $CLANG_BUILD/build.ninja" >&2
     exit 1

@@ -988,6 +988,8 @@ def test_native_wos_clang_port_stages_tablegen_for_next_self_host() -> None:
         ],
         "native WOS clang tool staging",
     )
+    if "< <(" in source:
+        fail("native WOS clang tool staging must not use Bash process substitution; WOS Bash rejects it")
 
 
 def test_busybox_and_dropbear_scripts_honor_host_toolchain_override() -> None:
