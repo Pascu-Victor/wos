@@ -1114,6 +1114,7 @@ def test_wos_tls_build_is_self_hostable_without_perl() -> None:
             "--disable-tests",
             "--disable-asm",
             "wos_make \"$WOS_MAKE_JOBS\" -C \"$TLS_WORK\"",
+            "SUBDIRS=\"include crypto ssl tls apps\"",
             "prefix= \\",
             "exec_prefix= \\",
             "includedir=/include \\",
