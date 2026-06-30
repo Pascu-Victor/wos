@@ -4562,6 +4562,70 @@ auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id) -> int {
     return 0;
 }
 
+auto procfs_open_fd_link_path(const char* path) -> File* {
+    if (path == nullptr) {
+        return nullptr;
+    }
+
+    while (*path == '/') {
+        path++;
+    }
+
+    uint64_t pid = 0;
+    const char* fd_text = nullptr;
+    if (std::strncmp(path, "self/fd/", 8) == 0) {
+        auto* task = ker::mod::sched::get_current_task();
+        if (task == nullptr) {
+            return nullptr;
+        }
+        pid = ker::mod::sched::task::process_pid(*task);
+        fd_text = path + 8;
+    } else {
+        const char* slash = nullptr;
+        for (const char* p = path; *p != 0; ++p) {
+            if (*p == '/') {
+                slash = p;
+                break;
+            }
+        }
+        if (slash == nullptr) {
+            return nullptr;
+        }
+
+        std::array<char, 24> pid_str{};
+        auto const PID_LEN = static_cast<size_t>(slash - path);
+        if (PID_LEN == 0 || PID_LEN >= pid_str.size()) {
+            return nullptr;
+        }
+        std::memcpy(pid_str.data(), path, PID_LEN);
+        pid_str[PID_LEN] = '\0';
+        int64_t const PID = parse_pid(pid_str.data());
+        if (PID < 0) {
+            return nullptr;
+        }
+
+        const char* subpath = slash + 1;
+        if (std::strncmp(subpath, "fd/", 3) != 0) {
+            return nullptr;
+        }
+        pid = static_cast<uint64_t>(PID);
+        fd_text = subpath + 3;
+    }
+
+    uint64_t fd = 0;
+    if (!parse_fd_component(fd_text, fd)) {
+        return nullptr;
+    }
+
+    auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
+    if (task == nullptr) {
+        return nullptr;
+    }
+    auto* file = task_fd_file_retain(task, fd);
+    task->release();
+    return file;
+}
+
 // --- Open a procfs path ---
 
 auto procfs_open_path(const char* path, int flags, int mode) -> File* {

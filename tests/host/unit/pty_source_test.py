@@ -9,6 +9,8 @@ PTY_CPP = ROOT / "modules" / "kern" / "src" / "dev" / "pty.cpp"
 DEVICE_HPP = ROOT / "modules" / "kern" / "src" / "dev" / "device.hpp"
 FILE_OPERATIONS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "file_operations.hpp"
 DEVFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "devfs.cpp"
+PROCFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.cpp"
+PROCFS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.hpp"
 SYS_NET_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "net" / "sys_net.cpp"
 EPOLL_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "epoll.cpp"
 VFS_CORE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "core.cpp"
@@ -239,12 +241,81 @@ def test_devfs_publishes_standard_fd_symlinks() -> None:
     )
 
 
+def test_procfs_fd_links_open_by_retaining_referenced_files() -> None:
+    procfs_header = PROCFS_HPP.read_text()
+    procfs_source = PROCFS_CPP.read_text()
+    vfs_core_source = VFS_CORE_CPP.read_text()
+    procfs_body = function_body(procfs_source, "procfs_open_fd_link_path")
+    vfs_helper_body = function_body(vfs_core_source, "vfs_try_open_procfs_fd_link")
+    vfs_open_body = function_body(vfs_core_source, "vfs_open")
+    vfs_open_file_body = function_body(vfs_core_source, "vfs_open_file_impl")
+
+    require_tokens(
+        procfs_header,
+        [
+            "auto procfs_open_fd_link_path(const char* path) -> File*;",
+        ],
+        "procfs fd-link open helper declaration",
+    )
+    require_tokens(
+        procfs_body,
+        [
+            'std::strncmp(path, "self/fd/", 8) == 0',
+            "parse_fd_component(fd_text, fd)",
+            "ker::mod::sched::find_task_by_pid_safe(pid)",
+            "task_fd_file_retain(task, fd)",
+            "task->release();",
+        ],
+        "procfs fd-link open helper",
+    )
+    require_tokens(
+        vfs_helper_body,
+        [
+            "resolve_symlinks(path, prefix_resolved.data(), prefix_resolved.size(), apply_task_policy, false)",
+            "mount->fs_type != FSType::PROCFS",
+            "strip_mount_prefix(mount, prefix_resolved.data())",
+            "procfs_open_fd_link_path(fs_relative_path)",
+        ],
+        "VFS procfs fd-link prefix resolver",
+    )
+    require_order(
+        vfs_open_body,
+        "vfs_try_open_procfs_fd_link(path_buffer.data(), !OPEN_LOCAL)",
+        "resolve_symlinks(path_buffer.data(), resolved.data(), resolved.size(), !OPEN_LOCAL",
+        "vfs_open should retain fd links before final symlink resolution",
+    )
+    require_tokens(
+        vfs_open_body,
+        [
+            "vfs_put_file(fd_link_file);",
+            "vfs_install_open_file(current, fd_link_file)",
+            "current->set_fd_cloexec(static_cast<unsigned>(FD));",
+        ],
+        "vfs_open direct fd-link install",
+    )
+    require_order(
+        vfs_open_file_body,
+        "vfs_try_open_procfs_fd_link(pathBuffer, apply_task_policy && !OPEN_LOCAL)",
+        "resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy && !OPEN_LOCAL",
+        "vfs_open_file_impl should retain fd links before final symlink resolution",
+    )
+    require_tokens(
+        vfs_open_file_body,
+        [
+            "vfs_put_file(fd_link_file);",
+            "return fd_link_file;",
+        ],
+        "vfs_open_file_impl direct fd-link return",
+    )
+
+
 def main() -> None:
     test_detached_pty_device_is_not_logged_as_pointer_corruption()
     test_pty_pair_detaches_only_after_both_sides_close()
     test_pty_waiter_wakes_preserve_deferred_switch_state()
     test_pty_poll_waits_publish_local_pty_wait_kind()
     test_devfs_publishes_standard_fd_symlinks()
+    test_procfs_fd_links_open_by_retaining_referenced_files()
     print("PTY source invariants hold")
 
 

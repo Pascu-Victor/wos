@@ -4733,6 +4733,27 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
 
     return -ELOOP;
 }
+
+auto vfs_try_open_procfs_fd_link(const char* path, bool apply_task_policy) -> File* {
+    if (path == nullptr) {
+        return nullptr;
+    }
+
+    std::array<char, MAX_PATH_LEN> prefix_resolved{};
+    int const RESOLVE_RET = resolve_symlinks(path, prefix_resolved.data(), prefix_resolved.size(), apply_task_policy, false);
+    if (RESOLVE_RET != 0) {
+        return nullptr;
+    }
+
+    auto mount_ref = find_mount_point(prefix_resolved.data());
+    MountPoint const* mount = mount_ref.get();
+    if (mount == nullptr || mount->fs_type != FSType::PROCFS) {
+        return nullptr;
+    }
+
+    const char* fs_relative_path = strip_mount_prefix(mount, prefix_resolved.data());
+    return ker::vfs::procfs::procfs_open_fd_link_path(fs_relative_path);
+}
 }  // namespace
 
 auto vfs_open(std::string_view path, int flags, int mode) -> int {
@@ -4785,6 +4806,30 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     bool const SKIP_FINAL_SYMLINK_PROBE = mount != nullptr && !REMOTE_MOUNT && !PATH_REQUIRES_DIRECTORY && !FLAGS_REQUIRE_DIRECTORY &&
                                           metadata_cache_proves_final_not_symlink(path_buffer.data(), mount->fs_type, mount->dev_id);
 
+    auto* current = ker::mod::sched::get_current_task();
+    if (current == nullptr) {
+        vfs_debug_log("vfs_open: no current task\n");
+        return -ESRCH;
+    }
+
+    if (!REMOTE_MOUNT) {
+        auto* fd_link_file = vfs_try_open_procfs_fd_link(path_buffer.data(), !OPEN_LOCAL);
+        if (fd_link_file != nullptr) {
+            if (PATH_REQUIRES_DIRECTORY || FLAGS_REQUIRE_DIRECTORY) {
+                vfs_put_file(fd_link_file);
+                return -ENOTDIR;
+            }
+            int const FD = vfs_install_open_file(current, fd_link_file);
+            if (FD < 0) {
+                return FD;
+            }
+            if ((flags & ker::vfs::O_CLOEXEC) != 0) {
+                current->set_fd_cloexec(static_cast<unsigned>(FD));
+            }
+            return FD;
+        }
+    }
+
     if (!REMOTE_MOUNT) {
         std::array<char, MAX_PATH_LEN> resolved{};
         int const RESOLVE_RET =
@@ -4800,12 +4845,6 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
         log_loader_path_event("symlink-resolved", raw_path.data(), path_buffer.data(), nullptr, RESOLVE_RET);
     } else {
         log_loader_path_event("symlink-deferred-remote", raw_path.data(), path_buffer.data(), mount, 0);
-    }
-
-    auto* current = ker::mod::sched::get_current_task();
-    if (current == nullptr) {
-        vfs_debug_log("vfs_open: no current task\n");
-        return -ESRCH;
     }
 
     int const ACCMODE = flags & 3;
@@ -9944,6 +9983,16 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
     bool const REMOTE_MOUNT = mount != nullptr && mount->fs_type == FSType::REMOTE;
     bool const SKIP_FINAL_SYMLINK_PROBE = mount != nullptr && !REMOTE_MOUNT && !PATH_REQUIRES_DIRECTORY && !FLAGS_REQUIRE_DIRECTORY &&
                                           metadata_cache_proves_final_not_symlink(pathBuffer, mount->fs_type, mount->dev_id);
+    if (!REMOTE_MOUNT) {
+        auto* fd_link_file = vfs_try_open_procfs_fd_link(pathBuffer, apply_task_policy && !OPEN_LOCAL);
+        if (fd_link_file != nullptr) {
+            if (PATH_REQUIRES_DIRECTORY || FLAGS_REQUIRE_DIRECTORY) {
+                vfs_put_file(fd_link_file);
+                return nullptr;
+            }
+            return fd_link_file;
+        }
+    }
     if (!REMOTE_MOUNT) {
         char resolved[MAX_PATH_LEN];  // NOLINT
         int const RESOLVE_RET =

@@ -83,6 +83,9 @@ void procfs_init();
 // Open a procfs path (relative to /proc mount)
 auto procfs_open_path(const char* path, int flags, int mode) -> File*;
 
+// Open /proc/<pid>/fd/<fd> by retaining the referenced open file.
+auto procfs_open_fd_link_path(const char* path) -> File*;
+
 // Fill stat metadata for an already-open procfs file.
 auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id) -> int;
 
