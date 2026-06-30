@@ -122,6 +122,37 @@ patch_config_sub_for_wos() {
     fi
 }
 
+patch_default_jobserver_for_wos() {
+    local source_dir="$1"
+    local posixos="$source_dir/src/posixos.c"
+    local marker="default to pipe jobserver on WOS"
+    local needle='  if (!style || strcmp (style, "fifo") == 0)'
+    local patched="$posixos.wos-jobserver.$$"
+
+    require_file "$posixos" "GNU make source is missing src/posixos.c."
+    if grep -q "$marker" "$posixos"; then
+        return 0
+    fi
+    if ! grep -qF "$needle" "$posixos"; then
+        echo "ERROR: do not know how to patch GNU make jobserver default in $posixos." >&2
+        exit 1
+    fi
+
+    echo "Patching GNU make to default to pipe jobserver on WOS..."
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ "$line" = "$needle" ]; then
+            printf '%s\n' "#if defined(__WOS__) /* $marker */"
+            printf '%s\n' '  if (style && strcmp (style, "fifo") == 0)'
+            printf '%s\n' "#else"
+            printf '%s\n' "$needle"
+            printf '%s\n' "#endif"
+        else
+            printf '%s\n' "$line"
+        fi
+    done <"$posixos" >"$patched"
+    mv "$patched" "$posixos"
+}
+
 rewrite_file_for_mtime() {
     local path="$1"
     local tmp="$path.wos-mtime.$$"
@@ -189,6 +220,7 @@ require_file "$TARGET_SYSROOT/lib/Scrt1.o" "Build mlibc startup objects before b
 MAKE_SOURCE_DIR="$(resolve_make_source)"
 ensure_make_configure "$MAKE_SOURCE_DIR"
 patch_config_sub_for_wos "$MAKE_SOURCE_DIR"
+patch_default_jobserver_for_wos "$MAKE_SOURCE_DIR"
 if [ "$HOST_SYSTEM" = "WOS" ]; then
     refresh_make_release_generated_files "$MAKE_SOURCE_DIR"
 fi

@@ -697,6 +697,28 @@ def test_gnu_make_script_passes_build_triplet_on_wos() -> None:
     )
 
 
+def test_gnu_make_defaults_to_pipe_jobserver_on_wos() -> None:
+    source = (ROOT / "scripts" / "build" / "build_make.sh").read_text()
+    require_tokens(
+        source,
+        [
+            "patch_default_jobserver_for_wos()",
+            'local posixos="$source_dir/src/posixos.c"',
+            "default to pipe jobserver on WOS",
+            'local needle=\'  if (!style || strcmp (style, "fifo") == 0)\'',
+            'local patched="$posixos.wos-jobserver.$$"',
+            'while IFS= read -r line || [ -n "$line" ]; do',
+            'if [ "$line" = "$needle" ]; then',
+            'if (style && strcmp (style, "fifo") == 0)',
+            'done <"$posixos" >"$patched"',
+            'mv "$patched" "$posixos"',
+            "Patching GNU make to default to pipe jobserver on WOS",
+            'patch_default_jobserver_for_wos "$MAKE_SOURCE_DIR"',
+        ],
+        "GNU make WOS default jobserver patch",
+    )
+
+
 def test_gnu_make_script_handles_native_wos_autoconf_probes() -> None:
     source = (ROOT / "scripts" / "build" / "build_make.sh").read_text()
     require_tokens(
@@ -1446,6 +1468,7 @@ if __name__ == "__main__":
     test_wos_tar_invocations_use_busybox_compatible_long_options()
     test_wos_source_copy_wrappers_avoid_busybox_tar_pipelines()
     test_gnu_make_script_passes_build_triplet_on_wos()
+    test_gnu_make_defaults_to_pipe_jobserver_on_wos()
     test_gnu_make_script_handles_native_wos_autoconf_probes()
     test_bash_script_falls_back_to_target_triplet_on_native_wos()
     test_nasm_script_uses_release_tarball_without_self_hosted_autogen()
