@@ -48,3 +48,6 @@ build_tests
 
 #not the benchmarks themselves!
 !tools/benchmarks
+
+#user specific agent rules
+.codex/rules/default.rules
