@@ -13,11 +13,16 @@ WOS_PROCESS_H = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "incl
 WOS_SYSDEPS_CPP = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "generic" / "sysdeps.cpp"
 WOS_MLIBC_CALLNUMS = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "callnums" / "process.h"
 WOS_SYSDEPS_H = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "mlibc" / "sysdeps.hpp"
-STRACE_MAIN = ROOT / "modules" / "strace" / "src" / "main.cpp"
+STRACE_SRC_DIR = ROOT / "modules" / "strace" / "src"
 
 
 def fail(message: str) -> None:
     raise AssertionError(message)
+
+
+def read_strace_source() -> str:
+    paths = [*sorted(STRACE_SRC_DIR.glob("*.cpp")), *sorted(STRACE_SRC_DIR.glob("*.hpp"))]
+    return "\n".join(path.read_text() for path in paths)
 
 
 def function_body(source: str, name: str) -> str:
@@ -185,7 +190,7 @@ def test_sigpending_is_wired_through_wos_sysdeps() -> None:
     wos_sysdeps_header = WOS_SYSDEPS_H.read_text()
     wos_process_header = WOS_PROCESS_H.read_text()
     wos_sysdeps = WOS_SYSDEPS_CPP.read_text()
-    strace_source = STRACE_MAIN.read_text()
+    strace_source = read_strace_source()
 
     require_tokens(
         process_callnums,

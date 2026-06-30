@@ -5,7 +5,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-WKICTL_MAIN = ROOT / "modules" / "wkictl" / "src" / "main.cpp"
+WKICTL_SRC_DIR = ROOT / "modules" / "wkictl" / "src"
+WKICTL_INCLUDE_DIR = ROOT / "modules" / "wkictl" / "include"
 ALIASES = ROOT / "configs" / "rootfs" / "aliases.tsv"
 PROCESS_HEADER = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "sys" / "process.h"
 VFS_HEADER = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "sys" / "vfs.h"
@@ -13,6 +14,11 @@ VFS_HEADER = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include
 
 def fail(message: str) -> None:
     raise AssertionError(message)
+
+
+def read_wkictl_source() -> str:
+    paths = [*sorted(WKICTL_SRC_DIR.glob("*.cpp")), *sorted(WKICTL_INCLUDE_DIR.rglob("*.hpp"))]
+    return "\n".join(path.read_text() for path in paths)
 
 
 def function_body(source: str, name: str) -> str:
@@ -57,7 +63,7 @@ def alias_targets() -> dict[str, tuple[str, str]]:
 
 
 def test_wkictl_installed_aliases_match_persona_dispatch() -> None:
-    source = WKICTL_MAIN.read_text()
+    source = read_wkictl_source()
     aliases = alias_targets()
     expected = {
         "/usr/bin/wkictl": ("copy", "build/modules/wkictl/wkictl"),
@@ -72,7 +78,7 @@ def test_wkictl_installed_aliases_match_persona_dispatch() -> None:
         if aliases.get(target) != wanted:
             fail(f"rootfs alias mismatch for {target}: got {aliases.get(target)!r}, expected {wanted!r}")
 
-    main_body = function_body(source, "main")
+    main_body = function_body(source, "run")
     require_tokens(
         main_body,
         [
@@ -90,7 +96,7 @@ def test_wkictl_installed_aliases_match_persona_dispatch() -> None:
 
 
 def test_wkictl_target_personas_set_expected_policy() -> None:
-    source = WKICTL_MAIN.read_text()
+    source = read_wkictl_source()
     run_locally = function_body(source, "run_locally")
     require_tokens(
         run_locally,
@@ -146,7 +152,7 @@ def test_wkictl_target_personas_set_expected_policy() -> None:
 
 
 def test_wkictl_vfs_forward_and_commands_use_wki_wrappers() -> None:
-    source = WKICTL_MAIN.read_text()
+    source = read_wkictl_source()
     forward_body = function_body(source, "run_forward")
     require_tokens(
         forward_body,

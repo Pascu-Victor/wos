@@ -20,11 +20,16 @@ MLIBC_SWAP_H = ROOT / "toolchain" / "src" / "mlibc" / "options" / "wos" / "inclu
 INIT_FSTAB = ROOT / "modules" / "init" / "src" / "fstab.cpp"
 PROCFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.cpp"
 MOUNT_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "mount.cpp"
-STRACE_CPP = ROOT / "modules" / "strace" / "src" / "main.cpp"
+STRACE_SRC_DIR = ROOT / "modules" / "strace" / "src"
 
 
 def fail(message: str) -> None:
     raise AssertionError(message)
+
+
+def read_strace_source() -> str:
+    paths = [*sorted(STRACE_SRC_DIR.glob("*.cpp")), *sorted(STRACE_SRC_DIR.glob("*.hpp"))]
+    return "\n".join(path.read_text() for path in paths)
 
 
 def function_body(source: str, name_pattern: str) -> str:
@@ -176,7 +181,7 @@ def test_swapon_swapoff_are_appended_kernel_and_mlibc_abi_ops() -> None:
     sysdeps_cpp = MLIBC_SYSDEPS_CPP.read_text()
     sysdeps_hpp = MLIBC_SYSDEPS_HPP.read_text()
     swap_h = MLIBC_SWAP_H.read_text()
-    strace = STRACE_CPP.read_text()
+    strace = read_strace_source()
 
     require_order(kernel_abi, "MSYNC,", "SWAPON,", "kernel VMEM ABI appends SWAPON after MSYNC")
     require_order(kernel_abi, "SWAPON,", "SWAPOFF,", "kernel VMEM ABI appends SWAPOFF after SWAPON")

@@ -5,11 +5,16 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-PERF_CPP = ROOT / "modules" / "perf" / "src" / "main.cpp"
+PERF_SRC_DIR = ROOT / "modules" / "perf" / "src"
 
 
 def fail(message: str) -> None:
     raise AssertionError(message)
+
+
+def read_perf_source() -> str:
+    paths = [*sorted(PERF_SRC_DIR.glob("*.cpp")), *sorted(PERF_SRC_DIR.glob("*.hpp"))]
+    return "\n".join(path.read_text() for path in paths)
 
 
 def function_body(source: str, name: str) -> str:
@@ -41,7 +46,7 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
 
 
 def test_perf_reads_are_byte_capped() -> None:
-    source = PERF_CPP.read_text()
+    source = read_perf_source()
     require_tokens(
         source,
         [
@@ -99,7 +104,7 @@ def test_perf_reads_are_byte_capped() -> None:
 
 
 def test_perf_run_waits_for_descendant_process_group() -> None:
-    source = PERF_CPP.read_text()
+    source = read_perf_source()
     cmd_run_body = function_body(source, "cmd_run")
     require_tokens(
         cmd_run_body,

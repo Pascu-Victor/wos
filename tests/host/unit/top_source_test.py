@@ -5,11 +5,17 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-TOP_CPP = ROOT / "modules" / "top" / "src" / "main.cpp"
+TOP_SRC_DIR = ROOT / "modules" / "top" / "src"
+TOP_INCLUDE_DIR = ROOT / "modules" / "top" / "include"
 
 
 def fail(message: str) -> None:
     raise AssertionError(message)
+
+
+def read_top_source() -> str:
+    paths = [*sorted(TOP_SRC_DIR.glob("*.cpp")), *sorted(TOP_INCLUDE_DIR.rglob("*.hpp"))]
+    return "\n".join(path.read_text() for path in paths)
 
 
 def function_body(source: str, name: str) -> str:
@@ -48,7 +54,7 @@ def require_order(source: str, first: str, second: str, context: str) -> None:
 
 
 def test_top_noninteractive_mode_is_one_shot_and_plain() -> None:
-    source = TOP_CPP.read_text()
+    source = read_top_source()
     require_tokens(
         source,
         [
@@ -82,14 +88,14 @@ def test_top_noninteractive_mode_is_one_shot_and_plain() -> None:
         "top render interactive gate",
     )
 
-    main_body = function_body(source, "main")
+    main_body = function_body(source, "run")
     require_order(main_body, "if (!INTERACTIVE)", "int remaining_ms = INTERVAL_MS;", "top one-shot exit before refresh wait")
     if "poll(&pfd, 1, WAIT_MS)" not in main_body:
         fail("top interactive mode should still poll for keyboard input")
 
 
 def test_top_input_shutdown_paths_quit_refresh_loop() -> None:
-    source = TOP_CPP.read_text()
+    source = read_top_source()
     require_tokens(
         source,
         [
@@ -112,7 +118,7 @@ def test_top_input_shutdown_paths_quit_refresh_loop() -> None:
         "top read_key EOF/error handling",
     )
 
-    main_body = function_body(source, "main")
+    main_body = function_body(source, "run")
     require_tokens(
         main_body,
         [
