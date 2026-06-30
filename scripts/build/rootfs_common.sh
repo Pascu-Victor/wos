@@ -234,7 +234,7 @@ rootfs_stage_etc() {
     mkdir -p "$ROOTFS_STAGING/etc/dropbear"
 
     cat > "$ROOTFS_STAGING/etc/passwd" <<'EOF'
-root:x:0:0:root:/root:/bin/bash
+root:!:0:0:root:/root:/bin/bash
 EOF
 
     cat > "$ROOTFS_STAGING/etc/group" <<'EOF'
