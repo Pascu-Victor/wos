@@ -3,7 +3,14 @@ project(netd_service CXX)
 
 set(TARGET netd)
 set(CXXFILES
+    src/config.cpp
+    src/daemon.cpp
+    src/dhcp.cpp
+    src/interface.cpp
     src/main.cpp
+    src/recv.cpp
+    src/resolver.cpp
+    src/time.cpp
     ../journal/src/journal_lib.cpp
 )
 
@@ -16,7 +23,13 @@ target_compile_options(${TARGET} PRIVATE
     -mcmodel=small
 )
 
-include_directories(src ../extern ../ ../extern/limine)
+target_include_directories(${TARGET} PRIVATE
+    include
+    src
+    ../extern
+    ../
+    ../extern/limine
+)
 
 set_target_properties(${TARGET} PROPERTIES
     POSITION_INDEPENDENT_CODE OFF

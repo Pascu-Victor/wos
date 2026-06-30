@@ -9,11 +9,17 @@ UDP_CPP = ROOT / "modules" / "kern" / "src" / "net" / "proto" / "udp.cpp"
 IPV4_CPP = ROOT / "modules" / "kern" / "src" / "net" / "proto" / "ipv4.cpp"
 IPV4_HPP = ROOT / "modules" / "kern" / "src" / "net" / "proto" / "ipv4.hpp"
 SYS_NET_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "net" / "sys_net.cpp"
-NETD_CPP = ROOT / "modules" / "netd" / "src" / "main.cpp"
+NETD_SRC_DIR = ROOT / "modules" / "netd" / "src"
+NETD_INCLUDE_DIR = ROOT / "modules" / "netd" / "include"
 
 
 def fail(message: str) -> None:
     raise AssertionError(message)
+
+
+def read_netd_source() -> str:
+    paths = [*sorted(NETD_SRC_DIR.glob("*.cpp")), *sorted(NETD_INCLUDE_DIR.rglob("*.hpp"))]
+    return "\n".join(path.read_text() for path in paths)
 
 
 def function_body(source: str, name: str) -> str:
@@ -285,7 +291,7 @@ def test_legacy_ipv4_ioctls_notify_wki_l3_state() -> None:
 
 
 def test_netd_lease_apply_fails_when_l3_ioctl_fails() -> None:
-    source = NETD_CPP.read_text()
+    source = read_netd_source()
     apply_lease = function_body(source, "apply_lease")
     require_order(
         apply_lease,

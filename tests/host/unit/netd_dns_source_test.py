@@ -5,13 +5,19 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-NETD_CPP = ROOT / "modules" / "netd" / "src" / "main.cpp"
+NETD_SRC_DIR = ROOT / "modules" / "netd" / "src"
+NETD_INCLUDE_DIR = ROOT / "modules" / "netd" / "include"
 ROOTFS_ALIASES = ROOT / "configs" / "rootfs" / "aliases.tsv"
 ROOTFS_RESOLV_CONF = ROOT / "configs" / "rootfs" / "etc" / "resolv.conf"
 
 
 def fail(message: str) -> None:
     raise AssertionError(message)
+
+
+def read_netd_source() -> str:
+    paths = [*sorted(NETD_SRC_DIR.glob("*.cpp")), *sorted(NETD_INCLUDE_DIR.rglob("*.hpp"))]
+    return "\n".join(path.read_text() for path in paths)
 
 
 def function_body(source: str, name: str) -> str:
@@ -55,7 +61,7 @@ def switch_case(source: str, start_token: str, end_token: str, context: str) -> 
 
 
 def test_dhcp_lease_keeps_multiple_dns_servers() -> None:
-    source = NETD_CPP.read_text()
+    source = read_netd_source()
     if "constexpr size_t MAX_DNS_SERVERS = 3" not in source:
         fail("netd should retain a bounded standard resolv.conf nameserver set")
     if 'constexpr auto RESOLVER_OPTIONS = "options timeout:2 attempts:4\\n"' not in source:
@@ -67,7 +73,7 @@ def test_dhcp_lease_keeps_multiple_dns_servers() -> None:
 
 
 def test_dhcp_dns_option_parses_all_addresses() -> None:
-    source = NETD_CPP.read_text()
+    source = read_netd_source()
     helper = function_body(source, "remember_dns_server")
     require_order(
         helper,
@@ -96,7 +102,7 @@ def test_dhcp_dns_option_parses_all_addresses() -> None:
 
 
 def test_resolv_conf_writes_every_dns_server() -> None:
-    source = NETD_CPP.read_text()
+    source = read_netd_source()
     writer = function_body(source, "write_resolv_conf")
     require_order(
         writer,
@@ -126,7 +132,7 @@ def test_rootfs_seeds_resolv_conf_for_netd_rewrite() -> None:
 
 
 def test_renewal_compares_full_dns_set() -> None:
-    source = NETD_CPP.read_text()
+    source = read_netd_source()
     if "same_dns_servers(renew_lease, lease)" not in source:
         fail("DHCP renewal must compare the whole DNS server set")
     if "copy_dns_servers(lease, renew_lease)" not in source:
