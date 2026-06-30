@@ -15,7 +15,23 @@ include_directories(
     ${WOS_MODULES_DIR}/stdlib/src
 )
 
-add_executable(testd src/main.cpp)
+set(SOURCES
+    src/harness.cpp
+    src/main.cpp
+    src/registry.cpp
+    src/remote_helper.cpp
+    src/suite_ipc.cpp
+    src/suite_journal.cpp
+    src/suite_memory.cpp
+    src/suite_misc.cpp
+    src/suite_net.cpp
+    src/suite_process.cpp
+    src/suite_remote_ipc.cpp
+    src/suite_vfs.cpp
+    src/suite_wki.cpp
+)
+
+add_executable(testd ${SOURCES})
 
 set_target_properties(testd PROPERTIES
     LINK_FLAGS "-Wl,-z,now -Wl,--no-dynamic-linker"

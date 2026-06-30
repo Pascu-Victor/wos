@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 KTEST_DIR = ROOT / "modules" / "kern" / "src" / "test"
 TESTD_MAIN = ROOT / "modules" / "testd" / "src" / "main.cpp"
+TESTD_SRC_DIR = ROOT / "modules" / "testd" / "src"
 USERLAND_SUITE = ROOT / "configs" / "drive" / "srv" / "wos_userland_suite.sh"
 
 KTEST_DECL_RE = re.compile(
@@ -31,6 +32,7 @@ TESTD_BODY_RE = re.compile(
     r"^TESTD_RUN\((?P<name>\w+)\)\s*\{(?P<body>.*?)^TESTD_RUN_END\((?P=name)\)",
     flags=re.MULTILINE | re.DOTALL,
 )
+TESTD_REGISTRY_RE = re.compile(r"^#define\s+TESTD_TESTS\(X\)(?P<body>(?:[^\n]*\\\n)*[^\n]*)", flags=re.MULTILINE)
 TESTD_START_RE = re.compile(r"\[TESTD\]\s+starting")
 TESTD_PASS_RE = re.compile(r"\[TESTD\]\s+(?P<index>\d+)/(?P<total>\d+)\s+PASS:\s+(?P<label>\S+)")
 TESTD_FAIL_RE = re.compile(r"\[TESTD\].*\bFAIL\b")
@@ -223,17 +225,55 @@ def ktest_manifest() -> tuple[set[str], set[str]]:
     return enabled, disabled
 
 
+def _testd_source_files() -> list[Path]:
+    if TESTD_MAIN == TESTD_SRC_DIR / "main.cpp" and TESTD_SRC_DIR.is_dir():
+        split_sources = sorted(TESTD_SRC_DIR.glob("*.cpp"))
+        if split_sources:
+            return split_sources
+    return [TESTD_MAIN]
+
+
+def _testd_registry_order(active_source: str) -> list[str]:
+    match = TESTD_REGISTRY_RE.search(active_source)
+    if match is None:
+        return []
+    return re.findall(r"\bX\((\w+)\)", match.group("body"))
+
+
 def testd_expected_pass_labels() -> list[str]:
-    source = TESTD_MAIN.read_text()
+    source = "\n".join(path.read_text() for path in _testd_source_files())
     active_source = _mask_cxx_non_code_preserve_offsets(source)
-    labels: list[str] = []
+    labels_by_test: dict[str, list[str]] = {}
+    body_order: list[str] = []
     for match in TESTD_BODY_RE.finditer(active_source):
+        name = match.group("name")
         source_body = source[match.start("body") : match.end("body")]
         active_body = active_source[match.start("body") : match.end("body")]
+        labels_by_test[name] = []
+        body_order.append(name)
         for label_match in TESTD_PASS_CALL_RE.finditer(active_body):
             label = TESTD_PASS_LABEL_AT_RE.match(source_body, label_match.end())
             if label is not None:
-                labels.append(label.group(1))
+                labels_by_test[name].append(label.group(1))
+
+    registry_order = _testd_registry_order(active_source)
+    if registry_order:
+        body_set = set(labels_by_test)
+        registry_set = set(registry_order)
+        missing = sorted(registry_set - body_set)
+        extra = sorted(body_set - registry_set)
+        if missing or extra:
+            problems = []
+            if missing:
+                problems.append(f"missing TESTD bodies {_format_list(missing)}")
+            if extra:
+                problems.append(f"unregistered TESTD bodies {_format_list(extra)}")
+            raise AuditError("TESTD source manifest mismatch: " + "; ".join(problems))
+        ordered_tests = registry_order
+    else:
+        ordered_tests = body_order
+
+    labels = [label for test_name in ordered_tests for label in labels_by_test[test_name]]
     if not labels:
         raise AuditError("no TESTD PASS/CHECK labels found in source manifest")
     duplicates = _duplicate_items(labels)

@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-TESTD_MAIN = ROOT / "modules" / "testd" / "src" / "main.cpp"
+TESTD_SRC_DIR = ROOT / "modules" / "testd" / "src"
 PASS_LABEL_RE = re.compile(r'\bTESTD_(?:PASS|CHECK)\(\s*"((?:[^"\\]|\\.)*)"')
 TEST_BODY_RE = re.compile(
     r"^TESTD_RUN\((?P<name>\w+)\)\s*\{(?P<body>.*?)^TESTD_RUN_END\((?P=name)\)",
@@ -15,6 +15,11 @@ TEST_BODY_RE = re.compile(
 
 def fail(message: str) -> None:
     raise AssertionError(message)
+
+
+def read_testd_source() -> str:
+    paths = [*sorted(TESTD_SRC_DIR.glob("*.cpp")), TESTD_SRC_DIR / "testd.hpp"]
+    return "\n".join(path.read_text() for path in paths)
 
 
 def strip_cxx_comments(source: str) -> str:
@@ -562,11 +567,22 @@ def require_process_waitpid_tests_are_deadline_bounded(source: str) -> None:
         if snippet not in wait_any_body:
             fail(f"waitpid_any_timeout is missing bounded wait-any snippet: {snippet}")
 
+    blocking_wait_any_body = function_body(source, "blocking_wait_any_nested_loop")
+    for snippet in [
+        "ITERATIONS = 32",
+        "pid_t const GRANDCHILD = fork()",
+        "pid_t const RELEASER = fork()",
+        "pid_t const WPID = waitpid(-1, &status, 0)",
+    ]:
+        if snippet not in blocking_wait_any_body:
+            fail(f"blocking wait-any helper is missing snippet: {snippet}")
+
     bodies = parse_test_bodies(source)
     specific_wait_tests = {
         "test_fork_exit": "waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)",
         "test_waitpid_exit_before_park_race": "waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)",
         "test_waitpid_specific_ignores_unrelated_child_exit": "waitpid_timeout(TARGET, &status, REMOTE_IPC_TIMEOUT_MS)",
+        "test_waitpid_any_blocking_child_exits": "waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)",
         "test_fork_multiple": "waitpid_timeout(pids[i], &status, REMOTE_IPC_TIMEOUT_MS)",
     }
     any_wait_tests = {
@@ -744,14 +760,22 @@ def require_journal_device_test(source: str) -> None:
 
 
 def require_compiled_manifest_rejects_empty_tests(source: str) -> None:
-    k_tests_body = braced_block_after(source, "constexpr auto K_TESTS = std::array")
+    run_end_body = macro_body(source, "TESTD_RUN_END")
     for snippet in [
-        "static_assert(fn##_pass_count > 0",
+        "static_assert(name##_pass_count_value > 0",
         "TESTD tests must execute at least one TESTD_PASS or TESTD_CHECK path",
-        "return TestSpec{fn, fn##_pass_count}",
+        "extern const int name##_pass_count = name##_pass_count_value",
+    ]:
+        if snippet not in run_end_body:
+            fail(f"TESTD_RUN_END macro is missing zero-check guard snippet: {snippet}")
+
+    k_tests_body = braced_block_after(source, "const auto K_TESTS = std::array")
+    for snippet in [
+        "TestSpec{fn, fn##_pass_count}",
+        "TESTD_TESTS(TESTD_MAKE_SPEC)",
     ]:
         if snippet not in k_tests_body:
-            fail(f"compiled TESTD registry is missing zero-check guard snippet: {snippet}")
+            fail(f"compiled TESTD registry is missing test-spec snippet: {snippet}")
 
 
 RAW_IO_TEST_ALLOWLIST = {
@@ -891,7 +915,7 @@ def require_sets_equal(left: set[str], right: set[str], left_name: str, right_na
 
 
 def main() -> None:
-    source = strip_cxx_comments(TESTD_MAIN.read_text())
+    source = strip_cxx_comments(read_testd_source())
     require_raw_blocking_call_guard_rejects_synthetic_unbounded_tests()
 
     test_runs, test_ends, listed = parse_test_registry(source)
