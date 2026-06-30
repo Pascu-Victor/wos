@@ -108,6 +108,7 @@ cmake -S "$LLVM_SRC" -B "$CLANG_BUILD" -G Ninja \
     -DLLVM_TARGETS_TO_BUILD=X86 \
     -DLLVM_ENABLE_PROJECTS="clang;lld" \
     -DLLVM_BUILD_TOOLS=ON \
+    -DLLVM_INSTALL_TOOLCHAIN_ONLY=OFF \
     -DLLVM_BUILD_UTILS=OFF \
     -DLLVM_BUILD_TESTS=OFF \
     -DLLVM_ENABLE_THREADS=OFF \
@@ -146,58 +147,155 @@ cmake -S "$LLVM_SRC" -B "$CLANG_BUILD" -G Ninja \
     -DDEFAULT_SYSROOT=/usr \
     -DC_INCLUDE_DIRS=/usr/include
 
-cmake --build "$CLANG_BUILD" --parallel "$WOS_NINJA_JOBS" --target \
-    clang \
-    lld \
-    llvm-ar \
-    llvm-ranlib \
-    llvm-nm \
-    llvm-objcopy \
-    llvm-strip \
-    llvm-readelf \
-    llvm-objdump \
-    llvm-tblgen \
-    clang-tblgen
+collect_wos_llvm_bin_outputs() {
+    local build_ninja="$CLANG_BUILD/build.ninja"
 
-install_tool() {
-    local tool="$1"
-    local required="${2:-1}"
-    local source="$CLANG_BUILD/bin/$tool"
+    require_file "$build_ninja" "CMake did not generate a Ninja build file for native WOS clang."
 
-    if [ ! -e "$source" ]; then
-        if [ "$required" -eq 0 ]; then
-            return 0
-        fi
-        echo "ERROR: expected native WOS tool was not built: $source" >&2
-        exit 1
-    fi
+    awk '
+        function tool_name(name) {
+            return name == "bugpoint" ||
+                   name == "c-index-test" ||
+                   name == "clang" ||
+                   name == "clang++" ||
+                   name ~ /^clang-/ ||
+                   name == "diagtool" ||
+                   name == "dsymutil" ||
+                   name == "ld.lld" ||
+                   name == "ld64.lld" ||
+                   name == "lld" ||
+                   name ~ /^lld-/ ||
+                   name == "llc" ||
+                   name == "lli" ||
+                   name ~ /^llvm-/ ||
+                   name == "obj2yaml" ||
+                   name == "offload-arch" ||
+                   name == "opt" ||
+                   name == "reduce-chunk-list" ||
+                   name == "sancov" ||
+                   name == "sanstats" ||
+                   name == "verify-uselistorder" ||
+                   name == "wasm-ld" ||
+                   name == "yaml2obj"
+        }
 
-    install -m 755 "$source" "$TARGET_SYSROOT/bin/$tool"
+        function excluded_tool(name) {
+            return name ~ /fuzzer/ ||
+                   name == "FileCheck" ||
+                   name == "UnicodeNameMappingGenerator" ||
+                   name == "apinotes-test" ||
+                   name == "clang-import-test" ||
+                   name == "count" ||
+                   name == "lli-child-target" ||
+                   name == "llvm-PerfectShuffle" ||
+                   name == "llvm-jitlink-executor" ||
+                   name == "llvm-lit" ||
+                   name == "llvm-locstats" ||
+                   name == "llvm-min-tblgen" ||
+                   name == "llvm-test-mustache-spec" ||
+                   name == "not" ||
+                   name == "split-file" ||
+                   name == "yaml-bench"
+        }
+
+        /^build / {
+            outputs = $0
+            sub(/^build /, "", outputs)
+            sub(/:.*/, "", outputs)
+            from_tool_dir = ($0 ~ /(^|[[:space:]])tools\//)
+            from_tablegen = ($0 ~ /(^|[[:space:]])utils\/TableGen\//)
+            output_count = split(outputs, output_fields, /[[:space:]]+/)
+            for (i = 1; i <= output_count; i++) {
+                output = output_fields[i]
+                if (output == "|") {
+                    break
+                }
+                gsub(/\$\{cmake_ninja_workdir\}/, "", output)
+                if (output !~ /^bin\//) {
+                    continue
+                }
+                name = output
+                sub(/^bin\//, "", name)
+                if (!from_tool_dir && !from_tablegen && !tool_name(name)) {
+                    continue
+                }
+                if (excluded_tool(name)) {
+                    continue
+                }
+                print output
+            }
+        }
+    ' "$build_ninja" | sort -u
 }
 
-if [ -e "$CLANG_BUILD/bin/clang" ]; then
-    install_tool clang
-elif [ -e "$CLANG_BUILD/bin/clang-$CLANG_VERSION" ]; then
-    install -m 755 "$CLANG_BUILD/bin/clang-$CLANG_VERSION" "$TARGET_SYSROOT/bin/clang"
-else
-    echo "ERROR: expected native WOS clang was not built under $CLANG_BUILD/bin" >&2
+mapfile -t WOS_LLVM_BIN_OUTPUTS < <(collect_wos_llvm_bin_outputs)
+if [ "${#WOS_LLVM_BIN_OUTPUTS[@]}" -eq 0 ]; then
+    echo "ERROR: no native WOS LLVM tool outputs were discovered in $CLANG_BUILD/build.ninja" >&2
     exit 1
 fi
 
-install_tool lld
-install_tool ld.lld
-install_tool llvm-ar
-install_tool llvm-ranlib
-install_tool llvm-nm
-install_tool llvm-objcopy
-install_tool llvm-strip
-install_tool llvm-readelf
-install_tool llvm-objdump
-install_tool llvm-tblgen
-install_tool clang-tblgen
+ninja -C "$CLANG_BUILD" -j"$WOS_NINJA_JOBS" "${WOS_LLVM_BIN_OUTPUTS[@]}"
 
-ln -sfn clang "$TARGET_SYSROOT/bin/clang++"
-ln -sfn clang "$TARGET_SYSROOT/bin/clang-$CLANG_VERSION"
+should_stage_wos_llvm_tool() {
+    local name="$1"
+
+    case "$name" in
+        *fuzzer*|FileCheck|UnicodeNameMappingGenerator|apinotes-test|clang-import-test|count|lli-child-target|llvm-PerfectShuffle|llvm-jitlink-executor|llvm-lit|llvm-locstats|llvm-min-tblgen|llvm-test-mustache-spec|not|split-file|yaml-bench)
+            return 1
+            ;;
+    esac
+
+    case "$name" in
+        bugpoint|c-index-test|clang|clang++|clang-*|diagtool|dsymutil|ld.lld|ld64.lld|lld|lld-*|llc|lli|llvm-*|obj2yaml|offload-arch|opt|reduce-chunk-list|sancov|sanstats|verify-uselistorder|wasm-ld|yaml2obj)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+install_tool() {
+    local name="$1"
+    local source
+    local target
+    local link_target
+
+    source="$CLANG_BUILD/bin/$name"
+    target="$TARGET_SYSROOT/bin/$name"
+    if [ -L "$source" ]; then
+        link_target="$(readlink "$source")"
+        ln -sfn "$link_target" "$target"
+    elif [ -f "$source" ]; then
+        install -m 755 "$source" "$target"
+    else
+        echo "ERROR: expected native WOS tool was not built: $source" >&2
+        exit 1
+    fi
+}
+
+install_built_toolset() {
+    local source
+    local name
+    local installed=0
+
+    for source in "$CLANG_BUILD/bin"/*; do
+        [ -e "$source" ] || [ -L "$source" ] || continue
+        name="$(basename "$source")"
+        should_stage_wos_llvm_tool "$name" || continue
+        install_tool "$name"
+        installed=$((installed + 1))
+    done
+
+    if [ "$installed" -eq 0 ]; then
+        echo "ERROR: no native WOS LLVM tools were staged from $CLANG_BUILD/bin" >&2
+        exit 1
+    fi
+}
+
+install_built_toolset
+
+[ -e "$TARGET_SYSROOT/bin/clang++" ] || ln -sfn clang "$TARGET_SYSROOT/bin/clang++"
+[ -e "$TARGET_SYSROOT/bin/clang-$CLANG_VERSION" ] || ln -sfn clang "$TARGET_SYSROOT/bin/clang-$CLANG_VERSION"
 ln -sfn clang "$TARGET_SYSROOT/bin/cc"
 ln -sfn clang++ "$TARGET_SYSROOT/bin/c++"
 ln -sfn ld.lld "$TARGET_SYSROOT/bin/ld"
@@ -206,6 +304,29 @@ ln -sfn llvm-ranlib "$TARGET_SYSROOT/bin/ranlib"
 ln -sfn llvm-nm "$TARGET_SYSROOT/bin/nm"
 ln -sfn llvm-objcopy "$TARGET_SYSROOT/bin/objcopy"
 ln -sfn llvm-strip "$TARGET_SYSROOT/bin/strip"
+[ -e "$TARGET_SYSROOT/bin/llvm-objdump" ] && ln -sfn llvm-objdump "$TARGET_SYSROOT/bin/objdump"
+[ -e "$TARGET_SYSROOT/bin/llvm-readelf" ] && ln -sfn llvm-readelf "$TARGET_SYSROOT/bin/readelf"
+[ -e "$TARGET_SYSROOT/bin/llvm-size" ] && ln -sfn llvm-size "$TARGET_SYSROOT/bin/size"
+[ -e "$TARGET_SYSROOT/bin/llvm-strings" ] && ln -sfn llvm-strings "$TARGET_SYSROOT/bin/strings"
+[ -e "$TARGET_SYSROOT/bin/llvm-cxxfilt" ] && ln -sfn llvm-cxxfilt "$TARGET_SYSROOT/bin/c++filt"
+[ -e "$TARGET_SYSROOT/bin/llvm-addr2line" ] && ln -sfn llvm-addr2line "$TARGET_SYSROOT/bin/addr2line"
+
+for required_tool in \
+    clang \
+    lld \
+    ld.lld \
+    llvm-ar \
+    llvm-ranlib \
+    llvm-nm \
+    llvm-objcopy \
+    llvm-strip \
+    llvm-readelf \
+    llvm-objdump \
+    llvm-symbolizer \
+    llvm-tblgen \
+    clang-tblgen; do
+    require_file "$TARGET_SYSROOT/bin/$required_tool" "Native WOS clang build did not stage $required_tool."
+done
 
 cat > "$TARGET_SYSROOT/bin/$TARGET_ARCH.cfg" <<EOF
 --target=$TARGET_ARCH

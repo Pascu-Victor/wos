@@ -603,7 +603,8 @@ require_wos_selfhost_tools() {
     for tool in \
         sh env make tar sed grep mktemp sha256sum xz yes sleep tail wc stat \
         ld.lld lld llvm-ar llvm-ranlib llvm-nm llvm-objcopy llvm-strip \
-        llvm-readelf llvm-objdump llvm-tblgen clang-tblgen; do
+        llvm-readelf llvm-objdump llvm-symbolizer llvm-tblgen clang-tblgen \
+        llvm-as llvm-dis llvm-link llc opt; do
         require_tool "$tool"
     done
 }
@@ -1012,6 +1013,17 @@ verify_artifacts() {
     require_file "toolchain/sysroot/bin/llvm-strip"
     require_file "toolchain/sysroot/bin/llvm-readelf"
     require_file "toolchain/sysroot/bin/llvm-objdump"
+    require_file "toolchain/sysroot/bin/llvm-symbolizer"
+    require_file "toolchain/sysroot/bin/llvm-as"
+    require_file "toolchain/sysroot/bin/llvm-dis"
+    require_file "toolchain/sysroot/bin/llvm-link"
+    require_file "toolchain/sysroot/bin/llvm-size"
+    require_file "toolchain/sysroot/bin/llvm-strings"
+    require_file "toolchain/sysroot/bin/llvm-dwarfdump"
+    require_file "toolchain/sysroot/bin/llc"
+    require_file "toolchain/sysroot/bin/opt"
+    require_file "toolchain/sysroot/bin/obj2yaml"
+    require_file "toolchain/sysroot/bin/yaml2obj"
     require_file "toolchain/sysroot/bin/llvm-tblgen"
     require_file "toolchain/sysroot/bin/clang-tblgen"
     require_file "toolchain/sysroot/bin/x86_64-pc-wos.cfg"

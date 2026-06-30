@@ -23,6 +23,10 @@ def main() -> None:
         "/usr/bin/bash",
         "cp \"$ssh_pubkey\" \"$ROOTFS_STAGING/root/.ssh/authorized_keys\"",
         "chmod 600 \"$ROOTFS_STAGING/root/.ssh/authorized_keys\"",
+        "rootfs_copy_glob_entry()",
+        "compgen -G \"$resolved_pattern\" | sort",
+        "[ -e \"$resolved\" ] || [ -L \"$resolved\" ] || continue",
+        "copy-glob)",
     ]:
         if token not in source:
             fail(f"rootfs auth staging missing {token!r}")

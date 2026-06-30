@@ -549,6 +549,17 @@ if(WOS_BUILD_CLANG_FOR_WOS)
             ${WOS_SYSROOT_PATH}/bin/llvm-strip
             ${WOS_SYSROOT_PATH}/bin/llvm-readelf
             ${WOS_SYSROOT_PATH}/bin/llvm-objdump
+            ${WOS_SYSROOT_PATH}/bin/llvm-symbolizer
+            ${WOS_SYSROOT_PATH}/bin/llvm-as
+            ${WOS_SYSROOT_PATH}/bin/llvm-dis
+            ${WOS_SYSROOT_PATH}/bin/llvm-link
+            ${WOS_SYSROOT_PATH}/bin/llvm-size
+            ${WOS_SYSROOT_PATH}/bin/llvm-strings
+            ${WOS_SYSROOT_PATH}/bin/llvm-dwarfdump
+            ${WOS_SYSROOT_PATH}/bin/llc
+            ${WOS_SYSROOT_PATH}/bin/opt
+            ${WOS_SYSROOT_PATH}/bin/obj2yaml
+            ${WOS_SYSROOT_PATH}/bin/yaml2obj
             ${WOS_SYSROOT_PATH}/bin/llvm-tblgen
             ${WOS_SYSROOT_PATH}/bin/clang-tblgen
             ${WOS_SYSROOT_PATH}/bin/x86_64-pc-wos.cfg

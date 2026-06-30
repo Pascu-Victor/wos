@@ -52,6 +52,30 @@ rootfs_copy_entry() {
     ROOTFS_CHANGED=1
 }
 
+rootfs_copy_glob_entry() {
+    local source_pattern="$1"
+    local target_dir="$2"
+    local resolved_pattern
+    local resolved
+
+    if [[ "$source_pattern" != /* && "$source_pattern" == build/* && "$ROOTFS_BUILD_DIR" != "build" ]]; then
+        resolved_pattern="${ROOTFS_BUILD_DIR%/}/${source_pattern#build/}"
+    elif [[ "$source_pattern" != /* && "$source_pattern" == toolchain/sysroot/* && -n "$ROOTFS_SYSROOT_DIR" ]]; then
+        resolved_pattern="${ROOTFS_SYSROOT_DIR%/}/${source_pattern#toolchain/sysroot/}"
+    elif [[ "$source_pattern" != /* && "$source_pattern" == toolchain/busybox-install/* && -n "$ROOTFS_BUSYBOX_INSTALL_DIR" ]]; then
+        resolved_pattern="${ROOTFS_BUSYBOX_INSTALL_DIR%/}/${source_pattern#toolchain/busybox-install/}"
+    elif [[ "$source_pattern" = /* ]]; then
+        resolved_pattern="$source_pattern"
+    else
+        resolved_pattern="$ROOTFS_REPO/$source_pattern"
+    fi
+
+    while IFS= read -r resolved; do
+        [ -e "$resolved" ] || [ -L "$resolved" ] || continue
+        rootfs_copy_entry "$resolved" "$target_dir/$(basename "$resolved")"
+    done < <(compgen -G "$resolved_pattern" | sort)
+}
+
 rootfs_symlink_entry() {
     local source="$1"
     local target="$2"
@@ -216,6 +240,13 @@ rootfs_stage_manifest() {
                     return 1
                 fi
                 rootfs_copy_entry "$source" "$target" "$mode"
+                ;;
+            copy-glob)
+                if [ -n "$mode" ] || [ -n "$extra" ]; then
+                    echo "Invalid copy-glob rootfs manifest entry in $manifest" >&2
+                    return 1
+                fi
+                rootfs_copy_glob_entry "$source" "$target"
                 ;;
             symlink)
                 rootfs_symlink_entry "$source" "$target"
