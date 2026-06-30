@@ -869,7 +869,7 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
             "waiter->wait_channel_is(task::WaitChannelKind::WAITPID)",
             "waiter->waiting_for_pid == 0",
             "bool const SIGCHLD_PENDING = (waiter->sig_pending & SIGCHLD_MASK) != 0;",
-            "SIGCHLD_PENDING && waiter->waitpid_last_repair_us == 0",
+            "if (SIGCHLD_PENDING)",
             "waiter->waitpid_last_repair_us != 0 ? waiter->waitpid_last_repair_us : waiter->last_sleep_start_us",
             "now_us - LAST_REPAIR_US >= WAITPID_REPAIR_FALLBACK_MIN_US",
         ],

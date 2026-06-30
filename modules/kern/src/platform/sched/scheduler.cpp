@@ -577,7 +577,7 @@ inline auto waitpid_repair_due(const task::Task* waiter, uint64_t now_us) -> boo
         return false;
     }
     bool const SIGCHLD_PENDING = (waiter->sig_pending & SIGCHLD_MASK) != 0;
-    if (SIGCHLD_PENDING && waiter->waitpid_last_repair_us == 0) {
+    if (SIGCHLD_PENDING) {
         return true;
     }
     uint64_t const LAST_REPAIR_US = waiter->waitpid_last_repair_us != 0 ? waiter->waitpid_last_repair_us : waiter->last_sleep_start_us;
