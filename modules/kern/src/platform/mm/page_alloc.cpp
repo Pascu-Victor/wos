@@ -272,6 +272,16 @@ auto page_has_live_large_alloc_magic(PageAllocator* alloc, uint32_t page_idx) ->
     return page_has_live_tracked_alloc_magic(alloc, page_idx, PageKind::KMALLOC_LARGE, LARGE_ALLOC_MAGIC);
 }
 
+auto page_has_live_slab_kind(PageAllocator* alloc, uint32_t page_idx) -> bool {
+    return decode_page_kind(alloc->page_kinds[page_idx].load(std::memory_order_acquire)) == PageKind::SLAB;
+}
+
+void report_live_slab_page_free(PageAllocator* alloc, uint32_t page_idx, const char* caller) {
+    auto const PAGE_BASE = reinterpret_cast<uint64_t>(page_to_ptr(alloc->base, page_idx));
+    dbg::emergency_log("BUG: %s on live slab page=0x%lx idx=%lu\n", caller != nullptr ? caller : "page_free", PAGE_BASE,
+                       static_cast<uint64_t>(page_idx));
+}
+
 auto order0_free_head_is_reusable(PageAllocator* alloc, PageAllocator::FreeBlock* block, uint32_t& page_idx) -> bool {
     if (!free_head_is_valid(alloc, block, 0, page_idx)) {
         return false;
@@ -651,6 +661,10 @@ auto PageAllocator::cache_allocated_order0(void* ptr, uint32_t& out_page_idx) ->
     if (page_refcounts[PAGE_IDX].load(std::memory_order_acquire) != 1) {
         return false;
     }
+    if (page_has_live_slab_kind(this, PAGE_IDX)) {
+        report_live_slab_page_free(this, PAGE_IDX, "page cache free");
+        return false;
+    }
     if (page_has_live_medium_alloc_magic(this, PAGE_IDX)) {
         auto const PAGE_BASE = reinterpret_cast<uint64_t>(page_to_ptr(base, PAGE_IDX));
         dbg::emergency_log("BUG: page_free on live medium alloc page=0x%lx caller_ptr=0x%lx\n", PAGE_BASE, reinterpret_cast<uint64_t>(ptr));
@@ -767,6 +781,12 @@ uint64_t PageAllocator::free(void* ptr) {
                            reinterpret_cast<uint64_t>(ptr));
         return 0;
     }
+    for (uint32_t i = 0; i < (1U << ORDER); ++i) {
+        if (page_has_live_slab_kind(this, page_idx + i)) {
+            report_live_slab_page_free(this, page_idx + i, "page_free");
+            return 0;
+        }
+    }
     if (!allocated_block_has_direct_free_refs(this, page_idx, ORDER)) {
         dbg::emergency_log("page_alloc: rejecting direct free of refcounted block order=%lu ptr=0x%lx\n", static_cast<uint64_t>(ORDER),
                            reinterpret_cast<uint64_t>(ptr));
@@ -781,6 +801,10 @@ uint64_t PageAllocator::free_order0_at(uint32_t page_idx) {
         return 0;
     }
     if (page_flags[page_idx] != FLAG_ALLOC_HEAD) {
+        return 0;
+    }
+    if (page_has_live_slab_kind(this, page_idx)) {
+        report_live_slab_page_free(this, page_idx, "page_free_order0");
         return 0;
     }
     if (page_has_live_medium_alloc_magic(this, page_idx)) {
@@ -807,6 +831,10 @@ uint64_t PageAllocator::free_order0_range_at(uint32_t page_idx, uint32_t page_co
             return 0;
         }
         if (page_refcounts[CUR_IDX].load(std::memory_order_acquire) != 0) {
+            return 0;
+        }
+        if (page_has_live_slab_kind(this, CUR_IDX)) {
+            report_live_slab_page_free(this, CUR_IDX, "page_free_order0_range");
             return 0;
         }
         if (page_has_live_medium_alloc_magic(this, CUR_IDX)) {

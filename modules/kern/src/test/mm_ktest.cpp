@@ -763,6 +763,9 @@ KTEST(MM, DestroyUserSpaceSkipsSlabUnknownAndCorruptNextLevelFrames) {
     KEXPECT_EQ(root->entries.at(2).present, 0U);
 
     free_live_page(root);
+    // This is synthetic slab tagging for destroy_user_space coverage, not a
+    // real mini_malloc slab page. Restore normal ownership before direct free.
+    KEXPECT_TRUE(phys::page_mark_kind(slab_page, mm::PageKind::NORMAL));
     free_live_page(slab_page);
     free_live_page(normal_page);
 }

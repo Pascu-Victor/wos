@@ -191,12 +191,70 @@ def test_direct_page_free_rejects_refcounted_blocks() -> None:
     )
 
 
+def test_live_slab_pages_are_not_reused_by_physical_allocator() -> None:
+    page_alloc = PAGE_ALLOC_CPP.read_text()
+    phys = PHYS_CPP.read_text()
+
+    require_tokens(
+        page_alloc,
+        [
+            "auto page_has_live_slab_kind(PageAllocator* alloc, uint32_t page_idx) -> bool",
+            "PageKind::SLAB",
+            "report_live_slab_page_free(this, PAGE_IDX, \"page cache free\")",
+            "report_live_slab_page_free(this, page_idx + i, \"page_free\")",
+            "report_live_slab_page_free(this, page_idx, \"page_free_order0\")",
+            "report_live_slab_page_free(this, CUR_IDX, \"page_free_order0_range\")",
+        ],
+        "physical allocator must reject live mini-slab pages before freeing or caching them",
+    )
+
+    require_tokens(
+        phys,
+        [
+            "void detect_live_slab_page_in_returned_block(void* block, uint64_t scan_size, const char* source)",
+            "offset < scan_size",
+            "offset += paging::PAGE_SIZE",
+            "DETECT: pageAlloc (%s) returning live slab page",
+        ],
+        "physical allocator must scan returned allocations for embedded live slab headers",
+    )
+
+    cache_body = function_body(phys, "try_alloc_from_per_cpu_cache")
+    alloc_body = function_body(phys, "page_alloc_impl")
+    huge_body = function_body(phys, "page_alloc_huge")
+    require_order(
+        cache_body,
+        [
+            "detect_live_slab_page_in_returned_block(page, paging::PAGE_SIZE, \"cache\");",
+            "prepare_allocated_block(page, paging::PAGE_SIZE, zeroing);",
+        ],
+        "per-CPU page-cache allocation must trap live slab pages before zeroing",
+    )
+    require_order(
+        alloc_body,
+        [
+            "detect_live_slab_page_in_returned_block(block, buddy_accounting_size(size), \"buddy\");",
+            "prepare_allocated_block(block, size, zeroing);",
+        ],
+        "buddy allocation must scan the full returned span before zeroing",
+    )
+    require_order(
+        huge_body,
+        [
+            "detect_live_slab_page_in_returned_block(block, buddy_accounting_size(size), \"huge\");",
+            "std::memset(block, 0, size);",
+        ],
+        "huge allocation must scan the full returned span before zeroing",
+    )
+
+
 def main() -> None:
     test_internal_reservation_requires_nonzero_base_and_spare_page()
     test_per_cpu_cache_reservation_uses_selector_not_raw_memmap_base()
     test_selftest_and_ktest_cover_boot_reservation_edges()
     test_buddy_free_list_repair_rebuilds_from_flags()
     test_direct_page_free_rejects_refcounted_blocks()
+    test_live_slab_pages_are_not_reused_by_physical_allocator()
     print("physical memory source invariants hold")
 
 
