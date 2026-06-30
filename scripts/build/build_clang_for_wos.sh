@@ -60,8 +60,10 @@ require_file "$TARGET_SYSROOT/lib/Scrt1.o" "Build mlibc startup objects before b
 
 mkdir -p "$CLANG_BUILD" "$TARGET_SYSROOT/bin" "$TARGET_SYSROOT/lib"
 
-TARGET_C_FLAGS="--sysroot=$TARGET_SYSROOT -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -fdiagnostics-color=always"
-TARGET_CXX_FLAGS="$TARGET_C_FLAGS -std=c++23 -isystem $TARGET_SYSROOT/include/c++/v1"
+TARGET_COMMON_FLAGS="--sysroot=$TARGET_SYSROOT -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -fdiagnostics-color=always"
+TARGET_C_INCLUDE_FLAGS="-isystem $HOST/lib/clang/22/include -isystem $TARGET_SYSROOT/include"
+TARGET_C_FLAGS="$TARGET_COMMON_FLAGS $TARGET_C_INCLUDE_FLAGS"
+TARGET_CXX_FLAGS="$TARGET_COMMON_FLAGS -std=c++23 -isystem $TARGET_SYSROOT/include/c++/v1 $TARGET_C_INCLUDE_FLAGS"
 TARGET_LINK_FLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
 TARGET_CXX_STANDARD_LIBRARIES="-lc++ -lc++abi -lunwind -lm -lpthread -ldl -lrt -lc"
 

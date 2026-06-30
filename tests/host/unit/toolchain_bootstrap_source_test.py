@@ -941,6 +941,10 @@ def test_native_wos_clang_port_stages_tablegen_for_next_self_host() -> None:
         source,
         [
             'HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"',
+            'TARGET_COMMON_FLAGS="--sysroot=$TARGET_SYSROOT',
+            'TARGET_C_INCLUDE_FLAGS="-isystem $HOST/lib/clang/22/include -isystem $TARGET_SYSROOT/include"',
+            'TARGET_C_FLAGS="$TARGET_COMMON_FLAGS $TARGET_C_INCLUDE_FLAGS"',
+            'TARGET_CXX_FLAGS="$TARGET_COMMON_FLAGS -std=c++23 -isystem $TARGET_SYSROOT/include/c++/v1 $TARGET_C_INCLUDE_FLAGS"',
             "llvm-tblgen \\",
             "clang-tblgen",
             "install_tool llvm-tblgen",
