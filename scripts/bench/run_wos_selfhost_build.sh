@@ -865,6 +865,31 @@ seed_sources_from_cache() {
     run_timed_event "source_cache" "depth1_submodules" validate_source_cache_submodules
 }
 
+submodule_paths() {
+    git -C "$checkout" config -f .gitmodules --get-regexp '^submodule\..*\.path$' |
+        awk '{ print $2 }'
+}
+
+clone_one_submodule() {
+    local path="$1"
+    local submodule_cmd=(git -C "$checkout" submodule update --init --recursive)
+    if [ "$full_history" != "1" ]; then
+        submodule_cmd+=(--depth 1)
+    fi
+    submodule_cmd+=(--jobs "$jobs" -- "$path")
+    run_timed_event "clone_submodule" "$path" run_git_http "${submodule_cmd[@]}"
+}
+
+clone_submodules() {
+    local path
+    local paths_file="$workdir/submodule-paths.txt"
+    submodule_paths > "$paths_file"
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        clone_one_submodule "$path"
+    done < "$paths_file"
+}
+
 resume_existing_checkout() {
     log "resume_checkout=$checkout"
     git -C "$checkout" rev-parse --is-inside-work-tree >/dev/null
@@ -908,12 +933,7 @@ clone_sources() {
 
     run_timed_event "clone" "submodule_init" run_git_http git -C "$checkout" submodule init
 
-    local submodule_cmd=(git -C "$checkout" submodule update --init --recursive)
-    if [ "$full_history" != "1" ]; then
-        submodule_cmd+=(--depth 1)
-    fi
-    submodule_cmd+=(--jobs "$jobs")
-    run_timed_event "clone" "submodules" run_git_http "${submodule_cmd[@]}"
+    clone_submodules
 
     run_timed_event "clone" "submodule_status" write_submodule_status
 }
