@@ -44,7 +44,8 @@ Options:
   --history-file PATH     Append detailed timing rows here
                          (default: <workdir>-history.tsv)
   --log-dir PATH          Store phase command logs here
-                         (default: <workdir>/logs)
+                         (defaults: wos=/tmp/wos-selfhost-logs-<run>,
+                          linux=<workdir>/logs)
   --source-cache PATH     Reuse a pre-cloned depth-1 checkout at this path
                          instead of cloning from the network;
                          iteration-only, path must be visible inside the
@@ -283,6 +284,17 @@ log_path_for() {
 
     safe_label="$(printf '%s' "$label" | sed 's#[^A-Za-z0-9._-]#_#g')"
     printf '%s/%s-%s.log\n' "$log_dir" "$phase" "$safe_label"
+}
+
+default_log_dir() {
+    case "$mode" in
+        wos)
+            printf '/tmp/wos-selfhost-logs-%s\n' "$run_id"
+            ;;
+        *)
+            printf '%s/logs\n' "$workdir"
+            ;;
+    esac
 }
 
 print_log_tail() {
@@ -744,7 +756,7 @@ safe_prepare_workdir() {
         history_file="${workdir%/}-history.tsv"
     fi
     if [ -z "$log_dir" ]; then
-        log_dir="$workdir/logs"
+        log_dir="$(default_log_dir)"
     fi
     ensure_parent_dir "$history_file"
     mkdir -p "$log_dir"
