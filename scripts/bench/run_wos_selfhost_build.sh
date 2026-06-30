@@ -142,6 +142,7 @@ log_dir="${WOS_SELFHOST_LOG_DIR:-}"
 total_elapsed=0
 commit="unknown"
 heartbeat_pid=""
+workdir_lock=""
 
 sanitize_selfhost_environment() {
     unset CC CXX CPP LD AR AS NM OBJCOPY OBJDUMP RANLIB READELF STRIP
@@ -442,6 +443,20 @@ stop_log_heartbeat() {
     fi
 }
 
+release_workdir_lock() {
+    if [ -n "$workdir_lock" ]; then
+        rm -rf -- "$workdir_lock"
+        workdir_lock=""
+    fi
+}
+
+selfhost_cleanup() {
+    local status=$?
+    stop_log_heartbeat "$heartbeat_pid"
+    release_workdir_lock
+    exit "$status"
+}
+
 timestamp_utc() {
     python3 - <<'PY'
 from datetime import datetime, timezone
@@ -662,6 +677,20 @@ time_step() {
     return "$status"
 }
 
+acquire_workdir_lock() {
+    workdir_lock="${workdir%/}.lock"
+    if ! mkdir "$workdir_lock" 2>/dev/null; then
+        echo "self-host benchmark workdir is already in use: $workdir" >&2
+        echo "lock directory: $workdir_lock" >&2
+        echo "remove the lock only after confirming no benchmark process is using that workdir" >&2
+        exit 1
+    fi
+
+    printf '%s\n' "$run_id" > "$workdir_lock/run_id" 2>/dev/null || true
+    printf '%s\n' "$$" > "$workdir_lock/pid" 2>/dev/null || true
+    trap selfhost_cleanup EXIT
+}
+
 safe_prepare_workdir() {
     if [ -n "$source_cache" ]; then
         case "${source_cache%/}" in
@@ -701,6 +730,8 @@ safe_prepare_workdir() {
         echo "checkout already exists and --keep-workdir was requested: $checkout" >&2
         exit 1
     fi
+
+    acquire_workdir_lock
 
     if [ "$keep_workdir" != "1" ] && [ "$resume_checkout" != "1" ]; then
         rm -rf -- "$workdir"

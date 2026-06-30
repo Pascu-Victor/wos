@@ -74,6 +74,33 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
     )
 
 
+def test_selfhost_runner_locks_workdir_before_replacing_it() -> None:
+    source = SELFHOST_RUNNER.read_text()
+    require_tokens(
+        source,
+        [
+            'workdir_lock=""',
+            "acquire_workdir_lock()",
+            'workdir_lock="${workdir%/}.lock"',
+            'mkdir "$workdir_lock"',
+            "self-host benchmark workdir is already in use",
+            "lock directory: $workdir_lock",
+            "remove the lock only after confirming no benchmark process is using that workdir",
+            "trap selfhost_cleanup EXIT",
+            "release_workdir_lock()",
+            'rm -rf -- "$workdir_lock"',
+            "selfhost_cleanup()",
+            'stop_log_heartbeat "$heartbeat_pid"',
+        ],
+        "WOS self-host benchmark workdir lock",
+    )
+
+    lock_pos = source.find("    acquire_workdir_lock\n\n    if [ \"$keep_workdir\"")
+    remove_pos = source.find('rm -rf -- "$workdir"', lock_pos)
+    if lock_pos < 0 or remove_pos < 0:
+        fail("self-host benchmark must acquire the workdir lock before replacing the workdir")
+
+
 def test_selfhost_cluster_profile_is_single_large_vm() -> None:
     config = json.loads(SELFHOST_CLUSTER.read_text())
     zones = config["zones"]
