@@ -10,7 +10,7 @@
 namespace ker::mod::mm {
 void init();
 inline constexpr size_t KERNEL_STACK_SIZE = 0x80000;  // 512KB
-inline constexpr size_t USER_STACK_SIZE = 0x800000;   // 8MiB
+inline constexpr size_t USER_STACK_SIZE = 0x4000000;  // 64MiB
 inline constexpr size_t TLS_STATIC_SIZE = 0x16000;    // 64KB
 
 template <size_t StackSize = 4096>

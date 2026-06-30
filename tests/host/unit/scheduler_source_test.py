@@ -17,6 +17,7 @@ GDT_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "interrupt" / "gdt.hp
 THREADING_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.cpp"
 THREADING_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.hpp"
 TASK_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.cpp"
+MM_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "mm.hpp"
 EXEC_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "exec.cpp"
 THREAD_CONTROL_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "multiproc" / "threadControl.cpp"
 SCHEDULER_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "scheduler_ktest.cpp"
@@ -222,7 +223,6 @@ def test_real_idle_tasks_never_enter_dead_gc() -> None:
     require_tokens(
         idle_restore_body,
         [
-            "auto restore_gc_protected_idle_task(task::Task* task) -> bool",
             "bool const NEEDS_RESTORE",
             "task->state.store(task::TaskState::ACTIVE, std::memory_order_release)",
             "task->death_epoch.store(0, std::memory_order_release)",
@@ -231,6 +231,11 @@ def test_real_idle_tasks_never_enter_dead_gc() -> None:
             "return true",
         ],
         "real idle task liveness repair",
+    )
+    require_tokens(
+        source,
+        ["auto restore_gc_protected_idle_task(task::Task* task) -> bool"],
+        "real idle task liveness repair helper",
     )
 
     require_tokens(
@@ -349,6 +354,32 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
         "publish_thread_tid_to_tcb(parent, tcb_va, t->pid)",
         "mod::sched::post_task_for_cpu(TARGET_CPU, t)",
         "secondary pthread TCB tid must be published before scheduling",
+    )
+
+
+def test_default_user_stack_reservation_covers_native_toolchain_links() -> None:
+    mm_header = MM_HPP.read_text()
+    match = re.search(r"USER_STACK_SIZE\s*=\s*(0x[0-9A-Fa-f]+|\d+)", mm_header)
+    if match is None:
+        fail("missing USER_STACK_SIZE definition")
+    stack_size = int(match.group(1), 0)
+    if stack_size < 64 * 1024 * 1024:
+        fail("default user stack must reserve at least 64MiB for native WOS toolchain links")
+
+    threading_source = THREADING_CPP.read_text()
+    create_thread_body = function_body(threading_source, "create_thread")
+    require_tokens(
+        create_thread_body,
+        [
+            "thread->stack_phys_ptr = 0;",
+            "ensure_stack_backing(thread, page_table, STACK_TOP - INITIAL_STACK_BYTES, STACK_TOP)",
+        ],
+        "larger user stacks must remain lazily backed",
+    )
+    require_tokens(
+        threading_source,
+        ["bool handle_lazy_stack_fault(Thread* thread, mm::paging::PageTable* page_table, uint64_t fault_addr, uint64_t rsp)"],
+        "larger user stacks must still rely on lazy fault backing",
     )
 
 
@@ -1114,6 +1145,7 @@ def main() -> None:
     test_higher_priority_wakeup_bypasses_only_priority_holdoff_guards()
     test_runtime_accounting_deltas_are_saturating()
     test_user_thread_tcbs_publish_nonzero_tid_before_user_execution()
+    test_default_user_stack_reservation_covers_native_toolchain_links()
     test_execve_publishes_new_context_before_old_image_teardown()
     test_pagemap_sibling_check_includes_dead_publishers()
     test_process_syscall_reschedules_defer_to_syscall_exit()
