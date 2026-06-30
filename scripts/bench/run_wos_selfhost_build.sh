@@ -877,22 +877,12 @@ clone_sources() {
 
     run_timed_event "clone" "submodule_init" run_git_http git -C "$checkout" submodule init
 
-    local submodule_list="$workdir/submodule-paths.tsv"
-    git -C "$checkout" config --file .gitmodules --get-regexp '^submodule\..*\.path$' > "$submodule_list"
-
-    local key path
-    while read -r key path; do
-        if [ -z "$path" ]; then
-            continue
-        fi
-
-        local submodule_cmd=(git -C "$checkout" submodule update --init --recursive)
-        if [ "$full_history" != "1" ]; then
-            submodule_cmd+=(--depth 1)
-        fi
-        submodule_cmd+=(--jobs "$jobs" -- "$path")
-        run_timed_event "clone_submodule" "$path" run_git_http "${submodule_cmd[@]}"
-    done < "$submodule_list"
+    local submodule_cmd=(git -C "$checkout" submodule update --init --recursive)
+    if [ "$full_history" != "1" ]; then
+        submodule_cmd+=(--depth 1)
+    fi
+    submodule_cmd+=(--jobs "$jobs")
+    run_timed_event "clone" "submodules" run_git_http "${submodule_cmd[@]}"
 
     run_timed_event "clone" "submodule_status" write_submodule_status
 }
