@@ -796,6 +796,11 @@ void devfs_init() {
         }
     }
 
+    devfs_create_symlink("fd", "/proc/self/fd");
+    devfs_create_symlink("stdin", "/proc/self/fd/0");
+    devfs_create_symlink("stdout", "/proc/self/fd/1");
+    devfs_create_symlink("stderr", "/proc/self/fd/2");
+
     register_devfs();
     ker::mod::dbg::journal::mark_devfs_ready();
     vfs_debug_log("devfs: initialized with ");

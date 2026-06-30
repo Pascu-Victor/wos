@@ -792,6 +792,21 @@ def test_bash_script_handles_native_wos_autoconf_maintainer_rules() -> None:
     )
 
 
+def test_bash_script_enables_dev_fd_for_process_substitution() -> None:
+    source = (ROOT / "scripts" / "build" / "build_bash_for_wos.sh").read_text()
+    require_tokens(
+        source,
+        [
+            "bash_cv_dev_fd=standard",
+            "bash_cv_dev_stdin=present",
+            "bash_cv_sys_named_pipes=missing",
+        ],
+        "Bash process substitution /dev/fd configuration",
+    )
+    if "bash_cv_dev_fd=absent" in source:
+        fail("Bash must not be configured as if /dev/fd is absent")
+
+
 def test_nasm_script_uses_release_tarball_without_self_hosted_autogen() -> None:
     source = WOS_NASM_BUILD.read_text()
     require_tokens(
@@ -1485,6 +1500,8 @@ if __name__ == "__main__":
     test_gnu_make_defaults_to_pipe_jobserver_on_wos()
     test_gnu_make_script_handles_native_wos_autoconf_probes()
     test_bash_script_falls_back_to_target_triplet_on_native_wos()
+    test_bash_script_handles_native_wos_autoconf_maintainer_rules()
+    test_bash_script_enables_dev_fd_for_process_substitution()
     test_nasm_script_uses_release_tarball_without_self_hosted_autogen()
     test_cpython_script_uses_target_build_triplet_on_native_wos()
     test_cpython_selfhost_uses_existing_build_python_when_available()

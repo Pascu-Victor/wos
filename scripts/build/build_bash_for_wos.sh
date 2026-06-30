@@ -214,7 +214,7 @@ write_config_site() {
     mkdir -p "$BASH_BUILD"
     tmp_config_site="$(mktemp "$BASH_BUILD/config.site.XXXXXX")"
     cat > "$tmp_config_site" <<'EOF'
-bash_cv_dev_fd=absent
+bash_cv_dev_fd=standard
 bash_cv_dev_stdin=present
 bash_cv_func_snprintf=yes
 bash_cv_func_vsnprintf=yes

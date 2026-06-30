@@ -224,11 +224,27 @@ def test_pty_poll_waits_publish_local_pty_wait_kind() -> None:
     )
 
 
+def test_devfs_publishes_standard_fd_symlinks() -> None:
+    devfs_source = DEVFS_CPP.read_text()
+    body = function_body(devfs_source, "devfs_init")
+    require_tokens(
+        body,
+        [
+            'devfs_create_symlink("fd", "/proc/self/fd");',
+            'devfs_create_symlink("stdin", "/proc/self/fd/0");',
+            'devfs_create_symlink("stdout", "/proc/self/fd/1");',
+            'devfs_create_symlink("stderr", "/proc/self/fd/2");',
+        ],
+        "devfs standard fd symlinks",
+    )
+
+
 def main() -> None:
     test_detached_pty_device_is_not_logged_as_pointer_corruption()
     test_pty_pair_detaches_only_after_both_sides_close()
     test_pty_waiter_wakes_preserve_deferred_switch_state()
     test_pty_poll_waits_publish_local_pty_wait_kind()
+    test_devfs_publishes_standard_fd_symlinks()
     print("PTY source invariants hold")
 
 
