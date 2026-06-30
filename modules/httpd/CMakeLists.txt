@@ -9,21 +9,28 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Compiler flags
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Werror -fno-sanitize=safe-stack")
 
-# Include paths
-include_directories(
+# Source files
+set(SOURCES
+    src/filesystem.cpp
+    src/main.cpp
+    src/request.cpp
+    src/response.cpp
+    src/routes.cpp
+    src/server.cpp
+    src/socket_io.cpp
+    src/time.cpp
+)
+
+# Create executable
+add_executable(httpd ${SOURCES})
+
+target_include_directories(httpd PRIVATE
+    include
     ${WOS_MODULES_DIR}/defines
     ${WOS_MODULES_DIR}/kern/src
     ${WOS_MODULES_DIR}/kern/src/abi
     ${WOS_MODULES_DIR}/stdlib/src
 )
-
-# Source files
-set(SOURCES
-    src/main.cpp
-)
-
-# Create executable
-add_executable(httpd ${SOURCES})
 
 # Build as dynamic PIE (override parent's -static)
 set_target_properties(httpd PROPERTIES

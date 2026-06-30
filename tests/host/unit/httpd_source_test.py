@@ -5,11 +5,19 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-HTTPD_CPP = ROOT / "modules" / "httpd" / "src" / "main.cpp"
+HTTPD_ROOT = ROOT / "modules" / "httpd"
+HTTPD_SOURCE_PATHS = [
+    *sorted((HTTPD_ROOT / "include").rglob("*.hpp")),
+    *sorted((HTTPD_ROOT / "src").glob("*.cpp")),
+]
 
 
 def fail(message: str) -> None:
     raise AssertionError(message)
+
+
+def httpd_source() -> str:
+    return "\n".join(path.read_text() for path in HTTPD_SOURCE_PATHS)
 
 
 def function_body(source: str, name: str) -> str:
@@ -41,7 +49,7 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
 
 
 def test_httpd_client_io_is_deadline_bounded() -> None:
-    source = HTTPD_CPP.read_text()
+    source = httpd_source()
     require_tokens(
         source,
         [
@@ -132,20 +140,20 @@ def test_httpd_client_io_is_deadline_bounded() -> None:
 
 
 def test_httpd_request_path_uses_deadline_helpers() -> None:
-    source = HTTPD_CPP.read_text()
-    main_body = function_body(source, "main")
+    source = httpd_source()
+    run_server_body = function_body(source, "run_server")
     require_tokens(
-        main_body,
+        run_server_body,
         [
             "std::string request;",
             "read_request_timeout(client_fd, request, CLIENT_IO_TIMEOUT_MS)",
             "std::string_view const REQUEST(request.data(), request.size())",
             "drain_client_input_timeout(client_fd, CLIENT_DRAIN_TIMEOUT_MS)",
         ],
-        "httpd main client receive/drain",
+        "httpd server client receive/drain",
     )
-    if "recv_once_timeout(client_fd, buffer.data()" in main_body or "std::string_view const REQUEST(buffer.data()" in main_body:
-        fail("httpd main must not dispatch a one-shot recv buffer")
+    if "recv_once_timeout(client_fd, buffer.data()" in run_server_body or "std::string_view const REQUEST(buffer.data()" in run_server_body:
+        fail("httpd server loop must not dispatch a one-shot recv buffer")
 
     serve_file_body = function_body(source, "serve_file")
     handle_request_body = function_body(source, "handle_request")
@@ -154,7 +162,7 @@ def test_httpd_request_path_uses_deadline_helpers() -> None:
 
 
 def test_httpd_request_framing_is_complete_and_bounded() -> None:
-    source = HTTPD_CPP.read_text()
+    source = httpd_source()
     require_tokens(
         source,
         [
@@ -224,7 +232,7 @@ def test_httpd_request_framing_is_complete_and_bounded() -> None:
 
 
 def test_httpd_mount_child_wait_is_deadline_bounded() -> None:
-    source = HTTPD_CPP.read_text()
+    source = httpd_source()
     require_tokens(
         source,
         [
@@ -281,7 +289,7 @@ def test_httpd_mount_child_wait_is_deadline_bounded() -> None:
 
 
 def test_httpd_mount_spawn_failure_and_fd_inheritance_are_guarded() -> None:
-    source = HTTPD_CPP.read_text()
+    source = httpd_source()
     cloexec_body = function_body(source, "set_fd_cloexec_best_effort")
     require_tokens(
         cloexec_body,
@@ -304,15 +312,18 @@ def test_httpd_mount_spawn_failure_and_fd_inheritance_are_guarded() -> None:
     if "exec_res < 0" in handle_request_body:
         fail("WOS exec returns 0 on failure; httpd must not check exec_res < 0")
 
-    main_body = function_body(source, "main")
+    run_server_body = function_body(source, "run_server")
     require_tokens(
-        main_body,
+        run_server_body,
         [
             "set_fd_cloexec_best_effort(server_fd)",
             "set_fd_cloexec_best_effort(client_fd)",
         ],
         "httpd listener/client fd inheritance guards",
     )
+
+    main_body = function_body(source, "main")
+    require_tokens(main_body, ["httpd::run_server()"], "httpd main entry delegates to server")
 
 
 def main() -> None:
