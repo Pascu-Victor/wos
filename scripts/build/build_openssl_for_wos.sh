@@ -189,6 +189,20 @@ remove_cross_libtool_archives() {
     done
 }
 
+disable_libressl_man_install() {
+    local makefile="$TLS_WORK/Makefile"
+
+    require_file "$makefile" "LibreSSL configure did not produce a top-level Makefile."
+    if grep -q '^SUBDIRS = include crypto ssl tls apps man ' "$makefile"; then
+        sed -i 's/^SUBDIRS = include crypto ssl tls apps man /SUBDIRS = include crypto ssl tls apps /' "$makefile"
+    fi
+
+    if grep -q '^SUBDIRS = .* man ' "$makefile"; then
+        echo "ERROR: failed to remove LibreSSL man subdir from $makefile." >&2
+        exit 1
+    fi
+}
+
 require_file "$HOST/bin/clang" "Run tools/host-toolchain.sh first."
 require_file "$HOST/bin/llvm-ar" "Run tools/host-toolchain.sh first."
 require_file "$HOST/bin/llvm-ranlib" "Run tools/host-toolchain.sh first."
@@ -241,10 +255,10 @@ fi
         --disable-tests \
         --disable-asm
 )
+disable_libressl_man_install
 
 wos_make "$WOS_MAKE_JOBS" -C "$TLS_WORK"
 wos_make "$WOS_MAKE_JOBS" -C "$TLS_WORK" \
-    SUBDIRS="include crypto ssl tls apps" \
     prefix= \
     exec_prefix= \
     libdir=/lib \
