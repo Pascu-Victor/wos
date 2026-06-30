@@ -30,11 +30,21 @@ if(WOS_NATIVE_SYSTEM_BUILD)
     set(WOS_BUILD_CMAKE_FOR_HOST_DEFAULT OFF)
 endif()
 
+set(WOS_BUILD_DISK_IMAGES_DEFAULT ON)
+if(WOS_NATIVE_SYSTEM_BUILD)
+    set(WOS_BUILD_DISK_IMAGES_DEFAULT OFF)
+endif()
+
 set(WOS_BUILD_WOSDBG_DEFAULT ON)
 if(WOS_NATIVE_SYSTEM_BUILD)
     set(WOS_BUILD_WOSDBG_DEFAULT OFF)
 endif()
 option(WOS_BUILD_WOSDBG "Build the Qt6-based wosdbg host tool" ${WOS_BUILD_WOSDBG_DEFAULT})
+option(WOS_BUILD_DISK_IMAGES "Build boot/rootfs qcow2 images with qemu-img and libguestfs" ${WOS_BUILD_DISK_IMAGES_DEFAULT})
+
+if(WOS_NATIVE_SYSTEM_BUILD AND NOT WOS_BUILD_DISK_IMAGES)
+    message(STATUS "Native WOS build: disk image packaging is disabled; pass -DWOS_BUILD_DISK_IMAGES=ON when qemu-img and guestfish are available.")
+endif()
 
 if(WOS_USE_CCACHE AND NOT WOS_CCACHE_PROGRAM)
     find_program(WOS_CCACHE_PROGRAM NAMES ccache cccache)
@@ -916,10 +926,17 @@ add_custom_target(wos_full
 add_dependencies(wos_full
     check_headers
     wos_modules
-    mountfs_disk
-    boot_image
+    busybox
+    dropbear
+    gnu_make
     wos_tools_build_always
 )
+if(WOS_BUILD_DISK_IMAGES)
+    add_dependencies(wos_full
+        mountfs_disk
+        boot_image
+    )
+endif()
 if(WOS_BUILD_CLANG_FOR_WOS)
     add_dependencies(wos_full clang_for_wos)
 endif()

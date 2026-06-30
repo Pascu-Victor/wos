@@ -963,17 +963,42 @@ bootstrap_toolchain() {
 }
 
 configure_wos() {
-    run_with_jobs_env cmake -GNinja \
+    local cmake_args=(cmake -GNinja
         -S "$checkout" \
         -B "$checkout/$build_dir" \
         -DWOS_BUILD_WOSDBG=OFF \
         -DWOS_BUILD_CMAKE_FOR_HOST=OFF \
-        -DWOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN=ON
+        -DWOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN=ON)
+    if [ "$mode" = "wos" ]; then
+        cmake_args+=(-DWOS_BUILD_DISK_IMAGES=OFF)
+    fi
+    run_with_jobs_env "${cmake_args[@]}"
 }
 
 build_wos() {
     local cmd=(cmake --build "$checkout/$build_dir" --target "$target" --parallel "$jobs")
     run_with_jobs_env "${cmd[@]}"
+}
+
+cmake_cache_value() {
+    local key="$1"
+    local cache="$checkout/$build_dir/CMakeCache.txt"
+
+    [ -f "$cache" ] || return 1
+    sed -n "s/^${key}:[^=]*=//p" "$cache" | tail -n 1
+}
+
+verify_disk_artifacts() {
+    local build_disk_images
+
+    build_disk_images="$(cmake_cache_value WOS_BUILD_DISK_IMAGES || printf 'ON')"
+    if [ "$build_disk_images" != "ON" ]; then
+        log "skip disk image artifact verification: WOS_BUILD_DISK_IMAGES=$build_disk_images"
+        return 0
+    fi
+
+    require_file "disk.qcow2"
+    require_file "mountfs.qcow2"
 }
 
 verify_artifacts() {
@@ -1027,8 +1052,7 @@ verify_artifacts() {
     require_file "$build_dir/modules/renderbench/renderbench"
     require_file "$build_dir/modules/strace/strace"
     require_file "$build_dir/modules/sftpserver/sftp-server"
-    require_file "disk.qcow2"
-    require_file "mountfs.qcow2"
+    verify_disk_artifacts
 }
 
 for tool in bash git cmake ninja clang clang++ python3; do
