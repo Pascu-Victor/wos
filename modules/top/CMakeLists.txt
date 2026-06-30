@@ -8,14 +8,26 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Werror -fno-sanitize=safe-stack")
 
-include_directories(
+set(SOURCES
+    src/app.cpp
+    src/io.cpp
+    src/main.cpp
+    src/parse.cpp
+    src/procfs_reader.cpp
+    src/render.cpp
+    src/terminal.cpp
+    src/types.cpp
+)
+
+add_executable(top ${SOURCES})
+
+target_include_directories(top PRIVATE
+    include
     ${WOS_MODULES_DIR}/defines
     ${WOS_MODULES_DIR}/kern/src
     ${WOS_MODULES_DIR}/kern/src/abi
     ${WOS_MODULES_DIR}/stdlib/src
 )
-
-add_executable(top src/main.cpp)
 
 set_target_properties(top PROPERTIES
     LINK_FLAGS "-Wl,-z,now -Wl,--no-dynamic-linker"
