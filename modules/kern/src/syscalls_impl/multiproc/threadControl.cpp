@@ -94,6 +94,46 @@ auto publish_thread_tid_to_tcb(mod::sched::task::Task* parent, uint64_t tcb_va, 
 }
 }  // namespace
 
+[[noreturn]] void wos_thread_exit_current() {
+    auto* task = mod::sched::get_current_task();
+    if (task == nullptr) {
+        jump_to_next_task_no_save();
+        __builtin_unreachable();
+    }
+    if (task->exit_in_progress) {
+        for (;;) {
+            asm volatile("hlt");
+        }
+    }
+    task->exit_in_progress = true;
+    release_thread_fd_refs(task);
+    task->has_exited = true;
+    task->exit_status = 0;
+    task->exit_notify_ready.store(true, std::memory_order_release);
+    task->death_epoch.store(mod::sched::EpochManager::current_epoch(), std::memory_order_release);
+    task->state.store(mod::sched::task::TaskState::DEAD, std::memory_order_release);
+
+    uint64_t const WAITER_LOCK_FLAGS = task->exit_waiters_lock.lock_irqsave();
+    const size_t WAITER_COUNT = task->awaitee_on_exit.size();
+    std::array<uint64_t, 16> waiting_pids{};
+    const size_t WAITING_PIDS_CAP = waiting_pids.size();
+    for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; ++i) {
+        waiting_pids.at(i) = task->awaitee_on_exit.at(i);
+    }
+    task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
+
+    for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; i++) {
+        auto* waiter = mod::sched::find_task_by_pid_safe(waiting_pids.at(i));
+        if (waiter != nullptr) {
+            mod::sched::reschedule_task_for_cpu(waiter->cpu, waiter);
+            waiter->release();
+        }
+    }
+
+    jump_to_next_task_no_save();
+    __builtin_unreachable();
+}
+
 auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2, void* arg3) -> uint64_t {
     switch (op) {
         case abi::multiproc::threadControlOps::SET_TCB: {
@@ -163,46 +203,7 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
         }
 
         case abi::multiproc::threadControlOps::THREAD_EXIT: {
-            // Exit the current thread without tearing down the process.
-            // The pagemap and ELF are shared - do NOT free them.
-            auto* task = mod::sched::get_current_task();
-            if (task == nullptr) {
-                return 0;
-            }
-            if (task->exit_in_progress) {
-                for (;;) {
-                    asm volatile("hlt");
-                }
-            }
-            task->exit_in_progress = true;
-            release_thread_fd_refs(task);
-            task->has_exited = true;
-            task->exit_status = 0;
-            task->exit_notify_ready.store(true, std::memory_order_release);
-            // Record death epoch for GC grace period, then transition to DEAD.
-            // Without this, threads stay EXITING forever and GC never reclaims them.
-            task->death_epoch.store(mod::sched::EpochManager::current_epoch(), std::memory_order_release);
-            task->state.store(mod::sched::task::TaskState::DEAD, std::memory_order_release);
-            // Wake anyone waiting on this thread (e.g. via awaitee list)
-            uint64_t const WAITER_LOCK_FLAGS = task->exit_waiters_lock.lock_irqsave();
-            const size_t WAITER_COUNT = task->awaitee_on_exit.size();
-            std::array<uint64_t, 16> waiting_pids{};
-            const size_t WAITING_PIDS_CAP = waiting_pids.size();
-            for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; ++i) {
-                waiting_pids.at(i) = task->awaitee_on_exit.at(i);
-            }
-            task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
-
-            for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; i++) {
-                auto* waiter = mod::sched::find_task_by_pid_safe(waiting_pids.at(i));
-                if (waiter != nullptr) {
-                    mod::sched::reschedule_task_for_cpu(waiter->cpu, waiter);
-                    waiter->release();
-                }
-            }
-            // Transfer to dead list and pick next task - never returns
-            jump_to_next_task_no_save();
-            __builtin_unreachable();
+            wos_thread_exit_current();
         }
 
         case abi::multiproc::threadControlOps::SET_AFFINITY: {

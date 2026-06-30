@@ -4,6 +4,7 @@
 
 namespace ker::syscall::process {
 
+void exit_current_if_process_exit_requested();
 [[noreturn]] void wos_proc_exit(int status);
 [[noreturn]] void wos_proc_exit_signal(int signo);
 

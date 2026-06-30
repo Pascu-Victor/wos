@@ -465,6 +465,8 @@ void exit_current_on_pending_fatal_default_signal() {
         return;
     }
 
+    ker::syscall::process::exit_current_if_process_exit_requested();
+
     uint64_t const DELIVERABLE = task->sig_pending & ~task->sig_mask;
     if (DELIVERABLE == 0) {
         return;
@@ -491,6 +493,8 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
     if (task == nullptr) {
         return 0;
     }
+
+    ker::syscall::process::exit_current_if_process_exit_requested();
 
     // --- Handle sigreturn first ---
     if (task->do_sigreturn) {
@@ -661,6 +665,8 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
         return;
     }
 
+    ker::syscall::process::exit_current_if_process_exit_requested();
+
     if (task->in_signal_handler) {
         return;
     }
@@ -821,6 +827,10 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
 void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDelivery delivery) {
     if (task == nullptr || task->type != sched::task::TaskType::PROCESS) {
         return;
+    }
+
+    if (task == sched::get_current_task()) {
+        ker::syscall::process::exit_current_if_process_exit_requested();
     }
 
     // A PROCESS can be resumed here with a saved kernel frame when it was

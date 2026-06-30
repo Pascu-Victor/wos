@@ -25,6 +25,7 @@
 #include "platform/sched/task.hpp"
 #include "platform/smt/smt.hpp"
 #include "syscalls_impl/futex/futex.hpp"
+#include "syscalls_impl/multiproc/threadControl.hpp"
 #include "syscalls_impl/shm/shm.hpp"
 #include "syscalls_impl/vmem/sys_vmem.hpp"
 #include "waitpid.hpp"
@@ -37,6 +38,7 @@ namespace sched_task = ker::mod::sched::task;
 
 constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
 constexpr uint64_t SIGCHLD_MASK = 1ULL << (17 - 1);
+constexpr uint64_t SIGKILL_MASK = 1ULL << (9 - 1);
 constexpr size_t EXIT_WAITER_NOTIFY_BATCH = 16;
 
 using ExitWaiterBatch = std::array<uint64_t, EXIT_WAITER_NOTIFY_BATCH>;
@@ -334,6 +336,43 @@ void cleanup_signal_handlers_for_exit(ker::mod::sched::task::Task* task) {
     }
 }
 
+auto task_alive_for_group_exit_request(ker::mod::sched::task::Task* task) -> bool {
+    return task != nullptr && task->type == ker::mod::sched::task::TaskType::PROCESS &&
+           task->state.load(std::memory_order_acquire) == ker::mod::sched::task::TaskState::ACTIVE && !task->has_exited;
+}
+
+void publish_process_exit_request(ker::mod::sched::task::Task* task, int status, int wait_status) {
+    if (!task_alive_for_group_exit_request(task)) {
+        return;
+    }
+
+    task->requested_process_exit_status.store(status, std::memory_order_relaxed);
+    task->requested_process_exit_wait_status.store(wait_status, std::memory_order_relaxed);
+    task->process_exit_requested.store(true, std::memory_order_release);
+    task->sig_pending |= SIGKILL_MASK;
+    ker::mod::sched::wake_task_for_signal(task);
+}
+
+void request_thread_group_exit_from_thread(ker::mod::sched::task::Task* initiator, int status, int wait_status) {
+    if (initiator == nullptr) {
+        return;
+    }
+
+    uint64_t const PROCESS_PID = sched_task::process_pid(*initiator);
+    uint32_t const COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < COUNT; i++) {
+        auto* task = ker::mod::sched::get_active_task_at_safe(i);
+        if (task == nullptr) {
+            continue;
+        }
+
+        if (task != initiator && sched_task::same_thread_group(*task, PROCESS_PID)) {
+            publish_process_exit_request(task, status, wait_status);
+        }
+        task->release();
+    }
+}
+
 }  // namespace
 
 namespace {
@@ -344,6 +383,11 @@ namespace {
         log::error("process exit without current task: status=%d wait_status=%d", status, wait_status);
         hcf();
     }
+    if (current_task->is_thread) {
+        request_thread_group_exit_from_thread(current_task, status, wait_status);
+        ker::syscall::multiproc::wos_thread_exit_current();
+    }
+
     uint32_t const EXIT_CORR = ker::mod::perf::next_wki_trace_correlation();
     uint64_t const EXIT_STARTED_US = ker::mod::time::get_us();
     record_local_proc_event(current_task, ker::mod::perf::WkiPerfLocalProcOp::EXIT, ker::mod::perf::WkiPerfPhase::BEGIN, EXIT_CORR, status,
@@ -546,6 +590,23 @@ namespace {
 }
 
 }  // namespace
+
+void exit_current_if_process_exit_requested() {
+    auto* task = ker::mod::sched::get_current_task();
+    if (!task_alive_for_group_exit_request(task) || !task->process_exit_requested.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    int const STATUS = task->requested_process_exit_status.load(std::memory_order_relaxed);
+    int const WAIT_STATUS = task->requested_process_exit_wait_status.load(std::memory_order_relaxed);
+    task->process_exit_requested.store(false, std::memory_order_release);
+
+    if (task->is_thread) {
+        ker::syscall::multiproc::wos_thread_exit_current();
+    }
+
+    wos_proc_exit_with_wait_status(STATUS, WAIT_STATUS);
+}
 
 [[noreturn]] void wos_proc_exit(int status) {
     // Store normal process exits in POSIX waitpid format.

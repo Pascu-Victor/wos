@@ -7,5 +7,6 @@
 #include <platform/smt/smt.hpp>
 
 namespace ker::syscall::multiproc {
+[[noreturn]] void wos_thread_exit_current();
 auto thread_control(ker::abi::multiproc::threadControlOps op, void* arg1, void* arg2, void* arg3) -> uint64_t;
 }  // namespace ker::syscall::multiproc

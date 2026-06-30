@@ -530,6 +530,9 @@ struct Task {
 
     bool exit_in_progress{};
     bool has_exited{};
+    std::atomic<bool> process_exit_requested{false};
+    std::atomic<int32_t> requested_process_exit_status{0};
+    std::atomic<int32_t> requested_process_exit_wait_status{0};
     // Set after exit cleanup finishes; waitpid may reap only after this.
     std::atomic<bool> exit_notify_ready{false};
     std::atomic<bool> waited_on{false};  // Set when waitpid atomically claims the exit status.
