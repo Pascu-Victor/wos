@@ -58,6 +58,25 @@ constexpr uint64_t PROC_CLK_TCK = 100ULL;
 constexpr uint64_t US_PER_PROC_TICK = 1000000ULL / PROC_CLK_TCK;
 constexpr uint64_t KIB = 1024ULL;
 
+enum class ProcRootReaddirIndex : uint8_t {
+    SELF = 2,
+    MOUNTS,
+    UPTIME,
+    VERSION,
+    STAT,
+    LOADAVG,
+    MEMINFO,
+    WKI,
+    MEMACC,
+    FIRST_PID,
+};
+
+constexpr auto proc_root_readdir_index(ProcRootReaddirIndex index) -> size_t { return static_cast<size_t>(index); }
+
+constexpr auto proc_root_readdir_next_index(ProcRootReaddirIndex index) -> uint64_t {
+    return static_cast<uint64_t>(proc_root_readdir_index(index) + 1);
+}
+
 uint64_t g_procfs_creation_epoch_ns = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // Helper: int to decimal string
@@ -387,75 +406,73 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
 
     if (pfd->node.type == ProcNodeType::ROOT_DIR) {
         // /proc root: fixed entries then PID directories
-        // index 2 = "self", 3 = "mounts", 4 = "uptime", 5 = "version",
-        // 6 = "stat", 7 = "loadavg", 8 = "meminfo", 9 = "wki", 10 = "memacc", 11+ = active task PIDs
-        if (count == 2) {
-            buf->d_ino = 2;
-            buf->d_off = 3;
+        if (count == proc_root_readdir_index(ProcRootReaddirIndex::SELF)) {
+            buf->d_ino = proc_root_readdir_index(ProcRootReaddirIndex::SELF);
+            buf->d_off = proc_root_readdir_next_index(ProcRootReaddirIndex::SELF);
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_LNK;
             std::memcpy(buf->d_name.data(), "self", 5);
             return 0;
         }
-        if (count == 3) {
-            buf->d_ino = 3;
-            buf->d_off = 4;
+        if (count == proc_root_readdir_index(ProcRootReaddirIndex::MOUNTS)) {
+            buf->d_ino = proc_root_readdir_index(ProcRootReaddirIndex::MOUNTS);
+            buf->d_off = proc_root_readdir_next_index(ProcRootReaddirIndex::MOUNTS);
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "mounts", 7);
             return 0;
         }
-        if (count == 4) {
-            buf->d_ino = 4;
-            buf->d_off = 5;
+        if (count == proc_root_readdir_index(ProcRootReaddirIndex::UPTIME)) {
+            buf->d_ino = proc_root_readdir_index(ProcRootReaddirIndex::UPTIME);
+            buf->d_off = proc_root_readdir_next_index(ProcRootReaddirIndex::UPTIME);
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "uptime", 7);
             return 0;
         }
-        if (count == 5) {
-            buf->d_ino = 5;
-            buf->d_off = 6;
+        if (count == proc_root_readdir_index(ProcRootReaddirIndex::VERSION)) {
+            buf->d_ino = proc_root_readdir_index(ProcRootReaddirIndex::VERSION);
+            buf->d_off = proc_root_readdir_next_index(ProcRootReaddirIndex::VERSION);
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "version", 8);
             return 0;
         }
-        if (count == 6) {
-            buf->d_ino = 6;
-            buf->d_off = 7;
+        if (count == proc_root_readdir_index(ProcRootReaddirIndex::STAT)) {
+            buf->d_ino = proc_root_readdir_index(ProcRootReaddirIndex::STAT);
+            buf->d_off = proc_root_readdir_next_index(ProcRootReaddirIndex::STAT);
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "stat", 5);
             return 0;
         }
-        if (count == 7) {
-            buf->d_ino = 7;
-            buf->d_off = 8;
+        if (count == proc_root_readdir_index(ProcRootReaddirIndex::LOADAVG)) {
+            buf->d_ino = proc_root_readdir_index(ProcRootReaddirIndex::LOADAVG);
+            buf->d_off = proc_root_readdir_next_index(ProcRootReaddirIndex::LOADAVG);
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "loadavg", 8);
             return 0;
         }
-        if (count == 8) {
-            buf->d_ino = 8;
-            buf->d_off = 9;
+        if (count == proc_root_readdir_index(ProcRootReaddirIndex::MEMINFO)) {
+            buf->d_ino = proc_root_readdir_index(ProcRootReaddirIndex::MEMINFO);
+            buf->d_off = proc_root_readdir_next_index(ProcRootReaddirIndex::MEMINFO);
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "meminfo", 8);
             return 0;
         }
-        if (count == 9) {
-            buf->d_ino = 9;
-            buf->d_off = 10;
+        if (count == proc_root_readdir_index(ProcRootReaddirIndex::WKI)) {
+            buf->d_ino = proc_root_readdir_index(ProcRootReaddirIndex::WKI);
+            buf->d_off = proc_root_readdir_next_index(ProcRootReaddirIndex::WKI);
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_DIR;
             std::memcpy(buf->d_name.data(), "wki", 4);
             return 0;
         }
-        if (count == 10) {
+        if (count == proc_root_readdir_index(ProcRootReaddirIndex::MEMACC)) {
             buf->d_ino = 22;
-            buf->d_off = 11;
+            buf->d_off = proc_root_readdir_next_index(ProcRootReaddirIndex::MEMACC);
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_DIR;
             std::memcpy(buf->d_name.data(), "memacc", 7);
@@ -463,7 +480,7 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
         }
         // PID directories from active task list. Threads and WKI proxy tasks
         // stay hidden here; real threads are exposed under /proc/<pid>/task/<tid>.
-        size_t const PID_INDEX = count - 11;
+        size_t const PID_INDEX = count - proc_root_readdir_index(ProcRootReaddirIndex::FIRST_PID);
         auto* task = process_visible_task_at(PID_INDEX);
         if (task == nullptr) {
             return -ENOENT;
