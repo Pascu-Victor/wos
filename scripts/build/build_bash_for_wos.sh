@@ -15,6 +15,7 @@ wos_setup_ccache
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
 WOS_BUILD_JOBS="$(wos_build_jobs)"
 WOS_MAKE_JOBS="$(wos_make_jobs)"
+HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
 
 B="$WORKSPACE_ROOT/toolchain"
 HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
@@ -111,6 +112,41 @@ copy_source_to_workdir() {
     wos_remove_tree "$BASH_WORK"
     mkdir -p "$BASH_WORK"
     wos_copy_tree_entries_excluding "$source_dir" "$BASH_WORK" ".git" ".github"
+}
+
+refresh_bash_release_generated_files() {
+    local source_dir="$1"
+    local file
+    local generated_files=(
+        aclocal.m4
+        config.h.in
+        configure
+    )
+
+    # WOS BusyBox touch currently does not advance existing mtimes. Rewrite the
+    # release-generated Autoconf outputs so Bash maintainer rules stay idle.
+    sleep 1
+    for file in "${generated_files[@]}"; do
+        wos_refresh_file_mtime "$source_dir/$file"
+    done
+}
+
+refresh_bash_build_generated_files() {
+    local build_dir="$1"
+    local file
+    local generated_files=(
+        config.status
+        Makefile
+        config.h
+        stamp-h
+        buildconf.h
+        support/bashbug.sh
+    )
+
+    sleep 1
+    for file in "${generated_files[@]}"; do
+        wos_refresh_file_mtime "$build_dir/$file"
+    done
 }
 
 patch_config_sub_for_wos() {
@@ -211,6 +247,9 @@ BASH_SOURCE_DIR="$(resolve_bash_source)"
 copy_source_to_workdir "$BASH_SOURCE_DIR"
 patch_config_sub_for_wos "$BASH_WORK/support/config.sub"
 patch_shobj_conf_for_wos "$BASH_WORK/support/shobj-conf"
+if [ "$HOST_SYSTEM" = "WOS" ]; then
+    refresh_bash_release_generated_files "$BASH_WORK"
+fi
 write_config_site
 
 BUILD_TRIPLE="$(detect_bash_build_triple "$BASH_WORK/support/config.guess")"
@@ -252,6 +291,10 @@ export CONFIG_SITE="$BASH_BUILD/config.site"
         --without-installed-readline \
         --with-gnu-ld
 )
+
+if [ "$HOST_SYSTEM" = "WOS" ]; then
+    refresh_bash_build_generated_files "$BASH_WORK"
+fi
 
 if [ -f "$BASH_WORK/bash" ]; then
     for lib in "$TARGET_SYSROOT"/lib/libc.so "$TARGET_SYSROOT"/lib/libm.so "$TARGET_SYSROOT"/lib/libdl.so; do

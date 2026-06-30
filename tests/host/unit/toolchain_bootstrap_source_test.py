@@ -743,6 +743,23 @@ def test_bash_script_falls_back_to_target_triplet_on_native_wos() -> None:
     )
 
 
+def test_bash_script_handles_native_wos_autoconf_maintainer_rules() -> None:
+    source = (ROOT / "scripts" / "build" / "build_bash_for_wos.sh").read_text()
+    require_tokens(
+        source,
+        [
+            'HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"',
+            "refresh_bash_release_generated_files()",
+            "refresh_bash_build_generated_files()",
+            "wos_refresh_file_mtime",
+            "sleep 1",
+            'if [ "$HOST_SYSTEM" = "WOS" ]; then\n    refresh_bash_release_generated_files "$BASH_WORK"\nfi',
+            'if [ "$HOST_SYSTEM" = "WOS" ]; then\n    refresh_bash_build_generated_files "$BASH_WORK"\nfi',
+        ],
+        "Bash native WOS Autoconf maintainer-rule handling",
+    )
+
+
 def test_nasm_script_uses_release_tarball_without_self_hosted_autogen() -> None:
     source = WOS_NASM_BUILD.read_text()
     require_tokens(
