@@ -5,7 +5,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-STRACE_CPP = ROOT / "modules" / "strace" / "src" / "main.cpp"
+STRACE_SOURCE_DIR = ROOT / "modules" / "strace" / "src"
+
+
+def read_strace_sources() -> str:
+    return "\n".join(path.read_text() for path in sorted(STRACE_SOURCE_DIR.glob("*.cpp")))
 
 
 def fail(message: str) -> None:
@@ -41,7 +45,7 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
 
 
 def test_strace_startup_wait_is_deadline_bounded() -> None:
-    source = STRACE_CPP.read_text()
+    source = read_strace_sources()
     require_tokens(
         source,
         [
@@ -111,7 +115,7 @@ def test_strace_startup_wait_is_deadline_bounded() -> None:
 
 
 def test_strace_trace_loop_uses_ptrace_syscall_wait() -> None:
-    source = STRACE_CPP.read_text()
+    source = read_strace_sources()
     trace_body = function_body(source, "trace_loop")
     require_tokens(
         trace_body,
@@ -129,9 +133,24 @@ def test_strace_trace_loop_uses_ptrace_syscall_wait() -> None:
         fail("strace steady trace loop should use ptrace SYSCALL_WAIT, not raw waitpid polling")
 
 
+def test_strace_names_process_priority_syscalls() -> None:
+    source = read_strace_sources()
+    require_tokens(
+        source,
+        [
+            "case ker::abi::process::procmgmt_ops::SETPRIORITY:",
+            'return "setpriority";',
+            "case ker::abi::process::procmgmt_ops::GETPRIORITY:",
+            'return "getpriority";',
+        ],
+        "strace process priority syscall names",
+    )
+
+
 def main() -> None:
     test_strace_startup_wait_is_deadline_bounded()
     test_strace_trace_loop_uses_ptrace_syscall_wait()
+    test_strace_names_process_priority_syscalls()
     print("strace startup waits are deadline bounded")
 
 
