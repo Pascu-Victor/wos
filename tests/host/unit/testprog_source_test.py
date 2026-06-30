@@ -537,8 +537,12 @@ def test_wos_ssh_connect_path_is_bounded() -> None:
         source,
         [
             "SSH_CONNECT_TIMEOUT=\"${WOS_SSH_CONNECT_TIMEOUT:-10}\"",
+            "SSH_SERVER_ALIVE_INTERVAL=\"${WOS_SSH_SERVER_ALIVE_INTERVAL:-15}\"",
+            "SSH_SERVER_ALIVE_COUNT_MAX=\"${WOS_SSH_SERVER_ALIVE_COUNT_MAX:-4}\"",
             "-o ConnectTimeout=\"$SSH_CONNECT_TIMEOUT\"",
             "-o ConnectionAttempts=1",
+            "-o ServerAliveInterval=\"$SSH_SERVER_ALIVE_INTERVAL\"",
+            "-o ServerAliveCountMax=\"$SSH_SERVER_ALIVE_COUNT_MAX\"",
             "-o BatchMode=yes",
         ],
         "wos ssh connection timeout",

@@ -195,7 +195,7 @@ def require_deferred_switch_futex_cleanup_outside_runqueue_lock(source: str) -> 
 
 def require_timer_futex_cleanup_outside_runqueue_lock(source: str) -> None:
     body = function_body(source, "process_tasks")
-    locked_body, locked_end = braced_block_after(body, "run_queues->this_cpu_locked_void([NOW_US")
+    locked_body, locked_end = braced_block_after(body, "run_queues->this_cpu_locked_void([WAIT_SCAN_NOW_US")
     if "futex_wait_cleanup_for_task" in locked_body:
         fail("process_tasks must not call futex timeout cleanup while the runqueue lock is held")
     if "pending_wake_slot(futex_timeout_cleanup, futex_timeout_cleanup_count++) = w;" not in locked_body:
