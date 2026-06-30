@@ -754,6 +754,69 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
     task->in_signal_handler = true;
 }
 
+auto deliver_synchronous_signal_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& frame, int signo) -> bool {
+    auto* task = sched::get_current_task();
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS) {
+        return false;
+    }
+
+    if ((frame.cs & 0x3) != 0x3 || task->is_voluntary_blocked() || task->in_signal_handler) {
+        return false;
+    }
+    if (signo <= 0) {
+        return false;
+    }
+
+    auto const SIGNO = static_cast<unsigned>(signo);
+    if (SIGNO > sched::task::Task::MAX_SIGNALS) {
+        return false;
+    }
+
+    auto const IDX = SIGNO - 1;
+    auto& handler = task->sig_handlers.at(IDX);
+    if (!is_user_signal_handler(handler) || (task->sig_mask & (1ULL << IDX)) != 0) {
+        return false;
+    }
+    if (!user_signal_target_valid(handler)) {
+        ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);
+        __builtin_unreachable();
+    }
+
+    uint64_t const FRAME_ADDR = signal_frame_address_for_task(*task, frame.rsp, handler.flags);
+    SignalFrame sigframe{};
+
+    sigframe.pretcode = handler.restorer;
+    sigframe.signo = static_cast<uint64_t>(SIGNO);
+    sigframe.saved_mask = signal_frame_saved_mask_value(*task);
+    sigframe.saved_rip = frame.rip;
+    sigframe.saved_rsp = frame.rsp;
+    sigframe.saved_rflags = frame.flags;
+    sigframe.saved_retval = gpr.rax;
+
+    const auto* regs_arr = reinterpret_cast<const uint64_t*>(&gpr);
+    for (int i = 0; i < 15; i++) {
+        sigframe.saved_regs.at(static_cast<size_t>(i)) = regs_arr[i];
+    }
+
+    if (!write_signal_frame(*task, FRAME_ADDR, sigframe)) {
+        handle_signal_frame_fault(task);
+        return false;
+    }
+    consume_signal_frame_saved_mask(*task);
+
+    gpr.rdi = static_cast<uint64_t>(SIGNO);
+    frame.rip = handler.handler;
+    frame.rsp = FRAME_ADDR;
+
+    task->sig_mask |= handler.mask;
+    if ((handler.flags & 0x40000000ULL) == 0U) {
+        task->sig_mask |= (1ULL << IDX);
+    }
+    sync_task_signal_mask_cache(task);
+    task->in_signal_handler = true;
+    return true;
+}
+
 void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, gates::InterruptFrame& frame) {
     if (task == nullptr || task->type != sched::task::TaskType::PROCESS) {
         return;

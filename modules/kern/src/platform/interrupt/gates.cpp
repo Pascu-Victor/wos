@@ -27,6 +27,7 @@
 #include "platform/mm/paging.hpp"
 #include "platform/perf/perf_events.hpp"
 #include "platform/sched/scheduler.hpp"
+#include "platform/sys/signal.hpp"
 #include "util/hcf.hpp"
 
 namespace ker::mod::gates {
@@ -233,6 +234,9 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
         auto const FATAL_SIGNAL = static_cast<uint32_t>(signal_for_user_exception(frame.int_num));
         uint64_t const FATAL_ADDRESS = frame.int_num == 14 ? cr2 : frame.rip;
         if (ker::mod::debug::ptrace::report_user_exception_stop(gpr, frame, FATAL_SIGNAL, FATAL_ADDRESS, frame.int_num)) {
+            return;
+        }
+        if (ker::mod::sys::signal::deliver_synchronous_signal_interrupt(gpr, frame, static_cast<int>(FATAL_SIGNAL))) {
             return;
         }
 

@@ -67,6 +67,7 @@ inline auto signal_frame_address_for_task(const sched::task::Task& task, uint64_
 // Deliver one pending signal when an interrupt/scheduler path is about to
 // return directly to userspace via iretq.
 void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& frame);
+auto deliver_synchronous_signal_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& frame, int signo) -> bool;
 void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, gates::InterruptFrame& frame);
 void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDelivery delivery);
 auto restore_deferred_sigreturn(sched::task::Task* task) -> DeferredSigreturnResult;

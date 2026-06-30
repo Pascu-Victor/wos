@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 SIGNAL_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "signal.cpp"
+GATES_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "interrupt" / "gates.cpp"
 CONTEXT_SWITCH_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "context_switch.cpp"
 PROCESS_CALLNUMS = ROOT / "modules" / "kern" / "src" / "abi" / "callnums" / "process.h"
 PROCESS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "process.cpp"
@@ -183,6 +184,59 @@ def test_interrupt_signal_delivery_is_gated_by_user_return_frame() -> None:
             fail(f"{context} return path must not call interrupt signal delivery before the frame-mode gate")
 
 
+def test_synchronous_user_exceptions_can_reach_installed_signal_handlers_before_coredump() -> None:
+    signal_source = SIGNAL_CPP.read_text()
+    gates_source = GATES_CPP.read_text()
+    helper_body = function_body(signal_source, "deliver_synchronous_signal_interrupt")
+    exception_body = function_body(gates_source, "exception_handler")
+
+    require_tokens(
+        signal_source,
+        [
+            "auto deliver_synchronous_signal_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& frame, int signo) -> bool",
+        ],
+        "synchronous exception signal helper",
+    )
+    require_tokens(
+        helper_body,
+        [
+            "if (!is_user_signal_handler(handler) || (task->sig_mask & (1ULL << IDX)) != 0)",
+            "if (!user_signal_target_valid(handler))",
+            "sigframe.saved_rip = frame.rip;",
+            "sigframe.saved_rsp = frame.rsp;",
+            "sigframe.saved_retval = gpr.rax;",
+            "frame.rip = handler.handler;",
+            "frame.rsp = FRAME_ADDR;",
+            "task->in_signal_handler = true;",
+            "return true;",
+        ],
+        "synchronous exception helper must build the existing interrupt signal frame",
+    )
+    if "sig_pending" in helper_body:
+        fail("synchronous exception helper must deliver the requested signal directly, not the first pending signal")
+    require_tokens(
+        exception_body,
+        [
+            "if (ker::mod::debug::ptrace::report_user_exception_stop(gpr, frame, FATAL_SIGNAL, FATAL_ADDRESS, frame.int_num))",
+            "if (ker::mod::sys::signal::deliver_synchronous_signal_interrupt(gpr, frame, static_cast<int>(FATAL_SIGNAL)))",
+            "ker::mod::dbg::coredump::try_write_for_task(current_task_for_dump, gpr, frame, cr2, cr3, apic::get_apic_id());",
+        ],
+        "user exception path must try handled signal delivery before coredump",
+    )
+    require_order(
+        exception_body,
+        "ker::mod::debug::ptrace::report_user_exception_stop",
+        "ker::mod::sys::signal::deliver_synchronous_signal_interrupt",
+        "ptrace must observe the exception before direct signal delivery",
+    )
+    require_order(
+        exception_body,
+        "ker::mod::sys::signal::deliver_synchronous_signal_interrupt",
+        "ker::mod::dbg::coredump::try_write_for_task",
+        "handled synchronous exceptions must not be coredumped first",
+    )
+
+
 def test_sigpending_is_wired_through_wos_sysdeps() -> None:
     process_callnums = PROCESS_CALLNUMS.read_text()
     process_source = PROCESS_CPP.read_text()
@@ -254,5 +308,6 @@ if __name__ == "__main__":
     test_syscall_signal_delivery_updates_live_gs_scratch()
     test_signal_targets_are_user_canonical_on_all_delivery_paths()
     test_interrupt_signal_delivery_is_gated_by_user_return_frame()
+    test_synchronous_user_exceptions_can_reach_installed_signal_handlers_before_coredump()
     test_sigpending_is_wired_through_wos_sysdeps()
     print("signal syscall return invariants hold")
