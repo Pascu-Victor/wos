@@ -900,6 +900,7 @@ def test_wos_toolchain_uses_shared_busybox_and_dropbear_build_scripts() -> None:
             '"$B/../scripts/build/build_dropbear.sh"',
             'WOS_BASH_BUILD_DIR="$B/bash-build" \\',
             '"$B/../scripts/build/build_bash_for_wos.sh"',
+            'WOS_HOST_TOOLCHAIN_ROOT="$HOST" \\',
             'WOS_CLANG_FOR_WOS_BUILD_DIR="$B/clang-wos-build" \\',
             '"$B/../scripts/build/build_clang_for_wos.sh"',
         ],

@@ -529,7 +529,8 @@ echo "=== Phase 17 complete: Git ==="
 
 # 18. Build clang/lld for WOS userspace
 echo "=== Phase 18: clang/lld for WOS userspace ==="
-WOS_SYSROOT_PATH="$SYSROOT" \
+WOS_HOST_TOOLCHAIN_ROOT="$HOST" \
+    WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_CLANG_FOR_WOS_BUILD_DIR="$B/clang-wos-build" \
     "$B/../scripts/build/build_clang_for_wos.sh"
 echo "=== Phase 18 complete: clang/lld ==="
