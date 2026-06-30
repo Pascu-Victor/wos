@@ -16,15 +16,20 @@ Do not silently fall back to `build/`, `toolchain/sysroot`, `disk.qcow2`, or
 `mountfs.qcow2`. `--reset-sysroot` should delete and re-seed only the isolated
 KTEST sysroot from the current toolchain sysroot.
 
-Default diagnostic build options include KCFI, KUBSan, KASan, KCOV, selftests,
-network packet tracing, allocator diagnostics, memacc provenance, and
-mandelbench debug instrumentation. Read `docs/kernel_debug_flags.md` before
-adding more expensive flags.
+Default diagnostic build options include KCFI, report-mode KUBSan, KASan,
+KCOV, selftests, network packet tracing, allocator diagnostics, memacc
+provenance, libc++ `debug` hardening, and mandelbench debug instrumentation.
+`--fast` switches the isolated diagnostic build to `RelWithDebInfo`, libc++
+`fast` hardening, and no KCOV source-friendly `O0` override. `--ubtrap`
+switches from report-mode KUBSan to runtime-free `WOS_KERNEL_UBSAN_TRAP`.
+Read `docs/kernel_debug_flags.md` before adding more expensive flags.
 
 Useful commands:
 
 - `bin/wos-ktest --build-only --reset-sysroot`
 - `bin/wos-ktest --build-only`
+- `bin/wos-ktest --fast --build-only`
+- `bin/wos-ktest --ubtrap --build-only`
 - `bin/wos-ktest --no-build --no-package`
 - `bin/wos-ktest --teardown`
 

@@ -4,61 +4,182 @@ applyTo: "modules/kern/src/net/wki/**"
 
 # WKI Subsystem Conventions
 
-## Namespace & Code Organization
+WKI code is one of the highest-risk areas of WOS. It combines networking, wire protocol, peer state, routing, reliable channels, remote VFS, remote compute, eventing, remote devices, and fencing.
 
-- All code lives in `ker::net::wki`. Internal RX handlers go in `ker::net::wki::detail`.
-- Anonymous namespaces in `.cpp` files hold storage (`g_*` globals) and helper functions.
-- Global state singleton: `extern WkiState g_wki;` (declared in `wki.hpp`).
+## Namespace and organization
 
-## Function Naming
+- All WKI code lives in `ker::net::wki`.
+- Internal RX handlers live in `ker::net::wki::detail`.
+- Anonymous namespaces in `.cpp` files hold file-local storage such as `g_*` globals and helpers.
+- The global state singleton is `extern WkiState g_wki;`, declared in `wki.hpp` and defined in `wki.cpp`.
 
-- Public API: `wki_*()` (e.g., `wki_init()`, `wki_send()`, `wki_peer_find()`)
-- Subsystem-specific: `wki_<subsys>_*()` (e.g., `wki_remote_vfs_mount()`, `wki_dev_proxy_attach_block()`)
-- RX handlers: `detail::handle_*()` (e.g., `detail::handle_hello()`, `detail::handle_task_submit()`)
-- Timer callbacks: `wki_*_timer_tick()`, `wki_timer_thread()`
+## Function naming
 
-## Key Constants (use these, not magic numbers)
+- Public API functions: `wki_*()`.
+- Subsystem-specific functions: `wki_<subsys>_*()`.
+- RX handlers: `detail::handle_*()`.
+- Timer callbacks: `wki_*_timer_tick()` or `wki_timer_thread()`.
 
-- Path limits: `Task::CWD_MAX` (256), `Task::EXE_PATH_MAX` (256), `WKI_HOSTNAME_MAX` (64)
-- Wire: `WKI_HEADER_SIZE` (32), `WKI_ETH_MAX_PAYLOAD` (8954)
-- VFS: `VFS_EXPORT_PATH_LEN` (256), `VFS_RDMA_BULK_SIZE` (2MB)
-- Timeouts: `WKI_OP_TIMEOUT_US` (5s), `WKI_DEV_PROXY_TIMEOUT_US` (100ms)
-- Peer: `WKI_MAX_PEERS` (256), `WKI_NODE_INVALID` (0x0000), `WKI_NODE_BROADCAST` (0xFFFF)
+## Read first for WKI tasks
+
+Always read:
+
+- `modules/kern/src/net/wki/wki.hpp`
+- `modules/kern/src/net/wki/wire.hpp`
+- `modules/kern/src/net/wki/wki.cpp`
+- The specific subsystem file being touched.
+
+For remote VFS:
+
+- `remote_vfs.hpp`
+- `remote_vfs.cpp`
+- VFS core/mount/path code.
+
+For remote compute:
+
+- `remote_compute.hpp`
+- `remote_compute.cpp`
+- Scheduler/task code.
+
+For device proxy/server:
+
+- `dev_proxy.hpp`, `dev_proxy.cpp`
+- `dev_server.hpp`, `dev_server.cpp`
+- `remotable.hpp`, `remotable.cpp`
+- `blk_ring.hpp`
+
+## Current local file map
+
+Reviewed: 2026-06-01.
+
+Observed WKI files include:
+
+- Core: `wki.hpp`, `wki.cpp`, `wire.hpp`
+- Peer/channel/routing: `peer.*`, `channel.*`, `routing.*`
+- Shared memory/zones: `zone.*`
+- Events: `event.*`
+- Remote device/resource: `dev_proxy.*`, `dev_server.*`, `remotable.*`, `blk_ring.hpp`, `irq_fwd.*`
+- Remote files/network/compute/IPC: `remote_vfs.*`, `remote_net.*`, `remote_compute.*`, `remote_ipc.*`, `remote_ipc_socket.cpp`
+- Transports: `transport_eth.*`, `transport_roce.*`, `transport_ivshmem.*`
+
+Verify this list against the local branch before relying on it.
+
+## Key constants and concepts
+
+Use named constants instead of magic numbers.
+
+- Wire: `WKI_HEADER_SIZE`, `WKI_ETH_MAX_PAYLOAD`, `WKI_MAX_FRAME_SIZE`
+- Peers: `WKI_MAX_PEERS`, `WKI_NODE_INVALID`, `WKI_NODE_BROADCAST`
+- Channels: `WKI_CHAN_CONTROL`, `WKI_CHAN_ZONE_MGMT`, `WKI_CHAN_EVENT_BUS`, `WKI_CHAN_RESOURCE`, `WKI_CHAN_DYNAMIC_BASE`, `WKI_CHAN_DYNAMIC_RESERVED_BASE`, `WKI_CHAN_IPC_DATA`
+- Peer/channel capacities: `WKI_MAX_TRANSPORTS`, `WKI_MAX_CHANNELS`
+- IPC/data credits: `WKI_CREDITS_IPC_DATA`, `WKI_REORDER_IPC_DATA` when touching remote IPC paths.
+- Heartbeat/RTO/credit constants from `wki.hpp`
+- VFS: `VFS_EXPORT_PATH_LEN`, `VFS_RDMA_BULK_SIZE` when present locally
+- Timeouts: `WKI_OP_TIMEOUT_US`, `WKI_DEV_PROXY_TIMEOUT_US`, `WKI_TASK_SUBMIT_TIMEOUT_US` when present locally
+
+Local values reviewed on 2026-06-01 include:
+
+- `WKI_MAX_PEERS = 256`
+- `WKI_MAX_TRANSPORTS = 8`
+- `WKI_MAX_CHANNELS = 256`
+- `WKI_HEADER_SIZE = 32`
+- `WKI_ETH_MAX_PAYLOAD = 8954`
+- `WKI_NODE_INVALID = 0x0000`
+- `WKI_NODE_BROADCAST = 0xFFFF`
+- well-known channels `0..3`, dynamic channels starting at `16`, reserved dynamic channels starting at `240`, and `WKI_CHAN_IPC_DATA = 240`
+
+## Wire protocol rules
+
+- All wire structs use `__attribute__((packed))`.
+- Fixed-size wire structs must have `static_assert` size checks.
+- Do not reorder fields in wire structs unless intentionally changing protocol ABI.
+- Check all handlers before adding or changing `MsgType` values.
+- Check payload-length validation before reading variable-length data.
+- Preserve sequence number arithmetic helpers in `wire.hpp`.
+- Preserve channel ID semantics.
 
 ## Locking
 
-- Per-peer: `WkiPeer::lock` (`Spinlock`)
-- Per-channel: `WkiChannel::lock` (`Spinlock`)
+Known locks include:
+
+- Per-peer: `WkiPeer::lock`
+- Per-channel: `WkiChannel::lock`
 - Global peer table: `WkiState::peer_lock`
-- `remote_compute.cpp`: `s_compute_lock` (file-local `Spinlock`)
+- Transport registry: `WkiState::transport_lock`
+- Channel pool lock in `wki.cpp`
+- `remote_compute.cpp`: file-local compute lock if present in local branch
 - Per-proxy: `ProxyVfsState::lock`, `ProxyNetState::lock`, `ProxyBlockState::lock`
 
-## Prefer `std::array` over C-style arrays for local buffers
+Before taking a lock, check whether RX/NAPI, scheduler, syscall, or timer context could already hold another relevant lock.
 
-Use `std::array<char, N>` with `.data()` and `.size()` instead of raw `char buf[N]`.
+## Preferred buffer style
 
-## VFS Path Construction
+Prefer `std::array` over C-style arrays for local buffers. Use `.data()` and `.size()`.
 
-Remote VFS paths follow the pattern `/wki/<hostname>/<local_path_without_leading_slash>`.
+C-style arrays may remain where required by ABI, packed wire overlays, compiler constraints, or existing carefully audited code. Do not perform broad style-only rewrites.
 
-- During init: `vfs_symlink("/", "/wki/<local_hostname>")` creates a self-symlink
-- On peer connect: `wki_remote_vfs_mount()` creates `FSType::REMOTE` mounts under `/wki/<peer_hostname>`
-- When building VFS_REF paths: strip leading `/` from the absolute local path, then prepend `/wki/<hostname>/`
+## WKI initialization
 
-## Critical Gotchas
+Local `wki_init()` initializes the global node state and then initializes WKI subsystems. Observed order includes routing, zone, RoCE transport, remotable devices, device server, device proxy, event bus, IRQ forwarding, remote VFS, remote NIC, remote compute, and the IPC proxy subsystem.
 
-1. **Cannot use `make_absolute()` from scheduler hooks or remote compute**: It calls `get_current_task()` which returns the _running_ task, not the task being submitted. Resolve relative paths manually using `task->cwd`.
+If adding a subsystem, check dependency order. Do not assume a later subsystem is available during earlier initialization.
 
-2. **NAPI re-entrance deadlocks**: `wki_remote_vfs_mount()` and `wki_zone_create()` spin-wait for ACKs. If called from NAPI poll context, the ACK can never arrive. Always defer these to the timer tick via pending queues.
+## Transport and send path notes
 
-3. **`std::atomic<bool>` deletes move constructors**: Structs containing atomics (`SubmittedTask`, `DevServerBinding`, `ProxyBlockState`) need explicit move constructors using `std::memory_order_relaxed` load/store.
+Local send path concepts:
 
-4. **Recursive VFS protection**: Server-side path resolution must not follow into other `FSType::REMOTE` mounts (`path_crosses_remote_mount()`). Readdir on remote `/wki/` dirs filters out self-referencing entries.
+- `wki_send_raw()` is used for raw/unreliable messages such as HELLO/HEARTBEAT.
+- `wki_send()` sends reliable messages through a `WkiChannel` with credits, seq/ack, retransmit tracking, and transport resolution.
+- Direct single-hop peers may bypass WKI CRC when Ethernet FCS is considered sufficient; routed paths may use CRC.
+- Transport ownership of `PacketBuffer` differs by TX function; verify before changing ownership or error paths.
 
-5. **Fence lifecycle**: Proxy block devices are suspended (not destroyed) on fence, with a 30s grace period. If the peer reconnects, ops resume. After timeout, hard teardown + unmount.
+## Async/spin-wait pattern
 
-## Wire Protocol
+Use the local branch's established async wait pattern. Existing local instructions mention:
 
-- All wire structs use `__attribute__((packed))` with `static_assert` on size.
-- Channels: `WKI_CHAN_CONTROL` (0), `WKI_CHAN_ZONE_MGMT` (1), `WKI_CHAN_EVENT_BUS` (2), `WKI_CHAN_RESOURCE` (3), dynamic channels start at `WKI_CHAN_DYNAMIC_BASE` (16+).
-- Async wait pattern: `WkiWaitEntry` on kernel stack + `wki_wait_for_op()` / `wki_wake_op()`.
+- `WkiWaitEntry` on the kernel stack.
+- `wki_wait_for_op()` / `wki_wake_op()`.
+
+The local branch also contains targeted spin-yield helpers such as `wki_spin_yield()` and `wki_spin_yield_channel()` for spin-wait loops that need to drive WKI progress. Verify the current wait pattern before editing.
+
+## Remote VFS path construction
+
+Remote VFS paths follow:
+
+```text
+/wki/<hostname>/<local_path_without_leading_slash>
+```
+
+Rules:
+
+- During init, the local hostname/self path may be symlinked to `/wki/<local_hostname>` in local-branch code.
+- On peer connect, remote VFS mounts may be created under `/wki/<peer_hostname>`.
+- When building VFS_REF paths, strip the leading `/` from the absolute local path, then prepend `/wki/<hostname>/`.
+- Server-side path resolution must not follow into another `FSType::REMOTE` mount.
+- Readdir on remote `/wki/` directories must filter self-referencing entries.
+
+## Critical WKI gotchas
+
+1. Do not use `make_absolute()` from scheduler hooks or remote compute if it resolves through `get_current_task()`. That can resolve against the running task, not the task being submitted. Resolve relative paths manually with the submitted task's `cwd`.
+
+2. Do not call ACK-waiting operations such as `wki_remote_vfs_mount()` or `wki_zone_create()` from NAPI poll/RX context. The ACK may require the same context to progress. Defer to a timer/thread/pending queue.
+
+3. Structs containing `std::atomic<bool>` need explicit move constructors if stored in containers that move elements. Use relaxed load/store for move-only state copies when that is the intended semantics.
+
+4. Server-side path resolution must protect against recursive remote mount traversal using the local branch's protection helper, such as `path_crosses_remote_mount()` when present.
+
+5. Proxy block devices are suspended, not immediately destroyed, on fence. Reconnect may resume operations during the grace period; after timeout, hard teardown and unmount are expected.
+
+6. Do not broaden WKI logging in hot RX/TX/spin-wait paths without checking allocation and lock behavior.
+
+7. Remote IPC paths (`remote_ipc.*`, `remote_ipc_socket.cpp`) are WKI resource/data-channel users for cross-node pipe, socket, PTY, futex, eventfd, and epoll forwarding. Check `s_ipc_lock`, exported file references, proxy refcounts, poll waiters, and deferred DEV_OP worker behavior before changing them.
+
+## Logging in WKI
+
+New WKI code should use the journal-backed typed logger convention when available:
+
+```cpp
+using log = ker::mod::dbg::logger<"wki">;
+```
+
+Existing old-style `ker::mod::dbg::log("[WKI] ...")` may remain during migration. Do not perform a wholesale logging migration unless requested.
