@@ -439,6 +439,15 @@ auto free_inode_data_extent(XfsInode* ip, XfsTransaction* tp, xfs_fsblock_t star
     xfs_agnumber_t agno = xfs_ag_number(startblock, mount->ag_blk_log);
     xfs_agblock_t agbno = xfs_ag_block(startblock, mount->ag_blk_log);
     xfs_filblks_t remaining = blockcount;
+    uint64_t const DEV_BLOCK = inode_fsblock_to_dev_block(mount, startblock);
+    size_t const DEV_COUNT = inode_fsb_to_dev_count(mount, blockcount);
+
+    if (mount->device != nullptr) {
+        int const SYNC_RC = sync_bdev_range(mount->device, DEV_BLOCK, DEV_COUNT);
+        if (SYNC_RC != 0) {
+            return SYNC_RC;
+        }
+    }
 
     while (remaining > 0) {
         if (agno >= mount->ag_count || agbno >= mount->ag_blocks) {
@@ -462,7 +471,7 @@ auto free_inode_data_extent(XfsInode* ip, XfsTransaction* tp, xfs_fsblock_t star
     }
 
     if (mount->device != nullptr) {
-        discard_bdev_range(mount->device, inode_fsblock_to_dev_block(mount, startblock), inode_fsb_to_dev_count(mount, blockcount));
+        discard_bdev_range(mount->device, DEV_BLOCK, DEV_COUNT);
     }
 
     return 0;

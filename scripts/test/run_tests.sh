@@ -159,6 +159,7 @@ UNIT_TESTS=(
     xfs_metadata_lock_source_test
     xfs_metadata_source_test
     xfs_close_source_test
+    xfs_extent_free_source_test
     xfs_btree_source_test
     xfs_dir_growth_source_test
     xfs_ialloc_source_test

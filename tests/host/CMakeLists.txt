@@ -257,6 +257,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_close_source_test.py
 )
 add_test(
+    NAME xfs_extent_free_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_extent_free_source_test.py
+)
+add_test(
     NAME xfs_btree_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_btree_source_test.py
 )
@@ -356,6 +360,7 @@ set_tests_properties(
     xfs_metadata_lock_source_test
     xfs_metadata_source_test
     xfs_close_source_test
+    xfs_extent_free_source_test
     xfs_btree_source_test
     xfs_dir_growth_source_test
     xfs_ialloc_source_test
