@@ -673,7 +673,12 @@ void tcp_close_op(Socket* sock) {
     }
 
     if (WAS_LISTENER) {
+        uint64_t const SOCK_FLAGS = sock->lock.lock_irqsave();
+        sock->state = SocketState::CLOSED;
+        sock->lock.unlock_irqrestore(SOCK_FLAGS);
+
         tcp_remove_listener(cb);
+        tcp_drain_accept_queue(sock);
     }
 
     tcp_bind_lock.lock();
@@ -962,6 +967,58 @@ void tcp_cb_release(TcpCB* cb) {
     }
     if (cb->refcnt.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         tcp_cb_destroy(cb);
+    }
+}
+
+void tcp_destroy_unaccepted_child(Socket* child) {
+    if (child == nullptr) {
+        return;
+    }
+
+    child->accept_next = nullptr;
+    child->state = SocketState::CLOSED;
+
+    auto* cb = static_cast<TcpCB*>(child->proto_data);
+    if (cb != nullptr) {
+        cb->lock.lock();
+        cb->state = TcpState::CLOSED;
+        cb->lock.unlock();
+
+        tcp_free_cb(cb);
+        child->proto_data = nullptr;
+        cb->socket = nullptr;
+        tcp_cb_release(cb);
+    }
+
+    socket_destroy(child);
+}
+
+void tcp_drain_accept_queue(Socket* listener) {
+    if (listener == nullptr) {
+        return;
+    }
+
+    for (;;) {
+        uint64_t const FLAGS = listener->lock.lock_irqsave();
+        Socket* child = listener->aq_head;
+        if (child == nullptr) {
+            listener->aq_tail = nullptr;
+            listener->aq_count = 0;
+            listener->lock.unlock_irqrestore(FLAGS);
+            return;
+        }
+
+        listener->aq_head = child->accept_next;
+        if (listener->aq_head == nullptr) {
+            listener->aq_tail = nullptr;
+        }
+        if (listener->aq_count > 0) {
+            listener->aq_count--;
+        }
+        child->accept_next = nullptr;
+        listener->lock.unlock_irqrestore(FLAGS);
+
+        tcp_destroy_unaccepted_child(child);
     }
 }
 

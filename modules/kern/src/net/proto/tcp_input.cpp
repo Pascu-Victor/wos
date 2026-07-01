@@ -541,13 +541,21 @@ auto discard_orphaned_payload(TcpCB* cb, size_t payload_len, uint32_t seg_seq) -
 
 // Handle SYN on a listening socket.
 void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, IPv4Address src_ip, IPv4Address dst_ip) {
-    Socket const* listen_sock = listener->socket;
+    Socket* listen_sock = listener->socket;
     if (listen_sock == nullptr) {
         return;
     }
 
-    if (std::cmp_greater_equal(listen_sock->aq_count, listen_sock->backlog)) {
-        log::warn("accept queue full port=%u aq=%zu backlog=%d", listener->local_port, listen_sock->aq_count, listen_sock->backlog);
+    uint64_t const LISTEN_FLAGS = listen_sock->lock.lock_irqsave();
+    size_t const AQ_COUNT = listen_sock->aq_count;
+    int const BACKLOG = listen_sock->backlog;
+    bool const CAN_CREATE_CHILD = listen_sock->state == SocketState::LISTENING && std::cmp_less(AQ_COUNT, BACKLOG);
+    listen_sock->lock.unlock_irqrestore(LISTEN_FLAGS);
+
+    if (!CAN_CREATE_CHILD) {
+        if (std::cmp_greater_equal(AQ_COUNT, BACKLOG)) {
+            log::warn("accept queue full port=%u aq=%zu backlog=%d", listener->local_port, AQ_COUNT, BACKLOG);
+        }
         return;
     }
 
@@ -595,7 +603,9 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, IPv4Address src_ip
 
     tcp_insert_cb(child_cb);
 
-    tcp_send_segment(child_cb, TCP_SYN | TCP_ACK, nullptr, 0);
+    if (!tcp_send_segment(child_cb, TCP_SYN | TCP_ACK, nullptr, 0)) {
+        tcp_destroy_unaccepted_child(child);
+    }
 }
 }  // namespace
 
@@ -714,8 +724,9 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     cb->lock.unlock_irqrestore(cb_lock_flags);
 
                     if (child_sock != nullptr) {
-                        child_sock->state = SocketState::CONNECTED;
                         TcpCB* listener = tcp_find_listener(SAVED_LOCAL_IP, SAVED_LOCAL_PORT);
+                        bool child_enqueued = false;
+                        Socket* listener_sock_to_wake = nullptr;
 #ifdef TCP_DEBUG
                         log::debug("SYN_RCVD->ESTAB: port=%u listener=%p owner_pid=%lu", SAVED_LOCAL_PORT, static_cast<void*>(listener),
                                    (listener != nullptr && listener->socket != nullptr) ? listener->socket->owner_pid : 0UL);
@@ -723,7 +734,8 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                         if (listener != nullptr && listener->socket != nullptr) {
                             Socket* lsock = listener->socket;
                             uint64_t const LSOCK_FLAGS = lsock->lock.lock_irqsave();
-                            if (std::cmp_less(lsock->aq_count, lsock->backlog)) {
+                            if (lsock->state == SocketState::LISTENING && std::cmp_less(lsock->aq_count, lsock->backlog)) {
+                                child_sock->state = SocketState::CONNECTED;
                                 child_sock->accept_next = nullptr;
                                 if (lsock->aq_tail != nullptr) {
                                     lsock->aq_tail->accept_next = child_sock;
@@ -732,12 +744,13 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                                 }
                                 lsock->aq_tail = child_sock;
                                 lsock->aq_count++;
+                                child_enqueued = true;
+                                listener_sock_to_wake = lsock;
                             }
 #ifdef TCP_DEBUG
                             log::debug("SYN_RCVD->ESTAB: enqueued child, aq_count=%zu", lsock->aq_count);
 #endif
                             lsock->lock.unlock_irqrestore(LSOCK_FLAGS);
-                            wake_socket(lsock);
                         } else {
 #ifdef TCP_DEBUG
                             log::debug("SYN_RCVD->ESTAB: no listener found for port=%u", SAVED_LOCAL_PORT);
@@ -745,6 +758,13 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                         }
                         if (listener != nullptr) {
                             tcp_cb_release(listener);
+                        }
+                        if (child_enqueued) {
+                            wake_socket(listener_sock_to_wake);
+                        } else {
+                            tcp_destroy_unaccepted_child(child_sock);
+                            tcp_cb_release(cb);
+                            return;
                         }
                     }
 

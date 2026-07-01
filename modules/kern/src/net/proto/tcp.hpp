@@ -250,6 +250,8 @@ void tcp_remove_listener(TcpCB* cb);
 void tcp_free_cb(TcpCB* cb);
 void tcp_cb_acquire(TcpCB* cb);
 void tcp_cb_release(TcpCB* cb);
+void tcp_destroy_unaccepted_child(Socket* child);
+void tcp_drain_accept_queue(Socket* listener);
 auto tcp_find_cb(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> TcpCB*;
 auto tcp_find_listener(uint32_t local_ip, uint16_t local_port) -> TcpCB*;
 auto tcp_listener_snapshot(TcpListenerSnapshot* out, size_t max) -> size_t;

@@ -165,6 +165,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tcp_fin_source_test.py
 )
 add_test(
+    NAME tcp_passive_open_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tcp_passive_open_source_test.py
+)
+add_test(
     NAME tcp_retransmit_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tcp_retransmit_source_test.py
 )
@@ -357,6 +361,7 @@ set_tests_properties(
     tcp_deadline_source_test
     tcp_ephemeral_source_test
     tcp_fin_source_test
+    tcp_passive_open_source_test
     tcp_retransmit_source_test
     poll_deadline_source_test
     futex_source_test
