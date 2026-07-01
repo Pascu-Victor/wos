@@ -5,6 +5,7 @@ applyTo: "**"
 # WOS Repo Intelligence Cache
 
 Generated: 2026-06-01.
+Last refreshed for local path and module inventory: 2026-07-01.
 
 Baseline sources:
 
@@ -20,7 +21,7 @@ WOS is a multi-system, multi-tasking operating system intended to scale across m
 
 ## Build facts
 
-Public `main` previously showed only the smaller baseline module set. Local workspace verified on 2026-06-01 shows:
+Public `main` previously showed only the smaller baseline module set. Local workspace refreshed on 2026-07-01 shows:
 
 - Root `CMakeLists.txt` includes `ExternalProject`, builds tools from `tools/`, and then adds `modules/`.
 - `modules/CMakeLists.txt` uses a sysroot at `toolchain/sysroot`, sets `clang`/`clang++` from the host toolchain area, enables C++23, uses static linking, and adds subdirectories:
@@ -36,29 +37,36 @@ Public `main` previously showed only the smaller baseline module set. Local work
   - `memacc`
   - `journal`
   - `wkictl`
+  - `powerctl`
   - `renderbench`
   - `strace`
   - `sftpserver`
+- `modules/journal/CMakeLists.txt` also builds the shared `journal_lib` target as `libjournal.so`.
 - `modules/kern/CMakeLists.txt` builds the kernel executable `wos` from recursive `src/*.c`, `src/*.cpp`, `src/*.S`, and `src/*.asm`; kernel compile options include freestanding/no-builtin/no-red-zone/no-SIMD constraints, no exceptions/RTTI/thread-safe statics for C++, deterministic overflow semantics in the normal build, libc++ `fast` hardening by default, and `-mcmodel=kernel`.
-- `configs/rootfs/aliases.tsv` installs several WOS utility targets into `/usr/bin` or `/usr/sbin`, including `perf`, `top`, `memacc`, `strace`, `journalctl`, `journald`, and `wkictl` plus the `wkictl` convenience symlinks.
+- `configs/rootfs/aliases.tsv` installs several WOS utility targets into `/usr/bin`, `/usr/sbin`, or `/usr/libexec`, including `perf`, `top`, `memacc`, `renderbench`, `debugserver`, `strace`, `journalctl`, `journald`, `wkictl`, `powerctl`, and `sftp-server` plus the `wkictl` and `powerctl` convenience symlinks.
 
 Prefer the workspace `Build WOS` task over manual public README commands. Manual commands are fallback only when the task is unavailable.
-Do not use retired root-level build helpers such as `scripts/build_kern.sh`;
-inspect `.vscode/tasks.json` for the current task command shape instead.
-Manual formatting uses `scripts/dev/format_repo.sh --check <paths>`; do not
-use the retired root-level `scripts/format_repo.sh` path.
+Use the workspace `Build WOS` task; inspect `.vscode/tasks.json` for the
+current task command shape when the task is unavailable. Manual formatting uses
+`scripts/dev/format_repo.sh --check <paths>`.
 
 ## Local submodules
 
-Local `.gitmodules` reviewed on 2026-06-01 lists:
+Local `.gitmodules` reviewed on 2026-07-01 lists:
 
 - `modules/extern/limine` from `https://github.com/limine-bootloader/limine.git`
 - `toolchain/src/llvm-project` from `https://github.com/Pascu-Victor/llvm-project.git`
 - `toolchain/src/mlibc` from `https://github.com/Pascu-Victor/mlibc.git`
 - `toolchain/src/dropbear` from `https://github.com/Pascu-Victor/dropbear.git`
 - `toolchain/src/busybox` from `https://github.com/Pascu-Victor/busybox.git`
+- `tools/wireshark/WireMCP` from `https://github.com/0xKoda/WireMCP.git`
+- `toolchain/src/cmake` from `https://github.com/Pascu-Victor/CMake.git`
+- `toolchain/src/ninja` from `https://github.com/Pascu-Victor/ninja.git`
+- `toolchain/src/python` from `https://github.com/Pascu-Victor/cpython.git`
+- `toolchain/src/nasm` from `https://github.com/Pascu-Victor/nasm.git`
+- `toolchain/src/clang-tidy-cache` from `https://github.com/williamfligor/clang-tidy-cache.git`
 
-The old public-baseline `modules/stdlib/musl` note is stale for this workspace. Verify local submodule checkout state before editing toolchain/libc code.
+Verify local submodule checkout state before editing toolchain/libc code.
 
 ## Major source areas
 
@@ -80,6 +88,7 @@ The old public-baseline `modules/stdlib/musl` note is stale for this workspace. 
 - `modules/memacc/`: WOS memory-accounting utility over `/proc/memacc`.
 - `modules/journal/`: WOS journal query/daemon binary and `libjournal.so`.
 - `modules/wkictl/`: WKI control utility and placement/routing convenience command implementation.
+- `modules/powerctl/`: WOS power control utility backing `powerctl`, `reboot`, `poweroff`, `halt`, and `shutdown`.
 - `modules/renderbench/`: rendering benchmark/userspace target.
 - `modules/strace/`: WOS ptrace syscall tracer.
 - `modules/sftpserver/`: SFTP server/userspace target.
@@ -128,10 +137,8 @@ Key files under `modules/kern/src/net/wki/` reviewed locally on 2026-06-01 inclu
 Existing local instructions specify:
 
 - Use the `Build WOS` task.
-- Use `scripts/dev/format_repo.sh --check <paths>` for formatting checks; the
-  old root-level `scripts/format_repo.sh` path is retired.
-- Do not use the old root-level `scripts/build_kern.sh` path; use `Build WOS`
-  or the current task command in `.vscode/tasks.json`.
+- Use `scripts/dev/format_repo.sh --check <paths>` for formatting checks.
+- Use `Build WOS` or the current task command in `.vscode/tasks.json`.
 - Treat mountfs/libguestfs/qemu appliance build failures as cluster/debug-VM state problems.
 - Runtime debugging must be performed by the user.
 - Kernel logging should use the journal-backed logging API with typed loggers for new code.

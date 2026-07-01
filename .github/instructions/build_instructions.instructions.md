@@ -18,8 +18,6 @@ cmake -GNinja -B build .
 cmake --build build
 ```
 
-Do not use retired root-level script references such as
-`scripts/build_kern.sh`; this workspace no longer uses that build entrypoint.
 When in doubt, inspect `.vscode/tasks.json` and mirror the current `Build WOS`
 task command.
 
@@ -58,8 +56,8 @@ When running the repo formatter manually, use the current workspace path:
 scripts/dev/format_repo.sh --check <paths>
 ```
 
-Do not use retired root-level formatter references such as
-`scripts/format_repo.sh`; this workspace uses `scripts/dev/format_repo.sh`.
+Use this formatter path for manual checks unless the workspace instructions are
+updated again.
 
 ## Cluster / VM state failures
 
@@ -98,25 +96,32 @@ Do not claim to have run this debug flow unless it was actually available and ru
 - Kernel binary: `build/modules/kern/wos`
 - Init binary: `build/modules/init/init`
 - Test program binary: `build/modules/testprog/testprog`
+- Test daemon binary: `build/modules/testd/testd`
+- Network daemon binary: `build/modules/netd/netd`
+- Debug server binary: `build/modules/debugserver/debugserver`
 - HTTP server binary: `build/modules/httpd/httpd`
 - Perf utility: `build/modules/perf/perf`
 - Top utility: `build/modules/top/top`
 - Memory accounting utility: `build/modules/memacc/memacc`
 - Journal utility/daemon binary: `build/modules/journal/journal`
 - WKI control utility: `build/modules/wkictl/wkictl`
+- Power control utility: `build/modules/powerctl/powerctl`
+- Render benchmark binary: `build/modules/renderbench/renderbench`
 - Strace utility: `build/modules/strace/strace`
+- SFTP server binary: `build/modules/sftpserver/sftp-server`
 
 ## CMake facts
 
-Local workspace verified on 2026-06-01:
+Local workspace verified on 2026-07-01:
 
 - Root `CMakeLists.txt` builds `tools/` through `ExternalProject` and then adds `modules/`.
 - A fresh single-config root build defaults to `CMAKE_BUILD_TYPE=RelWithDebInfo`;
   host-side WOS tools use the separate `WOS_TOOLS_BUILD_TYPE` cache value,
   defaulting to `Release`.
-- `modules/CMakeLists.txt` uses `toolchain/sysroot` as sysroot and adds `kern`, `init`, `testprog`, `testd`, `netd`, `httpd`, `debugserver`, `perf`, `top`, `memacc`, `journal`, `wkictl`, `renderbench`, `strace`, and `sftpserver`.
+- `modules/CMakeLists.txt` uses `toolchain/sysroot` as sysroot and adds `kern`, `init`, `testprog`, `testd`, `netd`, `httpd`, `debugserver`, `perf`, `top`, `memacc`, `journal`, `wkictl`, `powerctl`, `renderbench`, `strace`, and `sftpserver`.
+- `modules/journal/CMakeLists.txt` also builds the shared `journal_lib` target as `libjournal.so`.
 - `modules/kern/CMakeLists.txt` builds kernel target `wos`, recursively globs sources under `modules/kern/src`, disables hosted C++ runtime features for kernel C++, applies freestanding/no-builtin/no-red-zone/no-SIMD kernel flags, and defaults kernel libc++ hardening to `fast`.
-- `configs/rootfs/aliases.tsv` installs utility targets such as `perf`, `top`, `memacc`, `strace`, `journalctl`, `journald`, `wkictl`, and the `wkictl` convenience symlinks into the target rootfs.
+- `configs/rootfs/aliases.tsv` installs utility targets such as `testprog`, `testd`, `perf`, `top`, `memacc`, `renderbench`, `debugserver`, `strace`, `journalctl`, `journald`, `wkictl`, `powerctl`, and `sftp-server` into the target rootfs, plus convenience symlinks for `wkictl`, `powerctl`, and toolchain utilities.
 
 Do not infer GNU coreutils, systemd, Linux `perf`, procps `top`, or upstream `strace` behavior from these utility names. They are WOS userland programs and their option set may differ.
 

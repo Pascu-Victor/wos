@@ -34,13 +34,19 @@ cmake --build build
 - Kernel: `build/modules/kern/wos`
 - Init: `build/modules/init/init`
 - Test program: `build/modules/testprog/testprog`
+- Test daemon: `build/modules/testd/testd`
+- Network daemon: `build/modules/netd/netd`
+- Debug server: `build/modules/debugserver/debugserver`
 - HTTP server: `build/modules/httpd/httpd`
 - Perf utility: `build/modules/perf/perf`
 - Top utility: `build/modules/top/top`
 - Memory accounting utility: `build/modules/memacc/memacc`
 - Journal utility/daemon binary: `build/modules/journal/journal`
 - WKI control utility: `build/modules/wkictl/wkictl`
+- Power control utility: `build/modules/powerctl/powerctl`
+- Render benchmark: `build/modules/renderbench/renderbench`
 - Strace utility: `build/modules/strace/strace`
+- SFTP server: `build/modules/sftpserver/sftp-server`
 
 These utility names are WOS programs, not GNU coreutils or guaranteed Linux/systemd/procps/upstream-tool equivalents. Check the local module source or usage text before assuming options.
 
@@ -76,8 +82,7 @@ continue
 ### Formatting-only or style-sensitive changes
 
 - `scripts/dev/format_repo.sh --check <paths>`
-- Do not use retired root-level formatter references such as
-  `scripts/format_repo.sh`; this workspace uses `scripts/dev/format_repo.sh`.
+- Use this formatter path for manual checks unless the workspace instructions are updated again.
 
 ### Kernel syscall changes
 

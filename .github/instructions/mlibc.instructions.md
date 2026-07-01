@@ -8,7 +8,7 @@ These rules apply when the local branch contains `toolchain/src/mlibc/**`.
 
 Reviewed: 2026-06-01.
 
-Local `.gitmodules` currently contains `toolchain/src/mlibc`, `toolchain/src/busybox`, and `toolchain/src/dropbear` submodules, and no `modules/stdlib/musl` submodule. Before editing libc code, still verify the local workspace because this area changes quickly.
+Local `.gitmodules` currently contains `toolchain/src/mlibc` plus the WOS toolchain support submodules used by the build. Before editing libc code, still verify the local workspace because this area changes quickly.
 
 ## Sysdep tag system
 

@@ -69,12 +69,10 @@ Rollback plan:
 
 Use the `Build WOS` task when building WOS.
 
-Manual formatting uses `scripts/dev/format_repo.sh --check <paths>`. Do not
-use the retired root-level `scripts/format_repo.sh` path.
+Manual formatting uses `scripts/dev/format_repo.sh --check <paths>`.
 
-Do not use the retired root-level `scripts/build_kern.sh` path. If the build
-task is unavailable, read `.vscode/tasks.json` and use the current local CMake
-command shape instead.
+Use the `Build WOS` task for builds. If the build task is unavailable, read
+`.vscode/tasks.json` and use the current local CMake command shape instead.
 
 Kernel and module diagnostic flags are documented in `docs/kernel_debug_flags.md`. Read that map before enabling expensive sanitizer, coverage, allocator, scheduler, MM, or network tracing flags.
 
@@ -153,7 +151,7 @@ Debugging must be done by the user. When runtime/debug information is needed, as
 
 Several WOS utilities intentionally use familiar Unix/Linux names. Do not assume GNU coreutils, systemd, upstream `strace`, Linux `perf`, or procps behavior from the command name alone. These are WOS utilities, may have fewer, more, or different options than similarly named tools, and their current local source is the authority.
 
-The rootfs alias map in `configs/rootfs/aliases.tsv` installs the current utility targets under `/usr/bin` or `/usr/sbin`. Check the module source before relying on CLI behavior:
+The rootfs alias map in `configs/rootfs/aliases.tsv` installs the current utility targets under `/usr/bin`, `/usr/sbin`, or `/usr/libexec`. Check the module source before relying on CLI behavior:
 
 - `strace` (`modules/strace`): WOS ptrace-based syscall tracer for launching a command or attaching with `-p`; includes WKI-aware remote/proxy routing helpers.
 - `wkictl` (`modules/wkictl`): WKI control/query utility for target placement, VFS forwarding rules, WOS identity, and perf visibility hints. It also backs the `locally`, `remotely`, `homeward`, `on`, `forward`, and `wosid` convenience commands.
@@ -161,19 +159,28 @@ The rootfs alias map in `configs/rootfs/aliases.tsv` installs the current utilit
 - `memacc` (`modules/memacc`): memory accounting utility over `/proc/memacc` for summaries, per-process memory, kernel allocator/accounting rows, watch mode, tracking toggles, and reclaim controls.
 - `top` (`modules/top`): WOS interactive process/CPU/memory monitor using WOS `/proc` files.
 - `perf` (`modules/perf`): WOS kernel performance/event tool for CPU sampling, event recording/reporting, scheduler stats, WKI/local/VMEM/IPC reports, tail views, traces, and traced command runs.
+- `powerctl` (`modules/powerctl`): WOS power control utility installed as
+  `powerctl` and backing the `reboot`, `poweroff`, `halt`, and `shutdown`
+  aliases.
 
 Known artifact paths:
 
 - Kernel: `build/modules/kern/wos`
 - Init: `build/modules/init/init`
 - Test program: `build/modules/testprog/testprog`
+- Test daemon: `build/modules/testd/testd`
+- Network daemon: `build/modules/netd/netd`
+- Debug server: `build/modules/debugserver/debugserver`
 - HTTP server: `build/modules/httpd/httpd`
 - Perf utility: `build/modules/perf/perf`
 - Top utility: `build/modules/top/top`
 - Memory accounting utility: `build/modules/memacc/memacc`
 - Journal utility/daemon binary: `build/modules/journal/journal`
 - WKI control utility: `build/modules/wkictl/wkictl`
+- Power control utility: `build/modules/powerctl/powerctl`
+- Render benchmark: `build/modules/renderbench/renderbench`
 - Strace utility: `build/modules/strace/strace`
+- SFTP server: `build/modules/sftpserver/sftp-server`
 
 ## Final response requirements
 

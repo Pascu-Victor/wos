@@ -21,7 +21,7 @@ Current local workspace:
 
 - Tools are configured through an `ExternalProject` under `tools/`.
 - Modules build against `toolchain/sysroot` as the sysroot.
-- Module subdirectories include `kern`, `init`, `testprog`, `testd`, `netd`, `httpd`, `debugserver`, `perf`, `top`, `memacc`, `journal`, `wkictl`, `renderbench`, `strace`, and `sftpserver`.
+- Module subdirectories include `kern`, `init`, `testprog`, `testd`, `netd`, `httpd`, `debugserver`, `perf`, `top`, `memacc`, `journal`, `wkictl`, `powerctl`, `renderbench`, `strace`, and `sftpserver`.
 - Rootfs command aliases and install paths are declared in `configs/rootfs/aliases.tsv`.
 
 Risk areas:
@@ -58,9 +58,9 @@ Read first:
 
 - `.github/instructions/critical_paths.instructions.md`
 - `modules/kern/src/platform/sys/syscall.cpp`
-- `modules/kern/src/platform/sys/abi/callnums.hpp`
-- Relevant `modules/kern/src/platform/sys/abi/callnums/*.h`
-- Relevant `modules/kern/src/platform/sys/syscalls_impl/**`
+- `modules/kern/src/abi/callnums.hpp`
+- Relevant `modules/kern/src/abi/callnums/*.h`
+- Relevant `modules/kern/src/syscalls_impl/**`
 - libc/userspace wrapper code for the operation being changed.
 
 Risks:
@@ -157,6 +157,10 @@ Applies to:
 - `modules/memacc/**`
 - `modules/top/**`
 - `modules/perf/**`
+- `modules/powerctl/**`
+- `modules/debugserver/**`
+- `modules/renderbench/**`
+- `modules/sftpserver/**`
 
 Read first:
 
@@ -173,6 +177,10 @@ Utility map:
 - `memacc`: `/proc/memacc` memory accounting viewer/control utility for summaries, process rows, allocator rows, tracking, watch, and reclaim.
 - `top`: interactive WOS process/CPU/memory monitor over WOS `/proc`.
 - `perf`: WOS kernel event/performance utility for stat/record/report, scheduler CPU stats, WKI/local/VMEM/IPC reports, tail views, traces, and traced command runs.
+- `powerctl`: WOS power control utility installed as `powerctl` and backing the `reboot`, `poweroff`, `halt`, and `shutdown` aliases.
+- `debugserver`: WOS debug server utility.
+- `renderbench`: WOS rendering benchmark utility.
+- `sftpserver`: WOS SFTP server target; its built executable is named `sftp-server` in the rootfs alias map.
 
 Risks:
 

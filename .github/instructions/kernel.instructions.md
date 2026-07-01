@@ -35,8 +35,8 @@ For every kernel change, check:
 ## Common kernel areas
 
 - `platform/sys/`: syscall entry and dispatch.
-- `platform/sys/abi/`: syscall ABI enums and call number headers.
-- `platform/sys/syscalls_impl/`: syscall subsystem handlers.
+- `abi/`: syscall ABI enums, call number headers, and shared kernel/userspace ABI structs.
+- `syscalls_impl/`: syscall subsystem handlers.
 - `platform/sched/`: scheduler, task state, queues, process/thread control.
 - `platform/mm/`: physical/virtual/dynamic memory management.
 - `platform/ktime/`: time source.
@@ -52,7 +52,7 @@ For every kernel change, check:
 
 ## Syscall notes
 
-The local syscall handler in `platform/sys/syscall.cpp` copies `RAX` to `ker::abi::callnums`, then copies `RDI`, `RSI`, `RDX`, `R8`, `R9`, and `R10` into `A1..A6`. `A1` is usually the subsystem operation enum. When changing syscalls, inspect both sides:
+The local syscall handler in `modules/kern/src/platform/sys/syscall.cpp` copies `RAX` to `ker::abi::callnums`, then copies `RDI`, `RSI`, `RDX`, `R8`, `R9`, and `R10` into `A1..A6`. `A1` is usually the subsystem operation enum. When changing syscalls, inspect both sides:
 
 - Kernel dispatch and implementation.
 - ABI headers.
