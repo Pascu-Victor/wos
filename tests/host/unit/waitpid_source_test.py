@@ -36,6 +36,7 @@ def function_body(source: str, name: str) -> str:
         f"inline auto {name}(",
         f"void {name}(",
         f"inline void {name}(",
+        f"[[noreturn]] void {name}(",
         f"extern \"C\" void {name}(",
     ]:
         candidate = source.find(needle)
@@ -369,6 +370,32 @@ def require_exit_waiter_notify_drains_all_batches(exit_cpp: str) -> None:
         fail("exit waitpid notifier must not stop after one fixed-size snapshot")
 
 
+def require_exit_notify_ready_is_before_address_cleanup(waitpid_cpp: str, scheduler_cpp: str, exit_cpp: str) -> None:
+    for source, helper in [
+        (waitpid_cpp, "is_waitable_exit"),
+        (scheduler_cpp, "waitpid_child_is_waitable_exit"),
+    ]:
+        body = function_body(source, helper)
+        for snippet in [
+            "exit_notify_ready.load(std::memory_order_acquire)",
+            "TaskState::DEAD",
+        ]:
+            if snippet not in body:
+                fail(f"{helper} must treat exit-notified children and dead children as waitable: {snippet}")
+
+    exit_body = function_body(exit_cpp, "wos_proc_exit_with_wait_status")
+    fd_close = exit_body.find("while (!current_task->fd_table.empty())")
+    publish = exit_body.find("current_task->has_exited = true")
+    notify_ready = exit_body.find("current_task->exit_notify_ready.store(true, std::memory_order_release)", publish)
+    notify_parent = exit_body.find("notify_parent_after_exit_ready(current_task)", notify_ready)
+    address_cleanup = exit_body.find("release_exiting_user_address_space(current_task)", notify_ready)
+    accounting = exit_body.find("ker::mod::sched::finish_syscall_accounting()", fd_close)
+    if min(fd_close, accounting, publish, notify_ready, notify_parent, address_cleanup) < 0:
+        fail("exit path is missing FD cleanup, accounting, waitability publication, notification, or address cleanup markers")
+    if not (fd_close < accounting < publish < notify_ready < notify_parent < address_cleanup):
+        fail("exit must publish waitability after FD cleanup/accounting and before address-space cleanup")
+
+
 def require_waitpid_uses_stable_active_scans(scheduler_hpp: str, scheduler_cpp: str, waitpid_cpp: str) -> None:
     for snippet in [
         "using ActiveTaskPredicate = bool (*)(task::Task* task, void* context)",
@@ -443,6 +470,7 @@ def main() -> None:
     require_interrupted_waitpid_cleans_stale_wait_state(task_hpp, task_cpp, scheduler_cpp, exit_cpp)
     require_exit_completion_respects_publish_fence(exit_cpp)
     require_exit_waiter_notify_drains_all_batches(exit_cpp)
+    require_exit_notify_ready_is_before_address_cleanup(waitpid_cpp, scheduler_cpp, exit_cpp)
     require_scheduler_waitpid_completion_claims_waiter(task_hpp, waitpid_cpp, scheduler_cpp)
     require_waitpid_uses_stable_active_scans(scheduler_hpp, scheduler_cpp, waitpid_cpp)
     print("waitpid publish/exit notification source invariants hold")

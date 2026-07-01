@@ -564,9 +564,10 @@ inline auto waitpid_child_is_waitable_exit(const task::Task* child) -> bool {
         return false;
     }
 
-    // exit_notify_ready publishes the normal waitable-exit point. A task that
-    // has reached the final DEAD state is also waitable: preserving a waitpid
-    // block on a dead-listed direct child can strand the parent forever.
+    // exit_notify_ready is published after descriptor teardown but before later
+    // address-space cleanup. A task that has reached the final DEAD state is
+    // also waitable: preserving a waitpid block on a dead-listed direct child
+    // can strand the parent forever.
     bool const EXIT_READY = child->exit_notify_ready.load(std::memory_order_acquire);
     task::TaskState const STATE = child->state.load(std::memory_order_acquire);
     return EXIT_READY || STATE == task::TaskState::DEAD;

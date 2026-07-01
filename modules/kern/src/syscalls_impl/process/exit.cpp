@@ -478,15 +478,15 @@ namespace {
 
     // Memory barrier to ensure state change is visible to all CPUs.
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    current_task->has_exited = true;
-
-    // A waitable zombie keeps only status/accounting/PID metadata. It must not
-    // pin the exiting process's user address space while waiting for the parent
-    // to reap it, especially under fork/COW storms.
-    release_exiting_user_address_space(current_task);
 
     ker::mod::sched::finish_syscall_accounting();
+    current_task->has_exited = true;
     current_task->exit_notify_ready.store(true, std::memory_order_release);
+
+    // Publish waitability after descriptor teardown but before address-space
+    // reclamation. waitpid must not observe the child until files/pipes are
+    // closed and status/accounting are stable, but it also must not depend on
+    // later memory cleanup making progress under heavy build load.
 
     // Reschedule all tasks waiting for this process to exit.
     // This happens AFTER reparenting + FD cleanup so that any files written
@@ -545,6 +545,11 @@ namespace {
 
     notify_tracer_after_exit_ready(current_task);
     notify_parent_after_exit_ready(current_task);
+
+    // A waitable zombie keeps only status/accounting/PID metadata. It must not
+    // pin the exiting process's user address space while waiting for the parent
+    // to reap it, especially under fork/COW storms.
+    release_exiting_user_address_space(current_task);
 
     // Thread destruction deferred to gcExpiredTasks()
 

@@ -533,7 +533,9 @@ struct Task {
     std::atomic<bool> process_exit_requested{false};
     std::atomic<int32_t> requested_process_exit_status{0};
     std::atomic<int32_t> requested_process_exit_wait_status{0};
-    // Set after exit cleanup finishes; waitpid may reap only after this.
+    // Set after user-visible exit state is published: descriptors are closed,
+    // status/accounting are stable, and waitpid may reap while later memory
+    // cleanup continues.
     std::atomic<bool> exit_notify_ready{false};
     std::atomic<bool> waited_on{false};  // Set when waitpid atomically claims the exit status.
     std::atomic<bool> zombie_resources_reclaiming{false};

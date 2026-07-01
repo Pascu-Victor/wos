@@ -63,9 +63,10 @@ auto is_waitable_exit(const ker::mod::sched::task::Task* task) -> bool {
         return false;
     }
 
-    // exit_notify_ready publishes the normal waitable-exit point. A task that
-    // has reached the final DEAD state is also waitable: preserving a waitpid
-    // block on a dead-listed direct child can strand the parent forever.
+    // exit_notify_ready is published after descriptor teardown but before later
+    // address-space cleanup. A task that has reached the final DEAD state is
+    // also waitable: preserving a waitpid block on a dead-listed direct child
+    // can strand the parent forever.
     bool const EXIT_READY = task->exit_notify_ready.load(std::memory_order_acquire);
     auto const STATE = task->state.load(std::memory_order_acquire);
     return EXIT_READY || STATE == ker::mod::sched::task::TaskState::DEAD;
