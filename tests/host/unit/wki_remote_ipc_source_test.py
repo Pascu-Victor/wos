@@ -232,6 +232,22 @@ def test_pipe_fd_open_flags_preserve_nonblocking_access_mode() -> None:
         fail("IPC attach must restore open flags but choose pipe proxy fops from access mode: " + ", ".join(missing))
     if "entry.reserved1 & WKI_IPC_FD_ACCESS_MASK" in attach_body:
         fail("IPC attach must not strip nonblocking flags with the access-only mask")
+    if "proxy_file->open_flags = 0;" in attach_body:
+        fail("IPC attach must not reset non-pipe proxy fds to read-only open_flags")
+    pty_start = attach_body.find("} else if (proxy->res_type == ResourceType::IPC_PTY)")
+    if pty_start < 0:
+        fail("IPC attach must handle PTY proxies")
+    pty_end = attach_body.find("} else {", pty_start)
+    if pty_end < 0:
+        fail("IPC attach PTY branch must precede the fallback branch")
+    pty_attach = attach_body[pty_start:pty_end]
+    pty_required = [
+        "proxy_file->fops = &g_proxy_pty_fops",
+        "proxy_file->open_flags = (OPEN_FLAGS & ~WKI_IPC_FD_ACCESS_MASK) | WKI_IPC_FD_RDWR",
+    ]
+    missing = [token for token in pty_required if token not in pty_attach]
+    if missing:
+        fail("PTY proxy fds must be bidirectional so remote terminal stdout can write: " + ", ".join(missing))
 
     status_body = function_body(remote_ipc, "ipc_pipe_nonblocking_send_status")
     status_required = [
@@ -276,6 +292,29 @@ def test_pipe_fd_open_flags_preserve_nonblocking_access_mode() -> None:
     if missing:
         fail("message-path pipe writes must honor nonblocking fds before retry sleeps: " + ", ".join(missing))
     require_order(write_body, "if (NONBLOCKING)", "pause_for_ipc_send_retry(ret, ATTEMPT)", "message nonblocking send check")
+
+
+def test_pty_export_data_can_write_from_deferred_worker_without_backlog() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    handler_body = function_body(remote_ipc, "handle_ipc_dev_op_req_inline")
+    required = [
+        "exp->res_type == ResourceType::IPC_PTY",
+        "bool const HAS_BACKLOG = find_export_pipe_write_backlog_locked(exp) != nullptr",
+        "export_pty_immediate = true",
+        "ssize_t const WRITE_RET = export_pipe_write_nonblocking(export_file, op_data, OP_DATA_LEN)",
+        "note_export_pipe_data_received_locked(exp, OP_DATA_LEN)",
+        "queue_export_pipe_write_data(resource_id, op_data + written",
+    ]
+    missing = [token for token in required if token not in handler_body]
+    if missing:
+        fail("PTY export data should use immediate deferred-worker writes before falling back to ordered backlog: " + ", ".join(missing))
+    require_order(handler_body, "bool const HAS_BACKLOG", "export_pty_immediate = true", "PTY immediate write ordering")
+    require_order(
+        handler_body,
+        "export_pipe_write_nonblocking(export_file",
+        "queue_export_pipe_write_data(resource_id, op_data + written",
+        "PTY fallback ordering",
+    )
 
 
 def test_attach_fd_install_is_transactional() -> None:
@@ -462,6 +501,19 @@ def test_futex_dev_op_preserves_broadcast_wake_count() -> None:
         fail("remote IPC futex wake bridge must pass an explicit wake count")
 
 
+def test_ipc_send_retry_backpressure_sleeps_without_yield_livelock() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    retry_body = function_body(remote_ipc, "pause_for_ipc_send_retry")
+    if "kern_yield" in retry_body:
+        fail("IPC send retry must sleep on no-credit backpressure instead of keeping senders runnable")
+    for snippet in [
+        "ker::mod::sched::kern_sleep_us(ipc_pipe_send_retry_sleep_us(ret, attempt))",
+        "uint64_t const BASE_US = (ret == WKI_ERR_NO_CREDITS) ? 1000 : 2000",
+    ]:
+        if snippet not in remote_ipc:
+            fail(f"IPC send retry backoff is missing {snippet}")
+
+
 def test_ipc_selftests_are_declared_and_registered() -> None:
     header = REMOTE_IPC_HPP.read_text()
     ktest = WKI_WAIT_KTEST.read_text()
@@ -492,10 +544,12 @@ def main() -> None:
     test_proxy_lookup_is_peer_scoped()
     test_export_pipe_write_uses_nonmutating_nonblocking_view()
     test_pipe_fd_open_flags_preserve_nonblocking_access_mode()
+    test_pty_export_data_can_write_from_deferred_worker_without_backlog()
     test_attach_fd_install_is_transactional()
     test_dev_op_response_cookies_fence_stale_waiters()
     test_peer_cleanup_drains_deferred_dev_op_work()
     test_futex_dev_op_preserves_broadcast_wake_count()
+    test_ipc_send_retry_backpressure_sleeps_without_yield_livelock()
     test_ipc_selftests_are_declared_and_registered()
     print("WKI remote IPC source invariants hold")
 

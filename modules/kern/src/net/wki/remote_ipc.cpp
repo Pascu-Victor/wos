@@ -172,6 +172,7 @@ void wake_blocked_ipc_reader(ker::mod::sched::task::Task* reader) {
 }
 
 constexpr int WKI_IPC_FD_ACCESS_MASK = 0x0003;
+constexpr int WKI_IPC_FD_RDWR = 0x0002;
 constexpr int WKI_IPC_O_NONBLOCK = 04000;
 constexpr int WKI_IPC_FD_OPEN_FLAG_MASK = WKI_IPC_FD_ACCESS_MASK | WKI_IPC_O_NONBLOCK;
 
@@ -360,15 +361,7 @@ auto ipc_pipe_send_retry_sleep_us(int ret, uint32_t attempt) -> uint64_t {
     return std::min(SLEEP_US, CAP_US);
 }
 
-void pause_for_ipc_send_retry(int ret, uint32_t attempt) {
-    if (ret == WKI_ERR_NO_CREDITS) {
-        if (attempt == 0) {
-            ker::mod::sched::kern_yield();
-            return;
-        }
-    }
-    ker::mod::sched::kern_sleep_us(ipc_pipe_send_retry_sleep_us(ret, attempt));
-}
+void pause_for_ipc_send_retry(int ret, uint32_t attempt) { ker::mod::sched::kern_sleep_us(ipc_pipe_send_retry_sleep_us(ret, attempt)); }
 
 auto ipc_pipe_nonblocking_send_status(int ret) -> ssize_t {
     switch (ret) {
@@ -723,6 +716,18 @@ void queue_export_pipe_write_flush_locked(ExportPipeWriteBacklog* backlog) {
     g_export_pipe_write_flush_queues.at(export_pipe_write_backlog_shard(backlog)).push_back(backlog);
 }
 
+void note_export_pipe_data_received_locked(WkiIpcExport* exp, uint16_t len) {
+    if (exp == nullptr || len == 0) {
+        return;
+    }
+
+    exp->pipe_bytes_received += len;
+    auto* backlog = find_export_pipe_write_backlog_locked(exp);
+    if (backlog != nullptr && backlog->close_pending) {
+        queue_export_pipe_write_flush_locked(backlog);
+    }
+}
+
 auto queue_export_pipe_write_data(uint32_t resource_id, const uint8_t* data, uint16_t len) -> bool {
     if (data == nullptr || len == 0) {
         return true;
@@ -751,7 +756,7 @@ auto queue_export_pipe_write_data(uint32_t resource_id, const uint8_t* data, uin
 
     backlog->chunks.push_back(PendingPipeChunk{.data = copy, .len = len});
     backlog->buffered_bytes += len;
-    exp->pipe_bytes_received += len;
+    note_export_pipe_data_received_locked(exp, len);
     queue_export_pipe_write_flush_locked(backlog);
     size_t const FLUSH_SHARD = export_pipe_write_backlog_shard(backlog);
     s_ipc_lock.unlock_irqrestore(IRQF);
@@ -3425,11 +3430,11 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
         proxy_file->fd_flags = 0;
         proxy_file->vfs_path = nullptr;
         proxy_file->dir_fs_count = 0;
+        int const OPEN_FLAGS = ipc_fd_import_open_flags(entry.reserved1);
+        uint16_t const ACCESS_MODE = ipc_fd_access_mode(OPEN_FLAGS);
+        proxy_file->open_flags = OPEN_FLAGS;
 
         if (proxy->res_type == ResourceType::IPC_PIPE) {
-            int const OPEN_FLAGS = ipc_fd_import_open_flags(entry.reserved1);
-            uint16_t const ACCESS_MODE = ipc_fd_access_mode(OPEN_FLAGS);
-            proxy_file->open_flags = OPEN_FLAGS;
             if (ACCESS_MODE != 0 && entry.rdma_rkey != 0 && entry.rdma_offset != 0 && WKI_IPC_PIPE_RDMA_DOORBELL_ENABLED) {
                 auto* transport = ipc_pipe_rdma_transport_for_peer(entry.home_node);
                 if (transport != nullptr) {
@@ -3449,7 +3454,6 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
             }
         } else if (proxy->res_type == ResourceType::IPC_SOCKET) {
             proxy_file->fops = &g_proxy_socket_fops;
-            proxy_file->open_flags = 0;
             proxy_file->fs_type = ker::vfs::FSType::TMPFS;  // not SOCKET to avoid bad cast via fd_to_socket
         } else if (proxy->res_type == ResourceType::IPC_EPOLL) {
             // Allocate a local EpollInstance so kernel epoll_ctl / epoll_pwait work
@@ -3462,15 +3466,13 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
             epf->home_node = proxy->home_node;
             proxy_file->private_data = epf;  // epoll_ctl casts this to EpollInstance*
             proxy_file->fops = &g_proxy_epoll_fops;
-            proxy_file->open_flags = 0;
         } else if (proxy->res_type == ResourceType::IPC_PTY) {
             // PTY proxy: ring-buffer data plane + ioctl forwarding
             // private_data is already set to proxy above
             proxy_file->fops = &g_proxy_pty_fops;
-            proxy_file->open_flags = 0;
+            proxy_file->open_flags = (OPEN_FLAGS & ~WKI_IPC_FD_ACCESS_MASK) | WKI_IPC_FD_RDWR;
         } else {
             proxy_file->fops = &g_proxy_pipe_read_fops;
-            proxy_file->open_flags = 0;
         }
 
         IpcProxyFdInstallResult const INSTALL = install_ipc_proxy_file(task, entry.local_fd, proxy_file);
@@ -5101,6 +5103,8 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
 
         // Consumer receives pipe data — write into the local proxy ring if
         // present, otherwise route it to the exported home-side pipe.
+        ker::vfs::File* export_file = nullptr;
+        bool export_pty_immediate = false;
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
         auto* proxy = find_proxy_by_endpoint_locked(hdr->src_node, resource_id);
         bool const PENDING_BUFFERED = find_pending_pipe_delivery_locked(hdr->src_node, resource_id) != nullptr;
@@ -5109,6 +5113,13 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             auto* exp = find_export_by_resource_id(resource_id);
             if (exp != nullptr && exp->active && exp->file != nullptr) {
                 export_exists = true;
+                bool const HAS_BACKLOG = find_export_pipe_write_backlog_locked(exp) != nullptr;
+                if (exp->res_type == ResourceType::IPC_PTY && !HAS_BACKLOG && exp->file->fops != nullptr &&
+                    exp->file->fops->vfs_write != nullptr) {
+                    export_file = exp->file;
+                    export_file->refcount.fetch_add(1, std::memory_order_acq_rel);
+                    export_pty_immediate = true;
+                }
             }
         }
         s_ipc_lock.unlock_irqrestore(IRQF);
@@ -5216,6 +5227,44 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
         }
         if (OP_DATA_LEN == 0) {
             pipe_trace.finish(0);
+            return;
+        }
+        if (export_pty_immediate && export_file != nullptr) {
+            ssize_t const WRITE_RET = export_pipe_write_nonblocking(export_file, op_data, OP_DATA_LEN);
+            ipc_release_file_ref(export_file);
+
+            if (std::cmp_equal(WRITE_RET, OP_DATA_LEN)) {
+                uint64_t const NOTE_IRQF = s_ipc_lock.lock_irqsave();
+                if (auto* exp = find_export_by_resource_id(resource_id); exp != nullptr && exp->active) {
+                    note_export_pipe_data_received_locked(exp, OP_DATA_LEN);
+                }
+                s_ipc_lock.unlock_irqrestore(NOTE_IRQF);
+                pipe_trace.finish(0, OP_DATA_LEN);
+                return;
+            }
+
+            uint16_t written = 0;
+            if (WRITE_RET > 0) {
+                written = static_cast<uint16_t>(std::min<ssize_t>(WRITE_RET, OP_DATA_LEN));
+                uint64_t const NOTE_IRQF = s_ipc_lock.lock_irqsave();
+                if (auto* exp = find_export_by_resource_id(resource_id); exp != nullptr && exp->active) {
+                    note_export_pipe_data_received_locked(exp, written);
+                }
+                s_ipc_lock.unlock_irqrestore(NOTE_IRQF);
+            } else if (WRITE_RET != -EAGAIN && WRITE_RET != -EINTR) {
+                ker::mod::dbg::log("[WKI] IPC PTY export immediate write failed: resource_id=%u ret=%ld len=%u", resource_id, WRITE_RET,
+                                   OP_DATA_LEN);
+            }
+
+            if (written >= OP_DATA_LEN) {
+                pipe_trace.finish(0, OP_DATA_LEN);
+                return;
+            }
+            if (!queue_export_pipe_write_data(resource_id, op_data + written, static_cast<uint16_t>(OP_DATA_LEN - written))) {
+                ker::mod::dbg::log("[WKI] IPC PTY export backlog queue failed: resource_id=%u written=%u total=%u", resource_id, written,
+                                   OP_DATA_LEN);
+            }
+            pipe_trace.finish(0, OP_DATA_LEN);
             return;
         }
         if (!queue_export_pipe_write_data(resource_id, op_data, OP_DATA_LEN)) {
