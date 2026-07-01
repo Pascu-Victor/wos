@@ -41,6 +41,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/rootfs_source_test.py
 )
 add_test(
+    NAME image_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/image_source_test.py
+)
+add_test(
     NAME modules_cmake_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/modules_cmake_source_test.py
 )
@@ -330,6 +334,7 @@ set_tests_properties(
     toolchain_bootstrap_source_test
     selfhost_benchmark_source_test
     rootfs_source_test
+    image_source_test
     modules_cmake_source_test
     qcow_common_source_test
     testd_manifest_test

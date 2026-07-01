@@ -105,6 +105,7 @@ UNIT_TESTS=(
     toolchain_bootstrap_source_test
     selfhost_benchmark_source_test
     rootfs_source_test
+    image_source_test
     modules_cmake_source_test
     qcow_common_source_test
     testd_manifest_test

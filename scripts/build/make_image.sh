@@ -1,6 +1,5 @@
 #!/bin/bash
-# Create the boot disk image, build the initramfs (which needs final
-# PARTUUIDs from both disks), then populate the boot partition.
+# Build the initramfs, then create and populate the boot disk image.
 set -e
 
 WOS_ROOT="${WOS_WORKSPACE_ROOT:-$(git -C "$(dirname "$0")" rev-parse --show-toplevel)}"
@@ -155,19 +154,13 @@ create_boot_disk_fast() {
     BOOT_TMP=""
 }
 
-# Phase 1: Create a partitioned boot disk first, so initramfs fstab generation
-# can read its final PARTUUID. Prefer the mtools path to avoid libguestfs
-# appliance startup for the small FAT boot disk.
-if [ "${WOS_BOOT_IMAGE_LEGACY_GUESTFS:-0}" = "1" ] || ! create_boot_disk_fast 0; then
-    echo "  boot image: falling back to libguestfs boot disk creation"
-    create_boot_disk_guestfish 0
-fi
-
-# Phase 2: Build the CPIO initramfs now that all disk images exist
-# with their final PARTUUIDs (disk.qcow2 + mountfs.qcow2).
+# Phase 1: Build the CPIO initramfs.  configs/disks.conf records the stable
+# boot PARTUUID, so the boot disk does not need to be created once merely to
+# read back a GUID before being recreated with the final initramfs.
 bash "$CWD/scripts/build/make_initramfs.sh"
 
-# Phase 3: Rebuild the boot disk with the final initramfs contents.
+# Phase 2: Create the boot disk with the final initramfs contents.  Prefer the
+# mtools path to avoid libguestfs appliance startup for the small FAT boot disk.
 if [ "${WOS_BOOT_IMAGE_LEGACY_GUESTFS:-0}" = "1" ] || ! create_boot_disk_fast 1; then
     echo "  boot image: falling back to libguestfs boot disk population"
     create_boot_disk_guestfish 1
