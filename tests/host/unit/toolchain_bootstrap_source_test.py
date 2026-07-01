@@ -1427,6 +1427,75 @@ def test_busybox_and_dropbear_scripts_honor_host_toolchain_override() -> None:
     )
 
 
+def test_dropbear_script_preseeds_wos_target_configure_probes() -> None:
+    source = WOS_DROPBEAR_BUILD.read_text()
+    config_site_start = source.find("write_dropbear_config_site()")
+    config_site_end = source.find('LOCALOPTIONS="$DB_BUILD/localoptions.h"', config_site_start)
+    if config_site_start < 0 or config_site_end < 0:
+        fail("Dropbear WOS build script must keep write_dropbear_config_site before localoptions setup")
+    config_site = source[config_site_start:config_site_end]
+
+    require_tokens(
+        config_site,
+        [
+            "write_dropbear_config_site()",
+            'tmp_config_site="$(mktemp "$DB_BUILD/config.site.XXXXXX")"',
+            "ac_cv_func_clock_gettime=yes",
+            "ac_cv_func_explicit_bzero=yes",
+            "ac_cv_func_getaddrinfo=yes",
+            "ac_cv_func_getrandom=no",
+            "ac_cv_func_strlcat=yes",
+            "ac_cv_func_strlcpy=yes",
+            "ac_cv_have_struct_sockaddr_storage=yes",
+            "ac_cv_header_sys_random_h=no",
+            "ac_cv_header_utmp_h=yes",
+            "ac_cv_header_utmpx_h=no",
+            "ac_cv_search_openpty='none required'",
+            "dropbear_cv_func_have_openpty=yes",
+        ],
+        "Dropbear WOS target configure preseeds",
+    )
+    require_tokens(
+        config_site,
+        [
+            'if [ "$HOST_SYSTEM" = "WOS" ]; then',
+            "ac_cv_func_memcmp_working=yes",
+            "ac_cv_func_getusershell=no",
+            "ac_cv_func_getutxent=no",
+            "ac_cv_func_pututxline=no",
+            "ac_cv_func_utmpxname=no",
+            "ac_cv_func_memcmp_working=no",
+            "ac_cv_func_getusershell=yes",
+            "ac_cv_func_getutxent=yes",
+            "ac_cv_func_pututxline=yes",
+            "ac_cv_func_utmpxname=yes",
+        ],
+        "Dropbear native WOS and Linux-cross configure split",
+    )
+    require_tokens(
+        source,
+        [
+            'HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"',
+            "write_dropbear_config_site",
+            'export CONFIG_SITE="$DB_BUILD/config.site"',
+            '[ "$DB_BUILD/config.site" -nt "$DB_BUILD/Makefile" ]',
+        ],
+        "Dropbear config.site export and reconfigure trigger",
+    )
+    forbidden = [
+        "ac_cv_prog_CC=",
+        "ac_cv_prog_AR=",
+        "ac_cv_prog_RANLIB=",
+        "ac_cv_prog_STRIP=",
+        "ac_cv_path_install=",
+        "ac_cv_build=",
+        "ac_cv_host=",
+    ]
+    present = [token for token in forbidden if token in config_site]
+    if present:
+        fail("Dropbear config.site must not pin host/tool paths or build tuples: " + ", ".join(present))
+
+
 def test_mlibc_script_honors_host_toolchain_override_and_job_helper() -> None:
     source = WOS_MLIBC_BUILD.read_text()
     require_tokens(
@@ -1942,6 +2011,7 @@ if __name__ == "__main__":
     test_wos_toolchain_uses_shared_busybox_and_dropbear_build_scripts()
     test_native_wos_clang_port_stages_tablegen_for_next_self_host()
     test_busybox_and_dropbear_scripts_honor_host_toolchain_override()
+    test_dropbear_script_preseeds_wos_target_configure_probes()
     test_mlibc_script_honors_host_toolchain_override_and_job_helper()
     test_ninja_script_uses_target_header_stack()
     test_cmake_script_uses_target_header_stack()
