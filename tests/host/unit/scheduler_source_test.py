@@ -113,6 +113,97 @@ def test_event_wake_cancel_preserves_current_task_wakeup_token() -> None:
         fail("current-task event wakes must preserve wakeup_pending, even when deferred switch is cancelled")
 
 
+def test_event_wake_rebalances_normal_process_waiters() -> None:
+    source = SCHEDULER_CPP.read_text()
+    target_body = function_body(source, "event_wake_target_cpu")
+    can_balance_body = function_body(source, "event_wake_can_rebalance_process")
+    rebalance_body = function_body(source, "event_wake_rebalance_target_cpu")
+
+    require_tokens(
+        can_balance_body,
+        [
+            "task->type != task::TaskType::PROCESS",
+            "task->cpu_pinned || task->domain_hard",
+            "task->thread == nullptr || task->pagemap == nullptr",
+            "task->sched_queue != task::Task::sched_queue::WAITING",
+            "task->wait_channel_is(task::WaitChannelKind::WKI_EXECVE_PROXY)",
+        ],
+        "event wake rebalance eligibility must avoid pinned or invalid process migration",
+    )
+    if "!task->has_run" in can_balance_body:
+        fail("event wake rebalance must allow cold process placement when the process has a runnable context")
+    require_tokens(
+        rebalance_body,
+        [
+            "get_least_loaded_cpu_for_task(task)",
+            "cached_effective_load_for_cpu(preferred_cpu, task::TaskType::PROCESS)",
+            "cached_effective_load_for_cpu(BEST_CPU, task::TaskType::PROCESS)",
+            "EVENT_WAKE_REBALANCE_LOAD_GAP",
+            "PREFERRED_LOAD > BEST_LOAD",
+            "PREFERRED_LOAD - BEST_LOAD > EVENT_WAKE_REBALANCE_LOAD_GAP",
+        ],
+        "event wake rebalance must use cached process load with a migration gap",
+    )
+    require_tokens(
+        target_body,
+        [
+            "event_wake_prefers_waker_cpu(task->cpu_pinned, WAITING, VOLUNTARY_BLOCK)",
+            "return event_wake_rebalance_target_cpu(task, waker_cpu);",
+            "return task->cpu;",
+        ],
+        "event wake target policy must remain centralized",
+    )
+    if "try_steal_from_peers" in rebalance_body:
+        fail("event wake rebalance must not invoke peer stealing")
+
+
+def test_idle_steal_can_migrate_normal_process_work() -> None:
+    source = SCHEDULER_CPP.read_text()
+    mask_body = function_body(source, "task_can_run_on_cpu")
+    probe_body = function_body(source, "idle_rebalance_probe_needed_for_idle")
+    steal_body = function_body(source, "try_steal_from_peers")
+
+    require_tokens(
+        mask_body,
+        [
+            "cpu_no >= core_count",
+            "task->domain_mask & ALL_MASK",
+            "allowed_mask == 0",
+            "return cpu_mask_contains(allowed_mask, cpu_no);",
+        ],
+        "steal target CPU domain-mask helper",
+    )
+    require_tokens(
+        steal_body,
+        [
+            "victim_rq_raw->cached_current_load_process.load(std::memory_order_relaxed)",
+            "victim_rq_raw->cached_load_process.load(std::memory_order_relaxed) + VICTIM_CURRENT_LOAD",
+            "VICTIM_HEAP_SIZE == 0 || (VICTIM_CURRENT_LOAD == 0 && VICTIM_HEAP_SIZE < 2)",
+            "current_task_load_for_incoming(victim_rq->current_task, task::TaskType::PROCESS)",
+            "task_can_run_on_cpu(t, stealing_cpu, N)",
+            "t->cpu_pinned || t->domain_hard",
+            "!t->has_run",
+            "t->type == task::TaskType::PROCESS && (t->thread == nullptr || t->pagemap == nullptr)",
+            'publish_runnable_task_locked(our_rq, stolen, "work-steal")',
+        ],
+        "idle steal process eligibility",
+    )
+    require_tokens(
+        probe_body,
+        [
+            "victim_rq->cached_current_load_process.load(std::memory_order_relaxed)",
+            "victim_rq->cached_load_process.load(std::memory_order_relaxed) + VICTIM_CURRENT_LOAD",
+            "VICTIM_CURRENT_LOAD == 0 && VICTIM_HEAP_SIZE < 2",
+            "VICTIM_LOAD >= MIN_STEAL_LOAD",
+        ],
+        "idle rebalance probe must notice peer current-plus-runnable backlog",
+    )
+    if "Never steal PROCESS tasks" in steal_body or "Only DAEMON tasks" in steal_body:
+        fail("idle steal must not blanket-ban normal PROCESS migration")
+    if re.search(r"if\s*\(\s*t->type\s*==\s*task::TaskType::PROCESS\s*\)\s*\{\s*continue;", steal_body):
+        fail("idle steal must not skip every PROCESS task")
+
+
 def test_wait_channel_policy_uses_typed_kinds() -> None:
     source = SCHEDULER_CPP.read_text()
     task_header = TASK_HPP.read_text()
@@ -187,6 +278,7 @@ def test_higher_priority_wakeup_bypasses_only_priority_holdoff_guards() -> None:
             "bool const HIGHER_PRIORITY_PREEMPT = is_higher_priority_process_contender(current_task, next);",
             "next->vdeadline >= current_task->vdeadline && !HIGHER_PRIORITY_PREEMPT",
             "next->just_woke && !HIGHER_PRIORITY_PREEMPT && RUN_DURATION_US < SCHED_MIN_GRANULARITY_US",
+            "!HIGHER_PRIORITY_PREEMPT &&",
             "bool const LOWER_PRIORITY_PROCESS_PREEMPT",
             "bool const LOWER_WEIGHT_PREEMPT",
             "bool const BURSTY_PROCESS_WAKEUP_PREEMPT",
@@ -529,6 +621,62 @@ def test_scheduler_timer_disarm_clears_pending_reschedule_token() -> None:
             "rq->resched_timer_pending.store(false, std::memory_order_release);",
         ],
         "local wake coalescing depends on non-stale pending token",
+    )
+
+
+def test_idle_timer_arms_when_idle_runqueue_has_runnable_work() -> None:
+    source = SCHEDULER_CPP.read_text()
+    idle_timer_body = function_body(source, "arm_idle_timer_locked")
+    probe_body = function_body(source, "idle_rebalance_probe_needed_for_idle")
+    timer_decision_body = function_body(source, "get_scheduler_timer_decision_for_this_cpu")
+
+    require_tokens(
+        idle_timer_body,
+        [
+            "if (rq->runnable_heap.size != 0)",
+            "rq->idle_timer_arms.fetch_add(1, std::memory_order_relaxed);",
+            "apic::one_shot_timer(1);",
+            "return;",
+            "uint64_t const DEADLINE_US = rq->next_wait_deadline_us;",
+        ],
+        "idle timer must not disarm with runnable work queued",
+    )
+    require_order(
+        idle_timer_body,
+        "if (rq->runnable_heap.size != 0)",
+        "uint64_t const DEADLINE_US = rq->next_wait_deadline_us;",
+        "idle timer must check queued runnable work before wait deadlines",
+    )
+    require_tokens(
+        timer_decision_body,
+        [
+            "if (rq->runnable_heap.size != 0 && CURRENT_IS_IDLE)",
+            "SchedulerTimerArmReason::IDLE_WORK",
+            "return FIXED_QUANTUM;",
+        ],
+        "normal scheduler timer path must also keep idle CPUs with queued work ticking",
+    )
+    require_tokens(
+        source,
+        ["constexpr uint64_t IDLE_REBALANCE_PROBE_US = 2'000;"],
+        "idle rebalance probe interval",
+    )
+    require_tokens(
+        idle_timer_body,
+        [
+            "idle_rebalance_probe_needed_for_idle(cpu::current_cpu())",
+            "idle_timer_ticks_for_delta_us(IDLE_REBALANCE_PROBE_US)",
+        ],
+        "idle timer should periodically probe peer runqueues when work stealing is plausible",
+    )
+    require_tokens(
+        probe_body,
+        [
+            "VICTIM_HEAP_SIZE == 0",
+            "VICTIM_CURRENT_LOAD == 0 && VICTIM_HEAP_SIZE < 2",
+            "victim_dom != nullptr && victim_dom->hard",
+        ],
+        "idle rebalance probe must preserve hard-domain and leave-work-behind constraints",
     )
 
 
@@ -1141,6 +1289,8 @@ def test_runnable_publication_requires_successful_heap_insert() -> None:
 
 def main() -> None:
     test_event_wake_cancel_preserves_current_task_wakeup_token()
+    test_event_wake_rebalances_normal_process_waiters()
+    test_idle_steal_can_migrate_normal_process_work()
     test_wait_channel_policy_uses_typed_kinds()
     test_higher_priority_wakeup_bypasses_only_priority_holdoff_guards()
     test_runtime_accounting_deltas_are_saturating()
@@ -1150,6 +1300,7 @@ def main() -> None:
     test_pagemap_sibling_check_includes_dead_publishers()
     test_process_syscall_reschedules_defer_to_syscall_exit()
     test_scheduler_timer_disarm_clears_pending_reschedule_token()
+    test_idle_timer_arms_when_idle_runqueue_has_runnable_work()
     test_scheduler_cpu_dump_is_cmdline_gated_and_reports_reschedule_state()
     test_placement_load_counts_current_task()
     test_cpu_accounting_snapshot_projects_live_current_runtime()

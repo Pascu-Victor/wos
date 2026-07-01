@@ -1367,6 +1367,7 @@ uint8_t wake_ipi_vector = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global
 // Cached APIC timer tick count for the idle timer.
 uint32_t idle_timer_ticks = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 constexpr uint64_t IDLE_TIMER_CALIBRATION_US = 10'000;
+constexpr uint64_t IDLE_REBALANCE_PROBE_US = 2'000;
 constexpr uint32_t SCHED_GC_RECLAIM_BUDGET = 32;
 constexpr uint64_t SCHED_GC_WORK_BUDGET_US = 500;
 // Keep each deferred pagemap reclaim slice small enough that scheduler GC does
@@ -1983,6 +1984,75 @@ inline auto compute_wakeup_floor_vruntime(RunQueue* rq, task::Task* t, uint64_t 
 // ============================================================================
 inline auto cpu_mask_contains(uint64_t mask, uint64_t cpu_no) -> bool { return cpu_no < 64 && (mask & (1ULL << cpu_no)) != 0U; }
 
+inline auto task_can_run_on_cpu(task::Task const* task, uint64_t cpu_no, uint64_t core_count) -> bool {
+    if (task == nullptr || cpu_no >= core_count) {
+        return false;
+    }
+
+    uint64_t const ALL_MASK = (core_count >= 64) ? UINT64_MAX : ((1ULL << core_count) - 1ULL);
+    uint64_t allowed_mask = task->domain_mask & ALL_MASK;
+    if (allowed_mask == 0) {
+        allowed_mask = ALL_MASK;
+    }
+
+    return cpu_mask_contains(allowed_mask, cpu_no);
+}
+
+inline auto idle_rebalance_probe_needed_for_idle(uint64_t idle_cpu) -> bool {
+    if (run_queues == nullptr) {
+        return false;
+    }
+
+    uint64_t const N = smt::get_core_count();
+    if (N <= 1 || idle_cpu >= N) {
+        return false;
+    }
+
+    uint32_t const OUR_GROUP = smt::find_group_for_cpu(idle_cpu);
+    auto* group = smt::get_cpu_domain(OUR_GROUP);
+    uint64_t const GROUP_MASK = (group != nullptr) ? group->cpu_mask : ~0ULL;
+    constexpr uint32_t FULL_LOAD = 8;
+
+    for (uint64_t off = 1; off <= N; ++off) {
+        uint64_t const VICTIM_CPU = (idle_cpu + off) % N;
+        if (VICTIM_CPU == idle_cpu || !cpu_mask_contains(GROUP_MASK, VICTIM_CPU)) {
+            continue;
+        }
+
+        auto* victim_rq = run_queues->that_cpu(VICTIM_CPU);
+        if (victim_rq == nullptr) {
+            continue;
+        }
+
+        uint32_t const VICTIM_DOM_ID = victim_rq->domain_id;
+        if (VICTIM_DOM_ID != 0) {
+            auto* victim_dom = smt::get_cpu_domain(VICTIM_DOM_ID);
+            if (victim_dom != nullptr && victim_dom->hard && !cpu_mask_contains(victim_dom->cpu_mask, idle_cpu)) {
+                continue;
+            }
+        }
+
+        uint32_t const VICTIM_HEAP_SIZE = victim_rq->runnable_heap.size;
+        if (VICTIM_HEAP_SIZE == 0) {
+            continue;
+        }
+
+        uint32_t const VICTIM_CURRENT_LOAD = victim_rq->cached_current_load_process.load(std::memory_order_relaxed);
+        if (VICTIM_CURRENT_LOAD == 0 && VICTIM_HEAP_SIZE < 2) {
+            continue;
+        }
+
+        uint32_t const VICTIM_LOAD = victim_rq->cached_load_process.load(std::memory_order_relaxed) + VICTIM_CURRENT_LOAD;
+        uint32_t const MIN_STEAL_LOAD =
+            (victim_rq->daemon_load_penalty.load(std::memory_order_relaxed) > 0) ? FULL_LOAD * 4 : FULL_LOAD * 2;
+        if (VICTIM_LOAD >= MIN_STEAL_LOAD) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
     if (run_queues == nullptr) {
         return false;
@@ -2030,11 +2100,16 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
             }
         }
 
-        uint32_t const VLOAD = victim_rq_raw->runnable_heap.size * FULL_LOAD;
+        uint32_t const VICTIM_HEAP_SIZE = victim_rq_raw->runnable_heap.size;
+        uint32_t const VICTIM_CURRENT_LOAD = victim_rq_raw->cached_current_load_process.load(std::memory_order_relaxed);
+        uint32_t const VLOAD = victim_rq_raw->cached_load_process.load(std::memory_order_relaxed) + VICTIM_CURRENT_LOAD;
         // Phase 8b: soft-exclusive CPUs (daemon_load_penalty > 0) are only stolen from
         // if the load differential is 2× the normal threshold, preserving their intent.
         uint32_t const MIN_STEAL_LOAD =
             (victim_rq_raw->daemon_load_penalty.load(std::memory_order_relaxed) > 0) ? FULL_LOAD * 4 : FULL_LOAD * 2;
+        if (VICTIM_HEAP_SIZE == 0 || (VICTIM_CURRENT_LOAD == 0 && VICTIM_HEAP_SIZE < 2)) {
+            continue;
+        }
         if (VLOAD < MIN_STEAL_LOAD) {
             continue;
         }
@@ -2050,9 +2125,23 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
         // would then be silently refused (double-insert guard), leaving the
         // task stuck on the victim CPU with a stale cpu field.
         task::Task* stolen = nullptr;
-        run_queues->try_with_lock(VICTIM_CPU, [stealing_cpu, &stolen](RunQueue* victim_rq) {
+        run_queues->try_with_lock(VICTIM_CPU, [stealing_cpu, &stolen, N](RunQueue* victim_rq) {
             // Authoritative check under lock
-            if (victim_rq->runnable_heap.size < 2) {
+            uint32_t const VICTIM_HEAP_SIZE = victim_rq->runnable_heap.size;
+            if (VICTIM_HEAP_SIZE == 0) {
+                return;
+            }
+
+            uint32_t const VICTIM_CURRENT_LOAD = current_task_load_for_incoming(victim_rq->current_task, task::TaskType::PROCESS);
+            if (VICTIM_CURRENT_LOAD == 0 && VICTIM_HEAP_SIZE < 2) {
+                return;
+            }
+
+            constexpr uint32_t LOCKED_FULL_LOAD = 8;
+            uint32_t const VICTIM_LOAD = victim_rq->cached_load_process.load(std::memory_order_relaxed) + VICTIM_CURRENT_LOAD;
+            uint32_t const MIN_STEAL_LOAD =
+                (victim_rq->daemon_load_penalty.load(std::memory_order_relaxed) > 0) ? LOCKED_FULL_LOAD * 4 : LOCKED_FULL_LOAD * 2;
+            if (VICTIM_LOAD < MIN_STEAL_LOAD) {
                 return;
             }
 
@@ -2079,14 +2168,16 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
                 if (t->cpu_pinned || t->domain_hard) {
                     continue;
                 }
+                if (!task_can_run_on_cpu(t, stealing_cpu, N)) {
+                    continue;
+                }
                 if (t->type == task::TaskType::IDLE) {
                     continue;
                 }
-                // Never steal PROCESS tasks - they have large working sets and
-                // cross-CPU migration causes severe cache thrashing (mandelbench
-                // regression: >2x slowdown when compute threads are stolen).
-                // Only DAEMON tasks are lightweight enough to migrate safely.
-                if (t->type == task::TaskType::PROCESS) {
+                if (!t->has_run) {
+                    continue;
+                }
+                if (t->type == task::TaskType::PROCESS && (t->thread == nullptr || t->pagemap == nullptr)) {
                     continue;
                 }
                 if (t->vdeadline > best_vd) {
@@ -2185,7 +2276,7 @@ inline uint32_t cached_effective_load_for_cpu(uint64_t cpu_no, task::TaskType in
     return load;
 }
 
-uint64_t get_least_loaded_cpu_for_task(task::Task* incoming_task) {
+uint64_t get_least_loaded_cpu_for_task(task::Task const* incoming_task) {
     if (run_queues == nullptr) {
         return 0;
     }
@@ -2446,27 +2537,42 @@ void arm_local_timer_after_deferred_switch(task::Task* return_task) {
     apic::one_shot_timer(1);
 }
 
-void arm_idle_timer_locked(RunQueue* rq) {
-    uint64_t const DEADLINE_US = rq->next_wait_deadline_us;
-    if (DEADLINE_US == 0) {
-        rq->idle_timer_disarms.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-
+auto idle_timer_ticks_for_delta_us(uint64_t delta_us) -> uint64_t {
     if (idle_timer_ticks == 0) {
         idle_timer_ticks = apic::calibrate_timer(IDLE_TIMER_CALIBRATION_US);
     }
 
-    uint64_t const NOW_US = time::get_us();
-    uint64_t delta_us = DEADLINE_US > NOW_US ? DEADLINE_US - NOW_US : 1;
     delta_us = std::min<uint64_t>(delta_us, IDLE_TIMER_CALIBRATION_US);
     uint64_t ticks = (static_cast<uint64_t>(idle_timer_ticks) * delta_us) / IDLE_TIMER_CALIBRATION_US;
     if (ticks == 0) {
         ticks = 1;
     }
+    return ticks;
+}
+
+void arm_idle_timer_locked(RunQueue* rq) {
+    if (rq->runnable_heap.size != 0) {
+        rq->idle_timer_arms.fetch_add(1, std::memory_order_relaxed);
+        apic::one_shot_timer(1);
+        return;
+    }
+
+    uint64_t const DEADLINE_US = rq->next_wait_deadline_us;
+    if (DEADLINE_US == 0) {
+        if (idle_rebalance_probe_needed_for_idle(cpu::current_cpu())) {
+            rq->idle_timer_arms.fetch_add(1, std::memory_order_relaxed);
+            apic::one_shot_timer(idle_timer_ticks_for_delta_us(IDLE_REBALANCE_PROBE_US));
+            return;
+        }
+        rq->idle_timer_disarms.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    uint64_t const NOW_US = time::get_us();
+    uint64_t const DELTA_US = DEADLINE_US > NOW_US ? DEADLINE_US - NOW_US : 1;
 
     rq->idle_timer_arms.fetch_add(1, std::memory_order_relaxed);
-    apic::one_shot_timer(ticks);
+    apic::one_shot_timer(idle_timer_ticks_for_delta_us(DELTA_US));
 }
 
 // Enter the kernel idle loop on the idle task's stack. Does NOT return.
@@ -3414,6 +3520,64 @@ auto request_kernel_threads_shutdown(uint64_t timeout_us) -> KernelThreadShutdow
     return result;
 }
 
+namespace {
+constexpr uint32_t EVENT_WAKE_REBALANCE_LOAD_GAP = 16;
+
+inline auto task_allowed_cpu_mask(task::Task const* task, uint64_t core_count) -> uint64_t {
+    uint64_t const ALL_MASK = (core_count >= 64) ? UINT64_MAX : ((1ULL << core_count) - 1ULL);
+    uint64_t allowed_mask = task != nullptr ? task->domain_mask : ALL_MASK;
+    allowed_mask &= ALL_MASK;
+    return allowed_mask != 0 ? allowed_mask : ALL_MASK;
+}
+
+inline auto event_wake_can_rebalance_process(task::Task const* task) -> bool {
+    if (task == nullptr || task->type != task::TaskType::PROCESS) {
+        return false;
+    }
+    if (task->cpu_pinned || task->domain_hard) {
+        return false;
+    }
+    if (task->thread == nullptr || task->pagemap == nullptr) {
+        return false;
+    }
+    if (task->sched_queue != task::Task::sched_queue::WAITING) {
+        return false;
+    }
+    return !task->wait_channel_is(task::WaitChannelKind::WKI_EXECVE_PROXY);
+}
+
+inline auto event_wake_rebalance_target_cpu(task::Task const* task, uint64_t preferred_cpu) -> uint64_t {
+    if (!event_wake_can_rebalance_process(task) || run_queues == nullptr) {
+        return preferred_cpu;
+    }
+
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    if (CORE_COUNT <= 1) {
+        return preferred_cpu;
+    }
+
+    uint64_t const ALLOWED_MASK = task_allowed_cpu_mask(task, CORE_COUNT);
+    if (preferred_cpu >= CORE_COUNT || !cpu_mask_contains(ALLOWED_MASK, preferred_cpu)) {
+        return get_least_loaded_cpu_for_task(task);
+    }
+
+    uint64_t const BEST_CPU = get_least_loaded_cpu_for_task(task);
+    if (BEST_CPU >= CORE_COUNT || BEST_CPU == preferred_cpu) {
+        return preferred_cpu;
+    }
+
+    uint32_t const PREFERRED_LOAD = cached_effective_load_for_cpu(preferred_cpu, task::TaskType::PROCESS);
+    uint32_t const BEST_LOAD = cached_effective_load_for_cpu(BEST_CPU, task::TaskType::PROCESS);
+    if (PREFERRED_LOAD == UINT32_MAX || BEST_LOAD == UINT32_MAX) {
+        return preferred_cpu;
+    }
+    if (PREFERRED_LOAD > BEST_LOAD && PREFERRED_LOAD - BEST_LOAD > EVENT_WAKE_REBALANCE_LOAD_GAP) {
+        return BEST_CPU;
+    }
+    return preferred_cpu;
+}
+}  // namespace
+
 auto event_wake_target_cpu(const task::Task* task, uint64_t waker_cpu) -> uint64_t {
     if (task == nullptr) {
         return waker_cpu;
@@ -3422,7 +3586,7 @@ auto event_wake_target_cpu(const task::Task* task, uint64_t waker_cpu) -> uint64
     bool const WAITING = task->sched_queue == task::Task::sched_queue::WAITING;
     bool const VOLUNTARY_BLOCK = task->is_voluntary_blocked();
     if (event_wake_prefers_waker_cpu(task->cpu_pinned, WAITING, VOLUNTARY_BLOCK)) {
-        return waker_cpu;
+        return event_wake_rebalance_target_cpu(task, waker_cpu);
     }
     return task->cpu;
 }
@@ -3954,7 +4118,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             background_preempt_granularity_us =
                 std::max<uint64_t>(background_preempt_granularity_us, compute_bursty_preempt_guard_us(next));
         }
-        if (!current_task->is_voluntary_blocked() &&
+        if (!current_task->is_voluntary_blocked() && !HIGHER_PRIORITY_PREEMPT &&
             (LOWER_PRIORITY_PROCESS_PREEMPT || LOWER_WEIGHT_PREEMPT || BURSTY_PROCESS_WAKEUP_PREEMPT) &&
             rq->runnable_heap.contains(current_task) && RUN_DURATION_US < background_preempt_granularity_us) {
             return nullptr;
