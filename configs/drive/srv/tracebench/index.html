@@ -119,12 +119,28 @@
     const el = Object.fromEntries(ids.map((id) => [id, document.getElementById(id)]));
     const fill = document.getElementById("fill");
     const preview = document.getElementById("preview");
+    const pollIntervalMs = 1000;
     let activeRun = "";
 
     async function json(path) {
       const response = await fetch(`${path}?t=${Date.now()}`, { cache: "no-store" });
       if (!response.ok) throw new Error(path);
       return response.json();
+    }
+
+    function setPreview(path) {
+      const src = `${path}?t=${Date.now()}`;
+      return new Promise((resolve) => {
+        function settle() {
+          preview.removeEventListener("load", settle);
+          preview.removeEventListener("error", settle);
+          resolve();
+        }
+
+        preview.addEventListener("load", settle);
+        preview.addEventListener("error", settle);
+        preview.src = src;
+      });
     }
 
     async function tick() {
@@ -143,14 +159,20 @@
         el.samples.textContent = `${status.samples_done} / ${status.total_samples}`;
         el.elapsed.textContent = `${Number(status.elapsed_seconds || 0).toFixed(2)}s`;
         el.state.textContent = status.done ? "Frame complete." : "Rendering.";
-        preview.src = `/srv/tracebench/runs/${activeRun}/${status.done ? "frame_000.png" : "preview.png"}?t=${Date.now()}`;
+        await setPreview(`/srv/tracebench/runs/${activeRun}/${status.done ? "frame_000.png" : "preview.png"}`);
       } catch {
         el.state.textContent = "Waiting for a render.";
       }
     }
 
-    tick();
-    setInterval(tick, 1000);
+    async function poll() {
+      const started = performance.now();
+      await tick();
+      const elapsed = performance.now() - started;
+      setTimeout(poll, Math.max(0, pollIntervalMs - elapsed));
+    }
+
+    poll();
   </script>
 </body>
 </html>
