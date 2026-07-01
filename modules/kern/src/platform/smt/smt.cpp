@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <new>
 
 #include "mod/io/serial/serial.hpp"
 #include "net/proto/tcp.hpp"
@@ -169,6 +170,42 @@ cpu::PerCpu** kernel_per_cpu_ptrs = nullptr;
 // Atomic counter to track how many CPUs have completed GS_BASE initialization
 // The last CPU to reach cpu_count enables per-CPU allocations globally
 std::atomic<uint64_t> cpus_initialized{0};
+
+auto selftest_ap_per_cpu(uint64_t cpu_no) -> cpu::PerCpu* {
+    if (kernel_per_cpu_ptrs == nullptr || cpu_no >= g_cpu_count) {
+        return nullptr;
+    }
+    return kernel_per_cpu_ptrs[cpu_no];
+}
+
+void zero_per_cpu(cpu::PerCpu& per_cpu_data) {
+    per_cpu_data.syscall_stack = 0;
+    per_cpu_data.user_rsp = 0;
+    per_cpu_data.cpu_id = 0;
+    per_cpu_data.saved_ds = 0;
+    per_cpu_data.saved_es = 0;
+    per_cpu_data.syscall_ret_rip = 0;
+    per_cpu_data.syscall_ret_flags = 0;
+    per_cpu_data.syscall_entry_tmp = 0;
+}
+
+void prepare_selftest_ap_context(uint64_t cpu_no) {
+    if (kernel_per_cpu_ptrs == nullptr || cpu_no >= g_cpu_count) {
+        dbg::log("smt: missing selftest per-cpu storage for CPU %llu", static_cast<unsigned long long>(cpu_no));
+        hcf();
+    }
+    if (kernel_per_cpu_ptrs[cpu_no] != nullptr) {
+        return;
+    }
+
+    auto* per_cpu_data = new (std::nothrow) cpu::PerCpu();
+    if (per_cpu_data == nullptr) {
+        dbg::log("smt: failed to allocate selftest per-cpu storage for CPU %llu", static_cast<unsigned long long>(cpu_no));
+        hcf();
+    }
+    zero_per_cpu(*per_cpu_data);
+    kernel_per_cpu_ptrs[cpu_no] = per_cpu_data;
+}
 
 void cpu_param_init(uint64_t cpu_no, uint64_t stack_top) {
     // Enable CPU features FIRST (must be done on each CPU)
@@ -622,9 +659,12 @@ void selftest_secondary_cpu_park(limine_mp_info* smp_info) {
     cpu::enable_sse();
     cpu::enable_xsave();
 
-    auto* per_cpu_data = new cpu::PerCpu();
+    auto* per_cpu_data = selftest_ap_per_cpu(cpu_no);
+    if (per_cpu_data == nullptr) {
+        hcf();
+    }
     auto const PER_CPU_ADDR = reinterpret_cast<uint64_t>(per_cpu_data);
-    std::memset(reinterpret_cast<void*>(PER_CPU_ADDR), 0, sizeof(cpu::PerCpu));
+    zero_per_cpu(*per_cpu_data);
     per_cpu_data->syscall_stack = STACK_TOP;
     per_cpu_data->cpu_id = cpu_no;
 
@@ -696,6 +736,7 @@ void park_secondary_cpus_for_selftest() {
         if (response->cpus[i]->lapic_id == bsp_lapic_id) {
             continue;
         }
+        prepare_selftest_ap_context(i);
         expected_mask |= 1ULL << i;
         __atomic_store_n(&response->cpus[i]->goto_address, static_cast<limine_goto_address>(selftest_secondary_cpu_park), __ATOMIC_SEQ_CST);
     }

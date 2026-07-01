@@ -264,14 +264,18 @@ if(WOS_KASAN)
     target_compile_definitions(${KERNEL} PRIVATE WOS_KASAN=1)
 
     # ---------------------------------------------------------------------------
-    # Files that must NOT be KASan-instrumented because they execute before the
-    # shadow memory is mapped (PHASE_0 early boot, MM init, interrupt/fault
-    # infrastructure, and the KASan runtime itself).
+    # Files that must NOT be sanitizer- or coverage-instrumented because they
+    # execute before the shadow memory is mapped, before per-CPU/IDT state is
+    # ready, or inside sanitizer/fault runtimes themselves.
     #
-    # Instrumenting these causes the compiler-inserted shadow checks to fault on
-    # unmapped shadow pages before the page-fault handler is ready — instant
-    # triple fault or infinite recursion.
+    # Instrumenting these causes compiler-inserted shadow checks, UBSan checks,
+    # or KCOV callbacks to fault before the page-fault handler is ready —
+    # instant triple fault or infinite recursion.
     # ---------------------------------------------------------------------------
+    set(KASAN_EXCLUDED_COMPILE_OPTIONS
+        -fno-sanitize=all
+        -fno-sanitize-coverage=trace-pc
+    )
     set(KASAN_EXCLUDED_SRCS
         # Early boot / logging (runs before any shadow pages exist)
         src/platform/dbg/dbg.cpp
@@ -316,8 +320,8 @@ if(WOS_KASAN)
         src/platform/init/init_validation.cpp
         src/platform/init/limine_requests.cpp
         # Secondary CPU bootstrap runs before each AP installs its IDT, so any
-        # compiler-emitted shadow access there can reset the VM before the
-        # shadow-fault handler exists on that CPU.
+        # compiler-emitted or allocator-driven shadow access there can reset the
+        # VM before the shadow-fault handler exists on that CPU.
         src/platform/smt/smt.cpp
         # Low-level CPU/ASM helpers called from exception paths
         src/platform/asm/cpu.cpp
@@ -336,7 +340,7 @@ if(WOS_KASAN)
     foreach(src IN LISTS KASAN_EXCLUDED_SRCS)
         set_source_files_properties(
             ${CMAKE_CURRENT_SOURCE_DIR}/${src}
-            PROPERTIES COMPILE_OPTIONS "-fno-sanitize=kernel-address"
+            PROPERTIES COMPILE_OPTIONS "${KASAN_EXCLUDED_COMPILE_OPTIONS}"
         )
     endforeach()
 
