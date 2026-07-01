@@ -553,6 +553,72 @@ def test_top_level_build_paths_propagate_full_parallelism() -> None:
         fail("bootstrap libc++ wrapper must run after configuring the runtimes build")
 
 
+def test_libcxx_bootstrap_uses_host_tools_and_only_flag_preseeds() -> None:
+    bootstrap = WOS_TOOLCHAIN.read_text()
+    require_tokens(
+        bootstrap,
+        [
+            'HOST_NINJA="$(command -v ninja)"',
+            'HOST_PYTHON="$(command -v python3)"',
+            "LIBCXX_CMAKE_HOST_TOOL_ARGS=(",
+            '-DCMAKE_MAKE_PROGRAM="$HOST_NINJA"',
+            '-DPython3_EXECUTABLE="$HOST_PYTHON"',
+            '-DCMAKE_FIND_ROOT_PATH="$SYSROOT"',
+            "-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER",
+            "-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY",
+            "-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY",
+            "LIBCXX_CMAKE_SUPPORT_CACHE_ARGS=(",
+            "-DCXX_SUPPORTS_NOSTDLIBXX_FLAG=1",
+            "-DCXX_SUPPORTS_FVISIBILITY_EQ_HIDDEN_FLAG=1",
+            "-DCXX_SUPPORTS_WERROR_EQ_RETURN_TYPE_FLAG=1",
+            "-DC_SUPPORTS_FUNWIND_TABLES_FLAG=1",
+            "-DLLVM_USES_LIBSTDCXX=",
+            "-DLINKER_SUPPORTS_COLOR_DIAGNOSTICS=",
+            "LIBCXX_RUNTIME_CMAKE_SUPPORT_CACHE_ARGS=(",
+            '"${LIBCXX_CMAKE_SUPPORT_CACHE_ARGS[@]}"',
+            "-DCXX_SUPPORTS_FNO_EXCEPTIONS_FLAG=1",
+            "-DCXX_SUPPORTS_FNO_RTTI_FLAG=1",
+            "-DCXX_SUPPORTS_FUNWIND_TABLES_FLAG=1",
+            "-DCXX_SUPPORTS_PEDANTIC_FLAG=1",
+        ],
+        "libc++ bootstrap host-tool selection and flag support preseeds",
+    )
+
+    expected_counts = {
+        '"${LIBCXX_CMAKE_HOST_TOOL_ARGS[@]}"': 2,
+        '"${LIBCXX_CMAKE_SUPPORT_CACHE_ARGS[@]}"': 2,
+        '"${LIBCXX_RUNTIME_CMAKE_SUPPORT_CACHE_ARGS[@]}"': 1,
+    }
+    for token, expected_count in expected_counts.items():
+        actual_count = bootstrap.count(token)
+        if actual_count != expected_count:
+            fail(
+                "libc++ bootstrap expected "
+                f"{expected_count} occurrences of {token}, found {actual_count}"
+            )
+
+    forbidden = [
+        "LIBCXXABI_HAS_C_LIB=1",
+        "LIBCXXABI_HAS_DL_LIB=1",
+        "LIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL=1",
+        "LIBCXX_HAS_RT_LIB=1",
+        "LIBCXX_HAS_ATOMIC_LIB=1",
+        "LIBUNWIND_HAS_C_LIB=1",
+        "LIBUNWIND_HAS_DL_LIB=1",
+        "LIBUNWIND_HAS_PTHREAD_LIB=1",
+        "LIBUNWIND_HAS_GCC_S_LIB=1",
+        "LIBUNWIND_HAS_GCC_LIB=1",
+        "HAVE_FLOCK=1",
+        "PICOLIBC=1",
+    ]
+    present = [token for token in forbidden if token in bootstrap]
+    if present:
+        fail(
+            "libc++ bootstrap must keep library and runtime capability probes live: "
+            + ", ".join(present)
+        )
+
+
 def test_mlibc_wrap_dependencies_are_prefetched_with_retries() -> None:
     bootstrap = WOS_TOOLCHAIN.read_text()
     build_script = WOS_MLIBC_BUILD.read_text()
@@ -2158,6 +2224,7 @@ if __name__ == "__main__":
     test_root_toolchain_builds_do_not_use_ninja_console_pool()
     test_wos_build_jobs_helper_has_self_hostable_fallbacks()
     test_top_level_build_paths_propagate_full_parallelism()
+    test_libcxx_bootstrap_uses_host_tools_and_only_flag_preseeds()
     test_wos_mlibc_priority_sysdeps_are_syscall_backed()
     test_wos_port_build_scripts_use_shared_job_helper()
     test_gnu_make_port_build_scripts_use_make_job_helper()
