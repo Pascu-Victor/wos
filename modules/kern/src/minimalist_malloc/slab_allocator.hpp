@@ -59,8 +59,10 @@ class Slab {
     auto alloc_in_current_slab(size_t block_index) -> void*;
     auto alloc_in_new_slab() -> void*;
     void free_from_current_slab(size_t block_index);
+    auto request_untracked_memory_from_os(size_t size) -> void*;
     auto request_memory_from_os(size_t size) -> void*;
     auto free_memory_to_os(void* address, size_t size) -> void;
+    void mark_memory_as_slab(void* address);
 
     // Internal unlocked versions for use when lock is already held
     auto alloc_unlocked() -> void*;
@@ -120,7 +122,7 @@ auto Slab<slab_size, memory_size>::alloc_unlocked() -> void* {
         }
 
         if (slab->header.next == nullptr) {
-            return slab->alloc_in_new_slab();
+            return nullptr;
         }
 
         // Validate before following the pointer — misaligned means page-reuse UAF.
@@ -140,8 +142,47 @@ auto Slab<slab_size, memory_size>::alloc_unlocked() -> void* {
 
 template <size_t slab_size, size_t memory_size>
 auto Slab<slab_size, memory_size>::alloc() -> void* {
+    Slab* new_slab = nullptr;
+
     slab_lock.lock();
     void* result = alloc_unlocked();
+    if (result != nullptr) {
+        slab_lock.unlock();
+        return result;
+    }
+    slab_lock.unlock();
+
+    new_slab = static_cast<Slab*>(request_untracked_memory_from_os(sizeof(Slab)));
+    if (new_slab == nullptr) {
+        return nullptr;
+    }
+
+    slab_lock.lock();
+    result = alloc_unlocked();
+    if (result != nullptr) {
+        slab_lock.unlock();
+        free_memory_to_os(new_slab, sizeof(Slab));
+        return result;
+    }
+
+    Slab* tail = this;
+    while (tail->header.next != nullptr) {
+        auto next_addr = reinterpret_cast<uintptr_t>(tail->header.next);
+        const bool INVALID_DATA = (next_addr & 0xfULL) != 0 || ((next_addr < 0xffff800000000000ULL || next_addr >= 0xffff900000000000ULL) &&
+                                                                (next_addr < 0xffffffff80000000ULL || next_addr >= 0xffffffffc0000000ULL));
+        if (INVALID_DATA) {
+            ker::mod::dbg::log("slab UAF: header.next=0x%llx slab=%p free_blocks=%zu magic=0x%x size=%u",
+                               static_cast<unsigned long long>(next_addr), tail, tail->header.free_blocks, tail->header.magic,
+                               tail->header.size);
+            ker::mod::dbg::panic_handler("slab: corrupt header.next — freed slab page reused");
+        }
+        tail = tail->header.next;
+    }
+
+    new_slab->init(tail);
+    mark_memory_as_slab(new_slab);
+    tail->header.next = new_slab;
+    result = new_slab->alloc_in_current_slab(0);
     slab_lock.unlock();
     return result;
 }
@@ -314,13 +355,26 @@ void Slab<slab_size, memory_size>::free_from_current_slab(size_t block_index) {
 template <size_t slab_size, size_t memory_size>
 auto Slab<slab_size, memory_size>::request_memory_from_os(size_t size) -> void* {
     // system dependent function, returns aligned memory region.
+    void* address = request_untracked_memory_from_os(size);
+    mark_memory_as_slab(address);
+    return address;
+}
+
+template <size_t slab_size, size_t memory_size>
+auto Slab<slab_size, memory_size>::request_untracked_memory_from_os(size_t size) -> void* {
     void* address = ker::mod::mm::phys::page_alloc(size);
     if (address == nullptr) {
         ker::mod::dbg::log("Malloc memory expansion failed halting.");
         assert(false);
     }
-    (void)ker::mod::mm::phys::page_mark_kind(address, ker::mod::mm::PageKind::SLAB);
     return address;
+}
+
+template <size_t slab_size, size_t memory_size>
+void Slab<slab_size, memory_size>::mark_memory_as_slab(void* address) {
+    if (address != nullptr) {
+        (void)ker::mod::mm::phys::page_mark_kind(address, ker::mod::mm::PageKind::SLAB);
+    }
 }
 
 template <size_t slab_size, size_t memory_size>
