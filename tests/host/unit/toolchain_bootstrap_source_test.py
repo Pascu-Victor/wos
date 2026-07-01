@@ -141,21 +141,50 @@ def test_compiler_rt_runs_real_cmake_checks_without_forced_response_files() -> N
             "-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY",
             "-DCOMPILER_RT_BUILD_SANITIZERS=$build_sanitizers",
             '"${COMPILER_RT_CMAKE_SYSROOT_ARGS[@]}"',
+            '"${COMPILER_RT_CMAKE_CACHE_ARGS[@]}"',
         ],
         "compiler-rt bootstrap CMake configuration",
+    )
+    require_tokens(
+        source,
+        [
+            "COMPILER_RT_CMAKE_CACHE_ARGS=(",
+            "-DCOMPILER_RT_HAS_FPIC_FLAG=1",
+            "-DCOMPILER_RT_HAS_FPIE_FLAG=1",
+            "-DCOMPILER_RT_HAS_FNO_BUILTIN_FLAG=1",
+            "-DCOMPILER_RT_HAS_FNO_SANITIZE_SAFE_STACK_FLAG=1",
+            "-DCOMPILER_RT_HAS_WBUILTIN_DECLARATION_MISMATCH_FLAG=False",
+            "-DCOMPILER_RT_HAS_ZL_FLAG=False",
+            "-DCOMPILER_RT_HAS_ATOMIC_KEYWORD=True",
+            "-DCOMPILER_RT_HAS_ASM_LSE=False",
+            "-DCOMPILER_RT_HAS_AARCH64_SME=False",
+            "-DCXX_SUPPORTS_UNWINDLIB_NONE_FLAG=1",
+            "-DC_SUPPORTS_NODEFAULTLIBS_FLAG=1",
+        ],
+        "compiler-rt bootstrap stable clang capability preseeds",
     )
 
     forbidden = [
         "CMAKE_NINJA_FORCE_RESPONSE_FILE",
         "COMPILER_RT_LINK_FLAGS",
+        "COMPILER_RT_HAS_LIBC=ON",
+        "COMPILER_RT_HAS_LIBC=1",
+        "COMPILER_RT_HAS_LIBPTHREAD=ON",
+        "COMPILER_RT_HAS_LIBPTHREAD=1",
+        "COMPILER_RT_HAS_LIBUNWIND=ON",
+        "COMPILER_RT_HAS_LIBUNWIND=1",
         "COMPILER_RT_TARGET_HAS_ATOMICS=ON",
+        "COMPILER_RT_TARGET_HAS_ATOMICS=1",
         "COMPILER_RT_TARGET_HAS_FCNTL_LCK=ON",
+        "COMPILER_RT_TARGET_HAS_FCNTL_LCK=1",
         "COMPILER_RT_TARGET_HAS_FLOCK=ON",
+        "COMPILER_RT_TARGET_HAS_FLOCK=1",
         "COMPILER_RT_TARGET_HAS_UNAME=ON",
+        "COMPILER_RT_TARGET_HAS_UNAME=1",
     ]
     present = [token for token in forbidden if token in source]
     if present:
-        fail("compiler-rt bootstrap must not force or preseed CMake checks: " + ", ".join(present))
+        fail("compiler-rt bootstrap must not force response files or runtime target checks: " + ", ".join(present))
 
 
 def test_compiler_rt_sanitizers_are_built_after_mlibc() -> None:
