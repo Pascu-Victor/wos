@@ -582,6 +582,43 @@ def test_open_create_uses_central_cache_notify_path() -> None:
     )
 
 
+def test_tmpfs_permission_denied_open_runs_close_hook() -> None:
+    vfs_core = KERNEL_VFS_CORE_CPP.read_text()
+    tmpfs = (ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "tmpfs.cpp").read_text()
+
+    open_body = function_body(vfs_core, r"auto\s+vfs_open\(std::string_view\s+path,\s*int\s+flags,\s*int\s+mode\)\s*->\s*int")
+    require_order(
+        open_body,
+        [
+            "int const PERM_RET = vfs_check_permission(node->mode, node->uid, node->gid, required_access)",
+            "if (PERM_RET < 0)",
+            "vfs_destroy_file(f)",
+            "return PERM_RET",
+        ],
+        "tmpfs permission-denied open cleanup",
+    )
+    denied_cleanup = open_body[open_body.find("int const PERM_RET = vfs_check_permission") :]
+    denied_cleanup = denied_cleanup[: denied_cleanup.find("int const TRUNCATE_RET = apply_open_truncation")]
+    if "delete f" in denied_cleanup or "vfs_file_clear_path(f)" in denied_cleanup:
+        fail("permission-denied tmpfs open must use vfs_destroy_file so tmpfs close decrements open_count")
+
+    tmpfs_open = function_body(
+        tmpfs,
+        r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode\)\s*->\s*ker::vfs::File\*",
+    )
+    tmpfs_close = function_body(tmpfs, r"auto\s+tmpfs_fops_close\(ker::vfs::File\*\s+f\)\s*->\s*int")
+    require_tokens(
+        tmpfs_open,
+        ["node->open_count.fetch_add(1, std::memory_order_relaxed)"],
+        "tmpfs open count increment",
+    )
+    require_tokens(
+        tmpfs_close,
+        ["node->open_count.fetch_sub(1, std::memory_order_acq_rel)", "f->private_data = nullptr"],
+        "tmpfs close count decrement",
+    )
+
+
 if __name__ == "__main__":
     test_kernel_dirent_types_match_mlibc_public_abi()
     test_git_helper_pipe_cloexec_patch_is_preserved_by_mlibc()
@@ -594,4 +631,5 @@ if __name__ == "__main__":
     test_kernel_dirfd_resolution_returns_task_visible_paths()
     test_metadata_cache_store_uses_pre_backend_stat_generation()
     test_open_create_uses_central_cache_notify_path()
+    test_tmpfs_permission_denied_open_runs_close_hook()
     print("WOS mlibc VFS source invariants hold")

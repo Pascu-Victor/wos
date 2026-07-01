@@ -4996,9 +4996,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
         if (node != nullptr) {
             int const PERM_RET = vfs_check_permission(node->mode, node->uid, node->gid, required_access);
             if (PERM_RET < 0) {
-                // Permission denied - clean up and return
-                vfs_file_clear_path(f);
-                delete f;
+                vfs_destroy_file(f);
                 return PERM_RET;
             }
         }
