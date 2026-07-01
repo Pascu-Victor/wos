@@ -1145,10 +1145,13 @@ auto active_list_insert(task::Task* t) -> bool {
     uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
     for (uint32_t i = 0; i < active_task_count; ++i) {
         auto* existing = active_task_slot(i);
-        if (existing == t || (existing != nullptr && existing->pid == t->pid)) {
-            active_task_slot(i) = t;
+        if (existing == t) {
             global_task_registry_lock.unlock_irqrestore(FLAGS);
             return true;
+        }
+        if (existing != nullptr && existing->pid == t->pid) {
+            global_task_registry_lock.unlock_irqrestore(FLAGS);
+            return false;
         }
     }
     if (active_task_count < MAX_ACTIVE_TASKS) {
@@ -1194,10 +1197,9 @@ auto pid_table_insert(task::Task* t) -> bool {
             return true;
         }
         if (entry.pid == t->pid) {
-            // Slot already taken by same PID - update pointer (shouldn't happen)
-            entry.task = t;
+            bool const SAME_TASK = entry.task == t;
             global_task_registry_lock.unlock_irqrestore(FLAGS);
-            return true;
+            return SAME_TASK;
         }
     }
     global_task_registry_lock.unlock_irqrestore(FLAGS);

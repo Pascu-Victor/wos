@@ -1011,8 +1011,12 @@ void Task::save_context(cpu::GPRegs* gpr) const {
 }
 
 auto get_next_pid() -> uint64_t {
-    static uint64_t next_pid = 1;  // Start from 1 to avoid confusion with kernel tasks
-    return next_pid++;
+    static std::atomic<uint64_t> next_pid{1};  // Start from 1 to avoid confusion with kernel tasks
+    uint64_t pid = 0;
+    while (pid == 0) {
+        pid = next_pid.fetch_add(1, std::memory_order_relaxed);
+    }
+    return pid;
 }
 
 }  // namespace ker::mod::sched::task

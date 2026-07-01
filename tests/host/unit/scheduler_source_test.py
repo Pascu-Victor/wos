@@ -548,7 +548,7 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
     require_tokens(
         task_source,
         [
-            "static uint64_t next_pid = 1",
+            "static std::atomic<uint64_t> next_pid{1}",
             "this->pid = sched::task::get_next_pid();",
             "threading::create_thread(ker::mod::mm::USER_STACK_SIZE, ACTUAL_TLS_INFO.tls_size, this->pagemap, this->pid",
         ],
@@ -575,6 +575,59 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
         "mod::sched::post_task_for_cpu(TARGET_CPU, t)",
         "secondary pthread TCB tid must be published before scheduling",
     )
+
+
+def test_pid_allocation_and_publication_reject_duplicates() -> None:
+    task_source = TASK_CPP.read_text()
+    scheduler_source = SCHEDULER_CPP.read_text()
+    next_pid_body = function_body(task_source, "get_next_pid")
+    pid_insert_body = function_body(scheduler_source, "pid_table_insert")
+    active_insert_body = function_body(scheduler_source, "active_list_insert")
+
+    require_tokens(
+        next_pid_body,
+        [
+            "static std::atomic<uint64_t> next_pid{1}",
+            "uint64_t pid = 0",
+            "while (pid == 0)",
+            "pid = next_pid.fetch_add(1, std::memory_order_relaxed)",
+            "return pid",
+        ],
+        "PID allocation must be atomic and skip PID 0 on wrap",
+    )
+    if "static uint64_t next_pid" in next_pid_body or "return next_pid++" in next_pid_body:
+        fail("PID allocation must not use a plain static increment")
+
+    require_order(
+        pid_insert_body,
+        "if (entry.pid == 0)",
+        "if (entry.pid == t->pid)",
+        "PID table insert must probe empty slots before duplicate detection",
+    )
+    require_tokens(
+        pid_insert_body,
+        [
+            "bool const SAME_TASK = entry.task == t",
+            "return SAME_TASK",
+        ],
+        "PID table duplicate insert must be idempotent only for the same task",
+    )
+    duplicate_pid_branch = pid_insert_body[pid_insert_body.find("if (entry.pid == t->pid)") :]
+    if "entry.task = t;" in duplicate_pid_branch:
+        fail("PID table insert must not replace an existing task for a duplicate PID")
+
+    require_tokens(
+        active_insert_body,
+        [
+            "if (existing == t)",
+            "return true",
+            "if (existing != nullptr && existing->pid == t->pid)",
+            "return false",
+        ],
+        "active task list must reject a different task with a duplicate PID",
+    )
+    if "active_task_slot(i) = t;" in active_insert_body:
+        fail("active task list must not replace an existing task with the same PID")
 
 
 def test_default_user_stack_reservation_covers_native_toolchain_links() -> None:
@@ -1578,6 +1631,7 @@ def main() -> None:
     test_higher_priority_wakeup_bypasses_only_priority_holdoff_guards()
     test_runtime_accounting_deltas_are_saturating()
     test_user_thread_tcbs_publish_nonzero_tid_before_user_execution()
+    test_pid_allocation_and_publication_reject_duplicates()
     test_default_user_stack_reservation_covers_native_toolchain_links()
     test_execve_publishes_new_context_before_old_image_teardown()
     test_pagemap_sibling_check_includes_dead_publishers()
