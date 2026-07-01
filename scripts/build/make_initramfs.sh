@@ -139,6 +139,11 @@ stage_init_dynamic_runtime() {
 }
 
 sync_rootfs_etc_tables() {
+    if [ "${WOS_SYNC_ROOTFS_ETC_TABLES:-0}" != "1" ]; then
+        echo "  rootfs: skipped /etc/fstab and /etc/vfstab qcow sync (set WOS_SYNC_ROOTFS_ETC_TABLES=1 to force)"
+        return 0
+    fi
+
     if [ ! -f "$ROOTFS_DISK" ]; then
         echo "  rootfs: $ROOTFS_DISK not found, skipping /etc/fstab and /etc/vfstab sync"
         return 0

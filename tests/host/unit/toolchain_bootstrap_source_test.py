@@ -275,7 +275,7 @@ def test_native_wos_build_defaults_keep_target_ports_enabled() -> None:
             "set(WOS_BUILD_DISK_IMAGES_DEFAULT ON)",
             "if(WOS_NATIVE_SYSTEM_BUILD)\n    set(WOS_BUILD_DISK_IMAGES_DEFAULT OFF)\nendif()",
             'option(WOS_BUILD_WOSDBG "Build the Qt6-based wosdbg host tool" ${WOS_BUILD_WOSDBG_DEFAULT})',
-            'option(WOS_BUILD_DISK_IMAGES "Build boot/rootfs qcow2 images with qemu-img and libguestfs" ${WOS_BUILD_DISK_IMAGES_DEFAULT})',
+            'option(WOS_BUILD_DISK_IMAGES "Build boot/rootfs qcow2 images with qemu-img, mtools, and libguestfs" ${WOS_BUILD_DISK_IMAGES_DEFAULT})',
             'option(WOS_BUILD_HOST_TOOLS "Configure and build host-side WOS tools" ${WOS_BUILD_HOST_TOOLS_DEFAULT})',
             "if(WOS_BUILD_HOST_TOOLS)\n    ExternalProject_Add(wos_tools_build",
             'add_custom_target(wos_tools_build_always\n        COMMENT "Host-side WOS tools disabled."\n    )',

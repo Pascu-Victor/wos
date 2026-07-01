@@ -40,10 +40,10 @@ if(WOS_NATIVE_SYSTEM_BUILD)
     set(WOS_BUILD_WOSDBG_DEFAULT OFF)
 endif()
 option(WOS_BUILD_WOSDBG "Build the Qt6-based wosdbg host tool" ${WOS_BUILD_WOSDBG_DEFAULT})
-option(WOS_BUILD_DISK_IMAGES "Build boot/rootfs qcow2 images with qemu-img and libguestfs" ${WOS_BUILD_DISK_IMAGES_DEFAULT})
+option(WOS_BUILD_DISK_IMAGES "Build boot/rootfs qcow2 images with qemu-img, mtools, and libguestfs" ${WOS_BUILD_DISK_IMAGES_DEFAULT})
 
 if(WOS_NATIVE_SYSTEM_BUILD AND NOT WOS_BUILD_DISK_IMAGES)
-    message(STATUS "Native WOS build: disk image packaging is disabled; pass -DWOS_BUILD_DISK_IMAGES=ON when qemu-img and guestfish are available.")
+    message(STATUS "Native WOS build: disk image packaging is disabled; pass -DWOS_BUILD_DISK_IMAGES=ON when qemu-img, mtools, and guestfish are available.")
 endif()
 
 set(WOS_BUILD_HOST_TOOLS_DEFAULT ON)
@@ -902,6 +902,7 @@ add_custom_command(
     DEPENDS
         ${WOS_BUILD_SCRIPTS_DIR}/make_image.sh
         ${WOS_BUILD_SCRIPTS_DIR}/make_initramfs.sh
+        ${WOS_BUILD_SCRIPTS_DIR}/extract_partuuid.py
         ${WOS_BUILD_SCRIPTS_DIR}/qcow_common.sh
         ${CMAKE_SOURCE_DIR}/configs/disks.conf
         ${CMAKE_SOURCE_DIR}/configs/netdevs.conf

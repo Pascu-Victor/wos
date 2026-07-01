@@ -11,18 +11,27 @@ BUILD_DIR="${WOS_BUILD_DIR:-build}"
 BOOT_DISK="${WOS_BOOT_DISK:-disk.qcow2}"
 KERNEL_BINARY="$BUILD_DIR/modules/kern/wos"
 INITRAMFS_OUT="$BUILD_DIR/initramfs.cpio"
+BOOT_PART_START_SECTOR=2048
+BOOT_PART_END_SECTOR=1845247
+BOOT_PART_GUID="${WOS_BOOT_PARTUUID:-11044da0-352d-480a-9ef3-f995f3ac3f8b}"
+SECTOR_SIZE=512
 
 # shellcheck source=scripts/build/qcow_common.sh
 source "$CWD/scripts/build/qcow_common.sh"
 
 TMP_LIMINE_CONF=""
+BOOT_RAW=""
+BOOT_FAT=""
+BOOT_TMP=""
 
 cleanup() {
     test -z "$TMP_LIMINE_CONF" || rm -f "$TMP_LIMINE_CONF"
+    test -z "$BOOT_RAW" || rm -f "$BOOT_RAW"
+    test -z "$BOOT_FAT" || rm -f "$BOOT_FAT"
+    test -z "$BOOT_TMP" || rm -f "$BOOT_TMP"
     wos_qcow_cleanup_libguestfs_env
 }
 
-wos_qcow_prepare_libguestfs_env
 trap cleanup EXIT
 
 if [[ "$KERNEL_BINARY" = /* ]]; then
@@ -35,26 +44,6 @@ if [[ "$INITRAMFS_OUT" = /* ]]; then
 else
     INITRAMFS_COPY="$CWD/$INITRAMFS_OUT"
 fi
-
-if [ -e "$BOOT_DISK" ]; then
-    wos_qcow_guard_replace "$BOOT_DISK" "replace boot qcow image"
-    rm "$BOOT_DISK"
-fi
-
-# Phase 1: Create boot disk with GPT + FAT32 partition.
-# This assigns the final PARTUUID for the boot partition.
-mkdir -p "$(dirname "$BOOT_DISK")"
-qemu-img create -f qcow2 "$BOOT_DISK" 1G
-wos_qcow_guestfish "create partitioned boot qcow image" "$BOOT_DISK" --rw -a "$BOOT_DISK" <<_EOF_
-run
-part-init /dev/sda gpt
-part-add /dev/sda p 2048 1845247
-mkfs fat /dev/sda1
-_EOF_
-
-# Phase 2: Build the CPIO initramfs now that all disk images exist
-# with their final PARTUUIDs (disk.qcow2 + mountfs.qcow2).
-bash "$CWD/scripts/build/make_initramfs.sh"
 
 LIMINE_CONF="$CWD/modules/kern/limine.conf"
 if [ "${WOS_KERNEL_CMDLINE+x}" ]; then
@@ -72,8 +61,29 @@ _EOF_
     LIMINE_CONF="$TMP_LIMINE_CONF"
 fi
 
-# Phase 3: Populate the boot partition with kernel, bootloader, and initramfs.
-wos_qcow_guestfish "populate boot qcow image" "$BOOT_DISK" --rw -a "$BOOT_DISK" <<_EOF_
+create_boot_disk_guestfish() {
+    local populate="${1:-1}"
+
+    if [ -e "$BOOT_DISK" ]; then
+        wos_qcow_guard_replace "$BOOT_DISK" "replace boot qcow image"
+        rm "$BOOT_DISK"
+    fi
+
+    mkdir -p "$(dirname "$BOOT_DISK")"
+    qemu-img create -f qcow2 "$BOOT_DISK" 1G
+    wos_qcow_guestfish "create partitioned boot qcow image" "$BOOT_DISK" --rw -a "$BOOT_DISK" <<_EOF_
+run
+part-init /dev/sda gpt
+part-add /dev/sda p $BOOT_PART_START_SECTOR $BOOT_PART_END_SECTOR
+part-set-gpt-guid /dev/sda 1 $BOOT_PART_GUID
+mkfs fat /dev/sda1
+_EOF_
+
+    if [ "$populate" -ne 1 ]; then
+        return 0
+    fi
+
+    wos_qcow_guestfish "populate boot qcow image" "$BOOT_DISK" --rw -a "$BOOT_DISK" <<_EOF_
 run
 mount /dev/sda1 /
 mkdir /EFI
@@ -85,3 +95,80 @@ upload /usr/share/limine/BOOTX64.EFI /EFI/BOOT/BOOTX64.EFI
 upload $INITRAMFS_COPY /initramfs.cpio
 umount /
 _EOF_
+}
+
+create_boot_disk_fast() {
+    local populate="${1:-1}"
+    local part_size_sectors
+    local part_size_bytes
+    local boot_dir
+    local bootloader
+
+    for tool in sgdisk mformat mmd mcopy qemu-img dd truncate; do
+        command -v "$tool" >/dev/null 2>&1 || return 1
+    done
+
+    bootloader="/usr/share/limine/BOOTX64.EFI"
+    if [ "$populate" -eq 1 ]; then
+        [ -f "$bootloader" ] || return 1
+        [ -f "$KERNEL_COPY" ] || return 1
+        [ -f "$LIMINE_CONF" ] || return 1
+        [ -f "$INITRAMFS_COPY" ] || return 1
+    fi
+
+    boot_dir="$(dirname "$BOOT_DISK")"
+    mkdir -p "$boot_dir"
+    if [ -e "$BOOT_DISK" ]; then
+        wos_qcow_guard_replace "$BOOT_DISK" "replace boot qcow image"
+    fi
+
+    BOOT_RAW="$(mktemp "${TMPDIR:-/tmp}/wos-boot-raw.XXXXXX")"
+    BOOT_FAT="$(mktemp "${TMPDIR:-/tmp}/wos-boot-fat.XXXXXX")"
+    BOOT_TMP="$(mktemp "$boot_dir/$(basename "$BOOT_DISK").tmp.XXXXXX")"
+    rm -f "$BOOT_RAW" "$BOOT_FAT" "$BOOT_TMP"
+
+    part_size_sectors=$((BOOT_PART_END_SECTOR - BOOT_PART_START_SECTOR + 1))
+    part_size_bytes=$((part_size_sectors * SECTOR_SIZE))
+
+    truncate -s 1G "$BOOT_RAW"
+    sgdisk --clear --new=1:$BOOT_PART_START_SECTOR:$BOOT_PART_END_SECTOR --typecode=1:ef00 --change-name=1:WOSBOOT \
+        --partition-guid=1:"$BOOT_PART_GUID" "$BOOT_RAW" >/dev/null
+
+    truncate -s "$part_size_bytes" "$BOOT_FAT"
+    mformat -i "$BOOT_FAT" -F -v WOSBOOT ::
+    if [ "$populate" -eq 1 ]; then
+        mmd -i "$BOOT_FAT" ::/EFI
+        mmd -i "$BOOT_FAT" ::/EFI/BOOT
+        mmd -i "$BOOT_FAT" ::/limine
+        mcopy -o -i "$BOOT_FAT" "$KERNEL_COPY" ::/wos
+        mcopy -o -i "$BOOT_FAT" "$LIMINE_CONF" ::/limine/limine.conf
+        mcopy -o -i "$BOOT_FAT" "$bootloader" ::/EFI/BOOT/BOOTX64.EFI
+        mcopy -o -i "$BOOT_FAT" "$INITRAMFS_COPY" ::/initramfs.cpio
+    fi
+    dd if="$BOOT_FAT" of="$BOOT_RAW" bs="$SECTOR_SIZE" seek="$BOOT_PART_START_SECTOR" conv=notrunc status=none
+
+    qemu-img convert -f raw -O qcow2 "$BOOT_RAW" "$BOOT_TMP"
+    mv -f "$BOOT_TMP" "$BOOT_DISK"
+    rm -f "$BOOT_RAW" "$BOOT_FAT"
+    BOOT_RAW=""
+    BOOT_FAT=""
+    BOOT_TMP=""
+}
+
+# Phase 1: Create a partitioned boot disk first, so initramfs fstab generation
+# can read its final PARTUUID. Prefer the mtools path to avoid libguestfs
+# appliance startup for the small FAT boot disk.
+if [ "${WOS_BOOT_IMAGE_LEGACY_GUESTFS:-0}" = "1" ] || ! create_boot_disk_fast 0; then
+    echo "  boot image: falling back to libguestfs boot disk creation"
+    create_boot_disk_guestfish 0
+fi
+
+# Phase 2: Build the CPIO initramfs now that all disk images exist
+# with their final PARTUUIDs (disk.qcow2 + mountfs.qcow2).
+bash "$CWD/scripts/build/make_initramfs.sh"
+
+# Phase 3: Rebuild the boot disk with the final initramfs contents.
+if [ "${WOS_BOOT_IMAGE_LEGACY_GUESTFS:-0}" = "1" ] || ! create_boot_disk_fast 1; then
+    echo "  boot image: falling back to libguestfs boot disk population"
+    create_boot_disk_guestfish 1
+fi
