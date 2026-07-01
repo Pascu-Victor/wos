@@ -160,6 +160,7 @@ def test_event_wake_rebalances_normal_process_waiters() -> None:
 def test_idle_steal_can_migrate_normal_process_work() -> None:
     source = SCHEDULER_CPP.read_text()
     mask_body = function_body(source, "task_can_run_on_cpu")
+    process_steal_body = function_body(source, "process_task_can_idle_steal")
     probe_body = function_body(source, "idle_rebalance_probe_needed_for_idle")
     steal_body = function_body(source, "try_steal_from_peers")
 
@@ -183,10 +184,23 @@ def test_idle_steal_can_migrate_normal_process_work() -> None:
             "task_can_run_on_cpu(t, stealing_cpu, N)",
             "t->cpu_pinned || t->domain_hard",
             "!t->has_run",
-            "t->type == task::TaskType::PROCESS && (t->thread == nullptr || t->pagemap == nullptr)",
+            "process_task_can_idle_steal(t)",
             'publish_runnable_task_locked(our_rq, stolen, "work-steal")',
         ],
         "idle steal process eligibility",
+    )
+    require_tokens(
+        process_steal_body,
+        [
+            "task->type != task::TaskType::PROCESS",
+            "task->thread == nullptr || task->pagemap == nullptr || task->wki_proxy_task_id != 0",
+            "task->preempt_disable_depth != 0 || task->deferred_task_switch || task->wants_block",
+            "task->is_voluntary_blocked()",
+            "task->context.frame.cs == desc::gdt::GDT_KERN_CS",
+            "is_valid_kernel_stack(task->context.frame.rsp)",
+            "return user_context_is_canonical(task);",
+        ],
+        "idle steal must only migrate safe process resume contexts",
     )
     require_tokens(
         probe_body,

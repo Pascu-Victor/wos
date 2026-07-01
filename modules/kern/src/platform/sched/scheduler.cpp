@@ -1998,6 +1998,33 @@ inline auto task_can_run_on_cpu(task::Task const* task, uint64_t cpu_no, uint64_
     return cpu_mask_contains(allowed_mask, cpu_no);
 }
 
+inline auto user_context_is_canonical(task::Task const* task) -> bool {
+    if (task == nullptr) {
+        return false;
+    }
+
+    return task->context.frame.cs == desc::gdt::GDT_USER_CS && task->context.frame.ss == desc::gdt::GDT_USER_DS &&
+           task->context.frame.rip < 0x0000800000000000ULL && task->context.frame.rsp < 0x0000800000000000ULL;
+}
+
+inline auto process_task_can_idle_steal(task::Task const* task) -> bool {
+    if (task == nullptr || task->type != task::TaskType::PROCESS) {
+        return true;
+    }
+    if (task->thread == nullptr || task->pagemap == nullptr || task->wki_proxy_task_id != 0) {
+        return false;
+    }
+    if (task->preempt_disable_depth != 0 || task->deferred_task_switch || task->wants_block) {
+        return false;
+    }
+    if (task->is_voluntary_blocked()) {
+        return task->context.frame.cs == desc::gdt::GDT_KERN_CS && task->context.frame.ss == desc::gdt::GDT_KERN_DS &&
+               is_valid_kernel_stack(task->context.frame.rsp);
+    }
+
+    return user_context_is_canonical(task);
+}
+
 inline auto idle_rebalance_probe_needed_for_idle(uint64_t idle_cpu) -> bool {
     if (run_queues == nullptr) {
         return false;
@@ -2177,7 +2204,7 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
                 if (!t->has_run) {
                     continue;
                 }
-                if (t->type == task::TaskType::PROCESS && (t->thread == nullptr || t->pagemap == nullptr)) {
+                if (!process_task_can_idle_steal(t)) {
                     continue;
                 }
                 if (t->vdeadline > best_vd) {
