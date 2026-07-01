@@ -9,6 +9,7 @@
 #                       or WOS_HOST_TOOLCHAIN_ROOT when overridden
 #   toolchain/sysroot/ - WOS target libraries and headers only
 set -euo pipefail
+set -E
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -38,6 +39,97 @@ COMPILER_RT_NINJA_JOBS="$WOS_NINJA_JOBS"
 if [ "$HOST_SYSTEM" = "WOS" ]; then
     COMPILER_RT_CMAKE_SYSROOT_ARGS=("-DCMAKE_SYSROOT_COMPILE=$SYSROOT")
 fi
+
+BOOTSTRAP_DETAIL_TSV="${WOS_BOOTSTRAP_DETAIL_TSV:-}"
+BOOTSTRAP_PHASE=""
+BOOTSTRAP_PHASE_LABEL=""
+BOOTSTRAP_PHASE_START_MS=""
+
+bootstrap_now_ms() {
+    python3 - <<'PY'
+import time
+
+print(time.monotonic_ns() // 1_000_000)
+PY
+}
+
+bootstrap_timestamp_utc() {
+    python3 - <<'PY'
+from datetime import datetime, timezone
+
+print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))
+PY
+}
+
+bootstrap_detail_header() {
+    [ -n "$BOOTSTRAP_DETAIL_TSV" ] || return 0
+
+    case "$BOOTSTRAP_DETAIL_TSV" in
+        */*) mkdir -p "${BOOTSTRAP_DETAIL_TSV%/*}" ;;
+    esac
+    if [ ! -s "$BOOTSTRAP_DETAIL_TSV" ]; then
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "timestamp_utc" "phase" "label" "elapsed_ms" "status" \
+            "build_jobs" "ninja_jobs" "host_system" >> "$BOOTSTRAP_DETAIL_TSV"
+    fi
+}
+
+bootstrap_record_detail() {
+    local phase="$1"
+    local label="$2"
+    local elapsed_ms="$3"
+    local status="$4"
+
+    [ -n "$BOOTSTRAP_DETAIL_TSV" ] || return 0
+    bootstrap_detail_header
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(bootstrap_timestamp_utc)" "$phase" "$label" "$elapsed_ms" "$status" \
+        "$WOS_BUILD_JOBS" "$WOS_NINJA_JOBS" "$HOST_SYSTEM" >> "$BOOTSTRAP_DETAIL_TSV"
+}
+
+bootstrap_phase_start() {
+    BOOTSTRAP_PHASE="$1"
+    BOOTSTRAP_PHASE_LABEL="$2"
+    if [ -n "$BOOTSTRAP_DETAIL_TSV" ]; then
+        BOOTSTRAP_PHASE_START_MS="$(bootstrap_now_ms)"
+    else
+        BOOTSTRAP_PHASE_START_MS=""
+    fi
+    echo "=== Phase $BOOTSTRAP_PHASE: $BOOTSTRAP_PHASE_LABEL ==="
+}
+
+bootstrap_phase_end() {
+    local phase="$BOOTSTRAP_PHASE"
+    local label="$BOOTSTRAP_PHASE_LABEL"
+    local start_ms="$BOOTSTRAP_PHASE_START_MS"
+
+    if [ -n "$start_ms" ]; then
+        local end_ms
+        end_ms="$(bootstrap_now_ms)"
+        bootstrap_record_detail "$phase" "$label" "$((end_ms - start_ms))" "ok"
+    fi
+
+    echo "=== Phase $phase complete: $label ==="
+    BOOTSTRAP_PHASE=""
+    BOOTSTRAP_PHASE_LABEL=""
+    BOOTSTRAP_PHASE_START_MS=""
+}
+
+bootstrap_phase_fail() {
+    local status="$?"
+    local phase="$BOOTSTRAP_PHASE"
+    local label="$BOOTSTRAP_PHASE_LABEL"
+    local start_ms="$BOOTSTRAP_PHASE_START_MS"
+
+    if [ -n "$phase" ] && [ -n "$start_ms" ]; then
+        local end_ms
+        end_ms="$(bootstrap_now_ms)"
+        bootstrap_record_detail "$phase" "$label" "$((end_ms - start_ms))" "fail:$status"
+    fi
+    exit "$status"
+}
+
+trap bootstrap_phase_fail ERR
 
 meson_setup_rerunnable() {
     local build_dir="$1"
@@ -165,6 +257,7 @@ if [ "${WOS_BUILD_CMAKE_FOR_HOST:-1}" != "0" ]; then
     "$WORKSPACE_ROOT/scripts/build/build_cmake_for_host.sh"
 fi
 
+bootstrap_phase_start 1 "target sysroot skeleton and mlibc headers"
 # 1. Create target directories and empty CRT files
 mkdir -p $SYSROOT/bin $SYSROOT/lib $SYSROOT/include/abi-bits
 [ ! -e $SYSROOT/usr ] && ln -sf . $SYSROOT/usr
@@ -214,16 +307,20 @@ $CC -O3 -c empty.c       -o $SYSROOT/lib/Scrt1.o
 $CC -O3 -c empty.c       -o $SYSROOT/lib/crt1.o
 $CC -O3 -c empty.c       -o $SYSROOT/lib/crti.o
 $CC -O3 -c empty.c       -o $SYSROOT/lib/crtn.o
+bootstrap_phase_end
 
 # 2. Build the compiler-rt pieces needed to finish the libc bootstrap.
 # Sanitizers are built after mlibc installs real libc/libpthread/libm/etc.
+bootstrap_phase_start 2 "compiler-rt builtins and profile bootstrap"
 export CFLAGS="--sysroot=$SYSROOT -std=c23 -fno-sanitize=safe-stack "
 export CXXFLAGS="--sysroot=$SYSROOT -std=c++23 -fno-sanitize=safe-stack "
 unset LDFLAGS
 build_compiler_rt OFF
+bootstrap_phase_end
 
 # 3. Bootstrap libcxx (headers only, needed by mlibc)
 
+bootstrap_phase_start 3 "libcxx and libcxxabi headers"
 mkdir -p $B/libcxx-bootstrap
 cd $B/libcxx-bootstrap
 cmake -G Ninja \
@@ -270,9 +367,11 @@ cmake -G Ninja \
  $B/src/llvm-project/runtimes
 
 ninja -j"$WOS_NINJA_JOBS" install-cxx-headers install-cxxabi-headers
+bootstrap_phase_end
 
 # 4. Build mlibc
 
+bootstrap_phase_start 4 "mlibc"
 # Prepare cross-file (always regenerate to ensure correct paths)
 mkdir -p $B/../tools
 cat > $B/../tools/x86_64-pc-wos-mlibc.txt << EOF
@@ -314,13 +413,17 @@ meson_setup_rerunnable "$B/mlibc-build" --prefix=$SYSROOT \
   $B/src/mlibc
 cd $B/mlibc-build
 ninja -j"$WOS_NINJA_JOBS" && ninja -j"$WOS_NINJA_JOBS" install
+bootstrap_phase_end
 
 # 5. Finish compiler-rt now that mlibc installed the libraries ASAN links to.
+bootstrap_phase_start 5 "compiler-rt sanitizers"
 unset LDFLAGS
 build_compiler_rt ON
+bootstrap_phase_end
 
 # 6. Build libcxx, libcxxabi, and libunwind (now that mlibc is available)
 
+bootstrap_phase_start 6 "libcxx libcxxabi and libunwind"
 mkdir -p $B/libcxx-build
 cd $B/libcxx-build
 cmake -G Ninja \
@@ -382,9 +485,10 @@ cat > $HOST/bin/x86_64-pc-wos.cfg << 'CFGEOF'
 -pie
 -Wl,--dynamic-linker=/lib/ld.so
 CFGEOF
+bootstrap_phase_end
 
 # 7. Build busybox for WOS userspace
-echo "=== Phase 7: BusyBox for WOS userspace ==="
+bootstrap_phase_start 7 "BusyBox for WOS userspace"
 cd $B/src
 [ ! -d busybox ] && git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/busybox.git
 
@@ -393,10 +497,10 @@ WOS_HOST_TOOLCHAIN_ROOT="$HOST" \
     WOS_BUSYBOX_BUILD_DIR="$B/busybox-build" \
     WOS_BUSYBOX_INSTALL_DIR="$B/busybox-install" \
     "$B/../scripts/build/build_busybox.sh"
-echo "=== Phase 7 complete: BusyBox ==="
+bootstrap_phase_end
 
 # 8. Build Dropbear SSH for WOS userspace
-echo "=== Phase 8: Dropbear SSH for WOS userspace ==="
+bootstrap_phase_start 8 "Dropbear SSH for WOS userspace"
 cd $B/src
 [ ! -d dropbear ] && git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/dropbear.git
 
@@ -404,25 +508,25 @@ WOS_HOST_TOOLCHAIN_ROOT="$HOST" \
     WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_DROPBEAR_BUILD_DIR="$B/dropbear-build" \
     "$B/../scripts/build/build_dropbear.sh"
-echo "=== Phase 8 complete: Dropbear ==="
+bootstrap_phase_end
 
 # 9. Build GNU make for WOS userspace
-echo "=== Phase 9: GNU make for WOS userspace ==="
+bootstrap_phase_start 9 "GNU make for WOS userspace"
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_MAKE_BUILD_DIR="$B/make-build" \
     "$B/../scripts/build/build_make.sh"
-echo "=== Phase 9 complete: GNU make ==="
+bootstrap_phase_end
 
 # 10. Build Bash for WOS userspace
-echo "=== Phase 10: Bash for WOS userspace ==="
+bootstrap_phase_start 10 "Bash for WOS userspace"
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_BASH_SOURCE_DIR="$B/src/bash" \
     WOS_BASH_BUILD_DIR="$B/bash-build" \
     "$B/../scripts/build/build_bash_for_wos.sh"
-echo "=== Phase 10 complete: Bash ==="
+bootstrap_phase_end
 
 # 11. Build Ninja for WOS userspace
-echo "=== Phase 11: Ninja for WOS userspace ==="
+bootstrap_phase_start 11 "Ninja for WOS userspace"
 cd "$B/src"
 if [ ! -f ninja/CMakeLists.txt ]; then
     if [ -d "$WORKSPACE_ROOT/.git" ]; then
@@ -436,10 +540,10 @@ fi
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_NINJA_BUILD_DIR="$B/ninja-build" \
     "$B/../scripts/build/build_ninja_for_wos.sh"
-echo "=== Phase 11 complete: Ninja ==="
+bootstrap_phase_end
 
 # 12. Build CMake for WOS userspace
-echo "=== Phase 12: CMake for WOS userspace ==="
+bootstrap_phase_start 12 "CMake for WOS userspace"
 cd "$B/src"
 if [ ! -f cmake/CMakeLists.txt ]; then
     if [ -d "$WORKSPACE_ROOT/.git" ]; then
@@ -453,10 +557,10 @@ fi
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_CMAKE_FOR_WOS_BUILD_DIR="$B/cmake-wos-build" \
     "$B/../scripts/build/build_cmake_for_wos.sh"
-echo "=== Phase 12 complete: CMake ==="
+bootstrap_phase_end
 
 # 13. Build CPython for WOS userspace
-echo "=== Phase 13: CPython for WOS userspace ==="
+bootstrap_phase_start 13 "CPython for WOS userspace"
 cd "$B/src"
 PYTHON_GIT_BRANCH="${WOS_PYTHON_GIT_BRANCH:-wos-support}"
 if [ ! -f python/configure ]; then
@@ -472,18 +576,18 @@ WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_PYTHON_SOURCE_DIR="$B/src/python" \
     WOS_PYTHON_BUILD_DIR="$B/python-build" \
     "$B/../scripts/build/build_python_for_wos.sh"
-echo "=== Phase 13 complete: CPython ==="
+bootstrap_phase_end
 
 # 14. Stage Meson for WOS userspace
-echo "=== Phase 14: Meson for WOS userspace ==="
+bootstrap_phase_start 14 "Meson for WOS userspace"
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_MESON_SOURCE_DIR="$B/src/meson" \
     WOS_MESON_BUILD_DIR="$B/meson-build" \
     "$B/../scripts/build/build_meson_for_wos.sh"
-echo "=== Phase 14 complete: Meson ==="
+bootstrap_phase_end
 
 # 15. Build NASM for WOS userspace
-echo "=== Phase 15: NASM for WOS userspace ==="
+bootstrap_phase_start 15 "NASM for WOS userspace"
 cd "$B/src"
 NASM_GIT_BRANCH="${WOS_NASM_GIT_BRANCH:-wos-support}"
 if [ ! -f nasm/configure.ac ]; then
@@ -499,10 +603,10 @@ WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_NASM_SOURCE_DIR="$B/src/nasm" \
     WOS_NASM_BUILD_DIR="$B/nasm-build" \
     "$B/../scripts/build/build_nasm_for_wos.sh"
-echo "=== Phase 15 complete: NASM ==="
+bootstrap_phase_end
 
 # 16. Build zlib, OpenSSL, and curl for WOS userspace
-echo "=== Phase 16: zlib, OpenSSL, and curl for WOS userspace ==="
+bootstrap_phase_start 16 "zlib LibreSSL and curl for WOS userspace"
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_ZLIB_SOURCE_DIR="$B/src/zlib" \
     WOS_ZLIB_BUILD_DIR="$B/zlib-build" \
@@ -517,20 +621,20 @@ WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_CURL_SOURCE_DIR="$B/src/curl" \
     WOS_CURL_BUILD_DIR="$B/curl-build" \
     "$B/../scripts/build/build_curl_for_wos.sh"
-echo "=== Phase 16 complete: zlib, OpenSSL, and curl ==="
+bootstrap_phase_end
 
 # 17. Build Git for WOS userspace
-echo "=== Phase 17: Git for WOS userspace ==="
+bootstrap_phase_start 17 "Git for WOS userspace"
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_GIT_SOURCE_DIR="$B/src/git" \
     WOS_GIT_BUILD_DIR="$B/git-build" \
     "$B/../scripts/build/build_git_for_wos.sh"
-echo "=== Phase 17 complete: Git ==="
+bootstrap_phase_end
 
 # 18. Build clang/lld for WOS userspace
-echo "=== Phase 18: clang/lld for WOS userspace ==="
+bootstrap_phase_start 18 "clang/lld for WOS userspace"
 WOS_HOST_TOOLCHAIN_ROOT="$HOST" \
     WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_CLANG_FOR_WOS_BUILD_DIR="$B/clang-wos-build" \
     "$B/../scripts/build/build_clang_for_wos.sh"
-echo "=== Phase 18 complete: clang/lld ==="
+bootstrap_phase_end

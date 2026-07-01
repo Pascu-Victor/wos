@@ -138,6 +138,7 @@ heartbeat_stall_snapshots="${WOS_SELFHOST_HEARTBEAT_STALL_SNAPSHOTS:-6}"
 checkout="$workdir/wos"
 report="$workdir/selfhost-report.tsv"
 detail_report="$workdir/selfhost-detail.tsv"
+bootstrap_detail_report="$workdir/bootstrap-detail.tsv"
 history_file="${WOS_SELFHOST_HISTORY_FILE:-}"
 log_dir="${WOS_SELFHOST_LOG_DIR:-}"
 total_elapsed=0
@@ -883,24 +884,29 @@ submodule_paths() {
         awk '{ print $2 }'
 }
 
-clone_one_submodule() {
-    local path="$1"
+clone_submodules() {
+    local path
+    local paths_file="$workdir/submodule-paths.txt"
+    local have_paths=0
     local submodule_cmd=(git -C "$checkout" submodule update --init --recursive)
     if [ "$full_history" != "1" ]; then
         submodule_cmd+=(--depth 1)
     fi
-    submodule_cmd+=(--jobs "$jobs" -- "$path")
-    run_timed_event "clone_submodule" "$path" run_git_http "${submodule_cmd[@]}"
-}
+    submodule_cmd+=(--jobs "$jobs" --)
 
-clone_submodules() {
-    local path
-    local paths_file="$workdir/submodule-paths.txt"
     submodule_paths > "$paths_file"
     while IFS= read -r path; do
         [ -n "$path" ] || continue
-        clone_one_submodule "$path"
+        submodule_cmd+=("$path")
+        have_paths=1
     done < "$paths_file"
+
+    if [ "$have_paths" != "1" ]; then
+        log "no submodules to clone"
+        return 0
+    fi
+
+    run_timed_event "clone" "submodules" run_git_http "${submodule_cmd[@]}"
 }
 
 resume_existing_checkout() {
@@ -959,7 +965,9 @@ bootstrap_toolchain() {
 
     (
         cd "$checkout"
-        WOS_SOURCE_DISTDIR="$distdir" run_with_jobs_env ./tools/bootstrap.sh
+        WOS_BOOTSTRAP_DETAIL_TSV="$bootstrap_detail_report" \
+            WOS_SOURCE_DISTDIR="$distdir" \
+            run_with_jobs_env ./tools/bootstrap.sh
     )
 }
 
@@ -1089,6 +1097,7 @@ log "mode=$mode"
 log "repo=$repo"
 log "workdir=$workdir"
 log "detail_report=$detail_report"
+log "bootstrap_detail_report=$bootstrap_detail_report"
 log "history_file=$history_file"
 log "log_dir=$log_dir"
 log "target=$target"

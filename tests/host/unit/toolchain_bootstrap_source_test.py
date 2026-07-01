@@ -195,6 +195,36 @@ def test_native_wos_compiler_rt_does_not_link_with_workspace_sysroot() -> None:
     )
 
 
+def test_wos_toolchain_records_bootstrap_phase_timings() -> None:
+    source = WOS_TOOLCHAIN.read_text()
+    require_tokens(
+        source,
+        [
+            'BOOTSTRAP_DETAIL_TSV="${WOS_BOOTSTRAP_DETAIL_TSV:-}"',
+            "bootstrap_now_ms()",
+            "bootstrap_timestamp_utc()",
+            "bootstrap_detail_header()",
+            '"timestamp_utc" "phase" "label" "elapsed_ms" "status"',
+            "bootstrap_record_detail()",
+            "bootstrap_phase_start()",
+            "bootstrap_phase_end()",
+            "bootstrap_phase_fail()",
+            'bootstrap_record_detail "$phase" "$label" "$((end_ms - start_ms))" "fail:$status"',
+            "trap bootstrap_phase_fail ERR",
+        ],
+        "WOS bootstrap phase timing support",
+    )
+
+    phases = re.findall(r"^\s*bootstrap_phase_start\s+([0-9]+)\s+", source, flags=re.MULTILINE)
+    expected = [str(phase) for phase in range(1, 19)]
+    if phases != expected:
+        fail(f"WOS bootstrap must time phases 1 through 18 in order, got {phases}")
+
+    phase_end_count = len(re.findall(r"^\s*bootstrap_phase_end\s*$", source, flags=re.MULTILINE))
+    if phase_end_count != 18:
+        fail(f"WOS bootstrap must close each timed phase exactly once, got {phase_end_count}")
+
+
 def test_native_wos_build_defaults_keep_target_ports_enabled() -> None:
     source = ROOT_CMAKE.read_text()
     require_tokens(
@@ -265,6 +295,57 @@ def test_preseeded_toolchain_mode_validates_bootstrap_outputs() -> None:
     clang_preseed = source[clang_preseed_start:clang_preseed_end]
     if "build_clang_for_wos.sh" in clang_preseed or "COMMAND ${CMAKE_COMMAND} -E touch" in clang_preseed:
         fail("preseeded clang mode must validate existing artifacts instead of rebuilding or blindly touching stamps")
+
+
+def test_preseeded_toolchain_mode_skips_external_source_scans() -> None:
+    source = ROOT_CMAKE.read_text()
+
+    def assert_no_scan_before_preseed(label: str, section_marker: str, preseed_call: str) -> None:
+        section_start = source.find(section_marker)
+        if section_start < 0:
+            fail(f"{label} section is missing")
+        preseed_start = source.find(preseed_call, section_start)
+        if preseed_start < 0:
+            fail(f"{label} preseed validation call is missing")
+        prefix = source[section_start:preseed_start]
+        forbidden = [
+            "wos_collect_external_sources(",
+            "wos_glob_recurse(",
+        ]
+        offenders = [token for token in forbidden if token in prefix]
+        if offenders:
+            fail(f"{label} preseed configure path must not scan external sources before artifact validation: {', '.join(offenders)}")
+
+    preseeded_ports = [
+        ("mlibc", "# --- mlibc:", "wos_add_preseeded_artifact_target(mlibc ${MLIBC_STAMP} mlibc"),
+        ("busybox", "# --- busybox:", "wos_add_preseeded_artifact_target(busybox ${BUSYBOX_STAMP} busybox"),
+        ("dropbear", "# --- dropbear:", "wos_add_preseeded_artifact_target(dropbear ${DROPBEAR_STAMP} dropbear"),
+        ("gnu_make", "# --- gnu_make:", "wos_add_preseeded_artifact_target(gnu_make ${GNU_MAKE_STAMP} gnu_make"),
+        ("bash", "# --- bash_for_wos:", "wos_add_preseeded_artifact_target(bash_for_wos ${BASH_FOR_WOS_STAMP} bash"),
+        ("zlib", "# --- zlib_for_wos:", "wos_add_preseeded_artifact_target(zlib_for_wos ${ZLIB_FOR_WOS_STAMP} zlib"),
+        ("openssl", "# --- openssl_for_wos:", "wos_add_preseeded_artifact_target(openssl_for_wos ${OPENSSL_FOR_WOS_STAMP} openssl"),
+        ("curl", "# --- curl_for_wos:", "wos_add_preseeded_artifact_target(curl_for_wos ${CURL_FOR_WOS_STAMP} curl"),
+        ("git", "# --- git_for_wos:", "wos_add_preseeded_artifact_target(git_for_wos ${GIT_FOR_WOS_STAMP} git"),
+        ("clang", "# --- clang_for_wos:", "wos_add_preseeded_artifact_target(clang_for_wos ${CLANG_FOR_WOS_STAMP} clang_for_wos"),
+        ("ninja", "# --- ninja_for_wos:", "wos_add_preseeded_artifact_target(ninja_for_wos ${NINJA_FOR_WOS_STAMP} ninja"),
+        ("cmake", "# --- cmake_for_wos:", "wos_add_preseeded_artifact_target(cmake_for_wos ${CMAKE_FOR_WOS_STAMP} cmake"),
+        ("python", "# --- python_for_wos:", "wos_add_preseeded_artifact_target(python_for_wos ${PYTHON_FOR_WOS_STAMP} python"),
+        ("meson", "# --- meson_for_wos:", "wos_add_preseeded_artifact_target(meson_for_wos ${MESON_FOR_WOS_STAMP} meson"),
+        ("nasm", "# --- nasm_for_wos:", "wos_add_preseeded_artifact_target(nasm_for_wos ${NASM_FOR_WOS_STAMP} nasm"),
+    ]
+    for label, section_marker, preseed_call in preseeded_ports:
+        assert_no_scan_before_preseed(label, section_marker, preseed_call)
+
+    require_tokens(
+        source,
+        [
+            "set(WOS_SCAN_CMAKE_PORT_SOURCES OFF)",
+            "if(WOS_BUILD_CMAKE_FOR_HOST)\n    set(WOS_SCAN_CMAKE_PORT_SOURCES ON)",
+            "elseif(WOS_BUILD_CMAKE_FOR_WOS AND NOT WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)\n    set(WOS_SCAN_CMAKE_PORT_SOURCES ON)",
+            "if(WOS_SCAN_CMAKE_PORT_SOURCES)\n    wos_collect_external_sources(CMAKE_FOR_WOS_SOURCES",
+        ],
+        "preseeded CMake port source scan guard",
+    )
 
 
 def test_root_toolchain_builds_do_not_use_ninja_console_pool() -> None:
@@ -944,18 +1025,18 @@ def test_wos_toolchain_uses_shared_busybox_and_dropbear_build_scripts() -> None:
     require_tokens(
         source,
         [
-            "=== Phase 7: BusyBox for WOS userspace ===",
-            "=== Phase 8: Dropbear SSH for WOS userspace ===",
-            "=== Phase 9: GNU make for WOS userspace ===",
-            "=== Phase 10: Bash for WOS userspace ===",
-            "=== Phase 11: Ninja for WOS userspace ===",
-            "=== Phase 12: CMake for WOS userspace ===",
-            "=== Phase 13: CPython for WOS userspace ===",
-            "=== Phase 14: Meson for WOS userspace ===",
-            "=== Phase 15: NASM for WOS userspace ===",
-            "=== Phase 16: zlib, OpenSSL, and curl for WOS userspace ===",
-            "=== Phase 17: Git for WOS userspace ===",
-            "=== Phase 18: clang/lld for WOS userspace ===",
+            'bootstrap_phase_start 7 "BusyBox for WOS userspace"',
+            'bootstrap_phase_start 8 "Dropbear SSH for WOS userspace"',
+            'bootstrap_phase_start 9 "GNU make for WOS userspace"',
+            'bootstrap_phase_start 10 "Bash for WOS userspace"',
+            'bootstrap_phase_start 11 "Ninja for WOS userspace"',
+            'bootstrap_phase_start 12 "CMake for WOS userspace"',
+            'bootstrap_phase_start 13 "CPython for WOS userspace"',
+            'bootstrap_phase_start 14 "Meson for WOS userspace"',
+            'bootstrap_phase_start 15 "NASM for WOS userspace"',
+            'bootstrap_phase_start 16 "zlib LibreSSL and curl for WOS userspace"',
+            'bootstrap_phase_start 17 "Git for WOS userspace"',
+            'bootstrap_phase_start 18 "clang/lld for WOS userspace"',
             'WOS_HOST_TOOLCHAIN_ROOT="$HOST" \\',
             'WOS_BUSYBOX_BUILD_DIR="$B/busybox-build" \\',
             'WOS_BUSYBOX_INSTALL_DIR="$B/busybox-install" \\',
@@ -1483,8 +1564,10 @@ if __name__ == "__main__":
     test_compiler_rt_runs_real_cmake_checks_without_forced_response_files()
     test_compiler_rt_sanitizers_are_built_after_mlibc()
     test_native_wos_compiler_rt_does_not_link_with_workspace_sysroot()
+    test_wos_toolchain_records_bootstrap_phase_timings()
     test_native_wos_build_defaults_keep_target_ports_enabled()
     test_preseeded_toolchain_mode_validates_bootstrap_outputs()
+    test_preseeded_toolchain_mode_skips_external_source_scans()
     test_root_toolchain_builds_do_not_use_ninja_console_pool()
     test_wos_build_jobs_helper_has_self_hostable_fallbacks()
     test_top_level_build_paths_propagate_full_parallelism()

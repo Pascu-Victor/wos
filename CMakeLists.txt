@@ -188,16 +188,6 @@ add_custom_command(
 add_custom_target(check_headers DEPENDS ${CHECK_HEADERS_STAMP})
 
 # --- mlibc: build and install the C library ---------------------------------
-# Glob all mlibc sources so the stamp invalidates when any file changes,
-# including source additions discovered by Ninja's CMake regeneration check.
-wos_glob_recurse(MLIBC_SOURCES
-    ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.cpp
-    ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.c
-    ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.hpp
-    ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.h
-    ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.S
-    ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/meson.build
-)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/stamps)
 set(MLIBC_STAMP ${CMAKE_BINARY_DIR}/stamps/mlibc.stamp)
 if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
@@ -207,6 +197,16 @@ if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
         ${WOS_SYSROOT_PATH}/include/stdio.h
     )
 else()
+    # Glob mlibc only when the port is actually rebuilt. Preseeded self-host
+    # configures validate artifacts and should not walk external source trees.
+    wos_glob_recurse(MLIBC_SOURCES
+        ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.cpp
+        ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.c
+        ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.hpp
+        ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.h
+        ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/*.S
+        ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/meson.build
+    )
     add_custom_command(
         OUTPUT ${MLIBC_STAMP}
         COMMAND ${CMAKE_COMMAND} -E env
@@ -255,16 +255,16 @@ if(NOT WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
 endif()
 
 # --- busybox: cross-compile busybox for WOS ---------------------------------
-wos_glob_recurse(BUSYBOX_SOURCES
-    ${CMAKE_SOURCE_DIR}/toolchain/src/busybox/*
-)
-list(FILTER BUSYBOX_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
 set(BUSYBOX_STAMP ${CMAKE_BINARY_DIR}/stamps/busybox.stamp)
 if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
     wos_add_preseeded_artifact_target(busybox ${BUSYBOX_STAMP} busybox
         ${WOS_BUSYBOX_INSTALL_DIR}/bin/busybox
     )
 else()
+    wos_glob_recurse(BUSYBOX_SOURCES
+        ${CMAKE_SOURCE_DIR}/toolchain/src/busybox/*
+    )
+    list(FILTER BUSYBOX_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
     add_custom_command(
         OUTPUT ${BUSYBOX_STAMP}
         COMMAND ${CMAKE_COMMAND} -E env
@@ -281,16 +281,16 @@ else()
 endif()
 
 # --- dropbear: cross-compile dropbear SSH for WOS ---------------------------
-wos_glob_recurse(DROPBEAR_SOURCES
-    ${CMAKE_SOURCE_DIR}/toolchain/src/dropbear/*
-)
-list(FILTER DROPBEAR_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
 set(DROPBEAR_STAMP ${CMAKE_BINARY_DIR}/stamps/dropbear.stamp)
 if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
     wos_add_preseeded_artifact_target(dropbear ${DROPBEAR_STAMP} dropbear
         ${WOS_SYSROOT_PATH}/bin/dropbearmulti
     )
 else()
+    wos_glob_recurse(DROPBEAR_SOURCES
+        ${CMAKE_SOURCE_DIR}/toolchain/src/dropbear/*
+    )
+    list(FILTER DROPBEAR_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
     add_custom_command(
         OUTPUT ${DROPBEAR_STAMP}
         COMMAND ${CMAKE_COMMAND} -E env
@@ -306,16 +306,16 @@ else()
 endif()
 
 # --- gnu_make: cross-compile GNU make for WOS -------------------------------
-wos_glob_recurse(GNU_MAKE_SOURCES
-    ${WOS_MAKE_SOURCE_DIR}/*
-)
-list(FILTER GNU_MAKE_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
 set(GNU_MAKE_STAMP ${CMAKE_BINARY_DIR}/stamps/gnu_make.stamp)
 if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
     wos_add_preseeded_artifact_target(gnu_make ${GNU_MAKE_STAMP} gnu_make
         ${WOS_SYSROOT_PATH}/bin/make
     )
 else()
+    wos_glob_recurse(GNU_MAKE_SOURCES
+        ${WOS_MAKE_SOURCE_DIR}/*
+    )
+    list(FILTER GNU_MAKE_SOURCES EXCLUDE REGEX "${WOS_EXTERNAL_SOURCE_EXCLUDE_REGEX}")
     add_custom_command(
         OUTPUT ${GNU_MAKE_STAMP}
         COMMAND ${CMAKE_COMMAND} -E env
@@ -335,14 +335,14 @@ endif()
 set(BASH_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/bash_for_wos.stamp)
 set(WOS_BASH_FOR_WOS_ROOTFS_INPUTS)
 if(WOS_BUILD_BASH_FOR_WOS)
-    wos_collect_external_sources(BASH_FOR_WOS_SOURCES
-        ${WOS_BASH_SOURCE_DIR}/*
-    )
     if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
         wos_add_preseeded_artifact_target(bash_for_wos ${BASH_FOR_WOS_STAMP} bash
             ${WOS_SYSROOT_PATH}/bin/bash
         )
     else()
+        wos_collect_external_sources(BASH_FOR_WOS_SOURCES
+            ${WOS_BASH_SOURCE_DIR}/*
+        )
         add_custom_command(
             OUTPUT ${BASH_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
@@ -366,15 +366,15 @@ endif()
 # --- zlib_for_wos: static compression library for native Git ----------------
 set(ZLIB_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/zlib_for_wos.stamp)
 if(WOS_BUILD_CURL_FOR_WOS OR WOS_BUILD_GIT_FOR_WOS)
-    wos_collect_external_sources(ZLIB_FOR_WOS_SOURCES
-        ${WOS_ZLIB_SOURCE_DIR}/*
-    )
     if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
         wos_add_preseeded_artifact_target(zlib_for_wos ${ZLIB_FOR_WOS_STAMP} zlib
             ${WOS_SYSROOT_PATH}/lib/libz.a
             ${WOS_SYSROOT_PATH}/include/zlib.h
         )
     else()
+        wos_collect_external_sources(ZLIB_FOR_WOS_SOURCES
+            ${WOS_ZLIB_SOURCE_DIR}/*
+        )
         add_custom_command(
             OUTPUT ${ZLIB_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
@@ -397,9 +397,6 @@ endif()
 # --- openssl_for_wos: static OpenSSL-compatible TLS libraries for curl ------
 set(OPENSSL_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/openssl_for_wos.stamp)
 if(WOS_BUILD_OPENSSL_FOR_WOS OR WOS_BUILD_CURL_FOR_WOS OR WOS_BUILD_GIT_FOR_WOS)
-    wos_collect_external_sources(OPENSSL_FOR_WOS_SOURCES
-        ${WOS_OPENSSL_SOURCE_DIR}/*
-    )
     if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
         wos_add_preseeded_artifact_target(openssl_for_wos ${OPENSSL_FOR_WOS_STAMP} openssl
             ${WOS_SYSROOT_PATH}/lib/libssl.a
@@ -407,6 +404,9 @@ if(WOS_BUILD_OPENSSL_FOR_WOS OR WOS_BUILD_CURL_FOR_WOS OR WOS_BUILD_GIT_FOR_WOS)
             ${WOS_SYSROOT_PATH}/include/openssl/ssl.h
         )
     else()
+        wos_collect_external_sources(OPENSSL_FOR_WOS_SOURCES
+            ${WOS_OPENSSL_SOURCE_DIR}/*
+        )
         add_custom_command(
             OUTPUT ${OPENSSL_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
@@ -430,15 +430,15 @@ endif()
 set(CURL_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/curl_for_wos.stamp)
 set(WOS_CURL_FOR_WOS_ROOTFS_INPUTS)
 if(WOS_BUILD_CURL_FOR_WOS OR WOS_BUILD_GIT_FOR_WOS)
-    wos_collect_external_sources(CURL_FOR_WOS_SOURCES
-        ${WOS_CURL_SOURCE_DIR}/*
-    )
     if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
         wos_add_preseeded_artifact_target(curl_for_wos ${CURL_FOR_WOS_STAMP} curl
             ${WOS_SYSROOT_PATH}/bin/curl
             ${WOS_SYSROOT_PATH}/lib/libcurl.a
         )
     else()
+        wos_collect_external_sources(CURL_FOR_WOS_SOURCES
+            ${WOS_CURL_SOURCE_DIR}/*
+        )
         add_custom_command(
             OUTPUT ${CURL_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
@@ -468,9 +468,6 @@ endif()
 set(GIT_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/git_for_wos.stamp)
 set(WOS_GIT_FOR_WOS_ROOTFS_INPUTS)
 if(WOS_BUILD_GIT_FOR_WOS)
-    wos_collect_external_sources(GIT_FOR_WOS_SOURCES
-        ${WOS_GIT_SOURCE_DIR}/*
-    )
     if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
         wos_add_preseeded_artifact_target(git_for_wos ${GIT_FOR_WOS_STAMP} git
             ${WOS_SYSROOT_PATH}/bin/git
@@ -479,6 +476,9 @@ if(WOS_BUILD_GIT_FOR_WOS)
             ${WOS_SYSROOT_PATH}/libexec/git-core/git-remote-https
         )
     else()
+        wos_collect_external_sources(GIT_FOR_WOS_SOURCES
+            ${WOS_GIT_SOURCE_DIR}/*
+        )
         add_custom_command(
             OUTPUT ${GIT_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
@@ -504,7 +504,13 @@ endif()
 # --- cmake_for_host: build WOS-aware CMake for the Linux host ---------------
 set(CMAKE_FOR_HOST_STAMP ${CMAKE_BINARY_DIR}/stamps/cmake_for_host.stamp)
 set(WOS_CMAKE_FOR_HOST_DEPENDS)
-if(WOS_BUILD_CMAKE_FOR_HOST OR WOS_BUILD_CMAKE_FOR_WOS)
+set(WOS_SCAN_CMAKE_PORT_SOURCES OFF)
+if(WOS_BUILD_CMAKE_FOR_HOST)
+    set(WOS_SCAN_CMAKE_PORT_SOURCES ON)
+elseif(WOS_BUILD_CMAKE_FOR_WOS AND NOT WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
+    set(WOS_SCAN_CMAKE_PORT_SOURCES ON)
+endif()
+if(WOS_SCAN_CMAKE_PORT_SOURCES)
     wos_collect_external_sources(CMAKE_FOR_WOS_SOURCES
         ${CMAKE_SOURCE_DIR}/toolchain/src/cmake/*
     )
@@ -532,11 +538,6 @@ endif()
 set(CLANG_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/clang_for_wos.stamp)
 set(WOS_CLANG_FOR_WOS_ROOTFS_INPUTS)
 if(WOS_BUILD_CLANG_FOR_WOS)
-    wos_collect_external_sources(CLANG_FOR_WOS_SOURCES
-        ${CMAKE_SOURCE_DIR}/toolchain/src/llvm-project/llvm/*
-        ${CMAKE_SOURCE_DIR}/toolchain/src/llvm-project/clang/*
-        ${CMAKE_SOURCE_DIR}/toolchain/src/llvm-project/lld/*
-    )
     if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
         wos_add_preseeded_artifact_target(clang_for_wos ${CLANG_FOR_WOS_STAMP} clang_for_wos
             ${WOS_SYSROOT_PATH}/bin/clang
@@ -566,6 +567,11 @@ if(WOS_BUILD_CLANG_FOR_WOS)
             ${WOS_SYSROOT_PATH}/lib/clang/*/lib/x86_64-pc-wos/libclang_rt.builtins.a
         )
     else()
+        wos_collect_external_sources(CLANG_FOR_WOS_SOURCES
+            ${CMAKE_SOURCE_DIR}/toolchain/src/llvm-project/llvm/*
+            ${CMAKE_SOURCE_DIR}/toolchain/src/llvm-project/clang/*
+            ${CMAKE_SOURCE_DIR}/toolchain/src/llvm-project/lld/*
+        )
         add_custom_command(
             OUTPUT ${CLANG_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
@@ -597,14 +603,14 @@ endif()
 set(NINJA_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/ninja_for_wos.stamp)
 set(WOS_NINJA_FOR_WOS_ROOTFS_INPUTS)
 if(WOS_BUILD_NINJA_FOR_WOS)
-    wos_collect_external_sources(NINJA_FOR_WOS_SOURCES
-        ${CMAKE_SOURCE_DIR}/toolchain/src/ninja/*
-    )
     if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
         wos_add_preseeded_artifact_target(ninja_for_wos ${NINJA_FOR_WOS_STAMP} ninja
             ${WOS_SYSROOT_PATH}/bin/ninja
         )
     else()
+        wos_collect_external_sources(NINJA_FOR_WOS_SOURCES
+            ${CMAKE_SOURCE_DIR}/toolchain/src/ninja/*
+        )
         add_custom_command(
             OUTPUT ${NINJA_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
@@ -671,15 +677,15 @@ endif()
 set(PYTHON_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/python_for_wos.stamp)
 set(WOS_PYTHON_FOR_WOS_ROOTFS_INPUTS)
 if(WOS_BUILD_PYTHON_FOR_WOS)
-    wos_collect_external_sources(PYTHON_FOR_WOS_SOURCES
-        ${WOS_PYTHON_SOURCE_DIR}/*
-    )
     if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
         wos_add_preseeded_artifact_target(python_for_wos ${PYTHON_FOR_WOS_STAMP} python
             ${WOS_SYSROOT_PATH}/bin/python3*
             ${WOS_SYSROOT_PATH}/lib/python*
         )
     else()
+        wos_collect_external_sources(PYTHON_FOR_WOS_SOURCES
+            ${WOS_PYTHON_SOURCE_DIR}/*
+        )
         add_custom_command(
             OUTPUT ${PYTHON_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
@@ -705,23 +711,23 @@ endif()
 set(MESON_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/meson_for_wos.stamp)
 set(WOS_MESON_FOR_WOS_ROOTFS_INPUTS)
 if(WOS_BUILD_MESON_FOR_WOS)
-    wos_collect_external_sources(MESON_FOR_WOS_SOURCES
-        ${WOS_MESON_SOURCE_DIR}/*
-    )
-    set(WOS_MESON_FOR_WOS_DEPENDS
-        ${WOS_BUILD_SCRIPTS_DIR}/build_meson_for_wos.sh
-        ${MESON_FOR_WOS_SOURCES}
-        ${MLIBC_STAMP}
-        ${LIBCXX_STAMP}
-    )
-    if(WOS_BUILD_PYTHON_FOR_WOS)
-        list(APPEND WOS_MESON_FOR_WOS_DEPENDS ${PYTHON_FOR_WOS_STAMP})
-    endif()
     if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
         wos_add_preseeded_artifact_target(meson_for_wos ${MESON_FOR_WOS_STAMP} meson
             ${WOS_SYSROOT_PATH}/bin/meson
         )
     else()
+        wos_collect_external_sources(MESON_FOR_WOS_SOURCES
+            ${WOS_MESON_SOURCE_DIR}/*
+        )
+        set(WOS_MESON_FOR_WOS_DEPENDS
+            ${WOS_BUILD_SCRIPTS_DIR}/build_meson_for_wos.sh
+            ${MESON_FOR_WOS_SOURCES}
+            ${MLIBC_STAMP}
+            ${LIBCXX_STAMP}
+        )
+        if(WOS_BUILD_PYTHON_FOR_WOS)
+            list(APPEND WOS_MESON_FOR_WOS_DEPENDS ${PYTHON_FOR_WOS_STAMP})
+        endif()
         add_custom_command(
             OUTPUT ${MESON_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
@@ -746,16 +752,16 @@ endif()
 set(NASM_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/nasm_for_wos.stamp)
 set(WOS_NASM_FOR_WOS_ROOTFS_INPUTS)
 if(WOS_BUILD_NASM_FOR_WOS)
-    wos_collect_external_sources(NASM_FOR_WOS_SOURCES
-        ${WOS_NASM_SOURCE_DIR}/*
-    )
-    list(FILTER NASM_FOR_WOS_SOURCES EXCLUDE REGEX "/(configure|config/config\\.h\\.in|autoconf/aclocal\\.m4|autoconf/clean\\.sh|autom4te\\.cache)(/|$)")
     if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
         wos_add_preseeded_artifact_target(nasm_for_wos ${NASM_FOR_WOS_STAMP} nasm
             ${WOS_SYSROOT_PATH}/bin/nasm
             ${WOS_SYSROOT_PATH}/bin/ndisasm
         )
     else()
+        wos_collect_external_sources(NASM_FOR_WOS_SOURCES
+            ${WOS_NASM_SOURCE_DIR}/*
+        )
+        list(FILTER NASM_FOR_WOS_SOURCES EXCLUDE REGEX "/(configure|config/config\\.h\\.in|autoconf/aclocal\\.m4|autoconf/clean\\.sh|autom4te\\.cache)(/|$)")
         add_custom_command(
             OUTPUT ${NASM_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
