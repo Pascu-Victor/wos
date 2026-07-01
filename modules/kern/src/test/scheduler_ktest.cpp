@@ -17,6 +17,7 @@ static constexpr uint32_t WEIGHT_NICE_N5 = 3121;  // nice=-5 (higher prio)
 
 namespace ker::mod::sched {
 auto scheduler_selftest_runtime_delta_saturates() -> bool;
+auto scheduler_selftest_migration_policy_preserves_hot_process_migration() -> bool;
 }  // namespace ker::mod::sched
 
 KTEST(Sched, VruntimeOrdering) {
@@ -61,6 +62,10 @@ KTEST(Sched, SaturatingDeadlineUs) {
 }
 
 KTEST(SchedulerRuntime, RuntimeDeltaSaturates) { KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_runtime_delta_saturates()); }
+
+KTEST(SchedulerMigration, PreservesHotProcessMigrationPolicy) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_migration_policy_preserves_hot_process_migration());
+}
 
 KTEST(ContextSwitch, RepairsStaleProcessSyscallResume) {
     KEXPECT_TRUE(ker::mod::sys::context_switch::context_switch_selftest_repair_stale_process_syscall_resume());

@@ -7085,6 +7085,52 @@ auto scheduler_selftest_runtime_delta_saturates() -> bool {
     return REGULAR_US_TO_NS && HUGE_US_TO_NS_SATURATES && NICE0_VRUNTIME_MATCHES_NS && ZERO_WEIGHT_IS_SAFE && HUGE_VRUNTIME_SATURATES &&
            SLICE_ACCUMULATES && SLICE_SATURATES && WEIGHTED_MUL_SATURATES;
 }
+
+auto scheduler_selftest_migration_policy_preserves_hot_process_migration() -> bool {
+    auto init_cold_user_process = [](task::Task& t) {
+        t.type = task::TaskType::PROCESS;
+        t.thread = reinterpret_cast<threading::Thread*>(0x1000);
+        t.pagemap = reinterpret_cast<mm::paging::PageTable*>(0x2000);
+        t.has_run = false;
+        t.context.frame.cs = desc::gdt::GDT_USER_CS;
+        t.context.frame.ss = desc::gdt::GDT_USER_DS;
+        t.context.frame.rip = 0x401000;
+        t.context.frame.rsp = 0x7fff0000;
+    };
+
+    task::Task cold_process{};
+    init_cold_user_process(cold_process);
+    bool const COLD_USER_PROCESS_STEALABLE = process_task_can_idle_steal(&cold_process);
+
+    task::Task blocked_process{};
+    init_cold_user_process(blocked_process);
+    blocked_process.set_voluntary_blocked(true);
+    blocked_process.context.syscall_kernel_stack = 0xffff800000100000ULL;
+    blocked_process.context.frame.cs = desc::gdt::GDT_KERN_CS;
+    blocked_process.context.frame.ss = desc::gdt::GDT_KERN_DS;
+    blocked_process.context.frame.rip = reinterpret_cast<uint64_t>(&scheduler_selftest_migration_policy_preserves_hot_process_migration);
+    blocked_process.context.frame.rsp = blocked_process.context.syscall_kernel_stack - 128;
+    blocked_process.context.frame.flags = 0x202;
+    bool const SAFE_KERNEL_BLOCK_STEALABLE = process_task_can_idle_steal(&blocked_process);
+
+    task::Task bad_kernel_block{};
+    init_cold_user_process(bad_kernel_block);
+    bad_kernel_block.set_voluntary_blocked(true);
+    bad_kernel_block.context.syscall_kernel_stack = 0xffff800000100000ULL;
+    bad_kernel_block.context.frame.cs = desc::gdt::GDT_KERN_CS;
+    bad_kernel_block.context.frame.ss = desc::gdt::GDT_KERN_DS;
+    bad_kernel_block.context.frame.rip = 0x401000;
+    bad_kernel_block.context.frame.rsp = bad_kernel_block.context.syscall_kernel_stack - 128;
+    bad_kernel_block.context.frame.flags = 0x202;
+    bool const BAD_KERNEL_BLOCK_REJECTED = !process_task_can_idle_steal(&bad_kernel_block);
+
+    task::Task proxy_process{};
+    init_cold_user_process(proxy_process);
+    proxy_process.wki_proxy_task_id = 1;
+    bool const WKI_PROXY_REJECTED = !process_task_can_idle_steal(&proxy_process);
+
+    return COLD_USER_PROCESS_STEALABLE && SAFE_KERNEL_BLOCK_STEALABLE && BAD_KERNEL_BLOCK_REJECTED && WKI_PROXY_REJECTED;
+}
 #endif
 
 }  // namespace ker::mod::sched
