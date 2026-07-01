@@ -2013,6 +2013,25 @@ inline auto user_context_is_canonical(task::Task const* task) -> bool {
            task->context.frame.rip < 0x0000800000000000ULL && task->context.frame.rsp < 0x0000800000000000ULL;
 }
 
+inline auto task_kernel_stack_contains(task::Task const* task, uint64_t rsp) -> bool {
+    if (task == nullptr || !is_valid_kernel_stack(task->context.syscall_kernel_stack) || !is_valid_kernel_stack(rsp)) {
+        return false;
+    }
+
+    uint64_t const STACK_TOP = task->context.syscall_kernel_stack;
+    return rsp > STACK_TOP - mm::KERNEL_STACK_SIZE && rsp <= STACK_TOP;
+}
+
+inline auto kernel_context_is_migratable(task::Task const* task) -> bool {
+    if (task == nullptr || !task->is_voluntary_blocked()) {
+        return false;
+    }
+
+    return task->context.frame.cs == desc::gdt::GDT_KERN_CS && task->context.frame.ss == desc::gdt::GDT_KERN_DS &&
+           is_kernel_text_pointer(task->context.frame.rip) && task_kernel_stack_contains(task, task->context.frame.rsp) &&
+           (task->context.frame.flags & 0x2ULL) != 0;
+}
+
 inline auto process_task_can_idle_steal(task::Task const* task) -> bool {
     if (task == nullptr || task->type != task::TaskType::PROCESS) {
         return true;
@@ -2024,7 +2043,7 @@ inline auto process_task_can_idle_steal(task::Task const* task) -> bool {
         return false;
     }
     if (task->is_voluntary_blocked()) {
-        return false;
+        return kernel_context_is_migratable(task);
     }
 
     return user_context_is_canonical(task);

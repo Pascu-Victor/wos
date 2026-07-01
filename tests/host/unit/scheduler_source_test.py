@@ -160,6 +160,7 @@ def test_event_wake_rebalances_normal_process_waiters() -> None:
 def test_idle_steal_can_migrate_normal_process_work() -> None:
     source = SCHEDULER_CPP.read_text()
     mask_body = function_body(source, "task_can_run_on_cpu")
+    kernel_steal_body = function_body(source, "kernel_context_is_migratable")
     process_steal_body = function_body(source, "process_task_can_idle_steal")
     probe_body = function_body(source, "idle_rebalance_probe_needed_for_idle")
     steal_body = function_body(source, "try_steal_from_peers")
@@ -190,15 +191,28 @@ def test_idle_steal_can_migrate_normal_process_work() -> None:
         "idle steal process eligibility",
     )
     require_tokens(
+        kernel_steal_body,
+        [
+            "task->is_voluntary_blocked()",
+            "task->context.frame.cs == desc::gdt::GDT_KERN_CS",
+            "task->context.frame.ss == desc::gdt::GDT_KERN_DS",
+            "is_kernel_text_pointer(task->context.frame.rip)",
+            "task_kernel_stack_contains(task, task->context.frame.rsp)",
+            '(task->context.frame.flags & 0x2ULL) != 0',
+        ],
+        "idle steal voluntary-block kernel context validation",
+    )
+    require_tokens(
         process_steal_body,
         [
             "task->type != task::TaskType::PROCESS",
             "task->thread == nullptr || task->pagemap == nullptr || task->wki_proxy_task_id != 0",
             "task->preempt_disable_depth != 0 || task->deferred_task_switch || task->wants_block",
             "task->is_voluntary_blocked()",
+            "return kernel_context_is_migratable(task);",
             "return user_context_is_canonical(task);",
         ],
-        "idle steal must only migrate clean user process resume contexts",
+        "idle steal process resume context eligibility",
     )
     require_tokens(
         probe_body,
@@ -216,8 +230,8 @@ def test_idle_steal_can_migrate_normal_process_work() -> None:
         fail("idle steal must not skip every PROCESS task")
     if re.search(r"if\s*\(\s*!\s*t->has_run\s*\)\s*\{\s*continue;", steal_body):
         fail("idle steal must allow cold process placement when the process has a runnable context")
-    if "GDT_KERN_CS" in process_steal_body or "is_valid_kernel_stack" in process_steal_body:
-        fail("idle steal must not migrate voluntary-blocked process syscall kernel frames")
+    if re.search(r"if\s*\(\s*task->is_voluntary_blocked\(\)\s*\)\s*\{\s*return\s+false;", process_steal_body):
+        fail("idle steal must not blanket-ban voluntary-blocked process migration")
 
 
 def test_wait_channel_policy_uses_typed_kinds() -> None:
