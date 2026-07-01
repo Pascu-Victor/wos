@@ -113,13 +113,13 @@ auto raw_sendto(Socket* sock, const void* buf, size_t len, int /*unused*/, const
 }
 
 // Raw socket recvfrom - receive ICMP and other raw IP packets
-auto raw_recvfrom(Socket* sock, void* buf, size_t len, int /*unused*/, void* addr_out, size_t* addr_len) -> ssize_t {
+auto raw_recvfrom(Socket* sock, void* buf, size_t len, int flags, void* addr_out, size_t* addr_len) -> ssize_t {
     if (buf == nullptr) {
         return -EINVAL;
     }
 
     if (sock->rcvbuf.available() < sizeof(RawRecvRecord)) {
-        if (!sock->nonblock) {
+        if (!socket_call_nonblock(sock, flags)) {
             socket_defer_wait(sock, "raw_wait");
         }
         return -EAGAIN;

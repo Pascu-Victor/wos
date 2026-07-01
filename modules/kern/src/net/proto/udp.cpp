@@ -183,7 +183,7 @@ int udp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
 
 int udp_listen(Socket* /*unused*/, int /*unused*/) { return -1; }  // UDP doesn't listen
 int udp_accept(Socket* /*unused*/, Socket** /*unused*/, void* /*unused*/, size_t* /*unused*/) { return -1; }
-int udp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
+int udp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int /*unused*/) {
     uint16_t port = 0;
     uint32_t ip = 0;
     if (!socket_parse_sockaddr_v4(addr_raw, addr_len, &ip, &port)) {
@@ -236,7 +236,7 @@ auto udp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssiz
                                                                                                    : static_cast<ssize_t>(-1);
 }
 
-auto udp_recv(Socket* sock, void* buf, size_t len, int /*unused*/) -> ssize_t { return udp_recvfrom(sock, buf, len, 0, nullptr, nullptr); }
+auto udp_recv(Socket* sock, void* buf, size_t len, int flags) -> ssize_t { return udp_recvfrom(sock, buf, len, flags, nullptr, nullptr); }
 
 auto udp_sendto(Socket* sock, const void* buf, size_t len, int /*unused*/, const void* addr_raw, size_t addr_len) -> ssize_t {
     uint16_t port = 0;
@@ -286,9 +286,9 @@ auto udp_sendto(Socket* sock, const void* buf, size_t len, int /*unused*/, const
     return tx_ret == 0 ? static_cast<ssize_t>(len) : static_cast<ssize_t>(-1);
 }
 
-auto udp_recvfrom(Socket* sock, void* buf, size_t len, int /*unused*/, void* addr_raw, size_t* addr_len) -> ssize_t {
+auto udp_recvfrom(Socket* sock, void* buf, size_t len, int flags, void* addr_raw, size_t* addr_len) -> ssize_t {
     if (sock->rcvbuf.available() < sizeof(UdpRecvRecord)) {
-        if (!sock->nonblock) {
+        if (!socket_call_nonblock(sock, flags)) {
             socket_defer_wait(sock, "udp_wait");
         }
         return -EAGAIN;

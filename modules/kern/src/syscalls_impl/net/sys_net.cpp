@@ -38,7 +38,6 @@
 namespace ker::syscall::net {
 
 namespace {
-constexpr int WOS_MSG_DONTWAIT = 0x0040;
 constexpr int WOS_O_NONBLOCK = 04000;
 constexpr int WOS_O_RDWR = 2;
 constexpr int WOS_POLLIN = 0x0001;
@@ -404,37 +403,19 @@ auto run_select(size_t nfds, uint8_t* readfds, uint8_t* writefds, uint8_t* excep
     return selected;
 }
 
-auto socket_effective_nonblock(const ker::vfs::File* file, const ker::net::Socket* sock, int call_flags) -> bool {
+auto socket_call_effective_nonblock(const ker::vfs::File* file, const ker::net::Socket* sock, int call_flags) -> bool {
     bool const FILE_NONBLOCK = file != nullptr && (file->open_flags & WOS_O_NONBLOCK) != 0;
-    bool const MSG_NONBLOCK = (call_flags & WOS_MSG_DONTWAIT) != 0;
+    bool const MSG_NONBLOCK = (call_flags & ker::net::SOCKET_MSG_DONTWAIT) != 0;
     bool const SOCKET_NONBLOCK = sock != nullptr && sock->nonblock;
     return FILE_NONBLOCK || MSG_NONBLOCK || SOCKET_NONBLOCK;
 }
 
-struct SocketNonblockGuard {
-    ker::net::Socket* sock;
-    bool saved_nonblock;
-
-    SocketNonblockGuard(ker::net::Socket* sock, bool effective_nonblock)
-        : sock(sock), saved_nonblock(sock != nullptr ? sock->nonblock : false) {
-        if (sock != nullptr) {
-            sock->nonblock = effective_nonblock;
-        }
-    }
-
-    ~SocketNonblockGuard() {
-        if (sock != nullptr) {
-            sock->nonblock = saved_nonblock;
-        }
-    }
-};
-
 template <typename T, typename Fn>
 auto run_socket_call(ker::vfs::File* file, ker::net::Socket* sock, int call_flags, Fn&& fn) -> T {
-    bool const EFFECTIVE_NONBLOCK = socket_effective_nonblock(file, sock, call_flags);
-    SocketNonblockGuard const GUARD(sock, EFFECTIVE_NONBLOCK);
+    bool const EFFECTIVE_NONBLOCK = socket_call_effective_nonblock(file, sock, call_flags);
+    int const EFFECTIVE_FLAGS = EFFECTIVE_NONBLOCK ? (call_flags | ker::net::SOCKET_MSG_DONTWAIT) : call_flags;
     for (;;) {
-        T const RESULT = fn();
+        T const RESULT = fn(EFFECTIVE_FLAGS);
         bool const RETRYABLE = RESULT == static_cast<T>(-EAGAIN) || RESULT == static_cast<T>(-EINPROGRESS);
         if (!RETRYABLE) {
             return RESULT;
@@ -445,7 +426,7 @@ auto run_socket_call(ker::vfs::File* file, ker::net::Socket* sock, int call_flag
         }
         if (EFFECTIVE_NONBLOCK) {
             drain_network_rx_work();
-            return fn();
+            return fn(EFFECTIVE_FLAGS);
         }
         char const* wait_channel = task->wait_channel != nullptr ? task->wait_channel : "sock_wait";
         auto const WAIT_CHANNEL_KIND =
@@ -456,7 +437,7 @@ auto run_socket_call(ker::vfs::File* file, ker::net::Socket* sock, int call_flag
         }
 
         drain_network_rx_work();
-        T const AFTER_DRAIN = fn();
+        T const AFTER_DRAIN = fn(EFFECTIVE_FLAGS);
         if (AFTER_DRAIN != static_cast<T>(-EAGAIN) && AFTER_DRAIN != static_cast<T>(-EINPROGRESS)) {
             return AFTER_DRAIN;
         }
@@ -487,7 +468,8 @@ ssize_t socket_fops_read(ker::vfs::File* f, void* buf, size_t count, size_t /*un
     if (sock->proto_ops == nullptr || sock->proto_ops->recv == nullptr) {
         return -ENOSYS;
     }
-    return clamp_io_count(run_socket_call<ssize_t>(f, sock, 0, [&]() { return sock->proto_ops->recv(sock, buf, count, 0); }), count);
+    return clamp_io_count(run_socket_call<ssize_t>(f, sock, 0, [&](int flags) { return sock->proto_ops->recv(sock, buf, count, flags); }),
+                          count);
 }
 
 ssize_t socket_fops_write(ker::vfs::File* f, const void* buf, size_t count, size_t /*unused*/) {
@@ -498,7 +480,8 @@ ssize_t socket_fops_write(ker::vfs::File* f, const void* buf, size_t count, size
     if (sock->proto_ops == nullptr || sock->proto_ops->send == nullptr) {
         return -ENOSYS;
     }
-    return clamp_io_count(run_socket_call<ssize_t>(f, sock, 0, [&]() { return sock->proto_ops->send(sock, buf, count, 0); }), count);
+    return clamp_io_count(run_socket_call<ssize_t>(f, sock, 0, [&](int flags) { return sock->proto_ops->send(sock, buf, count, flags); }),
+                          count);
 }
 
 ker::vfs::FileOperations socket_fops = {
@@ -903,7 +886,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             }
             ker::net::Socket* new_sock = nullptr;
             auto* addr_len_ptr = reinterpret_cast<size_t*>(a3);
-            int const RESULT = run_socket_call<int>(handle.file, sock, 0, [&]() {
+            int const RESULT = run_socket_call<int>(handle.file, sock, 0, [&](int) {
                 return sock->proto_ops->accept(sock, &new_sock, reinterpret_cast<void*>(a2), addr_len_ptr);
             });
             if (RESULT < 0 || new_sock == nullptr) {
@@ -933,8 +916,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock->proto_ops == nullptr || sock->proto_ops->connect == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            int const RESULT = run_socket_call<int>(handle.file, sock, 0, [&]() {
-                return sock->proto_ops->connect(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3));
+            int const RESULT = run_socket_call<int>(handle.file, sock, 0, [&](int flags) {
+                return sock->proto_ops->connect(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), flags);
             });
             return static_cast<uint64_t>(RESULT);
         }
@@ -962,8 +945,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock->proto_ops == nullptr || sock->proto_ops->send == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            auto const RESULT = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&]() {
-                return sock->proto_ops->send(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4));
+            auto const RESULT = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&](int flags) {
+                return sock->proto_ops->send(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), flags);
             });
             return static_cast<uint64_t>(clamp_io_count(RESULT, static_cast<size_t>(a3)));
         }
@@ -991,8 +974,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock->proto_ops == nullptr || sock->proto_ops->recv == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            auto const RESULT = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&]() {
-                return sock->proto_ops->recv(sock, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4));
+            auto const RESULT = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&](int flags) {
+                return sock->proto_ops->recv(sock, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), flags);
             });
             return static_cast<uint64_t>(clamp_io_count(RESULT, static_cast<size_t>(a3)));
         }
@@ -1014,8 +997,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-ENOSYS);
             }
             size_t alen = addr_len_for_domain(sock->domain);
-            auto const RESULT = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&]() {
-                return sock->proto_ops->sendto(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4),
+            auto const RESULT = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&](int flags) {
+                return sock->proto_ops->sendto(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), flags,
                                                reinterpret_cast<const void*>(a5), alen);
             });
             return static_cast<uint64_t>(clamp_io_count(RESULT, static_cast<size_t>(a3)));
@@ -1032,8 +1015,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-ENOSYS);
             }
             size_t alen = addr_len_for_domain(sock->domain);
-            auto const RESULT = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&]() {
-                return sock->proto_ops->recvfrom(sock, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), static_cast<int>(a4),
+            auto const RESULT = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&](int flags) {
+                return sock->proto_ops->recvfrom(sock, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), flags,
                                                  reinterpret_cast<void*>(a5), &alen);
             });
             return static_cast<uint64_t>(clamp_io_count(RESULT, static_cast<size_t>(a3)));

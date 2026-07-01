@@ -223,8 +223,8 @@ def test_udp_receive_preserves_datagram_boundaries() -> None:
         fail("UDP receive record size must stay fixed")
 
     recv = function_body(source, "udp_recv")
-    if "return udp_recvfrom(sock, buf, len, 0, nullptr, nullptr)" not in recv:
-        fail("UDP recv must share recvfrom datagram-boundary handling")
+    if "return udp_recvfrom(sock, buf, len, flags, nullptr, nullptr)" not in recv:
+        fail("UDP recv must share recvfrom datagram-boundary handling while preserving call flags")
 
     recvfrom = function_body(source, "udp_recvfrom")
     require_order(

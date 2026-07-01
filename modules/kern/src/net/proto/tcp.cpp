@@ -287,11 +287,12 @@ int tcp_accept(Socket* sock, Socket** new_sock_out, void* addr_out, size_t* addr
     return 0;
 }
 
-int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
+int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int flags) {
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
     if (cb == nullptr) {
         return -1;
     }
+    bool const NONBLOCKING = socket_call_nonblock(sock, flags);
 
     // Already connected
     if (cb->state == TcpState::ESTABLISHED) {
@@ -301,7 +302,7 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
 
     // Connect in progress
     if (cb->state == TcpState::SYN_SENT) {
-        if (sock->nonblock) {
+        if (NONBLOCKING) {
             return -EINPROGRESS;
         }
         if (cb->state == TcpState::ESTABLISHED) {
@@ -364,7 +365,7 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
 
     tcp_send_segment(cb, TCP_SYN, nullptr, 0);
 
-    if (sock->nonblock) {
+    if (NONBLOCKING) {
         return -EINPROGRESS;
     }
 
@@ -379,11 +380,12 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len) {
     return -EINPROGRESS;
 }
 
-auto tcp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssize_t {
+auto tcp_send(Socket* sock, const void* buf, size_t len, int flags) -> ssize_t {
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
     if (cb == nullptr) {
         return -ENOTCONN;
     }
+    bool const NONBLOCKING = socket_call_nonblock(sock, flags);
     if (cb->state == TcpState::SYN_SENT) {
         return -EINPROGRESS;
     }
@@ -426,7 +428,7 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssiz
             if (sent > 0) {
                 return static_cast<ssize_t>(sent);
             }
-            if (sock->nonblock) {
+            if (NONBLOCKING) {
                 return -EAGAIN;
             }
             defer_socket_wait(sock);
@@ -439,7 +441,7 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssiz
             if (sent > 0) {
                 return static_cast<ssize_t>(sent);
             }
-            if (sock->nonblock) {
+            if (NONBLOCKING) {
                 return -EAGAIN;
             }
             defer_socket_wait(sock);
@@ -455,7 +457,7 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssiz
             if (sent > 0) {
                 return static_cast<ssize_t>(sent);
             }
-            if (sock->nonblock) {
+            if (NONBLOCKING) {
                 return -EAGAIN;
             }
             defer_socket_wait(sock);
@@ -467,11 +469,12 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssiz
     return static_cast<ssize_t>(sent);
 }
 
-auto tcp_recv(Socket* sock, void* buf, size_t len, int /*unused*/) -> ssize_t {
+auto tcp_recv(Socket* sock, void* buf, size_t len, int flags) -> ssize_t {
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
     if (cb == nullptr) {
         return -1;
     }
+    bool const NONBLOCKING = socket_call_nonblock(sock, flags);
 
 #ifdef TCP_DEBUG
     auto current_pid = [&]() -> uint64_t {
@@ -515,7 +518,7 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int /*unused*/) -> ssize_t {
         return -EAGAIN;
     }
 
-    if (sock->nonblock) {
+    if (NONBLOCKING) {
         return -EAGAIN;
     }
 

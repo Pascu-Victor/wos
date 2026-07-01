@@ -21,6 +21,7 @@ constexpr size_t SOCKET_RCVBUF_MAX = 10485760;  // 10 MB ceiling for SO_RCVBUF
 constexpr uint16_t SOCKADDR_V4_FAMILY = 2;
 constexpr size_t SOCKADDR_V4_MIN_LEN = 8;
 constexpr size_t SOCKADDR_V4_LEN = 16;
+constexpr int SOCKET_MSG_DONTWAIT = 0x0040;
 
 inline auto socket_parse_sockaddr_v4(const void* addr_raw, size_t addr_len, uint32_t* ip_out, uint16_t* port_out) -> bool {
     if (addr_raw == nullptr || addr_len < SOCKADDR_V4_MIN_LEN || ip_out == nullptr || port_out == nullptr) {
@@ -100,7 +101,7 @@ struct SocketProtoOps {
     int (*bind)(Socket*, const void*, size_t);
     int (*listen)(Socket*, int);
     int (*accept)(Socket*, Socket**, void*, size_t*);
-    int (*connect)(Socket*, const void*, size_t);
+    int (*connect)(Socket*, const void*, size_t, int);
     auto (*send)(Socket*, const void*, size_t, int) -> ssize_t;
     auto (*recv)(Socket*, void*, size_t, int) -> ssize_t;
     auto (*sendto)(Socket*, const void*, size_t, int, const void*, size_t) -> ssize_t;
@@ -152,6 +153,10 @@ struct Socket {
 
     ker::mod::sys::Spinlock lock;  // protects accept_queue and state transitions
 };
+
+inline auto socket_call_nonblock(const Socket* sock, int flags) -> bool {
+    return (sock != nullptr && sock->nonblock) || (flags & SOCKET_MSG_DONTWAIT) != 0;
+}
 
 // Socket management
 auto socket_create(int domain, int type, int protocol) -> Socket*;

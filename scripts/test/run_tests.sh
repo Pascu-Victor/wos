@@ -132,6 +132,7 @@ UNIT_TESTS=(
     mlibc_vfs_source_test
     netd_dns_source_test
     socket_ring_source_test
+    socket_nonblock_source_test
     tcp_deadline_source_test
     tcp_ephemeral_source_test
     tcp_fin_source_test
