@@ -483,16 +483,21 @@ void wki_routing_recompute() {
 // Routing table lookup
 // -----------------------------------------------------------------------------
 
-auto wki_routing_lookup(uint16_t dst_node) -> const RoutingEntry* {
-    // Lock-free read: callers accept slightly stale data during a
-    // concurrent routing table update.  Individual field reads are
-    // atomic on x86-64.
+auto wki_routing_lookup(uint16_t dst_node, RoutingEntry* out) -> bool {
+    if (out == nullptr) {
+        return false;
+    }
+
+    s_routing_lock.lock();
     for (auto const& route : s_routing_table) {
         if (route.valid && route.dst_node == dst_node) {
-            return &route;
+            *out = route;
+            s_routing_lock.unlock();
+            return true;
         }
     }
-    return nullptr;
+    s_routing_lock.unlock();
+    return false;
 }
 
 // -----------------------------------------------------------------------------

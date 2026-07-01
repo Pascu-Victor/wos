@@ -64,10 +64,10 @@ void wki_lsa_generate_and_flood();
 // Recompute routing table from LSDB using Dijkstra SPF
 void wki_routing_recompute();
 
-// Look up next hop for a destination node.
-// Returns nullptr if no route exists.  Lock-free read; callers accept
-// slightly stale data during a concurrent routing update.
-auto wki_routing_lookup(uint16_t dst_node) -> const RoutingEntry*;
+// Copy the current route for a destination node.
+// Returns false if no route exists.  The copied snapshot remains stable if a
+// concurrent routing recompute mutates the routing table after lookup returns.
+auto wki_routing_lookup(uint16_t dst_node, RoutingEntry* out) -> bool;
 
 // Invalidate the LSDB entry for a node (used after fencing).
 // Does NOT recompute routes - caller should call wki_routing_recompute() after.

@@ -1482,9 +1482,9 @@ auto find_transport_for_peer(uint16_t dst_node) -> WkiTransport* {
     }
 
     // Routing table lookup for multi-hop destinations
-    const RoutingEntry* route = wki_routing_lookup(dst_node);
-    if ((route != nullptr) && route->valid && route->next_hop != WKI_NODE_INVALID) {
-        WkiPeer const* hop = wki_peer_find(route->next_hop);
+    RoutingEntry route = {};
+    if (wki_routing_lookup(dst_node, &route) && route.valid && route.next_hop != WKI_NODE_INVALID) {
+        WkiPeer const* hop = wki_peer_find(route.next_hop);
         if ((hop != nullptr) && (hop->transport != nullptr)) {
             return hop->transport;
         }
@@ -1510,9 +1510,9 @@ auto resolve_next_hop(uint16_t dst_node) -> uint16_t {
     }
 
     // Routing table (populated by Dijkstra SPF)
-    const RoutingEntry* route = wki_routing_lookup(dst_node);
-    if ((route != nullptr) && route->valid) {
-        return route->next_hop;
+    RoutingEntry route = {};
+    if (wki_routing_lookup(dst_node, &route) && route.valid) {
+        return route.next_hop;
     }
 
     // Peer table fallback (next_hop set during routing recompute)
