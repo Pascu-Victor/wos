@@ -379,6 +379,173 @@ def test_vfs_attach_ack_requires_expected_cookie_before_completion() -> None:
     )
 
 
+def test_remote_vfs_unmount_cancels_waiters_before_teardown() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+
+    teardown_body = function_body(source, "deactivate_vfs_proxy_locked")
+    require_order(
+        teardown_body,
+        [
+            "teardown.state = state",
+            "teardown.owner_node = state->owner_node",
+            "state->lock.lock()",
+            "if (state->op_pending.load(std::memory_order_acquire))",
+            "teardown.op_wait_entry = claim_and_clear_waiter_locked(state->op_wait_entry)",
+            "clear_proxy_op_state_locked(state, -1)",
+            "if (state->attach_pending.load(std::memory_order_acquire))",
+            "teardown.attach_wait_entry = claim_and_clear_waiter_locked(state->attach_wait_entry)",
+            "clear_proxy_attach_state_locked(state, static_cast<uint8_t>(DevAttachStatus::BUSY))",
+            "state->active = false",
+            "state->destroy_when_idle = true",
+            "state->lock.unlock()",
+        ],
+        "remote VFS proxy deactivation",
+    )
+
+    unmount_body = function_body(source, "wki_remote_vfs_unmount")
+    require_order(
+        unmount_body,
+        [
+            "deactivate_vfs_proxy_locked(state, teardown, true)",
+            "invalidate_all_dir_caches(state)",
+            "s_vfs_lock.unlock()",
+            "finish_claimed_waiter(teardown.op_wait_entry, -1)",
+            "finish_claimed_waiter(teardown.attach_wait_entry, -1)",
+            "wki_send(teardown.owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH",
+            "wki_channel_close(ch)",
+            "ker::vfs::unmount_filesystem(local_mount_path)",
+            "mark_vfs_proxy_mount_released_and_maybe_destroy(teardown.state)",
+        ],
+        "remote VFS unmount teardown order",
+    )
+
+    cleanup_body = function_body(source, "wki_remote_vfs_cleanup_for_peer")
+    require_order(
+        cleanup_body,
+        [
+            "deactivate_vfs_proxy_locked(p, cleanup, false)",
+            "invalidate_all_dir_caches(p)",
+            "finish_claimed_waiter(cleanup.op_wait_entry, -1)",
+            "finish_claimed_waiter(cleanup.attach_wait_entry, -1)",
+            "wki_channel_close(ch)",
+            "release_and_maybe_destroy_idle_vfs_proxy(cleanup.state)",
+        ],
+        "remote VFS peer cleanup teardown order",
+    )
+
+
+def test_remote_vfs_teardown_releases_rdma_state_when_idle() -> None:
+    header = REMOTE_VFS_HPP.read_text()
+    source = REMOTE_VFS_CPP.read_text()
+
+    require_tokens(
+        header,
+        [
+            "std::atomic<uint32_t> open_file_refs{0};",
+            "bool destroy_when_idle = false;",
+            "bool mount_released = false;",
+            "bool resources_releasing = false;",
+            "bool resources_released = false;",
+        ],
+        "remote VFS proxy lifetime state",
+    )
+
+    release_body = function_body(source, "release_vfs_proxy_buffers")
+    require_tokens(
+        release_body,
+        [
+            "state->rdma_transport = nullptr",
+            "state->rdma_server_write_rkey = 0",
+            "state->rdma_server_read_staging_rkey = 0",
+            "state->rdma_server_bulk_staging_rkey = 0",
+            "state->bulk_owner_fd = -1",
+            "state->shared_io_in_use.store(false, std::memory_order_release)",
+            "state->op_untracked_send_pending.store(false, std::memory_order_release)",
+        ],
+        "remote VFS RDMA resource release",
+    )
+
+    erase_body = function_body(source, "erase_destroyed_idle_vfs_proxy_locked")
+    require_order(
+        erase_body,
+        [
+            "!state->destroy_when_idle",
+            "!state->mount_released",
+            "state->resources_releasing",
+            "!state->resources_released",
+            "std::erase_if(g_vfs_proxies",
+        ],
+        "remote VFS proxy erase gate",
+    )
+
+    mark_body = function_body(source, "mark_vfs_proxy_mount_released_and_maybe_destroy")
+    require_order(
+        mark_body,
+        [
+            "s_vfs_lock.lock()",
+            "state->mount_released = true",
+            "s_vfs_lock.unlock()",
+            "release_and_maybe_destroy_idle_vfs_proxy(state)",
+        ],
+        "remote VFS mount release gate",
+    )
+
+
+def test_remote_open_refs_delay_proxy_destroy_until_close() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+
+    acquire_body = function_body(source, "acquire_vfs_proxy_open_ref")
+    require_order(
+        acquire_body,
+        [
+            "s_vfs_lock.lock()",
+            "if (state->active && !state->destroy_when_idle && !state->resources_releasing && !state->resources_released)",
+            "uint32_t const REFS = state->open_file_refs.load(std::memory_order_acquire)",
+            "state->open_file_refs.store(REFS + 1, std::memory_order_release)",
+            "s_vfs_lock.unlock()",
+        ],
+        "remote VFS proxy open ref acquire",
+    )
+
+    release_body = function_body(source, "release_vfs_proxy_open_ref")
+    require_order(
+        release_body,
+        [
+            "uint32_t const REFS = state->open_file_refs.load(std::memory_order_acquire)",
+            "state->open_file_refs.store(REFS - 1, std::memory_order_release)",
+            "release_resources = claim_idle_vfs_proxy_resource_release_locked(state)",
+            "erase_destroyed_idle_vfs_proxy_locked(state)",
+            "release_vfs_proxy_buffers(state)",
+            "finish_idle_vfs_proxy_resource_release(state)",
+        ],
+        "remote VFS proxy open ref release",
+    )
+
+    open_body = function_body(source, "wki_remote_vfs_open_path")
+    require_order(
+        open_body,
+        [
+            "if (!acquire_vfs_proxy_open_ref(state))",
+            "ProxyOpenRefGuard open_ref_guard(state)",
+            "ctx->proxy = state",
+            "open_ref_guard.disarm()",
+            "return file",
+        ],
+        "remote VFS open ref transfer to file context",
+    )
+
+    close_body = function_body(source, "remote_vfs_close")
+    require_tokens(
+        close_body,
+        [
+            "ProxyVfsState* const PROXY = ctx->proxy;",
+            "release_vfs_proxy_open_ref(PROXY);",
+            "return FLUSH_STATUS;",
+        ],
+        "remote VFS close releases proxy open ref",
+    )
+
+
 def main() -> None:
     test_proxy_op_slot_waits_are_bounded()
     test_proxy_operations_fail_before_setup_when_slot_wait_times_out()
@@ -388,6 +555,9 @@ def main() -> None:
     test_export_lookup_returns_locked_snapshot()
     test_rdma_retry_cooldowns_are_saturating()
     test_vfs_attach_ack_requires_expected_cookie_before_completion()
+    test_remote_vfs_unmount_cancels_waiters_before_teardown()
+    test_remote_vfs_teardown_releases_rdma_state_when_idle()
+    test_remote_open_refs_delay_proxy_destroy_until_close()
     print("WKI remote VFS source invariants hold")
 
 

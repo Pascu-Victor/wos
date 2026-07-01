@@ -102,6 +102,14 @@ struct ProxyVfsState {
     std::array<char, VFS_EXPORT_PATH_LEN> local_mount_path = {};
     std::array<ReadlinkCacheEntry, VFS_READLINK_CACHE_ENTRIES> readlink_cache = {};
 
+    // RemoteFileContext keeps a raw proxy pointer after the VFS mount is gone.
+    // Unmount marks the proxy for destruction, then the final close releases it.
+    std::atomic<uint32_t> open_file_refs{0};
+    bool destroy_when_idle = false;    // Protected by s_vfs_lock.
+    bool mount_released = false;       // Protected by s_vfs_lock.
+    bool resources_releasing = false;  // Protected by s_vfs_lock.
+    bool resources_released = false;   // Protected by s_vfs_lock.
+
     // RDMA-backed I/O - populated at mount time when peer has RDMA transport.
     // Consumer registers rdma_bounce_buf for 64 KiB read mode. For writes,
     // consumer rdma_writes directly from caller/write-behind memory into the

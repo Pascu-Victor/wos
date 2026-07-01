@@ -924,6 +924,10 @@ void release_vfs_proxy_buffers(ProxyVfsState* state) {
     state->rdma_bounce_buf = nullptr;
     state->rdma_read_rkey = 0;
     state->rdma_capable = false;
+    state->rdma_transport = nullptr;
+    state->rdma_server_write_rkey = 0;
+    state->rdma_server_read_staging_rkey = 0;
+    state->rdma_server_bulk_staging_rkey = 0;
     state->rdma_read_disabled.store(false, std::memory_order_release);
     state->rdma_read_retry_after_us.store(0, std::memory_order_release);
     state->rdma_read_failure_count.store(0, std::memory_order_release);
@@ -932,10 +936,13 @@ void release_vfs_proxy_buffers(ProxyVfsState* state) {
     state->rdma_bulk_buf = nullptr;
     state->rdma_bulk_rkey = 0;
     state->rdma_bulk_size = 0;
+    state->bulk_owner_fd = -1;
     state->bulk_rdma_capable = false;
     state->bulk_rdma_disabled.store(false, std::memory_order_release);
     state->bulk_rdma_retry_after_us.store(0, std::memory_order_release);
     state->bulk_rdma_failure_count.store(0, std::memory_order_release);
+    state->shared_io_in_use.store(false, std::memory_order_release);
+    state->op_untracked_send_pending.store(false, std::memory_order_release);
 }
 
 void discard_failed_attached_proxy(ProxyVfsState* state, WkiChannel* reserved_channel) {
@@ -1256,6 +1263,161 @@ void cancel_proxy_attach_wait(ProxyVfsState* state, WkiWaitEntry& wait, int resu
     s_vfs_lock.unlock();
 
     finish_or_wait_for_cancelled_waiter(wait, claimed, result);
+}
+
+struct PendingProxyTeardown {
+    ProxyVfsState* state = nullptr;
+    uint16_t owner_node = WKI_NODE_INVALID;
+    uint16_t assigned_channel = 0;
+    uint32_t resource_id = 0;
+    uint16_t op_expected_id = 0;
+    uint16_t op_expected_seq = 0;
+    bool had_op_pending = false;
+    WkiWaitEntry* op_wait_entry = nullptr;
+    WkiWaitEntry* attach_wait_entry = nullptr;
+    std::array<char, VFS_EXPORT_PATH_LEN> local_mount_path = {};
+};
+
+auto proxy_is_idle_for_resource_release_locked(ProxyVfsState* state) -> bool {
+    return state != nullptr && !state->active && state->open_file_refs.load(std::memory_order_acquire) == 0;
+}
+
+auto claim_idle_vfs_proxy_resource_release_locked(ProxyVfsState* state) -> bool {
+    if (!proxy_is_idle_for_resource_release_locked(state) || state->resources_released || state->resources_releasing) {
+        return false;
+    }
+    state->resources_releasing = true;
+    return true;
+}
+
+void erase_destroyed_idle_vfs_proxy_locked(ProxyVfsState* state) {
+    if (!proxy_is_idle_for_resource_release_locked(state) || !state->destroy_when_idle || !state->mount_released ||
+        state->resources_releasing || !state->resources_released) {
+        return;
+    }
+
+    std::erase_if(g_vfs_proxies, [state](const std::unique_ptr<ProxyVfsState>& proxy) { return proxy.get() == state; });
+}
+
+void finish_idle_vfs_proxy_resource_release(ProxyVfsState* state) {
+    s_vfs_lock.lock();
+    state->resources_released = true;
+    state->resources_releasing = false;
+    erase_destroyed_idle_vfs_proxy_locked(state);
+    s_vfs_lock.unlock();
+}
+
+void release_and_maybe_destroy_idle_vfs_proxy(ProxyVfsState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    bool release_resources = false;
+    s_vfs_lock.lock();
+    release_resources = claim_idle_vfs_proxy_resource_release_locked(state);
+    if (!release_resources) {
+        erase_destroyed_idle_vfs_proxy_locked(state);
+    }
+    s_vfs_lock.unlock();
+
+    if (release_resources) {
+        release_vfs_proxy_buffers(state);
+        finish_idle_vfs_proxy_resource_release(state);
+    }
+}
+
+void mark_vfs_proxy_mount_released_and_maybe_destroy(ProxyVfsState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    s_vfs_lock.lock();
+    state->mount_released = true;
+    s_vfs_lock.unlock();
+
+    release_and_maybe_destroy_idle_vfs_proxy(state);
+}
+
+auto acquire_vfs_proxy_open_ref(ProxyVfsState* state) -> bool {
+    if (state == nullptr) {
+        return false;
+    }
+
+    bool acquired = false;
+    s_vfs_lock.lock();
+    if (state->active && !state->destroy_when_idle && !state->resources_releasing && !state->resources_released) {
+        uint32_t const REFS = state->open_file_refs.load(std::memory_order_acquire);
+        state->open_file_refs.store(REFS + 1, std::memory_order_release);
+        acquired = true;
+    }
+    s_vfs_lock.unlock();
+    return acquired;
+}
+
+void release_vfs_proxy_open_ref(ProxyVfsState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    bool release_resources = false;
+    s_vfs_lock.lock();
+    uint32_t const REFS = state->open_file_refs.load(std::memory_order_acquire);
+    if (REFS != 0) {
+        state->open_file_refs.store(REFS - 1, std::memory_order_release);
+    }
+    release_resources = claim_idle_vfs_proxy_resource_release_locked(state);
+    if (!release_resources) {
+        erase_destroyed_idle_vfs_proxy_locked(state);
+    }
+    s_vfs_lock.unlock();
+
+    if (release_resources) {
+        release_vfs_proxy_buffers(state);
+        finish_idle_vfs_proxy_resource_release(state);
+    }
+}
+
+struct ProxyOpenRefGuard {
+    explicit ProxyOpenRefGuard(ProxyVfsState* state_ref) : state(state_ref) {}
+    ~ProxyOpenRefGuard() { release_vfs_proxy_open_ref(state); }
+
+    ProxyOpenRefGuard(const ProxyOpenRefGuard&) = delete;
+    auto operator=(const ProxyOpenRefGuard&) -> ProxyOpenRefGuard& = delete;
+
+    void disarm() { state = nullptr; }
+
+    ProxyVfsState* state;
+};
+
+void deactivate_vfs_proxy_locked(ProxyVfsState* state, PendingProxyTeardown& teardown, bool destroy_when_idle) {
+    if (state == nullptr) {
+        return;
+    }
+
+    teardown.state = state;
+    teardown.owner_node = state->owner_node;
+    teardown.assigned_channel = state->assigned_channel;
+    teardown.resource_id = state->resource_id;
+    teardown.local_mount_path = state->local_mount_path;
+
+    state->lock.lock();
+    if (state->op_pending.load(std::memory_order_acquire)) {
+        teardown.had_op_pending = true;
+        teardown.op_expected_id = state->op_expected_id;
+        teardown.op_expected_seq = state->op_expected_seq;
+        state->op_status = -1;
+        teardown.op_wait_entry = claim_and_clear_waiter_locked(state->op_wait_entry);
+        clear_proxy_op_state_locked(state, -1);
+    }
+    if (state->attach_pending.load(std::memory_order_acquire)) {
+        teardown.attach_wait_entry = claim_and_clear_waiter_locked(state->attach_wait_entry);
+        clear_proxy_attach_state_locked(state, static_cast<uint8_t>(DevAttachStatus::BUSY));
+    }
+    state->active = false;
+    if (destroy_when_idle) {
+        state->destroy_when_idle = true;
+    }
+    state->lock.unlock();
 }
 
 // Helper: send DEV_OP_REQ and wait for response
@@ -1815,12 +1977,14 @@ auto remote_vfs_close(ker::vfs::File* f) -> int {
         return -EBADF;
     }
     auto* ctx = static_cast<RemoteFileContext*>(f->private_data);
-    if (ctx->proxy == nullptr || !ctx->proxy->active) {
+    ProxyVfsState* const PROXY = ctx->proxy;
+    if (PROXY == nullptr || !PROXY->active) {
         clear_remote_file_open_prefetch(ctx);
         delete ctx->read_cache;
         delete ctx->write_buf;
         delete ctx;
         f->private_data = nullptr;
+        release_vfs_proxy_open_ref(PROXY);
         return -EIO;
     }
 
@@ -1857,6 +2021,7 @@ auto remote_vfs_close(ker::vfs::File* f) -> int {
 
     delete ctx;
     f->private_data = nullptr;
+    release_vfs_proxy_open_ref(PROXY);
     return FLUSH_STATUS;
 }
 
@@ -4547,37 +4712,44 @@ void wki_remote_vfs_unmount(const char* local_mount_path) {
         return;
     }
 
+    PendingProxyTeardown teardown = {};
     s_vfs_lock.lock();
     auto* state = find_vfs_proxy_by_mount(local_mount_path);
     if (state == nullptr) {
         s_vfs_lock.unlock();
         return;
     }
-
-    // Capture what we need before unlock
-    uint16_t const OWNER_NODE = state->owner_node;
-    uint16_t const ASSIGNED_CHANNEL = state->assigned_channel;
-    uint32_t const RESOURCE_ID = state->resource_id;
-    state->active = false;
-
-    ker::vfs::vfs_stream_cache_invalidate_remote_scope(state);
+    deactivate_vfs_proxy_locked(state, teardown, true);
+    invalidate_all_dir_caches(state);
     s_vfs_lock.unlock();
+
+    ker::vfs::vfs_stream_cache_invalidate_remote_scope(teardown.state);
+    invalidate_readlink_cache(teardown.state);
+
+    if (teardown.had_op_pending) {
+        ker::mod::dbg::log("[WKI] VFS op UNMOUNT: node=0x%04x ch=%u op=%u seq=%u mount=%s", teardown.owner_node, teardown.assigned_channel,
+                           teardown.op_expected_id, teardown.op_expected_seq, teardown.local_mount_path.data());
+    }
+
+    finish_claimed_waiter(teardown.op_wait_entry, -1);
+    finish_claimed_waiter(teardown.attach_wait_entry, -1);
 
     // Send DEV_DETACH
     DevDetachPayload det = {};
-    det.target_node = OWNER_NODE;
+    det.target_node = teardown.owner_node;
     det.resource_type = static_cast<uint16_t>(ResourceType::VFS);
-    det.resource_id = RESOURCE_ID;
-    wki_send(OWNER_NODE, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+    det.resource_id = teardown.resource_id;
+    wki_send(teardown.owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
 
     // Close the dynamic channel
-    WkiChannel* ch = wki_channel_get(OWNER_NODE, ASSIGNED_CHANNEL);
+    WkiChannel* ch = wki_channel_get(teardown.owner_node, teardown.assigned_channel);
     if (ch != nullptr) {
         wki_channel_close(ch);
     }
 
     // Unmount
     ker::vfs::unmount_filesystem(local_mount_path);
+    mark_vfs_proxy_mount_released_and_maybe_destroy(teardown.state);
 }
 
 auto wki_remote_vfs_proxy_diag_snapshot(WkiRemoteVfsProxyDiag* out, size_t max) -> size_t {
@@ -4660,9 +4832,13 @@ auto wki_remote_vfs_find_resource_for_mount(uint16_t owner_node, const char* loc
 
 auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode, void* mount_private_data) -> ker::vfs::File* {
     auto* state = static_cast<ProxyVfsState*>(mount_private_data);
-    if (state == nullptr || !state->active || fs_relative_path == nullptr) {
+    if (state == nullptr || fs_relative_path == nullptr) {
         return nullptr;
     }
+    if (!acquire_vfs_proxy_open_ref(state)) {
+        return nullptr;
+    }
+    ProxyOpenRefGuard open_ref_guard(state);
 
     bool const WANT_OPEN_PREFETCH = remote_vfs_open_prefetch_capable(state, flags);
     uint32_t const OPEN_PREFETCH_LEN = WANT_OPEN_PREFETCH ? std::min<uint32_t>(state->rdma_bulk_size, VFS_RDMA_BULK_SIZE) : 0;
@@ -4793,6 +4969,7 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
         ctx->bulk_cached_len = valid_prefetched_bytes;
     }
 
+    open_ref_guard.disarm();
     return file;
 }
 
@@ -5532,21 +5709,9 @@ void wki_remote_vfs_rebuild_exports() {
 // -------------------------------------------------------------------------------
 
 void wki_remote_vfs_cleanup_for_peer(uint16_t node_id) {
-    struct PendingProxyCleanup {
-        ProxyVfsState* state = nullptr;
-        uint16_t owner_node = WKI_NODE_INVALID;
-        uint16_t assigned_channel = 0;
-        uint16_t op_expected_id = 0;
-        uint16_t op_expected_seq = 0;
-        bool had_op_pending = false;
-        WkiWaitEntry* op_wait_entry = nullptr;
-        WkiWaitEntry* attach_wait_entry = nullptr;
-        std::array<char, VFS_EXPORT_PATH_LEN> local_mount_path = {};
-    };
-
     // Server side: close all remote FDs for this consumer
     std::deque<ker::vfs::File*> files_to_close;
-    std::deque<PendingProxyCleanup> proxies_to_cleanup;
+    std::deque<PendingProxyTeardown> proxies_to_cleanup;
 
     s_vfs_lock.lock();
     for (auto& rfd : g_remote_fds) {
@@ -5570,28 +5735,9 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id) {
             continue;
         }
 
-        PendingProxyCleanup cleanup = {};
-        cleanup.state = p;
-        cleanup.owner_node = p->owner_node;
-        cleanup.assigned_channel = p->assigned_channel;
-        cleanup.local_mount_path = p->local_mount_path;
-
-        p->lock.lock();
-        if (p->op_pending.load(std::memory_order_acquire)) {
-            cleanup.had_op_pending = true;
-            cleanup.op_expected_id = p->op_expected_id;
-            cleanup.op_expected_seq = p->op_expected_seq;
-            p->op_status = -1;
-            cleanup.op_wait_entry = claim_and_clear_waiter_locked(p->op_wait_entry);
-            clear_proxy_op_state_locked(p, -1);
-        }
-        if (p->attach_pending.load(std::memory_order_acquire)) {
-            cleanup.attach_wait_entry = claim_and_clear_waiter_locked(p->attach_wait_entry);
-            p->attach_expected_cookie = 0;
-            p->attach_pending.store(false, std::memory_order_release);
-        }
-        p->active = false;
-        p->lock.unlock();
+        PendingProxyTeardown cleanup = {};
+        deactivate_vfs_proxy_locked(p, cleanup, false);
+        invalidate_all_dir_caches(p);
 
         proxies_to_cleanup.push_back(cleanup);
     }
@@ -5622,6 +5768,8 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id) {
         if (ch != nullptr) {
             wki_channel_close(ch);
         }
+
+        release_and_maybe_destroy_idle_vfs_proxy(cleanup.state);
 
         ker::mod::dbg::log("[WKI] Remote VFS proxy cleanup: %s node=0x%04x", cleanup.local_mount_path.data(), node_id);
     }
