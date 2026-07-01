@@ -110,17 +110,64 @@ def require_poll_waits_are_signal_interruptible() -> None:
     )
 
     poll_source = SYS_NET_CPP.read_text()
-    poll_start = poll_source.find("case ker::abi::net::ops::POLL:")
-    poll_end = poll_source.find("\n        default:", poll_start)
-    if poll_start < 0 or poll_end < 0:
-        fail("poll syscall case not found")
-    poll_body = poll_source[poll_start:poll_end]
+    poll_body = function_body(poll_source, "run_poll_wait")
     require_order(
         poll_body,
         "if (current_task_has_deliverable_signal())",
-        "bool can_block = (nfds > 0)",
+        "bool const CAN_BLOCK = register_poll_waiters",
         "if (current_task_has_deliverable_signal())",
-        'ker::mod::sched::preemptible_syscall_park("poll", poll_wait_kind, DEADLINE_US)',
+        "ker::mod::sched::preemptible_syscall_park(wait_channel, poll_wait_kind, DEADLINE_US)",
+    )
+
+
+def require_select_is_implemented_on_poll_core() -> None:
+    source = SYS_NET_CPP.read_text()
+    select_start = source.find("case ker::abi::net::ops::SELECT:")
+    poll_start = source.find("case ker::abi::net::ops::POLL:")
+    default_start = source.find("\n        default:", poll_start)
+    if select_start < 0:
+        fail("select syscall case not found")
+    if poll_start < 0 or default_start < 0:
+        fail("poll syscall case not found")
+    if not select_start < poll_start < default_start:
+        fail("select and poll syscall cases are not in the expected switch order")
+
+    select_case = body_after_marker(source, "case ker::abi::net::ops::SELECT:")
+    require_order(
+        select_case,
+        "if (a1 > WOS_FD_SETSIZE)",
+        "run_select(static_cast<size_t>(a1)",
+        "reinterpret_cast<const KSelectTimeval*>(a5)",
+    )
+
+    select_timeout_body = function_body(source, "select_timeout_ms")
+    require_order(
+        select_timeout_body,
+        "timeout_ms = -1",
+        "if (timeout == nullptr)",
+        "if (timeout->tv_sec < 0 || timeout->tv_usec < 0 || timeout->tv_usec >= SELECT_USEC_PER_SEC)",
+        "timeout_ms = SELECT_TIMEOUT_MAX_MS",
+    )
+
+    select_body = function_body(source, "run_select")
+    require_order(
+        select_body,
+        "select_timeout_ms(timeout, timeout_ms)",
+        "new (std::nothrow) KPollFd[watched_fds]{}",
+        'run_poll_wait(poll_fds, watched_fds, timeout_ms, "select")',
+        "WOS_POLLNVAL",
+        "return -EBADF",
+        "select_fd_zero(readfds)",
+        "select_fd_set_bit(FD, readfds)",
+        "select_fd_set_bit(FD, writefds)",
+        "select_fd_set_bit(FD, exceptfds)",
+    )
+
+    poll_case = body_after_marker(source, "case ker::abi::net::ops::POLL:")
+    require_order(
+        poll_case,
+        "auto* fds = reinterpret_cast<KPollFd*>(a1)",
+        'run_poll_wait(fds, nfds, timeout, "poll")',
     )
 
 
@@ -176,6 +223,7 @@ def main() -> None:
     require_poll_deadline_is_saturating(EPOLL_CPP)
     require_poll_deadline_is_saturating(SYS_NET_CPP)
     require_poll_waits_are_signal_interruptible()
+    require_select_is_implemented_on_poll_core()
     require_preemptible_parking_rechecks_signals()
     require_sigchld_wakes_interruptible_waits()
     print("poll and epoll waits use saturating deadlines and signal-safe parking")
