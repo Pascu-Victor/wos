@@ -264,6 +264,32 @@ def test_wos_toolchain_records_bootstrap_phase_timings() -> None:
         fail(f"WOS bootstrap must close each timed phase exactly once, got {phase_end_count}")
 
 
+def test_shared_build_timing_avoids_python_when_epochrealtime_exists() -> None:
+    source = CCACHE_ENV.read_text()
+    require_tokens(
+        source,
+        [
+            "wos_now_ms()",
+            "wos_timestamp_utc()",
+            'local epoch="${EPOCHREALTIME:-}"',
+            'if [ -n "$epoch" ]; then',
+            'TZ=UTC printf -v prefix',
+            'printf \'%s\\n\' "$((10#$seconds * 1000 + 10#${fraction:0:3}))"',
+            "python3 - <<'PY'",
+        ],
+        "shared WOS build timing fast path",
+    )
+
+    now_start = source.index("wos_now_ms()")
+    timestamp_start = source.index("wos_timestamp_utc()")
+    record_start = source.index("wos_record_detail()")
+    timing_block = source[now_start:record_start]
+    if timing_block.count("python3 - <<'PY'") != 2:
+        fail("shared timing helpers should keep Python only as a fallback")
+    if timing_block.find("python3 - <<'PY'") < timing_block.find('if [ -n "$epoch" ]; then'):
+        fail("shared timing helpers must try EPOCHREALTIME before Python")
+
+
 def test_native_wos_build_defaults_keep_target_ports_enabled() -> None:
     source = ROOT_CMAKE.read_text()
     require_tokens(
@@ -1640,6 +1666,7 @@ def test_cmake_script_uses_target_header_stack() -> None:
             'TARGET_C_INCLUDE_FLAGS="-isystem $HOST/lib/clang/22/include -isystem $TARGET_SYSROOT/include"',
             'TARGET_C_FLAGS="$TARGET_COMMON_FLAGS $TARGET_C_INCLUDE_FLAGS"',
             'TARGET_CXX_FLAGS="$TARGET_COMMON_FLAGS -std=c++23 -isystem $TARGET_SYSROOT/include/c++/v1 $TARGET_C_INCLUDE_FLAGS"',
+            'TARGET_RELEASE_FLAGS="-O2 -DNDEBUG"',
             'cached_cxx="$(sed -n \'s/^CMAKE_CXX_COMPILER:[^=]*=//p\' "$CMAKE_BUILD/CMakeCache.txt")"',
             'cached_cxx_flags="$(sed -n \'s/^CMAKE_CXX_FLAGS:[^=]*=//p\' "$CMAKE_BUILD/CMakeCache.txt")"',
             'if [ -n "$cached_cxx" ] && [ "$cached_cxx" != "$HOST/bin/clang++" ]; then',
@@ -1669,6 +1696,8 @@ def test_native_wos_cmake_configure_preseeds_expensive_checks() -> None:
             "-DCMAKE_HAVE_LIBC_PTHREAD=1",
             "-DHAVE_UNSETENV=1",
             "-DHAVE_ENVIRON_NOT_REQUIRE_PROTOTYPE=0",
+            '-DCMAKE_C_FLAGS_RELEASE="$TARGET_RELEASE_FLAGS"',
+            '-DCMAKE_CXX_FLAGS_RELEASE="$TARGET_RELEASE_FLAGS"',
         ],
         "CMake-for-WOS top-level configure preseeds",
     )
@@ -2229,6 +2258,7 @@ if __name__ == "__main__":
     test_compiler_rt_sanitizers_are_built_after_mlibc()
     test_native_wos_compiler_rt_does_not_link_with_workspace_sysroot()
     test_wos_toolchain_records_bootstrap_phase_timings()
+    test_shared_build_timing_avoids_python_when_epochrealtime_exists()
     test_native_wos_build_defaults_keep_target_ports_enabled()
     test_preseeded_toolchain_mode_validates_bootstrap_outputs()
     test_preseeded_toolchain_mode_skips_external_source_scans()

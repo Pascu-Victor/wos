@@ -56,6 +56,16 @@ wos_detail_file() {
 }
 
 wos_now_ms() {
+    local epoch="${EPOCHREALTIME:-}"
+
+    if [ -n "$epoch" ]; then
+        local seconds="${epoch%.*}"
+        local fraction="${epoch#*.}000"
+
+        printf '%s\n' "$((10#$seconds * 1000 + 10#${fraction:0:3}))"
+        return 0
+    fi
+
     python3 - <<'PY'
 import time
 
@@ -64,6 +74,18 @@ PY
 }
 
 wos_timestamp_utc() {
+    local epoch="${EPOCHREALTIME:-}"
+
+    if [ -n "$epoch" ]; then
+        local seconds="${epoch%.*}"
+        local fraction="${epoch#*.}000"
+        local prefix
+
+        TZ=UTC printf -v prefix '%(%Y-%m-%dT%H:%M:%S)T' "$seconds"
+        printf '%s.%sZ\n' "$prefix" "${fraction:0:3}"
+        return 0
+    fi
+
     python3 - <<'PY'
 from datetime import datetime, timezone
 
