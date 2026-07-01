@@ -113,11 +113,7 @@ class XfsMetadataGuard {
         }
     }
 
-    ~XfsMetadataGuard() {
-        if (ctx != nullptr && locked) {
-            ctx->metadata_lock.unlock();
-        }
-    }
+    ~XfsMetadataGuard() { unlock(); }
 
     XfsMetadataGuard(const XfsMetadataGuard&) = delete;
     XfsMetadataGuard(XfsMetadataGuard&&) = delete;

@@ -99,6 +99,11 @@ def test_metadata_guard_records_wait_and_hold_time() -> None:
             fail(f"local_xfs perf names/bucket sizing must include metadata-lock op: {token}")
 
     guard_body = xfs_source[xfs_source.find("class XfsMetadataGuard") : xfs_source.find("auto perf_xfs_started_us")]
+    if "~XfsMetadataGuard() { unlock(); }" not in guard_body:
+        fail("XfsMetadataGuard destructor must use unlock() so RAII lock holds are recorded")
+    destructor_body = guard_body[guard_body.find("~XfsMetadataGuard") : guard_body.find("XfsMetadataGuard(const XfsMetadataGuard&)")]
+    if "metadata_lock.unlock()" in destructor_body:
+        fail("XfsMetadataGuard destructor must not bypass metadata-lock hold accounting")
     require_order(
         guard_body,
         [
