@@ -175,6 +175,46 @@ def test_udp_bind_port_zero_allocates_ephemeral_once() -> None:
         fail("UDP auto-bind must not bypass the shared ephemeral allocator")
 
 
+def test_udp_tx_rejects_oversize_before_packet_copy() -> None:
+    source = UDP_CPP.read_text()
+    if "constexpr size_t UDP_MAX_PACKET_PAYLOAD" not in source:
+        fail("UDP TX must define a bounded max packet payload")
+    if "PKT_BUF_SIZE - PKT_HEADROOM" not in source:
+        fail("UDP TX max payload must include PacketBuffer tailroom")
+    if "static_cast<size_t>(UINT16_MAX) - sizeof(IPv4Header) - sizeof(UdpHeader)" not in source:
+        fail("UDP TX max payload must include IPv4/UDP length-field capacity")
+
+    helper = function_body(source, "udp_payload_too_large")
+    if "len > UDP_MAX_PACKET_PAYLOAD" not in helper:
+        fail("UDP oversize helper must reject payloads beyond UDP_MAX_PACKET_PAYLOAD")
+
+    for name in ("udp_send", "udp_sendto"):
+        body = function_body(source, name)
+        require_order(
+            body,
+            [
+                "if (udp_payload_too_large(len))",
+                "return -EMSGSIZE",
+                "auto* pkt = pkt_alloc_tx()",
+                "auto* payload = pkt->put(len)",
+                "std::memcpy(payload, buf, len)",
+            ],
+            f"{name} oversize guard before packet copy",
+        )
+
+    sendto = function_body(source, "udp_sendto")
+    require_order(
+        sendto,
+        [
+            "if (!socket_parse_sockaddr_v4(addr_raw, addr_len, &ip, &port))",
+            "if (udp_payload_too_large(len))",
+            "return -EMSGSIZE",
+            "if (sock->local_v4.port == 0)",
+        ],
+        "UDP sendto oversize rejection before auto-bind",
+    )
+
+
 def test_udp_receive_preserves_datagram_boundaries() -> None:
     source = UDP_CPP.read_text()
     if "struct UdpRecvRecord" not in source:
@@ -315,6 +355,7 @@ def main() -> None:
     test_so_bindtodevice_stores_ifindex()
     test_udp_sendto_bound_device_tx_precedes_route_auto()
     test_udp_bind_port_zero_allocates_ephemeral_once()
+    test_udp_tx_rejects_oversize_before_packet_copy()
     test_udp_receive_preserves_datagram_boundaries()
     test_ipv4_forced_tx_preserves_requested_device()
     test_legacy_ipv4_ioctls_notify_wki_l3_state()

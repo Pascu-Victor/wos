@@ -2,10 +2,13 @@
 // Most tests avoid NICs, packet-pool initialization, and tasks; the lifetime
 // release test intentionally uses the real packet pool to guard pkt_free().
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <net/checksum.hpp>
 #include <net/packet.hpp>
+#include <net/proto/udp.hpp>
+#include <net/socket.hpp>
 #include <test/ktest.hpp>
 
 // ---------------------------------------------------------------------------
@@ -170,4 +173,46 @@ KTEST(Net, PacketBufferLifetimeReleaseRunsOnceAndClearsBeforeReuse) {
     ker::net::pkt_free(reused);
     KEXPECT_EQ(release_count, 1U);
     KEXPECT_EQ(ker::net::pkt_pool_free_count(), BASELINE_FREE);
+}
+
+KTEST(Net, UdpSendRejectsOversizeBeforePacketCopy) {
+    auto* ops = ker::net::proto::get_udp_proto_ops();
+    KEXPECT_NE(ops, nullptr);
+    if (ops == nullptr || ops->send == nullptr) {
+        return;
+    }
+
+    ker::net::Socket sock{};
+    sock.state = ker::net::SocketState::CONNECTED;
+    sock.local_v4.addr = 0x0A000001;
+    sock.local_v4.port = 1234;
+    sock.remote_v4.addr = 0x0A000002;
+    sock.remote_v4.port = 4321;
+
+    uint8_t one_byte = 0;
+    size_t const OVERSIZE = ker::net::PKT_BUF_SIZE - ker::net::PKT_HEADROOM + 1;
+    ssize_t const RET = ops->send(&sock, &one_byte, OVERSIZE, 0);
+    KEXPECT_EQ(RET, static_cast<ssize_t>(-EMSGSIZE));
+}
+
+KTEST(Net, UdpSendtoRejectsOversizeBeforeAutobindAndCopy) {
+    auto* ops = ker::net::proto::get_udp_proto_ops();
+    KEXPECT_NE(ops, nullptr);
+    if (ops == nullptr || ops->sendto == nullptr) {
+        return;
+    }
+
+    ker::net::Socket sock{};
+    uint8_t addr[ker::net::SOCKADDR_V4_LEN]{};
+    bool const FILLED = ker::net::socket_fill_sockaddr_v4(addr, sizeof(addr), nullptr, 0x0A000002, 4321);
+    KEXPECT_TRUE(FILLED);
+    if (!FILLED) {
+        return;
+    }
+
+    uint8_t one_byte = 0;
+    size_t const OVERSIZE = ker::net::PKT_BUF_SIZE - ker::net::PKT_HEADROOM + 1;
+    ssize_t const RET = ops->sendto(&sock, &one_byte, OVERSIZE, 0, addr, sizeof(addr));
+    KEXPECT_EQ(RET, static_cast<ssize_t>(-EMSGSIZE));
+    KEXPECT_EQ(sock.local_v4.port, static_cast<uint16_t>(0));
 }

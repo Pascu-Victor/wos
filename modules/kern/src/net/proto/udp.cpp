@@ -32,6 +32,8 @@ constexpr int SO_BINDTODEVICE = 25;
 constexpr int SOL_SOCKET_LEVEL = 1;
 constexpr int POLLIN = 0x001;
 constexpr int POLLOUT = 0x004;
+constexpr size_t UDP_MAX_PACKET_PAYLOAD =
+    std::min(PKT_BUF_SIZE - PKT_HEADROOM, static_cast<size_t>(UINT16_MAX) - sizeof(IPv4Header) - sizeof(UdpHeader));
 
 struct UdpBinding {
     Socket* sock = nullptr;
@@ -162,6 +164,8 @@ auto first_ipv4_or_any(NetDevice* dev) -> IPv4Address {
     return nif->ipv4_addrs.front().addr;
 }
 
+auto udp_payload_too_large(size_t len) -> bool { return len > UDP_MAX_PACKET_PAYLOAD; }
+
 auto udp_recvfrom(Socket* sock, void* buf, size_t len, int flags, void* addr_raw, size_t* addr_len) -> ssize_t;
 
 int udp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
@@ -208,6 +212,9 @@ auto udp_send(Socket* sock, const void* buf, size_t len, int /*unused*/) -> ssiz
     if (sock->state != SocketState::CONNECTED) {
         return -1;
     }
+    if (udp_payload_too_large(len)) {
+        return -EMSGSIZE;
+    }
     // Use connected destination
     auto* pkt = pkt_alloc_tx();
     if (pkt == nullptr) {
@@ -236,6 +243,9 @@ auto udp_sendto(Socket* sock, const void* buf, size_t len, int /*unused*/, const
     uint32_t ip = 0;
     if (!socket_parse_sockaddr_v4(addr_raw, addr_len, &ip, &port)) {
         return -1;
+    }
+    if (udp_payload_too_large(len)) {
+        return -EMSGSIZE;
     }
 
     // Auto-bind if not bound
