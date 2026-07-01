@@ -46,6 +46,12 @@ if(WOS_NATIVE_SYSTEM_BUILD AND NOT WOS_BUILD_DISK_IMAGES)
     message(STATUS "Native WOS build: disk image packaging is disabled; pass -DWOS_BUILD_DISK_IMAGES=ON when qemu-img and guestfish are available.")
 endif()
 
+set(WOS_BUILD_HOST_TOOLS_DEFAULT ON)
+if(NOT WOS_BUILD_WOSDBG AND NOT WOS_BUILD_LINUX_BENCHMARKS)
+    set(WOS_BUILD_HOST_TOOLS_DEFAULT OFF)
+endif()
+option(WOS_BUILD_HOST_TOOLS "Configure and build host-side WOS tools" ${WOS_BUILD_HOST_TOOLS_DEFAULT})
+
 if(WOS_USE_CCACHE AND NOT WOS_CCACHE_PROGRAM)
     find_program(WOS_CCACHE_PROGRAM NAMES ccache cccache)
 endif()
@@ -62,26 +68,32 @@ elseif(DEFINED ENV{CMAKE_BUILD_PARALLEL_LEVEL} AND "$ENV{CMAKE_BUILD_PARALLEL_LE
     set(WOS_TOOLS_BUILD_PARALLEL_ARGS --parallel $ENV{CMAKE_BUILD_PARALLEL_LEVEL})
 endif()
 
-ExternalProject_Add(wos_tools_build
-    SOURCE_DIR ${CMAKE_SOURCE_DIR}/tools
-    BINARY_DIR ${CMAKE_BINARY_DIR}/tools
-    CMAKE_ARGS
-        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-        -DCMAKE_BUILD_TYPE=${WOS_TOOLS_BUILD_TYPE}
-        -DWOS_BUILD_LINUX_BENCHMARKS=${WOS_BUILD_LINUX_BENCHMARKS}
-        -DWOS_BUILD_WOSDBG=${WOS_BUILD_WOSDBG}
-        ${WOS_TOOLS_CCACHE_CMAKE_ARGS}
-    BUILD_COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}/tools ${WOS_TOOLS_BUILD_PARALLEL_ARGS}
-    INSTALL_COMMAND ""
-)
+if(WOS_BUILD_HOST_TOOLS)
+    ExternalProject_Add(wos_tools_build
+        SOURCE_DIR ${CMAKE_SOURCE_DIR}/tools
+        BINARY_DIR ${CMAKE_BINARY_DIR}/tools
+        CMAKE_ARGS
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+            -DCMAKE_BUILD_TYPE=${WOS_TOOLS_BUILD_TYPE}
+            -DWOS_BUILD_LINUX_BENCHMARKS=${WOS_BUILD_LINUX_BENCHMARKS}
+            -DWOS_BUILD_WOSDBG=${WOS_BUILD_WOSDBG}
+            ${WOS_TOOLS_CCACHE_CMAKE_ARGS}
+        BUILD_COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}/tools ${WOS_TOOLS_BUILD_PARALLEL_ARGS}
+        INSTALL_COMMAND ""
+    )
 
-# Always run the build step
-ExternalProject_Add_StepTargets(wos_tools_build build)
-add_custom_target(wos_tools_build_always ALL
-    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}/tools ${WOS_TOOLS_BUILD_PARALLEL_ARGS}
-    DEPENDS wos_tools_build-build
-    COMMENT "Building WOS tools..."
-)
+    # Always run the build step
+    ExternalProject_Add_StepTargets(wos_tools_build build)
+    add_custom_target(wos_tools_build_always ALL
+        COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}/tools ${WOS_TOOLS_BUILD_PARALLEL_ARGS}
+        DEPENDS wos_tools_build-build
+        COMMENT "Building WOS tools..."
+    )
+else()
+    add_custom_target(wos_tools_build_always
+        COMMENT "Host-side WOS tools disabled."
+    )
+endif()
 
 project(wos NONE)
 

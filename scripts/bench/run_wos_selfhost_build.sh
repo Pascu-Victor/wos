@@ -976,6 +976,7 @@ configure_wos() {
         -S "$checkout" \
         -B "$checkout/$build_dir" \
         -DWOS_BUILD_WOSDBG=OFF \
+        -DWOS_BUILD_HOST_TOOLS=OFF \
         -DWOS_BUILD_CMAKE_FOR_HOST=OFF \
         -DWOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN=ON)
     if [ "$mode" = "wos" ]; then

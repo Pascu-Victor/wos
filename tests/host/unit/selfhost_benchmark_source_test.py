@@ -59,6 +59,7 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             "./tools/bootstrap.sh",
             "cmake -GNinja",
             "-DWOS_BUILD_WOSDBG=OFF",
+            "-DWOS_BUILD_HOST_TOOLS=OFF",
             "-DWOS_BUILD_CMAKE_FOR_HOST=OFF",
             "-DWOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN=ON",
             "-DWOS_BUILD_DISK_IMAGES=OFF",
