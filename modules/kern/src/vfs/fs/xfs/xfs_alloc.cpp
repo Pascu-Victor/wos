@@ -75,6 +75,10 @@ auto agfl_bno_usable(const XfsMountContext* mount, xfs_agblock_t bno) -> bool {
 // split up to its maximum depth.
 constexpr uint32_t XFS_AGFL_MIN = static_cast<uint32_t>(2 * XFS_BTREE_MAXLEVELS);
 
+auto same_free_extent(xfs_agblock_t lhs_start, xfs_extlen_t lhs_len, xfs_agblock_t rhs_start, xfs_extlen_t rhs_len) -> bool {
+    return lhs_start == rhs_start && lhs_len == rhs_len;
+}
+
 // Top up the AGFL for the given AG to at least XFS_AGFL_MIN blocks.
 // Called at the start of alloc_ag_by_size when the AGFL is running low,
 // BEFORE any cursor is opened on the free space trees.  This is the only
@@ -100,10 +104,25 @@ auto agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
             return 0;
         }
 
+        // Prove both free-space indexes agree before mutating either tree.
+        XfsBtreeCursor<XfsBnobtTraits> bno_cur;
+        bno_cur.mount = mount;
+        bno_cur.agno = agno;
+        XfsBnobtTraits::IRec const BNO_TARGET{.startblock = FOUND.startblock, .blockcount = FOUND.blockcount};
+        int rc = xfs_btree_lookup(&bno_cur, pag->agf_bno_root, pag->agf_bno_level, BNO_TARGET, XfsBtreeLookup::EQ);
+        if (rc != 0) {
+            return rc;
+        }
+
+        XfsBnobtTraits::IRec const BNO_FOUND = xfs_btree_get_rec(&bno_cur);
+        if (!same_free_extent(BNO_FOUND.startblock, BNO_FOUND.blockcount, FOUND.startblock, FOUND.blockcount)) {
+            return -EIO;
+        }
+
         // Delete from cntbt
         uint64_t new_cnt_root = pag->agf_cnt_root;
         uint8_t new_cnt_lvl = pag->agf_cnt_level;
-        int rc = xfs_btree_delete(&cur, tp);
+        rc = xfs_btree_delete(&cur, tp);
         if (rc != 0) {
             return rc;
         }
@@ -112,14 +131,6 @@ auto agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
         // fields are updated when we write the AGF below.
 
         // Delete from bnobt
-        XfsBtreeCursor<XfsBnobtTraits> bno_cur;
-        bno_cur.mount = mount;
-        bno_cur.agno = agno;
-        XfsBnobtTraits::IRec const BNO_TARGET{.startblock = FOUND.startblock, .blockcount = 0};
-        rc = xfs_btree_lookup(&bno_cur, pag->agf_bno_root, pag->agf_bno_level, BNO_TARGET, XfsBtreeLookup::GE);
-        if (rc != 0) {
-            return rc;
-        }
         rc = xfs_btree_delete(&bno_cur, tp);
         if (rc != 0) {
             return rc;
@@ -235,16 +246,20 @@ auto alloc_ag_by_hint(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
         return -ENOSPC;
     }
 
-    rc = xfs_btree_delete(&bno_cur, tp);
-    if (rc != 0) {
-        return rc;
-    }
-
     XfsBtreeCursor<XfsCntbtTraits> cnt_cur;
     cnt_cur.mount = mount;
     cnt_cur.agno = agno;
     XfsCntbtTraits::IRec const CNT_TARGET{.startblock = FOUND.startblock, .blockcount = FOUND.blockcount};
     rc = xfs_btree_lookup(&cnt_cur, pag->agf_cnt_root, pag->agf_cnt_level, CNT_TARGET, XfsBtreeLookup::EQ);
+    if (rc != 0) {
+        return rc;
+    }
+    XfsCntbtTraits::IRec const CNT_FOUND = xfs_btree_get_rec(&cnt_cur);
+    if (!same_free_extent(CNT_FOUND.startblock, CNT_FOUND.blockcount, FOUND.startblock, FOUND.blockcount)) {
+        return -EIO;
+    }
+
+    rc = xfs_btree_delete(&bno_cur, tp);
     if (rc != 0) {
         return rc;
     }
@@ -380,25 +395,34 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
 
     // ---- 1. Remove the old free extent from both cntbt and bnobt ----
 
-    // Delete from cntbt (cursor already positioned)
-    int delrc = xfs_btree_delete(&cur, tp);
-    if (delrc != 0) {
-        return delrc;
-    }
-
-    // Locate and delete from bnobt
+    // Prove the by-block tree has the exact same free extent before mutating
+    // either index. A GE lookup here may legally return the next extent; using
+    // that for deletion would turn index disagreement into block reuse.
     XfsBtreeCursor<XfsBnobtTraits> bno_cur;
     bno_cur.mount = mount;
     bno_cur.agno = agno;
 
     XfsBnobtTraits::IRec bno_target{};
     bno_target.startblock = FOUND.startblock;
-    bno_target.blockcount = 0;
+    bno_target.blockcount = FOUND.blockcount;
 
-    rc = xfs_btree_lookup(&bno_cur, pag->agf_bno_root, pag->agf_bno_level, bno_target, XfsBtreeLookup::GE);
+    rc = xfs_btree_lookup(&bno_cur, pag->agf_bno_root, pag->agf_bno_level, bno_target, XfsBtreeLookup::EQ);
     if (rc != 0) {
         return -EIO;  // Tree inconsistency
     }
+
+    XfsBnobtTraits::IRec const BNO_FOUND = xfs_btree_get_rec(&bno_cur);
+    if (!same_free_extent(BNO_FOUND.startblock, BNO_FOUND.blockcount, FOUND.startblock, FOUND.blockcount)) {
+        return -EIO;
+    }
+
+    // Delete from cntbt (cursor already positioned)
+    int delrc = xfs_btree_delete(&cur, tp);
+    if (delrc != 0) {
+        return delrc;
+    }
+
+    // Delete from bnobt
     delrc = xfs_btree_delete(&bno_cur, tp);
     if (delrc != 0) {
         return delrc;

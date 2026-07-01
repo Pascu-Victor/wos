@@ -182,11 +182,65 @@ def test_agfl_slot_updates_refresh_sector_crc() -> None:
     )
 
 
+def test_free_space_allocators_validate_dual_indexes_before_delete() -> None:
+    source = XFS_ALLOC.read_text()
+    agfl_body = function_body(source, "agfl_refill")
+    hint_body = function_body(source, "alloc_ag_by_hint")
+    size_body = function_body(source, "alloc_ag_by_size")
+
+    require(source, "auto same_free_extent(", "free-space tree identity helper")
+
+    require_order(
+        agfl_body,
+        [
+            "BNO_TARGET{.startblock = FOUND.startblock, .blockcount = FOUND.blockcount}",
+            "XfsBtreeLookup::EQ",
+            "same_free_extent(BNO_FOUND.startblock, BNO_FOUND.blockcount, FOUND.startblock, FOUND.blockcount)",
+            "rc = xfs_btree_delete(&cur, tp);",
+            "rc = xfs_btree_delete(&bno_cur, tp);",
+        ],
+        "AGFL refill must validate bnobt before deleting either free-space record",
+    )
+
+    require_order(
+        hint_body,
+        [
+            "CNT_TARGET{.startblock = FOUND.startblock, .blockcount = FOUND.blockcount}",
+            "XfsBtreeLookup::EQ",
+            "same_free_extent(CNT_FOUND.startblock, CNT_FOUND.blockcount, FOUND.startblock, FOUND.blockcount)",
+            "rc = xfs_btree_delete(&bno_cur, tp);",
+            "rc = xfs_btree_delete(&cnt_cur, tp);",
+        ],
+        "hint allocation must validate cntbt before deleting either free-space record",
+    )
+
+    bnobt_probe = size_body[
+        size_body.find("XfsBnobtTraits::IRec bno_target{};") : size_body.find("// Delete from cntbt")
+    ]
+    require_absent(
+        bnobt_probe,
+        "XfsBtreeLookup::GE",
+        "size allocation must not use nearest-greater bnobt lookup for free-space deletion",
+    )
+    require_order(
+        size_body,
+        [
+            "bno_target.blockcount = FOUND.blockcount;",
+            "XfsBtreeLookup::EQ",
+            "same_free_extent(BNO_FOUND.startblock, BNO_FOUND.blockcount, FOUND.startblock, FOUND.blockcount)",
+            "int delrc = xfs_btree_delete(&cur, tp);",
+            "delrc = xfs_btree_delete(&bno_cur, tp);",
+        ],
+        "size allocation must validate exact bnobt extent before deleting either free-space record",
+    )
+
+
 def main() -> None:
     test_btree_updates_refresh_crc_before_logging()
     test_btree_insert_delete_refresh_crc_before_logging()
     test_btree_split_key_propagation_is_buffer_safe()
     test_agfl_slot_updates_refresh_sector_crc()
+    test_free_space_allocators_validate_dual_indexes_before_delete()
     print("XFS metadata CRC source invariants hold")
 
 
