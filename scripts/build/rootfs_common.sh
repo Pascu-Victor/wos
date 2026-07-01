@@ -12,6 +12,32 @@ ROOTFS_BUILD_DIR="${WOS_BUILD_DIR:-build}"
 ROOTFS_SYSROOT_DIR="${WOS_SYSROOT_PATH:-}"
 ROOTFS_BUSYBOX_INSTALL_DIR="${WOS_BUSYBOX_INSTALL_DIR:-}"
 
+rootfs_default_staging_parent() {
+    local repo="$1"
+    local build_dir="$ROOTFS_BUILD_DIR"
+
+    case "$build_dir" in
+        /*)
+            printf '%s/rootfs-staging\n' "${build_dir%/}"
+            ;;
+        *)
+            printf '%s/%s/rootfs-staging\n' "$repo" "${build_dir%/}"
+            ;;
+    esac
+}
+
+rootfs_make_staging_dir() {
+    local repo="$1"
+    local base="${WOS_ROOTFS_STAGING_TMPDIR:-}"
+
+    if [ -z "$base" ]; then
+        base="$(rootfs_default_staging_parent "$repo")"
+    fi
+
+    mkdir -p "$base"
+    mktemp -d "$base/staging.XXXXXX"
+}
+
 rootfs_record_managed_path() {
     printf '%s\n' "$1" >> "$ROOTFS_MANAGED_TMP"
 }
@@ -37,6 +63,8 @@ rootfs_copy_entry() {
     local target="$2"
     local mode="${3:-}"
     local resolved
+    local target_path
+    local target_parent
 
     resolved=$(rootfs_resolve_source "$source")
     if [ ! -e "$resolved" ]; then
@@ -44,7 +72,13 @@ rootfs_copy_entry() {
     fi
 
     mkdir -p "$ROOTFS_STAGING$(dirname "$target")"
-    cp -a "$resolved" "$ROOTFS_STAGING$target"
+    target_path="$ROOTFS_STAGING$target"
+    target_parent="$(dirname "$target_path")"
+    if [ -z "$mode" ] && [ "$(stat -c %d "$resolved" 2>/dev/null || true)" = "$(stat -c %d "$target_parent" 2>/dev/null || true)" ]; then
+        cp -al "$resolved" "$target_path" 2>/dev/null || cp -a "$resolved" "$target_path"
+    else
+        cp -a "$resolved" "$target_path"
+    fi
     if [ -n "$mode" ]; then
         chmod "$mode" "$ROOTFS_STAGING$target"
     fi

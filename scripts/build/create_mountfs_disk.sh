@@ -51,8 +51,10 @@ PART_SIZE_MIB=102400
 SECTOR_SIZE=512
 PART_END_SECTOR=$((PART_START_SECTOR + (PART_SIZE_MIB * 1024 * 1024 / SECTOR_SIZE) - 1))
 
-# Build a staging directory with the rootfs layout
-STAGING=$(mktemp -d)
+# Build a staging directory with the rootfs layout.  Keep it under the build
+# tree by default so rootfs_common.sh can hardlink-copy source trees instead of
+# duplicating large sysroot directories through /tmp.
+STAGING=$(rootfs_make_staging_dir "$CWD")
 STAGING_TAR="$STAGING.tar"
 trap 'rm -rf "$STAGING"; rm -f "$STAGING_TAR"; wos_qcow_cleanup_libguestfs_env' EXIT
 

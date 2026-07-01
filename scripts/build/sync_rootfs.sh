@@ -24,8 +24,10 @@ wos_qcow_validate_for_update "$DISK" "sync rootfs delta into qcow image"
 
 echo "Syncing rootfs delta into $DISK..."
 
-# Build a staging directory with only the files that need updating
-STAGING=$(mktemp -d)
+# Build a staging directory with only the files that need updating.  Keep it
+# under the build tree by default so rootfs_common.sh can hardlink-copy source
+# trees instead of duplicating large sysroot directories through /tmp.
+STAGING=$(rootfs_make_staging_dir "$CWD")
 STAGING_TAR="$STAGING.tar"
 trap 'rm -rf "$STAGING"; rm -f "$STAGING_TAR"; wos_qcow_cleanup_libguestfs_env' EXIT
 
