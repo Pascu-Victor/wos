@@ -67,7 +67,8 @@ TARGET_CXX_FLAGS="$TARGET_COMMON_FLAGS -std=c++23 -isystem $TARGET_SYSROOT/inclu
 TARGET_LINK_FLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
 TARGET_CXX_STANDARD_LIBRARIES="-lc++ -lc++abi -lunwind -lm -lpthread -ldl -lrt -lc"
 
-cmake -S "$LLVM_SRC" -B "$CLANG_BUILD" -G Ninja \
+wos_timed_step "configure" "clang_for_wos" \
+    cmake -S "$LLVM_SRC" -B "$CLANG_BUILD" -G Ninja \
     "${WOS_CCACHE_CMAKE_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$TARGET_SYSROOT/usr" \
@@ -237,7 +238,8 @@ if [ "${#WOS_LLVM_BIN_OUTPUTS[@]}" -eq 0 ]; then
     exit 1
 fi
 
-ninja -C "$CLANG_BUILD" -j"$WOS_NINJA_JOBS" "${WOS_LLVM_BIN_OUTPUTS[@]}"
+wos_timed_step "build" "clang_for_wos" \
+    ninja -C "$CLANG_BUILD" -j"$WOS_NINJA_JOBS" "${WOS_LLVM_BIN_OUTPUTS[@]}"
 
 should_stage_wos_llvm_tool() {
     local name="$1"

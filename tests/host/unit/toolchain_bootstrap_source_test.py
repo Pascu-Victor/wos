@@ -847,6 +847,8 @@ def test_ninja_port_build_scripts_use_ninja_job_helper() -> None:
         [
             'WOS_LLVM_PARALLEL_LINK_JOBS="${WOS_LLVM_PARALLEL_LINK_JOBS:-$WOS_NINJA_JOBS}"',
             "WOS_LLVM_PARALLEL_LINK_JOBS must be a positive integer",
+            'wos_timed_step "configure" "clang_for_wos"',
+            'wos_timed_step "build" "clang_for_wos"',
             '-DLLVM_PARALLEL_LINK_JOBS="$WOS_LLVM_PARALLEL_LINK_JOBS"',
         ],
         "native WOS clang LLVM link parallelism",
