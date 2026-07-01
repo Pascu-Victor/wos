@@ -1,0 +1,2 @@
+# System GNU Readline defaults for WOS interactive shells.
+"\e[3~": delete-char
