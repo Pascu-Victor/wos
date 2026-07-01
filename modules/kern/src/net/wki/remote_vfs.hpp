@@ -232,6 +232,9 @@ void wki_remote_vfs_unmount(const char* local_mount_path);
 // Consumer side: find the current mount path for a mounted remote VFS resource.
 auto wki_remote_vfs_find_mount_for_resource(uint16_t owner_node, uint32_t resource_id, char* out, size_t out_size) -> bool;
 
+// Consumer side: find the mounted remote VFS resource currently bound at a path.
+auto wki_remote_vfs_find_resource_for_mount(uint16_t owner_node, const char* local_mount_path, uint32_t* resource_id_out) -> bool;
+
 // Consumer side: called from vfs_open() for FSType::REMOTE mounts
 auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode, void* mount_private_data) -> ker::vfs::File*;
 

@@ -4621,6 +4621,29 @@ auto wki_remote_vfs_find_mount_for_resource(uint16_t owner_node, uint32_t resour
     return false;
 }
 
+auto wki_remote_vfs_find_resource_for_mount(uint16_t owner_node, const char* local_mount_path, uint32_t* resource_id_out) -> bool {
+    if (local_mount_path == nullptr || resource_id_out == nullptr) {
+        return false;
+    }
+
+    s_vfs_lock.lock();
+    for (auto& proxy : g_vfs_proxies) {
+        if (!proxy->active || proxy->owner_node != owner_node) {
+            continue;
+        }
+        if (std::strncmp(proxy->local_mount_path.data(), local_mount_path, proxy->local_mount_path.size()) != 0) {
+            continue;
+        }
+
+        *resource_id_out = proxy->resource_id;
+        s_vfs_lock.unlock();
+        return true;
+    }
+    s_vfs_lock.unlock();
+
+    return false;
+}
+
 auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode, void* mount_private_data) -> ker::vfs::File* {
     auto* state = static_cast<ProxyVfsState*>(mount_private_data);
     if (state == nullptr || !state->active || fs_relative_path == nullptr) {

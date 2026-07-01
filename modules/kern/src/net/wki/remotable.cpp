@@ -850,6 +850,14 @@ void wki_remotable_process_pending_mounts() {
                 }
 
                 wki_remote_vfs_unmount(existing_mount_path.data());
+            } else {
+                uint32_t mounted_resource_id = 0;
+                if (wki_remote_vfs_find_resource_for_mount(pending.node_id, pending.mount_path.data(), &mounted_resource_id) &&
+                    mounted_resource_id != pending.resource_id) {
+                    log::debug("Replacing VFS auto-mount: node=0x%04x path=%s old_res_id=%u new_res_id=%u", pending.node_id,
+                               pending.mount_path.data(), mounted_resource_id, pending.resource_id);
+                    wki_remote_vfs_unmount(pending.mount_path.data());
+                }
             }
 
             // Create intermediate directories (/wki/<hostname>)
