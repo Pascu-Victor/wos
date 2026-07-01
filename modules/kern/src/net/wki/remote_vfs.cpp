@@ -1389,6 +1389,15 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
     return normalize_proxy_status_for_errno(STATUS);
 }
 
+void remote_vfs_close_remote_fd_best_effort(ProxyVfsState* state, int32_t remote_fd) {
+    if (state == nullptr || remote_fd < 0) {
+        return;
+    }
+
+    static_cast<void>(
+        vfs_proxy_send_and_wait(state, OP_VFS_CLOSE, reinterpret_cast<const uint8_t*>(&remote_fd), sizeof(remote_fd), nullptr, 0));
+}
+
 auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, uint16_t req_data_len) -> int {
     if (state == nullptr) {
         return -EINVAL;
@@ -4722,12 +4731,14 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
     // Allocate File + RemoteFileContext
     auto* file = new (std::nothrow) ker::vfs::File{};
     if (file == nullptr) {
+        remote_vfs_close_remote_fd_best_effort(state, open_resp.fd);
         return nullptr;
     }
 
     auto* ctx = new (std::nothrow) RemoteFileContext{};
     if (ctx == nullptr) {
         delete file;
+        remote_vfs_close_remote_fd_best_effort(state, open_resp.fd);
         return nullptr;
     }
 

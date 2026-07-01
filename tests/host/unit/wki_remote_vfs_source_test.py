@@ -220,6 +220,48 @@ def test_shared_io_callers_timeout_or_fallback() -> None:
     )
 
 
+def test_remote_open_closes_server_fd_on_local_allocation_failure() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    helper_body = function_body(source, "remote_vfs_close_remote_fd_best_effort")
+    open_body = function_body(source, "wki_remote_vfs_open_path")
+
+    require_order(
+        helper_body,
+        [
+            "if (state == nullptr || remote_fd < 0)",
+            "return",
+            "vfs_proxy_send_and_wait(state, OP_VFS_CLOSE",
+            "reinterpret_cast<const uint8_t*>(&remote_fd)",
+            "sizeof(remote_fd)",
+            "nullptr, 0",
+        ],
+        "remote open cleanup close helper",
+    )
+    require_order(
+        open_body,
+        [
+            "auto* file = new (std::nothrow) ker::vfs::File{}",
+            "if (file == nullptr)",
+            "remote_vfs_close_remote_fd_best_effort(state, open_resp.fd)",
+            "return nullptr",
+            "auto* ctx = new (std::nothrow) RemoteFileContext{}",
+        ],
+        "remote open closes fd when File allocation fails",
+    )
+    require_order(
+        open_body,
+        [
+            "auto* ctx = new (std::nothrow) RemoteFileContext{}",
+            "if (ctx == nullptr)",
+            "delete file",
+            "remote_vfs_close_remote_fd_best_effort(state, open_resp.fd)",
+            "return nullptr",
+            "ctx->proxy = state",
+        ],
+        "remote open closes fd when context allocation fails",
+    )
+
+
 def test_rdma_retry_cooldowns_are_saturating() -> None:
     source = REMOTE_VFS_CPP.read_text()
     body = function_body(source, "remote_vfs_rdma_note_transient_failure")
@@ -309,6 +351,7 @@ def main() -> None:
     test_proxy_operations_fail_before_setup_when_slot_wait_times_out()
     test_shared_io_slot_waits_are_bounded()
     test_shared_io_callers_timeout_or_fallback()
+    test_remote_open_closes_server_fd_on_local_allocation_failure()
     test_rdma_retry_cooldowns_are_saturating()
     test_vfs_attach_ack_requires_expected_cookie_before_completion()
     print("WKI remote VFS source invariants hold")
