@@ -56,6 +56,7 @@ def main() -> None:
     leaf_find_data = function_body(source, "auto dir2_leaf_node_find_data_entry")
     leaf_find_free = function_body(source, "auto dir2_leaf_node_find_free_region")
     free_region = function_body(source, "auto dir2_find_free_region")
+    sf_to_block = function_body(source, "auto dir2_sf_to_block")
     block_add = function_body(source, "auto dir2_block_addname")
     block_remove = function_body(source, "auto dir2_block_removename")
     leaf_add = function_body(source, "auto dir2_leaf_node_addname")
@@ -132,6 +133,19 @@ def main() -> None:
     require(source, "dir2_make_data_free(ctx, new_data, DATA_START, BLKSIZE, DATA_START, BLKSIZE - DATA_START)", "spare data block")
     require(source, "dp->size = 2ULL * static_cast<uint64_t>(ctx->dir_blk_size)", "data block count update")
     require(source, "dp->data_fork.extents.capacity = 1", "shortform extent capacity initialization")
+    require(sf_to_block, "xfs_trans_log_buf_full(tp, bh);", "shortform conversion logs initialized block")
+    require_order(
+        sf_to_block,
+        "hdr3->hdr.crc = Be32::from_cpu(CRC);",
+        "xfs_trans_log_buf_full(tp, bh);",
+        "shortform conversion logs after final crc",
+    )
+    require_order(
+        sf_to_block,
+        "xfs_trans_log_buf_full(tp, bh);",
+        "brelse(bh);",
+        "shortform conversion logs before releasing buffer",
+    )
     require(source, "auto dir2_leaf_ensure_stale_slot(XfsMountContext const* ctx, XfsDir3LeafHdr* hdr) -> int", "leaf slot growth")
     require(source, "auto dir2_leaf_preflight_index_slot(XfsMountContext const* ctx, const XfsDir3LeafHdr* hdr) -> int", "leaf slot preflight")
     require(source, "auto dir2_count_stale_leaf_entries(const XfsDir2LeafEntry* entries, size_t count) -> size_t", "actual stale count")

@@ -562,6 +562,47 @@ auto dir2_db_to_fsbno(const XfsMountContext* ctx, xfs_dir2_db_t db) -> xfs_fileo
     return static_cast<xfs_fileoff_t>(db) << ctx->dir_blk_log;
 }
 
+void dir2_log_bad_magic(const char* where, XfsInode* dp, xfs_dir2_db_t db, BufHead* bh, uint32_t magic) {
+    if (where == nullptr || dp == nullptr || dp->mount == nullptr) {
+        mod::dbg::logger<"xfs">::error("dir bad magic: where=%s magic=0x%x", where != nullptr ? where : "<null>", magic);
+        return;
+    }
+
+    XfsMountContext* ctx = dp->mount;
+    xfs_fileoff_t const FILE_BLOCK = dir2_db_to_fsbno(ctx, db);
+    XfsBmapResult bmap{};
+    int const BMAP_RC = xfs_bmap_lookup(dp, FILE_BLOCK, &bmap);
+    uint32_t const FORK_EXTENTS = dp->data_fork.format == XFS_DINODE_FMT_EXTENTS ? dp->data_fork.extents.count : 0;
+
+    uint8_t b0 = 0;
+    uint8_t b1 = 0;
+    uint8_t b2 = 0;
+    uint8_t b3 = 0;
+    uint8_t b4 = 0;
+    uint8_t b5 = 0;
+    uint8_t b6 = 0;
+    uint8_t b7 = 0;
+    if (bh != nullptr && bh->data != nullptr && bh->size >= 8) {
+        b0 = bh->data[0];
+        b1 = bh->data[1];
+        b2 = bh->data[2];
+        b3 = bh->data[3];
+        b4 = bh->data[4];
+        b5 = bh->data[5];
+        b6 = bh->data[6];
+        b7 = bh->data[7];
+    }
+
+    mod::dbg::logger<"xfs">::error(
+        "dir bad magic: where=%s magic=0x%x ino=%lu db=%u file_block=%lu bmap_rc=%d hole=%d start=%lu len=%lu bh_dev_block=%lu "
+        "bh_size=%lu fmt=%d nextents=%u fork_extents=%u nblocks=%lu isize=%lu bytes=%02x %02x %02x %02x %02x %02x %02x %02x",
+        where, magic, static_cast<unsigned long>(dp->ino), static_cast<unsigned int>(db), static_cast<unsigned long>(FILE_BLOCK), BMAP_RC,
+        BMAP_RC == 0 && bmap.is_hole ? 1 : 0, BMAP_RC == 0 ? static_cast<unsigned long>(bmap.startblock) : 0UL,
+        BMAP_RC == 0 ? static_cast<unsigned long>(bmap.blockcount) : 0UL, bh != nullptr ? static_cast<unsigned long>(bh->block_no) : 0UL,
+        bh != nullptr ? static_cast<unsigned long>(bh->size) : 0UL, static_cast<int>(dp->data_fork.format), dp->nextents, FORK_EXTENTS,
+        static_cast<unsigned long>(dp->nblocks), static_cast<unsigned long>(dp->size), b0, b1, b2, b3, b4, b5, b6, b7);
+}
+
 // Read a directory block (may span multiple fs blocks if dir_blk_log > 0)
 auto dir2_read_block(XfsInode* dp, xfs_dir2_db_t db, BufHead** bhp) -> int {
     XfsMountContext* ctx = dp->mount;
@@ -610,16 +651,18 @@ auto dir2_is_single_block_dir(XfsInode* dp) -> bool {
 
     const auto* hdr = reinterpret_cast<const XfsDir3DataHdr*>(bh->data);
     uint32_t const MAGIC = hdr->hdr.magic.to_cpu();
-    brelse(bh);
 
     if (MAGIC == XFS_DIR3_BLOCK_MAGIC) {
+        brelse(bh);
         return true;
     }
     if (MAGIC == XFS_DIR3_DATA_MAGIC) {
+        brelse(bh);
         return false;
     }
 
-    mod::dbg::logger<"xfs">::error("dir format detect: unexpected magic 0x%x", MAGIC);
+    dir2_log_bad_magic("format-detect", dp, 0, bh, MAGIC);
+    brelse(bh);
     return dp->size <= dp->mount->dir_blk_size;
 }
 
@@ -827,7 +870,7 @@ auto dir2_block_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirE
     const auto* hdr = reinterpret_cast<const XfsDir3DataHdr*>(block);
     uint32_t const MAGIC = hdr->hdr.magic.to_cpu();
     if (MAGIC != XFS_DIR3_BLOCK_MAGIC) {
-        mod::dbg::logger<"xfs">::error("dir block: bad magic 0x%x", MAGIC);
+        dir2_log_bad_magic("block-lookup", dp, 0, bh, MAGIC);
         brelse(bh);
         return -EINVAL;
     }
@@ -1005,7 +1048,7 @@ auto dir2_scan_data_block(XfsInode* dp, xfs_dir2_db_t db, XfsDirIterFn fn, void*
     const auto* hdr = reinterpret_cast<const XfsDir3DataHdr*>(block);
     uint32_t const MAGIC = hdr->hdr.magic.to_cpu();
     if (MAGIC != XFS_DIR3_DATA_MAGIC && MAGIC != XFS_DIR3_BLOCK_MAGIC) {
-        mod::dbg::logger<"xfs">::error("dir data block: bad magic 0x%x", MAGIC);
+        dir2_log_bad_magic("data-scan", dp, db, bh, MAGIC);
         brelse(bh);
         return -EINVAL;
     }
@@ -2279,6 +2322,7 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
     // The transaction owns a reference until commit, so the follow-up
     // dir2_block_addname read in this same transaction can reuse the cached
     // exact-span buffer. Commit dirties it only after the log write.
+    xfs_trans_log_buf_full(tp, bh);
     brelse(bh);
 
     delete[] leaves;
