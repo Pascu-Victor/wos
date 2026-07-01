@@ -109,6 +109,7 @@ set(WOS_MLIBC_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/mlibc-build" CACHE PATH "
 set(WOS_LIBCXX_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/libcxx-build" CACHE PATH "libc++ build directory")
 set(WOS_BUSYBOX_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/busybox-build" CACHE PATH "BusyBox build directory")
 set(WOS_BUSYBOX_INSTALL_DIR "${CMAKE_SOURCE_DIR}/toolchain/busybox-install" CACHE PATH "BusyBox install staging directory")
+set(WOS_BUSYBOX_CONFIG "${CMAKE_SOURCE_DIR}/configs/busybox/wos_full.config" CACHE FILEPATH "Resolved BusyBox WOS config")
 set(WOS_DROPBEAR_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/dropbear-build" CACHE PATH "Dropbear build directory")
 set(WOS_MAKE_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/make-build" CACHE PATH "GNU make build directory")
 set(WOS_MAKE_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/make" CACHE PATH "GNU make source directory")
@@ -283,11 +284,12 @@ else()
                 WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                 WOS_BUSYBOX_BUILD_DIR=${WOS_BUSYBOX_BUILD_DIR}
                 WOS_BUSYBOX_INSTALL_DIR=${WOS_BUSYBOX_INSTALL_DIR}
+                WOS_BUSYBOX_CONFIG=${WOS_BUSYBOX_CONFIG}
                 ${WOS_BUILD_SCRIPTS_DIR}/build_busybox.sh
         COMMAND ${CMAKE_COMMAND} -E touch ${BUSYBOX_STAMP}
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         COMMENT "Building busybox..."
-        DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/build_busybox.sh ${BUSYBOX_SOURCES} ${MLIBC_STAMP} ${LIBCXX_STAMP}
+        DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/build_busybox.sh ${WOS_BUSYBOX_CONFIG} ${BUSYBOX_SOURCES} ${MLIBC_STAMP} ${LIBCXX_STAMP}
     )
     add_custom_target(busybox DEPENDS ${BUSYBOX_STAMP})
 endif()

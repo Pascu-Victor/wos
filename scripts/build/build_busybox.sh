@@ -21,9 +21,9 @@ HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
 TARGET_SYSROOT="${WOS_SYSROOT_PATH:-$B/sysroot}"
 BB_BUILD="${WOS_BUSYBOX_BUILD_DIR:-$B/busybox-build}"
 BB_INSTALL="${WOS_BUSYBOX_INSTALL_DIR:-$B/busybox-install}"
+BB_CONFIG="${WOS_BUSYBOX_CONFIG:-$WORKSPACE_ROOT/configs/busybox/wos_full.config}"
 BB_SHARED_DIR="$BB_BUILD/0_lib"
 BB_KBUILD_TOOLS="$BB_BUILD/wos-kbuild-tools"
-BB_OLDCONFIG_DEFAULTS="$BB_BUILD/wos-oldconfig-defaults.in"
 
 BB_SRC="$B/src/busybox"
 if [ ! -d "$BB_SRC" ]; then
@@ -121,62 +121,9 @@ if [ "$HOST_SYSTEM" = "WOS" ] && [ -x /bin/bash ]; then
     BB_MAKE_SHELL_ARGS=(SHELL=/bin/bash CONFIG_SHELL=/bin/bash)
 fi
 
-merge_busybox_config() {
-    local config="$1"
-    local overlay="$2"
-    local line sym val
-
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            "")
-                continue
-                ;;
-            \#\ CONFIG_*\ is\ not\ set)
-                sym="${line#\# CONFIG_}"
-                sym="${sym% is not set}"
-                if grep -qE "^CONFIG_${sym}=|^# CONFIG_${sym} is not set$" "$config"; then
-                    sed -i -E "s|^CONFIG_${sym}=.*$|# CONFIG_${sym} is not set|; s|^# CONFIG_${sym} is not set$|# CONFIG_${sym} is not set|" "$config"
-                else
-                    printf '# CONFIG_%s is not set\n' "$sym" >> "$config"
-                fi
-                ;;
-            \#*)
-                continue
-                ;;
-            CONFIG_*=*)
-                sym="${line%%=*}"
-                val="${line#*=}"
-                if grep -qE "^${sym}=|^# ${sym} is not set$" "$config"; then
-                    sed -i -E "s|^${sym}=.*$|${sym}=${val}|; s|^# ${sym} is not set$|${sym}=${val}|" "$config"
-                else
-                    printf '%s=%s\n' "$sym" "$val" >> "$config"
-                fi
-                ;;
-        esac
-    done < "$overlay"
-}
-
 busybox_config_enabled() {
     local sym="$1"
     grep -q "^${sym}=y$" "$BB_BUILD/.config"
-}
-
-generate_busybox_oldconfig_defaults() {
-    local count="${WOS_BUSYBOX_OLDCONFIG_DEFAULT_LINES:-4096}"
-    local i=0
-
-    case "$count" in
-        ''|*[!0-9]*|0)
-            echo "ERROR: WOS_BUSYBOX_OLDCONFIG_DEFAULT_LINES must be a positive integer, got '$count'" >&2
-            return 1
-            ;;
-    esac
-
-    : > "$BB_OLDCONFIG_DEFAULTS"
-    while [ "$i" -lt "$count" ]; do
-        printf '\n' >> "$BB_OLDCONFIG_DEFAULTS"
-        i=$((i + 1))
-    done
 }
 
 setup_busybox_kbuild_tools() {
@@ -274,44 +221,29 @@ PY
 
 setup_busybox_kbuild_tools
 
-# Re-apply config from wos_defconfig to stay in sync.
-if [ -f "$BB_SRC/configs/wos_defconfig" ]; then
-    rm -f "$BB_BUILD/.config"
+if [ ! -f "$BB_CONFIG" ]; then
+    echo "ERROR: BusyBox WOS full config not found at $BB_CONFIG" >&2
+    exit 1
+fi
+
+if [ ! -f "$BB_BUILD/Makefile" ]; then
     if ! wos_make "$WOS_MAKE_JOBS" -C "$BB_SRC" O="$BB_BUILD" \
-        CC="$BB_CC" \
-        AR="$BB_AR" \
-        STRIP="$BB_STRIP" \
-        RANLIB="$BB_RANLIB" \
-        OBJCOPY="$BB_OBJCOPY" \
-        NM="$BB_NM" \
-        HOSTCC="$BB_HOSTCC" \
-        CFLAGS="$BB_CFLAGS" \
-        LDFLAGS="$BB_LDFLAGS" \
         "${BB_MAKE_SHELL_ARGS[@]}" \
-        allnoconfig >/tmp/busybox_allnoconfig.log 2>&1; then
-        cat /tmp/busybox_allnoconfig.log
+        outputmakefile >/tmp/busybox_outputmakefile.log 2>&1; then
+        cat /tmp/busybox_outputmakefile.log
         exit 1
     fi
+fi
 
-    merge_busybox_config "$BB_BUILD/.config" "$BB_SRC/configs/wos_defconfig"
-
-    generate_busybox_oldconfig_defaults
-    if ! wos_make "$WOS_MAKE_JOBS" -C "$BB_SRC" O="$BB_BUILD" \
-        CC="$BB_CC" \
-        AR="$BB_AR" \
-        STRIP="$BB_STRIP" \
-        RANLIB="$BB_RANLIB" \
-        OBJCOPY="$BB_OBJCOPY" \
-        NM="$BB_NM" \
-        HOSTCC="$BB_HOSTCC" \
-        CFLAGS="$BB_CFLAGS" \
-        LDFLAGS="$BB_LDFLAGS" \
-        "${BB_MAKE_SHELL_ARGS[@]}" \
-        oldconfig < "$BB_OLDCONFIG_DEFAULTS" >/tmp/busybox_oldconfig.log 2>&1; then
-        cat /tmp/busybox_oldconfig.log
-        exit 1
-    fi
-    rm -f "$BB_OLDCONFIG_DEFAULTS"
+# Keep first-run WOS bootstrap out of BusyBox's interactive Kconfig path. This
+# full config is generated from the project WOS defconfig and matches the
+# resolved config produced by the previous allnoconfig+oldconfig flow.
+tmp_config="$BB_BUILD/.config.wos"
+cp "$BB_CONFIG" "$tmp_config"
+if [ ! -f "$BB_BUILD/.config" ] || ! cmp -s "$tmp_config" "$BB_BUILD/.config"; then
+    mv "$tmp_config" "$BB_BUILD/.config"
+else
+    rm -f "$tmp_config"
 fi
 
 # Force relink if any sysroot library is newer than the binary

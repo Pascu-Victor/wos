@@ -1500,6 +1500,7 @@ def test_busybox_and_dropbear_scripts_honor_host_toolchain_override() -> None:
             "BB_MAKE_SHELL_ARGS=()",
             "BB_MAKE_SHELL_ARGS=(SHELL=/bin/bash CONFIG_SHELL=/bin/bash)",
             'BB_INSTALL="${WOS_BUSYBOX_INSTALL_DIR:-$B/busybox-install}"',
+            'BB_CONFIG="${WOS_BUSYBOX_CONFIG:-$WORKSPACE_ROOT/configs/busybox/wos_full.config}"',
         ],
         "BusyBox WOS build script host-toolchain override",
     )
@@ -1510,16 +1511,16 @@ def test_busybox_and_dropbear_scripts_honor_host_toolchain_override() -> None:
             "cleanup_busybox_kbuild_temps()",
             "setup_busybox_kbuild_tools()",
             'BB_KBUILD_TOOLS="$BB_BUILD/wos-kbuild-tools"',
-            'BB_OLDCONFIG_DEFAULTS="$BB_BUILD/wos-oldconfig-defaults.in"',
-            "generate_busybox_oldconfig_defaults()",
-            'WOS_BUSYBOX_OLDCONFIG_DEFAULT_LINES must be a positive integer',
             'if [ "$HOST_SYSTEM" != "WOS" ]; then',
             "#!/usr/bin/python3",
             'PATH="$BB_KBUILD_TOOLS:$PATH"',
             "setup_busybox_kbuild_tools",
-            "generate_busybox_oldconfig_defaults",
-            'oldconfig < "$BB_OLDCONFIG_DEFAULTS" >/tmp/busybox_oldconfig.log 2>&1',
-            'rm -f "$BB_OLDCONFIG_DEFAULTS"',
+            'BusyBox WOS full config not found at $BB_CONFIG',
+            'outputmakefile >/tmp/busybox_outputmakefile.log 2>&1',
+            'tmp_config="$BB_BUILD/.config.wos"',
+            'cp "$BB_CONFIG" "$tmp_config"',
+            'cmp -s "$tmp_config" "$BB_BUILD/.config"',
+            'mv "$tmp_config" "$BB_BUILD/.config"',
             '"${BB_MAKE_SHELL_ARGS[@]}"',
             'if [ "$HOST_SYSTEM" = "WOS" ]; then',
             'wos_make "$WOS_MAKE_JOBS" -C "$BB_BUILD" \\',
@@ -1532,6 +1533,17 @@ def test_busybox_and_dropbear_scripts_honor_host_toolchain_override() -> None:
         "BusyBox WOS install uses GNU Make jobserver policy",
     )
     assert 'yes "" | wos_make' not in busybox
+    assert " allnoconfig " not in busybox
+    assert " oldconfig " not in busybox
+    require_tokens(
+        ROOT_CMAKE.read_text(),
+        [
+            'set(WOS_BUSYBOX_CONFIG "${CMAKE_SOURCE_DIR}/configs/busybox/wos_full.config" CACHE FILEPATH "Resolved BusyBox WOS config")',
+            'WOS_BUSYBOX_CONFIG=${WOS_BUSYBOX_CONFIG}',
+            '${WOS_BUILD_SCRIPTS_DIR}/build_busybox.sh ${WOS_BUSYBOX_CONFIG} ${BUSYBOX_SOURCES}',
+        ],
+        "BusyBox full config CMake dependency",
+    )
     require_tokens(
         dropbear,
         [
