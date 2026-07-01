@@ -838,6 +838,8 @@ add_custom_command(
         ${WOS_BUILD_SCRIPTS_DIR}/create_mountfs_disk.sh
         ${WOS_BUILD_SCRIPTS_DIR}/qcow_common.sh
         ${WOS_BUILD_SCRIPTS_DIR}/rootfs_common.sh
+        ${WOS_BUILD_SCRIPTS_DIR}/rootfs_delta.py
+        ${WOS_BUILD_SCRIPTS_DIR}/rootfs_qcow_xfs_delta.py
         ${WOS_BUILD_SCRIPTS_DIR}/sync_rootfs.sh
         ${CMAKE_SOURCE_DIR}/configs/system.conf
         ${CMAKE_SOURCE_DIR}/configs/vfstab

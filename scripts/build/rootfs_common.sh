@@ -11,6 +11,13 @@ ROOTFS_CHANGED=0
 ROOTFS_BUILD_DIR="${WOS_BUILD_DIR:-build}"
 ROOTFS_SYSROOT_DIR="${WOS_SYSROOT_PATH:-}"
 ROOTFS_BUSYBOX_INSTALL_DIR="${WOS_BUSYBOX_INSTALL_DIR:-}"
+ROOTFS_CONTENT_MANIFEST="/etc/wos-rootfs-manifest.tsv"
+ROOTFS_MANIFEST_HASH_LIMIT_BYTES="${WOS_ROOTFS_MANIFEST_HASH_LIMIT_BYTES:-16777216}"
+case "$ROOTFS_MANIFEST_HASH_LIMIT_BYTES" in
+    ''|*[!0-9]*)
+        ROOTFS_MANIFEST_HASH_LIMIT_BYTES=16777216
+        ;;
+esac
 
 rootfs_default_staging_parent() {
     local repo="$1"
@@ -40,6 +47,56 @@ rootfs_make_staging_dir() {
 
 rootfs_record_managed_path() {
     printf '%s\n' "$1" >> "$ROOTFS_MANAGED_TMP"
+}
+
+rootfs_write_content_manifest() {
+    local manifest="$1"
+    local tmp
+
+    tmp=$(mktemp)
+    mkdir -p "$(dirname "$manifest")"
+
+    # Most large payloads are hardlinked into staging; track those by metadata
+    # so rootfs sync does not read gigabytes just to prove they are unchanged.
+    (
+        cd "$ROOTFS_STAGING"
+        find . -mindepth 1 ! -path ".${ROOTFS_CONTENT_MANIFEST}" -print0 | sort -z | while IFS= read -r -d '' entry; do
+            local hash
+            local identity
+            local identity_kind
+            local links
+            local mode
+            local mtime
+            local rel
+            local size
+            local target
+
+            rel="/${entry#./}"
+            if [ -L "$entry" ]; then
+                target=$(readlink "$entry")
+                printf '%s\tL\t\t\t\t%s\n' "$rel" "$target"
+            elif [ -d "$entry" ]; then
+                mode=$(stat -c %a "$entry")
+                printf '%s\tD\t%s\t\t\t\n' "$rel" "$mode"
+            elif [ -f "$entry" ]; then
+                mode=$(stat -c %a "$entry")
+                size=$(stat -c %s "$entry")
+                links=$(stat -c %h "$entry")
+                if [ "${WOS_ROOTFS_MANIFEST_FORCE_HASH:-0}" = "1" ] ||
+                   { [ "$links" -le 1 ] && [ "$size" -le "$ROOTFS_MANIFEST_HASH_LIMIT_BYTES" ]; }; then
+                    hash=$(sha256sum -b "$entry" | awk '{print $1}')
+                    identity="$hash"
+                    identity_kind="sha256"
+                else
+                    mtime=$(TZ=UTC0 stat -c %y "$entry")
+                    identity="$mtime"
+                    identity_kind="mtime"
+                fi
+                printf '%s\tF\t%s\t%s\t%s\t%s\n' "$rel" "$mode" "$size" "$identity" "$identity_kind"
+            fi
+        done
+    ) > "$tmp"
+    mv -f "$tmp" "$manifest"
 }
 
 rootfs_resolve_source() {
@@ -467,10 +524,11 @@ rootfs_stage_tree() {
     rootfs_stage_srv
     rootfs_stage_misc_dirs
     rootfs_finalize_usr_merge
+    rootfs_record_managed_path "$ROOTFS_CONTENT_MANIFEST"
     rootfs_record_managed_path "/etc/wos-managed-paths"
     rootfs_write_managed_paths
-
     rm -f "$ROOTFS_MANAGED_TMP"
+    rootfs_write_content_manifest "$ROOTFS_STAGING$ROOTFS_CONTENT_MANIFEST"
 }
 
 rootfs_remove_old_managed_paths() {

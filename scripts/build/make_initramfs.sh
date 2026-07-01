@@ -11,6 +11,8 @@ INIT_BINARY="$BUILD_DIR/modules/init/init"
 INITRAMFS_OUT="$BUILD_DIR/initramfs.cpio"
 ROOTFS_DISK="${WOS_ROOTFS_DISK:-mountfs.qcow2}"
 READELF="${WOS_READELF:-}"
+INITRAMFS_TMP=""
+INITRAMFS_MTIME="${SOURCE_DATE_EPOCH:-0}"
 
 # shellcheck source=scripts/build/qcow_common.sh
 source "$CWD/scripts/build/qcow_common.sh"
@@ -164,7 +166,7 @@ EOF
 
 # Create temporary directory for initramfs contents
 INITRAMFS_DIR=$(mktemp -d)
-trap 'rm -rf "$INITRAMFS_DIR"; wos_qcow_cleanup_libguestfs_env' EXIT
+trap 'rm -rf "$INITRAMFS_DIR"; test -z "$INITRAMFS_TMP" || rm -f "$INITRAMFS_TMP"; wos_qcow_cleanup_libguestfs_env' EXIT
 
 # Create directory structure
 mkdir -p "$INITRAMFS_DIR/sbin"
@@ -223,8 +225,25 @@ fi
 
 sync_rootfs_etc_tables
 
-# Create CPIO newc archive
+# Create CPIO newc archive. Normalize metadata so unchanged inputs produce the
+# same archive bytes and repeated builds can avoid replacing the output.
 mkdir -p "$(dirname "$INITRAMFS_OUT")"
-(cd "$INITRAMFS_DIR" && find . | cpio -o -H newc --quiet) > "$INITRAMFS_OUT"
+case "$INITRAMFS_MTIME" in
+    ''|*[!0-9]*)
+        INITRAMFS_MTIME=0
+        ;;
+esac
+find "$INITRAMFS_DIR" -exec touch -h -d "@$INITRAMFS_MTIME" {} +
+INITRAMFS_TMP=$(mktemp "$(dirname "$INITRAMFS_OUT")/.initramfs.cpio.XXXXXX")
+(cd "$INITRAMFS_DIR" && find . -print0 | sort -z | cpio -0 -o -H newc --reproducible --quiet) > "$INITRAMFS_TMP"
 
-echo "  initramfs: created $INITRAMFS_OUT ($(du -h "$INITRAMFS_OUT" | cut -f1))"
+if [ -f "$INITRAMFS_OUT" ] && cmp -s "$INITRAMFS_TMP" "$INITRAMFS_OUT"; then
+    rm -f "$INITRAMFS_TMP"
+    INITRAMFS_TMP=""
+    touch -c "$INITRAMFS_OUT"
+    echo "  initramfs: unchanged $INITRAMFS_OUT ($(du -h "$INITRAMFS_OUT" | cut -f1))"
+else
+    mv -f "$INITRAMFS_TMP" "$INITRAMFS_OUT"
+    INITRAMFS_TMP=""
+    echo "  initramfs: created $INITRAMFS_OUT ($(du -h "$INITRAMFS_OUT" | cut -f1))"
+fi
