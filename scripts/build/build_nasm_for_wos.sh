@@ -369,12 +369,23 @@ fi
 if [ ! -f "$NASM_BUILD/Makefile" ] || [ "$NASM_SOURCE_DIR/configure" -nt "$NASM_BUILD/Makefile" ] ||
     [ "$NASM_BUILD/config.site" -nt "$NASM_BUILD/Makefile" ]; then
     echo "Configuring NASM for WOS..."
+    NASM_CONFIGURE_CACHE_ARGS=()
+    if [ "$HOST_SYSTEM" = "WOS" ]; then
+        NASM_CONFIGURE_CACHE_ARGS=(
+            "ac_cv_path_install=/usr/bin/install -c"
+            ac_cv_path_mkdir=/usr/bin/mkdir
+            ac_cv_prog_ASCIIDOC=false
+            ac_cv_prog_XMLTO=false
+            ac_cv_prog_XZ=false
+        )
+    fi
     wos_timed_step "configure" "nasm" \
         wos_run_env_in_dir "$NASM_BUILD" \
         ASCIIDOC=false \
         XMLTO=false \
         XZ=false \
         "$NASM_SOURCE_DIR/configure" \
+        "${NASM_CONFIGURE_CACHE_ARGS[@]}" \
         --build="$BUILD_TRIPLE" \
         --host="$TARGET_ARCH" \
         --prefix=/usr \

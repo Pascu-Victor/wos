@@ -352,7 +352,11 @@ if [ "$HOST_SYSTEM" = "WOS" ]; then
     TLS_CONFIGURE_CACHE_ARGS=(
         ac_cv_path_GREP=/usr/bin/grep
         "ac_cv_path_EGREP=/usr/bin/grep -E"
+        "ac_cv_path_EGREP_TRADITIONAL=/usr/bin/grep -E"
         "ac_cv_path_FGREP=/usr/bin/grep -F"
+        ac_cv_path_SED=/usr/bin/sed
+        "ac_cv_path_install=/usr/bin/install -c"
+        ac_cv_path_mkdir=/usr/bin/mkdir
     )
 fi
 
