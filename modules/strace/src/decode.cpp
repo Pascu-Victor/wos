@@ -12,9 +12,13 @@
 #include <abi/callnums/vmem.h>
 #include <sys/callnums.h>
 
+#include <cstdint>
 #include <cstring>
 #include <format>
+#include <string>
+#include <string_view>
 
+#include "common.hpp"
 #include "ptrace_client.hpp"
 
 namespace wos::strace {
@@ -321,6 +325,8 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "openat";
                 case ker::abi::vfs::ops::STATAT:
                     return "statat";
+                case ker::abi::vfs::ops::UTIMENSAT:
+                    return "utimensat";
             }
             break;
         case ker::abi::callnums::net:

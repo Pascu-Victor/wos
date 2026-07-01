@@ -81,6 +81,11 @@ auto xfs_chmod_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int;
 // Change the permission bits of an open file descriptor.
 auto xfs_fchmod(File* f, int mode) -> int;
 
+// Update atime/mtime by filesystem-relative path or open file.
+auto xfs_set_times_path(const char* fs_path, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,
+                        XfsMountContext* ctx) -> int;
+auto xfs_set_times_file(File* f, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime) -> int;
+
 // Create a directory by filesystem-relative path.
 auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int;
 

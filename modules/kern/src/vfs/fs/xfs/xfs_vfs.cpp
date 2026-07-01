@@ -55,7 +55,8 @@ namespace {
 constexpr uint32_t XFS_SLOW_TRACE_US = 2048;
 constexpr size_t XFS_DIRECT_READ_MIN_BYTES = size_t{4} * 1024;
 constexpr size_t XFS_DIRECT_READ_BATCH_MAX_BYTES = size_t{2} * 1024 * 1024;
-constexpr uint64_t XFS_NSEC_PER_SEC = 1000000000ULL;
+constexpr int64_t XFS_NSEC_PER_SEC_SIGNED = 1000000000LL;
+constexpr uint64_t XFS_NSEC_PER_SEC = static_cast<uint64_t>(XFS_NSEC_PER_SEC_SIGNED);
 constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
 // Maximum blocks to allocate per metadata transaction. Large user writes are
 // still copied in buffered I/O batches below, but the extent allocation itself
@@ -197,6 +198,29 @@ auto xfs_encode_epoch_timestamp(uint64_t epoch_ns, bool bigtime) -> uint64_t {
 auto xfs_current_timestamp(const XfsInode* ip) -> uint64_t {
     bool const BIGTIME = ip != nullptr && (ip->flags2 & XFS_DIFLAG2_BIGTIME) != 0;
     return xfs_encode_epoch_timestamp(ker::mod::time::get_epoch_ns(), BIGTIME);
+}
+
+auto xfs_encode_timespec_timestamp(const Timespec& ts, bool bigtime, uint64_t* out) -> int {
+    if (out == nullptr || ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= XFS_NSEC_PER_SEC_SIGNED) {
+        return -EINVAL;
+    }
+
+    auto const SEC = static_cast<uint64_t>(ts.tv_sec);
+    auto const NSEC = static_cast<uint64_t>(ts.tv_nsec);
+    if (bigtime) {
+        uint64_t const MAX_SEC = (UINT64_MAX / XFS_NSEC_PER_SEC) - static_cast<uint64_t>(XFS_BIGTIME_EPOCH_OFFSET);
+        if (SEC > MAX_SEC) {
+            return -EOVERFLOW;
+        }
+        *out = ((SEC + static_cast<uint64_t>(XFS_BIGTIME_EPOCH_OFFSET)) * XFS_NSEC_PER_SEC) + NSEC;
+        return 0;
+    }
+
+    if (SEC > UINT32_MAX) {
+        return -EOVERFLOW;
+    }
+    *out = (SEC << 32U) | NSEC;
+    return 0;
 }
 
 auto xfs_data_fork_record_capacity(const XfsInode* ip) -> uint32_t {
@@ -2356,6 +2380,88 @@ auto xfs_fchmod(File* f, int mode) -> int {
     xfs_trans_log_inode(tp, ip);
     int const RET = xfs_trans_commit(tp);
     return (RET == 0) ? 0 : -EIO;
+}
+
+namespace {
+
+auto xfs_set_inode_times(XfsMountContext* ctx, XfsInode* ip, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime)
+    -> int {
+    if (ctx == nullptr || ip == nullptr) {
+        return -EINVAL;
+    }
+    if (!set_atime && !set_mtime) {
+        return 0;
+    }
+
+    bool const BIGTIME = (ip->flags2 & XFS_DIFLAG2_BIGTIME) != 0;
+    uint64_t encoded_atime = 0;
+    uint64_t encoded_mtime = 0;
+    if (set_atime) {
+        if (int const RET = xfs_encode_timespec_timestamp(atime, BIGTIME, &encoded_atime); RET < 0) {
+            return RET;
+        }
+    }
+    if (set_mtime) {
+        if (int const RET = xfs_encode_timespec_timestamp(mtime, BIGTIME, &encoded_mtime); RET < 0) {
+            return RET;
+        }
+    }
+
+    auto* tp = xfs_trans_alloc(ctx);
+    if (tp == nullptr) {
+        return -ENOMEM;
+    }
+
+    if (set_atime) {
+        ip->atime = encoded_atime;
+    }
+    if (set_mtime) {
+        ip->mtime = encoded_mtime;
+    }
+    ip->ctime = xfs_current_timestamp(ip);
+    ip->dirty = true;
+
+    xfs_trans_log_inode(tp, ip);
+    int const RET = xfs_trans_commit(tp);
+    return (RET == 0) ? 0 : -EIO;
+}
+
+}  // namespace
+
+auto xfs_set_times_path(const char* fs_path, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,
+                        XfsMountContext* ctx) -> int {
+    if (fs_path == nullptr || ctx == nullptr) {
+        return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
+    }
+
+    XfsMetadataGuard metadata_guard(ctx);
+    auto* ip = walk_path(ctx, fs_path);
+    if (ip == nullptr) {
+        return -ENOENT;
+    }
+
+    int const RET = xfs_set_inode_times(ctx, ip, atime, mtime, set_atime, set_mtime);
+    xfs_inode_release(ip);
+    return RET;
+}
+
+auto xfs_set_times_file(File* f, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime) -> int {
+    if (f == nullptr) {
+        return -EBADF;
+    }
+    auto* xfd = static_cast<XfsFileData*>(f->private_data);
+    if (xfd == nullptr || xfd->inode == nullptr || xfd->mount == nullptr) {
+        return -EBADF;
+    }
+    if (xfd->mount->read_only) {
+        return -EROFS;
+    }
+
+    XfsMetadataGuard metadata_guard(xfd->mount);
+    return xfs_set_inode_times(xfd->mount, xfd->inode, atime, mtime, set_atime, set_mtime);
 }
 
 // ============================================================================

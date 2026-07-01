@@ -69,6 +69,45 @@ KTEST(VFS, CreateAndStat) {
     ker::vfs::vfs_unlink("/tmp/ktest_create");
 }
 
+KTEST(VFS, UtimensatUpdatesTmpfsTimestamps) {
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_utimensat";
+    constexpr int64_t UTIME_OMIT_VALUE = (1LL << 30) - 2;
+    ker::vfs::vfs_unlink(PATH);
+
+    ker::vfs::File* f = ker::vfs::vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(f, nullptr);
+    ker::vfs::tmpfs::tmpfs_fops_close(f);
+
+    ker::vfs::Timespec times[2] = {
+        {.tv_sec = 1234, .tv_nsec = 567},
+        {.tv_sec = 2345, .tv_nsec = 678},
+    };
+    KEXPECT_EQ(ker::vfs::vfs_utimensat(ker::vfs::AT_FDCWD, PATH, times, 0), 0);
+
+    ker::vfs::Stat st{};
+    KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
+    KEXPECT_EQ(st.st_atim.tv_sec, static_cast<int64_t>(1234));
+    KEXPECT_EQ(st.st_atim.tv_nsec, static_cast<int64_t>(567));
+    KEXPECT_EQ(st.st_mtim.tv_sec, static_cast<int64_t>(2345));
+    KEXPECT_EQ(st.st_mtim.tv_nsec, static_cast<int64_t>(678));
+
+    ker::vfs::Timespec omit_atime[2] = {
+        {.tv_sec = 0, .tv_nsec = UTIME_OMIT_VALUE},
+        {.tv_sec = 3456, .tv_nsec = 789},
+    };
+    KEXPECT_EQ(ker::vfs::vfs_utimensat(ker::vfs::AT_FDCWD, PATH, omit_atime, 0), 0);
+
+    KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
+    KEXPECT_EQ(st.st_atim.tv_sec, static_cast<int64_t>(1234));
+    KEXPECT_EQ(st.st_atim.tv_nsec, static_cast<int64_t>(567));
+    KEXPECT_EQ(st.st_mtim.tv_sec, static_cast<int64_t>(3456));
+    KEXPECT_EQ(st.st_mtim.tv_nsec, static_cast<int64_t>(789));
+
+    ker::vfs::vfs_unlink(PATH);
+}
+
 KTEST(VFS, MetadataCacheInvalidatesPathMutation) {
     ker::vfs::vfs_mkdir("/tmp", 0755);
 

@@ -62,6 +62,9 @@ constexpr int MAX_SYMLINK_DEPTH = 8;
 constexpr size_t MAX_COMPONENTS = 64;
 constexpr size_t MAX_VFSTAB_BYTES = 4096;
 constexpr size_t WKI_PATH_PREFIX_LEN = 5;
+constexpr int64_t VFS_NSEC_PER_SEC = 1000000000LL;
+constexpr int64_t VFS_UTIME_NOW = (1LL << 30) - 1;
+constexpr int64_t VFS_UTIME_OMIT = (1LL << 30) - 2;
 
 auto make_absolute(const char* path, char* out, size_t outsize) -> int;
 auto canonicalize_path(char* path, size_t bufsize) -> int;
@@ -77,6 +80,14 @@ ker::util::SmallVec<ker::mod::sched::task::WkiVfsRule, 8> g_default_vfs_rules;
 struct VfsRouteDecision {
     uint8_t route = static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL);
     size_t prefix_len = 0;
+};
+
+struct VfsResolvedTimes {
+    Timespec atime{};
+    Timespec mtime{};
+    Timespec ctime{};
+    bool set_atime = false;
+    bool set_mtime = false;
 };
 
 constexpr size_t STREAM_CHUNK_SIZE = 65536;
@@ -7687,6 +7698,241 @@ auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int {
             vfs_put_file(f);
             return -ENOSYS;
     }
+}
+
+namespace {
+
+auto current_vfs_timespec() -> Timespec {
+    uint64_t const NOW_NS = ker::mod::time::get_epoch_ns();
+    return Timespec{
+        .tv_sec = static_cast<int64_t>(NOW_NS / static_cast<uint64_t>(VFS_NSEC_PER_SEC)),
+        .tv_nsec = static_cast<int64_t>(NOW_NS % static_cast<uint64_t>(VFS_NSEC_PER_SEC)),
+    };
+}
+
+auto resolve_one_utimens_time(const Timespec& requested, const Timespec& now, Timespec* out, bool* should_set) -> int {
+    if (out == nullptr || should_set == nullptr) {
+        return -EINVAL;
+    }
+
+    if (requested.tv_nsec == VFS_UTIME_NOW) {
+        *out = now;
+        *should_set = true;
+        return 0;
+    }
+    if (requested.tv_nsec == VFS_UTIME_OMIT) {
+        *should_set = false;
+        return 0;
+    }
+    if (requested.tv_nsec < 0 || requested.tv_nsec >= VFS_NSEC_PER_SEC) {
+        return -EINVAL;
+    }
+
+    *out = requested;
+    *should_set = true;
+    return 0;
+}
+
+auto resolve_utimens_times(const Timespec* times, VfsResolvedTimes* resolved) -> int {
+    if (resolved == nullptr) {
+        return -EINVAL;
+    }
+
+    Timespec const NOW = current_vfs_timespec();
+    resolved->ctime = NOW;
+    if (times == nullptr) {
+        resolved->atime = NOW;
+        resolved->mtime = NOW;
+        resolved->set_atime = true;
+        resolved->set_mtime = true;
+        return 0;
+    }
+
+    if (int const RET = resolve_one_utimens_time(times[0], NOW, &resolved->atime, &resolved->set_atime); RET < 0) {
+        return RET;
+    }
+    return resolve_one_utimens_time(times[1], NOW, &resolved->mtime, &resolved->set_mtime);
+}
+
+auto apply_tmpfs_utimens(ker::vfs::tmpfs::TmpNode* node, const VfsResolvedTimes& times) -> int {
+    if (node == nullptr) {
+        return -ENOENT;
+    }
+    if (times.set_atime) {
+        node->atime = times.atime;
+    }
+    if (times.set_mtime) {
+        node->mtime = times.mtime;
+    }
+    if (times.set_atime || times.set_mtime) {
+        node->ctime = times.ctime;
+    }
+    return 0;
+}
+
+auto apply_devfs_utimens(ker::vfs::devfs::DevFSNode* node, const VfsResolvedTimes& times) -> int {
+    if (node == nullptr) {
+        return -ENOENT;
+    }
+    if (times.set_atime) {
+        node->atime = times.atime;
+    }
+    if (times.set_mtime) {
+        node->mtime = times.mtime;
+    }
+    if (times.set_atime || times.set_mtime) {
+        node->ctime = times.ctime;
+    }
+    return 0;
+}
+
+auto vfs_apply_utimens_to_path(const char* path, const Timespec* times, bool follow_final_symlink) -> int {
+    if (path == nullptr) {
+        return -EINVAL;
+    }
+
+    VfsResolvedTimes resolved_times{};
+    if (int const RET = resolve_utimens_times(times, &resolved_times); RET < 0) {
+        return RET;
+    }
+
+    std::array<char, MAX_PATH_LEN> path_buffer{};
+    if (resolve_task_path_raw(path, path_buffer.data(), path_buffer.size()) < 0) {
+        return -ENAMETOOLONG;
+    }
+
+    auto mount_ref = find_mount_point(path_buffer.data());
+    auto* mount = mount_ref.get();
+    bool const REMOTE_MOUNT = mount != nullptr && mount->fs_type == FSType::REMOTE;
+    if (follow_final_symlink && !REMOTE_MOUNT) {
+        std::array<char, MAX_PATH_LEN> resolved_path{};
+        int const RESOLVE_RET = resolve_symlinks(path_buffer.data(), resolved_path.data(), resolved_path.size(), true, true);
+        if (RESOLVE_RET < 0) {
+            return RESOLVE_RET;
+        }
+        std::memcpy(path_buffer.data(), resolved_path.data(), path_buffer.size());
+        mount_ref = find_mount_point(path_buffer.data());
+        mount = mount_ref.get();
+    }
+
+    if (mount == nullptr) {
+        return -ENOENT;
+    }
+    const char* fs_path = strip_mount_prefix(mount, path_buffer.data());
+
+    int ret = -ENOSYS;
+    bool changed = resolved_times.set_atime || resolved_times.set_mtime;
+    switch (mount->fs_type) {
+        case FSType::TMPFS: {
+            auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, false);
+            ret = apply_tmpfs_utimens(node, resolved_times);
+            break;
+        }
+        case FSType::DEVFS: {
+            auto* node = ker::vfs::devfs::devfs_walk_path(fs_path);
+            ret = apply_devfs_utimens(node, resolved_times);
+            break;
+        }
+        case FSType::XFS:
+            ret = ker::vfs::xfs::xfs_set_times_path(fs_path, resolved_times.atime, resolved_times.mtime, resolved_times.set_atime,
+                                                    resolved_times.set_mtime,
+                                                    static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+            break;
+        case FSType::FAT32:
+            changed = false;
+            ret = 0;
+            break;
+        case FSType::REMOTE:
+        case FSType::PROCFS:
+        case FSType::SOCKET:
+        default:
+            ret = -ENOSYS;
+            break;
+    }
+
+    if (ret == 0 && changed) {
+        cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type);
+    }
+    return ret;
+}
+
+}  // namespace
+
+auto vfs_utimensat(int dirfd, const char* pathname, const Timespec* times, int flags) -> int {
+    constexpr int ALLOWED_FLAGS = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+    if (pathname == nullptr || (flags & ~ALLOWED_FLAGS) != 0) {
+        return -EINVAL;
+    }
+
+    if ((flags & AT_EMPTY_PATH) != 0 && pathname[0] == '\0') {
+        return vfs_futimens(dirfd, times);
+    }
+
+    if (dirfd == AT_FDCWD || pathname[0] == '/') {
+        return vfs_apply_utimens_to_path(pathname, times, (flags & AT_SYMLINK_NOFOLLOW) == 0);
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved{};
+    int const RES = vfs_resolve_dirfd(task, dirfd, pathname, resolved.data(), resolved.size());
+    if (RES < 0) {
+        return RES;
+    }
+    return vfs_apply_utimens_to_path(resolved.data(), times, (flags & AT_SYMLINK_NOFOLLOW) == 0);
+}
+
+auto vfs_futimens(int fd, const Timespec* times) -> int {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+
+    auto* f = vfs_get_file_retain(task, fd);
+    if (f == nullptr) {
+        return -EBADF;
+    }
+
+    VfsResolvedTimes resolved_times{};
+    int ret = resolve_utimens_times(times, &resolved_times);
+    bool changed = resolved_times.set_atime || resolved_times.set_mtime;
+    if (ret == 0) {
+        switch (f->fs_type) {
+            case FSType::TMPFS:
+                if (f->fops != ker::vfs::tmpfs::get_tmpfs_fops()) {
+                    ret = -ENOSYS;
+                    break;
+                }
+                ret = apply_tmpfs_utimens(static_cast<ker::vfs::tmpfs::TmpNode*>(f->private_data), resolved_times);
+                break;
+            case FSType::DEVFS:
+                ret = apply_devfs_utimens(ker::vfs::devfs::devfs_file_node(f), resolved_times);
+                break;
+            case FSType::XFS:
+                ret = ker::vfs::xfs::xfs_set_times_file(f, resolved_times.atime, resolved_times.mtime, resolved_times.set_atime,
+                                                        resolved_times.set_mtime);
+                break;
+            case FSType::FAT32:
+                changed = false;
+                ret = 0;
+                break;
+            case FSType::REMOTE:
+            case FSType::PROCFS:
+            case FSType::SOCKET:
+            default:
+                ret = -ENOSYS;
+                break;
+        }
+    }
+
+    if (ret == 0 && changed) {
+        cache_notify_file_metadata_changed_impl(f);
+    }
+    vfs_put_file(f);
+    return ret;
 }
 
 // --- ftruncate ---

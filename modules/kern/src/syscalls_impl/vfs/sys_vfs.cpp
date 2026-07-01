@@ -43,6 +43,29 @@ auto copy_value_to_user(T* user_ptr, T value) -> int {
     }
     return 0;
 }
+
+template <typename T>
+auto copy_value_from_user(const T* user_ptr, T* out) -> int {
+    if (user_ptr == nullptr || out == nullptr) {
+        return -EFAULT;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr || task->pagemap == nullptr) {
+        return -EFAULT;
+    }
+
+    auto user_addr = reinterpret_cast<uint64_t>(user_ptr);
+    auto* dst = reinterpret_cast<uint8_t*>(out);
+    for (size_t i = 0; i < sizeof(T); ++i) {
+        uint64_t const PHYS = ker::mod::mm::virt::translate(task->pagemap, user_addr + i);
+        if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
+            return -EFAULT;
+        }
+        dst[i] = *reinterpret_cast<const uint8_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
+    }
+    return 0;
+}
 }  // namespace
 
 auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) -> int64_t {
@@ -236,6 +259,28 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<int64_t>(ker::vfs::vfs_lstat(resolved.data(), statbuf));
             }
             return static_cast<int64_t>(ker::vfs::vfs_stat(resolved.data(), statbuf));
+        }
+        case ops::UTIMENSAT: {
+            int const DIRFD = static_cast<int>(a1);
+            const auto* pathname = reinterpret_cast<const char*>(a2);
+            const auto* user_times = reinterpret_cast<const ker::vfs::Timespec*>(a3);
+            int const FLAGS = static_cast<int>(a4);
+            if (pathname == nullptr) {
+                return -EFAULT;
+            }
+
+            std::array<ker::vfs::Timespec, 2> kernel_times{};
+            const ker::vfs::Timespec* times = nullptr;
+            if (user_times != nullptr) {
+                if (int const COPY_RET = copy_value_from_user(user_times, &kernel_times.at(0)); COPY_RET < 0) {
+                    return COPY_RET;
+                }
+                if (int const COPY_RET = copy_value_from_user(user_times + 1, &kernel_times.at(1)); COPY_RET < 0) {
+                    return COPY_RET;
+                }
+                times = kernel_times.data();
+            }
+            return static_cast<int64_t>(ker::vfs::vfs_utimensat(DIRFD, pathname, times, FLAGS));
         }
         case ops::UMOUNT: {
             const auto* target = reinterpret_cast<const char*>(a1);

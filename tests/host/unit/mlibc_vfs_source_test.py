@@ -7,9 +7,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 WOS_VFS_H = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "sys" / "vfs.h"
 WOS_SYSDEPS_CPP = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "generic" / "sysdeps.cpp"
+KERNEL_VFS_CALLNUMS = ROOT / "modules" / "kern" / "src" / "abi" / "callnums" / "vfs.h"
+KERNEL_VFS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "vfs.hpp"
 KERNEL_SYS_VFS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vfs" / "sys_vfs.cpp"
 KERNEL_VFS_CORE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "core.cpp"
 KERNEL_FILE_OPS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "file_operations.hpp"
+KERNEL_XFS_VFS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / "xfs_vfs.hpp"
+KERNEL_XFS_VFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / "xfs_vfs.cpp"
+KERNEL_VFS_KTEST_CPP = ROOT / "modules" / "kern" / "src" / "test" / "vfs_ktest.cpp"
 MLIBC_DIRENT_H = ROOT / "toolchain" / "src" / "mlibc" / "options" / "posix" / "include" / "dirent.h"
 GIT_BUILD_SCRIPT = ROOT / "scripts" / "build" / "build_git_for_wos.sh"
 
@@ -282,6 +287,177 @@ def test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards() -> None:
     )
 
 
+def test_utimensat_reaches_real_vfs_timestamp_updates() -> None:
+    callnums = KERNEL_VFS_CALLNUMS.read_text()
+    require_order(
+        callnums,
+        [
+            "STATAT,                // 52",
+            "UTIMENSAT,             // 53",
+        ],
+        "kernel vfs syscall ABI op numbering",
+    )
+
+    header = WOS_VFS_H.read_text()
+    require_order(header, ["statat,", "utimensat,"], "WOS mlibc VFS op enum")
+    wrapper_body = function_body(
+        header,
+        r"static\s+inline\s+int\s+utimensat_path\(int\s+dirfd,\s*const\s+char\s+\*path,\s*const\s+void\s+\*times,\s*int\s+flags\)",
+    )
+    require_tokens(
+        wrapper_body,
+        [
+            "static_cast<uint64_t>(ops::utimensat)",
+            "static_cast<uint64_t>(dirfd)",
+            "reinterpret_cast<uint64_t>(path)",
+            "reinterpret_cast<uint64_t>(times)",
+            "static_cast<uint64_t>(flags)",
+        ],
+        "WOS mlibc utimensat ABI wrapper",
+    )
+
+    sysdeps = WOS_SYSDEPS_CPP.read_text()
+    sysdep_body = function_body(
+        sysdeps,
+        r"int\s+Sysdeps<Utimensat>::operator\(\)\(\s*int\s+dirfd,\s*const\s+char\s+\*pathname,\s*const\s+struct\s+timespec\s+\*times,\s*int\s+flags\s*\)",
+    )
+    require_tokens(
+        sysdep_body,
+        [
+            "const char *effective_path = pathname;",
+            "int effective_flags = flags;",
+            'effective_path = "";',
+            "effective_flags |= AT_EMPTY_PATH;",
+            "ker::abi::vfs::utimensat_path(dirfd, effective_path, times, effective_flags)",
+        ],
+        "WOS mlibc utimensat sysdep",
+    )
+    if "Timestamps are not tracked" in sysdep_body:
+        fail("WOS mlibc utimensat must not fake success without updating timestamps")
+
+    syscall_source = KERNEL_SYS_VFS_CPP.read_text()
+    require_tokens(
+        syscall_source,
+        [
+            "case ops::UTIMENSAT:",
+            "const auto* user_times = reinterpret_cast<const ker::vfs::Timespec*>(a3);",
+            "copy_value_from_user(user_times, &kernel_times.at(0))",
+            "copy_value_from_user(user_times + 1, &kernel_times.at(1))",
+            "ker::vfs::vfs_utimensat(DIRFD, pathname, times, FLAGS)",
+        ],
+        "kernel vfs utimensat syscall dispatch",
+    )
+
+    vfs_hpp = KERNEL_VFS_HPP.read_text()
+    require_tokens(
+        vfs_hpp,
+        [
+            "auto vfs_utimensat(int dirfd, const char* pathname, const Timespec* times, int flags) -> int;",
+            "auto vfs_futimens(int fd, const Timespec* times) -> int;",
+            "constexpr int AT_SYMLINK_NOFOLLOW = 0x100;",
+            "constexpr int AT_EMPTY_PATH = 0x1000;",
+        ],
+        "kernel vfs utimensat public declarations",
+    )
+
+    vfs_core = KERNEL_VFS_CORE_CPP.read_text()
+    resolve_body = function_body(
+        vfs_core,
+        r"auto\s+resolve_one_utimens_time\(const\s+Timespec&\s+requested,\s*const\s+Timespec&\s+now,\s*Timespec\*\s+out,\s*bool\*\s+should_set\)\s*->\s*int",
+    )
+    require_tokens(
+        resolve_body,
+        [
+            "if (requested.tv_nsec == VFS_UTIME_NOW)",
+            "if (requested.tv_nsec == VFS_UTIME_OMIT)",
+            "if (requested.tv_nsec < 0 || requested.tv_nsec >= VFS_NSEC_PER_SEC)",
+        ],
+        "kernel vfs utimensat timestamp resolver",
+    )
+
+    path_body = function_body(
+        vfs_core,
+        r"auto\s+vfs_apply_utimens_to_path\(const\s+char\*\s+path,\s*const\s+Timespec\*\s+times,\s*bool\s+follow_final_symlink\)\s*->\s*int",
+    )
+    require_tokens(
+        path_body,
+        [
+            "case FSType::TMPFS:",
+            "apply_tmpfs_utimens(node, resolved_times)",
+            "case FSType::XFS:",
+            "xfs_set_times_path(fs_path, resolved_times.atime, resolved_times.mtime",
+            "case FSType::FAT32:",
+            "changed = false;",
+            "cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type)",
+        ],
+        "kernel vfs utimensat path backend updates",
+    )
+
+    utimensat_body = function_body(
+        vfs_core,
+        r"auto\s+vfs_utimensat\(int\s+dirfd,\s*const\s+char\*\s+pathname,\s*const\s+Timespec\*\s+times,\s*int\s+flags\)\s*->\s*int",
+    )
+    require_tokens(
+        utimensat_body,
+        [
+            "constexpr int ALLOWED_FLAGS = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;",
+            "return vfs_futimens(dirfd, times);",
+            "return vfs_apply_utimens_to_path(pathname, times, (flags & AT_SYMLINK_NOFOLLOW) == 0);",
+            "vfs_resolve_dirfd(task, dirfd, pathname, resolved.data(), resolved.size())",
+        ],
+        "kernel vfs utimensat dirfd and empty-path handling",
+    )
+
+    futimens_body = function_body(vfs_core, r"auto\s+vfs_futimens\(int\s+fd,\s*const\s+Timespec\*\s+times\)\s*->\s*int")
+    require_tokens(
+        futimens_body,
+        [
+            "case FSType::TMPFS:",
+            "case FSType::XFS:",
+            "xfs_set_times_file(f, resolved_times.atime, resolved_times.mtime",
+            "cache_notify_file_metadata_changed_impl(f)",
+        ],
+        "kernel vfs futimens file backend updates",
+    )
+
+    xfs_hpp = KERNEL_XFS_VFS_HPP.read_text()
+    require_tokens(
+        xfs_hpp,
+        [
+            "auto xfs_set_times_path(const char* fs_path, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,",
+            "auto xfs_set_times_file(File* f, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime) -> int;",
+        ],
+        "kernel xfs utimensat declarations",
+    )
+
+    xfs_cpp = KERNEL_XFS_VFS_CPP.read_text()
+    require_tokens(
+        xfs_cpp,
+        [
+            "auto xfs_encode_timespec_timestamp(const Timespec& ts, bool bigtime, uint64_t* out) -> int",
+            "return -EOVERFLOW;",
+            "ip->ctime = xfs_current_timestamp(ip);",
+            "xfs_trans_log_inode(tp, ip);",
+            "xfs_set_times_path",
+            "xfs_set_times_file",
+        ],
+        "kernel xfs timestamp transaction updates",
+    )
+
+    ktest = KERNEL_VFS_KTEST_CPP.read_text()
+    require_tokens(
+        ktest,
+        [
+            "KTEST(VFS, UtimensatUpdatesTmpfsTimestamps)",
+            "vfs_utimensat(ker::vfs::AT_FDCWD, PATH, times, 0)",
+            "st.st_atim.tv_sec",
+            "st.st_mtim.tv_nsec",
+            "UTIME_OMIT_VALUE",
+        ],
+        "kernel vfs utimensat ktest coverage",
+    )
+
+
 def test_kernel_pipe_waiters_cover_32_job_make_without_spinlock_growth() -> None:
     vfs_core = KERNEL_VFS_CORE_CPP.read_text()
     require_tokens(
@@ -413,6 +589,7 @@ if __name__ == "__main__":
     test_pselect_empty_fd_sets_do_not_call_epoll_with_zero_maxevents()
     test_pselect_and_epoll_pwait_honor_temporary_signal_masks()
     test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards()
+    test_utimensat_reaches_real_vfs_timestamp_updates()
     test_kernel_pipe_waiters_cover_32_job_make_without_spinlock_growth()
     test_kernel_dirfd_resolution_returns_task_visible_paths()
     test_metadata_cache_store_uses_pre_backend_stat_generation()

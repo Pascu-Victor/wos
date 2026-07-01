@@ -121,6 +121,8 @@ auto vfs_chmod(const char* path, int mode) -> int;
 auto vfs_fchmod(int fd, int mode) -> int;
 auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int;
 auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int;
+auto vfs_utimensat(int dirfd, const char* pathname, const Timespec* times, int flags) -> int;
+auto vfs_futimens(int fd, const Timespec* times) -> int;
 
 // Truncate
 auto vfs_ftruncate(int fd, off_t length) -> int;
@@ -221,6 +223,8 @@ auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int;
 // AT_FDCWD (-100) uses task->cwd. Absolute pathnames ignore dirfd.
 // Returns 0 on success, negative errno on failure.
 constexpr int AT_FDCWD = -100;
+constexpr int AT_SYMLINK_NOFOLLOW = 0x100;
+constexpr int AT_EMPTY_PATH = 0x1000;
 auto vfs_resolve_dirfd(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, char* resolved, size_t resolved_size) -> int;
 
 // Initialize VFS (register tmpfs, devfs, etc.)

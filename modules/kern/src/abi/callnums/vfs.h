@@ -58,6 +58,7 @@ enum class ops : uint64_t {
     REALPATH,              // 50
     OPENAT,                // 51
     STATAT,                // 52
+    UTIMENSAT,             // 53
 };
 
 }  // namespace ker::abi::vfs
