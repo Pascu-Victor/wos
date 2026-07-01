@@ -141,6 +141,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/mlibc_dns_source_test.py
 )
 add_test(
+    NAME mlibc_spawn_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/mlibc_spawn_source_test.py
+)
+add_test(
     NAME mlibc_vfs_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/mlibc_vfs_source_test.py
 )
@@ -383,6 +387,7 @@ set_tests_properties(
     buffer_cache_source_test
     udp_bind_device_source_test
     mlibc_dns_source_test
+    mlibc_spawn_source_test
     mlibc_vfs_source_test
     netd_dns_source_test
     socket_ring_source_test
@@ -399,9 +404,11 @@ set_tests_properties(
     exec_source_test
     scheduler_source_test
     signal_source_test
+    usercopy_source_test
     kasan_bootstrap_source_test
     signal_atomic_source_test
     phys_source_test
+    tlb_shootdown_source_test
     wki_timer_source_test
     wki_wait_source_test
     wki_ivshmem_source_test

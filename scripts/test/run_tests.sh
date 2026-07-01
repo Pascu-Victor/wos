@@ -130,13 +130,16 @@ UNIT_TESTS=(
     buffer_cache_source_test
     udp_bind_device_source_test
     mlibc_dns_source_test
+    mlibc_spawn_source_test
     mlibc_vfs_source_test
     netd_dns_source_test
     socket_ring_source_test
     socket_nonblock_source_test
+    socket_waiter_source_test
     tcp_deadline_source_test
     tcp_ephemeral_source_test
     tcp_fin_source_test
+    tcp_passive_open_source_test
     tcp_retransmit_source_test
     poll_deadline_source_test
     futex_source_test
@@ -144,7 +147,11 @@ UNIT_TESTS=(
     exec_source_test
     scheduler_source_test
     signal_source_test
+    usercopy_source_test
+    kasan_bootstrap_source_test
+    signal_atomic_source_test
     phys_source_test
+    tlb_shootdown_source_test
     wki_timer_source_test
     wki_wait_source_test
     wki_ivshmem_source_test
@@ -156,6 +163,7 @@ UNIT_TESTS=(
     wki_remotable_source_test
     wki_zone_source_test
     wki_peer_source_test
+    wki_routing_source_test
     wki_remote_compute_source_test
     wki_remote_vfs_source_test
     vfs_mount_lifetime_source_test
@@ -173,6 +181,7 @@ UNIT_TESTS=(
     vfs_pread_source_test
     vfs_sendfile_source_test
     tmpfs_swap_source_test
+    tmpfs_link_source_test
     wki_wire_test
     wki_routing_test
     data_struct_test
