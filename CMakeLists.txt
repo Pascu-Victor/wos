@@ -918,8 +918,12 @@ add_custom_command(
 add_custom_target(boot_image DEPENDS ${WOS_BOOT_DISK} ${INITRAMFS_OUTPUT} ${BOOT_IMAGE_STAMP})
 
 if(NOT WOS_NATIVE_SYSTEM_BUILD)
-    foreach(mod wos init testprog testd netd httpd perf top memacc journal wkictl powerctl renderbench sftpserver)
-        add_dependencies(${mod} mlibc libcxx)
+    set(WOS_SYSROOT_DEPENDENT_TARGETS wos)
+    list(APPEND WOS_SYSROOT_DEPENDENT_TARGETS ${WOS_USERSPACE_TARGETS})
+    foreach(mod IN LISTS WOS_SYSROOT_DEPENDENT_TARGETS)
+        if(TARGET ${mod})
+            add_dependencies(${mod} mlibc libcxx)
+        endif()
     endforeach()
 endif()
 # busybox, dropbear, GNU make, Bash, curl, Git, Ninja, CMake, Python, Meson, and NASM are only needed for image creation, not compilation.

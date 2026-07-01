@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
+ROOT_CMAKE = ROOT / "CMakeLists.txt"
 MODULES_CMAKE = ROOT / "modules" / "CMakeLists.txt"
 
 
@@ -51,9 +52,40 @@ def test_compile_options_keep_libcxx_before_c_headers() -> None:
     )
 
 
+def test_root_mlibc_dependencies_follow_userspace_target_list() -> None:
+    modules = MODULES_CMAKE.read_text()
+    root = ROOT_CMAKE.read_text()
+
+    require_order(
+        modules,
+        [
+            "set(WOS_USERSPACE_TARGETS",
+            "debugserver",
+            "journal_lib",
+            "strace",
+            "set(WOS_USERSPACE_TARGETS ${WOS_USERSPACE_TARGETS} PARENT_SCOPE)",
+        ],
+        "exported userspace target list",
+    )
+    require_order(
+        root,
+        [
+            "set(WOS_SYSROOT_DEPENDENT_TARGETS wos)",
+            "list(APPEND WOS_SYSROOT_DEPENDENT_TARGETS ${WOS_USERSPACE_TARGETS})",
+            "foreach(mod IN LISTS WOS_SYSROOT_DEPENDENT_TARGETS)",
+            "if(TARGET ${mod})",
+            "add_dependencies(${mod} mlibc libcxx)",
+        ],
+        "root mlibc/libcxx dependency loop",
+    )
+    if "foreach(mod wos init testprog testd netd httpd perf top memacc journal wkictl powerctl renderbench sftpserver)" in root:
+        fail("root CMake still uses the stale hard-coded mlibc/libcxx dependency target list")
+
+
 def main() -> None:
     test_native_repo_sysroot_has_explicit_c_include_path()
     test_compile_options_keep_libcxx_before_c_headers()
+    test_root_mlibc_dependencies_follow_userspace_target_list()
     print("Module CMake sysroot include invariants hold")
 
 
