@@ -45,6 +45,33 @@ auto verify_ag_crc(const void* buf, size_t len, size_t crc_off) -> bool {
     return COMPUTED == on_disk_crc;
 }
 
+auto xfs_device_block_span(XfsMountContext* ctx, uint64_t xfs_block, size_t count, uint64_t& dev_block, size_t& dev_count) -> bool {
+    if (ctx == nullptr || ctx->device == nullptr || count == 0 || ctx->device->block_size == 0 ||
+        ctx->block_size < ctx->device->block_size || (ctx->block_size % ctx->device->block_size) != 0 || ctx->ag_blk_log >= 64) {
+        return false;
+    }
+
+    auto const AGNO = static_cast<xfs_agnumber_t>(xfs_block >> ctx->ag_blk_log);
+    auto const AGBNO = static_cast<xfs_agblock_t>(xfs_block & ((1ULL << ctx->ag_blk_log) - 1));
+    if (ctx->ag_blocks != 0 && static_cast<uint64_t>(AGNO) > UINT64_MAX / ctx->ag_blocks) {
+        return false;
+    }
+    uint64_t const AG_BASE = static_cast<uint64_t>(AGNO) * ctx->ag_blocks;
+    if (AGBNO > UINT64_MAX - AG_BASE) {
+        return false;
+    }
+    uint64_t const LINEAR_BLOCK = AG_BASE + AGBNO;
+
+    size_t const RATIO = ctx->block_size / ctx->device->block_size;
+    if (RATIO == 0 || count > SIZE_MAX / RATIO || LINEAR_BLOCK > UINT64_MAX / RATIO) {
+        return false;
+    }
+
+    dev_block = LINEAR_BLOCK * RATIO;
+    dev_count = count * RATIO;
+    return true;
+}
+
 }  // namespace
 
 // Read one XFS filesystem block.  The block device may have a smaller sector
@@ -54,64 +81,52 @@ auto verify_ag_crc(const void* buf, size_t len, size_t crc_off) -> bool {
 // xfs_block is an ENCODED xfs_fsblock_t: (agno << ag_blk_log) | agbno.
 // We decode it to a linear block number before multiplying by the ratio.
 auto xfs_buf_read(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead* {
-    // Decode encoded FSB -> linear block
-    auto agno = static_cast<xfs_agnumber_t>(xfs_block >> ctx->ag_blk_log);
-    auto agbno = static_cast<xfs_agblock_t>(xfs_block & ((1ULL << ctx->ag_blk_log) - 1));
-    uint64_t const LINEAR_BLOCK = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
-
-    size_t const DEV_BLK_SIZE = ctx->device->block_size;
-    size_t const RATIO = ctx->block_size / DEV_BLK_SIZE;  // e.g. 4096/512 = 8
-    uint64_t const DEV_BLOCK = LINEAR_BLOCK * RATIO;
-    if (RATIO <= 1) {
-        return bread(ctx->device, DEV_BLOCK);
+    uint64_t dev_block = 0;
+    size_t dev_count = 0;
+    if (!xfs_device_block_span(ctx, xfs_block, 1, dev_block, dev_count)) {
+        return nullptr;
     }
-    return bread_multi(ctx->device, DEV_BLOCK, RATIO);
+    if (dev_count <= 1) {
+        return bread(ctx->device, dev_block);
+    }
+    return bread_multi(ctx->device, dev_block, dev_count);
 }
 
 // Read multiple contiguous XFS filesystem blocks.
 auto xfs_buf_read_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) -> BufHead* {
-    // Decode encoded FSB -> linear block
-    auto agno = static_cast<xfs_agnumber_t>(xfs_block >> ctx->ag_blk_log);
-    auto agbno = static_cast<xfs_agblock_t>(xfs_block & ((1ULL << ctx->ag_blk_log) - 1));
-    uint64_t const LINEAR_BLOCK = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
-
-    size_t const DEV_BLK_SIZE = ctx->device->block_size;
-    size_t const RATIO = ctx->block_size / DEV_BLK_SIZE;
-    uint64_t const DEV_BLOCK = LINEAR_BLOCK * RATIO;
-    size_t const DEV_COUNT = count * RATIO;
-    if (DEV_COUNT <= 1) {
-        return bread(ctx->device, DEV_BLOCK);
+    uint64_t dev_block = 0;
+    size_t dev_count = 0;
+    if (!xfs_device_block_span(ctx, xfs_block, count, dev_block, dev_count)) {
+        return nullptr;
     }
-    return bread_multi(ctx->device, DEV_BLOCK, DEV_COUNT);
+    if (dev_count <= 1) {
+        return bread(ctx->device, dev_block);
+    }
+    return bread_multi(ctx->device, dev_block, dev_count);
 }
 
 auto xfs_buf_get(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead* {
-    auto agno = static_cast<xfs_agnumber_t>(xfs_block >> ctx->ag_blk_log);
-    auto agbno = static_cast<xfs_agblock_t>(xfs_block & ((1ULL << ctx->ag_blk_log) - 1));
-    uint64_t const LINEAR_BLOCK = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
-
-    size_t const DEV_BLK_SIZE = ctx->device->block_size;
-    size_t const RATIO = ctx->block_size / DEV_BLK_SIZE;
-    uint64_t const DEV_BLOCK = LINEAR_BLOCK * RATIO;
-    if (RATIO <= 1) {
-        return bget(ctx->device, DEV_BLOCK);
+    uint64_t dev_block = 0;
+    size_t dev_count = 0;
+    if (!xfs_device_block_span(ctx, xfs_block, 1, dev_block, dev_count)) {
+        return nullptr;
     }
-    return bget_multi(ctx->device, DEV_BLOCK, RATIO);
+    if (dev_count <= 1) {
+        return bget(ctx->device, dev_block);
+    }
+    return bget_multi(ctx->device, dev_block, dev_count);
 }
 
 auto xfs_buf_get_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) -> BufHead* {
-    auto agno = static_cast<xfs_agnumber_t>(xfs_block >> ctx->ag_blk_log);
-    auto agbno = static_cast<xfs_agblock_t>(xfs_block & ((1ULL << ctx->ag_blk_log) - 1));
-    uint64_t const LINEAR_BLOCK = (static_cast<uint64_t>(agno) * ctx->ag_blocks) + agbno;
-
-    size_t const DEV_BLK_SIZE = ctx->device->block_size;
-    size_t const RATIO = ctx->block_size / DEV_BLK_SIZE;
-    uint64_t const DEV_BLOCK = LINEAR_BLOCK * RATIO;
-    size_t const DEV_COUNT = count * RATIO;
-    if (DEV_COUNT <= 1) {
-        return bget(ctx->device, DEV_BLOCK);
+    uint64_t dev_block = 0;
+    size_t dev_count = 0;
+    if (!xfs_device_block_span(ctx, xfs_block, count, dev_block, dev_count)) {
+        return nullptr;
     }
-    return bget_multi(ctx->device, DEV_BLOCK, DEV_COUNT);
+    if (dev_count <= 1) {
+        return bget(ctx->device, dev_block);
+    }
+    return bget_multi(ctx->device, dev_block, dev_count);
 }
 
 namespace {

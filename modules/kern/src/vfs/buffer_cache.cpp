@@ -408,6 +408,14 @@ auto allocate_buffer_data(size_t size, uint32_t& flags) -> uint8_t* {
     return new uint8_t[size];
 }
 
+auto checked_block_span_size(const dev::BlockDevice* bdev, size_t count, size_t& total_size) -> bool {
+    if (bdev == nullptr || bdev->block_size == 0 || count == 0 || count > SIZE_MAX / bdev->block_size) {
+        return false;
+    }
+    total_size = bdev->block_size * count;
+    return true;
+}
+
 void free_data_buffer(uint8_t* data, uint32_t flags) {
     if (data == nullptr) {
         return;
@@ -2588,30 +2596,32 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
         buffer_cache_init();
     }
 
-    size_t const BLK_SIZE = bdev->block_size;
-    size_t const TOTAL_SIZE = BLK_SIZE * count;
+    size_t total_size = 0;
+    if (!checked_block_span_size(bdev, count, total_size)) {
+        return nullptr;
+    }
 
     // Multi-block buffers are cached by their exact span. This avoids aliasing
     // a single-block and multi-block view of the same starting device block.
     uint64_t irqflags = cache_lock.lock_irqsave();
 
-    BufHead* bh = hash_lookup(bdev, block_no, TOTAL_SIZE);
+    BufHead* bh = hash_lookup(bdev, block_no, total_size);
     if (bh != nullptr) {
         bh->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(bh);
         stat_hits++;
         static_cast<void>(copy_dirty_bdev_range_for_cached_buffer_locked(bh, block_no, count));
         cache_lock.unlock_irqrestore(irqflags);
-        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, TOTAL_SIZE);
+        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, total_size);
         return bh;
     }
 
     stat_misses++;
-    evict_lru_for_allocation(TOTAL_SIZE);
+    evict_lru_for_allocation(total_size);
     cache_lock.unlock_irqrestore(irqflags);
 
     uint64_t const PERF_ALLOC_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC);
-    bh = alloc_detached_buffer_with_size(bdev, block_no, TOTAL_SIZE, 0);
+    bh = alloc_detached_buffer_with_size(bdev, block_no, total_size, 0);
     if (bh == nullptr) {
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC, PERF_ALLOC_STARTED_US, -ENOMEM, 0);
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_MISS, PERF_STARTED_US, -ENOMEM, 0);
@@ -2620,9 +2630,9 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
     uint32_t const PERF_ALLOC_US = PERF_ALLOC_STARTED_US != 0 ? perf_elapsed_since_us(PERF_ALLOC_STARTED_US) : 0;
 
     if (PERF_ALLOC_STARTED_US != 0) {
-        ker::mod::perf::record_local_xfs_summary(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC, 0, PERF_ALLOC_US, true, TOTAL_SIZE);
+        ker::mod::perf::record_local_xfs_summary(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC, 0, PERF_ALLOC_US, true, total_size);
     }
-    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_MISS, PERF_STARTED_US, 0, TOTAL_SIZE);
+    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_MISS, PERF_STARTED_US, 0, total_size);
 
     if (copy_cached_bdev_range_if_complete_internal(bdev, block_no, count, bh->data) ||
         copy_dirty_bdev_range_if_complete(bdev, block_no, count, bh->data)) {
@@ -2639,14 +2649,14 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
     }
 
     irqflags = cache_lock.lock_irqsave();
-    BufHead* existing = hash_lookup(bdev, block_no, TOTAL_SIZE);
+    BufHead* existing = hash_lookup(bdev, block_no, total_size);
     if (existing != nullptr) {
         existing->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(existing);
         static_cast<void>(copy_dirty_bdev_range_for_cached_buffer_locked(existing, block_no, count));
         cache_lock.unlock_irqrestore(irqflags);
         free_detached_buffer(bh);
-        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, TOTAL_SIZE);
+        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, total_size);
         return existing;
     }
 
@@ -2779,26 +2789,28 @@ auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufH
         buffer_cache_init();
     }
 
-    size_t const BLK_SIZE = bdev->block_size;
-    size_t const TOTAL_SIZE = BLK_SIZE * count;
+    size_t total_size = 0;
+    if (!checked_block_span_size(bdev, count, total_size)) {
+        return nullptr;
+    }
 
     uint64_t irqflags = cache_lock.lock_irqsave();
 
     // If already cached, return it (caller will overwrite contents).
-    BufHead* bh = hash_lookup(bdev, block_no, TOTAL_SIZE);
+    BufHead* bh = hash_lookup(bdev, block_no, total_size);
     if (bh != nullptr) {
         bh->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(bh);
         cache_lock.unlock_irqrestore(irqflags);
-        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_GET_HIT, PERF_STARTED_US, 0, TOTAL_SIZE);
+        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_GET_HIT, PERF_STARTED_US, 0, total_size);
         return bh;
     }
 
-    evict_lru_for_allocation(TOTAL_SIZE);
+    evict_lru_for_allocation(total_size);
     cache_lock.unlock_irqrestore(irqflags);
 
     uint64_t const PERF_ALLOC_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC);
-    bh = alloc_detached_buffer_with_size(bdev, block_no, TOTAL_SIZE, BH_VALID);
+    bh = alloc_detached_buffer_with_size(bdev, block_no, total_size, BH_VALID);
     if (bh == nullptr) {
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC, PERF_ALLOC_STARTED_US, -ENOMEM, 0);
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_GET_MISS, PERF_STARTED_US, -ENOMEM, 0);
@@ -2807,22 +2819,22 @@ auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufH
     uint32_t const PERF_ALLOC_US = PERF_ALLOC_STARTED_US != 0 ? perf_elapsed_since_us(PERF_ALLOC_STARTED_US) : 0;
 
     irqflags = cache_lock.lock_irqsave();
-    BufHead* existing = hash_lookup(bdev, block_no, TOTAL_SIZE);
+    BufHead* existing = hash_lookup(bdev, block_no, total_size);
     if (existing != nullptr) {
         existing->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(existing);
         cache_lock.unlock_irqrestore(irqflags);
         free_detached_buffer(bh);
-        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_GET_HIT, PERF_STARTED_US, 0, TOTAL_SIZE);
+        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_GET_HIT, PERF_STARTED_US, 0, total_size);
         return existing;
     }
 
     insert_allocated_buffer_locked(bh);
     cache_lock.unlock_irqrestore(irqflags);
     if (PERF_ALLOC_STARTED_US != 0) {
-        ker::mod::perf::record_local_xfs_summary(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC, 0, PERF_ALLOC_US, true, TOTAL_SIZE);
+        ker::mod::perf::record_local_xfs_summary(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC, 0, PERF_ALLOC_US, true, total_size);
     }
-    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_GET_MISS, PERF_STARTED_US, 0, TOTAL_SIZE);
+    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_GET_MISS, PERF_STARTED_US, 0, total_size);
 
     return bh;
 }

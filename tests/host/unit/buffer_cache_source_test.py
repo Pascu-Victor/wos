@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 BUFFER_CACHE = ROOT / "modules/kern/src/vfs/buffer_cache.cpp"
+XFS_MOUNT = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_mount.cpp"
 
 
 def fail(message: str) -> None:
@@ -58,6 +59,7 @@ def require_order(source: str, tokens: list[str], context: str) -> None:
 
 def main() -> None:
     source = BUFFER_CACHE.read_text()
+    xfs_mount = XFS_MOUNT.read_text()
 
     require_absent(source, "evict_lru();", "cold miss eviction must be allocation-sized")
     require_absent(source, "alloc_buffer_with_size", "buffers must be detached until inserted")
@@ -232,11 +234,39 @@ def main() -> None:
         "insert must account before indexing a prepared buffer",
     )
 
+    span_body = function_body(source, "checked_block_span_size")
+    require_order(
+        span_body,
+        [
+            "bdev == nullptr || bdev->block_size == 0 || count == 0 || count > SIZE_MAX / bdev->block_size",
+            "return false",
+            "total_size = bdev->block_size * count",
+            "return true",
+        ],
+        "checked buffer-cache block span sizing",
+    )
+
+    for name in ("bread_multi", "bget_multi"):
+        body = function_body(source, name)
+        require_order(
+            body,
+            [
+                "size_t total_size = 0",
+                "if (!checked_block_span_size(bdev, count, total_size))",
+                "return nullptr",
+                "hash_lookup(bdev, block_no, total_size)",
+                "evict_lru_for_allocation(total_size)",
+            ],
+            f"{name} must validate byte size before cache lookup/allocation",
+        )
+        require_absent(body, "BLK_SIZE * count", f"{name} unchecked byte-size multiply")
+        require_absent(body, "bdev->block_size * count", f"{name} unchecked byte-size multiply")
+
     for name, allocator, size_token in [
         ("bread", "alloc_detached_buffer(bdev, block_no)", "bdev->block_size"),
-        ("bread_multi", "alloc_detached_buffer_with_size(bdev, block_no, TOTAL_SIZE, 0)", "TOTAL_SIZE"),
+        ("bread_multi", "alloc_detached_buffer_with_size(bdev, block_no, total_size, 0)", "total_size"),
         ("bget", "alloc_detached_buffer(bdev, block_no)", "bdev->block_size"),
-        ("bget_multi", "alloc_detached_buffer_with_size(bdev, block_no, TOTAL_SIZE, BH_VALID)", "TOTAL_SIZE"),
+        ("bget_multi", "alloc_detached_buffer_with_size(bdev, block_no, total_size, BH_VALID)", "total_size"),
     ]:
         body = function_body(source, name)
         require_order(
@@ -252,6 +282,42 @@ def main() -> None:
             ],
             f"{name} cold miss must allocate detached and recheck before insert",
         )
+
+    xfs_span_body = function_body(xfs_mount, "xfs_device_block_span")
+    for token in [
+        "ctx == nullptr || ctx->device == nullptr || count == 0 || ctx->device->block_size == 0",
+        "ctx->block_size < ctx->device->block_size",
+        "(ctx->block_size % ctx->device->block_size) != 0",
+        "ctx->ag_blk_log >= 64",
+        "static_cast<uint64_t>(AGNO) > UINT64_MAX / ctx->ag_blocks",
+        "AGBNO > UINT64_MAX - AG_BASE",
+        "count > SIZE_MAX / RATIO",
+        "LINEAR_BLOCK > UINT64_MAX / RATIO",
+        "dev_block = LINEAR_BLOCK * RATIO",
+        "dev_count = count * RATIO",
+    ]:
+        require(xfs_span_body, token, "XFS device block-span guard")
+
+    for name, io_call in [
+        ("xfs_buf_read", "bread(ctx->device, dev_block)"),
+        ("xfs_buf_read_multi", "bread_multi(ctx->device, dev_block, dev_count)"),
+        ("xfs_buf_get", "bget(ctx->device, dev_block)"),
+        ("xfs_buf_get_multi", "bget_multi(ctx->device, dev_block, dev_count)"),
+    ]:
+        body = function_body(xfs_mount, name)
+        require_order(
+            body,
+            [
+                "uint64_t dev_block = 0",
+                "size_t dev_count = 0",
+                "if (!xfs_device_block_span(ctx, xfs_block",
+                "return nullptr",
+                io_call,
+            ],
+            f"{name} must validate device block span before buffer-cache I/O",
+        )
+        require_absent(body, "count * RATIO", f"{name} unchecked XFS device-count multiply")
+        require_absent(body, "LINEAR_BLOCK * RATIO", f"{name} unchecked XFS device-block multiply")
 
     print("buffer cache cold-miss locking invariants hold")
 
