@@ -139,6 +139,7 @@ UNIT_TESTS=(
     poll_deadline_source_test
     futex_source_test
     waitpid_source_test
+    exec_source_test
     scheduler_source_test
     signal_source_test
     phys_source_test

@@ -1197,31 +1197,7 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
         }
     }  // !skipRelocations
 
-    if (register_special_symbols) {
-        // Iterate section headers to find symbol tables
-        for (size_t sidx = 0; sidx < elf_file.elf_head.e_shnum; sidx++) {
-            auto* section = section_header_at(elf_file, sidx);
-
-            if (section->sh_type == SHT_SYMTAB || section->sh_type == SHT_DYNSYM) {
-                // Get string table for this symbol table
-                auto* strtab = section_header_at(elf_file, section->sh_link);
-                auto const* strs = reinterpret_cast<const char*>(elf_file.base + strtab->sh_offset);
-                if (strs == nullptr) {
-                    continue;
-                }
-                uint64_t const NUM_SYMBOLS = section->sh_size / section->sh_entsize;
-                auto* syms = reinterpret_cast<Elf64_Sym*>(elf_file.base + section->sh_offset);
-
-                for (uint64_t si = 0; si < NUM_SYMBOLS; si++) {
-                    Elf64_Sym const* sym = &syms[si];
-                    auto const* sname = strs + sym->st_name;
-                    if ((sname == nullptr) || (sname[0] == 0)) {
-                        continue;
-                    }
-                }
-            }
-        }
-    }
+    (void)register_special_symbols;
 
 // Print debug info for verification
 #ifdef ELF_DEBUG

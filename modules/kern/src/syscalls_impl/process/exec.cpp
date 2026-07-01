@@ -27,6 +27,7 @@
 #include <platform/sched/task.hpp>
 #include <string_view>
 #include <util/smallvec.hpp>
+#include <utility>
 #include <vfs/file.hpp>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/vfs.hpp>
@@ -341,6 +342,197 @@ auto read_file_fully(int fd, uint8_t* dst, size_t size, const char* path) -> ssi
     return static_cast<ssize_t>(total);
 }
 
+constexpr size_t EXEC_SPARSE_ELF_MIN_SIZE = static_cast<size_t>(64) * 1024;
+constexpr size_t EXEC_SHEBANG_PROBE_SIZE = 4096;
+
+struct ExecImageReadResult {
+    ssize_t bytes_read{};
+    int status{};
+    size_t shebang_probe_size{};
+};
+
+auto exec_min_size(size_t lhs, size_t rhs) -> size_t { return lhs < rhs ? lhs : rhs; }
+
+auto exec_range_in_file(size_t file_size, uint64_t offset, uint64_t size) -> bool {
+    return offset <= file_size && size <= (static_cast<uint64_t>(file_size) - offset);
+}
+
+auto exec_table_size(uint64_t count, uint64_t entry_size, uint64_t& out) -> bool {
+    if (entry_size != 0 && count > UINT64_MAX / entry_size) {
+        return false;
+    }
+    out = count * entry_size;
+    return true;
+}
+
+auto read_file_range_fully(int fd, uint8_t* dst, size_t file_size, uint64_t offset, uint64_t size, const char* path, size_t& bytes_read)
+    -> int {
+    if (dst == nullptr || !exec_range_in_file(file_size, offset, size)) {
+        return -EINVAL;
+    }
+
+    uint64_t total = 0;
+    int consecutive_errors = 0;
+    constexpr int MAX_CONSECUTIVE_ERRORS = 3;
+
+    while (total < size) {
+        uint64_t const READ_OFFSET = offset + total;
+        auto const REMAINING = static_cast<size_t>(size - total);
+        auto* out = dst + static_cast<size_t>(READ_OFFSET);
+        ssize_t const RC = vfs::vfs_pread(fd, out, REMAINING, static_cast<off_t>(READ_OFFSET));
+        if (RC > 0) {
+            total += static_cast<uint64_t>(RC);
+            bytes_read += static_cast<size_t>(RC);
+            consecutive_errors = 0;
+            continue;
+        }
+        if (RC == 0) {
+            exec_log::warn("exec: unexpected EOF while reading '%s' at offset %llu (%llu/%llu bytes)", path,
+                           static_cast<unsigned long long>(READ_OFFSET), static_cast<unsigned long long>(total),
+                           static_cast<unsigned long long>(size));
+            return -EIO;
+        }
+
+        consecutive_errors++;
+        if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
+            exec_log::warn("exec: range read failed for '%s' at offset %llu (%llu/%llu bytes) rc=%lld after %d attempts", path,
+                           static_cast<unsigned long long>(READ_OFFSET), static_cast<unsigned long long>(total),
+                           static_cast<unsigned long long>(size), static_cast<long long>(RC), MAX_CONSECUTIVE_ERRORS);
+            return static_cast<int>(RC);
+        }
+    }
+
+    return 0;
+}
+
+auto read_full_exec_image(int fd, uint8_t* dst, size_t file_size, const char* path) -> ExecImageReadResult {
+    ssize_t const BYTES_READ = read_file_fully(fd, dst, file_size, path);
+    if (BYTES_READ < 0) {
+        return {.bytes_read = 0, .status = static_cast<int>(BYTES_READ)};
+    }
+    if (std::cmp_not_equal(BYTES_READ, file_size)) {
+        return {.bytes_read = BYTES_READ, .status = -EIO};
+    }
+    return {
+        .bytes_read = BYTES_READ,
+        .status = 0,
+        .shebang_probe_size = file_size,
+    };
+}
+
+auto read_exec_section_if_needed(int fd, uint8_t* dst, size_t file_size, const Elf64_Shdr& section, const char* section_name,
+                                 const char* path, bool read_relocation_metadata, size_t& bytes_read) -> int {
+    if (!read_relocation_metadata) {
+        return 0;
+    }
+    bool const READ_BY_TYPE = section.sh_type == SHT_STRTAB || section.sh_type == SHT_SYMTAB || section.sh_type == SHT_DYNSYM ||
+                              section.sh_type == SHT_REL || section.sh_type == SHT_RELA;
+    bool const READ_RELR_BY_NAME =
+        section_name != nullptr && (std::strcmp(section_name, ".relr") == 0 || std::strcmp(section_name, ".relr.dyn") == 0);
+    if (!READ_BY_TYPE && !READ_RELR_BY_NAME) {
+        return 0;
+    }
+    return read_file_range_fully(fd, dst, file_size, section.sh_offset, section.sh_size, path, bytes_read);
+}
+
+auto read_sparse_elf_image(int fd, uint8_t* dst, size_t file_size, const char* path, size_t initial_bytes_read,
+                           bool read_static_relocation_metadata) -> ExecImageReadResult {
+    size_t bytes_read = initial_bytes_read;
+    int ret = read_file_range_fully(fd, dst, file_size, 0, sizeof(Elf64_Ehdr), path, bytes_read);
+    if (ret < 0) {
+        return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = ret};
+    }
+
+    const auto* elf_header = reinterpret_cast<const Elf64_Ehdr*>(dst);
+    if (elf_header->e_ident[EI_MAG0] != ELFMAG0 || elf_header->e_ident[EI_MAG1] != ELFMAG1 || elf_header->e_ident[EI_MAG2] != ELFMAG2 ||
+        elf_header->e_ident[EI_MAG3] != ELFMAG3) {
+        return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = 0};
+    }
+    if (elf_header->e_phentsize != sizeof(Elf64_Phdr) || elf_header->e_shentsize != sizeof(Elf64_Shdr) || elf_header->e_phnum == 0 ||
+        elf_header->e_shnum == 0 || elf_header->e_shstrndx >= elf_header->e_shnum) {
+        return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = -ENOEXEC};
+    }
+
+    uint64_t phdr_bytes = 0;
+    uint64_t shdr_bytes = 0;
+    if (!exec_table_size(elf_header->e_phnum, elf_header->e_phentsize, phdr_bytes) ||
+        !exec_table_size(elf_header->e_shnum, elf_header->e_shentsize, shdr_bytes) ||
+        !exec_range_in_file(file_size, elf_header->e_phoff, phdr_bytes) ||
+        !exec_range_in_file(file_size, elf_header->e_shoff, shdr_bytes)) {
+        return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = -ENOEXEC};
+    }
+
+    ret = read_file_range_fully(fd, dst, file_size, elf_header->e_phoff, phdr_bytes, path, bytes_read);
+    if (ret < 0) {
+        return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = ret};
+    }
+    ret = read_file_range_fully(fd, dst, file_size, elf_header->e_shoff, shdr_bytes, path, bytes_read);
+    if (ret < 0) {
+        return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = ret};
+    }
+
+    const auto* program_headers = reinterpret_cast<const Elf64_Phdr*>(dst + elf_header->e_phoff);
+    const auto* section_headers = reinterpret_cast<const Elf64_Shdr*>(dst + elf_header->e_shoff);
+    const Elf64_Shdr& shstrtab = section_headers[elf_header->e_shstrndx];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    if (!exec_range_in_file(file_size, shstrtab.sh_offset, shstrtab.sh_size)) {
+        return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = -ENOEXEC};
+    }
+    ret = read_file_range_fully(fd, dst, file_size, shstrtab.sh_offset, shstrtab.sh_size, path, bytes_read);
+    if (ret < 0) {
+        return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = ret};
+    }
+    const char* const SECTION_NAMES = reinterpret_cast<const char*>(dst + shstrtab.sh_offset);
+
+    bool has_dynamic_interp = false;
+    for (Elf64_Half i = 0; i < elf_header->e_phnum; ++i) {
+        const Elf64_Phdr& ph = program_headers[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        has_dynamic_interp = has_dynamic_interp || ph.p_type == PT_INTERP;
+        if (ph.p_filesz == 0) {
+            continue;
+        }
+        if (ph.p_type != PT_LOAD && ph.p_type != PT_NOTE && ph.p_type != PT_INTERP) {
+            continue;
+        }
+        ret = read_file_range_fully(fd, dst, file_size, ph.p_offset, ph.p_filesz, path, bytes_read);
+        if (ret < 0) {
+            return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = ret};
+        }
+    }
+
+    bool const READ_RELOCATION_METADATA = read_static_relocation_metadata && !has_dynamic_interp;
+    for (Elf64_Half i = 0; i < elf_header->e_shnum; ++i) {
+        const Elf64_Shdr& section = section_headers[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        const char* section_name = "";
+        if (section.sh_name < shstrtab.sh_size) {
+            section_name = SECTION_NAMES + section.sh_name;
+        }
+        ret = read_exec_section_if_needed(fd, dst, file_size, section, section_name, path, READ_RELOCATION_METADATA, bytes_read);
+        if (ret < 0) {
+            return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = ret};
+        }
+    }
+
+    return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = 0};
+}
+
+auto read_exec_image_for_loader(int fd, uint8_t* dst, size_t file_size, const char* path, bool read_static_relocation_metadata = true)
+    -> ExecImageReadResult {
+    if (file_size <= EXEC_SPARSE_ELF_MIN_SIZE) {
+        return read_full_exec_image(fd, dst, file_size, path);
+    }
+
+    size_t bytes_read = 0;
+    size_t const PROBE_SIZE = exec_min_size(file_size, EXEC_SHEBANG_PROBE_SIZE);
+    int const PROBE_RET = read_file_range_fully(fd, dst, file_size, 0, PROBE_SIZE, path, bytes_read);
+    if (PROBE_RET < 0) {
+        return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = PROBE_RET};
+    }
+
+    ExecImageReadResult result = read_sparse_elf_image(fd, dst, file_size, path, bytes_read, read_static_relocation_metadata);
+    result.shebang_probe_size = PROBE_SIZE;
+    return result;
+}
+
 auto parse_shebang_line(const uint8_t* file_data, size_t file_size, ShebangInfo* out) -> bool {
     if (file_data == nullptr || out == nullptr || file_size < 2 || file_data[0] != '#' || file_data[1] != '!') {
         return false;
@@ -582,16 +774,17 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     uint64_t const ELF_READ_STARTED_US = time::get_us();
     record_local_proc_event(parent_task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::BEGIN, ELF_READ_CORR, 0,
                             clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
-    ssize_t const BYTES_READ = read_file_fully(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), path);
+    ExecImageReadResult const READ_RESULT = read_exec_image_for_loader(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), path);
     uint32_t const ELF_READ_US = clamp_perf_aux(time::get_us() - ELF_READ_STARTED_US);
-    int32_t const ELF_READ_STATUS = BYTES_READ == FILE_SIZE ? 0 : -EIO;
+    int32_t const ELF_READ_STATUS = READ_RESULT.status;
     record_local_proc_event(parent_task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::END, ELF_READ_CORR, ELF_READ_STATUS,
                             ELF_READ_US, WOS_PERF_CALLSITE());
     perf::record_wki_summary(perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(perf::WkiPerfLocalProcOp::ELF_READ), 0, 0,
-                             ELF_READ_STATUS, ELF_READ_US, true, 0, BYTES_READ > 0 ? static_cast<uint64_t>(BYTES_READ) : 0);
+                             ELF_READ_STATUS, ELF_READ_US, true, 0,
+                             READ_RESULT.bytes_read > 0 ? static_cast<uint64_t>(READ_RESULT.bytes_read) : 0);
     vfs::vfs_close(FD);
 
-    if (BYTES_READ != FILE_SIZE) {
+    if (READ_RESULT.status < 0) {
         dbg::log("wos_proc_exec: Failed to read file completely");
         delete[] elf_buffer;
         return 0;
@@ -601,7 +794,8 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     __asm__ volatile("mfence" ::: "memory");
 
     ShebangInfo shebang = {};
-    if (parse_shebang_line(elf_buffer, static_cast<size_t>(FILE_SIZE), &shebang)) {
+    size_t const SHEBANG_BYTES = READ_RESULT.shebang_probe_size != 0 ? READ_RESULT.shebang_probe_size : static_cast<size_t>(FILE_SIZE);
+    if (parse_shebang_line(elf_buffer, SHEBANG_BYTES, &shebang)) {
         delete[] elf_buffer;
         if (shebang_depth >= MAX_SHEBANG_DEPTH) {
             return 0;
@@ -1135,28 +1329,31 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     uint64_t const ELF_READ_STARTED_US = time::get_us();
     record_local_proc_event(task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::BEGIN, ELF_READ_CORR, 0,
                             clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
-    ssize_t const BYTES_READ = read_file_fully(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), exec_path);
+    ExecImageReadResult const READ_RESULT = read_exec_image_for_loader(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), exec_path);
     uint32_t const ELF_READ_US = clamp_perf_aux(time::get_us() - ELF_READ_STARTED_US);
-    int32_t const ELF_READ_STATUS = BYTES_READ == FILE_SIZE ? 0 : -EIO;
+    int32_t const ELF_READ_STATUS = READ_RESULT.status;
     record_local_proc_event(task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::END, ELF_READ_CORR, ELF_READ_STATUS, ELF_READ_US,
                             WOS_PERF_CALLSITE());
     perf::record_wki_summary(perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(perf::WkiPerfLocalProcOp::ELF_READ), 0, 0,
-                             ELF_READ_STATUS, ELF_READ_US, true, 0, BYTES_READ > 0 ? static_cast<uint64_t>(BYTES_READ) : 0);
+                             ELF_READ_STATUS, ELF_READ_US, true, 0,
+                             READ_RESULT.bytes_read > 0 ? static_cast<uint64_t>(READ_RESULT.bytes_read) : 0);
     vfs::vfs_close(FD);
 
-    if (BYTES_READ != FILE_SIZE) {
+    if (READ_RESULT.status < 0) {
 #ifdef EXEC_DEBUG
-        dbg::log("wos_proc_execve: short read for '%s' (got %ld, expect %ld)", exec_path, BYTES_READ, file_size);
+        dbg::log("wos_proc_execve: failed read for '%s' (status %d, got %ld, expect %ld)", exec_path, READ_RESULT.status,
+                 READ_RESULT.bytes_read, file_size);
 #endif
         delete[] elf_buffer;
         free_kernel_arg_env();
-        return static_cast<uint64_t>(-EIO);
+        return static_cast<uint64_t>(READ_RESULT.status);
     }
 
     __asm__ volatile("mfence" ::: "memory");
 
     ShebangInfo shebang = {};
-    if (parse_shebang_line(elf_buffer, static_cast<size_t>(FILE_SIZE), &shebang)) {
+    size_t const SHEBANG_BYTES = READ_RESULT.shebang_probe_size != 0 ? READ_RESULT.shebang_probe_size : static_cast<size_t>(FILE_SIZE);
+    if (parse_shebang_line(elf_buffer, SHEBANG_BYTES, &shebang)) {
         delete[] elf_buffer;
         free_kernel_arg_env_once();
         if (shebang_depth >= MAX_SHEBANG_DEPTH) {
@@ -1353,15 +1550,17 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         }
 
         auto* interp_buf = new uint8_t[INTERP_SIZE];
-        ssize_t const INTERP_READ = read_file_fully(INTERP_FD, interp_buf, static_cast<size_t>(INTERP_SIZE), INTERP_PATH);
+        ExecImageReadResult const INTERP_READ =
+            read_exec_image_for_loader(INTERP_FD, interp_buf, static_cast<size_t>(INTERP_SIZE), INTERP_PATH, false);
         vfs::vfs_close(INTERP_FD);
 
-        if (INTERP_READ != INTERP_SIZE) {
+        if (INTERP_READ.status < 0) {
             delete[] interp_buf;
-            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -EIO, 0, WOS_PERF_CALLSITE());
+            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, INTERP_READ.status, 0,
+                                 WOS_PERF_CALLSITE());
             cleanup_new_image();
             free_kernel_arg_env_once();
-            return static_cast<uint64_t>(-EIO);
+            return static_cast<uint64_t>(INTERP_READ.status);
         }
 
         loader::elf::ElfLoadResult const INTERP_RESULT =
