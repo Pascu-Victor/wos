@@ -82,7 +82,8 @@ TARGET_CXX_FLAGS="--sysroot=$TARGET_SYSROOT -I$WOS_NINJA_COMPAT_INCLUDE -fPIC -f
 TARGET_LINK_FLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
 TARGET_CXX_STANDARD_LIBRARIES="-lc++ -lc++abi -lunwind -lm -lpthread -ldl -lrt -lc"
 
-cmake -S "$NINJA_SRC" -B "$NINJA_BUILD" -G Ninja \
+wos_timed_step "configure" "ninja_cmake" \
+    cmake -S "$NINJA_SRC" -B "$NINJA_BUILD" -G Ninja \
     "${WOS_CCACHE_CMAKE_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$TARGET_SYSROOT" \
@@ -125,8 +126,10 @@ if [ -f "$NINJA_BUILD/ninja" ]; then
     done
 fi
 
-cmake --build "$NINJA_BUILD" --parallel "$WOS_NINJA_JOBS" --target ninja
-cmake --install "$NINJA_BUILD"
+wos_timed_step "build" "ninja_cmake" \
+    cmake --build "$NINJA_BUILD" --parallel "$WOS_NINJA_JOBS" --target ninja
+wos_timed_step "install" "ninja_cmake" \
+    cmake --install "$NINJA_BUILD"
 
 require_file "$TARGET_SYSROOT/bin/ninja" "Ninja install did not produce $TARGET_SYSROOT/bin/ninja."
 if [ "$WOS_NINJA_STRIP" != "0" ]; then

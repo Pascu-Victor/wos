@@ -90,7 +90,8 @@ if [ -f "$CMAKE_BUILD/CMakeCache.txt" ]; then
     fi
 fi
 
-cmake -S "$CMAKE_SRC" -B "$CMAKE_BUILD" -G Ninja \
+wos_timed_step "configure" "cmake_for_wos" \
+    cmake -S "$CMAKE_SRC" -B "$CMAKE_BUILD" -G Ninja \
     "${WOS_CCACHE_CMAKE_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_MODULE_PATH="$CMAKE_SRC/Modules" \
@@ -132,8 +133,10 @@ cmake -S "$CMAKE_SRC" -B "$CMAKE_BUILD" -G Ninja \
     -DBUILD_QtDialog=OFF \
     -DCMake_BUILD_DEVELOPER_REFERENCE=OFF
 
-cmake --build "$CMAKE_BUILD" --parallel "$WOS_NINJA_JOBS" --target cmake ctest cpack
-cmake --install "$CMAKE_BUILD" --prefix "$TARGET_SYSROOT"
+wos_timed_step "build" "cmake_for_wos" \
+    cmake --build "$CMAKE_BUILD" --parallel "$WOS_NINJA_JOBS" --target cmake ctest cpack
+wos_timed_step "install" "cmake_for_wos" \
+    cmake --install "$CMAKE_BUILD" --prefix "$TARGET_SYSROOT"
 
 for tool in cmake ctest cpack; do
     require_file "$TARGET_SYSROOT/bin/$tool" "CMake install did not produce $tool."

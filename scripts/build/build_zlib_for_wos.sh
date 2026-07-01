@@ -113,10 +113,9 @@ export LDFLAGS="$ZLIB_LDFLAGS"
 
 if [ ! -f "$ZLIB_BUILD/Makefile" ] || [ "$ZLIB_SOURCE_DIR/configure" -nt "$ZLIB_BUILD/Makefile" ] || [ "$SCRIPT_DIR/build_zlib_for_wos.sh" -nt "$ZLIB_BUILD/Makefile" ]; then
     echo "Configuring zlib for WOS..."
-    (
-        cd "$ZLIB_BUILD"
+    wos_timed_step "configure" "zlib" \
+        wos_run_in_dir "$ZLIB_BUILD" \
         "$ZLIB_SOURCE_DIR/configure" --prefix= --static
-    )
 fi
 
 wos_make "$WOS_MAKE_JOBS" -C "$ZLIB_BUILD" libz.a

@@ -36,9 +36,9 @@ reset_libcxx_ninja_state() {
 
 require_file "$LIBCXX_BUILD/build.ninja" "Run tools/wos-toolchain.sh to configure libc++ first."
 
-if ! run_libcxx_ninja; then
+if ! wos_timed_step "build" "libcxx_runtime" run_libcxx_ninja; then
     reset_libcxx_ninja_state
-    run_libcxx_ninja
+    wos_timed_step "build" "libcxx_runtime_retry" run_libcxx_ninja
 fi
 
-run_libcxx_ninja install
+wos_timed_step "install" "libcxx_runtime" run_libcxx_ninja install

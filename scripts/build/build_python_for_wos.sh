@@ -321,20 +321,20 @@ else
 			if [ -f "$PYTHON_HOST_BUILD/Makefile" ]; then
 				host_env make ${WOS_MAKE_JOBSERVER_ARG:+"$WOS_MAKE_JOBSERVER_ARG"} -j"$WOS_MAKE_JOBS" -C "$PYTHON_HOST_BUILD" clean >/dev/null 2>&1 || true
 			fi
-		(
-			cd "$PYTHON_HOST_BUILD"
-			host_env "$PYTHON_SRC/configure" \
+			wos_timed_step "configure" "cpython_host" \
+				wos_run_in_dir "$PYTHON_HOST_BUILD" \
+				host_env "$PYTHON_SRC/configure" \
 				"${PYTHON_CONFIGURE_CACHE_ARGS[@]}" \
 				"${PYTHON_HOST_CONFIGURE_BUILD_ARGS[@]}" \
 				--prefix="$PYTHON_HOST_BUILD/install" \
 				--without-ensurepip \
 				--disable-test-modules \
 				--disable-ipv6
-		)
 	fi
 
 	echo "Building build-host CPython with WOS_MAKE_JOBS=$WOS_MAKE_JOBS..."
-	host_env make ${WOS_MAKE_JOBSERVER_ARG:+"$WOS_MAKE_JOBSERVER_ARG"} -C "$PYTHON_HOST_BUILD" -j"$WOS_MAKE_JOBS" python
+	wos_timed_step "make" "cpython_host:python" \
+		host_env make ${WOS_MAKE_JOBSERVER_ARG:+"$WOS_MAKE_JOBSERVER_ARG"} -C "$PYTHON_HOST_BUILD" -j"$WOS_MAKE_JOBS" python
 	BUILD_PYTHON="$PYTHON_HOST_BUILD/python"
 	require_file "$BUILD_PYTHON" "Build-host CPython did not produce $BUILD_PYTHON."
 fi
@@ -359,33 +359,32 @@ discard_stale_target_config
 
 if [ ! -f "$PYTHON_TARGET_BUILD/Makefile" ] || [ "$PYTHON_SRC/configure" -nt "$PYTHON_TARGET_BUILD/Makefile" ] || [ "$PYTHON_CONFIG_SITE" -nt "$PYTHON_TARGET_BUILD/Makefile" ] || [ "$SCRIPT_DIR/build_python_for_wos.sh" -nt "$PYTHON_TARGET_BUILD/Makefile" ]; then
 	echo "Configuring CPython for WOS..."
-	(
-		cd "$PYTHON_TARGET_BUILD"
+	wos_timed_step "configure" "cpython_target" \
+		wos_run_env_in_dir "$PYTHON_TARGET_BUILD" \
 		CC="$TARGET_CC" \
-            CXX="$TARGET_CXX" \
-            AR="$TARGET_AR" \
-            RANLIB="$TARGET_RANLIB" \
-            STRIP="$TARGET_STRIP" \
-            READELF="$TARGET_READELF" \
-            CFLAGS="$PYTHON_CFLAGS" \
-			CPPFLAGS="$PYTHON_CPPFLAGS" \
-			LDFLAGS="$PYTHON_LDFLAGS" \
-			CONFIG_SITE="$PYTHON_CONFIG_SITE" \
-			PKG_CONFIG_LIBDIR="$TARGET_PKG_CONFIG_LIBDIR" \
-			PKG_CONFIG_SYSROOT_DIR="$TARGET_SYSROOT" \
-			PKG_CONFIG_PATH= \
-			"$PYTHON_SRC/configure" \
-				"${PYTHON_CONFIGURE_CACHE_ARGS[@]}" \
-				--build="$BUILD_TRIPLE" \
-				--host="$TARGET_ARCH" \
-				--prefix=/usr \
-				--exec-prefix=/usr \
-				--with-build-python="$BUILD_PYTHON" \
-				--without-ensurepip \
-				--without-remote-debug \
-				--disable-test-modules \
-				--disable-ipv6
-	)
+		CXX="$TARGET_CXX" \
+		AR="$TARGET_AR" \
+		RANLIB="$TARGET_RANLIB" \
+		STRIP="$TARGET_STRIP" \
+		READELF="$TARGET_READELF" \
+		CFLAGS="$PYTHON_CFLAGS" \
+		CPPFLAGS="$PYTHON_CPPFLAGS" \
+		LDFLAGS="$PYTHON_LDFLAGS" \
+		CONFIG_SITE="$PYTHON_CONFIG_SITE" \
+		PKG_CONFIG_LIBDIR="$TARGET_PKG_CONFIG_LIBDIR" \
+		PKG_CONFIG_SYSROOT_DIR="$TARGET_SYSROOT" \
+		PKG_CONFIG_PATH= \
+		"$PYTHON_SRC/configure" \
+		"${PYTHON_CONFIGURE_CACHE_ARGS[@]}" \
+		--build="$BUILD_TRIPLE" \
+		--host="$TARGET_ARCH" \
+		--prefix=/usr \
+		--exec-prefix=/usr \
+		--with-build-python="$BUILD_PYTHON" \
+		--without-ensurepip \
+		--without-remote-debug \
+		--disable-test-modules \
+		--disable-ipv6
 fi
 
 if ! python_target_config_is_wos; then

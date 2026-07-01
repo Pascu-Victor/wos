@@ -95,8 +95,9 @@ if [ ! -f "$DB_BUILD/Makefile" ]; then
             ac_cv_func_utmpxname=no
         )
     fi
-    cd "$DB_BUILD"
-    "$DB_SRC/configure" \
+    wos_timed_step "configure" "dropbear" \
+        wos_run_in_dir "$DB_BUILD" \
+        "$DB_SRC/configure" \
         "${DROPBEAR_CONFIGURE_CACHE_ARGS[@]}" \
         "${DROPBEAR_CONFIGURE_BUILD_ARGS[@]}" \
         --host="$TARGET_ARCH" \
@@ -110,7 +111,6 @@ if [ ! -f "$DB_BUILD/Makefile" ]; then
         --disable-lastlog \
         --disable-syslog \
         --disable-harden
-    cd "$B/.."
 fi
 
 # Force relink if any sysroot library is newer than the binary.

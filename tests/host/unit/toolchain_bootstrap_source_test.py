@@ -132,7 +132,10 @@ def test_compiler_rt_runs_real_cmake_checks_without_forced_response_files() -> N
     require_tokens(
         block,
         [
-            'env -u LDFLAGS cmake -G Ninja',
+            'wos_timed_step "configure" "$detail_label"',
+            'wos_run_env_in_dir "$B/compiler-rt-build"',
+            "-u LDFLAGS",
+            "cmake -G Ninja",
             "-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY",
             "-DCOMPILER_RT_BUILD_SANITIZERS=$build_sanitizers",
             '"${COMPILER_RT_CMAKE_SYSROOT_ARGS[@]}"',
@@ -159,7 +162,9 @@ def test_compiler_rt_sanitizers_are_built_after_mlibc() -> None:
         source,
         [
             "build_compiler_rt OFF",
-            'cd $B/mlibc-build\nninja -j"$WOS_NINJA_JOBS" && ninja -j"$WOS_NINJA_JOBS" install',
+            'wos_timed_step "build" "mlibc"',
+            'wos_timed_step "install" "mlibc"',
+            'wos_run_in_dir "$B/mlibc-build"',
             'ninja -j"$COMPILER_RT_NINJA_JOBS" install',
             "build_compiler_rt ON",
             'if [ "$require_sanitizers" = "ON" ]; then',
@@ -171,7 +176,7 @@ def test_compiler_rt_sanitizers_are_built_after_mlibc() -> None:
         fail("compiler-rt bootstrap must not relink archives in a second immediate Ninja invocation on WOS")
 
     bootstrap_index = source.index("build_compiler_rt OFF")
-    mlibc_install_index = source.index("cd $B/mlibc-build")
+    mlibc_install_index = source.index('wos_timed_step "install" "mlibc"')
     sanitizer_index = source.index("build_compiler_rt ON")
     libcxx_index = source.index("# 6. Build libcxx")
     if not bootstrap_index < mlibc_install_index < sanitizer_index < libcxx_index:
@@ -381,6 +386,8 @@ def test_wos_build_jobs_helper_has_self_hostable_fallbacks() -> None:
             "WOS_BOOTSTRAP_DETAIL_TSV",
             "wos_record_detail()",
             "wos_timed_step()",
+            "wos_run_in_dir()",
+            "wos_run_env_in_dir()",
             "wos_remove_tree()",
             'local attempts="${WOS_REMOVE_TREE_RETRIES:-5}"',
             "refusing to remove unsafe path",
@@ -495,10 +502,11 @@ def test_top_level_build_paths_propagate_full_parallelism() -> None:
         [
             'WOS_NINJA_JOBS="$(wos_ninja_jobs)"',
             'ninja -j"$WOS_NINJA_JOBS" -C "$LIBCXX_BUILD" "$@"',
-            "if ! run_libcxx_ninja; then",
+            'if ! wos_timed_step "build" "libcxx_runtime" run_libcxx_ninja; then',
             "reset_libcxx_ninja_state",
             'rm -f "$LIBCXX_BUILD/.ninja_log" "$LIBCXX_BUILD/.ninja_deps"',
-            "run_libcxx_ninja install",
+            'wos_timed_step "build" "libcxx_runtime_retry" run_libcxx_ninja',
+            'wos_timed_step "install" "libcxx_runtime" run_libcxx_ninja install',
         ],
         "libc++ nested Ninja retry keeps full parallelism",
     )

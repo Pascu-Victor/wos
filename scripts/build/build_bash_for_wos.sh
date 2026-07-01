@@ -273,20 +273,19 @@ export CPPFLAGS="-I$TARGET_SYSROOT/include"
 export LDFLAGS="$BASH_LDFLAGS"
 export CONFIG_SITE="$BASH_BUILD/config.site"
 
-(
-    cd "$BASH_WORK"
+wos_timed_step "configure" "bash" \
+    wos_run_in_dir "$BASH_WORK" \
     ./configure \
-        --build="$BUILD_TRIPLE" \
-        --host="$TARGET_ARCH" \
-        --prefix=/usr \
-        --exec-prefix=/usr \
-        --bindir=/usr/bin \
-        --disable-nls \
-        --disable-rpath \
-        --without-bash-malloc \
-        --without-installed-readline \
-        --with-gnu-ld
-)
+    --build="$BUILD_TRIPLE" \
+    --host="$TARGET_ARCH" \
+    --prefix=/usr \
+    --exec-prefix=/usr \
+    --bindir=/usr/bin \
+    --disable-nls \
+    --disable-rpath \
+    --without-bash-malloc \
+    --without-installed-readline \
+    --with-gnu-ld
 
 if [ "$HOST_SYSTEM" = "WOS" ]; then
     refresh_bash_build_generated_files "$BASH_WORK"

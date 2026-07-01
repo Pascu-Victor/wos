@@ -213,38 +213,37 @@ export LIBS="-lssl -lcrypto -lz -lpthread -ldl"
 export PKG_CONFIG=false
 export ac_cv_header_stdatomic_h=no
 
-(
-    cd "$CURL_WORK"
+wos_timed_step "configure" "curl" \
+    wos_run_in_dir "$CURL_WORK" \
     ./configure \
-        "${CURL_CONFIGURE_CACHE_ARGS[@]}" \
-        "${CURL_CONFIGURE_BUILD_ARGS[@]}" \
-        --host="$TARGET_ARCH" \
-        --prefix= \
-        --bindir=/bin \
-        --libdir=/lib \
-        --includedir=/include \
-        --datarootdir=/share \
-        --datadir=/share \
-        --mandir=/share/man \
-        --disable-shared \
-        --enable-static \
-        --with-openssl="$TARGET_SYSROOT" \
-        --with-zlib="$TARGET_SYSROOT" \
-        --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt \
-        --disable-ldap \
-        --disable-ldaps \
-        --without-libpsl \
-        --without-brotli \
-        --without-zstd \
-        --without-nghttp2 \
-        --without-ngtcp2 \
-        --without-nghttp3 \
-        --without-quiche \
-        --without-libidn2 \
-        --disable-threaded-resolver \
-        --disable-manual \
-        --disable-docs
-)
+    "${CURL_CONFIGURE_CACHE_ARGS[@]}" \
+    "${CURL_CONFIGURE_BUILD_ARGS[@]}" \
+    --host="$TARGET_ARCH" \
+    --prefix= \
+    --bindir=/bin \
+    --libdir=/lib \
+    --includedir=/include \
+    --datarootdir=/share \
+    --datadir=/share \
+    --mandir=/share/man \
+    --disable-shared \
+    --enable-static \
+    --with-openssl="$TARGET_SYSROOT" \
+    --with-zlib="$TARGET_SYSROOT" \
+    --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt \
+    --disable-ldap \
+    --disable-ldaps \
+    --without-libpsl \
+    --without-brotli \
+    --without-zstd \
+    --without-nghttp2 \
+    --without-ngtcp2 \
+    --without-nghttp3 \
+    --without-quiche \
+    --without-libidn2 \
+    --disable-threaded-resolver \
+    --disable-manual \
+    --disable-docs
 
 wos_make "$WOS_MAKE_JOBS" -C "$CURL_WORK"
 wos_make "$WOS_MAKE_JOBS" -C "$CURL_WORK" \

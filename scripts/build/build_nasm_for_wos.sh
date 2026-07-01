@@ -211,18 +211,17 @@ fi
 
 if [ ! -f "$NASM_BUILD/Makefile" ] || [ "$NASM_SOURCE_DIR/configure" -nt "$NASM_BUILD/Makefile" ]; then
     echo "Configuring NASM for WOS..."
-    (
-        cd "$NASM_BUILD"
+    wos_timed_step "configure" "nasm" \
+        wos_run_env_in_dir "$NASM_BUILD" \
         ASCIIDOC=false \
-            XMLTO=false \
-            XZ=false \
-            "$NASM_SOURCE_DIR/configure" \
-                --build="$BUILD_TRIPLE" \
-                --host="$TARGET_ARCH" \
-                --prefix=/usr \
-                --with-zlib=no \
-                --disable-pdf-compression
-    )
+        XMLTO=false \
+        XZ=false \
+        "$NASM_SOURCE_DIR/configure" \
+        --build="$BUILD_TRIPLE" \
+        --host="$TARGET_ARCH" \
+        --prefix=/usr \
+        --with-zlib=no \
+        --disable-pdf-compression
 fi
 
 seed_nasm_generated_files

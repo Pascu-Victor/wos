@@ -257,17 +257,16 @@ if [ ! -f "$MAKE_BUILD/Makefile" ] || [ ! -f "$MAKE_BUILD/config.status" ] || [ 
             ac_cv_func_mempcpy=yes
         )
     fi
-    (
-        cd "$MAKE_BUILD"
+    wos_timed_step "configure" "gnu_make" \
+        wos_run_in_dir "$MAKE_BUILD" \
         "$MAKE_SOURCE_DIR/configure" \
-            "${GNU_MAKE_CONFIGURE_CACHE_ARGS[@]}" \
-            "${GNU_MAKE_CONFIGURE_BUILD_ARGS[@]}" \
-            --host="$TARGET_ARCH" \
-            --prefix="$TARGET_SYSROOT" \
-            --disable-nls \
-            --disable-load \
-            --without-guile
-    )
+        "${GNU_MAKE_CONFIGURE_CACHE_ARGS[@]}" \
+        "${GNU_MAKE_CONFIGURE_BUILD_ARGS[@]}" \
+        --host="$TARGET_ARCH" \
+        --prefix="$TARGET_SYSROOT" \
+        --disable-nls \
+        --disable-load \
+        --without-guile
 fi
 
 if [ "$HOST_SYSTEM" = "WOS" ]; then

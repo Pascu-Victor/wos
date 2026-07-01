@@ -194,10 +194,17 @@ install_compiler_rt_resource_dir() {
 
 build_compiler_rt() {
     local build_sanitizers="$1"
+    local detail_label="compiler_rt_builtins"
+
+    if [ "$build_sanitizers" = "ON" ]; then
+        detail_label="compiler_rt_sanitizers"
+    fi
 
     mkdir -p "$B/compiler-rt-build"
-    cd "$B/compiler-rt-build"
-    env -u LDFLAGS cmake -G Ninja \
+    wos_timed_step "configure" "$detail_label" \
+        wos_run_env_in_dir "$B/compiler-rt-build" \
+        -u LDFLAGS \
+        cmake -G Ninja \
      "${WOS_CCACHE_CMAKE_ARGS[@]}" \
      -DCMAKE_BUILD_TYPE=Release \
      -DCMAKE_INSTALL_PREFIX=$HOST/lib/clang/22/target \
@@ -236,7 +243,9 @@ build_compiler_rt() {
      -DWOS=ON \
      $B/src/llvm-project/compiler-rt
 
-    ninja -j"$COMPILER_RT_NINJA_JOBS" install
+    wos_timed_step "build" "$detail_label" \
+        wos_run_in_dir "$B/compiler-rt-build" \
+        ninja -j"$COMPILER_RT_NINJA_JOBS" install
     install_compiler_rt_resource_dir "$build_sanitizers"
 }
 
@@ -281,7 +290,8 @@ EOF
 
 # Build mlibc headers
 mkdir -p $B/mlibc-headers
-meson_setup_rerunnable "$B/mlibc-headers" --prefix=$SYSROOT \
+wos_timed_step "configure" "mlibc_headers" \
+    meson_setup_rerunnable "$B/mlibc-headers" --prefix=$SYSROOT \
     --libdir=lib \
     --includedir=include \
     -Dheaders_only=true \
@@ -292,8 +302,10 @@ meson_setup_rerunnable "$B/mlibc-headers" --prefix=$SYSROOT \
     -Dglibc_option=enabled \
     -Db_staticpic=disabled \
     $B/src/mlibc
+wos_timed_step "install" "mlibc_headers" \
+    wos_run_in_dir "$B/mlibc-headers" \
+    ninja -j"$WOS_NINJA_JOBS" install
 cd $B/mlibc-headers
-ninja -j"$WOS_NINJA_JOBS" install
 
 # Create minimal CRT files for compiler-rt build (these will be replaced by mlibc later)
 touch empty.c
@@ -322,8 +334,9 @@ bootstrap_phase_end
 
 bootstrap_phase_start 3 "libcxx and libcxxabi headers"
 mkdir -p $B/libcxx-bootstrap
-cd $B/libcxx-bootstrap
-cmake -G Ninja \
+wos_timed_step "configure" "libcxx_headers" \
+    wos_run_in_dir "$B/libcxx-bootstrap" \
+    cmake -G Ninja \
  "${WOS_CCACHE_CMAKE_ARGS[@]}" \
  -DCMAKE_BUILD_TYPE=Release \
  -DCMAKE_INSTALL_PREFIX=$SYSROOT \
@@ -366,7 +379,9 @@ cmake -G Ninja \
  -DLIBCXX_ENABLE_LOCALIZATION=OFF \
  $B/src/llvm-project/runtimes
 
-ninja -j"$WOS_NINJA_JOBS" install-cxx-headers install-cxxabi-headers
+wos_timed_step "install" "libcxx_headers" \
+    wos_run_in_dir "$B/libcxx-bootstrap" \
+    ninja -j"$WOS_NINJA_JOBS" install-cxx-headers install-cxxabi-headers
 bootstrap_phase_end
 
 # 4. Build mlibc
@@ -397,7 +412,8 @@ export LDFLAGS="--sysroot=$SYSROOT"
 wos_prefetch_meson_subprojects "$B/src/mlibc" freestnd-c-hdrs freestnd-cxx-hdrs frigg
 
 mkdir -p $B/mlibc-build
-meson_setup_rerunnable "$B/mlibc-build" --prefix=$SYSROOT \
+wos_timed_step "configure" "mlibc" \
+    meson_setup_rerunnable "$B/mlibc-build" --prefix=$SYSROOT \
   --sysconfdir=etc \
   --buildtype=release \
   --cross-file=$B/../tools/x86_64-pc-wos-mlibc.txt \
@@ -411,8 +427,12 @@ meson_setup_rerunnable "$B/mlibc-build" --prefix=$SYSROOT \
   -Dbsd_option=enabled \
   -Db_sanitize=none \
   $B/src/mlibc
-cd $B/mlibc-build
-ninja -j"$WOS_NINJA_JOBS" && ninja -j"$WOS_NINJA_JOBS" install
+wos_timed_step "build" "mlibc" \
+    wos_run_in_dir "$B/mlibc-build" \
+    ninja -j"$WOS_NINJA_JOBS"
+wos_timed_step "install" "mlibc" \
+    wos_run_in_dir "$B/mlibc-build" \
+    ninja -j"$WOS_NINJA_JOBS" install
 bootstrap_phase_end
 
 # 5. Finish compiler-rt now that mlibc installed the libraries ASAN links to.
@@ -425,8 +445,9 @@ bootstrap_phase_end
 
 bootstrap_phase_start 6 "libcxx libcxxabi and libunwind"
 mkdir -p $B/libcxx-build
-cd $B/libcxx-build
-cmake -G Ninja \
+wos_timed_step "configure" "libcxx_runtime" \
+    wos_run_in_dir "$B/libcxx-build" \
+    cmake -G Ninja \
  "${WOS_CCACHE_CMAKE_ARGS[@]}" \
  -ULIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL \
  -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi;libunwind' \

@@ -241,19 +241,18 @@ if [ "$HOST_SYSTEM" = "WOS" ]; then
     )
 fi
 
-(
-    cd "$TLS_WORK"
+wos_timed_step "configure" "libressl" \
+    wos_run_in_dir "$TLS_WORK" \
     ./configure \
-        "${TLS_CONFIGURE_CACHE_ARGS[@]}" \
-        "${TLS_CONFIGURE_BUILD_ARGS[@]}" \
-        --host="$TARGET_ARCH" \
-        --prefix= \
-        --libdir=/lib \
-        --disable-shared \
-        --enable-static \
-        --disable-tests \
-        --disable-asm
-)
+    "${TLS_CONFIGURE_CACHE_ARGS[@]}" \
+    "${TLS_CONFIGURE_BUILD_ARGS[@]}" \
+    --host="$TARGET_ARCH" \
+    --prefix= \
+    --libdir=/lib \
+    --disable-shared \
+    --enable-static \
+    --disable-tests \
+    --disable-asm
 disable_libressl_man_install
 
 wos_make "$WOS_MAKE_JOBS" -C "$TLS_WORK"

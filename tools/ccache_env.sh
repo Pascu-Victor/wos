@@ -141,6 +141,26 @@ wos_timed_step() {
     return "$status"
 }
 
+wos_run_in_dir() {
+    local dir="$1"
+    shift
+
+    (
+        cd "$dir"
+        "$@"
+    )
+}
+
+wos_run_env_in_dir() {
+    local dir="$1"
+    shift
+
+    (
+        cd "$dir"
+        env "$@"
+    )
+}
+
 wos_remove_tree() {
     local path="$1"
     local attempts="${WOS_REMOVE_TREE_RETRIES:-5}"
