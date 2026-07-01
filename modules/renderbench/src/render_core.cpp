@@ -2183,7 +2183,7 @@ void print_usage(const char* argv0) {
                  "[--disable-worker-output-queue|--enable-worker-output-queue] "
                  "[--disable-single-thread-worker-queue|--enable-single-thread-worker-queue] "
                  "[--enable-process-persistent-workers|--disable-process-persistent-workers] "
-                 "[--disable-final-image|--enable-final-image] [--final-image-max-pixels N]\n",
+                 "[--disable-final-image|--enable-final-image] [--final-image-max-pixels N] [--live]\n",
                  argv0 != nullptr ? argv0 : "renderbench");
 }
 
@@ -2309,6 +2309,9 @@ auto parse_options(int argc, char* const* argv, Backend default_backend, Options
                 return ParseStatus::Error;
             }
             options.final_image_max_pixels = static_cast<uint64_t>(parsed);
+        } else if (ARG == "--live") {
+            options.live_preview = true;
+            options.preview_update_interval_seconds = LIVE_PREVIEW_UPDATE_INTERVAL_SECONDS;
         } else if (ARG == "--tracebench-worker" || ARG == "--worker-command-stream") {
             continue;
         } else if (ARG == "--worker-id") {
@@ -2578,6 +2581,8 @@ auto write_status(const Options& options, const Progress& progress) -> bool {
         << "  \"single_thread_worker_queue_disabled\": " << (options.disable_single_thread_worker_queue ? "true" : "false") << ",\n"
         << "  \"final_image_enabled\": " << (options.write_final_image ? "true" : "false") << ",\n"
         << "  \"final_image_max_pixels\": " << options.final_image_max_pixels << ",\n"
+        << "  \"live_preview\": " << (options.live_preview ? "true" : "false") << ",\n"
+        << "  \"preview_update_interval_seconds\": " << options.preview_update_interval_seconds << ",\n"
         << "  \"tiles_done\": " << progress.tiles_done << ",\n"
         << "  \"total_tiles\": " << progress.total_tiles << ",\n"
         << "  \"samples_done\": " << progress.samples_done << ",\n"
@@ -2609,6 +2614,8 @@ auto write_metrics(const Options& options, const Progress& progress, double rays
         << "  \"single_thread_worker_queue_disabled\": " << (options.disable_single_thread_worker_queue ? "true" : "false") << ",\n"
         << "  \"final_image_enabled\": " << (options.write_final_image ? "true" : "false") << ",\n"
         << "  \"final_image_max_pixels\": " << options.final_image_max_pixels << ",\n"
+        << "  \"live_preview\": " << (options.live_preview ? "true" : "false") << ",\n"
+        << "  \"preview_update_interval_seconds\": " << options.preview_update_interval_seconds << ",\n"
         << "  \"elapsed_seconds\": " << progress.elapsed_seconds << ",\n"
         << "  \"primary_samples\": " << progress.total_samples << ",\n"
         << "  \"rays_per_second_estimate\": " << rays_per_second << "\n"

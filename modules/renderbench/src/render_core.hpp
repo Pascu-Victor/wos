@@ -24,6 +24,9 @@ enum class ParseStatus {
     Error,
 };
 
+constexpr double DEFAULT_PREVIEW_UPDATE_INTERVAL_SECONDS = 10.0;
+constexpr double LIVE_PREVIEW_UPDATE_INTERVAL_SECONDS = 1.0;
+
 struct Options {
     std::string scene_path;
     Backend backend = Backend::Ipc;
@@ -48,6 +51,8 @@ struct Options {
     bool process_persistent_workers = false;
     bool write_final_image = true;
     uint64_t final_image_max_pixels = 8ULL * 1024ULL * 1024ULL;
+    bool live_preview = false;
+    double preview_update_interval_seconds = DEFAULT_PREVIEW_UPDATE_INTERVAL_SECONDS;
 };
 
 struct Tile {

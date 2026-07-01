@@ -99,6 +99,24 @@ TEST(RenderbenchOptions, WorkerOutputQueueIsOptIn) {
     EXPECT_FALSE(options.disable_single_thread_worker_queue);
 }
 
+TEST(RenderbenchOptions, LivePreviewUsesShortPreviewCadence) {
+    std::vector<char*> default_argv{
+        const_cast<char*>("renderbench"),
+    };
+    tracebench::Options options;
+    ASSERT_EQ(parse(default_argv, options), tracebench::ParseStatus::Ok);
+    EXPECT_FALSE(options.live_preview);
+    EXPECT_DOUBLE_EQ(options.preview_update_interval_seconds, tracebench::DEFAULT_PREVIEW_UPDATE_INTERVAL_SECONDS);
+
+    std::vector<char*> live_argv{
+        const_cast<char*>("renderbench"),
+        const_cast<char*>("--live"),
+    };
+    ASSERT_EQ(parse(live_argv, options), tracebench::ParseStatus::Ok);
+    EXPECT_TRUE(options.live_preview);
+    EXPECT_DOUBLE_EQ(options.preview_update_interval_seconds, tracebench::LIVE_PREVIEW_UPDATE_INTERVAL_SECONDS);
+}
+
 TEST(RenderbenchFilmView, StorageCompletenessRequiresRgbTriplesForEveryPixel) {
     auto storage = tracebench::make_film_storage(3, 2);
     tracebench::FilmView complete{

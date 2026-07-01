@@ -55,7 +55,6 @@ constexpr size_t WORKER_PIPE_DRAIN_BYTE_BUDGET = static_cast<size_t>(8U) * 1024U
 constexpr int WORKER_PIPE_IDLE_POLL_TIMEOUT_MS = 5;
 constexpr double COORDINATOR_STALL_REPORT_SECONDS = 15.0;
 constexpr double STATUS_UPDATE_INTERVAL_SECONDS = 0.75;
-constexpr double PREVIEW_UPDATE_INTERVAL_SECONDS = 10.0;
 constexpr double WORKER_CANCEL_KILL_AFTER_SECONDS = 2.0;
 constexpr double WORKER_CANCEL_GIVE_UP_AFTER_SECONDS = 10.0;
 constexpr double WORKER_EXIT_KILL_AFTER_SECONDS = 2.0;
@@ -454,6 +453,8 @@ void print_mpi_metrics_json(const tracebench::Options& options, const tracebench
     std::printf("\"coordinator_reserve_cpus\":%d,", options.coordinator_reserve_cpus);
     std::printf("\"node_worker_reserve_cpus\":%d,", options.node_worker_reserve_cpus);
     std::printf("\"coordinator_skip_local_worker\":%s,", options.coordinator_skip_local_worker ? "true" : "false");
+    std::printf("\"live_preview\":%s,", options.live_preview ? "true" : "false");
+    std::printf("\"preview_update_interval_seconds\":%.3f,", options.preview_update_interval_seconds);
     std::printf("\"world_size\":%d,", world_size);
     std::printf("\"threads_per_rank\":%d,", threads_per_rank);
     std::printf("\"width\":%d,", options.width);
@@ -1315,6 +1316,9 @@ auto make_worker_args(const std::string& program_path, const tracebench::Options
         "--run-id",
         options.run_id,
     };
+    if (options.live_preview) {
+        args.emplace_back("--live");
+    }
     if (spec.batch_count > 0) {
         args.emplace_back("--worker-batch-start");
         args.emplace_back(std::to_string(spec.batch_start));
@@ -2286,7 +2290,7 @@ auto run_node_threads(const tracebench::Options& options) -> int {
         }
         if (NOW >= next_preview || !running) {
             (void)tracebench::write_preview_png(options, film);
-            next_preview = NOW + PREVIEW_UPDATE_INTERVAL_SECONDS;
+            next_preview = NOW + options.preview_update_interval_seconds;
         }
         if (running) {
             timespec delay{.tv_sec = 0, .tv_nsec = 100000000L};
@@ -2782,7 +2786,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
         }
         if (NOW >= next_preview || open_pipes == 0) {
             (void)tracebench::write_preview_png(options, film);
-            next_preview = NOW + PREVIEW_UPDATE_INTERVAL_SECONDS;
+            next_preview = NOW + options.preview_update_interval_seconds;
         }
         if (open_pipes != 0) {
             int const POLL_TIMEOUT_MS = should_poll_workers_immediately(std::span<const ChildWorker>(workers.data(), workers.size()))
