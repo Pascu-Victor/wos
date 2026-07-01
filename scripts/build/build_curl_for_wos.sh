@@ -145,6 +145,44 @@ patch_config_sub_for_wos() {
     fi
 }
 
+patch_getifaddrs_probe_for_wos() {
+    local configure="$1"
+    local patched="$configure.tmp"
+
+    require_file "$configure" "curl source is missing configure."
+    if grep -q 'WOS skips curl getifaddrs run probe' "$configure"; then
+        return 0
+    fi
+
+    echo "Patching curl getifaddrs runtime probe for WOS..."
+    if ! awk '
+        /tst_works_getifaddrs="unknown"/ {
+            in_getifaddrs_probe = 1
+        }
+        in_getifaddrs_probe && $0 ~ /^[[:space:]]*if test "\$cross_compiling" != "yes" &&$/ {
+            print "    # WOS skips curl getifaddrs run probe: mlibc exposes the symbol,"
+            print "    # but the sysdep currently aborts, and curl must leave it disabled."
+            print "    tst_works_getifaddrs=\"no\""
+            print "    if false && test \"$cross_compiling\" != \"yes\" &&"
+            in_getifaddrs_probe = 0
+            patched = 1
+            next
+        }
+        { print }
+        END {
+            if (!patched)
+                exit 42
+        }
+    ' "$configure" >"$patched"; then
+        rm -f "$patched"
+        echo "ERROR: do not know how to patch $configure getifaddrs probe for WOS." >&2
+        exit 1
+    fi
+
+    mv "$patched" "$configure"
+    chmod +x "$configure"
+}
+
 stage_ca_bundle() {
     local source="${WOS_CA_CERT_BUNDLE:-}"
     local candidate
@@ -331,6 +369,7 @@ require_file "$TARGET_SYSROOT/include/openssl/ssl.h" "Run scripts/build/build_op
 CURL_SOURCE_DIR="$(resolve_curl_source)"
 copy_source_to_workdir "$CURL_SOURCE_DIR"
 patch_config_sub_for_wos "$CURL_WORK/config.sub"
+patch_getifaddrs_probe_for_wos "$CURL_WORK/configure"
 write_curl_config_site
 export CONFIG_SITE="$CURL_WORK/config.site"
 
