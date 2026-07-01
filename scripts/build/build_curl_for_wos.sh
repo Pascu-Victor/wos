@@ -38,6 +38,15 @@ if [ "$HOST_SYSTEM" = "WOS" ]; then
         ac_cv_path_GREP=/usr/bin/grep
         "ac_cv_path_EGREP=/usr/bin/grep -E"
         "ac_cv_path_FGREP=/usr/bin/grep -F"
+        ac_cv_path_SED=/usr/bin/sed
+        "ac_cv_path_install=/usr/bin/install -c"
+        ac_cv_path_lt_DD=/usr/bin/dd
+        ac_cv_prog_AWK=awk
+        ac_cv_prog_ac_ct_OBJDUMP=objdump
+        lt_cv_path_LD=/usr/bin/ld
+        "lt_cv_path_NM=/usr/bin/nm -B"
+        lt_cv_path_mainfest_tool=no
+        "lt_cv_truncate_bin=/usr/bin/dd bs=4096 count=1"
     )
 fi
 
