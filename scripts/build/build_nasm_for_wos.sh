@@ -154,7 +154,6 @@ seed_nasm_generated_files() {
         wos_refresh_file_mtime "$NASM_BUILD/$file"
     done
 
-    sleep 1
     for file in \
         asm/tokhash.c \
         asm/tokens.h \

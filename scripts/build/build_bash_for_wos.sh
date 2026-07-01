@@ -123,9 +123,6 @@ refresh_bash_release_generated_files() {
         configure
     )
 
-    # WOS BusyBox touch currently does not advance existing mtimes. Rewrite the
-    # release-generated Autoconf outputs so Bash maintainer rules stay idle.
-    sleep 1
     for file in "${generated_files[@]}"; do
         wos_refresh_file_mtime "$source_dir/$file"
     done
@@ -143,7 +140,6 @@ refresh_bash_build_generated_files() {
         support/bashbug.sh
     )
 
-    sleep 1
     for file in "${generated_files[@]}"; do
         wos_refresh_file_mtime "$build_dir/$file"
     done

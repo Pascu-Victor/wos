@@ -51,6 +51,96 @@ wos_setup_ccache_cmake_args() {
     fi
 }
 
+wos_detail_file() {
+    printf '%s\n' "${WOS_BUILD_DETAIL_TSV:-${WOS_BOOTSTRAP_DETAIL_TSV:-}}"
+}
+
+wos_now_ms() {
+    python3 - <<'PY'
+import time
+
+print(time.monotonic_ns() // 1_000_000)
+PY
+}
+
+wos_timestamp_utc() {
+    python3 - <<'PY'
+from datetime import datetime, timezone
+
+print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))
+PY
+}
+
+wos_detail_header() {
+    local output
+    output="$(wos_detail_file)"
+    [ -n "$output" ] || return 0
+
+    case "$output" in
+        */*) mkdir -p "${output%/*}" ;;
+    esac
+    if [ ! -s "$output" ]; then
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "timestamp_utc" "phase" "label" "elapsed_ms" "status" \
+            "build_jobs" "ninja_jobs" "host_system" >> "$output"
+    fi
+}
+
+wos_record_detail() {
+    local phase="$1"
+    local label="$2"
+    local elapsed_ms="$3"
+    local status="$4"
+    local output
+
+    output="$(wos_detail_file)"
+    [ -n "$output" ] || return 0
+    wos_detail_header
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(wos_timestamp_utc)" "$phase" "$label" "$elapsed_ms" "$status" \
+        "${WOS_BUILD_JOBS:-auto}" "${WOS_NINJA_JOBS:-auto}" \
+        "$(uname -s 2>/dev/null || printf unknown)" >> "$output"
+}
+
+wos_timed_step() {
+    local phase="$1"
+    local label="$2"
+    shift 2
+
+    if [ -z "$(wos_detail_file)" ]; then
+        "$@"
+        return $?
+    fi
+
+    local start_ms
+    local end_ms
+    local status
+    local had_errexit=0
+
+    start_ms="$(wos_now_ms)"
+    case $- in
+        *e*)
+            had_errexit=1
+            set +e
+            ;;
+    esac
+
+    "$@"
+    status=$?
+
+    if [ "$had_errexit" -eq 1 ]; then
+        set -e
+    fi
+    end_ms="$(wos_now_ms)"
+
+    if [ "$status" -eq 0 ]; then
+        wos_record_detail "$phase" "$label" "$((end_ms - start_ms))" "ok"
+    else
+        wos_record_detail "$phase" "$label" "$((end_ms - start_ms))" "fail:$status"
+    fi
+    return "$status"
+}
+
 wos_remove_tree() {
     local path="$1"
     local attempts="${WOS_REMOVE_TREE_RETRIES:-5}"
@@ -80,7 +170,13 @@ wos_remove_tree() {
     rm -rf "$path"
 }
 
-wos_copy_tree_entries_excluding() {
+wos_copy_tree_label() {
+    local source_dir="$1"
+    local dest_dir="$2"
+    printf '%s->%s\n' "${source_dir##*/}" "${dest_dir##*/}"
+}
+
+wos_copy_tree_entries_excluding_impl() {
     local source_dir="$1"
     local dest_dir="$2"
     shift 2
@@ -106,6 +202,15 @@ wos_copy_tree_entries_excluding() {
     done
 }
 
+wos_copy_tree_entries_excluding() {
+    local source_dir="$1"
+    local dest_dir="$2"
+    local label
+
+    label="$(wos_copy_tree_label "$source_dir" "$dest_dir")"
+    wos_timed_step "copy_tree" "$label" wos_copy_tree_entries_excluding_impl "$@"
+}
+
 wos_dir_has_entries() {
     local dir="$1"
     local entry
@@ -122,6 +227,10 @@ wos_refresh_file_mtime() {
     local tmp
 
     [ -f "$file" ] || return 0
+    if touch "$file" 2>/dev/null; then
+        return 0
+    fi
+
     tmp="$file.wos-mtime.$$"
     rm -f "$tmp"
     cp "$file" "$tmp"
@@ -485,12 +594,54 @@ wos_make() {
     shift
 
     local jobserver_arg
+    local label
     jobserver_arg="$(wos_make_jobserver_arg "$jobs")"
+    label="$(wos_make_label "$@")"
     if [ -n "$jobserver_arg" ]; then
-        make "$jobserver_arg" -j"$jobs" "$@"
+        wos_timed_step "make" "$label" make "$jobserver_arg" -j"$jobs" "$@"
     else
-        make -j"$jobs" "$@"
+        wos_timed_step "make" "$label" make -j"$jobs" "$@"
     fi
+}
+
+wos_make_label() {
+    local make_dir=""
+    local targets=""
+    local expect_make_dir=0
+    local arg
+
+    for arg in "$@"; do
+        if [ "$expect_make_dir" -eq 1 ]; then
+            make_dir="$arg"
+            expect_make_dir=0
+            continue
+        fi
+        case "$arg" in
+            -C)
+                expect_make_dir=1
+                ;;
+            -C*)
+                make_dir="${arg#-C}"
+                ;;
+            -*|*=*)
+                ;;
+            *)
+                if [ -n "$targets" ]; then
+                    targets="$targets,$arg"
+                else
+                    targets="$arg"
+                fi
+                ;;
+        esac
+    done
+
+    if [ -z "$make_dir" ]; then
+        make_dir="."
+    fi
+    if [ -z "$targets" ]; then
+        targets="all"
+    fi
+    printf '%s:%s\n' "${make_dir##*/}" "$targets"
 }
 
 wos_ninja_jobs() {

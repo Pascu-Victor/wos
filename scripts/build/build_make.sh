@@ -161,6 +161,10 @@ rewrite_file_for_mtime() {
         return 0
     fi
 
+    if touch "$path" 2>/dev/null; then
+        return 0
+    fi
+
     cp "$path" "$tmp"
     mv "$tmp" "$path"
 }
@@ -179,9 +183,6 @@ refresh_make_release_generated_files() {
         po/Makefile.in
     )
 
-    # WOS BusyBox touch currently does not advance existing mtimes. Rewrite the
-    # release-generated files instead so Automake maintainer rules stay idle.
-    sleep 1
     for file in "${generated_files[@]}"; do
         rewrite_file_for_mtime "$source_dir/$file"
     done
@@ -201,7 +202,6 @@ refresh_make_build_generated_files() {
         src/stamp-h1
     )
 
-    sleep 1
     for file in "${generated_files[@]}"; do
         rewrite_file_for_mtime "$build_dir/$file"
     done

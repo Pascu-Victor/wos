@@ -169,7 +169,6 @@ refresh_libressl_release_generated_files() {
     )
     local file
 
-    sleep 2
     for file in "${generated_files[@]}"; do
         wos_refresh_file_mtime "$TLS_WORK/$file"
     done
