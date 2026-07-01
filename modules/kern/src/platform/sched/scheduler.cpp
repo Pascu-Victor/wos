@@ -481,6 +481,8 @@ inline bool is_waitpid_wait_channel(task::WaitChannelKind wait_channel) { return
 inline auto effective_process_group_id(const task::Task& task) -> uint64_t { return task.pgid != 0 ? task.pgid : task::process_pid(task); }
 
 inline constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
+inline constexpr uint64_t WAIT_PROCESS_GROUP_SELECTOR = 1ULL << 63U;
+inline constexpr uint64_t WAIT_PROCESS_GROUP_MASK = WAIT_PROCESS_GROUP_SELECTOR - 1U;
 inline constexpr int WOS_WSTOPPED = 2;
 inline constexpr int STOP_STATUS_LOW = 0x7f;
 inline constexpr uint64_t SIGCHLD_MASK = 1ULL << (17 - 1);
@@ -495,11 +497,33 @@ inline auto active_waitpid_unwaited_child(task::Task* child, void* raw_waiter) -
 inline auto active_waitpid_waitable_exit_child(task::Task* child, void* raw_waiter) -> bool;
 inline auto active_waitpid_job_stop_child(task::Task* child, void* raw_waiter) -> bool;
 
+inline auto wait_selector_is_process_group(uint64_t selector) -> bool {
+    return selector != WAIT_ANY_CHILD && (selector & WAIT_PROCESS_GROUP_SELECTOR) != 0;
+}
+
+inline auto wait_selector_is_specific_pid(uint64_t selector) -> bool {
+    return selector != 0 && selector != WAIT_ANY_CHILD && !wait_selector_is_process_group(selector);
+}
+
+inline auto wait_selector_process_group(uint64_t selector) -> uint64_t { return selector & WAIT_PROCESS_GROUP_MASK; }
+
+inline auto wait_selector_matches_child(uint64_t selector, const task::Task* child) -> bool {
+    if (child == nullptr) {
+        return false;
+    }
+    if (selector == WAIT_ANY_CHILD) {
+        return true;
+    }
+    if (wait_selector_is_process_group(selector)) {
+        return effective_process_group_id(*child) == wait_selector_process_group(selector);
+    }
+    return child->pid == selector;
+}
+
 inline auto waitpid_job_stop_waitable(const task::Task* waiter, const task::Task* target) -> bool {
     return waiter != nullptr && target != nullptr && (waiter->wait_options & WOS_WSTOPPED) != 0 && target->parent_pid == waiter->pid &&
            !target->is_thread && !target->has_exited && target->jobctl_stopped.load(std::memory_order_acquire) &&
-           target->jobctl_stop_pending.load(std::memory_order_acquire) &&
-           (waiter->waiting_for_pid == WAIT_ANY_CHILD || waiter->waiting_for_pid == target->pid);
+           target->jobctl_stop_pending.load(std::memory_order_acquire) && wait_selector_matches_child(waiter->waiting_for_pid, target);
 }
 
 inline auto complete_waitpid_job_stop_if_waitable(task::Task* waiter, task::Task* target) -> bool {
@@ -530,7 +554,7 @@ inline auto waitpid_has_job_stop_ready(task::Task* waiter) -> bool {
         return false;
     }
 
-    if (waiter->waiting_for_pid != WAIT_ANY_CHILD) {
+    if (wait_selector_is_specific_pid(waiter->waiting_for_pid)) {
         auto* target = find_task_by_pid(waiter->waiting_for_pid);
         return waitpid_job_stop_waitable(waiter, target);
     }
@@ -549,7 +573,7 @@ inline auto waitpid_child_matches_waiter(const task::Task* waiter, const task::T
     if (waiter == nullptr || child == nullptr || child->is_thread) {
         return false;
     }
-    if (waiter->waiting_for_pid != WAIT_ANY_CHILD && waiter->waiting_for_pid != child->pid) {
+    if (!wait_selector_matches_child(waiter->waiting_for_pid, child)) {
         return false;
     }
     return child->parent_pid == waiter->pid || (child->ptrace_traced && child->ptrace_tracer_pid == waiter->pid);
@@ -600,7 +624,7 @@ inline auto active_waitpid_job_stop_child(task::Task* child, void* raw_waiter) -
 
 inline auto dead_waitpid_specific_target(task::Task* child, void* raw_waiter) -> bool {
     auto* waiter = static_cast<task::Task*>(raw_waiter);
-    return waiter != nullptr && child != nullptr && waiter->waiting_for_pid != 0 && waiter->waiting_for_pid != WAIT_ANY_CHILD &&
+    return waiter != nullptr && child != nullptr && wait_selector_is_specific_pid(waiter->waiting_for_pid) &&
            child->pid == waiter->waiting_for_pid;
 }
 
@@ -611,7 +635,7 @@ inline auto registered_waitpid_matches_child(const task::Task* waiter, const tas
     if (!waitpid_child_matches_waiter(waiter, child)) {
         return false;
     }
-    return waiter->waiting_for_pid == WAIT_ANY_CHILD || waiter->waiting_for_pid == child->pid;
+    return wait_selector_matches_child(waiter->waiting_for_pid, child);
 }
 
 __attribute__((no_sanitize("address"))) auto pid_table_find_lifetime_ref(uint64_t pid) -> task::Task*;
@@ -758,6 +782,11 @@ inline auto waitpid_has_unwaited_child_for_scheduler(task::Task* waiter) -> bool
 }
 
 inline auto complete_waitpid_any_for_scheduler(task::Task* waiter) -> bool {
+    uint64_t const WAIT_SELECTOR = waiter != nullptr ? waiter->waiting_for_pid : 0;
+    if (WAIT_SELECTOR == 0 || wait_selector_is_specific_pid(WAIT_SELECTOR)) {
+        return false;
+    }
+
     for (;;) {
         auto* child = find_active_task_lifetime_ref_if(active_waitpid_waitable_exit_child, waiter);
         if (child == nullptr) {
@@ -796,8 +825,8 @@ inline auto complete_waitpid_any_for_scheduler(task::Task* waiter) -> bool {
         if (!task::task_try_claim_waitpid_completion(*waiter)) {
             return waiter->waiting_for_pid == 0;
         }
-        if (waiter->waiting_for_pid != WAIT_ANY_CHILD || waitpid_has_unwaited_child_for_scheduler(waiter) ||
-            waitpid_has_registered_unwaited_child(waiter)) {
+        if (waiter->waiting_for_pid != WAIT_SELECTOR || wait_selector_is_specific_pid(waiter->waiting_for_pid) ||
+            waitpid_has_unwaited_child_for_scheduler(waiter) || waitpid_has_registered_unwaited_child(waiter)) {
             task::task_release_waitpid_completion_claim(*waiter);
             return waiter->waiting_for_pid == 0;
         }
@@ -811,7 +840,7 @@ inline auto complete_waitpid_any_for_scheduler(task::Task* waiter) -> bool {
 
 inline auto complete_waitpid_specific_for_scheduler(task::Task* waiter) -> bool {
     uint64_t const WAIT_TARGET = waiter != nullptr ? waiter->waiting_for_pid : 0;
-    if (WAIT_TARGET == 0 || WAIT_TARGET == WAIT_ANY_CHILD) {
+    if (!wait_selector_is_specific_pid(WAIT_TARGET)) {
         return false;
     }
 
@@ -902,7 +931,7 @@ inline auto complete_or_preserve_waitpid_block(task::Task* waiter) -> bool {
     }
 
     if (waitpid_has_job_stop_ready(waiter)) {
-        if (waiter->waiting_for_pid == WAIT_ANY_CHILD) {
+        if (!wait_selector_is_specific_pid(waiter->waiting_for_pid)) {
             for (;;) {
                 auto* child = find_active_task_lifetime_ref_if(active_waitpid_job_stop_child, waiter);
                 if (child == nullptr) {
@@ -928,7 +957,7 @@ inline auto complete_or_preserve_waitpid_block(task::Task* waiter) -> bool {
         return true;
     }
 
-    if (waiter->waiting_for_pid == WAIT_ANY_CHILD) {
+    if (!wait_selector_is_specific_pid(waiter->waiting_for_pid)) {
         return complete_waitpid_any_for_scheduler(waiter);
     }
     return complete_waitpid_specific_for_scheduler(waiter);
@@ -989,7 +1018,7 @@ inline void unlink_specific_waitpid_waiter(task::Task* waiter) {
     }
 
     uint64_t const WAIT_TARGET = waiter->waiting_for_pid;
-    if (WAIT_TARGET == 0 || WAIT_TARGET == WAIT_ANY_CHILD) {
+    if (!wait_selector_is_specific_pid(WAIT_TARGET)) {
         return;
     }
 

@@ -135,39 +135,39 @@ def require_wait_any_publish_recheck(waitpid_cpp: str) -> None:
 
     wnohang = braced_block_after(wait_any, "if ((options & WOS_WNOHANG) != 0)")
     for snippet in [
-        "claim_exited_child(current_task)",
-        "consume_stopped_child(current_task, status, options)",
-        "has_unwaited_child(current_task)",
+        "claim_exited_child(current_task, WAIT_SELECTOR)",
+        "consume_stopped_child(current_task, status, options, WAIT_SELECTOR)",
+        "has_unwaited_child(current_task, WAIT_SELECTOR)",
         "return 0",
     ]:
         if snippet not in wnohang:
             fail(f"wait-any WNOHANG path is missing nonblocking scan snippet: {snippet}")
     for forbidden in [
         "waitpid_publish_pending.store(true, std::memory_order_release)",
-        "current_task->waiting_for_pid = WAIT_ANY_CHILD",
+        "current_task->waiting_for_pid = WAIT_SELECTOR",
         "current_task->deferred_task_switch = true",
     ]:
         if forbidden in wnohang:
             fail(f"wait-any WNOHANG path must not publish a wait target: {forbidden}")
 
-    first_wait_target = wait_any.find("current_task->waiting_for_pid = WAIT_ANY_CHILD", first_publish)
-    first_scan = wait_any.find("claim_exited_child(current_task)", first_publish)
+    first_wait_target = wait_any.find("current_task->waiting_for_pid = WAIT_SELECTOR", first_publish)
+    first_scan = wait_any.find("claim_exited_child(current_task, WAIT_SELECTOR)", first_publish)
     if first_publish < 0 or first_wait_target < 0 or first_scan < 0:
         fail("wait-any path is missing publish fence, wait target, or exited-child scan")
     if not (first_publish < first_wait_target < first_scan):
         fail("wait-any path must publish the fence and WAIT_ANY target before the first exit scan")
 
     deferred = wait_any.find("current_task->deferred_task_switch = true")
-    second_scan = wait_any.find("claim_exited_child(current_task)", first_scan + 1)
+    second_scan = wait_any.find("claim_exited_child(current_task, WAIT_SELECTOR)", first_scan + 1)
     if deferred < 0 or second_scan < 0:
         fail("wait-any path is missing the post-publication exit recheck")
     if deferred > second_scan:
         fail("wait-any post-publication recheck must run after deferred_task_switch is set")
-    second_no_child = wait_any.find("if (!has_unwaited_child(current_task))", second_scan)
+    second_no_child = wait_any.find("if (!has_unwaited_child(current_task, WAIT_SELECTOR))", second_scan)
     fallthrough_block = wait_any.find("return 0", second_scan)
     if second_no_child < 0 or fallthrough_block < 0 or not (second_scan < second_no_child < fallthrough_block):
         fail("wait-any deferred path must recheck for terminal ECHILD before blocking")
-    post_deferred_no_child = braced_block_after(wait_any[second_no_child:], "if (!has_unwaited_child(current_task))")
+    post_deferred_no_child = braced_block_after(wait_any[second_no_child:], "if (!has_unwaited_child(current_task, WAIT_SELECTOR))")
     for snippet in [
         "clear_waitpid_syscall_state(current_task)",
         "return static_cast<uint64_t>(-ECHILD)",
@@ -194,6 +194,50 @@ def require_specific_wait_publish_recheck(waitpid_cpp: str) -> None:
     ]:
         if snippet not in trace_wait:
             fail(f"TRACE_WAIT path is missing post-publication recheck snippet: {snippet}")
+
+
+def require_waitpid_process_group_selectors(waitpid_cpp: str, exit_cpp: str, scheduler_cpp: str, task_hpp: str) -> None:
+    for snippet in [
+        "uint64_t waiting_for_pid{};            // Encoded waitpid selector",
+    ]:
+        if snippet not in task_hpp:
+            fail(f"Task waitpid selector comment is missing: {snippet}")
+
+    for snippet in [
+        "constexpr uint64_t WAIT_PROCESS_GROUP_SELECTOR = 1ULL << 63U",
+        "wait_selector_for_process_group(effective_process_group_id(*current_task))",
+        "if (pid == std::numeric_limits<int64_t>::min())",
+        "current_task->waiting_for_pid = WAIT_SELECTOR",
+        "claim_exited_child(current_task, WAIT_SELECTOR)",
+        "consume_stopped_child(current_task, status, options, WAIT_SELECTOR)",
+        "has_unwaited_child(current_task, WAIT_SELECTOR)",
+        "wait_selector_matches_child(selector, child)",
+    ]:
+        if snippet not in waitpid_cpp:
+            fail(f"waitpid syscall must use selector-aware pid<=0 handling: {snippet}")
+
+    for source, label in [
+        (scheduler_cpp, "scheduler"),
+        (exit_cpp, "exit notification"),
+    ]:
+        for snippet in [
+            "constexpr uint64_t WAIT_PROCESS_GROUP_SELECTOR = 1ULL << 63U",
+            "wait_selector_is_process_group",
+            "wait_selector_matches_child",
+        ]:
+            if snippet not in source:
+                fail(f"{label} must understand process-group wait selectors: {snippet}")
+
+    for snippet in [
+        "if (WAIT_SELECTOR == 0 || wait_selector_is_specific_pid(WAIT_SELECTOR))",
+        "waiter->waiting_for_pid != WAIT_SELECTOR",
+        "if (!wait_selector_is_specific_pid(waiter->waiting_for_pid))",
+    ]:
+        if snippet not in scheduler_cpp:
+            fail(f"scheduler waitpid completion must route group selectors through any-child scans: {snippet}")
+
+    if "return waiter->waiting_for_pid == WAIT_ANY_CHILD || waiter->waiting_for_pid == child->pid" in scheduler_cpp + exit_cpp:
+        fail("waitpid completion must not collapse selector matching back to WAIT_ANY_OR_EXACT_PID")
 
 
 def require_deferred_switch_clears_after_context_save(scheduler_cpp: str) -> None:
@@ -325,7 +369,8 @@ def require_scheduler_waitpid_completion_claims_waiter(task_hpp: str, waitpid_cp
     any_body = function_body(scheduler_cpp, "complete_waitpid_any_for_scheduler")
     for snippet in [
         "task::task_try_claim_waitpid_completion(*waiter)",
-        "waiter->waiting_for_pid != WAIT_ANY_CHILD",
+        "wait_selector_is_specific_pid(WAIT_SELECTOR)",
+        "waiter->waiting_for_pid != WAIT_SELECTOR",
         "task::task_release_waitpid_completion_claim(*waiter)",
         "waiter->context.regs.rax = static_cast<uint64_t>(-ECHILD)",
     ]:
@@ -335,7 +380,7 @@ def require_scheduler_waitpid_completion_claims_waiter(task_hpp: str, waitpid_cp
     specific_body = function_body(scheduler_cpp, "complete_waitpid_specific_for_scheduler")
     for snippet in [
         "task::task_try_claim_waitpid_completion(*waiter)",
-        "waiter->waiting_for_pid != WAIT_TARGET",
+        "!wait_selector_is_specific_pid(WAIT_TARGET)",
         "task::task_release_waitpid_completion_claim(*waiter)",
         "waiter->context.regs.rax = static_cast<uint64_t>(-ECHILD)",
     ]:
@@ -465,6 +510,7 @@ def main() -> None:
     require_waited_on_is_atomic_claim(task_hpp, task_cpp, waitpid_cpp, exit_cpp, scheduler_cpp)
     require_wait_any_publish_recheck(waitpid_cpp)
     require_specific_wait_publish_recheck(waitpid_cpp)
+    require_waitpid_process_group_selectors(waitpid_cpp, exit_cpp, scheduler_cpp, task_hpp)
     require_deferred_switch_clears_after_context_save(scheduler_cpp)
     require_syscall_epilogue_honors_deferred_before_signals(syscall_asm)
     require_interrupted_waitpid_cleans_stale_wait_state(task_hpp, task_cpp, scheduler_cpp, exit_cpp)

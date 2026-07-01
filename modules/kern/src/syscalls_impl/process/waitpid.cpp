@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
@@ -34,8 +35,12 @@ void fill_rusage(uint64_t rusage_phys_addr, ker::mod::sched::task::Task* child) 
     ru->ru_stime_usec = static_cast<int64_t>(SYSTEM_TIME_US % 1000000ULL);
 }
 
-// Sentinel value: waitingForPid == WAIT_ANY_CHILD means "wait for any child"
+// Sentinel value: waitingForPid == WAIT_ANY_CHILD means "wait for any child".
+// Process-group waits use a high-bit tagged selector; direct PID waits remain
+// plain positive pid values so existing specific-child paths keep working.
 constexpr uint64_t WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
+constexpr uint64_t WAIT_PROCESS_GROUP_SELECTOR = 1ULL << 63U;
+constexpr uint64_t WAIT_PROCESS_GROUP_MASK = WAIT_PROCESS_GROUP_SELECTOR - 1U;
 constexpr int WOS_WNOHANG = 1;
 constexpr int WOS_WSTOPPED = 2;
 constexpr int STOP_STATUS_LOW = 0x7f;
@@ -51,6 +56,7 @@ struct ClaimedExitedChild {
 
 struct ParentWaitScan {
     ker::mod::sched::task::Task* parent{nullptr};
+    uint64_t selector{WAIT_ANY_CHILD};
 };
 
 struct SpecificWaitScan {
@@ -72,9 +78,39 @@ auto is_waitable_exit(const ker::mod::sched::task::Task* task) -> bool {
     return EXIT_READY || STATE == ker::mod::sched::task::TaskState::DEAD;
 }
 
-auto is_unwaited_child(const ker::mod::sched::task::Task* parent, const ker::mod::sched::task::Task* child) -> bool {
+auto effective_process_group_id(const ker::mod::sched::task::Task& task) -> uint64_t {
+    return task.pgid != 0 ? task.pgid : sched_task::process_pid(task);
+}
+
+auto wait_selector_for_process_group(uint64_t pgid) -> uint64_t {
+    if (pgid == 0 || pgid >= WAIT_PROCESS_GROUP_MASK) {
+        return 0;
+    }
+    return WAIT_PROCESS_GROUP_SELECTOR | (pgid & WAIT_PROCESS_GROUP_MASK);
+}
+
+auto wait_selector_is_process_group(uint64_t selector) -> bool {
+    return selector != WAIT_ANY_CHILD && (selector & WAIT_PROCESS_GROUP_SELECTOR) != 0;
+}
+
+auto wait_selector_process_group(uint64_t selector) -> uint64_t { return selector & WAIT_PROCESS_GROUP_MASK; }
+
+auto wait_selector_matches_child(uint64_t selector, const ker::mod::sched::task::Task* child) -> bool {
+    if (child == nullptr) {
+        return false;
+    }
+    if (selector == WAIT_ANY_CHILD) {
+        return true;
+    }
+    if (wait_selector_is_process_group(selector)) {
+        return effective_process_group_id(*child) == wait_selector_process_group(selector);
+    }
+    return child->pid == selector;
+}
+
+auto is_unwaited_child(const ker::mod::sched::task::Task* parent, const ker::mod::sched::task::Task* child, uint64_t selector) -> bool {
     return parent != nullptr && child != nullptr && !child->is_thread && child->parent_pid == parent->pid &&
-           !sched_task::task_waited_on(*child);
+           wait_selector_matches_child(selector, child) && !sched_task::task_waited_on(*child);
 }
 
 auto ptrace_stop_status(const ker::mod::sched::task::Task& task) -> int32_t {
@@ -106,12 +142,12 @@ auto is_unwaited_specific_wait_target(const ker::mod::sched::task::Task* waiter,
 
 auto active_waitable_unwaited_child(ker::mod::sched::task::Task* child, void* raw_ctx) -> bool {
     auto* ctx = static_cast<ParentWaitScan*>(raw_ctx);
-    return ctx != nullptr && is_unwaited_child(ctx->parent, child) && is_waitable_exit(child);
+    return ctx != nullptr && is_unwaited_child(ctx->parent, child, ctx->selector) && is_waitable_exit(child);
 }
 
 auto active_unwaited_child(ker::mod::sched::task::Task* child, void* raw_ctx) -> bool {
     auto* ctx = static_cast<ParentWaitScan*>(raw_ctx);
-    return ctx != nullptr && is_unwaited_child(ctx->parent, child);
+    return ctx != nullptr && is_unwaited_child(ctx->parent, child, ctx->selector);
 }
 
 auto active_waitable_specific_child(ker::mod::sched::task::Task* child, void* raw_ctx) -> bool {
@@ -124,8 +160,9 @@ auto active_stopped_child(ker::mod::sched::task::Task* child, void* raw_ctx) -> 
     if (ctx == nullptr || ctx->parent == nullptr || child == nullptr) {
         return false;
     }
-    return child->parent_pid == ctx->parent->pid && !child->is_thread && !child->has_exited &&
-           child->jobctl_stopped.load(std::memory_order_acquire) && child->jobctl_stop_pending.load(std::memory_order_acquire);
+    return child->parent_pid == ctx->parent->pid && !child->is_thread && wait_selector_matches_child(ctx->selector, child) &&
+           !child->has_exited && child->jobctl_stopped.load(std::memory_order_acquire) &&
+           child->jobctl_stop_pending.load(std::memory_order_acquire);
 }
 
 auto consume_job_stop_if_waitable(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* target, int32_t* status,
@@ -169,8 +206,8 @@ auto consume_ptrace_stop_if_waitable(ker::mod::sched::task::Task* waiter, ker::m
 // intentionally rejects DEAD/EXITING tasks. Use the registry pointer directly:
 // a matching unwaited child cannot be reclaimed until this parent marks it
 // waited_on.
-auto claim_exited_child(ker::mod::sched::task::Task* parent) -> ClaimedExitedChild {
-    ParentWaitScan ctx{.parent = parent};
+auto claim_exited_child(ker::mod::sched::task::Task* parent, uint64_t selector) -> ClaimedExitedChild {
+    ParentWaitScan ctx{.parent = parent, .selector = selector};
     for (;;) {
         auto* child = ker::mod::sched::find_active_task_lifetime_ref_if(active_waitable_unwaited_child, &ctx);
         if (child == nullptr) {
@@ -255,12 +292,12 @@ auto consume_claimed_exit(ker::mod::sched::task::Task* waiter, ClaimedExitedChil
     return PID;
 }
 
-auto consume_stopped_child(ker::mod::sched::task::Task* parent, int32_t* status, int32_t options) -> uint64_t {
+auto consume_stopped_child(ker::mod::sched::task::Task* parent, int32_t* status, int32_t options, uint64_t selector) -> uint64_t {
     if ((options & WOS_WSTOPPED) == 0) {
         return 0;
     }
 
-    ParentWaitScan ctx{.parent = parent};
+    ParentWaitScan ctx{.parent = parent, .selector = selector};
     for (;;) {
         auto* child = ker::mod::sched::find_active_task_lifetime_ref_if(active_stopped_child, &ctx);
         if (child == nullptr) {
@@ -277,8 +314,8 @@ auto consume_stopped_child(ker::mod::sched::task::Task* parent, int32_t* status,
     return 0;
 }
 
-auto has_unwaited_child(ker::mod::sched::task::Task* parent) -> bool {
-    ParentWaitScan ctx{.parent = parent};
+auto has_unwaited_child(ker::mod::sched::task::Task* parent, uint64_t selector) -> bool {
+    ParentWaitScan ctx{.parent = parent, .selector = selector};
     auto* active_child = ker::mod::sched::find_active_task_lifetime_ref_if(active_unwaited_child, &ctx);
     if (active_child != nullptr) {
         active_child->release();
@@ -359,20 +396,36 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     // Save current task's context
     current_task->context.regs = gpr;
 
-    // --- Handle pid == -1 or pid == 0: wait for ANY child ---
+    // --- Handle pid == -1, pid == 0, or pid < -1: wait for a child selector ---
     if (pid <= 0) {
+        uint64_t const WAIT_SELECTOR = [&]() -> uint64_t {
+            if (pid == 0) {
+                return wait_selector_for_process_group(effective_process_group_id(*current_task));
+            }
+            if (pid == -1) {
+                return WAIT_ANY_CHILD;
+            }
+            if (pid == std::numeric_limits<int64_t>::min()) {
+                return 0;
+            }
+            return wait_selector_for_process_group(static_cast<uint64_t>(-pid));
+        }();
+        if (WAIT_SELECTOR == 0) {
+            return static_cast<uint64_t>(-EINVAL);
+        }
+
         if ((options & WOS_WNOHANG) != 0) {
-            auto exited = claim_exited_child(current_task);
+            auto exited = claim_exited_child(current_task, WAIT_SELECTOR);
             if (exited.task != nullptr) {
                 return consume_claimed_exit(current_task, exited, status, rusage_vaddr);
             }
 
-            uint64_t const STOPPED_PID = consume_stopped_child(current_task, status, options);
+            uint64_t const STOPPED_PID = consume_stopped_child(current_task, status, options, WAIT_SELECTOR);
             if (STOPPED_PID != 0) {
                 return STOPPED_PID;
             }
 
-            if (!has_unwaited_child(current_task)) {
+            if (!has_unwaited_child(current_task, WAIT_SELECTOR)) {
                 return static_cast<uint64_t>(-ECHILD);
             }
             return 0;
@@ -381,25 +434,25 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         current_task->waitpid_completion_claimed.store(false, std::memory_order_release);
         current_task->waitpid_last_repair_us = 0;
         current_task->waitpid_publish_pending.store(true, std::memory_order_release);
-        current_task->waiting_for_pid = WAIT_ANY_CHILD;
+        current_task->waiting_for_pid = WAIT_SELECTOR;
         current_task->wait_options = options;
 
         // Check for already-exited children
-        auto exited = claim_exited_child(current_task);
+        auto exited = claim_exited_child(current_task, WAIT_SELECTOR);
         if (exited.task != nullptr) {
             return consume_claimed_exit(current_task, exited, status, rusage_vaddr);
         }
 
-        uint64_t stopped_pid = consume_stopped_child(current_task, status, options);
+        uint64_t stopped_pid = consume_stopped_child(current_task, status, options, WAIT_SELECTOR);
         if (stopped_pid != 0) {
             clear_waitpid_syscall_state(current_task);
             return stopped_pid;
         }
 
-        // No direct child remains waitable.  POSIX waitpid(-1/0) must fail
-        // with ECHILD here; otherwise shells can block forever after their
-        // last pipeline child has already exited and been consumed.
-        if (!has_unwaited_child(current_task)) {
+        // No selected child remains waitable. POSIX waitpid selectors must fail
+        // with ECHILD here; otherwise shells can block forever after their last
+        // pipeline child has already exited and been consumed.
+        if (!has_unwaited_child(current_task, WAIT_SELECTOR)) {
             clear_waitpid_syscall_state(current_task);
             return static_cast<uint64_t>(-ECHILD);
         }
@@ -425,16 +478,16 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
 
         current_task->set_wait_channel("waitpid", sched_task::WaitChannelKind::WAITPID);
         current_task->deferred_task_switch = true;
-        exited = claim_exited_child(current_task);
+        exited = claim_exited_child(current_task, WAIT_SELECTOR);
         if (exited.task != nullptr) {
             return consume_claimed_exit(current_task, exited, status, rusage_vaddr);
         }
-        stopped_pid = consume_stopped_child(current_task, status, options);
+        stopped_pid = consume_stopped_child(current_task, status, options, WAIT_SELECTOR);
         if (stopped_pid != 0) {
             clear_waitpid_syscall_state(current_task);
             return stopped_pid;
         }
-        if (!has_unwaited_child(current_task)) {
+        if (!has_unwaited_child(current_task, WAIT_SELECTOR)) {
             clear_waitpid_syscall_state(current_task);
             return static_cast<uint64_t>(-ECHILD);
         }

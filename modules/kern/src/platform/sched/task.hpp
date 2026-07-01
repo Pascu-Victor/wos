@@ -327,7 +327,7 @@ struct Task {
     uint64_t preempt_disable_owner = 0;
 
     // Waitpid state: when this task is waiting for another task to exit.
-    uint64_t waiting_for_pid{};            // PID we're waiting for (for waitpid return value)
+    uint64_t waiting_for_pid{};            // Encoded waitpid selector: direct PID, any-child sentinel, or process group
     int32_t wait_options{};                // waitpid option bits active for the current block
     uint64_t wait_status_user_addr{};      // Userspace virtual address of status variable (for waitpid)
     uint64_t wait_status_phys_addr{};      // Last translated physical address (debug; may change after COW)

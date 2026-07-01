@@ -37,6 +37,8 @@ using log = ker::mod::dbg::logger<"pexit">;
 namespace sched_task = ker::mod::sched::task;
 
 constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
+constexpr uint64_t WAIT_PROCESS_GROUP_SELECTOR = 1ULL << 63U;
+constexpr uint64_t WAIT_PROCESS_GROUP_MASK = WAIT_PROCESS_GROUP_SELECTOR - 1U;
 constexpr uint64_t SIGCHLD_MASK = 1ULL << (17 - 1);
 constexpr uint64_t SIGKILL_MASK = 1ULL << (9 - 1);
 constexpr size_t EXIT_WAITER_NOTIFY_BATCH = 16;
@@ -144,6 +146,33 @@ void reschedule_on_task_cpu(ker::mod::sched::task::Task* task) {
     ker::mod::sched::reschedule_task_for_cpu(cpu, task);
 }
 
+auto effective_process_group_id(const ker::mod::sched::task::Task& task) -> uint64_t {
+    return task.pgid != 0 ? task.pgid : sched_task::process_pid(task);
+}
+
+auto wait_selector_is_process_group(uint64_t selector) -> bool {
+    return selector != WAIT_ANY_CHILD && (selector & WAIT_PROCESS_GROUP_SELECTOR) != 0;
+}
+
+auto wait_selector_is_specific_pid(uint64_t selector) -> bool {
+    return selector != 0 && selector != WAIT_ANY_CHILD && !wait_selector_is_process_group(selector);
+}
+
+auto wait_selector_process_group(uint64_t selector) -> uint64_t { return selector & WAIT_PROCESS_GROUP_MASK; }
+
+auto wait_selector_matches_child(uint64_t selector, const ker::mod::sched::task::Task* child) -> bool {
+    if (child == nullptr) {
+        return false;
+    }
+    if (selector == WAIT_ANY_CHILD) {
+        return true;
+    }
+    if (wait_selector_is_process_group(selector)) {
+        return effective_process_group_id(*child) == wait_selector_process_group(selector);
+    }
+    return child->pid == selector;
+}
+
 auto waiter_matches_child(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) -> bool {
     if (waiter == nullptr || child == nullptr || child->is_thread || waiter->waiting_for_pid == 0) {
         return false;
@@ -151,12 +180,12 @@ auto waiter_matches_child(ker::mod::sched::task::Task* waiter, ker::mod::sched::
     if (child->parent_pid != waiter->pid && (!child->ptrace_traced || child->ptrace_tracer_pid != waiter->pid)) {
         return false;
     }
-    return waiter->waiting_for_pid == WAIT_ANY_CHILD || waiter->waiting_for_pid == child->pid;
+    return wait_selector_matches_child(waiter->waiting_for_pid, child);
 }
 
 auto waiter_is_blocked_on_different_waitpid_child(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) -> bool {
     return waiter != nullptr && child != nullptr && waiter->waiting_for_pid != 0 && waiter->waiting_for_pid != WAIT_ANY_CHILD &&
-           waiter->waiting_for_pid != child->pid;
+           !wait_selector_matches_child(waiter->waiting_for_pid, child);
 }
 
 auto waiter_context_can_be_completed(ker::mod::sched::task::Task* waiter) -> bool {
@@ -173,8 +202,8 @@ auto waiter_context_can_be_completed(ker::mod::sched::task::Task* waiter) -> boo
 }
 
 auto waiter_has_stranded_specific_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) -> bool {
-    return waiter != nullptr && child != nullptr && waiter->waiting_for_pid == child->pid &&
-           waiter->wait_channel_is(ker::mod::sched::task::WaitChannelKind::WAITPID);
+    return waiter != nullptr && child != nullptr && wait_selector_is_specific_pid(waiter->waiting_for_pid) &&
+           waiter->waiting_for_pid == child->pid && waiter->wait_channel_is(ker::mod::sched::task::WaitChannelKind::WAITPID);
 }
 
 auto task_can_be_interrupted_by_signal(ker::mod::sched::task::Task* task) -> bool {
@@ -247,8 +276,13 @@ void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
         wake_parent = waiter_has_stranded_specific_wait(parent, child);
     } else {
         if (waiter_matches_child(parent, child) && waiter_context_can_be_completed(parent)) {
-            wake_parent =
-                complete_exit_wait(parent, child, parent->waiting_for_pid == WAIT_ANY_CHILD ? "exit-any" : "exit-specific-parent");
+            char const* path = "exit-specific-parent";
+            if (parent->waiting_for_pid == WAIT_ANY_CHILD) {
+                path = "exit-any";
+            } else if (wait_selector_is_process_group(parent->waiting_for_pid)) {
+                path = "exit-pgrp-parent";
+            }
+            wake_parent = complete_exit_wait(parent, child, path);
         } else if (waiter_matches_child(parent, child) && (parent->deferred_task_switch || parent->is_voluntary_blocked() ||
                                                            parent->wait_channel_is(ker::mod::sched::task::WaitChannelKind::WAITPID))) {
             // The deferred switch path will re-check waitability after it saves
