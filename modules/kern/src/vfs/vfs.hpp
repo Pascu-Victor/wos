@@ -58,6 +58,7 @@ auto vfs_close_file(File* file) -> int;
 auto vfs_close(int fd) -> int;
 auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
 auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
+auto vfs_write_file(File* file, const void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
 auto vfs_lseek(int fd, off_t offset, int whence) -> off_t;
 auto vfs_isatty(int fd) -> bool;
 auto vfs_read_dir_entries(int fd, void* buffer, std::size_t max_size) -> ssize_t;

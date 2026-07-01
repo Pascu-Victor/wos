@@ -5072,17 +5072,11 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
     return R;
 }
 
-auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ssize_t {
-    ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
-    if (t == nullptr) {
-        return -ESRCH;
-    }
-    ker::vfs::File* f = vfs_get_file_retain(t, fd);
+auto vfs_write_file(File* f, const void* buf, size_t count, size_t* actual_size) -> ssize_t {
     if (f == nullptr) {
         return -EBADF;
     }
     if ((f->fops == nullptr) || (f->fops->vfs_write == nullptr)) {
-        vfs_put_file(f);
         return -EINVAL;
     }
     ssize_t result = 0;
@@ -5114,11 +5108,23 @@ auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ss
         if (actual_size != nullptr) {
             *actual_size = static_cast<size_t>(result);
         }
-        vfs_put_file(f);
         return result;
     }
-    vfs_put_file(f);
     return result;
+}
+
+auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ssize_t {
+    ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
+    if (t == nullptr) {
+        return -ESRCH;
+    }
+    ker::vfs::File* f = vfs_get_file_retain(t, fd);
+    if (f == nullptr) {
+        return -EBADF;
+    }
+    ssize_t const RESULT = vfs_write_file(f, buf, count, actual_size);
+    vfs_put_file(f);
+    return RESULT;
 }
 
 auto vfs_lseek(int fd, off_t offset, int whence) -> off_t {
@@ -10538,7 +10544,7 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
 
     while (remaining > 0) {
         size_t const TO_READ = remaining > BUF_SIZE ? BUF_SIZE : remaining;
-        ssize_t const READ_RESULT = vfs_pread(infd, buffer, TO_READ, source_offset);
+        ssize_t const READ_RESULT = vfs_pread_file(infile, buffer, TO_READ, source_offset);
         if (READ_RESULT < 0) {
             if (total_sent == 0) {
                 delete[] buffer;
@@ -10557,7 +10563,7 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
         size_t chunk_offset = 0;
         while (chunk_offset < CHUNK_SIZE) {
             size_t bytes_written = 0;
-            ssize_t const WRITE_RESULT = vfs_write(outfd, buffer + chunk_offset, CHUNK_SIZE - chunk_offset, &bytes_written);
+            ssize_t const WRITE_RESULT = vfs_write_file(outfile, buffer + chunk_offset, CHUNK_SIZE - chunk_offset, &bytes_written);
             if (WRITE_RESULT < 0) {
                 if (total_sent == 0) {
                     delete[] buffer;
@@ -10570,13 +10576,11 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t {
                     vfs_put_file(infile);
                     return WRITE_RESULT;
                 }
-                chunk_offset = CHUNK_SIZE;
                 remaining = 0;
                 break;
             }
 
             if (bytes_written == 0) {
-                chunk_offset = CHUNK_SIZE;
                 remaining = 0;
                 break;
             }

@@ -169,6 +169,7 @@ UNIT_TESTS=(
     xfs_read_source_test
     xfs_write_source_test
     vfs_pread_source_test
+    vfs_sendfile_source_test
     tmpfs_swap_source_test
     wki_wire_test
     wki_routing_test

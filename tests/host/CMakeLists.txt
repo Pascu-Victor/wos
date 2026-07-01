@@ -297,6 +297,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_pread_source_test.py
 )
 add_test(
+    NAME vfs_sendfile_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_sendfile_source_test.py
+)
+add_test(
     NAME vmem_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vmem_source_test.py
 )
@@ -378,6 +382,7 @@ set_tests_properties(
     xfs_read_source_test
     xfs_write_source_test
     vfs_pread_source_test
+    vfs_sendfile_source_test
     vmem_source_test
     tmpfs_swap_source_test
     PROPERTIES LABELS "host;source"
