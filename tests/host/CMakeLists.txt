@@ -205,6 +205,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/signal_source_test.py
 )
 add_test(
+    NAME usercopy_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/usercopy_source_test.py
+)
+add_test(
     NAME kasan_bootstrap_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/kasan_bootstrap_source_test.py
 )

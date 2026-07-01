@@ -10,13 +10,13 @@
 #include <cstring>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <platform/sys/usercopy.hpp>
 #include <platform/sys/userspace.hpp>
 #include <utility>
 // Debug helpers
 #include <net/wki/remote_compute.hpp>
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/gdb_interface.hpp>
-#include <platform/mm/addr.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/virt.hpp>
 
@@ -536,12 +536,13 @@ inline auto complete_waitpid_job_stop_if_waitable(task::Task* waiter, task::Task
     }
 
     waiter->context.regs.rax = target->pid;
+    bool output_ok = true;
     if (waiter->wait_status_user_addr != 0 && waiter->pagemap != nullptr) {
-        uint64_t const STATUS_PHYS = mm::virt::translate(waiter->pagemap, waiter->wait_status_user_addr);
-        if (STATUS_PHYS != mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
-            auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(STATUS_PHYS));
-            *status_ptr = job_control_stop_status(*target);
-        }
+        int32_t const STATUS = job_control_stop_status(*target);
+        output_ok = sys::usercopy::copy_value_to_task_mapped(*waiter, waiter->wait_status_user_addr, STATUS);
+    }
+    if (!output_ok) {
+        waiter->context.regs.rax = static_cast<uint64_t>(-EFAULT);
     }
     target->jobctl_stop_pending.store(false, std::memory_order_release);
     waiter->waitpid_publish_pending.store(false, std::memory_order_release);
@@ -652,33 +653,25 @@ inline void clear_waitpid_output_addrs(task::Task* waiter) {
     waiter->wait_rusage_phys_addr = 0;
 }
 
-inline void write_waitpid_status(task::Task* waiter, int32_t status) {
+inline auto write_waitpid_status(task::Task* waiter, int32_t status) -> bool {
     if (waiter == nullptr || waiter->wait_status_user_addr == 0 || waiter->pagemap == nullptr) {
-        return;
+        return true;
     }
-    uint64_t const STATUS_PHYS = mm::virt::translate(waiter->pagemap, waiter->wait_status_user_addr);
-    if (STATUS_PHYS == mm::virt::PADDR_INVALID || STATUS_PHYS == 0) {
-        return;
-    }
-    auto* status_ptr = reinterpret_cast<int32_t*>(mm::addr::get_virt_pointer(STATUS_PHYS));
-    *status_ptr = status;
+    return sys::usercopy::copy_value_to_task_mapped(*waiter, waiter->wait_status_user_addr, status);
 }
 
-inline void fill_waitpid_rusage(task::Task* waiter, const task::Task* child) {
+inline auto fill_waitpid_rusage(task::Task* waiter, const task::Task* child) -> bool {
     if (waiter == nullptr || child == nullptr || waiter->wait_rusage_user_addr == 0 || waiter->pagemap == nullptr) {
-        return;
+        return true;
     }
-    uint64_t const RUSAGE_PHYS = mm::virt::translate(waiter->pagemap, waiter->wait_rusage_user_addr);
-    if (RUSAGE_PHYS == mm::virt::PADDR_INVALID || RUSAGE_PHYS == 0) {
-        return;
-    }
-    auto* ru = reinterpret_cast<syscall::process::KernRusage*>(mm::addr::get_virt_pointer(RUSAGE_PHYS));
+    syscall::process::KernRusage ru{};
     uint64_t const USER_TIME_US = task::task_rusage_user_time_us(*child);
     uint64_t const SYSTEM_TIME_US = task::task_rusage_system_time_us(*child);
-    ru->ru_utime_sec = static_cast<int64_t>(USER_TIME_US / 1000000ULL);
-    ru->ru_utime_usec = static_cast<int64_t>(USER_TIME_US % 1000000ULL);
-    ru->ru_stime_sec = static_cast<int64_t>(SYSTEM_TIME_US / 1000000ULL);
-    ru->ru_stime_usec = static_cast<int64_t>(SYSTEM_TIME_US % 1000000ULL);
+    ru.ru_utime_sec = static_cast<int64_t>(USER_TIME_US / 1000000ULL);
+    ru.ru_utime_usec = static_cast<int64_t>(USER_TIME_US % 1000000ULL);
+    ru.ru_stime_sec = static_cast<int64_t>(SYSTEM_TIME_US / 1000000ULL);
+    ru.ru_stime_usec = static_cast<int64_t>(SYSTEM_TIME_US % 1000000ULL);
+    return sys::usercopy::copy_value_to_task_mapped(*waiter, waiter->wait_rusage_user_addr, ru);
 }
 
 inline void finish_waitpid_scheduler_result(task::Task* waiter) {
@@ -708,8 +701,10 @@ inline auto complete_waitpid_exit_for_scheduler(task::Task* waiter, task::Task* 
     task::task_accumulate_waited_child_times(*waiter, *child);
     waiter->context.regs.rax = child->pid;
     validate_wait_resume_mapping(waiter, child, path);
-    write_waitpid_status(waiter, child->exit_status);
-    fill_waitpid_rusage(waiter, child);
+    bool const OUTPUT_OK = write_waitpid_status(waiter, child->exit_status) && fill_waitpid_rusage(waiter, child);
+    if (!OUTPUT_OK) {
+        waiter->context.regs.rax = static_cast<uint64_t>(-EFAULT);
+    }
     clear_waitpid_output_addrs(waiter);
     finish_waitpid_scheduler_result(waiter);
     return true;
@@ -730,8 +725,10 @@ inline auto complete_registered_waitpid_exit_for_scheduler(task::Task* waiter, t
     task::task_accumulate_waited_child_times(*waiter, *child);
     waiter->context.regs.rax = child->pid;
     validate_wait_resume_mapping(waiter, child, path);
-    write_waitpid_status(waiter, child->exit_status);
-    fill_waitpid_rusage(waiter, child);
+    bool const OUTPUT_OK = write_waitpid_status(waiter, child->exit_status) && fill_waitpid_rusage(waiter, child);
+    if (!OUTPUT_OK) {
+        waiter->context.regs.rax = static_cast<uint64_t>(-EFAULT);
+    }
     clear_waitpid_output_addrs(waiter);
     finish_waitpid_scheduler_result(waiter);
     return true;
@@ -755,7 +752,10 @@ inline auto complete_waitpid_ptrace_stop_for_scheduler(task::Task* waiter, task:
     }
 
     waiter->context.regs.rax = target->pid;
-    write_waitpid_status(waiter, static_cast<int32_t>((signal << 8U) | STOP_STATUS_LOW));
+    bool const OUTPUT_OK = write_waitpid_status(waiter, static_cast<int32_t>((signal << 8U) | STOP_STATUS_LOW));
+    if (!OUTPUT_OK) {
+        waiter->context.regs.rax = static_cast<uint64_t>(-EFAULT);
+    }
     target->ptrace_stop_pending = false;
     clear_waitpid_output_addrs(waiter);
     finish_waitpid_scheduler_result(waiter);

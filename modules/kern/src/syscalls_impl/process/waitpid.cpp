@@ -7,11 +7,11 @@
 #include <cstdint>
 #include <limits>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sys/usercopy.hpp>
 
 #include "platform/asm/cpu.hpp"
 
@@ -20,19 +20,49 @@ namespace {
 using log = ker::mod::dbg::logger<"waitpid">;
 namespace sched_task = ker::mod::sched::task;
 
-// Fill POSIX struct rusage with the child's timing data (ru_utime and ru_stime only).
-// rusage_phys_addr: physical address of the userspace rusage struct, 0 to skip.
-void fill_rusage(uint64_t rusage_phys_addr, ker::mod::sched::task::Task* child) {
-    if (rusage_phys_addr == 0 || rusage_phys_addr == ker::mod::mm::virt::PADDR_INVALID) {
+void fill_rusage_value(KernRusage& ru, ker::mod::sched::task::Task* child) {
+    if (child == nullptr) {
         return;
     }
-    auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::get_virt_pointer(rusage_phys_addr));
     uint64_t const USER_TIME_US = sched_task::task_rusage_user_time_us(*child);
     uint64_t const SYSTEM_TIME_US = sched_task::task_rusage_system_time_us(*child);
-    ru->ru_utime_sec = static_cast<int64_t>(USER_TIME_US / 1000000ULL);
-    ru->ru_utime_usec = static_cast<int64_t>(USER_TIME_US % 1000000ULL);
-    ru->ru_stime_sec = static_cast<int64_t>(SYSTEM_TIME_US / 1000000ULL);
-    ru->ru_stime_usec = static_cast<int64_t>(SYSTEM_TIME_US % 1000000ULL);
+    ru.ru_utime_sec = static_cast<int64_t>(USER_TIME_US / 1000000ULL);
+    ru.ru_utime_usec = static_cast<int64_t>(USER_TIME_US % 1000000ULL);
+    ru.ru_stime_sec = static_cast<int64_t>(SYSTEM_TIME_US / 1000000ULL);
+    ru.ru_stime_usec = static_cast<int64_t>(SYSTEM_TIME_US % 1000000ULL);
+}
+
+auto write_rusage_to_user(ker::mod::sched::task::Task* waiter, uint64_t rusage_vaddr, ker::mod::sched::task::Task* child) -> bool {
+    if (rusage_vaddr == 0) {
+        return true;
+    }
+    if (waiter == nullptr || waiter->pagemap == nullptr || child == nullptr) {
+        return false;
+    }
+
+    KernRusage ru{};
+    fill_rusage_value(ru, child);
+    return ker::mod::sys::usercopy::copy_value_to_task(*waiter, rusage_vaddr, ru);
+}
+
+auto write_status_to_user(ker::mod::sched::task::Task* waiter, int32_t* status, int32_t value) -> bool {
+    if (status == nullptr) {
+        return true;
+    }
+    if (waiter == nullptr || waiter->pagemap == nullptr) {
+        return false;
+    }
+    return ker::mod::sys::usercopy::copy_value_to_task(*waiter, reinterpret_cast<uint64_t>(status), value);
+}
+
+auto waitpid_outputs_writable(ker::mod::sched::task::Task& task, const int32_t* status, uint64_t rusage_vaddr) -> bool {
+    if (status != nullptr && !ker::mod::sys::usercopy::ensure_writable(task, reinterpret_cast<uint64_t>(status), sizeof(*status))) {
+        return false;
+    }
+    if (rusage_vaddr != 0 && !ker::mod::sys::usercopy::ensure_writable(task, rusage_vaddr, sizeof(KernRusage))) {
+        return false;
+    }
+    return true;
 }
 
 // Sentinel value: waitingForPid == WAIT_ANY_CHILD means "wait for any child".
@@ -174,8 +204,8 @@ auto consume_job_stop_if_waitable(ker::mod::sched::task::Task* waiter, ker::mod:
         !target->jobctl_stopped.load(std::memory_order_acquire) || !target->jobctl_stop_pending.load(std::memory_order_acquire)) {
         return false;
     }
-    if (status != nullptr) {
-        *status = job_stop_status(*target);
+    if (!write_status_to_user(waiter, status, job_stop_status(*target))) {
+        return false;
     }
     target->jobctl_stop_pending.store(false, std::memory_order_release);
     clear_waitpid_syscall_state(waiter);
@@ -193,8 +223,8 @@ auto consume_ptrace_stop_if_waitable(ker::mod::sched::task::Task* waiter, ker::m
     if (!target->ptrace_stopped || !target->ptrace_stop_pending) {
         return false;
     }
-    if (status != nullptr) {
-        *status = ptrace_stop_status(*target);
+    if (!write_status_to_user(waiter, status, ptrace_stop_status(*target))) {
+        return false;
     }
     target->ptrace_stop_pending = false;
     clear_waitpid_syscall_state(waiter);
@@ -280,12 +310,9 @@ auto consume_claimed_exit(ker::mod::sched::task::Task* waiter, ClaimedExitedChil
 
     clear_waitpid_syscall_state(waiter);
     sched_task::task_accumulate_waited_child_times(*waiter, *exited);
-    if (status != nullptr) {
-        *status = exited->exit_status;
-    }
-    if (rusage_vaddr != 0) {
-        uint64_t const PHYS = ker::mod::mm::virt::translate(waiter->pagemap, rusage_vaddr);
-        fill_rusage(PHYS, exited);
+    if (!write_status_to_user(waiter, status, exited->exit_status) || !write_rusage_to_user(waiter, rusage_vaddr, exited)) {
+        release_claimed_child(claimed);
+        return static_cast<uint64_t>(-EFAULT);
     }
     uint64_t const PID = exited->pid;
     release_claimed_child(claimed);
@@ -391,6 +418,10 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         log::debug("current task is null");
 #endif
         return static_cast<uint64_t>(-1);
+    }
+
+    if (!waitpid_outputs_writable(*current_task, status, rusage_vaddr)) {
+        return static_cast<uint64_t>(-EFAULT);
     }
 
     // Save current task's context
@@ -530,12 +561,9 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             return static_cast<uint64_t>(-ECHILD);
         }
         sched_task::task_accumulate_waited_child_times(*current_task, *target_task);
-        if (status != nullptr) {
-            *status = target_task->exit_status;
-        }
-        if (rusage_vaddr != 0) {
-            uint64_t const PHYS = ker::mod::mm::virt::translate(current_task->pagemap, rusage_vaddr);
-            fill_rusage(PHYS, target_task);
+        if (!write_status_to_user(current_task, status, target_task->exit_status) ||
+            !write_rusage_to_user(current_task, rusage_vaddr, target_task)) {
+            return static_cast<uint64_t>(-EFAULT);
         }
         current_task->wait_status_user_addr = 0;
         current_task->wait_status_phys_addr = 0;
@@ -600,12 +628,9 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             clear_waitpid_publish_pending(current_task);
             current_task->deferred_task_switch = false;
             sched_task::task_accumulate_waited_child_times(*current_task, *target_task);
-            if (status != nullptr) {
-                *status = target_task->exit_status;
-            }
-            if (rusage_vaddr != 0) {
-                uint64_t const PHYS = ker::mod::mm::virt::translate(current_task->pagemap, rusage_vaddr);
-                fill_rusage(PHYS, target_task);
+            if (!write_status_to_user(current_task, status, target_task->exit_status) ||
+                !write_rusage_to_user(current_task, rusage_vaddr, target_task)) {
+                return static_cast<uint64_t>(-EFAULT);
             }
             current_task->waiting_for_pid = 0;
             current_task->wait_options = 0;
@@ -643,12 +668,9 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             return static_cast<uint64_t>(-ECHILD);
         }
         sched_task::task_accumulate_waited_child_times(*current_task, *target_task);
-        if (status != nullptr) {
-            *status = target_task->exit_status;
-        }
-        if (rusage_vaddr != 0) {
-            uint64_t const PHYS = ker::mod::mm::virt::translate(current_task->pagemap, rusage_vaddr);
-            fill_rusage(PHYS, target_task);
+        if (!write_status_to_user(current_task, status, target_task->exit_status) ||
+            !write_rusage_to_user(current_task, rusage_vaddr, target_task)) {
+            return static_cast<uint64_t>(-EFAULT);
         }
         current_task->waiting_for_pid = 0;
         current_task->wait_options = 0;

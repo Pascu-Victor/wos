@@ -19,6 +19,7 @@
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sys/usercopy.hpp>
 #ifdef WOS_SELFTEST
 #include <platform/mm/phys.hpp>
 #endif
@@ -291,15 +292,13 @@ void complete_trace_wait(Task& tracer, Task& stopped) {
         return;
     }
 
+    bool output_ok = true;
     if (tracer.wait_status_user_addr != 0 && tracer.pagemap != nullptr) {
-        uint64_t const STATUS_PHYS = ker::mod::mm::virt::translate(tracer.pagemap, tracer.wait_status_user_addr);
-        if (STATUS_PHYS != ker::mod::mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
-            auto* status = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(STATUS_PHYS));
-            *status = static_cast<int32_t>((stop_signal(stopped) << 8U) | STOP_STATUS_LOW);
-        }
+        auto const STATUS = static_cast<int32_t>((stop_signal(stopped) << 8U) | STOP_STATUS_LOW);
+        output_ok = ker::mod::sys::usercopy::copy_value_to_task_mapped(tracer, tracer.wait_status_user_addr, STATUS);
     }
 
-    tracer.context.regs.rax = stopped.pid;
+    tracer.context.regs.rax = output_ok ? stopped.pid : static_cast<uint64_t>(-EFAULT);
     tracer.waiting_for_pid = 0;
     tracer.wait_options = 0;
     tracer.wait_status_user_addr = 0;

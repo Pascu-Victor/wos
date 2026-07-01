@@ -257,8 +257,9 @@ def test_sigpending_is_wired_through_wos_sysdeps() -> None:
         process_source,
         [
             "auto wos_proc_sigpending(uint64_t set_ptr) -> uint64_t",
-            "std::memset(set, 0, 1024 / 8);",
-            "set[0] = task->signal_pending_bits() & task->signal_mask_bits();",
+            "std::array<uint64_t, 16> set{};",
+            "set.at(0) = task->signal_pending_bits() & task->signal_mask_bits();",
+            "bool const COPIED = ker::mod::sys::usercopy::copy_to_task(*task, set_ptr, set.data(), set.size() * sizeof(set.at(0)));",
             "case abi::process::procmgmt_ops::SIGPENDING:",
             "return wos_proc_sigpending(a2);",
         ],

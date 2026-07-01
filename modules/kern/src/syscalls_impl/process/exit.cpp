@@ -12,13 +12,13 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/debug/ptrace.hpp>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/signal.hpp>
+#include <platform/sys/usercopy.hpp>
 #include <util/hcf.hpp>
 #include <vfs/vfs.hpp>
 
@@ -59,47 +59,36 @@ void record_local_proc_event(ker::mod::sched::task::Task* task, ker::mod::perf::
 }
 
 // Fill ru_utime and ru_stime in the waiter's rusage struct from the exiting child's timing data.
-void fill_rusage_for_waiter(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) {
+auto fill_rusage_for_waiter(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child) -> bool {
     if (waiter->wait_rusage_user_addr == 0 || waiter->pagemap == nullptr) {
         waiter->wait_rusage_user_addr = 0;
         waiter->wait_rusage_phys_addr = 0;
-        return;
+        return true;
     }
-    uint64_t const PHYS = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_rusage_user_addr);
-    if (PHYS == ker::mod::mm::virt::PADDR_INVALID || PHYS == 0) {
-        waiter->wait_rusage_user_addr = 0;
-        waiter->wait_rusage_phys_addr = 0;
-        return;
-    }
-    waiter->wait_rusage_phys_addr = PHYS;
-    auto* ru = reinterpret_cast<KernRusage*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
+
+    KernRusage ru{};
     uint64_t const USER_TIME_US = ker::mod::sched::task::task_rusage_user_time_us(*child);
     uint64_t const SYSTEM_TIME_US = ker::mod::sched::task::task_rusage_system_time_us(*child);
-    ru->ru_utime_sec = static_cast<int64_t>(USER_TIME_US / 1000000ULL);
-    ru->ru_utime_usec = static_cast<int64_t>(USER_TIME_US % 1000000ULL);
-    ru->ru_stime_sec = static_cast<int64_t>(SYSTEM_TIME_US / 1000000ULL);
-    ru->ru_stime_usec = static_cast<int64_t>(SYSTEM_TIME_US % 1000000ULL);
+    ru.ru_utime_sec = static_cast<int64_t>(USER_TIME_US / 1000000ULL);
+    ru.ru_utime_usec = static_cast<int64_t>(USER_TIME_US % 1000000ULL);
+    ru.ru_stime_sec = static_cast<int64_t>(SYSTEM_TIME_US / 1000000ULL);
+    ru.ru_stime_usec = static_cast<int64_t>(SYSTEM_TIME_US % 1000000ULL);
+    bool const OK = ker::mod::sys::usercopy::copy_value_to_task(*waiter, waiter->wait_rusage_user_addr, ru);
     waiter->wait_rusage_user_addr = 0;
     waiter->wait_rusage_phys_addr = 0;
+    return OK;
 }
 
-void write_wait_status_for_waiter(ker::mod::sched::task::Task* waiter, int32_t status) {
+auto write_wait_status_for_waiter(ker::mod::sched::task::Task* waiter, int32_t status) -> bool {
     if (waiter->wait_status_user_addr == 0 || waiter->pagemap == nullptr) {
         waiter->wait_status_user_addr = 0;
         waiter->wait_status_phys_addr = 0;
-        return;
+        return true;
     }
-    uint64_t const PHYS = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_status_user_addr);
-    if (PHYS == ker::mod::mm::virt::PADDR_INVALID || PHYS == 0) {
-        waiter->wait_status_user_addr = 0;
-        waiter->wait_status_phys_addr = 0;
-        return;
-    }
-    waiter->wait_status_phys_addr = PHYS;
-    auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
-    *status_ptr = status;
+    bool const OK = ker::mod::sys::usercopy::copy_value_to_task(*waiter, waiter->wait_status_user_addr, status);
     waiter->wait_status_user_addr = 0;
     waiter->wait_status_phys_addr = 0;
+    return OK;
 }
 
 void validate_waiter_resume_for_exit(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* child, const char* path) {
@@ -245,8 +234,10 @@ auto complete_exit_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::ta
     sched_task::task_accumulate_waited_child_times(*waiter, *child);
     waiter->context.regs.rax = child->pid;
     validate_waiter_resume_for_exit(waiter, child, path);
-    write_wait_status_for_waiter(waiter, child->exit_status);
-    fill_rusage_for_waiter(waiter, child);
+    bool const OUTPUT_OK = write_wait_status_for_waiter(waiter, child->exit_status) && fill_rusage_for_waiter(waiter, child);
+    if (!OUTPUT_OK) {
+        waiter->context.regs.rax = static_cast<uint64_t>(-EFAULT);
+    }
     waiter->waitpid_publish_pending.store(false, std::memory_order_release);
     waiter->deferred_task_switch = false;
     waiter->set_voluntary_blocked(false);

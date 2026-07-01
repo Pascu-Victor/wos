@@ -1,6 +1,7 @@
 #include "signal.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 
@@ -14,6 +15,7 @@
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sched/threading.hpp"
+#include "platform/sys/usercopy.hpp"
 #include "syscalls_impl/process/exit.hpp"
 
 namespace {
@@ -354,19 +356,17 @@ auto complete_waitpid_stop_waiter(Task& waiter, Task& stopped, int signo) -> boo
         return false;
     }
 
+    bool output_ok = true;
     if (waiter.wait_status_user_addr != 0 && waiter.pagemap != nullptr) {
-        uint64_t const PHYS = ker::mod::mm::virt::translate(waiter.pagemap, waiter.wait_status_user_addr);
-        if (PHYS != 0 && PHYS != ker::mod::mm::virt::PADDR_INVALID) {
-            auto* status = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
-            *status = job_control_stop_status(signo);
-        }
+        int32_t const STATUS = job_control_stop_status(signo);
+        output_ok = ker::mod::sys::usercopy::copy_value_to_task_mapped(waiter, waiter.wait_status_user_addr, STATUS);
     }
 
     uint64_t const WAITER_LOCK_FLAGS = stopped.exit_waiters_lock.lock_irqsave();
     (void)stopped.awaitee_on_exit.remove(waiter.pid);
     stopped.exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
 
-    waiter.context.regs.rax = stopped.pid;
+    waiter.context.regs.rax = output_ok ? stopped.pid : static_cast<uint64_t>(-EFAULT);
     clear_waitpid_wait_state(waiter);
     waiter.deferred_task_switch = false;
     waiter.set_voluntary_blocked(false);

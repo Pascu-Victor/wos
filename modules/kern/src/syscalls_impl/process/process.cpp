@@ -2,6 +2,7 @@
 
 #include <bits/posix/posix_string.h>
 
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -28,6 +29,7 @@
 #include "platform/sched/task.hpp"
 #include "platform/sched/threading.hpp"
 #include "platform/sys/signal.hpp"
+#include "platform/sys/usercopy.hpp"
 #include "release.hpp"
 #include "syscalls_impl/process/exec.hpp"
 #include "syscalls_impl/process/exit.hpp"
@@ -203,8 +205,12 @@ auto wos_proc_getgroups(size_t size, uint32_t* list) -> uint64_t {
         return static_cast<uint64_t>(-EINVAL);
     }
 
+    auto const LIST_ADDR = reinterpret_cast<uint64_t>(list);
     for (size_t i = 0; i < COUNT; ++i) {
-        list[i] = task->supplementary_groups.at(i);
+        uint32_t const GROUP = task->supplementary_groups.at(i);
+        if (!ker::mod::sys::usercopy::copy_value_to_task(*task, LIST_ADDR + (i * sizeof(uint32_t)), GROUP)) {
+            return static_cast<uint64_t>(-EFAULT);
+        }
     }
     return COUNT;
 }
@@ -225,8 +231,13 @@ auto wos_proc_setgroups(size_t size, const uint32_t* list) -> uint64_t {
     }
 
     ker::util::SmallVec<uint32_t, ker::mod::sched::task::Task::SUPPLEMENTARY_GROUPS_MAX> groups;
+    auto const LIST_ADDR = reinterpret_cast<uint64_t>(list);
     for (size_t i = 0; i < size; ++i) {
-        if (!groups.push_back(list[i])) {
+        uint32_t group = 0;
+        if (!ker::mod::sys::usercopy::copy_value_from_task(*task, LIST_ADDR + (i * sizeof(uint32_t)), group)) {
+            return static_cast<uint64_t>(-EFAULT);
+        }
+        if (!groups.push_back(group)) {
             return static_cast<uint64_t>(-ENOMEM);
         }
     }
@@ -711,18 +722,22 @@ void copy_cstr_field(char* dst, size_t cap, const char* src) {
 }
 
 auto wos_proc_uname(KernelUtsname* buf) -> uint64_t {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
     if (buf == nullptr) {
         return static_cast<uint64_t>(-EFAULT);
     }
 
-    std::memset(buf, 0, sizeof(*buf));
-    copy_cstr_field(buf->sysname, sizeof(buf->sysname), ker::release::NAME);
-    copy_cstr_field(buf->nodename, sizeof(buf->nodename), ker::util::hostname::get());
-    copy_cstr_field(buf->release, sizeof(buf->release), ker::release::VERSION);
-    copy_cstr_field(buf->version, sizeof(buf->version), ker::release::COMPILER);
-    copy_cstr_field(buf->machine, sizeof(buf->machine), "x86_64");
-    copy_cstr_field(buf->domainname, sizeof(buf->domainname), "localdomain");
-    return 0;
+    KernelUtsname uts{};
+    copy_cstr_field(uts.sysname, sizeof(uts.sysname), ker::release::NAME);
+    copy_cstr_field(uts.nodename, sizeof(uts.nodename), ker::util::hostname::get());
+    copy_cstr_field(uts.release, sizeof(uts.release), ker::release::VERSION);
+    copy_cstr_field(uts.version, sizeof(uts.version), ker::release::COMPILER);
+    copy_cstr_field(uts.machine, sizeof(uts.machine), "x86_64");
+    copy_cstr_field(uts.domainname, sizeof(uts.domainname), "localdomain");
+    return ker::mod::sys::usercopy::copy_value_to_task(*task, reinterpret_cast<uint64_t>(buf), uts) ? 0 : static_cast<uint64_t>(-EFAULT);
 }
 
 auto wos_proc_sigaction(int signum, uint64_t act_ptr, uint64_t oldact_ptr) -> uint64_t {
@@ -745,26 +760,33 @@ auto wos_proc_sigaction(int signum, uint64_t act_ptr, uint64_t oldact_ptr) -> ui
 
     auto const IDX = static_cast<unsigned>(signum - 1);
 
+    KernelSigaction act{};
+    if (act_ptr != 0 && !ker::mod::sys::usercopy::copy_value_from_task(*task, act_ptr, act)) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+
     // Return old handler if requested
     if (oldact_ptr != 0) {
-        auto* old = reinterpret_cast<KernelSigaction*>(oldact_ptr);
         const auto& handler = signal_handler_slot(*task, IDX);
-        old->handler = handler.handler;
-        old->flags = handler.flags;
-        old->restorer = handler.restorer;
-        old->mask = handler.mask;
+        KernelSigaction old{};
+        old.handler = handler.handler;
+        old.flags = handler.flags;
+        old.restorer = handler.restorer;
+        old.mask = handler.mask;
+        if (!ker::mod::sys::usercopy::copy_value_to_task(*task, oldact_ptr, old)) {
+            return static_cast<uint64_t>(-EFAULT);
+        }
     }
 
     // Set new handler if provided
     if (act_ptr != 0) {
-        const auto* act = reinterpret_cast<const KernelSigaction*>(act_ptr);
         auto& handler = signal_handler_slot(*task, IDX);
-        handler.handler = act->handler;
-        handler.flags = act->flags;
-        handler.mask = act->mask;
+        handler.handler = act.handler;
+        handler.flags = act.flags;
+        handler.mask = act.mask;
         // Store restorer if SA_RESTORER flag is set
-        if ((act->flags & WOS_SA_RESTORER) != 0U) {
-            handler.restorer = act->restorer;
+        if ((act.flags & WOS_SA_RESTORER) != 0U) {
+            handler.restorer = act.restorer;
         }
     }
 
@@ -778,15 +800,24 @@ auto wos_proc_sigaltstack(const KernelStackT* ss, KernelStackT* old_ss, ker::mod
         return static_cast<uint64_t>(-ESRCH);
     }
 
+    KernelStackT new_ss{};
+    if (ss != nullptr && !ker::mod::sys::usercopy::copy_value_from_task(*task, reinterpret_cast<uint64_t>(ss), new_ss)) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+
     uint64_t user_rsp = 0;
     asm volatile("movq %%gs:0x08, %0" : "=r"(user_rsp));
     bool const ON_STACK = (task->sigaltstack_flags & WOS_SS_DISABLE) == 0 && task->sigaltstack_sp != 0 &&
                           user_rsp >= task->sigaltstack_sp && user_rsp < task->sigaltstack_sp + task->sigaltstack_size;
 
     if (old_ss != nullptr) {
-        old_ss->ss_sp = reinterpret_cast<void*>(task->sigaltstack_sp);
-        old_ss->ss_size = task->sigaltstack_size;
-        old_ss->ss_flags = ON_STACK ? WOS_SS_ONSTACK : static_cast<int>(task->sigaltstack_flags);
+        KernelStackT old{};
+        old.ss_sp = reinterpret_cast<void*>(task->sigaltstack_sp);
+        old.ss_size = task->sigaltstack_size;
+        old.ss_flags = ON_STACK ? WOS_SS_ONSTACK : static_cast<int>(task->sigaltstack_flags);
+        if (!ker::mod::sys::usercopy::copy_value_to_task(*task, reinterpret_cast<uint64_t>(old_ss), old)) {
+            return static_cast<uint64_t>(-EFAULT);
+        }
     }
 
     if (ss == nullptr) {
@@ -795,11 +826,11 @@ auto wos_proc_sigaltstack(const KernelStackT* ss, KernelStackT* old_ss, ker::mod
     if (ON_STACK) {
         return static_cast<uint64_t>(-EPERM);
     }
-    uint32_t const FLAGS = static_cast<uint32_t>(ss->ss_flags);
-    if ((FLAGS & ~(WOS_SS_DISABLE)) != 0) {
+    auto const FLAGS = static_cast<uint32_t>(new_ss.ss_flags);
+    if ((FLAGS & ~WOS_SS_DISABLE) != 0) {
         return static_cast<uint64_t>(-EINVAL);
     }
-    if ((FLAGS & WOS_SS_DISABLE) == 0 && ss->ss_size < WOS_MINSIGSTKSZ) {
+    if ((FLAGS & WOS_SS_DISABLE) == 0 && new_ss.ss_size < WOS_MINSIGSTKSZ) {
         return static_cast<uint64_t>(-ENOMEM);
     }
 
@@ -810,8 +841,8 @@ auto wos_proc_sigaltstack(const KernelStackT* ss, KernelStackT* old_ss, ker::mod
         return 0;
     }
 
-    task->sigaltstack_sp = reinterpret_cast<uint64_t>(ss->ss_sp);
-    task->sigaltstack_size = ss->ss_size;
+    task->sigaltstack_sp = reinterpret_cast<uint64_t>(new_ss.ss_sp);
+    task->sigaltstack_size = new_ss.ss_size;
     task->sigaltstack_flags = 0;
     return 0;
 }
@@ -824,17 +855,21 @@ auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr) -> uin
         return static_cast<uint64_t>(-ESRCH);
     }
 
+    uint64_t set = 0;
+    if (set_ptr != 0 && !ker::mod::sys::usercopy::copy_value_from_task(*task, set_ptr, set)) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+
     // Return old mask if requested (sigset_t first word)
     if (oldset_ptr != 0) {
-        auto* oldset = reinterpret_cast<uint64_t*>(oldset_ptr);
-        *oldset = task->signal_mask_bits();
+        uint64_t const OLD_MASK = task->signal_mask_bits();
+        if (!ker::mod::sys::usercopy::copy_value_to_task(*task, oldset_ptr, OLD_MASK)) {
+            return static_cast<uint64_t>(-EFAULT);
+        }
     }
 
     // Apply new mask if provided
     if (set_ptr != 0) {
-        const auto* setp = reinterpret_cast<const uint64_t*>(set_ptr);
-        uint64_t set = *setp;
-
         // SIGKILL and SIGSTOP can never be blocked
         uint64_t const UNBLOCKABLE = (1ULL << (WOS_SIGKILL - 1)) | (1ULL << (WOS_SIGSTOP - 1));
         set &= ~UNBLOCKABLE;
@@ -871,10 +906,10 @@ auto wos_proc_sigpending(uint64_t set_ptr) -> uint64_t {
         return static_cast<uint64_t>(-EFAULT);
     }
 
-    auto* set = reinterpret_cast<uint64_t*>(set_ptr);
-    std::memset(set, 0, 1024 / 8);
-    set[0] = task->signal_pending_bits() & task->signal_mask_bits();
-    return 0;
+    std::array<uint64_t, 16> set{};
+    set.at(0) = task->signal_pending_bits() & task->signal_mask_bits();
+    bool const COPIED = ker::mod::sys::usercopy::copy_to_task(*task, set_ptr, set.data(), set.size() * sizeof(set.at(0)));
+    return COPIED ? 0 : static_cast<uint64_t>(-EFAULT);
 }
 
 auto wos_proc_personality(uint64_t persona) -> uint64_t {
@@ -901,8 +936,10 @@ auto wos_proc_sigsuspend(uint64_t set_ptr, ker::mod::cpu::GPRegs& gpr) -> uint64
         return static_cast<uint64_t>(-EFAULT);
     }
 
-    const auto* setp = reinterpret_cast<const uint64_t*>(set_ptr);
-    uint64_t set = *setp;
+    uint64_t set = 0;
+    if (!ker::mod::sys::usercopy::copy_value_from_task(*task, set_ptr, set)) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
     uint64_t const UNBLOCKABLE = (1ULL << (WOS_SIGKILL - 1)) | (1ULL << (WOS_SIGSTOP - 1));
     set &= ~UNBLOCKABLE;
 
@@ -921,23 +958,37 @@ auto wos_proc_sigsuspend(uint64_t set_ptr, ker::mod::cpu::GPRegs& gpr) -> uint64
     return 0;
 }
 
-auto wos_proc_clone_vm(const CloneVmArgs* args) -> uint64_t {
+auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     using namespace ker::mod;
 
     auto* parent = sched::get_current_task();
-    if (parent == nullptr || args == nullptr) {
-        return static_cast<uint64_t>(args == nullptr ? -EFAULT : -ESRCH);
+    if (args_addr == 0) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+    if (parent == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+
+    CloneVmArgs args{};
+    if (!sys::usercopy::copy_value_from_task(*parent, args_addr, args)) {
+        return static_cast<uint64_t>(-EFAULT);
     }
     if (power::shutdown_in_progress()) {
         return static_cast<uint64_t>(-ESHUTDOWN);
     }
-    if (args->fn == 0 || args->child_stack == 0 || (args->flags & WOS_CLONE_VM) == 0) {
+    if (args.fn == 0 || args.child_stack == 0 || (args.flags & WOS_CLONE_VM) == 0) {
         return static_cast<uint64_t>(-EINVAL);
     }
 
     uint64_t const SUPPORTED_FLAGS = WOS_CLONE_VM | WOS_CLONE_FS | WOS_CLONE_FILES | WOS_CLONE_UNTRACED | 0xFF;
-    if ((args->flags & ~SUPPORTED_FLAGS) != 0) {
+    if ((args.flags & ~SUPPORTED_FLAGS) != 0) {
         return static_cast<uint64_t>(-EINVAL);
+    }
+    if (args.parent_tidptr != 0 && !sys::usercopy::ensure_writable(*parent, args.parent_tidptr, sizeof(int))) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+    if (args.child_tidptr != 0 && !sys::usercopy::ensure_writable(*parent, args.child_tidptr, sizeof(int))) {
+        return static_cast<uint64_t>(-EFAULT);
     }
 
     auto const KERNEL_STACK_BASE = alloc_fork_kernel_stack_with_reclaim();
@@ -1030,8 +1081,15 @@ auto wos_proc_clone_vm(const CloneVmArgs* args) -> uint64_t {
         child_thread->tls_phys_ptr = 0;
         child_thread->stack_phys_ptr = 0;
     }
-    child_thread->fsbase = args->newtls != 0 ? args->newtls : (parent->thread != nullptr ? parent->thread->fsbase : 0);
-    child_thread->stack = args->child_stack;
+    uint64_t fsbase = 0;
+    if (parent->thread != nullptr) {
+        fsbase = parent->thread->fsbase;
+    }
+    if (args.newtls != 0) {
+        fsbase = args.newtls;
+    }
+    child_thread->fsbase = fsbase;
+    child_thread->stack = args.child_stack;
     child_thread->stack_size = 0;
     child_thread->stack_base_virt = 0;
     child_thread->stack_lowest_backed = 0;
@@ -1046,16 +1104,16 @@ auto wos_proc_clone_vm(const CloneVmArgs* args) -> uint64_t {
     }
     per_cpu->syscall_stack = KERNEL_RSP;
     per_cpu->cpu_id = cpu::current_cpu();
-    per_cpu->user_rsp = args->child_stack;
-    per_cpu->syscall_ret_rip = args->fn;
+    per_cpu->user_rsp = args.child_stack;
+    per_cpu->syscall_ret_rip = args.fn;
     per_cpu->syscall_ret_flags = 0x202;
     child->context.syscall_scratch_area = reinterpret_cast<uint64_t>(per_cpu);
     child_thread->gsbase = reinterpret_cast<uint64_t>(per_cpu);
 
     child->context.regs = {};
-    child->context.regs.rdi = args->arg;
-    child->context.frame.rip = args->fn;
-    child->context.frame.rsp = args->child_stack;
+    child->context.regs.rdi = args.arg;
+    child->context.frame.rip = args.fn;
+    child->context.frame.rsp = args.child_stack;
     child->context.frame.flags = 0x202;
     child->context.frame.cs = desc::gdt::GDT_USER_CS;
     child->context.frame.ss = desc::gdt::GDT_USER_DS;
@@ -1071,11 +1129,17 @@ auto wos_proc_clone_vm(const CloneVmArgs* args) -> uint64_t {
         return static_cast<uint64_t>(-ENOMEM);
     }
 
-    if (args->parent_tidptr != 0) {
-        *reinterpret_cast<int*>(args->parent_tidptr) = static_cast<int>(child->pid);
+    if (args.parent_tidptr != 0) {
+        int const CHILD_PID = static_cast<int>(child->pid);
+        if (!sys::usercopy::copy_value_to_task(*parent, args.parent_tidptr, CHILD_PID)) {
+            return static_cast<uint64_t>(-EFAULT);
+        }
     }
-    if (args->child_tidptr != 0) {
-        *reinterpret_cast<int*>(args->child_tidptr) = static_cast<int>(child->pid);
+    if (args.child_tidptr != 0) {
+        int const CHILD_PID = static_cast<int>(child->pid);
+        if (!sys::usercopy::copy_value_to_task(*parent, args.child_tidptr, CHILD_PID)) {
+            return static_cast<uint64_t>(-EFAULT);
+        }
     }
 
     return child->pid;
@@ -1098,8 +1162,10 @@ auto wos_proc_prctl(int option, uint64_t arg2, uint64_t arg3, uint64_t arg4, uin
             if (arg2 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            *reinterpret_cast<int*>(arg2) = static_cast<int>(task->parent_death_signal);
-            return 0;
+            {
+                int const SIGNAL = static_cast<int>(task->parent_death_signal);
+                return ker::mod::sys::usercopy::copy_value_to_task(*task, arg2, SIGNAL) ? 0 : static_cast<uint64_t>(-EFAULT);
+            }
         case WOS_PR_GET_DUMPABLE:
             return static_cast<uint64_t>(task->dumpable);
         case WOS_PR_SET_DUMPABLE:
@@ -1118,7 +1184,11 @@ auto wos_proc_prctl(int option, uint64_t arg2, uint64_t arg3, uint64_t arg4, uin
                 if (name == nullptr) {
                     return static_cast<uint64_t>(-ENOMEM);
                 }
-                copy_cstr_field(name, TASK_NAME_MAX, reinterpret_cast<const char*>(arg2));
+                if (!ker::mod::sys::usercopy::copy_cstring_from_task(*task, arg2, name, TASK_NAME_MAX)) {
+                    delete[] name;
+                    return static_cast<uint64_t>(-EFAULT);
+                }
+                delete[] task->name;
                 task->name = name;
             }
             return 0;
@@ -1126,8 +1196,11 @@ auto wos_proc_prctl(int option, uint64_t arg2, uint64_t arg3, uint64_t arg4, uin
             if (arg2 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            copy_cstr_field(reinterpret_cast<char*>(arg2), 16, task->name != nullptr ? task->name : "");
-            return 0;
+            {
+                std::array<char, 16> name{};
+                copy_cstr_field(name.data(), name.size(), task->name != nullptr ? task->name : "");
+                return ker::mod::sys::usercopy::copy_to_task(*task, arg2, name.data(), name.size()) ? 0 : static_cast<uint64_t>(-EFAULT);
+            }
         case WOS_PR_SET_PTRACER:
             task->ptrace_tracer_pid = arg2;
             return 0;
@@ -1157,8 +1230,7 @@ auto wos_proc_arch_prctl(int option, uint64_t arg2) -> uint64_t {
             if (arg2 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            *reinterpret_cast<uint64_t*>(arg2) = task->thread->fsbase;
-            return 0;
+            return ker::mod::sys::usercopy::copy_value_to_task(*task, arg2, task->thread->fsbase) ? 0 : static_cast<uint64_t>(-EFAULT);
         case WOS_ARCH_SET_GS:
             (void)arg2;
             return 0;
@@ -1166,8 +1238,10 @@ auto wos_proc_arch_prctl(int option, uint64_t arg2) -> uint64_t {
             if (arg2 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            *reinterpret_cast<uint64_t*>(arg2) = 0;
-            return 0;
+            {
+                uint64_t const GS_BASE = 0;
+                return ker::mod::sys::usercopy::copy_value_to_task(*task, arg2, GS_BASE) ? 0 : static_cast<uint64_t>(-EFAULT);
+            }
         default:
             return static_cast<uint64_t>(-EINVAL);
     }
@@ -1330,7 +1404,9 @@ auto wos_proc_setwkitarget(const char* hostname, size_t len, uint32_t flags) -> 
         return static_cast<uint64_t>(-ENAMETOOLONG);
     }
 
-    std::memcpy(task->wki_target_hostname.data(), hostname, len);
+    if (!ker::mod::sys::usercopy::copy_from_task(*task, reinterpret_cast<uint64_t>(hostname), task->wki_target_hostname.data(), len)) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
     mutable_hostname_char(task->wki_target_hostname, len) = '\0';
     task->wki_target_flags = flags;
     return 0;
@@ -1347,11 +1423,16 @@ auto wos_proc_getwkitarget(char* hostname_out, size_t hostname_out_size, uint32_
         if (hostname_out_size == 0 || LEN + 1 > hostname_out_size) {
             return static_cast<uint64_t>(-ENAMETOOLONG);
         }
-        std::memcpy(hostname_out, task->wki_target_hostname.data(), LEN + 1);
+        if (!ker::mod::sys::usercopy::copy_to_task(*task, reinterpret_cast<uint64_t>(hostname_out), task->wki_target_hostname.data(),
+                                                   LEN + 1)) {
+            return static_cast<uint64_t>(-EFAULT);
+        }
     }
 
     if (flags_out != nullptr) {
-        *flags_out = task->wki_target_flags;
+        if (!ker::mod::sys::usercopy::copy_value_to_task(*task, reinterpret_cast<uint64_t>(flags_out), task->wki_target_flags)) {
+            return static_cast<uint64_t>(-EFAULT);
+        }
     }
 
     return LEN;
@@ -1424,7 +1505,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             return wos_proc_uname(reinterpret_cast<KernelUtsname*>(a2));
         }
         case abi::process::procmgmt_ops::CLONE_VM_PROC: {
-            return wos_proc_clone_vm(reinterpret_cast<const CloneVmArgs*>(a2));
+            return wos_proc_clone_vm(a2);
         }
         case abi::process::procmgmt_ops::PRCTL: {
             return wos_proc_prctl(static_cast<int>(a2), a3, a4, a5, a6);
@@ -1469,15 +1550,14 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
-            auto* ruid = reinterpret_cast<uint32_t*>(a2);
-            auto* euid = reinterpret_cast<uint32_t*>(a3);
-            auto* suid = reinterpret_cast<uint32_t*>(a4);
-            if (ruid == nullptr || euid == nullptr || suid == nullptr) {
+            if (a2 == 0 || a3 == 0 || a4 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            *ruid = task->uid;
-            *euid = task->euid;
-            *suid = task->suid;
+            if (!ker::mod::sys::usercopy::copy_value_to_task(*task, a2, task->uid) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a3, task->euid) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a4, task->suid)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
             return 0;
         }
         case abi::process::procmgmt_ops::GETRESGID: {
@@ -1485,15 +1565,14 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
-            auto* rgid = reinterpret_cast<uint32_t*>(a2);
-            auto* egid = reinterpret_cast<uint32_t*>(a3);
-            auto* sgid = reinterpret_cast<uint32_t*>(a4);
-            if (rgid == nullptr || egid == nullptr || sgid == nullptr) {
+            if (a2 == 0 || a3 == 0 || a4 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            *rgid = task->gid;
-            *egid = task->egid;
-            *sgid = task->sgid;
+            if (!ker::mod::sys::usercopy::copy_value_to_task(*task, a2, task->gid) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a3, task->egid) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a4, task->sgid)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
             return 0;
         }
         case abi::process::procmgmt_ops::GETGROUPS: {
@@ -1666,9 +1745,12 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
                                    reinterpret_cast<const char* const*>(a4), gpr);
         }
         case abi::process::procmgmt_ops::GETHOSTNAME: {
-            auto* buf = reinterpret_cast<char*>(a2);
             auto bufsize = static_cast<size_t>(a3);
-            if (buf == nullptr) {
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            if (a2 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
             const char* name = ker::util::hostname::get();
@@ -1676,16 +1758,25 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             if (LEN + 1 > bufsize) {
                 return static_cast<uint64_t>(-ENAMETOOLONG);
             }
-            std::memcpy(buf, name, LEN + 1);
-            return 0;
+            return ker::mod::sys::usercopy::copy_to_task(*task, a2, name, LEN + 1) ? 0 : static_cast<uint64_t>(-EFAULT);
         }
         case abi::process::procmgmt_ops::SETHOSTNAME: {
-            const auto* name = reinterpret_cast<const char*>(a2);
             auto len = static_cast<size_t>(a3);
-            if (name == nullptr) {
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            if (a2 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            int const R = ker::util::hostname::set(name, len);
+            if (len == 0 || len >= ker::util::hostname::HOSTNAME_MAX) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            std::array<char, ker::util::hostname::HOSTNAME_MAX> name{};
+            if (!ker::mod::sys::usercopy::copy_from_task(*task, a2, name.data(), len)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            int const R = ker::util::hostname::set(name.data(), len);
             return (R < 0) ? static_cast<uint64_t>(R) : 0;
         }
         case abi::process::procmgmt_ops::SETPRIORITY: {

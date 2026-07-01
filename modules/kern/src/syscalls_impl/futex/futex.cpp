@@ -15,6 +15,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <platform/sys/usercopy.hpp>
 #include <util/hashtable.hpp>
 
 namespace ker::syscall::futex {
@@ -60,19 +61,22 @@ std::atomic<bool> futex_table_initialized{false};
     return initialized;
 }
 
-auto relative_timeout_us(const void* timeout, uint64_t& out_us) -> int64_t {
+auto relative_timeout_us(mod::sched::task::Task& task, const void* timeout, uint64_t& out_us) -> int64_t {
     out_us = 0;
     if (timeout == nullptr) {
         return 0;
     }
 
-    auto const* ts = reinterpret_cast<const timespec*>(timeout);
-    if (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= NSEC_PER_SEC) {
+    timespec ts{};
+    if (!mod::sys::usercopy::copy_value_from_task(task, reinterpret_cast<uint64_t>(timeout), ts)) {
+        return -EFAULT;
+    }
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC) {
         return -EINVAL;
     }
 
-    auto const NSEC_US = (static_cast<uint64_t>(ts->tv_nsec) + 999ULL) / 1000ULL;
-    auto const SEC = static_cast<uint64_t>(ts->tv_sec);
+    auto const NSEC_US = (static_cast<uint64_t>(ts.tv_nsec) + 999ULL) / 1000ULL;
+    auto const SEC = static_cast<uint64_t>(ts.tv_sec);
     if (SEC > (UINT64_MAX - NSEC_US) / USEC_PER_SEC) {
         return -EINVAL;
     }
@@ -149,6 +153,9 @@ int64_t futex_wait(const int* addr, int expected, const void* timeout) {
 
     // Translate user virtual address to physical address for cross-process uniqueness
     auto user_vaddr = reinterpret_cast<uint64_t>(addr);
+    if (!mod::sys::usercopy::range_valid(user_vaddr, sizeof(int))) {
+        return -EFAULT;
+    }
     uint64_t const PHYS_ADDR = mod::mm::virt::translate(current_task->pagemap, user_vaddr);
     if (PHYS_ADDR == ker::mod::mm::virt::PADDR_INVALID) {
         return -EFAULT;  // Invalid address
@@ -160,7 +167,7 @@ int64_t futex_wait(const int* addr, int expected, const void* timeout) {
     int const* kernel_addr = reinterpret_cast<int*>(reinterpret_cast<uint64_t>(mod::mm::addr::get_virt_pointer(PHYS_PAGE)) + OFFSET);
 
     uint64_t timeout_us = 0;
-    int64_t const TIMEOUT_STATUS = relative_timeout_us(timeout, timeout_us);
+    int64_t const TIMEOUT_STATUS = relative_timeout_us(*current_task, timeout, timeout_us);
     if (TIMEOUT_STATUS != 0) {
         return TIMEOUT_STATUS;
     }
@@ -234,6 +241,9 @@ int64_t futex_wake(int* addr, int count) {  // NOLINT
 
     // Translate user virtual address to physical address
     auto user_vaddr = reinterpret_cast<uint64_t>(addr);
+    if (!mod::sys::usercopy::range_valid(user_vaddr, sizeof(int))) {
+        return -EFAULT;
+    }
     uint64_t const PHYS_ADDR = mod::mm::virt::translate(current_task->pagemap, user_vaddr);
     if (PHYS_ADDR == ker::mod::mm::virt::PADDR_INVALID) {
         return -EFAULT;  // Invalid address

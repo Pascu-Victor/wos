@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -29,6 +30,7 @@
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
 #include <platform/smt/smt.hpp>
+#include <platform/sys/usercopy.hpp>
 #include <string_view>
 #include <util/errno_name.hpp>
 #include <utility>
@@ -652,22 +654,19 @@ auto proxy_waiter_context_can_be_completed(ker::mod::sched::task::Task* waiter) 
     return waiter != nullptr && !waiter->deferred_task_switch && !waiter->waitpid_publish_pending.load(std::memory_order_acquire);
 }
 
-void write_proxy_wait_status(ker::mod::sched::task::Task* waiter, int32_t wait_status) {
+auto write_proxy_wait_status(ker::mod::sched::task::Task* waiter, int32_t wait_status) -> bool {
     if (waiter == nullptr || waiter->wait_status_user_addr == 0 || waiter->pagemap == nullptr) {
         if (waiter != nullptr) {
             waiter->wait_status_user_addr = 0;
             waiter->wait_status_phys_addr = 0;
         }
-        return;
+        return true;
     }
 
-    uint64_t const STATUS_PHYS = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_status_user_addr);
-    if (STATUS_PHYS != ker::mod::mm::virt::PADDR_INVALID && STATUS_PHYS != 0) {
-        auto* status_ptr = reinterpret_cast<int32_t*>(ker::mod::mm::addr::get_virt_pointer(STATUS_PHYS));
-        *status_ptr = wait_status;
-    }
+    bool const OK = ker::mod::sys::usercopy::copy_value_to_task_mapped(*waiter, waiter->wait_status_user_addr, wait_status);
     waiter->wait_status_user_addr = 0;
     waiter->wait_status_phys_addr = 0;
+    return OK;
 }
 
 auto proxy_matches_waiter(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* proxy) -> bool {
@@ -695,7 +694,9 @@ auto try_complete_proxy_wait(ker::mod::sched::task::Task* waiter, ker::mod::sche
 
     ker::mod::sched::task::task_accumulate_waited_child_times(*waiter, *proxy);
     waiter->context.regs.rax = proxy->pid;
-    write_proxy_wait_status(waiter, wait_status);
+    if (!write_proxy_wait_status(waiter, wait_status)) {
+        waiter->context.regs.rax = static_cast<uint64_t>(-EFAULT);
+    }
     waiter->waitpid_publish_pending.store(false, std::memory_order_release);
     ker::mod::sched::task::task_clear_waitpid_block_state(*waiter);
     return true;
