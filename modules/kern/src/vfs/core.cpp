@@ -7086,6 +7086,16 @@ auto vfs_access(const char* path, int mode) -> int {
     return vfs_check_permission(st.st_mode & 07777, st.st_uid, st.st_gid, mode);
 }
 
+namespace {
+auto validate_positional_offset(off_t offset, size_t* out) -> int {
+    if (offset < 0 || out == nullptr) {
+        return -EINVAL;
+    }
+    *out = static_cast<size_t>(offset);
+    return 0;
+}
+}  // namespace
+
 // --- pread / pwrite ---
 auto vfs_pread(int fd, void* buf, size_t count, off_t offset) -> ssize_t {
     auto* task = ker::mod::sched::get_current_task();
@@ -7100,11 +7110,17 @@ auto vfs_pread(int fd, void* buf, size_t count, off_t offset) -> ssize_t {
         vfs_put_file(f);
         return -ENOSYS;
     }
+    size_t positional_offset = 0;
+    int const OFFSET_RET = validate_positional_offset(offset, &positional_offset);
+    if (OFFSET_RET < 0) {
+        vfs_put_file(f);
+        return OFFSET_RET;
+    }
     // Positional reads are often random-access probes over files that were
     // just written (for example Git pack verification). Keep them out of the
     // stream cache so cached EOF/island state cannot affect pread semantics.
     f->positional_read_depth.fetch_add(1, std::memory_order_acq_rel);
-    auto result = clamp_io_count(f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset)), count);
+    auto result = clamp_io_count(f->fops->vfs_read(f, buf, count, positional_offset), count);
     f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
     vfs_put_file(f);
     return result;
@@ -7117,9 +7133,14 @@ auto vfs_pread_file(File* f, void* buf, size_t count, off_t offset) -> ssize_t {
     if (f->fops == nullptr || f->fops->vfs_read == nullptr) {
         return -ENOSYS;
     }
+    size_t positional_offset = 0;
+    int const OFFSET_RET = validate_positional_offset(offset, &positional_offset);
+    if (OFFSET_RET < 0) {
+        return OFFSET_RET;
+    }
 
     f->positional_read_depth.fetch_add(1, std::memory_order_acq_rel);
-    auto result = clamp_io_count(f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset)), count);
+    auto result = clamp_io_count(f->fops->vfs_read(f, buf, count, positional_offset), count);
     f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
     return result;
 }
@@ -7131,9 +7152,14 @@ auto vfs_pread_file_direct(File* f, void* buf, size_t count, off_t offset) -> ss
     if (f->fops == nullptr || f->fops->vfs_read == nullptr) {
         return -ENOSYS;
     }
+    size_t positional_offset = 0;
+    int const OFFSET_RET = validate_positional_offset(offset, &positional_offset);
+    if (OFFSET_RET < 0) {
+        return OFFSET_RET;
+    }
 
     f->positional_read_depth.fetch_add(1, std::memory_order_acq_rel);
-    auto result = clamp_io_count(f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset)), count);
+    auto result = clamp_io_count(f->fops->vfs_read(f, buf, count, positional_offset), count);
     f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
     return result;
 }
@@ -7151,7 +7177,13 @@ auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t 
         vfs_put_file(f);
         return -ENOSYS;
     }
-    auto result = clamp_io_count(f->fops->vfs_write(f, buf, count, static_cast<size_t>(offset)), count);
+    size_t positional_offset = 0;
+    int const OFFSET_RET = validate_positional_offset(offset, &positional_offset);
+    if (OFFSET_RET < 0) {
+        vfs_put_file(f);
+        return OFFSET_RET;
+    }
+    auto result = clamp_io_count(f->fops->vfs_write(f, buf, count, positional_offset), count);
     if (result > 0) {
         cache_notify_file_data_changed_impl(f);
     }

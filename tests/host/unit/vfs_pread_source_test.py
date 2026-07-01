@@ -54,10 +54,58 @@ def test_pread_paths_bypass_stream_cache() -> None:
             body,
             [
                 "positional_read_depth.fetch_add(1, std::memory_order_acq_rel)",
-                "f->fops->vfs_read(f, buf, count, static_cast<size_t>(offset))",
+                "f->fops->vfs_read(f, buf, count, positional_offset)",
                 "positional_read_depth.fetch_sub(1, std::memory_order_acq_rel)",
             ],
             name,
+        )
+
+
+def test_positional_io_rejects_negative_offsets_before_unsigned_conversion() -> None:
+    source = CORE_CPP.read_text()
+    helper = function_body(source, "validate_positional_offset")
+    require_order(
+        helper,
+        [
+            "if (offset < 0 || out == nullptr)",
+            "return -EINVAL",
+            "*out = static_cast<size_t>(offset)",
+        ],
+        "positional offset validator",
+    )
+
+    for name in ("vfs_pread", "vfs_pread_file", "vfs_pread_file_direct", "vfs_pwrite"):
+        body = function_body(source, name)
+        if "static_cast<size_t>(offset)" in body:
+            fail(f"{name} must not convert a signed offset directly")
+        if "validate_positional_offset(offset, &positional_offset)" not in body:
+            fail(f"{name} must validate negative offsets before calling backend file ops")
+        if "positional_offset" not in body:
+            fail(f"{name} must pass the validated positional offset to backend file ops")
+
+    for name in ("vfs_pread", "vfs_pwrite"):
+        body = function_body(source, name)
+        require_order(
+            body,
+            [
+                "int const OFFSET_RET = validate_positional_offset(offset, &positional_offset)",
+                "if (OFFSET_RET < 0)",
+                "vfs_put_file(f)",
+                "return OFFSET_RET",
+            ],
+            f"{name} negative offset cleanup",
+        )
+
+    for name in ("vfs_pread_file", "vfs_pread_file_direct"):
+        body = function_body(source, name)
+        require_order(
+            body,
+            [
+                "int const OFFSET_RET = validate_positional_offset(offset, &positional_offset)",
+                "if (OFFSET_RET < 0)",
+                "return OFFSET_RET",
+            ],
+            f"{name} negative offset rejection",
         )
 
 
@@ -119,6 +167,7 @@ def test_loader_path_trace_is_compile_time_disabled_by_default() -> None:
 
 def main() -> None:
     test_pread_paths_bypass_stream_cache()
+    test_positional_io_rejects_negative_offsets_before_unsigned_conversion()
     test_ktest_covers_pread_contract()
     test_local_xfs_reads_bypass_stream_cache()
     test_loader_path_trace_is_compile_time_disabled_by_default()
