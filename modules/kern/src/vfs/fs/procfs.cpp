@@ -3901,6 +3901,8 @@ auto generate_kcpustate(char* buf, size_t bufsz) -> size_t {
         append_memacc_dec(p, end, "preempt_depth", state.current_preempt_depth);
         append_memacc_bool(p, end, "preempt_pending", state.current_preempt_pending);
         append_memacc_dec(p, end, "preempt_max_us", state.current_preempt_max_us);
+        append_memacc_hex(p, end, "preempt_owner", state.current_preempt_owner);
+        append_memacc_dec(p, end, "preempt_start_us", state.current_preempt_start_us);
         append_char(p, end, '\n');
     }
 

@@ -244,6 +244,8 @@ struct SchedulerCpuState {
     uint32_t current_preempt_depth;
     bool current_preempt_pending;
     uint64_t current_preempt_max_us;
+    uint64_t current_preempt_owner;
+    uint64_t current_preempt_start_us;
     bool resched_timer_pending;
     bool is_idle;
     uint64_t runnable_count;

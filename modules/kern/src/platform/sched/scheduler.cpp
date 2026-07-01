@@ -7012,6 +7012,8 @@ auto get_scheduler_cpu_state(uint64_t cpu_no) -> SchedulerCpuState {
             state.current_preempt_depth = current->preempt_disable_depth;
             state.current_preempt_pending = current->preempt_pending;
             state.current_preempt_max_us = current->preempt_disable_max_us;
+            state.current_preempt_owner = current->preempt_disable_owner;
+            state.current_preempt_start_us = current->preempt_disable_start_us;
         }
 
         return state;
@@ -7065,12 +7067,14 @@ void dump_scheduler_cpu_states() {
         auto state = get_scheduler_cpu_state(cpu_no);
         dbg::log(
             "schedcpu: cpu%lu idle=%u runq=%lu waitq=%lu cur=%lu(%s) type=%u vblk=%u wblk=%u pinned=%u preempt=%u/%u "
-            "preempt_max_us=%lu pending=%u timer=%lu/%lu/%lu wake=%lu/%lu local=%lu/%lu last_tick=%lu wait_deadline=%lu",
+            "preempt_max_us=%lu preempt_owner=0x%llx preempt_start_us=%lu pending=%u timer=%lu/%lu/%lu wake=%lu/%lu "
+            "local=%lu/%lu last_tick=%lu wait_deadline=%lu",
             static_cast<unsigned long>(state.cpu_no), state.is_idle ? 1U : 0U, static_cast<unsigned long>(state.runnable_count),
             static_cast<unsigned long>(state.wait_queue_count), static_cast<unsigned long>(state.current_pid), state.current_name,
             static_cast<unsigned>(state.current_type), state.current_voluntary_block ? 1U : 0U, state.current_wants_block ? 1U : 0U,
             state.current_cpu_pinned ? 1U : 0U, state.current_preempt_depth, state.current_preempt_pending ? 1U : 0U,
-            static_cast<unsigned long>(state.current_preempt_max_us), state.resched_timer_pending ? 1U : 0U,
+            static_cast<unsigned long>(state.current_preempt_max_us), static_cast<unsigned long long>(state.current_preempt_owner),
+            static_cast<unsigned long>(state.current_preempt_start_us), state.resched_timer_pending ? 1U : 0U,
             static_cast<unsigned long>(state.scheduler_timer_interrupts), static_cast<unsigned long>(state.scheduler_timer_arms),
             static_cast<unsigned long>(state.scheduler_timer_disarms), static_cast<unsigned long>(state.wake_ipis_sent),
             static_cast<unsigned long>(state.wake_ipis_coalesced), static_cast<unsigned long>(state.local_reschedule_requests),
