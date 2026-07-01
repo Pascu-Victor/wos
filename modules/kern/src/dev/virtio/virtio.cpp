@@ -147,12 +147,13 @@ auto virtq_get_buf(Virtqueue* vq, uint32_t* out_len) -> uint16_t {
     if (vq == nullptr || vq->size == 0 || vq->size > VIRTQ_MAX_SIZE) {
         return VIRTQ_NO_BUF;
     }
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    uint16_t const USED_RING_IDX = vq->used->idx;
+
     // Check if there are consumed buffers
-    if (vq->last_used_idx == vq->used->idx) {
+    if (vq->last_used_idx == USED_RING_IDX) {
         return VIRTQ_NO_BUF;
     }
-
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
 
     uint16_t const USED_IDX = vq->last_used_idx % vq->size;
     auto& elem = vq->used->ring[USED_IDX];

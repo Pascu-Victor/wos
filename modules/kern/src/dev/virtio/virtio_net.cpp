@@ -63,6 +63,7 @@ constexpr uint8_t SINGLE_QUEUE_PAIRS = 1;
 constexpr uint8_t MIN_MQ_QUEUE_PAIRS = 2;
 constexpr uint8_t DEFAULT_MQ_QUEUE_PAIR_LIMIT = 4;
 constexpr uint8_t WKI_CONTROL_TX_RETRY_POLLS = 8;
+constexpr uint8_t RX_EMPTY_PENDING_REARM_LIMIT = 1;
 
 auto future_deadline_ms(uint64_t timeout_ms) -> uint64_t {
     uint64_t const NOW_MS = ker::mod::time::get_ms();
@@ -443,6 +444,48 @@ void virtio_net_irq_enable_pair(VirtIONetDevice* dev, uint8_t pair) {
     dev->irq_lock.unlock_irqrestore(FLAGS);
 }
 
+auto rx_pending_after_irq_enable(VirtIONetDevice* dev, VirtIONetQueuePair* pair) -> bool {
+    if (dev == nullptr || pair == nullptr || pair->rxq == nullptr) {
+        return false;
+    }
+
+    bool has_pending = virtq_has_pending(pair->rxq);
+    if (pair->index == 0 && !has_pending && dev->configured_queue_pairs > dev->num_queue_pairs) {
+        for (uint8_t i = dev->num_queue_pairs; i < dev->configured_queue_pairs; i++) {
+            auto* rxq = dev->queue_pairs.at(i).rxq;
+            if (rxq != nullptr && virtq_has_pending(rxq)) {
+                has_pending = true;
+                break;
+            }
+        }
+    }
+    return has_pending;
+}
+
+auto should_rearm_rx_after_complete(VirtIONetDevice* dev, VirtIONetQueuePair* pair, int processed) -> bool {
+    if (pair == nullptr) {
+        return false;
+    }
+
+    bool const HAS_PENDING = rx_pending_after_irq_enable(dev, pair);
+    if (!HAS_PENDING) {
+        pair->rx_empty_pending_rearms = 0;
+        return false;
+    }
+
+    if (processed != 0) {
+        pair->rx_empty_pending_rearms = 0;
+        return true;
+    }
+
+    if (pair->rx_empty_pending_rearms < RX_EMPTY_PENDING_REARM_LIMIT) {
+        pair->rx_empty_pending_rearms++;
+        return true;
+    }
+
+    return false;
+}
+
 int virtio_net_poll(ker::net::NapiStruct* napi, int budget) {
     NET_TRACE_SPAN(SPAN_NAPI_POLL);
     auto* dev = static_cast<VirtIONetDevice*>(napi->dev->private_data);
@@ -485,18 +528,9 @@ int virtio_net_poll(ker::net::NapiStruct* napi, int budget) {
         ker::net::napi_complete(napi);
         virtio_net_irq_enable_pair(dev, pair->index);
 
-        // Handle missed notification races across IRQ re-enable.
-        bool has_pending = virtq_has_pending(pair->rxq);
-        if (pair->index == 0 && !has_pending && dev->configured_queue_pairs > dev->num_queue_pairs) {
-            for (uint8_t i = dev->num_queue_pairs; i < dev->configured_queue_pairs; i++) {
-                auto* rxq = dev->queue_pairs.at(i).rxq;
-                if (rxq != nullptr && virtq_has_pending(rxq)) {
-                    has_pending = true;
-                    break;
-                }
-            }
-        }
-        if (has_pending) {
+        // Handle missed notification races across IRQ re-enable without
+        // letting a stale/non-consumable pending bit spin an idle queue forever.
+        if (should_rearm_rx_after_complete(dev, pair, processed)) {
             virtio_net_irq_disable_pair(dev, pair->index);
             ker::net::napi_schedule(napi);
         }

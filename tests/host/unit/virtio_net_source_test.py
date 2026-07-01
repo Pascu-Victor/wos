@@ -5,6 +5,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 VIRTIO_NET_CPP = ROOT / "modules" / "kern" / "src" / "dev" / "virtio" / "virtio_net.cpp"
+VIRTIO_NET_HPP = ROOT / "modules" / "kern" / "src" / "dev" / "virtio" / "virtio_net.hpp"
+VIRTIO_CPP = ROOT / "modules" / "kern" / "src" / "dev" / "virtio" / "virtio.cpp"
 
 
 def fail(message: str) -> None:
@@ -63,9 +65,52 @@ def test_ctrl_ack_deadline_is_saturating() -> None:
         fail("virtio-net control ACK wait must not use wrapping deadline arithmetic")
 
 
+def test_used_ring_idx_is_acquired_before_empty_check() -> None:
+    body = function_body(VIRTIO_CPP.read_text(), "virtq_get_buf")
+
+    require_order(
+        body,
+        "__atomic_thread_fence(__ATOMIC_ACQUIRE)",
+        "uint16_t const USED_RING_IDX = vq->used->idx",
+        "if (vq->last_used_idx == USED_RING_IDX)",
+        "uint16_t const USED_IDX = vq->last_used_idx % vq->size",
+    )
+
+
+def test_rx_pending_self_rearm_is_bounded_without_progress() -> None:
+    source = VIRTIO_NET_CPP.read_text()
+    header = VIRTIO_NET_HPP.read_text()
+    helper_body = function_body(source, "should_rearm_rx_after_complete")
+
+    require_order(
+        helper_body,
+        "bool const HAS_PENDING = rx_pending_after_irq_enable(dev, pair)",
+        "if (!HAS_PENDING)",
+        "pair->rx_empty_pending_rearms = 0",
+        "if (processed != 0)",
+        "pair->rx_empty_pending_rearms = 0",
+        "if (pair->rx_empty_pending_rearms < RX_EMPTY_PENDING_REARM_LIMIT)",
+        "pair->rx_empty_pending_rearms++",
+        "return true",
+        "return false",
+    )
+
+    require_order(
+        source,
+        "constexpr uint8_t RX_EMPTY_PENDING_REARM_LIMIT = 1",
+        "if (should_rearm_rx_after_complete(dev, pair, processed))",
+        "virtio_net_irq_disable_pair(dev, pair->index)",
+        "ker::net::napi_schedule(napi)",
+    )
+    if "uint8_t rx_empty_pending_rearms{}" not in header:
+        fail("virtio queue-pair must persist empty pending rearm state")
+
+
 def main() -> None:
     test_ctrl_ack_deadline_is_saturating()
-    print("virtio-net control ACK deadline uses saturating arithmetic")
+    test_used_ring_idx_is_acquired_before_empty_check()
+    test_rx_pending_self_rearm_is_bounded_without_progress()
+    print("virtio-net polling guards are source covered")
 
 
 if __name__ == "__main__":

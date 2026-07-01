@@ -53,6 +53,7 @@ struct VirtIONetQueuePair {
     ker::net::NapiStruct napi{};
     uint8_t index{};
     uint8_t irq_vector{};
+    uint8_t rx_empty_pending_rearms{};
 };
 
 struct VirtIONetDevice {
