@@ -105,8 +105,9 @@ patch_git_source_for_wos() {
     local parallel_checkout="$GIT_WORK/parallel-checkout.c"
     local makefile="$GIT_WORK/Makefile"
     local templates_makefile="$GIT_WORK/templates/Makefile"
+    local generate_script="$GIT_WORK/tools/generate-script.sh"
 
-    python3 - "$run_command" "$parallel_checkout" "$makefile" "$templates_makefile" <<'PY'
+    python3 - "$run_command" "$parallel_checkout" "$makefile" "$templates_makefile" "$generate_script" <<'PY'
 from pathlib import Path
 import sys
 
@@ -114,6 +115,7 @@ run_command = Path(sys.argv[1])
 parallel_checkout = Path(sys.argv[2])
 makefile = Path(sys.argv[3])
 templates_makefile = Path(sys.argv[4])
+generate_script = Path(sys.argv[5])
 
 text = run_command.read_text()
 replacements = {
@@ -170,6 +172,13 @@ count = text.count(old)
 if count != 1:
     raise SystemExit(f"expected one Git templates tar install pipeline in {templates_makefile}, found {count}")
 templates_makefile.write_text(text.replace(old, new))
+
+text = generate_script.read_text()
+old = "#!/bin/sh\n"
+new = "#!/bin/bash\n"
+if old not in text and new not in text:
+    raise SystemExit(f"unable to find POSIX shell shebang in {generate_script}")
+generate_script.write_text(text.replace(old, new, 1))
 PY
 }
 
@@ -206,6 +215,7 @@ require_file "$HOST/bin/llvm-ranlib" "Run tools/host-toolchain.sh first."
 require_file "$HOST/bin/llvm-strip" "Run tools/host-toolchain.sh first."
 require_file "$TARGET_SYSROOT/lib/libc.so" "Build mlibc before building Git."
 require_file "$TARGET_SYSROOT/lib/Scrt1.o" "Build mlibc startup objects before building Git."
+require_file "$TARGET_SYSROOT/bin/bash" "Build Bash before building Git."
 require_file "$TARGET_SYSROOT/lib/libz.a" "Run scripts/build/build_zlib_for_wos.sh before building Git."
 require_file "$TARGET_SYSROOT/include/zlib.h" "Run scripts/build/build_zlib_for_wos.sh before building Git."
 require_file "$TARGET_SYSROOT/lib/libcurl.a" "Run scripts/build/build_curl_for_wos.sh before building Git."
@@ -247,6 +257,8 @@ GIT_MAKE_FLAGS=(
     "CURL_CFLAGS=$GIT_CURL_CFLAGS"
     "CURL_LDFLAGS=$GIT_CURL_LDFLAGS"
     "PYTHON_PATH=/usr/bin/python3"
+    "SHELL_PATH=/bin/bash"
+    "SHELL=/bin/bash"
     "CSPRNG_METHOD=urandom"
     "HAVE_ALLOCA_H=YesPlease"
     "HAVE_PATHS_H=YesPlease"

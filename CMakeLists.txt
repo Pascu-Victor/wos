@@ -510,7 +510,7 @@ if(WOS_BUILD_GIT_FOR_WOS)
                 ${MLIBC_STAMP}
         )
         add_custom_target(git_for_wos DEPENDS ${GIT_FOR_WOS_STAMP})
-        add_dependencies(git_for_wos curl_for_wos)
+        add_dependencies(git_for_wos bash_for_wos curl_for_wos)
     endif()
     list(APPEND WOS_GIT_FOR_WOS_ROOTFS_INPUTS ${GIT_FOR_WOS_STAMP})
 endif()
