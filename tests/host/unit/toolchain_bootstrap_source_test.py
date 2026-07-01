@@ -1670,6 +1670,8 @@ def test_wos_tls_build_is_self_hostable_without_perl() -> None:
             "aclocal.m4",
             "apps/openssl/Makefile.in",
             'wos_refresh_file_mtime "$TLS_WORK/$file"',
+            "write_libressl_config_site",
+            'export CONFIG_SITE="$TLS_WORK/config.site"',
             "-D__WOS__=1",
             'HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"',
             "TLS_CONFIGURE_BUILD_ARGS=()",
@@ -1716,6 +1718,79 @@ def test_wos_tls_build_is_self_hostable_without_perl() -> None:
     present = [token for token in forbidden if token in source]
     if present:
         fail("WOS TLS build path must avoid Perl/OpenSSL Configure dependency: " + ", ".join(present))
+
+
+def test_wos_tls_build_preseeds_target_configure_probes() -> None:
+    source = WOS_TLS_BUILD.read_text()
+    config_site_start = source.find("write_libressl_config_site()")
+    config_site_end = source.find('require_file "$HOST/bin/clang"', config_site_start)
+    if config_site_start < 0 or config_site_end < 0:
+        fail("LibreSSL WOS build script must keep write_libressl_config_site before host-tool validation")
+    config_site = source[config_site_start:config_site_end]
+
+    require_tokens(
+        config_site,
+        [
+            "write_libressl_config_site()",
+            'tmp_config_site="$(mktemp "$TLS_WORK/config.site.XXXXXX")"',
+            "ac_cv_func_accept4=yes",
+            "ac_cv_func_arc4random=no",
+            "ac_cv_func_clock_gettime=yes",
+            "ac_cv_func_explicit_bzero=yes",
+            "ac_cv_func_getentropy=yes",
+            "ac_cv_func_memmem=yes",
+            "ac_cv_func_reallocarray=yes",
+            "ac_cv_func_strlcpy=yes",
+            "ac_cv_func_timingsafe_memcmp=no",
+            "ac_cv_header_machine_endian_h=yes",
+            "ac_cv_header_readpassphrase_h=no",
+            "ac_cv_search_clock_gettime='none required'",
+            "ac_cv_search_pthread_once='none required'",
+            "ac_cv_sizeof_time_t=8",
+        ],
+        "LibreSSL WOS target configure preseeds",
+    )
+    require_tokens(
+        config_site,
+        [
+            "am_cv_CC_dependencies_compiler_type=gcc3",
+            "am_cv_prog_cc_c_o=yes",
+            "am_cv_prog_tar_ustar=gnutar",
+            "ax_cv_check_cflags___Werror=yes",
+            "lt_cv_deplibs_check_method=unknown",
+            "lt_cv_prog_compiler_pic='-fPIC -DPIC'",
+            "lt_cv_prog_compiler_pic_works=yes",
+            "lt_cv_sharedlib_from_linklib_cmd='printf %s\\n'",
+            "lt_cv_to_host_file_cmd=func_convert_file_noop",
+        ],
+        "LibreSSL Automake/libtool configure preseeds",
+    )
+    require_tokens(
+        source,
+        [
+            "write_libressl_config_site",
+            'export CONFIG_SITE="$TLS_WORK/config.site"',
+            '"${TLS_CONFIGURE_CACHE_ARGS[@]}"',
+            '"${TLS_CONFIGURE_BUILD_ARGS[@]}"',
+        ],
+        "LibreSSL config.site export",
+    )
+    forbidden = [
+        "ac_cv_prog_CC=",
+        "ac_cv_prog_AR=",
+        "ac_cv_prog_RANLIB=",
+        "ac_cv_prog_STRIP=",
+        "ac_cv_path_install=",
+        "ac_cv_path_GREP=",
+        "ac_cv_path_SED=",
+        "ac_cv_build=",
+        "ac_cv_host=",
+        "lt_cv_path_LD=",
+        "lt_cv_path_NM=",
+    ]
+    present = [token for token in forbidden if token in config_site]
+    if present:
+        fail("LibreSSL config.site must not pin host/tool paths or build tuples: " + ", ".join(present))
 
 
 def test_zlib_install_avoids_sysroot_usr_symlink() -> None:
@@ -2087,6 +2162,7 @@ if __name__ == "__main__":
     test_native_wos_cmake_configure_preseeds_expensive_checks()
     test_zlib_install_avoids_sysroot_usr_symlink()
     test_wos_tls_build_is_self_hostable_without_perl()
+    test_wos_tls_build_preseeds_target_configure_probes()
     test_wos_curl_build_uses_native_triplet_and_real_sysroot_install()
     test_wos_curl_build_preseeds_target_configure_probes()
     test_wos_curl_download_errors_stop_before_checksum_or_extract()

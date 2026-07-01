@@ -202,6 +202,119 @@ disable_libressl_man_install() {
     fi
 }
 
+write_libressl_config_site() {
+    local tmp_config_site
+
+    tmp_config_site="$(mktemp "$TLS_WORK/config.site.XXXXXX")"
+    cat > "$tmp_config_site" <<'EOF'
+ac_cv_c_compiler_gnu=yes
+ac_cv_func__mkgmtime=no
+ac_cv_func_accept4=yes
+ac_cv_func_arc4random=no
+ac_cv_func_arc4random_buf=no
+ac_cv_func_arc4random_uniform=no
+ac_cv_func_asprintf=yes
+ac_cv_func_clock_gettime=yes
+ac_cv_func_dl_iterate_phdr=yes
+ac_cv_func_explicit_bzero=yes
+ac_cv_func_freezero=no
+ac_cv_func_ftruncate=yes
+ac_cv_func_funopen=no
+ac_cv_func_getauxval=yes
+ac_cv_func_getdelim=yes
+ac_cv_func_getentropy=yes
+ac_cv_func_getline=yes
+ac_cv_func_getopt=yes
+ac_cv_func_getpagesize=yes
+ac_cv_func_getprogname=no
+ac_cv_func_memmem=yes
+ac_cv_func_pipe2=yes
+ac_cv_func_pledge=no
+ac_cv_func_poll=yes
+ac_cv_func_readpassphrase=no
+ac_cv_func_reallocarray=yes
+ac_cv_func_recallocarray=no
+ac_cv_func_socketpair=yes
+ac_cv_func_strcasecmp=yes
+ac_cv_func_strlcat=yes
+ac_cv_func_strlcpy=yes
+ac_cv_func_strndup=yes
+ac_cv_func_strnlen=yes
+ac_cv_func_strsep=yes
+ac_cv_func_strtonum=no
+ac_cv_func_symlink=yes
+ac_cv_func_syslog=yes
+ac_cv_func_syslog_r=no
+ac_cv_func_timegm=yes
+ac_cv_func_timespecsub=no
+ac_cv_func_timingsafe_bcmp=no
+ac_cv_func_timingsafe_memcmp=no
+ac_cv_have___va_copy=yes
+ac_cv_have_b64_ntop_arg=no
+ac_cv_have_va_copy=yes
+ac_cv_header_arpa_nameser_h=yes
+ac_cv_header_dlfcn_h=yes
+ac_cv_header_endian_h=yes
+ac_cv_header_err_h=yes
+ac_cv_header_inttypes_h=yes
+ac_cv_header_machine_endian_h=yes
+ac_cv_header_netdb_h=yes
+ac_cv_header_netinet_in_h=yes
+ac_cv_header_netinet_ip_h=yes
+ac_cv_header_readpassphrase_h=no
+ac_cv_header_resolv_h=yes
+ac_cv_header_stdint_h=yes
+ac_cv_header_stdio_h=yes
+ac_cv_header_stdlib_h=yes
+ac_cv_header_string_h=yes
+ac_cv_header_strings_h=yes
+ac_cv_header_sys_stat_h=yes
+ac_cv_header_sys_types_h=yes
+ac_cv_header_unistd_h=yes
+ac_cv_objext=o
+ac_cv_prog_cc_c11=
+ac_cv_prog_cc_g=yes
+ac_cv_prog_cc_stdc=
+ac_cv_prog_make_make_set=yes
+ac_cv_search___b64_ntop=no
+ac_cv_search_b64_ntop=no
+ac_cv_search_clock_gettime='none required'
+ac_cv_search_dl_iterate_phdr='none required'
+ac_cv_search_pthread_mutex_lock='none required'
+ac_cv_search_pthread_once='none required'
+ac_cv_sizeof_time_t=8
+am_cv_CCAS_dependencies_compiler_type=gcc3
+am_cv_CC_dependencies_compiler_type=gcc3
+am_cv_make_support_nested_variables=yes
+am_cv_prog_cc_c_o=yes
+am_cv_prog_tar_ustar=gnutar
+am_cv_sleep_fractional_seconds=yes
+am_cv_xargs_n_works=yes
+ax_cv_check_cflags___Werror=yes
+lt_cv_ar_at_file=@
+lt_cv_deplibs_check_method=unknown
+lt_cv_ld_reload_flag=-r
+lt_cv_nm_interface='BSD nm'
+lt_cv_objdir=.libs
+lt_cv_prog_compiler_c_o=yes
+lt_cv_prog_compiler_pic='-fPIC -DPIC'
+lt_cv_prog_compiler_pic_works=yes
+lt_cv_prog_compiler_rtti_exceptions=yes
+lt_cv_prog_compiler_static_works=yes
+lt_cv_prog_gnu_ld=yes
+lt_cv_sharedlib_from_linklib_cmd='printf %s\n'
+lt_cv_sys_max_cmd_len=1572864
+lt_cv_to_host_file_cmd=func_convert_file_noop
+lt_cv_to_tool_file_cmd=func_convert_file_noop
+EOF
+
+    if [ ! -f "$TLS_WORK/config.site" ] || ! cmp -s "$tmp_config_site" "$TLS_WORK/config.site"; then
+        mv "$tmp_config_site" "$TLS_WORK/config.site"
+    else
+        rm -f "$tmp_config_site"
+    fi
+}
+
 require_file "$HOST/bin/clang" "Run tools/host-toolchain.sh first."
 require_file "$HOST/bin/llvm-ar" "Run tools/host-toolchain.sh first."
 require_file "$HOST/bin/llvm-ranlib" "Run tools/host-toolchain.sh first."
@@ -213,6 +326,8 @@ copy_source_to_workdir "$TLS_SOURCE_DIR"
 patch_config_sub_for_wos "$TLS_WORK/config.sub"
 patch_arc4random_for_wos "$TLS_WORK/crypto/compat/arc4random.h"
 refresh_libressl_release_generated_files
+write_libressl_config_site
+export CONFIG_SITE="$TLS_WORK/config.site"
 
 mkdir -p "$TARGET_SYSROOT/bin" "$TARGET_SYSROOT/lib" "$TARGET_SYSROOT/include"
 if [ ! -e "$TARGET_SYSROOT/usr" ]; then
