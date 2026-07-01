@@ -639,6 +639,35 @@ def test_selfhost_runner_records_detailed_historical_timings() -> None:
         fail("self-host heartbeat loop must not run global sync while clone/build commands are active")
 
 
+def test_selfhost_runner_timing_avoids_python_when_epochrealtime_exists() -> None:
+    source = SELFHOST_RUNNER.read_text()
+    require_tokens(
+        source,
+        [
+            "now_ms()",
+            "timestamp_utc()",
+            'local epoch="${EPOCHREALTIME:-}"',
+            'if [ -n "$epoch" ]; then',
+            'TZ=UTC printf -v prefix',
+            'printf \'%s\\n\' "$((10#$seconds * 1000 + 10#${fraction:0:3}))"',
+            "python3 - <<'PY'",
+        ],
+        "WOS self-host benchmark timing fast path",
+    )
+
+    now_start = source.index("now_ms()")
+    log_start = source.index("log()", now_start)
+    now_block = source[now_start:log_start]
+    if now_block.find("python3 - <<'PY'") < now_block.find('if [ -n "$epoch" ]; then'):
+        fail("self-host now_ms must try EPOCHREALTIME before Python")
+
+    timestamp_start = source.index("timestamp_utc()")
+    ensure_parent_start = source.index("ensure_parent_dir()", timestamp_start)
+    timestamp_block = source[timestamp_start:ensure_parent_start]
+    if timestamp_block.find("python3 - <<'PY'") < timestamp_block.find('if [ -n "$epoch" ]; then'):
+        fail("self-host timestamp_utc must try EPOCHREALTIME before Python")
+
+
 def test_selfhost_runner_keeps_remote_and_scratch_handling_guarded() -> None:
     source = SELFHOST_RUNNER.read_text()
     require_tokens(
@@ -762,6 +791,7 @@ if __name__ == "__main__":
     test_selfhost_runner_resume_checkout_is_validation_only()
     test_selfhost_debug_mirror_path_is_shallow_and_not_source_tree_copy()
     test_selfhost_runner_records_detailed_historical_timings()
+    test_selfhost_runner_timing_avoids_python_when_epochrealtime_exists()
     test_selfhost_runner_keeps_remote_and_scratch_handling_guarded()
     test_selfhost_report_comparator_checks_clone_build_and_total()
     print("WOS self-host benchmark source invariants hold")
