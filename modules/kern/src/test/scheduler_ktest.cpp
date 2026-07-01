@@ -19,6 +19,7 @@ namespace ker::mod::sched {
 auto scheduler_selftest_runtime_delta_saturates() -> bool;
 auto scheduler_selftest_migration_policy_preserves_hot_process_migration() -> bool;
 auto scheduler_selftest_heap_scan_removal_repairs_stale_index() -> bool;
+auto scheduler_selftest_load_balance_nudge_needs_process_backlog() -> bool;
 }  // namespace ker::mod::sched
 
 KTEST(Sched, VruntimeOrdering) {
@@ -70,6 +71,10 @@ KTEST(SchedulerMigration, PreservesHotProcessMigrationPolicy) {
 
 KTEST(SchedulerMigration, HeapScanRemovalRepairsStaleIndex) {
     KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_heap_scan_removal_repairs_stale_index());
+}
+
+KTEST(SchedulerMigration, LoadBalanceNudgeNeedsProcessBacklog) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_load_balance_nudge_needs_process_backlog());
 }
 
 KTEST(ContextSwitch, RepairsStaleProcessSyscallResume) {

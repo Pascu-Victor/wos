@@ -234,6 +234,77 @@ def test_idle_steal_can_migrate_normal_process_work() -> None:
         fail("idle steal must not blanket-ban voluntary-blocked process migration")
 
 
+def test_busy_cpus_nudge_idle_peers_to_steal_process_backlog() -> None:
+    source = SCHEDULER_CPP.read_text()
+    backlog_body = function_body(source, "runqueue_has_stealable_process_backlog")
+    nudge_body = function_body(source, "maybe_nudge_idle_cpu_for_load_balance")
+    wake_handler_body = function_body(source, "scheduler_wake_handler")
+    timer_body = function_body(source, "process_tasks")
+    ktest_source = SCHEDULER_KTEST.read_text()
+
+    require_tokens(
+        backlog_body,
+        [
+            "uint32_t const HEAP_SIZE = rq->runnable_heap.size",
+            "uint32_t const CURRENT_LOAD = rq->cached_current_load_process.load(std::memory_order_relaxed)",
+            "CURRENT_LOAD == 0 && HEAP_SIZE < 2",
+            "rq->cached_load_process.load(std::memory_order_relaxed) + CURRENT_LOAD",
+            "rq->daemon_load_penalty.load(std::memory_order_relaxed)",
+            "return LOAD >= MIN_STEAL_LOAD;",
+        ],
+        "busy-side load-balance nudge must require stealable process backlog",
+    )
+    require_tokens(
+        nudge_body,
+        [
+            "runqueue_has_stealable_process_backlog(busy_rq)",
+            "smt::find_group_for_cpu(busy_cpu)",
+            "idle_rq->is_idle.load(std::memory_order_acquire)",
+            "idle_rq->runnable_heap.size != 0",
+            "idle_rq->resched_timer_pending.load(std::memory_order_acquire)",
+            "idle_rebalance_probe_needed_for_idle(TARGET_CPU)",
+            "busy_rq->load_balance_pushes.fetch_add(1, std::memory_order_relaxed)",
+            "wake_cpu(TARGET_CPU, WakeCpuMode::COALESCE)",
+        ],
+        "busy-side load-balance nudge must wake only idle peers that can run the existing steal path",
+    )
+    require_tokens(
+        wake_handler_body,
+        [
+            "bool const HAS_LOCAL_WORK = rq->runnable_heap.size > 0",
+            "bool const SHOULD_PROBE_IDLE_STEAL",
+            "idle_rebalance_probe_needed_for_idle(cpu::current_cpu())",
+            "if (HAS_LOCAL_WORK)",
+            "rq->resched_timer_pending.store(true, std::memory_order_release)",
+            "apic::one_shot_timer(1)",
+        ],
+        "scheduler wake IPI must arm idle-steal probes, not only local runqueue work",
+    )
+    require_tokens(
+        timer_body,
+        ["maybe_nudge_idle_cpu_for_load_balance(cpu::current_cpu(), rq);"],
+        "timer path must periodically nudge idle peers from busy CPUs",
+    )
+    require_tokens(
+        source,
+        [
+            "scheduler_selftest_load_balance_nudge_needs_process_backlog",
+            "CURRENT_ONLY_REJECTED",
+            "CURRENT_PLUS_QUEUED_ACCEPTED",
+            "SOFT_EXCLUSIVE_REJECTED",
+        ],
+        "busy-side load-balance nudge kernel selftest implementation",
+    )
+    require_tokens(
+        ktest_source,
+        [
+            "scheduler_selftest_load_balance_nudge_needs_process_backlog",
+            "KTEST(SchedulerMigration, LoadBalanceNudgeNeedsProcessBacklog)",
+        ],
+        "busy-side load-balance nudge kernel selftest wiring",
+    )
+
+
 def test_wait_channel_policy_uses_typed_kinds() -> None:
     source = SCHEDULER_CPP.read_text()
     task_header = TASK_HPP.read_text()
@@ -1383,6 +1454,7 @@ def main() -> None:
     test_event_wake_cancel_preserves_current_task_wakeup_token()
     test_event_wake_rebalances_normal_process_waiters()
     test_idle_steal_can_migrate_normal_process_work()
+    test_busy_cpus_nudge_idle_peers_to_steal_process_backlog()
     test_wait_channel_policy_uses_typed_kinds()
     test_higher_priority_wakeup_bypasses_only_priority_holdoff_guards()
     test_runtime_accounting_deltas_are_saturating()

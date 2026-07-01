@@ -2107,6 +2107,66 @@ inline auto idle_rebalance_probe_needed_for_idle(uint64_t idle_cpu) -> bool {
     return false;
 }
 
+inline auto runqueue_has_stealable_process_backlog(RunQueue const* rq) -> bool {
+    if (rq == nullptr) {
+        return false;
+    }
+
+    constexpr uint32_t FULL_LOAD = 8;
+    uint32_t const HEAP_SIZE = rq->runnable_heap.size;
+    if (HEAP_SIZE == 0) {
+        return false;
+    }
+
+    uint32_t const CURRENT_LOAD = rq->cached_current_load_process.load(std::memory_order_relaxed);
+    if (CURRENT_LOAD == 0 && HEAP_SIZE < 2) {
+        return false;
+    }
+
+    uint32_t const LOAD = rq->cached_load_process.load(std::memory_order_relaxed) + CURRENT_LOAD;
+    uint32_t const MIN_STEAL_LOAD = (rq->daemon_load_penalty.load(std::memory_order_relaxed) > 0) ? FULL_LOAD * 4 : FULL_LOAD * 2;
+    return LOAD >= MIN_STEAL_LOAD;
+}
+
+void maybe_nudge_idle_cpu_for_load_balance(uint64_t busy_cpu, RunQueue* busy_rq) {
+    if (run_queues == nullptr || busy_rq == nullptr || !runqueue_has_stealable_process_backlog(busy_rq)) {
+        return;
+    }
+
+    uint64_t const N = smt::get_core_count();
+    if (N <= 1 || busy_cpu >= N) {
+        return;
+    }
+
+    uint32_t const OUR_GROUP = smt::find_group_for_cpu(busy_cpu);
+    auto* group = smt::get_cpu_domain(OUR_GROUP);
+    uint64_t const GROUP_MASK = (group != nullptr) ? group->cpu_mask : ~0ULL;
+    static std::atomic<uint64_t> nudge_seed{0};
+    uint64_t const START = nudge_seed.fetch_add(1, std::memory_order_relaxed) % N;
+
+    for (uint64_t off = 1; off <= N; ++off) {
+        uint64_t const TARGET_CPU = (START + off) % N;
+        if (TARGET_CPU == busy_cpu || !cpu_mask_contains(GROUP_MASK, TARGET_CPU)) {
+            continue;
+        }
+
+        auto* idle_rq = run_queues->that_cpu(TARGET_CPU);
+        if (idle_rq == nullptr || !idle_rq->is_idle.load(std::memory_order_acquire)) {
+            continue;
+        }
+        if (idle_rq->runnable_heap.size != 0 || idle_rq->resched_timer_pending.load(std::memory_order_acquire)) {
+            continue;
+        }
+        if (!idle_rebalance_probe_needed_for_idle(TARGET_CPU)) {
+            continue;
+        }
+
+        busy_rq->load_balance_pushes.fetch_add(1, std::memory_order_relaxed);
+        wake_cpu(TARGET_CPU, WakeCpuMode::COALESCE);
+        return;
+    }
+}
+
 auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
     if (run_queues == nullptr) {
         return false;
@@ -2693,14 +2753,17 @@ void scheduler_wake_handler([[maybe_unused]] cpu::GPRegs gpr, [[maybe_unused]] g
     // was stale/empty, a racing later wake_cpu() must be able to send a fresh
     // IPI instead of being suppressed by our old pending flag.
     rq->resched_timer_pending.store(false, std::memory_order_release);
-    if (rq->runnable_heap.size > 0) {
-        rq->is_idle.store(false, std::memory_order_release);
+    bool const HAS_LOCAL_WORK = rq->runnable_heap.size > 0;
+    bool const SHOULD_PROBE_IDLE_STEAL =
+        !HAS_LOCAL_WORK && rq->is_idle.load(std::memory_order_acquire) && idle_rebalance_probe_needed_for_idle(cpu::current_cpu());
+    if (HAS_LOCAL_WORK || SHOULD_PROBE_IDLE_STEAL) {
+        if (HAS_LOCAL_WORK) {
+            rq->is_idle.store(false, std::memory_order_release);
+        }
         // Wake IPIs are the rescue path for CPUs halted in the idle loop.  The
         // idle loop does not inspect the runqueue after an interrupt returns;
-        // it immediately executes hlt again.  Program the local APIC timer
-        // directly here instead of going through the coalesced same-CPU poke
-        // path, because a stale pending bit would otherwise strand runnable
-        // work on a tickless idle CPU.
+        // it immediately executes hlt again. Program the local APIC timer for
+        // queued work or for an idle-steal probe that a busy CPU requested.
         rq->resched_timer_pending.store(true, std::memory_order_release);
         note_local_reschedule_timer_poke();
         apic::one_shot_timer(1);
@@ -3873,6 +3936,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
 
     auto* rq = run_queues->this_cpu();
     auto* current_task = rq->current_task;
+    maybe_nudge_idle_cpu_for_load_balance(cpu::current_cpu(), rq);
 
     // ---- Idle path: no running task, check heap for work ----
     if (current_task == nullptr || current_task->type == task::TaskType::IDLE) {
@@ -7168,6 +7232,33 @@ auto scheduler_selftest_heap_scan_removal_repairs_stale_index() -> bool {
     bool const LOAD_PROCESS_OK = rq.cached_load_process.load(std::memory_order_relaxed) == 16;
 
     return REMOVED && VICTIM_DETACHED && HEAP_SIZE_OK && TOTAL_WEIGHT_OK && LOAD_DEFAULT_OK && LOAD_PROCESS_OK;
+}
+
+auto scheduler_selftest_load_balance_nudge_needs_process_backlog() -> bool {
+    RunQueue rq{};
+    task::Task current{};
+    task::Task queued{};
+
+    current.type = task::TaskType::PROCESS;
+    current.pid = 1;
+    current.sched_weight = 1024;
+    publish_current_task(&rq, &current);
+
+    bool const CURRENT_ONLY_REJECTED = !runqueue_has_stealable_process_backlog(&rq);
+
+    queued.type = task::TaskType::PROCESS;
+    queued.pid = 2;
+    queued.heap_index = -1;
+    queued.vruntime = 0;
+    queued.vdeadline = 100;
+    queued.sched_weight = 1024;
+    bool const QUEUED_PUBLISHED = publish_runnable_task_locked(&rq, &queued, "load-balance-nudge-selftest");
+    bool const CURRENT_PLUS_QUEUED_ACCEPTED = runqueue_has_stealable_process_backlog(&rq);
+
+    rq.daemon_load_penalty.store(8, std::memory_order_relaxed);
+    bool const SOFT_EXCLUSIVE_REJECTED = !runqueue_has_stealable_process_backlog(&rq);
+
+    return CURRENT_ONLY_REJECTED && QUEUED_PUBLISHED && CURRENT_PLUS_QUEUED_ACCEPTED && SOFT_EXCLUSIVE_REJECTED;
 }
 #endif
 
