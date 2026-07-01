@@ -56,6 +56,19 @@ auto clamp_perf_u16(uint64_t value) -> uint16_t { return value > UINT16_MAX ? UI
 
 auto clamp_perf_u32(uint64_t value) -> uint32_t { return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value); }
 
+auto align_user_vmem_size(uint64_t size, uint64_t* aligned_size) -> int {
+    constexpr uint64_t PAGE_MASK = ker::mod::mm::paging::PAGE_SIZE - 1;
+    if (size == 0 || aligned_size == nullptr || size > UINT64_MAX - PAGE_MASK) {
+        return -ker::abi::vmem::VMEM_EINVAL;
+    }
+    uint64_t const ALIGNED = page_align_up(size);
+    if (ALIGNED == 0) {
+        return -ker::abi::vmem::VMEM_EINVAL;
+    }
+    *aligned_size = ALIGNED;
+    return 0;
+}
+
 auto vmem_latency_since(uint64_t started_us) -> uint32_t {
     uint64_t const NOW_US = ker::mod::time::get_us();
     return clamp_perf_u32(NOW_US >= started_us ? NOW_US - started_us : 0);
@@ -1533,18 +1546,15 @@ auto anon_free(uint64_t addr, uint64_t size) -> uint64_t {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
-    // Validate size
-    if (size == 0) {
-        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
-    }
-
     // Check alignment
     if (addr % ker::mod::mm::paging::PAGE_SIZE != 0) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
-    // Align size to page boundary
-    size = page_align_up(size);
+    int const SIZE_RET = align_user_vmem_size(size, &size);
+    if (SIZE_RET < 0) {
+        return static_cast<uint64_t>(SIZE_RET);
+    }
 
     // Check bounds
     if (addr + size > USER_SPACE_END || addr + size < addr) {
@@ -2003,14 +2013,14 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
             uint64_t size = a2;
             uint64_t const PROT = a3;
 
-            if (size == 0) {
-                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
-            }
             if (ADDR % ker::mod::mm::paging::PAGE_SIZE != 0) {
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
             }
 
-            size = page_align_up(size);
+            int const SIZE_RET = align_user_vmem_size(size, &size);
+            if (SIZE_RET < 0) {
+                return static_cast<uint64_t>(SIZE_RET);
+            }
 
             if (ADDR + size > USER_SPACE_END || ADDR + size < ADDR) {
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);

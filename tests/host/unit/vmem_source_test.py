@@ -52,6 +52,70 @@ def require_order(source: str, first: str, second: str, context: str) -> None:
         fail(f"{context}: expected {first} before {second}")
 
 
+def block_between(source: str, start_token: str, end_token: str, context: str) -> str:
+    start = source.find(start_token)
+    if start < 0:
+        fail(f"{context}: missing start token {start_token}")
+    end = source.find(end_token, start + len(start_token))
+    if end < 0:
+        fail(f"{context}: missing end token {end_token}")
+    return source[start:end]
+
+
+def test_munmap_and_mprotect_reject_overflowing_lengths() -> None:
+    source = SYS_VMEM_CPP.read_text()
+    helper = function_body(source, "align_user_vmem_size")
+    require_tokens(
+        helper,
+        [
+            "constexpr uint64_t PAGE_MASK = ker::mod::mm::paging::PAGE_SIZE - 1",
+            "size == 0 || aligned_size == nullptr || size > UINT64_MAX - PAGE_MASK",
+            "return -ker::abi::vmem::VMEM_EINVAL",
+            "uint64_t const ALIGNED = page_align_up(size)",
+            "if (ALIGNED == 0)",
+            "*aligned_size = ALIGNED",
+        ],
+        "checked user vmem size alignment",
+    )
+
+    anon_free = function_body(source, "anon_free")
+    require_order(
+        anon_free,
+        "int const SIZE_RET = align_user_vmem_size(size, &size)",
+        "if (addr + size > USER_SPACE_END || addr + size < addr)",
+        "munmap must validate overflow before range checks",
+    )
+    require_order(
+        anon_free,
+        "int const SIZE_RET = align_user_vmem_size(size, &size)",
+        "sync_file_mmap_range(task->pagemap, addr, size)",
+        "munmap must validate overflow before side effects",
+    )
+    if "size = page_align_up(size)" in anon_free:
+        fail("munmap must not use unchecked page_align_up(size)")
+
+    protect = block_between(
+        source,
+        "case ker::abi::vmem::ops::PROTECT:",
+        "case ker::abi::vmem::ops::MREMAP:",
+        "mprotect syscall case",
+    )
+    require_order(
+        protect,
+        "int const SIZE_RET = align_user_vmem_size(size, &size)",
+        "if (ADDR + size > USER_SPACE_END || ADDR + size < ADDR)",
+        "mprotect must validate overflow before range checks",
+    )
+    require_order(
+        protect,
+        "int const SIZE_RET = align_user_vmem_size(size, &size)",
+        "protect_shared_vmem_range(task, ADDR, size, PROT)",
+        "mprotect must validate overflow before side effects",
+    )
+    if "size = page_align_up(size)" in protect:
+        fail("mprotect must not use unchecked page_align_up(size)")
+
+
 def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
     source = SYS_VMEM_CPP.read_text()
     reserve_body = function_body(source, "reserve_free_mmap_range")
@@ -271,6 +335,7 @@ def test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free() 
 
 
 def main() -> None:
+    test_munmap_and_mprotect_reject_overflowing_lengths()
     test_nonfixed_mmap_address_selection_is_reserved_before_mapping()
     test_owned_frame_tracking_is_disabled_off_the_fault_path()
     test_cow_write_resolution_serializes_pte_reference_consumption()
