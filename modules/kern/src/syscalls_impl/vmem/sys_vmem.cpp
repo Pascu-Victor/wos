@@ -1134,6 +1134,7 @@ auto reserve_free_mmap_range(ker::mod::sched::task::Task* task, uint64_t size, u
     // Reserve the chosen range before returning it to the mapper. This closes
     // the check-then-map race between sibling threads that share a pagemap.
     if (!add_shared_vmem_range(task, VADDR, size, 0, 0)) {
+        (void)remove_shared_vmem_range(task, VADDR, size);
         return ker::abi::vmem::VMEM_ENOMEM;
     }
 
@@ -1461,6 +1462,7 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
 
     if (is_prot_none(prot) || (flags & ker::abi::vmem::MAP_NORESERVE) != 0) {
         if (!add_shared_vmem_range(task, vaddr, size, prot, flags)) {
+            release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
         }
         advance_shared_mmap_cursor(task, vaddr, size);
@@ -1471,9 +1473,12 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
 
     if ((prot & ker::abi::vmem::PROT_WRITE) == 0) {
         uint64_t const RESULT = private_anon_allocate(task, vaddr, size, prot, hint, flags);
+        int const RESULT_STATUS = perf_status_from_vmem_result(RESULT);
         record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0,
-                                perf_status_from_vmem_result(RESULT), vmem_latency_since(PERF_STARTED_US),
-                                perf_status_from_vmem_result(RESULT) == 0 ? RESULT : hint, size, true);
+                                RESULT_STATUS, vmem_latency_since(PERF_STARTED_US), RESULT_STATUS == 0 ? RESULT : hint, size, true);
+        if (RESULT_STATUS != 0) {
+            release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+        }
         return RESULT;
     }
 
@@ -1495,6 +1500,7 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
     }
 
     if (!add_shared_vmem_range(task, vaddr, size, prot, flags)) {
+        release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
     }
 

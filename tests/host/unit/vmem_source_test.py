@@ -52,6 +52,15 @@ def require_order(source: str, first: str, second: str, context: str) -> None:
         fail(f"{context}: expected {first} before {second}")
 
 
+def require_ordered_tokens(source: str, tokens: list[str], context: str) -> None:
+    cursor = 0
+    for token in tokens:
+        found = source.find(token, cursor)
+        if found < 0:
+            fail(f"{context}: missing ordered token {token}")
+        cursor = found + len(token)
+
+
 def block_between(source: str, start_token: str, end_token: str, context: str) -> str:
     start = source.find(start_token)
     if start < 0:
@@ -146,6 +155,15 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
         "add_shared_vmem_range(task, VADDR, size, 0, 0)",
         "non-fixed mmap must publish a reservation before mapping work starts",
     )
+    require_ordered_tokens(
+        reserve_body,
+        [
+            "if (!add_shared_vmem_range(task, VADDR, size, 0, 0))",
+            "(void)remove_shared_vmem_range(task, VADDR, size)",
+            "return ker::abi::vmem::VMEM_ENOMEM",
+        ],
+        "failed mmap reservation publication must roll back partial shared ranges",
+    )
 
     for body_name, body in [("anon_allocate", anon_body), ("file_allocate", file_body)]:
         if "vaddr = find_free_range(task, size, hint)" in body:
@@ -170,6 +188,51 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
         "release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
         "advance_shared_mmap_cursor(task, vaddr, size)",
         "file mmap reservation must be dropped only after page tables occupy the range",
+    )
+
+    noreserve_block = block_between(
+        anon_body,
+        "if (is_prot_none(prot) || (flags & ker::abi::vmem::MAP_NORESERVE) != 0)",
+        "if ((prot & ker::abi::vmem::PROT_WRITE) == 0)",
+        "anonymous PROT_NONE/MAP_NORESERVE branch",
+    )
+    require_ordered_tokens(
+        noreserve_block,
+        [
+            "if (!add_shared_vmem_range(task, vaddr, size, prot, flags))",
+            "release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
+            "return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM)",
+        ],
+        "anonymous lazy metadata failure must release non-fixed reservation",
+    )
+
+    require_ordered_tokens(
+        anon_body,
+        [
+            "uint64_t const RESULT = private_anon_allocate(task, vaddr, size, prot, hint, flags)",
+            "int const RESULT_STATUS = perf_status_from_vmem_result(RESULT)",
+            "record_local_vmem_event",
+            "if (RESULT_STATUS != 0)",
+            "release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
+            "return RESULT",
+        ],
+        "private anonymous failure must release non-fixed reservation",
+    )
+
+    zero_page_block = block_between(
+        anon_body,
+        "auto const ZERO_PADDR",
+        "ker::mod::mm::phys::page_ref_add(ZERO_PAGE, NUM_PAGES)",
+        "anonymous zero-page metadata branch",
+    )
+    require_ordered_tokens(
+        zero_page_block,
+        [
+            "if (!add_shared_vmem_range(task, vaddr, size, prot, flags))",
+            "release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
+            "return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM)",
+        ],
+        "zero-page anonymous metadata failure must release non-fixed reservation",
     )
 
 
