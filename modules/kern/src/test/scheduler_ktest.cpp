@@ -20,6 +20,8 @@ auto scheduler_selftest_runtime_delta_saturates() -> bool;
 auto scheduler_selftest_migration_policy_preserves_hot_process_migration() -> bool;
 auto scheduler_selftest_heap_scan_removal_repairs_stale_index() -> bool;
 auto scheduler_selftest_load_balance_nudge_needs_process_backlog() -> bool;
+auto scheduler_selftest_effectively_idle_current_accepts_rebalance_probe() -> bool;
+auto scheduler_selftest_loadavg_wait_channel_policy() -> bool;
 }  // namespace ker::mod::sched
 
 KTEST(Sched, VruntimeOrdering) {
@@ -76,6 +78,12 @@ KTEST(SchedulerMigration, HeapScanRemovalRepairsStaleIndex) {
 KTEST(SchedulerMigration, LoadBalanceNudgeNeedsProcessBacklog) {
     KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_load_balance_nudge_needs_process_backlog());
 }
+
+KTEST(SchedulerMigration, EffectivelyIdleCurrentAcceptsRebalanceProbe) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_effectively_idle_current_accepts_rebalance_probe());
+}
+
+KTEST(SchedulerMetrics, LoadAverageWaitChannelPolicy) { KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_loadavg_wait_channel_policy()); }
 
 KTEST(ContextSwitch, RepairsStaleProcessSyscallResume) {
     KEXPECT_TRUE(ker::mod::sys::context_switch::context_switch_selftest_repair_stale_process_syscall_resume());

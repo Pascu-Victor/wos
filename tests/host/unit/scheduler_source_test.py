@@ -259,39 +259,45 @@ def test_busy_cpus_nudge_idle_peers_to_steal_process_backlog() -> None:
         [
             "runqueue_has_stealable_process_backlog(busy_rq)",
             "smt::find_group_for_cpu(busy_cpu)",
-            "idle_rq->is_idle.load(std::memory_order_acquire)",
-            "idle_rq->runnable_heap.size != 0",
-            "idle_rq->resched_timer_pending.load(std::memory_order_acquire)",
+            "runqueue_accepts_rebalance_probe(idle_rq)",
             "idle_rebalance_probe_needed_for_idle(TARGET_CPU)",
             "busy_rq->load_balance_pushes.fetch_add(1, std::memory_order_relaxed)",
             "wake_cpu(TARGET_CPU, WakeCpuMode::COALESCE)",
         ],
-        "busy-side load-balance nudge must wake only idle peers that can run the existing steal path",
+        "busy-side load-balance nudge must wake idle-like peers that can run the existing steal path",
     )
     require_tokens(
         wake_handler_body,
         [
             "bool const HAS_LOCAL_WORK = rq->runnable_heap.size > 0",
             "bool const SHOULD_PROBE_IDLE_STEAL",
+            "runqueue_accepts_rebalance_probe(rq)",
             "idle_rebalance_probe_needed_for_idle(cpu::current_cpu())",
             "if (HAS_LOCAL_WORK)",
             "rq->resched_timer_pending.store(true, std::memory_order_release)",
             "apic::one_shot_timer(1)",
         ],
-        "scheduler wake IPI must arm idle-steal probes, not only local runqueue work",
+        "scheduler wake IPI must arm idle-like steal probes, not only local runqueue work",
     )
     require_tokens(
         timer_body,
-        ["maybe_nudge_idle_cpu_for_load_balance(cpu::current_cpu(), rq);"],
-        "timer path must periodically nudge idle peers from busy CPUs",
+        [
+            "maybe_nudge_idle_cpu_for_load_balance(cpu::current_cpu(), rq);",
+            "maybe_steal_for_effectively_idle_current_locked(rq, current_task);",
+        ],
+        "timer path must periodically nudge idle peers and let effectively idle current tasks steal",
     )
     require_tokens(
         source,
         [
             "scheduler_selftest_load_balance_nudge_needs_process_backlog",
+            "scheduler_selftest_effectively_idle_current_accepts_rebalance_probe",
             "CURRENT_ONLY_REJECTED",
             "CURRENT_PLUS_QUEUED_ACCEPTED",
             "SOFT_EXCLUSIVE_REJECTED",
+            "VOLUNTARY_EMPTY_ACCEPTED",
+            "VOLUNTARY_CURRENT_ONLY_ACCEPTED",
+            "REAL_LOCAL_WORK_REJECTED",
         ],
         "busy-side load-balance nudge kernel selftest implementation",
     )
@@ -299,7 +305,9 @@ def test_busy_cpus_nudge_idle_peers_to_steal_process_backlog() -> None:
         ktest_source,
         [
             "scheduler_selftest_load_balance_nudge_needs_process_backlog",
+            "scheduler_selftest_effectively_idle_current_accepts_rebalance_probe",
             "KTEST(SchedulerMigration, LoadBalanceNudgeNeedsProcessBacklog)",
+            "KTEST(SchedulerMigration, EffectivelyIdleCurrentAcceptsRebalanceProbe)",
         ],
         "busy-side load-balance nudge kernel selftest wiring",
     )
@@ -992,6 +1000,65 @@ def test_cpu_accounting_snapshot_projects_live_current_runtime() -> None:
     )
 
 
+def test_loadavg_does_not_count_interruptible_wait_channels() -> None:
+    source = SCHEDULER_CPP.read_text()
+    ktest_source = SCHEDULER_KTEST.read_text()
+    runnable_body = function_body(source, "loadavg_task_is_runnable")
+    blocked_body = function_body(source, "loadavg_wait_channel_counts_as_uninterruptible")
+    snapshot_body = function_body(source, "get_load_average_snapshot")
+
+    require_tokens(
+        runnable_body,
+        [
+            "task->sched_queue == task::Task::sched_queue::RUNNABLE",
+            "!task->is_voluntary_blocked()",
+        ],
+        "loadavg runnable classifier",
+    )
+    require_tokens(
+        blocked_body,
+        [
+            "task->sched_queue != task::Task::sched_queue::WAITING",
+            "task->wait_channel == nullptr",
+            "task->ptrace_stopped",
+            "task->wait_channel_kind == task::WaitChannelKind::GENERIC",
+            'std::strcmp(task->wait_channel, "dirty_bcache") == 0',
+        ],
+        "loadavg blocked classifier must not count every named wait channel",
+    )
+    if "task->sched_queue == task::Task::sched_queue::WAITING && task->wait_channel != nullptr" in snapshot_body:
+        fail("loadavg must not count every named WAITING task as uninterruptible load")
+    require_tokens(
+        snapshot_body,
+        [
+            "loadavg_task_is_runnable(task)",
+            "loadavg_wait_channel_counts_as_uninterruptible(task)",
+            "if (IS_RUNNABLE || IS_UNINTERRUPTIBLE)",
+        ],
+        "loadavg snapshot must use explicit classifiers",
+    )
+    require_tokens(
+        source,
+        [
+            "scheduler_selftest_loadavg_wait_channel_policy",
+            "VOLUNTARY_RUNNABLE_IGNORED",
+            "WAITPID_IGNORED",
+            "PIPE_IGNORED",
+            "FUTEX_IGNORED",
+            "DIRTY_BCACHE_COUNTS",
+        ],
+        "loadavg wait-channel kernel selftest implementation",
+    )
+    require_tokens(
+        ktest_source,
+        [
+            "scheduler_selftest_loadavg_wait_channel_policy",
+            "KTEST(SchedulerMetrics, LoadAverageWaitChannelPolicy)",
+        ],
+        "loadavg wait-channel kernel selftest wiring",
+    )
+
+
 def test_procfs_exposes_scheduler_cpu_state_snapshot() -> None:
     source = PROCFS_CPP.read_text()
     header = PROCFS_HPP.read_text()
@@ -1380,8 +1447,10 @@ def test_voluntary_blocked_current_cannot_hide_runnable_peer() -> None:
     require_tokens(
         timer_body,
         [
-            "auto* next = pick_best_eligible_for_switch_locked(rq, AVG, current_task)",
+            "int64_t const PICK_AVG = compute_avg_vruntime(rq)",
+            "auto* next = pick_best_eligible_for_switch_locked(rq, PICK_AVG, current_task)",
             "if (next == nullptr || next == current_task)",
+            "perf_lag_out = PICK_AVG - current_task->vruntime",
         ],
         "timer path must not let a voluntary-blocked current task hide runnable peers",
     )
@@ -1468,6 +1537,7 @@ def main() -> None:
     test_scheduler_cpu_dump_is_cmdline_gated_and_reports_reschedule_state()
     test_placement_load_counts_current_task()
     test_cpu_accounting_snapshot_projects_live_current_runtime()
+    test_loadavg_does_not_count_interruptible_wait_channels()
     test_procfs_exposes_scheduler_cpu_state_snapshot()
     test_procfs_status_exposes_waitpid_exit_debug_state()
     test_handoff_waitpid_wake_queues_out_of_lock_repair()

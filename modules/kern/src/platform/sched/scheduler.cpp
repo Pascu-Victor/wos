@@ -2128,6 +2128,31 @@ inline auto runqueue_has_stealable_process_backlog(RunQueue const* rq) -> bool {
     return LOAD >= MIN_STEAL_LOAD;
 }
 
+inline auto current_task_is_effectively_idle(task::Task const* current) -> bool {
+    return current != nullptr && (current->is_voluntary_blocked() || current->wants_block);
+}
+
+inline auto runqueue_accepts_rebalance_probe(RunQueue const* rq) -> bool {
+    if (rq == nullptr || rq->resched_timer_pending.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (rq->is_idle.load(std::memory_order_acquire)) {
+        return rq->runnable_heap.size == 0;
+    }
+
+    auto const* current = rq->current_task;
+    if (!current_task_is_effectively_idle(current)) {
+        return false;
+    }
+
+    // A voluntary-blocked current task can be halted in a syscall/kernel wait
+    // while still occupying current_task, and in the kern_yield case it can also
+    // remain as the only heap entry. Treat that CPU as idle-like for requesting
+    // a steal probe; if it has real local work, the timer path will run that
+    // first and the IPI is just a wakeup.
+    return rq->runnable_heap.size <= 1;
+}
+
 void maybe_nudge_idle_cpu_for_load_balance(uint64_t busy_cpu, RunQueue* busy_rq) {
     if (run_queues == nullptr || busy_rq == nullptr || !runqueue_has_stealable_process_backlog(busy_rq)) {
         return;
@@ -2151,10 +2176,7 @@ void maybe_nudge_idle_cpu_for_load_balance(uint64_t busy_cpu, RunQueue* busy_rq)
         }
 
         auto* idle_rq = run_queues->that_cpu(TARGET_CPU);
-        if (idle_rq == nullptr || !idle_rq->is_idle.load(std::memory_order_acquire)) {
-            continue;
-        }
-        if (idle_rq->runnable_heap.size != 0 || idle_rq->resched_timer_pending.load(std::memory_order_acquire)) {
+        if (!runqueue_accepts_rebalance_probe(idle_rq)) {
             continue;
         }
         if (!idle_rebalance_probe_needed_for_idle(TARGET_CPU)) {
@@ -2372,6 +2394,23 @@ inline uint32_t compute_effective_load_locked(RunQueue* rq, task::TaskType incom
     }
 
     return load;
+}
+
+inline auto runqueue_has_only_effectively_idle_current_locked(RunQueue* rq, task::Task* current_task) -> bool {
+    if (rq == nullptr || !current_task_is_effectively_idle(current_task)) {
+        return false;
+    }
+    if (rq->runnable_heap.size == 0) {
+        return true;
+    }
+    return rq->runnable_heap.size == 1 && rq->runnable_heap.contains(current_task);
+}
+
+inline void maybe_steal_for_effectively_idle_current_locked(RunQueue* rq, task::Task* current_task) {
+    if (!runqueue_has_only_effectively_idle_current_locked(rq, current_task)) {
+        return;
+    }
+    (void)try_steal_from_peers(cpu::current_cpu(), rq);
 }
 
 inline uint32_t cached_effective_load_for_cpu(uint64_t cpu_no, task::TaskType incoming_type) {
@@ -2754,8 +2793,7 @@ void scheduler_wake_handler([[maybe_unused]] cpu::GPRegs gpr, [[maybe_unused]] g
     // IPI instead of being suppressed by our old pending flag.
     rq->resched_timer_pending.store(false, std::memory_order_release);
     bool const HAS_LOCAL_WORK = rq->runnable_heap.size > 0;
-    bool const SHOULD_PROBE_IDLE_STEAL =
-        !HAS_LOCAL_WORK && rq->is_idle.load(std::memory_order_acquire) && idle_rebalance_probe_needed_for_idle(cpu::current_cpu());
+    bool const SHOULD_PROBE_IDLE_STEAL = runqueue_accepts_rebalance_probe(rq) && idle_rebalance_probe_needed_for_idle(cpu::current_cpu());
     if (HAS_LOCAL_WORK || SHOULD_PROBE_IDLE_STEAL) {
         if (HAS_LOCAL_WORK) {
             rq->is_idle.store(false, std::memory_order_release);
@@ -4178,11 +4216,14 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             blocked_current_task = true;
         }
 
+        maybe_steal_for_effectively_idle_current_locked(rq, current_task);
+
         // Pick best eligible task
         if (rq->runnable_heap.size == 0) {
             return nullptr;
         }
-        auto* next = pick_best_eligible_for_switch_locked(rq, AVG, current_task);
+        int64_t const PICK_AVG = compute_avg_vruntime(rq);
+        auto* next = pick_best_eligible_for_switch_locked(rq, PICK_AVG, current_task);
         if (next == nullptr || next == current_task) {
             return nullptr;
         }
@@ -4269,7 +4310,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
         // switch_to() has patched the timer return frame.
         reserve_handoff_task_locked(rq, next, NOW_US);
         // Capture lag for the perf SWITCH event recorded outside the lock.
-        perf_lag_out = AVG - current_task->vruntime;
+        perf_lag_out = PICK_AVG - current_task->vruntime;
         return next;
     });
 
@@ -6778,6 +6819,22 @@ namespace {
 auto decay_load_milli(uint64_t previous, uint64_t active_milli, uint64_t exp_scaled) -> uint64_t {
     return ((previous * exp_scaled) + (active_milli * (LOADAVG_SCALE - exp_scaled))) / LOADAVG_SCALE;
 }
+
+auto loadavg_task_is_runnable(task::Task const* task) -> bool {
+    return task != nullptr && task->sched_queue == task::Task::sched_queue::RUNNABLE && !task->is_voluntary_blocked();
+}
+
+auto loadavg_wait_channel_counts_as_uninterruptible(task::Task const* task) -> bool {
+    if (task == nullptr || task->sched_queue != task::Task::sched_queue::WAITING || task->wait_channel == nullptr || task->ptrace_stopped) {
+        return false;
+    }
+
+    // Linux loadavg includes runnable tasks and uninterruptible disk-style
+    // waits, not every named interruptible sleep. WOS currently names ordinary
+    // waitpid/poll/pipe/futex sleeps, so classify only known I/O throttle waits
+    // as blocked load until the scheduler grows an explicit D-state bit.
+    return task->wait_channel_kind == task::WaitChannelKind::GENERIC && std::strcmp(task->wait_channel, "dirty_bcache") == 0;
+}
 }  // namespace
 
 auto get_load_average_snapshot() -> LoadAverageSnapshot {
@@ -6802,9 +6859,8 @@ auto get_load_average_snapshot() -> LoadAverageSnapshot {
             if (DEAD || task->ptrace_stopped) {
                 continue;
             }
-            bool const IS_RUNNABLE = task->sched_queue == task::Task::sched_queue::RUNNABLE && !task->is_voluntary_blocked();
-            bool const IS_UNINTERRUPTIBLE =
-                task->sched_queue == task::Task::sched_queue::WAITING && task->wait_channel != nullptr && !task->ptrace_stopped;
+            bool const IS_RUNNABLE = loadavg_task_is_runnable(task);
+            bool const IS_UNINTERRUPTIBLE = loadavg_wait_channel_counts_as_uninterruptible(task);
             if (IS_RUNNABLE) {
                 runnable++;
             }
@@ -7259,6 +7315,72 @@ auto scheduler_selftest_load_balance_nudge_needs_process_backlog() -> bool {
     bool const SOFT_EXCLUSIVE_REJECTED = !runqueue_has_stealable_process_backlog(&rq);
 
     return CURRENT_ONLY_REJECTED && QUEUED_PUBLISHED && CURRENT_PLUS_QUEUED_ACCEPTED && SOFT_EXCLUSIVE_REJECTED;
+}
+
+auto scheduler_selftest_effectively_idle_current_accepts_rebalance_probe() -> bool {
+    RunQueue rq{};
+    task::Task current{};
+    task::Task queued{};
+
+    current.type = task::TaskType::PROCESS;
+    current.pid = 1;
+    current.sched_weight = 1024;
+    current.heap_index = -1;
+    publish_current_task(&rq, &current);
+
+    current.set_voluntary_blocked(true);
+    bool const VOLUNTARY_EMPTY_ACCEPTED = runqueue_accepts_rebalance_probe(&rq);
+    bool const ONLY_EMPTY_CURRENT = runqueue_has_only_effectively_idle_current_locked(&rq, &current);
+
+    bool const CURRENT_PUBLISHED = publish_runnable_task_locked(&rq, &current, "effective-idle-current-selftest");
+    bool const VOLUNTARY_CURRENT_ONLY_ACCEPTED = runqueue_accepts_rebalance_probe(&rq);
+    bool const ONLY_HEAP_CURRENT = runqueue_has_only_effectively_idle_current_locked(&rq, &current);
+
+    queued.type = task::TaskType::PROCESS;
+    queued.pid = 2;
+    queued.sched_weight = 1024;
+    queued.heap_index = -1;
+    queued.vdeadline = 100;
+    bool const QUEUED_PUBLISHED = publish_runnable_task_locked(&rq, &queued, "effective-idle-current-selftest");
+    bool const REAL_LOCAL_WORK_REJECTED = !runqueue_accepts_rebalance_probe(&rq);
+    bool const ONLY_CURRENT_WITH_REAL_WORK_REJECTED = !runqueue_has_only_effectively_idle_current_locked(&rq, &current);
+
+    return VOLUNTARY_EMPTY_ACCEPTED && ONLY_EMPTY_CURRENT && CURRENT_PUBLISHED && VOLUNTARY_CURRENT_ONLY_ACCEPTED && ONLY_HEAP_CURRENT &&
+           QUEUED_PUBLISHED && REAL_LOCAL_WORK_REJECTED && ONLY_CURRENT_WITH_REAL_WORK_REJECTED;
+}
+
+auto scheduler_selftest_loadavg_wait_channel_policy() -> bool {
+    task::Task runnable{};
+    runnable.sched_queue = task::Task::sched_queue::RUNNABLE;
+
+    task::Task voluntary_runnable{};
+    voluntary_runnable.sched_queue = task::Task::sched_queue::RUNNABLE;
+    voluntary_runnable.set_voluntary_blocked(true);
+
+    task::Task waitpid{};
+    waitpid.sched_queue = task::Task::sched_queue::WAITING;
+    waitpid.set_wait_channel("waitpid", task::WaitChannelKind::WAITPID);
+
+    task::Task pipe{};
+    pipe.sched_queue = task::Task::sched_queue::WAITING;
+    pipe.set_wait_channel("pipe_read", task::WaitChannelKind::LOCAL_PIPE);
+
+    task::Task futex{};
+    futex.sched_queue = task::Task::sched_queue::WAITING;
+    futex.set_wait_channel("futex_wait", task::WaitChannelKind::FUTEX);
+
+    task::Task dirty_bcache{};
+    dirty_bcache.sched_queue = task::Task::sched_queue::WAITING;
+    dirty_bcache.set_wait_channel("dirty_bcache", task::WaitChannelKind::GENERIC);
+
+    bool const RUNNABLE_COUNTS = loadavg_task_is_runnable(&runnable);
+    bool const VOLUNTARY_RUNNABLE_IGNORED = !loadavg_task_is_runnable(&voluntary_runnable);
+    bool const WAITPID_IGNORED = !loadavg_wait_channel_counts_as_uninterruptible(&waitpid);
+    bool const PIPE_IGNORED = !loadavg_wait_channel_counts_as_uninterruptible(&pipe);
+    bool const FUTEX_IGNORED = !loadavg_wait_channel_counts_as_uninterruptible(&futex);
+    bool const DIRTY_BCACHE_COUNTS = loadavg_wait_channel_counts_as_uninterruptible(&dirty_bcache);
+
+    return RUNNABLE_COUNTS && VOLUNTARY_RUNNABLE_IGNORED && WAITPID_IGNORED && PIPE_IGNORED && FUTEX_IGNORED && DIRTY_BCACHE_COUNTS;
 }
 #endif
 
