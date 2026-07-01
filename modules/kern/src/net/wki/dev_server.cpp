@@ -1131,8 +1131,8 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         }
     } else if (res_type == ResourceType::VFS) {
         // Find the VFS export
-        VfsExport* exp = wki_remote_vfs_find_export(req->resource_id);
-        if (exp == nullptr) {
+        VfsExport exp = {};
+        if (!wki_remote_vfs_find_export_snapshot(req->resource_id, &exp)) {
             ack.status = static_cast<uint8_t>(DevAttachStatus::NOT_FOUND);
             wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
             return;
@@ -1157,8 +1157,12 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.resource_type = ResourceType::VFS;
         binding.resource_id = req->resource_id;
         binding.attach_cookie = req->attach_cookie;
-        memcpy(static_cast<void*>(binding.vfs_export_path), static_cast<const void*>(exp->export_path), sizeof(binding.vfs_export_path));
-        memcpy(static_cast<void*>(binding.vfs_export_name), static_cast<const void*>(exp->name), sizeof(binding.vfs_export_name));
+        memcpy(static_cast<void*>(binding.vfs_export_path), static_cast<const void*>(exp.export_path),
+               std::min(sizeof(binding.vfs_export_path), sizeof(exp.export_path)));
+        memcpy(static_cast<void*>(binding.vfs_export_name), static_cast<const void*>(exp.name),
+               std::min(sizeof(binding.vfs_export_name), sizeof(exp.name)));
+        binding.vfs_export_path[sizeof(binding.vfs_export_path) - 1] = '\0';
+        binding.vfs_export_name[sizeof(binding.vfs_export_name) - 1] = '\0';
 
         // RDMA-backed VFS I/O: pre-register server-side buffers.
         // rdma_register_region is a local-only operation - safe to call in NAPI context.
@@ -1241,7 +1245,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         ack.max_op_size = static_cast<uint16_t>(WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload));
 
         ker::mod::dbg::log("[WKI] VFS attach: node=0x%04x res_id=%u ch=%u path=%s rdma_write=%s read_staging_rkey=%u bulk_staging_rkey=%u",
-                           hdr->src_node, req->resource_id, ch->channel_id, static_cast<const char*>(exp->name),
+                           hdr->src_node, req->resource_id, ch->channel_id, static_cast<const char*>(exp.name),
                            ((ack.rdma_flags & DEV_ATTACH_RDMA_VFS) != 0) ? "yes" : "no", ack.rdma_read_staging_rkey,
                            ack.rdma_bulk_staging_rkey);
 

@@ -2805,16 +2805,21 @@ auto wki_remote_vfs_export_add(const char* export_path, const char* name) -> uin
     return wki_remote_vfs_export_add_internal(export_path, name, 0);
 }
 
-auto wki_remote_vfs_find_export(uint32_t resource_id) -> VfsExport* {
+auto wki_remote_vfs_find_export_snapshot(uint32_t resource_id, VfsExport* out) -> bool {
+    if (out == nullptr) {
+        return false;
+    }
+
     s_vfs_lock.lock();
-    for (auto& exp : g_vfs_exports) {
+    for (const auto& exp : g_vfs_exports) {
         if (exp.active && exp.resource_id == resource_id) {
+            *out = exp;
             s_vfs_lock.unlock();
-            return &exp;
+            return true;
         }
     }
     s_vfs_lock.unlock();
-    return nullptr;
+    return false;
 }
 
 namespace {

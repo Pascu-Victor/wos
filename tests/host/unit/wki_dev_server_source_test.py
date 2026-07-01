@@ -9,6 +9,7 @@ DEV_SERVER_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "dev_server
 DEV_SERVER_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "dev_server.hpp"
 REMOTE_NET_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_net.cpp"
 REMOTE_NET_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_net.hpp"
+REMOTE_VFS_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_vfs.hpp"
 WIRE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wire.hpp"
 WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
 WKI_DEV_SERVER_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_dev_server_ktest.cpp"
@@ -90,6 +91,50 @@ def test_net_dispatch_does_not_pass_server_binding_pointer() -> None:
     expected_call = "detail::handle_net_op(hdr, hdr->channel_id, binding_net_dev, req->op_id, req_data, REQ_DATA_LEN);"
     if expected_call not in server_body:
         fail("handle_dev_op_req() must dispatch NET ops with the snapshotted net_dev only")
+
+
+def test_vfs_attach_uses_export_snapshot_not_unlocked_pointer() -> None:
+    remote_header = REMOTE_VFS_HPP.read_text()
+    attach_body = function_body(DEV_SERVER_CPP.read_text(), "handle_dev_attach_req")
+
+    if "wki_remote_vfs_find_export(uint32_t resource_id) -> VfsExport*" in remote_header:
+        fail("remote VFS export lookup must not expose unlocked VfsExport pointers")
+    if "wki_remote_vfs_find_export(req->resource_id)" in attach_body or "exp->" in attach_body:
+        fail("VFS attach must consume a copied export snapshot instead of an unlocked export pointer")
+
+    required = [
+        "VfsExport exp = {};",
+        "if (!wki_remote_vfs_find_export_snapshot(req->resource_id, &exp))",
+        "memcpy(static_cast<void*>(binding.vfs_export_path), static_cast<const void*>(exp.export_path),",
+        "std::min(sizeof(binding.vfs_export_path), sizeof(exp.export_path))",
+        "memcpy(static_cast<void*>(binding.vfs_export_name), static_cast<const void*>(exp.name),",
+        "std::min(sizeof(binding.vfs_export_name), sizeof(exp.name))",
+        "binding.vfs_export_path[sizeof(binding.vfs_export_path) - 1] = '\\0';",
+        "binding.vfs_export_name[sizeof(binding.vfs_export_name) - 1] = '\\0';",
+        "static_cast<const char*>(exp.name)",
+    ]
+    missing = [token for token in required if token not in attach_body]
+    if missing:
+        fail("VFS attach is missing export snapshot/copy tokens: " + ", ".join(missing))
+
+    require_order(
+        attach_body,
+        "VfsExport exp = {};",
+        "if (!wki_remote_vfs_find_export_snapshot(req->resource_id, &exp))",
+        "VFS attach snapshot declaration before lookup",
+    )
+    require_order(
+        attach_body,
+        "if (!wki_remote_vfs_find_export_snapshot(req->resource_id, &exp))",
+        "WkiChannel const* ch = reserve_attach_channel",
+        "VFS attach validates export before reserving channel",
+    )
+    require_order(
+        attach_body,
+        "wki_remote_vfs_find_export_snapshot(req->resource_id, &exp)",
+        "memcpy(static_cast<void*>(binding.vfs_export_path), static_cast<const void*>(exp.export_path),",
+        "VFS attach copies from snapshot",
+    )
 
 
 def test_duplicate_net_attach_does_not_rewrite_binding_cookie() -> None:
@@ -426,6 +471,7 @@ def main() -> None:
     test_rx_forward_sends_notify_cookie_envelope()
     test_state_notify_sends_notify_cookie_envelope()
     test_net_dispatch_does_not_pass_server_binding_pointer()
+    test_vfs_attach_uses_export_snapshot_not_unlocked_pointer()
     test_duplicate_net_attach_does_not_rewrite_binding_cookie()
     test_net_binding_state_mutation_revalidates_under_server_lock()
     test_net_notify_handlers_validate_cookie_envelope()

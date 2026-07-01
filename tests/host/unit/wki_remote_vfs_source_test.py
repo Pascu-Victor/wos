@@ -262,6 +262,39 @@ def test_remote_open_closes_server_fd_on_local_allocation_failure() -> None:
     )
 
 
+def test_export_lookup_returns_locked_snapshot() -> None:
+    header = REMOTE_VFS_HPP.read_text()
+    source = REMOTE_VFS_CPP.read_text()
+
+    require_tokens(
+        header,
+        ["auto wki_remote_vfs_find_export_snapshot(uint32_t resource_id, VfsExport* out) -> bool;"],
+        "remote VFS export snapshot declaration",
+    )
+    if "auto wki_remote_vfs_find_export(uint32_t resource_id) -> VfsExport*" in header + source:
+        fail("remote VFS export lookup must not return an unlocked pointer into g_vfs_exports")
+
+    body = function_body(source, "wki_remote_vfs_find_export_snapshot")
+    require_order(
+        body,
+        [
+            "if (out == nullptr)",
+            "return false",
+            "s_vfs_lock.lock()",
+            "for (const auto& exp : g_vfs_exports)",
+            "if (exp.active && exp.resource_id == resource_id)",
+            "*out = exp",
+            "s_vfs_lock.unlock()",
+            "return true",
+            "s_vfs_lock.unlock()",
+            "return false",
+        ],
+        "remote VFS export snapshot locking",
+    )
+    if "return &exp" in body:
+        fail("remote VFS export snapshot helper must not return a pointer into g_vfs_exports")
+
+
 def test_rdma_retry_cooldowns_are_saturating() -> None:
     source = REMOTE_VFS_CPP.read_text()
     body = function_body(source, "remote_vfs_rdma_note_transient_failure")
@@ -352,6 +385,7 @@ def main() -> None:
     test_shared_io_slot_waits_are_bounded()
     test_shared_io_callers_timeout_or_fallback()
     test_remote_open_closes_server_fd_on_local_allocation_failure()
+    test_export_lookup_returns_locked_snapshot()
     test_rdma_retry_cooldowns_are_saturating()
     test_vfs_attach_ack_requires_expected_cookie_before_completion()
     print("WKI remote VFS source invariants hold")

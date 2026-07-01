@@ -209,8 +209,8 @@ void wki_remote_vfs_init();
 // Server side: register a VFS export and return its resource_id
 auto wki_remote_vfs_export_add(const char* export_path, const char* name) -> uint32_t;
 
-// Server side: find an export by resource_id
-auto wki_remote_vfs_find_export(uint32_t resource_id) -> VfsExport*;
+// Server side: copy an export snapshot by resource_id while holding the export lock.
+auto wki_remote_vfs_find_export_snapshot(uint32_t resource_id, VfsExport* out) -> bool;
 
 // Server side: advertise all VFS exports to all connected peers
 void wki_remote_vfs_advertise_exports();
