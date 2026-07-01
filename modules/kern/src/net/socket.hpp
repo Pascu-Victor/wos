@@ -96,6 +96,11 @@ enum class SocketState : uint8_t {
 
 struct Socket;
 
+struct SocketWaiter {
+    uint64_t pid = 0;
+    SocketWaiter* next = nullptr;
+};
+
 // Protocol-specific operations
 struct SocketProtoOps {
     int (*bind)(Socket*, const void*, size_t);
@@ -146,6 +151,7 @@ struct Socket {
     Socket* accept_next = nullptr;
 
     uint64_t owner_pid = 0;
+    SocketWaiter* waiters = nullptr;
     bool reuse_addr = false;
     bool reuse_port = false;
     bool nonblock = false;
@@ -171,11 +177,14 @@ auto socket_init_buffers(Socket* sock, size_t rcvbuf_size) -> int;
 // Returns 0 on success, -1 on failure (ENOMEM or buffer non-empty).
 auto socket_resize_rcvbuf(Socket* sock, size_t new_size) -> int;
 
+// Register a task to be woken on the next readiness change.
+auto socket_register_waiter(Socket* sock, uint64_t pid) -> bool;
+
 // Block the current task waiting for socket I/O and arrange for the next
 // packet arrival to wake it.
-void socket_defer_wait(Socket* sock, const char* wait_channel = "sock_wait");
+auto socket_defer_wait(Socket* sock, const char* wait_channel = "sock_wait") -> bool;
 
-// Wake a task blocked on this socket's wait channel.
+// Wake tasks blocked on this socket's wait channel.
 void socket_wake_waiters(Socket* sock);
 
 }  // namespace ker::net

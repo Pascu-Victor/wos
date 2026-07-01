@@ -114,7 +114,7 @@ def require_poll_waits_are_signal_interruptible() -> None:
     require_order(
         poll_body,
         "if (current_task_has_deliverable_signal())",
-        "bool const CAN_BLOCK = register_poll_waiters",
+        "int const CAN_BLOCK = register_poll_waiters",
         "if (current_task_has_deliverable_signal())",
         "ker::mod::sched::preemptible_syscall_park(wait_channel, poll_wait_kind, DEADLINE_US)",
     )

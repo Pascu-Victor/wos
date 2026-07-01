@@ -13,8 +13,6 @@
 #include <net/proto/ipv4.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
-#include <platform/sched/scheduler.hpp>
-#include <platform/sched/task.hpp>
 #include <utility>
 
 #include "net/socket.hpp"
@@ -73,28 +71,15 @@ void parse_syn_options(TcpCB* cb, const TcpHeader* hdr, bool refresh_receive_wsc
     }
 }
 
-// Wake a task blocked on this socket.
+// Wake tasks blocked on this socket.
 void wake_socket(Socket* sock) {
     if (sock == nullptr) {
         return;
     }
-    uint64_t const PID = sock->owner_pid;
 #ifdef TCP_DEBUG
-    log::debug("wake_socket: sock=%p owner_pid=%lu", static_cast<void*>(sock), PID);
+    log::debug("wake_socket: sock=%p owner_pid=%lu", static_cast<void*>(sock), sock->owner_pid);
 #endif
-    if (PID != 0) {
-        auto* task = ker::mod::sched::find_task_by_pid_safe(PID);
-#ifdef TCP_DEBUG
-        log::debug("wake_socket: pid=%lu task=%p", PID, static_cast<void*>(task));
-#endif
-        if (task != nullptr) {
-#ifdef TCP_DEBUG
-            log::debug("wake_socket: event-waking pid=%lu", PID);
-#endif
-            ker::mod::sched::wake_task_from_event(task);
-            task->release();
-        }
-    }
+    socket_wake_waiters(sock);
 }
 
 // Free all retransmit entries.

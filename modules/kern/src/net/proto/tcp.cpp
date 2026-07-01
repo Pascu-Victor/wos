@@ -61,17 +61,7 @@ constexpr int POLLERR = 0x0008;
 constexpr int POLLHUP = 0x0010;
 constexpr int POLLRDHUP = 0x2000;
 
-void defer_socket_wait(Socket* sock) {
-    auto* current_task = ker::mod::sched::get_current_task();
-    if (current_task == nullptr) {
-        return;
-    }
-
-    if (sock != nullptr) {
-        sock->owner_pid = current_task->pid;
-    }
-    current_task->set_wait_channel("tcp_wait");
-}
+auto defer_socket_wait(Socket* sock) -> bool { return socket_defer_wait(sock, "tcp_wait"); }
 
 std::atomic<uint32_t> iss_counter{0x12345678};
 uint64_t iss_secret = 0;
@@ -308,7 +298,9 @@ int tcp_accept(Socket* sock, Socket** new_sock_out, void* addr_out, size_t* addr
 #endif
     if (sock->aq_count == 0) {
         sock->lock.unlock();
-        defer_socket_wait(sock);
+        if (!defer_socket_wait(sock)) {
+            return -ENOMEM;
+        }
 #ifdef TCP_DEBUG
         log::debug("tcp_accept: queue empty, parking pid=%lu", sock->owner_pid);
 #endif
@@ -359,7 +351,9 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int flags) 
         if (cb->state == TcpState::CLOSED) {
             return -ECONNREFUSED;
         }
-        defer_socket_wait(sock);
+        if (!defer_socket_wait(sock)) {
+            return -ENOMEM;
+        }
         return -EINPROGRESS;
     }
 
@@ -426,7 +420,9 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int flags) 
     if (cb->state == TcpState::CLOSED) {
         return -ECONNREFUSED;
     }
-    defer_socket_wait(sock);
+    if (!defer_socket_wait(sock)) {
+        return -ENOMEM;
+    }
     return -EINPROGRESS;
 }
 
@@ -443,7 +439,8 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int flags) -> ssize_t {
         return -ENOTCONN;
     }
 
-    // Update owner_pid so wake_socket() wakes the correct task after fork.
+    // Keep socket ownership metadata current for diagnostics and raw ICMP ID
+    // matching. Readiness wakeups use the socket waiter list.
     {
         auto* cur = ker::mod::sched::get_current_task();
         if (cur != nullptr) {
@@ -481,7 +478,9 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int flags) -> ssize_t {
             if (NONBLOCKING) {
                 return -EAGAIN;
             }
-            defer_socket_wait(sock);
+            if (!defer_socket_wait(sock)) {
+                return -ENOMEM;
+            }
             return -EAGAIN;
         }
 
@@ -494,7 +493,9 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int flags) -> ssize_t {
             if (NONBLOCKING) {
                 return -EAGAIN;
             }
-            defer_socket_wait(sock);
+            if (!defer_socket_wait(sock)) {
+                return -ENOMEM;
+            }
             return -EAGAIN;
         }
         chunk = std::min<size_t>(chunk, TCP_SEND_BURST_BYTES - sent);
@@ -510,7 +511,9 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int flags) -> ssize_t {
             if (NONBLOCKING) {
                 return -EAGAIN;
             }
-            defer_socket_wait(sock);
+            if (!defer_socket_wait(sock)) {
+                return -ENOMEM;
+            }
             return -EAGAIN;
         }
         sent += chunk;
@@ -572,15 +575,6 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int flags) -> ssize_t {
         return -EAGAIN;
     }
 
-    // Update owner_pid so wake_socket() wakes the correct task (handles fork: child
-    // inherits the fd but owner_pid still points to the parent that accepted it).
-    {
-        auto* cur = ker::mod::sched::get_current_task();
-        if (cur != nullptr) {
-            sock->owner_pid = cur->pid;
-        }
-    }
-
     // Drain any already-pending RX work before committing to a blocking wait.
     ker::net::napi_poll_all_pending();
     ker::net::backlog_drain_all_pending_inline();
@@ -588,7 +582,9 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int flags) -> ssize_t {
         return completed;
     }
 
-    socket_defer_wait(sock, "tcp_wait");
+    if (!socket_defer_wait(sock, "tcp_wait")) {
+        return -ENOMEM;
+    }
 
     // Close the race where data arrives after the last readiness check.
     if (maybe_finish_recv()) {

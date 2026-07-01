@@ -120,7 +120,9 @@ auto raw_recvfrom(Socket* sock, void* buf, size_t len, int flags, void* addr_out
 
     if (sock->rcvbuf.available() < sizeof(RawRecvRecord)) {
         if (!socket_call_nonblock(sock, flags)) {
-            socket_defer_wait(sock, "raw_wait");
+            if (!socket_defer_wait(sock, "raw_wait")) {
+                return -ENOMEM;
+            }
         }
         return -EAGAIN;
     }

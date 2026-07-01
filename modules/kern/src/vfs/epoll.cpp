@@ -37,22 +37,21 @@ auto poll_deadline_after_ms(int timeout_ms) -> uint64_t {
     return NOW_US + TIMEOUT_US;
 }
 
-auto register_poll_waiter(File* file, uint64_t pid) -> bool {
+auto register_poll_waiter(File* file, uint64_t pid) -> int {
     if (file == nullptr) {
-        return false;
+        return 0;
     }
     if (file->fs_type == FSType::SOCKET) {
         auto* sock = static_cast<ker::net::Socket*>(file->private_data);
         if (sock == nullptr) {
-            return false;
+            return 0;
         }
-        sock->owner_pid = pid;
-        return true;
+        return ker::net::socket_register_waiter(sock, pid) ? 1 : -ENOMEM;
     }
     if (file->fops != nullptr && file->fops->vfs_poll_register_waiter != nullptr) {
-        return file->fops->vfs_poll_register_waiter(file, pid);
+        return file->fops->vfs_poll_register_waiter(file, pid) ? 1 : 0;
     }
-    return false;
+    return 0;
 }
 
 auto poll_wait_kind_for_file(File* file) -> ker::mod::sched::task::WaitChannelKind {
@@ -372,14 +371,19 @@ auto epoll_pwait(int epfd, EpollEvent* events, int maxevents, int timeout_ms) ->
                     continue;
                 }
                 auto* f = vfs_get_file_retain(task, interest.fd);
-                bool const OK = (f != nullptr) && register_poll_waiter(f, task->pid);
-                if (OK) {
+                int const REGISTERED = (f != nullptr) ? register_poll_waiter(f, task->pid) : 0;
+                if (REGISTERED > 0) {
                     poll_wait_kind = merge_poll_wait_kind(poll_wait_kind, poll_wait_kind_for_file(f));
                 }
                 if (f != nullptr) {
                     vfs_put_file(f);
                 }
-                if (!OK) {
+                if (REGISTERED < 0) {
+                    clear_poll_timeout(task);
+                    vfs_put_file(epfile);
+                    return REGISTERED;
+                }
+                if (REGISTERED == 0) {
                     can_block = false;
                     break;
                 }

@@ -81,22 +81,21 @@ auto poll_deadline_after_ms(int timeout_ms) -> uint64_t {
     return NOW_US + TIMEOUT_US;
 }
 
-auto register_poll_waiter(ker::vfs::File* file, uint64_t pid) -> bool {
+auto register_poll_waiter(ker::vfs::File* file, uint64_t pid) -> int {
     if (file == nullptr) {
-        return false;
+        return 0;
     }
     if (file->fs_type == ker::vfs::FSType::SOCKET) {
         auto* sock = static_cast<ker::net::Socket*>(file->private_data);
         if (sock == nullptr) {
-            return false;
+            return 0;
         }
-        sock->owner_pid = pid;
-        return true;
+        return ker::net::socket_register_waiter(sock, pid) ? 1 : -ENOMEM;
     }
     if (file->fops != nullptr && file->fops->vfs_poll_register_waiter != nullptr) {
-        return file->fops->vfs_poll_register_waiter(file, pid);
+        return file->fops->vfs_poll_register_waiter(file, pid) ? 1 : 0;
     }
-    return false;
+    return 0;
 }
 
 auto poll_wait_kind_for_file(ker::vfs::File* file) -> ker::mod::sched::task::WaitChannelKind {
@@ -196,29 +195,32 @@ auto scan_poll_fds(ker::mod::sched::task::Task* task, KPollFd* fds, size_t nfds)
 }
 
 auto register_poll_waiters(KPollFd* fds, size_t nfds, ker::mod::sched::task::Task* task,
-                           ker::mod::sched::task::WaitChannelKind& poll_wait_kind) -> bool {
+                           ker::mod::sched::task::WaitChannelKind& poll_wait_kind) -> int {
     bool can_block = (nfds > 0);
     if (!can_block) {
-        return false;
+        return 0;
     }
     for (size_t i = 0; i < nfds; i++) {
         if (fds[i].fd < 0) {
             continue;
         }
         auto* file = ker::vfs::vfs_get_file_retain(task, fds[i].fd);
-        bool const OK = (file != nullptr) && register_poll_waiter(file, task->pid);
-        if (OK) {
+        int const REGISTERED = (file != nullptr) ? register_poll_waiter(file, task->pid) : 0;
+        if (REGISTERED > 0) {
             poll_wait_kind = merge_poll_wait_kind(poll_wait_kind, poll_wait_kind_for_file(file));
         }
         if (file != nullptr) {
             ker::vfs::vfs_put_file(file);
         }
-        if (!OK) {
+        if (REGISTERED < 0) {
+            return REGISTERED;
+        }
+        if (REGISTERED == 0) {
             can_block = false;
             break;
         }
     }
-    return can_block;
+    return can_block ? 1 : 0;
 }
 
 auto run_poll_wait(KPollFd* fds, size_t nfds, int timeout, const char* wait_channel) -> int {
@@ -249,9 +251,13 @@ auto run_poll_wait(KPollFd* fds, size_t nfds, int timeout, const char* wait_chan
         }
 
         auto poll_wait_kind = ker::mod::sched::task::WaitChannelKind::GENERIC;
-        bool const CAN_BLOCK = register_poll_waiters(fds, nfds, task, poll_wait_kind);
+        int const CAN_BLOCK = register_poll_waiters(fds, nfds, task, poll_wait_kind);
+        if (CAN_BLOCK < 0) {
+            clear_poll_timeout(task);
+            return CAN_BLOCK;
+        }
 
-        if (CAN_BLOCK) {
+        if (CAN_BLOCK != 0) {
             drain_network_rx_work();
 
             // Re-check fds after waiter registration to close the race window

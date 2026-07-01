@@ -100,8 +100,7 @@ void wake_socket_timer(Socket* sock) {
     if (sock == nullptr) {
         return;
     }
-    uint64_t const PID = sock->owner_pid;
-    static_cast<void>(ker::mod::sched::wake_task_by_pid_from_event(PID));
+    socket_wake_waiters(sock);
 }
 
 auto ooo_ack_probe_interval_ms(uint8_t probes_sent) -> uint64_t {

@@ -157,6 +157,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/socket_nonblock_source_test.py
 )
 add_test(
+    NAME socket_waiter_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/socket_waiter_source_test.py
+)
+add_test(
     NAME tcp_deadline_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tcp_deadline_source_test.py
 )
@@ -375,6 +379,7 @@ set_tests_properties(
     netd_dns_source_test
     socket_ring_source_test
     socket_nonblock_source_test
+    socket_waiter_source_test
     tcp_deadline_source_test
     tcp_ephemeral_source_test
     tcp_fin_source_test

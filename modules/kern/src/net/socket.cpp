@@ -33,6 +33,34 @@ void ring_write_unpublished(RingBuffer* ring, const uint8_t* src, size_t len) {
     }
     ring->write_pos = (ring->write_pos + len) % ring->capacity;
 }
+
+auto socket_has_waiter_locked(Socket* sock, uint64_t pid) -> bool {
+    for (auto* waiter = sock->waiters; waiter != nullptr; waiter = waiter->next) {
+        if (waiter->pid == pid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto socket_detach_waiters(Socket* sock) -> SocketWaiter* {
+    if (sock == nullptr) {
+        return nullptr;
+    }
+    uint64_t const FLAGS = sock->lock.lock_irqsave();
+    auto* waiters = sock->waiters;
+    sock->waiters = nullptr;
+    sock->lock.unlock_irqrestore(FLAGS);
+    return waiters;
+}
+
+void socket_delete_waiters(SocketWaiter* waiters) {
+    while (waiters != nullptr) {
+        auto* next = waiters->next;
+        delete waiters;
+        waiters = next;
+    }
+}
 }  // namespace
 
 auto RingBuffer::write(const void* buf, size_t len) -> ssize_t {
@@ -150,6 +178,7 @@ void socket_destroy(Socket* sock) {
     }
 
     delete[] sock->rcvbuf.data;
+    socket_delete_waiters(socket_detach_waiters(sock));
 
     delete sock;
 }
@@ -202,24 +231,61 @@ auto socket_resize_rcvbuf(Socket* sock, size_t new_size) -> int {
     return 0;
 }
 
-void socket_defer_wait(Socket* sock, const char* wait_channel) {
-    auto* current_task = ker::mod::sched::get_current_task();
-    if (current_task == nullptr) {
-        return;
+auto socket_register_waiter(Socket* sock, uint64_t pid) -> bool {
+    if (sock == nullptr || pid == 0) {
+        return false;
     }
 
-    if (sock != nullptr) {
-        sock->owner_pid = current_task->pid;
+    uint64_t flags = sock->lock.lock_irqsave();
+    if (socket_has_waiter_locked(sock, pid)) {
+        sock->owner_pid = pid;
+        sock->lock.unlock_irqrestore(flags);
+        return true;
+    }
+    sock->lock.unlock_irqrestore(flags);
+
+    auto* waiter = new (std::nothrow) SocketWaiter{.pid = pid, .next = nullptr};
+    if (waiter == nullptr) {
+        return false;
+    }
+
+    flags = sock->lock.lock_irqsave();
+    if (socket_has_waiter_locked(sock, pid)) {
+        sock->owner_pid = pid;
+        sock->lock.unlock_irqrestore(flags);
+        delete waiter;
+        return true;
+    }
+    waiter->next = sock->waiters;
+    sock->waiters = waiter;
+    sock->owner_pid = pid;
+    sock->lock.unlock_irqrestore(flags);
+    return true;
+}
+
+auto socket_defer_wait(Socket* sock, const char* wait_channel) -> bool {
+    auto* current_task = ker::mod::sched::get_current_task();
+    if (current_task == nullptr) {
+        return false;
+    }
+
+    if (!socket_register_waiter(sock, current_task->pid)) {
+        return false;
     }
     current_task->set_wait_channel(wait_channel);
+    return true;
 }
 
 void socket_wake_waiters(Socket* sock) {
-    if (sock == nullptr || sock->owner_pid == 0) {
-        return;
+    auto* waiters = socket_detach_waiters(sock);
+    while (waiters != nullptr) {
+        auto* next = waiters->next;
+        if (waiters->pid != 0) {
+            static_cast<void>(ker::mod::sched::wake_task_by_pid_from_event(waiters->pid));
+        }
+        delete waiters;
+        waiters = next;
     }
-
-    static_cast<void>(ker::mod::sched::wake_task_by_pid_from_event(sock->owner_pid));
 }
 
 }  // namespace ker::net

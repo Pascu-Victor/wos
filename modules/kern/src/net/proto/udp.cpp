@@ -289,7 +289,9 @@ auto udp_sendto(Socket* sock, const void* buf, size_t len, int /*unused*/, const
 auto udp_recvfrom(Socket* sock, void* buf, size_t len, int flags, void* addr_raw, size_t* addr_len) -> ssize_t {
     if (sock->rcvbuf.available() < sizeof(UdpRecvRecord)) {
         if (!socket_call_nonblock(sock, flags)) {
-            socket_defer_wait(sock, "udp_wait");
+            if (!socket_defer_wait(sock, "udp_wait")) {
+                return -ENOMEM;
+            }
         }
         return -EAGAIN;
     }
