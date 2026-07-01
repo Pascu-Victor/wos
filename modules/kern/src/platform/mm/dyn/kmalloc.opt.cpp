@@ -721,6 +721,14 @@ auto checked_page_rounded_alloc_size(uint64_t payload_size, uint64_t header_size
     return true;
 }
 
+auto small_realloc_copy_size(void* ptr, uint64_t new_size) -> uint64_t {
+    size_t const OLD_SLAB_SIZE = mini_malloc::mini_get_slab_size(ptr);
+    if (OLD_SLAB_SIZE == 0 || OLD_SLAB_SIZE > SLAB_MAX_SIZE) {
+        return 0;
+    }
+    return std::min<uint64_t>(static_cast<uint64_t>(OLD_SLAB_SIZE), new_size);
+}
+
 auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
 #ifndef WOS_KMALLOC_DEBUG_INFO
     (void)caller;
@@ -1211,25 +1219,34 @@ auto realloc(void* ptr, size_t size) -> void* {
         return new_ptr;
     }
 
-    // Case 3: Current allocation is SMALL (<= 0x800) - from mini_malloc
-    // We don't know the exact old size, so we'll allocate new and copy what we can
+    // Case 3: Current allocation is SMALL (<= 0x800) - from mini_malloc.
+    // The exact requested size is not tracked, so bound copies by the slab object size.
 
     // Staying in small range?
     if (NEW_SIZE <= SLAB_MAX_SIZE) {
+        uint64_t const OLD_SIZE = small_realloc_copy_size(ptr, NEW_SIZE);
+        if (OLD_SIZE == 0) {
+            return nullptr;
+        }
+        if (NEW_SIZE <= OLD_SIZE) {
+            return ptr;
+        }
+
         void* new_ptr = malloc(NEW_SIZE);
         if (new_ptr != nullptr && new_ptr != ptr) {
-            memcpy(new_ptr, ptr, NEW_SIZE);
+            memcpy(new_ptr, ptr, OLD_SIZE);
             free(ptr);
         }
         return new_ptr;
     }
 
     // Transitioning from small to medium or large
+    uint64_t const COPY_SIZE = small_realloc_copy_size(ptr, NEW_SIZE);
+    if (COPY_SIZE == 0) {
+        return nullptr;
+    }
     void* new_ptr = malloc(NEW_SIZE);
     if (new_ptr != nullptr) {
-        // We don't know the old size, but it's at most SLAB_MAX_SIZE
-        // Copy up to newSize (safe because old allocation is at least as large as requested)
-        uint64_t const COPY_SIZE = (SLAB_MAX_SIZE < NEW_SIZE) ? SLAB_MAX_SIZE : NEW_SIZE;
         memcpy(new_ptr, ptr, COPY_SIZE);
         free(ptr);
     }

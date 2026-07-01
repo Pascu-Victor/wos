@@ -341,6 +341,44 @@ def test_allocator_size_rounding_rejects_overflow_and_overmax_requests() -> None
     require_absent(kmalloc, "NEW_SIZE + sizeof(MediumAllocationHeader) + PAGE_SIZE - 1", "kmalloc medium realloc rounding")
 
 
+def test_kmalloc_realloc_bounds_small_copy_by_old_slab_size() -> None:
+    kmalloc = KMALLOC_CPP.read_text()
+
+    copy_size_body = function_body(kmalloc, "small_realloc_copy_size")
+    require_order(
+        copy_size_body,
+        [
+            "size_t const OLD_SLAB_SIZE = mini_malloc::mini_get_slab_size(ptr)",
+            "OLD_SLAB_SIZE == 0 || OLD_SLAB_SIZE > SLAB_MAX_SIZE",
+            "return 0",
+            "return std::min<uint64_t>(static_cast<uint64_t>(OLD_SLAB_SIZE), new_size)",
+        ],
+        "small realloc copy length must come from mini_malloc slab metadata",
+    )
+
+    realloc_body = function_body(kmalloc, "realloc")
+    require_order(
+        realloc_body,
+        [
+            "uint64_t const OLD_SIZE = small_realloc_copy_size(ptr, NEW_SIZE)",
+            "if (OLD_SIZE == 0)",
+            "return nullptr",
+            "if (NEW_SIZE <= OLD_SIZE)",
+            "return ptr",
+            "void* new_ptr = malloc(NEW_SIZE)",
+            "memcpy(new_ptr, ptr, OLD_SIZE)",
+            "uint64_t const COPY_SIZE = small_realloc_copy_size(ptr, NEW_SIZE)",
+            "if (COPY_SIZE == 0)",
+            "return nullptr",
+            "void* new_ptr = malloc(NEW_SIZE)",
+            "memcpy(new_ptr, ptr, COPY_SIZE)",
+        ],
+        "small realloc must bound copies by the old slab object size",
+    )
+    require_absent(realloc_body, "memcpy(new_ptr, ptr, NEW_SIZE)", "small realloc same-tier copy")
+    require_absent(realloc_body, "(SLAB_MAX_SIZE < NEW_SIZE) ? SLAB_MAX_SIZE : NEW_SIZE", "small realloc growth copy")
+
+
 def test_live_slab_pages_are_not_reused_by_physical_allocator() -> None:
     page_alloc = PAGE_ALLOC_CPP.read_text()
     phys = PHYS_CPP.read_text()
@@ -422,6 +460,7 @@ def main() -> None:
     test_buddy_free_list_repair_rebuilds_from_flags()
     test_direct_page_free_rejects_refcounted_blocks()
     test_allocator_size_rounding_rejects_overflow_and_overmax_requests()
+    test_kmalloc_realloc_bounds_small_copy_by_old_slab_size()
     test_live_slab_pages_are_not_reused_by_physical_allocator()
     print("physical memory source invariants hold")
 
