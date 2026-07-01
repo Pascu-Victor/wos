@@ -858,6 +858,58 @@ def test_gnu_make_script_handles_native_wos_autoconf_probes() -> None:
     )
 
 
+def test_gnu_make_script_preseeds_wos_target_configure_probes() -> None:
+    source = (ROOT / "scripts" / "build" / "build_make.sh").read_text()
+    config_site_start = source.find("write_make_config_site()")
+    config_site_end = source.find("require_file \"$HOST/bin/clang\"", config_site_start)
+    if config_site_start < 0 or config_site_end < 0:
+        fail("GNU make build script must keep write_make_config_site before host-tool validation")
+    config_site = source[config_site_start:config_site_end]
+
+    require_tokens(
+        config_site,
+        [
+            "write_make_config_site()",
+            'tmp_config_site="$(mktemp "$MAKE_BUILD/config.site.XXXXXX")"',
+            "ac_cv_func_getloadavg=yes",
+            "ac_cv_func_gettimeofday='no (cross-compiling)'",
+            "ac_cv_func_mempcpy=yes",
+            "ac_cv_func_posix_spawn=yes",
+            "ac_cv_func_posix_spawnattr_setsigmask=yes",
+            "ac_cv_func_pselect=yes",
+            "ac_cv_func_strsignal=yes",
+            "ac_cv_header_spawn_h=yes",
+            "ac_cv_header_sys_wait_h=yes",
+            "ac_cv_struct_st_mtim_nsec=st_mtim.tv_nsec",
+            "make_cv_file_timestamp_hi_res=yes",
+            "make_cv_job_server=yes",
+            "make_cv_posix_spawn=yes",
+            "make_cv_synchronous_posix_spawn='no (cross-compiling)'",
+            "make_cv_sys_gnu_glob=no",
+            "make_cv_union_wait=no",
+        ],
+        "GNU make WOS target configure preseeds",
+    )
+    require_tokens(
+        source,
+        [
+            "write_make_config_site",
+            'export CONFIG_SITE="$MAKE_BUILD/config.site"',
+        ],
+        "GNU make config.site export",
+    )
+    forbidden = [
+        "ac_cv_prog_CC=",
+        "ac_cv_prog_CXX=",
+        "ac_cv_prog_CPP=",
+        "ac_cv_prog_AR=",
+        "ac_cv_path_install=",
+    ]
+    present = [token for token in forbidden if token in config_site]
+    if present:
+        fail("GNU make config.site must not pin host/tool paths: " + ", ".join(present))
+
+
 def test_bash_script_falls_back_to_target_triplet_on_native_wos() -> None:
     source = (ROOT / "scripts" / "build" / "build_bash_for_wos.sh").read_text()
     require_tokens(
@@ -1823,6 +1875,7 @@ if __name__ == "__main__":
     test_gnu_make_script_passes_build_triplet_on_wos()
     test_gnu_make_defaults_to_pipe_jobserver_on_wos()
     test_gnu_make_script_handles_native_wos_autoconf_probes()
+    test_gnu_make_script_preseeds_wos_target_configure_probes()
     test_bash_script_falls_back_to_target_triplet_on_native_wos()
     test_bash_script_handles_native_wos_autoconf_maintainer_rules()
     test_bash_script_enables_dev_fd_for_process_substitution()

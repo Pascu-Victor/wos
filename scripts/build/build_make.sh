@@ -207,6 +207,155 @@ refresh_make_build_generated_files() {
     done
 }
 
+write_make_config_site() {
+    local tmp_config_site
+
+    mkdir -p "$MAKE_BUILD"
+    tmp_config_site="$(mktemp "$MAKE_BUILD/config.site.XXXXXX")"
+    cat > "$tmp_config_site" <<'EOF'
+ac_cv_c_bigendian=no
+ac_cv_c_const=yes
+ac_cv_c_undeclared_builtin_options='none needed'
+ac_cv_dos_paths=no
+ac_cv_func_alloca_works=yes
+ac_cv_func_atexit=yes
+ac_cv_func_closedir_void=no
+ac_cv_func_dup=yes
+ac_cv_func_dup2=yes
+ac_cv_func_eaccess=no
+ac_cv_func_fdopen=yes
+ac_cv_func_fork=yes
+ac_cv_func_fork_works=yes
+ac_cv_func_getcwd=yes
+ac_cv_func_getgroups=yes
+ac_cv_func_getloadavg=yes
+ac_cv_func_getrlimit=yes
+ac_cv_func_gettimeofday='no (cross-compiling)'
+ac_cv_func_isatty=yes
+ac_cv_func_lstat=yes
+ac_cv_func_mempcpy=yes
+ac_cv_func_memrchr=yes
+ac_cv_func_mkfifo=yes
+ac_cv_func_mkstemp=yes
+ac_cv_func_mktemp=yes
+ac_cv_func_pipe=yes
+ac_cv_func_posix_spawn=yes
+ac_cv_func_posix_spawnattr_setsigmask=yes
+ac_cv_func_pselect=yes
+ac_cv_func_readlink=yes
+ac_cv_func_realpath=yes
+ac_cv_func_setegid=yes
+ac_cv_func_seteuid=yes
+ac_cv_func_setlinebuf=yes
+ac_cv_func_setregid=yes
+ac_cv_func_setreuid=yes
+ac_cv_func_setrlimit=yes
+ac_cv_func_setvbuf=yes
+ac_cv_func_sigaction=yes
+ac_cv_func_sigsetmask=no
+ac_cv_func_stpcpy=yes
+ac_cv_func_strcasecmp=yes
+ac_cv_func_strcmpi=no
+ac_cv_func_strcoll_works=no
+ac_cv_func_strdup=yes
+ac_cv_func_strerror=yes
+ac_cv_func_stricmp=no
+ac_cv_func_strncasecmp=yes
+ac_cv_func_strncmpi=no
+ac_cv_func_strndup=yes
+ac_cv_func_strnicmp=no
+ac_cv_func_strsignal=yes
+ac_cv_func_strtoll=yes
+ac_cv_func_ttyname=yes
+ac_cv_func_umask=yes
+ac_cv_func_vfork=yes
+ac_cv_func_vfork_works=yes
+ac_cv_func_wait3=yes
+ac_cv_func_waitpid=yes
+ac_cv_have_decl___sys_siglist=no
+ac_cv_have_decl__sys_siglist=no
+ac_cv_have_decl_bsd_signal=no
+ac_cv_have_decl_dlerror=yes
+ac_cv_have_decl_dlopen=yes
+ac_cv_have_decl_dlsym=yes
+ac_cv_have_decl_getloadavg=yes
+ac_cv_have_decl_sys_siglist=no
+ac_cv_header_dirent_dirent_h=yes
+ac_cv_header_fcntl_h=yes
+ac_cv_header_inttypes_h=yes
+ac_cv_header_limits_h=yes
+ac_cv_header_locale_h=yes
+ac_cv_header_memory_h=yes
+ac_cv_header_minix_config_h=no
+ac_cv_header_spawn_h=yes
+ac_cv_header_stat_broken=no
+ac_cv_header_stdbool_h=yes
+ac_cv_header_stdint_h=yes
+ac_cv_header_stdio_h=yes
+ac_cv_header_stdlib_h=yes
+ac_cv_header_string_h=yes
+ac_cv_header_strings_h=yes
+ac_cv_header_sys_file_h=yes
+ac_cv_header_sys_loadavg_h=no
+ac_cv_header_sys_param_h=yes
+ac_cv_header_sys_resource_h=yes
+ac_cv_header_sys_select_h=yes
+ac_cv_header_sys_stat_h=yes
+ac_cv_header_sys_time_h=yes
+ac_cv_header_sys_timeb_h=yes
+ac_cv_header_sys_types_h=yes
+ac_cv_header_sys_wait_h=yes
+ac_cv_header_unistd_h=yes
+ac_cv_header_vfork_h=no
+ac_cv_header_wchar_h=yes
+ac_cv_member_struct_dirent_d_type=yes
+ac_cv_safe_to_define___extensions__=yes
+ac_cv_search_clock_gettime='none required'
+ac_cv_search_getpwnam='none required'
+ac_cv_search_opendir='none required'
+ac_cv_search_strerror='none required'
+ac_cv_should_define__xopen_source=no
+ac_cv_struct_st_mtim_nsec=st_mtim.tv_nsec
+ac_cv_sys_largefile_opts='none needed'
+ac_cv_type_intmax_t=yes
+ac_cv_type_long_long_int=yes
+ac_cv_type_off_t=yes
+ac_cv_type_pid_t=yes
+ac_cv_type_sig_atomic_t=yes
+ac_cv_type_size_t=yes
+ac_cv_type_ssize_t=yes
+ac_cv_type_uid_t=yes
+ac_cv_type_uintmax_t=yes
+ac_cv_type_unsigned_long_long_int=yes
+ac_cv_working_alloca_h=yes
+am_cv_make_support_nested_variables=yes
+am_cv_prog_cc_c_o=yes
+gl_cv_c_amsterdam_compiler=no
+gl_cv_c_bool=no
+gl_cv_cc_wallow=-Wno-error
+gl_cv_compiler_check_decl_option=-Werror=implicit-function-declaration
+gl_cv_compiler_clang=yes
+gl_cv_host_cpu_c_abi=x86_64
+gl_cv_rpl_alloca=yes
+gt_cv_func_CFLocaleCopyCurrent=no
+gt_cv_func_CFPreferencesCopyAppValue=no
+make_cv_file_timestamp_hi_res=yes
+make_cv_job_server=yes
+make_cv_load=no
+make_cv_posix_spawn=yes
+make_cv_sa_restart=yes
+make_cv_synchronous_posix_spawn='no (cross-compiling)'
+make_cv_sys_gnu_glob=no
+make_cv_union_wait=no
+EOF
+
+    if [ ! -f "$MAKE_BUILD/config.site" ] || ! cmp -s "$tmp_config_site" "$MAKE_BUILD/config.site"; then
+        mv "$tmp_config_site" "$MAKE_BUILD/config.site"
+    else
+        rm -f "$tmp_config_site"
+    fi
+}
+
 require_file "$HOST/bin/clang" "Run tools/host-toolchain.sh first."
 require_file "$HOST/bin/clang++" "Run tools/host-toolchain.sh first."
 require_file "$HOST/bin/ld.lld" "Run tools/host-toolchain.sh first."
@@ -239,6 +388,8 @@ export CXXFLAGS="$GNU_MAKE_CXXFLAGS"
 export LDFLAGS="$GNU_MAKE_LDFLAGS"
 
 mkdir -p "$MAKE_BUILD" "$TARGET_SYSROOT/bin"
+write_make_config_site
+export CONFIG_SITE="$MAKE_BUILD/config.site"
 
 if [ "$HOST_SYSTEM" = "WOS" ] && { [ ! -x "$MAKE_BUILD/make" ] || [ ! -f "$MAKE_BUILD/config.status" ]; }; then
     rm -f "$MAKE_BUILD/Makefile"
