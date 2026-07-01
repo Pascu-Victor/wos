@@ -1082,6 +1082,27 @@ def test_bash_script_handles_native_wos_autoconf_maintainer_rules() -> None:
     )
 
 
+def test_bash_script_preseeds_native_wos_tool_probes() -> None:
+    source = (ROOT / "scripts" / "build" / "build_bash_for_wos.sh").read_text()
+    require_tokens(
+        source,
+        [
+            "BASH_CONFIGURE_CACHE_ARGS=()",
+            'if [ "$HOST_SYSTEM" = "WOS" ]; then',
+            '"ac_cv_path_install=/usr/bin/install -c"',
+            "ac_cv_path_mkdir=/usr/bin/mkdir",
+            "ac_cv_path_SED=/usr/bin/sed",
+            '"ac_cv_path_EGREP_TRADITIONAL=/usr/bin/grep -E"',
+            "ac_cv_path_MSGFMT=:",
+            "ac_cv_path_GMSGFMT=:",
+            "ac_cv_path_XGETTEXT=:",
+            "ac_cv_path_MSGMERGE=:",
+            '"${BASH_CONFIGURE_CACHE_ARGS[@]}"',
+        ],
+        "Bash native WOS tool-probe configure cache",
+    )
+
+
 def test_bash_script_enables_dev_fd_for_process_substitution() -> None:
     source = (ROOT / "scripts" / "build" / "build_bash_for_wos.sh").read_text()
     require_tokens(
@@ -2327,6 +2348,7 @@ if __name__ == "__main__":
     test_gnu_make_script_preseeds_wos_target_configure_probes()
     test_bash_script_falls_back_to_target_triplet_on_native_wos()
     test_bash_script_handles_native_wos_autoconf_maintainer_rules()
+    test_bash_script_preseeds_native_wos_tool_probes()
     test_bash_script_enables_dev_fd_for_process_substitution()
     test_bash_script_preseeds_wos_target_configure_probes()
     test_nasm_script_uses_release_tarball_without_self_hosted_autogen()

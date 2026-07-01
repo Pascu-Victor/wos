@@ -638,9 +638,24 @@ export CPPFLAGS="-I$TARGET_SYSROOT/include"
 export LDFLAGS="$BASH_LDFLAGS"
 export CONFIG_SITE="$BASH_BUILD/config.site"
 
+BASH_CONFIGURE_CACHE_ARGS=()
+if [ "$HOST_SYSTEM" = "WOS" ]; then
+    BASH_CONFIGURE_CACHE_ARGS=(
+        "ac_cv_path_install=/usr/bin/install -c"
+        ac_cv_path_mkdir=/usr/bin/mkdir
+        ac_cv_path_SED=/usr/bin/sed
+        "ac_cv_path_EGREP_TRADITIONAL=/usr/bin/grep -E"
+        ac_cv_path_MSGFMT=:
+        ac_cv_path_GMSGFMT=:
+        ac_cv_path_XGETTEXT=:
+        ac_cv_path_MSGMERGE=:
+    )
+fi
+
 wos_timed_step "configure" "bash" \
     wos_run_in_dir "$BASH_WORK" \
     ./configure \
+    "${BASH_CONFIGURE_CACHE_ARGS[@]}" \
     --build="$BUILD_TRIPLE" \
     --host="$TARGET_ARCH" \
     --prefix=/usr \
