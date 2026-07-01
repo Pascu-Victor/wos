@@ -283,6 +283,12 @@ struct LoadAverageSnapshot {
     uint64_t load15_milli;
     uint32_t runnable_tasks;
     uint32_t uninterruptible_tasks;
+    uint32_t active_for_load_tasks;
+    uint32_t runnable_queue_tasks;
+    uint32_t runnable_voluntary_tasks;
+    uint32_t waiting_tasks;
+    uint32_t dead_or_exiting_tasks;
+    uint32_t ptrace_stopped_tasks;
     uint32_t total_tasks;
     uint64_t last_pid;
 };

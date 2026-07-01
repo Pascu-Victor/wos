@@ -6883,6 +6883,11 @@ auto get_load_average_snapshot() -> LoadAverageSnapshot {
     uint32_t runnable = 0;
     uint32_t uninterruptible = 0;
     uint32_t active_for_load = 0;
+    uint32_t runnable_queue = 0;
+    uint32_t runnable_voluntary = 0;
+    uint32_t waiting = 0;
+    uint32_t dead_or_exiting = 0;
+    uint32_t ptrace_stopped = 0;
     uint64_t last_pid = 0;
 
     {
@@ -6896,8 +6901,21 @@ auto get_load_average_snapshot() -> LoadAverageSnapshot {
             last_pid = std::max<uint64_t>(last_pid, task->pid);
             auto const TASK_STATE = task->state.load(std::memory_order_acquire);
             bool const DEAD = TASK_STATE == task::TaskState::DEAD || TASK_STATE == task::TaskState::EXITING || task->has_exited;
-            if (DEAD || task->ptrace_stopped) {
+            if (DEAD) {
+                dead_or_exiting++;
                 continue;
+            }
+            if (task->ptrace_stopped) {
+                ptrace_stopped++;
+                continue;
+            }
+            if (task->sched_queue == task::Task::sched_queue::RUNNABLE) {
+                runnable_queue++;
+                if (task->is_voluntary_blocked()) {
+                    runnable_voluntary++;
+                }
+            } else if (task->sched_queue == task::Task::sched_queue::WAITING) {
+                waiting++;
             }
             bool const IS_RUNNABLE = loadavg_task_is_runnable(task);
             bool const IS_UNINTERRUPTIBLE = loadavg_wait_channel_counts_as_uninterruptible(task);
@@ -6940,6 +6958,12 @@ auto get_load_average_snapshot() -> LoadAverageSnapshot {
     snapshot.load15_milli = load15_milli;
     snapshot.runnable_tasks = runnable;
     snapshot.uninterruptible_tasks = uninterruptible;
+    snapshot.active_for_load_tasks = active_for_load;
+    snapshot.runnable_queue_tasks = runnable_queue;
+    snapshot.runnable_voluntary_tasks = runnable_voluntary;
+    snapshot.waiting_tasks = waiting;
+    snapshot.dead_or_exiting_tasks = dead_or_exiting;
+    snapshot.ptrace_stopped_tasks = ptrace_stopped;
     snapshot.total_tasks = total;
     snapshot.last_pid = last_pid;
     load_average_lock.unlock_irqrestore(FLAGS);

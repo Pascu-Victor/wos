@@ -3885,6 +3885,23 @@ auto generate_kcpustate(char* buf, size_t bufsz) -> size_t {
         cpu_count = 1;
     }
 
+    auto const LOAD = ker::mod::sched::get_load_average_snapshot();
+    append_sconst(p, end, "loadavg_state");
+    append_memacc_dec(p, end, "load1_milli", LOAD.load1_milli);
+    append_memacc_dec(p, end, "load5_milli", LOAD.load5_milli);
+    append_memacc_dec(p, end, "load15_milli", LOAD.load15_milli);
+    append_memacc_dec(p, end, "active", LOAD.active_for_load_tasks);
+    append_memacc_dec(p, end, "runnable", LOAD.runnable_tasks);
+    append_memacc_dec(p, end, "uninterruptible", LOAD.uninterruptible_tasks);
+    append_memacc_dec(p, end, "runq", LOAD.runnable_queue_tasks);
+    append_memacc_dec(p, end, "runq_voluntary", LOAD.runnable_voluntary_tasks);
+    append_memacc_dec(p, end, "waiting", LOAD.waiting_tasks);
+    append_memacc_dec(p, end, "dead", LOAD.dead_or_exiting_tasks);
+    append_memacc_dec(p, end, "ptrace_stopped", LOAD.ptrace_stopped_tasks);
+    append_memacc_dec(p, end, "total", LOAD.total_tasks);
+    append_memacc_dec(p, end, "last_pid", LOAD.last_pid);
+    append_char(p, end, '\n');
+
     for (uint64_t c = 0; c < cpu_count; ++c) {
         auto state = ker::mod::sched::get_scheduler_cpu_state(c);
         append_sconst(p, end, "cpu_state");

@@ -1021,11 +1021,24 @@ def test_cpu_accounting_snapshot_projects_live_current_runtime() -> None:
 
 def test_loadavg_does_not_count_interruptible_wait_channels() -> None:
     source = SCHEDULER_CPP.read_text()
+    sched_header = SCHEDULER_HPP.read_text()
     ktest_source = SCHEDULER_KTEST.read_text()
     runnable_body = function_body(source, "loadavg_task_is_runnable")
     blocked_body = function_body(source, "loadavg_wait_channel_counts_as_uninterruptible")
     snapshot_body = function_body(source, "get_load_average_snapshot")
 
+    require_tokens(
+        sched_header,
+        [
+            "uint32_t active_for_load_tasks;",
+            "uint32_t runnable_queue_tasks;",
+            "uint32_t runnable_voluntary_tasks;",
+            "uint32_t waiting_tasks;",
+            "uint32_t dead_or_exiting_tasks;",
+            "uint32_t ptrace_stopped_tasks;",
+        ],
+        "loadavg diagnostic snapshot fields",
+    )
     require_tokens(
         runnable_body,
         [
@@ -1053,6 +1066,12 @@ def test_loadavg_does_not_count_interruptible_wait_channels() -> None:
             "loadavg_task_is_runnable(task)",
             "loadavg_wait_channel_counts_as_uninterruptible(task)",
             "if (IS_RUNNABLE || IS_UNINTERRUPTIBLE)",
+            "snapshot.active_for_load_tasks = active_for_load;",
+            "snapshot.runnable_queue_tasks = runnable_queue;",
+            "snapshot.runnable_voluntary_tasks = runnable_voluntary;",
+            "snapshot.waiting_tasks = waiting;",
+            "snapshot.dead_or_exiting_tasks = dead_or_exiting;",
+            "snapshot.ptrace_stopped_tasks = ptrace_stopped;",
         ],
         "loadavg snapshot must use explicit classifiers",
     )
@@ -1104,6 +1123,18 @@ def test_procfs_exposes_scheduler_cpu_state_snapshot() -> None:
     require_tokens(
         body,
         [
+            "ker::mod::sched::get_load_average_snapshot()",
+            "loadavg_state",
+            '"load1_milli"',
+            '"active"',
+            '"runnable"',
+            '"uninterruptible"',
+            '"runq"',
+            '"runq_voluntary"',
+            '"waiting"',
+            '"dead"',
+            '"ptrace_stopped"',
+            '"total"',
             "ker::mod::sched::get_scheduler_cpu_state(c)",
             "cpu_state",
             '"idle"',
