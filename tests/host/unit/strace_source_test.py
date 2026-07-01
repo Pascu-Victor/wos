@@ -44,6 +44,15 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
         fail(f"{context}: missing {', '.join(missing)}")
 
 
+def require_order(source: str, tokens: list[str], context: str) -> None:
+    cursor = 0
+    for token in tokens:
+        pos = source.find(token, cursor)
+        if pos < 0:
+            fail(f"{context}: missing ordered token {token}")
+        cursor = pos + len(token)
+
+
 def test_strace_startup_wait_is_deadline_bounded() -> None:
     source = read_strace_sources()
     require_tokens(
@@ -114,6 +123,36 @@ def test_strace_startup_wait_is_deadline_bounded() -> None:
     )
 
 
+def test_strace_proxy_startup_cleanup_reaps_tracee() -> None:
+    source = read_strace_sources()
+    command_body = function_body(source, "trace_command")
+    require_order(
+        command_body,
+        [
+            "if (target_is_proxy(static_cast<uint64_t>(CHILD)))",
+            'std::println(stderr, "strace: tracee became a WKI proxy before syscall tracing could start")',
+            "reap_tracee_after_startup_failure(CHILD)",
+            "return 1",
+        ],
+        "strace command proxy startup cleanup",
+    )
+
+
+def test_strace_tracee_is_pinned_local_before_startup_stop() -> None:
+    source = read_strace_sources()
+    launch_body = function_body(source, "launch_tracee")
+    require_order(
+        launch_body,
+        [
+            "ptrace_call(ker::abi::ptrace::request::TRACEME, 0, 0, 0)",
+            "ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_LOCAL | ker::process::WKI_TARGET_FLAG_NOINHERIT)",
+            "kill(getpid(), SIGSTOP)",
+            "execvp(argv[0], argv)",
+        ],
+        "strace command tracee local pin before startup stop",
+    )
+
+
 def test_strace_trace_loop_uses_ptrace_syscall_wait() -> None:
     source = read_strace_sources()
     trace_body = function_body(source, "trace_loop")
@@ -149,6 +188,8 @@ def test_strace_names_process_priority_syscalls() -> None:
 
 def main() -> None:
     test_strace_startup_wait_is_deadline_bounded()
+    test_strace_proxy_startup_cleanup_reaps_tracee()
+    test_strace_tracee_is_pinned_local_before_startup_stop()
     test_strace_trace_loop_uses_ptrace_syscall_wait()
     test_strace_names_process_priority_syscalls()
     print("strace startup waits are deadline bounded")

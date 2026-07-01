@@ -300,6 +300,7 @@ auto trace_command(char** argv, const TraceOptions& options) -> int {
     }
     if (target_is_proxy(static_cast<uint64_t>(CHILD))) {
         std::println(stderr, "strace: tracee became a WKI proxy before syscall tracing could start");
+        reap_tracee_after_startup_failure(CHILD);
         return 1;
     }
     return trace_loop(static_cast<uint64_t>(CHILD), options, true);
