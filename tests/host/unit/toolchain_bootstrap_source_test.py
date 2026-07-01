@@ -980,6 +980,63 @@ def test_cpython_script_uses_target_build_triplet_on_native_wos() -> None:
     )
 
 
+def test_cpython_target_configure_preseeds_wos_runtime_probes() -> None:
+    source = WOS_PYTHON_BUILD.read_text()
+    config_site_start = source.find("write_config_site()")
+    config_site_end = source.find("write_libressl_sigalgs_compat_header()", config_site_start)
+    if config_site_start < 0 or config_site_end < 0:
+        fail("CPython WOS build script must keep write_config_site before LibreSSL compatibility setup")
+    config_site = source[config_site_start:config_site_end]
+
+    require_tokens(
+        config_site,
+        [
+            "ac_cv_file__dev_ptmx=no",
+            "ac_cv_func_getrandom=no",
+            "ac_cv_have_decl_PR_SET_VMA_ANON_NAME=no",
+            "ac_cv_pthread_is_default=no",
+            "ac_cv_kpthread=no",
+            "ac_cv_kthread=no",
+            "ac_cv_pthread=no",
+            "ac_cv_cxx_thread=no",
+            "ac_cv_pthread_system_supported=no",
+            "ac_cv_posix_semaphores_enabled=yes",
+            "ac_cv_broken_sem_getvalue=yes",
+            "ac_cv_aligned_required=yes",
+            "ac_cv_wchar_t_signed=yes",
+            "ac_cv_rshift_extends_sign=yes",
+            "ac_cv_computed_gotos=no",
+            "ac_cv_broken_nice=no",
+            "ac_cv_broken_poll=no",
+            "ac_cv_working_tzset=no",
+            "ac_cv_broken_mbstowcs=no",
+            "ac_cv_have_chflags=no",
+            "ac_cv_have_lchflags=no",
+        ],
+        "CPython target configure WOS runtime probe preseeds",
+    )
+    require_tokens(
+        config_site,
+        [
+            "ac_cv_sizeof_int=4",
+            "ac_cv_sizeof_long=8",
+            "ac_cv_sizeof_long_long=8",
+            "ac_cv_sizeof_void_p=8",
+            "ac_cv_sizeof_size_t=8",
+            "ac_cv_sizeof_off_t=8",
+            "ac_cv_sizeof_time_t=8",
+            "ac_cv_sizeof_pthread_t=8",
+            "ac_cv_sizeof_pthread_key_t=8",
+            "ac_cv_sizeof_uintptr_t=8",
+            "ac_cv_alignof_long=8",
+            "ac_cv_alignof_size_t=8",
+            "ac_cv_alignof_max_align_t=16",
+            "ac_cv_pthread_key_t_is_arithmetic_type=no",
+        ],
+        "CPython target configure WOS ABI size preseeds",
+    )
+
+
 def test_cpython_selfhost_uses_existing_build_python_when_available() -> None:
     source = WOS_PYTHON_BUILD.read_text()
     require_tokens(
@@ -1700,6 +1757,7 @@ if __name__ == "__main__":
     test_bash_script_enables_dev_fd_for_process_substitution()
     test_nasm_script_uses_release_tarball_without_self_hosted_autogen()
     test_cpython_script_uses_target_build_triplet_on_native_wos()
+    test_cpython_target_configure_preseeds_wos_runtime_probes()
     test_cpython_selfhost_uses_existing_build_python_when_available()
     test_cpython_install_avoids_sysroot_usr_symlink()
     test_native_wos_bootstrap_keeps_host_toolchain_shim_discoverable()
