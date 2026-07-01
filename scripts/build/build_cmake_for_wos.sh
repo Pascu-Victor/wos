@@ -124,6 +124,7 @@ wos_timed_step "configure" "cmake_for_wos" \
     -DCMake_HAVE_CXX_MAKE_UNIQUE=TRUE \
     -DCMake_HAVE_CXX_UNIQUE_PTR=1 \
     -DCMake_HAVE_CXX_FILESYSTEM=TRUE \
+    -DCMake_BUILD_PCH=ON \
     -DCMAKE_HAVE_LIBC_PTHREAD=1 \
     -DHAVE_UNSETENV=1 \
     -DHAVE_ENVIRON_NOT_REQUIRE_PROTOTYPE=0 \
