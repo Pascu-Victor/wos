@@ -9,6 +9,7 @@
 #include <cstring>
 #include <vector>
 
+#include "abi/callnums/vmem.h"
 #include "debug_info.hpp"
 #include "platform/asm/cpu.hpp"
 #include "platform/dbg/dbg.hpp"
@@ -109,6 +110,91 @@ auto loader_pt_load_op(uint64_t base_address) -> mod::perf::WkiPerfLocalLoaderOp
 
 auto loader_final_perms_op(uint64_t base_address) -> mod::perf::WkiPerfLocalLoaderOp {
     return base_address == 0 ? mod::perf::WkiPerfLocalLoaderOp::FINAL_PERMS_MAIN : mod::perf::WkiPerfLocalLoaderOp::FINAL_PERMS_INTERP;
+}
+
+auto prot_for_program_header(const Elf64_Phdr* program_header) -> uint64_t {
+    uint64_t prot = ker::abi::vmem::PROT_READ;
+    if ((program_header->p_flags & PF_W) != 0U) {
+        prot |= ker::abi::vmem::PROT_WRITE;
+    }
+    if ((program_header->p_flags & PF_X) != 0U) {
+        prot |= ker::abi::vmem::PROT_EXEC;
+    }
+    return prot;
+}
+
+auto append_lazy_load_range(ElfLazyLoadRangeVec* ranges, const ElfLazyLoadRange& range) -> bool {
+    if (ranges == nullptr || range.size == 0) {
+        return false;
+    }
+
+    if (!ranges->empty()) {
+        auto& last = ranges->at(ranges->size() - 1);
+        if (last.vaddr + last.size == range.vaddr && last.file_offset + last.size == range.file_offset && last.prot == range.prot &&
+            last.flags == range.flags) {
+            last.size += range.size;
+            return true;
+        }
+    }
+
+    return ranges->push_back(range);
+}
+
+auto lazy_load_page_range(const Elf64_Phdr* program_header, uint64_t page_no, uint64_t base_offset, ElfLazyLoadRange& out) -> bool {
+    if (program_header == nullptr || program_header->p_type != PT_LOAD || (program_header->p_flags & PF_W) != 0U ||
+        program_header->p_filesz == 0 || program_header->p_memsz < program_header->p_filesz) {
+        return false;
+    }
+    if (page_no == 0) {
+        return false;
+    }
+
+    uint64_t const SEG_START_VA = program_header->p_vaddr + base_offset;
+    uint64_t const FIRST_PAGE_OFFSET = SEG_START_VA & (mod::mm::virt::PAGE_SIZE - 1);
+    uint64_t const ALIGNED_START_VA = SEG_START_VA & ~(mod::mm::virt::PAGE_SIZE - 1);
+    uint64_t const PAGE_VA = ALIGNED_START_VA + (page_no * mod::mm::virt::PAGE_SIZE);
+    uint64_t const DST_IN_PAGE = (page_no == 0) ? FIRST_PAGE_OFFSET : 0;
+    uint64_t const ROOM_IN_PAGE = mod::mm::virt::PAGE_SIZE - DST_IN_PAGE;
+
+    uint64_t bytes_before_this_page = 0;
+    if (page_no != 0) {
+        bytes_before_this_page = (mod::mm::virt::PAGE_SIZE - FIRST_PAGE_OFFSET) + ((page_no - 1) * mod::mm::virt::PAGE_SIZE);
+    }
+    if (bytes_before_this_page >= program_header->p_filesz) {
+        return false;
+    }
+
+    uint64_t const REMAINING_IN_FILE = program_header->p_filesz - bytes_before_this_page;
+    uint64_t const COPY_SIZE = REMAINING_IN_FILE < ROOM_IN_PAGE ? REMAINING_IN_FILE : ROOM_IN_PAGE;
+    if (DST_IN_PAGE != 0 || COPY_SIZE != mod::mm::virt::PAGE_SIZE) {
+        return false;
+    }
+    if (program_header->p_offset > UINT64_MAX - bytes_before_this_page) {
+        return false;
+    }
+
+    out = {.vaddr = PAGE_VA,
+           .size = mod::mm::virt::PAGE_SIZE,
+           .prot = prot_for_program_header(program_header),
+           .flags = ker::abi::vmem::MAP_PRIVATE,
+           .file_offset = program_header->p_offset + bytes_before_this_page};
+    return true;
+}
+
+auto pt_load_page_overlaps_other_segment(const ElfFile& elf, const Elf64_Phdr* owner, uint64_t page_vaddr) -> bool {
+    uint64_t const PAGE_END = page_vaddr + mod::mm::virt::PAGE_SIZE;
+    for (Elf64_Half i = 0; i < elf.elf_head.e_phnum; ++i) {
+        auto* ph = program_header_at(elf, i);
+        if (ph == owner || ph->p_type != PT_LOAD || ph->p_memsz == 0) {
+            continue;
+        }
+        uint64_t const START = (ph->p_vaddr + elf.load_base) & ~(mod::mm::virt::PAGE_SIZE - 1);
+        uint64_t const END = (ph->p_vaddr + elf.load_base + ph->p_memsz + mod::mm::virt::PAGE_SIZE - 1) & ~(mod::mm::virt::PAGE_SIZE - 1);
+        if (page_vaddr < END && PAGE_END > START) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void record_loader_event(uint64_t pid, mod::perf::WkiPerfLocalLoaderOp op, uint64_t pages, uint16_t detail, int32_t status,
@@ -797,17 +883,29 @@ void load_section_headers(const ElfFile& elf, ker::mod::mm::virt::PageTable* pag
 
 auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name, bool register_special_symbols,
               uint64_t base_address) -> ElfLoadResult {
+    ElfLoadOptions const OPTIONS{
+        .register_special_symbols = register_special_symbols,
+        .base_address = base_address,
+        .lazy_file_ranges = nullptr,
+    };
+    return load_elf(elf, pagemap, pid, process_name, OPTIONS);
+}
+
+auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name, const ElfLoadOptions& options)
+    -> ElfLoadResult {
     // Validate input pointer
     if (elf == nullptr) {
         mod::dbg::log("ERROR: loadElf called with null ELF pointer (pid=%d)", pid);
         return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0};
     }
+    bool const REGISTER_SPECIAL_SYMBOLS = options.register_special_symbols;
+    uint64_t const BASE_ADDRESS = options.base_address;
 
     ElfFile elf_file = parse_elf(reinterpret_cast<uint8_t*>(elf));
 
     // Apply explicit base address (used when loading ld.so at a non-zero base)
-    if (base_address != 0) {
-        elf_file.load_base = base_address;
+    if (BASE_ADDRESS != 0) {
+        elf_file.load_base = BASE_ADDRESS;
     }
 
     if (!header_is_valid(elf_file.elf_head)) {
@@ -845,13 +943,23 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
     uint64_t elf_header_vaddr = 0;
     uint64_t program_headers_vaddr = 0;
 
-    if (base_address == 0 && elf_file.elf_head.e_type == ET_DYN) {
+    bool has_dynamic_interp = false;
+    for (Elf64_Half i = 0; i < elf_file.elf_head.e_phnum; i++) {
+        auto* ph = program_header_at(elf_file, i);
+        if (ph->p_type == PT_INTERP) {
+            has_dynamic_interp = true;
+            break;
+        }
+    }
+    bool const ENABLE_LAZY_FILE_RANGES = options.lazy_file_ranges != nullptr && (has_dynamic_interp || BASE_ADDRESS != 0);
+
+    if (BASE_ADDRESS == 0 && elf_file.elf_head.e_type == ET_DYN) {
         // PIE executable: PHDRs already at loadBase + e_phoff via PT_LOAD mapping.
         // PT_PHDR.p_vaddr matches e_phoff, so ld.so computes baseAddress = AT_PHDR - p_vaddr = 0.
         elf_header_vaddr = elf_file.load_base;
         program_headers_vaddr = elf_file.load_base + elf_file.elf_head.e_phoff;
         debug::set_program_headers(pid, ptr_from_addr<Elf64_Phdr>(program_headers_vaddr), program_headers_vaddr, elf_file.elf_head.e_phnum);
-    } else if (base_address == 0) {
+    } else if (BASE_ADDRESS == 0) {
         // Non-PIE (ET_EXEC): copy headers to 0x1000 (no PT_LOAD overlap at low addresses)
         constexpr uint64_t HEADER_COPY_VADDR = 0x1000;
         constexpr uint64_t PROGRAM_HEADERS_OFFSET_IN_HEADER = sizeof(Elf64_Ehdr);
@@ -961,6 +1069,15 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
                     mod::mm::virt::PageMapBatch map_batch{};
                     mod::mm::virt::init_page_map_batch(&map_batch, pagemap, page_flags_for_program_header(current_header));
                     for (uint64_t j = 0; j < NUM_PAGES; j++) {
+                        if (ENABLE_LAZY_FILE_RANGES) {
+                            ElfLazyLoadRange lazy_range{};
+                            if (lazy_load_page_range(current_header, j, elf_file.load_base, lazy_range) &&
+                                !pt_load_page_overlaps_other_segment(elf_file, current_header, lazy_range.vaddr) &&
+                                !mod::mm::virt::is_page_mapped(pagemap, lazy_range.vaddr) &&
+                                append_lazy_load_range(options.lazy_file_ranges, lazy_range)) {
+                                continue;
+                            }
+                        }
                         LoadSegmentPageStats const PAGE_STATS =
                             load_segment(elf_file.base, pagemap, current_header, j, elf_file.load_base, &map_batch);
                         if (!PAGE_STATS.mapped) {
@@ -974,7 +1091,7 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
                         bytes_copied += PAGE_STATS.bytes_copied;
                     }
                     mod::mm::virt::flush_page_map_batch(&map_batch);
-                    record_loader_event(pid, loader_pt_load_op(base_address), NUM_PAGES, static_cast<uint16_t>(i),
+                    record_loader_event(pid, loader_pt_load_op(BASE_ADDRESS), NUM_PAGES, static_cast<uint16_t>(i),
                                         pack_loader_page_counts(allocated_pages, already_mapped_pages),
                                         perf_elapsed_since(SEGMENT_STARTED_US), current_header->p_vaddr + elf_file.load_base, bytes_copied);
                 }
@@ -1056,14 +1173,6 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
     // Dynamically-linked ones (PT_INTERP present) have their relocations
     // handled by the dynamic linker (ld.so).
     // ld.so itself (loaded with non-zero loadBase) handles its own via relocateSelf().
-    bool has_dynamic_interp = false;
-    for (Elf64_Half i = 0; i < elf_file.elf_head.e_phnum; i++) {
-        auto* ph = program_header_at(elf_file, i);
-        if (ph->p_type == PT_INTERP) {
-            has_dynamic_interp = true;
-            break;
-        }
-    }
     bool const SKIP_RELOCATIONS = has_dynamic_interp || elf_file.load_base != 0;
     if (!SKIP_RELOCATIONS) {
         process_relocations(elf_file, pagemap);
@@ -1099,6 +1208,9 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
                 uint64_t const END = (ph->p_vaddr + ph->p_memsz + mod::mm::virt::PAGE_SIZE - 1) & ~(mod::mm::virt::PAGE_SIZE - 1);
 
                 for (uint64_t va = START; va < END; va += mod::mm::virt::PAGE_SIZE) {
+                    if (!mod::mm::virt::is_page_mapped(pagemap, va)) {
+                        continue;
+                    }
                     // In pass 1 (read-only), check if page is already writable and skip it
                     if (pass == 1) {
                         uint64_t const PADDR = mod::mm::virt::translate(pagemap, va);
@@ -1139,7 +1251,7 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
             }
         }
     }
-    record_loader_event(pid, loader_final_perms_op(base_address), final_perm_pages, 0, 0, perf_elapsed_since(FINAL_PERMS_STARTED_US),
+    record_loader_event(pid, loader_final_perms_op(BASE_ADDRESS), final_perm_pages, 0, 0, perf_elapsed_since(FINAL_PERMS_STARTED_US),
                         WOS_PERF_CALLSITE(), final_perm_pages * mod::mm::virt::PAGE_SIZE);
 
     // Enforce RELRO after relocations: PT_GNU_RELRO pages become read-only.
@@ -1197,7 +1309,7 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
         }
     }  // !skipRelocations
 
-    (void)register_special_symbols;
+    (void)REGISTER_SPECIAL_SYMBOLS;
 
 // Print debug info for verification
 #ifdef ELF_DEBUG

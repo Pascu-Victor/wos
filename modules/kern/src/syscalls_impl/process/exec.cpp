@@ -53,6 +53,9 @@ constexpr int MAX_SHEBANG_DEPTH = 4;
 constexpr size_t EXEC_PATH_MAX = 512;
 using exec_log = ker::mod::dbg::logger<"exec">;
 using FdSnapshot = std::array<uint64_t, ker::mod::sched::task::Task::FD_TABLE_SIZE>;
+using LazyVmemKind = ker::mod::sched::task::LazyVmemKind;
+using LazyVmemRange = ker::mod::sched::task::LazyVmemRange;
+using LazyVmemRangeVec = ker::mod::sched::task::LazyVmemRangeVec;
 
 #ifdef WOS_SELFTEST
 std::atomic<bool> g_exec_selftest_force_fd_clone_insert_failure{false};
@@ -366,6 +369,157 @@ auto exec_table_size(uint64_t count, uint64_t entry_size, uint64_t& out) -> bool
 }
 
 auto read_file_range_fully(int fd, uint8_t* dst, size_t file_size, uint64_t offset, uint64_t size, const char* path, size_t& bytes_read)
+    -> int;
+
+auto exec_lazy_file_page_range(const Elf64_Phdr& ph, uint64_t page_no, uint64_t& file_offset_out, uint64_t& vaddr_out) -> bool {
+    if (ph.p_type != PT_LOAD || (ph.p_flags & PF_W) != 0U || ph.p_filesz == 0 || ph.p_memsz < ph.p_filesz || page_no == 0) {
+        return false;
+    }
+
+    uint64_t const FIRST_PAGE_OFFSET = ph.p_vaddr & (ker::mod::mm::virt::PAGE_SIZE - 1);
+    uint64_t const ALIGNED_START_VA = ph.p_vaddr & ~(ker::mod::mm::virt::PAGE_SIZE - 1);
+    uint64_t const PAGE_VA = ALIGNED_START_VA + (page_no * ker::mod::mm::virt::PAGE_SIZE);
+    uint64_t const DST_IN_PAGE = (page_no == 0) ? FIRST_PAGE_OFFSET : 0;
+    uint64_t const ROOM_IN_PAGE = ker::mod::mm::virt::PAGE_SIZE - DST_IN_PAGE;
+
+    uint64_t bytes_before_this_page = 0;
+    if (page_no != 0) {
+        bytes_before_this_page = (ker::mod::mm::virt::PAGE_SIZE - FIRST_PAGE_OFFSET) + ((page_no - 1) * ker::mod::mm::virt::PAGE_SIZE);
+    }
+    if (bytes_before_this_page >= ph.p_filesz) {
+        return false;
+    }
+
+    uint64_t const REMAINING_IN_FILE = ph.p_filesz - bytes_before_this_page;
+    uint64_t const COPY_SIZE = REMAINING_IN_FILE < ROOM_IN_PAGE ? REMAINING_IN_FILE : ROOM_IN_PAGE;
+    if (DST_IN_PAGE != 0 || COPY_SIZE != ker::mod::mm::virt::PAGE_SIZE || ph.p_offset > UINT64_MAX - bytes_before_this_page) {
+        return false;
+    }
+
+    file_offset_out = ph.p_offset + bytes_before_this_page;
+    vaddr_out = PAGE_VA;
+    return true;
+}
+
+auto exec_pt_load_page_overlaps_other_segment(const Elf64_Phdr* program_headers, Elf64_Half count, Elf64_Half owner_index,
+                                              uint64_t page_vaddr) -> bool {
+    if (program_headers == nullptr) {
+        return false;
+    }
+    uint64_t const PAGE_END = page_vaddr + ker::mod::mm::virt::PAGE_SIZE;
+    for (Elf64_Half i = 0; i < count; ++i) {
+        const Elf64_Phdr& ph = program_headers[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        if (i == owner_index || ph.p_type != PT_LOAD || ph.p_memsz == 0) {
+            continue;
+        }
+        uint64_t const START = ph.p_vaddr & ~(ker::mod::mm::virt::PAGE_SIZE - 1);
+        uint64_t const END = (ph.p_vaddr + ph.p_memsz + ker::mod::mm::virt::PAGE_SIZE - 1) & ~(ker::mod::mm::virt::PAGE_SIZE - 1);
+        if (page_vaddr < END && PAGE_END > START) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto read_exec_load_segment_for_loader(int fd, uint8_t* dst, size_t file_size, const Elf64_Phdr& ph, const Elf64_Phdr* program_headers,
+                                       Elf64_Half ph_count, Elf64_Half ph_index, const char* path, bool allow_lazy_file_pages,
+                                       size_t& bytes_read) -> int {
+    if (!allow_lazy_file_pages || ph.p_type != PT_LOAD || (ph.p_flags & PF_W) != 0U || ph.p_filesz == 0 || ph.p_memsz < ph.p_filesz) {
+        return read_file_range_fully(fd, dst, file_size, ph.p_offset, ph.p_filesz, path, bytes_read);
+    }
+
+    uint64_t const SEG_END = ph.p_vaddr + ph.p_memsz;
+    uint64_t const START_PAGE_ADDR = ph.p_vaddr & ~(ker::mod::mm::virt::PAGE_SIZE - 1);
+    uint64_t const END_PAGE_ADDR = (SEG_END + ker::mod::mm::virt::PAGE_SIZE - 1) & ~(ker::mod::mm::virt::PAGE_SIZE - 1);
+    size_t const NUM_PAGES = (END_PAGE_ADDR - START_PAGE_ADDR) / ker::mod::mm::virt::PAGE_SIZE;
+    uint64_t const FIRST_PAGE_OFFSET = ph.p_vaddr & (ker::mod::mm::virt::PAGE_SIZE - 1);
+
+    for (uint64_t page_no = 0; page_no < NUM_PAGES; ++page_no) {
+        uint64_t bytes_before_this_page = 0;
+        if (page_no != 0) {
+            bytes_before_this_page = (ker::mod::mm::virt::PAGE_SIZE - FIRST_PAGE_OFFSET) + ((page_no - 1) * ker::mod::mm::virt::PAGE_SIZE);
+        }
+        if (bytes_before_this_page >= ph.p_filesz) {
+            continue;
+        }
+
+        uint64_t const DST_IN_PAGE = (page_no == 0) ? FIRST_PAGE_OFFSET : 0;
+        uint64_t const ROOM_IN_PAGE = ker::mod::mm::virt::PAGE_SIZE - DST_IN_PAGE;
+        uint64_t const REMAINING_IN_FILE = ph.p_filesz - bytes_before_this_page;
+        uint64_t const COPY_SIZE = REMAINING_IN_FILE < ROOM_IN_PAGE ? REMAINING_IN_FILE : ROOM_IN_PAGE;
+        uint64_t lazy_file_offset = 0;
+        uint64_t lazy_vaddr = 0;
+        if (exec_lazy_file_page_range(ph, page_no, lazy_file_offset, lazy_vaddr) &&
+            !exec_pt_load_page_overlaps_other_segment(program_headers, ph_count, ph_index, lazy_vaddr)) {
+            continue;
+        }
+
+        if (ph.p_offset > UINT64_MAX - bytes_before_this_page) {
+            return -EINVAL;
+        }
+        int const RET = read_file_range_fully(fd, dst, file_size, ph.p_offset + bytes_before_this_page, COPY_SIZE, path, bytes_read);
+        if (RET < 0) {
+            return RET;
+        }
+    }
+    return 0;
+}
+
+void release_lazy_file_refs(LazyVmemRangeVec& ranges) {
+    for (const auto& range : ranges) {
+        if (range.kind == LazyVmemKind::FILE_BACKED && range.file != nullptr) {
+            vfs::vfs_put_file(range.file);
+        }
+    }
+    ranges.clear();
+}
+
+auto append_exec_lazy_file_ranges(LazyVmemRangeVec& out, const loader::elf::ElfLazyLoadRangeVec& loader_ranges, vfs::File* file,
+                                  const vfs::Stat& st) -> bool {
+    if (file == nullptr) {
+        return loader_ranges.empty();
+    }
+    for (const auto& loader_range : loader_ranges) {
+        if (loader_range.size == 0 || loader_range.vaddr > UINT64_MAX - loader_range.size) {
+            return false;
+        }
+        LazyVmemRange const RANGE{.start = loader_range.vaddr,
+                                  .end = loader_range.vaddr + loader_range.size,
+                                  .prot = loader_range.prot,
+                                  .flags = loader_range.flags,
+                                  .kind = LazyVmemKind::FILE_BACKED,
+                                  .file = file,
+                                  .file_offset = loader_range.file_offset,
+                                  .file_dev = st.st_dev,
+                                  .file_ino = st.st_ino,
+                                  .file_size = st.st_size > 0 ? static_cast<uint64_t>(st.st_size) : 0,
+                                  .file_mtime_sec = st.st_mtim.tv_sec,
+                                  .file_mtime_nsec = st.st_mtim.tv_nsec,
+                                  .file_ctime_sec = st.st_ctim.tv_sec,
+                                  .file_ctime_nsec = st.st_ctim.tv_nsec};
+        if (!out.push_back(RANGE)) {
+            return false;
+        }
+        vfs::vfs_retain_file(file);
+    }
+    return true;
+}
+
+void publish_exec_lazy_ranges(ker::mod::sched::task::Task* task, LazyVmemRangeVec& new_ranges) {
+    if (task == nullptr) {
+        release_lazy_file_refs(new_ranges);
+        return;
+    }
+
+    LazyVmemRangeVec old_ranges;
+    uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
+    old_ranges = std::move(task->lazy_vmem_ranges);
+    task->lazy_vmem_ranges = std::move(new_ranges);
+    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+    release_lazy_file_refs(old_ranges);
+}
+
+auto read_file_range_fully(int fd, uint8_t* dst, size_t file_size, uint64_t offset, uint64_t size, const char* path, size_t& bytes_read)
     -> int {
     if (dst == nullptr || !exec_range_in_file(file_size, offset, size)) {
         return -EINVAL;
@@ -436,7 +590,7 @@ auto read_exec_section_if_needed(int fd, uint8_t* dst, size_t file_size, const E
 }
 
 auto read_sparse_elf_image(int fd, uint8_t* dst, size_t file_size, const char* path, size_t initial_bytes_read,
-                           bool read_static_relocation_metadata) -> ExecImageReadResult {
+                           bool read_static_relocation_metadata, bool allow_lazy_file_segments) -> ExecImageReadResult {
     size_t bytes_read = initial_bytes_read;
     int ret = read_file_range_fully(fd, dst, file_size, 0, sizeof(Elf64_Ehdr), path, bytes_read);
     if (ret < 0) {
@@ -487,10 +641,22 @@ auto read_sparse_elf_image(int fd, uint8_t* dst, size_t file_size, const char* p
     for (Elf64_Half i = 0; i < elf_header->e_phnum; ++i) {
         const Elf64_Phdr& ph = program_headers[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
         has_dynamic_interp = has_dynamic_interp || ph.p_type == PT_INTERP;
+    }
+    bool const LAZY_FILE_SEGMENTS = allow_lazy_file_segments && (has_dynamic_interp || !read_static_relocation_metadata);
+    for (Elf64_Half i = 0; i < elf_header->e_phnum; ++i) {
+        const Elf64_Phdr& ph = program_headers[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
         if (ph.p_filesz == 0) {
             continue;
         }
-        if (ph.p_type != PT_LOAD && ph.p_type != PT_NOTE && ph.p_type != PT_INTERP) {
+        if (ph.p_type == PT_LOAD) {
+            ret = read_exec_load_segment_for_loader(fd, dst, file_size, ph, program_headers, elf_header->e_phnum, i, path,
+                                                    LAZY_FILE_SEGMENTS, bytes_read);
+            if (ret < 0) {
+                return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = ret};
+            }
+            continue;
+        }
+        if (ph.p_type != PT_NOTE && ph.p_type != PT_INTERP) {
             continue;
         }
         ret = read_file_range_fully(fd, dst, file_size, ph.p_offset, ph.p_filesz, path, bytes_read);
@@ -515,8 +681,8 @@ auto read_sparse_elf_image(int fd, uint8_t* dst, size_t file_size, const char* p
     return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = 0};
 }
 
-auto read_exec_image_for_loader(int fd, uint8_t* dst, size_t file_size, const char* path, bool read_static_relocation_metadata = true)
-    -> ExecImageReadResult {
+auto read_exec_image_for_loader(int fd, uint8_t* dst, size_t file_size, const char* path, bool read_static_relocation_metadata = true,
+                                bool allow_lazy_file_segments = false) -> ExecImageReadResult {
     if (file_size <= EXEC_SPARSE_ELF_MIN_SIZE) {
         return read_full_exec_image(fd, dst, file_size, path);
     }
@@ -528,7 +694,8 @@ auto read_exec_image_for_loader(int fd, uint8_t* dst, size_t file_size, const ch
         return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = PROBE_RET};
     }
 
-    ExecImageReadResult result = read_sparse_elf_image(fd, dst, file_size, path, bytes_read, read_static_relocation_metadata);
+    ExecImageReadResult result =
+        read_sparse_elf_image(fd, dst, file_size, path, bytes_read, read_static_relocation_metadata, allow_lazy_file_segments);
     result.shebang_probe_size = PROBE_SIZE;
     return result;
 }
@@ -1312,12 +1479,21 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         return static_cast<uint64_t>(-ENOEXEC);
     }
 
+    vfs::File* exec_file = vfs::vfs_get_file_retain(task, FD);
+    auto release_exec_file_once = [&]() {
+        if (exec_file != nullptr) {
+            vfs::vfs_put_file(exec_file);
+            exec_file = nullptr;
+        }
+    };
+
     auto* elf_buffer = new uint8_t[FILE_SIZE];
     if (elf_buffer == nullptr) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: alloc failed for '%s' (%ld bytes)", exec_path, file_size);
 #endif
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
+        release_exec_file_once();
         vfs::vfs_close(FD);
         free_kernel_arg_env();
         return static_cast<uint64_t>(-ENOMEM);
@@ -1329,7 +1505,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     uint64_t const ELF_READ_STARTED_US = time::get_us();
     record_local_proc_event(task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::BEGIN, ELF_READ_CORR, 0,
                             clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
-    ExecImageReadResult const READ_RESULT = read_exec_image_for_loader(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), exec_path);
+    ExecImageReadResult const READ_RESULT =
+        read_exec_image_for_loader(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), exec_path, true, exec_file != nullptr);
     uint32_t const ELF_READ_US = clamp_perf_aux(time::get_us() - ELF_READ_STARTED_US);
     int32_t const ELF_READ_STATUS = READ_RESULT.status;
     record_local_proc_event(task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::END, ELF_READ_CORR, ELF_READ_STATUS, ELF_READ_US,
@@ -1344,6 +1521,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         dbg::log("wos_proc_execve: failed read for '%s' (status %d, got %ld, expect %ld)", exec_path, READ_RESULT.status,
                  READ_RESULT.bytes_read, file_size);
 #endif
+        release_exec_file_once();
         delete[] elf_buffer;
         free_kernel_arg_env();
         return static_cast<uint64_t>(READ_RESULT.status);
@@ -1354,6 +1532,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     ShebangInfo shebang = {};
     size_t const SHEBANG_BYTES = READ_RESULT.shebang_probe_size != 0 ? READ_RESULT.shebang_probe_size : static_cast<size_t>(FILE_SIZE);
     if (parse_shebang_line(elf_buffer, SHEBANG_BYTES, &shebang)) {
+        release_exec_file_once();
         delete[] elf_buffer;
         free_kernel_arg_env_once();
         if (shebang_depth >= MAX_SHEBANG_DEPTH) {
@@ -1373,6 +1552,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
                  elf_header->e_ident[0], elf_header->e_ident[1], elf_header->e_ident[2], elf_header->e_ident[3], elf_header->e_ident[4]);
 #endif
         delete[] elf_buffer;
+        release_exec_file_once();
         free_kernel_arg_env();
         return static_cast<uint64_t>(-ENOEXEC);
     }
@@ -1416,6 +1596,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             task->deferred_task_switch = true;
             task->yield_switch = false;
             task->set_wait_channel("wki_execve_proxy", ker::mod::sched::task::WaitChannelKind::WKI_EXECVE_PROXY);
+            release_exec_file_once();
             free_kernel_arg_env_once();
             return 0;
         }
@@ -1425,6 +1606,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         task->wki_remote_pid = SAVED_WKI_REMOTE_PID;
 
         if (remote_result == ker::net::wki::WkiRemoteSpawnResult::FAILED) {
+            release_exec_file_once();
             delete[] elf_buffer;
             free_kernel_arg_env_once();
             return static_cast<uint64_t>(-EHOSTUNREACH);
@@ -1441,6 +1623,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     auto* new_pagemap = mm::virt::create_pagemap();
     if (new_pagemap == nullptr) {
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
+        release_exec_file_once();
         delete[] elf_buffer;
         free_kernel_arg_env_once();
         return static_cast<uint64_t>(-ENOMEM);
@@ -1456,7 +1639,13 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     auto* new_thread =
         mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, new_pagemap, task->pid, TLS_INFO);
     char* new_name = nullptr;
+    LazyVmemRangeVec new_lazy_ranges;
+    bool new_lazy_ranges_published = false;
     auto cleanup_new_image = [&]() {
+        release_exec_file_once();
+        if (!new_lazy_ranges_published) {
+            release_lazy_file_refs(new_lazy_ranges);
+        }
         if (new_pagemap != nullptr) {
             ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(new_pagemap);
             mm::virt::destroy_user_space(new_pagemap, task->pid, new_name != nullptr ? new_name : task->name, "exec-new-image-cleanup");
@@ -1495,8 +1684,14 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     // --- Load ELF into new pagemap ---
     LocalProcStage const LOAD_ELF_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_ELF,
                                                                  clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
+    loader::elf::ElfLazyLoadRangeVec main_loader_lazy_ranges;
+    loader::elf::ElfLoadOptions const MAIN_LOAD_OPTIONS{
+        .register_special_symbols = true,
+        .base_address = 0,
+        .lazy_file_ranges = exec_file != nullptr ? &main_loader_lazy_ranges : nullptr,
+    };
     loader::elf::ElfLoadResult elf_result =
-        loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(elf_buffer), new_pagemap, task->pid, task->name);
+        loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(elf_buffer), new_pagemap, task->pid, task->name, MAIN_LOAD_OPTIONS);
     if (elf_result.entry_point == 0) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: ELF load failed for '%s'", exec_path);
@@ -1507,6 +1702,14 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         free_kernel_arg_env_once();
         return static_cast<uint64_t>(-ENOEXEC);
     }
+    if (!append_exec_lazy_file_ranges(new_lazy_ranges, main_loader_lazy_ranges, exec_file, exec_stat)) {
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_ELF, LOAD_ELF_STAGE, -ENOMEM, static_cast<uint64_t>(FILE_SIZE),
+                             WOS_PERF_CALLSITE());
+        cleanup_new_image();
+        free_kernel_arg_env_once();
+        return static_cast<uint64_t>(-ENOMEM);
+    }
+    release_exec_file_once();
     end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_ELF, LOAD_ELF_STAGE, 0, static_cast<uint64_t>(FILE_SIZE),
                          WOS_PERF_CALLSITE());
 
@@ -1549,12 +1752,29 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             return static_cast<uint64_t>(-ENOEXEC);
         }
 
+        vfs::File* interp_file = vfs::vfs_get_file_retain(task, INTERP_FD);
+        auto release_interp_file_once = [&]() {
+            if (interp_file != nullptr) {
+                vfs::vfs_put_file(interp_file);
+                interp_file = nullptr;
+            }
+        };
+
         auto* interp_buf = new uint8_t[INTERP_SIZE];
+        if (interp_buf == nullptr) {
+            release_interp_file_once();
+            vfs::vfs_close(INTERP_FD);
+            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
+            cleanup_new_image();
+            free_kernel_arg_env_once();
+            return static_cast<uint64_t>(-ENOMEM);
+        }
         ExecImageReadResult const INTERP_READ =
-            read_exec_image_for_loader(INTERP_FD, interp_buf, static_cast<size_t>(INTERP_SIZE), INTERP_PATH, false);
+            read_exec_image_for_loader(INTERP_FD, interp_buf, static_cast<size_t>(INTERP_SIZE), INTERP_PATH, false, interp_file != nullptr);
         vfs::vfs_close(INTERP_FD);
 
         if (INTERP_READ.status < 0) {
+            release_interp_file_once();
             delete[] interp_buf;
             end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, INTERP_READ.status, 0,
                                  WOS_PERF_CALLSITE());
@@ -1563,10 +1783,17 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             return static_cast<uint64_t>(INTERP_READ.status);
         }
 
-        loader::elf::ElfLoadResult const INTERP_RESULT =
-            loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(interp_buf), new_pagemap, task->pid, "ld.so", false, INTERP_BASE);
+        loader::elf::ElfLazyLoadRangeVec interp_loader_lazy_ranges;
+        loader::elf::ElfLoadOptions const INTERP_LOAD_OPTIONS{
+            .register_special_symbols = false,
+            .base_address = INTERP_BASE,
+            .lazy_file_ranges = interp_file != nullptr ? &interp_loader_lazy_ranges : nullptr,
+        };
+        loader::elf::ElfLoadResult const INTERP_RESULT = loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(interp_buf),
+                                                                               new_pagemap, task->pid, "ld.so", INTERP_LOAD_OPTIONS);
 
         if (INTERP_RESULT.entry_point == 0) {
+            release_interp_file_once();
             delete[] interp_buf;
             end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -ENOEXEC,
                                  static_cast<uint64_t>(INTERP_SIZE), WOS_PERF_CALLSITE());
@@ -1574,6 +1801,16 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             free_kernel_arg_env_once();
             return static_cast<uint64_t>(-ENOEXEC);
         }
+        if (!append_exec_lazy_file_ranges(new_lazy_ranges, interp_loader_lazy_ranges, interp_file, interp_stat)) {
+            release_interp_file_once();
+            delete[] interp_buf;
+            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -ENOMEM,
+                                 static_cast<uint64_t>(INTERP_SIZE), WOS_PERF_CALLSITE());
+            cleanup_new_image();
+            free_kernel_arg_env_once();
+            return static_cast<uint64_t>(-ENOMEM);
+        }
+        release_interp_file_once();
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, 0, static_cast<uint64_t>(INTERP_SIZE),
                              WOS_PERF_CALLSITE());
 
@@ -1911,6 +2148,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     // see task->pagemap/task->thread pointing at storage that is being freed.
     task->pagemap = new_pagemap;
     task->thread = new_thread;
+    publish_exec_lazy_ranges(task, new_lazy_ranges);
+    new_lazy_ranges_published = true;
 
     auto phys_pagemap = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(new_pagemap)));
     asm volatile("mov %0, %%cr3" : : "r"(phys_pagemap) : "memory");

@@ -7,6 +7,7 @@
 #include <platform/mm/mm.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/virt.hpp>
+#include <util/smallvec.hpp>
 
 namespace ker::loader::elf {
 
@@ -32,6 +33,22 @@ struct ElfLoadResult {
     bool has_interp = false;                 // true if PT_INTERP was found
 };
 
+struct ElfLazyLoadRange {
+    uint64_t vaddr{};
+    uint64_t size{};
+    uint64_t prot{};
+    uint64_t flags{};
+    uint64_t file_offset{};
+};
+
+using ElfLazyLoadRangeVec = ker::util::SmallVec<ElfLazyLoadRange, 16>;
+
+struct ElfLoadOptions {
+    bool register_special_symbols = true;
+    uint64_t base_address = 0;
+    ElfLazyLoadRangeVec* lazy_file_ranges = nullptr;
+};
+
 struct ElfFile {
     Elf64_Ehdr elf_head;           // ELF header
     Elf64_Phdr* pg_head;           // Program headers
@@ -44,6 +61,8 @@ struct ElfFile {
 
 auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name,
               bool register_special_symbols = true, uint64_t base_address = 0) -> ElfLoadResult;
+auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name, const ElfLoadOptions& options)
+    -> ElfLoadResult;
 
 // Extract TLS information from ELF without fully loading it
 auto extract_tls_info(void* elf_data) -> TlsModule;
