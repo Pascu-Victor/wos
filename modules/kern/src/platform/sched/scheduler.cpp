@@ -4948,6 +4948,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         enter_idle_loop(rq);
     }
 
+    bool const FIRST_RUN_DAEMON = next_task->type == task::TaskType::DAEMON && !next_task->has_run;
     prepare_first_run_daemon(next_task, "deferred-switch");
     record_local_proc_first_run(next_task, WOS_PERF_CALLSITE());
     next_task->has_run = true;
@@ -5007,6 +5008,11 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     sys::context_switch::restore_debug_registers_for_task(next_task);
 
     arm_local_timer_after_deferred_switch(next_task);
+    if (FIRST_RUN_DAEMON) {
+        wos_start_kernel_thread(next_task->context.frame.rsp, next_task->kthread_entry);
+        __builtin_unreachable();
+    }
+
     wos_deferred_task_switch_return(&next_task->context.regs, &next_task->context.frame);
     __builtin_unreachable();
 }

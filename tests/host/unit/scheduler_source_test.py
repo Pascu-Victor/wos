@@ -1481,6 +1481,50 @@ def test_deferred_user_switch_commits_after_stack_handoff() -> None:
     )
 
 
+def test_deferred_first_run_daemon_starts_on_kernel_thread_stack() -> None:
+    source = SCHEDULER_CPP.read_text()
+    deferred_body = function_body(source, "deferred_task_switch")
+
+    require_tokens(
+        deferred_body,
+        [
+            "bool const FIRST_RUN_DAEMON = next_task->type == task::TaskType::DAEMON && !next_task->has_run;",
+            'prepare_first_run_daemon(next_task, "deferred-switch");',
+            "next_task->has_run = true;",
+            "sys::context_switch::restore_debug_registers_for_task(next_task);",
+            "arm_local_timer_after_deferred_switch(next_task);",
+            "if (FIRST_RUN_DAEMON)",
+            "wos_start_kernel_thread(next_task->context.frame.rsp, next_task->kthread_entry);",
+            "wos_deferred_task_switch_return(&next_task->context.regs, &next_task->context.frame);",
+        ],
+        "deferred first-run daemon handoff",
+    )
+    require_order(
+        deferred_body,
+        "bool const FIRST_RUN_DAEMON = next_task->type == task::TaskType::DAEMON && !next_task->has_run;",
+        'prepare_first_run_daemon(next_task, "deferred-switch");',
+        "deferred switch must classify first-run daemons before prepare_first_run_daemon can normalize their frame",
+    )
+    require_order(
+        deferred_body,
+        'prepare_first_run_daemon(next_task, "deferred-switch");',
+        "next_task->has_run = true;",
+        "deferred switch must preserve first-run daemon setup before publishing has_run",
+    )
+    require_order(
+        deferred_body,
+        "arm_local_timer_after_deferred_switch(next_task);",
+        "if (FIRST_RUN_DAEMON)",
+        "first-run daemon start must happen after CPU state and local timer setup",
+    )
+    require_order(
+        deferred_body,
+        "if (FIRST_RUN_DAEMON)",
+        "wos_deferred_task_switch_return(&next_task->context.regs, &next_task->context.frame);",
+        "first-run daemons must bypass the generic same-CPL iretq resume path",
+    )
+
+
 def test_switch_picker_evicts_unpublishable_runnable_tasks() -> None:
     source = SCHEDULER_CPP.read_text()
     switch_pick_body = function_body(source, "pick_best_eligible_for_switch_locked")
@@ -1648,6 +1692,7 @@ def main() -> None:
     test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld()
     test_context_switch_updates_tss_rsp0_to_task_stack()
     test_deferred_user_switch_commits_after_stack_handoff()
+    test_deferred_first_run_daemon_starts_on_kernel_thread_stack()
     test_switch_picker_evicts_unpublishable_runnable_tasks()
     test_voluntary_blocked_current_cannot_hide_runnable_peer()
     test_runnable_publication_requires_successful_heap_insert()
