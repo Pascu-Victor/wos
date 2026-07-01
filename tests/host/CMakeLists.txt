@@ -324,6 +324,10 @@ add_test(
     NAME tmpfs_swap_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tmpfs_swap_source_test.py
 )
+add_test(
+    NAME tmpfs_link_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tmpfs_link_source_test.py
+)
 set_tests_properties(
     host_test_manifest_test
     ktest_cov_test
@@ -405,6 +409,7 @@ set_tests_properties(
     vfs_sendfile_source_test
     vmem_source_test
     tmpfs_swap_source_test
+    tmpfs_link_source_test
     PROPERTIES LABELS "host;source"
 )
 

@@ -581,6 +581,25 @@ void tmpfs_unlock_tree() { tmpfs_lock.unlock(); }
 
 // --- Node operations ---
 
+auto tmpfs_canonical_node(TmpNode* node) -> TmpNode* {
+    while (node != nullptr && node->hardlink_target != nullptr) {
+        node = node->hardlink_target;
+    }
+    return node;
+}
+
+auto tmpfs_canonical_node(const TmpNode* node) -> const TmpNode* {
+    while (node != nullptr && node->hardlink_target != nullptr) {
+        node = node->hardlink_target;
+    }
+    return node;
+}
+
+auto tmpfs_link_count(const TmpNode* node) -> uint32_t {
+    auto const* canonical = tmpfs_canonical_node(node);
+    return canonical != nullptr ? canonical->link_count.load(std::memory_order_acquire) : 0;
+}
+
 auto tmpfs_lookup(TmpNode* dir, const char* name) -> TmpNode* {
     if (dir == nullptr || name == nullptr || dir->type != TmpNodeType::DIRECTORY) {
         return nullptr;
@@ -665,6 +684,36 @@ auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target)
     return node;
 }
 
+auto tmpfs_create_hardlink(TmpNode* parent, const char* name, TmpNode* target) -> TmpNode* {
+    TmpNode* canonical = tmpfs_canonical_node(target);
+    if (parent == nullptr || name == nullptr || parent->type != TmpNodeType::DIRECTORY || canonical == nullptr ||
+        canonical->type == TmpNodeType::DIRECTORY) {
+        return nullptr;
+    }
+    if (tmpfs_lookup(parent, name) != nullptr) {
+        return nullptr;
+    }
+
+    auto* node = new TmpNode;
+    copy_name(node->name, name);
+    node->type = canonical->type;
+    node->mount = parent->mount;
+    node->mode = canonical->mode;
+    node->uid = canonical->uid;
+    node->gid = canonical->gid;
+    node->atime = canonical->atime;
+    node->mtime = canonical->mtime;
+    node->ctime = canonical->ctime;
+    node->hardlink_target = canonical;
+    node->link_count.store(0, std::memory_order_relaxed);
+
+    register_tmp_node(node);
+    add_child(parent, node);
+    canonical->link_count.fetch_add(1, std::memory_order_acq_rel);
+    touch_modified(canonical);
+    return node;
+}
+
 auto tmpfs_attach_child(TmpNode* parent, TmpNode* child) -> bool {
     if (parent == nullptr || child == nullptr || parent->type != TmpNodeType::DIRECTORY) {
         return false;
@@ -698,6 +747,30 @@ auto tmpfs_detach_child(TmpNode* parent, TmpNode* child) -> bool {
     }
 
     return false;
+}
+
+void tmpfs_drop_detached_node(TmpNode* node) {
+    if (node == nullptr) {
+        return;
+    }
+
+    TmpNode* canonical = tmpfs_canonical_node(node);
+    bool last_link = false;
+    if (canonical != nullptr && canonical->type != TmpNodeType::DIRECTORY) {
+        uint32_t const PREV = canonical->link_count.fetch_sub(1, std::memory_order_acq_rel);
+        last_link = PREV <= 1;
+    }
+
+    if (node != canonical) {
+        tmpfs_free_node(node);
+    }
+
+    if (canonical != nullptr && last_link) {
+        canonical->unlinked = true;
+        if (canonical->open_count.load(std::memory_order_acquire) == 0) {
+            tmpfs_free_node(canonical);
+        }
+    }
 }
 
 auto tmpfs_directory_is_empty(const TmpNode* dir) -> bool {
@@ -924,8 +997,9 @@ auto tmpfs_reclaim_pages(size_t target_pages) -> size_t {
         if (node == nullptr) {
             continue;
         }
-        if (node->type == TmpNodeType::FILE) {
-            reclaimed += reclaim_from_node_locked(node, target_pages - reclaimed);
+        TmpNode* canonical = tmpfs_canonical_node(node);
+        if (canonical != nullptr && canonical->type == TmpNodeType::FILE && canonical == node) {
+            reclaimed += reclaim_from_node_locked(canonical, target_pages - reclaimed);
         }
         node->io_lock.unlock();
     }
@@ -1022,36 +1096,37 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ke
             }
         }
     }
-    if (node != nullptr) {
-        node->open_count.fetch_add(1, std::memory_order_relaxed);
+    TmpNode* file_node = tmpfs_canonical_node(node);
+    if (file_node != nullptr) {
+        file_node->open_count.fetch_add(1, std::memory_order_relaxed);
     }
     tmpfs_lock.unlock();
 
-    if (node == nullptr) {
+    if (file_node == nullptr) {
         return nullptr;
     }
 
-    if ((flags & ker::vfs::O_TRUNC) != 0 && node->type == TmpNodeType::FILE) {
+    if ((flags & ker::vfs::O_TRUNC) != 0 && file_node->type == TmpNodeType::FILE) {
         int truncate_ret = 0;
         {
-            ker::mod::sys::MutexGuard guard(node->io_lock);
-            truncate_ret = tmpfs_resize_locked(node, 0);
+            ker::mod::sys::MutexGuard guard(file_node->io_lock);
+            truncate_ret = tmpfs_resize_locked(file_node, 0);
         }
         int const TRUNCATE_RET = truncate_ret;
         if (TRUNCATE_RET < 0) {
-            uint32_t const PREV = node->open_count.fetch_sub(1, std::memory_order_acq_rel);
-            if (PREV == 1 && node->unlinked) {
-                tmpfs_free_node(node);
+            uint32_t const PREV = file_node->open_count.fetch_sub(1, std::memory_order_acq_rel);
+            if (PREV == 1 && file_node->unlinked) {
+                tmpfs_free_node(file_node);
             }
             return nullptr;
         }
     }
 
     auto* f = new File;
-    f->private_data = node;
+    f->private_data = file_node;
     f->fd = -1;
     f->pos = 0;
-    f->is_directory = (node->type == TmpNodeType::DIRECTORY);
+    f->is_directory = (file_node->type == TmpNodeType::DIRECTORY);
     f->fs_type = FSType::TMPFS;
     f->refcount = 1;
     f->open_create_result_known = (flags & O_CREAT) != 0;
@@ -1068,7 +1143,10 @@ auto tmpfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
     if (buf == nullptr && count != 0) {
         return -EINVAL;
     }
-    auto* n = static_cast<TmpNode*>(f->private_data);
+    auto* n = tmpfs_canonical_node(static_cast<TmpNode*>(f->private_data));
+    if (n == nullptr) {
+        return -EBADF;
+    }
     ker::mod::sys::MutexGuard guard(n->io_lock);
     if (offset >= n->size) {
         return 0;
@@ -1101,7 +1179,10 @@ auto tmpfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t offset
     if ((f == nullptr) || (f->private_data == nullptr)) {
         return -EBADF;
     }
-    auto* n = static_cast<TmpNode*>(f->private_data);
+    auto* n = tmpfs_canonical_node(static_cast<TmpNode*>(f->private_data));
+    if (n == nullptr) {
+        return -EBADF;
+    }
     ker::mod::sys::MutexGuard guard(n->io_lock);
     return tmpfs_write_locked(n, buf, count, offset);
 }
@@ -1110,7 +1191,10 @@ auto tmpfs_write_append(ker::vfs::File* f, const void* buf, size_t count, size_t
     if ((f == nullptr) || (f->private_data == nullptr)) {
         return -EBADF;
     }
-    auto* n = static_cast<TmpNode*>(f->private_data);
+    auto* n = tmpfs_canonical_node(static_cast<TmpNode*>(f->private_data));
+    if (n == nullptr) {
+        return -EBADF;
+    }
     ker::mod::sys::MutexGuard guard(n->io_lock);
     size_t const OFFSET = n->size;
     ssize_t const RET = tmpfs_write_locked(n, buf, count, OFFSET);
@@ -1124,12 +1208,17 @@ auto tmpfs_get_size(ker::vfs::File* f) -> size_t {
     if ((f == nullptr) || (f->private_data == nullptr)) {
         return 0;
     }
-    auto* n = static_cast<TmpNode*>(f->private_data);
+    auto* n = tmpfs_canonical_node(static_cast<TmpNode*>(f->private_data));
+    if (n == nullptr) {
+        return 0;
+    }
     ker::mod::sys::MutexGuard guard(n->io_lock);
     return n->size;
 }
 
 auto tmpfs_copy_file_contents(TmpNode* dst, TmpNode* src) -> int {
+    dst = tmpfs_canonical_node(dst);
+    src = tmpfs_canonical_node(src);
     if (dst == nullptr || src == nullptr || dst->type != TmpNodeType::FILE || src->type != TmpNodeType::FILE) {
         return -EINVAL;
     }
@@ -1184,7 +1273,11 @@ auto tmpfs_fops_close(ker::vfs::File* f) -> int {
     if (f == nullptr || f->private_data == nullptr) {
         return 0;
     }
-    auto* node = static_cast<TmpNode*>(f->private_data);
+    auto* node = tmpfs_canonical_node(static_cast<TmpNode*>(f->private_data));
+    if (node == nullptr) {
+        f->private_data = nullptr;
+        return 0;
+    }
     uint32_t const PREV = node->open_count.fetch_sub(1, std::memory_order_acq_rel);
     if (PREV == 1 && node->unlinked) {
         // Last close of an unlinked node — free it now
@@ -1284,7 +1377,8 @@ auto tmpfs_fops_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int
     }
 
     TmpNode* child = n->children[child_index];
-    entry->d_ino = reinterpret_cast<uint64_t>(child);
+    TmpNode const* child_identity = tmpfs_canonical_node(child);
+    entry->d_ino = reinterpret_cast<uint64_t>(child_identity != nullptr ? child_identity : child);
     entry->d_off = child_index + 3;
     entry->d_reclen = sizeof(DirEntry);
 
@@ -1320,7 +1414,10 @@ auto tmpfs_fops_readlink(ker::vfs::File* f, char* buf, size_t bufsize) -> ssize_
     if (f == nullptr || f->private_data == nullptr) {
         return -EBADF;
     }
-    auto* n = static_cast<TmpNode*>(f->private_data);
+    auto* n = tmpfs_canonical_node(static_cast<TmpNode*>(f->private_data));
+    if (n == nullptr) {
+        return -EBADF;
+    }
     if (n->type != TmpNodeType::SYMLINK || n->symlink_target == nullptr) {
         return -EINVAL;
     }
@@ -1339,7 +1436,10 @@ auto tmpfs_fops_truncate(ker::vfs::File* f, off_t length) -> int {
     if (f == nullptr || f->private_data == nullptr) {
         return -EBADF;
     }
-    auto* n = static_cast<TmpNode*>(f->private_data);
+    auto* n = tmpfs_canonical_node(static_cast<TmpNode*>(f->private_data));
+    if (n == nullptr) {
+        return -EBADF;
+    }
     if (n->type != TmpNodeType::FILE) {
         return -EISDIR;
     }

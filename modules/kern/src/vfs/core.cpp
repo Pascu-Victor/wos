@@ -2626,6 +2626,39 @@ void fill_tmpfs_stat_timestamps(const ker::vfs::tmpfs::TmpNode* node, Stat* stat
     statbuf->st_ctim = node->ctime;
 }
 
+void fill_tmpfs_node_stat(uint32_t dev_id, const ker::vfs::tmpfs::TmpNode* node, Stat* statbuf) {
+    if (node == nullptr || statbuf == nullptr) {
+        return;
+    }
+
+    auto const* stat_node = ker::vfs::tmpfs::tmpfs_canonical_node(node);
+    if (stat_node == nullptr) {
+        return;
+    }
+
+    statbuf->st_dev = dev_id;
+    statbuf->st_ino = reinterpret_cast<ino_t>(stat_node);
+    statbuf->st_nlink = ker::vfs::tmpfs::tmpfs_link_count(stat_node);
+    statbuf->st_uid = stat_node->uid;
+    statbuf->st_gid = stat_node->gid;
+    statbuf->st_rdev = 0;
+    statbuf->st_size = static_cast<off_t>(stat_node->size);
+    statbuf->st_blksize = 4096;
+    statbuf->st_blocks = static_cast<blkcnt_t>((stat_node->size + 511) / 512);
+    switch (stat_node->type) {
+        case ker::vfs::tmpfs::TmpNodeType::FILE:
+            statbuf->st_mode = S_IFREG | stat_node->mode;
+            break;
+        case ker::vfs::tmpfs::TmpNodeType::DIRECTORY:
+            statbuf->st_mode = S_IFDIR | stat_node->mode;
+            break;
+        case ker::vfs::tmpfs::TmpNodeType::SYMLINK:
+            statbuf->st_mode = S_IFLNK | stat_node->mode;
+            break;
+    }
+    fill_tmpfs_stat_timestamps(stat_node, statbuf);
+}
+
 void fill_devfs_stat_timestamps(const ker::vfs::devfs::DevFSNode* node, Stat* statbuf) {
     if (node == nullptr || statbuf == nullptr) {
         return;
@@ -2658,28 +2691,7 @@ auto vfs_stream_cache_get_file_stat(File* file, Stat* statbuf) -> int {
             if (node == nullptr) {
                 return -EBADF;
             }
-            uint32_t const SC_DEV_ID = stream_stat_dev_id();
-            statbuf->st_dev = SC_DEV_ID;
-            statbuf->st_ino = reinterpret_cast<ino_t>(node);
-            statbuf->st_nlink = 1;
-            statbuf->st_uid = node->uid;
-            statbuf->st_gid = node->gid;
-            statbuf->st_rdev = 0;
-            statbuf->st_size = static_cast<off_t>(node->size);
-            statbuf->st_blksize = 4096;
-            statbuf->st_blocks = static_cast<blkcnt_t>((node->size + 511) / 512);
-            switch (node->type) {
-                case ker::vfs::tmpfs::TmpNodeType::FILE:
-                    statbuf->st_mode = S_IFREG | node->mode;
-                    break;
-                case ker::vfs::tmpfs::TmpNodeType::DIRECTORY:
-                    statbuf->st_mode = S_IFDIR | node->mode;
-                    break;
-                case ker::vfs::tmpfs::TmpNodeType::SYMLINK:
-                    statbuf->st_mode = S_IFLNK | node->mode;
-                    break;
-            }
-            fill_tmpfs_stat_timestamps(node, statbuf);
+            fill_tmpfs_node_stat(stream_stat_dev_id(), node, statbuf);
             return 0;
         }
         case FSType::FAT32: {
@@ -4721,6 +4733,10 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
         if (node == nullptr) {
             return 0;  // Path doesn't exist yet (might be created with O_CREAT)
         }
+        node = ker::vfs::tmpfs::tmpfs_canonical_node(node);
+        if (node == nullptr) {
+            return 0;
+        }
 
         if (node->type != ker::vfs::tmpfs::TmpNodeType::SYMLINK) {
             return 0;  // Not a symlink, resolution complete
@@ -5827,6 +5843,11 @@ auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize
         symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -ENOENT, nullptr);
         return -ENOENT;
     }
+    node = ker::vfs::tmpfs::tmpfs_canonical_node(node);
+    if (node == nullptr) {
+        symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -ENOENT, nullptr);
+        return -ENOENT;
+    }
 
     if (node->type != ker::vfs::tmpfs::TmpNodeType::SYMLINK || node->symlink_target == nullptr) {
         symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -EINVAL, nullptr);
@@ -6443,28 +6464,7 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
                 result = -ENOENT;
                 break;
             }
-            // Access node fields immediately while potentially still holding any implicit lock
-            statbuf->st_dev = mount->dev_id;
-            statbuf->st_ino = reinterpret_cast<ino_t>(node);
-            statbuf->st_nlink = 1;
-            statbuf->st_uid = node->uid;
-            statbuf->st_gid = node->gid;
-            statbuf->st_rdev = 0;
-            statbuf->st_size = static_cast<off_t>(node->size);
-            statbuf->st_blksize = 4096;
-            statbuf->st_blocks = static_cast<blkcnt_t>((node->size + 511) / 512);
-            switch (node->type) {
-                case ker::vfs::tmpfs::TmpNodeType::FILE:
-                    statbuf->st_mode = S_IFREG | node->mode;
-                    break;
-                case ker::vfs::tmpfs::TmpNodeType::DIRECTORY:
-                    statbuf->st_mode = S_IFDIR | node->mode;
-                    break;
-                case ker::vfs::tmpfs::TmpNodeType::SYMLINK:
-                    statbuf->st_mode = S_IFLNK | node->mode;
-                    break;
-            }
-            fill_tmpfs_stat_timestamps(node, statbuf);
+            fill_tmpfs_node_stat(mount->dev_id, node, statbuf);
             result = 0;
             break;
         }
@@ -6610,27 +6610,7 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
             if (node == nullptr) {
                 return -EBADF;
             }
-            statbuf->st_dev = FSTAT_DEV_ID;
-            statbuf->st_ino = reinterpret_cast<ino_t>(node);
-            statbuf->st_nlink = 1;
-            statbuf->st_uid = node->uid;
-            statbuf->st_gid = node->gid;
-            statbuf->st_rdev = 0;
-            statbuf->st_size = static_cast<off_t>(node->size);
-            statbuf->st_blksize = 4096;
-            statbuf->st_blocks = static_cast<blkcnt_t>((node->size + 511) / 512);
-            switch (node->type) {
-                case ker::vfs::tmpfs::TmpNodeType::FILE:
-                    statbuf->st_mode = S_IFREG | node->mode;
-                    break;
-                case ker::vfs::tmpfs::TmpNodeType::DIRECTORY:
-                    statbuf->st_mode = S_IFDIR | node->mode;
-                    break;
-                case ker::vfs::tmpfs::TmpNodeType::SYMLINK:
-                    statbuf->st_mode = S_IFLNK | node->mode;
-                    break;
-            }
-            fill_tmpfs_stat_timestamps(node, statbuf);
+            fill_tmpfs_node_stat(FSTAT_DEV_ID, node, statbuf);
             return finish_stat(0);
         }
         case FSType::FAT32: {
@@ -7323,14 +7303,13 @@ auto vfs_unlink(const char* path) -> int {
         ker::vfs::tmpfs::tmpfs_unlock_tree();
         return -EISDIR;
     }
+    bool const HARDLINK_COUNT_CHANGE = ker::vfs::tmpfs::tmpfs_link_count(child) > 1;
     if (ker::vfs::tmpfs::tmpfs_detach_child(parent, child)) {
-        // POSIX: defer freeing if file handles are still open
-        if (child->open_count.load(std::memory_order_acquire) > 0) {
-            child->unlinked = true;
-        } else {
-            ker::vfs::tmpfs::tmpfs_free_node(child);
-        }
+        ker::vfs::tmpfs::tmpfs_drop_detached_node(child);
         ker::vfs::tmpfs::tmpfs_unlock_tree();
+        if (HARDLINK_COUNT_CHANGE) {
+            metadata_cache_note_path_changed("/", nullptr);
+        }
         vfs_cache_notify_path_changed(path_buf.data(), nullptr);
         return 0;
     }
@@ -7603,19 +7582,24 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
         ker::vfs::tmpfs::tmpfs_unlock_tree();
         return 0;
     }
+    bool existing_hardlink_count_changed = false;
     if (existing != nullptr) {
         if (existing->type == ker::vfs::tmpfs::TmpNodeType::DIRECTORY && !ker::vfs::tmpfs::tmpfs_directory_is_empty(existing)) {
             ker::vfs::tmpfs::tmpfs_unlock_tree();
             return -ENOTEMPTY;
         }
+        existing_hardlink_count_changed =
+            existing->type != ker::vfs::tmpfs::TmpNodeType::DIRECTORY && ker::vfs::tmpfs::tmpfs_link_count(existing) > 1;
         if (!ker::vfs::tmpfs::tmpfs_detach_child(new_parent, existing)) {
             ker::vfs::tmpfs::tmpfs_unlock_tree();
             return -ENOENT;
         }
-        if (existing->open_count.load(std::memory_order_acquire) > 0) {
+        if (existing->type == ker::vfs::tmpfs::TmpNodeType::DIRECTORY && existing->open_count.load(std::memory_order_acquire) > 0) {
             existing->unlinked = true;
-        } else {
+        } else if (existing->type == ker::vfs::tmpfs::TmpNodeType::DIRECTORY) {
             ker::vfs::tmpfs::tmpfs_free_node(existing);
+        } else {
+            ker::vfs::tmpfs::tmpfs_drop_detached_node(existing);
         }
     }
 
@@ -7636,6 +7620,9 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
     }
 
     ker::vfs::tmpfs::tmpfs_unlock_tree();
+    if (existing_hardlink_count_changed) {
+        metadata_cache_note_path_changed("/", nullptr);
+    }
     vfs_cache_notify_path_changed(old_buf.data(), new_buf.data());
     return 0;
 }
@@ -7662,6 +7649,10 @@ auto vfs_chmod(const char* path, int mode) -> int {
     switch (mount->fs_type) {
         case FSType::TMPFS: {
             auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, false);
+            if (node == nullptr) {
+                return -ENOENT;
+            }
+            node = ker::vfs::tmpfs::tmpfs_canonical_node(node);
             if (node == nullptr) {
                 return -ENOENT;
             }
@@ -7705,6 +7696,11 @@ auto vfs_fchmod(int fd, int mode) -> int {
     switch (f->fs_type) {
         case FSType::TMPFS: {
             auto* node = static_cast<ker::vfs::tmpfs::TmpNode*>(f->private_data);
+            if (node == nullptr) {
+                vfs_put_file(f);
+                return -EBADF;
+            }
+            node = ker::vfs::tmpfs::tmpfs_canonical_node(node);
             if (node == nullptr) {
                 vfs_put_file(f);
                 return -EBADF;
@@ -7756,6 +7752,10 @@ auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
             if (node == nullptr) {
                 return -ENOENT;
             }
+            node = ker::vfs::tmpfs::tmpfs_canonical_node(node);
+            if (node == nullptr) {
+                return -ENOENT;
+            }
             if (std::cmp_not_equal(owner, -1)) {
                 node->uid = owner;
             }
@@ -7800,6 +7800,11 @@ auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int {
     switch (f->fs_type) {
         case FSType::TMPFS: {
             auto* node = static_cast<ker::vfs::tmpfs::TmpNode*>(f->private_data);
+            if (node == nullptr) {
+                vfs_put_file(f);
+                return -EBADF;
+            }
+            node = ker::vfs::tmpfs::tmpfs_canonical_node(node);
             if (node == nullptr) {
                 vfs_put_file(f);
                 return -EBADF;
@@ -7880,6 +7885,7 @@ auto resolve_utimens_times(const Timespec* times, VfsResolvedTimes* resolved) ->
 }
 
 auto apply_tmpfs_utimens(ker::vfs::tmpfs::TmpNode* node, const VfsResolvedTimes& times) -> int {
+    node = ker::vfs::tmpfs::tmpfs_canonical_node(node);
     if (node == nullptr) {
         return -ENOENT;
     }
@@ -10830,12 +10836,16 @@ auto vfs_link(const char* oldpath, const char* newpath) -> int {
         return -ENOSYS;
     }
 
-    // --- tmpfs hard link (data-copy) ---
+    // --- tmpfs hard link ---
     const char* old_fs = strip_mount_prefix(old_mount, old_buf.data());
     const char* new_fs = strip_mount_prefix(new_mount, new_buf.data());
 
     // Look up the source node
     auto* src_node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(old_mount), old_fs, false);
+    if (src_node == nullptr) {
+        return -ENOENT;
+    }
+    src_node = ker::vfs::tmpfs::tmpfs_canonical_node(src_node);
     if (src_node == nullptr) {
         return -ENOENT;
     }
@@ -10878,30 +10888,21 @@ auto vfs_link(const char* oldpath, const char* newpath) -> int {
         return -ENOTDIR;
     }
 
-    // Destination must not already exist
+    ker::vfs::tmpfs::tmpfs_lock_tree();
+
     if (ker::vfs::tmpfs::tmpfs_lookup(new_parent, new_name) != nullptr) {
+        ker::vfs::tmpfs::tmpfs_unlock_tree();
         return -EEXIST;
     }
 
-    // Create the new node as a copy of the source
-    if (src_node->type == ker::vfs::tmpfs::TmpNodeType::SYMLINK) {
-        // Copy symlink
-        ker::vfs::tmpfs::tmpfs_create_symlink(new_parent, new_name, src_node->symlink_target);
-    } else {
-        // Regular file - copy data
-        auto* dst = ker::vfs::tmpfs::tmpfs_create_file(new_parent, new_name, src_node->mode);
-        if (dst == nullptr) {
-            return -ENOMEM;
-        }
-        int const COPY_RET = ker::vfs::tmpfs::tmpfs_copy_file_contents(dst, src_node);
-        if (COPY_RET < 0) {
-            return COPY_RET;
-        }
-        dst->uid = src_node->uid;
-        dst->gid = src_node->gid;
+    auto* link_node = ker::vfs::tmpfs::tmpfs_create_hardlink(new_parent, new_name, src_node);
+    ker::vfs::tmpfs::tmpfs_unlock_tree();
+    if (link_node == nullptr) {
+        return -ENOMEM;
     }
 
-    vfs_cache_notify_path_changed(new_buf.data(), nullptr);
+    metadata_cache_note_path_changed("/", nullptr);
+    vfs_cache_notify_path_changed(old_buf.data(), new_buf.data());
     return 0;
 }
 

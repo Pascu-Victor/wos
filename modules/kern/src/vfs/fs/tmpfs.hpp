@@ -57,7 +57,9 @@ struct TmpNode {
 
     // Reference counting for POSIX unlink semantics
     std::atomic<uint32_t> open_count{0};
-    bool unlinked = false;  // true once removed from parent directory
+    std::atomic<uint32_t> link_count{1};
+    TmpNode* hardlink_target = nullptr;  // Non-owning alias target; null means canonical node.
+    bool unlinked = false;               // true once removed from parent directory
 };
 
 struct TmpfsMount {
@@ -93,8 +95,13 @@ auto tmpfs_lookup(TmpNode* dir, const char* name) -> TmpNode*;
 auto tmpfs_mkdir(TmpNode* parent, const char* name) -> TmpNode*;
 auto tmpfs_create_file(TmpNode* parent, const char* name, uint32_t create_mode = 0644) -> TmpNode*;
 auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target) -> TmpNode*;
+auto tmpfs_create_hardlink(TmpNode* parent, const char* name, TmpNode* target) -> TmpNode*;
 auto tmpfs_attach_child(TmpNode* parent, TmpNode* child) -> bool;
 auto tmpfs_detach_child(TmpNode* parent, TmpNode* child) -> bool;
+auto tmpfs_canonical_node(TmpNode* node) -> TmpNode*;
+auto tmpfs_canonical_node(const TmpNode* node) -> const TmpNode*;
+auto tmpfs_link_count(const TmpNode* node) -> uint32_t;
+void tmpfs_drop_detached_node(TmpNode* node);
 auto tmpfs_directory_is_empty(const TmpNode* dir) -> bool;
 
 // Walk a multi-component path relative to root.
