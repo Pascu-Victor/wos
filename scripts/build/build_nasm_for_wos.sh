@@ -165,6 +165,161 @@ seed_nasm_generated_files() {
     done
 }
 
+write_nasm_config_site() {
+    local tmp_config_site
+
+    mkdir -p "$NASM_BUILD"
+    tmp_config_site="$(mktemp "$NASM_BUILD/config.site.XXXXXX")"
+    cat > "$tmp_config_site" <<'EOF'
+ac_cv_c_bigendian=no
+ac_cv_c_const=yes
+ac_cv_c_future_darwin_options='none needed'
+ac_cv_c_inline=inline
+ac_cv_c_restrict=__restrict__
+ac_cv_c_undeclared_builtin_options='none needed'
+ac_cv_func__access=no
+ac_cv_func__chsize=no
+ac_cv_func__chsize_s=no
+ac_cv_func__fileno=no
+ac_cv_func__fseeki64=no
+ac_cv_func__fullpath=no
+ac_cv_func_access=yes
+ac_cv_func_canonicalize_file_name=yes
+ac_cv_func_faccessat=yes
+ac_cv_func_fileno=yes
+ac_cv_func_fseeko_ftello=yes
+ac_cv_func_fstat=yes
+ac_cv_func_ftruncate=yes
+ac_cv_func_getgid=yes
+ac_cv_func_getpagesize=yes
+ac_cv_func_getrlimit=yes
+ac_cv_func_getuid=yes
+ac_cv_func_isascii=yes
+ac_cv_func_iscntrl=yes
+ac_cv_func_mempcpy=yes
+ac_cv_func_mempset=no
+ac_cv_func_mmap_fixed_mapped=no
+ac_cv_func_pathconf=yes
+ac_cv_func_realpath=yes
+ac_cv_func_stat=yes
+ac_cv_func_strcasecmp=yes
+ac_cv_func_stricmp=no
+ac_cv_func_strlcpy=yes
+ac_cv_func_strncasecmp=yes
+ac_cv_func_strnicmp=no
+ac_cv_func_strnlen=yes
+ac_cv_func_strsep=yes
+ac_cv_func_sysconf=yes
+ac_cv_have_decl_strcasecmp=yes
+ac_cv_have_decl_stricmp=no
+ac_cv_have_decl_strlcpy=yes
+ac_cv_have_decl_strncasecmp=yes
+ac_cv_have_decl_strnicmp=no
+ac_cv_have_decl_strnlen=yes
+ac_cv_have_decl_strsep=yes
+ac_cv_header_arpa_inet_h=yes
+ac_cv_header_byteswap_h=yes
+ac_cv_header_endian_h=yes
+ac_cv_header_fcntl_h=yes
+ac_cv_header_intrin_h=no
+ac_cv_header_inttypes_h=yes
+ac_cv_header_io_h=no
+ac_cv_header_machine_endian_h=yes
+ac_cv_header_minix_config_h=no
+ac_cv_header_stdarg_h=yes
+ac_cv_header_stdbit_h=no
+ac_cv_header_stdbool_h=yes
+ac_cv_header_stdint_h=yes
+ac_cv_header_stdio_h=yes
+ac_cv_header_stdlib_h=yes
+ac_cv_header_stdnoreturn_h=yes
+ac_cv_header_string_h=yes
+ac_cv_header_strings_h=yes
+ac_cv_header_sys_endian_h=yes
+ac_cv_header_sys_mman_h=yes
+ac_cv_header_sys_param_h=yes
+ac_cv_header_sys_resource_h=yes
+ac_cv_header_sys_stat_h=yes
+ac_cv_header_sys_types_h=yes
+ac_cv_header_unistd_h=yes
+ac_cv_header_wchar_h=yes
+ac_cv_objext=o
+ac_cv_prog_cc_c23=-std=gnu23
+ac_cv_prog_cc_g=yes
+ac_cv_prog_cc_stdc=-std=gnu23
+ac_cv_prog_make_make_set=yes
+ac_cv_safe_to_define___extensions__=yes
+ac_cv_search_inflate=no
+ac_cv_should_define__xopen_source=no
+ac_cv_sys_largefile_opts='none needed'
+ac_cv_type__Bool=yes
+ac_cv_type_size_t=yes
+ac_cv_type_struct__stati64=no
+ac_cv_type_struct_stat=yes
+ac_cv_type_uintmax_t=yes
+ac_cv_type_uintptr_t=yes
+ac_cv_type_unsigned_long_long_int=yes
+pa_cv_CFLAGS__U__STRICT_ANSI__=yes
+pa_cv_CFLAGS__W=yes
+pa_cv_CFLAGS__Wall=yes
+pa_cv_CFLAGS__Werror_comment=yes
+pa_cv_CFLAGS__Werror_implicit=yes
+pa_cv_CFLAGS__Werror_missing_braces=yes
+pa_cv_CFLAGS__Werror_missing_declarations=yes
+pa_cv_CFLAGS__Werror_missing_prototypes=yes
+pa_cv_CFLAGS__Werror_pointer_arith=yes
+pa_cv_CFLAGS__Werror_return_type=yes
+pa_cv_CFLAGS__Werror_strict_prototypes=yes
+pa_cv_CFLAGS__Werror_trigraphs=yes
+pa_cv_CFLAGS__Werror_unknown_warning_option=yes
+pa_cv_CFLAGS__Werror_vla=yes
+pa_cv_CFLAGS__Wlong_long=yes
+pa_cv_CFLAGS__Wpedantic_ms_format=no
+pa_cv_CFLAGS__Wshift_negative_value=yes
+pa_cv_CFLAGS__Wstringop_truncation=no
+pa_cv_CFLAGS__Wvariadic_macros=yes
+pa_cv_CFLAGS__fdata_sections=yes
+pa_cv_CFLAGS__ffunction_sections=yes
+pa_cv_CFLAGS__fno_common=yes
+pa_cv_CFLAGS__ftrivial_auto_var_init_zero=yes
+pa_cv_CFLAGS__fvisibility_hidden=yes
+pa_cv_CFLAGS__fwrapv=yes
+pa_cv_CFLAGS__g3=yes
+pa_cv_CFLAGS__ggdb=yes
+pa_cv_CFLAGS__pedantic=yes
+pa_cv_CFLAGS__std_c23=yes
+pa_cv_CPPFLAGS__Werror_attributes=yes
+pa_cv_LDFLAGS__Wl___as_needed=yes
+pa_cv_LDFLAGS__Wl___gc_sections=yes
+pa_cv_func_S_ISREG=yes
+pa_cv_func___builtin_choose_expr=yes
+pa_cv_func___builtin_clz=yes
+pa_cv_func___builtin_clzll=yes
+pa_cv_func___builtin_constant_p=yes
+pa_cv_func___builtin_expect=yes
+pa_cv_func___builtin_prefetch=yes
+pa_cv_func___builtin_unreachable=yes
+pa_cv_func_htobe16=yes
+pa_cv_func_htobe32=yes
+pa_cv_func_htobe64=yes
+pa_cv_func_htole16=yes
+pa_cv_func_htole32=yes
+pa_cv_func_htole64=yes
+pa_cv_func_name=__func__
+pa_cv_func_snprintf=snprintf
+pa_cv_func_stdc_leading_zeros=no
+pa_cv_func_vsnprintf=vsnprintf
+pa_cv_typeof=typeof
+pa_cv_variadic_macros=yes
+EOF
+
+    if [ ! -f "$NASM_BUILD/config.site" ] || ! cmp -s "$tmp_config_site" "$NASM_BUILD/config.site"; then
+        mv "$tmp_config_site" "$NASM_BUILD/config.site"
+    else
+        rm -f "$tmp_config_site"
+    fi
+}
+
 require_file "$HOST/bin/clang" "Run tools/host-toolchain.sh first."
 require_file "$HOST/bin/ld.lld" "Run tools/host-toolchain.sh first."
 require_file "$HOST/bin/llvm-ar" "Run tools/host-toolchain.sh first."
@@ -191,6 +346,8 @@ fi
 
 mkdir -p "$NASM_BUILD" "$TARGET_SYSROOT/bin"
 printf '%s\n' "$NASM_SOURCE_DIR" > "$NASM_BUILD/source.path"
+write_nasm_config_site
+export CONFIG_SITE="$NASM_BUILD/config.site"
 
 NASM_CFLAGS="--sysroot=$TARGET_SYSROOT -O2 -g -m64 -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector"
 NASM_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
@@ -209,7 +366,8 @@ if [ -f "$NASM_BUILD/Makefile" ] && grep -F -- "-I$TARGET_SYSROOT/include" "$NAS
     rm -f "$NASM_BUILD/Makefile" "$NASM_BUILD/config.status"
 fi
 
-if [ ! -f "$NASM_BUILD/Makefile" ] || [ "$NASM_SOURCE_DIR/configure" -nt "$NASM_BUILD/Makefile" ]; then
+if [ ! -f "$NASM_BUILD/Makefile" ] || [ "$NASM_SOURCE_DIR/configure" -nt "$NASM_BUILD/Makefile" ] ||
+    [ "$NASM_BUILD/config.site" -nt "$NASM_BUILD/Makefile" ]; then
     echo "Configuring NASM for WOS..."
     wos_timed_step "configure" "nasm" \
         wos_run_env_in_dir "$NASM_BUILD" \

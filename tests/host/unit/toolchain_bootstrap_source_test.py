@@ -1073,6 +1073,58 @@ def test_nasm_script_uses_release_tarball_without_self_hosted_autogen() -> None:
         fail("NASM WOS build must not require self-hosted Automake/autogen: " + ", ".join(present))
 
 
+def test_nasm_script_preseeds_wos_target_configure_probes() -> None:
+    source = WOS_NASM_BUILD.read_text()
+    config_site_start = source.find("write_nasm_config_site()")
+    config_site_end = source.find("require_file \"$HOST/bin/clang\"", config_site_start)
+    if config_site_start < 0 or config_site_end < 0:
+        fail("NASM WOS build script must keep write_nasm_config_site before host-tool validation")
+    config_site = source[config_site_start:config_site_end]
+
+    require_tokens(
+        config_site,
+        [
+            "write_nasm_config_site()",
+            'tmp_config_site="$(mktemp "$NASM_BUILD/config.site.XXXXXX")"',
+            "ac_cv_func_canonicalize_file_name=yes",
+            "ac_cv_func_faccessat=yes",
+            "ac_cv_func_mempcpy=yes",
+            "ac_cv_func_mmap_fixed_mapped=no",
+            "ac_cv_func_strlcpy=yes",
+            "ac_cv_header_machine_endian_h=yes",
+            "ac_cv_header_stdbit_h=no",
+            "ac_cv_prog_cc_c23=-std=gnu23",
+            "ac_cv_search_inflate=no",
+            "pa_cv_CFLAGS__Werror_unknown_warning_option=yes",
+            "pa_cv_CFLAGS__ftrivial_auto_var_init_zero=yes",
+            "pa_cv_func___builtin_prefetch=yes",
+            "pa_cv_func_htole64=yes",
+            "pa_cv_func_snprintf=snprintf",
+        ],
+        "NASM WOS target configure preseeds",
+    )
+    require_tokens(
+        source,
+        [
+            "write_nasm_config_site",
+            'export CONFIG_SITE="$NASM_BUILD/config.site"',
+            '[ "$NASM_BUILD/config.site" -nt "$NASM_BUILD/Makefile" ]',
+        ],
+        "NASM config.site export and reconfigure trigger",
+    )
+    forbidden = [
+        "ac_cv_prog_CC=",
+        "ac_cv_prog_AR=",
+        "ac_cv_prog_RANLIB=",
+        "ac_cv_prog_STRIP=",
+        "ac_cv_path_install=",
+        "ac_cv_path_mkdir=",
+    ]
+    present = [token for token in forbidden if token in config_site]
+    if present:
+        fail("NASM config.site must not pin host/tool paths: " + ", ".join(present))
+
+
 def test_cpython_script_uses_target_build_triplet_on_native_wos() -> None:
     source = WOS_PYTHON_BUILD.read_text()
     require_tokens(
@@ -1881,6 +1933,7 @@ if __name__ == "__main__":
     test_bash_script_enables_dev_fd_for_process_substitution()
     test_bash_script_preseeds_wos_target_configure_probes()
     test_nasm_script_uses_release_tarball_without_self_hosted_autogen()
+    test_nasm_script_preseeds_wos_target_configure_probes()
     test_cpython_script_uses_target_build_triplet_on_native_wos()
     test_cpython_target_configure_preseeds_wos_runtime_probes()
     test_cpython_selfhost_uses_existing_build_python_when_available()
