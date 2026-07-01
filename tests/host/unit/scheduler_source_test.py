@@ -183,7 +183,7 @@ def test_idle_steal_can_migrate_normal_process_work() -> None:
             "current_task_load_for_incoming(victim_rq->current_task, task::TaskType::PROCESS)",
             "task_can_run_on_cpu(t, stealing_cpu, N)",
             "t->cpu_pinned || t->domain_hard",
-            "!t->has_run",
+            "t->type != task::TaskType::PROCESS && !t->has_run",
             "process_task_can_idle_steal(t)",
             'publish_runnable_task_locked(our_rq, stolen, "work-steal")',
         ],
@@ -196,11 +196,9 @@ def test_idle_steal_can_migrate_normal_process_work() -> None:
             "task->thread == nullptr || task->pagemap == nullptr || task->wki_proxy_task_id != 0",
             "task->preempt_disable_depth != 0 || task->deferred_task_switch || task->wants_block",
             "task->is_voluntary_blocked()",
-            "task->context.frame.cs == desc::gdt::GDT_KERN_CS",
-            "is_valid_kernel_stack(task->context.frame.rsp)",
             "return user_context_is_canonical(task);",
         ],
-        "idle steal must only migrate safe process resume contexts",
+        "idle steal must only migrate clean user process resume contexts",
     )
     require_tokens(
         probe_body,
@@ -216,6 +214,10 @@ def test_idle_steal_can_migrate_normal_process_work() -> None:
         fail("idle steal must not blanket-ban normal PROCESS migration")
     if re.search(r"if\s*\(\s*t->type\s*==\s*task::TaskType::PROCESS\s*\)\s*\{\s*continue;", steal_body):
         fail("idle steal must not skip every PROCESS task")
+    if re.search(r"if\s*\(\s*!\s*t->has_run\s*\)\s*\{\s*continue;", steal_body):
+        fail("idle steal must allow cold process placement when the process has a runnable context")
+    if "GDT_KERN_CS" in process_steal_body or "is_valid_kernel_stack" in process_steal_body:
+        fail("idle steal must not migrate voluntary-blocked process syscall kernel frames")
 
 
 def test_wait_channel_policy_uses_typed_kinds() -> None:
@@ -1109,6 +1111,7 @@ def test_context_switch_updates_tss_rsp0_to_task_stack() -> None:
     gdt_source = GDT_CPP.read_text()
     switch_body = function_body(context_source, "switch_to")
     deferred_body = function_body(scheduler_source, "deferred_task_switch")
+    start_body = function_body(scheduler_source, "start_scheduler")
     set_rsp0_body = function_body(gdt_source, "set_rsp0")
 
     require_tokens(
@@ -1168,6 +1171,29 @@ def test_context_switch_updates_tss_rsp0_to_task_stack() -> None:
         "mm::virt::switch_pagemap(next_task);",
         "deferred context switch must update TSS RSP0 before user faults can enter the new pagemap",
     )
+    require_tokens(
+        start_body,
+        [
+            "uint64_t const REAL_CPU_ID = cpu::current_cpu();",
+            "desc::gdt::set_rsp0(reinterpret_cast<uint64_t*>(first_task->context.syscall_kernel_stack), REAL_CPU_ID);",
+            "mm::virt::switch_pagemap(first_task);",
+            "sys::context_switch::restore_debug_registers_for_task(first_task);",
+            "if (ALREADY_RAN)",
+        ],
+        "scheduler first-task CPU state install",
+    )
+    require_order(
+        start_body,
+        "desc::gdt::set_rsp0(reinterpret_cast<uint64_t*>(first_task->context.syscall_kernel_stack), REAL_CPU_ID);",
+        "mm::virt::switch_pagemap(first_task);",
+        "start_scheduler must update TSS RSP0 before entering the task pagemap",
+    )
+    require_order(
+        start_body,
+        "sys::context_switch::restore_debug_registers_for_task(first_task);",
+        "if (ALREADY_RAN)",
+        "already-run first-task resume must restore or clear debug registers before return",
+    )
 
 
 def test_deferred_user_switch_commits_after_stack_handoff() -> None:
@@ -1197,6 +1223,44 @@ def test_deferred_user_switch_commits_after_stack_handoff() -> None:
         "call wos_validate_deferred_return_frame",
         "build_user_return_from_ptrs_late_commit",
         "deferred switch must validate the frame before the late user handoff",
+    )
+
+
+def test_switch_picker_evicts_unpublishable_runnable_tasks() -> None:
+    source = SCHEDULER_CPP.read_text()
+    switch_pick_body = function_body(source, "pick_best_eligible_for_switch_locked")
+    deferred_body = function_body(source, "deferred_task_switch")
+    exit_candidate_body = function_body(source, "valid_exit_switch_candidate")
+
+    require_tokens(
+        switch_pick_body,
+        [
+            "while (rq->runnable_heap.size != 0)",
+            "is_publishable_runnable_task(next) && !next->has_exited",
+            "remove_from_heap_by_scan_locked(rq, next)",
+            "next->sched_queue = task::Task::sched_queue::NONE",
+        ],
+        "switch picker must evict stale unpublishable heap entries before handoff",
+    )
+    require_tokens(
+        deferred_body,
+        [
+            "task::Task* next = pick_best_eligible_for_switch_locked(rq, AVG, current_task)",
+            "if (next == nullptr)",
+            "reserve_handoff_task_locked(rq, next, time::get_us())",
+        ],
+        "deferred switch must use validated picker before reserving handoff",
+    )
+    require_order(
+        deferred_body,
+        "task::Task* next = pick_best_eligible_for_switch_locked(rq, AVG, current_task)",
+        "reserve_handoff_task_locked(rq, next, time::get_us())",
+        "deferred switch must validate picked tasks before handoff reservation",
+    )
+    require_tokens(
+        exit_candidate_body,
+        ["is_publishable_runnable_task(candidate) && !candidate->has_exited"],
+        "exit switch candidate validity must use normal runnable publication contract",
     )
 
 
@@ -1324,6 +1388,7 @@ def main() -> None:
     test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld()
     test_context_switch_updates_tss_rsp0_to_task_stack()
     test_deferred_user_switch_commits_after_stack_handoff()
+    test_switch_picker_evicts_unpublishable_runnable_tasks()
     test_voluntary_blocked_current_cannot_hide_runnable_peer()
     test_runnable_publication_requires_successful_heap_insert()
     print("scheduler wake-token and runtime accounting invariants hold")

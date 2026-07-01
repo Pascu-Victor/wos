@@ -1554,13 +1554,7 @@ inline auto valid_exit_switch_candidate(task::Task const* candidate, task::Task 
     if (candidate == nullptr || candidate == exiting_task) {
         return false;
     }
-    if (candidate->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
-        return false;
-    }
-    if (candidate->type == task::TaskType::IDLE) {
-        return false;
-    }
-    return candidate->type != task::TaskType::PROCESS || (candidate->thread != nullptr && candidate->pagemap != nullptr);
+    return is_publishable_runnable_task(candidate) && !candidate->has_exited;
 }
 
 inline auto pick_best_eligible_excluding_locked(RunQueue* rq, int64_t avg_vruntime, task::Task const* excluded) -> task::Task* {
@@ -1599,14 +1593,26 @@ inline auto pick_best_eligible_for_switch_locked(RunQueue* rq, int64_t avg_vrunt
         return nullptr;
     }
 
-    task::Task* next = rq->runnable_heap.pick_best_eligible(avg_vruntime);
-    if (next == current_task && current_task != nullptr && current_task->is_voluntary_blocked() && rq->runnable_heap.size > 1) {
-        task::Task* alternate = pick_best_eligible_excluding_locked(rq, avg_vruntime, current_task);
-        if (alternate != nullptr) {
-            return alternate;
+    while (rq->runnable_heap.size != 0) {
+        task::Task* next = rq->runnable_heap.pick_best_eligible(avg_vruntime);
+        if (next == current_task && current_task != nullptr && current_task->is_voluntary_blocked() && rq->runnable_heap.size > 1) {
+            task::Task* alternate = pick_best_eligible_excluding_locked(rq, avg_vruntime, current_task);
+            if (alternate != nullptr) {
+                next = alternate;
+            }
+        }
+        if (is_publishable_runnable_task(next) && !next->has_exited) {
+            return next;
+        }
+
+        if (!remove_from_heap_by_scan_locked(rq, next)) {
+            return nullptr;
+        }
+        if (next != nullptr) {
+            next->sched_queue = task::Task::sched_queue::NONE;
         }
     }
-    return next;
+    return nullptr;
 }
 
 inline auto pick_exit_switch_candidate_locked(RunQueue* rq, task::Task* exiting_task) -> task::Task* {
@@ -2018,8 +2024,7 @@ inline auto process_task_can_idle_steal(task::Task const* task) -> bool {
         return false;
     }
     if (task->is_voluntary_blocked()) {
-        return task->context.frame.cs == desc::gdt::GDT_KERN_CS && task->context.frame.ss == desc::gdt::GDT_KERN_DS &&
-               is_valid_kernel_stack(task->context.frame.rsp);
+        return false;
     }
 
     return user_context_is_canonical(task);
@@ -2201,7 +2206,7 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
                 if (t->type == task::TaskType::IDLE) {
                     continue;
                 }
-                if (!t->has_run) {
+                if (t->type != task::TaskType::PROCESS && !t->has_run) {
                     continue;
                 }
                 if (!process_task_can_idle_steal(t)) {
@@ -4412,6 +4417,7 @@ void start_scheduler() {
         cpu_set_msr(IA32_KERNEL_GS_BASE, first_task->context.syscall_scratch_area);
     }
 
+    desc::gdt::set_rsp0(reinterpret_cast<uint64_t*>(first_task->context.syscall_kernel_stack), REAL_CPU_ID);
     mm::virt::switch_pagemap(first_task);
 
     // Update debug task pointer
@@ -4433,6 +4439,7 @@ void start_scheduler() {
     if (first_task->type == task::TaskType::PROCESS && first_task->fx_state.saved) {
         sys::context_switch::restore_fpu_state(first_task);
     }
+    sys::context_switch::restore_debug_registers_for_task(first_task);
 
     if (ALREADY_RAN) {
 // Task was already running on another CPU and was migrated here.
@@ -4656,7 +4663,10 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         if (rq->runnable_heap.size == 0) {
             return nullptr;
         }
-        task::Task* next = rq->runnable_heap.pick_best_eligible(AVG);
+        task::Task* next = pick_best_eligible_for_switch_locked(rq, AVG, current_task);
+        if (next == nullptr) {
+            return nullptr;
+        }
         reserve_handoff_task_locked(rq, next, time::get_us());
         return next;
     });
