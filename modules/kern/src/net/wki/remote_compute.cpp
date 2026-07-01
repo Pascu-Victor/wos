@@ -3999,11 +3999,39 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
         return;
     }
 
+    // Track for completion monitoring before the task can run. A very short
+    // task, including one that fails immediately in the userspace loader, can
+    // reach exit_notify_ready before post_task_balanced() returns.
+    RunningRemoteTask rt;
+    rt.active = true;
+    rt.task_id = submit->task_id;
+    rt.submitter_node = hdr->src_node;
+    rt.local_pid = LAUNCHED_PID;
+    rt.task = completion_task_ref;
+    rt.output = EXEC.output;
+    s_compute_lock.lock();
+    g_running_remote_tasks.push_back(rt);
+    s_compute_lock.unlock();
+
     // Post to scheduler
     if (!ker::mod::sched::post_task_balanced(new_task)) {
+        TaskOutputCapture* output_to_delete = EXEC.output;
+
+        s_compute_lock.lock();
+        if (auto* running = find_running_task(submit->task_id, hdr->src_node); running != nullptr) {
+            if (running->task != nullptr) {
+                running->task = nullptr;
+            }
+            output_to_delete = running->output;
+            running->output = nullptr;
+            running->active = false;
+        }
+        compact_running_remote_tasks_locked();
+        s_compute_lock.unlock();
+
         completion_task_ref->release();
         delete new_task;
-        delete EXEC.output;
+        delete output_to_delete;
         TaskResponsePayload reject = {};
         reject.task_id = submit->task_id;
         reject.status = static_cast<uint8_t>(TaskRejectReason::OVERLOADED);
@@ -4018,18 +4046,6 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     // before the task can complete and be reclaimed.
     launched_cpu = static_cast<int>(new_task->cpu);
 #endif
-
-    // Track for completion monitoring (use saved PID, not exec.task->pid)
-    RunningRemoteTask rt;
-    rt.active = true;
-    rt.task_id = submit->task_id;
-    rt.submitter_node = hdr->src_node;
-    rt.local_pid = LAUNCHED_PID;
-    rt.task = completion_task_ref;
-    rt.output = EXEC.output;
-    s_compute_lock.lock();
-    g_running_remote_tasks.push_back(rt);
-    s_compute_lock.unlock();
 
     // Send TASK_ACCEPT
     TaskResponsePayload accept = {};
