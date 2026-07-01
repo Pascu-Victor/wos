@@ -19,7 +19,7 @@ def fail(message: str) -> None:
 
 def function_body(source: str, name: str) -> str:
     match = re.search(
-        rf"\bauto\s+{re.escape(name)}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>*]+)?\s*\{{",
+        rf"\b(?:auto|void)\s+{re.escape(name)}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>*]+)?\s*\{{",
         source,
     )
     if match is None:
@@ -48,6 +48,15 @@ def require_absent(source: str, token: str, context: str) -> None:
         fail(f"{context}: unexpected {token!r}")
 
 
+def require_order(source: str, tokens: list[str], context: str) -> None:
+    cursor = 0
+    for token in tokens:
+        found = source.find(token, cursor)
+        if found < 0:
+            fail(f"{context}: missing ordered token {token!r}")
+        cursor = found + len(token)
+
+
 def main() -> None:
     block_source = BLOCK_DEVICE.read_text()
     ahci_source = AHCI.read_text()
@@ -60,6 +69,51 @@ def main() -> None:
         body = function_body(block_source, name)
         require(body, "normalize_io_result(", f"{name} must normalize driver errors")
         require_absent(body, "return -1;", f"{name} must not leak raw -1")
+
+    register_body = function_body(block_source, "block_device_register")
+    unregister_body = function_body(block_source, "block_device_unregister")
+    remove_node_body = function_body(block_source, "remove_block_dev_node")
+
+    require(block_source, "ker::util::SmallVec<Device*, BDEV_INLINE_ALLOC_COUNT> block_dev_nodes;", "block /dev wrappers must be pointer-stable")
+    require_absent(
+        block_source,
+        "ker::util::SmallVec<Device, BDEV_INLINE_ALLOC_COUNT> block_dev_nodes;",
+        "block /dev wrappers must not be stored by value",
+    )
+    require_order(
+        register_body,
+        [
+            "auto* dev_node = new (std::nothrow) Device{}",
+            "if (dev_node == nullptr)",
+            "block_devices.remove_at(block_devices.size() - 1)",
+            "dev_node->private_data = bdev",
+            "if (!block_dev_nodes.push_back(dev_node))",
+            "delete dev_node",
+            "block_devices.remove_at(block_devices.size() - 1)",
+            "if (dev_register(dev_node) != 0)",
+            "block_dev_nodes.remove_at(block_dev_nodes.size() - 1)",
+            "delete dev_node",
+            "block_devices.remove_at(block_devices.size() - 1)",
+        ],
+        "block device register must own stable /dev wrappers and unwind failures",
+    )
+    require_absent(
+        register_body,
+        "dev_register(&block_dev_nodes.at",
+        "block device register must not register addresses inside SmallVec storage",
+    )
+    require_order(
+        remove_node_body,
+        [
+            "size_t const NODE_INDEX = find_block_dev_node_index(bdev)",
+            "Device* dev_node = block_dev_nodes.at(NODE_INDEX)",
+            "static_cast<void>(dev_unregister(dev_node))",
+            "block_dev_nodes.remove_at(NODE_INDEX)",
+            "delete dev_node",
+        ],
+        "block device unregister must remove and free /dev wrapper",
+    )
+    require(unregister_body, "remove_block_dev_node(bdev);", "block device unregister must free /dev wrapper storage")
 
     for name in ("partition_read", "partition_write", "partition_flush"):
         body = function_body(block_source, name)

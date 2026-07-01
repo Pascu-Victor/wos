@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <dev/gpt.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <span>
@@ -23,7 +24,7 @@ namespace {
 constexpr auto BDEV_INLINE_ALLOC_COUNT = 8;
 constexpr size_t MAX_BLOCK_IO_BYTES = size_t{16} * 1024 * 1024;
 ker::util::SmallVec<BlockDevice*, BDEV_INLINE_ALLOC_COUNT> block_devices;
-ker::util::SmallVec<Device, BDEV_INLINE_ALLOC_COUNT> block_dev_nodes;
+ker::util::SmallVec<Device*, BDEV_INLINE_ALLOC_COUNT> block_dev_nodes;
 
 auto max_io_blocks(BlockDevice const* bdev) -> size_t {
     if (bdev == nullptr || bdev->block_size == 0) {
@@ -62,6 +63,28 @@ auto normalize_io_result(int rc) -> int {
     }
     return (rc < 0) ? rc : -rc;
 }
+
+auto find_block_dev_node_index(BlockDevice const* bdev) -> size_t {
+    for (size_t i = 0; i < block_dev_nodes.size(); ++i) {
+        Device* dev_node = block_dev_nodes.at(i);
+        if (dev_node != nullptr && dev_node->private_data == bdev) {
+            return i;
+        }
+    }
+    return block_dev_nodes.size();
+}
+
+void remove_block_dev_node(BlockDevice const* bdev) {
+    size_t const NODE_INDEX = find_block_dev_node_index(bdev);
+    if (NODE_INDEX >= block_dev_nodes.size()) {
+        return;
+    }
+
+    Device* dev_node = block_dev_nodes.at(NODE_INDEX);
+    static_cast<void>(dev_unregister(dev_node));
+    block_dev_nodes.remove_at(NODE_INDEX);
+    delete dev_node;
+}
 }  // namespace
 
 auto block_device_register(BlockDevice* bdev) -> int {
@@ -79,22 +102,37 @@ auto block_device_register(BlockDevice* bdev) -> int {
 
     // Also register as a device node in /dev
     // Create a Device wrapper for this block device
-    Device dev_node{};
-    dev_node.major = bdev->major;
-    dev_node.minor = bdev->minor;
-    dev_node.name = bdev->name.data();
-    dev_node.type = DeviceType::BLOCK;
-    dev_node.private_data = bdev;
-    dev_node.char_ops = nullptr;  // Block devices don't use char ops
-
-    if (!block_dev_nodes.push_back(dev_node)) {
+    auto* dev_node = new (std::nothrow) Device{};
+    if (dev_node == nullptr) {
         // Undo block_devices push
         block_devices.remove_at(block_devices.size() - 1);
         log::warn("block_device_register: dev node alloc failed (OOM)");
         return -1;
     }
 
-    dev_register(&block_dev_nodes.at(block_dev_nodes.size() - 1));
+    dev_node->major = bdev->major;
+    dev_node->minor = bdev->minor;
+    dev_node->name = bdev->name.data();
+    dev_node->type = DeviceType::BLOCK;
+    dev_node->private_data = bdev;
+    dev_node->char_ops = nullptr;  // Block devices don't use char ops
+
+    if (!block_dev_nodes.push_back(dev_node)) {
+        delete dev_node;
+        // Undo block_devices push
+        block_devices.remove_at(block_devices.size() - 1);
+        log::warn("block_device_register: dev node table full (OOM)");
+        return -1;
+    }
+
+    if (dev_register(dev_node) != 0) {
+        block_dev_nodes.remove_at(block_dev_nodes.size() - 1);
+        delete dev_node;
+        // Undo block_devices push
+        block_devices.remove_at(block_devices.size() - 1);
+        log::warn("block_device_register: /dev registration failed");
+        return -1;
+    }
 
     mod::perf::record_container_stat(0, 0, mod::perf::PerfSubsystem::BLOCK_DEV, 0, mod::perf::PERF_FLAG_CT_INSERT,
                                      static_cast<int64_t>(block_devices.size()), 0, 0);
@@ -111,10 +149,7 @@ auto block_device_unregister(BlockDevice* bdev) -> int {
             block_devices.remove(i);
 
             // Also remove the corresponding /dev node
-            Device* dev_node = dev_find_by_name(bdev->name.data());
-            if (dev_node != nullptr && dev_node->private_data == bdev) {
-                dev_unregister(dev_node);
-            }
+            remove_block_dev_node(bdev);
 
             mod::perf::record_container_stat(0, 0, mod::perf::PerfSubsystem::BLOCK_DEV, 0, mod::perf::PERF_FLAG_CT_REMOVE,
                                              static_cast<int64_t>(block_devices.size()), 0, 0);
