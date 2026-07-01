@@ -345,6 +345,20 @@ auto wki_crc32_continue(uint32_t prev_crc, const void* data, size_t len) -> uint
     return crc ^ 0xFFFFFFFF;
 }
 
+namespace {
+
+auto wki_frame_checksum(const WkiHeader& hdr, const uint8_t* payload) -> uint32_t {
+    WkiHeader hdr_copy = hdr;
+    hdr_copy.checksum = 0;
+    uint32_t crc = wki_crc32(&hdr_copy, WKI_HEADER_SIZE);
+    if (hdr.payload_len > 0) {
+        crc = wki_crc32_continue(crc, payload, hdr.payload_len);
+    }
+    return crc;
+}
+
+}  // namespace
+
 // -----------------------------------------------------------------------------
 // V2: Async Wait Queue
 // Lock-free polling via kern_yield() - matches existing WKI blocking patterns.
@@ -1564,7 +1578,7 @@ auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint
     if (peer != nullptr && peer->is_direct) {
         hdr->checksum = 0;
     } else {
-        hdr->checksum = wki_crc32(frame, FRAME_LEN);
+        hdr->checksum = wki_frame_checksum(*hdr, frame + WKI_HEADER_SIZE);
     }
 
     int ret = 0;
@@ -1717,7 +1731,7 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
     if (peer->is_direct) {
         hdr->checksum = 0;  // RX path skips validation when checksum == 0
     } else {
-        hdr->checksum = wki_crc32(frame, FRAME_LEN);
+        hdr->checksum = wki_frame_checksum(*hdr, frame + WKI_HEADER_SIZE);
     }
 
     // Queue for retransmit - use inline entry if available, else allocate from heap
@@ -2019,14 +2033,8 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
 
     // Checksum verification (if non-zero)
     if (hdr->checksum != 0) {
-        // Compute CRC32 over header with checksum field zeroed, then payload
-        WkiHeader hdr_copy = *hdr;
-        hdr_copy.checksum = 0;
-        uint32_t crc = wki_crc32(&hdr_copy, WKI_HEADER_SIZE);
-        if (hdr->payload_len > 0) {
-            crc = wki_crc32_continue(crc, static_cast<const uint8_t*>(data) + WKI_HEADER_SIZE, hdr->payload_len);
-        }
-        if (crc != hdr->checksum) {
+        uint32_t const CRC = wki_frame_checksum(*hdr, static_cast<const uint8_t*>(data) + WKI_HEADER_SIZE);
+        if (CRC != hdr->checksum) {
             return;  // corrupted frame
         }
     }
@@ -2062,6 +2070,9 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
 
         auto* fwd_hdr = reinterpret_cast<WkiHeader*>(fwd_frame);
         fwd_hdr->hop_ttl--;
+        if (fwd_hdr->checksum != 0) {
+            fwd_hdr->checksum = wki_frame_checksum(*fwd_hdr, fwd_frame + WKI_HEADER_SIZE);
+        }
 
         fwd_transport->tx(fwd_transport, NEXT_HOP, fwd_frame, len);
         delete[] fwd_frame;

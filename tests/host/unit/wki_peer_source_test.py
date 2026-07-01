@@ -399,6 +399,49 @@ def test_ack_only_frames_do_not_refresh_peer_liveness() -> None:
         fail("wki_rx must not refresh peer liveness for every validated frame before ACK filtering")
 
 
+def test_forwarding_recomputes_checksum_after_ttl_decrement() -> None:
+    source = WKI_CPP.read_text()
+    checksum_body = function_body(source, "wki_frame_checksum")
+    body = function_body(source, "wki_rx")
+
+    require_order(
+        checksum_body,
+        "WkiHeader hdr_copy = hdr",
+        "hdr_copy.checksum = 0",
+        "checksum helper must zero the checksum field before computing CRC",
+    )
+    require_order(
+        checksum_body,
+        "uint32_t crc = wki_crc32(&hdr_copy, WKI_HEADER_SIZE)",
+        "crc = wki_crc32_continue(crc, payload, hdr.payload_len)",
+        "checksum helper must cover header and payload",
+    )
+    require_order(
+        body,
+        "if (hdr->checksum != 0)",
+        "uint32_t const CRC = wki_frame_checksum(*hdr, static_cast<const uint8_t*>(data) + WKI_HEADER_SIZE)",
+        "RX checksum validation must use the shared WKI frame checksum helper",
+    )
+    require_order(
+        body,
+        "fwd_hdr->hop_ttl--",
+        "if (fwd_hdr->checksum != 0)",
+        "forwarding must test whether a checksum needs refreshing after TTL mutation",
+    )
+    require_order(
+        body,
+        "if (fwd_hdr->checksum != 0)",
+        "fwd_hdr->checksum = wki_frame_checksum(*fwd_hdr, fwd_frame + WKI_HEADER_SIZE)",
+        "forwarding must recompute checksums after TTL mutation",
+    )
+    require_order(
+        body,
+        "fwd_hdr->checksum = wki_frame_checksum(*fwd_hdr, fwd_frame + WKI_HEADER_SIZE)",
+        "fwd_transport->tx(fwd_transport, NEXT_HOP, fwd_frame, len)",
+        "forwarding must transmit only after checksum refresh",
+    )
+
+
 def test_ipc_data_acks_before_ordered_dispatch() -> None:
     source = WKI_CPP.read_text()
     body = function_body(source, "wki_rx")
@@ -441,6 +484,7 @@ def main() -> None:
     test_fence_notify_rejects_invalid_targets_before_routing()
     test_shutdown_uses_graceful_goodbye_not_fence()
     test_ack_only_frames_do_not_refresh_peer_liveness()
+    test_forwarding_recomputes_checksum_after_ttl_decrement()
     test_ipc_data_acks_before_ordered_dispatch()
     print("WKI peer source invariants hold")
 
