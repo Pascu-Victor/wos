@@ -55,6 +55,10 @@ using log = ker::mod::dbg::logger<"vfs">;
 
 // Keep in sync with userspace fcntl.h (Linux-compatible octal values)
 constexpr int O_NONBLOCK = 04000;
+constexpr int O_RDONLY_MODE = 0;
+constexpr int O_WRONLY_MODE = 1;
+constexpr int O_RDWR_MODE = 2;
+constexpr int O_ACCMODE_MASK = 3;
 
 namespace {
 constexpr size_t MAX_PATH_LEN = 512;
@@ -5056,6 +5060,24 @@ auto vfs_close(int fd) -> int {
     return vfs_destroy_file(f);
 }
 
+namespace {
+auto vfs_file_can_read(const File* file) -> bool {
+    if (file == nullptr) {
+        return false;
+    }
+    int const ACCMODE = file->open_flags & O_ACCMODE_MASK;
+    return ACCMODE == O_RDONLY_MODE || ACCMODE == O_RDWR_MODE;
+}
+
+auto vfs_file_can_write(const File* file) -> bool {
+    if (file == nullptr) {
+        return false;
+    }
+    int const ACCMODE = file->open_flags & O_ACCMODE_MASK;
+    return ACCMODE == O_WRONLY_MODE || ACCMODE == O_RDWR_MODE;
+}
+}  // namespace
+
 auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
     ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
     if (t == nullptr) {
@@ -5063,6 +5085,10 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
     }
     ker::vfs::File* f = vfs_get_file_retain(t, fd);
     if (f == nullptr) {
+        return -EBADF;
+    }
+    if (!vfs_file_can_read(f)) {
+        vfs_put_file(f);
         return -EBADF;
     }
     if ((f->fops == nullptr) || (f->fops->vfs_read == nullptr)) {
@@ -5102,6 +5128,9 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
 
 auto vfs_write_file(File* f, const void* buf, size_t count, size_t* actual_size) -> ssize_t {
     if (f == nullptr) {
+        return -EBADF;
+    }
+    if (!vfs_file_can_write(f)) {
         return -EBADF;
     }
     if ((f->fops == nullptr) || (f->fops->vfs_write == nullptr)) {
@@ -7104,6 +7133,10 @@ auto vfs_pread(int fd, void* buf, size_t count, off_t offset) -> ssize_t {
     if (f == nullptr) {
         return -EBADF;
     }
+    if (!vfs_file_can_read(f)) {
+        vfs_put_file(f);
+        return -EBADF;
+    }
     if (f->fops == nullptr || f->fops->vfs_read == nullptr) {
         vfs_put_file(f);
         return -ENOSYS;
@@ -7128,6 +7161,9 @@ auto vfs_pread_file(File* f, void* buf, size_t count, off_t offset) -> ssize_t {
     if (f == nullptr) {
         return -EBADF;
     }
+    if (!vfs_file_can_read(f)) {
+        return -EBADF;
+    }
     if (f->fops == nullptr || f->fops->vfs_read == nullptr) {
         return -ENOSYS;
     }
@@ -7145,6 +7181,9 @@ auto vfs_pread_file(File* f, void* buf, size_t count, off_t offset) -> ssize_t {
 
 auto vfs_pread_file_direct(File* f, void* buf, size_t count, off_t offset) -> ssize_t {
     if (f == nullptr) {
+        return -EBADF;
+    }
+    if (!vfs_file_can_read(f)) {
         return -EBADF;
     }
     if (f->fops == nullptr || f->fops->vfs_read == nullptr) {
@@ -7169,6 +7208,10 @@ auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t 
     }
     auto* f = vfs_get_file_retain(task, fd);
     if (f == nullptr) {
+        return -EBADF;
+    }
+    if (!vfs_file_can_write(f)) {
+        vfs_put_file(f);
         return -EBADF;
     }
     if (f->fops == nullptr || f->fops->vfs_write == nullptr) {

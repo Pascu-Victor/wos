@@ -61,6 +61,91 @@ def test_pread_paths_bypass_stream_cache() -> None:
         )
 
 
+def test_vfs_fd_access_modes_gate_io_before_backend_dispatch() -> None:
+    source = CORE_CPP.read_text()
+    for token in [
+        "constexpr int O_RDONLY_MODE = 0;",
+        "constexpr int O_WRONLY_MODE = 1;",
+        "constexpr int O_RDWR_MODE = 2;",
+        "constexpr int O_ACCMODE_MASK = 3;",
+    ]:
+        if token not in source:
+            fail(f"VFS access mode constants are missing {token!r}")
+
+    read_helper = function_body(source, "vfs_file_can_read")
+    require_order(
+        read_helper,
+        [
+            "int const ACCMODE = file->open_flags & O_ACCMODE_MASK",
+            "return ACCMODE == O_RDONLY_MODE || ACCMODE == O_RDWR_MODE",
+        ],
+        "read access helper",
+    )
+
+    write_helper = function_body(source, "vfs_file_can_write")
+    require_order(
+        write_helper,
+        [
+            "int const ACCMODE = file->open_flags & O_ACCMODE_MASK",
+            "return ACCMODE == O_WRONLY_MODE || ACCMODE == O_RDWR_MODE",
+        ],
+        "write access helper",
+    )
+
+    read_body = function_body(source, "vfs_read")
+    require_order(
+        read_body,
+        [
+            "if (!vfs_file_can_read(f))",
+            "vfs_put_file(f)",
+            "return -EBADF",
+            "if ((f->fops == nullptr) || (f->fops->vfs_read == nullptr))",
+            "vfs_stream_cache_try_read",
+            "f->fops->vfs_read(f, buf, count, static_cast<size_t>(f->pos))",
+        ],
+        "vfs_read access gating",
+    )
+
+    write_file_body = function_body(source, "vfs_write_file")
+    require_order(
+        write_file_body,
+        [
+            "if (!vfs_file_can_write(f))",
+            "return -EBADF",
+            "if ((f->fops == nullptr) || (f->fops->vfs_write == nullptr))",
+            "f->fops->vfs_write(f, buf, count, static_cast<size_t>(f->pos))",
+        ],
+        "vfs_write_file access gating",
+    )
+
+    for name in ("vfs_pread", "vfs_pwrite"):
+        body = function_body(source, name)
+        helper = "vfs_file_can_read" if name == "vfs_pread" else "vfs_file_can_write"
+        fop = "vfs_read" if name == "vfs_pread" else "vfs_write"
+        require_order(
+            body,
+            [
+                f"if (!{helper}(f))",
+                "vfs_put_file(f)",
+                "return -EBADF",
+                f"f->fops->{fop}",
+            ],
+            f"{name} access gating",
+        )
+
+    for name in ("vfs_pread_file", "vfs_pread_file_direct"):
+        body = function_body(source, name)
+        require_order(
+            body,
+            [
+                "if (!vfs_file_can_read(f))",
+                "return -EBADF",
+                "f->fops->vfs_read",
+            ],
+            f"{name} access gating",
+        )
+
+
 def test_positional_io_rejects_negative_offsets_before_unsigned_conversion() -> None:
     source = CORE_CPP.read_text()
     helper = function_body(source, "validate_positional_offset")
@@ -167,6 +252,7 @@ def test_loader_path_trace_is_compile_time_disabled_by_default() -> None:
 
 def main() -> None:
     test_pread_paths_bypass_stream_cache()
+    test_vfs_fd_access_modes_gate_io_before_backend_dispatch()
     test_positional_io_rejects_negative_offsets_before_unsigned_conversion()
     test_ktest_covers_pread_contract()
     test_local_xfs_reads_bypass_stream_cache()
