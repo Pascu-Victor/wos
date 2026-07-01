@@ -72,6 +72,29 @@ void store_page_kind(std::atomic<uint8_t>& slot, PageKind kind) {
     slot.store(static_cast<uint8_t>(decode_page_kind(static_cast<uint8_t>(kind))), std::memory_order_release);
 }
 
+auto page_kind_name(PageKind kind) -> const char* {
+    switch (kind) {
+        case PageKind::UNKNOWN:
+            return "UNKNOWN";
+        case PageKind::FREE:
+            return "FREE";
+        case PageKind::RESERVED:
+            return "RESERVED";
+        case PageKind::NORMAL:
+            return "NORMAL";
+        case PageKind::PAGE_TABLE:
+            return "PAGE_TABLE";
+        case PageKind::SLAB:
+            return "SLAB";
+        case PageKind::MEDIUM:
+            return "MEDIUM";
+        case PageKind::KMALLOC_LARGE:
+            return "KMALLOC_LARGE";
+        default:
+            return "INVALID";
+    }
+}
+
 void fill_page_kinds(std::atomic<uint8_t>* kinds, uint32_t count, PageKind kind) {
     if (count == 0) {
         return;
@@ -162,6 +185,57 @@ auto remove_free_block(PageAllocator* alloc, int order, PageAllocator::FreeBlock
     return true;
 }
 
+struct FreeBlockPageIssue {
+    uint32_t free_head_idx;
+    uint32_t bad_page_idx;
+};
+
+[[noreturn]] void panic_non_reusable_free_block_page(PageAllocator* alloc, FreeBlockPageIssue issue, int order, const char* reason) {
+    PageKind const KIND = decode_page_kind(alloc->page_kinds[issue.bad_page_idx].load(std::memory_order_acquire));
+    uint32_t const REFCOUNT = alloc->page_refcounts[issue.bad_page_idx].load(std::memory_order_acquire);
+    dbg::emergency_log(
+        "page_alloc: free block overlaps non-reusable page reason=%s zone_base=0x%lx block_idx=%lu order=%lu page_idx=%lu "
+        "page=0x%lx flags=0x%lx kind=%s ref=%lu\n",
+        reason != nullptr ? reason : "?", alloc->base, static_cast<uint64_t>(issue.free_head_idx), static_cast<uint64_t>(order),
+        static_cast<uint64_t>(issue.bad_page_idx), reinterpret_cast<uint64_t>(page_to_ptr(alloc->base, issue.bad_page_idx)),
+        static_cast<uint64_t>(alloc->page_flags[issue.bad_page_idx]), page_kind_name(KIND), static_cast<uint64_t>(REFCOUNT));
+    ker::mod::dbg::panic_handler("page_alloc free block overlaps live page");
+    __builtin_unreachable();
+}
+
+auto free_block_pages_are_reusable(PageAllocator* alloc, uint32_t page_idx, int order, const char* reason) -> bool {
+    if (order < 0 || order > PageAllocator::MAX_ORDER) {
+        return false;
+    }
+
+    uint32_t const BLOCK_SIZE = 1U << order;
+    if (page_idx >= alloc->total_pages || page_idx + BLOCK_SIZE > alloc->total_pages) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < BLOCK_SIZE; ++i) {
+        uint32_t const CUR_IDX = page_idx + i;
+        uint8_t const EXPECTED_FLAGS =
+            i == 0 ? static_cast<uint8_t>(PageAllocator::FLAG_FREE_HEAD | static_cast<uint8_t>(order)) : PageAllocator::FLAG_FREE_INTERIOR;
+        if (alloc->page_flags[CUR_IDX] != EXPECTED_FLAGS) {
+            panic_non_reusable_free_block_page(alloc, {.free_head_idx = page_idx, .bad_page_idx = CUR_IDX}, order, reason);
+        }
+        if (decode_page_kind(alloc->page_kinds[CUR_IDX].load(std::memory_order_acquire)) != PageKind::FREE) {
+            panic_non_reusable_free_block_page(alloc, {.free_head_idx = page_idx, .bad_page_idx = CUR_IDX}, order, reason);
+        }
+        if (alloc->page_refcounts[CUR_IDX].load(std::memory_order_acquire) != 0) {
+            panic_non_reusable_free_block_page(alloc, {.free_head_idx = page_idx, .bad_page_idx = CUR_IDX}, order, reason);
+        }
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+        if (alloc->page_callers[CUR_IDX] != 0) {
+            panic_non_reusable_free_block_page(alloc, {.free_head_idx = page_idx, .bad_page_idx = CUR_IDX}, order, reason);
+        }
+#endif
+    }
+
+    return true;
+}
+
 void rebuild_free_lists_from_flags(PageAllocator* alloc, const char* reason) {
     dbg::emergency_log("page_alloc: rebuilding free lists reason=%s zone_base=0x%lx\n", reason != nullptr ? reason : "?", alloc->base);
 
@@ -198,6 +272,10 @@ void rebuild_free_lists_from_flags(PageAllocator* alloc, const char* reason) {
             dbg::emergency_log("page_alloc: rebuild skipping out-of-range free head order=%lu page=%lu total=%lu\n",
                                static_cast<uint64_t>(ORDER), static_cast<uint64_t>(page_idx), static_cast<uint64_t>(alloc->total_pages));
             alloc->page_flags[page_idx] = PageAllocator::FLAG_FREE_INTERIOR;
+            page_idx++;
+            continue;
+        }
+        if (!free_block_pages_are_reusable(alloc, page_idx, ORDER, "rebuild free head")) {
             page_idx++;
             continue;
         }
@@ -546,6 +624,10 @@ void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
 
     if (k > MAX_ORDER) {
         return nullptr;  // OOM
+    }
+
+    if (!free_block_pages_are_reusable(this, page_idx, k, "alloc candidate")) {
+        return nullptr;
     }
 
     // Split down: put the upper buddy of each split into the free list.

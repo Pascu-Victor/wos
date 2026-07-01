@@ -1155,24 +1155,6 @@ enum class ReturnedPageZeroing : uint8_t {
     FULL_OVERWRITE,
 };
 
-void detect_live_slab_page_in_returned_block(void* block, uint64_t scan_size, const char* source) {
-    if (block == nullptr || scan_size == 0) {
-        return;
-    }
-
-    constexpr uint32_t SLAB_MAGIC = 0x8CBEEFC8;
-    auto const BASE = reinterpret_cast<uint64_t>(block);
-    for (uint64_t offset = 0; offset < scan_size; offset += paging::PAGE_SIZE) {
-        auto const* page = reinterpret_cast<const volatile uint32_t*>(BASE + offset);
-        if (*page != SLAB_MAGIC) {
-            continue;
-        }
-        log::critical("DETECT: pageAlloc (%s) returning live slab page - double-alloc trap! virt=%p offset=0x%llx", source,
-                      reinterpret_cast<void*>(BASE + offset), static_cast<unsigned long long>(offset));
-        hcf();
-    }
-}
-
 void prepare_allocated_block(void* block, uint64_t size, ReturnedPageZeroing zeroing) {
     uint64_t saved_cr3 = 0;
     if (zeroing == ReturnedPageZeroing::ZERO && kernel_cr3 != 0) {
@@ -1296,7 +1278,6 @@ auto try_alloc_from_per_cpu_cache(uint64_t caller_tag, ReturnedPageZeroing zeroi
     page_cache_alloc_hits.fetch_add(1, std::memory_order_relaxed);
     note_physical_alloc(paging::PAGE_SIZE);
 
-    detect_live_slab_page_in_returned_block(page, paging::PAGE_SIZE, "cache");
     prepare_allocated_block(page, paging::PAGE_SIZE, zeroing);
 
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
@@ -1406,10 +1387,8 @@ auto page_alloc_impl(uint64_t size, std::string_view name, ReturnedPageZeroing z
         hcf();
     }
 
-    // Zero outside the lock - the block is exclusively ours now
-    // Double-alloc sentinel: if any page still holds a live slab header it was
-    // freed while still referenced by the slab chain.
-    detect_live_slab_page_in_returned_block(block, buddy_accounting_size(size), "buddy");
+    // Zero outside the lock - the block is exclusively ours now. The owning
+    // PageAllocator validates free-block metadata before publishing the block.
     prepare_allocated_block(block, size, zeroing);
 
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
@@ -1516,8 +1495,8 @@ auto page_alloc_huge(uint64_t size) -> void* {
 
     note_physical_alloc(buddy_accounting_size(size));
 
-    // Zero outside the lock - the block is exclusively ours now
-    detect_live_slab_page_in_returned_block(block, buddy_accounting_size(size), "huge");
+    // Zero outside the lock - the block is exclusively ours now. The owning
+    // PageAllocator validates free-block metadata before publishing the block.
     uint64_t saved_cr3 = 0;
     if (kernel_cr3 != 0) {
         uint64_t const CURRENT_CR3 = rdcr3();

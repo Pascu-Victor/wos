@@ -194,57 +194,74 @@ def test_direct_page_free_rejects_refcounted_blocks() -> None:
 def test_live_slab_pages_are_not_reused_by_physical_allocator() -> None:
     page_alloc = PAGE_ALLOC_CPP.read_text()
     phys = PHYS_CPP.read_text()
+    ktest = MM_KTEST.read_text()
 
     require_tokens(
         page_alloc,
         [
             "auto page_has_live_slab_kind(PageAllocator* alloc, uint32_t page_idx) -> bool",
             "PageKind::SLAB",
+            "auto free_block_pages_are_reusable(PageAllocator* alloc, uint32_t page_idx, int order, const char* reason) -> bool",
+            "struct FreeBlockPageIssue",
+            "panic_non_reusable_free_block_page(alloc, {.free_head_idx = page_idx, .bad_page_idx = CUR_IDX}, order, reason)",
+            "ker::mod::dbg::panic_handler(\"page_alloc free block overlaps live page\")",
+            "decode_page_kind(alloc->page_kinds[CUR_IDX].load(std::memory_order_acquire)) != PageKind::FREE",
+            "alloc->page_refcounts[CUR_IDX].load(std::memory_order_acquire) != 0",
             "report_live_slab_page_free(this, PAGE_IDX, \"page cache free\")",
             "report_live_slab_page_free(this, page_idx + i, \"page_free\")",
             "report_live_slab_page_free(this, page_idx, \"page_free_order0\")",
             "report_live_slab_page_free(this, CUR_IDX, \"page_free_order0_range\")",
         ],
-        "physical allocator must reject live mini-slab pages before freeing or caching them",
+        "physical allocator must reject live mini-slab pages before freeing, caching, or reusing free blocks",
     )
 
-    require_tokens(
-        phys,
-        [
-            "void detect_live_slab_page_in_returned_block(void* block, uint64_t scan_size, const char* source)",
-            "offset < scan_size",
-            "offset += paging::PAGE_SIZE",
-            "DETECT: pageAlloc (%s) returning live slab page",
-        ],
-        "physical allocator must scan returned allocations for embedded live slab headers",
-    )
-
-    cache_body = function_body(phys, "try_alloc_from_per_cpu_cache")
-    alloc_body = function_body(phys, "page_alloc_impl")
+    rebuild_body = function_body(page_alloc, "rebuild_free_lists_from_flags")
+    phys_alloc_body = function_body(phys, "page_alloc_impl")
     huge_body = function_body(phys, "page_alloc_huge")
     require_order(
-        cache_body,
+        function_body(page_alloc, "alloc"),
         [
-            "detect_live_slab_page_in_returned_block(page, paging::PAGE_SIZE, \"cache\");",
-            "prepare_allocated_block(page, paging::PAGE_SIZE, zeroing);",
+            "remove_free_block_with_repair(this, k, block, \"alloc unlink\")",
+            "free_block_pages_are_reusable(this, page_idx, k, \"alloc candidate\")",
+            "// Split down: put the upper buddy of each split into the free list.",
         ],
-        "per-CPU page-cache allocation must trap live slab pages before zeroing",
+        "buddy allocation must validate free-block metadata before publishing or splitting a block",
     )
     require_order(
-        alloc_body,
+        rebuild_body,
         [
-            "detect_live_slab_page_in_returned_block(block, buddy_accounting_size(size), \"buddy\");",
+            "free_block_pages_are_reusable(alloc, page_idx, ORDER, \"rebuild free head\")",
+            "link_free_block_unchecked(alloc, ORDER, block);",
+        ],
+        "free-list rebuild must not relink blocks whose metadata still belongs to live pages",
+    )
+    require_order(
+        phys_alloc_body,
+        [
+            "The owning",
+            "PageAllocator validates free-block metadata before publishing the block.",
             "prepare_allocated_block(block, size, zeroing);",
         ],
-        "buddy allocation must scan the full returned span before zeroing",
+        "phys allocation must rely on pre-publication PageAllocator metadata validation before zeroing",
     )
-    require_order(
+    require_tokens(
         huge_body,
         [
-            "detect_live_slab_page_in_returned_block(block, buddy_accounting_size(size), \"huge\");",
+            "PageAllocator validates free-block metadata before publishing the block.",
             "std::memset(block, 0, size);",
         ],
-        "huge allocation must scan the full returned span before zeroing",
+        "huge allocation must keep the pre-publication validation contract documented",
+    )
+    if "detect_live_slab_page_in_returned_block" in phys:
+        fail("post-allocation content-only slab magic traps can panic on stale freed bytes")
+    require_tokens(
+        ktest,
+        [
+            "KTEST(MM, StaleMiniSlabMagicOnFreePageDoesNotTripAllocator)",
+            "MINI_SLAB_MAGIC",
+            "KEXPECT_EQ(fresh_page[0], 0U)",
+        ],
+        "MM ktest must cover stale freed slab magic",
     )
 
 

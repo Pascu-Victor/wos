@@ -896,6 +896,20 @@ KTEST(MM, LargePageAlloc) {
     phys::page_free(mem);
 }
 
+KTEST(MM, StaleMiniSlabMagicOnFreePageDoesNotTripAllocator) {
+    constexpr uint32_t MINI_SLAB_MAGIC = 0x8CBEEFC8;
+
+    auto* page = static_cast<uint32_t*>(phys::page_alloc());
+    KREQUIRE_NE(page, nullptr);
+    page[0] = MINI_SLAB_MAGIC;
+    phys::page_free(page);
+
+    auto* fresh_page = static_cast<uint32_t*>(phys::page_alloc());
+    KREQUIRE_NE(fresh_page, nullptr);
+    KEXPECT_EQ(fresh_page[0], 0U);
+    phys::page_free(fresh_page);
+}
+
 KTEST(MM, PerCpuPageCacheRevivalOrder0FreeResetsMetadata) {
     void* page = phys::page_alloc();
     KREQUIRE_NE(page, nullptr);
