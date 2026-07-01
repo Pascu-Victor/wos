@@ -173,6 +173,149 @@ stage_ca_bundle() {
     fi
 }
 
+write_curl_config_site() {
+    local tmp_config_site
+
+    tmp_config_site="$(mktemp "$CURL_WORK/config.site.XXXXXX")"
+    cat > "$tmp_config_site" <<'EOF'
+ac_cv_c_compiler_gnu=yes
+ac_cv_c_const=yes
+ac_cv_c_undeclared_builtin_options='none needed'
+ac_cv_func_SSL_set0_wbio=no
+ac_cv_func_SSL_set_quic_use_legacy_codepoint=yes
+ac_cv_func_accept4=yes
+ac_cv_func_eventfd=no
+ac_cv_func_fnmatch=yes
+ac_cv_func_fseeko=yes
+ac_cv_func_geteuid=yes
+ac_cv_func_gethostbyname=yes
+ac_cv_func_getpass_r=no
+ac_cv_func_getppid=yes
+ac_cv_func_getpwuid=yes
+ac_cv_func_getpwuid_r=yes
+ac_cv_func_getrlimit=yes
+ac_cv_func_gettimeofday=yes
+ac_cv_func_if_nametoindex=yes
+ac_cv_func_mach_absolute_time=no
+ac_cv_func_opendir=yes
+ac_cv_func_pipe=yes
+ac_cv_func_pipe2=yes
+ac_cv_func_poll=yes
+ac_cv_func_pthread_create=yes
+ac_cv_func_realpath=yes
+ac_cv_func_sched_yield=yes
+ac_cv_func_sendmsg=yes
+ac_cv_func_sendmmsg=yes
+ac_cv_func_setlocale=yes
+ac_cv_func_setrlimit=yes
+ac_cv_func_utime=yes
+ac_cv_func_utimes=yes
+ac_cv_have_decl_fseeko=yes
+ac_cv_header_arpa_inet_h=yes
+ac_cv_header_dirent_h=yes
+ac_cv_header_dlfcn_h=yes
+ac_cv_header_fcntl_h=yes
+ac_cv_header_ifaddrs_h=yes
+ac_cv_header_inttypes_h=yes
+ac_cv_header_io_h=no
+ac_cv_header_libgen_h=yes
+ac_cv_header_linux_tcp_h=no
+ac_cv_header_locale_h=yes
+ac_cv_header_net_if_h=yes
+ac_cv_header_netdb_h=yes
+ac_cv_header_netinet_in6_h=no
+ac_cv_header_netinet_in_h=yes
+ac_cv_header_netinet_tcp_h=yes
+ac_cv_header_netinet_udp_h=yes
+ac_cv_header_openssl_crypto_h=yes
+ac_cv_header_openssl_err_h=yes
+ac_cv_header_openssl_pem_h=yes
+ac_cv_header_openssl_rsa_h=yes
+ac_cv_header_openssl_ssl_h=yes
+ac_cv_header_poll_h=yes
+ac_cv_header_proto_bsdsocket_h=no
+ac_cv_header_pthread_h=yes
+ac_cv_header_pwd_h=yes
+ac_cv_header_stdatomic_h=no
+ac_cv_header_stdbool_h=yes
+ac_cv_header_stdint_h=yes
+ac_cv_header_stdio_h=yes
+ac_cv_header_stdlib_h=yes
+ac_cv_header_string_h=yes
+ac_cv_header_strings_h=yes
+ac_cv_header_stropts_h=no
+ac_cv_header_sys_eventfd_h=no
+ac_cv_header_sys_filio_h=no
+ac_cv_header_sys_ioctl_h=yes
+ac_cv_header_sys_param_h=yes
+ac_cv_header_sys_poll_h=yes
+ac_cv_header_sys_resource_h=yes
+ac_cv_header_sys_select_h=yes
+ac_cv_header_sys_sockio_h=no
+ac_cv_header_sys_stat_h=yes
+ac_cv_header_sys_types_h=yes
+ac_cv_header_sys_un_h=yes
+ac_cv_header_sys_utime_h=no
+ac_cv_header_sys_xattr_h=no
+ac_cv_header_termio_h=no
+ac_cv_header_termios_h=yes
+ac_cv_header_unistd_h=yes
+ac_cv_header_utime_h=yes
+ac_cv_header_zlib_h=yes
+ac_cv_lib_crypto_HMAC_Update=yes
+ac_cv_lib_ssl_SSL_connect=yes
+ac_cv_lib_z_gzread=yes
+ac_cv_member_struct_sockaddr_un_sun_path=yes
+ac_cv_objext=o
+ac_cv_prog_cc_c11=
+ac_cv_prog_cc_g=yes
+ac_cv_prog_cc_stdc=
+ac_cv_prog_make_make_set=yes
+ac_cv_sizeof_curl_off_t=8
+ac_cv_sizeof_curl_socket_t=4
+ac_cv_sizeof_int=4
+ac_cv_sizeof_long=8
+ac_cv_sizeof_off_t=8
+ac_cv_sizeof_size_t=8
+ac_cv_sizeof_time_t=8
+ac_cv_sys_file_offset_bits=no
+ac_cv_sys_largefile_CC=no
+ac_cv_type_bool=yes
+ac_cv_type_sa_family_t=yes
+ac_cv_type_size_t=yes
+ac_cv_type_ssize_t=yes
+ac_cv_type_struct_sockaddr_storage=yes
+ac_cv_type_suseconds_t=yes
+am_cv_CC_dependencies_compiler_type=gcc3
+am_cv_make_support_nested_variables=yes
+am_cv_prog_cc_c_o=yes
+curl_cv_native_windows=no
+curl_cv_struct_timeval=yes
+lt_cv_ar_at_file=@
+lt_cv_deplibs_check_method=unknown
+lt_cv_ld_reload_flag=-r
+lt_cv_nm_interface='BSD nm'
+lt_cv_objdir=.libs
+lt_cv_prog_compiler_c_o=yes
+lt_cv_prog_compiler_c_o_RC=yes
+lt_cv_prog_compiler_pic='-fPIC -DPIC'
+lt_cv_prog_compiler_pic_works=yes
+lt_cv_prog_compiler_rtti_exceptions=yes
+lt_cv_prog_compiler_static_works=yes
+lt_cv_prog_gnu_ld=yes
+lt_cv_sharedlib_from_linklib_cmd='printf %s\n'
+lt_cv_sys_max_cmd_len=1572864
+lt_cv_to_host_file_cmd=func_convert_file_noop
+lt_cv_to_tool_file_cmd=func_convert_file_noop
+EOF
+
+    if [ ! -f "$CURL_WORK/config.site" ] || ! cmp -s "$tmp_config_site" "$CURL_WORK/config.site"; then
+        mv "$tmp_config_site" "$CURL_WORK/config.site"
+    else
+        rm -f "$tmp_config_site"
+    fi
+}
+
 require_file "$HOST/bin/clang" "Run tools/host-toolchain.sh first."
 require_file "$HOST/bin/llvm-ar" "Run tools/host-toolchain.sh first."
 require_file "$HOST/bin/llvm-ranlib" "Run tools/host-toolchain.sh first."
@@ -188,6 +331,8 @@ require_file "$TARGET_SYSROOT/include/openssl/ssl.h" "Run scripts/build/build_op
 CURL_SOURCE_DIR="$(resolve_curl_source)"
 copy_source_to_workdir "$CURL_SOURCE_DIR"
 patch_config_sub_for_wos "$CURL_WORK/config.sub"
+write_curl_config_site
+export CONFIG_SITE="$CURL_WORK/config.site"
 
 mkdir -p "$TARGET_SYSROOT/bin" "$TARGET_SYSROOT/lib" "$TARGET_SYSROOT/include"
 if [ ! -e "$TARGET_SYSROOT/usr" ]; then

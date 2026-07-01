@@ -1792,6 +1792,75 @@ def test_wos_curl_build_uses_native_triplet_and_real_sysroot_install() -> None:
         fail("curl WOS install must avoid installing through the sysroot /usr symlink: " + ", ".join(present))
 
 
+def test_wos_curl_build_preseeds_target_configure_probes() -> None:
+    source = WOS_CURL_BUILD.read_text()
+    config_site_start = source.find("write_curl_config_site()")
+    config_site_end = source.find('require_file "$HOST/bin/clang"', config_site_start)
+    if config_site_start < 0 or config_site_end < 0:
+        fail("curl WOS build script must keep write_curl_config_site before host-tool validation")
+    config_site = source[config_site_start:config_site_end]
+
+    require_tokens(
+        config_site,
+        [
+            "write_curl_config_site()",
+            'tmp_config_site="$(mktemp "$CURL_WORK/config.site.XXXXXX")"',
+            "ac_cv_func_SSL_set0_wbio=no",
+            "ac_cv_func_SSL_set_quic_use_legacy_codepoint=yes",
+            "ac_cv_func_accept4=yes",
+            "ac_cv_func_eventfd=no",
+            "ac_cv_func_pthread_create=yes",
+            "ac_cv_header_openssl_ssl_h=yes",
+            "ac_cv_header_stdatomic_h=no",
+            "ac_cv_lib_ssl_SSL_connect=yes",
+            "ac_cv_lib_crypto_HMAC_Update=yes",
+            "ac_cv_lib_z_gzread=yes",
+            "ac_cv_sizeof_curl_off_t=8",
+            "ac_cv_sizeof_curl_socket_t=4",
+            "ac_cv_type_struct_sockaddr_storage=yes",
+        ],
+        "curl WOS target configure preseeds",
+    )
+    require_tokens(
+        config_site,
+        [
+            "curl_cv_native_windows=no",
+            "curl_cv_struct_timeval=yes",
+            "lt_cv_prog_compiler_pic_works=yes",
+            "lt_cv_to_host_file_cmd=func_convert_file_noop",
+        ],
+        "curl WOS curl/libtool configure skip-key preseeds",
+    )
+    require_tokens(
+        source,
+        [
+            "write_curl_config_site",
+            'export CONFIG_SITE="$CURL_WORK/config.site"',
+            '"${CURL_CONFIGURE_CACHE_ARGS[@]}"',
+            '"${CURL_CONFIGURE_BUILD_ARGS[@]}"',
+        ],
+        "curl config.site export",
+    )
+    forbidden = [
+        "ac_cv_prog_CC=",
+        "ac_cv_prog_CPP=",
+        "ac_cv_prog_AR=",
+        "ac_cv_prog_RANLIB=",
+        "ac_cv_prog_STRIP=",
+        "ac_cv_path_install=",
+        "ac_cv_path_PERL=",
+        "ac_cv_build=",
+        "ac_cv_host=",
+        "curl_cv_func_",
+        "curl_cv_writable_argv=",
+        "lt_cv_path_LD=",
+        "lt_cv_path_NM=",
+    ]
+    present = [token for token in forbidden if token in config_site]
+    if present:
+        fail("curl config.site must not pin host/tool paths or build tuples: " + ", ".join(present))
+
+
 def test_wos_curl_download_errors_stop_before_checksum_or_extract() -> None:
     source = WOS_CURL_BUILD.read_text()
     require_tokens(
@@ -2019,6 +2088,7 @@ if __name__ == "__main__":
     test_zlib_install_avoids_sysroot_usr_symlink()
     test_wos_tls_build_is_self_hostable_without_perl()
     test_wos_curl_build_uses_native_triplet_and_real_sysroot_install()
+    test_wos_curl_build_preseeds_target_configure_probes()
     test_wos_curl_download_errors_stop_before_checksum_or_extract()
     test_wos_tarball_downloads_use_shared_retry_helper()
     test_wos_python_ssl_build_handles_libressl_sigalg_gap()
