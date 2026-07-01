@@ -907,6 +907,77 @@ def test_bash_script_enables_dev_fd_for_process_substitution() -> None:
         fail("Bash must not be configured as if /dev/fd is absent")
 
 
+def test_bash_script_preseeds_wos_target_configure_probes() -> None:
+    source = (ROOT / "scripts" / "build" / "build_bash_for_wos.sh").read_text()
+    config_site_start = source.find("write_config_site()")
+    config_site_end = source.find("require_file \"$HOST/bin/clang\"", config_site_start)
+    if config_site_start < 0 or config_site_end < 0:
+        fail("Bash WOS build script must keep write_config_site before host-tool validation")
+    config_site = source[config_site_start:config_site_end]
+
+    require_tokens(
+        config_site,
+        [
+            "ac_cv_header_sys_random_h=no",
+            "ac_cv_header_termios_h=yes",
+            "ac_cv_header_sys_mman_h=yes",
+            "ac_cv_func_getrandom=no",
+            "ac_cv_func_getentropy=yes",
+            "ac_cv_func_memfd_create=yes",
+            "ac_cv_func_shm_open=yes",
+            "ac_cv_func_working_mktime=no",
+            "ac_cv_func_chown_works=no",
+            "ac_cv_func_mmap_fixed_mapped=no",
+            "ac_cv_member_struct_stat_st_atim_tv_nsec=yes",
+            "ac_cv_typeof_struct_stat_st_atim_is_struct_timespec=yes",
+        ],
+        "Bash WOS target feature/configure preseeds",
+    )
+    require_tokens(
+        config_site,
+        [
+            "ac_cv_sizeof_char=1",
+            "ac_cv_sizeof_short=2",
+            "ac_cv_sizeof_int=4",
+            "ac_cv_sizeof_long=8",
+            "ac_cv_sizeof_long_long=8",
+            "ac_cv_sizeof_char_p=8",
+            "ac_cv_sizeof_size_t=8",
+            "ac_cv_type_pid_t=yes",
+            "ac_cv_type_uid_t=yes",
+            "ac_cv_type_gid_t=yes",
+            "ac_cv_type_size_t=yes",
+            "ac_cv_type_ssize_t=yes",
+            "ac_cv_type_time_t=yes",
+            "ac_cv_type_uintptr_t=yes",
+        ],
+        "Bash WOS target ABI/type preseeds",
+    )
+    require_tokens(
+        config_site,
+        [
+            "bash_cv_func_sigsetjmp=present",
+            "bash_cv_getcwd_malloc=no",
+            "bash_cv_struct_winsize_header=ioctl_h",
+            "bash_cv_struct_winsize_ioctl=yes",
+            "bash_cv_wcwidth_broken=no",
+            "bash_cv_wexitstatus_offset=0",
+            "bash_cv_std_putenv=yes",
+            "bash_cv_std_unsetenv=yes",
+        ],
+        "Bash WOS runtime behavior preseeds",
+    )
+    forbidden = [
+        "ac_cv_prog_CC=",
+        "ac_cv_prog_CPP=",
+        "ac_cv_prog_AR=",
+        "ac_cv_path_install=",
+    ]
+    present = [token for token in forbidden if token in config_site]
+    if present:
+        fail("Bash config.site must not pin host/tool paths: " + ", ".join(present))
+
+
 def test_nasm_script_uses_release_tarball_without_self_hosted_autogen() -> None:
     source = WOS_NASM_BUILD.read_text()
     require_tokens(
@@ -1755,6 +1826,7 @@ if __name__ == "__main__":
     test_bash_script_falls_back_to_target_triplet_on_native_wos()
     test_bash_script_handles_native_wos_autoconf_maintainer_rules()
     test_bash_script_enables_dev_fd_for_process_substitution()
+    test_bash_script_preseeds_wos_target_configure_probes()
     test_nasm_script_uses_release_tarball_without_self_hosted_autogen()
     test_cpython_script_uses_target_build_triplet_on_native_wos()
     test_cpython_target_configure_preseeds_wos_runtime_probes()
