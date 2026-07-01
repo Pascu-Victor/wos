@@ -9,6 +9,8 @@ XFS_MOUNT_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / "xfs_
 XFS_INODE_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / "xfs_inode.hpp"
 XFS_INODE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / "xfs_inode.cpp"
 XFS_VFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / "xfs_vfs.cpp"
+VFS_CORE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "core.cpp"
+VFS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "vfs.hpp"
 
 
 def fail(message: str) -> None:
@@ -153,6 +155,49 @@ def test_open_retries_stale_parent_path_cache_misses() -> None:
     )
 
 
+def test_xfs_open_seeds_fstat_snapshot_without_second_metadata_lock() -> None:
+    xfs_source = XFS_VFS_CPP.read_text()
+    vfs_source = VFS_CORE_CPP.read_text()
+    vfs_header = VFS_HPP.read_text()
+
+    if "void vfs_prefill_file_stat_snapshot(File* file, const Stat& statbuf);" not in vfs_header:
+        fail("vfs.hpp must expose the backend stat snapshot prefill helper")
+
+    open_body = function_body(xfs_source, "xfs_open_path")
+    require_order(
+        open_body,
+        [
+            "XfsMetadataGuard metadata_guard(ctx);",
+            "fill_stat(ip, &opened_stat);",
+            "ker::vfs::vfs_prefill_file_stat_snapshot(f, opened_stat);",
+            "return f;",
+        ],
+        "xfs_open_path must seed the fstat snapshot while the metadata lock is still held",
+    )
+
+    refresh_body = function_body(vfs_source, "file_stat_snapshot_refresh")
+    require_order(
+        refresh_body,
+        [
+            "if (file_stat_snapshot_current(file))",
+            "if (file_stat_snapshot_promote_prefilled_path(file))",
+            "file_stat_snapshot_refresh_from_backend(file, &statbuf)",
+        ],
+        "VFS refresh must promote the open-time snapshot before calling backend fstat",
+    )
+
+    promote_body = function_body(vfs_source, "file_stat_snapshot_promote_prefilled_path")
+    for token in [
+        "file->stat_cache_path_len != 0",
+        "metadata_path_invalidated_since(file->vfs_path, PATH_LEN, file->stat_cache_invalidation_generation)",
+        "file->stat_cache_path_len = PATH_LEN;",
+        "metadata_cache_note_observation_store();",
+        "g_vfs_fstat_snapshot_stores.fetch_add(1, std::memory_order_relaxed);",
+    ]:
+        if token not in promote_body:
+            fail(f"prefilled stat promotion must preserve invalidation invariants: {token}")
+
+
 def test_allocator_helpers_do_not_take_mount_guard_directly() -> None:
     source = XFS_VFS_CPP.read_text()
     locked_writer = function_body(source, "xfs_vfs_write_locked")
@@ -227,6 +272,7 @@ def main() -> None:
     test_metadata_lock_precedes_inode_locks()
     test_metadata_mutators_are_serialized()
     test_open_retries_stale_parent_path_cache_misses()
+    test_xfs_open_seeds_fstat_snapshot_without_second_metadata_lock()
     test_allocator_helpers_do_not_take_mount_guard_directly()
     test_write_does_not_reacquire_metadata_lock_while_holding_inode_lock()
     test_inode_inactivation_is_serialized_by_metadata_lock()

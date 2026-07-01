@@ -77,6 +77,10 @@ auto vfs_stat_resolved(const char* path, Stat* statbuf) -> int;
 auto vfs_fstat(int fd, Stat* statbuf) -> int;
 // Stat an already-open file without allocating an FD or consulting task state.
 auto vfs_fstat_file(File* file, Stat* statbuf) -> int;
+// Backend open paths may seed a freshly-read stat snapshot before VFS attaches
+// the absolute path. VFS will promote it only if metadata invalidation still
+// proves that the path has not changed.
+void vfs_prefill_file_stat_snapshot(File* file, const Stat& statbuf);
 
 // Filesystem statistics
 auto vfs_statvfs(const char* path, Statvfs* buf) -> int;

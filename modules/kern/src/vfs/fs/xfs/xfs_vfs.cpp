@@ -37,6 +37,7 @@
 #include <vfs/fs/xfs/xfs_trans.hpp>
 #include <vfs/fs/xfs/xfs_vfs.hpp>
 #include <vfs/stat.hpp>
+#include <vfs/vfs.hpp>
 
 #include "dev/block_device.hpp"
 #include "platform/dbg/dbg.hpp"
@@ -2000,6 +2001,52 @@ auto xfs_lookup_with_cached_parent(const char* fs_path, XfsMountContext* ctx, Xf
 
 }  // namespace
 
+// ============================================================================
+// Stat helpers
+// ============================================================================
+
+namespace {
+
+void fill_stat(XfsInode* ip, ker::vfs::Stat* st) {
+    st->st_dev = ip->mount->dev_id;
+    st->st_ino = ip->ino;
+    st->st_nlink = ip->nlink;
+    st->st_mode = ip->mode;
+    st->st_uid = ip->uid;
+    st->st_gid = ip->gid;
+    st->pad0 = 0;
+    st->st_rdev = 0;
+    st->st_size = static_cast<off_t>(ip->size);
+    st->st_blksize = static_cast<blksize_t>(ip->mount->block_size);
+    st->st_blocks = static_cast<blkcnt_t>(ip->nblocks * (ip->mount->block_size / 512));
+
+    // Timestamps: bigtime uses nanoseconds since Dec 13, 1901 packed into
+    // a uint64; legacy uses upper-32 = seconds, lower-32 = nanoseconds.
+    bool const BIGTIME = (ip->flags2 & XFS_DIFLAG2_BIGTIME) != 0;
+    if (BIGTIME) {
+        // XFS bigtime epoch: nanoseconds offset from the legacy min timestamp.
+        // Linux: XFS_BIGTIME_EPOCH_OFFSET = -(int64_t)S32_MIN = 2^31 = 2147483648
+        constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
+        constexpr uint64_t NSEC_PER_SEC = 1000000000ULL;
+        auto decode = [&](uint64_t raw, struct Timespec& ts) {
+            ts.tv_sec = static_cast<int64_t>(raw / NSEC_PER_SEC) - XFS_BIGTIME_EPOCH_OFFSET;
+            ts.tv_nsec = static_cast<int64_t>(raw % NSEC_PER_SEC);
+        };
+        decode(ip->atime, st->st_atim);
+        decode(ip->mtime, st->st_mtim);
+        decode(ip->ctime, st->st_ctim);
+    } else {
+        st->st_atim.tv_sec = static_cast<int64_t>(ip->atime >> 32);
+        st->st_atim.tv_nsec = static_cast<int64_t>(ip->atime & 0xFFFFFFFF);
+        st->st_mtim.tv_sec = static_cast<int64_t>(ip->mtime >> 32);
+        st->st_mtim.tv_nsec = static_cast<int64_t>(ip->mtime & 0xFFFFFFFF);
+        st->st_ctim.tv_sec = static_cast<int64_t>(ip->ctime >> 32);
+        st->st_ctim.tv_nsec = static_cast<int64_t>(ip->ctime & 0xFFFFFFFF);
+    }
+}
+
+}  // anonymous namespace
+
 auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ctx) -> File* {
     constexpr int O_CREAT_FLAG = 0100;
 
@@ -2164,54 +2211,12 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     f->vfs_path = nullptr;
     f->dir_fs_count = static_cast<size_t>(-1);
 
+    ker::vfs::Stat opened_stat{};
+    fill_stat(ip, &opened_stat);
+    ker::vfs::vfs_prefill_file_stat_snapshot(f, opened_stat);
+
     return f;
 }
-
-// ============================================================================
-// Stat helpers
-// ============================================================================
-
-namespace {
-
-void fill_stat(XfsInode* ip, ker::vfs::Stat* st) {
-    st->st_dev = ip->mount->dev_id;
-    st->st_ino = ip->ino;
-    st->st_nlink = ip->nlink;
-    st->st_mode = ip->mode;
-    st->st_uid = ip->uid;
-    st->st_gid = ip->gid;
-    st->pad0 = 0;
-    st->st_rdev = 0;
-    st->st_size = static_cast<off_t>(ip->size);
-    st->st_blksize = static_cast<blksize_t>(ip->mount->block_size);
-    st->st_blocks = static_cast<blkcnt_t>(ip->nblocks * (ip->mount->block_size / 512));
-
-    // Timestamps: bigtime uses nanoseconds since Dec 13, 1901 packed into
-    // a uint64; legacy uses upper-32 = seconds, lower-32 = nanoseconds.
-    bool const BIGTIME = (ip->flags2 & XFS_DIFLAG2_BIGTIME) != 0;
-    if (BIGTIME) {
-        // XFS bigtime epoch: nanoseconds offset from the legacy min timestamp.
-        // Linux: XFS_BIGTIME_EPOCH_OFFSET = -(int64_t)S32_MIN = 2^31 = 2147483648
-        constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
-        constexpr uint64_t NSEC_PER_SEC = 1000000000ULL;
-        auto decode = [&](uint64_t raw, struct Timespec& ts) {
-            ts.tv_sec = static_cast<int64_t>(raw / NSEC_PER_SEC) - XFS_BIGTIME_EPOCH_OFFSET;
-            ts.tv_nsec = static_cast<int64_t>(raw % NSEC_PER_SEC);
-        };
-        decode(ip->atime, st->st_atim);
-        decode(ip->mtime, st->st_mtim);
-        decode(ip->ctime, st->st_ctim);
-    } else {
-        st->st_atim.tv_sec = static_cast<int64_t>(ip->atime >> 32);
-        st->st_atim.tv_nsec = static_cast<int64_t>(ip->atime & 0xFFFFFFFF);
-        st->st_mtim.tv_sec = static_cast<int64_t>(ip->mtime >> 32);
-        st->st_mtim.tv_nsec = static_cast<int64_t>(ip->mtime & 0xFFFFFFFF);
-        st->st_ctim.tv_sec = static_cast<int64_t>(ip->ctime >> 32);
-        st->st_ctim.tv_nsec = static_cast<int64_t>(ip->ctime & 0xFFFFFFFF);
-    }
-}
-
-}  // anonymous namespace
 
 auto xfs_stat(const char* fs_path, ker::vfs::Stat* statbuf, XfsMountContext* ctx) -> int {
     if (statbuf == nullptr || ctx == nullptr) {
