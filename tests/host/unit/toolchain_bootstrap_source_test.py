@@ -25,6 +25,8 @@ WOS_NASM_BUILD = ROOT / "scripts" / "build" / "build_nasm_for_wos.sh"
 WOS_NINJA_BUILD = ROOT / "scripts" / "build" / "build_ninja_for_wos.sh"
 WOS_TLS_BUILD = ROOT / "scripts" / "build" / "build_openssl_for_wos.sh"
 WOS_PYTHON_BUILD = ROOT / "scripts" / "build" / "build_python_for_wos.sh"
+CMAKE_BUILD_UTILITIES = ROOT / "toolchain" / "src" / "cmake" / "Source" / "Modules" / "CMakeBuildUtilities.cmake"
+CMAKE_THIRD_PARTY_CHECKS = ROOT / "toolchain" / "src" / "cmake" / "Utilities" / "cmThirdPartyChecks.cmake"
 MLIBC_STDIO = ROOT / "toolchain" / "src" / "mlibc" / "options" / "ansi" / "generic" / "stdio.cpp"
 MLIBC_SSCANF_TEST = ROOT / "toolchain" / "src" / "mlibc" / "tests" / "ansi" / "sscanf.c"
 MLIBC_NAMESER = ROOT / "toolchain" / "src" / "mlibc" / "options" / "bsd" / "generic" / "arpa-nameser.cpp"
@@ -1249,6 +1251,102 @@ def test_cmake_script_uses_target_header_stack() -> None:
     )
 
 
+def test_native_wos_cmake_configure_preseeds_expensive_checks() -> None:
+    cmake_script = WOS_CMAKE_BUILD.read_text()
+    build_utilities = CMAKE_BUILD_UTILITIES.read_text()
+    third_party_checks = CMAKE_THIRD_PARTY_CHECKS.read_text()
+
+    require_tokens(
+        cmake_script,
+        [
+            "-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY",
+            "-DCMake_CXX17_WORKS=TRUE",
+            "-DCMake_HAVE_CXX_MAKE_UNIQUE=TRUE",
+            "-DCMake_HAVE_CXX_UNIQUE_PTR=1",
+            "-DCMake_HAVE_CXX_FILESYSTEM=TRUE",
+            "-DCMAKE_HAVE_LIBC_PTHREAD=1",
+            "-DHAVE_UNSETENV=1",
+            "-DHAVE_ENVIRON_NOT_REQUIRE_PROTOTYPE=0",
+        ],
+        "CMake-for-WOS top-level configure preseeds",
+    )
+
+    require_tokens(
+        build_utilities,
+        [
+            'if(CMAKE_SYSTEM_NAME STREQUAL "WOS")',
+            "set(KWSYS_C_HAS_CLOCK_GETTIME_MONOTONIC_COMPILED 1)",
+            "set(KWSYS_C_HAS_SSIZE_T_COMPILED 1)",
+            "set(KWSYS_CXX_HAS_BACKTRACE_COMPILED 1)",
+            "set(KWSYS_CXX_HAS_CXXABI_COMPILED 1)",
+            "set(KWSYS_CXX_HAS_DLADDR_COMPILED 1)",
+            "set(KWSYS_CXX_HAS_ENVIRON_IN_STDLIB_H_COMPILED 0)",
+            "set(KWSYS_CXX_HAS_GETLOADAVG_COMPILED 1)",
+            "set(KWSYS_CXX_HAS_RLIMIT64_COMPILED 0)",
+            "set(KWSYS_CXX_HAS_SETENV_COMPILED 1)",
+            "set(KWSYS_CXX_HAS_UNSETENV_COMPILED 1)",
+            "set(KWSYS_CXX_STAT_HAS_ST_MTIM_COMPILED 1)",
+            "set(KWSYS_CXX_STAT_HAS_ST_MTIMESPEC_COMPILED 0)",
+            "set(KWSYS_SYS_HAS_IFADDRS_H 1)",
+        ],
+        "CMake-for-WOS KWSys configure preseeds",
+    )
+
+    wos_third_party_match = re.search(
+        r'if\(CMAKE_SYSTEM_NAME STREQUAL "WOS"\)(?P<body>.*?)\nendif\(\)',
+        third_party_checks,
+        flags=re.DOTALL,
+    )
+    if wos_third_party_match is None:
+        fail("CMake third-party checks must include a WOS-specific preseed block")
+    wos_third_party_block = wos_third_party_match.group("body")
+    crypto_preseeds = [
+        "ARCHIVE_CRYPTO_MD5_LIBC",
+        "ARCHIVE_CRYPTO_MD5_LIBSYSTEM",
+        "ARCHIVE_CRYPTO_RMD160_LIBC",
+        "ARCHIVE_CRYPTO_SHA1_LIBC",
+        "ARCHIVE_CRYPTO_SHA1_LIBSYSTEM",
+        "ARCHIVE_CRYPTO_SHA256_LIBC",
+        "ARCHIVE_CRYPTO_SHA256_LIBC2",
+        "ARCHIVE_CRYPTO_SHA256_LIBC3",
+        "ARCHIVE_CRYPTO_SHA256_LIBSYSTEM",
+        "ARCHIVE_CRYPTO_SHA384_LIBC",
+        "ARCHIVE_CRYPTO_SHA384_LIBC2",
+        "ARCHIVE_CRYPTO_SHA384_LIBC3",
+        "ARCHIVE_CRYPTO_SHA384_LIBSYSTEM",
+        "ARCHIVE_CRYPTO_SHA512_LIBC",
+        "ARCHIVE_CRYPTO_SHA512_LIBC2",
+        "ARCHIVE_CRYPTO_SHA512_LIBC3",
+        "ARCHIVE_CRYPTO_SHA512_LIBSYSTEM",
+    ]
+    require_tokens(
+        wos_third_party_block,
+        [f"set({name} 0)" for name in crypto_preseeds],
+        "CMake-for-WOS libarchive crypto preseeds",
+    )
+    if re.search(r"ARCHIVE_CRYPTO_[A-Z0-9_]+\s+1", wos_third_party_block):
+        fail("WOS libarchive crypto preseeds must not invent enabled digest backends")
+    require_tokens(
+        wos_third_party_block,
+        [
+            "set(HAVE_ACCEPT4 1)",
+            "set(HAVE_SYS_EVENTFD_H 0)",
+            "set(HAVE_GETRANDOM 0)",
+            "set(HAVE_GETHOSTBYNAME_R_6 1)",
+            "set(HAVE_SIZEOF_STRUCT_SOCKADDR_STORAGE TRUE)",
+            "set(SIZEOF_STRUCT_SOCKADDR_STORAGE 128)",
+            "set(HAVE_STRUCT_STAT_ST_MTIM_TV_NSEC 1)",
+            "set(HAVE_STRUCT_STAT_ST_MTIMESPEC_TV_NSEC 0)",
+            "set(HAVE_WORKING_FS_IOC_GETFLAGS 0)",
+            "set(LIBMD_FOUND 0)",
+            "set(SAFE_TO_DEFINE_EXTENSIONS 1)",
+        ],
+        "CMake-for-WOS broad third-party configure preseeds",
+    )
+    if "set(LIBMD_FOUND 1)" in wos_third_party_block:
+        fail("WOS third-party preseeds must not pin libarchive's inconsistent positive libmd discovery result")
+
+
 def test_wos_tls_build_is_self_hostable_without_perl() -> None:
     source = WOS_TLS_BUILD.read_text()
     require_tokens(
@@ -1611,6 +1709,7 @@ if __name__ == "__main__":
     test_mlibc_script_honors_host_toolchain_override_and_job_helper()
     test_ninja_script_uses_target_header_stack()
     test_cmake_script_uses_target_header_stack()
+    test_native_wos_cmake_configure_preseeds_expensive_checks()
     test_zlib_install_avoids_sysroot_usr_symlink()
     test_wos_tls_build_is_self_hostable_without_perl()
     test_wos_curl_build_uses_native_triplet_and_real_sysroot_install()
