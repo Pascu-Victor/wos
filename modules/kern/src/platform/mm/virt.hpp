@@ -116,6 +116,8 @@ void unmap_page(PageTable* page_table, vaddr_t vaddr);
 
 void switch_to_kernel_pagemap();
 PageTable* get_kernel_pagemap();
+void init_tlb_shootdown();
+void note_tlb_shootdown_cpu_online();
 void init_pagemap();
 PageTable* create_pagemap();
 void release_pagemap(PageTable* pagemap);

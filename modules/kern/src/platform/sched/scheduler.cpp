@@ -3088,6 +3088,7 @@ void init() {
     } else {
         dbg::log("WARNING: No free interrupt vector for scheduler wake IPI");
     }
+    mm::virt::init_tlb_shootdown();
 }
 
 void setup_queues() {
@@ -3104,6 +3105,7 @@ void setup_queues() {
     } else {
         dbg::log("WARNING: No free interrupt vector for scheduler wake IPI");
     }
+    mm::virt::init_tlb_shootdown();
 }
 
 void percpu_init() {
@@ -4502,6 +4504,7 @@ void start_scheduler() {
     dbg::log("Starting scheduler, CPU:%x", cpu::current_cpu());
 
     auto* rq = run_queues->this_cpu();
+    mm::virt::note_tlb_shootdown_cpu_online();
 
     // Wait for a real (non-idle) task in the heap.
     // CRITICAL: Use lock for the initial check to prevent double-scheduling.

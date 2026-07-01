@@ -2,11 +2,14 @@
 
 #include <extern/limine.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <platform/acpi/apic/apic.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/interrupt/gates.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/perf/perf_events.hpp>
@@ -264,6 +267,166 @@ auto is_current_pagemap(PageTable* pagemap) -> bool {
 
     auto const PAGEMAP_PHYS = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(pagemap)));
     return PAGEMAP_PHYS == rdcr3();
+}
+
+constexpr size_t TLB_SHOOTDOWN_MAX_CPUS = desc::gdt::MAX_CPUS;
+
+struct TlbShootdownRequest {
+    std::atomic<uint64_t> generation{0};
+    std::atomic<PageTable*> pagemap{nullptr};
+    std::atomic<vaddr_t> vaddr{0};
+    std::atomic<bool> reload_cr3{false};
+    std::atomic<uint32_t> pending{0};
+    std::array<std::atomic<uint8_t>, TLB_SHOOTDOWN_MAX_CPUS> targets{};
+    std::array<std::atomic<uint64_t>, TLB_SHOOTDOWN_MAX_CPUS> observed{};
+};
+
+std::array<TlbShootdownRequest, TLB_SHOOTDOWN_MAX_CPUS>
+    tlb_shootdown_requests{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<std::atomic<uint8_t>, TLB_SHOOTDOWN_MAX_CPUS>
+    tlb_shootdown_cpu_online{};                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> tlb_shootdown_init_attempted{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint8_t tlb_shootdown_vector = 0;                       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+auto bounded_core_count() -> uint64_t {
+    if (!smt::has_cpu_data()) {
+        return 1;
+    }
+    return std::min<uint64_t>(smt::get_core_count(), TLB_SHOOTDOWN_MAX_CPUS);
+}
+
+auto cpu_slot_valid(uint64_t cpu_no) -> bool { return cpu_no < TLB_SHOOTDOWN_MAX_CPUS; }
+
+auto user_pagemap_can_need_remote_shootdown(PageTable* pagemap) -> bool { return pagemap != nullptr && pagemap != kernel_pagemap; }
+
+void invalidate_local_tlb_if_current(PageTable* pagemap, vaddr_t vaddr, bool reload_cr3) {
+    if (!is_current_pagemap(pagemap)) {
+        return;
+    }
+    if (reload_cr3) {
+        wrcr3(rdcr3());
+        return;
+    }
+    invlpg(vaddr);
+}
+
+void service_tlb_shootdown_requests_for_cpu(uint64_t cpu_no) {
+    if (!cpu_slot_valid(cpu_no) || tlb_shootdown_cpu_online[cpu_no].load(std::memory_order_acquire) == 0U) {
+        return;
+    }
+
+    uint64_t const CORE_COUNT = bounded_core_count();
+    for (uint64_t origin = 0; origin < CORE_COUNT; ++origin) {
+        if (origin == cpu_no) {
+            continue;
+        }
+
+        auto& request = tlb_shootdown_requests[static_cast<size_t>(origin)];
+        if (request.targets[static_cast<size_t>(cpu_no)].load(std::memory_order_acquire) == 0U) {
+            continue;
+        }
+
+        uint64_t const GENERATION = request.generation.load(std::memory_order_acquire);
+        if (GENERATION == 0) {
+            continue;
+        }
+
+        auto& observed = request.observed[static_cast<size_t>(cpu_no)];
+        uint64_t seen = observed.load(std::memory_order_acquire);
+        if (seen == GENERATION) {
+            continue;
+        }
+        if (!observed.compare_exchange_strong(seen, GENERATION, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            continue;
+        }
+
+        PageTable* const TARGET_PAGEMAP = request.pagemap.load(std::memory_order_acquire);
+        if (TARGET_PAGEMAP != nullptr) {
+            invalidate_local_tlb_if_current(TARGET_PAGEMAP, request.vaddr.load(std::memory_order_acquire),
+                                            request.reload_cr3.load(std::memory_order_acquire));
+        }
+        request.pending.fetch_sub(1, std::memory_order_acq_rel);
+    }
+}
+
+void send_tlb_shootdown_ipi(uint64_t cpu_no) {
+    if (tlb_shootdown_vector == 0 || !smt::has_cpu_data() || cpu_no >= smt::get_core_count()) {
+        return;
+    }
+
+    apic::IPIConfig const IPI{
+        .vector = tlb_shootdown_vector,
+        .delivery_mode = apic::IPIDeliveryMode::FIXED,
+        .destination_mode = apic::IPIDestinationMode::PHYSICAL,
+        .level = apic::IPILevel::ASSERT,
+        .trigger_mode = apic::IPITriggerMode::EDGE,
+        .destination_shorthand = apic::IPIDestinationShorthand::NONE,
+    };
+
+    apic::send_ipi(IPI, smt::get_cpu(cpu_no).lapic_id);
+}
+
+void wait_for_tlb_shootdown_completion(TlbShootdownRequest& request, uint64_t origin_cpu) {
+    while (request.pending.load(std::memory_order_acquire) != 0) {
+        service_tlb_shootdown_requests_for_cpu(origin_cpu);
+        asm volatile("pause" ::: "memory");
+    }
+}
+
+void shootdown_remote_user_pagemap(PageTable* pagemap, vaddr_t vaddr, bool reload_cr3) {
+    if (!user_pagemap_can_need_remote_shootdown(pagemap) || tlb_shootdown_vector == 0 || !smt::has_cpu_data()) {
+        return;
+    }
+
+    uint64_t const ORIGIN_CPU = cpu::current_cpu();
+    if (!cpu_slot_valid(ORIGIN_CPU)) {
+        return;
+    }
+
+    uint64_t const CORE_COUNT = bounded_core_count();
+    auto& request = tlb_shootdown_requests[static_cast<size_t>(ORIGIN_CPU)];
+    uint32_t pending = 0;
+    for (uint64_t target_cpu = 0; target_cpu < CORE_COUNT; ++target_cpu) {
+        bool const TARGET =
+            target_cpu != ORIGIN_CPU && tlb_shootdown_cpu_online[static_cast<size_t>(target_cpu)].load(std::memory_order_acquire) != 0U;
+        request.targets[static_cast<size_t>(target_cpu)].store(TARGET ? 1U : 0U, std::memory_order_relaxed);
+        if (TARGET) {
+            ++pending;
+        }
+    }
+
+    if (pending == 0) {
+        return;
+    }
+
+    uint64_t next_generation = request.generation.load(std::memory_order_relaxed) + 1;
+    if (next_generation == 0) {
+        next_generation = 1;
+    }
+
+    request.pagemap.store(pagemap, std::memory_order_relaxed);
+    request.vaddr.store(vaddr, std::memory_order_relaxed);
+    request.reload_cr3.store(reload_cr3, std::memory_order_relaxed);
+    request.pending.store(pending, std::memory_order_release);
+    request.generation.store(next_generation, std::memory_order_release);
+
+    for (uint64_t target_cpu = 0; target_cpu < CORE_COUNT; ++target_cpu) {
+        if (request.targets[static_cast<size_t>(target_cpu)].load(std::memory_order_relaxed) != 0U) {
+            send_tlb_shootdown_ipi(target_cpu);
+        }
+    }
+
+    wait_for_tlb_shootdown_completion(request, ORIGIN_CPU);
+    request.pagemap.store(nullptr, std::memory_order_release);
+}
+
+void flush_pagemap_after_update(PageTable* pagemap, vaddr_t vaddr, bool reload_cr3) {
+    invalidate_local_tlb_if_current(pagemap, vaddr, reload_cr3);
+    shootdown_remote_user_pagemap(pagemap, vaddr, reload_cr3);
+}
+
+void tlb_shootdown_handler([[maybe_unused]] cpu::GPRegs gpr, [[maybe_unused]] gates::InterruptFrame frame) {
+    service_tlb_shootdown_requests_for_cpu(cpu::current_cpu());
 }
 
 void zero_page_table_for_pool(PageTable* table) {
@@ -623,7 +786,7 @@ auto table_flags_for_leaf(const uint64_t FLAGS) -> uint64_t {
 
 auto is_aligned_to(uint64_t value, uint64_t alignment) -> bool { return (value & (alignment - 1)) == 0; }
 
-auto advance_page_table(paging::PageTable* page_table, size_t level, uint64_t flags) -> paging::PageTable*;
+auto advance_page_table(paging::PageTable* page_table, size_t level, uint64_t flags, bool* promoted = nullptr) -> paging::PageTable*;
 
 auto is_reserved_leaf(const PageTableEntry& entry) -> bool {
     uint64_t const RAW = pte_raw(entry);
@@ -693,17 +856,6 @@ auto promote_user_write_path(PageTableEntry& pml4e, PageTableEntry& pml3e, PageT
         changed = true;
     }
     return changed;
-}
-
-void flush_user_mapping_if_current(PageTable* pagemap, vaddr_t vaddr, bool reload_cr3) {
-    if (!is_current_pagemap(pagemap)) {
-        return;
-    }
-    if (reload_cr3) {
-        wrcr3(rdcr3());
-        return;
-    }
-    invlpg(vaddr);
 }
 
 enum class UserWriteFaultStatus : uint8_t {
@@ -780,7 +932,7 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
 
             bool const PATH_PROMOTED = promote_user_write_path(pml4e, pml3e, pml2e);
             cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
-            flush_user_mapping_if_current(PAGEMAP, VADDR, PATH_PROMOTED);
+            flush_pagemap_after_update(PAGEMAP, VADDR, PATH_PROMOTED);
             return UserWriteFaultStatus::HANDLED;
         }
 
@@ -803,7 +955,7 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
             pte = pte_from_raw(raw);
             owned_frame_track_private_mapping(PAGEMAP, VADDR, old_phys, raw);
             cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
-            flush_user_mapping_if_current(PAGEMAP, VADDR, initial_path_promoted);
+            flush_pagemap_after_update(PAGEMAP, VADDR, initial_path_promoted);
             record_cow_perf_event(task, cow_op, VADDR, refcount, cow_started_us);
             return UserWriteFaultStatus::HANDLED;
         }
@@ -864,12 +1016,12 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
     if (!installed_private_page) {
         phys::page_ref_dec(new_page);
         phys::page_ref_dec(old_virt, &cow_lookup);
-        flush_user_mapping_if_current(PAGEMAP, VADDR, initial_path_promoted);
+        flush_pagemap_after_update(PAGEMAP, VADDR, initial_path_promoted);
         record_cow_perf_event(task, cow_op, VADDR, refcount, cow_started_us);
         return UserWriteFaultStatus::HANDLED;
     }
 
-    flush_user_mapping_if_current(PAGEMAP, VADDR, initial_path_promoted || final_path_promoted);
+    flush_pagemap_after_update(PAGEMAP, VADDR, initial_path_promoted || final_path_promoted);
     phys::page_ref_dec(old_virt, &cow_lookup);
     phys::page_ref_dec(old_virt, &cow_lookup);
     record_cow_perf_event(task, cow_op, VADDR, refcount, cow_started_us);
@@ -1231,6 +1383,29 @@ auto map_boot_direct_range(PageTable* page_table, Range range, uint64_t flags) -
     return stats;
 }
 }  // namespace
+
+void init_tlb_shootdown() {
+    bool expected = false;
+    if (!tlb_shootdown_init_attempted.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+
+    tlb_shootdown_vector = gates::allocate_vector();
+    if (tlb_shootdown_vector != 0) {
+        gates::set_interrupt_handler(tlb_shootdown_vector, tlb_shootdown_handler);
+        dbg::log("Registered TLB shootdown IPI handler at vector 0x%x", tlb_shootdown_vector);
+    } else {
+        dbg::log("WARNING: No free interrupt vector for TLB shootdown IPI");
+    }
+}
+
+void note_tlb_shootdown_cpu_online() {
+    uint64_t const CPU_NO = cpu::current_cpu();
+    if (!cpu_slot_valid(CPU_NO)) {
+        return;
+    }
+    tlb_shootdown_cpu_online[static_cast<size_t>(CPU_NO)].store(1U, std::memory_order_release);
+}
 
 void init(limine_memmap_response* memmap_response_param, limine_executable_file_response* kernel_file_response_param,
           limine_executable_address_response* kernel_address_response_param) {
@@ -1654,7 +1829,7 @@ void init_pagemap() {
 namespace {
 
 // advance page table by level pages
-auto advance_page_table(paging::PageTable* page_table, size_t level, uint64_t flags) -> paging::PageTable* {
+auto advance_page_table(paging::PageTable* page_table, size_t level, uint64_t flags, bool* promoted) -> paging::PageTable* {
     PageTableEntry entry = entry_at(page_table, level);
     if (entry.present) {
         bool changed = false;
@@ -1679,6 +1854,9 @@ auto advance_page_table(paging::PageTable* page_table, size_t level, uint64_t fl
 
         if (changed) {
             entry_at(page_table, level) = entry;
+            if (promoted != nullptr) {
+                *promoted = true;
+            }
             // Force full TLB flush
             wrcr3(rdcr3());
         }
@@ -1723,16 +1901,22 @@ void map_page(PageTable* page_table, const vaddr_t VADDR, const paddr_t PADDR, c
     paging::PageTable* pml3 = nullptr;
     paging::PageTable* pml2 = nullptr;
     paging::PageTable* pml1 = nullptr;
-    pml3 = advance_page_table(page_table, index_of(VADDR, 4), FLAGS);
-    pml2 = advance_page_table(pml3, index_of(VADDR, 3), FLAGS);
-    pml1 = advance_page_table(pml2, index_of(VADDR, 2), FLAGS);
+    bool path_promoted = false;
+    pml3 = advance_page_table(page_table, index_of(VADDR, 4), FLAGS, &path_promoted);
+    pml2 = advance_page_table(pml3, index_of(VADDR, 3), FLAGS, &path_promoted);
+    pml1 = advance_page_table(pml2, index_of(VADDR, 2), FLAGS, &path_promoted);
 
     PageTableEntry& entry = entry_at(pml1, index_of(VADDR, 1));
-    owned_frame_untrack_leaf(page_table, VADDR, entry);
+    PageTableEntry const OLD_ENTRY = entry;
+    bool const REPLACED_TRANSLATION = OLD_ENTRY.present != 0 || is_reserved_leaf(OLD_ENTRY);
+    owned_frame_untrack_leaf(page_table, VADDR, OLD_ENTRY);
     entry = paging::create_page_table_entry(PADDR, FLAGS);
     owned_frame_track_private_mapping(page_table, VADDR, PADDR, FLAGS);
 
-    invlpg(VADDR);
+    invalidate_local_tlb_if_current(page_table, VADDR, path_promoted);
+    if (path_promoted || REPLACED_TRANSLATION) {
+        shootdown_remote_user_pagemap(page_table, VADDR, path_promoted);
+    }
 }
 
 void init_page_map_batch(PageMapBatch* batch, PageTable* page_table, const uint64_t FLAGS) {
@@ -1761,20 +1945,21 @@ void map_page_batched(PageMapBatch* batch, const vaddr_t VADDR, const paddr_t PA
     uint64_t const IDX4 = index_of(VADDR, 4);
     uint64_t const IDX3 = index_of(VADDR, 3);
     uint64_t const IDX2 = index_of(VADDR, 2);
+    bool path_promoted = false;
 
     if (IDX4 != batch->cached_idx4 || batch->pml3 == nullptr) {
-        batch->pml3 = advance_page_table(batch->root, IDX4, batch->table_flags);
+        batch->pml3 = advance_page_table(batch->root, IDX4, batch->table_flags, &path_promoted);
         batch->cached_idx4 = IDX4;
         batch->cached_idx3 = UINT64_MAX;
         batch->cached_idx2 = UINT64_MAX;
     }
     if (IDX3 != batch->cached_idx3 || batch->pml2 == nullptr) {
-        batch->pml2 = advance_page_table(batch->pml3, IDX3, batch->table_flags);
+        batch->pml2 = advance_page_table(batch->pml3, IDX3, batch->table_flags, &path_promoted);
         batch->cached_idx3 = IDX3;
         batch->cached_idx2 = UINT64_MAX;
     }
     if (IDX2 != batch->cached_idx2 || batch->pml1 == nullptr) {
-        batch->pml1 = advance_page_table(batch->pml2, IDX2, batch->table_flags);
+        batch->pml1 = advance_page_table(batch->pml2, IDX2, batch->table_flags, &path_promoted);
         batch->cached_idx2 = IDX2;
     }
 
@@ -1787,7 +1972,7 @@ void map_page_batched(PageMapBatch* batch, const vaddr_t VADDR, const paddr_t PA
 
 void flush_page_map_batch(PageMapBatch* batch) {
     if (batch != nullptr && batch->dirty) {
-        wrcr3(rdcr3());
+        flush_pagemap_after_update(batch->root, 0, true);
         batch->dirty = false;
     }
 }
@@ -1837,11 +2022,12 @@ void reserve_page_range(PageTable* page_table, const vaddr_t VADDR, const uint64
 
     uint64_t constexpr TABLE_FLAGS = paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER;
     bool changed = false;
+    bool path_promoted = false;
     for (uint64_t i = 0; i < PAGE_COUNT; i++) {
         vaddr_t const CURRENT_VADDR = VADDR + (i * paging::PAGE_SIZE);
-        PageTable* pml3 = advance_page_table(page_table, index_of(CURRENT_VADDR, 4), TABLE_FLAGS);
-        PageTable* pml2 = advance_page_table(pml3, index_of(CURRENT_VADDR, 3), TABLE_FLAGS);
-        PageTable* pml1 = advance_page_table(pml2, index_of(CURRENT_VADDR, 2), TABLE_FLAGS);
+        PageTable* pml3 = advance_page_table(page_table, index_of(CURRENT_VADDR, 4), TABLE_FLAGS, &path_promoted);
+        PageTable* pml2 = advance_page_table(pml3, index_of(CURRENT_VADDR, 3), TABLE_FLAGS, &path_promoted);
+        PageTable* pml1 = advance_page_table(pml2, index_of(CURRENT_VADDR, 2), TABLE_FLAGS, &path_promoted);
 
         PageTableEntry& entry = entry_at(pml1, index_of(CURRENT_VADDR, 1));
         uint64_t const OLD_RAW = pte_raw(entry);
@@ -1849,14 +2035,17 @@ void reserve_page_range(PageTable* page_table, const vaddr_t VADDR, const uint64
             continue;
         }
 
-        owned_frame_untrack_leaf(page_table, CURRENT_VADDR, entry);
-        drop_present_leaf_ref(entry);
+        PageTableEntry const OLD_ENTRY = entry;
+        owned_frame_untrack_leaf(page_table, CURRENT_VADDR, OLD_ENTRY);
         entry = pte_from_raw(paging::PAGE_RESERVED);
         changed = true;
+        flush_pagemap_after_update(page_table, CURRENT_VADDR, path_promoted);
+        path_promoted = false;
+        drop_present_leaf_ref(OLD_ENTRY);
     }
 
-    if (changed) {
-        wrcr3(rdcr3());
+    if (!changed && path_promoted) {
+        flush_pagemap_after_update(page_table, VADDR, true);
     }
 }
 
@@ -1898,8 +2087,9 @@ void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags) {
     }
 
     PageTable* table = page_table;
+    bool path_promoted = false;
     for (int i = 4; i > 1; i--) {
-        table = advance_page_table(table, index_of(vaddr, i), flags);
+        table = advance_page_table(table, index_of(vaddr, i), flags, &path_promoted);
     }
 
     // Get the current page table entry by computing the index first
@@ -1908,6 +2098,9 @@ void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags) {
 
     if (entry.present == 0) {
         // Page doesn't exist, nothing to modify
+        if (path_promoted) {
+            flush_pagemap_after_update(page_table, vaddr, true);
+        }
         return;
     }
 
@@ -1932,8 +2125,8 @@ void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags) {
 
     owned_frame_refresh_leaf(page_table, vaddr, entry);
 
-    if (*raw_entry != OLD_RAW) {
-        invlpg(vaddr);
+    if (*raw_entry != OLD_RAW || path_promoted) {
+        flush_pagemap_after_update(page_table, vaddr, path_promoted);
     }
 
 #ifdef ELF_DEBUG
@@ -1962,7 +2155,7 @@ void unmap_page(PageTable* page_table, vaddr_t vaddr) {
     }
     owned_frame_untrack_leaf(page_table, vaddr, OLD_ENTRY);
     *entry = paging::purge_page_table_entry();
-    invlpg(vaddr);
+    flush_pagemap_after_update(page_table, vaddr, false);
     drop_present_leaf_ref(OLD_ENTRY);
 }
 
@@ -3015,7 +3208,7 @@ auto destroy_user_space_budgeted(DestroyUserSpaceBudgetState* state, uint32_t ma
                 consumed_step = advance_free_page_tables_budgeted(*state, stats);
                 break;
             case DestroyUserSpacePhase::TLB_FLUSH:
-                wrcr3(rdcr3());
+                flush_pagemap_after_update(state->pagemap, 0, true);
                 state->phase = DestroyUserSpacePhase::DONE;
                 consumed_step = true;
                 break;
@@ -3081,7 +3274,7 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owne
 
     // Invalidate TLB for this address space
     phase_start_us = time::get_us();
-    wrcr3(rdcr3());
+    flush_pagemap_after_update(pagemap, 0, true);
     stats.tlb_flush_us = elapsed_us_since(phase_start_us, time::get_us());
     note_destroy_user_space_stats(stats);
 #ifdef ELF_DEBUG
@@ -3289,8 +3482,8 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
         }
     }
 
-    // Flush TLB for the source (parent) since we modified its PTEs
-    wrcr3(rdcr3());
+    // Flush TLB for the source (parent) since we modified its PTEs.
+    flush_pagemap_after_update(src, 0, true);
     return true;
 }
 
