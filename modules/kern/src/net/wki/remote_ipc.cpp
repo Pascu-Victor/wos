@@ -77,7 +77,7 @@ void clear_current_daemon_sigpipe() {
         return;
     }
 
-    task->sig_pending &= ~(1ULL << (WKI_SIGPIPE_NUM - 1));
+    task->signal_clear_pending_mask(1ULL << (WKI_SIGPIPE_NUM - 1));
 }
 
 auto clamp_io_count(ssize_t result, size_t requested) -> ssize_t {

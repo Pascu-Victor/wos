@@ -207,7 +207,7 @@ def require_sigchld_wakes_interruptible_waits() -> None:
         fail("SIGCHLD notification bypasses signal disposition checks")
     require_order(
         notify_body,
-        "parent->sig_pending |= SIGCHLD_MASK",
+        "parent->signal_add_pending_mask(SIGCHLD_MASK)",
         "bool wake_parent = false",
         "bool signal_wake_parent = false",
         "task_can_be_interrupted_by_signal(parent)",

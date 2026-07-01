@@ -810,7 +810,7 @@ void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status
     if (!proxy->is_thread && proxy->parent_pid != 0) {
         auto* parent = ker::mod::sched::find_task_by_pid_safe(proxy->parent_pid);
         if (parent != nullptr) {
-            parent->sig_pending |= (1ULL << (WKI_SIGCHLD_NUM - 1));
+            parent->signal_add_pending_mask(1ULL << (WKI_SIGCHLD_NUM - 1));
 
             if (parent->waiting_for_pid == WAIT_ANY_CHILD && try_complete_proxy_wait(parent, proxy, WAIT_STATUS)) {
                 uint64_t cpu = parent->cpu;
@@ -824,7 +824,7 @@ void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status
                     cpu = ker::mod::sched::get_least_loaded_cpu();
                 }
                 ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
-            } else if ((parent->sig_pending & ~parent->sig_mask & (1ULL << (WKI_SIGCHLD_NUM - 1))) != 0 &&
+            } else if ((parent->signal_deliverable_bits() & (1ULL << (WKI_SIGCHLD_NUM - 1))) != 0 &&
                        parent->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING &&
                        parent->wait_channel_is(ker::mod::sched::task::WaitChannelKind::SIGSUSPEND)) {
                 ker::mod::sched::wake_task_for_signal(parent);
@@ -2213,7 +2213,7 @@ auto queue_signal_for_process_tasks(uint64_t owner_pid, int signum) -> size_t {
             continue;
         }
         if (!candidate->has_exited && task_process_owner_pid(candidate) == owner_pid) {
-            candidate->sig_pending |= MASK;
+            candidate->signal_add_pending_mask(MASK);
             ker::mod::sched::wake_task_for_signal(candidate);
             ++signaled;
         }
@@ -4388,7 +4388,7 @@ void handle_task_cancel(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
                            static_cast<unsigned long>(SIGNALED));
     } else if (task != nullptr && !task->has_exited) {
         if (SIGNUM > 0 && std::cmp_less_equal(SIGNUM, ker::mod::sched::task::Task::MAX_SIGNALS)) {
-            task->sig_pending |= (1ULL << (SIGNUM - 1));
+            task->signal_add_pending_mask(1ULL << (SIGNUM - 1));
             ker::mod::sched::wake_task_for_signal(task);
             ker::mod::dbg::log("[WKI] Task cancel queued fallback: task_id=%u pid=0x%lx sig=%d", cancel->task_id, LOCAL_PID, SIGNUM);
         }

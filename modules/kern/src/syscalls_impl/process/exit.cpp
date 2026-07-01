@@ -266,7 +266,7 @@ void notify_parent_after_exit_ready(ker::mod::sched::task::Task* child) {
         return;
     }
 
-    parent->sig_pending |= SIGCHLD_MASK;
+    parent->signal_add_pending_mask(SIGCHLD_MASK);
 
     bool wake_parent = false;
     bool signal_wake_parent = false;
@@ -356,8 +356,8 @@ void cleanup_signal_handlers_for_exit(ker::mod::sched::task::Task* task) {
         return;
     }
 
-    task->sig_pending = 0;
-    task->sig_mask = 0;
+    task->signal_pending_store(0, std::memory_order_relaxed);
+    task->signal_mask_store(0, std::memory_order_relaxed);
     task->sigsuspend_saved_mask = 0;
     task->sigaltstack_sp = 0;
     task->sigaltstack_size = 0;
@@ -383,7 +383,7 @@ void publish_process_exit_request(ker::mod::sched::task::Task* task, int status,
     task->requested_process_exit_status.store(status, std::memory_order_relaxed);
     task->requested_process_exit_wait_status.store(wait_status, std::memory_order_relaxed);
     task->process_exit_requested.store(true, std::memory_order_release);
-    task->sig_pending |= SIGKILL_MASK;
+    task->signal_add_pending_mask(SIGKILL_MASK);
     ker::mod::sched::wake_task_for_signal(task);
 }
 

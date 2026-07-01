@@ -375,7 +375,7 @@ auto apply_spawn_options(ker::mod::sched::task::Task* task, const ker::abi::proc
 
     if ((options->flags & ker::abi::process::SPAWN_FLAG_SETSIGMASK) != 0) {
         uint64_t const UNBLOCKABLE = (1ULL << (WOS_SIGKILL - 1)) | (1ULL << (WOS_SIGSTOP - 1));
-        task->sig_mask = options->sig_mask & ~UNBLOCKABLE;
+        task->signal_mask_store(options->sig_mask & ~UNBLOCKABLE);
         ker::mod::sys::signal::sync_task_signal_mask_cache(task);
     }
 
@@ -1234,7 +1234,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     new_task->session_id = parent_task->session_id;
     new_task->pgid = (parent_task->pgid != 0) ? parent_task->pgid : PARENT_PID;
     new_task->controlling_tty = parent_task->controlling_tty;
-    new_task->sig_mask = parent_task->sig_mask;
+    new_task->signal_mask_store(parent_task->signal_mask_bits(), std::memory_order_relaxed);
     ker::mod::sys::signal::sync_task_signal_mask_cache(new_task);
     new_task->wki_prefer_inline = parent_task->wki_prefer_inline;
     new_task->wki_target_hostname = parent_task->wki_target_hostname;
@@ -2245,7 +2245,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         task->sgid = exec_stat.st_gid;
     }
 
-    task->sig_pending = 0;
+    task->signal_pending_store(0, std::memory_order_relaxed);
     task->in_signal_handler = false;
     task->do_sigreturn = false;
     for (auto& sh : task->sig_handlers) {

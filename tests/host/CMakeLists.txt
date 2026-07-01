@@ -205,6 +205,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/kasan_bootstrap_source_test.py
 )
 add_test(
+    NAME signal_atomic_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/signal_atomic_source_test.py
+)
+add_test(
     NAME phys_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/phys_source_test.py
 )
@@ -383,6 +387,7 @@ set_tests_properties(
     scheduler_source_test
     signal_source_test
     kasan_bootstrap_source_test
+    signal_atomic_source_test
     phys_source_test
     wki_timer_source_test
     wki_wait_source_test

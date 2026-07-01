@@ -8406,7 +8406,7 @@ auto current_task_has_deliverable_signal() -> bool {
 void signal_current_sigpipe() {
     auto* task = ker::mod::sched::get_current_task();
     if (task != nullptr) {
-        task->sig_pending |= (1ULL << (13 - 1));
+        task->signal_add_pending_mask(1ULL << (13 - 1));
     }
 }
 
@@ -8465,7 +8465,7 @@ void pipe_reschedule_waiters(const PipeWakeList& waiters, size_t waiter_count, b
         }
 
         if (sigpipe) {
-            waiter->sig_pending |= (1ULL << (13 - 1));
+            waiter->signal_add_pending_mask(1ULL << (13 - 1));
         }
 
         ker::mod::sched::wake_task_from_event(waiter);
@@ -8913,7 +8913,7 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
                 // Send SIGPIPE to the writing process (signal 13)
                 auto* task = ker::mod::sched::get_current_task();
                 if (task) {
-                    task->sig_pending |= (1ULL << (13 - 1));
+                    task->signal_add_pending_mask(1ULL << (13 - 1));
                 }
                 return finish(-EPIPE);
             }

@@ -892,7 +892,7 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
         case abi::ptrace::request::KILL:
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
-                target->sig_pending |= 1ULL << (SIGKILL - 1);
+                target->signal_add_pending_mask(1ULL << (SIGKILL - 1));
                 target->ptrace_stopped = false;
                 target->ptrace_stop_pending = false;
                 target->ptrace_single_step = false;

@@ -221,7 +221,7 @@ auto read_signal_frame(Task& task, uint64_t frame_addr, ker::mod::sys::signal::S
 }
 
 auto signal_frame_saved_mask_value(const Task& task) -> uint64_t {
-    return task.sigsuspend_active ? task.sigsuspend_saved_mask : task.sig_mask;
+    return task.sigsuspend_active ? task.sigsuspend_saved_mask : task.signal_mask_bits();
 }
 
 void consume_signal_frame_saved_mask(Task& task) {
@@ -251,8 +251,8 @@ void sync_task_signal_mask_cache(sched::task::Task* task) {
     uint64_t const TCB = task->thread->fsbase;
     uint32_t invalid = 0;
     uint32_t valid = 1;
-    uint64_t const MASK = task->sig_mask;
-    uint64_t const SEQ = ++task->sig_mask_seq;
+    uint64_t const MASK = task->signal_mask_bits();
+    uint64_t const SEQ = task->signal_mask_next_seq();
 
     if (!copy_to_task_user(*task, TCB + WOS_TCB_SIGNAL_MASK_VALID_OFFSET, &invalid, sizeof(invalid))) {
         return;
@@ -286,7 +286,7 @@ auto restore_deferred_sigreturn(sched::task::Task* task) -> DeferredSigreturnRes
         return DeferredSigreturnResult::FAULT;
     }
 
-    task->sig_mask = frame.saved_mask;
+    task->signal_mask_store(frame.saved_mask);
     sync_task_signal_mask_cache(task);
 
     auto* regs_arr = reinterpret_cast<uint64_t*>(&task->context.regs);
@@ -386,7 +386,7 @@ void notify_parent_of_job_control_stop(Task& stopped, int signo) {
         return;
     }
 
-    parent->sig_pending |= (1ULL << (WOS_SIGCHLD - 1));
+    parent->signal_add_pending_mask(1ULL << (WOS_SIGCHLD - 1));
     bool const COMPLETED_WAIT = complete_waitpid_stop_waiter(*parent, stopped, signo);
     if (!COMPLETED_WAIT) {
         ker::mod::sched::wake_task_for_signal(parent);
@@ -425,15 +425,15 @@ auto apply_job_control_stop(Task* task, int signo, bool park_current) -> bool {
 auto handle_handoff_non_user_signal_action(Task* task, int signo, unsigned idx, const Task::SigHandler& handler) -> bool {
     if (handler.handler == WOS_SIG_DFL) {
         if (default_signal_is_ignored(signo)) {
-            task->sig_pending &= ~(1ULL << idx);
+            task->signal_clear_pending_mask(1ULL << idx);
             if (task->sigsuspend_active) {
-                task->sig_mask = task->signal_frame_saved_mask();
+                task->signal_mask_store(task->signal_frame_saved_mask());
                 sync_task_signal_mask_cache(task);
             }
             return true;
         }
         if (is_job_control_stop_signal(signo)) {
-            task->sig_pending &= ~(1ULL << idx);
+            task->signal_clear_pending_mask(1ULL << idx);
             return apply_job_control_stop(task, signo, false);
         }
 
@@ -444,9 +444,9 @@ auto handle_handoff_non_user_signal_action(Task* task, int signo, unsigned idx, 
     }
 
     if (handler.handler == WOS_SIG_IGN) {
-        task->sig_pending &= ~(1ULL << idx);
+        task->signal_clear_pending_mask(1ULL << idx);
         if (task->sigsuspend_active) {
-            task->sig_mask = task->signal_frame_saved_mask();
+            task->signal_mask_store(task->signal_frame_saved_mask());
             sync_task_signal_mask_cache(task);
         }
         return true;
@@ -467,7 +467,7 @@ void exit_current_on_pending_fatal_default_signal() {
 
     ker::syscall::process::exit_current_if_process_exit_requested();
 
-    uint64_t const DELIVERABLE = task->sig_pending & ~task->sig_mask;
+    uint64_t const DELIVERABLE = task->signal_deliverable_bits();
     if (DELIVERABLE == 0) {
         return;
     }
@@ -479,7 +479,7 @@ void exit_current_on_pending_fatal_default_signal() {
         return;
     }
 
-    task->sig_pending &= ~(1ULL << IDX);
+    task->signal_clear_pending_mask(1ULL << IDX);
     ker::syscall::process::wos_proc_exit_signal(SIGNO);
     __builtin_unreachable();
 }
@@ -515,7 +515,7 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
         }
 
         // Restore signal mask
-        task->sig_mask = frame.saved_mask;
+        task->signal_mask_store(frame.saved_mask);
         sync_task_signal_mask_cache(task);
 
         // Restore GP registers to the on-stack positions
@@ -543,7 +543,7 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
         return 0;
     }
 
-    uint64_t const DELIVERABLE = task->sig_pending & ~task->sig_mask;
+    uint64_t const DELIVERABLE = task->signal_deliverable_bits();
     if (DELIVERABLE == 0) {
         return 0;
     }
@@ -556,14 +556,14 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
 
     // Handle SIG_DFL
     if (handler.handler == WOS_SIG_DFL) {
-        task->sig_pending &= ~(1ULL << IDX);
+        task->signal_clear_pending_mask(1ULL << IDX);
         // Default action depends on signal:
         // SIGCHLD, SIGURG, SIGWINCH, SIGCONT: ignore
         // SIGTSTP(20), SIGTTIN(21), SIGTTOU(22): stop (for job control)
         // SIGKILL, SIGTERM, SIGINT, etc: terminate
         if (SIGNO == WOS_SIGCHLD || SIGNO == WOS_SIGURG || SIGNO == WOS_SIGWINCH || SIGNO == WOS_SIGCONT) {
             if (task->sigsuspend_active) {
-                task->sig_mask = task->signal_frame_saved_mask();
+                task->signal_mask_store(task->signal_frame_saved_mask());
                 sync_task_signal_mask_cache(task);
             }
             return 0;  // Ignore
@@ -587,16 +587,16 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
 
     // Handle SIG_IGN
     if (handler.handler == WOS_SIG_IGN) {
-        task->sig_pending &= ~(1ULL << IDX);
+        task->signal_clear_pending_mask(1ULL << IDX);
         if (task->sigsuspend_active) {
-            task->sig_mask = task->signal_frame_saved_mask();
+            task->signal_mask_store(task->signal_frame_saved_mask());
             sync_task_signal_mask_cache(task);
         }
         return 0;
     }
 
     if (!user_signal_target_valid(handler)) {
-        task->sig_pending &= ~(1ULL << IDX);
+        task->signal_clear_pending_mask(1ULL << IDX);
         ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);
         __builtin_unreachable();
     }
@@ -629,7 +629,7 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
         return 0;
     }
     consume_signal_frame_saved_mask(*task);
-    task->sig_pending &= ~(1ULL << IDX);
+    task->signal_clear_pending_mask(1ULL << IDX);
 
     // Modify the on-stack registers to redirect to the signal handler
     stack_write(stack_base, STACK_OFF_RCX, handler.handler);               // sysret target = handler
@@ -642,9 +642,9 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
 
     // Block additional signals during handler execution
     // Block the handler's sa_mask + the signal itself (unless SA_NODEFER)
-    task->sig_mask |= handler.mask;
+    task->signal_add_mask_bits(handler.mask);
     if ((handler.flags & 0x40000000ULL) == 0U) {  // SA_NODEFER = 0x40000000
-        task->sig_mask |= (1ULL << IDX);
+        task->signal_add_mask_bits(1ULL << IDX);
     }
     sync_task_signal_mask_cache(task);
 
@@ -671,7 +671,7 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
         return;
     }
 
-    uint64_t const DELIVERABLE = task->sig_pending & ~task->sig_mask;
+    uint64_t const DELIVERABLE = task->signal_deliverable_bits();
     if (DELIVERABLE == 0) {
         return;
     }
@@ -682,10 +682,10 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
     auto& handler = task->sig_handlers.at(IDX);
 
     if (handler.handler == WOS_SIG_DFL) {
-        task->sig_pending &= ~(1ULL << IDX);
+        task->signal_clear_pending_mask(1ULL << IDX);
         if (SIGNO == WOS_SIGCHLD || SIGNO == WOS_SIGURG || SIGNO == WOS_SIGWINCH || SIGNO == WOS_SIGCONT) {
             if (task->sigsuspend_active) {
-                task->sig_mask = task->signal_frame_saved_mask();
+                task->signal_mask_store(task->signal_frame_saved_mask());
                 sync_task_signal_mask_cache(task);
             }
             return;
@@ -705,16 +705,16 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
     }
 
     if (handler.handler == WOS_SIG_IGN) {
-        task->sig_pending &= ~(1ULL << IDX);
+        task->signal_clear_pending_mask(1ULL << IDX);
         if (task->sigsuspend_active) {
-            task->sig_mask = task->signal_frame_saved_mask();
+            task->signal_mask_store(task->signal_frame_saved_mask());
             sync_task_signal_mask_cache(task);
         }
         return;
     }
 
     if (!user_signal_target_valid(handler)) {
-        task->sig_pending &= ~(1ULL << IDX);
+        task->signal_clear_pending_mask(1ULL << IDX);
         ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);
         __builtin_unreachable();
     }
@@ -740,15 +740,15 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
         return;
     }
     consume_signal_frame_saved_mask(*task);
-    task->sig_pending &= ~(1ULL << IDX);
+    task->signal_clear_pending_mask(1ULL << IDX);
 
     gpr.rdi = static_cast<uint64_t>(SIGNO);
     frame.rip = handler.handler;
     frame.rsp = FRAME_ADDR;
 
-    task->sig_mask |= handler.mask;
+    task->signal_add_mask_bits(handler.mask);
     if ((handler.flags & 0x40000000ULL) == 0U) {
-        task->sig_mask |= (1ULL << IDX);
+        task->signal_add_mask_bits(1ULL << IDX);
     }
     sync_task_signal_mask_cache(task);
     task->in_signal_handler = true;
@@ -774,7 +774,7 @@ auto deliver_synchronous_signal_interrupt(cpu::GPRegs& gpr, gates::InterruptFram
 
     auto const IDX = SIGNO - 1;
     auto& handler = task->sig_handlers.at(IDX);
-    if (!is_user_signal_handler(handler) || (task->sig_mask & (1ULL << IDX)) != 0) {
+    if (!is_user_signal_handler(handler) || (task->signal_mask_bits() & (1ULL << IDX)) != 0) {
         return false;
     }
     if (!user_signal_target_valid(handler)) {
@@ -808,9 +808,9 @@ auto deliver_synchronous_signal_interrupt(cpu::GPRegs& gpr, gates::InterruptFram
     frame.rip = handler.handler;
     frame.rsp = FRAME_ADDR;
 
-    task->sig_mask |= handler.mask;
+    task->signal_add_mask_bits(handler.mask);
     if ((handler.flags & 0x40000000ULL) == 0U) {
-        task->sig_mask |= (1ULL << IDX);
+        task->signal_add_mask_bits(1ULL << IDX);
     }
     sync_task_signal_mask_cache(task);
     task->in_signal_handler = true;
@@ -830,7 +830,7 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
         return;
     }
 
-    uint64_t const DELIVERABLE = task->sig_pending & ~task->sig_mask;
+    uint64_t const DELIVERABLE = task->signal_deliverable_bits();
     if (DELIVERABLE == 0) {
         return;
     }
@@ -843,8 +843,8 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
         return;
     }
     if (!user_signal_target_valid(handler)) {
-        task->sig_pending &= ~(1ULL << IDX);
-        task->sig_pending |= (1ULL << (WOS_SIGSEGV - 1));
+        task->signal_clear_pending_mask(1ULL << IDX);
+        task->signal_add_pending_mask(1ULL << (WOS_SIGSEGV - 1));
         return;
     }
 
@@ -869,7 +869,7 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
         return;
     }
     consume_signal_frame_saved_mask(*task);
-    task->sig_pending &= ~(1ULL << IDX);
+    task->signal_clear_pending_mask(1ULL << IDX);
 
     gpr.rdi = static_cast<uint64_t>(SIGNO);
     frame.rip = handler.handler;
@@ -877,9 +877,9 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
 
     write_task_syscall_return(*task, FRAME_ADDR, handler.handler, frame.flags);
 
-    task->sig_mask |= handler.mask;
+    task->signal_add_mask_bits(handler.mask);
     if ((handler.flags & 0x40000000ULL) == 0U) {
-        task->sig_mask |= (1ULL << IDX);
+        task->signal_add_mask_bits(1ULL << IDX);
     }
     sync_task_signal_mask_cache(task);
     task->in_signal_handler = true;
@@ -908,7 +908,7 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
         return;
     }
 
-    uint64_t const DELIVERABLE = task->sig_pending & ~task->sig_mask;
+    uint64_t const DELIVERABLE = task->signal_deliverable_bits();
     if (DELIVERABLE == 0) {
         return;
     }
@@ -921,16 +921,16 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
         return;
     }
     if (is_user_signal_handler(handler) && !user_signal_target_valid(handler)) {
-        task->sig_pending &= ~(1ULL << IDX);
+        task->signal_clear_pending_mask(1ULL << IDX);
         ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);
         __builtin_unreachable();
     }
 
     if (handler.handler == WOS_SIG_DFL) {
-        task->sig_pending &= ~(1ULL << IDX);
+        task->signal_clear_pending_mask(1ULL << IDX);
         if (SIGNO == WOS_SIGCHLD || SIGNO == WOS_SIGURG || SIGNO == WOS_SIGWINCH || SIGNO == WOS_SIGCONT) {
             if (task->sigsuspend_active) {
-                task->sig_mask = task->signal_frame_saved_mask();
+                task->signal_mask_store(task->signal_frame_saved_mask());
                 sync_task_signal_mask_cache(task);
             }
             return;
@@ -945,9 +945,9 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
     }
 
     if (handler.handler == WOS_SIG_IGN) {
-        task->sig_pending &= ~(1ULL << IDX);
+        task->signal_clear_pending_mask(1ULL << IDX);
         if (task->sigsuspend_active) {
-            task->sig_mask = task->signal_frame_saved_mask();
+            task->signal_mask_store(task->signal_frame_saved_mask());
             sync_task_signal_mask_cache(task);
         }
         return;
@@ -976,16 +976,16 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
         return;
     }
     consume_signal_frame_saved_mask(*task);
-    task->sig_pending &= ~(1ULL << IDX);
+    task->signal_clear_pending_mask(1ULL << IDX);
 
     gpr.rdi = static_cast<uint64_t>(SIGNO);
     frame.rip = handler.handler;
     frame.rsp = FRAME_ADDR;
     write_task_syscall_return(*task, FRAME_ADDR, handler.handler, frame.flags);
 
-    task->sig_mask |= handler.mask;
+    task->signal_add_mask_bits(handler.mask);
     if ((handler.flags & 0x40000000ULL) == 0U) {
-        task->sig_mask |= (1ULL << IDX);
+        task->signal_add_mask_bits(1ULL << IDX);
     }
     sync_task_signal_mask_cache(task);
     task->in_signal_handler = true;

@@ -573,8 +573,8 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->wants_block = false;
 
     // Signal infrastructure
-    this->sig_pending = 0;
-    this->sig_mask = 0;
+    this->signal_pending_store(0, std::memory_order_relaxed);
+    this->signal_mask_store(0, std::memory_order_relaxed);
     this->sigsuspend_saved_mask = 0;
     this->sigsuspend_active = false;
     this->in_signal_handler = false;
@@ -961,8 +961,8 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->sched_next = nullptr;
 
     // Signals: inherit mask and handlers from parent (POSIX  2.4)
-    t->sig_pending = 0;
-    t->sig_mask = parent->sig_mask;
+    t->signal_pending_store(0, std::memory_order_relaxed);
+    t->signal_mask_store(parent->signal_mask_bits(), std::memory_order_relaxed);
     t->sigsuspend_saved_mask = 0;
     t->sigsuspend_active = false;
     t->in_signal_handler = false;

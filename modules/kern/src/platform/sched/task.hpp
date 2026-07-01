@@ -341,20 +341,48 @@ struct Task {
     std::atomic<bool> waitpid_completion_claimed{false};  // One scheduler/exit completion per blocked waitpid.
 
     // Signal state.
-    uint64_t sig_pending{};            // Bit N = signal N+1 is pending, signals 1-64
-    uint64_t sig_mask{};               // Bitmask of blocked signals
-    uint64_t sig_mask_seq{};           // Monotonic version mirrored into the userspace TCB cache.
-    uint64_t sigsuspend_saved_mask{};  // Mask to restore after a sigsuspend wake.
-    uint64_t sigaltstack_sp{};         // Base address for sigaltstack(2), or 0 when disabled.
-    uint64_t sigaltstack_size{};       // Size of the alternate signal stack.
-    uint32_t sigaltstack_flags = 2;    // SS_DISABLE by default.
-    uint32_t parent_death_signal{};    // PR_SET_PDEATHSIG state.
-    int32_t dumpable = 1;              // PR_GET/SET_DUMPABLE state.
-    bool sigsuspend_active{};          // Current signal mask is temporary for sigsuspend.
+    std::atomic<uint64_t> sig_pending{0};   // Bit N = signal N+1 is pending, signals 1-64
+    std::atomic<uint64_t> sig_mask{0};      // Bitmask of blocked signals
+    std::atomic<uint64_t> sig_mask_seq{0};  // Monotonic version mirrored into the userspace TCB cache.
+    uint64_t sigsuspend_saved_mask{};       // Mask to restore after a sigsuspend wake.
+    uint64_t sigaltstack_sp{};              // Base address for sigaltstack(2), or 0 when disabled.
+    uint64_t sigaltstack_size{};            // Size of the alternate signal stack.
+    uint32_t sigaltstack_flags = 2;         // SS_DISABLE by default.
+    uint32_t parent_death_signal{};         // PR_SET_PDEATHSIG state.
+    int32_t dumpable = 1;                   // PR_GET/SET_DUMPABLE state.
+    bool sigsuspend_active{};               // Current signal mask is temporary for sigsuspend.
+
+    [[nodiscard]] auto signal_pending_bits(std::memory_order order = std::memory_order_acquire) const -> uint64_t {
+        return sig_pending.load(order);
+    }
+
+    [[nodiscard]] auto signal_mask_bits(std::memory_order order = std::memory_order_acquire) const -> uint64_t {
+        return sig_mask.load(order);
+    }
+
+    [[nodiscard]] auto signal_deliverable_bits(std::memory_order order = std::memory_order_acquire) const -> uint64_t {
+        return signal_pending_bits(order) & ~signal_mask_bits(order);
+    }
+
+    void signal_pending_store(uint64_t bits, std::memory_order order = std::memory_order_release) { sig_pending.store(bits, order); }
+
+    void signal_mask_store(uint64_t bits, std::memory_order order = std::memory_order_release) { sig_mask.store(bits, order); }
+
+    void signal_add_pending_mask(uint64_t mask, std::memory_order order = std::memory_order_acq_rel) { sig_pending.fetch_or(mask, order); }
+
+    void signal_clear_pending_mask(uint64_t mask, std::memory_order order = std::memory_order_acq_rel) {
+        sig_pending.fetch_and(~mask, order);
+    }
+
+    void signal_add_mask_bits(uint64_t mask, std::memory_order order = std::memory_order_acq_rel) { sig_mask.fetch_or(mask, order); }
+
+    [[nodiscard]] auto signal_mask_next_seq(std::memory_order order = std::memory_order_acq_rel) -> uint64_t {
+        return sig_mask_seq.fetch_add(1, order) + 1;
+    }
 
     auto signal_frame_saved_mask() -> uint64_t {
         if (!sigsuspend_active) {
-            return sig_mask;
+            return signal_mask_bits();
         }
         uint64_t const SAVED = sigsuspend_saved_mask;
         sigsuspend_active = false;
@@ -364,7 +392,7 @@ struct Task {
 
     auto has_interrupting_signal_pending() -> bool {
         for (;;) {
-            uint64_t const DELIVERABLE = sig_pending & ~sig_mask;
+            uint64_t const DELIVERABLE = signal_deliverable_bits();
             if (DELIVERABLE == 0) {
                 return false;
             }
@@ -378,9 +406,9 @@ struct Task {
                 return true;
             }
 
-            sig_pending &= ~(1ULL << IDX);
+            signal_clear_pending_mask(1ULL << IDX);
             if (sigsuspend_active) {
-                sig_mask = signal_frame_saved_mask();
+                signal_mask_store(signal_frame_saved_mask());
             }
         }
     }

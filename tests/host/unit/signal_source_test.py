@@ -200,7 +200,7 @@ def test_synchronous_user_exceptions_can_reach_installed_signal_handlers_before_
     require_tokens(
         helper_body,
         [
-            "if (!is_user_signal_handler(handler) || (task->sig_mask & (1ULL << IDX)) != 0)",
+            "if (!is_user_signal_handler(handler) || (task->signal_mask_bits() & (1ULL << IDX)) != 0)",
             "if (!user_signal_target_valid(handler))",
             "sigframe.saved_rip = frame.rip;",
             "sigframe.saved_rsp = frame.rsp;",
@@ -258,7 +258,7 @@ def test_sigpending_is_wired_through_wos_sysdeps() -> None:
         [
             "auto wos_proc_sigpending(uint64_t set_ptr) -> uint64_t",
             "std::memset(set, 0, 1024 / 8);",
-            "set[0] = task->sig_pending & task->sig_mask;",
+            "set[0] = task->signal_pending_bits() & task->signal_mask_bits();",
             "case abi::process::procmgmt_ops::SIGPENDING:",
             "return wos_proc_sigpending(a2);",
         ],

@@ -601,7 +601,7 @@ inline auto waitpid_repair_due(const task::Task* waiter, uint64_t now_us) -> boo
     if (waiter == nullptr || !waiter->wait_channel_is(task::WaitChannelKind::WAITPID) || waiter->waiting_for_pid == 0) {
         return false;
     }
-    bool const SIGCHLD_PENDING = (waiter->sig_pending & SIGCHLD_MASK) != 0;
+    bool const SIGCHLD_PENDING = (waiter->signal_pending_bits() & SIGCHLD_MASK) != 0;
     if (SIGCHLD_PENDING) {
         return true;
     }
@@ -3944,7 +3944,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                     pending_wake_slot(to_wake, wake_count++) = t;
                 } else if (TIMED_SCAN && t->itimer_real_expire_us != 0 && WAIT_SCAN_NOW_US >= t->itimer_real_expire_us &&
                            signal_wake_count < PENDING_WAKE_LIMIT) {
-                    t->sig_pending |= (1ULL << (14 - 1));  // SIGALRM = 14
+                    t->signal_add_pending_mask(1ULL << (14 - 1));  // SIGALRM = 14
                     if (t->itimer_real_interval_us != 0) {
                         t->itimer_real_expire_us = saturating_deadline_us(WAIT_SCAN_NOW_US, t->itimer_real_interval_us);
                     } else {
@@ -4175,7 +4175,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
 
         // ITIMER_REAL expiry check - fire SIGALRM and reload or disarm
         if (current_task->itimer_real_expire_us != 0 && NOW_US >= current_task->itimer_real_expire_us) {
-            current_task->sig_pending |= (1ULL << (14 - 1));  // SIGALRM = 14
+            current_task->signal_add_pending_mask(1ULL << (14 - 1));  // SIGALRM = 14
             if (current_task->itimer_real_interval_us != 0) {
                 current_task->itimer_real_expire_us = saturating_deadline_us(NOW_US, current_task->itimer_real_interval_us);
             } else {
@@ -5569,7 +5569,7 @@ void wake_task_for_signal(task::Task* task) {
 
     constexpr uint64_t SIGCONT_MASK = 1ULL << (18 - 1);
     constexpr uint64_t SIGKILL_MASK = 1ULL << (9 - 1);
-    uint64_t const PENDING = task->sig_pending;
+    uint64_t const PENDING = task->signal_pending_bits();
     if ((PENDING & (SIGCONT_MASK | SIGKILL_MASK)) != 0U && task->jobctl_stopped.load(std::memory_order_acquire)) {
         task->jobctl_stopped.store(false, std::memory_order_release);
         if ((PENDING & SIGCONT_MASK) != 0U) {
@@ -5632,7 +5632,7 @@ auto signal_process_group(uint64_t pgid, int sig) -> size_t {
                 if (sig != 0) {
                     bool const FORWARDED = ker::net::wki::wki_proxy_task_forward_signal(t, sig);
                     if (!FORWARDED) {
-                        t->sig_pending |= MASK;
+                        t->signal_add_pending_mask(MASK);
                         wake_task_for_signal(t);
                     }
                 }
@@ -5661,7 +5661,7 @@ auto signal_controlling_tty(int controlling_tty, int sig) -> size_t {
             if (sig != 0) {
                 bool const FORWARDED = ker::net::wki::wki_proxy_task_forward_signal(t, sig);
                 if (!FORWARDED) {
-                    t->sig_pending |= MASK;
+                    t->signal_add_pending_mask(MASK);
                     wake_task_for_signal(t);
                 }
             }
@@ -5712,7 +5712,7 @@ auto signal_visible_processes_except(uint64_t excluded_pid, uint64_t excluded_ow
         if (ALIVE && t->type == task::TaskType::PROCESS && task::process_visible(*t) && !EXCLUDED) {
             ++matched;
             if (sig != 0) {
-                t->sig_pending |= MASK;
+                t->signal_add_pending_mask(MASK);
                 wake_task_for_signal(t);
             }
         }

@@ -482,8 +482,8 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->controlling_tty = parent->controlling_tty;
 
     // Copy signal dispositions from parent (fork inherits signal handlers)
-    child->sig_pending = 0;  // Pending signals are NOT inherited
-    child->sig_mask = parent->sig_mask;
+    child->signal_pending_store(0, std::memory_order_relaxed);  // Pending signals are NOT inherited
+    child->signal_mask_store(parent->signal_mask_bits(), std::memory_order_relaxed);
     child->sigsuspend_saved_mask = 0;
     child->sigaltstack_sp = parent->sigaltstack_sp;
     child->sigaltstack_size = parent->sigaltstack_size;
@@ -827,7 +827,7 @@ auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr) -> uin
     // Return old mask if requested (sigset_t first word)
     if (oldset_ptr != 0) {
         auto* oldset = reinterpret_cast<uint64_t*>(oldset_ptr);
-        *oldset = task->sig_mask;
+        *oldset = task->signal_mask_bits();
     }
 
     // Apply new mask if provided
@@ -839,7 +839,7 @@ auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr) -> uin
         uint64_t const UNBLOCKABLE = (1ULL << (WOS_SIGKILL - 1)) | (1ULL << (WOS_SIGSTOP - 1));
         set &= ~UNBLOCKABLE;
 
-        uint64_t new_mask = task->sig_mask;
+        uint64_t new_mask = task->signal_mask_bits();
         switch (how) {
             case 0:  // SIG_BLOCK
                 new_mask |= set;
@@ -853,8 +853,8 @@ auto wos_proc_sigprocmask(int how, uint64_t set_ptr, uint64_t oldset_ptr) -> uin
             default:
                 return static_cast<uint64_t>(-EINVAL);
         }
-        if (new_mask != task->sig_mask) {
-            task->sig_mask = new_mask;
+        if (new_mask != task->signal_mask_bits()) {
+            task->signal_mask_store(new_mask);
             ker::mod::sys::signal::sync_task_signal_mask_cache(task);
         }
     }
@@ -873,7 +873,7 @@ auto wos_proc_sigpending(uint64_t set_ptr) -> uint64_t {
 
     auto* set = reinterpret_cast<uint64_t*>(set_ptr);
     std::memset(set, 0, 1024 / 8);
-    set[0] = task->sig_pending & task->sig_mask;
+    set[0] = task->signal_pending_bits() & task->signal_mask_bits();
     return 0;
 }
 
@@ -907,12 +907,12 @@ auto wos_proc_sigsuspend(uint64_t set_ptr, ker::mod::cpu::GPRegs& gpr) -> uint64
     set &= ~UNBLOCKABLE;
 
     task->context.regs = gpr;
-    task->sigsuspend_saved_mask = task->sig_mask;
+    task->sigsuspend_saved_mask = task->signal_mask_bits();
     task->sigsuspend_active = true;
-    task->sig_mask = set;
+    task->signal_mask_store(set);
     ker::mod::sys::signal::sync_task_signal_mask_cache(task);
 
-    if ((task->sig_pending & ~task->sig_mask) != 0) {
+    if (task->signal_deliverable_bits() != 0) {
         return static_cast<uint64_t>(-EINTR);
     }
 
@@ -1004,8 +1004,8 @@ auto wos_proc_clone_vm(const CloneVmArgs* args) -> uint64_t {
     child->sgid = parent->sgid;
     child->umask = parent->umask;
     child->personality = parent->personality;
-    child->sig_pending = 0;
-    child->sig_mask = parent->sig_mask;
+    child->signal_pending_store(0, std::memory_order_relaxed);
+    child->signal_mask_store(parent->signal_mask_bits(), std::memory_order_relaxed);
     child->sig_handlers = parent->sig_handlers;
     child->sigaltstack_sp = parent->sigaltstack_sp;
     child->sigaltstack_size = parent->sigaltstack_size;
@@ -1234,7 +1234,7 @@ auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
         }
 
         // Set the signal pending bit (signal N is bit N-1)
-        target->sig_pending |= (1ULL << (sig - 1));
+        target->signal_add_pending_mask(1ULL << (sig - 1));
 
         // Ensure blocked tasks become runnable so pending signals are delivered promptly.
         sched::wake_task_for_signal(target);

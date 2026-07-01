@@ -829,8 +829,8 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     req.waiting_for_pid = task->waiting_for_pid;
     req.wait_status_user_addr = task->wait_status_user_addr;
     req.wait_rusage_user_addr = task->wait_rusage_user_addr;
-    req.sig_pending = task->sig_pending;
-    req.sig_mask = task->sig_mask;
+    req.sig_pending = task->signal_pending_bits();
+    req.sig_mask = task->signal_mask_bits();
     req.ptrace_tracer_pid = task->ptrace_tracer_pid;
     req.uid = task->uid;
     req.gid = task->gid;

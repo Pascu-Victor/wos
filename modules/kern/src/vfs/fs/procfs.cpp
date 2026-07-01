@@ -855,9 +855,9 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz, bool thread_view) ->
 
     // Signals
     append("\nSigPnd:\t");
-    append_int(task->sig_pending);
+    append_int(task->signal_pending_bits());
     append("\nSigBlk:\t");
-    append_int(task->sig_mask);
+    append_int(task->signal_mask_bits());
     append("\nInSigHandler:\t");
     append(task->in_signal_handler ? "1" : "0");
 
@@ -986,10 +986,10 @@ auto generate_stat(uint64_t pid, char* buf, size_t bufsz, bool thread_view) -> s
     append(" ");
 
     // rlim signal blocked sigignore sigcatch wchan nswap cnswap exit_signal processor
-    append("0 ");                   // rlim
-    append_int(task->sig_pending);  // signal (pending)
+    append("0 ");                             // rlim
+    append_int(task->signal_pending_bits());  // signal (pending)
     append(" ");
-    append_int(task->sig_mask);  // blocked
+    append_int(task->signal_mask_bits());  // blocked
     append(" ");
     append("0 ");  // sigignore
     append("0 ");  // sigcatch
