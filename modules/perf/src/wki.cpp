@@ -1005,24 +1005,10 @@ void print_checkout_focus_rows(const CheckoutSummaryRows& loaded) {
         return;
     }
 
-    constexpr std::array<std::string_view, 17> FOCUS_OPS{{
-        "inode_fetch",
-        "inode_cache_miss",
-        "inode_unavailable",
-        "buf_get_miss",
-        "buf_read_miss",
-        "buf_disk_read",
-        "buf_disk_write",
-        "buf_dirty",
-        "buf_flush",
-        "sync_blockdev",
-        "write_bmap",
-        "write_alloc",
-        "write_ilog",
-        "write_io",
-        "read_bmap",
-        "read_io",
-        "read_gap",
+    constexpr std::array<std::string_view, 19> FOCUS_OPS{{
+        "metadata_lock_wait", "metadata_lock_hold", "inode_fetch", "inode_cache_miss", "inode_unavailable", "buf_get_miss", "buf_read_miss",
+        "buf_disk_read",      "buf_disk_write",     "buf_dirty",   "buf_flush",        "sync_blockdev",     "write_bmap",   "write_alloc",
+        "write_ilog",         "write_io",           "read_bmap",   "read_io",          "read_gap",
     }};
 
     std::println("");

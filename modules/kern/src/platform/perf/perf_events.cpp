@@ -56,7 +56,7 @@ struct WkiPerfSummaryBucket {
 std::array<WkiPerfSummaryBucket, WKI_PERF_SUMMARY_BUCKETS> g_wki_summary{};
 ker::mod::sys::Spinlock g_wki_summary_lock;
 
-constexpr size_t LOCAL_XFS_SUMMARY_BUCKETS = static_cast<size_t>(WkiPerfLocalXfsOp::READ_GAP) + 1;
+constexpr size_t LOCAL_XFS_SUMMARY_BUCKETS = static_cast<size_t>(WkiPerfLocalXfsOp::METADATA_LOCK_HOLD) + 1;
 
 struct LocalXfsSummaryBucket {
     std::atomic<uint64_t> calls{0};
@@ -654,6 +654,10 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "read_zero";
                 case WkiPerfLocalXfsOp::READ_GAP:
                     return "read_gap";
+                case WkiPerfLocalXfsOp::METADATA_LOCK_WAIT:
+                    return "metadata_lock_wait";
+                case WkiPerfLocalXfsOp::METADATA_LOCK_HOLD:
+                    return "metadata_lock_hold";
                 default:
                     return "unknown";
             }

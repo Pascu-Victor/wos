@@ -105,8 +105,11 @@ class XfsMetadataGuard {
    public:
     explicit XfsMetadataGuard(XfsMountContext* ctx, bool active = true) : ctx(active ? ctx : nullptr) {
         if (this->ctx != nullptr) {
+            uint64_t const WAIT_STARTED_US = metadata_perf_started_us(ker::mod::perf::WkiPerfLocalXfsOp::METADATA_LOCK_WAIT);
             this->ctx->metadata_lock.lock();
             locked = true;
+            metadata_perf_record(ker::mod::perf::WkiPerfLocalXfsOp::METADATA_LOCK_WAIT, WAIT_STARTED_US);
+            hold_started_us = metadata_perf_started_us(ker::mod::perf::WkiPerfLocalXfsOp::METADATA_LOCK_HOLD);
         }
     }
 
@@ -123,20 +126,45 @@ class XfsMetadataGuard {
 
     void lock() {
         if (ctx != nullptr && !locked) {
+            uint64_t const WAIT_STARTED_US = metadata_perf_started_us(ker::mod::perf::WkiPerfLocalXfsOp::METADATA_LOCK_WAIT);
             ctx->metadata_lock.lock();
             locked = true;
+            metadata_perf_record(ker::mod::perf::WkiPerfLocalXfsOp::METADATA_LOCK_WAIT, WAIT_STARTED_US);
+            hold_started_us = metadata_perf_started_us(ker::mod::perf::WkiPerfLocalXfsOp::METADATA_LOCK_HOLD);
         }
     }
 
     void unlock() {
         if (ctx != nullptr && locked) {
+            metadata_perf_record(ker::mod::perf::WkiPerfLocalXfsOp::METADATA_LOCK_HOLD, hold_started_us);
+            hold_started_us = 0;
             ctx->metadata_lock.unlock();
             locked = false;
         }
     }
 
    private:
+    static auto metadata_perf_started_us(ker::mod::perf::WkiPerfLocalXfsOp op) -> uint64_t {
+        return ker::mod::perf::is_wki_scope_recording_enabled(ker::mod::perf::WkiPerfScope::LOCAL_XFS, static_cast<uint8_t>(op))
+                   ? ker::mod::time::get_us()
+                   : 0;
+    }
+
+    static auto metadata_perf_elapsed_us(uint64_t started_us) -> uint32_t {
+        uint64_t const NOW_US = ker::mod::time::get_us();
+        uint64_t const ELAPSED_US = NOW_US >= started_us ? NOW_US - started_us : 0;
+        return ELAPSED_US > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(ELAPSED_US);
+    }
+
+    static void metadata_perf_record(ker::mod::perf::WkiPerfLocalXfsOp op, uint64_t started_us) {
+        if (started_us == 0) {
+            return;
+        }
+        ker::mod::perf::record_local_xfs_summary(op, 0, metadata_perf_elapsed_us(started_us), true, 0);
+    }
+
     XfsMountContext* ctx;
+    uint64_t hold_started_us = 0;
     bool locked = false;
 };
 

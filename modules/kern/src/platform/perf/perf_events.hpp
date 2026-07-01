@@ -276,6 +276,8 @@ enum class WkiPerfLocalXfsOp : uint8_t {
     READ_COPY = 30,
     READ_ZERO = 31,
     READ_GAP = 32,
+    METADATA_LOCK_WAIT = 33,
+    METADATA_LOCK_HOLD = 34,
 };
 
 enum class WkiPerfLocalIrqOp : uint8_t {

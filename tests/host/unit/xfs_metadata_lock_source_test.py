@@ -11,6 +11,9 @@ XFS_INODE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / "xfs_
 XFS_VFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / "xfs_vfs.cpp"
 VFS_CORE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "core.cpp"
 VFS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "vfs.hpp"
+PERF_EVENTS_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "perf" / "perf_events.hpp"
+PERF_EVENTS_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "perf" / "perf_events.cpp"
+PERF_WKI_CPP = ROOT / "modules" / "perf" / "src" / "wki.cpp"
 
 
 def fail(message: str) -> None:
@@ -72,6 +75,49 @@ def test_metadata_guard_raii_locks_mount_mutex() -> None:
         ],
         "XfsMetadataGuard lock/unlock",
     )
+
+
+def test_metadata_guard_records_wait_and_hold_time() -> None:
+    xfs_source = XFS_VFS_CPP.read_text()
+    perf_header = PERF_EVENTS_HPP.read_text()
+    perf_source = PERF_EVENTS_CPP.read_text()
+    perf_wki = PERF_WKI_CPP.read_text()
+
+    for token in [
+        "METADATA_LOCK_WAIT = 33",
+        "METADATA_LOCK_HOLD = 34",
+    ]:
+        if token not in perf_header:
+            fail(f"local_xfs perf enum must include metadata-lock op: {token}")
+
+    for token in [
+        'return "metadata_lock_wait";',
+        'return "metadata_lock_hold";',
+        "WkiPerfLocalXfsOp::METADATA_LOCK_HOLD) + 1",
+    ]:
+        if token not in perf_source:
+            fail(f"local_xfs perf names/bucket sizing must include metadata-lock op: {token}")
+
+    guard_body = xfs_source[xfs_source.find("class XfsMetadataGuard") : xfs_source.find("auto perf_xfs_started_us")]
+    require_order(
+        guard_body,
+        [
+            "metadata_perf_started_us(ker::mod::perf::WkiPerfLocalXfsOp::METADATA_LOCK_WAIT)",
+            "this->ctx->metadata_lock.lock();",
+            "metadata_perf_record(ker::mod::perf::WkiPerfLocalXfsOp::METADATA_LOCK_WAIT, WAIT_STARTED_US);",
+            "hold_started_us = metadata_perf_started_us(ker::mod::perf::WkiPerfLocalXfsOp::METADATA_LOCK_HOLD);",
+            "metadata_perf_record(ker::mod::perf::WkiPerfLocalXfsOp::METADATA_LOCK_HOLD, hold_started_us);",
+            "ctx->metadata_lock.unlock();",
+        ],
+        "XfsMetadataGuard must record metadata-lock wait and hold time without changing lock order",
+    )
+
+    for token in [
+        '"metadata_lock_wait"',
+        '"metadata_lock_hold"',
+    ]:
+        if token not in perf_wki:
+            fail(f"perf checkout-report focus counters must include metadata-lock op: {token}")
 
 
 def test_metadata_lock_precedes_inode_locks() -> None:
@@ -269,6 +315,7 @@ def test_zero_link_vfs_releases_use_metadata_locked_api() -> None:
 def main() -> None:
     test_mount_context_has_sleeping_metadata_mutex()
     test_metadata_guard_raii_locks_mount_mutex()
+    test_metadata_guard_records_wait_and_hold_time()
     test_metadata_lock_precedes_inode_locks()
     test_metadata_mutators_are_serialized()
     test_open_retries_stale_parent_path_cache_misses()
