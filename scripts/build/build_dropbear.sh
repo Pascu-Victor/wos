@@ -253,6 +253,7 @@ if [ ! -f "$DB_BUILD/Makefile" ] || [ "$DB_BUILD/config.site" -nt "$DB_BUILD/Mak
     if [ "$HOST_SYSTEM" = "WOS" ]; then
         DROPBEAR_CONFIGURE_BUILD_ARGS=(--build="$TARGET_ARCH")
         DROPBEAR_CONFIGURE_CACHE_ARGS=(
+            "ac_cv_path_install=/usr/bin/install -c"
             ac_cv_func_memcmp_working=yes
             ac_cv_func_endutent=no
             ac_cv_func_endutxent=no

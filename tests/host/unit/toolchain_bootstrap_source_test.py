@@ -1588,6 +1588,7 @@ def test_busybox_and_dropbear_scripts_honor_host_toolchain_override() -> None:
             'DROPBEAR_CONFIGURE_CACHE_ARGS=()',
             'uname -s 2>/dev/null || printf unknown',
             'DROPBEAR_CONFIGURE_BUILD_ARGS=(--build="$TARGET_ARCH")',
+            '"ac_cv_path_install=/usr/bin/install -c"',
             'ac_cv_func_memcmp_working=yes',
             'ac_cv_func_endutent=no',
             'ac_cv_func_endutxent=no',
