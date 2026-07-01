@@ -148,12 +148,59 @@ void seed_tcp_ephemeral_port_once() {
     tcp_ephemeral_seeded = true;
 }
 
-auto alloc_ephemeral_port() -> uint16_t {
+auto tcp_next_ephemeral_port(uint16_t port) -> uint16_t {
+    return port == TCP_EPHEMERAL_PORT_LAST ? TCP_EPHEMERAL_PORT_FIRST : static_cast<uint16_t>(port + 1);
+}
+
+auto tcp_binding_conflicts_locked(uint32_t local_ip, uint16_t local_port) -> bool {
+    return std::ranges::any_of(tcp_bindings, [local_ip, local_port](const TcpBinding& b) -> bool {
+        return b.cb != nullptr && b.local_port == local_port && (b.local_ip == local_ip || b.local_ip == 0 || local_ip == 0);
+    });
+}
+
+auto tcp_free_binding_slot_locked() -> TcpBinding* {
+    for (auto& b : tcp_bindings) {
+        if (b.cb == nullptr) {
+            return &b;
+        }
+    }
+    return nullptr;
+}
+
+auto reserve_ephemeral_port_for_connect(Socket* sock, TcpCB* cb, uint32_t local_ip) -> int {
+    if (sock == nullptr || cb == nullptr) {
+        return -EINVAL;
+    }
+
+    tcp_bind_lock.lock();
     seed_tcp_ephemeral_port_once();
-    uint16_t const PORT = tcp_ephemeral_port;
-    tcp_ephemeral_port =
-        tcp_ephemeral_port == TCP_EPHEMERAL_PORT_LAST ? TCP_EPHEMERAL_PORT_FIRST : static_cast<uint16_t>(tcp_ephemeral_port + 1);
-    return PORT;
+
+    TcpBinding* slot = tcp_free_binding_slot_locked();
+    if (slot == nullptr) {
+        tcp_bind_lock.unlock();
+        return -EADDRNOTAVAIL;
+    }
+
+    for (uint32_t attempts = 0; attempts < TCP_EPHEMERAL_PORT_COUNT; attempts++) {
+        uint16_t const PORT = tcp_ephemeral_port;
+        tcp_ephemeral_port = tcp_next_ephemeral_port(tcp_ephemeral_port);
+        if (tcp_binding_conflicts_locked(local_ip, PORT)) {
+            continue;
+        }
+
+        slot->cb = cb;
+        slot->local_ip = local_ip;
+        slot->local_port = PORT;
+        cb->local_ip = local_ip;
+        cb->local_port = PORT;
+        sock->local_v4.addr = local_ip;
+        sock->local_v4.port = PORT;
+        tcp_bind_lock.unlock();
+        return 0;
+    }
+
+    tcp_bind_lock.unlock();
+    return -EADDRNOTAVAIL;
 }
 
 void maybe_send_recv_window_update(TcpCB* cb, Socket* sock) {
@@ -328,12 +375,6 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int flags) 
         return -1;
     }
 
-    // Auto-bind if not already bound
-    if (cb->local_port == 0) {
-        cb->local_port = alloc_ephemeral_port();
-        sock->local_v4.port = cb->local_port;
-    }
-
     // Resolve local IP from the outgoing interface if not explicitly bound.
     if (cb->local_ip == 0) {
         auto* route = ker::net::route_lookup(ip);
@@ -343,6 +384,15 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int flags) 
                 cb->local_ip = nif->ipv4_addrs.front().addr;
                 sock->local_v4.addr = cb->local_ip;
             }
+        }
+    }
+
+    // Auto-bind if not already bound.  Reserve under tcp_bind_lock before the
+    // TCB is published so concurrent connects cannot claim the same local port.
+    if (cb->local_port == 0) {
+        int const BIND_RET = reserve_ephemeral_port_for_connect(sock, cb, cb->local_ip);
+        if (BIND_RET != 0) {
+            return BIND_RET;
         }
     }
 
