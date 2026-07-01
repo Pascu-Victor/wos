@@ -224,6 +224,14 @@ auto lru_tail() -> BufHead* {
     return bh;  // NOLINT(clang-analyzer-cplusplus.NewDelete): lru_remove unlinks victims before free_buffer deletes them.
 }
 
+auto lru_head() -> BufHead* {
+    BufHead* bh = lru_sentinel.lru_next;
+    if (bh == &lru_sentinel) {
+        return nullptr;
+    }
+    return bh;
+}
+
 // --- Cache bookkeeping ----------------------------------------------------
 
 mod::sys::Spinlock cache_lock;
@@ -327,6 +335,7 @@ ker::mod::sched::Workqueue* dirty_writeback_wq = nullptr;
 void clear_buffer_dirty_locked(BufHead* bh);
 auto copy_dirty_bdev_range_locked(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst, uint64_t min_epoch_exclusive)
     -> bool;
+void overlay_newer_cached_aliases(BufHead const* source, uint64_t source_epoch, uint8_t* dst);
 void dirty_coverage_add(std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS>& intervals, size_t& interval_count,
                         DirtyCoverageInterval interval, bool& overflow);
 auto dirty_coverage_complete(const std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS>& intervals, size_t interval_count,
@@ -426,6 +435,14 @@ auto make_writeback_snapshot(const BufHead* bh) -> WritebackSnapshot {
         return snapshot;
     }
     memcpy(snapshot.data, bh->data, bh->size);
+    return snapshot;
+}
+
+auto make_writeback_snapshot_for_epoch(const BufHead* bh, uint64_t dirty_epoch) -> WritebackSnapshot {
+    WritebackSnapshot snapshot = make_writeback_snapshot(bh);
+    if (snapshot.data != nullptr) {
+        overlay_newer_cached_aliases(bh, dirty_epoch, snapshot.data);
+    }
     return snapshot;
 }
 
@@ -545,6 +562,26 @@ auto find_reclaimable_lru_buffer(size_t scan_budget = SIZE_MAX, bool honor_secon
     return nullptr;
 }
 
+auto find_reclaimable_mru_buffer(size_t scan_budget = SIZE_MAX, bool honor_second_chance = true) -> BufHead* {
+    size_t scanned = 0;
+    for (BufHead* cur = lru_head(); cur != nullptr && cur != &lru_sentinel;) {
+        if (scanned++ >= scan_budget) {
+            break;
+        }
+        BufHead* next = cur->lru_next;
+        if (is_reclaimable_clean_buffer(cur)) {  // NOLINT(clang-analyzer-cplusplus.NewDelete): victims are unlinked before delete.
+            if (honor_second_chance && (cur->flags & BH_LRU_REFERENCED) != 0) {
+                lru_second_chance(cur);
+                cur = next;
+                continue;
+            }
+            return cur;
+        }
+        cur = next;
+    }
+    return nullptr;
+}
+
 auto cache_allocation_would_exceed_limit_locked(size_t incoming_bytes) -> bool {
     if (incoming_bytes == 0) {
         return false;
@@ -561,6 +598,13 @@ auto reclaim_clean_cache_locked(size_t target_bytes, size_t byte_budget, size_t 
     stats.before_bytes = cache_total_bytes;
     while (cache_total_bytes > target_bytes && stats.freed_bytes < byte_budget && stats.freed_buffers < victim_budget) {
         BufHead* victim = find_reclaimable_lru_buffer(scan_budget, honor_second_chance);
+        if (victim == nullptr) {
+            // Write-heavy workloads can leave dirty/writeback buffers clustered
+            // at the cold end. A bounded hot-end fallback prevents rescanning
+            // the same unreclaimable tail while clean buffers elsewhere let the
+            // cache run far past its target.
+            victim = find_reclaimable_mru_buffer(scan_budget, honor_second_chance);
+        }
         if (victim == nullptr) {
             break;
         }
@@ -1127,6 +1171,115 @@ void discard_clean_overlapping_aliases_locked(BufHead* source) {
     if (discarded_bytes != 0) {
         perf_record_xfs_count(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISCARD, discarded_bytes);
     }
+}
+
+auto cached_alias_can_overlay_writeback(const BufHead* alias, const BufHead* source, uint64_t source_epoch) -> bool {
+    if (alias == nullptr || source == nullptr || alias == source || alias->bdev != source->bdev || alias->data == nullptr ||
+        source->bdev == nullptr || source->bdev->block_size == 0 || (alias->flags & BH_VALID) == 0 || alias->dirty_epoch <= source_epoch) {
+        return false;
+    }
+    return block_ranges_overlap(alias->block_no, buffer_block_count(alias), source->block_no, buffer_block_count(source));
+}
+
+void overlay_cached_alias_into_snapshot(const BufHead* alias, const BufHead* source, uint8_t* dst) {
+    if (dst == nullptr || !cached_alias_can_overlay_writeback(alias, source, 0)) {
+        return;
+    }
+
+    uint64_t const ALIAS_LAST = range_buffer_last_block(alias);
+    uint64_t const SOURCE_LAST = range_buffer_last_block(source);
+    uint64_t const COPY_FIRST = std::max(alias->block_no, source->block_no);
+    uint64_t const COPY_LAST = std::min(ALIAS_LAST, SOURCE_LAST);
+    if (COPY_FIRST > COPY_LAST) {
+        return;
+    }
+
+    size_t const BLOCK_SIZE = source->bdev->block_size;
+    auto const COPY_BLOCKS = static_cast<size_t>(COPY_LAST - COPY_FIRST + 1);
+    size_t copy_bytes = COPY_BLOCKS * BLOCK_SIZE;
+    size_t const SRC_OFF = static_cast<size_t>(COPY_FIRST - alias->block_no) * BLOCK_SIZE;
+    size_t const DST_OFF = static_cast<size_t>(COPY_FIRST - source->block_no) * BLOCK_SIZE;
+    if (SRC_OFF >= alias->size || DST_OFF >= source->size) {
+        return;
+    }
+
+    copy_bytes = std::min(copy_bytes, alias->size - SRC_OFF);
+    copy_bytes = std::min(copy_bytes, source->size - DST_OFF);
+    if (copy_bytes == 0) {
+        return;
+    }
+
+    std::memcpy(dst + DST_OFF, alias->data + SRC_OFF, copy_bytes);
+}
+
+void consider_newer_cached_alias(const BufHead* alias, const BufHead* source, uint64_t min_epoch_exclusive, const BufHead*& best) {
+    if (!cached_alias_can_overlay_writeback(alias, source, min_epoch_exclusive)) {
+        return;
+    }
+    if (best == nullptr || alias->dirty_epoch < best->dirty_epoch ||
+        (alias->dirty_epoch == best->dirty_epoch && range_tree_less(alias, best))) {
+        best = alias;
+    }
+}
+
+void range_consider_newer_cached_aliases_locked(BufHead* root, const BufHead* source, uint64_t min_epoch_exclusive, const BufHead*& best) {
+    if (root == nullptr || source == nullptr) {
+        return;
+    }
+
+    uint64_t const SOURCE_LAST = range_buffer_last_block(source);
+    if (root->range_left != nullptr && root->range_left->range_subtree_last_block >= source->block_no) {
+        range_consider_newer_cached_aliases_locked(root->range_left, source, min_epoch_exclusive, best);
+    }
+
+    consider_newer_cached_alias(root, source, min_epoch_exclusive, best);
+
+    if (root->block_no <= SOURCE_LAST) {
+        range_consider_newer_cached_aliases_locked(root->range_right, source, min_epoch_exclusive, best);
+    }
+}
+
+auto find_oldest_newer_cached_alias_locked(const BufHead* source, uint64_t min_epoch_exclusive) -> const BufHead* {
+    if (range_index_degraded) {
+        const BufHead* best = nullptr;
+        for (auto* bucket_head : hash_buckets) {
+            for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
+                consider_newer_cached_alias(bh, source, min_epoch_exclusive, best);
+            }
+        }
+        return best;
+    }
+
+    RangeBdevState* state = find_range_bdev_state_locked(source->bdev);
+    if (state == nullptr || state->buffers <= 1 || !range_tree_overlaps(state->tree_root, source->block_no, buffer_block_count(source))) {
+        return nullptr;
+    }
+
+    const BufHead* best = nullptr;
+    range_consider_newer_cached_aliases_locked(state->tree_root, source, min_epoch_exclusive, best);
+    return best;
+}
+
+void overlay_newer_cached_aliases_locked(const BufHead* source, uint64_t source_epoch, uint8_t* dst) {
+    if (source == nullptr || source->bdev == nullptr || dst == nullptr) {
+        return;
+    }
+
+    uint64_t min_epoch = source_epoch;
+    while (const BufHead* alias = find_oldest_newer_cached_alias_locked(source, min_epoch)) {
+        overlay_cached_alias_into_snapshot(alias, source, dst);
+        min_epoch = alias->dirty_epoch;
+    }
+}
+
+void overlay_newer_cached_aliases(BufHead const* source, uint64_t source_epoch, uint8_t* dst) {
+    if (source == nullptr || dst == nullptr || source_epoch == 0 || !cache_initialized) {
+        return;
+    }
+
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    overlay_newer_cached_aliases_locked(source, source_epoch, dst);
+    cache_lock.unlock_irqrestore(IRQFLAGS);
 }
 
 auto dirty_tree_less(const BufHead* lhs, const BufHead* rhs) -> bool {
@@ -1776,7 +1929,7 @@ auto mark_buffer_dirty_locked(BufHead* bh) -> bool {
 }
 
 auto write_buffer_snapshot_for_epoch(BufHead* bh, uint64_t writeback_dirty_epoch, uint64_t owned_writeback_epoch) -> int {
-    WritebackSnapshot snapshot = make_writeback_snapshot(bh);
+    WritebackSnapshot snapshot = make_writeback_snapshot_for_epoch(bh, writeback_dirty_epoch);
     if (snapshot.data == nullptr) {
         uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
         if (owns_writeback_epoch(bh, owned_writeback_epoch)) {
@@ -1919,6 +2072,7 @@ auto make_writeback_run_snapshot(const DirtyWritebackRun& run) -> WritebackSnaps
     for (size_t i = 0; i < run.count; ++i) {
         const BufHead* bh = run.buffers.at(i);
         memcpy(snapshot.data + offset, bh->data, bh->size);
+        overlay_newer_cached_aliases(bh, run.dirty_epochs.at(i), snapshot.data + offset);
         offset += bh->size;
     }
     return snapshot;
@@ -1956,7 +2110,7 @@ auto write_dirty_run_buffers_individually(DirtyWritebackRun& run) -> int {
         }
 
         int rc = -ENOMEM;
-        WritebackSnapshot snapshot = make_writeback_snapshot(bh);
+        WritebackSnapshot snapshot = make_writeback_snapshot_for_epoch(bh, run.dirty_epochs.at(i));
         if (snapshot.data != nullptr) {
             rc = write_block_to_disk(bh, snapshot.data);
             free_writeback_snapshot(snapshot);

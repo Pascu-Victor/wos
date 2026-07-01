@@ -186,7 +186,7 @@ def main() -> None:
     require_order(
         fallback_body,
         [
-            "WritebackSnapshot snapshot = make_writeback_snapshot(bh)",
+            "WritebackSnapshot snapshot = make_writeback_snapshot_for_epoch(bh, run.dirty_epochs.at(i))",
             "rc = write_block_to_disk(bh, snapshot.data)",
             "bh->dirty_epoch == run.dirty_epochs.at(i)",
             "clear_buffer_dirty_locked(bh)",

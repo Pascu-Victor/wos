@@ -676,7 +676,7 @@ TEST_F(BufferCacheTest, SyncBlockdevWritesOverlappingDirtyBuffersOldestFirst) {
     ASSERT_EQ(io.write_calls, 2u);
     EXPECT_EQ(io.write_blocks[0], block_no);
     EXPECT_EQ(io.write_counts[0], 2u);
-    EXPECT_EQ(io.write_first_bytes[0], 0xA1);
+    EXPECT_EQ(io.write_first_bytes[0], 0xB2);
     EXPECT_EQ(io.write_blocks[1], block_no);
     EXPECT_EQ(io.write_counts[1], 1u);
     EXPECT_EQ(io.write_first_bytes[1], 0xB2);
@@ -719,7 +719,7 @@ TEST_F(BufferCacheTest, FailedOlderOverlappingWriteBlocksNewerAliasUntilRetry) {
     ASSERT_EQ(io.write_calls, 1u);
     EXPECT_EQ(io.write_blocks[0], block_no);
     EXPECT_EQ(io.write_counts[0], 2u);
-    EXPECT_EQ(io.write_first_bytes[0], 0xA1);
+    EXPECT_EQ(io.write_first_bytes[0], 0xB2);
     EXPECT_TRUE(has_dirty_bdev_range(&dev, block_no, 2));
 
     io.write_calls = 0;
@@ -727,11 +727,44 @@ TEST_F(BufferCacheTest, FailedOlderOverlappingWriteBlocksNewerAliasUntilRetry) {
     ASSERT_EQ(io.write_calls, 2u);
     EXPECT_EQ(io.write_blocks[0], block_no);
     EXPECT_EQ(io.write_counts[0], 2u);
-    EXPECT_EQ(io.write_first_bytes[0], 0xA1);
+    EXPECT_EQ(io.write_first_bytes[0], 0xB2);
     EXPECT_EQ(io.write_blocks[1], block_no);
     EXPECT_EQ(io.write_counts[1], 1u);
     EXPECT_EQ(io.write_first_bytes[1], 0xB2);
     EXPECT_FALSE(has_dirty_bdev_range(&dev, block_no, 2));
+    dev.private_data = nullptr;
+}
+
+TEST_F(BufferCacheTest, OlderDirtyAliasCannotOverwriteNewerCleanAlias) {
+    RecordingIoState io{};
+    dev.write_blocks = recording_write;
+    dev.private_data = &io;
+
+    constexpr uint64_t BLOCK = 760;
+
+    BufHead* older_multi = bget_multi(&dev, BLOCK, 2);
+    ASSERT_NE(older_multi, nullptr);
+    memset(older_multi->data, 0xA1, older_multi->size);
+    bdirty(older_multi);
+    brelse(older_multi);
+
+    BufHead* newer_single = bget(&dev, BLOCK);
+    ASSERT_NE(newer_single, nullptr);
+    memset(newer_single->data, 0xB2, newer_single->size);
+    EXPECT_EQ(bwrite(newer_single), 0);
+    brelse(newer_single);
+
+    ASSERT_EQ(io.write_calls, 1u);
+    EXPECT_EQ(io.write_blocks[0], BLOCK);
+    EXPECT_EQ(io.write_counts[0], 1u);
+    EXPECT_EQ(io.write_first_bytes[0], 0xB2);
+
+    EXPECT_EQ(sync_blockdev(&dev), 0);
+    ASSERT_EQ(io.write_calls, 2u);
+    EXPECT_EQ(io.write_blocks[1], BLOCK);
+    EXPECT_EQ(io.write_counts[1], 2u);
+    EXPECT_EQ(io.write_first_bytes[1], 0xB2);
+    EXPECT_FALSE(has_dirty_bdev_range(&dev, BLOCK, 2));
     dev.private_data = nullptr;
 }
 

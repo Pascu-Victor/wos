@@ -741,7 +741,7 @@ KTEST(BufferCache, SyncBlockdevWritesOverlappingDirtyBuffersOldestFirst) {
     KEXPECT_EQ(io.write_calls, static_cast<size_t>(2));
     KEXPECT_EQ(io.write_blocks[0], block_no);
     KEXPECT_EQ(io.write_counts[0], static_cast<size_t>(2));
-    KEXPECT_EQ(io.write_first_bytes[0], static_cast<uint8_t>(0xA1));
+    KEXPECT_EQ(io.write_first_bytes[0], static_cast<uint8_t>(0xB2));
     KEXPECT_EQ(io.write_blocks[1], block_no);
     KEXPECT_EQ(io.write_counts[1], static_cast<size_t>(1));
     KEXPECT_EQ(io.write_first_bytes[1], static_cast<uint8_t>(0xB2));
@@ -786,7 +786,7 @@ KTEST(BufferCache, FailedOlderOverlappingWriteBlocksNewerAliasUntilRetry) {
     KREQUIRE_EQ(io.write_calls, static_cast<size_t>(1));
     KEXPECT_EQ(io.write_blocks[0], block_no);
     KEXPECT_EQ(io.write_counts[0], static_cast<size_t>(2));
-    KEXPECT_EQ(io.write_first_bytes[0], static_cast<uint8_t>(0xA1));
+    KEXPECT_EQ(io.write_first_bytes[0], static_cast<uint8_t>(0xB2));
     KEXPECT_TRUE(ker::vfs::has_dirty_bdev_range(&dev, block_no, 2));
 
     io.write_calls = 0;
@@ -794,11 +794,46 @@ KTEST(BufferCache, FailedOlderOverlappingWriteBlocksNewerAliasUntilRetry) {
     KREQUIRE_EQ(io.write_calls, static_cast<size_t>(2));
     KEXPECT_EQ(io.write_blocks[0], block_no);
     KEXPECT_EQ(io.write_counts[0], static_cast<size_t>(2));
-    KEXPECT_EQ(io.write_first_bytes[0], static_cast<uint8_t>(0xA1));
+    KEXPECT_EQ(io.write_first_bytes[0], static_cast<uint8_t>(0xB2));
     KEXPECT_EQ(io.write_blocks[1], block_no);
     KEXPECT_EQ(io.write_counts[1], static_cast<size_t>(1));
     KEXPECT_EQ(io.write_first_bytes[1], static_cast<uint8_t>(0xB2));
     KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, block_no, 2));
+    ker::vfs::invalidate_bdev(&dev);
+}
+
+KTEST(BufferCache, OlderDirtyAliasCannotOverwriteNewerCleanAlias) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    RecordingWriteState io{};
+    dev.write_blocks = recording_write;
+    dev.private_data = &io;
+    ker::vfs::invalidate_bdev(&dev);
+
+    uint64_t const BLOCK = 760;
+
+    ker::vfs::BufHead* older_multi = ker::vfs::bget_multi(&dev, BLOCK, 2);
+    KREQUIRE_NE(older_multi, nullptr);
+    memset(older_multi->data, 0xA1, older_multi->size);
+    ker::vfs::bdirty(older_multi);
+    ker::vfs::brelse(older_multi);
+
+    ker::vfs::BufHead* newer_single = ker::vfs::bget(&dev, BLOCK);
+    KREQUIRE_NE(newer_single, nullptr);
+    memset(newer_single->data, 0xB2, newer_single->size);
+    KEXPECT_EQ(ker::vfs::bwrite(newer_single), 0);
+    ker::vfs::brelse(newer_single);
+
+    KREQUIRE_EQ(io.write_calls, static_cast<size_t>(1));
+    KEXPECT_EQ(io.write_blocks[0], BLOCK);
+    KEXPECT_EQ(io.write_counts[0], static_cast<size_t>(1));
+    KEXPECT_EQ(io.write_first_bytes[0], static_cast<uint8_t>(0xB2));
+
+    KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), 0);
+    KREQUIRE_EQ(io.write_calls, static_cast<size_t>(2));
+    KEXPECT_EQ(io.write_blocks[1], BLOCK);
+    KEXPECT_EQ(io.write_counts[1], static_cast<size_t>(2));
+    KEXPECT_EQ(io.write_first_bytes[1], static_cast<uint8_t>(0xB2));
+    KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, BLOCK, 2));
     ker::vfs::invalidate_bdev(&dev);
 }
 
