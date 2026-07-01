@@ -315,6 +315,10 @@ if(WOS_KASAN)
         src/platform/init/init_wrappers.cpp
         src/platform/init/init_validation.cpp
         src/platform/init/limine_requests.cpp
+        # Secondary CPU bootstrap runs before each AP installs its IDT, so any
+        # compiler-emitted shadow access there can reset the VM before the
+        # shadow-fault handler exists on that CPU.
+        src/platform/smt/smt.cpp
         # Low-level CPU/ASM helpers called from exception paths
         src/platform/asm/cpu.cpp
         src/platform/asm/tlb.cpp
