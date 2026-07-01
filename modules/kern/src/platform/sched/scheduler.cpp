@@ -1543,8 +1543,11 @@ inline auto remove_from_heap_by_scan_locked(RunQueue* rq, task::Task* task) -> b
         }
 
         task->heap_index = static_cast<int32_t>(idx);
+        if (!rq->runnable_heap.remove(task)) {
+            return false;
+        }
         remove_from_sums(rq, task);
-        return rq->runnable_heap.remove(task);
+        return true;
     }
 
     return false;
@@ -2242,11 +2245,16 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
 
             // Claim ownership BEFORE removing from heap - closes the window
             // where reschedule_task_for_cpu could re-insert into victim queue.
+            uint64_t const PREV_CPU = best->cpu;
             best->cpu = stealing_cpu;
 
-            // Remove from victim (victim lock still held)
-            remove_from_sums(victim_rq, best);
-            victim_rq->runnable_heap.remove(best);
+            // Remove from victim (victim lock still held). The candidate came
+            // from a heap-entry scan, so repair a stale heap_index before
+            // removal instead of turning hot migration into a publish panic.
+            if (!remove_from_heap_by_scan_locked(victim_rq, best)) {
+                best->cpu = PREV_CPU;
+                return;
+            }
             stolen = best;
         });
 
@@ -7130,6 +7138,36 @@ auto scheduler_selftest_migration_policy_preserves_hot_process_migration() -> bo
     bool const WKI_PROXY_REJECTED = !process_task_can_idle_steal(&proxy_process);
 
     return COLD_USER_PROCESS_STEALABLE && SAFE_KERNEL_BLOCK_STEALABLE && BAD_KERNEL_BLOCK_REJECTED && WKI_PROXY_REJECTED;
+}
+
+auto scheduler_selftest_heap_scan_removal_repairs_stale_index() -> bool {
+    RunQueue rq{};
+    std::array<task::Task, 3> tasks{};
+
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        auto& t = tasks[i];
+        t.type = task::TaskType::PROCESS;
+        t.pid = static_cast<uint64_t>(i + 1);
+        t.heap_index = -1;
+        t.vruntime = static_cast<int64_t>(i) * 100;
+        t.vdeadline = static_cast<int64_t>(i + 1) * 100;
+        t.sched_weight = 1024;
+        if (!publish_runnable_task_locked(&rq, &t, "heap-scan-selftest")) {
+            return false;
+        }
+    }
+
+    task::Task* victim = &tasks[1];
+    victim->heap_index = -1;
+
+    bool const REMOVED = remove_from_heap_by_scan_locked(&rq, victim);
+    bool const VICTIM_DETACHED = victim->heap_index == -1 && !rq.runnable_heap.contains(victim);
+    bool const HEAP_SIZE_OK = rq.runnable_heap.size == 2;
+    bool const TOTAL_WEIGHT_OK = rq.total_weight == 2048;
+    bool const LOAD_DEFAULT_OK = rq.cached_load_default.load(std::memory_order_relaxed) == 16;
+    bool const LOAD_PROCESS_OK = rq.cached_load_process.load(std::memory_order_relaxed) == 16;
+
+    return REMOVED && VICTIM_DETACHED && HEAP_SIZE_OK && TOTAL_WEIGHT_OK && LOAD_DEFAULT_OK && LOAD_PROCESS_OK;
 }
 #endif
 
