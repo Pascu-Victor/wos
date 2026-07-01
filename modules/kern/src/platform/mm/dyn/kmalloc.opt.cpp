@@ -65,6 +65,7 @@ inline auto get_current_cpu_id() -> uint64_t {
 // 0x10000+: large allocations (pageAllocHuge with tracking)
 constexpr uint64_t SLAB_MAX_SIZE = 0x800;     // 2KB - maximum size mini_malloc handles
 constexpr uint64_t MEDIUM_MAX_SIZE = 0xFFFF;  // ~64KB - maximum size for medium allocations
+constexpr uint64_t MAX_BUDDY_ALLOCATION_BYTES = (uint64_t{1} << PageAllocator::MAX_ORDER) * ker::mod::mm::paging::PAGE_SIZE;
 
 #ifdef WOS_KMALLOC_DEBUG_INFO
 struct AllocDebugInfo;
@@ -698,6 +699,28 @@ auto alloc_large_backing(uint64_t size) -> void* {
     return phys::page_alloc_with_reclaim(size, "kmalloc_large");
 }
 
+auto checked_page_rounded_alloc_size(uint64_t payload_size, uint64_t header_size, uint64_t& out_rounded_size) -> bool {
+    out_rounded_size = 0;
+    if (payload_size > UINT64_MAX - header_size) {
+        return false;
+    }
+
+    uint64_t const TOTAL_SIZE = payload_size + header_size;
+    uint64_t const PAGE_SIZE = ker::mod::mm::paging::PAGE_SIZE;
+    uint64_t const PAGES = (TOTAL_SIZE / PAGE_SIZE) + ((TOTAL_SIZE % PAGE_SIZE) != 0 ? 1 : 0);
+    if (PAGES == 0 || PAGES > UINT64_MAX / PAGE_SIZE) {
+        return false;
+    }
+
+    uint64_t const ALIGNED_SIZE = PAGES * PAGE_SIZE;
+    if (ALIGNED_SIZE > MAX_BUDDY_ALLOCATION_BYTES) {
+        return false;
+    }
+
+    out_rounded_size = ALIGNED_SIZE;
+    return true;
+}
+
 auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
 #ifndef WOS_KMALLOC_DEBUG_INFO
     (void)caller;
@@ -749,19 +772,20 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
 
     // Tier 2: Medium allocations (0x801 - 0xFFFF) - use regular pageAlloc with tracking
     if (size <= MEDIUM_MAX_SIZE) {
-        uint64_t const PAGE_SIZE = ker::mod::mm::paging::PAGE_SIZE;
-        uint64_t const TOTAL_SIZE = size + sizeof(MediumAllocationHeader);
-        uint64_t const ALLOC_SIZE = (TOTAL_SIZE + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        uint64_t rounded_size = 0;
+        if (!checked_page_rounded_alloc_size(size, sizeof(MediumAllocationHeader), rounded_size)) {
+            return nullptr;
+        }
 
 #ifdef DEBUG_KMALLOC
         emergency_serial::write("kmalloc: Medium allocation (0x");
         emergency_serial::write_hex(size);
         emergency_serial::write(" bytes), using pageAlloc (0x");
-        emergency_serial::write_hex(ALLOC_SIZE);
+        emergency_serial::write_hex(rounded_size);
         emergency_serial::write(" bytes)\n");
 #endif
 
-        void* alloc_ptr = alloc_medium_backing(ALLOC_SIZE);
+        void* alloc_ptr = alloc_medium_backing(rounded_size);
         if (alloc_ptr == nullptr) {
 #ifdef DEBUG_KMALLOC
             emergency_serial::write("kmalloc: pageAlloc failed for medium allocation\n");
@@ -772,7 +796,7 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
 
         // Set up header with tracking info
         auto* header = static_cast<MediumAllocationHeader*>(alloc_ptr);
-        header->size = ALLOC_SIZE;
+        header->size = rounded_size;
 #ifdef WOS_KMALLOC_DEBUG_INFO
         header->debug_info = register_alloc_debug(caller, tag);
 #endif
@@ -799,21 +823,22 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
     }
 
     // Tier 3: Large allocations (>= 0x10000) - use pageAllocHuge with tracking
-    uint64_t const PAGE_SIZE = ker::mod::mm::paging::PAGE_SIZE;
-    uint64_t const TOTAL_SIZE = size + sizeof(LargeAllocationHeader);
-    uint64_t const ALLOC_SIZE = (TOTAL_SIZE + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint64_t rounded_size = 0;
+    if (!checked_page_rounded_alloc_size(size, sizeof(LargeAllocationHeader), rounded_size)) {
+        return nullptr;
+    }
 
 #ifdef DEBUG_KMALLOC
     emergency_serial::write("kmalloc: Large allocation (0x");
     emergency_serial::write_hex(size);
     emergency_serial::write(" bytes), using pageAllocHuge (0x");
-    emergency_serial::write_hex(ALLOC_SIZE);
+    emergency_serial::write_hex(rounded_size);
     emergency_serial::write(" bytes)\n");
 #endif
 
     // Allocate from huge page zone first; if it is full, the regular-zone
     // fallback may yield to scheduler GC when the caller is preemptible.
-    void* alloc_ptr = alloc_large_backing(ALLOC_SIZE);
+    void* alloc_ptr = alloc_large_backing(rounded_size);
     if (alloc_ptr == nullptr) {
 #ifdef DEBUG_KMALLOC
         emergency_serial::write("kmalloc: pageAlloc failed for large allocation\n");
@@ -824,7 +849,7 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
 
     // Set up header with tracking info
     auto* header = static_cast<LargeAllocationHeader*>(alloc_ptr);
-    header->size = ALLOC_SIZE;
+    header->size = rounded_size;
 #ifdef WOS_KMALLOC_DEBUG_INFO
     header->debug_info = register_alloc_debug(caller, tag);
 #endif
@@ -1058,23 +1083,25 @@ auto realloc(void* ptr, size_t size) -> void* {
 
         // Staying in large range?
         if (NEW_SIZE > MEDIUM_MAX_SIZE) {
-            uint64_t const PAGE_SIZE = ker::mod::mm::paging::PAGE_SIZE;
-            uint64_t const NEW_ALLOC_SIZE = (NEW_SIZE + sizeof(LargeAllocationHeader) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            uint64_t new_rounded_size = 0;
+            if (!checked_page_rounded_alloc_size(NEW_SIZE, sizeof(LargeAllocationHeader), new_rounded_size)) {
+                return nullptr;
+            }
 
             // If the new size fits in the current allocation, return same pointer
-            if (NEW_ALLOC_SIZE == potential_large_header->size) {
+            if (new_rounded_size == potential_large_header->size) {
                 return ptr;
             }
 
             // Need to reallocate - allocate new, copy, free old
-            void* new_alloc = alloc_large_backing(NEW_ALLOC_SIZE);
+            void* new_alloc = alloc_large_backing(new_rounded_size);
             if (new_alloc == nullptr) {
                 return nullptr;
             }
             (void)phys::page_mark_kind(new_alloc, PageKind::KMALLOC_LARGE);
 
             auto* new_header = static_cast<LargeAllocationHeader*>(new_alloc);
-            new_header->size = NEW_ALLOC_SIZE;
+            new_header->size = new_rounded_size;
 #ifdef WOS_KMALLOC_DEBUG_INFO
             new_header->debug_info = nullptr;
 #endif
@@ -1123,23 +1150,25 @@ auto realloc(void* ptr, size_t size) -> void* {
 
         // Staying in medium range?
         if (NEW_SIZE > SLAB_MAX_SIZE && NEW_SIZE <= MEDIUM_MAX_SIZE) {
-            uint64_t const PAGE_SIZE = ker::mod::mm::paging::PAGE_SIZE;
-            uint64_t const NEW_ALLOC_SIZE = (NEW_SIZE + sizeof(MediumAllocationHeader) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            uint64_t new_rounded_size = 0;
+            if (!checked_page_rounded_alloc_size(NEW_SIZE, sizeof(MediumAllocationHeader), new_rounded_size)) {
+                return nullptr;
+            }
 
             // If the new size fits in the current allocation, return same pointer
-            if (NEW_ALLOC_SIZE == potential_medium_header->size) {
+            if (new_rounded_size == potential_medium_header->size) {
                 return ptr;
             }
 
             // Need to reallocate - allocate new, copy, free old
-            void* new_alloc = alloc_medium_backing(NEW_ALLOC_SIZE);
+            void* new_alloc = alloc_medium_backing(new_rounded_size);
             if (new_alloc == nullptr) {
                 return nullptr;
             }
             (void)phys::page_mark_kind(new_alloc, PageKind::MEDIUM);
 
             auto* new_header = static_cast<MediumAllocationHeader*>(new_alloc);
-            new_header->size = NEW_ALLOC_SIZE;
+            new_header->size = new_rounded_size;
 #ifdef WOS_KMALLOC_DEBUG_INFO
             new_header->debug_info = nullptr;
 #endif

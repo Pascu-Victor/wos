@@ -20,15 +20,19 @@ static_assert(sizeof(std::atomic<uint8_t>) == sizeof(uint8_t), "PageKind table f
 static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t), "Page refcount table clear assumes uint32-sized atomics");
 
 // Smallest order k such that (1 << k) pages >= the requested byte count.
-auto size_to_order(uint64_t size_bytes) -> int {
-    uint64_t const PAGES = (size_bytes + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
+auto size_to_order(uint64_t size_bytes, int& out_order) -> bool {
+    uint64_t const PAGES = (size_bytes / paging::PAGE_SIZE) + ((size_bytes % paging::PAGE_SIZE) != 0 ? 1 : 0);
     if (PAGES <= 1) {
-        return 0;
+        out_order = 0;
+        return true;
+    }
+    uint64_t const MAX_PAGES = uint64_t{1} << PageAllocator::MAX_ORDER;
+    if (PAGES > MAX_PAGES) {
+        return false;
     }
     // __builtin_clzll(0) is undefined, but pages >= 2 here.
-    int bits = 64 - __builtin_clzll(PAGES - 1);
-    bits = std::min(bits, PageAllocator::MAX_ORDER);
-    return bits;
+    out_order = 64 - __builtin_clzll(PAGES - 1);
+    return true;
 }
 
 auto largest_order_for_aligned_run(uint32_t page_idx, uint32_t page_count) -> int {
@@ -582,10 +586,13 @@ void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
 #ifndef WOS_PHYS_ALLOC_CALLER_STATS
     (void)caller;
 #endif
-    int const ORDER = size_to_order(size_bytes);
+    int order = 0;
+    if (!size_to_order(size_bytes, order)) {
+        return nullptr;
+    }
 
     // Walk up to find the smallest available block >= requested order.
-    int k = ORDER;
+    int k = order;
     uint32_t page_idx = 0;
     FreeBlock* block = nullptr;
     bool repaired_free_lists = false;
@@ -603,7 +610,7 @@ void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
             }
             rebuild_free_lists_from_flags(this, "alloc corrupt head");
             repaired_free_lists = true;
-            k = ORDER;
+            k = order;
             continue;
         }
 
@@ -615,7 +622,7 @@ void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
                 continue;
             }
             repaired_free_lists = true;
-            k = ORDER;
+            k = order;
             block = nullptr;
             continue;
         }
@@ -631,7 +638,7 @@ void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
     }
 
     // Split down: put the upper buddy of each split into the free list.
-    while (k > ORDER) {
+    while (k > order) {
         k--;
         uint32_t const BUDDY_SIZE = 1U << k;
         uint32_t const BUDDY_IDX = page_idx + BUDDY_SIZE;
@@ -647,8 +654,8 @@ void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
     }
 
     // Mark the allocated block.
-    uint32_t const BLOCK_SIZE = 1U << ORDER;
-    page_flags[page_idx] = FLAG_ALLOC_HEAD | static_cast<uint8_t>(ORDER);
+    uint32_t const BLOCK_SIZE = 1U << order;
+    page_flags[page_idx] = FLAG_ALLOC_HEAD | static_cast<uint8_t>(order);
     for (uint32_t i = 1; i < BLOCK_SIZE; i++) {
         page_flags[page_idx + i] = FLAG_ALLOC_CONT;
     }

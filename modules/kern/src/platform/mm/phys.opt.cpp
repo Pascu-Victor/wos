@@ -779,12 +779,18 @@ auto buddy_accounting_size(uint64_t size) -> uint64_t {
         return paging::PAGE_SIZE;
     }
 
-    uint64_t pages = (size + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
+    uint64_t pages = (size / paging::PAGE_SIZE) + ((size % paging::PAGE_SIZE) != 0 ? 1 : 0);
     uint64_t rounded_pages = 1;
-    while (rounded_pages < pages && rounded_pages < (uint64_t{1} << PageAllocator::MAX_ORDER)) {
+    uint64_t const MAX_PAGES = uint64_t{1} << PageAllocator::MAX_ORDER;
+    while (rounded_pages < pages && rounded_pages < MAX_PAGES) {
         rounded_pages <<= 1;
     }
     return rounded_pages * paging::PAGE_SIZE;
+}
+
+auto page_alloc_size_within_buddy_limit(uint64_t size, uint64_t& out_pages) -> bool {
+    out_pages = (size / paging::PAGE_SIZE) + ((size % paging::PAGE_SIZE) != 0 ? 1 : 0);
+    return out_pages <= (uint64_t{1} << PageAllocator::MAX_ORDER);
 }
 
 auto page_alloc_order_for_size(uint64_t size, int& out_order, uint64_t& out_pages) -> bool {
@@ -1331,9 +1337,10 @@ auto try_cache_freed_order0_page(PageAllocator* allocator, void* page) -> bool {
 }
 
 auto page_alloc_impl(uint64_t size, std::string_view name, ReturnedPageZeroing zeroing, void* caller_addr, bool log_oom) -> void* {
-#ifdef WOS_PHYS_ALLOC_CALLER_STATS
-    uint64_t const NUM_PAGES = (size + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
-#endif
+    [[maybe_unused]] uint64_t requested_pages = 0;
+    if (!page_alloc_size_within_buddy_limit(size, requested_pages)) {
+        return nullptr;
+    }
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     uint64_t const CALLER_TAG = caller_stats_runtime_enabled.load(std::memory_order_relaxed) ? reinterpret_cast<uint64_t>(caller_addr) : 0;
 #else
@@ -1392,7 +1399,7 @@ auto page_alloc_impl(uint64_t size, std::string_view name, ReturnedPageZeroing z
     prepare_allocated_block(block, size, zeroing);
 
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
-    record_page_alloc_caller(caller_addr, NUM_PAGES);
+    record_page_alloc_caller(caller_addr, requested_pages);
 #endif
     return block;
 }
@@ -1407,6 +1414,11 @@ auto can_wait_for_reclaim() -> bool {
 
 auto page_alloc_with_reclaim_impl(uint64_t size, std::string_view name, ReturnedPageZeroing zeroing, void* caller_addr,
                                   uint32_t retry_count) -> void* {
+    uint64_t requested_pages = 0;
+    if (!page_alloc_size_within_buddy_limit(size, requested_pages)) {
+        return nullptr;
+    }
+
     for (uint32_t attempt = 0; attempt < retry_count; ++attempt) {
         void* const PAGE = page_alloc_impl(size, name, zeroing, caller_addr, false);
         if (PAGE != nullptr) {
@@ -1476,9 +1488,13 @@ auto page_alloc_huge(uint64_t size) -> void* {
         return nullptr;
     }
 
+    [[maybe_unused]] uint64_t requested_pages = 0;
+    if (!page_alloc_size_within_buddy_limit(size, requested_pages)) {
+        return nullptr;
+    }
+
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     void* caller_addr = __builtin_return_address(0);
-    uint64_t const NUM_PAGES = (size + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE;
 #endif
 
     // Allocate from dedicated huge page zone
@@ -1518,7 +1534,7 @@ auto page_alloc_huge(uint64_t size) -> void* {
     }
 
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
-    record_page_alloc_caller(caller_addr, NUM_PAGES);
+    record_page_alloc_caller(caller_addr, requested_pages);
 #endif
     return block;
 }

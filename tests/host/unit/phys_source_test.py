@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[3]
 PHYS_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "phys.opt.cpp"
 PHYS_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "phys.hpp"
 PAGE_ALLOC_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "page_alloc.cpp"
+KMALLOC_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "dyn" / "kmalloc.opt.cpp"
 MM_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "mm_ktest.cpp"
 
 
@@ -43,6 +44,11 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
     missing = [token for token in tokens if token not in source]
     if missing:
         fail(f"{context}: missing {', '.join(missing)}")
+
+
+def require_absent(source: str, token: str, context: str) -> None:
+    if token in source:
+        fail(f"{context}: unexpected {token}")
 
 
 def require_order(source: str, tokens: list[str], context: str) -> None:
@@ -160,7 +166,7 @@ def test_buddy_free_list_repair_rebuilds_from_flags() -> None:
             "rebuild_free_lists_from_flags(this, \"alloc corrupt head\")",
             "remove_free_block_with_repair(this, k, block, \"alloc unlink\")",
             "repaired_free_lists = true;",
-            "k = ORDER;",
+            "k = order;",
         ],
         "allocation must retry after free-list rebuild",
     )
@@ -189,6 +195,150 @@ def test_direct_page_free_rejects_refcounted_blocks() -> None:
         ],
         "direct page_free refcount guard",
     )
+
+
+def test_allocator_size_rounding_rejects_overflow_and_overmax_requests() -> None:
+    page_alloc = PAGE_ALLOC_CPP.read_text()
+    phys = PHYS_CPP.read_text()
+    kmalloc = KMALLOC_CPP.read_text()
+
+    size_order_body = function_body(page_alloc, "size_to_order")
+    require_order(
+        size_order_body,
+        [
+            "uint64_t const PAGES = (size_bytes / paging::PAGE_SIZE) + ((size_bytes % paging::PAGE_SIZE) != 0 ? 1 : 0)",
+            "uint64_t const MAX_PAGES = uint64_t{1} << PageAllocator::MAX_ORDER",
+            "if (PAGES > MAX_PAGES)",
+            "return false",
+            "out_order = 64 - __builtin_clzll(PAGES - 1)",
+            "return true",
+        ],
+        "buddy allocator size-to-order conversion must be checked",
+    )
+    require_absent(size_order_body, "size_bytes + paging::PAGE_SIZE - 1", "buddy allocator size rounding")
+    require_absent(size_order_body, "std::min(bits, PageAllocator::MAX_ORDER)", "buddy allocator order conversion")
+
+    alloc_body = function_body(page_alloc, "alloc")
+    require_order(
+        alloc_body,
+        [
+            "int order = 0",
+            "if (!size_to_order(size_bytes, order))",
+            "return nullptr",
+            "int k = order",
+            "while (k > order)",
+            "uint32_t const BLOCK_SIZE = 1U << order",
+        ],
+        "PageAllocator::alloc must reject impossible orders before publishing a block",
+    )
+
+    limit_body = function_body(phys, "page_alloc_size_within_buddy_limit")
+    require_order(
+        limit_body,
+        [
+            "out_pages = (size / paging::PAGE_SIZE) + ((size % paging::PAGE_SIZE) != 0 ? 1 : 0)",
+            "return out_pages <= (uint64_t{1} << PageAllocator::MAX_ORDER)",
+        ],
+        "phys allocation public size limit",
+    )
+
+    phys_alloc_body = function_body(phys, "page_alloc_impl")
+    require_order(
+        phys_alloc_body,
+        [
+            "uint64_t requested_pages = 0",
+            "if (!page_alloc_size_within_buddy_limit(size, requested_pages))",
+            "return nullptr",
+            "find_free_block(size, CALLER_TAG)",
+            "prepare_allocated_block(block, size, zeroing)",
+        ],
+        "regular phys allocation must validate before zone search and zeroing",
+    )
+    require_tokens(
+        phys_alloc_body,
+        ["record_page_alloc_caller(caller_addr, requested_pages)"],
+        "regular phys caller stats must use checked page count",
+    )
+
+    reclaim_body = function_body(phys, "page_alloc_with_reclaim_impl")
+    require_order(
+        reclaim_body,
+        [
+            "uint64_t requested_pages = 0",
+            "if (!page_alloc_size_within_buddy_limit(size, requested_pages))",
+            "return nullptr",
+            "for (uint32_t attempt = 0; attempt < retry_count; ++attempt)",
+        ],
+        "reclaim allocation must reject invalid sizes before reclaim retries",
+    )
+
+    huge_body = function_body(phys, "page_alloc_huge")
+    require_order(
+        huge_body,
+        [
+            "if (!page_alloc_size_within_buddy_limit(size, requested_pages))",
+            "return nullptr",
+            "find_free_block_huge(size, CALLER_TAG)",
+            "std::memset(block, 0, size)",
+        ],
+        "huge phys allocation must validate before allocation and zeroing",
+    )
+    require_tokens(
+        huge_body,
+        ["record_page_alloc_caller(caller_addr, requested_pages)"],
+        "huge phys caller stats must use checked page count",
+    )
+
+    rounded_body = function_body(kmalloc, "checked_page_rounded_alloc_size")
+    require_order(
+        rounded_body,
+        [
+            "payload_size > UINT64_MAX - header_size",
+            "return false",
+            "uint64_t const TOTAL_SIZE = payload_size + header_size",
+            "uint64_t const PAGES = (TOTAL_SIZE / PAGE_SIZE) + ((TOTAL_SIZE % PAGE_SIZE) != 0 ? 1 : 0)",
+            "PAGES == 0 || PAGES > UINT64_MAX / PAGE_SIZE",
+            "uint64_t const ALIGNED_SIZE = PAGES * PAGE_SIZE",
+            "ALIGNED_SIZE > MAX_BUDDY_ALLOCATION_BYTES",
+            "out_rounded_size = ALIGNED_SIZE",
+            "return true",
+        ],
+        "kmalloc tracked allocation size rounding must be checked",
+    )
+
+    malloc_body = function_body(kmalloc, "malloc_impl")
+    require_order(
+        malloc_body,
+        [
+            "if (!checked_page_rounded_alloc_size(size, sizeof(MediumAllocationHeader), rounded_size))",
+            "return nullptr",
+            "alloc_medium_backing(rounded_size)",
+            "header->size = rounded_size",
+            "if (!checked_page_rounded_alloc_size(size, sizeof(LargeAllocationHeader), rounded_size))",
+            "return nullptr",
+            "alloc_large_backing(rounded_size)",
+            "header->size = rounded_size",
+        ],
+        "kmalloc malloc must reject overflowed tracked allocation sizes",
+    )
+
+    realloc_body = function_body(kmalloc, "realloc")
+    require_order(
+        realloc_body,
+        [
+            "if (!checked_page_rounded_alloc_size(NEW_SIZE, sizeof(LargeAllocationHeader), new_rounded_size))",
+            "return nullptr",
+            "alloc_large_backing(new_rounded_size)",
+            "new_header->size = new_rounded_size",
+            "if (!checked_page_rounded_alloc_size(NEW_SIZE, sizeof(MediumAllocationHeader), new_rounded_size))",
+            "return nullptr",
+            "alloc_medium_backing(new_rounded_size)",
+            "new_header->size = new_rounded_size",
+        ],
+        "kmalloc realloc tracked growth must reject overflowed allocation sizes",
+    )
+    require_absent(kmalloc, "NEW_SIZE + sizeof(LargeAllocationHeader) + PAGE_SIZE - 1", "kmalloc large realloc rounding")
+    require_absent(kmalloc, "NEW_SIZE + sizeof(MediumAllocationHeader) + PAGE_SIZE - 1", "kmalloc medium realloc rounding")
 
 
 def test_live_slab_pages_are_not_reused_by_physical_allocator() -> None:
@@ -271,6 +421,7 @@ def main() -> None:
     test_selftest_and_ktest_cover_boot_reservation_edges()
     test_buddy_free_list_repair_rebuilds_from_flags()
     test_direct_page_free_rejects_refcounted_blocks()
+    test_allocator_size_rounding_rejects_overflow_and_overmax_requests()
     test_live_slab_pages_are_not_reused_by_physical_allocator()
     print("physical memory source invariants hold")
 
