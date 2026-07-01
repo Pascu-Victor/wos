@@ -54,6 +54,15 @@ uint32_t flags;
 uint32_t bsp_lapic_id;
 uint64_t g_cpu_count;
 
+auto allocate_kernel_stack_top(const char* name) -> uint64_t {
+    auto const STACK_BASE = reinterpret_cast<uint64_t>(mm::phys::page_alloc(mm::KERNEL_STACK_SIZE, name));
+    if (STACK_BASE == 0) {
+        dbg::log("FATAL: Failed to allocate kernel stack for %s", name != nullptr ? name : "?");
+        hcf();
+    }
+    return STACK_BASE + mm::KERNEL_STACK_SIZE;
+}
+
 // ============================================================================
 // CPU Domain registry
 // ============================================================================
@@ -217,9 +226,10 @@ void cpu_param_init(uint64_t cpu_no, uint64_t stack_top) {
     // Initialize scheduler for this CPU
     sched::percpu_init();
 
-    // Create idle task for this CPU
-    // Pass the kernel stack TOP (stack grows downward, so syscall needs to start from top)
-    auto* idle_task = new sched::task::Task("idle", 0, stack_top, sched::task::TaskType::IDLE);
+    // Create idle task for this CPU. Do not reuse the AP bootstrap stack: idle
+    // becomes the long-lived scheduler context for this CPU.
+    uint64_t const IDLE_STACK_TOP = allocate_kernel_stack_top("ap-idle-stack");
+    auto* idle_task = new sched::task::Task("idle", 0, IDLE_STACK_TOP, sched::task::TaskType::IDLE);
     sched::post_task(idle_task);
 
     // Atomically increment the counter of initialized CPUs
@@ -266,7 +276,7 @@ void non_primary_cpu_init(limine_mp_info* smp_info) {
 
 // Create init task(s) from handover modules WITHOUT starting scheduler
 // This is called early to ensure init gets PID 1
-void create_init_tasks(boot::HandoverModules& mod_struct, uint64_t kernel_rsp) {
+void create_init_tasks(boot::HandoverModules& mod_struct) {
     // Try loading /sbin/init from tmpfs (unpacked from CPIO initramfs)
     auto* init_node = ker::vfs::tmpfs::tmpfs_walk_path("sbin/init", false);
     if (init_node != nullptr && init_node->type == ker::vfs::tmpfs::TmpNodeType::FILE && init_node->size > 0) {
@@ -289,8 +299,9 @@ void create_init_tasks(boot::HandoverModules& mod_struct, uint64_t kernel_rsp) {
 
     for (uint64_t i = 0; i < mod_struct.count; i++) {
         const auto& module = mod_struct.modules[i];
+        uint64_t const TASK_KERNEL_RSP = allocate_kernel_stack_top("init-task-stack");
         auto* new_task =
-            new sched::task::Task(module.name, reinterpret_cast<uint64_t>(module.entry), kernel_rsp, sched::task::TaskType::PROCESS);
+            new sched::task::Task(module.name, reinterpret_cast<uint64_t>(module.entry), TASK_KERNEL_RSP, sched::task::TaskType::PROCESS);
 
         if (new_task == nullptr || new_task->thread == nullptr || new_task->pagemap == nullptr) {
             dbg::log("FATAL: Failed to create handover task %s - OOM", module.name);
@@ -762,7 +773,7 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     // This ensures init gets PID 1, regardless of how many CPUs exist
     sched::percpu_init();
     dbg::log("Creating init task(s) from handover modules");
-    create_init_tasks(modules, kernel_rsp);
+    create_init_tasks(modules);
     sched::start_gc_worker();
 
     // Start the TCP timer as a kernel thread (DAEMON) instead of running it in interrupt context
@@ -791,7 +802,8 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
 
     dbg::log("All CPUs started, starting scheduler on BSP");
     // Create idle task for BSP (gets PID 0 like all idle tasks)
-    auto* idle_task = new sched::task::Task("idle", 0, kernel_rsp, sched::task::TaskType::IDLE);
+    uint64_t const IDLE_STACK_TOP = allocate_kernel_stack_top("bsp-idle-stack");
+    auto* idle_task = new sched::task::Task("idle", 0, IDLE_STACK_TOP, sched::task::TaskType::IDLE);
     sched::post_task(idle_task);
 
     // BSP will participate in the atomic counter via cpuParamInit-style logic
