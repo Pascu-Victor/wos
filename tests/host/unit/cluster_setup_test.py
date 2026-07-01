@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import subprocess
 import sys
+import tempfile
+import threading
 from pathlib import Path
 
 
@@ -120,12 +123,92 @@ def test_no_setup_topology_rejects_missing_or_stale_links(module) -> None:
             raise AssertionError(f"missing diagnostic {expected!r} in {message!r}")
 
 
+def test_node_overlay_creation_failure_aborts_launch_prep(module) -> None:
+    node_setup = module.node_setup
+    lines: list[str] = []
+    calls: list[list[str]] = []
+    old_run = node_setup.subprocess.run
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 1, "", "synthetic qemu-img failure")
+
+    node_setup.subprocess.run = fake_run
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            spec = {
+                "id": 0,
+                "vm": {
+                    "disk0": str(tmp_path / "missing-disk.qcow2"),
+                    "disk1": str(tmp_path / "missing-mountfs.qcow2"),
+                    "overlay_dir": str(tmp_path / "overlays"),
+                },
+            }
+            try:
+                node_setup.prepare_node_overlays(spec, log=lines.append)
+            except node_setup.OverlayCreationError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("overlay creation failure was accepted")
+    finally:
+        node_setup.subprocess.run = old_run
+
+    assert_equal(len(calls), 1, "overlay creation should fail fast")
+    for expected in ("failed to create overlay", "synthetic qemu-img failure"):
+        if expected not in message:
+            raise AssertionError(f"missing overlay failure diagnostic {expected!r} in {message!r}")
+    if not any("ERROR creating overlay" in line for line in lines):
+        raise AssertionError(f"overlay creation failure was not logged: {lines!r}")
+
+
+def test_launch_one_vm_wraps_overlay_creation_failure_without_popen(module) -> None:
+    old_build_qemu_args = module.build_qemu_args
+    old_popen = module.subprocess.Popen
+    popen_called = False
+
+    def fake_build_qemu_args(*_args, **_kwargs):
+        raise module.node_setup.OverlayCreationError(Path("overlay.qcow2"), Path("base.qcow2"), "boom")
+
+    def fake_popen(*_args, **_kwargs):
+        nonlocal popen_called
+        popen_called = True
+        raise AssertionError("QEMU launched after overlay prep failure")
+
+    module.build_qemu_args = fake_build_qemu_args
+    module.subprocess.Popen = fake_popen
+    try:
+        try:
+            module.launch_one_vm(
+                7,
+                {"effective": {}, "zones": []},
+                {"zones": [{"id": "GLOBAL"}]},
+                None,
+                None,
+                [],
+                threading.Lock(),
+                threading.Event(),
+            )
+        except module.LaunchError as exc:
+            if not isinstance(exc.cause, module.node_setup.OverlayCreationError):
+                raise AssertionError(f"wrong launch error cause: {exc.cause!r}") from exc
+        else:
+            raise AssertionError("launch_one_vm did not wrap overlay prep failure")
+    finally:
+        module.build_qemu_args = old_build_qemu_args
+        module.subprocess.Popen = old_popen
+
+    assert_equal(popen_called, False, "QEMU must not launch after overlay prep failure")
+
+
 def main() -> None:
     module = load_module()
     tests = [
         test_topology_probe_is_timeout_bounded,
         test_no_setup_topology_accepts_configured_links,
         test_no_setup_topology_rejects_missing_or_stale_links,
+        test_node_overlay_creation_failure_aborts_launch_prep,
+        test_launch_one_vm_wraps_overlay_creation_failure_without_popen,
     ]
     for test in tests:
         test(module)

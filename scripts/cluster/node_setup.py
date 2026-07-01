@@ -34,6 +34,15 @@ TCG_LOG_LEVELS = {
 }
 
 
+class OverlayCreationError(RuntimeError):
+    def __init__(self, overlay: Path, base_disk: Path, stderr: str):
+        self.overlay = overlay
+        self.base_disk = base_disk
+        self.stderr = stderr
+        detail = stderr or "qemu-img exited without an error message"
+        super().__init__(f"failed to create overlay {overlay} from {base_disk}: {detail}")
+
+
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -139,27 +148,37 @@ def prepare_node_overlays(spec: dict, log=print) -> tuple[Path, Path]:
     for path in (overlay0, overlay1):
         remove_existing_file(path)
 
-    for base_disk, overlay in (
-        (Path(vm_cfg.get("disk0", "disk.qcow2")), overlay0),
-        (Path(vm_cfg.get("disk1", "mountfs.qcow2")), overlay1),
-    ):
-        result = subprocess.run(
-            [
-                "qemu-img",
-                "create",
-                "-f",
-                "qcow2",
-                "-b",
-                str(base_disk.resolve()),
-                "-F",
-                "qcow2",
-                str(overlay),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            log(f"  ERROR creating overlay {overlay}: {result.stderr.strip()}")
+    created_overlays: list[Path] = []
+    try:
+        for base_disk, overlay in (
+            (Path(vm_cfg.get("disk0", "disk.qcow2")), overlay0),
+            (Path(vm_cfg.get("disk1", "mountfs.qcow2")), overlay1),
+        ):
+            result = subprocess.run(
+                [
+                    "qemu-img",
+                    "create",
+                    "-f",
+                    "qcow2",
+                    "-b",
+                    str(base_disk.resolve()),
+                    "-F",
+                    "qcow2",
+                    str(overlay),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                log(f"  ERROR creating overlay {overlay}: {stderr}")
+                remove_existing_file(overlay)
+                raise OverlayCreationError(overlay, base_disk, stderr)
+            created_overlays.append(overlay)
+    except Exception:
+        for overlay in created_overlays:
+            remove_existing_file(overlay)
+        raise
 
     return overlay0, overlay1
 
