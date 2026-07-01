@@ -162,6 +162,7 @@ def test_idle_steal_can_migrate_normal_process_work() -> None:
     mask_body = function_body(source, "task_can_run_on_cpu")
     kernel_steal_body = function_body(source, "kernel_context_is_migratable")
     process_steal_body = function_body(source, "process_task_can_idle_steal")
+    scan_limit_body = function_body(source, "steal_candidate_scan_limit")
     probe_body = function_body(source, "idle_rebalance_probe_needed_for_idle")
     steal_body = function_body(source, "try_steal_from_peers")
 
@@ -186,6 +187,7 @@ def test_idle_steal_can_migrate_normal_process_work() -> None:
             "t->cpu_pinned || t->domain_hard",
             "t->type != task::TaskType::PROCESS && !t->has_run",
             "process_task_can_idle_steal(t)",
+            "uint32_t const SCAN = steal_candidate_scan_limit(victim_rq->runnable_heap.size)",
             'publish_runnable_task_locked(our_rq, stolen, "work-steal")',
         ],
         "idle steal process eligibility",
@@ -214,6 +216,18 @@ def test_idle_steal_can_migrate_normal_process_work() -> None:
         ],
         "idle steal process resume context eligibility",
     )
+    require_tokens(
+        scan_limit_body,
+        [
+            "constexpr uint32_t BASE_SCAN_LIMIT = 16",
+            "constexpr uint32_t BACKLOG_SCAN_LIMIT = 64",
+            "heap_size <= BASE_SCAN_LIMIT",
+            "std::min<uint32_t>(heap_size, BACKLOG_SCAN_LIMIT)",
+        ],
+        "idle steal scan limit must expand for large process backlogs but stay bounded",
+    )
+    if "std::min<uint32_t>(scan, 16)" in steal_body:
+        fail("idle steal must not use a fixed 16-entry victim scan that can hide stealable backlog")
     require_tokens(
         probe_body,
         [
@@ -291,10 +305,13 @@ def test_busy_cpus_nudge_idle_peers_to_steal_process_backlog() -> None:
         source,
         [
             "scheduler_selftest_load_balance_nudge_needs_process_backlog",
+            "scheduler_selftest_idle_steal_scan_expands_for_large_backlog",
             "scheduler_selftest_effectively_idle_current_accepts_rebalance_probe",
             "CURRENT_ONLY_REJECTED",
             "CURRENT_PLUS_QUEUED_ACCEPTED",
             "SOFT_EXCLUSIVE_REJECTED",
+            "BACKLOG_EXPANDS",
+            "BACKLOG_BOUNDED",
             "VOLUNTARY_EMPTY_ACCEPTED",
             "VOLUNTARY_CURRENT_ONLY_ACCEPTED",
             "REAL_LOCAL_WORK_REJECTED",
@@ -305,8 +322,10 @@ def test_busy_cpus_nudge_idle_peers_to_steal_process_backlog() -> None:
         ktest_source,
         [
             "scheduler_selftest_load_balance_nudge_needs_process_backlog",
+            "scheduler_selftest_idle_steal_scan_expands_for_large_backlog",
             "scheduler_selftest_effectively_idle_current_accepts_rebalance_probe",
             "KTEST(SchedulerMigration, LoadBalanceNudgeNeedsProcessBacklog)",
+            "KTEST(SchedulerMigration, IdleStealScanExpandsForLargeBacklog)",
             "KTEST(SchedulerMigration, EffectivelyIdleCurrentAcceptsRebalanceProbe)",
         ],
         "busy-side load-balance nudge kernel selftest wiring",

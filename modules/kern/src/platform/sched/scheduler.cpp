@@ -2158,6 +2158,17 @@ inline auto runqueue_has_stealable_process_backlog(RunQueue const* rq) -> bool {
     return LOAD >= MIN_STEAL_LOAD;
 }
 
+inline auto steal_candidate_scan_limit(uint32_t heap_size) -> uint32_t {
+    constexpr uint32_t BASE_SCAN_LIMIT = 16;
+    constexpr uint32_t BACKLOG_SCAN_LIMIT = 64;
+
+    if (heap_size <= BASE_SCAN_LIMIT) {
+        return heap_size;
+    }
+
+    return std::min<uint32_t>(heap_size, BACKLOG_SCAN_LIMIT);
+}
+
 inline auto current_task_is_effectively_idle(task::Task const* current) -> bool {
     return current != nullptr && (current->is_voluntary_blocked() || current->wants_block);
 }
@@ -2318,9 +2329,8 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
             // Scan for highest-vdeadline stealable task (least urgent)
             task::Task* best = nullptr;
             int64_t best_vd = INT64_MIN;
-            uint32_t scan = victim_rq->runnable_heap.size;
-            scan = std::min<uint32_t>(scan, 16);  // Bound scan in interrupt context
-            for (uint32_t i = 0; i < scan; ++i) {
+            uint32_t const SCAN = steal_candidate_scan_limit(victim_rq->runnable_heap.size);
+            for (uint32_t i = 0; i < SCAN; ++i) {
                 task::Task* t = run_heap_entry(victim_rq->runnable_heap, i);
                 if (t == nullptr) {
                     continue;
@@ -7349,6 +7359,15 @@ auto scheduler_selftest_load_balance_nudge_needs_process_backlog() -> bool {
     bool const SOFT_EXCLUSIVE_REJECTED = !runqueue_has_stealable_process_backlog(&rq);
 
     return CURRENT_ONLY_REJECTED && QUEUED_PUBLISHED && CURRENT_PLUS_QUEUED_ACCEPTED && SOFT_EXCLUSIVE_REJECTED;
+}
+
+auto scheduler_selftest_idle_steal_scan_expands_for_large_backlog() -> bool {
+    bool const EMPTY_OK = steal_candidate_scan_limit(0) == 0;
+    bool const SMALL_OK = steal_candidate_scan_limit(8) == 8;
+    bool const BASE_OK = steal_candidate_scan_limit(16) == 16;
+    bool const BACKLOG_EXPANDS = steal_candidate_scan_limit(17) > 16;
+    bool const BACKLOG_BOUNDED = steal_candidate_scan_limit(128) == 64;
+    return EMPTY_OK && SMALL_OK && BASE_OK && BACKLOG_EXPANDS && BACKLOG_BOUNDED;
 }
 
 auto scheduler_selftest_effectively_idle_current_accepts_rebalance_probe() -> bool {
