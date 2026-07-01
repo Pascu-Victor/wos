@@ -1,5 +1,6 @@
 #include "exec.hpp"
 
+#include <abi/callnums/process.h>
 #include <bits/off_t.h>
 #include <bits/ssize_t.h>
 #include <extern/elf.h>
@@ -25,6 +26,7 @@
 #include <platform/power/power.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sys/signal.hpp>
 #include <string_view>
 #include <util/smallvec.hpp>
 #include <utility>
@@ -45,12 +47,15 @@
 namespace ker::syscall::process {
 
 namespace {
-auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* const* envp, int shebang_depth) -> uint64_t;
+auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* const* envp,
+                        const ker::abi::process::SpawnOptions* spawn_options, int shebang_depth) -> uint64_t;
 auto wos_proc_execve_impl(const char* path, const char* const* argv, const char* const* envp, ker::mod::cpu::GPRegs& gpr, int shebang_depth)
     -> uint64_t;
 
 constexpr int MAX_SHEBANG_DEPTH = 4;
 constexpr size_t EXEC_PATH_MAX = 512;
+constexpr int WOS_SIGKILL = 9;
+constexpr int WOS_SIGSTOP = 19;
 using exec_log = ker::mod::dbg::logger<"exec">;
 using FdSnapshot = std::array<uint64_t, ker::mod::sched::task::Task::FD_TABLE_SIZE>;
 using LazyVmemKind = ker::mod::sched::task::LazyVmemKind;
@@ -229,6 +234,154 @@ auto install_exec_fd_file_checked(ker::mod::sched::task::Task* task, unsigned fd
         vfs::vfs_put_file(file);
     }
     return inserted;
+}
+
+auto spawn_fd_valid(int32_t fd) -> bool { return fd >= 0 && std::cmp_less(fd, ker::mod::sched::task::Task::FD_TABLE_SIZE); }
+
+auto spawn_put_file(vfs::File* file) -> void {
+    if (file != nullptr) {
+        vfs::vfs_put_file(file);
+    }
+}
+
+auto spawn_replace_fd_file(ker::mod::sched::task::Task* task, int32_t fd, vfs::File* file) -> bool {
+    if (task == nullptr || file == nullptr || !spawn_fd_valid(fd)) {
+        spawn_put_file(file);
+        return false;
+    }
+
+    auto* existing = static_cast<vfs::File*>(nullptr);
+    bool inserted = false;
+    uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
+    existing = static_cast<vfs::File*>(task->fd_table.lookup(static_cast<uint64_t>(fd)));
+    inserted = task->fd_table.insert(static_cast<uint64_t>(fd), file);
+    if (inserted) {
+        file->fd = fd;
+        task->clear_fd_cloexec(static_cast<unsigned>(fd));
+    }
+    task->fd_table_lock.unlock_irqrestore(IRQF);
+
+    if (!inserted) {
+        spawn_put_file(file);
+        return false;
+    }
+    spawn_put_file(existing);
+    return true;
+}
+
+auto spawn_close_fd(ker::mod::sched::task::Task* task, int32_t fd) -> bool {
+    if (task == nullptr || !spawn_fd_valid(fd)) {
+        return true;
+    }
+
+    uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
+    auto* existing = static_cast<vfs::File*>(task->fd_table.lookup(static_cast<uint64_t>(fd)));
+    if (existing != nullptr) {
+        task->fd_table.remove(static_cast<uint64_t>(fd));
+        task->clear_fd_cloexec(static_cast<unsigned>(fd));
+    }
+    task->fd_table_lock.unlock_irqrestore(IRQF);
+
+    spawn_put_file(existing);
+    return true;
+}
+
+auto spawn_dup2_fd(ker::mod::sched::task::Task* task, int32_t srcfd, int32_t dstfd) -> bool {
+    if (task == nullptr || !spawn_fd_valid(srcfd) || !spawn_fd_valid(dstfd)) {
+        return false;
+    }
+
+    auto* displaced = static_cast<vfs::File*>(nullptr);
+    bool ok = false;
+    uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
+    auto* src = static_cast<vfs::File*>(task->fd_table.lookup(static_cast<uint64_t>(srcfd)));
+    if (src != nullptr) {
+        if (srcfd == dstfd) {
+            task->clear_fd_cloexec(static_cast<unsigned>(dstfd));
+            ok = true;
+        } else {
+            src->refcount.fetch_add(1, std::memory_order_acq_rel);
+            displaced = static_cast<vfs::File*>(task->fd_table.lookup(static_cast<uint64_t>(dstfd)));
+            ok = task->fd_table.insert(static_cast<uint64_t>(dstfd), src);
+            if (ok) {
+                task->clear_fd_cloexec(static_cast<unsigned>(dstfd));
+            } else {
+                src->refcount.fetch_sub(1, std::memory_order_acq_rel);
+                displaced = nullptr;
+            }
+        }
+    }
+    task->fd_table_lock.unlock_irqrestore(IRQF);
+
+    spawn_put_file(displaced);
+    return ok;
+}
+
+auto spawn_open_fd(ker::mod::sched::task::Task* task, const ker::abi::process::SpawnFdAction& action) -> bool {
+    if (!spawn_fd_valid(action.fd) || action.path == nullptr) {
+        return false;
+    }
+
+    int mode = static_cast<int>(action.mode);
+    if ((action.oflag & vfs::O_CREAT) != 0 && task != nullptr) {
+        mode &= ~static_cast<int>(task->umask);
+    }
+
+    auto* file = vfs::vfs_open_file(action.path, action.oflag, mode);
+    if (file == nullptr) {
+        return false;
+    }
+    return spawn_replace_fd_file(task, action.fd, file);
+}
+
+auto apply_spawn_options(ker::mod::sched::task::Task* task, const ker::abi::process::SpawnOptions* options) -> bool {
+    if (options == nullptr) {
+        return true;
+    }
+    if (options->size != sizeof(ker::abi::process::SpawnOptions) || options->version != ker::abi::process::SPAWN_OPTIONS_VERSION ||
+        options->reserved0 != 0 || options->reserved1 != 0) {
+        return false;
+    }
+    if ((options->flags & ~ker::abi::process::SPAWN_SUPPORTED_FLAGS) != 0) {
+        return false;
+    }
+
+    constexpr uint64_t MAX_SPAWN_ACTIONS = 32;
+    if (options->action_count > MAX_SPAWN_ACTIONS || (options->action_count != 0 && options->actions == nullptr)) {
+        return false;
+    }
+
+    for (uint64_t i = 0; i < options->action_count; ++i) {
+        auto const& action = options->actions[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        bool ok = false;
+        switch (static_cast<ker::abi::process::SpawnFdActionType>(action.type)) {
+            case ker::abi::process::SpawnFdActionType::CLOSE:
+                ok = spawn_close_fd(task, action.fd);
+                break;
+            case ker::abi::process::SpawnFdActionType::DUP2:
+                ok = spawn_dup2_fd(task, action.srcfd, action.fd);
+                break;
+            case ker::abi::process::SpawnFdActionType::OPEN:
+                ok = spawn_open_fd(task, action);
+                break;
+            default:
+                ok = false;
+                break;
+        }
+        if (!ok) {
+            return false;
+        }
+    }
+
+    if ((options->flags & ker::abi::process::SPAWN_FLAG_SETSIGMASK) != 0) {
+        uint64_t const UNBLOCKABLE = (1ULL << (WOS_SIGKILL - 1)) | (1ULL << (WOS_SIGSTOP - 1));
+        task->sig_mask = options->sig_mask & ~UNBLOCKABLE;
+        ker::mod::sys::signal::sync_task_signal_mask_cache(task);
+    }
+
+    // SPAWN_FLAG_SETPGROUP is accepted as a no-op to match the current mlibc
+    // posix_spawn child path, which logs and ignores POSIX_SPAWN_SETPGROUP.
+    return true;
 }
 
 auto ensure_exec_stdio_fallbacks(ker::mod::sched::task::Task* task) -> bool {
@@ -866,11 +1019,17 @@ auto exec_selftest_cloexec_snapshot_collects_marked_fds() -> bool {
 #endif
 
 auto wos_proc_exec(const char* path, const char* const* argv, const char* const* envp) -> uint64_t {
-    return wos_proc_exec_impl(path, argv, envp, 0);
+    return wos_proc_exec_impl(path, argv, envp, nullptr, 0);
+}
+
+auto wos_proc_spawn(const char* path, const char* const* argv, const char* const* envp, const ker::abi::process::SpawnOptions* options)
+    -> uint64_t {
+    return wos_proc_exec_impl(path, argv, envp, options, 0);
 }
 
 namespace {
-auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* const* envp, int shebang_depth) -> uint64_t {
+auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* const* envp,
+                        const ker::abi::process::SpawnOptions* spawn_options, int shebang_depth) -> uint64_t {
     if (ker::mod::power::shutdown_in_progress()) {
         return static_cast<uint64_t>(-ESHUTDOWN);
     }
@@ -967,10 +1126,11 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         if (shebang_depth >= MAX_SHEBANG_DEPTH) {
             return 0;
         }
-        return exec_shebang_script(path, argv, envp, argv_count, shebang, shebang_depth,
-                                   [](const char* interp, const char* const* argv2, const char* const* envp2, int depth) -> uint64_t {
-                                       return wos_proc_exec_impl(interp, argv2, envp2, depth);
-                                   });
+        return exec_shebang_script(
+            path, argv, envp, argv_count, shebang, shebang_depth,
+            [spawn_options](const char* interp, const char* const* argv2, const char* const* envp2, int depth) -> uint64_t {
+                return wos_proc_exec_impl(interp, argv2, envp2, spawn_options, depth);
+            });
     }
 
     auto* elf_header = reinterpret_cast<Elf64_Ehdr*>(elf_buffer);
@@ -1074,6 +1234,8 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     new_task->session_id = parent_task->session_id;
     new_task->pgid = (parent_task->pgid != 0) ? parent_task->pgid : PARENT_PID;
     new_task->controlling_tty = parent_task->controlling_tty;
+    new_task->sig_mask = parent_task->sig_mask;
+    ker::mod::sys::signal::sync_task_signal_mask_cache(new_task);
     new_task->wki_prefer_inline = parent_task->wki_prefer_inline;
     new_task->wki_target_hostname = parent_task->wki_target_hostname;
     new_task->wki_target_flags = parent_task->wki_target_flags;
@@ -1089,6 +1251,11 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
 
     // Inherit file descriptors from parent, respecting FD_CLOEXEC (per-fd bitmap).
     if (!clone_exec_fd_table_checked(parent_task, new_task)) {
+        cleanup_unpublished_task();
+        return 0;
+    }
+
+    if (!apply_spawn_options(new_task, spawn_options)) {
         cleanup_unpublished_task();
         return 0;
     }

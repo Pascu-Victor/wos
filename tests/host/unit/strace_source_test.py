@@ -186,12 +186,26 @@ def test_strace_names_process_priority_syscalls() -> None:
     )
 
 
+def test_strace_names_spawn_syscall() -> None:
+    source = read_strace_sources()
+    require_tokens(
+        source,
+        [
+            "case ker::abi::process::procmgmt_ops::SPAWN:",
+            'return "spawn";',
+            "proc_op == ker::abi::process::procmgmt_ops::SPAWN",
+        ],
+        "strace process spawn syscall name",
+    )
+
+
 def main() -> None:
     test_strace_startup_wait_is_deadline_bounded()
     test_strace_proxy_startup_cleanup_reaps_tracee()
     test_strace_tracee_is_pinned_local_before_startup_stop()
     test_strace_trace_loop_uses_ptrace_syscall_wait()
     test_strace_names_process_priority_syscalls()
+    test_strace_names_spawn_syscall()
     print("strace startup waits are deadline bounded")
 
 

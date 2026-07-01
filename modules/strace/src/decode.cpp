@@ -117,6 +117,8 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "exit";
                 case ker::abi::process::procmgmt_ops::EXEC:
                     return "exec";
+                case ker::abi::process::procmgmt_ops::SPAWN:
+                    return "spawn";
                 case ker::abi::process::procmgmt_ops::WAITPID:
                     return "waitpid";
                 case ker::abi::process::procmgmt_ops::GETPID:
@@ -438,9 +440,10 @@ auto should_decode_string(uint64_t callnum, uint64_t op, int arg_index) -> bool 
     }
     if (static_cast<ker::abi::callnums>(callnum) == ker::abi::callnums::process) {
         auto proc_op = static_cast<ker::abi::process::procmgmt_ops>(op);
-        return (proc_op == ker::abi::process::procmgmt_ops::EXEC || proc_op == ker::abi::process::procmgmt_ops::EXECVE ||
-                proc_op == ker::abi::process::procmgmt_ops::GETHOSTNAME || proc_op == ker::abi::process::procmgmt_ops::SETHOSTNAME ||
-                proc_op == ker::abi::process::procmgmt_ops::SETWKITARGET || proc_op == ker::abi::process::procmgmt_ops::GETWKITARGET) &&
+        return (proc_op == ker::abi::process::procmgmt_ops::EXEC || proc_op == ker::abi::process::procmgmt_ops::SPAWN ||
+                proc_op == ker::abi::process::procmgmt_ops::EXECVE || proc_op == ker::abi::process::procmgmt_ops::GETHOSTNAME ||
+                proc_op == ker::abi::process::procmgmt_ops::SETHOSTNAME || proc_op == ker::abi::process::procmgmt_ops::SETWKITARGET ||
+                proc_op == ker::abi::process::procmgmt_ops::GETWKITARGET) &&
                arg_index == 0;
     }
     if (static_cast<ker::abi::callnums>(callnum) == ker::abi::callnums::vfs) {

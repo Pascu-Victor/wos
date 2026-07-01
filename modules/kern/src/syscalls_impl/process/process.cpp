@@ -1392,6 +1392,10 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             return wos_proc_exec(reinterpret_cast<const char*>(a2), reinterpret_cast<const char* const*>(a3),
                                  reinterpret_cast<const char* const*>(a4));
         }
+        case abi::process::procmgmt_ops::SPAWN: {
+            return wos_proc_spawn(reinterpret_cast<const char*>(a2), reinterpret_cast<const char* const*>(a3),
+                                  reinterpret_cast<const char* const*>(a4), reinterpret_cast<const abi::process::SpawnOptions*>(a5));
+        }
         case abi::process::procmgmt_ops::WAITPID: {
             return wos_proc_waitpid(static_cast<int64_t>(a2), reinterpret_cast<int32_t*>(a3), static_cast<int32_t>(a4), a5, gpr);
         }

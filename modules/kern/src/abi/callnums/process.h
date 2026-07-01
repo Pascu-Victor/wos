@@ -48,5 +48,39 @@ enum class procmgmt_ops : uint64_t {
     GETRESGID,      // 40
     SIGPENDING,     // 41
     GETPRIORITY,    // 42
+    SPAWN,          // 43 - WOS fast posix_spawn-style create-process path
+};
+
+enum class SpawnFdActionType : uint32_t {
+    CLOSE = 1,
+    DUP2 = 2,
+    OPEN = 3,
+};
+
+constexpr uint64_t SPAWN_FLAG_SETSIGMASK = 1ULL << 0;
+constexpr uint64_t SPAWN_FLAG_SETPGROUP = 1ULL << 1;
+constexpr uint64_t SPAWN_FLAG_USEVFORK = 1ULL << 2;
+constexpr uint64_t SPAWN_SUPPORTED_FLAGS = SPAWN_FLAG_SETSIGMASK | SPAWN_FLAG_SETPGROUP | SPAWN_FLAG_USEVFORK;
+constexpr uint64_t SPAWN_OPTIONS_VERSION = 1;
+
+struct SpawnFdAction {
+    uint32_t type;
+    int32_t fd;
+    int32_t srcfd;
+    int32_t oflag;
+    uint32_t mode;
+    const char* path;
+};
+
+struct SpawnOptions {
+    uint64_t size;
+    uint64_t version;
+    uint64_t flags;
+    uint64_t sig_mask;
+    int64_t pgroup;
+    const SpawnFdAction* actions;
+    uint64_t action_count;
+    uint64_t reserved0;
+    uint64_t reserved1;
 };
 }  // namespace ker::abi::process
