@@ -517,7 +517,7 @@ auto devfs_file_node(File* file) -> DevFSNode* {
     return (devfs_file != nullptr) ? devfs_file->node : nullptr;
 }
 
-auto devfs_open_path(const char* path, int /*flags*/, int /*mode*/) -> File* {
+auto devfs_open_path(const char* path, int flags, int /*mode*/) -> File* {
     if (path == nullptr) {
         return nullptr;
     }
@@ -559,6 +559,8 @@ auto devfs_open_path(const char* path, int /*flags*/, int /*mode*/) -> File* {
     file->pos = 0;
     file->fs_type = FSType::DEVFS;
     file->refcount = 1;
+    file->open_flags = flags;
+    file->fd_flags = 0;
 
     if (node->type == DevFSNodeType::DIRECTORY) {
         file->is_directory = true;

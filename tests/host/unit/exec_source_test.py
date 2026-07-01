@@ -183,6 +183,19 @@ def require_callers_use_sparse_reader(source: str) -> None:
             fail(f"execve lazy ELF range lifetime invariant missing: {snippet}")
 
 
+def require_stdio_fallback_access_modes(source: str) -> None:
+    body = function_body(source, "ensure_exec_stdio_fallbacks")
+    for snippet in [
+        "constexpr int STDIN_OPEN_FLAGS = 0;",
+        "constexpr int STDOUT_OPEN_FLAGS = 1;",
+        "int const OPEN_FLAGS = fd == 0 ? STDIN_OPEN_FLAGS : STDOUT_OPEN_FLAGS;",
+        'vfs::devfs::devfs_open_path("/dev/console", OPEN_FLAGS, 0)',
+        "install_exec_fd_file_checked(task, fd, new_file)",
+    ]:
+        if snippet not in body:
+            fail(f"exec stdio fallback must preserve VFS access modes: {snippet}")
+
+
 def require_loader_does_not_scan_unread_symbol_payloads(loader_source: str) -> None:
     body = function_body_containing(loader_source, "load_elf", "(void)REGISTER_SPECIAL_SYMBOLS;")
     if "(void)REGISTER_SPECIAL_SYMBOLS;" not in body:
@@ -241,6 +254,7 @@ def main() -> None:
     loader_source = ELF_LOADER_CPP.read_text()
     require_sparse_exec_reads(source)
     require_callers_use_sparse_reader(source)
+    require_stdio_fallback_access_modes(source)
     require_loader_does_not_scan_unread_symbol_payloads(loader_source)
     require_loader_lazy_file_ranges(loader_source)
     print("exec sparse-read source invariants hold")

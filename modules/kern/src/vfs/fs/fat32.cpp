@@ -680,7 +680,8 @@ static auto compare_fat32_name(const char* dir_name, const char* search_name) ->
 // Helper function to create a new file in a directory
 // Returns a File* with start_cluster=0 (first write will allocate)
 // parent_cluster is the cluster of the directory to create the file in
-static auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, const char* filename) -> ker::vfs::File* {
+static auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, const char* filename, int open_flags)
+    -> ker::vfs::File* {
     if (ctx == nullptr || filename == nullptr || filename[0] == '\0') {
         log::warn("create_file_in_directory: invalid arguments");
         return nullptr;
@@ -860,7 +861,7 @@ static auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_clu
     f->is_directory = false;
     f->fs_type = FSType::FAT32;
     f->refcount = 1;
-    f->open_flags = 0;
+    f->open_flags = open_flags;
     f->fd_flags = 0;
     f->vfs_path = nullptr;
     f->dir_fs_count = static_cast<size_t>(-1);
@@ -920,7 +921,7 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
         file->is_directory = true;
         file->fs_type = FSType::FAT32;
         file->refcount = 1;
-        file->open_flags = 0;
+        file->open_flags = flags;
         file->fd_flags = 0;
         file->vfs_path = nullptr;
         file->dir_fs_count = static_cast<size_t>(-1);
@@ -1078,7 +1079,7 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
 #endif
 
                 delete[] cluster_buf;
-                return create_file_in_directory(ctx, current_cluster, component.data());
+                return create_file_in_directory(ctx, current_cluster, component.data(), flags);
             }
 
             delete[] cluster_buf;
@@ -1145,7 +1146,7 @@ auto fat32_open_path(const char* path, int flags, int /*mode*/, FAT32MountContex
     f->is_directory = node->is_directory;
     f->fs_type = FSType::FAT32;
     f->refcount = 1;
-    f->open_flags = 0;
+    f->open_flags = flags;
     f->fd_flags = 0;
     f->vfs_path = nullptr;
     f->dir_fs_count = static_cast<size_t>(-1);
@@ -2682,7 +2683,7 @@ auto fat32_rename_path(FAT32MountContext* ctx, const char* oldpath, const char* 
     uint8_t const ATTRS = old_loc.sfn.attributes;
 
     // Use create_file_in_dir to create entry, then update it
-    auto* new_file = create_file_in_directory(ctx, new_parent->start_cluster, new_name);
+    auto* new_file = create_file_in_directory(ctx, new_parent->start_cluster, new_name, 0);
     if (new_file == nullptr) {
         delete old_parent;
         delete new_parent;

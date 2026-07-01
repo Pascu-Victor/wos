@@ -555,7 +555,7 @@ auto capture_write(ker::vfs::File* file, const void* buf, size_t count, size_t /
 }
 
 auto capture_close(ker::vfs::File* /*file*/) -> int { return 0; }
-auto capture_isatty(ker::vfs::File* /*file*/) -> bool { return true; }
+auto capture_isatty(ker::vfs::File* /*file*/) -> bool { return false; }
 auto stdin_null_read(ker::vfs::File* /*file*/, void* /*buf*/, size_t /*count*/, size_t /*offset*/) -> ssize_t { return 0; }
 
 ker::vfs::FileOperations g_capture_fops = {

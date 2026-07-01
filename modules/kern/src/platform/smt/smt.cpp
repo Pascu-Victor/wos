@@ -345,11 +345,14 @@ void create_init_tasks(boot::HandoverModules& mod_struct) {
             hcf();
         }
 
+        constexpr int STDIN_OPEN_FLAGS = 0;   // O_RDONLY
+        constexpr int STDOUT_OPEN_FLAGS = 1;  // O_WRONLY
+
         // Setup stdin/stdout/stderr for init process
         // Open /dev/console as fd 0, 1, 2
-        ker::vfs::File* console_stdin = ker::vfs::devfs::devfs_open_path("/dev/console", 0, 0);
-        ker::vfs::File* console_stdout = ker::vfs::devfs::devfs_open_path("/dev/console", 0, 0);
-        ker::vfs::File* console_stderr = ker::vfs::devfs::devfs_open_path("/dev/console", 0, 0);
+        ker::vfs::File* console_stdin = ker::vfs::devfs::devfs_open_path("/dev/console", STDIN_OPEN_FLAGS, 0);
+        ker::vfs::File* console_stdout = ker::vfs::devfs::devfs_open_path("/dev/console", STDOUT_OPEN_FLAGS, 0);
+        ker::vfs::File* console_stderr = ker::vfs::devfs::devfs_open_path("/dev/console", STDOUT_OPEN_FLAGS, 0);
 
         if (console_stdin != nullptr && console_stdout != nullptr && console_stderr != nullptr) {
             console_stdin->fops = ker::vfs::devfs::get_devfs_fops();

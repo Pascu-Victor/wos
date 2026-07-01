@@ -389,6 +389,9 @@ auto ensure_exec_stdio_fallbacks(ker::mod::sched::task::Task* task) -> bool {
         return false;
     }
 
+    constexpr int STDIN_OPEN_FLAGS = 0;   // O_RDONLY
+    constexpr int STDOUT_OPEN_FLAGS = 1;  // O_WRONLY
+
     for (unsigned fd = 0; fd < 3; ++fd) {
         {
             uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
@@ -399,7 +402,8 @@ auto ensure_exec_stdio_fallbacks(ker::mod::sched::task::Task* task) -> bool {
             }
         }
 
-        vfs::File* new_file = vfs::devfs::devfs_open_path("/dev/console", 0, 0);
+        int const OPEN_FLAGS = fd == 0 ? STDIN_OPEN_FLAGS : STDOUT_OPEN_FLAGS;
+        vfs::File* new_file = vfs::devfs::devfs_open_path("/dev/console", OPEN_FLAGS, 0);
         if (new_file == nullptr) {
             continue;
         }

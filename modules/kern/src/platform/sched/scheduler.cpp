@@ -4648,13 +4648,13 @@ void start_scheduler() {
         __builtin_unreachable();
     }
 
-    // Brand new user task - write TLS self-pointer and enter at ELF entry point
+    // Brand new user task - write TLS self-pointer and enter at the prepared initial RIP.
     if (first_task->thread != nullptr) {
         *(reinterpret_cast<uint64_t*>(first_task->thread->fsbase)) = first_task->thread->fsbase;
     }
 
     for (;;) {
-        wos_asm_enter_usermode(first_task->entry, first_task->context.frame.rsp);
+        wos_asm_enter_usermode(first_task->context.frame.rip, first_task->context.frame.rsp);
     }
 }
 

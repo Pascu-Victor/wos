@@ -4648,7 +4648,6 @@ auto procfs_open_fd_link_path(const char* path) -> File* {
 // --- Open a procfs path ---
 
 auto procfs_open_path(const char* path, int flags, int mode) -> File* {
-    (void)flags;
     (void)mode;
 
     if (path == nullptr) {
@@ -4663,7 +4662,7 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     auto* task = ker::mod::sched::get_current_task();
     uint64_t const SELF_PID = (task != nullptr) ? ker::mod::sched::task::process_pid(*task) : 0;
 
-    auto make_file = [](ProcNodeType type, uint64_t pid, bool is_dir, bool thread_view = false, uint64_t fd = 0) -> File* {
+    auto make_file = [flags](ProcNodeType type, uint64_t pid, bool is_dir, bool thread_view = false, uint64_t fd = 0) -> File* {
         auto* pfd = new ProcFileData;
         pfd->node.type = type;
         pfd->node.pid = pid;
@@ -4679,6 +4678,8 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
         f->is_directory = is_dir;
         f->fs_type = FSType::PROCFS;
         f->refcount = 1;
+        f->open_flags = flags;
+        f->fd_flags = 0;
         f->fops = nullptr;  // set by caller
         return f;
     };

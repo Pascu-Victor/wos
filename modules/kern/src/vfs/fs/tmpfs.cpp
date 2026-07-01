@@ -1008,7 +1008,9 @@ auto tmpfs_reclaim_pages(size_t target_pages) -> size_t {
 
 // --- File-level operations ---
 
-auto create_root_file(TmpNode* root) -> ker::vfs::File* {
+namespace {
+
+auto create_root_file_with_flags(TmpNode* root, int open_flags) -> ker::vfs::File* {
     if (root == nullptr) {
         return nullptr;
     }
@@ -1020,10 +1022,16 @@ auto create_root_file(TmpNode* root) -> ker::vfs::File* {
     f->is_directory = true;
     f->fs_type = FSType::TMPFS;
     f->refcount = 1;
+    f->open_flags = open_flags;
+    f->fd_flags = 0;
     return f;
 }
 
-auto create_root_file() -> ker::vfs::File* { return create_root_file(root_node); }
+}  // namespace
+
+auto create_root_file(TmpNode* root) -> ker::vfs::File* { return create_root_file_with_flags(root, 0); }
+
+auto create_root_file() -> ker::vfs::File* { return create_root_file_with_flags(root_node, 0); }
 
 auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ker::vfs::File* {
     // mode is now used for O_CREAT
@@ -1033,7 +1041,7 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ke
 
     // Handle root path
     if (path[0] == '\0' || (path[0] == '/' && path[1] == '\0')) {
-        return create_root_file(root);
+        return create_root_file_with_flags(root, flags);
     }
 
     // Skip leading slash for walk_path
@@ -1042,7 +1050,7 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ke
         rel_path++;
     }
     if (rel_path[0] == '\0') {
-        return create_root_file(root);
+        return create_root_file_with_flags(root, flags);
     }
 
     // Split path into parent path and final component
@@ -1129,6 +1137,8 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ke
     f->is_directory = (file_node->type == TmpNodeType::DIRECTORY);
     f->fs_type = FSType::TMPFS;
     f->refcount = 1;
+    f->open_flags = flags;
+    f->fd_flags = 0;
     f->open_create_result_known = (flags & O_CREAT) != 0;
     f->created_by_open = created_by_open;
     return f;

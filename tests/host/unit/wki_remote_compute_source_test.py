@@ -316,6 +316,22 @@ def test_vfs_ref_loader_deadlines_are_saturating() -> None:
         fail("VFS_REF loader must keep retry backoff sleeps on every retry path")
 
 
+def test_remote_stdio_capture_is_write_only_and_non_tty() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    capture_isatty = function_body(source, "capture_isatty")
+    if "return false;" not in capture_isatty:
+        fail("remote stdout/stderr capture must not report tty semantics")
+
+    exec_body = function_body(source, "exec_elf_buffer")
+    for snippet in [
+        "stdin_file->open_flags = 0;",
+        "capture_file->open_flags = 1;",
+        "(void)new_task->fd_table.insert(fd_idx, capture_file)",
+    ]:
+        if snippet not in exec_body:
+            fail(f"remote stdio capture must preserve VFS access modes: {snippet}")
+
+
 def main() -> None:
     test_peer_cleanup_marks_all_targeted_submits_terminal_failure()
     test_proxy_wait_completion_respects_waitpid_publish_fence()
@@ -325,6 +341,7 @@ def main() -> None:
     test_receiver_path_localization_bounds_suffix_scan()
     test_vfs_ref_loader_rejects_null_or_empty_path_before_vfs_use()
     test_vfs_ref_loader_deadlines_are_saturating()
+    test_remote_stdio_capture_is_write_only_and_non_tty()
     print("WKI remote compute source invariants hold")
 
 
