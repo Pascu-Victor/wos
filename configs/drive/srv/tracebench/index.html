@@ -120,7 +120,11 @@
     const fill = document.getElementById("fill");
     const preview = document.getElementById("preview");
     const pollIntervalMs = 1000;
+    const settledPollIntervalMs = 5000;
+    const completionRetryMs = 500;
+    const completionMaxAttempts = 6;
     let activeRun = "";
+    let settledRun = "";
 
     async function json(path) {
       const response = await fetch(`${path}?t=${Date.now()}`, { cache: "no-store" });
@@ -128,26 +132,71 @@
       return response.json();
     }
 
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
     function setPreview(path) {
       const src = `${path}?t=${Date.now()}`;
       return new Promise((resolve) => {
-        function settle() {
-          preview.removeEventListener("load", settle);
-          preview.removeEventListener("error", settle);
-          resolve();
+        const image = new Image();
+
+        image.addEventListener("load", () => {
+          preview.src = src;
+          resolve(true);
+        }, { once: true });
+        image.addEventListener("error", () => {
+          resolve(false);
+        }, { once: true });
+        image.src = src;
+      });
+    }
+
+    function finalImageMayExist(status) {
+      if (status.final_image_enabled === false) return false;
+      const width = Number(status.width);
+      const height = Number(status.height);
+      const maxPixels = Number(status.final_image_max_pixels);
+      if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return true;
+      if (!Number.isFinite(maxPixels)) return true;
+      return width * height <= maxPixels;
+    }
+
+    async function settleCompletedRun(status) {
+      const run = status.run_id || activeRun;
+      const previewPath = `/srv/tracebench/runs/${run}/preview.png`;
+      const finalPath = `/srv/tracebench/runs/${run}/frame_000.png`;
+      const tryFinal = finalImageMayExist(status);
+      let previewLoaded = false;
+
+      for (let attempt = 0; attempt < completionMaxAttempts; attempt++) {
+        if (tryFinal && await setPreview(finalPath)) {
+          el.state.textContent = "Frame complete.";
+          return;
         }
 
-        preview.addEventListener("load", settle);
-        preview.addEventListener("error", settle);
-        preview.src = src;
-      });
+        if (!previewLoaded) {
+          previewLoaded = await setPreview(previewPath);
+        }
+
+        if (!tryFinal || attempt + 1 === completionMaxAttempts) {
+          el.state.textContent = previewLoaded || preview.currentSrc ? "Frame complete." : "Frame complete; preview unavailable.";
+          return;
+        }
+
+        await sleep(completionRetryMs);
+      }
     }
 
     async function tick() {
       try {
         const latest = await json("/srv/tracebench/runs/latest.json");
-        activeRun = latest.run_id || activeRun;
-        if (!activeRun) return;
+        if (latest.run_id && latest.run_id !== activeRun) {
+          activeRun = latest.run_id;
+          settledRun = "";
+        }
+        if (!activeRun) return pollIntervalMs;
+        if (activeRun === settledRun) return settledPollIntervalMs;
         const status = await json(`/srv/tracebench/runs/${activeRun}/status.json`);
         const percent = status.total_tiles ? (status.tiles_done / status.total_tiles) * 100 : 0;
         fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
@@ -159,17 +208,25 @@
         el.samples.textContent = `${status.samples_done} / ${status.total_samples}`;
         el.elapsed.textContent = `${Number(status.elapsed_seconds || 0).toFixed(2)}s`;
         el.state.textContent = status.done ? "Frame complete." : "Rendering.";
-        await setPreview(`/srv/tracebench/runs/${activeRun}/${status.done ? "frame_000.png" : "preview.png"}`);
+        if (status.done) {
+          await settleCompletedRun(status);
+          settledRun = activeRun;
+          return settledPollIntervalMs;
+        }
+
+        await setPreview(`/srv/tracebench/runs/${activeRun}/preview.png`);
       } catch {
+        if (activeRun && activeRun === settledRun) return settledPollIntervalMs;
         el.state.textContent = "Waiting for a render.";
       }
+      return pollIntervalMs;
     }
 
     async function poll() {
       const started = performance.now();
-      await tick();
+      const delay = await tick();
       const elapsed = performance.now() - started;
-      setTimeout(poll, Math.max(0, pollIntervalMs - elapsed));
+      setTimeout(poll, Math.max(0, delay - elapsed));
     }
 
     poll();
