@@ -1,7 +1,28 @@
 #!/bin/sh
 set -u
 
-SHOWCASE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+resolve_showcase_dir() {
+    script_path="$0"
+
+    case "$script_path" in
+        /*) ;;
+        *) script_path="$(pwd)/$script_path" ;;
+    esac
+
+    if command -v readlink >/dev/null 2>&1; then
+        while [ -L "$script_path" ]; do
+            link_target="$(readlink "$script_path")" || break
+            case "$link_target" in
+                /*) script_path="$link_target" ;;
+                *) script_path="$(dirname -- "$script_path")/$link_target" ;;
+            esac
+        done
+    fi
+
+    CDPATH= cd -- "$(dirname -- "$script_path")" && pwd
+}
+
+SHOWCASE_DIR="$(resolve_showcase_dir)"
 
 timestamp() {
     date +%Y%m%d-%H%M%S 2>/dev/null || echo unknown-time
