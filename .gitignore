@@ -51,3 +51,4 @@ build_tests
 
 #user specific agent rules
 .codex/rules/default.rules
+configs/rootfs/root/.ssh/authorized_keys
