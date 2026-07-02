@@ -143,7 +143,25 @@ auto try_acquire_backlog_consumer(BacklogQueue& q) -> bool {
     return q.consumer_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
-void release_backlog_consumer(BacklogQueue& q) { q.consumer_active.store(false, std::memory_order_release); }
+void wake_backlog_handler(BacklogQueue& q) {
+    if (q.handler == nullptr) {
+        return;
+    }
+
+    ker::mod::sched::kern_wake(q.handler);
+    if (q.handler->cpu == ker::mod::cpu::current_cpu()) {
+        ker::mod::sys::context_switch::request_reschedule();
+    } else {
+        ker::mod::sched::wake_cpu(q.handler->cpu);
+    }
+}
+
+void release_backlog_consumer(BacklogQueue& q) {
+    q.consumer_active.store(false, std::memory_order_release);
+    if (q.head.load(std::memory_order_acquire) != nullptr) {
+        wake_backlog_handler(q);
+    }
+}
 
 // Handler thread entry point (one per CPU). DAEMON type, pinned.
 void backlog_handler_loop(uint64_t cpu_idx) {
@@ -242,16 +260,7 @@ void backlog_enqueue(uint64_t target_cpu, PacketBuffer* pkt) {
         pkt->next = old_head;
     } while (!q.head.compare_exchange_weak(old_head, pkt, std::memory_order_release, std::memory_order_relaxed));
 
-    if (q.handler != nullptr) {
-        ker::mod::sched::kern_wake(q.handler);
-        if (q.handler->cpu == ker::mod::cpu::current_cpu()) {
-            // Same-CPU wake_cpu() is a no-op; force a local reschedule so the
-            // backlog worker does not wait for the next timer quantum.
-            ker::mod::sys::context_switch::request_reschedule();
-        } else {
-            ker::mod::sched::wake_cpu(q.handler->cpu);
-        }
-    }
+    wake_backlog_handler(q);
 }
 
 auto backlog_flow_hash(PacketBuffer* pkt, uint64_t num_cpus) -> uint64_t {

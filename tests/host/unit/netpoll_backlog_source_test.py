@@ -151,10 +151,25 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
             "split_backlog_batch(reverse_packet_list(batch), normal_head, wki_head)",
             "try_acquire_backlog_consumer",
             "q.consumer_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)",
+            "wake_backlog_handler",
+            "q.handler == nullptr",
             "release_backlog_consumer",
             "q.consumer_active.store(false, std::memory_order_release)",
+            "q.head.load(std::memory_order_acquire) != nullptr",
+            "wake_backlog_handler(q)",
         ],
         "backlog consumer guard and batch preparation helpers",
+    )
+    wake_body = function_body(source, "wake_backlog_handler")
+    require_tokens(
+        wake_body,
+        [
+            "ker::mod::sched::kern_wake(q.handler)",
+            "q.handler->cpu == ker::mod::cpu::current_cpu()",
+            "ker::mod::sys::context_switch::request_reschedule()",
+            "ker::mod::sched::wake_cpu(q.handler->cpu)",
+        ],
+        "backlog handler wake helper",
     )
 
     handler_body = function_body(source, "backlog_handler_loop")
@@ -162,6 +177,8 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
         handler_body,
         [
             "if (!try_acquire_backlog_consumer(q))",
+            "ker::mod::sched::kern_yield()",
+            "continue;",
             "q.head.exchange(nullptr, std::memory_order_acquire)",
             "release_backlog_consumer(q)",
             "q.handler_active.store(false, std::memory_order_seq_cst)",
@@ -189,10 +206,7 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
         enqueue_body,
         [
             "q.head.compare_exchange_weak(old_head, pkt, std::memory_order_release, std::memory_order_relaxed)",
-            "ker::mod::sched::kern_wake(q.handler)",
-            "q.handler->cpu == ker::mod::cpu::current_cpu()",
-            "ker::mod::sys::context_switch::request_reschedule()",
-            "ker::mod::sched::wake_cpu(q.handler->cpu)",
+            "wake_backlog_handler(q)",
         ],
         "backlog enqueue wake/reschedule guard",
     )
