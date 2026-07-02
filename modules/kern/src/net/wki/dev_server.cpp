@@ -663,20 +663,23 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
     if (forwarded_frame_is_wki(pkt)) {
         return;
     }
+    if (pkt->len < ker::net::proto::ETH_HLEN) {
+        return;
+    }
+
+    const auto* eth = reinterpret_cast<const ker::net::proto::EthernetHeader*>(pkt->data);
+    ker::net::proto::MacAddress const DST = eth->dst;
+    bool const IS_BROADCAST = DST.is_broadcast();
+    bool const IS_MULTICAST = !IS_BROADCAST && DST.is_multicast();
+    bool const IS_OWNER_UNICAST = !IS_BROADCAST && !IS_MULTICAST && DST == dev->mac;
+    if (IS_OWNER_UNICAST) {
+        return;
+    }
 
     auto pkt_data_len = static_cast<uint16_t>(pkt->len);
     auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + sizeof(NetNotifyHeader) + pkt_data_len);
     if (req_total > WKI_ETH_MAX_PAYLOAD) {
         return;  // Packet too large for a single WKI message
-    }
-
-    // D12: Determine packet type from destination MAC (first 6 bytes of Ethernet frame)
-    bool is_broadcast = false;
-    bool is_multicast = false;
-    if (pkt->len >= 6) {
-        is_broadcast = (pkt->data[0] == 0xFF && pkt->data[1] == 0xFF && pkt->data[2] == 0xFF && pkt->data[3] == 0xFF &&
-                        pkt->data[4] == 0xFF && pkt->data[5] == 0xFF);
-        is_multicast = (!is_broadcast) && ((pkt->data[0] & 0x01) != 0);
     }
 
     // Collect matching bindings under the lock, then send outside
@@ -697,10 +700,10 @@ void wki_dev_server_forward_net_rx(ker::net::NetDevice* dev, ker::net::PacketBuf
         if (!b.net_nic_opened) {
             continue;
         }
-        if (is_broadcast && !b.net_rx_filter.accept_broadcast) {
+        if (IS_BROADCAST && !b.net_rx_filter.accept_broadcast) {
             continue;
         }
-        if (is_multicast && !b.net_rx_filter.accept_multicast) {
+        if (IS_MULTICAST && !b.net_rx_filter.accept_multicast) {
             continue;
         }
         if (b.net_rx_credits == 0) {

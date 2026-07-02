@@ -973,6 +973,7 @@ void channel_init(WkiChannel* ch, uint16_t peer_node, uint16_t chan_id, Priority
     ch->tx_ack = 0;
     ch->rx_seq = 0;
     ch->rx_dispatch_seq = 0;
+    ch->rx_dispatch_waiters.fill(nullptr);
     ch->rx_ack_pending = 0;
     ch->ack_pending = false;
     ch->ack_pending_since_us = 0;
@@ -993,6 +994,45 @@ void channel_init(WkiChannel* ch, uint16_t peer_node, uint16_t chan_id, Priority
     ch->perf_last_stall_report_us = 0;
     ch->perf_last_stall_status = 0;
     ch->tx_rt_entry_in_use = false;
+}
+
+using DispatchWaiterList = std::array<ker::mod::sched::task::Task*, WKI_RX_DISPATCH_WAITER_SLOTS>;
+
+auto record_reliable_dispatch_waiter_locked(WkiChannel* ch, ker::mod::sched::task::Task* task) -> bool {
+    if (ch == nullptr || task == nullptr) {
+        return false;
+    }
+
+    for (auto* waiter : ch->rx_dispatch_waiters) {
+        if (waiter == task) {
+            return true;
+        }
+    }
+
+    for (auto& waiter : ch->rx_dispatch_waiters) {
+        if (waiter == nullptr) {
+            waiter = task;
+            return true;
+        }
+    }
+    return false;
+}
+
+void drain_reliable_dispatch_waiters_locked(WkiChannel* ch, DispatchWaiterList& waiters) {
+    if (ch == nullptr) {
+        return;
+    }
+
+    waiters = ch->rx_dispatch_waiters;
+    ch->rx_dispatch_waiters.fill(nullptr);
+}
+
+void wake_reliable_dispatch_waiters(const DispatchWaiterList& waiters) {
+    for (auto* waiter : waiters) {
+        if (waiter != nullptr) {
+            ker::mod::sched::kern_wake(waiter);
+        }
+    }
 }
 
 // Allocate a pool slot and register in peer->channels[].
@@ -1371,9 +1411,11 @@ void wki_channel_close(WkiChannel* ch) {
     s_channel_pool_lock.lock();
     ch->lock.lock();
 
+    DispatchWaiterList waiters{};
     uint16_t const PEER_NODE = ch->peer_node_id;
     uint16_t const CHANNEL_ID = ch->channel_id;
     ch->active = false;
+    drain_reliable_dispatch_waiters_locked(ch, waiters);
     wki_channel_reset(ch);
 
     // Clear per-peer index entry
@@ -1383,6 +1425,7 @@ void wki_channel_close(WkiChannel* ch) {
     }
 
     ch->lock.unlock();
+    wake_reliable_dispatch_waiters(waiters);
     s_channel_pool_lock.unlock();
 }
 
@@ -1395,10 +1438,13 @@ void wki_channels_close_for_peer(uint16_t node_id) {
     for (auto& pool_entry : s_channel_pool) {
         if (pool_entry.active && pool_entry.peer_node_id == node_id) {
             WkiChannel* ch = &pool_entry;
+            DispatchWaiterList waiters{};
             ch->lock.lock();
             ch->active = false;
+            drain_reliable_dispatch_waiters_locked(ch, waiters);
             wki_channel_reset(ch);
             ch->lock.unlock();
+            wake_reliable_dispatch_waiters(waiters);
         }
     }
     if (peer != nullptr) {
@@ -1971,9 +2017,12 @@ auto wait_for_reliable_dispatch_turn(WkiChannel* ch, uint32_t seq) -> bool {
         return true;
     }
 
+    uint32_t const GENERATION = ch->generation;
+    auto* current_task = ker::mod::sched::get_current_task();
     for (;;) {
+        bool should_block = false;
         ch->lock.lock();
-        bool const ACTIVE = ch->active;
+        bool const ACTIVE = ch->active && ch->generation == GENERATION;
         uint32_t const NEXT_DISPATCH = ch->rx_dispatch_seq;
         if (!ACTIVE || seq_before(seq, NEXT_DISPATCH)) {
             ch->lock.unlock();
@@ -1983,8 +2032,14 @@ auto wait_for_reliable_dispatch_turn(WkiChannel* ch, uint32_t seq) -> bool {
             ch->lock.unlock();
             return true;
         }
+        should_block = current_task != nullptr && current_task->type == ker::mod::sched::task::TaskType::DAEMON &&
+                       record_reliable_dispatch_waiter_locked(ch, current_task);
         ch->lock.unlock();
-        ker::mod::sched::kern_yield();
+        if (should_block) {
+            ker::mod::sched::kern_block();
+        } else {
+            ker::mod::sched::kern_yield();
+        }
     }
 }
 
@@ -1994,12 +2049,13 @@ void finish_reliable_dispatch_turn(WkiChannel* ch, uint32_t seq) {
     }
 
     ch->lock.lock();
+    DispatchWaiterList waiters{};
     if (ch->active && ch->rx_dispatch_seq == seq) {
-        // TODO(wki): Wake ordered-dispatch waiters here once the channel tracks
-        // the task(s) waiting for rx_dispatch_seq to advance.
         ch->rx_dispatch_seq++;
+        drain_reliable_dispatch_waiters_locked(ch, waiters);
     }
     ch->lock.unlock();
+    wake_reliable_dispatch_waiters(waiters);
 }
 
 void wki_dispatch_reliable_msg_ordered(WkiChannel* ch, MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {

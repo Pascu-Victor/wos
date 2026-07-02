@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 PEER_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "peer.cpp"
 WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
+WKI_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.hpp"
 WIRE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wire.hpp"
 WKI_PEER_LIVENESS_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_peer_liveness_ktest.cpp"
 
@@ -475,23 +476,63 @@ def test_ipc_data_acks_after_ordered_dispatch() -> None:
     )
 
 
-def test_ipc_data_ordered_dispatch_wait_uses_yield_until_explicit_wake() -> None:
-    body = function_body(WKI_CPP.read_text(), "wait_for_reliable_dispatch_turn")
+def test_ipc_data_ordered_dispatch_wait_uses_explicit_daemon_wake() -> None:
+    source = WKI_CPP.read_text()
+    header = WKI_HPP.read_text()
+
+    required_header = [
+        "WKI_RX_DISPATCH_WAITER_SLOTS",
+        "rx_dispatch_waiters",
+    ]
+    missing_header = [token for token in required_header if token not in header]
+    if missing_header:
+        fail("ordered IPC_DATA dispatch wait is missing channel waiter storage token(s): " + ", ".join(missing_header))
+
+    record_body = function_body(source, "record_reliable_dispatch_waiter_locked")
+    required_record = [
+        "waiter == task",
+        "waiter == nullptr",
+        "waiter = task",
+    ]
+    missing_record = [token for token in required_record if token not in record_body]
+    if missing_record:
+        fail("ordered IPC_DATA dispatch wait is missing waiter registration token(s): " + ", ".join(missing_record))
+
+    body = function_body(source, "wait_for_reliable_dispatch_turn")
     required = [
+        "uint32_t const GENERATION = ch->generation",
+        "ch->active && ch->generation == GENERATION",
+        "current_task->type == ker::mod::sched::task::TaskType::DAEMON",
+        "record_reliable_dispatch_waiter_locked(ch, current_task)",
+        "ker::mod::sched::kern_block()",
         "ker::mod::sched::kern_yield()",
     ]
     missing = [token for token in required if token not in body]
     if missing:
-        fail("ordered IPC_DATA dispatch wait is missing yield token(s): " + ", ".join(missing))
+        fail("ordered IPC_DATA dispatch wait is missing explicit wake wait token(s): " + ", ".join(missing))
 
-    finish_body = function_body(WKI_CPP.read_text(), "finish_reliable_dispatch_turn")
-    required_todo = [
-        "TODO(wki): Wake ordered-dispatch waiters here once the channel tracks",
+    finish_body = function_body(source, "finish_reliable_dispatch_turn")
+    required_finish = [
+        "DispatchWaiterList waiters{}",
         "rx_dispatch_seq++",
+        "drain_reliable_dispatch_waiters_locked(ch, waiters)",
+        "wake_reliable_dispatch_waiters(waiters)",
     ]
-    missing_todo = [token for token in required_todo if token not in finish_body]
-    if missing_todo:
-        fail("ordered IPC_DATA dispatch wait is missing future wake TODO token(s): " + ", ".join(missing_todo))
+    missing_finish = [token for token in required_finish if token not in finish_body]
+    if missing_finish:
+        fail("ordered IPC_DATA dispatch wait is missing wake completion token(s): " + ", ".join(missing_finish))
+    require_order(
+        finish_body,
+        "drain_reliable_dispatch_waiters_locked(ch, waiters)",
+        "ch->lock.unlock()",
+        "ordered IPC_DATA dispatch wait must drain waiters before unlocking channel",
+    )
+    require_order(
+        finish_body,
+        "ch->lock.unlock()",
+        "wake_reliable_dispatch_waiters(waiters)",
+        "ordered IPC_DATA dispatch wait must wake after dropping channel lock",
+    )
 
 
 def main() -> None:
@@ -503,7 +544,7 @@ def main() -> None:
     test_ack_only_frames_do_not_refresh_peer_liveness()
     test_forwarding_recomputes_checksum_after_ttl_decrement()
     test_ipc_data_acks_after_ordered_dispatch()
-    test_ipc_data_ordered_dispatch_wait_uses_yield_until_explicit_wake()
+    test_ipc_data_ordered_dispatch_wait_uses_explicit_daemon_wake()
     print("WKI peer source invariants hold")
 
 

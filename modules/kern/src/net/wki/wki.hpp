@@ -36,6 +36,7 @@ namespace ker::net::wki {
 constexpr size_t WKI_MAX_PEERS = 256;
 constexpr size_t WKI_MAX_TRANSPORTS = 8;
 constexpr size_t WKI_MAX_CHANNELS = 256;  // per-peer
+constexpr size_t WKI_RX_DISPATCH_WAITER_SLOTS = 8;
 static_assert(WKI_CHAN_DYNAMIC_BASE < WKI_CHAN_DYNAMIC_RESERVED_BASE, "dynamic channel allocation range must not be empty");
 static_assert(WKI_CHAN_DYNAMIC_RESERVED_BASE < WKI_MAX_CHANNELS, "reserved WKI channels must fit in the per-peer channel table");
 
@@ -270,7 +271,8 @@ struct WkiChannel {
     uint32_t tx_ack = 0;           // last ACK received from peer
     uint32_t rx_seq = 0;           // next expected seq from peer
     uint32_t rx_dispatch_seq = 0;  // next received seq allowed to enter handlers
-    uint32_t rx_ack_pending = 0;   // highest seq received, not yet ACKed
+    std::array<ker::mod::sched::task::Task*, WKI_RX_DISPATCH_WAITER_SLOTS> rx_dispatch_waiters = {};
+    uint32_t rx_ack_pending = 0;  // highest seq received, not yet ACKed
     bool ack_pending = false;
     uint64_t ack_pending_since_us = 0;  // time when ack_pending was last set (for delay enforcement)
 

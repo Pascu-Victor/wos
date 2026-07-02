@@ -154,6 +154,29 @@ def test_pty_waiter_wakes_preserve_deferred_switch_state() -> None:
             fail(f"PTY {context} path should park with LOCAL_PTY wait-channel kind")
 
 
+def test_pty_slave_write_fairness_returns_partial_progress() -> None:
+    source = PTY_CPP.read_text()
+    slave_write_body = function_body(source, "slave_write")
+    marker = "if (committed == PTY_WRITE_FAIR_YIELD_INTERVAL && i < count)"
+    start = slave_write_body.find(marker)
+    if start < 0:
+        fail("PTY slave write should bound long stdout bursts with a partial-progress return")
+    end = slave_write_body.find("if (written == 0)", start)
+    if end < 0:
+        fail("PTY slave write fairness block moved away from write completion handling")
+    fairness_block = slave_write_body[start:end]
+    require_tokens(
+        fairness_block,
+        [
+            "publish_master_output();",
+            "goto wake_and_return;",
+        ],
+        "PTY slave write fairness block",
+    )
+    if "ker::mod::sched::kern_yield();" in fairness_block:
+        fail("PTY slave write must not force kern_yield after publishing stdout progress")
+
+
 def test_pty_poll_waits_publish_local_pty_wait_kind() -> None:
     pty_source = PTY_CPP.read_text()
     device_header = DEVICE_HPP.read_text()
@@ -313,6 +336,7 @@ def main() -> None:
     test_detached_pty_device_is_not_logged_as_pointer_corruption()
     test_pty_pair_detaches_only_after_both_sides_close()
     test_pty_waiter_wakes_preserve_deferred_switch_state()
+    test_pty_slave_write_fairness_returns_partial_progress()
     test_pty_poll_waits_publish_local_pty_wait_kind()
     test_devfs_publishes_standard_fd_symlinks()
     test_procfs_fd_links_open_by_retaining_referenced_files()

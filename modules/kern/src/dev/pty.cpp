@@ -28,8 +28,8 @@ namespace ker::dev::pty {
 
 using log = ker::mod::dbg::logger<"pty">;
 using ker::mod::sched::task::WaitChannelKind;
-// Fairness cadence for long PTY write bursts. Yielding periodically prevents
-// a single writer from monopolizing CPU and improves terminal interactivity.
+// Fairness cadence for long PTY write bursts. Writers return after publishing
+// a full batch instead of sleeping inside the syscall success path.
 static constexpr size_t PTY_WRITE_FAIR_YIELD_INTERVAL = 4096;
 
 // Return a default termios (cooked mode: echo, canonical, signals)
@@ -1367,16 +1367,15 @@ ssize_t slave_write(ker::vfs::File* file, const void* buf, size_t count) {
         }
 
         // Prevent long-running writers from starving the scheduler when output
-        // arrives faster than the SSH/network side can consume it.
-        if (committed == PTY_WRITE_FAIR_YIELD_INTERVAL) {
+        // arrives faster than the SSH/network side can consume it. Returning
+        // partial progress keeps the handoff at a syscall boundary instead of
+        // relying on kern_yield() resume from the success path.
+        if (committed == PTY_WRITE_FAIR_YIELD_INTERVAL && i < count) {
             publish_master_output();
             if (current_task_has_deliverable_signal()) {
                 goto wake_and_return;
             }
-            ker::mod::sched::kern_yield();
-            if (current_task_has_deliverable_signal()) {
-                goto wake_and_return;
-            }
+            goto wake_and_return;
         }
     }
 

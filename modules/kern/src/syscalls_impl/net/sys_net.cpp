@@ -422,7 +422,6 @@ void checkpoint_blocking_socket_send_progress(ker::vfs::File* file, ker::net::So
     }
 
     drain_network_rx_work();
-    ker::mod::sched::kern_yield();
 }
 
 template <typename T, typename Fn>

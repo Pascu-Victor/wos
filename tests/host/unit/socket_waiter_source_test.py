@@ -213,10 +213,11 @@ def test_blocking_socket_send_progress_runs_network_checkpoint() -> None:
         [
             "if (result <= 0 || socket_call_effective_nonblock(file, sock, call_flags))",
             "drain_network_rx_work();",
-            "ker::mod::sched::kern_yield();",
         ],
         "blocking socket send progress checkpoint",
     )
+    if "ker::mod::sched::kern_yield();" in helper:
+        fail("successful blocking socket send progress must not force a syscall-path kern_yield")
 
     fops_write = function_body(source, "socket_fops_write")
     require_order(

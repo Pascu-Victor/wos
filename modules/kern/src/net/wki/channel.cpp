@@ -153,6 +153,7 @@ void wki_channel_reset(WkiChannel* ch) {
     ch->tx_ack = 0;
     ch->rx_seq = 0;
     ch->rx_dispatch_seq = 0;
+    ch->rx_dispatch_waiters.fill(nullptr);
     ch->rx_ack_pending = 0;
     ch->ack_pending = false;
     ch->ack_pending_since_us = 0;

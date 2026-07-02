@@ -46,9 +46,18 @@ def require_order(body: str, before: str, after: str, context: str) -> None:
 
 def test_rx_forward_does_not_spend_credits_before_delivery_is_possible() -> None:
     body = function_body(DEV_SERVER_CPP.read_text(), "wki_dev_server_forward_net_rx")
+    required = [
+        "DST == dev->mac",
+        "if (IS_OWNER_UNICAST)",
+        "return;",
+    ]
+    missing = [token for token in required if token not in body]
+    if missing:
+        fail("RX forwarding must skip owner-local unicast before mirroring into WKI: " + ", ".join(missing))
+    require_order(body, "if (IS_OWNER_UNICAST)", "s_server_lock.lock_irqsave", "owner-local unicast skip before binding scan")
     require_order(body, "req_total > WKI_ETH_MAX_PAYLOAD", "s_server_lock.lock_irqsave", "RX forwarding size gate")
-    require_order(body, "is_broadcast && !b.net_rx_filter.accept_broadcast", "b.net_rx_credits--", "broadcast filter")
-    require_order(body, "is_multicast && !b.net_rx_filter.accept_multicast", "b.net_rx_credits--", "multicast filter")
+    require_order(body, "IS_BROADCAST && !b.net_rx_filter.accept_broadcast", "b.net_rx_credits--", "broadcast filter")
+    require_order(body, "IS_MULTICAST && !b.net_rx_filter.accept_multicast", "b.net_rx_credits--", "multicast filter")
     require_order(body, "target_count < MAX_RX_TARGETS", "b.net_rx_credits--", "target capacity")
 
 
