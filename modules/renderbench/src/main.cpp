@@ -394,7 +394,7 @@ auto read_wki_peers() -> std::vector<WkiPeerInfo> {
         });
     }
 
-    std::stable_sort(peers_out.begin(), peers_out.end(), [](const WkiPeerInfo& left, const WkiPeerInfo& right) {
+    std::ranges::stable_sort(peers_out, [](const WkiPeerInfo& left, const WkiPeerInfo& right) {
         if (left.local != right.local) {
             return !left.local;
         }
