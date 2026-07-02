@@ -416,6 +416,15 @@ auto socket_call_effective_nonblock(const ker::vfs::File* file, const ker::net::
     return FILE_NONBLOCK || MSG_NONBLOCK || SOCKET_NONBLOCK;
 }
 
+void checkpoint_blocking_socket_send_progress(ker::vfs::File* file, ker::net::Socket* sock, int call_flags, ssize_t result) {
+    if (result <= 0 || socket_call_effective_nonblock(file, sock, call_flags)) {
+        return;
+    }
+
+    drain_network_rx_work();
+    ker::mod::sched::kern_yield();
+}
+
 template <typename T, typename Fn>
 auto run_socket_call(ker::vfs::File* file, ker::net::Socket* sock, int call_flags, Fn&& fn) -> T {
     bool const EFFECTIVE_NONBLOCK = socket_call_effective_nonblock(file, sock, call_flags);
@@ -486,8 +495,10 @@ ssize_t socket_fops_write(ker::vfs::File* f, const void* buf, size_t count, size
     if (sock->proto_ops == nullptr || sock->proto_ops->send == nullptr) {
         return -ENOSYS;
     }
-    return clamp_io_count(run_socket_call<ssize_t>(f, sock, 0, [&](int flags) { return sock->proto_ops->send(sock, buf, count, flags); }),
-                          count);
+    ssize_t const RESULT = clamp_io_count(
+        run_socket_call<ssize_t>(f, sock, 0, [&](int flags) { return sock->proto_ops->send(sock, buf, count, flags); }), count);
+    checkpoint_blocking_socket_send_progress(f, sock, 0, RESULT);
+    return RESULT;
 }
 
 ker::vfs::FileOperations socket_fops = {
@@ -954,7 +965,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto const RESULT = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&](int flags) {
                 return sock->proto_ops->send(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), flags);
             });
-            return static_cast<uint64_t>(clamp_io_count(RESULT, static_cast<size_t>(a3)));
+            ssize_t const CLAMPED = clamp_io_count(RESULT, static_cast<size_t>(a3));
+            checkpoint_blocking_socket_send_progress(handle.file, sock, static_cast<int>(a4), CLAMPED);
+            return static_cast<uint64_t>(CLAMPED);
         }
 
         case ker::abi::net::ops::RECV: {
@@ -1007,7 +1020,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return sock->proto_ops->sendto(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), flags,
                                                reinterpret_cast<const void*>(a5), alen);
             });
-            return static_cast<uint64_t>(clamp_io_count(RESULT, static_cast<size_t>(a3)));
+            ssize_t const CLAMPED = clamp_io_count(RESULT, static_cast<size_t>(a3));
+            checkpoint_blocking_socket_send_progress(handle.file, sock, static_cast<int>(a4), CLAMPED);
+            return static_cast<uint64_t>(CLAMPED);
         }
 
         case ker::abi::net::ops::RECVFROM: {

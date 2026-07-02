@@ -34,7 +34,7 @@ def find_matching_brace(source: str, brace: int) -> int:
 
 def function_body(source: str, name: str) -> str:
     match = re.search(
-        rf"\b(?:auto|bool|int|void)\s+(?:[A-Za-z0-9_:]+::)?{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&*]+)?\s*\{{",
+        rf"\b(?:auto|bool|int|ssize_t|void)\s+(?:[A-Za-z0-9_:]+::)?{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&*]+)?\s*\{{",
         source,
         flags=re.DOTALL,
     )
@@ -205,11 +205,47 @@ def test_blocking_protocol_waits_handle_waiter_allocation_failure() -> None:
     )
 
 
+def test_blocking_socket_send_progress_runs_network_checkpoint() -> None:
+    source = SYS_NET_CPP.read_text()
+    helper = function_body(source, "checkpoint_blocking_socket_send_progress")
+    require_order(
+        helper,
+        [
+            "if (result <= 0 || socket_call_effective_nonblock(file, sock, call_flags))",
+            "drain_network_rx_work();",
+            "ker::mod::sched::kern_yield();",
+        ],
+        "blocking socket send progress checkpoint",
+    )
+
+    fops_write = function_body(source, "socket_fops_write")
+    require_order(
+        fops_write,
+        [
+            "run_socket_call<ssize_t>",
+            "checkpoint_blocking_socket_send_progress(f, sock, 0, RESULT);",
+            "return RESULT;",
+        ],
+        "socket VFS write progress checkpoint",
+    )
+
+    require_tokens(
+        source,
+        [
+            "checkpoint_blocking_socket_send_progress(handle.file, sock, static_cast<int>(a4), CLAMPED);",
+        ],
+        "socket send syscall progress checkpoint",
+    )
+    if source.count("checkpoint_blocking_socket_send_progress(handle.file, sock, static_cast<int>(a4), CLAMPED);") < 2:
+        fail("SEND and SENDTO must both run the blocking socket send progress checkpoint")
+
+
 def main() -> None:
     test_socket_waiter_list_core()
     test_poll_and_epoll_register_socket_waiters()
     test_tcp_wakes_waiter_list()
     test_blocking_protocol_waits_handle_waiter_allocation_failure()
+    test_blocking_socket_send_progress_runs_network_checkpoint()
     print("socket waiter source invariants hold")
 
 
