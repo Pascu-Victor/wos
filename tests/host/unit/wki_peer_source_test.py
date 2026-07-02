@@ -442,39 +442,56 @@ def test_forwarding_recomputes_checksum_after_ttl_decrement() -> None:
     )
 
 
-def test_ipc_data_acks_before_ordered_dispatch() -> None:
+def test_ipc_data_acks_after_ordered_dispatch() -> None:
     source = WKI_CPP.read_text()
     body = function_body(source, "wki_rx")
     required = [
         "ch->channel_id == WKI_CHAN_IPC_DATA",
-        "pre_dispatch_ack = capture_ack_snapshot_locked(ch);",
-        "ack_snapshot_present(pre_dispatch_ack)",
-        "transmit_ack_snapshot(pre_dispatch_ack)",
-        "apply_ack_transmit_result(pre_dispatch_ack.channel, pre_dispatch_ack, ACK_RET, notify_timer)",
-        "ro_pre_dispatch_ack = capture_ack_snapshot_locked(ch);",
-        "apply_ack_transmit_result(ro_pre_dispatch_ack.channel, ro_pre_dispatch_ack, ACK_RET, notify_timer)",
+        "bool const IMM_ACK = ((ch->priority == PriorityClass::LATENCY || ch->channel_id == WKI_CHAN_IPC_DATA) && ch->ack_pending);",
+        "wki_dispatch_reliable_msg_ordered(ch, msg, hdr, payload, PAYLOAD_LEN);",
+        "wki_dispatch_reliable_msg_ordered(ch, RO_MSG, &RO_HDR, ro_data, RO_LEN);",
+        "complete_ack_transmit_for_generation_locked(ch, imm_ack_generation, imm_ack_num, tx_ret, notify_timer);",
     ]
     missing = [token for token in required if token not in body]
     if missing:
-        fail("IPC_DATA pre-dispatch ACK path is missing token(s): " + ", ".join(missing))
+        fail("IPC_DATA post-dispatch ACK path is missing token(s): " + ", ".join(missing))
     require_order(
         body,
-        "pre_dispatch_ack = capture_ack_snapshot_locked(ch);",
         "wki_dispatch_reliable_msg_ordered(ch, msg, hdr, payload, PAYLOAD_LEN);",
-        "IPC_DATA ACK must be captured before ordered dispatch can block in pipe delivery",
+        "bool const IMM_ACK = ((ch->priority == PriorityClass::LATENCY || ch->channel_id == WKI_CHAN_IPC_DATA) && ch->ack_pending);",
+        "IPC_DATA ACK gating must be computed after ordered local dispatch",
     )
     require_order(
         body,
-        "transmit_ack_snapshot(pre_dispatch_ack)",
-        "wki_dispatch_reliable_msg_ordered(ch, msg, hdr, payload, PAYLOAD_LEN);",
-        "IPC_DATA ACK must be transmitted before ordered dispatch can block in pipe delivery",
-    )
-    require_order(
-        body,
-        "ro_pre_dispatch_ack = capture_ack_snapshot_locked(ch);",
         "wki_dispatch_reliable_msg_ordered(ch, RO_MSG, &RO_HDR, ro_data, RO_LEN);",
-        "reordered IPC_DATA ACK must be captured before reordered dispatch",
+        "bool const IMM_ACK = ((ch->priority == PriorityClass::LATENCY || ch->channel_id == WKI_CHAN_IPC_DATA) && ch->ack_pending);",
+        "reordered IPC_DATA delivery must complete before the immediate ACK decision",
     )
+    require_order(
+        body,
+        "bool const IMM_ACK = ((ch->priority == PriorityClass::LATENCY || ch->channel_id == WKI_CHAN_IPC_DATA) && ch->ack_pending);",
+        "complete_ack_transmit_for_generation_locked(ch, imm_ack_generation, imm_ack_num, tx_ret, notify_timer);",
+        "IPC_DATA immediate ACK completion must follow the post-dispatch ACK decision",
+    )
+
+
+def test_ipc_data_ordered_dispatch_wait_uses_yield_until_explicit_wake() -> None:
+    body = function_body(WKI_CPP.read_text(), "wait_for_reliable_dispatch_turn")
+    required = [
+        "ker::mod::sched::kern_yield()",
+    ]
+    missing = [token for token in required if token not in body]
+    if missing:
+        fail("ordered IPC_DATA dispatch wait is missing yield token(s): " + ", ".join(missing))
+
+    finish_body = function_body(WKI_CPP.read_text(), "finish_reliable_dispatch_turn")
+    required_todo = [
+        "TODO(wki): Wake ordered-dispatch waiters here once the channel tracks",
+        "rx_dispatch_seq++",
+    ]
+    missing_todo = [token for token in required_todo if token not in finish_body]
+    if missing_todo:
+        fail("ordered IPC_DATA dispatch wait is missing future wake TODO token(s): " + ", ".join(missing_todo))
 
 
 def main() -> None:
@@ -485,7 +502,8 @@ def main() -> None:
     test_shutdown_uses_graceful_goodbye_not_fence()
     test_ack_only_frames_do_not_refresh_peer_liveness()
     test_forwarding_recomputes_checksum_after_ttl_decrement()
-    test_ipc_data_acks_before_ordered_dispatch()
+    test_ipc_data_acks_after_ordered_dispatch()
+    test_ipc_data_ordered_dispatch_wait_uses_yield_until_explicit_wake()
     print("WKI peer source invariants hold")
 
 
