@@ -1,6 +1,7 @@
 # action<TAB>source<TAB>target[<TAB>mode for copy-mode]
 copy	configs/rootfs/etc/services	/etc/services
 copy	configs/rootfs/etc/resolv.conf	/etc/resolv.conf
+copy	configs/rootfs/etc/inputrc	/etc/inputrc
 copy	configs/rootfs/etc/nanorc	/etc/nanorc
 copy	build/modules/testprog/testprog	/usr/bin/testprog
 copy	build/modules/testd/testd	/usr/bin/testd
