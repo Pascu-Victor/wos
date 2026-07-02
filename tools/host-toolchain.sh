@@ -19,10 +19,33 @@ B="$WORKSPACE_ROOT/toolchain"
 TARGET_ARCH=x86_64-pc-wos
 export NINJA_STATUS="[%f/%t %e] "
 HOST_PYTHON="${HOST_PYTHON:-$(command -v python3)}"
-HOST_PYTHON_INCLUDE="$("$HOST_PYTHON" -c 'import sysconfig; print(sysconfig.get_path("include"))')"
-HOST_PYTHON_LIBRARY="$("$HOST_PYTHON" -c 'import pathlib, sysconfig; print(pathlib.Path(sysconfig.get_config_var("LIBDIR")) / sysconfig.get_config_var("LDLIBRARY"))')"
-HOST_PYTHON_LIBDIR="$(dirname "$HOST_PYTHON_LIBRARY")"
-HOST_TOOLCHAIN_RPATH="\$ORIGIN/../lib;$HOST_PYTHON_LIBDIR"
+HOST_TOOLCHAIN_RPATH="\$ORIGIN/../lib"
+
+WOS_HOST_LLDB_PYTHON="${WOS_HOST_LLDB_PYTHON:-0}"
+LLDB_PYTHON_CMAKE_ARGS=(
+    -DLLDB_ENABLE_PYTHON=OFF
+    -DLLDB_ENABLE_SWIG=OFF
+)
+case "$WOS_HOST_LLDB_PYTHON" in
+    1|ON|on|TRUE|true|YES|yes)
+        HOST_PYTHON_INCLUDE="$("$HOST_PYTHON" -c 'import sysconfig; print(sysconfig.get_path("include"))')"
+        HOST_PYTHON_LIBRARY="$("$HOST_PYTHON" -c 'import pathlib, sysconfig; print(pathlib.Path(sysconfig.get_config_var("LIBDIR")) / sysconfig.get_config_var("LDLIBRARY"))')"
+        HOST_PYTHON_LIBDIR="$(dirname "$HOST_PYTHON_LIBRARY")"
+        HOST_TOOLCHAIN_RPATH="$HOST_TOOLCHAIN_RPATH;$HOST_PYTHON_LIBDIR"
+        LLDB_PYTHON_CMAKE_ARGS=(
+            -DLLDB_ENABLE_SWIG=ON
+            -DLLDB_ENABLE_PYTHON=ON
+            -DPython3_INCLUDE_DIR="$HOST_PYTHON_INCLUDE"
+            -DPython3_LIBRARY="$HOST_PYTHON_LIBRARY"
+        )
+        ;;
+    0|OFF|off|FALSE|false|NO|no)
+        ;;
+    *)
+        echo "ERROR: WOS_HOST_LLDB_PYTHON must be 0/1, OFF/ON, false/true, or no/yes." >&2
+        exit 1
+        ;;
+esac
 
 # 1. Clone repositories
 mkdir -p $B/src
@@ -48,10 +71,8 @@ cmake -U'Python3_*' -U'_Python3_*' -G Ninja \
  -DLLVM_ENABLE_PROJECTS='clang;lld;lldb' \
  -DLLVM_BUILD_TOOLS=ON \
  -DLLVM_INSTALL_TOOLCHAIN_ONLY=OFF \
- -DLLDB_ENABLE_PYTHON=ON \
  -DPython3_EXECUTABLE="$HOST_PYTHON" \
- -DPython3_INCLUDE_DIR="$HOST_PYTHON_INCLUDE" \
- -DPython3_LIBRARY="$HOST_PYTHON_LIBRARY" \
+ "${LLDB_PYTHON_CMAKE_ARGS[@]}" \
  -DLLVM_ENABLE_LIBXML2=Off \
  -DLLVM_ENABLE_LLD=On \
  -DLLVM_DEFAULT_TARGET_TRIPLE=$TARGET_ARCH \

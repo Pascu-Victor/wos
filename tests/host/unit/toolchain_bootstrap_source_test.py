@@ -874,6 +874,26 @@ def test_host_toolchain_install_uses_ninja_jobs() -> None:
         fail("host toolchain install must not use bare ninja install")
 
 
+def test_host_toolchain_lldb_python_bindings_are_opt_in() -> None:
+    source = HOST_TOOLCHAIN.read_text()
+    require_tokens(
+        source,
+        [
+            'WOS_HOST_LLDB_PYTHON="${WOS_HOST_LLDB_PYTHON:-0}"',
+            "-DLLDB_ENABLE_PYTHON=OFF",
+            "-DLLDB_ENABLE_SWIG=OFF",
+            "-DLLDB_ENABLE_SWIG=ON",
+            "-DLLDB_ENABLE_PYTHON=ON",
+            '-DPython3_EXECUTABLE="$HOST_PYTHON"',
+            '-DPython3_INCLUDE_DIR="$HOST_PYTHON_INCLUDE"',
+            '-DPython3_LIBRARY="$HOST_PYTHON_LIBRARY"',
+        ],
+        "host LLDB Python binding dependency opt-in",
+    )
+    if re.search(r"-DLLDB_ENABLE_PYTHON=ON\s+\\\n\s+-DPython3_EXECUTABLE", source):
+        fail("host LLDB Python bindings must not be enabled unconditionally")
+
+
 def test_wos_port_install_steps_keep_make_parallelism() -> None:
     scripts = [
         WOS_BUSYBOX_BUILD,
