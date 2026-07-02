@@ -909,9 +909,9 @@ static_assert(sizeof(TaskCancelPayload) == 8, "TaskCancelPayload must be 8 bytes
 struct LoadReportPayload {
     uint16_t num_cpus;
     uint16_t runnable_tasks;
-    uint16_t avg_load_pct;    // 0-1000
+    uint16_t avg_load_pct;    // 0-1000 non-idle utilization over the report interval
     uint16_t free_mem_pages;  // in units of 256 pages
-    // Followed by num_cpus * uint16_t per-CPU load values
+    // Followed by num_cpus * uint16_t per-CPU utilization values (0-1000)
 } __attribute__((packed));
 
 static_assert(sizeof(LoadReportPayload) == 8, "LoadReportPayload must be 8 bytes");

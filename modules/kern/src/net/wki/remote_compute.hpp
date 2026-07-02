@@ -225,6 +225,11 @@ auto wki_task_cancel(uint32_t task_id, int signum) -> bool;
 // Called periodically from wki_peer_timer_tick().
 void wki_load_report_send();
 
+// Return the locally cached node load percentage on the 0-1000 scale used by
+// LOAD_REPORT. Falls back to a queue-depth approximation until the first
+// accounting interval has been sampled.
+auto wki_local_node_load_pct() -> uint16_t;
+
 // Query cached remote load for a specific node. Copies the row under the
 // remote-compute lock so callers never retain a pointer into the load deque.
 auto wki_remote_node_load_snapshot(uint16_t node_id, RemoteNodeLoad* out) -> bool;

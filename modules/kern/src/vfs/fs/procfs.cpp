@@ -1638,12 +1638,7 @@ auto generate_wki_peers(char* buf, size_t bufsz) -> size_t {
     append("hostname node_id connected cpus load_pct last_update_us local\n");
 
     uint64_t const CPU_COUNT = std::max<uint64_t>(ker::mod::smt::get_core_count(), 1);
-    uint64_t local_runnable = 0;
-    for (uint64_t cpu = 0; cpu < CPU_COUNT; ++cpu) {
-        auto stats = ker::mod::sched::get_run_queue_stats(cpu);
-        local_runnable += stats.active_task_count;
-    }
-    uint64_t const LOCAL_LOAD = std::min<uint64_t>((local_runnable * 1000ULL) / CPU_COUNT, 1000ULL);
+    uint64_t const LOCAL_LOAD = ker::net::wki::wki_local_node_load_pct();
     uint16_t const LOCAL_NODE = ker::net::wki::g_wki.my_node_id != ker::net::wki::WKI_NODE_INVALID ? ker::net::wki::g_wki.my_node_id : 0;
     append_row(ker::net::wki::g_wki.local_hostname, LOCAL_NODE, true, CPU_COUNT, LOCAL_LOAD, ker::net::wki::wki_now_us(), true);
 

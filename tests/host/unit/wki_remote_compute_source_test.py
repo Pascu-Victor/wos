@@ -259,6 +259,51 @@ def test_remote_load_procfs_uses_locked_snapshot() -> None:
     require_tokens(ktest, ["LoadSnapshotSurvivesCleanup", token], "remote load snapshot KTEST coverage")
 
 
+def test_load_report_uses_cpu_accounting_and_shared_local_cache() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    procfs = PROCFS_CPP.read_text()
+
+    require_tokens(
+        source,
+        [
+            "auto wki_local_node_load_pct() -> uint16_t",
+            "auto compute_local_runnable_load_fallback() -> uint16_t",
+            "auto snapshot_total_time_us(ker::mod::sched::CpuAccountingSnapshot const& snapshot) -> uint64_t",
+            "auto snapshot_busy_time_us(ker::mod::sched::CpuAccountingSnapshot const& snapshot) -> uint64_t",
+            "auto snapshot_delta_pct_milli(",
+        ],
+        "local load accounting helpers",
+    )
+
+    body = function_body(source, "wki_load_report_send")
+    require_tokens(
+        body,
+        [
+            "ker::mod::sched::get_cpu_accounting_snapshot(c)",
+            "snapshot_delta_pct_milli(current_accounting.at(c), previous)",
+            "report.avg_load_pct = compute_local_runnable_load_fallback()",
+            "g_cached_local_load_pct = report.avg_load_pct",
+            "g_cached_local_load_update_us = NOW",
+        ],
+        "load report accounting-based utilization",
+    )
+    require_order(
+        body,
+        "g_cached_local_load_pct = report.avg_load_pct",
+        "memcpy(buf.data(), &report, sizeof(LoadReportPayload))",
+        "local load cache must update before payload serialization",
+    )
+
+    peers_body = function_body(procfs, "generate_wki_peers")
+    require_tokens(
+        peers_body,
+        [
+            "ker::net::wki::wki_local_node_load_pct()",
+        ],
+        "procfs local peer row should reuse the shared local load metric",
+    )
+
+
 def test_receiver_path_localization_bounds_suffix_scan() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
     body = function_body(source, "localize_receiver_logical_path")
@@ -338,6 +383,7 @@ def main() -> None:
     test_task_wait_consumes_completed_submitted_row()
     test_task_wait_completion_slot_is_single_owner()
     test_remote_load_procfs_uses_locked_snapshot()
+    test_load_report_uses_cpu_accounting_and_shared_local_cache()
     test_receiver_path_localization_bounds_suffix_scan()
     test_vfs_ref_loader_rejects_null_or_empty_path_before_vfs_use()
     test_vfs_ref_loader_deadlines_are_saturating()

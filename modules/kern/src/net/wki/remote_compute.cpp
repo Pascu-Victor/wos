@@ -53,6 +53,7 @@ namespace {
 constexpr uint32_t WKI_LATENCY_DAEMON_SLICE_NS = 2'000'000;
 constexpr int WKI_LATENCY_DAEMON_NICE = -5;
 constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
+constexpr uint16_t WKI_LOAD_REPORT_MAX_CPUS = 64;
 
 void promote_latency_sensitive_daemon(ker::mod::sched::task::Task* task) {
     if (task == nullptr || task->type != ker::mod::sched::task::TaskType::DAEMON) {
@@ -78,7 +79,12 @@ uint32_t g_next_task_id = 1;                                   // NOLINT(cppcore
 bool g_remote_compute_initialized = false;                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 uint64_t g_last_load_report_us = 0;                            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 uint16_t g_preferred_remote_cursor = 0;                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-ker::mod::sys::Spinlock s_compute_lock;                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<ker::mod::sched::CpuAccountingSnapshot, WKI_LOAD_REPORT_MAX_CPUS>
+    g_last_local_cpu_accounting{};         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+bool g_last_local_cpu_accounting_valid{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint16_t g_cached_local_load_pct{};        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t g_cached_local_load_update_us{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_compute_lock;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 struct SubmittedIpcCleanup {
     std::array<WkiIpcFdEntry, 16> map = {};
@@ -1148,19 +1154,46 @@ void copy_submit_identity_data(uint8_t* dest, const ker::mod::sched::task::Task*
     memcpy(dest, &identity, sizeof(identity));
 }
 
-auto compute_local_load() -> uint16_t {
-    uint16_t local_load = 0;
+auto compute_local_load() -> uint16_t { return wki_local_node_load_pct(); }
+
+auto compute_local_runnable_load_fallback() -> uint16_t {
     auto cpu_count = static_cast<uint16_t>(ker::mod::smt::get_core_count());
-    if (cpu_count > 0) {
-        uint16_t total_runnable = 0;
-        for (uint16_t c = 0; c < cpu_count; c++) {
-            auto stats = ker::mod::sched::get_run_queue_stats(c);
-            total_runnable += static_cast<uint16_t>(stats.active_task_count);
-        }
-        auto pct = static_cast<uint16_t>((static_cast<uint32_t>(total_runnable) * 1000U) / cpu_count);
-        local_load = std::min<uint16_t>(pct, 1000);
+    if (cpu_count == 0) {
+        return 0;
     }
-    return local_load;
+
+    uint16_t total_runnable = 0;
+    for (uint16_t c = 0; c < cpu_count; ++c) {
+        auto const STATS = ker::mod::sched::get_run_queue_stats(c);
+        total_runnable += static_cast<uint16_t>(STATS.active_task_count);
+    }
+
+    auto const PCT = static_cast<uint16_t>((static_cast<uint32_t>(total_runnable) * 1000U) / cpu_count);
+    return std::min<uint16_t>(PCT, 1000);
+}
+
+auto snapshot_total_time_us(ker::mod::sched::CpuAccountingSnapshot const& snapshot) -> uint64_t {
+    return snapshot.user_us + snapshot.nice_us + snapshot.system_us + snapshot.idle_us + snapshot.iowait_us + snapshot.irq_us +
+           snapshot.softirq_us + snapshot.steal_us;
+}
+
+auto snapshot_busy_time_us(ker::mod::sched::CpuAccountingSnapshot const& snapshot) -> uint64_t {
+    return snapshot_total_time_us(snapshot) - snapshot.idle_us;
+}
+
+auto snapshot_delta_pct_milli(ker::mod::sched::CpuAccountingSnapshot const& current, ker::mod::sched::CpuAccountingSnapshot const& previous)
+    -> uint16_t {
+    uint64_t const TOTAL_NOW = snapshot_total_time_us(current);
+    uint64_t const TOTAL_PREV = snapshot_total_time_us(previous);
+    if (TOTAL_NOW <= TOTAL_PREV) {
+        return 0;
+    }
+
+    uint64_t const BUSY_NOW = snapshot_busy_time_us(current);
+    uint64_t const BUSY_PREV = snapshot_busy_time_us(previous);
+    uint64_t const DELTA_TOTAL = TOTAL_NOW - TOTAL_PREV;
+    uint64_t const DELTA_BUSY = BUSY_NOW > BUSY_PREV ? BUSY_NOW - BUSY_PREV : 0;
+    return static_cast<uint16_t>(std::min<uint64_t>((DELTA_BUSY * 1000ULL) / DELTA_TOTAL, 1000ULL));
 }
 
 // -----------------------------------------------------------------------------
@@ -2330,33 +2363,61 @@ void wki_load_report_send() {
     if (cpu_count == 0) {
         cpu_count = 1;
     }
-    // Cap per-CPU array size to prevent buffer overflow
-    constexpr uint16_t MAX_REPORT_CPUS = 64;
-    uint16_t const REPORT_CPUS = std::min(cpu_count, MAX_REPORT_CPUS);
+    uint16_t const REPORT_CPUS = std::min(cpu_count, WKI_LOAD_REPORT_MAX_CPUS);
 
     LoadReportPayload report = {};
     report.num_cpus = REPORT_CPUS;
-
-    uint16_t total_runnable = 0;
-    constexpr size_t LOAD_REPORT_BUFFER_SIZE = sizeof(LoadReportPayload) + (MAX_REPORT_CPUS * sizeof(uint16_t));
-    std::array<uint8_t, LOAD_REPORT_BUFFER_SIZE> buf = {};
-
-    for (uint16_t c = 0; c < REPORT_CPUS; c++) {
-        auto stats = ker::mod::sched::get_run_queue_stats(c);
-        auto cpu_load = static_cast<uint16_t>(stats.active_task_count + stats.wait_queue_count);
-        std::memcpy(buf.data() + sizeof(LoadReportPayload) + (static_cast<size_t>(c) * sizeof(uint16_t)), &cpu_load, sizeof(cpu_load));
-        total_runnable += static_cast<uint16_t>(stats.active_task_count);
-    }
-
-    report.runnable_tasks = total_runnable;
-    // avg_load_pct: scale 0-1000. Approximation: (total_runnable / num_cpus) * 1000, capped at 1000.
-    if (REPORT_CPUS > 0 && total_runnable > 0) {
-        uint32_t const PCT = (static_cast<uint32_t>(total_runnable) * 1000U) / REPORT_CPUS;
-        report.avg_load_pct = static_cast<uint16_t>(std::min(PCT, 1000U));
-    } else {
-        report.avg_load_pct = 0;
-    }
+    auto const LOADAVG = ker::mod::sched::get_load_average_snapshot();
+    report.runnable_tasks = static_cast<uint16_t>(std::min<uint32_t>(LOADAVG.runnable_tasks, 0xFFFFU));
     report.free_mem_pages = static_cast<uint16_t>(std::min(ker::mod::mm::phys::get_free_mem_pages() / 256ULL, 0xFFFFULL));
+
+    constexpr size_t LOAD_REPORT_BUFFER_SIZE = sizeof(LoadReportPayload) + (WKI_LOAD_REPORT_MAX_CPUS * sizeof(uint16_t));
+    std::array<uint8_t, LOAD_REPORT_BUFFER_SIZE> buf = {};
+    std::array<ker::mod::sched::CpuAccountingSnapshot, WKI_LOAD_REPORT_MAX_CPUS> current_accounting = {};
+    uint64_t total_delta_busy_us = 0;
+    uint64_t total_delta_time_us = 0;
+
+    for (uint16_t c = 0; c < REPORT_CPUS; ++c) {
+        current_accounting.at(c) = ker::mod::sched::get_cpu_accounting_snapshot(c);
+
+        uint16_t cpu_load = 0;
+        if (g_last_local_cpu_accounting_valid) {
+            auto const& previous = g_last_local_cpu_accounting.at(c);
+            cpu_load = snapshot_delta_pct_milli(current_accounting.at(c), previous);
+
+            uint64_t const TOTAL_NOW = snapshot_total_time_us(current_accounting.at(c));
+            uint64_t const TOTAL_PREV = snapshot_total_time_us(previous);
+            if (TOTAL_NOW > TOTAL_PREV) {
+                total_delta_time_us += TOTAL_NOW - TOTAL_PREV;
+
+                uint64_t const BUSY_NOW = snapshot_busy_time_us(current_accounting.at(c));
+                uint64_t const BUSY_PREV = snapshot_busy_time_us(previous);
+                if (BUSY_NOW > BUSY_PREV) {
+                    total_delta_busy_us += BUSY_NOW - BUSY_PREV;
+                }
+            }
+        } else {
+            auto const STATS = ker::mod::sched::get_run_queue_stats(c);
+            cpu_load = static_cast<uint16_t>(STATS.active_task_count + STATS.wait_queue_count);
+        }
+
+        std::memcpy(buf.data() + sizeof(LoadReportPayload) + (static_cast<size_t>(c) * sizeof(uint16_t)), &cpu_load, sizeof(cpu_load));
+    }
+
+    if (g_last_local_cpu_accounting_valid && total_delta_time_us != 0) {
+        report.avg_load_pct = static_cast<uint16_t>(std::min<uint64_t>((total_delta_busy_us * 1000ULL) / total_delta_time_us, 1000ULL));
+    } else {
+        report.avg_load_pct = compute_local_runnable_load_fallback();
+    }
+
+    s_compute_lock.lock();
+    for (uint16_t c = 0; c < REPORT_CPUS; ++c) {
+        g_last_local_cpu_accounting.at(c) = current_accounting.at(c);
+    }
+    g_last_local_cpu_accounting_valid = true;
+    g_cached_local_load_pct = report.avg_load_pct;
+    g_cached_local_load_update_us = NOW;
+    s_compute_lock.unlock();
 
     auto total_len = static_cast<uint16_t>(sizeof(LoadReportPayload) + (REPORT_CPUS * sizeof(uint16_t)));
     memcpy(buf.data(), &report, sizeof(LoadReportPayload));
@@ -2372,6 +2433,23 @@ void wki_load_report_send() {
 
         wki_send(peer->node_id, WKI_CHAN_EVENT_BUS, MsgType::LOAD_REPORT, buf.data(), total_len);
     }
+}
+
+auto wki_local_node_load_pct() -> uint16_t {
+    uint16_t cached = 0;
+    uint64_t updated_at_us = 0;
+
+    s_compute_lock.lock();
+    cached = g_cached_local_load_pct;
+    updated_at_us = g_cached_local_load_update_us;
+    s_compute_lock.unlock();
+
+    uint64_t const NOW = wki_now_us();
+    if (updated_at_us != 0 && NOW >= updated_at_us && NOW - updated_at_us <= (WKI_LOAD_REPORT_INTERVAL_US * 2)) {
+        return cached;
+    }
+
+    return compute_local_runnable_load_fallback();
 }
 
 auto wki_remote_node_load_snapshot(uint16_t node_id, RemoteNodeLoad* out) -> bool {
