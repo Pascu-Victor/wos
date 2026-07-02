@@ -8,6 +8,7 @@ ROOTFS_COMMON = ROOT / "scripts" / "build" / "rootfs_common.sh"
 SYNC_ROOTFS = ROOT / "scripts" / "build" / "sync_rootfs.sh"
 ROOTFS_DELTA = ROOT / "scripts" / "build" / "rootfs_delta.py"
 ROOTFS_QCOW_XFS_DELTA = ROOT / "scripts" / "build" / "rootfs_qcow_xfs_delta.py"
+ALIASES = ROOT / "configs" / "rootfs" / "aliases.tsv"
 
 
 def fail(message: str) -> None:
@@ -19,6 +20,7 @@ def main() -> None:
     sync_rootfs = SYNC_ROOTFS.read_text(encoding="utf-8")
     delta = ROOTFS_DELTA.read_text(encoding="utf-8")
     qcow_xfs_delta = ROOTFS_QCOW_XFS_DELTA.read_text(encoding="utf-8")
+    aliases = ALIASES.read_text(encoding="utf-8")
     if "root:!:0:0:root:/root:/bin/bash" not in source:
         fail("root passwd entry must be locked locally instead of forcing shadow lookup")
     if "root:x:0:0:root:/root:/bin/bash" in source:
@@ -109,6 +111,12 @@ def main() -> None:
     ]:
         if token not in delta:
             fail(f"rootfs delta helper missing {token!r}")
+
+    inputrc = (ROOT / "configs" / "rootfs" / "etc" / "inputrc").read_text(encoding="utf-8")
+    if "configs/rootfs/etc/inputrc\t/etc/inputrc" not in aliases:
+        fail("rootfs manifest must stage system inputrc")
+    if '"\\e[3~": delete-char' not in inputrc:
+        fail("system inputrc must bind xterm Delete to Readline delete-char")
 
     for token in [
         "qemu-storage-daemon",
