@@ -66,6 +66,16 @@ auto stop_wait_status(const Task& task) -> int32_t { return static_cast<int32_t>
 
 auto target_exited(const Task& target) -> bool { return target.exit_notify_ready.load(std::memory_order_acquire) && target.has_exited; }
 
+auto is_wki_execve_proxy_wait(const Task& task) -> bool {
+    return task.wki_proxy_task_id != 0 && task.wait_channel_is(ker::mod::sched::task::WaitChannelKind::WKI_EXECVE_PROXY);
+}
+
+auto is_wki_execve_proxy_handoff(const Task& task) -> bool { return task.deferred_task_switch && is_wki_execve_proxy_wait(task); }
+
+auto should_wake_after_trace_clear(const Task& target, bool was_stopped, bool was_ptrace_wait) -> bool {
+    return (was_stopped || was_ptrace_wait) && !is_wki_execve_proxy_wait(target);
+}
+
 auto process_id(const Task& task) -> uint64_t { return ker::mod::sched::task::process_pid(task); }
 
 auto can_trace(const Task& tracer, const Task& target) -> bool {
@@ -371,6 +381,7 @@ void clear_trace_state_and_wake(Task& target) {
         (void)publish_stop_snapshot_to_syscall_scratch(target);
     }
     bool const WAS_STOPPED = target.ptrace_stopped;
+    bool const WAS_PTRACE_WAIT = target.wait_channel_is(ker::mod::sched::task::WaitChannelKind::PTRACE);
     target.ptrace_traced = false;
     target.ptrace_tracer_pid = 0;
     target.ptrace_options = 0;
@@ -387,10 +398,10 @@ void clear_trace_state_and_wake(Task& target) {
     target.ptrace_dr6 = 0;
     target.ptrace_dr7 = 0;
     clear_task_trap_flags(target);
-    if (target.wait_channel_is(ker::mod::sched::task::WaitChannelKind::PTRACE)) {
+    if (WAS_PTRACE_WAIT) {
         target.clear_wait_channel();
     }
-    if (WAS_STOPPED || target.sched_queue == Task::sched_queue::WAITING) {
+    if (should_wake_after_trace_clear(target, WAS_STOPPED, WAS_PTRACE_WAIT)) {
         ker::mod::sched::reschedule_task_for_cpu(target.cpu, &target);
     }
 }
@@ -1162,6 +1173,10 @@ auto report_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum, bool exit
         if (!task->ptrace_syscall_in_stop) {
             return false;
         }
+        if (is_wki_execve_proxy_handoff(*task)) {
+            task->ptrace_syscall_in_stop = false;
+            return false;
+        }
         task->ptrace_syscall_in_stop = false;
         task->ptrace_stop_reason = abi::ptrace::stop_reason::SYSCALL_EXIT;
     } else {
@@ -1259,6 +1274,54 @@ auto ptrace_selftest_syscall_snapshot_patches_live_sysret_state() -> bool {
 
     ker::mod::mm::phys::page_free(stack);
     return OK;
+}
+
+auto ptrace_selftest_wki_execve_proxy_suppresses_syscall_exit_stop() -> bool {
+    Task target{};
+
+    target.deferred_task_switch = true;
+    target.wki_proxy_task_id = 42;
+    target.set_wait_channel("wki_execve_proxy", ker::mod::sched::task::WaitChannelKind::WKI_EXECVE_PROXY);
+
+    bool ok = is_wki_execve_proxy_handoff(target);
+
+    target.set_wait_channel("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
+    ok = ok && !is_wki_execve_proxy_handoff(target);
+
+    target.set_wait_channel("wki_execve_proxy", ker::mod::sched::task::WaitChannelKind::WKI_EXECVE_PROXY);
+    target.deferred_task_switch = false;
+    ok = ok && !is_wki_execve_proxy_handoff(target);
+
+    target.deferred_task_switch = true;
+    target.wki_proxy_task_id = 0;
+    ok = ok && !is_wki_execve_proxy_handoff(target);
+
+    return ok;
+}
+
+auto ptrace_selftest_detach_preserves_wki_execve_proxy_wait() -> bool {
+    Task proxy{};
+    proxy.wki_proxy_task_id = 42;
+    proxy.sched_queue = Task::sched_queue::WAITING;
+    proxy.set_wait_channel("wki_execve_proxy", ker::mod::sched::task::WaitChannelKind::WKI_EXECVE_PROXY);
+
+    bool ok = is_wki_execve_proxy_wait(proxy);
+    ok = ok && !should_wake_after_trace_clear(proxy, false, false);
+    ok = ok && !should_wake_after_trace_clear(proxy, true, false);
+    ok = ok && !should_wake_after_trace_clear(proxy, false, true);
+
+    Task ptrace_stop{};
+    ptrace_stop.sched_queue = Task::sched_queue::WAITING;
+    ptrace_stop.set_wait_channel("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
+    ok = ok && should_wake_after_trace_clear(ptrace_stop, false, true);
+    ok = ok && should_wake_after_trace_clear(ptrace_stop, true, true);
+
+    Task blocked_tracee{};
+    blocked_tracee.sched_queue = Task::sched_queue::WAITING;
+    blocked_tracee.set_wait_channel("futex", ker::mod::sched::task::WaitChannelKind::GENERIC);
+    ok = ok && !should_wake_after_trace_clear(blocked_tracee, false, false);
+
+    return ok;
 }
 
 auto ptrace_selftest_nonparent_exit_observer_preserves_parent_wait_status() -> bool {

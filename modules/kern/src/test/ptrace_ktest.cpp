@@ -40,6 +40,14 @@ KTEST(PtraceSyscallStop, PublishesLiveSysretState) {
     KEXPECT_TRUE(ker::mod::debug::ptrace::ptrace_selftest_syscall_snapshot_patches_live_sysret_state());
 }
 
+KTEST(PtraceSyscallStop, SuppressesWkiExecveProxyExitStop) {
+    KEXPECT_TRUE(ker::mod::debug::ptrace::ptrace_selftest_wki_execve_proxy_suppresses_syscall_exit_stop());
+}
+
+KTEST(PtraceDetach, PreservesWkiExecveProxyWait) {
+    KEXPECT_TRUE(ker::mod::debug::ptrace::ptrace_selftest_detach_preserves_wki_execve_proxy_wait());
+}
+
 KTEST(PtraceExit, NonParentTracerDoesNotConsumeParentWaitStatus) {
     KEXPECT_TRUE(ker::mod::debug::ptrace::ptrace_selftest_nonparent_exit_observer_preserves_parent_wait_status());
 }

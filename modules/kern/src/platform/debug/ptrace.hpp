@@ -23,6 +23,8 @@ void detach_tracees_for_tracer_exit(uint64_t tracer_pid);
 
 #ifdef WOS_SELFTEST
 auto ptrace_selftest_syscall_snapshot_patches_live_sysret_state() -> bool;
+auto ptrace_selftest_wki_execve_proxy_suppresses_syscall_exit_stop() -> bool;
+auto ptrace_selftest_detach_preserves_wki_execve_proxy_wait() -> bool;
 auto ptrace_selftest_nonparent_exit_observer_preserves_parent_wait_status() -> bool;
 auto ptrace_selftest_parent_exit_observer_consumes_wait_status() -> bool;
 #endif
