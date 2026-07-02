@@ -252,6 +252,9 @@ auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path,
 // Consumer side: cached metadata lookup for an already-open remote file.
 auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int;
 
+// Consumer side: flush write-behind state and forward fsync for an open remote file.
+auto wki_remote_vfs_fsync(ker::vfs::File* file) -> int;
+
 // Consumer side: called from vfs_mkdir() for FSType::REMOTE mounts
 auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path, int mode) -> int;
 

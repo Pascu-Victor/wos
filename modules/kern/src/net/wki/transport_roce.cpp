@@ -77,6 +77,7 @@ struct RoceRegion {
     bool receive_gap = false;
     bool write_complete = false;
     bool tagged_receive = false;
+    bool tagged_receive_prepared = false;
     uint16_t received_cookie = 0;
     RoceRegion* next = nullptr;
 };
@@ -185,6 +186,7 @@ auto region_register(uint64_t vaddr, uint32_t size, bool temporary, uint32_t* rk
     region->receive_gap = false;
     region->write_complete = false;
     region->tagged_receive = false;
+    region->tagged_receive_prepared = false;
     region->received_cookie = 0;
 
     RoceRegion*& bucket = region_bucket(NEW_RKEY);
@@ -241,6 +243,7 @@ auto region_reset_received(uint32_t rkey) -> bool {
     region->receive_gap = false;
     region->write_complete = false;
     region->tagged_receive = false;
+    region->tagged_receive_prepared = false;
     region->received_cookie = 0;
     s_region_lock.unlock_irqrestore(FLAGS);
     return true;
@@ -254,13 +257,30 @@ auto region_prepare_tagged_write(uint32_t rkey, uint16_t cookie) -> bool {
         return false;
     }
 
-    region->received_bytes = 0;
-    region->receive_gap = false;
+    if (!region->tagged_receive || region->received_cookie != cookie) {
+        region->received_bytes = 0;
+        region->receive_gap = false;
+        region->write_complete = false;
+    }
     region->tagged_receive = true;
+    region->tagged_receive_prepared = true;
     region->received_cookie = cookie;
-    region->write_complete = false;
     s_region_lock.unlock_irqrestore(FLAGS);
     return true;
+}
+
+void region_finish_tagged_write(uint32_t rkey, uint16_t cookie) {
+    uint64_t const FLAGS = s_region_lock.lock_irqsave();
+    RoceRegion* region = region_find_locked(rkey);
+    if (region != nullptr && region->tagged_receive && region->received_cookie == cookie) {
+        region->received_bytes = 0;
+        region->receive_gap = false;
+        region->write_complete = false;
+        region->tagged_receive = false;
+        region->tagged_receive_prepared = false;
+        region->received_cookie = 0;
+    }
+    s_region_lock.unlock_irqrestore(FLAGS);
 }
 
 auto region_received_at_least(uint32_t rkey, uint32_t len) -> bool {
@@ -346,7 +366,14 @@ auto region_write(uint32_t rkey, uint64_t offset, const uint8_t* payload, uint32
 
     if (roce_write_tag_valid(write_tag)) {
         uint16_t const COOKIE = roce_write_tag_cookie(write_tag);
-        if (!region->tagged_receive || region->received_cookie != COOKIE) {
+        if (!region->tagged_receive || (!region->tagged_receive_prepared && region->received_cookie != COOKIE && offset == 0)) {
+            region->tagged_receive = true;
+            region->tagged_receive_prepared = false;
+            region->received_cookie = COOKIE;
+            region->received_bytes = 0;
+            region->receive_gap = false;
+            region->write_complete = false;
+        } else if (region->received_cookie != COOKIE) {
             s_region_lock.unlock_irqrestore(FLAGS);
             return false;
         }
@@ -516,6 +543,8 @@ int roce_doorbell(WkiTransport* /*self*/, uint16_t neighbor_id, uint32_t value) 
 auto wki_roce_region_reset_received(uint32_t rkey) -> bool { return region_reset_received(rkey); }
 
 auto wki_roce_region_prepare_tagged_write(uint32_t rkey, uint16_t cookie) -> bool { return region_prepare_tagged_write(rkey, cookie); }
+
+void wki_roce_region_finish_tagged_write(uint32_t rkey, uint16_t cookie) { region_finish_tagged_write(rkey, cookie); }
 
 auto wki_roce_region_wait_received(uint32_t rkey, uint32_t len, uint64_t timeout_us) -> bool {
     if (len == 0) {

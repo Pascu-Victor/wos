@@ -2877,6 +2877,24 @@ auto remote_vfs_truncate(ker::vfs::File* f, off_t length) -> int {
     return RET;
 }
 
+auto remote_vfs_fsync_file(ker::vfs::File* f) -> int {
+    if (f == nullptr || f->private_data == nullptr) {
+        return -EBADF;
+    }
+    auto* ctx = static_cast<RemoteFileContext*>(f->private_data);
+    if (ctx->proxy == nullptr || !ctx->proxy->active) {
+        return -EIO;
+    }
+
+    int const FLUSH_STATUS = flush_write_behind(ctx);
+    if (FLUSH_STATUS != 0) {
+        return FLUSH_STATUS;
+    }
+
+    int32_t remote_fd = ctx->remote_fd;
+    return vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_FSYNC, reinterpret_cast<const uint8_t*>(&remote_fd), sizeof(remote_fd), nullptr, 0);
+}
+
 // Static FileOperations for remote VFS files
 ker::vfs::FileOperations g_remote_vfs_fops = {
     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -2895,6 +2913,8 @@ ker::vfs::FileOperations g_remote_vfs_fops = {
 };
 
 }  // namespace
+
+auto wki_remote_vfs_fsync(ker::vfs::File* file) -> int { return remote_vfs_fsync_file(file); }
 
 // -------------------------------------------------------------------------------
 // Init
@@ -4046,15 +4066,17 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 
             s_vfs_lock.lock();
             RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
+            ker::vfs::File* local_file = nullptr;
             int ret = -1;
             if (rfd != nullptr && rfd->file != nullptr) {
                 touch_remote_fd(rfd);
-                // Flush write-through: fsync the underlying file if possible
-                // Most in-kernel filesystems (tmpfs, fat32) write immediately,
-                // so this is effectively a no-op but ensures correctness.
-                ret = 0;
+                local_file = rfd->file;
             }
             s_vfs_lock.unlock();
+
+            if (local_file != nullptr) {
+                ret = ker::vfs::vfs_fsync_file(local_file);
+            }
 
             DevOpRespPayload resp = {};
             resp.op_id = OP_VFS_FSYNC;
@@ -4380,7 +4402,12 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             // Request: {fd:i32, off:i64, len:u32} = 16 bytes
             // Consumer sends this control message first, then rdma_writes the
             // data into our pre-registered write buffer.
+            VfsWriteRegionInfo write_region_for_cleanup = {};
             auto send_rdma_write_err = [&](int16_t status) {
+                if (write_region_for_cleanup.transport != nullptr && write_region_for_cleanup.transport->name != nullptr &&
+                    std::strcmp(write_region_for_cleanup.transport->name, "wki-roce") == 0) {
+                    wki_roce_region_finish_tagged_write(write_region_for_cleanup.rkey, REQ_COOKIE);
+                }
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_WRITE_RDMA;
                 resp.status = status;
@@ -4404,6 +4431,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             len = std::min<uint32_t>(len, VFS_RDMA_WRITE_SIZE);
 
             VfsWriteRegionInfo const WRITE_REGION = wki_dev_server_get_vfs_write_region(hdr->src_node, channel_id);
+            write_region_for_cleanup = WRITE_REGION;
             uint8_t const* write_src = WRITE_REGION.buf;
             if (write_src == nullptr) {
                 send_rdma_write_err(-EIO);
@@ -4431,6 +4459,10 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             ssize_t const BYTES_WRITTEN = local_file->fops->vfs_write(local_file, write_src, len, static_cast<size_t>(offset));
             if (BYTES_WRITTEN >= 0) {
                 ker::vfs::vfs_cache_notify_file_data_changed(local_file);
+            }
+            if (WRITE_REGION.transport != nullptr && WRITE_REGION.transport->name != nullptr &&
+                std::strcmp(WRITE_REGION.transport->name, "wki-roce") == 0) {
+                wki_roce_region_finish_tagged_write(WRITE_REGION.rkey, REQ_COOKIE);
             }
 
             // Response: {bytes_written:u32} = 4 bytes

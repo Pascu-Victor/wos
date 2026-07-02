@@ -34,6 +34,7 @@ auto wki_roce_region_wait_received(uint32_t rkey, uint32_t len, uint64_t timeout
 // receiver's prepare step.
 auto wki_roce_region_prepare_tagged_write(uint32_t rkey, uint16_t cookie) -> bool;
 auto wki_roce_region_wait_tagged_write(uint32_t rkey, uint16_t cookie, uint32_t len, uint64_t timeout_us) -> bool;
+void wki_roce_region_finish_tagged_write(uint32_t rkey, uint16_t cookie);
 auto wki_roce_rdma_write_tagged(uint16_t neighbor_id, uint32_t rkey, uint64_t remote_offset, const void* local_buf, uint32_t len,
                                 uint16_t cookie) -> int;
 

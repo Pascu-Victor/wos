@@ -193,6 +193,7 @@ auto vfs_cache_epoch_snapshot() -> uint64_t;
 
 // Sync
 auto vfs_fsync(int fd) -> int;
+auto vfs_fsync_file(File* file) -> int;
 auto vfs_sync() -> int;
 auto vfs_shutdown_sync() -> int;
 auto vfs_shutdown_unmount_all(const char* root_path) -> int;

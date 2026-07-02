@@ -10739,25 +10739,31 @@ auto vfs_fsync(int fd) -> int {
         return -EBADF;
     }
 
+    int const RESULT = vfs_fsync_file(file);
+    vfs_put_file(file);
+    return RESULT;
+}
+
+auto vfs_fsync_file(File* file) -> int {
+    if (file == nullptr) {
+        return -EBADF;
+    }
+
     switch (file->fs_type) {
         case FSType::FAT32: {
-            int const RESULT = ker::vfs::fat32::fat32_fsync(file);
-            vfs_put_file(file);
-            return RESULT;
+            return ker::vfs::fat32::fat32_fsync(file);
         }
         case FSType::XFS: {
-            int const RESULT = ker::vfs::xfs::xfs_fsync(file);
-            vfs_put_file(file);
-            return RESULT;
+            return ker::vfs::xfs::xfs_fsync(file);
+        }
+        case FSType::REMOTE: {
+            return ker::net::wki::wki_remote_vfs_fsync(file);
         }
         case FSType::TMPFS:
         case FSType::DEVFS:
         case FSType::PROCFS:
-            vfs_put_file(file);
-            return 0;  // No-op for in-memory or read-only filesystems
         default:
-            vfs_put_file(file);
-            return 0;
+            return 0;  // No-op for in-memory or read-only filesystems
     }
 }
 
