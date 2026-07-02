@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the WOS target toolchain: sysroot, compiler-rt, mlibc, libc++, busybox,
-# dropbear, GNU make, Bash, Ninja, CMake, Python, Meson, NASM, OpenSSL, curl,
-# Git, and native WOS clang/lld.
+# dropbear, GNU make, Bash, Ninja, CMake, Python, Meson, NASM, ncurses, nano,
+# OpenSSL, curl, Git, and native WOS clang/lld.
 # Requires host-toolchain.sh to have been run first.
 #
 # Layout:
@@ -813,8 +813,21 @@ WOS_SYSROOT_PATH="$SYSROOT" \
     "$B/../scripts/build/build_nasm_for_wos.sh"
 bootstrap_phase_end
 
-# 16. Build zlib, OpenSSL, and curl for WOS userspace
-bootstrap_phase_start 16 "zlib LibreSSL and curl for WOS userspace"
+# 16. Build ncurses and nano for WOS userspace
+bootstrap_phase_start 16 "ncurses and nano for WOS userspace"
+WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_NCURSES_SOURCE_DIR="$B/src/ncurses" \
+    WOS_NCURSES_BUILD_DIR="$B/ncurses-build" \
+    "$B/../scripts/build/build_ncurses_for_wos.sh"
+
+WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_NANO_SOURCE_DIR="$B/src/nano" \
+    WOS_NANO_BUILD_DIR="$B/nano-build" \
+    "$B/../scripts/build/build_nano_for_wos.sh"
+bootstrap_phase_end
+
+# 17. Build zlib, OpenSSL, and curl for WOS userspace
+bootstrap_phase_start 17 "zlib LibreSSL and curl for WOS userspace"
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_ZLIB_SOURCE_DIR="$B/src/zlib" \
     WOS_ZLIB_BUILD_DIR="$B/zlib-build" \
@@ -831,16 +844,16 @@ WOS_SYSROOT_PATH="$SYSROOT" \
     "$B/../scripts/build/build_curl_for_wos.sh"
 bootstrap_phase_end
 
-# 17. Build Git for WOS userspace
-bootstrap_phase_start 17 "Git for WOS userspace"
+# 18. Build Git for WOS userspace
+bootstrap_phase_start 18 "Git for WOS userspace"
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_GIT_SOURCE_DIR="$B/src/git" \
     WOS_GIT_BUILD_DIR="$B/git-build" \
     "$B/../scripts/build/build_git_for_wos.sh"
 bootstrap_phase_end
 
-# 18. Build clang/lld for WOS userspace
-bootstrap_phase_start 18 "clang/lld for WOS userspace"
+# 19. Build clang/lld for WOS userspace
+bootstrap_phase_start 19 "clang/lld for WOS userspace"
 WOS_HOST_TOOLCHAIN_ROOT="$HOST" \
     WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_CLANG_FOR_WOS_BUILD_DIR="$B/clang-wos-build" \

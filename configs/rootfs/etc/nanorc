@@ -1,0 +1,2 @@
+## Load nano syntax highlighting files staged from the WOS nano port.
+include "/usr/share/nano/*.nanorc"

@@ -134,6 +134,10 @@ set(WOS_MESON_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/meson" CACHE PATH "M
 set(WOS_MESON_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/meson-build" CACHE PATH "Native WOS Meson staging directory")
 set(WOS_NASM_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/nasm" CACHE PATH "NASM source directory")
 set(WOS_NASM_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/nasm-build" CACHE PATH "Native WOS NASM build directory")
+set(WOS_NCURSES_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/ncurses" CACHE PATH "ncurses source directory")
+set(WOS_NCURSES_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/ncurses-build" CACHE PATH "Native WOS ncurses build directory")
+set(WOS_NANO_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/nano" CACHE PATH "GNU nano source directory")
+set(WOS_NANO_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/nano-build" CACHE PATH "Native WOS nano build directory")
 set(WOS_BOOT_DISK "${CMAKE_SOURCE_DIR}/disk.qcow2" CACHE FILEPATH "WOS boot disk image")
 set(WOS_ROOTFS_DISK "${CMAKE_SOURCE_DIR}/mountfs.qcow2" CACHE FILEPATH "WOS rootfs disk image")
 option(WOS_SKIP_LIBCXX_INSTALL "Skip the libc++ install target; useful when an isolated sysroot is pre-seeded" OFF)
@@ -145,6 +149,8 @@ option(WOS_BUILD_PYTHON_FOR_WOS "Build native WOS Python and stage it into the r
 option(WOS_BUILD_MESON_FOR_WOS "Stage native WOS Meson into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_NASM_FOR_WOS "Build native WOS NASM and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_BASH_FOR_WOS "Build native WOS Bash and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
+option(WOS_BUILD_NCURSES_FOR_WOS "Build static WOS ncursesw for terminal applications" ${WOS_PORT_BUILD_DEFAULT})
+option(WOS_BUILD_NANO_FOR_WOS "Build native WOS nano and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_OPENSSL_FOR_WOS "Build static WOS OpenSSL-compatible TLS libraries for curl and HTTPS-capable ports" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_CURL_FOR_WOS "Build native WOS curl and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_GIT_FOR_WOS "Build native WOS Git and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
@@ -796,6 +802,76 @@ if(WOS_BUILD_NASM_FOR_WOS)
     list(APPEND WOS_NASM_FOR_WOS_ROOTFS_INPUTS ${NASM_FOR_WOS_STAMP})
 endif()
 
+# --- ncurses_for_wos: static terminal library for native text UI ports ------
+set(NCURSES_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/ncurses_for_wos.stamp)
+set(WOS_NCURSES_FOR_WOS_ROOTFS_INPUTS)
+if(WOS_BUILD_NCURSES_FOR_WOS OR WOS_BUILD_NANO_FOR_WOS)
+    if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
+        wos_add_preseeded_artifact_target(ncurses_for_wos ${NCURSES_FOR_WOS_STAMP} ncurses
+            ${WOS_SYSROOT_PATH}/lib/libncursesw.a
+            ${WOS_SYSROOT_PATH}/include/curses.h
+            ${WOS_SYSROOT_PATH}/include/term.h
+        )
+    else()
+        wos_collect_external_sources(NCURSES_FOR_WOS_SOURCES
+            ${WOS_NCURSES_SOURCE_DIR}/*
+        )
+        add_custom_command(
+            OUTPUT ${NCURSES_FOR_WOS_STAMP}
+            COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+                    WOS_NCURSES_SOURCE_DIR=${WOS_NCURSES_SOURCE_DIR}
+                    WOS_NCURSES_BUILD_DIR=${WOS_NCURSES_BUILD_DIR}
+                    ${WOS_BUILD_SCRIPTS_DIR}/build_ncurses_for_wos.sh
+            COMMAND ${CMAKE_COMMAND} -E touch ${NCURSES_FOR_WOS_STAMP}
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            COMMENT "Building static WOS ncursesw..."
+            DEPENDS
+                ${WOS_BUILD_SCRIPTS_DIR}/build_ncurses_for_wos.sh
+                ${NCURSES_FOR_WOS_SOURCES}
+                ${MLIBC_STAMP}
+        )
+        add_custom_target(ncurses_for_wos DEPENDS ${NCURSES_FOR_WOS_STAMP})
+    endif()
+    list(APPEND WOS_NCURSES_FOR_WOS_ROOTFS_INPUTS ${NCURSES_FOR_WOS_STAMP})
+endif()
+
+# --- nano_for_wos: cross-compile GNU nano to run inside WOS -----------------
+set(NANO_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/nano_for_wos.stamp)
+set(WOS_NANO_FOR_WOS_ROOTFS_INPUTS)
+if(WOS_BUILD_NANO_FOR_WOS)
+    if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
+        wos_add_preseeded_artifact_target(nano_for_wos ${NANO_FOR_WOS_STAMP} nano
+            ${WOS_SYSROOT_PATH}/bin/nano
+            ${WOS_SYSROOT_PATH}/bin/rnano
+            ${WOS_SYSROOT_PATH}/share/nano
+        )
+    else()
+        wos_collect_external_sources(NANO_FOR_WOS_SOURCES
+            ${WOS_NANO_SOURCE_DIR}/*
+        )
+        add_custom_command(
+            OUTPUT ${NANO_FOR_WOS_STAMP}
+            COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+                    WOS_NANO_SOURCE_DIR=${WOS_NANO_SOURCE_DIR}
+                    WOS_NANO_BUILD_DIR=${WOS_NANO_BUILD_DIR}
+                    ${WOS_BUILD_SCRIPTS_DIR}/build_nano_for_wos.sh
+            COMMAND ${CMAKE_COMMAND} -E touch ${NANO_FOR_WOS_STAMP}
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            COMMENT "Building native WOS nano..."
+            DEPENDS
+                ${WOS_BUILD_SCRIPTS_DIR}/build_nano_for_wos.sh
+                ${NANO_FOR_WOS_SOURCES}
+                ${NCURSES_FOR_WOS_STAMP}
+                ${MLIBC_STAMP}
+        )
+        add_custom_target(nano_for_wos DEPENDS ${NANO_FOR_WOS_STAMP})
+        add_dependencies(nano_for_wos ncurses_for_wos)
+    endif()
+    list(APPEND WOS_NANO_FOR_WOS_ROOTFS_INPUTS ${NANO_FOR_WOS_STAMP})
+endif()
+
 # --- mountfs_disk: create or delta-sync the XFS rootfs image ----------------
 # If mountfs.qcow2 doesn't exist, create it from scratch.
 # If it already exists, delta-sync changed binaries and libraries.
@@ -856,6 +932,8 @@ add_custom_command(
         ${WOS_MESON_FOR_WOS_ROOTFS_INPUTS}
         ${WOS_NASM_FOR_WOS_ROOTFS_INPUTS}
         ${WOS_BASH_FOR_WOS_ROOTFS_INPUTS}
+        ${WOS_NCURSES_FOR_WOS_ROOTFS_INPUTS}
+        ${WOS_NANO_FOR_WOS_ROOTFS_INPUTS}
         ${WOS_CURL_FOR_WOS_ROOTFS_INPUTS}
         ${WOS_GIT_FOR_WOS_ROOTFS_INPUTS}
 )
@@ -880,6 +958,12 @@ if(WOS_BUILD_NASM_FOR_WOS)
 endif()
 if(WOS_BUILD_BASH_FOR_WOS)
     add_dependencies(mountfs_disk bash_for_wos)
+endif()
+if(WOS_BUILD_NCURSES_FOR_WOS OR WOS_BUILD_NANO_FOR_WOS)
+    add_dependencies(mountfs_disk ncurses_for_wos)
+endif()
+if(WOS_BUILD_NANO_FOR_WOS)
+    add_dependencies(mountfs_disk nano_for_wos)
 endif()
 if(WOS_BUILD_CURL_FOR_WOS)
     add_dependencies(mountfs_disk curl_for_wos)
@@ -930,7 +1014,7 @@ if(NOT WOS_NATIVE_SYSTEM_BUILD)
         endif()
     endforeach()
 endif()
-# busybox, dropbear, GNU make, Bash, curl, Git, Ninja, CMake, Python, Meson, and NASM are only needed for image creation, not compilation.
+# busybox, dropbear, GNU make, Bash, curl, Git, Ninja, CMake, Python, Meson, NASM, ncurses, and nano are only needed for image creation, not compilation.
 add_dependencies(boot_image busybox dropbear gnu_make)
 if(WOS_BUILD_NINJA_FOR_WOS)
     add_dependencies(boot_image ninja_for_wos)
@@ -949,6 +1033,12 @@ if(WOS_BUILD_NASM_FOR_WOS)
 endif()
 if(WOS_BUILD_BASH_FOR_WOS)
     add_dependencies(boot_image bash_for_wos)
+endif()
+if(WOS_BUILD_NCURSES_FOR_WOS OR WOS_BUILD_NANO_FOR_WOS)
+    add_dependencies(boot_image ncurses_for_wos)
+endif()
+if(WOS_BUILD_NANO_FOR_WOS)
+    add_dependencies(boot_image nano_for_wos)
 endif()
 if(WOS_BUILD_CURL_FOR_WOS)
     add_dependencies(boot_image curl_for_wos)
@@ -998,6 +1088,12 @@ if(WOS_BUILD_NASM_FOR_WOS)
 endif()
 if(WOS_BUILD_BASH_FOR_WOS)
     add_dependencies(wos_full bash_for_wos)
+endif()
+if(WOS_BUILD_NCURSES_FOR_WOS OR WOS_BUILD_NANO_FOR_WOS)
+    add_dependencies(wos_full ncurses_for_wos)
+endif()
+if(WOS_BUILD_NANO_FOR_WOS)
+    add_dependencies(wos_full nano_for_wos)
 endif()
 if(WOS_BUILD_OPENSSL_FOR_WOS)
     add_dependencies(wos_full openssl_for_wos)
