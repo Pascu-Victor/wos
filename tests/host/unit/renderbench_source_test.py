@@ -271,6 +271,48 @@ def test_renderbench_node_threads_avoid_persistent_command_stream() -> None:
     )
 
 
+def test_renderbench_live_mode_streams_worker_tiles() -> None:
+    source = RENDERBENCH_MAIN_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "stream_packets",
+            "LiveTileOutputQueue",
+            "start_live_output_queue",
+            "finish_live_output_queue",
+            "push_live_output_packet",
+            "live_output_writer_thread",
+            "cnd_wait(&queue->not_empty",
+            "cnd_signal(&queue.not_empty)",
+            "options.live_preview",
+            "LIVE_PROGRESS_PREVIEW",
+            "STARTED + options.preview_update_interval_seconds",
+        ],
+        "renderbench live preview async streaming surface",
+    )
+
+    render_packet_body = function_body(source, "render_worker_tile_packet")
+    if "write_all(" in render_packet_body:
+        fail("renderbench live mode must not write worker pipes from render threads")
+    require_order(
+        render_packet_body,
+        "state.tiles_rendered->fetch_add",
+        "push_live_output_packet",
+        "renderbench live mode must enqueue tile packets after render",
+    )
+
+    writer_body = function_body(source, "live_output_writer_thread")
+    require_tokens(
+        writer_body,
+        [
+            "write_all(queue->output_fd",
+            "queue->send_seconds",
+            "++queue->sent",
+        ],
+        "renderbench live output writer accounting",
+    )
+
+
 def main() -> None:
     test_renderbench_worker_reap_is_deadline_bounded()
     test_renderbench_worker_cancellation_is_cooperative()
@@ -280,6 +322,7 @@ def main() -> None:
     test_renderbench_coordinator_stall_report_exposes_batch_state()
     test_renderbench_command_stream_uses_per_batch_thread_join()
     test_renderbench_node_threads_avoid_persistent_command_stream()
+    test_renderbench_live_mode_streams_worker_tiles()
     print("renderbench worker source invariants hold")
 
 

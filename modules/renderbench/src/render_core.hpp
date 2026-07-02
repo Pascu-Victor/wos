@@ -25,7 +25,7 @@ enum class ParseStatus {
 };
 
 constexpr double DEFAULT_PREVIEW_UPDATE_INTERVAL_SECONDS = 10.0;
-constexpr double LIVE_PREVIEW_UPDATE_INTERVAL_SECONDS = 1.0;
+constexpr double LIVE_PREVIEW_UPDATE_INTERVAL_SECONDS = 0.1;
 
 struct Options {
     std::string scene_path;

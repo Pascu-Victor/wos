@@ -60,6 +60,7 @@ constexpr double WORKER_CANCEL_GIVE_UP_AFTER_SECONDS = 10.0;
 constexpr double WORKER_EXIT_KILL_AFTER_SECONDS = 2.0;
 constexpr double WORKER_EXIT_GIVE_UP_AFTER_SECONDS = 10.0;
 constexpr long WORKER_WAIT_POLL_NS = 50'000'000L;
+constexpr size_t LIVE_OUTPUT_QUEUE_MIN_PACKETS = 1;
 constexpr int WORKER_STDOUT_FD = 1;
 constexpr int WORKER_COMMAND_FD = 0;
 constexpr int WORKER_CHILD_FD_CLOSE_LIMIT = 256;
@@ -165,6 +166,25 @@ struct WorkerBatchCommand {
     uint32_t batch_count = 0;
     uint32_t stop = 0;
     uint32_t reserved = 0;
+};
+
+struct LiveTileOutputQueue {
+    std::vector<std::vector<unsigned char> > packets;
+    std::vector<size_t> packet_sizes;
+    size_t head = 0;
+    size_t tail = 0;
+    size_t count = 0;
+    bool closed = false;
+    bool failed = false;
+    uint64_t sent = 0;
+    double send_seconds = 0.0;
+    int output_fd = WORKER_STDOUT_FD;
+    bool lock_ready = false;
+    bool not_empty_ready = false;
+    bool not_full_ready = false;
+    mtx_t lock = {};
+    cnd_t not_empty = {};
+    cnd_t not_full = {};
 };
 
 static_assert(offsetof(WorkerDonePacket, magic) == 0);
@@ -313,6 +333,8 @@ struct WorkerBatchRenderThreadState {
     std::atomic<uint64_t>* tiles_rendered = nullptr;
     std::vector<std::vector<unsigned char> >* packets = nullptr;
     std::span<unsigned char> packet_buffer;
+    bool stream_packets = false;
+    LiveTileOutputQueue* output_queue = nullptr;
     double render_seconds = 0.0;
     double render_cpu_seconds = 0.0;
 };
@@ -657,6 +679,196 @@ auto read_exact(int fd, std::span<unsigned char> bytes) -> bool {
     return true;
 }
 
+auto live_output_queue_capacity(size_t expected_tiles) -> size_t { return std::max(LIVE_OUTPUT_QUEUE_MIN_PACKETS, expected_tiles); }
+
+void destroy_live_output_queue(LiveTileOutputQueue& queue) {
+    if (queue.not_full_ready) {
+        cnd_destroy(&queue.not_full);
+        queue.not_full_ready = false;
+    }
+    if (queue.not_empty_ready) {
+        cnd_destroy(&queue.not_empty);
+        queue.not_empty_ready = false;
+    }
+    if (queue.lock_ready) {
+        mtx_destroy(&queue.lock);
+        queue.lock_ready = false;
+    }
+    queue.packet_sizes.clear();
+    queue.packets.clear();
+}
+
+auto init_live_output_queue(LiveTileOutputQueue& queue, size_t expected_tiles, int output_fd) -> bool {
+    destroy_live_output_queue(queue);
+    size_t const CAPACITY = live_output_queue_capacity(expected_tiles);
+    try {
+        queue.packets.assign(CAPACITY, std::vector<unsigned char>());
+        queue.packet_sizes.assign(CAPACITY, 0);
+    } catch (...) {
+        return false;
+    }
+    queue.head = 0;
+    queue.tail = 0;
+    queue.count = 0;
+    queue.closed = false;
+    queue.failed = false;
+    queue.sent = 0;
+    queue.send_seconds = 0.0;
+    queue.output_fd = output_fd;
+    if (mtx_init(&queue.lock, MTX_PLAIN) != THRD_SUCCESS) {
+        destroy_live_output_queue(queue);
+        return false;
+    }
+    queue.lock_ready = true;
+    if (cnd_init(&queue.not_empty) != THRD_SUCCESS) {
+        destroy_live_output_queue(queue);
+        return false;
+    }
+    queue.not_empty_ready = true;
+    if (cnd_init(&queue.not_full) != THRD_SUCCESS) {
+        destroy_live_output_queue(queue);
+        return false;
+    }
+    queue.not_full_ready = true;
+    return true;
+}
+
+void close_live_output_queue(LiveTileOutputQueue& queue) {
+    if (!queue.lock_ready || mtx_lock(&queue.lock) != THRD_SUCCESS) {
+        return;
+    }
+    queue.closed = true;
+    if (queue.not_empty_ready) {
+        (void)cnd_broadcast(&queue.not_empty);
+    }
+    if (queue.not_full_ready) {
+        (void)cnd_broadcast(&queue.not_full);
+    }
+    (void)mtx_unlock(&queue.lock);
+}
+
+void fail_live_output_queue_locked(LiveTileOutputQueue& queue) {
+    queue.failed = true;
+    queue.closed = true;
+    (void)cnd_broadcast(&queue.not_empty);
+    (void)cnd_broadcast(&queue.not_full);
+}
+
+auto push_live_output_packet(LiveTileOutputQueue& queue, std::span<const unsigned char> bytes) -> bool {
+    if (!queue.lock_ready || queue.packets.empty() || bytes.empty()) {
+        return false;
+    }
+    if (mtx_lock(&queue.lock) != THRD_SUCCESS) {
+        return false;
+    }
+    while (queue.count == queue.packets.size() && !queue.closed && !queue.failed && !cancel_requested()) {
+        if (cnd_wait(&queue.not_full, &queue.lock) != THRD_SUCCESS) {
+            fail_live_output_queue_locked(queue);
+            (void)mtx_unlock(&queue.lock);
+            return false;
+        }
+    }
+    if (queue.closed || queue.failed || cancel_requested()) {
+        if (cancel_requested()) {
+            fail_live_output_queue_locked(queue);
+        }
+        (void)mtx_unlock(&queue.lock);
+        return false;
+    }
+
+    size_t const INDEX = queue.tail;
+    try {
+        auto& packet = queue.packets[INDEX];
+        packet.assign(bytes.begin(), bytes.end());
+        queue.packet_sizes[INDEX] = bytes.size();
+    } catch (...) {
+        fail_live_output_queue_locked(queue);
+        (void)mtx_unlock(&queue.lock);
+        return false;
+    }
+    queue.tail = (queue.tail + 1U) % queue.packets.size();
+    ++queue.count;
+    (void)cnd_signal(&queue.not_empty);
+    (void)mtx_unlock(&queue.lock);
+    return true;
+}
+
+auto live_output_writer_thread(void* raw) -> int {
+    auto* queue = static_cast<LiveTileOutputQueue*>(raw);
+    std::vector<unsigned char> packet;
+    for (;;) {
+        if (mtx_lock(&queue->lock) != THRD_SUCCESS) {
+            return 1;
+        }
+        while (queue->count == 0 && !queue->closed && !queue->failed && !cancel_requested()) {
+            if (cnd_wait(&queue->not_empty, &queue->lock) != THRD_SUCCESS) {
+                fail_live_output_queue_locked(*queue);
+                (void)mtx_unlock(&queue->lock);
+                return 1;
+            }
+        }
+        if (queue->count == 0 && (queue->closed || queue->failed || cancel_requested())) {
+            if (cancel_requested()) {
+                fail_live_output_queue_locked(*queue);
+            }
+            bool const FAILED = queue->failed;
+            (void)mtx_unlock(&queue->lock);
+            return FAILED ? 1 : 0;
+        }
+
+        size_t const INDEX = queue->head;
+        size_t const PACKET_SIZE = queue->packet_sizes[INDEX];
+        try {
+            auto& slot = queue->packets[INDEX];
+            packet.assign(slot.begin(), slot.begin() + static_cast<ptrdiff_t>(PACKET_SIZE));
+            slot.clear();
+            queue->packet_sizes[INDEX] = 0;
+        } catch (...) {
+            fail_live_output_queue_locked(*queue);
+            (void)mtx_unlock(&queue->lock);
+            return 1;
+        }
+        queue->head = (queue->head + 1U) % queue->packets.size();
+        --queue->count;
+        (void)cnd_signal(&queue->not_full);
+        (void)mtx_unlock(&queue->lock);
+
+        double const SEND_STARTED = tracebench::monotonic_seconds();
+        bool const SENT = write_all(queue->output_fd, std::span<const unsigned char>(packet.data(), packet.size()));
+        double const SEND_SECONDS = tracebench::monotonic_seconds() - SEND_STARTED;
+        if (mtx_lock(&queue->lock) != THRD_SUCCESS) {
+            return 1;
+        }
+        queue->send_seconds += SEND_SECONDS;
+        if (!SENT) {
+            fail_live_output_queue_locked(*queue);
+            (void)mtx_unlock(&queue->lock);
+            return 1;
+        }
+        ++queue->sent;
+        (void)mtx_unlock(&queue->lock);
+    }
+}
+
+auto start_live_output_queue(LiveTileOutputQueue& queue, thrd_t& thread, size_t expected_tiles, int output_fd) -> bool {
+    if (!init_live_output_queue(queue, expected_tiles, output_fd)) {
+        return false;
+    }
+    if (thrd_create(&thread, live_output_writer_thread, &queue) != THRD_SUCCESS) {
+        close_live_output_queue(queue);
+        destroy_live_output_queue(queue);
+        return false;
+    }
+    return true;
+}
+
+auto finish_live_output_queue(LiveTileOutputQueue& queue, thrd_t thread) -> bool {
+    close_live_output_queue(queue);
+    int result = 1;
+    thrd_join(thread, &result);
+    return result == 0 && !queue.failed;
+}
+
 auto seconds_to_milliseconds(double seconds) -> uint32_t {
     if (seconds <= 0.0) {
         return 0;
@@ -764,7 +976,8 @@ auto render_worker_tile_packet(WorkerBatchRenderThreadState& state, int tile_off
     size_t const PAYLOAD_FLOATS = tile_float_count(tile);
     size_t const PAYLOAD_BYTES = PAYLOAD_FLOATS * sizeof(float);
     size_t const PACKET_BYTES = sizeof(TilePacketHeader) + PAYLOAD_BYTES;
-    if (state.packet_buffer.size() < PACKET_BYTES || tile_offset < 0 || std::cmp_greater_equal(tile_offset, state.packets->size())) {
+    if (state.packet_buffer.size() < PACKET_BYTES || tile_offset < 0 ||
+        (!state.stream_packets && std::cmp_greater_equal(tile_offset, state.packets->size()))) {
         state.failed->store(true, std::memory_order_relaxed);
         return false;
     }
@@ -787,9 +1000,21 @@ auto render_worker_tile_packet(WorkerBatchRenderThreadState& state, int tile_off
 
     TilePacketHeader const HEADER = make_tile_packet_header(tile, tile_payload.size());
     std::memcpy(state.packet_buffer.data(), &HEADER, sizeof(HEADER));
+    state.tiles_rendered->fetch_add(1, std::memory_order_relaxed);
+    if (state.stream_packets) {
+        if (state.output_queue == nullptr) {
+            state.failed->store(true, std::memory_order_relaxed);
+            return false;
+        }
+        if (!push_live_output_packet(*state.output_queue, std::span<const unsigned char>(state.packet_buffer.data(), PACKET_BYTES))) {
+            state.failed->store(true, std::memory_order_relaxed);
+            return false;
+        }
+        return true;
+    }
+
     auto& packet = state.packets->at(static_cast<size_t>(tile_offset));
     packet.assign(state.packet_buffer.begin(), state.packet_buffer.begin() + static_cast<ptrdiff_t>(PACKET_BYTES));
-    state.tiles_rendered->fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -2260,7 +2485,8 @@ auto run_node_threads(const tracebench::Options& options) -> int {
     std::atomic<uint64_t> tiles_done{0};
     double const STARTED = tracebench::monotonic_seconds();
     double next_update = STARTED;
-    double next_preview = STARTED;
+    double next_preview = options.live_preview ? STARTED + options.preview_update_interval_seconds : STARTED;
+    uint64_t last_preview_tiles_done = 0;
 
     (void)tracebench::write_status(options, make_progress(options, 0, tiles.size(), STARTED, false));
     for (int i = 0; i < THREADS; ++i) {
@@ -2281,15 +2507,19 @@ auto run_node_threads(const tracebench::Options& options) -> int {
 
     bool running = true;
     while (running) {
-        running = tiles_done.load() < tiles.size();
+        uint64_t const CURRENT_TILES_DONE = tiles_done.load();
+        running = CURRENT_TILES_DONE < tiles.size();
         double const NOW = tracebench::monotonic_seconds();
         if (NOW >= next_update || !running) {
-            auto progress = make_progress(options, tiles_done.load(), tiles.size(), STARTED, !running);
+            auto progress = make_progress(options, CURRENT_TILES_DONE, tiles.size(), STARTED, !running);
             (void)tracebench::write_status(options, progress);
             next_update = NOW + STATUS_UPDATE_INTERVAL_SECONDS;
         }
-        if (NOW >= next_preview || !running) {
+        bool const LIVE_PROGRESS_PREVIEW =
+            options.live_preview && CURRENT_TILES_DONE != last_preview_tiles_done && (last_preview_tiles_done == 0 || NOW >= next_preview);
+        if (NOW >= next_preview || !running || LIVE_PROGRESS_PREVIEW) {
             (void)tracebench::write_preview_png(options, film);
+            last_preview_tiles_done = CURRENT_TILES_DONE;
             next_preview = NOW + options.preview_update_interval_seconds;
         }
         if (running) {
@@ -2359,16 +2589,28 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
             double const BATCH_STARTED = tracebench::monotonic_seconds();
             (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_BEGIN, command.batch_start, EXPECTED,
                                            static_cast<uint32_t>(THREADS));
+            bool const STREAM_PACKETS = options.live_preview;
+            if (STREAM_PACKETS) {
+                (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_WRITING, command.batch_start,
+                                               EXPECTED, 0U);
+            }
 
             std::vector<tracebench::Tile> batch_tiles;
             batch_tiles.insert(batch_tiles.end(), all_tiles.begin() + static_cast<ptrdiff_t>(START),
                                all_tiles.begin() + static_cast<ptrdiff_t>(END));
-            std::vector<std::vector<unsigned char> > batch_packets(EXPECTED);
+            std::vector<std::vector<unsigned char> > batch_packets(STREAM_PACKETS ? 0U : EXPECTED);
             std::vector<thrd_t> batch_threads(static_cast<size_t>(THREADS));
             std::vector<WorkerBatchRenderThreadState> states(static_cast<size_t>(THREADS));
             std::atomic<int> next_tile{0};
             std::atomic<bool> batch_failed{false};
             std::atomic<uint64_t> tiles_rendered{0};
+            LiveTileOutputQueue output_queue;
+            thrd_t output_thread = {};
+            bool const OUTPUT_STARTED = !STREAM_PACKETS || start_live_output_queue(output_queue, output_thread, EXPECTED, WORKER_STDOUT_FD);
+            if (!OUTPUT_STARTED) {
+                std::println(stderr, "renderbench: failed to start live output writer");
+                return false;
+            }
             for (int i = 0; i < THREADS; ++i) {
                 states.at(static_cast<size_t>(i)) = {
                     .scene = scene.get(),
@@ -2380,6 +2622,8 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
                     .packets = &batch_packets,
                     .packet_buffer = std::span<unsigned char>(thread_packets.at(static_cast<size_t>(i)).data(),
                                                               thread_packets.at(static_cast<size_t>(i)).size()),
+                    .stream_packets = STREAM_PACKETS,
+                    .output_queue = STREAM_PACKETS ? &output_queue : nullptr,
                 };
             }
 
@@ -2404,29 +2648,37 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
             uint64_t const RENDERED = tiles_rendered.load(std::memory_order_relaxed);
             double render_seconds = 0.0;
             double render_cpu_seconds = 0.0;
+            double send_seconds = 0.0;
             for (int i = 0; i < THREADS; ++i) {
                 render_seconds += states.at(static_cast<size_t>(i)).render_seconds;
                 render_cpu_seconds += states.at(static_cast<size_t>(i)).render_cpu_seconds;
             }
+            bool output_ok = true;
+            uint64_t sent = 0;
+            if (STREAM_PACKETS) {
+                output_ok = finish_live_output_queue(output_queue, output_thread);
+                sent = output_queue.sent;
+                send_seconds = output_queue.send_seconds;
+                destroy_live_output_queue(output_queue);
+            }
             (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_RENDERED, command.batch_start, EXPECTED,
                                            RENDERED, batch_failed.load(std::memory_order_relaxed) ? 1U : 0U);
-            uint64_t sent = 0;
-            double send_seconds = 0.0;
-            bool output_ok = true;
-            (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_WRITING, command.batch_start, EXPECTED,
-                                           RENDERED);
-            for (const auto& packet : batch_packets) {
-                if (packet.empty()) {
-                    output_ok = false;
-                    break;
+            if (!STREAM_PACKETS) {
+                (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_WRITING, command.batch_start,
+                                               EXPECTED, RENDERED);
+                for (const auto& packet : batch_packets) {
+                    if (packet.empty()) {
+                        output_ok = false;
+                        break;
+                    }
+                    double const SEND_STARTED = tracebench::monotonic_seconds();
+                    output_ok = write_all(WORKER_STDOUT_FD, std::span<const unsigned char>(packet.data(), packet.size()));
+                    send_seconds += tracebench::monotonic_seconds() - SEND_STARTED;
+                    if (!output_ok) {
+                        break;
+                    }
+                    ++sent;
                 }
-                double const SEND_STARTED = tracebench::monotonic_seconds();
-                output_ok = write_all(WORKER_STDOUT_FD, std::span<const unsigned char>(packet.data(), packet.size()));
-                send_seconds += tracebench::monotonic_seconds() - SEND_STARTED;
-                if (!output_ok) {
-                    break;
-                }
-                ++sent;
             }
             uint64_t const SENT = sent;
             bool const BATCH_FAILED = cancel_requested() || batch_failed.load(std::memory_order_relaxed) || !output_ok ||
@@ -2487,6 +2739,11 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
     int const THREADS = std::max(1, worker.worker_threads);
     (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_BEGIN, worker.batch_start, assigned_tiles.size(),
                                    static_cast<uint32_t>(THREADS), static_cast<uint32_t>(std::max(1, worker.worker_threads)));
+    bool const STREAM_PACKETS = options.live_preview;
+    if (STREAM_PACKETS) {
+        (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_WRITING, worker.batch_start,
+                                       assigned_tiles.size(), 0U);
+    }
     size_t max_payload_floats = 0;
     for (const auto& tile : assigned_tiles) {
         max_payload_floats = std::max(max_payload_floats, tile_float_count(tile));
@@ -2496,12 +2753,20 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
     for (auto& packet : thread_packets) {
         packet.resize(MAX_PACKET_BYTES);
     }
-    std::vector<std::vector<unsigned char> > batch_packets(assigned_tiles.size());
+    std::vector<std::vector<unsigned char> > batch_packets(STREAM_PACKETS ? 0U : assigned_tiles.size());
     std::vector<thrd_t> threads(static_cast<size_t>(THREADS));
     std::vector<WorkerBatchRenderThreadState> states(static_cast<size_t>(THREADS));
     std::atomic<int> next_tile{0};
     std::atomic<bool> failed{false};
     std::atomic<uint64_t> tiles_rendered{0};
+    LiveTileOutputQueue output_queue;
+    thrd_t output_thread = {};
+    bool const OUTPUT_STARTED =
+        !STREAM_PACKETS || start_live_output_queue(output_queue, output_thread, assigned_tiles.size(), WORKER_STDOUT_FD);
+    if (!OUTPUT_STARTED) {
+        std::println(stderr, "renderbench: failed to start live output writer");
+        return 2;
+    }
 
     auto init_thread_state = [&](int index) {
         states.at(static_cast<size_t>(index)) = {
@@ -2514,6 +2779,8 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
             .packets = &batch_packets,
             .packet_buffer = std::span<unsigned char>(thread_packets.at(static_cast<size_t>(index)).data(),
                                                       thread_packets.at(static_cast<size_t>(index)).size()),
+            .stream_packets = STREAM_PACKETS,
+            .output_queue = STREAM_PACKETS ? &output_queue : nullptr,
         };
     };
 
@@ -2542,28 +2809,37 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
     int const ACTIVE_STATES = THREADS == 1 ? 1 : created_threads;
     double render_seconds = 0.0;
     double render_cpu_seconds = 0.0;
+    double send_seconds = 0.0;
     for (int i = 0; i < ACTIVE_STATES; ++i) {
         render_seconds += states.at(static_cast<size_t>(i)).render_seconds;
         render_cpu_seconds += states.at(static_cast<size_t>(i)).render_cpu_seconds;
     }
+    bool output_ok = true;
+    uint64_t sent = 0;
+    if (STREAM_PACKETS) {
+        output_ok = finish_live_output_queue(output_queue, output_thread);
+        sent = output_queue.sent;
+        send_seconds = output_queue.send_seconds;
+        destroy_live_output_queue(output_queue);
+    }
     (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_RENDERED, worker.batch_start, EXPECTED, RENDERED,
                                    failed.load(std::memory_order_relaxed) ? 1U : 0U);
-    uint64_t sent = 0;
-    double send_seconds = 0.0;
-    bool output_ok = true;
-    (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_WRITING, worker.batch_start, EXPECTED, RENDERED);
-    for (const auto& packet : batch_packets) {
-        if (packet.empty()) {
-            output_ok = false;
-            break;
+    if (!STREAM_PACKETS) {
+        (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_WRITING, worker.batch_start, EXPECTED,
+                                       RENDERED);
+        for (const auto& packet : batch_packets) {
+            if (packet.empty()) {
+                output_ok = false;
+                break;
+            }
+            double const SEND_STARTED = tracebench::monotonic_seconds();
+            output_ok = write_all(WORKER_STDOUT_FD, std::span<const unsigned char>(packet.data(), packet.size()));
+            send_seconds += tracebench::monotonic_seconds() - SEND_STARTED;
+            if (!output_ok) {
+                break;
+            }
+            ++sent;
         }
-        double const SEND_STARTED = tracebench::monotonic_seconds();
-        output_ok = write_all(WORKER_STDOUT_FD, std::span<const unsigned char>(packet.data(), packet.size()));
-        send_seconds += tracebench::monotonic_seconds() - SEND_STARTED;
-        if (!output_ok) {
-            break;
-        }
-        ++sent;
     }
     uint64_t const SENT = sent;
     bool const WORKER_FAILED =
@@ -2637,7 +2913,8 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
 
     double const STARTED = tracebench::monotonic_seconds();
     double next_update = STARTED;
-    double next_preview = STARTED;
+    double next_preview = options.live_preview ? STARTED + options.preview_update_interval_seconds : STARTED;
+    uint64_t last_preview_tiles_done = 0;
     uint64_t tiles_done = 0;
     size_t next_tile_position = USE_DYNAMIC_ASSIGNMENT ? 0 : tiles.size();
     (void)tracebench::write_status(options, make_progress(options, 0, tiles.size(), STARTED, false));
@@ -2784,8 +3061,11 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
             (void)tracebench::write_status(options, progress);
             next_update = NOW + STATUS_UPDATE_INTERVAL_SECONDS;
         }
-        if (NOW >= next_preview || open_pipes == 0) {
+        bool const LIVE_PROGRESS_PREVIEW =
+            options.live_preview && tiles_done != last_preview_tiles_done && (last_preview_tiles_done == 0 || NOW >= next_preview);
+        if (NOW >= next_preview || open_pipes == 0 || LIVE_PROGRESS_PREVIEW) {
             (void)tracebench::write_preview_png(options, film);
+            last_preview_tiles_done = tiles_done;
             next_preview = NOW + options.preview_update_interval_seconds;
         }
         if (open_pipes != 0) {
