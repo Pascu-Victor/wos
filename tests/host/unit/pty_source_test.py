@@ -202,7 +202,7 @@ def test_pty_poll_waits_publish_local_pty_wait_kind() -> None:
             "auto poll_wait_kind_for_file(ker::vfs::File* file) -> ker::mod::sched::task::WaitChannelKind",
             "auto merge_poll_wait_kind(ker::mod::sched::task::WaitChannelKind current, ker::mod::sched::task::WaitChannelKind candidate)",
             "poll_wait_kind = merge_poll_wait_kind(poll_wait_kind, poll_wait_kind_for_file(file));",
-            'ker::mod::sched::preemptible_syscall_park("poll", poll_wait_kind, DEADLINE_US);',
+            "ker::mod::sched::preemptible_syscall_park(wait_channel, poll_wait_kind, DEADLINE_US);",
         ],
         "poll syscall should park with registered file wait kind",
     )
