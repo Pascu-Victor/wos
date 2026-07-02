@@ -275,12 +275,32 @@ class RootfsDelta:
                 self.add_source(tz, "/etc/localtime")
                 break
 
+    @staticmethod
+    def read_authorized_key_lines(path: Path, lines: list[str], seen: set[str]) -> None:
+        if not path.exists():
+            return
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.rstrip("\r")
+            if not line or line in seen:
+                continue
+            seen.add(line)
+            lines.append(line)
+
     def collect_root_home(self) -> None:
-        self.add_dir("/root/.ssh", 0o700)
+        lines: list[str] = []
+        seen: set[str] = set()
+        self.read_authorized_key_lines(
+            self.repo / "configs/rootfs/root/.ssh/authorized_keys",
+            lines,
+            seen,
+        )
         for key in (Path.home() / ".ssh/id_ed25519.pub", Path.home() / ".ssh/id_rsa.pub", Path.home() / ".ssh/id_ecdsa.pub"):
             if key.exists():
-                self.add_source(key, "/root/.ssh/authorized_keys", 0o600)
+                self.read_authorized_key_lines(key, lines, seen)
                 break
+        if lines:
+            self.add_generated_file("/root/.ssh/authorized_keys", ("\n".join(lines) + "\n").encode(), 0o600)
+        self.add_dir("/root/.ssh", 0o700)
 
     def collect_srv(self) -> None:
         self.add_dir("/srv")

@@ -421,12 +421,34 @@ EOF
     fi
 }
 
+rootfs_append_authorized_keys() {
+    local line
+    local source="$1"
+    local target="$2"
+
+    [ -f "$source" ] || return 0
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        if ! grep -qxF -- "$line" "$target" 2>/dev/null; then
+            printf '%s\n' "$line" >> "$target"
+        fi
+    done < "$source"
+}
+
 rootfs_stage_root_home() {
+    local authorized_keys
     local keyfile
+    local repo_authorized_keys
     local ssh_pubkey
 
     mkdir -p "$ROOTFS_STAGING/root/.ssh"
     chmod 700 "$ROOTFS_STAGING/root/.ssh"
+    rootfs_record_managed_path "/root/.ssh"
+
+    authorized_keys="$ROOTFS_STAGING/root/.ssh/authorized_keys"
+    repo_authorized_keys="$ROOTFS_REPO/configs/rootfs/root/.ssh/authorized_keys"
+    : > "$authorized_keys"
 
     ssh_pubkey=""
     for keyfile in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub ~/.ssh/id_ecdsa.pub; do
@@ -436,9 +458,16 @@ rootfs_stage_root_home() {
         fi
     done
 
+    rootfs_append_authorized_keys "$repo_authorized_keys" "$authorized_keys"
     if [ -n "$ssh_pubkey" ]; then
-        cp "$ssh_pubkey" "$ROOTFS_STAGING/root/.ssh/authorized_keys"
-        chmod 600 "$ROOTFS_STAGING/root/.ssh/authorized_keys"
+        rootfs_append_authorized_keys "$ssh_pubkey" "$authorized_keys"
+    fi
+
+    if [ -s "$authorized_keys" ]; then
+        chmod 600 "$authorized_keys"
+        rootfs_record_managed_path "/root/.ssh/authorized_keys"
+    else
+        rm -f "$authorized_keys"
     fi
 }
 
