@@ -31,6 +31,8 @@ constexpr uint64_t NSEC_PER_MSEC = 1000000ULL;
 constexpr uint32_t SERVICE_TERM_TIMEOUT_MS = 2000;
 constexpr uint32_t SERVICE_KILL_TIMEOUT_MS = 1000;
 constexpr size_t MAX_TRACKED_SERVICES = 16;
+constexpr uint32_t INIT_WKI_TARGET_FLAGS = ker::process::WKI_TARGET_FLAG_LOCAL | ker::process::WKI_TARGET_FLAG_NOINHERIT;
+constexpr uint32_t SERVICE_WKI_TARGET_FLAGS = ker::process::WKI_TARGET_FLAG_LOCAL;
 using init_log = wos::journal<"init">;
 
 struct ServiceEntry {
@@ -105,6 +107,15 @@ auto wait_for_child_exit(int64_t pid, int32_t* status, uint32_t timeout_ms) -> b
     return false;
 }
 
+auto fork_local_service_child() -> int64_t {
+    (void)ker::process::setwkitarget(nullptr, 0, SERVICE_WKI_TARGET_FLAGS);
+    int64_t const PID = ker::process::fork();
+    if (PID != 0) {
+        (void)ker::process::setwkitarget(nullptr, 0, INIT_WKI_TARGET_FLAGS);
+    }
+    return PID;
+}
+
 }  // namespace
 
 void register_service(const char* name, uint64_t pid, ServiceKind kind) {
@@ -173,12 +184,12 @@ void stop_services_for_shutdown() {
 void stop_journald_for_shutdown() { stop_services_by_kind(ServiceKind::JOURNAL); }
 
 auto spawn_local_service(const char* path, const char* const* argv, const char* const* envp) -> uint64_t {
-    int64_t const PID = ker::process::fork();
+    int64_t const PID = fork_local_service_child();
     if (PID < 0) {
         return 0;
     }
     if (PID == 0) {
-        ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_LOCAL);
+        ker::process::setwkitarget(nullptr, 0, SERVICE_WKI_TARGET_FLAGS);
         ker::process::execve(path, argv, envp);
         ker::process::exit(127);
         __builtin_unreachable();
@@ -199,7 +210,7 @@ auto spawn_with_journal_stdio(const char* path, const std::array<const char*, Ar
         return 0;
     }
 
-    int64_t const SERVICE_PID = ker::process::fork();
+    int64_t const SERVICE_PID = fork_local_service_child();
     if (SERVICE_PID < 0) {
         ::close(pipefd.at(PIPE_READ));
         ::close(pipefd.at(PIPE_WRITE));
@@ -207,10 +218,7 @@ auto spawn_with_journal_stdio(const char* path, const std::array<const char*, Ar
     }
     if (SERVICE_PID == 0) {
         // Service child: redirect stdout and stderr to the write end, then exec.
-        // Root init uses NOINHERIT, so forked service children start with automatic
-        // WKI placement. Re-pin daemons locally before exec; login/session
-        // boundaries can opt their own descendants back into automatic placement.
-        ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_LOCAL);
+        ker::process::setwkitarget(nullptr, 0, SERVICE_WKI_TARGET_FLAGS);
         ::dup2(pipefd.at(PIPE_WRITE), STDOUT_FILENO);
         ::dup2(pipefd.at(PIPE_WRITE), STDERR_FILENO);
         ::close(pipefd.at(PIPE_READ));
@@ -223,7 +231,7 @@ auto spawn_with_journal_stdio(const char* path, const std::array<const char*, Ar
     // Parent: close write end so the drain child sees EOF when the service exits.
     ::close(pipefd.at(PIPE_WRITE));
 
-    int64_t const DRAIN_PID = ker::process::fork();
+    int64_t const DRAIN_PID = fork_local_service_child();
     if (DRAIN_PID < 0) {
         ::close(pipefd.at(PIPE_READ));
         return static_cast<uint64_t>(SERVICE_PID);

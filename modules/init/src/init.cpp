@@ -109,10 +109,10 @@ auto main(int argc, char** argv) -> int {
     init_log::info("init[%llu]: root init starting", static_cast<unsigned long long>(CPUNO));
     shutdown_init();
 
-    // Pin init itself to the local node. NOINHERIT makes forked children start
-    // with automatic WKI placement; service launch code re-pins daemons locally
-    // before exec, and login/session boundaries can opt descendants back into
-    // automatic placement.
+    // Pin init itself to the local node. NOINHERIT makes ordinary children
+    // start with automatic WKI placement; service launch code temporarily drops
+    // NOINHERIT around fork so core daemons are born local before becoming
+    // runnable.
     ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_LOCAL | ker::process::WKI_TARGET_FLAG_NOINHERIT);
 
     mount_filesystems();
@@ -129,15 +129,15 @@ auto main(int argc, char** argv) -> int {
 
         // Recreate /wki on the new root filesystem so WKI remote VFS mounts
         // survive the old initramfs root being unmounted.
-        ker::abi::vfs::mkdir("/wki", 0755);
-
-        // Unmount the old initramfs root to free its RAM.
-        int const UMOUNT_RET = ker::abi::vfs::umount("/oldroot");
-        if (UMOUNT_RET < 0) {
-            init_log::warn("init[%llu]: umount /oldroot failed (ret=%d)", static_cast<unsigned long long>(CPUNO), UMOUNT_RET);
-        } else {
-            init_log::info("init[%llu]: unmounted old initramfs root", static_cast<unsigned long long>(CPUNO));
+        int const WKI_MKDIR_RET = ker::abi::vfs::mkdir("/wki", 0755);
+        if (WKI_MKDIR_RET < 0) {
+            init_log::warn("init[%llu]: mkdir /wki failed (ret=%d)", static_cast<unsigned long long>(CPUNO), WKI_MKDIR_RET);
         }
+
+        // Keep the old initramfs mounted until later.  Unmounting can wait on
+        // stale mount references here, and even a cleanup helper forks before
+        // journald/netd are available.  PID 1 must reach service startup first.
+        init_log::info("init[%llu]: leaving /oldroot mounted during early service startup", static_cast<unsigned long long>(CPUNO));
     }
 
     configure_init_coverage_profile();
