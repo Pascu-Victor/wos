@@ -28,6 +28,7 @@
 #include <platform/sched/task.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <platform/sys/usercopy.hpp>
 #include <string_view>
 #include <util/smallvec.hpp>
 #include <utility>
@@ -8216,6 +8217,7 @@ FileOperations* g_pipe_read_fops_ptr = nullptr;
 FileOperations* g_pipe_write_fops_ptr = nullptr;
 using PipeWakeList = std::array<uint64_t, PIPE_WAKE_BATCH>;
 using PipeWaiterList = ker::util::SmallVec<uint64_t, PIPE_WAITER_INLINE_CAPACITY>;
+constexpr size_t PIPE_COPY_CHUNK = 4096;
 struct PipeState {
     char* buf;
     size_t capacity;
@@ -8401,6 +8403,64 @@ auto current_task_has_deliverable_signal() -> bool {
         return false;
     }
     return task->has_interrupting_signal_pending();
+}
+
+auto pipe_copy_from_caller(const void* src, void* dst, size_t size) -> bool {
+    if (size == 0) {
+        return true;
+    }
+    if (src == nullptr || dst == nullptr) {
+        return false;
+    }
+
+    auto const USER_ADDR = reinterpret_cast<uint64_t>(src);
+    auto* task = ker::mod::sched::get_current_task();
+    if (task != nullptr && task->type == ker::mod::sched::task::TaskType::PROCESS &&
+        ker::mod::sys::usercopy::range_valid(USER_ADDR, size)) {
+        return ker::mod::sys::usercopy::copy_from_task(*task, USER_ADDR, dst, size);
+    }
+
+    std::memcpy(dst, src, size);
+    return true;
+}
+
+auto pipe_copy_to_caller(void* dst, const void* src, size_t size) -> bool {
+    if (size == 0) {
+        return true;
+    }
+    if (dst == nullptr || src == nullptr) {
+        return false;
+    }
+
+    auto const USER_ADDR = reinterpret_cast<uint64_t>(dst);
+    auto* task = ker::mod::sched::get_current_task();
+    if (task != nullptr && task->type == ker::mod::sched::task::TaskType::PROCESS &&
+        ker::mod::sys::usercopy::range_valid(USER_ADDR, size)) {
+        return ker::mod::sys::usercopy::copy_to_task(*task, USER_ADDR, src, size);
+    }
+
+    std::memcpy(dst, src, size);
+    return true;
+}
+
+void pipe_copy_from_ring_locked(PipeState* st, char* dst, size_t count) {
+    size_t const FIRST = std::min(count, st->capacity - st->tail);
+    std::memcpy(dst, st->buf + st->tail, FIRST);
+    if (FIRST < count) {
+        std::memcpy(dst + FIRST, st->buf, count - FIRST);
+    }
+    st->tail = (st->tail + count) % st->capacity;
+    st->count -= count;
+}
+
+void pipe_copy_to_ring_locked(PipeState* st, const char* src, size_t count) {
+    size_t const FIRST = std::min(count, st->capacity - st->head);
+    std::memcpy(st->buf + st->head, src, FIRST);
+    if (FIRST < count) {
+        std::memcpy(st->buf, src + FIRST, count - FIRST);
+    }
+    st->head = (st->head + count) % st->capacity;
+    st->count += count;
 }
 
 void signal_current_sigpipe() {
@@ -8795,6 +8855,7 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
         uint64_t const CALLSITE = WOS_PERF_CALLSITE();
         uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
         uint64_t const STARTED_US = ker::mod::time::get_us();
+        std::array<char, PIPE_COPY_CHUNK> bounce{};
         auto finish = [&](ssize_t rc, uint64_t bytes = 0) -> ssize_t {
             uint32_t const ELAPSED_US = static_cast<uint32_t>(ker::mod::time::get_us() - STARTED_US);
             int32_t const STATUS = rc >= 0 ? 0 : static_cast<int32_t>(rc);
@@ -8821,17 +8882,8 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
             uint64_t const IRQF = st->lock.lock_irqsave();
 
             if (st->count > 0) {
-                size_t const TO_READ = count < st->count ? count : st->count;
-                auto* dst = static_cast<char*>(buf);
-                size_t const FIRST = st->capacity - st->tail;
-                if (FIRST >= TO_READ) {
-                    std::memcpy(dst, st->buf + st->tail, TO_READ);
-                } else {
-                    std::memcpy(dst, st->buf + st->tail, FIRST);
-                    std::memcpy(dst + FIRST, st->buf, TO_READ - FIRST);
-                }
-                st->tail = (st->tail + TO_READ) % st->capacity;
-                st->count -= TO_READ;
+                size_t const TO_READ = std::min({count, st->count, bounce.size()});
+                pipe_copy_from_ring_locked(st, bounce.data(), TO_READ);
 
                 if (!st->writers_waiting.empty()) {
                     pipe_collect_waiters_locked(st->writers_waiting, pending_writers, &pending_writers_count);
@@ -8841,6 +8893,11 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
                 }
 
                 st->lock.unlock_irqrestore(IRQF);
+                if (!pipe_copy_to_caller(buf, bounce.data(), TO_READ)) {
+                    pipe_reschedule_waiters(pending_writers, pending_writers_count);
+                    pipe_reschedule_waiters(pending_write_pollers, pending_write_pollers_count);
+                    return finish(-EFAULT);
+                }
                 pipe_reschedule_waiters(pending_writers, pending_writers_count);
                 pipe_reschedule_waiters(pending_write_pollers, pending_write_pollers_count);
                 return finish(static_cast<ssize_t>(TO_READ), static_cast<uint64_t>(TO_READ));
@@ -8884,6 +8941,7 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
         uint64_t const CALLSITE = WOS_PERF_CALLSITE();
         uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
         uint64_t const STARTED_US = ker::mod::time::get_us();
+        std::array<char, PIPE_COPY_CHUNK> bounce{};
         auto finish = [&](ssize_t rc, uint64_t bytes = 0) -> ssize_t {
             uint32_t const ELAPSED_US = static_cast<uint32_t>(ker::mod::time::get_us() - STARTED_US);
             int32_t const STATUS = rc >= 0 ? 0 : static_cast<int32_t>(rc);
@@ -8950,17 +9008,25 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
 
             size_t const AVAIL = st->capacity - st->count;
             if (AVAIL > 0) {
-                size_t const TO_WRITE = count < AVAIL ? count : AVAIL;
-                const auto* src = static_cast<const char*>(buf);
-                size_t const FIRST = st->capacity - st->head;
-                if (FIRST >= TO_WRITE) {
-                    std::memcpy(st->buf + st->head, src, TO_WRITE);
-                } else {
-                    std::memcpy(st->buf + st->head, src, FIRST);
-                    std::memcpy(st->buf, src + FIRST, TO_WRITE - FIRST);
+                size_t const TO_STAGE = std::min({count, AVAIL, bounce.size()});
+                st->lock.unlock_irqrestore(IRQF);
+                if (!pipe_copy_from_caller(buf, bounce.data(), TO_STAGE)) {
+                    return finish(-EFAULT);
                 }
-                st->head = (st->head + TO_WRITE) % st->capacity;
-                st->count += TO_WRITE;
+
+                uint64_t const WRITE_IRQF = st->lock.lock_irqsave();
+                if (st->read_closed) {
+                    st->lock.unlock_irqrestore(WRITE_IRQF);
+                    signal_current_sigpipe();
+                    return finish(-EPIPE);
+                }
+                if (st->direct_write_active || st->count >= st->capacity) {
+                    st->lock.unlock_irqrestore(WRITE_IRQF);
+                    continue;
+                }
+
+                size_t const TO_WRITE = std::min(TO_STAGE, st->capacity - st->count);
+                pipe_copy_to_ring_locked(st, bounce.data(), TO_WRITE);
 
                 if (!st->readers_waiting.empty()) {
                     pipe_collect_waiters_locked(st->readers_waiting, pending_readers, &pending_readers_count);
@@ -8969,7 +9035,7 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
                     pipe_collect_waiters_locked(st->read_poll_waiting, pending_read_pollers, &pending_read_pollers_count);
                 }
 
-                st->lock.unlock_irqrestore(IRQF);
+                st->lock.unlock_irqrestore(WRITE_IRQF);
                 pipe_reschedule_waiters(pending_readers, pending_readers_count);
                 pipe_reschedule_waiters(pending_read_pollers, pending_read_pollers_count);
                 return finish(static_cast<ssize_t>(TO_WRITE), static_cast<uint64_t>(TO_WRITE));
