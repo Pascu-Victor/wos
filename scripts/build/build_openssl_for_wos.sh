@@ -321,6 +321,17 @@ require_file "$HOST/bin/llvm-ranlib" "Run tools/host-toolchain.sh first."
 require_file "$TARGET_SYSROOT/lib/libc.so" "Build mlibc before building OpenSSL."
 require_file "$TARGET_SYSROOT/lib/Scrt1.o" "Build mlibc startup objects before building OpenSSL."
 
+is_truthy() {
+    case "${1:-0}" in
+        1 | ON | On | on | TRUE | True | true | YES | Yes | yes)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 TLS_SOURCE_DIR="$(resolve_tls_source)"
 copy_source_to_workdir "$TLS_SOURCE_DIR"
 patch_config_sub_for_wos "$TLS_WORK/config.sub"
@@ -334,8 +345,14 @@ if [ ! -e "$TARGET_SYSROOT/usr" ]; then
     ln -s . "$TARGET_SYSROOT/usr"
 fi
 
-OPENSSL_CFLAGS="--sysroot=$TARGET_SYSROOT -O2 -g -fPIC -fno-sanitize=safe-stack -fno-stack-protector -D__STDC_NO_ATOMICS__ -D__WOS__=1"
+OPENSSL_OPTFLAGS="${WOS_OPENSSL_OPTFLAGS:--O0}"
+# Keep LibreSSL crypto conservative for now. Optimized portable ChaCha has
+# been observed to silently corrupt one 64-byte block under WOS runtime.
+OPENSSL_CFLAGS="--sysroot=$TARGET_SYSROOT $OPENSSL_OPTFLAGS -g -fPIC -fno-sanitize=safe-stack -fno-stack-protector -D__STDC_NO_ATOMICS__ -D__WOS__=1"
 OPENSSL_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
+if is_truthy "${WOS_USERSPACE_NO_AVX:-0}"; then
+    OPENSSL_CFLAGS+=" -mno-avx -mno-avx2 -mno-fma -mno-f16c -fno-vectorize -fno-slp-vectorize"
+fi
 
 export CC="${WOS_CCACHE_PREFIX}$HOST/bin/clang --target=$TARGET_ARCH --sysroot=$TARGET_SYSROOT"
 export AR="$HOST/bin/llvm-ar"

@@ -375,6 +375,17 @@ require_file "$TARGET_SYSROOT/lib/libssl.a" "Run scripts/build/build_openssl_for
 require_file "$TARGET_SYSROOT/lib/libcrypto.a" "Run scripts/build/build_openssl_for_wos.sh before building curl."
 require_file "$TARGET_SYSROOT/include/openssl/ssl.h" "Run scripts/build/build_openssl_for_wos.sh before building curl."
 
+is_truthy() {
+    case "${1:-0}" in
+        1 | ON | On | on | TRUE | True | true | YES | Yes | yes)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 CURL_SOURCE_DIR="$(resolve_curl_source)"
 copy_source_to_workdir "$CURL_SOURCE_DIR"
 patch_config_sub_for_wos "$CURL_WORK/config.sub"
@@ -392,6 +403,9 @@ CURL_TARGET_FLAGS="--target=$TARGET_ARCH --sysroot=$TARGET_SYSROOT"
 CURL_CFLAGS="$CURL_TARGET_FLAGS -O2 -g -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector"
 CURL_CPPFLAGS="$CURL_TARGET_FLAGS -I$TARGET_SYSROOT/include"
 CURL_LDFLAGS="$CURL_TARGET_FLAGS -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
+if is_truthy "${WOS_USERSPACE_NO_AVX:-0}"; then
+    CURL_CFLAGS+=" -mno-avx -mno-avx2 -mno-fma -mno-f16c -fno-vectorize -fno-slp-vectorize"
+fi
 
 # curl's libtool parses the compile command itself and misclassifies a CC value
 # with embedded target/sysroot flags as a library object. Keep CC to one path.
