@@ -1574,10 +1574,13 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     wki_ipc_export_task_fds(task, best_node, ipc_fd_map.data(), &ipc_fd_count);
     bool vfs_ref_submit_attempted = false;
 
-    // Automatic placement runs on the normal exec path and must be cheap to
-    // decline. VFS_REF can wait on remote filesystem progress for the full task
-    // submit timeout, so reserve it for explicit remote policies.
-    bool const ALLOW_VFS_REF = !AUTOMATIC_PLACEMENT;
+    // The legacy scheduler hook must stay cheap: it can run from task
+    // publication paths that should not block on remote VFS. Direct exec/spawn
+    // calls already paid the exec syscall cost and carry argv/env/cwd context,
+    // so automatic placement may use VFS_REF there for normal-sized tools that
+    // cannot fit in an inline TASK_SUBMIT frame.
+    bool const DIRECT_EXEC_SUBMIT = spec.argv != nullptr || spec.envp != nullptr || (spec.cwd != nullptr && spec.cwd[0] != '\0');
+    bool const ALLOW_VFS_REF = !AUTOMATIC_PLACEMENT || DIRECT_EXEC_SUBMIT;
     if (ALLOW_VFS_REF && HAS_EXE_PATH && (!task->wki_prefer_inline || !HAS_INLINE_BINARY)) {
         // Resolve relative exe_path against the task's cwd so that the
         // VFS_REF path sent to the remote node is always absolute.
