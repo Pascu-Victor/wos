@@ -25,6 +25,7 @@
 #include "platform/sched/task.hpp"
 #include "platform/smt/smt.hpp"
 #include "syscalls_impl/futex/futex.hpp"
+#include "syscalls_impl/log/sys_log.hpp"
 #include "syscalls_impl/multiproc/threadControl.hpp"
 #include "syscalls_impl/shm/shm.hpp"
 #include "syscalls_impl/vmem/sys_vmem.hpp"
@@ -433,6 +434,7 @@ namespace {
         }
     }
     current_task->exit_in_progress = true;
+    ker::syscall::log::sys_log_cleanup_for_task(current_task);
 
 #ifdef EXIT_DEBUG
     log::debug("task PID %x exiting with status %d", current_task->pid, status);

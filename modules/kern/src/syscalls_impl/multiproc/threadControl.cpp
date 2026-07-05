@@ -18,6 +18,7 @@
 #include "abi/callnums/multiproc.h"
 #include "platform/dbg/dbg.hpp"
 #include "platform/smt/smt.hpp"
+#include "syscalls_impl/log/sys_log.hpp"
 
 namespace ker::syscall::multiproc {
 namespace {
@@ -106,6 +107,7 @@ auto publish_thread_tid_to_tcb(mod::sched::task::Task* parent, uint64_t tcb_va, 
         }
     }
     task->exit_in_progress = true;
+    ker::syscall::log::sys_log_cleanup_for_task(task);
     release_thread_fd_refs(task);
     task->has_exited = true;
     task->exit_status = 0;
