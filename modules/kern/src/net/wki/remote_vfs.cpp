@@ -94,7 +94,13 @@ auto transport_supports_rdma_read_pull(const WkiTransport* transport) -> bool {
 }
 
 constexpr uint64_t VFS_PROXY_CONTENTION_SLEEP_US = 1000;
-constexpr uint64_t VFS_PROXY_SLOT_WAIT_TIMEOUT_US = WKI_OP_TIMEOUT_US;
+// Remote compilers can keep the exporting node CPU-bound long enough for a
+// response to arrive just after the generic WKI timeout. Retrying immediately
+// then leaves the proxy one sequence behind forever, so normal remote-VFS ops
+// use the same patience budget as remote task submit. Readlink keeps its
+// smaller interactive timeout schedule below.
+constexpr uint64_t VFS_PROXY_OP_TIMEOUT_US = 60'000'000;
+constexpr uint64_t VFS_PROXY_SLOT_WAIT_TIMEOUT_US = VFS_PROXY_OP_TIMEOUT_US;
 
 auto remote_vfs_strip_mount_prefix(const ker::vfs::MountPoint* mount, const char* path) -> const char* {
     if (mount == nullptr || path == nullptr) {
@@ -1422,7 +1428,7 @@ void deactivate_vfs_proxy_locked(ProxyVfsState* state, PendingProxyTeardown& tea
 
 // Helper: send DEV_OP_REQ and wait for response
 auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, uint16_t req_data_len, void* resp_buf,
-                             uint16_t resp_buf_max, uint16_t* resp_len_out = nullptr, uint64_t wait_timeout_us = WKI_OP_TIMEOUT_US,
+                             uint16_t resp_buf_max, uint16_t* resp_len_out = nullptr, uint64_t wait_timeout_us = VFS_PROXY_OP_TIMEOUT_US,
                              RoceTaggedReceive* tagged_receive = nullptr) -> int {
     uint64_t const CALLSITE = WOS_PERF_CALLSITE();
     uint64_t const PROXY_WAIT_START = wki_now_us();
@@ -1748,7 +1754,7 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
         }
     }
 
-    int const WAIT_RC = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
+    int const WAIT_RC = wki_wait_for_op(&wait, VFS_PROXY_OP_TIMEOUT_US);
     if (WAIT_RC != 0) {
         cancel_proxy_op_wait(state, wait, WAIT_RC);
 
@@ -1799,7 +1805,7 @@ constexpr std::array<uint64_t, 3> VFS_READLINK_TIMEOUTS_US = {250000, 1000000, 5
 
 auto vfs_read_retry_timeout_us(uint16_t op_id, uint32_t attempt) -> uint64_t {
     if (op_id != OP_VFS_READLINK) {
-        return WKI_OP_TIMEOUT_US;
+        return VFS_PROXY_OP_TIMEOUT_US;
     }
 
     size_t index = attempt;
@@ -2209,7 +2215,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
                     }
                 } else if (BULK_ROCE_PUSH_CAPABLE) {
                     if (!wki_roce_region_wait_tagged_write(ctx->proxy->rdma_bulk_rkey, tagged_receive.cookie, bytes_read,
-                                                           WKI_OP_TIMEOUT_US)) {
+                                                           VFS_PROXY_OP_TIMEOUT_US)) {
                         bulk_error = -ETIMEDOUT;
                         ctx->bulk_cached_len = 0;
                         ctx->proxy->bulk_owner_fd = -1;
@@ -2365,7 +2371,8 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
                         break;
                     }
                 } else if (RDMA_ROCE_PUSH_CAPABLE) {
-                    if (!wki_roce_region_wait_tagged_write(ctx->proxy->rdma_read_rkey, tagged_receive.cookie, to_copy, WKI_OP_TIMEOUT_US)) {
+                    if (!wki_roce_region_wait_tagged_write(ctx->proxy->rdma_read_rkey, tagged_receive.cookie, to_copy,
+                                                           VFS_PROXY_OP_TIMEOUT_US)) {
                         rdma_error = -ETIMEDOUT;
                         break;
                     }
@@ -4440,7 +4447,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 
             if (WRITE_REGION.transport != nullptr && WRITE_REGION.transport->name != nullptr &&
                 std::strcmp(WRITE_REGION.transport->name, "wki-roce") == 0 &&
-                !wki_roce_region_wait_tagged_write(WRITE_REGION.rkey, REQ_COOKIE, len, WKI_OP_TIMEOUT_US)) {
+                !wki_roce_region_wait_tagged_write(WRITE_REGION.rkey, REQ_COOKIE, len, VFS_PROXY_OP_TIMEOUT_US)) {
                 send_rdma_write_err(-ETIMEDOUT);
                 break;
             }
@@ -4563,7 +4570,7 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     }
 
     uint64_t const ATTACH_STARTED_US = wki_now_us();
-    int const WAIT_RC = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
+    int const WAIT_RC = wki_wait_for_op(&wait, VFS_PROXY_OP_TIMEOUT_US);
     s_vfs_lock.lock();
     if (WAIT_RC == 0 && state->attach_wait_entry == &wait) {
         state->attach_wait_entry = nullptr;
@@ -4918,7 +4925,7 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
     }
 
     int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_OPEN, req_data, req_data_len, &open_resp, sizeof(open_resp), &open_resp_len,
-                                               WKI_OP_TIMEOUT_US, tagged_receive_ptr);
+                                               VFS_PROXY_OP_TIMEOUT_US, tagged_receive_ptr);
     delete[] req_data;
 
     if (STATUS != 0 || open_resp.fd < 0) {
@@ -4929,7 +4936,7 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
     if (send_open_prefetch && open_resp_len >= OPEN_RESP_WITH_PREFETCH_LEN && open_resp.prefetched_bytes > 0 &&
         open_resp.prefetched_bytes <= OPEN_PREFETCH_LEN) {
         if (wki_roce_region_wait_tagged_write(state->rdma_bulk_rkey, tagged_receive.cookie, open_resp.prefetched_bytes,
-                                              WKI_OP_TIMEOUT_US)) {
+                                              VFS_PROXY_OP_TIMEOUT_US)) {
             valid_prefetched_bytes = open_resp.prefetched_bytes;
             remote_vfs_rdma_note_success(state->bulk_rdma_failure_count, state->bulk_rdma_retry_after_us);
             remote_vfs_rdma_note_success(state->rdma_read_failure_count, state->rdma_read_retry_after_us);
