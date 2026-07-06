@@ -20,6 +20,15 @@ struct BacklogQueueSnapshot {
     uint64_t queued = 0;
     uint64_t handler_pid = 0;
     uint64_t handler_cpu = 0;
+    uint64_t consumer_owner_pid = 0;
+    uint64_t consumer_owner_cpu = 0;
+    uint64_t consumer_owner_site = 0;
+    uint64_t consumer_start_us = 0;
+    uint64_t consumer_hold_us = 0;
+    uint64_t consumer_batch = 0;
+    uint64_t consumer_normal = 0;
+    uint64_t consumer_wki = 0;
+    uint8_t consumer_stage = 0;
     bool handler_active = false;
     bool consumer_active = false;
 };
@@ -37,6 +46,14 @@ struct BacklogQueue {
     std::atomic<PacketBuffer*> head{nullptr};
     std::atomic<uint64_t> depth{0};
     std::atomic<bool> consumer_active{false};
+    std::atomic<uint64_t> consumer_owner_pid{0};
+    std::atomic<uint64_t> consumer_owner_cpu{0};
+    std::atomic<uint64_t> consumer_owner_site{0};
+    std::atomic<uint64_t> consumer_start_us{0};
+    std::atomic<uint64_t> consumer_batch{0};
+    std::atomic<uint64_t> consumer_normal{0};
+    std::atomic<uint64_t> consumer_wki{0};
+    std::atomic<uint8_t> consumer_stage{0};
     std::array<std::byte, 48> pad{};  // avoid false sharing
     ker::mod::sched::task::Task* handler = nullptr;
     std::atomic<bool> handler_active{false};
@@ -50,5 +67,6 @@ auto backlog_flow_hash(PacketBuffer* pkt, uint64_t num_cpus) -> uint64_t;
 auto backlog_ready() -> bool;
 void backlog_get_snapshot(BacklogSnapshot& out);
 auto backlog_drain_all_pending_inline() -> int;
+auto backlog_rescue_needed(uint64_t min_queue_depth) -> bool;
 
 }  // namespace ker::net

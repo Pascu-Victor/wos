@@ -74,4 +74,6 @@ int napi_poll_all_pending();
 // Returns false if the active worker is currently running on another CPU.
 bool napi_set_worker_cpu(NapiStruct* napi, uint64_t cpu);
 
+auto net_watchdog_enabled() -> bool;
+
 }  // namespace ker::net

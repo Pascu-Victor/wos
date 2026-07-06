@@ -15,6 +15,7 @@
 #include <net/wki/wire.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
@@ -31,6 +32,19 @@ uint64_t num_cpus = 0;
 
 constexpr uint32_t NET_LATENCY_DAEMON_SLICE_NS = 2'000'000;
 constexpr int NET_LATENCY_DAEMON_NICE = -5;
+constexpr uint64_t BACKLOG_CONSUMER_CONTENTION_SLEEP_US = 50;
+constexpr uint32_t BACKLOG_HANDLER_COOPERATIVE_BATCH = 128;
+constexpr uint64_t BACKLOG_HANDLER_COOPERATIVE_SLEEP_US = 50;
+constexpr uint64_t BACKLOG_HANDLER_IDLE_SLEEP_US = 1000;
+
+enum class BacklogConsumerStage : uint8_t {
+    IDLE = 0,
+    ACQUIRED = 1,
+    EMPTY = 2,
+    NORMAL = 3,
+    WKI = 4,
+    RELEASE = 5,
+};
 
 auto is_loopback_dev(const NetDevice* dev) -> bool { return dev != nullptr && std::strncmp(dev->name.data(), "lo", dev->name.size()) == 0; }
 
@@ -89,6 +103,48 @@ void split_backlog_batch(PacketBuffer* batch, PacketBuffer*& normal_head, Packet
     }
 }
 
+auto count_packet_list(PacketBuffer* batch) -> uint64_t {
+    uint64_t count = 0;
+    while (batch != nullptr) {
+        ++count;
+        batch = batch->next;
+    }
+    return count;
+}
+
+void mark_consumer_stage(BacklogQueue& q, BacklogConsumerStage stage) {
+    q.consumer_stage.store(static_cast<uint8_t>(stage), std::memory_order_release);
+}
+
+void mark_consumer_acquired(BacklogQueue& q, uintptr_t owner_site) {
+    auto* current = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    q.consumer_owner_pid.store(current != nullptr ? current->pid : 0, std::memory_order_relaxed);
+    q.consumer_owner_cpu.store(ker::mod::cpu::current_cpu(), std::memory_order_relaxed);
+    q.consumer_owner_site.store(owner_site, std::memory_order_relaxed);
+    q.consumer_start_us.store(ker::mod::time::get_us(), std::memory_order_release);
+    q.consumer_batch.store(0, std::memory_order_relaxed);
+    q.consumer_normal.store(0, std::memory_order_relaxed);
+    q.consumer_wki.store(0, std::memory_order_relaxed);
+    mark_consumer_stage(q, BacklogConsumerStage::ACQUIRED);
+}
+
+void mark_consumer_batch(BacklogQueue& q, uint64_t batch_count, PacketBuffer* normal_head, PacketBuffer* wki_head) {
+    q.consumer_batch.store(batch_count, std::memory_order_relaxed);
+    q.consumer_normal.store(count_packet_list(normal_head), std::memory_order_relaxed);
+    q.consumer_wki.store(count_packet_list(wki_head), std::memory_order_relaxed);
+}
+
+void clear_consumer_owner(BacklogQueue& q) {
+    q.consumer_stage.store(static_cast<uint8_t>(BacklogConsumerStage::IDLE), std::memory_order_release);
+    q.consumer_batch.store(0, std::memory_order_relaxed);
+    q.consumer_normal.store(0, std::memory_order_relaxed);
+    q.consumer_wki.store(0, std::memory_order_relaxed);
+    q.consumer_start_us.store(0, std::memory_order_relaxed);
+    q.consumer_owner_site.store(0, std::memory_order_relaxed);
+    q.consumer_owner_cpu.store(0, std::memory_order_relaxed);
+    q.consumer_owner_pid.store(0, std::memory_order_relaxed);
+}
+
 void process_backlog_packet(PacketBuffer* pkt) {
     if (pkt == nullptr) {
         return;
@@ -116,12 +172,17 @@ void process_backlog_packet(PacketBuffer* pkt) {
     proto::eth_rx(pkt->dev, pkt);
 }
 
-void process_packet_list(PacketBuffer* batch) {
+void process_packet_list(PacketBuffer* batch, bool cooperative) {
+    uint32_t processed_since_sleep = 0;
     while (batch != nullptr) {
         PacketBuffer* next = batch->next;
         batch->next = nullptr;
         process_backlog_packet(batch);
         batch = next;
+        if (cooperative && batch != nullptr && ++processed_since_sleep >= BACKLOG_HANDLER_COOPERATIVE_BATCH) {
+            processed_since_sleep = 0;
+            ker::mod::sched::kern_sleep_us(BACKLOG_HANDLER_COOPERATIVE_SLEEP_US);
+        }
     }
 }
 
@@ -140,7 +201,11 @@ auto prepare_backlog_batch(PacketBuffer* batch, BacklogQueue& q, PacketBuffer*& 
 
 auto try_acquire_backlog_consumer(BacklogQueue& q) -> bool {
     bool expected = false;
-    return q.consumer_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+    bool const ACQUIRED = q.consumer_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+    if (ACQUIRED) {
+        mark_consumer_acquired(q, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+    }
+    return ACQUIRED;
 }
 
 void wake_backlog_handler(BacklogQueue& q) {
@@ -152,12 +217,14 @@ void wake_backlog_handler(BacklogQueue& q) {
     if (q.handler->cpu == ker::mod::cpu::current_cpu()) {
         ker::mod::sys::context_switch::request_reschedule();
     } else {
-        ker::mod::sched::wake_cpu(q.handler->cpu);
+        ker::mod::sched::wake_cpu(q.handler->cpu, ker::mod::sched::WakeCpuMode::FORCE);
     }
 }
 
 void release_backlog_consumer(BacklogQueue& q) {
+    mark_consumer_stage(q, BacklogConsumerStage::RELEASE);
     q.consumer_active.store(false, std::memory_order_release);
+    clear_consumer_owner(q);
     if (q.head.load(std::memory_order_acquire) != nullptr) {
         wake_backlog_handler(q);
     }
@@ -172,7 +239,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
         auto& q = queues[cpu_idx];
 
         if (!try_acquire_backlog_consumer(q)) {
-            ker::mod::sched::kern_yield();
+            ker::mod::sched::kern_sleep_us(BACKLOG_CONSUMER_CONTENTION_SLEEP_US);
             continue;
         }
 
@@ -180,6 +247,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
         PacketBuffer* batch = q.head.exchange(nullptr, std::memory_order_acquire);
 
         if (batch == nullptr) {
+            mark_consumer_stage(q, BacklogConsumerStage::EMPTY);
             release_backlog_consumer(q);
 
             // Store false and re-check for race between exchange and store.
@@ -190,18 +258,20 @@ void backlog_handler_loop(uint64_t cpu_idx) {
                 continue;
             }
 
-            ker::mod::sched::kern_block();
+            ker::mod::sched::kern_sleep_us(BACKLOG_HANDLER_IDLE_SLEEP_US);
             q.handler_active.store(true, std::memory_order_relaxed);
             continue;
         }
 
         PacketBuffer* normal_head = nullptr;
         PacketBuffer* wki_head = nullptr;
-        static_cast<void>(prepare_backlog_batch(batch, q, normal_head, wki_head));
+        int const QUEUE_DRAINED = prepare_backlog_batch(batch, q, normal_head, wki_head);
+        mark_consumer_batch(q, static_cast<uint64_t>(QUEUE_DRAINED), normal_head, wki_head);
 
-        process_packet_list(normal_head);
+        mark_consumer_stage(q, BacklogConsumerStage::NORMAL);
+        process_packet_list(normal_head, true);
         release_backlog_consumer(q);
-        process_packet_list(wki_head);
+        process_packet_list(wki_head, true);
     }
 }
 
@@ -328,6 +398,7 @@ auto backlog_drain_all_pending_inline() -> int {
 
         PacketBuffer* batch = q.head.exchange(nullptr, std::memory_order_acquire);
         if (batch == nullptr) {
+            mark_consumer_stage(q, BacklogConsumerStage::EMPTY);
             release_backlog_consumer(q);
             continue;
         }
@@ -336,16 +407,34 @@ auto backlog_drain_all_pending_inline() -> int {
         PacketBuffer* wki_head = nullptr;
         int const QUEUE_DRAINED = prepare_backlog_batch(batch, q, normal_head, wki_head);
         drained += QUEUE_DRAINED;
+        mark_consumer_batch(q, static_cast<uint64_t>(QUEUE_DRAINED), normal_head, wki_head);
 
-        process_packet_list(normal_head);
+        mark_consumer_stage(q, BacklogConsumerStage::NORMAL);
+        process_packet_list(normal_head, false);
         release_backlog_consumer(q);
-        process_packet_list(wki_head);
+        process_packet_list(wki_head, false);
     }
 
     return drained;
 }
 
 auto backlog_ready() -> bool { return ready.load(std::memory_order_acquire); }
+
+auto backlog_rescue_needed(uint64_t min_queue_depth) -> bool {
+    if (!ready.load(std::memory_order_acquire) || queues == nullptr) {
+        return false;
+    }
+
+    for (uint64_t cpu_idx = 0; cpu_idx < num_cpus; ++cpu_idx) {
+        auto& q = queues[cpu_idx];
+        uint64_t const QUEUED = q.depth.load(std::memory_order_acquire);
+        if (QUEUED >= min_queue_depth && !q.consumer_active.load(std::memory_order_acquire)) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 void backlog_get_snapshot(BacklogSnapshot& out) {
     out = {};
@@ -363,6 +452,18 @@ void backlog_get_snapshot(BacklogSnapshot& out) {
         row.queued = q.depth.load(std::memory_order_relaxed);
         row.handler_active = q.handler_active.load(std::memory_order_acquire);
         row.consumer_active = q.consumer_active.load(std::memory_order_acquire);
+        row.consumer_owner_pid = q.consumer_owner_pid.load(std::memory_order_acquire);
+        row.consumer_owner_cpu = q.consumer_owner_cpu.load(std::memory_order_acquire);
+        row.consumer_owner_site = q.consumer_owner_site.load(std::memory_order_acquire);
+        row.consumer_start_us = q.consumer_start_us.load(std::memory_order_acquire);
+        row.consumer_batch = q.consumer_batch.load(std::memory_order_acquire);
+        row.consumer_normal = q.consumer_normal.load(std::memory_order_acquire);
+        row.consumer_wki = q.consumer_wki.load(std::memory_order_acquire);
+        row.consumer_stage = q.consumer_stage.load(std::memory_order_acquire);
+        if (row.consumer_active && row.consumer_start_us != 0) {
+            uint64_t const NOW_US = ker::mod::time::get_us();
+            row.consumer_hold_us = NOW_US >= row.consumer_start_us ? NOW_US - row.consumer_start_us : 0;
+        }
         if (q.handler != nullptr) {
             row.handler_pid = q.handler->pid;
             row.handler_cpu = q.handler->cpu;
