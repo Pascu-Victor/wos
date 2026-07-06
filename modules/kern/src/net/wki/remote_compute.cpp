@@ -1620,12 +1620,71 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
             }
             return false;
         };
+        auto path_has_component = [](const char* path, const char* component) -> bool {
+            if (path == nullptr || component == nullptr || component[0] == '\0') {
+                return false;
+            }
+            size_t const COMPONENT_LEN = std::strlen(component);
+            const char* cursor = path;
+            while (*cursor != '\0') {
+                while (*cursor == '/') {
+                    ++cursor;
+                }
+                const char* start = cursor;
+                while (*cursor != '\0' && *cursor != '/') {
+                    ++cursor;
+                }
+                auto const LEN = static_cast<size_t>(cursor - start);
+                if (LEN == COMPONENT_LEN && std::strncmp(start, component, COMPONENT_LEN) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto path_has_component_suffix = [](const char* path, const char* suffix) -> bool {
+            if (path == nullptr || suffix == nullptr || suffix[0] == '\0') {
+                return false;
+            }
+            size_t const SUFFIX_LEN = std::strlen(suffix);
+            const char* cursor = path;
+            while (*cursor != '\0') {
+                while (*cursor == '/') {
+                    ++cursor;
+                }
+                const char* start = cursor;
+                while (*cursor != '\0' && *cursor != '/') {
+                    ++cursor;
+                }
+                auto const LEN = static_cast<size_t>(cursor - start);
+                if (LEN >= SUFFIX_LEN && std::strncmp(cursor - SUFFIX_LEN, suffix, SUFFIX_LEN) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto is_generated_build_tree_executable = [&base_name, &path_has_component, &path_has_component_suffix](const char* path) -> bool {
+            if (path == nullptr || path[0] == '\0') {
+                return false;
+            }
+            if (path_has_component(path, "build") || path_has_component(path, "CMakeFiles") || path_has_component(path, "meson-private")) {
+                return true;
+            }
+            if (path_has_component_suffix(path, "-build")) {
+                return true;
+            }
+            const char* base = base_name(path);
+            return std::strncmp(base, "cmTC_", 5) == 0;
+        };
         if (is_git_helper(task->name) || is_git_helper(task->exe_path.data()) ||
             std::strstr(task->exe_path.data(), "/git-core/") != nullptr) {
             return WkiRemoteSpawnResult::LOCAL;
         }
         if (is_toolchain_driver_helper(task->name) || is_toolchain_driver_helper(task->exe_path.data())) {
             log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "toolchain-helper");
+            return WkiRemoteSpawnResult::LOCAL;
+        }
+        if (is_generated_build_tree_executable(task->exe_path.data())) {
+            log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "generated-build-exe");
             return WkiRemoteSpawnResult::LOCAL;
         }
 
