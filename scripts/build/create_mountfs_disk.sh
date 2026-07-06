@@ -3,7 +3,7 @@
 # Uses usr-merge layout: real dirs under /usr/, compat symlinks at /.
 #
 # Layout:
-#   /usr/lib/       ← shared libraries (libc.so, libc++.so, ld.so, etc.) + CRT objects
+#   /usr/lib/       ← shared/static libraries (libc.so, libc.a, libc++.a, ld.so, etc.) + CRT objects
 #   /usr/include/   ← sysroot headers
 #   /usr/bin/       ← busybox + applets, dropbearmulti + applets, perf, testprog, wkictl
 #   /usr/sbin/      ← httpd, netd

@@ -191,7 +191,7 @@ rootfs_stage_sysroot_libs() {
     fi
 
     mkdir -p "$ROOTFS_STAGING/usr/lib"
-    for file in "$sysroot_lib"/*.so "$sysroot_lib"/*.so.* "$sysroot_lib"/crt*.o "$sysroot_lib"/Scrt1.o "$sysroot_lib"/ld.so; do
+    for file in "$sysroot_lib"/*.a "$sysroot_lib"/*.so "$sysroot_lib"/*.so.* "$sysroot_lib"/crt*.o "$sysroot_lib"/Scrt1.o "$sysroot_lib"/ld.so; do
         [ -e "$file" ] || continue
         rootfs_copy_entry "$file" "/usr/lib/$(basename "$file")"
     done

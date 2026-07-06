@@ -194,7 +194,7 @@ class RootfsDelta:
         if not lib.is_dir():
             return
         names: set[Path] = set()
-        for pattern in ("*.so", "*.so.*", "crt*.o", "Scrt1.o", "ld.so"):
+        for pattern in ("*.a", "*.so", "*.so.*", "crt*.o", "Scrt1.o", "ld.so"):
             names.update(lib.glob(pattern))
         for source in sorted(names):
             self.add_source(source, f"/usr/lib/{source.name}")
