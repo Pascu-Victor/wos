@@ -20,6 +20,7 @@
 #include <net/wki/wki.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
+#include <platform/init/limine_requests.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/phys.hpp>
@@ -78,7 +79,88 @@ std::deque<PendingTaskCompletion> g_pending_task_completions;  // NOLINT(cppcore
 uint32_t g_next_task_id = 1;                                   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_remote_compute_initialized = false;                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 uint64_t g_last_load_report_us = 0;                            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint16_t g_preferred_remote_cursor = 0;                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
+    if (cmdline == nullptr || token == nullptr || token[0] == '\0') {
+        return false;
+    }
+    size_t const TOKEN_LEN = std::strlen(token);
+    const char* cursor = cmdline;
+    while (*cursor != '\0') {
+        while (*cursor == ' ' || *cursor == '\t') {
+            ++cursor;
+        }
+        const char* start = cursor;
+        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
+            ++cursor;
+        }
+        if (std::cmp_equal(cursor - start, TOKEN_LEN) && std::strncmp(start, token, TOKEN_LEN) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto spawn_diag_enabled() -> bool {
+    static std::atomic<int> cached{-1};
+    int value = cached.load(std::memory_order_acquire);
+    if (value >= 0) {
+        return value != 0;
+    }
+    int const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.spawn_diag") ? 1 : 0;
+    cached.store(ENABLED, std::memory_order_release);
+    return ENABLED != 0;
+}
+
+auto spawn_diag_result_name(WkiRemoteSpawnResult result) -> const char* {
+    switch (result) {
+        case WkiRemoteSpawnResult::LOCAL:
+            return "local";
+        case WkiRemoteSpawnResult::REMOTE:
+            return "remote";
+        case WkiRemoteSpawnResult::FAILED:
+            return "failed";
+    }
+    return "unknown";
+}
+
+auto spawn_diag_fd_kind(ker::mod::sched::task::Task* task, uint64_t fd) -> const char* {
+    if (task == nullptr) {
+        return "no-task";
+    }
+    const char* kind = "closed";
+    uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
+    auto* file = static_cast<ker::vfs::File*>(task->fd_table.lookup(fd));
+    if (file != nullptr) {
+        if (ker::vfs::vfs_is_pipe_file(file)) {
+            kind = "local-pipe";
+        } else if (ker::vfs::vfs_is_epoll_file(file)) {
+            kind = "epoll";
+        } else {
+            kind = "file";
+        }
+    }
+    task->fd_table_lock.unlock_irqrestore(IRQF);
+    return kind;
+}
+
+void log_spawn_diag(ker::mod::sched::task::Task* task, WkiRemoteSpawnResult result, const char* reason, uint16_t node = WKI_NODE_INVALID) {
+    if (!spawn_diag_enabled() || task == nullptr) {
+        return;
+    }
+    const char* const TARGET = task->wki_target_hostname.front() != '\0' ? task->wki_target_hostname.data() : "<auto>";
+    const char* const SUBMITTER = task->wki_submitter_hostname.front() != '\0' ? task->wki_submitter_hostname.data() : "<local>";
+    const char* const NAME = task->name != nullptr ? task->name : "?";
+    ker::mod::dbg::log(
+        "[WKI-SPAWN] result=%s reason=%s pid=0x%lx name=%s exe='%s' target=%s flags=0x%x submitter=%s remote_pid=0x%lx skip=%u "
+        "has_path=%u has_inline=%u fd0=%s fd1=%s node=0x%04x",
+        spawn_diag_result_name(result), reason != nullptr ? reason : "?", task->pid, NAME, task->exe_path.data(), TARGET,
+        task->wki_target_flags, SUBMITTER, task->wki_remote_pid, task->wki_skip_legacy_placement ? 1U : 0U,
+        task->exe_path.front() != '\0' ? 1U : 0U, task->elf_buffer != nullptr && task->elf_buffer_size != 0 ? 1U : 0U,
+        spawn_diag_fd_kind(task, 0), spawn_diag_fd_kind(task, 1), node);
+}
+
+uint16_t g_preferred_remote_cursor = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::array<ker::mod::sched::CpuAccountingSnapshot, WKI_LOAD_REPORT_MAX_CPUS>
     g_last_local_cpu_accounting{};         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_last_local_cpu_accounting_valid{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -1471,17 +1553,20 @@ void wki_remote_compute_init() {
 
 auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpawnSpec& spec) -> WkiRemoteSpawnResult {
     if (!g_remote_compute_initialized || task == nullptr) {
+        log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "not-initialized");
         return WkiRemoteSpawnResult::LOCAL;
     }
 
     const bool HAS_EXE_PATH = task->exe_path.front() != '\0';
     const bool HAS_INLINE_BINARY = task->elf_buffer != nullptr && task->elf_buffer_size != 0;
     if (!HAS_EXE_PATH && !HAS_INLINE_BINARY) {
+        log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "no-exec-context");
         return WkiRemoteSpawnResult::LOCAL;
     }
 
     // WKI_TARGET_FLAG_LOCAL: task is pinned to the local node.
     if ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL) != 0) {
+        log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "local-flag");
         return WkiRemoteSpawnResult::LOCAL;
     }
 
@@ -1493,15 +1578,78 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     const bool REMOTE_RECEIVER =
         task->wki_submitter_hostname.front() != '\0' && std::strcmp(task->wki_submitter_hostname.data(), wki_local_hostname()) != 0;
 
+    if (AUTOMATIC_PLACEMENT) {
+        auto base_name = [](const char* name) -> const char* {
+            if (name == nullptr || name[0] == '\0') {
+                return "";
+            }
+            const char* base = name;
+            for (const char* cursor = name; *cursor != '\0'; ++cursor) {
+                if (*cursor == '/') {
+                    base = cursor + 1;
+                }
+            }
+            return base;
+        };
+        auto is_git_helper = [&base_name](const char* name) -> bool {
+            const char* base = base_name(name);
+            return std::strcmp(base, "git") == 0 || std::strncmp(base, "git-", 4) == 0;
+        };
+        auto is_toolchain_driver_helper = [&base_name](const char* name) -> bool {
+            const char* base = base_name(name);
+            if (base[0] == '\0') {
+                return false;
+            }
+            constexpr std::array<const char*, 27> EXACT_LOCAL_TOOLS = {
+                "sh",          "bash",    "dash",         "cmake", "ninja",    "make",     "gmake",     "clang-tidy-cache",
+                "cc",          "c++",     "gcc",          "g++",   "clang",    "clang++",  "clang-cpp", "nasm",
+                "as",          "ld",      "ld.lld",       "lld",   "lld-link", "ld64.lld", "wasm-ld",   "llvm-ar",
+                "llvm-ranlib", "llvm-nm", "llvm-objcopy",
+            };
+            for (const char* tool : EXACT_LOCAL_TOOLS) {
+                if (std::strcmp(base, tool) == 0) {
+                    return true;
+                }
+            }
+            if (std::strncmp(base, "llvm-", 5) == 0) {
+                return true;
+            }
+            if (std::strncmp(base, "clang-", 6) == 0) {
+                char const NEXT = base[6];
+                return NEXT >= '0' && NEXT <= '9';
+            }
+            return false;
+        };
+        if (is_git_helper(task->name) || is_git_helper(task->exe_path.data()) ||
+            std::strstr(task->exe_path.data(), "/git-core/") != nullptr) {
+            return WkiRemoteSpawnResult::LOCAL;
+        }
+        if (is_toolchain_driver_helper(task->name) || is_toolchain_driver_helper(task->exe_path.data())) {
+            log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "toolchain-helper");
+            return WkiRemoteSpawnResult::LOCAL;
+        }
+
+        bool stdin_is_pipe = false;
+        uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
+        auto* stdin_file = static_cast<ker::vfs::File*>(task->fd_table.lookup(0));
+        stdin_is_pipe = ker::vfs::vfs_is_pipe_file(stdin_file);
+        task->fd_table_lock.unlock_irqrestore(IRQF);
+        if (stdin_is_pipe) {
+            return WkiRemoteSpawnResult::LOCAL;
+        }
+    }
+
     // A task that was already submitted from another node stays on its receiver
     // for automatic follow-on execs. Explicit targets and remote-preferred
     // policies are an opt-in fan-out path used by distributed launchers.
     if (REMOTE_RECEIVER && !EXPLICIT_TARGET && !PREFER_REMOTE) {
+        log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "remote-receiver-auto");
         return WkiRemoteSpawnResult::LOCAL;
     }
 
     // Don't bounce tasks that are already remote-receiver instances.
     if (std::strncmp(task->name, "wki-remote", 10) == 0) {
+        log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "wki-remote-task");
         return WkiRemoteSpawnResult::LOCAL;
     }
 
@@ -1521,6 +1669,7 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
             }
         });
         if (must_stay_local) {
+            log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "epoll-fd");
             return WkiRemoteSpawnResult::LOCAL;
         }
     }
@@ -1530,17 +1679,22 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     uint16_t best_node = WKI_NODE_INVALID;
     if (EXPLICIT_TARGET) {
         if (std::strncmp(task->wki_target_hostname.data(), wki_local_hostname(), task->wki_target_hostname.size()) == 0) {
+            log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "explicit-local-target");
             return WkiRemoteSpawnResult::LOCAL;
         }
 
         uint16_t const NODE_ID = wki_peer_find_by_hostname(task->wki_target_hostname.data());
         if (NODE_ID == WKI_NODE_INVALID) {
-            return STRICT_TARGET ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
+            WkiRemoteSpawnResult const RESULT = STRICT_TARGET ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
+            log_spawn_diag(task, RESULT, "target-not-found");
+            return RESULT;
         }
 
         auto* peer = wki_peer_find(NODE_ID);
         if (peer == nullptr || peer->state != PeerState::CONNECTED) {
-            return STRICT_TARGET ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
+            WkiRemoteSpawnResult const RESULT = STRICT_TARGET ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
+            log_spawn_diag(task, RESULT, "target-not-connected", NODE_ID);
+            return RESULT;
         }
 
         best_node = NODE_ID;
@@ -1551,7 +1705,9 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
             s_compute_lock.unlock();
         }
         if (best_node == WKI_NODE_INVALID) {
-            return STRICT_REMOTE ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
+            WkiRemoteSpawnResult const RESULT = STRICT_REMOTE ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
+            log_spawn_diag(task, RESULT, "remote-preferred-no-node");
+            return RESULT;
         }
     } else {
         uint16_t const LOCAL_LOAD = compute_local_load();
@@ -1559,6 +1715,7 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
         best_node = wki_least_loaded_node(LOCAL_LOAD);
         s_compute_lock.unlock();
         if (best_node == WKI_NODE_INVALID) {
+            log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "automatic-no-node");
             return WkiRemoteSpawnResult::LOCAL;
         }
     }
@@ -1633,7 +1790,9 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
 
     if (tid == 0) {
         wki_ipc_cleanup_exported_fds(ipc_fd_map.data(), ipc_fd_count, best_node);
-        return STRICT_TARGET ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
+        WkiRemoteSpawnResult const RESULT = STRICT_TARGET ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
+        log_spawn_diag(task, RESULT, "submit-failed", best_node);
+        return RESULT;
     }
 
     if (task->is_elf_buffer_shared) {
@@ -1703,6 +1862,7 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
 #ifdef WKI_DEBUG
     ker::mod::dbg::log("[WKI] Task '%s' (pid=0x%lx) placed as proxy on node 0x%04x (task_id=%u)", task->name, task->pid, best_node, tid);
 #endif
+    log_spawn_diag(task, WkiRemoteSpawnResult::REMOTE, "submitted", best_node);
     return WkiRemoteSpawnResult::REMOTE;
 }
 
