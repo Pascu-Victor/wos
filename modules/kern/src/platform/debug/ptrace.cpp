@@ -605,6 +605,8 @@ auto write_regset(Task& target, uint64_t data) -> uint64_t {
         }
         std::memcpy(target.fx_state.aligned(), io->buffer, ker::mod::sched::task::FxState::XSAVE_AREA_SIZE);
         target.fx_state.saved = true;
+        target.fx_state.live_saved = true;
+        target.fx_state.initialized = true;
         return 0;
     }
     return as_error(EINVAL);
