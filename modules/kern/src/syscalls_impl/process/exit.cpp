@@ -379,7 +379,7 @@ void publish_process_exit_request(ker::mod::sched::task::Task* task, int status,
     ker::mod::sched::wake_task_for_signal(task);
 }
 
-void request_thread_group_exit_from_thread(ker::mod::sched::task::Task* initiator, int status, int wait_status) {
+void request_thread_group_exit(ker::mod::sched::task::Task* initiator, int status, int wait_status) {
     if (initiator == nullptr) {
         return;
     }
@@ -409,8 +409,8 @@ namespace {
         log::error("process exit without current task: status=%d wait_status=%d", status, wait_status);
         hcf();
     }
+    request_thread_group_exit(current_task, status, wait_status);
     if (current_task->is_thread) {
-        request_thread_group_exit_from_thread(current_task, status, wait_status);
         ker::syscall::multiproc::wos_thread_exit_current();
     }
 

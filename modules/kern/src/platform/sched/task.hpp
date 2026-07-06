@@ -391,6 +391,10 @@ struct Task {
     }
 
     auto has_interrupting_signal_pending() -> bool {
+        if (process_exit_requested.load(std::memory_order_acquire)) {
+            return true;
+        }
+
         for (;;) {
             uint64_t const DELIVERABLE = signal_deliverable_bits();
             if (DELIVERABLE == 0) {
