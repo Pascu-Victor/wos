@@ -72,6 +72,20 @@ auto is_wki_execve_proxy_wait(const Task& task) -> bool {
 
 auto is_wki_execve_proxy_handoff(const Task& task) -> bool { return task.deferred_task_switch && is_wki_execve_proxy_wait(task); }
 
+auto deferred_switch_is_sched_yield(const Task& task) -> bool {
+    return task.yield_switch && task.wait_channel != nullptr && task.wait_channel_kind == ker::mod::sched::task::WaitChannelKind::GENERIC &&
+           std::strcmp(task.wait_channel, "sched_yield") == 0;
+}
+
+auto is_waitpid_publish_in_progress(const Task& task) -> bool {
+    return task.waitpid_publish_pending.load(std::memory_order_acquire) && task.waiting_for_pid != 0;
+}
+
+auto should_suppress_deferred_syscall_exit_stop(const Task& task) -> bool {
+    return is_wki_execve_proxy_handoff(task) || is_waitpid_publish_in_progress(task) ||
+           (task.deferred_task_switch && !deferred_switch_is_sched_yield(task));
+}
+
 auto should_wake_after_trace_clear(const Task& target, bool was_stopped, bool was_ptrace_wait) -> bool {
     return (was_stopped || was_ptrace_wait) && !is_wki_execve_proxy_wait(target);
 }
@@ -1175,7 +1189,7 @@ auto report_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum, bool exit
         if (!task->ptrace_syscall_in_stop) {
             return false;
         }
-        if (is_wki_execve_proxy_handoff(*task)) {
+        if (should_suppress_deferred_syscall_exit_stop(*task)) {
             task->ptrace_syscall_in_stop = false;
             return false;
         }
@@ -1278,14 +1292,36 @@ auto ptrace_selftest_syscall_snapshot_patches_live_sysret_state() -> bool {
     return OK;
 }
 
-auto ptrace_selftest_wki_execve_proxy_suppresses_syscall_exit_stop() -> bool {
+auto ptrace_selftest_deferred_syscall_exit_stop_suppression() -> bool {
+    Task waitpid{};
+    waitpid.deferred_task_switch = true;
+    waitpid.set_wait_channel("waitpid", ker::mod::sched::task::WaitChannelKind::WAITPID);
+
+    bool ok = should_suppress_deferred_syscall_exit_stop(waitpid);
+
+    Task waitpid_publishing{};
+    waitpid_publishing.waitpid_publish_pending.store(true, std::memory_order_relaxed);
+    waitpid_publishing.waiting_for_pid = WAIT_ANY_CHILD;
+    ok = ok && should_suppress_deferred_syscall_exit_stop(waitpid_publishing);
+
+    Task yielded{};
+    yielded.deferred_task_switch = true;
+    yielded.yield_switch = true;
+    yielded.set_wait_channel("sched_yield");
+    ok = ok && !should_suppress_deferred_syscall_exit_stop(yielded);
+
+    Task stale_yield_waitpid{};
+    stale_yield_waitpid.deferred_task_switch = true;
+    stale_yield_waitpid.yield_switch = true;
+    stale_yield_waitpid.set_wait_channel("waitpid", ker::mod::sched::task::WaitChannelKind::WAITPID);
+    ok = ok && should_suppress_deferred_syscall_exit_stop(stale_yield_waitpid);
+
     Task target{};
 
     target.deferred_task_switch = true;
     target.wki_proxy_task_id = 42;
     target.set_wait_channel("wki_execve_proxy", ker::mod::sched::task::WaitChannelKind::WKI_EXECVE_PROXY);
-
-    bool ok = is_wki_execve_proxy_handoff(target);
+    ok = ok && is_wki_execve_proxy_handoff(target) && should_suppress_deferred_syscall_exit_stop(target);
 
     target.set_wait_channel("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
     ok = ok && !is_wki_execve_proxy_handoff(target);
