@@ -7644,6 +7644,19 @@ auto vfs_chmod(const char* path, int mode) -> int {
     if (mount == nullptr) {
         return -ENOENT;
     }
+    if (mount->fs_type != FSType::REMOTE) {
+        std::array<char, MAX_PATH_LEN> resolved_path{};
+        int const RESOLVE_RET = resolve_symlinks(path_buffer.data(), resolved_path.data(), resolved_path.size(), true, true);
+        if (RESOLVE_RET < 0) {
+            return RESOLVE_RET;
+        }
+        std::memcpy(path_buffer.data(), resolved_path.data(), path_buffer.size());
+        mount_ref = find_mount_point(path_buffer.data());
+        mount = mount_ref.get();
+        if (mount == nullptr) {
+            return -ENOENT;
+        }
+    }
 
     const char* fs_path = strip_mount_prefix(mount, path_buffer.data());
 
