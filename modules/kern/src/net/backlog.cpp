@@ -230,6 +230,30 @@ void release_backlog_consumer(BacklogQueue& q) {
     }
 }
 
+auto drain_backlog_queue_inline(BacklogQueue& q, bool cooperative) -> int {
+    if (!try_acquire_backlog_consumer(q)) {
+        return 0;
+    }
+
+    PacketBuffer* batch = q.head.exchange(nullptr, std::memory_order_acquire);
+    if (batch == nullptr) {
+        mark_consumer_stage(q, BacklogConsumerStage::EMPTY);
+        release_backlog_consumer(q);
+        return 0;
+    }
+
+    PacketBuffer* normal_head = nullptr;
+    PacketBuffer* wki_head = nullptr;
+    int const QUEUE_DRAINED = prepare_backlog_batch(batch, q, normal_head, wki_head);
+    mark_consumer_batch(q, static_cast<uint64_t>(QUEUE_DRAINED), normal_head, wki_head);
+
+    mark_consumer_stage(q, BacklogConsumerStage::NORMAL);
+    process_packet_list(normal_head, cooperative);
+    release_backlog_consumer(q);
+    process_packet_list(wki_head, cooperative);
+    return QUEUE_DRAINED;
+}
+
 // Handler thread entry point (one per CPU). DAEMON type, pinned.
 void backlog_handler_loop(uint64_t cpu_idx) {
     for (;;) {
@@ -237,6 +261,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
             cpu_idx = 0;
         }
         auto& q = queues[cpu_idx];
+        q.handler_active.store(true, std::memory_order_release);
 
         if (!try_acquire_backlog_consumer(q)) {
             ker::mod::sched::kern_sleep_us(BACKLOG_CONSUMER_CONTENTION_SLEEP_US);
@@ -391,28 +416,7 @@ auto backlog_drain_all_pending_inline() -> int {
 
     int drained = 0;
     for (uint64_t cpu_idx = 0; cpu_idx < num_cpus; ++cpu_idx) {
-        auto& q = queues[cpu_idx];
-        if (!try_acquire_backlog_consumer(q)) {
-            continue;
-        }
-
-        PacketBuffer* batch = q.head.exchange(nullptr, std::memory_order_acquire);
-        if (batch == nullptr) {
-            mark_consumer_stage(q, BacklogConsumerStage::EMPTY);
-            release_backlog_consumer(q);
-            continue;
-        }
-
-        PacketBuffer* normal_head = nullptr;
-        PacketBuffer* wki_head = nullptr;
-        int const QUEUE_DRAINED = prepare_backlog_batch(batch, q, normal_head, wki_head);
-        drained += QUEUE_DRAINED;
-        mark_consumer_batch(q, static_cast<uint64_t>(QUEUE_DRAINED), normal_head, wki_head);
-
-        mark_consumer_stage(q, BacklogConsumerStage::NORMAL);
-        process_packet_list(normal_head, false);
-        release_backlog_consumer(q);
-        process_packet_list(wki_head, false);
+        drained += drain_backlog_queue_inline(queues[cpu_idx], false);
     }
 
     return drained;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <net/address.hpp>
@@ -19,6 +20,7 @@
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/init/limine_requests.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/spinlock.hpp>
 
@@ -101,6 +103,44 @@ bool s_roce_initialized = false;  // NOLINT(cppcoreguidelines-avoid-non-const-gl
 // -----------------------------------------------------------------------------
 // Region management
 // -----------------------------------------------------------------------------
+
+auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
+    if (cmdline == nullptr || token == nullptr || token[0] == '\0') {
+        return false;
+    }
+
+    size_t const TOKEN_LEN = std::strlen(token);
+    const char* cur = cmdline;
+    while (*cur != '\0') {
+        while (*cur == ' ' || *cur == '\t' || *cur == '\n') {
+            ++cur;
+        }
+        if (*cur == '\0') {
+            break;
+        }
+        const char* start = cur;
+        while (*cur != '\0' && *cur != ' ' && *cur != '\t' && *cur != '\n') {
+            ++cur;
+        }
+        auto const LEN = static_cast<size_t>(cur - start);
+        if (LEN == TOKEN_LEN && std::strncmp(start, token, TOKEN_LEN) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto roce_disabled() -> bool {
+    static std::atomic<int> cached{-1};
+    int const VALUE = cached.load(std::memory_order_acquire);
+    if (VALUE >= 0) {
+        return VALUE != 0;
+    }
+
+    bool const DISABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.no_roce");
+    cached.store(DISABLED ? 1 : 0, std::memory_order_release);
+    return DISABLED;
+}
 
 auto region_bucket_index(uint32_t rkey) -> size_t {
     constexpr uint64_t HASH_MULT = 0x9E3779B97F4A7C15ULL;
@@ -609,6 +649,11 @@ auto wki_roce_rdma_write_tagged(uint16_t neighbor_id, uint32_t rkey, uint64_t re
 // -----------------------------------------------------------------------------
 
 void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
+    if (roce_disabled()) {
+        pkt_free(pkt);
+        return;
+    }
+
     if (pkt->len < sizeof(RoceHeader)) {
         pkt_free(pkt);
         return;
@@ -741,6 +786,10 @@ void wki_roce_transport_init() {
     if (s_roce_initialized) {
         return;
     }
+    if (roce_disabled()) {
+        ker::mod::dbg::log("[WKI] RoCE RDMA transport disabled by cmdline");
+        return;
+    }
 
     s_region_buckets.fill(nullptr);
     s_next_rkey = 1;
@@ -766,6 +815,6 @@ void wki_roce_transport_init() {
     ker::mod::dbg::log("[WKI] RoCE RDMA transport initialized (L2, EtherType 0x%04x)", WKI_ETHERTYPE_ROCE);
 }
 
-auto wki_roce_transport_get() -> WkiTransport* { return s_roce_initialized ? &s_roce_transport : nullptr; }
+auto wki_roce_transport_get() -> WkiTransport* { return s_roce_initialized && !roce_disabled() ? &s_roce_transport : nullptr; }
 
 }  // namespace ker::net::wki

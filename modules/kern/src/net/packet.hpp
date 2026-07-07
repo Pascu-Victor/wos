@@ -108,6 +108,7 @@ void pkt_pool_expand_for_nics();       // Call after NIC drivers have registered
 auto pkt_pool_size() -> size_t;        // Get current pool size
 auto pkt_pool_free_count() -> size_t;  // Approximate free buffers available
 auto pkt_pool_snapshot() -> PacketPoolSnapshot;
+auto pkt_pool_try_snapshot(PacketPoolSnapshot& snapshot) -> bool;
 auto pkt_pool_reclaim_free(size_t target_capacity) -> PacketPoolReclaimStats;
 void pkt_pool_ensure_free(size_t min_free);
 auto pkt_alloc() -> PacketBuffer*;

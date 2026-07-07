@@ -484,6 +484,10 @@ auto wki_channel_diag_snapshot(WkiChannelDiag* out, size_t max) -> size_t;
 // Process heartbeats, retransmit timers, ACK delays
 void wki_timer_tick(uint64_t now_us);
 
+// Worker for blocking WKI deferred tasks such as auto-mounts and remote device
+// attaches. Timer ticks only wake this worker so peer liveness remains timely.
+void wki_deferred_work_thread_start();
+
 // Returns true when channel retransmits/ACKs or async wait deadlines require
 // the WKI timer thread to stay on its fast cadence.
 auto wki_has_fast_timer_work() -> bool;
@@ -540,6 +544,19 @@ struct WkiWaitEntry {
     uint64_t deadline_us = 0;                                 // Timeout deadline (0 = no timeout)
     WkiWaitEntry* next = nullptr;                             // Intrusive linked list
     WkiWaitEntry* prev = nullptr;
+
+    // Optional diagnostic metadata.  The wait core does not interpret these
+    // fields; callers fill them before wki_wait_for_op() so boot-gated wait
+    // diagnostics can name the stranded operation without changing wire ABI.
+    const char* diag_name = nullptr;
+    uint64_t diag_callsite = 0;
+    uint64_t diag_arg0 = 0;
+    uint64_t diag_arg1 = 0;
+    uint32_t diag_resource_id = 0;
+    uint16_t diag_op_id = 0;
+    uint16_t diag_peer = WKI_NODE_INVALID;
+    uint16_t diag_channel = 0;
+    uint16_t diag_cookie = 0;
 };
 
 // Default operation timeout: 15 seconds (allows for CPU-loaded VFS servers)

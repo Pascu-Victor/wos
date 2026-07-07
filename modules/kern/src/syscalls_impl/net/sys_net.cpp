@@ -5,9 +5,11 @@
 #include <bits/ssize_t.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <net/backlog.hpp>
 #include <net/endian.hpp>
 #include <net/netdevice.hpp>
@@ -21,6 +23,7 @@
 #include <new>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sys/usercopy.hpp>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -51,6 +54,9 @@ constexpr size_t WOS_FD_SETSIZE = 1024;
 constexpr size_t WOS_FD_SET_BYTES = WOS_FD_SETSIZE / 8;
 constexpr int64_t SELECT_USEC_PER_SEC = 1000000;
 constexpr int SELECT_TIMEOUT_MAX_MS = 0x7fffffff;
+constexpr size_t SOCKET_IO_BOUNCE_STACK_CHUNK = 4096;
+constexpr size_t SOCKET_IO_BOUNCE_MAX_CHUNK = size_t{256} * 1024;
+constexpr size_t SOCKADDR_STORAGE_MAX = 28;
 
 struct KPollFd {
     int32_t fd;
@@ -461,6 +467,85 @@ auto run_socket_call(ker::vfs::File* file, ker::net::Socket* sock, int call_flag
             return static_cast<T>(-EINTR);
         }
     }
+}
+
+auto socket_bounce_heap_or_stack(std::unique_ptr<uint8_t[]>& heap, uint8_t* stack, size_t stack_size, size_t size) -> uint8_t* {
+    if (size <= stack_size) {
+        return stack;
+    }
+
+    heap.reset(new (std::nothrow) uint8_t[size]);
+    return heap.get();
+}
+
+template <typename Fn>
+auto socket_send_user_bounced(ker::vfs::File* file, ker::net::Socket* sock, uint64_t user_addr, size_t count, int call_flags, Fn&& fn)
+    -> ssize_t {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (count != 0 && !ker::mod::sys::usercopy::range_valid(user_addr, count)) {
+        return -EFAULT;
+    }
+    if (count == 0) {
+        return run_socket_call<ssize_t>(file, sock, call_flags, [&](int flags) { return fn(nullptr, size_t{0}, flags); });
+    }
+
+    uint8_t stack_bounce[SOCKET_IO_BOUNCE_STACK_CHUNK];
+    size_t const TO_COPY = std::min(count, SOCKET_IO_BOUNCE_MAX_CHUNK);
+    std::unique_ptr<uint8_t[]> heap_bounce{};
+    uint8_t* const bounce = socket_bounce_heap_or_stack(heap_bounce, stack_bounce, sizeof(stack_bounce), TO_COPY);
+    if (bounce == nullptr) {
+        return -ENOMEM;
+    }
+    if (!ker::mod::sys::usercopy::copy_from_task(*task, user_addr, bounce, TO_COPY)) {
+        return -EFAULT;
+    }
+
+    ssize_t const RESULT =
+        clamp_io_count(run_socket_call<ssize_t>(file, sock, call_flags, [&](int flags) { return fn(bounce, TO_COPY, flags); }), TO_COPY);
+    checkpoint_blocking_socket_send_progress(file, sock, call_flags, RESULT);
+    return RESULT;
+}
+
+template <typename Fn>
+auto socket_recv_user_bounced(ker::vfs::File* file, ker::net::Socket* sock, uint64_t user_addr, size_t count, int call_flags, Fn&& fn)
+    -> ssize_t {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (count == 0) {
+        return 0;
+    }
+    if (!ker::mod::sys::usercopy::range_valid(user_addr, count)) {
+        return -EFAULT;
+    }
+
+    uint8_t stack_bounce[SOCKET_IO_BOUNCE_STACK_CHUNK];
+    size_t const TO_READ = std::min(count, SOCKET_IO_BOUNCE_MAX_CHUNK);
+    if (!ker::mod::sys::usercopy::ensure_writable(*task, user_addr, TO_READ)) {
+        return -EFAULT;
+    }
+
+    std::unique_ptr<uint8_t[]> heap_bounce{};
+    uint8_t* const bounce = socket_bounce_heap_or_stack(heap_bounce, stack_bounce, sizeof(stack_bounce), TO_READ);
+    if (bounce == nullptr) {
+        return -ENOMEM;
+    }
+
+    ssize_t const RESULT =
+        clamp_io_count(run_socket_call<ssize_t>(file, sock, call_flags, [&](int flags) { return fn(bounce, TO_READ, flags); }), TO_READ);
+    if (RESULT <= 0) {
+        return RESULT;
+    }
+
+    auto const BYTES_READ = static_cast<size_t>(RESULT);
+    if (!ker::mod::sys::usercopy::copy_to_task(*task, user_addr, bounce, BYTES_READ)) {
+        return -EFAULT;
+    }
+    return RESULT;
 }
 
 // Socket file operations (integrate sockets with VFS fd table)
@@ -961,12 +1046,10 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock->proto_ops == nullptr || sock->proto_ops->send == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            auto const RESULT = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&](int flags) {
-                return sock->proto_ops->send(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), flags);
-            });
-            ssize_t const CLAMPED = clamp_io_count(RESULT, static_cast<size_t>(a3));
-            checkpoint_blocking_socket_send_progress(handle.file, sock, static_cast<int>(a4), CLAMPED);
-            return static_cast<uint64_t>(CLAMPED);
+            ssize_t const RESULT = socket_send_user_bounced(
+                handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4),
+                [&](const void* buf, size_t len, int flags) { return sock->proto_ops->send(sock, buf, len, flags); });
+            return static_cast<uint64_t>(RESULT);
         }
 
         case ker::abi::net::ops::RECV: {
@@ -992,10 +1075,10 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock->proto_ops == nullptr || sock->proto_ops->recv == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            auto const RESULT = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&](int flags) {
-                return sock->proto_ops->recv(sock, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), flags);
-            });
-            return static_cast<uint64_t>(clamp_io_count(RESULT, static_cast<size_t>(a3)));
+            ssize_t const RESULT =
+                socket_recv_user_bounced(handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4),
+                                         [&](void* buf, size_t len, int flags) { return sock->proto_ops->recv(sock, buf, len, flags); });
+            return static_cast<uint64_t>(RESULT);
         }
 
         case ker::abi::net::ops::CLOSE: {
@@ -1014,14 +1097,24 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock->proto_ops == nullptr || sock->proto_ops->sendto == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            size_t alen = addr_len_for_domain(sock->domain);
-            auto const RESULT = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&](int flags) {
-                return sock->proto_ops->sendto(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), flags,
-                                               reinterpret_cast<const void*>(a5), alen);
-            });
-            ssize_t const CLAMPED = clamp_io_count(RESULT, static_cast<size_t>(a3));
-            checkpoint_blocking_socket_send_progress(handle.file, sock, static_cast<int>(a4), CLAMPED);
-            return static_cast<uint64_t>(CLAMPED);
+            std::array<uint8_t, SOCKADDR_STORAGE_MAX> addr_storage{};
+            size_t const ALEN = addr_len_for_domain(sock->domain);
+            const void* addr_ptr = nullptr;
+            if (a5 != 0) {
+                auto* task = ker::mod::sched::get_current_task();
+                if (task == nullptr) {
+                    return static_cast<uint64_t>(-ESRCH);
+                }
+                if (ALEN > addr_storage.size() || !ker::mod::sys::usercopy::copy_from_task(*task, a5, addr_storage.data(), ALEN)) {
+                    return static_cast<uint64_t>(-EFAULT);
+                }
+                addr_ptr = addr_storage.data();
+            }
+
+            ssize_t const RESULT = socket_send_user_bounced(
+                handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4),
+                [&](const void* buf, size_t len, int flags) { return sock->proto_ops->sendto(sock, buf, len, flags, addr_ptr, ALEN); });
+            return static_cast<uint64_t>(RESULT);
         }
 
         case ker::abi::net::ops::RECVFROM: {
@@ -1034,12 +1127,22 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock->proto_ops == nullptr || sock->proto_ops->recvfrom == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
+            std::array<uint8_t, SOCKADDR_STORAGE_MAX> addr_storage{};
             size_t alen = addr_len_for_domain(sock->domain);
-            auto const RESULT = run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&](int flags) {
-                return sock->proto_ops->recvfrom(sock, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), flags,
-                                                 reinterpret_cast<void*>(a5), &alen);
-            });
-            return static_cast<uint64_t>(clamp_io_count(RESULT, static_cast<size_t>(a3)));
+            void* addr_ptr = a5 != 0 ? addr_storage.data() : nullptr;
+            ssize_t const RESULT = socket_recv_user_bounced(
+                handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4),
+                [&](void* buf, size_t len, int flags) { return sock->proto_ops->recvfrom(sock, buf, len, flags, addr_ptr, &alen); });
+            if (RESULT >= 0 && a5 != 0) {
+                auto* task = ker::mod::sched::get_current_task();
+                if (task == nullptr) {
+                    return static_cast<uint64_t>(-ESRCH);
+                }
+                if (alen > addr_storage.size() || !ker::mod::sys::usercopy::copy_to_task(*task, a5, addr_storage.data(), alen)) {
+                    return static_cast<uint64_t>(-EFAULT);
+                }
+            }
+            return static_cast<uint64_t>(RESULT);
         }
 
         case ker::abi::net::ops::SETSOCKOPT: {

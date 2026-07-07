@@ -60,8 +60,25 @@ constexpr int POLLOUT = 0x0004;
 constexpr int POLLERR = 0x0008;
 constexpr int POLLHUP = 0x0010;
 constexpr int POLLRDHUP = 0x2000;
+constexpr uint16_t TCP_DIAG_SSH_PORT = 22;
 
 auto defer_socket_wait(Socket* sock) -> bool { return socket_defer_wait(sock, "tcp_wait"); }
+
+auto tcp_diag_ssh_tuple(uint16_t local_port, uint16_t remote_port) -> bool {
+    return ker::net::net_watchdog_enabled() && (local_port == TCP_DIAG_SSH_PORT || remote_port == TCP_DIAG_SSH_PORT);
+}
+
+void tcp_diag_log_local_close(const char* op, Socket* sock, TcpCB* cb, TcpState old_state, TcpState next_state, int how, bool send_fin) {
+    if (sock == nullptr || cb == nullptr || !tcp_diag_ssh_tuple(cb->local_port, cb->remote_port)) {
+        return;
+    }
+
+    log::warn("tcp-close-local op=%s how=%d state=%u current=%u next=%u local=0x%08x:%u remote=0x%08x:%u send_fin=%u "
+              "rcv_nxt=%u rcv_wnd=%u snd_una=%u snd_nxt=%u snd_wnd=%u rcvbuf=%zu/%zu owner=%llu",
+              op, how, static_cast<unsigned>(old_state), static_cast<unsigned>(cb->state), static_cast<unsigned>(next_state), cb->local_ip,
+              cb->local_port, cb->remote_ip, cb->remote_port, send_fin ? 1U : 0U, cb->rcv_nxt, cb->rcv_wnd, cb->snd_una, cb->snd_nxt,
+              cb->snd_wnd, sock->rcvbuf.available(), sock->rcvbuf.capacity, static_cast<unsigned long long>(sock->owner_pid));
+}
 
 std::atomic<uint32_t> iss_counter{0x12345678};
 uint64_t iss_secret = 0;
@@ -540,20 +557,28 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int flags) -> ssize_t {
 
     ssize_t completed = 0;
     auto maybe_finish_recv = [&]() -> bool {
+        bool update_window = false;
+        cb->lock.lock();
         if (sock->rcvbuf.available() > 0) {
             ssize_t const N = sock->rcvbuf.read(buf, len);
             if (N > 0) {
-                maybe_send_recv_window_update(cb, sock);
+                update_window = true;
             }
             completed = N;
+            cb->lock.unlock();
+            if (update_window) {
+                maybe_send_recv_window_update(cb, sock);
+            }
             return true;
         }
 
         // EOF states.
-        if (cb->state == TcpState::CLOSE_WAIT || cb->state == TcpState::CLOSED || cb->state == TcpState::TIME_WAIT ||
-            cb->state == TcpState::CLOSING || cb->state == TcpState::LAST_ACK) {
+        TcpState const STATE = cb->state;
+        cb->lock.unlock();
+        if (STATE == TcpState::CLOSE_WAIT || STATE == TcpState::CLOSED || STATE == TcpState::TIME_WAIT || STATE == TcpState::CLOSING ||
+            STATE == TcpState::LAST_ACK) {
 #ifdef TCP_DEBUG
-            log::trace("tcp_recv: pid=%lu eof state=%u len=%zu avail=%zu", current_pid(), static_cast<unsigned>(cb->state), len,
+            log::trace("tcp_recv: pid=%lu eof state=%u len=%zu avail=%zu", current_pid(), static_cast<unsigned>(STATE), len,
                        sock->rcvbuf.available());
 #endif
             completed = 0;
@@ -567,7 +592,10 @@ auto tcp_recv(Socket* sock, void* buf, size_t len, int flags) -> ssize_t {
         return completed;
     }
 
-    if (cb->state != TcpState::ESTABLISHED && cb->state != TcpState::FIN_WAIT_1 && cb->state != TcpState::FIN_WAIT_2) {
+    cb->lock.lock();
+    TcpState const STATE = cb->state;
+    cb->lock.unlock();
+    if (STATE != TcpState::ESTABLISHED && STATE != TcpState::FIN_WAIT_1 && STATE != TcpState::FIN_WAIT_2) {
         return -EAGAIN;
     }
 
@@ -613,6 +641,7 @@ void tcp_close_op(Socket* sock) {
 
     cb->lock.lock();
 
+    TcpState const OLD_STATE = cb->state;
     bool const WAS_LISTENER = (cb->state == TcpState::LISTEN);
     bool send_fin = false;
     TcpState next_state = cb->state;
@@ -654,6 +683,7 @@ void tcp_close_op(Socket* sock) {
         default:
             break;
     }
+    tcp_diag_log_local_close("close", sock, cb, OLD_STATE, next_state, -1, send_fin);
     cb->lock.unlock();
 
     if (send_fin) {
@@ -714,6 +744,7 @@ int tcp_shutdown_op(Socket* sock, int how) {
     for (;;) {
         cb->lock.lock();
         if (cb->state == TcpState::ESTABLISHED) {
+            tcp_diag_log_local_close("shutdown", sock, cb, cb->state, TcpState::FIN_WAIT_1, how, true);
             cb->lock.unlock();
             if (tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0)) {
                 cb->lock.lock();
@@ -722,6 +753,7 @@ int tcp_shutdown_op(Socket* sock, int how) {
                 return 0;
             }
         } else if (cb->state == TcpState::CLOSE_WAIT) {
+            tcp_diag_log_local_close("shutdown", sock, cb, cb->state, TcpState::LAST_ACK, how, true);
             cb->lock.unlock();
             if (tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0)) {
                 cb->lock.lock();

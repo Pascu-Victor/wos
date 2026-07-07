@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <utility>
@@ -28,40 +29,62 @@ namespace {
 constexpr int SO_BINDTODEVICE = 25;
 #endif
 
+void boot_trace(const char* message) {
+    if (message == nullptr) {
+        return;
+    }
+    size_t len = 0;
+    while (message[len] != '\0') {
+        len++;
+    }
+    (void)::write(STDERR_FILENO, message, len);
+}
+
 }  // namespace
 
 auto run_dhcp_client() -> int {
     const char* ifname = find_ifname_for_driver("dhcp", "eth0");
+    boot_trace("netd-boot: run_dhcp_client entered\n");
     logger::info("netd: starting DHCP client for %s", ifname);
+    boot_trace("netd-boot: after startup log\n");
 
     int const SOCK = socket(AF_INET, SOCK_DGRAM, 0);
+    boot_trace("netd-boot: after socket\n");
     if (SOCK < 0) {
         logger::error("netd: failed to create socket: %d", SOCK);
         return 1;
     }
 
     if (setsockopt(SOCK, SOL_SOCKET, SO_BINDTODEVICE, ifname, std::strlen(ifname) + 1) != 0) {
+        boot_trace("netd-boot: setsockopt failed\n");
         logger::error("netd: failed to bind DHCP socket to %s", ifname);
         close(SOCK);
         return 1;
     }
+    boot_trace("netd-boot: after SO_BINDTODEVICE\n");
 
     struct sockaddr_in bind_addr{};
     bind_addr.sin_family = AF_INET;
     bind_addr.sin_port = htons(68);
     bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(SOCK, reinterpret_cast<struct sockaddr*>(&bind_addr), sizeof(bind_addr)) < 0) {
+        boot_trace("netd-boot: bind failed\n");
         logger::error("netd: failed to bind to port 68");
         close(SOCK);
         return 1;
     }
+    boot_trace("netd-boot: after bind port 68\n");
 
     std::array<uint8_t, 6> mac{};
     {
+        boot_trace("netd-boot: before mac socket\n");
         int const TMP = socket(AF_INET, SOCK_DGRAM, 0);
+        boot_trace("netd-boot: after mac socket\n");
         if (TMP >= 0) {
             get_mac(TMP, ifname, mac);
+            boot_trace("netd-boot: after get_mac\n");
             close(TMP);
+            boot_trace("netd-boot: after close mac socket\n");
         }
     }
     logger::info("netd: MAC = %02x:%02x:%02x:%02x:%02x:%02x", std::get<0>(mac), std::get<1>(mac), std::get<2>(mac), std::get<3>(mac),
@@ -90,20 +113,26 @@ auto run_dhcp_client() -> int {
     if (local_hostname[0] != '\0') {
         logger::info("netd: DHCP client hostname: %s", local_hostname.data());
     }
+    boot_trace("netd-boot: before discover loop\n");
 
 nak_restart:
     bool got_offer = false;
     lease = {};
     for (int attempt = 0; attempt < MAX_DISCOVER_RETRIES && !got_offer; attempt++) {
+        boot_trace("netd-boot: discover attempt\n");
         logger::debug("netd: sending DISCOVER (attempt %d/%d)", attempt + 1, MAX_DISCOVER_RETRIES);
         size_t const PKT_LEN = build_discover(&pkt, mac, xid, local_hostname.data(), nullptr);
+        boot_trace("netd-boot: before DISCOVER sendto\n");
         ssize_t const SENT = sendto(SOCK, &pkt, PKT_LEN, 0, reinterpret_cast<struct sockaddr*>(&dst_addr), sizeof(dst_addr));
+        boot_trace("netd-boot: after DISCOVER sendto\n");
         if (std::cmp_not_equal(SENT, PKT_LEN)) {
             logger::warn("netd: DISCOVER sendto returned %zd expected %zu errno=%d", SENT, PKT_LEN, errno);
         }
 
         while (!got_offer) {
+            boot_trace("netd-boot: before recv_with_timeout\n");
             ssize_t const N = recv_with_timeout(SOCK, recv_buf.data(), recv_buf.size(), RECV_TIMEOUT_SECS);
+            boot_trace("netd-boot: after recv_with_timeout\n");
             if (N <= 0) {
                 break;
             }

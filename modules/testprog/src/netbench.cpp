@@ -226,7 +226,7 @@ auto recv_all_timeout(int fd, void* buf, size_t len, int timeout_ms) -> bool {
             return false;
         }
         errno = 0;
-        ssize_t const RET = recv(fd, dst + offset, len - offset, 0);
+        ssize_t const RET = read(fd, dst + offset, len - offset);
         if (RET < 0) {
             if (retryable_socket_result(RET)) {
                 continue;
@@ -259,7 +259,7 @@ auto send_all_timeout(int fd, const void* buf, size_t len, int timeout_ms) -> bo
             return false;
         }
         errno = 0;
-        ssize_t const RET = send(fd, src + offset, len - offset, 0);
+        ssize_t const RET = write(fd, src + offset, len - offset);
         if (RET < 0) {
             if (retryable_socket_result(RET)) {
                 continue;
@@ -412,6 +412,18 @@ void fill_payload(uint8_t* buf, uint32_t len) {
     }
 }
 
+auto payload_matches_pattern(const uint8_t* buf, uint32_t len) -> bool {
+    if (buf == nullptr) {
+        return len == 0;
+    }
+    for (uint32_t i = 0; i < len; ++i) {
+        if (buf[i] != static_cast<uint8_t>(i & 0xffU)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 auto handle_pingpong_server(int client_fd, const BenchHeader& header, int timeout_ms) -> bool {
     std::vector<uint8_t> buf(header.payload_size);
 
@@ -442,6 +454,11 @@ auto handle_stream_server(int client_fd, const BenchHeader& header, int timeout_
         }
         ok = recv_all_timeout(client_fd, buf.data(), chunk, timeout_ms);
         if (!ok) {
+            break;
+        }
+        if (!payload_matches_pattern(buf.data(), chunk)) {
+            std::println("netbench-server: stream payload mismatch after {} bytes", header.total_bytes - remaining);
+            ok = false;
             break;
         }
         remaining -= chunk;

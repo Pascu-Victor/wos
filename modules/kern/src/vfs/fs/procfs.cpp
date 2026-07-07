@@ -3003,6 +3003,22 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
         append_bool01(p, end, row.handler_active);
         append_sconst(p, end, " consumer=");
         append_bool01(p, end, row.consumer_active);
+        append_sconst(p, end, " owner_pid=");
+        append_dec64(p, end, row.consumer_owner_pid);
+        append_sconst(p, end, " owner_cpu=");
+        append_dec64(p, end, row.consumer_owner_cpu);
+        append_sconst(p, end, " owner_site=");
+        append_hex64(p, end, row.consumer_owner_site);
+        append_sconst(p, end, " hold_us=");
+        append_dec64(p, end, row.consumer_hold_us);
+        append_sconst(p, end, " stage=");
+        append_dec64(p, end, row.consumer_stage);
+        append_sconst(p, end, " batch=");
+        append_dec64(p, end, row.consumer_batch);
+        append_sconst(p, end, " normal=");
+        append_dec64(p, end, row.consumer_normal);
+        append_sconst(p, end, " wki=");
+        append_dec64(p, end, row.consumer_wki);
         append_char(p, end, '\n');
     }
 

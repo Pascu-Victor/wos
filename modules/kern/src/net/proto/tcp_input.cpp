@@ -8,6 +8,7 @@
 #include <net/address.hpp>
 #include <net/checksum.hpp>
 #include <net/endian.hpp>
+#include <net/netpoll.hpp>
 #include <net/net_trace.hpp>
 #include <net/packet.hpp>
 #include <net/proto/ipv4.hpp>
@@ -26,8 +27,13 @@ namespace {
 constexpr auto TCP_IPV4_TTL = static_cast<uint8_t>(IPV4_DEFAULT_TTL);
 constexpr size_t TCP_OOO_MAX_BYTES = static_cast<size_t>(1024U) * 1024U;
 constexpr size_t TCP_OOO_MAX_SEGMENTS = 512;
+constexpr uint16_t TCP_DIAG_SSH_PORT = 22;
 
 auto tcp_header_len(const TcpHeader* hdr) -> size_t { return static_cast<size_t>(hdr->data_offset >> 4U) * sizeof(uint32_t); }
+
+auto tcp_diag_ssh_tuple(uint16_t local_port, uint16_t remote_port) -> bool {
+    return ker::net::net_watchdog_enabled() && (local_port == TCP_DIAG_SSH_PORT || remote_port == TCP_DIAG_SSH_PORT);
+}
 
 auto read_be16_unaligned(const uint8_t* bytes) -> uint16_t {
     return static_cast<uint16_t>((static_cast<uint16_t>(bytes[0]) << 8U) | bytes[1]);
@@ -647,6 +653,20 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
     cb_lock_flags = cb->lock.lock_irqsave();
 
+    if (((flags & (TCP_FIN | TCP_RST)) != 0) && tcp_diag_ssh_tuple(cb->local_port, cb->remote_port)) {
+        size_t rcvbuf_used = 0;
+        size_t rcvbuf_capacity = 0;
+        if (cb->socket != nullptr) {
+            rcvbuf_used = cb->socket->rcvbuf.available();
+            rcvbuf_capacity = cb->socket->rcvbuf.capacity;
+        }
+        log::warn("tcp-close-rx state=%u local=0x%08x:%u remote=0x%08x:%u flags=0x%x seq=%u ack=%u payload=%zu "
+                  "rcv_nxt=%u rcv_wnd=%u snd_una=%u snd_nxt=%u snd_wnd=%u rcvbuf=%zu/%zu ooo=%zu",
+                  static_cast<unsigned>(cb->state), cb->local_ip, cb->local_port, cb->remote_ip, cb->remote_port, flags, SEG_SEQ,
+                  seg_ack, payload_len, cb->rcv_nxt, cb->rcv_wnd, cb->snd_una, cb->snd_nxt, cb->snd_wnd, rcvbuf_used,
+                  rcvbuf_capacity, cb->ooo_bytes.load(std::memory_order_acquire));
+    }
+
     switch (cb->state) {
         case TcpState::SYN_SENT: {
             if ((flags & TCP_ACK) != 0 && (flags & TCP_SYN) != 0) {
@@ -1104,13 +1124,10 @@ void tcp_rx(NetDevice* dev, PacketBuffer* pkt, IPv4Address src_ip, IPv4Address d
         return;
     }
 
-    uint16_t const STORED_CSUM = hdr->checksum;
-    if (STORED_CSUM != 0) {
-        uint16_t const COMPUTED = pseudo_header_checksum(src_ip, dst_ip, IPPROTO_TCP, pkt->data, pkt->len);
-        if (COMPUTED != 0 && COMPUTED != 0xFFFF) {
-            pkt_free(pkt);
-            return;
-        }
+    uint16_t const COMPUTED = pseudo_header_checksum(src_ip, dst_ip, IPPROTO_TCP, pkt->data, pkt->len);
+    if (COMPUTED != 0 && COMPUTED != 0xFFFF) {
+        pkt_free(pkt);
+        return;
     }
 
     uint16_t const DST_PORT = ntohs(hdr->dst_port);

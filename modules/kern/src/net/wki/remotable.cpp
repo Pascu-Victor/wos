@@ -127,7 +127,7 @@ auto has_local_subnet_overlap(uint32_t remote_ip, uint32_t remote_mask) -> bool 
 }
 
 auto is_local_l3_candidate(ker::net::NetDevice const* dev) -> bool {
-    if (dev == nullptr || dev->state == 0 || dev->wki_transport) {
+    if (dev == nullptr || dev->wki_transport) {
         return false;
     }
     if (std::strncmp(dev->name.data(), "lo", ker::net::NETDEV_NAME_LEN) == 0) {
@@ -959,10 +959,16 @@ void wki_remotable_process_pending_net_attaches() {
                 continue;
             }
 
+            uint32_t remote_ipv4_addr = 0;
+            uint32_t remote_ipv4_mask = 0;
             s_remotable_lock.lock();
             DiscoveredResource const* live_resource = find_resource_unlocked(pending.node_id, ResourceType::NET, pending.resource_id);
             bool const RESOURCE_LIVE = live_resource != nullptr;
             bool const RESOURCE_READY = RESOURCE_LIVE && net_resource_ready(*live_resource);
+            if (RESOURCE_READY) {
+                remote_ipv4_addr = live_resource->net_ipv4_addr;
+                remote_ipv4_mask = live_resource->net_ipv4_mask;
+            }
             s_remotable_lock.unlock();
             if (!RESOURCE_LIVE) {
                 log::debug("Skipping stale NET auto-attach: node=0x%04x res_id=%u nic=%s", pending.node_id, pending.resource_id,
@@ -991,9 +997,12 @@ void wki_remotable_process_pending_net_attaches() {
                 continue;
             }
 
-            // ATTACH_SPARSE: subnet overlap check is done after attach (since we need
-            // the ACK to get IP info). For ATTACH_ALL, skip the check entirely.
-            // The actual subnet check happens post-attach: if overlap is found, we detach.
+            if (g_wki.nic_policy == WkiNicPolicy::ATTACH_SPARSE && has_local_subnet_overlap(remote_ipv4_addr, remote_ipv4_mask)) {
+                ker::mod::dbg::log("[WKI] Skipping remote NIC %s from %s: subnet overlap", pending.nic_name.data(),
+                                   pending.hostname.data());
+                continue;
+            }
+
             ker::net::NetDevice* proxy_dev = wki_remote_net_attach(pending.node_id, pending.resource_id, pending.nic_name.data());
             if (proxy_dev == nullptr) {
                 bool const REQUEUED = requeue_net_attach(pending);

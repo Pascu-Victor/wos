@@ -5,8 +5,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <iterator>
+#include <dev/virtio/virtio_net.hpp>
 #include <net/address.hpp>
+#include <net/backlog.hpp>
+#include <net/netdevice.hpp>
+#include <net/netpoll.hpp>
+#include <net/packet.hpp>
+#include <net/proto/tcp.hpp>
 #include <net/wki/dev_proxy.hpp>
 #include <net/wki/dev_server.hpp>
 #include <net/wki/event.hpp>
@@ -42,6 +47,145 @@ using log = ker::mod::dbg::logger<"wki">;
 namespace {
 constexpr size_t HELLO_CHANNEL_EPOCH_OFFSET = 0;
 constexpr size_t HELLO_BOOT_EPOCH_OFFSET = HELLO_CHANNEL_EPOCH_OFFSET + sizeof(uint32_t);
+constexpr uint64_t HEARTBEAT_NETDIAG_INTERVAL_US = 5'000'000;
+constexpr size_t HEARTBEAT_NETDIAG_VIRTIO_ROWS = 16;
+constexpr size_t HEARTBEAT_NETDIAG_TCP_LISTENERS = 8;
+constexpr size_t HEARTBEAT_NETDIAG_TCP_CONNS = 16;
+
+std::atomic<uint64_t> g_next_heartbeat_netdiag_us{0};
+
+auto heartbeat_netdiag_tcp_state_name(uint8_t state) -> const char* {
+    switch (static_cast<ker::net::proto::TcpState>(state)) {
+        case ker::net::proto::TcpState::CLOSED:
+            return "CLOSED";
+        case ker::net::proto::TcpState::LISTEN:
+            return "LISTEN";
+        case ker::net::proto::TcpState::SYN_SENT:
+            return "SYN_SENT";
+        case ker::net::proto::TcpState::SYN_RECEIVED:
+            return "SYN_RECEIVED";
+        case ker::net::proto::TcpState::ESTABLISHED:
+            return "ESTABLISHED";
+        case ker::net::proto::TcpState::FIN_WAIT_1:
+            return "FIN_WAIT_1";
+        case ker::net::proto::TcpState::FIN_WAIT_2:
+            return "FIN_WAIT_2";
+        case ker::net::proto::TcpState::CLOSE_WAIT:
+            return "CLOSE_WAIT";
+        case ker::net::proto::TcpState::CLOSING:
+            return "CLOSING";
+        case ker::net::proto::TcpState::LAST_ACK:
+            return "LAST_ACK";
+        case ker::net::proto::TcpState::TIME_WAIT:
+            return "TIME_WAIT";
+    }
+    return "?";
+}
+
+auto heartbeat_netdiag_napi_state_name(uint8_t state) -> const char* {
+    switch (static_cast<ker::net::NapiState>(state)) {
+        case ker::net::NapiState::IDLE:
+            return "IDLE";
+        case ker::net::NapiState::SCHEDULED:
+            return "SCHEDULED";
+        case ker::net::NapiState::POLLING:
+            return "POLLING";
+        case ker::net::NapiState::DISABLED:
+            return "DISABLED";
+    }
+    return "?";
+}
+
+void log_heartbeat_netdiag(uint16_t peer_node_id, const char* phase, uint64_t elapsed_us, uint64_t now_us) {
+    uint64_t const NEXT_ALLOWED = g_next_heartbeat_netdiag_us.load(std::memory_order_relaxed);
+    if (now_us < NEXT_ALLOWED) {
+        return;
+    }
+    g_next_heartbeat_netdiag_us.store(now_us + HEARTBEAT_NETDIAG_INTERVAL_US, std::memory_order_relaxed);
+
+    auto const POOL = ker::net::pkt_pool_snapshot();
+    log::warn(
+        "hb-netdiag phase=%s peer=0x%04x elapsed=%llu pool capacity=%zu baseline=%zu active=%zu free=%zu used=%zu "
+        "draining=%zu draining_free=%zu tx_refused=%u expanding=%u",
+        phase, peer_node_id, elapsed_us, POOL.capacity, POOL.baseline_capacity, POOL.active_capacity, POOL.free, POOL.used,
+        POOL.draining_buffers, POOL.draining_free, POOL.tx_refused, POOL.expand_in_progress ? 1U : 0U);
+
+    ker::net::BacklogSnapshot backlog{};
+    ker::net::backlog_get_snapshot(backlog);
+    log::warn("hb-netdiag backlog ready=%u cpus=%llu queues=%zu queued=%llu", backlog.ready ? 1U : 0U, backlog.num_cpus,
+              backlog.queue_count, backlog.total_queued);
+    for (size_t i = 0; i < backlog.queue_count; ++i) {
+        auto const& row = backlog.queues.at(i);
+        if (row.queued == 0 && !row.handler_active && !row.consumer_active) {
+            continue;
+        }
+        log::warn(
+            "hb-netdiag backlog_cpu cpu=%llu queued=%llu handler_pid=%llu handler_cpu=%llu active=%u consumer=%u owner_pid=%llu "
+            "owner_cpu=%llu owner_site=0x%llx hold_us=%llu stage=%u batch=%llu normal=%llu wki=%llu",
+            row.cpu, row.queued, row.handler_pid, row.handler_cpu, row.handler_active ? 1U : 0U, row.consumer_active ? 1U : 0U,
+            row.consumer_owner_pid, row.consumer_owner_cpu, row.consumer_owner_site, row.consumer_hold_us,
+            static_cast<unsigned>(row.consumer_stage), row.consumer_batch, row.consumer_normal, row.consumer_wki);
+    }
+
+    std::array<ker::net::NetDeviceSnapshot, ker::net::MAX_NET_DEVICES> devs{};
+    size_t const DEV_COUNT = ker::net::netdev_snapshot(devs.data(), devs.size());
+    for (size_t i = 0; i < DEV_COUNT; ++i) {
+        auto const& dev = devs.at(i);
+        log::warn(
+            "hb-netdiag netdev name=%.*s ifindex=%u state=%u wki_transport=%u rx_forward=%u remotable=%u rx_packets=%llu "
+            "rx_bytes=%llu rx_dropped=%llu tx_packets=%llu tx_bytes=%llu tx_dropped=%llu",
+            static_cast<int>(ker::net::NETDEV_NAME_LEN), dev.name.data(), dev.ifindex, static_cast<unsigned>(dev.state),
+            dev.wki_transport ? 1U : 0U, dev.wki_rx_forward ? 1U : 0U, dev.remotable ? 1U : 0U, dev.rx_packets, dev.rx_bytes,
+            dev.rx_dropped, dev.tx_packets, dev.tx_bytes, dev.tx_dropped);
+    }
+
+    std::array<ker::dev::virtio::VirtIONetDiagSnapshot, HEARTBEAT_NETDIAG_VIRTIO_ROWS> virtio_rows{};
+    size_t const VIRTIO_COUNT = ker::dev::virtio::virtio_net_diag_snapshot(virtio_rows.data(), virtio_rows.size());
+    for (size_t i = 0; i < VIRTIO_COUNT; ++i) {
+        auto const& row = virtio_rows.at(i);
+        log::warn(
+            "hb-netdiag virtio name=%.*s ifindex=%u pair=%u active=%u napi=%s work=%u worker_pid=%llu worker_cpu=%llu "
+            "polls=%llu completes=%llu rx_free=%u rx_pending=%u rx_mapped=%u rx_avail=%u rx_used=%u rx_last=%u "
+            "tx_free=%u tx_pending=%u tx_mapped=%u tx_avail=%u tx_used=%u tx_last=%u",
+            static_cast<int>(ker::net::NETDEV_NAME_LEN), row.name.data(), row.ifindex, static_cast<unsigned>(row.pair),
+            row.active ? 1U : 0U, heartbeat_netdiag_napi_state_name(row.napi_state), row.napi_has_work ? 1U : 0U, row.napi_worker_pid,
+            row.napi_worker_cpu, row.napi_polls, row.napi_completes, row.rx.num_free, row.rx.pending, row.rx.mapped, row.rx.avail_idx,
+            row.rx.used_idx, row.rx.last_used_idx, row.tx.num_free, row.tx.pending, row.tx.mapped, row.tx.avail_idx, row.tx.used_idx,
+            row.tx.last_used_idx);
+    }
+    if (VIRTIO_COUNT == virtio_rows.size()) {
+        log::warn("hb-netdiag virtio_truncated max=%zu", virtio_rows.size());
+    }
+
+    std::array<ker::net::proto::TcpListenerSnapshot, HEARTBEAT_NETDIAG_TCP_LISTENERS> listeners{};
+    size_t const LISTENER_COUNT = ker::net::proto::tcp_listener_snapshot(listeners.data(), listeners.size());
+    for (size_t i = 0; i < LISTENER_COUNT; ++i) {
+        auto const& listener = listeners.at(i);
+        log::warn(
+            "hb-netdiag tcp_listener local=0x%08x:%u state=%s owner_pid=%llu accept_queue=%zu backlog=%d rcvbuf=%zu/%zu "
+            "rcv_wnd=%u refcnt=%u",
+            listener.local_ip, listener.local_port, heartbeat_netdiag_tcp_state_name(listener.state), listener.owner_pid,
+            listener.accept_queue, listener.backlog, listener.rcvbuf_used, listener.rcvbuf_capacity, listener.rcv_wnd, listener.refcount);
+    }
+    if (LISTENER_COUNT == listeners.size()) {
+        log::warn("hb-netdiag tcp_listener_truncated max=%zu", listeners.size());
+    }
+
+    std::array<ker::net::proto::TcpConnSnapshot, HEARTBEAT_NETDIAG_TCP_CONNS> conns{};
+    size_t const CONN_COUNT = ker::net::proto::tcp_conn_snapshot(conns.data(), conns.size());
+    for (size_t i = 0; i < CONN_COUNT; ++i) {
+        auto const& conn = conns.at(i);
+        log::warn(
+            "hb-netdiag tcp_conn local=0x%08x:%u remote=0x%08x:%u state=%s owner_pid=%llu rcvbuf=%zu/%zu rcv_nxt=%u "
+            "rcv_wnd=%u snd_una=%u snd_nxt=%u snd_wnd=%u ooo=%zu sack=%u refcnt=%u",
+            conn.local_ip, conn.local_port, conn.remote_ip, conn.remote_port, heartbeat_netdiag_tcp_state_name(conn.state), conn.owner_pid,
+            conn.rcvbuf_used, conn.rcvbuf_capacity, conn.rcv_nxt, conn.rcv_wnd, conn.snd_una, conn.snd_nxt, conn.snd_wnd, conn.ooo_bytes,
+            conn.sack_permitted ? 1U : 0U, conn.refcount);
+    }
+    if (CONN_COUNT == conns.size()) {
+        log::warn("hb-netdiag tcp_conn_truncated max=%zu", conns.size());
+    }
+}
 
 void hello_set_channel_epoch(HelloPayload* hello, uint32_t epoch) {
     if (hello == nullptr || HELLO_CHANNEL_EPOCH_OFFSET + sizeof(uint32_t) > hello->reserved.size()) {
@@ -1378,6 +1522,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
         if (peer.missed_beats == 0) {
             log::warn("Heartbeat timeout candidate for peer 0x%04x (%llu us elapsed, timeout %llu us); probing before fence", peer.node_id,
                       ELAPSED, TIMEOUT_US);
+            log_heartbeat_netdiag(peer.node_id, "candidate", ELAPSED, now_us);
             int const PROBE_RET = wki_send_heartbeat_probe(&peer);
             if (PROBE_RET < 0) {
                 log::warn("Heartbeat probe TX failed for peer 0x%04x (rc=%d); deferring fence confirmation", peer.node_id, PROBE_RET);
@@ -1400,6 +1545,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
                 uint8_t const NEXT_ROUND = peer.missed_beats + 1;
                 log::warn("Heartbeat still missing for peer 0x%04x (%llu us elapsed); probe round %u/%u before fence", peer.node_id,
                           ELAPSED, NEXT_ROUND, WKI_PEER_FENCE_PROBE_ROUNDS);
+                log_heartbeat_netdiag(peer.node_id, "reprobe", ELAPSED, now_us);
                 int const PROBE_RET = wki_send_heartbeat_probe(&peer);
                 if (PROBE_RET < 0) {
                     log::warn("Heartbeat re-probe TX failed for peer 0x%04x (rc=%d); deferring fence confirmation", peer.node_id,
@@ -1410,6 +1556,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
                 continue;
             }
             log::warn("Heartbeat timeout for peer 0x%04x (%llu us elapsed, timeout %llu us)", peer.node_id, ELAPSED, TIMEOUT_US);
+            log_heartbeat_netdiag(peer.node_id, "timeout", ELAPSED, now_us);
             wki_peer_fence(&peer);
         }
     }
@@ -1609,6 +1756,8 @@ auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
 }
 
 void wki_timer_thread_start() {
+    wki_deferred_work_thread_start();
+
     auto* task = mod::sched::task::Task::create_kernel_thread("wki_timer", wki_timer_thread);
     if (task == nullptr) {
         log::error("Failed to create WKI timer kernel thread");

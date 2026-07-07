@@ -30,6 +30,7 @@
 #include <new>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -37,6 +38,7 @@
 #include <ranges>
 #include <span>
 #include <util/hostname.hpp>
+#include <utility>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/vfs.hpp>
 
@@ -54,15 +56,22 @@ WkiState g_wki;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 namespace {
 
-// Re-entrancy guard for deferred work processed inside wki_timer_tick().
-// wki_remote_vfs_mount() spin-waits via wki_spin_yield() which calls
-// wki_timer_tick() recursively.  The guard prevents the deferred mount/
-// attach processing from re-entering itself while the outer call is
-// still blocked inside wki_wait_for_op().
+// Re-entrancy guard for deferred work kicked by wki_timer_tick().
+// wki_remote_vfs_mount() may spin-wait via wki_spin_yield(), which calls
+// wki_timer_tick() recursively.  The guard prevents deferred mount/attach
+// processing from re-entering itself while the worker is blocked inside
+// wki_wait_for_op().
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<bool> s_timer_deferred_running{false};
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<mod::sched::task::Task*> s_timer_deferred_task{nullptr};
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> s_deferred_work_pending{false};
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+mod::sched::task::Task* s_deferred_work_task = nullptr;
+
+constexpr uint32_t WKI_DEFERRED_WORK_SLICE_NS = 2'000'000;
+constexpr int WKI_DEFERRED_WORK_NICE = -5;
 
 // RAII guard: ensures s_timer_deferred_running is reset even if a deferred
 // work function panics or asserts.  Without this, a crash inside the
@@ -90,6 +99,61 @@ auto is_timer_deferred_waiter(const mod::sched::task::Task* task) -> bool {
     return task != nullptr && s_timer_deferred_task.load(std::memory_order_acquire) == task;
 }
 
+auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
+    if (cmdline == nullptr || token == nullptr || token[0] == '\0') {
+        return false;
+    }
+    size_t const TOKEN_LEN = std::strlen(token);
+    const char* cursor = cmdline;
+    while (*cursor != '\0') {
+        while (*cursor == ' ' || *cursor == '\t') {
+            ++cursor;
+        }
+        const char* start = cursor;
+        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
+            ++cursor;
+        }
+        if (std::cmp_equal(cursor - start, TOKEN_LEN) && std::strncmp(start, token, TOKEN_LEN) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto wait_diag_enabled() -> bool {
+    static std::atomic<int> cached{-1};
+    int value = cached.load(std::memory_order_acquire);
+    if (value >= 0) {
+        return value != 0;
+    }
+    int const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.wait_diag") ? 1 : 0;
+    cached.store(ENABLED, std::memory_order_release);
+    return ENABLED != 0;
+}
+
+constexpr uint64_t WKI_WAIT_DIAG_FIRST_US = 500'000;
+constexpr uint64_t WKI_WAIT_DIAG_INTERVAL_US = 1'000'000;
+
+void log_wait_diag(const char* event, const WkiWaitEntry* entry, uint64_t started_us, uint64_t now_us, uint64_t timeout_us) {
+    if (entry == nullptr) {
+        return;
+    }
+    auto* task = entry->task.load(std::memory_order_acquire);
+    const char* const TASK_NAME = (task != nullptr && task->name != nullptr) ? task->name : "?";
+    const uint64_t PID = task != nullptr ? task->pid : 0;
+    const uint32_t TASK_TYPE = task != nullptr ? static_cast<uint32_t>(task->type) : 0;
+    log::warn(
+        "wait_%s entry=%p elapsed_us=%lu timeout_us=%lu deadline=%lu state=%u result=%d task=0x%lx(%s) type=%u diag=%s op=0x%x "
+        "peer=0x%04x chan=%u res=%u cookie=%u arg0=0x%lx arg1=0x%lx site=0x%lx",
+        event != nullptr ? event : "pending", entry, static_cast<unsigned long>(now_us - started_us),
+        static_cast<unsigned long>(timeout_us), static_cast<unsigned long>(entry->deadline_us),
+        static_cast<unsigned>(entry->state.load(std::memory_order_acquire)), entry->result, static_cast<unsigned long>(PID), TASK_NAME,
+        TASK_TYPE, entry->diag_name != nullptr ? entry->diag_name : "-", static_cast<unsigned>(entry->diag_op_id),
+        static_cast<unsigned>(entry->diag_peer), static_cast<unsigned>(entry->diag_channel), entry->diag_resource_id,
+        static_cast<unsigned>(entry->diag_cookie), static_cast<unsigned long>(entry->diag_arg0),
+        static_cast<unsigned long>(entry->diag_arg1), static_cast<unsigned long>(entry->diag_callsite));
+}
+
 void process_deferred_blocking_work() {
     DeferredGuard deferred;
     if (!deferred.try_enter()) {
@@ -110,6 +174,24 @@ void process_deferred_blocking_work() {
 
     // Refresh proxy NIC stats without blocking on a response.
     wki_remote_net_poll_stats();
+}
+
+void wki_deferred_work_notify() {
+    s_deferred_work_pending.store(true, std::memory_order_release);
+    if (s_deferred_work_task != nullptr) {
+        mod::sched::kern_wake(s_deferred_work_task);
+    }
+}
+
+[[noreturn]] void wki_deferred_work_thread() {
+    for (;;) {
+        if (!s_deferred_work_pending.exchange(false, std::memory_order_acq_rel)) {
+            mod::sched::kern_block();
+            continue;
+        }
+
+        process_deferred_blocking_work();
+    }
 }
 
 auto find_transport_for_peer(uint16_t dst_node) -> WkiTransport*;
@@ -345,6 +427,23 @@ auto wki_crc32_continue(uint32_t prev_crc, const void* data, size_t len) -> uint
     return crc ^ 0xFFFFFFFF;
 }
 
+void wki_deferred_work_thread_start() {
+    if (s_deferred_work_task != nullptr) {
+        return;
+    }
+
+    auto* task = mod::sched::task::Task::create_kernel_thread("wki_deferred", wki_deferred_work_thread);
+    if (task == nullptr) {
+        log::error("Failed to create WKI deferred worker");
+        return;
+    }
+    task->slice_ns = WKI_DEFERRED_WORK_SLICE_NS;
+    mod::sched::set_task_nice(task, WKI_DEFERRED_WORK_NICE);
+    s_deferred_work_task = task;
+    mod::sched::post_task_balanced(task);
+    log::info("Deferred worker started (PID %d)", task->pid);
+}
+
 namespace {
 
 auto wki_frame_checksum(const WkiHeader& hdr, const uint8_t* payload) -> uint32_t {
@@ -418,8 +517,9 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
     // Record the calling task so wake_op can send an IPI. Do not reset
     // state/result here: many callers publish the stack wait entry before
     // sending, and a fast response may complete it before we enter this helper.
+    uint64_t const STARTED_US = wki_now_us();
     entry->task.store(mod::sched::get_current_task(), std::memory_order_release);
-    entry->deadline_us = (timeout_us > 0) ? wki_future_deadline_us(wki_now_us(), timeout_us) : 0;
+    entry->deadline_us = (timeout_us > 0) ? wki_future_deadline_us(STARTED_US, timeout_us) : 0;
 
     bool linked = false;
     if (!wait_done(entry)) {
@@ -438,8 +538,10 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
     // suppresses one class of concurrent wake in deferred_task_switch(), and
     // using kern_block() here can therefore lose a wake and strand the task
     // until an unrelated signal arrives.
+    uint64_t next_diag_us = wait_diag_enabled() ? wki_future_deadline_us(STARTED_US, WKI_WAIT_DIAG_FIRST_US) : 0;
     while (!wait_done(entry)) {
-        if (entry->deadline_us != 0 && wki_now_us() >= entry->deadline_us) {
+        uint64_t const NOW_US = wki_now_us();
+        if (entry->deadline_us != 0 && NOW_US >= entry->deadline_us) {
             // Timed out locally. Claim completion before returning so a late
             // response cannot still complete the same stack waiter after the
             // caller has started timeout cleanup/retry handling.
@@ -449,10 +551,17 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
             if (linked) {
                 wait_list_unlink(entry);
             }
+            if (next_diag_us != 0) {
+                log_wait_diag("timeout", entry, STARTED_US, NOW_US, timeout_us);
+            }
             while (!wait_done(entry)) {
                 mod::sched::kern_yield();
             }
             return entry->result;
+        }
+        if (next_diag_us != 0 && NOW_US >= next_diag_us) {
+            log_wait_diag("pending", entry, STARTED_US, NOW_US, timeout_us);
+            next_diag_us = wki_future_deadline_us(NOW_US, WKI_WAIT_DIAG_INTERVAL_US);
         }
         auto* waiter_task = entry->task.load(std::memory_order_acquire);
         if (waiter_task != nullptr) {
@@ -476,6 +585,9 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
     // Completed - unlink and return result
     if (linked) {
         wait_list_unlink(entry);
+    }
+    if (next_diag_us != 0 && wki_now_us() >= next_diag_us) {
+        log_wait_diag("done", entry, STARTED_US, wki_now_us(), timeout_us);
     }
     return entry->result;
 }
@@ -1146,6 +1258,97 @@ struct AckSnapshot {
     uint32_t ack_num = 0;
 };
 
+struct RetransmitSnapshot {
+    uint8_t* data = nullptr;
+    uint16_t len = 0;
+    uint16_t peer = WKI_NODE_INVALID;
+    uint32_t seq = 0;
+    uint32_t generation = 0;
+};
+
+auto retransmit_snapshot_present(const RetransmitSnapshot& snapshot) -> bool {
+    return snapshot.data != nullptr && snapshot.len != 0 && snapshot.peer != WKI_NODE_INVALID;
+}
+
+void free_retransmit_snapshot(RetransmitSnapshot& snapshot) {
+    delete[] snapshot.data;
+    snapshot = {};
+}
+
+auto retransmit_head_matches_locked(WkiChannel* ch, uint64_t now_us, bool require_deadline, bool has_expected_seq, uint32_t expected_seq,
+                                    uint32_t expected_generation, uint16_t expected_len) -> bool {
+    if (ch == nullptr || !ch->active || ch->generation != expected_generation || ch->retransmit_head == nullptr) {
+        return false;
+    }
+    WkiRetransmitEntry const* rt = ch->retransmit_head;
+    if (rt->len != expected_len || (has_expected_seq && rt->seq != expected_seq)) {
+        return false;
+    }
+    return !require_deadline || now_us >= ch->retransmit_deadline;
+}
+
+void postpone_retransmit_after_snapshot_alloc_failure(WkiChannel* ch, uint64_t now_us, bool require_deadline, bool has_expected_seq,
+                                                      uint32_t expected_seq, uint32_t expected_generation, uint16_t expected_len) {
+    if (ch == nullptr || !require_deadline) {
+        return;
+    }
+    ch->lock.lock();
+    if (retransmit_head_matches_locked(ch, now_us, require_deadline, has_expected_seq, expected_seq, expected_generation, expected_len)) {
+        ch->retransmit_deadline = wki_future_deadline_us(now_us, ch->rto_us);
+    }
+    ch->lock.unlock();
+}
+
+auto capture_retransmit_head_snapshot(WkiChannel* ch, uint64_t now_us, bool require_deadline, bool has_expected_seq, uint32_t expected_seq,
+                                      RetransmitSnapshot& snapshot) -> bool {
+    snapshot = {};
+    if (ch == nullptr) {
+        return false;
+    }
+
+    uint16_t len = 0;
+    uint16_t peer = WKI_NODE_INVALID;
+    uint32_t seq = 0;
+    uint32_t generation = 0;
+    ch->lock.lock();
+    if (ch->active && ch->retransmit_head != nullptr && (!require_deadline || now_us >= ch->retransmit_deadline)) {
+        WkiRetransmitEntry const* rt = ch->retransmit_head;
+        if (!has_expected_seq || rt->seq == expected_seq) {
+            len = rt->len;
+            peer = ch->peer_node_id;
+            seq = rt->seq;
+            generation = ch->generation;
+        }
+    }
+    ch->lock.unlock();
+
+    if (len == 0 || len > WKI_MAX_FRAME_SIZE || peer == WKI_NODE_INVALID) {
+        return false;
+    }
+
+    auto* data = new (std::nothrow) uint8_t[len];
+    if (data == nullptr) {
+        postpone_retransmit_after_snapshot_alloc_failure(ch, now_us, require_deadline, has_expected_seq, expected_seq, generation, len);
+        return false;
+    }
+
+    ch->lock.lock();
+    if (!retransmit_head_matches_locked(ch, now_us, require_deadline, has_expected_seq, expected_seq, generation, len)) {
+        ch->lock.unlock();
+        delete[] data;
+        return false;
+    }
+
+    std::memcpy(data, ch->retransmit_head->data, len);
+    snapshot.data = data;
+    snapshot.len = len;
+    snapshot.peer = peer;
+    snapshot.seq = seq;
+    snapshot.generation = generation;
+    ch->lock.unlock();
+    return true;
+}
+
 auto capture_ack_snapshot_locked(WkiChannel* ch) -> AckSnapshot {
     AckSnapshot ack = {};
     ack.hdr.version_flags = wki_version_flags(WKI_VERSION, WKI_FLAG_ACK_PRESENT);
@@ -1707,10 +1910,22 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
     // Build frame directly in packet buffer data region
     uint8_t* frame = pkt->data;
 
+    auto* heap_rt_entry = new (std::nothrow) WkiRetransmitEntry{};
+    uint8_t* heap_rt_data = nullptr;
+    if (heap_rt_entry != nullptr) {
+        heap_rt_data = new (std::nothrow) uint8_t[FRAME_LEN];
+        if (heap_rt_data == nullptr) {
+            delete heap_rt_entry;
+            heap_rt_entry = nullptr;
+        }
+    }
+
     ch->lock.lock();
 
     if (!ch->active || ch->peer_node_id != dst_node || ch->channel_id != channel_id) {
         ch->lock.unlock();
+        delete[] heap_rt_data;
+        delete heap_rt_entry;
         net::pkt_free(pkt);
         return WKI_ERR_NOT_FOUND;
     }
@@ -1721,6 +1936,8 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
     // Check credits
     if (ch->tx_credits == 0) {
         ch->lock.unlock();
+        delete[] heap_rt_data;
+        delete heap_rt_entry;
         net::pkt_free(pkt);
         perf_record_transport_point(mod::perf::WkiPerfTransportOp::NO_CREDITS, dst_node, channel_id, WKI_ERR_NO_CREDITS, 0,
                                     TRACE_CORRELATION, TRACE_CALLSITE);
@@ -1790,15 +2007,11 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
         rt_data = ch->tx_rt_buf.data();
         ch->tx_rt_entry_in_use = true;
     } else {
-        // Slow path: frame too large for inline buffer or multiple in-flight
-        rt_entry = new (std::nothrow) WkiRetransmitEntry{};
-        if (rt_entry != nullptr) {
-            rt_data = new (std::nothrow) uint8_t[FRAME_LEN];
-            if (rt_data == nullptr) {
-                delete rt_entry;
-                rt_entry = nullptr;
-            }
-        }
+        // Slow path: use the heap storage prepared before taking the channel lock.
+        rt_entry = heap_rt_entry;
+        rt_data = heap_rt_data;
+        heap_rt_entry = nullptr;
+        heap_rt_data = nullptr;
     }
 
     bool notify_timer = false;
@@ -1815,6 +2028,8 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
         // recoverable. Sending without a retransmit copy can permanently wedge
         // the receiver behind a missing head-of-line packet.
         ch->lock.unlock();
+        delete[] heap_rt_data;
+        delete heap_rt_entry;
         net::pkt_free(pkt);
         perf_record_transport_end(dst_node, channel_id, TRACE_CORRELATION, WKI_ERR_NO_MEM, payload_len, TRACE_CALLSITE);
         return WKI_ERR_NO_MEM;
@@ -1874,6 +2089,8 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
     ch->bytes_sent += payload_len;
 
     ch->lock.unlock();
+    delete[] heap_rt_data;
+    delete heap_rt_entry;
 
     if (ack_snapshot_present(post_unlock_ack)) {
         bool ack_notify_timer = false;
@@ -2144,11 +2361,9 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
         uint16_t const ACK_CHANNEL_ID = wki_ack_channel_id(*hdr);
         WkiChannel* ch = wki_channel_lookup(hdr->src_node, ACK_CHANNEL_ID);
         if (ch != nullptr) {
-            auto* fast_retransmit_data = static_cast<uint8_t*>(nullptr);
-            uint16_t fast_retransmit_len = 0;
-            uint16_t fast_retransmit_peer = 0;
-            uint32_t fast_retransmit_seq = 0;
-            uint32_t fast_retransmit_generation = 0;
+            RetransmitSnapshot fast_retransmit = {};
+            uint32_t fast_retransmit_expected_seq = 0;
+            bool need_fast_retransmit = false;
             bool ack_progress = false;
 
             ch->lock.lock();
@@ -2209,17 +2424,10 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                         ch->dup_ack_count = 1;
                     }
 
-                    fast_retransmit_seq = 0;
                     if (ch->dup_ack_count >= WKI_FAST_RETRANSMIT_THRESH) {
                         WkiRetransmitEntry const* rt = ch->retransmit_head;
-                        fast_retransmit_data = new (std::nothrow) uint8_t[rt->len];
-                        if (fast_retransmit_data != nullptr) {
-                            memcpy(fast_retransmit_data, rt->data, rt->len);
-                            fast_retransmit_len = rt->len;
-                            fast_retransmit_peer = ch->peer_node_id;
-                            fast_retransmit_seq = rt->seq;
-                            fast_retransmit_generation = ch->generation;
-                        }
+                        fast_retransmit_expected_seq = rt->seq;
+                        need_fast_retransmit = true;
                         ch->dup_ack_count = 0;
                     }
                 } else if (ACK_IN_SENT_WINDOW) {
@@ -2245,19 +2453,24 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 mark_peer_rx_progress(hdr->src_node);
             }
 
-            if (fast_retransmit_data != nullptr) {
+            if (need_fast_retransmit) {
+                static_cast<void>(
+                    capture_retransmit_head_snapshot(ch, wki_now_us(), false, true, fast_retransmit_expected_seq, fast_retransmit));
+            }
+
+            if (retransmit_snapshot_present(fast_retransmit)) {
                 int tx_ret = -1;
-                WkiTransport* transport = find_transport_for_peer(fast_retransmit_peer);
+                WkiTransport* transport = find_transport_for_peer(fast_retransmit.peer);
                 if (transport != nullptr) {
-                    uint16_t const NEXT_HOP = resolve_next_hop(fast_retransmit_peer);
+                    uint16_t const NEXT_HOP = resolve_next_hop(fast_retransmit.peer);
                     if (NEXT_HOP != WKI_NODE_INVALID) {
-                        tx_ret = transport->tx(transport, NEXT_HOP, fast_retransmit_data, fast_retransmit_len);
+                        tx_ret = transport->tx(transport, NEXT_HOP, fast_retransmit.data, fast_retransmit.len);
                     }
                 }
 
                 ch->lock.lock();
-                if (ch->active && ch->generation == fast_retransmit_generation && ch->retransmit_head != nullptr &&
-                    ch->retransmit_head->seq == fast_retransmit_seq) {
+                if (ch->active && ch->generation == fast_retransmit.generation && ch->retransmit_head != nullptr &&
+                    ch->retransmit_head->seq == fast_retransmit.seq) {
                     uint64_t const NOW = wki_now_us();
                     if (tx_ret >= 0) {
                         WkiRetransmitEntry* rt = ch->retransmit_head;
@@ -2272,7 +2485,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     }
                 }
                 ch->lock.unlock();
-                delete[] fast_retransmit_data;
+                free_retransmit_snapshot(fast_retransmit);
             }
         }
     }
@@ -2599,12 +2812,8 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
         return;
     }
 
-    uint8_t* retransmit_data = nullptr;
-    uint16_t retransmit_len = 0;
-    uint16_t retransmit_peer = 0;
-    uint32_t retransmit_seq = 0;
-    uint32_t retransmit_generation = 0;
-    bool do_retransmit = false;
+    RetransmitSnapshot retransmit = {};
+    bool need_retransmit = false;
 
     WkiHeader ack_hdr = {};
     uint16_t ack_peer = 0;
@@ -2623,19 +2832,7 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
     }
 
     if ((ch->retransmit_head != nullptr) && now_us >= ch->retransmit_deadline) {
-        WkiRetransmitEntry const* rt = ch->retransmit_head;
-
-        retransmit_data = new (std::nothrow) uint8_t[rt->len];
-        if (retransmit_data != nullptr) {
-            memcpy(retransmit_data, rt->data, rt->len);
-            retransmit_len = rt->len;
-            retransmit_peer = ch->peer_node_id;
-            retransmit_seq = rt->seq;
-            retransmit_generation = ch->generation;
-            do_retransmit = true;
-        } else {
-            ch->retransmit_deadline = wki_future_deadline_us(now_us, ch->rto_us);
-        }
+        need_retransmit = true;
     }
 
     if (ch->ack_pending && now_us >= wki_future_deadline_us(ch->ack_pending_since_us, ack_delay_for_channel(ch->channel_id))) {
@@ -2659,18 +2856,22 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
 
     ch->lock.unlock();
 
-    if (do_retransmit) {
+    if (need_retransmit) {
+        static_cast<void>(capture_retransmit_head_snapshot(ch, now_us, true, false, 0, retransmit));
+    }
+
+    if (retransmit_snapshot_present(retransmit)) {
         int tx_ret = -1;
-        WkiTransport* transport = find_transport_for_peer(retransmit_peer);
+        WkiTransport* transport = find_transport_for_peer(retransmit.peer);
         if (transport != nullptr) {
-            uint16_t const NEXT_HOP = resolve_next_hop(retransmit_peer);
+            uint16_t const NEXT_HOP = resolve_next_hop(retransmit.peer);
             if (NEXT_HOP != WKI_NODE_INVALID) {
-                tx_ret = transport->tx(transport, NEXT_HOP, retransmit_data, retransmit_len);
+                tx_ret = transport->tx(transport, NEXT_HOP, retransmit.data, retransmit.len);
             }
         }
         ch->lock.lock();
-        if (ch->active && ch->generation == retransmit_generation && ch->retransmit_head != nullptr &&
-            ch->retransmit_head->seq == retransmit_seq) {
+        if (ch->active && ch->generation == retransmit.generation && ch->retransmit_head != nullptr &&
+            ch->retransmit_head->seq == retransmit.seq) {
             if (tx_ret >= 0) {
                 WkiRetransmitEntry* rt = ch->retransmit_head;
                 rt->retries++;
@@ -2685,7 +2886,7 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
             ch->retransmit_deadline = wki_future_deadline_us(now_us, ch->rto_us);
         }
         ch->lock.unlock();
-        delete[] retransmit_data;
+        free_retransmit_snapshot(retransmit);
     }
 
     if (do_ack) {
@@ -2740,12 +2941,8 @@ void wki_timer_tick(uint64_t now_us) {
 
         // Gather pending work under lock, then release before TX to avoid deadlock
         // (RX interrupt could try to lock the same channel)
-        uint8_t* retransmit_data = nullptr;
-        uint16_t retransmit_len = 0;
-        uint16_t retransmit_peer = 0;
-        uint32_t retransmit_seq = 0;
-        uint32_t retransmit_generation = 0;
-        bool do_retransmit = false;
+        RetransmitSnapshot retransmit = {};
+        bool need_retransmit = false;
 
         WkiHeader ack_hdr = {};
         uint16_t ack_peer = 0;
@@ -2765,20 +2962,7 @@ void wki_timer_tick(uint64_t now_us) {
 
         // Retransmit timeout
         if ((ch->retransmit_head != nullptr) && now_us >= ch->retransmit_deadline) {
-            WkiRetransmitEntry const* rt = ch->retransmit_head;
-
-            // Copy data for TX outside lock
-            retransmit_data = new (std::nothrow) uint8_t[rt->len];
-            if (retransmit_data != nullptr) {
-                memcpy(retransmit_data, rt->data, rt->len);
-                retransmit_len = rt->len;
-                retransmit_peer = ch->peer_node_id;
-                retransmit_seq = rt->seq;
-                retransmit_generation = ch->generation;
-                do_retransmit = true;
-            } else {
-                ch->retransmit_deadline = wki_future_deadline_us(now_us, ch->rto_us);
-            }
+            need_retransmit = true;
         }
 
         // Delayed ACK - send standalone ACK if pending.
@@ -2809,19 +2993,23 @@ void wki_timer_tick(uint64_t now_us) {
         ch->lock.unlock();
 
         // Now TX outside the lock to avoid deadlock with RX interrupt
-        if (do_retransmit) {
+        if (need_retransmit) {
+            static_cast<void>(capture_retransmit_head_snapshot(ch, now_us, true, false, 0, retransmit));
+        }
+
+        if (retransmit_snapshot_present(retransmit)) {
             int tx_ret = -1;
-            WkiTransport* transport = find_transport_for_peer(retransmit_peer);
+            WkiTransport* transport = find_transport_for_peer(retransmit.peer);
             if (transport != nullptr) {
-                uint16_t const NEXT_HOP = resolve_next_hop(retransmit_peer);
+                uint16_t const NEXT_HOP = resolve_next_hop(retransmit.peer);
                 if (NEXT_HOP != WKI_NODE_INVALID) {
-                    tx_ret = transport->tx(transport, NEXT_HOP, retransmit_data, retransmit_len);
+                    tx_ret = transport->tx(transport, NEXT_HOP, retransmit.data, retransmit.len);
                 }
             }
 
             ch->lock.lock();
-            if (ch->active && ch->generation == retransmit_generation && ch->retransmit_head != nullptr &&
-                ch->retransmit_head->seq == retransmit_seq) {
+            if (ch->active && ch->generation == retransmit.generation && ch->retransmit_head != nullptr &&
+                ch->retransmit_head->seq == retransmit.seq) {
                 if (tx_ret >= 0) {
                     WkiRetransmitEntry* rt = ch->retransmit_head;
                     rt->retries++;
@@ -2836,7 +3024,7 @@ void wki_timer_tick(uint64_t now_us) {
                 ch->retransmit_deadline = wki_future_deadline_us(now_us, ch->rto_us);
             }
             ch->lock.unlock();
-            delete[] retransmit_data;
+            free_retransmit_snapshot(retransmit);
         }
 
         if (do_ack) {
@@ -2863,8 +3051,8 @@ void wki_timer_tick(uint64_t now_us) {
     }
 
     // Heartbeat checks are done in peer.cpp's wki_peer_timer_tick().
-
-    process_deferred_blocking_work();
+    // Potentially blocking resource work is handled by wki_deferred_work_thread().
+    wki_deferred_work_notify();
 }
 
 }  // namespace ker::net::wki

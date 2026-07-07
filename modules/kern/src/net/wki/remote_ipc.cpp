@@ -16,6 +16,7 @@
 #include <net/wki/wki.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
+#include <platform/init/limine_requests.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -67,6 +68,110 @@ auto current_task_has_deliverable_signal() -> bool {
         return false;
     }
     return task->has_interrupting_signal_pending();
+}
+
+auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
+    if (cmdline == nullptr || token == nullptr || token[0] == '\0') {
+        return false;
+    }
+    size_t const TOKEN_LEN = std::strlen(token);
+    const char* cursor = cmdline;
+    while (*cursor != '\0') {
+        while (*cursor == ' ' || *cursor == '\t') {
+            ++cursor;
+        }
+        const char* start = cursor;
+        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
+            ++cursor;
+        }
+        if (std::cmp_equal(cursor - start, TOKEN_LEN) && std::strncmp(start, token, TOKEN_LEN) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto wait_diag_enabled() -> bool {
+    static std::atomic<int> cached{-1};
+    int value = cached.load(std::memory_order_acquire);
+    if (value >= 0) {
+        return value != 0;
+    }
+    int const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.wait_diag") ? 1 : 0;
+    cached.store(ENABLED, std::memory_order_release);
+    return ENABLED != 0;
+}
+
+auto pty_ioctl_cmd_name(unsigned long cmd) -> const char* {
+    switch (cmd) {
+        case ker::dev::pty::TIOCGPTN:
+            return "TIOCGPTN";
+        case ker::dev::pty::TIOCSPTLCK:
+            return "TIOCSPTLCK";
+        case ker::dev::pty::TIOCGWINSZ:
+            return "TIOCGWINSZ";
+        case ker::dev::pty::TIOCSWINSZ:
+            return "TIOCSWINSZ";
+        case ker::dev::pty::TIOCSCTTY:
+            return "TIOCSCTTY";
+        case ker::dev::pty::TIOCGPGRP:
+            return "TIOCGPGRP";
+        case ker::dev::pty::TIOCSPGRP:
+            return "TIOCSPGRP";
+        case ker::dev::pty::TIOCNOTTY:
+            return "TIOCNOTTY";
+        case ker::dev::pty::TCGETS:
+            return "TCGETS";
+        case ker::dev::pty::TCSETS:
+            return "TCSETS";
+        case ker::dev::pty::TCSETSW:
+            return "TCSETSW";
+        case ker::dev::pty::TCSETSF:
+            return "TCSETSF";
+        case ker::dev::pty::TCFLSH:
+            return "TCFLSH";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+constexpr size_t PTY_IOCTL_ARG_SIZE = 128;  // max bytes we send/receive for ioctl arg
+
+struct PtyIoctlMarshal {
+    size_t arg_size = 0;
+    bool pointer_arg = false;
+    bool copy_in = false;
+    bool copy_out = false;
+};
+
+auto pty_ioctl_marshalling(unsigned long cmd, unsigned long arg) -> PtyIoctlMarshal {
+    auto pointer = [arg](size_t size, bool copy_in, bool copy_out) -> PtyIoctlMarshal {
+        return {
+            .arg_size = size,
+            .pointer_arg = arg >= 8192,
+            .copy_in = copy_in,
+            .copy_out = copy_out,
+        };
+    };
+
+    switch (cmd) {
+        case ker::dev::pty::TIOCGPTN:
+        case ker::dev::pty::TIOCSPTLCK:
+            return pointer(sizeof(int), cmd == ker::dev::pty::TIOCSPTLCK, cmd == ker::dev::pty::TIOCGPTN);
+        case ker::dev::pty::TIOCGWINSZ:
+        case ker::dev::pty::TIOCSWINSZ:
+            return pointer(sizeof(ker::dev::pty::Winsize), cmd == ker::dev::pty::TIOCSWINSZ, cmd == ker::dev::pty::TIOCGWINSZ);
+        case ker::dev::pty::TIOCGPGRP:
+        case ker::dev::pty::TIOCSPGRP:
+            return pointer(sizeof(int64_t), cmd == ker::dev::pty::TIOCSPGRP, cmd == ker::dev::pty::TIOCGPGRP);
+        case ker::dev::pty::TCGETS:
+        case ker::dev::pty::TCSETS:
+        case ker::dev::pty::TCSETSW:
+        case ker::dev::pty::TCSETSF:
+            return pointer(sizeof(ker::dev::pty::KTermios), cmd != ker::dev::pty::TCGETS, cmd == ker::dev::pty::TCGETS);
+        default:
+            return {};
+    }
 }
 
 constexpr int WKI_SIGPIPE_NUM = 13;
@@ -294,6 +399,8 @@ std::array<IpcPeerCleanupEpoch, WKI_MAX_PEERS> g_ipc_peer_cleanup_epochs = {};
 constexpr uint64_t WKI_IPC_PIPE_WRITE_RETRY_US = 1000;
 constexpr uint64_t WKI_IPC_PIPE_READ_POLL_RECHECK_US = 1000;
 constexpr uint32_t WKI_IPC_PIPE_EOF_MAX_SEND_ATTEMPTS = 128;
+constexpr uint64_t WKI_IPC_DIAG_FIRST_US = 500'000;
+constexpr uint64_t WKI_IPC_DIAG_INTERVAL_US = 1'000'000;
 constexpr size_t WKI_IPC_MAX_POLL_WAKE_WAITERS = 32;
 constexpr size_t WKI_IPC_PROXY_CLOSE_MSG_MAX = sizeof(DevOpReqPayload) + sizeof(uint32_t) + sizeof(uint64_t);
 constexpr size_t WKI_IPC_PROXY_CLOSE_CLEANUP_BATCH = WKI_IPC_MAX_EXPORTS * 8;
@@ -323,6 +430,62 @@ struct PendingProxyPipeClose {
     uint32_t attempts = 0;
     std::array<uint8_t, WKI_IPC_PROXY_CLOSE_MSG_MAX> msg = {};
 };
+
+auto ipc_diag_due(uint64_t started_us, uint64_t& last_log_us) -> bool {
+    if (!wait_diag_enabled() || started_us == 0) {
+        return false;
+    }
+
+    uint64_t const NOW_US = wki_now_us();
+    if (NOW_US < started_us || NOW_US - started_us < WKI_IPC_DIAG_FIRST_US) {
+        return false;
+    }
+    if (last_log_us != 0 && NOW_US - last_log_us < WKI_IPC_DIAG_INTERVAL_US) {
+        return false;
+    }
+    last_log_us = NOW_US;
+    return true;
+}
+
+void log_ipc_send_retry_diag(const char* event, const ProxyIpcState* proxy, uint32_t resource_id, size_t requested, size_t progressed,
+                             int ret, uint32_t attempts, uint64_t started_us) {
+    if (!wait_diag_enabled()) {
+        return;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    uint64_t const PID = task != nullptr ? task->pid : 0;
+    const char* const TASK_NAME = task != nullptr && task->name != nullptr ? task->name : "?";
+    uint16_t const HOME = proxy != nullptr ? proxy->home_node : WKI_NODE_INVALID;
+    uint32_t const RES = proxy != nullptr ? proxy->resource_id : resource_id;
+    uint64_t const WRITTEN = proxy != nullptr ? proxy->bytes_written.load(std::memory_order_acquire) : 0;
+    uint32_t const ACTIVE = proxy != nullptr && proxy->active.load(std::memory_order_acquire) ? 1U : 0U;
+    uint64_t const ELAPSED = started_us != 0 ? wki_now_us() - started_us : 0;
+
+    ker::mod::dbg::logger<"wki">::warn(
+        "%s peer=0x%04x res=%u requested=%llu progressed=%llu ret=%d attempts=%u elapsed_us=%llu active=%u bytes_written=%llu "
+        "pid=%llu task=%s",
+        event != nullptr ? event : "ipc_send_retry", HOME, RES, static_cast<unsigned long long>(requested),
+        static_cast<unsigned long long>(progressed), ret, attempts, static_cast<unsigned long long>(ELAPSED), ACTIVE,
+        static_cast<unsigned long long>(WRITTEN), static_cast<unsigned long long>(PID), TASK_NAME);
+}
+
+void log_pipe_pump_send_retry_diag(const char* event, uint16_t target, uint32_t resource_id, ssize_t bytes, int ret, uint32_t attempts,
+                                   uint64_t started_us) {
+    if (!wait_diag_enabled()) {
+        return;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    uint64_t const PID = task != nullptr ? task->pid : 0;
+    const char* const TASK_NAME = task != nullptr && task->name != nullptr ? task->name : "?";
+    uint64_t const ELAPSED = started_us != 0 ? wki_now_us() - started_us : 0;
+
+    ker::mod::dbg::logger<"wki">::warn("%s peer=0x%04x res=%u bytes=%lld ret=%d attempts=%u elapsed_us=%llu pid=%llu task=%s",
+                                       event != nullptr ? event : "pipe_pump_send_retry", target, resource_id,
+                                       static_cast<long long>(bytes), ret, attempts, static_cast<unsigned long long>(ELAPSED),
+                                       static_cast<unsigned long long>(PID), TASK_NAME);
+}
 
 std::deque<PendingProxyPipeClose*> g_pending_proxy_pipe_closes;
 ker::mod::sched::task::Task* g_proxy_pipe_close_tx_task = nullptr;
@@ -1495,6 +1658,8 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
     req->op_id = OP_PIPE_DATA;
     std::memcpy(msg + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
 
+    uint64_t const SEND_STARTED_US = wki_now_us();
+    uint64_t last_send_diag_us = 0;
     while (sent < count) {
         size_t const TO_SEND = std::min(count - sent, MAX_CHUNK);
         req->data_len = static_cast<uint16_t>(sizeof(uint32_t) + TO_SEND);
@@ -1522,6 +1687,9 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
             if (ret != WKI_ERR_NO_CREDITS || ATTEMPT != 0) {
                 g_proxy_write_block_us.fetch_add(ipc_pipe_send_retry_sleep_us(ret, ATTEMPT), std::memory_order_relaxed);
             }
+            if (ipc_diag_due(SEND_STARTED_US, last_send_diag_us)) {
+                log_ipc_send_retry_diag("proxy_write_wait", proxy, proxy->resource_id, count, sent, ret, attempts, SEND_STARTED_US);
+            }
             pause_for_ipc_send_retry(ret, ATTEMPT);
         }
 
@@ -1548,6 +1716,8 @@ auto send_proxy_pipe_close(ProxyIpcState* proxy, const uint8_t* msg, uint16_t ms
     uint32_t const MAX_ATTEMPTS = CAN_BLOCK ? WKI_IPC_PIPE_EOF_MAX_SEND_ATTEMPTS : 1U;
     int ret = WKI_ERR_TX_FAILED;
     uint32_t attempts = 0;
+    uint64_t const SEND_STARTED_US = wki_now_us();
+    uint64_t last_send_diag_us = 0;
     while (attempts < MAX_ATTEMPTS) {
         ret = wki_send(proxy->home_node, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg, msg_size);
         if (ret == WKI_OK) {
@@ -1556,6 +1726,9 @@ auto send_proxy_pipe_close(ProxyIpcState* proxy, const uint8_t* msg, uint16_t ms
         ++attempts;
         if (!CAN_BLOCK || attempts >= MAX_ATTEMPTS) {
             break;
+        }
+        if (ipc_diag_due(SEND_STARTED_US, last_send_diag_us)) {
+            log_ipc_send_retry_diag("proxy_close_wait", proxy, resource_id, msg_size, 0, ret, attempts, SEND_STARTED_US);
         }
         pause_for_ipc_send_retry(ret, attempts);
     }
@@ -1783,8 +1956,6 @@ ker::vfs::FileOperations g_proxy_epoll_fops = {
 // Control plane: ioctl forwarded to home node via OP_PTY_IOCTL.
 // Close: OP_PTY_CLOSE fires and the export tears down.
 
-constexpr size_t PTY_IOCTL_ARG_SIZE = 128;  // max bytes we send/receive for ioctl arg
-
 auto proxy_pty_ioctl(ker::vfs::File* f, unsigned long cmd, unsigned long arg) -> int {
     auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
     uint64_t const CALLSITE = WOS_PERF_CALLSITE();
@@ -1807,6 +1978,7 @@ auto proxy_pty_ioctl(ker::vfs::File* f, unsigned long cmd, unsigned long arg) ->
     if (proxy->home_node == WKI_NODE_INVALID) {
         return finish(-EHOSTUNREACH);
     }
+    PtyIoctlMarshal const MARSHAL = pty_ioctl_marshalling(cmd, arg);
 
     // Wire layout (after resource_id): [cookie:u16][cmd:u64][arg_val:u64][arg_in:128B]
     constexpr size_t EXTRA = sizeof(uint64_t) + sizeof(uint64_t) + PTY_IOCTL_ARG_SIZE;
@@ -1822,10 +1994,26 @@ auto proxy_pty_ioctl(ker::vfs::File* f, unsigned long cmd, unsigned long arg) ->
     uint16_t op_cookie = 0;
     uint64_t irqf = proxy->lock.lock_irqsave();
     if (proxy->pending_wait_op != 0) {
+        uint16_t const PENDING_OP = proxy->pending_wait_op;
+        uint16_t const PENDING_COOKIE = proxy->pending_wait_cookie;
         proxy->lock.unlock_irqrestore(irqf);
+        if (wait_diag_enabled()) {
+            ker::mod::dbg::logger<"wki">::warn("pty_ioctl_busy peer=0x%04x res=%u cmd=%s(0x%lx) pending_op=0x%x pending_cookie=%u",
+                                               static_cast<unsigned>(proxy->home_node), proxy->resource_id, pty_ioctl_cmd_name(cmd), cmd,
+                                               static_cast<unsigned>(PENDING_OP), static_cast<unsigned>(PENDING_COOKIE));
+        }
         return finish(-EBUSY);
     }
     op_cookie = wki_ipc_allocate_wait_cookie_locked(proxy);
+    wait.diag_name = "pty_ioctl";
+    wait.diag_callsite = CALLSITE;
+    wait.diag_arg0 = static_cast<uint64_t>(cmd);
+    wait.diag_arg1 = static_cast<uint64_t>(arg);
+    wait.diag_resource_id = proxy->resource_id;
+    wait.diag_op_id = OP_PTY_IOCTL;
+    wait.diag_peer = proxy->home_node;
+    wait.diag_channel = WKI_CHAN_RESOURCE;
+    wait.diag_cookie = op_cookie;
     proxy->pending_wait = &wait;
     proxy->pending_wait_op = OP_PTY_IOCTL;
     proxy->pending_wait_cookie = op_cookie;
@@ -1843,19 +2031,35 @@ auto proxy_pty_ioctl(ker::vfs::File* f, unsigned long cmd, unsigned long arg) ->
     std::memcpy(msg.data() + cursor, &arg64, sizeof(uint64_t));
     cursor += sizeof(uint64_t);
 
-    // If arg looks like a pointer, copy the pointed-to data into the request
-    if (arg >= 8192) {
-        std::memcpy(msg.data() + cursor, reinterpret_cast<const void*>(arg), PTY_IOCTL_ARG_SIZE);
+    if (MARSHAL.pointer_arg && MARSHAL.copy_in && MARSHAL.arg_size > 0) {
+        std::memcpy(msg.data() + cursor, reinterpret_cast<const void*>(arg), MARSHAL.arg_size);
+    }
+
+    if (wait_diag_enabled()) {
+        ker::mod::dbg::logger<"wki">::info("pty_ioctl_send peer=0x%04x res=%u cookie=%u cmd=%s(0x%lx) arg=0x%lx size=%lu in=%u out=%u",
+                                           static_cast<unsigned>(proxy->home_node), proxy->resource_id, static_cast<unsigned>(op_cookie),
+                                           pty_ioctl_cmd_name(cmd), cmd, arg, static_cast<unsigned long>(MARSHAL.arg_size),
+                                           MARSHAL.copy_in ? 1U : 0U, MARSHAL.copy_out ? 1U : 0U);
     }
 
     int const TX = wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size()));
     if (TX != WKI_OK) {
+        if (wait_diag_enabled()) {
+            ker::mod::dbg::logger<"wki">::warn("pty_ioctl_tx_failed peer=0x%04x res=%u cookie=%u cmd=%s(0x%lx) tx=%d",
+                                               static_cast<unsigned>(proxy->home_node), proxy->resource_id,
+                                               static_cast<unsigned>(op_cookie), pty_ioctl_cmd_name(cmd), cmd, TX);
+        }
         wki_ipc_cancel_pending_wait(proxy, &wait, WKI_ERR_TX_FAILED);
         return finish(-EIO);
     }
 
     int const WAIT_RC = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
     if (WAIT_RC != 0) {
+        if (wait_diag_enabled()) {
+            ker::mod::dbg::logger<"wki">::warn("pty_ioctl_wait_failed peer=0x%04x res=%u cookie=%u cmd=%s(0x%lx) wait_rc=%d",
+                                               static_cast<unsigned>(proxy->home_node), proxy->resource_id,
+                                               static_cast<unsigned>(op_cookie), pty_ioctl_cmd_name(cmd), cmd, WAIT_RC);
+        }
         wki_ipc_cancel_pending_wait(proxy, &wait, -ETIMEDOUT);
         return finish(-ETIMEDOUT);
     }
@@ -1864,8 +2068,14 @@ auto proxy_pty_ioctl(ker::vfs::File* f, unsigned long cmd, unsigned long arg) ->
     uint16_t resp_len = 0;
     int const STATUS =
         wki_ipc_consume_pending_wait_response(proxy, &wait, OP_PTY_IOCTL, op_cookie, arg_out.data(), PTY_IOCTL_ARG_SIZE, &resp_len);
-    if (arg >= 8192 && resp_len >= PTY_IOCTL_ARG_SIZE) {
-        std::memcpy(reinterpret_cast<void*>(arg), arg_out.data(), PTY_IOCTL_ARG_SIZE);
+    if (MARSHAL.pointer_arg && MARSHAL.copy_out && MARSHAL.arg_size > 0 && resp_len >= MARSHAL.arg_size) {
+        std::memcpy(reinterpret_cast<void*>(arg), arg_out.data(), MARSHAL.arg_size);
+    }
+    if (wait_diag_enabled()) {
+        ker::mod::dbg::logger<"wki">::info("pty_ioctl_done peer=0x%04x res=%u cookie=%u cmd=%s(0x%lx) status=%d resp_len=%u copied=%lu",
+                                           static_cast<unsigned>(proxy->home_node), proxy->resource_id, static_cast<unsigned>(op_cookie),
+                                           pty_ioctl_cmd_name(cmd), cmd, STATUS, static_cast<unsigned>(resp_len),
+                                           static_cast<unsigned long>(MARSHAL.pointer_arg && MARSHAL.copy_out ? MARSHAL.arg_size : 0));
     }
     return finish(STATUS);
 }
@@ -2315,12 +2525,18 @@ template <int SLOT>
                                         static_cast<uint32_t>(n));
                 int ret = WKI_ERR_TX_FAILED;
                 uint32_t attempts = 0;
+                uint64_t const SEND_STARTED_US = wki_now_us();
+                uint64_t last_send_diag_us = 0;
                 while (exp->active && exp->pump_running.load(std::memory_order_acquire)) {
                     ret = wki_send(target, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(HEADER_SIZE + n));
                     if (ret == WKI_OK) {
                         break;
                     }
-                    pause_for_ipc_send_retry(ret, attempts++);
+                    uint32_t const ATTEMPT = attempts++;
+                    if (ipc_diag_due(SEND_STARTED_US, last_send_diag_us)) {
+                        log_pipe_pump_send_retry_diag("pipe_pump_data_wait", target, resource_id, n, ret, attempts, SEND_STARTED_US);
+                    }
+                    pause_for_ipc_send_retry(ret, ATTEMPT);
                 }
                 // NOLINTNEXTLINE(readability-suspicious-call-argument): ret is status; attempts is retry count.
                 send_trace.finish(ret, static_cast<uint64_t>(n), attempts);
@@ -2337,6 +2553,8 @@ template <int SLOT>
                 int ret = WKI_ERR_TX_FAILED;
                 uint32_t retries = 0;
                 uint32_t attempts = 0;
+                uint64_t const SEND_STARTED_US = wki_now_us();
+                uint64_t last_send_diag_us = 0;
                 while (exp->active && (exp->pump_running.load(std::memory_order_acquire) || attempts == 0) &&
                        attempts < WKI_IPC_PIPE_EOF_MAX_SEND_ATTEMPTS) {
                     attempts++;
@@ -2345,6 +2563,9 @@ template <int SLOT>
                         break;
                     }
                     retries++;
+                    if (ipc_diag_due(SEND_STARTED_US, last_send_diag_us)) {
+                        log_pipe_pump_send_retry_diag("pipe_pump_eof_wait", target, resource_id, 0, ret, attempts, SEND_STARTED_US);
+                    }
                     pause_for_ipc_send_retry(ret, attempts);
                 }
                 if (ret != WKI_OK) {
@@ -4734,14 +4955,27 @@ void wki_ipc_socket_handle_dev_op_resp(uint16_t src_node, uint16_t /*channel*/, 
     s_ipc_lock.unlock_irqrestore(IRQF);
 
     if (target_proxy == nullptr) {
+        if (resp.op_id == OP_PTY_IOCTL && wait_diag_enabled()) {
+            ker::mod::dbg::logger<"wki">::warn("pty_ioctl_resp_no_proxy src=0x%04x res=%u cookie=%u status=%d extra=%u",
+                                               static_cast<unsigned>(src_node), resource_id, static_cast<unsigned>(resp.reserved),
+                                               static_cast<int>(resp.status), static_cast<unsigned>(EXTRA_LEN));
+        }
         return;
     }
 
     WkiWaitEntry* wait = nullptr;
+    bool had_pending_wait = false;
+    bool pending_matches = false;
+    uint16_t pending_op = 0;
+    uint16_t pending_cookie = 0;
     {
         uint64_t const PROXY_IRQF = target_proxy->lock.lock_irqsave();
         wait = target_proxy->pending_wait;
-        if (wait != nullptr && wki_ipc_response_matches_pending(resp.op_id, resp.reserved, *target_proxy) && wki_claim_op(wait)) {
+        had_pending_wait = wait != nullptr;
+        pending_op = target_proxy->pending_wait_op;
+        pending_cookie = target_proxy->pending_wait_cookie;
+        pending_matches = wait != nullptr && wki_ipc_response_matches_pending(resp.op_id, resp.reserved, *target_proxy);
+        if (pending_matches && wki_claim_op(wait)) {
             target_proxy->pending_wait = nullptr;
             // Keep op/cookie populated until the waiting syscall consumes the
             // side-band status/response. They are the busy-slot fence.
@@ -4758,6 +4992,21 @@ void wki_ipc_socket_handle_dev_op_resp(uint16_t src_node, uint16_t /*channel*/, 
             wait = nullptr;  // op_id mismatch — stale response
         }
         target_proxy->lock.unlock_irqrestore(PROXY_IRQF);
+    }
+
+    if (resp.op_id == OP_PTY_IOCTL && wait_diag_enabled()) {
+        if (wait != nullptr) {
+            ker::mod::dbg::logger<"wki">::info("pty_ioctl_resp_match src=0x%04x res=%u cookie=%u status=%d extra=%u",
+                                               static_cast<unsigned>(src_node), resource_id, static_cast<unsigned>(resp.reserved),
+                                               static_cast<int>(resp.status), static_cast<unsigned>(EXTRA_LEN));
+        } else {
+            ker::mod::dbg::logger<"wki">::warn(
+                "pty_ioctl_resp_stale src=0x%04x res=%u cookie=%u status=%d extra=%u had_wait=%u pending_match=%u pending_op=0x%x "
+                "pending_cookie=%u",
+                static_cast<unsigned>(src_node), resource_id, static_cast<unsigned>(resp.reserved), static_cast<int>(resp.status),
+                static_cast<unsigned>(EXTRA_LEN), had_pending_wait ? 1U : 0U, pending_matches ? 1U : 0U, static_cast<unsigned>(pending_op),
+                static_cast<unsigned>(pending_cookie));
+        }
     }
 
     if (wait != nullptr) {
@@ -5401,13 +5650,24 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
         std::array<uint8_t, RESP_BUF_SIZE> pty_resp_buf = {};
         std::memcpy(pty_resp_buf.data() + sizeof(DevOpRespPayload), &resource_id, sizeof(uint32_t));
 
+        uint64_t ioctl_cmd = 0;
+        uint64_t ioctl_arg_val = 0;
         constexpr size_t MIN_REQ = sizeof(uint64_t) + sizeof(uint64_t) + PTY_ARG_SIZE;
         if (OP_DATA_LEN >= MIN_REQ) {
-            uint64_t ioctl_cmd = 0;
-            uint64_t ioctl_arg_val = 0;
             std::memcpy(&ioctl_cmd, op_data, sizeof(uint64_t));
             std::memcpy(&ioctl_arg_val, op_data + sizeof(uint64_t), sizeof(uint64_t));
             const uint8_t* arg_in = op_data + sizeof(uint64_t) + sizeof(uint64_t);
+            PtyIoctlMarshal const MARSHAL =
+                pty_ioctl_marshalling(static_cast<unsigned long>(ioctl_cmd), static_cast<unsigned long>(ioctl_arg_val));
+
+            if (wait_diag_enabled()) {
+                ker::mod::dbg::logger<"wki">::info(
+                    "pty_ioctl_handle src=0x%04x res=%u cookie=%u cmd=%s(0x%lx) arg=0x%lx size=%lu in=%u out=%u",
+                    static_cast<unsigned>(hdr->src_node), resource_id, static_cast<unsigned>(request_cookie),
+                    pty_ioctl_cmd_name(static_cast<unsigned long>(ioctl_cmd)), static_cast<unsigned long>(ioctl_cmd),
+                    static_cast<unsigned long>(ioctl_arg_val), static_cast<unsigned long>(MARSHAL.arg_size), MARSHAL.copy_in ? 1U : 0U,
+                    MARSHAL.copy_out ? 1U : 0U);
+            }
 
             ker::vfs::File* f = nullptr;
             {
@@ -5419,9 +5679,10 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             if (f != nullptr) {
                 unsigned long effective_arg = 0;
                 alignas(8) std::array<uint8_t, PTY_ARG_SIZE> local_buf = {};
-                if (ioctl_arg_val >= 4096) {
-                    // Pointer-type ioctl: use local buffer
-                    std::memcpy(local_buf.data(), arg_in, PTY_ARG_SIZE);
+                if (MARSHAL.pointer_arg) {
+                    if (MARSHAL.copy_in && MARSHAL.arg_size > 0) {
+                        std::memcpy(local_buf.data(), arg_in, MARSHAL.arg_size);
+                    }
                     effective_arg = reinterpret_cast<unsigned long>(local_buf.data());
                 } else {
                     // Value-type ioctl: pass arg_val directly
@@ -5430,17 +5691,40 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
 
                 int const RC = ker::vfs::devfs::devfs_ioctl(f, static_cast<unsigned long>(ioctl_cmd), effective_arg);
                 pty_resp.status = static_cast<int16_t>(RC < 0 ? RC : 0);
+                if (wait_diag_enabled()) {
+                    ker::mod::dbg::logger<"wki">::info(
+                        "pty_ioctl_home_done src=0x%04x res=%u cookie=%u cmd=%s(0x%lx) rc=%d", static_cast<unsigned>(hdr->src_node),
+                        resource_id, static_cast<unsigned>(request_cookie), pty_ioctl_cmd_name(static_cast<unsigned long>(ioctl_cmd)),
+                        static_cast<unsigned long>(ioctl_cmd), RC);
+                }
 
                 // Always copy back local buffer (for output ioctls)
                 std::memcpy(pty_resp_buf.data() + sizeof(DevOpRespPayload) + sizeof(uint32_t), local_buf.data(), PTY_ARG_SIZE);
                 ipc_release_file_ref(f);
             } else {
                 pty_resp.status = -ENOENT;
+                if (wait_diag_enabled()) {
+                    ker::mod::dbg::logger<"wki">::warn(
+                        "pty_ioctl_no_export src=0x%04x res=%u cookie=%u cmd=%s(0x%lx)", static_cast<unsigned>(hdr->src_node), resource_id,
+                        static_cast<unsigned>(request_cookie), pty_ioctl_cmd_name(static_cast<unsigned long>(ioctl_cmd)),
+                        static_cast<unsigned long>(ioctl_cmd));
+                }
             }
+        } else if (wait_diag_enabled()) {
+            ker::mod::dbg::logger<"wki">::warn("pty_ioctl_bad_request src=0x%04x res=%u cookie=%u data_len=%u",
+                                               static_cast<unsigned>(hdr->src_node), resource_id, static_cast<unsigned>(request_cookie),
+                                               static_cast<unsigned>(OP_DATA_LEN));
         }
 
         std::memcpy(pty_resp_buf.data(), &pty_resp, sizeof(pty_resp));
-        wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, pty_resp_buf.data(), static_cast<uint16_t>(pty_resp_buf.size()));
+        int const RESP_TX =
+            wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, pty_resp_buf.data(), static_cast<uint16_t>(pty_resp_buf.size()));
+        if (wait_diag_enabled()) {
+            ker::mod::dbg::logger<"wki">::info("pty_ioctl_resp_send dst=0x%04x res=%u cookie=%u cmd=%s(0x%lx) status=%d tx=%d",
+                                               static_cast<unsigned>(hdr->src_node), resource_id, static_cast<unsigned>(request_cookie),
+                                               pty_ioctl_cmd_name(static_cast<unsigned long>(ioctl_cmd)),
+                                               static_cast<unsigned long>(ioctl_cmd), static_cast<int>(pty_resp.status), RESP_TX);
+        }
         return;
     }
 

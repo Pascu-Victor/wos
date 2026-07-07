@@ -8,6 +8,8 @@
 #include <net/netdevice.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
+#include <platform/mm/phys.hpp>
+#include <platform/mm/paging.hpp>
 #include <platform/sys/spinlock.hpp>
 
 #ifdef WOS_NET_PACKET_DEBUG
@@ -26,7 +28,7 @@ constexpr uint32_t REFUSE_DUMP_STRIDE = 64;
 #endif
 
 struct PacketChunk {
-    PacketBuffer* base = nullptr;
+    PacketBuffer** buffers = nullptr;
     size_t count = 0;
     PacketChunk* next = nullptr;
 };
@@ -79,6 +81,38 @@ auto baseline_pool_capacity() -> size_t {
     return std::max(NIC_COUNT * PKT_POOL_PER_NIC, PKT_POOL_MIN_SIZE);
 }
 
+constexpr size_t align_up(size_t val, size_t align) { return (val + align - 1U) & ~(align - 1U); }
+
+constexpr size_t PACKET_BUFFER_ALLOC_BYTES = align_up(sizeof(PacketBuffer), ker::mod::mm::paging::PAGE_SIZE);
+static_assert(offsetof(PacketBuffer, storage) == 0, "virtio RX DMA assumes packet storage starts at allocation base");
+static_assert(PACKET_BUFFER_ALLOC_BYTES >= PKT_BUF_SIZE, "packet DMA allocation must cover advertised RX buffer length");
+
+auto alloc_dma_packet_buffer() -> PacketBuffer* {
+    void* mem = ker::mod::mm::phys::page_alloc_may_fail(PACKET_BUFFER_ALLOC_BYTES, "net_packet_buffer");
+    if (mem == nullptr) {
+        return nullptr;
+    }
+    return new (mem) PacketBuffer{};
+}
+
+void free_dma_packet_buffer(PacketBuffer* pkt) {
+    if (pkt == nullptr) {
+        return;
+    }
+    pkt->~PacketBuffer();
+    ker::mod::mm::phys::page_free(pkt);
+}
+
+void free_packet_buffer_array(PacketBuffer** buffers, size_t count) {
+    if (buffers == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        free_dma_packet_buffer(buffers[i]);
+    }
+    delete[] buffers;
+}
+
 #ifdef WOS_NET_PACKET_DEBUG
 void pkt_debug_dump_in_use(size_t avail) {
     std::array<SiteSummary, DEBUG_SITE_TRACK_SLOTS> site_counts{};
@@ -86,8 +120,8 @@ void pkt_debug_dump_in_use(size_t avail) {
 
     for (PacketChunk const* chunk = chunk_list; chunk != nullptr; chunk = chunk->next) {
         for (size_t i = 0; i < chunk->count; i++) {
-            PacketBuffer const* pkt = &chunk->base[i];
-            if (!pkt->debug_in_use) {
+            PacketBuffer const* pkt = chunk->buffers[i];
+            if (pkt == nullptr || !pkt->debug_in_use) {
                 continue;
             }
 
@@ -143,10 +177,9 @@ void pkt_debug_dump_in_use(size_t avail) {
 #endif
 
 void add_buffers_to_pool(size_t count) {
-    // Allocate new buffers
-    auto* new_buffers = new (std::nothrow) PacketBuffer[count]{};
+    auto* new_buffers = new (std::nothrow) PacketBuffer*[count]{};
     if (new_buffers == nullptr) {
-        log::error("Failed to allocate %zu packet buffers", count);
+        log::error("Failed to allocate packet pointer table for %zu buffers", count);
         return;
     }
 
@@ -156,7 +189,20 @@ void add_buffers_to_pool(size_t count) {
         log::error("Failed to allocate packet chunk metadata for %zu buffers", count);
         return;
     }
-    chunk->base = new_buffers;
+    size_t allocated = 0;
+    for (; allocated < count; ++allocated) {
+        new_buffers[allocated] = alloc_dma_packet_buffer();
+        if (new_buffers[allocated] == nullptr) {
+            break;
+        }
+    }
+    if (allocated != count) {
+        free_packet_buffer_array(new_buffers, allocated);
+        delete chunk;
+        log::error("Failed to allocate physically contiguous packet buffers (%zu/%zu)", allocated, count);
+        return;
+    }
+    chunk->buffers = new_buffers;
     chunk->count = count;
 
     pool_lock.lock();
@@ -164,8 +210,8 @@ void add_buffers_to_pool(size_t count) {
     chunk_list = chunk;
     // Link new buffers into free list
     for (size_t i = 0; i < count; i++) {
-        new_buffers[i].next = free_list;
-        free_list = &new_buffers[i];
+        new_buffers[i]->next = free_list;
+        free_list = new_buffers[i];
     }
     pool_capacity += count;
     size_t const TOTAL = pool_capacity;
@@ -248,13 +294,9 @@ auto pkt_pool_size() -> size_t { return pool_capacity; }
 
 auto pkt_pool_free_count() -> size_t { return free_count.load(std::memory_order_relaxed); }
 
-auto pkt_pool_snapshot() -> PacketPoolSnapshot {
-    PacketPoolSnapshot snapshot{};
-    snapshot.baseline_capacity = baseline_pool_capacity();
-    uint64_t const FLAGS = pool_lock.lock_irqsave();
-    snapshot.capacity = pool_capacity;
-    pool_lock.unlock_irqrestore(FLAGS);
+namespace {
 
+void fill_packet_pool_snapshot_common(PacketPoolSnapshot& snapshot) {
     snapshot.free = free_count.load(std::memory_order_relaxed);
     snapshot.used = snapshot.capacity > snapshot.free ? snapshot.capacity - snapshot.free : 0;
     snapshot.active_capacity = snapshot.capacity;
@@ -265,7 +307,39 @@ auto pkt_pool_snapshot() -> PacketPoolSnapshot {
     snapshot.headroom = PKT_HEADROOM;
     snapshot.tx_refused = refuse_count.load(std::memory_order_relaxed);
     snapshot.expand_in_progress = expand_in_progress.load(std::memory_order_acquire);
+}
+
+}  // namespace
+
+auto pkt_pool_snapshot() -> PacketPoolSnapshot {
+    PacketPoolSnapshot snapshot{};
+    snapshot.baseline_capacity = baseline_pool_capacity();
+    uint64_t const FLAGS = pool_lock.lock_irqsave();
+    snapshot.capacity = pool_capacity;
+    pool_lock.unlock_irqrestore(FLAGS);
+
+    fill_packet_pool_snapshot_common(snapshot);
     return snapshot;
+}
+
+auto pkt_pool_try_snapshot(PacketPoolSnapshot& snapshot) -> bool {
+    snapshot = {};
+    snapshot.baseline_capacity = baseline_pool_capacity();
+
+    uint64_t flags = 0;
+    asm volatile("pushfq; popq %0" : "=r"(flags));
+    asm volatile("cli" ::: "memory");
+    bool const LOCKED = pool_lock.try_lock();
+    if (LOCKED) {
+        snapshot.capacity = pool_capacity;
+        pool_lock.unlock();
+    }
+    if ((flags & 0x200) != 0) {
+        asm volatile("sti" ::: "memory");
+    }
+
+    fill_packet_pool_snapshot_common(snapshot);
+    return LOCKED;
 }
 
 auto pkt_pool_reclaim_free(size_t target_capacity) -> PacketPoolReclaimStats {

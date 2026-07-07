@@ -18,6 +18,7 @@
 #include <net/wki/wire.hpp>
 #include <new>
 #include <platform/acpi/ioapic/ioapic.hpp>
+#include <platform/init/limine_requests.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
@@ -99,6 +100,56 @@ auto desired_queue_pairs(uint16_t device_max_pairs, uint64_t core_count) -> uint
         return SINGLE_QUEUE_PAIRS;
     }
     return static_cast<uint8_t>(CAPPED);
+}
+
+auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
+    if (cmdline == nullptr || token == nullptr || token[0] == '\0') {
+        return false;
+    }
+
+    size_t const TOKEN_LEN = std::strlen(token);
+    const char* cur = cmdline;
+    while (*cur != '\0') {
+        while (*cur == ' ' || *cur == '\t' || *cur == '\n') {
+            ++cur;
+        }
+        if (*cur == '\0') {
+            break;
+        }
+        const char* start = cur;
+        while (*cur != '\0' && *cur != ' ' && *cur != '\t' && *cur != '\n') {
+            ++cur;
+        }
+        auto const LEN = static_cast<size_t>(cur - start);
+        if (LEN == TOKEN_LEN && std::strncmp(start, token, TOKEN_LEN) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto virtio_net_mq_disabled() -> bool {
+    static std::atomic<int> cached{-1};
+    int const VALUE = cached.load(std::memory_order_acquire);
+    if (VALUE >= 0) {
+        return VALUE != 0;
+    }
+
+    bool const DISABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "virtio_net.no_mq");
+    cached.store(DISABLED ? 1 : 0, std::memory_order_release);
+    return DISABLED;
+}
+
+auto virtio_net_mrg_rxbuf_disabled() -> bool {
+    static std::atomic<int> cached{-1};
+    int const VALUE = cached.load(std::memory_order_acquire);
+    if (VALUE >= 0) {
+        return VALUE != 0;
+    }
+
+    bool const DISABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "virtio_net.no_mrg_rxbuf");
+    cached.store(DISABLED ? 1 : 0, std::memory_order_release);
+    return DISABLED;
 }
 
 auto queue_pair_for_napi(VirtIONetDevice* dev, ker::net::NapiStruct* napi) -> VirtIONetQueuePair* {
@@ -886,12 +937,18 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     if ((FEAT_LO & VIRTIO_NET_F_STATUS) != 0) {
         our_lo |= VIRTIO_NET_F_STATUS;
     }
-    if ((FEAT_LO & VIRTIO_NET_F_MRG_RXBUF) != 0) {
+    bool const MRG_RXBUF_DISABLED = virtio_net_mrg_rxbuf_disabled();
+    if (!MRG_RXBUF_DISABLED && (FEAT_LO & VIRTIO_NET_F_MRG_RXBUF) != 0) {
         our_lo |= VIRTIO_NET_F_MRG_RXBUF;
+    } else if (MRG_RXBUF_DISABLED && (FEAT_LO & VIRTIO_NET_F_MRG_RXBUF) != 0) {
+        net_log::info("virtio-net mergeable RX buffers disabled by cmdline");
     }
-    bool want_mq = (CORE_COUNT >= 2) && ((FEAT_LO & VIRTIO_NET_F_CTRL_VQ) != 0) && ((FEAT_LO & VIRTIO_NET_F_MQ) != 0);
+    bool const MQ_DISABLED = virtio_net_mq_disabled();
+    bool want_mq = !MQ_DISABLED && (CORE_COUNT >= 2) && ((FEAT_LO & VIRTIO_NET_F_CTRL_VQ) != 0) && ((FEAT_LO & VIRTIO_NET_F_MQ) != 0);
     if (want_mq) {
         our_lo |= VIRTIO_NET_F_CTRL_VQ | VIRTIO_NET_F_MQ;
+    } else if (MQ_DISABLED && (FEAT_LO & VIRTIO_NET_F_MQ) != 0) {
+        net_log::info("virtio-net multiqueue disabled by cmdline");
     }
 
     cfg->driver_feature_select = 0;
