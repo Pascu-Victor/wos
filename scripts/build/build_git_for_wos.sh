@@ -30,6 +30,7 @@ GIT_TARBALL_SHA256="${WOS_GIT_TARBALL_SHA256:-f689162364c10de79ef89aa8dbf48731eb
 GIT_TARBALL_URLS="${WOS_GIT_TARBALL_URLS:-$GIT_TARBALL_URL}"
 GIT_DOWNLOAD_ATTEMPTS="${WOS_GIT_DOWNLOAD_ATTEMPTS:-${WOS_SOURCE_DOWNLOAD_ATTEMPTS:-3}}"
 WOS_GIT_STRIP="${WOS_GIT_STRIP:-0}"
+WOS_GIT_OPT_FLAGS="${WOS_GIT_OPT_FLAGS:--O2}"
 
 export PATH="$HOST/bin:$PATH"
 export LD_LIBRARY_PATH="$HOST/lib"
@@ -234,7 +235,7 @@ if [ ! -e "$TARGET_SYSROOT/usr" ]; then
 fi
 
 TARGET_CC="${WOS_CCACHE_PREFIX}$HOST/bin/clang --target=$TARGET_ARCH --sysroot=$TARGET_SYSROOT"
-GIT_CFLAGS="--sysroot=$TARGET_SYSROOT -O2 -g -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -I. -Icompat/regex -I$TARGET_SYSROOT/include"
+GIT_CFLAGS="--sysroot=$TARGET_SYSROOT $WOS_GIT_OPT_FLAGS -g -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -I. -Icompat/regex -I$TARGET_SYSROOT/include"
 GIT_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
 GIT_EXTLIBS="$TARGET_SYSROOT/lib/libz.a -lpthread -lrt -ldl -lm -lc"
 GIT_CURL_CFLAGS="-I$TARGET_SYSROOT/include -DCURL_STATICLIB"

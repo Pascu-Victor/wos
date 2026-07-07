@@ -162,6 +162,11 @@ if(WOS_NATIVE_SYSTEM_BUILD)
     set(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN_DEFAULT ON)
 endif()
 option(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN "Reuse artifacts already produced by tools/bootstrap.sh instead of rerunning external toolchain/userland port builders" ${WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN_DEFAULT})
+option(WOS_USERSPACE_NO_AVX "Build WOS userspace and HTTPS ports without AVX for FPU-state diagnostics" OFF)
+set(WOS_USERSPACE_NO_AVX_ENV 0)
+if(WOS_USERSPACE_NO_AVX)
+    set(WOS_USERSPACE_NO_AVX_ENV 1)
+endif()
 
 set(SYSROOT ${WOS_SYSROOT_PATH})
 set(MLIBC_BUILD_DIR ${WOS_MLIBC_BUILD_DIR})
@@ -440,6 +445,7 @@ if(WOS_BUILD_OPENSSL_FOR_WOS OR WOS_BUILD_CURL_FOR_WOS OR WOS_BUILD_GIT_FOR_WOS)
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_OPENSSL_BUILD_DIR=${WOS_OPENSSL_BUILD_DIR}
                     WOS_OPENSSL_SOURCE_DIR=${WOS_OPENSSL_SOURCE_DIR}
+                    WOS_USERSPACE_NO_AVX=${WOS_USERSPACE_NO_AVX_ENV}
                     ${WOS_BUILD_SCRIPTS_DIR}/build_openssl_for_wos.sh
             COMMAND ${CMAKE_COMMAND} -E touch ${OPENSSL_FOR_WOS_STAMP}
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -472,6 +478,7 @@ if(WOS_BUILD_CURL_FOR_WOS OR WOS_BUILD_GIT_FOR_WOS)
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_CURL_BUILD_DIR=${WOS_CURL_BUILD_DIR}
                     WOS_CURL_SOURCE_DIR=${WOS_CURL_SOURCE_DIR}
+                    WOS_USERSPACE_NO_AVX=${WOS_USERSPACE_NO_AVX_ENV}
                     ${WOS_BUILD_SCRIPTS_DIR}/build_curl_for_wos.sh
             COMMAND ${CMAKE_COMMAND} -E touch ${CURL_FOR_WOS_STAMP}
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}

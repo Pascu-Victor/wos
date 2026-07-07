@@ -91,6 +91,7 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF CACHE BOOL "Disable C++ modules" FORCE)
 option(WOS_UASAN "Enable AddressSanitizer instrumentation for WOS userspace modules" OFF)
 set(WOS_UASAN_RUNTIME_DIR "" CACHE PATH "Clang runtime directory containing WOS AddressSanitizer libraries")
 option(WOS_USERSPACE_COVERAGE "Enable LLVM source-based coverage instrumentation for WOS userspace modules" OFF)
+option(WOS_USERSPACE_NO_AVX "Build WOS userspace without AVX for FPU-state diagnostics" OFF)
 option(WOS_DYNAMIC_USERSPACE_PIE "Build dynamic WOS userspace executables as PIE" OFF)
 option(WOS_DYNAMIC_USERSPACE_NO_PLT "Use GOT calls instead of PLT stubs for dynamic WOS userspace executables" OFF)
 
@@ -106,9 +107,13 @@ else()
 endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(WOS_USERSPACE_CPU_OPTIONS -march=native)
+if(WOS_USERSPACE_NO_AVX)
+    list(APPEND WOS_USERSPACE_CPU_OPTIONS -mno-avx -mno-avx2 -mno-fma -mno-f16c -fno-vectorize -fno-slp-vectorize)
+endif()
 add_compile_options(
     # Common flags for C and C++
-    "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-O3;-g;-flto;-fdiagnostics-color=always;-fno-stack-protector;-fno-stack-check;-fno-sanitize=safe-stack;-pipe;-Wall;-Wextra;-pedantic;-Wno-gnu-anonymous-struct;-Wno-c99-extensions;-Wno-zero-length-array;-m64;-march=native;-Wformat;-Wformat-security;-Werror=format-security;${WOS_SYSROOT_COMPILE_OPTIONS};-fno-omit-frame-pointer>"
+    "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-O3;-g;-flto;-fdiagnostics-color=always;-fno-stack-protector;-fno-stack-check;-fno-sanitize=safe-stack;-pipe;-Wall;-Wextra;-pedantic;-Wno-gnu-anonymous-struct;-Wno-c99-extensions;-Wno-zero-length-array;-m64;-Wformat;-Wformat-security;-Werror=format-security;${WOS_SYSROOT_COMPILE_OPTIONS};-fno-omit-frame-pointer>"
     # C-specific flags
     "$<$<COMPILE_LANGUAGE:C>:-std=gnu11>"
     "$<$<COMPILE_LANGUAGE:C>:SHELL:-isystem ${WOS_C_STDLIB_INCLUDE}>"
@@ -215,6 +220,14 @@ add_subdirectory(powerctl)
 add_subdirectory(renderbench)
 add_subdirectory(strace)
 add_subdirectory(sftpserver)
+
+foreach(user_target IN LISTS WOS_USERSPACE_TARGETS)
+    if(TARGET ${user_target})
+        target_compile_options(${user_target} PRIVATE
+            "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:${WOS_USERSPACE_CPU_OPTIONS}>"
+        )
+    endif()
+endforeach()
 
 function(wos_strip_link_flag out_value in_value flag)
     string(REPLACE "${flag}" "" stripped_value "${in_value}")

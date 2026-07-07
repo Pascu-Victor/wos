@@ -3,6 +3,7 @@ copy	configs/rootfs/etc/services	/etc/services
 copy	configs/rootfs/etc/resolv.conf	/etc/resolv.conf
 copy	configs/rootfs/etc/inputrc	/etc/inputrc
 copy	configs/rootfs/etc/nanorc	/etc/nanorc
+copy	configs/rootfs/etc/gitconfig	/etc/gitconfig
 copy	build/modules/testprog/testprog	/usr/bin/testprog
 copy	build/modules/testd/testd	/usr/bin/testd
 copy	build/modules/perf/perf	/usr/bin/perf

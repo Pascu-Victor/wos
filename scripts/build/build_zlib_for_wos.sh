@@ -101,7 +101,9 @@ if [ ! -e "$TARGET_SYSROOT/usr" ]; then
     ln -s . "$TARGET_SYSROOT/usr"
 fi
 
-ZLIB_CFLAGS="--sysroot=$TARGET_SYSROOT -O2 -g -fPIC -fno-sanitize=safe-stack -fno-stack-protector"
+WOS_ZLIB_OPT_FLAGS="${WOS_ZLIB_OPT_FLAGS:--O2}"
+
+ZLIB_CFLAGS="--sysroot=$TARGET_SYSROOT $WOS_ZLIB_OPT_FLAGS -g -fPIC -fno-sanitize=safe-stack -fno-stack-protector"
 ZLIB_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib"
 
 export CHOST="$TARGET_ARCH"

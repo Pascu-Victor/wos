@@ -1,0 +1,10 @@
+# Keep Git on libcurl's HTTP/1.1 path on WOS. The HTTP/2 path can corrupt
+# large pack streams while the WOS transport stack is still maturing.
+[http]
+    version = HTTP/1.1
+
+[pack]
+    threads = 1
+
+[index]
+    threads = 1
