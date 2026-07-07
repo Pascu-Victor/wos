@@ -1116,6 +1116,8 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
             case PT_PHDR:
             case PT_INTERP:
             case PT_DYNAMIC:
+            case PT_GNU_PROPERTY:
+            case PT_GNU_SFRAME:
                 // Informational/user-loader segments: no kernel mapping work needed here.
 #ifdef ELF_DEBUG
                 if (current_header->p_type == PT_PHDR) {
@@ -1159,10 +1161,8 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
                 break;
 
             default:
-                mod::dbg::log("Segment processing failed");
-                mod::dbg::log("Tried to load segment type %d", current_header->p_type);
-                hcf();
-                break;
+                mod::dbg::log("Unsupported ELF segment type %d", current_header->p_type);
+                return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0};
         }
     }
 

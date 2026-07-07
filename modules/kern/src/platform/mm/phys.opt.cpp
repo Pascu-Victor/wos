@@ -13,6 +13,7 @@
 #include <sanitizer/kasan.hpp>
 #include <span>
 #include <string_view>
+#include <utility>
 
 #ifdef WOS_PHYS_LOCK_DEBUG
 #include <platform/acpi/apic/apic.hpp>
@@ -22,6 +23,7 @@
 #include "page_alloc.hpp"
 #include "platform/asm/tlb.hpp"
 #include "platform/dbg/dbg.hpp"
+#include "platform/init/limine_requests.hpp"
 #include "platform/mm/addr.hpp"
 #include "platform/mm/dyn/kmalloc.hpp"
 #include "platform/mm/paging.hpp"
@@ -85,6 +87,54 @@ std::atomic<bool> per_cpu_ready{false};  // Set after per-CPU structures are ini
 // independent order-0 pages. Cached pages have a distinct allocator flag and are
 // not linked in buddy lists, so coalescing cannot consume a CPU-local entry.
 constexpr bool USE_PER_CPU_PAGE_CACHE = true;
+
+auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
+    if (cmdline == nullptr || token == nullptr || token[0] == '\0') {
+        return false;
+    }
+
+    size_t const TOKEN_LEN = std::strlen(token);
+    const char* cursor = cmdline;
+    while (*cursor != '\0') {
+        while (*cursor == ' ') {
+            ++cursor;
+        }
+
+        const char* start = cursor;
+        while (*cursor != '\0' && *cursor != ' ') {
+            ++cursor;
+        }
+
+        if (std::cmp_equal(cursor - start, TOKEN_LEN) && std::strncmp(start, token, TOKEN_LEN) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto per_cpu_page_cache_enabled() -> bool {
+    if (!USE_PER_CPU_PAGE_CACHE) {
+        return false;
+    }
+
+    static std::atomic<int> s_enabled{-1};
+    int cached = s_enabled.load(std::memory_order_acquire);
+    if (cached >= 0) {
+        return cached != 0;
+    }
+
+    bool const DISABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "phys.no_page_cache");
+    int const VALUE = DISABLED ? 0 : 1;
+    int expected = -1;
+    if (s_enabled.compare_exchange_strong(expected, VALUE, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        if (DISABLED) {
+            log::warn("per-CPU order-0 page cache disabled by cmdline");
+        }
+        return !DISABLED;
+    }
+
+    return expected != 0;
+}
 
 struct TrackedSpinlock {
     std::atomic<bool> locked{false};
@@ -1246,7 +1296,7 @@ void refill_per_cpu_cache_locked(PerCpuPageCache& cache) {
 }
 
 auto try_alloc_from_per_cpu_cache(uint64_t caller_tag, ReturnedPageZeroing zeroing, void* caller_addr) -> void* {
-    if (!USE_PER_CPU_PAGE_CACHE || per_cpu_caches == nullptr || !per_cpu_ready.load(std::memory_order_acquire)) {
+    if (per_cpu_caches == nullptr || !per_cpu_ready.load(std::memory_order_acquire) || !per_cpu_page_cache_enabled()) {
         return nullptr;
     }
 
@@ -1295,8 +1345,8 @@ auto try_alloc_from_per_cpu_cache(uint64_t caller_tag, ReturnedPageZeroing zeroi
 }
 
 auto try_cache_freed_order0_page(PageAllocator* allocator, void* page) -> bool {
-    if (!USE_PER_CPU_PAGE_CACHE || allocator == nullptr || page == nullptr || per_cpu_caches == nullptr ||
-        !per_cpu_ready.load(std::memory_order_acquire)) {
+    if (allocator == nullptr || page == nullptr || per_cpu_caches == nullptr || !per_cpu_ready.load(std::memory_order_acquire) ||
+        !per_cpu_page_cache_enabled()) {
         return false;
     }
 
@@ -2103,7 +2153,7 @@ void get_page_ref_stats_snapshot(PageRefStatsSnapshot& out) {
 
 void get_page_cache_stats_snapshot(PageCacheStatsSnapshot& out) {
     out = PageCacheStatsSnapshot{
-        .enabled = USE_PER_CPU_PAGE_CACHE ? 1U : 0U,
+        .enabled = per_cpu_page_cache_enabled() ? 1U : 0U,
         .capacity = per_cpu_caches != nullptr ? static_cast<uint64_t>(num_cpus * PerCpuPageCache::CACHE_SIZE) : 0U,
         .cached_pages = total_cached_order0_pages_snapshot(),
         .alloc_hits = page_cache_alloc_hits.load(std::memory_order_relaxed),

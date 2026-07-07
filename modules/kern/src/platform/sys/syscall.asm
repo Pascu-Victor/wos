@@ -50,6 +50,18 @@ wos_asm_syscall_handler:
 
     ; Pass pointer to saved registers (GPRegs) as first argument.
     ; The separate syscall return-value slot is after the GPRegs block.
+    extern wos_syscall_save_current_fpu
+    ; Protect the user FPU snapshot before any timer IRQ can switch away and
+    ; resume this syscall on a CPU whose hardware FPU belongs to another task.
+    pushfq
+    pop r14
+    cli
+    call wos_syscall_save_current_fpu
+    test r14, 0x200
+    jz .syscall_fpu_saved
+    sti
+.syscall_fpu_saved:
+
     lea rdi, [rsp]
     xor rbp, rbp
 
@@ -92,6 +104,16 @@ wos_asm_syscall_handler:
     cli
     test rax, rax
     setnz r12b
+
+    extern wos_debug_validate_syscall_user_return
+    mov rdi, rsp
+    mov rsi, rax
+    call wos_debug_validate_syscall_user_return
+    cli
+
+    extern wos_syscall_restore_current_fpu
+    call wos_syscall_restore_current_fpu
+    cli
 .signal_checked:
     ; Validate the userspace return target before either SYSRET or the signal
     ; IRET path consumes the live per-CPU scratch fields.  SYSRET in particular
@@ -109,6 +131,9 @@ wos_asm_syscall_handler:
     mov r10, [gs:0x30]
     test r10, 0x2
     jz .sysret_bad_target_flags
+    or r10, 0x202
+    mov [gs:0x30], r10
+    mov [rsp + 32], r10
     test r12b, r12b
     jne .signal_iret_return
 

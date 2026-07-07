@@ -46,17 +46,6 @@ wos_enable_xsave_asm:
     jnc .no_avx
     or eax, 0x4          ; AVX (bit 2)
 
-    ; Check AVX-512 support (CPUID.(EAX=7,ECX=0):EBX bit 16 = AVX-512F)
-    push rax
-    mov eax, 7
-    xor ecx, ecx
-    cpuid
-    bt ebx, 16
-    pop rax
-    jnc .no_avx512
-    or eax, 0xE0         ; opmask (5) + ZMM_Hi256 (6) + Hi16_ZMM (7)
-.no_avx512:
-
 .no_avx:
     ; Write XCR0
     xor edx, edx

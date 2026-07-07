@@ -195,12 +195,14 @@ struct Context {
 // We over-allocate by 63 bytes so we can always find a 64-byte-aligned region
 // inside the buffer, regardless of the Task allocation's alignment.
 struct FxState {
-    static constexpr size_t XSAVE_AREA_SIZE = 2688;
+    static constexpr size_t XSAVE_AREA_SIZE = cpu::XSAVE_STATIC_AREA_SIZE;
     static constexpr size_t ALIGNMENT_SLACK = 63;
     using RawBuffer = std::array<uint8_t, XSAVE_AREA_SIZE + ALIGNMENT_SLACK>;
 
     RawBuffer raw{};
-    bool saved = false;  // true after first save_fpu_state - guards xrstor on zeroed buffer
+    bool saved = false;        // true once raw[] contains a valid xsave/fxsave image
+    bool live_saved = false;   // true while raw[] already protects the task's current user-visible state
+    bool initialized = false;  // true once hardware FPU state has been initialized for this task
 
     // Return a pointer to the 64-byte-aligned region within raw[].
     uint8_t* aligned() {

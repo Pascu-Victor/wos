@@ -118,6 +118,7 @@ void switch_to_kernel_pagemap();
 PageTable* get_kernel_pagemap();
 void init_tlb_shootdown();
 void note_tlb_shootdown_cpu_online();
+void service_pending_tlb_shootdowns();
 void init_pagemap();
 PageTable* create_pagemap();
 void release_pagemap(PageTable* pagemap);
@@ -136,6 +137,7 @@ static constexpr paddr_t PADDR_INVALID = static_cast<paddr_t>(-1);
 
 paddr_t translate(PageTable* page_table, vaddr_t vaddr);
 bool ensure_user_page_writable(sched::task::Task* task, vaddr_t vaddr);
+bool ensure_user_page_mapped(sched::task::Task* task, vaddr_t vaddr);
 auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats;
 auto get_destroy_user_space_stats(uint64_t cpu_no) -> DestroyUserSpaceStats;
 auto create_destroy_user_space_budget_state(PageTable* pagemap, uint64_t owner_pid = 0, const char* owner_name = nullptr,

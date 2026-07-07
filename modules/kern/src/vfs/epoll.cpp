@@ -183,7 +183,7 @@ auto epoll_create(int flags) -> int {
     }
     file->fd = FD;
     if ((flags & EPOLL_CLOEXEC_FLAG) != 0) {
-        task->set_fd_cloexec(static_cast<unsigned>(FD));
+        static_cast<void>(vfs_fcntl(FD, 2, 1));
     }
     return FD;
 }

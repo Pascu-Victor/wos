@@ -18,6 +18,8 @@
 #include <net/wki/remotable.hpp>
 #include <net/wki/remote_vfs.hpp>
 #include <net/wki/wki.hpp>
+#include <new>
+#include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/phys.hpp>
@@ -79,6 +81,7 @@ auto resolve_task_path_raw_impl(const char* path, char* out, size_t outsize, boo
 auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize_t;
 auto strip_mount_prefix(const MountPoint* mount, const char* path) -> const char*;
 auto tmpfs_root_for_mount(const MountPoint* mount) -> ker::vfs::tmpfs::TmpNode*;
+auto vfs_set_fd_cloexec_for_task(ker::mod::sched::task::Task* task, int fd, bool cloexec) -> int;
 
 ker::util::SmallVec<ker::mod::sched::task::WkiVfsRule, 8> g_default_vfs_rules;
 
@@ -110,6 +113,8 @@ constexpr size_t PIPE_WAKE_BATCH = 32;
 constexpr size_t PIPE_WAITER_INLINE_CAPACITY = PIPE_WAKE_BATCH * 2;
 constexpr size_t PIPE_DEFAULT_CAPACITY = 256UL * 1024UL;
 constexpr size_t PIPE_DIRECT_MAX_CAPACITY = 256UL * 1024UL;
+constexpr size_t USER_IO_BOUNCE_STACK_CHUNK = 4096;
+constexpr size_t USER_IO_BOUNCE_MAX_CHUNK = size_t{256} * 1024;
 constexpr uint64_t ADVISORY_RANGE_EOF = UINT64_MAX;
 // CMake/Ninja tree scans touch enough distinct paths that small metadata caches
 // thrash mostly on set conflicts. Keep this static and bounded: 131072 entries
@@ -378,20 +383,9 @@ auto advisory_user_copy(uint64_t user_addr, void* kernel_buf, size_t size, bool 
         return -EFAULT;
     }
 
-    auto* kernel_bytes = static_cast<uint8_t*>(kernel_buf);
-    for (size_t i = 0; i < size; ++i) {
-        uint64_t const PHYS = ker::mod::mm::virt::translate(task->pagemap, user_addr + i);
-        if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
-            return -EFAULT;
-        }
-        auto* user_byte = reinterpret_cast<uint8_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
-        if (to_user) {
-            *user_byte = kernel_bytes[i];
-        } else {
-            kernel_bytes[i] = *user_byte;
-        }
-    }
-    return 0;
+    bool const OK = to_user ? ker::mod::sys::usercopy::copy_to_task(*task, user_addr, kernel_buf, size)
+                            : ker::mod::sys::usercopy::copy_from_task(*task, user_addr, kernel_buf, size);
+    return OK ? 0 : -EFAULT;
 }
 
 auto advisory_copy_from_user(uint64_t user_addr, VfsFlockAbi& lock) -> int {
@@ -4886,7 +4880,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
                 return FD;
             }
             if ((flags & ker::vfs::O_CLOEXEC) != 0) {
-                current->set_fd_cloexec(static_cast<unsigned>(FD));
+                static_cast<void>(vfs_set_fd_cloexec_for_task(current, FD, true));
             }
             return FD;
         }
@@ -5043,12 +5037,82 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
         return FD;
     }
     if ((flags & ker::vfs::O_CLOEXEC) != 0) {
-        current->set_fd_cloexec(static_cast<unsigned>(FD));
+        static_cast<void>(vfs_set_fd_cloexec_for_task(current, FD, true));
     }
     return FD;
 }
 
 auto vfs_close_file(File* file) -> int { return vfs_destroy_file(file); }
+
+namespace {
+struct FdTableTaskRef {
+    ker::mod::sched::task::Task* task = nullptr;
+    bool retained = false;
+
+    FdTableTaskRef() = default;
+    FdTableTaskRef(ker::mod::sched::task::Task* task_ref, bool retained_ref) : task(task_ref), retained(retained_ref) {}
+    FdTableTaskRef(const FdTableTaskRef&) = delete;
+    auto operator=(const FdTableTaskRef&) -> FdTableTaskRef& = delete;
+    FdTableTaskRef(FdTableTaskRef&& other) noexcept : task(other.task), retained(other.retained) {
+        other.task = nullptr;
+        other.retained = false;
+    }
+    auto operator=(FdTableTaskRef&& other) noexcept -> FdTableTaskRef& {
+        if (this != &other) {
+            if (retained && task != nullptr) {
+                task->release();
+            }
+            task = other.task;
+            retained = other.retained;
+            other.task = nullptr;
+            other.retained = false;
+        }
+        return *this;
+    }
+    ~FdTableTaskRef() {
+        if (retained && task != nullptr) {
+            task->release();
+        }
+    }
+};
+
+auto fd_table_task_for(ker::mod::sched::task::Task* task) -> FdTableTaskRef {
+    if (task == nullptr) {
+        return {};
+    }
+    if (task->is_thread && task->owner_pid != 0 && task->owner_pid != task->pid) {
+        auto* owner = ker::mod::sched::find_task_by_pid_safe(task->owner_pid);
+        if (owner != nullptr) {
+            return {owner, true};
+        }
+        return {};
+    }
+    return {task, false};
+}
+
+auto vfs_set_fd_cloexec_for_task(ker::mod::sched::task::Task* task, int fd, bool cloexec) -> int {
+    if (task == nullptr || fd < 0) {
+        return -EINVAL;
+    }
+    auto fd_owner = fd_table_task_for(task);
+    auto* table_task = fd_owner.task;
+    if (table_task == nullptr) {
+        return -ESRCH;
+    }
+
+    uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+    bool const PRESENT = table_task->fd_table.lookup(static_cast<uint64_t>(fd)) != nullptr;
+    if (PRESENT) {
+        if (cloexec) {
+            table_task->set_fd_cloexec(static_cast<unsigned>(fd));
+        } else {
+            table_task->clear_fd_cloexec(static_cast<unsigned>(fd));
+        }
+    }
+    table_task->fd_table_lock.unlock_irqrestore(IRQF);
+    return PRESENT ? 0 : -EBADF;
+}
+}  // namespace
 
 auto vfs_close(int fd) -> int {
     // Release FD from current task
@@ -5056,18 +5120,25 @@ auto vfs_close(int fd) -> int {
     if (t == nullptr) {
         return -ESRCH;
     }
-    uint64_t const IRQF = t->fd_table_lock.lock_irqsave();
-    ker::vfs::File* f = vfs_take_fd_locked(t, fd);
-    size_t const FD_COUNT = t->fd_table.size();
-    t->fd_table_lock.unlock_irqrestore(IRQF);
+    auto fd_owner = fd_table_task_for(t);
+    auto* table_task = fd_owner.task;
+    if (table_task == nullptr) {
+        return -ESRCH;
+    }
+
+    uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+    ker::vfs::File* f = vfs_take_fd_locked(table_task, fd);
+    size_t const FD_COUNT = table_task->fd_table.size();
+    table_task->fd_table_lock.unlock_irqrestore(IRQF);
     if (f == nullptr) {
         return -EBADF;
     }
 
     advisory_release_process_locks_for_file(ker::mod::sched::task::process_pid(*t), f);
 
-    ker::mod::perf::record_container_stat(0, t->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
-                                          static_cast<int64_t>(FD_COUNT), 0, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+    ker::mod::perf::record_container_stat(0, table_task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0,
+                                          ker::mod::perf::PERF_FLAG_CT_REMOVE, static_cast<int64_t>(FD_COUNT), 0,
+                                          reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 
     // Atomically decrement; only the CPU that drives refcount to 0 does teardown.
     if (f->refcount.fetch_sub(1, std::memory_order_acq_rel) > 1) {
@@ -5093,6 +5164,74 @@ auto vfs_file_can_write(const File* file) -> bool {
     int const ACCMODE = file->open_flags & O_ACCMODE_MASK;
     return ACCMODE == O_WRONLY_MODE || ACCMODE == O_RDWR_MODE;
 }
+
+auto vfs_user_read_bounce_applies(const File* file, void* buf, size_t count, const ker::mod::sched::task::Task* task) -> bool {
+    if (file == nullptr || buf == nullptr || count == 0) {
+        return false;
+    }
+    if (task == nullptr || task->pagemap == nullptr) {
+        return false;
+    }
+    return ker::mod::sys::usercopy::range_valid(reinterpret_cast<uint64_t>(buf), count);
+}
+
+auto vfs_read_user_bounced(ker::mod::sched::task::Task& task, File* file, void* user_buf, size_t count, size_t offset, size_t* actual_size)
+    -> ssize_t {
+    std::array<uint8_t, USER_IO_BOUNCE_STACK_CHUNK> stack_bounce{};
+    size_t const BOUNCE_SIZE = std::min(count, USER_IO_BOUNCE_MAX_CHUNK);
+    std::unique_ptr<uint8_t[]> heap_bounce{};
+    if (BOUNCE_SIZE > stack_bounce.size()) {
+        heap_bounce.reset(new (std::nothrow) uint8_t[BOUNCE_SIZE]);
+    }
+    uint8_t* const bounce = heap_bounce != nullptr ? heap_bounce.get() : stack_bounce.data();
+    size_t const bounce_size = heap_bounce != nullptr ? BOUNCE_SIZE : stack_bounce.size();
+    auto const USER_BASE = reinterpret_cast<uint64_t>(user_buf);
+    size_t total = 0;
+
+    auto finish = [&](ssize_t result) -> ssize_t {
+        if (result >= 0 && actual_size != nullptr) {
+            *actual_size = static_cast<size_t>(result);
+        }
+        return result;
+    };
+
+    while (total < count) {
+        size_t const TO_READ = std::min(count - total, bounce_size);
+        if (!ker::mod::sys::usercopy::ensure_writable(task, USER_BASE + total, TO_READ)) {
+            return total > 0 ? finish(static_cast<ssize_t>(total)) : -EFAULT;
+        }
+
+        ssize_t const READ_RET = clamp_io_count(file->fops->vfs_read(file, bounce, TO_READ, offset + total), TO_READ);
+        if (READ_RET < 0) {
+            return total > 0 ? finish(static_cast<ssize_t>(total)) : READ_RET;
+        }
+        if (READ_RET == 0) {
+            return finish(static_cast<ssize_t>(total));
+        }
+
+        auto const BYTES_READ = static_cast<size_t>(READ_RET);
+        if (!ker::mod::sys::usercopy::copy_to_task(task, USER_BASE + total, bounce, BYTES_READ)) {
+            return total > 0 ? finish(static_cast<ssize_t>(total)) : -EFAULT;
+        }
+
+        total += BYTES_READ;
+        if (BYTES_READ < TO_READ) {
+            return finish(static_cast<ssize_t>(total));
+        }
+    }
+
+    return finish(static_cast<ssize_t>(total));
+}
+
+auto vfs_user_write_bounce_applies(const void* buf, size_t count, const ker::mod::sched::task::Task* task) -> bool {
+    if (buf == nullptr || count == 0) {
+        return false;
+    }
+    if (task == nullptr || task->pagemap == nullptr) {
+        return false;
+    }
+    return ker::mod::sys::usercopy::range_valid(reinterpret_cast<uint64_t>(buf), count);
+}
 }  // namespace
 
 auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
@@ -5111,6 +5250,19 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
     if ((f->fops == nullptr) || (f->fops->vfs_read == nullptr)) {
         vfs_put_file(f);
         return -EINVAL;
+    }
+    if (buf == nullptr && count != 0) {
+        vfs_put_file(f);
+        return -EFAULT;
+    }
+
+    if (vfs_user_read_bounce_applies(f, buf, count, t)) {
+        ssize_t const R = vfs_read_user_bounced(*t, f, buf, count, static_cast<size_t>(f->pos), actual_size);
+        if (R >= 0) {
+            f->pos += R;
+        }
+        vfs_put_file(f);
+        return R;
     }
 
     bool const USE_STREAM_CACHE = stream_cache_read_eligible(f);
@@ -5143,7 +5295,8 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
     return R;
 }
 
-auto vfs_write_file(File* f, const void* buf, size_t count, size_t* actual_size) -> ssize_t {
+namespace {
+auto vfs_write_file_direct(File* f, const void* buf, size_t count, size_t* actual_size) -> ssize_t {
     if (f == nullptr) {
         return -EBADF;
     }
@@ -5187,6 +5340,68 @@ auto vfs_write_file(File* f, const void* buf, size_t count, size_t* actual_size)
     return result;
 }
 
+auto vfs_write_user_bounced(ker::mod::sched::task::Task& task, File* file, const void* user_buf, size_t count, size_t* actual_size)
+    -> ssize_t {
+    if (file == nullptr) {
+        return -EBADF;
+    }
+    if (!vfs_file_can_write(file)) {
+        return -EBADF;
+    }
+    if (file->fops == nullptr || file->fops->vfs_write == nullptr) {
+        return -EINVAL;
+    }
+
+    std::array<uint8_t, USER_IO_BOUNCE_STACK_CHUNK> stack_bounce{};
+    size_t const BOUNCE_SIZE = std::min(count, USER_IO_BOUNCE_MAX_CHUNK);
+    std::unique_ptr<uint8_t[]> heap_bounce{};
+    if (BOUNCE_SIZE > stack_bounce.size()) {
+        heap_bounce.reset(new (std::nothrow) uint8_t[BOUNCE_SIZE]);
+    }
+    uint8_t* const bounce = heap_bounce != nullptr ? heap_bounce.get() : stack_bounce.data();
+    size_t const bounce_size = heap_bounce != nullptr ? BOUNCE_SIZE : stack_bounce.size();
+    auto const USER_BASE = reinterpret_cast<uint64_t>(user_buf);
+    size_t total = 0;
+
+    auto finish = [&](ssize_t result) -> ssize_t {
+        if (result >= 0 && actual_size != nullptr) {
+            *actual_size = static_cast<size_t>(result);
+        }
+        return result;
+    };
+
+    while (total < count) {
+        size_t const TO_WRITE = std::min(count - total, bounce_size);
+        if (!ker::mod::sys::usercopy::copy_from_task(task, USER_BASE + total, bounce, TO_WRITE)) {
+            return total > 0 ? finish(static_cast<ssize_t>(total)) : -EFAULT;
+        }
+
+        ssize_t const WRITE_RET = clamp_io_count(vfs_write_file_direct(file, bounce, TO_WRITE, nullptr), TO_WRITE);
+        if (WRITE_RET < 0) {
+            return total > 0 ? finish(static_cast<ssize_t>(total)) : WRITE_RET;
+        }
+        if (WRITE_RET == 0) {
+            return finish(static_cast<ssize_t>(total));
+        }
+
+        total += static_cast<size_t>(WRITE_RET);
+        if (std::cmp_less(WRITE_RET, TO_WRITE)) {
+            return finish(static_cast<ssize_t>(total));
+        }
+    }
+
+    return finish(static_cast<ssize_t>(total));
+}
+}  // namespace
+
+auto vfs_write_file(File* f, const void* buf, size_t count, size_t* actual_size) -> ssize_t {
+    ker::mod::sched::task::Task* task = ker::mod::sched::get_current_task();
+    if (vfs_user_write_bounce_applies(buf, count, task)) {
+        return vfs_write_user_bounced(*task, f, buf, count, actual_size);
+    }
+    return vfs_write_file_direct(f, buf, count, actual_size);
+}
+
 auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ssize_t {
     ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
     if (t == nullptr) {
@@ -5223,21 +5438,28 @@ auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int {
     if ((task == nullptr) || (file == nullptr)) {
         return -EINVAL;
     }
-    uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-    uint64_t const SLOT = vfs_find_free_fd_below_limit_locked(task, 0);
-    bool const INSERTED = SLOT != UINT64_MAX && task->fd_table.insert(SLOT, file);
-    if (INSERTED) {
-        task->clear_fd_cloexec(static_cast<unsigned>(SLOT));
+    auto fd_owner = fd_table_task_for(task);
+    auto* table_task = fd_owner.task;
+    if (table_task == nullptr) {
+        return -ESRCH;
     }
-    size_t const FD_COUNT = task->fd_table.size();
-    task->fd_table_lock.unlock_irqrestore(IRQF);
+
+    uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+    uint64_t const SLOT = vfs_find_free_fd_below_limit_locked(table_task, 0);
+    bool const INSERTED = SLOT != UINT64_MAX && table_task->fd_table.insert(SLOT, file);
+    if (INSERTED) {
+        table_task->clear_fd_cloexec(static_cast<unsigned>(SLOT));
+    }
+    size_t const FD_COUNT = table_task->fd_table.size();
+    table_task->fd_table_lock.unlock_irqrestore(IRQF);
 
     if (!INSERTED) {
         return -EMFILE;  // fd_table cannot currently distinguish OOM from exhaustion
     }
     file->fd = static_cast<int>(SLOT);
-    ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_INSERT,
-                                          static_cast<int64_t>(FD_COUNT), 0, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+    ker::mod::perf::record_container_stat(0, table_task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0,
+                                          ker::mod::perf::PERF_FLAG_CT_INSERT, static_cast<int64_t>(FD_COUNT), 0,
+                                          reinterpret_cast<uint64_t>(__builtin_return_address(0)));
     return static_cast<int>(SLOT);
 }
 
@@ -5245,9 +5467,15 @@ auto vfs_get_file(ker::mod::sched::task::Task* task, int fd) -> struct File* {
     if (task == nullptr || fd < 0) {
         return nullptr;
     }
-    uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-    auto* file = reinterpret_cast<struct File*>(task->fd_table.lookup(static_cast<uint64_t>(fd)));
-    task->fd_table_lock.unlock_irqrestore(IRQF);
+    auto fd_owner = fd_table_task_for(task);
+    auto* table_task = fd_owner.task;
+    if (table_task == nullptr) {
+        return nullptr;
+    }
+
+    uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+    auto* file = reinterpret_cast<struct File*>(table_task->fd_table.lookup(static_cast<uint64_t>(fd)));
+    table_task->fd_table_lock.unlock_irqrestore(IRQF);
     return file;
 }
 
@@ -5255,14 +5483,20 @@ auto vfs_get_file_retain(ker::mod::sched::task::Task* task, int fd) -> File* {
     if (task == nullptr || fd < 0) {
         return nullptr;
     }
-    uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-    auto* file = reinterpret_cast<File*>(task->fd_table.lookup(static_cast<uint64_t>(fd)));
+    auto fd_owner = fd_table_task_for(task);
+    auto* table_task = fd_owner.task;
+    if (table_task == nullptr) {
+        return nullptr;
+    }
+
+    uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+    auto* file = reinterpret_cast<File*>(table_task->fd_table.lookup(static_cast<uint64_t>(fd)));
     if (file == nullptr) {
-        task->fd_table_lock.unlock_irqrestore(IRQF);
+        table_task->fd_table_lock.unlock_irqrestore(IRQF);
         return nullptr;
     }
     file->refcount.fetch_add(1, std::memory_order_acq_rel);
-    task->fd_table_lock.unlock_irqrestore(IRQF);
+    table_task->fd_table_lock.unlock_irqrestore(IRQF);
     return file;
 }
 
@@ -5286,13 +5520,20 @@ auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int {
     if (task == nullptr || fd < 0) {
         return -EINVAL;
     }
-    uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-    task->fd_table.remove(static_cast<uint64_t>(fd));
-    task->clear_fd_cloexec(static_cast<unsigned>(fd));
-    size_t const FD_COUNT = task->fd_table.size();
-    task->fd_table_lock.unlock_irqrestore(IRQF);
-    ker::mod::perf::record_container_stat(0, task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
-                                          static_cast<int64_t>(FD_COUNT), 0, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+    auto fd_owner = fd_table_task_for(task);
+    auto* table_task = fd_owner.task;
+    if (table_task == nullptr) {
+        return -ESRCH;
+    }
+
+    uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+    table_task->fd_table.remove(static_cast<uint64_t>(fd));
+    table_task->clear_fd_cloexec(static_cast<unsigned>(fd));
+    size_t const FD_COUNT = table_task->fd_table.size();
+    table_task->fd_table_lock.unlock_irqrestore(IRQF);
+    ker::mod::perf::record_container_stat(0, table_task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0,
+                                          ker::mod::perf::PERF_FLAG_CT_REMOVE, static_cast<int64_t>(FD_COUNT), 0,
+                                          reinterpret_cast<uint64_t>(__builtin_return_address(0)));
     return 0;
 }
 
@@ -6960,9 +7201,16 @@ auto vfs_dup2(int oldfd, int newfd, int flags) -> int {
         return newfd;
     }
 
-    uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-    VfsDup2ReplaceResult const REPLACE = vfs_replace_fd_for_dup2_locked(task, newfd, f, (flags & ker::vfs::O_CLOEXEC) != 0);
-    task->fd_table_lock.unlock_irqrestore(IRQF);
+    auto fd_owner = fd_table_task_for(task);
+    auto* table_task = fd_owner.task;
+    if (table_task == nullptr) {
+        vfs_put_file(f);
+        return -ESRCH;
+    }
+
+    uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+    VfsDup2ReplaceResult const REPLACE = vfs_replace_fd_for_dup2_locked(table_task, newfd, f, (flags & ker::vfs::O_CLOEXEC) != 0);
+    table_task->fd_table_lock.unlock_irqrestore(IRQF);
 
     if (!REPLACE.inserted) {
         vfs_put_file(f);
@@ -7102,6 +7350,51 @@ auto validate_positional_offset(off_t offset, size_t* out) -> int {
     *out = static_cast<size_t>(offset);
     return 0;
 }
+
+auto vfs_pwrite_user_bounced(ker::mod::sched::task::Task& task, File* file, const void* user_buf, size_t count, size_t offset) -> ssize_t {
+    if (file == nullptr) {
+        return -EBADF;
+    }
+    if (!vfs_file_can_write(file)) {
+        return -EBADF;
+    }
+    if (file->fops == nullptr || file->fops->vfs_write == nullptr) {
+        return -ENOSYS;
+    }
+
+    std::array<uint8_t, USER_IO_BOUNCE_STACK_CHUNK> stack_bounce{};
+    size_t const BOUNCE_SIZE = std::min(count, USER_IO_BOUNCE_MAX_CHUNK);
+    std::unique_ptr<uint8_t[]> heap_bounce{};
+    if (BOUNCE_SIZE > stack_bounce.size()) {
+        heap_bounce.reset(new (std::nothrow) uint8_t[BOUNCE_SIZE]);
+    }
+    uint8_t* const bounce = heap_bounce != nullptr ? heap_bounce.get() : stack_bounce.data();
+    size_t const bounce_size = heap_bounce != nullptr ? BOUNCE_SIZE : stack_bounce.size();
+    auto const USER_BASE = reinterpret_cast<uint64_t>(user_buf);
+    size_t total = 0;
+
+    while (total < count) {
+        size_t const TO_WRITE = std::min(count - total, bounce_size);
+        if (!ker::mod::sys::usercopy::copy_from_task(task, USER_BASE + total, bounce, TO_WRITE)) {
+            return total > 0 ? static_cast<ssize_t>(total) : -EFAULT;
+        }
+
+        ssize_t const WRITE_RET = clamp_io_count(file->fops->vfs_write(file, bounce, TO_WRITE, offset + total), TO_WRITE);
+        if (WRITE_RET < 0) {
+            return total > 0 ? static_cast<ssize_t>(total) : WRITE_RET;
+        }
+        if (WRITE_RET == 0) {
+            return static_cast<ssize_t>(total);
+        }
+
+        total += static_cast<size_t>(WRITE_RET);
+        if (std::cmp_less(WRITE_RET, TO_WRITE)) {
+            return static_cast<ssize_t>(total);
+        }
+    }
+
+    return static_cast<ssize_t>(total);
+}
 }  // namespace
 
 // --- pread / pwrite ---
@@ -7128,11 +7421,17 @@ auto vfs_pread(int fd, void* buf, size_t count, off_t offset) -> ssize_t {
         vfs_put_file(f);
         return OFFSET_RET;
     }
+    if (buf == nullptr && count != 0) {
+        vfs_put_file(f);
+        return -EFAULT;
+    }
     // Positional reads are often random-access probes over files that were
     // just written (for example Git pack verification). Keep them out of the
     // stream cache so cached EOF/island state cannot affect pread semantics.
     f->positional_read_depth.fetch_add(1, std::memory_order_acq_rel);
-    auto result = clamp_io_count(f->fops->vfs_read(f, buf, count, positional_offset), count);
+    auto result = vfs_user_read_bounce_applies(f, buf, count, task)
+                      ? vfs_read_user_bounced(*task, f, buf, count, positional_offset, nullptr)
+                      : clamp_io_count(f->fops->vfs_read(f, buf, count, positional_offset), count);
     f->positional_read_depth.fetch_sub(1, std::memory_order_acq_rel);
     vfs_put_file(f);
     return result;
@@ -7205,7 +7504,13 @@ auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t 
         vfs_put_file(f);
         return OFFSET_RET;
     }
-    auto result = clamp_io_count(f->fops->vfs_write(f, buf, count, positional_offset), count);
+    if (buf == nullptr && count != 0) {
+        vfs_put_file(f);
+        return -EFAULT;
+    }
+    auto result = vfs_user_write_bounce_applies(buf, count, task)
+                      ? vfs_pwrite_user_bounced(*task, f, buf, count, positional_offset)
+                      : clamp_io_count(f->fops->vfs_write(f, buf, count, positional_offset), count);
     if (result > 0) {
         cache_notify_file_data_changed_impl(f);
     }
@@ -8120,13 +8425,20 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
                 vfs_put_file(f);
                 return -EINVAL;
             }
-            uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-            uint64_t const SLOT = vfs_find_free_fd_below_limit_locked(task, arg);
-            bool const INSERTED = SLOT != UINT64_MAX && task->fd_table.insert(SLOT, f);
-            if (INSERTED) {
-                task->clear_fd_cloexec(static_cast<unsigned>(SLOT));
+            auto fd_owner = fd_table_task_for(task);
+            auto* table_task = fd_owner.task;
+            if (table_task == nullptr) {
+                vfs_put_file(f);
+                return -ESRCH;
             }
-            task->fd_table_lock.unlock_irqrestore(IRQF);
+
+            uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+            uint64_t const SLOT = vfs_find_free_fd_below_limit_locked(table_task, arg);
+            bool const INSERTED = SLOT != UINT64_MAX && table_task->fd_table.insert(SLOT, f);
+            if (INSERTED) {
+                table_task->clear_fd_cloexec(static_cast<unsigned>(SLOT));
+            }
+            table_task->fd_table_lock.unlock_irqrestore(IRQF);
             if (!INSERTED) {
                 vfs_put_file(f);
                 return -EMFILE;
@@ -8135,23 +8447,24 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
         }
         case 1:  // F_GETFD
         {
-            uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-            int const RESULT = task->get_fd_cloexec(static_cast<unsigned>(fd)) ? 1 : 0;
-            task->fd_table_lock.unlock_irqrestore(IRQF);
+            auto fd_owner = fd_table_task_for(task);
+            auto* table_task = fd_owner.task;
+            if (table_task == nullptr) {
+                vfs_put_file(f);
+                return -ESRCH;
+            }
+
+            uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+            int const RESULT = table_task->get_fd_cloexec(static_cast<unsigned>(fd)) ? 1 : 0;
+            table_task->fd_table_lock.unlock_irqrestore(IRQF);
             vfs_put_file(f);
             return RESULT;
         }
         case 2:  // F_SETFD
         {
-            uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-            if ((arg & 1) != 0U) {
-                task->set_fd_cloexec(static_cast<unsigned>(fd));
-            } else {
-                task->clear_fd_cloexec(static_cast<unsigned>(fd));
-            }
-            task->fd_table_lock.unlock_irqrestore(IRQF);
+            int const SET_RET = vfs_set_fd_cloexec_for_task(task, fd, (arg & 1) != 0U);
             vfs_put_file(f);
-            return 0;
+            return SET_RET;
         }
         case 3:  // F_GETFL
         {
@@ -8202,13 +8515,20 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
                 vfs_put_file(f);
                 return -EINVAL;
             }
-            uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-            uint64_t const SLOT = vfs_find_free_fd_below_limit_locked(task, arg);
-            bool const INSERTED = SLOT != UINT64_MAX && task->fd_table.insert(SLOT, f);
-            if (INSERTED) {
-                task->set_fd_cloexec(static_cast<unsigned>(SLOT));
+            auto fd_owner = fd_table_task_for(task);
+            auto* table_task = fd_owner.task;
+            if (table_task == nullptr) {
+                vfs_put_file(f);
+                return -ESRCH;
             }
-            task->fd_table_lock.unlock_irqrestore(IRQF);
+
+            uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+            uint64_t const SLOT = vfs_find_free_fd_below_limit_locked(table_task, arg);
+            bool const INSERTED = SLOT != UINT64_MAX && table_task->fd_table.insert(SLOT, f);
+            if (INSERTED) {
+                table_task->set_fd_cloexec(static_cast<unsigned>(SLOT));
+            }
+            table_task->fd_table_lock.unlock_irqrestore(IRQF);
             if (!INSERTED) {
                 vfs_put_file(f);
                 return -EMFILE;
@@ -8266,6 +8586,44 @@ struct PipeDirectWriteWindow {
     size_t offset;
     size_t capacity;
 };
+
+auto pipe_cmdline_has_token(const char* cmdline, const char* token) -> bool {
+    if (cmdline == nullptr || token == nullptr || token[0] == '\0') {
+        return false;
+    }
+
+    size_t const TOKEN_LEN = std::strlen(token);
+    const char* cursor = cmdline;
+    while (*cursor != '\0') {
+        while (*cursor == ' ') {
+            ++cursor;
+        }
+        if (std::strncmp(cursor, token, TOKEN_LEN) == 0 && (cursor[TOKEN_LEN] == '\0' || cursor[TOKEN_LEN] == ' ')) {
+            return true;
+        }
+        while (*cursor != '\0' && *cursor != ' ') {
+            ++cursor;
+        }
+    }
+    return false;
+}
+
+auto pipe_diag_enabled() -> bool {
+    static std::atomic<int> cached{-1};
+    int const VALUE = cached.load(std::memory_order_acquire);
+    if (VALUE >= 0) {
+        return VALUE != 0;
+    }
+
+    bool const ENABLED = pipe_cmdline_has_token(ker::init::get_kernel_cmdline(), "vfs.pipe_diag");
+    cached.store(ENABLED ? 1 : 0, std::memory_order_release);
+    return ENABLED;
+}
+
+auto current_task_name() -> const char* {
+    auto* task = ker::mod::sched::get_current_task();
+    return task != nullptr && task->name != nullptr ? task->name : "?";
+}
 
 void pipe_diag_append(char* buf, size_t bufsz, size_t& len, bool& truncated, const char* fmt, ...) __attribute__((format(printf, 5, 6)));
 
@@ -8917,12 +9275,33 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
             }
 
             if (st->write_closed) {
+                size_t const BUFFERED = st->count;
+                size_t const CAPACITY = st->capacity;
+                int const OPEN_ENDS = st->open_ends.load(std::memory_order_relaxed);
+                bool const READ_CLOSED = st->read_closed;
                 st->lock.unlock_irqrestore(IRQF);
+                if (pipe_diag_enabled()) {
+                    log::warn("pipe-read-eof pid=%llu name=%s pipe=%p flags=0x%x buffered=%llu capacity=%llu open_ends=%d read_closed=%u",
+                              static_cast<unsigned long long>(perf_current_pid()), current_task_name(), static_cast<void*>(st),
+                              f->open_flags, static_cast<unsigned long long>(BUFFERED), static_cast<unsigned long long>(CAPACITY),
+                              OPEN_ENDS, READ_CLOSED ? 1U : 0U);
+                }
                 return finish(0);
             }
 
             if (f->open_flags & O_NONBLOCK) {
+                size_t const BUFFERED = st->count;
+                size_t const CAPACITY = st->capacity;
+                int const OPEN_ENDS = st->open_ends.load(std::memory_order_relaxed);
+                bool const WRITE_CLOSED = st->write_closed;
                 st->lock.unlock_irqrestore(IRQF);
+                if (pipe_diag_enabled()) {
+                    log::warn(
+                        "pipe-read-eagain pid=%llu name=%s pipe=%p flags=0x%x buffered=%llu capacity=%llu open_ends=%d write_closed=%u",
+                        static_cast<unsigned long long>(perf_current_pid()), current_task_name(), static_cast<void*>(st), f->open_flags,
+                        static_cast<unsigned long long>(BUFFERED), static_cast<unsigned long long>(CAPACITY), OPEN_ENDS,
+                        WRITE_CLOSED ? 1U : 0U);
+                }
                 return finish(-EAGAIN);
             }
 
@@ -8933,7 +9312,18 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
             }
 
             if (current_task_has_deliverable_signal()) {
+                size_t const BUFFERED = st->count;
+                size_t const CAPACITY = st->capacity;
+                int const OPEN_ENDS = st->open_ends.load(std::memory_order_relaxed);
+                bool const WRITE_CLOSED = st->write_closed;
                 st->lock.unlock_irqrestore(IRQF);
+                if (pipe_diag_enabled()) {
+                    log::warn(
+                        "pipe-read-eintr pid=%llu name=%s pipe=%p flags=0x%x buffered=%llu capacity=%llu open_ends=%d write_closed=%u",
+                        static_cast<unsigned long long>(perf_current_pid()), current_task_name(), static_cast<void*>(st), f->open_flags,
+                        static_cast<unsigned long long>(BUFFERED), static_cast<unsigned long long>(CAPACITY), OPEN_ENDS,
+                        WRITE_CLOSED ? 1U : 0U);
+                }
                 return finish(-EINTR);
             }
 
@@ -8980,7 +9370,18 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
             size_t pending_read_pollers_count = 0;
             uint64_t const IRQF = st->lock.lock_irqsave();
             if (st->read_closed) {
+                size_t const BUFFERED = st->count;
+                size_t const CAPACITY = st->capacity;
+                int const OPEN_ENDS = st->open_ends.load(std::memory_order_relaxed);
+                bool const WRITE_CLOSED = st->write_closed;
                 st->lock.unlock_irqrestore(IRQF);
+                if (pipe_diag_enabled()) {
+                    log::warn(
+                        "pipe-write-epipe pid=%llu name=%s pipe=%p flags=0x%x buffered=%llu capacity=%llu open_ends=%d write_closed=%u",
+                        static_cast<unsigned long long>(perf_current_pid()), current_task_name(), static_cast<void*>(st), f->open_flags,
+                        static_cast<unsigned long long>(BUFFERED), static_cast<unsigned long long>(CAPACITY), OPEN_ENDS,
+                        WRITE_CLOSED ? 1U : 0U);
+                }
                 // Send SIGPIPE to the writing process (signal 13)
                 auto* task = ker::mod::sched::get_current_task();
                 if (task) {
@@ -8991,7 +9392,16 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
 
             if (st->direct_write_active) {
                 if (f->open_flags & O_NONBLOCK) {
+                    size_t const BUFFERED = st->count;
+                    size_t const CAPACITY = st->capacity;
+                    int const OPEN_ENDS = st->open_ends.load(std::memory_order_relaxed);
                     st->lock.unlock_irqrestore(IRQF);
+                    if (pipe_diag_enabled()) {
+                        log::warn("pipe-write-eagain-direct pid=%llu name=%s pipe=%p flags=0x%x buffered=%llu capacity=%llu open_ends=%d",
+                                  static_cast<unsigned long long>(perf_current_pid()), current_task_name(), static_cast<void*>(st),
+                                  f->open_flags, static_cast<unsigned long long>(BUFFERED), static_cast<unsigned long long>(CAPACITY),
+                                  OPEN_ENDS);
+                    }
                     return finish(-EAGAIN);
                 }
 
@@ -9055,7 +9465,19 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
             }
 
             if (f->open_flags & O_NONBLOCK) {
+                size_t const BUFFERED = st->count;
+                size_t const CAPACITY = st->capacity;
+                int const OPEN_ENDS = st->open_ends.load(std::memory_order_relaxed);
+                bool const READ_CLOSED = st->read_closed;
                 st->lock.unlock_irqrestore(IRQF);
+                if (pipe_diag_enabled()) {
+                    log::warn(
+                        "pipe-write-eagain-full pid=%llu name=%s pipe=%p flags=0x%x buffered=%llu capacity=%llu open_ends=%d "
+                        "read_closed=%u",
+                        static_cast<unsigned long long>(perf_current_pid()), current_task_name(), static_cast<void*>(st), f->open_flags,
+                        static_cast<unsigned long long>(BUFFERED), static_cast<unsigned long long>(CAPACITY), OPEN_ENDS,
+                        READ_CLOSED ? 1U : 0U);
+                }
                 return finish(-EAGAIN);
             }
 
@@ -9088,12 +9510,20 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
         if (st == nullptr) {
             return 0;
         }
+        size_t buffered = 0;
+        size_t capacity = 0;
+        bool write_closed = false;
+        int open_ends_before = 0;
         PipeWakeList pending_writers{};
         size_t pending_writers_count = 0;
         PipeWakeList pending_write_pollers{};
         size_t pending_write_pollers_count = 0;
         {
             uint64_t const IRQF = st->lock.lock_irqsave();
+            buffered = st->count;
+            capacity = st->capacity;
+            write_closed = st->write_closed;
+            open_ends_before = st->open_ends.load(std::memory_order_relaxed);
             st->read_closed = true;
             if (!st->writers_waiting.empty()) {
                 pipe_collect_waiters_locked(st->writers_waiting, pending_writers, &pending_writers_count);
@@ -9102,6 +9532,12 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
                 pipe_collect_waiters_locked(st->write_poll_waiting, pending_write_pollers, &pending_write_pollers_count);
             }
             st->lock.unlock_irqrestore(IRQF);
+        }
+        if (pipe_diag_enabled()) {
+            log::warn("pipe-close-read pid=%llu name=%s pipe=%p flags=0x%x buffered=%llu capacity=%llu open_ends_before=%d write_closed=%u",
+                      static_cast<unsigned long long>(perf_current_pid()), current_task_name(), static_cast<void*>(st), f->open_flags,
+                      static_cast<unsigned long long>(buffered), static_cast<unsigned long long>(capacity), open_ends_before,
+                      write_closed ? 1U : 0U);
         }
         pipe_reschedule_waiters(pending_writers, pending_writers_count, true);
         pipe_reschedule_waiters(pending_write_pollers, pending_write_pollers_count);
@@ -9116,12 +9552,20 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
         if (st == nullptr) {
             return 0;
         }
+        size_t buffered = 0;
+        size_t capacity = 0;
+        bool read_closed = false;
+        int open_ends_before = 0;
         PipeWakeList pending_readers{};
         size_t pending_readers_count = 0;
         PipeWakeList pending_read_pollers{};
         size_t pending_read_pollers_count = 0;
         {
             uint64_t const IRQF = st->lock.lock_irqsave();
+            buffered = st->count;
+            capacity = st->capacity;
+            read_closed = st->read_closed;
+            open_ends_before = st->open_ends.load(std::memory_order_relaxed);
             st->write_closed = true;
             if (!st->readers_waiting.empty()) {
                 pipe_collect_waiters_locked(st->readers_waiting, pending_readers, &pending_readers_count);
@@ -9130,6 +9574,12 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
                 pipe_collect_waiters_locked(st->read_poll_waiting, pending_read_pollers, &pending_read_pollers_count);
             }
             st->lock.unlock_irqrestore(IRQF);
+        }
+        if (pipe_diag_enabled()) {
+            log::warn("pipe-close-write pid=%llu name=%s pipe=%p flags=0x%x buffered=%llu capacity=%llu open_ends_before=%d read_closed=%u",
+                      static_cast<unsigned long long>(perf_current_pid()), current_task_name(), static_cast<void*>(st), f->open_flags,
+                      static_cast<unsigned long long>(buffered), static_cast<unsigned long long>(capacity), open_ends_before,
+                      read_closed ? 1U : 0U);
         }
         pipe_reschedule_waiters(pending_readers, pending_readers_count);
         pipe_reschedule_waiters(pending_read_pollers, pending_read_pollers_count);
@@ -9294,10 +9744,8 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
     }
 
     if ((flags & ker::vfs::O_CLOEXEC) != 0) {
-        uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-        task->set_fd_cloexec(static_cast<unsigned>(RFD));
-        task->set_fd_cloexec(static_cast<unsigned>(WFD));
-        task->fd_table_lock.unlock_irqrestore(IRQF);
+        static_cast<void>(vfs_set_fd_cloexec_for_task(task, RFD, true));
+        static_cast<void>(vfs_set_fd_cloexec_for_task(task, WFD, true));
     }
 
     pipefd[0] = RFD;

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/init/limine_requests.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/ktime/ktime.hpp>
@@ -18,6 +19,7 @@
 #include <span>
 #include <string_view>
 #include <util/smallvec.hpp>
+#include <utility>
 
 #include "platform/sched/task.hpp"
 #include "platform/sys/spinlock.hpp"
@@ -47,6 +49,7 @@ using log = ker::mod::dbg::logger<"virt">;
 
 constexpr uint64_t LARGE_PAGE_2M_BYTES = paging::PAGE_SIZE * paging::PAGE_TABLE_ENTRIES;
 constexpr uint64_t LARGE_PAGE_1G_BYTES = LARGE_PAGE_2M_BYTES * paging::PAGE_TABLE_ENTRIES;
+constexpr uint64_t PTE_FRAME_MASK = 0x000FFFFFFFFFF000ULL;
 
 sys::Spinlock cow_pte_lock;
 
@@ -86,9 +89,121 @@ auto is_asan_shadow_address(uint64_t vaddr) -> bool {
     return vaddr >= ASAN_LOW_SHADOW_BEG && vaddr <= ASAN_HIGH_SHADOW_END;
 }
 
-void log_lazy_vmem_fault_state(sched::task::Task* task, uint64_t page_vaddr, const paging::PageFault& fault, const char* reason) {
+auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
+    if (cmdline == nullptr || token == nullptr || token[0] == '\0') {
+        return false;
+    }
+
+    size_t const TOKEN_LEN = std::strlen(token);
+    const char* cursor = cmdline;
+    while (*cursor != '\0') {
+        while (*cursor == ' ') {
+            ++cursor;
+        }
+
+        const char* start = cursor;
+        while (*cursor != '\0' && *cursor != ' ') {
+            ++cursor;
+        }
+
+        if (std::cmp_equal(cursor - start, TOKEN_LEN) && std::strncmp(start, token, TOKEN_LEN) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto lazy_vmem_fault_diag_enabled() -> bool {
+    static std::atomic<int> s_enabled{-1};
+    int cached = s_enabled.load(std::memory_order_acquire);
+    if (cached >= 0) {
+        return cached != 0;
+    }
+
+    bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "vmem.lazy_diag");
+    int const VALUE = ENABLED ? 1 : 0;
+    int expected = -1;
+    if (s_enabled.compare_exchange_strong(expected, VALUE, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        if (ENABLED) {
+            log::info("lazy vmem fault diagnostics enabled by cmdline");
+        }
+        return ENABLED;
+    }
+
+    return expected != 0;
+}
+
+auto fork_eager_copy_enabled() -> bool {
+    static std::atomic<int> s_enabled{-1};
+    int cached = s_enabled.load(std::memory_order_acquire);
+    if (cached >= 0) {
+        return cached != 0;
+    }
+
+    bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "vmem.fork_eager_copy");
+    int const VALUE = ENABLED ? 1 : 0;
+    int expected = -1;
+    if (s_enabled.compare_exchange_strong(expected, VALUE, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        if (ENABLED) {
+            log::info("fork writable private mappings will be eagerly copied by cmdline");
+        }
+        return ENABLED;
+    }
+
+    return expected != 0;
+}
+
+void log_sibling_lazy_vmem_fault_state(sched::task::Task* task, uint64_t page_vaddr) {
+    if (task == nullptr || task->pagemap == nullptr) {
+        return;
+    }
+
+    constexpr size_t MAX_LOGGED_SIBLINGS = 8;
+    auto* const PAGEMAP = task->pagemap;
+    size_t logged = 0;
+
+    uint32_t const TASK_COUNT = sched::get_active_task_count();
+    for (uint32_t i = 0; i < TASK_COUNT && logged < MAX_LOGGED_SIBLINGS; ++i) {
+        auto* candidate = sched::get_active_task_at_safe(i);
+        if (candidate == nullptr) {
+            continue;
+        }
+
+        if (candidate == task || candidate->pagemap != PAGEMAP || candidate->type == sched::task::TaskType::DAEMON) {
+            candidate->release();
+            continue;
+        }
+
+        sched::task::LazyVmemRange matching_range{};
+        bool found = false;
+        size_t range_count = 0;
+        uint64_t const IRQF = candidate->lazy_vmem_lock.lock_irqsave();
+        range_count = candidate->lazy_vmem_ranges.size();
+        for (const auto& range : candidate->lazy_vmem_ranges) {
+            if (page_vaddr >= range.start && page_vaddr < range.end) {
+                matching_range = range;
+                found = true;
+                break;
+            }
+        }
+        candidate->lazy_vmem_lock.unlock_irqrestore(IRQF);
+
+        if (found) {
+            log::warn(" lazy sibling hit: pid=%lu name=%s ranges=%llu range=[0x%llx, 0x%llx) prot=0x%llx flags=0x%llx", candidate->pid,
+                      candidate->name != nullptr ? candidate->name : "?", static_cast<unsigned long long>(range_count),
+                      static_cast<unsigned long long>(matching_range.start), static_cast<unsigned long long>(matching_range.end),
+                      static_cast<unsigned long long>(matching_range.prot), static_cast<unsigned long long>(matching_range.flags));
+            ++logged;
+        }
+
+        candidate->release();
+    }
+}
+
+void log_lazy_vmem_fault_state(sched::task::Task* task, uint64_t page_vaddr, const paging::PageFault& fault, const char* reason,
+                               uint64_t fault_rip = 0, uint64_t fault_rsp = 0) {
     constexpr size_t MAX_LOGGED_RANGES = 24;
-    if (task == nullptr || !is_asan_shadow_address(page_vaddr)) {
+    if (task == nullptr || (!is_asan_shadow_address(page_vaddr) && !lazy_vmem_fault_diag_enabled())) {
         return;
     }
 
@@ -101,9 +216,10 @@ void log_lazy_vmem_fault_state(sched::task::Task* task, uint64_t page_vaddr, con
     }
     task->lazy_vmem_lock.unlock_irqrestore(IRQF);
 
-    log::warn("lazy vmem %s: pid=%lu page=0x%llx err_present=%u err_write=%u ranges=%llu", reason, task->pid,
-              static_cast<unsigned long long>(page_vaddr), static_cast<unsigned>(fault.present), static_cast<unsigned>(fault.writable),
-              static_cast<unsigned long long>(RANGE_COUNT));
+    log::warn("lazy vmem %s: pid=%lu name=%s page=0x%llx rip=0x%llx rsp=0x%llx err_present=%u err_write=%u ranges=%llu", reason, task->pid,
+              task->name != nullptr ? task->name : "?", static_cast<unsigned long long>(page_vaddr),
+              static_cast<unsigned long long>(fault_rip), static_cast<unsigned long long>(fault_rsp), static_cast<unsigned>(fault.present),
+              static_cast<unsigned>(fault.writable), static_cast<unsigned long long>(RANGE_COUNT));
 
     for (size_t i = 0; i < LOG_COUNT; ++i) {
         auto const& range = ranges.at(i);
@@ -113,9 +229,14 @@ void log_lazy_vmem_fault_state(sched::task::Task* task, uint64_t page_vaddr, con
                   static_cast<unsigned long long>(range.prot), static_cast<unsigned long long>(range.flags),
                   static_cast<unsigned>(CONTAINS));
     }
+
+    if (lazy_vmem_fault_diag_enabled()) {
+        log_sibling_lazy_vmem_fault_state(task, page_vaddr);
+    }
 }
 
-auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const paging::PageFault& fault) -> bool {
+auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const paging::PageFault& fault, uint64_t fault_rip = 0,
+                            uint64_t fault_rsp = 0) -> bool {
     if (task == nullptr || task->pagemap == nullptr) {
         return false;
     }
@@ -128,7 +249,7 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
         }
         if (range.prot == 0 || (((range.prot & 0x2ULL) == 0) && fault.writable != 0U)) {
             task->lazy_vmem_lock.unlock_irqrestore(IRQF);
-            log_lazy_vmem_fault_state(task, PAGE_VADDR, fault, "deny");
+            log_lazy_vmem_fault_state(task, PAGE_VADDR, fault, "deny", fault_rip, fault_rsp);
             return false;
         }
 
@@ -159,7 +280,7 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
     }
     task->lazy_vmem_lock.unlock_irqrestore(IRQF);
 
-    log_lazy_vmem_fault_state(task, PAGE_VADDR, fault, "miss");
+    log_lazy_vmem_fault_state(task, PAGE_VADDR, fault, "miss", fault_rip, fault_rsp);
     return false;
 }
 
@@ -198,8 +319,12 @@ void record_cow_perf_event(sched::task::Task* task, perf::WkiPerfLocalVmemOp op,
 }
 
 auto alloc_cow_destination_page(bool full_overwrite) -> void* {
-    return full_overwrite ? phys::page_alloc_full_overwrite_page_with_reclaim("cow_copy")
-                          : phys::page_alloc_with_reclaim(paging::PAGE_SIZE, "cow_zero");
+    void* const PAGE = full_overwrite ? phys::page_alloc_full_overwrite_page_with_reclaim("cow_copy")
+                                      : phys::page_alloc_with_reclaim(paging::PAGE_SIZE, "cow_zero");
+    if (PAGE != nullptr && !full_overwrite) {
+        std::memset(PAGE, 0, paging::PAGE_SIZE);
+    }
+    return PAGE;
 }
 
 paging::PageTable* kernel_pagemap;
@@ -279,14 +404,40 @@ struct TlbShootdownRequest {
     std::atomic<uint32_t> pending{0};
     std::array<std::atomic<uint8_t>, TLB_SHOOTDOWN_MAX_CPUS> targets{};
     std::array<std::atomic<uint64_t>, TLB_SHOOTDOWN_MAX_CPUS> observed{};
+    std::array<std::atomic<uint64_t>, TLB_SHOOTDOWN_MAX_CPUS> completed{};
 };
 
 std::array<TlbShootdownRequest, TLB_SHOOTDOWN_MAX_CPUS>
     tlb_shootdown_requests{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::array<std::atomic<uint8_t>, TLB_SHOOTDOWN_MAX_CPUS>
-    tlb_shootdown_cpu_online{};                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<bool> tlb_shootdown_init_attempted{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint8_t tlb_shootdown_vector = 0;                       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+    tlb_shootdown_cpu_online{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<std::atomic<PageTable*>, TLB_SHOOTDOWN_MAX_CPUS>
+    tlb_active_pagemaps{};                                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> tlb_shootdown_init_attempted{false};    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> tlb_shootdown_late_acks{0};         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint32_t> tlb_shootdown_gate_owner{0};        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> tlb_shootdown_gate_contentions{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint8_t tlb_shootdown_vector = 0;                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+constexpr uint32_t TLB_SHOOTDOWN_GATE_FREE = 0;
+constexpr uint64_t TLB_SHOOTDOWN_RETRY_US = 1'000;
+constexpr uint64_t TLB_SHOOTDOWN_WAKE_RESCUE_US = 10'000;
+constexpr uint64_t TLB_SHOOTDOWN_LOG_FIRST_US = 50'000;
+constexpr uint64_t TLB_SHOOTDOWN_LOG_REPEAT_US = 1'000'000;
+
+struct TlbShootdownWaitSnapshot {
+    uint64_t missing_mask_low{};
+    uint32_t missing_count{};
+    uint32_t unclaimed_count{};
+    uint32_t first_missing{UINT32_MAX};
+    uint32_t pending{};
+};
+
+struct TlbShootdownGateGuard {
+    sched::task::Task* preempt_owner{};
+    uint64_t cpu_no{UINT64_MAX};
+    bool held{};
+};
 
 auto bounded_core_count() -> uint64_t {
     if (!smt::has_cpu_data()) {
@@ -298,6 +449,59 @@ auto bounded_core_count() -> uint64_t {
 auto cpu_slot_valid(uint64_t cpu_no) -> bool { return cpu_no < TLB_SHOOTDOWN_MAX_CPUS; }
 
 auto user_pagemap_can_need_remote_shootdown(PageTable* pagemap) -> bool { return pagemap != nullptr && pagemap != kernel_pagemap; }
+
+void note_active_pagemap(PageTable* pagemap) {
+    if (!smt::has_cpu_data()) {
+        return;
+    }
+
+    uint64_t const CPU_NO = cpu::current_cpu();
+    if (!cpu_slot_valid(CPU_NO)) {
+        return;
+    }
+
+    tlb_active_pagemaps[static_cast<size_t>(CPU_NO)].store(pagemap, std::memory_order_release);
+}
+
+auto cpu_may_have_active_pagemap(uint64_t cpu_no, PageTable* pagemap) -> bool {
+    if (!cpu_slot_valid(cpu_no) || tlb_shootdown_cpu_online[static_cast<size_t>(cpu_no)].load(std::memory_order_acquire) == 0U) {
+        return false;
+    }
+
+    PageTable* const ACTIVE = tlb_active_pagemaps[static_cast<size_t>(cpu_no)].load(std::memory_order_acquire);
+    return ACTIVE == nullptr || ACTIVE == pagemap;
+}
+
+auto snapshot_tlb_shootdown_wait(TlbShootdownRequest& request, uint64_t core_count, uint64_t generation) -> TlbShootdownWaitSnapshot {
+    TlbShootdownWaitSnapshot snapshot{};
+    snapshot.pending = request.pending.load(std::memory_order_acquire);
+    for (uint64_t cpu_no = 0; cpu_no < core_count; ++cpu_no) {
+        if (request.targets[static_cast<size_t>(cpu_no)].load(std::memory_order_acquire) == 0U) {
+            continue;
+        }
+
+        if (request.observed[static_cast<size_t>(cpu_no)].load(std::memory_order_acquire) == generation) {
+            if (request.completed[static_cast<size_t>(cpu_no)].load(std::memory_order_acquire) == generation) {
+                continue;
+            }
+        } else {
+            ++snapshot.unclaimed_count;
+        }
+
+        if (request.completed[static_cast<size_t>(cpu_no)].load(std::memory_order_acquire) == generation) {
+            continue;
+        }
+
+        if (cpu_no < 64) {
+            snapshot.missing_mask_low |= 1ULL << cpu_no;
+        }
+        if (snapshot.first_missing == UINT32_MAX) {
+            snapshot.first_missing = static_cast<uint32_t>(cpu_no);
+        }
+        ++snapshot.missing_count;
+    }
+    return snapshot;
+}
 
 void invalidate_local_tlb_if_current(PageTable* pagemap, vaddr_t vaddr, bool reload_cr3) {
     if (!is_current_pagemap(pagemap)) {
@@ -345,8 +549,73 @@ void service_tlb_shootdown_requests_for_cpu(uint64_t cpu_no) {
             invalidate_local_tlb_if_current(TARGET_PAGEMAP, request.vaddr.load(std::memory_order_acquire),
                                             request.reload_cr3.load(std::memory_order_acquire));
         }
-        request.pending.fetch_sub(1, std::memory_order_acq_rel);
+
+        uint32_t pending = request.pending.load(std::memory_order_acquire);
+        while (pending != 0U) {
+            if (request.pending.compare_exchange_weak(pending, pending - 1U, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                break;
+            }
+        }
+        if (pending == 0U) {
+            tlb_shootdown_late_acks.fetch_add(1, std::memory_order_relaxed);
+        }
+        request.completed[static_cast<size_t>(cpu_no)].store(GENERATION, std::memory_order_release);
     }
+}
+
+auto acquire_tlb_shootdown_gate() -> TlbShootdownGateGuard {
+    uint64_t const START_US = time::get_us();
+    uint64_t next_log_us = START_US + TLB_SHOOTDOWN_LOG_FIRST_US;
+    uint64_t spins = 0;
+    bool counted_contention = false;
+
+    for (;;) {
+        auto* const PREEMPT_OWNER = sched::preempt_disable_token_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+        uint64_t const CPU_NO = cpu::current_cpu();
+        if (!cpu_slot_valid(CPU_NO)) {
+            sched::preempt_enable_token_at(PREEMPT_OWNER, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+            return {};
+        }
+
+        auto const OWNER_ID = static_cast<uint32_t>(CPU_NO + 1U);
+        uint32_t expected = TLB_SHOOTDOWN_GATE_FREE;
+        if (tlb_shootdown_gate_owner.compare_exchange_weak(expected, OWNER_ID, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return TlbShootdownGateGuard{.preempt_owner = PREEMPT_OWNER, .cpu_no = CPU_NO, .held = true};
+        }
+
+        service_tlb_shootdown_requests_for_cpu(CPU_NO);
+        sched::preempt_enable_token_at(PREEMPT_OWNER, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+
+        if (!counted_contention) {
+            tlb_shootdown_gate_contentions.fetch_add(1, std::memory_order_relaxed);
+            counted_contention = true;
+        }
+
+        ++spins;
+        if ((spins & 0xFFFU) == 0U) {
+            uint64_t const NOW_US = time::get_us();
+            if (NOW_US >= next_log_us) {
+                uint32_t const OWNER = tlb_shootdown_gate_owner.load(std::memory_order_acquire);
+                log::warn("tlb shootdown gate wait: cpu=%llu owner=%u elapsed_us=%llu spins=%llu contentions=%llu",
+                          static_cast<unsigned long long>(CPU_NO), OWNER, static_cast<unsigned long long>(NOW_US - START_US),
+                          static_cast<unsigned long long>(spins),
+                          static_cast<unsigned long long>(tlb_shootdown_gate_contentions.load(std::memory_order_relaxed)));
+                next_log_us = NOW_US + TLB_SHOOTDOWN_LOG_REPEAT_US;
+            }
+            if (sched::preempt_count() == 0 && sched::interrupts_enabled()) {
+                sched::kern_yield();
+            }
+        }
+        asm volatile("pause" ::: "memory");
+    }
+}
+
+void release_tlb_shootdown_gate(TlbShootdownGateGuard& guard) {
+    if (guard.held) {
+        tlb_shootdown_gate_owner.store(TLB_SHOOTDOWN_GATE_FREE, std::memory_order_release);
+        guard.held = false;
+    }
+    sched::preempt_enable_token_at(guard.preempt_owner, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 }
 
 void send_tlb_shootdown_ipi(uint64_t cpu_no) {
@@ -366,9 +635,83 @@ void send_tlb_shootdown_ipi(uint64_t cpu_no) {
     apic::send_ipi(IPI, smt::get_cpu(cpu_no).lapic_id);
 }
 
-void wait_for_tlb_shootdown_completion(TlbShootdownRequest& request, uint64_t origin_cpu) {
-    while (request.pending.load(std::memory_order_acquire) != 0) {
+void retry_tlb_shootdown_wait(TlbShootdownRequest& request, uint64_t core_count, uint64_t generation, bool wake_rescue) {
+    TlbShootdownWaitSnapshot const SNAPSHOT = snapshot_tlb_shootdown_wait(request, core_count, generation);
+    if (SNAPSHOT.missing_count == 0) {
+        return;
+    }
+
+    for (uint64_t target_cpu = 0; target_cpu < core_count; ++target_cpu) {
+        if (request.targets[static_cast<size_t>(target_cpu)].load(std::memory_order_acquire) == 0U) {
+            continue;
+        }
+        if (request.completed[static_cast<size_t>(target_cpu)].load(std::memory_order_acquire) == generation) {
+            continue;
+        }
+        send_tlb_shootdown_ipi(target_cpu);
+        if (wake_rescue) {
+            sched::wake_cpu(target_cpu, sched::WakeCpuMode::FORCE);
+        }
+    }
+}
+
+void log_tlb_shootdown_wait(TlbShootdownRequest& request, uint64_t origin_cpu, uint64_t core_count, uint64_t generation,
+                            uint64_t elapsed_us, uint64_t retries) {
+    TlbShootdownWaitSnapshot const SNAPSHOT = snapshot_tlb_shootdown_wait(request, core_count, generation);
+    auto* current = sched::get_current_task();
+    log::warn(
+        "tlb shootdown wait: origin_cpu=%llu pid=%llu name=%s generation=%llu pending=%u missing=%u unclaimed=%u first_missing=%u "
+        "missing_low=0x%llx pagemap=%p vaddr=0x%llx reload=%u elapsed_us=%llu retries=%llu late_acks=%llu",
+        static_cast<unsigned long long>(origin_cpu), static_cast<unsigned long long>(current != nullptr ? current->pid : 0),
+        current != nullptr && current->name != nullptr ? current->name : "?", static_cast<unsigned long long>(generation), SNAPSHOT.pending,
+        SNAPSHOT.missing_count, SNAPSHOT.unclaimed_count, SNAPSHOT.first_missing,
+        static_cast<unsigned long long>(SNAPSHOT.missing_mask_low), request.pagemap.load(std::memory_order_acquire),
+        static_cast<unsigned long long>(request.vaddr.load(std::memory_order_acquire)),
+        request.reload_cr3.load(std::memory_order_acquire) ? 1U : 0U, static_cast<unsigned long long>(elapsed_us),
+        static_cast<unsigned long long>(retries), static_cast<unsigned long long>(tlb_shootdown_late_acks.load(std::memory_order_relaxed)));
+}
+
+void wait_for_tlb_shootdown_completion(TlbShootdownRequest& request, uint64_t origin_cpu, uint64_t generation, uint64_t core_count) {
+    uint64_t const START_US = time::get_us();
+    uint64_t next_retry_us = START_US + TLB_SHOOTDOWN_RETRY_US;
+    uint64_t next_wake_rescue_us = START_US + TLB_SHOOTDOWN_WAKE_RESCUE_US;
+    uint64_t next_log_us = START_US + TLB_SHOOTDOWN_LOG_FIRST_US;
+    uint64_t retries = 0;
+    uint64_t spins = 0;
+
+    for (;;) {
+        if (request.pending.load(std::memory_order_acquire) == 0U &&
+            snapshot_tlb_shootdown_wait(request, core_count, generation).missing_count == 0U) {
+            break;
+        }
+
         service_tlb_shootdown_requests_for_cpu(origin_cpu);
+        ++spins;
+        if ((spins & 0xFFFU) == 0) {
+            TlbShootdownWaitSnapshot const SNAPSHOT = snapshot_tlb_shootdown_wait(request, core_count, generation);
+            if (SNAPSHOT.missing_count == 0U) {
+                if (SNAPSHOT.pending != 0U) {
+                    log_tlb_shootdown_wait(request, origin_cpu, core_count, generation, time::get_us() - START_US, retries);
+                    request.pending.store(0U, std::memory_order_release);
+                }
+                break;
+            }
+
+            uint64_t const NOW_US = time::get_us();
+            if (NOW_US >= next_retry_us) {
+                bool const WAKE_RESCUE = NOW_US >= next_wake_rescue_us;
+                retry_tlb_shootdown_wait(request, core_count, generation, WAKE_RESCUE);
+                ++retries;
+                next_retry_us = NOW_US + TLB_SHOOTDOWN_RETRY_US;
+                if (WAKE_RESCUE) {
+                    next_wake_rescue_us = NOW_US + TLB_SHOOTDOWN_WAKE_RESCUE_US;
+                }
+            }
+            if (NOW_US >= next_log_us) {
+                log_tlb_shootdown_wait(request, origin_cpu, core_count, generation, NOW_US - START_US, retries);
+                next_log_us = NOW_US + TLB_SHOOTDOWN_LOG_REPEAT_US;
+            }
+        }
         asm volatile("pause" ::: "memory");
     }
 }
@@ -378,17 +721,17 @@ void shootdown_remote_user_pagemap(PageTable* pagemap, vaddr_t vaddr, bool reloa
         return;
     }
 
-    uint64_t const ORIGIN_CPU = cpu::current_cpu();
-    if (!cpu_slot_valid(ORIGIN_CPU)) {
+    auto gate = acquire_tlb_shootdown_gate();
+    if (!gate.held) {
         return;
     }
 
+    uint64_t const ORIGIN_CPU = gate.cpu_no;
     uint64_t const CORE_COUNT = bounded_core_count();
     auto& request = tlb_shootdown_requests[static_cast<size_t>(ORIGIN_CPU)];
     uint32_t pending = 0;
     for (uint64_t target_cpu = 0; target_cpu < CORE_COUNT; ++target_cpu) {
-        bool const TARGET =
-            target_cpu != ORIGIN_CPU && tlb_shootdown_cpu_online[static_cast<size_t>(target_cpu)].load(std::memory_order_acquire) != 0U;
+        bool const TARGET = target_cpu != ORIGIN_CPU && cpu_may_have_active_pagemap(target_cpu, pagemap);
         request.targets[static_cast<size_t>(target_cpu)].store(TARGET ? 1U : 0U, std::memory_order_relaxed);
         if (TARGET) {
             ++pending;
@@ -396,6 +739,7 @@ void shootdown_remote_user_pagemap(PageTable* pagemap, vaddr_t vaddr, bool reloa
     }
 
     if (pending == 0) {
+        release_tlb_shootdown_gate(gate);
         return;
     }
 
@@ -416,8 +760,9 @@ void shootdown_remote_user_pagemap(PageTable* pagemap, vaddr_t vaddr, bool reloa
         }
     }
 
-    wait_for_tlb_shootdown_completion(request, ORIGIN_CPU);
+    wait_for_tlb_shootdown_completion(request, ORIGIN_CPU, next_generation, CORE_COUNT);
     request.pagemap.store(nullptr, std::memory_order_release);
+    release_tlb_shootdown_gate(gate);
 }
 
 void flush_pagemap_after_update(PageTable* pagemap, vaddr_t vaddr, bool reload_cr3) {
@@ -881,6 +1226,7 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
     phys::PageLookupHint cow_lookup{};
     uint32_t refcount = 0;
     bool old_is_zero_page = false;
+    bool old_mapping_refcounted = true;
     perf::WkiPerfLocalVmemOp cow_op = perf::WkiPerfLocalVmemOp::COW_COPY;
     uint64_t cow_started_us = 0;
     bool initial_path_promoted = false;
@@ -943,13 +1289,14 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
         old_virt = reinterpret_cast<void*>(addr::get_virt_pointer(old_phys));
         refcount = phys::page_ref_get(old_virt, &cow_lookup);
         old_is_zero_page = perf::is_local_vmem_zero_page(old_virt);
+        old_mapping_refcounted = !old_is_zero_page || refcount > 1U;
         if (old_is_zero_page) {
             cow_op = perf::WkiPerfLocalVmemOp::COW_ZERO;
         } else if (refcount <= 1) {
             cow_op = perf::WkiPerfLocalVmemOp::COW_PROMOTE;
         }
 
-        if (refcount <= 1) {
+        if (refcount <= 1 && !old_is_zero_page) {
             raw &= ~paging::PAGE_COW;
             raw |= paging::PAGE_WRITE;
             pte = pte_from_raw(raw);
@@ -1023,7 +1370,12 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
 
     flush_pagemap_after_update(PAGEMAP, VADDR, initial_path_promoted || final_path_promoted);
     phys::page_ref_dec(old_virt, &cow_lookup);
-    phys::page_ref_dec(old_virt, &cow_lookup);
+    if (old_mapping_refcounted) {
+        phys::page_ref_dec(old_virt, &cow_lookup);
+    } else {
+        log::warn("COW zero page mapping had no mapping ref to drop: pid=%lu name=%s vaddr=0x%llx ref=%u", task->pid,
+                  task->name != nullptr ? task->name : "?", static_cast<unsigned long long>(VADDR), refcount);
+    }
     record_cow_perf_event(task, cow_op, VADDR, refcount, cow_started_us);
     return UserWriteFaultStatus::HANDLED;
 }
@@ -1051,7 +1403,33 @@ auto ensure_user_page_writable_for_task(sched::task::Task* task, vaddr_t vaddr) 
 
     return false;
 }
+
+auto ensure_user_page_mapped_for_task(sched::task::Task* task, vaddr_t vaddr) -> bool {
+    if (task == nullptr || task->pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
+        return false;
+    }
+
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        if (translate(task->pagemap, vaddr) != PADDR_INVALID) {
+            return true;
+        }
+
+        paging::PageFault const READ_FAULT = paging::create_page_fault(0, true);
+        if (!handle_lazy_vmem_fault(task, vaddr, READ_FAULT)) {
+            return false;
+        }
+    }
+
+    return translate(task->pagemap, vaddr) != PADDR_INVALID;
+}
 }  // namespace
+
+void service_pending_tlb_shootdowns() {
+    if (tlb_shootdown_vector == 0 || !smt::has_cpu_data()) {
+        return;
+    }
+    service_tlb_shootdown_requests_for_cpu(cpu::current_cpu());
+}
 
 constexpr size_t KERNEL_PML4_START = 256;
 constexpr size_t KERNEL_PML4_END = 512;
@@ -1404,6 +1782,7 @@ void note_tlb_shootdown_cpu_online() {
     if (!cpu_slot_valid(CPU_NO)) {
         return;
     }
+    tlb_active_pagemaps[static_cast<size_t>(CPU_NO)].store(kernel_pagemap, std::memory_order_release);
     tlb_shootdown_cpu_online[static_cast<size_t>(CPU_NO)].store(1U, std::memory_order_release);
 }
 
@@ -1504,7 +1883,9 @@ void switch_pagemap(sched::task::Task* t) {
     // physical PML4 frame as an old one, skipping the CR3 write leaves stale
     // TLB entries from the previous owner alive and can produce impossible
     // user faults on pages whose current PTEs are present and writable.
+    note_active_pagemap(nullptr);
     wrcr3(phys_pagemap);
+    note_active_pagemap(t->pagemap);
 }
 
 auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, ker::mod::cpu::GPRegs& /*gpr*/) -> bool {
@@ -1525,7 +1906,7 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
     // syscall copy paths writing into a not-yet-backed user stack page.
     if (PAGEFAULT.present == 0U && control_register < 0x0000800000000000ULL) {
         auto* current_task = sched::get_current_task();
-        if (handle_lazy_vmem_fault(current_task, control_register, PAGEFAULT)) {
+        if (handle_lazy_vmem_fault(current_task, control_register, PAGEFAULT, frame.rip, frame.rsp)) {
             return true;
         }
         if (current_task != nullptr && current_task->pagemap != nullptr && current_task->thread != nullptr &&
@@ -1550,6 +1931,22 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
         if (resolve_user_write_mapping(current_task, control_register) == UserWriteFaultStatus::HANDLED) {
             return true;
         }
+    }
+
+    if (control_register < 0x0000800000000000ULL) {
+        auto* current_task = sched::get_current_task();
+        paddr_t const PHYS = current_task != nullptr && current_task->pagemap != nullptr
+                                 ? translate(current_task->pagemap, control_register)
+                                 : PADDR_INVALID;
+        log::warn(
+            "user page fault: pid=%llu name=%s fault=0x%llx rip=0x%llx rsp=0x%llx cs=0x%llx err=0x%llx present=%u write=%u user=%u "
+            "phys=0x%llx",
+            static_cast<unsigned long long>(current_task != nullptr ? current_task->pid : 0),
+            current_task != nullptr && current_task->name != nullptr ? current_task->name : "?",
+            static_cast<unsigned long long>(control_register), static_cast<unsigned long long>(frame.rip),
+            static_cast<unsigned long long>(frame.rsp), static_cast<unsigned long long>(frame.cs),
+            static_cast<unsigned long long>(frame.err_code), PAGEFAULT.present != 0U ? 1U : 0U, PAGEFAULT.writable != 0U ? 1U : 0U,
+            PAGEFAULT.user != 0U ? 1U : 0U, static_cast<unsigned long long>(PHYS));
     }
 
     // Not a COW fault - let the caller handle it (userspace crash / kernel panic).
@@ -1587,6 +1984,8 @@ paddr_t translate(PageTable* page_table, vaddr_t vaddr) {
 }
 
 bool ensure_user_page_writable(sched::task::Task* task, vaddr_t vaddr) { return ensure_user_page_writable_for_task(task, vaddr); }
+
+bool ensure_user_page_mapped(sched::task::Task* task, vaddr_t vaddr) { return ensure_user_page_mapped_for_task(task, vaddr); }
 
 auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats {
     UserMemoryStats stats{};
@@ -3329,6 +3728,7 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
     // Page table pages (PML3/PML2/PML1) are freshly allocated for dst.
 
     constexpr size_t USER_PML4_ENTRIES = 256;
+    bool const EAGER_COPY_WRITABLE_PRIVATE = fork_eager_copy_enabled();
     phys::PageLookupHint ref_lookup{};
     for (size_t i4 = 0; i4 < USER_PML4_ENTRIES; i4++) {
         auto& src_pml4e = entry_at(src, i4);
@@ -3451,7 +3851,27 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                     const uint64_t VADDR = (static_cast<uint64_t>(i4) << 39) | (static_cast<uint64_t>(i3) << 30) |
                                            (static_cast<uint64_t>(i2) << 21) | (static_cast<uint64_t>(i1) << 12);
                     const bool WAS_WRITABLE = (raw & paging::PAGE_WRITE) != 0U;
+                    const bool IS_COW = (raw & paging::PAGE_COW) != 0U;
                     const bool IS_SHARED = (raw & paging::PAGE_SHARED) != 0U;
+                    const bool IS_WRITABLE_PRIVATE = !IS_SHARED && (WAS_WRITABLE || IS_COW);
+
+                    paddr_t const DATA_PHYS = src_pml1e.frame << paging::PAGE_SHIFT;
+                    void* data_virt = reinterpret_cast<void*>(addr::get_virt_pointer(DATA_PHYS));
+
+                    if (EAGER_COPY_WRITABLE_PRIVATE && IS_WRITABLE_PRIVATE) {
+                        auto* child_page = phys::page_alloc_full_overwrite_page_with_reclaim("fork_copy");
+                        if (child_page == nullptr) {
+                            return false;
+                        }
+                        std::memcpy(child_page, data_virt, paging::PAGE_SIZE);
+                        auto const CHILD_PHYS = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(child_page)));
+                        uint64_t child_raw = raw;
+                        child_raw &= ~paging::PAGE_COW;
+                        child_raw |= paging::PAGE_WRITE;
+                        dst_pml1e = pte_from_raw((child_raw & ~PTE_FRAME_MASK) | (CHILD_PHYS & PTE_FRAME_MASK));
+                        owned_frame_track_fresh_normal_mapping(dst, VADDR, CHILD_PHYS, pte_raw(dst_pml1e));
+                        continue;
+                    }
 
                     // Only writable mappings need COW. Shared read-only mappings
                     // (text/debug metadata) can stay read-only in both address
@@ -3466,9 +3886,7 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                     }
 
                     // Increment refcount on the shared data page
-                    paddr_t const DATA_PHYS = src_pml1e.frame << paging::PAGE_SHIFT;
                     owned_frame_untrack_mapping(src, VADDR, DATA_PHYS);
-                    void* data_virt = reinterpret_cast<void*>(addr::get_virt_pointer(DATA_PHYS));
                     phys::page_ref_inc(data_virt, &ref_lookup);
                     if (is_watched_mmap_vaddr(VADDR)) {
                         log::warn("watch mmap-cow: src=%p dst=%p vaddr=0x%llx phys=0x%llx writable=%u cow=%u ref=%llu",

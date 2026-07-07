@@ -28,6 +28,7 @@
 #include "platform/perf/perf_events.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sys/signal.hpp"
+#include "platform/sys/usercopy.hpp"
 #include "util/hcf.hpp"
 
 namespace ker::mod::gates {
@@ -98,6 +99,41 @@ void log_userfault_lazy_vmem_ranges(ker::mod::sched::task::Task* task, uint64_t 
     }
 
     journal::warn("  lazy_hit: <none>");
+}
+
+void log_user_exception_words(ker::mod::sched::task::Task* task, const char* label, uint64_t addr) {
+    if (task == nullptr) {
+        return;
+    }
+
+    std::array<uint64_t, 8> words{};
+    constexpr size_t WORD_BYTES = sizeof(words[0]) * 8;
+    if (!ker::mod::sys::usercopy::range_valid(addr, WORD_BYTES)) {
+        journal::warn(" userfault %s: addr=0x%lx outside canonical user range", label, addr);
+        return;
+    }
+
+    if (!ker::mod::sys::usercopy::copy_from_task(*task, addr, words.data(), WORD_BYTES)) {
+        journal::warn(" userfault %s: unable to copy 64 bytes at addr=0x%lx", label, addr);
+        return;
+    }
+
+    journal::warn(" userfault %s0: [0]=0x%lx [1]=0x%lx [2]=0x%lx [3]=0x%lx", label, words[0], words[1], words[2], words[3]);
+    journal::warn(" userfault %s1: [4]=0x%lx [5]=0x%lx [6]=0x%lx [7]=0x%lx", label, words[4], words[5], words[6], words[7]);
+}
+
+void log_user_exception_registers(ker::mod::sched::task::Task* task, const cpu::GPRegs& gpr, const InterruptFrame& frame, uint64_t cr2) {
+    journal::warn("Userspace exception detail: int=%d err=%d rip=0x%lx cs=0x%lx rsp=0x%lx ss=0x%lx rbp=0x%lx flags=0x%lx cr2=0x%lx pid=%d",
+                  frame.int_num, frame.err_code, frame.rip, frame.cs, frame.rsp, frame.ss, gpr.rbp, frame.flags, cr2,
+                  task != nullptr ? task->pid : 0);
+    journal::warn(" userfault gpr0: rax=0x%lx rbx=0x%lx rcx=0x%lx rdx=0x%lx rsi=0x%lx rdi=0x%lx", gpr.rax, gpr.rbx, gpr.rcx, gpr.rdx,
+                  gpr.rsi, gpr.rdi);
+    journal::warn(" userfault gpr1: r8=0x%lx r9=0x%lx r10=0x%lx r11=0x%lx r12=0x%lx r13=0x%lx r14=0x%lx r15=0x%lx", gpr.r8, gpr.r9, gpr.r10,
+                  gpr.r11, gpr.r12, gpr.r13, gpr.r14, gpr.r15);
+
+    log_user_exception_words(task, "rsp", frame.rsp);
+    log_user_exception_words(task, "rbp", gpr.rbp);
+    log_user_exception_words(task, "rip", frame.rip >= 16 ? frame.rip - 16 : frame.rip);
 }
 
 auto load_u64_unaligned(const void* ptr) -> uint64_t {
@@ -248,12 +284,27 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
         journal::warn("USERFAULT DEBUG: apicId=%d cpuFromApic=%d task=%p taskPid=%d cr3=0x%lx taskPagemap=%p", APIC_ID, CPU_ID_FROM_APIC,
                       current_task_for_dump, (current_task_for_dump != nullptr) ? current_task_for_dump->pid : 0xDEAD, cr3,
                       (current_task_for_dump != nullptr) ? reinterpret_cast<void*>(current_task_for_dump->pagemap) : nullptr);
+        log_user_exception_registers(current_task_for_dump, gpr, frame, cr2);
 
         if (frame.int_num == 14) {
             log_userfault_lazy_vmem_ranges(current_task_for_dump, cr2);
             journal::warn("Userspace page fault: cr2=0x%lx err=%d rip=0x%lx rsp=0x%lx pid=%d", cr2, frame.err_code, frame.rip, frame.rsp,
                           (ker::mod::sched::get_current_task() != nullptr) ? ker::mod::sched::get_current_task()->pid : 0);
+            journal::warn(" userfault gpr0: rax=0x%lx rbx=0x%lx rcx=0x%lx rdx=0x%lx rsi=0x%lx rdi=0x%lx rbp=0x%lx", gpr.rax, gpr.rbx,
+                          gpr.rcx, gpr.rdx, gpr.rsi, gpr.rdi, gpr.rbp);
+            journal::warn(" userfault gpr1: r8=0x%lx r9=0x%lx r10=0x%lx r11=0x%lx r12=0x%lx r13=0x%lx r14=0x%lx r15=0x%lx", gpr.r8, gpr.r9,
+                          gpr.r10, gpr.r11, gpr.r12, gpr.r13, gpr.r14, gpr.r15);
             if (current_task_for_dump != nullptr) {
+                std::array<uint64_t, 8> stack_words{};
+                if (ker::mod::sys::usercopy::copy_from_task(*current_task_for_dump, frame.rsp, stack_words.data(),
+                                                            stack_words.size() * sizeof(stack_words[0]))) {
+                    journal::warn(" userfault stack0: [0]=0x%lx [1]=0x%lx [2]=0x%lx [3]=0x%lx", stack_words[0], stack_words[1],
+                                  stack_words[2], stack_words[3]);
+                    journal::warn(" userfault stack1: [4]=0x%lx [5]=0x%lx [6]=0x%lx [7]=0x%lx", stack_words[4], stack_words[5],
+                                  stack_words[6], stack_words[7]);
+                } else {
+                    journal::warn(" userfault stack: unable to copy 64 bytes at rsp=0x%lx", frame.rsp);
+                }
                 journal::warn(" task_ctx: saved_rip=0x%lx saved_rsp=0x%lx entry=0x%lx thread=%p scratch=%p",
                               current_task_for_dump->context.frame.rip, current_task_for_dump->context.frame.rsp,
                               current_task_for_dump->entry, current_task_for_dump->thread,

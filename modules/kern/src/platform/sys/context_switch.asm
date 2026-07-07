@@ -12,6 +12,7 @@ bits 64
 
 extern wos_commit_handoff_task
 extern wos_user_handoff_stack_top
+extern wos_restore_return_task_fpu
 
 ; Same-CPL iretq consumes only RIP/CS/RFLAGS, but the scheduler and panic
 ; diagnostics treat the memory below the saved RSP as GPRegs + InterruptFrame.
@@ -196,6 +197,7 @@ extern wos_user_handoff_stack_top
     mov r14, rsp
     and rsp, -16
     call wos_commit_handoff_task
+    call wos_restore_return_task_fpu
     mov rsp, r14
 
     ; Returning to userspace - set up data segment selectors. The base values
@@ -271,6 +273,7 @@ extern wos_user_handoff_stack_top
     mov r14, rsp
     and rsp, -16
     call wos_commit_handoff_task
+    call wos_restore_return_task_fpu
     mov rsp, r14
 
     ; Swap from kernel GS base to the user's GS base prepared by switch_to().
@@ -362,6 +365,15 @@ wos_enterIdleStack:
 
 global wos_asm_enter_usermode
 wos_asm_enter_usermode:
+    mov r12, rdi
+    mov r13, rsi
+    mov r14, rsp
+    and rsp, -16
+    call wos_restore_return_task_fpu
+    mov rsp, r14
+    mov rdi, r12
+    mov rsi, r13
+
     ;clear registers
     xor rax, rax
     xor rdx, rdx

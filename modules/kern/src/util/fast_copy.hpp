@@ -4,9 +4,8 @@
 
 namespace ker::util {
 
-// Fast kernel copy helper.
-// Uses scalar copy for small sizes and SSE with explicit FPU/SIMD context
-// save/restore for larger sizes.
+// Fast kernel copy helper. Avoids SIMD/FPU state so it is safe in socket hot paths
+// while user processes freely use AVX.
 void copy_fast(void* dst, const void* src, size_t len);
 
 }  // namespace ker::util

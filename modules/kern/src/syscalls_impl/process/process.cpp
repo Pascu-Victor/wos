@@ -28,6 +28,7 @@
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sched/threading.hpp"
+#include "platform/sys/context_switch.hpp"
 #include "platform/sys/signal.hpp"
 #include "platform/sys/usercopy.hpp"
 #include "release.hpp"
@@ -351,6 +352,14 @@ auto throttle_fork_for_reclaim_pressure(uint64_t callsite) -> bool {
     }
 }
 
+void snapshot_fpu_state_for_fork(ker::mod::sched::task::Task* parent, ker::mod::sched::task::Task* child) {
+    ker::mod::sys::context_switch::save_fpu_state(parent);
+    std::memcpy(child->fx_state.aligned(), parent->fx_state.aligned(), ker::mod::sched::task::FxState::XSAVE_AREA_SIZE);
+    child->fx_state.saved = parent->fx_state.saved;
+    child->fx_state.live_saved = false;
+    child->fx_state.initialized = parent->fx_state.initialized;
+}
+
 auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     using namespace ker::mod;
 
@@ -390,6 +399,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         return finish_fork(-ENOMEM);
     }
+    snapshot_fpu_state_for_fork(parent, child);
 
     // --- Initialize child task fields ---
     // Copy name

@@ -7,6 +7,7 @@
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/task.hpp"
+#include "util/fast_copy.hpp"
 
 namespace ker::mod::sys::usercopy {
 namespace {
@@ -39,7 +40,7 @@ namespace {
         }
         size_t const CHUNK = copy_chunk(size - copied, CUR);
         auto* dst = reinterpret_cast<uint8_t*>(mm::addr::get_virt_pointer(PHYS));
-        std::memcpy(dst, in + copied, CHUNK);
+        ker::util::copy_fast(dst, in + copied, CHUNK);
         copied += CHUNK;
     }
     return true;
@@ -94,13 +95,16 @@ auto copy_from_task(sched::task::Task& task, uint64_t user_addr, void* dst, size
     size_t copied = 0;
     while (copied < size) {
         uint64_t const CUR = user_addr + copied;
+        if (!mm::virt::ensure_user_page_mapped(&task, CUR)) {
+            return false;
+        }
         uint64_t const PHYS = mm::virt::translate(task.pagemap, CUR);
         if (PHYS == mm::virt::PADDR_INVALID) {
             return false;
         }
         size_t const CHUNK = copy_chunk(size - copied, CUR);
         auto const* src = reinterpret_cast<const uint8_t*>(mm::addr::get_virt_pointer(PHYS));
-        std::memcpy(out + copied, src, CHUNK);
+        ker::util::copy_fast(out + copied, src, CHUNK);
         copied += CHUNK;
     }
     return true;

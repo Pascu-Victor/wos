@@ -17,6 +17,7 @@
 #include <iterator>
 #include <net/wki/remote_compute.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/elf_loader.hpp>
@@ -26,6 +27,7 @@
 #include <platform/power/power.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sys/context_switch.hpp>
 #include <platform/sys/signal.hpp>
 #include <string_view>
 #include <util/smallvec.hpp>
@@ -57,6 +59,55 @@ constexpr size_t EXEC_PATH_MAX = 512;
 constexpr int WOS_SIGKILL = 9;
 constexpr int WOS_SIGSTOP = 19;
 using exec_log = ker::mod::dbg::logger<"exec">;
+
+auto exec_cmdline_has_token(const char* cmdline, const char* token) -> bool {
+    if (cmdline == nullptr || token == nullptr || token[0] == '\0') {
+        return false;
+    }
+
+    size_t const TOKEN_LEN = std::strlen(token);
+    const char* cursor = cmdline;
+    while (*cursor != '\0') {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n') {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+
+        const char* const START = cursor;
+        size_t len = 0;
+        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t' && *cursor != '\n') {
+            ++cursor;
+            ++len;
+        }
+
+        if (len == TOKEN_LEN && std::strncmp(START, token, TOKEN_LEN) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto exec_lazy_file_segments_enabled() -> bool {
+    static std::atomic<int> s_enabled{-1};
+    int const CACHED = s_enabled.load(std::memory_order_acquire);
+    if (CACHED >= 0) {
+        return CACHED != 0;
+    }
+
+    const char* const CMDLINE = ker::init::get_kernel_cmdline();
+    bool const DISABLED =
+        exec_cmdline_has_token(CMDLINE, "vmem.no_lazy_file_mmap") || exec_cmdline_has_token(CMDLINE, "exec.no_lazy_file_segments");
+    int const VALUE = DISABLED ? 0 : 1;
+    int expected = -1;
+    if (s_enabled.compare_exchange_strong(expected, VALUE, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        exec_log::info("exec lazy file segments %s", DISABLED ? "disabled by cmdline" : "enabled");
+        return !DISABLED;
+    }
+
+    return expected != 0;
+}
 using FdSnapshot = std::array<uint64_t, ker::mod::sched::task::Task::FD_TABLE_SIZE>;
 using LazyVmemKind = ker::mod::sched::task::LazyVmemKind;
 using LazyVmemRange = ker::mod::sched::task::LazyVmemRange;
@@ -851,8 +902,9 @@ auto read_exec_image_for_loader(int fd, uint8_t* dst, size_t file_size, const ch
         return {.bytes_read = static_cast<ssize_t>(bytes_read), .status = PROBE_RET};
     }
 
+    bool const USE_LAZY_FILE_SEGMENTS = allow_lazy_file_segments && exec_lazy_file_segments_enabled();
     ExecImageReadResult result =
-        read_sparse_elf_image(fd, dst, file_size, path, bytes_read, read_static_relocation_metadata, allow_lazy_file_segments);
+        read_sparse_elf_image(fd, dst, file_size, path, bytes_read, read_static_relocation_metadata, USE_LAZY_FILE_SEGMENTS);
     result.shebang_probe_size = PROBE_SIZE;
     return result;
 }
@@ -1676,8 +1728,9 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     uint64_t const ELF_READ_STARTED_US = time::get_us();
     record_local_proc_event(task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::BEGIN, ELF_READ_CORR, 0,
                             clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
+    bool const EXEC_LAZY_FILE_SEGMENTS = exec_file != nullptr && exec_lazy_file_segments_enabled();
     ExecImageReadResult const READ_RESULT =
-        read_exec_image_for_loader(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), exec_path, true, exec_file != nullptr);
+        read_exec_image_for_loader(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), exec_path, true, EXEC_LAZY_FILE_SEGMENTS);
     uint32_t const ELF_READ_US = clamp_perf_aux(time::get_us() - ELF_READ_STARTED_US);
     int32_t const ELF_READ_STATUS = READ_RESULT.status;
     record_local_proc_event(task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::END, ELF_READ_CORR, ELF_READ_STATUS, ELF_READ_US,
@@ -1859,7 +1912,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     loader::elf::ElfLoadOptions const MAIN_LOAD_OPTIONS{
         .register_special_symbols = true,
         .base_address = 0,
-        .lazy_file_ranges = exec_file != nullptr ? &main_loader_lazy_ranges : nullptr,
+        .lazy_file_ranges = EXEC_LAZY_FILE_SEGMENTS ? &main_loader_lazy_ranges : nullptr,
     };
     loader::elf::ElfLoadResult elf_result =
         loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(elf_buffer), new_pagemap, task->pid, task->name, MAIN_LOAD_OPTIONS);
@@ -1940,8 +1993,9 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             free_kernel_arg_env_once();
             return static_cast<uint64_t>(-ENOMEM);
         }
-        ExecImageReadResult const INTERP_READ =
-            read_exec_image_for_loader(INTERP_FD, interp_buf, static_cast<size_t>(INTERP_SIZE), INTERP_PATH, false, interp_file != nullptr);
+        bool const INTERP_LAZY_FILE_SEGMENTS = interp_file != nullptr && exec_lazy_file_segments_enabled();
+        ExecImageReadResult const INTERP_READ = read_exec_image_for_loader(INTERP_FD, interp_buf, static_cast<size_t>(INTERP_SIZE),
+                                                                           INTERP_PATH, false, INTERP_LAZY_FILE_SEGMENTS);
         vfs::vfs_close(INTERP_FD);
 
         if (INTERP_READ.status < 0) {
@@ -1958,7 +2012,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         loader::elf::ElfLoadOptions const INTERP_LOAD_OPTIONS{
             .register_special_symbols = false,
             .base_address = INTERP_BASE,
-            .lazy_file_ranges = interp_file != nullptr ? &interp_loader_lazy_ranges : nullptr,
+            .lazy_file_ranges = INTERP_LAZY_FILE_SEGMENTS ? &interp_loader_lazy_ranges : nullptr,
         };
         loader::elf::ElfLoadResult const INTERP_RESULT = loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(interp_buf),
                                                                                new_pagemap, task->pid, "ld.so", INTERP_LOAD_OPTIONS);
@@ -2324,6 +2378,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 
     auto phys_pagemap = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(new_pagemap)));
     asm volatile("mov %0, %%cr3" : : "r"(phys_pagemap) : "memory");
+    ker::mod::sys::context_switch::reset_fpu_state(task);
 
     // execve() replaces the current image in-place, so the old address space
     // and thread backing storage must be reclaimed now rather than deferred to

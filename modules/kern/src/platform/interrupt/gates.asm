@@ -1,6 +1,8 @@
 bits 64
 
 extern iterrupt_handler
+extern wos_user_interrupt_save_fpu
+extern wos_user_interrupt_restore_fpu
 
 %include "platform/asm/helpers.asm"
 
@@ -69,8 +71,12 @@ __idt_isr_handler:
 .outer_entry:
     isr_swapgs entry
     pushq
+    call wos_user_interrupt_save_fpu
+    mov r12, rax
     mov rdi, rsp
     call iterrupt_handler
+    mov rdi, r12
+    call wos_user_interrupt_restore_fpu
     popq
     isr_swapgs exit
     add rsp, 16

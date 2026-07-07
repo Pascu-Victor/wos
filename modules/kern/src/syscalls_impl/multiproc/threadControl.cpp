@@ -82,6 +82,9 @@ auto publish_thread_tid_to_tcb(mod::sched::task::Task* parent, uint64_t tcb_va, 
         return false;
     }
 
+    if (!mod::mm::virt::ensure_user_page_writable(parent, tcb_va + MLIBC_TCB_TID_OFFSET)) {
+        return false;
+    }
     uint64_t const TID_PHYS = mod::mm::virt::translate(parent->pagemap, tcb_va + MLIBC_TCB_TID_OFFSET);
     if (TID_PHYS == mod::mm::virt::PADDR_INVALID) {
         return false;
@@ -170,8 +173,7 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
             if (parent == nullptr || tcb_va == 0) {
                 return static_cast<uint64_t>(-EINVAL);
             }
-            uint64_t const TID_PHYS = mod::mm::virt::translate(parent->pagemap, tcb_va + MLIBC_TCB_TID_OFFSET);
-            if (TID_PHYS == mod::mm::virt::PADDR_INVALID) {
+            if (!mod::mm::virt::ensure_user_page_writable(parent, tcb_va + MLIBC_TCB_TID_OFFSET)) {
                 return static_cast<uint64_t>(-EFAULT);
             }
 

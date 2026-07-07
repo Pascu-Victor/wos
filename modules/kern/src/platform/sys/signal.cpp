@@ -202,6 +202,9 @@ auto copy_to_task_user(Task& task, uint64_t user_addr, const void* src, size_t s
     size_t copied = 0;
     while (copied < size) {
         uint64_t const CUR = user_addr + copied;
+        if (!ker::mod::mm::virt::ensure_user_page_writable(&task, CUR)) {
+            return false;
+        }
         uint64_t const PHYS = ker::mod::mm::virt::translate(task.pagemap, CUR);
         if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
             return false;

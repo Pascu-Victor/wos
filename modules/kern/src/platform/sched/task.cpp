@@ -224,6 +224,7 @@ void release_cloned_fd_table_refs(Task* task) {
     });
 }
 
+#ifdef WOS_SELFTEST
 auto clone_user_thread_fds_checked(Task* parent, Task* child) -> bool {
     if (parent == nullptr || child == nullptr) {
         return false;
@@ -258,6 +259,7 @@ auto clone_user_thread_fds_checked(Task* parent, Task* child) -> bool {
     parent->fd_table_lock.unlock_irqrestore(IRQF);
     return ok;
 }
+#endif
 
 auto read_boot_file_fully(const char* path, uint8_t** out_buf) -> bool {
     if (path == nullptr || out_buf == nullptr) {
@@ -887,11 +889,8 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->context.regs.rdi = entry_va;     // arg1: entry function
     t->context.regs.rsi = user_arg_va;  // arg2: user_arg
 
-    // Inherit FDs: share the same File* pointers and bump each refcount.
-    if (!clone_user_thread_fds_checked(parent, t)) {
-        cleanup_constructed_thread_task();
-        return nullptr;
-    }
+    // POSIX threads share their process descriptor table. Keep this per-thread
+    // table empty; VFS fd helpers resolve user threads through owner_pid.
     // Copy fixed per-process storage inherited by userspace threads.
     t->fd_cloexec = parent->fd_cloexec;
     t->cwd = parent->cwd;

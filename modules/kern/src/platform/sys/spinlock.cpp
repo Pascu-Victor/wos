@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
+#include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 
 #if SPINLOCK_DEBUG
@@ -183,8 +184,12 @@ void Spinlock::unlock_irqrestore(uint64_t flags) {
     auto* const PREEMPT_OWNER = preempt_owner;
     preempt_owner = nullptr;
     unlock_ticket(this);
+    bool const RESTORE_INTERRUPTS = (flags & 0x200) != 0;
+    if (RESTORE_INTERRUPTS) {
+        mm::virt::service_pending_tlb_shootdowns();
+    }
     sched::preempt_enable_token_at(PREEMPT_OWNER, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-    if ((flags & 0x200) != 0) {
+    if (RESTORE_INTERRUPTS) {
         asm volatile("sti");
     }
 }

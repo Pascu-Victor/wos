@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <defines/defines.hpp>
 #include <platform/acpi/apic/apic.hpp>
@@ -107,12 +108,18 @@ void enable_pse();
 void enable_sse();
 void enable_fsgsbase();
 
+constexpr uint64_t XSAVE_LEGACY_MASK = 0x3;  // x87 + SSE.
+constexpr uint64_t XSAVE_AVX_MASK = 0x7;     // x87 + SSE + AVX.
+constexpr uint64_t XSAVE_SUPPORTED_MASK = XSAVE_AVX_MASK;
+constexpr size_t XSAVE_STATIC_AREA_SIZE = 2688;
+
 // Enable XSAVE/XRSTOR and configure XCR0 for x87+SSE+AVX.
 // Must be called after enableSSE(). Called on each CPU.
 void enable_xsave();
 
 // Size in bytes of the xsave area (set after enableXSave). 0 = XSAVE not supported, use fxsave.
 extern uint64_t xsave_area_size;
+extern uint64_t xsave_feature_mask;
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage): segment register name must be stringified into inline asm.
 #define SAVESEGMENT(seg, value) asm("movq %%" #seg ",%0" : "=r"(value) : : "memory")

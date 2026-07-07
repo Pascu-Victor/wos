@@ -261,6 +261,9 @@ constexpr size_t BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES = size_t{2} * 1024 * 1024;
 constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BYTES = BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES;
 constexpr size_t DIRTY_WAKE_BATCH = 32;
 constexpr size_t DIRTY_COPY_COVERAGE_MAX_INTERVALS = 64;
+constexpr size_t RANGE_COPY_MAX_VISITS = 256;
+constexpr size_t CLEAN_ALIAS_DISCARD_MAX_BUFFERS = 64;
+constexpr size_t CLEAN_ALIAS_DISCARD_MAX_BYTES = size_t{4} * 1024 * 1024;
 constexpr uint64_t DIRTY_THROTTLE_PARK_TIMEOUT_US = uint64_t{10} * 1000;
 constexpr size_t DIRTY_TARGET_DIVISOR = 2;
 constexpr size_t DIRTY_THROTTLE_RESUME_NUMERATOR = 3;
@@ -1085,22 +1088,34 @@ auto cached_buffer_copy_coverage(BufHead* bh, dev::BlockDevice* bdev, uint64_t b
 
 void range_copy_cached_overlaps_locked(BufHead* root, dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst,
                                        std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS>& coverage,
-                                       size_t& coverage_count, bool& copied, bool& coverage_overflow) {
+                                       size_t& coverage_count, size_t& visit_count, bool& copied, bool& coverage_overflow) {
     if (root == nullptr || coverage_overflow) {
         return;
     }
+    if (visit_count >= RANGE_COPY_MAX_VISITS) {
+        coverage_overflow = true;
+        return;
+    }
+    ++visit_count;
+
     uint64_t const QUERY_LAST = block_range_last_block(block_no, count);
 
     if (root->range_left != nullptr && root->range_left->range_subtree_last_block >= block_no) {
-        range_copy_cached_overlaps_locked(root->range_left, bdev, block_no, count, dst, coverage, coverage_count, copied,
+        range_copy_cached_overlaps_locked(root->range_left, bdev, block_no, count, dst, coverage, coverage_count, visit_count, copied,
                                           coverage_overflow);
+        if (coverage_overflow) {
+            return;
+        }
     }
 
     bool const DID_COPY = cached_buffer_copy_coverage(root, bdev, block_no, count, dst, coverage, coverage_count, coverage_overflow);
     copied = copied || DID_COPY;
+    if (coverage_overflow) {
+        return;
+    }
 
     if (root->block_no <= QUERY_LAST) {
-        range_copy_cached_overlaps_locked(root->range_right, bdev, block_no, count, dst, coverage, coverage_count, copied,
+        range_copy_cached_overlaps_locked(root->range_right, bdev, block_no, count, dst, coverage, coverage_count, visit_count, copied,
                                           coverage_overflow);
     }
 }
@@ -1124,7 +1139,9 @@ auto copy_cached_bdev_range_if_complete_internal(dev::BlockDevice* bdev, uint64_
     bool coverage_overflow = false;
     std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS> coverage{};
     size_t coverage_count = 0;
-    range_copy_cached_overlaps_locked(state->tree_root, bdev, block_no, count, dst, coverage, coverage_count, copied, coverage_overflow);
+    size_t visit_count = 0;
+    range_copy_cached_overlaps_locked(state->tree_root, bdev, block_no, count, dst, coverage, coverage_count, visit_count, copied,
+                                      coverage_overflow);
     bool const COMPLETE = copied && !coverage_overflow && dirty_coverage_complete(coverage, coverage_count, block_no, count);
     if (COMPLETE && cache_dirty_buffers != 0) {
         static_cast<void>(copy_dirty_bdev_range_locked(bdev, block_no, count, dst, 0));
@@ -1168,9 +1185,14 @@ void discard_clean_overlapping_aliases_locked(BufHead* source) {
     }
 
     uint64_t discarded_bytes = 0;
+    size_t discarded_buffers = 0;
     while (BufHead* alias = range_find_clean_overlapping_alias_locked(state->tree_root, source)) {
         discarded_bytes += alias->size;
         free_buffer(alias);
+        ++discarded_buffers;
+        if (discarded_buffers >= CLEAN_ALIAS_DISCARD_MAX_BUFFERS || discarded_bytes >= CLEAN_ALIAS_DISCARD_MAX_BYTES) {
+            break;
+        }
         state = find_range_bdev_state_locked(source->bdev);
         if (state == nullptr || state->buffers <= 1) {
             break;

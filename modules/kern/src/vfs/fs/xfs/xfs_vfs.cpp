@@ -16,7 +16,6 @@
 #include <memory>
 #include <new>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/addr.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/swap.hpp>
 #include <platform/perf/perf_events.hpp>
@@ -55,7 +54,7 @@ namespace {
 
 constexpr uint32_t XFS_SLOW_TRACE_US = 2048;
 constexpr size_t XFS_DIRECT_READ_MIN_BYTES = size_t{4} * 1024;
-constexpr size_t XFS_DIRECT_READ_BATCH_MAX_BYTES = size_t{2} * 1024 * 1024;
+constexpr size_t XFS_DIRECT_READ_BATCH_MAX_BYTES = size_t{256} * 1024;
 constexpr int64_t XFS_NSEC_PER_SEC_SIGNED = 1000000000LL;
 constexpr uint64_t XFS_NSEC_PER_SEC = static_cast<uint64_t>(XFS_NSEC_PER_SEC_SIGNED);
 constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
@@ -63,11 +62,11 @@ constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
 // still copied in buffered I/O batches below, but the extent allocation itself
 // must leave enough log item headroom for AG free-space updates, bmap updates,
 // and inode writeback during commit.
-constexpr xfs_extlen_t XFS_WRITE_ALLOC_TRANSACTION_BLOCKS = 16384;  // up to 64 MiB at 4 KiB blocks
-constexpr size_t XFS_BUFFERED_WRITE_BATCH_MAX_BYTES = size_t{2} * 1024 * 1024;
+constexpr xfs_extlen_t XFS_WRITE_ALLOC_TRANSACTION_BLOCKS = 1024;  // up to 4 MiB at 4 KiB blocks
+constexpr size_t XFS_BUFFERED_WRITE_BATCH_MAX_BYTES = size_t{256} * 1024;
 constexpr size_t XFS_DIRTY_THROTTLE_INTERVAL_BYTES = XFS_BUFFERED_WRITE_BATCH_MAX_BYTES;
-constexpr size_t XFS_STREAM_PREALLOC_TRIGGER_BYTES = size_t{2} * 1024 * 1024;
-constexpr xfs_extlen_t XFS_STREAM_PREALLOC_BLOCKS = 1024;  // 4 MiB
+constexpr size_t XFS_STREAM_PREALLOC_TRIGGER_BYTES = size_t{1} * 1024 * 1024;
+constexpr xfs_extlen_t XFS_STREAM_PREALLOC_BLOCKS = 256;  // 1 MiB
 constexpr uint32_t XFS_STREAM_PREALLOC_EXTENT_MARGIN = 8;
 constexpr size_t XFS_PARENT_PATH_CACHE_PATH_MAX = 512;
 constexpr size_t XFS_PARENT_PATH_CACHE_SET_COUNT = 4096;
@@ -322,13 +321,6 @@ auto xfs_direct_read_batch_max_bytes(size_t block_size) -> size_t {
     }
     size_t const MAX_BLOCKS = std::max<size_t>(1, XFS_DIRECT_READ_BATCH_MAX_BYTES / block_size);
     return MAX_BLOCKS * block_size;
-}
-
-auto xfs_direct_read_target_dma_safe(const void* buffer) -> bool {
-    if (buffer == nullptr) {
-        return false;
-    }
-    return reinterpret_cast<uint64_t>(buffer) >= ker::mod::mm::addr::get_hhdm_offset();
 }
 
 void xfs_set_alloc_hint_from_fsb(XfsMountContext* ctx, xfs_fsblock_t fsb, XfsAllocReq* req) {
@@ -752,6 +744,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         return -EISDIR;
     }
 
+    XfsMetadataGuard metadata_guard(ctx);
     ker::mod::sys::MutexGuard guard(ip->io_lock);
 
     // Inline data (LOCAL format)
@@ -929,7 +922,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             bool read_from_cache = chunk < XFS_DIRECT_READ_MIN_BYTES;
             std::unique_ptr<uint8_t[]> direct_bounce{};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
             uint8_t* direct_dst = dst + total_read;
-            if (!read_from_cache && !xfs_direct_read_target_dma_safe(direct_dst)) {
+            if (!read_from_cache) {
                 direct_bounce.reset(new (std::nothrow) uint8_t[chunk]);
                 if (direct_bounce == nullptr) {
                     read_from_cache = true;
@@ -959,7 +952,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                     perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
             } else {
                 uint64_t const PERF_COPY_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY);
-                bool const COPIED_CACHED = copy_cached_bdev_range_if_complete(ctx->device, dev_block, dev_count, dst + total_read);
+                bool const COPIED_CACHED = copy_cached_bdev_range_if_complete(ctx->device, dev_block, dev_count, direct_dst);
                 if (COPIED_CACHED) {
                     perf_accounted_us +=
                         perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
@@ -977,21 +970,21 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                         }
                         perf_accounted_us +=
                             perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
-                    } else {
+                        total_read += chunk;
+                        remaining -= chunk;
+                        continue;
+                    }
+                    perf_accounted_us +=
+                        perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, 0, chunk);
+                    bool const OVERLAYED = copy_dirty_bdev_range(ctx->device, dev_block, dev_count, direct_dst);
+                    if (OVERLAYED) {
                         perf_accounted_us +=
-                            perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, 0, chunk);
-                        bool const OVERLAYED = copy_dirty_bdev_range(ctx->device, dev_block, dev_count, direct_dst);
-                        if (OVERLAYED) {
-                            perf_accounted_us +=
-                                perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
-                        }
-                        if (direct_bounce != nullptr) {
-                            std::memcpy(dst + total_read, direct_dst, chunk);
-                            perf_accounted_us +=
-                                perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
-                        }
+                            perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
                     }
                 }
+                std::memcpy(dst + total_read, direct_dst, chunk);
+                perf_accounted_us +=
+                    perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
             }
         } else {
             // Partial or unaligned - fall back to single cached block.

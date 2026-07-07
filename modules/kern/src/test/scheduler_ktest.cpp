@@ -23,6 +23,7 @@ auto scheduler_selftest_load_balance_nudge_needs_process_backlog() -> bool;
 auto scheduler_selftest_idle_steal_scan_expands_for_large_backlog() -> bool;
 auto scheduler_selftest_effectively_idle_current_accepts_rebalance_probe() -> bool;
 auto scheduler_selftest_loadavg_wait_channel_policy() -> bool;
+auto scheduler_selftest_deferred_yield_requires_sched_yield_channel() -> bool;
 }  // namespace ker::mod::sched
 
 KTEST(Sched, VruntimeOrdering) {
@@ -89,6 +90,10 @@ KTEST(SchedulerMigration, EffectivelyIdleCurrentAcceptsRebalanceProbe) {
 }
 
 KTEST(SchedulerMetrics, LoadAverageWaitChannelPolicy) { KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_loadavg_wait_channel_policy()); }
+
+KTEST(SchedulerDeferredSwitch, YieldBitRequiresSchedYieldChannel) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_deferred_yield_requires_sched_yield_channel());
+}
 
 KTEST(ContextSwitch, RepairsStaleProcessSyscallResume) {
     KEXPECT_TRUE(ker::mod::sys::context_switch::context_switch_selftest_repair_stale_process_syscall_resume());

@@ -129,6 +129,14 @@ auto fork_child_from_syscall_result(const PendingSyscall& pending, int64_t resul
     return true;
 }
 
+void emit_deferred_syscall_without_exit_stop(const TraceOptions& options, TraceOutput& output, uint64_t pid,
+                                             const PendingSyscall& pending) {
+    if (!pending.valid) {
+        return;
+    }
+    emit_trace_line(options, output, pid, pending.entered_at, std::format("{} = ? <deferred>", format_entry(pid, pending)));
+}
+
 void spawn_follow_helper(TraceState& state, TraceOutput& output, uint64_t child_pid, const TraceOptions& options) {
     if (child_pid == 0) {
         return;
@@ -182,6 +190,10 @@ auto trace_loop(uint64_t pid, const TraceOptions& options, bool kill_on_setup_fa
         reap_follow_helpers(state, false);
 
         if ((stop.flags & ker::abi::ptrace::STOP_INFO_EXITED) != 0) {
+            for (auto& entry : pending) {
+                emit_deferred_syscall_without_exit_stop(options, output, pid, entry.second);
+                entry.second.valid = false;
+            }
             if (WIFEXITED(stop.wait_status)) {
                 emit_trace_line(options, output, pid, current_realtime(options),
                                 std::format("+++ exited with {} +++", WEXITSTATUS(stop.wait_status)));
@@ -200,7 +212,11 @@ auto trace_loop(uint64_t pid, const TraceOptions& options, bool kill_on_setup_fa
         auto const& event = stop.event;
         if (event.reason == ker::abi::ptrace::stop_reason::SYSCALL_ENTER) {
             auto it = pending.try_emplace(event.tid).first;
-            if (!it->second.valid && (stop.flags & ker::abi::ptrace::STOP_INFO_REGS_VALID) != 0) {
+            if (it->second.valid) {
+                emit_deferred_syscall_without_exit_stop(options, output, pid, it->second);
+                it->second.valid = false;
+            }
+            if ((stop.flags & ker::abi::ptrace::STOP_INFO_REGS_VALID) != 0) {
                 auto const& regs = stop.regs;
                 it->second = PendingSyscall{
                     .valid = true,

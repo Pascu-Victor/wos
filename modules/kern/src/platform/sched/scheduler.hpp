@@ -246,6 +246,33 @@ struct SchedulerCpuState {
     uint64_t current_preempt_max_us;
     uint64_t current_preempt_owner;
     uint64_t current_preempt_start_us;
+    const char* current_wait_channel;
+    uint8_t current_wait_kind;
+    uint64_t current_perf_wait_callsite;
+    uint64_t current_saved_rip;
+    uint64_t current_wake_at_us;
+    uint8_t current_sched_queue;
+    bool current_yield_switch;
+    bool current_deferred_task_switch;
+    uint64_t handoff_pid;
+    const char* handoff_name;
+    uint8_t handoff_type;
+    bool handoff_voluntary_block;
+    bool handoff_wants_block;
+    bool handoff_cpu_pinned;
+    uint32_t handoff_preempt_depth;
+    bool handoff_preempt_pending;
+    uint64_t handoff_preempt_max_us;
+    uint64_t handoff_preempt_owner;
+    uint64_t handoff_preempt_start_us;
+    const char* handoff_wait_channel;
+    uint8_t handoff_wait_kind;
+    uint64_t handoff_perf_wait_callsite;
+    uint64_t handoff_saved_rip;
+    uint64_t handoff_wake_at_us;
+    uint8_t handoff_sched_queue;
+    bool handoff_yield_switch;
+    bool handoff_deferred_task_switch;
     bool resched_timer_pending;
     bool is_idle;
     uint64_t runnable_count;
@@ -259,6 +286,40 @@ struct SchedulerCpuState {
     uint64_t local_reschedule_timer_pokes;
     uint64_t last_tick_us;
     uint64_t next_wait_deadline_us;
+};
+
+struct SchedulerRunQueueTaskState {
+    uint64_t pid;
+    const char* name;
+    uint8_t type;
+    uint8_t state;
+    uint8_t sched_queue;
+    bool current;
+    bool handoff;
+    bool in_heap;
+    bool voluntary_block;
+    bool wants_block;
+    bool cpu_pinned;
+    uint32_t preempt_depth;
+    bool preempt_pending;
+    uint64_t preempt_owner;
+    uint64_t preempt_start_us;
+    uint64_t preempt_max_us;
+    const char* wait_channel;
+    uint8_t wait_kind;
+    uint64_t perf_wait_callsite;
+    uint64_t saved_rip;
+    uint64_t wake_at_us;
+    uint64_t syscall_account_start_us;
+    int64_t vruntime;
+    int64_t vdeadline;
+    uint32_t slice_used_ns;
+    uint32_t slice_ns;
+    int32_t heap_index;
+    uint32_t heap_slot;
+    uint64_t owner_cpu;
+    bool yield_switch;
+    bool deferred_task_switch;
 };
 
 struct CpuAccountingSnapshot {
@@ -420,6 +481,17 @@ inline void halt_once_preserving_interrupt_state(bool const INTERRUPTS_WERE_ENAB
     }
 }
 
+inline void restore_process_syscall_park_interrupts(bool const INTERRUPTS_WERE_ENABLED, task::Task* task) {
+    if (INTERRUPTS_WERE_ENABLED || task == nullptr || task->type != task::TaskType::PROCESS) {
+        return;
+    }
+
+    // preemptible_syscall_park() is a syscall safe point, not an IRQ-save
+    // primitive. Letting the caller continue with IF clear can strand the
+    // local scheduler timer after the sti/hlt/cli sleep path.
+    asm volatile("sti" ::: "memory");
+}
+
 // OOM diagnostics - get queue sizes for a specific CPU
 struct RunQueueStats {
     uint64_t active_task_count;   // runnable_heap.size
@@ -429,8 +501,10 @@ struct RunQueueStats {
 auto get_run_queue_stats(uint64_t cpu_no) -> RunQueueStats;
 auto get_scheduler_trace_stats(uint64_t cpu_no) -> SchedulerTraceStats;
 auto get_scheduler_cpu_state(uint64_t cpu_no) -> SchedulerCpuState;
+size_t get_scheduler_runqueue_task_states(uint64_t cpu_no, SchedulerRunQueueTaskState* out, size_t max_entries);
 void dump_scheduler_trace_stats();
 void dump_scheduler_cpu_states();
+void dump_scheduler_current_cpu_state(const ker::mod::gates::InterruptFrame& frame);
 
 // Task enumeration helpers. Returned lifetime refs must be released by callers.
 using ActiveTaskPredicate = bool (*)(task::Task* task, void* context);
@@ -635,6 +709,7 @@ inline void preemptible_syscall_park_impl(const char* wait_channel, task::WaitCh
             task->wants_block = false;
             task->set_voluntary_blocked(false);
             task->clear_wait_channel();
+            restore_process_syscall_park_interrupts(INTERRUPTS_WERE_ENABLED, task);
             return;
         }
         if (task->has_interrupting_signal_pending()) {
@@ -642,6 +717,7 @@ inline void preemptible_syscall_park_impl(const char* wait_channel, task::WaitCh
             task->wants_block = false;
             task->set_voluntary_blocked(false);
             task->clear_wait_channel();
+            restore_process_syscall_park_interrupts(INTERRUPTS_WERE_ENABLED, task);
             return;
         }
         request_local_timer_recheck();
@@ -670,6 +746,7 @@ inline void preemptible_syscall_park_impl(const char* wait_channel, task::WaitCh
     if (PAUSED_SYSCALL_ACCOUNTING) {
         resume_syscall_accounting();
     }
+    restore_process_syscall_park_interrupts(INTERRUPTS_WERE_ENABLED, task);
 }
 
 inline void preemptible_syscall_park_impl(const char* wait_channel, uint64_t deadline_us, uint64_t perf_callsite) {

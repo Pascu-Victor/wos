@@ -22,6 +22,7 @@
 #include "platform/interrupt/gates.hpp"
 #include "platform/interrupt/gdt.hpp"
 #include "platform/mm/mm.hpp"
+#include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/power/power.hpp"
 #include "platform/sched/task.hpp"
@@ -46,6 +47,10 @@ constexpr bool K_ENABLE_SCHED_VALIDATE_CONTEXT = false;
 
 constexpr uint64_t USER_ADDR_LIMIT = 0x0000800000000000ULL;
 constexpr uint64_t USER_RFLAGS_FIXED_ONE = 1ULL << 1;
+constexpr uint64_t USER_RFLAGS_INTERRUPT_ENABLE = 1ULL << 9;
+constexpr uint64_t USER_RFLAGS_REQUIRED_MASK = USER_RFLAGS_FIXED_ONE | USER_RFLAGS_INTERRUPT_ENABLE;
+constexpr uint64_t USER_PROT_WRITE = 0x2ULL;
+constexpr uint64_t USER_PROT_EXEC = 0x4ULL;
 
 inline auto valid_kernel_stack(uint64_t rsp) -> bool { return rsp >= 0xffff800000000000ULL && rsp < 0xffff900000000000ULL; }
 
@@ -65,7 +70,35 @@ inline auto stack_belongs_to_task(sched::task::Task* task, uint64_t rsp) -> bool
 
 inline auto valid_user_resume_scalar(uint64_t value) -> bool { return value != 0 && value < USER_ADDR_LIMIT; }
 
-inline auto valid_user_rflags(uint64_t flags) -> bool { return (flags & USER_RFLAGS_FIXED_ONE) != 0; }
+inline auto user_rflags_have_fixed_bit(uint64_t flags) -> bool { return (flags & USER_RFLAGS_FIXED_ONE) != 0; }
+
+inline auto valid_user_rflags(uint64_t flags) -> bool { return (flags & USER_RFLAGS_REQUIRED_MASK) == USER_RFLAGS_REQUIRED_MASK; }
+
+enum class LazyUserAccess : uint8_t {
+    EXECUTE,
+    WRITE_STACK,
+};
+
+inline auto lazy_user_range_allows(sched::task::Task* task, uint64_t addr, LazyUserAccess access) -> bool {
+    if (task == nullptr || addr == 0 || addr >= USER_ADDR_LIMIT) {
+        return false;
+    }
+
+    uint64_t const PAGE_ADDR = addr & ~(mm::paging::PAGE_SIZE - 1);
+    bool allowed = false;
+    uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
+    for (const auto& range : task->lazy_vmem_ranges) {
+        if (PAGE_ADDR < range.start || PAGE_ADDR >= range.end) {
+            continue;
+        }
+
+        uint64_t const REQUIRED_PROT = access == LazyUserAccess::EXECUTE ? USER_PROT_EXEC : USER_PROT_WRITE;
+        allowed = (range.prot & REQUIRED_PROT) != 0;
+        break;
+    }
+    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+    return allowed;
+}
 
 inline auto stack_region_contains(sched::task::Task* task, uint64_t addr, size_t size) -> bool {
     if (task == nullptr || !valid_kernel_stack(task->context.syscall_kernel_stack) || size == 0) {
@@ -139,12 +172,16 @@ inline void validate_user_frame(const gates::InterruptFrame& frame, sched::task:
     const bool SS_BAD = frame.ss != desc::gdt::GDT_USER_DS;
     const bool RIP_BAD = frame.rip >= 0x800000000000ULL;
     const bool RSP_BAD = frame.rsp >= 0x800000000000ULL;
-    const bool FLAGS_BAD = (frame.flags & 0x2ULL) == 0;
+    const bool FLAGS_BAD = !valid_user_rflags(frame.flags);
     const uint64_t RIP_PHYS = !TASK_BAD && !RIP_BAD ? mm::virt::translate(task->pagemap, frame.rip) : mm::virt::PADDR_INVALID;
     const uint64_t RSP_PHYS = !TASK_BAD && !RSP_BAD ? mm::virt::translate(task->pagemap, frame.rsp) : mm::virt::PADDR_INVALID;
     const bool RIP_UNMAPPED = RIP_PHYS == mm::virt::PADDR_INVALID || RIP_PHYS == 0;
     const bool RSP_UNMAPPED = RSP_PHYS == mm::virt::PADDR_INVALID || RSP_PHYS == 0;
-    if (!TASK_BAD && !CS_BAD && !SS_BAD && !RIP_BAD && !RSP_BAD && !FLAGS_BAD && !RIP_UNMAPPED && !RSP_UNMAPPED) {
+    const bool RIP_LAZY_BACKED = RIP_UNMAPPED && !TASK_BAD && !RIP_BAD && lazy_user_range_allows(task, frame.rip, LazyUserAccess::EXECUTE);
+    const bool RSP_LAZY_BACKED =
+        RSP_UNMAPPED && !TASK_BAD && !RSP_BAD && lazy_user_range_allows(task, frame.rsp, LazyUserAccess::WRITE_STACK);
+    if (!TASK_BAD && !CS_BAD && !SS_BAD && !RIP_BAD && !RSP_BAD && !FLAGS_BAD && (!RIP_UNMAPPED || RIP_LAZY_BACKED) &&
+        (!RSP_UNMAPPED || RSP_LAZY_BACKED)) {
         return;
     }
 
@@ -165,6 +202,58 @@ inline auto is_idle_return_frame(const gates::InterruptFrame& frame, sched::task
 }
 
 inline auto is_user_return_frame(const gates::InterruptFrame& frame) -> bool { return (frame.cs & 0x3ULL) == 0x3ULL; }
+
+inline auto task_name_looks_like_clang(const sched::task::Task* task) -> bool {
+    if (task == nullptr || task->name == nullptr) {
+        return false;
+    }
+
+    char const* name = task->name;
+    return name[0] == 'c' && name[1] == 'l' && name[2] == 'a' && name[3] == 'n' && name[4] == 'g';
+}
+
+void debug_validate_clang_return(const char* path, sched::task::Task* task, const cpu::GPRegs& gpr, const gates::InterruptFrame& frame,
+                                 uint64_t syscall_signal_mode = UINT64_MAX, uint64_t live_rip = 0, uint64_t live_rsp = 0,
+                                 uint64_t live_flags = 0) {
+    constexpr uint64_t COMPLEX_MID_INSN_RIP = 0x2dcbb0fULL;
+    constexpr uint64_t OMP_R13_READY_BEGIN = 0x2ecce6fULL;
+    constexpr uint64_t OMP_SCOPE_END = 0x2eccee3ULL;
+    constexpr uint64_t OMP_MID_CALL_RIP = 0x2eccee0ULL;
+    constexpr uint64_t LOW_USER_POINTER_LIMIT = 0x100000000ULL;
+
+    if (!task_name_looks_like_clang(task) || frame.cs != desc::gdt::GDT_USER_CS) {
+        return;
+    }
+
+    bool const IN_WATCHED_RANGE = frame.rip >= OMP_R13_READY_BEGIN && frame.rip < OMP_SCOPE_END;
+    bool const MID_CALL_RIP = frame.rip == OMP_MID_CALL_RIP;
+    bool const COMPLEX_MID_RIP = frame.rip == COMPLEX_MID_INSN_RIP;
+    bool const LOW_R13 = gpr.r13 != 0 && gpr.r13 < LOW_USER_POINTER_LIMIT;
+    bool const LOW_R15 = gpr.r15 != 0 && gpr.r15 < LOW_USER_POINTER_LIMIT;
+    if ((!IN_WATCHED_RANGE && !MID_CALL_RIP && !COMPLEX_MID_RIP) || (!LOW_R13 && !LOW_R15 && !MID_CALL_RIP && !COMPLEX_MID_RIP)) {
+        return;
+    }
+
+    uint64_t const EXPECTED_R13 = gpr.rbp >= 0x168 ? gpr.rbp - 0x168 : 0;
+    static std::atomic<uint64_t> log_count{0};
+    uint64_t const N = log_count.fetch_add(1, std::memory_order_relaxed);
+    if (N >= 32) {
+        return;
+    }
+
+    dbg::logger<"ctxswitch">::warn(
+        "clang suspicious return: path=%s mode=%llu pid=%lu name=%s rip=0x%llx rsp=0x%llx flags=0x%llx live_rip=0x%llx "
+        "live_rsp=0x%llx live_flags=0x%llx r13=0x%llx expected_r13=0x%llx rbp=0x%llx r12=0x%llx r14=0x%llx r15=0x%llx "
+        "rcx=0x%llx sig=%u do_sig=%u pending=0x%llx",
+        path != nullptr ? path : "?", static_cast<unsigned long long>(syscall_signal_mode), task->pid,
+        task->name != nullptr ? task->name : "?", static_cast<unsigned long long>(frame.rip), static_cast<unsigned long long>(frame.rsp),
+        static_cast<unsigned long long>(frame.flags), static_cast<unsigned long long>(live_rip), static_cast<unsigned long long>(live_rsp),
+        static_cast<unsigned long long>(live_flags), static_cast<unsigned long long>(gpr.r13),
+        static_cast<unsigned long long>(EXPECTED_R13), static_cast<unsigned long long>(gpr.rbp), static_cast<unsigned long long>(gpr.r12),
+        static_cast<unsigned long long>(gpr.r14), static_cast<unsigned long long>(gpr.r15), static_cast<unsigned long long>(gpr.rcx),
+        task->in_signal_handler ? 1U : 0U, task->do_sigreturn ? 1U : 0U,
+        static_cast<unsigned long long>(task->sig_pending.load(std::memory_order_acquire)));
+}
 
 inline void check_pending_signals_for_return(cpu::GPRegs& gpr, gates::InterruptFrame& frame) {
     if (!is_user_return_frame(frame)) {
@@ -297,6 +386,30 @@ auto defer_process_reschedule_to_syscall_exit() -> bool {
 
 auto can_request_local_reschedule() -> bool { return current_stack_allows_local_reschedule(); }
 
+auto normalize_user_return_flags(uint64_t flags) -> uint64_t { return flags | USER_RFLAGS_REQUIRED_MASK; }
+
+auto valid_user_return_flags(uint64_t flags) -> bool { return valid_user_rflags(flags); }
+
+void normalize_process_user_return_state(sched::task::Task* task) {
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->is_voluntary_blocked()) {
+        return;
+    }
+
+    if (task->context.frame.cs == desc::gdt::GDT_USER_CS && task->context.frame.ss == desc::gdt::GDT_USER_DS &&
+        user_rflags_have_fixed_bit(task->context.frame.flags)) {
+        task->context.frame.flags = normalize_user_return_flags(task->context.frame.flags);
+    }
+
+    if (task->context.syscall_scratch_area == 0) {
+        return;
+    }
+
+    auto* scratch = reinterpret_cast<cpu::PerCpu*>(task->context.syscall_scratch_area);
+    if (user_rflags_have_fixed_bit(scratch->syscall_ret_flags)) {
+        scratch->syscall_ret_flags = normalize_user_return_flags(scratch->syscall_ret_flags);
+    }
+}
+
 auto repair_stale_process_syscall_resume(sched::task::Task* task) -> bool {
     if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->is_voluntary_blocked() ||
         task->context.syscall_scratch_area == 0 || task->deferred_task_switch || task->wants_block || task->wait_channel != nullptr) {
@@ -314,9 +427,10 @@ auto repair_stale_process_syscall_resume(sched::task::Task* task) -> bool {
     auto* scratch = reinterpret_cast<cpu::PerCpu*>(task->context.syscall_scratch_area);
     if (scratch->syscall_stack != task->context.syscall_kernel_stack || !valid_kernel_stack(scratch->syscall_stack) ||
         !valid_user_resume_scalar(scratch->syscall_ret_rip) || !valid_user_resume_scalar(scratch->user_rsp) ||
-        !valid_user_rflags(scratch->syscall_ret_flags)) {
+        !user_rflags_have_fixed_bit(scratch->syscall_ret_flags)) {
         return false;
     }
+    uint64_t const NORMALIZED_FLAGS = normalize_user_return_flags(scratch->syscall_ret_flags);
 
     uint64_t const REGS_ADDR = scratch->syscall_stack - sizeof(uint64_t) - sizeof(cpu::GPRegs);
     uint64_t const RETVAL_ADDR = scratch->syscall_stack - sizeof(uint64_t);
@@ -330,15 +444,16 @@ auto repair_stale_process_syscall_resume(sched::task::Task* task) -> bool {
     task->context.regs = *saved_regs;
     task->context.regs.rax = *return_value;
     task->context.regs.rcx = scratch->syscall_ret_rip;
-    task->context.regs.r11 = scratch->syscall_ret_flags;
+    task->context.regs.r11 = NORMALIZED_FLAGS;
 
     task->context.frame.int_num = 0;
     task->context.frame.err_code = 0;
     task->context.frame.rip = scratch->syscall_ret_rip;
     task->context.frame.cs = desc::gdt::GDT_USER_CS;
-    task->context.frame.flags = scratch->syscall_ret_flags;
+    task->context.frame.flags = NORMALIZED_FLAGS;
     task->context.frame.rsp = scratch->user_rsp;
     task->context.frame.ss = desc::gdt::GDT_USER_DS;
+    scratch->syscall_ret_flags = NORMALIZED_FLAGS;
     task->set_voluntary_blocked(false);
 
     static std::atomic<uint64_t> repair_count{0};
@@ -445,29 +560,257 @@ inline void kasan_unpoison_irq_save_area([[maybe_unused]] void* stack_ptr) {
 }
 }  // namespace
 
-// Save FPU/SSE/AVX state of a task. Uses xsave if available, fxsave otherwise.
-// The memory operand must be 64-byte aligned for xsave, 16-byte for fxsave.
-// fx_state::aligned() guarantees 64-byte alignment regardless of Task placement.
-void save_fpu_state(sched::task::Task* task) {
+namespace {
+
+alignas(64) std::array<uint8_t, cpu::XSAVE_STATIC_AREA_SIZE> initial_fpu_state{};
+std::atomic<int> initial_fpu_state_status{0};
+std::array<std::atomic<sched::task::Task*>, desc::gdt::MAX_CPUS> fpu_owner{};
+std::array<std::atomic<bool>, desc::gdt::MAX_CPUS> timer_fpu_restore_suppressed{};
+
+auto cmdline_has_token(const char* cmdline, const char* token) -> bool;
+
+auto timer_fpu_restore_slot() -> std::atomic<bool>* {
+    uint64_t const CPU_ID = cpu::current_cpu();
+    if (CPU_ID >= timer_fpu_restore_suppressed.size()) {
+        return nullptr;
+    }
+    return &timer_fpu_restore_suppressed[static_cast<size_t>(CPU_ID)];
+}
+
+void set_timer_fpu_restore_suppressed(bool suppressed) {
+    auto* slot = timer_fpu_restore_slot();
+    if (slot == nullptr) {
+        return;
+    }
+    slot->store(suppressed, std::memory_order_release);
+}
+
+auto consume_timer_fpu_restore_suppressed() -> bool {
+    auto* slot = timer_fpu_restore_slot();
+    if (slot == nullptr) {
+        return false;
+    }
+    return slot->exchange(false, std::memory_order_acq_rel);
+}
+
+auto local_fpu_owner_slot() -> std::atomic<sched::task::Task*>* {
+    uint64_t const CPU_ID = cpu::current_cpu();
+    if (CPU_ID >= fpu_owner.size()) {
+        return nullptr;
+    }
+    return &fpu_owner[static_cast<size_t>(CPU_ID)];
+}
+
+auto local_fpu_owner() -> sched::task::Task* {
+    auto* slot = local_fpu_owner_slot();
+    if (slot == nullptr) {
+        return nullptr;
+    }
+    return slot->load(std::memory_order_acquire);
+}
+
+void set_local_fpu_owner(sched::task::Task* task) {
+    auto* slot = local_fpu_owner_slot();
+    if (slot == nullptr) {
+        return;
+    }
+
+    if (task != nullptr) {
+        for (auto& owner_slot : fpu_owner) {
+            if (&owner_slot == slot) {
+                continue;
+            }
+            sched::task::Task* expected = task;
+            static_cast<void>(owner_slot.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel, std::memory_order_acquire));
+        }
+    }
+
+    slot->store(task, std::memory_order_release);
+}
+
+void forget_fpu_owner(sched::task::Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+
+    for (auto& slot : fpu_owner) {
+        sched::task::Task* expected = task;
+        static_cast<void>(slot.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel, std::memory_order_acquire));
+    }
+}
+
+auto initial_fpu_state_buffer() -> const uint8_t* {
+    int expected = 0;
+    if (initial_fpu_state_status.compare_exchange_strong(expected, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        initial_fpu_state.fill(0);
+
+        // FXSAVE legacy-region defaults. For XRSTOR, XSTATE_BV below names only
+        // x87/SSE as explicit; other enabled components are restored to their
+        // architectural initial state.
+        *reinterpret_cast<uint16_t*>(initial_fpu_state.data()) = 0x037F;
+        *reinterpret_cast<uint32_t*>(initial_fpu_state.data() + 24) = 0x1F80;
+        *reinterpret_cast<uint32_t*>(initial_fpu_state.data() + 28) = 0xFFFF;
+        *reinterpret_cast<uint64_t*>(initial_fpu_state.data() + 512) = cpu::XSAVE_LEGACY_MASK;
+
+        initial_fpu_state_status.store(2, std::memory_order_release);
+    } else {
+        while (initial_fpu_state_status.load(std::memory_order_acquire) != 2) {
+            asm volatile("pause" ::: "memory");
+        }
+    }
+
+    return initial_fpu_state.data();
+}
+
+// NOLINTNEXTLINE(readability-non-const-parameter): xsave writes through this pointer.
+inline void xsave_to_buffer(uint8_t* buf) {
+    uint64_t const MASK = cpu::xsave_feature_mask;
+    auto const EAX = static_cast<uint32_t>(MASK);
+    auto const EDX = static_cast<uint32_t>(MASK >> 32U);
+    asm volatile("xsave64 (%0)" : : "r"(buf), "a"(EAX), "d"(EDX) : "memory");
+}
+
+inline void xrstor_from_buffer(const uint8_t* buf) {
+    uint64_t const MASK = cpu::xsave_feature_mask;
+    auto const EAX = static_cast<uint32_t>(MASK);
+    auto const EDX = static_cast<uint32_t>(MASK >> 32U);
+    asm volatile("xrstor64 (%0)" : : "r"(buf), "a"(EAX), "d"(EDX) : "memory");
+}
+
+void save_live_fpu_state(sched::task::Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+
     // NOLINTNEXTLINE(misc-const-correctness)
     auto* buf = task->fx_state.aligned();
-    if (cpu::xsave_area_size > 0) {
-        asm volatile("xsave64 (%0)" : : "r"(buf), "a"(0xE7), "d"(0) : "memory");
+    if (cpu::xsave_feature_mask != 0) {
+        xsave_to_buffer(buf);
     } else {
         asm volatile("fxsave64 (%0)" : : "r"(buf) : "memory");
     }
     task->fx_state.saved = true;
+    task->fx_state.live_saved = true;
+    task->fx_state.initialized = true;
+    set_local_fpu_owner(nullptr);
+}
+
+}  // namespace
+
+// Save FPU/SSE/AVX state of a task. Uses xsave if available, fxsave otherwise.
+// The memory operand must be 64-byte aligned for xsave, 16-byte for fxsave.
+// fx_state::aligned() guarantees 64-byte alignment regardless of Task placement.
+void save_fpu_state(sched::task::Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+
+    if (task->fx_state.live_saved && local_fpu_owner() != task) {
+        return;
+    }
+
+    save_live_fpu_state(task);
 }
 
 // Restore FPU/SSE/AVX state of a task. Uses xrstor if available, fxrstor otherwise.
 void restore_fpu_state(sched::task::Task* task) {
     // NOLINTNEXTLINE(misc-const-correctness)
     auto* buf = task->fx_state.aligned();
-    if (cpu::xsave_area_size > 0) {
-        asm volatile("xrstor64 (%0)" : : "r"(buf), "a"(0xE7), "d"(0) : "memory");
+    if (cpu::xsave_feature_mask != 0) {
+        xrstor_from_buffer(buf);
     } else {
         asm volatile("fxrstor64 (%0)" : : "r"(buf) : "memory");
     }
+    set_local_fpu_owner(task);
+    task->fx_state.live_saved = false;
+    task->fx_state.initialized = true;
+}
+
+void restore_or_init_fpu_state(sched::task::Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+    if (task->fx_state.saved) {
+        restore_fpu_state(task);
+        return;
+    }
+
+    const uint8_t* const BUF = initial_fpu_state_buffer();
+    if (cpu::xsave_feature_mask != 0) {
+        xrstor_from_buffer(BUF);
+    } else {
+        asm volatile("fxrstor64 (%0)" : : "r"(BUF) : "memory");
+    }
+    set_local_fpu_owner(task);
+    task->fx_state.live_saved = false;
+    task->fx_state.initialized = true;
+}
+
+void reset_fpu_state(sched::task::Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+
+    task->fx_state.saved = false;
+    task->fx_state.live_saved = false;
+    task->fx_state.initialized = false;
+    forget_fpu_owner(task);
+    restore_or_init_fpu_state(task);
+}
+
+extern "C" void wos_syscall_save_current_fpu() {
+    auto* task = sched::get_current_task();
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS) {
+        return;
+    }
+
+    save_live_fpu_state(task);
+}
+
+extern "C" void wos_syscall_restore_current_fpu() {
+    auto* task = sched::get_current_task();
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS) {
+        return;
+    }
+
+    restore_or_init_fpu_state(task);
+}
+
+extern "C" auto wos_user_interrupt_save_fpu() -> sched::task::Task* {
+    auto* task = sched::get_current_task();
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS) {
+        return nullptr;
+    }
+
+    save_live_fpu_state(task);
+    return task;
+}
+
+extern "C" void wos_user_interrupt_restore_fpu(sched::task::Task* saved_task) {
+    if (saved_task == nullptr || saved_task->type != sched::task::TaskType::PROCESS) {
+        return;
+    }
+    if (sched::get_return_task() != saved_task) {
+        return;
+    }
+
+    restore_or_init_fpu_state(saved_task);
+}
+
+extern "C" void wos_restore_return_task_fpu() {
+    if (consume_timer_fpu_restore_suppressed()) {
+        return;
+    }
+
+    auto* task = sched::get_return_task();
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS) {
+        return;
+    }
+    if (local_fpu_owner() == task && !task->fx_state.live_saved) {
+        return;
+    }
+
+    restore_or_init_fpu_state(task);
 }
 
 namespace {
@@ -635,6 +978,7 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
     if (next_task->type == sched::task::TaskType::PROCESS && !next_task->is_voluntary_blocked()) {
         static_cast<void>(repair_stale_process_syscall_resume(next_task));
         static_cast<void>(sys::signal::restore_deferred_sigreturn(next_task));
+        normalize_process_user_return_state(next_task);
     }
     gpr = next_task->context.regs;
 
@@ -675,6 +1019,12 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
                 asm volatile("hlt");
             };
         }
+        if (!valid_user_rflags(frame.flags)) {
+            dbg::log("switchTo: CORRUPT flags=0x%x PID %x", frame.flags, next_task->pid);
+            for (;;) {
+                asm volatile("hlt");
+            };
+        }
     }
 
     install_task_cpu_bases(next_task, REAL_CPU_ID);
@@ -686,10 +1036,10 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
         mm::virt::switch_pagemap(next_task);
     }
 
-    // Restore incoming task's FPU/SSE/AVX state (PROCESS tasks only).
-    if (next_task->type == sched::task::TaskType::PROCESS && next_task->fx_state.saved) {
-        restore_fpu_state(next_task);
-    }
+    // FPU/SIMD state is restored only at the final userspace boundary.  A
+    // process can be resumed here into a kernel syscall/blocking frame; making
+    // its user FPU image live before that frame reaches userspace lets a later
+    // kernel-mode preemption overwrite the hardware state without saving it.
     restore_debug_registers_for_task(next_task);
 
     return true;
@@ -698,6 +1048,7 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
 namespace {
 long timer_quantum;
 constexpr uint64_t SCHED_TIMER_QUANTUM_US = 4000;
+uint64_t timer_quantum_us = SCHED_TIMER_QUANTUM_US;
 constexpr uint64_t APIC_TIMER_MAX_COUNT = 0xFFFFFFFFULL;
 
 // Tick counter for periodic epoch advancement and garbage collection
@@ -712,6 +1063,7 @@ constexpr auto TIMER_FRAME_KERNEL_CS = desc::gdt::GDT_KERN_CS;
 constexpr uint64_t HOT_TASK_STREAK_TICKS = 250;
 [[maybe_unused]]
 constexpr uint64_t SCHED_CPU_DUMP_PERIOD_TICKS = 1000;
+constexpr uint64_t SCHED_CPU_LOCAL_DUMP_PERIOD_TICKS = 1000;
 
 struct HotTaskTracker {
     uint64_t last_pid{0};
@@ -722,6 +1074,9 @@ struct HotTaskTracker {
 std::array<HotTaskTracker, 16> hot_task_trackers;
 
 std::atomic<int> sched_cpu_dump_enabled{-1};
+std::atomic<int> sched_cpu_local_dump_enabled{-1};
+std::atomic<int> sched_timer_bypass_inflate_enabled{-1};
+std::array<std::atomic<uint64_t>, desc::gdt::MAX_CPUS> sched_cpu_local_dump_ticks{};
 
 auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
     if (cmdline == nullptr || token == nullptr || token[0] == '\0') {
@@ -749,6 +1104,47 @@ auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
     return false;
 }
 
+auto cmdline_token_uint_value(const char* cmdline, const char* token, uint64_t& out_value) -> bool {
+    if (cmdline == nullptr || token == nullptr || token[0] == '\0') {
+        return false;
+    }
+
+    size_t const TOKEN_LEN = std::strlen(token);
+    const char* cursor = cmdline;
+    while (*cursor != '\0') {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n') {
+            cursor++;
+        }
+
+        const char* const START = cursor;
+        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t' && *cursor != '\n') {
+            cursor++;
+        }
+
+        auto const ARG_LEN = static_cast<size_t>(cursor - START);
+        if (ARG_LEN <= TOKEN_LEN || std::memcmp(START, token, TOKEN_LEN) != 0 || START[TOKEN_LEN] != '=') {
+            continue;
+        }
+
+        uint64_t value = 0;
+        bool any = false;
+        for (const char* p = START + TOKEN_LEN + 1; p < cursor; ++p) {
+            if (*p < '0' || *p > '9') {
+                return false;
+            }
+            any = true;
+            value = (value * 10U) + static_cast<uint64_t>(*p - '0');
+        }
+        if (!any) {
+            return false;
+        }
+        out_value = value;
+        return true;
+    }
+
+    return false;
+}
+
 auto scheduler_cpu_dump_enabled() -> bool {
     int const CACHED = sched_cpu_dump_enabled.load(std::memory_order_acquire);
     if (CACHED >= 0) {
@@ -758,6 +1154,49 @@ auto scheduler_cpu_dump_enabled() -> bool {
     bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "sched.cpu_dump");
     sched_cpu_dump_enabled.store(ENABLED ? 1 : 0, std::memory_order_release);
     return ENABLED;
+}
+
+auto scheduler_cpu_local_dump_enabled() -> bool {
+    int const CACHED = sched_cpu_local_dump_enabled.load(std::memory_order_acquire);
+    if (CACHED >= 0) {
+        return CACHED != 0;
+    }
+
+    bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "sched.cpu_dump_local");
+    sched_cpu_local_dump_enabled.store(ENABLED ? 1 : 0, std::memory_order_release);
+    return ENABLED;
+}
+
+auto scheduler_timer_bypass_inflate_enabled() -> bool {
+    int const CACHED = sched_timer_bypass_inflate_enabled.load(std::memory_order_acquire);
+    if (CACHED >= 0) {
+        return CACHED != 0;
+    }
+
+    bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "sched.timer_bypass_inflate");
+    sched_timer_bypass_inflate_enabled.store(ENABLED ? 1 : 0, std::memory_order_release);
+    return ENABLED;
+}
+
+auto task_name_looks_like_inflate_diag(const sched::task::Task* task) -> bool {
+    if (task == nullptr || task->name == nullptr) {
+        return false;
+    }
+
+    char const* name = task->name;
+    bool const INFLATE_PREFIX = name[0] == 'i' && name[1] == 'n' && name[2] == 'f' && name[3] == 'l' && name[4] == 'a' && name[5] == 't' &&
+                                name[6] == 'e' && name[7] == '_';
+    bool const WOS_INFLATE_PREFIX = name[0] == 'w' && name[1] == 'o' && name[2] == 's' && name[3] == '_' && name[4] == 'i' &&
+                                    name[5] == 'n' && name[6] == 'f' && name[7] == 'l' && name[8] == 'a' && name[9] == 't' &&
+                                    name[10] == 'e';
+    return INFLATE_PREFIX || WOS_INFLATE_PREFIX;
+}
+
+auto scheduler_timer_should_bypass_for_inflate_diag(const gates::InterruptFrame& frame) -> bool {
+    if (!scheduler_timer_bypass_inflate_enabled() || !is_user_return_frame(frame)) {
+        return false;
+    }
+    return task_name_looks_like_inflate_diag(sched::get_current_task());
 }
 
 [[maybe_unused]]
@@ -773,12 +1212,12 @@ auto scheduler_timer_ticks_for_delta_us(uint64_t delta_us) -> uint64_t {
     }
 
     auto const QUANTUM_TICKS = static_cast<uint64_t>(timer_quantum);
-    uint64_t const MAX_DELTA_US = (APIC_TIMER_MAX_COUNT / QUANTUM_TICKS) * SCHED_TIMER_QUANTUM_US;
+    uint64_t const MAX_DELTA_US = (APIC_TIMER_MAX_COUNT / QUANTUM_TICKS) * timer_quantum_us;
     if (MAX_DELTA_US == 0) {
         return APIC_TIMER_MAX_COUNT;
     }
     uint64_t const CLAMPED_DELTA_US = (MAX_DELTA_US != 0 && delta_us > MAX_DELTA_US) ? MAX_DELTA_US : delta_us;
-    uint64_t ticks = ((QUANTUM_TICKS * CLAMPED_DELTA_US) + (SCHED_TIMER_QUANTUM_US - 1)) / SCHED_TIMER_QUANTUM_US;
+    uint64_t ticks = ((QUANTUM_TICKS * CLAMPED_DELTA_US) + (timer_quantum_us - 1)) / timer_quantum_us;
     if (ticks == 0) {
         ticks = 1;
     }
@@ -816,7 +1255,6 @@ extern "C" __attribute__((no_sanitize("address", "undefined", "coverage"))) void
 
 extern "C" __attribute__((no_sanitize("address", "undefined", "coverage"))) void wos_validate_deferred_return_frame(
     cpu::GPRegs* gpr_ptr, gates::InterruptFrame* frame_ptr) {
-    (void)gpr_ptr;
     auto* task = sched::get_return_task();
     if (frame_ptr == nullptr) {
         dbg::logger<"ctxswitch">::error("deferred return without frame: task=%p pid=%lu", static_cast<void*>(task),
@@ -825,6 +1263,9 @@ extern "C" __attribute__((no_sanitize("address", "undefined", "coverage"))) void
     }
 
     if (frame_ptr->cs == desc::gdt::GDT_USER_CS) {
+        if (gpr_ptr != nullptr) {
+            debug_validate_clang_return("deferred-final", task, *gpr_ptr, *frame_ptr);
+        }
         validate_user_frame(*frame_ptr, task, "deferred-final");
         return;
     }
@@ -922,6 +1363,8 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
     [[maybe_unused]] uint64_t const IRQ_ACCOUNT_STARTED_US = K_ENABLE_SCHED_HOT_LOGGING ? ker::mod::time::get_us() : 0;
     apic::eoi();
     sched::note_scheduler_timer_interrupt();
+    mm::virt::service_pending_tlb_shootdowns();
+    set_timer_fpu_restore_suppressed(false);
 
     // Advance epoch and request garbage collection periodically on CPU 0 only.
     // Task reclamation itself runs in the scheduler GC daemon, never in IRQ.
@@ -936,6 +1379,13 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
     auto* gpr_ptr = reinterpret_cast<cpu::GPRegs*>(stack_ptr);
     auto* frame_ptr = reinterpret_cast<gates::InterruptFrame*>(reinterpret_cast<uint8_t*>(stack_ptr) + sizeof(cpu::GPRegs));
     validate_timer_stack(*frame_ptr, *gpr_ptr, sched::get_current_task());
+    if (scheduler_timer_should_bypass_for_inflate_diag(*frame_ptr)) {
+        sched::note_scheduler_timer_arm();
+        apic::one_shot_timer(timer_quantum);
+        return;
+    }
+    auto* const interrupted_task = is_user_return_frame(*frame_ptr) ? sched::get_current_task() : nullptr;
+    bool const INTERRUPTED_USER_PROCESS = interrupted_task != nullptr && interrupted_task->type == sched::task::TaskType::PROCESS;
 
 #ifdef SCHED_DEBUG
     uint64_t t0 = rdtsc();
@@ -946,7 +1396,12 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
 
     check_pending_signals_for_return(*gpr_ptr, *frame_ptr);
     auto* return_task = sched::get_return_task();
+    debug_validate_clang_return("timer", return_task, *gpr_ptr, *frame_ptr);
     validate_kernel_frame(*frame_ptr, return_task, "timer-return");
+    if (INTERRUPTED_USER_PROCESS && is_user_return_frame(*frame_ptr) && return_task == interrupted_task &&
+        local_fpu_owner() == return_task) {
+        set_timer_fpu_restore_suppressed(true);
+    }
 
     if (is_idle_return_frame(*frame_ptr, return_task)) {
         sched::arm_idle_timer_for_this_cpu();
@@ -998,6 +1453,15 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
         (TICKS % SCHED_CPU_DUMP_PERIOD_TICKS) == (SCHED_CPU_DUMP_PERIOD_TICKS - 1)) {
         sched::dump_scheduler_cpu_states();
     }
+    if (scheduler_cpu_local_dump_enabled()) {
+        uint64_t const CPU_NO = cpu::current_cpu();
+        if (CPU_NO < sched_cpu_local_dump_ticks.size()) {
+            uint64_t const LOCAL_TICK = sched_cpu_local_dump_ticks[CPU_NO].fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((LOCAL_TICK % SCHED_CPU_LOCAL_DUMP_PERIOD_TICKS) == 0) {
+                sched::dump_scheduler_current_cpu_state(*frame_ptr);
+            }
+        }
+    }
 
 #ifdef SCHED_DEBUG
     auto* task_after = sched::get_current_task();
@@ -1036,6 +1500,43 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
     }
 }
 
+extern "C" __attribute__((no_sanitize("address", "undefined", "coverage"))) void wos_debug_validate_syscall_user_return(
+    cpu::GPRegs* gpr_ptr, uint64_t signal_return_mode) {
+    if (gpr_ptr == nullptr) {
+        return;
+    }
+
+    auto* task = sched::get_current_task();
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->context.syscall_scratch_area == 0) {
+        return;
+    }
+
+    auto* scratch = reinterpret_cast<cpu::PerCpu*>(task->context.syscall_scratch_area);
+    uint64_t live_rip = 0;
+    uint64_t live_rsp = 0;
+    uint64_t live_flags = 0;
+    asm volatile("movq %%gs:0x28, %0" : "=r"(live_rip)::"memory");
+    asm volatile("movq %%gs:0x08, %0" : "=r"(live_rsp)::"memory");
+    asm volatile("movq %%gs:0x30, %0" : "=r"(live_flags)::"memory");
+
+    gates::InterruptFrame frame{};
+    frame.rip = scratch->syscall_ret_rip;
+    frame.cs = desc::gdt::GDT_USER_CS;
+    frame.flags = scratch->syscall_ret_flags;
+    frame.rsp = scratch->user_rsp;
+    frame.ss = desc::gdt::GDT_USER_DS;
+    debug_validate_clang_return("syscall", task, *gpr_ptr, frame, signal_return_mode, live_rip, live_rsp, live_flags);
+
+    if (live_rip == scratch->syscall_ret_rip && live_rsp == scratch->user_rsp && live_flags == scratch->syscall_ret_flags) {
+        return;
+    }
+
+    frame.rip = live_rip;
+    frame.flags = live_flags;
+    frame.rsp = live_rsp;
+    debug_validate_clang_return("syscall-live", task, *gpr_ptr, frame, signal_return_mode, live_rip, live_rsp, live_flags);
+}
+
 extern "C" void wos_jump_to_next_task_no_save(void* stack_ptr) {
     kasan_unpoison_irq_save_area(stack_ptr);
 
@@ -1049,7 +1550,14 @@ extern "C" void wos_jump_to_next_task_no_save(void* stack_ptr) {
 }
 
 void start_sched_timer() {
-    timer_quantum = apic::calibrate_timer(SCHED_TIMER_QUANTUM_US);  // 4ms (matches Linux CFS typical quantum)
+    uint64_t requested_quantum_us = SCHED_TIMER_QUANTUM_US;
+    if (cmdline_token_uint_value(ker::init::get_kernel_cmdline(), "sched.timer_quantum_us", requested_quantum_us) &&
+        requested_quantum_us != 0) {
+        timer_quantum_us = requested_quantum_us;
+    } else {
+        timer_quantum_us = SCHED_TIMER_QUANTUM_US;
+    }
+    timer_quantum = apic::calibrate_timer(timer_quantum_us);  // default 4ms (matches Linux CFS typical quantum)
     sched::note_scheduler_timer_arm();
     apic::one_shot_timer(timer_quantum);
 }

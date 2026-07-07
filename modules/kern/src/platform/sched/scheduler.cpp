@@ -15,6 +15,7 @@
 #include <utility>
 // Debug helpers
 #include <net/wki/remote_compute.hpp>
+#include <platform/init/limine_requests.hpp>
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/gdb_interface.hpp>
 #include <platform/mm/mm.hpp>
@@ -1068,9 +1069,17 @@ inline bool is_lower_weight_contender(const task::Task* current, const task::Tas
     return contender->sched_weight < current->sched_weight;
 }
 
-inline bool is_higher_priority_process_contender(const task::Task* current, const task::Task* contender) {
-    return current != nullptr && contender != nullptr && current->type == task::TaskType::PROCESS &&
-           contender->type == task::TaskType::PROCESS && contender->sched_nice < current->sched_nice;
+inline bool is_higher_priority_contender(const task::Task* current, const task::Task* contender) {
+    if (current == nullptr || contender == nullptr) {
+        return false;
+    }
+
+    if (current->type == task::TaskType::PROCESS && contender->sched_nice < current->sched_nice) {
+        return contender->type == task::TaskType::PROCESS || contender->type == task::TaskType::DAEMON;
+    }
+
+    return current->type == task::TaskType::DAEMON && contender->type == task::TaskType::DAEMON &&
+           contender->sched_nice < current->sched_nice;
 }
 
 inline uint64_t compute_lower_weight_preempt_guard_us(const task::Task* current, const task::Task* contender) {
@@ -1424,16 +1433,300 @@ std::atomic<bool> scheduler_gc_worker_started{false};             // NOLINT(cppc
 std::atomic<task::Task*> scheduler_gc_task{nullptr};              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<bool> scheduler_gc_memory_pressure_requested{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<bool> scheduler_gc_reclaim_active{false};             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<std::atomic<uint64_t>, desc::gdt::MAX_CPUS>
+    preempt_stall_last_log_us{};                                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<int> preempt_stall_enabled_cache{-1};                   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<int> single_process_cpu_enabled_cache{-1};              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> single_process_cpu_target_cache{UINT64_MAX};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<int> no_process_migration_enabled_cache{-1};            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<int> dual_run_panic_enabled_cache{-1};                  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<int> no_preempt_inflate_enabled_cache{-1};              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<int> daemon_preempt_inflate_enabled_cache{-1};          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> daemon_preempt_inflate_log_count{0};          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<int> pick_only_inflate_enabled_cache{-1};               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> pick_only_inflate_log_count{0};               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<int> preswitch_only_inflate_enabled_cache{-1};          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> preswitch_only_inflate_log_count{0};          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<int> postswitch_restore_inflate_enabled_cache{-1};      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> postswitch_restore_inflate_log_count{0};      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 constexpr uint8_t PERF_TIMER_VECTOR = 32;
 constexpr uint16_t PERF_IRQ_KIND_TIMER = 4;
 constexpr uint32_t PERF_IRQ_SLOW_TRACE_US = 30;
 constexpr bool K_ENABLE_SCHED_OWNER_SCAN_FALLBACK = true;
+constexpr uint64_t SCHED_PREEMPT_STALL_LOG_INTERVAL_US = 1'000'000;
+constexpr uint64_t SCHED_SINGLE_PROCESS_CPU_TARGET = 0;
 
 // ============================================================================
 // Internal helpers
 // ============================================================================
 
 void request_local_reschedule();
+
+auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
+    if (cmdline == nullptr || token == nullptr || token[0] == '\0') {
+        return false;
+    }
+
+    size_t const TOKEN_LEN = std::strlen(token);
+    const char* cursor = cmdline;
+    while (*cursor != '\0') {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n') {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+
+        const char* start = cursor;
+        size_t segment_len = 0;
+        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t' && *cursor != '\n') {
+            ++cursor;
+            ++segment_len;
+        }
+        if (segment_len == TOKEN_LEN && std::strncmp(start, token, TOKEN_LEN) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto cmdline_token_uint_value(const char* cmdline, const char* token, uint64_t& out_value) -> bool {
+    if (cmdline == nullptr || token == nullptr || token[0] == '\0') {
+        return false;
+    }
+
+    size_t const TOKEN_LEN = std::strlen(token);
+    const char* cursor = cmdline;
+    while (*cursor != '\0') {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n') {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+
+        const char* start = cursor;
+        size_t segment_len = 0;
+        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t' && *cursor != '\n') {
+            ++cursor;
+            ++segment_len;
+        }
+        if (segment_len <= TOKEN_LEN + 1 || start[TOKEN_LEN] != '=' || std::strncmp(start, token, TOKEN_LEN) != 0) {
+            continue;
+        }
+
+        uint64_t value = 0;
+        const char* digit = start + TOKEN_LEN + 1;
+        const char* const END = start + segment_len;
+        if (digit == END) {
+            return false;
+        }
+        while (digit != END) {
+            if (*digit < '0' || *digit > '9') {
+                return false;
+            }
+            value = (value * 10U) + static_cast<uint64_t>(*digit - '0');
+            ++digit;
+        }
+        out_value = value;
+        return true;
+    }
+    return false;
+}
+
+auto scheduler_preempt_stall_enabled() -> bool {
+    int const CACHED = preempt_stall_enabled_cache.load(std::memory_order_acquire);
+    if (CACHED >= 0) {
+        return CACHED != 0;
+    }
+
+    bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "sched.preempt_stall");
+    preempt_stall_enabled_cache.store(ENABLED ? 1 : 0, std::memory_order_release);
+    return ENABLED;
+}
+
+auto scheduler_single_process_cpu_enabled() -> bool {
+    int const CACHED = single_process_cpu_enabled_cache.load(std::memory_order_acquire);
+    if (CACHED >= 0) {
+        return CACHED != 0;
+    }
+
+    uint64_t parsed_target = 0;
+    bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "sched.single_process_cpu") ||
+                         cmdline_token_uint_value(ker::init::get_kernel_cmdline(), "sched.single_process_cpu", parsed_target);
+    single_process_cpu_enabled_cache.store(ENABLED ? 1 : 0, std::memory_order_release);
+    return ENABLED;
+}
+
+auto scheduler_single_process_cpu_target_value() -> uint64_t {
+    uint64_t const CACHED = single_process_cpu_target_cache.load(std::memory_order_acquire);
+    if (CACHED != UINT64_MAX) {
+        return CACHED;
+    }
+
+    uint64_t target = SCHED_SINGLE_PROCESS_CPU_TARGET;
+    uint64_t parsed_target = 0;
+    if (cmdline_token_uint_value(ker::init::get_kernel_cmdline(), "sched.single_process_cpu", parsed_target)) {
+        target = parsed_target;
+    }
+
+    single_process_cpu_target_cache.store(target, std::memory_order_release);
+    return target;
+}
+
+auto scheduler_no_process_migration_enabled() -> bool {
+    int const CACHED = no_process_migration_enabled_cache.load(std::memory_order_acquire);
+    if (CACHED >= 0) {
+        return CACHED != 0;
+    }
+
+    bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "sched.no_process_migration");
+    no_process_migration_enabled_cache.store(ENABLED ? 1 : 0, std::memory_order_release);
+    return ENABLED;
+}
+
+auto scheduler_dual_run_panic_enabled() -> bool {
+    int const CACHED = dual_run_panic_enabled_cache.load(std::memory_order_acquire);
+    if (CACHED >= 0) {
+        return CACHED != 0;
+    }
+
+    bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "sched.dual_run_panic");
+    dual_run_panic_enabled_cache.store(ENABLED ? 1 : 0, std::memory_order_release);
+    return ENABLED;
+}
+
+auto scheduler_no_preempt_inflate_enabled() -> bool {
+    int const CACHED = no_preempt_inflate_enabled_cache.load(std::memory_order_acquire);
+    if (CACHED >= 0) {
+        return CACHED != 0;
+    }
+
+    bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "sched.no_preempt_inflate");
+    no_preempt_inflate_enabled_cache.store(ENABLED ? 1 : 0, std::memory_order_release);
+    return ENABLED;
+}
+
+auto scheduler_daemon_preempt_inflate_enabled() -> bool {
+    int const CACHED = daemon_preempt_inflate_enabled_cache.load(std::memory_order_acquire);
+    if (CACHED >= 0) {
+        return CACHED != 0;
+    }
+
+    bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "sched.daemon_preempt_inflate");
+    daemon_preempt_inflate_enabled_cache.store(ENABLED ? 1 : 0, std::memory_order_release);
+    return ENABLED;
+}
+
+auto scheduler_pick_only_inflate_enabled() -> bool {
+    int const CACHED = pick_only_inflate_enabled_cache.load(std::memory_order_acquire);
+    if (CACHED >= 0) {
+        return CACHED != 0;
+    }
+
+    bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "sched.pick_only_inflate");
+    pick_only_inflate_enabled_cache.store(ENABLED ? 1 : 0, std::memory_order_release);
+    return ENABLED;
+}
+
+auto scheduler_preswitch_only_inflate_enabled() -> bool {
+    int const CACHED = preswitch_only_inflate_enabled_cache.load(std::memory_order_acquire);
+    if (CACHED >= 0) {
+        return CACHED != 0;
+    }
+
+    bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "sched.preswitch_only_inflate");
+    preswitch_only_inflate_enabled_cache.store(ENABLED ? 1 : 0, std::memory_order_release);
+    return ENABLED;
+}
+
+auto scheduler_postswitch_restore_inflate_enabled() -> bool {
+    int const CACHED = postswitch_restore_inflate_enabled_cache.load(std::memory_order_acquire);
+    if (CACHED >= 0) {
+        return CACHED != 0;
+    }
+
+    bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "sched.postswitch_restore_inflate");
+    postswitch_restore_inflate_enabled_cache.store(ENABLED ? 1 : 0, std::memory_order_release);
+    return ENABLED;
+}
+
+auto task_name_looks_like_inflate_diag(const task::Task* task) -> bool {
+    if (task == nullptr || task->name == nullptr) {
+        return false;
+    }
+    return std::strncmp(task->name, "inflate_", 8) == 0 || std::strncmp(task->name, "wos_inflate", 11) == 0;
+}
+
+void panic_if_task_reserved_on_other_cpu(task::Task* task, const char* path) {
+    if (!scheduler_dual_run_panic_enabled() || run_queues == nullptr || task == nullptr || task->type != task::TaskType::PROCESS) {
+        return;
+    }
+
+    uint64_t const THIS_CPU = cpu::current_cpu();
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    for (uint64_t other_cpu = 0; other_cpu < CORE_COUNT; ++other_cpu) {
+        if (other_cpu == THIS_CPU) {
+            continue;
+        }
+
+        RunQueue* other_rq = run_queues->that_cpu(other_cpu);
+        if (other_rq == nullptr) {
+            continue;
+        }
+
+        task::Task* const OTHER_CURRENT = other_rq->current_task;
+        task::Task* const OTHER_HANDOFF = other_rq->handoff_task;
+        if (OTHER_CURRENT != task && OTHER_HANDOFF != task) {
+            continue;
+        }
+
+        dbg::logger<"sched">::error(
+            "dual-run task reservation: path=%s pid=%lu name=%s this_cpu=%lu other_cpu=%lu as_current=%u as_handoff=%u owner_cpu=%lu "
+            "queue=%u heap_index=%d state=%u vblk=%u wblk=%u saved_rip=0x%llx saved_rsp=0x%llx",
+            path != nullptr ? path : "?", task->pid, task_name_for_log(task), static_cast<unsigned long>(THIS_CPU),
+            static_cast<unsigned long>(other_cpu), OTHER_CURRENT == task ? 1U : 0U, OTHER_HANDOFF == task ? 1U : 0U,
+            static_cast<unsigned long>(task->cpu), static_cast<unsigned>(task->sched_queue), task->heap_index,
+            static_cast<unsigned>(task->state.load(std::memory_order_acquire)), task->is_voluntary_blocked() ? 1U : 0U,
+            task->wants_block ? 1U : 0U, static_cast<unsigned long long>(task->context.frame.rip),
+            static_cast<unsigned long long>(task->context.frame.rsp));
+        dbg::panic_handler("scheduler: task reserved on multiple CPUs");
+    }
+}
+
+void maybe_log_preempt_stall(RunQueue* rq, task::Task* current_task, const ker::mod::gates::InterruptFrame& frame, uint64_t now_us) {
+    if (!scheduler_preempt_stall_enabled() || rq == nullptr || current_task == nullptr || rq->runnable_heap.size == 0) {
+        return;
+    }
+
+    uint64_t const CPU_NO = cpu::current_cpu();
+    if (CPU_NO >= preempt_stall_last_log_us.size()) {
+        return;
+    }
+
+    uint64_t const LAST_US = preempt_stall_last_log_us[CPU_NO].load(std::memory_order_relaxed);
+    if (LAST_US != 0 && now_us >= LAST_US && now_us - LAST_US < SCHED_PREEMPT_STALL_LOG_INTERVAL_US) {
+        return;
+    }
+    preempt_stall_last_log_us[CPU_NO].store(now_us, std::memory_order_relaxed);
+
+    dbg::logger<"sched">::warn(
+        "schedstall: cpu%lu pid=%lu(%s) cs=0x%llx rip=0x%llx rsp=0x%llx runq=%lu waitq=%lu wait_deadline=%lu now=%lu "
+        "vblk=%u wblk=%u wait=%s kind=%u callsite=0x%llx saved_rip=0x%llx wake_at=%lu queue=%u yield=%u deferred=%u "
+        "preempt=%u/%u preempt_owner=0x%llx syscall_start=%lu slice=%u/%u",
+        static_cast<unsigned long>(CPU_NO), static_cast<unsigned long>(current_task->pid),
+        current_task->name != nullptr ? current_task->name : "?", static_cast<unsigned long long>(frame.cs),
+        static_cast<unsigned long long>(frame.rip), static_cast<unsigned long long>(frame.rsp),
+        static_cast<unsigned long>(rq->runnable_heap.size), static_cast<unsigned long>(rq->wait_list.count),
+        static_cast<unsigned long>(rq->next_wait_deadline_us), static_cast<unsigned long>(now_us),
+        current_task->is_voluntary_blocked() ? 1U : 0U, current_task->wants_block ? 1U : 0U,
+        current_task->wait_channel != nullptr ? current_task->wait_channel : "-", static_cast<unsigned>(current_task->wait_channel_kind),
+        static_cast<unsigned long long>(perf_wait_callsite(current_task)), static_cast<unsigned long long>(current_task->context.frame.rip),
+        static_cast<unsigned long>(current_task->wake_at_us), static_cast<unsigned>(current_task->sched_queue),
+        current_task->yield_switch ? 1U : 0U, current_task->deferred_task_switch ? 1U : 0U, current_task->preempt_disable_depth,
+        current_task->preempt_pending ? 1U : 0U, static_cast<unsigned long long>(current_task->preempt_disable_owner),
+        static_cast<unsigned long>(current_task->syscall_account_start_us), current_task->slice_used_ns, current_task->slice_ns);
+}
 
 [[clang::no_sanitize("kernel-address")]] inline auto current_task_for_preempt() -> task::Task* {
     if (!can_query_current_task()) {
@@ -1623,6 +1916,40 @@ inline auto pick_best_eligible_excluding_locked(RunQueue* rq, int64_t avg_vrunti
     return best_eligible != nullptr ? best_eligible : best_any;
 }
 
+inline auto pick_best_daemon_eligible_for_switch_locked(RunQueue* rq, int64_t avg_vruntime, bool& saw_daemon) -> task::Task* {
+    saw_daemon = false;
+    if (rq == nullptr || rq->runnable_heap.size == 0) {
+        return nullptr;
+    }
+
+    task::Task* best_eligible = nullptr;
+    int64_t best_eligible_deadline = 0;
+    task::Task* best_any = nullptr;
+    int64_t best_any_deadline = 0;
+
+    for (uint32_t idx = 0; idx < rq->runnable_heap.size; ++idx) {
+        task::Task* candidate = run_heap_entry(rq->runnable_heap, idx);
+        if (candidate == nullptr || candidate->type != task::TaskType::DAEMON || !is_publishable_runnable_task(candidate) ||
+            candidate->has_exited) {
+            continue;
+        }
+
+        saw_daemon = true;
+        if (best_any == nullptr || candidate->vdeadline < best_any_deadline) {
+            best_any = candidate;
+            best_any_deadline = candidate->vdeadline;
+        }
+
+        int64_t const LAG = avg_vruntime - candidate->vruntime;
+        if (LAG >= 0 && (best_eligible == nullptr || candidate->vdeadline < best_eligible_deadline)) {
+            best_eligible = candidate;
+            best_eligible_deadline = candidate->vdeadline;
+        }
+    }
+
+    return best_eligible != nullptr ? best_eligible : best_any;
+}
+
 inline auto pick_best_eligible_for_switch_locked(RunQueue* rq, int64_t avg_vruntime, task::Task const* current_task) -> task::Task* {
     if (rq == nullptr || rq->runnable_heap.size == 0) {
         return nullptr;
@@ -1684,6 +2011,16 @@ inline void finish_wait_metadata_for_runqueue(task::Task* t) {
     }
     t->set_voluntary_blocked(false);
     t->clear_wait_channel();
+}
+
+inline auto deferred_switch_is_sched_yield(const task::Task* t) -> bool {
+    if (t == nullptr || !t->yield_switch) {
+        return false;
+    }
+    if (t->wait_channel == nullptr || t->wait_channel_kind == task::WaitChannelKind::NONE) {
+        return true;
+    }
+    return t->wait_channel_kind == task::WaitChannelKind::GENERIC && std::strcmp(t->wait_channel, "sched_yield") == 0;
 }
 
 inline auto min_nonzero_deadline(uint64_t lhs, uint64_t rhs) -> uint64_t {
@@ -1836,6 +2173,7 @@ inline auto runqueue_owns_task_locked(RunQueue* rq, task::Task* task) -> bool {
 }
 
 inline void reserve_handoff_task_locked(RunQueue* rq, task::Task* task, uint64_t start_us) {
+    panic_if_task_reserved_on_other_cpu(task, "reserve-handoff");
     task->cpu = cpu::current_cpu();
     rq->handoff_task = task;
     rq->current_task_start_us = start_us;
@@ -2039,6 +2377,35 @@ inline auto task_can_run_on_cpu(task::Task const* task, uint64_t cpu_no, uint64_
     return cpu_mask_contains(allowed_mask, cpu_no);
 }
 
+inline auto scheduler_single_process_cpu_target(task::Task const* task, uint64_t core_count) -> uint64_t {
+    if (!scheduler_single_process_cpu_enabled() || task == nullptr || task->type != task::TaskType::PROCESS) {
+        return UINT64_MAX;
+    }
+    if (task->cpu_pinned || task->domain_hard || core_count == 0) {
+        return UINT64_MAX;
+    }
+    uint64_t const TARGET_CPU = scheduler_single_process_cpu_target_value();
+    if (TARGET_CPU >= core_count || !task_can_run_on_cpu(task, TARGET_CPU, core_count)) {
+        return UINT64_MAX;
+    }
+    return TARGET_CPU;
+}
+
+inline auto scheduler_process_owner_cpu_if_migration_disabled(task::Task const* task, uint64_t core_count) -> uint64_t {
+    if (!scheduler_no_process_migration_enabled() || task == nullptr || task->type != task::TaskType::PROCESS) {
+        return UINT64_MAX;
+    }
+    if (task->cpu_pinned || task->domain_hard || core_count == 0) {
+        return UINT64_MAX;
+    }
+
+    uint64_t const OWNER_CPU = task->cpu;
+    if (OWNER_CPU >= core_count || !task_can_run_on_cpu(task, OWNER_CPU, core_count)) {
+        return UINT64_MAX;
+    }
+    return OWNER_CPU;
+}
+
 inline auto user_context_is_canonical(task::Task const* task) -> bool {
     if (task == nullptr) {
         return false;
@@ -2086,6 +2453,9 @@ inline auto process_task_can_idle_steal(task::Task const* task) -> bool {
 
 inline auto idle_rebalance_probe_needed_for_idle(uint64_t idle_cpu) -> bool {
     if (run_queues == nullptr) {
+        return false;
+    }
+    if (scheduler_single_process_cpu_enabled() || scheduler_no_process_migration_enabled()) {
         return false;
     }
 
@@ -2141,6 +2511,9 @@ inline auto idle_rebalance_probe_needed_for_idle(uint64_t idle_cpu) -> bool {
 
 inline auto runqueue_has_stealable_process_backlog(RunQueue const* rq) -> bool {
     if (rq == nullptr) {
+        return false;
+    }
+    if (scheduler_single_process_cpu_enabled() || scheduler_no_process_migration_enabled()) {
         return false;
     }
 
@@ -2234,6 +2607,9 @@ void maybe_nudge_idle_cpu_for_load_balance(uint64_t busy_cpu, RunQueue* busy_rq)
 
 auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
     if (run_queues == nullptr) {
+        return false;
+    }
+    if (scheduler_single_process_cpu_enabled() || scheduler_no_process_migration_enabled()) {
         return false;
     }
     if (our_rq == nullptr || our_rq->runnable_heap.size >= PER_CPU_HEAP_CAP) {
@@ -2487,6 +2863,10 @@ uint64_t get_least_loaded_cpu_for_task(task::Task const* incoming_task) {
     }
 
     task::TaskType const INCOMING_TYPE = incoming_task != nullptr ? incoming_task->type : task::TaskType::DAEMON;
+    uint64_t const SINGLE_PROCESS_CPU = scheduler_single_process_cpu_target(incoming_task, CORE_COUNT);
+    if (SINGLE_PROCESS_CPU != UINT64_MAX) {
+        return SINGLE_PROCESS_CPU;
+    }
 
     // Respect domain_mask: if the task has a restricted mask, only consider those CPUs.
     uint64_t allowed_mask = (incoming_task != nullptr) ? incoming_task->domain_mask : ~0ULL;
@@ -2657,6 +3037,10 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
     return true;
 }
 
+auto active_process_needs_periodic_scheduler_tick(task::Task const* task) -> bool {
+    return task != nullptr && task->type == task::TaskType::PROCESS && !task->is_voluntary_blocked() && !task->wants_block;
+}
+
 auto local_reschedule_requires_fresh_timer(RunQueue* rq) -> bool {
     if (rq == nullptr) {
         return false;
@@ -2664,7 +3048,7 @@ auto local_reschedule_requires_fresh_timer(RunQueue* rq) -> bool {
 
     auto* current = rq->current_task;
     return rq->is_idle.load(std::memory_order_acquire) || current == nullptr || current->type == task::TaskType::IDLE ||
-           current->is_voluntary_blocked() || current->wants_block;
+           current->is_voluntary_blocked() || current->wants_block || active_process_needs_periodic_scheduler_tick(current);
 }
 
 // Send a scheduler wake IPI to a specific CPU if it's currently idle.
@@ -2695,6 +3079,10 @@ auto deferred_return_needs_local_timer_locked(RunQueue* rq, task::Task* return_t
     }
 
     if (return_task->is_voluntary_blocked() || return_task->wants_block) {
+        return true;
+    }
+
+    if (active_process_needs_periodic_scheduler_tick(return_task)) {
         return true;
     }
 
@@ -2830,6 +3218,7 @@ void arm_idle_timer_locked(RunQueue* rq) {
 // sends EOI after dispatching interruptHandlers[].
 void scheduler_wake_handler([[maybe_unused]] cpu::GPRegs gpr, [[maybe_unused]] gates::InterruptFrame frame) {
     auto* rq = run_queues->this_cpu();
+    mm::virt::service_pending_tlb_shootdowns();
     // Consume the coalescing bit before looking at the run queue.  If this IPI
     // was stale/empty, a racing later wake_cpu() must be able to send a fresh
     // IPI instead of being suppressed by our old pending flag.
@@ -3738,6 +4127,9 @@ inline auto event_wake_can_rebalance_process(task::Task const* task) -> bool {
     if (task == nullptr || task->type != task::TaskType::PROCESS) {
         return false;
     }
+    if (scheduler_no_process_migration_enabled()) {
+        return false;
+    }
     if (task->cpu_pinned || task->domain_hard) {
         return false;
     }
@@ -3787,6 +4179,16 @@ auto event_wake_target_cpu(const task::Task* task, uint64_t waker_cpu) -> uint64
         return waker_cpu;
     }
 
+    uint64_t const SINGLE_PROCESS_CPU = scheduler_single_process_cpu_target(task, smt::get_core_count());
+    if (SINGLE_PROCESS_CPU != UINT64_MAX) {
+        return SINGLE_PROCESS_CPU;
+    }
+
+    uint64_t const OWNER_CPU = scheduler_process_owner_cpu_if_migration_disabled(task, smt::get_core_count());
+    if (OWNER_CPU != UINT64_MAX) {
+        return OWNER_CPU;
+    }
+
     bool const WAITING = task->sched_queue == task::Task::sched_queue::WAITING;
     bool const VOLUNTARY_BLOCK = task->is_voluntary_blocked();
     if (event_wake_prefers_waker_cpu(task->cpu_pinned, WAITING, VOLUNTARY_BLOCK)) {
@@ -3808,6 +4210,14 @@ void wake_task_from_event_on_cpu(task::Task* task, uint64_t target_cpu, EventWak
     // and recheck readiness before sleeping again.
     task->wakeup_pending.store(true, std::memory_order_release);
     uint64_t cpu = target_cpu;
+    uint64_t const SINGLE_PROCESS_CPU = scheduler_single_process_cpu_target(task, smt::get_core_count());
+    if (SINGLE_PROCESS_CPU != UINT64_MAX) {
+        cpu = SINGLE_PROCESS_CPU;
+    }
+    uint64_t const OWNER_CPU = scheduler_process_owner_cpu_if_migration_disabled(task, smt::get_core_count());
+    if (OWNER_CPU != UINT64_MAX) {
+        cpu = OWNER_CPU;
+    }
     if (cpu >= smt::get_core_count()) {
         cpu = get_least_loaded_cpu();
     }
@@ -4018,6 +4428,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
 
     auto* rq = run_queues->this_cpu();
     auto* current_task = rq->current_task;
+    panic_if_task_reserved_on_other_cpu(current_task, "timer-current");
     maybe_nudge_idle_cpu_for_load_balance(cpu::current_cpu(), rq);
 
     // ---- Idle path: no running task, check heap for work ----
@@ -4130,8 +4541,13 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
 
     bool blocked_current_task = false;
     int64_t perf_lag_out = 0;
-    task::Task* next_task = run_queues->this_cpu_locked([current_task, IN_KERNEL_MODE, KERNEL_PREEMPT_SAFE, CAN_PREEMPT_KERNEL,
-                                                         &blocked_current_task, &perf_lag_out](RunQueue* rq) -> task::Task* {
+    bool daemon_preempt_inflate_active = false;
+    bool daemon_preempt_inflate_saw_daemon = false;
+    uint32_t daemon_preempt_inflate_runq_size = 0;
+    task::Task* next_task = run_queues->this_cpu_locked([current_task, IN_KERNEL_MODE, KERNEL_PREEMPT_SAFE, CAN_PREEMPT_KERNEL, &frame,
+                                                         &blocked_current_task, &perf_lag_out, &daemon_preempt_inflate_active,
+                                                         &daemon_preempt_inflate_saw_daemon,
+                                                         &daemon_preempt_inflate_runq_size](RunQueue* rq) -> task::Task* {
         // Compute time delta since last tick
         uint64_t const NOW_US = time::get_us();
         auto delta_us = static_cast<int64_t>(NOW_US - rq->last_tick_us);
@@ -4220,6 +4636,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             if (KERNEL_PREEMPT_SAFE && current_task->preempt_disable_depth != 0) {
                 current_task->preempt_pending = true;
             }
+            maybe_log_preempt_stall(rq, current_task, frame, NOW_US);
             return nullptr;
         }
 
@@ -4260,6 +4677,16 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             blocked_current_task = true;
         }
 
+        if (!IN_KERNEL_MODE && scheduler_no_preempt_inflate_enabled() && task_name_looks_like_inflate_diag(current_task)) {
+            return nullptr;
+        }
+        bool const DAEMON_PREEMPT_INFLATE =
+            !IN_KERNEL_MODE && scheduler_daemon_preempt_inflate_enabled() && task_name_looks_like_inflate_diag(current_task);
+        daemon_preempt_inflate_active = DAEMON_PREEMPT_INFLATE;
+        if (DAEMON_PREEMPT_INFLATE) {
+            daemon_preempt_inflate_runq_size = rq->runnable_heap.size;
+        }
+
         maybe_steal_for_effectively_idle_current_locked(rq, current_task);
 
         // Pick best eligible task
@@ -4267,7 +4694,8 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             return nullptr;
         }
         int64_t const PICK_AVG = compute_avg_vruntime(rq);
-        auto* next = pick_best_eligible_for_switch_locked(rq, PICK_AVG, current_task);
+        auto* next = DAEMON_PREEMPT_INFLATE ? pick_best_daemon_eligible_for_switch_locked(rq, PICK_AVG, daemon_preempt_inflate_saw_daemon)
+                                            : pick_best_eligible_for_switch_locked(rq, PICK_AVG, current_task);
         if (next == nullptr || next == current_task) {
             return nullptr;
         }
@@ -4307,7 +4735,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                                              : UINT64_MAX;  // 0 = unset: allow preemption
         bool const LOWER_PRIORITY_PROCESS_PREEMPT = current_task->type == task::TaskType::PROCESS &&
                                                     next->type == task::TaskType::PROCESS && next->sched_nice > current_task->sched_nice;
-        bool const HIGHER_PRIORITY_PREEMPT = is_higher_priority_process_contender(current_task, next);
+        bool const HIGHER_PRIORITY_PREEMPT = is_higher_priority_contender(current_task, next);
         bool const LOWER_WEIGHT_PREEMPT = current_task->type == task::TaskType::PROCESS && is_lower_weight_contender(current_task, next);
         bool const BURSTY_PROCESS_WAKEUP_PREEMPT =
             current_task->type == task::TaskType::PROCESS &&
@@ -4348,6 +4776,15 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
         if (next->type == task::TaskType::IDLE) {
             return nullptr;
         }
+        if (!IN_KERNEL_MODE && scheduler_pick_only_inflate_enabled() && task_name_looks_like_inflate_diag(current_task)) {
+            uint64_t const LOG_INDEX = pick_only_inflate_log_count.fetch_add(1, std::memory_order_relaxed);
+            if (LOG_INDEX < 32) {
+                dbg::logger<"sched">::info("pick_only_inflate: pid=%lu(%s) next=%lu(%s) type=%u runq=%lu", current_task->pid,
+                                           task_name_for_log(current_task), next->pid, task_name_for_log(next), task_type_for_log(next),
+                                           static_cast<unsigned long>(rq->runnable_heap.size));
+            }
+            return nullptr;
+        }
 
         // Reserve the picked task without publishing it as current yet.
         // current_task must continue to match the live interrupted stack until
@@ -4360,11 +4797,31 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
 
     // No switch needed (same task, invalid, kernel mode, or no candidate)
     if (next_task == nullptr) {
+        if (daemon_preempt_inflate_active) {
+            uint64_t const LOG_INDEX = daemon_preempt_inflate_log_count.fetch_add(1, std::memory_order_relaxed);
+            if (LOG_INDEX < 32) {
+                dbg::logger<"sched">::info("daemon_preempt_inflate: pid=%lu(%s) saw_daemon=%u next=none runq=%lu", current_task->pid,
+                                           task_name_for_log(current_task), daemon_preempt_inflate_saw_daemon ? 1U : 0U,
+                                           static_cast<unsigned long>(daemon_preempt_inflate_runq_size));
+            }
+        }
         if (blocked_current_task) {
+            if (current_task->type == task::TaskType::PROCESS) {
+                sys::context_switch::save_fpu_state(current_task);
+            }
             auto* idle_rq = run_queues->this_cpu();
             enter_idle_loop(idle_rq);
         }
         return;
+    }
+    if (daemon_preempt_inflate_active) {
+        uint64_t const LOG_INDEX = daemon_preempt_inflate_log_count.fetch_add(1, std::memory_order_relaxed);
+        if (LOG_INDEX < 32) {
+            dbg::logger<"sched">::info("daemon_preempt_inflate: pid=%lu(%s) saw_daemon=%u next=%lu(%s) type=%u runq=%lu", current_task->pid,
+                                       task_name_for_log(current_task), daemon_preempt_inflate_saw_daemon ? 1U : 0U, next_task->pid,
+                                       task_name_for_log(next_task), task_type_for_log(next_task),
+                                       static_cast<unsigned long>(daemon_preempt_inflate_runq_size));
+        }
     }
 #ifdef SCHED_DEBUG
     dbg::log("PICK-PREEMPT: CPU %d switching PID %x -> PID %x (heapIdx=%d)", static_cast<int>(cpu::current_cpu()), current_task->pid,
@@ -4386,14 +4843,58 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
     }
 
     task::Task* original_task = current_task;
+    if (!IN_KERNEL_MODE && scheduler_preswitch_only_inflate_enabled() && task_name_looks_like_inflate_diag(current_task)) {
+        clear_handoff_task(next_task);
+        if (current_task->type == task::TaskType::PROCESS) {
+            sys::context_switch::restore_or_init_fpu_state(current_task);
+        }
+        uint64_t const LOG_INDEX = preswitch_only_inflate_log_count.fetch_add(1, std::memory_order_relaxed);
+        if (LOG_INDEX < 32) {
+            dbg::logger<"sched">::info("preswitch_only_inflate: pid=%lu(%s) next=%lu(%s) type=%u", current_task->pid,
+                                       task_name_for_log(current_task), next_task->pid, task_name_for_log(next_task),
+                                       task_type_for_log(next_task));
+        }
+        return;
+    }
     rq->is_idle.store(false, std::memory_order_release);
     prepare_first_run_daemon(next_task, "timer-switch");
+
+    bool const POSTSITCH_RESTORE_INFLATE =
+        !IN_KERNEL_MODE && scheduler_postswitch_restore_inflate_enabled() && task_name_looks_like_inflate_diag(current_task);
+    auto original_gpr = ker::mod::cpu::GPRegs{};
+    auto original_frame = ker::mod::gates::InterruptFrame{};
+    if (POSTSITCH_RESTORE_INFLATE) {
+        original_gpr = gpr;
+        original_frame = frame;
+    }
 
     if (!sys::context_switch::switch_to(gpr, frame, next_task)) {
         clear_handoff_task(next_task);
         publish_current_task(rq, original_task);
         debug_task_slot(cpu::current_cpu()) = original_task;
     } else {
+        if (POSTSITCH_RESTORE_INFLATE) {
+            clear_handoff_task(next_task);
+            gpr = original_gpr;
+            frame = original_frame;
+            uint64_t const REAL_CPU_ID = cpu::current_cpu();
+            sys::context_switch::install_task_cpu_bases(original_task, REAL_CPU_ID);
+            desc::gdt::set_rsp0(reinterpret_cast<uint64_t*>(original_task->context.syscall_kernel_stack), REAL_CPU_ID);
+            if (original_task->pagemap != nullptr) {
+                mm::virt::switch_pagemap(original_task);
+            }
+            sys::context_switch::restore_debug_registers_for_task(original_task);
+            if (original_task->type == task::TaskType::PROCESS) {
+                sys::context_switch::restore_or_init_fpu_state(original_task);
+            }
+            uint64_t const LOG_INDEX = postswitch_restore_inflate_log_count.fetch_add(1, std::memory_order_relaxed);
+            if (LOG_INDEX < 32) {
+                dbg::logger<"sched">::info("postswitch_restore_inflate: pid=%lu(%s) next=%lu(%s) type=%u", original_task->pid,
+                                           task_name_for_log(original_task), next_task->pid, task_name_for_log(next_task),
+                                           task_type_for_log(next_task));
+            }
+            return;
+        }
         record_local_proc_first_run(next_task, WOS_PERF_CALLSITE());
         next_task->has_run = true;
     }
@@ -4612,10 +5113,8 @@ void start_scheduler() {
     // target frame or enables it after switching to the kernel-thread stack.
     sys::context_switch::start_sched_timer();
 
-    // Restore FPU/SSE/AVX state (PROCESS tasks only, and only if previously saved).
-    if (first_task->type == task::TaskType::PROCESS && first_task->fx_state.saved) {
-        sys::context_switch::restore_fpu_state(first_task);
-    }
+    // Process FPU/SIMD state is restored by the final userspace-entry path.
+    // Keep it saved while scheduler startup is still running on kernel stacks.
     sys::context_switch::restore_debug_registers_for_task(first_task);
 
     if (ALREADY_RAN) {
@@ -4688,6 +5187,10 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     asm volatile("movq %%gs:0x28, %0" : "=r"(return_rip));
     asm volatile("movq %%gs:0x30, %0" : "=r"(return_flags));
     asm volatile("movq %%gs:0x08, %0" : "=r"(user_rsp));
+    if ((return_flags & 0x2ULL) != 0) {
+        return_flags = sys::context_switch::normalize_user_return_flags(return_flags);
+        asm volatile("movq %0, %%gs:0x30" : : "r"(return_flags) : "memory");
+    }
 
     // Save all GPRs from the syscall stack.
     current_task->context.regs = *gpr_ptr;
@@ -4713,7 +5216,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     // Save outgoing task's FPU/SSE/AVX state
     sys::context_switch::save_fpu_state(current_task);
 
-    bool const IS_YIELD = current_task->yield_switch;
+    bool const IS_YIELD = deferred_switch_is_sched_yield(current_task);
     current_task->yield_switch = false;
 
     // Signal race check: if a deliverable signal is already pending, do not
@@ -4957,6 +5460,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
     if (next_task->type == task::TaskType::PROCESS && !next_task->is_voluntary_blocked()) {
         static_cast<void>(sys::context_switch::repair_stale_process_syscall_resume(next_task));
         restored_deferred_sigreturn = sys::signal::restore_deferred_sigreturn(next_task) == sys::signal::DeferredSigreturnResult::RESTORED;
+        sys::context_switch::normalize_process_user_return_state(next_task);
     }
 
     // Set up GS/FS for next task
@@ -4987,6 +5491,10 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
             dbg::log("deferred_task_switch: CORRUPT rsp=0x%x PID %x", next_task->context.frame.rsp, next_task->pid);
             hcf();
         }
+        if (!sys::context_switch::valid_user_return_flags(next_task->context.frame.flags)) {
+            dbg::log("deferred_task_switch: CORRUPT flags=0x%x PID %x", next_task->context.frame.flags, next_task->pid);
+            hcf();
+        }
     }
     validate_user_resume_target(next_task, "deferred-resume-next");
 
@@ -5001,10 +5509,8 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         }
     }
 
-    // Restore incoming task's FPU/SSE/AVX state (PROCESS tasks only).
-    if (next_task->type == task::TaskType::PROCESS && next_task->fx_state.saved) {
-        sys::context_switch::restore_fpu_state(next_task);
-    }
+    // Process FPU/SIMD state is restored by wos_deferred_task_switch_return()
+    // only if the saved frame actually returns to userspace.
     sys::context_switch::restore_debug_registers_for_task(next_task);
 
     arm_local_timer_after_deferred_switch(next_task);
@@ -5090,6 +5596,14 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
     uint64_t const NCPUS_RESCHED = smt::get_core_count();
     if (NCPUS_RESCHED == 0) {
         return;
+    }
+    uint64_t const SINGLE_PROCESS_CPU = scheduler_single_process_cpu_target(task, NCPUS_RESCHED);
+    if (SINGLE_PROCESS_CPU != UINT64_MAX) {
+        cpu_no = SINGLE_PROCESS_CPU;
+    }
+    uint64_t const OWNER_CPU = scheduler_process_owner_cpu_if_migration_disabled(task, NCPUS_RESCHED);
+    if (OWNER_CPU != UINT64_MAX) {
+        cpu_no = OWNER_CPU;
     }
     if (cpu_no >= NCPUS_RESCHED) {
         cpu_no = get_least_loaded_cpu();
@@ -6789,6 +7303,15 @@ auto get_scheduler_timer_decision_for_this_cpu(uint64_t now_us) -> SchedulerTime
             return FIXED_QUANTUM;
         }
 
+        // A CPU running userspace with a disarmed one-shot timer cannot be
+        // preempted if later runnable competitors land on its queue. Keep a
+        // periodic tick for active processes so accounting and wakeup fairness
+        // do not depend on a separate remote poke succeeding.
+        if (active_process_needs_periodic_scheduler_tick(CURRENT)) {
+            note_scheduler_timer_arm_reason_locked(rq, SchedulerTimerArmReason::RUNQUEUE);
+            return FIXED_QUANTUM;
+        }
+
         if (rq->runnable_heap.size != 0 && CURRENT_IS_IDLE) {
             note_scheduler_timer_arm_reason_locked(rq, SchedulerTimerArmReason::IDLE_WORK);
             return FIXED_QUANTUM;
@@ -7043,10 +7566,58 @@ auto get_scheduler_trace_stats(uint64_t cpu_no) -> SchedulerTraceStats {
     });
 }
 
+namespace {
+void fill_runqueue_task_state(SchedulerRunQueueTaskState& state, task::Task* task, bool current, bool handoff, bool in_heap,
+                              uint32_t heap_slot) {
+    state = SchedulerRunQueueTaskState{};
+    state.name = "?";
+    state.wait_channel = "-";
+    state.current = current;
+    state.handoff = handoff;
+    state.in_heap = in_heap;
+    state.heap_slot = heap_slot;
+
+    if (task == nullptr) {
+        return;
+    }
+
+    state.pid = task->pid;
+    state.name = task->name != nullptr ? task->name : "?";
+    state.type = static_cast<uint8_t>(task->type);
+    state.state = static_cast<uint8_t>(task->state.load(std::memory_order_acquire));
+    state.sched_queue = static_cast<uint8_t>(task->sched_queue);
+    state.voluntary_block = task->is_voluntary_blocked();
+    state.wants_block = task->wants_block;
+    state.cpu_pinned = task->cpu_pinned;
+    state.preempt_depth = task->preempt_disable_depth;
+    state.preempt_pending = task->preempt_pending;
+    state.preempt_owner = task->preempt_disable_owner;
+    state.preempt_start_us = task->preempt_disable_start_us;
+    state.preempt_max_us = task->preempt_disable_max_us;
+    state.wait_channel = task->wait_channel != nullptr ? task->wait_channel : "-";
+    state.wait_kind = static_cast<uint8_t>(task->wait_channel_kind);
+    state.perf_wait_callsite = perf_wait_callsite(task);
+    state.saved_rip = task->context.frame.rip;
+    state.wake_at_us = task->wake_at_us;
+    state.syscall_account_start_us = task->syscall_account_start_us;
+    state.vruntime = task->vruntime;
+    state.vdeadline = task->vdeadline;
+    state.slice_used_ns = task->slice_used_ns;
+    state.slice_ns = task->slice_ns;
+    state.heap_index = task->heap_index;
+    state.owner_cpu = task->cpu;
+    state.yield_switch = task->yield_switch;
+    state.deferred_task_switch = task->deferred_task_switch;
+}
+}  // namespace
+
 auto get_scheduler_cpu_state(uint64_t cpu_no) -> SchedulerCpuState {
     SchedulerCpuState state{};
     state.cpu_no = cpu_no;
     state.current_name = "?";
+    state.current_wait_channel = "-";
+    state.handoff_name = "?";
+    state.handoff_wait_channel = "-";
 
     if (run_queues == nullptr) {
         return state;
@@ -7056,6 +7627,9 @@ auto get_scheduler_cpu_state(uint64_t cpu_no) -> SchedulerCpuState {
         SchedulerCpuState state{};
         state.cpu_no = cpu_no;
         state.current_name = "?";
+        state.current_wait_channel = "-";
+        state.handoff_name = "?";
+        state.handoff_wait_channel = "-";
 
         if (rq == nullptr) {
             return state;
@@ -7088,9 +7662,73 @@ auto get_scheduler_cpu_state(uint64_t cpu_no) -> SchedulerCpuState {
             state.current_preempt_max_us = current->preempt_disable_max_us;
             state.current_preempt_owner = current->preempt_disable_owner;
             state.current_preempt_start_us = current->preempt_disable_start_us;
+            state.current_wait_channel = current->wait_channel != nullptr ? current->wait_channel : "-";
+            state.current_wait_kind = static_cast<uint8_t>(current->wait_channel_kind);
+            state.current_perf_wait_callsite = perf_wait_callsite(current);
+            state.current_saved_rip = current->context.frame.rip;
+            state.current_wake_at_us = current->wake_at_us;
+            state.current_sched_queue = static_cast<uint8_t>(current->sched_queue);
+            state.current_yield_switch = current->yield_switch;
+            state.current_deferred_task_switch = current->deferred_task_switch;
+        }
+
+        auto* handoff = rq->handoff_task;
+        if (handoff != nullptr) {
+            state.handoff_pid = handoff->pid;
+            state.handoff_name = handoff->name != nullptr ? handoff->name : "?";
+            state.handoff_type = static_cast<uint8_t>(handoff->type);
+            state.handoff_voluntary_block = handoff->is_voluntary_blocked();
+            state.handoff_wants_block = handoff->wants_block;
+            state.handoff_cpu_pinned = handoff->cpu_pinned;
+            state.handoff_preempt_depth = handoff->preempt_disable_depth;
+            state.handoff_preempt_pending = handoff->preempt_pending;
+            state.handoff_preempt_max_us = handoff->preempt_disable_max_us;
+            state.handoff_preempt_owner = handoff->preempt_disable_owner;
+            state.handoff_preempt_start_us = handoff->preempt_disable_start_us;
+            state.handoff_wait_channel = handoff->wait_channel != nullptr ? handoff->wait_channel : "-";
+            state.handoff_wait_kind = static_cast<uint8_t>(handoff->wait_channel_kind);
+            state.handoff_perf_wait_callsite = perf_wait_callsite(handoff);
+            state.handoff_saved_rip = handoff->context.frame.rip;
+            state.handoff_wake_at_us = handoff->wake_at_us;
+            state.handoff_sched_queue = static_cast<uint8_t>(handoff->sched_queue);
+            state.handoff_yield_switch = handoff->yield_switch;
+            state.handoff_deferred_task_switch = handoff->deferred_task_switch;
         }
 
         return state;
+    });
+}
+
+size_t get_scheduler_runqueue_task_states(uint64_t cpu_no, SchedulerRunQueueTaskState* out, size_t max_entries) {
+    if (run_queues == nullptr || out == nullptr || max_entries == 0) {
+        return 0;
+    }
+
+    return run_queues->with_lock(cpu_no, [out, max_entries](RunQueue* rq) -> size_t {
+        if (rq == nullptr) {
+            return 0;
+        }
+
+        size_t count = 0;
+        auto append = [&](task::Task* task, bool current, bool handoff, bool in_heap, uint32_t heap_slot) {
+            if (task == nullptr || count >= max_entries) {
+                return;
+            }
+            fill_runqueue_task_state(out[count], task, current, handoff, in_heap, heap_slot);
+            ++count;
+        };
+
+        append(rq->current_task, true, rq->current_task != nullptr && rq->current_task == rq->handoff_task, false, UINT32_MAX);
+        if (rq->handoff_task != nullptr && rq->handoff_task != rq->current_task) {
+            append(rq->handoff_task, false, true, false, UINT32_MAX);
+        }
+
+        for (uint32_t idx = 0; idx < rq->runnable_heap.size && count < max_entries; ++idx) {
+            auto* task = run_heap_entry(rq->runnable_heap, idx);
+            append(task, task != nullptr && task == rq->current_task, task != nullptr && task == rq->handoff_task, true, idx);
+        }
+
+        return count;
     });
 }
 
@@ -7131,6 +7769,31 @@ void dump_scheduler_trace_stats() {
     }
 }
 
+namespace {
+void log_scheduler_cpu_state(const SchedulerCpuState& state) {
+    dbg::log(
+        "schedcpu: cpu%lu idle=%u runq=%lu waitq=%lu cur=%lu(%s) type=%u vblk=%u wblk=%u pinned=%u preempt=%u/%u "
+        "preempt_max_us=%lu preempt_owner=0x%llx preempt_start_us=%lu wait=%s kind=%u callsite=0x%llx saved_rip=0x%llx "
+        "wake_at=%lu queue=%u yield=%u deferred=%u pending=%u timer=%lu/%lu/%lu wake=%lu/%lu local=%lu/%lu last_tick=%lu "
+        "wait_deadline=%lu",
+        static_cast<unsigned long>(state.cpu_no), state.is_idle ? 1U : 0U, static_cast<unsigned long>(state.runnable_count),
+        static_cast<unsigned long>(state.wait_queue_count), static_cast<unsigned long>(state.current_pid), state.current_name,
+        static_cast<unsigned>(state.current_type), state.current_voluntary_block ? 1U : 0U, state.current_wants_block ? 1U : 0U,
+        state.current_cpu_pinned ? 1U : 0U, state.current_preempt_depth, state.current_preempt_pending ? 1U : 0U,
+        static_cast<unsigned long>(state.current_preempt_max_us), static_cast<unsigned long long>(state.current_preempt_owner),
+        static_cast<unsigned long>(state.current_preempt_start_us), state.current_wait_channel,
+        static_cast<unsigned>(state.current_wait_kind), static_cast<unsigned long long>(state.current_perf_wait_callsite),
+        static_cast<unsigned long long>(state.current_saved_rip), static_cast<unsigned long>(state.current_wake_at_us),
+        static_cast<unsigned>(state.current_sched_queue), state.current_yield_switch ? 1U : 0U,
+        state.current_deferred_task_switch ? 1U : 0U, state.resched_timer_pending ? 1U : 0U,
+        static_cast<unsigned long>(state.scheduler_timer_interrupts), static_cast<unsigned long>(state.scheduler_timer_arms),
+        static_cast<unsigned long>(state.scheduler_timer_disarms), static_cast<unsigned long>(state.wake_ipis_sent),
+        static_cast<unsigned long>(state.wake_ipis_coalesced), static_cast<unsigned long>(state.local_reschedule_requests),
+        static_cast<unsigned long>(state.local_reschedule_timer_pokes), static_cast<unsigned long>(state.last_tick_us),
+        static_cast<unsigned long>(state.next_wait_deadline_us));
+}
+}  // namespace
+
 void dump_scheduler_cpu_states() {
     if (run_queues == nullptr) {
         return;
@@ -7139,22 +7802,36 @@ void dump_scheduler_cpu_states() {
     uint64_t const CORE_COUNT = smt::get_core_count();
     for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
         auto state = get_scheduler_cpu_state(cpu_no);
-        dbg::log(
-            "schedcpu: cpu%lu idle=%u runq=%lu waitq=%lu cur=%lu(%s) type=%u vblk=%u wblk=%u pinned=%u preempt=%u/%u "
-            "preempt_max_us=%lu preempt_owner=0x%llx preempt_start_us=%lu pending=%u timer=%lu/%lu/%lu wake=%lu/%lu "
-            "local=%lu/%lu last_tick=%lu wait_deadline=%lu",
-            static_cast<unsigned long>(state.cpu_no), state.is_idle ? 1U : 0U, static_cast<unsigned long>(state.runnable_count),
-            static_cast<unsigned long>(state.wait_queue_count), static_cast<unsigned long>(state.current_pid), state.current_name,
-            static_cast<unsigned>(state.current_type), state.current_voluntary_block ? 1U : 0U, state.current_wants_block ? 1U : 0U,
-            state.current_cpu_pinned ? 1U : 0U, state.current_preempt_depth, state.current_preempt_pending ? 1U : 0U,
-            static_cast<unsigned long>(state.current_preempt_max_us), static_cast<unsigned long long>(state.current_preempt_owner),
-            static_cast<unsigned long>(state.current_preempt_start_us), state.resched_timer_pending ? 1U : 0U,
-            static_cast<unsigned long>(state.scheduler_timer_interrupts), static_cast<unsigned long>(state.scheduler_timer_arms),
-            static_cast<unsigned long>(state.scheduler_timer_disarms), static_cast<unsigned long>(state.wake_ipis_sent),
-            static_cast<unsigned long>(state.wake_ipis_coalesced), static_cast<unsigned long>(state.local_reschedule_requests),
-            static_cast<unsigned long>(state.local_reschedule_timer_pokes), static_cast<unsigned long>(state.last_tick_us),
-            static_cast<unsigned long>(state.next_wait_deadline_us));
+        log_scheduler_cpu_state(state);
     }
+}
+
+void dump_scheduler_current_cpu_state(const ker::mod::gates::InterruptFrame& frame) {
+    if (run_queues == nullptr) {
+        return;
+    }
+
+    auto state = get_scheduler_cpu_state(cpu::current_cpu());
+    dbg::log(
+        "schedcpulive: cpu%lu live_cs=0x%llx live_rip=0x%llx live_rsp=0x%llx idle=%u runq=%lu waitq=%lu cur=%lu(%s) type=%u "
+        "vblk=%u wblk=%u pinned=%u preempt=%u/%u preempt_owner=0x%llx wait=%s kind=%u callsite=0x%llx saved_rip=0x%llx "
+        "wake_at=%lu queue=%u yield=%u deferred=%u pending=%u timer=%lu/%lu/%lu wake=%lu/%lu local=%lu/%lu last_tick=%lu "
+        "wait_deadline=%lu",
+        static_cast<unsigned long>(state.cpu_no), static_cast<unsigned long long>(frame.cs), static_cast<unsigned long long>(frame.rip),
+        static_cast<unsigned long long>(frame.rsp), state.is_idle ? 1U : 0U, static_cast<unsigned long>(state.runnable_count),
+        static_cast<unsigned long>(state.wait_queue_count), static_cast<unsigned long>(state.current_pid), state.current_name,
+        static_cast<unsigned>(state.current_type), state.current_voluntary_block ? 1U : 0U, state.current_wants_block ? 1U : 0U,
+        state.current_cpu_pinned ? 1U : 0U, state.current_preempt_depth, state.current_preempt_pending ? 1U : 0U,
+        static_cast<unsigned long long>(state.current_preempt_owner), state.current_wait_channel,
+        static_cast<unsigned>(state.current_wait_kind), static_cast<unsigned long long>(state.current_perf_wait_callsite),
+        static_cast<unsigned long long>(state.current_saved_rip), static_cast<unsigned long>(state.current_wake_at_us),
+        static_cast<unsigned>(state.current_sched_queue), state.current_yield_switch ? 1U : 0U,
+        state.current_deferred_task_switch ? 1U : 0U, state.resched_timer_pending ? 1U : 0U,
+        static_cast<unsigned long>(state.scheduler_timer_interrupts), static_cast<unsigned long>(state.scheduler_timer_arms),
+        static_cast<unsigned long>(state.scheduler_timer_disarms), static_cast<unsigned long>(state.wake_ipis_sent),
+        static_cast<unsigned long>(state.wake_ipis_coalesced), static_cast<unsigned long>(state.local_reschedule_requests),
+        static_cast<unsigned long>(state.local_reschedule_timer_pokes), static_cast<unsigned long>(state.last_tick_us),
+        static_cast<unsigned long>(state.next_wait_deadline_us));
 }
 
 auto get_least_loaded_cpu() -> uint64_t {
@@ -7469,6 +8146,26 @@ auto scheduler_selftest_loadavg_wait_channel_policy() -> bool {
     bool const DIRTY_BCACHE_COUNTS = loadavg_wait_channel_counts_as_uninterruptible(&dirty_bcache);
 
     return RUNNABLE_COUNTS && VOLUNTARY_RUNNABLE_IGNORED && WAITPID_IGNORED && PIPE_IGNORED && FUTEX_IGNORED && DIRTY_BCACHE_COUNTS;
+}
+
+auto scheduler_selftest_deferred_yield_requires_sched_yield_channel() -> bool {
+    task::Task internal_resched{};
+    internal_resched.yield_switch = true;
+
+    task::Task sched_yield{};
+    sched_yield.yield_switch = true;
+    sched_yield.set_wait_channel("sched_yield", task::WaitChannelKind::GENERIC);
+
+    task::Task waitpid{};
+    waitpid.yield_switch = true;
+    waitpid.set_wait_channel("waitpid", task::WaitChannelKind::WAITPID);
+
+    task::Task ptrace{};
+    ptrace.yield_switch = true;
+    ptrace.set_wait_channel("ptrace", task::WaitChannelKind::PTRACE);
+
+    return deferred_switch_is_sched_yield(&internal_resched) && deferred_switch_is_sched_yield(&sched_yield) &&
+           !deferred_switch_is_sched_yield(&waitpid) && !deferred_switch_is_sched_yield(&ptrace);
 }
 #endif
 
