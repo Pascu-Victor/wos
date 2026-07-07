@@ -290,12 +290,13 @@ def test_shared_build_timing_avoids_python_when_epochrealtime_exists() -> None:
         fail("shared timing helpers must try EPOCHREALTIME before Python")
 
 
-def test_native_wos_build_defaults_keep_target_ports_enabled() -> None:
+def test_native_wos_build_defaults_skip_target_port_rebuilds() -> None:
     source = ROOT_CMAKE.read_text()
     require_tokens(
         source,
         [
             "set(WOS_PORT_BUILD_DEFAULT ON)",
+            "if(WOS_NATIVE_SYSTEM_BUILD)\n    set(WOS_PORT_BUILD_DEFAULT OFF)\nendif()",
             "set(WOS_BUILD_CMAKE_FOR_HOST_DEFAULT ${WOS_PORT_BUILD_DEFAULT})",
             "if(WOS_NATIVE_SYSTEM_BUILD)\n    set(WOS_BUILD_CMAKE_FOR_HOST_DEFAULT OFF)\nendif()",
             "set(WOS_BUILD_DISK_IMAGES_DEFAULT ON)",
@@ -309,16 +310,15 @@ def test_native_wos_build_defaults_keep_target_ports_enabled() -> None:
             'option(WOS_BUILD_CMAKE_FOR_HOST "Build host-side CMake from the WOS fork and install it into toolchain/host" ${WOS_BUILD_CMAKE_FOR_HOST_DEFAULT})',
             'option(WOS_BUILD_CMAKE_FOR_WOS "Build native WOS CMake tools and stage them into the rootfs" ${WOS_PORT_BUILD_DEFAULT})',
             'option(WOS_BUILD_GIT_FOR_WOS "Build native WOS Git and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})',
-            'option(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN "Reuse artifacts already produced by tools/bootstrap.sh instead of rerunning external toolchain/userland port builders" OFF)',
+            "set(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN_DEFAULT OFF)",
+            "if(WOS_NATIVE_SYSTEM_BUILD)\n    set(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN_DEFAULT ON)\nendif()",
+            'option(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN "Reuse artifacts already produced by tools/bootstrap.sh instead of rerunning external toolchain/userland port builders" ${WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN_DEFAULT})',
             "add_dependencies(git_for_wos bash_for_wos curl_for_wos)",
             "if(WOS_BUILD_DISK_IMAGES)\n    add_dependencies(wos_full\n        mountfs_disk\n        boot_image\n    )\nendif()",
             "if(NOT WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)\n    add_custom_target(libcxx DEPENDS ${LIBCXX_STAMP})\nendif()",
         ],
         "native WOS self-hosting build defaults",
     )
-
-    if "set(WOS_PORT_BUILD_DEFAULT OFF)" in source:
-        fail("native WOS builds must keep target port/toolchain targets enabled by default")
 
 
 def test_preseeded_toolchain_mode_validates_bootstrap_outputs() -> None:
@@ -2372,7 +2372,7 @@ if __name__ == "__main__":
     test_native_wos_compiler_rt_does_not_link_with_workspace_sysroot()
     test_wos_toolchain_records_bootstrap_phase_timings()
     test_shared_build_timing_avoids_python_when_epochrealtime_exists()
-    test_native_wos_build_defaults_keep_target_ports_enabled()
+    test_native_wos_build_defaults_skip_target_port_rebuilds()
     test_preseeded_toolchain_mode_validates_bootstrap_outputs()
     test_preseeded_toolchain_mode_skips_external_source_scans()
     test_root_toolchain_builds_do_not_use_ninja_console_pool()

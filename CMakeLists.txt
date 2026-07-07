@@ -157,7 +157,11 @@ option(WOS_BUILD_NANO_FOR_WOS "Build native WOS nano and stage it into the rootf
 option(WOS_BUILD_OPENSSL_FOR_WOS "Build static WOS OpenSSL-compatible TLS libraries for curl and HTTPS-capable ports" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_CURL_FOR_WOS "Build native WOS curl and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_GIT_FOR_WOS "Build native WOS Git and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
-option(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN "Reuse artifacts already produced by tools/bootstrap.sh instead of rerunning external toolchain/userland port builders" OFF)
+set(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN_DEFAULT OFF)
+if(WOS_NATIVE_SYSTEM_BUILD)
+    set(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN_DEFAULT ON)
+endif()
+option(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN "Reuse artifacts already produced by tools/bootstrap.sh instead of rerunning external toolchain/userland port builders" ${WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN_DEFAULT})
 
 set(SYSROOT ${WOS_SYSROOT_PATH})
 set(MLIBC_BUILD_DIR ${WOS_MLIBC_BUILD_DIR})
