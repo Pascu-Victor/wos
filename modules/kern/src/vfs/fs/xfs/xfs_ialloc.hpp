@@ -11,7 +11,8 @@
 
 namespace ker::vfs::xfs {
 
-// Allocate a new inode.
+// Allocate a new inode. The caller must log a fully initialized inode in the
+// same transaction before committing any namespace entry that references it.
 // mode: POSIX file type & mode bits (S_IFREG, S_IFDIR, etc.)
 // Returns the allocated inode number, or NULLFSINO on failure.
 auto xfs_ialloc(XfsMountContext* mount, XfsTransaction* tp, uint16_t mode) -> xfs_ino_t;

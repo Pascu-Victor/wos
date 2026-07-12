@@ -366,31 +366,47 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
         return -ENOSPC;
     }
 
-    XfsCntbtTraits::IRec const FOUND = xfs_btree_get_rec(&cur);
+    XfsCntbtTraits::IRec found{};
+    xfs_agblock_t alloc_start = 0;
+    xfs_extlen_t alloc_len = 0;
+    bool selected = false;
 
-    if (FOUND.blockcount < req.minlen) {
-        return -ENOSPC;
+    while (true) {
+        found = xfs_btree_get_rec(&cur);
+        if (found.blockcount >= req.minlen) {
+            xfs_agblock_t candidate_start = found.startblock;
+            xfs_extlen_t candidate_len = std::min(found.blockcount, req.maxlen);
+
+            if (req.alignment > 1) {
+                xfs_agblock_t const ALIGNED =
+                    ((candidate_start + req.alignment - 1) / req.alignment) * static_cast<xfs_agblock_t>(req.alignment);
+                xfs_extlen_t const LOST = ALIGNED - candidate_start;
+                if (LOST < found.blockcount) {
+                    xfs_extlen_t const REMAINING = found.blockcount - LOST;
+                    if (REMAINING >= req.minlen) {
+                        candidate_start = ALIGNED;
+                        candidate_len = std::min(candidate_len, REMAINING);
+                        alloc_start = candidate_start;
+                        alloc_len = candidate_len;
+                        selected = true;
+                        break;
+                    }
+                }
+            } else {
+                alloc_start = candidate_start;
+                alloc_len = candidate_len;
+                selected = true;
+                break;
+            }
+        }
+
+        rc = xfs_btree_increment(&cur);
+        if (rc != 0) {
+            break;
+        }
     }
-
-    // Compute actual allocation length
-    xfs_extlen_t alloc_len = FOUND.blockcount;
-    alloc_len = std::min(alloc_len, req.maxlen);
-
-    xfs_agblock_t alloc_start = FOUND.startblock;
-
-    // Apply alignment if requested
-    if (req.alignment > 1) {
-        xfs_agblock_t const ALIGNED = (alloc_start + req.alignment - 1) & ~(static_cast<xfs_agblock_t>(req.alignment) - 1);
-        xfs_extlen_t const LOST = ALIGNED - alloc_start;
-        if (LOST >= FOUND.blockcount) {
-            return -ENOSPC;
-        }
-        alloc_start = ALIGNED;
-        xfs_extlen_t const REMAINING = FOUND.blockcount - LOST;
-        if (REMAINING < req.minlen) {
-            return -ENOSPC;
-        }
-        alloc_len = std::min(alloc_len, REMAINING);
+    if (!selected) {
+        return -ENOSPC;
     }
 
     // ---- 1. Remove the old free extent from both cntbt and bnobt ----
@@ -403,8 +419,8 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     bno_cur.agno = agno;
 
     XfsBnobtTraits::IRec bno_target{};
-    bno_target.startblock = FOUND.startblock;
-    bno_target.blockcount = FOUND.blockcount;
+    bno_target.startblock = found.startblock;
+    bno_target.blockcount = found.blockcount;
 
     rc = xfs_btree_lookup(&bno_cur, pag->agf_bno_root, pag->agf_bno_level, bno_target, XfsBtreeLookup::EQ);
     if (rc != 0) {
@@ -412,7 +428,7 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     }
 
     XfsBnobtTraits::IRec const BNO_FOUND = xfs_btree_get_rec(&bno_cur);
-    if (!same_free_extent(BNO_FOUND.startblock, BNO_FOUND.blockcount, FOUND.startblock, FOUND.blockcount)) {
+    if (!same_free_extent(BNO_FOUND.startblock, BNO_FOUND.blockcount, found.startblock, found.blockcount)) {
         return -EIO;
     }
 
@@ -431,14 +447,14 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     // ---- 2 & 3. Re-insert remainder extents ----
 
     // Left remainder: blocks before alloc_start
-    if (alloc_start > FOUND.startblock) {
-        xfs_extlen_t const LEFT_LEN = alloc_start - FOUND.startblock;
+    if (alloc_start > found.startblock) {
+        xfs_extlen_t const LEFT_LEN = alloc_start - found.startblock;
         uint64_t new_bno_root = pag->agf_bno_root;
         uint8_t new_bno_lvl = pag->agf_bno_level;
         uint64_t new_cnt_root = pag->agf_cnt_root;
         uint8_t new_cnt_lvl = pag->agf_cnt_level;
 
-        XfsBnobtTraits::IRec const LEFT_BNO{.startblock = FOUND.startblock, .blockcount = LEFT_LEN};
+        XfsBnobtTraits::IRec const LEFT_BNO{.startblock = found.startblock, .blockcount = LEFT_LEN};
         rc = xfs_btree_insert(&bno_cur, tp, LEFT_BNO, pag->agf_bno_root, pag->agf_bno_level, &new_bno_root, &new_bno_lvl);
         if (rc != 0) {
             return rc;
@@ -446,7 +462,7 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
         pag->agf_bno_root = static_cast<xfs_agblock_t>(new_bno_root);
         pag->agf_bno_level = new_bno_lvl;
 
-        XfsCntbtTraits::IRec const LEFT_CNT{.startblock = FOUND.startblock, .blockcount = LEFT_LEN};
+        XfsCntbtTraits::IRec const LEFT_CNT{.startblock = found.startblock, .blockcount = LEFT_LEN};
         rc = xfs_btree_insert(&cur, tp, LEFT_CNT, pag->agf_cnt_root, pag->agf_cnt_level, &new_cnt_root, &new_cnt_lvl);
         if (rc != 0) {
             return rc;
@@ -457,7 +473,7 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
 
     // Right remainder: blocks after alloc_start+alloc_len
     xfs_agblock_t const ALLOC_END = alloc_start + alloc_len;
-    xfs_agblock_t const ORIG_END = FOUND.startblock + FOUND.blockcount;
+    xfs_agblock_t const ORIG_END = found.startblock + found.blockcount;
     if (ALLOC_END < ORIG_END) {
         xfs_extlen_t const RIGHT_LEN = ORIG_END - ALLOC_END;
         uint64_t new_bno_root = pag->agf_bno_root;
@@ -581,7 +597,6 @@ auto xfs_alloc_extent(XfsMountContext* mount, XfsTransaction* tp, const XfsAlloc
     if (req.minlen == 0) {
         return -EINVAL;
     }
-
     // Try preferred AG first
     if (req.agno != NULLAGNUMBER && req.agno < mount->ag_count) {
         if (req.agbno != 0) {

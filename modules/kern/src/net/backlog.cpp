@@ -35,7 +35,6 @@ constexpr int NET_LATENCY_DAEMON_NICE = -5;
 constexpr uint64_t BACKLOG_CONSUMER_CONTENTION_SLEEP_US = 50;
 constexpr uint32_t BACKLOG_HANDLER_COOPERATIVE_BATCH = 128;
 constexpr uint64_t BACKLOG_HANDLER_COOPERATIVE_SLEEP_US = 50;
-constexpr uint64_t BACKLOG_HANDLER_IDLE_SLEEP_US = 1000;
 
 enum class BacklogConsumerStage : uint8_t {
     IDLE = 0,
@@ -283,7 +282,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
                 continue;
             }
 
-            ker::mod::sched::kern_sleep_us(BACKLOG_HANDLER_IDLE_SLEEP_US);
+            ker::mod::sched::kern_block();
             q.handler_active.store(true, std::memory_order_relaxed);
             continue;
         }

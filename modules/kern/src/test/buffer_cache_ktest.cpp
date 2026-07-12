@@ -145,9 +145,9 @@ KTEST(BufferCache, SizingKeepsDirtyLimitsBelowCleanCache) {
     size_t const DIRTY_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(ONE_GIB, CACHE_MAX);
     size_t const DIRTY_HARD = ker::vfs::buffer_cache_selftest_choose_dirty_hard_bytes(DIRTY_TARGET, CACHE_MAX);
 
-    KEXPECT_EQ(CACHE_MAX, static_cast<size_t>(ONE_GIB / 4));
-    KEXPECT_EQ(DIRTY_TARGET, static_cast<size_t>(ONE_GIB / 20));
-    KEXPECT_EQ(DIRTY_HARD, DIRTY_TARGET * 2);
+    KEXPECT_EQ(CACHE_MAX, static_cast<size_t>((ONE_GIB / 16) * 7));
+    KEXPECT_EQ(DIRTY_TARGET, static_cast<size_t>(ONE_GIB / 8));
+    KEXPECT_EQ(DIRTY_HARD, CACHE_MAX);
 
     size_t const FALLBACK_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(0);
     size_t const FALLBACK_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(0, FALLBACK_MAX);
@@ -159,9 +159,9 @@ KTEST(BufferCache, SizingKeepsDirtyLimitsBelowCleanCache) {
     size_t const LARGE_CACHE_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(THIRTY_TWO_GIB);
     size_t const LARGE_DIRTY_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(THIRTY_TWO_GIB, LARGE_CACHE_MAX);
     size_t const LARGE_DIRTY_HARD = ker::vfs::buffer_cache_selftest_choose_dirty_hard_bytes(LARGE_DIRTY_TARGET, LARGE_CACHE_MAX);
-    KEXPECT_EQ(LARGE_CACHE_MAX, static_cast<size_t>(ONE_GIB));
-    KEXPECT_EQ(LARGE_DIRTY_TARGET, static_cast<size_t>(ONE_GIB / 2));
-    KEXPECT_EQ(LARGE_DIRTY_HARD, static_cast<size_t>(ONE_GIB));
+    KEXPECT_EQ(LARGE_CACHE_MAX, static_cast<size_t>(14 * ONE_GIB));
+    KEXPECT_EQ(LARGE_DIRTY_TARGET, static_cast<size_t>(8 * ONE_GIB));
+    KEXPECT_EQ(LARGE_DIRTY_HARD, LARGE_CACHE_MAX);
 }
 
 KTEST(BufferCache, BreadHit) {
@@ -651,6 +651,31 @@ KTEST(BufferCache, BreadMissCopiesCleanMultiAliasAfterWriteback) {
     KEXPECT_EQ(reread_single->data[0], static_cast<uint8_t>(0x61));
     KEXPECT_EQ(reread_single->data[reread_single->size - 1], static_cast<uint8_t>(0x61));
     ker::vfs::brelse(reread_single);
+    ker::vfs::invalidate_bdev(&dev);
+}
+
+KTEST(BufferCache, CompleteRangeCopyUsesCoveringAliasBeyondVisitBudget) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    RecordingReadState reads{};
+    dev.read_blocks = recording_read;
+    dev.private_data = &reads;
+    ker::vfs::invalidate_bdev(&dev);
+
+    constexpr uint64_t BLK = 1800;
+    constexpr size_t ALIAS_COUNT = 257;
+    constexpr uint8_t VALUE = 0x6D;
+    for (size_t count = 1; count <= ALIAS_COUNT; ++count) {
+        ker::vfs::BufHead* alias = ker::vfs::bget_multi(&dev, BLK, count);
+        KREQUIRE_NE(alias, nullptr);
+        memset(alias->data, VALUE, alias->size);
+        ker::vfs::brelse(alias);
+    }
+
+    std::array<uint8_t, 512> copied{};
+    KEXPECT_TRUE(ker::vfs::copy_cached_bdev_range_if_complete(&dev, BLK, 1, copied.data()));
+    KEXPECT_EQ(copied.front(), VALUE);
+    KEXPECT_EQ(copied.back(), VALUE);
+    KEXPECT_EQ(reads.read_calls, static_cast<size_t>(0));
     ker::vfs::invalidate_bdev(&dev);
 }
 

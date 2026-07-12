@@ -107,17 +107,17 @@ auto remote_vfs_strip_mount_prefix(const ker::vfs::MountPoint* mount, const char
         return path;
     }
 
-    size_t mount_len = std::strlen(mount->path);
-    if (mount_len == 1 && mount->path[0] == '/') {
+    size_t const MOUNT_LEN = mount->path_len;
+    if (MOUNT_LEN == 1 && mount->path[0] == '/') {
         return path + 1;
     }
-    if (path[mount_len] == '/') {
-        return path + mount_len + 1;
+    if (path[MOUNT_LEN] == '/') {
+        return path + MOUNT_LEN + 1;
     }
-    if (path[mount_len] == '\0') {
+    if (path[MOUNT_LEN] == '\0') {
         return "";
     }
-    return path + mount_len;
+    return path + MOUNT_LEN;
 }
 
 auto remote_vfs_try_copy_cached_stat(RemoteFileContext* ctx, ker::vfs::Stat* statbuf) -> bool {

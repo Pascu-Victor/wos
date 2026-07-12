@@ -13,12 +13,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <new>
 #include <platform/dbg/dbg.hpp>
+#include <platform/ktime/ktime.hpp>
+#include <platform/perf/perf_events.hpp>
+#include <platform/sys/mutex.hpp>
 #include <util/crc32c.hpp>
 #include <utility>
 #include <vfs/buffer_cache.hpp>
@@ -33,6 +37,31 @@ namespace ker::vfs::xfs {
 namespace {
 
 constexpr size_t XFS_LOG_STACK_BODY_MAX_BYTES = 4096;
+constexpr size_t XFS_LOG_BATCH_MAX_ITEMS = 8192;
+constexpr uint32_t XFS_LOG_BATCH_MAX_TRANSACTIONS = 256;
+constexpr size_t XFS_LOG_BATCH_MAX_BODY_BYTES = size_t{4} * 1024 * 1024;
+ker::mod::sys::Mutex log_write_lock;
+
+class XfsLogWriteGuard {
+   public:
+    XfsLogWriteGuard() {
+        constexpr int ADAPTIVE_SPIN_LIMIT = 4096;
+        for (int i = 0; i < ADAPTIVE_SPIN_LIMIT; ++i) {
+            if (log_write_lock.try_lock()) {
+                return;
+            }
+            asm volatile("pause" ::: "memory");
+        }
+        log_write_lock.lock();
+    }
+
+    ~XfsLogWriteGuard() { log_write_lock.unlock(); }
+
+    XfsLogWriteGuard(const XfsLogWriteGuard&) = delete;
+    XfsLogWriteGuard(XfsLogWriteGuard&&) = delete;
+    auto operator=(const XfsLogWriteGuard&) -> XfsLogWriteGuard& = delete;
+    auto operator=(XfsLogWriteGuard&&) -> XfsLogWriteGuard& = delete;
+};
 
 auto xfs_log_serialize_body(const XfsTransItem* items, int item_count, uint8_t* body_buf, size_t body_capacity) -> int {
     if (items == nullptr || body_buf == nullptr || item_count < 0) {
@@ -67,7 +96,6 @@ auto xfs_log_write_header_bytes(const XlogRecHeader& hdr, uint8_t* dst, uint32_t
         return -EINVAL;
     }
 
-    __builtin_memset(dst, 0, block_size);
     size_t write_len = sizeof(XlogRecHeader);
     write_len = std::min<size_t>(write_len, block_size);
     __builtin_memcpy(dst, &hdr, write_len);
@@ -164,6 +192,16 @@ auto xfs_log_find_head_tail(XfsLog* log) -> int {
 
 // Global log state (one per mounted XFS filesystem at this time)
 XfsLog* active_log = nullptr;
+
+struct XfsLogBatch {
+    XfsMountContext* mount{};
+    std::array<XfsTransItem, XFS_LOG_BATCH_MAX_ITEMS> items{};
+    size_t item_count{};
+    size_t body_bytes{};
+    uint32_t transactions{};
+};
+
+XfsLogBatch* active_batch = nullptr;
 
 // Replay a single log record starting at the given block.
 // Reads the header, then reads body blocks and replays buffer modifications.
@@ -356,12 +394,21 @@ auto xfs_log_mount(XfsMountContext* mount) -> int {
         mod::dbg::log("[xfs log] log is clean");
     }
 
+    auto* batch = new (std::nothrow) XfsLogBatch{};
+    if (batch == nullptr) {
+        delete log;
+        return -ENOMEM;
+    }
+    batch->mount = mount;
     log->active = true;
     active_log = log;
+    active_batch = batch;
     return 0;
 }
 
 void xfs_log_unmount(XfsMountContext* mount) {
+    static_cast<void>(xfs_log_flush(mount));
+    XfsLogWriteGuard guard;
     if (active_log == nullptr || active_log->mount != mount) {
         return;
     }
@@ -371,6 +418,8 @@ void xfs_log_unmount(XfsMountContext* mount) {
 
     delete active_log;
     active_log = nullptr;
+    delete active_batch;
+    active_batch = nullptr;
 }
 
 auto xfs_log_needs_recovery(XfsMountContext* mount) -> bool {
@@ -380,15 +429,34 @@ auto xfs_log_needs_recovery(XfsMountContext* mount) -> bool {
     return !active_log->clean;
 }
 
-auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_count) -> int {
+namespace {
+
+auto xfs_log_write_record_locked(XfsMountContext* mount, const XfsTransItem* items, int item_count) -> int {
+    uint64_t const PERF_STARTED_US =
+        ker::mod::perf::is_wki_scope_recording_enabled(ker::mod::perf::WkiPerfScope::LOCAL_XFS,
+                                                       static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalXfsOp::LOG_WRITE))
+            ? ker::mod::time::get_us()
+            : 0;
     if (mount == nullptr || active_log == nullptr || active_log->mount != mount) {
         return -EINVAL;
     }
     if (!active_log->active) {
         return -EINVAL;
     }
-
     XfsLog* log = active_log;
+    uint64_t perf_body_bytes = 0;
+    uint64_t perf_block_bytes = 0;
+    auto finish_log_write = [&](int status) -> int {
+        if (PERF_STARTED_US != 0) {
+            uint64_t const NOW_US = ker::mod::time::get_us();
+            uint64_t const ELAPSED_US = NOW_US >= PERF_STARTED_US ? NOW_US - PERF_STARTED_US : 0;
+            auto const CLAMPED_US = static_cast<uint32_t>(std::min<uint64_t>(ELAPSED_US, UINT32_MAX));
+            ker::mod::perf::record_local_xfs_summary(ker::mod::perf::WkiPerfLocalXfsOp::LOG_WRITE, status, CLAMPED_US, true,
+                                                     perf_body_bytes);
+            ker::mod::perf::record_local_xfs_summary(ker::mod::perf::WkiPerfLocalXfsOp::LOG_BLOCKS, status, 0, false, perf_block_bytes);
+        }
+        return status;
+    };
 
     // Compute total body size: for each buffer item, store block_no (8B) +
     // offset (4B) + len (4B) + data (len B). INODE transaction items are
@@ -404,17 +472,19 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     }
 
     if (num_logops == 0) {
-        return 0;  // nothing to log
+        return finish_log_write(0);  // nothing to log
     }
+    perf_body_bytes = body_size;
 
     // Number of blocks needed: header (1) + data blocks
     uint32_t const BLOCK_SIZE = mount->block_size;
     uint32_t const DATA_BLOCKS = (body_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
     uint32_t const TOTAL_BLOCKS = 1 + DATA_BLOCKS;  // header block + data
+    perf_block_bytes = static_cast<uint64_t>(TOTAL_BLOCKS) * BLOCK_SIZE;
 
     if (TOTAL_BLOCKS > log->log_blocks) {
         mod::dbg::log("[xfs log] transaction too large for log (%u blocks needed, %u available)", TOTAL_BLOCKS, log->log_blocks);
-        return -ENOSPC;
+        return finish_log_write(-ENOSPC);
     }
 
     // Check if we have enough space before wrapping
@@ -427,7 +497,7 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     }
     if (TOTAL_BLOCKS >= avail) {
         mod::dbg::log("[xfs log] log full (%u blocks needed, %u available)", TOTAL_BLOCKS, avail);
-        return -ENOSPC;
+        return finish_log_write(-ENOSPC);
     }
 
     // Build the log record header
@@ -456,38 +526,37 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     if (DATA_BLOCKS == 1 && HEAD <= log->log_blocks - TOTAL_BLOCKS) {
         BufHead* record_bh = xfs_buf_get_multi(mount, HDR_DISK_BLOCK, TOTAL_BLOCKS);
         if (record_bh == nullptr) {
-            return -EIO;
+            return finish_log_write(-EIO);
         }
 
         int rc = xfs_log_write_header_bytes(hdr, record_bh->data, BLOCK_SIZE);
         if (rc == 0) {
             uint8_t* body_dst = record_bh->data + BLOCK_SIZE;
-            __builtin_memset(body_dst, 0, BLOCK_SIZE);
             rc = xfs_log_serialize_body(items, item_count, body_dst, BLOCK_SIZE);
         }
         if (rc != 0) {
             brelse(record_bh);
-            return rc;
+            return finish_log_write(rc);
         }
 
         bdirty(record_bh);
         brelse(record_bh);
         cur_block = (HEAD + TOTAL_BLOCKS) % log->log_blocks;
         xfs_log_advance_head(log, HEAD, cur_block);
-        return 0;
+        return finish_log_write(0);
     }
 
     // Write header block - use xfs_buf_get (not xfs_buf_read) since we
     // immediately zero and overwrite the entire block; no need to read from disk.
     BufHead* hdr_bh = xfs_buf_get(mount, HDR_DISK_BLOCK);
     if (hdr_bh == nullptr) {
-        return -EIO;
+        return finish_log_write(-EIO);
     }
 
     int const HEADER_RC = xfs_log_write_header_bytes(hdr, hdr_bh->data, BLOCK_SIZE);
     if (HEADER_RC != 0) {
         brelse(hdr_bh);
-        return HEADER_RC;
+        return finish_log_write(HEADER_RC);
     }
 
     bdirty(hdr_bh);
@@ -497,23 +566,22 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
         uint64_t const DATA_DISK_BLOCK = log->log_start + cur_block;
         BufHead* data_bh = xfs_buf_get(mount, DATA_DISK_BLOCK);
         if (data_bh == nullptr) {
-            return -EIO;
+            return finish_log_write(-EIO);
         }
-        __builtin_memset(data_bh->data, 0, BLOCK_SIZE);
         int const SERIALIZE_RC = xfs_log_serialize_body(items, item_count, data_bh->data, BLOCK_SIZE);
         if (SERIALIZE_RC != 0) {
             brelse(data_bh);
-            return SERIALIZE_RC;
+            return finish_log_write(SERIALIZE_RC);
         }
         bdirty(data_bh);
         brelse(data_bh);
         cur_block = (cur_block + 1) % log->log_blocks;
         xfs_log_advance_head(log, HEAD, cur_block);
-        return 0;
+        return finish_log_write(0);
     }
 
     if (DATA_BLOCKS != 0 && BLOCK_SIZE > SIZE_MAX / DATA_BLOCKS) {
-        return -EOVERFLOW;
+        return finish_log_write(-EOVERFLOW);
     }
 
     size_t const BODY_BUFFER_BYTES = static_cast<size_t>(DATA_BLOCKS) * BLOCK_SIZE;
@@ -526,7 +594,7 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
         heap_body_buf = true;
     }
     if (body_buf == nullptr) {
-        return -ENOMEM;
+        return finish_log_write(-ENOMEM);
     }
 
     int const SERIALIZE_RC = xfs_log_serialize_body(items, item_count, body_buf, BODY_BUFFER_BYTES);
@@ -534,7 +602,7 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
         if (heap_body_buf) {
             delete[] body_buf;
         }
-        return SERIALIZE_RC;
+        return finish_log_write(SERIALIZE_RC);
     }
 
     // Write body data block by block
@@ -546,12 +614,11 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
             if (heap_body_buf) {
                 delete[] body_buf;
             }
-            return -EIO;
+            return finish_log_write(-EIO);
         }
 
         uint32_t chunk = body_size - body_offset;
         chunk = std::min(chunk, BLOCK_SIZE);
-        __builtin_memset(data_bh->data, 0, BLOCK_SIZE);
         __builtin_memcpy(data_bh->data, body_buf + body_offset, chunk);
 
         bdirty(data_bh);
@@ -568,7 +635,187 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     // Advance the log head
     xfs_log_advance_head(log, HEAD, cur_block);
 
+    return finish_log_write(0);
+}
+
+auto xfs_log_item_matches_buffer(const XfsTransItem& item, const BufHead* bp) -> bool {
+    if (item.type != XfsLogItemType::BUFFER || item.buf.bp == nullptr || bp == nullptr) {
+        return false;
+    }
+    BufHead const* existing = item.buf.bp;
+    return existing == bp || (existing->bdev == bp->bdev && existing->block_no == bp->block_no && existing->size == bp->size);
+}
+
+auto xfs_log_batch_find_item(XfsLogBatch* batch, const BufHead* bp) -> XfsTransItem* {
+    if (batch == nullptr || bp == nullptr) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < batch->item_count; ++i) {
+        if (xfs_log_item_matches_buffer(batch->items.at(i), bp)) {
+            return &batch->items.at(i);
+        }
+    }
+    return nullptr;
+}
+
+auto xfs_log_transaction_shape(const XfsTransItem* items, int item_count, size_t* dirty_items_out, size_t* body_bytes_out) -> int {
+    if (items == nullptr || item_count < 0 || dirty_items_out == nullptr || body_bytes_out == nullptr) {
+        return -EINVAL;
+    }
+    size_t dirty_items = 0;
+    size_t body_bytes = 0;
+    for (int i = 0; i < item_count; ++i) {
+        if (items[i].type != XfsLogItemType::BUFFER || !items[i].buf.dirty) {
+            continue;
+        }
+        BufHead const* bp = items[i].buf.bp;
+        uint32_t const OFFSET = items[i].buf.offset;
+        uint32_t const LEN = items[i].buf.len;
+        if (bp == nullptr || OFFSET > bp->size || LEN > bp->size - OFFSET || body_bytes > SIZE_MAX - 16U - LEN) {
+            return -EIO;
+        }
+        dirty_items++;
+        body_bytes += 16U + LEN;
+    }
+    *dirty_items_out = dirty_items;
+    *body_bytes_out = body_bytes;
     return 0;
+}
+
+void xfs_log_batch_reset(XfsLogBatch* batch) {
+    if (batch == nullptr) {
+        return;
+    }
+    batch->item_count = 0;
+    batch->body_bytes = 0;
+    batch->transactions = 0;
+}
+
+auto xfs_log_batch_flush_locked(XfsMountContext* mount) -> int {
+    if (active_batch == nullptr || active_batch->mount != mount) {
+        return -EINVAL;
+    }
+    if (active_batch->item_count == 0) {
+        xfs_log_batch_reset(active_batch);
+        return 0;
+    }
+
+    int const RC = xfs_log_write_record_locked(mount, active_batch->items.data(), static_cast<int>(active_batch->item_count));
+    for (size_t i = 0; i < active_batch->item_count; ++i) {
+        XfsTransItem& item = active_batch->items.at(i);
+        if (item.type != XfsLogItemType::BUFFER || item.buf.bp == nullptr) {
+            continue;
+        }
+        bdirty(item.buf.bp);
+        bjournal_release(item.buf.bp);
+        brelse(item.buf.bp);
+        item.buf.bp = nullptr;
+        item.type = XfsLogItemType::NONE;
+    }
+    xfs_log_batch_reset(active_batch);
+    return RC;
+}
+
+auto xfs_log_batch_add_locked(const XfsTransItem* items, int item_count) -> int {
+    if (active_batch == nullptr || items == nullptr || item_count < 0) {
+        return -EINVAL;
+    }
+
+    for (int i = 0; i < item_count; ++i) {
+        if (items[i].type != XfsLogItemType::BUFFER || !items[i].buf.dirty || items[i].buf.bp == nullptr) {
+            continue;
+        }
+
+        BufHead* bp = items[i].buf.bp;
+        uint32_t const OFFSET = items[i].buf.offset;
+        uint32_t const LEN = items[i].buf.len;
+        if (XfsTransItem* existing = xfs_log_batch_find_item(active_batch, bp)) {
+            if (existing->buf.bp != bp) {
+                __builtin_memcpy(existing->buf.bp->data + OFFSET, bp->data + OFFSET, LEN);
+            }
+            uint32_t const OLD_LEN = existing->buf.len;
+            uint32_t const OLD_END = existing->buf.offset + OLD_LEN;
+            uint32_t const NEW_END = OFFSET + LEN;
+            uint32_t const START = std::min(existing->buf.offset, OFFSET);
+            uint32_t const END = std::max(OLD_END, NEW_END);
+            existing->buf.offset = START;
+            existing->buf.len = END - START;
+            active_batch->body_bytes += existing->buf.len - OLD_LEN;
+            continue;
+        }
+
+        if (active_batch->item_count >= active_batch->items.size()) {
+            return -E2BIG;
+        }
+        bp->refcount.fetch_add(1, std::memory_order_relaxed);
+        bjournal_hold(bp);
+        XfsTransItem& dst = active_batch->items.at(active_batch->item_count++);
+        dst.type = XfsLogItemType::BUFFER;
+        dst.buf = items[i].buf;
+        active_batch->body_bytes += 16U + LEN;
+    }
+    active_batch->transactions++;
+    return 0;
+}
+
+}  // anonymous namespace
+
+auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_count, bool* owns_metadata_out) -> int {
+    if (owns_metadata_out != nullptr) {
+        *owns_metadata_out = false;
+    }
+
+    size_t dirty_items = 0;
+    size_t transaction_body_bytes = 0;
+    int const SHAPE_RC = xfs_log_transaction_shape(items, item_count, &dirty_items, &transaction_body_bytes);
+    if (SHAPE_RC != 0) {
+        return SHAPE_RC;
+    }
+    if (dirty_items == 0) {
+        return 0;
+    }
+
+    XfsLogWriteGuard guard;
+    if (mount == nullptr || active_log == nullptr || active_log->mount != mount || !active_log->active || active_batch == nullptr ||
+        active_batch->mount != mount) {
+        return -EINVAL;
+    }
+
+    int result = 0;
+    bool const FLUSH_BEFORE_ADD =
+        active_batch->item_count != 0 && (active_batch->item_count + dirty_items > active_batch->items.size() ||
+                                          active_batch->body_bytes + transaction_body_bytes > XFS_LOG_BATCH_MAX_BODY_BYTES);
+    if (FLUSH_BEFORE_ADD) {
+        result = xfs_log_batch_flush_locked(mount);
+    }
+
+    if (dirty_items > active_batch->items.size()) {
+        return result != 0 ? result : -E2BIG;
+    }
+    int const ADD_RC = xfs_log_batch_add_locked(items, item_count);
+    if (ADD_RC != 0) {
+        return result != 0 ? result : ADD_RC;
+    }
+    if (owns_metadata_out != nullptr) {
+        *owns_metadata_out = true;
+    }
+
+    if (active_batch->transactions >= XFS_LOG_BATCH_MAX_TRANSACTIONS || active_batch->body_bytes >= XFS_LOG_BATCH_MAX_BODY_BYTES) {
+        int const FLUSH_RC = xfs_log_batch_flush_locked(mount);
+        if (result == 0) {
+            result = FLUSH_RC;
+        }
+    }
+    return result;
+}
+
+auto xfs_log_flush(XfsMountContext* mount) -> int {
+    XfsLogWriteGuard guard;
+    if (mount == nullptr || active_log == nullptr || active_log->mount != mount || active_batch == nullptr ||
+        active_batch->mount != mount) {
+        return -EINVAL;
+    }
+    return xfs_log_batch_flush_locked(mount);
 }
 
 }  // namespace ker::vfs::xfs

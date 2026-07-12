@@ -278,6 +278,17 @@ enum class WkiPerfLocalXfsOp : uint8_t {
     READ_GAP = 32,
     METADATA_LOCK_WAIT = 33,
     METADATA_LOCK_HOLD = 34,
+    OPEN_CREATE = 35,
+    CREATE_LOOKUP = 36,
+    IALLOC = 37,
+    DIR_ADD = 38,
+    OPEN_COMMIT = 39,
+    CREATE_TRANS_ALLOC = 40,
+    CREATE_INODE_INIT = 41,
+    CREATE_PATH_INVALIDATE = 42,
+    CREATE_ICACHE = 43,
+    LOG_WRITE = 44,
+    LOG_BLOCKS = 45,
 };
 
 enum class WkiPerfLocalIrqOp : uint8_t {

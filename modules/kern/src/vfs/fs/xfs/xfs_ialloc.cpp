@@ -146,29 +146,6 @@ auto init_inode_chunk(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     return 0;
 }
 
-auto init_allocated_dinode(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int {
-    auto const AGNO = static_cast<xfs_agnumber_t>(ino >> mount->agino_log);
-    auto const AGINO = static_cast<xfs_agino_t>(ino & ((1ULL << mount->agino_log) - 1));
-    xfs_agblock_t const AGBNO = AGINO / mount->inodes_per_block;
-    xfs_fsblock_t const FSBNO = xfs_agbno_to_fsbno(AGNO, AGBNO, mount->ag_blk_log);
-    size_t const OFFSET = static_cast<size_t>(AGINO % mount->inodes_per_block) * mount->inode_size;
-
-    BufHead* bh = xfs_buf_read(mount, FSBNO);
-    if (bh == nullptr) {
-        return -EIO;
-    }
-    if (OFFSET + mount->inode_size > bh->size) {
-        brelse(bh);
-        return -EIO;
-    }
-
-    auto* dip = reinterpret_cast<XfsDinode*>(bh->data + OFFSET);
-    init_free_dinode(mount, dip, ino);
-    xfs_trans_log_buf(tp, bh, static_cast<uint32_t>(OFFSET), static_cast<uint32_t>(mount->inode_size));
-    brelse(bh);
-    return 0;
-}
-
 auto allocate_inode_chunk(XfsMountContext* mount, XfsTransaction* tp) -> xfs_ino_t {
     xfs_extlen_t const CHUNK_BLOCKS = inode_chunk_blocks(mount);
     if (CHUNK_BLOCKS == 0) {
@@ -245,12 +222,7 @@ auto first_free_inode_bit(uint64_t free_mask) -> int {
     if (free_mask == 0) {
         return -1;
     }
-    for (uint32_t bit = 0; bit < XFS_INODES_PER_CHUNK; bit++) {
-        if ((free_mask & inobt_free_mask_for_bit(bit)) != 0) {
-            return static_cast<int>(bit);
-        }
-    }
-    return -1;
+    return __builtin_ctzll(free_mask);
 }
 
 // Try to allocate an inode from a specific AG
@@ -261,95 +233,100 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
         return NULLFSINO;
     }
 
-    // Always search the inobt directly.  Both inobt and finobt records
-    // carry freecount/free_mask, but the finobt uses a different on-disk
-    // magic number (FIB3 vs IAB3).  Using XfsBtreeCursor<XfsInobtTraits>
-    // on finobt blocks causes a magic-validation failure.  Scanning the
-    // inobt is slightly slower but correct; the update path below still
-    // maintains both trees when finobt is present.
-    xfs_agblock_t const ROOT = pag->agi_root;
-    uint32_t const LEVEL = pag->agi_level;
+    bool const TRY_HINT = pag->ialloc_hint_valid;
+    for (int pass = 0; pass < (TRY_HINT ? 2 : 1); ++pass) {
+        xfs_agino_t const SEARCH_START = (pass == 0 && TRY_HINT) ? pag->ialloc_hint_startino : 0;
 
-    // Set up cursor and search for any record (start from the beginning)
-    XfsBtreeCursor<XfsInobtTraits> cur;
-    cur.mount = mount;
-    cur.agno = agno;
+        // Always search the inobt directly.  Both inobt and finobt records
+        // carry freecount/free_mask, but the finobt uses a different on-disk
+        // magic number (FIB3 vs IAB3).  Using XfsBtreeCursor<XfsInobtTraits>
+        // on finobt blocks causes a magic-validation failure.  Scanning the
+        // inobt is slightly slower but correct; the update path below still
+        // maintains both trees when finobt is present.
+        XfsBtreeCursor<XfsInobtTraits> cur;
+        cur.mount = mount;
+        cur.agno = agno;
 
-    XfsInobtTraits::IRec target{};
-    target.startino = 0;  // start from smallest inode number
+        XfsInobtTraits::IRec target{};
+        target.startino = SEARCH_START;
 
-    int rc = xfs_btree_lookup(&cur, ROOT, LEVEL, target, XfsBtreeLookup::GE);
-    if (rc != 0) {
-        return NULLFSINO;
-    }
+        int rc = xfs_btree_lookup(&cur, pag->agi_root, pag->agi_level, target, XfsBtreeLookup::GE);
+        if (rc != 0) {
+            if (SEARCH_START != 0) {
+                continue;
+            }
+            return NULLFSINO;
+        }
 
-    // Scan forward to find a record with free inodes
-    while (true) {
-        XfsInobtTraits::IRec rec = xfs_btree_get_rec(&cur);
+        // Scan forward to find a record with free inodes
+        while (true) {
+            XfsInobtTraits::IRec rec = xfs_btree_get_rec(&cur);
 
-        if (rec.freecount > 0 && rec.free_mask != 0) {
-            // Found a chunk with free inodes
-            int const BIT = first_free_inode_bit(rec.free_mask);
-            if (BIT >= 0 && std::cmp_less(BIT, XFS_INODES_PER_CHUNK)) {
-                xfs_agino_t const AGINO = rec.startino + static_cast<xfs_agino_t>(BIT);
-                xfs_ino_t const INO = (static_cast<xfs_ino_t>(agno) << mount->agino_log) | AGINO;
+            if (rec.freecount > 0 && rec.free_mask != 0) {
+                // Found a chunk with free inodes
+                int const BIT = first_free_inode_bit(rec.free_mask);
+                if (BIT >= 0 && std::cmp_less(BIT, XFS_INODES_PER_CHUNK)) {
+                    xfs_agino_t const AGINO = rec.startino + static_cast<xfs_agino_t>(BIT);
+                    xfs_ino_t const INO = (static_cast<xfs_ino_t>(agno) << mount->agino_log) | AGINO;
 
-                // 1. Clear the bit in ir_free and decrement ir_freecount
-                rec.free_mask &= ~inobt_free_mask_for_bit(static_cast<uint32_t>(BIT));
-                rec.freecount--;
+                    // 1. Clear the bit in ir_free and decrement ir_freecount
+                    rec.free_mask &= ~inobt_free_mask_for_bit(static_cast<uint32_t>(BIT));
+                    rec.freecount--;
+                    pag->ialloc_hint_valid = true;
+                    pag->ialloc_hint_startino =
+                        rec.freecount != 0 ? rec.startino : rec.startino + static_cast<xfs_agino_t>(XFS_INODES_PER_CHUNK);
 
-                // 2-3. Update the inobt record on disk
-                // We need to look up again via the inobt if we used finobt
-                XfsBtreeCursor<XfsInobtTraits> ino_cur;
-                ino_cur.mount = mount;
-                ino_cur.agno = agno;
+                    // 2-3. The inobt cursor already identifies this exact
+                    // record; update it directly instead of traversing the
+                    // same tree a second time.
+                    int urc = xfs_btree_update(&cur, tp, rec);
+                    if (urc != 0) {
+                        return NULLFSINO;
+                    }
 
-                XfsInobtTraits::IRec ino_target{};
-                ino_target.startino = rec.startino;
+                    // 4. Update the finobt if present
+                    if (xfs_has_finobt(mount) && pag->agi_free_root != 0) {
+                        XfsBtreeCursor<XfsFinobtTraits> fi_cur;
+                        fi_cur.mount = mount;
+                        fi_cur.agno = agno;
 
-                int urc = xfs_btree_lookup(&ino_cur, pag->agi_root, pag->agi_level, ino_target, XfsBtreeLookup::GE);
-                if (urc == 0) {
-                    xfs_btree_update(&ino_cur, tp, rec);
-                }
+                        XfsFinobtTraits::IRec fi_target{};
+                        fi_target.startino = rec.startino;
 
-                // 4. Update the finobt if present
-                if (xfs_has_finobt(mount) && pag->agi_free_root != 0) {
-                    XfsBtreeCursor<XfsFinobtTraits> fi_cur;
-                    fi_cur.mount = mount;
-                    fi_cur.agno = agno;
-
-                    XfsFinobtTraits::IRec fi_target{};
-                    fi_target.startino = rec.startino;
-
-                    urc = xfs_btree_lookup(&fi_cur, pag->agi_free_root, pag->agi_free_level, fi_target, XfsBtreeLookup::GE);
-                    if (urc == 0) {
-                        if (rec.freecount == 0) {
-                            // No more free inodes in this chunk - remove from finobt
-                            xfs_btree_delete(&fi_cur, tp);
-                        } else {
-                            xfs_btree_update(&fi_cur, tp, rec);
+                        urc = xfs_btree_lookup(&fi_cur, pag->agi_free_root, pag->agi_free_level, fi_target, XfsBtreeLookup::GE);
+                        if (urc == 0) {
+                            if (rec.freecount == 0) {
+                                // No more free inodes in this chunk - remove from finobt
+                                xfs_btree_delete(&fi_cur, tp);
+                            } else {
+                                xfs_btree_update(&fi_cur, tp, rec);
+                            }
                         }
                     }
-                }
 
-                // 5. Update AGI counters
-                pag->agi_freecount--;
-                log_agi_state(mount, tp, agno, AGINO, true);
+                    // 5. Update AGI counters
+                    pag->agi_freecount--;
+                    log_agi_state(mount, tp, agno, AGINO, true);
 
-                // 6. Ensure the inode buffer has a valid dinode core before
-                // any directory entry can point at it.
-                if (init_allocated_dinode(mount, tp, INO) != 0) {
-                    return NULLFSINO;
-                }
+                    // The create/mkdir/symlink caller logs the initialized
+                    // inode in this same transaction before the inode becomes
+                    // reachable from any committed directory entry. Avoid
+                    // writing a temporary free dinode core that would be
+                    // overwritten during transaction commit.
 #ifdef XFS_DEBUG
-                mod::dbg::log("[xfs ialloc] allocated inode %lu (AG %u agino %u)\n", static_cast<unsigned long>(ino), agno, agino);
+                    mod::dbg::log("[xfs ialloc] allocated inode %lu (AG %u agino %u)\n", static_cast<unsigned long>(ino), agno, agino);
 #endif
-                return INO;
+                    return INO;
+                }
+            }
+
+            rc = xfs_btree_increment(&cur);
+            if (rc != 0) {
+                break;
             }
         }
 
-        rc = xfs_btree_increment(&cur);
-        if (rc != 0) {
+        if (SEARCH_START == 0) {
             break;
         }
     }

@@ -131,6 +131,9 @@ void map_to_kernel_page_table(vaddr_t vaddr, paddr_t paddr, uint64_t flags);
 void map_range_to_kernel_page_table(Range range, uint64_t flags, uint64_t offset);
 // assume hhdm as offset
 void map_range_to_kernel_page_table(Range range, uint64_t flags);
+[[nodiscard]] bool active_pagemap_is(PageTable* pagemap);
+[[nodiscard]] bool user_page_mapped_now(PageTable* pagemap, vaddr_t vaddr);
+[[nodiscard]] bool user_page_writable_now(PageTable* pagemap, vaddr_t vaddr);
 // Sentinel returned by translate() when the virtual address is not mapped.
 // Using (paddr_t)-1 so physical address 0 remains valid.
 static constexpr paddr_t PADDR_INVALID = static_cast<paddr_t>(-1);

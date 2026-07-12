@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/paging.hpp>
@@ -245,6 +246,20 @@ size_t dirty_hard_limit_bytes = BUFFER_CACHE_DEFAULT_SIZE;
 
 uint64_t stat_hits = 0;
 uint64_t stat_misses = 0;
+std::atomic<uint64_t> stat_disk_read_calls{0};
+std::atomic<uint64_t> stat_disk_read_bytes{0};
+std::atomic<uint64_t> stat_metadata_disk_read_calls{0};
+std::atomic<uint64_t> stat_metadata_disk_read_bytes{0};
+std::atomic<uint64_t> stat_data_disk_read_calls{0};
+std::atomic<uint64_t> stat_data_disk_read_bytes{0};
+std::atomic<uint64_t> stat_range_copy_attempts{0};
+std::atomic<uint64_t> stat_range_copy_cover_hits{0};
+std::atomic<uint64_t> stat_range_copy_overlap_hits{0};
+std::atomic<uint64_t> stat_range_copy_no_state{0};
+std::atomic<uint64_t> stat_range_copy_no_overlap{0};
+std::atomic<uint64_t> stat_range_copy_incomplete{0};
+std::atomic<uint64_t> stat_range_copy_overflow{0};
+std::atomic<uint64_t> stat_range_copy_degraded{0};
 std::atomic<uint64_t> next_writeback_epoch{1};
 std::atomic<uint64_t> next_dirty_epoch{1};
 std::atomic<bool> dirty_writeback_queued{false};
@@ -266,14 +281,19 @@ constexpr size_t CLEAN_ALIAS_DISCARD_MAX_BUFFERS = 64;
 constexpr size_t CLEAN_ALIAS_DISCARD_MAX_BYTES = size_t{4} * 1024 * 1024;
 constexpr uint64_t DIRTY_THROTTLE_PARK_TIMEOUT_US = uint64_t{10} * 1000;
 constexpr size_t DIRTY_TARGET_DIVISOR = 2;
+constexpr size_t DIRTY_TARGET_MAX_NUMERATOR = 3;
+constexpr size_t DIRTY_TARGET_MAX_DENOMINATOR = 4;
 constexpr size_t DIRTY_THROTTLE_RESUME_NUMERATOR = 3;
 constexpr size_t DIRTY_THROTTLE_RESUME_DENOMINATOR = 4;
-// Let clean cache grow beyond dirty limits, closer to Linux's page cache shape,
-// while keeping dirty throttling below the point where WOS's non-reclaimable
-// kernel allocations lose large contiguous ranges under file-heavy workloads.
-constexpr size_t BUFFER_CACHE_MEMORY_DIVISOR = 4;
-constexpr size_t DIRTY_TARGET_MEMORY_DIVISOR = 20;
-constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{1} * 1024 * 1024 * 1024;
+// Let clean cache grow beyond dirty limits, closer to Linux's page cache shape.
+// Large-memory self-host checkouts need enough dirty headroom to avoid forcing
+// every few hundred MiB of file creation through synchronous writeback.
+constexpr size_t BUFFER_CACHE_MEMORY_NUMERATOR = 7;
+constexpr size_t BUFFER_CACHE_MEMORY_DENOMINATOR = 16;
+constexpr size_t DIRTY_TARGET_MEMORY_DIVISOR = 8;
+constexpr size_t DIRTY_TARGET_LARGE_MEMORY_DIVISOR = 4;
+constexpr uint64_t DIRTY_TARGET_LARGE_MEMORY_THRESHOLD = uint64_t{8} * 1024 * 1024 * 1024;
+constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{16} * 1024 * 1024 * 1024;
 
 struct DirtyBdevState {
     dev::BlockDevice* bdev{};
@@ -348,6 +368,15 @@ ker::mod::sched::WorkItem dirty_writeback_work{.fn = dirty_writeback_worker, .ar
 constexpr size_t HOT_EVICT_SCAN_BUDGET = 8192;
 constexpr size_t HOT_EVICT_MAX_VICTIMS = 4096;
 constexpr size_t HOT_EVICT_MAX_BYTES = size_t{16} * 1024 * 1024;
+constexpr size_t BUFHEAD_ARENA_BYTES = size_t{256} * 1024;
+constexpr size_t BUFHEAD_STRIDE = (sizeof(BufHead) + alignof(BufHead) - 1) & ~(alignof(BufHead) - 1);
+
+struct BufHeadPool {
+    ker::mod::sys::Spinlock lock;
+    BufHead* free_list{};
+};
+
+BufHeadPool bufhead_pool{};
 
 struct WritebackSnapshot {
     uint8_t* data = nullptr;
@@ -395,18 +424,72 @@ void perf_record_xfs_count(ker::mod::perf::WkiPerfLocalXfsOp op, uint64_t bytes 
     ker::mod::perf::record_local_xfs_summary(op, status, 0, false, bytes);
 }
 
+void add_bufhead_arena_to_pool_locked(void* arena, size_t bytes) {
+    auto* next = static_cast<uint8_t*>(arena);
+    size_t remaining = bytes;
+    while (remaining >= BUFHEAD_STRIDE) {
+        auto* bh = new (next) BufHead{};
+        bh->hash_next = bufhead_pool.free_list;
+        bufhead_pool.free_list = bh;
+        next += BUFHEAD_STRIDE;
+        remaining -= BUFHEAD_STRIDE;
+    }
+}
+
+auto alloc_bufhead() -> BufHead* {
+    auto pop_free = []() -> BufHead* {
+        uint64_t const IRQFLAGS = bufhead_pool.lock.lock_irqsave();
+        BufHead* bh = bufhead_pool.free_list;
+        if (bh != nullptr) {
+            bufhead_pool.free_list = bh->hash_next;
+            bh->hash_next = nullptr;
+        }
+        bufhead_pool.lock.unlock_irqrestore(IRQFLAGS);
+        return bh;
+    };
+
+    if (BufHead* bh = pop_free()) {
+        return bh;
+    }
+
+    void* const ARENA = ker::mod::mm::phys::page_alloc_full_overwrite(BUFHEAD_ARENA_BYTES, "buffer_cache_bufheads");
+    if (ARENA == nullptr) {
+        return new (std::nothrow) BufHead{};
+    }
+
+    uint64_t const IRQFLAGS = bufhead_pool.lock.lock_irqsave();
+    add_bufhead_arena_to_pool_locked(ARENA, BUFHEAD_ARENA_BYTES);
+    BufHead* bh = bufhead_pool.free_list;
+    if (bh != nullptr) {
+        bufhead_pool.free_list = bh->hash_next;
+        bh->hash_next = nullptr;
+    }
+    bufhead_pool.lock.unlock_irqrestore(IRQFLAGS);
+    return bh;
+}
+
+void free_bufhead(BufHead* bh) {
+    if (bh == nullptr) {
+        return;
+    }
+    uint64_t const IRQFLAGS = bufhead_pool.lock.lock_irqsave();
+    bh->hash_next = bufhead_pool.free_list;
+    bufhead_pool.free_list = bh;
+    bufhead_pool.lock.unlock_irqrestore(IRQFLAGS);
+}
+
 auto allocate_buffer_data(size_t size, uint32_t& flags) -> uint8_t* {
     flags &= ~BH_DATA_PAGE_ALLOC;
     if (size > BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES) {
         return nullptr;
     }
     if (size >= ker::mod::mm::paging::PAGE_SIZE && (size % ker::mod::mm::paging::PAGE_SIZE) == 0) {
-        auto* page_data = ker::mod::mm::phys::page_alloc(size, "buffer_cache");
+        auto* page_data = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc_full_overwrite(size, "buffer_cache"));
         if (page_data == nullptr) {
             return nullptr;
         }
         flags |= BH_DATA_PAGE_ALLOC;
-        return static_cast<uint8_t*>(page_data);
+        return page_data;
     }
     return new uint8_t[size];
 }
@@ -472,7 +555,7 @@ void free_unlinked_buffer(BufHead* bh) {
     cache_total_buffers--;
 
     free_buffer_data(bh);
-    delete bh;
+    free_bufhead(bh);
 }
 
 auto clamp_u64_to_size(uint64_t value) -> size_t {
@@ -485,7 +568,7 @@ auto choose_buffer_cache_max_bytes_for_total(uint64_t total_mem) -> size_t {
         return BUFFER_CACHE_DEFAULT_SIZE;
     }
 
-    uint64_t const SCALED = total_mem / BUFFER_CACHE_MEMORY_DIVISOR;
+    uint64_t const SCALED = (total_mem / BUFFER_CACHE_MEMORY_DENOMINATOR) * BUFFER_CACHE_MEMORY_NUMERATOR;
     uint64_t const CLAMPED = std::clamp<uint64_t>(SCALED, BUFFER_CACHE_DEFAULT_SIZE, BUFFER_CACHE_MAX_SIZE);
     return clamp_u64_to_size(CLAMPED);
 }
@@ -496,9 +579,12 @@ auto choose_dirty_target_bytes_for_total(uint64_t total_mem, size_t max_bytes) -
     }
 
     auto const FALLBACK = static_cast<uint64_t>(max_bytes / DIRTY_TARGET_DIVISOR);
-    uint64_t const SCALED = total_mem == 0 ? FALLBACK : total_mem / DIRTY_TARGET_MEMORY_DIVISOR;
+    size_t const MEMORY_DIVISOR =
+        total_mem >= DIRTY_TARGET_LARGE_MEMORY_THRESHOLD ? DIRTY_TARGET_LARGE_MEMORY_DIVISOR : DIRTY_TARGET_MEMORY_DIVISOR;
+    uint64_t const SCALED = total_mem == 0 ? FALLBACK : total_mem / MEMORY_DIVISOR;
     uint64_t const MIN_TARGET = std::min<uint64_t>(ker::mod::mm::paging::PAGE_SIZE, max_bytes);
-    uint64_t const MAX_TARGET = std::max<uint64_t>(MIN_TARGET, max_bytes / DIRTY_TARGET_DIVISOR);
+    uint64_t const MAX_TARGET =
+        std::max<uint64_t>(MIN_TARGET, (static_cast<uint64_t>(max_bytes) * DIRTY_TARGET_MAX_NUMERATOR) / DIRTY_TARGET_MAX_DENOMINATOR);
     uint64_t const CLAMPED = std::clamp<uint64_t>(SCALED, MIN_TARGET, MAX_TARGET);
     return clamp_u64_to_size(CLAMPED);
 }
@@ -507,13 +593,7 @@ auto choose_dirty_hard_limit_bytes(size_t target_bytes, size_t max_bytes) -> siz
     if (target_bytes == 0) {
         return 0;
     }
-    if (max_bytes == 0) {
-        return max_bytes;
-    }
-    if (target_bytes > max_bytes / 2) {
-        return max_bytes;
-    }
-    return std::min(max_bytes, target_bytes * 2);
+    return max_bytes;
 }
 
 // Free a buffer's resources completely (removes from hash + LRU).
@@ -650,7 +730,7 @@ void evict_lru_for_allocation(size_t incoming_bytes) {
 }
 
 auto alloc_detached_buffer_with_size(dev::BlockDevice* bdev, uint64_t block_no, size_t size, uint32_t initial_flags) -> BufHead* {
-    auto* bh = new BufHead{};
+    auto* bh = alloc_bufhead();
     if (bh == nullptr) {
         return nullptr;
     }
@@ -658,7 +738,7 @@ auto alloc_detached_buffer_with_size(dev::BlockDevice* bdev, uint64_t block_no, 
     uint32_t data_flags = 0;
     auto* data = allocate_buffer_data(size, data_flags);
     if (data == nullptr) {
-        delete bh;
+        free_bufhead(bh);
         return nullptr;
     }
 
@@ -666,6 +746,7 @@ auto alloc_detached_buffer_with_size(dev::BlockDevice* bdev, uint64_t block_no, 
     bh->block_no = block_no;
     bh->bdev = bdev;
     bh->refcount.store(1, std::memory_order_relaxed);
+    bh->journal_pending.store(0, std::memory_order_relaxed);
     bh->flags = initial_flags | data_flags;
     bh->size = size;
     bh->tree_priority = buffer_tree_priority_for(bh);
@@ -701,6 +782,7 @@ void insert_allocated_buffer_locked(BufHead* bh) {
     account_buffer_locked(bh);
     hash_insert(bh);
     lru_touch(bh);
+    reclaim_clean_cache_over_limit_locked();
 }
 
 void free_detached_buffer(BufHead* bh) {
@@ -708,7 +790,7 @@ void free_detached_buffer(BufHead* bh) {
         return;
     }
     free_buffer_data(bh);
-    delete bh;
+    free_bufhead(bh);
 }
 
 // Allocate a new BufHead with backing data buffer.
@@ -716,7 +798,19 @@ auto alloc_detached_buffer(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead
     return alloc_detached_buffer_with_size(bdev, block_no, bdev->block_size, 0);
 }
 
-auto read_blocks_with_retry(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* data) -> int {
+void account_disk_read(BufferReadClass read_class, uint64_t bytes) {
+    stat_disk_read_calls.fetch_add(1, std::memory_order_relaxed);
+    stat_disk_read_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (read_class == BufferReadClass::FILESYSTEM_METADATA) {
+        stat_metadata_disk_read_calls.fetch_add(1, std::memory_order_relaxed);
+        stat_metadata_disk_read_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    } else if (read_class == BufferReadClass::FILE_DATA) {
+        stat_data_disk_read_calls.fetch_add(1, std::memory_order_relaxed);
+        stat_data_disk_read_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+}
+
+auto read_blocks_with_retry(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* data, BufferReadClass read_class) -> int {
     constexpr int MAX_ATTEMPTS = 3;
     uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISK_READ);
     int rc = -EIO;
@@ -736,14 +830,15 @@ auto read_blocks_with_retry(dev::BlockDevice* bdev, uint64_t block_no, size_t co
                   static_cast<unsigned long long>(block_no), count, RC, MAX_ATTEMPTS);
         rc = RC;
     }
-    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISK_READ, STARTED_US, rc,
-                          count * static_cast<uint64_t>(bdev->block_size));
+    uint64_t const BYTES = count * static_cast<uint64_t>(bdev->block_size);
+    account_disk_read(read_class, BYTES);
+    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISK_READ, STARTED_US, rc, BYTES);
     return rc;
 }
 
 // Read the block data from disk into an already-allocated buffer.
-auto read_block_from_disk(BufHead* bh) -> int {
-    int const RC = read_blocks_with_retry(bh->bdev, bh->block_no, 1, bh->data);
+auto read_block_from_disk(BufHead* bh, BufferReadClass read_class) -> int {
+    int const RC = read_blocks_with_retry(bh->bdev, bh->block_no, 1, bh->data, read_class);
     if (RC == 0) {
         bh->flags |= BH_VALID;
     }
@@ -1048,6 +1143,29 @@ auto range_tree_overlaps(const BufHead* root, uint64_t block_no, size_t count) -
     return false;
 }
 
+auto range_find_discard_candidate_locked(BufHead* root, dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufHead* {
+    if (root == nullptr || bdev == nullptr || count == 0) {
+        return nullptr;
+    }
+
+    uint64_t const QUERY_LAST = block_range_last_block(block_no, count);
+    if (root->range_left != nullptr && root->range_left->range_subtree_last_block >= block_no) {
+        if (BufHead* found = range_find_discard_candidate_locked(root->range_left, bdev, block_no, count)) {
+            return found;
+        }
+    }
+
+    if (root->bdev == bdev && root->refcount.load(std::memory_order_relaxed) == 0 && root->block_no <= QUERY_LAST &&
+        range_buffer_last_block(root) >= block_no) {
+        return root;
+    }
+
+    if (root->block_no <= QUERY_LAST) {
+        return range_find_discard_candidate_locked(root->range_right, bdev, block_no, count);
+    }
+    return nullptr;
+}
+
 auto cached_buffer_copy_coverage(BufHead* bh, dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst,
                                  std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS>& coverage, size_t& coverage_count,
                                  bool& coverage_overflow) -> bool {
@@ -1086,6 +1204,36 @@ auto cached_buffer_copy_coverage(BufHead* bh, dev::BlockDevice* bdev, uint64_t b
     return !coverage_overflow;
 }
 
+auto cached_buffer_fully_covers(BufHead* bh, dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> bool {
+    if (bh == nullptr || bh->bdev != bdev || bh->data == nullptr || (bh->flags & BH_VALID) == 0 ||
+        bh->refcount.load(std::memory_order_relaxed) != 0) {
+        return false;
+    }
+
+    uint64_t const QUERY_LAST = block_range_last_block(block_no, count);
+    return bh->block_no <= block_no && range_buffer_last_block(bh) >= QUERY_LAST;
+}
+
+void range_find_newest_covering_locked(BufHead* root, dev::BlockDevice* bdev, uint64_t block_no, size_t count, BufHead*& best) {
+    if (root == nullptr) {
+        return;
+    }
+
+    uint64_t const QUERY_LAST = block_range_last_block(block_no, count);
+    if (root->range_left != nullptr && root->range_left->range_subtree_last_block >= QUERY_LAST) {
+        range_find_newest_covering_locked(root->range_left, bdev, block_no, count, best);
+    }
+
+    if (cached_buffer_fully_covers(root, bdev, block_no, count) &&
+        (best == nullptr || root->dirty_epoch > best->dirty_epoch || (root->dirty_epoch == best->dirty_epoch && root->size < best->size))) {
+        best = root;
+    }
+
+    if (root->block_no <= block_no) {
+        range_find_newest_covering_locked(root->range_right, bdev, block_no, count, best);
+    }
+}
+
 void range_copy_cached_overlaps_locked(BufHead* root, dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst,
                                        std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS>& coverage,
                                        size_t& coverage_count, size_t& visit_count, bool& copied, bool& coverage_overflow) {
@@ -1121,18 +1269,43 @@ void range_copy_cached_overlaps_locked(BufHead* root, dev::BlockDevice* bdev, ui
 }
 
 auto copy_cached_bdev_range_if_complete_internal(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst) -> bool {
-    if (bdev == nullptr || bdev->block_size == 0 || count == 0 || dst == nullptr || !cache_initialized || range_index_degraded) {
+    if (bdev == nullptr || bdev->block_size == 0 || count == 0 || dst == nullptr || !cache_initialized) {
         return false;
     }
     if (count > SIZE_MAX / bdev->block_size) {
         return false;
     }
+    stat_range_copy_attempts.fetch_add(1, std::memory_order_relaxed);
+    if (range_index_degraded) {
+        stat_range_copy_degraded.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
 
     uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
     RangeBdevState* state = find_range_bdev_state_locked(bdev);
-    if (state == nullptr || state->buffers == 0 || !range_tree_overlaps(state->tree_root, block_no, count)) {
+    if (state == nullptr || state->buffers == 0) {
+        stat_range_copy_no_state.fetch_add(1, std::memory_order_relaxed);
         cache_lock.unlock_irqrestore(IRQFLAGS);
         return false;
+    }
+    if (!range_tree_overlaps(state->tree_root, block_no, count)) {
+        stat_range_copy_no_overlap.fetch_add(1, std::memory_order_relaxed);
+        cache_lock.unlock_irqrestore(IRQFLAGS);
+        return false;
+    }
+
+    BufHead* covering = nullptr;
+    range_find_newest_covering_locked(state->tree_root, bdev, block_no, count, covering);
+    if (covering != nullptr) {
+        size_t const SRC_OFF = static_cast<size_t>(block_no - covering->block_no) * bdev->block_size;
+        size_t const COPY_BYTES = count * bdev->block_size;
+        std::memcpy(dst, covering->data + SRC_OFF, COPY_BYTES);
+        if (cache_dirty_buffers != 0) {
+            static_cast<void>(copy_dirty_bdev_range_locked(bdev, block_no, count, dst, covering->dirty_epoch));
+        }
+        stat_range_copy_cover_hits.fetch_add(1, std::memory_order_relaxed);
+        cache_lock.unlock_irqrestore(IRQFLAGS);
+        return true;
     }
 
     bool copied = false;
@@ -1145,6 +1318,13 @@ auto copy_cached_bdev_range_if_complete_internal(dev::BlockDevice* bdev, uint64_
     bool const COMPLETE = copied && !coverage_overflow && dirty_coverage_complete(coverage, coverage_count, block_no, count);
     if (COMPLETE && cache_dirty_buffers != 0) {
         static_cast<void>(copy_dirty_bdev_range_locked(bdev, block_no, count, dst, 0));
+    }
+    if (COMPLETE) {
+        stat_range_copy_overlap_hits.fetch_add(1, std::memory_order_relaxed);
+    } else if (coverage_overflow) {
+        stat_range_copy_overflow.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        stat_range_copy_incomplete.fetch_add(1, std::memory_order_relaxed);
     }
     cache_lock.unlock_irqrestore(IRQFLAGS);
     return COMPLETE;
@@ -1630,7 +1810,7 @@ auto dirty_bdev_count_locked() -> size_t {
 }
 
 auto dirty_filter_matches(const BufHead* bh, const DirtyWritebackFilter& filter) -> bool {
-    if (bh == nullptr || (bh->flags & BH_DIRTY) == 0) {
+    if (bh == nullptr || (bh->flags & BH_DIRTY) == 0 || bh->journal_pending.load(std::memory_order_acquire) != 0) {
         return false;
     }
     if (filter.bdev != nullptr && bh->bdev != filter.bdev) {
@@ -2522,11 +2702,25 @@ void buffer_cache_init() {
     dirty_writeback_queued.store(false, std::memory_order_release);
     stat_hits = 0;
     stat_misses = 0;
+    stat_disk_read_calls.store(0, std::memory_order_relaxed);
+    stat_disk_read_bytes.store(0, std::memory_order_relaxed);
+    stat_metadata_disk_read_calls.store(0, std::memory_order_relaxed);
+    stat_metadata_disk_read_bytes.store(0, std::memory_order_relaxed);
+    stat_data_disk_read_calls.store(0, std::memory_order_relaxed);
+    stat_data_disk_read_bytes.store(0, std::memory_order_relaxed);
+    stat_range_copy_attempts.store(0, std::memory_order_relaxed);
+    stat_range_copy_cover_hits.store(0, std::memory_order_relaxed);
+    stat_range_copy_overlap_hits.store(0, std::memory_order_relaxed);
+    stat_range_copy_no_state.store(0, std::memory_order_relaxed);
+    stat_range_copy_no_overlap.store(0, std::memory_order_relaxed);
+    stat_range_copy_incomplete.store(0, std::memory_order_relaxed);
+    stat_range_copy_overflow.store(0, std::memory_order_relaxed);
+    stat_range_copy_degraded.store(0, std::memory_order_relaxed);
     cache_initialized = true;
     log::info("initialized (max %lu bytes)", static_cast<uint64_t>(cache_max_bytes));
 }
 
-auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
+auto bread(dev::BlockDevice* bdev, uint64_t block_no, BufferReadClass read_class) -> BufHead* {
     if (bdev == nullptr) {
         return nullptr;
     }
@@ -2578,7 +2772,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
         copy_dirty_bdev_range_if_complete(bdev, block_no, 1, bh->data)) {
         bh->flags |= BH_VALID;
     } else {
-        int const RC = read_block_from_disk(bh);
+        int const RC = read_block_from_disk(bh, read_class);
         if (RC != 0) {
             free_detached_buffer(bh);
             return nullptr;
@@ -2604,12 +2798,12 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     return bh;
 }
 
-auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufHead* {
+auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count, BufferReadClass read_class) -> BufHead* {
     if (bdev == nullptr || count == 0) {
         return nullptr;
     }
     if (count == 1) {
-        return bread(bdev, block_no);
+        return bread(bdev, block_no, read_class);
     }
     uint64_t const PERF_STARTED_US = perf_xfs_started_us();
 
@@ -2661,7 +2855,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> Buf
         bh->flags |= BH_VALID;
     } else {
         // Read from disk outside the lock
-        int const RC = read_blocks_with_retry(bdev, block_no, count, bh->data);
+        int const RC = read_blocks_with_retry(bdev, block_no, count, bh->data, read_class);
         if (RC != 0) {
             free_detached_buffer(bh);
             return nullptr;
@@ -2696,6 +2890,22 @@ void brelse(BufHead* bh) {
     int32_t const PREV = bh->refcount.fetch_sub(1, std::memory_order_acq_rel);
     if (PREV <= 0) {
         bh->refcount.store(0, std::memory_order_relaxed);
+    }
+}
+
+void bjournal_hold(BufHead* bh) {
+    if (bh != nullptr) {
+        bh->journal_pending.fetch_add(1, std::memory_order_acq_rel);
+    }
+}
+
+void bjournal_release(BufHead* bh) {
+    if (bh == nullptr) {
+        return;
+    }
+    uint32_t const PREV = bh->journal_pending.fetch_sub(1, std::memory_order_acq_rel);
+    if (PREV == 0) {
+        bh->journal_pending.store(0, std::memory_order_release);
     }
 }
 
@@ -2740,7 +2950,8 @@ void bdirty(BufHead* bh) {
     }
 }
 
-auto bget(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
+namespace {
+auto bget_impl(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     if (bdev == nullptr) {
         return nullptr;
     }
@@ -2798,12 +3009,12 @@ auto bget(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     return bh;
 }
 
-auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufHead* {
+auto bget_multi_impl(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufHead* {
     if (bdev == nullptr || count == 0) {
         return nullptr;
     }
     if (count == 1) {
-        return bget(bdev, block_no);
+        return bget_impl(bdev, block_no);
     }
     uint64_t const PERF_STARTED_US = perf_xfs_started_us();
 
@@ -2860,6 +3071,12 @@ auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufH
 
     return bh;
 }
+
+}  // namespace
+
+auto bget(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* { return bget_impl(bdev, block_no); }
+
+auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufHead* { return bget_multi_impl(bdev, block_no, count); }
 
 auto sync_blockdev(dev::BlockDevice* bdev) -> int {
     if (bdev == nullptr) {
@@ -3168,6 +3385,21 @@ void discard_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count)
             cache_lock.unlock_irqrestore(IRQFLAGS);
             return;
         }
+
+        while (state->buffers != 0 && range_tree_overlaps(state->tree_root, block_no, count)) {
+            BufHead* victim = range_find_discard_candidate_locked(state->tree_root, bdev, block_no, count);
+            if (victim == nullptr) {
+                break;
+            }
+            discarded_bytes += victim->size;
+            free_buffer(victim);
+        }
+
+        cache_lock.unlock_irqrestore(IRQFLAGS);
+        if (discarded_bytes != 0) {
+            perf_record_xfs_count(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISCARD, discarded_bytes);
+        }
+        return;
     }
 
     for (auto& hash_bucket : hash_buckets) {
@@ -3209,6 +3441,20 @@ auto buffer_cache_stats() -> BufferCacheStats {
     s.dirty_waiters = dirty_waiters.size();
     s.hits = stat_hits;
     s.misses = stat_misses;
+    s.disk_read_calls = stat_disk_read_calls.load(std::memory_order_relaxed);
+    s.disk_read_bytes = stat_disk_read_bytes.load(std::memory_order_relaxed);
+    s.metadata_disk_read_calls = stat_metadata_disk_read_calls.load(std::memory_order_relaxed);
+    s.metadata_disk_read_bytes = stat_metadata_disk_read_bytes.load(std::memory_order_relaxed);
+    s.data_disk_read_calls = stat_data_disk_read_calls.load(std::memory_order_relaxed);
+    s.data_disk_read_bytes = stat_data_disk_read_bytes.load(std::memory_order_relaxed);
+    s.range_copy_attempts = stat_range_copy_attempts.load(std::memory_order_relaxed);
+    s.range_copy_cover_hits = stat_range_copy_cover_hits.load(std::memory_order_relaxed);
+    s.range_copy_overlap_hits = stat_range_copy_overlap_hits.load(std::memory_order_relaxed);
+    s.range_copy_no_state = stat_range_copy_no_state.load(std::memory_order_relaxed);
+    s.range_copy_no_overlap = stat_range_copy_no_overlap.load(std::memory_order_relaxed);
+    s.range_copy_incomplete = stat_range_copy_incomplete.load(std::memory_order_relaxed);
+    s.range_copy_overflow = stat_range_copy_overflow.load(std::memory_order_relaxed);
+    s.range_copy_degraded = stat_range_copy_degraded.load(std::memory_order_relaxed);
     cache_lock.unlock_irqrestore(IRQFLAGS);
     return s;
 }
@@ -3244,6 +3490,18 @@ auto reclaim_clean_buffer_cache(size_t target_bytes) -> BufferCacheReclaimStats 
     stats = reclaim_clean_cache_locked(target_bytes, SIZE_MAX, SIZE_MAX, SIZE_MAX, false);
     cache_lock.unlock_irqrestore(IRQFLAGS);
     return stats;
+}
+
+auto reclaim_clean_buffer_cache_for_pressure(size_t byte_budget) -> size_t {
+    if (!cache_initialized || byte_budget == 0) {
+        return 0;
+    }
+
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    size_t const TARGET_BYTES = cache_total_bytes > byte_budget ? cache_total_bytes - byte_budget : 0;
+    BufferCacheReclaimStats const STATS = reclaim_clean_cache_locked(TARGET_BYTES, byte_budget, SIZE_MAX, SIZE_MAX, false);
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    return STATS.freed_bytes;
 }
 
 #ifdef WOS_SELFTEST

@@ -27,7 +27,9 @@ defaults to cloning `https://github.com/Pascu-Victor/wos.git`, building the
 `wos_full` target with Qt/wosdbg disabled, and writing
 `selfhost-report.tsv`. It also writes `selfhost-detail.tsv` for the current
 run and appends the same detailed rows to `<workdir>-history.tsv` by default.
-Those detailed rows include root WOS repository fetch time, recursive submodule
+In WOS mode it also writes `selfhost-cache-deltas.tsv` with VFS, XFS dentry,
+and buffer cache counter deltas around each timed step and nested phase. Those
+detailed rows include root WOS repository fetch time, recursive submodule
 update time, configure time, build time, mode, commit, target, job count, and
 shallow/full-history mode. Use `--history-file <path>` to put the append-only
 history somewhere else. The intent is to see whether self-hosting changes move
@@ -68,8 +70,18 @@ Then collect comparable reports:
 
 ```sh
 scripts/bench/run_wos_selfhost_build.sh wos --host wos-0 --jobs 32
-scripts/bench/run_wos_selfhost_build.sh linux --workdir /tmp/wos-selfhost-linux --jobs 32
+scripts/bench/run_wos_selfhost_build.sh linux --workdir /tmp/wos-selfhost-linux \
+  --jobs 32 --skip-bootstrap --host-toolchain "$PWD/toolchain/host"
 ```
+
+The explicit host-toolchain path gives a fresh Linux checkout the same
+preinstalled-toolchain premise used by the native WOS configure. The benchmark
+uses that toolchain's CMake and derives its populated target sysroot from
+`toolchain/sysroot`; pass `--host-sysroot` to override it. This does not seed or
+bypass source checkout work, and compiler ABI probes must complete successfully.
+Immediately before the timed configure step, both modes run the selected CMake
+and Ninja version commands. This keeps executable paging outside the project
+configure interval without warming source-tree metadata or generated files.
 
 When running the script from an existing WOS shell, use `wos-local`; this is
 the same WOS benchmark payload without the outer SSH hop.
@@ -83,6 +95,21 @@ scripts/bench/compare_wos_selfhost_reports.py \
   --wos /root/wos-selfhost-bench/selfhost-report.tsv \
   --linux /tmp/wos-selfhost-linux/selfhost-report.tsv \
   --json-output benchmarks/results/wos-selfhost-comparison.json
+```
+
+For the checkout/configure parity acceptance check, include the detailed timing
+reports. This compares the derived `clone_checkout` time from root repository
+clone plus recursive submodule init/update, and `configure_wos`, with a strict
+WOS/Linux ratio of 1.0:
+
+```sh
+scripts/bench/compare_wos_selfhost_reports.py \
+  --wos /root/wos-selfhost-bench/selfhost-report.tsv \
+  --linux /tmp/wos-selfhost-linux/selfhost-report.tsv \
+  --wos-detail /root/wos-selfhost-bench/selfhost-detail.tsv \
+  --linux-detail /tmp/wos-selfhost-linux/selfhost-detail.tsv \
+  --acceptance-profile checkout-configure \
+  --json-output benchmarks/results/wos-selfhost-acceptance.json
 ```
 
 ## Cross-OS host KVM tracing

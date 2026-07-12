@@ -48,6 +48,7 @@ wos_vfs$unlink(op const[20], path path) int64
 
 wos_vfs$stat(op const[12], path path, buf ptr[out, array[int8, 128]]) int64
 wos_vfs$fstat(op const[13], fd fd, buf ptr[out, array[int8, 128]]) int64
+wos_vfs$fstat_close(op const[61], fd fd, buf ptr[out, array[int8, 144]], stat_result ptr[out, int32]) int64
 
 # --- Dup ---
 

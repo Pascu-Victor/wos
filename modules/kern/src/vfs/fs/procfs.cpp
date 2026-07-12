@@ -2563,6 +2563,20 @@ auto generate_memacc_alloc_totals(char* buf, size_t bufsz) -> size_t {
     append_memacc_dec(p, end, "dirty_waiters", BCACHE.dirty_waiters);
     append_memacc_dec(p, end, "hits", BCACHE.hits);
     append_memacc_dec(p, end, "misses", BCACHE.misses);
+    append_memacc_dec(p, end, "disk_read_calls", BCACHE.disk_read_calls);
+    append_memacc_dec(p, end, "disk_read_bytes", BCACHE.disk_read_bytes);
+    append_memacc_dec(p, end, "metadata_disk_read_calls", BCACHE.metadata_disk_read_calls);
+    append_memacc_dec(p, end, "metadata_disk_read_bytes", BCACHE.metadata_disk_read_bytes);
+    append_memacc_dec(p, end, "data_disk_read_calls", BCACHE.data_disk_read_calls);
+    append_memacc_dec(p, end, "data_disk_read_bytes", BCACHE.data_disk_read_bytes);
+    append_memacc_dec(p, end, "range_copy_attempts", BCACHE.range_copy_attempts);
+    append_memacc_dec(p, end, "range_copy_cover_hits", BCACHE.range_copy_cover_hits);
+    append_memacc_dec(p, end, "range_copy_overlap_hits", BCACHE.range_copy_overlap_hits);
+    append_memacc_dec(p, end, "range_copy_no_state", BCACHE.range_copy_no_state);
+    append_memacc_dec(p, end, "range_copy_no_overlap", BCACHE.range_copy_no_overlap);
+    append_memacc_dec(p, end, "range_copy_incomplete", BCACHE.range_copy_incomplete);
+    append_memacc_dec(p, end, "range_copy_overflow", BCACHE.range_copy_overflow);
+    append_memacc_dec(p, end, "range_copy_degraded", BCACHE.range_copy_degraded);
     append_char(p, end, '\n');
 
     std::array<ker::vfs::BufferCacheBdevStats, 16> bcache_bdevs{};
@@ -2590,6 +2604,9 @@ auto generate_memacc_alloc_totals(char* buf, size_t bufsz) -> size_t {
     append_memacc_dec(p, end, "metadata_miss_conflict", vfs_cache.metadata_miss_conflict);
     append_memacc_dec(p, end, "metadata_path_invalidations", vfs_cache.metadata_path_invalidations);
     append_memacc_dec(p, end, "metadata_generation_resets", vfs_cache.metadata_generation_resets);
+    append_memacc_dec(p, end, "existence_hits", vfs_cache.existence_hits);
+    append_memacc_dec(p, end, "existence_misses", vfs_cache.existence_misses);
+    append_memacc_dec(p, end, "existence_stores", vfs_cache.existence_stores);
     append_memacc_dec(p, end, "symlink_hits", vfs_cache.symlink_hits);
     append_memacc_dec(p, end, "symlink_misses", vfs_cache.symlink_misses);
     append_memacc_dec(p, end, "symlink_stores", vfs_cache.symlink_stores);

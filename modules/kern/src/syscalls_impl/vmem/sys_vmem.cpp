@@ -147,7 +147,7 @@ enum class FileMmapCacheInsertResult : uint8_t {
     EVICTED,
 };
 
-constexpr size_t FILE_MMAP_CACHE_SET_COUNT = 2048;
+constexpr size_t FILE_MMAP_CACHE_SET_COUNT = 32768;
 constexpr size_t FILE_MMAP_CACHE_WAYS = 4;
 constexpr size_t FILE_MMAP_CACHE_PAGES = FILE_MMAP_CACHE_SET_COUNT * FILE_MMAP_CACHE_WAYS;
 static_assert((FILE_MMAP_CACHE_SET_COUNT & (FILE_MMAP_CACHE_SET_COUNT - 1)) == 0);
@@ -813,14 +813,19 @@ auto file_mmap_cached_page_for_file(ker::vfs::File* file, const ker::vfs::Stat& 
     record_local_vmem_cache_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_CACHE_MISS, file_offset,
                                   vmem_latency_since(LOOKUP_STARTED_US), true);
 
-    void* const NEW_PAGE = ker::mod::mm::phys::page_alloc(ker::mod::mm::paging::PAGE_SIZE, "vmem-file-cache");
+    uint64_t const FILE_SIZE = KEY.size;
+    bool const FULL_PAGE_READ =
+        file_offset < FILE_SIZE && FILE_SIZE - file_offset >= static_cast<uint64_t>(ker::mod::mm::paging::PAGE_SIZE);
+    void* const NEW_PAGE = FULL_PAGE_READ ? ker::mod::mm::phys::page_alloc_full_overwrite_page("vmem-file-cache")
+                                          : ker::mod::mm::phys::page_alloc(ker::mod::mm::paging::PAGE_SIZE, "vmem-file-cache");
     if (NEW_PAGE == nullptr) {
         return false;
     }
-    std::memset(NEW_PAGE, 0, ker::mod::mm::paging::PAGE_SIZE);
+    if (!FULL_PAGE_READ) {
+        std::memset(NEW_PAGE, 0, ker::mod::mm::paging::PAGE_SIZE);
+    }
 
     uint64_t const FILL_STARTED_US = ker::mod::time::get_us();
-    uint64_t const FILE_SIZE = KEY.size;
     if (file_offset < FILE_SIZE) {
         size_t const READ_SIZE = static_cast<size_t>(std::min<uint64_t>(ker::mod::mm::paging::PAGE_SIZE, FILE_SIZE - file_offset));
         if (file_offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {

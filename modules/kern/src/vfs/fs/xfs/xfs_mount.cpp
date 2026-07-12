@@ -23,6 +23,7 @@
 #include "vfs/fs/xfs/xfs_dir2.hpp"
 #include "vfs/fs/xfs/xfs_format.hpp"
 #include "vfs/fs/xfs/xfs_inode.hpp"
+#include "vfs/fs/xfs/xfs_log.hpp"
 #include "vfs/fs/xfs/xfs_vfs.hpp"
 
 namespace ker::vfs::xfs {
@@ -87,9 +88,21 @@ auto xfs_buf_read(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead* {
         return nullptr;
     }
     if (dev_count <= 1) {
-        return bread(ctx->device, dev_block);
+        return bread(ctx->device, dev_block, BufferReadClass::FILESYSTEM_METADATA);
     }
-    return bread_multi(ctx->device, dev_block, dev_count);
+    return bread_multi(ctx->device, dev_block, dev_count, BufferReadClass::FILESYSTEM_METADATA);
+}
+
+auto xfs_buf_read_data(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead* {
+    uint64_t dev_block = 0;
+    size_t dev_count = 0;
+    if (!xfs_device_block_span(ctx, xfs_block, 1, dev_block, dev_count)) {
+        return nullptr;
+    }
+    if (dev_count <= 1) {
+        return bread(ctx->device, dev_block, BufferReadClass::FILE_DATA);
+    }
+    return bread_multi(ctx->device, dev_block, dev_count, BufferReadClass::FILE_DATA);
 }
 
 // Read multiple contiguous XFS filesystem blocks.
@@ -100,9 +113,9 @@ auto xfs_buf_read_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) 
         return nullptr;
     }
     if (dev_count <= 1) {
-        return bread(ctx->device, dev_block);
+        return bread(ctx->device, dev_block, BufferReadClass::FILESYSTEM_METADATA);
     }
-    return bread_multi(ctx->device, dev_block, dev_count);
+    return bread_multi(ctx->device, dev_block, dev_count, BufferReadClass::FILESYSTEM_METADATA);
 }
 
 auto xfs_buf_get(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead* {
@@ -418,6 +431,7 @@ void xfs_unmount(XfsMountContext* ctx) {
     if (!ctx->read_only) {
         (void)xfs_sync_mount(ctx);
     }
+    xfs_log_unmount(ctx);
 
     if (ctx->root_inode != nullptr) {
         XfsInode* root_inode = ctx->root_inode;

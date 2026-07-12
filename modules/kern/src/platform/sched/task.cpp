@@ -894,7 +894,9 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     // Copy fixed per-process storage inherited by userspace threads.
     t->fd_cloexec = parent->fd_cloexec;
     t->cwd = parent->cwd;
+    t->cwd_len = parent->cwd_len;
     t->root = parent->root;
+    t->root_len = parent->root_len;
     t->exe_path = parent->exe_path;
     t->uid = parent->uid;
     t->gid = parent->gid;

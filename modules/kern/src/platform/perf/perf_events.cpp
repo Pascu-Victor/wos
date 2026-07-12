@@ -56,7 +56,7 @@ struct WkiPerfSummaryBucket {
 std::array<WkiPerfSummaryBucket, WKI_PERF_SUMMARY_BUCKETS> g_wki_summary{};
 ker::mod::sys::Spinlock g_wki_summary_lock;
 
-constexpr size_t LOCAL_XFS_SUMMARY_BUCKETS = static_cast<size_t>(WkiPerfLocalXfsOp::METADATA_LOCK_HOLD) + 1;
+constexpr size_t LOCAL_XFS_SUMMARY_BUCKETS = static_cast<size_t>(WkiPerfLocalXfsOp::LOG_BLOCKS) + 1;
 
 struct LocalXfsSummaryBucket {
     std::atomic<uint64_t> calls{0};
@@ -658,6 +658,28 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "metadata_lock_wait";
                 case WkiPerfLocalXfsOp::METADATA_LOCK_HOLD:
                     return "metadata_lock_hold";
+                case WkiPerfLocalXfsOp::OPEN_CREATE:
+                    return "open_create";
+                case WkiPerfLocalXfsOp::CREATE_LOOKUP:
+                    return "create_lookup";
+                case WkiPerfLocalXfsOp::IALLOC:
+                    return "ialloc";
+                case WkiPerfLocalXfsOp::DIR_ADD:
+                    return "dir_add";
+                case WkiPerfLocalXfsOp::OPEN_COMMIT:
+                    return "open_commit";
+                case WkiPerfLocalXfsOp::CREATE_TRANS_ALLOC:
+                    return "create_trans_alloc";
+                case WkiPerfLocalXfsOp::CREATE_INODE_INIT:
+                    return "create_inode_init";
+                case WkiPerfLocalXfsOp::CREATE_PATH_INVALIDATE:
+                    return "create_path_invalidate";
+                case WkiPerfLocalXfsOp::CREATE_ICACHE:
+                    return "create_icache";
+                case WkiPerfLocalXfsOp::LOG_WRITE:
+                    return "log_write";
+                case WkiPerfLocalXfsOp::LOG_BLOCKS:
+                    return "log_blocks";
                 default:
                     return "unknown";
             }

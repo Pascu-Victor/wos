@@ -86,8 +86,7 @@ wos_kernel_glob_recurse(CXXFILES src/*.cpp)
 # Exclude test sources unless self-test mode is explicitly enabled.
 # GLOB_RECURSE picks up src/test/*.cpp; strip them in production builds.
 if(NOT WOS_SELFTEST)
-    wos_kernel_glob_recurse(KTEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/test/*.cpp)
-    list(REMOVE_ITEM CXXFILES ${KTEST_SRCS})
+    list(FILTER CXXFILES EXCLUDE REGEX "/src/test/")
 endif()
 
 # Add executable
@@ -443,8 +442,18 @@ target_include_directories(${KERNEL} SYSTEM PRIVATE
 )
 
 # Inject builder identity (user@hostname) into the kernel binary
-execute_process(COMMAND whoami OUTPUT_VARIABLE _WOS_USER OUTPUT_STRIP_TRAILING_WHITESPACE)
-cmake_host_system_information(RESULT _WOS_HOST QUERY HOSTNAME)
+if(DEFINED ENV{USER} AND NOT "$ENV{USER}" STREQUAL "")
+    set(_WOS_USER "$ENV{USER}")
+elseif(DEFINED ENV{LOGNAME} AND NOT "$ENV{LOGNAME}" STREQUAL "")
+    set(_WOS_USER "$ENV{LOGNAME}")
+else()
+    execute_process(COMMAND whoami OUTPUT_VARIABLE _WOS_USER OUTPUT_STRIP_TRAILING_WHITESPACE)
+endif()
+if(DEFINED ENV{HOSTNAME} AND NOT "$ENV{HOSTNAME}" STREQUAL "")
+    set(_WOS_HOST "$ENV{HOSTNAME}")
+else()
+    cmake_host_system_information(RESULT _WOS_HOST QUERY HOSTNAME)
+endif()
 target_compile_definitions(${KERNEL} PRIVATE "WOS_BUILDER=\"${_WOS_USER}@${_WOS_HOST}\"")
 
 target_link_options(${KERNEL} PRIVATE ${CMAKE_LINK_FLAGS})

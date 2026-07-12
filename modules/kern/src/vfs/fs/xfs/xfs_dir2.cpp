@@ -68,6 +68,57 @@ auto xfs_da_hashname(const uint8_t* name, int namelen) -> xfs_dahash_t {
     }
 }
 
+namespace {
+
+auto dir2_name_filter_second_hash(uint32_t hash) -> uint32_t {
+    hash ^= hash >> 16U;
+    hash *= 0x7feb352dU;
+    hash ^= hash >> 15U;
+    return hash;
+}
+
+void dir2_name_filter_add(XfsInode* dp, const char* name, uint16_t namelen) {
+    if (dp == nullptr || name == nullptr || namelen == 0) {
+        return;
+    }
+
+    constexpr size_t FILTER_BITS = XFS_DIR_NAME_FILTER_WORDS * 64;
+    uint32_t const HASH = xfs_da_hashname(reinterpret_cast<const uint8_t*>(name), namelen);
+    size_t const FIRST_BIT = HASH & (FILTER_BITS - 1);
+    size_t const SECOND_BIT = dir2_name_filter_second_hash(HASH) & (FILTER_BITS - 1);
+    dp->dir_name_filter[FIRST_BIT >> 6U] |= 1ULL << (FIRST_BIT & 63U);
+    dp->dir_name_filter[SECOND_BIT >> 6U] |= 1ULL << (SECOND_BIT & 63U);
+}
+
+}  // anonymous namespace
+
+void xfs_dir_name_filter_init_empty(XfsInode* dp) {
+    if (dp == nullptr || !xfs_inode_isdir(dp)) {
+        return;
+    }
+
+    for (auto& word : dp->dir_name_filter) {
+        word = 0;
+    }
+    dp->dir_name_filter_complete = true;
+    dir2_name_filter_add(dp, ".", 1);
+    dir2_name_filter_add(dp, "..", 2);
+}
+
+auto xfs_dir_name_filter_known_absent(const XfsInode* dp, const char* name, uint16_t namelen) -> bool {
+    if (dp == nullptr || name == nullptr || namelen == 0 || !xfs_inode_isdir(dp) || !dp->dir_name_filter_complete) {
+        return false;
+    }
+
+    constexpr size_t FILTER_BITS = XFS_DIR_NAME_FILTER_WORDS * 64;
+    uint32_t const HASH = xfs_da_hashname(reinterpret_cast<const uint8_t*>(name), namelen);
+    size_t const FIRST_BIT = HASH & (FILTER_BITS - 1);
+    size_t const SECOND_BIT = dir2_name_filter_second_hash(HASH) & (FILTER_BITS - 1);
+    uint64_t const FIRST_MASK = 1ULL << (FIRST_BIT & 63U);
+    uint64_t const SECOND_MASK = 1ULL << (SECOND_BIT & 63U);
+    return (dp->dir_name_filter[FIRST_BIT >> 6U] & FIRST_MASK) == 0 || (dp->dir_name_filter[SECOND_BIT >> 6U] & SECOND_MASK) == 0;
+}
+
 // ============================================================================
 // Directory entry size helpers
 // ============================================================================
@@ -267,57 +318,27 @@ auto dir2_data_unused_at_if_valid(const uint8_t* block, size_t offset, size_t da
     return true;
 }
 
-auto dir2_block_linear_lookup(const XfsMountContext* ctx, const uint8_t* block, size_t data_start, size_t data_end, const char* name,
-                              uint16_t namelen, XfsDirEntry* entry) -> int {
-    size_t offset = data_start;
-    while (offset < data_end) {
-        if (offset + sizeof(XfsDir2DataUnused) > data_end) {
-            break;
-        }
-
-        uint16_t free_len = 0;
-        if (dir2_data_unused_at_if_valid(block, offset, data_end, &free_len)) {
-            offset += free_len;
-            continue;
-        }
-
-        const XfsDir2DataEntry* dep = nullptr;
-        size_t dep_size = 0;
-        if (!dir2_data_entry_at_if_valid(ctx, block, offset, data_end, &dep, &dep_size)) {
-            break;
-        }
-
-        if (dep->namelen == namelen && __builtin_memcmp(xfs_dir2_data_entry_name(dep), name, namelen) == 0) {
-            fill_dir_entry(ctx, dep, entry);
-            return 0;
-        }
-
-        offset += dep_size;
-    }
-
-    return -ENOENT;
-}
-
-// Large source checkouts and compiler tree scans revisit far more than 4096
-// directory names. Keep this fixed-size and bounded while reducing set churn
-// in hot XFS path walks.
-constexpr size_t XFS_DENTRY_CACHE_SET_COUNT = 4096;
+// Large source checkouts and compiler tree scans revisit far more directory
+// names than small fixed tables can retain. Keep this static and bounded while
+// reducing set churn in hot XFS path walks.
+constexpr size_t XFS_DENTRY_CACHE_SET_COUNT = 65536;
 constexpr size_t XFS_DENTRY_CACHE_WAYS = 4;
-constexpr size_t XFS_DENTRY_GENERATION_SET_COUNT = 4096;
+constexpr size_t XFS_DENTRY_GENERATION_SET_COUNT = 16384;
 constexpr size_t XFS_DENTRY_GENERATION_WAYS = 4;
 static_assert((XFS_DENTRY_CACHE_SET_COUNT & (XFS_DENTRY_CACHE_SET_COUNT - 1)) == 0);
 static_assert((XFS_DENTRY_GENERATION_SET_COUNT & (XFS_DENTRY_GENERATION_SET_COUNT - 1)) == 0);
 
 struct XfsDentryCacheEntry {
     std::array<char, 256> name{};
-    XfsDirEntry entry{};
     XfsMountContext* mount{};
     xfs_ino_t parent_ino{};
+    xfs_ino_t ino{};
     uint64_t hash{};
     uint64_t dir_generation{};
     uint64_t last_used{};
     uint16_t namelen{};
     int result{};
+    uint8_t ftype{};
     bool valid{};
 };
 
@@ -405,21 +426,22 @@ auto xfs_dentry_cache_dir_generation_locked(XfsDentryGenerationSet& set, XfsMoun
     return GENERATION;
 }
 
-auto xfs_dentry_cache_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry, int* result) -> bool {
-    if (dp == nullptr || dp->mount == nullptr || name == nullptr || entry == nullptr || result == nullptr || namelen >= 256) {
+auto xfs_dentry_cache_lookup_impl(XfsMountContext* mount, xfs_ino_t parent_ino, const char* name, uint16_t namelen, XfsDirEntry* entry,
+                                  int* result) -> bool {
+    if (mount == nullptr || parent_ino == NULLFSINO || name == nullptr || entry == nullptr || result == nullptr || namelen >= 256) {
         return false;
     }
 
-    uint64_t const HASH = xfs_dentry_hash_name(dp->mount, dp->ino, name, namelen);
-    uint64_t const DIR_HASH = xfs_dentry_hash_dir(dp->mount, dp->ino);
+    uint64_t const HASH = xfs_dentry_hash_name(mount, parent_ino, name, namelen);
+    uint64_t const DIR_HASH = xfs_dentry_hash_dir(mount, parent_ino);
     auto& generation_set = g_xfs_dentry_generations.at(DIR_HASH & (XFS_DENTRY_GENERATION_SET_COUNT - 1));
     auto& set = g_xfs_dentry_cache.at(HASH & (XFS_DENTRY_CACHE_SET_COUNT - 1));
 
     uint64_t const GENERATION_IRQF = generation_set.lock.lock_irqsave();
-    uint64_t const DIR_GENERATION = xfs_dentry_cache_dir_generation_locked(generation_set, dp->mount, dp->ino, DIR_HASH);
+    uint64_t const DIR_GENERATION = xfs_dentry_cache_dir_generation_locked(generation_set, mount, parent_ino, DIR_HASH);
     uint64_t const CACHE_IRQF = set.lock.lock_irqsave();
     for (auto& candidate : set.ways) {
-        if (!candidate.valid || candidate.hash != HASH || candidate.mount != dp->mount || candidate.parent_ino != dp->ino ||
+        if (!candidate.valid || candidate.hash != HASH || candidate.mount != mount || candidate.parent_ino != parent_ino ||
             candidate.namelen != namelen || candidate.dir_generation != DIR_GENERATION) {
             continue;
         }
@@ -430,7 +452,11 @@ auto xfs_dentry_cache_lookup(XfsInode* dp, const char* name, uint16_t namelen, X
         candidate.last_used = ++set.clock;
         *result = candidate.result;
         if (candidate.result == 0) {
-            *entry = candidate.entry;
+            entry->ino = candidate.ino;
+            entry->ftype = candidate.ftype;
+            entry->namelen = candidate.namelen;
+            entry->cookie = 0;
+            std::memcpy(entry->name.data(), candidate.name.data(), candidate.namelen + 1);
         }
         set.lock.unlock_irqrestore(CACHE_IRQF);
         generation_set.lock.unlock_irqrestore(GENERATION_IRQF);
@@ -441,6 +467,13 @@ auto xfs_dentry_cache_lookup(XfsInode* dp, const char* name, uint16_t namelen, X
     generation_set.lock.unlock_irqrestore(GENERATION_IRQF);
     g_xfs_dentry_misses.fetch_add(1, std::memory_order_relaxed);
     return false;
+}
+
+auto xfs_dentry_cache_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry, int* result) -> bool {
+    if (dp == nullptr) {
+        return false;
+    }
+    return xfs_dentry_cache_lookup_impl(dp->mount, dp->ino, name, namelen, entry, result);
 }
 
 void xfs_dentry_cache_store(XfsInode* dp, const char* name, uint16_t namelen, int result, const XfsDirEntry* entry) {
@@ -482,12 +515,13 @@ void xfs_dentry_cache_store(XfsInode* dp, const char* name, uint16_t namelen, in
     victim->name.at(namelen) = '\0';
     victim->mount = dp->mount;
     victim->parent_ino = dp->ino;
+    victim->ino = result == 0 ? entry->ino : NULLFSINO;
     victim->hash = HASH;
     victim->dir_generation = DIR_GENERATION;
     victim->last_used = USE_STAMP;
     victim->namelen = namelen;
     victim->result = result;
-    victim->entry = (result == 0) ? *entry : XfsDirEntry{};
+    victim->ftype = result == 0 ? entry->ftype : XFS_DIR3_FT_UNKNOWN;
     victim->valid = true;
     set.lock.unlock_irqrestore(CACHE_IRQF);
     generation_set.lock.unlock_irqrestore(GENERATION_IRQF);
@@ -853,14 +887,11 @@ auto dir2_sf_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
 // Block-format directory operations
 // ============================================================================
 
-auto dir2_block_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry) -> int {
+auto dir2_block_lookup_loaded(XfsInode* dp, BufHead* bh, const char* name, uint16_t namelen, XfsDirEntry* entry, bool log_bad_magic)
+    -> int {
     XfsMountContext const* ctx = dp->mount;
-
-    // Read the single directory block
-    BufHead* bh = nullptr;
-    int const RC = dir2_read_block(dp, 0, &bh);
-    if (RC != 0) {
-        return RC;
+    if (bh == nullptr || bh->data == nullptr) {
+        return -EIO;
     }
 
     const uint8_t* block = bh->data;
@@ -870,9 +901,10 @@ auto dir2_block_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirE
     const auto* hdr = reinterpret_cast<const XfsDir3DataHdr*>(block);
     uint32_t const MAGIC = hdr->hdr.magic.to_cpu();
     if (MAGIC != XFS_DIR3_BLOCK_MAGIC) {
-        dir2_log_bad_magic("block-lookup", dp, 0, bh, MAGIC);
-        brelse(bh);
-        return -EINVAL;
+        if (log_bad_magic) {
+            dir2_log_bad_magic("block-lookup", dp, 0, bh, MAGIC);
+        }
+        return -EAGAIN;
     }
 
     // Block tail is at the very end of the block
@@ -883,12 +915,10 @@ auto dir2_block_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirE
     size_t const DATA_START = sizeof(XfsDir3DataHdr);
     size_t const LEAF_BYTES = static_cast<size_t>(LEAF_COUNT) * sizeof(XfsDir2LeafEntry);
     if (LEAF_BYTES > BLKSIZE - DATA_START - sizeof(XfsDir2BlockTail)) {
-        brelse(bh);
         return -EINVAL;
     }
     size_t const DATA_END = BLKSIZE - sizeof(XfsDir2BlockTail) - LEAF_BYTES;
     if (DATA_END <= DATA_START) {
-        brelse(bh);
         return -EINVAL;
     }
 
@@ -918,9 +948,7 @@ auto dir2_block_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirE
     }
 
     if (!found) {
-        int const FALLBACK = dir2_block_linear_lookup(ctx, block, DATA_START, DATA_END, name, namelen, entry);
-        brelse(bh);
-        return FALLBACK;
+        return -ENOENT;
     }
 
     // Back up to the first entry with this hash
@@ -947,14 +975,11 @@ auto dir2_block_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirE
 
         if (dep->namelen == namelen && __builtin_memcmp(xfs_dir2_data_entry_name(dep), name, namelen) == 0) {
             fill_dir_entry(ctx, dep, entry);
-            brelse(bh);
             return 0;
         }
     }
 
-    int const FALLBACK = dir2_block_linear_lookup(ctx, block, DATA_START, DATA_END, name, namelen, entry);
-    brelse(bh);
-    return FALLBACK;
+    return -ENOENT;
 }
 
 auto dir2_block_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
@@ -1084,6 +1109,130 @@ auto dir2_scan_data_block(XfsInode* dp, xfs_dir2_db_t db, XfsDirIterFn fn, void*
     return 0;
 }
 
+auto dir2_leaf_index_known_complete(const XfsInode* dp) -> bool {
+    return dp != nullptr && dp->dir_leaf_index_complete && dp->dir_leaf_index_complete_generation == dp->dir_generation;
+}
+
+void dir2_leaf_index_note_complete(XfsInode* dp) {
+    if (dp == nullptr) {
+        return;
+    }
+    dp->dir_leaf_index_complete_generation = dp->dir_generation;
+    dp->dir_leaf_index_complete = true;
+}
+
+void dir2_leaf_index_note_unknown(XfsInode* dp) {
+    if (dp == nullptr) {
+        return;
+    }
+    dp->dir_leaf_index_complete = false;
+    dp->dir_leaf_index_complete_generation = 0;
+}
+
+auto dir2_leaf_entries_contain_dataptr(const XfsDir2LeafEntry* entries, size_t count, xfs_dahash_t hash, xfs_dir2_dataptr_t dataptr)
+    -> bool {
+    if (entries == nullptr || count == 0 || dataptr == XFS_DIR2_NULL_DATAPTR) {
+        return false;
+    }
+
+    int lo = 0;
+    int hi = static_cast<int>(count) - 1;
+    int mid = -1;
+    bool found = false;
+    while (lo <= hi) {
+        mid = (lo + hi) / 2;
+        uint32_t const ENTRY_HASH = entries[mid].hashval.to_cpu();
+        if (hash < ENTRY_HASH) {
+            hi = mid - 1;
+        } else if (hash > ENTRY_HASH) {
+            lo = mid + 1;
+        } else {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return false;
+    }
+
+    while (mid > 0 && entries[mid - 1].hashval.to_cpu() == hash) {
+        mid--;
+    }
+    for (int i = mid; std::cmp_less(i, count); ++i) {
+        if (entries[i].hashval.to_cpu() != hash) {
+            break;
+        }
+        if (entries[i].address.to_cpu() == dataptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto dir2_db_off_to_dataptr(const XfsMountContext* ctx, xfs_dir2_db_t db, size_t off) -> xfs_dir2_dataptr_t;
+
+auto dir2_leaf_node_linear_scan(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry,
+                                const XfsDir2LeafEntry* leaf_entries = nullptr, size_t leaf_count = 0,
+                                bool prove_leaf_index_complete = false) -> int {
+    XfsMountContext* ctx = dp->mount;
+    bool leaf_index_complete = prove_leaf_index_complete && leaf_entries != nullptr;
+
+    uint64_t nblocks = dp->size >> (ctx->block_log + ctx->dir_blk_log);
+    if (nblocks == 0) {
+        nblocks = 1;
+    }
+
+    for (xfs_dir2_db_t db = 0; db < nblocks; db++) {
+        BufHead* data_bh = nullptr;
+        int const RC = dir2_read_block(dp, db, &data_bh);
+        if (RC != 0) {
+            leaf_index_complete = false;
+            continue;
+        }
+
+        const uint8_t* block = data_bh->data;
+        size_t const BLKSIZE = ctx->dir_blk_size;
+        size_t offset = sizeof(XfsDir3DataHdr);
+
+        while (offset + sizeof(XfsDir2DataUnused) <= BLKSIZE) {
+            uint16_t free_len = 0;
+            if (dir2_data_unused_at_if_valid(block, offset, BLKSIZE, &free_len)) {
+                offset += free_len;
+                continue;
+            }
+
+            const XfsDir2DataEntry* dep = nullptr;
+            size_t dep_size = 0;
+            if (!dir2_data_entry_at_if_valid(ctx, block, offset, BLKSIZE, &dep, &dep_size)) {
+                leaf_index_complete = false;
+                break;
+            }
+
+            if (leaf_index_complete) {
+                xfs_dahash_t const ENTRY_HASH = xfs_da_hashname(xfs_dir2_data_entry_name(dep), dep->namelen);
+                xfs_dir2_dataptr_t const DATAPTR = dir2_db_off_to_dataptr(ctx, db, offset);
+                if (!dir2_leaf_entries_contain_dataptr(leaf_entries, leaf_count, ENTRY_HASH, DATAPTR)) {
+                    leaf_index_complete = false;
+                }
+            }
+
+            if (dep->namelen == namelen && __builtin_memcmp(xfs_dir2_data_entry_name(dep), name, namelen) == 0) {
+                fill_dir_entry(ctx, dep, entry);
+                brelse(data_bh);
+                return 0;
+            }
+
+            offset += dep_size;
+        }
+        brelse(data_bh);
+    }
+
+    if (leaf_index_complete) {
+        dir2_leaf_index_note_complete(dp);
+    }
+    return -ENOENT;
+}
+
 // Lookup in leaf/node format: find the name by scanning data blocks
 // using the bmap to resolve block addresses.
 auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry) -> int {
@@ -1102,7 +1251,7 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
     if (rc != 0 || bmap.is_hole) {
         // No leaf block - might be single-block or corrupt
         // Fall back to linear scan of data blocks
-        goto linear_scan;
+        return dir2_leaf_node_linear_scan(dp, name, namelen, entry);
     }
 
     {
@@ -1115,7 +1264,7 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
             leaf_bh = xfs_buf_read_multi(ctx, bmap.startblock, FBS);
         }
         if (leaf_bh == nullptr) {
-            goto linear_scan;
+            return dir2_leaf_node_linear_scan(dp, name, namelen, entry);
         }
 
         const uint8_t* leaf_data = leaf_bh->data;
@@ -1126,7 +1275,7 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
 
         if (LEAF_MAGIC != XFS_DIR3_LEAF_MAGIC && LEAF_MAGIC != XFS_DIR3_LEAFN_MAGIC) {
             brelse(leaf_bh);
-            goto linear_scan;
+            return dir2_leaf_node_linear_scan(dp, name, namelen, entry);
         }
 
         // Leaf entries start after the leaf header.
@@ -1143,7 +1292,7 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
         size_t const LEAF_CAPACITY = (ctx->dir_blk_size - LEAF_HDR_SIZE) / sizeof(XfsDir2LeafEntry);
         if (leaf_count > LEAF_CAPACITY) {
             brelse(leaf_bh);
-            goto linear_scan;
+            return dir2_leaf_node_linear_scan(dp, name, namelen, entry);
         }
         bool const LEAF_INDEX_FULL = leaf_count >= LEAF_CAPACITY;
 
@@ -1169,10 +1318,16 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
         }
 
         if (!found) {
-            brelse(leaf_bh);
             if (LEAF_INDEX_FULL) {
-                goto linear_scan;
+                if (dir2_leaf_index_known_complete(dp)) {
+                    brelse(leaf_bh);
+                    return -ENOENT;
+                }
+                int const SCAN_RET = dir2_leaf_node_linear_scan(dp, name, namelen, entry, lep, leaf_count, true);
+                brelse(leaf_bh);
+                return SCAN_RET;
             }
+            brelse(leaf_bh);
             return -ENOENT;
         }
 
@@ -1214,58 +1369,18 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
             brelse(data_bh);
         }
 
-        brelse(leaf_bh);
         if (LEAF_INDEX_FULL) {
-            goto linear_scan;
+            if (dir2_leaf_index_known_complete(dp)) {
+                brelse(leaf_bh);
+                return -ENOENT;
+            }
+            int const SCAN_RET = dir2_leaf_node_linear_scan(dp, name, namelen, entry, lep, leaf_count, true);
+            brelse(leaf_bh);
+            return SCAN_RET;
         }
+        brelse(leaf_bh);
         return -ENOENT;
     }
-
-linear_scan:
-    // Fall back to scanning data blocks sequentially
-    {
-        // Estimate number of data blocks from file size
-        uint64_t nblocks = dp->size >> (ctx->block_log + ctx->dir_blk_log);
-        if (nblocks == 0) {
-            nblocks = 1;
-        }
-
-        for (xfs_dir2_db_t db = 0; db < nblocks; db++) {
-            BufHead* data_bh = nullptr;
-            rc = dir2_read_block(dp, db, &data_bh);
-            if (rc != 0) {
-                continue;
-            }
-
-            const uint8_t* block = data_bh->data;
-            size_t const BLKSIZE = ctx->dir_blk_size;
-            size_t offset = sizeof(XfsDir3DataHdr);
-
-            while (offset + sizeof(XfsDir2DataUnused) <= BLKSIZE) {
-                uint16_t free_len = 0;
-                if (dir2_data_unused_at_if_valid(block, offset, BLKSIZE, &free_len)) {
-                    offset += free_len;
-                    continue;
-                }
-
-                const XfsDir2DataEntry* dep = nullptr;
-                size_t dep_size = 0;
-                if (!dir2_data_entry_at_if_valid(ctx, block, offset, BLKSIZE, &dep, &dep_size)) {
-                    break;
-                }
-
-                if (dep->namelen == namelen && __builtin_memcmp(xfs_dir2_data_entry_name(dep), name, namelen) == 0) {
-                    fill_dir_entry(ctx, dep, entry);
-                    brelse(data_bh);
-                    return 0;
-                }
-
-                offset += dep_size;
-            }
-            brelse(data_bh);
-        }
-    }
-
     return -ENOENT;
 }
 
@@ -1297,11 +1412,51 @@ auto dir2_leaf_node_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> in
     return 0;
 }
 
+auto dir2_extent_or_btree_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry) -> int {
+    XfsMountContext const* ctx = dp->mount;
+
+    BufHead* bh = nullptr;
+    int const RC = dir2_read_block(dp, 0, &bh);
+    if (RC != 0 || bh == nullptr || bh->data == nullptr) {
+        if (bh != nullptr) {
+            brelse(bh);
+        }
+        if (dp->size <= ctx->dir_blk_size) {
+            return RC != 0 ? RC : -EIO;
+        }
+        return dir2_leaf_node_lookup(dp, name, namelen, entry);
+    }
+
+    const auto* hdr = reinterpret_cast<const XfsDir3DataHdr*>(bh->data);
+    uint32_t const MAGIC = hdr->hdr.magic.to_cpu();
+    if (MAGIC == XFS_DIR3_BLOCK_MAGIC) {
+        int const RESULT = dir2_block_lookup_loaded(dp, bh, name, namelen, entry, false);
+        brelse(bh);
+        return RESULT == -EAGAIN ? -EINVAL : RESULT;
+    }
+    if (MAGIC == XFS_DIR3_DATA_MAGIC) {
+        brelse(bh);
+        return dir2_leaf_node_lookup(dp, name, namelen, entry);
+    }
+
+    dir2_log_bad_magic("format-detect", dp, 0, bh, MAGIC);
+    brelse(bh);
+    if (dp->size <= ctx->dir_blk_size) {
+        return -EINVAL;
+    }
+    return dir2_leaf_node_lookup(dp, name, namelen, entry);
+}
+
 }  // anonymous namespace
 
 // ============================================================================
 // Public API
 // ============================================================================
+
+auto xfs_dentry_cache_lookup_parent(XfsMountContext* mount, xfs_ino_t parent_ino, const char* name, uint16_t namelen, XfsDirEntry* entry,
+                                    int* result) -> bool {
+    return xfs_dentry_cache_lookup_impl(mount, parent_ino, name, namelen, entry, result);
+}
 
 auto xfs_dir_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry) -> int {
     if (dp == nullptr || name == nullptr || entry == nullptr) {
@@ -1327,11 +1482,7 @@ auto xfs_dir_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntr
 
         case XFS_DINODE_FMT_EXTENTS:
         case XFS_DINODE_FMT_BTREE: {
-            if (dir2_is_single_block_dir(dp)) {
-                result = dir2_block_lookup(dp, name, namelen, entry);
-            } else {
-                result = dir2_leaf_node_lookup(dp, name, namelen, entry);
-            }
+            result = dir2_extent_or_btree_lookup(dp, name, namelen, entry);
             break;
         }
 
@@ -1341,6 +1492,13 @@ auto xfs_dir_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntr
     }
     xfs_dentry_cache_store(dp, name, namelen, result, entry);
     return result;
+}
+
+void xfs_dir_observe_entry(XfsInode* dp, const XfsDirEntry* entry) {
+    if (dp == nullptr || entry == nullptr || entry->namelen == 0) {
+        return;
+    }
+    xfs_dentry_cache_store(dp, entry->name.data(), entry->namelen, 0, entry);
 }
 
 auto xfs_dir_iterate(XfsInode* dp, XfsDirIterFn fn, void* ctx) -> int {
@@ -3165,7 +3323,8 @@ auto dir2_leaf_node_removename(XfsInode* dp, const char* name, uint16_t namelen,
 
 }  // anonymous namespace
 
-auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t ino, uint8_t ftype, XfsTransaction* tp) -> int {
+auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t ino, uint8_t ftype, XfsTransaction* tp,
+                     bool name_known_absent) -> int {
     if (dp == nullptr || name == nullptr || namelen == 0 || tp == nullptr) {
         return -EINVAL;
     }
@@ -3173,11 +3332,14 @@ auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
         return -ENOTDIR;
     }
 
-    // Check that the name doesn't already exist
-    XfsDirEntry existing{};
-    int rc = xfs_dir_lookup(dp, name, namelen, &existing);
-    if (rc == 0) {
-        return -EEXIST;
+    int rc = 0;
+    if (!name_known_absent && !xfs_dir_name_filter_known_absent(dp, name, namelen)) {
+        // Check that the name doesn't already exist.
+        XfsDirEntry existing{};
+        rc = xfs_dir_lookup(dp, name, namelen, &existing);
+        if (rc == 0) {
+            return -EEXIST;
+        }
     }
 
     switch (dp->data_fork.format) {
@@ -3221,6 +3383,11 @@ auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
             return -EINVAL;
     }
     if (rc == 0) {
+        dp->dir_generation++;
+        dir2_leaf_index_note_unknown(dp);
+        if (dp->dir_name_filter_complete) {
+            dir2_name_filter_add(dp, name, namelen);
+        }
         xfs_dentry_cache_store_added_name(dp, name, namelen, ino, ftype);
     }
     return rc;
@@ -3256,6 +3423,8 @@ auto xfs_dir_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTra
             return -EINVAL;
     }
     if (rc == 0) {
+        dp->dir_generation++;
+        dir2_leaf_index_note_unknown(dp);
         xfs_dentry_cache_store(dp, name, namelen, -ENOENT, nullptr);
     }
     return rc;
@@ -3361,6 +3530,153 @@ auto xfs_selftest_dentry_cache_shortform() -> bool {
     XfsDentryCacheStats after_invalidate{};
     xfs_dentry_cache_stats(after_invalidate);
     return after_invalidate.misses > after_hit.misses && after_invalidate.invalidations > after_hit.invalidations;
+}
+
+auto xfs_selftest_block_lookup_uses_leaf_index_for_misses() -> bool {
+    XfsMountContext mount{};
+    mount.block_size = 4096;
+    mount.block_log = 12;
+    mount.dir_blk_size = 4096;
+    mount.dir_blk_log = 0;
+    mount.inode_size = 512;
+    mount.feat_incompat = XFS_SB_FEAT_INCOMPAT_FTYPE;
+
+    XfsInode dir{};
+    dir.ino = 100;
+    dir.mount = &mount;
+    dir.mode = 0040755;
+
+    std::array<uint8_t, 4096> block{};
+    auto* hdr = reinterpret_cast<XfsDir3DataHdr*>(block.data());
+    hdr->hdr.magic = Be32::from_cpu(XFS_DIR3_BLOCK_MAGIC);
+    hdr->hdr.owner = Be64::from_cpu(dir.ino);
+
+    constexpr size_t LEAF_COUNT = 1;
+    size_t const DATA_START = sizeof(XfsDir3DataHdr);
+    size_t const LEAF_BYTES = LEAF_COUNT * sizeof(XfsDir2LeafEntry);
+    size_t const DATA_END = mount.dir_blk_size - sizeof(XfsDir2BlockTail) - LEAF_BYTES;
+
+    auto write_entry = [&mount, &block](size_t off, const char* name, uint16_t namelen, xfs_ino_t ino, uint8_t ftype) -> size_t {
+        size_t const ENTRY_SIZE = dir2_data_entsize(&mount, static_cast<uint8_t>(namelen));
+        auto* dep = reinterpret_cast<XfsDir2DataEntry*>(block.data() + off);
+        dep->inumber = Be64::from_cpu(ino);
+        dep->namelen = static_cast<uint8_t>(namelen);
+        std::memcpy(xfs_dir2_data_entry_name(dep), name, namelen);
+        xfs_dir2_data_entry_name(dep)[namelen] = ftype;
+
+        size_t const USED = 8 + 1 + namelen + 1;
+        size_t const PAD_START = off + USED;
+        size_t const PAD_END = off + ENTRY_SIZE - sizeof(Be16);
+        if (PAD_END > PAD_START) {
+            std::memset(block.data() + PAD_START, 0, PAD_END - PAD_START);
+        }
+
+        auto* tag = reinterpret_cast<Be16*>(block.data() + off + ENTRY_SIZE - sizeof(Be16));
+        *tag = Be16::from_cpu(static_cast<uint16_t>(off));
+        return ENTRY_SIZE;
+    };
+
+    size_t const ALPHA_OFF = DATA_START;
+    size_t const ALPHA_SIZE = write_entry(ALPHA_OFF, "alpha", 5, 42, XFS_DIR3_FT_REG_FILE);
+    size_t const BETA_OFF = ALPHA_OFF + ALPHA_SIZE;
+    size_t const BETA_SIZE = write_entry(BETA_OFF, "beta", 4, 84, XFS_DIR3_FT_REG_FILE);
+    size_t const FREE_OFF = BETA_OFF + BETA_SIZE;
+    if (FREE_OFF >= DATA_END || (FREE_OFF & (XFS_DIR2_DATA_ALIGN - 1)) != 0) {
+        return false;
+    }
+
+    auto* unused = reinterpret_cast<XfsDir2DataUnused*>(block.data() + FREE_OFF);
+    size_t const FREE_LEN = DATA_END - FREE_OFF;
+    unused->freetag = Be16::from_cpu(XFS_DIR2_DATA_FREE_TAG);
+    unused->length = Be16::from_cpu(static_cast<uint16_t>(FREE_LEN));
+    auto* unused_tag = reinterpret_cast<Be16*>(block.data() + DATA_END - sizeof(Be16));
+    *unused_tag = Be16::from_cpu(static_cast<uint16_t>(FREE_OFF));
+
+    auto* blp = reinterpret_cast<XfsDir2LeafEntry*>(block.data() + DATA_END);
+    blp[0].hashval = Be32::from_cpu(xfs_da_hashname(reinterpret_cast<const uint8_t*>("alpha"), 5));
+    blp[0].address = Be32::from_cpu(dir2_db_off_to_dataptr(&mount, 0, ALPHA_OFF));
+
+    auto* btp = reinterpret_cast<XfsDir2BlockTail*>(block.data() + mount.dir_blk_size - sizeof(XfsDir2BlockTail));
+    btp->count = Be32::from_cpu(static_cast<uint32_t>(LEAF_COUNT));
+    btp->stale = Be32::from_cpu(0);
+
+    BufHead bh{};
+    bh.data = block.data();
+    bh.size = block.size();
+
+    XfsDirEntry entry{};
+    if (dir2_block_lookup_loaded(&dir, &bh, "alpha", 5, &entry, false) != 0 || entry.ino != 42) {
+        return false;
+    }
+
+    entry = {};
+    if (dir2_block_lookup_loaded(&dir, &bh, "beta", 4, &entry, false) != -ENOENT) {
+        return false;
+    }
+
+    entry = {};
+    return dir2_block_lookup_loaded(&dir, &bh, "gamma", 5, &entry, false) == -ENOENT;
+}
+
+auto xfs_selftest_leaf_index_complete_marker() -> bool {
+    XfsInode dir{};
+    dir.dir_generation = 7;
+    bool ok = !dir2_leaf_index_known_complete(&dir);
+    dir2_leaf_index_note_complete(&dir);
+    ok = ok && dir2_leaf_index_known_complete(&dir);
+    dir.dir_generation++;
+    ok = ok && !dir2_leaf_index_known_complete(&dir);
+    dir2_leaf_index_note_complete(&dir);
+    dir2_leaf_index_note_unknown(&dir);
+    ok = ok && !dir2_leaf_index_known_complete(&dir);
+
+    std::array<XfsDir2LeafEntry, 2> entries{};
+    xfs_dahash_t const ALPHA_HASH = xfs_da_hashname(reinterpret_cast<const uint8_t*>("alpha"), 5);
+    xfs_dahash_t const BETA_HASH = xfs_da_hashname(reinterpret_cast<const uint8_t*>("beta"), 4);
+    constexpr xfs_dir2_dataptr_t ALPHA_DATAPTR = 8;
+    constexpr xfs_dir2_dataptr_t BETA_DATAPTR = 16;
+    if (ALPHA_HASH <= BETA_HASH) {
+        entries.at(0).hashval = Be32::from_cpu(ALPHA_HASH);
+        entries.at(0).address = Be32::from_cpu(ALPHA_DATAPTR);
+        entries.at(1).hashval = Be32::from_cpu(BETA_HASH);
+        entries.at(1).address = Be32::from_cpu(BETA_DATAPTR);
+    } else {
+        entries.at(0).hashval = Be32::from_cpu(BETA_HASH);
+        entries.at(0).address = Be32::from_cpu(BETA_DATAPTR);
+        entries.at(1).hashval = Be32::from_cpu(ALPHA_HASH);
+        entries.at(1).address = Be32::from_cpu(ALPHA_DATAPTR);
+    }
+    ok = ok && dir2_leaf_entries_contain_dataptr(entries.data(), entries.size(), ALPHA_HASH, ALPHA_DATAPTR);
+    ok = ok && dir2_leaf_entries_contain_dataptr(entries.data(), entries.size(), BETA_HASH, BETA_DATAPTR);
+    ok = ok && !dir2_leaf_entries_contain_dataptr(entries.data(), entries.size(), ALPHA_HASH, BETA_DATAPTR);
+    xfs_dahash_t const GAMMA_HASH = xfs_da_hashname(reinterpret_cast<const uint8_t*>("gamma"), 5);
+    ok = ok && !dir2_leaf_entries_contain_dataptr(entries.data(), entries.size(), GAMMA_HASH, ALPHA_DATAPTR);
+    return ok;
+}
+
+auto xfs_selftest_directory_name_filter() -> bool {
+    XfsInode dir{};
+    dir.mode = 0040000;
+    if (xfs_dir_name_filter_known_absent(&dir, "alpha", 5)) {
+        return false;
+    }
+
+    xfs_dir_name_filter_init_empty(&dir);
+    if (!xfs_dir_name_filter_known_absent(&dir, "alpha", 5) || xfs_dir_name_filter_known_absent(&dir, ".", 1) ||
+        xfs_dir_name_filter_known_absent(&dir, "..", 2)) {
+        return false;
+    }
+
+    dir2_name_filter_add(&dir, "alpha", 5);
+    if (xfs_dir_name_filter_known_absent(&dir, "alpha", 5)) {
+        return false;
+    }
+
+    bool const PROVES_ANOTHER_MISS = xfs_dir_name_filter_known_absent(&dir, "beta", 4) ||
+                                     xfs_dir_name_filter_known_absent(&dir, "gamma", 5) ||
+                                     xfs_dir_name_filter_known_absent(&dir, "delta", 5);
+    dir.dir_name_filter_complete = false;
+    return PROVES_ANOTHER_MISS && !xfs_dir_name_filter_known_absent(&dir, "beta", 4);
 }
 
 auto xfs_selftest_dentry_cache_keeps_unrelated_dir_hot() -> bool {

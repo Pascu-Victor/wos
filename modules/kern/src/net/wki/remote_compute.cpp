@@ -1007,6 +1007,7 @@ void apply_submitted_task_identity(ker::mod::sched::task::Task* task, const WkiT
     if (identity.root.front() == '/') {
         std::strncpy(task->root.data(), identity.root.data(), task->root.size() - 1);
         task->root.back() = '\0';
+        task->root_len = static_cast<uint16_t>(std::strlen(task->root.data()));
     }
     if (identity.submitter_hostname.front() != '\0') {
         std::strncpy(task->wki_submitter_hostname.data(), identity.submitter_hostname.data(), task->wki_submitter_hostname.size() - 1);
@@ -1017,6 +1018,7 @@ void apply_submitted_task_identity(ker::mod::sched::task::Task* task, const WkiT
 struct ScopedSubmitVfsIdentity {
     ker::mod::sched::task::Task* task = nullptr;
     ker::mod::sched::task::Task::PathBuffer saved_root{};
+    uint16_t saved_root_len = 1;
     ker::mod::sched::task::Task::HostnameBuffer saved_submitter{};
     bool active = false;
 
@@ -1028,10 +1030,12 @@ struct ScopedSubmitVfsIdentity {
         }
 
         saved_root = task->root;
+        saved_root_len = task->root_len;
         saved_submitter = task->wki_submitter_hostname;
 
         if (identity != nullptr && identity->root.front() == '/') {
             task->root = identity->root;
+            task->root_len = static_cast<uint16_t>(std::strlen(task->root.data()));
         }
 
         if (submitter_hostname != nullptr && submitter_hostname[0] != '\0') {
@@ -1051,6 +1055,7 @@ struct ScopedSubmitVfsIdentity {
             return;
         }
         task->root = saved_root;
+        task->root_len = saved_root_len;
         task->wki_submitter_hostname = saved_submitter;
     }
 };
@@ -1807,7 +1812,9 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
         std::array<char, ABS_PATH_MAX> abs_exe_path = {};
         const char* local_path = task->exe_path.data();
         if (task->exe_path.front() != '/') {
-            size_t const CWDLEN = std::strlen(task->cwd.data());
+            size_t const CWD_HINT = task->cwd_len;
+            size_t const CWDLEN =
+                (CWD_HINT > 0 && CWD_HINT < task->cwd.size() && task->cwd.at(CWD_HINT) == '\0') ? CWD_HINT : std::strlen(task->cwd.data());
             size_t const PATHLEN = std::strlen(task->exe_path.data());
             bool const NEED_SEP = (CWDLEN > 1);
             size_t const TOTAL = CWDLEN + (NEED_SEP ? 1 : 0) + PATHLEN + 1;
@@ -4027,6 +4034,7 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     }
     memcpy(new_task->cwd.data(), task_cwd, cwd_copy_len);
     *std::next(new_task->cwd.begin(), static_cast<ptrdiff_t>(cwd_copy_len)) = '\0';
+    new_task->cwd_len = static_cast<uint16_t>(cwd_copy_len);
 
     // The submitter's per-process root is part of the identity context.  Do not
     // inherit root from the receiver-side wki_compute kernel thread; that would

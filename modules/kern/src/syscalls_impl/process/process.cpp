@@ -450,7 +450,9 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 
     // Copy fixed per-process path storage.
     child->cwd = parent->cwd;
+    child->cwd_len = parent->cwd_len;
     child->root = parent->root;
+    child->root_len = parent->root_len;
     child->exe_path = parent->exe_path;
 
     // Copy WKI spawn configuration. NOINHERIT applies when a process creates
@@ -1052,7 +1054,9 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     child->heap_index = -1;
     child->sched_queue = sched::task::Task::sched_queue::NONE;
     child->cwd = parent->cwd;
+    child->cwd_len = parent->cwd_len;
     child->root = parent->root;
+    child->root_len = parent->root_len;
     child->exe_path = parent->exe_path;
     child->session_id = parent->session_id;
     child->pgid = (parent->pgid != 0) ? parent->pgid : parent->pid;

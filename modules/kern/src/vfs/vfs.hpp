@@ -45,6 +45,7 @@ struct VNode {
 
 // Open a path and return a file descriptor-like opaque pointer
 auto vfs_open(std::string_view path, int flags, int mode) -> int;
+auto vfs_openat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int flags, int mode) -> int;
 
 // Open a path and return a File* directly (no FD allocation, no task context).
 // Used by server-side subsystems (e.g. WKI remote VFS) that operate on files
@@ -66,20 +67,30 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t;
 
 // Symlink operations
 auto vfs_symlink(const char* target, const char* linkpath) -> int;
+auto vfs_symlinkat(ker::mod::sched::task::Task* task, const char* target, int dirfd, const char* linkpath) -> int;
 auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t;
+auto vfs_readlinkat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, char* buf, size_t bufsize) -> ssize_t;
 auto vfs_readlink_resolved(const char* path, char* buf, size_t bufsize) -> ssize_t;
-auto vfs_realpath(const char* path, char* buf, size_t bufsize) -> int;
+auto vfs_realpath(const char* path, char* buf, size_t bufsize, size_t* len_out = nullptr) -> int;
 
 // Stat operations
 auto vfs_stat(const char* path, Stat* statbuf) -> int;
 auto vfs_lstat(const char* path, Stat* statbuf) -> int;
 auto vfs_stat_resolved(const char* path, Stat* statbuf) -> int;
+auto vfs_statat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int flags, Stat* statbuf) -> int;
 auto vfs_fstat(int fd, Stat* statbuf) -> int;
 // Stat an already-open file without allocating an FD or consulting task state.
 auto vfs_fstat_file(File* file, Stat* statbuf) -> int;
+// Fast cached fstat path for syscall dispatch. Returns -EAGAIN when the caller
+// must fall back to vfs_fstat_file() with a retained file reference.
+auto vfs_fstat_snapshot_fast(ker::mod::sched::task::Task* task, int fd, Stat* statbuf) -> int;
+// Consume fd while returning independent fstat and close results. A valid fd
+// is removed before any backend fstat or close work runs.
+auto vfs_fstat_close_for_task(ker::mod::sched::task::Task* task, int fd, Stat* statbuf, int* stat_result) -> int;
 // Backend open paths may seed a freshly-read stat snapshot before VFS attaches
 // the absolute path. VFS will promote it only if metadata invalidation still
-// proves that the path has not changed.
+// proves that the path has not changed; created-by-open files may also seed
+// their initial empty inode state until the first write invalidates it.
 void vfs_prefill_file_stat_snapshot(File* file, const Stat& statbuf);
 
 // Filesystem statistics
@@ -88,6 +99,7 @@ auto vfs_fstatvfs(int fd, Statvfs* buf) -> int;
 
 // Directory operations
 auto vfs_mkdir(const char* path, int mode) -> int;
+auto vfs_mkdirat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int mode) -> int;
 
 // Mount operations (called from userspace via syscall)
 auto vfs_mount(const char* source, const char* target, const char* fstype, unsigned long flags = 0, const char* data = nullptr) -> int;
@@ -99,11 +111,13 @@ auto vfs_dup(int oldfd) -> int;
 auto vfs_dup2(int oldfd, int newfd, int flags = 0) -> int;
 
 // Working directory
-auto vfs_getcwd(char* buf, size_t size) -> int;
+auto vfs_getcwd(char* buf, size_t size, size_t* len_out = nullptr) -> int;
 auto vfs_chdir(const char* path) -> int;
+auto vfs_fchdir(ker::mod::sched::task::Task* task, int fd) -> int;
 
 // Access check
 auto vfs_access(const char* path, int mode) -> int;
+auto vfs_faccessat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int mode, int flags) -> int;
 
 // Permission check helper: checks if current task can perform requested access
 // on a file with the given mode/uid/gid. access_bits are R_OK/W_OK/X_OK.
@@ -119,13 +133,17 @@ auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t;
 // File removal / rename
 auto vfs_unlink(const char* path) -> int;
 auto vfs_rmdir(const char* path) -> int;
+auto vfs_unlinkat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int flags) -> int;
 auto vfs_rename(const char* oldpath, const char* newpath) -> int;
+auto vfs_renameat(ker::mod::sched::task::Task* task, int olddirfd, const char* oldpath, int newdirfd, const char* newpath) -> int;
 
 // Permissions
 auto vfs_chmod(const char* path, int mode) -> int;
 auto vfs_fchmod(int fd, int mode) -> int;
+auto vfs_fchmodat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int mode, int flags) -> int;
 auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int;
 auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int;
+auto vfs_fchownat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, uint32_t owner, uint32_t group, int flags) -> int;
 auto vfs_utimensat(int dirfd, const char* pathname, const Timespec* times, int flags) -> int;
 auto vfs_futimens(int fd, const Timespec* times) -> int;
 
@@ -166,6 +184,9 @@ struct VfsCachePerfSnapshot {
     uint64_t metadata_miss_conflict{};
     uint64_t metadata_path_invalidations{};
     uint64_t metadata_generation_resets{};
+    uint64_t existence_hits{};
+    uint64_t existence_misses{};
+    uint64_t existence_stores{};
     uint64_t symlink_hits{};
     uint64_t symlink_misses{};
     uint64_t symlink_stores{};
@@ -200,6 +221,7 @@ auto vfs_shutdown_unmount_all(const char* root_path) -> int;
 
 // Hard link
 auto vfs_link(const char* oldpath, const char* newpath) -> int;
+auto vfs_linkat(ker::mod::sched::task::Task* task, int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags) -> int;
 
 // WKI task-local VFS policy
 auto vfs_wki_rule_add(const char* prefix, uint32_t route) -> int;
@@ -230,6 +252,8 @@ auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int;
 // Returns 0 on success, negative errno on failure.
 constexpr int AT_FDCWD = -100;
 constexpr int AT_SYMLINK_NOFOLLOW = 0x100;
+constexpr int AT_REMOVEDIR = 0x200;
+constexpr int AT_SYMLINK_FOLLOW = 0x400;
 constexpr int AT_EMPTY_PATH = 0x1000;
 auto vfs_resolve_dirfd(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, char* resolved, size_t resolved_size) -> int;
 
@@ -254,13 +278,57 @@ auto vfs_selftest_dup2_replace_preserves_newfd_on_failure() -> bool;
 auto vfs_selftest_pipe_failure_unwinds() -> bool;
 auto vfs_selftest_pipe_flags() -> bool;
 auto vfs_selftest_anonymous_fstat_snapshot_hits() -> bool;
+auto vfs_selftest_fstat_snapshot_fast_path_hits() -> bool;
+auto vfs_selftest_fstat_close_combines_fd_removal() -> bool;
 auto vfs_selftest_remote_fstat_snapshot_cacheable() -> bool;
+auto vfs_selftest_fstat_seeds_path_metadata_cache() -> bool;
 auto vfs_selftest_file_path_storage() -> bool;
 auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool;
 auto vfs_selftest_file_data_write_skips_uncached_path_invalidation() -> bool;
+auto vfs_selftest_file_data_close_refreshes_created_path_stat() -> bool;
+auto vfs_selftest_created_open_prefill_seeds_path_stat() -> bool;
 auto vfs_selftest_file_metadata_change_invalidates_path_stat() -> bool;
 auto vfs_selftest_open_create_metadata_hint() -> bool;
+auto vfs_selftest_open_missing_uses_metadata_cache() -> bool;
+auto vfs_selftest_open_success_seeds_metadata_cache() -> bool;
+auto vfs_selftest_open_write_success_seeds_metadata_hints() -> bool;
+auto vfs_selftest_metadata_cache_stores_enotdir() -> bool;
+auto vfs_selftest_mkdir_seeds_metadata_cache() -> bool;
+auto vfs_selftest_removed_paths_seed_missing_metadata_cache() -> bool;
+auto vfs_selftest_openat_dirfd_installs_open_file() -> bool;
+auto vfs_selftest_openat_at_fdcwd_uses_supplied_task() -> bool;
+auto vfs_selftest_fchdir_changes_supplied_task_cwd() -> bool;
+auto vfs_selftest_unlinkat_renameat_dirfd_mutations() -> bool;
+auto vfs_selftest_rename_seeds_metadata_cache() -> bool;
 auto vfs_selftest_metadata_cache_rejects_stale_negative_store() -> bool;
+auto vfs_selftest_resolved_stat_cache_rejects_mount_generation_change() -> bool;
+auto vfs_selftest_path_text_scan_matches_helpers() -> bool;
+auto vfs_selftest_wki_host_root_mount_gate_matches_task_root() -> bool;
+auto vfs_selftest_resolved_wki_entry_uses_task_root_view() -> bool;
+auto vfs_selftest_absolute_local_stat_fast_path_gate() -> bool;
+auto vfs_selftest_common_local_relative_resolver_fast_path() -> bool;
+auto vfs_selftest_statat_dirfd_metadata_cache() -> bool;
+auto vfs_selftest_statat_at_fdcwd_uses_supplied_task() -> bool;
+auto vfs_selftest_statat_root_cwd_relative_paths() -> bool;
+auto vfs_selftest_faccessat_dirfd_metadata_cache() -> bool;
+auto vfs_selftest_faccessat_at_fdcwd_uses_supplied_task() -> bool;
+auto vfs_selftest_faccessat_f_ok_existence_cache_invalidates() -> bool;
+auto vfs_selftest_faccessat_f_ok_skips_known_non_symlink_probe() -> bool;
+auto vfs_selftest_faccessat_flags() -> bool;
+auto vfs_selftest_mkdirat_dirfd_creates_relative_directory() -> bool;
+auto vfs_selftest_readlinkat_dirfd_reads_relative_symlink() -> bool;
+auto vfs_selftest_symlinkat_dirfd_creates_relative_symlink() -> bool;
+auto vfs_selftest_linkat_dirfd_creates_relative_hardlink() -> bool;
+auto vfs_selftest_chdir_common_local_fast_path_uses_metadata_cache() -> bool;
+auto vfs_selftest_fchmodat_dirfd_changes_relative_file_mode() -> bool;
+auto vfs_selftest_fchownat_dirfd_changes_relative_file_owner() -> bool;
+auto vfs_selftest_stat_lstat_share_non_symlink_cache() -> bool;
+auto vfs_selftest_readdir_seeds_non_symlink_hints() -> bool;
+auto vfs_selftest_readlink_uses_metadata_negative_cache() -> bool;
+auto vfs_selftest_missing_prefix_short_circuits_symlink_walk() -> bool;
+auto vfs_selftest_symlink_prefix_cache_skips_known_parent() -> bool;
+auto vfs_selftest_procfs_fd_link_probe_gate() -> bool;
+auto vfs_selftest_packed_dirent_records() -> bool;
 auto vfs_selftest_fcntl_setfl_preserves_open_policy_flags() -> bool;
 auto vfs_selftest_stream_cache_read_eligibility() -> bool;
 auto vfs_selftest_stream_cache_local_detached_ttl() -> bool;

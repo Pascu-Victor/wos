@@ -63,6 +63,21 @@ using XfsDirIterFn = int (*)(const XfsDirEntry* entry, void* ctx);
 // -ENOENT if not found, or negative errno on I/O error.
 auto xfs_dir_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry) -> int;
 
+// Look up a name already observed for a parent inode without loading that
+// parent inode.  Returns true only when the dentry cache can answer.
+auto xfs_dentry_cache_lookup_parent(XfsMountContext* mount, xfs_ino_t parent_ino, const char* name, uint16_t namelen, XfsDirEntry* entry,
+                                    int* result) -> bool;
+
+// Initialize the no-false-negative name filter for a newly created empty
+// directory, or use it to prove that a name cannot exist. Loaded directories
+// remain incomplete and always fall back to the on-disk lookup.
+void xfs_dir_name_filter_init_empty(XfsInode* dp);
+auto xfs_dir_name_filter_known_absent(const XfsInode* dp, const char* name, uint16_t namelen) -> bool;
+
+// Seed the shared dentry cache with an entry observed while iterating a
+// directory.  This is equivalent to caching a successful lookup.
+void xfs_dir_observe_entry(XfsInode* dp, const XfsDirEntry* entry);
+
 // Iterate over all entries in a directory.
 // Calls fn(entry, ctx) for each entry.  Returns 0 on success.
 auto xfs_dir_iterate(XfsInode* dp, XfsDirIterFn fn, void* ctx) -> int;
@@ -70,12 +85,16 @@ auto xfs_dir_iterate(XfsInode* dp, XfsDirIterFn fn, void* ctx) -> int;
 // Add a new name to a directory.
 // dp: directory inode, name/namelen: entry name, ino: target inode number,
 // ftype: XFS_DIR3_FT_* file type, tp: enclosing transaction.
+// name_known_absent may only be true when the caller has just observed
+// -ENOENT for the same parent/name under the same metadata lock, or when a
+// valid same-generation dentry cache entry proves the name is absent.
 // Returns 0 on success, negative errno on failure.
 // Supports shortform and block-format directories. Leaf/node directories can
 // reuse leaf slots while available and fall back to data-block scans for
 // entries appended after the current single-leaf index is saturated.
 struct XfsTransaction;
-auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t ino, uint8_t ftype, XfsTransaction* tp) -> int;
+auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t ino, uint8_t ftype, XfsTransaction* tp,
+                     bool name_known_absent = false) -> int;
 
 // Remove a name from a directory.
 // dp: directory inode, name/namelen: entry name, tp: enclosing transaction.
@@ -95,6 +114,9 @@ void xfs_dentry_cache_purge_mount(XfsMountContext* mount);
 
 #ifdef WOS_SELFTEST
 auto xfs_selftest_dentry_cache_shortform() -> bool;
+auto xfs_selftest_block_lookup_uses_leaf_index_for_misses() -> bool;
+auto xfs_selftest_leaf_index_complete_marker() -> bool;
+auto xfs_selftest_directory_name_filter() -> bool;
 auto xfs_selftest_dentry_cache_keeps_unrelated_dir_hot() -> bool;
 auto xfs_selftest_dentry_cache_add_keeps_sibling_hot() -> bool;
 auto xfs_selftest_dentry_cache_remove_keeps_sibling_hot() -> bool;

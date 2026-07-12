@@ -36,3 +36,8 @@
 	path = toolchain/src/clang-tidy-cache
 	url = https://github.com/williamfligor/clang-tidy-cache.git
 	branch = master
+[submodule "toolchain/src/git"]
+	path = toolchain/src/git
+	url = https://github.com/Pascu-Victor/git.git
+	branch = wos-support
+	shallow = true

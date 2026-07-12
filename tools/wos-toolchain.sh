@@ -421,7 +421,16 @@ build_compiler_rt() {
     install_compiler_rt_resource_dir "$build_sanitizers"
 }
 
-if [ ! -x "$HOST/bin/clang" ]; then
+host_toolchain_clang_usable() {
+    if [ "$HOST_SYSTEM" = "WOS" ]; then
+        [ -f "$HOST/bin/clang" ] && "$HOST/bin/clang" --version >/dev/null 2>&1
+        return $?
+    fi
+
+    [ -x "$HOST/bin/clang" ]
+}
+
+if ! host_toolchain_clang_usable; then
     echo "ERROR: Host toolchain not found at $HOST/bin/clang"
     echo "Run tools/host-toolchain.sh first, or run tools/bootstrap.sh on WOS to create a system-toolchain shim."
     exit 1
@@ -846,6 +855,16 @@ bootstrap_phase_end
 
 # 18. Build Git for WOS userspace
 bootstrap_phase_start 18 "Git for WOS userspace"
+cd "$B/src"
+if [ ! -f git/Makefile ]; then
+    if [ -d "$WORKSPACE_ROOT/.git" ]; then
+        git -C "$WORKSPACE_ROOT" submodule update --init --depth=1 toolchain/src/git || true
+    fi
+fi
+if [ ! -f git/Makefile ]; then
+    git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/git.git git
+fi
+
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_GIT_SOURCE_DIR="$B/src/git" \
     WOS_GIT_BUILD_DIR="$B/git-build" \

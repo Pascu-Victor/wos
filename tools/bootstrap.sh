@@ -63,6 +63,17 @@ find_system_tool() {
     printf '%s\n' "$path"
 }
 
+wos_host_tool_is_usable() {
+    local path="$1"
+
+    if [ "$WOS_BOOTSTRAP_HOST_SYSTEM" = "WOS" ]; then
+        [ -f "$path" ] && "$path" --version >/dev/null 2>&1
+        return $?
+    fi
+
+    [ -x "$path" ]
+}
+
 write_clang_wrapper() {
     local output="$1"
     local system_clang="$2"
@@ -152,7 +163,7 @@ setup_wos_host_toolchain_shim() {
             cd "$WORKSPACE_ROOT/toolchain"
             ln -sfn "$(basename "$shim_root")" host
         )
-    elif [ ! -x "$compat_root/bin/clang" ]; then
+    elif ! wos_host_tool_is_usable "$compat_root/bin/clang"; then
         echo "ERROR: $compat_root exists but does not provide bin/clang for native WOS bootstrap." >&2
         echo "Remove or fix it so build scripts can use the WOS host-toolchain shim." >&2
         exit 1

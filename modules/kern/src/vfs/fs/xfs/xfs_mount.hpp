@@ -47,6 +47,8 @@ struct XfsPerAG {
     uint32_t agi_freecount;       // free inodes
     xfs_agblock_t agi_free_root;  // free inobt root (v5)
     uint32_t agi_free_level;      // free inobt levels (v5)
+    xfs_agino_t ialloc_hint_startino;
+    bool ialloc_hint_valid;
 
     mod::sys::Spinlock lock;  // Per-AG lock for concurrent access
 };
@@ -95,8 +97,9 @@ struct XfsMountContext {
     // Per-AG state array (ag_count elements, heap-allocated)
     XfsPerAG* per_ag;
 
-    // Serializes metadata transactions and AG btree/counter mutations. This is
-    // a sleeping mutex because XFS metadata paths can issue disk I/O.
+    // Serializes metadata transactions and AG btree/counter mutations while
+    // allowing concurrent read-only metadata probes. This is a sleeping lock
+    // because XFS metadata paths can issue disk I/O.
     mod::sys::Mutex metadata_lock;
 
     // Filesystem UUIDs
@@ -120,6 +123,10 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
 // numbers and reads the appropriate number of contiguous device blocks to
 // cover a full XFS block.  Caller must call brelse() on the returned buffer.
 auto xfs_buf_read(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead*;
+
+// Read regular-file data while keeping physical-read diagnostics separate
+// from filesystem metadata.
+auto xfs_buf_read_data(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead*;
 
 // Read `count` contiguous XFS filesystem blocks.
 auto xfs_buf_read_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) -> BufHead*;

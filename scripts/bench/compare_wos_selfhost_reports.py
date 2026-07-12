@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import sys
@@ -13,6 +14,15 @@ from typing import Any
 
 
 DEFAULT_STEPS = ("clone_sources", "build_wos", "total")
+ACCEPTANCE_PROFILE = "checkout-configure"
+ACCEPTANCE_STEPS = ("clone_checkout", "configure_wos")
+DEFAULT_MAX_WOS_RATIO = 1.25
+ACCEPTANCE_MAX_WOS_RATIO = 1.0
+CLONE_CHECKOUT_EVENTS = (
+    "clone:wos_repo",
+    "clone:submodule_init",
+    "clone:submodules",
+)
 
 
 def fail(message: str) -> None:
@@ -65,6 +75,63 @@ def read_report(path: Path) -> dict[str, int]:
         fail(f"{path}: no timing rows found")
     if "total" not in timings:
         timings["total"] = sum(value for step, value in timings.items() if step != "total")
+    return timings
+
+
+def read_detail_report(path: Path) -> dict[str, int]:
+    if not path.is_file():
+        fail(f"missing detail report: {path}")
+
+    timings: dict[str, int] = {}
+    with path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file, delimiter="\t")
+        required_fields = {"phase", "label", "elapsed_ms", "status"}
+        missing_fields = required_fields - set(reader.fieldnames or ())
+        if missing_fields:
+            fail(f"{path}: missing detail report fields: {', '.join(sorted(missing_fields))}")
+
+        for lineno, row in enumerate(reader, start=2):
+            phase = row["phase"].strip()
+            label = row["label"].strip()
+            status = row["status"].strip()
+            if not phase or not label:
+                fail(f"{path}:{lineno}: detail row is missing phase or label")
+
+            step = f"{phase}:{label}"
+            if step in timings:
+                fail(f"{path}:{lineno}: duplicate detail step {step!r}")
+            if status != "ok":
+                fail(f"{path}:{lineno}: detail step {step!r} did not pass: {status!r}")
+
+            elapsed_text = row["elapsed_ms"].strip()
+            try:
+                elapsed_ms = int(elapsed_text)
+            except ValueError:
+                fail(f"{path}:{lineno}: elapsed time is not an integer: {elapsed_text!r}")
+            if elapsed_ms < 0:
+                fail(f"{path}:{lineno}: elapsed time must be nonnegative")
+            timings[step] = elapsed_ms
+
+    if not timings:
+        fail(f"{path}: no detail timing rows found")
+    return timings
+
+
+def derive_clone_checkout(timings: dict[str, int], path: Path) -> int:
+    missing = [step for step in CLONE_CHECKOUT_EVENTS if step not in timings]
+    if missing:
+        fail(f"{path}: missing clone checkout detail steps: {', '.join(missing)}")
+    return sum(timings[step] for step in CLONE_CHECKOUT_EVENTS)
+
+
+def augment_with_detail(report: dict[str, int], detail_path: Path | None) -> dict[str, int]:
+    if detail_path is None:
+        return report
+
+    timings = dict(report)
+    detail = read_detail_report(detail_path)
+    timings.update(detail)
+    timings["clone_checkout"] = derive_clone_checkout(detail, detail_path)
     return timings
 
 
@@ -131,14 +198,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-wos-ratio",
         type=positive_float,
-        default=1.25,
-        help="maximum allowed WOS/Linux time ratio for required steps; default 1.25",
+        default=None,
+        help="maximum allowed WOS/Linux time ratio for required steps; default 1.25, or 1.0 with --acceptance-profile",
     )
     parser.add_argument(
         "--steps",
         type=parse_steps,
-        default=list(DEFAULT_STEPS),
+        default=None,
         help="comma-separated required steps; default clone_sources,build_wos,total",
+    )
+    parser.add_argument("--wos-detail", type=Path, help="WOS selfhost-detail.tsv for detail or derived steps")
+    parser.add_argument("--linux-detail", type=Path, help="Linux selfhost-detail.tsv for detail or derived steps")
+    parser.add_argument(
+        "--acceptance-profile",
+        choices=(ACCEPTANCE_PROFILE,),
+        help="strict goal check: compare clone_checkout and configure_wos at WOS/Linux ratio <= 1.0",
     )
     parser.add_argument("--json-output", type=Path, help="write comparison evidence as JSON")
     return parser
@@ -146,9 +220,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    wos = read_report(args.wos)
-    linux = read_report(args.linux)
+    if args.acceptance_profile == ACCEPTANCE_PROFILE:
+        if args.wos_detail is None or args.linux_detail is None:
+            fail(f"--acceptance-profile {ACCEPTANCE_PROFILE} requires --wos-detail and --linux-detail")
+        if args.steps is None:
+            args.steps = list(ACCEPTANCE_STEPS)
+        if args.max_wos_ratio is None:
+            args.max_wos_ratio = ACCEPTANCE_MAX_WOS_RATIO
+    else:
+        if args.steps is None:
+            args.steps = list(DEFAULT_STEPS)
+        if args.max_wos_ratio is None:
+            args.max_wos_ratio = DEFAULT_MAX_WOS_RATIO
+
+    wos = augment_with_detail(read_report(args.wos), args.wos_detail)
+    linux = augment_with_detail(read_report(args.linux), args.linux_detail)
     result = compare_reports(wos, linux, args.steps, args.max_wos_ratio)
+    if args.acceptance_profile is not None:
+        result["acceptance_profile"] = args.acceptance_profile
 
     print_text(result)
     if args.json_output is not None:

@@ -7,6 +7,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 WOS_VFS_H = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "sys" / "vfs.h"
 WOS_SYSDEPS_CPP = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "generic" / "sysdeps.cpp"
+WOS_FD_H = ROOT / "toolchain" / "src" / "mlibc" / "options" / "wos" / "include" / "wos" / "fd.h"
+WOS_FD_CPP = ROOT / "toolchain" / "src" / "mlibc" / "options" / "wos" / "generic" / "fd.cpp"
+WOS_OPTIONS_MESON = ROOT / "toolchain" / "src" / "mlibc" / "options" / "wos" / "meson.build"
 KERNEL_VFS_CALLNUMS = ROOT / "modules" / "kern" / "src" / "abi" / "callnums" / "vfs.h"
 KERNEL_VFS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "vfs.hpp"
 KERNEL_SYS_VFS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vfs" / "sys_vfs.cpp"
@@ -16,7 +19,10 @@ KERNEL_XFS_VFS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / 
 KERNEL_XFS_VFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / "xfs_vfs.cpp"
 KERNEL_VFS_KTEST_CPP = ROOT / "modules" / "kern" / "src" / "test" / "vfs_ktest.cpp"
 MLIBC_DIRENT_H = ROOT / "toolchain" / "src" / "mlibc" / "options" / "posix" / "include" / "dirent.h"
-GIT_BUILD_SCRIPT = ROOT / "scripts" / "build" / "build_git_for_wos.sh"
+GIT_RUN_COMMAND = ROOT / "toolchain" / "src" / "git" / "run-command.c"
+GIT_PARALLEL_CHECKOUT = ROOT / "toolchain" / "src" / "git" / "parallel-checkout.c"
+STRACE_DECODE_CPP = ROOT / "modules" / "strace" / "src" / "decode.cpp"
+SYZKALLER_FS = ROOT / "tests" / "vm" / "syzkaller" / "sys" / "wos" / "fs.txt"
 
 
 def fail(message: str) -> None:
@@ -87,18 +93,18 @@ def test_kernel_dirent_types_match_mlibc_public_abi() -> None:
             fail(f"mlibc {name} must be {value}, got {mlibc_constants.get(name)}")
 
 
-def test_git_helper_pipe_cloexec_patch_is_preserved_by_mlibc() -> None:
-    git_build = GIT_BUILD_SCRIPT.read_text()
-    require_tokens(
-        git_build,
-        [
-            '"pipe(fdin)": ("pipe2(fdin, O_CLOEXEC)", 2)',
-            '"pipe(fdout)": ("pipe2(fdout, O_CLOEXEC)", 2)',
-            '"pipe(fderr)": ("pipe2(fderr, O_CLOEXEC)", 1)',
-            '"pipe(notify_pipe)": ("pipe2(notify_pipe, O_CLOEXEC)", 1)',
-        ],
-        "Git run-command pipe patch",
-    )
+def test_git_helper_pipe_cloexec_support_is_preserved_by_mlibc() -> None:
+    git_run_command = GIT_RUN_COMMAND.read_text()
+    expected_counts = {
+        "pipe2(fdin, O_CLOEXEC)": 2,
+        "pipe2(fdout, O_CLOEXEC)": 2,
+        "pipe2(fderr, O_CLOEXEC)": 1,
+        "pipe2(notify_pipe, O_CLOEXEC)": 1,
+    }
+    for token, expected_count in expected_counts.items():
+        actual_count = git_run_command.count(token)
+        if actual_count != expected_count:
+            fail(f"Git run-command source must contain {expected_count} occurrences of {token}, got {actual_count}")
 
     sysdeps = WOS_SYSDEPS_CPP.read_text()
     pipe_body = function_body(sysdeps, r"int\s+Sysdeps<Pipe>::operator\(\)\(int\s+\*fds,\s*int\s+flags\)")
@@ -150,7 +156,116 @@ def test_mlibc_vfs_wrappers_pass_fd_creation_flags_to_kernel() -> None:
     )
 
 
-def test_pselect_empty_fd_sets_do_not_call_epoll_with_zero_maxevents() -> None:
+def test_wos_fstat_close_abi_consumes_each_fd_once() -> None:
+    kernel_ops = KERNEL_VFS_CALLNUMS.read_text()
+    require_order(
+        kernel_ops,
+        ["FCHOWNAT,              // 60", "FSTAT_CLOSE,           // 61"],
+        "append-only kernel fstat-close operation",
+    )
+
+    mlibc_vfs = WOS_VFS_H.read_text()
+    require_order(mlibc_vfs, ["\tfchownat,", "\tfstat_close,"], "mlibc fstat-close operation mirror")
+    low_level_body = function_body(
+        mlibc_vfs,
+        r"static\s+inline\s+int\s+fstat_close_fd\(int\s+fd,\s*void\s+\*statbuf,\s*int\s+\*stat_result\)",
+    )
+    require_tokens(
+        low_level_body,
+        [
+            "static_cast<uint64_t>(ops::fstat_close)",
+            "static_cast<uint64_t>(fd)",
+            "reinterpret_cast<uint64_t>(statbuf)",
+            "reinterpret_cast<uint64_t>(stat_result)",
+        ],
+        "mlibc raw fstat-close syscall wrapper",
+    )
+
+    vfs_core = KERNEL_VFS_CORE_CPP.read_text()
+    close_body = function_body(vfs_core, r"auto\s+vfs_close\(int\s+fd\)\s*->\s*int")
+    require_tokens(close_body, ["vfs_take_fd_locked", "vfs_close_taken_file"], "factored VFS close path")
+    combined_body = function_body(
+        vfs_core,
+        r"auto\s+vfs_fstat_close_for_task\(ker::mod::sched::task::Task\*\s+task,\s*int\s+fd,\s*Stat\*\s+statbuf,\s*int\*\s+stat_result\)\s*->\s*int",
+    )
+    require_order(
+        combined_body,
+        [
+            "fd_table_lock.lock_irqsave()",
+            "vfs_take_fd_locked(table_task, fd)",
+            "file_stat_snapshot_fast_current(file, statbuf)",
+            "table_task->fd_table.size()",
+            "fd_table_lock.unlock_irqrestore(IRQF)",
+            "if (result == -EAGAIN)",
+            "vfs_fstat_file(file, statbuf)",
+            "vfs_close_taken_file(task, table_task, file",
+        ],
+        "combined fstat-close lock and lifetime ordering",
+    )
+    locked_region = combined_body[
+        combined_body.find("fd_table_lock.lock_irqsave()") : combined_body.find("fd_table_lock.unlock_irqrestore(IRQF)")
+    ]
+    if "vfs_fstat_file" in locked_region or "vfs_close_taken_file" in locked_region:
+        fail("combined fstat-close must not run backend stat or close work under fd_table_lock")
+
+    dispatch_body = function_body(KERNEL_SYS_VFS_CPP.read_text(), r"case\s+ops::FSTAT_CLOSE:")
+    require_order(
+        dispatch_body,
+        [
+            "ensure_writable(*task, a2, sizeof(ker::vfs::Stat))",
+            "ensure_writable(*task, a3, sizeof(int))",
+            "vfs_fstat_close_for_task(task, FD, &kernel_statbuf, &stat_result)",
+            "copy_value_to_user_for_task(task, statbuf, kernel_statbuf)",
+            "copy_value_to_user_for_task(task, stat_result_out, stat_result)",
+        ],
+        "fstat-close syscall pointer preflight and output ordering",
+    )
+
+    require_tokens(
+        WOS_FD_H.read_text(),
+        ["int wos_fstat_close(int fd, struct stat *statbuf, int *fstat_error);"],
+        "public WOS fd API",
+    )
+    public_body = function_body(
+        WOS_FD_CPP.read_text(),
+        r"extern\s+\"C\"\s+int\s+wos_fstat_close\(int\s+fd,\s*struct\s+stat\s+\*statbuf,\s*int\s+\*fstat_error\)",
+    )
+    require_tokens(
+        public_body,
+        [
+            "ker::abi::vfs::fstat_close_fd(fd, statbuf, &stat_result)",
+            "*fstat_error = stat_result < 0 ? -stat_result : 0",
+            "errno = -close_result",
+        ],
+        "public WOS fstat-close errno translation",
+    )
+    require_tokens(WOS_OPTIONS_MESON.read_text(), ["'generic/fd.cpp'", "'include/wos/fd.h'"], "WOS fd API installation")
+
+    git_checkout = GIT_PARALLEL_CHECKOUT.read_text()
+    require_order(
+        git_checkout,
+        [
+            "wos_fstat_close(fd, &pc_item->st, &fstat_error)",
+            "fd = -1",
+            "fstat_done = !fstat_error",
+            "if (close_result)",
+        ],
+        "Git combined fstat-close ownership transfer",
+    )
+    require_tokens(
+        KERNEL_VFS_KTEST_CPP.read_text(),
+        ["KTEST(VFS, FstatCloseCombinesFdRemoval)"],
+        "kernel fstat-close selftest",
+    )
+    require_tokens(STRACE_DECODE_CPP.read_text(), ["ops::FSTAT_CLOSE", 'return "fstat_close"'], "strace decoder")
+    require_tokens(
+        SYZKALLER_FS.read_text(),
+        ["wos_vfs$fstat_close(op const[61]", "array[int8, 144]", "stat_result ptr[out, int32]"],
+        "syzkaller fstat-close description",
+    )
+
+
+def test_pselect_uses_dense_pollfds_and_handles_empty_sets() -> None:
     sysdeps = WOS_SYSDEPS_CPP.read_text()
     pselect_body = function_body(
         sysdeps,
@@ -160,18 +275,19 @@ def test_pselect_empty_fd_sets_do_not_call_epoll_with_zero_maxevents() -> None:
         pselect_body,
         [
             "if (num_fds < 0)",
+            "std::array<pollfd, FD_SETSIZE> poll_fds{};",
             "int watched_fds = 0;",
+            "poll_fds[watched_fds].fd = fd;",
             "watched_fds++;",
             "if (watched_fds == 0)",
             "pselect_sleep_for_timeout_ms(timeout_ms, sigmask)",
             "*num_events = 0;",
-            "int max = watched_fds < 64 ? watched_fds : 64;",
-            "ker::abi::vfs::epoll_pwait_vfs(epfd, out_events, max, timeout_ms)",
+            "ker::abi::net::poll(poll_fds.data(), static_cast<size_t>(watched_fds), timeout_ms)",
         ],
         "WOS mlibc pselect empty-fd handling",
     )
-    if "int max = num_fds < 64 ? num_fds : 64;" in pselect_body:
-        fail("WOS mlibc pselect must not derive epoll maxevents from num_fds")
+    if "epoll_pwait_vfs" in pselect_body:
+        fail("WOS mlibc pselect must use a dense pollfd array instead of rebuilding an epoll instance")
 
     wait_body = function_body(sysdeps, r"int\s+pselect_sleep_for_timeout_ms\(int\s+timeout_ms,\s*const\s+sigset_t\s+\*sigmask\)")
     require_tokens(
@@ -221,9 +337,8 @@ def test_pselect_and_epoll_pwait_honor_temporary_signal_masks() -> None:
     require_order(
         pselect_body,
         [
-            "int max = watched_fds < 64 ? watched_fds : 64;",
             "apply_wait_signal_mask(sigmask, &old_mask, &restore_mask)",
-            "ker::abi::vfs::epoll_pwait_vfs(epfd, out_events, max, timeout_ms)",
+            "ker::abi::net::poll(poll_fds.data(), static_cast<size_t>(watched_fds), timeout_ms)",
             "restore_wait_signal_mask(&old_mask, restore_mask)",
         ],
         "WOS mlibc pselect fd wait signal-mask handling",
@@ -270,8 +385,8 @@ def test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards() -> None:
             "int const READ_OPEN_FLAGS = (flags & O_NONBLOCK) != 0 ? O_NONBLOCK : 0;",
             "int const WRITE_OPEN_FLAGS = 1 | ((flags & O_NONBLOCK) != 0 ? O_NONBLOCK : 0);",
             "if ((flags & ker::vfs::O_CLOEXEC) != 0)",
-            "task->set_fd_cloexec(static_cast<unsigned>(RFD));",
-            "task->set_fd_cloexec(static_cast<unsigned>(WFD));",
+            "vfs_set_fd_cloexec_for_task(task, RFD, true)",
+            "vfs_set_fd_cloexec_for_task(task, WFD, true)",
         ],
         "kernel vfs pipe flag handling",
     )
@@ -281,7 +396,7 @@ def test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards() -> None:
         dup2_body,
         [
             "if ((flags & ~ker::vfs::O_CLOEXEC) != 0)",
-            "vfs_replace_fd_for_dup2_locked(task, newfd, f, (flags & ker::vfs::O_CLOEXEC) != 0)",
+            "vfs_replace_fd_for_dup2_locked(table_task, newfd, f, (flags & ker::vfs::O_CLOEXEC) != 0)",
         ],
         "kernel vfs dup2 flag handling",
     )
@@ -377,7 +492,7 @@ def test_utimensat_reaches_real_vfs_timestamp_updates() -> None:
 
     path_body = function_body(
         vfs_core,
-        r"auto\s+vfs_apply_utimens_to_path\(const\s+char\*\s+path,\s*const\s+Timespec\*\s+times,\s*bool\s+follow_final_symlink\)\s*->\s*int",
+        r"auto\s+vfs_apply_utimens_to_resolved_path\(const\s+char\*\s+resolved_path,\s*const\s+Timespec\*\s+times,\s*bool\s+follow_final_symlink,\s*size_t\s+known_resolved_path_len\s*=\s*UNKNOWN_PATH_LEN\)\s*->\s*int",
     )
     require_tokens(
         path_body,
@@ -385,7 +500,8 @@ def test_utimensat_reaches_real_vfs_timestamp_updates() -> None:
             "case FSType::TMPFS:",
             "apply_tmpfs_utimens(node, resolved_times)",
             "case FSType::XFS:",
-            "xfs_set_times_path(fs_path, resolved_times.atime, resolved_times.mtime",
+            "ker::vfs::xfs::xfs_set_times_path(",
+            "fs_path, resolved_times.atime, resolved_times.mtime",
             "case FSType::FAT32:",
             "changed = false;",
             "cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type)",
@@ -403,7 +519,8 @@ def test_utimensat_reaches_real_vfs_timestamp_updates() -> None:
             "constexpr int ALLOWED_FLAGS = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;",
             "return vfs_futimens(dirfd, times);",
             "return vfs_apply_utimens_to_path(pathname, times, (flags & AT_SYMLINK_NOFOLLOW) == 0);",
-            "vfs_resolve_dirfd(task, dirfd, pathname, resolved.data(), resolved.size())",
+            "resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, dirfd, pathname, resolved.data(), resolved.size(), true",
+            "&resolved_len);",
         ],
         "kernel vfs utimensat dirfd and empty-path handling",
     )
@@ -425,7 +542,8 @@ def test_utimensat_reaches_real_vfs_timestamp_updates() -> None:
         xfs_hpp,
         [
             "auto xfs_set_times_path(const char* fs_path, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,",
-            "auto xfs_set_times_file(File* f, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime) -> int;",
+            "auto xfs_set_times_file(File* f, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,",
+            "ker::vfs::Stat* statbuf = nullptr) -> int;",
         ],
         "kernel xfs utimensat declarations",
     )
@@ -509,29 +627,45 @@ def test_kernel_dirfd_resolution_returns_task_visible_paths() -> None:
 
 def test_metadata_cache_store_uses_pre_backend_stat_generation() -> None:
     vfs_core = KERNEL_VFS_CORE_CPP.read_text()
+    prepare_body = function_body(
+        vfs_core,
+        r"auto\s+metadata_cache_prepare_path_observation\([^{}]*\)\s*->\s*bool",
+    )
+    require_order(
+        prepare_body,
+        [
+            "if (stamp.cache_generation != EPOCH)",
+            "metadata_path_invalidation_check(path, PATH_LEN, stamp.invalidation_generation)",
+            "if (INVALIDATION.invalidated)",
+            "*invalidation_generation_out = INVALIDATION.checked_generation;",
+        ],
+        "metadata cache stale observation guard",
+    )
+
     store_body = function_body(
         vfs_core,
-        r"void\s+metadata_cache_store\(const\s+char\*\s+path,\s*FSType\s+fs_type,\s*uint64_t\s+dev_id,\s*bool\s+follow_final_symlink,\s*bool\s+require_directory,\s*int\s+result,\s*const\s+Stat\*\s+statbuf,\s*MetadataSnapshotStamp\s+stamp\)",
+        r"void\s+metadata_cache_store\([^{}]*\)",
     )
     require_tokens(
         store_body,
         [
-            "if (stamp.cache_generation != EPOCH || metadata_path_invalidated_since(path, PATH_LEN, stamp.invalidation_generation))",
-            "victim->invalidation_generation = stamp.invalidation_generation;",
+            "metadata_cache_prepare_store(path, fs_type, result, statbuf, stamp",
+            "metadata_cache_store_prehashed(path, path_len, fs_type, dev_id",
+            "stamp.mount_generation, invalidation_generation",
         ],
         "metadata cache stale stat race guard",
     )
 
     stat_body = function_body(
         vfs_core,
-        r"static\s+auto\s+vfs_stat_impl\(const\s+char\*\s+path,\s*ker::vfs::Stat\*\s+statbuf,\s*bool\s+resolve_task_path,\s*bool\s+apply_task_policy,\s*bool\s+follow_final_symlink\)\s*->\s*int",
+        r"static\s+auto\s+vfs_stat_impl\([^{}]*\)\s*->\s*int",
     )
     require_tokens(
         stat_body,
         [
             "MetadataSnapshotStamp const STAT_STAMP = metadata_snapshot_stamp();",
-            "metadata_cache_store(pathBuffer, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, result, statbuf,",
-            "STAT_STAMP);",
+            "metadata_cache_store(current_path, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, result,",
+            "statbuf, STAT_STAMP, current_path_len, current_path_hash);",
         ],
         "vfs_stat metadata cache observation stamp",
     )
@@ -545,7 +679,7 @@ def test_open_create_uses_central_cache_notify_path() -> None:
     tmpfs = (ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "tmpfs.cpp").read_text()
 
     for pattern, context in [
-        (r"auto\s+vfs_open\(std::string_view\s+path,\s*int\s+flags,\s*int\s+mode\)\s*->\s*int", "vfs_open"),
+        (r"auto\s+vfs_open_resolved_for_task\([^{}]*\)\s*->\s*int", "vfs_open_resolved_for_task"),
         (
             r"static\s+auto\s+vfs_open_file_impl\(const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*bool\s+resolve_task_path,\s*bool\s+apply_task_policy\)\s*->\s*File\*",
             "vfs_open_file_impl",
@@ -568,7 +702,7 @@ def test_open_create_uses_central_cache_notify_path() -> None:
 
     tmpfs_open = function_body(
         tmpfs,
-        r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode\)\s*->\s*ker::vfs::File\*",
+        r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
     )
     require_tokens(
         tmpfs_open,
@@ -586,7 +720,7 @@ def test_tmpfs_permission_denied_open_runs_close_hook() -> None:
     vfs_core = KERNEL_VFS_CORE_CPP.read_text()
     tmpfs = (ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "tmpfs.cpp").read_text()
 
-    open_body = function_body(vfs_core, r"auto\s+vfs_open\(std::string_view\s+path,\s*int\s+flags,\s*int\s+mode\)\s*->\s*int")
+    open_body = function_body(vfs_core, r"auto\s+vfs_open_resolved_for_task\([^{}]*\)\s*->\s*int")
     require_order(
         open_body,
         [
@@ -604,7 +738,7 @@ def test_tmpfs_permission_denied_open_runs_close_hook() -> None:
 
     tmpfs_open = function_body(
         tmpfs,
-        r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode\)\s*->\s*ker::vfs::File\*",
+        r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
     )
     tmpfs_close = function_body(tmpfs, r"auto\s+tmpfs_fops_close\(ker::vfs::File\*\s+f\)\s*->\s*int")
     require_tokens(
@@ -621,9 +755,10 @@ def test_tmpfs_permission_denied_open_runs_close_hook() -> None:
 
 if __name__ == "__main__":
     test_kernel_dirent_types_match_mlibc_public_abi()
-    test_git_helper_pipe_cloexec_patch_is_preserved_by_mlibc()
+    test_git_helper_pipe_cloexec_support_is_preserved_by_mlibc()
     test_mlibc_vfs_wrappers_pass_fd_creation_flags_to_kernel()
-    test_pselect_empty_fd_sets_do_not_call_epoll_with_zero_maxevents()
+    test_wos_fstat_close_abi_consumes_each_fd_once()
+    test_pselect_uses_dense_pollfds_and_handles_empty_sets()
     test_pselect_and_epoll_pwait_honor_temporary_signal_masks()
     test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards()
     test_utimensat_reaches_real_vfs_timestamp_updates()

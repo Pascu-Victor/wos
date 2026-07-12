@@ -35,12 +35,59 @@ namespace ker::vfs {
 namespace {
 ker::util::SmallVec<MountPoint*, 8> mounts;
 mod::sys::Spinlock mount_lock;  // Protects mounts and mount_count
+std::atomic<uint64_t> mount_generation{1};
 uint32_t next_dev_id = 1;
 using log = ker::mod::dbg::logger<"vfs_mount">;
 
 constexpr size_t MAX_MOUNT_PATH = 512;
 constexpr size_t MAX_MOUNT_COMPONENTS = 64;
 constexpr uint32_t SHUTDOWN_UNMOUNT_DRAIN_YIELDS = 5000;
+constexpr size_t MOUNT_LOOKUP_CACHE_SET_COUNT = 128;
+constexpr size_t MOUNT_LOOKUP_CACHE_WAYS = 2;
+constexpr size_t MOUNT_ROOT_FALLBACK_CACHE_SET_COUNT = 64;
+constexpr size_t MOUNT_ROOT_FALLBACK_CACHE_WAYS = 2;
+constexpr size_t MOUNT_ROOT_COMPONENT_CACHE_MAX = 64;
+static_assert((MOUNT_LOOKUP_CACHE_SET_COUNT & (MOUNT_LOOKUP_CACHE_SET_COUNT - 1)) == 0);
+static_assert((MOUNT_ROOT_FALLBACK_CACHE_SET_COUNT & (MOUNT_ROOT_FALLBACK_CACHE_SET_COUNT - 1)) == 0);
+
+struct MountLookupCacheEntry {
+    std::array<char, MOUNT_PATH_MAX> path{};
+    uint64_t hash = 0;
+    uint64_t generation = 0;
+    uint64_t last_used = 0;
+    MountPoint* mount = nullptr;
+    size_t path_len = 0;
+    bool valid = false;
+};
+
+struct MountLookupCacheSet {
+    mod::sys::Spinlock lock;
+    std::array<MountLookupCacheEntry, MOUNT_LOOKUP_CACHE_WAYS> ways{};
+    uint64_t clock = 0;
+};
+
+struct MountRootFallbackCacheEntry {
+    std::array<char, MOUNT_ROOT_COMPONENT_CACHE_MAX> component{};
+    uint64_t hash = 0;
+    uint64_t generation = 0;
+    uint64_t last_used = 0;
+    MountPoint* root_mount = nullptr;
+    size_t component_len = 0;
+    bool valid = false;
+};
+
+struct MountRootFallbackCacheSet {
+    mod::sys::Spinlock lock;
+    std::array<MountRootFallbackCacheEntry, MOUNT_ROOT_FALLBACK_CACHE_WAYS> ways{};
+    uint64_t clock = 0;
+};
+
+std::array<MountLookupCacheSet, MOUNT_LOOKUP_CACHE_SET_COUNT> mount_lookup_cache{};
+std::array<MountRootFallbackCacheSet, MOUNT_ROOT_FALLBACK_CACHE_SET_COUNT> mount_root_fallback_cache{};
+
+#ifdef WOS_SELFTEST
+std::atomic<uint64_t> mount_lookup_cache_hits{0};
+#endif
 
 auto path_is_under_root(const char* path, const char* root, size_t root_len) -> bool {
     return std::strncmp(path, root, root_len) == 0 && (path[root_len] == '/' || path[root_len] == '\0');
@@ -218,6 +265,272 @@ auto retain_mount_locked(MountPoint* mount) -> bool {
     return true;
 }
 
+void bump_mount_generation_locked() { mount_generation.fetch_add(1, std::memory_order_acq_rel); }
+
+auto mount_lookup_known_path_len(const char* path, size_t known_path_len) -> size_t {
+    if (known_path_len != UNKNOWN_MOUNT_PATH_LEN) {
+        return known_path_len;
+    }
+    if (path == nullptr) {
+        return UNKNOWN_MOUNT_PATH_LEN;
+    }
+
+    size_t path_len = 0;
+    while (path_len < MOUNT_PATH_MAX && path[path_len] != '\0') {
+        ++path_len;
+    }
+    return path_len < MOUNT_PATH_MAX ? path_len : UNKNOWN_MOUNT_PATH_LEN;
+}
+
+auto mount_lookup_hash(const char* path, size_t path_len) -> uint64_t {
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < path_len; ++i) {
+        hash ^= static_cast<unsigned char>(path[i]);
+        hash *= 1099511628211ULL;
+    }
+    hash ^= path_len;
+    hash *= 1099511628211ULL;
+    return hash;
+}
+
+auto mount_is_root(const MountPoint* mount) -> bool {
+    return mount != nullptr && mount->path != nullptr && mount->path_len == 1 && mount->path[0] == '/';
+}
+
+auto mount_first_component_len(const char* path, size_t path_len) -> size_t {
+    if (path == nullptr || path_len < 2 || path[0] != '/') {
+        return 0;
+    }
+
+    size_t end = 1;
+    while (end < path_len && path[end] != '/') {
+        ++end;
+    }
+    return end - 1;
+}
+
+auto mount_component_hash(const char* component, size_t component_len) -> uint64_t {
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < component_len; ++i) {
+        hash ^= static_cast<unsigned char>(component[i]);
+        hash *= 1099511628211ULL;
+    }
+    hash ^= component_len;
+    hash *= 1099511628211ULL;
+    return hash == 0 ? 1 : hash;
+}
+
+auto mount_first_component_matches(const MountPoint* mount, const char* path, size_t component_len) -> bool {
+    if (mount == nullptr || mount->path == nullptr || path == nullptr || component_len == 0 || mount_is_root(mount) ||
+        mount->path_len < 2 || mount->path[0] != '/') {
+        return false;
+    }
+
+    size_t mount_component_len = 0;
+    for (size_t pos = 1; pos < mount->path_len && mount->path[pos] != '/'; ++pos) {
+        ++mount_component_len;
+    }
+    return mount_component_len == component_len && std::memcmp(mount->path + 1, path + 1, component_len) == 0;
+}
+
+auto mount_path_matches(const MountPoint* mount, const char* path, size_t path_len, bool path_len_known) -> bool {
+    if (mount == nullptr || mount->path == nullptr || path == nullptr) {
+        return false;
+    }
+
+    size_t const MOUNT_LEN = mount->path_len;
+    if (MOUNT_LEN == 0) {
+        return false;
+    }
+    if (path_len_known && MOUNT_LEN > path_len) {
+        return false;
+    }
+
+    if (MOUNT_LEN == 1 && mount->path[0] == '/') {
+        return path[0] == '/';
+    }
+
+    if (path_len_known) {
+        if (std::memcmp(path, mount->path, MOUNT_LEN) != 0) {
+            return false;
+        }
+        return MOUNT_LEN == path_len || path[MOUNT_LEN] == '/';
+    }
+
+    return std::strncmp(path, mount->path, MOUNT_LEN) == 0 && (path[MOUNT_LEN] == '\0' || path[MOUNT_LEN] == '/');
+}
+
+auto mount_lookup_cache_get_retained(const char* path, size_t path_len) -> MountPoint* {
+    if (path == nullptr || path_len == 0 || path_len >= MOUNT_PATH_MAX) {
+        return nullptr;
+    }
+
+    uint64_t const GENERATION = mount_generation.load(std::memory_order_acquire);
+    uint64_t const HASH = mount_lookup_hash(path, path_len);
+    auto& set = mount_lookup_cache.at(HASH & (MOUNT_LOOKUP_CACHE_SET_COUNT - 1));
+
+    MountPoint* candidate = nullptr;
+    set.lock.lock();
+    for (auto& entry : set.ways) {
+        if (!entry.valid || entry.generation != GENERATION || entry.hash != HASH || entry.path_len != path_len) {
+            continue;
+        }
+        if (std::memcmp(entry.path.data(), path, path_len) != 0) {
+            continue;
+        }
+        entry.last_used = ++set.clock;
+        candidate = entry.mount;
+        break;
+    }
+    set.lock.unlock();
+
+    if (candidate == nullptr) {
+        return nullptr;
+    }
+
+    MountPoint* retained = nullptr;
+    mount_lock.lock();
+    if (mount_generation.load(std::memory_order_acquire) == GENERATION && mount_path_matches(candidate, path, path_len, true) &&
+        retain_mount_locked(candidate)) {
+        retained = candidate;
+    }
+    mount_lock.unlock();
+
+#ifdef WOS_SELFTEST
+    if (retained != nullptr) {
+        mount_lookup_cache_hits.fetch_add(1, std::memory_order_relaxed);
+    }
+#endif
+
+    return retained;
+}
+
+auto mount_root_fallback_cache_get_retained(const char* path, size_t component_len) -> MountPoint* {
+    if (path == nullptr || component_len == 0 || component_len >= MOUNT_ROOT_COMPONENT_CACHE_MAX || path[0] != '/') {
+        return nullptr;
+    }
+
+    uint64_t const GENERATION = mount_generation.load(std::memory_order_acquire);
+    uint64_t const HASH = mount_component_hash(path + 1, component_len);
+    auto& set = mount_root_fallback_cache.at(HASH & (MOUNT_ROOT_FALLBACK_CACHE_SET_COUNT - 1));
+
+    MountPoint* candidate = nullptr;
+    set.lock.lock();
+    for (auto& entry : set.ways) {
+        if (!entry.valid || entry.generation != GENERATION || entry.hash != HASH || entry.component_len != component_len) {
+            continue;
+        }
+        if (std::memcmp(entry.component.data(), path + 1, component_len) != 0) {
+            continue;
+        }
+        entry.last_used = ++set.clock;
+        candidate = entry.root_mount;
+        break;
+    }
+    set.lock.unlock();
+
+    if (candidate == nullptr) {
+        return nullptr;
+    }
+
+    MountPoint* retained = nullptr;
+    mount_lock.lock();
+    if (mount_generation.load(std::memory_order_acquire) == GENERATION && mount_is_root(candidate) && retain_mount_locked(candidate)) {
+        retained = candidate;
+    }
+    mount_lock.unlock();
+    return retained;
+}
+
+void mount_lookup_cache_store(const char* path, size_t path_len, MountPoint* mount, uint64_t generation) {
+    if (path == nullptr || mount == nullptr || path_len == 0 || path_len >= MOUNT_PATH_MAX) {
+        return;
+    }
+
+    uint64_t const HASH = mount_lookup_hash(path, path_len);
+    auto& set = mount_lookup_cache.at(HASH & (MOUNT_LOOKUP_CACHE_SET_COUNT - 1));
+
+    set.lock.lock();
+    MountLookupCacheEntry* victim = nullptr;
+    for (auto& entry : set.ways) {
+        if (entry.valid && entry.generation == generation && entry.hash == HASH && entry.path_len == path_len &&
+            std::memcmp(entry.path.data(), path, path_len) == 0) {
+            entry.mount = mount;
+            entry.last_used = ++set.clock;
+            set.lock.unlock();
+            return;
+        }
+        if (!entry.valid && victim == nullptr) {
+            victim = &entry;
+        }
+    }
+
+    if (victim == nullptr) {
+        victim = &set.ways.at(0);
+        for (auto& entry : set.ways) {
+            if (entry.last_used < victim->last_used) {
+                victim = &entry;
+            }
+        }
+    }
+
+    victim->valid = false;
+    std::memcpy(victim->path.data(), path, path_len);
+    victim->path.at(path_len) = '\0';
+    victim->hash = HASH;
+    victim->generation = generation;
+    victim->last_used = ++set.clock;
+    victim->mount = mount;
+    victim->path_len = path_len;
+    victim->valid = true;
+    set.lock.unlock();
+}
+
+void mount_root_fallback_cache_store(const char* path, size_t component_len, MountPoint* root_mount, uint64_t generation) {
+    if (path == nullptr || path[0] != '/' || component_len == 0 || component_len >= MOUNT_ROOT_COMPONENT_CACHE_MAX ||
+        !mount_is_root(root_mount)) {
+        return;
+    }
+
+    uint64_t const HASH = mount_component_hash(path + 1, component_len);
+    auto& set = mount_root_fallback_cache.at(HASH & (MOUNT_ROOT_FALLBACK_CACHE_SET_COUNT - 1));
+
+    set.lock.lock();
+    MountRootFallbackCacheEntry* victim = nullptr;
+    for (auto& entry : set.ways) {
+        if (entry.valid && entry.generation == generation && entry.hash == HASH && entry.component_len == component_len &&
+            std::memcmp(entry.component.data(), path + 1, component_len) == 0) {
+            entry.root_mount = root_mount;
+            entry.last_used = ++set.clock;
+            set.lock.unlock();
+            return;
+        }
+        if (!entry.valid && victim == nullptr) {
+            victim = &entry;
+        }
+    }
+
+    if (victim == nullptr) {
+        victim = &set.ways.at(0);
+        for (auto& entry : set.ways) {
+            if (entry.last_used < victim->last_used) {
+                victim = &entry;
+            }
+        }
+    }
+
+    victim->valid = false;
+    std::memcpy(victim->component.data(), path + 1, component_len);
+    victim->component.at(component_len) = '\0';
+    victim->hash = HASH;
+    victim->generation = generation;
+    victim->last_used = ++set.clock;
+    victim->root_mount = root_mount;
+    victim->component_len = component_len;
+    victim->valid = true;
+    set.lock.unlock();
+}
+
 auto replace_mount_path_locked(MountPoint* mount, const char* new_path, size_t new_path_len) -> int {
     if (mount_has_active_refs_locked(mount)) {
         return -EBUSY;
@@ -229,6 +542,7 @@ auto replace_mount_path_locked(MountPoint* mount, const char* new_path, size_t n
     std::memcpy(replacement, new_path, new_path_len + 1);
     delete[] mount->path;
     mount->path = replacement;
+    mount->path_len = new_path_len;
     return 0;
 }
 
@@ -341,8 +655,8 @@ auto mount_should_come_after(const MountPoint* lhs, const MountPoint* rhs, const
         return LHS_DEPTH < RHS_DEPTH;
     }
 
-    size_t const LHS_LEN = lhs != nullptr && lhs->path != nullptr ? std::strlen(lhs->path) : 0;
-    size_t const RHS_LEN = rhs != nullptr && rhs->path != nullptr ? std::strlen(rhs->path) : 0;
+    size_t const LHS_LEN = lhs != nullptr && lhs->path != nullptr ? lhs->path_len : 0;
+    size_t const RHS_LEN = rhs != nullptr && rhs->path != nullptr ? rhs->path_len : 0;
     return LHS_LEN < RHS_LEN;
 }
 
@@ -399,6 +713,38 @@ auto mount_point_ref_count_for_test(const MountPoint* mount) -> uint32_t {
     }
     return mount->refs.load(std::memory_order_acquire);
 }
+
+void mount_lookup_cache_reset_for_test() {
+    for (auto& set : mount_lookup_cache) {
+        set.lock.lock();
+        set.clock = 0;
+        for (auto& entry : set.ways) {
+            entry.valid = false;
+            entry.mount = nullptr;
+            entry.path_len = 0;
+            entry.hash = 0;
+            entry.generation = 0;
+            entry.last_used = 0;
+        }
+        set.lock.unlock();
+    }
+    for (auto& set : mount_root_fallback_cache) {
+        set.lock.lock();
+        set.clock = 0;
+        for (auto& entry : set.ways) {
+            entry.valid = false;
+            entry.root_mount = nullptr;
+            entry.component_len = 0;
+            entry.hash = 0;
+            entry.generation = 0;
+            entry.last_used = 0;
+        }
+        set.lock.unlock();
+    }
+    mount_lookup_cache_hits.store(0, std::memory_order_relaxed);
+}
+
+auto mount_lookup_cache_hits_for_test() -> uint64_t { return mount_lookup_cache_hits.load(std::memory_order_relaxed); }
 #endif
 
 // Resolve path like resolve_task_path_raw does for mount-table keys:
@@ -493,6 +839,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     }
     std::memcpy(path_copy, resolved.data(), PATH_LEN + 1);
     mount->path = path_copy;
+    mount->path_len = PATH_LEN;
 
     size_t const FSTYPE_LEN = std::strlen(fstype);
     auto* fstype_copy = new char[FSTYPE_LEN + 1];
@@ -602,6 +949,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     if (mount->fs_type == FSType::XFS && mount->private_data != nullptr) {
         static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data)->dev_id = mount->dev_id;
     }
+    bump_mount_generation_locked();
     if (!mounts.push_back(mount)) {
         mount_lock.unlock();
         vfs_debug_log("mount_filesystem: mount table full (OOM)\n");
@@ -647,6 +995,7 @@ auto unmount_filesystem(const char* path) -> int {
         MountPoint* mp = mounts.at(i);
         if (mp != nullptr && mp->path != nullptr && std::strcmp(resolved.data(), mp->path) == 0) {
             mp->retiring.store(true, std::memory_order_release);
+            bump_mount_generation_locked();
             mounts.remove_at(i);
             size_t const MOUNT_COUNT_AFTER_REMOVE = mounts.size();
             mount_lock.unlock();
@@ -701,6 +1050,7 @@ auto shutdown_unmount_all_exact(const char* root_path) -> int {
             mp->retiring.store(true, std::memory_order_release);
             pending[pending_count++] = mp;
         }
+        bump_mount_generation_locked();
         mounts.remove_at(0);
     }
     if (!mounts.empty()) {
@@ -739,14 +1089,31 @@ auto shutdown_unmount_all_exact(const char* root_path) -> int {
     return result;
 }
 
-auto find_mount_point(const char* path) -> MountRef {
+auto find_mount_point(const char* path, size_t known_path_len) -> MountRef {
     if (path == nullptr) {
         return MountRef{};
+    }
+
+    size_t const PATH_LEN = mount_lookup_known_path_len(path, known_path_len);
+    bool const PATH_LEN_KNOWN = PATH_LEN != UNKNOWN_MOUNT_PATH_LEN;
+    size_t const FIRST_COMPONENT_LEN = PATH_LEN_KNOWN ? mount_first_component_len(path, PATH_LEN) : 0;
+    bool const ROOT_FALLBACK_CACHEABLE = FIRST_COMPONENT_LEN > 0 && FIRST_COMPONENT_LEN < MOUNT_ROOT_COMPONENT_CACHE_MAX && path[0] == '/';
+    if (PATH_LEN_KNOWN) {
+        if (ROOT_FALLBACK_CACHEABLE) {
+            if (auto* cached_root = mount_root_fallback_cache_get_retained(path, FIRST_COMPONENT_LEN); cached_root != nullptr) {
+                return MountRef{cached_root};
+            }
+        }
+        if (auto* cached = mount_lookup_cache_get_retained(path, PATH_LEN); cached != nullptr) {
+            return MountRef{cached};
+        }
     }
 
     // Find the longest matching mount point
     MountPoint* best_match = nullptr;
     size_t best_length = 0;
+    uint64_t generation = 0;
+    bool first_component_has_nonroot_mount = false;
 
     mount_lock.lock();
     for (auto* mount : mounts) {
@@ -754,40 +1121,33 @@ auto find_mount_point(const char* path) -> MountRef {
             continue;
         }
 
-        // Check if path starts with this mount point
-        const char* mount_path = mount->path;
-        const char* current_path = path;
-        size_t j = 0;
-        while (*mount_path != '\0' && *current_path != '\0') {
-            if (*mount_path != *current_path) {
-                break;
-            }
-            mount_path++;
-            current_path++;
-            j++;
+        if (ROOT_FALLBACK_CACHEABLE && mount_first_component_matches(mount, path, FIRST_COMPONENT_LEN)) {
+            first_component_has_nonroot_mount = true;
         }
 
-        // Path matches this mount point if we've consumed the entire mount path
-        // Special case: root mount "/" matches everything that starts with /
-        // Otherwise: mount path must be followed by \0 or /
-        if (*mount_path == '\0') {
-            // For root mount "/", j==1 and we just need path to start with /
-            // For other mounts, path must end or continue with /
-            if ((j == 1 && *mount->path == '/') || *current_path == '\0' || *current_path == '/') {
-                if (j > best_length) {
-                    best_match = mount;
-                    best_length = j;
-                }
-            }
+        size_t const MOUNT_LEN = mount->path_len;
+        if (mount_path_matches(mount, path, PATH_LEN, PATH_LEN_KNOWN) && MOUNT_LEN > best_length) {
+            best_match = mount;
+            best_length = MOUNT_LEN;
         }
     }
     if (best_match != nullptr && !retain_mount_locked(best_match)) {
         best_match = nullptr;
     }
+    generation = mount_generation.load(std::memory_order_acquire);
     mount_lock.unlock();
+
+    if (best_match != nullptr && PATH_LEN_KNOWN) {
+        mount_lookup_cache_store(path, PATH_LEN, best_match, generation);
+        if (ROOT_FALLBACK_CACHEABLE && mount_is_root(best_match) && !first_component_has_nonroot_mount) {
+            mount_root_fallback_cache_store(path, FIRST_COMPONENT_LEN, best_match, generation);
+        }
+    }
 
     return MountRef{best_match};
 }
+
+auto mount_table_generation_snapshot() -> uint64_t { return mount_generation.load(std::memory_order_acquire); }
 
 auto configure_mount_point_exact(const char* path, FSType expected_type, void* private_data, FileOperations* fops) -> bool {
     if (path == nullptr) {
@@ -861,6 +1221,8 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int {
         }
     }
 
+    bump_mount_generation_locked();
+
     if (old_root_mount != nullptr) {
         int const REPLACE_RET = replace_mount_path_locked(old_root_mount, put_old, PUT_OLD_LEN);
         if (REPLACE_RET < 0) {
@@ -877,7 +1239,7 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int {
             continue;
         }
 
-        size_t const MP_LEN = std::strlen(mp->path);
+        size_t const MP_LEN = mp->path_len;
         auto* remapped = new char[NEW_ROOT_LEN + MP_LEN + 1];
         if (remapped == nullptr) {
             continue;
@@ -888,6 +1250,7 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int {
         log::info("pivot_root remapped mount '%s' -> '%s'", mp->path, remapped);
         delete[] mp->path;
         mp->path = remapped;
+        mp->path_len = NEW_ROOT_LEN + MP_LEN;
     }
 
     mount_lock.unlock();
@@ -902,6 +1265,7 @@ void rebase_wki_mounts_for_new_root(const char* new_root) {
     size_t const NEW_ROOT_LEN = std::strlen(new_root);
 
     mount_lock.lock();
+    bump_mount_generation_locked();
     for (auto* mp : mounts) {
         if (mp == nullptr || mp->path == nullptr) {
             continue;
@@ -916,7 +1280,7 @@ void rebase_wki_mounts_for_new_root(const char* new_root) {
             continue;
         }
 
-        size_t const MP_LEN = std::strlen(mp->path);
+        size_t const MP_LEN = mp->path_len;
         auto* remapped = new char[NEW_ROOT_LEN + MP_LEN + 1];
         if (remapped == nullptr) {
             continue;
@@ -927,6 +1291,7 @@ void rebase_wki_mounts_for_new_root(const char* new_root) {
         log::info("pivot_root rebased late WKI mount '%s' -> '%s'", mp->path, remapped);
         delete[] mp->path;
         mp->path = remapped;
+        mp->path_len = NEW_ROOT_LEN + MP_LEN;
     }
     mount_lock.unlock();
 }
@@ -969,7 +1334,7 @@ auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool {
         return false;
     }
 
-    size_t const PATH_LEN = std::strlen(mp->path);
+    size_t const PATH_LEN = mp->path_len;
     if (PATH_LEN >= MOUNT_PATH_MAX) {
         mount_lock.unlock();
         return false;

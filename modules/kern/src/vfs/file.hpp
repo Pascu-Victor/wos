@@ -15,6 +15,8 @@ namespace ker::vfs {
 constexpr int O_CLOEXEC = 02000000;
 // O_CREAT: create file if it does not exist
 constexpr int O_CREAT = 0100;
+// O_EXCL: with O_CREAT, fail if the final path already exists
+constexpr int O_EXCL = 0200;
 // O_TRUNC: truncate regular file to zero length on open
 constexpr int O_TRUNC = 01000;
 // O_DIRECTORY: fail open unless the resolved path is a directory.
@@ -29,6 +31,10 @@ constexpr int O_NO_CACHE = 0100000000;
 constexpr int O_LOCAL = 0200000000;
 // O_ALWAYS_CACHE: trust detached file-cache contents until explicitly invalidated.
 constexpr int O_ALWAYS_CACHE = 0400000000;
+// O_WOS_KNOWN_ABSENT: private WOS hint for trusted O_CREAT|O_EXCL callers that
+// already know the final path is absent. Filesystems must not persist this in
+// File::open_flags.
+constexpr int O_WOS_KNOWN_ABSENT = 01000000000;
 // FD_CLOEXEC: per-descriptor flag indicating close-on-exec
 constexpr int FD_CLOEXEC = 1;
 
@@ -57,9 +63,15 @@ struct File {
     // Backends that know the O_CREAT result can avoid conservative parent metadata invalidation.
     bool open_create_result_known = false;
     bool created_by_open = false;
+    // Some backends may finalize allocation metadata in close(). In that case
+    // VFS must invalidate any path stat cached before the backend close hook.
+    bool close_may_change_metadata = false;
+    uint32_t mount_dev_id = 0;
+    uint64_t mount_generation = 0;
 
     // Mount-overlay directory listing support
     const char* vfs_path{};  // Absolute VFS path, set by VFS open helpers
+    size_t vfs_path_len{};   // Normalized length of vfs_path, or 0 when unknown
     size_t dir_fs_count{};   // Cached FS readdir entry count ((size_t)-1 = unknown)
     std::array<char, INLINE_VFS_PATH_CAPACITY> vfs_path_inline{};
     bool vfs_path_heap_allocated = false;
@@ -81,6 +93,8 @@ struct File {
     // Last global metadata-observation epoch covered by this file's data-write
     // invalidation. Repeated writes can reuse it until stat caches are stored.
     uint64_t metadata_data_invalidation_observation_epoch = 0;
+    uint64_t metadata_data_close_refresh_invalidation_generation = 0;
+    bool metadata_data_close_refresh_pending = false;
 
     // Hint for filesystem backends that this file is currently being serviced
     // through vfs_pread(), so sequential prefetch/read-ahead should be avoided.

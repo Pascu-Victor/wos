@@ -1,28 +1,34 @@
 cmake_minimum_required(VERSION 3.20)
 
-include(ExternalProject)
-
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "WOS build type" FORCE)
 endif()
 set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
 
 option(WOS_BUILD_LINUX_BENCHMARKS "Build Linux host benchmark binaries alongside WOS artifacts" OFF)
-option(WOS_USE_CCACHE "Use ccache/cccache as a compiler launcher when available" ON)
-set(WOS_CCACHE_PROGRAM "" CACHE FILEPATH "Path to ccache/cccache")
 set(WOS_TOOLS_BUILD_TYPE Release CACHE STRING "Build type for host-side WOS tools")
 set_property(CACHE WOS_TOOLS_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
 set(WOS_NATIVE_SYSTEM_BUILD OFF CACHE BOOL "Build modules with the native WOS system toolchain")
-execute_process(
-    COMMAND uname -s
-    OUTPUT_VARIABLE WOS_HOST_UNAME
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
+set(WOS_HOST_UNAME "")
+if(NOT ((DEFINED ENV{WOS_NATIVE_HOST} AND "$ENV{WOS_NATIVE_HOST}" STREQUAL "1") OR CMAKE_HOST_SYSTEM_NAME STREQUAL "WOS"))
+    execute_process(
+        COMMAND uname -s
+        OUTPUT_VARIABLE WOS_HOST_UNAME
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
 if((DEFINED ENV{WOS_NATIVE_HOST} AND "$ENV{WOS_NATIVE_HOST}" STREQUAL "1") OR CMAKE_HOST_SYSTEM_NAME STREQUAL "WOS" OR
    WOS_HOST_UNAME STREQUAL "WOS")
     set(WOS_NATIVE_SYSTEM_BUILD ON CACHE BOOL "Build modules with the native WOS system toolchain" FORCE)
 endif()
+
+set(WOS_USE_CCACHE_DEFAULT ON)
+if(WOS_NATIVE_SYSTEM_BUILD)
+    set(WOS_USE_CCACHE_DEFAULT OFF)
+endif()
+option(WOS_USE_CCACHE "Use ccache/cccache as a compiler launcher when available" ${WOS_USE_CCACHE_DEFAULT})
+set(WOS_CCACHE_PROGRAM "" CACHE FILEPATH "Path to ccache/cccache")
 
 set(WOS_PORT_BUILD_DEFAULT ON)
 if(WOS_NATIVE_SYSTEM_BUILD)
@@ -72,6 +78,7 @@ elseif(DEFINED ENV{CMAKE_BUILD_PARALLEL_LEVEL} AND "$ENV{CMAKE_BUILD_PARALLEL_LE
 endif()
 
 if(WOS_BUILD_HOST_TOOLS)
+    include(ExternalProject)
     ExternalProject_Add(wos_tools_build
         SOURCE_DIR ${CMAKE_SOURCE_DIR}/tools
         BINARY_DIR ${CMAKE_BINARY_DIR}/tools
@@ -202,10 +209,13 @@ function(wos_add_preseeded_artifact_target target_name stamp label)
 endfunction()
 
 # --- check_headers: validate #pragma once in kern and init headers ----------
-wos_glob_recurse(WOS_HEADER_CHECK_FILES
-    ${CMAKE_SOURCE_DIR}/modules/kern/*.hpp
-    ${CMAKE_SOURCE_DIR}/modules/init/*.hpp
-)
+set(WOS_HEADER_CHECK_FILES)
+if(NOT WOS_NATIVE_SYSTEM_BUILD)
+    wos_glob_recurse(WOS_HEADER_CHECK_FILES
+        ${CMAKE_SOURCE_DIR}/modules/kern/*.hpp
+        ${CMAKE_SOURCE_DIR}/modules/init/*.hpp
+    )
+endif()
 set(CHECK_HEADERS_STAMP ${CMAKE_BINARY_DIR}/stamps/check_headers.stamp)
 add_custom_command(
     OUTPUT ${CHECK_HEADERS_STAMP}
@@ -886,138 +896,173 @@ if(WOS_BUILD_NANO_FOR_WOS)
     list(APPEND WOS_NANO_FOR_WOS_ROOTFS_INPUTS ${NANO_FOR_WOS_STAMP})
 endif()
 
-# --- mountfs_disk: create or delta-sync the XFS rootfs image ----------------
-# If mountfs.qcow2 doesn't exist, create it from scratch.
-# If it already exists, delta-sync changed binaries and libraries.
-wos_glob_recurse(WOS_ROOTFS_CONFIG_INPUTS
-    ${CMAKE_SOURCE_DIR}/configs/rootfs/*
-    ${CMAKE_SOURCE_DIR}/configs/drive/srv/*
-)
-set(WOS_MODULE_TARGET_FILES
-    $<TARGET_FILE:wos>
-    $<TARGET_FILE:init>
-    $<TARGET_FILE:testprog>
-    $<TARGET_FILE:testd>
-    $<TARGET_FILE:netd>
-    $<TARGET_FILE:httpd>
-    $<TARGET_FILE:debugserver>
-    $<TARGET_FILE:perf>
-    $<TARGET_FILE:top>
-    $<TARGET_FILE:memacc>
-    $<TARGET_FILE:journal>
-    $<TARGET_FILE:journal_lib>
-    $<TARGET_FILE:wkictl>
-    $<TARGET_FILE:powerctl>
-    $<TARGET_FILE:renderbench>
-    $<TARGET_FILE:strace>
-    $<TARGET_FILE:sftpserver>
-)
-set(MOUNTFS_STAMP ${CMAKE_BINARY_DIR}/stamps/mountfs_disk.stamp)
-add_custom_command(
-    OUTPUT ${WOS_ROOTFS_DISK} ${MOUNTFS_STAMP}
-    COMMAND ${CMAKE_COMMAND} -E env
-            WOS_BUILD_DIR=${CMAKE_BINARY_DIR}
-            WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
-            WOS_BUSYBOX_INSTALL_DIR=${WOS_BUSYBOX_INSTALL_DIR}
-            WOS_ROOTFS_DISK=${WOS_ROOTFS_DISK}
-            bash -c "if [ -f '${WOS_ROOTFS_DISK}' ]\; then '${WOS_BUILD_SCRIPTS_DIR}/sync_rootfs.sh'\; else '${WOS_BUILD_SCRIPTS_DIR}/create_mountfs_disk.sh'\; fi"
-    COMMAND ${CMAKE_COMMAND} -E touch ${MOUNTFS_STAMP}
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    COMMENT "Syncing rootfs disk..."
-    DEPENDS
-        ${WOS_BUILD_SCRIPTS_DIR}/create_mountfs_disk.sh
-        ${WOS_BUILD_SCRIPTS_DIR}/qcow_common.sh
-        ${WOS_BUILD_SCRIPTS_DIR}/rootfs_common.sh
-        ${WOS_BUILD_SCRIPTS_DIR}/rootfs_delta.py
-        ${WOS_BUILD_SCRIPTS_DIR}/rootfs_qcow_xfs_delta.py
-        ${WOS_BUILD_SCRIPTS_DIR}/sync_rootfs.sh
-        ${CMAKE_SOURCE_DIR}/configs/system.conf
-        ${CMAKE_SOURCE_DIR}/configs/vfstab
-        ${WOS_ROOTFS_CONFIG_INPUTS}
-        ${WOS_MODULE_TARGET_FILES}
-        ${BUSYBOX_STAMP}
-        ${DROPBEAR_STAMP}
-        ${GNU_MAKE_STAMP}
-        ${LIBCXX_STAMP}
-        ${WOS_CLANG_FOR_WOS_ROOTFS_INPUTS}
-        ${WOS_NINJA_FOR_WOS_ROOTFS_INPUTS}
-        ${WOS_CMAKE_FOR_WOS_ROOTFS_INPUTS}
-        ${WOS_PYTHON_FOR_WOS_ROOTFS_INPUTS}
-        ${WOS_MESON_FOR_WOS_ROOTFS_INPUTS}
-        ${WOS_NASM_FOR_WOS_ROOTFS_INPUTS}
-        ${WOS_BASH_FOR_WOS_ROOTFS_INPUTS}
-        ${WOS_NCURSES_FOR_WOS_ROOTFS_INPUTS}
-        ${WOS_NANO_FOR_WOS_ROOTFS_INPUTS}
-        ${WOS_CURL_FOR_WOS_ROOTFS_INPUTS}
-        ${WOS_GIT_FOR_WOS_ROOTFS_INPUTS}
-)
-add_custom_target(mountfs_disk DEPENDS ${WOS_ROOTFS_DISK} ${MOUNTFS_STAMP})
-if(WOS_BUILD_CLANG_FOR_WOS)
-    add_dependencies(mountfs_disk clang_for_wos)
-endif()
-if(WOS_BUILD_NINJA_FOR_WOS)
-    add_dependencies(mountfs_disk ninja_for_wos)
-endif()
-if(WOS_BUILD_CMAKE_FOR_WOS)
-    add_dependencies(mountfs_disk cmake_for_wos)
-endif()
-if(WOS_BUILD_PYTHON_FOR_WOS)
-    add_dependencies(mountfs_disk python_for_wos)
-endif()
-if(WOS_BUILD_MESON_FOR_WOS)
-    add_dependencies(mountfs_disk meson_for_wos)
-endif()
-if(WOS_BUILD_NASM_FOR_WOS)
-    add_dependencies(mountfs_disk nasm_for_wos)
-endif()
-if(WOS_BUILD_BASH_FOR_WOS)
-    add_dependencies(mountfs_disk bash_for_wos)
-endif()
-if(WOS_BUILD_NCURSES_FOR_WOS OR WOS_BUILD_NANO_FOR_WOS)
-    add_dependencies(mountfs_disk ncurses_for_wos)
-endif()
-if(WOS_BUILD_NANO_FOR_WOS)
-    add_dependencies(mountfs_disk nano_for_wos)
-endif()
-if(WOS_BUILD_CURL_FOR_WOS)
-    add_dependencies(mountfs_disk curl_for_wos)
-endif()
-if(WOS_BUILD_GIT_FOR_WOS)
-    add_dependencies(mountfs_disk git_for_wos)
-endif()
-
-# --- boot_image: create the boot disk + initramfs --------------------------
-set(INITRAMFS_OUTPUT ${CMAKE_BINARY_DIR}/initramfs.cpio)
-set(BOOT_IMAGE_STAMP ${CMAKE_BINARY_DIR}/stamps/boot_image.stamp)
-add_custom_command(
-    OUTPUT ${WOS_BOOT_DISK} ${INITRAMFS_OUTPUT} ${BOOT_IMAGE_STAMP}
-    COMMAND ${CMAKE_COMMAND} -E env
-            WOS_BUILD_DIR=${CMAKE_BINARY_DIR}
-            WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
-            WOS_BUSYBOX_INSTALL_DIR=${WOS_BUSYBOX_INSTALL_DIR}
-            WOS_BOOT_DISK=${WOS_BOOT_DISK}
-            WOS_ROOTFS_DISK=${WOS_ROOTFS_DISK}
-            ${WOS_BUILD_SCRIPTS_DIR}/make_image.sh
-    COMMAND ${CMAKE_COMMAND} -E touch ${BOOT_IMAGE_STAMP}
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    COMMENT "Creating boot image..."
-    DEPENDS
-        ${WOS_BUILD_SCRIPTS_DIR}/make_image.sh
-        ${WOS_BUILD_SCRIPTS_DIR}/make_initramfs.sh
-        ${WOS_BUILD_SCRIPTS_DIR}/extract_partuuid.py
-        ${WOS_BUILD_SCRIPTS_DIR}/qcow_common.sh
-        ${CMAKE_SOURCE_DIR}/configs/disks.conf
-        ${CMAKE_SOURCE_DIR}/configs/netdevs.conf
-        ${CMAKE_SOURCE_DIR}/configs/system.conf
-        ${CMAKE_SOURCE_DIR}/configs/vfstab
-        ${CMAKE_SOURCE_DIR}/modules/kern/limine.conf
+if(WOS_BUILD_DISK_IMAGES)
+    # --- mountfs_disk: create or delta-sync the XFS rootfs image ------------
+    # If mountfs.qcow2 doesn't exist, create it from scratch.
+    # If it already exists, delta-sync changed binaries and libraries.
+    wos_glob_recurse(WOS_ROOTFS_CONFIG_INPUTS
+        ${CMAKE_SOURCE_DIR}/configs/rootfs/*
+        ${CMAKE_SOURCE_DIR}/configs/drive/srv/*
+    )
+    set(WOS_MODULE_TARGET_FILES
         $<TARGET_FILE:wos>
         $<TARGET_FILE:init>
-        ${WOS_ROOTFS_DISK}
-        ${MOUNTFS_STAMP}
-        ${LIBCXX_STAMP}
-)
-add_custom_target(boot_image DEPENDS ${WOS_BOOT_DISK} ${INITRAMFS_OUTPUT} ${BOOT_IMAGE_STAMP})
+        $<TARGET_FILE:testprog>
+        $<TARGET_FILE:testd>
+        $<TARGET_FILE:netd>
+        $<TARGET_FILE:httpd>
+        $<TARGET_FILE:debugserver>
+        $<TARGET_FILE:perf>
+        $<TARGET_FILE:top>
+        $<TARGET_FILE:memacc>
+        $<TARGET_FILE:journal>
+        $<TARGET_FILE:journal_lib>
+        $<TARGET_FILE:wkictl>
+        $<TARGET_FILE:powerctl>
+        $<TARGET_FILE:renderbench>
+        $<TARGET_FILE:strace>
+        $<TARGET_FILE:sftpserver>
+    )
+    set(MOUNTFS_STAMP ${CMAKE_BINARY_DIR}/stamps/mountfs_disk.stamp)
+    add_custom_command(
+        OUTPUT ${WOS_ROOTFS_DISK} ${MOUNTFS_STAMP}
+        COMMAND ${CMAKE_COMMAND} -E env
+                WOS_BUILD_DIR=${CMAKE_BINARY_DIR}
+                WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+                WOS_BUSYBOX_INSTALL_DIR=${WOS_BUSYBOX_INSTALL_DIR}
+                WOS_ROOTFS_DISK=${WOS_ROOTFS_DISK}
+                bash -c "if [ -f '${WOS_ROOTFS_DISK}' ]\; then '${WOS_BUILD_SCRIPTS_DIR}/sync_rootfs.sh'\; else '${WOS_BUILD_SCRIPTS_DIR}/create_mountfs_disk.sh'\; fi"
+        COMMAND ${CMAKE_COMMAND} -E touch ${MOUNTFS_STAMP}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Syncing rootfs disk..."
+        DEPENDS
+            ${WOS_BUILD_SCRIPTS_DIR}/create_mountfs_disk.sh
+            ${WOS_BUILD_SCRIPTS_DIR}/qcow_common.sh
+            ${WOS_BUILD_SCRIPTS_DIR}/rootfs_common.sh
+            ${WOS_BUILD_SCRIPTS_DIR}/rootfs_delta.py
+            ${WOS_BUILD_SCRIPTS_DIR}/rootfs_qcow_xfs_delta.py
+            ${WOS_BUILD_SCRIPTS_DIR}/sync_rootfs.sh
+            ${CMAKE_SOURCE_DIR}/configs/system.conf
+            ${CMAKE_SOURCE_DIR}/configs/vfstab
+            ${WOS_ROOTFS_CONFIG_INPUTS}
+            ${WOS_MODULE_TARGET_FILES}
+            ${BUSYBOX_STAMP}
+            ${DROPBEAR_STAMP}
+            ${GNU_MAKE_STAMP}
+            ${LIBCXX_STAMP}
+            ${WOS_CLANG_FOR_WOS_ROOTFS_INPUTS}
+            ${WOS_NINJA_FOR_WOS_ROOTFS_INPUTS}
+            ${WOS_CMAKE_FOR_WOS_ROOTFS_INPUTS}
+            ${WOS_PYTHON_FOR_WOS_ROOTFS_INPUTS}
+            ${WOS_MESON_FOR_WOS_ROOTFS_INPUTS}
+            ${WOS_NASM_FOR_WOS_ROOTFS_INPUTS}
+            ${WOS_BASH_FOR_WOS_ROOTFS_INPUTS}
+            ${WOS_NCURSES_FOR_WOS_ROOTFS_INPUTS}
+            ${WOS_NANO_FOR_WOS_ROOTFS_INPUTS}
+            ${WOS_CURL_FOR_WOS_ROOTFS_INPUTS}
+            ${WOS_GIT_FOR_WOS_ROOTFS_INPUTS}
+    )
+    add_custom_target(mountfs_disk DEPENDS ${WOS_ROOTFS_DISK} ${MOUNTFS_STAMP})
+    if(WOS_BUILD_CLANG_FOR_WOS)
+        add_dependencies(mountfs_disk clang_for_wos)
+    endif()
+    if(WOS_BUILD_NINJA_FOR_WOS)
+        add_dependencies(mountfs_disk ninja_for_wos)
+    endif()
+    if(WOS_BUILD_CMAKE_FOR_WOS)
+        add_dependencies(mountfs_disk cmake_for_wos)
+    endif()
+    if(WOS_BUILD_PYTHON_FOR_WOS)
+        add_dependencies(mountfs_disk python_for_wos)
+    endif()
+    if(WOS_BUILD_MESON_FOR_WOS)
+        add_dependencies(mountfs_disk meson_for_wos)
+    endif()
+    if(WOS_BUILD_NASM_FOR_WOS)
+        add_dependencies(mountfs_disk nasm_for_wos)
+    endif()
+    if(WOS_BUILD_BASH_FOR_WOS)
+        add_dependencies(mountfs_disk bash_for_wos)
+    endif()
+    if(WOS_BUILD_NCURSES_FOR_WOS OR WOS_BUILD_NANO_FOR_WOS)
+        add_dependencies(mountfs_disk ncurses_for_wos)
+    endif()
+    if(WOS_BUILD_NANO_FOR_WOS)
+        add_dependencies(mountfs_disk nano_for_wos)
+    endif()
+    if(WOS_BUILD_CURL_FOR_WOS)
+        add_dependencies(mountfs_disk curl_for_wos)
+    endif()
+    if(WOS_BUILD_GIT_FOR_WOS)
+        add_dependencies(mountfs_disk git_for_wos)
+    endif()
+
+    # --- boot_image: create the boot disk + initramfs ----------------------
+    set(INITRAMFS_OUTPUT ${CMAKE_BINARY_DIR}/initramfs.cpio)
+    set(BOOT_IMAGE_STAMP ${CMAKE_BINARY_DIR}/stamps/boot_image.stamp)
+    add_custom_command(
+        OUTPUT ${WOS_BOOT_DISK} ${INITRAMFS_OUTPUT} ${BOOT_IMAGE_STAMP}
+        COMMAND ${CMAKE_COMMAND} -E env
+                WOS_BUILD_DIR=${CMAKE_BINARY_DIR}
+                WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+                WOS_BUSYBOX_INSTALL_DIR=${WOS_BUSYBOX_INSTALL_DIR}
+                WOS_BOOT_DISK=${WOS_BOOT_DISK}
+                WOS_ROOTFS_DISK=${WOS_ROOTFS_DISK}
+                ${WOS_BUILD_SCRIPTS_DIR}/make_image.sh
+        COMMAND ${CMAKE_COMMAND} -E touch ${BOOT_IMAGE_STAMP}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Creating boot image..."
+        DEPENDS
+            ${WOS_BUILD_SCRIPTS_DIR}/make_image.sh
+            ${WOS_BUILD_SCRIPTS_DIR}/make_initramfs.sh
+            ${WOS_BUILD_SCRIPTS_DIR}/extract_partuuid.py
+            ${WOS_BUILD_SCRIPTS_DIR}/qcow_common.sh
+            ${CMAKE_SOURCE_DIR}/configs/disks.conf
+            ${CMAKE_SOURCE_DIR}/configs/netdevs.conf
+            ${CMAKE_SOURCE_DIR}/configs/system.conf
+            ${CMAKE_SOURCE_DIR}/configs/vfstab
+            ${CMAKE_SOURCE_DIR}/modules/kern/limine.conf
+            $<TARGET_FILE:wos>
+            $<TARGET_FILE:init>
+            ${WOS_ROOTFS_DISK}
+            ${MOUNTFS_STAMP}
+            ${LIBCXX_STAMP}
+    )
+    add_custom_target(boot_image DEPENDS ${WOS_BOOT_DISK} ${INITRAMFS_OUTPUT} ${BOOT_IMAGE_STAMP})
+
+    # busybox, dropbear, GNU make, Bash, curl, Git, Ninja, CMake, Python, Meson, NASM, ncurses, and nano are only needed for image creation, not compilation.
+    add_dependencies(boot_image busybox dropbear gnu_make)
+    if(WOS_BUILD_NINJA_FOR_WOS)
+        add_dependencies(boot_image ninja_for_wos)
+    endif()
+    if(WOS_BUILD_CMAKE_FOR_WOS)
+        add_dependencies(boot_image cmake_for_wos)
+    endif()
+    if(WOS_BUILD_PYTHON_FOR_WOS)
+        add_dependencies(boot_image python_for_wos)
+    endif()
+    if(WOS_BUILD_MESON_FOR_WOS)
+        add_dependencies(boot_image meson_for_wos)
+    endif()
+    if(WOS_BUILD_NASM_FOR_WOS)
+        add_dependencies(boot_image nasm_for_wos)
+    endif()
+    if(WOS_BUILD_BASH_FOR_WOS)
+        add_dependencies(boot_image bash_for_wos)
+    endif()
+    if(WOS_BUILD_NCURSES_FOR_WOS OR WOS_BUILD_NANO_FOR_WOS)
+        add_dependencies(boot_image ncurses_for_wos)
+    endif()
+    if(WOS_BUILD_NANO_FOR_WOS)
+        add_dependencies(boot_image nano_for_wos)
+    endif()
+    if(WOS_BUILD_CURL_FOR_WOS)
+        add_dependencies(boot_image curl_for_wos)
+    endif()
+    if(WOS_BUILD_GIT_FOR_WOS)
+        add_dependencies(boot_image git_for_wos)
+    endif()
+endif()
 
 if(NOT WOS_NATIVE_SYSTEM_BUILD)
     set(WOS_SYSROOT_DEPENDENT_TARGETS wos)
@@ -1027,38 +1072,6 @@ if(NOT WOS_NATIVE_SYSTEM_BUILD)
             add_dependencies(${mod} mlibc libcxx)
         endif()
     endforeach()
-endif()
-# busybox, dropbear, GNU make, Bash, curl, Git, Ninja, CMake, Python, Meson, NASM, ncurses, and nano are only needed for image creation, not compilation.
-add_dependencies(boot_image busybox dropbear gnu_make)
-if(WOS_BUILD_NINJA_FOR_WOS)
-    add_dependencies(boot_image ninja_for_wos)
-endif()
-if(WOS_BUILD_CMAKE_FOR_WOS)
-    add_dependencies(boot_image cmake_for_wos)
-endif()
-if(WOS_BUILD_PYTHON_FOR_WOS)
-    add_dependencies(boot_image python_for_wos)
-endif()
-if(WOS_BUILD_MESON_FOR_WOS)
-    add_dependencies(boot_image meson_for_wos)
-endif()
-if(WOS_BUILD_NASM_FOR_WOS)
-    add_dependencies(boot_image nasm_for_wos)
-endif()
-if(WOS_BUILD_BASH_FOR_WOS)
-    add_dependencies(boot_image bash_for_wos)
-endif()
-if(WOS_BUILD_NCURSES_FOR_WOS OR WOS_BUILD_NANO_FOR_WOS)
-    add_dependencies(boot_image ncurses_for_wos)
-endif()
-if(WOS_BUILD_NANO_FOR_WOS)
-    add_dependencies(boot_image nano_for_wos)
-endif()
-if(WOS_BUILD_CURL_FOR_WOS)
-    add_dependencies(boot_image curl_for_wos)
-endif()
-if(WOS_BUILD_GIT_FOR_WOS)
-    add_dependencies(boot_image git_for_wos)
 endif()
 
 # --- wos_full: top-level target that builds everything ---------------------

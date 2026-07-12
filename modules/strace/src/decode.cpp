@@ -249,6 +249,8 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "stat";
                 case ker::abi::vfs::ops::FSTAT:
                     return "fstat";
+                case ker::abi::vfs::ops::FSTAT_CLOSE:
+                    return "fstat_close";
                 case ker::abi::vfs::ops::UMOUNT:
                     return "umount";
                 case ker::abi::vfs::ops::DUP:
@@ -285,6 +287,8 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "chown";
                 case ker::abi::vfs::ops::FCHOWN:
                     return "fchown";
+                case ker::abi::vfs::ops::FCHOWNAT:
+                    return "fchownat";
                 case ker::abi::vfs::ops::FACCESSAT:
                     return "faccessat";
                 case ker::abi::vfs::ops::UNLINKAT:
@@ -329,6 +333,18 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "statat";
                 case ker::abi::vfs::ops::UTIMENSAT:
                     return "utimensat";
+                case ker::abi::vfs::ops::MKDIRAT:
+                    return "mkdirat";
+                case ker::abi::vfs::ops::READLINKAT:
+                    return "readlinkat";
+                case ker::abi::vfs::ops::LINKAT:
+                    return "linkat";
+                case ker::abi::vfs::ops::SYMLINKAT:
+                    return "symlinkat";
+                case ker::abi::vfs::ops::FCHMODAT:
+                    return "fchmodat";
+                case ker::abi::vfs::ops::FCHDIR:
+                    return "fchdir";
             }
             break;
         case ker::abi::callnums::net:
@@ -471,8 +487,16 @@ auto should_decode_string(uint64_t callnum, uint64_t op, int arg_index) -> bool 
                 return arg_index == 0;
             case ker::abi::vfs::ops::FACCESSAT:
             case ker::abi::vfs::ops::UNLINKAT:
-            case ker::abi::vfs::ops::RENAMEAT:
+            case ker::abi::vfs::ops::MKDIRAT:
+            case ker::abi::vfs::ops::READLINKAT:
+            case ker::abi::vfs::ops::FCHMODAT:
+            case ker::abi::vfs::ops::FCHOWNAT:
                 return arg_index == 1;
+            case ker::abi::vfs::ops::RENAMEAT:
+            case ker::abi::vfs::ops::LINKAT:
+                return arg_index == 1 || arg_index == 3;
+            case ker::abi::vfs::ops::SYMLINKAT:
+                return arg_index == 0 || arg_index == 2;
             default:
                 break;
         }

@@ -1033,15 +1033,26 @@ auto create_root_file(TmpNode* root) -> ker::vfs::File* { return create_root_fil
 
 auto create_root_file() -> ker::vfs::File* { return create_root_file_with_flags(root_node, 0); }
 
-auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ker::vfs::File* {
+namespace {
+void tmpfs_set_open_result(int* result_out, int result) {
+    if (result_out != nullptr) {
+        *result_out = result;
+    }
+}
+}  // namespace
+
+auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode, int* result_out) -> ker::vfs::File* {
     // mode is now used for O_CREAT
     if (path == nullptr || root == nullptr) {
+        tmpfs_set_open_result(result_out, -EINVAL);
         return nullptr;
     }
 
     // Handle root path
     if (path[0] == '\0' || (path[0] == '/' && path[1] == '\0')) {
-        return create_root_file_with_flags(root, flags);
+        auto* file = create_root_file_with_flags(root, flags);
+        tmpfs_set_open_result(result_out, file != nullptr ? 0 : -ENOMEM);
+        return file;
     }
 
     // Skip leading slash for walk_path
@@ -1050,7 +1061,9 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ke
         rel_path++;
     }
     if (rel_path[0] == '\0') {
-        return create_root_file_with_flags(root, flags);
+        auto* file = create_root_file_with_flags(root, flags);
+        tmpfs_set_open_result(result_out, file != nullptr ? 0 : -ENOMEM);
+        return file;
     }
 
     // Split path into parent path and final component
@@ -1081,6 +1094,7 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ke
         std::array<char, MAX_PATH_LEN> parent_path{};
         if (parent_len >= MAX_PATH_LEN) {
             tmpfs_lock.unlock();
+            tmpfs_set_open_result(result_out, -ENAMETOOLONG);
             return nullptr;
         }
         std::memcpy(parent_path.data(), rel_path, parent_len);
@@ -1095,6 +1109,7 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ke
             TmpNode* parent = tmpfs_walk_path_unlocked(root, parent_path.data(), (flags & O_CREAT) != 0);
             if (parent == nullptr) {
                 tmpfs_lock.unlock();
+                tmpfs_set_open_result(result_out, -ENOENT);
                 return nullptr;
             }
             node = tmpfs_lookup(parent, final_name);
@@ -1111,6 +1126,7 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ke
     tmpfs_lock.unlock();
 
     if (file_node == nullptr) {
+        tmpfs_set_open_result(result_out, -ENOENT);
         return nullptr;
     }
 
@@ -1126,6 +1142,7 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ke
             if (PREV == 1 && file_node->unlinked) {
                 tmpfs_free_node(file_node);
             }
+            tmpfs_set_open_result(result_out, TRUNCATE_RET);
             return nullptr;
         }
     }
@@ -1141,10 +1158,13 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ke
     f->fd_flags = 0;
     f->open_create_result_known = (flags & O_CREAT) != 0;
     f->created_by_open = created_by_open;
+    tmpfs_set_open_result(result_out, 0);
     return f;
 }
 
-auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File* { return tmpfs_open_path(root_node, path, flags, mode); }
+auto tmpfs_open_path(const char* path, int flags, int mode, int* result_out) -> ker::vfs::File* {
+    return tmpfs_open_path(root_node, path, flags, mode, result_out);
+}
 
 auto tmpfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     if ((f == nullptr) || (f->private_data == nullptr)) {

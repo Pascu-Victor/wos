@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[3]
 BOOTSTRAP = ROOT / "tools" / "bootstrap.sh"
 CCACHE_ENV = ROOT / "tools" / "ccache_env.sh"
 HOST_TOOLCHAIN = ROOT / "tools" / "host-toolchain.sh"
+GITMODULES = ROOT / ".gitmodules"
 ROOT_CMAKE = ROOT / "CMakeLists.txt"
 BUILD_WOS = ROOT / "scripts" / "dev" / "build_wos.sh"
 NINJA_WITH_JOBS = ROOT / "scripts" / "build" / "ninja_with_jobs.sh"
@@ -19,6 +20,7 @@ WOS_CMAKE_BUILD = ROOT / "scripts" / "build" / "build_cmake_for_wos.sh"
 WOS_CURL_BUILD = ROOT / "scripts" / "build" / "build_curl_for_wos.sh"
 WOS_DROPBEAR_BUILD = ROOT / "scripts" / "build" / "build_dropbear.sh"
 WOS_GIT_BUILD = ROOT / "scripts" / "build" / "build_git_for_wos.sh"
+WOS_GIT_SOURCE = ROOT / "toolchain" / "src" / "git"
 WOS_MESON_BUILD = ROOT / "scripts" / "build" / "build_meson_for_wos.sh"
 WOS_MLIBC_BUILD = ROOT / "scripts" / "build" / "build_mlibc.sh"
 WOS_NASM_BUILD = ROOT / "scripts" / "build" / "build_nasm_for_wos.sh"
@@ -27,6 +29,7 @@ WOS_TLS_BUILD = ROOT / "scripts" / "build" / "build_openssl_for_wos.sh"
 WOS_PYTHON_BUILD = ROOT / "scripts" / "build" / "build_python_for_wos.sh"
 CMAKE_BUILD_UTILITIES = ROOT / "toolchain" / "src" / "cmake" / "Source" / "Modules" / "CMakeBuildUtilities.cmake"
 CMAKE_THIRD_PARTY_CHECKS = ROOT / "toolchain" / "src" / "cmake" / "Utilities" / "cmThirdPartyChecks.cmake"
+WOS_CMAKE_SOURCE = ROOT / "toolchain" / "src" / "cmake" / "Source"
 MLIBC_STDIO = ROOT / "toolchain" / "src" / "mlibc" / "options" / "ansi" / "generic" / "stdio.cpp"
 MLIBC_SSCANF_TEST = ROOT / "toolchain" / "src" / "mlibc" / "tests" / "ansi" / "sscanf.c"
 MLIBC_NAMESER = ROOT / "toolchain" / "src" / "mlibc" / "options" / "bsd" / "generic" / "arpa-nameser.cpp"
@@ -46,7 +49,6 @@ WOS_JOB_HELPER_USERS = [
     ROOT / "scripts" / "build" / "build_cmake_for_wos.sh",
     ROOT / "scripts" / "build" / "build_curl_for_wos.sh",
     WOS_DROPBEAR_BUILD,
-    ROOT / "scripts" / "build" / "build_git_for_wos.sh",
     ROOT / "scripts" / "build" / "build_make.sh",
     WOS_MLIBC_BUILD,
     WOS_NASM_BUILD,
@@ -90,7 +92,6 @@ WOS_BUSYBOX_TAR_USERS = [
 WOS_TARBALL_DOWNLOAD_USERS = {
     "Bash": ROOT / "scripts" / "build" / "build_bash_for_wos.sh",
     "curl": ROOT / "scripts" / "build" / "build_curl_for_wos.sh",
-    "Git": ROOT / "scripts" / "build" / "build_git_for_wos.sh",
     "GNU make": ROOT / "scripts" / "build" / "build_make.sh",
     "LibreSSL": WOS_TLS_BUILD,
     "Meson": WOS_MESON_BUILD,
@@ -255,12 +256,12 @@ def test_wos_toolchain_records_bootstrap_phase_timings() -> None:
     )
 
     phases = re.findall(r"^\s*bootstrap_phase_start\s+([0-9]+)\s+", source, flags=re.MULTILINE)
-    expected = [str(phase) for phase in range(1, 19)]
+    expected = [str(phase) for phase in range(1, 20)]
     if phases != expected:
-        fail(f"WOS bootstrap must time phases 1 through 18 in order, got {phases}")
+        fail(f"WOS bootstrap must time phases 1 through 19 in order, got {phases}")
 
     phase_end_count = len(re.findall(r"^\s*bootstrap_phase_end\s*$", source, flags=re.MULTILINE))
-    if phase_end_count != 18:
+    if phase_end_count != 19:
         fail(f"WOS bootstrap must close each timed phase exactly once, got {phase_end_count}")
 
 
@@ -304,7 +305,7 @@ def test_native_wos_build_defaults_skip_target_port_rebuilds() -> None:
             'option(WOS_BUILD_WOSDBG "Build the Qt6-based wosdbg host tool" ${WOS_BUILD_WOSDBG_DEFAULT})',
             'option(WOS_BUILD_DISK_IMAGES "Build boot/rootfs qcow2 images with qemu-img, mtools, and libguestfs" ${WOS_BUILD_DISK_IMAGES_DEFAULT})',
             'option(WOS_BUILD_HOST_TOOLS "Configure and build host-side WOS tools" ${WOS_BUILD_HOST_TOOLS_DEFAULT})',
-            "if(WOS_BUILD_HOST_TOOLS)\n    ExternalProject_Add(wos_tools_build",
+            "if(WOS_BUILD_HOST_TOOLS)\n    include(ExternalProject)\n    ExternalProject_Add(wos_tools_build",
             'add_custom_target(wos_tools_build_always\n        COMMENT "Host-side WOS tools disabled."\n    )',
             'option(WOS_BUILD_CLANG_FOR_WOS "Build a native WOS clang/lld toolchain and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})',
             'option(WOS_BUILD_CMAKE_FOR_HOST "Build host-side CMake from the WOS fork and install it into toolchain/host" ${WOS_BUILD_CMAKE_FOR_HOST_DEFAULT})',
@@ -1470,7 +1471,7 @@ def test_native_wos_bootstrap_keeps_host_toolchain_shim_discoverable() -> None:
             'local compat_root="$WORKSPACE_ROOT/toolchain/host"',
             'WOS_HOST_TOOLCHAIN_ROOT="$WORKSPACE_ROOT/toolchain/wos-host-shim"',
             'ln -sfn "$(basename "$shim_root")" host',
-            'elif [ ! -x "$compat_root/bin/clang" ]; then',
+            'elif ! wos_host_tool_is_usable "$compat_root/bin/clang"; then',
             "llvm-tblgen clang-tblgen",
             "Host toolchain compatibility path",
         ],
@@ -1492,9 +1493,10 @@ def test_wos_toolchain_uses_shared_busybox_and_dropbear_build_scripts() -> None:
             'bootstrap_phase_start 13 "CPython for WOS userspace"',
             'bootstrap_phase_start 14 "Meson for WOS userspace"',
             'bootstrap_phase_start 15 "NASM for WOS userspace"',
-            'bootstrap_phase_start 16 "zlib LibreSSL and curl for WOS userspace"',
-            'bootstrap_phase_start 17 "Git for WOS userspace"',
-            'bootstrap_phase_start 18 "clang/lld for WOS userspace"',
+            'bootstrap_phase_start 16 "ncurses and nano for WOS userspace"',
+            'bootstrap_phase_start 17 "zlib LibreSSL and curl for WOS userspace"',
+            'bootstrap_phase_start 18 "Git for WOS userspace"',
+            'bootstrap_phase_start 19 "clang/lld for WOS userspace"',
             'WOS_HOST_TOOLCHAIN_ROOT="$HOST" \\',
             'WOS_BUSYBOX_BUILD_DIR="$B/busybox-build" \\',
             'WOS_BUSYBOX_INSTALL_DIR="$B/busybox-install" \\',
@@ -1871,6 +1873,86 @@ def test_native_wos_cmake_configure_preseeds_expensive_checks() -> None:
     )
     if "set(LIBMD_FOUND 1)" in wos_third_party_block:
         fail("WOS third-party preseeds must not pin libarchive's inconsistent positive libmd discovery result")
+
+
+def test_wos_cmake_metadata_fast_paths_preserve_filesystem_validation() -> None:
+    directory = (WOS_CMAKE_SOURCE / "kwsys" / "Directory.cxx").read_text()
+    require_tokens(
+        directory,
+        [
+            "unsigned char Type;",
+            "this->Internal->Files.emplace_back(d->d_name, d->d_type);",
+            "if (type == DT_DIR)",
+            "if (type != DT_UNKNOWN && type != DT_LNK)",
+            "return kwsys::SystemTools::FileIsDirectory(path);",
+        ],
+        "WOS CMake dirent type retention with unknown/symlink fallback",
+    )
+
+    system_tools = (WOS_CMAKE_SOURCE / "kwsys" / "SystemTools.cxx").read_text()
+    require_tokens(
+        system_tools,
+        [
+            "bool WOSMkdirCacheContains(std::string const& dir)",
+            "if (WOSPathIsDirectory(dir))",
+            "WOSMkdirCache().erase(dir);",
+            "return faccessat(AT_FDCWD, path.c_str(), F_OK, AT_SYMLINK_NOFOLLOW) == 0;",
+            "return faccessat(AT_FDCWD, filename.c_str(), R_OK, 0) == 0;",
+            "return readlinkat(AT_FDCWD, name.c_str(), &ignored, sizeof(ignored)) >= 0;",
+        ],
+        "WOS CMake low-level metadata fast paths",
+    )
+    if "return faccessat(AT_FDCWD, filename.c_str(), F_OK, 0) == 0;" in system_tools:
+        fail("WOS CMake FileExists must preserve the POSIX readability check")
+
+    global_generator = (WOS_CMAKE_SOURCE / "cmGlobalGenerator.cxx").read_text()
+    require_tokens(
+        global_generator,
+        [
+            "bool cmWOSDirectoryContentCanSkipRestat(std::string const& dir)",
+            'cmStrCat(cmSystemTools::GetCMakeRoot(), "/Modules")',
+            'return dir == "/usr"',
+            "if (dc.LastDiskTime != -1 && cmWOSDirectoryContentCanSkipRestat(dir))",
+            "long mt = cmSystemTools::ModifiedTime(dir);",
+        ],
+        "WOS CMake immutable directory-content reuse",
+    )
+
+    find_library = (WOS_CMAKE_SOURCE / "cmFindLibraryCommand.cxx").read_text()
+    find_program = (WOS_CMAKE_SOURCE / "cmFindProgramCommand.cxx").read_text()
+    find_path = (WOS_CMAKE_SOURCE / "cmFindPathCommand.cxx").read_text()
+    find_package = (WOS_CMAKE_SOURCE / "cmFindPackageCommand.cxx").read_text()
+    require_tokens(
+        find_library,
+        ["GetDirectoryContent(path)", "files.find(name.Raw)", "rawMayExist && cmListedLibraryEntryIsFile(testPath)"],
+        "WOS CMake find_library negative-probe gate",
+    )
+    require_tokens(
+        find_program,
+        ["GetDirectoryContent(path)", "directoryContent->find(testNameExt)", "cmWOSProgramIsExecutableFile"],
+        "WOS CMake find_program negative-probe gate",
+    )
+    require_tokens(
+        find_path,
+        ["directoryContentCache", "GetDirectoryContent(sp)", "headerMayExist && cmSystemTools::FileExists(tryPath)"],
+        "WOS CMake find_path negative-probe gate",
+    )
+    require_tokens(
+        find_package,
+        ["GetDirectoryContent(dir)", "configMayExist && cmWOSFileExistsAndIsNotDirectory(file)", "versionFileExists"],
+        "WOS CMake find_package negative-probe gate",
+    )
+
+    include_command = (WOS_CMAKE_SOURCE / "cmIncludeCommand.cxx").read_text()
+    read_index = include_command.find("ReadDependentFile(")
+    fallback_stat_index = include_command.find("cmSystemTools::Stat(listFile", read_index)
+    if read_index < 0 or fallback_stat_index < 0 or read_index >= fallback_stat_index:
+        fail("WOS CMake include must parse first and stat only to classify a failed read")
+    require_tokens(
+        (WOS_CMAKE_SOURCE / "cmListFileCache.cxx").read_text(),
+        ["cmSystemTools::Stat(filename, &st) != 0 || S_ISDIR(st.st_mode)"],
+        "WOS CMake list-file single-stat validation",
+    )
 
 
 def test_wos_tls_build_is_self_hostable_without_perl() -> None:
@@ -2261,18 +2343,12 @@ def test_wos_git_install_avoids_sysroot_usr_symlink() -> None:
             '"gitexecdir=/libexec/git-core"',
             '"template_dir=/share/git-core/templates"',
             '"sysconfdir=/etc"',
-            'GIT_CFLAGS="--sysroot=$TARGET_SYSROOT -O2 -g -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -I. -Icompat/regex -I$TARGET_SYSROOT/include"',
+            'GIT_CFLAGS="--sysroot=$TARGET_SYSROOT $WOS_GIT_OPT_FLAGS -g -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -DHAVE_WOS_FSTAT_CLOSE=1 -I. -Icompat/regex -I$TARGET_SYSROOT/include"',
             '"NO_REGEX=NeedsStartEnd"',
             '"WOS_SKIP_TEST_ARTIFACTS=YesPlease"',
-            "all:: $(FUZZ_OBJS)",
-            "all:: $(TEST_PROGRAMS) $(test_bindir_programs) $(UNIT_TEST_PROGS) $(CLAR_TEST_PROG)",
-            "ifndef WOS_SKIP_TEST_ARTIFACTS",
-            "templates_makefile",
-            "generate_script",
-            "$(TAR) cf -",
-            "cp -a blt/.",
-            '"#!/bin/bash\\n"',
+            '"NO_RUST=YesPlease"',
             'require_file "$TARGET_SYSROOT/bin/bash"',
+            'require_file "$GIT_SRC/Makefile"',
             '"SHELL_PATH=/bin/bash"',
             '"SHELL=/bin/bash"',
             '"DESTDIR=$TARGET_SYSROOT"',
@@ -2292,6 +2368,126 @@ def test_wos_git_install_avoids_sysroot_usr_symlink() -> None:
     present = [token for token in forbidden if token in source]
     if present:
         fail("Git WOS install must avoid installing through the sysroot /usr symlink: " + ", ".join(present))
+
+
+def test_wos_git_build_uses_the_pinned_fork_without_source_rewriting() -> None:
+    gitmodules = GITMODULES.read_text()
+    require_tokens(
+        gitmodules,
+        [
+            '[submodule "toolchain/src/git"]',
+            "path = toolchain/src/git",
+            "url = https://github.com/Pascu-Victor/git.git",
+            "branch = wos-support",
+            "shallow = true",
+        ],
+        "WOS Git submodule",
+    )
+
+    toolchain = WOS_TOOLCHAIN.read_text()
+    require_tokens(
+        toolchain,
+        [
+            "git -C \"$WORKSPACE_ROOT\" submodule update --init --depth=1 toolchain/src/git",
+            "git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/git.git git",
+            'WOS_GIT_SOURCE_DIR="$B/src/git"',
+        ],
+        "WOS Git bootstrap source",
+    )
+
+    builder = WOS_GIT_BUILD.read_text()
+    require_tokens(
+        builder,
+        [
+            'GIT_SRC="${WOS_GIT_SOURCE_DIR:-$B/src/git}"',
+            'wos_copy_tree_entries_excluding "$GIT_SRC" "$GIT_WORK" ".git" ".github"',
+            'require_file "$GIT_SRC/Makefile"',
+        ],
+        "WOS Git fork builder",
+    )
+    forbidden = [
+        "GIT_TARBALL",
+        "download_git_source",
+        "patch_git_source_for_wos",
+        "patch_installed_git_scripts",
+        "python3 -",
+    ]
+    present = [token for token in forbidden if token in builder]
+    if present:
+        fail("WOS Git builder must not download or rewrite upstream source: " + ", ".join(present))
+
+    makefile = (WOS_GIT_SOURCE / "Makefile").read_text()
+    require_tokens(
+        makefile,
+        [
+            "ifndef WOS_SKIP_TEST_ARTIFACTS\nall:: $(FUZZ_OBJS)\nendif",
+            "ifndef WOS_SKIP_TEST_ARTIFACTS\nall:: $(TEST_PROGRAMS) $(test_bindir_programs) $(UNIT_TEST_PROGS) $(CLAR_TEST_PROG)\nendif",
+        ],
+        "WOS Git fork Makefile",
+    )
+    require_tokens(
+        (WOS_GIT_SOURCE / "templates" / "Makefile").read_text(),
+        ["cp -a blt/. '$(DESTDIR_SQ)$(template_instdir_SQ)'"],
+        "WOS Git template install",
+    )
+    if not (WOS_GIT_SOURCE / "tools" / "generate-script.sh").read_text().startswith("#!/bin/bash\n"):
+        fail("WOS Git script generator must use Bash")
+    require_tokens(
+        (WOS_GIT_SOURCE / "git-submodule.sh").read_text(),
+        ['case "$command" in', "cmd_set_branch", "cmd_set_url", '"cmd_$command" "$@"'],
+        "WOS Git submodule shell dispatch",
+    )
+    require_tokens(
+        (WOS_GIT_SOURCE / "parallel-checkout.c").read_text(),
+        [
+            "leading_dirs_prevalidated = state->clone && !state->base_dir_len",
+            "dir_sep && !leading_dirs_prevalidated",
+            "if (leading_dirs_prevalidated)",
+            "HAVE_WOS_FSTAT_CLOSE",
+            "wos_fstat_close(fd, &pc_item->st, &fstat_error)",
+            "fd = -1",
+            "fstat_done = !fstat_error",
+        ],
+        "WOS Git clone checkout metadata suppression",
+    )
+    require_tokens(
+        (WOS_GIT_SOURCE / "builtin" / "checkout--worker.c").read_text(),
+        ['getenv("GIT_WOS_CLONE_CHECKOUT")', "state.clone = 1"],
+        "WOS Git checkout worker clone state",
+    )
+    require_tokens(
+        (WOS_GIT_SOURCE / "builtin" / "clone.c").read_text(),
+        [
+            'setenv("GIT_WOS_CLONE_CHECKOUT", "1", 1)',
+            'unsetenv("GIT_WOS_CLONE_CHECKOUT")',
+        ],
+        "WOS Git clone checkout scope",
+    )
+    require_tokens(
+        (WOS_GIT_SOURCE / "attr.c").read_text(),
+        [
+            "checkout_attr_fallback_to_worktree",
+            'getenv("GIT_WOS_CLONE_CHECKOUT") == NULL',
+        ],
+        "WOS Git clone attribute metadata suppression",
+    )
+    require_tokens(
+        (WOS_GIT_SOURCE / "odb" / "source-packed.c").read_text(),
+        [
+            "packed->clone_incore_fallback",
+            "ODB_SOURCE_READ_STREAM_INCORE_FALLBACK",
+            'getenv("GIT_WOS_CLONE_CHECKOUT")',
+        ],
+        "WOS Git packed clone fallback",
+    )
+    require_tokens(
+        (WOS_GIT_SOURCE / "odb" / "streaming.c").read_text(),
+        [
+            "ret == ODB_SOURCE_READ_STREAM_INCORE_FALLBACK",
+            "return open_istream_incore(out, odb, oid)",
+        ],
+        "WOS Git packed in-core fallback",
+    )
 
 
 def test_wos_python_ssl_build_handles_libressl_sigalg_gap() -> None:
@@ -2411,6 +2607,7 @@ if __name__ == "__main__":
     test_ninja_script_uses_target_header_stack()
     test_cmake_script_uses_target_header_stack()
     test_native_wos_cmake_configure_preseeds_expensive_checks()
+    test_wos_cmake_metadata_fast_paths_preserve_filesystem_validation()
     test_zlib_install_avoids_sysroot_usr_symlink()
     test_wos_tls_build_is_self_hostable_without_perl()
     test_wos_tls_build_preseeds_target_configure_probes()
@@ -2418,6 +2615,8 @@ if __name__ == "__main__":
     test_wos_curl_build_preseeds_target_configure_probes()
     test_wos_curl_download_errors_stop_before_checksum_or_extract()
     test_wos_tarball_downloads_use_shared_retry_helper()
+    test_wos_git_install_avoids_sysroot_usr_symlink()
+    test_wos_git_build_uses_the_pinned_fork_without_source_rewriting()
     test_wos_python_ssl_build_handles_libressl_sigalg_gap()
     test_mlibc_scanf_float_zero_counts_as_conversion()
     test_mlibc_nameser_parser_does_not_panic_on_dns_packets()

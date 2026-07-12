@@ -49,6 +49,9 @@ auto xfs_log_needs_recovery(XfsMountContext* mount) -> bool;
 // synchronously before the buffers are flushed (write-ahead guarantee).
 // Returns 0 on success, negative errno on failure.
 struct XfsTransItem;
-auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_count) -> int;
+auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_count, bool* owns_metadata_out = nullptr) -> int;
+
+// Commit the current metadata group and release its writeback holds.
+auto xfs_log_flush(XfsMountContext* mount) -> int;
 
 }  // namespace ker::vfs::xfs

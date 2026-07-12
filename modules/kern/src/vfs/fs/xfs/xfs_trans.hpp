@@ -20,9 +20,10 @@ namespace ker::vfs::xfs {
 // ============================================================================
 
 // BMBT rebuilds for large fragmented files can log hundreds of metadata blocks.
-// XfsTransaction is heap-allocated, so keep enough headroom for selfhost Git
-// workloads without putting this array on kernel stacks.
+// Keep that headroom available, but don't make every tiny create/write
+// transaction reserve and zero the full item array.
 constexpr int XFS_TRANS_MAX_ITEMS = 512;  // max logged items per transaction
+constexpr int XFS_TRANS_INLINE_ITEMS = 32;
 
 // Log item types
 enum class XfsLogItemType : uint8_t {
@@ -57,8 +58,23 @@ struct XfsTransItem {
 
 // Transaction structure
 struct XfsTransaction {
+    XfsTransaction() = default;
+    ~XfsTransaction() {
+        if (items != inline_items.data()) {
+            delete[] items;
+        }
+    }
+
+    XfsTransaction(const XfsTransaction&) = delete;
+    auto operator=(const XfsTransaction&) -> XfsTransaction& = delete;
+    XfsTransaction(XfsTransaction&&) = delete;
+    auto operator=(XfsTransaction&&) -> XfsTransaction& = delete;
+
     XfsMountContext* mount{};
-    std::array<XfsTransItem, XFS_TRANS_MAX_ITEMS> items{};
+    XfsTransaction* pool_next{};
+    std::array<XfsTransItem, XFS_TRANS_INLINE_ITEMS> inline_items{};
+    XfsTransItem* items{inline_items.data()};
+    int item_capacity{XFS_TRANS_INLINE_ITEMS};
     int item_count{};
     bool overflowed{};
     bool committed{};

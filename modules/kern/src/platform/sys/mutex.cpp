@@ -148,19 +148,23 @@ auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
 }
 
 auto mutex_stall_enabled() -> bool {
-    int const CACHED = mutex_stall_enabled_cache.load(std::memory_order_acquire);
+    int const CACHED = mutex_stall_enabled_cache.load(std::memory_order_relaxed);
     if (CACHED >= 0) {
         return CACHED != 0;
     }
 
     bool const ENABLED = cmdline_has_token(ker::init::get_kernel_cmdline(), "mutex.stall");
-    mutex_stall_enabled_cache.store(ENABLED ? 1 : 0, std::memory_order_release);
+    mutex_stall_enabled_cache.store(ENABLED ? 1 : 0, std::memory_order_relaxed);
     return ENABLED;
 }
 
 }  // namespace
 
 void Mutex::record_owner(uint64_t acquire_site) {
+    if (!mutex_stall_enabled()) {
+        return;
+    }
+
     owner_acquire_site.store(acquire_site, std::memory_order_relaxed);
     if (!sched::can_query_current_task()) {
         owner_name.store(nullptr, std::memory_order_relaxed);
@@ -175,6 +179,10 @@ void Mutex::record_owner(uint64_t acquire_site) {
 }
 
 void Mutex::clear_owner() {
+    if (!mutex_stall_enabled()) {
+        return;
+    }
+
     owner_acquire_site.store(0, std::memory_order_relaxed);
     owner_name.store(nullptr, std::memory_order_relaxed);
     owner_pid.store(0, std::memory_order_release);

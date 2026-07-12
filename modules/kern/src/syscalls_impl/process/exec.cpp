@@ -1275,7 +1275,9 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     // Inherit process execution context from the parent before applying
     // executable-specific overrides such as setuid/setgid.
     new_task->cwd = parent_task->cwd;
+    new_task->cwd_len = parent_task->cwd_len;
     new_task->root = parent_task->root;
+    new_task->root_len = parent_task->root_len;
     new_task->uid = parent_task->uid;
     new_task->gid = parent_task->gid;
     new_task->euid = parent_task->euid;

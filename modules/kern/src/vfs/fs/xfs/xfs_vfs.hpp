@@ -12,6 +12,7 @@
 
 #include <bits/ssize_t.h>
 
+#include <cstddef>
 #include <dev/block_device.hpp>
 #include <platform/mm/swap.hpp>
 #include <vfs/file.hpp>
@@ -21,19 +22,41 @@
 
 namespace ker::vfs::xfs {
 
+constexpr size_t UNKNOWN_XFS_PATH_LEN = static_cast<size_t>(-1);
+
 // Initialize an XFS filesystem on the given block device.
 // Returns a heap-allocated XfsMountContext on success, nullptr on failure.
 auto xfs_vfs_init_device(dev::BlockDevice* device) -> XfsMountContext*;
 
-// Open a file or directory by filesystem-relative path.
-// Returns a heap-allocated File* on success, nullptr on error.
-auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ctx) -> File*;
+// Open a file or directory by filesystem-relative path. Returns a heap-allocated
+// File* on success, nullptr on error. When result_out is non-null, it receives
+// the backend status for cache-safe callers that need to distinguish misses.
+auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ctx, int* result_out = nullptr,
+                   size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN, bool require_directory = false) -> File*;
 
 // Stat a file by filesystem-relative path.
-auto xfs_stat(const char* fs_path, ker::vfs::Stat* statbuf, XfsMountContext* ctx) -> int;
+auto xfs_stat(const char* fs_path, ker::vfs::Stat* statbuf, XfsMountContext* ctx, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN,
+              bool require_directory = false) -> int;
+
+// Test path existence without reading the target inode when directory entry
+// type information is sufficient. If require_directory is true, non-directory
+// paths return -ENOTDIR.
+auto xfs_path_exists(const char* fs_path, bool require_directory, XfsMountContext* ctx, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN)
+    -> int;
+
+// Readlink by filesystem-relative path without allocating a VFS File.
+auto xfs_readlink_path(const char* fs_path, char* buf, size_t bufsize, XfsMountContext* ctx,
+                       size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> ssize_t;
 
 // Fstat an open file descriptor.
 auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int;
+
+// Fill stat data from an open XFS file's inode without resolving its path.
+auto xfs_snapshot_file_stat(File* f, ker::vfs::Stat* statbuf) -> int;
+
+// Consume the exact stat snapshot captured by the most recent successful write,
+// if one is available for this open file.
+auto xfs_consume_recent_write_stat(File* f, ker::vfs::Stat* statbuf) -> bool;
 
 // Return the mount context backing an open XFS file.
 auto xfs_file_mount_context(File* f) -> XfsMountContext*;
@@ -68,40 +91,68 @@ auto xfs_selftest_close_should_commit_inode(bool close_may_need_inode_commit, in
                                             bool may_have_eof_prealloc = false) -> bool;
 auto xfs_selftest_inode_has_eof_prealloc() -> bool;
 auto xfs_selftest_mapped_append_can_zero_without_read(size_t write_pos, uint64_t file_size, size_t block_size) -> bool;
+auto xfs_selftest_zero_fresh_block_preserves_write_range() -> bool;
 auto xfs_selftest_direct_read_batch_max_bytes(size_t block_size) -> size_t;
 auto xfs_selftest_parent_path_cache() -> bool;
+auto xfs_selftest_path_inode_cache_generation() -> bool;
+auto xfs_selftest_path_inode_cache_exact_invalidate() -> bool;
+auto xfs_selftest_directory_lookup_seeds_parent_path_cache() -> bool;
+auto xfs_selftest_walk_path_seeds_ancestor_parent_cache() -> bool;
+auto xfs_selftest_readdir_cache_batches_sequential_scan() -> bool;
+auto xfs_selftest_readlink_path_uses_dentry_type() -> bool;
+auto xfs_selftest_path_exists_uses_dentry_type() -> bool;
+auto xfs_selftest_stat_require_directory_uses_dentry_type() -> bool;
+auto xfs_selftest_open_require_directory_uses_dentry_type() -> bool;
+auto xfs_selftest_cached_parent_missing_lookup_stays_negative() -> bool;
 #endif
 
 // Filesystem statistics (statvfs).
 auto xfs_statvfs(XfsMountContext* ctx, ker::vfs::Statvfs* buf) -> int;
 
-// Change the permission bits of a file by filesystem-relative path.
-auto xfs_chmod_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int;
+// Change the permission bits of a file by filesystem-relative path. When
+// statbuf is non-null and the change succeeds, it receives the updated inode's
+// stat data.
+auto xfs_chmod_path(const char* fs_path, int mode, XfsMountContext* ctx, ker::vfs::Stat* statbuf = nullptr,
+                    size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
 
-// Change the permission bits of an open file descriptor.
-auto xfs_fchmod(File* f, int mode) -> int;
+// Change the permission bits of an open file descriptor. When statbuf is
+// non-null and the change succeeds, it receives the updated inode's stat data.
+auto xfs_fchmod(File* f, int mode, ker::vfs::Stat* statbuf = nullptr) -> int;
 
 // Update atime/mtime by filesystem-relative path or open file.
 auto xfs_set_times_path(const char* fs_path, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,
-                        XfsMountContext* ctx) -> int;
-auto xfs_set_times_file(File* f, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime) -> int;
+                        XfsMountContext* ctx, ker::vfs::Stat* statbuf = nullptr, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
+auto xfs_set_times_file(File* f, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,
+                        ker::vfs::Stat* statbuf = nullptr) -> int;
 
-// Create a directory by filesystem-relative path.
-auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx) -> int;
+// Create a directory by filesystem-relative path.  When statbuf is non-null
+// and a new directory is created, it receives the created inode's stat data.
+auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx, ker::vfs::Stat* statbuf = nullptr,
+                    size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
 
-// Create an inline symlink by filesystem-relative path.
-auto xfs_symlink_path(const char* target, const char* fs_path, XfsMountContext* ctx) -> int;
+// Create an inline symlink by filesystem-relative path. When statbuf is
+// non-null and the symlink is created, it receives the new link's stat data.
+auto xfs_symlink_path(const char* target, const char* fs_path, XfsMountContext* ctx, ker::vfs::Stat* statbuf = nullptr,
+                      size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
+
+// Create a hardlink from new_fs_path to old_fs_path within one XFS mount. When
+// statbuf is non-null and the link is created, it receives the linked inode's
+// updated stat data.
+auto xfs_link_path(const char* old_fs_path, const char* new_fs_path, XfsMountContext* ctx, ker::vfs::Stat* statbuf = nullptr,
+                   size_t known_old_fs_path_len = UNKNOWN_XFS_PATH_LEN, size_t known_new_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
 
 // Remove a file by filesystem-relative path.
 // Returns 0 on success, negative errno on failure.
 // Cannot be used to remove directories (use xfs_rmdir_path for that).
-auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx) -> int;
+auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
 
 // Remove an empty directory by filesystem-relative path.
-auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx) -> int;
+auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
 
-// Rename/move a file or directory within the same XFS mount.
-auto xfs_rename_path(const char* old_fs_path, const char* new_fs_path, XfsMountContext* ctx) -> int;
+// Rename/move a file or directory within the same XFS mount.  When statbuf is
+// non-null and the rename succeeds, it receives the moved inode's stat data.
+auto xfs_rename_path(const char* old_fs_path, const char* new_fs_path, XfsMountContext* ctx, ker::vfs::Stat* statbuf = nullptr,
+                     size_t known_old_fs_path_len = UNKNOWN_XFS_PATH_LEN, size_t known_new_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
 
 // Return the global XFS FileOperations vtable.
 auto get_xfs_fops() -> FileOperations*;

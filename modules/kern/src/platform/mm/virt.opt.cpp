@@ -1176,6 +1176,53 @@ auto present_mapping_entry(PageTable* root, vaddr_t vaddr) -> const PageTableEnt
     return entry.present != 0 ? &entry : nullptr;
 }
 
+auto user_copy_writable_entry(const PageTableEntry& entry) -> bool {
+    uint64_t const RAW = pte_raw(entry);
+    return entry.present != 0 && entry.writable != 0 && entry.user != 0 && (RAW & paging::PAGE_COW) == 0;
+}
+
+auto user_page_mapped_now_impl(PageTable* pagemap, vaddr_t vaddr) -> bool {
+    if (pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
+        return false;
+    }
+
+    PageTable const* table = pagemap;
+    for (int level = 4; level > 1; --level) {
+        PageTableEntry const& entry = entry_at(table, index_of(vaddr, level));
+        if (entry.present == 0 || entry.user == 0) {
+            return false;
+        }
+        if (level < 4 && entry.pagesize != 0) {
+            return true;
+        }
+        table = reinterpret_cast<PageTable const*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+    }
+
+    PageTableEntry const& entry = entry_at(table, index_of(vaddr, 1));
+    return entry.present != 0 && entry.user != 0;
+}
+
+auto user_page_writable_now_impl(PageTable* pagemap, vaddr_t vaddr) -> bool {
+    if (pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
+        return false;
+    }
+
+    PageTable const* table = pagemap;
+    for (int level = 4; level > 1; --level) {
+        PageTableEntry const& entry = entry_at(table, index_of(vaddr, level));
+        if (!user_copy_writable_entry(entry)) {
+            return false;
+        }
+        if (level < 4 && entry.pagesize != 0) {
+            return true;
+        }
+        table = reinterpret_cast<PageTable const*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+    }
+
+    PageTableEntry const& entry = entry_at(table, index_of(vaddr, 1));
+    return user_copy_writable_entry(entry);
+}
+
 void drop_present_leaf_ref(const PageTableEntry& entry) {
     if (entry.present == 0 || entry.frame == 0) {
         return;
@@ -1776,6 +1823,12 @@ void init_tlb_shootdown() {
         dbg::log("WARNING: No free interrupt vector for TLB shootdown IPI");
     }
 }
+
+bool active_pagemap_is(PageTable* pagemap) { return is_current_pagemap(pagemap); }
+
+bool user_page_mapped_now(PageTable* pagemap, vaddr_t vaddr) { return user_page_mapped_now_impl(pagemap, vaddr); }
+
+bool user_page_writable_now(PageTable* pagemap, vaddr_t vaddr) { return user_page_writable_now_impl(pagemap, vaddr); }
 
 void note_tlb_shootdown_cpu_online() {
     uint64_t const CPU_NO = cpu::current_cpu();

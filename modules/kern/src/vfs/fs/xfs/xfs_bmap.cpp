@@ -256,7 +256,7 @@ auto transaction_has_inode_item(const XfsTransaction* tp, const XfsInode* ip) ->
         return false;
     }
     for (int i = 0; i < tp->item_count; i++) {
-        XfsTransItem const& item = tp->items.at(static_cast<size_t>(i));
+        XfsTransItem const& item = tp->items[i];
         if (item.type == XfsLogItemType::INODE && item.inode.ip == ip) {
             return true;
         }
@@ -271,11 +271,118 @@ auto ensure_inode_logged(XfsTransaction* tp, XfsInode* ip) -> int {
     if (transaction_has_inode_item(tp, ip)) {
         return 0;
     }
-    if (tp->item_count >= XFS_TRANS_MAX_ITEMS) {
-        return -EFBIG;
-    }
     xfs_trans_log_inode(tp, ip);
     return transaction_has_inode_item(tp, ip) ? 0 : -EFBIG;
+}
+
+auto grow_extent_list_for_append(XfsIforkExtents& ext, uint32_t new_count, uint32_t inline_capacity) -> int {
+    if (new_count <= ext.capacity) {
+        return 0;
+    }
+    if (new_count > inline_capacity) {
+        return -EOVERFLOW;
+    }
+
+    if (new_count <= XFS_IFORK_INLINE_EXTENT_CAPACITY) {
+        if (!xfs_ifork_extents_uses_inline(ext)) {
+            XfsBmbtIrec* old_list = ext.list;
+            for (uint32_t i = 0; i < ext.count; ++i) {
+                ext.inline_list[i] = old_list[i];
+            }
+            delete[] old_list;
+            ext.list = xfs_ifork_extents_inline_data(ext);
+        }
+        ext.capacity = XFS_IFORK_INLINE_EXTENT_CAPACITY;
+        return 0;
+    }
+
+    uint32_t new_capacity = ext.capacity == 0 ? 4 : ext.capacity * 2;
+    if (new_capacity < ext.capacity || new_capacity > inline_capacity) {
+        new_capacity = inline_capacity;
+    }
+    new_capacity = std::max(new_capacity, new_count);
+
+    auto* new_list = new (std::nothrow) XfsBmbtIrec[new_capacity];
+    if (new_list == nullptr) {
+        return -ENOMEM;
+    }
+    for (uint32_t i = 0; i < ext.count; ++i) {
+        new_list[i] = ext.list[i];
+    }
+    if (!xfs_ifork_extents_uses_inline(ext)) {
+        delete[] ext.list;
+    }
+    ext.list = new_list;
+    ext.capacity = new_capacity;
+    return 0;
+}
+
+auto try_extents_fast_add(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& new_ext, bool* handled) -> int {
+    if (handled == nullptr) {
+        return -EINVAL;
+    }
+    *handled = false;
+    if (ip == nullptr || tp == nullptr || ip->data_fork.format != XFS_DINODE_FMT_EXTENTS) {
+        return 0;
+    }
+
+    XfsIforkExtents& ext = ip->data_fork.extents;
+    uint32_t const INLINE_CAPACITY = data_fork_record_capacity(ip);
+    if (INLINE_CAPACITY == 0) {
+        return 0;
+    }
+
+    if (ext.count == 0) {
+        int const GROW_RC = grow_extent_list_for_append(ext, 1, INLINE_CAPACITY);
+        if (GROW_RC != 0) {
+            *handled = GROW_RC != -EOVERFLOW;
+            return GROW_RC == -EOVERFLOW ? 0 : GROW_RC;
+        }
+        ext.list[0] = new_ext;
+        ext.count = 1;
+        ip->nextents = 1;
+        ip->dirty = true;
+        xfs_trans_log_inode(tp, ip);
+        *handled = true;
+        return 0;
+    }
+
+    if (ext.list == nullptr) {
+        *handled = true;
+        return -EIO;
+    }
+
+    XfsBmbtIrec& last = ext.list[ext.count - 1];
+    xfs_fileoff_t const LAST_END = bmbt_file_end_exclusive(last);
+    if (LAST_END > new_ext.br_startoff) {
+        return 0;
+    }
+    if (extent_can_merge_left(last, new_ext)) {
+        last.br_blockcount += new_ext.br_blockcount;
+        ip->nextents = ext.count;
+        ip->dirty = true;
+        xfs_trans_log_inode(tp, ip);
+        *handled = true;
+        return 0;
+    }
+    if (ext.count >= INLINE_CAPACITY) {
+        return 0;
+    }
+
+    uint32_t const NEW_COUNT = ext.count + 1;
+    int const GROW_RC = grow_extent_list_for_append(ext, NEW_COUNT, INLINE_CAPACITY);
+    if (GROW_RC != 0) {
+        *handled = GROW_RC != -EOVERFLOW;
+        return GROW_RC == -EOVERFLOW ? 0 : GROW_RC;
+    }
+
+    ext.list[ext.count] = new_ext;
+    ext.count = NEW_COUNT;
+    ip->nextents = NEW_COUNT;
+    ip->dirty = true;
+    xfs_trans_log_inode(tp, ip);
+    *handled = true;
+    return 0;
 }
 
 auto insert_or_merge_extent(const XfsBmbtIrec* old_list, uint32_t old_count, const XfsBmbtIrec& new_ext, XfsBmbtIrec* out_list,
@@ -367,6 +474,7 @@ auto bmbt_ceil_div(uint32_t value, uint32_t divisor) -> uint32_t {
 // Rebuilding a bmbt logs more than the new bmbt blocks: the inode buffer is
 // written during commit, and allocation/freeing can touch AG free-space blocks.
 constexpr uint32_t BMBT_REBUILD_TRANSACTION_HEADROOM = 8;
+constexpr uint32_t BMAP_STACK_EXTENT_CAPACITY = 8;
 
 auto bmbt_tree_metadata_blocks(uint32_t extent_count, uint32_t leaf_capacity, uint32_t node_capacity, uint32_t* blocks_out,
                                uint16_t* bmdr_level_out) -> int {
@@ -1217,6 +1325,12 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
         return rc;
     }
 
+    bool fast_handled = false;
+    rc = try_extents_fast_add(ip, tp, new_ext, &fast_handled);
+    if (fast_handled || rc != 0) {
+        return rc;
+    }
+
     XfsBmbtIrec* old_extents = nullptr;
     uint32_t old_count = 0;
 
@@ -1254,13 +1368,24 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
     }
 
     uint32_t const NEW_EXTENTS_CAPACITY = old_count + 1;
-    auto* new_extents = new (std::nothrow) XfsBmbtIrec[NEW_EXTENTS_CAPACITY];
-    if (new_extents == nullptr) {
-        if (WAS_BTREE) {
-            delete[] old_extents;
+    std::array<XfsBmbtIrec, BMAP_STACK_EXTENT_CAPACITY> stack_extents{};
+    bool new_extents_heap = false;
+    XfsBmbtIrec* new_extents = stack_extents.data();
+    if (NEW_EXTENTS_CAPACITY > stack_extents.size()) {
+        new_extents = new (std::nothrow) XfsBmbtIrec[NEW_EXTENTS_CAPACITY];
+        if (new_extents == nullptr) {
+            if (WAS_BTREE) {
+                delete[] old_extents;
+            }
+            return -ENOMEM;
         }
-        return -ENOMEM;
+        new_extents_heap = true;
     }
+    auto free_new_extents = [&]() {
+        if (new_extents_heap) {
+            delete[] new_extents;
+        }
+    };
 
     uint32_t new_count = 0;
     rc = insert_or_merge_extent(old_extents, old_count, new_ext, new_extents, &new_count);
@@ -1269,11 +1394,11 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
         old_extents = nullptr;
     }
     if (rc != 0) {
-        delete[] new_extents;
+        free_new_extents();
         return rc;
     }
     if (new_count > NEW_EXTENTS_CAPACITY) {
-        delete[] new_extents;
+        free_new_extents();
         return -EIO;
     }
 
@@ -1285,11 +1410,11 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
         old_root_size = ip->data_fork.btree.root_size;
         rc = bmbt_count_root_bytes(ip, old_root, old_root_size, &old_metadata_blocks);
         if (rc != 0) {
-            delete[] new_extents;
+            free_new_extents();
             return rc;
         }
         if (ip->nblocks < old_metadata_blocks) {
-            delete[] new_extents;
+            free_new_extents();
             return -EIO;
         }
     }
@@ -1303,22 +1428,26 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
 
         XfsBmbtIrec* target_list = WAS_LOCAL ? nullptr : ip->data_fork.extents.list;
         uint32_t target_capacity = old_capacity;
+        if (!WAS_LOCAL && target_list == nullptr && old_count == 0 && new_count <= XFS_IFORK_INLINE_EXTENT_CAPACITY) {
+            target_list = xfs_ifork_extents_inline_data(ip->data_fork.extents);
+            target_capacity = XFS_IFORK_INLINE_EXTENT_CAPACITY;
+        }
         if (new_count > target_capacity) {
             uint32_t new_cap = target_capacity == 0 ? 4 : target_capacity * 2;
             new_cap = std::max(new_cap, new_count);
             auto* new_list = new (std::nothrow) XfsBmbtIrec[new_cap];
             if (new_list == nullptr) {
-                delete[] new_extents;
+                free_new_extents();
                 return -ENOMEM;
             }
-            if (!WAS_LOCAL) {
+            if (!WAS_LOCAL && !xfs_ifork_extents_uses_inline(ip->data_fork.extents)) {
                 delete[] ip->data_fork.extents.list;
             }
             target_list = new_list;
             target_capacity = new_cap;
         }
         if (new_count != 0 && target_list == nullptr) {
-            delete[] new_extents;
+            free_new_extents();
             return -EIO;
         }
         for (uint32_t i = 0; i < new_count; i++) {
@@ -1335,14 +1464,14 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
         ip->nextents = new_count;
         ip->dirty = true;
         xfs_trans_log_inode(tp, ip);
-        delete[] new_extents;
+        free_new_extents();
         return 0;
     }
 
     BmbtRootBuild new_root{};
     rc = build_bmbt_tree(ip, tp, new_extents, new_count, &new_root);
     if (rc != 0) {
-        delete[] new_extents;
+        free_new_extents();
         return rc;
     }
 
@@ -1350,7 +1479,7 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
     if (ACCOUNTED_BLOCKS > UINT64_MAX - new_root.metadata_blocks) {
         static_cast<void>(bmbt_free_root_bytes(ip, tp, new_root.root, new_root.root_size, nullptr));
         free_bmbt_root(&new_root);
-        delete[] new_extents;
+        free_new_extents();
         return -EFBIG;
     }
     uint64_t const FINAL_NBLOCKS = ACCOUNTED_BLOCKS + new_root.metadata_blocks;
@@ -1360,14 +1489,14 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
         if (rc != 0) {
             static_cast<void>(bmbt_free_root_bytes(ip, tp, new_root.root, new_root.root_size, nullptr));
             free_bmbt_root(&new_root);
-            delete[] new_extents;
+            free_new_extents();
             return rc;
         }
     }
 
     if (WAS_LOCAL) {
         delete[] ip->data_fork.local.data;
-    } else if (!WAS_BTREE) {
+    } else if (!WAS_BTREE && !xfs_ifork_extents_uses_inline(ip->data_fork.extents)) {
         delete[] ip->data_fork.extents.list;
     } else {
         delete[] old_root;
@@ -1383,7 +1512,7 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
     ip->dirty = true;
     xfs_trans_log_inode(tp, ip);
 
-    delete[] new_extents;
+    free_new_extents();
 
     return 0;
 }
@@ -1676,7 +1805,9 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
     auto cleanup = [&](bool ok) -> bool {
         xfs_icache_purge(&mount);
         if (inode.data_fork.format == XFS_DINODE_FMT_EXTENTS) {
-            delete[] inode.data_fork.extents.list;
+            if (!xfs_ifork_extents_uses_inline(inode.data_fork.extents)) {
+                delete[] inode.data_fork.extents.list;
+            }
             inode.data_fork.extents.list = nullptr;
         } else if (inode.data_fork.format == XFS_DINODE_FMT_BTREE) {
             delete[] inode.data_fork.btree.root;

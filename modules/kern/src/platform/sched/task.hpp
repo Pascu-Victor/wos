@@ -628,10 +628,12 @@ struct Task {
 
     // Current working directory (absolute path, "/" by default).
     PathBuffer cwd{'/', '\0'};
+    uint16_t cwd_len = 1;
 
     // Per-process root directory (for pivot_root / chroot).
     // Path resolution prepends this to absolute paths when it differs from "/".
     PathBuffer root{'/', '\0'};
+    uint16_t root_len = 1;
 
     // Executable path (set by exec, used by procfs /proc/self/exe).
     ExePathBuffer exe_path{};

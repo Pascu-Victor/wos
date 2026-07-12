@@ -113,8 +113,8 @@ auto tmpfs_walk_path(const char* path, bool create_intermediate) -> TmpNode*;
 // File-level operations
 auto create_root_file(TmpNode* root) -> ker::vfs::File*;
 auto create_root_file() -> ker::vfs::File*;
-auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode) -> ker::vfs::File*;
-auto tmpfs_open_path(const char* path, int flags, int mode) -> ker::vfs::File*;
+auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode, int* result_out = nullptr) -> ker::vfs::File*;
+auto tmpfs_open_path(const char* path, int flags, int mode, int* result_out = nullptr) -> ker::vfs::File*;
 auto tmpfs_read(ker::vfs::File* f, void* buf, std::size_t count, std::size_t offset) -> ssize_t;
 auto tmpfs_write(ker::vfs::File* f, const void* buf, std::size_t count, std::size_t offset) -> ssize_t;
 auto tmpfs_write_append(ker::vfs::File* f, const void* buf, std::size_t count, std::size_t* offset_out) -> ssize_t;

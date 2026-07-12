@@ -12,7 +12,10 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <new>
 #include <platform/dbg/dbg.hpp>
+#include <platform/mm/phys.hpp>
+#include <platform/sys/spinlock.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_log.hpp>
 
@@ -23,6 +26,16 @@ namespace ker::vfs::xfs {
 
 namespace {
 
+constexpr size_t XFS_TRANS_ARENA_BYTES = size_t{256} * 1024;
+constexpr size_t XFS_TRANS_STRIDE = (sizeof(XfsTransaction) + alignof(XfsTransaction) - 1) & ~(alignof(XfsTransaction) - 1);
+
+struct XfsTransactionPool {
+    ker::mod::sys::Spinlock lock;
+    XfsTransaction* free_list{};
+};
+
+XfsTransactionPool transaction_pool{};
+
 void xfs_trans_mark_overflowed(XfsTransaction* tp) {
     if (tp == nullptr) {
         return;
@@ -31,6 +44,107 @@ void xfs_trans_mark_overflowed(XfsTransaction* tp) {
         mod::dbg::log("[xfs trans] too many items in transaction (%d max)", XFS_TRANS_MAX_ITEMS);
     }
     tp->overflowed = true;
+}
+
+auto xfs_trans_ensure_item_capacity(XfsTransaction* tp) -> bool {
+    if (tp == nullptr) {
+        return false;
+    }
+    if (tp->item_count < tp->item_capacity) {
+        return true;
+    }
+    if (tp->item_capacity >= XFS_TRANS_MAX_ITEMS) {
+        xfs_trans_mark_overflowed(tp);
+        return false;
+    }
+
+    auto* expanded = new (std::nothrow) XfsTransItem[XFS_TRANS_MAX_ITEMS];
+    if (expanded == nullptr) {
+        xfs_trans_mark_overflowed(tp);
+        return false;
+    }
+    for (int i = 0; i < tp->item_count; ++i) {
+        expanded[i] = tp->items[i];
+    }
+    tp->items = expanded;
+    tp->item_capacity = XFS_TRANS_MAX_ITEMS;
+    return true;
+}
+
+void xfs_trans_reset_for_reuse(XfsTransaction* tp) {
+    if (tp == nullptr) {
+        return;
+    }
+    if (tp->items != tp->inline_items.data()) {
+        delete[] tp->items;
+    }
+    tp->mount = nullptr;
+    tp->pool_next = nullptr;
+    tp->items = tp->inline_items.data();
+    tp->item_capacity = XFS_TRANS_INLINE_ITEMS;
+    tp->item_count = 0;
+    tp->overflowed = false;
+    tp->committed = false;
+    tp->cancelled = false;
+}
+
+void xfs_trans_add_arena_locked(void* arena, size_t bytes) {
+    auto* next = static_cast<uint8_t*>(arena);
+    size_t remaining = bytes;
+    while (remaining >= XFS_TRANS_STRIDE) {
+        auto* tp = new (next) XfsTransaction{};
+        tp->pool_next = transaction_pool.free_list;
+        transaction_pool.free_list = tp;
+        next += XFS_TRANS_STRIDE;
+        remaining -= XFS_TRANS_STRIDE;
+    }
+}
+
+auto xfs_trans_pool_pop() -> XfsTransaction* {
+    uint64_t const IRQF = transaction_pool.lock.lock_irqsave();
+    XfsTransaction* tp = transaction_pool.free_list;
+    if (tp != nullptr) {
+        transaction_pool.free_list = tp->pool_next;
+        tp->pool_next = nullptr;
+    }
+    transaction_pool.lock.unlock_irqrestore(IRQF);
+    return tp;
+}
+
+auto xfs_trans_pool_alloc() -> XfsTransaction* {
+    if (XfsTransaction* tp = xfs_trans_pool_pop()) {
+        xfs_trans_reset_for_reuse(tp);
+        return tp;
+    }
+
+    void* const ARENA = ker::mod::mm::phys::page_alloc_full_overwrite(XFS_TRANS_ARENA_BYTES, "xfs_transactions");
+    if (ARENA != nullptr) {
+        uint64_t const IRQF = transaction_pool.lock.lock_irqsave();
+        xfs_trans_add_arena_locked(ARENA, XFS_TRANS_ARENA_BYTES);
+        XfsTransaction* tp = transaction_pool.free_list;
+        if (tp != nullptr) {
+            transaction_pool.free_list = tp->pool_next;
+            tp->pool_next = nullptr;
+        }
+        transaction_pool.lock.unlock_irqrestore(IRQF);
+        if (tp != nullptr) {
+            xfs_trans_reset_for_reuse(tp);
+        }
+        return tp;
+    }
+
+    return new (std::nothrow) XfsTransaction{};
+}
+
+void xfs_trans_release(XfsTransaction* tp) {
+    if (tp == nullptr) {
+        return;
+    }
+    xfs_trans_reset_for_reuse(tp);
+    uint64_t const IRQF = transaction_pool.lock.lock_irqsave();
+    tp->pool_next = transaction_pool.free_list;
+    transaction_pool.free_list = tp;
+    transaction_pool.lock.unlock_irqrestore(IRQF);
 }
 
 }  // namespace
@@ -44,7 +158,10 @@ auto xfs_trans_alloc(XfsMountContext* mount) -> XfsTransaction* {
         return nullptr;
     }
 
-    auto* tp = new XfsTransaction{};
+    auto* tp = xfs_trans_pool_alloc();
+    if (tp == nullptr) {
+        return nullptr;
+    }
     tp->mount = mount;
     return tp;
 }
@@ -60,7 +177,7 @@ void xfs_trans_log_buf(XfsTransaction* tp, BufHead* bp, uint32_t offset, uint32_
     // Check if this buffer (or a different buffer for the same disk block)
     // is already logged in this transaction.
     for (int i = 0; i < tp->item_count; i++) {
-        XfsTransItem& item = tp->items.at(static_cast<size_t>(i));
+        XfsTransItem& item = tp->items[i];
         if (item.type != XfsLogItemType::BUFFER || item.buf.bp == nullptr) {
             continue;
         }
@@ -97,8 +214,7 @@ void xfs_trans_log_buf(XfsTransaction* tp, BufHead* bp, uint32_t offset, uint32_
         }
     }
 
-    if (tp->item_count >= XFS_TRANS_MAX_ITEMS) {
-        xfs_trans_mark_overflowed(tp);
+    if (!xfs_trans_ensure_item_capacity(tp)) {
         return;
     }
 
@@ -107,7 +223,7 @@ void xfs_trans_log_buf(XfsTransaction* tp, BufHead* bp, uint32_t offset, uint32_
     // call brelse() before the transaction commits.
     bp->refcount.fetch_add(1, std::memory_order_relaxed);
 
-    XfsTransItem& item = tp->items.at(static_cast<size_t>(tp->item_count++));
+    XfsTransItem& item = tp->items[tp->item_count++];
     item.type = XfsLogItemType::BUFFER;
     item.buf.bp = bp;
     item.buf.offset = offset;
@@ -129,21 +245,19 @@ void xfs_trans_log_inode(XfsTransaction* tp, XfsInode* ip) {
     if (tp->overflowed) {
         return;
     }
-
     // Check if already logged
     for (int i = 0; i < tp->item_count; i++) {
-        XfsTransItem const& item = tp->items.at(static_cast<size_t>(i));
+        XfsTransItem const& item = tp->items[i];
         if (item.type == XfsLogItemType::INODE && item.inode.ip == ip) {
             return;  // already tracked
         }
     }
 
-    if (tp->item_count >= XFS_TRANS_MAX_ITEMS) {
-        xfs_trans_mark_overflowed(tp);
+    if (!xfs_trans_ensure_item_capacity(tp)) {
         return;
     }
 
-    XfsTransItem& item = tp->items.at(static_cast<size_t>(tp->item_count++));
+    XfsTransItem& item = tp->items[tp->item_count++];
     item.type = XfsLogItemType::INODE;
     item.inode.ip = ip;
 }
@@ -164,7 +278,7 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
     // Phase 1: Write dirty inodes back to their buffers so the buffer
     // data is up-to-date before we write the log record.
     for (int i = 0; i < tp->item_count; i++) {
-        XfsTransItem const& item = tp->items.at(static_cast<size_t>(i));
+        XfsTransItem const& item = tp->items[i];
         if (item.type == XfsLogItemType::INODE && item.inode.ip != nullptr) {
             int const WRC = xfs_inode_write(item.inode.ip, tp);
             if (WRC != 0) {
@@ -182,7 +296,8 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
 
     // Phase 2: Write-ahead log - serialize all buffer modifications to the
     // journal before flushing any data.  This ensures recoverability.
-    int const LOG_RC = xfs_log_write(tp->mount, tp->items.data(), tp->item_count);
+    bool log_owns_metadata = false;
+    int const LOG_RC = xfs_log_write(tp->mount, tp->items, tp->item_count, &log_owns_metadata);
     if (LOG_RC != 0 && LOG_RC != -EINVAL) {
         // Log write failure is not fatal if the log isn't active (read-only
         // or no log area), but is serious otherwise.
@@ -194,16 +309,18 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
     // be flushed to disk by LRU writeback, avoiding per-transaction I/O.
     int const RC = 0;
     for (int i = 0; i < tp->item_count; i++) {
-        XfsTransItem& item = tp->items.at(static_cast<size_t>(i));
+        XfsTransItem& item = tp->items[i];
         if (item.type == XfsLogItemType::BUFFER && item.buf.dirty && item.buf.bp != nullptr) {
-            bdirty(item.buf.bp);
+            if (!log_owns_metadata) {
+                bdirty(item.buf.bp);
+            }
             brelse(item.buf.bp);
             item.buf.bp = nullptr;
         }
     }
 
     tp->committed = true;
-    delete tp;
+    xfs_trans_release(tp);
     return RC;
 }
 
@@ -217,7 +334,7 @@ void xfs_trans_cancel(XfsTransaction* tp) {
 
     // Release the transaction's buffer references (taken in xfs_trans_log_buf).
     for (int i = 0; i < tp->item_count; i++) {
-        XfsTransItem& item = tp->items.at(static_cast<size_t>(i));
+        XfsTransItem& item = tp->items[i];
         if (item.type == XfsLogItemType::BUFFER && item.buf.bp != nullptr) {
             brelse(item.buf.bp);
             item.buf.bp = nullptr;
@@ -225,7 +342,7 @@ void xfs_trans_cancel(XfsTransaction* tp) {
     }
 
     tp->cancelled = true;
-    delete tp;
+    xfs_trans_release(tp);
 }
 
 }  // namespace ker::vfs::xfs

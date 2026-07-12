@@ -72,15 +72,22 @@ constexpr size_t WKI_PATH_PREFIX_LEN = 5;
 constexpr int64_t VFS_NSEC_PER_SEC = 1000000000LL;
 constexpr int64_t VFS_UTIME_NOW = (1LL << 30) - 1;
 constexpr int64_t VFS_UTIME_OMIT = (1LL << 30) - 2;
+constexpr int RESOLVE_FAST_PATH_DECLINED = 1;
+constexpr size_t UNKNOWN_PATH_LEN = static_cast<size_t>(-1);
+constexpr uint64_t UNKNOWN_PATH_HASH = 0;
 
-auto make_absolute(const char* path, char* out, size_t outsize) -> int;
+auto make_absolute(const char* path, char* out, size_t outsize, size_t* out_len = nullptr) -> int;
 auto canonicalize_path(char* path, size_t bufsize) -> int;
 auto normalize_task_path_inplace(char* path, size_t bufsize) -> int;
 auto normalize_task_path_inplace_with_route(char* path, size_t bufsize, bool apply_task_route) -> int;
-auto resolve_task_path_raw_impl(const char* path, char* out, size_t outsize, bool apply_task_route) -> int;
-auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize_t;
+auto resolve_task_path_raw_impl(const char* path, char* out, size_t outsize, bool apply_task_route, size_t* resolved_len_out = nullptr,
+                                uint64_t* resolved_hash_out = nullptr) -> int;
+auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize, size_t known_abs_path_len = UNKNOWN_PATH_LEN,
+                       uint64_t known_abs_path_hash = UNKNOWN_PATH_HASH) -> ssize_t;
 auto strip_mount_prefix(const MountPoint* mount, const char* path) -> const char*;
+auto strip_mount_prefix_len(const MountPoint* mount, const char* path, size_t path_len) -> size_t;
 auto tmpfs_root_for_mount(const MountPoint* mount) -> ker::vfs::tmpfs::TmpNode*;
+auto path_is_under_mount(const MountPoint* mount, const char* path, size_t path_len) -> bool;
 auto vfs_set_fd_cloexec_for_task(ker::mod::sched::task::Task* task, int fd, bool cloexec) -> int;
 
 ker::util::SmallVec<ker::mod::sched::task::WkiVfsRule, 8> g_default_vfs_rules;
@@ -113,8 +120,8 @@ constexpr size_t PIPE_WAKE_BATCH = 32;
 constexpr size_t PIPE_WAITER_INLINE_CAPACITY = PIPE_WAKE_BATCH * 2;
 constexpr size_t PIPE_DEFAULT_CAPACITY = 256UL * 1024UL;
 constexpr size_t PIPE_DIRECT_MAX_CAPACITY = 256UL * 1024UL;
-constexpr size_t USER_IO_BOUNCE_STACK_CHUNK = 4096;
-constexpr size_t USER_IO_BOUNCE_MAX_CHUNK = size_t{256} * 1024;
+constexpr size_t USER_IO_BOUNCE_STACK_CHUNK = size_t{16} * 1024;
+constexpr size_t USER_IO_BOUNCE_MAX_CHUNK = size_t{1} * 1024 * 1024;
 constexpr uint64_t ADVISORY_RANGE_EOF = UINT64_MAX;
 // CMake/Ninja tree scans touch enough distinct paths that small metadata caches
 // thrash mostly on set conflicts. Keep this static and bounded: 131072 entries
@@ -122,17 +129,19 @@ constexpr uint64_t ADVISORY_RANGE_EOF = UINT64_MAX;
 // the per-lookup way scan.
 constexpr size_t METADATA_CACHE_SET_COUNT = 16384;
 constexpr size_t METADATA_CACHE_WAYS = 8;
+constexpr size_t EXISTENCE_CACHE_SET_COUNT = 8192;
+constexpr size_t EXISTENCE_CACHE_WAYS = 4;
 constexpr size_t METADATA_INVALIDATION_SET_COUNT = 8192;
 constexpr size_t METADATA_INVALIDATION_WAYS = 4;
-// Source-tree opens/stat calls repeatedly prove that hot ancestor directories
-// are not symlinks. LLVM-sized checkouts also generate many one-shot final-path
-// ENOENT probes, so keep enough negative readlink entries that those do not
-// evict hot ancestor directory proofs immediately.
 constexpr size_t SYMLINK_CACHE_SET_COUNT = 8192;
 constexpr size_t SYMLINK_CACHE_WAYS = 4;
+constexpr size_t SYMLINK_PREFIX_CACHE_SET_COUNT = 8192;
+constexpr size_t SYMLINK_PREFIX_CACHE_WAYS = 4;
 static_assert((METADATA_CACHE_SET_COUNT & (METADATA_CACHE_SET_COUNT - 1)) == 0);
+static_assert((EXISTENCE_CACHE_SET_COUNT & (EXISTENCE_CACHE_SET_COUNT - 1)) == 0);
 static_assert((METADATA_INVALIDATION_SET_COUNT & (METADATA_INVALIDATION_SET_COUNT - 1)) == 0);
 static_assert((SYMLINK_CACHE_SET_COUNT & (SYMLINK_CACHE_SET_COUNT - 1)) == 0);
+static_assert((SYMLINK_PREFIX_CACHE_SET_COUNT & (SYMLINK_PREFIX_CACHE_SET_COUNT - 1)) == 0);
 
 struct MetadataCacheEntry {
     std::array<char, MAX_PATH_LEN> path{};
@@ -141,6 +150,7 @@ struct MetadataCacheEntry {
     uint64_t epoch = 0;
     uint64_t last_used = 0;
     uint64_t dev_id = 0;
+    uint64_t mount_generation = 0;
     uint64_t invalidation_generation = 0;
     size_t path_len = 0;
     int result = 0;
@@ -151,8 +161,30 @@ struct MetadataCacheEntry {
 };
 
 struct MetadataCacheSet {
-    ker::mod::sys::Mutex lock;
+    ker::mod::sys::Spinlock lock;
     std::array<MetadataCacheEntry, METADATA_CACHE_WAYS> ways{};
+    uint64_t clock = 0;
+};
+
+struct ExistenceCacheEntry {
+    std::array<char, MAX_PATH_LEN> path{};
+    uint64_t hash = 0;
+    uint64_t epoch = 0;
+    uint64_t last_used = 0;
+    uint64_t dev_id = 0;
+    uint64_t mount_generation = 0;
+    uint64_t invalidation_generation = 0;
+    size_t path_len = 0;
+    int result = 0;
+    FSType fs_type = FSType::TMPFS;
+    bool follow_final_symlink = true;
+    bool require_directory = false;
+    bool valid = false;
+};
+
+struct ExistenceCacheSet {
+    ker::mod::sys::Spinlock lock;
+    std::array<ExistenceCacheEntry, EXISTENCE_CACHE_WAYS> ways{};
     uint64_t clock = 0;
 };
 
@@ -172,8 +204,27 @@ struct SymlinkCacheEntry {
 };
 
 struct SymlinkCacheSet {
-    ker::mod::sys::Mutex lock;
+    ker::mod::sys::Spinlock lock;
     std::array<SymlinkCacheEntry, SYMLINK_CACHE_WAYS> ways{};
+    uint64_t clock = 0;
+};
+
+struct SymlinkPrefixCacheEntry {
+    std::array<char, MAX_PATH_LEN> path{};
+    uint64_t hash = 0;
+    uint64_t epoch = 0;
+    uint64_t last_used = 0;
+    uint64_t dev_id = 0;
+    uint64_t mount_generation = 0;
+    uint64_t invalidation_generation = 0;
+    size_t path_len = 0;
+    FSType fs_type = FSType::TMPFS;
+    bool valid = false;
+};
+
+struct SymlinkPrefixCacheSet {
+    ker::mod::sys::Spinlock lock;
+    std::array<SymlinkPrefixCacheEntry, SYMLINK_PREFIX_CACHE_WAYS> ways{};
     uint64_t clock = 0;
 };
 
@@ -187,6 +238,12 @@ struct MetadataInvalidationSet {
     std::array<MetadataInvalidationEntry, METADATA_INVALIDATION_WAYS> ways{};
     // If the set fills, invalidate the whole hash set instead of the whole cache.
     uint64_t overflow_generation = 0;
+    std::atomic<uint64_t> latest_generation{0};
+};
+
+struct MetadataInvalidationCheck {
+    bool invalidated = true;
+    uint64_t checked_generation = 0;
 };
 
 struct VfsFlockAbi {
@@ -254,19 +311,23 @@ struct AdvisoryLock {
 };
 
 std::array<MetadataCacheSet, METADATA_CACHE_SET_COUNT> g_metadata_cache{};
+std::array<ExistenceCacheSet, EXISTENCE_CACHE_SET_COUNT> g_existence_cache{};
 // Path metadata/readlink caches use path-scoped invalidation generations.
 // g_metadata_cache_epoch remains the conservative public epoch exposed for
 // diagnostics and external cache consumers that need a simple global token.
 std::atomic<uint64_t> g_metadata_cache_generation{1};
 std::atomic<uint64_t> g_metadata_cache_epoch{1};
 std::atomic<uint64_t> g_metadata_observation_epoch{1};
+std::atomic<uint64_t> g_metadata_store_observation_epoch{1};
 
 std::array<SymlinkCacheSet, SYMLINK_CACHE_SET_COUNT> g_symlink_cache{};
+std::array<SymlinkPrefixCacheSet, SYMLINK_PREFIX_CACHE_SET_COUNT> g_symlink_prefix_cache{};
 
 std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT> g_metadata_subtree_invalidations{};
 std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT> g_metadata_exact_invalidations{};
-ker::mod::sys::Mutex g_metadata_invalidation_lock;
+ker::mod::sys::Spinlock g_metadata_invalidation_lock;
 std::atomic<uint64_t> g_metadata_invalidation_generation{1};
+std::atomic<uint64_t> g_metadata_subtree_invalidation_generation{1};
 std::deque<AdvisoryLock> g_advisory_locks;
 ker::mod::sys::Mutex g_advisory_lock_mutex;
 
@@ -279,9 +340,14 @@ std::atomic<uint64_t> g_vfs_metadata_miss_stale_generation{0};
 std::atomic<uint64_t> g_vfs_metadata_miss_conflict{0};
 std::atomic<uint64_t> g_vfs_metadata_path_invalidations{0};
 std::atomic<uint64_t> g_vfs_metadata_generation_resets{0};
+std::atomic<uint64_t> g_vfs_existence_hits{0};
+std::atomic<uint64_t> g_vfs_existence_misses{0};
+std::atomic<uint64_t> g_vfs_existence_stores{0};
 std::atomic<uint64_t> g_vfs_symlink_hits{0};
 std::atomic<uint64_t> g_vfs_symlink_misses{0};
 std::atomic<uint64_t> g_vfs_symlink_stores{0};
+std::atomic<uint64_t> g_vfs_symlink_prefix_hits{0};
+std::atomic<uint64_t> g_vfs_symlink_prefix_stores{0};
 std::atomic<uint64_t> g_vfs_stream_hits{0};
 std::atomic<uint64_t> g_vfs_stream_misses{0};
 std::atomic<uint64_t> g_vfs_stream_backend_reads{0};
@@ -311,6 +377,8 @@ auto fcntl_setfl_flags(int current_flags, uint64_t requested_raw) -> int {
     return (current_flags & ~MUTABLE_STATUS_FLAGS) | (REQUESTED_FLAGS & MUTABLE_STATUS_FLAGS);
 }
 
+auto public_open_flags(int flags) -> int { return flags & ~ker::vfs::O_WOS_KNOWN_ABSENT; }
+
 struct StreamCacheIdentity;
 struct StreamFreshnessStamp;
 
@@ -320,12 +388,37 @@ void cache_notify_detach_file(File* file);
 void cache_notify_file_data_changed_impl(File* file);
 void cache_notify_file_metadata_changed_impl(File* file);
 auto cache_notify_file_dirty_impl(File* file) -> bool;
+void refresh_created_file_stat_snapshot_after_write(File* file);
+void metadata_cache_refresh_file_data_on_close(File* file);
+void symlink_cache_store(const char* path, FSType fs_type, uint64_t dev_id, ssize_t result, const char* target,
+                         size_t known_path_len = UNKNOWN_PATH_LEN, uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH);
+auto symlink_hash_from_raw(uint64_t path_hash, FSType fs_type, uint64_t dev_id) -> uint64_t;
+void symlink_cache_store_prehashed(const char* path, size_t path_len, FSType fs_type, uint64_t dev_id, ssize_t result, const char* target,
+                                   size_t target_len, uint64_t hash, uint64_t epoch, uint64_t invalidation_generation);
+void symlink_cache_store_prechecked(const char* path, size_t path_len, FSType fs_type, uint64_t dev_id, ssize_t result, const char* target,
+                                    size_t target_len, uint64_t epoch, uint64_t invalidation_generation);
+auto symlink_prefix_hash_from_symlink_hash(uint64_t symlink_hash, uint64_t mount_generation) -> uint64_t;
+void symlink_prefix_cache_store_prehashed(const char* path, size_t prefix_len, MountPoint const* mount, uint64_t hash, uint64_t epoch,
+                                          uint64_t mount_generation, uint64_t invalidation_generation);
+void symlink_prefix_cache_store_prechecked(const char* path, size_t prefix_len, MountPoint const* mount, uint64_t epoch,
+                                           uint64_t mount_generation, uint64_t invalidation_generation);
+auto symlink_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, char* buf, size_t bufsize, ssize_t* out_result,
+                          size_t known_path_len = UNKNOWN_PATH_LEN, size_t* path_len_out = nullptr,
+                          uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH) -> bool;
 void stream_invalidate_identity_locked(const StreamCacheIdentity& identity);
 void stream_gc_locked(uint64_t now_us);
 auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t start_offset, size_t* actual_size, ssize_t* result) -> bool;
 auto vfs_stream_cache_get_file_stat(File* file, Stat* statbuf) -> int;
 auto stream_build_identity(File* file, const Stat& statbuf, StreamCacheIdentity* identity, StreamFreshnessStamp* stamp,
                            bool* can_reuse_detached, bool* retain_full_file) -> int;
+
+constexpr uint64_t METADATA_PATH_HASH_OFFSET = 1469598103934665603ULL;
+constexpr uint64_t METADATA_PATH_HASH_PRIME = 1099511628211ULL;
+auto metadata_path_hash_append(uint64_t hash, char ch) -> uint64_t {
+    hash ^= static_cast<unsigned char>(ch);
+    hash *= METADATA_PATH_HASH_PRIME;
+    return hash;
+}
 
 auto metadata_hash_mix(uint64_t value) -> uint64_t {
     value ^= value >> 33U;
@@ -336,24 +429,74 @@ auto metadata_hash_mix(uint64_t value) -> uint64_t {
     return value;
 }
 
-auto metadata_hash_path(const char* path, size_t len, bool follow_final_symlink, bool require_directory, FSType fs_type, uint64_t dev_id)
-    -> uint64_t {
-    uint64_t hash = 1469598103934665603ULL;
+auto metadata_path_hash_raw(const char* path, size_t len) -> uint64_t {
+    uint64_t hash = METADATA_PATH_HASH_OFFSET;
     for (size_t i = 0; i < len; ++i) {
-        hash ^= static_cast<unsigned char>(path[i]);
-        hash *= 1099511628211ULL;
+        hash = metadata_path_hash_append(hash, path[i]);
     }
+    return hash;
+}
+
+auto metadata_path_hash_known_len(const char* path, size_t len) -> uint64_t {
+    if (path == nullptr || len == UNKNOWN_PATH_LEN || len == 0 || len >= MAX_PATH_LEN) {
+        return UNKNOWN_PATH_HASH;
+    }
+    return metadata_path_hash_raw(path, len);
+}
+
+auto metadata_path_hash_concat(const char* first, size_t first_len, bool add_separator, const char* second, size_t second_len) -> uint64_t {
+    uint64_t hash = METADATA_PATH_HASH_OFFSET;
+    for (size_t i = 0; i < first_len; ++i) {
+        hash = metadata_path_hash_append(hash, first[i]);
+    }
+    if (add_separator) {
+        hash = metadata_path_hash_append(hash, '/');
+    }
+    for (size_t i = 0; i < second_len; ++i) {
+        hash = metadata_path_hash_append(hash, second[i]);
+    }
+    return hash;
+}
+
+auto metadata_hash_path_from_raw(uint64_t path_hash, bool follow_final_symlink, bool require_directory, FSType fs_type, uint64_t dev_id)
+    -> uint64_t {
+    static_cast<void>(fs_type);
+    static_cast<void>(dev_id);
+    uint64_t hash = path_hash;
     hash ^= follow_final_symlink ? 0x9e3779b97f4a7c15ULL : 0x517cc1b727220a95ULL;
     hash = metadata_hash_mix(hash ^ (require_directory ? 0x94d049bb133111ebULL : 0x2545f4914f6cdd1dULL));
-    hash = metadata_hash_mix(hash ^ (static_cast<uint64_t>(fs_type) << 56U) ^ dev_id);
     return hash == 0 ? 1 : hash;
 }
 
+auto metadata_hash_path(const char* path, size_t len, bool follow_final_symlink, bool require_directory, FSType fs_type, uint64_t dev_id)
+    -> uint64_t {
+    return metadata_hash_path_from_raw(metadata_path_hash_raw(path, len), follow_final_symlink, require_directory, fs_type, dev_id);
+}
+
+auto existence_hash_from_metadata_hash(uint64_t metadata_hash) -> uint64_t {
+    return metadata_hash_mix(metadata_hash ^ 0x8e5f6a35d9c31b27ULL);
+}
+
+auto existence_effective_follow_final_symlink(bool follow_final_symlink, bool require_directory) -> bool {
+    return follow_final_symlink || require_directory;
+}
+
+auto existence_hash_from_raw_path(uint64_t raw_path_hash, bool follow_final_symlink, bool require_directory, FSType fs_type,
+                                  uint64_t dev_id) -> uint64_t {
+    return existence_hash_from_metadata_hash(
+        metadata_hash_path_from_raw(raw_path_hash, existence_effective_follow_final_symlink(follow_final_symlink, require_directory),
+                                    require_directory, fs_type, dev_id));
+}
+
+auto existence_hash_path(const char* path, size_t len, bool follow_final_symlink, bool require_directory, FSType fs_type, uint64_t dev_id)
+    -> uint64_t {
+    return existence_hash_from_raw_path(metadata_path_hash_raw(path, len), follow_final_symlink, require_directory, fs_type, dev_id);
+}
+
 auto metadata_invalidation_hash_path(const char* path, size_t len) -> uint64_t {
-    uint64_t hash = 1469598103934665603ULL;
+    uint64_t hash = METADATA_PATH_HASH_OFFSET;
     for (size_t i = 0; i < len; ++i) {
-        hash ^= static_cast<unsigned char>(path[i]);
-        hash *= 1099511628211ULL;
+        hash = metadata_path_hash_append(hash, path[i]);
     }
     return hash == 0 ? 1 : hash;
 }
@@ -844,6 +987,16 @@ auto metadata_normalized_path_len(const char* path) -> size_t {
     return len;
 }
 
+auto file_vfs_path_len(const File* file) -> size_t {
+    if (file == nullptr || file->vfs_path == nullptr || file->vfs_path[0] != '/') {
+        return 0;
+    }
+    if (file->vfs_path_len != 0) {
+        return file->vfs_path_len;
+    }
+    return metadata_normalized_path_len(file->vfs_path);
+}
+
 auto metadata_parent_path_len(const char* path, size_t path_len) -> size_t {
     if (path == nullptr || path_len == 0 || path[0] != '/') {
         return 0;
@@ -862,12 +1015,14 @@ auto metadata_parent_path_len(const char* path, size_t path_len) -> size_t {
 void metadata_invalidation_clear_locked() {
     for (auto& set : g_metadata_subtree_invalidations) {
         set.overflow_generation = 0;
+        set.latest_generation.store(0, std::memory_order_release);
         for (auto& entry : set.ways) {
             entry.valid = false;
         }
     }
     for (auto& set : g_metadata_exact_invalidations) {
         set.overflow_generation = 0;
+        set.latest_generation.store(0, std::memory_order_release);
         for (auto& entry : set.ways) {
             entry.valid = false;
         }
@@ -880,6 +1035,14 @@ void metadata_cache_bump_generation_locked() {
     metadata_invalidation_clear_locked();
 }
 
+auto metadata_invalidation_next_generation_locked() -> uint64_t {
+    return g_metadata_invalidation_generation.load(std::memory_order_relaxed) + 1;
+}
+
+void metadata_invalidation_publish_generation_locked(uint64_t generation) {
+    g_metadata_invalidation_generation.store(generation, std::memory_order_release);
+}
+
 void metadata_invalidation_store_locked(std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT>& table, uint64_t path_hash,
                                         uint64_t generation) {
     auto& set = table.at(path_hash & (METADATA_INVALIDATION_SET_COUNT - 1));
@@ -887,6 +1050,7 @@ void metadata_invalidation_store_locked(std::array<MetadataInvalidationSet, META
     for (auto& entry : set.ways) {
         if (entry.valid && entry.path_hash == path_hash) {
             entry.generation = generation;
+            set.latest_generation.store(generation, std::memory_order_release);
             return;
         }
         if (!entry.valid && free_entry == nullptr) {
@@ -895,12 +1059,14 @@ void metadata_invalidation_store_locked(std::array<MetadataInvalidationSet, META
     }
     if (free_entry == nullptr) {
         set.overflow_generation = std::max(set.overflow_generation, generation);
+        set.latest_generation.store(generation, std::memory_order_release);
         return;
     }
 
     free_entry->path_hash = path_hash;
     free_entry->generation = generation;
     free_entry->valid = true;
+    set.latest_generation.store(generation, std::memory_order_release);
 }
 
 auto metadata_invalidation_generation_for_hash_locked(const std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT>& table,
@@ -915,6 +1081,40 @@ auto metadata_invalidation_generation_for_hash_locked(const std::array<MetadataI
     return generation;
 }
 
+auto metadata_invalidation_hash_set_may_contain_newer(const std::array<MetadataInvalidationSet, METADATA_INVALIDATION_SET_COUNT>& table,
+                                                      uint64_t path_hash, uint64_t seen_generation) -> bool {
+    auto const& set = table.at(path_hash & (METADATA_INVALIDATION_SET_COUNT - 1));
+    return set.latest_generation.load(std::memory_order_acquire) > seen_generation;
+}
+
+auto metadata_invalidation_subtree_set_may_contain_newer(const char* path, size_t path_len, uint64_t seen_generation) -> bool {
+    uint64_t hash = METADATA_PATH_HASH_OFFSET;
+    for (size_t i = 0; i < path_len; ++i) {
+        hash = metadata_path_hash_append(hash, path[i]);
+        if (i == 0 || (i + 1 != path_len && path[i + 1] != '/')) {
+            continue;
+        }
+        if (metadata_invalidation_hash_set_may_contain_newer(g_metadata_subtree_invalidations, hash, seen_generation)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto metadata_invalidation_subtree_has_newer_locked(const char* path, size_t path_len, uint64_t seen_generation) -> bool {
+    uint64_t hash = METADATA_PATH_HASH_OFFSET;
+    for (size_t i = 0; i < path_len; ++i) {
+        hash = metadata_path_hash_append(hash, path[i]);
+        if (i == 0 || (i + 1 != path_len && path[i + 1] != '/')) {
+            continue;
+        }
+        if (metadata_invalidation_generation_for_hash_locked(g_metadata_subtree_invalidations, hash) > seen_generation) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void metadata_cache_note_one_path_changed_locked(const char* path) {
     size_t const PATH_LEN = metadata_normalized_path_len(path);
     if (PATH_LEN == 0) {
@@ -926,17 +1126,20 @@ void metadata_cache_note_one_path_changed_locked(const char* path) {
         return;
     }
 
-    uint64_t const PATH_GENERATION = g_metadata_invalidation_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    uint64_t const PATH_GENERATION = metadata_invalidation_next_generation_locked();
     uint64_t const PATH_HASH = metadata_invalidation_hash_path(path, PATH_LEN);
     metadata_invalidation_store_locked(g_metadata_subtree_invalidations, PATH_HASH, PATH_GENERATION);
+    g_metadata_subtree_invalidation_generation.store(PATH_GENERATION, std::memory_order_release);
+    metadata_invalidation_publish_generation_locked(PATH_GENERATION);
 
     size_t const PARENT_LEN = metadata_parent_path_len(path, PATH_LEN);
     if (PARENT_LEN == 0) {
         return;
     }
-    uint64_t const PARENT_GENERATION = g_metadata_invalidation_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    uint64_t const PARENT_GENERATION = metadata_invalidation_next_generation_locked();
     uint64_t const PARENT_HASH = metadata_invalidation_hash_path(path, PARENT_LEN);
     metadata_invalidation_store_locked(g_metadata_exact_invalidations, PARENT_HASH, PARENT_GENERATION);
+    metadata_invalidation_publish_generation_locked(PARENT_GENERATION);
 }
 
 void metadata_cache_note_path_changed(const char* old_path, const char* new_path) {
@@ -945,40 +1148,79 @@ void metadata_cache_note_path_changed(const char* old_path, const char* new_path
     }
 
     g_metadata_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
-    g_metadata_invalidation_lock.lock();
+    uint64_t const IRQF = g_metadata_invalidation_lock.lock_irqsave();
     metadata_cache_note_one_path_changed_locked(old_path);
     if (new_path != nullptr && (old_path == nullptr || std::strcmp(old_path, new_path) != 0)) {
         metadata_cache_note_one_path_changed_locked(new_path);
     }
-    g_metadata_invalidation_lock.unlock();
+    g_metadata_invalidation_lock.unlock_irqrestore(IRQF);
 }
 
-auto metadata_path_invalidated_since(const char* path, size_t path_len, uint64_t seen_generation) -> bool {
+auto metadata_path_invalidation_check(const char* path, size_t path_len, uint64_t seen_generation) -> MetadataInvalidationCheck {
+    uint64_t const CURRENT_GENERATION = g_metadata_invalidation_generation.load(std::memory_order_acquire);
     if (path == nullptr || path_len == 0 || path[0] != '/') {
-        return true;
+        return MetadataInvalidationCheck{.invalidated = true, .checked_generation = CURRENT_GENERATION};
     }
-    if (seen_generation == g_metadata_invalidation_generation.load(std::memory_order_acquire)) {
-        return false;
+    if (seen_generation == CURRENT_GENERATION) {
+        return MetadataInvalidationCheck{.invalidated = false, .checked_generation = CURRENT_GENERATION};
+    }
+
+    uint64_t const EXACT_HASH = metadata_invalidation_hash_path(path, path_len);
+    bool const CHECK_EXACT = metadata_invalidation_hash_set_may_contain_newer(g_metadata_exact_invalidations, EXACT_HASH, seen_generation);
+    bool check_subtree = false;
+    uint64_t const SUBTREE_GENERATION = g_metadata_subtree_invalidation_generation.load(std::memory_order_acquire);
+    if (SUBTREE_GENERATION > seen_generation) {
+        check_subtree = metadata_invalidation_subtree_set_may_contain_newer(path, path_len, seen_generation);
+    }
+    if (!CHECK_EXACT && !check_subtree) {
+        return MetadataInvalidationCheck{.invalidated = false, .checked_generation = CURRENT_GENERATION};
     }
 
     bool invalidated = false;
-    g_metadata_invalidation_lock.lock();
+    uint64_t const IRQF = g_metadata_invalidation_lock.lock_irqsave();
 
-    uint64_t const EXACT_HASH = metadata_invalidation_hash_path(path, path_len);
-    invalidated = metadata_invalidation_generation_for_hash_locked(g_metadata_exact_invalidations, EXACT_HASH) > seen_generation;
+    uint64_t const CHECKED_GENERATION = g_metadata_invalidation_generation.load(std::memory_order_acquire);
+    if (seen_generation != CHECKED_GENERATION) {
+        invalidated = metadata_invalidation_generation_for_hash_locked(g_metadata_exact_invalidations, EXACT_HASH) > seen_generation;
 
-    size_t prefix_len = 1;
-    while (!invalidated && prefix_len < path_len) {
-        ++prefix_len;
-        while (prefix_len < path_len && path[prefix_len] != '/') {
-            ++prefix_len;
+        if (g_metadata_subtree_invalidation_generation.load(std::memory_order_acquire) > seen_generation) {
+            invalidated = invalidated || metadata_invalidation_subtree_has_newer_locked(path, path_len, seen_generation);
         }
-        uint64_t const PREFIX_HASH = metadata_invalidation_hash_path(path, prefix_len);
-        invalidated = metadata_invalidation_generation_for_hash_locked(g_metadata_subtree_invalidations, PREFIX_HASH) > seen_generation;
     }
 
-    g_metadata_invalidation_lock.unlock();
-    return invalidated;
+    g_metadata_invalidation_lock.unlock_irqrestore(IRQF);
+    return MetadataInvalidationCheck{.invalidated = invalidated, .checked_generation = CHECKED_GENERATION};
+}
+
+auto metadata_path_subtree_invalidation_check(const char* path, size_t path_len, uint64_t seen_generation) -> MetadataInvalidationCheck {
+    uint64_t const CURRENT_GENERATION = g_metadata_invalidation_generation.load(std::memory_order_acquire);
+    if (path == nullptr || path_len == 0 || path[0] != '/') {
+        return MetadataInvalidationCheck{.invalidated = true, .checked_generation = CURRENT_GENERATION};
+    }
+    if (seen_generation == CURRENT_GENERATION) {
+        return MetadataInvalidationCheck{.invalidated = false, .checked_generation = CURRENT_GENERATION};
+    }
+
+    bool check_subtree = false;
+    uint64_t const SUBTREE_GENERATION = g_metadata_subtree_invalidation_generation.load(std::memory_order_acquire);
+    if (SUBTREE_GENERATION > seen_generation) {
+        check_subtree = metadata_invalidation_subtree_set_may_contain_newer(path, path_len, seen_generation);
+    }
+    if (!check_subtree) {
+        return MetadataInvalidationCheck{.invalidated = false, .checked_generation = CURRENT_GENERATION};
+    }
+
+    bool invalidated = false;
+    uint64_t const IRQF = g_metadata_invalidation_lock.lock_irqsave();
+
+    uint64_t const CHECKED_GENERATION = g_metadata_invalidation_generation.load(std::memory_order_acquire);
+    if (seen_generation != CHECKED_GENERATION &&
+        g_metadata_subtree_invalidation_generation.load(std::memory_order_acquire) > seen_generation) {
+        invalidated = metadata_invalidation_subtree_has_newer_locked(path, path_len, seen_generation);
+    }
+
+    g_metadata_invalidation_lock.unlock_irqrestore(IRQF);
+    return MetadataInvalidationCheck{.invalidated = invalidated, .checked_generation = CHECKED_GENERATION};
 }
 
 auto metadata_cacheable_fs(FSType fs_type) -> bool {
@@ -987,6 +1229,11 @@ auto metadata_cacheable_fs(FSType fs_type) -> bool {
 
 void metadata_cache_note_observation_store() { g_metadata_observation_epoch.fetch_add(1, std::memory_order_acq_rel); }
 
+void metadata_cache_note_metadata_store_observation() {
+    metadata_cache_note_observation_store();
+    g_metadata_store_observation_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
 auto metadata_cache_note_exact_path_changed(const char* path) -> bool {
     size_t const PATH_LEN = metadata_normalized_path_len(path);
     if (PATH_LEN == 0) {
@@ -994,12 +1241,13 @@ auto metadata_cache_note_exact_path_changed(const char* path) -> bool {
     }
 
     g_metadata_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
-    uint64_t const PATH_GENERATION = g_metadata_invalidation_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     uint64_t const PATH_HASH = metadata_invalidation_hash_path(path, PATH_LEN);
 
-    g_metadata_invalidation_lock.lock();
+    uint64_t const IRQF = g_metadata_invalidation_lock.lock_irqsave();
+    uint64_t const PATH_GENERATION = metadata_invalidation_next_generation_locked();
     metadata_invalidation_store_locked(g_metadata_exact_invalidations, PATH_HASH, PATH_GENERATION);
-    g_metadata_invalidation_lock.unlock();
+    metadata_invalidation_publish_generation_locked(PATH_GENERATION);
+    g_metadata_invalidation_lock.unlock_irqrestore(IRQF);
     return true;
 }
 
@@ -1009,7 +1257,7 @@ auto metadata_cache_has_path_variant(const char* path, size_t path_len, FSType f
     uint64_t const HASH = metadata_hash_path(path, path_len, follow_final_symlink, require_directory, fs_type, dev_id);
     auto& set = g_metadata_cache[HASH & (METADATA_CACHE_SET_COUNT - 1)];
 
-    ker::mod::sys::MutexGuard guard(set.lock);
+    uint64_t const IRQF = set.lock.lock_irqsave();
     for (auto& entry : set.ways) {
         if (!entry.valid || entry.epoch != EPOCH || entry.hash != HASH || entry.path_len != path_len || entry.fs_type != fs_type ||
             entry.dev_id != dev_id || entry.follow_final_symlink != follow_final_symlink || entry.require_directory != require_directory) {
@@ -1018,12 +1266,17 @@ auto metadata_cache_has_path_variant(const char* path, size_t path_len, FSType f
         if (std::memcmp(entry.path.data(), path, path_len + 1) != 0) {
             continue;
         }
-        if (metadata_path_invalidated_since(entry.path.data(), entry.path_len, entry.invalidation_generation)) {
+        MetadataInvalidationCheck const INVALIDATION =
+            metadata_path_invalidation_check(entry.path.data(), entry.path_len, entry.invalidation_generation);
+        if (INVALIDATION.invalidated) {
             entry.valid = false;
             continue;
         }
+        entry.invalidation_generation = INVALIDATION.checked_generation;
+        set.lock.unlock_irqrestore(IRQF);
         return true;
     }
+    set.lock.unlock_irqrestore(IRQF);
     return false;
 }
 
@@ -1032,12 +1285,18 @@ auto metadata_cache_has_file_data_observation(File* file) -> bool {
         return true;
     }
 
-    size_t const PATH_LEN = metadata_normalized_path_len(file->vfs_path);
+    size_t const PATH_LEN = file_vfs_path_len(file);
     if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
         return true;
     }
 
-    MountRef mount_ref = find_mount_point(file->vfs_path);
+    uint64_t const CURRENT_MOUNT_GENERATION = mount_table_generation_snapshot();
+    if (file->mount_dev_id != 0 && file->mount_generation == CURRENT_MOUNT_GENERATION && metadata_cacheable_fs(file->fs_type)) {
+        return metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, file->fs_type, file->mount_dev_id, true, false) ||
+               metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, file->fs_type, file->mount_dev_id, false, false);
+    }
+
+    MountRef mount_ref = find_mount_point(file->vfs_path, PATH_LEN);
     MountPoint const* mount = mount_ref.get();
     if (mount == nullptr || !metadata_cacheable_fs(mount->fs_type)) {
         return true;
@@ -1047,23 +1306,45 @@ auto metadata_cache_has_file_data_observation(File* file) -> bool {
            metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, mount->fs_type, mount->dev_id, false, false);
 }
 
-void metadata_cache_note_file_data_changed(File* file) {
+void metadata_cache_mark_file_data_close_refresh_path_current(File* file) {
     if (file == nullptr || file->vfs_path == nullptr || !metadata_cacheable_fs(file->fs_type)) {
         return;
+    }
+    size_t const PATH_LEN = file_vfs_path_len(file);
+    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
+        return;
+    }
+    file->metadata_data_close_refresh_invalidation_generation = g_metadata_invalidation_generation.load(std::memory_order_acquire);
+}
+
+void metadata_cache_schedule_file_data_close_refresh(File* file) {
+    if (file == nullptr || file->vfs_path == nullptr || !metadata_cacheable_fs(file->fs_type) ||
+        file->metadata_data_close_refresh_invalidation_generation == 0) {
+        return;
+    }
+    file->metadata_data_close_refresh_pending = true;
+}
+
+auto metadata_cache_note_file_data_changed(File* file) -> bool {
+    if (file == nullptr || file->vfs_path == nullptr || !metadata_cacheable_fs(file->fs_type)) {
+        return false;
     }
 
     uint64_t const OBSERVED_EPOCH = g_metadata_observation_epoch.load(std::memory_order_acquire);
     if (file->metadata_data_invalidation_observation_epoch == OBSERVED_EPOCH) {
-        return;
+        return false;
     }
     if (!metadata_cache_has_file_data_observation(file)) {
         file->metadata_data_invalidation_observation_epoch = OBSERVED_EPOCH;
-        return;
+        return false;
     }
 
     if (metadata_cache_note_exact_path_changed(file->vfs_path)) {
         file->metadata_data_invalidation_observation_epoch = OBSERVED_EPOCH;
+        metadata_cache_mark_file_data_close_refresh_path_current(file);
+        return true;
     }
+    return false;
 }
 
 void metadata_cache_mark_file_data_observed(File* file) {
@@ -1081,11 +1362,17 @@ void metadata_cache_note_path_data_changed(const char* path, FSType fs_type) {
     static_cast<void>(metadata_cache_note_exact_path_changed(path));
 }
 
-auto metadata_cacheable_result(int result) -> bool { return result == 0 || result == -ENOENT; }
+auto metadata_cacheable_result(int result) -> bool { return result == 0 || result == -ENOENT || result == -ENOTDIR; }
+
+auto existence_cacheable_result(int result) -> bool { return result == 0 || result == -ENOENT || result == -ENOTDIR; }
+
+auto existence_cache_negative_result(int result) -> bool { return result == -ENOENT || result == -ENOTDIR; }
 
 auto symlink_cacheable_fs(FSType fs_type) -> bool { return fs_type == FSType::TMPFS || fs_type == FSType::FAT32 || fs_type == FSType::XFS; }
 
-auto symlink_cacheable_result(ssize_t result) -> bool { return result >= 0 || result == -EINVAL || result == -ENOSYS || result == -ENOENT; }
+auto symlink_cacheable_result(ssize_t result) -> bool {
+    return result >= 0 || result == -EINVAL || result == -ENOSYS || result == -ENOENT || result == -ENOTDIR;
+}
 
 auto file_stat_snapshot_anonymous_cacheable(const File* file) -> bool {
     if (file == nullptr || file->vfs_path != nullptr || (file->open_flags & ker::vfs::O_NO_CACHE) != 0) {
@@ -1139,6 +1426,31 @@ auto file_stat_snapshot_prefetchable(const File* file) -> bool {
     return true;
 }
 
+auto file_stat_snapshot_created_open_prefill_eligible(const File* file) -> bool {
+    return file != nullptr && file->open_create_result_known && file->created_by_open && (file->open_flags & ker::vfs::O_CREAT) != 0 &&
+           (file->open_flags & ker::vfs::O_NO_CACHE) == 0;
+}
+
+auto file_stat_snapshot_open_prefill_safe(const File* file) -> bool {
+    if (file == nullptr) {
+        return false;
+    }
+    if ((file->open_flags & ker::vfs::O_TRUNC) != 0) {
+        return file_stat_snapshot_created_open_prefill_eligible(file);
+    }
+    if ((file->open_flags & ker::vfs::O_CREAT) == 0) {
+        return true;
+    }
+    return file->open_create_result_known;
+}
+
+auto opened_writable_created_file_stat_deferred(const File* file) -> bool {
+    if (file == nullptr || !file->created_by_open) {
+        return false;
+    }
+    return (file->open_flags & O_ACCMODE_MASK) != O_RDONLY_MODE;
+}
+
 auto file_stat_snapshot_mode_cacheable(mode_t mode) -> bool {
     mode_t const TYPE = mode & static_cast<mode_t>(S_IFMT);
     return TYPE == static_cast<mode_t>(S_IFREG) || TYPE == static_cast<mode_t>(S_IFDIR);
@@ -1164,14 +1476,20 @@ auto file_stat_snapshot_result_cacheable(const File* file, mode_t mode) -> bool 
     return TYPE == static_cast<mode_t>(S_IFIFO) || TYPE == static_cast<mode_t>(S_IFSOCK);
 }
 
+auto file_is_synthetic_mount_dir(const File* file) -> bool {
+    return file != nullptr && file->fops == nullptr && file->private_data == nullptr && file->is_directory && file->vfs_path != nullptr;
+}
+
 struct MetadataSnapshotStamp {
     uint64_t cache_generation = 0;
+    uint64_t mount_generation = 0;
     uint64_t invalidation_generation = 0;
 };
 
 auto metadata_snapshot_stamp() -> MetadataSnapshotStamp {
     return MetadataSnapshotStamp{
         .cache_generation = g_metadata_cache_generation.load(std::memory_order_acquire),
+        .mount_generation = mount_table_generation_snapshot(),
         .invalidation_generation = g_metadata_invalidation_generation.load(std::memory_order_acquire),
     };
 }
@@ -1196,18 +1514,43 @@ void file_stat_snapshot_store(File* file, const Stat& statbuf, MetadataSnapshotS
         g_vfs_fstat_snapshot_stores.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    size_t const PATH_LEN = metadata_normalized_path_len(file->vfs_path);
+    size_t const PATH_LEN = file_vfs_path_len(file);
     if (PATH_LEN == 0) {
         file_stat_snapshot_invalidate(file);
         return;
     }
+    uint64_t invalidation_generation = stamp.invalidation_generation;
+    if (stamp.cache_generation == g_metadata_cache_generation.load(std::memory_order_acquire)) {
+        MetadataInvalidationCheck const INVALIDATION =
+            metadata_path_invalidation_check(file->vfs_path, PATH_LEN, stamp.invalidation_generation);
+        if (!INVALIDATION.invalidated) {
+            invalidation_generation = INVALIDATION.checked_generation;
+        }
+    }
     file->stat_cache = statbuf;
     file->stat_cache_generation = stamp.cache_generation;
-    file->stat_cache_invalidation_generation = stamp.invalidation_generation;
+    file->stat_cache_invalidation_generation = invalidation_generation;
     file->stat_cache_path_len = PATH_LEN;
     file->stat_cache_valid = true;
     metadata_cache_note_observation_store();
     g_vfs_fstat_snapshot_stores.fetch_add(1, std::memory_order_relaxed);
+}
+
+auto file_stat_snapshot_path_current(File* file, size_t path_len, uint64_t cache_generation) -> bool {
+    if (file == nullptr || file->vfs_path == nullptr || path_len == 0) {
+        return false;
+    }
+    if (file->stat_cache_generation != cache_generation) {
+        return false;
+    }
+
+    MetadataInvalidationCheck const INVALIDATION =
+        metadata_path_invalidation_check(file->vfs_path, path_len, file->stat_cache_invalidation_generation);
+    if (INVALIDATION.invalidated) {
+        return false;
+    }
+    file->stat_cache_invalidation_generation = INVALIDATION.checked_generation;
+    return true;
 }
 
 auto file_stat_snapshot_current(File* file) -> bool {
@@ -1220,8 +1563,8 @@ auto file_stat_snapshot_current(File* file) -> bool {
     if (file->vfs_path == nullptr) {
         return true;
     }
-    return file->stat_cache_generation == g_metadata_cache_generation.load(std::memory_order_acquire) && file->stat_cache_path_len != 0 &&
-           !metadata_path_invalidated_since(file->vfs_path, file->stat_cache_path_len, file->stat_cache_invalidation_generation);
+    uint64_t const CACHE_GENERATION = g_metadata_cache_generation.load(std::memory_order_acquire);
+    return file_stat_snapshot_path_current(file, file->stat_cache_path_len, CACHE_GENERATION);
 }
 
 auto file_stat_snapshot_promote_prefilled_path(File* file) -> bool {
@@ -1230,13 +1573,13 @@ auto file_stat_snapshot_promote_prefilled_path(File* file) -> bool {
         return false;
     }
 
-    size_t const PATH_LEN = metadata_normalized_path_len(file->vfs_path);
+    size_t const PATH_LEN = file_vfs_path_len(file);
     if (PATH_LEN == 0) {
         file_stat_snapshot_invalidate(file);
         return false;
     }
-    if (file->stat_cache_generation != g_metadata_cache_generation.load(std::memory_order_acquire) ||
-        metadata_path_invalidated_since(file->vfs_path, PATH_LEN, file->stat_cache_invalidation_generation)) {
+    uint64_t const CACHE_GENERATION = g_metadata_cache_generation.load(std::memory_order_acquire);
+    if (!file_stat_snapshot_path_current(file, PATH_LEN, CACHE_GENERATION)) {
         file_stat_snapshot_invalidate(file);
         return false;
     }
@@ -1246,6 +1589,34 @@ auto file_stat_snapshot_promote_prefilled_path(File* file) -> bool {
     }
 
     file->stat_cache_path_len = PATH_LEN;
+    metadata_cache_note_observation_store();
+    g_vfs_fstat_snapshot_stores.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+auto file_stat_snapshot_promote_created_open_prefill(File* file) -> bool {
+    if (!file_stat_snapshot_created_open_prefill_eligible(file) || file->vfs_path == nullptr || !file->stat_cache_valid ||
+        file->stat_cache_path_len != 0) {
+        return false;
+    }
+
+    Stat const STATBUF = file->stat_cache;
+    file_stat_snapshot_store(file, STATBUF, metadata_snapshot_stamp());
+    return file->stat_cache_valid && file->stat_cache_path_len != 0;
+}
+
+auto file_stat_snapshot_promote_open_prefill_for_path(File* file, size_t path_len, MetadataSnapshotStamp stamp) -> bool {
+    if (file == nullptr || path_len == 0 || !file->stat_cache_valid || file->stat_cache_path_len != 0 ||
+        !file_stat_snapshot_result_cacheable(file, file->stat_cache.st_mode) || file->stat_cache_generation != stamp.cache_generation) {
+        return false;
+    }
+
+    if (!file_stat_snapshot_path_current(file, path_len, stamp.cache_generation)) {
+        file_stat_snapshot_invalidate(file);
+        return false;
+    }
+
+    file->stat_cache_path_len = path_len;
     metadata_cache_note_observation_store();
     g_vfs_fstat_snapshot_stores.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -1273,13 +1644,23 @@ auto file_stat_snapshot_lookup(File* file, Stat* statbuf) -> bool {
         g_vfs_fstat_snapshot_hits.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
-    if (file->stat_cache_generation != g_metadata_cache_generation.load(std::memory_order_acquire)) {
+    uint64_t const CACHE_GENERATION = g_metadata_cache_generation.load(std::memory_order_acquire);
+    if (file->stat_cache_generation != CACHE_GENERATION) {
         g_vfs_fstat_snapshot_miss_generation.fetch_add(1, std::memory_order_relaxed);
         g_vfs_fstat_snapshot_misses.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    if (file->stat_cache_path_len == 0 ||
-        metadata_path_invalidated_since(file->vfs_path, file->stat_cache_path_len, file->stat_cache_invalidation_generation)) {
+    if (file->stat_cache_path_len == 0) {
+        if (file_stat_snapshot_created_open_prefill_eligible(file)) {
+            *statbuf = file->stat_cache;
+            g_vfs_fstat_snapshot_hits.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        g_vfs_fstat_snapshot_miss_invalidated.fetch_add(1, std::memory_order_relaxed);
+        g_vfs_fstat_snapshot_misses.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (!file_stat_snapshot_path_current(file, file->stat_cache_path_len, CACHE_GENERATION)) {
         g_vfs_fstat_snapshot_miss_invalidated.fetch_add(1, std::memory_order_relaxed);
         g_vfs_fstat_snapshot_misses.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -1315,19 +1696,18 @@ void file_stat_snapshot_refresh(File* file) {
     static_cast<void>(file_stat_snapshot_refresh_from_backend(file, &statbuf));
 }
 
-auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bool follow_final_symlink, bool require_directory,
-                           Stat* statbuf, bool record_miss = true) -> int {
+auto metadata_cache_lookup_prehashed(const char* path, size_t path_len, uint64_t raw_path_hash, FSType fs_type, uint64_t dev_id,
+                                     bool follow_final_symlink, bool require_directory, Stat* statbuf, bool record_miss = true) -> int {
     if (path == nullptr || statbuf == nullptr || !metadata_cacheable_fs(fs_type)) {
         return -EAGAIN;
     }
 
-    size_t const PATH_LEN = std::strlen(path);
-    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
+    if (path_len == 0 || path_len >= MAX_PATH_LEN || raw_path_hash == UNKNOWN_PATH_HASH) {
         return -EAGAIN;
     }
 
     uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
-    uint64_t const HASH = metadata_hash_path(path, PATH_LEN, follow_final_symlink, require_directory, fs_type, dev_id);
+    uint64_t const HASH = metadata_hash_path_from_raw(raw_path_hash, follow_final_symlink, require_directory, fs_type, dev_id);
     auto& set = g_metadata_cache[HASH & (METADATA_CACHE_SET_COUNT - 1)];
 
     bool saw_valid = false;
@@ -1336,29 +1716,32 @@ auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bo
     bool cache_hit = false;
     int cache_result = -EAGAIN;
     {
-        ker::mod::sys::MutexGuard guard(set.lock);
+        uint64_t const IRQF = set.lock.lock_irqsave();
         for (auto& entry : set.ways) {
             if (!entry.valid) {
                 continue;
             }
             saw_valid = true;
-            if (entry.hash != HASH || entry.path_len != PATH_LEN || entry.fs_type != fs_type || entry.dev_id != dev_id ||
+            if (entry.hash != HASH || entry.path_len != path_len || entry.fs_type != fs_type || entry.dev_id != dev_id ||
                 entry.follow_final_symlink != follow_final_symlink || entry.require_directory != require_directory) {
                 continue;
             }
-            if (std::memcmp(entry.path.data(), path, PATH_LEN + 1) != 0) {
+            if (std::memcmp(entry.path.data(), path, path_len + 1) != 0) {
                 continue;
             }
             if (entry.epoch != EPOCH) {
                 saw_stale_generation = true;
                 continue;
             }
-            if (metadata_path_invalidated_since(entry.path.data(), entry.path_len, entry.invalidation_generation)) {
+            MetadataInvalidationCheck const INVALIDATION =
+                metadata_path_invalidation_check(entry.path.data(), entry.path_len, entry.invalidation_generation);
+            if (INVALIDATION.invalidated) {
                 entry.valid = false;
                 saw_invalidated = true;
                 continue;
             }
 
+            entry.invalidation_generation = INVALIDATION.checked_generation;
             entry.last_used = ++set.clock;
             cache_result = entry.result;
             if (cache_result == 0) {
@@ -1367,6 +1750,7 @@ auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bo
             cache_hit = true;
             break;
         }
+        set.lock.unlock_irqrestore(IRQF);
     }
     if (cache_hit) {
         g_vfs_metadata_hits.fetch_add(1, std::memory_order_relaxed);
@@ -1387,40 +1771,131 @@ auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bo
     return -EAGAIN;
 }
 
-void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, bool follow_final_symlink, bool require_directory, int result,
-                          const Stat* statbuf, MetadataSnapshotStamp stamp) {
-    if (path == nullptr || !metadata_cacheable_fs(fs_type) || !metadata_cacheable_result(result)) {
-        return;
-    }
-    if (result == 0 && statbuf == nullptr) {
-        return;
+auto metadata_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, bool follow_final_symlink, bool require_directory,
+                           Stat* statbuf, bool record_miss = true, size_t known_path_len = UNKNOWN_PATH_LEN) -> int {
+    if (path == nullptr || statbuf == nullptr || !metadata_cacheable_fs(fs_type)) {
+        return -EAGAIN;
     }
 
-    size_t const PATH_LEN = std::strlen(path);
+    size_t const PATH_LEN = known_path_len != UNKNOWN_PATH_LEN ? known_path_len : std::strlen(path);
     if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
-        return;
+        return -EAGAIN;
     }
 
+    return metadata_cache_lookup_prehashed(path, PATH_LEN, metadata_path_hash_raw(path, PATH_LEN), fs_type, dev_id, follow_final_symlink,
+                                           require_directory, statbuf, record_miss);
+}
+
+auto existence_cache_lookup_prehashed(const char* path, size_t path_len, uint64_t raw_path_hash, MountPoint const* mount,
+                                      bool require_directory, bool require_negative, bool follow_final_symlink = true) -> int {
+    if (path == nullptr || mount == nullptr || !metadata_cacheable_fs(mount->fs_type)) {
+        return -EAGAIN;
+    }
+
+    if (path_len == 0 || path_len >= MAX_PATH_LEN || raw_path_hash == UNKNOWN_PATH_HASH) {
+        return -EAGAIN;
+    }
+
+    uint64_t const MOUNT_GENERATION = mount_table_generation_snapshot();
     uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
-    if (stamp.cache_generation != EPOCH || metadata_path_invalidated_since(path, PATH_LEN, stamp.invalidation_generation)) {
-        return;
+    bool const EFFECTIVE_FOLLOW_FINAL_SYMLINK = existence_effective_follow_final_symlink(follow_final_symlink, require_directory);
+    uint64_t const HASH =
+        existence_hash_from_raw_path(raw_path_hash, EFFECTIVE_FOLLOW_FINAL_SYMLINK, require_directory, mount->fs_type, mount->dev_id);
+    auto& set = g_existence_cache[HASH & (EXISTENCE_CACHE_SET_COUNT - 1)];
+
+    bool cache_hit = false;
+    int cache_result = -EAGAIN;
+    {
+        uint64_t const IRQF = set.lock.lock_irqsave();
+        for (auto& entry : set.ways) {
+            if (!entry.valid || entry.hash != HASH || entry.path_len != path_len || entry.fs_type != mount->fs_type ||
+                entry.dev_id != mount->dev_id || entry.require_directory != require_directory ||
+                entry.follow_final_symlink != EFFECTIVE_FOLLOW_FINAL_SYMLINK || entry.mount_generation != MOUNT_GENERATION ||
+                entry.epoch != EPOCH || (require_negative && !existence_cache_negative_result(entry.result))) {
+                continue;
+            }
+            if (std::memcmp(entry.path.data(), path, path_len + 1) != 0) {
+                continue;
+            }
+            MetadataInvalidationCheck const INVALIDATION =
+                metadata_path_subtree_invalidation_check(entry.path.data(), entry.path_len, entry.invalidation_generation);
+            if (INVALIDATION.invalidated) {
+                entry.valid = false;
+                continue;
+            }
+
+            entry.invalidation_generation = INVALIDATION.checked_generation;
+            entry.last_used = ++set.clock;
+            cache_result = entry.result;
+            cache_hit = true;
+            break;
+        }
+        set.lock.unlock_irqrestore(IRQF);
     }
 
-    uint64_t const HASH = metadata_hash_path(path, PATH_LEN, follow_final_symlink, require_directory, fs_type, dev_id);
-    auto& set = g_metadata_cache[HASH & (METADATA_CACHE_SET_COUNT - 1)];
+    if (!cache_hit || mount_table_generation_snapshot() != MOUNT_GENERATION) {
+        if (!require_negative) {
+            g_vfs_existence_misses.fetch_add(1, std::memory_order_relaxed);
+        }
+        return -EAGAIN;
+    }
+
+    g_vfs_existence_hits.fetch_add(1, std::memory_order_relaxed);
+    return cache_result;
+}
+
+auto existence_cache_lookup_mount(const char* path, MountPoint const* mount, bool require_directory,
+                                  size_t known_path_len = UNKNOWN_PATH_LEN, uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH,
+                                  bool follow_final_symlink = true) -> int {
+    if (path == nullptr || mount == nullptr || !metadata_cacheable_fs(mount->fs_type)) {
+        return -EAGAIN;
+    }
+
+    size_t const PATH_LEN = known_path_len != UNKNOWN_PATH_LEN ? known_path_len : std::strlen(path);
+    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
+        return -EAGAIN;
+    }
+    uint64_t const RAW_HASH = known_raw_path_hash != UNKNOWN_PATH_HASH && known_path_len != UNKNOWN_PATH_LEN
+                                  ? known_raw_path_hash
+                                  : metadata_path_hash_raw(path, PATH_LEN);
+    return existence_cache_lookup_prehashed(path, PATH_LEN, RAW_HASH, mount, require_directory, false, follow_final_symlink);
+}
+
+auto existence_cache_lookup_negative_mount(const char* path, MountPoint const* mount, bool require_directory,
+                                           size_t known_path_len = UNKNOWN_PATH_LEN, uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH,
+                                           bool follow_final_symlink = true) -> int {
+    if (path == nullptr || mount == nullptr || !metadata_cacheable_fs(mount->fs_type)) {
+        return -EAGAIN;
+    }
+
+    size_t const PATH_LEN = known_path_len != UNKNOWN_PATH_LEN ? known_path_len : std::strlen(path);
+    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
+        return -EAGAIN;
+    }
+    uint64_t const RAW_HASH = known_raw_path_hash != UNKNOWN_PATH_HASH && known_path_len != UNKNOWN_PATH_LEN
+                                  ? known_raw_path_hash
+                                  : metadata_path_hash_raw(path, PATH_LEN);
+    return existence_cache_lookup_prehashed(path, PATH_LEN, RAW_HASH, mount, require_directory, true, follow_final_symlink);
+}
+
+void existence_cache_store_prehashed(const char* path, size_t path_len, FSType fs_type, uint64_t dev_id, bool require_directory, int result,
+                                     uint64_t hash, uint64_t epoch, uint64_t mount_generation, uint64_t invalidation_generation,
+                                     bool note_observation = true, bool follow_final_symlink = true) {
+    bool const EFFECTIVE_FOLLOW_FINAL_SYMLINK = existence_effective_follow_final_symlink(follow_final_symlink, require_directory);
+    auto& set = g_existence_cache[hash & (EXISTENCE_CACHE_SET_COUNT - 1)];
 
     {
-        ker::mod::sys::MutexGuard guard(set.lock);
+        uint64_t const IRQF = set.lock.lock_irqsave();
         uint64_t const USE_STAMP = ++set.clock;
-        MetadataCacheEntry* victim = &set.ways.front();
+        ExistenceCacheEntry* victim = &set.ways.front();
         for (auto& entry : set.ways) {
-            if (entry.valid && entry.epoch == EPOCH && entry.hash == HASH && entry.path_len == PATH_LEN && entry.fs_type == fs_type &&
-                entry.dev_id == dev_id && entry.follow_final_symlink == follow_final_symlink &&
-                entry.require_directory == require_directory && std::memcmp(entry.path.data(), path, PATH_LEN + 1) == 0) {
+            if (entry.valid && entry.epoch == epoch && entry.hash == hash && entry.path_len == path_len && entry.fs_type == fs_type &&
+                entry.dev_id == dev_id && entry.follow_final_symlink == EFFECTIVE_FOLLOW_FINAL_SYMLINK &&
+                entry.require_directory == require_directory && std::memcmp(entry.path.data(), path, path_len + 1) == 0) {
                 victim = &entry;
                 break;
             }
-            if (!entry.valid || entry.epoch != EPOCH) {
+            if (!entry.valid || entry.epoch != epoch) {
                 victim = &entry;
                 break;
             }
@@ -1429,63 +1904,962 @@ void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, boo
             }
         }
 
-        std::memcpy(victim->path.data(), path, PATH_LEN + 1);
-        victim->stat = (result == 0) ? *statbuf : Stat{};
-        victim->hash = HASH;
-        victim->epoch = EPOCH;
+        std::memcpy(victim->path.data(), path, path_len + 1);
+        victim->hash = hash;
+        victim->epoch = epoch;
         victim->last_used = USE_STAMP;
         victim->dev_id = dev_id;
-        victim->invalidation_generation = stamp.invalidation_generation;
-        victim->path_len = PATH_LEN;
+        victim->mount_generation = mount_generation;
+        victim->invalidation_generation = invalidation_generation;
+        victim->path_len = path_len;
+        victim->result = result;
+        victim->fs_type = fs_type;
+        victim->follow_final_symlink = EFFECTIVE_FOLLOW_FINAL_SYMLINK;
+        victim->require_directory = require_directory;
+        victim->valid = true;
+        set.lock.unlock_irqrestore(IRQF);
+    }
+    if (note_observation) {
+        metadata_cache_note_observation_store();
+    }
+    g_vfs_existence_stores.fetch_add(1, std::memory_order_relaxed);
+}
+
+void existence_cache_store_prechecked(const char* path, size_t path_len, FSType fs_type, uint64_t dev_id, bool require_directory,
+                                      int result, uint64_t epoch, uint64_t mount_generation, uint64_t invalidation_generation,
+                                      bool note_observation = true, bool follow_final_symlink = true) {
+    uint64_t const HASH = existence_hash_path(path, path_len, follow_final_symlink, require_directory, fs_type, dev_id);
+    existence_cache_store_prehashed(path, path_len, fs_type, dev_id, require_directory, result, HASH, epoch, mount_generation,
+                                    invalidation_generation, note_observation, follow_final_symlink);
+}
+
+void existence_cache_store(const char* path, MountPoint const* mount, bool require_directory, int result, MetadataSnapshotStamp stamp,
+                           size_t known_path_len = UNKNOWN_PATH_LEN, uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH,
+                           bool follow_final_symlink = true) {
+    if (path == nullptr || mount == nullptr || !metadata_cacheable_fs(mount->fs_type) || !existence_cacheable_result(result)) {
+        return;
+    }
+
+    size_t const PATH_LEN = known_path_len != UNKNOWN_PATH_LEN ? known_path_len : std::strlen(path);
+    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
+        return;
+    }
+
+    uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
+    if (stamp.cache_generation != EPOCH || stamp.mount_generation != mount_table_generation_snapshot()) {
+        return;
+    }
+    MetadataInvalidationCheck const INVALIDATION = metadata_path_subtree_invalidation_check(path, PATH_LEN, stamp.invalidation_generation);
+    if (INVALIDATION.invalidated) {
+        return;
+    }
+
+    uint64_t const RAW_HASH = known_raw_path_hash != UNKNOWN_PATH_HASH && known_path_len != UNKNOWN_PATH_LEN && PATH_LEN == known_path_len
+                                  ? known_raw_path_hash
+                                  : metadata_path_hash_raw(path, PATH_LEN);
+    bool const EFFECTIVE_FOLLOW_FINAL_SYMLINK = existence_effective_follow_final_symlink(follow_final_symlink, require_directory);
+    bool const STORE_DEFAULT_EXISTENCE_VARIANT = result == 0 && require_directory;
+    if (STORE_DEFAULT_EXISTENCE_VARIANT) {
+        metadata_cache_note_observation_store();
+    }
+    existence_cache_store_prehashed(
+        path, PATH_LEN, mount->fs_type, mount->dev_id, require_directory, result,
+        existence_hash_from_raw_path(RAW_HASH, EFFECTIVE_FOLLOW_FINAL_SYMLINK, require_directory, mount->fs_type, mount->dev_id), EPOCH,
+        stamp.mount_generation, INVALIDATION.checked_generation, !STORE_DEFAULT_EXISTENCE_VARIANT, EFFECTIVE_FOLLOW_FINAL_SYMLINK);
+    if (STORE_DEFAULT_EXISTENCE_VARIANT) {
+        existence_cache_store_prehashed(
+            path, PATH_LEN, mount->fs_type, mount->dev_id, false, result,
+            existence_hash_from_raw_path(RAW_HASH, EFFECTIVE_FOLLOW_FINAL_SYMLINK, false, mount->fs_type, mount->dev_id), EPOCH,
+            stamp.mount_generation, INVALIDATION.checked_generation, false, EFFECTIVE_FOLLOW_FINAL_SYMLINK);
+    }
+}
+
+void metadata_cache_store_prehashed(const char* path, size_t path_len, FSType fs_type, uint64_t dev_id, bool follow_final_symlink,
+                                    bool require_directory, int result, const Stat* statbuf, uint64_t hash, uint64_t epoch,
+                                    uint64_t mount_generation, uint64_t invalidation_generation, bool note_observation = true) {
+    auto& set = g_metadata_cache[hash & (METADATA_CACHE_SET_COUNT - 1)];
+
+    {
+        uint64_t const IRQF = set.lock.lock_irqsave();
+        uint64_t const USE_STAMP = ++set.clock;
+        MetadataCacheEntry* victim = &set.ways.front();
+        for (auto& entry : set.ways) {
+            if (entry.valid && entry.epoch == epoch && entry.hash == hash && entry.path_len == path_len && entry.fs_type == fs_type &&
+                entry.dev_id == dev_id && entry.follow_final_symlink == follow_final_symlink &&
+                entry.require_directory == require_directory && std::memcmp(entry.path.data(), path, path_len + 1) == 0) {
+                victim = &entry;
+                break;
+            }
+            if (!entry.valid || entry.epoch != epoch) {
+                victim = &entry;
+                break;
+            }
+            if (entry.last_used < victim->last_used) {
+                victim = &entry;
+            }
+        }
+
+        std::memcpy(victim->path.data(), path, path_len + 1);
+        victim->stat = (result == 0) ? *statbuf : Stat{};
+        victim->hash = hash;
+        victim->epoch = epoch;
+        victim->last_used = USE_STAMP;
+        victim->dev_id = dev_id;
+        victim->mount_generation = mount_generation;
+        victim->invalidation_generation = invalidation_generation;
+        victim->path_len = path_len;
         victim->result = result;
         victim->fs_type = fs_type;
         victim->follow_final_symlink = follow_final_symlink;
         victim->require_directory = require_directory;
         victim->valid = true;
+        set.lock.unlock_irqrestore(IRQF);
     }
-    metadata_cache_note_observation_store();
+    if (note_observation) {
+        metadata_cache_note_metadata_store_observation();
+    }
     g_vfs_metadata_stores.fetch_add(1, std::memory_order_relaxed);
 }
 
-auto metadata_cache_proves_final_not_symlink(const char* path, FSType fs_type, uint64_t dev_id) -> bool {
-    Stat cached{};
-    int const CACHED_RESULT = metadata_cache_lookup(path, fs_type, dev_id, false, false, &cached, false);
-    if (CACHED_RESULT == -ENOENT) {
-        return true;
-    }
-    if (CACHED_RESULT != 0) {
-        return false;
-    }
-    return (cached.st_mode & static_cast<mode_t>(S_IFMT)) != static_cast<mode_t>(S_IFLNK);
-}
-
-auto symlink_hash_path(const char* path, size_t len, FSType fs_type, uint64_t dev_id) -> uint64_t {
-    uint64_t hash = 1469598103934665603ULL;
-    for (size_t i = 0; i < len; ++i) {
-        hash ^= static_cast<unsigned char>(path[i]);
-        hash *= 1099511628211ULL;
-    }
-    return metadata_hash_mix(hash ^ (static_cast<uint64_t>(fs_type) << 56U) ^ dev_id);
-}
-
-auto symlink_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, char* buf, size_t bufsize, ssize_t* out_result) -> bool {
-    if (path == nullptr || buf == nullptr || bufsize == 0 || out_result == nullptr || !symlink_cacheable_fs(fs_type)) {
+auto metadata_cache_prepare_path_observation(const char* path, FSType fs_type, MetadataSnapshotStamp stamp, size_t* path_len_out,
+                                             uint64_t* epoch_out, uint64_t* invalidation_generation_out,
+                                             size_t known_path_len = UNKNOWN_PATH_LEN) -> bool {
+    if (path == nullptr || !metadata_cacheable_fs(fs_type)) {
         return false;
     }
 
-    size_t const PATH_LEN = std::strlen(path);
+    size_t const PATH_LEN = known_path_len != UNKNOWN_PATH_LEN ? known_path_len : std::strlen(path);
     if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
         return false;
     }
 
     uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
-    uint64_t const HASH = symlink_hash_path(path, PATH_LEN, fs_type, dev_id);
+    if (stamp.cache_generation != EPOCH) {
+        return false;
+    }
+    MetadataInvalidationCheck const INVALIDATION = metadata_path_invalidation_check(path, PATH_LEN, stamp.invalidation_generation);
+    if (INVALIDATION.invalidated) {
+        return false;
+    }
+
+    if (path_len_out != nullptr) {
+        *path_len_out = PATH_LEN;
+    }
+    if (epoch_out != nullptr) {
+        *epoch_out = EPOCH;
+    }
+    if (invalidation_generation_out != nullptr) {
+        *invalidation_generation_out = INVALIDATION.checked_generation;
+    }
+    return true;
+}
+
+auto metadata_cache_prepare_store(const char* path, FSType fs_type, int result, const Stat* statbuf, MetadataSnapshotStamp stamp,
+                                  size_t* path_len_out, uint64_t* epoch_out, uint64_t* invalidation_generation_out,
+                                  size_t known_path_len = UNKNOWN_PATH_LEN) -> bool {
+    if (!metadata_cacheable_result(result)) {
+        return false;
+    }
+    if (result == 0 && statbuf == nullptr) {
+        return false;
+    }
+
+    return metadata_cache_prepare_path_observation(path, fs_type, stamp, path_len_out, epoch_out, invalidation_generation_out,
+                                                   known_path_len);
+}
+
+void metadata_cache_store(const char* path, FSType fs_type, uint64_t dev_id, bool follow_final_symlink, bool require_directory, int result,
+                          const Stat* statbuf, MetadataSnapshotStamp stamp, size_t known_path_len = UNKNOWN_PATH_LEN,
+                          uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH) {
+    size_t path_len = 0;
+    uint64_t epoch = 0;
+    uint64_t invalidation_generation = 0;
+    if (!metadata_cache_prepare_store(path, fs_type, result, statbuf, stamp, &path_len, &epoch, &invalidation_generation, known_path_len)) {
+        return;
+    }
+
+    uint64_t const RAW_HASH = known_raw_path_hash != UNKNOWN_PATH_HASH && known_path_len != UNKNOWN_PATH_LEN && path_len == known_path_len
+                                  ? known_raw_path_hash
+                                  : metadata_path_hash_raw(path, path_len);
+    metadata_cache_store_prehashed(path, path_len, fs_type, dev_id, follow_final_symlink, require_directory, result, statbuf,
+                                   metadata_hash_path_from_raw(RAW_HASH, follow_final_symlink, require_directory, fs_type, dev_id), epoch,
+                                   stamp.mount_generation, invalidation_generation);
+    if (result == -ENOTDIR && !require_directory) {
+        symlink_cache_store_prehashed(path, path_len, fs_type, dev_id, -ENOTDIR, nullptr, 0,
+                                      symlink_hash_from_raw(RAW_HASH, fs_type, dev_id), epoch, invalidation_generation);
+    }
+}
+
+auto metadata_cache_proves_final_not_symlink(const char* path, FSType fs_type, uint64_t dev_id, size_t known_path_len = UNKNOWN_PATH_LEN,
+                                             size_t* path_len_out = nullptr, uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH) -> bool {
+    if (path == nullptr || !metadata_cacheable_fs(fs_type)) {
+        return false;
+    }
+
+    size_t path_len = known_path_len;
+    if (path_len == UNKNOWN_PATH_LEN) {
+        path_len = std::strlen(path);
+    }
+    if (path_len_out != nullptr) {
+        *path_len_out = path_len;
+    }
+    if (path_len == 0 || path_len >= MAX_PATH_LEN) {
+        return false;
+    }
+
+    uint64_t const RAW_HASH = known_raw_path_hash != UNKNOWN_PATH_HASH && known_path_len != UNKNOWN_PATH_LEN
+                                  ? known_raw_path_hash
+                                  : metadata_path_hash_raw(path, path_len);
+
+    std::array<char, 1> target_scratch{};
+    ssize_t cached_readlink_result = 0;
+    if (symlink_cache_lookup(path, fs_type, dev_id, target_scratch.data(), target_scratch.size(), &cached_readlink_result, path_len,
+                             nullptr, RAW_HASH) &&
+        (cached_readlink_result == -EINVAL || cached_readlink_result == -ENOENT)) {
+        return true;
+    }
+
+    Stat cached{};
+    int const CACHED_RESULT = metadata_cache_lookup_prehashed(path, path_len, RAW_HASH, fs_type, dev_id, false, false, &cached, false);
+    if (CACHED_RESULT == -ENOENT) {
+        return true;
+    }
+    if (CACHED_RESULT == 0) {
+        return (cached.st_mode & static_cast<mode_t>(S_IFMT)) != static_cast<mode_t>(S_IFLNK);
+    }
+    return false;
+}
+
+auto metadata_cache_readlink_negative_result(const char* path, FSType fs_type, uint64_t dev_id, size_t known_path_len = UNKNOWN_PATH_LEN,
+                                             uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH) -> ssize_t {
+    if (path == nullptr || !metadata_cacheable_fs(fs_type)) {
+        return -EAGAIN;
+    }
+
+    size_t const PATH_LEN = known_path_len != UNKNOWN_PATH_LEN ? known_path_len : std::strlen(path);
+    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
+        return -EAGAIN;
+    }
+    uint64_t const RAW_HASH = known_raw_path_hash != UNKNOWN_PATH_HASH && known_path_len != UNKNOWN_PATH_LEN
+                                  ? known_raw_path_hash
+                                  : metadata_path_hash_raw(path, PATH_LEN);
+    Stat cached{};
+    int const CACHED_RESULT = metadata_cache_lookup_prehashed(path, PATH_LEN, RAW_HASH, fs_type, dev_id, false, false, &cached, false);
+    if (CACHED_RESULT == -ENOENT) {
+        return -ENOENT;
+    }
+    if (CACHED_RESULT == -ENOTDIR) {
+        return -ENOTDIR;
+    }
+    if (CACHED_RESULT != 0) {
+        return -EAGAIN;
+    }
+    if ((cached.st_mode & static_cast<mode_t>(S_IFMT)) != static_cast<mode_t>(S_IFLNK)) {
+        return -EINVAL;
+    }
+    return -EAGAIN;
+}
+
+void metadata_cache_store_require_directory_enotdir_prehashed(const char* path, size_t path_len, FSType fs_type, uint64_t dev_id,
+                                                              uint64_t metadata_hash, uint64_t existence_hash, uint64_t epoch,
+                                                              uint64_t mount_generation, uint64_t invalidation_generation,
+                                                              bool note_observation = true) {
+    if (note_observation) {
+        metadata_cache_note_metadata_store_observation();
+    }
+    metadata_cache_store_prehashed(path, path_len, fs_type, dev_id, true, true, -ENOTDIR, nullptr, metadata_hash, epoch, mount_generation,
+                                   invalidation_generation, false);
+    existence_cache_store_prehashed(path, path_len, fs_type, dev_id, true, -ENOTDIR, existence_hash, epoch, mount_generation,
+                                    invalidation_generation, false);
+}
+
+void metadata_cache_store_require_directory_enotdir_prechecked(const char* path, size_t path_len, FSType fs_type, uint64_t dev_id,
+                                                               uint64_t epoch, uint64_t mount_generation, uint64_t invalidation_generation,
+                                                               bool note_observation = true) {
+    uint64_t const METADATA_HASH = metadata_hash_path(path, path_len, true, true, fs_type, dev_id);
+    uint64_t const EXISTENCE_HASH = existence_hash_from_metadata_hash(METADATA_HASH);
+    metadata_cache_store_require_directory_enotdir_prehashed(path, path_len, fs_type, dev_id, METADATA_HASH, EXISTENCE_HASH, epoch,
+                                                             mount_generation, invalidation_generation, note_observation);
+}
+
+void metadata_cache_store_non_symlink_stat_variants(const char* path, FSType fs_type, uint64_t dev_id, const Stat& statbuf,
+                                                    MetadataSnapshotStamp stamp, size_t known_path_len = UNKNOWN_PATH_LEN,
+                                                    MountPoint const* mount = nullptr, uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH) {
+    size_t path_len = 0;
+    uint64_t epoch = 0;
+    uint64_t invalidation_generation = 0;
+    if (!metadata_cache_prepare_store(path, fs_type, 0, &statbuf, stamp, &path_len, &epoch, &invalidation_generation, known_path_len)) {
+        return;
+    }
+
+    metadata_cache_note_metadata_store_observation();
+    uint64_t const PATH_HASH = known_raw_path_hash != UNKNOWN_PATH_HASH && known_path_len != UNKNOWN_PATH_LEN && path_len == known_path_len
+                                   ? known_raw_path_hash
+                                   : metadata_path_hash_raw(path, path_len);
+    uint64_t const LSTAT_HASH = metadata_hash_path_from_raw(PATH_HASH, false, false, fs_type, dev_id);
+    uint64_t const STAT_HASH = metadata_hash_path_from_raw(PATH_HASH, true, false, fs_type, dev_id);
+    uint64_t const REQUIRE_DIRECTORY_HASH = metadata_hash_path_from_raw(PATH_HASH, true, true, fs_type, dev_id);
+    uint64_t const LSTAT_EXISTENCE_HASH = existence_hash_from_metadata_hash(LSTAT_HASH);
+    uint64_t const STAT_EXISTENCE_HASH = existence_hash_from_metadata_hash(STAT_HASH);
+    uint64_t const REQUIRE_DIRECTORY_EXISTENCE_HASH = existence_hash_from_metadata_hash(REQUIRE_DIRECTORY_HASH);
+    uint64_t const SYMLINK_HASH = symlink_hash_from_raw(PATH_HASH, fs_type, dev_id);
+
+    metadata_cache_store_prehashed(path, path_len, fs_type, dev_id, false, false, 0, &statbuf, LSTAT_HASH, epoch, stamp.mount_generation,
+                                   invalidation_generation, false);
+    metadata_cache_store_prehashed(path, path_len, fs_type, dev_id, true, false, 0, &statbuf, STAT_HASH, epoch, stamp.mount_generation,
+                                   invalidation_generation, false);
+    if ((statbuf.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFDIR)) {
+        metadata_cache_store_prehashed(path, path_len, fs_type, dev_id, true, true, 0, &statbuf, REQUIRE_DIRECTORY_HASH, epoch,
+                                       stamp.mount_generation, invalidation_generation, false);
+        existence_cache_store_prehashed(path, path_len, fs_type, dev_id, true, 0, REQUIRE_DIRECTORY_EXISTENCE_HASH, epoch,
+                                        stamp.mount_generation, invalidation_generation, false);
+        if (mount != nullptr && mount->fs_type == fs_type && mount->dev_id == dev_id) {
+            symlink_prefix_cache_store_prechecked(path, path_len, mount, epoch, stamp.mount_generation, invalidation_generation);
+        }
+    } else {
+        metadata_cache_store_require_directory_enotdir_prehashed(path, path_len, fs_type, dev_id, REQUIRE_DIRECTORY_HASH,
+                                                                 REQUIRE_DIRECTORY_EXISTENCE_HASH, epoch, stamp.mount_generation,
+                                                                 invalidation_generation, false);
+    }
+    existence_cache_store_prehashed(path, path_len, fs_type, dev_id, false, 0, LSTAT_EXISTENCE_HASH, epoch, stamp.mount_generation,
+                                    invalidation_generation, false, false);
+    existence_cache_store_prehashed(path, path_len, fs_type, dev_id, false, 0, STAT_EXISTENCE_HASH, epoch, stamp.mount_generation,
+                                    invalidation_generation, false);
+    symlink_cache_store_prehashed(path, path_len, fs_type, dev_id, -EINVAL, nullptr, 0, SYMLINK_HASH, epoch, invalidation_generation);
+}
+
+void metadata_cache_store_known_stat_variants(const char* path, FSType fs_type, uint64_t dev_id, const Stat& statbuf,
+                                              MetadataSnapshotStamp stamp, size_t known_path_len = UNKNOWN_PATH_LEN,
+                                              MountPoint const* mount = nullptr, uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH) {
+    if ((statbuf.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFLNK)) {
+        metadata_cache_store(path, fs_type, dev_id, false, false, 0, &statbuf, stamp, known_path_len, known_raw_path_hash);
+        return;
+    }
+    metadata_cache_store_non_symlink_stat_variants(path, fs_type, dev_id, statbuf, stamp, known_path_len, mount, known_raw_path_hash);
+}
+
+[[maybe_unused]] void metadata_cache_store_missing_stat_variants(const char* path, FSType fs_type, uint64_t dev_id,
+                                                                 MetadataSnapshotStamp stamp, size_t known_path_len = UNKNOWN_PATH_LEN);
+
+void metadata_cache_store_missing_stat_variants_prehashed(const char* path, size_t path_len, FSType fs_type, uint64_t dev_id,
+                                                          uint64_t path_hash, uint64_t epoch, uint64_t mount_generation,
+                                                          uint64_t invalidation_generation, bool note_observation = true) {
+    if (note_observation) {
+        metadata_cache_note_metadata_store_observation();
+    }
+    metadata_cache_store_prehashed(path, path_len, fs_type, dev_id, false, false, -ENOENT, nullptr,
+                                   metadata_hash_path_from_raw(path_hash, false, false, fs_type, dev_id), epoch, mount_generation,
+                                   invalidation_generation, false);
+    metadata_cache_store_prehashed(path, path_len, fs_type, dev_id, true, false, -ENOENT, nullptr,
+                                   metadata_hash_path_from_raw(path_hash, true, false, fs_type, dev_id), epoch, mount_generation,
+                                   invalidation_generation, false);
+    metadata_cache_store_prehashed(path, path_len, fs_type, dev_id, true, true, -ENOENT, nullptr,
+                                   metadata_hash_path_from_raw(path_hash, true, true, fs_type, dev_id), epoch, mount_generation,
+                                   invalidation_generation, false);
+    symlink_cache_store_prehashed(path, path_len, fs_type, dev_id, -ENOENT, nullptr, 0, symlink_hash_from_raw(path_hash, fs_type, dev_id),
+                                  epoch, invalidation_generation);
+}
+
+void metadata_cache_store_missing_stat_variants_prechecked(const char* path, size_t path_len, FSType fs_type, uint64_t dev_id,
+                                                           uint64_t epoch, uint64_t mount_generation, uint64_t invalidation_generation,
+                                                           bool note_observation = true) {
+    metadata_cache_store_missing_stat_variants_prehashed(path, path_len, fs_type, dev_id, metadata_path_hash_raw(path, path_len), epoch,
+                                                         mount_generation, invalidation_generation, note_observation);
+}
+
+void metadata_cache_store_missing_observation(const char* path, MountPoint const* mount, MetadataSnapshotStamp stamp,
+                                              size_t known_path_len = UNKNOWN_PATH_LEN, uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH) {
+    if (path == nullptr || mount == nullptr || !metadata_cacheable_fs(mount->fs_type)) {
+        return;
+    }
+
+    size_t path_len = 0;
+    uint64_t epoch = 0;
+    uint64_t invalidation_generation = 0;
+    if (!metadata_cache_prepare_store(path, mount->fs_type, -ENOENT, nullptr, stamp, &path_len, &epoch, &invalidation_generation,
+                                      known_path_len)) {
+        return;
+    }
+
+    metadata_cache_note_metadata_store_observation();
+    uint64_t const PATH_HASH = known_raw_path_hash != UNKNOWN_PATH_HASH && known_path_len != UNKNOWN_PATH_LEN && path_len == known_path_len
+                                   ? known_raw_path_hash
+                                   : metadata_path_hash_raw(path, path_len);
+    uint64_t const LSTAT_HASH = metadata_hash_path_from_raw(PATH_HASH, false, false, mount->fs_type, mount->dev_id);
+    uint64_t const STAT_HASH = metadata_hash_path_from_raw(PATH_HASH, true, false, mount->fs_type, mount->dev_id);
+    uint64_t const REQUIRE_DIRECTORY_HASH = metadata_hash_path_from_raw(PATH_HASH, true, true, mount->fs_type, mount->dev_id);
+    metadata_cache_store_missing_stat_variants_prehashed(path, path_len, mount->fs_type, mount->dev_id, PATH_HASH, epoch,
+                                                         stamp.mount_generation, invalidation_generation, false);
+    if (stamp.mount_generation != mount_table_generation_snapshot()) {
+        return;
+    }
+    existence_cache_store_prehashed(path, path_len, mount->fs_type, mount->dev_id, false, -ENOENT,
+                                    existence_hash_from_metadata_hash(LSTAT_HASH), epoch, stamp.mount_generation, invalidation_generation,
+                                    false, false);
+    existence_cache_store_prehashed(path, path_len, mount->fs_type, mount->dev_id, false, -ENOENT,
+                                    existence_hash_from_metadata_hash(STAT_HASH), epoch, stamp.mount_generation, invalidation_generation,
+                                    false);
+    existence_cache_store_prehashed(path, path_len, mount->fs_type, mount->dev_id, true, -ENOENT,
+                                    existence_hash_from_metadata_hash(REQUIRE_DIRECTORY_HASH), epoch, stamp.mount_generation,
+                                    invalidation_generation, false);
+}
+
+void metadata_cache_store_readlink_negative_observation(const char* path, MountPoint const* mount, ssize_t result,
+                                                        MetadataSnapshotStamp stamp, size_t known_path_len = UNKNOWN_PATH_LEN,
+                                                        uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH) {
+    if (path == nullptr || mount == nullptr || !metadata_cacheable_fs(mount->fs_type)) {
+        return;
+    }
+
+    if (result == -EINVAL) {
+        existence_cache_store(path, mount, false, 0, stamp, known_path_len, known_raw_path_hash);
+        existence_cache_store(path, mount, false, 0, stamp, known_path_len, known_raw_path_hash, false);
+        return;
+    }
+    if (result == -ENOENT) {
+        metadata_cache_store_missing_observation(path, mount, stamp, known_path_len, known_raw_path_hash);
+        return;
+    }
+    if (result == -ENOTDIR) {
+        metadata_cache_store(path, mount->fs_type, mount->dev_id, true, false, -ENOTDIR, nullptr, stamp, known_path_len,
+                             known_raw_path_hash);
+        existence_cache_store(path, mount, false, -ENOTDIR, stamp, known_path_len, known_raw_path_hash);
+    }
+}
+
+void metadata_cache_refresh_file_data_on_close(File* file) {
+    if (file == nullptr || !file->metadata_data_close_refresh_pending) {
+        return;
+    }
+    file->metadata_data_close_refresh_pending = false;
+
+    if (file->vfs_path == nullptr || !metadata_cacheable_fs(file->fs_type)) {
+        return;
+    }
+    size_t const PATH_LEN = file_vfs_path_len(file);
+    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN || file->metadata_data_close_refresh_invalidation_generation == 0) {
+        return;
+    }
+
+    MetadataInvalidationCheck const PATH_CURRENT =
+        metadata_path_invalidation_check(file->vfs_path, PATH_LEN, file->metadata_data_close_refresh_invalidation_generation);
+    if (PATH_CURRENT.invalidated) {
+        return;
+    }
+
+    MountRef mount_ref = find_mount_point(file->vfs_path, PATH_LEN);
+    MountPoint const* mount = mount_ref.get();
+    if (mount == nullptr || mount->fs_type != file->fs_type || !metadata_cacheable_fs(mount->fs_type)) {
+        return;
+    }
+    if (metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, mount->fs_type, mount->dev_id, true, false) ||
+        metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, mount->fs_type, mount->dev_id, false, false)) {
+        return;
+    }
+
+    MetadataSnapshotStamp const STAMP = metadata_snapshot_stamp();
+    Stat statbuf{};
+    if (vfs_stream_cache_get_file_stat(file, &statbuf) != 0) {
+        return;
+    }
+    metadata_cache_store_non_symlink_stat_variants(file->vfs_path, mount->fs_type, mount->dev_id, statbuf, STAMP, PATH_LEN, mount);
+}
+
+[[maybe_unused]] void metadata_cache_store_missing_stat_variants(const char* path, FSType fs_type, uint64_t dev_id,
+                                                                 MetadataSnapshotStamp stamp, size_t known_path_len) {
+    size_t path_len = 0;
+    uint64_t epoch = 0;
+    uint64_t invalidation_generation = 0;
+    if (!metadata_cache_prepare_store(path, fs_type, -ENOENT, nullptr, stamp, &path_len, &epoch, &invalidation_generation,
+                                      known_path_len)) {
+        return;
+    }
+
+    metadata_cache_store_missing_stat_variants_prechecked(path, path_len, fs_type, dev_id, epoch, stamp.mount_generation,
+                                                          invalidation_generation);
+}
+
+void metadata_cache_store_missing_path_on_current_mount(const char* path, MountPoint const* mount, size_t known_path_len = UNKNOWN_PATH_LEN,
+                                                        uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH) {
+    if (path == nullptr || mount == nullptr || !metadata_cacheable_fs(mount->fs_type)) {
+        return;
+    }
+    metadata_cache_store_missing_observation(path, mount, metadata_snapshot_stamp(), known_path_len, known_raw_path_hash);
+}
+
+void metadata_cache_store_known_path_stat_on_current_mount(const char* path, MountPoint const* mount, const Stat& statbuf,
+                                                           size_t known_path_len = UNKNOWN_PATH_LEN,
+                                                           uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH) {
+    if (path == nullptr || mount == nullptr || !metadata_cacheable_fs(mount->fs_type)) {
+        return;
+    }
+    metadata_cache_store_known_stat_variants(path, mount->fs_type, mount->dev_id, statbuf, metadata_snapshot_stamp(), known_path_len, mount,
+                                             known_raw_path_hash);
+}
+
+void metadata_cache_store_created_symlink_hints(const char* path, MountPoint const* mount, const Stat& statbuf, const char* target,
+                                                size_t known_path_len = UNKNOWN_PATH_LEN) {
+    if (path == nullptr || mount == nullptr || target == nullptr || !metadata_cacheable_fs(mount->fs_type)) {
+        return;
+    }
+
+    metadata_cache_store_known_path_stat_on_current_mount(path, mount, statbuf, known_path_len);
+
+    size_t const TARGET_LEN = std::strlen(target);
+    if (TARGET_LEN < MAX_PATH_LEN) {
+        symlink_cache_store(path, mount->fs_type, mount->dev_id, static_cast<ssize_t>(TARGET_LEN), target, known_path_len);
+    }
+}
+
+void metadata_cache_store_known_file_stat_after_metadata_change(File* file, const Stat& statbuf) {
+    if (file == nullptr) {
+        return;
+    }
+
+    MetadataSnapshotStamp const STAMP = metadata_snapshot_stamp();
+    file_stat_snapshot_store(file, statbuf, STAMP);
+
+    if (file->vfs_path == nullptr || !metadata_cacheable_fs(file->fs_type)) {
+        return;
+    }
+    size_t const PATH_LEN = file_vfs_path_len(file);
+    if (PATH_LEN == 0) {
+        return;
+    }
+
+    if ((statbuf.st_mode & static_cast<mode_t>(S_IFMT)) != static_cast<mode_t>(S_IFDIR) && file->mount_dev_id != 0 &&
+        file->mount_generation == STAMP.mount_generation) {
+        metadata_cache_store_known_stat_variants(file->vfs_path, file->fs_type, file->mount_dev_id, statbuf, STAMP, PATH_LEN);
+        return;
+    }
+
+    MountRef mount_ref = find_mount_point(file->vfs_path, PATH_LEN);
+    MountPoint const* mount = mount_ref.get();
+    if (mount == nullptr || mount->fs_type != file->fs_type || !metadata_cacheable_fs(mount->fs_type)) {
+        return;
+    }
+    metadata_cache_store_known_stat_variants(file->vfs_path, mount->fs_type, mount->dev_id, statbuf, STAMP, PATH_LEN, mount);
+}
+
+void metadata_cache_store_fresh_file_stat(File* file, const Stat& statbuf, MetadataSnapshotStamp stamp) {
+    file_stat_snapshot_store(file, statbuf, stamp);
+
+    if (file == nullptr || file->vfs_path == nullptr || file_is_synthetic_mount_dir(file) || !metadata_cacheable_fs(file->fs_type) ||
+        !file_stat_snapshot_cacheable(file) || !file_stat_snapshot_result_cacheable(file, statbuf.st_mode) ||
+        cache_notify_file_dirty_impl(file)) {
+        return;
+    }
+    size_t const PATH_LEN = file_vfs_path_len(file);
+    if (PATH_LEN == 0) {
+        return;
+    }
+
+    if ((statbuf.st_mode & static_cast<mode_t>(S_IFMT)) != static_cast<mode_t>(S_IFDIR) && file->mount_dev_id != 0 &&
+        file->mount_generation == stamp.mount_generation) {
+        metadata_cache_store_known_stat_variants(file->vfs_path, file->fs_type, file->mount_dev_id, statbuf, stamp, PATH_LEN);
+        return;
+    }
+
+    MountRef mount_ref = find_mount_point(file->vfs_path, PATH_LEN);
+    MountPoint const* mount = mount_ref.get();
+    if (mount == nullptr || mount->fs_type != file->fs_type || !metadata_cacheable_fs(mount->fs_type)) {
+        return;
+    }
+
+    metadata_cache_store_known_stat_variants(file->vfs_path, mount->fs_type, mount->dev_id, statbuf, stamp, PATH_LEN, mount);
+}
+
+auto metadata_cache_store_opened_file_stat(File* file, MountPoint const* known_mount = nullptr) -> bool {
+    if (file == nullptr || file->vfs_path == nullptr || file_is_synthetic_mount_dir(file) || !metadata_cacheable_fs(file->fs_type) ||
+        !file_stat_snapshot_cacheable(file) || !file->stat_cache_valid || (file->open_flags & ker::vfs::O_NO_CACHE) != 0 ||
+        !file_stat_snapshot_open_prefill_safe(file) || cache_notify_file_dirty_impl(file)) {
+        return false;
+    }
+
+    size_t const PATH_LEN = file_vfs_path_len(file);
+    if (PATH_LEN == 0 || !file_stat_snapshot_result_cacheable(file, file->stat_cache.st_mode)) {
+        return false;
+    }
+
+    MetadataSnapshotStamp const STAMP = metadata_snapshot_stamp();
+    if (file->stat_cache_path_len == 0) {
+        if (!file_stat_snapshot_promote_open_prefill_for_path(file, PATH_LEN, STAMP)) {
+            return false;
+        }
+    } else if (file->stat_cache_path_len != PATH_LEN || !file_stat_snapshot_path_current(file, PATH_LEN, STAMP.cache_generation)) {
+        return false;
+    }
+
+    MountRef mount_ref{};
+    MountPoint const* mount = known_mount;
+    if (mount == nullptr || mount->fs_type != file->fs_type || !metadata_cacheable_fs(mount->fs_type) ||
+        (file->mount_dev_id != 0 && mount->dev_id != file->mount_dev_id)) {
+        mount_ref = find_mount_point(file->vfs_path, PATH_LEN);
+        mount = mount_ref.get();
+    }
+    if (mount == nullptr || mount->fs_type != file->fs_type || !metadata_cacheable_fs(mount->fs_type)) {
+        return false;
+    }
+
+    Stat statbuf = file->stat_cache;
+    statbuf.st_dev = mount->dev_id;
+    metadata_cache_store_non_symlink_stat_variants(file->vfs_path, mount->fs_type, mount->dev_id, statbuf, STAMP, PATH_LEN, mount);
+    return true;
+}
+
+void metadata_cache_store_opened_file_hints(File* file, MountPoint const* known_mount = nullptr) {
+    if (file == nullptr || file->vfs_path == nullptr || file_is_synthetic_mount_dir(file) || !metadata_cacheable_fs(file->fs_type) ||
+        (file->open_flags & ker::vfs::O_NO_CACHE) != 0 || cache_notify_file_dirty_impl(file)) {
+        return;
+    }
+
+    size_t const PATH_LEN = file_vfs_path_len(file);
+    if (PATH_LEN == 0) {
+        return;
+    }
+
+    MountRef mount_ref{};
+    MountPoint const* mount = known_mount;
+    if (mount == nullptr || mount->fs_type != file->fs_type || !metadata_cacheable_fs(mount->fs_type) ||
+        (file->mount_dev_id != 0 && mount->dev_id != file->mount_dev_id)) {
+        mount_ref = find_mount_point(file->vfs_path, PATH_LEN);
+        mount = mount_ref.get();
+    }
+    if (mount == nullptr || mount->fs_type != file->fs_type || !metadata_cacheable_fs(mount->fs_type)) {
+        return;
+    }
+    if (metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, mount->fs_type, mount->dev_id, true, false) ||
+        metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, mount->fs_type, mount->dev_id, false, false)) {
+        return;
+    }
+
+    MetadataSnapshotStamp const STAMP = metadata_snapshot_stamp();
+    size_t prepared_path_len = 0;
+    uint64_t epoch = 0;
+    uint64_t invalidation_generation = 0;
+    if (!metadata_cache_prepare_path_observation(file->vfs_path, mount->fs_type, STAMP, &prepared_path_len, &epoch,
+                                                 &invalidation_generation, PATH_LEN) ||
+        prepared_path_len != PATH_LEN) {
+        return;
+    }
+
+    if (file->is_directory) {
+        metadata_cache_note_observation_store();
+    } else {
+        metadata_cache_note_metadata_store_observation();
+    }
+    symlink_cache_store_prechecked(file->vfs_path, PATH_LEN, mount->fs_type, mount->dev_id, -EINVAL, nullptr, 0, epoch,
+                                   invalidation_generation);
+    existence_cache_store_prechecked(file->vfs_path, PATH_LEN, mount->fs_type, mount->dev_id, false, 0, epoch, STAMP.mount_generation,
+                                     invalidation_generation, false);
+    if (file->is_directory) {
+        existence_cache_store_prechecked(file->vfs_path, PATH_LEN, mount->fs_type, mount->dev_id, true, 0, epoch, STAMP.mount_generation,
+                                         invalidation_generation, false);
+        symlink_prefix_cache_store_prechecked(file->vfs_path, PATH_LEN, mount, epoch, STAMP.mount_generation, invalidation_generation);
+    } else {
+        metadata_cache_store_require_directory_enotdir_prechecked(file->vfs_path, PATH_LEN, mount->fs_type, mount->dev_id, epoch,
+                                                                  STAMP.mount_generation, invalidation_generation, false);
+    }
+}
+
+void metadata_cache_store_opened_file_stat_or_hints(File* file, MountPoint const* known_mount = nullptr) {
+    if (opened_writable_created_file_stat_deferred(file)) {
+        return;
+    }
+    if (!metadata_cache_store_opened_file_stat(file, known_mount)) {
+        metadata_cache_store_opened_file_hints(file, known_mount);
+    }
+}
+
+void metadata_cache_refresh_file_stat_after_metadata_change(File* file) {
+    if (file == nullptr) {
+        return;
+    }
+
+    Stat statbuf{};
+    if (vfs_stream_cache_get_file_stat(file, &statbuf) != 0) {
+        return;
+    }
+    metadata_cache_store_known_file_stat_after_metadata_change(file, statbuf);
+}
+
+auto symlink_hash_from_raw(uint64_t path_hash, FSType fs_type, uint64_t dev_id) -> uint64_t {
+    return metadata_hash_mix(path_hash ^ (static_cast<uint64_t>(fs_type) << 56U) ^ dev_id);
+}
+
+auto symlink_hash_path(const char* path, size_t len, FSType fs_type, uint64_t dev_id) -> uint64_t {
+    return symlink_hash_from_raw(metadata_path_hash_raw(path, len), fs_type, dev_id);
+}
+
+auto symlink_prefix_hash_from_symlink_hash(uint64_t symlink_hash, uint64_t mount_generation) -> uint64_t {
+    uint64_t const HASH = metadata_hash_mix(symlink_hash ^ (mount_generation * 0x9e3779b97f4a7c15ULL));
+    return HASH == 0 ? 1 : HASH;
+}
+
+auto symlink_prefix_hash_path(const char* path, size_t len, FSType fs_type, uint64_t dev_id, uint64_t mount_generation) -> uint64_t {
+    return symlink_prefix_hash_from_symlink_hash(symlink_hash_path(path, len, fs_type, dev_id), mount_generation);
+}
+
+auto symlink_prefix_cache_mount_cacheable(MountPoint const* mount) -> bool {
+    return mount != nullptr && mount->path != nullptr && symlink_cacheable_fs(mount->fs_type);
+}
+
+auto symlink_prefix_cache_lookup_with_parent(const char* path, size_t path_len, size_t parent_len, MountPoint const* mount) -> size_t {
+    if (path == nullptr || path_len == UNKNOWN_PATH_LEN || path_len <= 1 || path_len >= MAX_PATH_LEN || path[0] != '/' ||
+        !symlink_prefix_cache_mount_cacheable(mount)) {
+        return 0;
+    }
+
+    uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
+    uint64_t const MOUNT_GENERATION = mount_table_generation_snapshot();
+    if (parent_len == 0 || parent_len >= path_len) {
+        return 0;
+    }
+    size_t candidate_len = parent_len;
+    size_t hit_len = 0;
+
+    while (candidate_len > 1) {
+        if (!path_is_under_mount(mount, path, candidate_len)) {
+            break;
+        }
+
+        uint64_t const HASH = symlink_prefix_hash_path(path, candidate_len, mount->fs_type, mount->dev_id, MOUNT_GENERATION);
+        auto& set = g_symlink_prefix_cache[HASH & (SYMLINK_PREFIX_CACHE_SET_COUNT - 1)];
+
+        {
+            uint64_t const IRQF = set.lock.lock_irqsave();
+            for (auto& entry : set.ways) {
+                if (!entry.valid || entry.epoch != EPOCH || entry.hash != HASH || entry.path_len != candidate_len ||
+                    entry.fs_type != mount->fs_type || entry.dev_id != mount->dev_id || entry.mount_generation != MOUNT_GENERATION) {
+                    continue;
+                }
+                if (std::memcmp(entry.path.data(), path, candidate_len) != 0) {
+                    continue;
+                }
+
+                MetadataInvalidationCheck const INVALIDATION =
+                    metadata_path_subtree_invalidation_check(entry.path.data(), entry.path_len, entry.invalidation_generation);
+                if (INVALIDATION.invalidated) {
+                    entry.valid = false;
+                    continue;
+                }
+
+                entry.invalidation_generation = INVALIDATION.checked_generation;
+                entry.last_used = ++set.clock;
+                hit_len = candidate_len;
+                break;
+            }
+            set.lock.unlock_irqrestore(IRQF);
+        }
+
+        if (hit_len != 0) {
+            break;
+        }
+
+        size_t const NEXT_LEN = metadata_parent_path_len(path, candidate_len);
+        if (NEXT_LEN >= candidate_len) {
+            break;
+        }
+        candidate_len = NEXT_LEN;
+    }
+
+    if (hit_len == 0 || mount_table_generation_snapshot() != MOUNT_GENERATION) {
+        return 0;
+    }
+
+    g_vfs_symlink_prefix_hits.fetch_add(1, std::memory_order_relaxed);
+    return hit_len;
+}
+
+auto symlink_prefix_cache_lookup(const char* path, size_t path_len, MountPoint const* mount) -> size_t {
+    if (path == nullptr || path_len == UNKNOWN_PATH_LEN || path_len <= 1 || path_len >= MAX_PATH_LEN || path[0] != '/') {
+        return 0;
+    }
+
+    return symlink_prefix_cache_lookup_with_parent(path, path_len, metadata_parent_path_len(path, path_len), mount);
+}
+
+auto symlink_prefix_cache_covers_parent(const char* path, size_t path_len, MountPoint const* mount) -> bool {
+    if (path == nullptr || path_len == UNKNOWN_PATH_LEN || path_len == 0 || path_len >= MAX_PATH_LEN || path[0] != '/') {
+        return false;
+    }
+
+    size_t const PARENT_LEN = metadata_parent_path_len(path, path_len);
+    if (PARENT_LEN <= 1) {
+        return true;
+    }
+
+    return symlink_prefix_cache_lookup_with_parent(path, path_len, PARENT_LEN, mount) >= PARENT_LEN;
+}
+
+void symlink_prefix_cache_store_validated(const char* path, size_t prefix_len, MountPoint const* mount, uint64_t hash, uint64_t epoch,
+                                          uint64_t mount_generation, uint64_t invalidation_generation) {
+    auto& set = g_symlink_prefix_cache[hash & (SYMLINK_PREFIX_CACHE_SET_COUNT - 1)];
+
+    {
+        uint64_t const IRQF = set.lock.lock_irqsave();
+        uint64_t const USE_STAMP = ++set.clock;
+        SymlinkPrefixCacheEntry* victim = &set.ways.front();
+        for (auto& entry : set.ways) {
+            if (entry.valid && entry.epoch == epoch && entry.hash == hash && entry.path_len == prefix_len &&
+                entry.fs_type == mount->fs_type && entry.dev_id == mount->dev_id && entry.mount_generation == mount_generation &&
+                std::memcmp(entry.path.data(), path, prefix_len) == 0) {
+                victim = &entry;
+                break;
+            }
+            if (!entry.valid || entry.epoch != epoch || entry.mount_generation != mount_generation) {
+                victim = &entry;
+                break;
+            }
+            if (entry.last_used < victim->last_used) {
+                victim = &entry;
+            }
+        }
+
+        std::memcpy(victim->path.data(), path, prefix_len);
+        victim->path[prefix_len] = '\0';
+        victim->hash = hash;
+        victim->epoch = epoch;
+        victim->last_used = USE_STAMP;
+        victim->dev_id = mount->dev_id;
+        victim->mount_generation = mount_generation;
+        victim->invalidation_generation = invalidation_generation;
+        victim->path_len = prefix_len;
+        victim->fs_type = mount->fs_type;
+        victim->valid = true;
+        set.lock.unlock_irqrestore(IRQF);
+    }
+    g_vfs_symlink_prefix_stores.fetch_add(1, std::memory_order_relaxed);
+}
+
+void symlink_prefix_cache_store_prehashed(const char* path, size_t prefix_len, MountPoint const* mount, uint64_t hash, uint64_t epoch,
+                                          uint64_t mount_generation, uint64_t invalidation_generation) {
+    if (path == nullptr || prefix_len <= 1 || prefix_len >= MAX_PATH_LEN || path[0] != '/' ||
+        !symlink_prefix_cache_mount_cacheable(mount) || !path_is_under_mount(mount, path, prefix_len)) {
+        return;
+    }
+
+    symlink_prefix_cache_store_validated(path, prefix_len, mount, hash, epoch, mount_generation, invalidation_generation);
+}
+
+void symlink_prefix_cache_store_prechecked(const char* path, size_t prefix_len, MountPoint const* mount, uint64_t epoch,
+                                           uint64_t mount_generation, uint64_t invalidation_generation) {
+    if (path == nullptr || prefix_len <= 1 || prefix_len >= MAX_PATH_LEN || path[0] != '/' ||
+        !symlink_prefix_cache_mount_cacheable(mount) || !path_is_under_mount(mount, path, prefix_len)) {
+        return;
+    }
+
+    uint64_t const HASH = symlink_prefix_hash_path(path, prefix_len, mount->fs_type, mount->dev_id, mount_generation);
+    symlink_prefix_cache_store_validated(path, prefix_len, mount, HASH, epoch, mount_generation, invalidation_generation);
+}
+
+void symlink_prefix_cache_store(const char* path, size_t prefix_len, MountPoint const* mount) {
+    uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
+    uint64_t const MOUNT_GENERATION = mount_table_generation_snapshot();
+    uint64_t const INVALIDATION_GENERATION = g_metadata_invalidation_generation.load(std::memory_order_acquire);
+    symlink_prefix_cache_store_prechecked(path, prefix_len, mount, EPOCH, MOUNT_GENERATION, INVALIDATION_GENERATION);
+}
+
+void symlink_cache_store_prehashed(const char* path, size_t path_len, FSType fs_type, uint64_t dev_id, ssize_t result, const char* target,
+                                   size_t target_len, uint64_t hash, uint64_t epoch, uint64_t invalidation_generation) {
+    if (path == nullptr || path_len == 0 || path_len >= MAX_PATH_LEN || !symlink_cacheable_fs(fs_type) ||
+        !symlink_cacheable_result(result)) {
+        return;
+    }
+    if (result > 0) {
+        if (target == nullptr || std::cmp_not_equal(target_len, result) || target_len >= MAX_PATH_LEN) {
+            return;
+        }
+    } else if (target_len != 0) {
+        return;
+    }
+
+    auto& set = g_symlink_cache[hash & (SYMLINK_CACHE_SET_COUNT - 1)];
+
+    {
+        uint64_t const IRQF = set.lock.lock_irqsave();
+        uint64_t const USE_STAMP = ++set.clock;
+        SymlinkCacheEntry* victim = &set.ways.front();
+        for (auto& entry : set.ways) {
+            if (entry.valid && entry.epoch == epoch && entry.hash == hash && entry.path_len == path_len && entry.fs_type == fs_type &&
+                entry.dev_id == dev_id && std::memcmp(entry.path.data(), path, path_len + 1) == 0) {
+                victim = &entry;
+                break;
+            }
+            if (!entry.valid || entry.epoch != epoch) {
+                victim = &entry;
+                break;
+            }
+            if (entry.last_used < victim->last_used) {
+                victim = &entry;
+            }
+        }
+
+        std::memcpy(victim->path.data(), path, path_len + 1);
+        if (target_len > 0) {
+            std::memcpy(victim->target.data(), target, target_len);
+            victim->target[target_len] = '\0';
+        } else {
+            victim->target.at(0) = '\0';
+        }
+        victim->hash = hash;
+        victim->epoch = epoch;
+        victim->last_used = USE_STAMP;
+        victim->dev_id = dev_id;
+        victim->invalidation_generation = invalidation_generation;
+        victim->path_len = path_len;
+        victim->target_len = target_len;
+        victim->result = result;
+        victim->fs_type = fs_type;
+        victim->valid = true;
+        set.lock.unlock_irqrestore(IRQF);
+    }
+    g_vfs_symlink_stores.fetch_add(1, std::memory_order_relaxed);
+}
+
+void symlink_cache_store_prechecked(const char* path, size_t path_len, FSType fs_type, uint64_t dev_id, ssize_t result, const char* target,
+                                    size_t target_len, uint64_t epoch, uint64_t invalidation_generation) {
+    if (path == nullptr || path_len == 0 || path_len >= MAX_PATH_LEN || !symlink_cacheable_fs(fs_type) ||
+        !symlink_cacheable_result(result)) {
+        return;
+    }
+    if (result > 0) {
+        if (target == nullptr || std::cmp_not_equal(target_len, result) || target_len >= MAX_PATH_LEN) {
+            return;
+        }
+    } else if (target_len != 0) {
+        return;
+    }
+
+    uint64_t const HASH = symlink_hash_path(path, path_len, fs_type, dev_id);
+    symlink_cache_store_prehashed(path, path_len, fs_type, dev_id, result, target, target_len, HASH, epoch, invalidation_generation);
+}
+
+auto symlink_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, char* buf, size_t bufsize, ssize_t* out_result,
+                          size_t known_path_len, size_t* path_len_out, uint64_t known_raw_path_hash) -> bool {
+    if (path == nullptr || buf == nullptr || bufsize == 0 || out_result == nullptr || !symlink_cacheable_fs(fs_type)) {
+        return false;
+    }
+
+    size_t const PATH_LEN = known_path_len != UNKNOWN_PATH_LEN ? known_path_len : std::strlen(path);
+    if (path_len_out != nullptr) {
+        *path_len_out = PATH_LEN;
+    }
+    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
+        return false;
+    }
+
+    uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
+    uint64_t const RAW_HASH = known_raw_path_hash != UNKNOWN_PATH_HASH && known_path_len != UNKNOWN_PATH_LEN
+                                  ? known_raw_path_hash
+                                  : metadata_path_hash_raw(path, PATH_LEN);
+    uint64_t const HASH = symlink_hash_from_raw(RAW_HASH, fs_type, dev_id);
     auto& set = g_symlink_cache[HASH & (SYMLINK_CACHE_SET_COUNT - 1)];
 
     bool cache_hit = false;
     ssize_t cache_result = 0;
     {
-        ker::mod::sys::MutexGuard guard(set.lock);
+        uint64_t const IRQF = set.lock.lock_irqsave();
         for (auto& entry : set.ways) {
             if (!entry.valid || entry.epoch != EPOCH || entry.hash != HASH || entry.path_len != PATH_LEN || entry.fs_type != fs_type ||
                 entry.dev_id != dev_id) {
@@ -1494,11 +2868,14 @@ auto symlink_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, cha
             if (std::memcmp(entry.path.data(), path, PATH_LEN + 1) != 0) {
                 continue;
             }
-            if (metadata_path_invalidated_since(entry.path.data(), entry.path_len, entry.invalidation_generation)) {
+            MetadataInvalidationCheck const INVALIDATION =
+                metadata_path_subtree_invalidation_check(entry.path.data(), entry.path_len, entry.invalidation_generation);
+            if (INVALIDATION.invalidated) {
                 entry.valid = false;
                 continue;
             }
 
+            entry.invalidation_generation = INVALIDATION.checked_generation;
             entry.last_used = ++set.clock;
             cache_result = entry.result;
             if (cache_result > 0) {
@@ -1509,6 +2886,7 @@ auto symlink_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, cha
             cache_hit = true;
             break;
         }
+        set.lock.unlock_irqrestore(IRQF);
     }
     if (cache_hit) {
         *out_result = cache_result;
@@ -1519,12 +2897,13 @@ auto symlink_cache_lookup(const char* path, FSType fs_type, uint64_t dev_id, cha
     return false;
 }
 
-void symlink_cache_store(const char* path, FSType fs_type, uint64_t dev_id, ssize_t result, const char* target) {
+void symlink_cache_store(const char* path, FSType fs_type, uint64_t dev_id, ssize_t result, const char* target, size_t known_path_len,
+                         uint64_t known_raw_path_hash) {
     if (path == nullptr || !symlink_cacheable_fs(fs_type) || !symlink_cacheable_result(result)) {
         return;
     }
 
-    size_t const PATH_LEN = std::strlen(path);
+    size_t const PATH_LEN = known_path_len != UNKNOWN_PATH_LEN ? known_path_len : std::strlen(path);
     if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
         return;
     }
@@ -1542,45 +2921,11 @@ void symlink_cache_store(const char* path, FSType fs_type, uint64_t dev_id, ssiz
 
     uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
     uint64_t const INVALIDATION_GENERATION = g_metadata_invalidation_generation.load(std::memory_order_acquire);
-    uint64_t const HASH = symlink_hash_path(path, PATH_LEN, fs_type, dev_id);
-    auto& set = g_symlink_cache[HASH & (SYMLINK_CACHE_SET_COUNT - 1)];
-
-    {
-        ker::mod::sys::MutexGuard guard(set.lock);
-        uint64_t const USE_STAMP = ++set.clock;
-        SymlinkCacheEntry* victim = &set.ways.front();
-        for (auto& entry : set.ways) {
-            if (entry.valid && entry.epoch == EPOCH && entry.hash == HASH && entry.path_len == PATH_LEN && entry.fs_type == fs_type &&
-                entry.dev_id == dev_id && std::memcmp(entry.path.data(), path, PATH_LEN + 1) == 0) {
-                victim = &entry;
-                break;
-            }
-            if (!entry.valid || entry.epoch != EPOCH) {
-                victim = &entry;
-                break;
-            }
-            if (entry.last_used < victim->last_used) {
-                victim = &entry;
-            }
-        }
-
-        std::memcpy(victim->path.data(), path, PATH_LEN + 1);
-        if (target_len > 0) {
-            std::memcpy(victim->target.data(), target, target_len);
-            victim->target[target_len] = '\0';
-        }
-        victim->hash = HASH;
-        victim->epoch = EPOCH;
-        victim->last_used = USE_STAMP;
-        victim->dev_id = dev_id;
-        victim->invalidation_generation = INVALIDATION_GENERATION;
-        victim->path_len = PATH_LEN;
-        victim->target_len = target_len;
-        victim->result = result;
-        victim->fs_type = fs_type;
-        victim->valid = true;
-    }
-    g_vfs_symlink_stores.fetch_add(1, std::memory_order_relaxed);
+    uint64_t const RAW_HASH = known_raw_path_hash != UNKNOWN_PATH_HASH && known_path_len != UNKNOWN_PATH_LEN
+                                  ? known_raw_path_hash
+                                  : metadata_path_hash_raw(path, PATH_LEN);
+    symlink_cache_store_prehashed(path, PATH_LEN, fs_type, dev_id, result, target, target_len,
+                                  symlink_hash_from_raw(RAW_HASH, fs_type, dev_id), EPOCH, INVALIDATION_GENERATION);
 }
 
 void vfs_file_clear_path(File* file) {
@@ -1591,6 +2936,7 @@ void vfs_file_clear_path(File* file) {
         delete[] file->vfs_path;
     }
     file->vfs_path = nullptr;
+    file->vfs_path_len = 0;
     file->vfs_path_heap_allocated = false;
     file->vfs_path_inline.at(0) = '\0';
 }
@@ -1605,9 +2951,11 @@ auto vfs_file_set_path(File* file, const char* path) -> bool {
     }
 
     size_t const PATH_LEN = std::strlen(path);
+    size_t const NORMALIZED_PATH_LEN = metadata_normalized_path_len(path);
     if (PATH_LEN + 1 <= file->vfs_path_inline.size()) {
         std::memcpy(file->vfs_path_inline.data(), path, PATH_LEN + 1);
         file->vfs_path = file->vfs_path_inline.data();
+        file->vfs_path_len = NORMALIZED_PATH_LEN;
         return true;
     }
 
@@ -1617,6 +2965,7 @@ auto vfs_file_set_path(File* file, const char* path) -> bool {
     }
     std::memcpy(path_copy, path, PATH_LEN + 1);
     file->vfs_path = path_copy;
+    file->vfs_path_len = NORMALIZED_PATH_LEN;
     file->vfs_path_heap_allocated = true;
     return true;
 }
@@ -1630,8 +2979,21 @@ auto vfs_destroy_file(File* f) -> int {
     stream_detach_file(f);
     cache_notify_detach_file(f);
     advisory_release_file_owner_locks(f);
+    bool const CLOSE_MAY_CHANGE_METADATA = f->close_may_change_metadata;
+    if (!CLOSE_MAY_CHANGE_METADATA) {
+        metadata_cache_refresh_file_data_on_close(f);
+    }
     if ((f->fops != nullptr) && (f->fops->vfs_close != nullptr)) {
         close_result = f->fops->vfs_close(f);
+    }
+    if (close_result < 0) {
+        ker::mod::dbg::log("[vfs] close error: fd=%d ret=%d fs=%u flags=0x%x refs=%d fops=%p path=%s", f->fd, close_result,
+                           static_cast<unsigned>(f->fs_type), static_cast<unsigned>(f->open_flags),
+                           f->refcount.load(std::memory_order_relaxed), static_cast<void*>(f->fops),
+                           f->vfs_path != nullptr ? f->vfs_path : "?");
+    }
+    if (CLOSE_MAY_CHANGE_METADATA && f->vfs_path != nullptr) {
+        metadata_cache_note_exact_path_changed(f->vfs_path);
     }
     vfs_file_clear_path(f);
     f->private_data = nullptr;
@@ -2671,7 +4033,10 @@ auto vfs_stream_cache_get_file_stat(File* file, Stat* statbuf) -> int {
     std::memset(statbuf, 0, sizeof(Stat));
 
     auto stream_stat_dev_id = [&]() -> uint32_t {
-        MountRef sc_mount_ref = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path) : MountRef{};
+        if (file->mount_dev_id != 0) {
+            return file->mount_dev_id;
+        }
+        MountRef sc_mount_ref = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path, file_vfs_path_len(file)) : MountRef{};
         MountPoint const* sc_mount = sc_mount_ref.get();
         return sc_mount != nullptr ? sc_mount->dev_id : 0;
     };
@@ -2741,7 +4106,7 @@ auto stream_build_identity(File* file, const Stat& statbuf, StreamCacheIdentity*
             return -ENOSYS;
         }
     } else {
-        auto mount_ref = find_mount_point(file->vfs_path);
+        auto mount_ref = find_mount_point(file->vfs_path, file_vfs_path_len(file));
         MountPoint const* mount = mount_ref.get();
         if (mount == nullptr) {
             return -ENOENT;
@@ -3150,7 +4515,10 @@ void cache_notify_file_data_changed_impl(File* file) {
         return;
     }
 
-    metadata_cache_note_file_data_changed(file);
+    bool const INVALIDATED_OBSERVED_PATH = metadata_cache_note_file_data_changed(file);
+    if (INVALIDATED_OBSERVED_PATH || file->created_by_open) {
+        metadata_cache_schedule_file_data_close_refresh(file);
+    }
 
     if (cache_notify_invalidate_path_local(file->vfs_path)) {
         ker::net::wki::wki_remote_vfs_notify_path_changed(file->vfs_path, nullptr);
@@ -3163,7 +4531,12 @@ void cache_notify_file_metadata_changed_impl(File* file) {
     }
 
     file_stat_snapshot_invalidate(file);
+    bool const SHOULD_REFRESH_PATH_STAT = file->created_by_open || metadata_cache_has_file_data_observation(file);
     cache_notify_path_data_changed_impl(file->vfs_path, file->fs_type);
+    if (SHOULD_REFRESH_PATH_STAT) {
+        metadata_cache_mark_file_data_close_refresh_path_current(file);
+        metadata_cache_schedule_file_data_close_refresh(file);
+    }
 }
 
 auto cache_notify_file_dirty_impl(File* file) -> bool {
@@ -3201,6 +4574,21 @@ void cache_notify_acknowledge_file_impl(File* file) {
         watcher->entry->last_used_us = stream_now_us();
     }
     g_cache_notify_lock.unlock();
+}
+
+void refresh_created_file_stat_snapshot_after_write(File* file) {
+    if (!file_stat_snapshot_created_open_prefill_eligible(file) || file->fs_type != FSType::XFS) {
+        return;
+    }
+
+    Stat statbuf{};
+    if (!ker::vfs::xfs::xfs_consume_recent_write_stat(file, &statbuf) && ker::vfs::xfs::xfs_snapshot_file_stat(file, &statbuf) != 0) {
+        file_stat_snapshot_invalidate(file);
+        return;
+    }
+
+    cache_notify_acknowledge_file_impl(file);
+    file_stat_snapshot_store(file, statbuf, metadata_snapshot_stamp());
 }
 
 auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t start_offset, size_t* actual_size, ssize_t* result) -> bool {
@@ -3342,31 +4730,180 @@ auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t sta
     return true;
 }
 
-auto copy_path_string(const char* src, char* dst, size_t dst_size) -> int {
+auto copy_path_string(const char* src, char* dst, size_t dst_size, size_t known_src_len = UNKNOWN_PATH_LEN,
+                      size_t* copied_len_out = nullptr) -> int {
     if (src == nullptr || dst == nullptr || dst_size == 0) {
         return -EINVAL;
     }
 
-    size_t const LEN = std::strlen(src);
+    size_t const LEN = known_src_len != UNKNOWN_PATH_LEN ? known_src_len : std::strlen(src);
     if (LEN + 1 > dst_size) {
         return -ENAMETOOLONG;
     }
 
     std::memcpy(dst, src, LEN + 1);
+    if (copied_len_out != nullptr) {
+        *copied_len_out = LEN;
+    }
     return 0;
 }
 
-auto path_requires_directory(const char* path) -> bool {
-    if (path == nullptr || path[0] == '\0') {
+auto path_text_equal(const char* left, size_t left_len, const char* right, size_t right_len) -> bool {
+    if (left == nullptr || right == nullptr) {
+        return false;
+    }
+    if (left_len != UNKNOWN_PATH_LEN && right_len != UNKNOWN_PATH_LEN) {
+        return left_len == right_len && std::memcmp(left, right, left_len) == 0;
+    }
+    return std::strcmp(left, right) == 0;
+}
+
+auto path_requires_directory(const char* path, size_t path_len) -> bool {
+    if (path == nullptr || path_len == 0) {
         return false;
     }
 
-    size_t end = std::strlen(path);
+    size_t end = path_len;
     while (end > 0 && path[end - 1] == '/') {
         end--;
     }
 
-    return end > 0 && path[end] == '/';
+    return end > 0 && end < path_len;
+}
+
+auto path_requires_directory(const char* path) -> bool {
+    if (path == nullptr) {
+        return false;
+    }
+    return path_requires_directory(path, std::strlen(path));
+}
+
+auto path_component_needs_canonicalize(const char* component, size_t len) -> bool {
+    return (len == 1 && component[0] == '.') || (len == 2 && component[0] == '.' && component[1] == '.');
+}
+
+auto path_text_needs_canonicalize(const char* path, size_t path_len) -> bool {
+    if (path == nullptr || path_len == 0) {
+        return true;
+    }
+    if (path_len == 1 && path[0] == '/') {
+        return false;
+    }
+    if (path[path_len - 1] == '/') {
+        return true;
+    }
+
+    size_t component_start = path[0] == '/' ? 1 : 0;
+    size_t component_count = 0;
+    bool previous_slash = path[0] == '/';
+    auto finish_component = [&](size_t component_len) -> bool {
+        ++component_count;
+        return component_count > MAX_COMPONENTS || path_component_needs_canonicalize(path + component_start, component_len);
+    };
+    for (size_t i = component_start; i < path_len; ++i) {
+        if (path[i] != '/') {
+            previous_slash = false;
+            continue;
+        }
+        if (previous_slash) {
+            return true;
+        }
+
+        if (finish_component(i - component_start)) {
+            return true;
+        }
+        component_start = i + 1;
+        previous_slash = true;
+    }
+
+    return finish_component(path_len - component_start);
+}
+
+struct PathTextScan {
+    size_t path_len{};
+    size_t normalized_len{};
+    uint64_t path_hash = UNKNOWN_PATH_HASH;
+    uint64_t normalized_path_hash = UNKNOWN_PATH_HASH;
+    bool requires_directory{};
+    bool needs_canonicalize = true;
+    bool trailing_slash_only_canonicalize{};
+};
+
+auto path_text_is_simple_relative_basename(const char* path, const PathTextScan& scan) -> bool {
+    return path != nullptr && path[0] != '/' && scan.path_len != 0 && scan.path_len < MAX_PATH_LEN && !scan.requires_directory &&
+           !scan.needs_canonicalize && std::memchr(path, '/', scan.path_len) == nullptr;
+}
+
+auto scan_path_text(const char* path) -> PathTextScan {
+    PathTextScan scan{};
+    if (path == nullptr) {
+        return scan;
+    }
+
+    bool previous_slash = path[0] == '/';
+    size_t component_start = previous_slash ? 1 : 0;
+    size_t component_count = 0;
+    size_t last_non_slash_end = 0;
+    uint64_t path_hash = METADATA_PATH_HASH_OFFSET;
+    uint64_t last_non_slash_hash = UNKNOWN_PATH_HASH;
+    bool needs_canonicalize = false;
+    auto finish_component = [&](size_t end) {
+        if (end <= component_start) {
+            return;
+        }
+        size_t const COMPONENT_LEN = end - component_start;
+        ++component_count;
+        if (component_count > MAX_COMPONENTS || path_component_needs_canonicalize(path + component_start, COMPONENT_LEN)) {
+            needs_canonicalize = true;
+        }
+    };
+
+    size_t pos = 0;
+    for (; path[pos] != '\0'; ++pos) {
+        char const CH = path[pos];
+        path_hash = metadata_path_hash_append(path_hash, CH);
+        if (CH != '/') {
+            previous_slash = false;
+            last_non_slash_end = pos + 1;
+            last_non_slash_hash = path_hash;
+            continue;
+        }
+
+        if (pos == 0) {
+            previous_slash = true;
+            component_start = 1;
+            continue;
+        }
+        if (previous_slash) {
+            needs_canonicalize = true;
+        } else {
+            finish_component(pos);
+        }
+        component_start = pos + 1;
+        previous_slash = true;
+    }
+
+    scan.path_len = pos;
+    scan.path_hash = pos != 0 ? path_hash : UNKNOWN_PATH_HASH;
+    scan.requires_directory = last_non_slash_end != 0 && last_non_slash_end < pos;
+    scan.normalized_len = scan.requires_directory ? last_non_slash_end : pos;
+    scan.normalized_path_hash = scan.requires_directory ? last_non_slash_hash : scan.path_hash;
+    if (pos == 0) {
+        scan.needs_canonicalize = true;
+    } else if (pos == 1 && path[0] == '/') {
+        scan.needs_canonicalize = false;
+        scan.normalized_len = 1;
+        scan.normalized_path_hash = scan.path_hash;
+    } else {
+        if (path[pos - 1] == '/') {
+            scan.trailing_slash_only_canonicalize = !needs_canonicalize;
+            needs_canonicalize = true;
+        } else if (!previous_slash) {
+            finish_component(pos);
+        }
+        scan.needs_canonicalize = needs_canonicalize;
+    }
+    return scan;
 }
 
 auto tmpfs_root_for_mount(const MountPoint* mount) -> ker::vfs::tmpfs::TmpNode* {
@@ -3481,26 +5018,495 @@ auto path_prefix_matches(const char* path, const char* prefix, size_t prefix_len
     return path[prefix_len] == '\0' || path[prefix_len] == '/';
 }
 
+auto path_is_wki_prefix(const char* path) -> bool {
+    return path != nullptr && path[0] == '/' && path[1] == 'w' && path[2] == 'k' && path[3] == 'i' && (path[4] == '\0' || path[4] == '/');
+}
+
+auto path_has_wki_host_root_prefix(const char* path) -> bool {
+    return path != nullptr && path[0] == '/' && path[1] == 'w' && path[2] == 'k' && path[3] == 'i' && path[4] == '/' && path[5] != '\0' &&
+           path[5] != '/';
+}
+
+auto ensure_wki_host_root_mount(const char* path) -> int;
+
+auto task_cached_root_len(const ker::mod::sched::task::Task* task) -> size_t {
+    if (task == nullptr) {
+        return 0;
+    }
+    size_t const HINT = task->root_len;
+    if (HINT > 0 && HINT < task->root.size() && task->root.at(HINT) == '\0') {
+        return HINT;
+    }
+    return std::strlen(task->root.data());
+}
+
+auto resolved_path_may_need_wki_host_root_mount_for_task(const ker::mod::sched::task::Task* task, const char* resolved_path) -> bool {
+    if (resolved_path == nullptr) {
+        return false;
+    }
+
+    if (task == nullptr || (task->root[0] == '/' && task->root[1] == '\0')) {
+        return path_has_wki_host_root_prefix(resolved_path);
+    }
+
+    size_t const ROOT_LEN = task_cached_root_len(task);
+    if (ROOT_LEN > 1 && std::strncmp(resolved_path, task->root.data(), ROOT_LEN) == 0 &&
+        (resolved_path[ROOT_LEN] == '\0' || resolved_path[ROOT_LEN] == '/')) {
+        if (resolved_path[ROOT_LEN] == '\0') {
+            return false;
+        }
+        return path_has_wki_host_root_prefix(resolved_path + ROOT_LEN);
+    }
+
+    return path_has_wki_host_root_prefix(resolved_path);
+}
+
+void maybe_ensure_wki_host_root_mount_for_task(const ker::mod::sched::task::Task* task, const char* resolved_path) {
+    if (ker::net::wki::g_wki.initialized && resolved_path_may_need_wki_host_root_mount_for_task(task, resolved_path)) {
+        ensure_wki_host_root_mount(resolved_path);
+    }
+}
+
+auto task_has_common_local_vfs_routing(const ker::mod::sched::task::Task* task) -> bool {
+    if (task == nullptr) {
+        return false;
+    }
+    if (task->root[0] != '/') {
+        return false;
+    }
+    if (!task->wki_vfs_rules.empty()) {
+        return false;
+    }
+    if (task->wki_submitter_hostname[0] != '\0' &&
+        std::strcmp(task->wki_submitter_hostname.data(), ker::net::wki::g_wki.local_hostname.data()) != 0) {
+        return false;
+    }
+
+    return true;
+}
+
+auto task_vfs_route_is_common_local_noop(const ker::mod::sched::task::Task* task, const char* path) -> bool {
+    if (path == nullptr || !task_has_common_local_vfs_routing(task)) {
+        return false;
+    }
+
+    size_t const ROOT_LEN = task_cached_root_len(task);
+    if (ROOT_LEN <= 1) {
+        return !path_is_wki_prefix(path);
+    }
+
+    if (std::strncmp(path, task->root.data(), ROOT_LEN) != 0 || (path[ROOT_LEN] != '\0' && path[ROOT_LEN] != '/')) {
+        return false;
+    }
+    if (path[ROOT_LEN] == '\0') {
+        return true;
+    }
+
+    return !path_is_wki_prefix(path + ROOT_LEN);
+}
+
+auto common_local_visible_path_is_noop(const char* visible_path) -> bool {
+    return visible_path != nullptr && !path_is_wki_prefix(visible_path);
+}
+
+auto copy_task_visible_absolute_path_with_root(const ker::mod::sched::task::Task* task, const char* visible_path, size_t visible_len,
+                                               char* out, size_t outsize, size_t* out_len = nullptr) -> int {
+    if (task == nullptr || visible_path == nullptr || out == nullptr || outsize == 0 || visible_path[0] != '/') {
+        return -EINVAL;
+    }
+    if (visible_len == 0 || visible_len >= MAX_PATH_LEN) {
+        return -ENAMETOOLONG;
+    }
+
+    size_t const ROOT_LEN = task_cached_root_len(task);
+    if (ROOT_LEN <= 1) {
+        if (visible_len + 1 > outsize) {
+            return -ENAMETOOLONG;
+        }
+        if (out != visible_path) {
+            std::memcpy(out, visible_path, visible_len + 1);
+        }
+        if (out_len != nullptr) {
+            *out_len = visible_len;
+        }
+        return 0;
+    }
+
+    if (ROOT_LEN + visible_len + 1 > outsize) {
+        return -ENAMETOOLONG;
+    }
+    std::memmove(out + ROOT_LEN, visible_path, visible_len + 1);
+    std::memcpy(out, task->root.data(), ROOT_LEN);
+    if (out_len != nullptr) {
+        *out_len = ROOT_LEN + visible_len;
+    }
+    return 0;
+}
+
+void pop_dot_clean_path_component(char* out, size_t* out_len) {
+    if (out == nullptr || out_len == nullptr || *out_len <= 1) {
+        if (out != nullptr) {
+            out[0] = '/';
+            out[1] = '\0';
+        }
+        if (out_len != nullptr) {
+            *out_len = 1;
+        }
+        return;
+    }
+
+    size_t pos = *out_len;
+    while (pos > 1 && out[pos - 1] == '/') {
+        --pos;
+    }
+    while (pos > 1 && out[pos - 1] != '/') {
+        --pos;
+    }
+    if (pos <= 1) {
+        out[1] = '\0';
+        *out_len = 1;
+        return;
+    }
+
+    out[pos - 1] = '\0';
+    *out_len = pos - 1;
+}
+
+auto append_dot_clean_path_components(const char* path, const PathTextScan& scan, size_t start_pos, char* out, size_t* out_len,
+                                      size_t outsize) -> int {
+    if (path == nullptr || out == nullptr || out_len == nullptr || outsize == 0 || *out_len == 0 || *out_len >= outsize ||
+        scan.path_len == 0 || scan.path_len >= MAX_PATH_LEN || start_pos > scan.path_len) {
+        return RESOLVE_FAST_PATH_DECLINED;
+    }
+
+    size_t cursor = start_pos;
+    size_t component_count = 0;
+    while (cursor < scan.path_len) {
+        while (cursor < scan.path_len && path[cursor] == '/') {
+            ++cursor;
+        }
+        if (cursor >= scan.path_len) {
+            break;
+        }
+
+        size_t const COMPONENT_START = cursor;
+        while (cursor < scan.path_len && path[cursor] != '/') {
+            ++cursor;
+        }
+        size_t const COMPONENT_LEN = cursor - COMPONENT_START;
+        if (COMPONENT_LEN == 0) {
+            continue;
+        }
+        if (++component_count > MAX_COMPONENTS) {
+            return RESOLVE_FAST_PATH_DECLINED;
+        }
+
+        if (COMPONENT_LEN == 1 && path[COMPONENT_START] == '.') {
+            continue;
+        }
+        if (COMPONENT_LEN == 2 && path[COMPONENT_START] == '.' && path[COMPONENT_START + 1] == '.') {
+            pop_dot_clean_path_component(out, out_len);
+            continue;
+        }
+
+        size_t pos = *out_len;
+        if (pos > 1) {
+            if (pos + 1 >= outsize) {
+                return -ENAMETOOLONG;
+            }
+            out[pos++] = '/';
+        }
+        if (pos + COMPONENT_LEN + 1 > outsize) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(out + pos, path + COMPONENT_START, COMPONENT_LEN);
+        pos += COMPONENT_LEN;
+        out[pos] = '\0';
+        *out_len = pos;
+    }
+    return 0;
+}
+
+auto copy_dot_clean_visible_absolute_path(const char* path, const PathTextScan& scan, char* out, size_t outsize, size_t* out_len = nullptr)
+    -> int {
+    if (path == nullptr || out == nullptr || outsize < 2 || path[0] != '/') {
+        return RESOLVE_FAST_PATH_DECLINED;
+    }
+
+    out[0] = '/';
+    out[1] = '\0';
+    size_t len = 1;
+    int const RET = append_dot_clean_path_components(path, scan, 1, out, &len, outsize);
+    if (RET == 0 && out_len != nullptr) {
+        *out_len = len;
+    }
+    return RET;
+}
+
+auto copy_common_local_visible_absolute_path_fast_path(const ker::mod::sched::task::Task* task, const char* path, const PathTextScan& scan,
+                                                       char* out, size_t outsize, size_t* out_len = nullptr, uint64_t* out_hash = nullptr)
+    -> int {
+    if (out_hash != nullptr) {
+        *out_hash = UNKNOWN_PATH_HASH;
+    }
+    if (task == nullptr || path == nullptr || out == nullptr || outsize == 0 || path[0] != '/' || scan.path_len == 0 ||
+        scan.path_len >= MAX_PATH_LEN) {
+        return RESOLVE_FAST_PATH_DECLINED;
+    }
+    if (!task_has_common_local_vfs_routing(task)) {
+        return RESOLVE_FAST_PATH_DECLINED;
+    }
+    if (scan.needs_canonicalize) {
+        std::array<char, MAX_PATH_LEN> visible{};
+        size_t visible_len = UNKNOWN_PATH_LEN;
+        int const DOT_CLEAN_RET = copy_dot_clean_visible_absolute_path(path, scan, visible.data(), visible.size(), &visible_len);
+        if (DOT_CLEAN_RET != 0) {
+            return DOT_CLEAN_RET;
+        }
+        if (!common_local_visible_path_is_noop(visible.data())) {
+            return RESOLVE_FAST_PATH_DECLINED;
+        }
+        size_t resolved_len = UNKNOWN_PATH_LEN;
+        size_t* const RESOLVED_LEN_OUT = out_len != nullptr ? out_len : &resolved_len;
+        int const ROOT_COPY_RET =
+            copy_task_visible_absolute_path_with_root(task, visible.data(), visible_len, out, outsize, RESOLVED_LEN_OUT);
+        if (ROOT_COPY_RET == 0 && out_hash != nullptr) {
+            *out_hash = metadata_path_hash_known_len(out, out_len != nullptr ? *out_len : resolved_len);
+        }
+        return ROOT_COPY_RET;
+    }
+    if (!common_local_visible_path_is_noop(path)) {
+        return RESOLVE_FAST_PATH_DECLINED;
+    }
+
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    size_t* const RESOLVED_LEN_OUT = out_len != nullptr ? out_len : &resolved_len;
+    int const COPY_RET = copy_task_visible_absolute_path_with_root(task, path, scan.path_len, out, outsize, RESOLVED_LEN_OUT);
+    if (COPY_RET == 0 && out_hash != nullptr) {
+        *out_hash = task_cached_root_len(task) <= 1 ? scan.path_hash
+                                                    : metadata_path_hash_known_len(out, out_len != nullptr ? *out_len : resolved_len);
+    }
+    return COPY_RET;
+}
+
+auto task_absolute_local_path_fast_path_allowed(const ker::mod::sched::task::Task* task, const char* path, PathTextScan* scan_out) -> bool {
+    if (task == nullptr || path == nullptr || path[0] != '/') {
+        return false;
+    }
+    if (task->root[0] != '/' || task->root[1] != '\0') {
+        return false;
+    }
+
+    PathTextScan const SCAN = scan_path_text(path);
+    if (SCAN.path_len == 0 || SCAN.path_len >= MAX_PATH_LEN || SCAN.needs_canonicalize) {
+        return false;
+    }
+    if (!task_vfs_route_is_common_local_noop(task, path)) {
+        return false;
+    }
+
+    if (scan_out != nullptr) {
+        *scan_out = SCAN;
+    }
+    return true;
+}
+
+auto task_absolute_local_path_direct_result_allowed(const ker::mod::sched::task::Task* task, const char* path, const PathTextScan& scan)
+    -> bool {
+    if (task == nullptr || path == nullptr || path[0] != '/' || scan.path_len == 0 || scan.path_len >= MAX_PATH_LEN ||
+        scan.needs_canonicalize) {
+        return false;
+    }
+    if (task->root[0] != '/' || task->root[1] != '\0') {
+        return false;
+    }
+
+    return task_vfs_route_is_common_local_noop(task, path);
+}
+
+auto task_absolute_local_trailing_slash_direct_allowed(const ker::mod::sched::task::Task* task, const char* path, const PathTextScan& scan)
+    -> bool {
+    if (task == nullptr || path == nullptr || path[0] != '/' || scan.path_len == 0 || scan.path_len >= MAX_PATH_LEN ||
+        !scan.requires_directory || !scan.trailing_slash_only_canonicalize || scan.normalized_len == 0 ||
+        scan.normalized_len >= MAX_PATH_LEN) {
+        return false;
+    }
+    if (task->root[0] != '/' || task->root[1] != '\0') {
+        return false;
+    }
+
+    return task_vfs_route_is_common_local_noop(task, path);
+}
+
+auto copy_trailing_slash_trimmed_path(const char* path, const PathTextScan& scan, std::array<char, MAX_PATH_LEN>& out) -> bool {
+    if (path == nullptr || scan.normalized_len == 0 || scan.normalized_len >= out.size()) {
+        return false;
+    }
+    std::memcpy(out.data(), path, scan.normalized_len);
+    out.at(scan.normalized_len) = '\0';
+    return true;
+}
+
+auto task_cached_cwd_len(const ker::mod::sched::task::Task* task) -> size_t {
+    if (task == nullptr) {
+        return 0;
+    }
+    size_t const HINT = task->cwd_len;
+    if (HINT > 0 && HINT < task->cwd.size() && task->cwd.at(HINT) == '\0') {
+        return HINT;
+    }
+    return std::strlen(task->cwd.data());
+}
+
+auto copy_simple_relative_path_from_base(const char* base, const char* pathname, const PathTextScan& scan, char* out, size_t outsize,
+                                         size_t* out_len = nullptr, size_t known_base_len = UNKNOWN_PATH_LEN, uint64_t* out_hash = nullptr)
+    -> int {
+    if (out_hash != nullptr) {
+        *out_hash = UNKNOWN_PATH_HASH;
+    }
+    if (base == nullptr || pathname == nullptr || out == nullptr || outsize == 0) {
+        return -EINVAL;
+    }
+    if (base[0] != '/' || scan.path_len == 0 || scan.path_len >= MAX_PATH_LEN) {
+        return RESOLVE_FAST_PATH_DECLINED;
+    }
+
+    size_t base_len = known_base_len != UNKNOWN_PATH_LEN ? known_base_len : std::strlen(base);
+    while (base_len > 1 && base[base_len - 1] == '/') {
+        --base_len;
+    }
+
+    if (scan.needs_canonicalize) {
+        if (base_len + 1 > outsize) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(out, base, base_len);
+        out[base_len] = '\0';
+        int const RET = append_dot_clean_path_components(pathname, scan, 0, out, &base_len, outsize);
+        if (RET == 0 && out_len != nullptr) {
+            *out_len = base_len;
+        }
+        if (RET == 0 && out_hash != nullptr) {
+            *out_hash = metadata_path_hash_raw(out, base_len);
+        }
+        return RET;
+    }
+
+    size_t const SEP_LEN = (base_len == 1 && base[0] == '/') ? 0 : 1;
+    if (base_len + SEP_LEN + scan.path_len + 1 > outsize) {
+        return -ENAMETOOLONG;
+    }
+
+    std::memcpy(out, base, base_len);
+    out[base_len] = '\0';
+    size_t suffix_pos = base_len;
+    if (SEP_LEN != 0) {
+        out[suffix_pos++] = '/';
+    }
+    std::memcpy(out + suffix_pos, pathname, scan.path_len + 1);
+    if (out_len != nullptr) {
+        *out_len = suffix_pos + scan.path_len;
+    }
+    if (out_hash != nullptr) {
+        *out_hash = metadata_path_hash_concat(base, base_len, SEP_LEN != 0, pathname, scan.path_len);
+    }
+    return 0;
+}
+
+auto resolve_task_path_raw_common_local_fast_path(const char* path, char* out, size_t outsize, bool apply_task_route,
+                                                  size_t* out_len = nullptr, uint64_t* out_hash = nullptr) -> int {
+    if (out_hash != nullptr) {
+        *out_hash = UNKNOWN_PATH_HASH;
+    }
+    if (path == nullptr || out == nullptr || outsize == 0) {
+        return -EINVAL;
+    }
+    if (!apply_task_route || !ker::mod::sched::can_query_current_task()) {
+        return RESOLVE_FAST_PATH_DECLINED;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    PathTextScan scan = scan_path_text(path);
+    if (path[0] == '/') {
+        return copy_common_local_visible_absolute_path_fast_path(task, path, scan, out, outsize, out_len, out_hash);
+    }
+
+    if (scan.path_len == 0 || scan.path_len >= MAX_PATH_LEN) {
+        return RESOLVE_FAST_PATH_DECLINED;
+    }
+    if (!task_has_common_local_vfs_routing(task)) {
+        return RESOLVE_FAST_PATH_DECLINED;
+    }
+
+    size_t visible_len = UNKNOWN_PATH_LEN;
+    uint64_t visible_hash = UNKNOWN_PATH_HASH;
+    int const COPY_RET = copy_simple_relative_path_from_base(task->cwd.data(), path, scan, out, outsize, &visible_len,
+                                                             task_cached_cwd_len(task), &visible_hash);
+    if (COPY_RET != 0) {
+        return COPY_RET;
+    }
+    if (!common_local_visible_path_is_noop(out)) {
+        return RESOLVE_FAST_PATH_DECLINED;
+    }
+    if (task->root[0] == '/' && task->root[1] == '\0') {
+        if (out_len != nullptr) {
+            *out_len = visible_len;
+        }
+        if (out_hash != nullptr) {
+            *out_hash = visible_hash;
+        }
+        return 0;
+    }
+    size_t const ROOT_VISIBLE_LEN = visible_len != UNKNOWN_PATH_LEN ? visible_len : std::strlen(out);
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    size_t* const RESOLVED_LEN_OUT = out_len != nullptr ? out_len : &resolved_len;
+    int const ROOT_COPY_RET = copy_task_visible_absolute_path_with_root(task, out, ROOT_VISIBLE_LEN, out, outsize, RESOLVED_LEN_OUT);
+    if (ROOT_COPY_RET == 0 && out_hash != nullptr) {
+        *out_hash = metadata_path_hash_known_len(out, out_len != nullptr ? *out_len : resolved_len);
+    }
+    return ROOT_COPY_RET;
+}
+
 auto strip_mount_prefix(const MountPoint* mount, const char* path) -> const char* {
     if (mount == nullptr || path == nullptr) {
         return path;
     }
 
-    size_t mount_len = 0;
-    while (mount->path[mount_len] != '\0') {
-        mount_len++;
-    }
+    size_t const MOUNT_LEN = mount->path_len;
 
-    if (mount_len == 1 && mount->path[0] == '/') {
+    if (MOUNT_LEN == 1 && mount->path[0] == '/') {
         return path + 1;
     }
-    if (path[mount_len] == '/') {
-        return path + mount_len + 1;
+    if (path[MOUNT_LEN] == '/') {
+        return path + MOUNT_LEN + 1;
     }
-    if (path[mount_len] == '\0') {
+    if (path[MOUNT_LEN] == '\0') {
         return "";
     }
-    return path + mount_len;
+    return path + MOUNT_LEN;
+}
+
+auto strip_mount_prefix_len(const MountPoint* mount, const char* path, size_t path_len) -> size_t {
+    if (mount == nullptr || path == nullptr || path_len == UNKNOWN_PATH_LEN) {
+        return UNKNOWN_PATH_LEN;
+    }
+
+    size_t const MOUNT_LEN = mount->path_len;
+    if (MOUNT_LEN > path_len) {
+        return UNKNOWN_PATH_LEN;
+    }
+
+    if (MOUNT_LEN == 1 && mount->path[0] == '/') {
+        return path_len == 0 ? UNKNOWN_PATH_LEN : path_len - 1;
+    }
+    if (path[MOUNT_LEN] == '/') {
+        return path_len - MOUNT_LEN - 1;
+    }
+    if (path[MOUNT_LEN] == '\0') {
+        return 0;
+    }
+
+    return path_len - MOUNT_LEN;
 }
 
 auto find_first_mount_child(const char* path) -> MountRef {
@@ -3516,7 +5522,7 @@ auto find_first_mount_child(const char* path) -> MountRef {
             continue;
         }
 
-        size_t const MP_LEN = std::strlen(mp->path);
+        size_t const MP_LEN = mp->path_len;
         if (MP_LEN > PATH_LEN && std::strncmp(mp->path, path, PATH_LEN) == 0 && mp->path[PATH_LEN] == '/') {
             return mount_ref;
         }
@@ -3543,7 +5549,7 @@ bool is_logical_wki_root_dir(const char* path) {
         return false;
     }
 
-    size_t const ROOT_LEN = std::strlen(task->root.data());
+    size_t const ROOT_LEN = task_cached_root_len(task);
     if (ROOT_LEN <= 1) {
         return false;
     }
@@ -3557,7 +5563,7 @@ bool logical_wki_root_has_mount_child() {
     if (ker::mod::sched::can_query_current_task()) {
         auto* task = ker::mod::sched::get_current_task();
         if (task != nullptr) {
-            size_t const ROOT_LEN = std::strlen(task->root.data());
+            size_t const ROOT_LEN = task_cached_root_len(task);
             if (ROOT_LEN > 1) {
                 if (ROOT_LEN + 4 >= resolved.size()) {
                     return false;
@@ -3631,7 +5637,7 @@ auto strip_task_root_prefix(const ker::mod::sched::task::Task* task, const char*
         return copy_path_string(path, out, out_size);
     }
 
-    size_t const ROOT_LEN = std::strlen(task->root.data());
+    size_t const ROOT_LEN = task_cached_root_len(task);
     if (ROOT_LEN <= 1) {
         return copy_path_string(path, out, out_size);
     }
@@ -3663,6 +5669,58 @@ auto strip_current_task_root_prefix(const char* path, char* out, size_t out_size
 
     auto* task = ker::mod::sched::get_current_task();
     return strip_task_root_prefix(task, path, out, out_size, nullptr);
+}
+
+auto task_root_relative_path_view(const ker::mod::sched::task::Task* task, const char* path) -> const char* {
+    if (path == nullptr || task == nullptr) {
+        return path;
+    }
+
+    if (task->root[0] == '/' && task->root[1] == '\0') {
+        return path;
+    }
+
+    size_t const ROOT_LEN = task_cached_root_len(task);
+    if (ROOT_LEN <= 1) {
+        return path;
+    }
+    if (std::strncmp(path, task->root.data(), ROOT_LEN) != 0 || (path[ROOT_LEN] != '\0' && path[ROOT_LEN] != '/')) {
+        return path;
+    }
+    if (path[ROOT_LEN] == '\0') {
+        return "/";
+    }
+    return path + ROOT_LEN;
+}
+
+auto is_wki_entry_path(const char* path) -> bool {
+    if (path == nullptr) {
+        return false;
+    }
+    if (std::strcmp(path, "/wki") == 0) {
+        return true;
+    }
+    if (std::strncmp(path, "/wki/", 5) != 0) {
+        return false;
+    }
+
+    const char* child = path + 5;
+    if (*child == '\0') {
+        return false;
+    }
+    for (const char* p = child; *p != '\0'; ++p) {
+        if (*p == '/') {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto resolved_task_path_is_wki_entry(const ker::mod::sched::task::Task* task, const char* resolved_path) -> bool {
+    if (resolved_path == nullptr) {
+        return false;
+    }
+    return is_wki_entry_path(task_root_relative_path_view(task, resolved_path));
 }
 
 auto build_wki_host_path(const char* hostname, const char* suffix, char* out, size_t out_size) -> int {
@@ -3730,12 +5788,20 @@ auto ensure_wki_host_root_mount(const char* path) -> int {
         return 0;
     }
 
-    std::array<char, MAX_PATH_LEN> logical{};
-    if (strip_current_task_root_prefix(path, logical.data(), logical.size()) < 0) {
+    constexpr std::string_view WKI_PREFIX{"/wki/"};
+    auto const* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    bool const ROOT_IS_GLOBAL = task == nullptr || (task->root[0] == '/' && task->root[1] == '\0');
+    if (ROOT_IS_GLOBAL && std::strncmp(path, WKI_PREFIX.data(), WKI_PREFIX.size()) != 0) {
         return 0;
     }
 
-    constexpr std::string_view WKI_PREFIX{"/wki/"};
+    std::array<char, MAX_PATH_LEN> logical{};
+    int const STRIP_RET = ROOT_IS_GLOBAL ? copy_path_string(path, logical.data(), logical.size())
+                                         : strip_task_root_prefix(task, path, logical.data(), logical.size(), nullptr);
+    if (STRIP_RET < 0) {
+        return 0;
+    }
+
     if (std::strncmp(logical.data(), WKI_PREFIX.data(), WKI_PREFIX.size()) != 0) {
         return 0;
     }
@@ -3897,6 +5963,8 @@ auto rewrite_wki_host_alias(const ker::mod::sched::task::Task* task, const char*
     return copy_path_string(current.data(), out, out_size);
 }
 
+auto dirent_name_length(const DirEntry& entry) -> size_t;
+
 auto dir_contains_name(ker::vfs::File* file, bool has_fs_readdir, size_t fs_count, const char* name) -> bool {
     if (!has_fs_readdir || file == nullptr || file->fops == nullptr || file->fops->vfs_readdir == nullptr || name == nullptr) {
         return false;
@@ -3909,7 +5977,7 @@ auto dir_contains_name(ker::vfs::File* file, bool has_fs_readdir, size_t fs_coun
             break;
         }
 
-        size_t const PROBE_LEN = std::strlen(probe.d_name.data());
+        size_t const PROBE_LEN = dirent_name_length(probe);
         if (PROBE_LEN == NAME_LEN && std::memcmp(probe.d_name.data(), name, NAME_LEN) == 0) {
             return true;
         }
@@ -3923,6 +5991,62 @@ auto dir_contains_name(ker::vfs::File* file, bool has_fs_readdir, size_t fs_coun
     return false;
 }
 
+auto align_dirent_record_size(size_t size) -> size_t {
+    return ((size + DIRENT_RECORD_ALIGNMENT - 1) / DIRENT_RECORD_ALIGNMENT) * DIRENT_RECORD_ALIGNMENT;
+}
+
+auto dirent_presized_record_size(const DirEntry& entry) -> size_t {
+    size_t const RECORD_SIZE = entry.d_reclen;
+    if (RECORD_SIZE < DIRENT_MIN_RECLEN || RECORD_SIZE >= sizeof(DirEntry) || (RECORD_SIZE % DIRENT_RECORD_ALIGNMENT) != 0) {
+        return 0;
+    }
+    return RECORD_SIZE;
+}
+
+auto dirent_name_length(const DirEntry& entry) -> size_t {
+    size_t scan_limit = DIRENT_NAME_MAX;
+    size_t const PRESIZED_RECORD_SIZE = dirent_presized_record_size(entry);
+    if (PRESIZED_RECORD_SIZE != 0) {
+        scan_limit = std::min(scan_limit, PRESIZED_RECORD_SIZE - DIRENT_HEADER_SIZE);
+    }
+
+    for (size_t i = 0; i < scan_limit; ++i) {
+        if (entry.d_name[i] == '\0') {
+            return i;
+        }
+    }
+    return scan_limit < DIRENT_NAME_MAX && scan_limit > 0 ? scan_limit - 1 : DIRENT_NAME_MAX - 1;
+}
+
+auto copy_packed_dirent_record(const DirEntry& entry, uint8_t* dst, size_t capacity) -> size_t {
+    size_t const PRESIZED_RECORD_SIZE = dirent_presized_record_size(entry);
+    size_t const RECORD_SIZE =
+        PRESIZED_RECORD_SIZE != 0 ? PRESIZED_RECORD_SIZE : align_dirent_record_size(DIRENT_HEADER_SIZE + dirent_name_length(entry) + 1);
+    if (dst == nullptr || RECORD_SIZE > capacity) {
+        return 0;
+    }
+
+    auto const RECORD_LEN = static_cast<uint16_t>(RECORD_SIZE);
+    std::memset(dst, 0, RECORD_SIZE);
+    std::memcpy(dst + offsetof(DirEntry, d_ino), &entry.d_ino, sizeof(entry.d_ino));
+    std::memcpy(dst + offsetof(DirEntry, d_off), &entry.d_off, sizeof(entry.d_off));
+    std::memcpy(dst + offsetof(DirEntry, d_reclen), &RECORD_LEN, sizeof(RECORD_LEN));
+    std::memcpy(dst + offsetof(DirEntry, d_type), &entry.d_type, sizeof(entry.d_type));
+    size_t const NAME_BYTES = RECORD_SIZE - DIRENT_HEADER_SIZE;
+    std::memcpy(dst + DIRENT_HEADER_SIZE, entry.d_name.data(), NAME_BYTES);
+    return RECORD_SIZE;
+}
+
+#ifdef WOS_SELFTEST
+auto dirent_packed_record_size(const DirEntry& entry) -> size_t {
+    size_t const PRESIZED_RECORD_SIZE = dirent_presized_record_size(entry);
+    if (PRESIZED_RECORD_SIZE != 0) {
+        return PRESIZED_RECORD_SIZE;
+    }
+    return align_dirent_record_size(DIRENT_HEADER_SIZE + dirent_name_length(entry) + 1);
+}
+#endif
+
 // Re-apply the calling task's root prefix after following an absolute symlink.
 // Without this, absolute symlink targets (e.g. /usr/sbin) escape the pivoted
 // root and resolve against the global root instead of the task's root.
@@ -3934,7 +6058,7 @@ auto reapply_root_prefix(char* path, size_t bufsize) -> int {
     if (task == nullptr) {
         return 0;
     }
-    size_t const ROOT_LEN = std::strlen(task->root.data());
+    size_t const ROOT_LEN = task_cached_root_len(task);
     if (ROOT_LEN <= 1) {
         return 0;  // root == "/"
     }
@@ -4013,12 +6137,146 @@ auto splice_symlink_target(const char* original_path, size_t prefix_len, const c
     return canonicalize_path(out, out_size);
 }
 
-auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_policy, bool follow_final_symlink) -> int {
+auto path_is_under_mount(const MountPoint* mount, const char* path, size_t path_len) -> bool {
+    if (mount == nullptr || path == nullptr || path_len == 0) {
+        return false;
+    }
+
+    size_t const MOUNT_LEN = mount->path_len;
+    if (MOUNT_LEN == 1 && mount->path[0] == '/') {
+        return path[0] == '/';
+    }
+    if (path_len < MOUNT_LEN || std::memcmp(path, mount->path, MOUNT_LEN) != 0) {
+        return false;
+    }
+    return path_len == MOUNT_LEN || path[MOUNT_LEN] == '/';
+}
+
+auto build_readdir_child_path(const File* dir, const DirEntry& entry, std::array<char, MAX_PATH_LEN>& out, size_t* path_len_out) -> bool {
+    if (dir == nullptr || dir->vfs_path == nullptr || path_len_out == nullptr) {
+        return false;
+    }
+
+    size_t const NAME_LEN = dirent_name_length(entry);
+    if (NAME_LEN == 0 || (NAME_LEN == 1 && entry.d_name[0] == '.') || (NAME_LEN == 2 && entry.d_name[0] == '.' && entry.d_name[1] == '.')) {
+        return false;
+    }
+    for (size_t i = 0; i < NAME_LEN; ++i) {
+        if (entry.d_name[i] == '/') {
+            return false;
+        }
+    }
+
+    size_t parent_len = file_vfs_path_len(dir);
+    if (parent_len == 0 || parent_len >= MAX_PATH_LEN) {
+        return false;
+    }
+    while (parent_len > 1 && dir->vfs_path[parent_len - 1] == '/') {
+        --parent_len;
+    }
+
+    size_t const SEP_LEN = (parent_len == 1 && dir->vfs_path[0] == '/') ? 0 : 1;
+    size_t const CHILD_LEN = parent_len + SEP_LEN + NAME_LEN;
+    if (CHILD_LEN == 0 || CHILD_LEN >= out.size()) {
+        return false;
+    }
+
+    std::memcpy(out.data(), dir->vfs_path, parent_len);
+    size_t pos = parent_len;
+    if (SEP_LEN != 0) {
+        out.at(pos++) = '/';
+    }
+    std::memcpy(out.data() + pos, entry.d_name.data(), NAME_LEN);
+    out.at(CHILD_LEN) = '\0';
+    *path_len_out = CHILD_LEN;
+    return true;
+}
+
+void vfs_seed_readdir_entry_cache_hints(const File* dir, MountPoint const* mount, const DirEntry& entry, MetadataSnapshotStamp stamp) {
+    if (dir == nullptr || mount == nullptr || dir->vfs_path == nullptr || mount->fs_type != dir->fs_type ||
+        !metadata_cacheable_fs(mount->fs_type)) {
+        return;
+    }
+
+    uint8_t const ENTRY_TYPE = entry.d_type & static_cast<uint8_t>(~DT_WOSLINK);
+    if (ENTRY_TYPE == DT_UNKNOWN || ENTRY_TYPE == DT_LNK) {
+        return;
+    }
+
+    std::array<char, MAX_PATH_LEN> child_path{};
+    size_t child_path_len = 0;
+    if (!build_readdir_child_path(dir, entry, child_path, &child_path_len) ||
+        !path_is_under_mount(mount, child_path.data(), child_path_len)) {
+        return;
+    }
+
+    size_t prepared_path_len = 0;
+    uint64_t epoch = 0;
+    uint64_t invalidation_generation = 0;
+    if (!metadata_cache_prepare_path_observation(child_path.data(), mount->fs_type, stamp, &prepared_path_len, &epoch,
+                                                 &invalidation_generation, child_path_len) ||
+        prepared_path_len != child_path_len) {
+        return;
+    }
+
+    uint64_t const PATH_HASH = metadata_path_hash_raw(child_path.data(), child_path_len);
+    uint64_t const LSTAT_HASH = metadata_hash_path_from_raw(PATH_HASH, false, false, mount->fs_type, mount->dev_id);
+    uint64_t const STAT_HASH = metadata_hash_path_from_raw(PATH_HASH, true, false, mount->fs_type, mount->dev_id);
+    uint64_t const REQUIRE_DIRECTORY_HASH = metadata_hash_path_from_raw(PATH_HASH, true, true, mount->fs_type, mount->dev_id);
+    uint64_t const LSTAT_EXISTENCE_HASH = existence_hash_from_metadata_hash(LSTAT_HASH);
+    uint64_t const STAT_EXISTENCE_HASH = existence_hash_from_metadata_hash(STAT_HASH);
+    uint64_t const REQUIRE_DIRECTORY_EXISTENCE_HASH = existence_hash_from_metadata_hash(REQUIRE_DIRECTORY_HASH);
+    uint64_t const SYMLINK_HASH = symlink_hash_from_raw(PATH_HASH, mount->fs_type, mount->dev_id);
+
+    symlink_cache_store_prehashed(child_path.data(), child_path_len, mount->fs_type, mount->dev_id, -EINVAL, nullptr, 0, SYMLINK_HASH,
+                                  epoch, invalidation_generation);
+
+    bool const REQUIRE_DIRECTORY = ENTRY_TYPE == DT_DIR;
+    if (REQUIRE_DIRECTORY) {
+        metadata_cache_note_observation_store();
+    } else {
+        metadata_cache_note_metadata_store_observation();
+    }
+    if (REQUIRE_DIRECTORY) {
+        existence_cache_store_prehashed(child_path.data(), child_path_len, mount->fs_type, mount->dev_id, true, 0,
+                                        REQUIRE_DIRECTORY_EXISTENCE_HASH, epoch, stamp.mount_generation, invalidation_generation, false);
+        symlink_prefix_cache_store_prehashed(child_path.data(), child_path_len, mount,
+                                             symlink_prefix_hash_from_symlink_hash(SYMLINK_HASH, stamp.mount_generation), epoch,
+                                             stamp.mount_generation, invalidation_generation);
+        existence_cache_store_prehashed(child_path.data(), child_path_len, mount->fs_type, mount->dev_id, false, 0, LSTAT_EXISTENCE_HASH,
+                                        epoch, stamp.mount_generation, invalidation_generation, false, false);
+        existence_cache_store_prehashed(child_path.data(), child_path_len, mount->fs_type, mount->dev_id, false, 0, STAT_EXISTENCE_HASH,
+                                        epoch, stamp.mount_generation, invalidation_generation, false);
+    } else {
+        existence_cache_store_prehashed(child_path.data(), child_path_len, mount->fs_type, mount->dev_id, false, 0, LSTAT_EXISTENCE_HASH,
+                                        epoch, stamp.mount_generation, invalidation_generation, false, false);
+        existence_cache_store_prehashed(child_path.data(), child_path_len, mount->fs_type, mount->dev_id, false, 0, STAT_EXISTENCE_HASH,
+                                        epoch, stamp.mount_generation, invalidation_generation, false);
+        metadata_cache_store_require_directory_enotdir_prehashed(child_path.data(), child_path_len, mount->fs_type, mount->dev_id,
+                                                                 REQUIRE_DIRECTORY_HASH, REQUIRE_DIRECTORY_EXISTENCE_HASH, epoch,
+                                                                 stamp.mount_generation, invalidation_generation, false);
+    }
+}
+
+auto readlink_resolved_on_mount(const char* abs_path, char* buf, size_t bufsize, MountPoint const* mount,
+                                size_t known_abs_path_len = UNKNOWN_PATH_LEN, uint64_t known_abs_path_hash = UNKNOWN_PATH_HASH) -> ssize_t;
+
+auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_policy, bool follow_final_symlink,
+                                 MountPoint const* current_path_mount, size_t known_path_len = UNKNOWN_PATH_LEN) -> int {
     if (path == nullptr || bufsize == 0) {
         return -EINVAL;
     }
 
-    for (size_t end = 1;; ++end) {
+    size_t clean_prefix_len = 0;
+    size_t scan_start = 1;
+    size_t const CACHED_PREFIX_LEN = symlink_prefix_cache_lookup(path, known_path_len, current_path_mount);
+    if (CACHED_PREFIX_LEN > 1 && CACHED_PREFIX_LEN < known_path_len && path[CACHED_PREFIX_LEN] == '/') {
+        clean_prefix_len = CACHED_PREFIX_LEN;
+        scan_start = CACHED_PREFIX_LEN + 1;
+    }
+
+    std::array<char, MAX_PATH_LEN> linkbuf{};
+    for (size_t end = scan_start;; ++end) {
         char const CH = path[end];
         if (CH != '/' && CH != '\0') {
             continue;
@@ -4033,16 +6291,17 @@ auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_pol
             break;
         }
 
-        std::array<char, MAX_PATH_LEN> prefix{};
-        if (end + 1 > prefix.size()) {
+        if (end + 1 > bufsize) {
             return -ENAMETOOLONG;
         }
-        std::memcpy(prefix.data(), path, end);
-        prefix[end] = '\0';
 
-        std::array<char, MAX_PATH_LEN> linkbuf{};
-        ssize_t const LINK_LEN = readlink_resolved(prefix.data(), linkbuf.data(), linkbuf.size() - 1);
+        path[end] = '\0';
+        ssize_t const LINK_LEN = path_is_under_mount(current_path_mount, path, end)
+                                     ? readlink_resolved_on_mount(path, linkbuf.data(), linkbuf.size() - 1, current_path_mount, end)
+                                     : readlink_resolved(path, linkbuf.data(), linkbuf.size() - 1, end);
+        path[end] = CH;
         if (LINK_LEN > 0) {
+            symlink_prefix_cache_store(path, clean_prefix_len, current_path_mount);
             linkbuf[LINK_LEN] = '\0';
 
             std::array<char, MAX_PATH_LEN> substituted{};
@@ -4074,11 +6333,21 @@ auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_pol
             return 1;
         }
 
+        if (CH != '\0' && (LINK_LEN == -ENOENT || LINK_LEN == -ENOTDIR)) {
+            symlink_prefix_cache_store(path, clean_prefix_len, current_path_mount);
+            return static_cast<int>(LINK_LEN);
+        }
+
+        if (CH != '\0') {
+            clean_prefix_len = end;
+        }
+
         if (CH == '\0') {
             break;
         }
     }
 
+    symlink_prefix_cache_store(path, clean_prefix_len, current_path_mount);
     return 0;
 }
 
@@ -4153,7 +6422,7 @@ auto apply_task_vfs_route(const ker::mod::sched::task::Task* task, const char* p
         return copy_path_string(routed.data(), out, out_size);
     }
 
-    size_t const ROOT_LEN = std::strlen(task->root.data());
+    size_t const ROOT_LEN = task_cached_root_len(task);
     if (ROOT_LEN <= 1) {
         return copy_path_string(routed.data(), out, out_size);
     }
@@ -4190,9 +6459,13 @@ auto normalize_task_path_inplace_with_route(char* path, size_t bufsize, bool app
         return 0;
     }
 
-    std::array<char, MAX_PATH_LEN> routed{};
     ker::mod::sched::task::Task const* current_task =
         ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (task_vfs_route_is_common_local_noop(current_task, path)) {
+        return 0;
+    }
+
+    std::array<char, MAX_PATH_LEN> routed{};
     int const ROUTE_RESULT = apply_task_vfs_route(current_task, path, routed.data(), routed.size());
     if (ROUTE_RESULT < 0) {
         return ROUTE_RESULT;
@@ -4205,19 +6478,27 @@ auto resolve_task_path_raw(const char* path, char* out, size_t outsize) -> int {
     return resolve_task_path_raw_impl(path, out, outsize, true);
 }
 
-auto resolve_task_path_raw_impl(const char* path, char* out, size_t outsize, bool apply_task_route) -> int {
-    int const ABSOLUTE = make_absolute(path, out, outsize);
-    if (ABSOLUTE < 0) {
-        return ABSOLUTE;
+auto finish_canonical_task_path_raw(char* out, size_t outsize, bool apply_task_route, size_t known_path_len = UNKNOWN_PATH_LEN,
+                                    size_t* out_len = nullptr, uint64_t* out_hash = nullptr) -> int {
+    if (out_hash != nullptr) {
+        *out_hash = UNKNOWN_PATH_HASH;
+    }
+    if (out == nullptr || outsize == 0) {
+        return -EINVAL;
     }
 
-    // Canonicalize before applying the per-task root prefix. If we prepend
-    // first, paths like "/.." become "/rootfs/.." and collapse to "/",
-    // escaping the pivot_root namespace.
-    int const CANONICAL = canonicalize_path(out, outsize);
-    if (CANONICAL < 0) {
-        return CANONICAL;
-    }
+    size_t path_len = known_path_len;
+    auto finish_len_and_hash = [&]() {
+        if (path_len == UNKNOWN_PATH_LEN) {
+            path_len = std::strlen(out);
+        }
+        if (out_len != nullptr) {
+            *out_len = path_len;
+        }
+        if (out_hash != nullptr) {
+            *out_hash = metadata_path_hash_known_len(out, path_len);
+        }
+    };
 
     // Prepend per-process root prefix when it differs from "/".
     // This makes pivot_root transparent: after pivot_root("/rootfs", ...),
@@ -4225,20 +6506,80 @@ auto resolve_task_path_raw_impl(const char* path, char* out, size_t outsize, boo
     if (ker::mod::sched::can_query_current_task()) {
         auto* task = ker::mod::sched::get_current_task();
         if (task != nullptr) {
-            size_t const ROOT_LEN = std::strlen(task->root.data());
+            size_t const ROOT_LEN = task_cached_root_len(task);
             if (ROOT_LEN > 1) {  // root != "/"
-                size_t const PATH_LEN = std::strlen(out);
-                if (ROOT_LEN + PATH_LEN + 1 > outsize) {
+                if (path_len == UNKNOWN_PATH_LEN) {
+                    path_len = std::strlen(out);
+                }
+                if (ROOT_LEN + path_len + 1 > outsize) {
                     return -ENAMETOOLONG;
                 }
-                // Shift existing path right to make room for root prefix
-                std::memmove(out + ROOT_LEN, out, PATH_LEN + 1);
+                std::memmove(out + ROOT_LEN, out, path_len + 1);
                 std::memcpy(out, task->root.data(), ROOT_LEN);
+                path_len += ROOT_LEN;
             }
         }
     }
 
-    return normalize_task_path_inplace_with_route(out, outsize, apply_task_route);
+    if (!apply_task_route) {
+        finish_len_and_hash();
+        return 0;
+    }
+
+    ker::mod::sched::task::Task const* current_task =
+        ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (task_vfs_route_is_common_local_noop(current_task, out)) {
+        finish_len_and_hash();
+        return 0;
+    }
+
+    std::array<char, MAX_PATH_LEN> routed{};
+    int const ROUTE_RESULT = apply_task_vfs_route(current_task, out, routed.data(), routed.size());
+    if (ROUTE_RESULT < 0) {
+        return ROUTE_RESULT;
+    }
+
+    size_t routed_len = UNKNOWN_PATH_LEN;
+    int const COPY_RESULT = copy_path_string(routed.data(), out, outsize, UNKNOWN_PATH_LEN, &routed_len);
+    if (COPY_RESULT == 0) {
+        path_len = routed_len;
+        finish_len_and_hash();
+    }
+    return COPY_RESULT;
+}
+
+auto resolve_task_path_raw_impl(const char* path, char* out, size_t outsize, bool apply_task_route, size_t* resolved_len_out,
+                                uint64_t* resolved_hash_out) -> int {
+    if (resolved_hash_out != nullptr) {
+        *resolved_hash_out = UNKNOWN_PATH_HASH;
+    }
+    int const FAST_RET =
+        resolve_task_path_raw_common_local_fast_path(path, out, outsize, apply_task_route, resolved_len_out, resolved_hash_out);
+    if (FAST_RET == 0) {
+        return 0;
+    }
+    if (FAST_RET < 0) {
+        return FAST_RET;
+    }
+
+    size_t out_len = UNKNOWN_PATH_LEN;
+    int const ABSOLUTE = make_absolute(path, out, outsize, &out_len);
+    if (ABSOLUTE < 0) {
+        return ABSOLUTE;
+    }
+
+    // Canonicalize before applying the per-task root prefix. If we prepend
+    // first, paths like "/.." become "/rootfs/.." and collapse to "/",
+    // escaping the pivot_root namespace.
+    if (path_text_needs_canonicalize(out, out_len)) {
+        int const CANONICAL = canonicalize_path(out, outsize);
+        if (CANONICAL < 0) {
+            return CANONICAL;
+        }
+        out_len = UNKNOWN_PATH_LEN;
+    }
+
+    return finish_canonical_task_path_raw(out, outsize, apply_task_route, out_len, resolved_len_out, resolved_hash_out);
 }
 
 auto add_default_vfs_rule(const char* prefix, uint8_t route) -> int {
@@ -4383,7 +6724,7 @@ void load_vfs_rules_from_buffer(char* buffer) {
 // Convert a possibly-relative path to an absolute path by prepending CWD.
 // If the path is already absolute, copies it as-is.
 // Returns 0 on success, negative on error.
-auto make_absolute(const char* path, char* out, size_t outsize) -> int {
+auto make_absolute(const char* path, char* out, size_t outsize, size_t* out_len) -> int {
     if (path == nullptr || out == nullptr || outsize == 0) {
         return -EINVAL;
     }
@@ -4397,6 +6738,9 @@ auto make_absolute(const char* path, char* out, size_t outsize) -> int {
             return -ENAMETOOLONG;
         }
         std::memcpy(out, path, PLEN + 1);
+        if (out_len != nullptr) {
+            *out_len = PLEN;
+        }
         return 0;
     }
 
@@ -4406,7 +6750,7 @@ auto make_absolute(const char* path, char* out, size_t outsize) -> int {
         return -ESRCH;
     }
 
-    size_t const CWDLEN = std::strlen(task->cwd.data());
+    size_t const CWDLEN = task_cached_cwd_len(task);
     // Need: cwd + "/" + path + '\0'
     bool const NEED_SEP = (CWDLEN > 1);  // Root "/" doesn't need extra /
     size_t const TOTAL = CWDLEN + (NEED_SEP ? 1 : 0) + PLEN + 1;
@@ -4421,6 +6765,9 @@ auto make_absolute(const char* path, char* out, size_t outsize) -> int {
     } else {
         std::memcpy(out + CWDLEN, path, PLEN + 1);
     }
+    if (out_len != nullptr) {
+        *out_len = TOTAL - 1;
+    }
     return 0;
 }
 
@@ -4430,6 +6777,50 @@ auto make_absolute(const char* path, char* out, size_t outsize) -> int {
 auto canonicalize_path(char* path, size_t bufsize) -> int {
     if (path == nullptr || bufsize == 0 || path[0] != '/') {
         return -EINVAL;
+    }
+
+    bool needs_rewrite = false;
+    bool in_component = false;
+    size_t component_start = 0;
+    size_t component_count = 0;
+    size_t path_len = 0;
+    auto finish_component = [&](size_t end) {
+        size_t const COMPONENT_LEN = end - component_start;
+        component_count++;
+        if ((COMPONENT_LEN == 1 && path[component_start] == '.') ||
+            (COMPONENT_LEN == 2 && path[component_start] == '.' && path[component_start + 1] == '.')) {
+            needs_rewrite = true;
+        }
+    };
+
+    for (; path_len < bufsize && path[path_len] != '\0'; ++path_len) {
+        if (path[path_len] == '/') {
+            if (path_len > 0 && path[path_len - 1] == '/') {
+                needs_rewrite = true;
+            }
+            if (in_component) {
+                finish_component(path_len);
+                in_component = false;
+            }
+            continue;
+        }
+
+        if (!in_component) {
+            in_component = true;
+            component_start = path_len;
+        }
+    }
+    if (path_len == bufsize) {
+        return -ENAMETOOLONG;
+    }
+    if (in_component) {
+        finish_component(path_len);
+    }
+    if (path_len > 1 && path[path_len - 1] == '/') {
+        needs_rewrite = true;
+    }
+    if (!needs_rewrite) {
+        return component_count > MAX_COMPONENTS ? -ENAMETOOLONG : 0;
     }
 
     // Split into components, resolving . and ..
@@ -4510,16 +6901,35 @@ auto canonicalize_path(char* path, size_t bufsize) -> int {
 // Resolve symlinks in a path. The resolved path is written to resolved_buf.
 // Returns 0 on success, -ELOOP on too many symlinks, or another negative errno.
 auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool apply_task_policy = false,
-                      bool follow_final_symlink = true) -> int {
+                      bool follow_final_symlink = true, size_t known_path_len = UNKNOWN_PATH_LEN, size_t* resolved_len_out = nullptr)
+    -> int {
     if (path == nullptr || resolved_buf == nullptr || bufsize == 0) {
         return -EINVAL;
     }
 
-    // Copy initial path to working buffer
     size_t path_len = 0;
-    while (path[path_len] != '\0' && path_len < bufsize - 1) {
-        resolved_buf[path_len] = path[path_len];
-        path_len++;
+    bool path_len_known = false;
+    auto finish_success = [&]() -> int {
+        if (resolved_len_out != nullptr) {
+            *resolved_len_out = path_len_known ? path_len : std::strlen(resolved_buf);
+        }
+        return 0;
+    };
+
+    // Copy initial path to working buffer
+    if (known_path_len != UNKNOWN_PATH_LEN) {
+        if (known_path_len >= bufsize) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(resolved_buf, path, known_path_len);
+        path_len = known_path_len;
+        path_len_known = true;
+    } else {
+        while (path[path_len] != '\0' && path_len < bufsize - 1) {
+            resolved_buf[path_len] = path[path_len];
+            path_len++;
+        }
+        path_len_known = true;
     }
     resolved_buf[path_len] = '\0';
 
@@ -4528,46 +6938,38 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
         if (NORMALIZE < 0) {
             return NORMALIZE;
         }
+        path_len = std::strlen(resolved_buf);
+        path_len_known = true;
     }
 
     for (int depth = 0; depth < MAX_SYMLINK_DEPTH; ++depth) {
-        int const PREFIX_RESULT = resolve_prefix_symlink_once(resolved_buf, bufsize, apply_task_policy, follow_final_symlink);
+        auto mount_ref = find_mount_point(resolved_buf, path_len_known ? path_len : UNKNOWN_PATH_LEN);
+        MountPoint const* mount = mount_ref.get();
+        int const PREFIX_RESULT = resolve_prefix_symlink_once(resolved_buf, bufsize, apply_task_policy, follow_final_symlink, mount,
+                                                              path_len_known ? path_len : UNKNOWN_PATH_LEN);
         if (PREFIX_RESULT < 0) {
             return PREFIX_RESULT;
         }
         if (PREFIX_RESULT > 0) {
+            path_len = std::strlen(resolved_buf);
+            path_len_known = true;
             continue;
         }
         if (!follow_final_symlink) {
-            return 0;
+            return finish_success();
         }
 
-        auto mount_ref = find_mount_point(resolved_buf);
-        MountPoint const* mount = mount_ref.get();
         if (mount == nullptr) {
-            return 0;
+            return finish_success();
         }
 
         if (mount->fs_type == FSType::PROCFS) {
             // Handle procfs symlinks (e.g., /proc/self -> /proc/<pid>)
-            size_t mount_len = 0;
-            while (mount->path[mount_len] != '\0') {
-                mount_len++;
-            }
-            const char* fs_path = resolved_buf;
-            if (mount_len == 1 && mount->path[0] == '/') {
-                fs_path = resolved_buf + 1;
-            } else if (resolved_buf[mount_len] == '/') {
-                fs_path = resolved_buf + mount_len + 1;
-            } else if (resolved_buf[mount_len] == '\0') {
-                fs_path = "";
-            } else {
-                fs_path = resolved_buf + mount_len;
-            }
+            const char* fs_path = strip_mount_prefix(mount, resolved_buf);
 
             auto* f = ker::vfs::procfs::procfs_open_path(fs_path, 0, 0);
             if (f == nullptr) {
-                return 0;
+                return finish_success();
             }
             auto* pfd = static_cast<ker::vfs::procfs::ProcFileData*>(f->private_data);
             bool const IS_SYMLINK = (pfd != nullptr && (pfd->node.type == ker::vfs::procfs::ProcNodeType::SELF_LINK ||
@@ -4578,14 +6980,14 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
             if (!IS_SYMLINK) {
                 ker::vfs::procfs::get_procfs_fops()->vfs_close(f);
                 delete f;
-                return 0;
+                return finish_success();
             }
             std::array<char, MAX_PATH_LEN> linkbuf{};
             ssize_t const LINK_LEN = ker::vfs::procfs::get_procfs_fops()->vfs_readlink(f, linkbuf.data(), linkbuf.size());
             ker::vfs::procfs::get_procfs_fops()->vfs_close(f);
             delete f;
             if (LINK_LEN <= 0) {
-                return 0;
+                return finish_success();
             }
             linkbuf[static_cast<size_t>(LINK_LEN)] = '\0';
             if (linkbuf[0] == '/') {
@@ -4593,10 +6995,13 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
                     return -ENAMETOOLONG;
                 }
                 std::memcpy(resolved_buf, linkbuf.data(), static_cast<size_t>(LINK_LEN) + 1);
+                path_len = static_cast<size_t>(LINK_LEN);
+                path_len_known = true;
                 int const RR = reapply_root_prefix(resolved_buf, bufsize);
                 if (RR < 0) {
                     return RR;
                 }
+                path_len_known = false;
             } else {
                 size_t last_slash = 0;
                 bool found_slash = false;
@@ -4615,42 +7020,32 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
                 std::memcpy(new_path.data() + PREFIX_LEN, linkbuf.data(), static_cast<size_t>(LINK_LEN));
                 new_path[PREFIX_LEN + static_cast<size_t>(LINK_LEN)] = '\0';
                 std::memcpy(resolved_buf, new_path.data(), PREFIX_LEN + static_cast<size_t>(LINK_LEN) + 1);
+                path_len = PREFIX_LEN + static_cast<size_t>(LINK_LEN);
+                path_len_known = true;
             }
             if (apply_task_policy) {
                 int const NORMALIZE = normalize_task_path_inplace(resolved_buf, bufsize);
                 if (NORMALIZE < 0) {
                     return NORMALIZE;
                 }
+                path_len_known = false;
             }
             continue;  // re-resolve after substitution
         }
 
         // Remote mounts: ask the server to resolve symlinks
         if (mount->fs_type == FSType::REMOTE) {
-            size_t mount_len = 0;
-            while (mount->path[mount_len] != '\0') {
-                mount_len++;
-            }
-            const char* fs_path = resolved_buf;
-            if (mount_len == 1 && mount->path[0] == '/') {
-                fs_path = resolved_buf + 1;
-            } else if (resolved_buf[mount_len] == '/') {
-                fs_path = resolved_buf + mount_len + 1;
-            } else if (resolved_buf[mount_len] == '\0') {
-                fs_path = "";
-            } else {
-                fs_path = resolved_buf + mount_len;
-            }
+            const char* fs_path = strip_mount_prefix(mount, resolved_buf);
 
             if (fs_path[0] == '\0') {
-                return 0;
+                return finish_success();
             }
 
             std::array<char, MAX_PATH_LEN> linkbuf{};
             ssize_t const LINK_LEN =
                 ker::net::wki::wki_remote_vfs_readlink_path(mount->private_data, fs_path, linkbuf.data(), linkbuf.size() - 1);
             if (LINK_LEN <= 0) {
-                return 0;  // Not a symlink or readlink failed - resolution complete
+                return finish_success();  // Not a symlink or readlink failed - resolution complete
             }
             linkbuf[static_cast<size_t>(LINK_LEN)] = '\0';
 
@@ -4660,10 +7055,13 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
                     return -ENAMETOOLONG;
                 }
                 std::memcpy(resolved_buf, linkbuf.data(), static_cast<size_t>(LINK_LEN) + 1);
+                path_len = static_cast<size_t>(LINK_LEN);
+                path_len_known = true;
                 int const RR = reapply_root_prefix(resolved_buf, bufsize);
                 if (RR < 0) {
                     return RR;
                 }
+                path_len_known = false;
             } else {
                 // Relative symlink target - replace last component
                 size_t last_slash = 0;
@@ -4683,12 +7081,15 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
                 std::memcpy(new_path.data() + PREFIX_LEN, linkbuf.data(), static_cast<size_t>(LINK_LEN));
                 new_path[PREFIX_LEN + static_cast<size_t>(LINK_LEN)] = '\0';
                 std::memcpy(resolved_buf, new_path.data(), PREFIX_LEN + static_cast<size_t>(LINK_LEN) + 1);
+                path_len = PREFIX_LEN + static_cast<size_t>(LINK_LEN);
+                path_len_known = true;
             }
             if (apply_task_policy) {
                 int const NORMALIZE = normalize_task_path_inplace(resolved_buf, bufsize);
                 if (NORMALIZE < 0) {
                     return NORMALIZE;
                 }
+                path_len_known = false;
             }
             continue;  // Re-resolve after substitution
         }
@@ -4697,44 +7098,29 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
         // readlink_resolved(). Avoid immediately reopening the same path for
         // another negative readlink probe on common non-symlink files.
         if (mount->fs_type == FSType::XFS) {
-            return 0;
+            return finish_success();
         }
 
         // The remaining legacy final-node walk is only for tmpfs. Other local
         // final symlinks are resolved by the prefix pass above.
         if (mount->fs_type != FSType::TMPFS) {
-            return 0;
+            return finish_success();
         }
 
-        // Strip mount prefix to get fs-relative path
-        size_t mount_len = 0;
-        while (mount->path[mount_len] != '\0') {
-            mount_len++;
-        }
-
-        const char* fs_path = resolved_buf;
-        if (mount_len == 1 && mount->path[0] == '/') {
-            fs_path = resolved_buf + 1;
-        } else if (resolved_buf[mount_len] == '/') {
-            fs_path = resolved_buf + mount_len + 1;
-        } else if (resolved_buf[mount_len] == '\0') {
-            fs_path = "";
-        } else {
-            fs_path = resolved_buf + mount_len;
-        }
+        const char* fs_path = strip_mount_prefix(mount, resolved_buf);
 
         // Walk the tmpfs path to find the node
         auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, false);
         if (node == nullptr) {
-            return 0;  // Path doesn't exist yet (might be created with O_CREAT)
+            return finish_success();  // Path doesn't exist yet (might be created with O_CREAT)
         }
         node = ker::vfs::tmpfs::tmpfs_canonical_node(node);
         if (node == nullptr) {
-            return 0;
+            return finish_success();
         }
 
         if (node->type != ker::vfs::tmpfs::TmpNodeType::SYMLINK) {
-            return 0;  // Not a symlink, resolution complete
+            return finish_success();  // Not a symlink, resolution complete
         }
 
         if (node->symlink_target == nullptr) {
@@ -4754,10 +7140,13 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
                 return -ENAMETOOLONG;
             }
             std::memcpy(resolved_buf, node->symlink_target, target_len + 1);
+            path_len = target_len;
+            path_len_known = true;
             int const RR = reapply_root_prefix(resolved_buf, bufsize);
             if (RR < 0) {
                 return RR;
             }
+            path_len_known = false;
         } else {
             // Relative symlink target - replace last component
             size_t last_slash = 0;
@@ -4777,6 +7166,8 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
             std::memcpy(new_path.data() + PREFIX_LEN, node->symlink_target, target_len);
             new_path[PREFIX_LEN + target_len] = '\0';
             std::memcpy(resolved_buf, new_path.data(), PREFIX_LEN + target_len + 1);
+            path_len = PREFIX_LEN + target_len;
+            path_len_known = true;
         }
 
         if (apply_task_policy) {
@@ -4784,19 +7175,48 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
             if (NORMALIZE < 0) {
                 return NORMALIZE;
             }
+            path_len_known = false;
         }
     }
 
     return -ELOOP;
 }
 
-auto vfs_try_open_procfs_fd_link(const char* path, bool apply_task_policy) -> File* {
+auto procfs_fd_link_prefix_probe_needed(const char* path, size_t known_path_len, MountPoint const* mount) -> bool {
+    if (path == nullptr || mount == nullptr || known_path_len == UNKNOWN_PATH_LEN || known_path_len == 0 ||
+        known_path_len >= MAX_PATH_LEN || path[0] != '/') {
+        return true;
+    }
+    if (mount->fs_type == FSType::PROCFS) {
+        return true;
+    }
+
+    size_t const PARENT_LEN = metadata_parent_path_len(path, known_path_len);
+    if (PARENT_LEN <= 1) {
+        return false;
+    }
+
+    return symlink_prefix_cache_lookup_with_parent(path, known_path_len, PARENT_LEN, mount) < PARENT_LEN;
+}
+
+auto vfs_try_open_procfs_fd_link(const char* path, bool apply_task_policy, MountPoint const* initial_mount = nullptr,
+                                 size_t known_path_len = UNKNOWN_PATH_LEN) -> File* {
     if (path == nullptr) {
         return nullptr;
     }
 
+    if (initial_mount != nullptr && initial_mount->fs_type == FSType::PROCFS) {
+        const char* fs_relative_path = strip_mount_prefix(initial_mount, path);
+        if (auto* file = ker::vfs::procfs::procfs_open_fd_link_path(fs_relative_path); file != nullptr) {
+            return file;
+        }
+    } else if (!procfs_fd_link_prefix_probe_needed(path, known_path_len, initial_mount)) {
+        return nullptr;
+    }
+
     std::array<char, MAX_PATH_LEN> prefix_resolved{};
-    int const RESOLVE_RET = resolve_symlinks(path, prefix_resolved.data(), prefix_resolved.size(), apply_task_policy, false);
+    int const RESOLVE_RET =
+        resolve_symlinks(path, prefix_resolved.data(), prefix_resolved.size(), apply_task_policy, false, known_path_len);
     if (RESOLVE_RET != 0) {
         return nullptr;
     }
@@ -4812,117 +7232,319 @@ auto vfs_try_open_procfs_fd_link(const char* path, bool apply_task_policy) -> Fi
 }
 }  // namespace
 
-auto vfs_open(std::string_view path, int flags, int mode) -> int {
-    vfs_debug_log("vfs_open: opening file\n");
-    bool const OPEN_LOCAL = (flags & ker::vfs::O_LOCAL) != 0;
+#ifdef WOS_SELFTEST
+auto vfs_selftest_path_text_scan_matches_helpers() -> bool {
+    constexpr const char* CASES[] = {
+        "", "/", "///", "/tmp", "/tmp/", "tmp/file", "tmp/file/", "/tmp//file", "tmp/../file", "./file", "a/.", "a/..", "a/b/c",
+    };
 
-    // Apply umask on creation
-    if ((flags & ker::vfs::O_CREAT) != 0) {
-        auto* task = ker::mod::sched::get_current_task();
-        if (task != nullptr) {
-            mode = mode & ~static_cast<int>(task->umask);
+    for (const char* path : CASES) {
+        PathTextScan const SCAN = scan_path_text(path);
+        size_t const PATH_LEN = std::strlen(path);
+        if (SCAN.path_len != PATH_LEN || SCAN.requires_directory != path_requires_directory(path, PATH_LEN) ||
+            SCAN.needs_canonicalize != path_text_needs_canonicalize(path, PATH_LEN)) {
+            return false;
         }
     }
 
-    // Convert string_view to null-terminated string
-    std::array<char, MAX_PATH_LEN> raw_path{};
-    if (path.size() >= MAX_PATH_LEN) {
-        return -ENAMETOOLONG;
-    }
-    std::memcpy(raw_path.data(), path.data(), path.size());
-    raw_path[path.size()] = '\0';
+    PathTextScan const NULL_SCAN = scan_path_text(nullptr);
+    return NULL_SCAN.path_len == 0 && !NULL_SCAN.requires_directory && NULL_SCAN.needs_canonicalize;
+}
 
-    bool const PATH_REQUIRES_DIRECTORY = path_requires_directory(raw_path.data());
-    bool const FLAGS_REQUIRE_DIRECTORY = (flags & ker::vfs::O_DIRECTORY) != 0;
-    if (FLAGS_REQUIRE_DIRECTORY && (flags & ker::vfs::O_CREAT) != 0) {
-        return -EINVAL;
-    }
-    int backend_flags = flags;
-    if (PATH_REQUIRES_DIRECTORY) {
-        backend_flags &= ~ker::vfs::O_CREAT;
+auto vfs_selftest_wki_host_root_mount_gate_matches_task_root() -> bool {
+    ker::mod::sched::task::Task global_root_task{};
+    if (copy_path_string("/", global_root_task.root.data(), global_root_task.root.size()) < 0) {
+        return false;
     }
 
-    std::array<char, MAX_PATH_LEN> path_buffer{};
-    // NOLINTNEXTLINE(readability-suspicious-call-argument)
-    if (resolve_task_path_raw_impl(raw_path.data(), path_buffer.data(), MAX_PATH_LEN, !OPEN_LOCAL) < 0) {
-        log_loader_path_event("resolve-failed", raw_path.data(), nullptr, nullptr, -ENOENT);
-        return -ENOENT;
+    bool ok = !resolved_path_may_need_wki_host_root_mount_for_task(&global_root_task, "/tmp/file");
+    ok = ok && !resolved_path_may_need_wki_host_root_mount_for_task(&global_root_task, "/wki");
+    ok = ok && !resolved_path_may_need_wki_host_root_mount_for_task(&global_root_task, "/wki/");
+    ok = ok && resolved_path_may_need_wki_host_root_mount_for_task(&global_root_task, "/wki/node");
+    ok = ok && resolved_path_may_need_wki_host_root_mount_for_task(&global_root_task, "/wki/node/file");
+
+    ker::mod::sched::task::Task rooted_task{};
+    if (copy_path_string("/rootfs", rooted_task.root.data(), rooted_task.root.size()) < 0) {
+        return false;
     }
 
-    ensure_wki_host_root_mount(path_buffer.data());
-    log_loader_path_event("resolved", raw_path.data(), path_buffer.data(), nullptr, 0);
+    ok = ok && !resolved_path_may_need_wki_host_root_mount_for_task(&rooted_task, "/rootfs/tmp/file");
+    ok = ok && !resolved_path_may_need_wki_host_root_mount_for_task(&rooted_task, "/rootfs/wki");
+    ok = ok && !resolved_path_may_need_wki_host_root_mount_for_task(&rooted_task, "/rootfs/wki/");
+    ok = ok && resolved_path_may_need_wki_host_root_mount_for_task(&rooted_task, "/rootfs/wki/node");
+    ok = ok && resolved_path_may_need_wki_host_root_mount_for_task(&rooted_task, "/rootfs/wki/node/file");
+    ok = ok && resolved_path_may_need_wki_host_root_mount_for_task(&rooted_task, "/wki/node/file");
+    ok = ok && !resolved_path_may_need_wki_host_root_mount_for_task(&rooted_task, "/rootfs2/wki/node/file");
 
-    // Remote mounts resolve symlinks on the server side during the actual open.
-    // Avoid probing each path component with client-side READLINK RPCs here:
-    // they are redundant and can fail independently of the real open.
-    auto mount_ref = find_mount_point(path_buffer.data());
-    MountPoint const* mount = mount_ref.get();
-    bool const REMOTE_MOUNT = (mount != nullptr && mount->fs_type == FSType::REMOTE);
+    ker::mod::sched::task::Task wki_root_task{};
+    if (copy_path_string("/wki/node", wki_root_task.root.data(), wki_root_task.root.size()) < 0) {
+        return false;
+    }
 
-    bool const SKIP_FINAL_SYMLINK_PROBE = mount != nullptr && !REMOTE_MOUNT && !PATH_REQUIRES_DIRECTORY && !FLAGS_REQUIRE_DIRECTORY &&
-                                          metadata_cache_proves_final_not_symlink(path_buffer.data(), mount->fs_type, mount->dev_id);
+    ok = ok && !resolved_path_may_need_wki_host_root_mount_for_task(&wki_root_task, "/wki/node/tmp/file");
+    ok = ok && resolved_path_may_need_wki_host_root_mount_for_task(&wki_root_task, "/wki/other/tmp/file");
+    return ok;
+}
 
-    auto* current = ker::mod::sched::get_current_task();
-    if (current == nullptr) {
+auto vfs_selftest_resolved_wki_entry_uses_task_root_view() -> bool {
+    ker::mod::sched::task::Task global_root_task{};
+    if (copy_path_string("/", global_root_task.root.data(), global_root_task.root.size()) < 0) {
+        return false;
+    }
+
+    bool ok = !resolved_task_path_is_wki_entry(&global_root_task, "/tmp/file");
+    ok = ok && resolved_task_path_is_wki_entry(&global_root_task, "/wki");
+    ok = ok && resolved_task_path_is_wki_entry(&global_root_task, "/wki/node");
+    ok = ok && !resolved_task_path_is_wki_entry(&global_root_task, "/wki/node/file");
+
+    ker::mod::sched::task::Task rooted_task{};
+    if (copy_path_string("/rootfs", rooted_task.root.data(), rooted_task.root.size()) < 0) {
+        return false;
+    }
+
+    ok = ok && !resolved_task_path_is_wki_entry(&rooted_task, "/rootfs");
+    ok = ok && !resolved_task_path_is_wki_entry(&rooted_task, "/rootfs/tmp/file");
+    ok = ok && resolved_task_path_is_wki_entry(&rooted_task, "/rootfs/wki");
+    ok = ok && resolved_task_path_is_wki_entry(&rooted_task, "/rootfs/wki/node");
+    ok = ok && !resolved_task_path_is_wki_entry(&rooted_task, "/rootfs/wki/node/file");
+    ok = ok && resolved_task_path_is_wki_entry(&rooted_task, "/wki/node");
+    ok = ok && !resolved_task_path_is_wki_entry(&rooted_task, "/rootfs2/wki/node");
+    return ok;
+}
+#endif
+
+namespace {
+auto resolve_dirfd_task_path_raw(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, char* out, size_t outsize,
+                                 bool apply_task_route = true, bool* path_requires_directory_out = nullptr,
+                                 size_t* resolved_len_out = nullptr, bool* common_local_fast_path_out = nullptr,
+                                 uint64_t* resolved_hash_out = nullptr, bool* trusted_dirfd_parent_out = nullptr) -> int;
+auto resolve_dirfd_task_path_raw_with_absolute_local_fast_path(ker::mod::sched::task::Task* task, int dirfd, const char* pathname,
+                                                               char* out, size_t outsize, bool apply_task_route = true,
+                                                               bool* path_requires_directory_out = nullptr,
+                                                               size_t* resolved_len_out = nullptr, uint64_t* resolved_hash_out = nullptr)
+    -> int;
+auto metadata_cache_lookup_mount_stat(const char* resolved_path, MountPoint const* mount, bool follow_final_symlink, bool require_directory,
+                                      Stat* statbuf, size_t known_path_len = UNKNOWN_PATH_LEN,
+                                      uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH) -> int;
+auto vfs_pre_symlink_negative_existence_result(const char* current_path, MountPoint const* mount, bool follow_final_symlink,
+                                               bool require_directory, size_t current_path_len,
+                                               uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH) -> int;
+
+auto vfs_open_cacheable_metadata_failure(int result) -> bool { return result == -ENOENT || result == -ENOTDIR; }
+
+auto vfs_open_missing_metadata_cacheable(int flags) -> bool {
+    int const ACCMODE = flags & O_ACCMODE_MASK;
+    return ACCMODE == O_RDONLY_MODE && (flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC | ker::vfs::O_NO_CACHE)) == 0;
+}
+
+auto vfs_open_missing_existence_result(const char* resolved_path, MountPoint const* mount, int flags, bool require_directory,
+                                       size_t known_path_len = UNKNOWN_PATH_LEN, uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH) -> int {
+    if (resolved_path == nullptr || mount == nullptr || mount->fs_type == FSType::REMOTE || !vfs_open_missing_metadata_cacheable(flags)) {
+        return -EAGAIN;
+    }
+
+    int const EXISTENCE_RESULT =
+        existence_cache_lookup_negative_mount(resolved_path, mount, require_directory, known_path_len, known_raw_path_hash);
+    return vfs_open_cacheable_metadata_failure(EXISTENCE_RESULT) ? EXISTENCE_RESULT : -EAGAIN;
+}
+
+auto vfs_open_missing_metadata_result(const char* resolved_path, MountPoint const* mount, int flags, bool require_directory,
+                                      size_t known_path_len = UNKNOWN_PATH_LEN, uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH) -> int {
+    if (resolved_path == nullptr || mount == nullptr || mount->fs_type == FSType::REMOTE) {
+        return -EAGAIN;
+    }
+
+    if (!vfs_open_missing_metadata_cacheable(flags)) {
+        return -EAGAIN;
+    }
+
+    Stat cached{};
+    int const CACHED_RESULT =
+        metadata_cache_lookup_mount_stat(resolved_path, mount, true, require_directory, &cached, known_path_len, known_raw_path_hash);
+    if (vfs_open_cacheable_metadata_failure(CACHED_RESULT)) {
+        return CACHED_RESULT;
+    }
+    return vfs_open_missing_existence_result(resolved_path, mount, flags, require_directory, known_path_len, known_raw_path_hash);
+}
+
+void vfs_apply_xfs_known_absent_hint(const char* resolved_path, MountPoint const* mount, int flags, bool require_directory,
+                                     size_t known_path_len, uint64_t known_raw_path_hash, int& backend_flags) {
+    backend_flags &= ~ker::vfs::O_WOS_KNOWN_ABSENT;
+    if (resolved_path == nullptr || mount == nullptr || mount->fs_type != FSType::XFS || (backend_flags & ker::vfs::O_CREAT) == 0 ||
+        (flags & ker::vfs::O_EXCL) == 0 || require_directory) {
+        return;
+    }
+
+    if (existence_cache_lookup_negative_mount(resolved_path, mount, false, known_path_len, known_raw_path_hash) == -ENOENT) {
+        backend_flags |= ker::vfs::O_WOS_KNOWN_ABSENT;
+    }
+}
+
+void vfs_open_store_missing_metadata_result(const char* resolved_path, MountPoint const* mount, int flags, bool require_directory,
+                                            int backend_result, size_t known_path_len = UNKNOWN_PATH_LEN,
+                                            uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH) {
+    if (!vfs_open_cacheable_metadata_failure(backend_result) || resolved_path == nullptr || mount == nullptr ||
+        mount->fs_type == FSType::REMOTE || !vfs_open_missing_metadata_cacheable(flags)) {
+        return;
+    }
+
+    MetadataSnapshotStamp const STAMP = metadata_snapshot_stamp();
+    if (backend_result == -ENOENT) {
+        metadata_cache_store_missing_observation(resolved_path, mount, STAMP, known_path_len, known_raw_path_hash);
+    } else {
+        metadata_cache_store(resolved_path, mount->fs_type, mount->dev_id, true, require_directory, backend_result, nullptr, STAMP,
+                             known_path_len, known_raw_path_hash);
+        existence_cache_store(resolved_path, mount, require_directory, backend_result, STAMP, known_path_len, known_raw_path_hash);
+    }
+}
+
+auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* raw_path, std::array<char, MAX_PATH_LEN>& path_buffer,
+                                int flags, int backend_flags, int mode, bool path_requires_directory, bool flags_require_directory,
+                                bool open_local, size_t known_path_buffer_len = UNKNOWN_PATH_LEN, bool common_local_fast_path = false,
+                                uint64_t known_path_buffer_hash = UNKNOWN_PATH_HASH, bool trusted_dirfd_parent = false) -> int {
+    if (!common_local_fast_path) {
+        maybe_ensure_wki_host_root_mount_for_task(task, path_buffer.data());
+    }
+    log_loader_path_event("resolved", raw_path, path_buffer.data(), nullptr, 0);
+
+    bool const OPEN_REQUIRE_DIRECTORY = path_requires_directory || flags_require_directory;
+    if (task == nullptr) {
         vfs_debug_log("vfs_open: no current task\n");
         return -ESRCH;
     }
 
+    size_t path_buffer_len = known_path_buffer_len != UNKNOWN_PATH_LEN ? known_path_buffer_len : std::strlen(path_buffer.data());
+    uint64_t path_buffer_hash = (known_path_buffer_hash != UNKNOWN_PATH_HASH && known_path_buffer_len != UNKNOWN_PATH_LEN)
+                                    ? known_path_buffer_hash
+                                    : UNKNOWN_PATH_HASH;
+
+    // Remote mounts resolve symlinks on the server side during the actual open.
+    // Avoid probing each path component with client-side READLINK RPCs here:
+    // they are redundant and can fail independently of the real open.
+    auto mount_ref = find_mount_point(path_buffer.data(), path_buffer_len);
+    MountPoint const* mount = mount_ref.get();
+    bool const REMOTE_MOUNT = (mount != nullptr && mount->fs_type == FSType::REMOTE);
+    bool path_changed_by_symlink = false;
+    uint64_t metadata_store_epoch_before_symlink = 0;
+
+    int const CACHED_MISSING_RESULT =
+        vfs_open_missing_metadata_result(path_buffer.data(), mount, flags, OPEN_REQUIRE_DIRECTORY, path_buffer_len, path_buffer_hash);
+    if (CACHED_MISSING_RESULT != -EAGAIN) {
+        return CACHED_MISSING_RESULT;
+    }
+
+    bool const CREATE_TARGET_KNOWN_MISSING =
+        mount != nullptr && !REMOTE_MOUNT && (backend_flags & ker::vfs::O_CREAT) != 0 && !OPEN_REQUIRE_DIRECTORY &&
+        existence_cache_lookup_negative_mount(path_buffer.data(), mount, false, path_buffer_len, path_buffer_hash) == -ENOENT;
+    bool const SKIP_FINAL_SYMLINK_PROBE =
+        CREATE_TARGET_KNOWN_MISSING || (mount != nullptr && !REMOTE_MOUNT &&
+                                        metadata_cache_proves_final_not_symlink(path_buffer.data(), mount->fs_type, mount->dev_id,
+                                                                                path_buffer_len, &path_buffer_len, path_buffer_hash));
+    bool const EXCLUSIVE_XFS_CREATE = mount != nullptr && mount->fs_type == FSType::XFS && (backend_flags & ker::vfs::O_CREAT) != 0 &&
+                                      (flags & ker::vfs::O_EXCL) != 0 && !OPEN_REQUIRE_DIRECTORY;
+    bool const FINAL_SYMLINK_PROBE_NOT_NEEDED = SKIP_FINAL_SYMLINK_PROBE || EXCLUSIVE_XFS_CREATE;
+    bool const TRUSTED_DIRFD_PARENT_KNOWN_NOOP = trusted_dirfd_parent && EXCLUSIVE_XFS_CREATE && mount != nullptr && !REMOTE_MOUNT;
+    bool const PARENT_SYMLINK_PREFIX_KNOWN_NOOP =
+        TRUSTED_DIRFD_PARENT_KNOWN_NOOP ||
+        (mount != nullptr && !REMOTE_MOUNT && symlink_prefix_cache_covers_parent(path_buffer.data(), path_buffer_len, mount));
+    bool const SYMLINK_RESOLUTION_KNOWN_NOOP = FINAL_SYMLINK_PROBE_NOT_NEEDED && PARENT_SYMLINK_PREFIX_KNOWN_NOOP;
+
+    if (mount != nullptr && !REMOTE_MOUNT && vfs_open_missing_metadata_cacheable(flags) && metadata_cacheable_fs(mount->fs_type)) {
+        metadata_store_epoch_before_symlink = g_metadata_store_observation_epoch.load(std::memory_order_acquire);
+    }
+
     if (!REMOTE_MOUNT) {
-        auto* fd_link_file = vfs_try_open_procfs_fd_link(path_buffer.data(), !OPEN_LOCAL);
+        auto* fd_link_file = vfs_try_open_procfs_fd_link(path_buffer.data(), !open_local, mount, path_buffer_len);
         if (fd_link_file != nullptr) {
-            if (PATH_REQUIRES_DIRECTORY || FLAGS_REQUIRE_DIRECTORY) {
+            if (OPEN_REQUIRE_DIRECTORY) {
                 vfs_put_file(fd_link_file);
                 return -ENOTDIR;
             }
-            int const FD = vfs_install_open_file(current, fd_link_file);
+            int const FD = vfs_install_open_file(task, fd_link_file);
             if (FD < 0) {
                 return FD;
             }
             if ((flags & ker::vfs::O_CLOEXEC) != 0) {
-                static_cast<void>(vfs_set_fd_cloexec_for_task(current, FD, true));
+                static_cast<void>(vfs_set_fd_cloexec_for_task(task, FD, true));
             }
             return FD;
         }
     }
 
-    if (!REMOTE_MOUNT) {
-        std::array<char, MAX_PATH_LEN> resolved{};
-        int const RESOLVE_RET =
-            resolve_symlinks(path_buffer.data(), resolved.data(), resolved.size(), !OPEN_LOCAL, !SKIP_FINAL_SYMLINK_PROBE);
-        if (RESOLVE_RET == -ELOOP) {
-            log::warn("vfs_open: too many symlink levels");
-            return -ELOOP;
+    if (!SYMLINK_RESOLUTION_KNOWN_NOOP && PARENT_SYMLINK_PREFIX_KNOWN_NOOP && vfs_open_missing_metadata_cacheable(flags)) {
+        int const EXISTENCE_RESULT = vfs_pre_symlink_negative_existence_result(path_buffer.data(), mount, true, OPEN_REQUIRE_DIRECTORY,
+                                                                               path_buffer_len, path_buffer_hash);
+        if (EXISTENCE_RESULT != -EAGAIN) {
+            return EXISTENCE_RESULT;
+        }
+    }
+
+    if (!REMOTE_MOUNT && !SYMLINK_RESOLUTION_KNOWN_NOOP) {
+        std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+        size_t resolved_len = path_buffer_len;
+        int const RESOLVE_RET = resolve_symlinks(path_buffer.data(), resolved.data(), resolved.size(), !open_local,
+                                                 !FINAL_SYMLINK_PROBE_NOT_NEEDED, path_buffer_len, &resolved_len);
+        if (RESOLVE_RET < 0) {
+            if (RESOLVE_RET == -ELOOP) {
+                log::warn("vfs_open: too many symlink levels");
+            }
+            log_loader_path_event("symlink-resolve-failed", raw_path, path_buffer.data(), nullptr, RESOLVE_RET);
+            return RESOLVE_RET;
         }
         if (RESOLVE_RET == 0) {
-            // Use the resolved path
-            std::memcpy(path_buffer.data(), resolved.data(), resolved.size());
+            path_changed_by_symlink = !path_text_equal(path_buffer.data(), path_buffer_len, resolved.data(), resolved_len);
+            if (path_changed_by_symlink) {
+                int const COPY_RET = copy_path_string(resolved.data(), path_buffer.data(), path_buffer.size(), resolved_len);
+                if (COPY_RET < 0) {
+                    return COPY_RET;
+                }
+                path_buffer_hash = UNKNOWN_PATH_HASH;
+            }
+            path_buffer_len = resolved_len;
         }
-        log_loader_path_event("symlink-resolved", raw_path.data(), path_buffer.data(), nullptr, RESOLVE_RET);
+        log_loader_path_event("symlink-resolved", raw_path, path_buffer.data(), nullptr, RESOLVE_RET);
+    } else if (SYMLINK_RESOLUTION_KNOWN_NOOP) {
+        log_loader_path_event("symlink-cached-noop", raw_path, path_buffer.data(), mount, 0);
     } else {
-        log_loader_path_event("symlink-deferred-remote", raw_path.data(), path_buffer.data(), mount, 0);
+        log_loader_path_event("symlink-deferred-remote", raw_path, path_buffer.data(), mount, 0);
     }
 
     int const ACCMODE = flags & 3;
 
     // Find the mount point for this path
-    mount_ref = find_mount_point(path_buffer.data());
-    mount = mount_ref.get();
+    if (path_changed_by_symlink) {
+        mount_ref = find_mount_point(path_buffer.data(), path_buffer_len);
+        mount = mount_ref.get();
+    }
+    bool const MISSING_METADATA_OBSERVED_DURING_SYMLINK =
+        metadata_store_epoch_before_symlink != 0 &&
+        g_metadata_store_observation_epoch.load(std::memory_order_acquire) != metadata_store_epoch_before_symlink;
+    if (path_changed_by_symlink || MISSING_METADATA_OBSERVED_DURING_SYMLINK) {
+        int const SYMLINK_CACHED_MISSING_RESULT =
+            vfs_open_missing_metadata_result(path_buffer.data(), mount, flags, OPEN_REQUIRE_DIRECTORY, path_buffer_len, path_buffer_hash);
+        if (SYMLINK_CACHED_MISSING_RESULT != -EAGAIN) {
+            return SYMLINK_CACHED_MISSING_RESULT;
+        }
+    }
     if (mount == nullptr) {
         vfs_debug_log("vfs_open: no mount point found for path\n");
         log::warn("vfs_open: no mount point found for path: %s", path_buffer.data());
-        log_loader_path_event("mount-miss", raw_path.data(), path_buffer.data(), nullptr, -ENOENT);
+        log_loader_path_event("mount-miss", raw_path, path_buffer.data(), nullptr, -ENOENT);
         return -ENOENT;
     }
-    log_loader_path_event("mount-found", raw_path.data(), path_buffer.data(), mount, 0);
+    log_loader_path_event("mount-found", raw_path, path_buffer.data(), mount, 0);
 
     const char* fs_relative_path = strip_mount_prefix(mount, path_buffer.data());
+    size_t const FS_RELATIVE_PATH_LEN = strip_mount_prefix_len(mount, path_buffer.data(), path_buffer_len);
     if (mount->read_only && open_flags_require_fs_write(backend_flags)) {
-        log_loader_path_event("open-readonly", raw_path.data(), path_buffer.data(), mount, -EROFS);
+        log_loader_path_event("open-readonly", raw_path, path_buffer.data(), mount, -EROFS);
         return -EROFS;
     }
+    vfs_apply_xfs_known_absent_hint(path_buffer.data(), mount, flags, OPEN_REQUIRE_DIRECTORY, path_buffer_len, path_buffer_hash,
+                                    backend_flags);
 
     ker::vfs::File* f = nullptr;
+    int backend_open_result = -ENOSYS;
 
     // Route to the appropriate filesystem driver based on mount point
     switch (mount->fs_type) {
@@ -4945,7 +7567,7 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
             }
             break;
         case FSType::TMPFS:
-            f = ker::vfs::tmpfs::tmpfs_open_path(tmpfs_root_for_mount(mount), fs_relative_path, backend_flags, mode);
+            f = ker::vfs::tmpfs::tmpfs_open_path(tmpfs_root_for_mount(mount), fs_relative_path, backend_flags, mode, &backend_open_result);
             if (f != nullptr) {
                 f->fops = ker::vfs::tmpfs::get_tmpfs_fops();
                 f->fs_type = FSType::TMPFS;
@@ -4963,7 +7585,8 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
             break;
         case FSType::XFS:
             f = ker::vfs::xfs::xfs_open_path(fs_relative_path, backend_flags, mode,
-                                             static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+                                             static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), &backend_open_result,
+                                             FS_RELATIVE_PATH_LEN, OPEN_REQUIRE_DIRECTORY);
             if (f != nullptr) {
                 f->fops = ker::vfs::xfs::get_xfs_fops();
                 f->fs_type = FSType::XFS;
@@ -4980,19 +7603,25 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
 
     if (f == nullptr) {
         vfs_debug_log("vfs_open: failed to open file\n");
-        log_loader_path_event("open-failed", raw_path.data(), path_buffer.data(), mount, -ENOENT);
+        log_loader_path_event("open-failed", raw_path, path_buffer.data(), mount, -ENOENT);
+        vfs_open_store_missing_metadata_result(path_buffer.data(), mount, flags, OPEN_REQUIRE_DIRECTORY, backend_open_result,
+                                               path_buffer_len, path_buffer_hash);
         return -ENOENT;
     }
-    if ((PATH_REQUIRES_DIRECTORY || FLAGS_REQUIRE_DIRECTORY) && !f->is_directory) {
+    if ((path_requires_directory || flags_require_directory) && !f->is_directory) {
+        vfs_open_store_missing_metadata_result(path_buffer.data(), mount, flags, OPEN_REQUIRE_DIRECTORY, -ENOTDIR, path_buffer_len,
+                                               path_buffer_hash);
         vfs_destroy_file(f);
         return -ENOTDIR;
     }
-    log_loader_path_event("open-ok", raw_path.data(), path_buffer.data(), mount, 0);
+    log_loader_path_event("open-ok", raw_path, path_buffer.data(), mount, 0);
 
     // Store the absolute VFS path for mount-overlay directory listing.
     static_cast<void>(vfs_file_set_path(f, path_buffer.data()));
+    f->mount_dev_id = mount->dev_id;
+    f->mount_generation = mount_table_generation_snapshot();
     f->dir_fs_count = static_cast<size_t>(-1);
-    f->open_flags = flags;
+    f->open_flags = public_open_flags(flags);
     f->fd_flags = 0;  // fd_flags on File is legacy; CLOEXEC is per-fd in task bitmap
 
     // Permission check: verify R/W access based on open flags
@@ -5025,21 +7654,180 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     if (open_create_should_invalidate_metadata(f, backend_flags)) {
         vfs_cache_notify_path_changed(path_buffer.data(), nullptr);
         metadata_cache_mark_file_data_observed(f);
+        if (f->created_by_open) {
+            metadata_cache_mark_file_data_close_refresh_path_current(f);
+            metadata_cache_schedule_file_data_close_refresh(f);
+        }
     }
     if ((flags & ker::vfs::O_NO_CACHE) != 0) {
         vfs_cache_notify_path_changed(f->vfs_path, nullptr);
     }
     vfs_cache_notify_register_open_file(f);
-    file_stat_snapshot_refresh(f);
+    if (!file_stat_snapshot_promote_created_open_prefill(f)) {
+        file_stat_snapshot_refresh(f);
+    }
+    metadata_cache_store_opened_file_stat_or_hints(f, mount);
 
-    int const FD = vfs_install_open_file(current, f);
+    int const FD = vfs_install_open_file(task, f);
     if (FD < 0) {
         return FD;
     }
     if ((flags & ker::vfs::O_CLOEXEC) != 0) {
-        static_cast<void>(vfs_set_fd_cloexec_for_task(current, FD, true));
+        static_cast<void>(vfs_set_fd_cloexec_for_task(task, FD, true));
     }
     return FD;
+}
+
+auto vfs_open_absolute_common_local_fast_path(ker::mod::sched::task::Task* task, const char* raw_path,
+                                              std::array<char, MAX_PATH_LEN>& path_buffer, bool* path_requires_directory_out,
+                                              size_t* resolved_len_out = nullptr, uint64_t* resolved_hash_out = nullptr) -> int {
+    if (path_requires_directory_out != nullptr) {
+        *path_requires_directory_out = false;
+    }
+    if (resolved_hash_out != nullptr) {
+        *resolved_hash_out = UNKNOWN_PATH_HASH;
+    }
+    if (task == nullptr || raw_path == nullptr || raw_path[0] != '/') {
+        return RESOLVE_FAST_PATH_DECLINED;
+    }
+
+    PathTextScan const SCAN = scan_path_text(raw_path);
+    int const FAST_RET = copy_common_local_visible_absolute_path_fast_path(task, raw_path, SCAN, path_buffer.data(), path_buffer.size(),
+                                                                           resolved_len_out, resolved_hash_out);
+    if (FAST_RET == 0 && path_requires_directory_out != nullptr) {
+        *path_requires_directory_out = SCAN.requires_directory;
+    }
+    return FAST_RET;
+}
+}  // namespace
+
+auto vfs_open(std::string_view path, int flags, int mode) -> int {
+    vfs_debug_log("vfs_open: opening file\n");
+    bool const OPEN_LOCAL = (flags & ker::vfs::O_LOCAL) != 0;
+    auto* task = ker::mod::sched::get_current_task();
+
+    if ((flags & ker::vfs::O_CREAT) != 0) {
+        if (task != nullptr) {
+            mode = mode & ~static_cast<int>(task->umask);
+        }
+    }
+
+    if (path.empty()) {
+        return -ENOENT;
+    }
+    std::array<char, MAX_PATH_LEN> raw_path;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    if (path.size() >= MAX_PATH_LEN) {
+        return -ENAMETOOLONG;
+    }
+    std::memcpy(raw_path.data(), path.data(), path.size());
+    raw_path[path.size()] = '\0';
+
+    bool const PATH_REQUIRES_DIRECTORY = path_requires_directory(raw_path.data(), path.size());
+    bool const FLAGS_REQUIRE_DIRECTORY = (flags & ker::vfs::O_DIRECTORY) != 0;
+    if (FLAGS_REQUIRE_DIRECTORY && (flags & ker::vfs::O_CREAT) != 0) {
+        return -EINVAL;
+    }
+    int backend_flags = flags;
+    if (PATH_REQUIRES_DIRECTORY) {
+        backend_flags &= ~ker::vfs::O_CREAT;
+    }
+
+    std::array<char, MAX_PATH_LEN> path_buffer;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    bool fast_path_requires_directory = false;
+    size_t path_buffer_len = UNKNOWN_PATH_LEN;
+    uint64_t path_buffer_hash = UNKNOWN_PATH_HASH;
+    int const FAST_RET = !OPEN_LOCAL
+                             ? vfs_open_absolute_common_local_fast_path(task, raw_path.data(), path_buffer, &fast_path_requires_directory,
+                                                                        &path_buffer_len, &path_buffer_hash)
+                             : RESOLVE_FAST_PATH_DECLINED;
+    if (FAST_RET == 0) {
+        return vfs_open_resolved_for_task(task, raw_path.data(), path_buffer, flags, backend_flags, mode, fast_path_requires_directory,
+                                          FLAGS_REQUIRE_DIRECTORY, OPEN_LOCAL, path_buffer_len, true, path_buffer_hash);
+    }
+    if (FAST_RET < 0) {
+        return FAST_RET;
+    }
+
+    bool common_local_fast_path = false;
+    int const RESOLVE_RET =
+        task != nullptr ? resolve_dirfd_task_path_raw(task, AT_FDCWD, raw_path.data(), path_buffer.data(), path_buffer.size(), !OPEN_LOCAL,
+                                                      nullptr, &path_buffer_len, &common_local_fast_path, &path_buffer_hash)
+                        : resolve_task_path_raw_impl(raw_path.data(), path_buffer.data(), MAX_PATH_LEN, !OPEN_LOCAL, &path_buffer_len,
+                                                     &path_buffer_hash);
+    if (RESOLVE_RET < 0) {
+        log_loader_path_event("resolve-failed", raw_path.data(), nullptr, nullptr, -ENOENT);
+        return -ENOENT;
+    }
+
+    return vfs_open_resolved_for_task(task, raw_path.data(), path_buffer, flags, backend_flags, mode, PATH_REQUIRES_DIRECTORY,
+                                      FLAGS_REQUIRE_DIRECTORY, OPEN_LOCAL, path_buffer_len, common_local_fast_path, path_buffer_hash);
+}
+
+auto vfs_openat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int flags, int mode) -> int {
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (pathname == nullptr) {
+        return -EINVAL;
+    }
+    if (pathname[0] == '\0') {
+        return -ENOENT;
+    }
+
+    bool const OPEN_LOCAL = (flags & ker::vfs::O_LOCAL) != 0;
+    bool path_requires_directory = false;
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    uint64_t resolved_hash = UNKNOWN_PATH_HASH;
+    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    int const FAST_RET = !OPEN_LOCAL ? vfs_open_absolute_common_local_fast_path(task, pathname, resolved, &path_requires_directory,
+                                                                                &resolved_len, &resolved_hash)
+                                     : RESOLVE_FAST_PATH_DECLINED;
+    if (FAST_RET == 0) {
+        if ((flags & ker::vfs::O_CREAT) != 0) {
+            mode = mode & ~static_cast<int>(task->umask);
+        }
+
+        bool const FLAGS_REQUIRE_DIRECTORY = (flags & ker::vfs::O_DIRECTORY) != 0;
+        if (FLAGS_REQUIRE_DIRECTORY && (flags & ker::vfs::O_CREAT) != 0) {
+            return -EINVAL;
+        }
+        int backend_flags = flags;
+        if (path_requires_directory) {
+            backend_flags &= ~ker::vfs::O_CREAT;
+        }
+
+        return vfs_open_resolved_for_task(task, pathname, resolved, flags, backend_flags, mode, path_requires_directory,
+                                          FLAGS_REQUIRE_DIRECTORY, OPEN_LOCAL, resolved_len, true, resolved_hash);
+    }
+    if (FAST_RET < 0) {
+        return FAST_RET;
+    }
+
+    bool common_local_fast_path = false;
+    bool trusted_dirfd_parent = false;
+    int const RESOLVE_RET =
+        resolve_dirfd_task_path_raw(task, dirfd, pathname, resolved.data(), resolved.size(), !OPEN_LOCAL, &path_requires_directory,
+                                    &resolved_len, &common_local_fast_path, &resolved_hash, &trusted_dirfd_parent);
+    if (RESOLVE_RET < 0) {
+        return RESOLVE_RET;
+    }
+
+    if ((flags & ker::vfs::O_CREAT) != 0) {
+        mode = mode & ~static_cast<int>(task->umask);
+    }
+
+    bool const FLAGS_REQUIRE_DIRECTORY = (flags & ker::vfs::O_DIRECTORY) != 0;
+    if (FLAGS_REQUIRE_DIRECTORY && (flags & ker::vfs::O_CREAT) != 0) {
+        return -EINVAL;
+    }
+    int backend_flags = flags;
+    if (path_requires_directory) {
+        backend_flags &= ~ker::vfs::O_CREAT;
+    }
+
+    return vfs_open_resolved_for_task(task, pathname, resolved, flags, backend_flags, mode, path_requires_directory,
+                                      FLAGS_REQUIRE_DIRECTORY, OPEN_LOCAL, resolved_len, common_local_fast_path, resolved_hash,
+                                      trusted_dirfd_parent);
 }
 
 auto vfs_close_file(File* file) -> int { return vfs_destroy_file(file); }
@@ -5112,6 +7900,21 @@ auto vfs_set_fd_cloexec_for_task(ker::mod::sched::task::Task* task, int fd, bool
     table_task->fd_table_lock.unlock_irqrestore(IRQF);
     return PRESENT ? 0 : -EBADF;
 }
+
+auto vfs_close_taken_file(ker::mod::sched::task::Task* caller, ker::mod::sched::task::Task* table_task, File* file, size_t fd_count,
+                          uint64_t callsite) -> int {
+    advisory_release_process_locks_for_file(ker::mod::sched::task::process_pid(*caller), file);
+
+    ker::mod::perf::record_container_stat(0, table_task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0,
+                                          ker::mod::perf::PERF_FLAG_CT_REMOVE, static_cast<int64_t>(fd_count), 0, callsite);
+
+    // Atomically decrement; only the CPU that drives refcount to 0 does teardown.
+    if (file->refcount.fetch_sub(1, std::memory_order_acq_rel) > 1) {
+        return 0;
+    }
+
+    return vfs_destroy_file(file);
+}
 }  // namespace
 
 auto vfs_close(int fd) -> int {
@@ -5134,18 +7937,7 @@ auto vfs_close(int fd) -> int {
         return -EBADF;
     }
 
-    advisory_release_process_locks_for_file(ker::mod::sched::task::process_pid(*t), f);
-
-    ker::mod::perf::record_container_stat(0, table_task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0,
-                                          ker::mod::perf::PERF_FLAG_CT_REMOVE, static_cast<int64_t>(FD_COUNT), 0,
-                                          reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-
-    // Atomically decrement; only the CPU that drives refcount to 0 does teardown.
-    if (f->refcount.fetch_sub(1, std::memory_order_acq_rel) > 1) {
-        return 0;
-    }
-
-    return vfs_destroy_file(f);
+    return vfs_close_taken_file(t, table_task, f, FD_COUNT, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 }
 
 namespace {
@@ -5183,8 +7975,8 @@ auto vfs_read_user_bounced(ker::mod::sched::task::Task& task, File* file, void* 
     if (BOUNCE_SIZE > stack_bounce.size()) {
         heap_bounce.reset(new (std::nothrow) uint8_t[BOUNCE_SIZE]);
     }
-    uint8_t* const bounce = heap_bounce != nullptr ? heap_bounce.get() : stack_bounce.data();
-    size_t const bounce_size = heap_bounce != nullptr ? BOUNCE_SIZE : stack_bounce.size();
+    uint8_t* const BOUNCE_BUFFER = heap_bounce != nullptr ? heap_bounce.get() : stack_bounce.data();
+    size_t const BOUNCE_CAPACITY = heap_bounce != nullptr ? BOUNCE_SIZE : stack_bounce.size();
     auto const USER_BASE = reinterpret_cast<uint64_t>(user_buf);
     size_t total = 0;
 
@@ -5196,12 +7988,12 @@ auto vfs_read_user_bounced(ker::mod::sched::task::Task& task, File* file, void* 
     };
 
     while (total < count) {
-        size_t const TO_READ = std::min(count - total, bounce_size);
+        size_t const TO_READ = std::min(count - total, BOUNCE_CAPACITY);
         if (!ker::mod::sys::usercopy::ensure_writable(task, USER_BASE + total, TO_READ)) {
             return total > 0 ? finish(static_cast<ssize_t>(total)) : -EFAULT;
         }
 
-        ssize_t const READ_RET = clamp_io_count(file->fops->vfs_read(file, bounce, TO_READ, offset + total), TO_READ);
+        ssize_t const READ_RET = clamp_io_count(file->fops->vfs_read(file, BOUNCE_BUFFER, TO_READ, offset + total), TO_READ);
         if (READ_RET < 0) {
             return total > 0 ? finish(static_cast<ssize_t>(total)) : READ_RET;
         }
@@ -5210,7 +8002,7 @@ auto vfs_read_user_bounced(ker::mod::sched::task::Task& task, File* file, void* 
         }
 
         auto const BYTES_READ = static_cast<size_t>(READ_RET);
-        if (!ker::mod::sys::usercopy::copy_to_task(task, USER_BASE + total, bounce, BYTES_READ)) {
+        if (!ker::mod::sys::usercopy::copy_to_task(task, USER_BASE + total, BOUNCE_BUFFER, BYTES_READ)) {
             return total > 0 ? finish(static_cast<ssize_t>(total)) : -EFAULT;
         }
 
@@ -5326,6 +8118,7 @@ auto vfs_write_file_direct(File* f, const void* buf, size_t count, size_t* actua
     if (result >= 0) {
         if (result > 0) {
             cache_notify_file_data_changed_impl(f);
+            refresh_created_file_stat_snapshot_after_write(f);
         }
         if (TMPFS_APPEND || XFS_APPEND) {
             f->pos = static_cast<off_t>(append_offset + static_cast<size_t>(result));
@@ -5358,8 +8151,8 @@ auto vfs_write_user_bounced(ker::mod::sched::task::Task& task, File* file, const
     if (BOUNCE_SIZE > stack_bounce.size()) {
         heap_bounce.reset(new (std::nothrow) uint8_t[BOUNCE_SIZE]);
     }
-    uint8_t* const bounce = heap_bounce != nullptr ? heap_bounce.get() : stack_bounce.data();
-    size_t const bounce_size = heap_bounce != nullptr ? BOUNCE_SIZE : stack_bounce.size();
+    uint8_t* const BOUNCE_BUFFER = heap_bounce != nullptr ? heap_bounce.get() : stack_bounce.data();
+    size_t const BOUNCE_CAPACITY = heap_bounce != nullptr ? BOUNCE_SIZE : stack_bounce.size();
     auto const USER_BASE = reinterpret_cast<uint64_t>(user_buf);
     size_t total = 0;
 
@@ -5371,12 +8164,12 @@ auto vfs_write_user_bounced(ker::mod::sched::task::Task& task, File* file, const
     };
 
     while (total < count) {
-        size_t const TO_WRITE = std::min(count - total, bounce_size);
-        if (!ker::mod::sys::usercopy::copy_from_task(task, USER_BASE + total, bounce, TO_WRITE)) {
+        size_t const TO_WRITE = std::min(count - total, BOUNCE_CAPACITY);
+        if (!ker::mod::sys::usercopy::copy_from_task(task, USER_BASE + total, BOUNCE_BUFFER, TO_WRITE)) {
             return total > 0 ? finish(static_cast<ssize_t>(total)) : -EFAULT;
         }
 
-        ssize_t const WRITE_RET = clamp_io_count(vfs_write_file_direct(file, bounce, TO_WRITE, nullptr), TO_WRITE);
+        ssize_t const WRITE_RET = clamp_io_count(vfs_write_file_direct(file, BOUNCE_BUFFER, TO_WRITE, nullptr), TO_WRITE);
         if (WRITE_RET < 0) {
             return total > 0 ? finish(static_cast<ssize_t>(total)) : WRITE_RET;
         }
@@ -5554,8 +8347,10 @@ auto vfs_resolve_dirfd(ker::mod::sched::task::Task* task, int dirfd, const char*
 
     // Determine the base directory path
     const char* base = nullptr;
+    size_t known_base_len = UNKNOWN_PATH_LEN;
     if (dirfd == AT_FDCWD) {
         base = task->cwd.data();
+        known_base_len = task_cached_cwd_len(task);
     } else {
         auto* file = vfs_get_file_retain(task, dirfd);
         if (file == nullptr) {
@@ -5579,7 +8374,7 @@ auto vfs_resolve_dirfd(ker::mod::sched::task::Task* task, int dirfd, const char*
     }
 
     // Concatenate base + "/" + pathname
-    size_t base_len = std::strlen(base);
+    size_t base_len = known_base_len != UNKNOWN_PATH_LEN ? known_base_len : std::strlen(base);
     size_t const PATH_LEN = std::strlen(pathname);
 
     // Strip trailing slash from base
@@ -5634,41 +8429,63 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
         return -ENOTDIR;
     }
 
-    // Buffer must be large enough for at least one DirEntry
-    if (buffer == nullptr || max_size < sizeof(DirEntry)) {
+    // Buffer must be large enough for at least one packed DirEntry.
+    if (buffer == nullptr || max_size < DIRENT_MIN_RECLEN) {
         vfs_put_file(f);
         return -EINVAL;
     }
 
     // We allow vfs_readdir to be null - the directory may contain only mount children
     bool const HAS_FS_READDIR = (f->fops != nullptr) && (f->fops->vfs_readdir != nullptr);
+    MountRef readdir_mount_ref{};
+    if (f->vfs_path != nullptr && metadata_cacheable_fs(f->fs_type)) {
+        readdir_mount_ref = find_mount_point(f->vfs_path, file_vfs_path_len(f));
+    }
+    MountPoint const* readdir_mount = readdir_mount_ref.get();
+    if (readdir_mount != nullptr && readdir_mount->fs_type != f->fs_type) {
+        readdir_mount = nullptr;
+    }
 
-    auto* entries = static_cast<DirEntry*>(buffer);
-    size_t const MAX_ENTRIES = max_size / sizeof(DirEntry);
+    auto* packed_entries = static_cast<uint8_t*>(buffer);
+    size_t packed_bytes = 0;
     size_t entries_read = 0;
+    bool buffer_full = false;
+    MetadataSnapshotStamp const READ_STAMP = metadata_snapshot_stamp();
 
     // Read directory entries using the current position as an opaque-ish index.
     // Filesystems that need sparse/stable cookies can return d_off greater
     // than the requested index; older backends that leave d_off at the current
     // index still advance by one.
     auto next_index = static_cast<size_t>(f->pos);
-    auto advance_after_entry = [&](size_t actual_index) {
-        uint64_t const ENTRY_OFF = entries[entries_read].d_off;
+    auto emit_entry = [&](const DirEntry& entry, size_t actual_index) -> bool {
+        size_t const RECORD_SIZE = copy_packed_dirent_record(entry, packed_entries + packed_bytes, max_size - packed_bytes);
+        if (RECORD_SIZE == 0) {
+            buffer_full = true;
+            return false;
+        }
+
+        uint64_t const ENTRY_OFF = entry.d_off;
         next_index = actual_index + 1;
         if (ENTRY_OFF > static_cast<uint64_t>(actual_index) && ENTRY_OFF <= static_cast<uint64_t>(~size_t{0})) {
             next_index = static_cast<size_t>(ENTRY_OFF);
         }
         entries_read++;
+        packed_bytes += RECORD_SIZE;
+        return true;
     };
 
-    for (size_t i = 0; i < MAX_ENTRIES; ++i) {
+    while (max_size - packed_bytes >= DIRENT_MIN_RECLEN) {
         size_t const ACTUAL_INDEX = next_index;
 
         // Phase 1: try filesystem readdir
         if (HAS_FS_READDIR && (std::cmp_equal(f->dir_fs_count, -1) || ACTUAL_INDEX < f->dir_fs_count)) {
-            int const RET = f->fops->vfs_readdir(f, &entries[entries_read], ACTUAL_INDEX);
+            DirEntry entry = {};
+            int const RET = f->fops->vfs_readdir(f, &entry, ACTUAL_INDEX);
             if (RET == 0) {
-                advance_after_entry(ACTUAL_INDEX);
+                if (!emit_entry(entry, ACTUAL_INDEX)) {
+                    break;
+                }
+                vfs_seed_readdir_entry_cache_hints(f, readdir_mount, entry, READ_STAMP);
                 continue;
             }
             // FS entries exhausted at this index
@@ -5700,13 +8517,14 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
 
             if (INJECT_WKI_ROOT) {
                 if (synthetic_index == 0) {
-                    entries[entries_read].d_ino = 0x574b49524f4f54ULL;
-                    entries[entries_read].d_off = ACTUAL_INDEX + 1;
-                    entries[entries_read].d_reclen = sizeof(DirEntry);
-                    entries[entries_read].d_type = DT_DIR | DT_WOSLINK;
-                    std::memcpy(entries[entries_read].d_name.data(), "wki", 4);
-                    entries[entries_read].d_name[3] = '\0';
-                    advance_after_entry(ACTUAL_INDEX);
+                    DirEntry entry = {};
+                    entry.d_ino = 0x574b49524f4f54ULL;
+                    entry.d_off = ACTUAL_INDEX + 1;
+                    entry.d_type = DT_DIR | DT_WOSLINK;
+                    std::memcpy(entry.d_name.data(), "wki", 4);
+                    if (!emit_entry(entry, ACTUAL_INDEX)) {
+                        break;
+                    }
                     continue;
                 }
                 synthetic_index--;
@@ -5714,12 +8532,14 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
 
             if (INJECT_HOST_ALIAS) {
                 if (synthetic_index == 0) {
-                    entries[entries_read].d_ino = 0x574b49486f7374ULL;
-                    entries[entries_read].d_off = ACTUAL_INDEX + 1;
-                    entries[entries_read].d_reclen = sizeof(DirEntry);
-                    entries[entries_read].d_type = DT_DIR | DT_WOSLINK;
-                    std::memcpy(entries[entries_read].d_name.data(), "host", 5);
-                    advance_after_entry(ACTUAL_INDEX);
+                    DirEntry entry = {};
+                    entry.d_ino = 0x574b49486f7374ULL;
+                    entry.d_off = ACTUAL_INDEX + 1;
+                    entry.d_type = DT_DIR | DT_WOSLINK;
+                    std::memcpy(entry.d_name.data(), "host", 5);
+                    if (!emit_entry(entry, ACTUAL_INDEX)) {
+                        break;
+                    }
                     continue;
                 }
                 synthetic_index--;
@@ -5727,17 +8547,19 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
 
             if (INJECT_LOCAL_ALIAS) {
                 if (synthetic_index == 0) {
-                    entries[entries_read].d_ino = 0x574b494c6f6361ULL;
-                    entries[entries_read].d_off = ACTUAL_INDEX + 1;
-                    entries[entries_read].d_reclen = sizeof(DirEntry);
-                    entries[entries_read].d_type = DT_DIR | DT_WOSLINK;
+                    DirEntry entry = {};
+                    entry.d_ino = 0x574b494c6f6361ULL;
+                    entry.d_off = ACTUAL_INDEX + 1;
+                    entry.d_type = DT_DIR | DT_WOSLINK;
                     size_t copy_len = std::strlen(local_hostname);
                     if (copy_len >= DIRENT_NAME_MAX) {
                         copy_len = DIRENT_NAME_MAX - 1;
                     }
-                    std::memcpy(entries[entries_read].d_name.data(), local_hostname, copy_len);
-                    entries[entries_read].d_name[copy_len] = '\0';
-                    advance_after_entry(ACTUAL_INDEX);
+                    std::memcpy(entry.d_name.data(), local_hostname, copy_len);
+                    entry.d_name[copy_len] = '\0';
+                    if (!emit_entry(entry, ACTUAL_INDEX)) {
+                        break;
+                    }
                     continue;
                 }
                 synthetic_index--;
@@ -5844,7 +8666,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                         if (PRET != 0) {
                             break;
                         }
-                        size_t const DN_LEN = std::strlen(probe.d_name.data());
+                        size_t const DN_LEN = dirent_name_length(probe);
                         if (DN_LEN == child_len && std::memcmp(probe.d_name.data(), child_start, child_len) == 0) {
                             already_in_fs = true;
                             break;
@@ -5862,30 +8684,36 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
 
                 if (child_count == MOUNT_IDX) {
                     // Fill the synthetic DirEntry
-                    entries[entries_read].d_ino = (static_cast<uint64_t>(mount_snapshot.dev_id) << 32) | 0x4d4e5455ULL;
-                    entries[entries_read].d_off = ACTUAL_INDEX + 1;
-                    entries[entries_read].d_reclen = sizeof(DirEntry);
+                    DirEntry entry = {};
+                    entry.d_ino = (static_cast<uint64_t>(mount_snapshot.dev_id) << 32) | 0x4d4e5455ULL;
+                    entry.d_off = ACTUAL_INDEX + 1;
 
                     // Mark WKI entries with WOSLINK flag for recursion prevention:
                     // - listing /wki: all mount children (wos-0, wos-1, ...) are WOSLINK
                     // - listing /: the "wki" mount child is WOSLINK
                     if (std::strcmp(visible_dir_path, "/wki") == 0 ||
                         (DIR_LEN == 1 && visible_dir_path[0] == '/' && child_len == 3 && std::memcmp(child_start, "wki", 3) == 0)) {
-                        entries[entries_read].d_type = DT_DIR | DT_WOSLINK;
+                        entry.d_type = DT_DIR | DT_WOSLINK;
                     } else {
-                        entries[entries_read].d_type = DT_DIR;
+                        entry.d_type = DT_DIR;
                     }
 
                     size_t const COPY_LEN = child_len < DIRENT_NAME_MAX - 1 ? child_len : DIRENT_NAME_MAX - 1;
-                    std::memcpy(entries[entries_read].d_name.data(), child_start, COPY_LEN);
-                    entries[entries_read].d_name[COPY_LEN] = '\0';
+                    std::memcpy(entry.d_name.data(), child_start, COPY_LEN);
+                    entry.d_name[COPY_LEN] = '\0';
 
-                    advance_after_entry(ACTUAL_INDEX);
                     found_mount_child = true;
+                    if (!emit_entry(entry, ACTUAL_INDEX)) {
+                        break;
+                    }
                     break;
                 }
                 child_count++;
             }
+        }
+
+        if (buffer_full) {
+            break;
         }
 
         if (found_mount_child) {
@@ -5899,44 +8727,47 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
     // Update file position
     f->pos = static_cast<off_t>(next_index);
 
-    auto result = static_cast<ssize_t>(entries_read * sizeof(DirEntry));
+    auto result = static_cast<ssize_t>(packed_bytes);
+    if (entries_read == 0 && buffer_full) {
+        result = -EINVAL;
+    }
     vfs_put_file(f);
     return result;
 }
 
 // --- Symlink / mkdir / mount operations ---
 
-auto vfs_symlink(const char* target, const char* linkpath) -> int {
-    if (target == nullptr || linkpath == nullptr) {
+namespace {
+auto vfs_symlink_resolved_linkpath(const char* target, const char* abs_linkpath, size_t known_abs_linkpath_len = UNKNOWN_PATH_LEN) -> int {
+    if (target == nullptr || abs_linkpath == nullptr) {
         return -EINVAL;
     }
 
-    std::array<char, MAX_PATH_LEN> abs_linkpath{};
-    if (resolve_task_path_raw(linkpath, abs_linkpath.data(), abs_linkpath.size()) < 0) {
-        return -ENOENT;
-    }
-
     // Find mount point for the linkpath
-    auto mount_ref = find_mount_point(abs_linkpath.data());
+    auto mount_ref = find_mount_point(abs_linkpath, known_abs_linkpath_len);
     MountPoint const* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
 
     if (mount->fs_type == FSType::REMOTE) {
-        const char* fs_path = strip_mount_prefix(mount, abs_linkpath.data());
+        const char* fs_path = strip_mount_prefix(mount, abs_linkpath);
         int const RET = ker::net::wki::wki_remote_vfs_symlink(mount->private_data, target, fs_path);
         if (RET == 0) {
-            vfs_cache_notify_path_changed(abs_linkpath.data(), nullptr);
+            vfs_cache_notify_path_changed(abs_linkpath, nullptr);
         }
         return RET;
     }
 
     if (mount->fs_type == FSType::XFS) {
-        const char* fs_path = strip_mount_prefix(mount, abs_linkpath.data());
-        int const RET = ker::vfs::xfs::xfs_symlink_path(target, fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+        const char* fs_path = strip_mount_prefix(mount, abs_linkpath);
+        size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, abs_linkpath, known_abs_linkpath_len);
+        Stat link_stat{};
+        int const RET = ker::vfs::xfs::xfs_symlink_path(target, fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data),
+                                                        &link_stat, FS_PATH_LEN);
         if (RET == 0) {
-            vfs_cache_notify_path_changed(abs_linkpath.data(), nullptr);
+            vfs_cache_notify_path_changed(abs_linkpath, nullptr);
+            metadata_cache_store_created_symlink_hints(abs_linkpath, mount, link_stat, target, known_abs_linkpath_len);
         }
         return RET;
     }
@@ -5945,7 +8776,7 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int {
         return -ENOSYS;
     }
 
-    const char* fs_path = strip_mount_prefix(mount, abs_linkpath.data());
+    const char* fs_path = strip_mount_prefix(mount, abs_linkpath);
 
     // Split into parent path and link name
     const char* last_slash = nullptr;
@@ -5981,8 +8812,54 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int {
     if (node == nullptr) {
         return -1;
     }
-    vfs_cache_notify_path_changed(abs_linkpath.data(), nullptr);
+    Stat link_stat{};
+    fill_tmpfs_node_stat(mount->dev_id, node, &link_stat);
+    vfs_cache_notify_path_changed(abs_linkpath, nullptr);
+    metadata_cache_store_created_symlink_hints(abs_linkpath, mount, link_stat, target, known_abs_linkpath_len);
     return 0;
+}
+}  // namespace
+
+auto vfs_symlink(const char* target, const char* linkpath) -> int {
+    if (target == nullptr || linkpath == nullptr) {
+        return -EINVAL;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    PathTextScan scan{};
+    if (task_absolute_local_path_fast_path_allowed(task, linkpath, &scan)) {
+        return vfs_symlink_resolved_linkpath(target, linkpath, scan.path_len);
+    }
+
+    std::array<char, MAX_PATH_LEN> abs_linkpath{};
+    size_t abs_linkpath_len = UNKNOWN_PATH_LEN;
+    if (resolve_task_path_raw_impl(linkpath, abs_linkpath.data(), abs_linkpath.size(), true, &abs_linkpath_len) < 0) {
+        return -ENOENT;
+    }
+
+    return vfs_symlink_resolved_linkpath(target, abs_linkpath.data(), abs_linkpath_len);
+}
+
+auto vfs_symlinkat(ker::mod::sched::task::Task* task, const char* target, int dirfd, const char* linkpath) -> int {
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (target == nullptr || linkpath == nullptr) {
+        return -EINVAL;
+    }
+    if (linkpath[0] == '\0') {
+        return -ENOENT;
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    int const RESOLVE_RET = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, dirfd, linkpath, resolved.data(),
+                                                                                      resolved.size(), true, nullptr, &resolved_len);
+    if (RESOLVE_RET < 0) {
+        return RESOLVE_RET;
+    }
+
+    return vfs_symlink_resolved_linkpath(target, resolved.data(), resolved_len);
 }
 
 // Internal readlink operating on an already-resolved absolute path (no root
@@ -5990,21 +8867,41 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int {
 // that already include the task root.
 namespace {
 
-auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize_t {
+auto vfs_stat_resolved_cache_or_impl(const char* resolved_path, bool follow_final_symlink, bool require_directory, bool apply_task_policy,
+                                     Stat* statbuf, size_t known_resolved_path_len = UNKNOWN_PATH_LEN,
+                                     uint64_t known_resolved_path_hash = UNKNOWN_PATH_HASH) -> int;
+
+auto readlink_resolved_on_mount(const char* abs_path, char* buf, size_t bufsize, MountPoint const* mount, size_t known_abs_path_len,
+                                uint64_t known_abs_path_hash) -> ssize_t {
     if (abs_path == nullptr || buf == nullptr || bufsize == 0) {
         return -EINVAL;
     }
 
-    auto mount_ref = find_mount_point(abs_path);
-    MountPoint const* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
     uint64_t const DEV_ID = mount->dev_id;
+    size_t abs_path_len = known_abs_path_len;
+    uint64_t abs_path_hash =
+        known_abs_path_hash != UNKNOWN_PATH_HASH && known_abs_path_len != UNKNOWN_PATH_LEN ? known_abs_path_hash : UNKNOWN_PATH_HASH;
     ssize_t cached_result = 0;
-    if (symlink_cache_lookup(abs_path, mount->fs_type, DEV_ID, buf, bufsize, &cached_result)) {
+    if (symlink_cache_lookup(abs_path, mount->fs_type, DEV_ID, buf, bufsize, &cached_result, abs_path_len, &abs_path_len, abs_path_hash)) {
         return cached_result;
     }
+    if (abs_path_hash == UNKNOWN_PATH_HASH && abs_path_len != UNKNOWN_PATH_LEN && abs_path_len > 0 && abs_path_len < MAX_PATH_LEN &&
+        symlink_cacheable_fs(mount->fs_type)) {
+        abs_path_hash = metadata_path_hash_raw(abs_path, abs_path_len);
+    }
+    ssize_t const METADATA_NEGATIVE =
+        metadata_cache_readlink_negative_result(abs_path, mount->fs_type, DEV_ID, abs_path_len, abs_path_hash);
+    if (METADATA_NEGATIVE != -EAGAIN) {
+        return METADATA_NEGATIVE;
+    }
+    int const EXISTENCE_NEGATIVE = existence_cache_lookup_negative_mount(abs_path, mount, false, abs_path_len, abs_path_hash);
+    if (EXISTENCE_NEGATIVE != -EAGAIN) {
+        return EXISTENCE_NEGATIVE;
+    }
+    MetadataSnapshotStamp const READLINK_STAMP = metadata_snapshot_stamp();
 
     if (mount->fs_type == FSType::PROCFS) {
         const char* fsp = strip_mount_prefix(mount, abs_path);
@@ -6034,17 +8931,24 @@ auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize
 
     if (mount->fs_type == FSType::XFS) {
         const char* fs_path = strip_mount_prefix(mount, abs_path);
+        size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, abs_path, abs_path_len);
         auto* xctx = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
-        auto* f = ker::vfs::xfs::xfs_open_path(fs_path, 0, 0, xctx);
-        if (f == nullptr) {
-            symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -ENOENT, nullptr);
+        ssize_t const RET = ker::vfs::xfs::xfs_readlink_path(fs_path, buf, bufsize, xctx, FS_PATH_LEN);
+        if (RET == -ENOENT) {
+            metadata_cache_store_readlink_negative_observation(abs_path, mount, RET, READLINK_STAMP, abs_path_len, abs_path_hash);
+            symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -ENOENT, nullptr, abs_path_len, abs_path_hash);
             return -ENOENT;
         }
-        ssize_t const RET = ker::vfs::xfs::get_xfs_fops()->vfs_readlink(f, buf, bufsize);
-        ker::vfs::xfs::get_xfs_fops()->vfs_close(f);
-        delete f;
+        if (RET == -EINVAL) {
+            metadata_cache_store_readlink_negative_observation(abs_path, mount, RET, READLINK_STAMP, abs_path_len, abs_path_hash);
+            symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -EINVAL, nullptr, abs_path_len, abs_path_hash);
+            return -EINVAL;
+        }
+        if (RET == -ENOTDIR) {
+            metadata_cache_store_readlink_negative_observation(abs_path, mount, RET, READLINK_STAMP, abs_path_len, abs_path_hash);
+        }
         if (RET <= 0 || std::cmp_less(RET, bufsize)) {
-            symlink_cache_store(abs_path, mount->fs_type, DEV_ID, RET, RET > 0 ? buf : nullptr);
+            symlink_cache_store(abs_path, mount->fs_type, DEV_ID, RET, RET > 0 ? buf : nullptr, abs_path_len, abs_path_hash);
         }
         return RET;
     }
@@ -6074,7 +8978,7 @@ auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize
     }
 
     if (mount->fs_type != FSType::TMPFS) {
-        symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -ENOSYS, nullptr);
+        symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -ENOSYS, nullptr, abs_path_len, abs_path_hash);
         return -ENOSYS;
     }
 
@@ -6082,17 +8986,20 @@ auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize
 
     auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, false);
     if (node == nullptr) {
-        symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -ENOENT, nullptr);
+        metadata_cache_store_readlink_negative_observation(abs_path, mount, -ENOENT, READLINK_STAMP, abs_path_len, abs_path_hash);
+        symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -ENOENT, nullptr, abs_path_len, abs_path_hash);
         return -ENOENT;
     }
     node = ker::vfs::tmpfs::tmpfs_canonical_node(node);
     if (node == nullptr) {
-        symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -ENOENT, nullptr);
+        metadata_cache_store_readlink_negative_observation(abs_path, mount, -ENOENT, READLINK_STAMP, abs_path_len, abs_path_hash);
+        symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -ENOENT, nullptr, abs_path_len, abs_path_hash);
         return -ENOENT;
     }
 
     if (node->type != ker::vfs::tmpfs::TmpNodeType::SYMLINK || node->symlink_target == nullptr) {
-        symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -EINVAL, nullptr);
+        metadata_cache_store_readlink_negative_observation(abs_path, mount, -EINVAL, READLINK_STAMP, abs_path_len, abs_path_hash);
+        symlink_cache_store(abs_path, mount->fs_type, DEV_ID, -EINVAL, nullptr, abs_path_len, abs_path_hash);
         return -EINVAL;
     }
 
@@ -6103,9 +9010,19 @@ auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize) -> ssize
     size_t const TO_COPY = (len < bufsize) ? len : bufsize;
     std::memcpy(buf, node->symlink_target, TO_COPY);
     if (TO_COPY == len) {
-        symlink_cache_store(abs_path, mount->fs_type, DEV_ID, static_cast<ssize_t>(TO_COPY), buf);
+        symlink_cache_store(abs_path, mount->fs_type, DEV_ID, static_cast<ssize_t>(TO_COPY), buf, abs_path_len, abs_path_hash);
     }
     return static_cast<ssize_t>(TO_COPY);
+}
+
+auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize, size_t known_abs_path_len, uint64_t known_abs_path_hash)
+    -> ssize_t {
+    if (abs_path == nullptr || buf == nullptr || bufsize == 0) {
+        return -EINVAL;
+    }
+
+    auto mount_ref = find_mount_point(abs_path, known_abs_path_len);
+    return readlink_resolved_on_mount(abs_path, buf, bufsize, mount_ref.get(), known_abs_path_len, known_abs_path_hash);
 }
 
 auto realpath_reset_to_task_root(char* resolved, size_t resolved_size, size_t* min_len) -> int {
@@ -6298,11 +9215,12 @@ auto realpath_resolve_visible_path(const char* path, char* resolved, size_t reso
         }
 
         std::array<char, MAX_PATH_LEN> linkbuf{};
-        ssize_t const LINK_LEN = readlink_resolved(resolved, linkbuf.data(), linkbuf.size() - 1);
+        size_t const RESOLVED_LEN = std::strlen(resolved);
+        ssize_t const LINK_LEN = readlink_resolved(resolved, linkbuf.data(), linkbuf.size() - 1, RESOLVED_LEN);
         if (LINK_LEN == -EINVAL || LINK_LEN == -ENOSYS) {
             if (*rest != '\0') {
                 Stat st{};
-                ret = vfs_stat_resolved(resolved, &st);
+                ret = vfs_stat_resolved_cache_or_impl(resolved, true, false, false, &st, RESOLVED_LEN);
                 if (ret < 0) {
                     return ret;
                 }
@@ -6372,6 +9290,9 @@ void vfs_get_cache_perf_snapshot(VfsCachePerfSnapshot& out) {
     out.metadata_miss_conflict = g_vfs_metadata_miss_conflict.load(std::memory_order_relaxed);
     out.metadata_path_invalidations = g_vfs_metadata_path_invalidations.load(std::memory_order_relaxed);
     out.metadata_generation_resets = g_vfs_metadata_generation_resets.load(std::memory_order_relaxed);
+    out.existence_hits = g_vfs_existence_hits.load(std::memory_order_relaxed);
+    out.existence_misses = g_vfs_existence_misses.load(std::memory_order_relaxed);
+    out.existence_stores = g_vfs_existence_stores.load(std::memory_order_relaxed);
     out.symlink_hits = g_vfs_symlink_hits.load(std::memory_order_relaxed);
     out.symlink_misses = g_vfs_symlink_misses.load(std::memory_order_relaxed);
     out.symlink_stores = g_vfs_symlink_stores.load(std::memory_order_relaxed);
@@ -6396,8 +9317,8 @@ void vfs_get_cache_perf_snapshot(VfsCachePerfSnapshot& out) {
 
 void vfs_prefill_file_stat_snapshot(File* file, const Stat& statbuf) {
     if (file == nullptr || !file_stat_snapshot_path_cacheable_fs(file->fs_type) ||
-        !file_stat_snapshot_result_cacheable(file, statbuf.st_mode) ||
-        (file->open_flags & (ker::vfs::O_NO_CACHE | ker::vfs::O_TRUNC | ker::vfs::O_CREAT)) != 0 || (file->open_flags & 3) != 0) {
+        !file_stat_snapshot_result_cacheable(file, statbuf.st_mode) || (file->open_flags & ker::vfs::O_NO_CACHE) != 0 ||
+        !file_stat_snapshot_open_prefill_safe(file)) {
         file_stat_snapshot_invalidate(file);
         return;
     }
@@ -6423,20 +9344,37 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
         return -EINVAL;
     }
 
-    std::array<char, MAX_PATH_LEN> abs_path{};
-    if (resolve_task_path_raw(path, abs_path.data(), abs_path.size()) < 0) {
+    std::array<char, MAX_PATH_LEN> abs_path;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    bool require_directory = path_requires_directory(path);
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    size_t abs_path_len = UNKNOWN_PATH_LEN;
+    uint64_t abs_path_hash = UNKNOWN_PATH_HASH;
+    int const RESOLVE_PATH_RET =
+        task != nullptr ? resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, AT_FDCWD, path, abs_path.data(), abs_path.size(),
+                                                                                    true, &require_directory, &abs_path_len, &abs_path_hash)
+                        : resolve_task_path_raw(path, abs_path.data(), abs_path.size());
+    if (RESOLVE_PATH_RET < 0) {
         return -ENOENT;
     }
+    if (abs_path_len == UNKNOWN_PATH_LEN) {
+        abs_path_len = std::strlen(abs_path.data());
+    }
 
-    if (path_requires_directory(path)) {
+    if (require_directory) {
         std::array<char, MAX_PATH_LEN> resolved{};
-        int const RESOLVE_RET = resolve_symlinks(abs_path.data(), resolved.data(), resolved.size(), true, true);
+        size_t resolved_len = abs_path_len;
+        int const RESOLVE_RET =
+            resolve_symlinks(abs_path.data(), resolved.data(), resolved.size(), true, true, abs_path_len, &resolved_len);
         if (RESOLVE_RET < 0) {
             return RESOLVE_RET;
         }
+        uint64_t const RESOLVED_HASH = abs_path_hash != UNKNOWN_PATH_HASH && resolved_len == abs_path_len &&
+                                               std::memcmp(resolved.data(), abs_path.data(), resolved_len + 1) == 0
+                                           ? abs_path_hash
+                                           : UNKNOWN_PATH_HASH;
 
         Stat st{};
-        int const STAT_RET = vfs_stat_resolved(resolved.data(), &st);
+        int const STAT_RET = vfs_stat_resolved_cache_or_impl(resolved.data(), true, false, false, &st, resolved_len, RESOLVED_HASH);
         if (STAT_RET < 0) {
             return STAT_RET;
         }
@@ -6444,45 +9382,110 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
             return -ENOTDIR;
         }
 
-        return readlink_resolved(resolved.data(), buf, bufsize);
+        return readlink_resolved(resolved.data(), buf, bufsize, resolved_len, RESOLVED_HASH);
     }
 
-    return readlink_resolved(abs_path.data(), buf, bufsize);
+    return readlink_resolved(abs_path.data(), buf, bufsize, abs_path_len, abs_path_hash);
 }
 
-auto vfs_realpath(const char* path, char* buf, size_t bufsize) -> int {
+auto vfs_readlinkat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, char* buf, size_t bufsize) -> ssize_t {
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (pathname == nullptr || buf == nullptr || bufsize == 0) {
+        return -EINVAL;
+    }
+    if (pathname[0] == '\0') {
+        return -ENOENT;
+    }
+
+    std::array<char, MAX_PATH_LEN> abs_path{};
+    bool require_directory = false;
+    size_t abs_path_len = UNKNOWN_PATH_LEN;
+    uint64_t abs_path_hash = UNKNOWN_PATH_HASH;
+    int const RESOLVE_PATH_RET = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(
+        task, dirfd, pathname, abs_path.data(), abs_path.size(), true, &require_directory, &abs_path_len, &abs_path_hash);
+    if (RESOLVE_PATH_RET < 0) {
+        return RESOLVE_PATH_RET;
+    }
+
+    if (require_directory) {
+        std::array<char, MAX_PATH_LEN> resolved{};
+        size_t resolved_len = abs_path_len;
+        int const RESOLVE_RET =
+            resolve_symlinks(abs_path.data(), resolved.data(), resolved.size(), true, true, abs_path_len, &resolved_len);
+        if (RESOLVE_RET < 0) {
+            return RESOLVE_RET;
+        }
+        uint64_t const RESOLVED_HASH = abs_path_hash != UNKNOWN_PATH_HASH && resolved_len == abs_path_len &&
+                                               std::memcmp(resolved.data(), abs_path.data(), resolved_len + 1) == 0
+                                           ? abs_path_hash
+                                           : UNKNOWN_PATH_HASH;
+
+        Stat st{};
+        int const STAT_RET = vfs_stat_resolved_cache_or_impl(resolved.data(), true, false, false, &st, resolved_len, RESOLVED_HASH);
+        if (STAT_RET < 0) {
+            return STAT_RET;
+        }
+        if ((st.st_mode & S_IFMT) != S_IFDIR) {
+            return -ENOTDIR;
+        }
+
+        return readlink_resolved(resolved.data(), buf, bufsize, resolved_len, RESOLVED_HASH);
+    }
+
+    return readlink_resolved(abs_path.data(), buf, bufsize, abs_path_len, abs_path_hash);
+}
+
+auto vfs_realpath(const char* path, char* buf, size_t bufsize, size_t* len_out) -> int {
     if (path == nullptr || buf == nullptr || bufsize == 0) {
         return -EINVAL;
     }
 
     std::array<char, MAX_PATH_LEN> local_backing_path{};
-    int ret = resolve_task_path_raw_impl(path, local_backing_path.data(), local_backing_path.size(), false);
+    size_t local_backing_path_len = UNKNOWN_PATH_LEN;
+    int ret = resolve_task_path_raw_impl(path, local_backing_path.data(), local_backing_path.size(), false, &local_backing_path_len);
     if (ret < 0) {
         return ret;
     }
 
     std::array<char, MAX_PATH_LEN> backing_path{};
-    ret = resolve_task_path_raw(path, backing_path.data(), backing_path.size());
-    if (ret < 0) {
-        return ret;
+    size_t backing_path_len = UNKNOWN_PATH_LEN;
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (task_vfs_route_is_common_local_noop(task, local_backing_path.data())) {
+        ret = copy_path_string(local_backing_path.data(), backing_path.data(), backing_path.size(), local_backing_path_len,
+                               &backing_path_len);
+        if (ret < 0) {
+            return ret;
+        }
+    } else {
+        ret = resolve_task_path_raw_impl(path, backing_path.data(), backing_path.size(), true, &backing_path_len);
+        if (ret < 0) {
+            return ret;
+        }
     }
 
     // If WKI routing rewrites the path to a backing namespace, keep userspace on
     // the generic resolver so realpath() returns process-visible paths.
-    if (std::strcmp(local_backing_path.data(), backing_path.data()) != 0) {
+    if (!path_text_equal(local_backing_path.data(), local_backing_path_len, backing_path.data(), backing_path_len)) {
         return -ENOSYS;
     }
 
     ensure_wki_host_root_mount(backing_path.data());
 
-    std::array<char, MAX_PATH_LEN> resolved{};
+    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
     ret = realpath_resolve_visible_path(path, resolved.data(), resolved.size());
     if (ret < 0) {
         return ret;
     }
 
     Stat st{};
-    ret = vfs_stat_resolved(resolved.data(), &st);
+    size_t const RESOLVED_LEN = std::strlen(resolved.data());
+    if (!is_wki_entry_path(resolved.data())) {
+        ret = vfs_stat_resolved_cache_or_impl(resolved.data(), true, false, false, &st, RESOLVED_LEN);
+    } else {
+        ret = vfs_stat_resolved(resolved.data(), &st);
+    }
     if (ret < 0) {
         return ret;
     }
@@ -6503,29 +9506,49 @@ auto vfs_realpath(const char* path, char* buf, size_t bufsize) -> int {
         return -ERANGE;
     }
     std::memcpy(buf, visible_path.data(), LEN + 1);
+    if (len_out != nullptr) {
+        *len_out = LEN;
+    }
     return 0;
 }
 
-auto vfs_mkdir(const char* path, int mode) -> int {
-    (void)mode;
-    if (path == nullptr) {
+namespace {
+auto vfs_mkdir_cached_existing_directory_result(const char* abs_path, MountPoint const* mount, size_t known_abs_path_len = UNKNOWN_PATH_LEN,
+                                                uint64_t known_abs_path_hash = UNKNOWN_PATH_HASH) -> int {
+    if (abs_path == nullptr || mount == nullptr || !metadata_cacheable_fs(mount->fs_type)) {
+        return -EAGAIN;
+    }
+
+    Stat cached{};
+    int const CACHED_STAT = metadata_cache_lookup_mount_stat(abs_path, mount, true, true, &cached, known_abs_path_len, known_abs_path_hash);
+    if (CACHED_STAT == 0 && (cached.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFDIR)) {
+        return 0;
+    }
+
+    int const EXISTENCE_CACHED = existence_cache_lookup_mount(abs_path, mount, true, known_abs_path_len, known_abs_path_hash);
+    return EXISTENCE_CACHED == 0 ? 0 : -EAGAIN;
+}
+
+auto vfs_mkdir_resolved_path(const char* abs_path, int mode, size_t known_abs_path_len = UNKNOWN_PATH_LEN,
+                             uint64_t known_abs_path_hash = UNKNOWN_PATH_HASH) -> int {
+    if (abs_path == nullptr) {
         return -EINVAL;
     }
 
-    std::array<char, MAX_PATH_LEN> abs_path{};
-    if (resolve_task_path_raw(path, abs_path.data(), abs_path.size()) < 0) {
-        return -ENOENT;
-    }
-
-    auto mount_ref = find_mount_point(abs_path.data());
+    auto mount_ref = find_mount_point(abs_path, known_abs_path_len);
     MountPoint const* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
 
-    const char* fs_path = strip_mount_prefix(mount, abs_path.data());
+    const char* fs_path = strip_mount_prefix(mount, abs_path);
+    size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, abs_path, known_abs_path_len);
 
     if (fs_path[0] == '\0') {
+        return 0;
+    }
+
+    if (vfs_mkdir_cached_existing_directory_result(abs_path, mount, known_abs_path_len, known_abs_path_hash) == 0) {
         return 0;
     }
 
@@ -6534,17 +9557,33 @@ auto vfs_mkdir(const char* path, int mode) -> int {
         if (node == nullptr) {
             return -1;
         }
-        vfs_cache_notify_path_changed(abs_path.data(), nullptr);
+        auto* stat_node = ker::vfs::tmpfs::tmpfs_canonical_node(node);
+        Stat created_stat{};
+        bool const HAVE_DIRECTORY_STAT = stat_node != nullptr && stat_node->type == ker::vfs::tmpfs::TmpNodeType::DIRECTORY;
+        if (HAVE_DIRECTORY_STAT) {
+            fill_tmpfs_node_stat(mount->dev_id, stat_node, &created_stat);
+        }
+        vfs_cache_notify_path_changed(abs_path, nullptr);
+        if (HAVE_DIRECTORY_STAT) {
+            metadata_cache_store_non_symlink_stat_variants(abs_path, mount->fs_type, mount->dev_id, created_stat, metadata_snapshot_stamp(),
+                                                           known_abs_path_len, mount, known_abs_path_hash);
+        }
         return 0;
     }
 
     if (mount->fs_type == FSType::XFS) {
         auto* xctx = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
-        int const R = ker::vfs::xfs::xfs_mkdir_path(fs_path, mode, xctx);
+        Stat created_stat{};
+        int const R = ker::vfs::xfs::xfs_mkdir_path(fs_path, mode, xctx, &created_stat, FS_PATH_LEN);
         // mkdir -p calls mkdir on existing dirs; treat EEXIST as success
         int const RESULT = (R == -EEXIST) ? 0 : R;
         if (R == 0) {
-            vfs_cache_notify_path_changed(abs_path.data(), nullptr);
+            vfs_cache_notify_path_changed(abs_path, nullptr);
+            metadata_cache_store_non_symlink_stat_variants(abs_path, mount->fs_type, mount->dev_id, created_stat, metadata_snapshot_stamp(),
+                                                           known_abs_path_len, mount, known_abs_path_hash);
+        } else if (R == -EEXIST && (created_stat.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFDIR)) {
+            metadata_cache_store_non_symlink_stat_variants(abs_path, mount->fs_type, mount->dev_id, created_stat, metadata_snapshot_stamp(),
+                                                           known_abs_path_len, mount, known_abs_path_hash);
         }
         return RESULT;
     }
@@ -6553,56 +9592,684 @@ auto vfs_mkdir(const char* path, int mode) -> int {
         int const R = ker::net::wki::wki_remote_vfs_mkdir(mount->private_data, fs_path, mode);
         int const RESULT = (R == -EEXIST) ? 0 : R;
         if (R == 0) {
-            vfs_cache_notify_path_changed(abs_path.data(), nullptr);
+            vfs_cache_notify_path_changed(abs_path, nullptr);
         }
         return RESULT;
     }
 
     // For other mounts (devfs, procfs, etc.) return 0 if the directory exists
     ker::vfs::Stat st{};
-    if (vfs_stat(abs_path.data(), &st) == 0) {
+    if (vfs_stat(abs_path, &st) == 0) {
         return 0;
     }
     return -ENOSYS;
 }
+}  // namespace
+
+auto vfs_mkdir(const char* path, int mode) -> int {
+    if (path == nullptr) {
+        return -EINVAL;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    PathTextScan scan{};
+    if (task_absolute_local_path_fast_path_allowed(task, path, &scan)) {
+        return vfs_mkdir_resolved_path(path, mode, scan.path_len, scan.path_hash);
+    }
+
+    std::array<char, MAX_PATH_LEN> abs_path;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t abs_path_len = UNKNOWN_PATH_LEN;
+    uint64_t abs_path_hash = UNKNOWN_PATH_HASH;
+    if (resolve_task_path_raw_impl(path, abs_path.data(), abs_path.size(), true, &abs_path_len, &abs_path_hash) < 0) {
+        return -ENOENT;
+    }
+
+    return vfs_mkdir_resolved_path(abs_path.data(), mode, abs_path_len, abs_path_hash);
+}
+
+auto vfs_mkdirat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int mode) -> int {
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (pathname == nullptr) {
+        return -EINVAL;
+    }
+    if (pathname[0] == '\0') {
+        return -ENOENT;
+    }
+
+    PathTextScan scan{};
+    if (task_absolute_local_path_fast_path_allowed(task, pathname, &scan)) {
+        return vfs_mkdir_resolved_path(pathname, mode, scan.path_len, scan.path_hash);
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    bool require_directory = false;
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    uint64_t resolved_hash = UNKNOWN_PATH_HASH;
+    int const RESOLVE_RET = resolve_dirfd_task_path_raw(task, dirfd, pathname, resolved.data(), resolved.size(), true, &require_directory,
+                                                        &resolved_len, nullptr, &resolved_hash);
+    if (RESOLVE_RET < 0) {
+        return RESOLVE_RET;
+    }
+
+    (void)require_directory;
+    return vfs_mkdir_resolved_path(resolved.data(), mode, resolved_len, resolved_hash);
+}
+
+namespace {
+auto copy_common_local_dirfd_relative_path(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, const PathTextScan& scan,
+                                           char* out, size_t outsize, size_t* out_len = nullptr, uint64_t* out_hash = nullptr,
+                                           bool* trusted_dirfd_parent_out = nullptr) -> int {
+    if (out_hash != nullptr) {
+        *out_hash = UNKNOWN_PATH_HASH;
+    }
+    if (trusted_dirfd_parent_out != nullptr) {
+        *trusted_dirfd_parent_out = false;
+    }
+    if (task == nullptr || pathname == nullptr || out == nullptr || outsize == 0) {
+        return -EINVAL;
+    }
+    if (dirfd == AT_FDCWD) {
+        return copy_simple_relative_path_from_base(task->cwd.data(), pathname, scan, out, outsize, out_len, task_cached_cwd_len(task),
+                                                   out_hash);
+    }
+
+    auto fd_owner = fd_table_task_for(task);
+    auto* table_task = fd_owner.task;
+    if (table_task == nullptr) {
+        return -EBADF;
+    }
+
+    int result = -EBADF;
+    bool trusted_dirfd_parent = false;
+    uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+    auto* base_file = reinterpret_cast<File*>(table_task->fd_table.lookup(static_cast<uint64_t>(dirfd)));
+    if (base_file == nullptr) {
+        result = -EBADF;
+    } else if (!base_file->is_directory) {
+        result = -ENOTDIR;
+    } else if (base_file->vfs_path == nullptr) {
+        result = -EBADF;
+    } else {
+        bool const ROOT_IS_GLOBAL = task->root[0] == '/' && task->root[1] == '\0';
+        if (ROOT_IS_GLOBAL) {
+            result = copy_simple_relative_path_from_base(base_file->vfs_path, pathname, scan, out, outsize, out_len,
+                                                         file_vfs_path_len(base_file), out_hash);
+            trusted_dirfd_parent = result == 0 && path_text_is_simple_relative_basename(pathname, scan);
+        } else {
+            std::array<char, MAX_PATH_LEN> visible{};
+            int const STRIP_RET = strip_task_root_prefix(task, base_file->vfs_path, visible.data(), visible.size(), nullptr);
+            result = STRIP_RET < 0 ? STRIP_RET : copy_simple_relative_path_from_base(visible.data(), pathname, scan, out, outsize, out_len);
+        }
+    }
+    table_task->fd_table_lock.unlock_irqrestore(IRQF);
+    if (trusted_dirfd_parent_out != nullptr) {
+        *trusted_dirfd_parent_out = trusted_dirfd_parent;
+    }
+    return result;
+}
+
+auto resolve_dirfd_task_path_raw_common_local_fast_path(ker::mod::sched::task::Task* task, int dirfd, const char* pathname,
+                                                        const PathTextScan& scan, char* out, size_t outsize, bool apply_task_route,
+                                                        size_t* resolved_len_out = nullptr, uint64_t* resolved_hash_out = nullptr,
+                                                        bool* trusted_dirfd_parent_out = nullptr) -> int {
+    if (resolved_hash_out != nullptr) {
+        *resolved_hash_out = UNKNOWN_PATH_HASH;
+    }
+    if (trusted_dirfd_parent_out != nullptr) {
+        *trusted_dirfd_parent_out = false;
+    }
+    if (task == nullptr || pathname == nullptr || out == nullptr || outsize == 0) {
+        return -EINVAL;
+    }
+    if (!apply_task_route || scan.path_len == 0 || scan.path_len >= MAX_PATH_LEN) {
+        return RESOLVE_FAST_PATH_DECLINED;
+    }
+    if (pathname[0] == '/') {
+        return copy_common_local_visible_absolute_path_fast_path(task, pathname, scan, out, outsize, resolved_len_out, resolved_hash_out);
+    }
+    if (!task_has_common_local_vfs_routing(task)) {
+        return RESOLVE_FAST_PATH_DECLINED;
+    }
+
+    size_t visible_len = UNKNOWN_PATH_LEN;
+    uint64_t visible_hash = UNKNOWN_PATH_HASH;
+    bool trusted_dirfd_parent = false;
+    int const COPY_RET = copy_common_local_dirfd_relative_path(task, dirfd, pathname, scan, out, outsize, &visible_len, &visible_hash,
+                                                               &trusted_dirfd_parent);
+    if (COPY_RET != 0) {
+        return COPY_RET;
+    }
+    if (!common_local_visible_path_is_noop(out)) {
+        return RESOLVE_FAST_PATH_DECLINED;
+    }
+    if (task->root[0] == '/' && task->root[1] == '\0') {
+        if (resolved_len_out != nullptr) {
+            *resolved_len_out = visible_len;
+        }
+        if (resolved_hash_out != nullptr) {
+            *resolved_hash_out = visible_hash;
+        }
+        if (trusted_dirfd_parent_out != nullptr) {
+            *trusted_dirfd_parent_out = trusted_dirfd_parent;
+        }
+        return 0;
+    }
+    size_t const ROOT_VISIBLE_LEN = visible_len != UNKNOWN_PATH_LEN ? visible_len : std::strlen(out);
+    int const ROOT_COPY_RET = copy_task_visible_absolute_path_with_root(task, out, ROOT_VISIBLE_LEN, out, outsize, resolved_len_out);
+    if (ROOT_COPY_RET == 0 && resolved_hash_out != nullptr) {
+        size_t const RESOLVED_LEN =
+            resolved_len_out != nullptr && *resolved_len_out != UNKNOWN_PATH_LEN ? *resolved_len_out : std::strlen(out);
+        if (RESOLVED_LEN > 0 && RESOLVED_LEN < MAX_PATH_LEN) {
+            *resolved_hash_out = metadata_path_hash_raw(out, RESOLVED_LEN);
+        }
+    }
+    return ROOT_COPY_RET;
+}
+
+auto resolve_dirfd_task_path_raw(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, char* out, size_t outsize,
+                                 bool apply_task_route, bool* path_requires_directory_out, size_t* resolved_len_out,
+                                 bool* common_local_fast_path_out, uint64_t* resolved_hash_out, bool* trusted_dirfd_parent_out) -> int {
+    if (task == nullptr || pathname == nullptr || out == nullptr || outsize == 0) {
+        return -EINVAL;
+    }
+    if (common_local_fast_path_out != nullptr) {
+        *common_local_fast_path_out = false;
+    }
+    if (resolved_hash_out != nullptr) {
+        *resolved_hash_out = UNKNOWN_PATH_HASH;
+    }
+    if (trusted_dirfd_parent_out != nullptr) {
+        *trusted_dirfd_parent_out = false;
+    }
+
+    bool const ROOT_IS_GLOBAL = task->root[0] == '/' && task->root[1] == '\0';
+    PathTextScan const PATH_SCAN = scan_path_text(pathname);
+    size_t const PATH_LEN = PATH_SCAN.path_len;
+    if (path_requires_directory_out != nullptr) {
+        *path_requires_directory_out = PATH_SCAN.requires_directory;
+    }
+    bool trusted_dirfd_parent = false;
+    int const FAST_RET = resolve_dirfd_task_path_raw_common_local_fast_path(
+        task, dirfd, pathname, PATH_SCAN, out, outsize, apply_task_route, resolved_len_out, resolved_hash_out, &trusted_dirfd_parent);
+    if (FAST_RET == 0) {
+        if (common_local_fast_path_out != nullptr) {
+            *common_local_fast_path_out = true;
+        }
+        if (trusted_dirfd_parent_out != nullptr) {
+            *trusted_dirfd_parent_out = trusted_dirfd_parent;
+        }
+        return 0;
+    }
+    if (FAST_RET < 0) {
+        return FAST_RET;
+    }
+
+    bool const needs_canonicalize = PATH_SCAN.needs_canonicalize;
+    size_t out_len = UNKNOWN_PATH_LEN;
+    if (pathname[0] == '/') {
+        if (PATH_LEN + 1 > outsize) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(out, pathname, PATH_LEN + 1);
+        out_len = PATH_LEN;
+    } else {
+        std::array<char, MAX_PATH_LEN> visible;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+        const char* base = nullptr;
+        auto* base_file = static_cast<File*>(nullptr);
+        size_t known_base_len = UNKNOWN_PATH_LEN;
+        if (dirfd == AT_FDCWD) {
+            base = task->cwd.data();
+            known_base_len = task_cached_cwd_len(task);
+        } else {
+            auto* file = vfs_get_file_retain(task, dirfd);
+            if (file == nullptr) {
+                return -EBADF;
+            }
+            if (!file->is_directory) {
+                vfs_put_file(file);
+                return -ENOTDIR;
+            }
+            if (file->vfs_path == nullptr) {
+                vfs_put_file(file);
+                return -EBADF;
+            }
+            if (ROOT_IS_GLOBAL) {
+                base_file = file;
+                base = file->vfs_path;
+            } else {
+                int const STRIP_RET = strip_task_root_prefix(task, file->vfs_path, visible.data(), visible.size(), nullptr);
+                vfs_put_file(file);
+                if (STRIP_RET < 0) {
+                    return STRIP_RET;
+                }
+                base = visible.data();
+            }
+        }
+
+        size_t base_len = known_base_len != UNKNOWN_PATH_LEN ? known_base_len : std::strlen(base);
+        while (base_len > 1 && base[base_len - 1] == '/') {
+            --base_len;
+        }
+
+        size_t const SEP_LEN = (base_len == 1 && base[0] == '/') ? 0 : 1;
+        if (base_len + SEP_LEN + PATH_LEN + 1 > outsize) {
+            if (base_file != nullptr) {
+                vfs_put_file(base_file);
+            }
+            return -ENAMETOOLONG;
+        }
+
+        std::memcpy(out, base, base_len);
+        size_t suffix_pos = base_len;
+        if (SEP_LEN != 0) {
+            out[suffix_pos++] = '/';
+        }
+        std::memcpy(out + suffix_pos, pathname, PATH_LEN + 1);
+        out_len = suffix_pos + PATH_LEN;
+        if (base_file != nullptr) {
+            vfs_put_file(base_file);
+        }
+    }
+
+    int result = 0;
+    if (needs_canonicalize) {
+        result = canonicalize_path(out, outsize);
+        if (result < 0) {
+            return result;
+        }
+        out_len = UNKNOWN_PATH_LEN;
+    }
+
+    if (!ROOT_IS_GLOBAL) {
+        size_t const ROOT_LEN = task_cached_root_len(task);
+        if (ROOT_LEN > 1) {
+            size_t const OUT_LEN = out_len != UNKNOWN_PATH_LEN ? out_len : std::strlen(out);
+            if (ROOT_LEN + OUT_LEN + 1 > outsize) {
+                return -ENAMETOOLONG;
+            }
+            std::memmove(out + ROOT_LEN, out, OUT_LEN + 1);
+            std::memcpy(out, task->root.data(), ROOT_LEN);
+            out_len = ROOT_LEN + OUT_LEN;
+        }
+    }
+
+    if (!apply_task_route) {
+        if (resolved_len_out != nullptr) {
+            *resolved_len_out = out_len != UNKNOWN_PATH_LEN ? out_len : std::strlen(out);
+        }
+        return 0;
+    }
+
+    if (task_vfs_route_is_common_local_noop(task, out)) {
+        if (resolved_len_out != nullptr) {
+            *resolved_len_out = out_len != UNKNOWN_PATH_LEN ? out_len : std::strlen(out);
+        }
+        return 0;
+    }
+
+    std::array<char, MAX_PATH_LEN> routed{};
+    result = apply_task_vfs_route(task, out, routed.data(), routed.size());
+    if (result < 0) {
+        return result;
+    }
+    size_t routed_len = UNKNOWN_PATH_LEN;
+    int const COPY_RET = copy_path_string(routed.data(), out, outsize, UNKNOWN_PATH_LEN, &routed_len);
+    if (COPY_RET == 0 && resolved_len_out != nullptr) {
+        *resolved_len_out = routed_len;
+    }
+    return COPY_RET;
+}
+
+auto resolve_dirfd_task_path_raw_with_absolute_local_fast_path(ker::mod::sched::task::Task* task, int dirfd, const char* pathname,
+                                                               char* out, size_t outsize, bool apply_task_route,
+                                                               bool* path_requires_directory_out, size_t* resolved_len_out,
+                                                               uint64_t* resolved_hash_out) -> int {
+    if (resolved_hash_out != nullptr) {
+        *resolved_hash_out = UNKNOWN_PATH_HASH;
+    }
+    PathTextScan scan{};
+    if (apply_task_route && task_absolute_local_path_fast_path_allowed(task, pathname, &scan)) {
+        if (out == nullptr || outsize == 0) {
+            return -EINVAL;
+        }
+        if (scan.path_len + 1 > outsize) {
+            return -ENAMETOOLONG;
+        }
+        if (path_requires_directory_out != nullptr) {
+            *path_requires_directory_out = scan.requires_directory;
+        }
+        std::memcpy(out, pathname, scan.path_len + 1);
+        if (resolved_len_out != nullptr) {
+            *resolved_len_out = scan.path_len;
+        }
+        if (resolved_hash_out != nullptr) {
+            *resolved_hash_out = scan.path_hash;
+        }
+        return 0;
+    }
+
+    return resolve_dirfd_task_path_raw(task, dirfd, pathname, out, outsize, apply_task_route, path_requires_directory_out, resolved_len_out,
+                                       nullptr, resolved_hash_out);
+}
+
+#ifdef WOS_SELFTEST
+auto common_local_relative_resolver_fast_path_selftest_impl() -> bool {
+    ker::mod::sched::task::Task task{};
+    if (copy_path_string("/tmp", task.cwd.data(), task.cwd.size()) < 0) {
+        return false;
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved{};
+    uint64_t resolved_hash = UNKNOWN_PATH_HASH;
+    int ret = resolve_dirfd_task_path_raw_common_local_fast_path(&task, AT_FDCWD, "file", scan_path_text("file"), resolved.data(),
+                                                                 resolved.size(), true, nullptr, &resolved_hash);
+    bool ok = ret == 0 && std::strcmp(resolved.data(), "/tmp/file") == 0 &&
+              resolved_hash == metadata_path_hash_raw("/tmp/file", std::strlen("/tmp/file"));
+
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    resolved_hash = UNKNOWN_PATH_HASH;
+    ret = copy_common_local_visible_absolute_path_fast_path(&task, "/tmp/./file", scan_path_text("/tmp/./file"), resolved.data(),
+                                                            resolved.size(), &resolved_len, &resolved_hash);
+    ok = ok && ret == 0 && resolved_len == std::strlen("/tmp/file") && std::strcmp(resolved.data(), "/tmp/file") == 0 &&
+         resolved_hash == metadata_path_hash_raw("/tmp/file", std::strlen("/tmp/file"));
+
+    resolved_len = UNKNOWN_PATH_LEN;
+    resolved_hash = UNKNOWN_PATH_HASH;
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&task, AT_FDCWD, "/tmp/./file", scan_path_text("/tmp/./file"), resolved.data(),
+                                                             resolved.size(), true, &resolved_len, &resolved_hash);
+    ok = ok && ret == 0 && resolved_len == std::strlen("/tmp/file") && std::strcmp(resolved.data(), "/tmp/file") == 0 &&
+         resolved_hash == metadata_path_hash_raw("/tmp/file", std::strlen("/tmp/file"));
+
+    resolved_hash = 1;
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&task, AT_FDCWD, ".", scan_path_text("."), resolved.data(), resolved.size(),
+                                                             true, nullptr, &resolved_hash);
+    ok =
+        ok && ret == 0 && std::strcmp(resolved.data(), "/tmp") == 0 && resolved_hash == metadata_path_hash_raw("/tmp", std::strlen("/tmp"));
+
+    resolved_hash = UNKNOWN_PATH_HASH;
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&task, AT_FDCWD, "./", scan_path_text("./"), resolved.data(), resolved.size(),
+                                                             true, nullptr, &resolved_hash);
+    ok =
+        ok && ret == 0 && std::strcmp(resolved.data(), "/tmp") == 0 && resolved_hash == metadata_path_hash_raw("/tmp", std::strlen("/tmp"));
+
+    resolved_hash = UNKNOWN_PATH_HASH;
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&task, AT_FDCWD, "./file", scan_path_text("./file"), resolved.data(),
+                                                             resolved.size(), true, nullptr, &resolved_hash);
+    ok = ok && ret == 0 && std::strcmp(resolved.data(), "/tmp/file") == 0 &&
+         resolved_hash == metadata_path_hash_raw("/tmp/file", std::strlen("/tmp/file"));
+
+    if (copy_path_string("/tmp/sub", task.cwd.data(), task.cwd.size()) < 0) {
+        return false;
+    }
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&task, AT_FDCWD, "../file", scan_path_text("../file"), resolved.data(),
+                                                             resolved.size(), true, nullptr, &resolved_hash);
+    ok = ok && ret == 0 && std::strcmp(resolved.data(), "/tmp/file") == 0 &&
+         resolved_hash == metadata_path_hash_raw("/tmp/file", std::strlen("/tmp/file"));
+
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&task, AT_FDCWD, "../../file", scan_path_text("../../file"), resolved.data(),
+                                                             resolved.size(), true, nullptr, &resolved_hash);
+    ok = ok && ret == 0 && std::strcmp(resolved.data(), "/file") == 0 &&
+         resolved_hash == metadata_path_hash_raw("/file", std::strlen("/file"));
+
+    if (copy_path_string("/tmp", task.cwd.data(), task.cwd.size()) < 0) {
+        return false;
+    }
+
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&task, AT_FDCWD, "file/", scan_path_text("file/"), resolved.data(),
+                                                             resolved.size(), true, nullptr, &resolved_hash);
+    ok = ok && ret == 0 && std::strcmp(resolved.data(), "/tmp/file") == 0 &&
+         resolved_hash == metadata_path_hash_raw("/tmp/file", std::strlen("/tmp/file"));
+
+    bool requires_directory = false;
+    bool common_local_fast_path = false;
+    resolved_len = UNKNOWN_PATH_LEN;
+    resolved_hash = UNKNOWN_PATH_HASH;
+    ret = resolve_dirfd_task_path_raw(&task, AT_FDCWD, "file/", resolved.data(), resolved.size(), true, &requires_directory, &resolved_len,
+                                      &common_local_fast_path, &resolved_hash);
+    ok = ok && ret == 0 && requires_directory && common_local_fast_path && resolved_len == std::strlen("/tmp/file") &&
+         std::strcmp(resolved.data(), "/tmp/file") == 0 && resolved_hash == metadata_path_hash_raw("/tmp/file", std::strlen("/tmp/file"));
+
+    common_local_fast_path = true;
+    resolved_len = UNKNOWN_PATH_LEN;
+    ret = resolve_dirfd_task_path_raw(&task, AT_FDCWD, "file", resolved.data(), resolved.size(), false, nullptr, &resolved_len,
+                                      &common_local_fast_path);
+    ok = ok && ret == 0 && !common_local_fast_path && resolved_len == std::strlen("/tmp/file") &&
+         std::strcmp(resolved.data(), "/tmp/file") == 0;
+
+    requires_directory = false;
+    ret = resolve_dirfd_task_path_raw(&task, AT_FDCWD, "./", resolved.data(), resolved.size(), true, &requires_directory);
+    ok = ok && ret == 0 && requires_directory && std::strcmp(resolved.data(), "/tmp") == 0;
+
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&task, AT_FDCWD, "wki/node", scan_path_text("wki/node"), resolved.data(),
+                                                             resolved.size(), true);
+    ok = ok && ret == 0 && std::strcmp(resolved.data(), "/tmp/wki/node") == 0;
+
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&task, AT_FDCWD, "/tmp/../wki/node", scan_path_text("/tmp/../wki/node"),
+                                                             resolved.data(), resolved.size(), true);
+    ok = ok && ret == RESOLVE_FAST_PATH_DECLINED;
+
+    ker::mod::sched::task::Task rooted_task{};
+    if (copy_path_string("/rootfs", rooted_task.root.data(), rooted_task.root.size()) < 0 ||
+        copy_path_string("/tmp", rooted_task.cwd.data(), rooted_task.cwd.size()) < 0) {
+        return false;
+    }
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&rooted_task, AT_FDCWD, "/usr/bin", scan_path_text("/usr/bin"),
+                                                             resolved.data(), resolved.size(), true);
+    ok = ok && ret == 0 && std::strcmp(resolved.data(), "/rootfs/usr/bin") == 0;
+
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&rooted_task, AT_FDCWD, "/./usr//bin/", scan_path_text("/./usr//bin/"),
+                                                             resolved.data(), resolved.size(), true);
+    ok = ok && ret == 0 && std::strcmp(resolved.data(), "/rootfs/usr/bin") == 0;
+
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&rooted_task, AT_FDCWD, "/usr/../bin", scan_path_text("/usr/../bin"),
+                                                             resolved.data(), resolved.size(), true);
+    ok = ok && ret == 0 && std::strcmp(resolved.data(), "/rootfs/bin") == 0;
+
+    requires_directory = false;
+    ret = resolve_dirfd_task_path_raw(&rooted_task, AT_FDCWD, "/./usr//bin/", resolved.data(), resolved.size(), true, &requires_directory);
+    ok = ok && ret == 0 && requires_directory && std::strcmp(resolved.data(), "/rootfs/usr/bin") == 0;
+
+    if (copy_path_string("/tmp/sub", rooted_task.cwd.data(), rooted_task.cwd.size()) < 0) {
+        return false;
+    }
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&rooted_task, AT_FDCWD, "../file", scan_path_text("../file"), resolved.data(),
+                                                             resolved.size(), true);
+    ok = ok && ret == 0 && std::strcmp(resolved.data(), "/rootfs/tmp/file") == 0;
+
+    if (copy_path_string("/tmp", rooted_task.cwd.data(), rooted_task.cwd.size()) < 0) {
+        return false;
+    }
+
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&rooted_task, AT_FDCWD, "file", scan_path_text("file"), resolved.data(),
+                                                             resolved.size(), true);
+    ok = ok && ret == 0 && std::strcmp(resolved.data(), "/rootfs/tmp/file") == 0;
+
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&rooted_task, AT_FDCWD, ".", scan_path_text("."), resolved.data(),
+                                                             resolved.size(), true);
+    ok = ok && ret == 0 && std::strcmp(resolved.data(), "/rootfs/tmp") == 0;
+
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&rooted_task, AT_FDCWD, "./file", scan_path_text("./file"), resolved.data(),
+                                                             resolved.size(), true);
+    ok = ok && ret == 0 && std::strcmp(resolved.data(), "/rootfs/tmp/file") == 0;
+
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&rooted_task, AT_FDCWD, "/wki/node", scan_path_text("/wki/node"),
+                                                             resolved.data(), resolved.size(), true);
+    ok = ok && ret == RESOLVE_FAST_PATH_DECLINED;
+
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&rooted_task, AT_FDCWD, "/./wki/node", scan_path_text("/./wki/node"),
+                                                             resolved.data(), resolved.size(), true);
+    ok = ok && ret == RESOLVE_FAST_PATH_DECLINED;
+
+    ret = resolve_dirfd_task_path_raw_common_local_fast_path(&rooted_task, AT_FDCWD, "/usr/../wki/node", scan_path_text("/usr/../wki/node"),
+                                                             resolved.data(), resolved.size(), true);
+    ok = ok && ret == RESOLVE_FAST_PATH_DECLINED;
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_common_local_relative_resolver";
+    constexpr const char* FILE_PATH = "/tmp/ktest_common_local_relative_resolver/file";
+    vfs_unlink(FILE_PATH);
+    vfs_rmdir(DIR_PATH);
+    ok = (vfs_mkdir(DIR_PATH, 0755) == 0) && ok;
+
+    auto* dir = vfs_open_file(DIR_PATH, 0, 0);
+    if (dir == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+
+    int const DIRFD = vfs_alloc_fd(&task, dir);
+    ok = ok && DIRFD >= 0;
+    if (DIRFD >= 0) {
+        bool trusted_dirfd_parent = true;
+        ret = resolve_dirfd_task_path_raw(&task, DIRFD, "../sibling", resolved.data(), resolved.size(), true, nullptr, nullptr, nullptr,
+                                          nullptr, &trusted_dirfd_parent);
+        ok = ok && ret == 0 && !trusted_dirfd_parent;
+
+        trusted_dirfd_parent = false;
+        ret = resolve_dirfd_task_path_raw(&task, DIRFD, "child", resolved.data(), resolved.size(), true, nullptr, nullptr, nullptr, nullptr,
+                                          &trusted_dirfd_parent);
+        ok = ok && ret == 0 && trusted_dirfd_parent;
+
+        ret = resolve_dirfd_task_path_raw_common_local_fast_path(&task, DIRFD, "child", scan_path_text("child"), resolved.data(),
+                                                                 resolved.size(), true);
+        ok = ok && ret == 0 && std::strcmp(resolved.data(), "/tmp/ktest_common_local_relative_resolver/child") == 0;
+        ret = resolve_dirfd_task_path_raw_common_local_fast_path(&task, DIRFD, "../sibling", scan_path_text("../sibling"), resolved.data(),
+                                                                 resolved.size(), true);
+        ok = ok && ret == 0 && std::strcmp(resolved.data(), "/tmp/sibling") == 0;
+        ok = (vfs_release_fd(&task, DIRFD) == 0) && ok;
+    }
+    vfs_put_file(dir);
+
+    auto* file = vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (file == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    int const FILEFD = vfs_alloc_fd(&task, file);
+    ok = ok && FILEFD >= 0;
+    if (FILEFD >= 0) {
+        ret = resolve_dirfd_task_path_raw_common_local_fast_path(&task, FILEFD, "child", scan_path_text("child"), resolved.data(),
+                                                                 resolved.size(), true);
+        ok = ok && ret == -ENOTDIR;
+        ok = (vfs_release_fd(&task, FILEFD) == 0) && ok;
+    }
+    vfs_put_file(file);
+    ok = (vfs_unlink(FILE_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    ok = task.fd_table.empty() && ok;
+    return ok;
+}
+#endif
+
+auto metadata_cache_lookup_mount_stat(const char* resolved_path, MountPoint const* mount, bool follow_final_symlink, bool require_directory,
+                                      Stat* statbuf, size_t known_path_len, uint64_t known_raw_path_hash) -> int {
+    if (resolved_path == nullptr || mount == nullptr || statbuf == nullptr || mount->fs_type == FSType::REMOTE) {
+        return -EAGAIN;
+    }
+
+    size_t const PATH_LEN = known_path_len != UNKNOWN_PATH_LEN ? known_path_len : std::strlen(resolved_path);
+    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
+        return -EAGAIN;
+    }
+    uint64_t const RAW_HASH = known_raw_path_hash != UNKNOWN_PATH_HASH && known_path_len != UNKNOWN_PATH_LEN
+                                  ? known_raw_path_hash
+                                  : metadata_path_hash_raw(resolved_path, PATH_LEN);
+    return metadata_cache_lookup_prehashed(resolved_path, PATH_LEN, RAW_HASH, mount->fs_type, mount->dev_id,
+                                           follow_final_symlink || require_directory, require_directory, statbuf, false);
+}
+
+}  // namespace
+
+#ifdef WOS_SELFTEST
+auto vfs_selftest_common_local_relative_resolver_fast_path() -> bool { return common_local_relative_resolver_fast_path_selftest_impl(); }
+#endif
+
+namespace {
+auto vfs_pre_symlink_negative_existence_result(const char* current_path, MountPoint const* mount, bool follow_final_symlink,
+                                               bool require_directory, size_t current_path_len, uint64_t known_raw_path_hash) -> int {
+    if (current_path == nullptr || mount == nullptr || current_path_len == UNKNOWN_PATH_LEN || current_path_len == 0 ||
+        current_path_len >= MAX_PATH_LEN || mount->fs_type == FSType::REMOTE || !metadata_cacheable_fs(mount->fs_type)) {
+        return -EAGAIN;
+    }
+
+    MetadataSnapshotStamp const STAT_STAMP = metadata_snapshot_stamp();
+    const char* fs_path = strip_mount_prefix(mount, current_path);
+    size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, current_path, current_path_len);
+    int result = -EAGAIN;
+
+    switch (mount->fs_type) {
+        case FSType::TMPFS: {
+            auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, false);
+            result = node == nullptr ? -ENOENT : 0;
+            break;
+        }
+        case FSType::FAT32: {
+            Stat ignored{};
+            result = ker::vfs::fat32::fat32_stat(fs_path, &ignored, static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data));
+            break;
+        }
+        case FSType::XFS:
+            result = ker::vfs::xfs::xfs_path_exists(fs_path, false, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data),
+                                                    FS_PATH_LEN);
+            break;
+        default:
+            return -EAGAIN;
+    }
+
+    if (!existence_cache_negative_result(result)) {
+        return -EAGAIN;
+    }
+    if (result == -ENOENT) {
+        Stat synthetic{};
+        if (fill_synthetic_mount_dir_stat(current_path, &synthetic) == 0) {
+            return -EAGAIN;
+        }
+        metadata_cache_store_missing_observation(current_path, mount, STAT_STAMP, current_path_len, known_raw_path_hash);
+        return -ENOENT;
+    }
+
+    metadata_cache_store(current_path, mount->fs_type, mount->dev_id, follow_final_symlink, require_directory, result, nullptr, STAT_STAMP,
+                         current_path_len, known_raw_path_hash);
+    existence_cache_store(current_path, mount, require_directory, result, STAT_STAMP, current_path_len, known_raw_path_hash);
+    return result;
+}
+}  // namespace
 
 static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolve_task_path, bool apply_task_policy,
-                          bool follow_final_symlink) -> int {
+                          bool follow_final_symlink, bool force_require_directory = false, MountRef* resolved_mount_ref = nullptr,
+                          bool pre_symlink_metadata_cache_missed = false, size_t known_path_len = UNKNOWN_PATH_LEN,
+                          bool pre_symlink_existence_negative_cache_missed = false, uint64_t known_raw_path_hash = UNKNOWN_PATH_HASH)
+    -> int {
     if (path == nullptr || statbuf == nullptr) {
         return -EINVAL;
     }
 
-    bool const REQUIRE_DIRECTORY = resolve_task_path && path_requires_directory(path);
+    bool const REQUIRE_DIRECTORY = force_require_directory || (resolve_task_path && path_requires_directory(path));
     bool const EFFECTIVE_FOLLOW_FINAL_SYMLINK = follow_final_symlink || REQUIRE_DIRECTORY;
     bool is_wki_entry = false;
+    char pathBuffer[MAX_PATH_LEN];  // NOLINT
+    const char* current_path = nullptr;
+    size_t current_path_len = UNKNOWN_PATH_LEN;
+    uint64_t current_path_hash = UNKNOWN_PATH_HASH;
     if (resolve_task_path) {
         // WOSLINK detection: compute canonical pre-rewrite path to detect /wki
         // entries before resolve_task_path_raw rewrites them (e.g., /wki/host -> /).
-        std::array<char, MAX_PATH_LEN> pre_rewrite{};
-        if (make_absolute(path, pre_rewrite.data(), pre_rewrite.size()) == 0 &&
-            canonicalize_path(pre_rewrite.data(), pre_rewrite.size()) == 0) {
-            if (std::strcmp(pre_rewrite.data(), "/wki") == 0) {
-                is_wki_entry = true;
-            } else if (std::strncmp(pre_rewrite.data(), "/wki/", 5) == 0) {
-                // Direct child of /wki (one component, no further slashes)
-                const char* child = pre_rewrite.data() + 5;
-                bool has_slash = false;
-                for (const char* p = child; *p != '\0'; ++p) {
-                    if (*p == '/') {
-                        has_slash = true;
-                        break;
-                    }
-                }
-                if (*child != '\0' && !has_slash) {
-                    is_wki_entry = true;
-                }
-            }
+        size_t path_buffer_len = UNKNOWN_PATH_LEN;
+        if (make_absolute(path, pathBuffer, MAX_PATH_LEN, &path_buffer_len) < 0) {
+            log_loader_path_event("stat-resolve-failed", path, nullptr, nullptr, -ENOENT);
+            return -ENOENT;
         }
-    }
+        if (path_text_needs_canonicalize(pathBuffer, path_buffer_len)) {
+            if (canonicalize_path(pathBuffer, MAX_PATH_LEN) < 0) {
+                log_loader_path_event("stat-resolve-failed", path, nullptr, nullptr, -ENOENT);
+                return -ENOENT;
+            }
+            path_buffer_len = UNKNOWN_PATH_LEN;
+        }
+        is_wki_entry = is_wki_entry_path(pathBuffer);
 
-    char pathBuffer[MAX_PATH_LEN];  // NOLINT
-    if (resolve_task_path) {
-        if (resolve_task_path_raw(path, pathBuffer, MAX_PATH_LEN) < 0) {
+        if (finish_canonical_task_path_raw(pathBuffer, MAX_PATH_LEN, true, path_buffer_len, &path_buffer_len) < 0) {
             log_loader_path_event("stat-resolve-failed", path, nullptr, nullptr, -ENOENT);
             return -ENOENT;
         }
@@ -6613,87 +10280,159 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
         if (!is_wki_entry) {
             ensure_wki_host_root_mount(pathBuffer);
         }
-    } else if (copy_path_string(path, pathBuffer, sizeof(pathBuffer)) < 0) {
-        return -ENOENT;
+        current_path = pathBuffer;
+        current_path_len = path_buffer_len;
+    } else {
+        size_t const PATH_LEN = known_path_len != UNKNOWN_PATH_LEN ? known_path_len : std::strlen(path);
+        if (PATH_LEN >= sizeof(pathBuffer)) {
+            return -ENOENT;
+        }
+        current_path = path;
+        current_path_len = PATH_LEN;
+        if (known_raw_path_hash != UNKNOWN_PATH_HASH && known_path_len != UNKNOWN_PATH_LEN) {
+            current_path_hash = known_raw_path_hash;
+        }
     }
-    log_loader_path_event("stat-resolved", path, pathBuffer, nullptr, 0);
+    log_loader_path_event("stat-resolved", path, current_path, nullptr, 0);
 
     // Remote mounts resolve symlinks on the server side during the actual stat.
     // Avoid a redundant client-side READLINK walk here; it pessimizes metadata
     // traffic and can fail independently of the real remote stat operation.
-    auto mount_ref = find_mount_point(pathBuffer);
+    MountRef mount_ref = resolved_mount_ref != nullptr ? std::move(*resolved_mount_ref) : find_mount_point(current_path, current_path_len);
     MountPoint const* mount = mount_ref.get();
     bool const REMOTE_MOUNT = (mount != nullptr && mount->fs_type == FSType::REMOTE);
+    bool path_changed_by_symlink = false;
+    bool stat_cache_missed_before_symlink = false;
+    bool existence_negative_missed_before_symlink = pre_symlink_existence_negative_cache_missed;
+    uint64_t metadata_store_epoch_before_symlink = 0;
 
     if (mount != nullptr && !REMOTE_MOUNT && !is_wki_entry) {
-        int const CACHED_RESULT = metadata_cache_lookup(pathBuffer, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK,
-                                                        REQUIRE_DIRECTORY, statbuf, false);
-        if (CACHED_RESULT != -EAGAIN) {
-            log_loader_path_event(CACHED_RESULT == 0 ? "stat-cache-hit-pre-symlink" : "stat-cache-negative-hit-pre-symlink", path,
-                                  pathBuffer, mount, CACHED_RESULT);
-            return CACHED_RESULT;
+        if (pre_symlink_metadata_cache_missed) {
+            stat_cache_missed_before_symlink = metadata_cacheable_fs(mount->fs_type);
+        } else {
+            int const CACHED_RESULT =
+                current_path_hash != UNKNOWN_PATH_HASH
+                    ? metadata_cache_lookup_prehashed(current_path, current_path_len, current_path_hash, mount->fs_type, mount->dev_id,
+                                                      EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, statbuf, true)
+                    : metadata_cache_lookup(current_path, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY,
+                                            statbuf, true, current_path_len);
+            if (CACHED_RESULT != -EAGAIN) {
+                log_loader_path_event(CACHED_RESULT == 0 ? "stat-cache-hit-pre-symlink" : "stat-cache-negative-hit-pre-symlink", path,
+                                      current_path, mount, CACHED_RESULT);
+                return CACHED_RESULT;
+            }
+            stat_cache_missed_before_symlink = metadata_cacheable_fs(mount->fs_type);
+        }
+        if (stat_cache_missed_before_symlink) {
+            metadata_store_epoch_before_symlink = g_metadata_store_observation_epoch.load(std::memory_order_acquire);
+            if (!existence_negative_missed_before_symlink) {
+                int const EXISTENCE_NEGATIVE =
+                    existence_cache_lookup_negative_mount(current_path, mount, REQUIRE_DIRECTORY, current_path_len, current_path_hash);
+                if (EXISTENCE_NEGATIVE != -EAGAIN) {
+                    return EXISTENCE_NEGATIVE;
+                }
+                existence_negative_missed_before_symlink = true;
+            }
         }
     }
 
-    if (!REMOTE_MOUNT) {
+    bool const SKIP_FINAL_SYMLINK_PROBE =
+        mount != nullptr && !REMOTE_MOUNT && !is_wki_entry && EFFECTIVE_FOLLOW_FINAL_SYMLINK &&
+        metadata_cache_proves_final_not_symlink(current_path, mount->fs_type, mount->dev_id, current_path_len, nullptr, current_path_hash);
+    bool const PARENT_SYMLINK_PREFIX_KNOWN_NOOP =
+        mount != nullptr && !REMOTE_MOUNT && !is_wki_entry && symlink_prefix_cache_covers_parent(current_path, current_path_len, mount);
+    bool const SYMLINK_RESOLUTION_KNOWN_NOOP =
+        PARENT_SYMLINK_PREFIX_KNOWN_NOOP && (!EFFECTIVE_FOLLOW_FINAL_SYMLINK || SKIP_FINAL_SYMLINK_PROBE);
+
+    if (!SYMLINK_RESOLUTION_KNOWN_NOOP && PARENT_SYMLINK_PREFIX_KNOWN_NOOP && EFFECTIVE_FOLLOW_FINAL_SYMLINK) {
+        int const EXISTENCE_RESULT = vfs_pre_symlink_negative_existence_result(current_path, mount, EFFECTIVE_FOLLOW_FINAL_SYMLINK,
+                                                                               REQUIRE_DIRECTORY, current_path_len, current_path_hash);
+        if (EXISTENCE_RESULT != -EAGAIN) {
+            return EXISTENCE_RESULT;
+        }
+    }
+
+    if (!REMOTE_MOUNT && !SYMLINK_RESOLUTION_KNOWN_NOOP) {
         char resolved[MAX_PATH_LEN];  // NOLINT
-        int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy, EFFECTIVE_FOLLOW_FINAL_SYMLINK);
+        size_t resolved_len = current_path_len;
+        bool const RESOLVE_FINAL_SYMLINK = EFFECTIVE_FOLLOW_FINAL_SYMLINK && !SKIP_FINAL_SYMLINK_PROBE;
+        int const RESOLVE_RET = resolve_symlinks(current_path, resolved, MAX_PATH_LEN, apply_task_policy, RESOLVE_FINAL_SYMLINK,
+                                                 current_path_len, &resolved_len);
         if (RESOLVE_RET == -ELOOP) {
             return -ELOOP;
         }
         if (RESOLVE_RET < 0) {
-            log_loader_path_event("stat-symlink-failed", path, pathBuffer, nullptr, RESOLVE_RET);
+            log_loader_path_event("stat-symlink-failed", path, current_path, nullptr, RESOLVE_RET);
             return RESOLVE_RET;
         }
-        std::memcpy(pathBuffer, resolved, MAX_PATH_LEN);
-        log_loader_path_event("stat-symlink-resolved", path, pathBuffer, nullptr, RESOLVE_RET);
+        path_changed_by_symlink = !path_text_equal(current_path, current_path_len, resolved, resolved_len);
+        if (path_changed_by_symlink) {
+            int const COPY_RET = copy_path_string(resolved, pathBuffer, sizeof(pathBuffer), resolved_len);
+            if (COPY_RET < 0) {
+                return COPY_RET;
+            }
+            current_path = pathBuffer;
+            current_path_hash = UNKNOWN_PATH_HASH;
+        }
+        current_path_len = resolved_len;
+        log_loader_path_event("stat-symlink-resolved", path, current_path, nullptr, RESOLVE_RET);
+    } else if (SYMLINK_RESOLUTION_KNOWN_NOOP) {
+        log_loader_path_event("stat-symlink-cached-noop", path, current_path, mount, 0);
     } else {
-        log_loader_path_event("stat-symlink-deferred-remote", path, pathBuffer, mount, 0);
+        log_loader_path_event("stat-symlink-deferred-remote", path, current_path, mount, 0);
     }
 
     // Post-rewrite WOSLINK check: after host alias rewriting, deeper paths
     // like /wki/host/wki resolve to /wki, and /wki/host/wki/wos-1 resolves
-    // to /wki/wos-1.  Catch these by examining the resolved pathBuffer.
+    // to /wki/wos-1.  Catch these by examining the resolved path.
     if (!is_wki_entry) {
-        if (std::strcmp(pathBuffer, "/wki") == 0) {
-            is_wki_entry = true;
-        } else if (std::strncmp(pathBuffer, "/wki/", 5) == 0) {
-            const char* child = pathBuffer + 5;
-            bool has_slash = false;
-            for (const char* p = child; *p != '\0'; ++p) {
-                if (*p == '/') {
-                    has_slash = true;
-                    break;
-                }
-            }
-            if (*child != '\0' && !has_slash) {
-                is_wki_entry = true;
-            }
-        }
+        is_wki_entry = is_wki_entry_path(current_path);
     }
 
     // Find mount point
-    mount_ref = find_mount_point(pathBuffer);
-    mount = mount_ref.get();
+    if (path_changed_by_symlink) {
+        mount_ref = find_mount_point(current_path, current_path_len);
+        mount = mount_ref.get();
+    }
     if (mount == nullptr) {
-        log_loader_path_event("stat-mount-miss", path, pathBuffer, nullptr, -ENOENT);
+        log_loader_path_event("stat-mount-miss", path, current_path, nullptr, -ENOENT);
         return -ENOENT;
     }
-    log_loader_path_event("stat-mount-found", path, pathBuffer, mount, 0);
+    log_loader_path_event("stat-mount-found", path, current_path, mount, 0);
 
-    const char* fs_path = strip_mount_prefix(mount, pathBuffer);
-    if (!is_wki_entry) {
+    const char* fs_path = strip_mount_prefix(mount, current_path);
+    size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, current_path, current_path_len);
+    bool const metadata_store_observed_during_symlink =
+        stat_cache_missed_before_symlink && metadata_store_epoch_before_symlink != 0 &&
+        g_metadata_store_observation_epoch.load(std::memory_order_acquire) != metadata_store_epoch_before_symlink;
+    if (!is_wki_entry && (path_changed_by_symlink || !stat_cache_missed_before_symlink || metadata_store_observed_during_symlink)) {
         int const CACHED_RESULT =
-            metadata_cache_lookup(pathBuffer, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, statbuf);
+            current_path_hash != UNKNOWN_PATH_HASH
+                ? metadata_cache_lookup_prehashed(current_path, current_path_len, current_path_hash, mount->fs_type, mount->dev_id,
+                                                  EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, statbuf, true)
+                : metadata_cache_lookup(current_path, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY,
+                                        statbuf, true, current_path_len);
         if (CACHED_RESULT != -EAGAIN) {
-            log_loader_path_event(CACHED_RESULT == 0 ? "stat-cache-hit" : "stat-cache-negative-hit", path, pathBuffer, mount,
+            log_loader_path_event(CACHED_RESULT == 0 ? "stat-cache-hit" : "stat-cache-negative-hit", path, current_path, mount,
                                   CACHED_RESULT);
             return CACHED_RESULT;
         }
     }
+    bool const EXISTENCE_NEGATIVE_ALREADY_MISSED =
+        existence_negative_missed_before_symlink && !path_changed_by_symlink && !metadata_store_observed_during_symlink;
+    if (!is_wki_entry && mount->fs_type != FSType::REMOTE && !EXISTENCE_NEGATIVE_ALREADY_MISSED) {
+        int const EXISTENCE_NEGATIVE =
+            existence_cache_lookup_negative_mount(current_path, mount, REQUIRE_DIRECTORY, current_path_len, current_path_hash);
+        if (EXISTENCE_NEGATIVE != -EAGAIN) {
+            return EXISTENCE_NEGATIVE;
+        }
+    }
 
-    // Initialize stat buffer
-    std::memset(statbuf, 0, sizeof(ker::vfs::Stat));
+    // XFS fills the complete Stat ABI image itself; other backends still rely
+    // on this clear for reserved fields and partial pseudo-file stats.
+    if (mount->fs_type != FSType::XFS) {
+        std::memset(statbuf, 0, sizeof(ker::vfs::Stat));
+    }
 
     int result = -ENOSYS;
     bool synthetic_stat = false;
@@ -6761,7 +10500,8 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
             break;
         }
         case FSType::XFS: {
-            result = ker::vfs::xfs::xfs_stat(fs_path, statbuf, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+            result = ker::vfs::xfs::xfs_stat(fs_path, statbuf, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data),
+                                             FS_PATH_LEN, REQUIRE_DIRECTORY);
             break;
         }
         default:
@@ -6774,7 +10514,7 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     // synthetic directory stat so that `ls /` can stat `/wki` even when the
     // backing XFS filesystem has no such directory entry.
     if (result != 0) {
-        result = fill_synthetic_mount_dir_stat(pathBuffer, statbuf);
+        result = fill_synthetic_mount_dir_stat(current_path, statbuf);
         synthetic_stat = result == 0;
     }
 
@@ -6794,20 +10534,255 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     }
 
     if (!is_wki_entry && !synthetic_stat) {
-        metadata_cache_store(pathBuffer, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, result, statbuf,
-                             STAT_STAMP);
+        if (result == 0 && (statbuf->st_mode & static_cast<mode_t>(S_IFMT)) != static_cast<mode_t>(S_IFLNK)) {
+            metadata_cache_store_non_symlink_stat_variants(current_path, mount->fs_type, mount->dev_id, *statbuf, STAT_STAMP,
+                                                           current_path_len, mount, current_path_hash);
+        } else if (result == -ENOENT) {
+            metadata_cache_store_missing_observation(current_path, mount, STAT_STAMP, current_path_len, current_path_hash);
+        } else {
+            metadata_cache_store(current_path, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, result,
+                                 statbuf, STAT_STAMP, current_path_len, current_path_hash);
+        }
     }
 
-    log_loader_path_event(result == 0 ? "stat-ok" : "stat-failed", path, pathBuffer, mount, result);
+    log_loader_path_event(result == 0 ? "stat-ok" : "stat-failed", path, current_path, mount, result);
 
     return result;
 }
 
-auto vfs_stat(const char* path, Stat* statbuf) -> int { return vfs_stat_impl(path, statbuf, true, true, true); }
+namespace {
+auto vfs_stat_resolved_cache_or_impl(const char* resolved_path, bool follow_final_symlink, bool require_directory, bool apply_task_policy,
+                                     Stat* statbuf, size_t known_resolved_path_len, uint64_t known_resolved_path_hash) -> int {
+    size_t resolved_path_len = known_resolved_path_len;
+    if (resolved_path_len == UNKNOWN_PATH_LEN && resolved_path != nullptr) {
+        resolved_path_len = std::strlen(resolved_path);
+    }
+    uint64_t resolved_path_hash = known_resolved_path_hash != UNKNOWN_PATH_HASH && known_resolved_path_len != UNKNOWN_PATH_LEN &&
+                                          resolved_path_len == known_resolved_path_len
+                                      ? known_resolved_path_hash
+                                      : UNKNOWN_PATH_HASH;
 
-auto vfs_lstat(const char* path, Stat* statbuf) -> int { return vfs_stat_impl(path, statbuf, true, true, false); }
+    auto mount_ref = find_mount_point(resolved_path, resolved_path_len);
+    MountPoint const* mount = mount_ref.get();
+    if (mount != nullptr && mount->fs_type != FSType::REMOTE) {
+        if (resolved_path_hash == UNKNOWN_PATH_HASH && resolved_path != nullptr && resolved_path_len > 0 &&
+            resolved_path_len < MAX_PATH_LEN) {
+            resolved_path_hash = metadata_path_hash_raw(resolved_path, resolved_path_len);
+        }
+        int const CACHED_RESULT = metadata_cache_lookup_mount_stat(resolved_path, mount, follow_final_symlink, require_directory, statbuf,
+                                                                   resolved_path_len, resolved_path_hash);
+        if (CACHED_RESULT != -EAGAIN) {
+            return CACHED_RESULT;
+        }
+        int const EXISTENCE_NEGATIVE =
+            existence_cache_lookup_negative_mount(resolved_path, mount, require_directory, resolved_path_len, resolved_path_hash);
+        if (EXISTENCE_NEGATIVE != -EAGAIN) {
+            return EXISTENCE_NEGATIVE;
+        }
+        return vfs_stat_impl(resolved_path, statbuf, false, apply_task_policy, follow_final_symlink, require_directory, &mount_ref, true,
+                             resolved_path_len, true, resolved_path_hash);
+    }
 
-auto vfs_stat_resolved(const char* path, Stat* statbuf) -> int { return vfs_stat_impl(path, statbuf, false, false, true); }
+    if (mount != nullptr) {
+        return vfs_stat_impl(resolved_path, statbuf, false, apply_task_policy, follow_final_symlink, require_directory, &mount_ref, false,
+                             resolved_path_len, false, resolved_path_hash);
+    }
+
+    return vfs_stat_impl(resolved_path, statbuf, false, apply_task_policy, follow_final_symlink, require_directory, nullptr, false,
+                         resolved_path_len, false, resolved_path_hash);
+}
+
+auto vfs_stat_absolute_local_fast_path(ker::mod::sched::task::Task* task, const char* path, bool follow_final_symlink, Stat* statbuf,
+                                       int* result_out) -> bool {
+    if (path == nullptr || path[0] != '/' || statbuf == nullptr || result_out == nullptr) {
+        return false;
+    }
+
+    PathTextScan const SCAN = scan_path_text(path);
+    if (task_absolute_local_path_direct_result_allowed(task, path, SCAN)) {
+        *result_out = vfs_stat_resolved_cache_or_impl(path, follow_final_symlink, SCAN.requires_directory, true, statbuf, SCAN.path_len,
+                                                      SCAN.path_hash);
+        return true;
+    }
+    if (task_absolute_local_trailing_slash_direct_allowed(task, path, SCAN)) {
+        std::array<char, MAX_PATH_LEN> trimmed{};  // NOLINT(cppcoreguidelines-pro-type-member-init)
+        if (!copy_trailing_slash_trimmed_path(path, SCAN, trimmed)) {
+            *result_out = -ENAMETOOLONG;
+            return true;
+        }
+        *result_out = vfs_stat_resolved_cache_or_impl(trimmed.data(), follow_final_symlink, true, true, statbuf, SCAN.normalized_len,
+                                                      SCAN.normalized_path_hash);
+        return true;
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    uint64_t resolved_hash = UNKNOWN_PATH_HASH;
+    int const FAST_RET = copy_common_local_visible_absolute_path_fast_path(task, path, SCAN, resolved.data(), resolved.size(),
+                                                                           &resolved_len, &resolved_hash);
+    if (FAST_RET == RESOLVE_FAST_PATH_DECLINED) {
+        return false;
+    }
+    if (FAST_RET < 0) {
+        *result_out = FAST_RET;
+        return true;
+    }
+
+    *result_out = vfs_stat_resolved_cache_or_impl(resolved.data(), follow_final_symlink, SCAN.requires_directory, true, statbuf,
+                                                  resolved_len, resolved_hash);
+    return true;
+}
+
+auto vfs_stat_current_task_fast_path(const char* path, bool follow_final_symlink, Stat* statbuf, int* result_out) -> bool {
+    if (path == nullptr || path[0] == '\0' || statbuf == nullptr || result_out == nullptr || !ker::mod::sched::can_query_current_task()) {
+        return false;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return false;
+    }
+
+    if (vfs_stat_absolute_local_fast_path(task, path, follow_final_symlink, statbuf, result_out)) {
+        return true;
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    bool require_directory = false;
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    uint64_t resolved_hash = UNKNOWN_PATH_HASH;
+    bool common_local_fast_path = false;
+    int const RESOLVE_RET = resolve_dirfd_task_path_raw(task, AT_FDCWD, path, resolved.data(), resolved.size(), true, &require_directory,
+                                                        &resolved_len, &common_local_fast_path, &resolved_hash);
+    if (RESOLVE_RET < 0 || (!common_local_fast_path && resolved_task_path_is_wki_entry(task, resolved.data()))) {
+        return false;
+    }
+
+    if (!common_local_fast_path) {
+        maybe_ensure_wki_host_root_mount_for_task(task, resolved.data());
+    }
+    *result_out = vfs_stat_resolved_cache_or_impl(resolved.data(), follow_final_symlink, require_directory, true, statbuf, resolved_len,
+                                                  resolved_hash);
+    return true;
+}
+}  // namespace
+
+#ifdef WOS_SELFTEST
+auto vfs_selftest_absolute_local_stat_fast_path_gate() -> bool {
+    ker::mod::sched::task::Task task{};
+    PathTextScan scan{};
+
+    bool ok = task_absolute_local_path_fast_path_allowed(&task, "/tmp/file", &scan);
+    ok = ok && scan.path_len == std::strlen("/tmp/file") && !scan.requires_directory && !scan.needs_canonicalize;
+    ok = ok && scan.path_hash == metadata_path_hash_raw("/tmp/file", scan.path_len);
+    ok = ok && scan.normalized_path_hash == scan.path_hash;
+    ok = ok && task_absolute_local_path_direct_result_allowed(&task, "/tmp/file", scan);
+    ok = ok && task_absolute_local_path_fast_path_allowed(&task, "/", nullptr);
+    ok = ok && !task_absolute_local_path_fast_path_allowed(&task, "tmp/file", nullptr);
+    ok = ok && !task_absolute_local_path_fast_path_allowed(&task, "/tmp/", nullptr);
+    PathTextScan const trailing_scan = scan_path_text("/tmp/file/");
+    ok = ok && trailing_scan.normalized_len == std::strlen("/tmp/file") &&
+         trailing_scan.normalized_path_hash == metadata_path_hash_raw("/tmp/file", trailing_scan.normalized_len);
+    ok = ok && !task_absolute_local_path_direct_result_allowed(&task, "/tmp/", scan_path_text("/tmp/"));
+    ok = ok && task_absolute_local_trailing_slash_direct_allowed(&task, "/tmp/", scan_path_text("/tmp/"));
+    ok = ok && !task_absolute_local_path_fast_path_allowed(&task, "/tmp/../file", nullptr);
+    ok = ok && !task_absolute_local_path_direct_result_allowed(&task, "/tmp/../file", scan_path_text("/tmp/../file"));
+    ok = ok && !task_absolute_local_trailing_slash_direct_allowed(&task, "/tmp/../file/", scan_path_text("/tmp/../file/"));
+    ok = ok && !task_absolute_local_path_fast_path_allowed(&task, "/wki", nullptr);
+    ok = ok && !task_absolute_local_path_fast_path_allowed(&task, "/wki/node", nullptr);
+
+    std::array<char, MAX_PATH_LEN + 1> too_long{};
+    too_long.fill('a');
+    too_long.at(0) = '/';
+    too_long.at(MAX_PATH_LEN) = '\0';
+    ok = ok && !task_absolute_local_path_fast_path_allowed(&task, too_long.data(), nullptr);
+
+    ker::mod::sched::task::Task rooted_task{};
+    if (copy_path_string("/rootfs", rooted_task.root.data(), rooted_task.root.size()) < 0) {
+        return false;
+    }
+    rooted_task.root_len = sizeof("/rootfs") - 1;
+    ok = ok && task_cached_root_len(&rooted_task) == sizeof("/rootfs") - 1;
+    rooted_task.root_len = 1;
+    ok = ok && task_cached_root_len(&rooted_task) == sizeof("/rootfs") - 1;
+    ok = ok && !task_absolute_local_path_fast_path_allowed(&rooted_task, "/tmp/file", nullptr);
+    ok = ok && !task_absolute_local_path_direct_result_allowed(&rooted_task, "/tmp/file", scan_path_text("/tmp/file"));
+    return ok;
+}
+#endif
+
+auto vfs_stat(const char* path, Stat* statbuf) -> int {
+    int result = 0;
+    if (vfs_stat_current_task_fast_path(path, true, statbuf, &result)) {
+        return result;
+    }
+    return vfs_stat_impl(path, statbuf, true, true, true);
+}
+
+auto vfs_lstat(const char* path, Stat* statbuf) -> int {
+    int result = 0;
+    if (vfs_stat_current_task_fast_path(path, false, statbuf, &result)) {
+        return result;
+    }
+    return vfs_stat_impl(path, statbuf, true, true, false);
+}
+
+auto vfs_stat_resolved(const char* path, Stat* statbuf) -> int {
+    if (!is_wki_entry_path(path)) {
+        return vfs_stat_resolved_cache_or_impl(path, true, false, false, statbuf);
+    }
+    return vfs_stat_impl(path, statbuf, false, false, true);
+}
+
+auto vfs_statat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int flags, Stat* statbuf) -> int {
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (pathname == nullptr || statbuf == nullptr) {
+        return -EINVAL;
+    }
+
+    bool const EMPTY_PATH = pathname[0] == '\0';
+    if ((flags & AT_EMPTY_PATH) != 0 && EMPTY_PATH) {
+        auto* file = vfs_get_file_retain(task, dirfd);
+        if (file == nullptr) {
+            return -EBADF;
+        }
+        int const RESULT = vfs_fstat_file(file, statbuf);
+        vfs_put_file(file);
+        return RESULT;
+    }
+    if (EMPTY_PATH) {
+        return -ENOENT;
+    }
+
+    bool const FOLLOW_FINAL_SYMLINK = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    int fast_result = 0;
+    if (vfs_stat_absolute_local_fast_path(task, pathname, FOLLOW_FINAL_SYMLINK, statbuf, &fast_result)) {
+        return fast_result;
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    bool require_directory = false;
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    uint64_t resolved_hash = UNKNOWN_PATH_HASH;
+    bool common_local_fast_path = false;
+    int const RESOLVE_RET = resolve_dirfd_task_path_raw(task, dirfd, pathname, resolved.data(), resolved.size(), true, &require_directory,
+                                                        &resolved_len, &common_local_fast_path, &resolved_hash);
+    if (RESOLVE_RET < 0) {
+        return RESOLVE_RET;
+    }
+
+    if (!common_local_fast_path && (dirfd == AT_FDCWD || pathname[0] == '/') && resolved_task_path_is_wki_entry(task, resolved.data())) {
+        return FOLLOW_FINAL_SYMLINK ? vfs_stat(pathname, statbuf) : vfs_lstat(pathname, statbuf);
+    }
+
+    if (!common_local_fast_path) {
+        maybe_ensure_wki_host_root_mount_for_task(task, resolved.data());
+    }
+    return vfs_stat_resolved_cache_or_impl(resolved.data(), FOLLOW_FINAL_SYMLINK, require_directory, true, statbuf, resolved_len,
+                                           resolved_hash);
+}
 
 auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
     if (file == nullptr || statbuf == nullptr) {
@@ -6821,19 +10796,26 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
     MetadataSnapshotStamp const STAT_STAMP = metadata_snapshot_stamp();
     auto finish_stat = [&](int result) -> int {
         if (result == 0) {
-            file_stat_snapshot_store(file, *statbuf, STAT_STAMP);
+            metadata_cache_store_fresh_file_stat(file, *statbuf, STAT_STAMP);
         }
         return result;
     };
 
-    std::memset(statbuf, 0, sizeof(Stat));
+    // XFS fills the complete Stat ABI image itself; other backends still rely
+    // on this clear for reserved fields and partial pseudo-file stats.
+    if (file->fs_type != FSType::XFS) {
+        std::memset(statbuf, 0, sizeof(Stat));
+    }
 
-    if (file->fops == nullptr && file->private_data == nullptr && file->is_directory && file->vfs_path != nullptr) {
+    if (file_is_synthetic_mount_dir(file)) {
         return finish_stat(fill_synthetic_mount_dir_stat(file->vfs_path, statbuf));
     }
 
     auto fstat_dev_id = [&]() -> uint32_t {
-        MountRef fstat_mount_ref = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path) : MountRef{};
+        if (file->mount_dev_id != 0) {
+            return file->mount_dev_id;
+        }
+        MountRef fstat_mount_ref = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path, file_vfs_path_len(file)) : MountRef{};
         MountPoint const* fstat_mount = fstat_mount_ref.get();
         return fstat_mount != nullptr ? fstat_mount->dev_id : 0;
     };
@@ -6938,6 +10920,107 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
     }
 }
 
+namespace {
+auto file_stat_snapshot_fast_current(File* file, Stat* statbuf) -> bool {
+    if (file == nullptr || statbuf == nullptr || !file_stat_snapshot_cacheable(file)) {
+        return false;
+    }
+    if (file->cache_notify_attachment != nullptr || !file->stat_cache_valid) {
+        return false;
+    }
+    if (file->vfs_path == nullptr) {
+        *statbuf = file->stat_cache;
+        g_vfs_fstat_snapshot_hits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    uint64_t const CACHE_GENERATION = g_metadata_cache_generation.load(std::memory_order_acquire);
+    if (file->stat_cache_generation != CACHE_GENERATION || file->stat_cache_path_len == 0) {
+        return false;
+    }
+    uint64_t const INVALIDATION_GENERATION = g_metadata_invalidation_generation.load(std::memory_order_acquire);
+    if (file->stat_cache_invalidation_generation != INVALIDATION_GENERATION) {
+        return false;
+    }
+
+    *statbuf = file->stat_cache;
+    g_vfs_fstat_snapshot_hits.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+}  // namespace
+
+auto vfs_fstat_snapshot_fast(ker::mod::sched::task::Task* task, int fd, Stat* statbuf) -> int {
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (fd < 0) {
+        return -EBADF;
+    }
+    if (statbuf == nullptr) {
+        return -EINVAL;
+    }
+
+    auto fd_owner = fd_table_task_for(task);
+    auto* table_task = fd_owner.task;
+    if (table_task == nullptr) {
+        return -ESRCH;
+    }
+
+    uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+    auto* file = static_cast<File*>(table_task->fd_table.lookup(static_cast<uint64_t>(fd)));
+    int result = -EBADF;
+    if (file != nullptr) {
+        result = file_stat_snapshot_fast_current(file, statbuf) ? 0 : -EAGAIN;
+    }
+    table_task->fd_table_lock.unlock_irqrestore(IRQF);
+    return result;
+}
+
+auto vfs_fstat_close_for_task(ker::mod::sched::task::Task* task, int fd, Stat* statbuf, int* stat_result) -> int {
+    if (stat_result == nullptr) {
+        return -EINVAL;
+    }
+    if (statbuf == nullptr) {
+        *stat_result = -EINVAL;
+        return -EINVAL;
+    }
+    if (task == nullptr) {
+        *stat_result = -ESRCH;
+        return -ESRCH;
+    }
+    if (fd < 0) {
+        *stat_result = -EBADF;
+        return -EBADF;
+    }
+
+    auto fd_owner = fd_table_task_for(task);
+    auto* table_task = fd_owner.task;
+    if (table_task == nullptr) {
+        *stat_result = -ESRCH;
+        return -ESRCH;
+    }
+
+    uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+    auto* file = vfs_take_fd_locked(table_task, fd);
+    int result = -EBADF;
+    if (file != nullptr) {
+        result = file_stat_snapshot_fast_current(file, statbuf) ? 0 : -EAGAIN;
+    }
+    size_t const FD_COUNT = table_task->fd_table.size();
+    table_task->fd_table_lock.unlock_irqrestore(IRQF);
+
+    if (file == nullptr) {
+        *stat_result = -EBADF;
+        return -EBADF;
+    }
+    if (result == -EAGAIN) {
+        result = vfs_fstat_file(file, statbuf);
+    }
+    *stat_result = result;
+
+    return vfs_close_taken_file(task, table_task, file, FD_COUNT, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+}
+
 auto vfs_fstat(int fd, Stat* statbuf) -> int {
     if (statbuf == nullptr) {
         return -EINVAL;
@@ -6958,6 +11041,26 @@ auto vfs_fstat(int fd, Stat* statbuf) -> int {
     return RESULT;
 }
 
+namespace {
+auto local_symlink_resolution_known_noop(const char* path, MountPoint const* mount, size_t* path_len_inout,
+                                         bool* skip_final_symlink_probe_out) -> bool {
+    if (skip_final_symlink_probe_out != nullptr) {
+        *skip_final_symlink_probe_out = false;
+    }
+    if (path == nullptr || mount == nullptr || path_len_inout == nullptr || mount->fs_type == FSType::REMOTE) {
+        return false;
+    }
+
+    size_t path_len = *path_len_inout;
+    bool const SKIP_FINAL_SYMLINK_PROBE = metadata_cache_proves_final_not_symlink(path, mount->fs_type, mount->dev_id, path_len, &path_len);
+    *path_len_inout = path_len;
+    if (skip_final_symlink_probe_out != nullptr) {
+        *skip_final_symlink_probe_out = SKIP_FINAL_SYMLINK_PROBE;
+    }
+    return SKIP_FINAL_SYMLINK_PROBE && symlink_prefix_cache_covers_parent(path, path_len, mount);
+}
+}  // namespace
+
 // --- statvfs / fstatvfs ---
 
 static void fill_synthetic_statvfs(Statvfs* buf) {
@@ -6973,17 +11076,49 @@ auto vfs_statvfs(const char* path, Statvfs* buf) -> int {
     }
 
     std::array<char, MAX_PATH_LEN> path_buffer{};
-    if (resolve_task_path_raw(path, path_buffer.data(), path_buffer.size()) < 0) {
+    auto* task = ker::mod::sched::get_current_task();
+    size_t path_buffer_len = UNKNOWN_PATH_LEN;
+    PathTextScan const SCAN = scan_path_text(path);
+    if (task_absolute_local_path_direct_result_allowed(task, path, SCAN)) {
+        int const COPY_RET = copy_path_string(path, path_buffer.data(), path_buffer.size(), SCAN.path_len, &path_buffer_len);
+        if (COPY_RET < 0) {
+            return COPY_RET;
+        }
+    } else if (task_absolute_local_trailing_slash_direct_allowed(task, path, SCAN)) {
+        if (!copy_trailing_slash_trimmed_path(path, SCAN, path_buffer)) {
+            return -ENAMETOOLONG;
+        }
+        path_buffer_len = SCAN.normalized_len;
+    } else if (resolve_task_path_raw_impl(path, path_buffer.data(), path_buffer.size(), true, &path_buffer_len) < 0) {
         return -ENOENT;
     }
+
+    auto mount_ref = find_mount_point(path_buffer.data(), path_buffer_len);
+    MountPoint const* mount = mount_ref.get();
+    bool skip_final_symlink_probe = false;
+    bool const SYMLINK_RESOLUTION_KNOWN_NOOP =
+        local_symlink_resolution_known_noop(path_buffer.data(), mount, &path_buffer_len, &skip_final_symlink_probe);
 
     std::array<char, MAX_PATH_LEN> resolved{};
-    if (resolve_symlinks(path_buffer.data(), resolved.data(), resolved.size(), true) < 0) {
-        return -ENOENT;
+    bool path_changed_by_symlink = false;
+    if (!SYMLINK_RESOLUTION_KNOWN_NOOP) {
+        size_t resolved_len = path_buffer_len;
+        int const RESOLVE_RET = resolve_symlinks(path_buffer.data(), resolved.data(), resolved.size(), true, !skip_final_symlink_probe,
+                                                 path_buffer_len, &resolved_len);
+        if (RESOLVE_RET < 0) {
+            return -ENOENT;
+        }
+        path_changed_by_symlink = !path_text_equal(path_buffer.data(), path_buffer_len, resolved.data(), resolved_len);
+        if (path_changed_by_symlink) {
+            std::memcpy(path_buffer.data(), resolved.data(), path_buffer.size());
+        }
+        path_buffer_len = resolved_len;
     }
 
-    auto mount_ref = find_mount_point(resolved.data());
-    MountPoint const* mount = mount_ref.get();
+    if (path_changed_by_symlink || mount == nullptr) {
+        mount_ref = find_mount_point(path_buffer.data(), path_buffer_len);
+        mount = mount_ref.get();
+    }
     if (mount == nullptr) {
         return -ENOENT;
     }
@@ -7032,7 +11167,7 @@ auto vfs_fstatvfs(int fd, Statvfs* buf) -> int {
     // For any fs type that has a path, delegate to vfs_statvfs so mount
     // context lookup is centralised.
     if (file->vfs_path != nullptr) {
-        auto mount_ref = find_mount_point(file->vfs_path);
+        auto mount_ref = find_mount_point(file->vfs_path, file_vfs_path_len(file));
         MountPoint const* mount = mount_ref.get();
         if (mount != nullptr) {
             switch (mount->fs_type) {
@@ -7141,6 +11276,7 @@ auto vfs_pivot_root(const char* new_root, const char* put_old) -> int {
             // Only update tasks that still have the old root "/"
             if (t->root[0] == '/' && t->root[1] == '\0') {
                 std::memcpy(t->root.data(), new_root, NEW_ROOT_LEN + 1);
+                t->root_len = static_cast<uint16_t>(NEW_ROOT_LEN);
             }
             t->release();
         }
@@ -7225,7 +11361,7 @@ auto vfs_dup2(int oldfd, int newfd, int flags) -> int {
 }
 
 // --- getcwd / chdir ---
-auto vfs_getcwd(char* buf, size_t size) -> int {
+auto vfs_getcwd(char* buf, size_t size, size_t* len_out) -> int {
     if (buf == nullptr || size == 0) {
         return -EINVAL;
     }
@@ -7233,13 +11369,83 @@ auto vfs_getcwd(char* buf, size_t size) -> int {
     if (task == nullptr) {
         return -ESRCH;
     }
-    size_t const LEN = std::strlen(task->cwd.data());
+    size_t const LEN = task_cached_cwd_len(task);
     if (LEN + 1 > size) {
         return -ERANGE;
     }
     std::memcpy(buf, task->cwd.data(), LEN + 1);
+    if (len_out != nullptr) {
+        *len_out = LEN;
+    }
     return 0;
 }
+
+namespace {
+auto vfs_chdir_common_local_fast_path(ker::mod::sched::task::Task* task, const char* path, int* result_out) -> bool {
+    if (task == nullptr || path == nullptr || result_out == nullptr || !task_has_common_local_vfs_routing(task)) {
+        return false;
+    }
+
+    PathTextScan const SCAN = scan_path_text(path);
+    if (SCAN.path_len == 0 || SCAN.path_len >= MAX_PATH_LEN) {
+        return false;
+    }
+
+    std::array<char, MAX_PATH_LEN> visible;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t visible_len = UNKNOWN_PATH_LEN;
+    int copy_ret = RESOLVE_FAST_PATH_DECLINED;
+    if (path[0] == '/') {
+        if (SCAN.needs_canonicalize) {
+            copy_ret = copy_dot_clean_visible_absolute_path(path, SCAN, visible.data(), visible.size(), &visible_len);
+        } else {
+            copy_ret = copy_path_string(path, visible.data(), visible.size(), SCAN.path_len, &visible_len);
+        }
+    } else {
+        copy_ret = copy_simple_relative_path_from_base(task->cwd.data(), path, SCAN, visible.data(), visible.size(), &visible_len,
+                                                       task_cached_cwd_len(task));
+    }
+
+    if (copy_ret == RESOLVE_FAST_PATH_DECLINED) {
+        return false;
+    }
+    if (copy_ret < 0) {
+        *result_out = copy_ret;
+        return true;
+    }
+    if (!common_local_visible_path_is_noop(visible.data())) {
+        return false;
+    }
+    if (visible_len + 1 > ker::mod::sched::task::Task::CWD_MAX) {
+        *result_out = -ENAMETOOLONG;
+        return true;
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    int const ROOT_RET =
+        copy_task_visible_absolute_path_with_root(task, visible.data(), visible_len, resolved.data(), resolved.size(), &resolved_len);
+    if (ROOT_RET < 0) {
+        *result_out = ROOT_RET;
+        return true;
+    }
+
+    ker::vfs::Stat st{};
+    int const STAT_RET = vfs_stat_resolved_cache_or_impl(resolved.data(), true, true, true, &st, resolved_len);
+    if (STAT_RET < 0) {
+        *result_out = STAT_RET;
+        return true;
+    }
+    if ((st.st_mode & S_IFMT) != S_IFDIR) {
+        *result_out = -ENOTDIR;
+        return true;
+    }
+
+    std::memcpy(task->cwd.data(), visible.data(), visible_len + 1);
+    task->cwd_len = static_cast<uint16_t>(visible_len);
+    *result_out = 0;
+    return true;
+}
+}  // namespace
 
 auto vfs_chdir(const char* path) -> int {
     if (path == nullptr) {
@@ -7248,6 +11454,11 @@ auto vfs_chdir(const char* path) -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return -ESRCH;
+    }
+
+    int fast_result = 0;
+    if (vfs_chdir_common_local_fast_path(task, path, &fast_result)) {
+        return fast_result;
     }
 
     std::array<char, MAX_PATH_LEN> logical{};
@@ -7278,7 +11489,42 @@ auto vfs_chdir(const char* path) -> int {
         return -ENAMETOOLONG;
     }
     std::memcpy(task->cwd.data(), logical.data(), RLEN + 1);
+    task->cwd_len = static_cast<uint16_t>(RLEN);
     return 0;
+}
+
+auto vfs_fchdir(ker::mod::sched::task::Task* task, int fd) -> int {
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+
+    auto* file = vfs_get_file_retain(task, fd);
+    if (file == nullptr) {
+        return -EBADF;
+    }
+
+    int ret = 0;
+    std::array<char, MAX_PATH_LEN> logical{};
+    if (!file->is_directory) {
+        ret = -ENOTDIR;
+    } else if (file->vfs_path == nullptr) {
+        ret = -EBADF;
+    } else {
+        ret = strip_task_root_prefix(task, file->vfs_path, logical.data(), logical.size(), nullptr);
+    }
+
+    if (ret == 0) {
+        size_t const LEN = std::strlen(logical.data());
+        if (LEN + 1 > ker::mod::sched::task::Task::CWD_MAX) {
+            ret = -ENAMETOOLONG;
+        } else {
+            std::memcpy(task->cwd.data(), logical.data(), LEN + 1);
+            task->cwd_len = static_cast<uint16_t>(LEN);
+        }
+    }
+
+    vfs_put_file(file);
+    return ret;
 }
 
 // --- access ---
@@ -7322,24 +11568,376 @@ auto vfs_check_permission(uint32_t file_mode, uint32_t file_uid, uint32_t file_g
     return 0;
 }
 
-auto vfs_access(const char* path, int mode) -> int {
-    if (path == nullptr) {
-        return -EINVAL;
-    }
-
-    // Check existence first
-    ker::vfs::Stat st{};
-    int const RET = vfs_stat(path, &st);
-    if (RET < 0) {
-        return RET;
-    }
-
+namespace {
+auto vfs_access_stat_result(const Stat& st, int mode) -> int {
     if (mode == 0) {
         return 0;  // F_OK - just existence check
     }
 
     // st_mode already has the full mode bits from stat
     return vfs_check_permission(st.st_mode & 07777, st.st_uid, st.st_gid, mode);
+}
+
+auto vfs_access_f_ok_resolved(const char* resolved_path, bool require_directory, bool apply_task_policy,
+                              size_t known_resolved_path_len = UNKNOWN_PATH_LEN, uint64_t known_resolved_path_hash = UNKNOWN_PATH_HASH,
+                              bool follow_final_symlink = true) -> int {
+    if (resolved_path == nullptr) {
+        return -EINVAL;
+    }
+
+    Stat cached{};
+    size_t resolved_path_len = known_resolved_path_len != UNKNOWN_PATH_LEN ? known_resolved_path_len : std::strlen(resolved_path);
+    if (resolved_path_len >= MAX_PATH_LEN) {
+        return -ENAMETOOLONG;
+    }
+
+    const char* current_path = resolved_path;
+    size_t current_path_len = resolved_path_len;
+    uint64_t current_path_hash = (known_resolved_path_hash != UNKNOWN_PATH_HASH && known_resolved_path_len != UNKNOWN_PATH_LEN &&
+                                  resolved_path_len == known_resolved_path_len)
+                                     ? known_resolved_path_hash
+                                     : UNKNOWN_PATH_HASH;
+    std::array<char, MAX_PATH_LEN> path_buffer;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    auto mount_ref = find_mount_point(current_path, current_path_len);
+    MountPoint const* mount = mount_ref.get();
+    bool const EFFECTIVE_FOLLOW_FINAL_SYMLINK = follow_final_symlink || require_directory;
+    bool final_not_symlink_known = false;
+    auto refresh_final_not_symlink_known = [&]() -> bool {
+        if (mount == nullptr || mount->fs_type == FSType::REMOTE) {
+            return false;
+        }
+        if (!final_not_symlink_known) {
+            final_not_symlink_known = metadata_cache_proves_final_not_symlink(current_path, mount->fs_type, mount->dev_id, current_path_len,
+                                                                              &current_path_len, current_path_hash);
+        }
+        return final_not_symlink_known;
+    };
+
+    auto lookup_cached_existence = [&](bool skip_metadata_stat_lookup) -> int {
+        if (mount == nullptr || mount->fs_type == FSType::REMOTE) {
+            return -EAGAIN;
+        }
+        int const EXISTENCE_CACHED_RESULT = existence_cache_lookup_mount(current_path, mount, require_directory, current_path_len,
+                                                                         current_path_hash, EFFECTIVE_FOLLOW_FINAL_SYMLINK);
+        if (EXISTENCE_CACHED_RESULT != -EAGAIN) {
+            return EXISTENCE_CACHED_RESULT;
+        }
+        if (!skip_metadata_stat_lookup) {
+            int const CACHED_RESULT = metadata_cache_lookup_mount_stat(current_path, mount, EFFECTIVE_FOLLOW_FINAL_SYMLINK,
+                                                                       require_directory, &cached, current_path_len, current_path_hash);
+            if (CACHED_RESULT != -EAGAIN) {
+                return CACHED_RESULT;
+            }
+        }
+        return -EAGAIN;
+    };
+
+    int cached_result = lookup_cached_existence(false);
+    if (cached_result != -EAGAIN) {
+        return cached_result;
+    }
+
+    bool const SKIP_FINAL_SYMLINK_PROBE = EFFECTIVE_FOLLOW_FINAL_SYMLINK && refresh_final_not_symlink_known();
+    bool const PARENT_SYMLINK_PREFIX_KNOWN_NOOP =
+        mount != nullptr && mount->fs_type != FSType::REMOTE && symlink_prefix_cache_covers_parent(current_path, current_path_len, mount);
+    bool const SYMLINK_RESOLUTION_KNOWN_NOOP =
+        PARENT_SYMLINK_PREFIX_KNOWN_NOOP && (!EFFECTIVE_FOLLOW_FINAL_SYMLINK || SKIP_FINAL_SYMLINK_PROBE);
+
+    if (!SYMLINK_RESOLUTION_KNOWN_NOOP && PARENT_SYMLINK_PREFIX_KNOWN_NOOP) {
+        int const EXISTENCE_RESULT =
+            vfs_pre_symlink_negative_existence_result(current_path, mount, true, require_directory, current_path_len, current_path_hash);
+        if (EXISTENCE_RESULT != -EAGAIN) {
+            return EXISTENCE_RESULT;
+        }
+    }
+
+    if (mount != nullptr && mount->fs_type != FSType::REMOTE && !SYMLINK_RESOLUTION_KNOWN_NOOP) {
+        std::array<char, MAX_PATH_LEN> symlink_resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+        uint64_t const OBSERVATION_EPOCH_BEFORE_SYMLINK = g_metadata_observation_epoch.load(std::memory_order_acquire);
+        size_t symlink_resolved_len = current_path_len;
+        bool const RESOLVE_FINAL_SYMLINK = EFFECTIVE_FOLLOW_FINAL_SYMLINK && !SKIP_FINAL_SYMLINK_PROBE;
+        int const RESOLVE_RET = resolve_symlinks(current_path, symlink_resolved.data(), symlink_resolved.size(), apply_task_policy,
+                                                 RESOLVE_FINAL_SYMLINK, current_path_len, &symlink_resolved_len);
+        if (RESOLVE_RET < 0) {
+            return RESOLVE_RET;
+        }
+        bool const PATH_CHANGED_BY_SYMLINK =
+            !path_text_equal(current_path, current_path_len, symlink_resolved.data(), symlink_resolved_len);
+        if (PATH_CHANGED_BY_SYMLINK) {
+            int const COPY_RET = copy_path_string(symlink_resolved.data(), path_buffer.data(), path_buffer.size(), symlink_resolved_len);
+            if (COPY_RET < 0) {
+                return COPY_RET;
+            }
+            current_path = path_buffer.data();
+            current_path_len = symlink_resolved_len;
+            current_path_hash = UNKNOWN_PATH_HASH;
+            mount_ref = find_mount_point(current_path, current_path_len);
+            mount = mount_ref.get();
+            final_not_symlink_known = false;
+        }
+        current_path_len = symlink_resolved_len;
+        bool const OBSERVED_DURING_SYMLINK =
+            g_metadata_observation_epoch.load(std::memory_order_acquire) != OBSERVATION_EPOCH_BEFORE_SYMLINK;
+        if (PATH_CHANGED_BY_SYMLINK || OBSERVED_DURING_SYMLINK) {
+            cached_result = lookup_cached_existence(false);
+            if (cached_result != -EAGAIN) {
+                return cached_result;
+            }
+        }
+    }
+
+    if (mount == nullptr) {
+        return -ENOENT;
+    }
+
+    MetadataSnapshotStamp const STAT_STAMP = metadata_snapshot_stamp();
+    const char* fs_path = strip_mount_prefix(mount, current_path);
+    size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, current_path, current_path_len);
+    int result = -ENOSYS;
+    bool synthetic_exists = false;
+    switch (mount->fs_type) {
+        case FSType::TMPFS: {
+            auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, false);
+            node = ker::vfs::tmpfs::tmpfs_canonical_node(node);
+            if (node == nullptr) {
+                result = -ENOENT;
+            } else if (require_directory && node->type != ker::vfs::tmpfs::TmpNodeType::DIRECTORY) {
+                result = -ENOTDIR;
+            } else {
+                result = 0;
+            }
+            break;
+        }
+        case FSType::DEVFS: {
+            auto* node = ker::vfs::devfs::devfs_walk_path(fs_path);
+            if (node == nullptr) {
+                result = -ENOENT;
+            } else if (require_directory && node->type != ker::vfs::devfs::DevFSNodeType::DIRECTORY) {
+                result = -ENOTDIR;
+            } else {
+                result = 0;
+            }
+            break;
+        }
+        case FSType::PROCFS: {
+            auto* file = ker::vfs::procfs::procfs_open_path(fs_path, 0, 0);
+            if (file == nullptr) {
+                result = -ENOENT;
+                break;
+            }
+            result = (!require_directory || file->is_directory) ? 0 : -ENOTDIR;
+            ker::vfs::procfs::get_procfs_fops()->vfs_close(file);
+            delete file;
+            break;
+        }
+        case FSType::XFS:
+            result = ker::vfs::xfs::xfs_path_exists(fs_path, require_directory,
+                                                    static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), FS_PATH_LEN);
+            break;
+        case FSType::FAT32: {
+            Stat statbuf{};
+            result = ker::vfs::fat32::fat32_stat(fs_path, &statbuf, static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data));
+            if (result == 0 && require_directory && (statbuf.st_mode & static_cast<mode_t>(S_IFMT)) != static_cast<mode_t>(S_IFDIR)) {
+                result = -ENOTDIR;
+            }
+            break;
+        }
+        case FSType::REMOTE: {
+            Stat statbuf{};
+            result = ker::net::wki::wki_remote_vfs_stat(mount->private_data, fs_path, &statbuf);
+            if (result == 0 && require_directory && (statbuf.st_mode & static_cast<mode_t>(S_IFMT)) != static_cast<mode_t>(S_IFDIR)) {
+                result = -ENOTDIR;
+            }
+            break;
+        }
+        default:
+            result = -ENOSYS;
+            break;
+    }
+
+    if (result == -ENOENT) {
+        Stat synthetic{};
+        if (fill_synthetic_mount_dir_stat(current_path, &synthetic) == 0) {
+            result = 0;
+            synthetic_exists = true;
+        }
+    }
+    if (result == -ENOENT) {
+        metadata_cache_store_missing_observation(current_path, mount, STAT_STAMP, current_path_len, current_path_hash);
+    }
+    if (!synthetic_exists && result != -ENOENT) {
+        existence_cache_store(current_path, mount, require_directory, result, STAT_STAMP, current_path_len, current_path_hash,
+                              EFFECTIVE_FOLLOW_FINAL_SYMLINK);
+    }
+    return result;
+}
+
+auto vfs_access_absolute_local_fast_path(ker::mod::sched::task::Task* task, const char* path, int mode, int* result_out,
+                                         bool follow_final_symlink = true) -> bool {
+    if (path == nullptr || path[0] != '/' || result_out == nullptr) {
+        return false;
+    }
+
+    PathTextScan const SCAN = scan_path_text(path);
+    if (task_absolute_local_path_direct_result_allowed(task, path, SCAN)) {
+        if (mode == 0) {
+            *result_out =
+                vfs_access_f_ok_resolved(path, SCAN.requires_directory, true, SCAN.path_len, SCAN.path_hash, follow_final_symlink);
+            return true;
+        }
+
+        ker::vfs::Stat st{};
+        int const STAT_RET =
+            vfs_stat_resolved_cache_or_impl(path, follow_final_symlink, SCAN.requires_directory, true, &st, SCAN.path_len, SCAN.path_hash);
+        if (STAT_RET < 0) {
+            *result_out = STAT_RET;
+            return true;
+        }
+
+        *result_out = vfs_access_stat_result(st, mode);
+        return true;
+    }
+    if (task_absolute_local_trailing_slash_direct_allowed(task, path, SCAN)) {
+        std::array<char, MAX_PATH_LEN> trimmed{};  // NOLINT(cppcoreguidelines-pro-type-member-init)
+        if (!copy_trailing_slash_trimmed_path(path, SCAN, trimmed)) {
+            *result_out = -ENAMETOOLONG;
+            return true;
+        }
+        if (mode == 0) {
+            *result_out =
+                vfs_access_f_ok_resolved(trimmed.data(), true, true, SCAN.normalized_len, SCAN.normalized_path_hash, follow_final_symlink);
+            return true;
+        }
+
+        ker::vfs::Stat st{};
+        int const STAT_RET = vfs_stat_resolved_cache_or_impl(trimmed.data(), follow_final_symlink, true, true, &st, SCAN.normalized_len,
+                                                             SCAN.normalized_path_hash);
+        if (STAT_RET < 0) {
+            *result_out = STAT_RET;
+            return true;
+        }
+
+        *result_out = vfs_access_stat_result(st, mode);
+        return true;
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    uint64_t resolved_hash = UNKNOWN_PATH_HASH;
+    int const FAST_RET = copy_common_local_visible_absolute_path_fast_path(task, path, SCAN, resolved.data(), resolved.size(),
+                                                                           &resolved_len, &resolved_hash);
+    if (FAST_RET == RESOLVE_FAST_PATH_DECLINED) {
+        return false;
+    }
+    if (FAST_RET < 0) {
+        *result_out = FAST_RET;
+        return true;
+    }
+
+    if (mode == 0) {
+        *result_out =
+            vfs_access_f_ok_resolved(resolved.data(), SCAN.requires_directory, true, resolved_len, resolved_hash, follow_final_symlink);
+        return true;
+    }
+
+    ker::vfs::Stat st{};
+    int const STAT_RET = vfs_stat_resolved_cache_or_impl(resolved.data(), follow_final_symlink, SCAN.requires_directory, true, &st,
+                                                         resolved_len, resolved_hash);
+    if (STAT_RET < 0) {
+        *result_out = STAT_RET;
+        return true;
+    }
+
+    *result_out = vfs_access_stat_result(st, mode);
+    return true;
+}
+}  // namespace
+
+auto vfs_access(const char* path, int mode) -> int {
+    if (path == nullptr) {
+        return -EINVAL;
+    }
+    if (mode == 0) {
+        int fast_result = 0;
+        auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+        if (vfs_access_absolute_local_fast_path(task, path, mode, &fast_result)) {
+            return fast_result;
+        }
+    }
+
+    ker::vfs::Stat st{};
+    int const RET = vfs_stat(path, &st);
+    if (RET < 0) {
+        return RET;
+    }
+
+    return vfs_access_stat_result(st, mode);
+}
+
+auto vfs_faccessat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int mode, int flags) -> int {
+    constexpr int ALLOWED_FLAGS = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+    if ((flags & ~ALLOWED_FLAGS) != 0) {
+        return -EINVAL;
+    }
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (pathname == nullptr) {
+        return -EINVAL;
+    }
+    if (pathname[0] == '\0') {
+        if ((flags & AT_EMPTY_PATH) == 0) {
+            return -ENOENT;
+        }
+        auto* file = vfs_get_file_retain(task, dirfd);
+        if (file == nullptr) {
+            return -EBADF;
+        }
+        Stat st{};
+        int const STAT_RET = vfs_fstat_file(file, &st);
+        vfs_put_file(file);
+        if (STAT_RET < 0) {
+            return STAT_RET;
+        }
+        return vfs_access_stat_result(st, mode);
+    }
+
+    bool const FOLLOW_FINAL_SYMLINK = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    int fast_result = 0;
+    if (vfs_access_absolute_local_fast_path(task, pathname, mode, &fast_result, FOLLOW_FINAL_SYMLINK)) {
+        return fast_result;
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    bool require_directory = false;
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    uint64_t resolved_hash = UNKNOWN_PATH_HASH;
+    bool common_local_fast_path = false;
+    int const RESOLVE_RET = resolve_dirfd_task_path_raw(task, dirfd, pathname, resolved.data(), resolved.size(), true, &require_directory,
+                                                        &resolved_len, &common_local_fast_path, &resolved_hash);
+    if (RESOLVE_RET < 0) {
+        return RESOLVE_RET;
+    }
+
+    if (!common_local_fast_path && (dirfd == AT_FDCWD || pathname[0] == '/') && resolved_task_path_is_wki_entry(task, resolved.data())) {
+        return vfs_access(pathname, mode);
+    }
+
+    if (!common_local_fast_path) {
+        maybe_ensure_wki_host_root_mount_for_task(task, resolved.data());
+    }
+    if (mode == 0) {
+        return vfs_access_f_ok_resolved(resolved.data(), require_directory, true, resolved_len, resolved_hash, FOLLOW_FINAL_SYMLINK);
+    }
+
+    ker::vfs::Stat st{};
+    int const STAT_RET =
+        vfs_stat_resolved_cache_or_impl(resolved.data(), FOLLOW_FINAL_SYMLINK, require_directory, true, &st, resolved_len, resolved_hash);
+    if (STAT_RET < 0) {
+        return STAT_RET;
+    }
+
+    return vfs_access_stat_result(st, mode);
 }
 
 namespace {
@@ -7368,18 +11966,18 @@ auto vfs_pwrite_user_bounced(ker::mod::sched::task::Task& task, File* file, cons
     if (BOUNCE_SIZE > stack_bounce.size()) {
         heap_bounce.reset(new (std::nothrow) uint8_t[BOUNCE_SIZE]);
     }
-    uint8_t* const bounce = heap_bounce != nullptr ? heap_bounce.get() : stack_bounce.data();
-    size_t const bounce_size = heap_bounce != nullptr ? BOUNCE_SIZE : stack_bounce.size();
+    uint8_t* const BOUNCE_BUFFER = heap_bounce != nullptr ? heap_bounce.get() : stack_bounce.data();
+    size_t const BOUNCE_CAPACITY = heap_bounce != nullptr ? BOUNCE_SIZE : stack_bounce.size();
     auto const USER_BASE = reinterpret_cast<uint64_t>(user_buf);
     size_t total = 0;
 
     while (total < count) {
-        size_t const TO_WRITE = std::min(count - total, bounce_size);
-        if (!ker::mod::sys::usercopy::copy_from_task(task, USER_BASE + total, bounce, TO_WRITE)) {
+        size_t const TO_WRITE = std::min(count - total, BOUNCE_CAPACITY);
+        if (!ker::mod::sys::usercopy::copy_from_task(task, USER_BASE + total, BOUNCE_BUFFER, TO_WRITE)) {
             return total > 0 ? static_cast<ssize_t>(total) : -EFAULT;
         }
 
-        ssize_t const WRITE_RET = clamp_io_count(file->fops->vfs_write(file, bounce, TO_WRITE, offset + total), TO_WRITE);
+        ssize_t const WRITE_RET = clamp_io_count(file->fops->vfs_write(file, BOUNCE_BUFFER, TO_WRITE, offset + total), TO_WRITE);
         if (WRITE_RET < 0) {
             return total > 0 ? static_cast<ssize_t>(total) : WRITE_RET;
         }
@@ -7513,51 +12111,54 @@ auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t 
                       : clamp_io_count(f->fops->vfs_write(f, buf, count, positional_offset), count);
     if (result > 0) {
         cache_notify_file_data_changed_impl(f);
+        refresh_created_file_stat_snapshot_after_write(f);
     }
     vfs_put_file(f);
     return result;
 }
 
-// --- unlink ---
-auto vfs_unlink(const char* path) -> int {
-    if (path == nullptr) {
+namespace {
+auto vfs_unlink_resolved_path(const char* resolved_path, size_t known_resolved_path_len = UNKNOWN_PATH_LEN,
+                              uint64_t known_resolved_path_hash = UNKNOWN_PATH_HASH) -> int {
+    if (resolved_path == nullptr) {
         return -EINVAL;
     }
 
-    std::array<char, MAX_PATH_LEN> path_buf{};
-    if (resolve_task_path_raw(path, path_buf.data(), MAX_PATH_LEN) < 0) {
-        return -ENAMETOOLONG;
-    }
-
-    auto mount_ref = find_mount_point(path_buf.data());
+    auto mount_ref = find_mount_point(resolved_path, known_resolved_path_len);
     MountPoint const* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
 
+    size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, resolved_path, known_resolved_path_len);
+
     if (mount->fs_type == FSType::XFS) {
-        const char* fs_path = strip_mount_prefix(mount, path_buf.data());
-        int const RET = ker::vfs::xfs::xfs_unlink_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+        const char* fs_path = strip_mount_prefix(mount, resolved_path);
+        int const RET =
+            ker::vfs::xfs::xfs_unlink_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), FS_PATH_LEN);
         if (RET == 0) {
-            vfs_cache_notify_path_changed(path_buf.data(), nullptr);
+            vfs_cache_notify_path_changed(resolved_path, nullptr);
+            metadata_cache_store_missing_path_on_current_mount(resolved_path, mount, known_resolved_path_len, known_resolved_path_hash);
         }
         return RET;
     }
 
     if (mount->fs_type == FSType::FAT32) {
-        const char* fs_path = strip_mount_prefix(mount, path_buf.data());
+        const char* fs_path = strip_mount_prefix(mount, resolved_path);
         int const RET = ker::vfs::fat32::fat32_unlink_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), fs_path);
         if (RET == 0) {
-            vfs_cache_notify_path_changed(path_buf.data(), nullptr);
+            vfs_cache_notify_path_changed(resolved_path, nullptr);
+            metadata_cache_store_missing_path_on_current_mount(resolved_path, mount, known_resolved_path_len, known_resolved_path_hash);
         }
         return RET;
     }
 
     if (mount->fs_type == FSType::REMOTE) {
-        const char* fs_path = strip_mount_prefix(mount, path_buf.data());
+        const char* fs_path = strip_mount_prefix(mount, resolved_path);
         int const RET = ker::net::wki::wki_remote_vfs_unlink(mount->private_data, fs_path);
         if (RET == 0) {
-            vfs_cache_notify_path_changed(path_buf.data(), nullptr);
+            vfs_cache_notify_path_changed(resolved_path, nullptr);
+            metadata_cache_store_missing_path_on_current_mount(resolved_path, mount, known_resolved_path_len, known_resolved_path_hash);
         }
         return RET;
     }
@@ -7566,7 +12167,7 @@ auto vfs_unlink(const char* path) -> int {
         return -ENOSYS;
     }
 
-    const char* fs_path = strip_mount_prefix(mount, path_buf.data());
+    const char* fs_path = strip_mount_prefix(mount, resolved_path);
 
     // Walk to parent, then find child
     const char* last_slash = nullptr;
@@ -7616,53 +12217,79 @@ auto vfs_unlink(const char* path) -> int {
         if (HARDLINK_COUNT_CHANGE) {
             metadata_cache_note_path_changed("/", nullptr);
         }
-        vfs_cache_notify_path_changed(path_buf.data(), nullptr);
+        vfs_cache_notify_path_changed(resolved_path, nullptr);
+        metadata_cache_store_missing_path_on_current_mount(resolved_path, mount, known_resolved_path_len, known_resolved_path_hash);
         return 0;
     }
     ker::vfs::tmpfs::tmpfs_unlock_tree();
     return -ENOENT;
 }
+}  // namespace
 
-// --- rmdir ---
-auto vfs_rmdir(const char* path) -> int {
+// --- unlink ---
+auto vfs_unlink(const char* path) -> int {
     if (path == nullptr) {
         return -EINVAL;
     }
 
-    std::array<char, MAX_PATH_LEN> path_buf{};
-    if (resolve_task_path_raw(path, path_buf.data(), path_buf.size()) < 0) {
+    auto* task = ker::mod::sched::get_current_task();
+    PathTextScan scan{};
+    if (task_absolute_local_path_fast_path_allowed(task, path, &scan)) {
+        return vfs_unlink_resolved_path(path, scan.path_len, scan.path_hash);
+    }
+
+    std::array<char, MAX_PATH_LEN> path_buf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t path_buf_len = UNKNOWN_PATH_LEN;
+    uint64_t path_buf_hash = UNKNOWN_PATH_HASH;
+    if (resolve_task_path_raw_impl(path, path_buf.data(), MAX_PATH_LEN, true, &path_buf_len, &path_buf_hash) < 0) {
         return -ENAMETOOLONG;
     }
 
-    auto mount_ref = find_mount_point(path_buf.data());
+    return vfs_unlink_resolved_path(path_buf.data(), path_buf_len, path_buf_hash);
+}
+
+namespace {
+auto vfs_rmdir_resolved_path(const char* resolved_path, size_t known_resolved_path_len = UNKNOWN_PATH_LEN,
+                             uint64_t known_resolved_path_hash = UNKNOWN_PATH_HASH) -> int {
+    if (resolved_path == nullptr) {
+        return -EINVAL;
+    }
+
+    auto mount_ref = find_mount_point(resolved_path, known_resolved_path_len);
     MountPoint const* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
 
+    size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, resolved_path, known_resolved_path_len);
+
     if (mount->fs_type == FSType::FAT32) {
-        const char* fs_path = strip_mount_prefix(mount, path_buf.data());
+        const char* fs_path = strip_mount_prefix(mount, resolved_path);
         int const RET = ker::vfs::fat32::fat32_rmdir_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data), fs_path);
         if (RET == 0) {
-            vfs_cache_notify_path_changed(path_buf.data(), nullptr);
+            vfs_cache_notify_path_changed(resolved_path, nullptr);
+            metadata_cache_store_missing_path_on_current_mount(resolved_path, mount, known_resolved_path_len, known_resolved_path_hash);
         }
         return RET;
     }
 
     if (mount->fs_type == FSType::REMOTE) {
-        const char* fs_path = strip_mount_prefix(mount, path_buf.data());
+        const char* fs_path = strip_mount_prefix(mount, resolved_path);
         int const RET = ker::net::wki::wki_remote_vfs_rmdir(mount->private_data, fs_path);
         if (RET == 0) {
-            vfs_cache_notify_path_changed(path_buf.data(), nullptr);
+            vfs_cache_notify_path_changed(resolved_path, nullptr);
+            metadata_cache_store_missing_path_on_current_mount(resolved_path, mount, known_resolved_path_len, known_resolved_path_hash);
         }
         return RET;
     }
 
     if (mount->fs_type == FSType::XFS) {
-        const char* fs_path = strip_mount_prefix(mount, path_buf.data());
-        int const RET = ker::vfs::xfs::xfs_rmdir_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+        const char* fs_path = strip_mount_prefix(mount, resolved_path);
+        int const RET =
+            ker::vfs::xfs::xfs_rmdir_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), FS_PATH_LEN);
         if (RET == 0) {
-            vfs_cache_notify_path_changed(path_buf.data(), nullptr);
+            vfs_cache_notify_path_changed(resolved_path, nullptr);
+            metadata_cache_store_missing_path_on_current_mount(resolved_path, mount, known_resolved_path_len, known_resolved_path_hash);
         }
         return RET;
     }
@@ -7671,7 +12298,7 @@ auto vfs_rmdir(const char* path) -> int {
         return -ENOSYS;
     }
 
-    const char* fs_path = strip_mount_prefix(mount, path_buf.data());
+    const char* fs_path = strip_mount_prefix(mount, resolved_path);
 
     const char* last_slash = nullptr;
     for (const char* p = fs_path; (*p) != 0; ++p) {
@@ -7724,50 +12351,92 @@ auto vfs_rmdir(const char* path) -> int {
             ker::vfs::tmpfs::tmpfs_free_node(child);
         }
         ker::vfs::tmpfs::tmpfs_unlock_tree();
-        vfs_cache_notify_path_changed(path_buf.data(), nullptr);
+        vfs_cache_notify_path_changed(resolved_path, nullptr);
+        metadata_cache_store_missing_path_on_current_mount(resolved_path, mount, known_resolved_path_len, known_resolved_path_hash);
         return 0;
     }
     ker::vfs::tmpfs::tmpfs_unlock_tree();
     return -ENOENT;
 }
+}  // namespace
 
-// --- rename ---
-auto vfs_rename(const char* oldpath, const char* newpath) -> int {
-    if (oldpath == nullptr || newpath == nullptr) {
+// --- rmdir ---
+auto vfs_rmdir(const char* path) -> int {
+    if (path == nullptr) {
         return -EINVAL;
     }
 
-    bool const OLD_PATH_REQUIRES_DIRECTORY = path_requires_directory(oldpath);
-    bool const NEW_PATH_REQUIRES_DIRECTORY = path_requires_directory(newpath);
-    std::array<char, MAX_PATH_LEN> old_buf{};
-    std::array<char, MAX_PATH_LEN> new_buf{};
-    if (resolve_task_path_raw(oldpath, old_buf.data(), old_buf.size()) < 0) {
-        return -ENAMETOOLONG;
+    auto* task = ker::mod::sched::get_current_task();
+    PathTextScan scan{};
+    if (task_absolute_local_path_fast_path_allowed(task, path, &scan)) {
+        return vfs_rmdir_resolved_path(path, scan.path_len, scan.path_hash);
     }
-    if (resolve_task_path_raw(newpath, new_buf.data(), new_buf.size()) < 0) {
+
+    std::array<char, MAX_PATH_LEN> path_buf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t path_buf_len = UNKNOWN_PATH_LEN;
+    uint64_t path_buf_hash = UNKNOWN_PATH_HASH;
+    if (resolve_task_path_raw_impl(path, path_buf.data(), path_buf.size(), true, &path_buf_len, &path_buf_hash) < 0) {
         return -ENAMETOOLONG;
     }
 
-    auto old_mount_ref = find_mount_point(old_buf.data());
-    auto new_mount_ref = find_mount_point(new_buf.data());
+    return vfs_rmdir_resolved_path(path_buf.data(), path_buf_len, path_buf_hash);
+}
+
+auto vfs_unlinkat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int flags) -> int {
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (pathname == nullptr) {
+        return -EINVAL;
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    uint64_t resolved_hash = UNKNOWN_PATH_HASH;
+    int const RESOLVE_RET = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(
+        task, dirfd, pathname, resolved.data(), resolved.size(), true, nullptr, &resolved_len, &resolved_hash);
+    if (RESOLVE_RET < 0) {
+        return RESOLVE_RET;
+    }
+
+    if ((flags & AT_REMOVEDIR) != 0) {
+        return vfs_rmdir_resolved_path(resolved.data(), resolved_len, resolved_hash);
+    }
+    return vfs_unlink_resolved_path(resolved.data(), resolved_len, resolved_hash);
+}
+
+namespace {
+auto vfs_rename_resolved_paths(const char* old_resolved_path, const char* new_resolved_path, bool old_path_requires_directory,
+                               bool new_path_requires_directory, size_t known_old_resolved_path_len = UNKNOWN_PATH_LEN,
+                               size_t known_new_resolved_path_len = UNKNOWN_PATH_LEN,
+                               uint64_t known_old_resolved_path_hash = UNKNOWN_PATH_HASH,
+                               uint64_t known_new_resolved_path_hash = UNKNOWN_PATH_HASH) -> int {
+    if (old_resolved_path == nullptr || new_resolved_path == nullptr) {
+        return -EINVAL;
+    }
+
+    auto old_mount_ref = find_mount_point(old_resolved_path, known_old_resolved_path_len);
+    auto new_mount_ref = find_mount_point(new_resolved_path, known_new_resolved_path_len);
     MountPoint* old_mount = old_mount_ref.get();
     MountPoint* new_mount = new_mount_ref.get();
     if ((old_mount == nullptr) || (new_mount == nullptr)) {
         return -ENOENT;
     }
 
-    if (OLD_PATH_REQUIRES_DIRECTORY || NEW_PATH_REQUIRES_DIRECTORY) {
+    if (old_path_requires_directory || new_path_requires_directory) {
         Stat old_stat{};
-        int stat_result = vfs_stat_resolved(old_buf.data(), &old_stat);
+        int stat_result = vfs_stat_resolved_cache_or_impl(old_resolved_path, true, false, false, &old_stat, known_old_resolved_path_len,
+                                                          known_old_resolved_path_hash);
         if (stat_result < 0) {
             return stat_result;
         }
-        if (OLD_PATH_REQUIRES_DIRECTORY && (old_stat.st_mode & S_IFMT) != S_IFDIR) {
+        if (old_path_requires_directory && (old_stat.st_mode & S_IFMT) != S_IFDIR) {
             return -ENOTDIR;
         }
-        if (NEW_PATH_REQUIRES_DIRECTORY) {
+        if (new_path_requires_directory) {
             Stat new_stat{};
-            stat_result = vfs_stat_resolved(new_buf.data(), &new_stat);
+            stat_result = vfs_stat_resolved_cache_or_impl(new_resolved_path, true, false, false, &new_stat, known_new_resolved_path_len,
+                                                          known_new_resolved_path_hash);
             if (stat_result < 0) {
                 return stat_result;
             }
@@ -7786,29 +12455,41 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
 
     if (old_mount->fs_type == FSType::FAT32 && new_mount->fs_type == FSType::FAT32 && old_mount == new_mount) {
         int const RET = ker::vfs::fat32::fat32_rename_path(static_cast<ker::vfs::fat32::FAT32MountContext*>(old_mount->private_data),
-                                                           strip_mount_prefix(old_mount, old_buf.data()),
-                                                           strip_mount_prefix(new_mount, new_buf.data()));
+                                                           strip_mount_prefix(old_mount, old_resolved_path),
+                                                           strip_mount_prefix(new_mount, new_resolved_path));
         if (RET == 0) {
-            vfs_cache_notify_path_changed(old_buf.data(), new_buf.data());
+            vfs_cache_notify_path_changed(old_resolved_path, new_resolved_path);
+            metadata_cache_store_missing_path_on_current_mount(old_resolved_path, old_mount, known_old_resolved_path_len,
+                                                               known_old_resolved_path_hash);
         }
         return RET;
     }
 
     if (old_mount->fs_type == FSType::REMOTE && new_mount->fs_type == FSType::REMOTE && old_mount == new_mount) {
-        int const RET = ker::net::wki::wki_remote_vfs_rename(old_mount->private_data, strip_mount_prefix(old_mount, old_buf.data()),
-                                                             strip_mount_prefix(new_mount, new_buf.data()));
+        int const RET = ker::net::wki::wki_remote_vfs_rename(old_mount->private_data, strip_mount_prefix(old_mount, old_resolved_path),
+                                                             strip_mount_prefix(new_mount, new_resolved_path));
         if (RET == 0) {
-            vfs_cache_notify_path_changed(old_buf.data(), new_buf.data());
+            vfs_cache_notify_path_changed(old_resolved_path, new_resolved_path);
+            metadata_cache_store_missing_path_on_current_mount(old_resolved_path, old_mount, known_old_resolved_path_len,
+                                                               known_old_resolved_path_hash);
         }
         return RET;
     }
 
     if (old_mount->fs_type == FSType::XFS && new_mount->fs_type == FSType::XFS && old_mount == new_mount) {
-        int const RET =
-            ker::vfs::xfs::xfs_rename_path(strip_mount_prefix(old_mount, old_buf.data()), strip_mount_prefix(new_mount, new_buf.data()),
-                                           static_cast<ker::vfs::xfs::XfsMountContext*>(old_mount->private_data));
+        Stat renamed_stat{};
+        size_t const OLD_FS_PATH_LEN = strip_mount_prefix_len(old_mount, old_resolved_path, known_old_resolved_path_len);
+        size_t const NEW_FS_PATH_LEN = strip_mount_prefix_len(new_mount, new_resolved_path, known_new_resolved_path_len);
+        int const RET = ker::vfs::xfs::xfs_rename_path(
+            strip_mount_prefix(old_mount, old_resolved_path), strip_mount_prefix(new_mount, new_resolved_path),
+            static_cast<ker::vfs::xfs::XfsMountContext*>(old_mount->private_data), &renamed_stat, OLD_FS_PATH_LEN, NEW_FS_PATH_LEN);
         if (RET == 0) {
-            vfs_cache_notify_path_changed(old_buf.data(), new_buf.data());
+            vfs_cache_notify_path_changed(old_resolved_path, new_resolved_path);
+            metadata_cache_store_missing_path_on_current_mount(old_resolved_path, old_mount, known_old_resolved_path_len,
+                                                               known_old_resolved_path_hash);
+            metadata_cache_store_known_stat_variants(new_resolved_path, new_mount->fs_type, new_mount->dev_id, renamed_stat,
+                                                     metadata_snapshot_stamp(), known_new_resolved_path_len, new_mount,
+                                                     known_new_resolved_path_hash);
         }
         return RET;
     }
@@ -7819,7 +12500,7 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
 
     // Helper lambda to strip mount prefix
     auto strip_mount = [](const char* buf, MountPoint* m) -> const char* {
-        size_t const ML = std::strlen(m->path);
+        size_t const ML = m->path_len;
         if (ML == 1 && m->path[0] == '/') {
             return buf + 1;
         }
@@ -7829,8 +12510,8 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
         return buf + ML;
     };
 
-    const char* old_fs = strip_mount(old_buf.data(), old_mount);
-    const char* new_fs = strip_mount(new_buf.data(), new_mount);
+    const char* old_fs = strip_mount(old_resolved_path, old_mount);
+    const char* new_fs = strip_mount(new_resolved_path, new_mount);
 
     if (*old_fs == '\0') {
         return -EINVAL;  // Can't rename root
@@ -7849,7 +12530,7 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
     if (old_node == nullptr) {
         return -ENOENT;
     }
-    if (OLD_PATH_REQUIRES_DIRECTORY && old_node->type != ker::vfs::tmpfs::TmpNodeType::DIRECTORY) {
+    if (old_path_requires_directory && old_node->type != ker::vfs::tmpfs::TmpNodeType::DIRECTORY) {
         return -ENOTDIR;
     }
 
@@ -7870,7 +12551,7 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
     // If destination exists, remove it
     ker::vfs::tmpfs::tmpfs_lock_tree();
     auto* existing = ker::vfs::tmpfs::tmpfs_lookup(new_parent, new_name);
-    if (NEW_PATH_REQUIRES_DIRECTORY) {
+    if (new_path_requires_directory) {
         if (existing == nullptr) {
             ker::vfs::tmpfs::tmpfs_unlock_tree();
             return -ENOENT;
@@ -7925,41 +12606,140 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
         return -EIO;
     }
 
+    Stat renamed_stat{};
+    auto* stat_node = ker::vfs::tmpfs::tmpfs_canonical_node(old_node);
+    bool const HAVE_RENAMED_STAT = stat_node != nullptr;
+    if (HAVE_RENAMED_STAT) {
+        fill_tmpfs_node_stat(new_mount->dev_id, stat_node, &renamed_stat);
+    }
     ker::vfs::tmpfs::tmpfs_unlock_tree();
     if (existing_hardlink_count_changed) {
         metadata_cache_note_path_changed("/", nullptr);
     }
-    vfs_cache_notify_path_changed(old_buf.data(), new_buf.data());
+    vfs_cache_notify_path_changed(old_resolved_path, new_resolved_path);
+    metadata_cache_store_missing_path_on_current_mount(old_resolved_path, old_mount, known_old_resolved_path_len,
+                                                       known_old_resolved_path_hash);
+    if (HAVE_RENAMED_STAT) {
+        metadata_cache_store_known_stat_variants(new_resolved_path, new_mount->fs_type, new_mount->dev_id, renamed_stat,
+                                                 metadata_snapshot_stamp(), known_new_resolved_path_len, new_mount,
+                                                 known_new_resolved_path_hash);
+    }
     return 0;
 }
+}  // namespace
 
-// --- chmod (stub) ---
-auto vfs_chmod(const char* path, int mode) -> int {
-    if (path == nullptr) {
+// --- rename ---
+auto vfs_rename(const char* oldpath, const char* newpath) -> int {
+    if (oldpath == nullptr || newpath == nullptr) {
         return -EINVAL;
     }
 
-    std::array<char, MAX_PATH_LEN> path_buffer{};
-    if (resolve_task_path_raw(path, path_buffer.data(), path_buffer.size()) < 0) {
+    std::array<char, MAX_PATH_LEN> old_buf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> new_buf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    auto* task = ker::mod::sched::get_current_task();
+    PathTextScan old_scan{};
+    size_t old_buf_len = UNKNOWN_PATH_LEN;
+    uint64_t old_buf_hash = UNKNOWN_PATH_HASH;
+    if (task_absolute_local_path_fast_path_allowed(task, oldpath, &old_scan)) {
+        int const COPY_RET = copy_path_string(oldpath, old_buf.data(), old_buf.size(), old_scan.path_len, &old_buf_len);
+        if (COPY_RET < 0) {
+            return COPY_RET;
+        }
+        old_buf_hash = old_scan.path_hash;
+    } else if (resolve_task_path_raw_impl(oldpath, old_buf.data(), old_buf.size(), true, &old_buf_len, &old_buf_hash) < 0) {
+        return -ENAMETOOLONG;
+    }
+    PathTextScan new_scan{};
+    size_t new_buf_len = UNKNOWN_PATH_LEN;
+    uint64_t new_buf_hash = UNKNOWN_PATH_HASH;
+    if (task_absolute_local_path_fast_path_allowed(task, newpath, &new_scan)) {
+        int const COPY_RET = copy_path_string(newpath, new_buf.data(), new_buf.size(), new_scan.path_len, &new_buf_len);
+        if (COPY_RET < 0) {
+            return COPY_RET;
+        }
+        new_buf_hash = new_scan.path_hash;
+    } else if (resolve_task_path_raw_impl(newpath, new_buf.data(), new_buf.size(), true, &new_buf_len, &new_buf_hash) < 0) {
         return -ENAMETOOLONG;
     }
 
-    auto mount_ref = find_mount_point(path_buffer.data());
+    return vfs_rename_resolved_paths(old_buf.data(), new_buf.data(), path_requires_directory(oldpath), path_requires_directory(newpath),
+                                     old_buf_len, new_buf_len, old_buf_hash, new_buf_hash);
+}
+
+auto vfs_renameat(ker::mod::sched::task::Task* task, int olddirfd, const char* oldpath, int newdirfd, const char* newpath) -> int {
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (oldpath == nullptr || newpath == nullptr) {
+        return -EINVAL;
+    }
+
+    std::array<char, MAX_PATH_LEN> old_resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> new_resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    bool old_path_requires_directory = false;
+    bool new_path_requires_directory = false;
+    size_t old_resolved_len = UNKNOWN_PATH_LEN;
+    size_t new_resolved_len = UNKNOWN_PATH_LEN;
+    uint64_t old_resolved_hash = UNKNOWN_PATH_HASH;
+    uint64_t new_resolved_hash = UNKNOWN_PATH_HASH;
+    int result =
+        resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, olddirfd, oldpath, old_resolved.data(), old_resolved.size(), true,
+                                                                  &old_path_requires_directory, &old_resolved_len, &old_resolved_hash);
+    if (result < 0) {
+        return result;
+    }
+    result =
+        resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, newdirfd, newpath, new_resolved.data(), new_resolved.size(), true,
+                                                                  &new_path_requires_directory, &new_resolved_len, &new_resolved_hash);
+    if (result < 0) {
+        return result;
+    }
+
+    return vfs_rename_resolved_paths(old_resolved.data(), new_resolved.data(), old_path_requires_directory, new_path_requires_directory,
+                                     old_resolved_len, new_resolved_len, old_resolved_hash, new_resolved_hash);
+}
+
+namespace {
+auto vfs_chmod_resolved_path(const char* resolved_path, int mode, bool follow_final_symlink,
+                             size_t known_resolved_path_len = UNKNOWN_PATH_LEN) -> int {
+    if (resolved_path == nullptr) {
+        return -EINVAL;
+    }
+
+    std::array<char, MAX_PATH_LEN> path_buffer;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t path_buffer_len = UNKNOWN_PATH_LEN;
+    int const COPY_RET = copy_path_string(resolved_path, path_buffer.data(), path_buffer.size(), known_resolved_path_len, &path_buffer_len);
+    if (COPY_RET < 0) {
+        return COPY_RET;
+    }
+
+    auto mount_ref = find_mount_point(path_buffer.data(), path_buffer_len);
     auto* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
-    if (mount->fs_type != FSType::REMOTE) {
-        std::array<char, MAX_PATH_LEN> resolved_path{};
-        int const RESOLVE_RET = resolve_symlinks(path_buffer.data(), resolved_path.data(), resolved_path.size(), true, true);
-        if (RESOLVE_RET < 0) {
-            return RESOLVE_RET;
-        }
-        std::memcpy(path_buffer.data(), resolved_path.data(), path_buffer.size());
-        mount_ref = find_mount_point(path_buffer.data());
-        mount = mount_ref.get();
-        if (mount == nullptr) {
-            return -ENOENT;
+    if (follow_final_symlink && mount->fs_type != FSType::REMOTE) {
+        bool skip_final_symlink_probe = false;
+        bool const SYMLINK_RESOLUTION_KNOWN_NOOP =
+            local_symlink_resolution_known_noop(path_buffer.data(), mount, &path_buffer_len, &skip_final_symlink_probe);
+        if (!SYMLINK_RESOLUTION_KNOWN_NOOP) {
+            std::array<char, MAX_PATH_LEN> resolved_path;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+            size_t resolved_len = path_buffer_len;
+            int const RESOLVE_RET = resolve_symlinks(path_buffer.data(), resolved_path.data(), resolved_path.size(), true,
+                                                     !skip_final_symlink_probe, path_buffer_len, &resolved_len);
+            if (RESOLVE_RET < 0) {
+                return RESOLVE_RET;
+            }
+            bool const PATH_CHANGED_BY_SYMLINK = !path_text_equal(path_buffer.data(), path_buffer_len, resolved_path.data(), resolved_len);
+            if (PATH_CHANGED_BY_SYMLINK) {
+                std::memcpy(path_buffer.data(), resolved_path.data(), path_buffer.size());
+                mount_ref = find_mount_point(path_buffer.data(), resolved_len);
+                mount = mount_ref.get();
+                if (mount == nullptr) {
+                    return -ENOENT;
+                }
+            }
+            path_buffer_len = resolved_len;
         }
     }
 
@@ -7976,7 +12756,10 @@ auto vfs_chmod(const char* path, int mode) -> int {
                 return -ENOENT;
             }
             node->mode = static_cast<uint32_t>(mode) & 07777;
+            Stat updated_stat{};
+            fill_tmpfs_node_stat(mount->dev_id, node, &updated_stat);
             cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type);
+            metadata_cache_store_known_path_stat_on_current_mount(path_buffer.data(), mount, updated_stat, path_buffer_len);
             return 0;
         }
         case FSType::DEVFS: {
@@ -7991,9 +12774,13 @@ auto vfs_chmod(const char* path, int mode) -> int {
         case FSType::FAT32:
             return 0;  // FAT32 has no permission model; silently accept
         case FSType::XFS: {
-            int const RET = ker::vfs::xfs::xfs_chmod_path(fs_path, mode, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+            Stat updated_stat{};
+            size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, path_buffer.data(), path_buffer_len);
+            int const RET = ker::vfs::xfs::xfs_chmod_path(fs_path, mode, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data),
+                                                          &updated_stat, FS_PATH_LEN);
             if (RET == 0) {
                 cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type);
+                metadata_cache_store_known_path_stat_on_current_mount(path_buffer.data(), mount, updated_stat, path_buffer_len);
             }
             return RET;
         }
@@ -8001,9 +12788,10 @@ auto vfs_chmod(const char* path, int mode) -> int {
             return -ENOSYS;
     }
 }
+}  // namespace
 
-auto vfs_fchmod(int fd, int mode) -> int {
-    auto* task = ker::mod::sched::get_current_task();
+namespace {
+auto vfs_fchmod_for_task(ker::mod::sched::task::Task* task, int fd, int mode) -> int {
     if (task == nullptr) {
         return -ESRCH;
     }
@@ -8026,6 +12814,7 @@ auto vfs_fchmod(int fd, int mode) -> int {
             }
             node->mode = static_cast<uint32_t>(mode) & 07777;
             cache_notify_file_metadata_changed_impl(f);
+            metadata_cache_refresh_file_stat_after_metadata_change(f);
             vfs_put_file(f);
             return 0;
         }
@@ -8034,9 +12823,11 @@ auto vfs_fchmod(int fd, int mode) -> int {
             vfs_put_file(f);
             return 0;  // No permission model; silently accept
         case FSType::XFS: {
-            int const RESULT = ker::vfs::xfs::xfs_fchmod(f, mode);
+            Stat updated_stat{};
+            int const RESULT = ker::vfs::xfs::xfs_fchmod(f, mode, &updated_stat);
             if (RESULT == 0) {
                 cache_notify_file_metadata_changed_impl(f);
+                metadata_cache_store_known_file_stat_after_metadata_change(f, updated_stat);
             }
             vfs_put_file(f);
             return RESULT;
@@ -8046,24 +12837,66 @@ auto vfs_fchmod(int fd, int mode) -> int {
             return -ENOSYS;
     }
 }
+}  // namespace
 
-auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
+// --- chmod (stub) ---
+auto vfs_chmod(const char* path, int mode) -> int {
     if (path == nullptr) {
         return -EINVAL;
     }
 
-    std::array<char, MAX_PATH_LEN> path_buffer{};
-    if (resolve_task_path_raw(path, path_buffer.data(), path_buffer.size()) < 0) {
+    auto* task = ker::mod::sched::get_current_task();
+    PathTextScan scan{};
+    if (task_absolute_local_path_fast_path_allowed(task, path, &scan)) {
+        return vfs_chmod_resolved_path(path, mode, true, scan.path_len);
+    }
+
+    std::array<char, MAX_PATH_LEN> path_buffer;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t path_buffer_len = UNKNOWN_PATH_LEN;
+    if (resolve_task_path_raw_impl(path, path_buffer.data(), path_buffer.size(), true, &path_buffer_len) < 0) {
         return -ENAMETOOLONG;
     }
 
-    auto mount_ref = find_mount_point(path_buffer.data());
+    return vfs_chmod_resolved_path(path_buffer.data(), mode, true, path_buffer_len);
+}
+
+auto vfs_fchmod(int fd, int mode) -> int {
+    auto* task = ker::mod::sched::get_current_task();
+    return vfs_fchmod_for_task(task, fd, mode);
+}
+
+auto vfs_fchmodat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int mode, int flags) -> int {
+    constexpr int ALLOWED_FLAGS = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (pathname == nullptr || (flags & ~ALLOWED_FLAGS) != 0) {
+        return -EINVAL;
+    }
+
+    if ((flags & AT_EMPTY_PATH) != 0 && pathname[0] == '\0') {
+        return vfs_fchmod_for_task(task, dirfd, mode);
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    int const RESOLVE_RET = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, dirfd, pathname, resolved.data(),
+                                                                                      resolved.size(), true, nullptr, &resolved_len);
+    if (RESOLVE_RET < 0) {
+        return RESOLVE_RET;
+    }
+    return vfs_chmod_resolved_path(resolved.data(), mode, (flags & AT_SYMLINK_NOFOLLOW) == 0, resolved_len);
+}
+
+namespace {
+auto vfs_chown_resolved_path(const char* path, uint32_t owner, uint32_t group, size_t known_path_len = UNKNOWN_PATH_LEN) -> int {
+    auto mount_ref = find_mount_point(path, known_path_len);
     auto* mount = mount_ref.get();
     if (mount == nullptr) {
         return -ENOENT;
     }
 
-    const char* fs_path = strip_mount_prefix(mount, path_buffer.data());
+    const char* fs_path = strip_mount_prefix(mount, path);
 
     switch (mount->fs_type) {
         case FSType::TMPFS: {
@@ -8081,7 +12914,10 @@ auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
             if (std::cmp_not_equal(group, -1)) {
                 node->gid = group;
             }
-            cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type);
+            Stat updated_stat{};
+            fill_tmpfs_node_stat(mount->dev_id, node, &updated_stat);
+            cache_notify_path_data_changed_impl(path, mount->fs_type);
+            metadata_cache_store_known_path_stat_on_current_mount(path, mount, updated_stat, known_path_len);
             return 0;
         }
         case FSType::DEVFS: {
@@ -8095,7 +12931,7 @@ auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
             if (std::cmp_not_equal(group, -1)) {
                 node->gid = group;
             }
-            cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type);
+            cache_notify_path_data_changed_impl(path, mount->fs_type);
             return 0;
         }
         case FSType::FAT32:
@@ -8106,8 +12942,7 @@ auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
     }
 }
 
-auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int {
-    auto* task = ker::mod::sched::get_current_task();
+auto vfs_fchown_for_task(ker::mod::sched::task::Task* task, int fd, uint32_t owner, uint32_t group) -> int {
     if (task == nullptr) {
         return -ESRCH;
     }
@@ -8134,7 +12969,8 @@ auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int {
             if (std::cmp_not_equal(group, -1)) {
                 node->gid = group;
             }
-            cache_notify_file_data_changed_impl(f);
+            cache_notify_file_metadata_changed_impl(f);
+            metadata_cache_refresh_file_stat_after_metadata_change(f);
             vfs_put_file(f);
             return 0;
         }
@@ -8147,6 +12983,55 @@ auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int {
             vfs_put_file(f);
             return -ENOSYS;
     }
+}
+}  // namespace
+
+auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
+    if (path == nullptr) {
+        return -EINVAL;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    PathTextScan scan{};
+    if (task_absolute_local_path_fast_path_allowed(task, path, &scan)) {
+        return vfs_chown_resolved_path(path, owner, group, scan.path_len);
+    }
+
+    std::array<char, MAX_PATH_LEN> path_buffer;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t path_buffer_len = UNKNOWN_PATH_LEN;
+    if (resolve_task_path_raw_impl(path, path_buffer.data(), path_buffer.size(), true, &path_buffer_len) < 0) {
+        return -ENAMETOOLONG;
+    }
+
+    return vfs_chown_resolved_path(path_buffer.data(), owner, group, path_buffer_len);
+}
+
+auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int {
+    auto* task = ker::mod::sched::get_current_task();
+    return vfs_fchown_for_task(task, fd, owner, group);
+}
+
+auto vfs_fchownat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, uint32_t owner, uint32_t group, int flags) -> int {
+    constexpr int ALLOWED_FLAGS = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (pathname == nullptr || (flags & ~ALLOWED_FLAGS) != 0) {
+        return -EINVAL;
+    }
+
+    if ((flags & AT_EMPTY_PATH) != 0 && pathname[0] == '\0') {
+        return vfs_fchown_for_task(task, dirfd, owner, group);
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    int const RESOLVE_RET = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, dirfd, pathname, resolved.data(),
+                                                                                      resolved.size(), true, nullptr, &resolved_len);
+    if (RESOLVE_RET < 0) {
+        return RESOLVE_RET;
+    }
+    return vfs_chown_resolved_path(resolved.data(), owner, group, resolved_len);
 }
 
 namespace {
@@ -8236,8 +13121,9 @@ auto apply_devfs_utimens(ker::vfs::devfs::DevFSNode* node, const VfsResolvedTime
     return 0;
 }
 
-auto vfs_apply_utimens_to_path(const char* path, const Timespec* times, bool follow_final_symlink) -> int {
-    if (path == nullptr) {
+auto vfs_apply_utimens_to_resolved_path(const char* resolved_path, const Timespec* times, bool follow_final_symlink,
+                                        size_t known_resolved_path_len = UNKNOWN_PATH_LEN) -> int {
+    if (resolved_path == nullptr) {
         return -EINVAL;
     }
 
@@ -8246,23 +13132,36 @@ auto vfs_apply_utimens_to_path(const char* path, const Timespec* times, bool fol
         return RET;
     }
 
-    std::array<char, MAX_PATH_LEN> path_buffer{};
-    if (resolve_task_path_raw(path, path_buffer.data(), path_buffer.size()) < 0) {
-        return -ENAMETOOLONG;
+    std::array<char, MAX_PATH_LEN> path_buffer;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t path_buffer_len = UNKNOWN_PATH_LEN;
+    int const COPY_RET = copy_path_string(resolved_path, path_buffer.data(), path_buffer.size(), known_resolved_path_len, &path_buffer_len);
+    if (COPY_RET < 0) {
+        return COPY_RET;
     }
 
-    auto mount_ref = find_mount_point(path_buffer.data());
+    auto mount_ref = find_mount_point(path_buffer.data(), path_buffer_len);
     auto* mount = mount_ref.get();
     bool const REMOTE_MOUNT = mount != nullptr && mount->fs_type == FSType::REMOTE;
     if (follow_final_symlink && !REMOTE_MOUNT) {
-        std::array<char, MAX_PATH_LEN> resolved_path{};
-        int const RESOLVE_RET = resolve_symlinks(path_buffer.data(), resolved_path.data(), resolved_path.size(), true, true);
-        if (RESOLVE_RET < 0) {
-            return RESOLVE_RET;
+        bool skip_final_symlink_probe = false;
+        bool const SYMLINK_RESOLUTION_KNOWN_NOOP =
+            local_symlink_resolution_known_noop(path_buffer.data(), mount, &path_buffer_len, &skip_final_symlink_probe);
+        if (!SYMLINK_RESOLUTION_KNOWN_NOOP) {
+            std::array<char, MAX_PATH_LEN> resolved_path;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+            size_t resolved_len = path_buffer_len;
+            int const RESOLVE_RET = resolve_symlinks(path_buffer.data(), resolved_path.data(), resolved_path.size(), true,
+                                                     !skip_final_symlink_probe, path_buffer_len, &resolved_len);
+            if (RESOLVE_RET < 0) {
+                return RESOLVE_RET;
+            }
+            bool const PATH_CHANGED_BY_SYMLINK = !path_text_equal(path_buffer.data(), path_buffer_len, resolved_path.data(), resolved_len);
+            if (PATH_CHANGED_BY_SYMLINK) {
+                std::memcpy(path_buffer.data(), resolved_path.data(), path_buffer.size());
+                mount_ref = find_mount_point(path_buffer.data(), resolved_len);
+                mount = mount_ref.get();
+            }
+            path_buffer_len = resolved_len;
         }
-        std::memcpy(path_buffer.data(), resolved_path.data(), path_buffer.size());
-        mount_ref = find_mount_point(path_buffer.data());
-        mount = mount_ref.get();
     }
 
     if (mount == nullptr) {
@@ -8272,10 +13171,19 @@ auto vfs_apply_utimens_to_path(const char* path, const Timespec* times, bool fol
 
     int ret = -ENOSYS;
     bool changed = resolved_times.set_atime || resolved_times.set_mtime;
+    Stat updated_stat{};
+    bool have_updated_stat = false;
     switch (mount->fs_type) {
         case FSType::TMPFS: {
             auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, false);
             ret = apply_tmpfs_utimens(node, resolved_times);
+            if (ret == 0 && changed) {
+                auto* stat_node = ker::vfs::tmpfs::tmpfs_canonical_node(node);
+                if (stat_node != nullptr) {
+                    fill_tmpfs_node_stat(mount->dev_id, stat_node, &updated_stat);
+                    have_updated_stat = true;
+                }
+            }
             break;
         }
         case FSType::DEVFS: {
@@ -8283,11 +13191,14 @@ auto vfs_apply_utimens_to_path(const char* path, const Timespec* times, bool fol
             ret = apply_devfs_utimens(node, resolved_times);
             break;
         }
-        case FSType::XFS:
-            ret = ker::vfs::xfs::xfs_set_times_path(fs_path, resolved_times.atime, resolved_times.mtime, resolved_times.set_atime,
-                                                    resolved_times.set_mtime,
-                                                    static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+        case FSType::XFS: {
+            size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, path_buffer.data(), path_buffer_len);
+            ret = ker::vfs::xfs::xfs_set_times_path(
+                fs_path, resolved_times.atime, resolved_times.mtime, resolved_times.set_atime, resolved_times.set_mtime,
+                static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), &updated_stat, FS_PATH_LEN);
+            have_updated_stat = ret == 0 && changed;
             break;
+        }
         case FSType::FAT32:
             changed = false;
             ret = 0;
@@ -8302,8 +13213,31 @@ auto vfs_apply_utimens_to_path(const char* path, const Timespec* times, bool fol
 
     if (ret == 0 && changed) {
         cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type);
+        if (have_updated_stat) {
+            metadata_cache_store_known_path_stat_on_current_mount(path_buffer.data(), mount, updated_stat, path_buffer_len);
+        }
     }
     return ret;
+}
+
+auto vfs_apply_utimens_to_path(const char* path, const Timespec* times, bool follow_final_symlink) -> int {
+    if (path == nullptr) {
+        return -EINVAL;
+    }
+
+    auto* task = ker::mod::sched::get_current_task();
+    PathTextScan scan{};
+    if (task_absolute_local_path_fast_path_allowed(task, path, &scan)) {
+        return vfs_apply_utimens_to_resolved_path(path, times, follow_final_symlink, scan.path_len);
+    }
+
+    std::array<char, MAX_PATH_LEN> path_buffer;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t path_buffer_len = UNKNOWN_PATH_LEN;
+    if (resolve_task_path_raw_impl(path, path_buffer.data(), path_buffer.size(), true, &path_buffer_len) < 0) {
+        return -ENAMETOOLONG;
+    }
+
+    return vfs_apply_utimens_to_resolved_path(path_buffer.data(), times, follow_final_symlink, path_buffer_len);
 }
 
 }  // namespace
@@ -8327,12 +13261,14 @@ auto vfs_utimensat(int dirfd, const char* pathname, const Timespec* times, int f
         return -ESRCH;
     }
 
-    std::array<char, MAX_PATH_LEN> resolved{};
-    int const RES = vfs_resolve_dirfd(task, dirfd, pathname, resolved.data(), resolved.size());
+    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    int const RES = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, dirfd, pathname, resolved.data(), resolved.size(), true,
+                                                                              nullptr, &resolved_len);
     if (RES < 0) {
         return RES;
     }
-    return vfs_apply_utimens_to_path(resolved.data(), times, (flags & AT_SYMLINK_NOFOLLOW) == 0);
+    return vfs_apply_utimens_to_resolved_path(resolved.data(), times, (flags & AT_SYMLINK_NOFOLLOW) == 0, resolved_len);
 }
 
 auto vfs_futimens(int fd, const Timespec* times) -> int {
@@ -8349,6 +13285,8 @@ auto vfs_futimens(int fd, const Timespec* times) -> int {
     VfsResolvedTimes resolved_times{};
     int ret = resolve_utimens_times(times, &resolved_times);
     bool changed = resolved_times.set_atime || resolved_times.set_mtime;
+    Stat updated_stat{};
+    bool have_updated_stat = false;
     if (ret == 0) {
         switch (f->fs_type) {
             case FSType::TMPFS:
@@ -8363,7 +13301,8 @@ auto vfs_futimens(int fd, const Timespec* times) -> int {
                 break;
             case FSType::XFS:
                 ret = ker::vfs::xfs::xfs_set_times_file(f, resolved_times.atime, resolved_times.mtime, resolved_times.set_atime,
-                                                        resolved_times.set_mtime);
+                                                        resolved_times.set_mtime, &updated_stat);
+                have_updated_stat = ret == 0 && changed;
                 break;
             case FSType::FAT32:
                 changed = false;
@@ -8380,6 +13319,11 @@ auto vfs_futimens(int fd, const Timespec* times) -> int {
 
     if (ret == 0 && changed) {
         cache_notify_file_metadata_changed_impl(f);
+        if (have_updated_stat) {
+            metadata_cache_store_known_file_stat_after_metadata_change(f, updated_stat);
+        } else {
+            metadata_cache_refresh_file_stat_after_metadata_change(f);
+        }
     }
     vfs_put_file(f);
     return ret;
@@ -10183,6 +15127,81 @@ auto vfs_selftest_anonymous_fstat_snapshot_hits() -> bool {
     return ok && CLOSED_READ && CLOSED_WRITE && task.fd_table.empty();
 }
 
+auto vfs_selftest_fstat_snapshot_fast_path_hits() -> bool {
+    ker::mod::sched::task::Task task{};
+    std::array<int, 2> pipefd{-1, -1};
+    if (vfs_pipe_for_task(&task, pipefd.data()) != 0) {
+        return false;
+    }
+
+    auto* read_file = static_cast<File*>(task.fd_table.lookup(static_cast<uint64_t>(pipefd[0])));
+    Stat st{};
+    bool ok = read_file != nullptr && vfs_fstat_snapshot_fast(&task, pipefd[0], &st) == -EAGAIN &&
+              vfs_fstat_snapshot_fast(&task, -1, &st) == -EBADF;
+
+    ok = ok && vfs_fstat_file(read_file, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFIFO);
+
+    VfsCachePerfSnapshot before{};
+    VfsCachePerfSnapshot after{};
+    vfs_get_cache_perf_snapshot(before);
+    Stat fast_st{};
+    ok = ok && vfs_fstat_snapshot_fast(&task, pipefd[0], &fast_st) == 0 &&
+         (fast_st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFIFO);
+    vfs_get_cache_perf_snapshot(after);
+    ok = ok && after.fstat_snapshot_hits > before.fstat_snapshot_hits;
+
+    bool const CLOSED_READ = pipefd[0] >= 0 && pipe_close_fake_task_fd(task, pipefd[0]);
+    bool const CLOSED_WRITE = pipefd[1] >= 0 && pipe_close_fake_task_fd(task, pipefd[1]);
+    return ok && CLOSED_READ && CLOSED_WRITE && task.fd_table.empty();
+}
+
+auto vfs_selftest_fstat_close_combines_fd_removal() -> bool {
+    ker::mod::sched::task::Task task{};
+    std::array<int, 2> pipefd{-1, -1};
+    if (vfs_pipe_for_task(&task, pipefd.data()) != 0) {
+        return false;
+    }
+
+    auto cleanup_fd = [&task](int fd) {
+        return task.fd_table.lookup(static_cast<uint64_t>(fd)) == nullptr || pipe_close_fake_task_fd(task, fd);
+    };
+
+    auto* read_file = static_cast<File*>(task.fd_table.lookup(static_cast<uint64_t>(pipefd[0])));
+    Stat seeded_st{};
+    bool ok = read_file != nullptr && vfs_fstat_file(read_file, &seeded_st) == 0;
+
+    VfsCachePerfSnapshot before_fast{};
+    VfsCachePerfSnapshot after_fast{};
+    vfs_get_cache_perf_snapshot(before_fast);
+    Stat fast_st{};
+    int fast_stat_result = -EINPROGRESS;
+    int const FAST_CLOSE_RESULT = vfs_fstat_close_for_task(&task, pipefd[0], &fast_st, &fast_stat_result);
+    vfs_get_cache_perf_snapshot(after_fast);
+    ok = ok && FAST_CLOSE_RESULT == 0 && fast_stat_result == 0 &&
+         (fast_st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFIFO) &&
+         task.fd_table.lookup(static_cast<uint64_t>(pipefd[0])) == nullptr &&
+         after_fast.fstat_snapshot_hits > before_fast.fstat_snapshot_hits;
+
+    VfsCachePerfSnapshot before_fallback{};
+    VfsCachePerfSnapshot after_fallback{};
+    vfs_get_cache_perf_snapshot(before_fallback);
+    Stat fallback_st{};
+    int fallback_stat_result = -EINPROGRESS;
+    int const FALLBACK_CLOSE_RESULT = vfs_fstat_close_for_task(&task, pipefd[1], &fallback_st, &fallback_stat_result);
+    vfs_get_cache_perf_snapshot(after_fallback);
+    ok = ok && FALLBACK_CLOSE_RESULT == 0 && fallback_stat_result == 0 &&
+         (fallback_st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFIFO) &&
+         task.fd_table.lookup(static_cast<uint64_t>(pipefd[1])) == nullptr &&
+         after_fallback.fstat_snapshot_stores > before_fallback.fstat_snapshot_stores;
+
+    Stat invalid_st{};
+    int invalid_stat_result = 0;
+    int const INVALID_CLOSE_RESULT = vfs_fstat_close_for_task(&task, pipefd[1], &invalid_st, &invalid_stat_result);
+    ok = ok && INVALID_CLOSE_RESULT == -EBADF && invalid_stat_result == -EBADF;
+
+    return ok && cleanup_fd(pipefd[0]) && cleanup_fd(pipefd[1]) && task.fd_table.empty();
+}
+
 auto vfs_selftest_remote_fstat_snapshot_cacheable() -> bool {
     constexpr const char PATH[] = "/remote/ktest-fstat-snapshot";
 
@@ -10213,15 +15232,56 @@ auto vfs_selftest_remote_fstat_snapshot_cacheable() -> bool {
            after_lookup.fstat_snapshot_miss_uncacheable == before.fstat_snapshot_miss_uncacheable;
 }
 
+auto vfs_selftest_fstat_seeds_path_metadata_cache() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_fstat_seeds_path_metadata_cache";
+    vfs_unlink(PATH);
+    vfs_cache_notify_path_changed(PATH, nullptr);
+
+    auto* file = vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (file == nullptr) {
+        return false;
+    }
+
+    VfsCachePerfSnapshot before_fstat{};
+    VfsCachePerfSnapshot after_fstat{};
+    VfsCachePerfSnapshot after_lstat{};
+    Stat st{};
+    bool ok = true;
+    vfs_get_cache_perf_snapshot(before_fstat);
+    mount_lookup_cache_reset_for_test();
+    {
+        auto seed_mount_ref = find_mount_point(PATH);
+        ok = ok && seed_mount_ref.get() != nullptr;
+    }
+    uint64_t const MOUNT_CACHE_HITS_BEFORE_FSTAT = mount_lookup_cache_hits_for_test();
+
+    ok = ok && file->mount_dev_id != 0 && vfs_fstat_file(file, &st) == 0 &&
+         (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG) && st.st_dev == file->mount_dev_id;
+    vfs_get_cache_perf_snapshot(after_fstat);
+    ok = ok && after_fstat.fstat_snapshot_stores > before_fstat.fstat_snapshot_stores &&
+         after_fstat.metadata_stores > before_fstat.metadata_stores && mount_lookup_cache_hits_for_test() == MOUNT_CACHE_HITS_BEFORE_FSTAT;
+
+    ok = ok && vfs_lstat(PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG);
+    vfs_get_cache_perf_snapshot(after_lstat);
+    ok = ok && after_lstat.metadata_hits > after_fstat.metadata_hits;
+
+    vfs_put_file(file);
+    ok = (vfs_unlink(PATH) == 0) && ok;
+    return ok;
+}
+
 auto vfs_selftest_file_path_storage() -> bool {
     File file{};
     constexpr const char SHORT_PATH[] = "/tmp/short-vfs-path";
 
     bool ok = vfs_file_set_path(&file, SHORT_PATH);
-    ok = ok && file.vfs_path == file.vfs_path_inline.data() && !file.vfs_path_heap_allocated && std::strcmp(file.vfs_path, SHORT_PATH) == 0;
+    ok = ok && file.vfs_path == file.vfs_path_inline.data() && file.vfs_path_len == sizeof(SHORT_PATH) - 1 &&
+         !file.vfs_path_heap_allocated && std::strcmp(file.vfs_path, SHORT_PATH) == 0;
 
     vfs_file_clear_path(&file);
-    ok = ok && file.vfs_path == nullptr && !file.vfs_path_heap_allocated && file.vfs_path_inline.at(0) == '\0';
+    ok = ok && file.vfs_path == nullptr && file.vfs_path_len == 0 && !file.vfs_path_heap_allocated && file.vfs_path_inline.at(0) == '\0';
 
     std::array<char, File::INLINE_VFS_PATH_CAPACITY + 8> long_path{};
     long_path.at(0) = '/';
@@ -10231,8 +15291,8 @@ auto vfs_selftest_file_path_storage() -> bool {
     long_path.back() = '\0';
 
     ok = ok && vfs_file_set_path(&file, long_path.data());
-    ok = ok && file.vfs_path != nullptr && file.vfs_path != file.vfs_path_inline.data() && file.vfs_path_heap_allocated &&
-         std::strcmp(file.vfs_path, long_path.data()) == 0;
+    ok = ok && file.vfs_path != nullptr && file.vfs_path != file.vfs_path_inline.data() && file.vfs_path_len == long_path.size() - 1 &&
+         file.vfs_path_heap_allocated && std::strcmp(file.vfs_path, long_path.data()) == 0;
 
     vfs_file_clear_path(&file);
 
@@ -10241,7 +15301,7 @@ auto vfs_selftest_file_path_storage() -> bool {
     file.vfs_path_heap_allocated = false;
     vfs_file_clear_path(&file);
 
-    return ok && file.vfs_path == nullptr && !file.vfs_path_heap_allocated;
+    return ok && file.vfs_path == nullptr && file.vfs_path_len == 0 && !file.vfs_path_heap_allocated;
 }
 
 auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool {
@@ -10286,6 +15346,7 @@ auto vfs_selftest_file_data_write_skips_uncached_path_invalidation() -> bool {
     if (file == nullptr) {
         return false;
     }
+    bool ok = file->mount_dev_id != 0 && file->mount_generation == mount_table_generation_snapshot();
 
     VfsCachePerfSnapshot before_unrelated{};
     VfsCachePerfSnapshot after_unrelated{};
@@ -10296,7 +15357,7 @@ auto vfs_selftest_file_data_write_skips_uncached_path_invalidation() -> bool {
     vfs_get_cache_perf_snapshot(after_unrelated);
     bool const STORED_UNRELATED = after_unrelated.metadata_stores > before_unrelated.metadata_stores;
     bool const HAD_PATH_OBSERVATION_BEFORE_STAT = metadata_cache_has_file_data_observation(file);
-    bool ok = STORED_UNRELATED && !HAD_PATH_OBSERVATION_BEFORE_STAT;
+    ok = ok && STORED_UNRELATED && !HAD_PATH_OBSERVATION_BEFORE_STAT;
 
     metadata_cache_note_file_data_changed(file);
     vfs_get_cache_perf_snapshot(after_uncached_write);
@@ -10329,6 +15390,230 @@ auto vfs_selftest_file_data_write_skips_uncached_path_invalidation() -> bool {
 
     vfs_put_file(file);
     ok = ok && vfs_unlink(PATH) == 0;
+    return ok;
+}
+
+auto vfs_selftest_file_data_close_refreshes_created_path_stat() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_file_data_close_refresh";
+    constexpr const char* EMPTY_PATH = "/tmp/ktest_file_data_close_refresh_empty";
+    constexpr char DATA[] = "created-file-payload";
+    vfs_unlink(PATH);
+    vfs_unlink(EMPTY_PATH);
+
+    auto* file = vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (file == nullptr || file->fops == nullptr || file->fops->vfs_write == nullptr) {
+        return false;
+    }
+
+    Stat pathless_open_stat{};
+    const char* saved_path = file->vfs_path;
+    file->vfs_path = nullptr;
+    bool ok = file->mount_dev_id != 0 && vfs_stream_cache_get_file_stat(file, &pathless_open_stat) == 0 &&
+              pathless_open_stat.st_dev == file->mount_dev_id && file->mount_generation == mount_table_generation_snapshot();
+    file->vfs_path = saved_path;
+
+    ok = ok && file->created_by_open && file->fops->vfs_write(file, DATA, sizeof(DATA) - 1, 0) == static_cast<ssize_t>(sizeof(DATA) - 1);
+    cache_notify_file_data_changed_impl(file);
+
+    VfsCachePerfSnapshot before_close{};
+    VfsCachePerfSnapshot after_close{};
+    VfsCachePerfSnapshot after_lstat{};
+    vfs_get_cache_perf_snapshot(before_close);
+    vfs_put_file(file);
+    vfs_get_cache_perf_snapshot(after_close);
+
+    Stat st{};
+    ok = ok && after_close.metadata_stores > before_close.metadata_stores;
+    ok = ok && vfs_lstat(PATH, &st) == 0 && st.st_size == static_cast<off_t>(sizeof(DATA) - 1);
+    vfs_get_cache_perf_snapshot(after_lstat);
+    ok = ok && after_lstat.metadata_hits > after_close.metadata_hits;
+
+    ok = ok && vfs_unlink(PATH) == 0;
+
+    auto* empty_file = vfs_open_file(EMPTY_PATH, ker::vfs::O_CREAT | 1, 0644);
+    ok = ok && empty_file != nullptr && empty_file->created_by_open;
+    if (empty_file != nullptr && empty_file->fs_type == FSType::TMPFS && empty_file->private_data != nullptr) {
+        auto* node = static_cast<ker::vfs::tmpfs::TmpNode*>(empty_file->private_data);
+        node = ker::vfs::tmpfs::tmpfs_canonical_node(node);
+        if (node != nullptr) {
+            node->mode = 0755;
+            cache_notify_file_metadata_changed_impl(empty_file);
+        }
+    }
+    VfsCachePerfSnapshot before_empty_close{};
+    VfsCachePerfSnapshot after_empty_close{};
+    VfsCachePerfSnapshot after_empty_lstat{};
+    vfs_get_cache_perf_snapshot(before_empty_close);
+    if (empty_file != nullptr) {
+        vfs_put_file(empty_file);
+    }
+    vfs_get_cache_perf_snapshot(after_empty_close);
+
+    ok = ok && after_empty_close.metadata_stores > before_empty_close.metadata_stores;
+    ok = ok && vfs_lstat(EMPTY_PATH, &st) == 0 && st.st_size == 0 && (st.st_mode & 07777) == 0755;
+    vfs_get_cache_perf_snapshot(after_empty_lstat);
+    ok = ok && after_empty_lstat.metadata_hits > after_empty_close.metadata_hits;
+    ok = ok && vfs_unlink(EMPTY_PATH) == 0;
+    return ok;
+}
+
+auto vfs_selftest_created_open_prefill_seeds_path_stat() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_created_open_prefill_stat";
+    constexpr const char* WRITE_PATH = "/tmp/ktest_write_open_prefill_stat";
+    constexpr const char* EXISTING_CREAT_PATH = "/tmp/ktest_existing_creat_prefill_stat";
+    constexpr const char* TRUNC_PATH = "/tmp/ktest_trunc_prefill_stat";
+    vfs_unlink(PATH);
+    vfs_unlink(WRITE_PATH);
+    vfs_unlink(EXISTING_CREAT_PATH);
+    vfs_unlink(TRUNC_PATH);
+    vfs_cache_notify_path_changed(PATH, nullptr);
+    vfs_cache_notify_path_changed(WRITE_PATH, nullptr);
+    vfs_cache_notify_path_changed(EXISTING_CREAT_PATH, nullptr);
+    vfs_cache_notify_path_changed(TRUNC_PATH, nullptr);
+
+    auto* file = vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (file == nullptr) {
+        return false;
+    }
+
+    auto mount_ref = find_mount_point(PATH);
+    MountPoint const* mount = mount_ref.get();
+    bool ok = file->created_by_open && mount != nullptr;
+    Stat opened_stat{};
+    if (mount != nullptr) {
+        opened_stat.st_dev = mount->dev_id;
+    }
+    opened_stat.st_ino = 12345;
+    opened_stat.st_mode = S_IFREG | 0644;
+    opened_stat.st_nlink = 1;
+    opened_stat.st_size = 0;
+    opened_stat.st_blksize = 4096;
+
+    vfs_prefill_file_stat_snapshot(file, opened_stat);
+    ok = ok && file->stat_cache_valid && file->stat_cache_path_len == 0;
+    ok = ok && file_stat_snapshot_promote_created_open_prefill(file);
+    ok = ok && metadata_cache_store_opened_file_stat(file, mount);
+
+    if (mount != nullptr) {
+        Stat cached{};
+        ok = ok && metadata_cache_lookup_mount_stat(PATH, mount, true, false, &cached) == 0;
+        ok = ok && cached.st_ino == opened_stat.st_ino && cached.st_size == opened_stat.st_size &&
+             (cached.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG);
+
+        cache_notify_file_data_changed_impl(file);
+        ok = ok && metadata_cache_lookup_mount_stat(PATH, mount, true, false, &cached) == -EAGAIN;
+    }
+
+    vfs_put_file(file);
+    ok = ok && vfs_unlink(PATH) == 0;
+
+    auto* seed_file = vfs_open_file(WRITE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    ok = ok && seed_file != nullptr;
+    if (seed_file != nullptr) {
+        vfs_put_file(seed_file);
+    }
+    vfs_cache_notify_path_changed(WRITE_PATH, nullptr);
+
+    auto* write_file = vfs_open_file(WRITE_PATH, 1, 0);
+    ok = ok && write_file != nullptr;
+    auto write_mount_ref = find_mount_point(WRITE_PATH);
+    MountPoint const* write_mount = write_mount_ref.get();
+    ok = ok && write_mount != nullptr;
+
+    if (write_file != nullptr && write_mount != nullptr) {
+        Stat write_opened_stat{};
+        write_opened_stat.st_dev = write_mount->dev_id;
+        write_opened_stat.st_ino = 23456;
+        write_opened_stat.st_mode = S_IFREG | 0644;
+        write_opened_stat.st_nlink = 1;
+        write_opened_stat.st_size = 7;
+        write_opened_stat.st_blksize = 4096;
+
+        vfs_prefill_file_stat_snapshot(write_file, write_opened_stat);
+        ok = ok && write_file->stat_cache_valid && write_file->stat_cache_path_len == 0;
+        ok = ok && metadata_cache_store_opened_file_stat(write_file, write_mount);
+
+        Stat cached{};
+        ok = ok && metadata_cache_lookup_mount_stat(WRITE_PATH, write_mount, true, false, &cached) == 0;
+        ok = ok && cached.st_ino == write_opened_stat.st_ino && cached.st_size == write_opened_stat.st_size &&
+             (cached.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG);
+
+        cache_notify_file_data_changed_impl(write_file);
+        ok = ok && metadata_cache_lookup_mount_stat(WRITE_PATH, write_mount, true, false, &cached) == -EAGAIN;
+    }
+
+    if (write_file != nullptr) {
+        vfs_put_file(write_file);
+    }
+    ok = ok && vfs_unlink(WRITE_PATH) == 0;
+
+    auto* existing_seed = vfs_open_file(EXISTING_CREAT_PATH, ker::vfs::O_CREAT | 1, 0644);
+    ok = ok && existing_seed != nullptr;
+    if (existing_seed != nullptr) {
+        vfs_put_file(existing_seed);
+    }
+    vfs_cache_notify_path_changed(EXISTING_CREAT_PATH, nullptr);
+
+    auto* existing_creat_file = vfs_open_file(EXISTING_CREAT_PATH, ker::vfs::O_CREAT | 1, 0644);
+    ok = ok && existing_creat_file != nullptr && existing_creat_file->open_create_result_known && !existing_creat_file->created_by_open;
+    auto existing_mount_ref = find_mount_point(EXISTING_CREAT_PATH);
+    MountPoint const* existing_mount = existing_mount_ref.get();
+    ok = ok && existing_mount != nullptr;
+    if (existing_creat_file != nullptr && existing_mount != nullptr) {
+        Stat existing_opened_stat{};
+        existing_opened_stat.st_dev = existing_mount->dev_id;
+        existing_opened_stat.st_ino = 34567;
+        existing_opened_stat.st_mode = S_IFREG | 0644;
+        existing_opened_stat.st_nlink = 1;
+        existing_opened_stat.st_size = 11;
+        existing_opened_stat.st_blksize = 4096;
+
+        vfs_prefill_file_stat_snapshot(existing_creat_file, existing_opened_stat);
+        ok = ok && existing_creat_file->stat_cache_valid && existing_creat_file->stat_cache_path_len == 0;
+        ok = ok && metadata_cache_store_opened_file_stat(existing_creat_file, existing_mount);
+
+        Stat cached{};
+        ok = ok && metadata_cache_lookup_mount_stat(EXISTING_CREAT_PATH, existing_mount, true, false, &cached) == 0;
+        ok = ok && cached.st_ino == existing_opened_stat.st_ino && cached.st_size == existing_opened_stat.st_size &&
+             (cached.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG);
+    }
+    if (existing_creat_file != nullptr) {
+        vfs_put_file(existing_creat_file);
+    }
+    ok = ok && vfs_unlink(EXISTING_CREAT_PATH) == 0;
+
+    auto* trunc_seed = vfs_open_file(TRUNC_PATH, ker::vfs::O_CREAT | 1, 0644);
+    ok = ok && trunc_seed != nullptr;
+    if (trunc_seed != nullptr) {
+        vfs_put_file(trunc_seed);
+    }
+    vfs_cache_notify_path_changed(TRUNC_PATH, nullptr);
+
+    auto* trunc_file = vfs_open_file(TRUNC_PATH, ker::vfs::O_CREAT | ker::vfs::O_TRUNC | 1, 0644);
+    ok = ok && trunc_file != nullptr && trunc_file->open_create_result_known && !trunc_file->created_by_open;
+    auto trunc_mount_ref = find_mount_point(TRUNC_PATH);
+    MountPoint const* trunc_mount = trunc_mount_ref.get();
+    if (trunc_file != nullptr && trunc_mount != nullptr) {
+        Stat stale_trunc_stat{};
+        stale_trunc_stat.st_dev = trunc_mount->dev_id;
+        stale_trunc_stat.st_ino = 45678;
+        stale_trunc_stat.st_mode = S_IFREG | 0644;
+        stale_trunc_stat.st_nlink = 1;
+        stale_trunc_stat.st_size = 17;
+        stale_trunc_stat.st_blksize = 4096;
+
+        vfs_prefill_file_stat_snapshot(trunc_file, stale_trunc_stat);
+        ok = ok && !trunc_file->stat_cache_valid;
+        ok = ok && !metadata_cache_store_opened_file_stat(trunc_file, trunc_mount);
+    }
+    if (trunc_file != nullptr) {
+        vfs_put_file(trunc_file);
+    }
+    ok = ok && vfs_unlink(TRUNC_PATH) == 0;
     return ok;
 }
 
@@ -10373,11 +15658,740 @@ auto vfs_selftest_open_create_metadata_hint() -> bool {
     created_file.open_create_result_known = true;
     created_file.created_by_open = true;
 
-    return !open_create_should_invalidate_metadata(&created_file, 0) &&
+    constexpr const char* PATH = "/ktest_xfs_known_absent_create_hint";
+    MountPoint xfs_mount{};
+    xfs_mount.fs_type = FSType::XFS;
+    xfs_mount.dev_id = UINT32_MAX;
+    vfs_cache_notify_path_changed(PATH, nullptr);
+    existence_cache_store(PATH, &xfs_mount, false, -ENOENT, metadata_snapshot_stamp());
+
+    int hinted_flags = ker::vfs::O_CREAT | ker::vfs::O_EXCL;
+    vfs_apply_xfs_known_absent_hint(PATH, &xfs_mount, hinted_flags, false, std::strlen(PATH), UNKNOWN_PATH_HASH, hinted_flags);
+    int nonexclusive_flags = ker::vfs::O_CREAT;
+    vfs_apply_xfs_known_absent_hint(PATH, &xfs_mount, nonexclusive_flags, false, std::strlen(PATH), UNKNOWN_PATH_HASH, nonexclusive_flags);
+    int directory_flags = ker::vfs::O_CREAT | ker::vfs::O_EXCL;
+    vfs_apply_xfs_known_absent_hint(PATH, &xfs_mount, directory_flags, true, std::strlen(PATH), UNKNOWN_PATH_HASH, directory_flags);
+
+    bool const HINT_OK = (hinted_flags & ker::vfs::O_WOS_KNOWN_ABSENT) != 0 && (nonexclusive_flags & ker::vfs::O_WOS_KNOWN_ABSENT) == 0 &&
+                         (directory_flags & ker::vfs::O_WOS_KNOWN_ABSENT) == 0 &&
+                         public_open_flags(hinted_flags) == (ker::vfs::O_CREAT | ker::vfs::O_EXCL);
+    vfs_cache_notify_path_changed(PATH, nullptr);
+
+    return HINT_OK && !open_create_should_invalidate_metadata(&created_file, 0) &&
            open_create_should_invalidate_metadata(nullptr, ker::vfs::O_CREAT) &&
            open_create_should_invalidate_metadata(&unknown_backend, ker::vfs::O_CREAT) &&
            !open_create_should_invalidate_metadata(&existing_file, ker::vfs::O_CREAT) &&
            open_create_should_invalidate_metadata(&created_file, ker::vfs::O_CREAT);
+}
+
+auto vfs_selftest_open_missing_uses_metadata_cache() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_open_missing_metadata_cache";
+    constexpr const char* OPEN_SEEDED_PATH = "/tmp/ktest_open_missing_metadata_store";
+    constexpr const char* FILE_OPEN_SEEDED_PATH = "/tmp/ktest_open_missing_file_metadata_store";
+    constexpr const char* EXISTENCE_ONLY_PATH = "/tmp/ktest_open_missing_existence_only";
+    constexpr const char* FILE_EXISTENCE_ONLY_PATH = "/tmp/ktest_open_missing_file_existence_only";
+    constexpr const char* ENOTDIR_FILE_PATH = "/tmp/ktest_open_enotdir_metadata_cache";
+    constexpr const char* ENOTDIR_OPEN_PATH = "/tmp/ktest_open_enotdir_metadata_cache/";
+    vfs_unlink(PATH);
+    vfs_unlink(OPEN_SEEDED_PATH);
+    vfs_unlink(FILE_OPEN_SEEDED_PATH);
+    vfs_unlink(EXISTENCE_ONLY_PATH);
+    vfs_unlink(FILE_EXISTENCE_ONLY_PATH);
+    vfs_unlink(ENOTDIR_FILE_PATH);
+    vfs_cache_notify_path_changed(PATH, nullptr);
+    vfs_cache_notify_path_changed(OPEN_SEEDED_PATH, nullptr);
+    vfs_cache_notify_path_changed(FILE_OPEN_SEEDED_PATH, nullptr);
+    vfs_cache_notify_path_changed(EXISTENCE_ONLY_PATH, nullptr);
+    vfs_cache_notify_path_changed(FILE_EXISTENCE_ONLY_PATH, nullptr);
+    vfs_cache_notify_path_changed(ENOTDIR_FILE_PATH, nullptr);
+
+    Stat st{};
+    bool ok = vfs_stat(PATH, &st) == -ENOENT;
+
+    auto mount_ref = find_mount_point(PATH);
+    MountPoint const* mount = mount_ref.get();
+    ok = ok && mount != nullptr;
+    if (mount != nullptr) {
+        ok = vfs_open_missing_metadata_result(PATH, mount, 0, false) == -ENOENT && ok;
+    }
+
+    ker::mod::sched::task::Task task{};
+    VfsCachePerfSnapshot before_missing_open{};
+    VfsCachePerfSnapshot after_missing_open{};
+    vfs_get_cache_perf_snapshot(before_missing_open);
+    int const MISSING_FD = vfs_openat(&task, AT_FDCWD, PATH, 0, 0);
+    vfs_get_cache_perf_snapshot(after_missing_open);
+    ok = MISSING_FD == -ENOENT && after_missing_open.metadata_hits > before_missing_open.metadata_hits && ok;
+
+    VfsCachePerfSnapshot before_open_seed{};
+    VfsCachePerfSnapshot after_open_seed{};
+    VfsCachePerfSnapshot after_open_seed_stat{};
+    vfs_get_cache_perf_snapshot(before_open_seed);
+    int const OPEN_SEED_FD = vfs_openat(&task, AT_FDCWD, OPEN_SEEDED_PATH, 0, 0);
+    vfs_get_cache_perf_snapshot(after_open_seed);
+    ok = OPEN_SEED_FD == -ENOENT && after_open_seed.metadata_stores > before_open_seed.metadata_stores &&
+         after_open_seed.metadata_hits > before_open_seed.metadata_hits && ok;
+    if (mount != nullptr) {
+        VfsCachePerfSnapshot before_open_seed_existence{};
+        VfsCachePerfSnapshot after_open_seed_existence{};
+        vfs_get_cache_perf_snapshot(before_open_seed_existence);
+        ok = ok && existence_cache_lookup_mount(OPEN_SEEDED_PATH, mount, false) == -ENOENT;
+        ok = ok && existence_cache_lookup_mount(OPEN_SEEDED_PATH, mount, true) == -ENOENT;
+        vfs_get_cache_perf_snapshot(after_open_seed_existence);
+        ok = ok && after_open_seed_existence.existence_hits > before_open_seed_existence.existence_hits;
+    }
+    ok = vfs_stat(OPEN_SEEDED_PATH, &st) == -ENOENT && ok;
+    vfs_get_cache_perf_snapshot(after_open_seed_stat);
+    ok = after_open_seed_stat.metadata_hits > after_open_seed.metadata_hits && ok;
+
+    VfsCachePerfSnapshot before_file_open_seed{};
+    VfsCachePerfSnapshot after_file_open_seed{};
+    vfs_get_cache_perf_snapshot(before_file_open_seed);
+    auto* missing_file = vfs_open_file(FILE_OPEN_SEEDED_PATH, 0, 0);
+    vfs_get_cache_perf_snapshot(after_file_open_seed);
+    ok = missing_file == nullptr && after_file_open_seed.metadata_stores > before_file_open_seed.metadata_stores &&
+         after_file_open_seed.metadata_hits > before_file_open_seed.metadata_hits && ok;
+    if (missing_file != nullptr) {
+        vfs_put_file(missing_file);
+    }
+
+    auto existence_only_mount_ref = find_mount_point(EXISTENCE_ONLY_PATH);
+    MountPoint const* existence_only_mount = existence_only_mount_ref.get();
+    ok = ok && existence_only_mount != nullptr;
+    if (existence_only_mount != nullptr) {
+        existence_cache_store(EXISTENCE_ONLY_PATH, existence_only_mount, false, -ENOENT, metadata_snapshot_stamp());
+        VfsCachePerfSnapshot before_existence_open{};
+        VfsCachePerfSnapshot after_existence_open{};
+        vfs_get_cache_perf_snapshot(before_existence_open);
+        int const EXISTENCE_FD = vfs_openat(&task, AT_FDCWD, EXISTENCE_ONLY_PATH, 0, 0);
+        vfs_get_cache_perf_snapshot(after_existence_open);
+        ok = ok && EXISTENCE_FD == -ENOENT && after_existence_open.existence_hits > before_existence_open.existence_hits &&
+             after_existence_open.symlink_hits == before_existence_open.symlink_hits &&
+             after_existence_open.symlink_misses == before_existence_open.symlink_misses;
+    }
+
+    auto file_existence_only_mount_ref = find_mount_point(FILE_EXISTENCE_ONLY_PATH);
+    MountPoint const* file_existence_only_mount = file_existence_only_mount_ref.get();
+    ok = ok && file_existence_only_mount != nullptr;
+    if (file_existence_only_mount != nullptr) {
+        existence_cache_store(FILE_EXISTENCE_ONLY_PATH, file_existence_only_mount, false, -ENOENT, metadata_snapshot_stamp());
+        VfsCachePerfSnapshot before_file_existence_open{};
+        VfsCachePerfSnapshot after_file_existence_open{};
+        vfs_get_cache_perf_snapshot(before_file_existence_open);
+        auto* existence_missing_file = vfs_open_file(FILE_EXISTENCE_ONLY_PATH, 0, 0);
+        vfs_get_cache_perf_snapshot(after_file_existence_open);
+        ok = ok && existence_missing_file == nullptr &&
+             after_file_existence_open.existence_hits > before_file_existence_open.existence_hits &&
+             after_file_existence_open.symlink_hits == before_file_existence_open.symlink_hits &&
+             after_file_existence_open.symlink_misses == before_file_existence_open.symlink_misses;
+        if (existence_missing_file != nullptr) {
+            vfs_put_file(existence_missing_file);
+        }
+    }
+
+    auto* enotdir_file = vfs_open_file(ENOTDIR_FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    ok = enotdir_file != nullptr && ok;
+    if (enotdir_file != nullptr) {
+        vfs_put_file(enotdir_file);
+    }
+    vfs_cache_notify_path_changed(ENOTDIR_FILE_PATH, nullptr);
+
+    VfsCachePerfSnapshot before_enotdir_open{};
+    VfsCachePerfSnapshot after_enotdir_open{};
+    VfsCachePerfSnapshot after_enotdir_stat{};
+    vfs_get_cache_perf_snapshot(before_enotdir_open);
+    int const ENOTDIR_FD = vfs_openat(&task, AT_FDCWD, ENOTDIR_OPEN_PATH, 0, 0);
+    vfs_get_cache_perf_snapshot(after_enotdir_open);
+    ok = ENOTDIR_FD == -ENOTDIR && after_enotdir_open.metadata_stores > before_enotdir_open.metadata_stores && ok;
+    if (mount != nullptr) {
+        ok = vfs_open_missing_metadata_result(ENOTDIR_FILE_PATH, mount, 0, true) == -ENOTDIR && ok;
+    }
+    ok = vfs_stat(ENOTDIR_OPEN_PATH, &st) == -ENOTDIR && ok;
+    vfs_get_cache_perf_snapshot(after_enotdir_stat);
+    ok = after_enotdir_stat.metadata_hits > after_enotdir_open.metadata_hits && ok;
+
+    auto* created = vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    ok = created != nullptr && ok;
+    if (created != nullptr) {
+        vfs_put_file(created);
+    }
+    if (mount != nullptr) {
+        ok = vfs_open_missing_metadata_result(PATH, mount, 0, false) != -ENOENT && ok;
+    }
+
+    int const FD = vfs_openat(&task, AT_FDCWD, PATH, 0, 0);
+    File* opened = FD >= 0 ? vfs_get_file(&task, FD) : nullptr;
+    ok = FD >= 0 && opened != nullptr && ok;
+    if (FD >= 0) {
+        ok = (vfs_release_fd(&task, FD) == 0) && ok;
+    }
+    if (opened != nullptr) {
+        vfs_put_file(opened);
+    }
+
+    ok = task.fd_table.empty() && ok;
+    ok = (vfs_unlink(ENOTDIR_FILE_PATH) == 0) && ok;
+    int const UNLINK_RET = vfs_unlink(PATH);
+    ok = (UNLINK_RET == 0) && ok;
+    if (mount != nullptr && UNLINK_RET == 0) {
+        VfsCachePerfSnapshot before_unlink_existence{};
+        VfsCachePerfSnapshot after_unlink_existence{};
+        vfs_get_cache_perf_snapshot(before_unlink_existence);
+        ok = ok && existence_cache_lookup_mount(PATH, mount, false) == -ENOENT;
+        ok = ok && existence_cache_lookup_mount(PATH, mount, true) == -ENOENT;
+        vfs_get_cache_perf_snapshot(after_unlink_existence);
+        ok = ok && after_unlink_existence.existence_hits > before_unlink_existence.existence_hits;
+    }
+    return ok;
+}
+
+auto vfs_selftest_open_success_seeds_metadata_cache() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_open_success_metadata_cache";
+    vfs_unlink(PATH);
+    auto* created = vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    bool ok = created != nullptr;
+    if (created != nullptr) {
+        vfs_put_file(created);
+    }
+
+    vfs_cache_notify_path_changed(PATH, nullptr);
+
+    ker::mod::sched::task::Task task{};
+    VfsCachePerfSnapshot before_open{};
+    VfsCachePerfSnapshot after_open{};
+    vfs_get_cache_perf_snapshot(before_open);
+    int const FD = vfs_openat(&task, AT_FDCWD, PATH, 0, 0);
+    vfs_get_cache_perf_snapshot(after_open);
+    ok = FD >= 0 && after_open.metadata_stores > before_open.metadata_stores && ok;
+    if (FD >= 0) {
+        ok = (vfs_release_fd(&task, FD) == 0) && ok;
+    }
+
+    Stat st{};
+    VfsCachePerfSnapshot after_lstat{};
+    ok = vfs_lstat(PATH, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG && ok;
+    vfs_get_cache_perf_snapshot(after_lstat);
+    ok = after_lstat.metadata_hits > after_open.metadata_hits && ok;
+
+    ok = task.fd_table.empty() && ok;
+    ok = (vfs_unlink(PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_open_write_success_seeds_metadata_hints() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_open_write_success_metadata_hints";
+    vfs_unlink(PATH);
+    vfs_cache_notify_path_changed(PATH, nullptr);
+
+    auto mount_ref = find_mount_point(PATH);
+    MountPoint const* mount = mount_ref.get();
+    bool ok = mount != nullptr;
+
+    auto* seed = vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    ok = seed != nullptr && ok;
+    if (seed != nullptr) {
+        vfs_put_file(seed);
+    }
+    vfs_cache_notify_path_changed(PATH, nullptr);
+
+    VfsCachePerfSnapshot before_open{};
+    VfsCachePerfSnapshot after_open{};
+    vfs_get_cache_perf_snapshot(before_open);
+    auto* opened = vfs_open_file(PATH, 1, 0644);
+    vfs_get_cache_perf_snapshot(after_open);
+    ok = opened != nullptr && after_open.symlink_stores > before_open.symlink_stores &&
+         after_open.existence_stores > before_open.existence_stores && ok;
+
+    if (mount != nullptr) {
+        Stat cached{};
+        ok = ok && metadata_cache_lookup_mount_stat(PATH, mount, true, false, &cached) == -EAGAIN;
+
+        VfsCachePerfSnapshot before_not_symlink{};
+        VfsCachePerfSnapshot after_not_symlink{};
+        vfs_get_cache_perf_snapshot(before_not_symlink);
+        ok = ok && metadata_cache_proves_final_not_symlink(PATH, mount->fs_type, mount->dev_id);
+        vfs_get_cache_perf_snapshot(after_not_symlink);
+        ok = ok && after_not_symlink.symlink_hits > before_not_symlink.symlink_hits;
+        ok = ok && after_not_symlink.metadata_misses == before_not_symlink.metadata_misses;
+
+        VfsCachePerfSnapshot before_exists{};
+        VfsCachePerfSnapshot after_exists{};
+        vfs_get_cache_perf_snapshot(before_exists);
+        ok = ok && existence_cache_lookup_mount(PATH, mount, false) == 0;
+        vfs_get_cache_perf_snapshot(after_exists);
+        ok = ok && after_exists.existence_hits > before_exists.existence_hits;
+
+        VfsCachePerfSnapshot before_require_dir{};
+        VfsCachePerfSnapshot after_require_dir{};
+        vfs_get_cache_perf_snapshot(before_require_dir);
+        ok = ok && metadata_cache_lookup_mount_stat(PATH, mount, true, true, &cached) == -ENOTDIR;
+        vfs_get_cache_perf_snapshot(after_require_dir);
+        ok = ok && after_require_dir.metadata_hits > before_require_dir.metadata_hits;
+    }
+
+    if (opened != nullptr) {
+        vfs_put_file(opened);
+    }
+    ok = (vfs_unlink(PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_metadata_cache_stores_enotdir() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_metadata_cache_enotdir";
+    constexpr const char* NOTDIR_PATH = "/tmp/ktest_metadata_cache_enotdir/";
+    vfs_unlink(PATH);
+
+    auto* created = vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    bool ok = created != nullptr;
+    if (created != nullptr) {
+        vfs_put_file(created);
+    }
+
+    vfs_cache_notify_path_changed(NOTDIR_PATH, nullptr);
+
+    Stat st{};
+    VfsCachePerfSnapshot before_first_stat{};
+    VfsCachePerfSnapshot after_first_stat{};
+    VfsCachePerfSnapshot after_second_stat{};
+    vfs_get_cache_perf_snapshot(before_first_stat);
+    ok = vfs_stat(NOTDIR_PATH, &st) == -ENOTDIR && ok;
+    vfs_get_cache_perf_snapshot(after_first_stat);
+    ok = after_first_stat.metadata_stores > before_first_stat.metadata_stores && ok;
+
+    ok = vfs_stat(NOTDIR_PATH, &st) == -ENOTDIR && ok;
+    vfs_get_cache_perf_snapshot(after_second_stat);
+    ok = after_second_stat.metadata_hits > after_first_stat.metadata_hits && ok;
+
+    ok = (vfs_unlink(PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_mkdir_seeds_metadata_cache() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_mkdir_metadata_cache";
+    vfs_rmdir(PATH);
+    vfs_cache_notify_path_changed(PATH, nullptr);
+
+    VfsCachePerfSnapshot before_mkdir{};
+    VfsCachePerfSnapshot after_mkdir{};
+    VfsCachePerfSnapshot after_lstat{};
+    VfsCachePerfSnapshot after_repeat_mkdir{};
+    vfs_get_cache_perf_snapshot(before_mkdir);
+    bool ok = vfs_mkdir(PATH, 0755) == 0;
+    vfs_get_cache_perf_snapshot(after_mkdir);
+
+    Stat st{};
+    ok = ok && after_mkdir.metadata_stores > before_mkdir.metadata_stores;
+    ok = ok && vfs_lstat(PATH, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR;
+    vfs_get_cache_perf_snapshot(after_lstat);
+    ok = ok && after_lstat.metadata_hits > after_mkdir.metadata_hits;
+    ok = ok && vfs_mkdir(PATH, 0755) == 0;
+    vfs_get_cache_perf_snapshot(after_repeat_mkdir);
+    ok = ok && after_repeat_mkdir.metadata_hits > after_lstat.metadata_hits;
+
+    ok = (vfs_rmdir(PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_removed_paths_seed_missing_metadata_cache() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* FILE_PATH = "/tmp/ktest_removed_metadata_cache_file";
+    constexpr const char* DIR_PATH = "/tmp/ktest_removed_metadata_cache_dir";
+    vfs_unlink(FILE_PATH);
+    vfs_rmdir(DIR_PATH);
+
+    auto* file = vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (file == nullptr) {
+        return false;
+    }
+    vfs_put_file(file);
+
+    VfsCachePerfSnapshot before_unlink{};
+    VfsCachePerfSnapshot after_unlink{};
+    VfsCachePerfSnapshot after_unlink_lstat{};
+    vfs_get_cache_perf_snapshot(before_unlink);
+    bool ok = vfs_unlink(FILE_PATH) == 0;
+    vfs_get_cache_perf_snapshot(after_unlink);
+
+    Stat st{};
+    ok = ok && after_unlink.metadata_stores > before_unlink.metadata_stores;
+    ok = ok && vfs_lstat(FILE_PATH, &st) == -ENOENT;
+    vfs_get_cache_perf_snapshot(after_unlink_lstat);
+    ok = ok && after_unlink_lstat.metadata_hits > after_unlink.metadata_hits;
+
+    VfsCachePerfSnapshot before_rmdir{};
+    VfsCachePerfSnapshot after_rmdir{};
+    VfsCachePerfSnapshot after_rmdir_stat{};
+    ok = (vfs_mkdir(DIR_PATH, 0755) == 0) && ok;
+    vfs_get_cache_perf_snapshot(before_rmdir);
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    vfs_get_cache_perf_snapshot(after_rmdir);
+
+    ok = ok && after_rmdir.metadata_stores > before_rmdir.metadata_stores;
+    ok = ok && vfs_stat(DIR_PATH, &st) == -ENOENT;
+    vfs_get_cache_perf_snapshot(after_rmdir_stat);
+    ok = ok && after_rmdir_stat.metadata_hits > after_rmdir.metadata_hits;
+    return ok;
+}
+
+auto vfs_selftest_openat_dirfd_installs_open_file() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_openat_dirfd";
+    constexpr const char* FILE_PATH = "/tmp/ktest_openat_dirfd/file";
+    constexpr const char* FILE_NAME = "file";
+
+    vfs_unlink(FILE_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+
+    auto* created = vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    vfs_put_file(created);
+
+    ker::mod::sched::task::Task task{};
+    auto* dir = vfs_open_file(DIR_PATH, 0, 0);
+    if (dir == nullptr) {
+        vfs_unlink(FILE_PATH);
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+
+    int const DIRFD = vfs_alloc_fd(&task, dir);
+    bool ok = DIRFD >= 0;
+    int opened_fd = -1;
+    File* opened = nullptr;
+    if (ok) {
+        opened_fd = vfs_openat(&task, DIRFD, FILE_NAME, 0 | ker::vfs::O_CLOEXEC, 0);
+        opened = vfs_get_file(&task, opened_fd);
+        ok = opened_fd >= 0 && opened != nullptr && task.get_fd_cloexec(static_cast<unsigned>(opened_fd));
+    }
+
+    if (opened_fd >= 0) {
+        ok = (vfs_release_fd(&task, opened_fd) == 0) && ok;
+        if (opened != nullptr) {
+            vfs_put_file(opened);
+        }
+    }
+    if (DIRFD >= 0) {
+        ok = (vfs_release_fd(&task, DIRFD) == 0) && ok;
+    }
+    vfs_put_file(dir);
+    ok = (vfs_unlink(FILE_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    ok = task.fd_table.empty() && ok;
+    return ok;
+}
+
+auto vfs_selftest_openat_at_fdcwd_uses_supplied_task() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_openat_at_fdcwd";
+    constexpr const char* FILE_PATH = "/tmp/ktest_openat_at_fdcwd/file";
+    constexpr const char* FILE_NAME = "file";
+
+    vfs_unlink(FILE_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+
+    auto* created = vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    vfs_put_file(created);
+
+    ker::mod::sched::task::Task task{};
+    std::memcpy(task.cwd.data(), DIR_PATH, std::strlen(DIR_PATH) + 1);
+
+    std::array<char, MAX_PATH_LEN> fast_resolved{};
+    bool fast_requires_directory = true;
+    int fast_ret =
+        vfs_open_absolute_common_local_fast_path(&task, "/tmp/../tmp/ktest_openat_at_fdcwd/file", fast_resolved, &fast_requires_directory);
+    bool ok = fast_ret == 0 && !fast_requires_directory && std::strcmp(fast_resolved.data(), FILE_PATH) == 0;
+
+    fast_requires_directory = false;
+    fast_ret =
+        vfs_open_absolute_common_local_fast_path(&task, "/tmp/../tmp/ktest_openat_at_fdcwd/", fast_resolved, &fast_requires_directory);
+    ok = ok && fast_ret == 0 && fast_requires_directory && std::strcmp(fast_resolved.data(), DIR_PATH) == 0;
+
+    fast_ret = vfs_open_absolute_common_local_fast_path(&task, "/tmp/../wki/node", fast_resolved, &fast_requires_directory);
+    ok = ok && fast_ret == RESOLVE_FAST_PATH_DECLINED;
+
+    int const FD = vfs_openat(&task, AT_FDCWD, FILE_NAME, ker::vfs::O_CLOEXEC, 0);
+    File* opened = FD >= 0 ? vfs_get_file(&task, FD) : nullptr;
+    ok = FD >= 0 && opened != nullptr && task.get_fd_cloexec(static_cast<unsigned>(FD)) && ok;
+    constexpr int BOGUS_DIRFD = 9999;
+    int const ABS_FD = vfs_openat(&task, BOGUS_DIRFD, FILE_PATH, ker::vfs::O_CLOEXEC, 0);
+    File* abs_opened = ABS_FD >= 0 ? vfs_get_file(&task, ABS_FD) : nullptr;
+    ok = ABS_FD >= 0 && abs_opened != nullptr && task.get_fd_cloexec(static_cast<unsigned>(ABS_FD)) && ok;
+    ok = (vfs_openat(&task, AT_FDCWD, "", 0, 0) == -ENOENT) && ok;
+
+    if (FD >= 0) {
+        ok = (vfs_release_fd(&task, FD) == 0) && ok;
+    }
+    if (ABS_FD >= 0) {
+        ok = (vfs_release_fd(&task, ABS_FD) == 0) && ok;
+    }
+    if (opened != nullptr) {
+        vfs_put_file(opened);
+    }
+    if (abs_opened != nullptr) {
+        vfs_put_file(abs_opened);
+    }
+    ok = (vfs_unlink(FILE_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    ok = task.fd_table.empty() && ok;
+    return ok;
+}
+
+auto vfs_selftest_fchdir_changes_supplied_task_cwd() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_fchdir";
+    constexpr const char* FILE_PATH = "/tmp/ktest_fchdir/file";
+    constexpr const char* FILE_NAME = "file";
+
+    vfs_unlink(FILE_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+
+    auto* created = vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    vfs_put_file(created);
+
+    ker::mod::sched::task::Task task{};
+    std::memcpy(task.cwd.data(), "/", 2);
+    auto* dir = vfs_open_file(DIR_PATH, 0, 0);
+    if (dir == nullptr) {
+        vfs_unlink(FILE_PATH);
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+
+    int const DIRFD = vfs_alloc_fd(&task, dir);
+    bool ok = DIRFD >= 0;
+    if (ok) {
+        ok = vfs_fchdir(&task, DIRFD) == 0 && std::strcmp(task.cwd.data(), DIR_PATH) == 0;
+    }
+
+    Stat st{};
+    if (ok) {
+        ok = vfs_statat(&task, AT_FDCWD, FILE_NAME, 0, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
+    }
+
+    if (DIRFD >= 0) {
+        ok = (vfs_release_fd(&task, DIRFD) == 0) && ok;
+    }
+    vfs_put_file(dir);
+    ok = (vfs_unlink(FILE_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    ok = task.fd_table.empty() && ok;
+    return ok;
+}
+
+auto vfs_selftest_chdir_common_local_fast_path_uses_metadata_cache() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_chdir_cache";
+    constexpr const char* CHILD_PATH = "/tmp/ktest_chdir_cache/child";
+    constexpr const char* CHILD_NAME = "child";
+    constexpr size_t DIR_LEN = sizeof("/tmp/ktest_chdir_cache") - 1;
+
+    vfs_rmdir(CHILD_PATH);
+    vfs_rmdir(DIR_PATH);
+    bool ok = vfs_mkdir(DIR_PATH, 0755) == 0;
+    ok = ok && vfs_mkdir(CHILD_PATH, 0755) == 0;
+
+    Stat st{};
+    ok = ok && vfs_stat(CHILD_PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFDIR);
+
+    ker::mod::sched::task::Task task{};
+    std::memcpy(task.root.data(), "/", 2);
+    task.root_len = 1;
+    std::memcpy(task.cwd.data(), DIR_PATH, DIR_LEN + 1);
+    task.cwd_len = static_cast<uint16_t>(DIR_LEN);
+
+    int result = -EINVAL;
+    VfsCachePerfSnapshot before_chdir{};
+    VfsCachePerfSnapshot after_chdir{};
+    vfs_get_cache_perf_snapshot(before_chdir);
+    bool const USED_FAST_PATH = vfs_chdir_common_local_fast_path(&task, CHILD_NAME, &result);
+    vfs_get_cache_perf_snapshot(after_chdir);
+
+    ok = ok && USED_FAST_PATH && result == 0 && std::strcmp(task.cwd.data(), CHILD_PATH) == 0;
+    ok = ok && after_chdir.metadata_hits > before_chdir.metadata_hits;
+
+    ok = (vfs_rmdir(CHILD_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_unlinkat_renameat_dirfd_mutations() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_at_mutations";
+    constexpr const char* OLD_PATH = "/tmp/ktest_at_mutations/file";
+    constexpr const char* NEW_PATH = "/tmp/ktest_at_mutations/renamed";
+    constexpr const char* SUBDIR_PATH = "/tmp/ktest_at_mutations/subdir";
+    constexpr const char* ABS_OLD_PATH = "/tmp/ktest_at_mutations/abs_file";
+    constexpr const char* ABS_NEW_PATH = "/tmp/ktest_at_mutations/abs_renamed";
+    constexpr const char* ABS_SUBDIR_PATH = "/tmp/ktest_at_mutations/abs_subdir";
+
+    vfs_unlink(OLD_PATH);
+    vfs_unlink(NEW_PATH);
+    vfs_unlink(ABS_OLD_PATH);
+    vfs_unlink(ABS_NEW_PATH);
+    vfs_rmdir(SUBDIR_PATH);
+    vfs_rmdir(ABS_SUBDIR_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+
+    auto* created = vfs_open_file(OLD_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    vfs_put_file(created);
+
+    auto* abs_created = vfs_open_file(ABS_OLD_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (abs_created == nullptr) {
+        vfs_unlink(OLD_PATH);
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    vfs_put_file(abs_created);
+
+    bool ok = vfs_mkdir(SUBDIR_PATH, 0755) == 0;
+    ok = vfs_mkdir(ABS_SUBDIR_PATH, 0755) == 0 && ok;
+
+    ker::mod::sched::task::Task task{};
+    auto* dir = vfs_open_file(DIR_PATH, 0, 0);
+    if (dir == nullptr) {
+        vfs_unlink(OLD_PATH);
+        vfs_unlink(ABS_OLD_PATH);
+        vfs_rmdir(SUBDIR_PATH);
+        vfs_rmdir(ABS_SUBDIR_PATH);
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+
+    int const DIRFD = vfs_alloc_fd(&task, dir);
+    ok = ok && DIRFD >= 0;
+
+    Stat st{};
+    if (ok) {
+        ok = vfs_renameat(&task, DIRFD, "file", DIRFD, "renamed") == 0;
+    }
+    ok = ok && vfs_stat(OLD_PATH, &st) == -ENOENT;
+    ok = ok && vfs_stat(NEW_PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
+    if (ok) {
+        ok = vfs_unlinkat(&task, DIRFD, "renamed", 0) == 0;
+    }
+    ok = ok && vfs_stat(NEW_PATH, &st) == -ENOENT;
+    if (ok) {
+        ok = vfs_unlinkat(&task, DIRFD, "subdir", ker::vfs::AT_REMOVEDIR) == 0;
+    }
+    ok = ok && vfs_stat(SUBDIR_PATH, &st) == -ENOENT;
+    constexpr int BOGUS_DIRFD = 9999;
+    if (ok) {
+        ok = vfs_renameat(&task, BOGUS_DIRFD, ABS_OLD_PATH, BOGUS_DIRFD, ABS_NEW_PATH) == 0;
+    }
+    ok = ok && vfs_stat(ABS_OLD_PATH, &st) == -ENOENT;
+    ok = ok && vfs_stat(ABS_NEW_PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
+    if (ok) {
+        ok = vfs_unlinkat(&task, BOGUS_DIRFD, ABS_NEW_PATH, 0) == 0;
+    }
+    ok = ok && vfs_stat(ABS_NEW_PATH, &st) == -ENOENT;
+    if (ok) {
+        ok = vfs_unlinkat(&task, BOGUS_DIRFD, ABS_SUBDIR_PATH, ker::vfs::AT_REMOVEDIR) == 0;
+    }
+    ok = ok && vfs_stat(ABS_SUBDIR_PATH, &st) == -ENOENT;
+
+    if (DIRFD >= 0) {
+        ok = (vfs_release_fd(&task, DIRFD) == 0) && ok;
+    }
+    vfs_put_file(dir);
+    vfs_unlink(OLD_PATH);
+    vfs_unlink(NEW_PATH);
+    vfs_unlink(ABS_OLD_PATH);
+    vfs_unlink(ABS_NEW_PATH);
+    vfs_rmdir(SUBDIR_PATH);
+    vfs_rmdir(ABS_SUBDIR_PATH);
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    ok = task.fd_table.empty() && ok;
+    return ok;
+}
+
+auto vfs_selftest_rename_seeds_metadata_cache() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_rename_metadata_cache";
+    constexpr const char* OLD_PATH = "/tmp/ktest_rename_metadata_cache/old";
+    constexpr const char* NEW_PATH = "/tmp/ktest_rename_metadata_cache/new";
+    constexpr char DATA[] = "renamed-payload";
+
+    vfs_unlink(OLD_PATH);
+    vfs_unlink(NEW_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+
+    auto* file = vfs_open_file(OLD_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (file == nullptr || file->fops == nullptr || file->fops->vfs_write == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    bool ok = file->fops->vfs_write(file, DATA, sizeof(DATA) - 1, 0) == static_cast<ssize_t>(sizeof(DATA) - 1);
+    cache_notify_file_data_changed_impl(file);
+    vfs_put_file(file);
+
+    VfsCachePerfSnapshot before_rename{};
+    VfsCachePerfSnapshot after_rename{};
+    VfsCachePerfSnapshot after_old_lstat{};
+    VfsCachePerfSnapshot after_lstat{};
+    vfs_get_cache_perf_snapshot(before_rename);
+    ok = (vfs_rename(OLD_PATH, NEW_PATH) == 0) && ok;
+    vfs_get_cache_perf_snapshot(after_rename);
+
+    Stat st{};
+    ok = ok && after_rename.metadata_stores > before_rename.metadata_stores;
+    ok = ok && vfs_lstat(OLD_PATH, &st) == -ENOENT;
+    vfs_get_cache_perf_snapshot(after_old_lstat);
+    ok = ok && after_old_lstat.metadata_hits > after_rename.metadata_hits;
+    ok = ok && vfs_lstat(NEW_PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG &&
+         st.st_size == static_cast<off_t>(sizeof(DATA) - 1);
+    vfs_get_cache_perf_snapshot(after_lstat);
+    ok = ok && after_lstat.metadata_hits > after_old_lstat.metadata_hits;
+
+    ok = (vfs_unlink(NEW_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    return ok;
 }
 
 auto vfs_selftest_metadata_cache_rejects_stale_negative_store() -> bool {
@@ -10389,6 +16403,1677 @@ auto vfs_selftest_metadata_cache_rejects_stale_negative_store() -> bool {
     metadata_cache_store(PATH, FSType::TMPFS, 0, true, false, -ENOENT, nullptr, STALE_STAMP);
 
     return metadata_cache_lookup(PATH, FSType::TMPFS, 0, true, false, &st) == -EAGAIN;
+}
+
+auto vfs_selftest_resolved_stat_cache_rejects_mount_generation_change() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* MOUNT_PATH = "/tmp/ktest_stat_mount_generation";
+    constexpr const char* FILE_PATH = "/tmp/ktest_stat_mount_generation/file";
+
+    unmount_filesystem(MOUNT_PATH);
+    vfs_unlink(FILE_PATH);
+    vfs_rmdir(MOUNT_PATH);
+    if (vfs_mkdir(MOUNT_PATH, 0755) != 0) {
+        return false;
+    }
+    if (mount_filesystem(MOUNT_PATH, "tmpfs", nullptr) != 0) {
+        vfs_rmdir(MOUNT_PATH);
+        return false;
+    }
+
+    auto* created = vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    bool ok = created != nullptr;
+    if (created != nullptr) {
+        vfs_put_file(created);
+    }
+
+    VfsCachePerfSnapshot after_first{};
+    VfsCachePerfSnapshot after_second{};
+    Stat st{};
+    if (ok) {
+        ok = vfs_stat(FILE_PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
+        vfs_get_cache_perf_snapshot(after_first);
+    }
+    if (ok) {
+        ok = vfs_stat(FILE_PATH, &st) == 0;
+        vfs_get_cache_perf_snapshot(after_second);
+    }
+    ok = ok && after_second.metadata_hits > after_first.metadata_hits;
+    ok = (unmount_filesystem(MOUNT_PATH) == 0) && ok;
+    ok = vfs_stat(FILE_PATH, &st) == -ENOENT && ok;
+    ok = (vfs_rmdir(MOUNT_PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_statat_dirfd_metadata_cache() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_statat_dirfd_cache";
+    constexpr const char* FILE_PATH = "/tmp/ktest_statat_dirfd_cache/file";
+    constexpr const char* FILE_NAME = "file";
+
+    vfs_unlink(FILE_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+
+    auto* created = vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    vfs_put_file(created);
+
+    ker::mod::sched::task::Task task{};
+    auto* dir = vfs_open_file(DIR_PATH, 0, 0);
+    if (dir == nullptr) {
+        vfs_unlink(FILE_PATH);
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+
+    int const DIRFD = vfs_alloc_fd(&task, dir);
+    bool ok = DIRFD >= 0;
+
+    VfsCachePerfSnapshot before{};
+    VfsCachePerfSnapshot after_first{};
+    VfsCachePerfSnapshot after_second{};
+    Stat st{};
+    if (ok) {
+        vfs_get_cache_perf_snapshot(before);
+        ok = vfs_statat(&task, DIRFD, FILE_NAME, 0, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
+        vfs_get_cache_perf_snapshot(after_first);
+    }
+    if (ok) {
+        ok = vfs_statat(&task, DIRFD, FILE_NAME, 0, &st) == 0;
+        vfs_get_cache_perf_snapshot(after_second);
+    }
+    uint64_t const STORES_BEFORE = before.metadata_stores + before.existence_stores;
+    uint64_t const STORES_AFTER_FIRST = after_first.metadata_stores + after_first.existence_stores;
+    uint64_t const HITS_AFTER_FIRST = after_first.metadata_hits + after_first.existence_hits;
+    uint64_t const HITS_AFTER_SECOND = after_second.metadata_hits + after_second.existence_hits;
+    ok = ok && STORES_AFTER_FIRST > STORES_BEFORE && HITS_AFTER_SECOND > HITS_AFTER_FIRST;
+
+    if (DIRFD >= 0) {
+        ok = (vfs_release_fd(&task, DIRFD) == 0) && ok;
+    }
+    vfs_put_file(dir);
+    ok = (vfs_unlink(FILE_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    ok = task.fd_table.empty() && ok;
+    return ok;
+}
+
+auto vfs_selftest_statat_at_fdcwd_uses_supplied_task() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_statat_at_fdcwd";
+    constexpr const char* FILE_PATH = "/tmp/ktest_statat_at_fdcwd/file";
+    constexpr const char* FILE_NAME = "file";
+
+    vfs_unlink(FILE_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+
+    auto* created = vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    vfs_put_file(created);
+
+    ker::mod::sched::task::Task task{};
+    std::memcpy(task.cwd.data(), DIR_PATH, std::strlen(DIR_PATH) + 1);
+
+    VfsCachePerfSnapshot before{};
+    VfsCachePerfSnapshot after_first{};
+    VfsCachePerfSnapshot after_second{};
+    Stat st{};
+    vfs_get_cache_perf_snapshot(before);
+    bool ok = vfs_statat(&task, AT_FDCWD, FILE_NAME, 0, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
+    vfs_get_cache_perf_snapshot(after_first);
+    ok = ok && vfs_statat(&task, AT_FDCWD, FILE_NAME, 0, &st) == 0;
+    vfs_get_cache_perf_snapshot(after_second);
+    ok = ok && vfs_statat(&task, AT_FDCWD, "", 0, &st) == -ENOENT;
+    uint64_t const STORES_BEFORE = before.metadata_stores + before.existence_stores;
+    uint64_t const STORES_AFTER_FIRST = after_first.metadata_stores + after_first.existence_stores;
+    uint64_t const HITS_AFTER_FIRST = after_first.metadata_hits + after_first.existence_hits;
+    uint64_t const HITS_AFTER_SECOND = after_second.metadata_hits + after_second.existence_hits;
+    ok = ok && STORES_AFTER_FIRST > STORES_BEFORE && HITS_AFTER_SECOND > HITS_AFTER_FIRST;
+
+    ok = (vfs_unlink(FILE_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_statat_root_cwd_relative_paths() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* FILE_PATH = "/tmp/ktest_statat_root_cwd_relative";
+    constexpr const char* SIMPLE_RELATIVE = "tmp/ktest_statat_root_cwd_relative";
+    constexpr const char* SIMPLE_RELATIVE_TRAILING_SLASH = "tmp/ktest_statat_root_cwd_relative/";
+    constexpr const char* CANONICALIZED_RELATIVE = "tmp/../tmp/ktest_statat_root_cwd_relative";
+
+    vfs_unlink(FILE_PATH);
+    auto* created = vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        return false;
+    }
+    vfs_put_file(created);
+
+    ker::mod::sched::task::Task task{};
+    std::memcpy(task.cwd.data(), "/", 2);
+
+    Stat st{};
+    bool ok = vfs_statat(&task, AT_FDCWD, SIMPLE_RELATIVE, 0, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
+    ok = ok && vfs_statat(&task, AT_FDCWD, CANONICALIZED_RELATIVE, 0, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
+    ok = ok && vfs_statat(&task, AT_FDCWD, SIMPLE_RELATIVE_TRAILING_SLASH, 0, &st) == -ENOTDIR;
+    ok = ok && vfs_statat(&task, AT_FDCWD, "tmp/", 0, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFDIR;
+
+    ok = (vfs_unlink(FILE_PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_faccessat_dirfd_metadata_cache() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_faccessat_dirfd_cache";
+    constexpr const char* FILE_PATH = "/tmp/ktest_faccessat_dirfd_cache/file";
+    constexpr const char* FILE_NAME = "file";
+
+    vfs_unlink(FILE_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+
+    auto* created = vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    vfs_put_file(created);
+
+    ker::mod::sched::task::Task task{};
+    auto* dir = vfs_open_file(DIR_PATH, 0, 0);
+    if (dir == nullptr) {
+        vfs_unlink(FILE_PATH);
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+
+    int const DIRFD = vfs_alloc_fd(&task, dir);
+    bool ok = DIRFD >= 0;
+
+    VfsCachePerfSnapshot before{};
+    VfsCachePerfSnapshot after_first{};
+    VfsCachePerfSnapshot after_second{};
+    if (ok) {
+        vfs_get_cache_perf_snapshot(before);
+        ok = vfs_faccessat(&task, DIRFD, FILE_NAME, 0, 0) == 0;
+        vfs_get_cache_perf_snapshot(after_first);
+    }
+    if (ok) {
+        ok = vfs_faccessat(&task, DIRFD, FILE_NAME, 0, 0) == 0;
+        vfs_get_cache_perf_snapshot(after_second);
+    }
+    uint64_t const STORES_BEFORE = before.metadata_stores + before.existence_stores;
+    uint64_t const STORES_AFTER_FIRST = after_first.metadata_stores + after_first.existence_stores;
+    uint64_t const HITS_AFTER_FIRST = after_first.metadata_hits + after_first.existence_hits;
+    uint64_t const HITS_AFTER_SECOND = after_second.metadata_hits + after_second.existence_hits;
+    ok = ok && STORES_AFTER_FIRST > STORES_BEFORE && HITS_AFTER_SECOND > HITS_AFTER_FIRST;
+
+    if (DIRFD >= 0) {
+        ok = (vfs_release_fd(&task, DIRFD) == 0) && ok;
+    }
+    vfs_put_file(dir);
+    ok = (vfs_unlink(FILE_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    ok = task.fd_table.empty() && ok;
+    return ok;
+}
+
+auto vfs_selftest_faccessat_at_fdcwd_uses_supplied_task() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_faccessat_at_fdcwd";
+    constexpr const char* FILE_PATH = "/tmp/ktest_faccessat_at_fdcwd/file";
+    constexpr const char* FILE_NAME = "file";
+
+    vfs_unlink(FILE_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+
+    auto* created = vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    vfs_put_file(created);
+
+    ker::mod::sched::task::Task task{};
+    std::memcpy(task.cwd.data(), DIR_PATH, std::strlen(DIR_PATH) + 1);
+
+    VfsCachePerfSnapshot before{};
+    VfsCachePerfSnapshot after_first{};
+    VfsCachePerfSnapshot after_second{};
+    vfs_get_cache_perf_snapshot(before);
+    bool ok = vfs_faccessat(&task, AT_FDCWD, FILE_NAME, 0, 0) == 0;
+    vfs_get_cache_perf_snapshot(after_first);
+    ok = ok && vfs_faccessat(&task, AT_FDCWD, FILE_NAME, 0, 0) == 0;
+    vfs_get_cache_perf_snapshot(after_second);
+    ok = ok && vfs_faccessat(&task, AT_FDCWD, "", 0, 0) == -ENOENT;
+    uint64_t const STORES_BEFORE = before.metadata_stores + before.existence_stores;
+    uint64_t const STORES_AFTER_FIRST = after_first.metadata_stores + after_first.existence_stores;
+    uint64_t const HITS_AFTER_FIRST = after_first.metadata_hits + after_first.existence_hits;
+    uint64_t const HITS_AFTER_SECOND = after_second.metadata_hits + after_second.existence_hits;
+    ok = ok && STORES_AFTER_FIRST > STORES_BEFORE && HITS_AFTER_SECOND > HITS_AFTER_FIRST;
+
+    ok = (vfs_unlink(FILE_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_faccessat_f_ok_existence_cache_invalidates() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_faccessat_f_ok_exists_cache";
+    constexpr const char* ROOTED_VISIBLE_PATH = "/ktest_faccessat_f_ok_exists_cache";
+    constexpr const char* MISSING_PATH = "/tmp/ktest_faccessat_f_ok_exists_cache_missing";
+    vfs_unlink(PATH);
+    vfs_unlink(MISSING_PATH);
+
+    auto* created = vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        return false;
+    }
+    vfs_put_file(created);
+    vfs_cache_notify_path_changed(PATH, nullptr);
+
+    ker::mod::sched::task::Task task{};
+    VfsCachePerfSnapshot before{};
+    VfsCachePerfSnapshot after_first{};
+    VfsCachePerfSnapshot after_second{};
+    VfsCachePerfSnapshot after_unlink{};
+
+    vfs_get_cache_perf_snapshot(before);
+    bool ok = vfs_faccessat(&task, AT_FDCWD, PATH, 0, 0) == 0;
+    vfs_get_cache_perf_snapshot(after_first);
+    ok = ok && after_first.existence_stores > before.existence_stores && after_first.existence_hits > before.existence_hits;
+
+    ker::mod::sched::task::Task rooted_task{};
+    if (copy_path_string("/tmp", rooted_task.root.data(), rooted_task.root.size()) < 0) {
+        vfs_unlink(PATH);
+        return false;
+    }
+    int rooted_fast_result = 0;
+    ok = ok && vfs_access_absolute_local_fast_path(&rooted_task, ROOTED_VISIBLE_PATH, 0, &rooted_fast_result) && rooted_fast_result == 0;
+    ok = ok && vfs_faccessat(&rooted_task, AT_FDCWD, ROOTED_VISIBLE_PATH, 0, 0) == 0;
+
+    ok = ok && vfs_faccessat(&task, AT_FDCWD, PATH, 0, 0) == 0;
+    vfs_get_cache_perf_snapshot(after_second);
+    ok = ok && after_second.existence_hits > after_first.existence_hits;
+
+    ok = (vfs_unlink(PATH) == 0) && ok;
+    ok = ok && vfs_faccessat(&task, AT_FDCWD, PATH, 0, 0) == -ENOENT;
+    vfs_get_cache_perf_snapshot(after_unlink);
+    ok = ok && after_unlink.existence_misses > after_second.existence_misses;
+
+    vfs_cache_notify_path_changed(MISSING_PATH, nullptr);
+
+    VfsCachePerfSnapshot before_missing{};
+    VfsCachePerfSnapshot after_missing{};
+    vfs_get_cache_perf_snapshot(before_missing);
+    ok = ok && vfs_faccessat(&task, AT_FDCWD, MISSING_PATH, 0, 0) == -ENOENT;
+    vfs_get_cache_perf_snapshot(after_missing);
+    ok = ok && after_missing.existence_stores > before_missing.existence_stores &&
+         after_missing.existence_hits > before_missing.existence_hits;
+    return ok;
+}
+
+auto vfs_selftest_faccessat_f_ok_skips_known_non_symlink_probe() -> bool {
+    constexpr char PATH[] = "/ktest_faccessat_f_ok_known_non_symlink_probe";
+    constexpr size_t PATH_LEN = sizeof(PATH) - 1;
+
+    vfs_unlink(PATH);
+
+    auto* created = vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        return false;
+    }
+    vfs_put_file(created);
+
+    Stat st{};
+    bool ok = vfs_lstat(PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG);
+    vfs_cache_notify_path_changed(PATH, nullptr);
+
+    auto mount_ref = find_mount_point(PATH, PATH_LEN);
+    MountPoint const* mount = mount_ref.get();
+    ok = ok && mount != nullptr;
+    if (mount != nullptr) {
+        metadata_cache_store(PATH, mount->fs_type, mount->dev_id, false, false, 0, &st, metadata_snapshot_stamp(), PATH_LEN);
+    }
+
+    ker::mod::sched::task::Task task{};
+    VfsCachePerfSnapshot before{};
+    VfsCachePerfSnapshot after{};
+    vfs_get_cache_perf_snapshot(before);
+    ok = ok && vfs_faccessat(&task, AT_FDCWD, PATH, 0, 0) == 0;
+    vfs_get_cache_perf_snapshot(after);
+    ok = ok && after.metadata_hits > before.metadata_hits;
+    ok = ok && after.symlink_misses == before.symlink_misses;
+    ok = ok && after.existence_stores > before.existence_stores;
+
+    ok = (vfs_unlink(PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_faccessat_flags() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* FILE_PATH = "/tmp/ktest_faccessat_flags_file";
+    constexpr const char* LINK_PATH = "/tmp/ktest_faccessat_flags_link";
+    constexpr const char* MISSING_TARGET = "/tmp/ktest_faccessat_flags_missing_target";
+    constexpr int INVALID_FLAG = 0x40000000;
+
+    vfs_unlink(FILE_PATH);
+    vfs_unlink(LINK_PATH);
+    vfs_unlink(MISSING_TARGET);
+
+    auto* created = vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        return false;
+    }
+
+    ker::mod::sched::task::Task task{};
+    int const FD = vfs_alloc_fd(&task, created);
+    bool ok = FD >= 0;
+    if (ok) {
+        ok = vfs_faccessat(&task, FD, "", 0, 0) == -ENOENT;
+        ok = ok && vfs_faccessat(&task, FD, "", 0, AT_EMPTY_PATH) == 0;
+        ok = ok && vfs_faccessat(&task, AT_FDCWD, FILE_PATH, 0, INVALID_FLAG) == -EINVAL;
+    }
+
+    if (FD >= 0) {
+        ok = (vfs_release_fd(&task, FD) == 0) && ok;
+    }
+    vfs_put_file(created);
+
+    ok = ok && vfs_symlink(MISSING_TARGET, LINK_PATH) == 0;
+    ok = ok && vfs_faccessat(&task, AT_FDCWD, LINK_PATH, 0, 0) == -ENOENT;
+
+    VfsCachePerfSnapshot before_nofollow{};
+    VfsCachePerfSnapshot after_nofollow_first{};
+    VfsCachePerfSnapshot before_nofollow_second{};
+    VfsCachePerfSnapshot after_nofollow_second{};
+    vfs_get_cache_perf_snapshot(before_nofollow);
+    ok = ok && vfs_faccessat(&task, AT_FDCWD, LINK_PATH, 0, AT_SYMLINK_NOFOLLOW) == 0;
+    vfs_get_cache_perf_snapshot(after_nofollow_first);
+    ok = ok && after_nofollow_first.existence_stores > before_nofollow.existence_stores;
+    auto link_mount_ref = find_mount_point(LINK_PATH, std::strlen(LINK_PATH));
+    MountPoint const* link_mount = link_mount_ref.get();
+    if (link_mount == nullptr) {
+        ok = false;
+    } else {
+        size_t const LINK_PATH_LEN = std::strlen(LINK_PATH);
+        uint64_t const LINK_PATH_HASH = metadata_path_hash_raw(LINK_PATH, LINK_PATH_LEN);
+        ok = ok && existence_cache_lookup_mount(LINK_PATH, link_mount, false, LINK_PATH_LEN, LINK_PATH_HASH, false) == 0;
+        ok = ok && existence_cache_lookup_mount(LINK_PATH, link_mount, false, LINK_PATH_LEN, LINK_PATH_HASH, true) == -EAGAIN;
+    }
+    vfs_get_cache_perf_snapshot(before_nofollow_second);
+    ok = ok && vfs_faccessat(&task, AT_FDCWD, LINK_PATH, 0, AT_SYMLINK_NOFOLLOW) == 0;
+    vfs_get_cache_perf_snapshot(after_nofollow_second);
+    ok = ok && after_nofollow_second.existence_hits > before_nofollow_second.existence_hits;
+    ok = ok && vfs_faccessat(&task, AT_FDCWD, LINK_PATH, 0, 0) == -ENOENT;
+
+    ok = (vfs_unlink(LINK_PATH) == 0) && ok;
+    ok = (vfs_unlink(FILE_PATH) == 0) && ok;
+    ok = task.fd_table.empty() && ok;
+    return ok;
+}
+
+auto vfs_selftest_mkdirat_dirfd_creates_relative_directory() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_mkdirat_dirfd";
+    constexpr const char* CHILD_PATH = "/tmp/ktest_mkdirat_dirfd/child";
+    constexpr const char* CHILD_NAME = "child";
+    constexpr const char* ABS_CHILD_PATH = "/tmp/ktest_mkdirat_dirfd/abs_child";
+
+    vfs_rmdir(ABS_CHILD_PATH);
+    vfs_rmdir(CHILD_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+
+    ker::mod::sched::task::Task task{};
+    auto* dir = vfs_open_file(DIR_PATH, 0, 0);
+    if (dir == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+
+    int const DIRFD = vfs_alloc_fd(&task, dir);
+    bool ok = DIRFD >= 0;
+    if (ok) {
+        ok = vfs_mkdirat(&task, DIRFD, CHILD_NAME, 0755) == 0;
+    }
+    constexpr int BOGUS_DIRFD = 9999;
+    ok = vfs_mkdirat(&task, BOGUS_DIRFD, ABS_CHILD_PATH, 0755) == 0 && ok;
+
+    Stat st{};
+    ok = ok && vfs_stat(CHILD_PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFDIR;
+    ok = ok && vfs_stat(ABS_CHILD_PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFDIR;
+
+    if (DIRFD >= 0) {
+        ok = (vfs_release_fd(&task, DIRFD) == 0) && ok;
+    }
+    vfs_put_file(dir);
+    ok = (vfs_rmdir(ABS_CHILD_PATH) == 0) && ok;
+    ok = (vfs_rmdir(CHILD_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    ok = task.fd_table.empty() && ok;
+    return ok;
+}
+
+auto vfs_selftest_readlinkat_dirfd_reads_relative_symlink() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_readlinkat_dirfd";
+    constexpr const char* LINK_PATH = "/tmp/ktest_readlinkat_dirfd/link";
+    constexpr const char* ABS_LINK_PATH = "/tmp/ktest_readlinkat_dirfd/abs_link";
+    constexpr const char* LINK_NAME = "link";
+    constexpr const char* TARGET = "target-name";
+
+    vfs_unlink(LINK_PATH);
+    vfs_unlink(ABS_LINK_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+    if (vfs_symlink(TARGET, LINK_PATH) != 0) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    if (vfs_symlink(TARGET, ABS_LINK_PATH) != 0) {
+        vfs_unlink(LINK_PATH);
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+
+    ker::mod::sched::task::Task task{};
+    auto* dir = vfs_open_file(DIR_PATH, 0, 0);
+    if (dir == nullptr) {
+        vfs_unlink(LINK_PATH);
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+
+    int const DIRFD = vfs_alloc_fd(&task, dir);
+    bool ok = DIRFD >= 0;
+    std::array<char, 32> buf{};
+    if (ok) {
+        ssize_t const READ = vfs_readlinkat(&task, DIRFD, LINK_NAME, buf.data(), buf.size());
+        ok = READ == static_cast<ssize_t>(std::strlen(TARGET)) && std::memcmp(buf.data(), TARGET, static_cast<size_t>(READ)) == 0;
+    }
+    if (ok) {
+        buf.fill(0);
+        constexpr int BOGUS_DIRFD = 9999;
+        ssize_t const READ = vfs_readlinkat(&task, BOGUS_DIRFD, ABS_LINK_PATH, buf.data(), buf.size());
+        ok = READ == static_cast<ssize_t>(std::strlen(TARGET)) && std::memcmp(buf.data(), TARGET, static_cast<size_t>(READ)) == 0;
+    }
+
+    if (DIRFD >= 0) {
+        ok = (vfs_release_fd(&task, DIRFD) == 0) && ok;
+    }
+    vfs_put_file(dir);
+    ok = (vfs_unlink(LINK_PATH) == 0) && ok;
+    ok = (vfs_unlink(ABS_LINK_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    ok = task.fd_table.empty() && ok;
+    return ok;
+}
+
+auto vfs_selftest_symlinkat_dirfd_creates_relative_symlink() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_symlinkat_dirfd";
+    constexpr const char* LINK_PATH = "/tmp/ktest_symlinkat_dirfd/link";
+    constexpr const char* ABS_LINK_PATH = "/tmp/ktest_symlinkat_dirfd/abs_link";
+    constexpr const char* LINK_NAME = "link";
+    constexpr const char* TARGET = "target-name";
+
+    vfs_unlink(LINK_PATH);
+    vfs_unlink(ABS_LINK_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+
+    ker::mod::sched::task::Task task{};
+    auto* dir = vfs_open_file(DIR_PATH, 0, 0);
+    if (dir == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+
+    int const DIRFD = vfs_alloc_fd(&task, dir);
+    bool ok = DIRFD >= 0;
+    if (ok) {
+        ok = vfs_symlinkat(&task, TARGET, DIRFD, LINK_NAME) == 0;
+    }
+    constexpr int BOGUS_DIRFD = 9999;
+    if (ok) {
+        ok = vfs_symlinkat(&task, TARGET, BOGUS_DIRFD, ABS_LINK_PATH) == 0;
+    }
+
+    Stat st{};
+    VfsCachePerfSnapshot before_link_lstat{};
+    VfsCachePerfSnapshot after_link_lstat{};
+    VfsCachePerfSnapshot before_abs_lstat{};
+    VfsCachePerfSnapshot after_abs_lstat{};
+    if (ok) {
+        vfs_get_cache_perf_snapshot(before_link_lstat);
+        ok = vfs_lstat(LINK_PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFLNK) &&
+             st.st_size == static_cast<off_t>(std::strlen(TARGET));
+        vfs_get_cache_perf_snapshot(after_link_lstat);
+        ok = ok && after_link_lstat.metadata_hits > before_link_lstat.metadata_hits;
+    }
+    if (ok) {
+        vfs_get_cache_perf_snapshot(before_abs_lstat);
+        ok = vfs_lstat(ABS_LINK_PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFLNK) &&
+             st.st_size == static_cast<off_t>(std::strlen(TARGET));
+        vfs_get_cache_perf_snapshot(after_abs_lstat);
+        ok = ok && after_abs_lstat.metadata_hits > before_abs_lstat.metadata_hits;
+    }
+
+    std::array<char, 32> buf{};
+    VfsCachePerfSnapshot before_link_readlink{};
+    VfsCachePerfSnapshot after_link_readlink{};
+    VfsCachePerfSnapshot before_abs_readlink{};
+    VfsCachePerfSnapshot after_abs_readlink{};
+    if (ok) {
+        vfs_get_cache_perf_snapshot(before_link_readlink);
+        ssize_t const READ = vfs_readlink(LINK_PATH, buf.data(), buf.size());
+        vfs_get_cache_perf_snapshot(after_link_readlink);
+        ok = READ == static_cast<ssize_t>(std::strlen(TARGET)) && std::memcmp(buf.data(), TARGET, static_cast<size_t>(READ)) == 0;
+        ok = ok && after_link_readlink.symlink_hits > before_link_readlink.symlink_hits;
+    }
+    if (ok) {
+        buf.fill(0);
+        vfs_get_cache_perf_snapshot(before_abs_readlink);
+        ssize_t const READ = vfs_readlink(ABS_LINK_PATH, buf.data(), buf.size());
+        vfs_get_cache_perf_snapshot(after_abs_readlink);
+        ok = READ == static_cast<ssize_t>(std::strlen(TARGET)) && std::memcmp(buf.data(), TARGET, static_cast<size_t>(READ)) == 0;
+        ok = ok && after_abs_readlink.symlink_hits > before_abs_readlink.symlink_hits;
+    }
+
+    if (DIRFD >= 0) {
+        ok = (vfs_release_fd(&task, DIRFD) == 0) && ok;
+    }
+    vfs_put_file(dir);
+    ok = (vfs_unlink(LINK_PATH) == 0) && ok;
+    ok = (vfs_unlink(ABS_LINK_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    ok = task.fd_table.empty() && ok;
+    return ok;
+}
+
+auto vfs_selftest_linkat_dirfd_creates_relative_hardlink() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_linkat_dirfd";
+    constexpr const char* SOURCE_PATH = "/tmp/ktest_linkat_dirfd/source";
+    constexpr const char* LINK_PATH = "/tmp/ktest_linkat_dirfd/hard";
+    constexpr const char* ABS_LINK_PATH = "/tmp/ktest_linkat_dirfd/abs_hard";
+    constexpr const char* SOURCE_NAME = "source";
+    constexpr const char* LINK_NAME = "hard";
+    constexpr const char* DATA = "linked-data";
+
+    vfs_unlink(ABS_LINK_PATH);
+    vfs_unlink(LINK_PATH);
+    vfs_unlink(SOURCE_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+
+    auto* source = vfs_open_file(SOURCE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (source == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    bool ok = vfs_write_file(source, DATA, std::strlen(DATA)) == static_cast<ssize_t>(std::strlen(DATA));
+    vfs_put_file(source);
+
+    ker::mod::sched::task::Task task{};
+    auto* dir = vfs_open_file(DIR_PATH, 0, 0);
+    if (dir == nullptr) {
+        vfs_unlink(SOURCE_PATH);
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+
+    int const DIRFD = vfs_alloc_fd(&task, dir);
+    ok = ok && DIRFD >= 0;
+    if (ok) {
+        ok = vfs_linkat(&task, DIRFD, SOURCE_NAME, DIRFD, LINK_NAME, 0) == 0;
+    }
+    constexpr int BOGUS_DIRFD = 9999;
+    if (ok) {
+        ok = vfs_linkat(&task, BOGUS_DIRFD, SOURCE_PATH, BOGUS_DIRFD, ABS_LINK_PATH, 0) == 0;
+    }
+
+    auto* linked = vfs_open_file(LINK_PATH, 0, 0);
+    if (ok) {
+        ok = linked != nullptr;
+    }
+    if (ok) {
+        std::array<char, 32> buf{};
+        ssize_t const READ = vfs_pread_file(linked, buf.data(), std::strlen(DATA), 0);
+        ok = READ == static_cast<ssize_t>(std::strlen(DATA)) && std::memcmp(buf.data(), DATA, static_cast<size_t>(READ)) == 0;
+    }
+    if (linked != nullptr) {
+        vfs_put_file(linked);
+    }
+    auto* abs_linked = vfs_open_file(ABS_LINK_PATH, 0, 0);
+    if (ok) {
+        ok = abs_linked != nullptr;
+    }
+    if (ok) {
+        std::array<char, 32> buf{};
+        ssize_t const READ = vfs_pread_file(abs_linked, buf.data(), std::strlen(DATA), 0);
+        ok = READ == static_cast<ssize_t>(std::strlen(DATA)) && std::memcmp(buf.data(), DATA, static_cast<size_t>(READ)) == 0;
+    }
+    if (abs_linked != nullptr) {
+        vfs_put_file(abs_linked);
+    }
+
+    if (DIRFD >= 0) {
+        ok = (vfs_release_fd(&task, DIRFD) == 0) && ok;
+    }
+    vfs_put_file(dir);
+    ok = (vfs_unlink(ABS_LINK_PATH) == 0) && ok;
+    ok = (vfs_unlink(LINK_PATH) == 0) && ok;
+    ok = (vfs_unlink(SOURCE_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    ok = task.fd_table.empty() && ok;
+    return ok;
+}
+
+auto vfs_selftest_fchmodat_dirfd_changes_relative_file_mode() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_fchmodat_dirfd";
+    constexpr const char* FILE_PATH = "/tmp/ktest_fchmodat_dirfd/file";
+    constexpr const char* ABS_FILE_PATH = "/tmp/ktest_fchmodat_dirfd/abs_file";
+    constexpr const char* FILE_NAME = "file";
+    constexpr mode_t EXPECTED_MODE = 0751;
+    constexpr mode_t EXPECTED_ABS_MODE = 0640;
+
+    vfs_unlink(ABS_FILE_PATH);
+    vfs_unlink(FILE_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+
+    auto* created = vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    vfs_put_file(created);
+    created = vfs_open_file(ABS_FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        vfs_unlink(FILE_PATH);
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    vfs_put_file(created);
+
+    ker::mod::sched::task::Task task{};
+    auto* dir = vfs_open_file(DIR_PATH, 0, 0);
+    if (dir == nullptr) {
+        vfs_unlink(FILE_PATH);
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+
+    int const DIRFD = vfs_alloc_fd(&task, dir);
+    bool ok = DIRFD >= 0;
+    if (ok) {
+        ok = vfs_fchmodat(&task, DIRFD, FILE_NAME, EXPECTED_MODE, 0) == 0;
+    }
+    constexpr int BOGUS_DIRFD = 9999;
+    if (ok) {
+        ok = vfs_fchmodat(&task, BOGUS_DIRFD, ABS_FILE_PATH, EXPECTED_ABS_MODE, 0) == 0;
+    }
+
+    VfsCachePerfSnapshot before_file_stat{};
+    VfsCachePerfSnapshot after_file_stat{};
+    VfsCachePerfSnapshot before_abs_stat{};
+    VfsCachePerfSnapshot after_abs_stat{};
+    Stat st{};
+    if (ok) {
+        vfs_get_cache_perf_snapshot(before_file_stat);
+        ok = vfs_stat(FILE_PATH, &st) == 0 && (st.st_mode & 07777) == EXPECTED_MODE;
+        vfs_get_cache_perf_snapshot(after_file_stat);
+        ok = ok && after_file_stat.metadata_hits > before_file_stat.metadata_hits;
+    }
+    if (ok) {
+        vfs_get_cache_perf_snapshot(before_abs_stat);
+        ok = vfs_stat(ABS_FILE_PATH, &st) == 0 && (st.st_mode & 07777) == EXPECTED_ABS_MODE;
+        vfs_get_cache_perf_snapshot(after_abs_stat);
+        ok = ok && after_abs_stat.metadata_hits > before_abs_stat.metadata_hits;
+    }
+
+    if (DIRFD >= 0) {
+        ok = (vfs_release_fd(&task, DIRFD) == 0) && ok;
+    }
+    vfs_put_file(dir);
+    ok = (vfs_unlink(ABS_FILE_PATH) == 0) && ok;
+    ok = (vfs_unlink(FILE_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    ok = task.fd_table.empty() && ok;
+    return ok;
+}
+
+auto vfs_selftest_fchownat_dirfd_changes_relative_file_owner() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_fchownat_dirfd";
+    constexpr const char* FILE_PATH = "/tmp/ktest_fchownat_dirfd/file";
+    constexpr const char* ABS_FILE_PATH = "/tmp/ktest_fchownat_dirfd/abs_file";
+    constexpr const char* FILE_NAME = "file";
+    constexpr uid_t EXPECTED_UID = 1234;
+    constexpr gid_t EXPECTED_GID = 5678;
+    constexpr uid_t EXPECTED_ABS_UID = 4321;
+    constexpr gid_t EXPECTED_ABS_GID = 8765;
+
+    vfs_unlink(ABS_FILE_PATH);
+    vfs_unlink(FILE_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+
+    auto* created = vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    vfs_put_file(created);
+    created = vfs_open_file(ABS_FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        vfs_unlink(FILE_PATH);
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    vfs_put_file(created);
+
+    ker::mod::sched::task::Task task{};
+    auto* dir = vfs_open_file(DIR_PATH, 0, 0);
+    if (dir == nullptr) {
+        vfs_unlink(FILE_PATH);
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+
+    int const DIRFD = vfs_alloc_fd(&task, dir);
+    bool ok = DIRFD >= 0;
+    if (ok) {
+        ok = vfs_fchownat(&task, DIRFD, FILE_NAME, EXPECTED_UID, EXPECTED_GID, 0) == 0;
+    }
+    constexpr int BOGUS_DIRFD = 9999;
+    if (ok) {
+        ok = vfs_fchownat(&task, BOGUS_DIRFD, ABS_FILE_PATH, EXPECTED_ABS_UID, EXPECTED_ABS_GID, 0) == 0;
+    }
+
+    VfsCachePerfSnapshot before_file_stat{};
+    VfsCachePerfSnapshot after_file_stat{};
+    VfsCachePerfSnapshot before_abs_stat{};
+    VfsCachePerfSnapshot after_abs_stat{};
+    Stat st{};
+    if (ok) {
+        vfs_get_cache_perf_snapshot(before_file_stat);
+        ok = vfs_stat(FILE_PATH, &st) == 0 && st.st_uid == EXPECTED_UID && st.st_gid == EXPECTED_GID;
+        vfs_get_cache_perf_snapshot(after_file_stat);
+        ok = ok && after_file_stat.metadata_hits > before_file_stat.metadata_hits;
+    }
+    if (ok) {
+        vfs_get_cache_perf_snapshot(before_abs_stat);
+        ok = vfs_stat(ABS_FILE_PATH, &st) == 0 && st.st_uid == EXPECTED_ABS_UID && st.st_gid == EXPECTED_ABS_GID;
+        vfs_get_cache_perf_snapshot(after_abs_stat);
+        ok = ok && after_abs_stat.metadata_hits > before_abs_stat.metadata_hits;
+    }
+
+    if (DIRFD >= 0) {
+        ok = (vfs_release_fd(&task, DIRFD) == 0) && ok;
+    }
+    vfs_put_file(dir);
+    ok = (vfs_unlink(ABS_FILE_PATH) == 0) && ok;
+    ok = (vfs_unlink(FILE_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    ok = task.fd_table.empty() && ok;
+    return ok;
+}
+
+auto vfs_selftest_stat_lstat_share_non_symlink_cache() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_stat_lstat_shared_cache";
+    constexpr const char* MISSING_PATH = "/tmp/ktest_stat_lstat_shared_cache_missing";
+    constexpr const char* FIRST_STAT_MISSING_PATH = "/tmp/ktest_stat_lstat_shared_cache_first_stat_missing";
+    constexpr const char* EXISTENCE_ONLY_MISSING_PATH = "/tmp/ktest_stat_lstat_shared_cache_existence_only_missing";
+    constexpr const char* CACHE_ONLY_PATH = "/tmp/ktest_stat_lstat_shared_cache_only";
+    constexpr size_t CACHE_ONLY_PATH_LEN = sizeof("/tmp/ktest_stat_lstat_shared_cache_only") - 1;
+
+    vfs_unlink(PATH);
+    vfs_unlink(MISSING_PATH);
+    vfs_unlink(FIRST_STAT_MISSING_PATH);
+    vfs_unlink(EXISTENCE_ONLY_MISSING_PATH);
+    vfs_unlink(CACHE_ONLY_PATH);
+
+    auto* created = vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (created == nullptr) {
+        return false;
+    }
+    vfs_put_file(created);
+
+    vfs_cache_notify_path_changed(PATH, nullptr);
+
+    VfsCachePerfSnapshot before{};
+    VfsCachePerfSnapshot after_lstat{};
+    VfsCachePerfSnapshot after_stat{};
+    Stat st{};
+    vfs_get_cache_perf_snapshot(before);
+    bool ok = vfs_lstat(PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
+    vfs_get_cache_perf_snapshot(after_lstat);
+    if (ok) {
+        ok = vfs_stat(PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
+        vfs_get_cache_perf_snapshot(after_stat);
+    }
+    ok = ok && after_lstat.metadata_stores > before.metadata_stores && after_stat.metadata_hits > after_lstat.metadata_hits;
+    VfsCachePerfSnapshot before_require_dir{};
+    VfsCachePerfSnapshot after_require_dir{};
+    vfs_get_cache_perf_snapshot(before_require_dir);
+    ok = ok && vfs_stat("/tmp/ktest_stat_lstat_shared_cache/", &st) == -ENOTDIR;
+    vfs_get_cache_perf_snapshot(after_require_dir);
+    ok = ok && after_require_dir.metadata_hits > before_require_dir.metadata_hits;
+
+    auto cache_only_mount_ref = find_mount_point(CACHE_ONLY_PATH, CACHE_ONLY_PATH_LEN);
+    MountPoint const* cache_only_mount = cache_only_mount_ref.get();
+    ok = ok && cache_only_mount != nullptr;
+    vfs_cache_notify_path_changed(CACHE_ONLY_PATH, nullptr);
+    if (cache_only_mount != nullptr) {
+        Stat cache_only_stat{};
+        cache_only_stat.st_mode = static_cast<mode_t>(S_IFREG | 0644);
+        cache_only_stat.st_dev = cache_only_mount->dev_id;
+        cache_only_stat.st_size = 424242;
+        uint64_t const CACHE_ONLY_HASH = metadata_path_hash_raw(CACHE_ONLY_PATH, CACHE_ONLY_PATH_LEN);
+        metadata_cache_store_known_stat_variants(CACHE_ONLY_PATH, cache_only_mount->fs_type, cache_only_mount->dev_id, cache_only_stat,
+                                                 metadata_snapshot_stamp(), CACHE_ONLY_PATH_LEN, cache_only_mount, CACHE_ONLY_HASH);
+
+        VfsCachePerfSnapshot before_cache_only_access{};
+        VfsCachePerfSnapshot after_cache_only_access{};
+        vfs_get_cache_perf_snapshot(before_cache_only_access);
+        ok = ok && vfs_access_f_ok_resolved(CACHE_ONLY_PATH, false, true, CACHE_ONLY_PATH_LEN, CACHE_ONLY_HASH) == 0;
+        vfs_get_cache_perf_snapshot(after_cache_only_access);
+        ok = ok && after_cache_only_access.metadata_hits > before_cache_only_access.metadata_hits;
+
+        VfsCachePerfSnapshot before_cache_only_resolved_stat{};
+        VfsCachePerfSnapshot after_cache_only_resolved_stat{};
+        Stat cache_only_out{};
+        vfs_get_cache_perf_snapshot(before_cache_only_resolved_stat);
+        ok = ok &&
+             vfs_stat_resolved_cache_or_impl(CACHE_ONLY_PATH, true, false, true, &cache_only_out, CACHE_ONLY_PATH_LEN, CACHE_ONLY_HASH) ==
+                 0 &&
+             cache_only_out.st_size == cache_only_stat.st_size;
+        vfs_get_cache_perf_snapshot(after_cache_only_resolved_stat);
+        ok = ok && after_cache_only_resolved_stat.metadata_hits > before_cache_only_resolved_stat.metadata_hits;
+        vfs_cache_notify_path_changed(CACHE_ONLY_PATH, nullptr);
+    }
+
+    vfs_cache_notify_path_changed(MISSING_PATH, nullptr);
+
+    VfsCachePerfSnapshot before_missing{};
+    VfsCachePerfSnapshot after_missing_lstat{};
+    VfsCachePerfSnapshot after_missing_stat{};
+    vfs_get_cache_perf_snapshot(before_missing);
+    ok = (vfs_lstat(MISSING_PATH, &st) == -ENOENT) && ok;
+    vfs_get_cache_perf_snapshot(after_missing_lstat);
+    ok = (vfs_stat(MISSING_PATH, &st) == -ENOENT) && ok;
+    vfs_get_cache_perf_snapshot(after_missing_stat);
+    ok = ok && after_missing_lstat.metadata_stores > before_missing.metadata_stores &&
+         after_missing_stat.metadata_hits > after_missing_lstat.metadata_hits;
+    auto missing_mount_ref = find_mount_point(MISSING_PATH);
+    MountPoint const* missing_mount = missing_mount_ref.get();
+    ok = ok && missing_mount != nullptr;
+    if (missing_mount != nullptr) {
+        VfsCachePerfSnapshot before_missing_existence_lookup{};
+        VfsCachePerfSnapshot after_missing_existence_lookup{};
+        vfs_get_cache_perf_snapshot(before_missing_existence_lookup);
+        ok = ok && existence_cache_lookup_mount(MISSING_PATH, missing_mount, false) == -ENOENT;
+        ok = ok && existence_cache_lookup_mount(MISSING_PATH, missing_mount, true) == -ENOENT;
+        vfs_get_cache_perf_snapshot(after_missing_existence_lookup);
+        ok = ok && after_missing_existence_lookup.existence_hits > before_missing_existence_lookup.existence_hits;
+    }
+
+    vfs_cache_notify_path_changed(FIRST_STAT_MISSING_PATH, nullptr);
+
+    VfsCachePerfSnapshot before_first_missing_stat{};
+    VfsCachePerfSnapshot after_first_missing_stat{};
+    vfs_get_cache_perf_snapshot(before_first_missing_stat);
+    ok = (vfs_stat(FIRST_STAT_MISSING_PATH, &st) == -ENOENT) && ok;
+    vfs_get_cache_perf_snapshot(after_first_missing_stat);
+    ok = ok && after_first_missing_stat.metadata_stores > before_first_missing_stat.metadata_stores &&
+         after_first_missing_stat.metadata_hits > before_first_missing_stat.metadata_hits;
+
+    auto existence_only_mount_ref = find_mount_point(EXISTENCE_ONLY_MISSING_PATH);
+    MountPoint const* existence_only_mount = existence_only_mount_ref.get();
+    ok = ok && existence_only_mount != nullptr;
+    vfs_cache_notify_path_changed(EXISTENCE_ONLY_MISSING_PATH, nullptr);
+    if (existence_only_mount != nullptr) {
+        existence_cache_store(EXISTENCE_ONLY_MISSING_PATH, existence_only_mount, false, -ENOENT, metadata_snapshot_stamp());
+        VfsCachePerfSnapshot before_existence_only_missing_stat{};
+        VfsCachePerfSnapshot after_existence_only_missing_stat{};
+        vfs_get_cache_perf_snapshot(before_existence_only_missing_stat);
+        ok = (vfs_stat(EXISTENCE_ONLY_MISSING_PATH, &st) == -ENOENT) && ok;
+        vfs_get_cache_perf_snapshot(after_existence_only_missing_stat);
+        ok = ok && after_existence_only_missing_stat.existence_hits > before_existence_only_missing_stat.existence_hits;
+        ok = ok && after_existence_only_missing_stat.symlink_hits == before_existence_only_missing_stat.symlink_hits &&
+             after_existence_only_missing_stat.symlink_misses == before_existence_only_missing_stat.symlink_misses;
+    }
+
+    ok = (vfs_unlink(PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_readdir_seeds_non_symlink_hints() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_readdir_hints";
+    constexpr const char* CHILD_PATH = "/tmp/ktest_readdir_hints/child";
+    constexpr const char* DIR_CHILD_PATH = "/tmp/ktest_readdir_hints/dir_child";
+    constexpr const char* DIR_GRANDCHILD_PATH = "/tmp/ktest_readdir_hints/dir_child/nested";
+    constexpr const char* CHILD_NAME = "child";
+    constexpr const char* DIR_CHILD_NAME = "dir_child";
+    constexpr size_t DIR_CHILD_PATH_LEN = sizeof("/tmp/ktest_readdir_hints/dir_child") - 1;
+    constexpr size_t DIR_GRANDCHILD_PATH_LEN = sizeof("/tmp/ktest_readdir_hints/dir_child/nested") - 1;
+
+    vfs_unlink(CHILD_PATH);
+    vfs_rmdir(DIR_CHILD_PATH);
+    vfs_rmdir(DIR_PATH);
+    if (vfs_mkdir(DIR_PATH, 0755) != 0) {
+        return false;
+    }
+
+    auto* child = vfs_open_file(CHILD_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (child == nullptr) {
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+    vfs_put_file(child);
+
+    if (vfs_mkdir(DIR_CHILD_PATH, 0755) != 0) {
+        vfs_unlink(CHILD_PATH);
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+
+    auto* dir = vfs_open_file(DIR_PATH, 0, 0);
+    if (dir == nullptr || dir->fops == nullptr || dir->fops->vfs_readdir == nullptr) {
+        if (dir != nullptr) {
+            vfs_put_file(dir);
+        }
+        vfs_unlink(CHILD_PATH);
+        vfs_rmdir(DIR_CHILD_PATH);
+        vfs_rmdir(DIR_PATH);
+        return false;
+    }
+
+    auto mount_ref = find_mount_point(DIR_PATH);
+    MountPoint const* mount = mount_ref.get();
+    bool ok = mount != nullptr;
+
+    vfs_cache_notify_path_changed(CHILD_PATH, nullptr);
+    vfs_cache_notify_path_changed(DIR_CHILD_PATH, nullptr);
+
+    DirEntry found{};
+    DirEntry found_dir{};
+    MetadataSnapshotStamp found_stamp{};
+    MetadataSnapshotStamp found_dir_stamp{};
+    bool found_child = false;
+    bool found_dir_child = false;
+    for (size_t index = 0; index < 16 && (!found_child || !found_dir_child); ++index) {
+        DirEntry entry{};
+        MetadataSnapshotStamp const STAMP = metadata_snapshot_stamp();
+        int const RET = dir->fops->vfs_readdir(dir, &entry, index);
+        if (RET != 0) {
+            break;
+        }
+        if (std::strcmp(entry.d_name.data(), CHILD_NAME) == 0) {
+            found = entry;
+            found_stamp = STAMP;
+            found_child = true;
+        }
+        if (std::strcmp(entry.d_name.data(), DIR_CHILD_NAME) == 0) {
+            found_dir = entry;
+            found_dir_stamp = STAMP;
+            found_dir_child = true;
+        }
+    }
+    ok = ok && found_child && (found.d_type & static_cast<uint8_t>(~DT_WOSLINK)) == DT_REG;
+    ok = ok && found_dir_child && (found_dir.d_type & static_cast<uint8_t>(~DT_WOSLINK)) == DT_DIR;
+
+    VfsCachePerfSnapshot before_seed{};
+    VfsCachePerfSnapshot after_seed{};
+    vfs_get_cache_perf_snapshot(before_seed);
+    if (ok) {
+        vfs_seed_readdir_entry_cache_hints(dir, mount, found, found_stamp);
+    }
+    vfs_get_cache_perf_snapshot(after_seed);
+    ok = ok && after_seed.symlink_stores > before_seed.symlink_stores && after_seed.existence_stores > before_seed.existence_stores;
+
+    uint64_t const PREFIX_STORES_BEFORE = g_vfs_symlink_prefix_stores.load(std::memory_order_relaxed);
+    if (ok) {
+        vfs_seed_readdir_entry_cache_hints(dir, mount, found_dir, found_dir_stamp);
+    }
+    uint64_t const PREFIX_STORES_AFTER = g_vfs_symlink_prefix_stores.load(std::memory_order_relaxed);
+    ok = ok && PREFIX_STORES_AFTER > PREFIX_STORES_BEFORE;
+
+    if (mount != nullptr) {
+        VfsCachePerfSnapshot before_not_symlink_proof{};
+        VfsCachePerfSnapshot after_not_symlink_proof{};
+        vfs_get_cache_perf_snapshot(before_not_symlink_proof);
+        ok = ok && metadata_cache_proves_final_not_symlink(CHILD_PATH, mount->fs_type, mount->dev_id);
+        vfs_get_cache_perf_snapshot(after_not_symlink_proof);
+        ok = ok && after_not_symlink_proof.symlink_hits > before_not_symlink_proof.symlink_hits;
+    }
+
+    std::array<char, MAX_PATH_LEN> buf{};
+    VfsCachePerfSnapshot before_readlink{};
+    VfsCachePerfSnapshot after_readlink{};
+    vfs_get_cache_perf_snapshot(before_readlink);
+    ok = ok && readlink_resolved(CHILD_PATH, buf.data(), buf.size()) == -EINVAL;
+    vfs_get_cache_perf_snapshot(after_readlink);
+    ok = ok && after_readlink.symlink_hits > before_readlink.symlink_hits;
+
+    if (mount != nullptr) {
+        VfsCachePerfSnapshot before_existence{};
+        VfsCachePerfSnapshot after_existence{};
+        vfs_get_cache_perf_snapshot(before_existence);
+        ok = ok && existence_cache_lookup_mount(CHILD_PATH, mount, false) == 0;
+        vfs_get_cache_perf_snapshot(after_existence);
+        ok = ok && after_existence.existence_hits > before_existence.existence_hits;
+
+        Stat cached{};
+        VfsCachePerfSnapshot before_require_dir{};
+        VfsCachePerfSnapshot after_require_dir{};
+        vfs_get_cache_perf_snapshot(before_require_dir);
+        ok = ok && metadata_cache_lookup_mount_stat(CHILD_PATH, mount, true, true, &cached) == -ENOTDIR;
+        vfs_get_cache_perf_snapshot(after_require_dir);
+        ok = ok && after_require_dir.metadata_hits > before_require_dir.metadata_hits;
+
+        VfsCachePerfSnapshot before_existence_require_dir{};
+        VfsCachePerfSnapshot after_existence_require_dir{};
+        vfs_get_cache_perf_snapshot(before_existence_require_dir);
+        ok = ok && existence_cache_lookup_mount(CHILD_PATH, mount, true) == -ENOTDIR;
+        vfs_get_cache_perf_snapshot(after_existence_require_dir);
+        ok = ok && after_existence_require_dir.existence_hits > before_existence_require_dir.existence_hits;
+
+        uint64_t const PREFIX_HITS_BEFORE = g_vfs_symlink_prefix_hits.load(std::memory_order_relaxed);
+        ok = ok && symlink_prefix_cache_lookup(DIR_GRANDCHILD_PATH, DIR_GRANDCHILD_PATH_LEN, mount) == DIR_CHILD_PATH_LEN;
+        uint64_t const PREFIX_HITS_AFTER = g_vfs_symlink_prefix_hits.load(std::memory_order_relaxed);
+        ok = ok && PREFIX_HITS_AFTER > PREFIX_HITS_BEFORE;
+    }
+
+    vfs_put_file(dir);
+    ok = (vfs_unlink(CHILD_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_CHILD_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_readlink_uses_metadata_negative_cache() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PATH = "/tmp/ktest_readlink_metadata_negative";
+    constexpr const char* MISSING_PATH = "/tmp/ktest_readlink_metadata_missing";
+    constexpr const char* OBSERVED_PATH = "/tmp/ktest_readlink_observed_regular";
+    constexpr const char* OBSERVED_MISSING_PATH = "/tmp/ktest_readlink_observed_missing";
+    constexpr const char* EXISTENCE_ONLY_MISSING_PATH = "/tmp/ktest_readlink_existence_only_missing";
+    constexpr const char* ENOTDIR_PATH = "/tmp/ktest_readlink_metadata_enotdir/child";
+    constexpr const char* REQUIRE_DIR_ENOTDIR_PATH = "/tmp/ktest_readlink_metadata_enotdir_require";
+    constexpr uint64_t ENOTDIR_DEV_ID = 0x4242;
+
+    vfs_unlink(PATH);
+    vfs_unlink(MISSING_PATH);
+    vfs_unlink(OBSERVED_PATH);
+    vfs_unlink(OBSERVED_MISSING_PATH);
+    vfs_unlink(EXISTENCE_ONLY_MISSING_PATH);
+    vfs_cache_notify_path_changed(ENOTDIR_PATH, nullptr);
+    vfs_cache_notify_path_changed(REQUIRE_DIR_ENOTDIR_PATH, nullptr);
+
+    Stat st{};
+    st.st_mode = S_IFREG | 0644;
+    VfsCachePerfSnapshot before_regular_store{};
+    VfsCachePerfSnapshot after_regular_store{};
+    vfs_get_cache_perf_snapshot(before_regular_store);
+    metadata_cache_store_non_symlink_stat_variants(PATH, FSType::TMPFS, 0, st, metadata_snapshot_stamp());
+    vfs_get_cache_perf_snapshot(after_regular_store);
+    bool ok = after_regular_store.symlink_stores > before_regular_store.symlink_stores;
+
+    std::array<char, MAX_PATH_LEN> buf{};
+    VfsCachePerfSnapshot before{};
+    VfsCachePerfSnapshot after_regular{};
+    vfs_get_cache_perf_snapshot(before);
+    ok = readlink_resolved(PATH, buf.data(), buf.size()) == -EINVAL && ok;
+    vfs_get_cache_perf_snapshot(after_regular);
+    ok = ok && after_regular.symlink_hits > before.symlink_hits;
+
+    VfsCachePerfSnapshot before_missing_store{};
+    VfsCachePerfSnapshot after_missing_store{};
+    vfs_get_cache_perf_snapshot(before_missing_store);
+    metadata_cache_store_missing_stat_variants(MISSING_PATH, FSType::TMPFS, 0, metadata_snapshot_stamp());
+    vfs_get_cache_perf_snapshot(after_missing_store);
+    ok = ok && after_missing_store.symlink_stores > before_missing_store.symlink_stores;
+
+    VfsCachePerfSnapshot after_missing{};
+    ok = (readlink_resolved(MISSING_PATH, buf.data(), buf.size()) == -ENOENT) && ok;
+    vfs_get_cache_perf_snapshot(after_missing);
+    ok = ok && after_missing.symlink_hits > after_regular.symlink_hits;
+
+    auto existence_only_mount_ref = find_mount_point(EXISTENCE_ONLY_MISSING_PATH);
+    MountPoint const* existence_only_mount = existence_only_mount_ref.get();
+    ok = ok && existence_only_mount != nullptr;
+    vfs_cache_notify_path_changed(EXISTENCE_ONLY_MISSING_PATH, nullptr);
+    if (existence_only_mount != nullptr) {
+        existence_cache_store(EXISTENCE_ONLY_MISSING_PATH, existence_only_mount, false, -ENOENT, metadata_snapshot_stamp());
+        VfsCachePerfSnapshot before_existence_only_readlink{};
+        VfsCachePerfSnapshot after_existence_only_readlink{};
+        vfs_get_cache_perf_snapshot(before_existence_only_readlink);
+        ok = (readlink_resolved(EXISTENCE_ONLY_MISSING_PATH, buf.data(), buf.size()) == -ENOENT) && ok;
+        vfs_get_cache_perf_snapshot(after_existence_only_readlink);
+        ok = ok && after_existence_only_readlink.existence_hits > before_existence_only_readlink.existence_hits;
+    }
+
+    VfsCachePerfSnapshot before_enotdir_store{};
+    VfsCachePerfSnapshot after_enotdir_store{};
+    vfs_get_cache_perf_snapshot(before_enotdir_store);
+    metadata_cache_store(ENOTDIR_PATH, FSType::XFS, ENOTDIR_DEV_ID, false, false, -ENOTDIR, nullptr, metadata_snapshot_stamp());
+    vfs_get_cache_perf_snapshot(after_enotdir_store);
+    ok = ok && after_enotdir_store.symlink_stores > before_enotdir_store.symlink_stores;
+    ok = ok && metadata_cache_readlink_negative_result(ENOTDIR_PATH, FSType::XFS, ENOTDIR_DEV_ID) == -ENOTDIR;
+
+    ssize_t cached_result = 0;
+    VfsCachePerfSnapshot before_enotdir_lookup{};
+    VfsCachePerfSnapshot after_enotdir_lookup{};
+    vfs_get_cache_perf_snapshot(before_enotdir_lookup);
+    bool const ENOTDIR_SYMLINK_HIT =
+        symlink_cache_lookup(ENOTDIR_PATH, FSType::XFS, ENOTDIR_DEV_ID, buf.data(), buf.size(), &cached_result);
+    vfs_get_cache_perf_snapshot(after_enotdir_lookup);
+    ok = ok && ENOTDIR_SYMLINK_HIT && cached_result == -ENOTDIR && after_enotdir_lookup.symlink_hits > before_enotdir_lookup.symlink_hits;
+
+    metadata_cache_store(REQUIRE_DIR_ENOTDIR_PATH, FSType::XFS, ENOTDIR_DEV_ID, true, true, -ENOTDIR, nullptr, metadata_snapshot_stamp());
+    cached_result = 0;
+    bool const REQUIRE_DIR_SYMLINK_HIT =
+        symlink_cache_lookup(REQUIRE_DIR_ENOTDIR_PATH, FSType::XFS, ENOTDIR_DEV_ID, buf.data(), buf.size(), &cached_result);
+    ok = ok && !REQUIRE_DIR_SYMLINK_HIT &&
+         metadata_cache_readlink_negative_result(REQUIRE_DIR_ENOTDIR_PATH, FSType::XFS, ENOTDIR_DEV_ID) == -EAGAIN;
+
+    auto* observed = vfs_open_file(OBSERVED_PATH, ker::vfs::O_CREAT | 1, 0644);
+    ok = ok && observed != nullptr;
+    if (observed != nullptr) {
+        vfs_put_file(observed);
+    }
+
+    auto observed_mount_ref = find_mount_point(OBSERVED_PATH);
+    MountPoint const* observed_mount = observed_mount_ref.get();
+    ok = ok && observed_mount != nullptr;
+
+    vfs_cache_notify_path_changed(OBSERVED_PATH, nullptr);
+    VfsCachePerfSnapshot before_observed_readlink{};
+    VfsCachePerfSnapshot after_observed_readlink{};
+    vfs_get_cache_perf_snapshot(before_observed_readlink);
+    ok = ok && readlink_resolved(OBSERVED_PATH, buf.data(), buf.size()) == -EINVAL;
+    vfs_get_cache_perf_snapshot(after_observed_readlink);
+    ok = ok && after_observed_readlink.existence_stores > before_observed_readlink.existence_stores;
+    if (observed_mount != nullptr) {
+        VfsCachePerfSnapshot before_observed_exists{};
+        VfsCachePerfSnapshot after_observed_exists{};
+        vfs_get_cache_perf_snapshot(before_observed_exists);
+        ok = ok && existence_cache_lookup_mount(OBSERVED_PATH, observed_mount, false) == 0;
+        vfs_get_cache_perf_snapshot(after_observed_exists);
+        ok = ok && after_observed_exists.existence_hits > before_observed_exists.existence_hits;
+    }
+
+    vfs_cache_notify_path_changed(OBSERVED_MISSING_PATH, nullptr);
+    VfsCachePerfSnapshot before_missing_observed_readlink{};
+    VfsCachePerfSnapshot after_missing_observed_readlink{};
+    vfs_get_cache_perf_snapshot(before_missing_observed_readlink);
+    ok = ok && readlink_resolved(OBSERVED_MISSING_PATH, buf.data(), buf.size()) == -ENOENT;
+    vfs_get_cache_perf_snapshot(after_missing_observed_readlink);
+    ok = ok && after_missing_observed_readlink.existence_stores > before_missing_observed_readlink.existence_stores;
+    if (observed_mount != nullptr) {
+        VfsCachePerfSnapshot before_missing_observed_exists{};
+        VfsCachePerfSnapshot after_missing_observed_exists{};
+        vfs_get_cache_perf_snapshot(before_missing_observed_exists);
+        ok = ok && existence_cache_lookup_mount(OBSERVED_MISSING_PATH, observed_mount, false) == -ENOENT;
+        vfs_get_cache_perf_snapshot(after_missing_observed_exists);
+        ok = ok && after_missing_observed_exists.existence_hits > before_missing_observed_exists.existence_hits;
+    }
+
+    vfs_cache_notify_path_changed(PATH, nullptr);
+    vfs_cache_notify_path_changed(MISSING_PATH, nullptr);
+    vfs_cache_notify_path_changed(OBSERVED_PATH, nullptr);
+    vfs_cache_notify_path_changed(OBSERVED_MISSING_PATH, nullptr);
+    vfs_cache_notify_path_changed(EXISTENCE_ONLY_MISSING_PATH, nullptr);
+    vfs_cache_notify_path_changed(ENOTDIR_PATH, nullptr);
+    vfs_cache_notify_path_changed(REQUIRE_DIR_ENOTDIR_PATH, nullptr);
+    ok = (vfs_unlink(OBSERVED_PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_missing_prefix_short_circuits_symlink_walk() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* PREFIX_PATH = "/tmp/ktest_missing_prefix_short_circuit";
+    constexpr const char* CHILD_PATH = "/tmp/ktest_missing_prefix_short_circuit/child";
+    constexpr const char* CREATABLE_FINAL_PATH = "/tmp/ktest_missing_prefix_short_circuit_final";
+
+    vfs_unlink(CHILD_PATH);
+    vfs_rmdir(PREFIX_PATH);
+    vfs_unlink(PREFIX_PATH);
+    vfs_unlink(CREATABLE_FINAL_PATH);
+    vfs_cache_notify_path_changed(PREFIX_PATH, nullptr);
+    vfs_cache_notify_path_changed(CHILD_PATH, nullptr);
+    vfs_cache_notify_path_changed(CREATABLE_FINAL_PATH, nullptr);
+
+    Stat st{};
+    VfsCachePerfSnapshot before_first_stat{};
+    VfsCachePerfSnapshot after_first_stat{};
+    VfsCachePerfSnapshot after_second_stat{};
+    vfs_get_cache_perf_snapshot(before_first_stat);
+    bool ok = vfs_stat(CHILD_PATH, &st) == -ENOENT;
+    vfs_get_cache_perf_snapshot(after_first_stat);
+    ok = ok && after_first_stat.symlink_stores > before_first_stat.symlink_stores;
+
+    ok = ok && vfs_stat(CHILD_PATH, &st) == -ENOENT;
+    vfs_get_cache_perf_snapshot(after_second_stat);
+    ok = ok && after_second_stat.symlink_hits > after_first_stat.symlink_hits;
+
+    VfsCachePerfSnapshot before_open{};
+    VfsCachePerfSnapshot after_open{};
+    vfs_get_cache_perf_snapshot(before_open);
+    auto* missing = vfs_open_file(CHILD_PATH, 0, 0);
+    vfs_get_cache_perf_snapshot(after_open);
+    ok = ok && missing == nullptr && after_open.symlink_hits > before_open.symlink_hits;
+    if (missing != nullptr) {
+        vfs_put_file(missing);
+    }
+
+    auto* created = vfs_open_file(CREATABLE_FINAL_PATH, ker::vfs::O_CREAT | 1, 0644);
+    ok = ok && created != nullptr;
+    if (created != nullptr) {
+        vfs_put_file(created);
+    }
+
+    ok = (vfs_unlink(CREATABLE_FINAL_PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_symlink_prefix_cache_skips_known_parent() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_symlink_prefix_cache";
+    constexpr const char* DIR_TRAILING_PATH = "/tmp/ktest_symlink_prefix_cache/";
+    constexpr const char* DIR_PARENT_PATH = "/tmp";
+    constexpr const char* FIRST_PATH = "/tmp/ktest_symlink_prefix_cache/first";
+    constexpr const char* SECOND_PATH = "/tmp/ktest_symlink_prefix_cache/second";
+    constexpr const char* MISSING_PATH = "/tmp/ktest_symlink_prefix_cache/missing";
+    constexpr size_t DIR_LEN = sizeof("/tmp/ktest_symlink_prefix_cache") - 1;
+    constexpr size_t DIR_PARENT_LEN = sizeof("/tmp") - 1;
+    constexpr size_t FIRST_LEN = sizeof("/tmp/ktest_symlink_prefix_cache/first") - 1;
+    constexpr size_t SECOND_LEN = sizeof("/tmp/ktest_symlink_prefix_cache/second") - 1;
+    constexpr size_t MISSING_LEN = sizeof("/tmp/ktest_symlink_prefix_cache/missing") - 1;
+
+    vfs_unlink(FIRST_PATH);
+    vfs_unlink(SECOND_PATH);
+    vfs_unlink(MISSING_PATH);
+    vfs_rmdir(DIR_PATH);
+    vfs_cache_notify_path_changed(DIR_PATH, nullptr);
+    vfs_cache_notify_path_changed(FIRST_PATH, nullptr);
+    vfs_cache_notify_path_changed(SECOND_PATH, nullptr);
+    vfs_cache_notify_path_changed(MISSING_PATH, nullptr);
+
+    bool ok = vfs_mkdir(DIR_PATH, 0755) == 0;
+
+    auto* first = ok ? vfs_open_file(FIRST_PATH, ker::vfs::O_CREAT | 1, 0644) : nullptr;
+    ok = ok && first != nullptr;
+    if (first != nullptr) {
+        vfs_put_file(first);
+    }
+
+    auto* second = ok ? vfs_open_file(SECOND_PATH, ker::vfs::O_CREAT | 1, 0644) : nullptr;
+    ok = ok && second != nullptr;
+    if (second != nullptr) {
+        vfs_put_file(second);
+    }
+
+    vfs_cache_notify_path_changed(FIRST_PATH, nullptr);
+    vfs_cache_notify_path_changed(SECOND_PATH, nullptr);
+
+    uint64_t const STORES_BEFORE = g_vfs_symlink_prefix_stores.load(std::memory_order_relaxed);
+    Stat st{};
+    ok = ok && vfs_stat(FIRST_PATH, &st) == 0;
+    uint64_t const STORES_AFTER_FIRST = g_vfs_symlink_prefix_stores.load(std::memory_order_relaxed);
+    uint64_t const HITS_AFTER_FIRST = g_vfs_symlink_prefix_hits.load(std::memory_order_relaxed);
+    ok = ok && STORES_AFTER_FIRST > STORES_BEFORE;
+
+    ok = ok && vfs_stat(SECOND_PATH, &st) == 0;
+    uint64_t const HITS_AFTER_SECOND = g_vfs_symlink_prefix_hits.load(std::memory_order_relaxed);
+    ok = ok && HITS_AFTER_SECOND > HITS_AFTER_FIRST;
+
+    auto mount_ref = find_mount_point(DIR_PATH, DIR_LEN);
+    MountPoint const* mount = mount_ref.get();
+    ok = ok && mount != nullptr;
+    if (mount != nullptr) {
+        symlink_prefix_cache_store(DIR_PATH, DIR_LEN, mount);
+        ok = ok && symlink_prefix_cache_covers_parent(FIRST_PATH, FIRST_LEN, mount);
+        ok = ok && symlink_prefix_cache_lookup(FIRST_PATH, FIRST_LEN, mount) == DIR_LEN;
+        ok = ok && symlink_prefix_cache_lookup_with_parent(FIRST_PATH, FIRST_LEN, DIR_LEN, mount) == DIR_LEN;
+        vfs_cache_notify_path_changed(DIR_PATH, nullptr);
+        ok = ok && !symlink_prefix_cache_covers_parent(FIRST_PATH, FIRST_LEN, mount);
+        ok = ok && symlink_prefix_cache_lookup(FIRST_PATH, FIRST_LEN, mount) != DIR_LEN;
+
+        symlink_prefix_cache_store(DIR_PATH, DIR_LEN, mount);
+        vfs_cache_notify_path_changed(FIRST_PATH, nullptr);
+        ok = ok && symlink_prefix_cache_covers_parent(SECOND_PATH, SECOND_LEN, mount);
+        ok = ok && symlink_prefix_cache_lookup_with_parent(SECOND_PATH, SECOND_LEN, DIR_LEN, mount) == DIR_LEN;
+
+        symlink_cache_store(FIRST_PATH, mount->fs_type, mount->dev_id, -EINVAL, nullptr, FIRST_LEN);
+        vfs_cache_notify_path_changed(FIRST_PATH, nullptr);
+        ok = ok && !metadata_cache_proves_final_not_symlink(FIRST_PATH, mount->fs_type, mount->dev_id, FIRST_LEN);
+
+        symlink_cache_store(FIRST_PATH, mount->fs_type, mount->dev_id, -EINVAL, nullptr, FIRST_LEN);
+        ok = ok && metadata_cache_note_exact_path_changed(FIRST_PATH);
+        ok = ok && metadata_cache_proves_final_not_symlink(FIRST_PATH, mount->fs_type, mount->dev_id, FIRST_LEN);
+
+        existence_cache_store(DIR_PATH, mount, false, 0, metadata_snapshot_stamp(), DIR_LEN);
+        vfs_cache_notify_path_changed(DIR_PATH, nullptr);
+        ok = ok && existence_cache_lookup_mount(DIR_PATH, mount, false, DIR_LEN) == -EAGAIN;
+
+        existence_cache_store(DIR_PATH, mount, false, 0, metadata_snapshot_stamp(), DIR_LEN);
+        vfs_cache_notify_path_changed(FIRST_PATH, nullptr);
+        ok = ok && existence_cache_lookup_mount(DIR_PATH, mount, false, DIR_LEN) == 0;
+
+        existence_cache_store(FIRST_PATH, mount, false, 0, metadata_snapshot_stamp(), FIRST_LEN);
+        ok = ok && metadata_cache_note_exact_path_changed(FIRST_PATH);
+        ok = ok && existence_cache_lookup_mount(FIRST_PATH, mount, false, FIRST_LEN) == 0;
+
+        uint64_t const DIR_STAT_PREFIX_STORES_BEFORE = g_vfs_symlink_prefix_stores.load(std::memory_order_relaxed);
+        ok = ok && vfs_stat(DIR_PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFDIR);
+        uint64_t const DIR_STAT_PREFIX_STORES_AFTER = g_vfs_symlink_prefix_stores.load(std::memory_order_relaxed);
+        ok = ok && DIR_STAT_PREFIX_STORES_AFTER > DIR_STAT_PREFIX_STORES_BEFORE;
+        ok = ok && symlink_prefix_cache_lookup(FIRST_PATH, FIRST_LEN, mount) == DIR_LEN;
+
+        vfs_cache_notify_path_changed(FIRST_PATH, nullptr);
+        symlink_prefix_cache_store(DIR_PATH, DIR_LEN, mount);
+        symlink_cache_store(FIRST_PATH, mount->fs_type, mount->dev_id, -EINVAL, nullptr, FIRST_LEN);
+
+        VfsCachePerfSnapshot before_cached_noop_stat{};
+        VfsCachePerfSnapshot after_cached_noop_stat{};
+        vfs_get_cache_perf_snapshot(before_cached_noop_stat);
+        ok = ok && vfs_stat(FIRST_PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG);
+        vfs_get_cache_perf_snapshot(after_cached_noop_stat);
+        ok = ok && after_cached_noop_stat.symlink_misses == before_cached_noop_stat.symlink_misses;
+
+        vfs_cache_notify_path_changed(MISSING_PATH, nullptr);
+        symlink_prefix_cache_store(DIR_PATH, DIR_LEN, mount);
+        VfsCachePerfSnapshot before_missing_stat{};
+        VfsCachePerfSnapshot after_missing_stat{};
+        vfs_get_cache_perf_snapshot(before_missing_stat);
+        ok = ok && vfs_stat(MISSING_PATH, &st) == -ENOENT;
+        vfs_get_cache_perf_snapshot(after_missing_stat);
+        ok = ok && after_missing_stat.symlink_misses == before_missing_stat.symlink_misses;
+        ok = ok && existence_cache_lookup_mount(MISSING_PATH, mount, false, MISSING_LEN) == -ENOENT;
+
+        vfs_cache_notify_path_changed(DIR_PATH, nullptr);
+        symlink_prefix_cache_store(DIR_PARENT_PATH, DIR_PARENT_LEN, mount);
+        symlink_cache_store(DIR_PATH, mount->fs_type, mount->dev_id, -EINVAL, nullptr, DIR_LEN);
+        VfsCachePerfSnapshot before_cached_noop_dir_stat{};
+        VfsCachePerfSnapshot after_cached_noop_dir_stat{};
+        vfs_get_cache_perf_snapshot(before_cached_noop_dir_stat);
+        ok = ok && vfs_stat(DIR_TRAILING_PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFDIR);
+        vfs_get_cache_perf_snapshot(after_cached_noop_dir_stat);
+        ok = ok && after_cached_noop_dir_stat.symlink_misses == before_cached_noop_dir_stat.symlink_misses;
+
+        vfs_cache_notify_path_changed(DIR_PATH, nullptr);
+        symlink_prefix_cache_store(DIR_PARENT_PATH, DIR_PARENT_LEN, mount);
+        symlink_cache_store(DIR_PATH, mount->fs_type, mount->dev_id, -EINVAL, nullptr, DIR_LEN);
+        ker::mod::sched::task::Task dir_task{};
+        ok = ok && copy_path_string("/", dir_task.root.data(), dir_task.root.size()) == 0;
+        ok = ok && copy_path_string("/", dir_task.cwd.data(), dir_task.cwd.size()) == 0;
+        VfsCachePerfSnapshot before_cached_noop_dir_openat{};
+        VfsCachePerfSnapshot after_cached_noop_dir_openat{};
+        vfs_get_cache_perf_snapshot(before_cached_noop_dir_openat);
+        int const CACHED_NOOP_DIR_FD = vfs_openat(&dir_task, AT_FDCWD, DIR_TRAILING_PATH, 0, 0);
+        vfs_get_cache_perf_snapshot(after_cached_noop_dir_openat);
+        ok = ok && CACHED_NOOP_DIR_FD >= 0 && after_cached_noop_dir_openat.symlink_misses == before_cached_noop_dir_openat.symlink_misses;
+        if (CACHED_NOOP_DIR_FD >= 0) {
+            ok = (vfs_release_fd(&dir_task, CACHED_NOOP_DIR_FD) == 0) && ok;
+        }
+        ok = dir_task.fd_table.empty() && ok;
+
+        vfs_cache_notify_path_changed(FIRST_PATH, nullptr);
+        symlink_prefix_cache_store(DIR_PATH, DIR_LEN, mount);
+        symlink_cache_store(FIRST_PATH, mount->fs_type, mount->dev_id, -EINVAL, nullptr, FIRST_LEN);
+        ker::mod::sched::task::Task task{};
+        ok = ok && copy_path_string("/", task.root.data(), task.root.size()) == 0;
+        ok = ok && copy_path_string("/", task.cwd.data(), task.cwd.size()) == 0;
+        ok = ok && vfs_faccessat(&task, AT_FDCWD, FIRST_PATH, 0, 0) == 0;
+
+        vfs_cache_notify_path_changed(MISSING_PATH, nullptr);
+        symlink_prefix_cache_store(DIR_PATH, DIR_LEN, mount);
+        VfsCachePerfSnapshot before_missing_access{};
+        VfsCachePerfSnapshot after_missing_access{};
+        vfs_get_cache_perf_snapshot(before_missing_access);
+        ok = ok && vfs_faccessat(&task, AT_FDCWD, MISSING_PATH, 0, 0) == -ENOENT;
+        vfs_get_cache_perf_snapshot(after_missing_access);
+        ok = ok && after_missing_access.symlink_misses == before_missing_access.symlink_misses;
+        ok = ok && existence_cache_lookup_mount(MISSING_PATH, mount, false, MISSING_LEN) == -ENOENT;
+
+        vfs_cache_notify_path_changed(MISSING_PATH, nullptr);
+        symlink_prefix_cache_store(DIR_PATH, DIR_LEN, mount);
+        VfsCachePerfSnapshot before_missing_openat{};
+        VfsCachePerfSnapshot after_missing_openat{};
+        vfs_get_cache_perf_snapshot(before_missing_openat);
+        int const MISSING_FD = vfs_openat(&task, AT_FDCWD, MISSING_PATH, 0, 0);
+        vfs_get_cache_perf_snapshot(after_missing_openat);
+        ok = ok && MISSING_FD == -ENOENT && after_missing_openat.symlink_misses == before_missing_openat.symlink_misses;
+        ok = ok && existence_cache_lookup_mount(MISSING_PATH, mount, false, MISSING_LEN) == -ENOENT;
+
+        vfs_cache_notify_path_changed(MISSING_PATH, nullptr);
+        symlink_prefix_cache_store(DIR_PATH, DIR_LEN, mount);
+        VfsCachePerfSnapshot before_missing_open{};
+        VfsCachePerfSnapshot after_missing_open{};
+        vfs_get_cache_perf_snapshot(before_missing_open);
+        auto* missing_open = vfs_open_file(MISSING_PATH, 0, 0);
+        vfs_get_cache_perf_snapshot(after_missing_open);
+        ok = ok && missing_open == nullptr && after_missing_open.symlink_misses == before_missing_open.symlink_misses;
+        ok = ok && existence_cache_lookup_mount(MISSING_PATH, mount, false, MISSING_LEN) == -ENOENT;
+        if (missing_open != nullptr) {
+            vfs_put_file(missing_open);
+        }
+
+        vfs_cache_notify_path_changed(FIRST_PATH, nullptr);
+        symlink_prefix_cache_store(DIR_PATH, DIR_LEN, mount);
+        symlink_cache_store(FIRST_PATH, mount->fs_type, mount->dev_id, -EINVAL, nullptr, FIRST_LEN);
+        VfsCachePerfSnapshot before_cached_noop_openat{};
+        VfsCachePerfSnapshot after_cached_noop_openat{};
+        vfs_get_cache_perf_snapshot(before_cached_noop_openat);
+        int const CACHED_NOOP_FD = vfs_openat(&task, AT_FDCWD, FIRST_PATH, 0, 0);
+        vfs_get_cache_perf_snapshot(after_cached_noop_openat);
+        ok = ok && CACHED_NOOP_FD >= 0 && after_cached_noop_openat.symlink_misses == before_cached_noop_openat.symlink_misses;
+        if (CACHED_NOOP_FD >= 0) {
+            ok = (vfs_release_fd(&task, CACHED_NOOP_FD) == 0) && ok;
+        }
+
+        vfs_cache_notify_path_changed(DIR_PATH, nullptr);
+        symlink_prefix_cache_store(DIR_PARENT_PATH, DIR_PARENT_LEN, mount);
+        symlink_cache_store(DIR_PATH, mount->fs_type, mount->dev_id, -EINVAL, nullptr, DIR_LEN);
+        VfsCachePerfSnapshot before_cached_noop_dir_open{};
+        VfsCachePerfSnapshot after_cached_noop_dir_open{};
+        vfs_get_cache_perf_snapshot(before_cached_noop_dir_open);
+        auto* cached_noop_dir_open = vfs_open_file(DIR_TRAILING_PATH, 0, 0);
+        vfs_get_cache_perf_snapshot(after_cached_noop_dir_open);
+        ok = ok && cached_noop_dir_open != nullptr && cached_noop_dir_open->is_directory &&
+             after_cached_noop_dir_open.symlink_misses == before_cached_noop_dir_open.symlink_misses;
+        if (cached_noop_dir_open != nullptr) {
+            vfs_put_file(cached_noop_dir_open);
+        }
+
+        vfs_cache_notify_path_changed(FIRST_PATH, nullptr);
+        symlink_prefix_cache_store(DIR_PATH, DIR_LEN, mount);
+        symlink_cache_store(FIRST_PATH, mount->fs_type, mount->dev_id, -EINVAL, nullptr, FIRST_LEN);
+        auto* cached_noop_open = vfs_open_file(FIRST_PATH, 0, 0);
+        ok = ok && cached_noop_open != nullptr;
+        if (cached_noop_open != nullptr) {
+            vfs_put_file(cached_noop_open);
+        }
+
+        vfs_cache_notify_path_changed(FIRST_PATH, nullptr);
+        symlink_prefix_cache_store(DIR_PATH, DIR_LEN, mount);
+        symlink_cache_store(FIRST_PATH, mount->fs_type, mount->dev_id, -EINVAL, nullptr, FIRST_LEN);
+        Statvfs cached_noop_statvfs{};
+        VfsCachePerfSnapshot before_cached_noop_statvfs{};
+        VfsCachePerfSnapshot after_cached_noop_statvfs{};
+        vfs_get_cache_perf_snapshot(before_cached_noop_statvfs);
+        ok = ok && vfs_statvfs(FIRST_PATH, &cached_noop_statvfs) == 0;
+        vfs_get_cache_perf_snapshot(after_cached_noop_statvfs);
+        ok = ok && after_cached_noop_statvfs.symlink_misses == before_cached_noop_statvfs.symlink_misses;
+
+        vfs_cache_notify_path_changed(FIRST_PATH, nullptr);
+        symlink_prefix_cache_store(DIR_PATH, DIR_LEN, mount);
+        symlink_cache_store(FIRST_PATH, mount->fs_type, mount->dev_id, -EINVAL, nullptr, FIRST_LEN);
+        VfsCachePerfSnapshot before_cached_noop_chmod{};
+        VfsCachePerfSnapshot after_cached_noop_chmod{};
+        vfs_get_cache_perf_snapshot(before_cached_noop_chmod);
+        ok = ok && vfs_chmod(FIRST_PATH, 0600) == 0;
+        vfs_get_cache_perf_snapshot(after_cached_noop_chmod);
+        ok = ok && after_cached_noop_chmod.symlink_misses == before_cached_noop_chmod.symlink_misses;
+
+        vfs_cache_notify_path_changed(FIRST_PATH, nullptr);
+        symlink_prefix_cache_store(DIR_PATH, DIR_LEN, mount);
+        symlink_cache_store(FIRST_PATH, mount->fs_type, mount->dev_id, -EINVAL, nullptr, FIRST_LEN);
+        VfsCachePerfSnapshot before_cached_noop_utimens{};
+        VfsCachePerfSnapshot after_cached_noop_utimens{};
+        vfs_get_cache_perf_snapshot(before_cached_noop_utimens);
+        ok = ok && vfs_utimensat(AT_FDCWD, FIRST_PATH, nullptr, 0) == 0;
+        vfs_get_cache_perf_snapshot(after_cached_noop_utimens);
+        ok = ok && after_cached_noop_utimens.symlink_misses == before_cached_noop_utimens.symlink_misses;
+    }
+
+    ok = (vfs_unlink(FIRST_PATH) == 0) && ok;
+    ok = (vfs_unlink(SECOND_PATH) == 0) && ok;
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_procfs_fd_link_probe_gate() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* DIR_PATH = "/tmp/ktest_procfs_fd_probe_gate";
+    constexpr const char* FILE_PATH = "/tmp/ktest_procfs_fd_probe_gate/file";
+    constexpr size_t DIR_LEN = sizeof("/tmp/ktest_procfs_fd_probe_gate") - 1;
+    constexpr size_t FILE_LEN = sizeof("/tmp/ktest_procfs_fd_probe_gate/file") - 1;
+    constexpr const char* PROC_FD_PATH = "/proc/self/fd/0";
+    constexpr size_t PROC_FD_LEN = sizeof("/proc/self/fd/0") - 1;
+
+    vfs_unlink(FILE_PATH);
+    vfs_rmdir(DIR_PATH);
+    vfs_cache_notify_path_changed(DIR_PATH, nullptr);
+    bool ok = vfs_mkdir(DIR_PATH, 0755) == 0;
+
+    auto mount_ref = find_mount_point(FILE_PATH, FILE_LEN);
+    MountPoint const* mount = mount_ref.get();
+    ok = ok && mount != nullptr && mount->fs_type != FSType::PROCFS &&
+         (mount->fs_type == FSType::TMPFS || mount->fs_type == FSType::FAT32 || mount->fs_type == FSType::XFS);
+    if (mount != nullptr) {
+        vfs_cache_notify_path_changed(DIR_PATH, nullptr);
+        ok = ok && procfs_fd_link_prefix_probe_needed(FILE_PATH, FILE_LEN, mount);
+        symlink_prefix_cache_store(DIR_PATH, DIR_LEN, mount);
+        ok = ok && !procfs_fd_link_prefix_probe_needed(FILE_PATH, FILE_LEN, mount);
+    }
+
+    MountPoint proc_mount{};
+    proc_mount.path = "/proc";
+    proc_mount.path_len = sizeof("/proc") - 1;
+    proc_mount.fs_type = FSType::PROCFS;
+    proc_mount.dev_id = 123;
+    ok = ok && procfs_fd_link_prefix_probe_needed(PROC_FD_PATH, PROC_FD_LEN, &proc_mount);
+
+    ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
+    return ok;
+}
+
+auto vfs_selftest_packed_dirent_records() -> bool {
+    std::array<uint8_t, DIRENT_MIN_RECLEN * 4> buffer{};
+
+    DirEntry first = {};
+    first.d_ino = 11;
+    first.d_off = 12;
+    first.d_reclen = sizeof(DirEntry);
+    first.d_type = DT_DIR;
+    std::memcpy(first.d_name.data(), "cm", 3);
+
+    DirEntry second = {};
+    second.d_ino = 21;
+    second.d_off = 22;
+    second.d_reclen = sizeof(DirEntry);
+    second.d_type = DT_REG;
+    std::memcpy(second.d_name.data(), "configure", 10);
+
+    DirEntry presized = {};
+    presized.d_ino = 31;
+    presized.d_off = 32;
+    presized.d_reclen = static_cast<uint16_t>(align_dirent_record_size(DIRENT_HEADER_SIZE + 3 + 1));
+    presized.d_type = DT_REG;
+    std::memcpy(presized.d_name.data(), "xfs", 4);
+
+    size_t const FIRST_SIZE = dirent_packed_record_size(first);
+    size_t const SECOND_SIZE = dirent_packed_record_size(second);
+    size_t const PRESIZED_SIZE = dirent_packed_record_size(presized);
+    bool ok = FIRST_SIZE >= DIRENT_MIN_RECLEN && FIRST_SIZE < sizeof(DirEntry) && FIRST_SIZE % DIRENT_RECORD_ALIGNMENT == 0;
+    ok = ok && SECOND_SIZE >= DIRENT_MIN_RECLEN && SECOND_SIZE < sizeof(DirEntry) && SECOND_SIZE % DIRENT_RECORD_ALIGNMENT == 0;
+    ok = ok && PRESIZED_SIZE == presized.d_reclen;
+
+    size_t const WRITTEN_FIRST = copy_packed_dirent_record(first, buffer.data(), buffer.size());
+    size_t const WRITTEN_SECOND = copy_packed_dirent_record(second, buffer.data() + WRITTEN_FIRST, buffer.size() - WRITTEN_FIRST);
+    size_t const WRITTEN_PRESIZED =
+        copy_packed_dirent_record(presized, buffer.data() + WRITTEN_FIRST + WRITTEN_SECOND, buffer.size() - WRITTEN_FIRST - WRITTEN_SECOND);
+    ok = ok && WRITTEN_FIRST == FIRST_SIZE && WRITTEN_SECOND == SECOND_SIZE && WRITTEN_PRESIZED == PRESIZED_SIZE;
+
+    const auto* first_out = reinterpret_cast<const DirEntry*>(buffer.data());
+    const auto* second_out = reinterpret_cast<const DirEntry*>(buffer.data() + first_out->d_reclen);
+    const auto* presized_out = reinterpret_cast<const DirEntry*>(buffer.data() + first_out->d_reclen + second_out->d_reclen);
+    ok = ok && first_out->d_ino == first.d_ino && first_out->d_off == first.d_off && first_out->d_reclen == FIRST_SIZE &&
+         first_out->d_type == first.d_type && std::strcmp(first_out->d_name.data(), "cm") == 0;
+    ok = ok && second_out->d_ino == second.d_ino && second_out->d_off == second.d_off && second_out->d_reclen == SECOND_SIZE &&
+         second_out->d_type == second.d_type && std::strcmp(second_out->d_name.data(), "configure") == 0;
+    ok = ok && presized_out->d_ino == presized.d_ino && presized_out->d_off == presized.d_off && presized_out->d_reclen == PRESIZED_SIZE &&
+         presized_out->d_type == presized.d_type && std::strcmp(presized_out->d_name.data(), "xfs") == 0;
+
+    return ok;
 }
 
 auto vfs_selftest_fcntl_setfl_preserves_open_policy_flags() -> bool {
@@ -10862,6 +18547,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
     int const ACCMODE = flags & 3;
     bool const PATH_REQUIRES_DIRECTORY = resolve_task_path && path_requires_directory(path);
     bool const FLAGS_REQUIRE_DIRECTORY = (flags & ker::vfs::O_DIRECTORY) != 0;
+    bool const OPEN_REQUIRE_DIRECTORY = PATH_REQUIRES_DIRECTORY || FLAGS_REQUIRE_DIRECTORY;
     if (FLAGS_REQUIRE_DIRECTORY && (flags & ker::vfs::O_CREAT) != 0) {
         return nullptr;
     }
@@ -10871,70 +18557,115 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
     }
 
     char pathBuffer[MAX_PATH_LEN];  // NOLINT
+    size_t path_buffer_len = UNKNOWN_PATH_LEN;
+    uint64_t path_buffer_hash = UNKNOWN_PATH_HASH;
     if (resolve_task_path) {
-        if (resolve_task_path_raw_impl(path, pathBuffer, MAX_PATH_LEN, !OPEN_LOCAL) < 0) {
+        if (resolve_task_path_raw_impl(path, pathBuffer, MAX_PATH_LEN, !OPEN_LOCAL, &path_buffer_len, &path_buffer_hash) < 0) {
             return nullptr;
         }
 
         // attach before the backend open can find a mount point.
         ensure_wki_host_root_mount(pathBuffer);
-    } else if (copy_path_string(path, pathBuffer, sizeof(pathBuffer)) < 0) {
+    } else if (copy_path_string(path, pathBuffer, sizeof(pathBuffer), UNKNOWN_PATH_LEN, &path_buffer_len) < 0) {
         return nullptr;
     }
+    if (path_buffer_hash == UNKNOWN_PATH_HASH && vfs_open_missing_metadata_cacheable(flags)) {
+        path_buffer_hash = metadata_path_hash_known_len(pathBuffer, path_buffer_len);
+    }
 
-    auto mount_ref = find_mount_point(pathBuffer);
+    auto mount_ref = find_mount_point(pathBuffer, path_buffer_len);
     MountPoint const* mount = mount_ref.get();
     bool const REMOTE_MOUNT = mount != nullptr && mount->fs_type == FSType::REMOTE;
-    bool const SKIP_FINAL_SYMLINK_PROBE = mount != nullptr && !REMOTE_MOUNT && !PATH_REQUIRES_DIRECTORY && !FLAGS_REQUIRE_DIRECTORY &&
-                                          metadata_cache_proves_final_not_symlink(pathBuffer, mount->fs_type, mount->dev_id);
+    bool path_changed_by_symlink = false;
+    uint64_t metadata_store_epoch_before_symlink = 0;
+    int const CACHED_MISSING_RESULT =
+        vfs_open_missing_metadata_result(pathBuffer, mount, flags, OPEN_REQUIRE_DIRECTORY, path_buffer_len, path_buffer_hash);
+    if (CACHED_MISSING_RESULT != -EAGAIN) {
+        return nullptr;
+    }
+    bool const CREATE_TARGET_KNOWN_MISSING =
+        mount != nullptr && !REMOTE_MOUNT && (backend_flags & ker::vfs::O_CREAT) != 0 && !OPEN_REQUIRE_DIRECTORY &&
+        existence_cache_lookup_negative_mount(pathBuffer, mount, false, path_buffer_len, path_buffer_hash) == -ENOENT;
+    bool const SKIP_FINAL_SYMLINK_PROBE =
+        CREATE_TARGET_KNOWN_MISSING || (mount != nullptr && !REMOTE_MOUNT &&
+                                        metadata_cache_proves_final_not_symlink(pathBuffer, mount->fs_type, mount->dev_id, path_buffer_len,
+                                                                                &path_buffer_len, path_buffer_hash));
+    bool const EXCLUSIVE_XFS_CREATE = mount != nullptr && mount->fs_type == FSType::XFS && (backend_flags & ker::vfs::O_CREAT) != 0 &&
+                                      (flags & ker::vfs::O_EXCL) != 0 && !OPEN_REQUIRE_DIRECTORY;
+    bool const FINAL_SYMLINK_PROBE_NOT_NEEDED = SKIP_FINAL_SYMLINK_PROBE || EXCLUSIVE_XFS_CREATE;
+    bool const PARENT_SYMLINK_PREFIX_KNOWN_NOOP =
+        mount != nullptr && !REMOTE_MOUNT && symlink_prefix_cache_covers_parent(pathBuffer, path_buffer_len, mount);
+    bool const SYMLINK_RESOLUTION_KNOWN_NOOP = FINAL_SYMLINK_PROBE_NOT_NEEDED && PARENT_SYMLINK_PREFIX_KNOWN_NOOP;
+    if (mount != nullptr && !REMOTE_MOUNT && vfs_open_missing_metadata_cacheable(flags) && metadata_cacheable_fs(mount->fs_type)) {
+        metadata_store_epoch_before_symlink = g_metadata_store_observation_epoch.load(std::memory_order_acquire);
+    }
     if (!REMOTE_MOUNT) {
-        auto* fd_link_file = vfs_try_open_procfs_fd_link(pathBuffer, apply_task_policy && !OPEN_LOCAL);
+        auto* fd_link_file = vfs_try_open_procfs_fd_link(pathBuffer, apply_task_policy && !OPEN_LOCAL, mount, path_buffer_len);
         if (fd_link_file != nullptr) {
-            if (PATH_REQUIRES_DIRECTORY || FLAGS_REQUIRE_DIRECTORY) {
+            if (OPEN_REQUIRE_DIRECTORY) {
                 vfs_put_file(fd_link_file);
                 return nullptr;
             }
             return fd_link_file;
         }
     }
-    if (!REMOTE_MOUNT) {
+    if (!SYMLINK_RESOLUTION_KNOWN_NOOP && PARENT_SYMLINK_PREFIX_KNOWN_NOOP && vfs_open_missing_metadata_cacheable(flags)) {
+        int const EXISTENCE_RESULT =
+            vfs_pre_symlink_negative_existence_result(pathBuffer, mount, true, OPEN_REQUIRE_DIRECTORY, path_buffer_len, path_buffer_hash);
+        if (EXISTENCE_RESULT != -EAGAIN) {
+            return nullptr;
+        }
+    }
+    if (!REMOTE_MOUNT && !SYMLINK_RESOLUTION_KNOWN_NOOP) {
         char resolved[MAX_PATH_LEN];  // NOLINT
-        int const RESOLVE_RET =
-            resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy && !OPEN_LOCAL, !SKIP_FINAL_SYMLINK_PROBE);
+        size_t resolved_len = path_buffer_len;
+        int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, sizeof(resolved), apply_task_policy && !OPEN_LOCAL,
+                                                 !FINAL_SYMLINK_PROBE_NOT_NEEDED, path_buffer_len, &resolved_len);
+        if (RESOLVE_RET < 0) {
+            return nullptr;
+        }
         if (RESOLVE_RET == 0) {
-            std::memcpy(pathBuffer, resolved, MAX_PATH_LEN);
+            path_changed_by_symlink = !path_text_equal(pathBuffer, path_buffer_len, resolved, resolved_len);
+            if (path_changed_by_symlink) {
+                int const COPY_RET = copy_path_string(resolved, pathBuffer, sizeof(pathBuffer), resolved_len);
+                if (COPY_RET < 0) {
+                    return nullptr;
+                }
+                path_buffer_hash = UNKNOWN_PATH_HASH;
+            }
+            path_buffer_len = resolved_len;
         }
 
-        mount_ref = find_mount_point(pathBuffer);
-        mount = mount_ref.get();
+        if (path_changed_by_symlink) {
+            mount_ref = find_mount_point(pathBuffer, path_buffer_len);
+            mount = mount_ref.get();
+        }
+        bool const MISSING_METADATA_OBSERVED_DURING_SYMLINK =
+            metadata_store_epoch_before_symlink != 0 &&
+            g_metadata_store_observation_epoch.load(std::memory_order_acquire) != metadata_store_epoch_before_symlink;
+        if (path_changed_by_symlink || MISSING_METADATA_OBSERVED_DURING_SYMLINK) {
+            int const SYMLINK_CACHED_MISSING_RESULT =
+                vfs_open_missing_metadata_result(pathBuffer, mount, flags, OPEN_REQUIRE_DIRECTORY, path_buffer_len, path_buffer_hash);
+            if (SYMLINK_CACHED_MISSING_RESULT != -EAGAIN) {
+                return nullptr;
+            }
+        }
     }
 
     if (mount == nullptr) {
         return nullptr;
     }
 
-    // Strip mount prefix
-    const char* fs_relative_path = pathBuffer;
-    size_t mount_len = 0;
-    while (mount->path[mount_len] != '\0') {
-        mount_len++;
-    }
-
-    if (mount_len > 0 && pathBuffer[mount_len - 1] == '/' && mount_len == 1) {
-        fs_relative_path = pathBuffer + 1;
-    } else if (pathBuffer[mount_len] == '/') {
-        fs_relative_path = pathBuffer + mount_len + 1;
-    } else if (pathBuffer[mount_len] == '\0') {
-        fs_relative_path = "";
-    } else {
-        fs_relative_path = pathBuffer + mount_len;
-    }
+    const char* fs_relative_path = strip_mount_prefix(mount, pathBuffer);
+    size_t const FS_RELATIVE_PATH_LEN = strip_mount_prefix_len(mount, pathBuffer, path_buffer_len);
 
     if (mount->read_only && open_flags_require_fs_write(backend_flags)) {
         return nullptr;
     }
+    vfs_apply_xfs_known_absent_hint(pathBuffer, mount, flags, OPEN_REQUIRE_DIRECTORY, path_buffer_len, path_buffer_hash, backend_flags);
 
     File* f = nullptr;
+    int backend_open_result = -ENOSYS;
 
     switch (mount->fs_type) {
         case FSType::DEVFS:
@@ -10953,7 +18684,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
             }
             break;
         case FSType::TMPFS:
-            f = ker::vfs::tmpfs::tmpfs_open_path(tmpfs_root_for_mount(mount), fs_relative_path, backend_flags, mode);
+            f = ker::vfs::tmpfs::tmpfs_open_path(tmpfs_root_for_mount(mount), fs_relative_path, backend_flags, mode, &backend_open_result);
             if (f != nullptr) {
                 f->fops = ker::vfs::tmpfs::get_tmpfs_fops();
                 f->fs_type = FSType::TMPFS;
@@ -10964,7 +18695,8 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
             break;
         case FSType::XFS:
             f = ker::vfs::xfs::xfs_open_path(fs_relative_path, backend_flags, mode,
-                                             static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+                                             static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), &backend_open_result,
+                                             FS_RELATIVE_PATH_LEN, OPEN_REQUIRE_DIRECTORY);
             if (f != nullptr) {
                 f->fops = ker::vfs::xfs::get_xfs_fops();
                 f->fs_type = FSType::XFS;
@@ -10985,7 +18717,9 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
         f = create_synthetic_mount_dir_file(pathBuffer, mount->fs_type);
     }
 
-    if (f != nullptr && (PATH_REQUIRES_DIRECTORY || FLAGS_REQUIRE_DIRECTORY) && !f->is_directory) {
+    if (f != nullptr && OPEN_REQUIRE_DIRECTORY && !f->is_directory) {
+        vfs_open_store_missing_metadata_result(pathBuffer, mount, flags, OPEN_REQUIRE_DIRECTORY, -ENOTDIR, path_buffer_len,
+                                               path_buffer_hash);
         vfs_destroy_file(f);
         return nullptr;
     }
@@ -11001,18 +18735,30 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
     // Store the absolute VFS path for mount-overlay directory listing
     if (f != nullptr) {
         static_cast<void>(vfs_file_set_path(f, pathBuffer));
+        f->mount_dev_id = mount->dev_id;
+        f->mount_generation = mount_table_generation_snapshot();
         f->dir_fs_count = static_cast<size_t>(-1);
-        f->open_flags = flags;
+        f->open_flags = public_open_flags(flags);
         f->fd_flags = 0;
         if (open_create_should_invalidate_metadata(f, backend_flags)) {
             vfs_cache_notify_path_changed(pathBuffer, nullptr);
             metadata_cache_mark_file_data_observed(f);
+            if (f->created_by_open) {
+                metadata_cache_mark_file_data_close_refresh_path_current(f);
+                metadata_cache_schedule_file_data_close_refresh(f);
+            }
         }
         if ((flags & ker::vfs::O_NO_CACHE) != 0) {
             vfs_cache_notify_path_changed(f->vfs_path, nullptr);
         }
         vfs_cache_notify_register_open_file(f);
-        file_stat_snapshot_refresh(f);
+        if (!file_stat_snapshot_promote_created_open_prefill(f)) {
+            file_stat_snapshot_refresh(f);
+        }
+        metadata_cache_store_opened_file_stat_or_hints(f, mount);
+    } else {
+        vfs_open_store_missing_metadata_result(pathBuffer, mount, flags, OPEN_REQUIRE_DIRECTORY, backend_open_result, path_buffer_len,
+                                               path_buffer_hash);
     }
 
     return f;
@@ -11333,22 +19079,14 @@ auto vfs_shutdown_sync() -> int { return vfs_sync(); }
 
 auto vfs_shutdown_unmount_all(const char* root_path) -> int { return shutdown_unmount_all_exact(root_path); }
 
-auto vfs_link(const char* oldpath, const char* newpath) -> int {
-    if (oldpath == nullptr || newpath == nullptr) {
+namespace {
+auto vfs_link_resolved_paths(const char* old_abs_path, const char* new_abs_path) -> int {
+    if (old_abs_path == nullptr || new_abs_path == nullptr) {
         return -EINVAL;
     }
 
-    std::array<char, MAX_PATH_LEN> old_buf{};
-    std::array<char, MAX_PATH_LEN> new_buf{};
-    if (resolve_task_path_raw(oldpath, old_buf.data(), old_buf.size()) < 0) {
-        return -ENAMETOOLONG;
-    }
-    if (resolve_task_path_raw(newpath, new_buf.data(), new_buf.size()) < 0) {
-        return -ENAMETOOLONG;
-    }
-
-    auto old_mount_ref = find_mount_point(old_buf.data());
-    auto new_mount_ref = find_mount_point(new_buf.data());
+    auto old_mount_ref = find_mount_point(old_abs_path);
+    auto new_mount_ref = find_mount_point(new_abs_path);
     MountPoint const* old_mount = old_mount_ref.get();
     MountPoint const* new_mount = new_mount_ref.get();
     if ((old_mount == nullptr) || (new_mount == nullptr)) {
@@ -11365,13 +19103,28 @@ auto vfs_link(const char* oldpath, const char* newpath) -> int {
         return -EPERM;
     }
 
+    if (old_mount->fs_type == FSType::XFS) {
+        const char* old_fs = strip_mount_prefix(old_mount, old_abs_path);
+        const char* new_fs = strip_mount_prefix(new_mount, new_abs_path);
+        size_t const OLD_FS_LEN = strip_mount_prefix_len(old_mount, old_abs_path, UNKNOWN_PATH_LEN);
+        size_t const NEW_FS_LEN = strip_mount_prefix_len(new_mount, new_abs_path, UNKNOWN_PATH_LEN);
+        Stat link_stat{};
+        int const RET = ker::vfs::xfs::xfs_link_path(old_fs, new_fs, static_cast<ker::vfs::xfs::XfsMountContext*>(old_mount->private_data),
+                                                     &link_stat, OLD_FS_LEN, NEW_FS_LEN);
+        if (RET == 0) {
+            vfs_cache_notify_path_changed(old_abs_path, new_abs_path);
+            metadata_cache_store_known_path_stat_on_current_mount(new_abs_path, new_mount, link_stat);
+        }
+        return RET;
+    }
+
     if (old_mount->fs_type != FSType::TMPFS) {
         return -ENOSYS;
     }
 
     // --- tmpfs hard link ---
-    const char* old_fs = strip_mount_prefix(old_mount, old_buf.data());
-    const char* new_fs = strip_mount_prefix(new_mount, new_buf.data());
+    const char* old_fs = strip_mount_prefix(old_mount, old_abs_path);
+    const char* new_fs = strip_mount_prefix(new_mount, new_abs_path);
 
     // Look up the source node
     auto* src_node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(old_mount), old_fs, false);
@@ -11435,8 +19188,67 @@ auto vfs_link(const char* oldpath, const char* newpath) -> int {
     }
 
     metadata_cache_note_path_changed("/", nullptr);
-    vfs_cache_notify_path_changed(old_buf.data(), new_buf.data());
+    vfs_cache_notify_path_changed(old_abs_path, new_abs_path);
     return 0;
+}
+}  // namespace
+
+auto vfs_link(const char* oldpath, const char* newpath) -> int {
+    if (oldpath == nullptr || newpath == nullptr) {
+        return -EINVAL;
+    }
+
+    std::array<char, MAX_PATH_LEN> old_buf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> new_buf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    auto* task = ker::mod::sched::get_current_task();
+    if (task_absolute_local_path_fast_path_allowed(task, oldpath, nullptr)) {
+        int const COPY_RET = copy_path_string(oldpath, old_buf.data(), old_buf.size());
+        if (COPY_RET < 0) {
+            return COPY_RET;
+        }
+    } else if (resolve_task_path_raw(oldpath, old_buf.data(), old_buf.size()) < 0) {
+        return -ENAMETOOLONG;
+    }
+    if (task_absolute_local_path_fast_path_allowed(task, newpath, nullptr)) {
+        int const COPY_RET = copy_path_string(newpath, new_buf.data(), new_buf.size());
+        if (COPY_RET < 0) {
+            return COPY_RET;
+        }
+    } else if (resolve_task_path_raw(newpath, new_buf.data(), new_buf.size()) < 0) {
+        return -ENAMETOOLONG;
+    }
+
+    return vfs_link_resolved_paths(old_buf.data(), new_buf.data());
+}
+
+auto vfs_linkat(ker::mod::sched::task::Task* task, int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags) -> int {
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (oldpath == nullptr || newpath == nullptr) {
+        return -EINVAL;
+    }
+    if (oldpath[0] == '\0' || newpath[0] == '\0') {
+        return -ENOENT;
+    }
+    if ((flags & ~AT_SYMLINK_FOLLOW) != 0) {
+        return -EINVAL;
+    }
+
+    std::array<char, MAX_PATH_LEN> old_resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> new_resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    int result = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, olddirfd, oldpath, old_resolved.data(),
+                                                                           old_resolved.size(), true, nullptr);
+    if (result < 0) {
+        return result;
+    }
+    result = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, newdirfd, newpath, new_resolved.data(), new_resolved.size(),
+                                                                       true, nullptr);
+    if (result < 0) {
+        return result;
+    }
+
+    return vfs_link_resolved_paths(old_resolved.data(), new_resolved.data());
 }
 
 auto vfs_is_pipe_file(const File* f) -> bool {

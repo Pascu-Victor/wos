@@ -14,6 +14,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/usercopy.hpp>
+#include <utility>
 #include <vfs/epoll.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
@@ -25,18 +26,28 @@ namespace ker::syscall::vfs {
 using ker::abi::vfs::ops;
 
 namespace {
+// Match libc's DIR refill size while keeping stack use small relative to the
+// 512 KiB syscall kernel stack.
+constexpr size_t READ_DIR_STACK_BUFFER_SIZE = size_t{16} * 1024;
+constexpr size_t READLINK_STACK_BUFFER_SIZE = 512;
+constexpr size_t REALPATH_STACK_BUFFER_SIZE = 512;
+
 template <typename T>
-auto copy_value_to_user(T* user_ptr, T value) -> int {
+auto copy_value_to_user_for_task(ker::mod::sched::task::Task* task, T* user_ptr, const T& value) -> int {
     if (user_ptr == nullptr) {
         return 0;
     }
 
-    auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr || task->pagemap == nullptr) {
         return -EFAULT;
     }
 
     return ker::mod::sys::usercopy::copy_value_to_task(*task, reinterpret_cast<uint64_t>(user_ptr), value) ? 0 : -EFAULT;
+}
+
+template <typename T>
+auto copy_value_to_user(T* user_ptr, const T& value) -> int {
+    return copy_value_to_user_for_task(ker::mod::sched::get_current_task(), user_ptr, value);
 }
 
 auto copy_buffer_to_user(void* user_ptr, const void* src, size_t size) -> int {
@@ -69,14 +80,15 @@ auto copy_value_from_user(const T* user_ptr, T* out) -> int {
     return ker::mod::sys::usercopy::copy_value_from_task(*task, reinterpret_cast<uint64_t>(user_ptr), *out) ? 0 : -EFAULT;
 }
 
-auto copy_stat_result_to_user(int result, ker::vfs::Stat* user_statbuf, const ker::vfs::Stat& kernel_statbuf) -> int64_t {
+auto copy_stat_result_to_user_for_task(ker::mod::sched::task::Task* task, int result, ker::vfs::Stat* user_statbuf,
+                                       const ker::vfs::Stat& kernel_statbuf) -> int64_t {
     if (result < 0) {
         return static_cast<int64_t>(result);
     }
     if (user_statbuf == nullptr) {
         return -EFAULT;
     }
-    if (int const COPY_RET = copy_value_to_user(user_statbuf, kernel_statbuf); COPY_RET < 0) {
+    if (int const COPY_RET = copy_value_to_user_for_task(task, user_statbuf, kernel_statbuf); COPY_RET < 0) {
         return static_cast<int64_t>(COPY_RET);
     }
     return static_cast<int64_t>(result);
@@ -149,15 +161,7 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (task == nullptr) {
                 return -ESRCH;
             }
-            if (DIRFD == ker::vfs::AT_FDCWD) {
-                return static_cast<int64_t>(ker::vfs::vfs_open(pathname, FLAGS, MODE));
-            }
-            std::array<char, 512> resolved{};
-            int const RES = ker::vfs::vfs_resolve_dirfd(task, DIRFD, pathname, resolved.data(), resolved.size());
-            if (RES < 0) {
-                return static_cast<int64_t>(RES);
-            }
-            return static_cast<int64_t>(ker::vfs::vfs_open(resolved.data(), FLAGS, MODE));
+            return static_cast<int64_t>(ker::vfs::vfs_openat(task, DIRFD, pathname, FLAGS, MODE));
         }
         case ops::READ: {
             int const FD = static_cast<int>(a1);
@@ -220,28 +224,31 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             int const FD = static_cast<int>(a1);
             void* buffer = reinterpret_cast<void*>(a2);
             auto max_size = static_cast<size_t>(a3);
-            if (buffer == nullptr || max_size < sizeof(ker::vfs::DirEntry)) {
+            if (buffer == nullptr || max_size < ker::vfs::DIRENT_MIN_RECLEN) {
                 return static_cast<int64_t>(ker::vfs::vfs_read_dir_entries(FD, buffer, max_size));
             }
-            auto* kernel_buffer = new (std::nothrow) uint8_t[max_size];
-            if (kernel_buffer == nullptr) {
-                return -ENOMEM;
-            }
-            ssize_t const RET = ker::vfs::vfs_read_dir_entries(FD, kernel_buffer, max_size);
-            if (RET < 0) {
-                delete[] kernel_buffer;
-                return static_cast<int64_t>(RET);
-            }
-            if (RET > 0) {
-                int const COPY_RET = copy_buffer_to_user(buffer, kernel_buffer, static_cast<size_t>(RET));
-                delete[] kernel_buffer;
-                if (COPY_RET < 0) {
-                    return static_cast<int64_t>(COPY_RET);
+
+            std::array<uint8_t, READ_DIR_STACK_BUFFER_SIZE> stack_buffer;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+            auto* user_buffer = static_cast<uint8_t*>(buffer);
+            size_t total = 0;
+            while (max_size - total >= ker::vfs::DIRENT_MIN_RECLEN) {
+                size_t const CHUNK_SIZE = std::min(stack_buffer.size(), max_size - total);
+                ssize_t const RET = ker::vfs::vfs_read_dir_entries(FD, stack_buffer.data(), CHUNK_SIZE);
+                if (RET < 0) {
+                    return total > 0 ? static_cast<int64_t>(total) : static_cast<int64_t>(RET);
                 }
-            } else {
-                delete[] kernel_buffer;
+                if (RET == 0) {
+                    break;
+                }
+
+                int const COPY_RET = copy_buffer_to_user(user_buffer + total, stack_buffer.data(), static_cast<size_t>(RET));
+                if (COPY_RET < 0) {
+                    return total > 0 ? static_cast<int64_t>(total) : static_cast<int64_t>(COPY_RET);
+                }
+
+                total += static_cast<size_t>(RET);
             }
-            return static_cast<int64_t>(RET);
+            return static_cast<int64_t>(total);
         }
         case ops::MOUNT: {
             const auto* source = reinterpret_cast<const char*>(a1);
@@ -258,6 +265,13 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             int const RET = ker::vfs::vfs_mkdir(path, MODE);
             return static_cast<int64_t>(RET);
         }
+        case ops::MKDIRAT: {
+            int const DIRFD = static_cast<int>(a1);
+            const auto* pathname = reinterpret_cast<const char*>(a2);
+            int const MODE = static_cast<int>(a3);
+            auto* task = ker::mod::sched::get_current_task();
+            return static_cast<int64_t>(ker::vfs::vfs_mkdirat(task, DIRFD, pathname, MODE));
+        }
         case ops::READLINK: {
             const auto* path = reinterpret_cast<const char*>(a1);
             auto* buf = reinterpret_cast<char*>(a2);
@@ -265,27 +279,85 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (buf == nullptr || bufsize == 0) {
                 return static_cast<int64_t>(ker::vfs::vfs_readlink(path, buf, bufsize));
             }
-            auto* kernel_buf = new (std::nothrow) char[bufsize];
-            if (kernel_buf == nullptr) {
-                return -ENOMEM;
+
+            std::array<char, READLINK_STACK_BUFFER_SIZE> stack_buf{};
+            char* kernel_buf = stack_buf.data();
+            bool heap_allocated = false;
+            size_t read_size = std::min(bufsize, stack_buf.size());
+            ssize_t ret = ker::vfs::vfs_readlink(path, kernel_buf, read_size);
+            if (std::cmp_greater_equal(ret, read_size) && bufsize > read_size) {
+                kernel_buf = new (std::nothrow) char[bufsize];
+                if (kernel_buf == nullptr) {
+                    return -ENOMEM;
+                }
+                heap_allocated = true;
+                read_size = bufsize;
+                ret = ker::vfs::vfs_readlink(path, kernel_buf, read_size);
             }
-            ssize_t const RET = ker::vfs::vfs_readlink(path, kernel_buf, bufsize);
-            if (RET > 0) {
-                int const COPY_RET = copy_buffer_to_user(buf, kernel_buf, static_cast<size_t>(RET));
-                delete[] kernel_buf;
+
+            if (ret > 0) {
+                int const COPY_RET = copy_buffer_to_user(buf, kernel_buf, static_cast<size_t>(ret));
+                if (heap_allocated) {
+                    delete[] kernel_buf;
+                }
                 if (COPY_RET < 0) {
                     return static_cast<int64_t>(COPY_RET);
                 }
-            } else {
+            } else if (heap_allocated) {
                 delete[] kernel_buf;
             }
-            return static_cast<int64_t>(RET);
+            return static_cast<int64_t>(ret);
+        }
+        case ops::READLINKAT: {
+            int const DIRFD = static_cast<int>(a1);
+            const auto* pathname = reinterpret_cast<const char*>(a2);
+            auto* buf = reinterpret_cast<char*>(a3);
+            auto bufsize = static_cast<size_t>(a4);
+            auto* task = ker::mod::sched::get_current_task();
+            if (buf == nullptr || bufsize == 0) {
+                return static_cast<int64_t>(ker::vfs::vfs_readlinkat(task, DIRFD, pathname, buf, bufsize));
+            }
+
+            std::array<char, READLINK_STACK_BUFFER_SIZE> stack_buf{};
+            char* kernel_buf = stack_buf.data();
+            bool heap_allocated = false;
+            size_t read_size = std::min(bufsize, stack_buf.size());
+            ssize_t ret = ker::vfs::vfs_readlinkat(task, DIRFD, pathname, kernel_buf, read_size);
+            if (std::cmp_greater_equal(ret, read_size) && bufsize > read_size) {
+                kernel_buf = new (std::nothrow) char[bufsize];
+                if (kernel_buf == nullptr) {
+                    return -ENOMEM;
+                }
+                heap_allocated = true;
+                read_size = bufsize;
+                ret = ker::vfs::vfs_readlinkat(task, DIRFD, pathname, kernel_buf, read_size);
+            }
+
+            if (ret > 0) {
+                int const COPY_RET = copy_buffer_to_user(buf, kernel_buf, static_cast<size_t>(ret));
+                if (heap_allocated) {
+                    delete[] kernel_buf;
+                }
+                if (COPY_RET < 0) {
+                    return static_cast<int64_t>(COPY_RET);
+                }
+            } else if (heap_allocated) {
+                delete[] kernel_buf;
+            }
+            return static_cast<int64_t>(ret);
         }
         case ops::SYMLINK: {
             const auto* target = reinterpret_cast<const char*>(a1);
             const auto* linkpath = reinterpret_cast<const char*>(a2);
             int const RET = ker::vfs::vfs_symlink(target, linkpath);
             return static_cast<int64_t>(RET);
+        }
+        case ops::SYMLINKAT: {
+            const auto* target = reinterpret_cast<const char*>(a1);
+            int const DIRFD = static_cast<int>(a2);
+            const auto* linkpath = reinterpret_cast<const char*>(a3);
+            auto* task = ker::mod::sched::get_current_task();
+            return static_cast<int64_t>(ker::vfs::vfs_symlinkat(task, target, DIRFD, linkpath));
         }
         case ops::SENDFILE: {
             int const OUTFD = static_cast<int>(a1);
@@ -311,27 +383,74 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
         case ops::STAT: {
             const auto* path = reinterpret_cast<const char*>(a1);
             auto* statbuf = reinterpret_cast<ker::vfs::Stat*>(a2);
-            ker::vfs::Stat kernel_statbuf{};
-            int const RET = ker::vfs::vfs_stat(path, &kernel_statbuf);
-            return copy_stat_result_to_user(RET, statbuf, kernel_statbuf);
+            ker::vfs::Stat kernel_statbuf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+            auto* task = ker::mod::sched::get_current_task();
+            int const RET = task != nullptr ? ker::vfs::vfs_statat(task, ker::vfs::AT_FDCWD, path, 0, &kernel_statbuf)
+                                            : ker::vfs::vfs_stat(path, &kernel_statbuf);
+            return copy_stat_result_to_user_for_task(task, RET, statbuf, kernel_statbuf);
         }
         case ops::LSTAT: {
             const auto* path = reinterpret_cast<const char*>(a1);
             auto* statbuf = reinterpret_cast<ker::vfs::Stat*>(a2);
-            ker::vfs::Stat kernel_statbuf{};
-            int const RET = ker::vfs::vfs_lstat(path, &kernel_statbuf);
-            return copy_stat_result_to_user(RET, statbuf, kernel_statbuf);
+            ker::vfs::Stat kernel_statbuf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+            auto* task = ker::mod::sched::get_current_task();
+            int const RET = task != nullptr
+                                ? ker::vfs::vfs_statat(task, ker::vfs::AT_FDCWD, path, ker::vfs::AT_SYMLINK_NOFOLLOW, &kernel_statbuf)
+                                : ker::vfs::vfs_lstat(path, &kernel_statbuf);
+            return copy_stat_result_to_user_for_task(task, RET, statbuf, kernel_statbuf);
         }
         case ops::FSTAT: {
             int const FD = static_cast<int>(a1);
             auto* statbuf = reinterpret_cast<ker::vfs::Stat*>(a2);
-            ker::vfs::Stat kernel_statbuf{};
-            int const RET = ker::vfs::vfs_fstat(FD, &kernel_statbuf);
-            return copy_stat_result_to_user(RET, statbuf, kernel_statbuf);
+            ker::vfs::Stat kernel_statbuf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+            auto* task = ker::mod::sched::get_current_task();
+            int ret = -ESRCH;
+            if (task != nullptr) {
+                ret = ker::vfs::vfs_fstat_snapshot_fast(task, FD, &kernel_statbuf);
+                if (ret == -EAGAIN) {
+                    auto* file = ker::vfs::vfs_get_file_retain(task, FD);
+                    if (file == nullptr) {
+                        ret = -EBADF;
+                    } else {
+                        ret = ker::vfs::vfs_fstat_file(file, &kernel_statbuf);
+                        ker::vfs::vfs_put_file(file);
+                    }
+                } else {
+                    // The fast path returns only a complete cached stat result
+                    // or a terminal fd/task error.
+                }
+            }
+            int const RET = ret;
+            return copy_stat_result_to_user_for_task(task, RET, statbuf, kernel_statbuf);
+        }
+        case ops::FSTAT_CLOSE: {
+            int const FD = static_cast<int>(a1);
+            auto* statbuf = reinterpret_cast<ker::vfs::Stat*>(a2);
+            auto* stat_result_out = reinterpret_cast<int*>(a3);
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return -ESRCH;
+            }
+            if (statbuf == nullptr || stat_result_out == nullptr ||
+                !ker::mod::sys::usercopy::ensure_writable(*task, a2, sizeof(ker::vfs::Stat)) ||
+                !ker::mod::sys::usercopy::ensure_writable(*task, a3, sizeof(int))) {
+                return -EFAULT;
+            }
+
+            ker::vfs::Stat kernel_statbuf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+            int stat_result = -EIO;
+            int const CLOSE_RESULT = ker::vfs::vfs_fstat_close_for_task(task, FD, &kernel_statbuf, &stat_result);
+            if (stat_result == 0) {
+                if (int const COPY_RET = copy_value_to_user_for_task(task, statbuf, kernel_statbuf); COPY_RET < 0) {
+                    return COPY_RET;
+                }
+            }
+            if (int const COPY_RET = copy_value_to_user_for_task(task, stat_result_out, stat_result); COPY_RET < 0) {
+                return COPY_RET;
+            }
+            return static_cast<int64_t>(CLOSE_RESULT);
         }
         case ops::STATAT: {
-            constexpr int AT_SYMLINK_NOFOLLOW_FLAG = 0x100;
-            constexpr int AT_EMPTY_PATH_FLAG = 0x1000;
             int const DIRFD = static_cast<int>(a1);
             const auto* pathname = reinterpret_cast<const char*>(a2);
             auto* statbuf = reinterpret_cast<ker::vfs::Stat*>(a3);
@@ -339,36 +458,13 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (pathname == nullptr || statbuf == nullptr) {
                 return -EFAULT;
             }
-            ker::vfs::Stat kernel_statbuf{};
-            if ((FLAGS & AT_EMPTY_PATH_FLAG) != 0 && pathname[0] == '\0') {
-                int const RET = ker::vfs::vfs_fstat(DIRFD, &kernel_statbuf);
-                return copy_stat_result_to_user(RET, statbuf, kernel_statbuf);
-            }
+            ker::vfs::Stat kernel_statbuf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
                 return -ESRCH;
             }
-            if (DIRFD == ker::vfs::AT_FDCWD) {
-                int ret = 0;
-                if ((FLAGS & AT_SYMLINK_NOFOLLOW_FLAG) != 0) {
-                    ret = ker::vfs::vfs_lstat(pathname, &kernel_statbuf);
-                } else {
-                    ret = ker::vfs::vfs_stat(pathname, &kernel_statbuf);
-                }
-                return copy_stat_result_to_user(ret, statbuf, kernel_statbuf);
-            }
-            std::array<char, 512> resolved{};
-            int const RES = ker::vfs::vfs_resolve_dirfd(task, DIRFD, pathname, resolved.data(), resolved.size());
-            if (RES < 0) {
-                return static_cast<int64_t>(RES);
-            }
-            int ret = 0;
-            if ((FLAGS & AT_SYMLINK_NOFOLLOW_FLAG) != 0) {
-                ret = ker::vfs::vfs_lstat(resolved.data(), &kernel_statbuf);
-            } else {
-                ret = ker::vfs::vfs_stat(resolved.data(), &kernel_statbuf);
-            }
-            return copy_stat_result_to_user(ret, statbuf, kernel_statbuf);
+            int const RET = ker::vfs::vfs_statat(task, DIRFD, pathname, FLAGS, &kernel_statbuf);
+            return copy_stat_result_to_user_for_task(task, RET, statbuf, kernel_statbuf);
         }
         case ops::UTIMENSAT: {
             int const DIRFD = static_cast<int>(a1);
@@ -409,13 +505,13 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
         case ops::GETCWD: {
             auto* buf = reinterpret_cast<char*>(a1);
             auto size = static_cast<size_t>(a2);
-            std::array<char, ker::mod::sched::task::Task::CWD_MAX> kernel_buf{};
-            int const RET = ker::vfs::vfs_getcwd(kernel_buf.data(), size);
+            std::array<char, ker::mod::sched::task::Task::CWD_MAX> kernel_buf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+            size_t len = 0;
+            int const RET = ker::vfs::vfs_getcwd(kernel_buf.data(), size, &len);
             if (RET < 0) {
                 return static_cast<int64_t>(RET);
             }
-            size_t const LEN = std::strlen(kernel_buf.data()) + 1;
-            if (int const COPY_RET = copy_buffer_to_user(buf, kernel_buf.data(), LEN); COPY_RET < 0) {
+            if (int const COPY_RET = copy_buffer_to_user(buf, kernel_buf.data(), len + 1); COPY_RET < 0) {
                 return COPY_RET;
             }
             return static_cast<int64_t>(RET);
@@ -424,9 +520,18 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             const auto* path = reinterpret_cast<const char*>(a1);
             return static_cast<int64_t>(ker::vfs::vfs_chdir(path));
         }
+        case ops::FCHDIR: {
+            int const FD = static_cast<int>(a1);
+            auto* task = ker::mod::sched::get_current_task();
+            return static_cast<int64_t>(ker::vfs::vfs_fchdir(task, FD));
+        }
         case ops::ACCESS: {
             const auto* path = reinterpret_cast<const char*>(a1);
             int const MODE = static_cast<int>(a2);
+            auto* task = ker::mod::sched::get_current_task();
+            if (task != nullptr) {
+                return static_cast<int64_t>(ker::vfs::vfs_faccessat(task, ker::vfs::AT_FDCWD, path, MODE, 0));
+            }
             return static_cast<int64_t>(ker::vfs::vfs_access(path, MODE));
         }
         case ops::UNLINK: {
@@ -496,6 +601,14 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             int const MODE = static_cast<int>(a2);
             return static_cast<int64_t>(ker::vfs::vfs_fchmod(FD, MODE));
         }
+        case ops::FCHMODAT: {
+            int const DIRFD = static_cast<int>(a1);
+            const auto* pathname = reinterpret_cast<const char*>(a2);
+            int const MODE = static_cast<int>(a3);
+            int const FLAGS = static_cast<int>(a4);
+            auto* task = ker::mod::sched::get_current_task();
+            return static_cast<int64_t>(ker::vfs::vfs_fchmodat(task, DIRFD, pathname, MODE, FLAGS));
+        }
         case ops::CHOWN: {
             const auto* path = reinterpret_cast<const char*>(a1);
             auto owner = static_cast<uint32_t>(a2);
@@ -508,48 +621,29 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto group = static_cast<uint32_t>(a3);
             return static_cast<int64_t>(ker::vfs::vfs_fchown(FD, owner, group));
         }
+        case ops::FCHOWNAT: {
+            int const DIRFD = static_cast<int>(a1);
+            const auto* pathname = reinterpret_cast<const char*>(a2);
+            auto owner = static_cast<uint32_t>(a3);
+            auto group = static_cast<uint32_t>(a4);
+            int const FLAGS = static_cast<int>(a5);
+            auto* task = ker::mod::sched::get_current_task();
+            return static_cast<int64_t>(ker::vfs::vfs_fchownat(task, DIRFD, pathname, owner, group, FLAGS));
+        }
         case ops::FACCESSAT: {
             int const DIRFD = static_cast<int>(a1);
             const auto* pathname = reinterpret_cast<const char*>(a2);
             int const MODE = static_cast<int>(a3);
-            // Resolve dirfd-relative path
+            int const FLAGS = static_cast<int>(a4);
             auto* task = ker::mod::sched::get_current_task();
-            if (task == nullptr) {
-                return -ESRCH;
-            }
-            if (DIRFD == ker::vfs::AT_FDCWD) {
-                return static_cast<int64_t>(ker::vfs::vfs_access(pathname, MODE));
-            }
-            std::array<char, 512> resolved{};
-            int const RES = ker::vfs::vfs_resolve_dirfd(task, DIRFD, pathname, resolved.data(), resolved.size());
-            if (RES < 0) {
-                return static_cast<int64_t>(RES);
-            }
-            return static_cast<int64_t>(ker::vfs::vfs_access(resolved.data(), MODE));
+            return static_cast<int64_t>(ker::vfs::vfs_faccessat(task, DIRFD, pathname, MODE, FLAGS));
         }
         case ops::UNLINKAT: {
             int const DIRFD = static_cast<int>(a1);
             const auto* pathname = reinterpret_cast<const char*>(a2);
             int const FLAGS = static_cast<int>(a3);
             auto* task = ker::mod::sched::get_current_task();
-            if (task == nullptr) {
-                return -ESRCH;
-            }
-            if (DIRFD == ker::vfs::AT_FDCWD) {
-                if ((FLAGS & 0x200) != 0) {  // AT_REMOVEDIR
-                    return static_cast<int64_t>(ker::vfs::vfs_rmdir(pathname));
-                }
-                return static_cast<int64_t>(ker::vfs::vfs_unlink(pathname));
-            }
-            std::array<char, 512> resolved{};
-            int const RES = ker::vfs::vfs_resolve_dirfd(task, DIRFD, pathname, resolved.data(), resolved.size());
-            if (RES < 0) {
-                return static_cast<int64_t>(RES);
-            }
-            if ((FLAGS & 0x200) != 0) {  // AT_REMOVEDIR
-                return static_cast<int64_t>(ker::vfs::vfs_rmdir(resolved.data()));
-            }
-            return static_cast<int64_t>(ker::vfs::vfs_unlink(resolved.data()));
+            return static_cast<int64_t>(ker::vfs::vfs_unlinkat(task, DIRFD, pathname, FLAGS));
         }
         case ops::RENAMEAT: {
             int const OLDDIRFD = static_cast<int>(a1);
@@ -557,23 +651,7 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             int const NEWDIRFD = static_cast<int>(a3);
             const auto* newpath = reinterpret_cast<const char*>(a4);
             auto* task = ker::mod::sched::get_current_task();
-            if (task == nullptr) {
-                return -ESRCH;
-            }
-            if (OLDDIRFD == ker::vfs::AT_FDCWD && NEWDIRFD == ker::vfs::AT_FDCWD) {
-                return static_cast<int64_t>(ker::vfs::vfs_rename(oldpath, newpath));
-            }
-            std::array<char, 512> resolved_old{};
-            std::array<char, 512> resolved_new{};
-            int res = ker::vfs::vfs_resolve_dirfd(task, OLDDIRFD, oldpath, resolved_old.data(), resolved_old.size());
-            if (res < 0) {
-                return static_cast<int64_t>(res);
-            }
-            res = ker::vfs::vfs_resolve_dirfd(task, NEWDIRFD, newpath, resolved_new.data(), resolved_new.size());
-            if (res < 0) {
-                return static_cast<int64_t>(res);
-            }
-            return static_cast<int64_t>(ker::vfs::vfs_rename(resolved_old.data(), resolved_new.data()));
+            return static_cast<int64_t>(ker::vfs::vfs_renameat(task, OLDDIRFD, oldpath, NEWDIRFD, newpath));
         }
         case ops::EPOLL_CREATE: {
             int const FLAGS = static_cast<int>(a1);
@@ -662,6 +740,15 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             const auto* newpath = reinterpret_cast<const char*>(a2);
             return static_cast<int64_t>(ker::vfs::vfs_link(oldpath, newpath));
         }
+        case ops::LINKAT: {
+            int const OLDDIRFD = static_cast<int>(a1);
+            const auto* oldpath = reinterpret_cast<const char*>(a2);
+            int const NEWDIRFD = static_cast<int>(a3);
+            const auto* newpath = reinterpret_cast<const char*>(a4);
+            int const FLAGS = static_cast<int>(a5);
+            auto* task = ker::mod::sched::get_current_task();
+            return static_cast<int64_t>(ker::vfs::vfs_linkat(task, OLDDIRFD, oldpath, NEWDIRFD, newpath, FLAGS));
+        }
         case ops::WKI_RULE_ADD: {
             const auto* prefix = reinterpret_cast<const char*>(a1);
             auto route = static_cast<uint32_t>(a2);
@@ -710,18 +797,33 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (buf == nullptr || bufsize == 0) {
                 return static_cast<int64_t>(ker::vfs::vfs_realpath(path, buf, bufsize));
             }
-            auto* kernel_buf = new (std::nothrow) char[bufsize];
-            if (kernel_buf == nullptr) {
-                return -ENOMEM;
+
+            std::array<char, REALPATH_STACK_BUFFER_SIZE> stack_buf{};
+            char* kernel_buf = stack_buf.data();
+            bool heap_allocated = false;
+            size_t kernel_bufsize = std::min(bufsize, stack_buf.size());
+            size_t len = 0;
+            int ret = ker::vfs::vfs_realpath(path, kernel_buf, kernel_bufsize, &len);
+            if (ret == -ERANGE && bufsize > kernel_bufsize) {
+                kernel_buf = new (std::nothrow) char[bufsize];
+                if (kernel_buf == nullptr) {
+                    return -ENOMEM;
+                }
+                heap_allocated = true;
+                kernel_bufsize = bufsize;
+                ret = ker::vfs::vfs_realpath(path, kernel_buf, kernel_bufsize, &len);
             }
-            int const RET = ker::vfs::vfs_realpath(path, kernel_buf, bufsize);
+            int const RET = ret;
             if (RET < 0) {
-                delete[] kernel_buf;
+                if (heap_allocated) {
+                    delete[] kernel_buf;
+                }
                 return static_cast<int64_t>(RET);
             }
-            size_t const LEN = std::strlen(kernel_buf) + 1;
-            int const COPY_RET = copy_buffer_to_user(buf, kernel_buf, LEN);
-            delete[] kernel_buf;
+            int const COPY_RET = copy_buffer_to_user(buf, kernel_buf, len + 1);
+            if (heap_allocated) {
+                delete[] kernel_buf;
+            }
             if (COPY_RET < 0) {
                 return static_cast<int64_t>(COPY_RET);
             }

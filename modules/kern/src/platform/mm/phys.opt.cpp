@@ -41,6 +41,10 @@ namespace ker::vfs::tmpfs {
 auto tmpfs_reclaim_pages(size_t target_pages) -> size_t;
 }
 
+namespace ker::vfs {
+auto reclaim_clean_buffer_cache_for_pressure(size_t byte_budget) -> size_t;
+}
+
 namespace ker::mod::mm::phys {
 
 namespace {
@@ -77,6 +81,9 @@ constexpr size_t MAX_ZONE_LOOKUP_ENTRIES = 128;
 std::array<ZoneLookupEntry, MAX_ZONE_LOOKUP_ENTRIES> regular_zone_lookup{};
 size_t regular_zone_lookup_count = 0;
 bool regular_zone_lookup_ready = false;
+constexpr size_t PAGE_ALLOC_BUFFER_RECLAIM_MIN_BYTES = size_t{8} * 1024 * 1024;
+constexpr size_t PAGE_ALLOC_BUFFER_RECLAIM_MAX_BYTES = size_t{64} * 1024 * 1024;
+constexpr uint64_t PAGE_ALLOC_RECLAIM_RESERVE_BYTES = uint64_t{256} * 1024 * 1024;
 
 // Per-CPU caches (initialized in init())
 PerCpuPageCache* per_cpu_caches = nullptr;
@@ -1462,6 +1469,13 @@ auto can_wait_for_reclaim() -> bool {
     return sched::has_run_queues() && sched::preempt_count() == 0 && sched::interrupts_enabled();
 }
 
+auto page_alloc_buffer_reclaim_budget(uint64_t requested_pages) -> size_t {
+    uint64_t const REQUEST_BYTES = requested_pages * paging::PAGE_SIZE;
+    uint64_t const BUDGET =
+        std::clamp<uint64_t>(REQUEST_BYTES * 16, PAGE_ALLOC_BUFFER_RECLAIM_MIN_BYTES, PAGE_ALLOC_BUFFER_RECLAIM_MAX_BYTES);
+    return static_cast<size_t>(BUDGET);
+}
+
 auto page_alloc_with_reclaim_impl(uint64_t size, std::string_view name, ReturnedPageZeroing zeroing, void* caller_addr,
                                   uint32_t retry_count) -> void* {
     uint64_t requested_pages = 0;
@@ -1469,16 +1483,24 @@ auto page_alloc_with_reclaim_impl(uint64_t size, std::string_view name, Returned
         return nullptr;
     }
 
+    bool const CAN_RECLAIM = can_wait_for_reclaim();
+    if (CAN_RECLAIM && !page_alloc_can_satisfy(size, PAGE_ALLOC_RECLAIM_RESERVE_BYTES)) {
+        static_cast<void>(ker::vfs::reclaim_clean_buffer_cache_for_pressure(PAGE_ALLOC_BUFFER_RECLAIM_MAX_BYTES));
+    }
+
     for (uint32_t attempt = 0; attempt < retry_count; ++attempt) {
         void* const PAGE = page_alloc_impl(size, name, zeroing, caller_addr, false);
         if (PAGE != nullptr) {
             return PAGE;
         }
-        if (!can_wait_for_reclaim()) {
+        if (!CAN_RECLAIM) {
             break;
         }
         uint32_t const RECLAIMED = sched::reclaim_memory_pressure();
         if (RECLAIMED == 0) {
+            if (ker::vfs::reclaim_clean_buffer_cache_for_pressure(page_alloc_buffer_reclaim_budget(requested_pages)) != 0) {
+                continue;
+            }
             if (ker::vfs::tmpfs::tmpfs_reclaim_pages(32) != 0) {
                 continue;
             }
@@ -1510,6 +1532,10 @@ void write_hex_field(const char* label, uint64_t value) {
 
 auto page_alloc(uint64_t size, std::string_view name) -> void* {
     return page_alloc_impl(size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), true);
+}
+
+auto page_alloc_full_overwrite(uint64_t size, std::string_view name) -> void* {
+    return page_alloc_impl(size, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0), true);
 }
 
 auto page_alloc_full_overwrite_page(std::string_view name) -> void* {

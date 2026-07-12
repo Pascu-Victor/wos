@@ -70,6 +70,12 @@ Options:
                          Rewrite https://github.com/ to PATH/ directly;
                          iteration-only for WOS file:// upload-pack debugging
   --mirror-http-prefix U  Rewrite https://github.com/ to an HTTP mirror prefix
+  --checkout-workers N    Set Git checkout.workers during clone/submodule timing
+                         for controlled parallel-checkout experiments
+  --host-toolchain PATH   Reuse an existing Linux host toolchain for a valid
+                         --skip-bootstrap configure of a fresh checkout
+  --host-sysroot PATH     Matching populated WOS sysroot for --host-toolchain
+                         (default: <host-toolchain>/../sysroot)
   -h, --help              Show this help
 
 Direct GitHub cloning is the default and is the acceptance-path check. Mirror
@@ -123,6 +129,9 @@ full_history="${WOS_SELFHOST_FULL_HISTORY:-0}"
 mirror_file="${WOS_SELFHOST_MIRROR_FILE:-}"
 mirror_local_path="${WOS_SELFHOST_MIRROR_LOCAL_PATH:-}"
 mirror_http_prefix="${WOS_SELFHOST_MIRROR_HTTP_PREFIX:-}"
+checkout_workers="${WOS_SELFHOST_CHECKOUT_WORKERS:-}"
+host_toolchain="${WOS_SELFHOST_HOST_TOOLCHAIN:-}"
+host_sysroot="${WOS_SELFHOST_HOST_SYSROOT:-}"
 source_cache="${WOS_SELFHOST_SOURCE_CACHE:-}"
 distdir="${WOS_SELFHOST_DISTDIR:-}"
 clean_path="${WOS_SELFHOST_CLEAN_PATH:-}"
@@ -139,6 +148,7 @@ checkout="$workdir/wos"
 report="$workdir/selfhost-report.tsv"
 detail_report="$workdir/selfhost-detail.tsv"
 bootstrap_detail_report="$workdir/bootstrap-detail.tsv"
+cache_diag_report="$workdir/selfhost-cache-deltas.tsv"
 history_file="${WOS_SELFHOST_HISTORY_FILE:-}"
 log_dir="${WOS_SELFHOST_LOG_DIR:-}"
 total_elapsed=0
@@ -170,6 +180,9 @@ sanitize_selfhost_environment() {
 }
 
 sanitize_selfhost_environment
+if [ "$mode" = "wos" ]; then
+    export WOS_NATIVE_HOST=1
+fi
 
 reset_selfhost_priority_with_helper() {
     if ! command -v clang >/dev/null 2>&1; then
@@ -517,6 +530,136 @@ write_timing_header() {
     fi
 }
 
+write_cache_diag_header() {
+    local output="$1"
+
+    if [ ! -s "$output" ]; then
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "run_id" "timestamp_utc" "mode" "phase" "label" \
+            "record" "key" "before" "after" "delta" >> "$output"
+    fi
+}
+
+capture_wos_cache_snapshot() {
+    local phase="$1"
+    local label="$2"
+    local marker="$3"
+
+    if [ "$mode" != "wos" ] || [ ! -e /proc/memacc/alloc_totals ]; then
+        return 0
+    fi
+
+    local output
+    output="$(log_path_for diag "${phase}-${label}-${marker}")"
+    sed -n '/^buffer_cache /p;/^vfs_cache /p;/^xfs_dentry_cache /p' /proc/memacc/alloc_totals > "$output" 2>/dev/null || true
+    printf '%s\n' "$output"
+}
+
+record_wos_cache_delta() {
+    local phase="$1"
+    local label="$2"
+    local before="$3"
+    local after="$4"
+
+    if [ "$mode" != "wos" ] || [ -z "$before" ] || [ -z "$after" ] || [ ! -s "$before" ] || [ ! -s "$after" ]; then
+        return 0
+    fi
+
+    python3 - "$cache_diag_report" "$run_id" "$(timestamp_utc)" "$mode" "$phase" "$label" "$before" "$after" <<'PY' || true
+import sys
+
+output, run_id, timestamp, mode, phase, label, before_path, after_path = sys.argv[1:]
+tracked = {
+    "buffer_cache": (
+        "hits",
+        "misses",
+        "dirty_buffers",
+        "dirty_bytes",
+        "dirty_waiters",
+        "disk_read_calls",
+        "disk_read_bytes",
+        "metadata_disk_read_calls",
+        "metadata_disk_read_bytes",
+        "data_disk_read_calls",
+        "data_disk_read_bytes",
+        "range_copy_attempts",
+        "range_copy_cover_hits",
+        "range_copy_overlap_hits",
+        "range_copy_no_state",
+        "range_copy_no_overlap",
+        "range_copy_incomplete",
+        "range_copy_overflow",
+        "range_copy_degraded",
+    ),
+    "vfs_cache": (
+        "metadata_hits",
+        "metadata_misses",
+        "metadata_stores",
+        "metadata_miss_empty",
+        "metadata_miss_invalidated",
+        "metadata_miss_stale_generation",
+        "metadata_miss_conflict",
+        "metadata_path_invalidations",
+        "metadata_generation_resets",
+        "existence_hits",
+        "existence_misses",
+        "existence_stores",
+        "symlink_hits",
+        "symlink_misses",
+        "symlink_stores",
+        "fstat_snapshot_hits",
+        "fstat_snapshot_misses",
+        "fstat_snapshot_stores",
+        "fstat_snapshot_miss_uncacheable",
+        "fstat_snapshot_miss_empty",
+        "fstat_snapshot_miss_generation",
+        "fstat_snapshot_miss_invalidated",
+    ),
+    "xfs_dentry_cache": (
+        "hits",
+        "misses",
+        "stores",
+        "invalidations",
+    ),
+}
+
+
+def parse(path):
+    rows = {}
+    with open(path, "r", encoding="utf-8") as file:
+        for line in file:
+            fields = line.strip().split()
+            if not fields:
+                continue
+            record = fields[0]
+            values = {}
+            for field in fields[1:]:
+                if "=" not in field:
+                    continue
+                key, value = field.split("=", 1)
+                try:
+                    values[key] = int(value, 0)
+                except ValueError:
+                    continue
+            rows[record] = values
+    return rows
+
+
+before = parse(before_path)
+after = parse(after_path)
+with open(output, "a", encoding="utf-8") as file:
+    for record, keys in tracked.items():
+        before_row = before.get(record, {})
+        after_row = after.get(record, {})
+        for key in keys:
+            if key not in before_row or key not in after_row:
+                continue
+            old = before_row[key]
+            new = after_row[key]
+            print(run_id, timestamp, mode, phase, label, record, key, old, new, new - old, sep="\t", file=file)
+PY
+}
+
 record_timing() {
     local phase="$1"
     local label="$2"
@@ -545,16 +688,20 @@ run_timed_event() {
     log "start $phase $label log=$output"
     local start end elapsed status
     local phase_heartbeat_pid
-    start="$(now_ms)"
+    local cache_before cache_after
+    cache_before="$(capture_wos_cache_snapshot "$phase" "$label" "before")"
     start_log_heartbeat "$phase" "$label" "$output"
     phase_heartbeat_pid="$heartbeat_pid"
+    start="$(now_ms)"
     set +e
     "$@" >"$output" 2>&1
     status=$?
     set -e
-    stop_log_heartbeat "$phase_heartbeat_pid"
     end="$(now_ms)"
+    stop_log_heartbeat "$phase_heartbeat_pid"
     elapsed=$((end - start))
+    cache_after="$(capture_wos_cache_snapshot "$phase" "$label" "after")"
+    record_wos_cache_delta "$phase" "$label" "$cache_before" "$cache_after"
 
     if [ "$status" -eq 0 ]; then
         record_timing "$phase" "$label" "$elapsed" "ok"
@@ -575,6 +722,17 @@ require_tool() {
 }
 
 validate_runtime_settings() {
+    if [ -n "$host_toolchain" ]; then
+        if [ ! -x "$host_toolchain/bin/clang" ] || [ ! -x "$host_toolchain/bin/cmake" ]; then
+            echo "ERROR: WOS_SELFHOST_HOST_TOOLCHAIN must contain bin/clang and bin/cmake: $host_toolchain" >&2
+            exit 1
+        fi
+        if [ -z "$host_sysroot" ] || [ ! -f "$host_sysroot/lib/Scrt1.o" ] || [ ! -f "$host_sysroot/lib/libc.a" ]; then
+            echo "ERROR: WOS_SELFHOST_HOST_SYSROOT must contain lib/Scrt1.o and lib/libc.a: $host_sysroot" >&2
+            exit 1
+        fi
+    fi
+
     if [ -n "$distdir" ] && [ ! -d "$distdir" ]; then
         echo "ERROR: WOS_SELFHOST_DISTDIR must name an existing directory: $distdir" >&2
         exit 1
@@ -690,16 +848,20 @@ time_step() {
     log "start $name log=$output"
     local start end elapsed status
     local step_heartbeat_pid
-    start="$(now_ms)"
+    local cache_before cache_after
+    cache_before="$(capture_wos_cache_snapshot step "$name" "before")"
     start_log_heartbeat "step" "$name" "$output"
     step_heartbeat_pid="$heartbeat_pid"
+    start="$(now_ms)"
     set +e
     "$@" >"$output" 2>&1
     status=$?
     set -e
-    stop_log_heartbeat "$step_heartbeat_pid"
     end="$(now_ms)"
+    stop_log_heartbeat "$step_heartbeat_pid"
     elapsed=$((end - start))
+    cache_after="$(capture_wos_cache_snapshot step "$name" "after")"
+    record_wos_cache_delta step "$name" "$cache_before" "$cache_after"
     total_elapsed=$((total_elapsed + elapsed))
     printf '%s\t%s\n' "$name" "$elapsed" >> "$report"
     if [ "$status" -eq 0 ]; then
@@ -786,11 +948,17 @@ safe_prepare_workdir() {
     mkdir -p "$log_dir"
     : > "$report"
     : > "$detail_report"
+    : > "$cache_diag_report"
     write_timing_header "$detail_report"
     write_timing_header "$history_file"
+    write_cache_diag_header "$cache_diag_report"
 }
 
 configure_git_mirror() {
+    if [ -n "$checkout_workers" ]; then
+        git config --global checkout.workers "$checkout_workers"
+    fi
+
     if [ -n "$mirror_file" ]; then
         git config --global protocol.file.allow always
         git config --global "url.file://$mirror_file/".insteadOf https://github.com/
@@ -993,14 +1161,38 @@ bootstrap_toolchain() {
     )
 }
 
+configure_cmake_command() {
+    if [ "$mode" = "linux" ] && [ -n "$host_toolchain" ]; then
+        printf '%s\n' "$host_toolchain/bin/cmake"
+        return
+    fi
+    command -v cmake
+}
+
+warm_configure_tools() {
+    local cmake_command
+    cmake_command="$(configure_cmake_command)"
+
+    "$cmake_command" --version >/dev/null
+    ninja --version >/dev/null
+    log "warmed configure tools: cmake=$cmake_command ninja=$(command -v ninja)"
+}
+
 configure_wos() {
-    local cmake_args=(cmake -GNinja
+    local cmake_command
+    cmake_command="$(configure_cmake_command)"
+    local cmake_args=("$cmake_command" -GNinja
         -S "$checkout" \
         -B "$checkout/$build_dir" \
         -DWOS_BUILD_WOSDBG=OFF \
         -DWOS_BUILD_HOST_TOOLS=OFF \
         -DWOS_BUILD_CMAKE_FOR_HOST=OFF \
+        -DWOS_USE_CCACHE=OFF \
         -DWOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN=ON)
+    if [ -n "$host_toolchain" ]; then
+        cmake_args+=("-DWOS_HOST_TOOLCHAIN_PATH=$host_toolchain")
+        cmake_args+=("-DWOS_SYSROOT_PATH=$host_sysroot")
+    fi
     if [ "$mode" = "wos" ]; then
         cmake_args+=(-DWOS_BUILD_DISK_IMAGES=OFF)
     fi
@@ -1121,6 +1313,9 @@ log "repo=$repo"
 log "workdir=$workdir"
 log "detail_report=$detail_report"
 log "bootstrap_detail_report=$bootstrap_detail_report"
+log "cache_diag_report=$cache_diag_report"
+log "host_toolchain=$host_toolchain"
+log "host_sysroot=$host_sysroot"
 log "history_file=$history_file"
 log "log_dir=$log_dir"
 log "target=$target"
@@ -1128,9 +1323,14 @@ log "git_http_low_speed=${git_http_low_speed_limit}Bps/${git_http_low_speed_time
 log "heartbeat=${heartbeat_interval}s tail=${heartbeat_tail} stall_snapshots=${heartbeat_stall_snapshots} sync=${heartbeat_sync}"
 time_step clone_sources clone_sources
 time_step bootstrap_toolchain bootstrap_toolchain
+warm_configure_tools
 time_step configure_wos configure_wos
 time_step build_wos build_wos
-verify_artifacts
+if [ "$skip_bootstrap" = "1" ]; then
+    log "skip toolchain artifact verification: WOS_SELFHOST_SKIP_BOOTSTRAP=1"
+else
+    verify_artifacts
+fi
 printf '%s\t%s\n' "total" "$total_elapsed" >> "$report"
 record_timing "step" "total" "$total_elapsed" "ok"
 log "report=$report"
@@ -1157,6 +1357,9 @@ run_local() {
         WOS_SELFHOST_MIRROR_FILE="$mirror_file" \
         WOS_SELFHOST_MIRROR_LOCAL_PATH="$mirror_local_path" \
         WOS_SELFHOST_MIRROR_HTTP_PREFIX="$mirror_http_prefix" \
+        WOS_SELFHOST_CHECKOUT_WORKERS="$checkout_workers" \
+        WOS_SELFHOST_HOST_TOOLCHAIN="$host_toolchain" \
+        WOS_SELFHOST_HOST_SYSROOT="$host_sysroot" \
         WOS_SELFHOST_SOURCE_CACHE="$source_cache" \
         WOS_SELFHOST_DISTDIR="$distdir" \
         WOS_SELFHOST_HEARTBEAT_INTERVAL="$heartbeat_interval" \
@@ -1184,6 +1387,9 @@ run_wos_local() {
         WOS_SELFHOST_MIRROR_FILE="$mirror_file" \
         WOS_SELFHOST_MIRROR_LOCAL_PATH="$mirror_local_path" \
         WOS_SELFHOST_MIRROR_HTTP_PREFIX="$mirror_http_prefix" \
+        WOS_SELFHOST_CHECKOUT_WORKERS="$checkout_workers" \
+        WOS_SELFHOST_HOST_TOOLCHAIN="$host_toolchain" \
+        WOS_SELFHOST_HOST_SYSROOT="$host_sysroot" \
         WOS_SELFHOST_SOURCE_CACHE="$source_cache" \
         WOS_SELFHOST_DISTDIR="$distdir" \
         WOS_SELFHOST_HEARTBEAT_INTERVAL="$heartbeat_interval" \
@@ -1214,6 +1420,9 @@ run_wos() {
     remote_env+=" WOS_SELFHOST_MIRROR_FILE=$(shell_quote "$mirror_file")"
     remote_env+=" WOS_SELFHOST_MIRROR_LOCAL_PATH=$(shell_quote "$mirror_local_path")"
     remote_env+=" WOS_SELFHOST_MIRROR_HTTP_PREFIX=$(shell_quote "$mirror_http_prefix")"
+    remote_env+=" WOS_SELFHOST_CHECKOUT_WORKERS=$(shell_quote "$checkout_workers")"
+    remote_env+=" WOS_SELFHOST_HOST_TOOLCHAIN=$(shell_quote "$host_toolchain")"
+    remote_env+=" WOS_SELFHOST_HOST_SYSROOT=$(shell_quote "$host_sysroot")"
     remote_env+=" WOS_SELFHOST_SOURCE_CACHE=$(shell_quote "$source_cache")"
     remote_env+=" WOS_SELFHOST_DISTDIR=$(shell_quote "$distdir")"
     remote_env+=" WOS_SELFHOST_HEARTBEAT_INTERVAL=$(shell_quote "$heartbeat_interval")"
@@ -1256,6 +1465,9 @@ full_history=0
 mirror_file=""
 mirror_local_path=""
 mirror_http_prefix=""
+checkout_workers=""
+host_toolchain=""
+host_sysroot=""
 source_cache=""
 distdir=""
 heartbeat_interval="30"
@@ -1332,6 +1544,21 @@ while (($# > 0)); do
             [ -n "$mirror_http_prefix" ] || die "--mirror-http-prefix requires a value"
             shift
             ;;
+        --checkout-workers)
+            checkout_workers="${2:-}"
+            [[ "$checkout_workers" =~ ^[1-9][0-9]*$ ]] || die "--checkout-workers requires a positive integer"
+            shift
+            ;;
+        --host-toolchain)
+            host_toolchain="${2:-}"
+            [ -n "$host_toolchain" ] || die "--host-toolchain requires a value"
+            shift
+            ;;
+        --host-sysroot)
+            host_sysroot="${2:-}"
+            [ -n "$host_sysroot" ] || die "--host-sysroot requires a value"
+            shift
+            ;;
         --source-cache)
             source_cache="${2:-}"
             [ -n "$source_cache" ] || die "--source-cache requires a value"
@@ -1394,6 +1621,10 @@ if [ -z "$workdir" ]; then
     esac
 fi
 
+if [ "$mode" = "linux" ] && [ -n "$host_toolchain" ] && [ -z "$host_sysroot" ]; then
+    host_sysroot="$(dirname "$host_toolchain")/sysroot"
+fi
+
 reject_whitespace "--host" "$host"
 reject_whitespace "--repo" "$repo"
 reject_whitespace "--workdir" "$workdir"
@@ -1404,6 +1635,8 @@ reject_whitespace "--log-dir" "$log_dir"
 reject_whitespace "--mirror-file" "$mirror_file"
 reject_whitespace "--mirror-local-path" "$mirror_local_path"
 reject_whitespace "--mirror-http-prefix" "$mirror_http_prefix"
+reject_whitespace "--host-toolchain" "$host_toolchain"
+reject_whitespace "--host-sysroot" "$host_sysroot"
 reject_whitespace "--source-cache" "$source_cache"
 
 case "$mode" in

@@ -24,6 +24,11 @@ struct DirEntry {
     std::array<char, DIRENT_NAME_MAX> d_name;  // Filename (null-terminated)
 };
 
+constexpr size_t DIRENT_HEADER_SIZE = offsetof(DirEntry, d_name);
+constexpr size_t DIRENT_RECORD_ALIGNMENT = alignof(DirEntry);
+constexpr size_t DIRENT_MIN_RECLEN =
+    ((DIRENT_HEADER_SIZE + 1 + DIRENT_RECORD_ALIGNMENT - 1) / DIRENT_RECORD_ALIGNMENT) * DIRENT_RECORD_ALIGNMENT;
+
 // Directory entry types
 constexpr uint8_t DT_UNKNOWN = 0;
 constexpr uint8_t DT_FIFO = 1;   // FIFO

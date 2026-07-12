@@ -66,7 +66,7 @@ Notes:
   serve-http exposes repositories as:
     http://HOST:PORT/cgi-bin/git/OWNER/REPO.git
 
-  If WOS cannot reach the host HTTP port, use sync-file-mirror and the file
+  If WOS cannot reach the host HTTP port, use sync-file-mirror and the local-path
   rewrite printed at the end. That copies the bare mirror repositories only,
   not the live workspace, and still avoids GitHub completely. By default
   sync-file-mirror only replaces paths under /tmp or /var/tmp; pass
@@ -666,7 +666,7 @@ EOF
             [ -n "$path" ] || die "print-wos-config file requires PATH"
             cat <<EOF
 git config --global protocol.file.allow always
-git config --global url.file://$path/.insteadOf https://github.com/
+git config --global url.$path/.insteadOf https://github.com/
 EOF
             ;;
         *)

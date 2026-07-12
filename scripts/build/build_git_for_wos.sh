@@ -1,7 +1,5 @@
 #!/bin/bash
-# Cross-build Git so it can run inside WOS and install it into the sysroot.
-# This intentionally keeps Git's own optional helpers small, but enables
-# HTTP(S) transport through the WOS curl/OpenSSL ports.
+# Cross-build the WOS Git fork and install it into the target sysroot.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,7 +12,6 @@ if [ -z "${CCACHE_DIR:-}" ]; then
 fi
 wos_setup_ccache
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
-WOS_BUILD_JOBS="$(wos_build_jobs)"
 WOS_MAKE_JOBS="$(wos_make_jobs)"
 
 B="$WORKSPACE_ROOT/toolchain"
@@ -24,11 +21,6 @@ TARGET_SYSROOT="${WOS_SYSROOT_PATH:-$B/sysroot}"
 GIT_BUILD="${WOS_GIT_BUILD_DIR:-$B/git-build}"
 GIT_SRC="${WOS_GIT_SOURCE_DIR:-$B/src/git}"
 GIT_WORK="$GIT_BUILD/work"
-GIT_VERSION="${WOS_GIT_VERSION:-2.54.0}"
-GIT_TARBALL_URL="${WOS_GIT_TARBALL_URL:-https://www.kernel.org/pub/software/scm/git/git-$GIT_VERSION.tar.xz}"
-GIT_TARBALL_SHA256="${WOS_GIT_TARBALL_SHA256:-f689162364c10de79ef89aa8dbf48731eb057e34edbbd20aca510ce0154681a3}"
-GIT_TARBALL_URLS="${WOS_GIT_TARBALL_URLS:-$GIT_TARBALL_URL}"
-GIT_DOWNLOAD_ATTEMPTS="${WOS_GIT_DOWNLOAD_ATTEMPTS:-${WOS_SOURCE_DOWNLOAD_ATTEMPTS:-3}}"
 WOS_GIT_STRIP="${WOS_GIT_STRIP:-0}"
 WOS_GIT_OPT_FLAGS="${WOS_GIT_OPT_FLAGS:--O2}"
 
@@ -46,168 +38,10 @@ require_file() {
     fi
 }
 
-download_git_source() {
-    local dest="$1"
-    local archive_dir="$GIT_BUILD/src"
-    local archive="$archive_dir/git-$GIT_VERSION.tar.xz"
-    local tmp_dest="$dest.tmp"
-
-    mkdir -p "$archive_dir"
-    if [ ! -f "$archive" ]; then
-        if ! command -v curl >/dev/null 2>&1; then
-            echo "ERROR: Git source not found at $GIT_SRC and curl is unavailable." >&2
-            echo "Populate $GIT_SRC with a Git release tree or install curl." >&2
-            exit 1
-        fi
-        wos_download_file "Git $GIT_VERSION source" "$archive" "$GIT_TARBALL_URLS" "$GIT_DOWNLOAD_ATTEMPTS"
-    fi
-
-    echo "$GIT_TARBALL_SHA256  $archive" | sha256sum -c - >&2
-    wos_remove_tree "$tmp_dest"
-    wos_remove_tree "$dest"
-    mkdir -p "$tmp_dest"
-    tar -xJf "$archive" -C "$tmp_dest" --strip-components 1
-    mv "$tmp_dest" "$dest"
-}
-
-resolve_git_source() {
-    local fallback_src="$GIT_BUILD/src/git-$GIT_VERSION"
-
-    if [ -f "$GIT_SRC/Makefile" ]; then
-        printf '%s\n' "$GIT_SRC"
-        return 0
-    fi
-
-    if [ -f "$fallback_src/Makefile" ]; then
-        printf '%s\n' "$fallback_src"
-        return 0
-    fi
-
-    if [ -d "$GIT_SRC" ] && wos_dir_has_entries "$GIT_SRC"; then
-        echo "ERROR: Git source at $GIT_SRC does not contain Makefile." >&2
-        echo "Use a Git release tree or clear the directory so the release tarball can be downloaded." >&2
-        exit 1
-    fi
-
-    download_git_source "$fallback_src"
-    printf '%s\n' "$fallback_src"
-}
-
 copy_source_to_workdir() {
-    local source_dir="$1"
-
     wos_remove_tree "$GIT_WORK"
     mkdir -p "$GIT_WORK"
-    wos_copy_tree_entries_excluding "$source_dir" "$GIT_WORK" ".git" ".github"
-}
-
-patch_git_source_for_wos() {
-    local run_command="$GIT_WORK/run-command.c"
-    local parallel_checkout="$GIT_WORK/parallel-checkout.c"
-    local makefile="$GIT_WORK/Makefile"
-    local templates_makefile="$GIT_WORK/templates/Makefile"
-    local generate_script="$GIT_WORK/tools/generate-script.sh"
-
-    python3 - "$run_command" "$parallel_checkout" "$makefile" "$templates_makefile" "$generate_script" <<'PY'
-from pathlib import Path
-import sys
-
-run_command = Path(sys.argv[1])
-parallel_checkout = Path(sys.argv[2])
-makefile = Path(sys.argv[3])
-templates_makefile = Path(sys.argv[4])
-generate_script = Path(sys.argv[5])
-
-text = run_command.read_text()
-replacements = {
-    "pipe(fdin)": ("pipe2(fdin, O_CLOEXEC)", 2),
-    "pipe(fdout)": ("pipe2(fdout, O_CLOEXEC)", 2),
-    "pipe(fderr)": ("pipe2(fderr, O_CLOEXEC)", 1),
-    "pipe(notify_pipe)": ("pipe2(notify_pipe, O_CLOEXEC)", 1),
-}
-
-for old, (new, expected_count) in replacements.items():
-    count = text.count(old)
-    if count != expected_count:
-        raise SystemExit(f"expected {expected_count} occurrences of {old!r} in {run_command}, found {count}")
-    text = text.replace(old, new)
-
-run_command.write_text(text)
-
-text = parallel_checkout.read_text()
-replacements = {
-    "static const int DEFAULT_THRESHOLD_FOR_PARALLELISM = 100;": "static const int DEFAULT_THRESHOLD_FOR_PARALLELISM = 0;",
-    "static const int DEFAULT_NUM_WORKERS = 1;": "static const int DEFAULT_NUM_WORKERS = 0;",
-}
-
-for old, new in replacements.items():
-    count = text.count(old)
-    if count != 1:
-        raise SystemExit(f"expected one occurrence of {old!r} in {parallel_checkout}, found {count}")
-    text = text.replace(old, new)
-
-parallel_checkout.write_text(text)
-
-text = makefile.read_text()
-replacements = {
-    "all:: $(FUZZ_OBJS)": "ifndef WOS_SKIP_TEST_ARTIFACTS\nall:: $(FUZZ_OBJS)\nendif",
-    "all:: $(TEST_PROGRAMS) $(test_bindir_programs) $(UNIT_TEST_PROGS) $(CLAR_TEST_PROG)": (
-        "ifndef WOS_SKIP_TEST_ARTIFACTS\n"
-        "all:: $(TEST_PROGRAMS) $(test_bindir_programs) $(UNIT_TEST_PROGS) $(CLAR_TEST_PROG)\n"
-        "endif"
-    ),
-}
-
-for old, new in replacements.items():
-    count = text.count(old)
-    if count != 1:
-        raise SystemExit(f"expected one occurrence of {old!r} in {makefile}, found {count}")
-    text = text.replace(old, new)
-
-makefile.write_text(text)
-
-text = templates_makefile.read_text()
-old = "\t(cd blt && $(TAR) cf - .) | \\\n\t(cd '$(DESTDIR_SQ)$(template_instdir_SQ)' && umask 022 && $(TAR) xof -)"
-new = "\tcp -a blt/. '$(DESTDIR_SQ)$(template_instdir_SQ)'"
-count = text.count(old)
-if count != 1:
-    raise SystemExit(f"expected one Git templates tar install pipeline in {templates_makefile}, found {count}")
-templates_makefile.write_text(text.replace(old, new))
-
-text = generate_script.read_text()
-old = "#!/bin/sh\n"
-new = "#!/bin/bash\n"
-if old not in text and new not in text:
-    raise SystemExit(f"unable to find POSIX shell shebang in {generate_script}")
-generate_script.write_text(text.replace(old, new, 1))
-PY
-}
-
-patch_installed_git_scripts() {
-    local submodule="$TARGET_SYSROOT/libexec/git-core/git-submodule"
-
-    python3 - "$submodule" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-text = path.read_text()
-old = '"cmd_$(echo $command | sed -e s/-/_/g)" "$@"'
-new = '''case "$command" in
-set-branch)
-\tcmd_set_branch "$@"
-\t;;
-set-url)
-\tcmd_set_url "$@"
-\t;;
-*)
-\t"cmd_$command" "$@"
-\t;;
-esac'''
-if old not in text and new not in text:
-    raise SystemExit(f"unable to find git-submodule dispatcher in {path}")
-path.write_text(text.replace(old, new))
-PY
+    wos_copy_tree_entries_excluding "$GIT_SRC" "$GIT_WORK" ".git" ".github"
 }
 
 require_file "$HOST/bin/clang" "Run tools/host-toolchain.sh first."
@@ -224,10 +58,9 @@ require_file "$TARGET_SYSROOT/bin/curl-config" "Run scripts/build/build_curl_for
 require_file "$TARGET_SYSROOT/include/curl/curl.h" "Run scripts/build/build_curl_for_wos.sh before building Git."
 require_file "$TARGET_SYSROOT/lib/libssl.a" "Run scripts/build/build_openssl_for_wos.sh before building Git."
 require_file "$TARGET_SYSROOT/lib/libcrypto.a" "Run scripts/build/build_openssl_for_wos.sh before building Git."
+require_file "$GIT_SRC/Makefile" "Initialize the Git source with: git submodule update --init toolchain/src/git"
 
-GIT_SOURCE_DIR="$(resolve_git_source)"
-copy_source_to_workdir "$GIT_SOURCE_DIR"
-patch_git_source_for_wos
+copy_source_to_workdir
 
 mkdir -p "$TARGET_SYSROOT/bin" "$TARGET_SYSROOT/libexec" "$TARGET_SYSROOT/share"
 if [ ! -e "$TARGET_SYSROOT/usr" ]; then
@@ -235,7 +68,7 @@ if [ ! -e "$TARGET_SYSROOT/usr" ]; then
 fi
 
 TARGET_CC="${WOS_CCACHE_PREFIX}$HOST/bin/clang --target=$TARGET_ARCH --sysroot=$TARGET_SYSROOT"
-GIT_CFLAGS="--sysroot=$TARGET_SYSROOT $WOS_GIT_OPT_FLAGS -g -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -I. -Icompat/regex -I$TARGET_SYSROOT/include"
+GIT_CFLAGS="--sysroot=$TARGET_SYSROOT $WOS_GIT_OPT_FLAGS -g -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector -DHAVE_WOS_FSTAT_CLOSE=1 -I. -Icompat/regex -I$TARGET_SYSROOT/include"
 GIT_LDFLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"
 GIT_EXTLIBS="$TARGET_SYSROOT/lib/libz.a -lpthread -lrt -ldl -lm -lc"
 GIT_CURL_CFLAGS="-I$TARGET_SYSROOT/include -DCURL_STATICLIB"
@@ -273,6 +106,7 @@ GIT_MAKE_FLAGS=(
     "NO_PCRE2=YesPlease"
     "NO_TCLTK=YesPlease"
     "NO_PERL=YesPlease"
+    "NO_RUST=YesPlease"
     "NO_INSTALL_HARDLINKS=YesPlease"
     "INSTALL_SYMLINKS=YesPlease"
     "NO_IPV6=YesPlease"
@@ -282,7 +116,6 @@ GIT_MAKE_FLAGS=(
 )
 
 wos_make "$WOS_MAKE_JOBS" -C "$GIT_WORK" "${GIT_MAKE_FLAGS[@]}" "DESTDIR=$TARGET_SYSROOT" install
-patch_installed_git_scripts
 
 require_file "$TARGET_SYSROOT/bin/git" "Git install did not produce $TARGET_SYSROOT/bin/git."
 require_file "$TARGET_SYSROOT/libexec/git-core/git" "Git install did not produce $TARGET_SYSROOT/libexec/git-core/git."

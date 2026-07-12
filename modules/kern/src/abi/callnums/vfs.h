@@ -59,6 +59,14 @@ enum class ops : uint64_t {
     OPENAT,                // 51
     STATAT,                // 52
     UTIMENSAT,             // 53
+    MKDIRAT,               // 54
+    READLINKAT,            // 55
+    LINKAT,                // 56
+    SYMLINKAT,             // 57
+    FCHMODAT,              // 58
+    FCHDIR,                // 59
+    FCHOWNAT,              // 60
+    FSTAT_CLOSE,           // 61
 };
 
 }  // namespace ker::abi::vfs

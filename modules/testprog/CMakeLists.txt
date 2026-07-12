@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
-
 project(testprog LANGUAGES CXX)
+
 
 option(WOS_MANDELBENCH_DEBUG "Enable verbose mandelbench CPU instrumentation" OFF)
 

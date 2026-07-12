@@ -12,6 +12,12 @@
 
 namespace ker::vfs {
 
+enum class BufferReadClass : uint8_t {
+    GENERIC,
+    FILESYSTEM_METADATA,
+    FILE_DATA,
+};
+
 // Buffer flags
 constexpr uint32_t BH_DIRTY = (1U << 0);            // Buffer has been modified
 constexpr uint32_t BH_VALID = (1U << 1);            // Buffer contains valid data from disk
@@ -25,10 +31,13 @@ constexpr uint32_t BH_LRU_REFERENCED = (1U << 7);   // Clean eviction should giv
 // Buffer head - represents a single cached block from a block device.
 // Analogous to Linux struct buffer_head / simplified xfs_buf.
 struct BufHead {
-    uint8_t* data{};                   // Pointer to cached block data
-    uint64_t block_no{};               // Block number on the device
-    dev::BlockDevice* bdev{};          // Owning block device
-    std::atomic<int32_t> refcount;     // Reference count (0 = reclaimable)
+    uint8_t* data{};                // Pointer to cached block data
+    uint64_t block_no{};            // Block number on the device
+    dev::BlockDevice* bdev{};       // Owning block device
+    std::atomic<int32_t> refcount;  // Reference count (0 = reclaimable)
+    // Journal batches pin metadata against writeback until their log record is
+    // complete. Batch references separately keep the allocation alive.
+    std::atomic<uint32_t> journal_pending;
     uint32_t flags{};                  // BH_DIRTY, BH_VALID, etc.
     uint64_t writeback_epoch{};        // Owner token for an in-progress writeback
     uint64_t dirty_epoch{};            // Incremented whenever data is marked dirty
@@ -65,7 +74,7 @@ struct BufHead {
 // Buffer cache configuration. This is the minimum/default cap; the live kernel
 // scales the cache up at init when enough physical memory is available.
 constexpr size_t BUFFER_CACHE_DEFAULT_SIZE = static_cast<size_t>(64) * 1024 * 1024;  // 64 MB
-constexpr size_t BUFFER_CACHE_HASH_BUCKETS = 16384;
+constexpr size_t BUFFER_CACHE_HASH_BUCKETS = 262144;
 static_assert((BUFFER_CACHE_HASH_BUCKETS & (BUFFER_CACHE_HASH_BUCKETS - 1)) == 0);
 
 // Initialize the buffer cache subsystem. Call once at kernel init.
@@ -74,18 +83,23 @@ void buffer_cache_init();
 // Read a block from the cache (or disk if not cached).
 // Returns a referenced BufHead* with valid data. Caller must call brelse() when done.
 // Returns nullptr on I/O error.
-auto bread(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead*;
+auto bread(dev::BlockDevice* bdev, uint64_t block_no, BufferReadClass read_class = BufferReadClass::GENERIC) -> BufHead*;
 
 // Read multiple contiguous blocks. Returns pointer to the first BufHead in an
 // internally-managed array. Caller must call brelse() on the returned BufHead.
 // `count` blocks starting at `block_no` are read. The returned buffer's `size`
 // field reflects the total byte count (count * block_size).
 // Returns nullptr on I/O error.
-auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufHead*;
+auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count, BufferReadClass read_class = BufferReadClass::GENERIC)
+    -> BufHead*;
 
 // Release a buffer - decrements refcount. If refcount reaches 0 the buffer
 // becomes eligible for LRU eviction but is NOT freed immediately.
 void brelse(BufHead* bh);
+
+// Prevent/re-enable writeback while a write-ahead log batch owns metadata.
+void bjournal_hold(BufHead* bh);
+void bjournal_release(BufHead* bh);
 
 // Mark a buffer dirty and write it to disk immediately (synchronous).
 // Returns 0 on success, negative errno on failure.
@@ -165,6 +179,20 @@ struct BufferCacheStats {
     size_t dirty_waiters;
     uint64_t hits;
     uint64_t misses;
+    uint64_t disk_read_calls;
+    uint64_t disk_read_bytes;
+    uint64_t metadata_disk_read_calls;
+    uint64_t metadata_disk_read_bytes;
+    uint64_t data_disk_read_calls;
+    uint64_t data_disk_read_bytes;
+    uint64_t range_copy_attempts;
+    uint64_t range_copy_cover_hits;
+    uint64_t range_copy_overlap_hits;
+    uint64_t range_copy_no_state;
+    uint64_t range_copy_no_overlap;
+    uint64_t range_copy_incomplete;
+    uint64_t range_copy_overflow;
+    uint64_t range_copy_degraded;
 };
 auto buffer_cache_stats() -> BufferCacheStats;
 
@@ -188,6 +216,10 @@ struct BufferCacheReclaimStats {
 // Drop clean, unreferenced buffers until the logical cache is at or below
 // target_bytes. Dirty or referenced buffers are never written or discarded.
 auto reclaim_clean_buffer_cache(size_t target_bytes) -> BufferCacheReclaimStats;
+
+// Drop up to byte_budget bytes of clean, unreferenced buffers for allocator
+// pressure. Dirty or referenced buffers are never written or discarded.
+auto reclaim_clean_buffer_cache_for_pressure(size_t byte_budget) -> size_t;
 
 #ifdef WOS_SELFTEST
 auto buffer_cache_selftest_choose_cache_max_bytes(uint64_t total_mem) -> size_t;
