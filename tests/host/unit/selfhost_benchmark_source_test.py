@@ -30,7 +30,7 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
         source,
         [
             'DEFAULT_REPO="https://github.com/Pascu-Victor/wos.git"',
-            'DEFAULT_LINUX_WORKDIR="/tmp/wos-selfhost-bench"',
+            'DEFAULT_LINUX_WORKDIR="${HOME:-/tmp}/wos-selfhost-bench"',
             'DEFAULT_WOS_WORKDIR="/root/wos-selfhost-bench"',
             'DEFAULT_JOBS="32"',
             "wos-local",
