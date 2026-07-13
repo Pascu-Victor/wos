@@ -61,6 +61,7 @@ constexpr double WORKER_EXIT_KILL_AFTER_SECONDS = 2.0;
 constexpr double WORKER_EXIT_GIVE_UP_AFTER_SECONDS = 10.0;
 constexpr long WORKER_WAIT_POLL_NS = 50'000'000L;
 constexpr size_t LIVE_OUTPUT_QUEUE_MIN_PACKETS = 1;
+constexpr size_t WORKER_TILE_WRITE_BATCH_BYTES = static_cast<size_t>(1U) * 1024U * 1024U;
 constexpr int WORKER_STDOUT_FD = 1;
 constexpr int WORKER_COMMAND_FD = 0;
 constexpr int WORKER_CHILD_FD_CLOSE_LIMIT = 256;
@@ -656,6 +657,76 @@ auto write_all(int fd, std::span<const unsigned char> bytes) -> bool {
         bytes = bytes.subspan(static_cast<size_t>(WRITTEN));
     }
     return true;
+}
+
+auto write_buffered_tile_packets(int fd, const std::vector<std::vector<unsigned char> >& packets, std::vector<unsigned char>& output_batch,
+                                 uint64_t& sent_tiles, double& send_seconds) -> bool {
+    output_batch.clear();
+    size_t reserve_bytes = 0;
+    for (const auto& packet : packets) {
+        if (packet.size() >= WORKER_TILE_WRITE_BATCH_BYTES - reserve_bytes) {
+            reserve_bytes = WORKER_TILE_WRITE_BATCH_BYTES;
+            break;
+        }
+        reserve_bytes += packet.size();
+    }
+    try {
+        output_batch.reserve(reserve_bytes);
+    } catch (...) {
+        return false;
+    }
+
+    size_t buffered_packets = 0;
+    auto flush_output_batch = [&]() -> bool {
+        if (output_batch.empty()) {
+            return true;
+        }
+        double const SEND_STARTED = tracebench::monotonic_seconds();
+        bool const SENT = write_all(fd, std::span<const unsigned char>(output_batch.data(), output_batch.size()));
+        send_seconds += tracebench::monotonic_seconds() - SEND_STARTED;
+        if (!SENT) {
+            // A partial failed write may contain whole packets, but the caller
+            // fails the worker. Keep the unconfirmed batch count conservative.
+            return false;
+        }
+        sent_tiles += buffered_packets;
+        buffered_packets = 0;
+        output_batch.clear();
+        return true;
+    };
+
+    for (const auto& packet : packets) {
+        if (cancel_requested()) {
+            return false;
+        }
+        if (packet.empty()) {
+            (void)flush_output_batch();
+            return false;
+        }
+        if (packet.size() > WORKER_TILE_WRITE_BATCH_BYTES) {
+            if (!flush_output_batch()) {
+                return false;
+            }
+            double const SEND_STARTED = tracebench::monotonic_seconds();
+            bool const SENT = write_all(fd, std::span<const unsigned char>(packet.data(), packet.size()));
+            send_seconds += tracebench::monotonic_seconds() - SEND_STARTED;
+            if (!SENT) {
+                return false;
+            }
+            ++sent_tiles;
+            continue;
+        }
+        if (!output_batch.empty() && packet.size() > WORKER_TILE_WRITE_BATCH_BYTES - output_batch.size() && !flush_output_batch()) {
+            return false;
+        }
+        try {
+            output_batch.insert(output_batch.end(), packet.begin(), packet.end());
+        } catch (...) {
+            return false;
+        }
+        ++buffered_packets;
+    }
+    return flush_output_batch();
 }
 
 auto read_exact(int fd, std::span<unsigned char> bytes) -> bool {
@@ -2572,6 +2643,7 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
         return 2;
     }
     auto all_tiles = tracebench::make_tiles(options.width, options.height, options.tile_size);
+    std::vector<unsigned char> tile_write_batch;
     (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::SCENE_LOADED, worker.batch_start, worker.batch_count,
                                    all_tiles.size(), static_cast<uint32_t>(options.tile_size));
     if (options.placement == tracebench::Placement::ProcessPerCore) {
@@ -2684,19 +2756,7 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
             if (!STREAM_PACKETS) {
                 (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_WRITING, command.batch_start,
                                                EXPECTED, RENDERED);
-                for (const auto& packet : batch_packets) {
-                    if (packet.empty()) {
-                        output_ok = false;
-                        break;
-                    }
-                    double const SEND_STARTED = tracebench::monotonic_seconds();
-                    output_ok = write_all(WORKER_STDOUT_FD, std::span<const unsigned char>(packet.data(), packet.size()));
-                    send_seconds += tracebench::monotonic_seconds() - SEND_STARTED;
-                    if (!output_ok) {
-                        break;
-                    }
-                    ++sent;
-                }
+                output_ok = write_buffered_tile_packets(WORKER_STDOUT_FD, batch_packets, tile_write_batch, sent, send_seconds);
             }
             uint64_t const SENT = sent;
             bool const BATCH_FAILED = cancel_requested() || batch_failed.load(std::memory_order_relaxed) || !output_ok ||
@@ -2845,19 +2905,7 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
     if (!STREAM_PACKETS) {
         (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::BATCH_WRITING, worker.batch_start, EXPECTED,
                                        RENDERED);
-        for (const auto& packet : batch_packets) {
-            if (packet.empty()) {
-                output_ok = false;
-                break;
-            }
-            double const SEND_STARTED = tracebench::monotonic_seconds();
-            output_ok = write_all(WORKER_STDOUT_FD, std::span<const unsigned char>(packet.data(), packet.size()));
-            send_seconds += tracebench::monotonic_seconds() - SEND_STARTED;
-            if (!output_ok) {
-                break;
-            }
-            ++sent;
-        }
+        output_ok = write_buffered_tile_packets(WORKER_STDOUT_FD, batch_packets, tile_write_batch, sent, send_seconds);
     }
     uint64_t const SENT = sent;
     bool const WORKER_FAILED =

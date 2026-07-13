@@ -97,6 +97,7 @@ def test_renderbench_worker_cancellation_is_cooperative() -> None:
     for name in [
         "read_exact",
         "write_all",
+        "write_buffered_tile_packets",
         "render_worker_tile_packet",
         "batch_render_thread",
     ]:
@@ -232,11 +233,17 @@ def test_renderbench_command_stream_uses_per_batch_thread_join() -> None:
             "std::vector<thrd_t> batch_threads",
             "batch_render_thread",
             "thrd_join(batch_threads.at",
-            "write_all(WORKER_STDOUT_FD",
+            "write_buffered_tile_packets(WORKER_STDOUT_FD",
             "send_worker_phase_packet",
             "send_worker_batch_done_packet",
         ],
         "renderbench command-stream per-batch thread join path",
+    )
+    require_order(
+        run_body,
+        "thrd_join(batch_threads.at",
+        "write_buffered_tile_packets(WORKER_STDOUT_FD",
+        "renderbench must join batch threads before coalescing their packets",
     )
     require_order(
         run_body,
@@ -246,9 +253,73 @@ def test_renderbench_command_stream_uses_per_batch_thread_join() -> None:
     )
     require_order(
         run_body,
-        "write_all(WORKER_STDOUT_FD",
+        "write_buffered_tile_packets(WORKER_STDOUT_FD",
         "send_worker_batch_done_packet",
         "renderbench command-stream worker main thread must send tile packets before batch-done",
+    )
+
+
+def test_renderbench_non_live_tiles_use_bounded_write_batches() -> None:
+    source = RENDERBENCH_MAIN_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "WORKER_TILE_WRITE_BATCH_BYTES = static_cast<size_t>(1U) * 1024U * 1024U",
+            "write_buffered_tile_packets",
+        ],
+        "renderbench bounded tile write batching surface",
+    )
+
+    helper = function_body(source, "write_buffered_tile_packets")
+    require_tokens(
+        helper,
+        [
+            "output_batch.reserve(reserve_bytes)",
+            "output_batch.insert(output_batch.end(), packet.begin(), packet.end())",
+            "packet.size() > WORKER_TILE_WRITE_BATCH_BYTES",
+            "packet.empty()",
+            "(void)flush_output_batch()",
+            "WORKER_TILE_WRITE_BATCH_BYTES - output_batch.size()",
+            "write_all(fd",
+            "send_seconds += tracebench::monotonic_seconds() - SEND_STARTED",
+            "sent_tiles += buffered_packets",
+            "++sent_tiles",
+            "cancel_requested()",
+            "return flush_output_batch();",
+        ],
+        "renderbench bounded tile write batching helper",
+    )
+    require_order(
+        helper,
+        "if (!SENT)",
+        "sent_tiles += buffered_packets",
+        "renderbench must count a buffered tile group only after its write completes",
+    )
+
+    run_body = function_body(source, "run_ipc_worker")
+    if run_body.count("write_buffered_tile_packets(WORKER_STDOUT_FD") != 2:
+        fail("renderbench must batch both command-stream and one-shot non-live tile output")
+    non_live_blocks = re.findall(
+        r"if \(!STREAM_PACKETS\) \{(?P<body>.*?)\n\s*\}",
+        run_body,
+        flags=re.DOTALL,
+    )
+    if len(non_live_blocks) != 2 or any(
+        "write_buffered_tile_packets(WORKER_STDOUT_FD" not in block
+        for block in non_live_blocks
+    ):
+        fail("renderbench tile coalescing must remain confined to both non-live output blocks")
+    if "write_all(WORKER_STDOUT_FD, std::span<const unsigned char>(packet.data(), packet.size()))" in run_body:
+        fail("renderbench non-live worker paths must not retain one write_all call per tile")
+    if "for (const auto& packet : batch_packets)" in run_body:
+        fail("renderbench non-live worker paths must not retain per-tile output loops")
+
+    one_shot = run_body[run_body.find("std::vector<tracebench::Tile> assigned_tiles;") :]
+    require_order(
+        one_shot,
+        "write_buffered_tile_packets(WORKER_STDOUT_FD",
+        "send_worker_done_packet",
+        "renderbench one-shot worker must flush tile batches before done",
     )
 
 
@@ -381,6 +452,7 @@ def main() -> None:
     test_renderbench_worker_child_closes_inherited_fds()
     test_renderbench_coordinator_stall_report_exposes_batch_state()
     test_renderbench_command_stream_uses_per_batch_thread_join()
+    test_renderbench_non_live_tiles_use_bounded_write_batches()
     test_renderbench_node_threads_avoid_persistent_command_stream()
     test_renderbench_live_mode_streams_worker_tiles()
     test_renderbench_ipc_profile_separates_capacity_from_dynamic_runs()
