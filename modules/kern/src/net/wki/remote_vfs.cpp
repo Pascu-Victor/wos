@@ -2002,22 +2002,17 @@ auto remote_vfs_close(ker::vfs::File* f) -> int {
     invalidate_dir_cache(ctx->proxy, ctx->remote_fd);
     s_vfs_lock.unlock();
 
-    // Send OP_VFS_CLOSE: {remote_fd:i32} = 4 bytes
-    // Read-only closes can be fire-and-forget: the request still travels on the
-    // reliable WKI channel, but the local caller does not need remote close
-    // status before the dynamic loader opens the next shared object.
-    constexpr int OPEN_ACCESS_MODE_MASK = 0x3;
-    bool const NEEDS_CLOSE_STATUS = FLUSH_STATUS != 0 || (f->open_flags & OPEN_ACCESS_MODE_MASK) != 0;
+    // Send OP_VFS_CLOSE: {remote_fd:i32} = 4 bytes. Pending writes were flushed
+    // synchronously above, and the close request remains ordered on the reliable
+    // per-mount channel. The owner response only reports whether the remote fd
+    // existed, which is not observable after the local descriptor is gone, so
+    // normal closes do not need to pay another request/response RTT.
     int32_t remote_fd = ctx->remote_fd;
-    if (NEEDS_CLOSE_STATUS) {
-        vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_CLOSE, reinterpret_cast<const uint8_t*>(&remote_fd), sizeof(int32_t), nullptr, 0);
-    } else {
-        int const SEND_STATUS =
-            vfs_proxy_send_untracked(ctx->proxy, OP_VFS_CLOSE, reinterpret_cast<const uint8_t*>(&remote_fd), sizeof(int32_t));
-        if (SEND_STATUS != 0) {
-            ker::mod::dbg::log("[WKI] async remote close send failed: node=0x%04x ch=%u fd=%d rc=%d", ctx->proxy->owner_node,
-                               ctx->proxy->assigned_channel, remote_fd, SEND_STATUS);
-        }
+    int const SEND_STATUS =
+        vfs_proxy_send_untracked(ctx->proxy, OP_VFS_CLOSE, reinterpret_cast<const uint8_t*>(&remote_fd), sizeof(int32_t));
+    if (SEND_STATUS != 0) {
+        ker::mod::dbg::log("[WKI] async remote close send failed: node=0x%04x ch=%u fd=%d rc=%d", ctx->proxy->owner_node,
+                           ctx->proxy->assigned_channel, remote_fd, SEND_STATUS);
     }
 
     // D6: Free caches

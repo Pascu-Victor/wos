@@ -89,7 +89,7 @@ def test_proxy_op_slot_waits_are_bounded() -> None:
         source,
         [
             "#include <net/wki/timer_math.hpp>",
-            "constexpr uint64_t VFS_PROXY_SLOT_WAIT_TIMEOUT_US = WKI_OP_TIMEOUT_US;",
+            "constexpr uint64_t VFS_PROXY_SLOT_WAIT_TIMEOUT_US = VFS_PROXY_OP_TIMEOUT_US;",
             "auto acquire_proxy_op_slot_locked(ProxyVfsState* state, uint64_t start_us) -> int",
             "auto acquire_proxy_untracked_send_slot_locked(ProxyVfsState* state, uint64_t start_us) -> int",
         ],
@@ -260,6 +260,28 @@ def test_remote_open_closes_server_fd_on_local_allocation_failure() -> None:
         ],
         "remote open closes fd when context allocation fails",
     )
+
+
+def test_normal_remote_close_flushes_then_sends_without_response_wait() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    close_body = function_body(source, "remote_vfs_close")
+
+    require_order(
+        close_body,
+        [
+            "int const FLUSH_STATUS = flush_write_behind(ctx)",
+            "int32_t remote_fd = ctx->remote_fd",
+            "vfs_proxy_send_untracked(ctx->proxy, OP_VFS_CLOSE",
+            "delete ctx;",
+            "release_vfs_proxy_open_ref(PROXY)",
+            "return FLUSH_STATUS",
+        ],
+        "normal remote close ordering",
+    )
+    if "vfs_proxy_send_and_wait" in close_body:
+        fail("normal remote close must not wait for the owner close response")
+    if "NEEDS_CLOSE_STATUS" in close_body:
+        fail("normal remote close must not branch on access mode for response waiting")
 
 
 def test_export_lookup_returns_locked_snapshot() -> None:
@@ -552,6 +574,7 @@ def main() -> None:
     test_shared_io_slot_waits_are_bounded()
     test_shared_io_callers_timeout_or_fallback()
     test_remote_open_closes_server_fd_on_local_allocation_failure()
+    test_normal_remote_close_flushes_then_sends_without_response_wait()
     test_export_lookup_returns_locked_snapshot()
     test_rdma_retry_cooldowns_are_saturating()
     test_vfs_attach_ack_requires_expected_cookie_before_completion()
