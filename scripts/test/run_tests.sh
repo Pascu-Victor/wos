@@ -100,6 +100,7 @@ UNIT_TESTS=(
     ktest_cov_test
     coverage_summary_test
     cluster_setup_test
+    cross_os_benchmark_suite_test
     ktest_manifest_test
     runtime_test_audit_test
     toolchain_bootstrap_source_test

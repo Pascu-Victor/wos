@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.util
 import json
 import os
 import signal
@@ -19,7 +21,11 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 BENCH_SCRIPTS = ROOT / "scripts" / "bench"
 REMOTE_SCRIPTS = ROOT / "scripts" / "remote"
+CLUSTER_SCRIPTS = ROOT / "scripts" / "cluster"
 DEFAULT_ARTIFACT_FETCH_TIMEOUT_SECONDS = 120.0
+DEFAULT_MANDEL_WORKERS_PER_NODE = 8
+WOS_ACCEPTANCE_TOTAL_VCPUS = 32
+WOS_ACCEPTANCE_TOTAL_MEMORY_MIB = 32 * 1024
 
 
 @dataclass(frozen=True)
@@ -182,6 +188,171 @@ def relpath(path: Path) -> str:
         return str(path.relative_to(ROOT))
     except ValueError:
         return str(path)
+
+
+def load_cluster_setup_module() -> Any:
+    if str(CLUSTER_SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(CLUSTER_SCRIPTS))
+    source = CLUSTER_SCRIPTS / "cluster_setup.py"
+    spec = importlib.util.spec_from_file_location("wos_benchmark_cluster_setup", source)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"failed to load cluster topology helpers from {source}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def qemu_memory_mib(value: object) -> int:
+    text = str(value).strip().upper()
+    if text.endswith("M"):
+        amount = text[:-1]
+        multiplier = 1
+    elif text.endswith("G"):
+        amount = text[:-1]
+        multiplier = 1024
+    else:
+        amount = text
+        multiplier = 1
+    if not amount.isdigit() or int(amount) <= 0:
+        raise ValueError(f"invalid positive QEMU memory size: {value!r}")
+    return int(amount) * multiplier
+
+
+def validate_wos_cluster_config(raw_path: str | Path, num_vms: int) -> tuple[dict[str, Any], bytes]:
+    config_path = Path(raw_path)
+    if not config_path.is_absolute():
+        config_path = ROOT / config_path
+    config_path = config_path.resolve()
+    config_bytes = config_path.read_bytes()
+    config = json.loads(config_bytes)
+    if not isinstance(config, dict) or not isinstance(config.get("zones"), list):
+        raise ValueError("topology root must contain a zones array")
+    cluster_setup = load_cluster_setup_module()
+
+    expected_node_ids = list(range(num_vms))
+    if any(not isinstance(zone, dict) for zone in config["zones"]):
+        raise ValueError("topology zones must be objects")
+    global_zones = [zone for zone in config["zones"] if zone.get("id") == "GLOBAL"]
+    if len(global_zones) != 1:
+        raise ValueError("topology must define exactly one GLOBAL zone")
+    zones = [zone for zone in config["zones"] if zone.get("id") != "GLOBAL"]
+    for zone in zones:
+        zone_name = zone.get("name", zone.get("id", "unnamed"))
+        zone_node_ids = list(range(int(zone.get("nodes", 2))))
+        if zone_node_ids != expected_node_ids:
+            raise ValueError(
+                f"{zone_name} zone node ids {zone_node_ids} do not match --num-vms nodes {expected_node_ids}"
+            )
+        node_overrides = zone.get("nodes_config", [])
+        if not isinstance(node_overrides, list) or any(
+            not isinstance(node, dict) for node in node_overrides
+        ):
+            raise ValueError(f"{zone_name} zone nodes_config must be an array of objects")
+        override_ids = [int(node.get("id", -1)) for node in node_overrides]
+        if any(node_id not in expected_node_ids for node_id in override_ids):
+            raise ValueError(
+                f"{zone_name} zone has nodes_config ids outside {expected_node_ids}: {override_ids}"
+            )
+
+    for zone_name in ("lan", "wki"):
+        matching = [zone for zone in zones if zone.get("name") == zone_name]
+        if len(matching) != 1:
+            raise ValueError(f"topology must define exactly one {zone_name!r} zone")
+
+    nodes = cluster_setup.collect_unique_nodes(config)
+    if sorted(nodes) != expected_node_ids:
+        raise ValueError(f"resolved topology node ids {sorted(nodes)} do not match {expected_node_ids}")
+
+    node_records: list[dict[str, Any]] = []
+    total_vcpus = 0
+    total_memory_mib = 0
+    for node_id in expected_node_ids:
+        node_spec = cluster_setup.cluster_node_spec(node_id, nodes[node_id], config)
+        expected_hostname = f"wos-{node_id}"
+        if node_spec.get("hostname") != expected_hostname:
+            raise ValueError(
+                f"node {node_id} hostname {node_spec.get('hostname')!r} does not match {expected_hostname!r}"
+            )
+
+        vm = node_spec.get("vm", {})
+        vcpus = int(vm.get("cpus", 0))
+        if vcpus <= 0:
+            raise ValueError(f"node {node_id} has invalid vCPU count {vcpus}")
+        memory_mib = qemu_memory_mib(vm.get("memory", 0))
+
+        nics = [
+            {
+                "name": nic.get("name"),
+                "zone_id": nic.get("zone_id"),
+                "model": nic.get("model"),
+                "queues": int(nic.get("queues", 1)),
+                "vhost": bool(nic.get("vhost", False)),
+                "driver": nic.get("driver"),
+            }
+            for nic in node_spec.get("nics", [])
+        ]
+        nics_by_name = {nic["name"]: nic for nic in nics}
+        if nics_by_name.get("lan", {}).get("driver") != "dhcp":
+            raise ValueError(f"node {node_id} must have a DHCP LAN NIC")
+        if nics_by_name.get("wki", {}).get("driver") != "wki":
+            raise ValueError(f"node {node_id} must have a WKI NIC")
+
+        total_vcpus += vcpus
+        total_memory_mib += memory_mib
+        node_records.append(
+            {
+                "id": node_id,
+                "hostname": expected_hostname,
+                "vcpus": vcpus,
+                "memory_mib": memory_mib,
+                "nics": nics,
+            }
+        )
+
+    if total_vcpus != WOS_ACCEPTANCE_TOTAL_VCPUS:
+        raise ValueError(
+            f"topology has {total_vcpus} aggregate vCPUs; fixed-resource acceptance requires "
+            f"{WOS_ACCEPTANCE_TOTAL_VCPUS}"
+        )
+    if total_memory_mib != WOS_ACCEPTANCE_TOTAL_MEMORY_MIB:
+        raise ValueError(
+            f"topology has {total_memory_mib} MiB aggregate memory; fixed-resource acceptance requires "
+            f"{WOS_ACCEPTANCE_TOTAL_MEMORY_MIB} MiB"
+        )
+
+    return (
+        {
+            "config_validated": True,
+            "runtime_validated": False,
+            "config_path": relpath(config_path),
+            "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+            "node_count": len(node_records),
+            "nodes": node_records,
+            "total_vcpus": total_vcpus,
+            "total_memory_mib": total_memory_mib,
+        },
+        config_bytes,
+    )
+
+
+def git_source_state() -> dict[str, Any]:
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, check=False, text=True, capture_output=True
+    )
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=normal"],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    return {
+        "revision": revision.stdout.strip() if revision.returncode == 0 else None,
+        "dirty": bool(status.stdout.strip()) if status.returncode == 0 else None,
+        "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "revision_error": revision.stderr.strip() if revision.returncode != 0 else None,
+        "status_error": status.stderr.strip() if status.returncode != 0 else None,
+    }
 
 
 def step_log_text(result: subprocess.CompletedProcess[str]) -> str:
@@ -865,6 +1036,35 @@ def run_benchmark_command(
     ]
 
 
+def mandel_worker_layout(args: argparse.Namespace, host_count: int) -> tuple[int, int | None]:
+    if host_count <= 0:
+        raise ValueError("Mandelbench requires at least one host")
+    total_workers = getattr(args, "mandel_total_workers", None)
+    if total_workers is not None:
+        return total_workers, None
+    workers_per_node = getattr(args, "mandel_threads", None)
+    if workers_per_node is not None:
+        return workers_per_node * host_count, workers_per_node
+    return DEFAULT_MANDEL_WORKERS_PER_NODE * host_count, DEFAULT_MANDEL_WORKERS_PER_NODE
+
+
+def mandel_worker_source(args: argparse.Namespace) -> str:
+    if getattr(args, "mandel_total_workers", None) is not None:
+        return "explicit-total"
+    if getattr(args, "mandel_threads", None) is not None:
+        return "explicit-per-node"
+    return "default-per-node"
+
+
+def linux_mandel_worker_args(args: argparse.Namespace, host_count: int) -> list[str]:
+    total_workers, workers_per_node = mandel_worker_layout(args, host_count)
+    result: list[str] = []
+    if workers_per_node is not None:
+        result += ["--threads", str(workers_per_node)]
+    result += ["--np", str(total_workers)]
+    return result
+
+
 def run_wos_mandelbench(
     args: argparse.Namespace,
     suite_dir: Path,
@@ -878,7 +1078,7 @@ def run_wos_mandelbench(
     step_dir = suite_dir / step_name
     step_dir.mkdir(parents=True, exist_ok=True)
     remote_work_dir = f"{suite_remote_root}/{step_name}"
-    total_workers = args.mandel_threads * args.num_vms
+    total_workers, workers_per_node = mandel_worker_layout(args, len(wos_hosts))
     remote_command = " ".join(
         [
             "mkdir -p",
@@ -923,7 +1123,9 @@ def run_wos_mandelbench(
             "height": args.mandel_height,
             "max_iteration": args.mandel_max_iter,
             "threads": total_workers,
-            "threads_per_node": args.mandel_threads,
+            "threads_per_node": workers_per_node,
+            "worker_mode": "total" if workers_per_node is None else "per-node",
+            "worker_source": mandel_worker_source(args),
             "repeat": args.mandel_repeat,
         }
     )
@@ -967,7 +1169,7 @@ def run_linux_mandelbench(
     step_dir.mkdir(parents=True, exist_ok=True)
     output_path = step_dir / "result.json"
     remote_work_dir = f"{suite_remote_root}/{step_name}"
-    total_workers = args.mandel_threads * len(linux_hosts)
+    total_workers, workers_per_node = mandel_worker_layout(args, len(linux_hosts))
 
     command = [
         str(BENCH_SCRIPTS / "run_linux_mpi_benchmark.sh"),
@@ -989,10 +1191,7 @@ def run_linux_mandelbench(
         str(args.mandel_max_iter),
         "--repeat",
         str(args.mandel_repeat),
-        "--threads",
-        str(args.mandel_threads),
-        "--np",
-        str(total_workers),
+        *linux_mandel_worker_args(args, len(linux_hosts)),
         "--mandel-output-root",
         remote_work_dir,
         "--output",
@@ -1024,7 +1223,9 @@ def run_linux_mandelbench(
             "height": args.mandel_height,
             "max_iteration": args.mandel_max_iter,
             "threads": total_workers,
-            "threads_per_node": args.mandel_threads,
+            "threads_per_node": workers_per_node,
+            "worker_mode": "total" if workers_per_node is None else "per-node",
+            "worker_source": mandel_worker_source(args),
             "repeat": args.mandel_repeat,
         }
     )
@@ -1475,6 +1676,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--num-vms", type=int, required=True)
     parser.add_argument(
+        "--wos-cluster-config",
+        help=(
+            "Validate and snapshot an explicit fixed-resource WOS cluster config; "
+            "existing runs remain unvalidated when omitted."
+        ),
+    )
+    parser.add_argument(
         "--os",
         choices=["both", "wos", "linux"],
         default="both",
@@ -1491,7 +1699,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mandel-width", type=int, default=2000)
     parser.add_argument("--mandel-height", type=int, default=2000)
     parser.add_argument("--mandel-max-iter", type=int, default=5000)
-    parser.add_argument("--mandel-threads", type=int, default=8, help="Mandelbench worker processes/ranks per node.")
+    mandel_workers = parser.add_mutually_exclusive_group()
+    mandel_workers.add_argument(
+        "--mandel-threads",
+        type=int,
+        help="Mandelbench workers per node; defaults to 8 when omitted.",
+    )
+    mandel_workers.add_argument(
+        "--mandel-total-workers",
+        type=int,
+        help="Use one total Mandelbench worker count across all nodes; useful for fixed-resource scaling runs.",
+    )
     parser.add_argument("--mandel-repeat", type=int, default=5)
     parser.add_argument(
         "--render-placements",
@@ -1729,6 +1947,10 @@ def main() -> int:
 
     if args.num_vms <= 0:
         parser.error("--num-vms must be greater than zero")
+    if args.mandel_threads is not None and args.mandel_threads <= 0:
+        parser.error("--mandel-threads must be greater than zero")
+    if args.mandel_total_workers is not None and args.mandel_total_workers <= 0:
+        parser.error("--mandel-total-workers must be greater than zero")
     if not 0 <= args.wos_launcher_index < args.num_vms:
         parser.error("--wos-launcher-index must be within the VM count")
     if not 0 <= args.linux_launcher_index < args.num_vms:
@@ -1786,32 +2008,56 @@ def main() -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
+    wos_cluster: dict[str, Any] | None = None
+    wos_cluster_bytes: bytes | None = None
+    if args.wos_cluster_config is not None:
+        try:
+            wos_cluster, wos_cluster_bytes = validate_wos_cluster_config(args.wos_cluster_config, args.num_vms)
+        except (OSError, TypeError, ValueError, KeyError) as exc:
+            parser.error(f"invalid --wos-cluster-config: {exc}")
+
     linux_duck_scene = ROOT / args.linux_duck_scene
     if not args.skip_renderbench and not linux_duck_scene.is_file():
         parser.error(f"Linux Duck scene not found: {linux_duck_scene}")
 
+    source_state = git_source_state()
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     args.remote_suite_name = f"cross-os-suite-{timestamp}"
     suite_dir = ROOT / args.results_dir / args.remote_suite_name
     suite_dir.mkdir(parents=True, exist_ok=True)
     suite_remote_root = f"/tmp/{args.remote_suite_name}"
+    if wos_cluster is not None and wos_cluster_bytes is not None:
+        topology_snapshot = suite_dir / "wos-cluster-config.json"
+        topology_snapshot.write_bytes(wos_cluster_bytes)
+        wos_cluster["snapshot_file"] = relpath(topology_snapshot)
 
     wos_hosts = [f"wos-{index}.wos" for index in range(args.num_vms)]
     linux_hosts = [f"wos-ubuntu-vm{index}.wos" for index in range(args.num_vms)]
     wos_launcher = wos_hosts[args.wos_launcher_index]
     linux_launcher = linux_hosts[args.linux_launcher_index]
+    mandel_total_workers, mandel_workers_per_node = mandel_worker_layout(args, args.num_vms)
 
     manifest: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "suite_name": args.remote_suite_name,
+        "invocation": [sys.executable, *sys.argv],
+        "source": source_state,
         "os_selection": args.os,
         "num_vms": args.num_vms,
         "wos_hosts": wos_hosts,
         "linux_hosts": linux_hosts,
         "wos_launcher": wos_launcher,
         "linux_launcher": linux_launcher,
+        "mandel_workers": {
+            "mode": "total" if mandel_workers_per_node is None else "per-node",
+            "source": mandel_worker_source(args),
+            "total": mandel_total_workers,
+            "per_node": mandel_workers_per_node,
+        },
         "steps": [],
     }
+    if wos_cluster is not None:
+        manifest["wos_cluster"] = wos_cluster
     host_kvm_tracer = HostKvmTracer(args, suite_dir)
     manifest["host_kvm_trace"] = host_kvm_tracer.config_summary()
     write_json(suite_dir / "manifest.json", manifest)

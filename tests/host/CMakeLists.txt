@@ -21,6 +21,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster_setup_test.py
 )
 add_test(
+    NAME cross_os_benchmark_suite_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/cross_os_benchmark_suite_test.py
+)
+add_test(
     NAME ktest_manifest_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ktest_manifest_test.py
 )
@@ -357,6 +361,7 @@ set_tests_properties(
     ktest_cov_test
     coverage_summary_test
     cluster_setup_test
+    cross_os_benchmark_suite_test
     ktest_manifest_test
     runtime_test_audit_test
     toolchain_bootstrap_source_test
