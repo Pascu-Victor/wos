@@ -595,6 +595,16 @@ def test_cross_channel_ack_scan_uses_allocated_range_bounds() -> None:
             fail(f"{close_function} must not lower monotonic ACK scan bounds")
 
 
+def test_fence_drains_deferred_vfs_bindings_before_remote_fd_cleanup() -> None:
+    body = function_body(PEER_CPP.read_text(), "wki_peer_disconnect_impl")
+    require_order(
+        body,
+        "wki_dev_server_detach_all_for_peer(fenced_id)",
+        "wki_remote_vfs_cleanup_for_peer(fenced_id)",
+        "peer fence must drain retained VFS handlers before closing their remote FDs",
+    )
+
+
 def main() -> None:
     test_hello_ack_reconnects_fenced_peer_outside_peer_lock()
     test_hello_boot_epoch_fences_connected_broadcast_restarts()
@@ -606,6 +616,7 @@ def main() -> None:
     test_ipc_data_acks_after_ordered_dispatch()
     test_ipc_data_ordered_dispatch_wait_uses_explicit_daemon_wake()
     test_cross_channel_ack_scan_uses_allocated_range_bounds()
+    test_fence_drains_deferred_vfs_bindings_before_remote_fd_cleanup()
     print("WKI peer source invariants hold")
 
 

@@ -240,27 +240,28 @@ void run_deferred_vfs_op(void* arg) {
 
     std::array<char, sizeof(DevServerBinding::vfs_export_path)> export_path{};
     std::array<char, sizeof(DevServerBinding::vfs_export_name)> export_name{};
-    bool binding_active = false;
+    DevServerBinding* retained_binding = nullptr;
 
     {
         uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
         DevServerBinding* binding = find_binding_by_channel(op->hdr.src_node, op->hdr.channel_id);
-        if (binding != nullptr && binding->resource_type == ResourceType::VFS) {
+        if (binding != nullptr && binding->resource_type == ResourceType::VFS && retain_binding_locked(binding)) {
             std::memcpy(export_path.data(), static_cast<const void*>(binding->vfs_export_path), export_path.size());
             std::memcpy(export_name.data(), static_cast<const void*>(binding->vfs_export_name), export_name.size());
             export_path.at(export_path.size() - 1) = '\0';
             export_name.at(export_name.size() - 1) = '\0';
-            binding_active = true;
+            retained_binding = binding;
         }
         s_server_lock.unlock_irqrestore(SRV_FLAGS);
     }
 
-    if (binding_active) {
+    if (retained_binding != nullptr) {
         detail::handle_vfs_op(&op->hdr, op->hdr.channel_id, export_path.data(), export_name.data(), op->op_id, op->req_data,
                               op->req_data_len);
     } else {
         send_vfs_error_response(op->hdr.src_node, op->hdr.channel_id, op->op_id, -ENOTCONN, req_cookie_from_header(&op->hdr));
     }
+    release_binding(retained_binding);
 
     delete[] op->req_data;
     delete op;

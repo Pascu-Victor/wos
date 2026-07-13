@@ -250,6 +250,44 @@ def test_message_fallback_readahead_targets_small_sequential_reads() -> None:
         fail("optional message read-ahead allocation failure must use the direct stack path")
 
 
+def test_server_open_reuses_the_open_file_stat_snapshot() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    handler_body = function_body(source, "handle_vfs_op")
+    open_start = handler_body.find("case OP_VFS_OPEN:")
+    read_start = handler_body.find("case OP_VFS_READ:", open_start)
+    if open_start < 0 or read_start < 0:
+        fail("remote VFS server open/read opcode cases must remain present")
+    open_case = handler_body[open_start:read_start]
+
+    require_order(
+        open_case,
+        [
+            "ker::vfs::vfs_open_file_resolved(full_path.data()",
+            "ker::vfs::vfs_fstat_file(file, &open_stat)",
+            "open_resp.has_stat = 1",
+            "open_resp.stat = open_stat",
+            "if (prefetch_rkey != 0",
+            "alloc_remote_fd(hdr->src_node, channel_id, file)",
+            "open_resp.fd = fd_id",
+            "int const SEND_RET = wki_send",
+            "if (SEND_RET != WKI_OK)",
+            "RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id)",
+            "rfd->file == file",
+            "orphan = rfd->file",
+            "rfd->file = nullptr",
+            "rfd->active = false",
+            "s_vfs_lock.unlock()",
+            "ker::vfs::vfs_close_file(orphan)",
+        ],
+        "remote VFS server open metadata snapshot reuse",
+    )
+    if "vfs_stat_resolved(full_path.data(), &open_stat)" in open_case:
+        fail("remote VFS server open must not repeat path resolution for metadata")
+    published_file = open_case.find("alloc_remote_fd(hdr->src_node, channel_id, file)")
+    if re.search(r"\bfile->", open_case[published_file:]):
+        fail("remote VFS server open must not dereference a file after publishing it to peer cleanup")
+
+
 def test_write_behind_storage_grows_in_allocator_shaped_classes() -> None:
     header = REMOTE_VFS_HPP.read_text()
     source = REMOTE_VFS_CPP.read_text()
@@ -872,6 +910,7 @@ def main() -> None:
     test_shared_io_slot_waits_are_bounded()
     test_shared_io_callers_timeout_or_fallback()
     test_message_fallback_readahead_targets_small_sequential_reads()
+    test_server_open_reuses_the_open_file_stat_snapshot()
     test_write_behind_storage_grows_in_allocator_shaped_classes()
     test_message_write_flush_retains_tail_on_request_allocation_failure()
     test_remote_open_closes_server_fd_on_local_allocation_failure()

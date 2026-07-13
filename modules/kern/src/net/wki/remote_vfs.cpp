@@ -3321,17 +3321,11 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 break;
             }
 
-            // Allocate a remote FD
-            s_vfs_lock.lock();
-            int32_t fd_id = alloc_remote_fd(hdr->src_node, channel_id, file);
-            s_vfs_lock.unlock();
-
             OpenRespPayload open_resp = {};
-            open_resp.fd = fd_id;
             open_resp.is_dir = file->is_directory ? 1 : 0;
 
             ker::vfs::Stat open_stat = {};
-            if (ker::vfs::vfs_stat_resolved(full_path.data(), &open_stat) == 0) {
+            if (ker::vfs::vfs_fstat_file(file, &open_stat) == 0) {
                 open_resp.has_stat = 1;
                 open_resp.stat = open_stat;
             }
@@ -3364,6 +3358,23 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 }
             }
 
+#ifdef DEBUG_WKI_VFS
+            std::array<uint8_t, 4> debug_probe = {0xEE, 0xEE, 0xEE, 0xEE};
+            ssize_t debug_probe_n = 0;
+            bool const DEBUG_PROBE_VALID = file->fops != nullptr && file->fops->vfs_read != nullptr && !file->is_directory;
+            int const DEBUG_FS_TYPE = static_cast<int>(file->fs_type);
+            if (DEBUG_PROBE_VALID) {
+                debug_probe_n = file->fops->vfs_read(file, debug_probe.data(), debug_probe.size(), 0);
+            }
+#endif
+
+            // Publish the opened file only after all metadata and prefetch work
+            // is complete. Peer cleanup can detach and delete published files.
+            s_vfs_lock.lock();
+            int32_t fd_id = alloc_remote_fd(hdr->src_node, channel_id, file);
+            s_vfs_lock.unlock();
+            open_resp.fd = fd_id;
+
             uint16_t const OPEN_DATA_LEN = (open_resp.has_stat == 0)          ? OPEN_RESP_NO_STAT_LEN
                                            : (open_resp.prefetched_bytes > 0) ? OPEN_RESP_WITH_PREFETCH_LEN
                                                                               : OPEN_RESP_WITH_STAT_LEN;
@@ -3379,19 +3390,32 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             perf_record_vfs_server_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::REPLY_SEND), hdr->src_node, channel_id,
                                          CORRELATION, 0, static_cast<uint16_t>(sizeof(DevOpRespPayload) + OPEN_DATA_LEN), CALLSITE);
 
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, resp_buf.data(),
-                     static_cast<uint16_t>(sizeof(DevOpRespPayload) + OPEN_DATA_LEN));
+            int const SEND_RET = wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, resp_buf.data(),
+                                          static_cast<uint16_t>(sizeof(DevOpRespPayload) + OPEN_DATA_LEN));
+            if (SEND_RET != WKI_OK) {
+                ker::vfs::File* orphan = nullptr;
+                s_vfs_lock.lock();
+                RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
+                if (rfd != nullptr && rfd->file == file) {
+                    orphan = rfd->file;
+                    rfd->file = nullptr;
+                    rfd->active = false;
+                }
+                std::erase_if(g_remote_fds, [](const RemoteVfsFd& entry) { return !entry.active; });
+                s_vfs_lock.unlock();
+
+                if (orphan != nullptr) {
+                    static_cast<void>(ker::vfs::vfs_close_file(orphan));
+                }
+            }
 
 #ifdef DEBUG_WKI_VFS
-            // Diagnostic: immediately read first 4 bytes at open time to verify file data
-            if (file->fops != nullptr && file->fops->vfs_read != nullptr && !file->is_directory) {
-                uint8_t probe[4] = {0xEE, 0xEE, 0xEE, 0xEE};
-                ssize_t probe_n = file->fops->vfs_read(file, probe, 4, 0);
+            if (DEBUG_PROBE_VALID) {
                 ker::mod::dbg::log(
                     "[WKI-SRV] VFS_OPEN: node=0x%04x path='%s' fd=%d fs_type=%d"
                     " probe=[%02x %02x %02x %02x] probe_bytes=%ld",
-                    hdr->src_node, full_path.data(), fd_id, static_cast<int>(file->fs_type), probe[0], probe[1], probe[2], probe[3],
-                    static_cast<long>(probe_n));
+                    hdr->src_node, full_path.data(), fd_id, DEBUG_FS_TYPE, debug_probe[0], debug_probe[1], debug_probe[2], debug_probe[3],
+                    static_cast<long>(debug_probe_n));
             }
 #endif
             break;

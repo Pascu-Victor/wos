@@ -375,6 +375,25 @@ def test_block_ring_binding_lifetime_is_retained_outside_server_lock() -> None:
     require_order(poll_body, "blk_ring_server_poll(binding);", "release_binding(binding);", "ring poll release")
 
 
+def test_deferred_vfs_ops_retain_their_binding_through_blocking_work() -> None:
+    body = function_body(DEV_SERVER_CPP.read_text(), "run_deferred_vfs_op")
+    required = [
+        "DevServerBinding* retained_binding = nullptr",
+        "retain_binding_locked(binding)",
+        "retained_binding = binding",
+        "if (retained_binding != nullptr)",
+        "detail::handle_vfs_op",
+        "release_binding(retained_binding)",
+    ]
+    missing = [token for token in required if token not in body]
+    if missing:
+        fail("deferred VFS operations must retain their binding: " + ", ".join(missing))
+
+    require_order(body, "retain_binding_locked(binding)", "detail::handle_vfs_op", "deferred VFS retain before handler")
+    require_order(body, "detail::handle_vfs_op", "release_binding(retained_binding)", "deferred VFS release after handler")
+    require_order(body, "release_binding(retained_binding)", "delete[] op->req_data", "deferred VFS release before request cleanup")
+
+
 def test_detach_waits_for_binding_refs_before_cleanup_and_erase() -> None:
     detach_all_body = function_body(DEV_SERVER_CPP.read_text(), "wki_dev_server_detach_all_for_peer")
     detach_body = function_body(DEV_SERVER_CPP.read_text(), "handle_dev_detach")
@@ -493,6 +512,7 @@ def main() -> None:
     test_reliable_rx_does_not_autocreate_allocated_dynamic_channels()
     test_channel_reuse_generation_guards_unlock_tx_relock_paths()
     test_block_ring_binding_lifetime_is_retained_outside_server_lock()
+    test_deferred_vfs_ops_retain_their_binding_through_blocking_work()
     test_detach_waits_for_binding_refs_before_cleanup_and_erase()
     test_attach_ack_failure_rolls_back_block_and_vfs_bindings()
     print("WKI dev server source invariants hold")
