@@ -62,6 +62,9 @@ showcase_scale_value() {
         quick:read_iterations) printf '%s\n' 1 ;;
         full:read_iterations) printf '%s\n' 3 ;;
         stress:read_iterations) printf '%s\n' 8 ;;
+        quick:metadata_iterations) printf '%s\n' 32 ;;
+        full:metadata_iterations) printf '%s\n' 256 ;;
+        stress:metadata_iterations) printf '%s\n' 1000 ;;
         quick:mandel_width) printf '%s\n' 320 ;;
         full:mandel_width) printf '%s\n' 800 ;;
         stress:mandel_width) printf '%s\n' 1600 ;;

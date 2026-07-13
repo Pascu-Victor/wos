@@ -9,7 +9,10 @@ TESTPROG_MAIN_CPP = ROOT / "modules" / "testprog" / "src" / "main.cpp"
 NETBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "netbench.cpp"
 PERFBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "perfbench.cpp"
 COWBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "cowbench.cpp"
+FSBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "fsbench.cpp"
 MANDELBENCH_WKI_CPP = ROOT / "modules" / "testprog" / "src" / "mandelbench" / "mandelbench_wki.cpp"
+WOS_SHOWCASE_BENCH = ROOT / "configs" / "rootfs" / "root" / "wos-showcase" / "30-bench-wki.sh"
+WOS_SHOWCASE_COMMON = ROOT / "configs" / "rootfs" / "root" / "wos-showcase" / "showcase-common.sh"
 USERLAND_SUITE = ROOT / "configs" / "drive" / "srv" / "wos_userland_suite.sh"
 RUN_USERLAND_SUITE = ROOT / "scripts" / "bench" / "run_wos_userland_suite.sh"
 WOS_SSH = ROOT / "scripts" / "remote" / "wos_ssh.sh"
@@ -733,6 +736,76 @@ def test_cowbench_child_wait_is_deadline_bounded() -> None:
     require_tokens(stress_body, ["wait_for_child(PID, options.child_timeout_ms)"], "cowbench stress wait timeout plumbing")
 
 
+def test_vfsbench_metadata_timing_excludes_setup_and_cleanup() -> None:
+    source = FSBENCH_CPP.read_text()
+    main_source = TESTPROG_MAIN_CPP.read_text()
+    require_tokens(
+        main_source,
+        ['std::strcmp(command, "vfsbench-create") == 0', 'std::strcmp(command, "vfsbench-rename") == 0'],
+        "testprog metadata benchmark dispatch",
+    )
+    require_tokens(
+        source,
+        [
+            "clock_gettime(CLOCK_MONOTONIC, &ts)",
+            '"benchmark":"wos_vfsbench_create"',
+            '"benchmark":"wos_vfsbench_rename"',
+            "O_CREAT | O_EXCL | O_WRONLY",
+            "PARSED > std::numeric_limits<uint32_t>::max()",
+            "paths_are_absent(source_paths)",
+            "bool const SOURCES_CLEAN = cleanup_paths(source_paths)",
+            "bool const DESTINATIONS_CLEAN = cleanup_paths(destination_paths)",
+        ],
+        "VFS metadata benchmark",
+    )
+
+    create_body = function_body(source, "run_create")
+    require_order(create_body, "iteration_paths(", "uint64_t const STARTED_NS", "create path setup")
+    require_order(create_body, "uint64_t const STARTED_NS", "open(path.c_str()", "create timing start")
+    require_order(create_body, "uint64_t const ELAPSED_NS", "verify_empty_files(paths)", "create verification timing boundary")
+    create_timed = create_body[
+        create_body.index("uint64_t const STARTED_NS") : create_body.index("uint64_t const ELAPSED_NS")
+    ]
+    if "unlink(" in create_timed or "stat(" in create_timed:
+        fail("VFS create timing must exclude verification and cleanup syscalls")
+
+    rename_body = function_body(source, "run_rename")
+    require_order(rename_body, "for (const auto& path : source_paths)", "uint64_t const STARTED_NS", "rename setup")
+    require_order(rename_body, "uint64_t const STARTED_NS", "rename(source_paths.at(index)", "rename timing start")
+    require_order(
+        rename_body,
+        "uint64_t const ELAPSED_NS",
+        "verify_empty_files(destination_paths)",
+        "rename verification timing boundary",
+    )
+    rename_timed = rename_body[
+        rename_body.index("uint64_t const STARTED_NS") : rename_body.index("uint64_t const ELAPSED_NS")
+    ]
+    if "open(" in rename_timed or "unlink(" in rename_timed or "stat(" in rename_timed:
+        fail("VFS rename timing must exclude fixture setup, verification, and cleanup syscalls")
+
+    showcase = WOS_SHOWCASE_BENCH.read_text()
+    require_tokens(
+        showcase,
+        [
+            "showcase_scale_value metadata_iterations",
+            'metadata_target="$(showcase_first_remote_host || true)"',
+            'on "$metadata_target" wosid',
+            'on "$metadata_target" forward +/tmp -- /usr/bin/testprog vfsbench-create',
+            'on "$metadata_target" forward +/tmp -- /usr/bin/testprog vfsbench-rename',
+            "single-node baseline: running metadata operations locally",
+            "locally /usr/bin/testprog vfsbench-create",
+            "locally /usr/bin/testprog vfsbench-rename",
+        ],
+        "WKI metadata showcase",
+    )
+    require_tokens(
+        WOS_SHOWCASE_COMMON.read_text(),
+        ["quick:metadata_iterations", "full:metadata_iterations", "stress:metadata_iterations"],
+        "WKI metadata showcase scales",
+    )
+
+
 def test_mandelbench_worker_waits_use_monotonic_elapsed_time() -> None:
     source = MANDELBENCH_WKI_CPP.read_text()
     require_tokens(
@@ -986,6 +1059,7 @@ def main() -> None:
     test_perfbench_context_switch_counter_is_atomic()
     test_perfbench_parallel_workers_cleanup_before_failure_return()
     test_cowbench_child_wait_is_deadline_bounded()
+    test_vfsbench_metadata_timing_excludes_setup_and_cleanup()
     test_mandelbench_worker_waits_use_monotonic_elapsed_time()
     test_mandelbench_auto_nodes_request_remote_wki_placement()
     test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local()

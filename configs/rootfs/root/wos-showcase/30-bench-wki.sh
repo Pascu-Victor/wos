@@ -8,6 +8,7 @@ DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 data_path="$(showcase_data_path)"
 stat_iterations="${WOS_SHOWCASE_STAT_ITERATIONS:-$(showcase_scale_value stat_iterations)}"
 read_iterations="${WOS_SHOWCASE_READ_ITERATIONS:-$(showcase_scale_value read_iterations)}"
+metadata_iterations="${WOS_SHOWCASE_METADATA_ITERATIONS:-$(showcase_scale_value metadata_iterations)}"
 mandel_width="${WOS_SHOWCASE_MANDEL_WIDTH:-$(showcase_scale_value mandel_width)}"
 mandel_height="${WOS_SHOWCASE_MANDEL_HEIGHT:-$(showcase_scale_value mandel_height)}"
 mandel_iter="${WOS_SHOWCASE_MANDEL_ITER:-$(showcase_scale_value mandel_iter)}"
@@ -26,6 +27,19 @@ showcase_cmd remotely /usr/bin/testprog vfsbench-stat --path "$data_path" --iter
 showcase_section "vfsbench through forward +/srv -/tmp"
 showcase_cmd forward +/srv -/tmp -- /usr/bin/testprog vfsbench-read --path "$data_path" --read-size 65536 --iterations "$read_iterations"
 showcase_cmd remotely forward +/srv -/tmp -- /usr/bin/testprog vfsbench-stat --path "$data_path" --iterations "$stat_iterations"
+
+showcase_section "remote VFS create and rename through forward +/tmp"
+metadata_prefix="/tmp/wos-showcase-vfsbench"
+metadata_target="$(showcase_first_remote_host || true)"
+if [ -n "$metadata_target" ]; then
+    showcase_cmd on "$metadata_target" wosid
+    showcase_cmd on "$metadata_target" forward +/tmp -- /usr/bin/testprog vfsbench-create --path "$metadata_prefix" --iterations "$metadata_iterations"
+    showcase_cmd on "$metadata_target" forward +/tmp -- /usr/bin/testprog vfsbench-rename --path "$metadata_prefix" --iterations "$metadata_iterations"
+else
+    printf 'single-node baseline: running metadata operations locally\n'
+    showcase_cmd locally /usr/bin/testprog vfsbench-create --path "$metadata_prefix" --iterations "$metadata_iterations"
+    showcase_cmd locally /usr/bin/testprog vfsbench-rename --path "$metadata_prefix" --iterations "$metadata_iterations"
+fi
 
 showcase_section "small distributed mandelbench"
 mandel_nodes="${WOS_SHOWCASE_HOSTS:-}"
