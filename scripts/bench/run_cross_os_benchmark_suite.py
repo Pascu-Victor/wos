@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import signal
 import shlex
 import shutil
@@ -26,6 +27,9 @@ DEFAULT_ARTIFACT_FETCH_TIMEOUT_SECONDS = 120.0
 DEFAULT_MANDEL_WORKERS_PER_NODE = 8
 WOS_ACCEPTANCE_TOTAL_VCPUS = 32
 WOS_ACCEPTANCE_TOTAL_MEMORY_MIB = 32 * 1024
+# Keep this aligned with compare_fixed_resource_scaling.py. WOS MemTotal reports
+# allocator-visible usable memory rather than the QEMU -m value.
+WOS_RUNTIME_MIN_USABLE_MEMORY_PERCENT = 85
 
 
 @dataclass(frozen=True)
@@ -333,6 +337,111 @@ def validate_wos_cluster_config(raw_path: str | Path, num_vms: int) -> tuple[dic
         },
         config_bytes,
     )
+
+
+def parse_wos_online_vcpus(proc_stat: str) -> int:
+    raw_cpu_ids = re.findall(r"^cpu([0-9]+)[ \t]+", proc_stat, flags=re.MULTILINE)
+    cpu_ids = [int(cpu_id) for cpu_id in raw_cpu_ids]
+    if (
+        not cpu_ids
+        or len(set(cpu_ids)) != len(cpu_ids)
+        or sorted(cpu_ids) != list(range(len(cpu_ids)))
+        or any(raw_cpu_id != str(cpu_id) for raw_cpu_id, cpu_id in zip(raw_cpu_ids, cpu_ids))
+    ):
+        raise ValueError("/proc/stat must contain one contiguous numbered row for each CPU from cpu0")
+    return len(cpu_ids)
+
+
+def parse_wos_mem_total_kib(meminfo: str) -> int:
+    matches = re.findall(
+        r"^MemTotal:[ \t]*([0-9]+)[ \t]+kB[ \t]*$", meminfo, flags=re.MULTILINE
+    )
+    if len(matches) != 1:
+        raise ValueError("/proc/meminfo must contain exactly one MemTotal value in kB")
+    mem_total_kib = int(matches[0])
+    if mem_total_kib <= 0:
+        raise ValueError("/proc/meminfo MemTotal must be positive")
+    return mem_total_kib
+
+
+def collect_wos_runtime_resources(
+    topology: dict[str, Any], hosts: list[str], *, timeout: float
+) -> dict[str, Any]:
+    if topology.get("config_validated") is not True:
+        raise RuntimeError("runtime resource collection requires a validated WOS topology")
+
+    configured_nodes = topology.get("nodes")
+    if not isinstance(configured_nodes, list) or any(
+        not isinstance(node, dict) for node in configured_nodes
+    ):
+        raise RuntimeError("validated WOS topology has invalid node records")
+    expected_hosts = [f"{node.get('hostname')}.wos" for node in configured_nodes]
+    if hosts != expected_hosts:
+        raise RuntimeError(
+            f"WOS runtime hosts {hosts!r} do not exactly match configured hosts {expected_hosts!r}"
+        )
+
+    runtime_nodes: list[dict[str, Any]] = []
+    for host, configured_node in zip(hosts, configured_nodes, strict=True):
+        expected_hostname = configured_node.get("hostname")
+        configured_vcpus = configured_node.get("vcpus")
+        configured_memory_mib = configured_node.get("memory_mib")
+        if (
+            not isinstance(expected_hostname, str)
+            or not expected_hostname
+            or isinstance(configured_vcpus, bool)
+            or not isinstance(configured_vcpus, int)
+            or configured_vcpus <= 0
+            or isinstance(configured_memory_mib, bool)
+            or not isinstance(configured_memory_mib, int)
+            or configured_memory_mib <= 0
+        ):
+            raise RuntimeError(f"configured resource record for {host} is invalid")
+
+        try:
+            observed_hostname = wos_remote_command(host, "hostname", timeout=timeout).stdout.strip()
+            proc_stat = wos_remote_command(host, "cat /proc/stat", timeout=timeout).stdout
+            meminfo = wos_remote_command(host, "cat /proc/meminfo", timeout=timeout).stdout
+            online_vcpus = parse_wos_online_vcpus(proc_stat)
+            mem_total_kib = parse_wos_mem_total_kib(meminfo)
+        except (RuntimeError, ValueError) as exc:
+            raise RuntimeError(f"failed to collect runtime resources from {host}: {exc}") from exc
+
+        if observed_hostname != expected_hostname:
+            raise RuntimeError(
+                f"{host} reported hostname {observed_hostname!r}; expected {expected_hostname!r}"
+            )
+        if online_vcpus != configured_vcpus:
+            raise RuntimeError(
+                f"{host} reports {online_vcpus} online vCPUs; configured topology requires {configured_vcpus}"
+            )
+
+        configured_memory_kib = configured_memory_mib * 1024
+        minimum_memory_kib = (
+            configured_memory_kib * WOS_RUNTIME_MIN_USABLE_MEMORY_PERCENT // 100
+        )
+        if mem_total_kib < minimum_memory_kib or mem_total_kib > configured_memory_kib:
+            raise RuntimeError(
+                f"{host} reports MemTotal={mem_total_kib} kB; expected allocator-visible memory "
+                f"within {WOS_RUNTIME_MIN_USABLE_MEMORY_PERCENT}%-100% of configured "
+                f"{configured_memory_kib} kB"
+            )
+
+        runtime_nodes.append(
+            {
+                "hostname": expected_hostname,
+                "online_vcpus": online_vcpus,
+                "mem_total_kib": mem_total_kib,
+            }
+        )
+
+    return {
+        "collector": "wos-procfs-v1",
+        "memory_semantics": "allocator-visible-usable-kib",
+        "nodes": runtime_nodes,
+        "total_online_vcpus": sum(node["online_vcpus"] for node in runtime_nodes),
+        "total_mem_total_kib": sum(node["mem_total_kib"] for node in runtime_nodes),
+    }
 
 
 def git_source_state() -> dict[str, Any]:
@@ -2061,6 +2170,24 @@ def main() -> int:
     if not args.skip_renderbench and not linux_duck_scene.is_file():
         parser.error(f"Linux Duck scene not found: {linux_duck_scene}")
 
+    run_wos = args.os in {"both", "wos"}
+    run_linux = args.os in {"both", "linux"}
+    wos_hosts = [f"wos-{index}.wos" for index in range(args.num_vms)]
+    linux_hosts = [f"wos-ubuntu-vm{index}.wos" for index in range(args.num_vms)]
+    wos_launcher = wos_hosts[args.wos_launcher_index]
+    linux_launcher = linux_hosts[args.linux_launcher_index]
+    if wos_cluster is not None and run_wos:
+        try:
+            runtime_resources = collect_wos_runtime_resources(
+                wos_cluster,
+                wos_hosts,
+                timeout=args.wos_preflight_timeout,
+            )
+        except RuntimeError as exc:
+            parser.error(f"WOS runtime resource validation failed: {exc}")
+        wos_cluster["runtime_resources"] = runtime_resources
+        wos_cluster["runtime_validated"] = True
+
     source_state = git_source_state()
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     args.remote_suite_name = f"cross-os-suite-{timestamp}"
@@ -2072,10 +2199,6 @@ def main() -> int:
         topology_snapshot.write_bytes(wos_cluster_bytes)
         wos_cluster["snapshot_file"] = relpath(topology_snapshot)
 
-    wos_hosts = [f"wos-{index}.wos" for index in range(args.num_vms)]
-    linux_hosts = [f"wos-ubuntu-vm{index}.wos" for index in range(args.num_vms)]
-    wos_launcher = wos_hosts[args.wos_launcher_index]
-    linux_launcher = linux_hosts[args.linux_launcher_index]
     mandel_total_workers, mandel_workers_per_node = mandel_worker_layout(args, args.num_vms)
 
     manifest: dict[str, Any] = {
@@ -2184,9 +2307,6 @@ def main() -> int:
         attach_wos_perf_diagnostics(step, post_perf_diagnostic_entries)
         append_step(manifest, suite_dir, step)
         print(f"[suite] {name} complete")
-
-    run_wos = args.os in {"both", "wos"}
-    run_linux = args.os in {"both", "linux"}
 
     if args.schedstat_probe:
         run_step(

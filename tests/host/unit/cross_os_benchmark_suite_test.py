@@ -23,6 +23,41 @@ EXPECTED_LAYOUTS = {
 }
 
 
+def runtime_remote_stub(
+    layout,
+    calls=None,
+    *,
+    hostname_overrides=None,
+    vcpu_overrides=None,
+    memory_overrides=None,
+):
+    hostname_overrides = hostname_overrides or {}
+    vcpu_overrides = vcpu_overrides or {}
+    memory_overrides = memory_overrides or {}
+
+    def remote(host, command, *, timeout=None):
+        if calls is not None:
+            calls.append((host, command, timeout))
+        hostname = host.removesuffix(".wos")
+        node_id = int(hostname.removeprefix("wos-"))
+        vcpus, memory_mib = layout[node_id]
+        if command == "hostname":
+            stdout = hostname_overrides.get(hostname, hostname) + "\n"
+        elif command == "cat /proc/stat":
+            online_vcpus = vcpu_overrides.get(hostname, vcpus)
+            stdout = "cpu  1 0 1 1 0 0 0 0 0 0\n" + "".join(
+                f"cpu{cpu}  1 0 1 1 0 0 0 0 0 0\n" for cpu in range(online_vcpus)
+            )
+        elif command == "cat /proc/meminfo":
+            mem_total_kib = memory_overrides.get(hostname, (memory_mib - 1) * 1024)
+            stdout = f"MemTotal:\t{mem_total_kib} kB\nMemFree:\t1 kB\n"
+        else:
+            fail(f"unexpected WOS runtime resource command: {command}")
+        return subprocess.CompletedProcess([host, command], 0, stdout, "")
+
+    return remote
+
+
 def fail(message: str) -> None:
     raise AssertionError(message)
 
@@ -90,6 +125,147 @@ def test_cluster_mismatch_rejections(runner) -> None:
                 fail(f"unexpected aggregate-resource diagnostic: {exc}")
         else:
             fail("33-vCPU topology was accepted for fixed-resource benchmarking")
+
+
+def test_runtime_resource_parsing(runner) -> None:
+    proc_stat = (
+        "cpu  2 0 2 2 0 0 0 0 0 0\n"
+        "cpu0  1 0 1 1 0 0 0 0 0 0\n"
+        "cpu1\t1 0 1 1 0 0 0 0 0 0\n"
+        "cpu-online 2\n"
+        " cpu2  0 0 0 0 0 0 0 0 0 0\n"
+    )
+    assert_equal(runner.parse_wos_online_vcpus(proc_stat), 2, "numbered /proc/stat CPU rows")
+    assert_equal(
+        runner.parse_wos_mem_total_kib("MemTotal:\t33553408 kB\nMemFree:\t1 kB\n"),
+        33553408,
+        "WOS MemTotal parsing",
+    )
+
+    for invalid in ("", "MemTotal:\t0 kB\n", "MemTotal:\t1 bytes\n"):
+        try:
+            runner.parse_wos_mem_total_kib(invalid)
+        except ValueError:
+            pass
+        else:
+            fail(f"invalid WOS MemTotal was accepted: {invalid!r}")
+
+    invalid_proc_stats = (
+        "cpu  1 0 1 1 0 0 0 0 0 0\n",
+        "cpu0  1 0 1 1 0 0 0 0 0 0\ncpu0  1 0 1 1 0 0 0 0 0 0\n",
+        "cpu0  1 0 1 1 0 0 0 0 0 0\ncpu2  1 0 1 1 0 0 0 0 0 0\n",
+        "cpu00  1 0 1 1 0 0 0 0 0 0\n",
+    )
+    for invalid in invalid_proc_stats:
+        try:
+            runner.parse_wos_online_vcpus(invalid)
+        except ValueError:
+            pass
+        else:
+            fail(f"invalid numbered /proc/stat CPU rows were accepted: {invalid!r}")
+
+
+def test_runtime_resource_collection(runner) -> None:
+    topology, _raw = runner.validate_wos_cluster_config(
+        ROOT / "configs" / "cluster_bench_3.json", 3
+    )
+    hosts = ["wos-0.wos", "wos-1.wos", "wos-2.wos"]
+    calls = []
+    original_remote = runner.wos_remote_command
+    runner.wos_remote_command = runtime_remote_stub(EXPECTED_LAYOUTS[3], calls)
+    try:
+        resources = runner.collect_wos_runtime_resources(topology, hosts, timeout=4.5)
+    finally:
+        runner.wos_remote_command = original_remote
+
+    expected_nodes = [
+        {
+            "hostname": f"wos-{node_id}",
+            "online_vcpus": vcpus,
+            "mem_total_kib": (memory_mib - 1) * 1024,
+        }
+        for node_id, (vcpus, memory_mib) in enumerate(EXPECTED_LAYOUTS[3])
+    ]
+    assert_equal(
+        resources,
+        {
+            "collector": "wos-procfs-v1",
+            "memory_semantics": "allocator-visible-usable-kib",
+            "nodes": expected_nodes,
+            "total_online_vcpus": 32,
+            "total_mem_total_kib": sum(node["mem_total_kib"] for node in expected_nodes),
+        },
+        "runtime resource evidence",
+    )
+    assert_equal(
+        calls,
+        [
+            (host, command, 4.5)
+            for host in hosts
+            for command in ("hostname", "cat /proc/stat", "cat /proc/meminfo")
+        ],
+        "runtime resource probe commands",
+    )
+    assert_equal(topology["runtime_validated"], False, "collector does not validate early")
+    if "runtime_resources" in topology:
+        fail("collector mutated topology before the caller attached complete evidence")
+
+
+def test_runtime_resource_mismatch_rejections(runner) -> None:
+    topology, _raw = runner.validate_wos_cluster_config(
+        ROOT / "configs" / "cluster_bench_1.json", 1
+    )
+    original_remote = runner.wos_remote_command
+
+    cases = [
+        (
+            runtime_remote_stub(
+                EXPECTED_LAYOUTS[1], hostname_overrides={"wos-0": "unexpected-host"}
+            ),
+            "reported hostname",
+        ),
+        (
+            runtime_remote_stub(EXPECTED_LAYOUTS[1], vcpu_overrides={"wos-0": 31}),
+            "reports 31 online vCPUs",
+        ),
+        (
+            runtime_remote_stub(EXPECTED_LAYOUTS[1], memory_overrides={"wos-0": 1}),
+            "allocator-visible memory within 85%-100%",
+        ),
+        (
+            runtime_remote_stub(
+                EXPECTED_LAYOUTS[1], memory_overrides={"wos-0": 32768 * 1024 + 1}
+            ),
+            "allocator-visible memory within 85%-100%",
+        ),
+    ]
+    try:
+        for remote, diagnostic in cases:
+            runner.wos_remote_command = remote
+            try:
+                runner.collect_wos_runtime_resources(topology, ["wos-0.wos"], timeout=1.0)
+            except RuntimeError as exc:
+                if diagnostic not in str(exc):
+                    fail(f"unexpected runtime resource rejection diagnostic: {exc}")
+            else:
+                fail(f"runtime resource mismatch was accepted: {diagnostic}")
+
+        calls = []
+        runner.wos_remote_command = runtime_remote_stub(EXPECTED_LAYOUTS[1], calls)
+        try:
+            runner.collect_wos_runtime_resources(topology, ["wos-0"], timeout=1.0)
+        except RuntimeError as exc:
+            if "do not exactly match configured hosts" not in str(exc):
+                fail(f"unexpected runtime host-list rejection diagnostic: {exc}")
+        else:
+            fail("noncanonical WOS runtime host list was accepted")
+        assert_equal(calls, [], "host-list mismatch aborts before SSH")
+    finally:
+        runner.wos_remote_command = original_remote
+
+    assert_equal(topology["runtime_validated"], False, "failed collection runtime flag")
+    if "runtime_resources" in topology:
+        fail("failed runtime collection attached partial evidence")
 
 
 def test_mandel_worker_modes(runner) -> None:
@@ -411,6 +587,8 @@ def test_mandel_command_composition(runner) -> None:
 def test_manifest_snapshots_validated_config(runner) -> None:
     source = ROOT / "configs" / "cluster_bench_3.json"
     original_argv = sys.argv
+    original_remote = runner.wos_remote_command
+    runner.wos_remote_command = runtime_remote_stub(EXPECTED_LAYOUTS[3])
     try:
         with tempfile.TemporaryDirectory() as tmp:
             sys.argv = [
@@ -436,6 +614,17 @@ def test_manifest_snapshots_validated_config(runner) -> None:
             topology = manifest["wos_cluster"]
             assert_equal(topology["total_vcpus"], 32, "manifest aggregate vCPUs")
             assert_equal(topology["total_memory_mib"], 32768, "manifest aggregate memory")
+            assert_equal(topology["runtime_validated"], True, "manifest runtime flag")
+            assert_equal(
+                topology["runtime_resources"]["collector"],
+                "wos-procfs-v1",
+                "manifest runtime collector",
+            )
+            assert_equal(
+                topology["runtime_resources"]["total_online_vcpus"],
+                32,
+                "manifest runtime aggregate vCPUs",
+            )
             assert_equal(
                 manifest["mandel_workers"],
                 {"mode": "total", "source": "explicit-total", "total": 32, "per_node": None},
@@ -450,6 +639,97 @@ def test_manifest_snapshots_validated_config(runner) -> None:
             assert_equal(snapshot.read_bytes(), source.read_bytes(), "manifest topology snapshot")
     finally:
         sys.argv = original_argv
+        runner.wos_remote_command = original_remote
+
+
+def test_linux_only_manifest_preserves_config_only_evidence(runner) -> None:
+    source = ROOT / "configs" / "cluster_bench_2.json"
+    original_argv = sys.argv
+    original_remote = runner.wos_remote_command
+    runner.wos_remote_command = lambda *_args, **_kwargs: fail(
+        "Linux-only run unexpectedly probed WOS runtime resources"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            sys.argv = [
+                str(RUNNER_PATH),
+                "--num-vms",
+                "2",
+                "--os",
+                "linux",
+                "--wos-cluster-config",
+                str(source),
+                "--results-dir",
+                tmp,
+                "--skip-showcase",
+                "--skip-mandelbench",
+                "--skip-renderbench",
+            ]
+            assert_equal(runner.main(), 0, "Linux-only empty benchmark suite return code")
+            suites = list(Path(tmp).glob("cross-os-suite-*"))
+            assert_equal(len(suites), 1, "Linux-only suite directory count")
+            topology = json.loads(
+                (suites[0] / "manifest.json").read_text(encoding="utf-8")
+            )["wos_cluster"]
+            assert_equal(topology["runtime_validated"], False, "Linux-only runtime flag")
+            if "runtime_resources" in topology:
+                fail("Linux-only manifest attached unobserved runtime resources")
+    finally:
+        sys.argv = original_argv
+        runner.wos_remote_command = original_remote
+
+
+def test_runtime_collection_failure_aborts_before_benchmarks(runner) -> None:
+    source = ROOT / "configs" / "cluster_bench_1.json"
+    original_argv = sys.argv
+    original_remote = runner.wos_remote_command
+    original_showcase = runner.run_wos_showcase
+    showcase_called = False
+
+    def unexpected_showcase(*_args, **_kwargs):
+        nonlocal showcase_called
+        showcase_called = True
+        fail("WOS showcase started after runtime resource validation failed")
+
+    runner.wos_remote_command = runtime_remote_stub(
+        EXPECTED_LAYOUTS[1], vcpu_overrides={"wos-0": 31}
+    )
+    runner.run_wos_showcase = unexpected_showcase
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            sys.argv = [
+                str(RUNNER_PATH),
+                "--num-vms",
+                "1",
+                "--os",
+                "wos",
+                "--wos-cluster-config",
+                str(source),
+                "--results-dir",
+                tmp,
+                "--skip-mandelbench",
+                "--skip-renderbench",
+            ]
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                try:
+                    runner.main()
+                except SystemExit as exc:
+                    assert_equal(exc.code, 2, "runtime resource checkpoint exit status")
+                else:
+                    fail("runtime resource checkpoint failure did not abort the suite")
+            if "WOS runtime resource validation failed" not in stderr.getvalue():
+                fail(f"missing runtime resource checkpoint diagnostic: {stderr.getvalue()}")
+            assert_equal(showcase_called, False, "benchmark start after checkpoint failure")
+            assert_equal(
+                list(Path(tmp).glob("cross-os-suite-*")),
+                [],
+                "suite artifacts created before runtime validation",
+            )
+    finally:
+        sys.argv = original_argv
+        runner.wos_remote_command = original_remote
+        runner.run_wos_showcase = original_showcase
 
 
 def main() -> None:
@@ -457,12 +737,17 @@ def main() -> None:
     tests = [
         test_committed_cluster_provenance,
         test_cluster_mismatch_rejections,
+        test_runtime_resource_parsing,
+        test_runtime_resource_collection,
+        test_runtime_resource_mismatch_rejections,
         test_mandel_worker_modes,
         test_showcase_measurement_parsing,
         test_wos_showcase_metrics_collection,
         test_wos_showcase_metrics_plumbing,
         test_mandel_command_composition,
         test_manifest_snapshots_validated_config,
+        test_linux_only_manifest_preserves_config_only_evidence,
+        test_runtime_collection_failure_aborts_before_benchmarks,
     ]
     for test in tests:
         test(runner)
