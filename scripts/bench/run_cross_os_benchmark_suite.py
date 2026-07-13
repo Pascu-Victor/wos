@@ -439,6 +439,28 @@ def parse_showcase_summary(text: str) -> dict[str, Any]:
     }
 
 
+def parse_showcase_measurements(text: str) -> list[dict[str, Any]]:
+    if not text:
+        return []
+
+    measurements: list[dict[str, Any]] = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            raise RuntimeError(f"showcase metrics.jsonl line {line_number} is empty")
+        try:
+            measurement = json.loads(line)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(
+                f"showcase metrics.jsonl line {line_number} is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(measurement, dict):
+            raise RuntimeError(
+                f"showcase metrics.jsonl line {line_number} must contain a JSON object"
+            )
+        measurements.append(measurement)
+    return measurements
+
+
 def render_cases(args: argparse.Namespace) -> list[RenderCase]:
     return [
         RenderCase(
@@ -1555,10 +1577,18 @@ def run_wos_showcase(
             step_dir / "partial-summary.tsv",
             timeout=fetch_timeout,
         )
+        fetch_optional_remote_file(
+            REMOTE_SCRIPTS / "wos_sftp_get.sh",
+            host,
+            f"{remote_output_root}/metrics.jsonl",
+            step_dir / "partial-metrics.jsonl",
+            timeout=fetch_timeout,
+        )
         raise
     write_text(step_dir / "command.log", step_log_text(result))
 
     summary_local = step_dir / "summary.tsv"
+    metrics_local = step_dir / "metrics.jsonl"
     fetch_remote_file(
         REMOTE_SCRIPTS / "wos_sftp_get.sh",
         host,
@@ -1566,7 +1596,17 @@ def run_wos_showcase(
         summary_local,
         timeout=fetch_timeout,
     )
+    fetch_remote_file(
+        REMOTE_SCRIPTS / "wos_sftp_get.sh",
+        host,
+        f"{remote_output_root}/metrics.jsonl",
+        metrics_local,
+        timeout=fetch_timeout,
+    )
     summary = parse_showcase_summary(summary_local.read_text(encoding="utf-8"))
+    summary["measurements"] = parse_showcase_measurements(
+        metrics_local.read_text(encoding="utf-8")
+    )
     summary.update(
         {
             "benchmark": "showcase",
@@ -1589,6 +1629,7 @@ def run_wos_showcase(
         "result_file": relpath(step_dir / "result.json"),
         "artifacts": [
             relpath(summary_local),
+            relpath(metrics_local),
             relpath(step_dir / "result.json"),
             relpath(step_dir / "command.log"),
         ],

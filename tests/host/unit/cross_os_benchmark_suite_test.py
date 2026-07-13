@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 RUNNER_PATH = ROOT / "scripts" / "bench" / "run_cross_os_benchmark_suite.py"
+WOS_SHOWCASE_RUNNER = ROOT / "configs" / "rootfs" / "root" / "wos-showcase" / "run-all.sh"
 EXPECTED_LAYOUTS = {
     1: [(32, 32768)],
     2: [(16, 16384), (16, 16384)],
@@ -123,6 +124,207 @@ def test_mandel_worker_modes(runner) -> None:
             assert_equal(exc.code, 2, "mutually exclusive worker options exit")
         else:
             fail("per-node and total Mandel worker options were accepted together")
+
+
+def test_showcase_measurement_parsing(runner) -> None:
+    measurements = runner.parse_showcase_measurements(
+        '{"benchmark":"duplicate","sequence":1}\n'
+        '{"benchmark":"duplicate","sequence":2}\n'
+    )
+    assert_equal(
+        measurements,
+        [
+            {"benchmark": "duplicate", "sequence": 1},
+            {"benchmark": "duplicate", "sequence": 2},
+        ],
+        "showcase measurement order",
+    )
+    assert_equal(runner.parse_showcase_measurements(""), [], "empty showcase measurements")
+
+    malformed_inputs = [
+        ("not-json\n", "not valid JSON"),
+        ("[1, 2, 3]\n", "must contain a JSON object"),
+        ('{"valid":true}\n\n', "line 2 is empty"),
+    ]
+    for text, expected_diagnostic in malformed_inputs:
+        try:
+            runner.parse_showcase_measurements(text)
+        except RuntimeError as exc:
+            if expected_diagnostic not in str(exc):
+                fail(f"unexpected metrics rejection diagnostic: {exc}")
+        else:
+            fail(f"invalid showcase metrics were accepted: {text!r}")
+
+
+def test_wos_showcase_metrics_collection(_runner) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        output_root = tmp_path / "output"
+        output_root.mkdir()
+        (output_root / "metrics.jsonl").write_text('{"stale":true}\n', encoding="utf-8")
+
+        successful_case = tmp_path / "successful.sh"
+        successful_case.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' 'ordinary output' "
+            "'{\"benchmark\":\"duplicate\",\"sequence\":1}' "
+            "'[\"not-an-object\"]' "
+            "'{\"benchmark\":\"duplicate\",\"sequence\":2}'\n",
+            encoding="utf-8",
+        )
+        successful_case.chmod(0o755)
+
+        failed_case = tmp_path / "failed.sh"
+        failed_case.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' '{\"benchmark\":\"failed-diagnostic\",\"valid\":true}'\n"
+            "exit 7\n",
+            encoding="utf-8",
+        )
+        failed_case.chmod(0o755)
+
+        result = subprocess.run(
+            [
+                str(WOS_SHOWCASE_RUNNER),
+                "--output-root",
+                str(output_root),
+                str(successful_case),
+                str(failed_case),
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        assert_equal(result.returncode, 1, "showcase failed-case exit status")
+        assert_equal(
+            (output_root / "metrics.jsonl").read_text(encoding="utf-8"),
+            '{"benchmark":"duplicate","sequence":1}\n'
+            '{"benchmark":"duplicate","sequence":2}\n'
+            '{"benchmark":"failed-diagnostic","valid":true}\n',
+            "showcase collected metrics",
+        )
+        if f"METRICS_FILE={output_root}/metrics.jsonl" not in result.stdout:
+            fail(f"showcase metrics path is missing from output: {result.stdout}")
+
+        rerun = subprocess.run(
+            [
+                str(WOS_SHOWCASE_RUNNER),
+                "--output-root",
+                str(output_root),
+                str(successful_case),
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        assert_equal(rerun.returncode, 0, "showcase successful rerun exit status")
+        assert_equal(
+            (output_root / "metrics.jsonl").read_text(encoding="utf-8"),
+            '{"benchmark":"duplicate","sequence":1}\n'
+            '{"benchmark":"duplicate","sequence":2}\n',
+            "showcase metrics truncation",
+        )
+
+
+def test_wos_showcase_metrics_plumbing(runner) -> None:
+    args = runner.build_parser().parse_args(["--num-vms", "2"])
+    suite_remote_root = "/tmp/synthetic-suite"
+    host = "wos-0.wos"
+    hosts = [host, "wos-1.wos"]
+    fetches: list[tuple[str, Path]] = []
+    optional_fetches: list[tuple[str, Path]] = []
+
+    original_prepare = runner.prepare_wos_hosts
+    original_run = runner.run_benchmark_command
+    original_fetch = runner.fetch_remote_file
+    original_optional_fetch = runner.fetch_optional_remote_file
+
+    def fake_fetch(_fetcher, _host, remote_path, local_path, *, timeout):
+        del timeout
+        fetches.append((remote_path, local_path))
+        if remote_path.endswith("/summary.tsv"):
+            local_path.write_text("30-bench-wki\tPASS\tlog=synthetic\n", encoding="utf-8")
+        elif remote_path.endswith("/metrics.jsonl"):
+            local_path.write_text(
+                '{"benchmark":"duplicate","sequence":1}\n'
+                '{"benchmark":"duplicate","sequence":2}\n',
+                encoding="utf-8",
+            )
+        else:
+            fail(f"unexpected showcase fetch: {remote_path}")
+
+    runner.prepare_wos_hosts = lambda _args, _hosts: None
+    runner.run_benchmark_command = lambda _args, _step_dir, command: (
+        subprocess.CompletedProcess(command, 0, "synthetic stdout", ""),
+        [],
+    )
+    runner.fetch_remote_file = fake_fetch
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            suite_dir = Path(tmp)
+            step = runner.run_wos_showcase(args, suite_dir, suite_remote_root, host, hosts)
+            remote_output_root = f"{suite_remote_root}/wos-showcase"
+            assert_equal(
+                [remote_path for remote_path, _local_path in fetches],
+                [f"{remote_output_root}/summary.tsv", f"{remote_output_root}/metrics.jsonl"],
+                "successful showcase fetches",
+            )
+            result = json.loads(
+                (suite_dir / "wos-showcase" / "result.json").read_text(encoding="utf-8")
+            )
+            assert_equal(
+                result["measurements"],
+                [
+                    {"benchmark": "duplicate", "sequence": 1},
+                    {"benchmark": "duplicate", "sequence": 2},
+                ],
+                "showcase result measurements",
+            )
+            metrics_artifact = suite_dir / "wos-showcase" / "metrics.jsonl"
+            if runner.relpath(metrics_artifact) not in step["artifacts"]:
+                fail(f"showcase metrics artifact is missing: {step['artifacts']}")
+            remote_command = step["command"][-1]
+            if f"--output-root {remote_output_root}" not in remote_command:
+                fail(f"showcase remote output root is missing from command: {remote_command}")
+
+        def fake_failed_run(_args, _step_dir, _command):
+            raise RuntimeError("synthetic showcase failure")
+
+        def fake_optional_fetch(_fetcher, _host, remote_path, local_path, *, timeout):
+            del timeout
+            optional_fetches.append((remote_path, local_path))
+            return True
+
+        runner.run_benchmark_command = fake_failed_run
+        runner.fetch_optional_remote_file = fake_optional_fetch
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                runner.run_wos_showcase(args, Path(tmp), suite_remote_root, host, hosts)
+            except RuntimeError as exc:
+                if "synthetic showcase failure" not in str(exc):
+                    fail(f"unexpected failed showcase diagnostic: {exc}")
+            else:
+                fail("failed WOS showcase was reported as successful")
+        assert_equal(
+            [remote_path for remote_path, _local_path in optional_fetches],
+            [
+                f"{suite_remote_root}/wos-showcase/summary.tsv",
+                f"{suite_remote_root}/wos-showcase/metrics.jsonl",
+            ],
+            "failed showcase optional fetches",
+        )
+        assert_equal(
+            [local_path.name for _remote_path, local_path in optional_fetches],
+            ["partial-summary.tsv", "partial-metrics.jsonl"],
+            "failed showcase partial artifact names",
+        )
+    finally:
+        runner.prepare_wos_hosts = original_prepare
+        runner.run_benchmark_command = original_run
+        runner.fetch_remote_file = original_fetch
+        runner.fetch_optional_remote_file = original_optional_fetch
 
 
 def test_mandel_command_composition(runner) -> None:
@@ -256,6 +458,9 @@ def main() -> None:
         test_committed_cluster_provenance,
         test_cluster_mismatch_rejections,
         test_mandel_worker_modes,
+        test_showcase_measurement_parsing,
+        test_wos_showcase_metrics_collection,
+        test_wos_showcase_metrics_plumbing,
         test_mandel_command_composition,
         test_manifest_snapshots_validated_config,
     ]

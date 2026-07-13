@@ -94,12 +94,14 @@ fi
 
 LOG_DIR="$OUTPUT_ROOT/logs"
 SUMMARY_FILE="$OUTPUT_ROOT/summary.tsv"
+METRICS_FILE="$OUTPUT_ROOT/metrics.jsonl"
 PASS=0
 FAIL=0
 SKIP=0
 
 mkdir -p "$LOG_DIR"
 rm -f "$SUMMARY_FILE"
+: > "$METRICS_FILE"
 
 export WOS_SHOWCASE_SCALE="$SCALE"
 export WOS_SHOWCASE_HOSTS="$HOSTS"
@@ -107,6 +109,10 @@ export WOS_SHOWCASE_OUTPUT_ROOT="$OUTPUT_ROOT"
 
 record_summary() {
     printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$SUMMARY_FILE"
+}
+
+collect_metrics() {
+    sed -n '/^[[:space:]]*{.*}[[:space:]]*$/p' "$1" >> "$METRICS_FILE"
 }
 
 run_one() {
@@ -128,13 +134,17 @@ run_one() {
     printf '\n=== RUN %s ===\n' "$name"
     printf 'script=%s scale=%s hosts=%s\n' "$path" "$SCALE" "${HOSTS:-<auto>}"
     if "$path" > "$log" 2>&1; then
-        cat "$log"
+        rc=0
+    else
+        rc="$?"
+    fi
+    collect_metrics "$log"
+    cat "$log"
+    if [ "$rc" -eq 0 ]; then
         PASS=$((PASS + 1))
         printf 'PASS %s\n' "$name"
         record_summary "$name" PASS "log=$log"
     else
-        rc="$?"
-        cat "$log"
         FAIL=$((FAIL + 1))
         printf 'FAIL %s rc=%s\n' "$name" "$rc"
         record_summary "$name" FAIL "rc=$rc log=$log"
@@ -156,6 +166,7 @@ cat "$SUMMARY_FILE"
 printf '\nPASS=%s FAIL=%s SKIP=%s\n' "$PASS" "$FAIL" "$SKIP"
 printf 'RESULT_DIR=%s\n' "$OUTPUT_ROOT"
 printf 'SUMMARY_FILE=%s\n' "$SUMMARY_FILE"
+printf 'METRICS_FILE=%s\n' "$METRICS_FILE"
 
 if [ "$FAIL" -eq 0 ]; then
     exit 0
