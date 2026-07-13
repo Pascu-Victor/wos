@@ -1169,6 +1169,10 @@ auto channel_pool_alloc(WkiPeer* peer, uint16_t peer_node, uint16_t chan_id, Pri
                 s_channel_pool_high_water.store(ALLOCATED_LIMIT, std::memory_order_release);
             }
             peer->channels.at(chan_id) = ch;
+            auto& scan_limit =
+                chan_id < WKI_CHAN_DYNAMIC_RESERVED_BASE ? peer->ordinary_channel_scan_limit : peer->reserved_channel_scan_limit;
+            auto const PUBLISHED_LIMIT = static_cast<uint16_t>(chan_id + 1U);
+            scan_limit.store(std::max(scan_limit.load(std::memory_order_relaxed), PUBLISHED_LIMIT), std::memory_order_release);
             ch->lock.unlock();
             return ch;
         }
@@ -1391,26 +1395,36 @@ auto capture_pending_peer_ack_for_tx_locked(WkiPeer* peer, WkiChannel* tx_ch) ->
         return {};
     }
 
-    for (WkiChannel* candidate : peer->channels) {
-        if (candidate == nullptr || candidate == tx_ch) {
-            continue;
-        }
-        if (!candidate->lock.try_lock()) {
-            continue;
-        }
+    auto capture_in_range = [peer, tx_ch](uint16_t first, uint16_t limit) -> AckSnapshot {
+        for (uint16_t channel_id = first; channel_id < limit; ++channel_id) {
+            WkiChannel* candidate = peer->channels.at(channel_id);
+            if (candidate == nullptr || candidate == tx_ch) {
+                continue;
+            }
+            if (!candidate->lock.try_lock()) {
+                continue;
+            }
 
-        AckSnapshot ack = {};
-        if (candidate->active && candidate->peer_node_id == peer->node_id && candidate->ack_pending) {
-            ack = capture_ack_snapshot_locked(candidate);
-        }
+            AckSnapshot ack = {};
+            if (candidate->active && candidate->peer_node_id == peer->node_id && candidate->ack_pending) {
+                ack = capture_ack_snapshot_locked(candidate);
+            }
 
-        candidate->lock.unlock();
-        if (ack_snapshot_present(ack)) {
-            return ack;
+            candidate->lock.unlock();
+            if (ack_snapshot_present(ack)) {
+                return ack;
+            }
         }
+        return {};
+    };
+
+    uint16_t const ORDINARY_LIMIT = peer->ordinary_channel_scan_limit.load(std::memory_order_acquire);
+    if (AckSnapshot ack = capture_in_range(0, ORDINARY_LIMIT); ack_snapshot_present(ack)) {
+        return ack;
     }
 
-    return {};
+    uint16_t const RESERVED_LIMIT = peer->reserved_channel_scan_limit.load(std::memory_order_acquire);
+    return capture_in_range(WKI_CHAN_DYNAMIC_RESERVED_BASE, RESERVED_LIMIT);
 }
 
 auto transmit_ack_snapshot(const AckSnapshot& ack) -> int {

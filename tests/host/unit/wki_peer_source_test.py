@@ -535,6 +535,66 @@ def test_ipc_data_ordered_dispatch_wait_uses_explicit_daemon_wake() -> None:
     )
 
 
+def test_cross_channel_ack_scan_uses_allocated_range_bounds() -> None:
+    source = WKI_CPP.read_text()
+    header = WKI_HPP.read_text()
+    for token in [
+        "std::atomic<uint16_t>::is_always_lock_free",
+        '"WKI channel scan bounds must stay lock-free"',
+        "std::atomic<uint16_t> ordinary_channel_scan_limit{0};",
+        "std::atomic<uint16_t> reserved_channel_scan_limit{WKI_CHAN_DYNAMIC_RESERVED_BASE};",
+    ]:
+        if token not in header:
+            fail(f"per-peer ACK scan bound is missing {token}")
+
+    allocator = function_body(source, "channel_pool_alloc")
+    for token in [
+        "chan_id < WKI_CHAN_DYNAMIC_RESERVED_BASE",
+        "peer->ordinary_channel_scan_limit",
+        "peer->reserved_channel_scan_limit",
+        "std::max(scan_limit.load(std::memory_order_relaxed), PUBLISHED_LIMIT)",
+        "std::memory_order_release",
+    ]:
+        if token not in allocator:
+            fail(f"channel publication is missing ACK scan bound update {token}")
+    require_order(
+        allocator,
+        "peer->channels.at(chan_id) = ch;",
+        "scan_limit.store(",
+        "channel pointer must be published before its ACK scan bound",
+    )
+    require_order(
+        allocator,
+        "scan_limit.store(",
+        "ch->lock.unlock();",
+        "ACK scan bound must be published before the initialized channel is unlocked",
+    )
+
+    capture = function_body(source, "capture_pending_peer_ack_for_tx_locked")
+    if "for (WkiChannel* candidate : peer->channels)" in capture:
+        fail("cross-channel ACK scan must not walk the full per-peer table")
+    for token in [
+        "auto capture_in_range = [peer, tx_ch](uint16_t first, uint16_t limit)",
+        "peer->channels.at(channel_id)",
+        "ordinary_channel_scan_limit.load(std::memory_order_acquire)",
+        "reserved_channel_scan_limit.load(std::memory_order_acquire)",
+        "capture_in_range(0, ORDINARY_LIMIT)",
+        "capture_in_range(WKI_CHAN_DYNAMIC_RESERVED_BASE, RESERVED_LIMIT)",
+    ]:
+        if token not in capture:
+            fail(f"bounded cross-channel ACK scan is missing {token}")
+    require_order(
+        capture,
+        "capture_in_range(0, ORDINARY_LIMIT)",
+        "reserved_channel_scan_limit.load(std::memory_order_acquire)",
+        "ordinary ACK channels must retain priority over reserved channels",
+    )
+    for close_function in ["wki_channel_close", "wki_channels_close_for_peer"]:
+        close_body = function_body(source, close_function)
+        if "channel_scan_limit" in close_body:
+            fail(f"{close_function} must not lower monotonic ACK scan bounds")
+
+
 def main() -> None:
     test_hello_ack_reconnects_fenced_peer_outside_peer_lock()
     test_hello_boot_epoch_fences_connected_broadcast_restarts()
@@ -545,6 +605,7 @@ def main() -> None:
     test_forwarding_recomputes_checksum_after_ttl_decrement()
     test_ipc_data_acks_after_ordered_dispatch()
     test_ipc_data_ordered_dispatch_wait_uses_explicit_daemon_wake()
+    test_cross_channel_ack_scan_uses_allocated_range_bounds()
     print("WKI peer source invariants hold")
 
 

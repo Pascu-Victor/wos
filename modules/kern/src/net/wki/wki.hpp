@@ -39,6 +39,7 @@ constexpr size_t WKI_MAX_CHANNELS = 256;  // per-peer
 constexpr size_t WKI_RX_DISPATCH_WAITER_SLOTS = 8;
 static_assert(WKI_CHAN_DYNAMIC_BASE < WKI_CHAN_DYNAMIC_RESERVED_BASE, "dynamic channel allocation range must not be empty");
 static_assert(WKI_CHAN_DYNAMIC_RESERVED_BASE < WKI_MAX_CHANNELS, "reserved WKI channels must fit in the per-peer channel table");
+static_assert(std::atomic<uint16_t>::is_always_lock_free, "WKI channel scan bounds must stay lock-free");
 
 // Heartbeat defaults (in milliseconds to fit in uint16_t for wire format)
 constexpr uint16_t WKI_DEFAULT_HEARTBEAT_INTERVAL_MS = 1000;  // 1 second
@@ -215,6 +216,11 @@ struct WkiPeer {
     // Per-peer channel index - O(1) lookup by channel_id
     // Pointers into the global channel pool; nullptr = not allocated.
     std::array<WkiChannel*, WKI_MAX_CHANNELS> channels = {};
+    // Monotonic exclusive bounds for nonblocking cross-channel ACK scans.
+    // Keeping the reserved range separate prevents IPC_DATA at channel 240
+    // from forcing every send to walk the unused ordinary-channel gap.
+    std::atomic<uint16_t> ordinary_channel_scan_limit{0};
+    std::atomic<uint16_t> reserved_channel_scan_limit{WKI_CHAN_DYNAMIC_RESERVED_BASE};
 
     ker::mod::sys::Spinlock lock;
 
