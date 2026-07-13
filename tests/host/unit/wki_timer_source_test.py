@@ -68,12 +68,56 @@ def require_order(source: str, tokens: list[str], context: str) -> None:
 def test_remote_net_stats_poll_is_scheduled() -> None:
     source = WKI_CPP.read_text()
     deferred_body = function_body(source, "process_deferred_blocking_work")
+    worker_body = function_body(source, "wki_deferred_work_thread")
     timer_body = function_body(source, "wki_timer_tick")
 
     if "wki_remote_net_poll_stats();" not in deferred_body:
         fail("process_deferred_blocking_work() must schedule remote NET stats polling")
-    if "process_deferred_blocking_work();" not in timer_body:
-        fail("wki_timer_tick() must run deferred WKI maintenance work")
+    if "process_deferred_blocking_work();" not in worker_body:
+        fail("wki_deferred_work_thread() must run deferred WKI maintenance work")
+    if "wki_deferred_work_notify();" not in timer_body:
+        fail("wki_timer_tick() must wake the deferred WKI maintenance worker")
+
+
+def test_timer_scans_only_published_channel_prefix() -> None:
+    source = WKI_CPP.read_text()
+    allocator_body = braced_block_after(source, "auto channel_pool_alloc(")
+    slots_body = braced_block_after(source, "auto channel_pool_timer_slots(")
+    deadline_body = braced_block_after(source, "auto wki_next_fast_timer_deadline_us(")
+    timer_body = function_body(source, "wki_timer_tick")
+
+    require_tokens(
+        source,
+        ["std::atomic<size_t> s_channel_pool_high_water{0}"],
+        "channel-pool high-water initialization",
+    )
+    require_order(
+        allocator_body,
+        [
+            "channel_init(ch",
+            "size_t const ALLOCATED_LIMIT = channel_index + 1",
+            "if (ALLOCATED_LIMIT > s_channel_pool_high_water.load(std::memory_order_relaxed))",
+            "s_channel_pool_high_water.store(ALLOCATED_LIMIT, std::memory_order_release)",
+            "peer->channels.at(chan_id) = ch",
+            "ch->lock.unlock()",
+        ],
+        "channel-pool high-water publication",
+    )
+    require_tokens(
+        slots_body,
+        [
+            "s_channel_pool_high_water.load(std::memory_order_acquire)",
+            "s_channel_pool.size()",
+            "s_channel_pool.data()",
+        ],
+        "bounded timer channel view",
+    )
+    if "for (const auto& channel : channel_pool_timer_slots())" not in deadline_body:
+        fail("fast deadline scan must use the published channel prefix")
+    if "for (auto& pool_entry : channel_pool_timer_slots())" not in timer_body:
+        fail("timer tick must use the published channel prefix")
+    if source.count("s_channel_pool_high_water.store(") != 1:
+        fail("channel-pool high-water mark must only be raised by allocation")
 
 
 def test_deferred_work_reentrancy_guard_prevents_recursive_blocking_work() -> None:
@@ -167,6 +211,7 @@ def test_remote_net_stats_poll_has_cadence_guard() -> None:
 
 def main() -> None:
     test_remote_net_stats_poll_is_scheduled()
+    test_timer_scans_only_published_channel_prefix()
     test_deferred_work_reentrancy_guard_prevents_recursive_blocking_work()
     test_deferred_waiter_uses_spin_yield_instead_of_self_blocking()
     test_remote_net_stats_poll_has_cadence_guard()

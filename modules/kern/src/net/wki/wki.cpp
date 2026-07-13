@@ -1047,6 +1047,9 @@ namespace {
 std::array<WkiChannel, CHANNEL_POOL_SIZE> s_channel_pool;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool s_channel_pool_init = false;                          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::mod::sys::Spinlock s_channel_pool_lock;               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+// Highest channel-pool index ever published, plus one. It is monotonic so a
+// timer snapshot remains safe across channel close and slot reuse.
+std::atomic<size_t> s_channel_pool_high_water{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 void channel_pool_init() {
     if (s_channel_pool_init) {
@@ -1056,6 +1059,11 @@ void channel_pool_init() {
         channel.active = false;
     }
     s_channel_pool_init = true;
+}
+
+auto channel_pool_timer_slots() -> std::span<WkiChannel> {
+    size_t const LIMIT = std::min(s_channel_pool_high_water.load(std::memory_order_acquire), s_channel_pool.size());
+    return {s_channel_pool.data(), LIMIT};
 }
 
 // Free a retransmit entry - checks whether it's the inline pre-allocated entry
@@ -1150,11 +1158,16 @@ void wake_reliable_dispatch_waiters(const DispatchWaiterList& waiters) {
 // Allocate a pool slot and register in peer->channels[].
 // Caller must hold s_channel_pool_lock.
 auto channel_pool_alloc(WkiPeer* peer, uint16_t peer_node, uint16_t chan_id, PriorityClass prio, uint16_t credits) -> WkiChannel* {
-    for (auto& pool_entry : s_channel_pool) {
+    for (size_t channel_index = 0; channel_index < s_channel_pool.size(); ++channel_index) {
+        auto& pool_entry = s_channel_pool.at(channel_index);
         if (!pool_entry.active) {
             WkiChannel* ch = &pool_entry;
             ch->lock.lock();
             channel_init(ch, peer_node, chan_id, prio, credits);
+            size_t const ALLOCATED_LIMIT = channel_index + 1;
+            if (ALLOCATED_LIMIT > s_channel_pool_high_water.load(std::memory_order_relaxed)) {
+                s_channel_pool_high_water.store(ALLOCATED_LIMIT, std::memory_order_release);
+            }
             peer->channels.at(chan_id) = ch;
             ch->lock.unlock();
             return ch;
@@ -1472,7 +1485,7 @@ auto wki_next_fast_timer_deadline_us(uint64_t now_us) -> uint64_t {
     uint64_t next_deadline = UINT64_MAX;
 
     s_channel_pool_lock.lock();
-    for (const auto& channel : s_channel_pool) {
+    for (const auto& channel : channel_pool_timer_slots()) {
         WkiChannel const* ch = &channel;
         if (!ch->active) {
             continue;
@@ -2965,8 +2978,8 @@ void wki_timer_tick(uint64_t now_us) {
         return;
     }
 
-    // Check retransmit deadlines on all active channels
-    for (auto& pool_entry : s_channel_pool) {
+    // Check retransmit deadlines on every pool slot that has ever been used.
+    for (auto& pool_entry : channel_pool_timer_slots()) {
         WkiChannel* ch = &pool_entry;
         if (!ch->active) {
             continue;
