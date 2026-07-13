@@ -1910,39 +1910,66 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
     // Build frame directly in packet buffer data region
     uint8_t* frame = pkt->data;
 
-    auto* heap_rt_entry = new (std::nothrow) WkiRetransmitEntry{};
+    WkiRetransmitEntry* heap_rt_entry = nullptr;
     uint8_t* heap_rt_data = nullptr;
-    if (heap_rt_entry != nullptr) {
-        heap_rt_data = new (std::nothrow) uint8_t[FRAME_LEN];
-        if (heap_rt_data == nullptr) {
-            delete heap_rt_entry;
-            heap_rt_entry = nullptr;
-        }
-    }
+    bool heap_rt_prepare_attempted = false;
+    uint32_t heap_rt_channel_generation = 0;
+    bool use_inline_retransmit = false;
+    uint64_t const TRACE_CALLSITE = WOS_PERF_CALLSITE();
 
     ch->lock.lock();
+    for (;;) {
+        bool const CHANNEL_REUSED = heap_rt_prepare_attempted && ch->generation != heap_rt_channel_generation;
+        if (!ch->active || ch->peer_node_id != dst_node || ch->channel_id != channel_id || CHANNEL_REUSED) {
+            ch->lock.unlock();
+            delete[] heap_rt_data;
+            delete heap_rt_entry;
+            net::pkt_free(pkt);
+            return WKI_ERR_NOT_FOUND;
+        }
 
-    if (!ch->active || ch->peer_node_id != dst_node || ch->channel_id != channel_id) {
+        // Check credits before allocating fallback storage. Another sender may
+        // consume the final credit while this thread temporarily drops the lock,
+        // so revalidate on every pass through the two-phase reservation.
+        if (ch->tx_credits == 0) {
+            uint32_t const TRACE_CORRELATION = ch->tx_seq;
+            ch->lock.unlock();
+            delete[] heap_rt_data;
+            delete heap_rt_entry;
+            net::pkt_free(pkt);
+            perf_record_transport_point(mod::perf::WkiPerfTransportOp::NO_CREDITS, dst_node, channel_id, WKI_ERR_NO_CREDITS, 0,
+                                        TRACE_CORRELATION, TRACE_CALLSITE);
+            return WKI_ERR_NO_CREDITS;
+        }
+
+        bool const INLINE_RETRANSMIT_AVAILABLE = wki_channel_has_inline_retransmit_storage(ch, FRAME_LEN);
+        if (heap_rt_entry != nullptr || INLINE_RETRANSMIT_AVAILABLE) {
+            use_inline_retransmit = heap_rt_entry == nullptr && INLINE_RETRANSMIT_AVAILABLE;
+            break;
+        }
+        if (heap_rt_prepare_attempted) {
+            break;
+        }
+
+        // Heap allocation cannot run while holding a channel spinlock. Drop the
+        // lock only for the uncommon large/multiple-in-flight frame, then retry
+        // channel generation, identity, credit, and inline-slot checks after
+        // allocation so a recycled pool slot cannot receive this frame.
+        heap_rt_channel_generation = ch->generation;
         ch->lock.unlock();
-        delete[] heap_rt_data;
-        delete heap_rt_entry;
-        net::pkt_free(pkt);
-        return WKI_ERR_NOT_FOUND;
+        heap_rt_prepare_attempted = true;
+        heap_rt_entry = new (std::nothrow) WkiRetransmitEntry{};
+        if (heap_rt_entry != nullptr) {
+            heap_rt_data = new (std::nothrow) uint8_t[FRAME_LEN];
+            if (heap_rt_data == nullptr) {
+                delete heap_rt_entry;
+                heap_rt_entry = nullptr;
+            }
+        }
+        ch->lock.lock();
     }
 
-    uint64_t const TRACE_CALLSITE = WOS_PERF_CALLSITE();
     uint32_t const TRACE_CORRELATION = ch->tx_seq;
-
-    // Check credits
-    if (ch->tx_credits == 0) {
-        ch->lock.unlock();
-        delete[] heap_rt_data;
-        delete heap_rt_entry;
-        net::pkt_free(pkt);
-        perf_record_transport_point(mod::perf::WkiPerfTransportOp::NO_CREDITS, dst_node, channel_id, WKI_ERR_NO_CREDITS, 0,
-                                    TRACE_CORRELATION, TRACE_CALLSITE);
-        return WKI_ERR_NO_CREDITS;
-    }
 
     perf_record_transport_begin(dst_node, channel_id, TRACE_CORRELATION, payload_len, TRACE_CALLSITE);
 
@@ -2001,17 +2028,23 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
     WkiRetransmitEntry* rt_entry = nullptr;
     uint8_t* rt_data = nullptr;
 
-    if (!ch->tx_rt_entry_in_use && FRAME_LEN <= WkiChannel::WKI_RT_INLINE_SIZE) {
+    if (heap_rt_entry != nullptr) {
+        // The slow path already paid for fallback storage. Keep the inline slot
+        // free for another small frame that may arrive before this one is ACKed.
+        rt_entry = heap_rt_entry;
+        rt_data = heap_rt_data;
+        heap_rt_entry = nullptr;
+        heap_rt_data = nullptr;
+    } else if (use_inline_retransmit) {
         // Fast path: use pre-allocated inline buffers (fits small frames)
         rt_entry = &ch->tx_rt_entry;
         rt_data = ch->tx_rt_buf.data();
         ch->tx_rt_entry_in_use = true;
     } else {
-        // Slow path: use the heap storage prepared before taking the channel lock.
-        rt_entry = heap_rt_entry;
-        rt_data = heap_rt_data;
-        heap_rt_entry = nullptr;
-        heap_rt_data = nullptr;
+        // Allocation failed while the lock was dropped, and the inline slot did
+        // not become available before the channel was revalidated.
+        rt_entry = nullptr;
+        rt_data = nullptr;
     }
 
     bool notify_timer = false;

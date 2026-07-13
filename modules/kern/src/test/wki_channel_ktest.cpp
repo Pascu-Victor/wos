@@ -168,3 +168,14 @@ KTEST(WkiChannel, AckNextMustNotAdvancePastTransmittedSeq) {
     KEXPECT_FALSE(ker::net::wki::wki_channel_ack_next_within_sent_window(&ch, 2));
     KEXPECT_FALSE(ker::net::wki::wki_channel_ack_next_within_sent_window(nullptr, 1));
 }
+
+KTEST(WkiChannel, InlineRetransmitStorageRequiresCapacityAndIdleSlot) {
+    ker::net::wki::WkiChannel ch{};
+
+    KEXPECT_TRUE(ker::net::wki::wki_channel_has_inline_retransmit_storage(&ch, ker::net::wki::WkiChannel::WKI_RT_INLINE_SIZE));
+    KEXPECT_FALSE(ker::net::wki::wki_channel_has_inline_retransmit_storage(&ch, ker::net::wki::WkiChannel::WKI_RT_INLINE_SIZE + 1));
+
+    ch.tx_rt_entry_in_use = true;
+    KEXPECT_FALSE(ker::net::wki::wki_channel_has_inline_retransmit_storage(&ch, 1));
+    KEXPECT_FALSE(ker::net::wki::wki_channel_has_inline_retransmit_storage(nullptr, 1));
+}

@@ -203,6 +203,17 @@ TEST(WkiChannel, AckNextMustNotAdvancePastTransmittedSeq) {
     EXPECT_FALSE(wki_channel_ack_next_within_sent_window(nullptr, 1));
 }
 
+TEST(WkiChannel, InlineRetransmitStorageRequiresCapacityAndIdleSlot) {
+    WkiChannel ch{};
+
+    EXPECT_TRUE(wki_channel_has_inline_retransmit_storage(&ch, WkiChannel::WKI_RT_INLINE_SIZE));
+    EXPECT_FALSE(wki_channel_has_inline_retransmit_storage(&ch, WkiChannel::WKI_RT_INLINE_SIZE + 1));
+
+    ch.tx_rt_entry_in_use = true;
+    EXPECT_FALSE(wki_channel_has_inline_retransmit_storage(&ch, 1));
+    EXPECT_FALSE(wki_channel_has_inline_retransmit_storage(nullptr, 1));
+}
+
 // =============================================================================
 // Reliability Constants
 // =============================================================================

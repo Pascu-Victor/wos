@@ -30,6 +30,12 @@ auto wki_channel_lookup_in_peer(WkiPeer* peer, uint16_t peer_node, uint16_t chan
 // True when ACK_NEXT does not acknowledge beyond bytes this channel has sent.
 auto wki_channel_ack_next_within_sent_window(const WkiChannel* ch, uint32_t ack_next) -> bool;
 
+// True when a small reliable frame can use storage embedded in the channel.
+// Concurrent callers must hold WkiChannel::lock while inspecting/reserving it.
+inline auto wki_channel_has_inline_retransmit_storage(const WkiChannel* ch, size_t frame_len) -> bool {
+    return ch != nullptr && frame_len <= WkiChannel::WKI_RT_INLINE_SIZE && !ch->tx_rt_entry_in_use;
+}
+
 // Get default credit count for a well-known channel
 auto wki_channel_default_credits(uint16_t channel_id) -> uint16_t;
 
