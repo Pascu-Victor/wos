@@ -122,6 +122,20 @@ def wos_remote_command(host: str, command: str, *, timeout: float | None = None)
     return run_command([str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, command], timeout=timeout)
 
 
+def wos_remote_file_sha256(host: str, path: str, *, timeout: float) -> str:
+    result = wos_remote_command(
+        host,
+        f"sha256sum -- {shlex.quote(path)}",
+        timeout=timeout,
+    )
+    match = re.fullmatch(r"([0-9a-f]{64})[ \t]+[^\r\n]+\n?", result.stdout)
+    if match is None:
+        raise RuntimeError(
+            f"{host}: sha256sum returned malformed output for {path!r}: {result.stdout!r}"
+        )
+    return match.group(1)
+
+
 def wos_benchmark_pids(host: str, *, timeout: float) -> list[int]:
     result = wos_remote_command(host, "ps aux 2>/dev/null || ps", timeout=timeout)
     pids: list[int] = []
@@ -1398,6 +1412,15 @@ def run_wos_renderbench(
     placement: str,
 ) -> dict[str, Any]:
     prepare_wos_hosts(args, wos_hosts)
+    scene_sha256 = (
+        wos_remote_file_sha256(
+            host,
+            case.wos_scene,
+            timeout=args.wos_preflight_timeout,
+        )
+        if case.wos_scene is not None
+        else None
+    )
 
     step_name = f"wos-render-{case.name}-{placement}"
     step_dir = suite_dir / step_name
@@ -1436,8 +1459,11 @@ def run_wos_renderbench(
         command += ["--debug-constant-tile-us", str(args.render_debug_constant_tile_us)]
     if args.render_debug_node_thread_batch_size > 0:
         command += ["--debug-node-thread-batch-size", str(args.render_debug_node_thread_batch_size)]
-    if args.wos_coordinator_reserve_cpus is not None:
-        command += ["--coordinator-reserve-cpus", str(args.wos_coordinator_reserve_cpus)]
+    coordinator_reserve_cpus = args.wos_coordinator_reserve_cpus
+    if args.wos_render_tuning == "optimal":
+        coordinator_reserve_cpus = 0
+    if coordinator_reserve_cpus is not None:
+        command += ["--coordinator-reserve-cpus", str(coordinator_reserve_cpus)]
     node_worker_reserve_cpus = args.wos_node_worker_reserve_cpus
     if args.wos_render_tuning == "safe" and placement == "node-threads" and node_worker_reserve_cpus == 0:
         node_worker_reserve_cpus = 1
@@ -1550,6 +1576,7 @@ def run_wos_renderbench(
             "host": host,
             "scene": case.name,
             "scene_path": case.wos_scene,
+            "scene_sha256": scene_sha256,
             "image_artifact": "frame_000.png" if frame_fetched else "preview.png",
         }
     )
@@ -1900,7 +1927,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("manual", "optimal", "safe"),
         default="manual",
         help=(
-            "Category-specific WOS renderbench tuning. 'optimal' keeps node-threads on the fast no-reserve path "
+            "Category-specific WOS renderbench tuning. 'optimal' explicitly uses coordinator reserve 0 "
             "and 'safe' also reserves one node-thread CPU per host. Persistent process-per-core workers remain "
             "explicitly opt-in."
         ),
@@ -2130,6 +2157,10 @@ def main() -> int:
     if args.wos_disable_process_persistent_workers and args.wos_enable_process_persistent_workers:
         parser.error("--wos-disable-process-persistent-workers and --wos-enable-process-persistent-workers are mutually exclusive")
     if args.wos_render_tuning == "optimal":
+        if args.wos_coordinator_reserve_cpus not in (None, 0):
+            parser.error(
+                "--wos-render-tuning optimal is incompatible with nonzero --wos-coordinator-reserve-cpus"
+            )
         if args.wos_node_worker_reserve_cpus > 0:
             parser.error("--wos-render-tuning optimal is incompatible with --wos-node-worker-reserve-cpus")
         if args.wos_coordinator_skip_local_worker:

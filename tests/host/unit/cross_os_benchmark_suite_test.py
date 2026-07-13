@@ -584,6 +584,193 @@ def test_mandel_command_composition(runner) -> None:
         runner.parse_mandel_report = original_parse
 
 
+def test_wos_render_command_and_scene_evidence(runner) -> None:
+    parser = runner.build_parser()
+    host = "wos-0.wos"
+    hosts = [host, "wos-1.wos"]
+    duck_digest = "65bf938f54d6073e619e76e007820bbf980cdc3dc0daec0d94830ffc4ae54ab5"
+    remote_calls: list[tuple[str, str, float | None]] = []
+
+    original_prepare = runner.prepare_wos_hosts
+    original_remote = runner.wos_remote_command
+    original_run = runner.run_benchmark_command
+    original_fetch = runner.fetch_remote_file
+    original_optional_fetch = runner.fetch_optional_remote_file
+
+    def fake_remote(remote_host, command, *, timeout=None):
+        remote_calls.append((remote_host, command, timeout))
+        return subprocess.CompletedProcess(
+            [remote_host, command], 0, f"{duck_digest}  /srv/Duck.glb\n", ""
+        )
+
+    def fake_fetch(_fetcher, _host, _remote_path, local_path, *, timeout):
+        del timeout
+        if local_path.name == "metrics.json":
+            local_path.write_text('{"elapsed_seconds":1.0}\n', encoding="utf-8")
+        elif local_path.name == "status.json":
+            local_path.write_text('{"coordinator_reserve_cpus":0}\n', encoding="utf-8")
+        elif local_path.name == "ipc_profile.json":
+            local_path.write_text('{"effective_reserve_cpus":0}\n', encoding="utf-8")
+        elif local_path.name == "preview.png":
+            local_path.write_bytes(b"synthetic preview")
+        else:
+            fail(f"unexpected render fetch target: {local_path}")
+
+    runner.prepare_wos_hosts = lambda _args, _hosts: None
+    runner.wos_remote_command = fake_remote
+    runner.run_benchmark_command = lambda _args, _step_dir, command: (
+        subprocess.CompletedProcess(command, 0, "", ""),
+        [],
+    )
+    runner.fetch_remote_file = fake_fetch
+    runner.fetch_optional_remote_file = (
+        lambda _fetcher, _host, _remote_path, _local_path, *, timeout: False
+    )
+    try:
+        optimal_args = parser.parse_args(
+            ["--num-vms", "2", "--wos-render-tuning", "optimal"]
+        )
+        cases = runner.render_cases(optimal_args)
+        with tempfile.TemporaryDirectory() as tmp:
+            suite_dir = Path(tmp)
+            builtin_step = runner.run_wos_renderbench(
+                optimal_args,
+                suite_dir,
+                "/tmp/render-evidence",
+                host,
+                hosts,
+                cases[0],
+                "node-threads",
+            )
+            builtin_command = builtin_step["command"]
+            reserve_index = builtin_command.index("--coordinator-reserve-cpus")
+            assert_equal(
+                builtin_command[reserve_index + 1], "0", "optimal node-thread reserve"
+            )
+            assert_equal(
+                builtin_command.count("--coordinator-reserve-cpus"),
+                1,
+                "optimal node-thread reserve count",
+            )
+            if "--scene" in builtin_command:
+                fail(f"builtin render unexpectedly supplied a scene: {builtin_command}")
+            builtin_result = json.loads(
+                (suite_dir / "wos-render-default-scene-node-threads" / "result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert_equal(builtin_result["scene_sha256"], None, "builtin scene digest")
+            assert_equal(remote_calls, [], "builtin scene hash commands")
+
+            duck_step = runner.run_wos_renderbench(
+                optimal_args,
+                suite_dir,
+                "/tmp/render-evidence",
+                host,
+                hosts,
+                cases[1],
+                "process-per-core",
+            )
+            duck_command = duck_step["command"]
+            reserve_index = duck_command.index("--coordinator-reserve-cpus")
+            assert_equal(
+                duck_command[reserve_index + 1], "0", "optimal process reserve"
+            )
+            scene_index = duck_command.index("--scene")
+            assert_equal(duck_command[scene_index + 1], "/srv/Duck.glb", "Duck scene path")
+            duck_result = json.loads(
+                (suite_dir / "wos-render-duck-process-per-core" / "result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert_equal(duck_result["scene_sha256"], duck_digest, "Duck scene digest")
+            assert_equal(
+                remote_calls,
+                [(host, "sha256sum -- /srv/Duck.glb", optimal_args.wos_preflight_timeout)],
+                "Duck scene hash command",
+            )
+
+        manual_args = parser.parse_args(["--num-vms", "2"])
+        with tempfile.TemporaryDirectory() as tmp:
+            manual_step = runner.run_wos_renderbench(
+                manual_args,
+                Path(tmp),
+                "/tmp/render-manual",
+                host,
+                hosts,
+                runner.render_cases(manual_args)[0],
+                "node-threads",
+            )
+            if "--coordinator-reserve-cpus" in manual_step["command"]:
+                fail(f"manual render unexpectedly forced coordinator reserve: {manual_step['command']}")
+
+        runner.wos_remote_command = lambda remote_host, command, *, timeout=None: subprocess.CompletedProcess(
+            [remote_host, command], 0, f"{'A' * 64}  /srv/Duck.glb\n", ""
+        )
+        try:
+            runner.wos_remote_file_sha256(host, "/srv/Duck.glb", timeout=1.0)
+        except RuntimeError as exc:
+            if "malformed output" not in str(exc):
+                fail(f"unexpected malformed scene digest diagnostic: {exc}")
+        else:
+            fail("uppercase WOS scene digest was accepted")
+    finally:
+        runner.prepare_wos_hosts = original_prepare
+        runner.wos_remote_command = original_remote
+        runner.run_benchmark_command = original_run
+        runner.fetch_remote_file = original_fetch
+        runner.fetch_optional_remote_file = original_optional_fetch
+
+
+def test_optimal_render_rejects_nonzero_coordinator_reserve(runner) -> None:
+    original_argv = sys.argv
+    try:
+        sys.argv = [
+            str(RUNNER_PATH),
+            "--num-vms",
+            "1",
+            "--wos-render-tuning",
+            "optimal",
+            "--wos-coordinator-reserve-cpus",
+            "1",
+            "--skip-showcase",
+            "--skip-mandelbench",
+            "--skip-renderbench",
+        ]
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            try:
+                runner.main()
+            except SystemExit as exc:
+                assert_equal(exc.code, 2, "optimal coordinator conflict exit")
+            else:
+                fail("optimal render accepted a nonzero coordinator reserve")
+        if "incompatible with nonzero --wos-coordinator-reserve-cpus" not in stderr.getvalue():
+            fail(f"missing optimal coordinator conflict diagnostic: {stderr.getvalue()}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sys.argv = [
+                str(RUNNER_PATH),
+                "--num-vms",
+                "1",
+                "--os",
+                "linux",
+                "--wos-render-tuning",
+                "optimal",
+                "--wos-coordinator-reserve-cpus",
+                "0",
+                "--results-dir",
+                tmp,
+                "--skip-showcase",
+                "--skip-mandelbench",
+                "--skip-renderbench",
+            ]
+            with contextlib.redirect_stdout(io.StringIO()):
+                assert_equal(runner.main(), 0, "optimal explicit zero coordinator reserve")
+    finally:
+        sys.argv = original_argv
+
+
 def test_manifest_snapshots_validated_config(runner) -> None:
     source = ROOT / "configs" / "cluster_bench_3.json"
     original_argv = sys.argv
@@ -745,6 +932,8 @@ def main() -> None:
         test_wos_showcase_metrics_collection,
         test_wos_showcase_metrics_plumbing,
         test_mandel_command_composition,
+        test_wos_render_command_and_scene_evidence,
+        test_optimal_render_rejects_nonzero_coordinator_reserve,
         test_manifest_snapshots_validated_config,
         test_linux_only_manifest_preserves_config_only_evidence,
         test_runtime_collection_failure_aborts_before_benchmarks,
