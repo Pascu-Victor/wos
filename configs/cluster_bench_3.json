@@ -1,0 +1,98 @@
+{
+    "zones": [
+        {
+            "id": "GLOBAL",
+            "debug": false,
+            "mtu": 9000,
+            "nic_model": "virtio-net-pci",
+            "ivshmem": {
+                "enabled": false,
+                "size": "16M",
+                "root_path": "/dev/shm",
+                "topology": "full-mesh"
+            },
+            "bridge": {
+                "stp": false,
+                "ip": null
+            },
+            "vm": {
+                "memory": "10923M",
+                "cpus": 11,
+                "disk0": "disk.qcow2",
+                "disk1": "mountfs.qcow2"
+            }
+        },
+        {
+            "id": 0,
+            "name": "lan",
+            "nodes": 3,
+            "nodes_config": [
+                {
+                    "id": 0,
+                    "vm": {
+                        "memory": "10923M",
+                        "cpus": 11
+                    }
+                },
+                {
+                    "id": 1,
+                    "vm": {
+                        "memory": "10923M",
+                        "cpus": 11
+                    }
+                },
+                {
+                    "id": 2,
+                    "vm": {
+                        "memory": "10922M",
+                        "cpus": 10
+                    }
+                }
+            ],
+            "nic_model": "virtio-net-pci",
+            "nic_queues": 2,
+            "vhost": false,
+            "netdev_driver": "dhcp",
+            "bridge": {
+                "ip": "10.10.0.100/24",
+                "dns": "10.10.0.1"
+            }
+        },
+        {
+            "id": 1,
+            "name": "wki",
+            "nodes": 3,
+            "nodes_config": [
+                {
+                    "id": 0,
+                    "vm": {
+                        "memory": "10923M",
+                        "cpus": 11
+                    }
+                },
+                {
+                    "id": 1,
+                    "vm": {
+                        "memory": "10923M",
+                        "cpus": 11
+                    }
+                },
+                {
+                    "id": 2,
+                    "vm": {
+                        "memory": "10922M",
+                        "cpus": 10
+                    }
+                }
+            ],
+            "nic_model": "virtio-net-pci",
+            "nic_queues": 8,
+            "vhost": true,
+            "netdev_driver": "wki",
+            "ivshmem": {
+                "enabled": false,
+                "topology": "full-mesh"
+            }
+        }
+    ]
+}
