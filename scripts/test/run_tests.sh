@@ -102,6 +102,7 @@ UNIT_TESTS=(
     cluster_setup_test
     cross_os_benchmark_suite_test
     fixed_resource_scaling_test
+    wos_showcase_compile_test
     linux_cluster_source_test
     ktest_manifest_test
     runtime_test_audit_test

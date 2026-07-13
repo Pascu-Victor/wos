@@ -1,6 +1,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -10,11 +11,34 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <print>
 
 namespace {
 
 constexpr size_t BUFFER_SIZE = 4096;
+
+auto print_monotonic_ns() -> int {
+    timespec now{};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        std::println(stderr, "live-cpp-demo: clock_gettime failed: {}", strerror(errno));
+        return 1;
+    }
+    if (now.tv_sec < 0 || now.tv_nsec < 0 || now.tv_nsec >= 1000000000L) {
+        std::println(stderr, "live-cpp-demo: clock_gettime returned an invalid timespec");
+        return 1;
+    }
+
+    auto const seconds = static_cast<uint64_t>(now.tv_sec);
+    auto const subsecond_ns = static_cast<uint64_t>(now.tv_nsec);
+    if (seconds > (std::numeric_limits<uint64_t>::max() - subsecond_ns) / 1000000000ULL) {
+        std::println(stderr, "live-cpp-demo: monotonic timestamp overflow");
+        return 1;
+    }
+    auto const nanoseconds = seconds * 1000000000ULL + subsecond_ns;
+    std::println("{}", nanoseconds);
+    return 0;
+}
 
 auto parse_long(const char* text, long fallback) -> long {
     if (text == nullptr) {
@@ -216,10 +240,11 @@ auto run_pipevfs(const char* path, long bytes, const char* label) -> int {
 auto usage(const char* argv0) -> int {
     fprintf(stderr,
             "usage:\n"
+            "  %s monotonic-ns\n"
             "  %s pipevfs <path> <bytes> <label>\n"
             "  %s emit <bytes> <label>\n"
             "  %s sink <path> <label>\n",
-            argv0, argv0, argv0);
+            argv0, argv0, argv0, argv0);
     return 1;
 }
 
@@ -229,6 +254,10 @@ auto main(int argc, char** argv) -> int {
     const char* self = argc > 0 ? argv[0] : "live-cpp-demo";
     if (argc < 2) {
         return usage(self);
+    }
+
+    if (strcmp(argv[1], "monotonic-ns") == 0) {
+        return argc == 2 ? print_monotonic_ns() : usage(self);
     }
 
     if (strcmp(argv[1], "pipevfs") == 0) {
