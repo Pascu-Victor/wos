@@ -374,6 +374,8 @@ void perf_record_transport_stall_locked(WkiChannel* ch, uint64_t now_us) {
 
 auto wki_now_us() -> uint64_t { return mod::time::get_us(); }
 
+auto wki_current_wait_must_drive_progress() -> bool { return is_timer_deferred_waiter(mod::sched::get_current_task()); }
+
 void wki_spin_yield() {
     // Drive inline NAPI poll so the NIC's RX queue is drained even when
     // the caller is busy-waiting on this CPU.
@@ -610,12 +612,17 @@ void wki_finish_claimed_op(WkiWaitEntry* entry, int result) {
     if (entry == nullptr) {
         return;
     }
+    auto* waiter_task = entry->task.load(std::memory_order_acquire);
+    bool const RETAINED_WAITER_TASK = waiter_task != nullptr && waiter_task->try_acquire();
+    // DONE is the completion claimant's final access to the stack-backed wait
+    // entry. Subsystems with an external retirement owner separately gate
+    // stack reclamation with retirement_pending.
     publish_claimed_wait_entry(entry, result);
     // Wake the waiter whether it has already moved to WAITING or is still at
     // the current-task voluntary block point.
-    auto* waiter_task = entry->task.load(std::memory_order_acquire);
-    if (waiter_task != nullptr) {
+    if (RETAINED_WAITER_TASK) {
         mod::sched::kern_wake(waiter_task);
+        waiter_task->release();
     }
 }
 
@@ -640,12 +647,8 @@ void wki_wait_timeout_scan(uint64_t now_us) {
         // Check for timeout
         if (cur->deadline_us != 0 && now_us >= cur->deadline_us) {
             if (claim_wait_entry(cur)) {
-                publish_claimed_wait_entry(cur, WKI_ERR_TIMEOUT);
+                wki_finish_claimed_op(cur, WKI_ERR_TIMEOUT);
                 should_unlink = true;
-                auto* waiter_task = cur->task.load(std::memory_order_acquire);
-                if (waiter_task != nullptr) {
-                    ker::mod::sched::kern_wake(waiter_task);
-                }
             }
         }
 
@@ -674,34 +677,56 @@ void wki_wait_timeout_scan(uint64_t now_us) {
 }
 
 void wki_wait_cleanup_for_task(ker::mod::sched::task::Task* task) {
-    s_wait_lock.lock();
-    WkiWaitEntry* cur = s_wait_head;
-    while (cur != nullptr) {
-        WkiWaitEntry* next = cur->next;
-        if (cur->task.load(std::memory_order_acquire) == task) {
-            // Unlink this entry - the task is dying and won't clean up itself.
-            if (cur->prev != nullptr) {
-                cur->prev->next = cur->next;
-            } else if (s_wait_head == cur) {
-                s_wait_head = cur->next;
-            }
-            if (cur->next != nullptr) {
-                cur->next->prev = cur->prev;
-            }
-            cur->next = nullptr;
-            cur->prev = nullptr;
-            cur->task.store(nullptr, std::memory_order_release);
-            // Only the state owner may publish a result.  If another context
-            // already claimed this waiter, let that owner finish it rather
-            // than forcing DONE with a stale result.
-            uint8_t expected = WkiWaitEntry::PENDING;
-            if (cur->state.compare_exchange_strong(expected, WkiWaitEntry::CLAIMED, std::memory_order_acq_rel, std::memory_order_acquire)) {
-                publish_claimed_wait_entry(cur, WKI_ERR_PEER_FENCED);
-            }
-        }
-        cur = next;
+    if (task == nullptr) {
+        return;
     }
-    s_wait_lock.unlock();
+
+    while (true) {
+        WkiWaitEntry* claimed_waiter = nullptr;
+        s_wait_lock.lock();
+        WkiWaitEntry* cur = s_wait_head;
+        while (cur != nullptr) {
+            WkiWaitEntry* next = cur->next;
+            if (cur->task.load(std::memory_order_acquire) == task) {
+                // Unlink this entry - the task is dying and won't clean up itself.
+                if (cur->prev != nullptr) {
+                    cur->prev->next = cur->next;
+                } else if (s_wait_head == cur) {
+                    s_wait_head = cur->next;
+                }
+                if (cur->next != nullptr) {
+                    cur->next->prev = cur->prev;
+                }
+                cur->next = nullptr;
+                cur->prev = nullptr;
+                cur->task.store(nullptr, std::memory_order_release);
+
+                uint8_t expected = WkiWaitEntry::PENDING;
+                if (cur->state.compare_exchange_strong(expected, WkiWaitEntry::CLAIMED, std::memory_order_acq_rel,
+                                                       std::memory_order_acquire)) {
+                    publish_claimed_wait_entry(cur, WKI_ERR_PEER_FENCED);
+                } else if (expected == WkiWaitEntry::CLAIMED) {
+                    // The claimant may still be publishing through this task's
+                    // stack. Quiesce it before exit can reclaim that stack.
+                    claimed_waiter = cur;
+                    break;
+                }
+            }
+            cur = next;
+        }
+        s_wait_lock.unlock();
+
+        if (claimed_waiter == nullptr) {
+            break;
+        }
+        // kern_yield() re-enters the kernel-thread shutdown exit hook. Keep
+        // this lock-free wait preemptible and let the claim owner publish DONE.
+        while (!wait_done(claimed_waiter)) {
+            asm volatile("pause" ::: "memory");
+        }
+    }
+
+    wki_remote_vfs_cleanup_for_task(task->pid);
 }
 
 #ifdef WOS_SELFTEST

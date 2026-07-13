@@ -7,6 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 REMOTE_VFS_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_vfs.cpp"
 REMOTE_VFS_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_vfs.hpp"
+WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
+WKI_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.hpp"
 WKI_DEV_PROXY_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_dev_proxy_ktest.cpp"
 
 
@@ -47,59 +49,90 @@ def require_order(source: str, tokens: list[str], context: str) -> None:
         cursor = found + len(token)
 
 
-def require_proxy_slot_helper(name: str, body: str, claims_untracked_slot: bool) -> None:
-    require_tokens(
-        body,
-        [
-            "uint64_t const DEADLINE_US = wki_future_deadline_us(start_us, VFS_PROXY_SLOT_WAIT_TIMEOUT_US)",
-            "while (true)",
-            "state->lock.lock()",
-            "if (!proxy_op_slot_busy(state))",
-            "return WKI_OK",
-            "state->lock.unlock()",
-            "if (!proxy_op_slot_busy(state))",
-            "continue",
-            "if (wki_now_us() >= DEADLINE_US)",
-            "return WKI_ERR_TIMEOUT",
-            "ker::mod::sched::kern_sleep_us(VFS_PROXY_CONTENTION_SLEEP_US)",
-        ],
-        name,
-    )
-    if claims_untracked_slot and "state->op_untracked_send_pending.store(true, std::memory_order_release)" not in body:
-        fail(f"{name} must claim the untracked-send slot before returning success")
-    if not claims_untracked_slot and "op_untracked_send_pending.store(true" in body:
-        fail(f"{name} must not mark untracked sends pending")
-    require_order(
-        body,
-        [
-            "state->lock.lock()",
-            "if (!proxy_op_slot_busy(state))",
-            "return WKI_OK",
-            "state->lock.unlock()",
-            "if (wki_now_us() >= DEADLINE_US)",
-            "return WKI_ERR_TIMEOUT",
-        ],
-        name,
-    )
-
-
 def test_proxy_op_slot_waits_are_bounded() -> None:
+    header = REMOTE_VFS_HPP.read_text()
     source = REMOTE_VFS_CPP.read_text()
+    wki_header = WKI_HPP.read_text()
+    wki_source = WKI_CPP.read_text()
+    require_tokens(
+        header,
+        [
+            "constexpr size_t VFS_PROXY_SLOT_WAITER_CAPACITY = 64;",
+            "uint64_t op_generation = 0;",
+            "uint64_t op_waiter_pid = 0;",
+            "WkiWaitEntry* op_retiring_wait_entry = nullptr;",
+            "uint64_t op_retiring_waiter_pid = 0;",
+            "std::array<uint64_t, VFS_PROXY_SLOT_WAITER_CAPACITY> op_slot_waiter_pids = {};",
+            "size_t op_slot_waiter_count = 0;",
+            "void wki_remote_vfs_cleanup_for_task(uint64_t pid);",
+        ],
+        "remote VFS allocation-free proxy slot FIFO",
+    )
     require_tokens(
         source,
         [
-            "#include <net/wki/timer_math.hpp>",
             "constexpr uint64_t VFS_PROXY_SLOT_WAIT_TIMEOUT_US = VFS_PROXY_OP_TIMEOUT_US;",
+            "auto acquire_proxy_slot_locked(ProxyVfsState* state, uint64_t start_us, bool claim_untracked_send) -> int",
             "auto acquire_proxy_op_slot_locked(ProxyVfsState* state, uint64_t start_us) -> int",
             "auto acquire_proxy_untracked_send_slot_locked(ProxyVfsState* state, uint64_t start_us) -> int",
         ],
         "remote VFS proxy slot timeout scaffolding",
     )
-    require_proxy_slot_helper("acquire_proxy_op_slot_locked", function_body(source, "acquire_proxy_op_slot_locked"), False)
-    require_proxy_slot_helper(
-        "acquire_proxy_untracked_send_slot_locked",
-        function_body(source, "acquire_proxy_untracked_send_slot_locked"),
-        True,
+    acquire_body = function_body(source, "acquire_proxy_slot_locked")
+    require_order(
+        acquire_body,
+        [
+            "uint64_t const DEADLINE_US = wki_future_deadline_us(start_us, VFS_PROXY_SLOT_WAIT_TIMEOUT_US)",
+            "state->lock.lock()",
+            "if (!state->active)",
+            "return WKI_ERR_PEER_FENCED",
+            "uint64_t const HEAD_PID = proxy_slot_waiter_head_locked(state)",
+            "if (!proxy_op_slot_busy(state) && (HEAD_PID == 0 || CALLER_IS_HEAD))",
+            "remove_proxy_slot_waiter_locked(state, CALLER.pid)",
+            "state->op_untracked_send_pending.store(true, std::memory_order_release)",
+            "return WKI_OK",
+            "if (NOW_US >= DEADLINE_US)",
+            "remove_proxy_slot_waiter_locked(state, CALLER.pid)",
+            "return WKI_ERR_TIMEOUT",
+            "enqueue_proxy_slot_waiter_locked(state, CALLER.pid)",
+            "state->lock.unlock()",
+            "park_proxy_slot_caller(CALLER, DEADLINE_US, REGISTERED)",
+        ],
+        "wake-driven FIFO proxy slot acquisition",
+    )
+    require_order(
+        function_body(source, "park_proxy_slot_caller"),
+        [
+            "uint64_t const REMAINING_US = deadline_us - NOW_US",
+            "wki_current_wait_must_drive_progress()",
+            "wki_spin_yield()",
+            "caller.type == ker::mod::sched::task::TaskType::PROCESS",
+            "bool const SYSCALL_PARK_SAFE",
+            "task->syscall_account_start_us != 0",
+            "ker::mod::sched::interrupts_enabled()",
+            "uint64_t const PARK_DEADLINE_US",
+            'ker::mod::sched::preemptible_syscall_park("wki_vfs_slot", PARK_DEADLINE_US)',
+            "if (!registered)",
+            "std::min(REMAINING_US, VFS_PROXY_CONTENTION_SLEEP_US)",
+            "ker::mod::sched::kern_sleep_us(REMAINING_US)",
+        ],
+        "proxy slot PROCESS/DAEMON park split",
+    )
+    require_tokens(
+        wki_header,
+        [
+            "std::atomic<bool> retirement_pending{false};",
+            "auto wki_current_wait_must_drive_progress() -> bool;",
+        ],
+        "WKI progress-driving wait API",
+    )
+    require_order(
+        function_body(wki_source, "wki_wait_cleanup_for_task"),
+        [
+            "s_wait_lock.unlock()",
+            "wki_remote_vfs_cleanup_for_task(task->pid)",
+        ],
+        "task exit releases remote VFS operation ownership after WKI wait quiescence",
     )
 
 
@@ -117,7 +150,9 @@ def test_proxy_operations_fail_before_setup_when_slot_wait_times_out() -> None:
             "delete[] req_buf",
             "return encode_proxy_wki_status(SLOT_RET)",
             "peek_channel_tx_seq16",
+            "advance_proxy_op_generation_locked(state)",
             "state->op_wait_entry = &wait",
+            "state->op_waiter_pid = perf_current_pid()",
         ],
         "vfs_proxy_send_and_wait slot timeout",
     )
@@ -139,9 +174,160 @@ def test_proxy_operations_fail_before_setup_when_slot_wait_times_out() -> None:
             "if (SLOT_RET != WKI_OK)",
             "return normalize_proxy_status_for_errno(encode_proxy_wki_status(SLOT_RET))",
             "peek_channel_tx_seq16",
+            "advance_proxy_op_generation_locked(state)",
             "state->op_wait_entry = &wait",
+            "state->op_waiter_pid = perf_current_pid()",
         ],
         "vfs_proxy_write_rdma_and_wait slot timeout",
+    )
+
+
+def test_proxy_slot_release_paths_handoff_after_unlock() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    ktest = WKI_DEV_PROXY_KTEST.read_text()
+    cancel_body = function_body(source, "cancel_proxy_op_wait")
+    send_body = function_body(source, "vfs_proxy_send_and_wait")
+    untracked_body = function_body(source, "vfs_proxy_send_untracked")
+    rdma_body = function_body(source, "vfs_proxy_write_rdma_and_wait")
+    deactivate_body = function_body(source, "deactivate_vfs_proxy_locked")
+    response_body = function_body(source, "handle_vfs_op_resp")
+
+    require_order(
+        cancel_body,
+        [
+            "state->lock.lock()",
+            "state->op_pending.load(std::memory_order_acquire)",
+            "state->op_generation == op_generation",
+            "clear_proxy_op_state_locked(state, result)",
+            "next_pid = proxy_slot_handoff_candidate_locked(state)",
+            "state->lock.unlock()",
+            "wake_proxy_slot_waiter(next_pid)",
+            "finish_or_quiesce_waiter(&wait, claimed, result)",
+            "wait_for_waiter_retirement(&wait)",
+        ],
+        "tracked cancellation only clears its own generation and wakes unlocked",
+    )
+    if send_body.count("unlock_proxy_slot_and_wake_next(state)") < 3:
+        fail("generic proxy RPC must hand off on both setup failures and successful teardown")
+    if rdma_body.count("unlock_proxy_slot_and_wake_next(state)") < 2:
+        fail("RDMA proxy write must hand off on setup failure and successful teardown")
+    if untracked_body.count("unlock_proxy_slot_and_wake_next(state)") < 2:
+        fail("untracked proxy send must hand off on sequence failure and send completion")
+    require_order(
+        send_body,
+        ["consume_proxy_op_result_locked(state, OP_GENERATION)", "wait_for_waiter_retirement(&wait)"],
+        "generic proxy RPC waits for teardown's final stack reference",
+    )
+    require_order(
+        rdma_body,
+        ["consume_proxy_op_result_locked(state, OP_GENERATION)", "wait_for_waiter_retirement(&wait)"],
+        "RDMA proxy RPC waits for teardown's final stack reference",
+    )
+
+    require_order(
+        deactivate_body,
+        [
+            "state->lock.lock()",
+            "state->active = false",
+            "teardown.op_wait_entry = state->op_wait_entry",
+            "teardown.op_wait_entry->retirement_pending.store(true, std::memory_order_release)",
+            "state->op_wait_entry = nullptr",
+            "clear_proxy_op_state_locked(state, -1)",
+            "teardown.op_slot_waiter_pids = state->op_slot_waiter_pids",
+            "state->op_slot_waiter_pids.fill(0)",
+            "state->op_slot_waiter_count = 0",
+            "state->lock.unlock()",
+        ],
+        "proxy teardown rejects and detaches FIFO waiters under the state lock",
+    )
+    finish_teardown_body = function_body(source, "finish_proxy_teardown_op_waiter")
+    require_order(
+        finish_teardown_body,
+        [
+            "finish_or_quiesce_waiter(teardown.op_wait_entry, teardown.op_wait_claimed, result)",
+            "teardown.state->lock.lock()",
+            "teardown.state->op_retiring_wait_entry = nullptr",
+            "teardown.state->op_retiring_waiter_pid = 0",
+            "teardown.op_wait_entry->retirement_pending.store(false, std::memory_order_release)",
+            "teardown.state->lock.unlock()",
+        ],
+        "teardown clears discovery marker before its final stack-waiter release",
+    )
+    wake_body = function_body(source, "wake_proxy_slot_waiter")
+    require_tokens(wake_body, ["remove_one_proxy_slot_waiter(pid)"], "failed wake reaps FIFO state only")
+    if "wki_remote_vfs_cleanup_for_task" in wake_body or "remove_one_proxy_task_reference" in wake_body:
+        fail("failed wake must not touch active-operation task lifetime state")
+    if "wake_proxy_slot_waiter" in response_body or "unlock_proxy_slot_and_wake_next" in response_body:
+        fail("DEV_OP_RESP must leave proxy slot handoff to the result consumer")
+    require_order(
+        function_body(source, "claim_response_waiter_locked"),
+        [
+            "if (!wki_claim_op(waiter))",
+            "return nullptr",
+            "return waiter",
+        ],
+        "response claim retains the exact stack waiter through completion",
+    )
+    require_tokens(
+        response_body,
+        ["wait_entry = claim_response_waiter_locked(state->op_wait_entry)"],
+        "DEV_OP_RESP retained waiter ownership",
+    )
+    if "state->op_wait_entry = nullptr" in response_body:
+        fail("DEV_OP_RESP must retain the waiter for pre-registration task-exit cleanup")
+
+    clear_body = function_body(source, "clear_proxy_op_state_locked")
+    require_tokens(
+        clear_body,
+        ["state->op_wait_entry = nullptr", "state->op_waiter_pid = 0", "state->op_pending.store(false, std::memory_order_release)"],
+        "tracked proxy operation state reset",
+    )
+    cleanup_ref_body = function_body(source, "cleanup_proxy_task_reference_locked")
+    require_order(
+        cleanup_ref_body,
+        [
+            "remove_proxy_slot_waiter_locked(state, pid)",
+            "state->op_waiter_pid == pid",
+            "cleanup.op_wait_entry = state->op_wait_entry",
+            "state->op_wait_entry = nullptr",
+            "cleanup.op_wait_claimed = wki_claim_op(cleanup.op_wait_entry)",
+            "clear_proxy_op_state_locked(state, WKI_ERR_PEER_FENCED)",
+            "else if (RELEASED_RETIRING_OP)",
+            "cleanup.op_wait_entry = state->op_retiring_wait_entry",
+            "cleanup.op_wait_retiring = true",
+            "cleanup.removed = REMOVAL.removed || RELEASED_ACTIVE_OP || RELEASED_RETIRING_OP",
+            "proxy_slot_handoff_candidate_locked(state)",
+        ],
+        "task exit releases active operation and hands off its FIFO slot",
+    )
+    if "state->op_retiring_wait_entry = nullptr" in cleanup_ref_body:
+        fail("task exit must not steal teardown's retiring waiter marker")
+    cleanup_body = function_body(source, "wki_remote_vfs_cleanup_for_task")
+    require_order(
+        cleanup_body,
+        [
+            "remove_one_proxy_task_reference(pid)",
+            "if (!CLEANUP.removed)",
+            "if (CLEANUP.op_wait_retiring)",
+            "wait_for_waiter_retirement(CLEANUP.op_wait_entry)",
+            "finish_or_quiesce_waiter(CLEANUP.op_wait_entry, CLEANUP.op_wait_claimed, WKI_ERR_PEER_FENCED)",
+            "wake_proxy_slot_waiter(CLEANUP.next_pid)",
+        ],
+        "task-exit proxy cleanup and handoff",
+    )
+    require_tokens(
+        ktest,
+        [
+            "KTEST(WkiRemoteVfsProxySlot, WaitersRemainFifo)",
+            "KTEST(WkiRemoteVfsProxySlot, StaleCancelPreservesSuccessor)",
+            "KTEST(WkiRemoteVfsProxySlot, ResponseClaimRetainsWaiterSlot)",
+            "KTEST(WkiRemoteVfsProxySlot, CompletedResponseCancelReleasesSlot)",
+            "KTEST(WkiRemoteVfsProxySlot, TaskExitReleasesOwnedSlot)",
+            "KTEST(WkiRemoteVfsProxySlot, TaskExitDiscoversRetiringSlot)",
+            "KTEST(WkiRemoteVfsProxySlot, TeardownQuiescesRetiringSlot)",
+            "KTEST(WkiRemoteVfsProxySlot, InactiveProxyRejectsAcquisition)",
+        ],
+        "remote VFS proxy-slot KTEST coverage",
     )
 
 
@@ -747,13 +933,19 @@ def test_remote_vfs_unmount_cancels_waiters_before_teardown() -> None:
             "teardown.state = state",
             "teardown.owner_node = state->owner_node",
             "state->lock.lock()",
+            "state->active = false",
             "if (state->op_pending.load(std::memory_order_acquire))",
-            "teardown.op_wait_entry = claim_and_clear_waiter_locked(state->op_wait_entry)",
+            "teardown.op_wait_entry = state->op_wait_entry",
+            "state->op_wait_entry = nullptr",
+            "teardown.op_wait_claimed = wki_claim_op(teardown.op_wait_entry)",
             "clear_proxy_op_state_locked(state, -1)",
+            "state->op_retiring_wait_entry = teardown.op_wait_entry",
+            "state->op_retiring_waiter_pid = OP_WAITER_PID",
             "if (state->attach_pending.load(std::memory_order_acquire))",
             "teardown.attach_wait_entry = claim_and_clear_waiter_locked(state->attach_wait_entry)",
             "clear_proxy_attach_state_locked(state, static_cast<uint8_t>(DevAttachStatus::BUSY))",
-            "state->active = false",
+            "teardown.op_slot_waiter_pids = state->op_slot_waiter_pids",
+            "state->op_slot_waiter_count = 0",
             "state->destroy_when_idle = true",
             "state->lock.unlock()",
         ],
@@ -767,7 +959,9 @@ def test_remote_vfs_unmount_cancels_waiters_before_teardown() -> None:
             "deactivate_vfs_proxy_locked(state, teardown, true)",
             "invalidate_all_dir_caches(state)",
             "s_vfs_lock.unlock()",
-            "finish_claimed_waiter(teardown.op_wait_entry, -1)",
+            "finish_proxy_teardown_op_waiter(teardown, -1)",
+            "vfs_stream_cache_invalidate_remote_scope(teardown.state)",
+            "wake_proxy_slot_waiters(teardown)",
             "finish_claimed_waiter(teardown.attach_wait_entry, -1)",
             "wki_send(teardown.owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH",
             "wki_channel_close(ch)",
@@ -783,7 +977,9 @@ def test_remote_vfs_unmount_cancels_waiters_before_teardown() -> None:
         [
             "deactivate_vfs_proxy_locked(p, cleanup, false)",
             "invalidate_all_dir_caches(p)",
-            "finish_claimed_waiter(cleanup.op_wait_entry, -1)",
+            "s_vfs_lock.unlock()",
+            "finish_proxy_teardown_op_waiter(cleanup, -1)",
+            "wake_proxy_slot_waiters(cleanup)",
             "finish_claimed_waiter(cleanup.attach_wait_entry, -1)",
             "wki_channel_close(ch)",
             "release_and_maybe_destroy_idle_vfs_proxy(cleanup.state)",
@@ -907,6 +1103,7 @@ def test_remote_open_refs_delay_proxy_destroy_until_close() -> None:
 def main() -> None:
     test_proxy_op_slot_waits_are_bounded()
     test_proxy_operations_fail_before_setup_when_slot_wait_times_out()
+    test_proxy_slot_release_paths_handoff_after_unlock()
     test_shared_io_slot_waits_are_bounded()
     test_shared_io_callers_timeout_or_fallback()
     test_message_fallback_readahead_targets_small_sequential_reads()

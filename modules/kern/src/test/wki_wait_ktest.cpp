@@ -100,13 +100,14 @@ KTEST(WkiWaitEntry, TaskCleanupFencesPendingWaiterAndRejectsLateWake) {
     KEXPECT_EQ(wait.result, ker::net::wki::WKI_ERR_PEER_FENCED);
 }
 
-KTEST(WkiWaitEntry, TaskCleanupDoesNotPublishAlreadyClaimedWaiter) {
+KTEST(WkiWaitEntry, TaskCleanupPreservesCompletedClaimedWaiter) {
     ker::mod::sched::task::Task task{};
     ker::net::wki::WkiWaitEntry wait{};
-    wait.task.store(&task, std::memory_order_release);
     wait.result = 17;
 
     KEXPECT_TRUE(ker::net::wki::wki_claim_op(&wait));
+    ker::net::wki::wki_finish_claimed_op(&wait, 77);
+    wait.task.store(&task, std::memory_order_release);
     ker::net::wki::wki_selftest_wait_list_link(&wait);
     KEXPECT_TRUE(ker::net::wki::wki_selftest_wait_list_contains(&wait));
 
@@ -115,10 +116,6 @@ KTEST(WkiWaitEntry, TaskCleanupDoesNotPublishAlreadyClaimedWaiter) {
     KEXPECT_NULL(wait.next);
     KEXPECT_NULL(wait.prev);
     KEXPECT_NULL(wait.task.load(std::memory_order_acquire));
-    KEXPECT_EQ(wait.result, 17);
-    KEXPECT_EQ(wait.state.load(std::memory_order_acquire), static_cast<uint8_t>(ker::net::wki::WkiWaitEntry::CLAIMED));
-
-    ker::net::wki::wki_finish_claimed_op(&wait, 77);
     KEXPECT_EQ(wait.result, 77);
     KEXPECT_EQ(wait.state.load(std::memory_order_acquire), static_cast<uint8_t>(ker::net::wki::WkiWaitEntry::DONE));
 }

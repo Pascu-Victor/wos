@@ -29,6 +29,36 @@ KTEST(WkiRemoteVfsAttachAck, CookieFencesStaleMountCompletion) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_attach_ack_cookie_fences_stale_completion());
 }
 
+KTEST(WkiRemoteVfsProxySlot, WaitersRemainFifo) { KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_slot_waiter_fifo()); }
+
+KTEST(WkiRemoteVfsProxySlot, StaleCancelPreservesSuccessor) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_stale_cancel_preserves_successor());
+}
+
+KTEST(WkiRemoteVfsProxySlot, ResponseClaimRetainsWaiterSlot) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_response_claim_retains_waiter_slot());
+}
+
+KTEST(WkiRemoteVfsProxySlot, CompletedResponseCancelReleasesSlot) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_completed_response_cancel_releases_slot());
+}
+
+KTEST(WkiRemoteVfsProxySlot, TaskExitReleasesOwnedSlot) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_task_exit_releases_owned_slot());
+}
+
+KTEST(WkiRemoteVfsProxySlot, TaskExitDiscoversRetiringSlot) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_task_exit_discovers_retiring_slot());
+}
+
+KTEST(WkiRemoteVfsProxySlot, TeardownQuiescesRetiringSlot) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_teardown_quiesces_retiring_slot());
+}
+
+KTEST(WkiRemoteVfsProxySlot, InactiveProxyRejectsAcquisition) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_inactive_slot_rejected());
+}
+
 KTEST(WkiRemoteVfsWriteBehind, CapacityClassesMatchAllocator) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_write_behind_capacity_classes());
 }

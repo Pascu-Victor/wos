@@ -546,6 +546,7 @@ struct WkiWaitEntry {
 
     std::atomic<ker::mod::sched::task::Task*> task{nullptr};  // The task that is waiting
     std::atomic<uint8_t> state{PENDING};                      // Result writer ownership/state
+    std::atomic<bool> retirement_pending{false};              // External owner still references this stack entry
     int result = 0;                                           // Operation result code
     uint64_t deadline_us = 0;                                 // Timeout deadline (0 = no timeout)
     WkiWaitEntry* next = nullptr;                             // Intrusive linked list
@@ -572,6 +573,10 @@ constexpr uint64_t WKI_OP_TIMEOUT_US = 15'000'000;
 // Returns: 0 on success, WKI_ERR_TIMEOUT on timeout, WKI_ERR_PEER_FENCED on fencing.
 // Caller allocates WkiWaitEntry on kernel stack (no heap allocation needed).
 auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int;
+
+// True while the current WKI deferred worker must keep polling transport work
+// instead of entering a long scheduler park.
+auto wki_current_wait_must_drive_progress() -> bool;
 
 // Wake a waiting task. Called from RX handler context.
 void wki_wake_op(WkiWaitEntry* entry, int result);

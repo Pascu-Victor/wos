@@ -23,6 +23,7 @@ constexpr size_t VFS_EXPORT_PATH_LEN = 256;
 constexpr size_t VFS_EXPORT_NAME_LEN = 64;
 constexpr size_t VFS_READLINK_CACHE_ENTRIES = 128;
 constexpr size_t VFS_READLINK_CACHE_TEXT_MAX = 512;
+constexpr size_t VFS_PROXY_SLOT_WAITER_CAPACITY = 64;
 
 // Bounce buffer sizes for RDMA-backed VFS I/O.
 constexpr uint32_t VFS_RDMA_BOUNCE_SIZE = 65536;
@@ -92,7 +93,13 @@ struct ProxyVfsState {
     uint16_t op_resp_len = 0;
     uint16_t op_resp_max = 0;
     WkiWaitEntry* op_wait_entry = nullptr;  // V2 I-4: async wait for DEV_OP_RESP
+    uint64_t op_generation = 0;
+    uint64_t op_waiter_pid = 0;
+    WkiWaitEntry* op_retiring_wait_entry = nullptr;
+    uint64_t op_retiring_waiter_pid = 0;
     std::atomic<bool> op_untracked_send_pending{false};
+    std::array<uint64_t, VFS_PROXY_SLOT_WAITER_CAPACITY> op_slot_waiter_pids = {};
+    size_t op_slot_waiter_count = 0;
 
     std::atomic<bool> attach_pending{false};
     uint8_t attach_status = 0;
@@ -237,9 +244,20 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
 auto wki_remote_vfs_selftest_attach_ack_cookie_fences_stale_completion() -> bool;
 
 #ifdef WOS_SELFTEST
+auto wki_remote_vfs_selftest_slot_waiter_fifo() -> bool;
+auto wki_remote_vfs_selftest_stale_cancel_preserves_successor() -> bool;
+auto wki_remote_vfs_selftest_response_claim_retains_waiter_slot() -> bool;
+auto wki_remote_vfs_selftest_completed_response_cancel_releases_slot() -> bool;
+auto wki_remote_vfs_selftest_task_exit_releases_owned_slot() -> bool;
+auto wki_remote_vfs_selftest_task_exit_discovers_retiring_slot() -> bool;
+auto wki_remote_vfs_selftest_teardown_quiesces_retiring_slot() -> bool;
+auto wki_remote_vfs_selftest_inactive_slot_rejected() -> bool;
 auto wki_remote_vfs_selftest_write_behind_capacity_classes() -> bool;
 auto wki_remote_vfs_selftest_write_behind_growth() -> bool;
 #endif
+
+// Task-exit hook: release a task's active proxy operation or queued slot wait.
+void wki_remote_vfs_cleanup_for_task(uint64_t pid);
 
 // Consumer side: best-effort diagnostic snapshot for /proc/wki/netdiag.
 auto wki_remote_vfs_proxy_diag_snapshot(WkiRemoteVfsProxyDiag* out, size_t max) -> size_t;

@@ -24,6 +24,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sched/task.hpp>
 #include <platform/sys/mutex.hpp>
 #include <utility>
 #include <vfs/mount.hpp>
@@ -1169,45 +1170,298 @@ struct RoceTaggedReceive {
     uint16_t cookie = 0;
 };
 
-auto proxy_op_slot_busy(ProxyVfsState* state) -> bool {
+auto proxy_op_slot_busy(const ProxyVfsState* state) -> bool {
     return state->op_pending.load(std::memory_order_acquire) || state->op_untracked_send_pending.load(std::memory_order_acquire);
 }
 
-auto acquire_proxy_op_slot_locked(ProxyVfsState* state, uint64_t start_us) -> int {
-    uint64_t const DEADLINE_US = wki_future_deadline_us(start_us, VFS_PROXY_SLOT_WAIT_TIMEOUT_US);
-    while (true) {
-        state->lock.lock();
-        if (!proxy_op_slot_busy(state)) {
-            return WKI_OK;
+struct ProxySlotCaller {
+    uint64_t pid = 0;
+    ker::mod::sched::task::TaskType type = ker::mod::sched::task::TaskType::IDLE;
+};
+
+struct ProxySlotWaiterRemoval {
+    bool removed = false;
+    bool was_head = false;
+};
+
+struct ProxySlotWaiterCleanup {
+    bool removed = false;
+    uint64_t next_pid = 0;
+};
+
+struct ProxyTaskCleanup {
+    bool removed = false;
+    uint64_t next_pid = 0;
+    WkiWaitEntry* op_wait_entry = nullptr;
+    bool op_wait_claimed = false;
+    bool op_wait_retiring = false;
+};
+
+auto current_proxy_slot_caller() -> ProxySlotCaller {
+    if (!ker::mod::sched::can_query_current_task()) {
+        return {};
+    }
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return {};
+    }
+    return {.pid = task->pid, .type = task->type};
+}
+
+auto find_proxy_slot_waiter_locked(const ProxyVfsState* state, uint64_t pid) -> size_t {
+    if (state == nullptr || pid == 0) {
+        return VFS_PROXY_SLOT_WAITER_CAPACITY;
+    }
+    for (size_t i = 0; i < state->op_slot_waiter_count; ++i) {
+        if (state->op_slot_waiter_pids.at(i) == pid) {
+            return i;
         }
-        state->lock.unlock();
-        if (!proxy_op_slot_busy(state)) {
+    }
+    return VFS_PROXY_SLOT_WAITER_CAPACITY;
+}
+
+auto enqueue_proxy_slot_waiter_locked(ProxyVfsState* state, uint64_t pid) -> bool {
+    if (state == nullptr || pid == 0) {
+        return false;
+    }
+    if (find_proxy_slot_waiter_locked(state, pid) != VFS_PROXY_SLOT_WAITER_CAPACITY) {
+        return true;
+    }
+    if (state->op_slot_waiter_count >= state->op_slot_waiter_pids.size()) {
+        return false;
+    }
+    state->op_slot_waiter_pids.at(state->op_slot_waiter_count++) = pid;
+    return true;
+}
+
+auto remove_proxy_slot_waiter_locked(ProxyVfsState* state, uint64_t pid) -> ProxySlotWaiterRemoval {
+    size_t const INDEX = find_proxy_slot_waiter_locked(state, pid);
+    if (INDEX >= state->op_slot_waiter_count) {
+        return {};
+    }
+    for (size_t i = INDEX + 1; i < state->op_slot_waiter_count; ++i) {
+        state->op_slot_waiter_pids.at(i - 1) = state->op_slot_waiter_pids.at(i);
+    }
+    state->op_slot_waiter_count--;
+    state->op_slot_waiter_pids.at(state->op_slot_waiter_count) = 0;
+    return {.removed = true, .was_head = INDEX == 0};
+}
+
+auto proxy_slot_waiter_head_locked(const ProxyVfsState* state) -> uint64_t {
+    return state != nullptr && state->op_slot_waiter_count != 0 ? state->op_slot_waiter_pids.front() : 0;
+}
+
+auto proxy_slot_handoff_candidate_locked(const ProxyVfsState* state) -> uint64_t {
+    if (state == nullptr || !state->active || proxy_op_slot_busy(state)) {
+        return 0;
+    }
+    return proxy_slot_waiter_head_locked(state);
+}
+
+void clear_proxy_op_state_locked(ProxyVfsState* state, int status) {
+    state->op_status = static_cast<int16_t>(status);
+    state->op_expected_id = 0;
+    state->op_expected_seq = 0;
+    state->op_resp_buf = nullptr;
+    state->op_resp_max = 0;
+    state->op_resp_len = 0;
+    state->op_wait_entry = nullptr;
+    state->op_waiter_pid = 0;
+    state->op_pending.store(false, std::memory_order_release);
+}
+
+auto advance_proxy_op_generation_locked(ProxyVfsState* state) -> uint64_t {
+    state->op_generation++;
+    if (state->op_generation == 0) {
+        state->op_generation++;
+    }
+    return state->op_generation;
+}
+
+auto remove_one_proxy_slot_waiter(uint64_t pid) -> ProxySlotWaiterCleanup {
+    ProxySlotWaiterCleanup cleanup{};
+    if (pid == 0) {
+        return cleanup;
+    }
+
+    s_vfs_lock.lock();
+    for (auto& proxy : g_vfs_proxies) {
+        auto* state = proxy.get();
+        if (state == nullptr) {
             continue;
         }
-        if (wki_now_us() >= DEADLINE_US) {
-            return WKI_ERR_TIMEOUT;
+        state->lock.lock();
+        ProxySlotWaiterRemoval const REMOVAL = remove_proxy_slot_waiter_locked(state, pid);
+        if (REMOVAL.removed) {
+            cleanup.removed = true;
+            if (REMOVAL.was_head) {
+                cleanup.next_pid = proxy_slot_handoff_candidate_locked(state);
+            }
+            state->lock.unlock();
+            break;
         }
-        ker::mod::sched::kern_sleep_us(VFS_PROXY_CONTENTION_SLEEP_US);
+        state->lock.unlock();
+    }
+    s_vfs_lock.unlock();
+    return cleanup;
+}
+
+void wake_proxy_slot_waiter(uint64_t pid) {
+    while (pid != 0 && !ker::mod::sched::wake_task_by_pid_from_event(pid)) {
+        // Task exit normally removes the PID through wki_wait_cleanup_for_task().
+        // If lookup lost that race, reap only the stale FIFO entry. Active-op
+        // cleanup is reserved for the exit hook, which owns task-stack lifetime.
+        ProxySlotWaiterCleanup const CLEANUP = remove_one_proxy_slot_waiter(pid);
+        if (!CLEANUP.removed) {
+            return;
+        }
+        pid = CLEANUP.next_pid;
     }
 }
 
-auto acquire_proxy_untracked_send_slot_locked(ProxyVfsState* state, uint64_t start_us) -> int {
-    uint64_t const DEADLINE_US = wki_future_deadline_us(start_us, VFS_PROXY_SLOT_WAIT_TIMEOUT_US);
-    while (true) {
-        state->lock.lock();
-        if (!proxy_op_slot_busy(state)) {
-            state->op_untracked_send_pending.store(true, std::memory_order_release);
-            return WKI_OK;
+void unlock_proxy_slot_and_wake_next(ProxyVfsState* state) {
+    uint64_t const NEXT_PID = proxy_slot_handoff_candidate_locked(state);
+    state->lock.unlock();
+    wake_proxy_slot_waiter(NEXT_PID);
+}
+
+void park_proxy_slot_caller(const ProxySlotCaller& caller, uint64_t deadline_us, bool registered) {
+    uint64_t const NOW_US = wki_now_us();
+    if (NOW_US >= deadline_us) {
+        return;
+    }
+    uint64_t const REMAINING_US = deadline_us - NOW_US;
+    if (caller.type == ker::mod::sched::task::TaskType::DAEMON && wki_current_wait_must_drive_progress()) {
+        // This worker can be responsible for receiving the response that
+        // releases the slot, including when the fixed FIFO is at capacity.
+        wki_spin_yield();
+        ker::mod::sched::kern_yield();
+        return;
+    }
+    if (caller.type == ker::mod::sched::task::TaskType::PROCESS) {
+        auto* task = ker::mod::sched::get_current_task();
+        bool const SYSCALL_PARK_SAFE = task != nullptr && task->syscall_account_start_us != 0 && ker::mod::sched::preempt_count() == 0 &&
+                                       ker::mod::sched::interrupts_enabled();
+        if (!SYSCALL_PARK_SAFE || task->has_interrupting_signal_pending()) {
+            // File-backed page faults can reach remote reads on a PROCESS task
+            // outside a syscall safe point. Preserve IRQ/exception state there.
+            // Pending signals also make syscall park return immediately; this
+            // wait remains uninterruptible without becoming a hot park loop.
+            ker::mod::sched::kern_yield();
+            return;
         }
-        state->lock.unlock();
-        if (!proxy_op_slot_busy(state)) {
+        uint64_t const PARK_DEADLINE_US =
+            registered ? deadline_us : wki_future_deadline_us(NOW_US, std::min(REMAINING_US, VFS_PROXY_CONTENTION_SLEEP_US));
+        ker::mod::sched::preemptible_syscall_park("wki_vfs_slot", PARK_DEADLINE_US);
+        return;
+    }
+    if (!registered) {
+        ker::mod::sched::kern_sleep_us(std::min(REMAINING_US, VFS_PROXY_CONTENTION_SLEEP_US));
+        return;
+    }
+    if (caller.type == ker::mod::sched::task::TaskType::DAEMON) {
+        ker::mod::sched::kern_sleep_us(REMAINING_US);
+        return;
+    }
+    ker::mod::sched::kern_sleep_us(std::min(REMAINING_US, VFS_PROXY_CONTENTION_SLEEP_US));
+}
+
+auto cleanup_proxy_task_reference_locked(ProxyVfsState* state, uint64_t pid) -> ProxyTaskCleanup {
+    ProxyTaskCleanup cleanup{};
+    if (state == nullptr || pid == 0) {
+        return cleanup;
+    }
+
+    ProxySlotWaiterRemoval const REMOVAL = remove_proxy_slot_waiter_locked(state, pid);
+    bool const RELEASED_ACTIVE_OP = state->op_pending.load(std::memory_order_acquire) && state->op_waiter_pid == pid;
+    bool const RELEASED_RETIRING_OP = state->op_retiring_wait_entry != nullptr && state->op_retiring_waiter_pid == pid;
+    if (RELEASED_ACTIVE_OP) {
+        cleanup.op_wait_entry = state->op_wait_entry;
+        state->op_wait_entry = nullptr;
+        cleanup.op_wait_claimed = wki_claim_op(cleanup.op_wait_entry);
+        clear_proxy_op_state_locked(state, WKI_ERR_PEER_FENCED);
+    } else if (RELEASED_RETIRING_OP) {
+        // Teardown exclusively owns the raw waiter. Keep this exiting task's
+        // stack alive until teardown drops its retirement reference.
+        cleanup.op_wait_entry = state->op_retiring_wait_entry;
+        cleanup.op_wait_retiring = true;
+    }
+
+    cleanup.removed = REMOVAL.removed || RELEASED_ACTIVE_OP || RELEASED_RETIRING_OP;
+    if (REMOVAL.was_head || RELEASED_ACTIVE_OP) {
+        cleanup.next_pid = proxy_slot_handoff_candidate_locked(state);
+    }
+    return cleanup;
+}
+
+auto remove_one_proxy_task_reference(uint64_t pid) -> ProxyTaskCleanup {
+    ProxyTaskCleanup cleanup{};
+    if (pid == 0) {
+        return cleanup;
+    }
+
+    s_vfs_lock.lock();
+    for (auto& proxy : g_vfs_proxies) {
+        auto* state = proxy.get();
+        if (state == nullptr) {
             continue;
         }
-        if (wki_now_us() >= DEADLINE_US) {
+        state->lock.lock();
+        cleanup = cleanup_proxy_task_reference_locked(state, pid);
+        if (cleanup.removed) {
+            state->lock.unlock();
+            break;
+        }
+        state->lock.unlock();
+    }
+    s_vfs_lock.unlock();
+    return cleanup;
+}
+
+auto acquire_proxy_slot_locked(ProxyVfsState* state, uint64_t start_us, bool claim_untracked_send) -> int {
+    uint64_t const DEADLINE_US = wki_future_deadline_us(start_us, VFS_PROXY_SLOT_WAIT_TIMEOUT_US);
+    ProxySlotCaller const CALLER = current_proxy_slot_caller();
+    while (true) {
+        state->lock.lock();
+        if (!state->active) {
+            static_cast<void>(remove_proxy_slot_waiter_locked(state, CALLER.pid));
+            state->lock.unlock();
+            return WKI_ERR_PEER_FENCED;
+        }
+
+        uint64_t const HEAD_PID = proxy_slot_waiter_head_locked(state);
+        bool const CALLER_IS_HEAD = CALLER.pid != 0 && HEAD_PID == CALLER.pid;
+        if (!proxy_op_slot_busy(state) && (HEAD_PID == 0 || CALLER_IS_HEAD)) {
+            if (CALLER_IS_HEAD) {
+                static_cast<void>(remove_proxy_slot_waiter_locked(state, CALLER.pid));
+            }
+            if (claim_untracked_send) {
+                state->op_untracked_send_pending.store(true, std::memory_order_release);
+            }
+            return WKI_OK;
+        }
+
+        uint64_t const NOW_US = wki_now_us();
+        if (NOW_US >= DEADLINE_US) {
+            ProxySlotWaiterRemoval const REMOVAL = remove_proxy_slot_waiter_locked(state, CALLER.pid);
+            uint64_t const NEXT_PID = REMOVAL.was_head ? proxy_slot_handoff_candidate_locked(state) : 0;
+            state->lock.unlock();
+            wake_proxy_slot_waiter(NEXT_PID);
             return WKI_ERR_TIMEOUT;
         }
-        ker::mod::sched::kern_sleep_us(VFS_PROXY_CONTENTION_SLEEP_US);
+
+        bool const REGISTERED = enqueue_proxy_slot_waiter_locked(state, CALLER.pid);
+        state->lock.unlock();
+        park_proxy_slot_caller(CALLER, DEADLINE_US, REGISTERED);
     }
+}
+
+auto acquire_proxy_op_slot_locked(ProxyVfsState* state, uint64_t start_us) -> int {
+    return acquire_proxy_slot_locked(state, start_us, false);
+}
+
+auto acquire_proxy_untracked_send_slot_locked(ProxyVfsState* state, uint64_t start_us) -> int {
+    return acquire_proxy_slot_locked(state, start_us, true);
 }
 
 // Caller must hold the lock protecting waiter_slot.
@@ -1220,44 +1474,82 @@ auto claim_and_clear_waiter_locked(WkiWaitEntry*& waiter_slot) -> WkiWaitEntry* 
     return waiter;
 }
 
+// Response RX retains the exact waiter pointer in proxy state so task-exit or
+// teardown cleanup can quiesce a claimant even before wki_wait_for_op() links
+// the stack entry into the global wait list.
+auto claim_response_waiter_locked(WkiWaitEntry* waiter) -> WkiWaitEntry* {
+    if (!wki_claim_op(waiter)) {
+        return nullptr;
+    }
+    return waiter;
+}
+
 void finish_claimed_waiter(WkiWaitEntry* waiter, int result) {
     if (waiter != nullptr) {
         wki_finish_claimed_op(waiter, result);
     }
 }
 
-void finish_or_wait_for_cancelled_waiter(WkiWaitEntry& wait, bool claimed, int result) {
+void finish_or_quiesce_waiter(WkiWaitEntry* wait, bool claimed, int result) {
+    if (wait == nullptr) {
+        return;
+    }
     if (claimed) {
-        wki_finish_claimed_op(&wait, result);
+        wki_finish_claimed_op(wait, result);
         return;
     }
 
-    while (wait.state.load(std::memory_order_acquire) != static_cast<uint8_t>(WkiWaitEntry::DONE)) {
-        ker::mod::sched::kern_yield();
+    // Do not enter a scheduler wait here: this path also quiesces stack
+    // waiters while a kernel thread is already exiting for shutdown.
+    while (wait->state.load(std::memory_order_acquire) != static_cast<uint8_t>(WkiWaitEntry::DONE)) {
+        asm volatile("pause" ::: "memory");
     }
 }
 
-void clear_proxy_op_state_locked(ProxyVfsState* state, int status) {
-    state->op_status = static_cast<int16_t>(status);
-    state->op_expected_id = 0;
-    state->op_expected_seq = 0;
-    state->op_resp_buf = nullptr;
-    state->op_resp_max = 0;
-    state->op_resp_len = 0;
-    state->op_pending.store(false, std::memory_order_release);
+void wait_for_waiter_retirement(WkiWaitEntry* wait) {
+    if (wait == nullptr) {
+        return;
+    }
+
+    while (wait->retirement_pending.load(std::memory_order_acquire)) {
+        asm volatile("pause" ::: "memory");
+    }
 }
 
-void cancel_proxy_op_wait(ProxyVfsState* state, WkiWaitEntry& wait, int result) {
+void cancel_proxy_op_wait(ProxyVfsState* state, WkiWaitEntry& wait, uint64_t op_generation, int result) {
     bool claimed = false;
+    uint64_t next_pid = 0;
     state->lock.lock();
-    if (state->op_wait_entry == &wait) {
-        state->op_wait_entry = nullptr;
+    if (state->op_pending.load(std::memory_order_acquire) && state->op_generation == op_generation) {
+        clear_proxy_op_state_locked(state, result);
+        next_pid = proxy_slot_handoff_candidate_locked(state);
     }
-    clear_proxy_op_state_locked(state, result);
     claimed = wki_claim_op(&wait);
     state->lock.unlock();
 
-    finish_or_wait_for_cancelled_waiter(wait, claimed, result);
+    wake_proxy_slot_waiter(next_pid);
+    finish_or_quiesce_waiter(&wait, claimed, result);
+    wait_for_waiter_retirement(&wait);
+}
+
+struct ProxyOpResult {
+    int status = -ENOTCONN;
+    uint16_t response_len = 0;
+    bool consumed = false;
+};
+
+auto consume_proxy_op_result_locked(ProxyVfsState* state, uint64_t op_generation) -> ProxyOpResult {
+    if (!state->op_pending.load(std::memory_order_acquire) || state->op_generation != op_generation) {
+        return {};
+    }
+
+    ProxyOpResult result = {
+        .status = static_cast<int>(state->op_status),
+        .response_len = state->op_resp_len,
+        .consumed = true,
+    };
+    clear_proxy_op_state_locked(state, result.status);
+    return result;
 }
 
 void clear_proxy_attach_state_locked(ProxyVfsState* state, uint8_t status) {
@@ -1278,7 +1570,7 @@ void cancel_proxy_attach_wait(ProxyVfsState* state, WkiWaitEntry& wait, int resu
     claimed = wki_claim_op(&wait);
     s_vfs_lock.unlock();
 
-    finish_or_wait_for_cancelled_waiter(wait, claimed, result);
+    finish_or_quiesce_waiter(&wait, claimed, result);
 }
 
 struct PendingProxyTeardown {
@@ -1290,9 +1582,36 @@ struct PendingProxyTeardown {
     uint16_t op_expected_seq = 0;
     bool had_op_pending = false;
     WkiWaitEntry* op_wait_entry = nullptr;
+    bool op_wait_claimed = false;
     WkiWaitEntry* attach_wait_entry = nullptr;
+    std::array<uint64_t, VFS_PROXY_SLOT_WAITER_CAPACITY> op_slot_waiter_pids = {};
+    size_t op_slot_waiter_count = 0;
     std::array<char, VFS_EXPORT_PATH_LEN> local_mount_path = {};
 };
+
+void wake_proxy_slot_waiters(const PendingProxyTeardown& teardown) {
+    for (size_t i = 0; i < teardown.op_slot_waiter_count; ++i) {
+        wake_proxy_slot_waiter(teardown.op_slot_waiter_pids.at(i));
+    }
+}
+
+void finish_proxy_teardown_op_waiter(const PendingProxyTeardown& teardown, int result) {
+    finish_or_quiesce_waiter(teardown.op_wait_entry, teardown.op_wait_claimed, result);
+    if (teardown.state == nullptr || teardown.op_wait_entry == nullptr) {
+        return;
+    }
+
+    teardown.state->lock.lock();
+    if (teardown.state->op_retiring_wait_entry == teardown.op_wait_entry) {
+        teardown.state->op_retiring_wait_entry = nullptr;
+        teardown.state->op_retiring_waiter_pid = 0;
+        // Exit discovery uses this same lock. Clear the marker, then make this
+        // release teardown's final dereference before exposing the unlocked
+        // state or allowing the RPC owner to unwind its stack.
+        teardown.op_wait_entry->retirement_pending.store(false, std::memory_order_release);
+    }
+    teardown.state->lock.unlock();
+}
 
 auto proxy_is_idle_for_resource_release_locked(ProxyVfsState* state) -> bool {
     return state != nullptr && !state->active && state->open_file_refs.load(std::memory_order_acquire) == 0;
@@ -1417,19 +1736,33 @@ void deactivate_vfs_proxy_locked(ProxyVfsState* state, PendingProxyTeardown& tea
     teardown.local_mount_path = state->local_mount_path;
 
     state->lock.lock();
+    // Publish inactivity before releasing tracked ownership or draining the
+    // FIFO so every awakened contender fails before constructing a request.
+    state->active = false;
     if (state->op_pending.load(std::memory_order_acquire)) {
         teardown.had_op_pending = true;
         teardown.op_expected_id = state->op_expected_id;
         teardown.op_expected_seq = state->op_expected_seq;
+        uint64_t const OP_WAITER_PID = state->op_waiter_pid;
         state->op_status = -1;
-        teardown.op_wait_entry = claim_and_clear_waiter_locked(state->op_wait_entry);
+        teardown.op_wait_entry = state->op_wait_entry;
+        if (teardown.op_wait_entry != nullptr) {
+            teardown.op_wait_entry->retirement_pending.store(true, std::memory_order_release);
+        }
+        state->op_wait_entry = nullptr;
+        teardown.op_wait_claimed = wki_claim_op(teardown.op_wait_entry);
         clear_proxy_op_state_locked(state, -1);
+        state->op_retiring_wait_entry = teardown.op_wait_entry;
+        state->op_retiring_waiter_pid = OP_WAITER_PID;
     }
     if (state->attach_pending.load(std::memory_order_acquire)) {
         teardown.attach_wait_entry = claim_and_clear_waiter_locked(state->attach_wait_entry);
         clear_proxy_attach_state_locked(state, static_cast<uint8_t>(DevAttachStatus::BUSY));
     }
-    state->active = false;
+    teardown.op_slot_waiter_pids = state->op_slot_waiter_pids;
+    teardown.op_slot_waiter_count = state->op_slot_waiter_count;
+    state->op_slot_waiter_pids.fill(0);
+    state->op_slot_waiter_count = 0;
     if (destroy_when_idle) {
         state->destroy_when_idle = true;
     }
@@ -1476,7 +1809,7 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
 
     uint16_t expected_seq = 0;
     if (!peek_channel_tx_seq16(state->owner_node, state->assigned_channel, &expected_seq)) {
-        state->lock.unlock();
+        unlock_proxy_slot_and_wake_next(state);
         delete[] req_buf;
         return -EIO;
     }
@@ -1484,7 +1817,7 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
 
     if (tagged_receive != nullptr) {
         if (tagged_receive->rkey == 0 || !wki_roce_region_prepare_tagged_write(tagged_receive->rkey, expected_seq)) {
-            state->lock.unlock();
+            unlock_proxy_slot_and_wake_next(state);
             delete[] req_buf;
             return -EIO;
         }
@@ -1493,7 +1826,9 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
 
     // Lock held, op_pending still false - set up wait entry and response fields
     WkiWaitEntry wait = {};
+    uint64_t const OP_GENERATION = advance_proxy_op_generation_locked(state);
     state->op_wait_entry = &wait;
+    state->op_waiter_pid = perf_current_pid();
     state->op_expected_id = op_id;
     state->op_expected_seq = expected_seq;
     state->op_status = 0;
@@ -1513,7 +1848,7 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
     delete[] req_buf;
 
     if (SEND_RET != WKI_OK) {
-        cancel_proxy_op_wait(state, wait, SEND_RET);
+        cancel_proxy_op_wait(state, wait, OP_GENERATION, SEND_RET);
         auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
         ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS,
                                          perf_vfs_op(op_id), ker::mod::perf::WkiPerfPhase::END, state->owner_node, state->assigned_channel,
@@ -1527,7 +1862,7 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
 
     int const WAIT_RC = wki_wait_for_op(&wait, wait_timeout_us);
     if (WAIT_RC != 0) {
-        cancel_proxy_op_wait(state, wait, WAIT_RC);
+        cancel_proxy_op_wait(state, wait, OP_GENERATION, WAIT_RC);
         auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
         ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS,
                                          perf_vfs_op(op_id), ker::mod::perf::WkiPerfPhase::END, state->owner_node, state->assigned_channel,
@@ -1545,13 +1880,15 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
     }
 
     state->lock.lock();
-    if (state->op_wait_entry == &wait) {
-        state->op_wait_entry = nullptr;
+    ProxyOpResult const RESULT = consume_proxy_op_result_locked(state, OP_GENERATION);
+    if (RESULT.consumed) {
+        unlock_proxy_slot_and_wake_next(state);
+    } else {
+        state->lock.unlock();
     }
-    int const STATUS = static_cast<int>(state->op_status);
-    uint16_t const RESP_LEN = state->op_resp_len;
-    clear_proxy_op_state_locked(state, STATUS);
-    state->lock.unlock();
+    wait_for_waiter_retirement(&wait);
+    int const STATUS = RESULT.status;
+    uint16_t const RESP_LEN = RESULT.response_len;
 
     auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
     ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id),
@@ -1612,7 +1949,7 @@ auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_
     uint16_t expected_seq = 0;
     if (!peek_channel_tx_seq16(state->owner_node, state->assigned_channel, &expected_seq)) {
         state->op_untracked_send_pending.store(false, std::memory_order_release);
-        state->lock.unlock();
+        unlock_proxy_slot_and_wake_next(state);
         delete[] req_buf;
         return -EIO;
     }
@@ -1629,7 +1966,7 @@ auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_
 
     state->lock.lock();
     state->op_untracked_send_pending.store(false, std::memory_order_release);
-    state->lock.unlock();
+    unlock_proxy_slot_and_wake_next(state);
 
     auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
     ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id),
@@ -1670,14 +2007,16 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
 
     uint16_t expected_seq = 0;
     if (!peek_channel_tx_seq16(state->owner_node, state->assigned_channel, &expected_seq)) {
-        state->lock.unlock();
+        unlock_proxy_slot_and_wake_next(state);
         return -EIO;
     }
     uint32_t const CORRELATION = expected_seq;
 
     WkiWaitEntry wait = {};
     uint32_t resp_written = 0;
+    uint64_t const OP_GENERATION = advance_proxy_op_generation_locked(state);
     state->op_wait_entry = &wait;
+    state->op_waiter_pid = perf_current_pid();
     state->op_expected_id = OP_VFS_WRITE_RDMA;
     state->op_expected_seq = expected_seq;
     state->op_status = 0;
@@ -1700,7 +2039,7 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
     auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + ctrl.size());
     auto* req_buf = new (std::nothrow) uint8_t[req_total];
     if (req_buf == nullptr) {
-        cancel_proxy_op_wait(state, wait, -ENOMEM);
+        cancel_proxy_op_wait(state, wait, OP_GENERATION, -ENOMEM);
 
         auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
         ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS,
@@ -1722,7 +2061,7 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
             state->rdma_transport->rdma_write(state->rdma_transport, state->owner_node, state->rdma_server_write_rkey, 0, src, chunk);
         if (RDMA_RET != 0) {
             delete[] req_buf;
-            cancel_proxy_op_wait(state, wait, RDMA_RET);
+            cancel_proxy_op_wait(state, wait, OP_GENERATION, RDMA_RET);
 
             auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
             ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS,
@@ -1737,7 +2076,7 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
     int const SEND_RET = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
     delete[] req_buf;
     if (SEND_RET != WKI_OK) {
-        cancel_proxy_op_wait(state, wait, SEND_RET);
+        cancel_proxy_op_wait(state, wait, OP_GENERATION, SEND_RET);
 
         auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
         ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS,
@@ -1752,7 +2091,7 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
         int const RDMA_RET =
             wki_roce_rdma_write_tagged(state->owner_node, state->rdma_server_write_rkey, 0, src, chunk, static_cast<uint16_t>(CORRELATION));
         if (RDMA_RET != 0) {
-            cancel_proxy_op_wait(state, wait, RDMA_RET);
+            cancel_proxy_op_wait(state, wait, OP_GENERATION, RDMA_RET);
 
             auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
             ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS,
@@ -1766,7 +2105,7 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
 
     int const WAIT_RC = wki_wait_for_op(&wait, VFS_PROXY_OP_TIMEOUT_US);
     if (WAIT_RC != 0) {
-        cancel_proxy_op_wait(state, wait, WAIT_RC);
+        cancel_proxy_op_wait(state, wait, OP_GENERATION, WAIT_RC);
 
         auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
         ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS,
@@ -1778,13 +2117,15 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
     }
 
     state->lock.lock();
-    if (state->op_wait_entry == &wait) {
-        state->op_wait_entry = nullptr;
+    ProxyOpResult const RESULT = consume_proxy_op_result_locked(state, OP_GENERATION);
+    if (RESULT.consumed) {
+        unlock_proxy_slot_and_wake_next(state);
+    } else {
+        state->lock.unlock();
     }
-    int const STATUS = static_cast<int>(state->op_status);
-    uint16_t const RESP_LEN = state->op_resp_len;
-    clear_proxy_op_state_locked(state, STATUS);
-    state->lock.unlock();
+    wait_for_waiter_retirement(&wait);
+    int const STATUS = RESULT.status;
+    uint16_t const RESP_LEN = RESULT.response_len;
 
     auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
     ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS,
@@ -2978,9 +3319,149 @@ ker::vfs::FileOperations g_remote_vfs_fops = {
 
 }  // namespace
 
+void wki_remote_vfs_cleanup_for_task(uint64_t pid) {
+    while (true) {
+        ProxyTaskCleanup const CLEANUP = remove_one_proxy_task_reference(pid);
+        if (!CLEANUP.removed) {
+            return;
+        }
+        if (CLEANUP.op_wait_retiring) {
+            wait_for_waiter_retirement(CLEANUP.op_wait_entry);
+        } else {
+            finish_or_quiesce_waiter(CLEANUP.op_wait_entry, CLEANUP.op_wait_claimed, WKI_ERR_PEER_FENCED);
+        }
+        wake_proxy_slot_waiter(CLEANUP.next_pid);
+    }
+}
+
 auto wki_remote_vfs_fsync(ker::vfs::File* file) -> int { return remote_vfs_fsync_file(file); }
 
 #ifdef WOS_SELFTEST
+auto wki_remote_vfs_selftest_slot_waiter_fifo() -> bool {
+    ProxyVfsState state{};
+    state.active = true;
+
+    if (!enqueue_proxy_slot_waiter_locked(&state, 11) || !enqueue_proxy_slot_waiter_locked(&state, 22) ||
+        !enqueue_proxy_slot_waiter_locked(&state, 33) || !enqueue_proxy_slot_waiter_locked(&state, 22) || state.op_slot_waiter_count != 3 ||
+        proxy_slot_waiter_head_locked(&state) != 11) {
+        return false;
+    }
+
+    ProxySlotWaiterRemoval const MIDDLE = remove_proxy_slot_waiter_locked(&state, 22);
+    if (!MIDDLE.removed || MIDDLE.was_head || state.op_slot_waiter_count != 2 || state.op_slot_waiter_pids.at(1) != 33) {
+        return false;
+    }
+
+    ProxySlotWaiterRemoval const HEAD = remove_proxy_slot_waiter_locked(&state, 11);
+    return HEAD.removed && HEAD.was_head && proxy_slot_handoff_candidate_locked(&state) == 33;
+}
+
+auto wki_remote_vfs_selftest_stale_cancel_preserves_successor() -> bool {
+    ProxyVfsState state{};
+    WkiWaitEntry stale{};
+    WkiWaitEntry successor{};
+    state.active = true;
+    state.op_generation = 18;
+    state.op_wait_entry = &successor;
+    state.op_waiter_pid = 22;
+    state.op_expected_id = OP_VFS_STAT;
+    state.op_expected_seq = 17;
+    state.op_pending.store(true, std::memory_order_release);
+
+    cancel_proxy_op_wait(&state, stale, 17, WKI_ERR_TIMEOUT);
+    return state.op_generation == 18 && state.op_wait_entry == &successor && state.op_waiter_pid == 22 &&
+           state.op_expected_id == OP_VFS_STAT && state.op_expected_seq == 17 && state.op_pending.load(std::memory_order_acquire);
+}
+
+auto wki_remote_vfs_selftest_response_claim_retains_waiter_slot() -> bool {
+    WkiWaitEntry timed_out{};
+    timed_out.state.store(WkiWaitEntry::DONE, std::memory_order_release);
+    WkiWaitEntry* waiter_slot = &timed_out;
+    if (claim_response_waiter_locked(waiter_slot) != nullptr || waiter_slot != &timed_out) {
+        return false;
+    }
+
+    WkiWaitEntry pending{};
+    waiter_slot = &pending;
+    return claim_response_waiter_locked(waiter_slot) == &pending && waiter_slot == &pending &&
+           pending.state.load(std::memory_order_acquire) == WkiWaitEntry::CLAIMED;
+}
+
+auto wki_remote_vfs_selftest_completed_response_cancel_releases_slot() -> bool {
+    ProxyVfsState state{};
+    WkiWaitEntry completed{};
+    state.active = true;
+    state.op_generation = 23;
+    state.op_waiter_pid = 11;
+    state.op_expected_id = OP_VFS_WRITE_RDMA;
+    state.op_expected_seq = 23;
+    state.op_pending.store(true, std::memory_order_release);
+    completed.state.store(WkiWaitEntry::DONE, std::memory_order_release);
+
+    cancel_proxy_op_wait(&state, completed, 23, -EIO);
+    return !state.op_pending.load(std::memory_order_acquire) && state.op_waiter_pid == 0 && state.op_expected_id == 0 &&
+           state.op_expected_seq == 0;
+}
+
+auto wki_remote_vfs_selftest_task_exit_releases_owned_slot() -> bool {
+    ProxyVfsState state{};
+    WkiWaitEntry exiting{};
+    state.active = true;
+    state.op_generation = 41;
+    state.op_wait_entry = &exiting;
+    state.op_waiter_pid = 11;
+    state.op_expected_id = OP_VFS_STAT;
+    state.op_expected_seq = 9;
+    state.op_pending.store(true, std::memory_order_release);
+    static_cast<void>(enqueue_proxy_slot_waiter_locked(&state, 22));
+
+    ProxyTaskCleanup const CLEANUP = cleanup_proxy_task_reference_locked(&state, 11);
+    finish_or_quiesce_waiter(CLEANUP.op_wait_entry, CLEANUP.op_wait_claimed, WKI_ERR_PEER_FENCED);
+    return CLEANUP.removed && CLEANUP.next_pid == 22 && exiting.state.load(std::memory_order_acquire) == WkiWaitEntry::DONE &&
+           !state.op_pending.load(std::memory_order_acquire) && state.op_wait_entry == nullptr && state.op_waiter_pid == 0 &&
+           state.op_generation == 41;
+}
+
+auto wki_remote_vfs_selftest_task_exit_discovers_retiring_slot() -> bool {
+    ProxyVfsState state{};
+    WkiWaitEntry retiring{};
+    state.op_retiring_wait_entry = &retiring;
+    state.op_retiring_waiter_pid = 11;
+    retiring.retirement_pending.store(true, std::memory_order_release);
+
+    ProxyTaskCleanup const CLEANUP = cleanup_proxy_task_reference_locked(&state, 11);
+    return CLEANUP.removed && CLEANUP.op_wait_retiring && CLEANUP.op_wait_entry == &retiring && !CLEANUP.op_wait_claimed &&
+           state.op_retiring_wait_entry == &retiring && state.op_retiring_waiter_pid == 11 &&
+           retiring.state.load(std::memory_order_acquire) == WkiWaitEntry::PENDING;
+}
+
+auto wki_remote_vfs_selftest_teardown_quiesces_retiring_slot() -> bool {
+    ProxyVfsState state{};
+    WkiWaitEntry retiring{};
+    retiring.retirement_pending.store(true, std::memory_order_release);
+    if (!wki_claim_op(&retiring)) {
+        return false;
+    }
+    state.op_retiring_wait_entry = &retiring;
+    state.op_retiring_waiter_pid = 11;
+    PendingProxyTeardown teardown = {
+        .state = &state,
+        .op_wait_entry = &retiring,
+        .op_wait_claimed = true,
+    };
+
+    finish_proxy_teardown_op_waiter(teardown, WKI_ERR_PEER_FENCED);
+    return state.op_retiring_wait_entry == nullptr && state.op_retiring_waiter_pid == 0 &&
+           !retiring.retirement_pending.load(std::memory_order_acquire) &&
+           retiring.state.load(std::memory_order_acquire) == WkiWaitEntry::DONE;
+}
+
+auto wki_remote_vfs_selftest_inactive_slot_rejected() -> bool {
+    ProxyVfsState state{};
+    state.active = false;
+    return acquire_proxy_op_slot_locked(&state, wki_now_us()) == WKI_ERR_PEER_FENCED;
+}
+
 auto wki_remote_vfs_selftest_write_behind_capacity_classes() -> bool {
     struct CapacityCase {
         uint64_t required;
@@ -4920,6 +5401,7 @@ void wki_remote_vfs_unmount(const char* local_mount_path) {
     invalidate_all_dir_caches(state);
     s_vfs_lock.unlock();
 
+    finish_proxy_teardown_op_waiter(teardown, -1);
     ker::vfs::vfs_stream_cache_invalidate_remote_scope(teardown.state);
     invalidate_readlink_cache(teardown.state);
 
@@ -4928,7 +5410,7 @@ void wki_remote_vfs_unmount(const char* local_mount_path) {
                            teardown.op_expected_id, teardown.op_expected_seq, teardown.local_mount_path.data());
     }
 
-    finish_claimed_waiter(teardown.op_wait_entry, -1);
+    wake_proxy_slot_waiters(teardown);
     finish_claimed_waiter(teardown.attach_wait_entry, -1);
 
     // Send DEV_DETACH
@@ -5705,7 +6187,7 @@ void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     }
 
     WkiWaitEntry* wait_entry = nullptr;
-    wait_entry = claim_and_clear_waiter_locked(state->op_wait_entry);
+    wait_entry = claim_response_waiter_locked(state->op_wait_entry);
     if (wait_entry != nullptr) {
         uint16_t copy_len = 0;
         if (RESP_DATA_LEN > 0 && state->op_resp_buf != nullptr) {
@@ -5728,11 +6210,10 @@ void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
         }
         state->op_status = resp->status;
     }
-    // Do NOT clear op_pending here. The waiter's success teardown in
-    // vfs_proxy_send_and_wait will clear it while holding state->lock after
-    // consuming the result. Clearing it here (outside state->lock) opens a
-    // window where a new request can steal the slot and overwrite
-    // op_expected_id/seq before the original waiter's teardown runs.
+    // Keep both the operation slot and exact stack-waiter identity published
+    // until the result consumer, cancellation, teardown, or task-exit cleanup
+    // clears this generation. Those paths quiesce an RX claimant before the
+    // owning stack can be reclaimed.
     state->lock.unlock();
     s_vfs_lock.unlock();
 
@@ -5945,6 +6426,10 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id) {
     }
     s_vfs_lock.unlock();
 
+    for (const auto& cleanup : proxies_to_cleanup) {
+        finish_proxy_teardown_op_waiter(cleanup, -1);
+    }
+
     for (auto* file : files_to_close) {
         if (file != nullptr) {
             if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
@@ -5963,7 +6448,7 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id) {
                                cleanup.assigned_channel, cleanup.op_expected_id, cleanup.op_expected_seq, cleanup.local_mount_path.data());
         }
 
-        finish_claimed_waiter(cleanup.op_wait_entry, -1);
+        wake_proxy_slot_waiters(cleanup);
         finish_claimed_waiter(cleanup.attach_wait_entry, -1);
 
         WkiChannel* ch = wki_channel_get(cleanup.owner_node, cleanup.assigned_channel);
