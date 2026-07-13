@@ -922,8 +922,13 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
         return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0};
     }
 
-    // Register this process for debugging
-    debug::register_process(pid, process_name, reinterpret_cast<uint64_t>(elf_file.base), elf_file.elf_head.e_entry + elf_file.load_base);
+    // The main image owns the PID-scoped debug row. PT_INTERP loads pass
+    // register_special_symbols=false and append any useful metadata to that
+    // row instead of creating an unreachable duplicate with the same PID.
+    if (REGISTER_SPECIAL_SYMBOLS) {
+        debug::register_process(pid, process_name, reinterpret_cast<uint64_t>(elf_file.base),
+                                elf_file.elf_head.e_entry + elf_file.load_base);
+    }
 
     // Collect all program headers for the executable — ld.so needs the full set
     // (PT_LOAD, PT_DYNAMIC, PT_TLS, PT_PHDR, PT_GNU_RELRO, etc.)
@@ -1308,8 +1313,6 @@ auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid
             }
         }
     }  // !skipRelocations
-
-    (void)REGISTER_SPECIAL_SYMBOLS;
 
 // Print debug info for verification
 #ifdef ELF_DEBUG

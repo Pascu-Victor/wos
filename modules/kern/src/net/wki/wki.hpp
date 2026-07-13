@@ -208,6 +208,13 @@ struct WkiPeer {
     uint32_t local_channel_epoch = 0;
     uint32_t remote_channel_epoch = 0;
     uint32_t remote_boot_epoch = 0;
+    // Serializes peer/channel teardown with the final scheduler publication
+    // of receiver-side remote compute work.
+    std::atomic<bool> disconnect_cleanup_in_progress{false};
+    // HELLO RX retires exact channel/session state synchronously, then asks the
+    // task-context timer worker to terminalize work bound to that retired
+    // generation.
+    std::atomic<bool> compute_reset_cleanup_pending{false};
 
     // HELLO retry
     uint64_t hello_sent_time = 0;
@@ -255,6 +262,7 @@ struct WkiReorderEntry {
     uint16_t len = 0;
     uint8_t msg_type = 0;
     uint32_t seq = 0;
+    uint32_t channel_generation = 0;
     WkiReorderEntry* next = nullptr;
 };
 
@@ -440,12 +448,23 @@ auto wki_peer_alloc(uint16_t node_id) -> WkiPeer*;
 // Get the peer count
 auto wki_peer_count() -> uint16_t;
 
+// Serialize peer/channel teardown with deferred work that is about to become
+// externally visible. The blocking form is task-context only.
+auto wki_peer_lifecycle_try_acquire(WkiPeer* peer) -> bool;
+auto wki_peer_lifecycle_acquire(WkiPeer* peer) -> bool;
+void wki_peer_lifecycle_release(WkiPeer* peer);
+
 // -----------------------------------------------------------------------------
 // Public API - Sending
 // -----------------------------------------------------------------------------
 
 // Send a message on a specific channel (handles reliability, credits, routing)
 auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const void* payload, uint16_t payload_len) -> int;
+
+// Send only if a stable pool slot still names the exact resource-channel
+// generation captured by deferred compute work.
+auto wki_send_on_channel_generation(uint16_t dst_node, WkiChannel* expected_channel, uint32_t expected_generation, MsgType msg_type,
+                                    const void* payload, uint16_t payload_len) -> int;
 
 // Send a raw frame (bypasses reliability - used for HELLO, HEARTBEAT)
 auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint16_t payload_len, uint8_t flags = 0) -> int;
@@ -476,6 +495,8 @@ auto wki_channel_reserve(uint16_t peer_node, uint16_t channel_id, PriorityClass 
 
 // Close and free a channel
 void wki_channel_close(WkiChannel* ch);
+auto wki_channel_close_generation(WkiChannel* ch, uint16_t expected_peer, uint16_t expected_channel_id, uint32_t expected_generation)
+    -> bool;
 
 // Close all channels to a specific peer (used during fencing)
 void wki_channels_close_for_peer(uint16_t node_id);

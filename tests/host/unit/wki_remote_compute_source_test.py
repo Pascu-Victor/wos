@@ -8,6 +8,9 @@ ROOT = Path(__file__).resolve().parents[3]
 REMOTE_COMPUTE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_compute.cpp"
 REMOTE_COMPUTE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_compute.hpp"
 REMOTE_COMPUTE_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_remote_compute_ktest.cpp"
+WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
+WKI_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.hpp"
+PEER_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "peer.cpp"
 PROCFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.cpp"
 
 
@@ -48,7 +51,7 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
 
 def test_peer_cleanup_marks_all_targeted_submits_terminal_failure() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
-    body = function_body(source, "wki_remote_compute_cleanup_for_peer")
+    body = function_body(source, "fail_submitted_tasks_for_peer")
 
     if "t.exit_status = -1;" not in body:
         fail("fenced peer cleanup must set failure exit_status for every active submitted task")
@@ -324,7 +327,7 @@ def test_vfs_ref_loader_rejects_null_or_empty_path_before_vfs_use() -> None:
         "localize_receiver_logical_path(path",
         "fallback_to_local_path_for_disconnected_wki_host(resolved_path",
         "ker::vfs::vfs_stat(resolved_path",
-        "std::strncpy(pending.path.data(), resolved_path",
+        "std::strncpy(pending.path.data(), cache_path.data()",
     ]:
         require_order(body, guard, later, "VFS_REF loader must reject null/empty path before VFS/cache use")
 
@@ -335,9 +338,9 @@ def test_vfs_ref_loader_deadlines_are_saturating() -> None:
 
     for snippet in [
         "#include <net/wki/timer_math.hpp>",
-        "uint64_t const INFLIGHT_DEADLINE_US = wki_future_deadline_us(wki_now_us(), WKI_TASK_SUBMIT_VFS_TIMEOUT_US)",
-        "uint64_t const RETRY_DEADLINE_US = wki_future_deadline_us(RETRY_WINDOW_START_US, WKI_VFS_LOAD_RETRY_WINDOW_US)",
-        "uint64_t const WAIT_UNTIL_US = wki_future_deadline_us(wki_now_us(), WKI_VFS_LOAD_RETRY_BACKOFF_US)",
+        "uint64_t inflight_deadline_us = wki_future_deadline_us(wki_now_us(), WKI_TASK_SUBMIT_VFS_TIMEOUT_US)",
+        "uint64_t retry_deadline_us = wki_future_deadline_us(RETRY_WINDOW_START_US, WKI_VFS_LOAD_RETRY_WINDOW_US)",
+        "wki_future_deadline_us(wki_now_us(), WKI_VFS_LOAD_RETRY_BACKOFF_US)",
     ]:
         if snippet not in source:
             fail(f"VFS_REF loader deadline helper use is missing: {snippet}")
@@ -354,11 +357,73 @@ def test_vfs_ref_loader_deadlines_are_saturating() -> None:
     require_order(
         body,
         "s_compute_lock.unlock();",
-        "if (wki_now_us() >= INFLIGHT_DEADLINE_US)",
+        "if (wki_now_us() >= inflight_deadline_us || !request_is_current())",
         "inflight wait timeout must be checked after dropping compute lock",
     )
     if body.count("sleep_until_us(WAIT_UNTIL_US, WKI_VFS_LOAD_BACKOFF_POLL_US)") < 3:
         fail("VFS_REF loader must keep retry backoff sleeps on every retry path")
+
+
+def test_shared_elf_cache_preserves_inflight_load_markers() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    gc_body = function_body(source, "gc_shared_elf_cache_locked")
+    require_tokens(
+        gc_body,
+        [
+            "!it->loading && it->refcount == 0",
+            "it->refcount != 0 || it->loading",
+        ],
+        "shared ELF cache in-flight GC exclusion",
+    )
+
+    loader_body = function_body(source, "load_elf_from_vfs_path")
+    require_tokens(
+        loader_body,
+        [
+            "std::array<char, 512> cache_path = {}",
+            "std::strncpy(cache_path.data(), resolved_path, cache_path.size() - 1)",
+            "find_shared_elf_cache_entry_locked(session, cache_path.data(), cache_key)",
+            "find_shared_elf_cache_locked(session, cache_path.data(), cache_key)",
+            "pending.session = session",
+            "pending.load_token = next_nonzero_token(s_next_shared_elf_cache_load_token)",
+            "std::strncpy(pending.path.data(), cache_path.data(), pending.path.size() - 1)",
+            "shared_elf_freshness_matches(cache_key, retry_stat)",
+            "shared_elf_freshness_matches(cache_key, post_read_stat)",
+        ],
+        "shared ELF cache immutable single-flight key",
+    )
+    require_order(
+        loader_body,
+        "std::strncpy(cache_path.data(), resolved_path, cache_path.size() - 1)",
+        "auto fail_inflight_load = [&]()",
+        "cache key snapshot before failure cleanup",
+    )
+    cache_snapshot = loader_body.find("std::strncpy(cache_path.data(), resolved_path, cache_path.size() - 1)")
+    if "resolved_path = fallback_local_path.data()" in loader_body[cache_snapshot:]:
+        fail("VFS_REF retry must not publish fallback bytes under the original cache identity")
+
+    require_tokens(
+        loader_body,
+        [
+            "// marker or launch them uncached for the retired request.",
+            "if (is_loader)",
+            "result.reject_reason = TaskRejectReason::OVERLOADED",
+        ],
+        "retired loader rejects instead of launching uncached bytes",
+    )
+
+    cleanup_body = function_body(source, "wki_remote_compute_cleanup_for_peer")
+    require_tokens(
+        cleanup_body,
+        [
+            "if (entry.loading)",
+            "entry.loading = false",
+            "entry.load_status = -1",
+            "entry.valid = false",
+        ],
+        "peer cleanup cancels in-flight shared ELF markers",
+    )
+    require_order(cleanup_body, "entry.loading = false", "entry.valid = false", "cancel loader before cache invalidation")
 
 
 def test_remote_stdio_capture_is_write_only_and_non_tty() -> None:
@@ -415,6 +480,395 @@ def test_submitted_vfs_policy_is_active_during_elf_construction() -> None:
     require_tokens(ktest, ["SubmitPolicyScopeRestoresWorker", token], "submitted policy scope KTEST coverage")
 
 
+def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    header = REMOTE_COMPUTE_HPP.read_text()
+    ktest = REMOTE_COMPUTE_KTEST.read_text()
+    wki = WKI_CPP.read_text()
+    peer = PEER_CPP.read_text()
+
+    require_tokens(
+        source,
+        [
+            "constexpr size_t WKI_COMPUTE_SUBMIT_WORKER_MAX = 4",
+            "constexpr size_t WKI_COMPUTE_SUBMIT_QUEUE_MAX = 64",
+            "std::array<PendingTaskSubmit, WKI_COMPUTE_SUBMIT_QUEUE_MAX>",
+            "std::array<CancelledTaskSubmit, WKI_COMPUTE_SUBMIT_CANCEL_MAX>",
+            "std::array<ker::mod::sched::task::Task*, WKI_COMPUTE_SUBMIT_WORKER_MAX>",
+            "std::atomic<size_t> s_compute_submit_task_count{0}",
+            "compute_submit_worker_target(ker::mod::smt::get_core_count())",
+        ],
+        "bounded compute-submit pool",
+    )
+
+    start_body = function_body(source, "wki_remote_compute_start_submit_thread")
+    require_tokens(
+        start_body,
+        [
+            "for (size_t i = 0; i < TARGET_WORKERS; ++i)",
+            "Task::create_kernel_thread(WORKER_NAMES.at(i), wki_compute_submit_thread)",
+            "post_task_balanced(task)",
+            "destroy_unpublished_compute_submit_worker(task)",
+            "s_compute_submit_tasks.at(started_workers++) = task",
+            "s_compute_submit_task_count.store(started_workers, std::memory_order_release)",
+        ],
+        "compute-submit pool startup",
+    )
+    require_order(
+        start_body,
+        "post_task_balanced(task)",
+        "s_compute_submit_tasks.at(started_workers++) = task",
+        "compute-submit worker publication after scheduler post",
+    )
+    destroy_body = function_body(source, "destroy_unpublished_compute_submit_worker")
+    require_tokens(
+        destroy_body,
+        [
+            "delete reinterpret_cast<ker::mod::cpu::PerCpu*>(task->context.syscall_scratch_area)",
+            "delete[] task->name",
+            "phys::page_free(",
+            "delete task",
+        ],
+        "failed compute-submit worker cleanup",
+    )
+
+    notify_body = function_body(source, "wki_remote_compute_notify_pending_submit")
+    require_tokens(
+        notify_body,
+        [
+            "s_compute_submit_task_count.load(std::memory_order_acquire)",
+            "for (size_t i = 0; i < WORKER_COUNT; ++i)",
+            "kern_wake(s_compute_submit_tasks.at(i))",
+        ],
+        "compute-submit wake-all",
+    )
+
+    handler_body = function_body(source, "handle_task_submit")
+    require_tokens(
+        handler_body,
+        [
+            "capture_compute_submit_session_locked(hdr->src_node, rx_channel, rx_channel_generation)",
+            "wki_send_on_channel_generation(hdr->src_node, SESSION.rx_channel, SESSION.rx_channel_generation",
+            "s_compute_submit_task_count.load(std::memory_order_acquire) == 0",
+            "new (std::nothrow) uint8_t[payload_len]",
+            "std::memcpy(copy, payload, payload_len)",
+            "s_pending_task_submit_count < WKI_COMPUTE_SUBMIT_QUEUE_MAX",
+            "g_pending_task_submits.at(s_pending_task_submit_tail) = pending",
+            "s_pending_task_submit_count++",
+            "mode == TaskDeliveryMode::INLINE ? WKI_TASK_SUBMIT_INLINE_RECEIVER_TIMEOUT_US",
+            "pending.deadline_us = wki_future_deadline_us(pending.queued_at_us, RESPONSE_TIMEOUT_US)",
+            "pending.session = SESSION",
+            "delete[] copy",
+            "reject_submit(TaskRejectReason::OVERLOADED)",
+            "wki_remote_compute_notify_pending_submit()",
+        ],
+        "all-mode TASK_SUBMIT deferral",
+    )
+    if "handle_task_submit_work(" in handler_body:
+        fail("TASK_SUBMIT RX handler must defer INLINE as well as VFS/RESOURCE construction")
+    if "push_back(" in handler_body:
+        fail("TASK_SUBMIT RX handler must not allocate queue storage under its spinlock")
+    require_order(
+        handler_body,
+        "g_pending_task_submits.at(s_pending_task_submit_tail) = pending",
+        "wki_remote_compute_notify_pending_submit()",
+        "TASK_SUBMIT publish before worker wake",
+    )
+    overflow_start = handler_body.find("if (!queued)")
+    overflow_end = handler_body.find("wki_remote_compute_notify_pending_submit()", overflow_start)
+    overflow_block = handler_body[overflow_start:overflow_end]
+    require_order(
+        overflow_block,
+        "delete[] copy",
+        "reject_submit(TaskRejectReason::OVERLOADED)",
+        "TASK_SUBMIT queue overflow payload release before rejection",
+    )
+
+    drain_body = function_body(source, "drain_pending_task_submits")
+    require_order(
+        drain_body,
+        "PendingTaskSubmit pending = g_pending_task_submits.at(s_pending_task_submit_head)",
+        "handle_task_submit_work(",
+        "dequeue before task construction",
+    )
+    dequeue_start = drain_body.find("PendingTaskSubmit pending = g_pending_task_submits.at(s_pending_task_submit_head)")
+    dequeue_end = drain_body.find("handle_task_submit_work(", dequeue_start)
+    dequeue_block = drain_body[dequeue_start:dequeue_end]
+    require_order(dequeue_block, "s_pending_task_submit_count--", "s_pending_submit_lock.unlock()", "dequeue count under queue lock")
+    require_order(drain_body, "handle_task_submit_work(", "delete[] pending.payload", "payload release after task construction")
+    require_tokens(
+        source,
+        [
+            "auto submit_deadline_expired = [&]() -> bool",
+            "deadline_us != 0 && wki_now_us() >= deadline_us",
+            "reject_reason == TaskRejectReason::ACCEPTED && submit_deadline_expired()",
+            "handle_task_submit_work(pending.src_node, pending.payload, pending.payload_len, pending.deadline_us, pending.session)",
+        ],
+        "queued submit deadline and session enforcement",
+    )
+    work_body = function_body(source, "handle_task_submit_work")
+    require_tokens(
+        work_body,
+        [
+            "compute_submit_session_is_current_locked(session)",
+            "take_cancelled_task_submit_locked(session, submit->task_id)",
+            "wki_send_on_channel_generation(src_node, session.rx_channel, session.rx_channel_generation",
+            "Task submit expired before post",
+            "perf_compute_reject_status(TaskRejectReason::OVERLOADED)",
+            "rt.published = false",
+            "rt.accept_pending = false",
+            "rt.submit_session_epoch = session.epoch",
+            "g_running_remote_tasks.push_back(rt)",
+            "bool const POSTED = ker::mod::sched::post_task_balanced(new_task)",
+            "published_row->published = true",
+            "published_row->accept_pending = send_accept",
+            "worker_task_ref = new_task",
+            "worker_task_ref->release()",
+        ],
+        "final submit session, cancellation, publication, and accept fence",
+    )
+    publication_block = work_body[work_body.find("g_running_remote_tasks.push_back(rt)") :]
+    require_order(
+        publication_block,
+        "g_running_remote_tasks.push_back(rt)",
+        "s_compute_lock.unlock()",
+        "running row must be published before releasing the compute lock",
+    )
+    require_order(
+        publication_block,
+        "s_compute_lock.unlock()",
+        "bool const POSTED = ker::mod::sched::post_task_balanced(new_task)",
+        "scheduler publication must not run under the compute spinlock",
+    )
+    successful_publication = work_body[
+        work_body.find("published_row->published = true") :
+    ]
+    require_order(
+        successful_publication,
+        "task_process_owner_pid(new_task)",
+        "worker_task_ref->release()",
+        "worker task reference must cover post-publication cancellation",
+    )
+    require_order(
+        successful_publication,
+        "new_task->has_exited",
+        "worker_task_ref->release()",
+        "worker task reference must cover post-publication liveness access",
+    )
+
+    destroy_process_body = function_body(source, "destroy_unpublished_remote_process")
+    require_tokens(
+        destroy_process_body,
+        [
+            "loader::debug::unregister_process(task->pid)",
+            "loader::debug::remove_gdb_debug_info(task->pid)",
+            "close_proxy_fd_table(task)",
+            "task::release_lazy_vmem_ranges(*task)",
+            "release_loaded_elf_buffer(task->elf_buffer, task->is_elf_buffer_shared)",
+            "task->thread->tls_phys_ptr = 0",
+            "task->thread->stack_phys_ptr = 0",
+            "threading::destroy_thread(task->thread)",
+            "delete reinterpret_cast<ker::mod::cpu::PerCpu*>(task->context.syscall_scratch_area)",
+            "virt::destroy_user_space(task->pagemap, task->pid, task->name, reason)",
+            "virt::release_pagemap(task->pagemap)",
+            "delete[] task->name",
+            "task->context.syscall_kernel_stack - ker::mod::mm::KERNEL_STACK_SIZE",
+            "delete output",
+        ],
+        "expired unpublished remote-process cleanup",
+    )
+    for reason in [
+        "wki-submit-parse",
+        "wki-submit-stack",
+        "wki-submit-expired",
+        "wki-submit-cancel",
+        "wki-submit-session",
+        "wki-submit-ref",
+        "wki-submit-post",
+    ]:
+        require_tokens(
+            work_body,
+            [f'destroy_unpublished_remote_process(new_task,'],
+            f"{reason} rejection uses complete unpublished-process cleanup",
+        )
+        if reason not in work_body:
+            fail(f"{reason} rejection must use complete unpublished-process cleanup")
+
+    cleanup_body = function_body(source, "wki_remote_compute_cleanup_for_peer")
+    require_tokens(
+        cleanup_body,
+        [
+            "fail_submitted_tasks_for_peer(node_id, RemoteComputeCleanupScope::ALL)",
+            "terminate_running_remote_tasks_for_peer(node_id, RemoteComputeCleanupScope::ALL)",
+            "entry.loading = false",
+            "entry.load_status = -1",
+        ],
+        "peer cleanup retains live output capture and cancels cache loads",
+    )
+    retired_cleanup_body = function_body(source, "wki_remote_compute_cleanup_retired_for_peer")
+    require_tokens(
+        retired_cleanup_body,
+        [
+            "fail_submitted_tasks_for_peer(node_id, RemoteComputeCleanupScope::RETIRED)",
+            "terminate_running_remote_tasks_for_peer(node_id, RemoteComputeCleanupScope::RETIRED)",
+            "compute_submit_session_is_current_locked(SESSION)",
+            "compact_pending_task_completions_locked()",
+        ],
+        "ordinary epoch reset cleans only retired compute generations",
+    )
+    terminate_body = function_body(source, "terminate_running_remote_tasks_for_peer")
+    require_tokens(
+        terminate_body,
+        [
+            "running.discard_completion = true",
+            "running.termination_requested = true",
+            "queue_signal_for_process_tasks(OWNER_PID, WKI_SIGKILL_NUM)",
+        ],
+        "peer cleanup terminates receiver-side processes outside the compute lock",
+    )
+    completion_body = function_body(source, "wki_remote_compute_check_completions")
+    require_tokens(
+        completion_body,
+        [
+            "if (rt.discard_completion)",
+            "retry_pending_task_accepts()",
+            "rt.accept_pending && !rt.discard_completion",
+            "wki_send_on_channel_generation(info.submitter_node, info.submit_rx_channel, info.submit_rx_channel_generation",
+            "g_pending_task_completions.push_back(info)",
+            "delete rt.output",
+            "rt.task->release()",
+        ],
+        "retired peer output capture release after task exit",
+    )
+
+    cancel_body = function_body(source, "handle_task_cancel")
+    require_tokens(
+        cancel_body,
+        [
+            "capture_compute_submit_session_locked(hdr->src_node, rx_channel, rx_channel_generation)",
+            "find_running_task(cancel->task_id, SESSION)",
+            "record_cancelled_task_submit_locked(SESSION, cancel->task_id, SIGNUM)",
+            "rt->accept_pending = false",
+            "rt->discard_completion = true",
+        ],
+        "session-scoped queued/in-flight TASK_CANCEL",
+    )
+
+    for handler in ["handle_task_accept", "handle_task_reject", "handle_task_complete"]:
+        body = function_body(source, handler)
+        require_tokens(
+            body,
+            [
+                "task->target_node != hdr->src_node",
+                "task->submit_channel != rx_channel",
+                "task->submit_channel_generation != rx_channel_generation",
+            ],
+            f"{handler} exact submitter channel identity",
+        )
+
+    submit_inline = source[
+        source.find("auto wki_task_submit_inline") : source.find("// Submitter Side - VFS_REF Submit")
+    ]
+    require_tokens(
+        submit_inline,
+        [
+            "uint64_t const TOTAL =",
+            "if (TOTAL > WKI_ETH_MAX_PAYLOAD)",
+            "capture_submitter_channel(target_node)",
+            "wki_send_on_channel_generation(target_node, SUBMIT_CHANNEL.channel, SUBMIT_CHANNEL.generation",
+        ],
+        "INLINE sender overflow and channel-generation guards",
+    )
+    submit_vfs = source[
+        source.find("auto wki_task_submit_vfs_ref") : source.find("// Submitter Side - Wait for Completion")
+    ]
+    require_tokens(
+        submit_vfs,
+        [
+            "size_t const PATH_LEN = std::strlen(vfs_path)",
+            "PATH_LEN >= 512",
+            "PATH_LEN > UINT16_MAX",
+            "capture_submitter_channel(target_node)",
+        ],
+        "VFS_REF sender path and channel-generation guards",
+    )
+
+    require_tokens(
+        wki,
+        [
+            "detail::handle_task_submit(hdr, payload, payload_len, rx_channel, rx_channel_generation)",
+            "detail::handle_task_accept(hdr, payload, payload_len, rx_channel, rx_channel_generation)",
+            "detail::handle_task_reject(hdr, payload, payload_len, rx_channel, rx_channel_generation)",
+            "detail::handle_task_complete(hdr, payload, payload_len, rx_channel, rx_channel_generation)",
+            "detail::handle_task_cancel(hdr, payload, payload_len, rx_channel, rx_channel_generation)",
+        ],
+        "compute dispatch channel-generation propagation",
+    )
+    require_tokens(
+        peer,
+        [
+            "class PeerLifecycleGuard",
+            "disconnect_cleanup_in_progress.compare_exchange_strong",
+            "PeerLifecycleGuard lifecycle",
+            "lifecycle.try_acquire(peer)",
+            "lifecycle.acquire(peer)",
+            "wki_remote_compute_retire_submit_session(peer_node)",
+            "compute_reset_cleanup_pending.store(true, std::memory_order_release)",
+            "wki_remote_compute_cleanup_retired_for_peer(peer.node_id)",
+            "wki_remote_compute_cleanup_for_peer(fenced_id)",
+            "wki_peer_lifecycle_release(claimed_peer)",
+        ],
+        "disconnect/reconnect cleanup admission gate",
+    )
+    require_tokens(
+        wki,
+        [
+            "class PeerLifecycleTryLease",
+            "message_uses_compute_lifecycle(msg)",
+            "compute_lifecycle.try_acquire(hdr->src_node)",
+            "message_uses_compute_lifecycle(RO_MSG)",
+            "!compute_lifecycle.owns(hdr->src_node)",
+        ],
+        "TASK message admission serialized with peer cleanup",
+    )
+    require_order(
+        function_body(wki, "wki_rx"),
+        "message_uses_compute_lifecycle(RO_MSG)",
+        "WkiReorderEntry* ro = ch->reorder_head",
+        "reordered TASK admission must precede consuming the buffered frame",
+    )
+
+    token = "wki_remote_compute_selftest_submit_worker_count_is_bounded"
+    require_tokens(source, [f"auto {token}() -> bool"], "submit-worker count selftest implementation")
+    require_tokens(header, [f"auto {token}() -> bool;"], "submit-worker count selftest declaration")
+    require_tokens(ktest, ["SubmitWorkerCountIsBounded", token], "submit-worker count KTEST coverage")
+
+    fairness_body = function_body(source, "collect_pending_task_accept_attempts_locked")
+    require_tokens(
+        fairness_body,
+        [
+            "s_pending_task_accept_cursor % ROW_COUNT",
+            "visited < ROW_COUNT && attempt_count < attempts.size()",
+            "s_pending_task_accept_cursor = index",
+        ],
+        "pending TASK_ACCEPT retry round robin",
+    )
+    require_tokens(
+        function_body(source, "retry_pending_task_accepts"),
+        ["collect_pending_task_accept_attempts_locked(attempts)"],
+        "pending TASK_ACCEPT retry uses round robin",
+    )
+    fairness_token = "wki_remote_compute_selftest_accept_retry_is_fair"
+    require_tokens(source, [f"auto {fairness_token}() -> bool"], "accept retry fairness selftest implementation")
+    require_tokens(header, [f"auto {fairness_token}() -> bool;"], "accept retry fairness selftest declaration")
+    require_tokens(ktest, ["AcceptRetryIsFair", fairness_token], "accept retry fairness KTEST coverage")
+
+    cancel_token = "wki_remote_compute_selftest_submit_cancel_is_session_scoped"
+    require_tokens(source, [f"auto {cancel_token}() -> bool"], "session-scoped cancel selftest implementation")
+    require_tokens(header, [f"auto {cancel_token}() -> bool;"], "session-scoped cancel selftest declaration")
+    require_tokens(ktest, ["SubmitCancelIsSessionScoped", cancel_token], "session-scoped cancel KTEST coverage")
+
+
 def main() -> None:
     test_peer_cleanup_marks_all_targeted_submits_terminal_failure()
     test_proxy_wait_completion_respects_waitpid_publish_fence()
@@ -425,8 +879,10 @@ def main() -> None:
     test_receiver_path_localization_bounds_suffix_scan()
     test_vfs_ref_loader_rejects_null_or_empty_path_before_vfs_use()
     test_vfs_ref_loader_deadlines_are_saturating()
+    test_shared_elf_cache_preserves_inflight_load_markers()
     test_remote_stdio_capture_is_write_only_and_non_tty()
     test_submitted_vfs_policy_is_active_during_elf_construction()
+    test_receiver_vfs_ref_submit_uses_bounded_worker_pool()
     print("WKI remote compute source invariants hold")
 
 

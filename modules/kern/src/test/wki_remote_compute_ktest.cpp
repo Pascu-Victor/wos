@@ -24,3 +24,13 @@ KTEST(WkiRemoteCompute, LoadSnapshotSurvivesCleanup) {
 KTEST(WkiRemoteCompute, SubmitPolicyScopeRestoresWorker) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_submit_policy_scope_restores_worker());
 }
+
+KTEST(WkiRemoteCompute, SubmitWorkerCountIsBounded) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_submit_worker_count_is_bounded());
+}
+
+KTEST(WkiRemoteCompute, AcceptRetryIsFair) { KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_accept_retry_is_fair()); }
+
+KTEST(WkiRemoteCompute, SubmitCancelIsSessionScoped) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_submit_cancel_is_session_scoped());
+}

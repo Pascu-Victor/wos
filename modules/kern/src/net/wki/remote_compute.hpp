@@ -43,6 +43,8 @@ struct SubmittedTask {
     uint32_t task_id = 0;
     uint16_t target_node = WKI_NODE_INVALID;
     uint64_t local_pid = 0;
+    WkiChannel* submit_channel = nullptr;
+    uint32_t submit_channel_generation = 0;
 
     std::atomic<bool> response_pending{false};
     uint8_t accept_status = 0;                    // TaskRejectReason
@@ -69,6 +71,8 @@ struct SubmittedTask {
           task_id(o.task_id),
           target_node(o.target_node),
           local_pid(o.local_pid),
+          submit_channel(o.submit_channel),
+          submit_channel_generation(o.submit_channel_generation),
           response_pending(o.response_pending.load(std::memory_order_relaxed)),
           accept_status(o.accept_status),
           response_wait_entry(o.response_wait_entry),
@@ -87,6 +91,8 @@ struct SubmittedTask {
             task_id = o.task_id;
             target_node = o.target_node;
             local_pid = o.local_pid;
+            submit_channel = o.submit_channel;
+            submit_channel_generation = o.submit_channel_generation;
             response_pending.store(o.response_pending.load(std::memory_order_relaxed), std::memory_order_relaxed);
             accept_status = o.accept_status;
             response_wait_entry = o.response_wait_entry;
@@ -118,9 +124,16 @@ struct TaskOutputCapture {
 
 struct RunningRemoteTask {
     bool active = false;
+    bool published = false;
+    bool accept_pending = false;
+    bool discard_completion = false;
+    bool termination_requested = false;
     uint32_t task_id = 0;
     uint16_t submitter_node = WKI_NODE_INVALID;
     uint64_t local_pid = 0;
+    uint64_t submit_session_epoch = 0;
+    WkiChannel* submit_rx_channel = nullptr;
+    uint32_t submit_rx_channel_generation = 0;
     ker::mod::sched::task::Task* task = nullptr;
 
     // D19: stdout/stderr capture
@@ -239,6 +252,11 @@ auto wki_remote_node_load_snapshot(uint16_t node_id, RemoteNodeLoad* out) -> boo
 auto wki_least_loaded_node(uint16_t local_load) -> uint16_t;
 
 // Fencing cleanup
+// Retire receiver-side TASK_SUBMIT admission for a channel/session reset.
+void wki_remote_compute_retire_submit_session(uint16_t node_id);
+// Task-context cleanup after an ordinary peer epoch/channel reset. Only work
+// bound to a retired resource-channel generation is terminalized.
+void wki_remote_compute_cleanup_retired_for_peer(uint16_t node_id);
 void wki_remote_compute_cleanup_for_peer(uint16_t node_id);
 
 // Release a shared cached ELF buffer acquired for remote execution.
@@ -265,17 +283,16 @@ auto wki_remote_compute_diag_snapshot(WkiRemoteComputeDiagRow* rows, size_t capa
 // When a task exits, sends TASK_COMPLETE back to the submitter.
 void wki_remote_compute_check_completions();
 
-// Process deferred VFS_REF/RESOURCE_REF task submits.  Drains the pending
-// queue inline (still called from the timer tick deferred section as a
-// fallback).  The primary processing path is the dedicated compute submit
-// kernel thread started by wki_remote_compute_start_submit_thread().
+// Process deferred TASK_SUBMIT messages. Drains the pending queue inline as a
+// fallback; the primary path is the bounded compute-submit worker pool started
+// by wki_remote_compute_start_submit_thread().
 void wki_remote_compute_process_pending_submits();
 
-// Start the dedicated kernel thread that processes VFS_REF/RESOURCE_REF
-// task submits.  Must be called after the scheduler is running.
+// Start the bounded kernel-thread pool that processes all TASK_SUBMIT modes.
+// Must be called after the scheduler is running.
 void wki_remote_compute_start_submit_thread();
 
-// Wake the compute submit thread after queuing a new pending submit.
+// Wake the compute-submit workers after queuing a new pending submit.
 void wki_remote_compute_notify_pending_submit();
 
 #ifdef WOS_SELFTEST
@@ -285,6 +302,9 @@ auto wki_remote_compute_selftest_task_wait_consumes_completed_row() -> bool;
 auto wki_remote_compute_selftest_task_wait_timeout_preserves_successor() -> bool;
 auto wki_remote_compute_selftest_load_snapshot_survives_cleanup() -> bool;
 auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool;
+auto wki_remote_compute_selftest_submit_worker_count_is_bounded() -> bool;
+auto wki_remote_compute_selftest_accept_retry_is_fair() -> bool;
+auto wki_remote_compute_selftest_submit_cancel_is_session_scoped() -> bool;
 #endif
 
 // -----------------------------------------------------------------------------
@@ -294,17 +314,22 @@ auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool;
 namespace detail {
 
 // Receiver side: handle incoming task submission
-void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
+void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                        uint32_t rx_channel_generation);
 
 // Submitter side: handle accept/reject response
-void handle_task_accept(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
-void handle_task_reject(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
+void handle_task_accept(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                        uint32_t rx_channel_generation);
+void handle_task_reject(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                        uint32_t rx_channel_generation);
 
 // Submitter side: handle task completion
-void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
+void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                          uint32_t rx_channel_generation);
 
 // Receiver side: handle cancel request
-void handle_task_cancel(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
+void handle_task_cancel(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                        uint32_t rx_channel_generation);
 
 // Receiver side: handle incoming load report
 void handle_load_report(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);

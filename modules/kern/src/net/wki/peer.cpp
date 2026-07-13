@@ -44,6 +44,31 @@ namespace ker::net::wki {
 
 using log = ker::mod::dbg::logger<"wki">;
 
+auto wki_peer_lifecycle_try_acquire(WkiPeer* peer) -> bool {
+    if (peer == nullptr) {
+        return false;
+    }
+    bool expected = false;
+    return peer->disconnect_cleanup_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+                                                                        std::memory_order_acquire);
+}
+
+auto wki_peer_lifecycle_acquire(WkiPeer* peer) -> bool {
+    if (peer == nullptr) {
+        return false;
+    }
+    while (!wki_peer_lifecycle_try_acquire(peer)) {
+        ker::mod::sched::kern_yield();
+    }
+    return true;
+}
+
+void wki_peer_lifecycle_release(WkiPeer* peer) {
+    if (peer != nullptr) {
+        peer->disconnect_cleanup_in_progress.store(false, std::memory_order_release);
+    }
+}
+
 namespace {
 constexpr size_t HELLO_CHANNEL_EPOCH_OFFSET = 0;
 constexpr size_t HELLO_BOOT_EPOCH_OFFSET = HELLO_CHANNEL_EPOCH_OFFSET + sizeof(uint32_t);
@@ -53,6 +78,32 @@ constexpr size_t HEARTBEAT_NETDIAG_TCP_LISTENERS = 8;
 constexpr size_t HEARTBEAT_NETDIAG_TCP_CONNS = 16;
 
 std::atomic<uint64_t> g_next_heartbeat_netdiag_us{0};
+
+class PeerLifecycleGuard {
+   public:
+    PeerLifecycleGuard() = default;
+    PeerLifecycleGuard(const PeerLifecycleGuard&) = delete;
+    auto operator=(const PeerLifecycleGuard&) -> PeerLifecycleGuard& = delete;
+
+    ~PeerLifecycleGuard() { wki_peer_lifecycle_release(claimed_peer); }
+
+    auto try_acquire(WkiPeer* peer) -> bool {
+        if (claimed_peer != nullptr || !wki_peer_lifecycle_try_acquire(peer)) {
+            return false;
+        }
+        claimed_peer = peer;
+        return true;
+    }
+
+    void acquire(WkiPeer* peer) {
+        if (claimed_peer == nullptr && wki_peer_lifecycle_acquire(peer)) {
+            claimed_peer = peer;
+        }
+    }
+
+   private:
+    WkiPeer* claimed_peer = nullptr;
+};
 
 auto heartbeat_netdiag_tcp_state_name(uint8_t state) -> const char* {
     switch (static_cast<ker::net::proto::TcpState>(state)) {
@@ -525,6 +576,11 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
             return;
         }
     }
+    PeerLifecycleGuard lifecycle;
+    if (!lifecycle.try_acquire(peer)) {
+        g_wki.peer_lock.unlock();
+        return;
+    }
 
     bool const WAS_FENCED = (peer->state == PeerState::FENCED);
 
@@ -626,6 +682,11 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
     if (log_hostname_collision) {
         log::warn("Hostname collision with 0x%04x, falling back to '%s'", peer_node, local_hostname_fallback.data());
     }
+    if (remote_boot_epoch_changed || remote_channel_epoch_changed || WAS_FENCED) {
+        wki_remote_compute_retire_submit_session(peer_node);
+        peer->compute_reset_cleanup_pending.store(true, std::memory_order_release);
+        wki_timer_notify();
+    }
     if (remote_boot_epoch_changed) {
         log::info("Peer 0x%04x boot epoch changed to %u; resetting stale channel state", peer_node, REMOTE_BOOT_EPOCH);
         wki_channels_close_for_peer(peer_node);
@@ -705,6 +766,11 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
             return;
         }
     }
+    PeerLifecycleGuard lifecycle;
+    if (!lifecycle.try_acquire(peer)) {
+        g_wki.peer_lock.unlock();
+        return;
+    }
 
     peer->mac = ack->mac_addr;
     // Prefer RDMA-capable (ivshmem) transport over Ethernet per spec
@@ -769,6 +835,12 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
 
     if (WAS_FENCED) {
         log::info("Peer 0x%04x '%s' reconnecting from HELLO_ACK (was fenced)", peer_node, log_hostname.data());
+    }
+
+    if (remote_boot_epoch_changed || remote_channel_epoch_changed || WAS_FENCED) {
+        wki_remote_compute_retire_submit_session(peer_node);
+        peer->compute_reset_cleanup_pending.store(true, std::memory_order_release);
+        wki_timer_notify();
     }
 
     if (remote_boot_epoch_changed && !WAS_FENCED) {
@@ -1133,6 +1205,8 @@ auto queue_pending_peer_goodbye(const PeerGoodbyePayload& goodbye, uint16_t src_
 }
 
 void wki_peer_disconnect_impl(WkiPeer* peer, PeerDisconnectKind kind, bool notify_connected_peers) {
+    PeerLifecycleGuard lifecycle;
+    lifecycle.acquire(peer);
     peer->lock.lock();
     if (peer->state == PeerState::FENCED) {
         peer->lock.unlock();
@@ -1437,6 +1511,21 @@ auto local_observation_confirms_fence(const WkiPeer* peer, uint64_t now_us) -> b
     return wki_peer_local_observation_confirms_fence(peer, now_us, wki_eth_recent_tx_pressure(now_us));
 }
 
+void drain_pending_compute_reset_cleanups() {
+    for (auto& peer : g_wki.peers) {
+        if (peer.node_id == WKI_NODE_INVALID || !peer.compute_reset_cleanup_pending.exchange(false, std::memory_order_acq_rel)) {
+            continue;
+        }
+
+        // This is the task-context half of HELLO epoch handling. The lifecycle
+        // lease prevents a new TASK_* dispatch/publication from changing the
+        // current generation while stale rows are selected and terminalized.
+        PeerLifecycleGuard lifecycle;
+        lifecycle.acquire(&peer);
+        wki_remote_compute_cleanup_retired_for_peer(peer.node_id);
+    }
+}
+
 }  // namespace
 
 void wki_peer_timer_tick(uint64_t now_us) {
@@ -1444,6 +1533,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
         return;
     }
 
+    drain_pending_compute_reset_cleanups();
     drain_pending_fence_notifies();
     drain_pending_peer_goodbyes();
 

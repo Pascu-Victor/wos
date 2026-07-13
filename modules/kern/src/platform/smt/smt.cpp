@@ -826,8 +826,8 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     // Start the WKI timer as a kernel thread (heartbeats, fencing, retransmit, load reports)
     ker::net::wki::wki_timer_thread_start();
 
-    // Start the WKI compute submit thread (processes VFS_REF/RESOURCE_REF task
-    // submits with blocking VFS I/O, decoupled from the timer tick)
+    // Start the bounded WKI compute-submit pool; every delivery mode can enter
+    // blocking VFS through executable or PT_INTERP construction.
     ker::net::wki::wki_remote_compute_start_submit_thread();
 
     // Start secondary CPUs (their idle tasks all get PID 0 - kernel/swapper convention)

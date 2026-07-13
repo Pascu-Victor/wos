@@ -131,7 +131,7 @@ def require_sparse_exec_reads(source: str) -> None:
         "file_size <= EXEC_SPARSE_ELF_MIN_SIZE",
         "read_full_exec_image(fd, dst, file_size, path)",
         "EXEC_SHEBANG_PROBE_SIZE",
-        "read_sparse_elf_image(fd, dst, file_size, path, bytes_read, read_static_relocation_metadata, allow_lazy_file_segments)",
+        "read_sparse_elf_image(fd, dst, file_size, path, bytes_read, read_static_relocation_metadata, USE_LAZY_FILE_SEGMENTS)",
         "result.shebang_probe_size = PROBE_SIZE",
     ]:
         if snippet not in image_body:
@@ -151,7 +151,7 @@ def require_callers_use_sparse_reader(source: str) -> None:
         fail("both exec and execve must read executable images through the sparse reader")
     if "read_exec_image_for_loader(INTERP_FD, interp_buf" not in source:
         fail("PT_INTERP load must use the sparse reader")
-    if "read_exec_image_for_loader(INTERP_FD, interp_buf, static_cast<size_t>(INTERP_SIZE), INTERP_PATH, false, interp_file != nullptr)" not in source:
+    if "INTERP_PATH, false, INTERP_LAZY_FILE_SEGMENTS" not in source:
         fail("PT_INTERP load must not read static-only relocation metadata")
 
     forbidden = [
@@ -172,7 +172,7 @@ def require_callers_use_sparse_reader(source: str) -> None:
         "vfs::File* exec_file = vfs::vfs_get_file_retain(task, FD)",
         "release_exec_file_once",
         "ElfLoadOptions const MAIN_LOAD_OPTIONS",
-        ".lazy_file_ranges = exec_file != nullptr ? &main_loader_lazy_ranges : nullptr",
+        ".lazy_file_ranges = EXEC_LAZY_FILE_SEGMENTS ? &main_loader_lazy_ranges : nullptr",
         "append_exec_lazy_file_ranges(new_lazy_ranges, main_loader_lazy_ranges, exec_file, exec_stat)",
         "vfs::File* interp_file = vfs::vfs_get_file_retain(task, INTERP_FD)",
         "append_exec_lazy_file_ranges(new_lazy_ranges, interp_loader_lazy_ranges, interp_file, interp_stat)",
@@ -197,12 +197,14 @@ def require_stdio_fallback_access_modes(source: str) -> None:
 
 
 def require_loader_does_not_scan_unread_symbol_payloads(loader_source: str) -> None:
-    body = function_body_containing(loader_source, "load_elf", "(void)REGISTER_SPECIAL_SYMBOLS;")
-    if "(void)REGISTER_SPECIAL_SYMBOLS;" not in body:
-        fail("loader must not scan symbol/string table payloads after sparse exec reads")
-    marker = body.find("(void)REGISTER_SPECIAL_SYMBOLS;")
+    body = function_body_containing(loader_source, "load_elf", "if (REGISTER_SPECIAL_SYMBOLS)")
+    registration_gate = body.find("if (REGISTER_SPECIAL_SYMBOLS)")
+    registration = body.find("debug::register_process", registration_gate)
+    if registration_gate < 0 or registration < registration_gate:
+        fail("interpreter loads must not create a duplicate PID debug-registry row")
+    marker = body.find("// Print debug info for verification", registration)
     if marker < 0:
-        fail("register_special_symbols marker missing")
+        fail("loader sparse-symbol scan boundary missing")
     tail = body[marker:]
     for forbidden in [
         "SHT_SYMTAB",

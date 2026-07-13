@@ -19,8 +19,11 @@
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <new>
+#include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/init/limine_requests.hpp>
+#include <platform/loader/debug_info.hpp>
+#include <platform/loader/gdb_interface.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/phys.hpp>
@@ -56,6 +59,37 @@ constexpr uint32_t WKI_LATENCY_DAEMON_SLICE_NS = 2'000'000;
 constexpr int WKI_LATENCY_DAEMON_NICE = -5;
 constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
 constexpr uint16_t WKI_LOAD_REPORT_MAX_CPUS = 64;
+constexpr size_t WKI_COMPUTE_SUBMIT_WORKER_MAX = 4;
+constexpr size_t WKI_COMPUTE_SUBMIT_QUEUE_MAX = 64;
+constexpr size_t WKI_COMPUTE_SUBMIT_CANCEL_MAX = WKI_COMPUTE_SUBMIT_QUEUE_MAX * 2;
+constexpr uint64_t WKI_TASK_SUBMIT_VFS_TIMEOUT_US = 60'000'000;  // Remote binary fetch + launch.
+constexpr uint64_t WKI_TASK_SUBMIT_INLINE_RECEIVER_TIMEOUT_US = WKI_OP_TIMEOUT_US - 1'000'000;
+constexpr uint64_t WKI_TASK_SUBMIT_VFS_RECEIVER_TIMEOUT_US = WKI_TASK_SUBMIT_VFS_TIMEOUT_US - 5'000'000;
+static_assert(WKI_TASK_SUBMIT_INLINE_RECEIVER_TIMEOUT_US > 0);
+
+class PeerLifecycleLease {
+   public:
+    PeerLifecycleLease() = default;
+    PeerLifecycleLease(const PeerLifecycleLease&) = delete;
+    auto operator=(const PeerLifecycleLease&) -> PeerLifecycleLease& = delete;
+
+    ~PeerLifecycleLease() { wki_peer_lifecycle_release(claimed_peer); }
+
+    auto acquire(uint16_t node_id) -> bool {
+        if (claimed_peer != nullptr) {
+            return false;
+        }
+        WkiPeer* peer = wki_peer_find(node_id);
+        if (!wki_peer_lifecycle_acquire(peer)) {
+            return false;
+        }
+        claimed_peer = peer;
+        return true;
+    }
+
+   private:
+    WkiPeer* claimed_peer = nullptr;
+};
 
 void promote_latency_sensitive_daemon(ker::mod::sched::task::Task* task) {
     if (task == nullptr || task->type != ker::mod::sched::task::TaskType::DAEMON) {
@@ -69,12 +103,16 @@ void promote_latency_sensitive_daemon(ker::mod::sched::task::Task* task) {
 std::deque<SubmittedTask> g_submitted_tasks;           // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::deque<RemoteNodeLoad> g_remote_loads;             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::deque<RunningRemoteTask> g_running_remote_tasks;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+size_t s_pending_task_accept_cursor = 0;               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 struct PendingTaskCompletion {
     uint32_t task_id = 0;
     uint16_t submitter_node = WKI_NODE_INVALID;
     uint64_t local_pid = 0;
     int32_t exit_status = -1;
     TaskOutputCapture* output = nullptr;
+    uint64_t submit_session_epoch = 0;
+    WkiChannel* submit_rx_channel = nullptr;
+    uint32_t submit_rx_channel_generation = 0;
 };
 std::deque<PendingTaskCompletion> g_pending_task_completions;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 uint32_t g_next_task_id = 1;                                   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -169,6 +207,33 @@ uint16_t g_cached_local_load_pct{};        // NOLINT(cppcoreguidelines-avoid-non
 uint64_t g_cached_local_load_update_us{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::mod::sys::Spinlock s_compute_lock;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+struct ComputeSubmitSessionToken {
+    uint16_t node_id = WKI_NODE_INVALID;
+    WkiChannel* rx_channel = nullptr;
+    uint32_t rx_channel_generation = 0;
+    uint64_t epoch = 0;
+};
+
+enum class RemoteComputeCleanupScope : uint8_t {
+    ALL,
+    RETIRED,
+};
+
+struct ComputeSubmitPeerSession {
+    bool used = false;
+    bool open = false;
+    bool retiring = false;
+    uint16_t node_id = WKI_NODE_INVALID;
+    ComputeSubmitSessionToken current = {};
+    WkiChannel* retired_channel = nullptr;
+    uint32_t retired_channel_generation = 0;
+};
+
+std::array<ComputeSubmitPeerSession, WKI_MAX_PEERS>
+    g_compute_submit_peer_sessions{};              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t s_next_compute_submit_session_epoch = 1;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t s_next_shared_elf_cache_load_token = 1;   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
 struct SubmittedIpcCleanup {
     std::array<WkiIpcFdEntry, 16> map = {};
     uint16_t count = 0;
@@ -209,26 +274,44 @@ void cleanup_submitted_ipc_exports(const SubmittedIpcCleanup& cleanup) {
     wki_ipc_cleanup_exported_fds(cleanup.map.data(), cleanup.count, cleanup.target_node);
 }
 
-// Pending queue for VFS_REF/RESOURCE_REF task submits.
-// These delivery modes call load_elf_from_vfs_path() which does blocking
-// remote VFS reads.  Running those from NAPI poll context causes
-// re-entrance deadlocks, so they are queued here and processed by a
-// dedicated kernel thread (wki_compute_submit_thread).
+// Pending TASK_SUBMIT queue. VFS/RESOURCE executable fetches and INLINE
+// PT_INTERP construction can all block in VFS, so receiver-side construction
+// stays out of NAPI poll context.
 struct PendingTaskSubmit {
     uint16_t src_node;
     uint8_t* payload;
     uint16_t payload_len;
     uint64_t queued_at_us;
+    uint64_t deadline_us;
+    ComputeSubmitSessionToken session;
 };
-std::deque<PendingTaskSubmit> g_pending_task_submits;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-ker::mod::sys::Spinlock s_pending_submit_lock;                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-ker::mod::sched::task::Task* s_compute_submit_task = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+struct CancelledTaskSubmit {
+    bool active = false;
+    uint32_t task_id = 0;
+    int32_t signum = 0;
+    uint64_t expires_at_us = 0;
+    ComputeSubmitSessionToken session = {};
+};
+std::array<CancelledTaskSubmit, WKI_COMPUTE_SUBMIT_CANCEL_MAX>
+    g_cancelled_task_submits{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<PendingTaskSubmit, WKI_COMPUTE_SUBMIT_QUEUE_MAX>
+    g_pending_task_submits{};                   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+size_t s_pending_task_submit_head = 0;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+size_t s_pending_task_submit_tail = 0;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+size_t s_pending_task_submit_count = 0;         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_pending_submit_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<ker::mod::sched::task::Task*, WKI_COMPUTE_SUBMIT_WORKER_MAX>
+    s_compute_submit_tasks{};                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<size_t> s_compute_submit_task_count{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 struct SharedElfCacheEntry {
     bool valid = false;
     bool loading = false;
     int32_t load_status = 0;
     uint16_t submitter_node = WKI_NODE_INVALID;
+    ComputeSubmitSessionToken session = {};
+    uint64_t load_token = 0;
     std::array<char, 512> path = {};
     ker::vfs::Stat freshness = {};
     uint8_t* buffer = nullptr;
@@ -323,7 +406,6 @@ struct ScopedComputeMeasure {
     }
 };
 
-constexpr uint64_t WKI_TASK_SUBMIT_VFS_TIMEOUT_US = 60000000;  // 60 s for remote binary fetch + launch
 // Keep executable preads bounded: remote VFS may split one logical pread into
 // several RDMA sub-requests, and cold fan-out does this concurrently per node.
 constexpr size_t WKI_VFS_LOAD_CHUNK = size_t{2} * 1024 * 1024;
@@ -331,6 +413,7 @@ constexpr uint32_t WKI_VFS_LOAD_IDLE_RETRIES = 8;
 constexpr uint32_t WKI_VFS_LOAD_MAX_ATTEMPTS = 24;
 constexpr uint64_t WKI_VFS_LOAD_RETRY_WINDOW_US = 15000000;
 constexpr uint64_t WKI_VFS_LOAD_RETRY_BACKOFF_US = 750000;
+static_assert(WKI_TASK_SUBMIT_VFS_RECEIVER_TIMEOUT_US > WKI_VFS_LOAD_RETRY_WINDOW_US);
 // Remote executable buffers sit on the receiver and prevent repeat VFS_REF
 // submits from retransferring multi-MiB binaries over the same WKI links that
 // carry stdout/stderr pipes.  Keep enough room for the normal perf-suite mix
@@ -347,6 +430,38 @@ constexpr int32_t WKI_SIGTERM_NUM = 15;
 constexpr uint64_t WKI_SIGCHLD_NUM = 17;
 constexpr int32_t WKI_WAIT_STATUS_SIGNAL_MASK = 0x7f;
 constexpr int32_t WKI_WAIT_STATUS_STOPPED = 0x7f;
+
+struct SubmitterChannelToken {
+    WkiChannel* channel = nullptr;
+    uint32_t generation = 0;
+};
+
+auto capture_submitter_channel(uint16_t target_node) -> SubmitterChannelToken {
+    WkiChannel* channel = wki_channel_get(target_node, WKI_CHAN_RESOURCE);
+    if (channel == nullptr) {
+        return {};
+    }
+
+    channel->lock.lock();
+    SubmitterChannelToken token = {};
+    if (channel->active && channel->peer_node_id == target_node && channel->channel_id == WKI_CHAN_RESOURCE && channel->generation != 0) {
+        token.channel = channel;
+        token.generation = channel->generation;
+    }
+    channel->lock.unlock();
+    return token;
+}
+
+auto send_task_cancel_request(uint16_t target_node, uint32_t task_id, int32_t signum, WkiChannel* channel, uint32_t channel_generation)
+    -> int {
+    TaskCancelPayload cancel = {};
+    cancel.task_id = task_id;
+    cancel.signum = signum;
+    if (channel != nullptr && channel_generation != 0) {
+        return wki_send_on_channel_generation(target_node, channel, channel_generation, MsgType::TASK_CANCEL, &cancel, sizeof(cancel));
+    }
+    return WKI_ERR_NOT_FOUND;
+}
 constexpr int32_t WKI_WAIT_STATUS_EXIT_SHIFT = 8;
 constexpr int32_t WKI_WAIT_STATUS_FAILURE_CODE = 255;
 constexpr std::string_view WKI_PATH_PREFIX = "/wki/";
@@ -458,9 +573,11 @@ auto find_remote_load(uint16_t node_id) -> RemoteNodeLoad* {
 }
 
 // s_compute_lock must be held by caller
-auto find_running_task(uint32_t task_id, uint16_t submitter) -> RunningRemoteTask* {
+auto find_running_task(uint32_t task_id, const ComputeSubmitSessionToken& session) -> RunningRemoteTask* {
     for (auto& rt : g_running_remote_tasks) {
-        if (rt.active && rt.task_id == task_id && rt.submitter_node == submitter) {
+        if (rt.active && rt.published && !rt.discard_completion && rt.task_id == task_id && rt.submitter_node == session.node_id &&
+            rt.submit_session_epoch == session.epoch && rt.submit_rx_channel == session.rx_channel &&
+            rt.submit_rx_channel_generation == session.rx_channel_generation) {
             return &rt;
         }
     }
@@ -478,6 +595,200 @@ void compact_pending_task_completions_locked() {
                   [](const PendingTaskCompletion& completion) { return completion.submitter_node == WKI_NODE_INVALID; });
 }
 
+auto next_nonzero_token(uint64_t& counter) -> uint64_t {
+    uint64_t token = counter++;
+    if (token == 0) {
+        token = counter++;
+    }
+    if (counter == 0) {
+        counter = 1;
+    }
+    return token;
+}
+
+auto compute_submit_session_token_matches(const ComputeSubmitSessionToken& lhs, const ComputeSubmitSessionToken& rhs) -> bool {
+    return lhs.epoch != 0 && lhs.node_id == rhs.node_id && lhs.epoch == rhs.epoch && lhs.rx_channel == rhs.rx_channel &&
+           lhs.rx_channel_generation == rhs.rx_channel_generation;
+}
+
+auto compute_submit_channel_token_matches(uint16_t node_id, WkiChannel* channel, uint32_t generation) -> bool {
+    if (channel == nullptr || generation == 0) {
+        return false;
+    }
+
+    channel->lock.lock();
+    bool const MATCHES = channel->active && channel->peer_node_id == node_id && channel->channel_id == WKI_CHAN_RESOURCE &&
+                         channel->generation == generation;
+    channel->lock.unlock();
+    return MATCHES;
+}
+
+auto find_compute_submit_peer_session_locked(uint16_t node_id) -> ComputeSubmitPeerSession* {
+    for (auto& session : g_compute_submit_peer_sessions) {
+        if (session.used && session.node_id == node_id) {
+            return &session;
+        }
+    }
+    return nullptr;
+}
+
+auto get_or_create_compute_submit_peer_session_locked(uint16_t node_id) -> ComputeSubmitPeerSession* {
+    if (auto* session = find_compute_submit_peer_session_locked(node_id); session != nullptr) {
+        return session;
+    }
+    for (auto& session : g_compute_submit_peer_sessions) {
+        if (!session.used) {
+            session.used = true;
+            session.node_id = node_id;
+            return &session;
+        }
+    }
+    return nullptr;
+}
+
+auto running_task_session_matches(const RunningRemoteTask& task, const ComputeSubmitSessionToken& session) -> bool {
+    return task.submitter_node == session.node_id && task.submit_session_epoch == session.epoch &&
+           task.submit_rx_channel == session.rx_channel && task.submit_rx_channel_generation == session.rx_channel_generation;
+}
+
+void retire_running_compute_submit_session_locked(const ComputeSubmitSessionToken& session) {
+    if (session.epoch == 0) {
+        return;
+    }
+    for (auto& task : g_running_remote_tasks) {
+        if (task.active && running_task_session_matches(task, session)) {
+            task.discard_completion = true;
+        }
+    }
+}
+
+auto capture_compute_submit_session_locked(uint16_t node_id, WkiChannel* channel, uint32_t generation) -> ComputeSubmitSessionToken {
+    if (!compute_submit_channel_token_matches(node_id, channel, generation)) {
+        return {};
+    }
+
+    auto* peer_session = get_or_create_compute_submit_peer_session_locked(node_id);
+    if (peer_session == nullptr) {
+        return {};
+    }
+    if (peer_session->retiring) {
+        return {};
+    }
+    if (peer_session->open && peer_session->current.rx_channel == channel && peer_session->current.rx_channel_generation == generation) {
+        return peer_session->current;
+    }
+    if (!peer_session->open && peer_session->retired_channel == channel && peer_session->retired_channel_generation == generation) {
+        return {};
+    }
+    if (peer_session->open) {
+        retire_running_compute_submit_session_locked(peer_session->current);
+        peer_session->retired_channel = peer_session->current.rx_channel;
+        peer_session->retired_channel_generation = peer_session->current.rx_channel_generation;
+    }
+
+    peer_session->current = {
+        .node_id = node_id,
+        .rx_channel = channel,
+        .rx_channel_generation = generation,
+        .epoch = next_nonzero_token(s_next_compute_submit_session_epoch),
+    };
+    peer_session->open = true;
+    return peer_session->current;
+}
+
+auto compute_submit_session_is_current_locked(const ComputeSubmitSessionToken& session) -> bool {
+    auto* peer_session = find_compute_submit_peer_session_locked(session.node_id);
+    return peer_session != nullptr && peer_session->open && !peer_session->retiring &&
+           compute_submit_session_token_matches(peer_session->current, session) &&
+           compute_submit_channel_token_matches(session.node_id, session.rx_channel, session.rx_channel_generation);
+}
+
+void gc_cancelled_task_submits_locked(uint64_t now_us) {
+    for (auto& cancelled : g_cancelled_task_submits) {
+        if (cancelled.active && now_us >= cancelled.expires_at_us) {
+            cancelled = {};
+        }
+    }
+}
+
+auto find_cancelled_task_submit_locked(const ComputeSubmitSessionToken& session, uint32_t task_id) -> CancelledTaskSubmit* {
+    for (auto& cancelled : g_cancelled_task_submits) {
+        if (cancelled.active && cancelled.task_id == task_id && compute_submit_session_token_matches(cancelled.session, session)) {
+            return &cancelled;
+        }
+    }
+    return nullptr;
+}
+
+void record_cancelled_task_submit_locked(const ComputeSubmitSessionToken& session, uint32_t task_id, int32_t signum) {
+    uint64_t const NOW_US = wki_now_us();
+    gc_cancelled_task_submits_locked(NOW_US);
+    if (auto* existing = find_cancelled_task_submit_locked(session, task_id); existing != nullptr) {
+        existing->signum = signum;
+        existing->expires_at_us = wki_future_deadline_us(NOW_US, WKI_TASK_SUBMIT_VFS_TIMEOUT_US);
+        return;
+    }
+
+    CancelledTaskSubmit* slot = nullptr;
+    for (auto& cancelled : g_cancelled_task_submits) {
+        if (!cancelled.active) {
+            slot = &cancelled;
+            break;
+        }
+        if (slot == nullptr || cancelled.expires_at_us < slot->expires_at_us) {
+            slot = &cancelled;
+        }
+    }
+    if (slot != nullptr) {
+        *slot = {
+            .active = true,
+            .task_id = task_id,
+            .signum = signum,
+            .expires_at_us = wki_future_deadline_us(NOW_US, WKI_TASK_SUBMIT_VFS_TIMEOUT_US),
+            .session = session,
+        };
+    }
+}
+
+auto take_cancelled_task_submit_locked(const ComputeSubmitSessionToken& session, uint32_t task_id) -> int32_t {
+    gc_cancelled_task_submits_locked(wki_now_us());
+    auto* cancelled = find_cancelled_task_submit_locked(session, task_id);
+    if (cancelled == nullptr) {
+        return 0;
+    }
+    int32_t const SIGNUM = cancelled->signum;
+    *cancelled = {};
+    return SIGNUM;
+}
+
+auto compute_submit_request_is_current_locked(const ComputeSubmitSessionToken& session, uint32_t task_id) -> bool {
+    gc_cancelled_task_submits_locked(wki_now_us());
+    return compute_submit_session_is_current_locked(session) && find_cancelled_task_submit_locked(session, task_id) == nullptr;
+}
+
+void retire_compute_submit_session_locked(uint16_t node_id, WkiChannel* channel, uint32_t generation) {
+    auto* peer_session = get_or_create_compute_submit_peer_session_locked(node_id);
+    if (peer_session == nullptr) {
+        return;
+    }
+
+    if (peer_session->open) {
+        retire_running_compute_submit_session_locked(peer_session->current);
+        peer_session->retired_channel = peer_session->current.rx_channel;
+        peer_session->retired_channel_generation = peer_session->current.rx_channel_generation;
+    } else if (channel != nullptr && generation != 0) {
+        peer_session->retired_channel = channel;
+        peer_session->retired_channel_generation = generation;
+    }
+    peer_session->open = false;
+    peer_session->current = {};
+    for (auto& cancelled : g_cancelled_task_submits) {
+        if (cancelled.active && cancelled.session.node_id == node_id) {
+            cancelled = {};
+        }
+    }
+}
+
 auto shared_elf_path_matches(const SharedElfCacheEntry& entry, const char* path) -> bool {
     if (path == nullptr) {
         return false;
@@ -489,12 +800,22 @@ auto shared_elf_path_matches(const SharedElfCacheEntry& entry, const char* path)
 }
 
 auto shared_elf_freshness_matches(const ker::vfs::Stat& lhs, const ker::vfs::Stat& rhs) -> bool {
-    return lhs.st_size > 0 && lhs.st_size == rhs.st_size;
+    if (lhs.st_size <= 0 || lhs.st_size != rhs.st_size) {
+        return false;
+    }
+    bool const LHS_HAS_TIMES = lhs.st_mtim.tv_sec != 0 || lhs.st_mtim.tv_nsec != 0 || lhs.st_ctim.tv_sec != 0 || lhs.st_ctim.tv_nsec != 0;
+    bool const RHS_HAS_TIMES = rhs.st_mtim.tv_sec != 0 || rhs.st_mtim.tv_nsec != 0 || rhs.st_ctim.tv_sec != 0 || rhs.st_ctim.tv_nsec != 0;
+    if (!LHS_HAS_TIMES || !RHS_HAS_TIMES) {
+        return true;
+    }
+    return lhs.st_mtim.tv_sec == rhs.st_mtim.tv_sec && lhs.st_mtim.tv_nsec == rhs.st_mtim.tv_nsec &&
+           lhs.st_ctim.tv_sec == rhs.st_ctim.tv_sec && lhs.st_ctim.tv_nsec == rhs.st_ctim.tv_nsec;
 }
 
-auto find_shared_elf_cache_locked(uint16_t submitter_node, const char* path, const ker::vfs::Stat& freshness) -> SharedElfCacheEntry* {
+auto find_shared_elf_cache_locked(const ComputeSubmitSessionToken& session, const char* path, const ker::vfs::Stat& freshness)
+    -> SharedElfCacheEntry* {
     for (auto& entry : g_shared_elf_cache) {
-        if (!entry.valid || entry.loading || entry.submitter_node != submitter_node || entry.buffer == nullptr) {
+        if (!entry.valid || entry.loading || entry.buffer == nullptr || !compute_submit_session_token_matches(entry.session, session)) {
             continue;
         }
         if (!shared_elf_path_matches(entry, path)) {
@@ -508,10 +829,10 @@ auto find_shared_elf_cache_locked(uint16_t submitter_node, const char* path, con
     return nullptr;
 }
 
-auto find_shared_elf_cache_entry_locked(uint16_t submitter_node, const char* path, const ker::vfs::Stat& freshness)
+auto find_shared_elf_cache_entry_locked(const ComputeSubmitSessionToken& session, const char* path, const ker::vfs::Stat& freshness)
     -> SharedElfCacheEntry* {
     for (auto& entry : g_shared_elf_cache) {
-        if (!entry.valid || entry.submitter_node != submitter_node) {
+        if (!entry.valid || !compute_submit_session_token_matches(entry.session, session)) {
             continue;
         }
         if (!shared_elf_path_matches(entry, path)) {
@@ -546,8 +867,9 @@ auto shared_elf_cache_bytes_locked() -> uint64_t {
 
 void gc_shared_elf_cache_locked(uint64_t now_us) {
     for (auto it = g_shared_elf_cache.begin(); it != g_shared_elf_cache.end();) {
-        bool const EXPIRED = it->refcount == 0 && (!it->valid || (it->last_used_us != 0 && now_us >= it->last_used_us &&
-                                                                  (now_us - it->last_used_us) >= WKI_EXEC_CACHE_RETENTION_US));
+        bool const EXPIRED = !it->loading && it->refcount == 0 &&
+                             (!it->valid || (it->last_used_us != 0 && now_us >= it->last_used_us &&
+                                             (now_us - it->last_used_us) >= WKI_EXEC_CACHE_RETENTION_US));
         if (!EXPIRED) {
             ++it;
             continue;
@@ -560,7 +882,7 @@ void gc_shared_elf_cache_locked(uint64_t now_us) {
     auto evict_oldest_unref = [&]() -> bool {
         auto victim = g_shared_elf_cache.end();
         for (auto it = g_shared_elf_cache.begin(); it != g_shared_elf_cache.end(); ++it) {
-            if (it->refcount != 0) {
+            if (it->refcount != 0 || it->loading) {
                 continue;
             }
             if (victim == g_shared_elf_cache.end() || it->last_used_us < victim->last_used_us) {
@@ -699,6 +1021,42 @@ void close_proxy_fd_table(ker::mod::sched::task::Task* task) {
         task->fd_table_lock.unlock_irqrestore(IRQF);
         ker::vfs::vfs_put_file(file);
     }
+}
+
+void destroy_unpublished_remote_process(ker::mod::sched::task::Task* task, TaskOutputCapture* output, const char* reason) {
+    if (task != nullptr) {
+        ker::loader::debug::unregister_process(task->pid);
+        ker::loader::debug::remove_gdb_debug_info(task->pid);
+        close_proxy_fd_table(task);
+        ker::mod::sched::task::release_lazy_vmem_ranges(*task);
+        release_loaded_elf_buffer(task->elf_buffer, task->is_elf_buffer_shared);
+        task->elf_buffer = nullptr;
+        task->elf_buffer_size = 0;
+
+        if (task->thread != nullptr) {
+            // User pages belong to the pagemap and are reclaimed below.
+            // destroy_thread() still has to retire the Thread registry row.
+            task->thread->tls_phys_ptr = 0;
+            task->thread->stack_phys_ptr = 0;
+            ker::mod::sched::threading::destroy_thread(task->thread);
+            task->thread = nullptr;
+        }
+        delete reinterpret_cast<ker::mod::cpu::PerCpu*>(task->context.syscall_scratch_area);
+        task->context.syscall_scratch_area = 0;
+        if (task->pagemap != nullptr && task->pagemap != ker::mod::mm::virt::get_kernel_pagemap()) {
+            ker::mod::mm::virt::destroy_user_space(task->pagemap, task->pid, task->name, reason);
+            ker::mod::mm::virt::release_pagemap(task->pagemap);
+            task->pagemap = nullptr;
+        }
+        delete[] task->name;
+        task->name = nullptr;
+        if (task->context.syscall_kernel_stack >= ker::mod::mm::KERNEL_STACK_SIZE) {
+            ker::mod::mm::phys::page_free(reinterpret_cast<void*>(task->context.syscall_kernel_stack - ker::mod::mm::KERNEL_STACK_SIZE));
+            task->context.syscall_kernel_stack = 0;
+        }
+        delete task;
+    }
+    delete output;
 }
 
 auto encode_remote_wait_status(int32_t exit_status) -> int32_t {
@@ -1981,9 +2339,16 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     // Check total size fits in WKI message:
     // TaskSubmitPayload + binary_len + binary + argv/envp/cwd + identity + policy + IPC fd entries.
     uint32_t const IPC_DATA_LEN = static_cast<uint32_t>(ipc_fd_count) * sizeof(WkiIpcFdEntry);
-    auto total = static_cast<uint32_t>(sizeof(TaskSubmitPayload) + sizeof(uint32_t) + binary_len + context_info.data_len + IPC_DATA_LEN);
-    if (total > WKI_ETH_MAX_PAYLOAD) {
+    uint64_t const TOTAL =
+        static_cast<uint64_t>(sizeof(TaskSubmitPayload)) + sizeof(uint32_t) + binary_len + context_info.data_len + IPC_DATA_LEN;
+    if (TOTAL > WKI_ETH_MAX_PAYLOAD) {
         ker::mod::dbg::log("[WKI] Task binary too large for inline submit: %u bytes", binary_len);
+        cleanup_ipc_exports();
+        return 0;
+    }
+
+    SubmitterChannelToken const SUBMIT_CHANNEL = capture_submitter_channel(target_node);
+    if (SUBMIT_CHANNEL.channel == nullptr) {
         cleanup_ipc_exports();
         return 0;
     }
@@ -1997,6 +2362,8 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     st.task_id = TASK_ID;
     st.target_node = target_node;
     st.response_pending = false;
+    st.submit_channel = SUBMIT_CHANNEL.channel;
+    st.submit_channel_generation = SUBMIT_CHANNEL.generation;
     st.accept_status = 0;
     st.complete_pending = false;
     st.exit_status = 0;
@@ -2013,7 +2380,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     perf_record_compute_begin(ker::mod::perf::WkiPerfComputeOp::SUBMIT_INLINE, target_node, TASK_ID, binary_len, CALLSITE);
 
     // Build TASK_SUBMIT message
-    auto msg_len = static_cast<uint16_t>(total);
+    auto msg_len = static_cast<uint16_t>(TOTAL);
     auto* buf = new (std::nothrow) uint8_t[msg_len];
     if (buf == nullptr) {
         s_compute_lock.lock();
@@ -2068,7 +2435,8 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     }
     s_compute_lock.unlock();
 
-    int const SEND_RET = wki_send(target_node, WKI_CHAN_RESOURCE, MsgType::TASK_SUBMIT, buf, msg_len);
+    int const SEND_RET =
+        wki_send_on_channel_generation(target_node, SUBMIT_CHANNEL.channel, SUBMIT_CHANNEL.generation, MsgType::TASK_SUBMIT, buf, msg_len);
     delete[] buf;
 
     if (SEND_RET != WKI_OK) {
@@ -2104,6 +2472,8 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
             task_ptr->active = false;
         }
         s_compute_lock.unlock();
+        static_cast<void>(
+            send_task_cancel_request(target_node, TASK_ID, WKI_SIGKILL_NUM, SUBMIT_CHANNEL.channel, SUBMIT_CHANNEL.generation));
         cleanup_ipc_exports();
         ker::mod::dbg::log("[WKI] Task submit wait failed: task_id=%u target=0x%04x rc=%d (%s)", TASK_ID, target_node, WAIT_RC,
                            errno_name(WAIT_RC));
@@ -2146,11 +2516,12 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
         return 0;
     }
 
-    auto path_len = static_cast<uint16_t>(std::strlen(vfs_path));
-    if (path_len == 0) {
+    size_t const PATH_LEN = std::strlen(vfs_path);
+    if (PATH_LEN == 0 || PATH_LEN >= 512 || PATH_LEN > UINT16_MAX) {
         cleanup_ipc_exports();
         return 0;
     }
+    auto const PATH_LEN_WIRE = static_cast<uint16_t>(PATH_LEN);
 
     SubmitContextInfo context_info = {};
     if (!build_submit_context_info(local_task, argv, envp, cwd, &context_info)) {
@@ -2160,9 +2531,15 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
 
     // TaskSubmitPayload + path_len + path + argv/envp/cwd + identity + policy + IPC fd entries.
     uint32_t const IPC_DATA_LEN = static_cast<uint32_t>(ipc_fd_count) * sizeof(WkiIpcFdEntry);
-    auto total = static_cast<uint32_t>(sizeof(TaskSubmitPayload) + sizeof(uint16_t) + path_len + context_info.data_len + IPC_DATA_LEN);
+    auto total = static_cast<uint32_t>(sizeof(TaskSubmitPayload) + sizeof(uint16_t) + PATH_LEN_WIRE + context_info.data_len + IPC_DATA_LEN);
     if (total > WKI_ETH_MAX_PAYLOAD) {
-        ker::mod::dbg::log("[WKI] VFS_REF path too large: %u bytes", path_len);
+        ker::mod::dbg::log("[WKI] VFS_REF path too large: %u bytes", PATH_LEN_WIRE);
+        cleanup_ipc_exports();
+        return 0;
+    }
+
+    SubmitterChannelToken const SUBMIT_CHANNEL = capture_submitter_channel(target_node);
+    if (SUBMIT_CHANNEL.channel == nullptr) {
         cleanup_ipc_exports();
         return 0;
     }
@@ -2175,6 +2552,8 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
     st.task_id = TASK_ID;
     st.target_node = target_node;
     st.response_pending = false;
+    st.submit_channel = SUBMIT_CHANNEL.channel;
+    st.submit_channel_generation = SUBMIT_CHANNEL.generation;
     st.accept_status = 0;
     st.complete_pending = false;
     st.exit_status = 0;
@@ -2188,7 +2567,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
 
     uint64_t const STARTED_US = wki_now_us();
     uint64_t const CALLSITE = WOS_PERF_CALLSITE();
-    perf_record_compute_begin(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, TASK_ID, path_len, CALLSITE);
+    perf_record_compute_begin(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, TASK_ID, PATH_LEN_WIRE, CALLSITE);
 
     auto msg_len = static_cast<uint16_t>(total);
     auto* buf = new (std::nothrow) uint8_t[msg_len];
@@ -2216,10 +2595,10 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
 
     // VFS_REF format: {path_len:u16, path[path_len], argv/envp/cwd, identity, policy, ipc_fd_entries[]}
     uint8_t* cursor = buf + sizeof(TaskSubmitPayload);
-    memcpy(cursor, &path_len, sizeof(uint16_t));
+    memcpy(cursor, &PATH_LEN_WIRE, sizeof(uint16_t));
     cursor += sizeof(uint16_t);
-    memcpy(cursor, vfs_path, path_len);
-    cursor += path_len;
+    memcpy(cursor, vfs_path, PATH_LEN_WIRE);
+    cursor += PATH_LEN_WIRE;
     if (context_info.args_len > 0) {
         copy_submit_context_data(cursor, argv, envp, cwd);
         cursor += context_info.args_len;
@@ -2245,7 +2624,8 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
     }
     s_compute_lock.unlock();
 
-    int const SEND_RET = wki_send(target_node, WKI_CHAN_RESOURCE, MsgType::TASK_SUBMIT, buf, msg_len);
+    int const SEND_RET =
+        wki_send_on_channel_generation(target_node, SUBMIT_CHANNEL.channel, SUBMIT_CHANNEL.generation, MsgType::TASK_SUBMIT, buf, msg_len);
     delete[] buf;
 
     if (SEND_RET != WKI_OK) {
@@ -2263,7 +2643,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
         finish_or_wait_for_cancelled_waiter(wait, claimed_waiter, SEND_RET);
         cleanup_ipc_exports();
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, TASK_ID, SEND_RET,
-                                static_cast<uint32_t>(wki_now_us() - STARTED_US), path_len, CALLSITE);
+                                static_cast<uint32_t>(wki_now_us() - STARTED_US), PATH_LEN_WIRE, CALLSITE);
         return 0;
     }
 
@@ -2281,11 +2661,13 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
             task_ptr->active = false;
         }
         s_compute_lock.unlock();
+        static_cast<void>(
+            send_task_cancel_request(target_node, TASK_ID, WKI_SIGKILL_NUM, SUBMIT_CHANNEL.channel, SUBMIT_CHANNEL.generation));
         cleanup_ipc_exports();
         ker::mod::dbg::log("[WKI] VFS_REF submit wait failed: task_id=%u rc=%d (%s) timeout_us=%llu", TASK_ID, WAIT_RC, errno_name(WAIT_RC),
                            WKI_TASK_SUBMIT_VFS_TIMEOUT_US);
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, TASK_ID, WAIT_RC,
-                                static_cast<uint32_t>(wki_now_us() - STARTED_US), path_len, CALLSITE);
+                                static_cast<uint32_t>(wki_now_us() - STARTED_US), PATH_LEN_WIRE, CALLSITE);
         return 0;
     }
 
@@ -2298,7 +2680,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
         ker::mod::dbg::log("[WKI] VFS_REF task rejected: task_id=%u status=%u", TASK_ID, accept_status);
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, TASK_ID,
                                 -static_cast<int32_t>(accept_status == 0 ? 1 : accept_status),
-                                static_cast<uint32_t>(wki_now_us() - STARTED_US), path_len, CALLSITE);
+                                static_cast<uint32_t>(wki_now_us() - STARTED_US), PATH_LEN_WIRE, CALLSITE);
         return 0;
     }
     s_compute_lock.unlock();
@@ -2306,7 +2688,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
     ker::mod::dbg::log("[WKI] VFS_REF task accepted: task_id=%u", TASK_ID);
 #endif
     perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, TASK_ID, 0,
-                            static_cast<uint32_t>(wki_now_us() - STARTED_US), path_len, CALLSITE);
+                            static_cast<uint32_t>(wki_now_us() - STARTED_US), PATH_LEN_WIRE, CALLSITE);
     return TASK_ID;
 }
 
@@ -2451,16 +2833,14 @@ auto wki_task_cancel(uint32_t task_id, int signum) -> bool {
     }
 
     uint16_t const TARGET_NODE = task->target_node;
+    WkiChannel* const SUBMIT_CHANNEL = task->submit_channel;
+    uint32_t const SUBMIT_CHANNEL_GENERATION = task->submit_channel_generation;
     if (TEARDOWN_EXPORTS) {
         cleanup = submitted_ipc_cleanup_snapshot_locked(task);
     }
     s_compute_lock.unlock();
 
-    TaskCancelPayload cancel = {};
-    cancel.task_id = task_id;
-    cancel.signum = signum;
-
-    int const SEND_RET = wki_send(TARGET_NODE, WKI_CHAN_RESOURCE, MsgType::TASK_CANCEL, &cancel, sizeof(cancel));
+    int const SEND_RET = send_task_cancel_request(TARGET_NODE, task_id, signum, SUBMIT_CHANNEL, SUBMIT_CHANNEL_GENERATION);
     if (SEND_RET != WKI_OK) {
         return false;
     }
@@ -2508,6 +2888,67 @@ auto queue_signal_for_process_tasks(uint64_t owner_pid, int signum) -> size_t {
         candidate->release();
     }
     return signaled;
+}
+
+auto running_task_matches_cleanup_locked(const RunningRemoteTask& running, uint16_t node_id, RemoteComputeCleanupScope scope) -> bool {
+    if (!running.active || running.submitter_node != node_id) {
+        return false;
+    }
+    if (scope == RemoteComputeCleanupScope::ALL || running.discard_completion) {
+        return true;
+    }
+
+    ComputeSubmitSessionToken const SESSION = {
+        .node_id = running.submitter_node,
+        .rx_channel = running.submit_rx_channel,
+        .rx_channel_generation = running.submit_rx_channel_generation,
+        .epoch = running.submit_session_epoch,
+    };
+    return !compute_submit_session_is_current_locked(SESSION);
+}
+
+void terminate_running_remote_tasks_for_peer(uint16_t node_id, RemoteComputeCleanupScope scope) {
+    for (;;) {
+        constexpr size_t MAX_TERMINATIONS_PER_BATCH = 64;
+        std::array<ker::mod::sched::task::Task*, MAX_TERMINATIONS_PER_BATCH> tasks_to_terminate = {};
+        size_t termination_count = 0;
+        bool drained_running = true;
+
+        s_compute_lock.lock();
+        for (auto& running : g_running_remote_tasks) {
+            if (!running_task_matches_cleanup_locked(running, node_id, scope)) {
+                continue;
+            }
+            running.discard_completion = true;
+            if (running.termination_requested) {
+                continue;
+            }
+            if (termination_count >= tasks_to_terminate.size()) {
+                drained_running = false;
+                continue;
+            }
+            running.termination_requested = true;
+            if (running.task != nullptr && running.task->try_acquire()) {
+                tasks_to_terminate.at(termination_count++) = running.task;
+            }
+        }
+        s_compute_lock.unlock();
+
+        for (size_t i = 0; i < termination_count; ++i) {
+            auto* task = tasks_to_terminate.at(i);
+            uint64_t const OWNER_PID = task_process_owner_pid(task);
+            size_t const SIGNALED = queue_signal_for_process_tasks(OWNER_PID, WKI_SIGKILL_NUM);
+            if (SIGNALED == 0 && !task->has_exited) {
+                task->signal_add_pending_mask(1ULL << (WKI_SIGKILL_NUM - 1));
+                ker::mod::sched::wake_task_for_signal(task);
+            }
+            task->release();
+        }
+
+        if (drained_running) {
+            return;
+        }
+    }
 }
 
 }  // namespace
@@ -2792,7 +3233,63 @@ auto wki_preferred_remote_node() -> uint16_t {
 // Fencing Cleanup
 // ===============================================================================
 
-void wki_remote_compute_cleanup_for_peer(uint16_t node_id) {
+void wki_remote_compute_retire_submit_session(uint16_t node_id) {
+    s_compute_lock.lock();
+    auto* peer_session = get_or_create_compute_submit_peer_session_locked(node_id);
+    if (peer_session == nullptr) {
+        s_compute_lock.unlock();
+        return;
+    }
+    peer_session->retiring = true;
+    ComputeSubmitSessionToken const RETIRED_SESSION = peer_session->current;
+    s_compute_lock.unlock();
+
+    WkiChannel* channel = RETIRED_SESSION.rx_channel;
+    uint32_t generation = RETIRED_SESSION.rx_channel_generation;
+    if (channel == nullptr || generation == 0) {
+        channel = wki_channel_lookup(node_id, WKI_CHAN_RESOURCE);
+        if (channel != nullptr) {
+            channel->lock.lock();
+            if (channel->active && channel->peer_node_id == node_id && channel->channel_id == WKI_CHAN_RESOURCE) {
+                generation = channel->generation;
+            }
+            channel->lock.unlock();
+        }
+    }
+    if (channel != nullptr && generation != 0) {
+        static_cast<void>(wki_channel_close_generation(channel, node_id, WKI_CHAN_RESOURCE, generation));
+    }
+
+    s_compute_lock.lock();
+    retire_compute_submit_session_locked(node_id, channel, generation);
+    peer_session = find_compute_submit_peer_session_locked(node_id);
+    if (peer_session != nullptr) {
+        peer_session->retiring = false;
+    }
+    for (auto& entry : g_shared_elf_cache) {
+        if (entry.submitter_node != node_id) {
+            continue;
+        }
+        if (entry.loading) {
+            entry.loading = false;
+            entry.load_status = -1;
+        }
+        entry.valid = false;
+    }
+    s_compute_lock.unlock();
+}
+
+namespace {
+
+auto submitted_task_matches_cleanup_locked(const SubmittedTask& submitted, uint16_t node_id, RemoteComputeCleanupScope scope) -> bool {
+    if (!submitted.active || submitted.target_node != node_id) {
+        return false;
+    }
+    return scope == RemoteComputeCleanupScope::ALL ||
+           !compute_submit_channel_token_matches(node_id, submitted.submit_channel, submitted.submit_channel_generation);
+}
+
+void fail_submitted_tasks_for_peer(uint16_t node_id, RemoteComputeCleanupScope scope) {
     constexpr size_t MAX_PROXIES_PER_BATCH = 64;
     constexpr size_t MAX_WAITERS_PER_BATCH = MAX_PROXIES_PER_BATCH * 2;
 
@@ -2801,6 +3298,8 @@ void wki_remote_compute_cleanup_for_peer(uint16_t node_id) {
         size_t proxy_count = 0;
         std::array<WkiWaitEntry*, MAX_WAITERS_PER_BATCH> waiters_to_finish = {};
         size_t waiter_count = 0;
+        std::array<SubmittedIpcCleanup, MAX_PROXIES_PER_BATCH> ipc_cleanups = {};
+        size_t ipc_cleanup_count = 0;
         bool drained_submitted = true;
 
         s_compute_lock.lock();
@@ -2810,7 +3309,7 @@ void wki_remote_compute_cleanup_for_peer(uint16_t node_id) {
         // pointer so timeout and late-response paths cannot touch it after the
         // submitter unwinds.
         for (auto& t : g_submitted_tasks) {
-            if (!t.active || t.target_node != node_id) {
+            if (!submitted_task_matches_cleanup_locked(t, node_id, scope)) {
                 continue;
             }
 
@@ -2822,7 +3321,9 @@ void wki_remote_compute_cleanup_for_peer(uint16_t node_id) {
                 needed_waiters++;
             }
             size_t const NEEDED_PROXIES = (t.local_task != nullptr && t.proxy_ready) ? 1U : 0U;
-            if (waiter_count + needed_waiters > waiters_to_finish.size() || proxy_count + NEEDED_PROXIES > proxy_tasks.size()) {
+            size_t const NEEDED_IPC_CLEANUPS = t.ipc_fd_count != 0 ? 1U : 0U;
+            if (waiter_count + needed_waiters > waiters_to_finish.size() || proxy_count + NEEDED_PROXIES > proxy_tasks.size() ||
+                ipc_cleanup_count + NEEDED_IPC_CLEANUPS > ipc_cleanups.size()) {
                 drained_submitted = false;
                 break;
             }
@@ -2854,6 +3355,10 @@ void wki_remote_compute_cleanup_for_peer(uint16_t node_id) {
                 *std::next(proxy_tasks.begin(), static_cast<ptrdiff_t>(proxy_count++)) = t.local_task;
                 t.local_task = nullptr;
             }
+            if (t.ipc_fd_count != 0) {
+                ipc_cleanups.at(ipc_cleanup_count++) = submitted_ipc_cleanup_snapshot_locked(&t);
+                t.ipc_fd_count = 0;
+            }
 
             t.active = false;
         }
@@ -2871,29 +3376,32 @@ void wki_remote_compute_cleanup_for_peer(uint16_t node_id) {
             ker::mod::dbg::log("[WKI] Proxy task cleanup: pid=0x%lx (peer 0x%04x)", proxy->pid, node_id);
         }
 
+        for (size_t i = 0; i < ipc_cleanup_count; ++i) {
+            cleanup_submitted_ipc_exports(ipc_cleanups.at(i));
+        }
+
         if (drained_submitted) {
             break;
         }
     }
+}
+
+}  // namespace
+
+void wki_remote_compute_cleanup_for_peer(uint16_t node_id) {
+    wki_remote_compute_retire_submit_session(node_id);
+    fail_submitted_tasks_for_peer(node_id, RemoteComputeCleanupScope::ALL);
+
+    terminate_running_remote_tasks_for_peer(node_id, RemoteComputeCleanupScope::ALL);
 
     s_compute_lock.lock();
 
     // Invalidate load cache for this peer
     std::erase_if(g_remote_loads, [node_id](const RemoteNodeLoad& rl) { return rl.node_id == node_id; });
 
-    // Cancel running remote tasks submitted by this peer (they'll exit on their own,
-    // but we won't be able to send TASK_COMPLETE back)
-    for (auto& rt : g_running_remote_tasks) {
-        if (rt.active && rt.submitter_node == node_id) {
-            delete rt.output;
-            rt.output = nullptr;
-            if (rt.task != nullptr) {
-                rt.task->release();
-                rt.task = nullptr;
-            }
-            rt.active = false;
-        }
-    }
+    // The process can still write through stdout/stderr File::private_data, so
+    // keep its capture and lifetime reference until the termination requested
+    // above reaches exit. The completion scanner releases both afterward.
     compact_running_remote_tasks_locked();
 
     for (auto& completion : g_pending_task_completions) {
@@ -2910,10 +3418,44 @@ void wki_remote_compute_cleanup_for_peer(uint16_t node_id) {
         if (entry.submitter_node != node_id) {
             continue;
         }
+        if (entry.loading) {
+            entry.loading = false;
+            entry.load_status = -1;
+        }
         entry.valid = false;
     }
     gc_shared_elf_cache_locked(wki_now_us());
 
+    s_compute_lock.unlock();
+}
+
+void wki_remote_compute_cleanup_retired_for_peer(uint16_t node_id) {
+    // Peer epoch/channel resets keep the peer connected. Fail only work still
+    // bound to a retired resource-channel generation so submissions admitted
+    // after reconnection remain intact.
+    fail_submitted_tasks_for_peer(node_id, RemoteComputeCleanupScope::RETIRED);
+    terminate_running_remote_tasks_for_peer(node_id, RemoteComputeCleanupScope::RETIRED);
+
+    s_compute_lock.lock();
+    for (auto& completion : g_pending_task_completions) {
+        if (completion.submitter_node != node_id) {
+            continue;
+        }
+        ComputeSubmitSessionToken const SESSION = {
+            .node_id = completion.submitter_node,
+            .rx_channel = completion.submit_rx_channel,
+            .rx_channel_generation = completion.submit_rx_channel_generation,
+            .epoch = completion.submit_session_epoch,
+        };
+        if (compute_submit_session_is_current_locked(SESSION)) {
+            continue;
+        }
+        delete completion.output;
+        completion.output = nullptr;
+        completion.submitter_node = WKI_NODE_INVALID;
+    }
+    compact_pending_task_completions_locked();
+    gc_shared_elf_cache_locked(wki_now_us());
     s_compute_lock.unlock();
 }
 
@@ -3266,15 +3808,92 @@ auto wki_shared_elf_cache_stats() -> WkiSharedElfCacheStats {
 // Receiver Side - Completion Monitoring
 // ===============================================================================
 
+namespace {
+
+struct PendingTaskAcceptAttempt {
+    uint32_t task_id = 0;
+    uint16_t submitter_node = WKI_NODE_INVALID;
+    uint64_t local_pid = 0;
+    ComputeSubmitSessionToken session = {};
+};
+
+auto collect_pending_task_accept_attempts_locked(std::array<PendingTaskAcceptAttempt, WKI_COMPUTE_SUBMIT_QUEUE_MAX>& attempts) -> size_t {
+    size_t const ROW_COUNT = g_running_remote_tasks.size();
+    if (ROW_COUNT == 0) {
+        s_pending_task_accept_cursor = 0;
+        return 0;
+    }
+
+    size_t index = s_pending_task_accept_cursor % ROW_COUNT;
+    size_t visited = 0;
+    size_t attempt_count = 0;
+    while (visited < ROW_COUNT && attempt_count < attempts.size()) {
+        const auto& running = g_running_remote_tasks.at(index);
+        if (running.active && running.published && running.accept_pending && !running.discard_completion) {
+            attempts.at(attempt_count++) = {
+                .task_id = running.task_id,
+                .submitter_node = running.submitter_node,
+                .local_pid = running.local_pid,
+                .session =
+                    {
+                        .node_id = running.submitter_node,
+                        .rx_channel = running.submit_rx_channel,
+                        .rx_channel_generation = running.submit_rx_channel_generation,
+                        .epoch = running.submit_session_epoch,
+                    },
+            };
+        }
+        index = (index + 1) % ROW_COUNT;
+        ++visited;
+    }
+    s_pending_task_accept_cursor = index;
+    return attempt_count;
+}
+
+void retry_pending_task_accepts() {
+    std::array<PendingTaskAcceptAttempt, WKI_COMPUTE_SUBMIT_QUEUE_MAX> attempts = {};
+
+    s_compute_lock.lock();
+    size_t const ATTEMPT_COUNT = collect_pending_task_accept_attempts_locked(attempts);
+    s_compute_lock.unlock();
+
+    for (size_t i = 0; i < ATTEMPT_COUNT; ++i) {
+        const auto& attempt = attempts.at(i);
+        TaskResponsePayload accept = {};
+        accept.task_id = attempt.task_id;
+        accept.status = static_cast<uint8_t>(TaskRejectReason::ACCEPTED);
+        accept.remote_pid = attempt.local_pid;
+        int const SEND_RESULT =
+            wki_send_on_channel_generation(attempt.submitter_node, attempt.session.rx_channel, attempt.session.rx_channel_generation,
+                                           MsgType::TASK_ACCEPT, &accept, sizeof(accept));
+
+        s_compute_lock.lock();
+        auto* running = find_running_task(attempt.task_id, attempt.session);
+        if (running != nullptr && running->local_pid == attempt.local_pid) {
+            if (SEND_RESULT == WKI_OK) {
+                running->accept_pending = false;
+            } else if (!compute_submit_session_is_current_locked(attempt.session)) {
+                running->accept_pending = false;
+                running->discard_completion = true;
+            }
+        }
+        s_compute_lock.unlock();
+    }
+}
+
+}  // namespace
+
 void wki_remote_compute_check_completions() {
     if (!g_remote_compute_initialized) {
         return;
     }
 
+    retry_pending_task_accepts();
+
     s_compute_lock.lock();
 
     for (auto& rt : g_running_remote_tasks) {
-        if (!rt.active) {
+        if (!rt.active || !rt.published || (rt.accept_pending && !rt.discard_completion)) {
             continue;
         }
 
@@ -3303,11 +3922,18 @@ void wki_remote_compute_check_completions() {
             continue;
         }
 
-        g_pending_task_completions.push_back(PendingTaskCompletion{.task_id = rt.task_id,
-                                                                   .submitter_node = rt.submitter_node,
-                                                                   .local_pid = rt.local_pid,
-                                                                   .exit_status = exit_status,
-                                                                   .output = rt.output});
+        if (rt.discard_completion) {
+            delete rt.output;
+        } else {
+            g_pending_task_completions.push_back(PendingTaskCompletion{.task_id = rt.task_id,
+                                                                       .submitter_node = rt.submitter_node,
+                                                                       .local_pid = rt.local_pid,
+                                                                       .exit_status = exit_status,
+                                                                       .output = rt.output,
+                                                                       .submit_session_epoch = rt.submit_session_epoch,
+                                                                       .submit_rx_channel = rt.submit_rx_channel,
+                                                                       .submit_rx_channel_generation = rt.submit_rx_channel_generation});
+        }
         if (rt.task != nullptr) {
             rt.task->release();
             rt.task = nullptr;
@@ -3324,7 +3950,10 @@ void wki_remote_compute_check_completions() {
     // Process queued completions without lock. Keep entries queued until the
     // submitter actually accepts TASK_COMPLETE so transient transport stalls
     // cannot strand waitpid()/proxy waiters.
-    for (;;) {
+    s_compute_lock.lock();
+    size_t completions_remaining = g_pending_task_completions.size();
+    s_compute_lock.unlock();
+    while (completions_remaining-- > 0) {
         PendingTaskCompletion info = {};
         {
             s_compute_lock.lock();
@@ -3337,7 +3966,21 @@ void wki_remote_compute_check_completions() {
             s_compute_lock.unlock();
         }
 
-        bool sent = false;
+        ComputeSubmitSessionToken const SESSION = {
+            .node_id = info.submitter_node,
+            .rx_channel = info.submit_rx_channel,
+            .rx_channel_generation = info.submit_rx_channel_generation,
+            .epoch = info.submit_session_epoch,
+        };
+        s_compute_lock.lock();
+        bool session_current = compute_submit_session_is_current_locked(SESSION);
+        s_compute_lock.unlock();
+        if (!session_current) {
+            delete info.output;
+            continue;
+        }
+
+        int send_result = WKI_ERR_NO_MEM;
         // D19: Build TASK_COMPLETE with captured output
         uint16_t const OUT_LEN = (info.output != nullptr) ? info.output->len : static_cast<uint16_t>(0);
         auto msg_len = static_cast<uint16_t>(sizeof(TaskCompletePayload) + OUT_LEN);
@@ -3352,19 +3995,27 @@ void wki_remote_compute_check_completions() {
                 memcpy(buf + sizeof(TaskCompletePayload), info.output->data.data(), OUT_LEN);
             }
 
-            sent = (wki_send(info.submitter_node, WKI_CHAN_RESOURCE, MsgType::TASK_COMPLETE, buf, msg_len) == WKI_OK);
+            send_result = wki_send_on_channel_generation(info.submitter_node, info.submit_rx_channel, info.submit_rx_channel_generation,
+                                                         MsgType::TASK_COMPLETE, buf, msg_len);
             delete[] buf;
         }
 
-        if (!sent) {
+        if (send_result != WKI_OK) {
             s_compute_lock.lock();
-            g_pending_task_completions.push_front(info);
+            session_current = compute_submit_session_is_current_locked(SESSION);
+            if (session_current) {
+                g_pending_task_completions.push_back(info);
+            }
             s_compute_lock.unlock();
+            if (!session_current) {
+                delete info.output;
+                continue;
+            }
 #if WKI_DEBUG
-            ker::mod::dbg::log("[WKI] TASK_COMPLETE send deferred: task_id=%u pid=0x%lx submitter=0x%04x", info.task_id, info.local_pid,
-                               info.submitter_node);
+            ker::mod::dbg::log("[WKI] TASK_COMPLETE send deferred: task_id=%u pid=0x%lx submitter=0x%04x status=%d", info.task_id,
+                               info.local_pid, info.submitter_node, send_result);
 #endif
-            break;
+            continue;
         }
 
 #if WKI_DEBUG
@@ -3428,7 +4079,13 @@ auto exec_elf_buffer(uint8_t* elf_buffer, uint32_t binary_len, bool shared_elf_b
     auto* new_task = new ker::mod::sched::task::Task(  // NOLINT(cppcoreguidelines-owning-memory)
         "wki-remote", reinterpret_cast<uint64_t>(elf_buffer), KERNEL_RSP, ker::mod::sched::task::TaskType::PROCESS);
 
-    if (new_task == nullptr || new_task->thread == nullptr || new_task->pagemap == nullptr) {
+    if (new_task == nullptr) {
+        ker::mod::mm::phys::page_free(reinterpret_cast<void*>(stack_base));
+        release_loaded_elf_buffer(elf_buffer, shared_elf_buffer);
+        result.reject_reason = TaskRejectReason::NO_MEM;
+        return result;
+    }
+    if (new_task->thread == nullptr || new_task->pagemap == nullptr) {
         delete new_task;
         release_loaded_elf_buffer(elf_buffer, shared_elf_buffer);
         result.reject_reason = TaskRejectReason::NO_MEM;
@@ -3492,12 +4149,28 @@ struct VfsLoadResult {
     bool shared = false;
 };
 
-auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t correlation) -> VfsLoadResult {
+auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t correlation, const ComputeSubmitSessionToken& session,
+                            uint64_t request_deadline_us) -> VfsLoadResult {
     VfsLoadResult result;
     ScopedComputeMeasure load_measure(ker::mod::perf::WkiPerfComputeOp::LOAD_ELF, submitter_node, correlation,
                                       path != nullptr ? static_cast<uint32_t>(std::strlen(path)) : 0U, WOS_PERF_CALLSITE());
     if (path == nullptr || path[0] == '\0') {
         result.reject_reason = TaskRejectReason::BINARY_NOT_FOUND;
+        load_measure.finish(perf_compute_reject_status(result.reject_reason));
+        return result;
+    }
+
+    auto request_is_current = [&]() -> bool {
+        if (request_deadline_us != 0 && wki_now_us() >= request_deadline_us) {
+            return false;
+        }
+        s_compute_lock.lock();
+        bool const CURRENT = compute_submit_request_is_current_locked(session, correlation);
+        s_compute_lock.unlock();
+        return CURRENT;
+    };
+    if (!request_is_current()) {
+        result.reject_reason = TaskRejectReason::OVERLOADED;
         load_measure.finish(perf_compute_reject_status(result.reject_reason));
         return result;
     }
@@ -3549,9 +4222,18 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
         statbuf = equivalent_local_stat;
     }
 
+    // The I/O path may switch to a disconnected-host fallback during retry.
+    // Keep the cache/single-flight identity fixed to the path whose freshness
+    // key was captured so another worker cannot lose or replace our marker.
+    std::array<char, 512> cache_path = {};
+    std::strncpy(cache_path.data(), resolved_path, cache_path.size() - 1);
     ker::vfs::Stat cache_key = statbuf;
     bool is_loader = false;
-    uint64_t const INFLIGHT_DEADLINE_US = wki_future_deadline_us(wki_now_us(), WKI_TASK_SUBMIT_VFS_TIMEOUT_US);
+    uint64_t loader_token = 0;
+    uint64_t inflight_deadline_us = wki_future_deadline_us(wki_now_us(), WKI_TASK_SUBMIT_VFS_TIMEOUT_US);
+    if (request_deadline_us != 0) {
+        inflight_deadline_us = std::min(inflight_deadline_us, request_deadline_us);
+    }
 
     auto fail_inflight_load = [&]() {
         if (!is_loader) {
@@ -3559,7 +4241,8 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
         }
 
         s_compute_lock.lock();
-        if (auto* inflight = find_shared_elf_cache_entry_locked(submitter_node, resolved_path, cache_key); inflight != nullptr) {
+        if (auto* inflight = find_shared_elf_cache_entry_locked(session, cache_path.data(), cache_key);
+            inflight != nullptr && inflight->load_token == loader_token) {
             inflight->loading = false;
             inflight->load_status = -1;
             inflight->last_used_us = wki_now_us();
@@ -3571,9 +4254,16 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
 
     while (true) {
         s_compute_lock.lock();
+        if (!compute_submit_request_is_current_locked(session, correlation) ||
+            (request_deadline_us != 0 && wki_now_us() >= request_deadline_us)) {
+            s_compute_lock.unlock();
+            result.reject_reason = TaskRejectReason::OVERLOADED;
+            load_measure.finish(perf_compute_reject_status(result.reject_reason));
+            return result;
+        }
         gc_shared_elf_cache_locked(wki_now_us());
 
-        if (auto* cached = find_shared_elf_cache_locked(submitter_node, resolved_path, cache_key); cached != nullptr) {
+        if (auto* cached = find_shared_elf_cache_locked(session, cache_path.data(), cache_key); cached != nullptr) {
             cached->refcount++;
             cached->last_used_us = wki_now_us();
             result.buffer = cached->buffer;
@@ -3584,11 +4274,11 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
             return result;
         }
 
-        auto* inflight = find_shared_elf_cache_entry_locked(submitter_node, resolved_path, cache_key);
+        auto* inflight = find_shared_elf_cache_entry_locked(session, cache_path.data(), cache_key);
         if (inflight != nullptr) {
             if (inflight->loading) {
                 s_compute_lock.unlock();
-                if (wki_now_us() >= INFLIGHT_DEADLINE_US) {
+                if (wki_now_us() >= inflight_deadline_us || !request_is_current()) {
                     result.reject_reason = TaskRejectReason::FETCH_FAILED;
                     load_measure.finish(perf_compute_reject_status(result.reject_reason));
                     return result;
@@ -3617,11 +4307,14 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
         pending.loading = true;
         pending.load_status = 0;
         pending.submitter_node = submitter_node;
-        std::strncpy(pending.path.data(), resolved_path, pending.path.size() - 1);
+        pending.session = session;
+        pending.load_token = next_nonzero_token(s_next_shared_elf_cache_load_token);
+        std::strncpy(pending.path.data(), cache_path.data(), pending.path.size() - 1);
         pending.freshness = cache_key;
         pending.last_used_us = wki_now_us();
         g_shared_elf_cache.push_back(pending);
         is_loader = true;
+        loader_token = pending.load_token;
         s_compute_lock.unlock();
         break;
     }
@@ -3632,27 +4325,25 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
     size_t final_file_size = file_size;
     bool load_ok = false;
     uint64_t const RETRY_WINDOW_START_US = wki_now_us();
-    uint64_t const RETRY_DEADLINE_US = wki_future_deadline_us(RETRY_WINDOW_START_US, WKI_VFS_LOAD_RETRY_WINDOW_US);
+    uint64_t retry_deadline_us = wki_future_deadline_us(RETRY_WINDOW_START_US, WKI_VFS_LOAD_RETRY_WINDOW_US);
+    if (request_deadline_us != 0) {
+        retry_deadline_us = std::min(retry_deadline_us, request_deadline_us);
+    }
 
     for (uint32_t attempt = 0; attempt < WKI_VFS_LOAD_MAX_ATTEMPTS; attempt++) {
         uint64_t const NOW_US = wki_now_us();
-        bool const RETRY_WINDOW_OPEN = NOW_US < RETRY_DEADLINE_US;
+        bool const RETRY_WINDOW_OPEN = NOW_US < retry_deadline_us;
 
-        if (attempt > 0 && !RETRY_WINDOW_OPEN) {
+        if (!RETRY_WINDOW_OPEN || !request_is_current()) {
             break;
         }
 
         if (attempt > 0) {
-            if (!using_disconnected_host_fallback &&
-                fallback_to_local_path_for_disconnected_wki_host(resolved_path, fallback_local_path.data(), fallback_local_path.size())) {
-                resolved_path = fallback_local_path.data();
-                using_disconnected_host_fallback = true;
-            }
-
             ker::vfs::Stat retry_stat = {};
             if (ker::vfs::vfs_stat(resolved_path, &retry_stat) != 0 || retry_stat.st_size <= 0) {
                 if (RETRY_WINDOW_OPEN && attempt + 1 < WKI_VFS_LOAD_MAX_ATTEMPTS) {
-                    uint64_t const WAIT_UNTIL_US = wki_future_deadline_us(wki_now_us(), WKI_VFS_LOAD_RETRY_BACKOFF_US);
+                    uint64_t const WAIT_UNTIL_US =
+                        std::min(wki_future_deadline_us(wki_now_us(), WKI_VFS_LOAD_RETRY_BACKOFF_US), retry_deadline_us);
                     while (wki_now_us() < WAIT_UNTIL_US) {
                         sleep_until_us(WAIT_UNTIL_US, WKI_VFS_LOAD_BACKOFF_POLL_US);
                     }
@@ -3660,6 +4351,12 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
                 continue;
             }
             if (std::cmp_greater(retry_stat.st_size, UINT32_MAX)) {
+                fail_inflight_load();
+                result.reject_reason = TaskRejectReason::FETCH_FAILED;
+                load_measure.finish(perf_compute_reject_status(result.reject_reason));
+                return result;
+            }
+            if (!shared_elf_freshness_matches(cache_key, retry_stat)) {
                 fail_inflight_load();
                 result.reject_reason = TaskRejectReason::FETCH_FAILED;
                 load_measure.finish(perf_compute_reject_status(result.reject_reason));
@@ -3675,7 +4372,8 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
         int const FD = ker::vfs::vfs_open(resolved_path, open_flags, 0);
         if (FD < 0) {
             if (RETRY_WINDOW_OPEN && attempt + 1 < WKI_VFS_LOAD_MAX_ATTEMPTS) {
-                uint64_t const WAIT_UNTIL_US = wki_future_deadline_us(wki_now_us(), WKI_VFS_LOAD_RETRY_BACKOFF_US);
+                uint64_t const WAIT_UNTIL_US =
+                    std::min(wki_future_deadline_us(wki_now_us(), WKI_VFS_LOAD_RETRY_BACKOFF_US), retry_deadline_us);
                 while (wki_now_us() < WAIT_UNTIL_US) {
                     sleep_until_us(WAIT_UNTIL_US, WKI_VFS_LOAD_BACKOFF_POLL_US);
                 }
@@ -3694,6 +4392,9 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
         uint32_t idle_retries = 0;
 
         while (total_read < file_size) {
+            if (!request_is_current()) {
+                break;
+            }
             size_t const CHUNK = std::min(WKI_VFS_LOAD_CHUNK, file_size - total_read);
             // Executable images need exact offset/data coupling; avoid sequential
             // remote read caches while assembling the ELF buffer.
@@ -3724,7 +4425,7 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
             uint64_t const ELAPSED_MS = (wki_now_us() - RETRY_WINDOW_START_US) / 1000;
             ker::mod::dbg::log("[WKI] VFS_REF: short read retry for '%s' (%zu/%zu bytes) attempt %u/%u elapsed=%llu ms", resolved_path,
                                total_read, file_size, attempt + 1, WKI_VFS_LOAD_MAX_ATTEMPTS, static_cast<unsigned long long>(ELAPSED_MS));
-            uint64_t const WAIT_UNTIL_US = wki_future_deadline_us(wki_now_us(), WKI_VFS_LOAD_RETRY_BACKOFF_US);
+            uint64_t const WAIT_UNTIL_US = std::min(wki_future_deadline_us(wki_now_us(), WKI_VFS_LOAD_RETRY_BACKOFF_US), retry_deadline_us);
             while (wki_now_us() < WAIT_UNTIL_US) {
                 sleep_until_us(WAIT_UNTIL_US, WKI_VFS_LOAD_BACKOFF_POLL_US);
             }
@@ -3732,8 +4433,18 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
     }
 
     if (!load_ok) {
+        bool const REQUEST_CURRENT = request_is_current();
         fail_inflight_load();
         ker::mod::dbg::log("[WKI] VFS_REF: short read for '%s' (%zu/%zu bytes)", resolved_path, total_read, final_file_size);
+        result.reject_reason = REQUEST_CURRENT ? TaskRejectReason::FETCH_FAILED : TaskRejectReason::OVERLOADED;
+        load_measure.finish(perf_compute_reject_status(result.reject_reason), total_read);
+        return result;
+    }
+
+    ker::vfs::Stat post_read_stat = {};
+    if (ker::vfs::vfs_stat(resolved_path, &post_read_stat) != 0 || !shared_elf_freshness_matches(cache_key, post_read_stat)) {
+        fail_inflight_load();
+        delete[] buf;
         result.reject_reason = TaskRejectReason::FETCH_FAILED;
         load_measure.finish(perf_compute_reject_status(result.reject_reason), total_read);
         return result;
@@ -3745,8 +4456,23 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
 #endif
 
     s_compute_lock.lock();
+    if (!compute_submit_request_is_current_locked(session, correlation) ||
+        (request_deadline_us != 0 && wki_now_us() >= request_deadline_us)) {
+        if (auto* inflight = find_shared_elf_cache_entry_locked(session, cache_path.data(), cache_key);
+            inflight != nullptr && inflight->load_token == loader_token) {
+            inflight->loading = false;
+            inflight->load_status = -1;
+            inflight->valid = false;
+        }
+        gc_shared_elf_cache_locked(wki_now_us());
+        s_compute_lock.unlock();
+        delete[] buf;
+        result.reject_reason = TaskRejectReason::OVERLOADED;
+        load_measure.finish(perf_compute_reject_status(result.reject_reason), total_read);
+        return result;
+    }
     gc_shared_elf_cache_locked(wki_now_us());
-    if (auto* cached = find_shared_elf_cache_locked(submitter_node, resolved_path, cache_key); cached != nullptr) {
+    if (auto* cached = find_shared_elf_cache_locked(session, cache_path.data(), cache_key); cached != nullptr) {
         cached->refcount++;
         cached->last_used_us = wki_now_us();
         result.buffer = cached->buffer;
@@ -3758,8 +4484,8 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
         return result;
     }
 
-    auto* inflight = find_shared_elf_cache_entry_locked(submitter_node, resolved_path, cache_key);
-    if (is_loader && inflight != nullptr && inflight->loading) {
+    auto* inflight = find_shared_elf_cache_entry_locked(session, cache_path.data(), cache_key);
+    if (is_loader && inflight != nullptr && inflight->loading && inflight->load_token == loader_token) {
         inflight->loading = false;
         inflight->load_status = 0;
         inflight->buffer = buf;
@@ -3775,12 +4501,25 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
         return result;
     }
 
+    // Cleanup or a same-key replacement can retire our exact marker while the
+    // VFS read is outside s_compute_lock. Never publish those bytes into a new
+    // marker or launch them uncached for the retired request.
+    if (is_loader) {
+        s_compute_lock.unlock();
+        delete[] buf;
+        result.reject_reason = TaskRejectReason::OVERLOADED;
+        load_measure.finish(perf_compute_reject_status(result.reject_reason), total_read);
+        return result;
+    }
+
     SharedElfCacheEntry cache_entry = {};
     cache_entry.valid = true;
     cache_entry.loading = false;
     cache_entry.load_status = 0;
     cache_entry.submitter_node = submitter_node;
-    std::strncpy(cache_entry.path.data(), resolved_path, cache_entry.path.size() - 1);
+    cache_entry.session = session;
+    cache_entry.load_token = next_nonzero_token(s_next_shared_elf_cache_load_token);
+    std::strncpy(cache_entry.path.data(), cache_path.data(), cache_entry.path.size() - 1);
     cache_entry.freshness = cache_key;
     cache_entry.buffer = buf;
     cache_entry.size = static_cast<uint32_t>(final_file_size);
@@ -3808,7 +4547,8 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
 // wki_spin_yield() / inline NAPI draining are safe (i.e. NOT from inside
 // the NAPI poll dispatch path).
 namespace {
-void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t payload_len) {
+void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t payload_len, uint64_t deadline_us,
+                             const ComputeSubmitSessionToken& session) {
     if (payload_len < sizeof(TaskSubmitPayload)) {
         return;
     }
@@ -3835,6 +4575,38 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     bool has_submitted_identity = false;
     std::strncpy(exe_path_buf.data(), "wki-remote", exe_path_buf.size() - 1);
 
+    auto send_submit_response = [&](MsgType type, const TaskResponsePayload& response) -> int {
+        return wki_send_on_channel_generation(src_node, session.rx_channel, session.rx_channel_generation, type, &response,
+                                              sizeof(response));
+    };
+
+    auto submit_deadline_expired = [&]() -> bool { return deadline_us != 0 && wki_now_us() >= deadline_us; };
+    s_compute_lock.lock();
+    bool const SESSION_CURRENT = compute_submit_session_is_current_locked(session);
+    int32_t const EARLY_CANCEL_SIGNAL = take_cancelled_task_submit_locked(session, submit->task_id);
+    s_compute_lock.unlock();
+    if (!SESSION_CURRENT) {
+        handle_measure.finish(perf_compute_reject_status(TaskRejectReason::OVERLOADED));
+        return;
+    }
+    if (EARLY_CANCEL_SIGNAL != 0) {
+        TaskResponsePayload reject = {};
+        reject.task_id = submit->task_id;
+        reject.status = static_cast<uint8_t>(TaskRejectReason::OVERLOADED);
+        send_submit_response(MsgType::TASK_REJECT, reject);
+        handle_measure.finish(perf_compute_reject_status(TaskRejectReason::OVERLOADED));
+        return;
+    }
+    if (submit_deadline_expired()) {
+        TaskResponsePayload reject = {};
+        reject.task_id = submit->task_id;
+        reject.status = static_cast<uint8_t>(TaskRejectReason::OVERLOADED);
+        reject.remote_pid = 0;
+        send_submit_response(MsgType::TASK_REJECT, reject);
+        handle_measure.finish(perf_compute_reject_status(TaskRejectReason::OVERLOADED));
+        return;
+    }
+
     auto mode = static_cast<TaskDeliveryMode>(submit->delivery_mode);
     switch (mode) {
         case TaskDeliveryMode::INLINE: {
@@ -3846,7 +4618,7 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
             memcpy(&binary_len, var_data, sizeof(uint32_t));
             const uint8_t* binary_data = var_data + sizeof(uint32_t);
 
-            if (binary_len == 0 || binary_len + sizeof(uint32_t) > var_len) {
+            if (binary_len == 0 || binary_len > static_cast<uint32_t>(var_len - sizeof(uint32_t))) {
                 reject_reason = TaskRejectReason::FETCH_FAILED;
                 break;
             }
@@ -3867,7 +4639,7 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
             uint16_t path_len = 0;
             memcpy(&path_len, var_data, sizeof(uint16_t));
 
-            if (path_len == 0 || sizeof(uint16_t) + path_len > var_len) {
+            if (path_len == 0 || path_len >= 512 || sizeof(uint16_t) + path_len > var_len) {
                 reject_reason = TaskRejectReason::FETCH_FAILED;
                 break;
             }
@@ -3878,7 +4650,7 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
             memcpy(path_buf.data(), var_data + sizeof(uint16_t), copy_len);
             *std::next(path_buf.begin(), static_cast<ptrdiff_t>(copy_len)) = '\0';
 
-            auto vfs_result = load_elf_from_vfs_path(path_buf.data(), hdr->src_node, submit->task_id);
+            auto vfs_result = load_elf_from_vfs_path(path_buf.data(), hdr->src_node, submit->task_id, session, deadline_us);
             if (vfs_result.buffer == nullptr) {
                 ker::mod::dbg::log("[WKI] Task submit VFS_REF load failed: task_id=%u path='%s' reason=%u", submit->task_id,
                                    path_buf.data(), static_cast<uint8_t>(vfs_result.reject_reason));
@@ -3913,7 +4685,7 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
             memcpy(&path_len, var_data + off, sizeof(uint16_t));
             off += sizeof(uint16_t);
 
-            if (path_len == 0 || off + path_len > var_len) {
+            if (path_len == 0 || path_len >= 512 || off + path_len > var_len) {
                 reject_reason = TaskRejectReason::FETCH_FAILED;
                 break;
             }
@@ -3927,7 +4699,7 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
             // mounted (e.g., via wki_remote_vfs_mount), the path is accessible.
             // Construct full path: "/remote_<node>_<resource>/<ref_path>" or just try ref_path.
             // For simplicity: try the path as-is first (works if already mounted at that path).
-            auto vfs_result = load_elf_from_vfs_path(ref_path.data(), hdr->src_node, submit->task_id);
+            auto vfs_result = load_elf_from_vfs_path(ref_path.data(), hdr->src_node, submit->task_id, session, deadline_us);
             if (vfs_result.buffer == nullptr) {
                 ker::mod::dbg::log("[WKI] RESOURCE_REF: failed to load node=0x%04x res=%u path='%s'", ref_node, ref_resource,
                                    ref_path.data());
@@ -3946,6 +4718,23 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
         default:
             reject_reason = TaskRejectReason::FETCH_FAILED;
             break;
+    }
+
+    if (reject_reason == TaskRejectReason::ACCEPTED && submit_deadline_expired()) {
+        reject_reason = TaskRejectReason::OVERLOADED;
+    }
+
+    s_compute_lock.lock();
+    int32_t const LOAD_CANCEL_SIGNAL = take_cancelled_task_submit_locked(session, submit->task_id);
+    s_compute_lock.unlock();
+    if (LOAD_CANCEL_SIGNAL != 0) {
+        release_loaded_elf_buffer(elf_buffer, elf_buffer_shared);
+        TaskResponsePayload reject = {};
+        reject.task_id = submit->task_id;
+        reject.status = static_cast<uint8_t>(TaskRejectReason::OVERLOADED);
+        send_submit_response(MsgType::TASK_REJECT, reject);
+        handle_measure.finish(perf_compute_reject_status(TaskRejectReason::OVERLOADED), binary_len);
+        return;
     }
 
     uint16_t context_without_ipc = submit_context_len;
@@ -3981,7 +4770,7 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
         reject.remote_pid = 0;
         ker::mod::dbg::log("[WKI] Task submit reject before exec: task_id=%u reason=%u", submit->task_id,
                            static_cast<uint8_t>(reject_reason));
-        wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_REJECT, &reject, sizeof(reject));
+        send_submit_response(MsgType::TASK_REJECT, reject);
         handle_measure.finish(perf_compute_reject_status(reject_reason), binary_len);
         return;
     }
@@ -4003,7 +4792,7 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
         reject.status = static_cast<uint8_t>(TaskRejectReason::FETCH_FAILED);
         reject.remote_pid = 0;
         ker::mod::dbg::log("[WKI] Task submit policy parse failed before exec: task_id=%u", submit->task_id);
-        wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_REJECT, &reject, sizeof(reject));
+        send_submit_response(MsgType::TASK_REJECT, reject);
         handle_measure.finish(perf_compute_reject_status(TaskRejectReason::FETCH_FAILED), binary_len);
         return;
     }
@@ -4018,7 +4807,7 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
         reject.status = static_cast<uint8_t>(exec_reason);
         reject.remote_pid = 0;
         ker::mod::dbg::log("[WKI] Task submit exec failed: task_id=%u reason=%u", submit->task_id, static_cast<uint8_t>(exec_reason));
-        wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_REJECT, &reject, sizeof(reject));
+        send_submit_response(MsgType::TASK_REJECT, reject);
         handle_measure.finish(perf_compute_reject_status(exec_reason), binary_len);
         return;
     }
@@ -4114,15 +4903,14 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     if (!parse_ok) {
         delete[] argv_strings;
         delete[] envp_strings;
-        delete new_task;
-        delete EXEC.output;
+        destroy_unpublished_remote_process(new_task, EXEC.output, "wki-submit-parse");
 
         TaskResponsePayload reject = {};
         reject.task_id = submit->task_id;
         reject.status = static_cast<uint8_t>(TaskRejectReason::FETCH_FAILED);
         reject.remote_pid = 0;
         ker::mod::dbg::log("[WKI] Task submit parse failed: task_id=%u", submit->task_id);
-        wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_REJECT, &reject, sizeof(reject));
+        send_submit_response(MsgType::TASK_REJECT, reject);
         handle_measure.finish(perf_compute_reject_status(TaskRejectReason::FETCH_FAILED), binary_len);
         return;
     }
@@ -4364,16 +5152,29 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
 
     if (!STACK_SETUP_OK) {
         uint64_t const FAILED_PID = new_task->pid;
-        delete new_task;
-        delete EXEC.output;
+        destroy_unpublished_remote_process(new_task, EXEC.output, "wki-submit-stack");
 
         TaskResponsePayload reject = {};
         reject.task_id = submit->task_id;
         reject.status = static_cast<uint8_t>(TaskRejectReason::NO_MEM);
         reject.remote_pid = 0;
         ker::mod::dbg::log("[WKI] Task submit stack setup failed: task_id=%u pid=0x%lx", submit->task_id, FAILED_PID);
-        wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_REJECT, &reject, sizeof(reject));
+        send_submit_response(MsgType::TASK_REJECT, reject);
         handle_measure.finish(perf_compute_reject_status(TaskRejectReason::NO_MEM), binary_len);
+        return;
+    }
+
+    if (submit_deadline_expired()) {
+        uint64_t const EXPIRED_PID = new_task->pid;
+        destroy_unpublished_remote_process(new_task, EXEC.output, "wki-submit-expired");
+
+        TaskResponsePayload reject = {};
+        reject.task_id = submit->task_id;
+        reject.status = static_cast<uint8_t>(TaskRejectReason::OVERLOADED);
+        reject.remote_pid = 0;
+        ker::mod::dbg::log("[WKI] Task submit expired before post: task_id=%u pid=0x%lx", submit->task_id, EXPIRED_PID);
+        send_submit_response(MsgType::TASK_REJECT, reject);
+        handle_measure.finish(perf_compute_reject_status(TaskRejectReason::OVERLOADED), binary_len);
         return;
     }
 
@@ -4405,17 +5206,28 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     // Hold the completion-monitor reference before the task can run.  Very
     // short tasks may exit before post_task_balanced() returns.
     auto* completion_task_ref = static_cast<ker::mod::sched::task::Task*>(nullptr);
+    auto* worker_task_ref = static_cast<ker::mod::sched::task::Task*>(nullptr);
     if (new_task->try_acquire()) {
         completion_task_ref = new_task;
-    } else {
-        delete new_task;
-        delete EXEC.output;
+    }
+    // Scheduler publication transfers the creator's raw ownership. Keep a
+    // distinct worker reference until every post-publication field access and
+    // cancellation fallback has finished; the completion scanner may release
+    // the monitor row's reference as soon as published becomes true.
+    if (completion_task_ref != nullptr && new_task->try_acquire()) {
+        worker_task_ref = new_task;
+    }
+    if (completion_task_ref == nullptr || worker_task_ref == nullptr) {
+        if (completion_task_ref != nullptr) {
+            completion_task_ref->release();
+        }
+        destroy_unpublished_remote_process(new_task, EXEC.output, "wki-submit-ref");
         TaskResponsePayload reject = {};
         reject.task_id = submit->task_id;
         reject.status = static_cast<uint8_t>(TaskRejectReason::OVERLOADED);
         reject.remote_pid = 0;
         ker::mod::dbg::log("[WKI] Task submit ref failed: task_id=%u pid=0x%lx", submit->task_id, LAUNCHED_PID);
-        wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_REJECT, &reject, sizeof(reject));
+        send_submit_response(MsgType::TASK_REJECT, reject);
         handle_measure.finish(perf_compute_reject_status(TaskRejectReason::OVERLOADED), binary_len);
         return;
     }
@@ -4425,43 +5237,108 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     // reach exit_notify_ready before post_task_balanced() returns.
     RunningRemoteTask rt;
     rt.active = true;
+    rt.published = false;
+    rt.accept_pending = false;
     rt.task_id = submit->task_id;
     rt.submitter_node = hdr->src_node;
     rt.local_pid = LAUNCHED_PID;
+    rt.submit_session_epoch = session.epoch;
+    rt.submit_rx_channel = session.rx_channel;
+    rt.submit_rx_channel_generation = session.rx_channel_generation;
     rt.task = completion_task_ref;
     rt.output = EXEC.output;
+
+    // Linearize scheduler publication with peer epoch/disconnect cleanup.
+    // Lifecycle teardown owns the same lease before retiring this session, so
+    // it either invalidates us before this final check or runs after the task
+    // and its monitor row have been published consistently.
+    PeerLifecycleLease publication_lease;
+    if (!publication_lease.acquire(src_node)) {
+        worker_task_ref->release();
+        completion_task_ref->release();
+        destroy_unpublished_remote_process(new_task, EXEC.output, "wki-submit-peer");
+        handle_measure.finish(perf_compute_reject_status(TaskRejectReason::OVERLOADED), binary_len);
+        return;
+    }
+
     s_compute_lock.lock();
+    bool const FINAL_SESSION_CURRENT = compute_submit_session_is_current_locked(session);
+    int32_t const FINAL_CANCEL_SIGNAL = take_cancelled_task_submit_locked(session, submit->task_id);
+    bool const FINAL_DEADLINE_EXPIRED = submit_deadline_expired();
+    if (!FINAL_SESSION_CURRENT || FINAL_CANCEL_SIGNAL != 0 || FINAL_DEADLINE_EXPIRED) {
+        s_compute_lock.unlock();
+        worker_task_ref->release();
+        completion_task_ref->release();
+        const char* failure_reason = "wki-submit-expired";
+        if (!FINAL_SESSION_CURRENT) {
+            failure_reason = "wki-submit-session";
+        } else if (FINAL_CANCEL_SIGNAL != 0) {
+            failure_reason = "wki-submit-cancel";
+        }
+        destroy_unpublished_remote_process(new_task, EXEC.output, failure_reason);
+        if (FINAL_SESSION_CURRENT) {
+            TaskResponsePayload reject = {};
+            reject.task_id = submit->task_id;
+            reject.status = static_cast<uint8_t>(TaskRejectReason::OVERLOADED);
+            send_submit_response(MsgType::TASK_REJECT, reject);
+        }
+        handle_measure.finish(perf_compute_reject_status(TaskRejectReason::OVERLOADED), binary_len);
+        return;
+    }
     g_running_remote_tasks.push_back(rt);
     s_compute_lock.unlock();
 
-    // Post to scheduler
-    if (!ker::mod::sched::post_task_balanced(new_task)) {
-        TaskOutputCapture* output_to_delete = EXEC.output;
-
-        s_compute_lock.lock();
-        if (auto* running = find_running_task(submit->task_id, hdr->src_node); running != nullptr) {
-            if (running->task != nullptr) {
-                running->task = nullptr;
-            }
-            output_to_delete = running->output;
-            running->output = nullptr;
-            running->active = false;
+    // The unpublished row owns the monitor reference/output but is invisible
+    // to cancel and completion readers until scheduler publication returns.
+    bool const POSTED = ker::mod::sched::post_task_balanced(new_task);
+    bool send_accept = false;
+    int32_t post_cancel_signal = 0;
+    TaskOutputCapture* output_to_delete = EXEC.output;
+    s_compute_lock.lock();
+    RunningRemoteTask* published_row = nullptr;
+    for (auto& running : g_running_remote_tasks) {
+        if (running.active && !running.published && running.task == completion_task_ref && running.local_pid == LAUNCHED_PID) {
+            published_row = &running;
+            break;
+        }
+    }
+    if (!POSTED) {
+        if (published_row != nullptr) {
+            published_row->task = nullptr;
+            output_to_delete = published_row->output;
+            published_row->output = nullptr;
+            published_row->active = false;
         }
         compact_running_remote_tasks_locked();
         s_compute_lock.unlock();
 
+        worker_task_ref->release();
         completion_task_ref->release();
-        delete new_task;
-        delete output_to_delete;
+        destroy_unpublished_remote_process(new_task, output_to_delete, "wki-submit-post");
         TaskResponsePayload reject = {};
         reject.task_id = submit->task_id;
         reject.status = static_cast<uint8_t>(TaskRejectReason::OVERLOADED);
         reject.remote_pid = 0;
         ker::mod::dbg::log("[WKI] Task submit post failed: task_id=%u pid=0x%lx", submit->task_id, LAUNCHED_PID);
-        wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_REJECT, &reject, sizeof(reject));
+        send_submit_response(MsgType::TASK_REJECT, reject);
         handle_measure.finish(perf_compute_reject_status(TaskRejectReason::OVERLOADED), binary_len);
         return;
     }
+    if (published_row != nullptr) {
+        published_row->published = true;
+        bool const CURRENT = compute_submit_session_is_current_locked(session);
+        post_cancel_signal = take_cancelled_task_submit_locked(session, submit->task_id);
+        bool const DEADLINE_EXPIRED = submit_deadline_expired();
+        if ((!CURRENT || DEADLINE_EXPIRED) && post_cancel_signal == 0) {
+            post_cancel_signal = WKI_SIGKILL_NUM;
+        }
+        if (!CURRENT || DEADLINE_EXPIRED || post_cancel_signal != 0) {
+            published_row->discard_completion = true;
+        }
+        send_accept = CURRENT && !published_row->discard_completion;
+        published_row->accept_pending = send_accept;
+    }
+    s_compute_lock.unlock();
 #ifdef DEBUG_WKI_COMPUTE
     // post_task_balanced sets task->cpu before returning; capture it here
     // before the task can complete and be reclaimed.
@@ -4473,12 +5350,33 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     accept.task_id = submit->task_id;
     accept.status = static_cast<uint8_t>(TaskRejectReason::ACCEPTED);
     accept.remote_pid = LAUNCHED_PID;
-    wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_ACCEPT, &accept, sizeof(accept));
+    if (post_cancel_signal != 0) {
+        uint64_t const OWNER_PID = task_process_owner_pid(new_task);
+        size_t const SIGNALED = queue_signal_for_process_tasks(OWNER_PID, post_cancel_signal);
+        if (SIGNALED == 0 && !new_task->has_exited && post_cancel_signal > 0 &&
+            std::cmp_less_equal(post_cancel_signal, ker::mod::sched::task::Task::MAX_SIGNALS)) {
+            new_task->signal_add_pending_mask(1ULL << (post_cancel_signal - 1));
+            ker::mod::sched::wake_task_for_signal(new_task);
+        }
+    } else if (send_accept) {
+        int const ACCEPT_RESULT = send_submit_response(MsgType::TASK_ACCEPT, accept);
+        s_compute_lock.lock();
+        if (auto* running = find_running_task(submit->task_id, session); running != nullptr) {
+            if (ACCEPT_RESULT == WKI_OK) {
+                running->accept_pending = false;
+            } else if (!compute_submit_session_is_current_locked(session)) {
+                running->accept_pending = false;
+                running->discard_completion = true;
+            }
+        }
+        s_compute_lock.unlock();
+    }
     handle_measure.finish(0, binary_len);
 #ifdef DEBUG_WKI_COMPUTE
     ker::mod::dbg::log("[WKI] Remote task launched: task_id=%u pid=0x%lx on CPU %d mode=%u", submit->task_id, launched_pid, launched_cpu,
                        submit->delivery_mode);
 #endif
+    worker_task_ref->release();
 }
 
 // ---------------------------------------------------------------------------
@@ -4486,23 +5384,40 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Dedicated kernel thread for processing VFS_REF/RESOURCE_REF task submits.
-// These operations perform blocking remote VFS reads (stat/open/read) which
-// can each take up to 15s on timeout.  Running them from the timer tick's
-// deferred-work section serialised them behind zone creations and mount
-// retries, easily exceeding the 60s submit timeout on the submitter side.
-// A dedicated thread lets VFS_REF processing proceed independently.
+// Bounded kernel-thread pool for all task submits. Keeping remote VFS and
+// PT_INTERP task construction off the RX path lets independent loads overlap
+// without creating one worker per CPU.
 // ---------------------------------------------------------------------------
+
+auto compute_submit_worker_target(uint64_t cpu_count) -> size_t {
+    uint64_t const AVAILABLE_CPUS = std::max<uint64_t>(cpu_count, 1);
+    return static_cast<size_t>(std::min<uint64_t>(AVAILABLE_CPUS, WKI_COMPUTE_SUBMIT_WORKER_MAX));
+}
+
+void destroy_unpublished_compute_submit_worker(ker::mod::sched::task::Task* task) {
+    if (task == nullptr) {
+        return;
+    }
+
+    delete reinterpret_cast<ker::mod::cpu::PerCpu*>(task->context.syscall_scratch_area);
+    delete[] task->name;
+    if (task->context.syscall_kernel_stack >= ker::mod::mm::KERNEL_STACK_SIZE) {
+        ker::mod::mm::phys::page_free(reinterpret_cast<void*>(task->context.syscall_kernel_stack - ker::mod::mm::KERNEL_STACK_SIZE));
+    }
+    delete task;
+}
 
 void drain_pending_task_submits() {
     while (true) {
         s_pending_submit_lock.lock();
-        if (g_pending_task_submits.empty()) {
+        if (s_pending_task_submit_count == 0) {
             s_pending_submit_lock.unlock();
             return;
         }
-        auto pending = g_pending_task_submits.front();
-        g_pending_task_submits.pop_front();
+        PendingTaskSubmit pending = g_pending_task_submits.at(s_pending_task_submit_head);
+        g_pending_task_submits.at(s_pending_task_submit_head) = {};
+        s_pending_task_submit_head = (s_pending_task_submit_head + 1) % WKI_COMPUTE_SUBMIT_QUEUE_MAX;
+        s_pending_task_submit_count--;
         s_pending_submit_lock.unlock();
 
         if (pending.payload_len >= sizeof(TaskSubmitPayload)) {
@@ -4515,7 +5430,7 @@ void drain_pending_task_submits() {
                                     CALLSITE);
         }
 
-        handle_task_submit_work(pending.src_node, pending.payload, pending.payload_len);
+        handle_task_submit_work(pending.src_node, pending.payload, pending.payload_len, pending.deadline_us, pending.session);
         delete[] pending.payload;
     }
 }
@@ -4526,9 +5441,9 @@ void drain_pending_task_submits() {
 
         // Sleep until woken by wki_remote_compute_notify_pending_submit().
         // No polling — kern_wake() delivers an immediate wakeup when a new
-        // VFS_REF/RESOURCE_REF submit is queued.
+        // TASK_SUBMIT is queued.
         s_pending_submit_lock.lock();
-        bool const EMPTY = g_pending_task_submits.empty();
+        bool const EMPTY = s_pending_task_submit_count == 0;
         s_pending_submit_lock.unlock();
         if (EMPTY) {
             ker::mod::sched::kern_block();
@@ -4539,24 +5454,120 @@ void drain_pending_task_submits() {
 }  // namespace
 
 void wki_remote_compute_start_submit_thread() {
-    auto* task = ker::mod::sched::task::Task::create_kernel_thread("wki_compute", wki_compute_submit_thread);
-    if (task == nullptr) {
-        ker::mod::dbg::log("[WKI] Failed to create compute submit kernel thread");
+    if (s_compute_submit_task_count.load(std::memory_order_acquire) != 0) {
         return;
     }
-    promote_latency_sensitive_daemon(task);
-    s_compute_submit_task = task;
-    ker::mod::sched::post_task_balanced(task);
-    ker::mod::dbg::log("[WKI] Compute submit thread started (PID %d)", task->pid);
+
+    constexpr std::array<const char*, WKI_COMPUTE_SUBMIT_WORKER_MAX> WORKER_NAMES = {
+        "wki_compute0",
+        "wki_compute1",
+        "wki_compute2",
+        "wki_compute3",
+    };
+    size_t const TARGET_WORKERS = compute_submit_worker_target(ker::mod::smt::get_core_count());
+    size_t started_workers = 0;
+    for (size_t i = 0; i < TARGET_WORKERS; ++i) {
+        auto* task = ker::mod::sched::task::Task::create_kernel_thread(WORKER_NAMES.at(i), wki_compute_submit_thread);
+        if (task == nullptr) {
+            ker::mod::dbg::log("[WKI] Failed to create compute submit worker %u", static_cast<unsigned>(i));
+            continue;
+        }
+        promote_latency_sensitive_daemon(task);
+        if (!ker::mod::sched::post_task_balanced(task)) {
+            ker::mod::dbg::log("[WKI] Failed to post compute submit worker %u", static_cast<unsigned>(i));
+            destroy_unpublished_compute_submit_worker(task);
+            continue;
+        }
+        s_compute_submit_tasks.at(started_workers++) = task;
+    }
+
+    s_compute_submit_task_count.store(started_workers, std::memory_order_release);
+    wki_remote_compute_notify_pending_submit();
+    ker::mod::dbg::log("[WKI] Compute submit pool started (%u/%u workers)", static_cast<unsigned>(started_workers),
+                       static_cast<unsigned>(TARGET_WORKERS));
 }
 
 void wki_remote_compute_notify_pending_submit() {
-    if (s_compute_submit_task != nullptr) {
-        ker::mod::sched::kern_wake(s_compute_submit_task);
+    size_t const WORKER_COUNT = s_compute_submit_task_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < WORKER_COUNT; ++i) {
+        ker::mod::sched::kern_wake(s_compute_submit_tasks.at(i));
     }
 }
 
 void wki_remote_compute_process_pending_submits() { drain_pending_task_submits(); }
+
+#ifdef WOS_SELFTEST
+auto wki_remote_compute_selftest_submit_worker_count_is_bounded() -> bool {
+    return compute_submit_worker_target(0) == 1 && compute_submit_worker_target(1) == 1 && compute_submit_worker_target(2) == 2 &&
+           compute_submit_worker_target(WKI_COMPUTE_SUBMIT_WORKER_MAX) == WKI_COMPUTE_SUBMIT_WORKER_MAX &&
+           compute_submit_worker_target(WKI_COMPUTE_SUBMIT_WORKER_MAX + 1) == WKI_COMPUTE_SUBMIT_WORKER_MAX &&
+           compute_submit_worker_target(256) == WKI_COMPUTE_SUBMIT_WORKER_MAX;
+}
+
+auto wki_remote_compute_selftest_accept_retry_is_fair() -> bool {
+    constexpr size_t ROW_COUNT = WKI_COMPUTE_SUBMIT_QUEUE_MAX + 2;
+    std::deque<RunningRemoteTask> test_rows;
+    for (size_t i = 0; i < ROW_COUNT; ++i) {
+        RunningRemoteTask row{};
+        row.active = true;
+        row.published = true;
+        row.accept_pending = true;
+        row.task_id = static_cast<uint32_t>(i + 1);
+        row.submitter_node = i < WKI_COMPUTE_SUBMIT_QUEUE_MAX ? 0x7A31 : 0x7A32;
+        row.local_pid = i + 1;
+        test_rows.push_back(row);
+    }
+
+    std::array<PendingTaskAcceptAttempt, WKI_COMPUTE_SUBMIT_QUEUE_MAX> first = {};
+    std::array<PendingTaskAcceptAttempt, WKI_COMPUTE_SUBMIT_QUEUE_MAX> second = {};
+    std::deque<RunningRemoteTask> saved_rows;
+
+    s_compute_lock.lock();
+    saved_rows.swap(g_running_remote_tasks);
+    test_rows.swap(g_running_remote_tasks);
+    size_t const SAVED_CURSOR = s_pending_task_accept_cursor;
+    s_pending_task_accept_cursor = 0;
+    size_t const FIRST_COUNT = collect_pending_task_accept_attempts_locked(first);
+    size_t const SECOND_COUNT = collect_pending_task_accept_attempts_locked(second);
+    s_pending_task_accept_cursor = SAVED_CURSOR;
+    test_rows.swap(g_running_remote_tasks);
+    saved_rows.swap(g_running_remote_tasks);
+    s_compute_lock.unlock();
+
+    bool later_peer_seen = false;
+    for (size_t i = 0; i < SECOND_COUNT; ++i) {
+        later_peer_seen = later_peer_seen || second.at(i).submitter_node == 0x7A32;
+    }
+    return FIRST_COUNT == WKI_COMPUTE_SUBMIT_QUEUE_MAX && SECOND_COUNT != 0 && later_peer_seen;
+}
+
+auto wki_remote_compute_selftest_submit_cancel_is_session_scoped() -> bool {
+    constexpr uint32_t TASK_ID = 0xC10101U;
+    constexpr uint16_t NODE_ID = 0x7A26;
+    WkiChannel channel{};
+    ComputeSubmitSessionToken const SESSION_A = {
+        .node_id = NODE_ID,
+        .rx_channel = &channel,
+        .rx_channel_generation = 7,
+        .epoch = 11,
+    };
+    ComputeSubmitSessionToken const SESSION_B = {
+        .node_id = NODE_ID,
+        .rx_channel = &channel,
+        .rx_channel_generation = 8,
+        .epoch = 12,
+    };
+
+    s_compute_lock.lock();
+    record_cancelled_task_submit_locked(SESSION_A, TASK_ID, WKI_SIGKILL_NUM);
+    bool const EXACT_MATCH = find_cancelled_task_submit_locked(SESSION_A, TASK_ID) != nullptr;
+    bool const OTHER_SESSION_CLEAR = find_cancelled_task_submit_locked(SESSION_B, TASK_ID) == nullptr;
+    bool const CONSUMED = take_cancelled_task_submit_locked(SESSION_A, TASK_ID) == WKI_SIGKILL_NUM;
+    bool const CLEARED = find_cancelled_task_submit_locked(SESSION_A, TASK_ID) == nullptr;
+    s_compute_lock.unlock();
+    return EXACT_MATCH && OTHER_SESSION_CLEAR && CONSUMED && CLEARED;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // detail:: RX handlers (called from NAPI dispatch in wki_rx)
@@ -4564,51 +5575,76 @@ void wki_remote_compute_process_pending_submits() { drain_pending_task_submits()
 
 namespace detail {
 
-void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
-    if (payload_len < sizeof(TaskSubmitPayload)) {
+void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                        uint32_t rx_channel_generation) {
+    if (hdr == nullptr || payload_len < sizeof(TaskSubmitPayload)) {
         return;
     }
 
     const auto* submit = reinterpret_cast<const TaskSubmitPayload*>(payload);
     auto mode = static_cast<TaskDeliveryMode>(submit->delivery_mode);
-
-    // VFS_REF and RESOURCE_REF delivery modes call load_elf_from_vfs_path()
-    // which does blocking remote VFS reads through vfs_proxy_send_and_wait().
-    // Those waits call wki_spin_yield() -> inline NAPI draining, causing NAPI
-    // re-entrance when dispatched from wki_rx().  Defer to the dedicated
-    // compute submit thread where blocking VFS I/O is safe.
-    if (mode == TaskDeliveryMode::VFS_REF || mode == TaskDeliveryMode::RESOURCE_REF) {
-        auto* copy = new (std::nothrow) uint8_t[payload_len];
-        if (copy == nullptr) {
-            TaskResponsePayload reject = {};
-            reject.task_id = submit->task_id;
-            reject.status = static_cast<uint8_t>(TaskRejectReason::NO_MEM);
-            reject.remote_pid = 0;
-            wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_REJECT, &reject, sizeof(reject));
-            return;
-        }
-        std::memcpy(copy, payload, payload_len);
-
-        PendingTaskSubmit pending{};
-        pending.src_node = hdr->src_node;
-        pending.payload = copy;
-        pending.payload_len = payload_len;
-        pending.queued_at_us = wki_now_us();
-
-        s_pending_submit_lock.lock();
-        g_pending_task_submits.push_back(pending);
-        s_pending_submit_lock.unlock();
-
-        wki_remote_compute_notify_pending_submit();
+    s_compute_lock.lock();
+    ComputeSubmitSessionToken const SESSION = capture_compute_submit_session_locked(hdr->src_node, rx_channel, rx_channel_generation);
+    s_compute_lock.unlock();
+    if (SESSION.epoch == 0) {
         return;
     }
 
-    // INLINE delivery has no blocking VFS I/O — safe to handle directly.
-    handle_task_submit_work(hdr->src_node, payload, payload_len);
+    auto reject_submit = [&](TaskRejectReason reason) {
+        TaskResponsePayload reject = {};
+        reject.task_id = submit->task_id;
+        reject.status = static_cast<uint8_t>(reason);
+        reject.remote_pid = 0;
+        wki_send_on_channel_generation(hdr->src_node, SESSION.rx_channel, SESSION.rx_channel_generation, MsgType::TASK_REJECT, &reject,
+                                       sizeof(reject));
+    };
+
+    // VFS/RESOURCE loads block directly, and INLINE construction can follow a
+    // PT_INTERP path through VFS. Keep every process construction out of RX.
+    if (s_compute_submit_task_count.load(std::memory_order_acquire) == 0) {
+        reject_submit(TaskRejectReason::OVERLOADED);
+        return;
+    }
+
+    auto* copy = new (std::nothrow) uint8_t[payload_len];
+    if (copy == nullptr) {
+        reject_submit(TaskRejectReason::NO_MEM);
+        return;
+    }
+    std::memcpy(copy, payload, payload_len);
+
+    PendingTaskSubmit pending{};
+    pending.src_node = hdr->src_node;
+    pending.payload = copy;
+    pending.payload_len = payload_len;
+    pending.queued_at_us = wki_now_us();
+    uint64_t const RESPONSE_TIMEOUT_US =
+        mode == TaskDeliveryMode::INLINE ? WKI_TASK_SUBMIT_INLINE_RECEIVER_TIMEOUT_US : WKI_TASK_SUBMIT_VFS_RECEIVER_TIMEOUT_US;
+    pending.deadline_us = wki_future_deadline_us(pending.queued_at_us, RESPONSE_TIMEOUT_US);
+    pending.session = SESSION;
+
+    bool queued = false;
+    s_pending_submit_lock.lock();
+    if (s_pending_task_submit_count < WKI_COMPUTE_SUBMIT_QUEUE_MAX) {
+        g_pending_task_submits.at(s_pending_task_submit_tail) = pending;
+        s_pending_task_submit_tail = (s_pending_task_submit_tail + 1) % WKI_COMPUTE_SUBMIT_QUEUE_MAX;
+        s_pending_task_submit_count++;
+        queued = true;
+    }
+    s_pending_submit_lock.unlock();
+
+    if (!queued) {
+        delete[] copy;
+        reject_submit(TaskRejectReason::OVERLOADED);
+        return;
+    }
+
+    wki_remote_compute_notify_pending_submit();
 }
 
-void handle_task_accept(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
-    if (payload_len < sizeof(TaskResponsePayload)) {
+void handle_task_accept(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                        uint32_t rx_channel_generation) {
+    if (hdr == nullptr || payload_len < sizeof(TaskResponsePayload)) {
         return;
     }
 
@@ -4616,7 +5652,8 @@ void handle_task_accept(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 
     s_compute_lock.lock();
     SubmittedTask* task = find_submitted_task(resp->task_id);
-    if (task == nullptr || !task->response_pending.load(std::memory_order_acquire)) {
+    if (task == nullptr || task->target_node != hdr->src_node || task->submit_channel != rx_channel ||
+        task->submit_channel_generation != rx_channel_generation || !task->response_pending.load(std::memory_order_acquire)) {
         s_compute_lock.unlock();
         return;
     }
@@ -4641,8 +5678,9 @@ void handle_task_accept(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
                               0, WOS_PERF_CALLSITE());
 }
 
-void handle_task_reject(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
-    if (payload_len < sizeof(TaskResponsePayload)) {
+void handle_task_reject(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                        uint32_t rx_channel_generation) {
+    if (hdr == nullptr || payload_len < sizeof(TaskResponsePayload)) {
         return;
     }
 
@@ -4650,7 +5688,8 @@ void handle_task_reject(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 
     s_compute_lock.lock();
     SubmittedTask* task = find_submitted_task(resp->task_id);
-    if (task == nullptr || !task->response_pending.load(std::memory_order_acquire)) {
+    if (task == nullptr || task->target_node != hdr->src_node || task->submit_channel != rx_channel ||
+        task->submit_channel_generation != rx_channel_generation || !task->response_pending.load(std::memory_order_acquire)) {
         s_compute_lock.unlock();
         return;
     }
@@ -4673,8 +5712,9 @@ void handle_task_reject(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
                               -static_cast<int32_t>(resp->status == 0 ? 1 : resp->status), 0, WOS_PERF_CALLSITE());
 }
 
-void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
-    if (payload_len < sizeof(TaskCompletePayload)) {
+void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                          uint32_t rx_channel_generation) {
+    if (hdr == nullptr || payload_len < sizeof(TaskCompletePayload)) {
         return;
     }
 
@@ -4689,7 +5729,8 @@ void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t
 
     s_compute_lock.lock();
     SubmittedTask* task = find_submitted_task(comp->task_id);
-    if (task == nullptr) {
+    if (task == nullptr || task->target_node != hdr->src_node || task->submit_channel != rx_channel ||
+        task->submit_channel_generation != rx_channel_generation) {
         s_compute_lock.unlock();
         ker::mod::dbg::log("[WKI] TASK_COMPLETE: no submitted task for task_id=%u", comp->task_id);
         return;
@@ -4787,8 +5828,9 @@ void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t
                               comp->exit_status, comp->output_len, WOS_PERF_CALLSITE());
 }
 
-void handle_task_cancel(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
-    if (payload_len < sizeof(uint32_t)) {
+void handle_task_cancel(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                        uint32_t rx_channel_generation) {
+    if (hdr == nullptr || payload_len < sizeof(uint32_t)) {
         return;
     }
 
@@ -4797,14 +5839,22 @@ void handle_task_cancel(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 
     // D18: Find the running task and extract fields under lock
     s_compute_lock.lock();
-    RunningRemoteTask const* rt = find_running_task(cancel->task_id, hdr->src_node);
+    ComputeSubmitSessionToken const SESSION = capture_compute_submit_session_locked(hdr->src_node, rx_channel, rx_channel_generation);
+    RunningRemoteTask* rt = SESSION.epoch != 0 ? find_running_task(cancel->task_id, SESSION) : nullptr;
     if (rt == nullptr) {
+        if (SESSION.epoch != 0 && SIGNUM > 0 && std::cmp_less_equal(SIGNUM, ker::mod::sched::task::Task::MAX_SIGNALS)) {
+            record_cancelled_task_submit_locked(SESSION, cancel->task_id, SIGNUM);
+        }
         s_compute_lock.unlock();
-        ker::mod::dbg::log("[WKI] Task cancel: no matching running task task_id=%u from 0x%04x", cancel->task_id, hdr->src_node);
+        ker::mod::dbg::log("[WKI] Task cancel queued before publication: task_id=%u from 0x%04x", cancel->task_id, hdr->src_node);
         return;
     }
 
     uint64_t const LOCAL_PID = rt->local_pid;
+    if (rt->accept_pending) {
+        rt->accept_pending = false;
+        rt->discard_completion = true;
+    }
     auto* task = rt->task;
     bool drop_task_ref = false;
     if (task != nullptr && task->try_acquire()) {

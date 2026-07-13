@@ -449,8 +449,8 @@ def test_ipc_data_acks_after_ordered_dispatch() -> None:
     required = [
         "ch->channel_id == WKI_CHAN_IPC_DATA",
         "bool const IMM_ACK = ((ch->priority == PriorityClass::LATENCY || ch->channel_id == WKI_CHAN_IPC_DATA) && ch->ack_pending);",
-        "wki_dispatch_reliable_msg_ordered(ch, msg, hdr, payload, PAYLOAD_LEN);",
-        "wki_dispatch_reliable_msg_ordered(ch, RO_MSG, &RO_HDR, ro_data, RO_LEN);",
+        "wki_dispatch_reliable_msg_ordered(ch, RX_CHANNEL_GENERATION, msg, hdr, payload, PAYLOAD_LEN);",
+        "wki_dispatch_reliable_msg_ordered(ch, RO_CHANNEL_GENERATION, RO_MSG, &RO_HDR, ro_data, RO_LEN);",
         "complete_ack_transmit_for_generation_locked(ch, imm_ack_generation, imm_ack_num, tx_ret, notify_timer);",
     ]
     missing = [token for token in required if token not in body]
@@ -458,13 +458,13 @@ def test_ipc_data_acks_after_ordered_dispatch() -> None:
         fail("IPC_DATA post-dispatch ACK path is missing token(s): " + ", ".join(missing))
     require_order(
         body,
-        "wki_dispatch_reliable_msg_ordered(ch, msg, hdr, payload, PAYLOAD_LEN);",
+        "wki_dispatch_reliable_msg_ordered(ch, RX_CHANNEL_GENERATION, msg, hdr, payload, PAYLOAD_LEN);",
         "bool const IMM_ACK = ((ch->priority == PriorityClass::LATENCY || ch->channel_id == WKI_CHAN_IPC_DATA) && ch->ack_pending);",
         "IPC_DATA ACK gating must be computed after ordered local dispatch",
     )
     require_order(
         body,
-        "wki_dispatch_reliable_msg_ordered(ch, RO_MSG, &RO_HDR, ro_data, RO_LEN);",
+        "wki_dispatch_reliable_msg_ordered(ch, RO_CHANNEL_GENERATION, RO_MSG, &RO_HDR, ro_data, RO_LEN);",
         "bool const IMM_ACK = ((ch->priority == PriorityClass::LATENCY || ch->channel_id == WKI_CHAN_IPC_DATA) && ch->ack_pending);",
         "reordered IPC_DATA delivery must complete before the immediate ACK decision",
     )
@@ -500,8 +500,7 @@ def test_ipc_data_ordered_dispatch_wait_uses_explicit_daemon_wake() -> None:
 
     body = function_body(source, "wait_for_reliable_dispatch_turn")
     required = [
-        "uint32_t const GENERATION = ch->generation",
-        "ch->active && ch->generation == GENERATION",
+        "bool const ACTIVE = ch->active && ch->generation == generation",
         "current_task->type == ker::mod::sched::task::TaskType::DAEMON",
         "record_reliable_dispatch_waiter_locked(ch, current_task)",
         "ker::mod::sched::kern_block()",
@@ -514,6 +513,7 @@ def test_ipc_data_ordered_dispatch_wait_uses_explicit_daemon_wake() -> None:
     finish_body = function_body(source, "finish_reliable_dispatch_turn")
     required_finish = [
         "DispatchWaiterList waiters{}",
+        "ch->active && ch->generation == generation && ch->rx_dispatch_seq == seq",
         "rx_dispatch_seq++",
         "drain_reliable_dispatch_waiters_locked(ch, waiters)",
         "wake_reliable_dispatch_waiters(waiters)",

@@ -236,6 +236,45 @@ auto reliable_rx_peer_accepts(uint16_t src_node) -> bool {
     return peer != nullptr && reliable_rx_peer_state_accepts(peer->state);
 }
 
+auto message_uses_compute_lifecycle(MsgType type) -> bool {
+    switch (type) {
+        case MsgType::TASK_SUBMIT:
+        case MsgType::TASK_ACCEPT:
+        case MsgType::TASK_REJECT:
+        case MsgType::TASK_COMPLETE:
+        case MsgType::TASK_CANCEL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+class PeerLifecycleTryLease {
+   public:
+    PeerLifecycleTryLease() = default;
+    PeerLifecycleTryLease(const PeerLifecycleTryLease&) = delete;
+    auto operator=(const PeerLifecycleTryLease&) -> PeerLifecycleTryLease& = delete;
+
+    ~PeerLifecycleTryLease() { wki_peer_lifecycle_release(claimed_peer); }
+
+    auto try_acquire(uint16_t node_id) -> bool {
+        if (claimed_peer != nullptr) {
+            return false;
+        }
+        WkiPeer* peer = wki_peer_find(node_id);
+        if (!wki_peer_lifecycle_try_acquire(peer)) {
+            return false;
+        }
+        claimed_peer = peer;
+        return true;
+    }
+
+    [[nodiscard]] auto owns(uint16_t node_id) const -> bool { return claimed_peer != nullptr && claimed_peer->node_id == node_id; }
+
+   private:
+    WkiPeer* claimed_peer = nullptr;
+};
+
 void perf_record_transport_point(mod::perf::WkiPerfTransportOp op, uint16_t peer, uint16_t channel, int32_t status, uint32_t aux,
                                  uint32_t correlation, uint64_t callsite) {
     if (!mod::perf::is_wki_recording_enabled()) {
@@ -1658,13 +1697,21 @@ auto wki_channel_reserve(uint16_t peer_node, uint16_t channel_id, PriorityClass 
     return ch;
 }
 
-void wki_channel_close(WkiChannel* ch) {
-    if (ch == nullptr) {
-        return;
+auto wki_channel_close_generation(WkiChannel* ch, uint16_t expected_peer, uint16_t expected_channel_id, uint32_t expected_generation)
+    -> bool {
+    if (ch == nullptr || expected_generation == 0) {
+        return false;
     }
 
     s_channel_pool_lock.lock();
     ch->lock.lock();
+
+    if (!ch->active || ch->peer_node_id != expected_peer || ch->channel_id != expected_channel_id ||
+        ch->generation != expected_generation) {
+        ch->lock.unlock();
+        s_channel_pool_lock.unlock();
+        return false;
+    }
 
     DispatchWaiterList waiters{};
     uint16_t const PEER_NODE = ch->peer_node_id;
@@ -1674,6 +1721,37 @@ void wki_channel_close(WkiChannel* ch) {
     wki_channel_reset(ch);
 
     // Clear per-peer index entry
+    WkiPeer* peer = wki_peer_find(PEER_NODE);
+    if (peer != nullptr && CHANNEL_ID < WKI_MAX_CHANNELS && peer->channels.at(CHANNEL_ID) == ch) {
+        peer->channels.at(CHANNEL_ID) = nullptr;
+    }
+
+    ch->lock.unlock();
+    wake_reliable_dispatch_waiters(waiters);
+    s_channel_pool_lock.unlock();
+    return true;
+}
+
+void wki_channel_close(WkiChannel* ch) {
+    if (ch == nullptr) {
+        return;
+    }
+
+    s_channel_pool_lock.lock();
+    ch->lock.lock();
+    if (!ch->active) {
+        ch->lock.unlock();
+        s_channel_pool_lock.unlock();
+        return;
+    }
+
+    DispatchWaiterList waiters{};
+    uint16_t const PEER_NODE = ch->peer_node_id;
+    uint16_t const CHANNEL_ID = ch->channel_id;
+    ch->active = false;
+    drain_reliable_dispatch_waiters_locked(ch, waiters);
+    wki_channel_reset(ch);
+
     WkiPeer* peer = wki_peer_find(PEER_NODE);
     if (peer != nullptr && CHANNEL_ID < WKI_MAX_CHANNELS && peer->channels.at(CHANNEL_ID) == ch) {
         peer->channels.at(CHANNEL_ID) = nullptr;
@@ -1921,7 +1999,10 @@ auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint
 // Sending - reliable (via channel)
 // -----------------------------------------------------------------------------
 
-auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const void* payload, uint16_t payload_len) -> int {
+namespace {
+
+auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const void* payload, uint16_t payload_len,
+                   WkiChannel* expected_channel, uint32_t expected_generation) -> int {
     if (!g_wki.initialized) {
         return WKI_ERR_INVALID;
     }
@@ -1934,9 +2015,12 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
         return WKI_ERR_PEER_FENCED;
     }
 
-    WkiChannel* ch = wki_channel_get(dst_node, channel_id);
+    WkiChannel* ch = expected_channel != nullptr ? wki_channel_lookup(dst_node, channel_id) : wki_channel_get(dst_node, channel_id);
     if (ch == nullptr) {
-        return WKI_ERR_NO_MEM;
+        return expected_channel != nullptr ? WKI_ERR_NOT_FOUND : WKI_ERR_NO_MEM;
+    }
+    if (expected_channel != nullptr && ch != expected_channel) {
+        return WKI_ERR_NOT_FOUND;
     }
 
     WkiTransport* transport = find_transport_for_peer(dst_node);
@@ -1972,7 +2056,9 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
     ch->lock.lock();
     for (;;) {
         bool const CHANNEL_REUSED = heap_rt_prepare_attempted && ch->generation != heap_rt_channel_generation;
-        if (!ch->active || ch->peer_node_id != dst_node || ch->channel_id != channel_id || CHANNEL_REUSED) {
+        bool const EXPECTED_CHANNEL_RETIRED =
+            expected_channel != nullptr && (ch != expected_channel || ch->generation != expected_generation);
+        if (!ch->active || ch->peer_node_id != dst_node || ch->channel_id != channel_id || CHANNEL_REUSED || EXPECTED_CHANNEL_RETIRED) {
             ch->lock.unlock();
             delete[] heap_rt_data;
             delete heap_rt_entry;
@@ -2197,6 +2283,20 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
     return WKI_OK;
 }
 
+}  // namespace
+
+auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const void* payload, uint16_t payload_len) -> int {
+    return wki_send_impl(dst_node, channel_id, msg_type, payload, payload_len, nullptr, 0);
+}
+
+auto wki_send_on_channel_generation(uint16_t dst_node, WkiChannel* expected_channel, uint32_t expected_generation, MsgType msg_type,
+                                    const void* payload, uint16_t payload_len) -> int {
+    if (expected_channel == nullptr || expected_generation == 0) {
+        return WKI_ERR_INVALID;
+    }
+    return wki_send_impl(dst_node, WKI_CHAN_RESOURCE, msg_type, payload, payload_len, expected_channel, expected_generation);
+}
+
 // -----------------------------------------------------------------------------
 // RX Dispatch
 // -----------------------------------------------------------------------------
@@ -2205,7 +2305,8 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
 // Used for both in-order delivery and reorder buffer drain.
 namespace {
 
-void wki_dispatch_reliable_msg(MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+void wki_dispatch_reliable_msg(WkiChannel* rx_channel, uint32_t rx_channel_generation, MsgType type, const WkiHeader* hdr,
+                               const uint8_t* payload, uint16_t payload_len) {
     switch (type) {
         case MsgType::LSA:
             detail::handle_lsa(hdr, payload, payload_len);
@@ -2290,19 +2391,19 @@ void wki_dispatch_reliable_msg(MsgType type, const WkiHeader* hdr, const uint8_t
             detail::handle_dev_irq_fwd(hdr, payload, payload_len);
             break;
         case MsgType::TASK_SUBMIT:
-            detail::handle_task_submit(hdr, payload, payload_len);
+            detail::handle_task_submit(hdr, payload, payload_len, rx_channel, rx_channel_generation);
             break;
         case MsgType::TASK_ACCEPT:
-            detail::handle_task_accept(hdr, payload, payload_len);
+            detail::handle_task_accept(hdr, payload, payload_len, rx_channel, rx_channel_generation);
             break;
         case MsgType::TASK_REJECT:
-            detail::handle_task_reject(hdr, payload, payload_len);
+            detail::handle_task_reject(hdr, payload, payload_len, rx_channel, rx_channel_generation);
             break;
         case MsgType::TASK_COMPLETE:
-            detail::handle_task_complete(hdr, payload, payload_len);
+            detail::handle_task_complete(hdr, payload, payload_len, rx_channel, rx_channel_generation);
             break;
         case MsgType::TASK_CANCEL:
-            detail::handle_task_cancel(hdr, payload, payload_len);
+            detail::handle_task_cancel(hdr, payload, payload_len, rx_channel, rx_channel_generation);
             break;
         case MsgType::LOAD_REPORT:
             detail::handle_load_report(hdr, payload, payload_len);
@@ -2314,17 +2415,16 @@ void wki_dispatch_reliable_msg(MsgType type, const WkiHeader* hdr, const uint8_t
 
 auto reliable_dispatch_needs_serial_order(const WkiChannel* ch) -> bool { return ch != nullptr && ch->channel_id == WKI_CHAN_IPC_DATA; }
 
-auto wait_for_reliable_dispatch_turn(WkiChannel* ch, uint32_t seq) -> bool {
+auto wait_for_reliable_dispatch_turn(WkiChannel* ch, uint32_t generation, uint32_t seq) -> bool {
     if (!reliable_dispatch_needs_serial_order(ch)) {
         return true;
     }
 
-    uint32_t const GENERATION = ch->generation;
     auto* current_task = ker::mod::sched::get_current_task();
     for (;;) {
         bool should_block = false;
         ch->lock.lock();
-        bool const ACTIVE = ch->active && ch->generation == GENERATION;
+        bool const ACTIVE = ch->active && ch->generation == generation;
         uint32_t const NEXT_DISPATCH = ch->rx_dispatch_seq;
         if (!ACTIVE || seq_before(seq, NEXT_DISPATCH)) {
             ch->lock.unlock();
@@ -2345,14 +2445,14 @@ auto wait_for_reliable_dispatch_turn(WkiChannel* ch, uint32_t seq) -> bool {
     }
 }
 
-void finish_reliable_dispatch_turn(WkiChannel* ch, uint32_t seq) {
+void finish_reliable_dispatch_turn(WkiChannel* ch, uint32_t generation, uint32_t seq) {
     if (!reliable_dispatch_needs_serial_order(ch)) {
         return;
     }
 
     ch->lock.lock();
     DispatchWaiterList waiters{};
-    if (ch->active && ch->rx_dispatch_seq == seq) {
+    if (ch->active && ch->generation == generation && ch->rx_dispatch_seq == seq) {
         ch->rx_dispatch_seq++;
         drain_reliable_dispatch_waiters_locked(ch, waiters);
     }
@@ -2360,14 +2460,15 @@ void finish_reliable_dispatch_turn(WkiChannel* ch, uint32_t seq) {
     wake_reliable_dispatch_waiters(waiters);
 }
 
-void wki_dispatch_reliable_msg_ordered(WkiChannel* ch, MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+void wki_dispatch_reliable_msg_ordered(WkiChannel* ch, uint32_t generation, MsgType type, const WkiHeader* hdr, const uint8_t* payload,
+                                       uint16_t payload_len) {
     uint32_t const SEQ = hdr != nullptr ? hdr->seq_num : 0U;
-    if (!wait_for_reliable_dispatch_turn(ch, SEQ)) {
+    if (!wait_for_reliable_dispatch_turn(ch, generation, SEQ)) {
         return;
     }
 
-    wki_dispatch_reliable_msg(type, hdr, payload, payload_len);
-    finish_reliable_dispatch_turn(ch, SEQ);
+    wki_dispatch_reliable_msg(ch, generation, type, hdr, payload, payload_len);
+    finish_reliable_dispatch_turn(ch, generation, SEQ);
 }
 
 }  // namespace
@@ -2436,6 +2537,14 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
 
         fwd_transport->tx(fwd_transport, NEXT_HOP, fwd_frame, len);
         delete[] fwd_frame;
+        return;
+    }
+
+    // TASK_* handlers publish or retire scheduler-visible state. Serialize
+    // their channel lookup and synchronous dispatch with HELLO/fence cleanup;
+    // RX cannot wait here, so contention drops the reliable frame for retry.
+    PeerLifecycleTryLease compute_lifecycle;
+    if (message_uses_compute_lifecycle(msg) && !compute_lifecycle.try_acquire(hdr->src_node)) {
         return;
     }
 
@@ -2682,6 +2791,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 }
                 ch->ack_pending = true;
                 ch->bytes_received += PAYLOAD_LEN;
+                uint32_t const RX_CHANNEL_GENERATION = ch->generation;
 
                 bool notify_timer = false;
                 ch->lock.unlock();
@@ -2689,11 +2799,12 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 mark_peer_rx_progress(hdr->src_node);
 
                 // Dispatch to handler via shared helper
-                wki_dispatch_reliable_msg_ordered(ch, msg, hdr, payload, PAYLOAD_LEN);
+                wki_dispatch_reliable_msg_ordered(ch, RX_CHANNEL_GENERATION, msg, hdr, payload, PAYLOAD_LEN);
 
                 // Deliver any buffered reorder entries that are now in-order
                 ch->lock.lock();
-                if (!ch->active || ch->peer_node_id != hdr->src_node || ch->channel_id != hdr->channel_id) {
+                if (!ch->active || ch->generation != RX_CHANNEL_GENERATION || ch->peer_node_id != hdr->src_node ||
+                    ch->channel_id != hdr->channel_id) {
                     ch->lock.unlock();
                     return;
                 }
@@ -2702,6 +2813,18 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     ch->ack_pending_since_us = 0;
                 }
                 while ((ch->reorder_head != nullptr) && ch->reorder_head->seq == ch->rx_seq) {
+                    auto const RO_MSG = static_cast<MsgType>(ch->reorder_head->msg_type);
+                    // A TASK_* packet may have been buffered by an earlier RX
+                    // call whose lifecycle lease ended before this gap-filling
+                    // packet arrived. Admit the deferred dispatch before
+                    // consuming the reorder entry or advancing rx_seq. On
+                    // contention, leave it queued and unacknowledged so the
+                    // reliable sender retries after peer cleanup completes.
+                    if (message_uses_compute_lifecycle(RO_MSG) && !compute_lifecycle.owns(hdr->src_node) &&
+                        !compute_lifecycle.try_acquire(hdr->src_node)) {
+                        break;
+                    }
+
                     WkiReorderEntry* ro = ch->reorder_head;
                     ch->reorder_head = ro->next;
                     ch->reorder_count--;
@@ -2715,18 +2838,19 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     ch->bytes_received += ro->len;
 
                     WkiHeader const RO_HDR = ro->hdr;
-                    auto const RO_MSG = static_cast<MsgType>(ro->msg_type);
                     uint8_t* ro_data = ro->data;
                     uint16_t const RO_LEN = ro->len;
+                    uint32_t const RO_CHANNEL_GENERATION = ro->channel_generation;
                     ch->lock.unlock();
 
                     // Re-dispatch reordered message through the same handler switch
-                    wki_dispatch_reliable_msg_ordered(ch, RO_MSG, &RO_HDR, ro_data, RO_LEN);
+                    wki_dispatch_reliable_msg_ordered(ch, RO_CHANNEL_GENERATION, RO_MSG, &RO_HDR, ro_data, RO_LEN);
 
                     delete[] ro_data;
                     delete ro;
                     ch->lock.lock();
-                    if (!ch->active || ch->peer_node_id != hdr->src_node || ch->channel_id != hdr->channel_id) {
+                    if (!ch->active || ch->generation != RX_CHANNEL_GENERATION || ch->peer_node_id != hdr->src_node ||
+                        ch->channel_id != hdr->channel_id) {
                         ch->lock.unlock();
                         return;
                     }
@@ -2817,6 +2941,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                                 ro->len = PAYLOAD_LEN;
                                 ro->msg_type = hdr->msg_type;
                                 ro->seq = hdr->seq_num;
+                                ro->channel_generation = ch->generation;
 
                                 // Insert sorted by seq.
                                 WkiReorderEntry** pp = &ch->reorder_head;
