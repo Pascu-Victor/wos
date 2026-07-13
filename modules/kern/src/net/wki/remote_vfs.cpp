@@ -2449,17 +2449,15 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     std::array<uint8_t, VFS_DIRECT_READ_STACK_SIZE> direct_read_buf{};
 
     while (remaining > 0) {
-        bool const USING_CACHE = ALLOW_READ_CACHES && !POSITIONAL_READ && remaining >= VFS_CACHE_SIZE;
+        bool const SHOULD_READ_AHEAD = ALLOW_READ_CACHES && !POSITIONAL_READ && remaining < VFS_CACHE_SIZE;
+        if (SHOULD_READ_AHEAD && ctx->read_cache == nullptr) {
+            ctx->read_cache = new (std::nothrow) ReadAheadCache();  // NOLINT(cppcoreguidelines-owning-memory)
+        }
+        bool const USING_CACHE = SHOULD_READ_AHEAD && ctx->read_cache != nullptr;
         auto fetch_size = USING_CACHE ? static_cast<uint32_t>(VFS_CACHE_SIZE) : std::min(remaining, VFS_DIRECT_READ_STACK_SIZE);
         fetch_size = std::min(fetch_size, max_resp_data);
 
         uint8_t* fetch_dest = direct_read_buf.data();
-        if (USING_CACHE && ctx->read_cache == nullptr) {
-            ctx->read_cache = new ReadAheadCache();  // NOLINT(cppcoreguidelines-owning-memory)
-            if (ctx->read_cache == nullptr) {
-                return (total_read > 0) ? total_read : -ENOMEM;
-            }
-        }
         if (USING_CACHE) {
             fetch_dest = ctx->read_cache->data.data();
         }

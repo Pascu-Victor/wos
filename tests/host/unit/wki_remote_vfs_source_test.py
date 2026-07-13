@@ -220,6 +220,34 @@ def test_shared_io_callers_timeout_or_fallback() -> None:
     )
 
 
+def test_message_fallback_readahead_targets_small_sequential_reads() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    read_body = function_body(source, "remote_vfs_read")
+
+    require_order(
+        read_body,
+        [
+            "bool const SHOULD_READ_AHEAD = ALLOW_READ_CACHES && !POSITIONAL_READ && remaining < VFS_CACHE_SIZE",
+            "if (SHOULD_READ_AHEAD && ctx->read_cache == nullptr)",
+            "ctx->read_cache = new (std::nothrow) ReadAheadCache()",
+            "bool const USING_CACHE = SHOULD_READ_AHEAD && ctx->read_cache != nullptr",
+            "auto fetch_size = USING_CACHE ? static_cast<uint32_t>(VFS_CACHE_SIZE) : std::min(remaining, VFS_DIRECT_READ_STACK_SIZE)",
+            "uint8_t* fetch_dest = direct_read_buf.data()",
+            "if (USING_CACHE)",
+            "fetch_dest = ctx->read_cache->data.data()",
+            "ctx->read_cache->cached_offset = cur_offset",
+            "ctx->read_cache->cached_len = BYTES_READ",
+            "auto to_copy = static_cast<uint16_t>(std::min(static_cast<uint32_t>(BYTES_READ), remaining))",
+            "remaining -= to_copy",
+        ],
+        "message fallback small-read read-ahead",
+    )
+    if "remaining >= VFS_CACHE_SIZE" in read_body:
+        fail("message fallback must not reserve read-ahead for already-full cache-sized reads")
+    if "return (total_read > 0) ? total_read : -ENOMEM" in read_body:
+        fail("optional message read-ahead allocation failure must use the direct stack path")
+
+
 def test_remote_open_closes_server_fd_on_local_allocation_failure() -> None:
     source = REMOTE_VFS_CPP.read_text()
     helper_body = function_body(source, "remote_vfs_close_remote_fd_best_effort")
@@ -573,6 +601,7 @@ def main() -> None:
     test_proxy_operations_fail_before_setup_when_slot_wait_times_out()
     test_shared_io_slot_waits_are_bounded()
     test_shared_io_callers_timeout_or_fallback()
+    test_message_fallback_readahead_targets_small_sequential_reads()
     test_remote_open_closes_server_fd_on_local_allocation_failure()
     test_normal_remote_close_flushes_then_sends_without_response_wait()
     test_export_lookup_returns_locked_snapshot()
