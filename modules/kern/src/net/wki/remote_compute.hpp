@@ -49,9 +49,13 @@ struct SubmittedTask {
     std::atomic<bool> response_pending{false};
     uint8_t accept_status = 0;                    // TaskRejectReason
     WkiWaitEntry* response_wait_entry = nullptr;  // V2 I-4: async wait for TASK_ACCEPT/REJECT
+    // Handler ownership clears response_wait_entry before waking. Keep the
+    // caller pinned separately until it refinds this row and consumes status.
+    WkiWaitEntry* response_consumer_wait_entry = nullptr;
 
     std::atomic<bool> complete_pending{false};
     WkiWaitEntry* complete_wait_entry = nullptr;  // V2 I-4: async wait for TASK_COMPLETE
+    WkiWaitEntry* complete_consumer_wait_entry = nullptr;
     int32_t exit_status = 0;
     uint64_t accepted_at_us = 0;
     uint64_t complete_received_at_us = 0;
@@ -59,6 +63,11 @@ struct SubmittedTask {
     // V2 A7: Proxy task pointer - kept alive in WAITING state until remote completes
     ker::mod::sched::task::Task* local_task = nullptr;
     bool proxy_ready = false;
+    // An accepted direct-submit ID remains a valid one-shot wait handle until
+    // wki_try_remote_spawn transfers it to proxy ownership or wki_task_wait
+    // consumes the terminal result.
+    bool result_handle_owned = false;
+    bool reclaim_requested = false;
     // Completion can arrive before the exec handoff has parked the local
     // proxy. Keep an owned copy for wki_proxy_task_blocked() rather than a raw
     // task/File pointer across the compute lock.
@@ -82,13 +91,17 @@ struct SubmittedTask {
           response_pending(o.response_pending.load(std::memory_order_relaxed)),
           accept_status(o.accept_status),
           response_wait_entry(o.response_wait_entry),
+          response_consumer_wait_entry(o.response_consumer_wait_entry),
           complete_pending(o.complete_pending.load(std::memory_order_relaxed)),
           complete_wait_entry(o.complete_wait_entry),
+          complete_consumer_wait_entry(o.complete_consumer_wait_entry),
           exit_status(o.exit_status),
           accepted_at_us(o.accepted_at_us),
           complete_received_at_us(o.complete_received_at_us),
           local_task(o.local_task),
           proxy_ready(o.proxy_ready),
+          result_handle_owned(o.result_handle_owned),
+          reclaim_requested(o.reclaim_requested),
           pending_proxy_output(o.pending_proxy_output),
           pending_proxy_output_len(o.pending_proxy_output_len),
           ipc_fd_map(o.ipc_fd_map),
@@ -107,13 +120,17 @@ struct SubmittedTask {
             response_pending.store(o.response_pending.load(std::memory_order_relaxed), std::memory_order_relaxed);
             accept_status = o.accept_status;
             response_wait_entry = o.response_wait_entry;
+            response_consumer_wait_entry = o.response_consumer_wait_entry;
             complete_pending.store(o.complete_pending.load(std::memory_order_relaxed), std::memory_order_relaxed);
             complete_wait_entry = o.complete_wait_entry;
+            complete_consumer_wait_entry = o.complete_consumer_wait_entry;
             exit_status = o.exit_status;
             accepted_at_us = o.accepted_at_us;
             complete_received_at_us = o.complete_received_at_us;
             local_task = o.local_task;
             proxy_ready = o.proxy_ready;
+            result_handle_owned = o.result_handle_owned;
+            reclaim_requested = o.reclaim_requested;
             delete[] pending_proxy_output;
             pending_proxy_output = o.pending_proxy_output;
             pending_proxy_output_len = o.pending_proxy_output_len;
@@ -337,6 +354,8 @@ auto wki_remote_compute_selftest_cleanup_marks_unready_proxy_failure() -> bool;
 auto wki_remote_compute_selftest_proxy_wait_completion_respects_publish_fence() -> bool;
 auto wki_remote_compute_selftest_task_wait_consumes_completed_row() -> bool;
 auto wki_remote_compute_selftest_task_wait_timeout_preserves_successor() -> bool;
+auto wki_remote_compute_selftest_submitted_slots_reclaim_safely() -> bool;
+auto wki_remote_compute_selftest_task_id_wrap_is_safe() -> bool;
 auto wki_remote_compute_selftest_load_snapshot_survives_cleanup() -> bool;
 auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool;
 auto wki_remote_compute_selftest_submit_worker_count_is_bounded() -> bool;

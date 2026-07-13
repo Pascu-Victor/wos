@@ -17,6 +17,12 @@ KTEST(WkiRemoteCompute, TaskWaitTimeoutPreservesSuccessor) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_task_wait_timeout_preserves_successor());
 }
 
+KTEST(WkiRemoteCompute, SubmittedSlotsReclaimSafely) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_submitted_slots_reclaim_safely());
+}
+
+KTEST(WkiRemoteCompute, TaskIdWrapIsSafe) { KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_task_id_wrap_is_safe()); }
+
 KTEST(WkiRemoteCompute, LoadSnapshotSurvivesCleanup) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_load_snapshot_survives_cleanup());
 }

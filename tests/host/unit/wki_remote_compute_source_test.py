@@ -139,6 +139,8 @@ def test_task_wait_consumes_completed_submitted_row() -> None:
     inactive_block = body[body.find("if (!task->active)") : body.find("// V2 I-4")]
     for snippet in [
         "COMPLETED_EXIT_STATUS = task->exit_status",
+        "consume_submitted_task_result_locked(task)",
+        "delete[] discarded_output",
         "*exit_status = COMPLETED_EXIT_STATUS",
         "return 0",
     ]:
@@ -148,6 +150,44 @@ def test_task_wait_consumes_completed_submitted_row() -> None:
         fail("wki_task_wait must not use the active-only submitted-task lookup")
     if "wki_remote_compute_selftest_task_wait_consumes_completed_row" not in source:
         fail("remote-compute KTEST selftest must cover waiting after TASK_COMPLETE made the row inactive")
+    require_order(
+        inactive_block,
+        "COMPLETED_EXIT_STATUS = task->exit_status",
+        "consume_submitted_task_result_locked(task)",
+        "wki_task_wait must copy terminal status before recycling its one-shot row",
+    )
+    require_tokens(
+        body,
+        [
+            "!task->result_handle_owned",
+            "task->response_consumer_wait_entry != nullptr",
+            "!task->active && task->complete_consumer_wait_entry != nullptr",
+        ],
+        "exclusive one-shot result ownership",
+    )
+    consume_body = function_body(source, "consume_submitted_task_result_locked")
+    require_tokens(
+        consume_body,
+        [
+            "task->pending_proxy_output = nullptr",
+            "task->local_task = nullptr",
+            "task->result_handle_owned = false",
+            "request_submitted_task_reclaim_locked(task)",
+        ],
+        "direct result proxy/output detachment",
+    )
+    selftest = function_body(source, "wki_remote_compute_selftest_task_wait_consumes_completed_row")
+    require_tokens(
+        selftest,
+        [
+            "task.complete_consumer_wait_entry = &in_flight_consumer",
+            "BLOCKED_WAIT_RC = wki_task_wait",
+            "CONSUMER_PIN_PRESERVED",
+            "stored->complete_consumer_wait_entry = nullptr",
+            "SECOND_WAIT_RC = wki_task_wait",
+        ],
+        "one-shot in-flight consumer regression",
+    )
 
 
 def test_task_wait_completion_slot_is_single_owner() -> None:
@@ -162,6 +202,7 @@ def test_task_wait_completion_slot_is_single_owner() -> None:
             "task->complete_pending.load(std::memory_order_acquire)",
             "return false",
             "task->complete_wait_entry = &wait",
+            "task->complete_consumer_wait_entry = &wait",
             "task->complete_pending.store(true, std::memory_order_release)",
         ],
         "task wait publish helper",
@@ -172,8 +213,11 @@ def test_task_wait_completion_slot_is_single_owner() -> None:
         clear_body,
         [
             "WAIT_SLOT_OWNED = task->complete_wait_entry == &wait",
+            "WAIT_CONSUMER_OWNED = task->complete_consumer_wait_entry == &wait",
             "if (WAIT_SLOT_OWNED)",
             "task->complete_wait_entry = nullptr",
+            "if (WAIT_CONSUMER_OWNED)",
+            "task->complete_consumer_wait_entry = nullptr",
             "wait_result == WKI_ERR_TIMEOUT && WAIT_SLOT_OWNED",
             "task->complete_pending.store(false, std::memory_order_release)",
         ],
@@ -262,6 +306,135 @@ def test_remote_load_procfs_uses_locked_snapshot() -> None:
     require_tokens(source, [f"auto {token}() -> bool"], "remote load snapshot selftest implementation")
     require_tokens(header, [f"auto {token}() -> bool;"], "remote load snapshot selftest declaration")
     require_tokens(ktest, ["LoadSnapshotSurvivesCleanup", token], "remote load snapshot KTEST coverage")
+
+
+def test_submitted_task_slots_are_indexed_and_reclaimed() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    header = REMOTE_COMPUTE_HPP.read_text()
+    ktest = REMOTE_COMPUTE_KTEST.read_text()
+
+    require_tokens(
+        source,
+        [
+            "constexpr size_t WKI_SUBMITTED_TASK_INDEX_BUCKETS = 1024",
+            "struct SubmittedTaskSlot",
+            "std::deque<SubmittedTaskSlot> g_submitted_tasks",
+            "std::array<SubmittedTaskSlot*, WKI_SUBMITTED_TASK_INDEX_BUCKETS>",
+            "SubmittedTaskSlot* s_submitted_task_free = nullptr",
+            "size_t s_submitted_task_count = 0",
+            "auto find_submitted_task_slot_locked(uint32_t task_id) -> SubmittedTaskSlot*",
+            "auto publish_submitted_task_locked(SubmittedTask&& task) -> SubmittedTask*",
+            "auto allocate_submitted_task_id_locked() -> uint32_t",
+        ],
+        "stable indexed submitted-task slots",
+    )
+    if "g_next_task_id++" in source:
+        fail("submitted task IDs must not use raw wrapping increment")
+
+    lookup_body = function_body(source, "find_submitted_task_slot_locked")
+    require_tokens(
+        lookup_body,
+        [
+            "s_submitted_task_index.at(submitted_task_bucket(task_id))",
+            "slot = slot->id_next",
+            "slot->occupied && slot->task.task_id == task_id",
+        ],
+        "allocation-free submitted-task lookup",
+    )
+    allocator_body = function_body(source, "allocate_submitted_task_id_locked")
+    require_tokens(
+        allocator_body,
+        [
+            "s_submitted_task_count >= UINT32_MAX",
+            "return 0",
+            "CANDIDATE == UINT32_MAX ? 1U : CANDIDATE + 1U",
+            "CANDIDATE != 0",
+            "find_submitted_task_slot_locked(CANDIDATE) == nullptr",
+        ],
+        "nonzero collision-safe submitted-task IDs",
+    )
+
+    eligibility = function_body(source, "submitted_task_can_reclaim_locked")
+    require_tokens(
+        eligibility,
+        [
+            "task.reclaim_requested",
+            "!task.active",
+            "task.response_consumer_wait_entry == nullptr",
+            "task.complete_consumer_wait_entry == nullptr",
+            "!task.result_handle_owned",
+            "task.local_task == nullptr",
+            "task.pending_proxy_output == nullptr",
+        ],
+        "consumer-pinned submitted-task reclamation",
+    )
+    if "ipc_fd_count" in eligibility or "cleanup_submitted_ipc_exports" in function_body(source, "reclaim_submitted_task_if_safe_locked"):
+        fail("historical IPC metadata must not pin rows or move IPC teardown into slot reclamation")
+
+    submit_sections = {
+        "wki_task_submit_inline": source[
+            source.index("auto wki_task_submit_inline(") : source.index("auto wki_task_submit_vfs_ref(")
+        ],
+        "wki_task_submit_vfs_ref": source[
+            source.index("auto wki_task_submit_vfs_ref(") : source.index("auto wki_task_wait(")
+        ],
+    }
+    for submit_name, submit_body in submit_sections.items():
+        require_tokens(
+            submit_body,
+            [
+                "allocate_submitted_task_id_locked()",
+                "st.result_handle_owned = true",
+                "publish_submitted_task_locked(std::move(st))",
+                "task_ptr->response_consumer_wait_entry = &wait",
+                "discarded_output = consume_submitted_task_result_locked(task_ptr)",
+                "delete[] discarded_output",
+            ],
+            f"{submit_name} indexed publication and terminal retirement",
+        )
+        if submit_body.count("consume_submitted_task_result_locked(task_ptr)") < 4:
+            fail(f"{submit_name} must detach captured output on every terminal submit-failure path")
+
+    require_tokens(
+        function_body(source, "wki_try_remote_spawn"),
+        [
+            "st->result_handle_owned = false",
+            "st->complete_pending.store(false, std::memory_order_release)",
+            "request_submitted_task_reclaim(tid)",
+        ],
+        "proxy handle transfer and early-completion retirement",
+    )
+    require_tokens(
+        function_body(source, "wki_proxy_task_blocked"),
+        [
+            "submitted->complete_pending.store(false, std::memory_order_release)",
+            "request_submitted_task_reclaim(TASK_ID)",
+        ],
+        "blocked proxy completion retirement",
+    )
+
+    require_tokens(
+        header,
+        [
+            "WkiWaitEntry* response_consumer_wait_entry = nullptr",
+            "WkiWaitEntry* complete_consumer_wait_entry = nullptr",
+            "bool result_handle_owned = false",
+            "bool reclaim_requested = false",
+            "wki_remote_compute_selftest_submitted_slots_reclaim_safely",
+            "wki_remote_compute_selftest_task_id_wrap_is_safe",
+        ],
+        "submitted-task ownership state and selftests",
+    )
+    require_tokens(
+        ktest,
+        [
+            "SubmittedSlotsReclaimSafely",
+            "TaskIdWrapIsSafe",
+            "wki_remote_compute_selftest_submitted_slots_reclaim_safely",
+            "wki_remote_compute_selftest_task_id_wrap_is_safe",
+        ],
+        "submitted-slot KTEST registration",
+    )
 
 
 def test_load_report_uses_cpu_accounting_and_shared_local_cache() -> None:
@@ -1042,6 +1215,7 @@ def main() -> None:
     test_proxy_wait_completion_respects_waitpid_publish_fence()
     test_task_wait_consumes_completed_submitted_row()
     test_task_wait_completion_slot_is_single_owner()
+    test_submitted_task_slots_are_indexed_and_reclaimed()
     test_remote_load_procfs_uses_locked_snapshot()
     test_load_report_uses_cpu_accounting_and_shared_local_cache()
     test_receiver_path_localization_bounds_suffix_scan()
