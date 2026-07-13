@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BENCH_SCRIPTS = ROOT / "scripts" / "bench"
 CLUSTER_SCRIPTS = ROOT / "scripts" / "cluster"
 REMOTE_SCRIPTS = ROOT / "scripts" / "remote"
+LINUX_CLUSTER_CONFIG = CLUSTER_SCRIPTS / "linux_cluster_config.py"
 
 
 def run_command(
@@ -50,6 +51,19 @@ def ping_once(host: str) -> bool:
         ["ping", "-c", "1", "-W", "1", host], cwd=ROOT, capture_output=True, text=True
     )
     return result.returncode == 0
+
+
+def parse_linux_resource_rows(text: str) -> list[dict[str, int]]:
+    resources: list[dict[str, int]] = []
+    for line in text.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 3:
+            raise RuntimeError(f"invalid Linux cluster resource row: {line!r}")
+        node_id, vcpus, memory_kib = (int(field) for field in fields)
+        resources.append(
+            {"node_id": node_id, "vcpus": vcpus, "memory_kib": memory_kib}
+        )
+    return resources
 
 
 def check_lan(router_ip: str, host_ip: str, ubuntu_hosts: list[str]) -> int:
@@ -192,6 +206,24 @@ def run_suite(args: argparse.Namespace) -> int:
 
 
 def prepare_linux_cluster(args: argparse.Namespace) -> int:
+    resources: list[dict[str, int]] = []
+    if args.cluster_config:
+        resource_cmd = [
+            sys.executable,
+            str(LINUX_CLUSTER_CONFIG),
+            "resources",
+            "--config",
+            args.cluster_config,
+            "--num-vms",
+            str(args.num_vms),
+        ]
+        print("[linux-up] validating per-node VM resources")
+        resources = parse_linux_resource_rows(run_command(resource_cmd).stdout)
+        if [resource["node_id"] for resource in resources] != list(
+            range(args.num_vms)
+        ):
+            raise RuntimeError("Linux cluster resource preflight returned unexpected node ids")
+
     cluster_setup_cmd = [str(CLUSTER_SCRIPTS / "cluster_setup.py"), "--setup"]
     if args.cluster_config:
         cluster_setup_cmd += ["--config", args.cluster_config]
@@ -203,6 +235,8 @@ def prepare_linux_cluster(args: argparse.Namespace) -> int:
         str(args.num_vms),
         "--detach",
     ]
+    if args.cluster_config:
+        launch_cmd += ["--cluster-config", args.cluster_config]
     if args.skip:
         launch_cmd += ["--skip", str(args.skip)]
     print("[linux-up] launching Ubuntu VMs in detached mode")
@@ -214,6 +248,9 @@ def prepare_linux_cluster(args: argparse.Namespace) -> int:
         "host_ip": args.host_ip,
         "num_vms": args.num_vms,
         "skip": args.skip,
+        "launched_vms": args.num_vms - args.skip,
+        "cluster_config": args.cluster_config,
+        "resources": resources,
         "router_reachable": ping_once(args.router_ip),
         "provisioned_hosts": [],
     }
@@ -280,7 +317,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     linux_up_parser.add_argument("--num-vms", type=int, default=2)
     linux_up_parser.add_argument("--skip", type=int, default=0)
-    linux_up_parser.add_argument("--cluster-config")
+    linux_up_parser.add_argument(
+        "--cluster-config",
+        help="Use the same cluster config for host topology and per-node Linux VM CPU/memory resources.",
+    )
     linux_up_parser.add_argument("--router-ip", default="10.10.0.1")
     linux_up_parser.add_argument("--host-ip", default="10.10.0.100")
     linux_up_parser.add_argument("--wait-seconds", type=int, default=30)
@@ -364,6 +404,10 @@ def main() -> int:
     if args.command == "check-lan":
         return check_lan(args.router_ip, args.host_ip, args.ubuntu_host)
     if args.command == "linux-up":
+        if args.num_vms <= 0:
+            parser.error("linux-up --num-vms must be greater than zero")
+        if not 0 <= args.skip < args.num_vms:
+            parser.error("linux-up --skip must be at least zero and less than --num-vms")
         return prepare_linux_cluster(args)
     if args.command == "linux-down":
         return stop_linux_cluster()

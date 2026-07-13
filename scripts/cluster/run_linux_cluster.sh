@@ -4,11 +4,13 @@ set -euo pipefail
 WOS_ROOT="${WOS_WORKSPACE_ROOT:-$(git -C "$(dirname "$0")" rev-parse --show-toplevel)}"
 cd "$WOS_ROOT"
 
-NUM_VMS="${1:-2}"
+NUM_VMS=2
+NUM_VMS_SET=0
 SKIP=0
 DETACH=0
 STOP=0
 STATUS=0
+CLUSTER_CONFIG=""
 
 BASE_DOMAIN="${WOS_LINUX_BASE_DOMAIN:-ubuntu25.10}"
 LIBVIRT_URI="${WOS_LINUX_LIBVIRT_URI:-qemu:///system}"
@@ -21,11 +23,24 @@ NVRAM_DIR="${WOS_LINUX_NVRAM_DIR:-/var/lib/libvirt/qemu/nvram}"
 OVMF_VARS_TEMPLATE="${WOS_LINUX_OVMF_VARS_TEMPLATE:-/usr/share/edk2/x64/OVMF_VARS.4m.fd}"
 STATE_DIR="${WOS_LINUX_STATE_DIR:-cluster-data/linux-cluster-state}"
 DOMAIN_FILE="${STATE_DIR}/domains.tsv"
+RESOURCE_HELPER="${WOS_ROOT}/scripts/cluster/linux_cluster_config.py"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --skip requires a node index." >&2
+        exit 2
+      fi
       SKIP="$2"
+      shift 2
+      ;;
+    --cluster-config)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --cluster-config requires a path." >&2
+        exit 2
+      fi
+      CLUSTER_CONFIG="$2"
       shift 2
       ;;
     --detach)
@@ -40,14 +55,21 @@ while [[ $# -gt 0 ]]; do
       STATUS=1
       shift
       ;;
+    --*)
+      echo "ERROR: unknown option '$1'." >&2
+      exit 2
+      ;;
     *)
+      if [[ "$NUM_VMS_SET" == "1" ]]; then
+        echo "ERROR: multiple VM counts were provided." >&2
+        exit 2
+      fi
       NUM_VMS="$1"
+      NUM_VMS_SET=1
       shift
       ;;
   esac
 done
-
-mkdir -p "$STATE_DIR"
 
 run_virsh() {
   sudo virsh -c "$LIBVIRT_URI" "$@"
@@ -201,6 +223,43 @@ if [[ "$STATUS" == "1" ]]; then
   exit $?
 fi
 
+if [[ ! "$NUM_VMS" =~ ^[0-9]+$ || "$NUM_VMS" -le 0 ]]; then
+  echo "ERROR: VM count must be a positive integer." >&2
+  exit 2
+fi
+if [[ ! "$SKIP" =~ ^[0-9]+$ || "$SKIP" -lt 0 || "$SKIP" -ge "$NUM_VMS" ]]; then
+  echo "ERROR: --skip must be an integer from 0 through VM count minus one." >&2
+  exit 2
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "ERROR: python3 is required on the host." >&2
+  exit 1
+fi
+
+declare -a NODE_VCPUS=()
+declare -a NODE_MEMORY_KIB=()
+if [[ -n "$CLUSTER_CONFIG" ]]; then
+  RESOURCE_ROWS="$(
+    python3 "$RESOURCE_HELPER" resources \
+      --config "$CLUSTER_CONFIG" \
+      --num-vms "$NUM_VMS"
+  )"
+  while IFS=$'\t' read -r node_id node_vcpus node_memory_kib; do
+    [[ -z "$node_id" ]] && continue
+    NODE_VCPUS[node_id]="$node_vcpus"
+    NODE_MEMORY_KIB[node_id]="$node_memory_kib"
+  done <<< "$RESOURCE_ROWS"
+
+  for ((i = 0; i < NUM_VMS; i++)); do
+    if [[ ! -v "NODE_VCPUS[$i]" || ! -v "NODE_MEMORY_KIB[$i]" ]]; then
+      echo "ERROR: cluster config did not resolve resources for node ${i}." >&2
+      exit 2
+    fi
+  done
+fi
+
+mkdir -p "$STATE_DIR"
+
 if ! command -v qemu-img >/dev/null 2>&1; then
   echo "ERROR: qemu-img is required on the host." >&2
   exit 1
@@ -246,6 +305,8 @@ fi
 declare -a CREATED_DOMAINS=()
 declare -a CREATED_TAPS=()
 TMP_XML="$(mktemp)"
+CURRENT_DOMAIN_XML=""
+CURRENT_DEFINED_XML=""
 run_virsh dumpxml "$BASE_DOMAIN" > "$TMP_XML"
 LAN_MTU="$(bridge_mtu)"
 
@@ -259,7 +320,7 @@ cleanup() {
     cleanup_tap "$tap_name"
   done
   stop_cluster >/dev/null 2>&1 || true
-  rm -f "$TMP_XML"
+  rm -f "$TMP_XML" "$CURRENT_DOMAIN_XML" "$CURRENT_DEFINED_XML"
 }
 trap cleanup EXIT INT TERM
 
@@ -269,9 +330,11 @@ for ((i = SKIP; i < NUM_VMS; i++)); do
   nvram_path="${NVRAM_DIR}/${domain_name}_VARS.fd"
   tap_name="${LAN_TAP_PREFIX}${i}"
   mac_addr="52:54:00:22:34:$(printf '%02x' $((0x80 + i)))"
-  domain_xml="$(mktemp)"
+  CURRENT_DOMAIN_XML="$(mktemp)"
+  domain_xml="$CURRENT_DOMAIN_XML"
 
   cleanup_domain "$domain_name" "$disk_path" "$nvram_path" "$tap_name"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$domain_name" "$disk_path" "$nvram_path" "$mac_addr" "$tap_name" >> "$DOMAIN_FILE"
   ensure_tap "$tap_name" "$LAN_MTU"
 
   echo "--- Cloning Ubuntu VM${i} from libvirt domain '${BASE_DOMAIN}' ---"
@@ -280,92 +343,51 @@ for ((i = SKIP; i < NUM_VMS; i++)); do
   patch_guest_identity "$disk_path" "$domain_name" "$mac_addr"
 
   cp "$TMP_XML" "$domain_xml"
-  python3 - "$domain_xml" "$domain_name" "$BASE_DISK" "$disk_path" "$nvram_path" "$tap_name" "$mac_addr" <<'PY'
-from pathlib import Path
-import sys
-import xml.etree.ElementTree as ET
-
-xml_path = Path(sys.argv[1])
-domain_name = sys.argv[2]
-base_disk = sys.argv[3]
-disk_path = sys.argv[4]
-nvram_path = sys.argv[5]
-tap_name = sys.argv[6]
-mac_addr = sys.argv[7]
-
-tree = ET.parse(xml_path)
-root = tree.getroot()
-
-name_node = root.find("name")
-if name_node is None:
-    raise SystemExit("missing <name> in base libvirt XML")
-name_node.text = domain_name
-
-uuid_node = root.find("uuid")
-if uuid_node is not None:
-    root.remove(uuid_node)
-
-os_node = root.find("os")
-if os_node is None:
-    raise SystemExit("missing <os> in base libvirt XML")
-
-nvram_node = os_node.find("nvram")
-if nvram_node is not None:
-    nvram_node.text = nvram_path
-
-devices = root.find("devices")
-if devices is None:
-    raise SystemExit("missing <devices> in base libvirt XML")
-
-for disk in devices.findall("disk"):
-    target = disk.find("target")
-    source = disk.find("source")
-    if target is None or source is None:
-        continue
-    if target.get("dev") == "vda" and source.get("file") == base_disk:
-        source.set("file", disk_path)
-
-first_interface = devices.find("interface")
-if first_interface is None:
-    raise SystemExit("missing network interface in base libvirt XML")
-first_interface.set("type", "ethernet")
-source = first_interface.find("source")
-if source is not None:
-    first_interface.remove(source)
-target = first_interface.find("target")
-if target is None:
-    target = ET.SubElement(first_interface, "target")
-target.attrib.clear()
-target.set("dev", tap_name)
-target.set("managed", "no")
-script = first_interface.find("script")
-if script is not None:
-  first_interface.remove(script)
-link = first_interface.find("link")
-if link is None:
-    link = ET.SubElement(first_interface, "link")
-link.attrib.clear()
-link.set("state", "up")
-mac = first_interface.find("mac")
-if mac is None:
-    raise SystemExit("missing interface MAC in base libvirt XML")
-mac.set("address", mac_addr)
-
-tree.write(xml_path, encoding="unicode")
-PY
+  patch_args=(
+    python3 "$RESOURCE_HELPER" patch-domain "$domain_xml"
+    --domain-name "$domain_name"
+    --base-disk "$BASE_DISK"
+    --disk-path "$disk_path"
+    --nvram-path "$nvram_path"
+    --tap-name "$tap_name"
+    --mac-address "$mac_addr"
+  )
+  if [[ -n "$CLUSTER_CONFIG" ]]; then
+    patch_args+=(
+      --cpus "${NODE_VCPUS[i]}"
+      --memory-kib "${NODE_MEMORY_KIB[i]}"
+    )
+    echo "    resources: ${NODE_VCPUS[i]} vCPU, ${NODE_MEMORY_KIB[i]} KiB"
+  fi
+  "${patch_args[@]}"
 
   run_virsh define "$domain_xml" >/dev/null
+  if [[ -n "$CLUSTER_CONFIG" ]]; then
+    CURRENT_DEFINED_XML="$(mktemp)"
+    run_virsh dumpxml --inactive "$domain_name" > "$CURRENT_DEFINED_XML"
+    python3 "$RESOURCE_HELPER" verify-domain "$CURRENT_DEFINED_XML" \
+      --domain-name "$domain_name" \
+      --base-disk "$BASE_DISK" \
+      --disk-path "$disk_path" \
+      --nvram-path "$nvram_path" \
+      --tap-name "$tap_name" \
+      --mac-address "$mac_addr" \
+      --cpus "${NODE_VCPUS[i]}" \
+      --memory-kib "${NODE_MEMORY_KIB[i]}"
+    rm -f "$CURRENT_DEFINED_XML"
+    CURRENT_DEFINED_XML=""
+  fi
   run_virsh start "$domain_name" >/dev/null
 
-  printf '%s\t%s\t%s\t%s\t%s\n' "$domain_name" "$disk_path" "$nvram_path" "$mac_addr" "$tap_name" >> "$DOMAIN_FILE"
   CREATED_DOMAINS+=("$domain_name")
   CREATED_TAPS+=("$tap_name")
   rm -f "$domain_xml"
+  CURRENT_DOMAIN_XML=""
 done
 
 rm -f "$TMP_XML"
 
-echo "=== Linux cluster launched: ${NUM_VMS} VM(s) ==="
+echo "=== Linux cluster launched: $((NUM_VMS - SKIP)) VM(s) ==="
 echo "State file: $DOMAIN_FILE"
 echo "Bridge: $LAN_BRIDGE"
 
