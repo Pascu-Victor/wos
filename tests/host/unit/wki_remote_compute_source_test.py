@@ -377,6 +377,44 @@ def test_remote_stdio_capture_is_write_only_and_non_tty() -> None:
             fail(f"remote stdio capture must preserve VFS access modes: {snippet}")
 
 
+def test_submitted_vfs_policy_is_active_during_elf_construction() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    header = REMOTE_COMPUTE_HPP.read_text()
+    ktest = REMOTE_COMPUTE_KTEST.read_text()
+    body = function_body(source, "handle_task_submit_work")
+
+    require_tokens(
+        source,
+        [
+            "saved_vfs_rules = std::move(task->wki_vfs_rules)",
+            "submitted_policy_valid = deserialize_task_vfs_rules(task, policy_data, policy_len)",
+            "submitted_task->wki_vfs_rules = std::move(task->wki_vfs_rules)",
+            "task->wki_vfs_rules = std::move(saved_vfs_rules)",
+        ],
+        "submitted VFS policy scope",
+    )
+    require_order(body, "policy_cursor =", "ScopedSubmitVfsIdentity submit_vfs_identity", "policy cursor before scoped install")
+    require_order(
+        body,
+        "if (!submit_vfs_identity.policy_valid())",
+        "exec_elf_buffer(elf_buffer, binary_len, elf_buffer_shared)",
+        "submitted policy validation before ELF construction",
+    )
+    require_order(
+        body,
+        "exec_elf_buffer(elf_buffer, binary_len, elf_buffer_shared)",
+        "submit_vfs_identity.transfer_vfs_rules_to(new_task)",
+        "validated policy transfer after ELF construction",
+    )
+    if "deserialize_task_vfs_rules(new_task" in body:
+        fail("submitted VFS policy must not be deferred until after Task construction")
+
+    token = "wki_remote_compute_selftest_submit_policy_scope_restores_worker"
+    require_tokens(source, [f"auto {token}() -> bool"], "submitted policy scope selftest implementation")
+    require_tokens(header, [f"auto {token}() -> bool;"], "submitted policy scope selftest declaration")
+    require_tokens(ktest, ["SubmitPolicyScopeRestoresWorker", token], "submitted policy scope KTEST coverage")
+
+
 def main() -> None:
     test_peer_cleanup_marks_all_targeted_submits_terminal_failure()
     test_proxy_wait_completion_respects_waitpid_publish_fence()
@@ -388,6 +426,7 @@ def main() -> None:
     test_vfs_ref_loader_rejects_null_or_empty_path_before_vfs_use()
     test_vfs_ref_loader_deadlines_are_saturating()
     test_remote_stdio_capture_is_write_only_and_non_tty()
+    test_submitted_vfs_policy_is_active_during_elf_construction()
     print("WKI remote compute source invariants hold")
 
 

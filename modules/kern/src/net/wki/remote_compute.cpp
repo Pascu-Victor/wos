@@ -34,6 +34,7 @@
 #include <platform/sys/usercopy.hpp>
 #include <string_view>
 #include <util/errno_name.hpp>
+#include <util/smallvec.hpp>
 #include <utility>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
@@ -1015,15 +1016,20 @@ void apply_submitted_task_identity(ker::mod::sched::task::Task* task, const WkiT
     }
 }
 
+auto deserialize_task_vfs_rules(ker::mod::sched::task::Task* task, const uint8_t* data, uint16_t data_len) -> bool;
+
 struct ScopedSubmitVfsIdentity {
     ker::mod::sched::task::Task* task = nullptr;
     ker::mod::sched::task::Task::PathBuffer saved_root{};
     uint16_t saved_root_len = 1;
     ker::mod::sched::task::Task::HostnameBuffer saved_submitter{};
+    ker::util::SmallVec<ker::mod::sched::task::WkiVfsRule, 4> saved_vfs_rules;
     bool active = false;
+    bool vfs_rules_installed = false;
+    bool submitted_policy_valid = false;
 
     ScopedSubmitVfsIdentity(ker::mod::sched::task::Task* current_task, const WkiTaskIdentityContext* identity,
-                            const char* submitter_hostname)
+                            const char* submitter_hostname, const uint8_t* policy_data, uint16_t policy_len)
         : task(current_task) {
         if (task == nullptr) {
             return;
@@ -1032,6 +1038,8 @@ struct ScopedSubmitVfsIdentity {
         saved_root = task->root;
         saved_root_len = task->root_len;
         saved_submitter = task->wki_submitter_hostname;
+        saved_vfs_rules = std::move(task->wki_vfs_rules);
+        vfs_rules_installed = true;
 
         if (identity != nullptr && identity->root.front() == '/') {
             task->root = identity->root;
@@ -1048,11 +1056,28 @@ struct ScopedSubmitVfsIdentity {
         }
 
         active = true;
+        submitted_policy_valid = deserialize_task_vfs_rules(task, policy_data, policy_len);
+    }
+
+    [[nodiscard]] auto policy_valid() const -> bool { return submitted_policy_valid; }
+
+    [[nodiscard]] auto transfer_vfs_rules_to(ker::mod::sched::task::Task* submitted_task) -> bool {
+        if (!active || !submitted_policy_valid || !vfs_rules_installed || task == nullptr || submitted_task == nullptr) {
+            return false;
+        }
+
+        submitted_task->wki_vfs_rules = std::move(task->wki_vfs_rules);
+        task->wki_vfs_rules = std::move(saved_vfs_rules);
+        vfs_rules_installed = false;
+        return true;
     }
 
     ~ScopedSubmitVfsIdentity() {
         if (!active || task == nullptr) {
             return;
+        }
+        if (vfs_rules_installed) {
+            task->wki_vfs_rules = std::move(saved_vfs_rules);
         }
         task->root = saved_root;
         task->root_len = saved_root_len;
@@ -3053,6 +3078,84 @@ auto wki_remote_compute_selftest_load_snapshot_survives_cleanup() -> bool {
     return SNAPSHOT_FOUND && snapshot.valid && snapshot.node_id == NODE_ID && snapshot.num_cpus == CPU_COUNT &&
            snapshot.avg_load_pct == LOAD_PCT && snapshot.last_update_us == LAST_UPDATE_US && CLEANED_UP;
 }
+
+auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool {
+    using ker::mod::sched::task::Task;
+    using ker::mod::sched::task::WkiVfsRoute;
+    using ker::mod::sched::task::WkiVfsRule;
+
+    auto add_rule = [](Task* task, const char* prefix, WkiVfsRoute route) -> bool {
+        WkiVfsRule rule{};
+        size_t const PREFIX_LEN = std::strlen(prefix);
+        if (PREFIX_LEN == 0 || PREFIX_LEN >= rule.prefix.size()) {
+            return false;
+        }
+        memcpy(rule.prefix.data(), prefix, PREFIX_LEN);
+        rule.prefix[PREFIX_LEN] = '\0';
+        rule.prefix_len = static_cast<uint16_t>(PREFIX_LEN);
+        rule.route = static_cast<uint8_t>(route);
+        return task->wki_vfs_rules.push_back(rule);
+    };
+    auto has_only_rule = [](const Task& task, const char* prefix, WkiVfsRoute route) -> bool {
+        if (task.wki_vfs_rules.size() != 1) {
+            return false;
+        }
+        const auto& rule = task.wki_vfs_rules[0];
+        return rule.prefix_len == std::strlen(prefix) && std::strcmp(rule.prefix.data(), prefix) == 0 &&
+               rule.route == static_cast<uint8_t>(route);
+    };
+
+    Task worker{};
+    Task submitted{};
+    std::strncpy(worker.root.data(), "/worker-root", worker.root.size() - 1);
+    worker.root_len = static_cast<uint16_t>(std::strlen(worker.root.data()));
+    std::strncpy(worker.wki_submitter_hostname.data(), "worker-host", worker.wki_submitter_hostname.size() - 1);
+    if (!add_rule(&worker, "/worker", WkiVfsRoute::HOST)) {
+        return false;
+    }
+
+    WkiTaskIdentityContext identity{};
+    std::strncpy(identity.root.data(), "/submit-root", identity.root.size() - 1);
+    std::strncpy(identity.submitter_hostname.data(), "submit-host", identity.submitter_hostname.size() - 1);
+
+    constexpr char POLICY_PREFIX[] = "/lib";
+    std::array<uint8_t, sizeof(uint16_t) + sizeof(uint8_t) + sizeof(uint8_t) + sizeof(uint16_t) + sizeof(POLICY_PREFIX) - 1> policy{};
+    uint16_t const RULE_COUNT = 1;
+    uint16_t const PREFIX_LEN = sizeof(POLICY_PREFIX) - 1;
+    memcpy(policy.data(), &RULE_COUNT, sizeof(RULE_COUNT));
+    policy[sizeof(uint16_t)] = static_cast<uint8_t>(WkiVfsRoute::LOCAL);
+    memcpy(policy.data() + sizeof(uint16_t) + sizeof(uint8_t) + sizeof(uint8_t), &PREFIX_LEN, sizeof(PREFIX_LEN));
+    memcpy(policy.data() + sizeof(uint16_t) + sizeof(uint8_t) + sizeof(uint8_t) + sizeof(uint16_t), POLICY_PREFIX, PREFIX_LEN);
+
+    bool scope_state_ok = false;
+    {
+        ScopedSubmitVfsIdentity scope(&worker, &identity, identity.submitter_hostname.data(), policy.data(), policy.size());
+        bool const POLICY_INSTALLED = scope.policy_valid() && std::strcmp(worker.root.data(), identity.root.data()) == 0 &&
+                                      std::strcmp(worker.wki_submitter_hostname.data(), identity.submitter_hostname.data()) == 0 &&
+                                      has_only_rule(worker, POLICY_PREFIX, WkiVfsRoute::LOCAL);
+        bool const TRANSFERRED = scope.transfer_vfs_rules_to(&submitted);
+        bool const WORKER_RULES_RESTORED = has_only_rule(worker, "/worker", WkiVfsRoute::HOST);
+        scope_state_ok =
+            POLICY_INSTALLED && TRANSFERRED && WORKER_RULES_RESTORED && has_only_rule(submitted, POLICY_PREFIX, WkiVfsRoute::LOCAL);
+    }
+
+    bool const WORKER_IDENTITY_RESTORED =
+        std::strcmp(worker.root.data(), "/worker-root") == 0 && std::strcmp(worker.wki_submitter_hostname.data(), "worker-host") == 0;
+
+    std::array<uint8_t, sizeof(uint16_t)> truncated_policy{};
+    memcpy(truncated_policy.data(), &RULE_COUNT, sizeof(RULE_COUNT));
+    bool invalid_policy_rejected = false;
+    {
+        ScopedSubmitVfsIdentity scope(&worker, &identity, identity.submitter_hostname.data(), truncated_policy.data(),
+                                      truncated_policy.size());
+        invalid_policy_rejected = !scope.policy_valid();
+    }
+
+    bool const WORKER_RESTORED_AFTER_REJECT = std::strcmp(worker.root.data(), "/worker-root") == 0 &&
+                                              std::strcmp(worker.wki_submitter_hostname.data(), "worker-host") == 0 &&
+                                              has_only_rule(worker, "/worker", WkiVfsRoute::HOST);
+    return scope_state_ok && WORKER_IDENTITY_RESTORED && invalid_policy_rejected && WORKER_RESTORED_AFTER_REJECT;
+}
 #endif
 
 auto wki_remote_compute_diag_snapshot(WkiRemoteComputeDiagRow* rows, size_t capacity, WkiRemoteComputeDiagCounts* counts) -> size_t {
@@ -3856,11 +3959,17 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     bool const INVALID_SUBMIT_CONTEXT = submit->args_len > context_without_ipc ||
                                         submit->identity_len > static_cast<uint16_t>(context_without_ipc - submit->args_len) ||
                                         !valid_task_identity_len(submit->identity_len);
+    const uint8_t* policy_cursor = nullptr;
+    uint16_t policy_len = 0;
     if (INVALID_SUBMIT_CONTEXT) {
         reject_reason = TaskRejectReason::FETCH_FAILED;
-    } else if (submit->identity_len == WkiTaskIdentityContext::V1_SIZE || submit->identity_len == sizeof(WkiTaskIdentityContext)) {
-        memcpy(&submitted_identity, submit_context + submit->args_len, submit->identity_len);
-        has_submitted_identity = true;
+    } else {
+        policy_cursor = submit_context + submit->args_len + submit->identity_len;
+        policy_len = static_cast<uint16_t>(context_without_ipc - submit->args_len - submit->identity_len);
+        if (submit->identity_len == WkiTaskIdentityContext::V1_SIZE || submit->identity_len == sizeof(WkiTaskIdentityContext)) {
+            memcpy(&submitted_identity, submit_context + submit->args_len, submit->identity_len);
+            has_submitted_identity = true;
+        }
     }
 
     // If binary loading failed, reject
@@ -3882,8 +3991,22 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     const char* effective_submitter_hostname = (has_submitted_identity && submitted_identity.submitter_hostname.front() != '\0')
                                                    ? submitted_identity.submitter_hostname.data()
                                                    : wki_peer_get_hostname(hdr->src_node);
-    ScopedSubmitVfsIdentity const SUBMIT_VFS_IDENTITY(current_task, has_submitted_identity ? &submitted_identity : nullptr,
-                                                      effective_submitter_hostname);
+    // Task construction opens PT_INTERP through the current task. Install and
+    // validate the submitted routes first, then move that exact policy into the
+    // unpublished task after construction succeeds.
+    ScopedSubmitVfsIdentity submit_vfs_identity(current_task, has_submitted_identity ? &submitted_identity : nullptr,
+                                                effective_submitter_hostname, policy_cursor, policy_len);
+    if (!submit_vfs_identity.policy_valid()) {
+        release_loaded_elf_buffer(elf_buffer, elf_buffer_shared);
+        TaskResponsePayload reject = {};
+        reject.task_id = submit->task_id;
+        reject.status = static_cast<uint8_t>(TaskRejectReason::FETCH_FAILED);
+        reject.remote_pid = 0;
+        ker::mod::dbg::log("[WKI] Task submit policy parse failed before exec: task_id=%u", submit->task_id);
+        wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::TASK_REJECT, &reject, sizeof(reject));
+        handle_measure.finish(perf_compute_reject_status(TaskRejectReason::FETCH_FAILED), binary_len);
+        return;
+    }
     ExecResult const EXEC = exec_elf_buffer(elf_buffer, binary_len, elf_buffer_shared);
     if (EXEC.task == nullptr) {
         auto exec_reason = EXEC.reject_reason;
@@ -3928,13 +4051,7 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     const char** argv_strings = nullptr;
     const char** envp_strings = nullptr;
     const char* cwd_string = "/";
-    bool parse_ok = true;
-
-    // IPC fd entries are appended after args+identity+policy in the submit context.
-    // Subtract their size so policy_len covers only the actual VFS rules.
-    const uint8_t* identity_cursor = submit_context + submit->args_len;
-    const uint8_t* policy_cursor = identity_cursor + submit->identity_len;
-    auto const POLICY_LEN = static_cast<uint16_t>(context_without_ipc - submit->args_len - submit->identity_len);
+    bool parse_ok = submit_vfs_identity.transfer_vfs_rules_to(new_task);
 
     if (submit->argc > 0) {
         argv_strings = new const char*[static_cast<size_t>(submit->argc) + 1];
@@ -3992,10 +4109,6 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
         } else {
             cwd_string = reinterpret_cast<const char*>(context_cursor);
         }
-    }
-
-    if (parse_ok && !deserialize_task_vfs_rules(new_task, policy_cursor, POLICY_LEN)) {
-        parse_ok = false;
     }
 
     if (!parse_ok) {

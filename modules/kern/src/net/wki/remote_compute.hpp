@@ -284,6 +284,7 @@ auto wki_remote_compute_selftest_proxy_wait_completion_respects_publish_fence() 
 auto wki_remote_compute_selftest_task_wait_consumes_completed_row() -> bool;
 auto wki_remote_compute_selftest_task_wait_timeout_preserves_successor() -> bool;
 auto wki_remote_compute_selftest_load_snapshot_survives_cleanup() -> bool;
+auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool;
 #endif
 
 // -----------------------------------------------------------------------------
