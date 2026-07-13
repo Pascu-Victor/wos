@@ -25,6 +25,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/cross_os_benchmark_suite_test.py
 )
 add_test(
+    NAME fixed_resource_scaling_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/fixed_resource_scaling_test.py
+)
+add_test(
     NAME linux_cluster_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/linux_cluster_source_test.py
 )
@@ -366,6 +370,7 @@ set_tests_properties(
     coverage_summary_test
     cluster_setup_test
     cross_os_benchmark_suite_test
+    fixed_resource_scaling_test
     linux_cluster_source_test
     ktest_manifest_test
     runtime_test_audit_test
