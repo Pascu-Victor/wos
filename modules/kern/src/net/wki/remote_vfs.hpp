@@ -4,8 +4,10 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
+#include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
@@ -156,7 +158,8 @@ struct ReadAheadCache {
 struct WriteBehindBuffer {
     int64_t pending_offset = -1;  // Start offset of buffered writes (-1 = empty)
     uint32_t pending_len = 0;     // Bytes pending in buffer
-    std::array<uint8_t, VFS_WRITE_BEHIND_SIZE> data = {};
+    uint32_t capacity = 0;
+    std::unique_ptr<uint8_t[]> data{};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 };
 
 // -----------------------------------------------------------------------------
@@ -175,6 +178,8 @@ struct RemoteFileContext {
     // D6: Read-ahead and write-behind (lazily allocated on first use)
     ReadAheadCache* read_cache = nullptr;
     WriteBehindBuffer* write_buf = nullptr;
+    ker::mod::sys::Mutex io_lock;
+    std::atomic<bool> cache_invalidation_pending{false};
 
     ker::mod::sys::Spinlock stat_cache_lock;
     bool stat_cache_valid = false;
@@ -230,6 +235,11 @@ void wki_remote_vfs_advertise_exports_to_peer(uint16_t peer_node);
 auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path) -> int;
 
 auto wki_remote_vfs_selftest_attach_ack_cookie_fences_stale_completion() -> bool;
+
+#ifdef WOS_SELFTEST
+auto wki_remote_vfs_selftest_write_behind_capacity_classes() -> bool;
+auto wki_remote_vfs_selftest_write_behind_growth() -> bool;
+#endif
 
 // Consumer side: best-effort diagnostic snapshot for /proc/wki/netdiag.
 auto wki_remote_vfs_proxy_diag_snapshot(WkiRemoteVfsProxyDiag* out, size_t max) -> size_t;

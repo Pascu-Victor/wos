@@ -28,3 +28,9 @@ KTEST(WkiDevProxyRdmaSqWait, StopsOnFenceOrInactive) { KEXPECT_TRUE(ker::net::wk
 KTEST(WkiRemoteVfsAttachAck, CookieFencesStaleMountCompletion) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_attach_ack_cookie_fences_stale_completion());
 }
+
+KTEST(WkiRemoteVfsWriteBehind, CapacityClassesMatchAllocator) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_write_behind_capacity_classes());
+}
+
+KTEST(WkiRemoteVfsWriteBehind, GrowthPreservesPendingData) { KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_write_behind_growth()); }

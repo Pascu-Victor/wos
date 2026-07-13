@@ -184,6 +184,8 @@ def test_shared_io_callers_timeout_or_fallback() -> None:
     require_order(
         write_body,
         [
+            "chunk == 0 || chunk > VFS_RDMA_WRITE_SIZE",
+            "return -EINVAL",
             "*written_out = 0",
             "SharedIoSlotGuard const SHARED_IO_GUARD(state, wki_now_us())",
             "if (!SHARED_IO_GUARD.acquired())",
@@ -248,6 +250,270 @@ def test_message_fallback_readahead_targets_small_sequential_reads() -> None:
         fail("optional message read-ahead allocation failure must use the direct stack path")
 
 
+def test_write_behind_storage_grows_in_allocator_shaped_classes() -> None:
+    header = REMOTE_VFS_HPP.read_text()
+    source = REMOTE_VFS_CPP.read_text()
+    ktest = WKI_DEV_PROXY_KTEST.read_text()
+
+    require_tokens(
+        header,
+        [
+            "#include <memory>",
+            "#include <platform/sys/mutex.hpp>",
+            "uint32_t capacity = 0;",
+            "std::unique_ptr<uint8_t[]> data{};",
+            "ker::mod::sys::Mutex io_lock;",
+            "std::atomic<bool> cache_invalidation_pending{false};",
+            "wki_remote_vfs_selftest_write_behind_capacity_classes()",
+            "wki_remote_vfs_selftest_write_behind_growth()",
+        ],
+        "adaptive remote VFS write-behind storage",
+    )
+    if "std::array<uint8_t, VFS_WRITE_BEHIND_SIZE> data" in header:
+        fail("remote VFS write-behind must not embed and zero the maximum-size storage")
+
+    require_tokens(
+        source,
+        [
+            "constexpr std::array<uint32_t, 8> VFS_WRITE_BEHIND_CAPACITIES",
+            "28U * 1024U",
+            "60U * 1024U",
+            "124U * 1024U",
+            "252U * 1024U",
+            "508U * 1024U",
+            "1020U * 1024U",
+            "2044U * 1024U",
+            "4092U * 1024U",
+            "static_assert(VFS_WRITE_BEHIND_MAX_CAPACITY < VFS_WRITE_BEHIND_SIZE)",
+        ],
+        "allocator-shaped remote VFS write-behind capacities",
+    )
+    capacity_body = function_body(source, "write_behind_capacity_for")
+    require_order(
+        capacity_body,
+        [
+            "for (uint32_t const CAPACITY : VFS_WRITE_BEHIND_CAPACITIES)",
+            "if (required_bytes <= CAPACITY)",
+            "return CAPACITY",
+            "return VFS_WRITE_BEHIND_MAX_CAPACITY",
+        ],
+        "saturating remote VFS write-behind capacity selection",
+    )
+
+    install_body = function_body(source, "install_write_behind_storage")
+    require_order(
+        install_body,
+        [
+            "replacement == nullptr",
+            "wb->pending_len > replacement_capacity",
+            "memcpy(replacement.get(), wb->data.get(), wb->pending_len)",
+            "wb->data = std::move(replacement)",
+            "wb->capacity = replacement_capacity",
+        ],
+        "remote VFS write-behind growth commit",
+    )
+    reserve_body = function_body(source, "try_reserve_write_behind")
+    require_order(
+        reserve_body,
+        [
+            "write_behind_capacity_for(required_bytes)",
+            "TARGET_CAPACITY <= wb->capacity",
+            "new (std::nothrow) uint8_t[TARGET_CAPACITY]",
+            "install_write_behind_storage(wb, std::move(replacement), TARGET_CAPACITY)",
+        ],
+        "remote VFS write-behind temporary growth",
+    )
+
+    write_body = function_body(source, "remote_vfs_write")
+    require_order(
+        write_body,
+        [
+            "bool allow_write_behind_growth = true",
+            "bool const IS_SEQUENTIAL",
+            "if (!IS_SEQUENTIAL)",
+            "flush_write_behind(ctx)",
+            "continue",
+            "uint64_t const REQUIRED_CAPACITY",
+            "!try_reserve_write_behind(wb, REQUIRED_CAPACITY)",
+            "allow_write_behind_growth = false",
+            "uint32_t const SPACE = wb->capacity - wb->pending_len",
+            "memcpy(wb->data.get() + wb->pending_len, src, TO_BUFFER)",
+            "total_written += TO_BUFFER",
+            "if (wb->pending_len >= wb->capacity)",
+            "flush_write_behind(ctx)",
+            "return total_written",
+        ],
+        "adaptive remote VFS sequential write path",
+    )
+    if "wb->data.data()" in write_body:
+        fail("adaptive remote VFS write path must use the owning storage pointer")
+    if "remaining >= VFS_WRITE_BEHIND_SIZE" in write_body:
+        fail("large remote VFS writes must continue through the RDMA-capable write-behind path")
+    if "WRITTEN_BEFORE_BUFFER" in write_body:
+        fail("remote VFS must report bytes already accepted into write-behind after a flush failure")
+
+    for function_name in [
+        "remote_vfs_read",
+        "remote_vfs_write",
+        "remote_vfs_truncate",
+        "remote_vfs_fsync_file",
+        "wki_remote_vfs_fstat",
+    ]:
+        require_order(
+            function_body(source, function_name),
+            [
+                "ker::mod::sys::MutexGuard io_guard(ctx->io_lock)",
+                "consume_remote_file_cache_invalidation(ctx)",
+            ],
+            f"{function_name} adaptive write-behind serialization and deferred invalidation",
+        )
+    require_order(
+        function_body(source, "remote_vfs_lseek"),
+        [
+            "ker::mod::sys::MutexGuard io_guard(ctx->io_lock)",
+            "consume_remote_file_cache_invalidation(ctx)",
+            "int const FLUSH_STATUS = flush_write_behind(ctx)",
+            "if (FLUSH_STATUS != 0)",
+            "return FLUSH_STATUS",
+            "vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_SEEK_END",
+        ],
+        "remote VFS SEEK_END flush-before-operation serialization",
+    )
+    require_order(
+        function_body(source, "remote_vfs_read"),
+        [
+            "ker::mod::sys::MutexGuard io_guard(ctx->io_lock)",
+            "consume_remote_file_cache_invalidation(ctx)",
+            "int const FLUSH_STATUS = flush_write_behind(ctx)",
+            "if (FLUSH_STATUS != 0)",
+            "return FLUSH_STATUS",
+            "vfs_proxy_read_with_retry(ctx->proxy, OP_VFS_READ_BULK",
+        ],
+        "remote VFS read flush-before-operation serialization",
+    )
+    require_order(
+        function_body(source, "remote_vfs_truncate"),
+        [
+            "ker::mod::sys::MutexGuard io_guard(ctx->io_lock)",
+            "consume_remote_file_cache_invalidation(ctx)",
+            "int const FLUSH_STATUS = flush_write_behind(ctx)",
+            "if (FLUSH_STATUS != 0)",
+            "return FLUSH_STATUS",
+            "vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_TRUNCATE",
+        ],
+        "remote VFS truncate flush-before-operation serialization",
+    )
+    require_order(
+        function_body(source, "remote_vfs_fsync_file"),
+        [
+            "ker::mod::sys::MutexGuard io_guard(ctx->io_lock)",
+            "consume_remote_file_cache_invalidation(ctx)",
+            "int const FLUSH_STATUS = flush_write_behind(ctx)",
+            "if (FLUSH_STATUS != 0)",
+            "return FLUSH_STATUS",
+            "vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_FSYNC",
+        ],
+        "remote VFS fsync flush-before-operation serialization",
+    )
+    consume_body = function_body(source, "consume_remote_file_cache_invalidation")
+    require_order(
+        consume_body,
+        [
+            "ctx->cache_invalidation_pending.exchange(false, std::memory_order_acq_rel)",
+            "invalidate_remote_file_open_caches(ctx)",
+        ],
+        "task-context remote VFS cache invalidation consumption",
+    )
+    invalidate_body = function_body(source, "wki_remote_vfs_invalidate_open_file_caches")
+    require_tokens(
+        invalidate_body,
+        ["ctx->cache_invalidation_pending.store(true, std::memory_order_release)"],
+        "RX-safe remote VFS cache invalidation deferral",
+    )
+    if "MutexGuard" in invalidate_body or "invalidate_remote_file_open_caches(ctx)" in invalidate_body:
+        fail("RX-reachable remote VFS cache invalidation must not block or free per-open storage")
+
+    require_tokens(
+        source,
+        [
+            "CapacityCase{1, 28U * 1024U}",
+            "CapacityCase{16U * 1024U, 28U * 1024U}",
+            "CapacityCase{28U * 1024U, 28U * 1024U}",
+            "CapacityCase{(28U * 1024U) + 1U, 60U * 1024U}",
+            "CapacityCase{60U * 1024U, 60U * 1024U}",
+            "CapacityCase{(60U * 1024U) + 1U, 124U * 1024U}",
+            "CapacityCase{64U * 1024U, 124U * 1024U}",
+            "CapacityCase{124U * 1024U, 124U * 1024U}",
+            "CapacityCase{(124U * 1024U) + 1U, 252U * 1024U}",
+            "CapacityCase{128U * 1024U, 252U * 1024U}",
+            "CapacityCase{252U * 1024U, 252U * 1024U}",
+            "CapacityCase{(252U * 1024U) + 1U, 508U * 1024U}",
+            "CapacityCase{256U * 1024U, 508U * 1024U}",
+            "CapacityCase{508U * 1024U, 508U * 1024U}",
+            "CapacityCase{(508U * 1024U) + 1U, 1020U * 1024U}",
+            "CapacityCase{1020U * 1024U, 1020U * 1024U}",
+            "CapacityCase{(1020U * 1024U) + 1U, 2044U * 1024U}",
+            "CapacityCase{1U * 1024U * 1024U, 2044U * 1024U}",
+            "CapacityCase{2044U * 1024U, 2044U * 1024U}",
+            "CapacityCase{(2044U * 1024U) + 1U, 4092U * 1024U}",
+            "CapacityCase{4092U * 1024U, 4092U * 1024U}",
+            "CapacityCase{(4092U * 1024U) + 1U, 4092U * 1024U}",
+            "CapacityCase{UINT64_MAX, 4092U * 1024U}",
+        ],
+        "remote VFS write-behind capacity selftest boundaries",
+    )
+    require_tokens(
+        ktest,
+        [
+            "KTEST(WkiRemoteVfsWriteBehind, CapacityClassesMatchAllocator)",
+            "wki_remote_vfs_selftest_write_behind_capacity_classes()",
+            "KTEST(WkiRemoteVfsWriteBehind, GrowthPreservesPendingData)",
+            "wki_remote_vfs_selftest_write_behind_growth()",
+        ],
+        "remote VFS write-behind KTEST coverage",
+    )
+
+
+def test_message_write_flush_retains_tail_on_request_allocation_failure() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    flush_body = function_body(source, "flush_write_behind")
+    require_order(
+        flush_body,
+        [
+            "uint32_t const CHUNK = std::min(remaining, VFS_RDMA_WRITE_SIZE)",
+            "vfs_proxy_write_rdma_and_wait(ctx->proxy, ctx->remote_fd, cur_offset, src, CHUNK, &written)",
+            "constexpr uint32_t WRITE_HDR_OVERHEAD = sizeof(DevOpReqPayload) + 12",
+            "auto max_data = static_cast<uint32_t>(WKI_ETH_MAX_PAYLOAD - WRITE_HDR_OVERHEAD)",
+            "uint32_t const CHUNK = (remaining > max_data) ? max_data : remaining",
+            "auto req_data_len = static_cast<uint16_t>(12 + CHUNK)",
+            "vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_WRITE, req_data, req_data_len",
+        ],
+        "RDMA and message write-behind chunk bounds",
+    )
+    require_order(
+        flush_body,
+        [
+            "auto* req_data = new (std::nothrow) uint8_t[req_data_len]",
+            "if (req_data == nullptr)",
+            "keep_pending_tail(src, remaining, cur_offset)",
+            "return -ENOMEM",
+        ],
+        "message-mode write-behind allocation failure",
+    )
+    require_tokens(
+        flush_body,
+        [
+            "wb->data.get()",
+            "wb->pending_len > wb->capacity",
+            "remote_vfs_invalidate_cached_stat(ctx)",
+            "written == 0 || written > CHUNK",
+        ],
+        "dynamic write-behind flush bounds",
+    )
+    if flush_body.count("written == 0 || written > CHUNK") != 2:
+        fail("both RDMA and message write-behind flushes must reject oversized write responses")
+
+
 def test_remote_open_closes_server_fd_on_local_allocation_failure() -> None:
     source = REMOTE_VFS_CPP.read_text()
     helper_body = function_body(source, "remote_vfs_close_remote_fd_best_effort")
@@ -297,15 +563,19 @@ def test_normal_remote_close_flushes_then_sends_without_response_wait() -> None:
     require_order(
         close_body,
         [
-            "int const FLUSH_STATUS = flush_write_behind(ctx)",
+            "ker::mod::sys::MutexGuard io_guard(ctx->io_lock)",
+            "flush_status = flush_write_behind(ctx)",
             "int32_t remote_fd = ctx->remote_fd",
             "vfs_proxy_send_untracked(ctx->proxy, OP_VFS_CLOSE",
+            "delete ctx->write_buf",
             "delete ctx;",
             "release_vfs_proxy_open_ref(PROXY)",
-            "return FLUSH_STATUS",
+            "return flush_status",
         ],
         "normal remote close ordering",
     )
+    if close_body.count("ker::mod::sys::MutexGuard io_guard(ctx->io_lock)") != 2:
+        fail("both inactive and normal remote close cleanup must serialize per-file storage")
     if "vfs_proxy_send_and_wait" in close_body:
         fail("normal remote close must not wait for the owner close response")
     if "NEEDS_CLOSE_STATUS" in close_body:
@@ -590,7 +860,7 @@ def test_remote_open_refs_delay_proxy_destroy_until_close() -> None:
         [
             "ProxyVfsState* const PROXY = ctx->proxy;",
             "release_vfs_proxy_open_ref(PROXY);",
-            "return FLUSH_STATUS;",
+            "return flush_status;",
         ],
         "remote VFS close releases proxy open ref",
     )
@@ -602,6 +872,8 @@ def main() -> None:
     test_shared_io_slot_waits_are_bounded()
     test_shared_io_callers_timeout_or_fallback()
     test_message_fallback_readahead_targets_small_sequential_reads()
+    test_write_behind_storage_grows_in_allocator_shaped_classes()
+    test_message_write_flush_retains_tail_on_request_allocation_failure()
     test_remote_open_closes_server_fd_on_local_allocation_failure()
     test_normal_remote_close_flushes_then_sends_without_response_wait()
     test_export_lookup_returns_locked_snapshot()

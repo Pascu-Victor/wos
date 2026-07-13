@@ -24,6 +24,8 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sys/mutex.hpp>
+#include <utility>
 #include <vfs/mount.hpp>
 #include <vfs/vfs.hpp>
 
@@ -893,6 +895,14 @@ void invalidate_remote_file_open_caches(RemoteFileContext* ctx) {
     }
 }
 
+// RX invalidation only sets cache_invalidation_pending. Task-context callers
+// consume it while holding io_lock before touching per-open cache storage.
+void consume_remote_file_cache_invalidation(RemoteFileContext* ctx) {
+    if (ctx != nullptr && ctx->cache_invalidation_pending.exchange(false, std::memory_order_acq_rel)) {
+        invalidate_remote_file_open_caches(ctx);
+    }
+}
+
 auto path_matches_export(const char* export_path, const char* local_vfs_path) -> bool {
     if (export_path == nullptr || local_vfs_path == nullptr) {
         return false;
@@ -1634,7 +1644,7 @@ auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_
 auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int64_t offset, const uint8_t* src, uint32_t chunk,
                                    uint32_t* written_out) -> int {
     if (state == nullptr || src == nullptr || written_out == nullptr || state->rdma_transport == nullptr ||
-        state->rdma_server_write_rkey == 0) {
+        state->rdma_server_write_rkey == 0 || chunk == 0 || chunk > VFS_RDMA_WRITE_SIZE) {
         return -EINVAL;
     }
 
@@ -1887,13 +1897,64 @@ auto vfs_proxy_read_with_retry(ProxyVfsState* state, uint16_t op_id, const uint8
 // D6: Write-behind flush helper
 // -----------------------------------------------------------------------------
 
+constexpr std::array<uint32_t, 8> VFS_WRITE_BEHIND_CAPACITIES = {
+    28U * 1024U, 60U * 1024U, 124U * 1024U, 252U * 1024U, 508U * 1024U, 1020U * 1024U, 2044U * 1024U, 4092U * 1024U,
+};
+constexpr uint32_t VFS_WRITE_BEHIND_MAX_CAPACITY = 4092U * 1024U;
+static_assert(VFS_WRITE_BEHIND_MAX_CAPACITY < VFS_WRITE_BEHIND_SIZE);
+
+auto write_behind_capacity_for(uint64_t required_bytes) -> uint32_t {
+    for (uint32_t const CAPACITY : VFS_WRITE_BEHIND_CAPACITIES) {
+        if (required_bytes <= CAPACITY) {
+            return CAPACITY;
+        }
+    }
+    return VFS_WRITE_BEHIND_MAX_CAPACITY;
+}
+
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+auto install_write_behind_storage(WriteBehindBuffer* wb, std::unique_ptr<uint8_t[]> replacement, uint32_t replacement_capacity) -> bool {
+    if (wb == nullptr || replacement == nullptr || replacement_capacity == 0 || replacement_capacity > VFS_WRITE_BEHIND_MAX_CAPACITY ||
+        wb->pending_len > replacement_capacity || (wb->pending_len > 0 && wb->data == nullptr)) {
+        return false;
+    }
+
+    if (wb->pending_len > 0) {
+        memcpy(replacement.get(), wb->data.get(), wb->pending_len);
+    }
+    wb->data = std::move(replacement);
+    wb->capacity = replacement_capacity;
+    return true;
+}
+
+auto try_reserve_write_behind(WriteBehindBuffer* wb, uint64_t required_bytes) -> bool {
+    if (wb == nullptr) {
+        return false;
+    }
+
+    uint32_t const TARGET_CAPACITY = write_behind_capacity_for(required_bytes);
+    if (wb->data != nullptr && TARGET_CAPACITY <= wb->capacity) {
+        return true;
+    }
+
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    std::unique_ptr<uint8_t[]> replacement{new (std::nothrow) uint8_t[TARGET_CAPACITY]};
+    return install_write_behind_storage(wb, std::move(replacement), TARGET_CAPACITY);
+}
+
+// The caller holds ctx->io_lock so storage promotion cannot invalidate src
+// while an RDMA or message flush is sleeping on the remote operation.
 auto flush_write_behind(RemoteFileContext* ctx) -> int {
     if (ctx->write_buf == nullptr || ctx->write_buf->pending_len == 0) {
         return 0;
     }
 
     auto* wb = ctx->write_buf;
-    auto* src = wb->data.data();
+    if (wb->data == nullptr || wb->pending_len > wb->capacity) {
+        return -EIO;
+    }
+    remote_vfs_invalidate_cached_stat(ctx);
+    auto* src = wb->data.get();
     auto remaining = wb->pending_len;
     auto cur_offset = wb->pending_offset;
     auto keep_pending_tail = [&](const uint8_t* tail_src, uint32_t tail_len, int64_t tail_offset) {
@@ -1903,8 +1964,8 @@ auto flush_write_behind(RemoteFileContext* ctx) -> int {
             return;
         }
 
-        if (tail_src != wb->data.data()) {
-            memmove(wb->data.data(), tail_src, tail_len);
+        if (tail_src != wb->data.get()) {
+            memmove(wb->data.get(), tail_src, tail_len);
         }
         wb->pending_offset = tail_offset;
         wb->pending_len = tail_len;
@@ -1924,7 +1985,7 @@ auto flush_write_behind(RemoteFileContext* ctx) -> int {
                 return STATUS;
             }
 
-            if (written == 0) {
+            if (written == 0 || written > CHUNK) {
                 keep_pending_tail(src, remaining, cur_offset);
                 return -EIO;
             }
@@ -1943,7 +2004,8 @@ auto flush_write_behind(RemoteFileContext* ctx) -> int {
             auto req_data_len = static_cast<uint16_t>(12 + CHUNK);
             auto* req_data = new (std::nothrow) uint8_t[req_data_len];
             if (req_data == nullptr) {
-                break;
+                keep_pending_tail(src, remaining, cur_offset);
+                return -ENOMEM;
             }
 
             int32_t remote_fd = ctx->remote_fd;
@@ -1958,7 +2020,7 @@ auto flush_write_behind(RemoteFileContext* ctx) -> int {
                 keep_pending_tail(src, remaining, cur_offset);
                 return STATUS;
             }
-            if (written == 0) {
+            if (written == 0 || written > CHUNK) {
                 keep_pending_tail(src, remaining, cur_offset);
                 return -EIO;
             }
@@ -1985,45 +2047,53 @@ auto remote_vfs_close(ker::vfs::File* f) -> int {
     auto* ctx = static_cast<RemoteFileContext*>(f->private_data);
     ProxyVfsState* const PROXY = ctx->proxy;
     if (PROXY == nullptr || !PROXY->active) {
-        clear_remote_file_open_prefetch(ctx);
-        delete ctx->read_cache;
-        delete ctx->write_buf;
+        {
+            ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
+            clear_remote_file_open_prefetch(ctx);
+            delete ctx->read_cache;
+            delete ctx->write_buf;
+        }
         delete ctx;
         f->private_data = nullptr;
         release_vfs_proxy_open_ref(PROXY);
         return -EIO;
     }
 
-    // D6: Flush pending writes before closing
-    int const FLUSH_STATUS = flush_write_behind(ctx);
+    int flush_status = 0;
+    {
+        ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
 
-    // D7: Invalidate directory cache for this file
-    s_vfs_lock.lock();
-    invalidate_dir_cache(ctx->proxy, ctx->remote_fd);
-    s_vfs_lock.unlock();
+        // D6: Flush pending writes before closing
+        flush_status = flush_write_behind(ctx);
 
-    // Send OP_VFS_CLOSE: {remote_fd:i32} = 4 bytes. Pending writes were flushed
-    // synchronously above, and the close request remains ordered on the reliable
-    // per-mount channel. The owner response only reports whether the remote fd
-    // existed, which is not observable after the local descriptor is gone, so
-    // normal closes do not need to pay another request/response RTT.
-    int32_t remote_fd = ctx->remote_fd;
-    int const SEND_STATUS =
-        vfs_proxy_send_untracked(ctx->proxy, OP_VFS_CLOSE, reinterpret_cast<const uint8_t*>(&remote_fd), sizeof(int32_t));
-    if (SEND_STATUS != 0) {
-        ker::mod::dbg::log("[WKI] async remote close send failed: node=0x%04x ch=%u fd=%d rc=%d", ctx->proxy->owner_node,
-                           ctx->proxy->assigned_channel, remote_fd, SEND_STATUS);
+        // D7: Invalidate directory cache for this file
+        s_vfs_lock.lock();
+        invalidate_dir_cache(ctx->proxy, ctx->remote_fd);
+        s_vfs_lock.unlock();
+
+        // Send OP_VFS_CLOSE: {remote_fd:i32} = 4 bytes. Pending writes were flushed
+        // synchronously above, and the close request remains ordered on the reliable
+        // per-mount channel. The owner response only reports whether the remote fd
+        // existed, which is not observable after the local descriptor is gone, so
+        // normal closes do not need to pay another request/response RTT.
+        int32_t remote_fd = ctx->remote_fd;
+        int const SEND_STATUS =
+            vfs_proxy_send_untracked(ctx->proxy, OP_VFS_CLOSE, reinterpret_cast<const uint8_t*>(&remote_fd), sizeof(int32_t));
+        if (SEND_STATUS != 0) {
+            ker::mod::dbg::log("[WKI] async remote close send failed: node=0x%04x ch=%u fd=%d rc=%d", ctx->proxy->owner_node,
+                               ctx->proxy->assigned_channel, remote_fd, SEND_STATUS);
+        }
+
+        // D6: Free caches
+        clear_remote_file_open_prefetch(ctx);
+        delete ctx->read_cache;
+        delete ctx->write_buf;
     }
-
-    // D6: Free caches
-    clear_remote_file_open_prefetch(ctx);
-    delete ctx->read_cache;
-    delete ctx->write_buf;
 
     delete ctx;
     f->private_data = nullptr;
     release_vfs_proxy_open_ref(PROXY);
-    return FLUSH_STATUS;
+    return flush_status;
 }
 
 auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ssize_t {
@@ -2034,6 +2104,8 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     if (ctx->proxy == nullptr || !ctx->proxy->active) {
         return -EIO;
     }
+    ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
+    consume_remote_file_cache_invalidation(ctx);
 
     if (ker::vfs::vfs_cache_notify_file_dirty(f)) {
         invalidate_remote_file_open_caches(ctx);
@@ -2525,6 +2597,8 @@ auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t o
     if (ctx->proxy == nullptr || !ctx->proxy->active) {
         return -EIO;
     }
+    ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
+    consume_remote_file_cache_invalidation(ctx);
 
     remote_vfs_invalidate_cached_stat(ctx);
 
@@ -2543,16 +2617,13 @@ auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t o
     auto remaining = static_cast<uint32_t>(count);
     auto cur_offset = static_cast<int64_t>(offset);
     ssize_t total_written = 0;
-
-    // Max data per request: payload - DevOpReqPayload(4) - {remote_fd(4)+offset(8)} = data
-    constexpr uint32_t WRITE_HDR_OVERHEAD = sizeof(DevOpReqPayload) + 12;
-    auto max_data = static_cast<uint32_t>(WKI_ETH_MAX_PAYLOAD - WRITE_HDR_OVERHEAD);
+    bool allow_write_behind_growth = true;
 
     // D6: Try to buffer sequential writes
     while (remaining > 0) {
         // Lazily allocate write-behind buffer
         if (ctx->write_buf == nullptr) {
-            ctx->write_buf = new WriteBehindBuffer();  // NOLINT(cppcoreguidelines-owning-memory)
+            ctx->write_buf = new (std::nothrow) WriteBehindBuffer();  // NOLINT(cppcoreguidelines-owning-memory)
             if (ctx->write_buf == nullptr) {
                 return (total_written > 0) ? total_written : -ENOMEM;
             }
@@ -2562,72 +2633,59 @@ auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t o
 
         // Check if this write is sequential and fits in the buffer
         bool const IS_SEQUENTIAL = (wb->pending_len == 0) || (wb->pending_offset + wb->pending_len == cur_offset);
-        auto space = static_cast<uint32_t>(VFS_WRITE_BEHIND_SIZE - wb->pending_len);
-
-        if (IS_SEQUENTIAL && space > 0) {
-            // Buffer this write
-            uint32_t const TO_BUFFER = std::min(space, remaining);
-            ssize_t const WRITTEN_BEFORE_BUFFER = total_written;
-            memcpy(wb->data.data() + wb->pending_len, src, TO_BUFFER);
-            if (wb->pending_len == 0) {
-                wb->pending_offset = cur_offset;
-            }
-            wb->pending_len += TO_BUFFER;
-
-            src += TO_BUFFER;
-            cur_offset += TO_BUFFER;
-            remaining -= TO_BUFFER;
-            total_written += TO_BUFFER;
-
-            // If buffer is full, flush it
-            if (wb->pending_len >= VFS_WRITE_BEHIND_SIZE) {
-                int const FLUSH_STATUS = flush_write_behind(ctx);
-                if (FLUSH_STATUS != 0) {
-                    return (WRITTEN_BEFORE_BUFFER > 0) ? WRITTEN_BEFORE_BUFFER : FLUSH_STATUS;
-                }
+        if (!IS_SEQUENTIAL) {
+            int const FLUSH_STATUS = flush_write_behind(ctx);
+            if (FLUSH_STATUS != 0) {
+                return (total_written > 0) ? total_written : FLUSH_STATUS;
             }
             continue;
         }
 
-        // Non-sequential or buffer full: flush existing buffer first
-        int const FLUSH_STATUS = flush_write_behind(ctx);
-        if (FLUSH_STATUS != 0) {
-            return (total_written > 0) ? total_written : FLUSH_STATUS;
+        uint64_t const REQUIRED_CAPACITY = static_cast<uint64_t>(wb->pending_len) + remaining;
+        if (allow_write_behind_growth && REQUIRED_CAPACITY > wb->capacity && wb->capacity < VFS_WRITE_BEHIND_MAX_CAPACITY &&
+            !try_reserve_write_behind(wb, REQUIRED_CAPACITY)) {
+            // Keep using the existing allocation after one failed promotion;
+            // repeated reclaim attempts in the same write would only add churn.
+            allow_write_behind_growth = false;
         }
 
-        // If the data exceeds the buffer size, send directly (bypass buffering)
-        if (remaining >= VFS_WRITE_BEHIND_SIZE) {
-            uint32_t const CHUNK = (remaining > max_data) ? max_data : remaining;
+        if (wb->data == nullptr || wb->capacity == 0) {
+            return (total_written > 0) ? total_written : -ENOMEM;
+        }
+        if (wb->capacity > VFS_WRITE_BEHIND_MAX_CAPACITY || wb->pending_len > wb->capacity) {
+            return (total_written > 0) ? total_written : -EIO;
+        }
 
-            auto req_data_len = static_cast<uint16_t>(12 + CHUNK);
-            auto* req_data = new (std::nothrow) uint8_t[req_data_len];
-            if (req_data == nullptr) {
-                return (total_written > 0) ? total_written : -ENOMEM;
+        if (wb->pending_len == wb->capacity) {
+            int const FLUSH_STATUS = flush_write_behind(ctx);
+            if (FLUSH_STATUS != 0) {
+                return (total_written > 0) ? total_written : FLUSH_STATUS;
             }
+            continue;
+        }
 
-            int32_t remote_fd = ctx->remote_fd;
-            memcpy(req_data, &remote_fd, sizeof(int32_t));
-            memcpy(req_data + 4, &cur_offset, sizeof(int64_t));
-            memcpy(req_data + 12, src, CHUNK);
+        uint32_t const SPACE = wb->capacity - wb->pending_len;
+        uint32_t const TO_BUFFER = std::min(SPACE, remaining);
+        memcpy(wb->data.get() + wb->pending_len, src, TO_BUFFER);
+        if (wb->pending_len == 0) {
+            wb->pending_offset = cur_offset;
+        }
+        wb->pending_len += TO_BUFFER;
 
-            uint32_t written = 0;
-            int const STATUS = vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_WRITE, req_data, req_data_len, &written, sizeof(uint32_t));
-            delete[] req_data;
+        src += TO_BUFFER;
+        cur_offset += TO_BUFFER;
+        remaining -= TO_BUFFER;
+        total_written += TO_BUFFER;
 
-            if (STATUS != 0) {
-                return (total_written > 0) ? total_written : STATUS;
-            }
-
-            src += written;
-            cur_offset += static_cast<int64_t>(written);
-            remaining -= written;
-            total_written += static_cast<ssize_t>(written);
-
-            if (written < CHUNK) {
-                break;  // Short write
+        if (wb->pending_len >= wb->capacity) {
+            int const FLUSH_STATUS = flush_write_behind(ctx);
+            if (FLUSH_STATUS != 0) {
+                // The bytes are already owned by write-behind, including any
+                // tail retained after a partial flush. Report them as accepted
+                // so a retry cannot overlap data that remains queued.
+                return total_written;
             }
         }
-        // Loop back - remaining data will be buffered on next iteration
     }
 
     return total_written;
@@ -2656,6 +2714,8 @@ auto remote_vfs_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
                                    (ctx->proxy != nullptr) ? static_cast<int>(ctx->proxy->active) : -1);
                 return -EIO;
             }
+            ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
+            consume_remote_file_cache_invalidation(ctx);
 
             // Flush pending writes before seek
             int const FLUSH_STATUS = flush_write_behind(ctx);
@@ -2852,6 +2912,8 @@ auto remote_vfs_truncate(ker::vfs::File* f, off_t length) -> int {
     if (ctx->proxy == nullptr || !ctx->proxy->active) {
         return -EIO;
     }
+    ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
+    consume_remote_file_cache_invalidation(ctx);
 
     remote_vfs_invalidate_cached_stat(ctx);
 
@@ -2885,6 +2947,8 @@ auto remote_vfs_fsync_file(ker::vfs::File* f) -> int {
     if (ctx->proxy == nullptr || !ctx->proxy->active) {
         return -EIO;
     }
+    ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
+    consume_remote_file_cache_invalidation(ctx);
 
     int const FLUSH_STATUS = flush_write_behind(ctx);
     if (FLUSH_STATUS != 0) {
@@ -2915,6 +2979,83 @@ ker::vfs::FileOperations g_remote_vfs_fops = {
 }  // namespace
 
 auto wki_remote_vfs_fsync(ker::vfs::File* file) -> int { return remote_vfs_fsync_file(file); }
+
+#ifdef WOS_SELFTEST
+auto wki_remote_vfs_selftest_write_behind_capacity_classes() -> bool {
+    struct CapacityCase {
+        uint64_t required;
+        uint32_t expected;
+    };
+    constexpr std::array<CapacityCase, 23> CASES = {
+        CapacityCase{1, 28U * 1024U},
+        CapacityCase{16U * 1024U, 28U * 1024U},
+        CapacityCase{28U * 1024U, 28U * 1024U},
+        CapacityCase{(28U * 1024U) + 1U, 60U * 1024U},
+        CapacityCase{60U * 1024U, 60U * 1024U},
+        CapacityCase{(60U * 1024U) + 1U, 124U * 1024U},
+        CapacityCase{64U * 1024U, 124U * 1024U},
+        CapacityCase{124U * 1024U, 124U * 1024U},
+        CapacityCase{(124U * 1024U) + 1U, 252U * 1024U},
+        CapacityCase{128U * 1024U, 252U * 1024U},
+        CapacityCase{252U * 1024U, 252U * 1024U},
+        CapacityCase{(252U * 1024U) + 1U, 508U * 1024U},
+        CapacityCase{256U * 1024U, 508U * 1024U},
+        CapacityCase{508U * 1024U, 508U * 1024U},
+        CapacityCase{(508U * 1024U) + 1U, 1020U * 1024U},
+        CapacityCase{1020U * 1024U, 1020U * 1024U},
+        CapacityCase{(1020U * 1024U) + 1U, 2044U * 1024U},
+        CapacityCase{1U * 1024U * 1024U, 2044U * 1024U},
+        CapacityCase{2044U * 1024U, 2044U * 1024U},
+        CapacityCase{(2044U * 1024U) + 1U, 4092U * 1024U},
+        CapacityCase{4092U * 1024U, 4092U * 1024U},
+        CapacityCase{(4092U * 1024U) + 1U, 4092U * 1024U},
+        CapacityCase{UINT64_MAX, 4092U * 1024U},
+    };
+
+    for (const auto& test_case : CASES) {
+        if (write_behind_capacity_for(test_case.required) != test_case.expected) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto wki_remote_vfs_selftest_write_behind_growth() -> bool {
+    WriteBehindBuffer wb = {};
+    if (!try_reserve_write_behind(&wb, 16U * 1024U) || wb.capacity != 28U * 1024U || wb.data == nullptr) {
+        return false;
+    }
+
+    wb.pending_offset = 37;
+    wb.pending_len = 256;
+    for (uint32_t i = 0; i < wb.pending_len; ++i) {
+        wb.data[i] = static_cast<uint8_t>(i ^ 0xA5U);
+    }
+
+    uint8_t* const INITIAL_STORAGE = wb.data.get();
+    if (!try_reserve_write_behind(&wb, 1) || wb.data.get() != INITIAL_STORAGE || wb.capacity != 28U * 1024U) {
+        return false;
+    }
+    if (!try_reserve_write_behind(&wb, (28U * 1024U) + 1U) || wb.data.get() == INITIAL_STORAGE || wb.capacity != 60U * 1024U ||
+        wb.pending_offset != 37 || wb.pending_len != 256) {
+        return false;
+    }
+    for (uint32_t i = 0; i < wb.pending_len; ++i) {
+        if (wb.data[i] != static_cast<uint8_t>(i ^ 0xA5U)) {
+            return false;
+        }
+    }
+
+    uint8_t* const GROWN_STORAGE = wb.data.get();
+    uint32_t const GROWN_CAPACITY = wb.capacity;
+    std::unique_ptr<uint8_t[]> no_replacement{};
+    if (install_write_behind_storage(&wb, std::move(no_replacement), 124U * 1024U) || wb.data.get() != GROWN_STORAGE ||
+        wb.capacity != GROWN_CAPACITY || wb.pending_offset != 37 || wb.pending_len != 256) {
+        return false;
+    }
+    return true;
+}
+#endif
 
 // -------------------------------------------------------------------------------
 // Init
@@ -5046,6 +5187,8 @@ auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int 
     if (ctx->proxy == nullptr || !ctx->proxy->active) {
         return -EIO;
     }
+    ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
+    consume_remote_file_cache_invalidation(ctx);
 
     ker::vfs::MountRef mount_ref = (file->vfs_path != nullptr) ? ker::vfs::find_mount_point(file->vfs_path) : ker::vfs::MountRef{};
     auto* mount = mount_ref.get();
@@ -5316,7 +5459,10 @@ void wki_remote_vfs_invalidate_open_file_caches(ker::vfs::File* file) {
     }
 
     auto* ctx = static_cast<RemoteFileContext*>(file->private_data);
-    invalidate_remote_file_open_caches(ctx);
+    // This callback is reachable from inline WKI RX while a writer may hold
+    // io_lock and wait for the response that the same RX path must deliver.
+    // Defer cache storage mutation to the next task-context file operation.
+    ctx->cache_invalidation_pending.store(true, std::memory_order_release);
 }
 
 void wki_remote_vfs_notify_path_changed(const char* old_local_vfs_path, const char* new_local_vfs_path) {
