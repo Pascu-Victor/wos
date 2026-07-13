@@ -6,6 +6,7 @@ DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 . "$DIR/showcase-common.sh"
 
 CXX="${CXX:-clang++}"
+COMPILE_CXX_REQUEST="$CXX"
 SRC="${WOS_LIVE_DEMO_SRC:-$DIR/live-cpp-demo.cpp}"
 BIN="${WOS_LIVE_DEMO_BIN:-/tmp/wos-live-demo}"
 case "${WOS_SHOWCASE_SCALE:-quick}" in
@@ -19,6 +20,35 @@ LOCAL_FILE="${WOS_LIVE_DEMO_LOCAL_FILE:-/tmp/wos-live-demo-local.dat}"
 REMOTE_FILE="${WOS_LIVE_DEMO_REMOTE_FILE:-/tmp/wos-live-demo-remote.dat}"
 COMPILE_ONLY="${WOS_LIVE_DISTRIBUTED_COMPILE_ONLY:-0}"
 COMPILE_TOTAL_UNITS=32
+COMPILE_WORKLOAD_ID=wos-live-cpp-32-tu-v1
+COMPILE_EXPECTED_SOURCE_SHA256=aa52bc6a7f7f5b58904b6c1d06fb7f813c8567c97470fbe4161a4e691a60c726
+COMPILE_FLAGS='-std=c++23 -O2 -fno-ident'
+COMPILE_LINK_FLAGS='-std=c++23 -O2 -Wl,--build-id=none'
+COMPILE_CACHE_POLICY=prewarmed-compiler-source-headers-all-hosts
+COMPILE_LOCAL_ROUTE_OPERANDS='-/root/wos-showcase -/usr -/bin -/lib -/lib64 -/libexec -/share -/tmp'
+COMPILE_RUNTIME_PATHS_JSON='["/root/wos-showcase","/usr","/bin","/lib","/lib64","/libexec","/share","/tmp"]'
+# shellcheck disable=SC2016  # The targeted shell expands the compiler probe.
+COMPILE_COMPILER_PROBE='set -eu
+workspace=$2
+cd "$workspace"
+wkictl_path=$(command -v wkictl) || exit 1
+routes=$(locally "$wkictl_path" vfs list)
+for runtime_path in /root/wos-showcase /usr /bin /lib /lib64 /libexec /share /tmp; do
+    runtime_route=$(printf "%s\n" "$routes" | awk -v path="$runtime_path" '\''$1 ~ /^vfs-task\[[0-9]+\]:$/ && $2 == path && $3 == "->" { print $4 }'\'')
+    [ "$runtime_route" = local ] || exit 1
+done
+workspace_route=$(printf "%s\n" "$routes" | awk -v path="$workspace" '\''$1 ~ /^vfs-task\[[0-9]+\]:$/ && $2 == path && $3 == "->" { print $4 }'\'')
+[ "$workspace_route" = host ] || exit 1
+compiler=$(command -v "$1") || exit 1
+version_output=$("$compiler" --version) || exit 1
+[ -n "$version_output" ] || exit 1
+digest_line=$(printf "%s\n" "$version_output" | sha256sum -b) || exit 1
+digest=${digest_line%% *}
+compiler_digest_line=$(sha256sum -b "$compiler") || exit 1
+compiler_digest=${compiler_digest_line%% *}
+wkictl_digest_line=$(sha256sum -b "$wkictl_path") || exit 1
+wkictl_digest=${wkictl_digest_line%% *}
+printf "%s %s %s %s\n" "$compiler" "$digest" "$compiler_digest" "$wkictl_digest"'
 
 compile_error() {
     printf 'distributed compile: %s\n' "$*" >&2
@@ -30,6 +60,152 @@ compile_safe_hostname() {
         ""|*[!A-Za-z0-9._-]*) return 1 ;;
         *) return 0 ;;
     esac
+}
+
+compile_safe_path() {
+    case "$1" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        *[!A-Za-z0-9_./+-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+compile_validate_sha256() {
+    compile_sha256_value="$1"
+    case "$compile_sha256_value" in
+        ""|*[!0-9a-f]*) return 1 ;;
+    esac
+    [ "${#compile_sha256_value}" -eq 64 ]
+}
+
+compile_validate_compiler_identity() {
+    compile_identity_record="$1"
+    compile_identity_label="$2"
+    compile_identity_path="${compile_identity_record%% *}"
+    compile_identity_rest="${compile_identity_record#* }"
+    compile_identity_digest="${compile_identity_rest%% *}"
+    compile_identity_binary_rest="${compile_identity_rest#* }"
+    compile_identity_binary_digest="${compile_identity_binary_rest%% *}"
+    compile_identity_wkictl_digest="${compile_identity_binary_rest#* }"
+    if [ "$compile_identity_record" != "$compile_identity_path $compile_identity_digest $compile_identity_binary_digest $compile_identity_wkictl_digest" ] || \
+        ! compile_safe_path "$compile_identity_path" || \
+        ! compile_validate_sha256 "$compile_identity_digest" || \
+        ! compile_validate_sha256 "$compile_identity_binary_digest" || \
+        ! compile_validate_sha256 "$compile_identity_wkictl_digest"; then
+        compile_error "invalid compiler identity from $compile_identity_label: $compile_identity_record"
+        return 1
+    fi
+}
+
+compile_resolve_launcher_compiler() {
+    compile_resolve_workspace="$1"
+    # shellcheck disable=SC2086  # Fixed, whitespace-separated route operands.
+    compile_launcher_compiler_identity="$(
+        on "$COMPILE_LAUNCHER_TARGET" forward "+$compile_resolve_workspace" $COMPILE_LOCAL_ROUTE_OPERANDS -- \
+            sh -c "$COMPILE_COMPILER_PROBE" sh "$COMPILE_CXX_REQUEST" "$compile_resolve_workspace"
+    )" || {
+        compile_error "cannot resolve or fingerprint compiler $COMPILE_CXX_REQUEST on the launcher"
+        return 1
+    }
+    compile_validate_compiler_identity "$compile_launcher_compiler_identity" launcher || return 1
+    COMPILE_COMPILER_PATH="${compile_launcher_compiler_identity%% *}"
+    compile_launcher_identity_rest="${compile_launcher_compiler_identity#* }"
+    COMPILE_COMPILER_VERSION_SHA256="${compile_launcher_identity_rest%% *}"
+    compile_launcher_binary_rest="${compile_launcher_identity_rest#* }"
+    COMPILE_COMPILER_SHA256="${compile_launcher_binary_rest%% *}"
+    COMPILE_WKICTL_SHA256="${compile_launcher_binary_rest#* }"
+    CXX="$COMPILE_COMPILER_PATH"
+}
+
+compile_local_profile() {
+    # shellcheck disable=SC2086  # Fixed, whitespace-separated route operands.
+    # shellcheck disable=SC2016  # The profiled shell expands its command arguments.
+    locally forward "+$compile_workspace" $COMPILE_LOCAL_ROUTE_OPERANDS -- sh -c '
+set -eu
+workspace=$1
+shift
+cd "$workspace"
+exec "$@"
+' sh "$compile_workspace" "$@"
+}
+
+compile_file_sha256() {
+    compile_digest_line="$(sha256sum -b "$1")" || return 1
+    compile_file_digest="${compile_digest_line%% *}"
+    compile_validate_sha256 "$compile_file_digest" || return 1
+    printf '%s\n' "$compile_file_digest"
+}
+
+compile_create_private_root() {
+    compile_private_attempt=0
+    while [ "$compile_private_attempt" -lt 100 ]; do
+        COMPILE_WORK_ROOT_OWNER="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" || {
+            compile_error "cannot generate private workspace ownership token"
+            return 1
+        }
+        case "$COMPILE_WORK_ROOT_OWNER" in
+            *[!0-9a-f]*) compile_error "invalid private workspace ownership token"; return 1 ;;
+        esac
+        if [ "${#COMPILE_WORK_ROOT_OWNER}" -ne 32 ]; then
+            compile_error "invalid private workspace ownership token"
+            return 1
+        fi
+        compile_work_suffix="$(printf '%.16s' "$COMPILE_WORK_ROOT_OWNER")"
+        COMPILE_WORK_ROOT="/tmp/wos-showcase-fixed-$compile_work_suffix"
+        if (umask 077 && mkdir "$COMPILE_WORK_ROOT"); then
+            if ! printf '%s' "$COMPILE_WORK_ROOT_OWNER" > "$COMPILE_WORK_ROOT/.wos-showcase-owner"; then
+                rm -f -- "$COMPILE_WORK_ROOT/.wos-showcase-owner"
+                rmdir "$COMPILE_WORK_ROOT" 2>/dev/null || true
+                compile_error "cannot record private workspace ownership"
+                return 1
+            fi
+            return 0
+        fi
+        compile_private_attempt=$((compile_private_attempt + 1))
+    done
+    compile_error "cannot allocate a private distributed compile workspace"
+    return 1
+}
+
+compile_cleanup_private_root() {
+    if [ -z "${COMPILE_WORK_ROOT:-}" ]; then
+        return 0
+    fi
+    compile_cleanup_root="$COMPILE_WORK_ROOT"
+    compile_cleanup_owner="$COMPILE_WORK_ROOT_OWNER"
+    compile_cleanup_suffix="${compile_cleanup_root#/tmp/wos-showcase-fixed-}"
+    case "$compile_cleanup_root" in
+        /tmp/wos-showcase-fixed-*) ;;
+        *) compile_error "refusing unsafe compile workspace cleanup: $compile_cleanup_root"; return 1 ;;
+    esac
+    if [ "${#compile_cleanup_suffix}" -ne 16 ] || \
+        [ "${#compile_cleanup_owner}" -ne 32 ] || \
+        [ "$(printf '%.16s' "$compile_cleanup_owner")" != "$compile_cleanup_suffix" ]; then
+        compile_error "refusing malformed compile workspace cleanup: $compile_cleanup_root"
+        return 1
+    fi
+    case "$compile_cleanup_suffix$compile_cleanup_owner" in
+        *[!0-9a-f]*) compile_error "refusing non-hex compile workspace cleanup"; return 1 ;;
+    esac
+    if [ ! -d "$compile_cleanup_root" ] || [ -L "$compile_cleanup_root" ] || \
+        [ ! -f "$compile_cleanup_root/.wos-showcase-owner" ] || \
+        [ -L "$compile_cleanup_root/.wos-showcase-owner" ] || \
+        [ "$(wc -c < "$compile_cleanup_root/.wos-showcase-owner")" -ne 32 ] || \
+        [ "$(cat "$compile_cleanup_root/.wos-showcase-owner")" != "$compile_cleanup_owner" ]; then
+        compile_error "refusing compile workspace with changed ownership: $compile_cleanup_root"
+        return 1
+    fi
+    cd /
+    rm -rf -- "$compile_cleanup_root"
+    COMPILE_WORK_ROOT=
+}
+
+compile_exit_cleanup() {
+    compile_cancel_jobs
+    compile_cleanup_private_root
 }
 
 compile_normalize_hostname() {
@@ -103,15 +279,23 @@ compile_validate_hosts() {
     fi
 
     compile_launcher_declared=0
+    COMPILE_LAUNCHER_TARGET=
     for compile_host in "$@"; do
         if [ "$(compile_normalize_hostname "$compile_host")" = "$COMPILE_LAUNCHER_NORMALIZED" ]; then
             compile_launcher_declared=$((compile_launcher_declared + 1))
+            COMPILE_LAUNCHER_TARGET="$compile_host"
         fi
     done
     if [ "$compile_launcher_declared" -ne 1 ]; then
         compile_error "declared hosts do not contain launcher $COMPILE_LAUNCHER_HOST exactly once"
         return 1
     fi
+
+    COMPILE_CANONICAL_HOSTS="$(
+        for compile_host in "$@"; do
+            printf '%s\t%s\n' "$(compile_normalize_hostname "$compile_host")" "$compile_host"
+        done | LC_ALL=C sort -k1,1 | awk 'BEGIN { separator = "" } { printf "%s%s", separator, $2; separator = "," } END { print "" }'
+    )"
 }
 
 compile_generate_driver() {
@@ -160,16 +344,45 @@ compile_cancel_jobs() {
     done < "$compile_pids"
 }
 
-run_distributed_compile() {
-    compile_workspace_root="${WOS_LIVE_COMPILE_WORKSPACE_ROOT:-${WOS_SHOWCASE_OUTPUT_ROOT:-/tmp/wos-showcase-live}}"
-    case "$compile_workspace_root" in
-        /*) ;;
-        *)
-            compile_error "workspace root must be absolute: $compile_workspace_root"
+compile_prewarm_hosts() {
+    compile_prewarm_index=0
+    while read -r compile_prewarm_host _compile_prewarm_units _compile_prewarm_first; do
+        compile_prewarm_tag="$(printf '%02d' "$compile_prewarm_index")"
+        compile_prewarm_object="$compile_workspace/prewarm-$compile_prewarm_tag.o"
+        compile_prewarm_log="$compile_workspace/prewarm-$compile_prewarm_tag.log"
+        compile_prewarm_symbol="wos_compile_prewarm_$compile_prewarm_tag"
+        # shellcheck disable=SC2016  # The targeted shell expands the submitted script.
+        # shellcheck disable=SC2086  # Fixed, whitespace-separated route operands.
+        if ! on "$compile_prewarm_host" forward "+$compile_workspace" $COMPILE_LOCAL_ROUTE_OPERANDS -- sh -c '
+set -eu
+workspace=$1
+cxx=$2
+source_file=$3
+object_file=$4
+symbol=$5
+cd "$workspace"
+exec "$cxx" -std=c++23 -O2 -fno-ident -c "$source_file" "-Dmain=$symbol" -o "$object_file"
+' sh "$compile_workspace" "$CXX" "$compile_source" "$compile_prewarm_object" "$compile_prewarm_symbol" \
+            > "$compile_prewarm_log" 2>&1; then
+            compile_error "compiler prewarm failed on $compile_prewarm_host"
+            cat "$compile_prewarm_log" >&2 || true
             return 1
-            ;;
-    esac
-    compile_workspace="${compile_workspace_root%/}/distributed-compile"
+        fi
+        if [ ! -s "$compile_prewarm_object" ]; then
+            compile_error "compiler prewarm produced no object on $compile_prewarm_host"
+            return 1
+        fi
+        compile_prewarm_index=$((compile_prewarm_index + 1))
+    done < "$compile_host_plan"
+    if [ "$compile_prewarm_index" -ne "$COMPILE_HOST_COUNT" ]; then
+        compile_error "compiler prewarm did not cover every host"
+        return 1
+    fi
+    rm -f "$compile_workspace"/prewarm-*.o "$compile_workspace"/prewarm-*.log
+}
+
+run_distributed_compile() {
+    compile_workspace="$COMPILE_WORK_ROOT/distributed-compile"
     compile_source="$compile_workspace/source.cpp"
     compile_driver_source="$compile_workspace/driver.cpp"
     compile_driver_object="$compile_workspace/driver.o"
@@ -178,29 +391,47 @@ run_distributed_compile() {
     compile_pids="$compile_workspace/pids"
     compile_participants="$compile_workspace/participants"
 
-    mkdir -p "$compile_workspace"
-    rm -f "$compile_source" "$compile_driver_source" "$compile_driver_object" "$compile_artifact" \
-        "$compile_host_plan" "$compile_pids" "$compile_participants" \
-        "$compile_workspace"/unit-*.o "$compile_workspace"/runner-*.txt "$compile_workspace"/compile-*.log
+    mkdir "$compile_workspace"
+    cd "$compile_workspace"
     cp "$SRC" "$compile_source"
     compile_generate_driver "$compile_driver_source"
+
+    COMPILE_SOURCE_SHA256="$(compile_file_sha256 "$compile_source")" || {
+        compile_error "cannot fingerprint source $SRC"
+        return 1
+    }
+    if [ "$COMPILE_SOURCE_SHA256" != "$COMPILE_EXPECTED_SOURCE_SHA256" ]; then
+        compile_error "source fingerprint differs from $COMPILE_WORKLOAD_ID"
+        return 1
+    fi
 
     compile_old_ifs="$IFS"
     IFS=,
     # shellcheck disable=SC2086  # Intentional CSV field splitting after validation.
-    set -- $hosts
+    set -- $COMPILE_CANONICAL_HOSTS
     IFS="$compile_old_ifs"
 
+    compile_resolve_launcher_compiler "$compile_workspace" || return 1
+
     for compile_host in "$@"; do
-        # shellcheck disable=SC2016  # The targeted shell expands its positional parameter.
-        if ! on "$compile_host" sh -c 'command -v "$1" >/dev/null 2>&1 || [ -x "$1" ]' sh "$CXX"; then
-            compile_error "$CXX is not available on $compile_host"
+        # shellcheck disable=SC2086  # Fixed, whitespace-separated route operands.
+        compile_host_compiler_identity="$(
+            on "$compile_host" forward "+$compile_workspace" $COMPILE_LOCAL_ROUTE_OPERANDS -- \
+                sh -c "$COMPILE_COMPILER_PROBE" sh "$COMPILE_CXX_REQUEST" "$compile_workspace"
+        )" || {
+            compile_error "cannot resolve or fingerprint compiler $COMPILE_CXX_REQUEST on $compile_host"
+            return 1
+        }
+        compile_validate_compiler_identity "$compile_host_compiler_identity" "$compile_host" || return 1
+        if [ "$compile_host_compiler_identity" != "$compile_launcher_compiler_identity" ]; then
+            compile_error "compiler identity on $compile_host differs from launcher: $compile_host_compiler_identity"
             return 1
         fi
     done
 
     showcase_section "fixed-total distributed c++ compilation"
-    showcase_cmd locally "$CXX" -std=c++23 -O2 -fno-ident -c "$compile_driver_source" -o "$compile_driver_object"
+    showcase_cmd compile_local_profile "$CXX" -std=c++23 -O2 -fno-ident -c \
+        "$compile_driver_source" -o "$compile_driver_object"
 
     : > "$compile_host_plan"
     compile_base_units=$((COMPILE_TOTAL_UNITS / COMPILE_HOST_COUNT))
@@ -221,7 +452,9 @@ run_distributed_compile() {
         return 1
     fi
 
-    compile_started="$(locally "$BIN" monotonic-ns)" || {
+    compile_prewarm_hosts || return 1
+
+    compile_started="$(compile_local_profile "$BIN" monotonic-ns)" || {
         compile_error "monotonic start timestamp failed"
         return 1
     }
@@ -234,10 +467,6 @@ run_distributed_compile() {
 
     : > "$compile_pids"
     compile_jobs_active=1
-    trap 'compile_cancel_jobs' 0
-    trap 'compile_cancel_jobs; exit 129' HUP
-    trap 'compile_cancel_jobs; exit 130' INT
-    trap 'compile_cancel_jobs; exit 143' TERM
     while read -r compile_host compile_host_units compile_first_unit; do
         compile_offset=0
         while [ "$compile_offset" -lt "$compile_host_units" ]; do
@@ -248,16 +477,19 @@ run_distributed_compile() {
             compile_log="$compile_workspace/compile-$compile_tag.log"
             compile_symbol="wos_compile_unit_$compile_tag"
             # shellcheck disable=SC2016  # The targeted shell expands the submitted script.
-            on "$compile_host" forward "+$compile_workspace" -- sh -c '
+            # shellcheck disable=SC2086  # Fixed, whitespace-separated route operands.
+            on "$compile_host" forward "+$compile_workspace" $COMPILE_LOCAL_ROUTE_OPERANDS -- sh -c '
 set -eu
 marker=$1
 cxx=$2
 source_file=$3
 object_file=$4
 symbol=$5
+workspace=$6
+cd "$workspace"
 wosid > "$marker"
 exec "$cxx" -std=c++23 -O2 -fno-ident -c "$source_file" "-Dmain=$symbol" -o "$object_file"
-' sh "$compile_marker" "$CXX" "$compile_source" "$compile_object" "$compile_symbol" > "$compile_log" 2>&1 &
+' sh "$compile_marker" "$CXX" "$compile_source" "$compile_object" "$compile_symbol" "$compile_workspace" > "$compile_log" 2>&1 &
             compile_pid=$!
             printf '%s %s %s\n' "$compile_pid" "$compile_tag" "$compile_host" >> "$compile_pids"
             compile_offset=$((compile_offset + 1))
@@ -276,14 +508,13 @@ exec "$cxx" -std=c++23 -O2 -fno-ident -c "$source_file" "-Dmain=$symbol" -o "$ob
         fi
     done < "$compile_pids"
     compile_jobs_active=0
-    trap - 0 HUP INT TERM
     if [ "$compile_failed" -ne 0 ]; then
         return 1
     fi
 
-    showcase_cmd locally "$CXX" -std=c++23 -O2 "$compile_driver_object" "$compile_workspace"/unit-*.o \
-        -Wl,--build-id=none -o "$compile_artifact"
-    compile_finished="$(locally "$BIN" monotonic-ns)" || {
+    showcase_cmd compile_local_profile "$CXX" -std=c++23 -O2 -Wl,--build-id=none \
+        "$compile_driver_object" "$compile_workspace"/unit-*.o -o "$compile_artifact"
+    compile_finished="$(compile_local_profile "$BIN" monotonic-ns)" || {
         compile_error "monotonic finish timestamp failed"
         return 1
     }
@@ -310,7 +541,7 @@ exec "$cxx" -std=c++23 -O2 -fno-ident -c "$source_file" "-Dmain=$symbol" -o "$ob
         compile_unit=$((compile_unit + 1))
     done
 
-    compile_program_output="$(locally "$compile_artifact")" || {
+    compile_program_output="$(compile_local_profile "$compile_artifact")" || {
         compile_error "linked artifact failed verification"
         return 1
     }
@@ -387,9 +618,18 @@ exec "$cxx" -std=c++23 -O2 -fno-ident -c "$source_file" "-Dmain=$symbol" -o "$ob
 
     printf '{"benchmark":"wos_distributed_compile","units":%s,"total_workers":%s,' \
         "$COMPILE_TOTAL_UNITS" "$COMPILE_TOTAL_UNITS"
+    printf '"workload_id":"%s","source_sha256":"%s",' \
+        "$COMPILE_WORKLOAD_ID" "$COMPILE_SOURCE_SHA256"
+    printf '"compiler_path":"%s","compiler_version_sha256":"%s","compiler_sha256":"%s",' \
+        "$COMPILE_COMPILER_PATH" "$COMPILE_COMPILER_VERSION_SHA256" "$COMPILE_COMPILER_SHA256"
+    printf '"wkictl_sha256":"%s",' "$COMPILE_WKICTL_SHA256"
+    printf '"compile_flags":"%s","link_flags":"%s",' "$COMPILE_FLAGS" "$COMPILE_LINK_FLAGS"
+    printf '"cache_policy":"%s",' "$COMPILE_CACHE_POLICY"
     printf '"artifact_digest":"%s","elapsed_seconds":%s,' "$compile_digest" "$compile_elapsed_seconds"
     printf '"placement":"%s","wki_route":"host-workspace","launcher_host":"%s",' \
         "$compile_placement" "$COMPILE_LAUNCHER_HOST"
+    printf '"runtime_route":"local","runtime_paths":%s,' "$COMPILE_RUNTIME_PATHS_JSON"
+    printf '"workspace_route":"host","workspace_path":"%s",' "$compile_workspace"
     printf '"total_work_units":%s,"participants":[' "$COMPILE_TOTAL_UNITS"
     compile_first_participant=1
     while read -r compile_host compile_runner compile_transport compile_host_units; do
@@ -421,6 +661,13 @@ if [ ! -f "$SRC" ]; then
     exit 0
 fi
 
+compile_create_private_root
+trap 'compile_exit_cleanup' 0
+trap 'compile_exit_cleanup; exit 129' HUP
+trap 'compile_exit_cleanup; exit 130' INT
+trap 'compile_exit_cleanup; exit 143' TERM
+cd "$COMPILE_WORK_ROOT"
+
 showcase_section "live compile c++ on WOS"
 showcase_cmd "$CXX" -std=c++23 -O2 "$SRC" -o "$BIN"
 
@@ -441,6 +688,7 @@ if [ -z "$hosts" ]; then
     exit 0
 fi
 compile_validate_hosts "$hosts"
+hosts="$COMPILE_CANONICAL_HOSTS"
 
 if [ "$COMPILE_ONLY" -eq 0 ]; then
     showcase_section "run once on each requested WOS host"

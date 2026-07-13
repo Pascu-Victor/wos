@@ -129,6 +129,82 @@ class ShowcaseMetricSpec:
     metric: str
     fingerprint_fields: tuple[str, ...]
     wki_route: str
+    evidence_contract: str | None = None
+    count_field: str | None = None
+    workspace_route: str | None = None
+    participant_digest: bool = False
+    expected_work_units: int | None = None
+    process_identity: bool = False
+
+
+JOB_MAP_EVIDENCE_CONTRACT = "wos-showcase-job-map-v1"
+JOB_MAP_TOTAL_JOBS = 32
+JOB_MAP_GIT_REPOSITORY = "wos-showcase-git-fixture-v1"
+JOB_MAP_GIT_FILES = 100
+JOB_MAP_GIT_BYTES = 100 * 16 * 1024
+JOB_MAP_GIT_COMMIT = "01cc47f97d58c90edec1b043d7288563d82a923d"
+JOB_MAP_GIT_TREE = "104396b28c8cbbe7f97e3d6a13704881d700f421"
+JOB_MAP_GIT_DIGEST = "20c827ddcaa537afd3379325d782e732190950eaec535af107f4c1580949e1b9"
+JOB_MAP_ROUNDS = {
+    "quick": 20_000,
+    "full": 200_000,
+    "stress": 1_000_000,
+}
+JOB_MAP_PYTHON_DIGESTS = {
+    "wos_python_sha256": {
+        "quick": "24e31aa0d4cf8694503463fec69aef8b1bfa91a5cc7d2a887b497576d9e33887",
+        "full": "da2e3b5fca1be6e37b4fe2bb4e5b118fd1fd090fb77be8528686cb49734007a9",
+        "stress": "c670c4081279ba457b212b76af90859fb08c7aea88acf97ff1fcf1bf4ae52e5c",
+    },
+    "wos_python_json": {
+        "quick": "63f0520ef6c8664e16473f9936dd84d09c56c7a0d2a35a8ec3fb519ffb0adade",
+        "full": "79332e7c99c2097d7ec9a0603433a159925abbd8c44cec38c258ae7600926672",
+        "stress": "1586dfe1209b9d4266e21b333e22eb56d2420c1e246b99b5901ac99bd2f3fb33",
+    },
+}
+SHOWCASE_METADATA_COUNTS = {
+    "quick": 32,
+    "full": 256,
+    "stress": 1000,
+}
+JOB_MAP_WORK_ROOT_PREFIX = "/tmp/wos-showcase-fixed-"
+JOB_MAP_RUNTIME_PATHS = {
+    "/root/wos-showcase",
+    "/usr",
+    "/bin",
+    "/lib",
+    "/lib64",
+    "/libexec",
+    "/share",
+    "/tmp",
+}
+JOB_MAP_RUNTIME_PROVENANCE_FIELDS = {
+    "helper_sha256",
+    "python_sha256",
+    "python_hashlib_runtime_sha256",
+    "python_json_runtime_sha256",
+    "git_sha256",
+    "git_upload_pack_sha256",
+    "wkictl_sha256",
+}
+EXPECTED_FIXED_RESOURCE_HELPER_SHA256 = hashlib.sha256(
+    (
+        ROOT
+        / "configs"
+        / "rootfs"
+        / "root"
+        / "wos-showcase"
+        / "fixed_resource_workloads.py"
+    ).read_bytes()
+).hexdigest()
+COMPILE_WORKLOAD_ID = "wos-live-cpp-32-tu-v1"
+COMPILE_SOURCE_SHA256 = (
+    "aa52bc6a7f7f5b58904b6c1d06fb7f813c8567c97470fbe4161a4e691a60c726"
+)
+COMPILE_COMPILER_PATH = "/usr/bin/clang++"
+COMPILE_FLAGS = "-std=c++23 -O2 -fno-ident"
+COMPILE_LINK_FLAGS = "-std=c++23 -O2 -Wl,--build-id=none"
+COMPILE_CACHE_POLICY = "prewarmed-compiler-source-headers-all-hosts"
 
 
 SHOWCASE_METRICS = {
@@ -136,8 +212,27 @@ SHOWCASE_METRICS = {
         "distributed-compilation",
         "distributed-compilation",
         "elapsed_seconds",
-        ("units", "total_workers", "artifact_digest", "total_work_units"),
+        (
+            "workload_id",
+            "source_sha256",
+            "compiler_path",
+            "compiler_version_sha256",
+            "compiler_sha256",
+            "wkictl_sha256",
+            "compile_flags",
+            "link_flags",
+            "cache_policy",
+            "runtime_route",
+            "runtime_paths",
+            "workspace_route",
+            "units",
+            "total_workers",
+            "artifact_digest",
+            "total_work_units",
+        ),
         "host-workspace",
+        count_field="units",
+        expected_work_units=32,
     ),
     "wos_vfsbench_create": ShowcaseMetricSpec(
         "file-create",
@@ -145,6 +240,8 @@ SHOWCASE_METRICS = {
         "elapsed_seconds",
         ("path", "iterations", "total_work_units"),
         "host-path",
+        count_field="iterations",
+        process_identity=True,
     ),
     "wos_vfsbench_rename": ShowcaseMetricSpec(
         "file-rename",
@@ -152,34 +249,89 @@ SHOWCASE_METRICS = {
         "elapsed_seconds",
         ("path", "iterations", "total_work_units"),
         "host-path",
+        count_field="iterations",
+        process_identity=True,
     ),
     "wos_git_clone": ShowcaseMetricSpec(
         "git-clone",
         "git-clone",
         "elapsed_seconds",
-        ("repository", "commit", "checkout_files", "total_work_units"),
+        (
+            "repository",
+            "scale",
+            "commit",
+            "tree_oid",
+            "checkout_files",
+            "fixture_bytes",
+            "fixture_digest",
+            "artifact_digest",
+            "cache_policy",
+            "runtime_provenance",
+            "total_work_units",
+        ),
         "host-workspace",
+        JOB_MAP_EVIDENCE_CONTRACT,
+        workspace_route="host",
+        participant_digest=True,
+        expected_work_units=JOB_MAP_TOTAL_JOBS,
     ),
     "wos_git_checkout": ShowcaseMetricSpec(
         "git-checkout",
         "git-checkout",
         "elapsed_seconds",
-        ("commit", "checkout_files", "total_work_units"),
+        (
+            "scale",
+            "commit",
+            "tree_oid",
+            "checkout_files",
+            "fixture_bytes",
+            "fixture_digest",
+            "artifact_digest",
+            "cache_policy",
+            "runtime_provenance",
+            "total_work_units",
+        ),
         "host-workspace",
+        JOB_MAP_EVIDENCE_CONTRACT,
+        workspace_route="host",
+        participant_digest=True,
+        expected_work_units=JOB_MAP_TOTAL_JOBS,
     ),
     "wos_python_sha256": ShowcaseMetricSpec(
         "python",
         "python:sha256",
         "elapsed_seconds",
-        ("jobs", "rounds", "digest", "total_work_units"),
+        (
+            "scale",
+            "jobs",
+            "rounds",
+            "digest",
+            "runtime_provenance",
+            "total_work_units",
+        ),
         "local-runtime",
+        JOB_MAP_EVIDENCE_CONTRACT,
+        count_field="jobs",
+        participant_digest=True,
+        expected_work_units=JOB_MAP_TOTAL_JOBS,
     ),
     "wos_python_json": ShowcaseMetricSpec(
         "python",
         "python:json",
         "elapsed_seconds",
-        ("documents", "rounds", "digest", "total_work_units"),
+        (
+            "scale",
+            "documents",
+            "rounds",
+            "digest",
+            "runtime_provenance",
+            "total_work_units",
+        ),
         "local-runtime",
+        JOB_MAP_EVIDENCE_CONTRACT,
+        count_field="documents",
+        participant_digest=True,
+        expected_work_units=JOB_MAP_TOTAL_JOBS,
     ),
 }
 
@@ -929,6 +1081,76 @@ def validate_showcase_participants(
         raise ComparisonError(
             f"{manifest_path}: {benchmark} has no fixed total work count"
         )
+    if (
+        spec.expected_work_units is not None
+        and total_work_units != spec.expected_work_units
+    ):
+        raise ComparisonError(
+            f"{manifest_path}: {benchmark} does not use the required fixed work total"
+        )
+    if spec.count_field is not None:
+        count = payload.get(spec.count_field)
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count != total_work_units
+        ):
+            raise ComparisonError(
+                f"{manifest_path}: {benchmark} count field disagrees with fixed total work"
+            )
+    if benchmark == "wos_distributed_compile":
+        total_workers = payload.get("total_workers")
+        runtime_paths = payload.get("runtime_paths")
+        workspace_path = payload.get("workspace_path")
+        workspace_suffix = (
+            workspace_path.removeprefix(JOB_MAP_WORK_ROOT_PREFIX).removesuffix(
+                "/distributed-compile"
+            )
+            if isinstance(workspace_path, str)
+            and workspace_path.startswith(JOB_MAP_WORK_ROOT_PREFIX)
+            and workspace_path.endswith("/distributed-compile")
+            else ""
+        )
+        if (
+            isinstance(total_workers, bool)
+            or not isinstance(total_workers, int)
+            or total_workers != 32
+            or payload.get("workload_id") != COMPILE_WORKLOAD_ID
+            or payload.get("source_sha256") != COMPILE_SOURCE_SHA256
+            or payload.get("compiler_path") != COMPILE_COMPILER_PATH
+            or not valid_lowercase_hex(payload.get("compiler_version_sha256"), 64)
+            or not valid_lowercase_hex(payload.get("compiler_sha256"), 64)
+            or not valid_lowercase_hex(payload.get("wkictl_sha256"), 64)
+            or payload.get("compile_flags") != COMPILE_FLAGS
+            or payload.get("link_flags") != COMPILE_LINK_FLAGS
+            or payload.get("cache_policy") != COMPILE_CACHE_POLICY
+            or not valid_lowercase_hex(payload.get("artifact_digest"), 64)
+        ):
+            raise ComparisonError(
+                f"{manifest_path}: {benchmark} has invalid fixed compile evidence"
+            )
+        if (
+            payload.get("runtime_route") != "local"
+            or not isinstance(runtime_paths, list)
+            or len(runtime_paths) != len(JOB_MAP_RUNTIME_PATHS)
+            or any(not isinstance(path, str) for path in runtime_paths)
+            or set(runtime_paths) != JOB_MAP_RUNTIME_PATHS
+            or payload.get("workspace_route") != "host"
+            or len(workspace_suffix) != 16
+            or any(
+                character not in "0123456789abcdef" for character in workspace_suffix
+            )
+            or workspace_path
+            != f"{JOB_MAP_WORK_ROOT_PREFIX}{workspace_suffix}/distributed-compile"
+        ):
+            raise ComparisonError(
+                f"{manifest_path}: {benchmark} has invalid compile route evidence"
+            )
+    elif benchmark in ("wos_vfsbench_create", "wos_vfsbench_rename"):
+        if payload.get("path") != "/tmp/wos-showcase-vfsbench":
+            raise ComparisonError(
+                f"{manifest_path}: {benchmark} has invalid HOST path evidence"
+            )
     raw_participants = payload.get("participants")
     if not isinstance(raw_participants, list) or len(raw_participants) != len(
         expected_hosts
@@ -938,6 +1160,7 @@ def validate_showcase_participants(
         )
     actual_hosts: set[str] = set()
     assigned_work = 0
+    work_by_host: dict[str, int] = {}
     for index, participant in enumerate(raw_participants):
         if not isinstance(participant, dict):
             raise ComparisonError(
@@ -966,10 +1189,323 @@ def validate_showcase_participants(
                 f"{manifest_path}: {benchmark} participant {index} has invalid WKI work evidence"
             )
         actual_hosts.add(host)
+        work_by_host[host] = work_units
         assigned_work += work_units
     if actual_hosts != expected_hosts or assigned_work != total_work_units:
         raise ComparisonError(
             f"{manifest_path}: {benchmark} participant coverage/work does not match the fixed topology"
+        )
+    base, extra = divmod(total_work_units, len(expected_hosts))
+    expected_work_by_host = {
+        host: base + (1 if index < extra else 0)
+        for index, host in enumerate(sorted(expected_hosts))
+    }
+    if work_by_host != expected_work_by_host:
+        raise ComparisonError(
+            f"{manifest_path}: {benchmark} participants do not use the canonical fixed partition"
+        )
+    if spec.process_identity:
+        for index, participant in enumerate(raw_participants):
+            host = normalize_wos_hostname(participant["host"])
+            spawner = participant.get("spawner_host")
+            remote_pid = participant.get("remote_pid")
+            if (
+                not isinstance(spawner, str)
+                or normalize_wos_hostname(spawner) != launcher
+                or isinstance(remote_pid, bool)
+                or not isinstance(remote_pid, int)
+                or (host == launcher and remote_pid != 0)
+                or (host != launcher and remote_pid <= 0)
+            ):
+                raise ComparisonError(
+                    f"{manifest_path}: {benchmark} participant {index} has invalid process identity evidence"
+                )
+    if spec.evidence_contract is not None:
+        validate_showcase_job_map(
+            manifest_path,
+            benchmark,
+            payload,
+            spec,
+            expected_hosts,
+            launcher,
+            total_work_units,
+        )
+
+
+def valid_lowercase_hex(value: object, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def validate_showcase_job_map(
+    manifest_path: Path,
+    benchmark: str,
+    payload: dict[str, Any],
+    spec: ShowcaseMetricSpec,
+    expected_hosts: set[str],
+    launcher: str,
+    total_work_units: int,
+) -> None:
+    context = f"{manifest_path}: {benchmark}"
+    if payload.get("evidence_contract") != spec.evidence_contract:
+        raise ComparisonError(f"{context} has no supported job-map evidence contract")
+    runtime_provenance = payload.get("runtime_provenance")
+    if (
+        not isinstance(runtime_provenance, dict)
+        or set(runtime_provenance) != JOB_MAP_RUNTIME_PROVENANCE_FIELDS
+        or any(
+            not valid_lowercase_hex(value, 64) for value in runtime_provenance.values()
+        )
+        or runtime_provenance.get("helper_sha256")
+        != EXPECTED_FIXED_RESOURCE_HELPER_SHA256
+    ):
+        raise ComparisonError(f"{context} has invalid node-local runtime provenance")
+    scale = payload.get("scale")
+    if not isinstance(scale, str) or scale not in JOB_MAP_ROUNDS:
+        raise ComparisonError(f"{context} has invalid showcase scale evidence")
+    if "route_path" not in payload:
+        raise ComparisonError(f"{context} is missing observed route-path evidence")
+    route_path = payload["route_path"]
+    if spec.workspace_route == "host":
+        suffix = (
+            route_path.removeprefix(JOB_MAP_WORK_ROOT_PREFIX)
+            if isinstance(route_path, str)
+            else ""
+        )
+        if (
+            not isinstance(route_path, str)
+            or not route_path.startswith(JOB_MAP_WORK_ROOT_PREFIX)
+            or len(suffix) != 16
+            or any(character not in "0123456789abcdef" for character in suffix)
+        ):
+            raise ComparisonError(f"{context} has invalid HOST workspace evidence")
+    elif route_path is not None:
+        raise ComparisonError(
+            f"{context} unexpectedly routes a local-runtime workspace"
+        )
+
+    participants = payload["participants"]
+    all_job_ids: list[int] = []
+    all_job_digests: dict[int, str] = {}
+    ordered_hosts = sorted(expected_hosts)
+    base, extra = divmod(total_work_units, len(ordered_hosts))
+    expected_assignments: dict[str, tuple[int, list[int]]] = {}
+    first_job = 0
+    for host_index, host in enumerate(ordered_hosts):
+        count = base + (1 if host_index < extra else 0)
+        expected_assignments[host] = (
+            count,
+            list(range(first_job, first_job + count)),
+        )
+        first_job += count
+    required_keys = {
+        "host",
+        "runner_host",
+        "launcher_host",
+        "remote_pid",
+        "job_remote_pids",
+        "strict_target",
+        "transport",
+        "work_units",
+        "completed_work_units",
+        "job_ids",
+        "job_digests",
+        "digest",
+        "runtime_route",
+        "runtime_paths",
+        "workspace_route",
+        "workspace_path",
+    }
+    for index, participant in enumerate(participants):
+        if not required_keys.issubset(participant):
+            raise ComparisonError(
+                f"{context} participant {index} lacks job-map evidence"
+            )
+        host = normalize_wos_hostname(participant["host"])
+        work_units = participant["work_units"]
+        completed = participant["completed_work_units"]
+        job_ids = participant["job_ids"]
+        job_digests = participant["job_digests"]
+        remote_pid = participant["remote_pid"]
+        job_remote_pids = participant["job_remote_pids"]
+        participant_launcher = participant["launcher_host"]
+        if (
+            not isinstance(participant_launcher, str)
+            or not participant_launcher
+            or normalize_wos_hostname(participant_launcher) != launcher
+            or participant["strict_target"] is not True
+            or isinstance(completed, bool)
+            or not isinstance(completed, int)
+            or completed != work_units
+            or not isinstance(job_ids, list)
+            or not isinstance(job_digests, list)
+            or not isinstance(job_remote_pids, list)
+            or len(job_ids) != work_units
+            or len(job_digests) != work_units
+            or len(job_remote_pids) != work_units
+        ):
+            raise ComparisonError(
+                f"{context} participant {index} has inconsistent completion evidence"
+            )
+        if any(
+            isinstance(job_id, bool) or not isinstance(job_id, int) or job_id < 0
+            for job_id in job_ids
+        ):
+            raise ComparisonError(f"{context} participant {index} has invalid job IDs")
+        expected_count, expected_ids = expected_assignments[host]
+        if work_units != expected_count or job_ids != expected_ids:
+            raise ComparisonError(
+                f"{context} participant {index} has the wrong fixed host/job assignment"
+            )
+        if any(not valid_lowercase_hex(digest, 64) for digest in job_digests):
+            raise ComparisonError(
+                f"{context} participant {index} has invalid per-job digests"
+            )
+        if (
+            participant["runtime_route"] != "local"
+            or not isinstance(participant["runtime_paths"], list)
+            or len(participant["runtime_paths"]) != len(JOB_MAP_RUNTIME_PATHS)
+            or any(not isinstance(path, str) for path in participant["runtime_paths"])
+            or set(participant["runtime_paths"]) != JOB_MAP_RUNTIME_PATHS
+            or participant["workspace_route"] != spec.workspace_route
+            or participant["workspace_path"] != route_path
+        ):
+            raise ComparisonError(
+                f"{context} participant {index} has invalid route evidence"
+            )
+        if (
+            isinstance(remote_pid, bool)
+            or not isinstance(remote_pid, int)
+            or any(
+                isinstance(pid, bool) or not isinstance(pid, int)
+                for pid in job_remote_pids
+            )
+        ):
+            raise ComparisonError(
+                f"{context} participant {index} has invalid PID evidence"
+            )
+        if host == launcher:
+            if remote_pid != 0 or any(pid != 0 for pid in job_remote_pids):
+                raise ComparisonError(
+                    f"{context} local participant has remote PID evidence"
+                )
+        elif (
+            remote_pid <= 0
+            or any(pid <= 0 for pid in job_remote_pids)
+            or len(set(job_remote_pids)) != len(job_remote_pids)
+            or remote_pid in job_remote_pids
+        ):
+            raise ComparisonError(
+                f"{context} remote participant has invalid PID evidence"
+            )
+        if spec.participant_digest and not valid_lowercase_hex(
+            participant.get("digest"), 64
+        ):
+            raise ComparisonError(
+                f"{context} participant {index} has invalid digest evidence"
+            )
+        participant_digest = hashlib.sha256()
+        for job_id, job_digest in zip(job_ids, job_digests, strict=True):
+            participant_digest.update(job_id.to_bytes(4, "big"))
+            participant_digest.update(bytes.fromhex(job_digest))
+            if job_id in all_job_digests:
+                raise ComparisonError(f"{context} job map contains a duplicate job ID")
+            all_job_digests[job_id] = job_digest
+        if participant.get("digest") != participant_digest.hexdigest():
+            raise ComparisonError(
+                f"{context} participant {index} digest is not bound to its jobs"
+            )
+        all_job_ids.extend(job_ids)
+
+    if sorted(all_job_ids) != list(range(total_work_units)):
+        raise ComparisonError(
+            f"{context} job map does not cover each fixed work unit exactly once"
+        )
+    aggregate_digest = hashlib.sha256()
+    for job_id in range(total_work_units):
+        aggregate_digest.update(job_id.to_bytes(4, "big"))
+        aggregate_digest.update(bytes.fromhex(all_job_digests[job_id]))
+    aggregate = aggregate_digest.hexdigest()
+
+    if benchmark in ("wos_git_clone", "wos_git_checkout"):
+        if not valid_lowercase_hex(
+            payload.get("commit"), 40
+        ) or not valid_lowercase_hex(payload.get("tree_oid"), 40):
+            raise ComparisonError(f"{context} has invalid Git object identities")
+        for field in ("fixture_digest", "artifact_digest"):
+            if not valid_lowercase_hex(payload.get(field), 64):
+                raise ComparisonError(f"{context} has invalid {field}")
+        expected_cache_policy = (
+            "warm-source-cold-destination"
+            if benchmark == "wos_git_clone"
+            else "post-clone-object-cache"
+        )
+        expected_job_digest = (
+            hashlib.sha256(
+                f"{payload['commit']}\0{payload['tree_oid']}".encode("ascii")
+            ).hexdigest()
+            if benchmark == "wos_git_clone"
+            else payload.get("fixture_digest")
+        )
+        if (
+            payload.get("commit") != JOB_MAP_GIT_COMMIT
+            or payload.get("tree_oid") != JOB_MAP_GIT_TREE
+            or payload.get("fixture_digest") != JOB_MAP_GIT_DIGEST
+            or payload.get("checkout_files") != JOB_MAP_GIT_FILES
+            or isinstance(payload.get("checkout_files"), bool)
+            or not isinstance(payload.get("checkout_files"), int)
+            or payload.get("fixture_bytes") != JOB_MAP_GIT_BYTES
+            or isinstance(payload.get("fixture_bytes"), bool)
+            or not isinstance(payload.get("fixture_bytes"), int)
+            or payload.get("cache_policy") != expected_cache_policy
+            or any(
+                job_digest != expected_job_digest
+                for job_digest in all_job_digests.values()
+            )
+            or payload.get("artifact_digest") != aggregate
+        ):
+            raise ComparisonError(f"{context} has invalid fixed Git workload evidence")
+        if benchmark == "wos_git_clone":
+            expected_uri = f"file://{route_path}/git-fixture.git"
+            if (
+                payload.get("repository") != JOB_MAP_GIT_REPOSITORY
+                or payload.get("repository_uri") != expected_uri
+            ):
+                raise ComparisonError(f"{context} has invalid Git repository evidence")
+    else:
+        rounds = payload.get("rounds")
+        expected_digest = JOB_MAP_PYTHON_DIGESTS[benchmark][scale]
+        if (
+            isinstance(rounds, bool)
+            or not isinstance(rounds, int)
+            or rounds != JOB_MAP_ROUNDS[scale]
+            or not valid_lowercase_hex(payload.get("digest"), 64)
+            or payload.get("digest") != aggregate
+            or payload.get("digest") != expected_digest
+        ):
+            raise ComparisonError(f"{context} has invalid fixed Python work evidence")
+
+
+def validate_git_phase_coherence(
+    manifest_path: Path,
+    clone: dict[str, Any],
+    checkout: dict[str, Any],
+) -> None:
+    coherent_fields = (
+        "scale",
+        "commit",
+        "tree_oid",
+        "checkout_files",
+        "fixture_bytes",
+        "fixture_digest",
+        "route_path",
+    )
+    if any(clone.get(field) != checkout.get(field) for field in coherent_fields):
+        raise ComparisonError(
+            f"{manifest_path}: Git clone/checkout phases do not describe one fixed fixture"
         )
 
 
@@ -993,6 +1529,10 @@ def extract_showcase(
         )
     measurements: list[Measurement] = []
     seen_names: set[str] = set()
+    job_map_payloads: dict[str, dict[str, Any]] = {}
+    showcase_scale = result.get("scale")
+    if not isinstance(showcase_scale, str) or showcase_scale not in JOB_MAP_ROUNDS:
+        raise ComparisonError(f"{manifest_path}: showcase scale evidence is invalid")
     for index, payload in enumerate(raw_measurements):
         if not isinstance(payload, dict):
             raise ComparisonError(
@@ -1007,6 +1547,20 @@ def extract_showcase(
                 f"{manifest_path}: duplicate showcase measurement for {spec.name}"
             )
         seen_names.add(spec.name)
+        if spec.evidence_contract is not None:
+            if payload.get("scale") != showcase_scale:
+                raise ComparisonError(
+                    f"{manifest_path}: {benchmark} scale evidence disagrees with the showcase run"
+                )
+            job_map_payloads[benchmark] = payload
+        if (
+            benchmark in ("wos_vfsbench_create", "wos_vfsbench_rename")
+            and payload.get("total_work_units")
+            != SHOWCASE_METADATA_COUNTS[showcase_scale]
+        ):
+            raise ComparisonError(
+                f"{manifest_path}: {benchmark} does not use the scale-fixed metadata total"
+            )
         validate_showcase_participants(
             manifest_path, benchmark, payload, spec, expected_hosts, launcher
         )
@@ -1025,6 +1579,18 @@ def extract_showcase(
                     f"{manifest_path}: {benchmark}",
                 ),
             )
+        )
+    clone = job_map_payloads.get("wos_git_clone")
+    checkout = job_map_payloads.get("wos_git_checkout")
+    if clone is not None and checkout is not None:
+        validate_git_phase_coherence(manifest_path, clone, checkout)
+    runtime_provenance = {
+        json.dumps(payload.get("runtime_provenance"), sort_keys=True)
+        for payload in job_map_payloads.values()
+    }
+    if len(runtime_provenance) > 1:
+        raise ComparisonError(
+            f"{manifest_path}: fixed-resource phases used different node-local runtimes"
         )
     return measurements
 

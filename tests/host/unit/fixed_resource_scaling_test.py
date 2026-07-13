@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import importlib.util
 import io
@@ -191,6 +192,8 @@ def participants(node_count: int, total_work_units: int) -> list[dict[str, objec
         {
             "host": f"wos-{index}.wos",
             "runner_host": f"wos-{index}.wos",
+            "spawner_host": "wos-0.wos",
+            "remote_pid": 0 if index == 0 else 100 + index,
             "transport": "local" if index == 0 else "wki",
             "work_units": base + (1 if index < extra else 0),
         }
@@ -198,20 +201,233 @@ def participants(node_count: int, total_work_units: int) -> list[dict[str, objec
     ]
 
 
+JOB_MAP_RUNTIME_PATHS = [
+    "/root/wos-showcase",
+    "/usr",
+    "/bin",
+    "/lib",
+    "/lib64",
+    "/libexec",
+    "/share",
+    "/tmp",
+]
+FIXED_RESOURCE_HELPER_SHA256 = hashlib.sha256(
+    (
+        ROOT
+        / "configs"
+        / "rootfs"
+        / "root"
+        / "wos-showcase"
+        / "fixed_resource_workloads.py"
+    ).read_bytes()
+).hexdigest()
+JOB_MAP_RUNTIME_PROVENANCE = {
+    "helper_sha256": FIXED_RESOURCE_HELPER_SHA256,
+    "python_sha256": "8" * 64,
+    "python_hashlib_runtime_sha256": "b" * 64,
+    "python_json_runtime_sha256": "c" * 64,
+    "git_sha256": "9" * 64,
+    "git_upload_pack_sha256": "a" * 64,
+    "wkictl_sha256": "d" * 64,
+}
+JOB_MAP_QUICK_DIGESTS = {
+    "wos_python_sha256": [
+        "468bc27e4ee67c2ebf24615181a7e6a0ca41a406f12d467249e34d28fbaee57b",
+        "ccc19ded6f5ff3cc2c882865e9f354d29ccea271b741ae675595b17a9216628e",
+        "d3f6b7cbcc1b5c1aad9a43677c7d266816fc84c2479ea34c6d28f1ba95fc981e",
+        "e87adc6b282f8f6a65b7fc1d6acfe586ae51a2fa759c3569739b6095e3f768c9",
+        "00c50a91977a752615deb2728be72b7cf71864d55a2d9ad7ee12d8df4c3eed91",
+        "dbfd0c1c3149a93224f113ea4f6733cc0700ff5f161aea1014af9aafb13be9c3",
+        "b655fedcd0f6aa173c3c08a7794f1d9881bc7dc08faf0d27d9facd7c768196f1",
+        "8458443e2a49202ce68e058a1de45eb35ae34cd7c89d8a4bebd9a46c134c9c81",
+        "a76ecd11c936be91a88ca1d8aa42c145e817faa0001a5c793d7e10fb1a26e128",
+        "2b39ca819552539c95dc88d58a5bbbf03790318e707213525efd64e0e00413f0",
+        "bf9ac176c24ea954ed97411b7f65ae390cd3198d23bad5c96cdb51665c4bca81",
+        "f4eddef70745691ad3fd4e415514d8b00c72397368f5690f3e290da89c74c717",
+        "feec768afd27e0dcaf7d7275bd38e6b91031cd735940f54e6ccb744e3717337a",
+        "9db1b7532379f61aacea948f4bec850d8b828bec1b87bcbc7e3d3bd2ed3ced36",
+        "613a30d6d1953734059a09f20b4f7be1d7b533b82cdf3e0070efda82a4b7e87d",
+        "37247511d24f2762050cda17811a78c9d73231e9cc3648022cf3fa962e9db766",
+        "43bb23df40451f376afba703554c34b034a7922ca2f3bb6f002003bd20ad32b3",
+        "aa9cbbd8ecb493768a9ca5582728925f09147297e074abad6bbeaafa7069c9e9",
+        "84af72f35365ad3b1cface43002e3df5eaf324481d3910388c7845eae6e9fea8",
+        "2e4ec263604b7700a74ffa774e86e8e515e7d0e2bfa3ecd7e2e8f23030a00483",
+        "e804be602686bfcc14ea856f54fc7b603d94df3b499b4c0c89f44f873519a9b3",
+        "ce37d29b3faf34b815c387c5109403c77b5711f826b4832309c955cfaed60c2e",
+        "c7bcb5a2d3120cbc4aba271476e23b2c0cb70e723577f181d54f33164f3af6da",
+        "6ad6a7527bb59af8e47935c64f947536a0ab780dd7b478d65f179a39297d8ba8",
+        "eb43afaba54b02c44b5179de8e1c49355df071b516b3e263d30ac55144bc0f91",
+        "db218618ea22da627b612fe34055f2817750265620b7d1315e15b7dd3d2db9d5",
+        "39a987373e533e6f9d35e3c26ed71b414d7a3fc9718ea2b1850c3825fec1b112",
+        "367d287f01d1538609859c5d8c13fef60c2c540d9798bee3f11e197c5733a1d3",
+        "92752af5ec79247b2d4ae6ecf4e81122fb2661eaefe2b383fd99bc88a491ca89",
+        "87e56850695e6574a8639a27a40f745afa5712dba25e8567943f6096e4e6b3b7",
+        "f1550787b3ca9c6a2acaa9507e1805f11cd17d38283e62e6b5a2bf825a9f1e88",
+        "c7e1b6b48087bfdd7528a0a81d6daec4e6547e1f4859c23e69a670a1e8f733e2",
+    ],
+    "wos_python_json": [
+        "4675c457b9523915ce6a91f1dc0067dd57984894c0002e0638644f1be7db3d5d",
+        "f4ae413b470b636e77d6312d7be509f4e642811fb465ba5f9921fc1c732735b3",
+        "09142eb8832f63e2c86953a66dd47b3ef425d5e32c25e6595493f32e646e612f",
+        "d2ccc620a1efa5674b9c7d13314403b55c78e68881082f99d5228e5e90c23ef8",
+        "e4c96710c7a739ab163a6f245af57e8279b05f589facb234809ac032c5f534aa",
+        "9e9f9db65718154a52a9575a005efe0add5d718f58e3c568c31075ab0eea7726",
+        "8fad2a2182beb46f98cceda1d7b73f3dea205659a70b9f165507de33ef68a7bc",
+        "15acaf799a5e28e42b01f8bfd02ffab0a850fb892c73c1d8c7436879d292252b",
+        "dd6f001fb82f1028a16dfc72ba5a12445f0a8b87a2acc47134de974e4829aa1a",
+        "e1e95ef75bf6f0098e7a3c9de11718cfac29be8dc76c0e8ffa6f9ac84854890d",
+        "495abdd0ac7ae82b5f86de09b9e46c39c2b2c0015c48f61004d8d46e51fb263c",
+        "9d48dd348c04e90ad40ba38cff7b8d1b4bdba7584fd80549265bf39ec58073cc",
+        "4a86c02219319fb632aae5226d10fbc3cd231ebf0302608bbfdd51662ddab5a3",
+        "9a972dcdbb8ac619ace2699026eea4977b2e89b32aafbdee6941a609e909d0bb",
+        "23dbe8a5b81ac42c62d60bb6483308dd633eba4eac07166b17d0d7ad39966141",
+        "dbaddd29b14058bac5409b510fdab87252f064024d3145200804bb1412d0d2a5",
+        "aed4b8aee0be3cb8d6ba89963d74faed42226bddc576f1719c303c2e7084c311",
+        "549315c1505bf4c95d2292304b5250add8d40384ea48462342c300882896e94c",
+        "63896e2aa58d81aff30791c8a2ec9bff578bbdedeea20c278196a6fa1751b4c1",
+        "48450000b436f2b55f2f6f407654ab219588e9ff291c28f785da22130a6c6ac4",
+        "9106909a4d2a113abbfe1a723932138a24b13dcc12833a1412200755c1ce5b2d",
+        "1cd2c3c9e06a4a9dfae6d49254639d964e2454a0e3a67f2a5e296293fe832b47",
+        "c04fa9d9cadf5df91d419731a922fb98674ee851c47494ce63c71b756c244a40",
+        "5883cad3a051833596d012667b365369a5731eea124fc4ff3d200f2482ccd490",
+        "ecbd0f66726843701b69d38d0e3a01e3e1799149433554f3a0efebd1afffd767",
+        "9b613be77d16aa70d809108d3051f7d3b36f9d5ac251a5bde652ece28b9ef0ee",
+        "2654e3fd62fd6321ad484f904db2d2a9c645972507b8809214ce0797c9e2fc3f",
+        "b465de6ee05e8d2a4215d66997edc9b2ec07fec31ed3a934688e826392f3a827",
+        "eab3d360435182cfc3f80cb4f3c7d5efe5085395ae7581fcc4b1f9843f037ebf",
+        "4def86ec58ce049cb7b7bdf8047dc86551bd4e22c4ca3135e1ea8530d872df99",
+        "8ed293bd752d2cb07d2fb7f3fb8a7d9f7f6db48db97be985cb9cff34236e253b",
+        "cb96f87f06da25d19d8722627d707e1ec8a0b352c2e3ef1c5052ff52f6aa365d",
+    ],
+}
+
+
+def job_map_participants(
+    node_count: int,
+    total_work_units: int,
+    route_path: str | None,
+    payload: dict[str, object],
+) -> list[dict[str, object]]:
+    benchmark = str(payload["benchmark"])
+    base, extra = divmod(total_work_units, node_count)
+    result: list[dict[str, object]] = []
+    first_job = 0
+    for index in range(node_count):
+        work_units = base + (1 if index < extra else 0)
+        job_ids = list(range(first_job, first_job + work_units))
+        if benchmark == "wos_git_clone":
+            job_digest = hashlib.sha256(
+                f"{payload['commit']}\0{payload['tree_oid']}".encode("ascii")
+            ).hexdigest()
+            job_digests = [job_digest] * work_units
+        elif benchmark == "wos_git_checkout":
+            job_digests = [str(payload["fixture_digest"])] * work_units
+        else:
+            job_digests = [
+                JOB_MAP_QUICK_DIGESTS[benchmark][job_id] for job_id in job_ids
+            ]
+        participant_digest = hashlib.sha256()
+        for job_id, job_digest in zip(job_ids, job_digests, strict=True):
+            participant_digest.update(job_id.to_bytes(4, "big"))
+            participant_digest.update(bytes.fromhex(job_digest))
+        remote = index != 0
+        result.append(
+            {
+                "host": f"wos-{index}.wos",
+                "runner_host": f"wos-{index}.wos",
+                "launcher_host": "wos-0.wos",
+                "remote_pid": 100 + index if remote else 0,
+                "job_remote_pids": (
+                    [1000 + job_id for job_id in job_ids]
+                    if remote
+                    else [0] * work_units
+                ),
+                "strict_target": True,
+                "transport": "wki" if remote else "local",
+                "work_units": work_units,
+                "completed_work_units": work_units,
+                "job_ids": job_ids,
+                "job_digests": job_digests,
+                "runtime_route": "local",
+                "runtime_paths": JOB_MAP_RUNTIME_PATHS,
+                "workspace_route": "host" if route_path is not None else None,
+                "workspace_path": route_path,
+                "digest": participant_digest.hexdigest(),
+            }
+        )
+        first_job += work_units
+    return result
+
+
 def showcase_measurement(
     payload: dict[str, object],
     node_count: int,
     total_work_units: int,
     wki_route: str,
+    *,
+    job_map: bool = False,
 ) -> dict[str, object]:
-    return {
+    route_path = (
+        "/tmp/wos-showcase-fixed-0123456789abcdef"
+        if wki_route == "host-workspace"
+        else None
+    )
+    benchmark = str(payload["benchmark"])
+    result = {
         **payload,
         "placement": "local-baseline" if node_count == 1 else "strict-on",
         "wki_route": wki_route,
         "launcher_host": "wos-0.wos",
         "total_work_units": total_work_units,
-        "participants": participants(node_count, total_work_units),
+        "participants": (
+            job_map_participants(node_count, total_work_units, route_path, payload)
+            if job_map
+            else participants(node_count, total_work_units)
+        ),
     }
+    if job_map:
+        aggregate_digest = hashlib.sha256()
+        for participant in result["participants"]:
+            for job_id, job_digest in zip(
+                participant["job_ids"], participant["job_digests"], strict=True
+            ):
+                aggregate_digest.update(job_id.to_bytes(4, "big"))
+                aggregate_digest.update(bytes.fromhex(job_digest))
+        aggregate = aggregate_digest.hexdigest()
+        result.update(
+            {
+                "evidence_contract": "wos-showcase-job-map-v1",
+                "route_path": route_path,
+                "runtime_provenance": JOB_MAP_RUNTIME_PROVENANCE,
+                "scale": "quick",
+            }
+        )
+        if benchmark in ("wos_git_clone", "wos_git_checkout"):
+            result["artifact_digest"] = aggregate
+        else:
+            result["digest"] = aggregate
+    return result
+
+
+def rebind_job_map_digests(
+    payload: dict[str, object], job_digests: list[str], aggregate_field: str
+) -> None:
+    aggregate = hashlib.sha256()
+    for participant in payload["participants"]:
+        participant_digest = hashlib.sha256()
+        first_job = participant["job_ids"][0]
+        count = participant["work_units"]
+        selected = job_digests[first_job : first_job + count]
+        participant["job_digests"] = selected
+        for job_id, job_digest in zip(participant["job_ids"], selected, strict=True):
+            encoded_job = job_id.to_bytes(4, "big")
+            encoded_digest = bytes.fromhex(job_digest)
+            participant_digest.update(encoded_job)
+            participant_digest.update(encoded_digest)
+            aggregate.update(encoded_job)
+            aggregate.update(encoded_digest)
+        participant["digest"] = participant_digest.hexdigest()
+    payload[aggregate_field] = aggregate.hexdigest()
 
 
 def showcase_measurements(scale: float, node_count: int) -> list[dict[str, object]]:
@@ -219,9 +435,22 @@ def showcase_measurements(scale: float, node_count: int) -> list[dict[str, objec
         showcase_measurement(
             {
                 "benchmark": "wos_distributed_compile",
+                "workload_id": "wos-live-cpp-32-tu-v1",
+                "source_sha256": "aa52bc6a7f7f5b58904b6c1d06fb7f813c8567c97470fbe4161a4e691a60c726",
+                "compiler_path": "/usr/bin/clang++",
+                "compiler_version_sha256": "7f5ddecc0cfc8134433d3e5e6df0d6b264fd4e11e95e820c745400907363fa43",
+                "compiler_sha256": "6" * 64,
+                "wkictl_sha256": "5" * 64,
+                "compile_flags": "-std=c++23 -O2 -fno-ident",
+                "link_flags": "-std=c++23 -O2 -Wl,--build-id=none",
+                "cache_policy": "prewarmed-compiler-source-headers-all-hosts",
+                "runtime_route": "local",
+                "runtime_paths": JOB_MAP_RUNTIME_PATHS,
+                "workspace_route": "host",
+                "workspace_path": "/tmp/wos-showcase-fixed-0123456789abcdef/distributed-compile",
                 "units": 32,
                 "total_workers": 32,
-                "artifact_digest": "compile-digest",
+                "artifact_digest": "a" * 64,
                 "elapsed_seconds": 20.0 * scale,
             },
             node_count,
@@ -232,70 +461,85 @@ def showcase_measurements(scale: float, node_count: int) -> list[dict[str, objec
             {
                 "benchmark": "wos_vfsbench_create",
                 "path": "/tmp/wos-showcase-vfsbench",
-                "iterations": 256,
+                "iterations": 32,
                 "elapsed_seconds": 3.0 * scale,
             },
             node_count,
-            256,
+            32,
             "host-path",
         ),
         showcase_measurement(
             {
                 "benchmark": "wos_vfsbench_rename",
                 "path": "/tmp/wos-showcase-vfsbench",
-                "iterations": 256,
+                "iterations": 32,
                 "elapsed_seconds": 2.5 * scale,
             },
             node_count,
-            256,
+            32,
             "host-path",
         ),
         showcase_measurement(
             {
                 "benchmark": "wos_git_clone",
-                "repository": "file:///srv/fixture.git",
-                "commit": "fixture-commit",
+                "repository": "wos-showcase-git-fixture-v1",
+                "repository_uri": "file:///tmp/wos-showcase-fixed-0123456789abcdef/git-fixture.git",
+                "commit": "01cc47f97d58c90edec1b043d7288563d82a923d",
+                "tree_oid": "104396b28c8cbbe7f97e3d6a13704881d700f421",
                 "checkout_files": 100,
+                "fixture_bytes": 1638400,
+                "fixture_digest": "20c827ddcaa537afd3379325d782e732190950eaec535af107f4c1580949e1b9",
+                "artifact_digest": "4" * 64,
+                "cache_policy": "warm-source-cold-destination",
                 "elapsed_seconds": 3.0 * scale,
             },
             node_count,
             32,
             "host-workspace",
+            job_map=True,
         ),
         showcase_measurement(
             {
                 "benchmark": "wos_git_checkout",
-                "commit": "fixture-commit",
+                "commit": "01cc47f97d58c90edec1b043d7288563d82a923d",
+                "tree_oid": "104396b28c8cbbe7f97e3d6a13704881d700f421",
                 "checkout_files": 100,
+                "fixture_bytes": 1638400,
+                "fixture_digest": "20c827ddcaa537afd3379325d782e732190950eaec535af107f4c1580949e1b9",
+                "artifact_digest": "5" * 64,
+                "cache_policy": "post-clone-object-cache",
                 "elapsed_seconds": 2.0 * scale,
             },
             node_count,
             32,
             "host-workspace",
+            job_map=True,
         ),
         showcase_measurement(
             {
                 "benchmark": "wos_python_sha256",
                 "jobs": 32,
-                "rounds": 1000,
-                "digest": "python-sha256-digest",
+                "rounds": 20_000,
+                "digest": "6" * 64,
                 "elapsed_seconds": 4.0 * scale,
             },
             node_count,
             32,
             "local-runtime",
+            job_map=True,
         ),
         showcase_measurement(
             {
                 "benchmark": "wos_python_json",
                 "documents": 32,
-                "rounds": 1000,
-                "digest": "python-json-digest",
+                "rounds": 20_000,
+                "digest": "7" * 64,
                 "elapsed_seconds": 5.0 * scale,
             },
             node_count,
             32,
             "local-runtime",
+            job_map=True,
         ),
     ]
 
@@ -383,6 +627,7 @@ def write_run(
             showcase_path,
             {
                 "benchmark": "showcase",
+                "scale": "quick",
                 "measurements": showcase_measurements(measured_scale, node_count),
             },
         )
@@ -842,6 +1087,346 @@ def test_showcase_routing_participant_coverage_and_python_rows(comparator) -> No
             required_workloads=("distributed-compilation",),
         )
 
+        changed_compile_source = complete_matrix(root / "changed-compile-source")
+        candidate = result_path_for(changed_compile_source[0], "wos-showcase")
+        payload = read_json(candidate)
+        payload["measurements"][0]["source_sha256"] = "0" * 64
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            changed_compile_source,
+            "invalid fixed compile evidence",
+            required_workloads=("distributed-compilation",),
+        )
+
+        bad_compile_cache_policy = complete_matrix(root / "bad-compile-cache-policy")
+        candidate = result_path_for(bad_compile_cache_policy[-1], "wos-showcase")
+        payload = read_json(candidate)
+        payload["measurements"][0]["cache_policy"] = "launcher-only-warm-cache"
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            bad_compile_cache_policy,
+            "invalid fixed compile evidence",
+            required_workloads=("distributed-compilation",),
+        )
+
+        changed_compile_binary = complete_matrix(root / "changed-compile-binary")
+        candidate = result_path_for(changed_compile_binary[0], "wos-showcase")
+        payload = read_json(candidate)
+        payload["measurements"][0]["compiler_sha256"] = "7" * 64
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            changed_compile_binary,
+            "workload parameters differ for distributed-compilation",
+            required_workloads=("distributed-compilation",),
+        )
+
+        changed_wkictl_binary = complete_matrix(root / "changed-wkictl-binary")
+        candidate = result_path_for(changed_wkictl_binary[0], "wos-showcase")
+        payload = read_json(candidate)
+        payload["measurements"][0]["wkictl_sha256"] = "4" * 64
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            changed_wkictl_binary,
+            "workload parameters differ for distributed-compilation",
+            required_workloads=("distributed-compilation",),
+        )
+
+        bad_compile_routes = complete_matrix(root / "bad-compile-routes")
+        candidate = result_path_for(bad_compile_routes[-1], "wos-showcase")
+        payload = read_json(candidate)
+        payload["measurements"][0]["runtime_route"] = "host"
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            bad_compile_routes,
+            "invalid compile route evidence",
+            required_workloads=("distributed-compilation",),
+        )
+
+        bad_compile_workspace = complete_matrix(root / "bad-compile-workspace")
+        candidate = result_path_for(bad_compile_workspace[-1], "wos-showcase")
+        payload = read_json(candidate)
+        payload["measurements"][0][
+            "workspace_path"
+        ] = "/tmp/wos-showcase-fixed-0123456789abcdef/distributed-compile-extra"
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            bad_compile_workspace,
+            "invalid compile route evidence",
+            required_workloads=("distributed-compilation",),
+        )
+
+        for benchmark, workload in (
+            ("wos_distributed_compile", "distributed-compilation"),
+            ("wos_vfsbench_create", "file-create"),
+        ):
+            unbalanced = complete_matrix(root / f"unbalanced-{benchmark}")
+            candidate = result_path_for(unbalanced[-1], "wos-showcase")
+            payload = read_json(candidate)
+            measurement = next(
+                item
+                for item in payload["measurements"]
+                if item["benchmark"] == benchmark
+            )
+            for participant, work_units in zip(
+                measurement["participants"], (29, 1, 1, 1), strict=True
+            ):
+                participant["work_units"] = work_units
+            write_json(candidate, payload)
+            expect_error(
+                comparator,
+                unbalanced,
+                "canonical fixed partition",
+                required_workloads=(workload,),
+            )
+
+
+def test_showcase_job_map_evidence_contract_is_strict(comparator) -> None:
+    expected_hosts = {"wos-0", "wos-1", "wos-2"}
+    launcher = "wos-0"
+    manifest = Path("job-map-fixture.json")
+    git_payload = next(
+        measurement
+        for measurement in showcase_measurements(1.0, 3)
+        if measurement["benchmark"] == "wos_git_clone"
+    )
+    git_spec = comparator.SHOWCASE_METRICS["wos_git_clone"]
+
+    def validate(payload: dict[str, object], benchmark: str, spec) -> None:
+        comparator.validate_showcase_participants(
+            manifest,
+            benchmark,
+            payload,
+            spec,
+            expected_hosts,
+            launcher,
+        )
+
+    def reject(
+        label: str,
+        payload: dict[str, object],
+        benchmark: str = "wos_git_clone",
+        spec=git_spec,
+    ) -> None:
+        try:
+            validate(payload, benchmark, spec)
+        except comparator.ComparisonError:
+            return
+        fail(f"job-map validator accepted {label}")
+
+    validate(git_payload, "wos_git_clone", git_spec)
+
+    mutations = {
+        "missing evidence contract": lambda payload: payload.pop("evidence_contract"),
+        "incomplete work": lambda payload: payload["participants"][0].__setitem__(
+            "completed_work_units", 10
+        ),
+        "duplicate job ID": lambda payload: payload["participants"][1][
+            "job_ids"
+        ].__setitem__(0, 0),
+        "zero remote job PID": lambda payload: payload["participants"][1][
+            "job_remote_pids"
+        ].__setitem__(0, 0),
+        "missing runtime route": lambda payload: payload["participants"][1][
+            "runtime_paths"
+        ].pop(),
+        "wrong workspace path": lambda payload: payload["participants"][1].__setitem__(
+            "workspace_path", "/tmp/not-the-measured-workspace"
+        ),
+        "non-strict target": lambda payload: payload["participants"][1].__setitem__(
+            "strict_target", False
+        ),
+        "invalid participant digest": lambda payload: payload["participants"][
+            1
+        ].__setitem__("digest", "A" * 64),
+        "changed per-job digest": lambda payload: payload["participants"][1][
+            "job_digests"
+        ].__setitem__(0, "0" * 64),
+        "changed aggregate digest": lambda payload: payload.__setitem__(
+            "artifact_digest", "0" * 64
+        ),
+        "missing top-level route path": lambda payload: payload.pop("route_path"),
+        "noncanonical route path": lambda payload: payload.__setitem__(
+            "route_path", "/usr"
+        ),
+        "missing repository URI": lambda payload: payload.pop("repository_uri"),
+        "null participant launcher": lambda payload: payload["participants"][
+            1
+        ].__setitem__("launcher_host", None),
+        "wrong helper provenance": lambda payload: payload[
+            "runtime_provenance"
+        ].__setitem__("helper_sha256", "0" * 64),
+    }
+    for label, mutate in mutations.items():
+        candidate = copy.deepcopy(git_payload)
+        mutate(candidate)
+        reject(label, candidate)
+
+    swapped = copy.deepcopy(git_payload)
+    first = swapped["participants"][0]
+    last = swapped["participants"][2]
+    for field in (
+        "work_units",
+        "completed_work_units",
+        "job_ids",
+        "job_digests",
+        "digest",
+    ):
+        first[field], last[field] = last[field], first[field]
+    first["job_remote_pids"] = [0] * first["work_units"]
+    last["job_remote_pids"] = list(range(2000, 2000 + last["work_units"]))
+    reject("swapped canonical host ranges", swapped)
+
+    for total in (4, 31, 33):
+        reduced = showcase_measurement(
+            copy.deepcopy(git_payload),
+            3 if total != 4 else 4,
+            total,
+            "host-workspace",
+            job_map=True,
+        )
+        reject(f"fixed total {total}", reduced)
+
+    python_payload = next(
+        measurement
+        for measurement in showcase_measurements(1.0, 3)
+        if measurement["benchmark"] == "wos_python_sha256"
+    )
+    for invalid_count in (31, 32.0):
+        candidate = copy.deepcopy(python_payload)
+        candidate["jobs"] = invalid_count
+        reject(
+            f"Python count {invalid_count!r}",
+            candidate,
+            "wos_python_sha256",
+            comparator.SHOWCASE_METRICS["wos_python_sha256"],
+        )
+
+    invalid_rounds = copy.deepcopy(python_payload)
+    invalid_rounds["rounds"] = 0
+    reject(
+        "Python rounds mismatch",
+        invalid_rounds,
+        "wos_python_sha256",
+        comparator.SHOWCASE_METRICS["wos_python_sha256"],
+    )
+
+    substituted_git = copy.deepcopy(git_payload)
+    substituted_git["commit"] = "a" * 40
+    substituted_git["tree_oid"] = "b" * 40
+    substituted_git["fixture_digest"] = "c" * 64
+    substituted_job_digest = hashlib.sha256(
+        f"{substituted_git['commit']}\0{substituted_git['tree_oid']}".encode("ascii")
+    ).hexdigest()
+    rebind_job_map_digests(
+        substituted_git, [substituted_job_digest] * 32, "artifact_digest"
+    )
+    reject("coherent substituted Git fixture", substituted_git)
+
+    substituted_python = copy.deepcopy(python_payload)
+    rebind_job_map_digests(substituted_python, ["0" * 64] * 32, "digest")
+    reject(
+        "coherent substituted Python outputs",
+        substituted_python,
+        "wos_python_sha256",
+        comparator.SHOWCASE_METRICS["wos_python_sha256"],
+    )
+
+
+def test_showcase_cross_phase_and_outer_evidence_is_coherent(comparator) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+
+        incoherent_git = complete_matrix(root / "incoherent-git")
+        candidate = result_path_for(incoherent_git[0], "wos-showcase")
+        payload = read_json(candidate)
+        checkout = next(
+            measurement
+            for measurement in payload["measurements"]
+            if measurement["benchmark"] == "wos_git_checkout"
+        )
+        checkout["commit"] = "f" * 40
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            incoherent_git,
+            "invalid fixed Git workload evidence",
+            required_workloads=("git-clone", "git-checkout"),
+        )
+
+        mismatched_scale = complete_matrix(root / "mismatched-scale")
+        candidate = result_path_for(mismatched_scale[0], "wos-showcase")
+        payload = read_json(candidate)
+        payload["scale"] = "stress"
+        for measurement in payload["measurements"]:
+            if measurement["benchmark"] in (
+                "wos_vfsbench_create",
+                "wos_vfsbench_rename",
+            ):
+                measurement["iterations"] = 1000
+                measurement["total_work_units"] = 1000
+                measurement["participants"][0]["work_units"] = 1000
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            mismatched_scale,
+            "scale evidence disagrees",
+            required_workloads=("python",),
+        )
+
+        reduced_metadata = complete_matrix(root / "reduced-metadata")
+        candidate = result_path_for(reduced_metadata[0], "wos-showcase")
+        payload = read_json(candidate)
+        create = next(
+            measurement
+            for measurement in payload["measurements"]
+            if measurement["benchmark"] == "wos_vfsbench_create"
+        )
+        create["iterations"] = 31
+        create["total_work_units"] = 31
+        create["participants"][0]["work_units"] = 31
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            reduced_metadata,
+            "scale-fixed metadata total",
+            required_workloads=("file-create",),
+        )
+
+        null_launcher = complete_matrix(root / "null-launcher")
+        candidate = result_path_for(null_launcher[1], "wos-showcase")
+        payload = read_json(candidate)
+        payload["measurements"][3]["participants"][0]["launcher_host"] = None
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            null_launcher,
+            "inconsistent completion evidence",
+            required_workloads=("git-clone",),
+        )
+
+        mixed_runtime = complete_matrix(root / "mixed-runtime")
+        candidate = result_path_for(mixed_runtime[0], "wos-showcase")
+        payload = read_json(candidate)
+        python_json = next(
+            measurement
+            for measurement in payload["measurements"]
+            if measurement["benchmark"] == "wos_python_json"
+        )
+        python_json["runtime_provenance"]["python_sha256"] = "b" * 64
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            mixed_runtime,
+            "different node-local runtimes",
+            required_workloads=("python",),
+        )
+
 
 def run_cli(comparator, argv: list[str]) -> tuple[int, str, str]:
     stdout = io.StringIO()
@@ -899,6 +1484,8 @@ def main() -> None:
         test_provenance_launcher_and_exact_topology_reject,
         test_render_matrix_and_per_host_work_are_enforced,
         test_showcase_routing_participant_coverage_and_python_rows,
+        test_showcase_job_map_evidence_contract_is_strict,
+        test_showcase_cross_phase_and_outer_evidence_is_coherent,
         test_cli_return_codes_and_machine_readable_result,
     ]
     for test in tests:

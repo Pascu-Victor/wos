@@ -89,7 +89,7 @@ case "$SCALE" in
 esac
 
 if [ -z "$SCRIPTS" ]; then
-    SCRIPTS="00-wki-map.sh 10-placement-hop.sh 20-forward-vfs.sh 30-bench-wki.sh 40-live-cpp-distributed.sh"
+    SCRIPTS="00-wki-map.sh 10-placement-hop.sh 20-forward-vfs.sh 30-bench-wki.sh 40-live-cpp-distributed.sh 50-fixed-resource-workloads.sh"
 fi
 
 LOG_DIR="$OUTPUT_ROOT/logs"

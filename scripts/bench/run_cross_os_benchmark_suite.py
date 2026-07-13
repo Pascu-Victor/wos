@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import signal
@@ -30,6 +31,9 @@ WOS_ACCEPTANCE_TOTAL_MEMORY_MIB = 32 * 1024
 # Keep this aligned with compare_fixed_resource_scaling.py. WOS MemTotal reports
 # allocator-visible usable memory rather than the QEMU -m value.
 WOS_RUNTIME_MIN_USABLE_MEMORY_PERCENT = 85
+WOS_FIXED_RESOURCE_CWD_RE = re.compile(
+    r"/tmp/wos-showcase-fixed-[0-9a-f]{16}(?:/.*)?"
+)
 
 
 @dataclass(frozen=True)
@@ -118,6 +122,16 @@ def positive_timeout(seconds: float) -> float | None:
     return seconds if seconds > 0 else None
 
 
+def finite_nonnegative_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a finite nonnegative number") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("expected a finite nonnegative number")
+    return parsed
+
+
 def wos_remote_command(host: str, command: str, *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
     return run_command([str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, command], timeout=timeout)
 
@@ -137,20 +151,66 @@ def wos_remote_file_sha256(host: str, path: str, *, timeout: float) -> str:
 
 
 def wos_benchmark_pids(host: str, *, timeout: float) -> list[int]:
-    result = wos_remote_command(host, "ps aux 2>/dev/null || ps", timeout=timeout)
+    result = wos_remote_command(
+        host,
+        "for f in /proc/[0-9]*/cmdline; do "
+        '[ -r "$f" ] || continue; '
+        'pid=${f#/proc/}; pid=${pid%/cmdline}; '
+        'cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue; '
+        "printf '%s\\t' \"$pid\"; "
+        "tr '\\000' ' ' < \"$f\"; "
+        "printf '\\t%s\\n' \"$cwd\"; "
+        "done",
+        timeout=timeout,
+    )
     pids: list[int] = []
     for line in result.stdout.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("PID "):
+        fields = line.split("\t", 2)
+        if len(fields) != 3 or not fields[0].isdigit():
             continue
-        fields = stripped.split(maxsplit=4)
-        if len(fields) < 5 or not fields[0].isdigit():
+        pid_text, command_text, cwd = fields
+        command_text = command_text.split("\0", 1)[0]
+        command_fields = command_text.split()
+        if not command_fields:
             continue
-        command = fields[4].split("\0", 1)[0].split()[0]
+        command = command_fields[0]
         basename = os.path.basename(command)
-        if basename in {"renderbench", "testprog"}:
-            pids.append(int(fields[0]))
+        if (
+            basename in {"renderbench", "testprog"}
+            or WOS_FIXED_RESOURCE_CWD_RE.fullmatch(cwd) is not None
+        ):
+            pids.append(int(pid_text))
     return pids
+
+
+def cleanup_wos_stale_work_roots(host: str, *, timeout: float) -> None:
+    wos_remote_command(
+        host,
+        "for d in /tmp/wos-showcase-fixed-*; do "
+        '[ -d "$d" ] && [ ! -L "$d" ] || continue; '
+        'name=${d##*/}; suffix=${name#wos-showcase-fixed-}; '
+        '[ "${#suffix}" -eq 16 ] || continue; '
+        'case "$suffix" in *[!0-9a-f]*) continue;; esac; '
+        'marker="$d/.wos-showcase-owner"; '
+        '[ -f "$marker" ] && [ ! -L "$marker" ] || continue; '
+        'bytes=$(wc -c < "$marker" 2>/dev/null) || continue; '
+        '[ "$bytes" -eq 32 ] || continue; '
+        'owner_x=$(cat "$marker" 2>/dev/null && printf x) || continue; '
+        'owner=${owner_x%x}; '
+        '[ "${#owner}" -eq 32 ] || continue; '
+        'case "$owner" in *[!0-9a-f]*) continue;; esac; '
+        'owner_prefix=${owner%????????????????}; '
+        '[ "$owner_prefix" = "$suffix" ] || continue; '
+        'rm -rf -- "$d"; '
+        "done",
+        timeout=timeout,
+    )
+
+
+def launcher_first_hosts(launcher: str, hosts: list[str]) -> list[str]:
+    if launcher not in hosts or len(set(hosts)) != len(hosts):
+        raise ValueError("WOS launcher must appear exactly once in the host list")
+    return [launcher, *(host for host in hosts if host != launcher)]
 
 
 def kill_wos_pids(host: str, pids: list[int], signal: str, *, timeout: float) -> None:
@@ -172,23 +232,30 @@ def prepare_wos_hosts(args: argparse.Namespace, hosts: list[str]) -> None:
             failures.append(f"{host}: unreachable ({exc})")
             continue
 
-        pids = wos_benchmark_pids(host, timeout=args.wos_preflight_timeout)
-        if not pids:
+        try:
+            pids = wos_benchmark_pids(host, timeout=args.wos_preflight_timeout)
+            remaining = pids
+            if pids:
+                print(f"[suite] cleanup {host}: stale benchmark pids {','.join(str(pid) for pid in pids)}")
+                kill_wos_pids(host, pids, "TERM", timeout=args.wos_preflight_timeout)
+                remaining = wos_benchmark_pids(host, timeout=args.wos_preflight_timeout)
+                if remaining:
+                    kill_wos_pids(host, remaining, "KILL", timeout=args.wos_preflight_timeout)
+                    remaining = wos_benchmark_pids(host, timeout=args.wos_preflight_timeout)
+        except RuntimeError as exc:
+            failures.append(f"{host}: stale benchmark process cleanup failed ({exc})")
             continue
-
-        print(f"[suite] cleanup {host}: stale benchmark pids {','.join(str(pid) for pid in pids)}")
-        kill_wos_pids(host, pids, "TERM", timeout=args.wos_preflight_timeout)
-        remaining = wos_benchmark_pids(host, timeout=args.wos_preflight_timeout)
-        remaining = [pid for pid in remaining if pid in pids]
-        if remaining:
-            kill_wos_pids(host, remaining, "KILL", timeout=args.wos_preflight_timeout)
-            remaining = wos_benchmark_pids(host, timeout=args.wos_preflight_timeout)
-            remaining = [pid for pid in remaining if pid in pids]
         if remaining:
             failures.append(f"{host}: stale benchmark pids did not exit: {','.join(str(pid) for pid in remaining)}")
 
     if failures:
         raise RuntimeError("WOS preflight failed:\n" + "\n".join(failures))
+
+    # HOST-routed workspaces physically live on the launcher while remote
+    # workers can retain the same logical cwd. Do not remove any root until
+    # every node has crossed the process-cleanup barrier.
+    for host in hosts:
+        cleanup_wos_stale_work_roots(host, timeout=args.wos_preflight_timeout)
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -1154,8 +1221,11 @@ def run_benchmark_command(
     args: argparse.Namespace,
     step_dir: Path,
     payload_command: list[str],
+    *,
+    timeout_seconds: float | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, Any]]]:
-    timeout = positive_timeout(args.benchmark_timeout)
+    configured_timeout = args.benchmark_timeout if timeout_seconds is None else timeout_seconds
+    timeout = positive_timeout(configured_timeout)
     if not args.schedstat_wrap_steps:
         return run_command(payload_command, timeout=timeout), []
 
@@ -1684,6 +1754,7 @@ def run_wos_showcase(
     wos_hosts: list[str],
 ) -> dict[str, Any]:
     prepare_wos_hosts(args, wos_hosts)
+    ordered_hosts = launcher_first_hosts(host, wos_hosts)
 
     step_name = "wos-showcase"
     step_dir = suite_dir / step_name
@@ -1695,7 +1766,7 @@ def run_wos_showcase(
             "--scale",
             shlex.quote(args.showcase_scale),
             "--hosts",
-            shlex.quote(",".join(wos_hosts)),
+            shlex.quote(",".join(ordered_hosts)),
             "--output-root",
             shlex.quote(remote_output_root),
         ]
@@ -1704,8 +1775,26 @@ def run_wos_showcase(
     write_text(step_dir / "command.log", "=== command ===\n" + shlex.join(host_command) + "\n")
     fetch_timeout = positive_timeout(args.artifact_fetch_timeout)
     try:
-        result, schedstat_entries = run_benchmark_command(args, step_dir, host_command)
-    except Exception:
+        result, schedstat_entries = run_benchmark_command(
+            args,
+            step_dir,
+            host_command,
+            timeout_seconds=args.wos_showcase_timeout,
+        )
+    except Exception as error:
+        cleanup_args = argparse.Namespace(**vars(args))
+        cleanup_args.skip_wos_cleanup = False
+        try:
+            prepare_wos_hosts(cleanup_args, wos_hosts)
+        except Exception as cleanup_error:
+            cleanup_message = (
+                "WOS showcase failure cleanup did not complete: "
+                f"{cleanup_error}"
+            )
+            print(f"[suite] {cleanup_message}", file=sys.stderr)
+            error.wos_cleanup_error = cleanup_message
+            if hasattr(error, "add_note"):
+                error.add_note(cleanup_message)
         fetch_optional_remote_file(
             REMOTE_SCRIPTS / "wos_sftp_get.sh",
             host,
@@ -2112,6 +2201,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="/root/run-wos-showcase",
         help="Remote WOS showcase runner path installed in the XFS rootfs.",
     )
+    parser.add_argument(
+        "--wos-showcase-timeout",
+        type=finite_nonnegative_float,
+        default=9000.0,
+        help=(
+            "Seconds to wait for the complete multi-script WOS showcase; default 9000, "
+            "0 disables this outer timeout."
+        ),
+    )
     parser.add_argument("--skip-showcase", action="store_true")
     parser.add_argument("--skip-mandelbench", action="store_true")
     parser.add_argument("--skip-renderbench", action="store_true")
@@ -2167,6 +2265,8 @@ def main() -> int:
             parser.error("--wos-render-tuning optimal is incompatible with --wos-coordinator-skip-local-worker")
     if args.benchmark_timeout < 0:
         parser.error("--benchmark-timeout must be nonnegative")
+    if args.wos_showcase_timeout < 0:
+        parser.error("--wos-showcase-timeout must be nonnegative")
     if args.artifact_fetch_timeout < 0:
         parser.error("--artifact-fetch-timeout must be nonnegative")
     if args.schedstat_probe or args.schedstat_wrap_steps:

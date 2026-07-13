@@ -116,14 +116,15 @@ def parse_hosts(raw_hosts: str, launcher: str) -> tuple[str, ...]:
 
 
 def make_jobs(config: Config) -> list[Job]:
-    host_count = len(config.hosts)
+    canonical_hosts = sorted(config.hosts, key=normalize_hostname)
+    host_count = len(canonical_hosts)
     if config.total_work_units < host_count:
         raise BenchmarkError(
             "--total-work-units must assign at least one operation to every host"
         )
     quotient, remainder = divmod(config.total_work_units, host_count)
     jobs = []
-    for index, host in enumerate(config.hosts):
+    for index, host in enumerate(canonical_hosts):
         work_units = quotient + (1 if index < remainder else 0)
         jobs.append(
             Job(
@@ -528,6 +529,7 @@ def run_self_test() -> int:
             job: Job,
             sleep_seconds: float = 0.12,
             runner_host: str | None = None,
+            launcher: str | None = None,
             exit_code: int = 0,
             malformed_json: bool = False,
         ) -> Sequence[str]:
@@ -540,7 +542,7 @@ def run_self_test() -> int:
                 "--host",
                 runner_host or job.host,
                 "--launcher",
-                config.launcher,
+                launcher or config.launcher,
                 "--path",
                 job.worker_path,
                 "--iterations",
@@ -584,6 +586,37 @@ def run_self_test() -> int:
             "-c",
             WORKER_SHELL,
         )
+
+        rotated_config = Config(
+            operation="create",
+            hosts=("wos-2.wos", "wos-0.wos", "wos-1.wos"),
+            launcher="wos-2.wos",
+            path=config.path,
+            total_work_units=10,
+            timeout_seconds=2.0,
+            log_dir=Path(directory),
+        )
+
+        def rotated_command(job: Job) -> Sequence[str]:
+            return fake_command(
+                job,
+                sleep_seconds=0.001,
+                launcher=rotated_config.launcher,
+            )
+
+        rotated_payload, rotated_jobs = execute_benchmark(
+            rotated_config, rotated_command
+        )
+        assert [job.host for job in rotated_jobs] == [
+            "wos-0.wos",
+            "wos-1.wos",
+            "wos-2.wos",
+        ]
+        assert [job.work_units for job in rotated_jobs] == [4, 3, 3]
+        assert rotated_payload["launcher_host"] == "wos-2.wos"
+        assert [
+            participant["transport"] for participant in rotated_payload["participants"]
+        ] == ["wki", "wki", "local"]
 
         single_config = Config(
             operation="create",

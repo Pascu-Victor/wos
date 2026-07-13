@@ -33,6 +33,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wos_showcase_compile_test.py
 )
 add_test(
+    NAME wos_showcase_fixed_resource_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wos_showcase_fixed_resource_test.py
+)
+add_test(
     NAME linux_cluster_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/linux_cluster_source_test.py
 )
@@ -376,6 +380,7 @@ set_tests_properties(
     cross_os_benchmark_suite_test
     fixed_resource_scaling_test
     wos_showcase_compile_test
+    wos_showcase_fixed_resource_test
     linux_cluster_source_test
     ktest_manifest_test
     runtime_test_audit_test

@@ -332,6 +332,218 @@ def test_showcase_measurement_parsing(runner) -> None:
             fail(f"invalid showcase metrics were accepted: {text!r}")
 
 
+def test_wos_showcase_timeout_is_finite_and_nonnegative(runner) -> None:
+    parser = runner.build_parser()
+    assert_equal(
+        parser.parse_args(["--num-vms", "1", "--wos-showcase-timeout", "0"]).wos_showcase_timeout,
+        0.0,
+        "disabled showcase timeout",
+    )
+    for invalid in ("-1", "nan", "inf", "-inf"):
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                parser.parse_args(
+                    ["--num-vms", "1", "--wos-showcase-timeout", invalid]
+                )
+            except SystemExit as exc:
+                assert_equal(exc.code, 2, f"invalid showcase timeout {invalid}")
+            else:
+                fail(f"invalid showcase timeout was accepted: {invalid}")
+
+
+def test_wos_cleanup_cwd_and_timeout_override(runner) -> None:
+    original_remote = runner.wos_remote_command
+    original_run = runner.run_command
+
+    def fake_remote(_host, command, *, timeout=None):
+        del timeout
+        if "/proc/[0-9]*/cmdline" not in command:
+            fail(f"unexpected cleanup command: {command}")
+        if 'readlink "/proc/$pid/cwd"' not in command:
+            fail(f"cleanup command does not read process cwd: {command}")
+        if "printf '%s\\t'" not in command or "printf '\\t%s\\n'" not in command:
+            fail(f"cleanup command does not emit PID-tab-exe-tab-cwd rows: {command}")
+        stdout = (
+            "101\t/usr/bin/python3\t/tmp/wos-showcase-fixed-0123456789abcdef\n"
+            "102\t/usr/bin/git\t/tmp/wos-showcase-fixed-0123456789abcdef/git-clones/job-0\n"
+            "103\t/usr/bin/renderbench\t/root\n"
+            "104\t/usr/bin/python3\t/root\n"
+            "105\t/usr/bin/python3\t/tmp/wos-showcase-fixed-0123456789abcdefx\n"
+            "106\t/usr/bin/renderbench-helper\t/root\n"
+            "107\t/usr/bin/git\t/tmp/wos-showcase-fixed-0123456789abcdeF\n"
+        )
+        return subprocess.CompletedProcess([command], 0, stdout, "")
+
+    timeouts = []
+
+    def fake_run(command, *, cwd=None, timeout=None):
+        del cwd
+        timeouts.append(timeout)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    runner.wos_remote_command = fake_remote
+    runner.run_command = fake_run
+    try:
+        assert_equal(
+            runner.wos_benchmark_pids("wos-0.wos", timeout=2.0),
+            [101, 102, 103],
+            "fixed-resource stale worker detection",
+        )
+        args = runner.build_parser().parse_args(["--num-vms", "1"])
+        with tempfile.TemporaryDirectory() as tmp:
+            step_dir = Path(tmp)
+            runner.run_benchmark_command(args, step_dir, ["true"])
+            runner.run_benchmark_command(args, step_dir, ["true"], timeout_seconds=321.0)
+            runner.run_benchmark_command(args, step_dir, ["true"], timeout_seconds=0.0)
+        assert_equal(timeouts, [900.0, 321.0, None], "benchmark timeout override")
+    finally:
+        runner.wos_remote_command = original_remote
+        runner.run_command = original_run
+
+
+def test_wos_stale_work_root_cleanup(runner) -> None:
+    original_remote = runner.wos_remote_command
+    commands = []
+
+    def fake_remote(_host, command, *, timeout=None):
+        del timeout
+        commands.append(command)
+        if command == "hostname >/dev/null":
+            return subprocess.CompletedProcess([command], 0, "", "")
+        if "/proc/[0-9]*/cmdline" in command:
+            return subprocess.CompletedProcess([command], 0, "", "")
+        if command.startswith("for d in /tmp/wos-showcase-fixed-*"):
+            return subprocess.CompletedProcess([command], 0, "", "")
+        fail(f"unexpected stale-work-root cleanup command: {command}")
+
+    runner.wos_remote_command = fake_remote
+    try:
+        args = runner.build_parser().parse_args(["--num-vms", "1"])
+        runner.prepare_wos_hosts(args, ["wos-0.wos"])
+    finally:
+        runner.wos_remote_command = original_remote
+
+    assert_equal(len(commands), 3, "preflight command count")
+    cleanup_command = commands[-1]
+    required_safety_checks = [
+        '[ -d "$d" ] && [ ! -L "$d" ]',
+        '[ "${#suffix}" -eq 16 ]',
+        '*[!0-9a-f]*',
+        'marker="$d/.wos-showcase-owner"',
+        '[ -f "$marker" ] && [ ! -L "$marker" ]',
+        'bytes=$(wc -c < "$marker"',
+        '[ "$bytes" -eq 32 ]',
+        '&& printf x',
+        '[ "${#owner}" -eq 32 ]',
+        'owner_prefix=${owner%????????????????}',
+        '[ "$owner_prefix" = "$suffix" ]',
+        'rm -rf -- "$d"',
+    ]
+    for safety_check in required_safety_checks:
+        if safety_check not in cleanup_command:
+            fail(f"stale-work-root cleanup is missing safety check {safety_check!r}")
+    assert_equal(
+        cleanup_command.count("*[!0-9a-f]*"),
+        2,
+        "suffix and owner lowercase-hex checks",
+    )
+
+    blocked_commands = []
+
+    def fake_blocked_remote(_host, command, *, timeout=None):
+        del timeout
+        blocked_commands.append(command)
+        if command == "hostname >/dev/null" or command.startswith("kill -"):
+            return subprocess.CompletedProcess([command], 0, "", "")
+        if "/proc/[0-9]*/cmdline" in command:
+            stdout = (
+                "201\t/usr/bin/python3\t"
+                "/tmp/wos-showcase-fixed-0123456789abcdef/python-sha/job-0\n"
+            )
+            return subprocess.CompletedProcess([command], 0, stdout, "")
+        if command.startswith("for d in /tmp/wos-showcase-fixed-*"):
+            fail("stale work roots were removed while a matching process remained")
+        fail(f"unexpected blocked-cleanup command: {command}")
+
+    runner.wos_remote_command = fake_blocked_remote
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                runner.prepare_wos_hosts(args, ["wos-0.wos"])
+            except RuntimeError as exc:
+                if "stale benchmark pids did not exit: 201" not in str(exc):
+                    fail(f"unexpected blocked-cleanup diagnostic: {exc}")
+            else:
+                fail("preflight accepted a fixed-resource process that survived cleanup")
+    finally:
+        runner.wos_remote_command = original_remote
+    if any(command.startswith("for d in /tmp/wos-showcase-fixed-*") for command in blocked_commands):
+        fail("stale work-root cleanup ran before matching processes exited")
+
+    barrier_calls = []
+
+    def fake_barrier_remote(host, command, *, timeout=None):
+        del timeout
+        barrier_calls.append((host, command))
+        if command == "hostname >/dev/null":
+            return subprocess.CompletedProcess([command], 0, "", "")
+        if "/proc/[0-9]*/cmdline" in command:
+            return subprocess.CompletedProcess([command], 0, "", "")
+        if command.startswith("for d in /tmp/wos-showcase-fixed-*"):
+            return subprocess.CompletedProcess([command], 0, "", "")
+        fail(f"unexpected multi-host cleanup command: {command}")
+
+    runner.wos_remote_command = fake_barrier_remote
+    try:
+        runner.prepare_wos_hosts(args, ["wos-0.wos", "wos-1.wos"])
+    finally:
+        runner.wos_remote_command = original_remote
+    scan_indices = [
+        index
+        for index, (_host, command) in enumerate(barrier_calls)
+        if "/proc/[0-9]*/cmdline" in command
+    ]
+    cleanup_indices = [
+        index
+        for index, (_host, command) in enumerate(barrier_calls)
+        if command.startswith("for d in /tmp/wos-showcase-fixed-*")
+    ]
+    assert_equal(len(scan_indices), 2, "multi-host process scans")
+    assert_equal(len(cleanup_indices), 2, "multi-host root cleanups")
+    if max(scan_indices) >= min(cleanup_indices):
+        fail("a stale work root was removed before every host crossed the scan barrier")
+
+    failure_calls = []
+
+    def fake_late_failure_remote(host, command, *, timeout=None):
+        del timeout
+        failure_calls.append((host, command))
+        if host == "wos-1.wos" and command == "hostname >/dev/null":
+            raise RuntimeError("host unavailable")
+        if command == "hostname >/dev/null" or "/proc/[0-9]*/cmdline" in command:
+            return subprocess.CompletedProcess([command], 0, "", "")
+        if command.startswith("for d in /tmp/wos-showcase-fixed-*"):
+            fail("root cleanup ran despite a later unreachable host")
+        fail(f"unexpected failed-barrier command: {command}")
+
+    runner.wos_remote_command = fake_late_failure_remote
+    try:
+        try:
+            runner.prepare_wos_hosts(args, ["wos-0.wos", "wos-1.wos"])
+        except RuntimeError as exc:
+            if "wos-1.wos: unreachable" not in str(exc):
+                fail(f"unexpected late-host failure diagnostic: {exc}")
+        else:
+            fail("preflight accepted an unreachable later host")
+    finally:
+        runner.wos_remote_command = original_remote
+    if any(
+        command.startswith("for d in /tmp/wos-showcase-fixed-*")
+        for _host, command in failure_calls
+    ):
+        fail("stale work-root cleanup bypassed the all-host barrier")
+
+
 def test_wos_showcase_metrics_collection(_runner) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -407,10 +619,17 @@ def test_wos_showcase_metrics_collection(_runner) -> None:
 def test_wos_showcase_metrics_plumbing(runner) -> None:
     args = runner.build_parser().parse_args(["--num-vms", "2"])
     suite_remote_root = "/tmp/synthetic-suite"
-    host = "wos-0.wos"
-    hosts = [host, "wos-1.wos"]
+    host = "wos-1.wos"
+    hosts = ["wos-0.wos", host]
+    fixed_measurements = [
+        {"benchmark": "wos_git_clone", "sequence": 1},
+        {"benchmark": "wos_git_checkout", "sequence": 2},
+        {"benchmark": "wos_python_sha256", "sequence": 3},
+        {"benchmark": "wos_python_json", "sequence": 4},
+    ]
     fetches: list[tuple[str, Path]] = []
     optional_fetches: list[tuple[str, Path]] = []
+    failure_events: list[str] = []
 
     original_prepare = runner.prepare_wos_hosts
     original_run = runner.run_benchmark_command
@@ -424,15 +643,17 @@ def test_wos_showcase_metrics_plumbing(runner) -> None:
             local_path.write_text("30-bench-wki\tPASS\tlog=synthetic\n", encoding="utf-8")
         elif remote_path.endswith("/metrics.jsonl"):
             local_path.write_text(
-                '{"benchmark":"duplicate","sequence":1}\n'
-                '{"benchmark":"duplicate","sequence":2}\n',
+                "".join(
+                    json.dumps(measurement, separators=(",", ":")) + "\n"
+                    for measurement in fixed_measurements
+                ),
                 encoding="utf-8",
             )
         else:
             fail(f"unexpected showcase fetch: {remote_path}")
 
     runner.prepare_wos_hosts = lambda _args, _hosts: None
-    runner.run_benchmark_command = lambda _args, _step_dir, command: (
+    runner.run_benchmark_command = lambda _args, _step_dir, command, **_kwargs: (
         subprocess.CompletedProcess(command, 0, "synthetic stdout", ""),
         [],
     )
@@ -452,10 +673,7 @@ def test_wos_showcase_metrics_plumbing(runner) -> None:
             )
             assert_equal(
                 result["measurements"],
-                [
-                    {"benchmark": "duplicate", "sequence": 1},
-                    {"benchmark": "duplicate", "sequence": 2},
-                ],
+                fixed_measurements,
                 "showcase result measurements",
             )
             metrics_artifact = suite_dir / "wos-showcase" / "metrics.jsonl"
@@ -464,17 +682,28 @@ def test_wos_showcase_metrics_plumbing(runner) -> None:
             remote_command = step["command"][-1]
             if f"--output-root {remote_output_root}" not in remote_command:
                 fail(f"showcase remote output root is missing from command: {remote_command}")
+            if "wos-1.wos,wos-0.wos" not in remote_command:
+                fail(f"showcase hosts are not launcher-first: {remote_command}")
 
-        def fake_failed_run(_args, _step_dir, _command):
+        def fake_failed_run(_args, _step_dir, _command, **_kwargs):
+            failure_events.append("run-failed")
             raise RuntimeError("synthetic showcase failure")
 
         def fake_optional_fetch(_fetcher, _host, remote_path, local_path, *, timeout):
             del timeout
+            failure_events.append("partial-fetch")
             optional_fetches.append((remote_path, local_path))
             return True
 
+        def fake_failure_cleanup(cleanup_args, cleanup_hosts):
+            if cleanup_args.skip_wos_cleanup:
+                fail("failure cleanup retained --skip-wos-cleanup")
+            assert_equal(cleanup_hosts, hosts, "failure cleanup hosts")
+            failure_events.append("all-host-cleanup")
+
         runner.run_benchmark_command = fake_failed_run
         runner.fetch_optional_remote_file = fake_optional_fetch
+        runner.prepare_wos_hosts = fake_failure_cleanup
         with tempfile.TemporaryDirectory() as tmp:
             try:
                 runner.run_wos_showcase(args, Path(tmp), suite_remote_root, host, hosts)
@@ -495,6 +724,54 @@ def test_wos_showcase_metrics_plumbing(runner) -> None:
             [local_path.name for _remote_path, local_path in optional_fetches],
             ["partial-summary.tsv", "partial-metrics.jsonl"],
             "failed showcase partial artifact names",
+        )
+        assert_equal(
+            failure_events,
+            ["all-host-cleanup", "run-failed", "all-host-cleanup", "partial-fetch", "partial-fetch"],
+            "failed showcase cleanup/fetch ordering",
+        )
+
+        failure_events.clear()
+        cleanup_attempts = 0
+
+        def fake_incomplete_cleanup(_cleanup_args, _cleanup_hosts):
+            nonlocal cleanup_attempts
+            cleanup_attempts += 1
+            failure_events.append(
+                "initial-preflight" if cleanup_attempts == 1 else "cleanup-failed"
+            )
+            if cleanup_attempts == 2:
+                raise RuntimeError("synthetic cleanup failure")
+
+        runner.prepare_wos_hosts = fake_incomplete_cleanup
+        cleanup_stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(
+            cleanup_stderr
+        ):
+            try:
+                runner.run_wos_showcase(
+                    args, Path(tmp), suite_remote_root, host, hosts
+                )
+            except RuntimeError as exc:
+                if str(exc) != "synthetic showcase failure":
+                    fail(f"cleanup failure replaced the original exception: {exc}")
+                cleanup_note = getattr(exc, "wos_cleanup_error", "")
+                if "synthetic cleanup failure" not in cleanup_note:
+                    fail(f"cleanup failure was not attached: {cleanup_note!r}")
+            else:
+                fail("cleanup failure caused a failed showcase to be accepted")
+        if "synthetic cleanup failure" not in cleanup_stderr.getvalue():
+            fail("cleanup failure was not reported")
+        assert_equal(
+            failure_events,
+            [
+                "initial-preflight",
+                "run-failed",
+                "cleanup-failed",
+                "partial-fetch",
+                "partial-fetch",
+            ],
+            "incomplete cleanup/fetch ordering",
         )
     finally:
         runner.prepare_wos_hosts = original_prepare
@@ -929,6 +1206,9 @@ def main() -> None:
         test_runtime_resource_mismatch_rejections,
         test_mandel_worker_modes,
         test_showcase_measurement_parsing,
+        test_wos_showcase_timeout_is_finite_and_nonnegative,
+        test_wos_cleanup_cwd_and_timeout_override,
+        test_wos_stale_work_root_cleanup,
         test_wos_showcase_metrics_collection,
         test_wos_showcase_metrics_plumbing,
         test_mandel_command_composition,

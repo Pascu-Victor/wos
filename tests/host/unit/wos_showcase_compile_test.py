@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -25,7 +27,10 @@ def install_mocks(root: Path) -> tuple[Path, dict[str, str]]:
     bin_dir = root / "bin"
     bin_dir.mkdir()
     compile_log = root / "compile.log"
+    event_log = root / "event.log"
     on_log = root / "on.log"
+    prewarm_log = root / "prewarm.log"
+    workspace_log = root / "workspace.log"
     live_bin = root / "wos-live-demo"
 
     write_executable(
@@ -39,7 +44,12 @@ if [ "${MOCK_MISMATCH_HOST:-}" = "$host" ]; then
     runner=mismatch.wos
 fi
 if [ "${1:-}" = forward ]; then
-    printf '%s|%s|%s|%s\n' "$host" "$1" "${2:-}" "${3:-}" >> "$MOCK_ON_LOG"
+    route_record=$host
+    for operand in "$@"; do
+        route_record="$route_record|$operand"
+        [ "$operand" != -- ] || break
+    done
+    printf '%s\n' "$route_record" >> "$MOCK_ON_LOG"
 fi
 MOCK_RUNNER=$runner
 export MOCK_RUNNER
@@ -50,13 +60,40 @@ exec "$@"
         bin_dir / "forward",
         """#!/bin/sh
 set -eu
+MOCK_VFS_RULES=
+route_index=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --) shift; break ;;
-        +*|-*) shift ;;
+        +*|-*)
+            operand=$1
+            path=${operand#?}
+            case "$operand" in
+                +*) route=host ;;
+                -*) route=local ;;
+            esac
+            if [ "${MOCK_DROP_ROUTE_PATH:-}" != "$path" ]; then
+                MOCK_VFS_RULES="${MOCK_VFS_RULES}vfs-task[$route_index]: $path -> $route
+"
+                route_index=$((route_index + 1))
+            fi
+            case "$operand" in
+                +/tmp/wos-showcase-fixed-????????????????/distributed-compile)
+                    work_root=${path%/distributed-compile}
+                    marker=$work_root/.wos-showcase-owner
+                    [ -d "$work_root" ] && [ ! -L "$work_root" ] || exit 86
+                    [ -f "$marker" ] && [ ! -L "$marker" ] || exit 87
+                    owner=$(cat "$marker")
+                    [ "${#owner}" -eq 32 ] || exit 88
+                    printf '%s|%s\n' "$path" "$owner" >> "$MOCK_WORKSPACE_LOG"
+                    ;;
+            esac
+            shift
+            ;;
         *) break ;;
     esac
 done
+export MOCK_VFS_RULES
 exec "$@"
 """,
     )
@@ -67,6 +104,35 @@ set -eu
 MOCK_RUNNER=$MOCK_LAUNCHER
 export MOCK_RUNNER
 exec "$@"
+""",
+    )
+    write_executable(
+        bin_dir / "wkictl",
+        """#!/bin/sh
+set -eu
+[ "${1:-}" = vfs ] && [ "${2:-}" = list ] || exit 89
+printf '%s' "${MOCK_VFS_RULES:-}"
+""",
+    )
+    write_executable(
+        bin_dir / "sha256sum",
+        """#!/bin/sh
+set -eu
+binary=0
+if [ "${1:-}" = -b ]; then
+    binary=1
+    shift
+fi
+if [ "$#" -eq 1 ] && [ "$1" = "$MOCK_WKICTL_BIN" ] && \
+    [ "${MOCK_WKICTL_MISMATCH_HOST:-}" = "${MOCK_RUNNER:-$MOCK_LAUNCHER}" ]; then
+    printf '%s  %s\n' \
+        ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff "$1"
+    exit 0
+fi
+if [ "$binary" -eq 1 ]; then
+    exec /usr/bin/sha256sum -b "$@"
+fi
+exec /usr/bin/sha256sum "$@"
 """,
     )
     write_executable(
@@ -81,6 +147,14 @@ printf 'spawner=%s host=%s pid=%s remote_pid=0\n' \
         bin_dir / "fake-cxx",
         """#!/bin/sh
 set -eu
+if [ "${1:-}" = --version ]; then
+    version='fake-cxx version 1.0'
+    if [ "${MOCK_COMPILER_MISMATCH_HOST:-}" = "${MOCK_RUNNER:-$MOCK_LAUNCHER}" ]; then
+        version='fake-cxx version 2.0'
+    fi
+    printf '%s\n' "$version"
+    exit 0
+fi
 out=
 compile=0
 symbol=
@@ -103,10 +177,23 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$out" ] || exit 90
 if [ -n "$symbol" ]; then
-    printf '%s %s\n' "${MOCK_RUNNER:-$MOCK_LAUNCHER}" "$symbol" >> "$MOCK_COMPILE_LOG"
-    if [ "${MOCK_FAIL_SYMBOL:-}" = "$symbol" ]; then
-        exit 23
-    fi
+    runner=${MOCK_RUNNER:-$MOCK_LAUNCHER}
+    case "$symbol" in
+        wos_compile_prewarm_*)
+            printf 'prewarm %s %s\n' "$runner" "$symbol" >> "$MOCK_EVENT_LOG"
+            printf '%s %s\n' "$runner" "$symbol" >> "$MOCK_PREWARM_LOG"
+            if [ "${MOCK_FAIL_PREWARM_HOST:-}" = "$runner" ]; then
+                exit 24
+            fi
+            ;;
+        *)
+            printf 'timed %s %s\n' "$runner" "$symbol" >> "$MOCK_EVENT_LOG"
+            printf '%s %s\n' "$runner" "$symbol" >> "$MOCK_COMPILE_LOG"
+            if [ "${MOCK_FAIL_SYMBOL:-}" = "$symbol" ]; then
+                exit 23
+            fi
+            ;;
+    esac
     printf 'object %s\n' "$symbol" > "$out"
 elif [ "$compile" -eq 1 ]; then
     printf 'driver object\n' > "$out"
@@ -130,10 +217,13 @@ fi
             "PATH": f"{bin_dir}:{env['PATH']}",
             "CXX": str(bin_dir / "fake-cxx"),
             "MOCK_COMPILE_LOG": str(compile_log),
+            "MOCK_EVENT_LOG": str(event_log),
             "MOCK_LAUNCHER": "wos-0.wos",
             "MOCK_LIVE_BIN": str(live_bin),
             "MOCK_ON_LOG": str(on_log),
-            "WOS_LIVE_COMPILE_WORKSPACE_ROOT": str(root / "workspace"),
+            "MOCK_PREWARM_LOG": str(prewarm_log),
+            "MOCK_WKICTL_BIN": str(bin_dir / "wkictl"),
+            "MOCK_WORKSPACE_LOG": str(workspace_log),
             "WOS_LIVE_DEMO_BIN": str(live_bin),
             "WOS_LIVE_DISTRIBUTED_COMPILE_ONLY": "1",
         }
@@ -192,10 +282,71 @@ def test_fixed_layouts() -> None:
                 fail(f"invalid fixed compile size: {metric}")
             if metric.get("total_work_units") != 32:
                 fail(f"invalid total work evidence: {metric}")
+            if metric.get("workload_id") != "wos-live-cpp-32-tu-v1":
+                fail(f"invalid workload identity: {metric}")
+            if (
+                metric.get("source_sha256")
+                != "aa52bc6a7f7f5b58904b6c1d06fb7f813c8567c97470fbe4161a4e691a60c726"
+            ):
+                fail(f"invalid source identity: {metric}")
+            if metric.get("compiler_path") != str(root / "bin" / "fake-cxx"):
+                fail(f"invalid compiler path: {metric}")
+            expected_version_digest = hashlib.sha256(
+                b"fake-cxx version 1.0\n"
+            ).hexdigest()
+            if metric.get("compiler_version_sha256") != expected_version_digest:
+                fail(f"invalid compiler version identity: {metric}")
+            expected_compiler_digest = hashlib.sha256(
+                (root / "bin" / "fake-cxx").read_bytes()
+            ).hexdigest()
+            if metric.get("compiler_sha256") != expected_compiler_digest:
+                fail(f"invalid compiler binary identity: {metric}")
+            expected_wkictl_digest = hashlib.sha256(
+                (root / "bin" / "wkictl").read_bytes()
+            ).hexdigest()
+            if metric.get("wkictl_sha256") != expected_wkictl_digest:
+                fail(f"invalid wkictl binary identity: {metric}")
+            if metric.get("compile_flags") != "-std=c++23 -O2 -fno-ident":
+                fail(f"invalid compile flags: {metric}")
+            if metric.get("link_flags") != "-std=c++23 -O2 -Wl,--build-id=none":
+                fail(f"invalid link flags: {metric}")
+            if (
+                metric.get("cache_policy")
+                != "prewarmed-compiler-source-headers-all-hosts"
+            ):
+                fail(f"invalid cache policy: {metric}")
             if metric.get("placement") != expected_placement:
                 fail(f"invalid placement evidence: {metric}")
             if metric.get("wki_route") != "host-workspace":
                 fail(f"invalid workspace routing evidence: {metric}")
+            expected_runtime_paths = [
+                "/root/wos-showcase",
+                "/usr",
+                "/bin",
+                "/lib",
+                "/lib64",
+                "/libexec",
+                "/share",
+                "/tmp",
+            ]
+            if (
+                metric.get("runtime_route") != "local"
+                or metric.get("runtime_paths") != expected_runtime_paths
+            ):
+                fail(f"invalid LOCAL runtime evidence: {metric}")
+            workspace = metric.get("workspace_path")
+            if metric.get("workspace_route") != "host" or not isinstance(
+                workspace, str
+            ):
+                fail(f"invalid HOST workspace evidence: {metric}")
+            if (
+                re.fullmatch(
+                    r"/tmp/wos-showcase-fixed-[0-9a-f]{16}/distributed-compile",
+                    workspace,
+                )
+                is None
+            ):
+                fail(f"unsafe private workspace evidence: {metric}")
             if metric.get("launcher_host") != hosts[0]:
                 fail(f"invalid launcher evidence: {metric}")
             elapsed = metric.get("elapsed_seconds")
@@ -232,14 +383,52 @@ def test_fixed_layouts() -> None:
             if len(compile_rows) != 32:
                 fail(f"expected 32 compiler jobs, got {compile_rows}")
             on_rows = (root / "on.log").read_text(encoding="utf-8").splitlines()
-            workspace_operand = f"+{root}/workspace/distributed-compile"
-            expected_on_rows = [
-                f"{host}|forward|{workspace_operand}|--"
-                for host, count in zip(hosts, expected_work, strict=True)
-                for _index in range(count)
+            profile = [
+                "forward",
+                f"+{workspace}",
+                *(f"-{path}" for path in expected_runtime_paths),
+                "--",
             ]
+            expected_on_rows = (
+                ["|".join([host, *profile]) for host in [hosts[0], *hosts]]
+                + ["|".join([host, *profile]) for host in hosts]
+                + [
+                    "|".join([host, *profile])
+                    for host, count in zip(hosts, expected_work, strict=True)
+                    for _index in range(count)
+                ]
+            )
             if on_rows != expected_on_rows:
                 fail(f"strict on/forward launches differ:\n{on_rows}")
+            prewarm_rows = (
+                (root / "prewarm.log").read_text(encoding="utf-8").splitlines()
+            )
+            if [row.split()[0] for row in prewarm_rows] != hosts:
+                fail(f"compiler prewarm does not cover canonical hosts: {prewarm_rows}")
+            event_rows = (root / "event.log").read_text(encoding="utf-8").splitlines()
+            if [row.split()[0] for row in event_rows[:node_count]] != [
+                "prewarm"
+            ] * node_count or any(
+                row.split()[0] != "timed" for row in event_rows[node_count:]
+            ):
+                fail(f"prewarm did not finish before timed jobs: {event_rows}")
+            workspace_rows = (
+                (root / "workspace.log").read_text(encoding="utf-8").splitlines()
+            )
+            if not workspace_rows or any(
+                row.split("|", 1)[0] != workspace for row in workspace_rows
+            ):
+                fail(f"private workspace marker was not observed: {workspace_rows}")
+            owner = workspace_rows[0].split("|", 1)[1]
+            work_suffix = workspace.split("/")[2].removeprefix("wos-showcase-fixed-")
+            if (
+                len(owner) != 32
+                or owner[:16] != work_suffix
+                or not all(character in "0123456789abcdef" for character in owner)
+            ):
+                fail(f"invalid private workspace owner: {owner}")
+            if Path(workspace).parent.exists():
+                fail(f"private workspace was not cleaned: {workspace}")
 
 
 def test_compile_failure_waits_for_all_jobs() -> None:
@@ -277,6 +466,149 @@ def test_runner_mismatch_is_rejected() -> None:
             fail("runner mismatch emitted an acceptance metric")
 
 
+def test_compiler_mismatch_is_rejected_before_timing() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        result = run_showcase(
+            root,
+            ["wos-0.wos", "wos-1.wos"],
+            MOCK_COMPILER_MISMATCH_HOST="wos-1.wos",
+        )
+        if result.returncode == 0:
+            fail(f"compiler mismatch was accepted:\n{result.stdout}")
+        if "compiler identity on wos-1.wos differs from launcher" not in result.stderr:
+            fail(f"compiler mismatch diagnostic is missing:\n{result.stderr}")
+        if (root / "compile.log").exists():
+            fail("compiler mismatch launched timed translation-unit jobs")
+        if '"benchmark":"wos_distributed_compile"' in result.stdout:
+            fail("compiler mismatch emitted an acceptance metric")
+
+
+def test_wkictl_mismatch_is_rejected_before_timing() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        result = run_showcase(
+            root,
+            ["wos-0.wos", "wos-1.wos"],
+            MOCK_WKICTL_MISMATCH_HOST="wos-1.wos",
+        )
+        if result.returncode == 0:
+            fail(f"wkictl mismatch was accepted:\n{result.stdout}")
+        if "compiler identity on wos-1.wos differs from launcher" not in result.stderr:
+            fail(f"wkictl mismatch diagnostic is missing:\n{result.stderr}")
+        if (root / "prewarm.log").exists() or (root / "compile.log").exists():
+            fail("wkictl mismatch reached prewarm or timed compilation")
+        if '"benchmark":"wos_distributed_compile"' in result.stdout:
+            fail("wkictl mismatch emitted an acceptance metric")
+
+
+def test_source_mismatch_is_rejected_before_timing() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source = root / "different.cpp"
+        source.write_text("auto main() -> int { return 0; }\n", encoding="utf-8")
+        result = run_showcase(
+            root,
+            ["wos-0.wos"],
+            WOS_LIVE_DEMO_SRC=str(source),
+        )
+        if result.returncode == 0:
+            fail(f"source mismatch was accepted:\n{result.stdout}")
+        if "source fingerprint differs from wos-live-cpp-32-tu-v1" not in result.stderr:
+            fail(f"source mismatch diagnostic is missing:\n{result.stderr}")
+        if (root / "compile.log").exists():
+            fail("source mismatch launched timed translation-unit jobs")
+        if '"benchmark":"wos_distributed_compile"' in result.stdout:
+            fail("source mismatch emitted an acceptance metric")
+
+
+def test_missing_local_runtime_route_is_rejected_before_timing() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        result = run_showcase(
+            root,
+            ["wos-0.wos", "wos-1.wos"],
+            MOCK_DROP_ROUTE_PATH="/lib64",
+        )
+        if result.returncode == 0:
+            fail(f"missing LOCAL runtime route was accepted:\n{result.stdout}")
+        if "cannot resolve or fingerprint compiler" not in result.stderr:
+            fail(f"route failure diagnostic is missing:\n{result.stderr}")
+        if (root / "compile.log").exists():
+            fail("invalid runtime profile launched timed translation-unit jobs")
+        if '"benchmark":"wos_distributed_compile"' in result.stdout:
+            fail("invalid runtime profile emitted an acceptance metric")
+
+
+def test_prewarm_failure_is_rejected_before_timing() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        result = run_showcase(
+            root,
+            ["wos-0.wos", "wos-1.wos"],
+            MOCK_FAIL_PREWARM_HOST="wos-1.wos",
+        )
+        if result.returncode == 0:
+            fail(f"compiler prewarm failure was accepted:\n{result.stdout}")
+        if "compiler prewarm failed on wos-1.wos" not in result.stderr:
+            fail(f"compiler prewarm failure diagnostic is missing:\n{result.stderr}")
+        if (root / "compile.log").exists():
+            fail("compiler prewarm failure launched timed translation-unit jobs")
+        event_rows = (root / "event.log").read_text(encoding="utf-8").splitlines()
+        if any(row.startswith("timed ") for row in event_rows):
+            fail(f"timed jobs started before prewarm completed: {event_rows}")
+        if '"benchmark":"wos_distributed_compile"' in result.stdout:
+            fail("compiler prewarm failure emitted an acceptance metric")
+
+
+def test_rotated_launcher_uses_canonical_three_node_partition() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        submitted_hosts = ["wos-2.wos", "wos-0.wos", "wos-1.wos"]
+        result = run_showcase(
+            root,
+            submitted_hosts,
+            MOCK_LAUNCHER="wos-2.wos",
+        )
+        if result.returncode != 0:
+            fail(
+                f"rotated-launcher showcase failed with {result.returncode}:\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+        metric = metric_from_stdout(result.stdout)
+        participants = metric.get("participants")
+        if not isinstance(participants, list):
+            fail(f"missing canonical participants: {metric}")
+        canonical_hosts = ["wos-0.wos", "wos-1.wos", "wos-2.wos"]
+        if [participant["host"] for participant in participants] != canonical_hosts:
+            fail(f"host partition is launcher-order dependent: {participants}")
+        if [participant["work_units"] for participant in participants] != [11, 11, 10]:
+            fail(f"three-node remainder is not canonical: {participants}")
+        if [participant["transport"] for participant in participants] != [
+            "wki",
+            "wki",
+            "local",
+        ]:
+            fail(f"rotated-launcher transport evidence is invalid: {participants}")
+        if metric.get("launcher_host") != "wos-2.wos":
+            fail(f"rotated launcher identity was lost: {metric}")
+
+        compile_assignments = {}
+        for row in (root / "compile.log").read_text(encoding="utf-8").splitlines():
+            runner, symbol = row.split()
+            compile_assignments[int(symbol.removeprefix("wos_compile_unit_"))] = runner
+        expected_assignments = {
+            unit: (
+                canonical_hosts[0]
+                if unit < 11
+                else canonical_hosts[1] if unit < 22 else canonical_hosts[2]
+            )
+            for unit in range(32)
+        }
+        if compile_assignments != expected_assignments:
+            fail(f"timed jobs do not follow canonical partition: {compile_assignments}")
+
+
 def test_invalid_host_sets_are_rejected() -> None:
     invalid_sets = [
         ["wos-0.wos", "wos-0.wos"],
@@ -295,8 +627,14 @@ def main() -> int:
     test_fixed_layouts()
     test_compile_failure_waits_for_all_jobs()
     test_runner_mismatch_is_rejected()
+    test_compiler_mismatch_is_rejected_before_timing()
+    test_wkictl_mismatch_is_rejected_before_timing()
+    test_source_mismatch_is_rejected_before_timing()
+    test_missing_local_runtime_route_is_rejected_before_timing()
+    test_prewarm_failure_is_rejected_before_timing()
+    test_rotated_launcher_uses_canonical_three_node_partition()
     test_invalid_host_sets_are_rejected()
-    print("4 WOS showcase distributed compile tests passed")
+    print("10 WOS showcase distributed compile tests passed")
     return 0
 
 
