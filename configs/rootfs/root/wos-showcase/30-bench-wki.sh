@@ -1,14 +1,14 @@
 #!/bin/sh
 set -eu
 
-DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck disable=SC1091
 . "$DIR/showcase-common.sh"
 
 data_path="$(showcase_data_path)"
 stat_iterations="${WOS_SHOWCASE_STAT_ITERATIONS:-$(showcase_scale_value stat_iterations)}"
 read_iterations="${WOS_SHOWCASE_READ_ITERATIONS:-$(showcase_scale_value read_iterations)}"
-metadata_iterations="${WOS_SHOWCASE_METADATA_ITERATIONS:-$(showcase_scale_value metadata_iterations)}"
+metadata_iterations="${WOS_SHOWCASE_METADATA_TOTAL_ITERATIONS:-${WOS_SHOWCASE_METADATA_ITERATIONS:-$(showcase_scale_value metadata_iterations)}}"
 mandel_width="${WOS_SHOWCASE_MANDEL_WIDTH:-$(showcase_scale_value mandel_width)}"
 mandel_height="${WOS_SHOWCASE_MANDEL_HEIGHT:-$(showcase_scale_value mandel_height)}"
 mandel_iter="${WOS_SHOWCASE_MANDEL_ITER:-$(showcase_scale_value mandel_iter)}"
@@ -28,18 +28,29 @@ showcase_section "vfsbench through forward +/srv -/tmp"
 showcase_cmd forward +/srv -/tmp -- /usr/bin/testprog vfsbench-read --path "$data_path" --read-size 65536 --iterations "$read_iterations"
 showcase_cmd remotely forward +/srv -/tmp -- /usr/bin/testprog vfsbench-stat --path "$data_path" --iterations "$stat_iterations"
 
-showcase_section "remote VFS create and rename through forward +/tmp"
+showcase_section "fixed-total VFS create and rename through forward +/tmp"
 metadata_prefix="/tmp/wos-showcase-vfsbench"
-metadata_target="$(showcase_first_remote_host || true)"
-if [ -n "$metadata_target" ]; then
-    showcase_cmd on "$metadata_target" wosid
-    showcase_cmd on "$metadata_target" forward +/tmp -- /usr/bin/testprog vfsbench-create --path "$metadata_prefix" --iterations "$metadata_iterations"
-    showcase_cmd on "$metadata_target" forward +/tmp -- /usr/bin/testprog vfsbench-rename --path "$metadata_prefix" --iterations "$metadata_iterations"
-else
-    printf 'single-node baseline: running metadata operations locally\n'
-    showcase_cmd locally /usr/bin/testprog vfsbench-create --path "$metadata_prefix" --iterations "$metadata_iterations"
-    showcase_cmd locally /usr/bin/testprog vfsbench-rename --path "$metadata_prefix" --iterations "$metadata_iterations"
-fi
+metadata_hosts="${WOS_SHOWCASE_HOSTS:-$(hostname)}"
+metadata_launcher="$(hostname)"
+metadata_log_dir="${WOS_SHOWCASE_OUTPUT_ROOT:-/tmp/wos-showcase-metadata}/logs/30-bench-wki-metadata"
+metadata_timeout="${WOS_SHOWCASE_METADATA_TIMEOUT_SECONDS:-120}"
+
+showcase_cmd locally /usr/bin/python3 "$DIR/metadata_bench.py" \
+    --operation create \
+    --hosts "$metadata_hosts" \
+    --launcher "$metadata_launcher" \
+    --path "$metadata_prefix" \
+    --total-work-units "$metadata_iterations" \
+    --timeout-seconds "$metadata_timeout" \
+    --log-dir "$metadata_log_dir"
+showcase_cmd locally /usr/bin/python3 "$DIR/metadata_bench.py" \
+    --operation rename \
+    --hosts "$metadata_hosts" \
+    --launcher "$metadata_launcher" \
+    --path "$metadata_prefix" \
+    --total-work-units "$metadata_iterations" \
+    --timeout-seconds "$metadata_timeout" \
+    --log-dir "$metadata_log_dir"
 
 showcase_section "small distributed mandelbench"
 mandel_nodes="${WOS_SHOWCASE_HOSTS:-}"

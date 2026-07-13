@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -13,6 +15,7 @@ FSBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "fsbench.cpp"
 MANDELBENCH_WKI_CPP = ROOT / "modules" / "testprog" / "src" / "mandelbench" / "mandelbench_wki.cpp"
 WOS_SHOWCASE_BENCH = ROOT / "configs" / "rootfs" / "root" / "wos-showcase" / "30-bench-wki.sh"
 WOS_SHOWCASE_COMMON = ROOT / "configs" / "rootfs" / "root" / "wos-showcase" / "showcase-common.sh"
+WOS_METADATA_BENCH = ROOT / "configs" / "rootfs" / "root" / "wos-showcase" / "metadata_bench.py"
 USERLAND_SUITE = ROOT / "configs" / "drive" / "srv" / "wos_userland_suite.sh"
 RUN_USERLAND_SUITE = ROOT / "scripts" / "bench" / "run_wos_userland_suite.sh"
 WOS_SSH = ROOT / "scripts" / "remote" / "wos_ssh.sh"
@@ -789,13 +792,14 @@ def test_vfsbench_metadata_timing_excludes_setup_and_cleanup() -> None:
         showcase,
         [
             "showcase_scale_value metadata_iterations",
-            'metadata_target="$(showcase_first_remote_host || true)"',
-            'on "$metadata_target" wosid',
-            'on "$metadata_target" forward +/tmp -- /usr/bin/testprog vfsbench-create',
-            'on "$metadata_target" forward +/tmp -- /usr/bin/testprog vfsbench-rename',
-            "single-node baseline: running metadata operations locally",
-            "locally /usr/bin/testprog vfsbench-create",
-            "locally /usr/bin/testprog vfsbench-rename",
+            "WOS_SHOWCASE_METADATA_TOTAL_ITERATIONS",
+            'metadata_hosts="${WOS_SHOWCASE_HOSTS:-$(hostname)}"',
+            'metadata_launcher="$(hostname)"',
+            'showcase_cmd locally /usr/bin/python3 "$DIR/metadata_bench.py"',
+            "--operation create",
+            "--operation rename",
+            '--hosts "$metadata_hosts"',
+            '--total-work-units "$metadata_iterations"',
         ],
         "WKI metadata showcase",
     )
@@ -804,6 +808,36 @@ def test_vfsbench_metadata_timing_excludes_setup_and_cleanup() -> None:
         ["quick:metadata_iterations", "full:metadata_iterations", "stress:metadata_iterations"],
         "WKI metadata showcase scales",
     )
+
+    metadata_helper = WOS_METADATA_BENCH.read_text()
+    require_tokens(
+        metadata_helper,
+        [
+            "time.monotonic_ns()",
+            "subprocess.Popen(",
+            '"on",',
+            '"forward",',
+            '"+/tmp",',
+            '"spawner_host": worker_evidence.spawner_host',
+            '"remote_pid": worker_evidence.remote_pid',
+            '"placement": "local-baseline" if len(jobs) == 1 else "strict-on"',
+            '"wki_route": "host-path"',
+            '"total_work_units": config.total_work_units',
+        ],
+        "fixed-total WKI metadata coordinator",
+    )
+    result = subprocess.run(
+        [sys.executable, str(WOS_METADATA_BENCH), "--self-test"],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0 or "metadata_bench self-test: PASS" not in result.stdout:
+        fail(
+            "metadata benchmark self-test failed: "
+            f"rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
 
 
 def test_mandelbench_worker_waits_use_monotonic_elapsed_time() -> None:
