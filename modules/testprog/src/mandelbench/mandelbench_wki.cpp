@@ -1124,6 +1124,50 @@ void print_slowest_worker_profiles(std::span<const WorkerLaunch> launches, int r
     return ok;
 }
 
+struct LocalComputeTask {
+    std::span<const WorkerLaunch> launches;
+    unsigned char* image;
+    unsigned char* colormap;
+    int width;
+    int height;
+    int max_iteration;
+    size_t row_size;
+    int repeat_index;
+    bool ok = false;
+    uint64_t end_us = 0;
+    std::atomic<bool> finished{false};
+};
+
+auto execute_local_compute_task(LocalComputeTask& task) -> bool {
+    bool const OK = compute_local_launches(task.launches, task.image, task.colormap, task.width, task.height, task.max_iteration,
+                                           task.row_size, task.repeat_index);
+    task.ok = OK;
+    task.end_us = now_us();
+    task.finished.store(true, std::memory_order_release);
+    return OK;
+}
+
+auto run_local_compute_task(void* raw_task) -> int {
+    auto* task = static_cast<LocalComputeTask*>(raw_task);
+    if (task == nullptr) {
+        return EXIT_FAILURE;
+    }
+    return execute_local_compute_task(*task) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+auto join_local_compute_task(thrd_t thread, LocalComputeTask& task) -> bool {
+    int result = EXIT_FAILURE;
+    if (thrd_join(thread, &result) != THRD_SUCCESS) {
+        std::println(stderr, "mandelbench: failed to join local compute supervisor");
+        static_cast<void>(thrd_detach(thread));
+        while (!task.finished.load(std::memory_order_acquire)) {
+            thrd_yield();
+        }
+        return false;
+    }
+    return result == EXIT_SUCCESS && task.ok;
+}
+
 struct WorkerEventResult {
     bool ok;
     uint64_t wait_end_us;
@@ -1732,23 +1776,51 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
         uint64_t const AFTER_START_SIGNAL_US = now_us();
         uint64_t const LOCAL_COMPUTE_START_US = now_us();
         MANDELBENCH_TRACE("mandelbench: repeat {} local-compute begin local_workers={}", repeat_index, local_launches.size());
-        if (!compute_local_launches(local_launches, image.data(), local_colormap.data(), width, height, max_iteration, ROW_SIZE,
-                                    repeat_index)) {
-            close_worker_pipes(remote_launches);
-            return 1;
+
+        LocalComputeTask local_compute_task{
+            .launches = local_launches,
+            .image = image.data(),
+            .colormap = local_colormap.data(),
+            .width = width,
+            .height = height,
+            .max_iteration = max_iteration,
+            .row_size = ROW_SIZE,
+            .repeat_index = repeat_index,
+        };
+        thrd_t local_compute_thread{};
+        bool local_compute_started = false;
+        bool const OVERLAP_LOCAL_AND_REMOTE = !local_launches.empty() && !remote_launches.empty();
+        if (OVERLAP_LOCAL_AND_REMOTE) {
+            local_compute_started = thrd_create(&local_compute_thread, run_local_compute_task, &local_compute_task) == THRD_SUCCESS;
+            if (!local_compute_started) {
+                std::println(stderr, "mandelbench: failed to create local compute supervisor; using synchronous fallback");
+            }
         }
-        uint64_t const AFTER_LOCAL_COMPUTE_US = now_us();
+
+        bool local_compute_ok = true;
+        if (!local_compute_started) {
+            local_compute_ok = execute_local_compute_task(local_compute_task);
+            if (!local_compute_ok) {
+                close_worker_pipes(remote_launches);
+                return 1;
+            }
+        }
+
+        uint64_t const PAYLOAD_DRAIN_START_US = now_us();
+        WorkerPayloadResult const WORKER_RESULT =
+            complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index, PAYLOAD_RELEASE);
+        if (local_compute_started) {
+            local_compute_ok = join_local_compute_task(local_compute_thread, local_compute_task);
+        }
+        uint64_t const AFTER_LOCAL_COMPUTE_US = local_compute_task.end_us;
         MANDELBENCH_TRACE("mandelbench: repeat {} local-compute end ms={:.3f}", repeat_index,
                           elapsed_ms(LOCAL_COMPUTE_START_US, AFTER_LOCAL_COMPUTE_US));
 
-        WorkerPayloadResult const WORKER_RESULT =
-            complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index, PAYLOAD_RELEASE);
         uint64_t const AFTER_HEADER_US = WORKER_RESULT.header_end_us;
-        uint64_t const PAYLOAD_RELEASE_START_US = AFTER_LOCAL_COMPUTE_US;
         uint64_t const AFTER_PAYLOAD_RELEASE_US = WORKER_RESULT.release_end_us;
         uint64_t const AFTER_WAIT_US = WORKER_RESULT.wait_end_us;
         uint64_t const AFTER_READ_US = WORKER_RESULT.read_end_us;
-        if (!WORKER_RESULT.ok) {
+        if (!local_compute_ok || !WORKER_RESULT.ok) {
             close_worker_pipes(remote_launches);
             return 1;
         }
@@ -1767,8 +1839,8 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
                          "header_ms={:.3f} release_ms={:.3f} wait_ms={:.3f} payload_ms={:.3f} merge_ms={:.3f} workers={} "
                          "remote_workers={} local_workers={} nodes={}",
                          repeat_index, elapsed_ms(START_US, AFTER_MERGE_US), elapsed_ms(START_US, AFTER_START_SIGNAL_US),
-                         elapsed_ms(LOCAL_COMPUTE_START_US, AFTER_LOCAL_COMPUTE_US), elapsed_ms(AFTER_LOCAL_COMPUTE_US, AFTER_HEADER_US),
-                         elapsed_ms(PAYLOAD_RELEASE_START_US, AFTER_PAYLOAD_RELEASE_US),
+                         elapsed_ms(LOCAL_COMPUTE_START_US, AFTER_LOCAL_COMPUTE_US), elapsed_ms(PAYLOAD_DRAIN_START_US, AFTER_HEADER_US),
+                         elapsed_ms(PAYLOAD_DRAIN_START_US, AFTER_PAYLOAD_RELEASE_US),
                          elapsed_ms(AFTER_PAYLOAD_RELEASE_US, AFTER_WAIT_US), elapsed_ms(AFTER_PAYLOAD_RELEASE_US, AFTER_READ_US),
                          elapsed_ms(AFTER_PAYLOAD_RELEASE_US, AFTER_MERGE_US), ACTIVE_WORKERS, REMOTE_WORKER_COUNT, LOCAL_WORKER_COUNT,
                          TARGET_NODE_TEXT);

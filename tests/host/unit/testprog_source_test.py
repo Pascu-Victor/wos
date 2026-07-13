@@ -971,7 +971,7 @@ def test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local() ->
             "make_worker_launch(slot.worker_id, slot.target_node, THREAD_COUNT, true)",
             "bool const SAVE_IMAGES = mandelbench_save_images_enabled();",
             "bool const PAYLOAD_RELEASE = mandelbench_payload_release_enabled();",
-            "compute_local_launches(local_launches, image.data(), local_colormap.data(), width, height, max_iteration, ROW_SIZE,",
+            "LocalComputeTask local_compute_task{",
             "complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index, PAYLOAD_RELEASE)",
             "print_slowest_worker_profiles(remote_launches, repeat_index, START_US);",
             "if (SAVE_IMAGES)",
@@ -1083,6 +1083,98 @@ def test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local() ->
         fail("mandelbench local compute must not join one local chunk before starting the next")
 
 
+def test_mandelbench_overlaps_local_compute_with_remote_payload_drain() -> None:
+    source = MANDELBENCH_WKI_CPP.read_text()
+    execute_body = function_body(source, "execute_local_compute_task")
+    thread_body = function_body(source, "run_local_compute_task")
+    join_body = function_body(source, "join_local_compute_task")
+    coordinator_body = function_body(source, "mandelbench_wki")
+
+    require_tokens(
+        source,
+        [
+            "struct LocalComputeTask",
+            "std::span<const WorkerLaunch> launches;",
+            "std::atomic<bool> finished{false};",
+        ],
+        "mandelbench local compute supervisor task",
+    )
+    require_tokens(
+        execute_body,
+        [
+            "bool const OK = compute_local_launches(task.launches",
+            "task.ok = OK;",
+            "task.end_us = now_us();",
+            "task.finished.store(true, std::memory_order_release);",
+            "return OK;",
+        ],
+        "mandelbench local compute supervisor execution",
+    )
+    require_order(execute_body, "task.ok = OK;", "task.end_us = now_us();", "mandelbench supervisor result before completion time")
+    require_order(
+        execute_body,
+        "task.end_us = now_us();",
+        "task.finished.store(true, std::memory_order_release);",
+        "mandelbench supervisor publishes completion after all task writes",
+    )
+    finished_token = "task.finished.store(true, std::memory_order_release);"
+    finished_store = execute_body.find(finished_token)
+    if "task." in execute_body[finished_store + len(finished_token) :]:
+        fail("mandelbench supervisor must not access its stack task after publishing completion")
+    require_tokens(
+        thread_body,
+        [
+            "execute_local_compute_task(*task)",
+            "EXIT_SUCCESS",
+            "EXIT_FAILURE",
+        ],
+        "mandelbench local compute supervisor entry",
+    )
+    require_tokens(
+        join_body,
+        [
+            "thrd_join(thread, &result)",
+            "task.finished.load(std::memory_order_acquire)",
+            "thrd_yield();",
+        ],
+        "mandelbench local compute supervisor join",
+    )
+    require_tokens(
+        coordinator_body,
+        [
+            "bool const OVERLAP_LOCAL_AND_REMOTE = !local_launches.empty() && !remote_launches.empty();",
+            "thrd_create(&local_compute_thread, run_local_compute_task, &local_compute_task)",
+            "using synchronous fallback",
+            "execute_local_compute_task(local_compute_task)",
+            "complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index, PAYLOAD_RELEASE)",
+            "join_local_compute_task(local_compute_thread, local_compute_task)",
+            "if (!local_compute_ok || !WORKER_RESULT.ok)",
+            "scatter_worker_outputs(remote_launches, image.data(), ROW_SIZE)",
+        ],
+        "mandelbench mixed-node compute and payload overlap",
+    )
+    require_order(
+        coordinator_body,
+        "thrd_create(&local_compute_thread, run_local_compute_task, &local_compute_task)",
+        "complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index, PAYLOAD_RELEASE)",
+        "mandelbench starts local compute before draining remote payloads",
+    )
+    require_order(
+        coordinator_body,
+        "complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index, PAYLOAD_RELEASE)",
+        "join_local_compute_task(local_compute_thread, local_compute_task)",
+        "mandelbench keeps remote child polling on the coordinator before joining local compute",
+    )
+    require_order(
+        coordinator_body,
+        "join_local_compute_task(local_compute_thread, local_compute_task)",
+        "scatter_worker_outputs(remote_launches, image.data(), ROW_SIZE)",
+        "mandelbench joins local row writers before scattering remote rows",
+    )
+    if "complete_worker_payloads_streaming" in thread_body:
+        fail("mandelbench remote waitpid/payload draining must stay on the original fork-parent task")
+
+
 def main() -> None:
     test_ping_receive_is_deadline_bounded()
     test_netbench_io_is_deadline_bounded()
@@ -1097,6 +1189,7 @@ def main() -> None:
     test_mandelbench_worker_waits_use_monotonic_elapsed_time()
     test_mandelbench_auto_nodes_request_remote_wki_placement()
     test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local()
+    test_mandelbench_overlaps_local_compute_with_remote_payload_drain()
     print("testprog ping, netbench, suite, perfbench, cowbench, and mandelbench waits are deadline bounded")
 
 
