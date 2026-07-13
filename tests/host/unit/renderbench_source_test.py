@@ -3,7 +3,6 @@
 import re
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[3]
 RENDERBENCH_MAIN_CPP = ROOT / "modules" / "renderbench" / "src" / "main.cpp"
 
@@ -95,7 +94,12 @@ def test_renderbench_worker_cancellation_is_cooperative() -> None:
         "renderbench worker mode must install signal handlers before entering worker loop",
     )
 
-    for name in ["read_exact", "write_all", "render_worker_tile_packet", "batch_render_thread"]:
+    for name in [
+        "read_exact",
+        "write_all",
+        "render_worker_tile_packet",
+        "batch_render_thread",
+    ]:
         body = function_body(source, name)
         if "cancel_requested()" not in body:
             fail(f"{name} must observe cooperative cancellation")
@@ -215,7 +219,9 @@ def test_renderbench_coordinator_stall_report_exposes_batch_state() -> None:
 def test_renderbench_command_stream_uses_per_batch_thread_join() -> None:
     source = RENDERBENCH_MAIN_CPP.read_text()
     if "CommandStreamThreadPool" in source or "command_stream_worker_thread" in source:
-        fail("renderbench command-stream batches must not use a persistent condition-variable thread pool")
+        fail(
+            "renderbench command-stream batches must not use a persistent condition-variable thread pool"
+        )
 
     run_body = function_body(source, "run_ipc_worker")
     require_tokens(
@@ -313,6 +319,60 @@ def test_renderbench_live_mode_streams_worker_tiles() -> None:
     )
 
 
+def test_renderbench_ipc_profile_separates_capacity_from_dynamic_runs() -> None:
+    source = RENDERBENCH_MAIN_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "size_t configured_slots = 0;",
+            "size_t configured_threads = 0;",
+            '\\"configured_slots\\"',
+            '\\"configured_threads\\"',
+        ],
+        "renderbench configured IPC capacity surface",
+    )
+
+    initialize_body = function_body(source, "initialize_process_ipc_profile")
+    require_tokens(
+        initialize_body,
+        [
+            "profile.worker_slots = specs.size();",
+            "++host->configured_slots;",
+            "host->configured_threads +=",
+            "spec.worker_threads",
+        ],
+        "renderbench initial IPC capacity accounting",
+    )
+
+    note_body = function_body(source, "note_process_ipc_profile")
+    require_tokens(
+        note_body,
+        ["++profile.completed_runs;", "++host->completed_runs;"],
+        "renderbench dynamic IPC run accounting",
+    )
+    if "configured_slots" in note_body or "configured_threads" in note_body:
+        fail("renderbench dynamic completions must not mutate configured IPC capacity")
+
+    write_body = function_body(source, "write_process_ipc_profile_json")
+    require_tokens(
+        write_body,
+        ['\\"configured_slots\\"', '\\"configured_threads\\"'],
+        "renderbench configured IPC capacity JSON",
+    )
+    if "if (host.completed_runs == 0)" in write_body:
+        fail(
+            "renderbench IPC profile must retain configured hosts with no completed work"
+        )
+
+    run_body = function_body(source, "run_distributed_ipc")
+    require_order(
+        run_body,
+        "initialize_process_ipc_profile(ipc_profile",
+        "for (size_t i = 0; i < specs.size(); ++i)",
+        "renderbench must snapshot configured capacity before launching workers",
+    )
+
+
 def main() -> None:
     test_renderbench_worker_reap_is_deadline_bounded()
     test_renderbench_worker_cancellation_is_cooperative()
@@ -323,6 +383,7 @@ def main() -> None:
     test_renderbench_command_stream_uses_per_batch_thread_join()
     test_renderbench_node_threads_avoid_persistent_command_stream()
     test_renderbench_live_mode_streams_worker_tiles()
+    test_renderbench_ipc_profile_separates_capacity_from_dynamic_runs()
     print("renderbench worker source invariants hold")
 
 

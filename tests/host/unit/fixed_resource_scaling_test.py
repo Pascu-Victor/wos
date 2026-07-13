@@ -109,14 +109,18 @@ def render_result(elapsed: float, node_count: int, step_name: str) -> dict[str, 
     host_records: list[dict[str, object]] = []
     for hostname, vcpus, _ in layout:
         if placement == "node-threads":
-            runs = 1
+            configured_slots = 1
+            runs = 2
             effective_threads = vcpus
         else:
-            runs = vcpus
+            configured_slots = vcpus
+            runs = vcpus + 1
             effective_threads = 1
         host_records.append(
             {
                 "host": f"{hostname}.wos",
+                "configured_slots": configured_slots,
+                "configured_threads": vcpus,
                 "runs": runs,
                 "effective_threads": effective_threads,
                 "render_ms_avg": 100.0,
@@ -129,7 +133,8 @@ def render_result(elapsed: float, node_count: int, step_name: str) -> dict[str, 
 
     total_tiles = ((width + 23) // 24) * ((height + 23) // 24)
     total_samples = width * height * spp
-    worker_slots = sum(int(record["runs"]) for record in host_records)
+    worker_slots = sum(int(record["configured_slots"]) for record in host_records)
+    completed_runs = sum(int(record["runs"]) for record in host_records)
     return {
         "benchmark": "renderbench",
         "backend": "ipc",
@@ -173,7 +178,7 @@ def render_result(elapsed: float, node_count: int, step_name: str) -> dict[str, 
             "read_bytes": total_tiles * 4096,
             "read_calls": total_tiles,
             "worker_slots": worker_slots,
-            "completed_runs": worker_slots,
+            "completed_runs": completed_runs,
             "effective_reserve_cpus": 0,
             "hosts": host_records,
         },
@@ -670,6 +675,18 @@ def test_render_matrix_and_per_host_work_are_enforced(comparator) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
 
+        dynamic_runs = complete_matrix(root / "dynamic-runs")
+        dynamic_candidate = result_path_for(
+            dynamic_runs[-1], "wos-render-duck-node-threads"
+        )
+        dynamic_profile = read_json(dynamic_candidate)["ipc_profile"]
+        if dynamic_profile["completed_runs"] <= dynamic_profile["worker_slots"]:
+            fail("synthetic render profile does not exercise repeated dynamic runs")
+        dynamic_result = comparator.compare_runs(
+            dynamic_runs, required_workloads=("rendering",)
+        )
+        assert_equal(dynamic_result["pass"], True, "dynamic render runs comparison")
+
         incomplete = complete_matrix(root / "incomplete")
         payload = read_json(incomplete[-1])
         payload["steps"] = [
@@ -709,6 +726,50 @@ def test_render_matrix_and_per_host_work_are_enforced(comparator) -> None:
         expect_error(
             comparator,
             wrong_capacity,
+            "node-thread capacity",
+            required_workloads=("rendering",),
+        )
+
+        incomplete_runs = complete_matrix(root / "incomplete-runs")
+        candidate = result_path_for(
+            incomplete_runs[-1], "wos-render-duck-process-per-core"
+        )
+        payload = read_json(candidate)
+        payload["ipc_profile"]["completed_runs"] = (
+            payload["ipc_profile"]["worker_slots"] - 1
+        )
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            incomplete_runs,
+            "incomplete worker slots",
+            required_workloads=("rendering",),
+        )
+
+        wrong_configured_slots = complete_matrix(root / "wrong-configured-slots")
+        candidate = result_path_for(
+            wrong_configured_slots[-1], "wos-render-duck-process-per-core"
+        )
+        payload = read_json(candidate)
+        payload["ipc_profile"]["hosts"][-1]["configured_slots"] += 1
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            wrong_configured_slots,
+            "configured slots do not match worker slots",
+            required_workloads=("rendering",),
+        )
+
+        wrong_configured_threads = complete_matrix(root / "wrong-configured-threads")
+        candidate = result_path_for(
+            wrong_configured_threads[-1], "wos-render-duck-node-threads"
+        )
+        payload = read_json(candidate)
+        payload["ipc_profile"]["hosts"][-1]["configured_threads"] -= 1
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            wrong_configured_threads,
             "node-thread capacity",
             required_workloads=("rendering",),
         )

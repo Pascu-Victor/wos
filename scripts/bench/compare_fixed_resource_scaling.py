@@ -707,7 +707,7 @@ def validate_render_completion(
         or worker_slots <= 0
         or isinstance(completed_runs, bool)
         or not isinstance(completed_runs, int)
-        or completed_runs != worker_slots
+        or completed_runs < worker_slots
     ):
         raise ComparisonError(
             f"{manifest_path}: {step_name} has incomplete worker slots"
@@ -727,6 +727,8 @@ def validate_render_completion(
         )
     actual_hosts: set[str] = set()
     runs_by_host: dict[str, int] = {}
+    configured_slots_by_host: dict[str, int] = {}
+    configured_threads_by_host: dict[str, int] = {}
     threads_by_host: dict[str, float] = {}
     for host_record in raw_hosts:
         if not isinstance(host_record, dict) or not isinstance(
@@ -736,8 +738,21 @@ def validate_render_completion(
                 f"{manifest_path}: {step_name} has an invalid IPC host record"
             )
         host = normalize_wos_hostname(host_record["host"])
+        configured_slots = host_record.get("configured_slots")
+        configured_threads = host_record.get("configured_threads")
         runs = host_record.get("runs")
         effective_threads = host_record.get("effective_threads")
+        if (
+            isinstance(configured_slots, bool)
+            or not isinstance(configured_slots, int)
+            or configured_slots <= 0
+            or isinstance(configured_threads, bool)
+            or not isinstance(configured_threads, int)
+            or configured_threads <= 0
+        ):
+            raise ComparisonError(
+                f"{manifest_path}: {step_name} host {host} has no positive configured capacity"
+            )
         if (
             isinstance(runs, bool)
             or not isinstance(runs, int)
@@ -769,6 +784,8 @@ def validate_render_completion(
                 )
         actual_hosts.add(host)
         runs_by_host[host] = runs
+        configured_slots_by_host[host] = configured_slots
+        configured_threads_by_host[host] = configured_threads
         threads_by_host[host] = float(effective_threads)
     if len(actual_hosts) != len(raw_hosts) or actual_hosts != expected_hosts:
         raise ComparisonError(
@@ -776,7 +793,11 @@ def validate_render_completion(
         )
     if sum(runs_by_host.values()) != completed_runs:
         raise ComparisonError(
-            f"{manifest_path}: {step_name} per-host runs do not match completed worker slots"
+            f"{manifest_path}: {step_name} per-host runs do not match completed runs"
+        )
+    if sum(configured_slots_by_host.values()) != worker_slots:
+        raise ComparisonError(
+            f"{manifest_path}: {step_name} per-host configured slots do not match worker slots"
         )
     if placement == "node-threads":
         if worker_slots != len(expected_hosts):
@@ -784,7 +805,11 @@ def validate_render_completion(
                 f"{manifest_path}: {step_name} must launch one node-thread worker per host"
             )
         for host in expected_hosts:
-            if runs_by_host[host] != 1 or threads_by_host[host] != expected_vcpus[host]:
+            if (
+                configured_slots_by_host[host] != 1
+                or configured_threads_by_host[host] != expected_vcpus[host]
+                or threads_by_host[host] != expected_vcpus[host]
+            ):
                 raise ComparisonError(
                     f"{manifest_path}: {step_name} node-thread capacity for {host} does not match the topology"
                 )
@@ -794,7 +819,11 @@ def validate_render_completion(
                 f"{manifest_path}: {step_name} process-per-core worker total is not fixed at {EXPECTED_TOTAL_VCPUS}"
             )
         for host in expected_hosts:
-            if runs_by_host[host] != expected_vcpus[host] or threads_by_host[host] != 1:
+            if (
+                configured_slots_by_host[host] != expected_vcpus[host]
+                or configured_threads_by_host[host] != expected_vcpus[host]
+                or threads_by_host[host] != 1
+            ):
                 raise ComparisonError(
                     f"{manifest_path}: {step_name} process-per-core capacity for {host} does not match the topology"
                 )

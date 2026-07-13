@@ -255,6 +255,8 @@ struct ChildWorker {
 
 struct HostIpcProfile {
     std::string hostname;
+    size_t configured_slots = 0;
+    size_t configured_threads = 0;
     size_t completed_runs = 0;
     uint64_t worker_elapsed_total_ms = 0;
     uint64_t worker_render_total_ms = 0;
@@ -2283,6 +2285,22 @@ auto host_thread_capacity_ms(const HostIpcProfile& host) -> double {
     return static_cast<double>(host.worker_thread_capacity_total_ms) / static_cast<double>(host.completed_runs);
 }
 
+void initialize_process_ipc_profile(ProcessIpcProfile& profile, std::span<const IpcWorkerSpec> specs) {
+    profile.worker_slots = specs.size();
+    profile.hosts.reserve(specs.size());
+    for (const auto& spec : specs) {
+        auto host = std::ranges::find_if(profile.hosts, [&](const HostIpcProfile& item) { return item.hostname == spec.hostname; });
+        if (host == profile.hosts.end()) {
+            profile.hosts.push_back({
+                .hostname = spec.hostname,
+            });
+            host = profile.hosts.end() - 1;
+        }
+        ++host->configured_slots;
+        host->configured_threads += static_cast<size_t>(std::max(1, spec.worker_threads));
+    }
+}
+
 auto write_process_ipc_profile_json(const tracebench::Options& options, const ProcessIpcProfile& profile, double launch_seconds,
                                     uint64_t tiles_done, uint64_t total_tiles) -> bool {
     std::ostringstream out;
@@ -2314,21 +2332,21 @@ auto write_process_ipc_profile_json(const tracebench::Options& options, const Pr
 
     bool first = true;
     for (const auto& host : profile.hosts) {
-        if (host.completed_runs == 0) {
-            continue;
-        }
         if (!first) {
             out << ",\n";
         }
         first = false;
         uint32_t const HOST_MIN_WORKER_MS = host.min_worker_ms == UINT32_MAX ? 0 : host.min_worker_ms;
-        double const AVG_HOST_WORKER_MS = static_cast<double>(host.worker_elapsed_total_ms) / static_cast<double>(host.completed_runs);
-        double const AVG_RENDER_MS = static_cast<double>(host.worker_render_total_ms) / static_cast<double>(host.completed_runs);
-        double const AVG_RENDER_CPU_MS = static_cast<double>(host.worker_render_cpu_total_ms) / static_cast<double>(host.completed_runs);
-        double const AVG_SEND_MS = static_cast<double>(host.worker_send_total_ms) / static_cast<double>(host.completed_runs);
+        auto const RUNS = static_cast<double>(host.completed_runs);
+        double const AVG_HOST_WORKER_MS = ratio_or_zero(static_cast<double>(host.worker_elapsed_total_ms), RUNS);
+        double const AVG_RENDER_MS = ratio_or_zero(static_cast<double>(host.worker_render_total_ms), RUNS);
+        double const AVG_RENDER_CPU_MS = ratio_or_zero(static_cast<double>(host.worker_render_cpu_total_ms), RUNS);
+        double const AVG_SEND_MS = ratio_or_zero(static_cast<double>(host.worker_send_total_ms), RUNS);
         double const CAPACITY_MS = host_thread_capacity_ms(host);
         out << "    {\n"
             << "      \"host\": \"" << json_escape(host.hostname) << "\",\n"
+            << "      \"configured_slots\": " << host.configured_slots << ",\n"
+            << "      \"configured_threads\": " << host.configured_threads << ",\n"
             << "      \"runs\": " << host.completed_runs << ",\n"
             << "      \"effective_threads\": "
             << ratio_or_zero(static_cast<double>(host.effective_threads), static_cast<double>(host.completed_runs)) << ",\n"
@@ -2921,7 +2939,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
 
     bool ok = true;
     ProcessIpcProfile ipc_profile{};
-    ipc_profile.worker_slots = specs.size();
+    initialize_process_ipc_profile(ipc_profile, std::span<const IpcWorkerSpec>(specs.data(), specs.size()));
     ipc_profile.persistent_batch_size = PERSISTENT_BATCH_SIZE;
     ipc_profile.effective_reserve_cpus = local_coordinator_reserve_cpus(options, peers.size());
     size_t open_pipes = 0;
