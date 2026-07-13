@@ -62,6 +62,13 @@ constexpr uint16_t WKI_LOAD_REPORT_MAX_CPUS = 64;
 constexpr size_t WKI_COMPUTE_SUBMIT_WORKER_MAX = 4;
 constexpr size_t WKI_COMPUTE_SUBMIT_QUEUE_MAX = 64;
 constexpr size_t WKI_COMPUTE_SUBMIT_CANCEL_MAX = WKI_COMPUTE_SUBMIT_QUEUE_MAX * 2;
+constexpr size_t WKI_COMPUTE_RX_WORKER_MAX = 4;
+// One full resource-channel receive window per worker. A shared pool lets a
+// busy compile peer borrow unused capacity from idle shards while remaining
+// bounded across four-node bursts.
+constexpr size_t WKI_COMPUTE_RX_QUEUE_MAX = WKI_CREDITS_RESOURCE * WKI_COMPUTE_RX_WORKER_MAX;
+constexpr size_t WKI_COMPUTE_RX_PAYLOAD_MAX = sizeof(TaskCompletePayload) + WKI_TASK_MAX_OUTPUT;
+static_assert(WKI_COMPUTE_RX_QUEUE_MAX <= UINT16_MAX);
 constexpr uint64_t WKI_TASK_SUBMIT_VFS_TIMEOUT_US = 60'000'000;  // Remote binary fetch + launch.
 constexpr uint64_t WKI_TASK_SUBMIT_INLINE_RECEIVER_TIMEOUT_US = WKI_OP_TIMEOUT_US - 1'000'000;
 constexpr uint64_t WKI_TASK_SUBMIT_VFS_RECEIVER_TIMEOUT_US = WKI_TASK_SUBMIT_VFS_TIMEOUT_US - 5'000'000;
@@ -304,6 +311,31 @@ ker::mod::sys::Spinlock s_pending_submit_lock;  // NOLINT(cppcoreguidelines-avoi
 std::array<ker::mod::sched::task::Task*, WKI_COMPUTE_SUBMIT_WORKER_MAX>
     s_compute_submit_tasks{};                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<size_t> s_compute_submit_task_count{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+struct PendingComputeRx {
+    uint8_t type = 0;
+    WkiHeader hdr = {};
+    WkiChannel* rx_channel = nullptr;
+    uint32_t rx_channel_generation = 0;
+    uint16_t payload_len = 0;
+    std::array<uint8_t, WKI_COMPUTE_RX_PAYLOAD_MAX> payload = {};
+};
+
+struct ComputeRxShard {
+    std::array<uint16_t, WKI_COMPUTE_RX_QUEUE_MAX> slot_indices = {};
+    size_t head = 0;
+    size_t tail = 0;
+    size_t count = 0;
+};
+
+std::array<PendingComputeRx, WKI_COMPUTE_RX_QUEUE_MAX> s_compute_rx_slots{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<bool, WKI_COMPUTE_RX_QUEUE_MAX> s_compute_rx_slot_used{};          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<ComputeRxShard, WKI_COMPUTE_RX_WORKER_MAX> s_compute_rx_shards{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+size_t s_compute_rx_slot_cursor = 0;                                          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_compute_rx_lock;                                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<ker::mod::sched::task::Task*, WKI_COMPUTE_RX_WORKER_MAX>
+    s_compute_rx_tasks{};                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<size_t> s_compute_rx_task_count{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 struct SharedElfCacheEntry {
     bool valid = false;
@@ -2261,6 +2293,8 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
 
     bool completed_immediately = false;
     int32_t completed_exit_status = 0;
+    uint8_t* completed_output = nullptr;
+    uint16_t completed_output_len = 0;
     bool emit_proxy_ready_wait = false;
     uint32_t proxy_ready_wait_us = 0;
     bool emit_complete_hold = false;
@@ -2283,6 +2317,10 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
         if (proxy_ready && !st->active) {
             completed_immediately = true;
             completed_exit_status = st->exit_status;
+            completed_output = st->pending_proxy_output;
+            completed_output_len = st->pending_proxy_output_len;
+            st->pending_proxy_output = nullptr;
+            st->pending_proxy_output_len = 0;
             if (st->complete_received_at_us != 0 && METRIC_NOW_US >= st->complete_received_at_us) {
                 emit_complete_hold = true;
                 complete_hold_us = static_cast<uint32_t>(METRIC_NOW_US - st->complete_received_at_us);
@@ -2306,7 +2344,8 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     }
 
     if (completed_immediately) {
-        finalize_proxy_task(task, completed_exit_status, nullptr, 0, tid);
+        finalize_proxy_task(task, completed_exit_status, completed_output, completed_output_len, tid);
+        delete[] completed_output;
     }
 #ifdef WKI_DEBUG
     ker::mod::dbg::log("[WKI] Task '%s' (pid=0x%lx) placed as proxy on node 0x%04x (task_id=%u)", task->name, task->pid, best_node, tid);
@@ -2768,6 +2807,8 @@ void wki_proxy_task_blocked(ker::mod::sched::task::Task* task) {
 
     bool completed_immediately = false;
     int32_t completed_exit_status = 0;
+    uint8_t* completed_output = nullptr;
+    uint16_t completed_output_len = 0;
     uint16_t target_node = WKI_NODE_INVALID;
     bool emit_proxy_ready_wait = false;
     uint32_t proxy_ready_wait_us = 0;
@@ -2789,6 +2830,10 @@ void wki_proxy_task_blocked(ker::mod::sched::task::Task* task) {
         if (!submitted->active) {
             completed_immediately = true;
             completed_exit_status = submitted->exit_status;
+            completed_output = submitted->pending_proxy_output;
+            completed_output_len = submitted->pending_proxy_output_len;
+            submitted->pending_proxy_output = nullptr;
+            submitted->pending_proxy_output_len = 0;
             if (submitted->complete_received_at_us != 0 && METRIC_NOW_US >= submitted->complete_received_at_us) {
                 emit_complete_hold = true;
                 complete_hold_us = static_cast<uint32_t>(METRIC_NOW_US - submitted->complete_received_at_us);
@@ -2814,7 +2859,8 @@ void wki_proxy_task_blocked(ker::mod::sched::task::Task* task) {
     }
 
     if (completed_immediately) {
-        finalize_proxy_task(task, completed_exit_status, nullptr, 0, task->wki_proxy_task_id);
+        finalize_proxy_task(task, completed_exit_status, completed_output, completed_output_len, task->wki_proxy_task_id);
+        delete[] completed_output;
     }
 }
 
@@ -5389,6 +5435,128 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
 // without creating one worker per CPU.
 // ---------------------------------------------------------------------------
 
+auto compute_rx_worker_target(uint64_t cpu_count) -> size_t {
+    uint64_t const AVAILABLE_CPUS = std::max<uint64_t>(cpu_count, 1);
+    return static_cast<size_t>(std::min<uint64_t>(AVAILABLE_CPUS, WKI_COMPUTE_RX_WORKER_MAX));
+}
+
+auto compute_rx_worker_index(uint16_t src_node, size_t worker_count) -> size_t {
+    if (worker_count == 0) {
+        return 0;
+    }
+    uint32_t hash = src_node;
+    hash ^= hash >> 16U;
+    hash *= 0x7feb352dU;
+    hash ^= hash >> 15U;
+    hash *= 0x846ca68bU;
+    hash ^= hash >> 16U;
+    return static_cast<size_t>(hash % worker_count);
+}
+
+auto classify_compute_rx_payload(MsgType type, const uint8_t* payload, uint16_t payload_len, uint16_t* copy_len) -> WkiComputeRxAdmission {
+    if (copy_len == nullptr) {
+        return WkiComputeRxAdmission::DISCARD;
+    }
+    *copy_len = 0;
+
+    if (type == MsgType::TASK_COMPLETE) {
+        if (payload == nullptr || payload_len < sizeof(TaskCompletePayload)) {
+            return WkiComputeRxAdmission::DISCARD;
+        }
+        TaskCompletePayload complete = {};
+        std::memcpy(&complete, payload, sizeof(complete));
+        size_t const EXPECTED_LEN = sizeof(TaskCompletePayload) + complete.output_len;
+        if (complete.output_len > WKI_TASK_MAX_OUTPUT || EXPECTED_LEN > payload_len) {
+            return WkiComputeRxAdmission::DISCARD;
+        }
+        *copy_len = static_cast<uint16_t>(EXPECTED_LEN);
+        return WkiComputeRxAdmission::DEFERRED;
+    }
+
+    if (type == MsgType::TASK_CANCEL) {
+        if (payload == nullptr || payload_len < sizeof(uint32_t)) {
+            return WkiComputeRxAdmission::DISCARD;
+        }
+        if (payload_len >= sizeof(TaskCancelPayload)) {
+            TaskCancelPayload cancel = {};
+            std::memcpy(&cancel, payload, sizeof(cancel));
+            if (cancel.signum <= 0 || std::cmp_greater(cancel.signum, ker::mod::sched::task::Task::MAX_SIGNALS)) {
+                return WkiComputeRxAdmission::DISCARD;
+            }
+            *copy_len = sizeof(TaskCancelPayload);
+        } else {
+            // Preserve the legacy task-id-only form, whose handler defaults to
+            // SIGKILL. Ignore any partial signal bytes.
+            *copy_len = sizeof(uint32_t);
+        }
+        return WkiComputeRxAdmission::DEFERRED;
+    }
+
+    return WkiComputeRxAdmission::INLINE;
+}
+
+auto dequeue_compute_rx(size_t worker_index, uint16_t* slot_index) -> bool {
+    if (slot_index == nullptr || worker_index >= WKI_COMPUTE_RX_WORKER_MAX) {
+        return false;
+    }
+
+    s_compute_rx_lock.lock();
+    auto& shard = s_compute_rx_shards.at(worker_index);
+    if (shard.count == 0) {
+        s_compute_rx_lock.unlock();
+        return false;
+    }
+    *slot_index = shard.slot_indices.at(shard.head);
+    shard.head = (shard.head + 1) % WKI_COMPUTE_RX_QUEUE_MAX;
+    shard.count--;
+    s_compute_rx_lock.unlock();
+    return true;
+}
+
+void release_compute_rx_slot(uint16_t slot_index) {
+    if (slot_index >= WKI_COMPUTE_RX_QUEUE_MAX) {
+        return;
+    }
+    s_compute_rx_lock.lock();
+    s_compute_rx_slot_used.at(slot_index) = false;
+    s_compute_rx_lock.unlock();
+}
+
+[[noreturn]] void compute_rx_worker_loop(size_t worker_index) {
+    for (;;) {
+        uint16_t slot_index = 0;
+        if (!dequeue_compute_rx(worker_index, &slot_index)) {
+            ker::mod::sched::kern_block();
+            continue;
+        }
+
+        auto& work = s_compute_rx_slots.at(slot_index);
+        {
+            PeerLifecycleLease lifecycle;
+            if (lifecycle.acquire(work.hdr.src_node)) {
+                WkiPeer const* peer = wki_peer_find(work.hdr.src_node);
+                if (peer != nullptr && peer->state == PeerState::CONNECTED &&
+                    compute_submit_channel_token_matches(work.hdr.src_node, work.rx_channel, work.rx_channel_generation)) {
+                    auto const WORK_TYPE = static_cast<MsgType>(work.type);
+                    if (WORK_TYPE == MsgType::TASK_COMPLETE) {
+                        detail::handle_task_complete(&work.hdr, work.payload.data(), work.payload_len, work.rx_channel,
+                                                     work.rx_channel_generation);
+                    } else if (WORK_TYPE == MsgType::TASK_CANCEL) {
+                        detail::handle_task_cancel(&work.hdr, work.payload.data(), work.payload_len, work.rx_channel,
+                                                   work.rx_channel_generation);
+                    }
+                }
+            }
+        }
+        release_compute_rx_slot(slot_index);
+    }
+}
+
+[[noreturn]] void compute_rx_worker_0() { compute_rx_worker_loop(0); }
+[[noreturn]] void compute_rx_worker_1() { compute_rx_worker_loop(1); }
+[[noreturn]] void compute_rx_worker_2() { compute_rx_worker_loop(2); }
+[[noreturn]] void compute_rx_worker_3() { compute_rx_worker_loop(3); }
+
 auto compute_submit_worker_target(uint64_t cpu_count) -> size_t {
     uint64_t const AVAILABLE_CPUS = std::max<uint64_t>(cpu_count, 1);
     return static_cast<size_t>(std::min<uint64_t>(AVAILABLE_CPUS, WKI_COMPUTE_SUBMIT_WORKER_MAX));
@@ -5453,6 +5621,115 @@ void drain_pending_task_submits() {
 
 }  // namespace
 
+auto wki_remote_compute_admit_rx(MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                                 uint32_t rx_channel_generation) -> WkiComputeRxAdmission {
+    uint16_t copy_len = 0;
+    WkiComputeRxAdmission const CLASSIFICATION = classify_compute_rx_payload(type, payload, payload_len, &copy_len);
+    if (CLASSIFICATION != WkiComputeRxAdmission::DEFERRED) {
+        return CLASSIFICATION;
+    }
+    if (hdr == nullptr || rx_channel == nullptr || rx_channel_generation == 0 || hdr->channel_id != WKI_CHAN_RESOURCE ||
+        rx_channel->channel_id != WKI_CHAN_RESOURCE) {
+        return WkiComputeRxAdmission::DISCARD;
+    }
+
+    size_t const WORKER_COUNT = s_compute_rx_task_count.load(std::memory_order_acquire);
+    if (WORKER_COUNT == 0 || WORKER_COUNT > WKI_COMPUTE_RX_WORKER_MAX) {
+        return WkiComputeRxAdmission::RETRY;
+    }
+    size_t const WORKER_INDEX = compute_rx_worker_index(hdr->src_node, WORKER_COUNT);
+
+    size_t slot_index = WKI_COMPUTE_RX_QUEUE_MAX;
+    s_compute_rx_lock.lock();
+    for (size_t offset = 0; offset < WKI_COMPUTE_RX_QUEUE_MAX; ++offset) {
+        size_t const CANDIDATE = (s_compute_rx_slot_cursor + offset) % WKI_COMPUTE_RX_QUEUE_MAX;
+        if (!s_compute_rx_slot_used.at(CANDIDATE)) {
+            slot_index = CANDIDATE;
+            s_compute_rx_slot_used.at(CANDIDATE) = true;
+            s_compute_rx_slot_cursor = (CANDIDATE + 1) % WKI_COMPUTE_RX_QUEUE_MAX;
+            break;
+        }
+    }
+    s_compute_rx_lock.unlock();
+    if (slot_index == WKI_COMPUTE_RX_QUEUE_MAX) {
+        return WkiComputeRxAdmission::RETRY;
+    }
+
+    // The slot is private until its index is published below. Keep the queue
+    // lock out of the bounded 4 KiB copy while the reliable channel lock keeps
+    // this frame stable.
+    auto& slot = s_compute_rx_slots.at(slot_index);
+    slot.type = static_cast<uint8_t>(type);
+    slot.hdr = *hdr;
+    slot.rx_channel = rx_channel;
+    slot.rx_channel_generation = rx_channel_generation;
+    slot.payload_len = copy_len;
+    std::memcpy(slot.payload.data(), payload, copy_len);
+
+    s_compute_rx_lock.lock();
+    auto& shard = s_compute_rx_shards.at(WORKER_INDEX);
+    if (shard.count >= WKI_COMPUTE_RX_QUEUE_MAX) {
+        s_compute_rx_slot_used.at(slot_index) = false;
+        s_compute_rx_lock.unlock();
+        return WkiComputeRxAdmission::RETRY;
+    }
+    shard.slot_indices.at(shard.tail) = static_cast<uint16_t>(slot_index);
+    shard.tail = (shard.tail + 1) % WKI_COMPUTE_RX_QUEUE_MAX;
+    shard.count++;
+    s_compute_rx_lock.unlock();
+    return WkiComputeRxAdmission::DEFERRED;
+}
+
+void wki_remote_compute_notify_deferred_rx(uint16_t src_node) {
+    size_t const WORKER_COUNT = s_compute_rx_task_count.load(std::memory_order_acquire);
+    if (WORKER_COUNT == 0 || WORKER_COUNT > WKI_COMPUTE_RX_WORKER_MAX) {
+        return;
+    }
+    size_t const WORKER_INDEX = compute_rx_worker_index(src_node, WORKER_COUNT);
+    ker::mod::sched::wake_task_from_event(s_compute_rx_tasks.at(WORKER_INDEX));
+}
+
+void wki_remote_compute_start_rx_threads() {
+    if (s_compute_rx_task_count.load(std::memory_order_acquire) != 0) {
+        return;
+    }
+
+    using WorkerEntry = void (*)();
+    constexpr std::array<WorkerEntry, WKI_COMPUTE_RX_WORKER_MAX> WORKER_ENTRIES = {
+        compute_rx_worker_0,
+        compute_rx_worker_1,
+        compute_rx_worker_2,
+        compute_rx_worker_3,
+    };
+    constexpr std::array<const char*, WKI_COMPUTE_RX_WORKER_MAX> WORKER_NAMES = {
+        "wki_comp_rx0",
+        "wki_comp_rx1",
+        "wki_comp_rx2",
+        "wki_comp_rx3",
+    };
+    size_t const TARGET_WORKERS = compute_rx_worker_target(ker::mod::smt::get_core_count());
+    size_t started_workers = 0;
+    for (size_t i = 0; i < TARGET_WORKERS; ++i) {
+        auto* task = ker::mod::sched::task::Task::create_kernel_thread(WORKER_NAMES.at(i), WORKER_ENTRIES.at(i));
+        if (task == nullptr) {
+            ker::mod::dbg::log("[WKI] Failed to create compute RX worker %u", static_cast<unsigned>(i));
+            break;
+        }
+        promote_latency_sensitive_daemon(task);
+        if (!ker::mod::sched::post_task_balanced(task)) {
+            ker::mod::dbg::log("[WKI] Failed to post compute RX worker %u", static_cast<unsigned>(i));
+            destroy_unpublished_compute_submit_worker(task);
+            break;
+        }
+        s_compute_rx_tasks.at(i) = task;
+        started_workers++;
+    }
+
+    s_compute_rx_task_count.store(started_workers, std::memory_order_release);
+    ker::mod::dbg::log("[WKI] Compute RX pool started (%u/%u workers)", static_cast<unsigned>(started_workers),
+                       static_cast<unsigned>(TARGET_WORKERS));
+}
+
 void wki_remote_compute_start_submit_thread() {
     if (s_compute_submit_task_count.load(std::memory_order_acquire) != 0) {
         return;
@@ -5502,6 +5779,44 @@ auto wki_remote_compute_selftest_submit_worker_count_is_bounded() -> bool {
            compute_submit_worker_target(WKI_COMPUTE_SUBMIT_WORKER_MAX) == WKI_COMPUTE_SUBMIT_WORKER_MAX &&
            compute_submit_worker_target(WKI_COMPUTE_SUBMIT_WORKER_MAX + 1) == WKI_COMPUTE_SUBMIT_WORKER_MAX &&
            compute_submit_worker_target(256) == WKI_COMPUTE_SUBMIT_WORKER_MAX;
+}
+
+auto wki_remote_compute_selftest_rx_admission_is_bounded() -> bool {
+    std::array<uint8_t, WKI_COMPUTE_RX_PAYLOAD_MAX> complete_bytes = {};
+    TaskCompletePayload complete = {};
+    complete.output_len = WKI_TASK_MAX_OUTPUT;
+    std::memcpy(complete_bytes.data(), &complete, sizeof(complete));
+
+    uint16_t copy_len = 0;
+    bool const COMPLETE_VALID =
+        classify_compute_rx_payload(MsgType::TASK_COMPLETE, complete_bytes.data(), static_cast<uint16_t>(complete_bytes.size()),
+                                    &copy_len) == WkiComputeRxAdmission::DEFERRED &&
+        copy_len == complete_bytes.size();
+    bool const COMPLETE_TRUNCATED =
+        classify_compute_rx_payload(MsgType::TASK_COMPLETE, complete_bytes.data(), static_cast<uint16_t>(complete_bytes.size() - 1),
+                                    &copy_len) == WkiComputeRxAdmission::DISCARD;
+    complete.output_len = WKI_TASK_MAX_OUTPUT + 1;
+    std::memcpy(complete_bytes.data(), &complete, sizeof(complete));
+    bool const COMPLETE_OVERSIZED =
+        classify_compute_rx_payload(MsgType::TASK_COMPLETE, complete_bytes.data(), static_cast<uint16_t>(complete_bytes.size()),
+                                    &copy_len) == WkiComputeRxAdmission::DISCARD;
+
+    TaskCancelPayload cancel = {.task_id = 1, .signum = WKI_SIGKILL_NUM};
+    bool const CANCEL_VALID = classify_compute_rx_payload(MsgType::TASK_CANCEL, reinterpret_cast<const uint8_t*>(&cancel), sizeof(cancel),
+                                                          &copy_len) == WkiComputeRxAdmission::DEFERRED &&
+                              copy_len == sizeof(cancel);
+    bool const CANCEL_LEGACY = classify_compute_rx_payload(MsgType::TASK_CANCEL, reinterpret_cast<const uint8_t*>(&cancel),
+                                                           sizeof(cancel.task_id), &copy_len) == WkiComputeRxAdmission::DEFERRED &&
+                               copy_len == sizeof(cancel.task_id);
+    cancel.signum = 0;
+    bool const CANCEL_INVALID = classify_compute_rx_payload(MsgType::TASK_CANCEL, reinterpret_cast<const uint8_t*>(&cancel), sizeof(cancel),
+                                                            &copy_len) == WkiComputeRxAdmission::DISCARD;
+
+    size_t const SHARD = compute_rx_worker_index(0x7A21, WKI_COMPUTE_RX_WORKER_MAX);
+    return WKI_COMPUTE_RX_QUEUE_MAX == WKI_CREDITS_RESOURCE * WKI_COMPUTE_RX_WORKER_MAX && compute_rx_worker_target(0) == 1 &&
+           compute_rx_worker_target(2) == 2 && compute_rx_worker_target(256) == WKI_COMPUTE_RX_WORKER_MAX &&
+           SHARD < WKI_COMPUTE_RX_WORKER_MAX && SHARD == compute_rx_worker_index(0x7A21, WKI_COMPUTE_RX_WORKER_MAX) && COMPLETE_VALID &&
+           COMPLETE_TRUNCATED && COMPLETE_OVERSIZED && CANCEL_VALID && CANCEL_LEGACY && CANCEL_INVALID;
 }
 
 auto wki_remote_compute_selftest_accept_retry_is_fair() -> bool {
@@ -5719,12 +6034,21 @@ void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     }
 
     const auto* comp = reinterpret_cast<const TaskCompletePayload*>(payload);
+    auto const AVAILABLE_OUTPUT = static_cast<uint16_t>(payload_len - sizeof(TaskCompletePayload));
+    uint16_t const OUTPUT_LEN = std::min({comp->output_len, AVAILABLE_OUTPUT, WKI_TASK_MAX_OUTPUT});
+    uint8_t* pending_output = nullptr;
+    if (OUTPUT_LEN != 0) {
+        pending_output = new (std::nothrow) uint8_t[OUTPUT_LEN];
+        if (pending_output != nullptr) {
+            std::memcpy(pending_output, payload + sizeof(TaskCompletePayload), OUTPUT_LEN);
+        }
+    }
     WkiWaitEntry* complete_waiter = nullptr;
     bool emit_task_runtime = false;
     uint32_t task_runtime_us = 0;
     uint64_t const COMPLETE_NOW_US = wki_now_us();
     ker::mod::sched::task::Task* proxy = nullptr;
-    ker::mod::sched::task::Task* local_task_for_output = nullptr;
+    uint8_t* replaced_pending_output = nullptr;
     WkiWaitEntry* response_waiter = nullptr;
 
     s_compute_lock.lock();
@@ -5732,6 +6056,7 @@ void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     if (task == nullptr || task->target_node != hdr->src_node || task->submit_channel != rx_channel ||
         task->submit_channel_generation != rx_channel_generation) {
         s_compute_lock.unlock();
+        delete[] pending_output;
         ker::mod::dbg::log("[WKI] TASK_COMPLETE: no submitted task for task_id=%u", comp->task_id);
         return;
     }
@@ -5748,7 +6073,12 @@ void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t
         task->complete_received_at_us = 0;
     } else {
         task->complete_received_at_us = COMPLETE_NOW_US;
-        local_task_for_output = task->local_task;
+        if (task->local_task != nullptr && pending_output != nullptr) {
+            replaced_pending_output = task->pending_proxy_output;
+            task->pending_proxy_output = pending_output;
+            task->pending_proxy_output_len = OUTPUT_LEN;
+            pending_output = nullptr;
+        }
     }
 
     if (task->response_pending.load(std::memory_order_acquire)) {
@@ -5765,6 +6095,7 @@ void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     complete_waiter = claim_and_clear_waiter_locked(task->complete_wait_entry);
     task->active = false;
     s_compute_lock.unlock();
+    delete[] replaced_pending_output;
 
     // IPC data/close packets may already be queued on the deferred IPC worker
     // when TASK_COMPLETE arrives.  Normal proxy close, cancel, or peer fence
@@ -5779,11 +6110,8 @@ void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t
 
     if (proxy != nullptr) {
         const uint8_t* output_data = payload + sizeof(TaskCompletePayload);
-        uint16_t out_len = comp->output_len;
-        if (out_len > 0 && payload_len > sizeof(TaskCompletePayload)) {
-            auto avail = static_cast<uint16_t>(payload_len - sizeof(TaskCompletePayload));
-            out_len = std::min(out_len, avail);
-            finalize_proxy_task(proxy, comp->exit_status, output_data, out_len, comp->task_id);
+        if (OUTPUT_LEN > 0) {
+            finalize_proxy_task(proxy, comp->exit_status, output_data, OUTPUT_LEN, comp->task_id);
         } else {
             finalize_proxy_task(proxy, comp->exit_status, nullptr, 0, comp->task_id);
         }
@@ -5793,29 +6121,15 @@ void handle_task_complete(const WkiHeader* hdr, const uint8_t* payload, uint16_t
 #endif
     } else {
         // proxy_ready=false: the proxy task hasn't blocked yet (it's still
-        // in exec return / deferred-switch setup).  Record exit_status so
-        // that the submit path or wki_proxy_task_blocked() can finalize when
-        // it observes task->active became false. If local_task is set, also
-        // forward any captured output.
+        // in exec return / deferred-switch setup). Record exit_status and an
+        // owned output copy so wki_proxy_task_blocked() can finalize without
+        // racing an unlocked raw task/File pointer.
 #ifdef DEBUG_WKI_COMPUTE
-        ker::mod::dbg::log("[WKI] TASK_COMPLETE early (proxy not ready): task_id=%u exit=%d local_task=%p", comp->task_id,
-                           comp->exit_status, local_task_for_output);
-#endif
-        if (local_task_for_output != nullptr) {
-            const uint8_t* output_data = payload + sizeof(TaskCompletePayload);
-            uint16_t out_len = comp->output_len;
-            if (out_len > 0 && payload_len > sizeof(TaskCompletePayload)) {
-                auto avail = static_cast<uint16_t>(payload_len - sizeof(TaskCompletePayload));
-                out_len = std::min(out_len, avail);
-                write_proxy_output(local_task_for_output, output_data, out_len, comp->task_id);
-            }
-        }
-#ifdef DEBUG_WKI_COMPUTE
-        else if (comp->output_len > 0 && payload_len > sizeof(TaskCompletePayload)) {
-            ker::mod::dbg::log("[WKI] Task %u output (%u bytes)", comp->task_id, comp->output_len);
-        }
+        ker::mod::dbg::log("[WKI] TASK_COMPLETE early (proxy not ready): task_id=%u exit=%d output=%u", comp->task_id, comp->exit_status,
+                           OUTPUT_LEN);
 #endif
     }
+    delete[] pending_output;
 
     if (complete_waiter != nullptr) {
         wki_finish_claimed_op(complete_waiter, 0);
@@ -5836,6 +6150,9 @@ void handle_task_cancel(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 
     const auto* cancel = reinterpret_cast<const TaskCancelPayload*>(payload);
     int const SIGNUM = payload_len >= sizeof(TaskCancelPayload) ? cancel->signum : WKI_SIGKILL_NUM;
+    if (SIGNUM <= 0 || std::cmp_greater(SIGNUM, ker::mod::sched::task::Task::MAX_SIGNALS)) {
+        return;
+    }
 
     // D18: Find the running task and extract fields under lock
     s_compute_lock.lock();

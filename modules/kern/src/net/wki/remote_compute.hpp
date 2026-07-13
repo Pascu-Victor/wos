@@ -59,11 +59,17 @@ struct SubmittedTask {
     // V2 A7: Proxy task pointer - kept alive in WAITING state until remote completes
     ker::mod::sched::task::Task* local_task = nullptr;
     bool proxy_ready = false;
+    // Completion can arrive before the exec handoff has parked the local
+    // proxy. Keep an owned copy for wki_proxy_task_blocked() rather than a raw
+    // task/File pointer across the compute lock.
+    uint8_t* pending_proxy_output = nullptr;
+    uint16_t pending_proxy_output_len = 0;
 
     std::array<WkiIpcFdEntry, 16> ipc_fd_map = {};
     uint16_t ipc_fd_count = 0;
 
     SubmittedTask() = default;
+    ~SubmittedTask() { delete[] pending_proxy_output; }
     SubmittedTask(const SubmittedTask&) = delete;
     auto operator=(const SubmittedTask&) -> SubmittedTask& = delete;
     SubmittedTask(SubmittedTask&& o) noexcept
@@ -83,8 +89,13 @@ struct SubmittedTask {
           complete_received_at_us(o.complete_received_at_us),
           local_task(o.local_task),
           proxy_ready(o.proxy_ready),
+          pending_proxy_output(o.pending_proxy_output),
+          pending_proxy_output_len(o.pending_proxy_output_len),
           ipc_fd_map(o.ipc_fd_map),
-          ipc_fd_count(o.ipc_fd_count) {}
+          ipc_fd_count(o.ipc_fd_count) {
+        o.pending_proxy_output = nullptr;
+        o.pending_proxy_output_len = 0;
+    }
     auto operator=(SubmittedTask&& o) noexcept -> SubmittedTask& {
         if (this != &o) {
             active = o.active;
@@ -103,6 +114,11 @@ struct SubmittedTask {
             complete_received_at_us = o.complete_received_at_us;
             local_task = o.local_task;
             proxy_ready = o.proxy_ready;
+            delete[] pending_proxy_output;
+            pending_proxy_output = o.pending_proxy_output;
+            pending_proxy_output_len = o.pending_proxy_output_len;
+            o.pending_proxy_output = nullptr;
+            o.pending_proxy_output_len = 0;
             ipc_fd_map = o.ipc_fd_map;
             ipc_fd_count = o.ipc_fd_count;
         }
@@ -180,6 +196,16 @@ enum class WkiRemoteSpawnResult : uint8_t {
     LOCAL = 0,
     REMOTE = 1,
     FAILED = 2,
+};
+
+// Reliable-RX ownership result for TASK_COMPLETE/TASK_CANCEL. RETRY means the
+// channel must not advance or ACK the frame; DEFERRED and DISCARD mean the
+// frame is consumed without synchronous handler dispatch.
+enum class WkiComputeRxAdmission : uint8_t {
+    INLINE,
+    DEFERRED,
+    DISCARD,
+    RETRY,
 };
 
 struct WkiRemoteSpawnSpec {
@@ -292,6 +318,17 @@ void wki_remote_compute_process_pending_submits();
 // Must be called after the scheduler is running.
 void wki_remote_compute_start_submit_thread();
 
+// Start the bounded peer-sharded pool that processes TASK_COMPLETE and
+// TASK_CANCEL outside network RX/NAPI context.
+void wki_remote_compute_start_rx_threads();
+
+// Called with the reliable channel lock held. This function only validates
+// and copies into preallocated storage; it never allocates, blocks, or wakes a
+// task. Notify after dropping the channel lock when DEFERRED is returned.
+auto wki_remote_compute_admit_rx(MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                                 uint32_t rx_channel_generation) -> WkiComputeRxAdmission;
+void wki_remote_compute_notify_deferred_rx(uint16_t src_node);
+
 // Wake the compute-submit workers after queuing a new pending submit.
 void wki_remote_compute_notify_pending_submit();
 
@@ -305,6 +342,7 @@ auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool;
 auto wki_remote_compute_selftest_submit_worker_count_is_bounded() -> bool;
 auto wki_remote_compute_selftest_accept_retry_is_fair() -> bool;
 auto wki_remote_compute_selftest_submit_cancel_is_session_scoped() -> bool;
+auto wki_remote_compute_selftest_rx_admission_is_bounded() -> bool;
 #endif
 
 // -----------------------------------------------------------------------------

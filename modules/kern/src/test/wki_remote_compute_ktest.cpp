@@ -29,6 +29,8 @@ KTEST(WkiRemoteCompute, SubmitWorkerCountIsBounded) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_submit_worker_count_is_bounded());
 }
 
+KTEST(WkiRemoteCompute, RxAdmissionIsBounded) { KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_rx_admission_is_bounded()); }
+
 KTEST(WkiRemoteCompute, AcceptRetryIsFair) { KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_accept_retry_is_fair()); }
 
 KTEST(WkiRemoteCompute, SubmitCancelIsSessionScoped) {

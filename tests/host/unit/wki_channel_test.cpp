@@ -57,6 +57,12 @@ TEST(WkiChannel, StatsInitZero) {
     EXPECT_EQ(ch.retransmits, 0u);
 }
 
+TEST(WkiChannel, InitialCumulativeAckConsumesNoSequence) {
+    WkiChannel ch{};
+    EXPECT_EQ(ch.rx_ack_pending, WKI_ACK_NONE);
+    EXPECT_EQ(WKI_ACK_NONE + 1u, 0u);
+}
+
 TEST(WkiChannel, DupAckInitZero) {
     WkiChannel ch{};
     EXPECT_EQ(ch.last_dup_ack, 0u);
@@ -117,7 +123,7 @@ TEST(WkiChannel, ResetClearsPostFenceReliabilityState) {
     EXPECT_EQ(ch.tx_ack, 0u);
     EXPECT_EQ(ch.rx_seq, 0u);
     EXPECT_EQ(ch.rx_dispatch_seq, 0u);
-    EXPECT_EQ(ch.rx_ack_pending, 0u);
+    EXPECT_EQ(ch.rx_ack_pending, WKI_ACK_NONE);
     EXPECT_FALSE(ch.ack_pending);
     EXPECT_EQ(ch.ack_pending_since_us, 0u);
     EXPECT_EQ(ch.tx_credits, WKI_CREDITS_IPC_DATA);

@@ -241,13 +241,13 @@ auto message_uses_compute_lifecycle(MsgType type) -> bool {
         case MsgType::TASK_SUBMIT:
         case MsgType::TASK_ACCEPT:
         case MsgType::TASK_REJECT:
-        case MsgType::TASK_COMPLETE:
-        case MsgType::TASK_CANCEL:
             return true;
         default:
             return false;
     }
 }
+
+auto message_uses_deferred_compute_rx(MsgType type) -> bool { return type == MsgType::TASK_COMPLETE || type == MsgType::TASK_CANCEL; }
 
 class PeerLifecycleTryLease {
    public:
@@ -1156,9 +1156,10 @@ void channel_init(WkiChannel* ch, uint16_t peer_node, uint16_t chan_id, Priority
     ch->tx_seq = 0;
     ch->tx_ack = 0;
     ch->rx_seq = 0;
+    ch->rx_baseline_initialized = false;
     ch->rx_dispatch_seq = 0;
     ch->rx_dispatch_waiters.fill(nullptr);
-    ch->rx_ack_pending = 0;
+    ch->rx_ack_pending = WKI_ACK_NONE;
     ch->ack_pending = false;
     ch->ack_pending_since_us = 0;
     ch->tx_credits = credits;
@@ -2540,9 +2541,11 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
         return;
     }
 
-    // TASK_* handlers publish or retire scheduler-visible state. Serialize
-    // their channel lookup and synchronous dispatch with HELLO/fence cleanup;
-    // RX cannot wait here, so contention drops the reliable frame for retry.
+    // Inline TASK handlers publish scheduler-visible state. Serialize their
+    // channel lookup and dispatch with HELLO/fence cleanup; RX cannot wait
+    // here, so contention drops the reliable frame for retry. COMPLETE/CANCEL
+    // only copy into stable bounded storage here and reacquire this lifecycle
+    // gate in their task-context worker.
     PeerLifecycleTryLease compute_lifecycle;
     if (message_uses_compute_lifecycle(msg) && !compute_lifecycle.try_acquire(hdr->src_node)) {
         return;
@@ -2774,15 +2777,27 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
             // Reconnect resync: if this channel was just recreated locally (all-zero RX state)
             // but the peer continued its sequence space, adopt the peer's current seq baseline.
             // This avoids getting stuck buffering every frame as permanently out-of-order.
-            if (channel_allows_initial_resync(hdr->channel_id) && ch->rx_seq == 0 && ch->bytes_received == 0 &&
-                ch->reorder_head == nullptr && hdr->seq_num != 0) {
+            if (channel_allows_initial_resync(hdr->channel_id) && !ch->rx_baseline_initialized && ch->rx_seq == 0 &&
+                ch->bytes_received == 0 && ch->reorder_head == nullptr && hdr->seq_num != 0) {
                 ker::mod::dbg::log("[WKI] Resyncing channel seq: src=0x%04x ch=%u local_rx_seq=0 remote_seq=%u", hdr->src_node,
                                    hdr->channel_id, hdr->seq_num);
                 ch->rx_seq = hdr->seq_num;
                 ch->rx_dispatch_seq = hdr->seq_num;
             }
+            // Record observation even when bounded deferred admission below
+            // returns RETRY. Otherwise a later seq=1 frame could trigger the
+            // reconnect baseline heuristic and skip a refused seq=0 frame.
+            ch->rx_baseline_initialized = true;
 
             if (hdr->seq_num == ch->rx_seq) {
+                WkiComputeRxAdmission admission = WkiComputeRxAdmission::INLINE;
+                if (ch->channel_id == WKI_CHAN_RESOURCE && message_uses_deferred_compute_rx(msg)) {
+                    admission = wki_remote_compute_admit_rx(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation);
+                    if (admission == WkiComputeRxAdmission::RETRY) {
+                        ch->lock.unlock();
+                        return;
+                    }
+                }
                 // In-order: advance rx_seq, mark ACK pending
                 ch->rx_seq++;
                 ch->rx_ack_pending = hdr->seq_num;
@@ -2798,8 +2813,12 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
 
                 mark_peer_rx_progress(hdr->src_node);
 
-                // Dispatch to handler via shared helper
-                wki_dispatch_reliable_msg_ordered(ch, RX_CHANNEL_GENERATION, msg, hdr, payload, PAYLOAD_LEN);
+                if (admission == WkiComputeRxAdmission::DEFERRED) {
+                    wki_remote_compute_notify_deferred_rx(hdr->src_node);
+                } else if (admission == WkiComputeRxAdmission::INLINE) {
+                    // Dispatch to handler via shared helper.
+                    wki_dispatch_reliable_msg_ordered(ch, RX_CHANNEL_GENERATION, msg, hdr, payload, PAYLOAD_LEN);
+                }
 
                 // Deliver any buffered reorder entries that are now in-order
                 ch->lock.lock();
@@ -2814,15 +2833,23 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                 }
                 while ((ch->reorder_head != nullptr) && ch->reorder_head->seq == ch->rx_seq) {
                     auto const RO_MSG = static_cast<MsgType>(ch->reorder_head->msg_type);
-                    // A TASK_* packet may have been buffered by an earlier RX
-                    // call whose lifecycle lease ended before this gap-filling
-                    // packet arrived. Admit the deferred dispatch before
-                    // consuming the reorder entry or advancing rx_seq. On
-                    // contention, leave it queued and unacknowledged so the
-                    // reliable sender retries after peer cleanup completes.
+                    // An inline TASK packet may have been buffered by an
+                    // earlier RX call whose lifecycle lease ended before this
+                    // gap-filling packet arrived. Acquire the dispatch gate
+                    // before consuming it. Deferred COMPLETE/CANCEL admission
+                    // only needs the channel and fixed queue locks here.
                     if (message_uses_compute_lifecycle(RO_MSG) && !compute_lifecycle.owns(hdr->src_node) &&
                         !compute_lifecycle.try_acquire(hdr->src_node)) {
                         break;
+                    }
+
+                    WkiComputeRxAdmission ro_admission = WkiComputeRxAdmission::INLINE;
+                    if (ch->channel_id == WKI_CHAN_RESOURCE && message_uses_deferred_compute_rx(RO_MSG)) {
+                        ro_admission = wki_remote_compute_admit_rx(RO_MSG, &ch->reorder_head->hdr, ch->reorder_head->data,
+                                                                   ch->reorder_head->len, ch, ch->reorder_head->channel_generation);
+                        if (ro_admission == WkiComputeRxAdmission::RETRY) {
+                            break;
+                        }
                     }
 
                     WkiReorderEntry* ro = ch->reorder_head;
@@ -2843,8 +2870,12 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     uint32_t const RO_CHANNEL_GENERATION = ro->channel_generation;
                     ch->lock.unlock();
 
-                    // Re-dispatch reordered message through the same handler switch
-                    wki_dispatch_reliable_msg_ordered(ch, RO_CHANNEL_GENERATION, RO_MSG, &RO_HDR, ro_data, RO_LEN);
+                    if (ro_admission == WkiComputeRxAdmission::DEFERRED) {
+                        wki_remote_compute_notify_deferred_rx(RO_HDR.src_node);
+                    } else if (ro_admission == WkiComputeRxAdmission::INLINE) {
+                        // Re-dispatch reordered message through the same handler switch.
+                        wki_dispatch_reliable_msg_ordered(ch, RO_CHANNEL_GENERATION, RO_MSG, &RO_HDR, ro_data, RO_LEN);
+                    }
 
                     delete[] ro_data;
                     delete ro;

@@ -58,7 +58,7 @@ KTEST(WkiChannel, ResetClearsPostFenceReliabilityState) {
     KEXPECT_EQ(ch.tx_ack, 0U);
     KEXPECT_EQ(ch.rx_seq, 0U);
     KEXPECT_EQ(ch.rx_dispatch_seq, 0U);
-    KEXPECT_EQ(ch.rx_ack_pending, 0U);
+    KEXPECT_EQ(ch.rx_ack_pending, ker::net::wki::WKI_ACK_NONE);
     KEXPECT_FALSE(ch.ack_pending);
     KEXPECT_EQ(ch.ack_pending_since_us, 0U);
     KEXPECT_EQ(ch.tx_credits, ker::net::wki::WKI_CREDITS_IPC_DATA);
@@ -145,7 +145,7 @@ KTEST(WkiChannel, CloseRetiresChannelAndClearsQueuedState) {
     KEXPECT_EQ(ch.tx_seq, 0U);
     KEXPECT_EQ(ch.tx_ack, 0U);
     KEXPECT_EQ(ch.rx_seq, 0U);
-    KEXPECT_EQ(ch.rx_ack_pending, 0U);
+    KEXPECT_EQ(ch.rx_ack_pending, ker::net::wki::WKI_ACK_NONE);
     KEXPECT_FALSE(ch.ack_pending);
     KEXPECT_EQ(ch.ack_pending_since_us, 0U);
     KEXPECT_EQ(ch.tx_credits, ker::net::wki::WKI_CREDITS_RESOURCE);
@@ -163,6 +163,8 @@ KTEST(WkiChannel, AckNextMustNotAdvancePastTransmittedSeq) {
     ch.tx_seq = 1;
     ch.tx_ack = 0;
 
+    KEXPECT_EQ(ch.rx_ack_pending, ker::net::wki::WKI_ACK_NONE);
+    KEXPECT_EQ(ker::net::wki::WKI_ACK_NONE + 1U, 0U);
     KEXPECT_TRUE(ker::net::wki::wki_channel_ack_next_within_sent_window(&ch, 0));
     KEXPECT_TRUE(ker::net::wki::wki_channel_ack_next_within_sent_window(&ch, 1));
     KEXPECT_FALSE(ker::net::wki::wki_channel_ack_next_within_sent_window(&ch, 2));

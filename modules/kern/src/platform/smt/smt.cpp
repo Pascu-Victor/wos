@@ -830,6 +830,10 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     // blocking VFS through executable or PT_INTERP construction.
     ker::net::wki::wki_remote_compute_start_submit_thread();
 
+    // Completion/cancel handlers can enter VFS, scheduler, and signal paths;
+    // keep those operations out of network RX on a bounded peer-sharded pool.
+    ker::net::wki::wki_remote_compute_start_rx_threads();
+
     // Start secondary CPUs (their idle tasks all get PID 0 - kernel/swapper convention)
     for (uint64_t i = 0; i < response->cpu_count; i++) {
         // Skip BSP - it's already running

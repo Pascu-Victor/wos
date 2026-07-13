@@ -10,7 +10,9 @@ REMOTE_COMPUTE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote
 REMOTE_COMPUTE_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_remote_compute_ktest.cpp"
 WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
 WKI_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.hpp"
+CHANNEL_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "channel.cpp"
 PEER_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "peer.cpp"
+SMT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "smt" / "smt.cpp"
 PROCFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.cpp"
 
 
@@ -485,7 +487,10 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
     header = REMOTE_COMPUTE_HPP.read_text()
     ktest = REMOTE_COMPUTE_KTEST.read_text()
     wki = WKI_CPP.read_text()
+    wki_header = WKI_HPP.read_text()
+    channel = CHANNEL_CPP.read_text()
     peer = PEER_CPP.read_text()
+    smt = SMT_CPP.read_text()
 
     require_tokens(
         source,
@@ -542,6 +547,68 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         ],
         "compute-submit wake-all",
     )
+
+    require_tokens(
+        source,
+        [
+            "constexpr size_t WKI_COMPUTE_RX_WORKER_MAX = 4",
+            "WKI_COMPUTE_RX_QUEUE_MAX = WKI_CREDITS_RESOURCE * WKI_COMPUTE_RX_WORKER_MAX",
+            "WKI_COMPUTE_RX_PAYLOAD_MAX = sizeof(TaskCompletePayload) + WKI_TASK_MAX_OUTPUT",
+            "std::array<PendingComputeRx, WKI_COMPUTE_RX_QUEUE_MAX>",
+            "std::array<ComputeRxShard, WKI_COMPUTE_RX_WORKER_MAX>",
+            "std::array<bool, WKI_COMPUTE_RX_QUEUE_MAX>",
+            "uint8_t type = 0",
+        ],
+        "bounded zero-initialized compute RX pool",
+    )
+    admission_body = function_body(source, "wki_remote_compute_admit_rx")
+    require_tokens(
+        admission_body,
+        [
+            "classify_compute_rx_payload(type, payload, payload_len, &copy_len)",
+            "s_compute_rx_task_count.load(std::memory_order_acquire)",
+            "s_compute_rx_slot_used.at(CANDIDATE) = true",
+            "std::memcpy(slot.payload.data(), payload, copy_len)",
+            "shard.slot_indices.at(shard.tail)",
+            "return WkiComputeRxAdmission::RETRY",
+            "return WkiComputeRxAdmission::DEFERRED",
+        ],
+        "preallocated compute RX admission",
+    )
+    if "new " in admission_body or "kern_" in admission_body or "s_compute_lock" in admission_body:
+        fail("compute RX admission must not allocate, wake/block, or invert channel->compute lock order")
+
+    rx_start_body = function_body(source, "wki_remote_compute_start_rx_threads")
+    require_tokens(
+        rx_start_body,
+        [
+            "compute_rx_worker_target(ker::mod::smt::get_core_count())",
+            "Task::create_kernel_thread(WORKER_NAMES.at(i), WORKER_ENTRIES.at(i))",
+            "post_task_balanced(task)",
+            "s_compute_rx_tasks.at(i) = task",
+            "s_compute_rx_task_count.store(started_workers, std::memory_order_release)",
+        ],
+        "compute RX worker startup",
+    )
+    require_tokens(
+        function_body(source, "wki_remote_compute_notify_deferred_rx"),
+        ["compute_rx_worker_index(src_node, WORKER_COUNT)", "wake_task_from_event(s_compute_rx_tasks.at(WORKER_INDEX))"],
+        "race-safe compute RX worker wake",
+    )
+    require_tokens(
+        function_body(source, "compute_rx_worker_loop"),
+        [
+            "dequeue_compute_rx(worker_index, &slot_index)",
+            "PeerLifecycleLease lifecycle",
+            "peer->state == PeerState::CONNECTED",
+            "compute_submit_channel_token_matches(",
+            "detail::handle_task_complete(",
+            "detail::handle_task_cancel(",
+            "release_compute_rx_slot(slot_index)",
+        ],
+        "task-context compute RX dispatch",
+    )
+    require_tokens(smt, ["wki_remote_compute_start_rx_threads()"], "compute RX startup after scheduler initialization")
 
     handler_body = function_body(source, "handle_task_submit")
     require_tokens(
@@ -831,17 +898,118 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         ],
         "TASK message admission serialized with peer cleanup",
     )
+    lifecycle_body = function_body(wki, "message_uses_compute_lifecycle")
+    require_tokens(
+        lifecycle_body,
+        ["MsgType::TASK_SUBMIT", "MsgType::TASK_ACCEPT", "MsgType::TASK_REJECT"],
+        "inline TASK handlers use peer lifecycle gate",
+    )
+    if "MsgType::TASK_COMPLETE" in lifecycle_body or "MsgType::TASK_CANCEL" in lifecycle_body:
+        fail("deferred COMPLETE/CANCEL admission must not stall behind a task-context lifecycle holder")
     require_order(
         function_body(wki, "wki_rx"),
         "message_uses_compute_lifecycle(RO_MSG)",
         "WkiReorderEntry* ro = ch->reorder_head",
         "reordered TASK admission must precede consuming the buffered frame",
     )
+    rx_body = function_body(wki, "wki_rx")
+    require_tokens(
+        rx_body,
+        [
+            "ch->channel_id == WKI_CHAN_RESOURCE && message_uses_deferred_compute_rx(msg)",
+            "wki_remote_compute_admit_rx(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation)",
+            "admission == WkiComputeRxAdmission::RETRY",
+            "admission == WkiComputeRxAdmission::DEFERRED",
+            "wki_remote_compute_notify_deferred_rx(hdr->src_node)",
+            "ch->channel_id == WKI_CHAN_RESOURCE && message_uses_deferred_compute_rx(RO_MSG)",
+            "ro_admission == WkiComputeRxAdmission::RETRY",
+            "ro_admission == WkiComputeRxAdmission::DEFERRED",
+            "wki_remote_compute_notify_deferred_rx(RO_HDR.src_node)",
+        ],
+        "reliable compute RX admission results",
+    )
+    require_order(
+        rx_body,
+        "wki_remote_compute_admit_rx(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation)",
+        "ch->rx_seq++",
+        "direct compute admission before reliable consumption",
+    )
+    require_order(
+        rx_body,
+        "ro_admission = wki_remote_compute_admit_rx(",
+        "WkiReorderEntry* ro = ch->reorder_head",
+        "reordered compute admission before unlink",
+    )
+    require_tokens(
+        wki_header,
+        [
+            "constexpr uint32_t WKI_ACK_NONE = UINT32_MAX",
+            "uint32_t rx_ack_pending = WKI_ACK_NONE",
+            "bool rx_baseline_initialized = false",
+        ],
+        "reliable receive retry and no-ACK sentinel state",
+    )
+    require_tokens(
+        channel,
+        ["ch->rx_baseline_initialized = false", "ch->rx_ack_pending = WKI_ACK_NONE"],
+        "channel reset clears receive baseline and cumulative ACK state",
+    )
+    require_tokens(wki, ["ch->rx_ack_pending = WKI_ACK_NONE"], "fresh channels start without a cumulative ACK")
+    require_order(
+        rx_body,
+        "ch->rx_baseline_initialized = true",
+        "wki_remote_compute_admit_rx(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation)",
+        "first refused sequence pins receive baseline",
+    )
+
+    complete_body = function_body(source, "handle_task_complete")
+    blocked_body = function_body(source, "wki_proxy_task_blocked")
+    require_tokens(
+        complete_body,
+        [
+            "task->pending_proxy_output = pending_output",
+            "task->pending_proxy_output_len = OUTPUT_LEN",
+            "task->active = false",
+        ],
+        "early completion transfers output ownership before publication",
+    )
+    require_order(
+        complete_body,
+        "task->pending_proxy_output = pending_output",
+        "task->active = false",
+        "early output ownership before inactive publication",
+    )
+    require_tokens(
+        blocked_body,
+        [
+            "completed_output = submitted->pending_proxy_output",
+            "submitted->pending_proxy_output = nullptr",
+            "finalize_proxy_task(task, completed_exit_status, completed_output, completed_output_len",
+            "delete[] completed_output",
+        ],
+        "proxy-block handoff consumes owned early output",
+    )
+    spawn_body = function_body(source, "wki_try_remote_spawn")
+    require_tokens(
+        spawn_body,
+        [
+            "completed_output = st->pending_proxy_output",
+            "st->pending_proxy_output = nullptr",
+            "finalize_proxy_task(task, completed_exit_status, completed_output, completed_output_len, tid)",
+            "delete[] completed_output",
+        ],
+        "spawn-side immediate completion consumes owned early output",
+    )
 
     token = "wki_remote_compute_selftest_submit_worker_count_is_bounded"
     require_tokens(source, [f"auto {token}() -> bool"], "submit-worker count selftest implementation")
     require_tokens(header, [f"auto {token}() -> bool;"], "submit-worker count selftest declaration")
     require_tokens(ktest, ["SubmitWorkerCountIsBounded", token], "submit-worker count KTEST coverage")
+
+    rx_token = "wki_remote_compute_selftest_rx_admission_is_bounded"
+    require_tokens(source, [f"auto {rx_token}() -> bool"], "compute RX admission selftest implementation")
+    require_tokens(header, [f"auto {rx_token}() -> bool;"], "compute RX admission selftest declaration")
+    require_tokens(ktest, ["RxAdmissionIsBounded", rx_token], "compute RX admission KTEST coverage")
 
     fairness_body = function_body(source, "collect_pending_task_accept_attempts_locked")
     require_tokens(

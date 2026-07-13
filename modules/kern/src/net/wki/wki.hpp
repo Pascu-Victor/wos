@@ -61,6 +61,9 @@ constexpr uint32_t WKI_MIN_RTO_US = 100;           // 100 us (floor: 5-10x singl
 constexpr uint32_t WKI_MAX_RTO_US = 50000;         // 50 ms (cap for pathological cases)
 constexpr uint32_t WKI_ACK_DELAY_US = 2000;        // 2 ms: window for piggybacking on BULK channels (LATENCY channels ack inline)
 constexpr uint8_t WKI_FAST_RETRANSMIT_THRESH = 3;  // 3 dup ACKs
+// Cumulative ACK sentinel: ack_num + 1 wraps to the initial tx_ack (zero), so
+// it advertises that no receive sequence has been consumed yet.
+constexpr uint32_t WKI_ACK_NONE = UINT32_MAX;
 
 // Credit defaults
 constexpr uint16_t WKI_CREDITS_CONTROL = 64;
@@ -286,8 +289,11 @@ struct WkiChannel {
     uint32_t rx_seq = 0;           // next expected seq from peer
     uint32_t rx_dispatch_seq = 0;  // next received seq allowed to enter handlers
     std::array<ker::mod::sched::task::Task*, WKI_RX_DISPATCH_WAITER_SLOTS> rx_dispatch_waiters = {};
-    uint32_t rx_ack_pending = 0;  // highest seq received, not yet ACKed
+    uint32_t rx_ack_pending = WKI_ACK_NONE;  // highest seq received, or WKI_ACK_NONE before the first consumed frame
     bool ack_pending = false;
+    // Prevent reconnect baseline resync from skipping a first frame that was
+    // observed but deliberately left unconsumed for bounded-queue retry.
+    bool rx_baseline_initialized = false;
     uint64_t ack_pending_since_us = 0;  // time when ack_pending was last set (for delay enforcement)
 
     // Flow control (credits)
