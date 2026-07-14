@@ -75,13 +75,14 @@ struct RemoteVfsFd {
 
 struct ProxyVfsState {
     struct ReadlinkCacheEntry {
-        bool valid = false;
+        uint32_t generation = 0;
         int16_t status = 0;
         uint16_t target_len = 0;
         uint64_t cached_at_us = 0;
         std::array<char, VFS_READLINK_CACHE_TEXT_MAX> path = {};
         std::array<char, VFS_READLINK_CACHE_TEXT_MAX> target = {};
     };
+    static_assert(sizeof(ReadlinkCacheEntry) == 1040);
 
     bool active = false;
     bool epoch_reset_pending = false;
@@ -137,6 +138,7 @@ struct ProxyVfsState {
     ProxyVfsState* detach_next = nullptr;
 
     std::array<char, VFS_EXPORT_PATH_LEN> local_mount_path = {};
+    uint32_t readlink_cache_generation = 1;
     std::array<ReadlinkCacheEntry, VFS_READLINK_CACHE_ENTRIES> readlink_cache = {};
 
     // RemoteFileContext keeps a raw proxy pointer after the VFS mount is gone.
@@ -293,6 +295,7 @@ auto wki_remote_vfs_selftest_teardown_quiesces_retiring_slot() -> bool;
 auto wki_remote_vfs_selftest_inactive_slot_rejected() -> bool;
 auto wki_remote_vfs_selftest_write_behind_capacity_classes() -> bool;
 auto wki_remote_vfs_selftest_write_behind_growth() -> bool;
+auto wki_remote_vfs_selftest_readlink_cache_generation_invalidation() -> bool;
 #endif
 
 // Task-exit hook: release a task's active proxy operation or queued slot wait.

@@ -669,6 +669,132 @@ def test_server_message_read_uses_bounded_stack_response() -> None:
         fail("server message-read stack response lacks a kernel-stack headroom bound")
 
 
+def test_readlink_cache_invalidation_is_generation_based() -> None:
+    header = REMOTE_VFS_HPP.read_text()
+    source = REMOTE_VFS_CPP.read_text()
+    ktest = WKI_DEV_PROXY_KTEST.read_text()
+
+    require_tokens(
+        header,
+        [
+            "uint32_t generation = 0;",
+            "static_assert(sizeof(ReadlinkCacheEntry) == 1040);",
+            "uint32_t readlink_cache_generation = 1;",
+            "wki_remote_vfs_selftest_readlink_cache_generation_invalidation()",
+        ],
+        "generation-scoped readlink cache layout",
+    )
+    if "bool valid = false;" in header:
+        fail("readlink cache entries must not retain per-row validity flags")
+
+    reset_body = function_body(source, "reset_readlink_cache_entry")
+    require_tokens(reset_body, ["entry.generation = 0"], "constant-time readlink entry reset")
+    for forbidden in ["entry.status", "entry.target_len", "entry.cached_at_us", "entry.path", "entry.target"]:
+        if forbidden in reset_body:
+            fail(f"readlink entry reset still clears stale payload field: {forbidden}")
+
+    invalidate_body = function_body(source, "invalidate_readlink_cache_locked")
+    require_order(
+        invalidate_body,
+        [
+            "uint32_t const NEXT_GENERATION = state->readlink_cache_generation + 1",
+            "if (NEXT_GENERATION != 0)",
+            "state->readlink_cache_generation = NEXT_GENERATION",
+            "return",
+            "for (auto& entry : state->readlink_cache)",
+            "reset_readlink_cache_entry(entry)",
+            "state->readlink_cache_generation = 1",
+        ],
+        "O(1) normal invalidation with bounded wrap reset",
+    )
+
+    lookup_body = function_body(source, "try_readlink_cache_lookup")
+    require_order(
+        lookup_body,
+        [
+            "state->lock.lock()",
+            "uint32_t const CACHE_GENERATION = state->readlink_cache_generation",
+            "*generation_out = CACHE_GENERATION",
+            "entry.generation != CACHE_GENERATION",
+            "entry.cached_at_us",
+            "state->lock.unlock()",
+        ],
+        "readlink lookup generation gate",
+    )
+
+    cache_body = function_body(source, "cache_readlink_result")
+    require_tokens(
+        cache_body,
+        [
+            "expected_generation == 0",
+            "entry.generation == CACHE_GENERATION",
+            "entry.generation != CACHE_GENERATION",
+        ],
+        "readlink insertion generation selection",
+    )
+    require_order(
+        cache_body,
+        [
+            "state->lock.lock()",
+            "state->readlink_cache_generation != expected_generation",
+            "state->lock.unlock()",
+            "return",
+            "uint32_t const CACHE_GENERATION = expected_generation",
+        ],
+        "late readlink result generation fence",
+    )
+    require_order(
+        cache_body,
+        [
+            "reset_readlink_cache_entry(*selected)",
+            "selected->status =",
+            "selected->cached_at_us = NOW",
+            "memcpy(selected->path.data()",
+            "selected->target_len = target_len",
+            "memcpy(selected->target.data()",
+            "selected->generation = CACHE_GENERATION",
+        ],
+        "readlink entry generation publication",
+    )
+
+    readlink_body = function_body(source, "wki_remote_vfs_readlink_path")
+    require_order(
+        readlink_body,
+        [
+            "uint32_t cache_generation = 0",
+            "try_readlink_cache_lookup(state, fs_relative_path, buf, bufsize, &cached_result, &cache_generation)",
+            "vfs_proxy_read_with_retry(state, OP_VFS_READLINK",
+            "cache_readlink_result(state, cache_generation, fs_relative_path, STATUS, nullptr, 0)",
+            "cache_readlink_result(state, cache_generation, fs_relative_path, 0",
+        ],
+        "readlink miss generation carried across RPC",
+    )
+
+    require_tokens(
+        source,
+        [
+            "state.readlink_cache_generation = UINT32_MAX",
+            "entry.generation == 0",
+            "cache_misses(POSITIVE_PATH, nullptr)",
+            "cache_misses(WRAP_PATH, nullptr)",
+            "lookup_status(NEGATIVE_PATH, -ENOENT)",
+            "late_positive_generation",
+            "cache_misses(LATE_POSITIVE_PATH, nullptr)",
+            "late_negative_generation",
+            "cache_misses(LATE_NEGATIVE_PATH, nullptr)",
+        ],
+        "readlink generation invalidation selftest",
+    )
+    require_tokens(
+        ktest,
+        [
+            "KTEST(WkiRemoteVfsReadlinkCache, GenerationInvalidationAndWrap)",
+            "wki_remote_vfs_selftest_readlink_cache_generation_invalidation()",
+        ],
+        "readlink generation invalidation KTEST registration",
+    )
+
+
 def test_server_roce_push_reads_reuse_registered_staging() -> None:
     source = REMOTE_VFS_CPP.read_text()
     handler = function_body(source, "handle_vfs_op")
@@ -2321,6 +2447,7 @@ def main() -> None:
     test_message_fallback_readahead_targets_small_sequential_reads()
     test_server_open_reuses_the_open_file_stat_snapshot()
     test_server_message_read_uses_bounded_stack_response()
+    test_readlink_cache_invalidation_is_generation_based()
     test_server_roce_push_reads_reuse_registered_staging()
     test_remote_metadata_scratch_initializes_only_consumed_prefix()
     test_write_behind_storage_grows_in_allocator_shaped_classes()

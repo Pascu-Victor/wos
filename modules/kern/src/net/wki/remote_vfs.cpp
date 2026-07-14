@@ -1041,23 +1041,26 @@ auto readlink_cache_retention_us(int status) -> uint64_t {
     return (status == 0) ? VFS_READLINK_CACHE_SUCCESS_RETENTION_US : VFS_READLINK_CACHE_NEGATIVE_RETENTION_US;
 }
 
-void reset_readlink_cache_entry(ProxyVfsState::ReadlinkCacheEntry& entry) {
-    entry.valid = false;
-    entry.status = 0;
-    entry.target_len = 0;
-    entry.cached_at_us = 0;
-    entry.path.front() = '\0';
-    entry.target.front() = '\0';
-}
+void reset_readlink_cache_entry(ProxyVfsState::ReadlinkCacheEntry& entry) { entry.generation = 0; }
 
 void invalidate_readlink_cache_locked(ProxyVfsState* state) {
     if (state == nullptr) {
         return;
     }
 
+    uint32_t const NEXT_GENERATION = state->readlink_cache_generation + 1;
+    if (NEXT_GENERATION != 0) [[likely]] {
+        state->readlink_cache_generation = NEXT_GENERATION;
+        return;
+    }
+
+    // Generation zero is reserved for invalid entries. Clear the bounded
+    // cache before restarting at one so an entry from the first cycle cannot
+    // become visible again after uint32_t wrap.
     for (auto& entry : state->readlink_cache) {
         reset_readlink_cache_entry(entry);
     }
+    state->readlink_cache_generation = 1;
 }
 
 void invalidate_readlink_cache(ProxyVfsState* state) {
@@ -1411,8 +1414,9 @@ auto readlink_status_is_cacheable(int status) -> bool {
     return status == 0 || status == -EINVAL || status == -ENOENT || status == -ENOTDIR;
 }
 
-auto try_readlink_cache_lookup(ProxyVfsState* state, const char* fs_relative_path, char* buf, size_t bufsize, ssize_t* result_out) -> bool {
-    if (state == nullptr || fs_relative_path == nullptr || result_out == nullptr) {
+auto try_readlink_cache_lookup(ProxyVfsState* state, const char* fs_relative_path, char* buf, size_t bufsize, ssize_t* result_out,
+                               uint32_t* generation_out) -> bool {
+    if (state == nullptr || fs_relative_path == nullptr || result_out == nullptr || generation_out == nullptr) {
         return false;
     }
 
@@ -1423,8 +1427,10 @@ auto try_readlink_cache_lookup(ProxyVfsState* state, const char* fs_relative_pat
     bool found = false;
     uint64_t const NOW = wki_now_us();
     state->lock.lock();
+    uint32_t const CACHE_GENERATION = state->readlink_cache_generation;
+    *generation_out = CACHE_GENERATION;
     for (auto& entry : state->readlink_cache) {
-        if (!entry.valid) {
+        if (entry.generation != CACHE_GENERATION) {
             continue;
         }
 
@@ -1454,8 +1460,9 @@ auto try_readlink_cache_lookup(ProxyVfsState* state, const char* fs_relative_pat
     return found;
 }
 
-void cache_readlink_result(ProxyVfsState* state, const char* fs_relative_path, int status, const char* target, uint16_t target_len) {
-    if (state == nullptr || fs_relative_path == nullptr || !readlink_status_is_cacheable(status)) {
+void cache_readlink_result(ProxyVfsState* state, uint32_t expected_generation, const char* fs_relative_path, int status, const char* target,
+                           uint16_t target_len) {
+    if (state == nullptr || expected_generation == 0 || fs_relative_path == nullptr || !readlink_status_is_cacheable(status)) {
         return;
     }
 
@@ -1470,15 +1477,20 @@ void cache_readlink_result(ProxyVfsState* state, const char* fs_relative_path, i
 
     uint64_t const NOW = wki_now_us();
     state->lock.lock();
+    if (state->readlink_cache_generation != expected_generation) {
+        state->lock.unlock();
+        return;
+    }
+    uint32_t const CACHE_GENERATION = expected_generation;
 
     ProxyVfsState::ReadlinkCacheEntry* selected = nullptr;
     ProxyVfsState::ReadlinkCacheEntry* oldest = nullptr;
     for (auto& entry : state->readlink_cache) {
-        if (entry.valid && NOW - entry.cached_at_us > readlink_cache_retention_us(entry.status)) {
+        if (entry.generation == CACHE_GENERATION && NOW - entry.cached_at_us > readlink_cache_retention_us(entry.status)) {
             reset_readlink_cache_entry(entry);
         }
 
-        if (!entry.valid) {
+        if (entry.generation != CACHE_GENERATION) {
             if (selected == nullptr) {
                 selected = &entry;
             }
@@ -1500,7 +1512,6 @@ void cache_readlink_result(ProxyVfsState* state, const char* fs_relative_path, i
     }
     if (selected != nullptr) {
         reset_readlink_cache_entry(*selected);
-        selected->valid = true;
         selected->status = static_cast<int16_t>(status);
         selected->cached_at_us = NOW;
         memcpy(selected->path.data(), fs_relative_path, PATH_LEN + 1);
@@ -1508,6 +1519,7 @@ void cache_readlink_result(ProxyVfsState* state, const char* fs_relative_path, i
             selected->target_len = target_len;
             memcpy(selected->target.data(), target, target_len);
         }
+        selected->generation = CACHE_GENERATION;
     }
 
     state->lock.unlock();
@@ -3896,6 +3908,128 @@ auto wki_remote_vfs_selftest_inactive_slot_rejected() -> bool {
     ProxyVfsState state{};
     state.active = false;
     return acquire_proxy_op_slot_locked(&state, wki_now_us()) == WKI_ERR_PEER_FENCED;
+}
+
+auto wki_remote_vfs_selftest_readlink_cache_generation_invalidation() -> bool {
+    constexpr char POSITIVE_PATH[] = "/positive-link";
+    constexpr char POSITIVE_TARGET[] = "positive-target";
+    constexpr char LATE_POSITIVE_PATH[] = "/late-positive-link";
+    constexpr char LATE_POSITIVE_TARGET[] = "late-positive-target";
+    constexpr char LATE_NEGATIVE_PATH[] = "/late-missing-link";
+    constexpr char NEGATIVE_PATH[] = "/missing-link";
+    constexpr char WRAP_PATH[] = "/wrap-link";
+    constexpr char WRAP_TARGET[] = "wrap-target";
+
+    ProxyVfsState state{};
+    std::array<char, VFS_READLINK_CACHE_TEXT_MAX> result_buf{};
+    auto lookup_positive = [&](const char* path, const char* target, size_t target_len) {
+        ssize_t result = -1;
+        uint32_t generation = 0;
+        result_buf.fill('\0');
+        return try_readlink_cache_lookup(&state, path, result_buf.data(), result_buf.size(), &result, &generation) &&
+               result == static_cast<ssize_t>(target_len) && std::memcmp(result_buf.data(), target, target_len) == 0;
+    };
+    auto lookup_status = [&](const char* path, ssize_t expected) {
+        ssize_t result = 0;
+        uint32_t generation = 0;
+        return try_readlink_cache_lookup(&state, path, result_buf.data(), result_buf.size(), &result, &generation) && result == expected;
+    };
+    auto cache_misses = [&](const char* path, uint32_t* generation_out) {
+        ssize_t result = 0;
+        uint32_t generation = 0;
+        bool const MISSED = !try_readlink_cache_lookup(&state, path, result_buf.data(), result_buf.size(), &result, &generation);
+        if (generation_out != nullptr) {
+            *generation_out = generation;
+        }
+        return MISSED;
+    };
+
+    uint32_t positive_generation = 0;
+    if (!cache_misses(POSITIVE_PATH, &positive_generation)) {
+        return false;
+    }
+    cache_readlink_result(&state, positive_generation, POSITIVE_PATH, 0, POSITIVE_TARGET, sizeof(POSITIVE_TARGET) - 1);
+    if (!lookup_positive(POSITIVE_PATH, POSITIVE_TARGET, sizeof(POSITIVE_TARGET) - 1)) {
+        return false;
+    }
+
+    // Preserve a generation-one entry away from the normal first replacement
+    // slot. A correct wrap invalidation must prevent this stale row reviving.
+    state.lock.lock();
+    state.readlink_cache.at(7) = state.readlink_cache.front();
+    uint32_t const INITIAL_GENERATION = state.readlink_cache_generation;
+    state.lock.unlock();
+
+    invalidate_readlink_cache(&state);
+    state.lock.lock();
+    bool const GENERATION_BUMPED = state.readlink_cache_generation == INITIAL_GENERATION + 1;
+    state.lock.unlock();
+    if (!GENERATION_BUMPED || !cache_misses(POSITIVE_PATH, nullptr)) {
+        return false;
+    }
+
+    uint32_t late_positive_generation = 0;
+    if (!cache_misses(LATE_POSITIVE_PATH, &late_positive_generation)) {
+        return false;
+    }
+    invalidate_readlink_cache(&state);
+    cache_readlink_result(&state, late_positive_generation, LATE_POSITIVE_PATH, 0, LATE_POSITIVE_TARGET, sizeof(LATE_POSITIVE_TARGET) - 1);
+    if (!cache_misses(LATE_POSITIVE_PATH, nullptr)) {
+        return false;
+    }
+
+    uint32_t late_negative_generation = 0;
+    if (!cache_misses(LATE_NEGATIVE_PATH, &late_negative_generation)) {
+        return false;
+    }
+    invalidate_readlink_cache(&state);
+    cache_readlink_result(&state, late_negative_generation, LATE_NEGATIVE_PATH, -ENOENT, nullptr, 0);
+    if (!cache_misses(LATE_NEGATIVE_PATH, nullptr)) {
+        return false;
+    }
+
+    uint32_t negative_generation = 0;
+    if (!cache_misses(NEGATIVE_PATH, &negative_generation)) {
+        return false;
+    }
+    cache_readlink_result(&state, negative_generation, NEGATIVE_PATH, -ENOENT, nullptr, 0);
+    if (!lookup_status(NEGATIVE_PATH, -ENOENT)) {
+        return false;
+    }
+    invalidate_readlink_cache(&state);
+    if (!cache_misses(NEGATIVE_PATH, nullptr)) {
+        return false;
+    }
+
+    state.lock.lock();
+    state.readlink_cache_generation = UINT32_MAX;
+    state.lock.unlock();
+    uint32_t wrap_generation = 0;
+    if (!cache_misses(WRAP_PATH, &wrap_generation) || wrap_generation != UINT32_MAX) {
+        return false;
+    }
+    cache_readlink_result(&state, wrap_generation, WRAP_PATH, 0, WRAP_TARGET, sizeof(WRAP_TARGET) - 1);
+    if (!lookup_positive(WRAP_PATH, WRAP_TARGET, sizeof(WRAP_TARGET) - 1)) {
+        return false;
+    }
+
+    invalidate_readlink_cache(&state);
+    state.lock.lock();
+    bool wrap_cleared = state.readlink_cache_generation == 1;
+    for (const auto& entry : state.readlink_cache) {
+        wrap_cleared = wrap_cleared && entry.generation == 0;
+    }
+    state.lock.unlock();
+    if (!wrap_cleared || !cache_misses(POSITIVE_PATH, nullptr) || !cache_misses(WRAP_PATH, nullptr)) {
+        return false;
+    }
+
+    uint32_t post_wrap_generation = 0;
+    if (!cache_misses(POSITIVE_PATH, &post_wrap_generation) || post_wrap_generation != 1) {
+        return false;
+    }
+    cache_readlink_result(&state, post_wrap_generation, POSITIVE_PATH, 0, POSITIVE_TARGET, sizeof(POSITIVE_TARGET) - 1);
+    return lookup_positive(POSITIVE_PATH, POSITIVE_TARGET, sizeof(POSITIVE_TARGET) - 1);
 }
 
 auto wki_remote_vfs_selftest_write_behind_capacity_classes() -> bool {
@@ -6597,7 +6731,8 @@ auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relat
     }
 
     ssize_t cached_result = 0;
-    if (try_readlink_cache_lookup(state, fs_relative_path, buf, bufsize, &cached_result)) {
+    uint32_t cache_generation = 0;
+    if (try_readlink_cache_lookup(state, fs_relative_path, buf, bufsize, &cached_result, &cache_generation)) {
         return cached_result;
     }
 
@@ -6628,7 +6763,7 @@ auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relat
         }
 
         if (STATUS == -EINVAL || STATUS == -ENOENT) {
-            cache_readlink_result(state, fs_relative_path, STATUS, nullptr, 0);
+            cache_readlink_result(state, cache_generation, fs_relative_path, STATUS, nullptr, 0);
             return STATUS;
         }
 
@@ -6650,7 +6785,7 @@ auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relat
     auto to_copy = static_cast<size_t>(target_len);
     to_copy = std::min(to_copy, bufsize);
     memcpy(buf, resp_buf.data() + 2, to_copy);
-    cache_readlink_result(state, fs_relative_path, 0, reinterpret_cast<const char*>(resp_buf.data() + 2), target_len);
+    cache_readlink_result(state, cache_generation, fs_relative_path, 0, reinterpret_cast<const char*>(resp_buf.data() + 2), target_len);
     return static_cast<ssize_t>(to_copy);
 }
 
