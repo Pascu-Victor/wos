@@ -8659,7 +8659,9 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
             size_t const FS_COUNT = HAS_FS_READDIR ? f->dir_fs_count : 0;
             size_t synthetic_index = ACTUAL_INDEX - FS_COUNT;
 
-            char visible_dir_path[MAX_PATH_LEN] = {};
+            // strip_current_task_root_prefix initializes the complete NUL-terminated path on success.
+            // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-pro-type-member-init)
+            char visible_dir_path[MAX_PATH_LEN] __attribute__((uninitialized));
             if (strip_current_task_root_prefix(f->vfs_path, visible_dir_path, sizeof(visible_dir_path)) < 0) {
                 break;
             }
@@ -8733,7 +8735,9 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                     continue;
                 }
 
-                char visible_mount_path[MAX_PATH_LEN] = {};
+                // strip_current_task_root_prefix initializes the complete NUL-terminated path on success.
+                // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-pro-type-member-init)
+                char visible_mount_path[MAX_PATH_LEN] __attribute__((uninitialized));
                 if (strip_current_task_root_prefix(mount_snapshot.path, visible_mount_path, sizeof(visible_mount_path)) < 0) {
                     continue;
                 }
@@ -8777,7 +8781,9 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
                         continue;
                     }
 
-                    char visible_mount_path2[MAX_PATH_LEN] = {};
+                    // strip_current_task_root_prefix initializes the complete NUL-terminated path on success.
+                    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-pro-type-member-init)
+                    char visible_mount_path2[MAX_PATH_LEN] __attribute__((uninitialized));
                     if (strip_current_task_root_prefix(mount_snapshot2.path, visible_mount_path2, sizeof(visible_mount_path2)) < 0) {
                         continue;
                     }
@@ -17676,6 +17682,20 @@ auto vfs_selftest_readdir_seeds_non_symlink_hints() -> bool {
     auto mount_ref = find_mount_point(DIR_PATH);
     MountPoint const* mount = mount_ref.get();
     bool ok = mount != nullptr;
+
+    std::array<char, MAX_PATH_LEN> visible_path{};
+    visible_path.fill('x');
+    int const VISIBLE_PATH_RET = strip_task_root_prefix(nullptr, DIR_PATH, visible_path.data(), visible_path.size(), nullptr);
+    ok = ok && VISIBLE_PATH_RET == 0 && std::strcmp(visible_path.data(), DIR_PATH) == 0 && visible_path.at(std::strlen(DIR_PATH)) == '\0';
+
+    ker::mod::sched::task::Task rooted_task{};
+    ok = ok && copy_path_string("/tmp", rooted_task.root.data(), rooted_task.root.size()) == 0;
+    rooted_task.root_len = sizeof("/tmp") - 1;
+    constexpr const char* ROOTED_VISIBLE_PATH = "/ktest_readdir_hints";
+    visible_path.fill('x');
+    int const ROOTED_VISIBLE_PATH_RET = strip_task_root_prefix(&rooted_task, DIR_PATH, visible_path.data(), visible_path.size(), nullptr);
+    ok = ok && ROOTED_VISIBLE_PATH_RET == 0 && std::strcmp(visible_path.data(), ROOTED_VISIBLE_PATH) == 0 &&
+         visible_path.at(std::strlen(ROOTED_VISIBLE_PATH)) == '\0';
 
     vfs_cache_notify_path_changed(CHILD_PATH, nullptr);
     vfs_cache_notify_path_changed(DIR_CHILD_PATH, nullptr);

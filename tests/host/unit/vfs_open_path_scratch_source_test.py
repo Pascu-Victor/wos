@@ -581,6 +581,179 @@ def test_readdir_child_path_scratch_is_initialized_by_its_producer() -> None:
         cursor = verification_pos + len(verification)
 
 
+def test_synthetic_readdir_visible_paths_are_initialized_by_root_strip() -> None:
+    core = VFS_CORE_CPP.read_text()
+    readdir = function_body(core, "vfs_read_dir_entries")
+    strip_current = function_body(core, "strip_current_task_root_prefix")
+    strip_task = function_body(core, "strip_task_root_prefix")
+    copy_path = function_body(core, "copy_path_string")
+    selftest = function_body(core, "vfs_selftest_readdir_seeds_non_symlink_hints")
+
+    declarations = {
+        "visible_dir_path": "char visible_dir_path[MAX_PATH_LEN] __attribute__((uninitialized));",
+        "visible_mount_path": "char visible_mount_path[MAX_PATH_LEN] __attribute__((uninitialized));",
+        "visible_mount_path2": "char visible_mount_path2[MAX_PATH_LEN] __attribute__((uninitialized));",
+    }
+    for name, declaration in declarations.items():
+        array_declarations = re.findall(rf"\bchar\s+{name}\s*\[[^;\n]+;", readdir)
+        if array_declarations != [declaration]:
+            fail(f"synthetic readdir path: unexpected {name} declarations: {array_declarations!r}")
+        forbid(
+            readdir,
+            [
+                f"{name}[MAX_PATH_LEN] = {{}}",
+                f"memset({name}",
+                f"std::fill({name}",
+                f"std::ranges::fill({name}",
+            ],
+            f"synthetic readdir redundant {name} initialization",
+        )
+
+    require_order(
+        readdir,
+        [
+            declarations["visible_dir_path"],
+            "strip_current_task_root_prefix(f->vfs_path, visible_dir_path, sizeof(visible_dir_path))",
+            "break",
+            "std::strcmp(visible_dir_path, \"/\")",
+            "size_t const DIR_LEN = std::strlen(visible_dir_path)",
+            declarations["visible_mount_path"],
+            "strip_current_task_root_prefix(mount_snapshot.path, visible_mount_path, sizeof(visible_mount_path))",
+            "continue",
+            "size_t const MP_LEN = std::strlen(visible_mount_path)",
+            declarations["visible_mount_path2"],
+            "strip_current_task_root_prefix(mount_snapshot2.path, visible_mount_path2, sizeof(visible_mount_path2))",
+            "continue",
+            "size_t const MP2_LEN = std::strlen(visible_mount_path2)",
+        ],
+        "synthetic readdir visible-path producer and consumer ordering",
+    )
+    failure_guards = [
+        (
+            "if (strip_current_task_root_prefix(f->vfs_path, visible_dir_path, sizeof(visible_dir_path)) < 0)",
+            "break;",
+        ),
+        (
+            "if (strip_current_task_root_prefix(mount_snapshot.path, visible_mount_path, sizeof(visible_mount_path)) < 0)",
+            "continue;",
+        ),
+        (
+            "if (strip_current_task_root_prefix(mount_snapshot2.path, visible_mount_path2, sizeof(visible_mount_path2)) < 0)",
+            "continue;",
+        ),
+    ]
+    for header, expected_body in failure_guards:
+        if block_body_after(readdir, header).strip() != expected_body:
+            fail(f"synthetic readdir must not consume a failed visible-path production: {header}")
+    expected_uses = {"visible_dir_path": 13, "visible_mount_path": 9, "visible_mount_path2": 9}
+    for name, count in expected_uses.items():
+        if len(re.findall(rf"\b{name}\b", readdir)) != count:
+            fail(f"synthetic readdir path has an unexpected {name} producer or consumer")
+
+    copy_returns = re.findall(r"\breturn\s+([^;]+);", copy_path)
+    if copy_returns != ["-EINVAL", "-ENAMETOOLONG", "0"]:
+        fail("bounded path copy must only succeed after copying the complete string")
+    expected_copy_body = """if (src == nullptr || dst == nullptr || dst_size == 0) {
+        return -EINVAL;
+    }
+
+    size_t const LEN = known_src_len != UNKNOWN_PATH_LEN ? known_src_len : std::strlen(src);
+    if (LEN + 1 > dst_size) {
+        return -ENAMETOOLONG;
+    }
+
+    std::memcpy(dst, src, LEN + 1);
+    if (copied_len_out != nullptr) {
+        *copied_len_out = LEN;
+    }
+    return 0;"""
+    if copy_path.strip() != expected_copy_body:
+        fail("bounded path copy must remain one complete straight-line string production")
+    require_order(
+        copy_path,
+        [
+            "size_t const LEN = known_src_len != UNKNOWN_PATH_LEN ? known_src_len : std::strlen(src)",
+            "if (LEN + 1 > dst_size)",
+            "std::memcpy(dst, src, LEN + 1)",
+            "return 0",
+        ],
+        "synthetic readdir bounded path production",
+    )
+    forbid(copy_path, ["memset", "bzero", "std::fill", "std::ranges::fill", "fill_n"], "bounded path copy bulk clear")
+
+    strip_task_returns = re.findall(r"\breturn\s+([^;]+);", strip_task)
+    if strip_task_returns != [
+        "-EINVAL",
+        "copy_path_string(path, out, out_size)",
+        "copy_path_string(path, out, out_size)",
+        "copy_path_string(path, out, out_size)",
+        'copy_path_string("/", out, out_size)',
+        "copy_path_string(logical_path, out, out_size)",
+    ]:
+        fail("task-root stripping must produce every successful output through bounded path copy")
+    if len(re.findall(r"\bout\b", strip_task)) != 6:
+        fail("task-root stripping has an unexpected destination access")
+    strip_current_returns = re.findall(r"\breturn\s+([^;]+);", strip_current)
+    if strip_current_returns != [
+        "-EINVAL",
+        "copy_path_string(path, out, out_size)",
+        "strip_task_root_prefix(task, path, out, out_size, nullptr)",
+    ]:
+        fail("current-task root stripping must produce every successful output through the proven producers")
+    if len(re.findall(r"\bout\b", strip_current)) != 3:
+        fail("current-task root stripping has an unexpected destination access")
+    forbid(
+        strip_task + strip_current,
+        ["memset", "bzero", "std::fill", "std::ranges::fill", "fill_n"],
+        "task-root stripping destinations must not be bulk-cleared",
+    )
+
+    require_order(
+        selftest,
+        [
+            "visible_path.fill('x')",
+            "VISIBLE_PATH_RET = strip_task_root_prefix(nullptr, DIR_PATH, visible_path.data(), visible_path.size(), nullptr)",
+            "std::strcmp(visible_path.data(), DIR_PATH) == 0",
+            "visible_path.at(std::strlen(DIR_PATH)) == '\\0'",
+            'copy_path_string("/tmp", rooted_task.root.data(), rooted_task.root.size())',
+            'ROOTED_VISIBLE_PATH = "/ktest_readdir_hints"',
+            "visible_path.fill('x')",
+            "ROOTED_VISIBLE_PATH_RET =",
+            "strip_task_root_prefix(&rooted_task, DIR_PATH, visible_path.data(), visible_path.size(), nullptr)",
+            "visible_path.at(std::strlen(ROOTED_VISIBLE_PATH)) == '\\0'",
+        ],
+        "poisoned synthetic readdir visible-path KTEST coverage",
+    )
+    poison = "visible_path.fill('x');"
+    coverage_cases = [
+        (
+            "int const VISIBLE_PATH_RET = strip_task_root_prefix(nullptr, DIR_PATH, visible_path.data(), visible_path.size(), nullptr);",
+            "ok = ok && VISIBLE_PATH_RET == 0",
+        ),
+        (
+            "int const ROOTED_VISIBLE_PATH_RET = strip_task_root_prefix(&rooted_task, DIR_PATH, visible_path.data(), visible_path.size(), nullptr);",
+            "ok = ok && ROOTED_VISIBLE_PATH_RET == 0",
+        ),
+    ]
+    if (
+        selftest.count("visible_path.fill(") != len(coverage_cases)
+        or selftest.count(poison) != len(coverage_cases)
+        or len(re.findall(r"\bvisible_path\b", selftest)) != 11
+    ):
+        fail("every synthetic readdir visible-path case must preserve its poisoned destination")
+    cursor = 0
+    for call, verification in coverage_cases:
+        poison_pos = selftest.find(poison, cursor)
+        call_pos = selftest.find(call, poison_pos + len(poison))
+        if poison_pos < 0 or call_pos < 0 or selftest[poison_pos + len(poison) : call_pos].strip():
+            fail("synthetic readdir visible-path poison must immediately precede each producer call")
+        call_end = call_pos + len(call)
+        verification_pos = selftest.find(verification, call_end)
+        if verification_pos < 0 or selftest[call_end:verification_pos].strip():
+            fail("synthetic readdir visible-path output must be verified before any destination mutation")
+        cursor = verification_pos + len(verification)
+
+
 def test_open_path_scratch_is_initialized_by_its_producers() -> None:
     core = VFS_CORE_CPP.read_text()
 
@@ -695,5 +868,6 @@ if __name__ == "__main__":
     test_absolute_visible_scratch_is_initialized_by_dot_clean_producer()
     test_prefix_symlink_scratch_is_initialized_by_its_producers()
     test_readdir_child_path_scratch_is_initialized_by_its_producer()
+    test_synthetic_readdir_visible_paths_are_initialized_by_root_strip()
     test_open_path_scratch_is_initialized_by_its_producers()
     print("VFS open path scratch invariants hold")
