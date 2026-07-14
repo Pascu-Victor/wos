@@ -383,14 +383,18 @@ struct IpcDevOpWork {
     WkiHeader hdr = {};
     uint8_t* payload = nullptr;
     uint16_t payload_len = 0;
+    bool payload_coallocated = false;
     uint64_t cleanup_epoch = 0;
 };
+static_assert(sizeof(IpcDevOpWork) == 56);
 
 constexpr size_t WKI_IPC_DEV_OP_WORKER_COUNT = 4;
 std::array<std::deque<IpcDevOpWork*>, WKI_IPC_DEV_OP_WORKER_COUNT> g_ipc_dev_op_queues;
 std::array<ker::mod::sched::task::Task*, WKI_IPC_DEV_OP_WORKER_COUNT> g_ipc_dev_op_worker_tasks = {};
 constexpr size_t WKI_IPC_DEV_OP_MAX_PENDING = 256;
 constexpr size_t WKI_IPC_DEV_OP_CLEANUP_BATCH = 64;
+constexpr uint16_t WKI_IPC_DEV_OP_COALLOC_MIN_PAYLOAD = 8192;
+static_assert(WKI_IPC_DEV_OP_COALLOC_MIN_PAYLOAD <= WKI_ETH_MAX_PAYLOAD);
 
 struct IpcPeerCleanupEpoch {
     bool used = false;
@@ -2735,6 +2739,34 @@ void start_pipe_pump(WkiIpcExport* exp) {
     ker::mod::sched::kern_wake(task);
 }
 
+auto alloc_ipc_dev_op_work(uint16_t payload_len) -> IpcDevOpWork* {
+    // Full pipe and socket frames already occupy the same medium-allocation
+    // backing order after adding the work descriptor. Keep smaller and
+    // out-of-wire-range payloads separate so coallocation cannot promote them
+    // across a slab or page-size boundary.
+    bool const COALLOCATE_PAYLOAD = payload_len >= WKI_IPC_DEV_OP_COALLOC_MIN_PAYLOAD && payload_len <= WKI_ETH_MAX_PAYLOAD;
+    size_t const STORAGE_SIZE = sizeof(IpcDevOpWork) + (COALLOCATE_PAYLOAD ? payload_len : 0);
+    void* const STORAGE = ::operator new(STORAGE_SIZE, std::nothrow);
+    if (STORAGE == nullptr) {
+        return nullptr;
+    }
+
+    auto* work = new (STORAGE) IpcDevOpWork{};
+    work->payload_len = payload_len;
+    work->payload_coallocated = COALLOCATE_PAYLOAD;
+    if (COALLOCATE_PAYLOAD) {
+        work->payload = reinterpret_cast<uint8_t*>(work + 1);
+    } else if (payload_len != 0) {
+        work->payload = new (std::nothrow) uint8_t[payload_len];
+        if (work->payload == nullptr) {
+            work->~IpcDevOpWork();
+            ::operator delete(work);
+            return nullptr;
+        }
+    }
+    return work;
+}
+
 void free_ipc_dev_op_work(IpcDevOpWork* work) {
     if (work == nullptr) {
         return;
@@ -2744,9 +2776,11 @@ void free_ipc_dev_op_work(IpcDevOpWork* work) {
     g_ipc_dev_op_work_selftest_frees.fetch_add(1, std::memory_order_relaxed);
 #endif
 
-    delete[] work->payload;
-
-    delete work;
+    if (!work->payload_coallocated) {
+        delete[] work->payload;
+    }
+    work->~IpcDevOpWork();
+    ::operator delete(work);
 }
 
 auto ipc_dev_op_expects_response(uint16_t op_id) -> bool {
@@ -2940,20 +2974,13 @@ auto enqueue_ipc_dev_op_work(const WkiHeader* hdr, const uint8_t* payload, uint1
     -> bool {
     uint32_t const CORRELATION = hdr != nullptr ? static_cast<uint32_t>(hdr->seq_num & UINT16_MAX) : 0U;
     uint16_t const REQUEST_COOKIE = ipc_dev_op_request_cookie(payload, payload_len, op_id);
-    auto* work = new (std::nothrow) IpcDevOpWork();
-    auto* payload_copy = new (std::nothrow) uint8_t[payload_len];
-    if (work == nullptr || payload_copy == nullptr) {
-        delete[] payload_copy;
-
-        delete work;
-
+    auto* work = alloc_ipc_dev_op_work(payload_len);
+    if (work == nullptr) {
         send_ipc_dev_op_error_response(hdr, op_id, resource_id, -ENOMEM, REQUEST_COOKIE);
         return false;
     }
 
     work->hdr = *hdr;
-    work->payload = payload_copy;
-    work->payload_len = payload_len;
     std::memcpy(work->payload, payload, payload_len);
 
     ker::mod::sched::task::Task* worker = nullptr;
@@ -4298,13 +4325,14 @@ auto wki_ipc_selftest_cleanup_for_peer_drains_deferred_dev_ops() -> int {
     constexpr uint16_t NODE_ID = 0x6C6C;
     constexpr uint16_t OTHER_NODE_ID = 0x6D6D;
     constexpr size_t DEV_OP_COUNT = WKI_IPC_DEV_OP_CLEANUP_BATCH + 3;
+    constexpr uint16_t PAYLOAD_LEN = sizeof(DevOpReqPayload);
 
     wki_ipc_cleanup_for_peer(NODE_ID);
     wki_ipc_cleanup_for_peer(OTHER_NODE_ID);
 
     std::array<IpcDevOpWork*, DEV_OP_COUNT> works = {};
     for (size_t i = 0; i < works.size(); ++i) {
-        auto* work = new (std::nothrow) IpcDevOpWork{};
+        auto* work = alloc_ipc_dev_op_work(PAYLOAD_LEN);
         if (work == nullptr) {
             for (auto* allocated : works) {
                 free_ipc_dev_op_work(allocated);
@@ -4316,7 +4344,7 @@ auto wki_ipc_selftest_cleanup_for_peer_drains_deferred_dev_ops() -> int {
         works.at(i) = work;
     }
 
-    auto* survivor = new (std::nothrow) IpcDevOpWork{};
+    auto* survivor = alloc_ipc_dev_op_work(PAYLOAD_LEN);
     if (survivor == nullptr) {
         for (auto* work : works) {
             free_ipc_dev_op_work(work);
@@ -4389,6 +4417,23 @@ auto wki_ipc_selftest_cleanup_for_peer_drains_deferred_dev_ops() -> int {
     }
 
     return 0;
+}
+
+auto wki_ipc_selftest_large_dev_op_work_coallocates_payload() -> int {
+    auto* work = alloc_ipc_dev_op_work(WKI_IPC_DEV_OP_COALLOC_MIN_PAYLOAD);
+    if (work == nullptr) {
+        return -ENOMEM;
+    }
+
+    auto* const EXPECTED_PAYLOAD = reinterpret_cast<uint8_t*>(work + 1);
+    bool const VALID =
+        work->payload_coallocated && work->payload == EXPECTED_PAYLOAD && work->payload_len == WKI_IPC_DEV_OP_COALLOC_MIN_PAYLOAD;
+    if (VALID) {
+        work->payload[0] = 0xA5;
+        work->payload[work->payload_len - 1] = 0x5A;
+    }
+    free_ipc_dev_op_work(work);
+    return VALID ? 0 : -EIO;
 }
 
 auto wki_ipc_selftest_poll_wake_drains_over_capacity() -> int {

@@ -604,6 +604,46 @@ def test_peer_cleanup_drains_deferred_dev_op_work() -> None:
     )
 
 
+def test_large_deferred_dev_op_payloads_are_coallocated() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    for snippet in [
+        "bool payload_coallocated = false",
+        "static_assert(sizeof(IpcDevOpWork) == 56)",
+        "WKI_IPC_DEV_OP_COALLOC_MIN_PAYLOAD = 8192",
+        "payload_len <= WKI_ETH_MAX_PAYLOAD",
+    ]:
+        if snippet not in remote_ipc:
+            fail(f"large deferred IPC DEV_OP storage policy is missing {snippet!r}")
+
+    alloc_body = function_body(remote_ipc, "alloc_ipc_dev_op_work")
+    for snippet in [
+        "payload_len >= WKI_IPC_DEV_OP_COALLOC_MIN_PAYLOAD",
+        "sizeof(IpcDevOpWork) + (COALLOCATE_PAYLOAD ? payload_len : 0)",
+        "::operator new(STORAGE_SIZE, std::nothrow)",
+        "new (STORAGE) IpcDevOpWork{}",
+        "work->payload = reinterpret_cast<uint8_t*>(work + 1)",
+        "new (std::nothrow) uint8_t[payload_len]",
+    ]:
+        if snippet not in alloc_body:
+            fail(f"deferred IPC DEV_OP allocator is missing {snippet!r}")
+
+    release_body = function_body(remote_ipc, "free_ipc_dev_op_work")
+    for snippet in [
+        "if (!work->payload_coallocated)",
+        "delete[] work->payload",
+        "work->~IpcDevOpWork()",
+        "::operator delete(work)",
+    ]:
+        if snippet not in release_body:
+            fail(f"deferred IPC DEV_OP release is missing {snippet!r}")
+
+    enqueue_body = function_body(remote_ipc, "enqueue_ipc_dev_op_work")
+    if "alloc_ipc_dev_op_work(payload_len)" not in enqueue_body:
+        fail("deferred IPC DEV_OP enqueue must use the shared storage allocator")
+    if "new (std::nothrow) IpcDevOpWork" in enqueue_body or "new (std::nothrow) uint8_t[payload_len]" in enqueue_body:
+        fail("deferred IPC DEV_OP enqueue must not allocate the descriptor and large payload separately")
+
+
 def test_futex_dev_op_preserves_broadcast_wake_count() -> None:
     remote_ipc = REMOTE_IPC_CPP.read_text()
     for snippet in [
@@ -635,6 +675,7 @@ def test_ipc_selftests_are_declared_and_registered() -> None:
     ktest = WKI_WAIT_KTEST.read_text()
     required = [
         "wki_ipc_selftest_cleanup_for_peer_drains_deferred_dev_ops",
+        "wki_ipc_selftest_large_dev_op_work_coallocates_payload",
         "wki_ipc_selftest_poll_wake_drains_over_capacity",
         "wki_ipc_selftest_inactive_proxy_poll_is_terminal",
         "wki_ipc_selftest_epoll_close_releases_lookup_ref",
@@ -666,6 +707,7 @@ def main() -> None:
     test_attach_fd_install_is_transactional()
     test_dev_op_response_cookies_fence_stale_waiters()
     test_peer_cleanup_drains_deferred_dev_op_work()
+    test_large_deferred_dev_op_payloads_are_coallocated()
     test_futex_dev_op_preserves_broadcast_wake_count()
     test_ipc_send_retry_backpressure_sleeps_without_yield_livelock()
     test_ipc_selftests_are_declared_and_registered()
