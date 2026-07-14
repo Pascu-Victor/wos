@@ -452,6 +452,135 @@ def test_prefix_symlink_scratch_is_initialized_by_its_producers() -> None:
     )
 
 
+def test_readdir_child_path_scratch_is_initialized_by_its_producer() -> None:
+    core = VFS_CORE_CPP.read_text()
+    builder = function_body(core, "build_readdir_child_path")
+    seed = function_body(core, "vfs_seed_readdir_entry_cache_hints")
+    selftest = function_body(core, "vfs_selftest_readdir_seeds_non_symlink_hints")
+
+    declaration = "std::array<char, MAX_PATH_LEN> child_path __attribute__((uninitialized));"
+    require_only_uninitialized_array(seed, "child_path", declaration, "readdir child-path scratch")
+    require_order(
+        seed,
+        [
+            "if (ENTRY_TYPE == DT_UNKNOWN || ENTRY_TYPE == DT_LNK)",
+            declaration,
+            "size_t child_path_len = 0",
+            "if (!build_readdir_child_path(dir, entry, child_path, &child_path_len) ||",
+            "!path_is_under_mount(mount, child_path.data(), child_path_len))",
+            "return",
+            "metadata_cache_prepare_path_observation(child_path.data()",
+            "metadata_path_hash_raw(child_path.data(), child_path_len)",
+        ],
+        "readdir child-path producer and consumer ordering",
+    )
+    build_failure = block_body_after(seed, "if (!build_readdir_child_path(dir, entry, child_path, &child_path_len) ||")
+    if build_failure.strip() != "return;":
+        fail("failed readdir child-path production must return before consuming scratch")
+    if len(re.findall(r"\bchild_path\b", seed)) != 13:
+        fail("readdir child-path scratch has an unexpected producer or consumer")
+
+    require_order(
+        builder,
+        [
+            "size_t const NAME_LEN = dirent_name_length(entry)",
+            "for (size_t i = 0; i < NAME_LEN; ++i)",
+            "size_t parent_len = file_vfs_path_len(dir)",
+            "size_t const SEP_LEN = (parent_len == 1 && dir->vfs_path[0] == '/') ? 0 : 1",
+            "size_t const CHILD_LEN = parent_len + SEP_LEN + NAME_LEN",
+            "if (CHILD_LEN == 0 || CHILD_LEN >= out.size())",
+            "std::memcpy(out.data(), dir->vfs_path, parent_len)",
+            "if (SEP_LEN != 0)",
+            "out.at(pos++) = '/'",
+            "std::memcpy(out.data() + pos, entry.d_name.data(), NAME_LEN)",
+            "out.at(CHILD_LEN) = '\\0'",
+            "*path_len_out = CHILD_LEN",
+            "return true",
+        ],
+        "bounded readdir child-path construction",
+    )
+    first_output_write = builder.find("std::memcpy(out.data(), dir->vfs_path, parent_len)")
+    if first_output_write < 0:
+        fail("readdir child-path builder is missing its first output write")
+    expected_success_tail = """std::memcpy(out.data(), dir->vfs_path, parent_len);
+    size_t pos = parent_len;
+    if (SEP_LEN != 0) {
+        out.at(pos++) = '/';
+    }
+    std::memcpy(out.data() + pos, entry.d_name.data(), NAME_LEN);
+    out.at(CHILD_LEN) = '\\0';
+    *path_len_out = CHILD_LEN;
+    return true;"""
+    if builder[first_output_write:].strip() != expected_success_tail:
+        fail("readdir child-path success must remain one complete straight-line production after its optional separator")
+    returns = re.findall(r"\breturn\s+([^;]+);", builder)
+    if returns != ["false", "false", "false", "false", "false", "true"]:
+        fail("readdir child-path builder must reject all failures before writing output and have one final success exit")
+    if len(re.findall(r"\bout\b", builder)) != 5:
+        fail("readdir child-path builder has an unexpected success exit or output-buffer use")
+    forbid(
+        builder,
+        ["memset", "bzero", "std::fill", "std::ranges::fill", "fill_n"],
+        "readdir child-path output must not be bulk-cleared",
+    )
+
+    require_order(
+        selftest,
+        [
+            "built_child_path.fill('x')",
+            "BUILT_CHILD_PATH = build_readdir_child_path(dir, found, built_child_path, &built_child_path_len)",
+            "built_child_path_len == CHILD_PATH_LEN",
+            "built_child_path.at(CHILD_PATH_LEN) == '\\0'",
+            "root_dir.vfs_path = \"/\"",
+            "root_dir.vfs_path_len = 1",
+            "built_child_path.fill('x')",
+            "BUILT_ROOT_CHILD_PATH = build_readdir_child_path(&root_dir, root_entry, built_child_path, &built_child_path_len)",
+            "built_child_path_len == 2",
+            "built_child_path.at(2) == '\\0'",
+            "UNCHANGED_PATH_LEN = MAX_PATH_LEN",
+            "built_child_path.fill('x')",
+            "BUILT_INVALID_CHILD_PATH = build_readdir_child_path(dir, invalid_entry, built_child_path, &built_child_path_len)",
+            "built_child_path_len == UNCHANGED_PATH_LEN",
+            "built_child_path.front() == 'x'",
+            "built_child_path.back() == 'x'",
+        ],
+        "poisoned readdir child-path KTEST coverage",
+    )
+    poison = "built_child_path.fill('x');"
+    coverage_cases = [
+        (
+            "bool const BUILT_CHILD_PATH = build_readdir_child_path(dir, found, built_child_path, &built_child_path_len);",
+            "ok = ok && BUILT_CHILD_PATH && built_child_path_len == CHILD_PATH_LEN",
+        ),
+        (
+            "bool const BUILT_ROOT_CHILD_PATH = build_readdir_child_path(&root_dir, root_entry, built_child_path, &built_child_path_len);",
+            "ok = ok && BUILT_ROOT_CHILD_PATH && built_child_path_len == 2",
+        ),
+        (
+            "bool const BUILT_INVALID_CHILD_PATH = build_readdir_child_path(dir, invalid_entry, built_child_path, &built_child_path_len);",
+            "ok = ok && !BUILT_INVALID_CHILD_PATH && built_child_path_len == UNCHANGED_PATH_LEN",
+        ),
+    ]
+    if (
+        selftest.count("built_child_path.fill(") != len(coverage_cases)
+        or selftest.count(poison) != len(coverage_cases)
+        or len(re.findall(r"\bbuilt_child_path\b", selftest)) != 13
+        or len(re.findall(r"\bbuilt_child_path_len\b", selftest)) != 9
+    ):
+        fail("every readdir child-path coverage case must preserve its poisoned destination")
+    cursor = 0
+    for builder_call, verification in coverage_cases:
+        poison_pos = selftest.find(poison, cursor)
+        call_pos = selftest.find(builder_call, poison_pos + len(poison))
+        if poison_pos < 0 or call_pos < 0 or selftest[poison_pos + len(poison) : call_pos].strip():
+            fail("readdir child-path destination poison must immediately precede each producer call")
+        call_end = call_pos + len(builder_call)
+        verification_pos = selftest.find(verification, call_end)
+        if verification_pos < 0 or selftest[call_end:verification_pos].strip():
+            fail("readdir child-path producer result must be verified before any destination mutation")
+        cursor = verification_pos + len(verification)
+
+
 def test_open_path_scratch_is_initialized_by_its_producers() -> None:
     core = VFS_CORE_CPP.read_text()
 
@@ -565,5 +694,6 @@ if __name__ == "__main__":
     test_dirfd_visible_scratch_is_initialized_by_root_strip()
     test_absolute_visible_scratch_is_initialized_by_dot_clean_producer()
     test_prefix_symlink_scratch_is_initialized_by_its_producers()
+    test_readdir_child_path_scratch_is_initialized_by_its_producer()
     test_open_path_scratch_is_initialized_by_its_producers()
     print("VFS open path scratch invariants hold")

@@ -6248,7 +6248,9 @@ void vfs_seed_readdir_entry_cache_hints(const File* dir, MountPoint const* mount
         return;
     }
 
-    std::array<char, MAX_PATH_LEN> child_path{};
+    // build_readdir_child_path initializes the complete bounded NUL-terminated path on success.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> child_path __attribute__((uninitialized));
     size_t child_path_len = 0;
     if (!build_readdir_child_path(dir, entry, child_path, &child_path_len) ||
         !path_is_under_mount(mount, child_path.data(), child_path_len)) {
@@ -17636,6 +17638,7 @@ auto vfs_selftest_readdir_seeds_non_symlink_hints() -> bool {
     constexpr const char* DIR_GRANDCHILD_PATH = "/tmp/ktest_readdir_hints/dir_child/nested";
     constexpr const char* CHILD_NAME = "child";
     constexpr const char* DIR_CHILD_NAME = "dir_child";
+    constexpr size_t CHILD_PATH_LEN = sizeof("/tmp/ktest_readdir_hints/child") - 1;
     constexpr size_t DIR_CHILD_PATH_LEN = sizeof("/tmp/ktest_readdir_hints/dir_child") - 1;
     constexpr size_t DIR_GRANDCHILD_PATH_LEN = sizeof("/tmp/ktest_readdir_hints/dir_child/nested") - 1;
 
@@ -17703,6 +17706,33 @@ auto vfs_selftest_readdir_seeds_non_symlink_hints() -> bool {
     }
     ok = ok && found_child && (found.d_type & static_cast<uint8_t>(~DT_WOSLINK)) == DT_REG;
     ok = ok && found_dir_child && (found_dir.d_type & static_cast<uint8_t>(~DT_WOSLINK)) == DT_DIR;
+
+    std::array<char, MAX_PATH_LEN> built_child_path{};
+    size_t built_child_path_len = 0;
+    built_child_path.fill('x');
+    bool const BUILT_CHILD_PATH = build_readdir_child_path(dir, found, built_child_path, &built_child_path_len);
+    ok = ok && BUILT_CHILD_PATH && built_child_path_len == CHILD_PATH_LEN && std::strcmp(built_child_path.data(), CHILD_PATH) == 0 &&
+         built_child_path.at(CHILD_PATH_LEN) == '\0';
+
+    File root_dir{};
+    root_dir.vfs_path = "/";
+    root_dir.vfs_path_len = 1;
+    DirEntry root_entry{};
+    std::memcpy(root_entry.d_name.data(), "x", 2);
+    built_child_path_len = 0;
+    built_child_path.fill('x');
+    bool const BUILT_ROOT_CHILD_PATH = build_readdir_child_path(&root_dir, root_entry, built_child_path, &built_child_path_len);
+    ok = ok && BUILT_ROOT_CHILD_PATH && built_child_path_len == 2 && std::strcmp(built_child_path.data(), "/x") == 0 &&
+         built_child_path.at(2) == '\0';
+
+    DirEntry invalid_entry{};
+    std::memcpy(invalid_entry.d_name.data(), ".", 2);
+    constexpr size_t UNCHANGED_PATH_LEN = MAX_PATH_LEN;
+    built_child_path_len = UNCHANGED_PATH_LEN;
+    built_child_path.fill('x');
+    bool const BUILT_INVALID_CHILD_PATH = build_readdir_child_path(dir, invalid_entry, built_child_path, &built_child_path_len);
+    ok = ok && !BUILT_INVALID_CHILD_PATH && built_child_path_len == UNCHANGED_PATH_LEN && built_child_path.front() == 'x' &&
+         built_child_path.back() == 'x';
 
     VfsCachePerfSnapshot before_seed{};
     VfsCachePerfSnapshot after_seed{};
