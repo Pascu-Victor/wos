@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 RENDERBENCH_MAIN_CPP = ROOT / "modules" / "renderbench" / "src" / "main.cpp"
+VFS_CORE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "core.cpp"
 
 
 def fail(message: str) -> None:
@@ -124,9 +125,26 @@ def test_renderbench_worker_stream_corruption_is_fatal() -> None:
 
 def test_renderbench_worker_pipe_read_uses_uninitialized_scratch() -> None:
     source = RENDERBENCH_MAIN_CPP.read_text()
+    vfs_source = VFS_CORE_CPP.read_text()
+    require_tokens(
+        source,
+        ["constexpr size_t WORKER_PIPE_READ_CHUNK = 4096;"],
+        "renderbench worker pipe read chunk",
+    )
+    require_tokens(
+        vfs_source,
+        [
+            "constexpr size_t PIPE_COPY_CHUNK = 4096;",
+            "std::array<char, PIPE_COPY_CHUNK> bounce",
+            "std::min({count, st->count, bounce.size()})",
+            "constexpr size_t USER_IO_BOUNCE_STACK_CHUNK = size_t{16} * 1024;",
+            "if (bounce_size > stack_bounce.size())",
+        ],
+        "local pipe read ceiling",
+    )
     body = function_body(source, "drain_ready_worker_pipe")
     declaration = (
-        "std::array<unsigned char, 65536> chunk "
+        "std::array<unsigned char, WORKER_PIPE_READ_CHUNK> chunk "
         "__attribute__((uninitialized));"
     )
     read_call = (

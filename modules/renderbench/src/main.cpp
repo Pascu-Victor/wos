@@ -52,6 +52,8 @@ constexpr std::array<char, 4> BATCH_COMMAND_MAGIC = {'R', 'B', 'T', 'C'};
 constexpr std::array<char, 4> PHASE_PACKET_MAGIC = {'R', 'B', 'T', 'P'};
 constexpr size_t WORKER_PIPE_BUFFER_RESERVE = static_cast<size_t>(256U) * 1024U;
 constexpr size_t WORKER_PIPE_DRAIN_BYTE_BUDGET = static_cast<size_t>(8U) * 1024U * 1024U;
+// Match the local pipe read ceiling so each user read stays on the VFS stack bounce.
+constexpr size_t WORKER_PIPE_READ_CHUNK = 4096;
 constexpr int WORKER_PIPE_IDLE_POLL_TIMEOUT_MS = 5;
 constexpr double COORDINATOR_STALL_REPORT_SECONDS = 15.0;
 constexpr double STATUS_UPDATE_INTERVAL_SECONDS = 0.75;
@@ -1468,7 +1470,7 @@ auto drain_ready_worker_pipe(ChildWorker& worker, tracebench::FilmView film, std
                              std::span<const int> tile_owner, uint64_t& tiles_done) -> bool {
     // read() initializes the exact positive prefix consumed below.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
-    std::array<unsigned char, 65536> chunk __attribute__((uninitialized));
+    std::array<unsigned char, WORKER_PIPE_READ_CHUNK> chunk __attribute__((uninitialized));
     size_t drained_bytes = 0;
     worker.drain_budget_hit = false;
     while (worker.read_fd >= 0 && drained_bytes < WORKER_PIPE_DRAIN_BYTE_BUDGET) {
