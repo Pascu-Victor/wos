@@ -240,6 +240,15 @@ def test_proxy_request_envelopes_use_stack_storage() -> None:
         fail("RDMA write retained heap-backed request-envelope storage")
 
     open_body = function_body(source, "wki_remote_vfs_open_path")
+    require_tokens(
+        source,
+        [
+            "constexpr size_t OPEN_REQ_INLINE_CAPACITY =",
+            "OPEN_REQ_BASE_LEN + ker::vfs::MOUNT_PATH_MAX + OPEN_PREFETCH_REQ_LEN",
+            "static_assert(OPEN_REQ_INLINE_CAPACITY <= WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload))",
+        ],
+        "ordinary remote open inline request capacity",
+    )
     require_order(
         open_body,
         [
@@ -249,10 +258,22 @@ def test_proxy_request_envelopes_use_stack_storage() -> None:
             "return nullptr",
             "auto path_len = static_cast<uint16_t>(PATH_LEN)",
             "size_t const REQ_DATA_LEN = REQ_FIXED_LEN + PATH_LEN",
+            "std::array<uint8_t, OPEN_REQ_INLINE_CAPACITY> inline_req_data",
+            "std::unique_ptr<uint8_t[]> heap_req_data",
+            "uint8_t* req_data = inline_req_data.data()",
+            "if (REQ_DATA_LEN > inline_req_data.size())",
+            "heap_req_data.reset(new (std::nothrow) uint8_t[REQ_DATA_LEN])",
+            "if (heap_req_data == nullptr)",
+            "return nullptr",
+            "req_data = heap_req_data.get()",
             "vfs_proxy_send_and_wait(state, OP_VFS_OPEN, req_data, REQ_DATA_LEN",
         ],
         "open request validates its wire size before narrowing",
     )
+    if "delete[] req_data" in open_body:
+        fail("ordinary remote open retained unconditional heap request ownership")
+    if re.search(r"inline_req_data\s*(?:\{\}|=\s*\{\})", open_body):
+        fail("remote open zero-initializes its inline request storage")
 
 
 def test_proxy_slot_release_paths_handoff_after_unlock() -> None:

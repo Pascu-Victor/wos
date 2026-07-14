@@ -172,6 +172,8 @@ struct OpenRespPayload {
 
 constexpr uint16_t OPEN_REQ_BASE_LEN = 10;
 constexpr uint16_t OPEN_PREFETCH_REQ_LEN = 8;
+constexpr size_t OPEN_REQ_INLINE_CAPACITY = OPEN_REQ_BASE_LEN + ker::vfs::MOUNT_PATH_MAX + OPEN_PREFETCH_REQ_LEN;
+static_assert(OPEN_REQ_INLINE_CAPACITY <= WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload));
 constexpr uint16_t OPEN_RESP_NO_STAT_LEN = static_cast<uint16_t>(offsetof(OpenRespPayload, stat));
 constexpr uint16_t OPEN_RESP_WITH_STAT_LEN = static_cast<uint16_t>(offsetof(OpenRespPayload, prefetched_bytes));
 constexpr uint16_t OPEN_RESP_WITH_PREFETCH_LEN = static_cast<uint16_t>(sizeof(OpenRespPayload));
@@ -6251,9 +6253,16 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
     }
     auto path_len = static_cast<uint16_t>(PATH_LEN);
     size_t const REQ_DATA_LEN = REQ_FIXED_LEN + PATH_LEN;
-    auto* req_data = new (std::nothrow) uint8_t[REQ_DATA_LEN];
-    if (req_data == nullptr) {
-        return nullptr;
+    std::array<uint8_t, OPEN_REQ_INLINE_CAPACITY> inline_req_data;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): Variable-size nothrow fallback ownership.
+    std::unique_ptr<uint8_t[]> heap_req_data;
+    uint8_t* req_data = inline_req_data.data();
+    if (REQ_DATA_LEN > inline_req_data.size()) {
+        heap_req_data.reset(new (std::nothrow) uint8_t[REQ_DATA_LEN]);
+        if (heap_req_data == nullptr) {
+            return nullptr;
+        }
+        req_data = heap_req_data.get();
     }
 
     auto u_flags = static_cast<uint32_t>(flags);
@@ -6282,7 +6291,6 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
 
     int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_OPEN, req_data, REQ_DATA_LEN, &open_resp, sizeof(open_resp), &open_resp_len,
                                                VFS_PROXY_OP_TIMEOUT_US, tagged_receive_ptr);
-    delete[] req_data;
 
     if (STATUS != 0 || open_resp.fd < 0) {
         return nullptr;
