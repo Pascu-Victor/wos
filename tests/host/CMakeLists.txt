@@ -369,6 +369,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_write_source_test.py
 )
 add_test(
+    NAME vfs_pipe_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_pipe_source_test.py
+)
+add_test(
     NAME vfs_pread_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_pread_source_test.py
 )
@@ -480,6 +484,7 @@ set_tests_properties(
     xfs_inode_source_test
     xfs_read_source_test
     xfs_write_source_test
+    vfs_pipe_source_test
     vfs_pread_source_test
     vfs_sendfile_source_test
     vmem_source_test

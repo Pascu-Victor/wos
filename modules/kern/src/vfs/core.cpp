@@ -14244,7 +14244,9 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
         uint64_t const CALLSITE = WOS_PERF_CALLSITE();
         uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
         uint64_t const STARTED_US = ker::mod::time::get_us();
-        std::array<char, PIPE_COPY_CHUNK> bounce{};
+        // The ring copy initializes the exact positive prefix consumed below.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+        std::array<char, PIPE_COPY_CHUNK> bounce __attribute__((uninitialized));
         auto finish = [&](ssize_t rc, uint64_t bytes = 0) -> ssize_t {
             uint32_t const ELAPSED_US = static_cast<uint32_t>(ker::mod::time::get_us() - STARTED_US);
             int32_t const STATUS = rc >= 0 ? 0 : static_cast<int32_t>(rc);
@@ -14362,7 +14364,9 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
         uint64_t const CALLSITE = WOS_PERF_CALLSITE();
         uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
         uint64_t const STARTED_US = ker::mod::time::get_us();
-        std::array<char, PIPE_COPY_CHUNK> bounce{};
+        // The caller copy initializes the exact staged prefix consumed below.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+        std::array<char, PIPE_COPY_CHUNK> bounce __attribute__((uninitialized));
         auto finish = [&](ssize_t rc, uint64_t bytes = 0) -> ssize_t {
             uint32_t const ELAPSED_US = static_cast<uint32_t>(ker::mod::time::get_us() - STARTED_US);
             int32_t const STATUS = rc >= 0 ? 0 : static_cast<int32_t>(rc);
