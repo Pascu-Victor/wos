@@ -331,25 +331,15 @@ void run_deferred_vfs_op(void* arg) {
         return;
     }
 
-    std::array<char, sizeof(DevServerBinding::vfs_export_path)> export_path{};
-    std::array<char, sizeof(DevServerBinding::vfs_export_name)> export_name{};
     DevServerBinding* const RETAINED_BINDING = op->retained_binding;
 
-    {
-        uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
-        if (RETAINED_BINDING != nullptr && RETAINED_BINDING->resource_type == ResourceType::VFS &&
-            channel_identity_matches(RETAINED_BINDING->channel_identity, op->channel_identity)) {
-            std::memcpy(export_path.data(), static_cast<const void*>(RETAINED_BINDING->vfs_export_path), export_path.size());
-            std::memcpy(export_name.data(), static_cast<const void*>(RETAINED_BINDING->vfs_export_name), export_name.size());
-            export_path.at(export_path.size() - 1) = '\0';
-            export_name.at(export_name.size() - 1) = '\0';
-        }
-        s_server_lock.unlock_irqrestore(SRV_FLAGS);
-    }
-
-    if (RETAINED_BINDING != nullptr) {
-        detail::handle_vfs_op(&op->hdr, op->channel_identity, export_path.data(), export_name.data(), op->op_id, op->req_data,
-                              op->req_data_len);
+    // queue_vfs_op retained an exact published list node. Its channel identity
+    // and export strings are immutable after publication, and retirement
+    // cannot erase the node until this reference is released.
+    if (RETAINED_BINDING != nullptr && RETAINED_BINDING->resource_type == ResourceType::VFS &&
+        channel_identity_matches(RETAINED_BINDING->channel_identity, op->channel_identity)) {
+        detail::handle_vfs_op(&op->hdr, op->channel_identity, static_cast<const char*>(RETAINED_BINDING->vfs_export_path),
+                              static_cast<const char*>(RETAINED_BINDING->vfs_export_name), op->op_id, op->req_data, op->req_data_len);
     } else {
         send_vfs_error_response(op->channel_identity, op->op_id, -ENOTCONN, req_cookie_from_header(&op->hdr));
     }

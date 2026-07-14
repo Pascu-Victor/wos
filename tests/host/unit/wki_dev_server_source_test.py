@@ -665,7 +665,10 @@ def test_deferred_vfs_ops_retain_their_binding_through_blocking_work() -> None:
 
     run_required = [
         "DevServerBinding* const RETAINED_BINDING = op->retained_binding",
-        "if (RETAINED_BINDING != nullptr)",
+        "RETAINED_BINDING != nullptr",
+        "channel_identity_matches(RETAINED_BINDING->channel_identity, op->channel_identity)",
+        "static_cast<const char*>(RETAINED_BINDING->vfs_export_path)",
+        "static_cast<const char*>(RETAINED_BINDING->vfs_export_name)",
         "detail::handle_vfs_op",
         "op->channel_identity",
         "release_binding(RETAINED_BINDING)",
@@ -678,8 +681,23 @@ def test_deferred_vfs_ops_retain_their_binding_through_blocking_work() -> None:
     require_order(queue_body, "retain_binding_locked(binding)", "op->retained_binding = retained_binding", "VFS retained pointer transfer")
     require_order(queue_body, "deferred_vfs_op_alloc(req_data_len)", "std::memcpy(op->req_data", "VFS allocation before request copy")
     require_order(queue_body, "std::memcpy(op->req_data", "shard->lock.lock_irqsave()", "VFS request copy before FIFO publication")
+    require_order(
+        run_body,
+        "channel_identity_matches(RETAINED_BINDING->channel_identity, op->channel_identity)",
+        "detail::handle_vfs_op",
+        "retained VFS generation validation",
+    )
     require_order(run_body, "detail::handle_vfs_op", "release_binding(RETAINED_BINDING)", "deferred VFS release after handler")
     require_order(run_body, "release_binding(RETAINED_BINDING)", "deferred_vfs_op_release(op)", "deferred VFS release before request cleanup")
+    for forbidden in [
+        "s_server_lock.lock_irqsave()",
+        "std::array<char, sizeof(DevServerBinding::vfs_export_path)>",
+        "std::array<char, sizeof(DevServerBinding::vfs_export_name)>",
+        "std::memcpy(export_path.data()",
+        "std::memcpy(export_name.data()",
+    ]:
+        if forbidden in run_body:
+            fail(f"retained VFS binding identity must be consumed directly without a locked snapshot: found {forbidden}")
 
     for token in [
         "::operator new(sizeof(DeferredVfsOp) + req_data_len, std::nothrow)",
