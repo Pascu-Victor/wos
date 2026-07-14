@@ -149,7 +149,6 @@ def test_proxy_operations_fail_before_setup_when_slot_wait_times_out() -> None:
         [
             "int const SLOT_RET = acquire_proxy_op_slot_locked(state, PROXY_WAIT_START)",
             "if (SLOT_RET != WKI_OK)",
-            "delete[] req_buf",
             "return encode_proxy_wki_status(SLOT_RET)",
             "peek_channel_tx_seq16",
             "advance_proxy_op_generation_locked(state)",
@@ -163,7 +162,6 @@ def test_proxy_operations_fail_before_setup_when_slot_wait_times_out() -> None:
         [
             "int const SLOT_RET = acquire_proxy_untracked_send_slot_locked(state, PROXY_WAIT_START)",
             "if (SLOT_RET != WKI_OK)",
-            "delete[] req_buf",
             "return normalize_proxy_status_for_errno(encode_proxy_wki_status(SLOT_RET))",
             "peek_channel_tx_seq16",
         ],
@@ -181,6 +179,79 @@ def test_proxy_operations_fail_before_setup_when_slot_wait_times_out() -> None:
             "state->op_waiter_pid = perf_current_pid()",
         ],
         "vfs_proxy_write_rdma_and_wait slot timeout",
+    )
+
+
+def test_proxy_request_envelopes_use_stack_storage() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+
+    require_tokens(
+        source,
+        [
+            "static_assert(sizeof(DevOpReqPayload) <= WKI_ETH_MAX_PAYLOAD)",
+            "static_assert(WKI_ETH_MAX_PAYLOAD <= UINT16_MAX)",
+            "auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, size_t req_data_len",
+            "auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, size_t req_data_len",
+        ],
+        "request-envelope wire-size assumptions",
+    )
+
+    for function_name in ["vfs_proxy_send_and_wait", "vfs_proxy_send_untracked"]:
+        body = function_body(source, function_name)
+        require_order(
+            body,
+            [
+                "req_data_len > WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload)",
+                "return -EMSGSIZE",
+                "req_data_len > 0 && req_data == nullptr",
+                "return -EINVAL",
+                "auto const REQ_DATA_LEN = static_cast<uint16_t>(req_data_len)",
+                "size_t const REQ_TOTAL = sizeof(DevOpReqPayload) + req_data_len",
+                "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> req_buf",
+                "reinterpret_cast<DevOpReqPayload*>(req_buf.data())",
+                "memcpy(req_buf.data() + sizeof(DevOpReqPayload), req_data, req_data_len)",
+                "wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data()",
+                "static_cast<uint16_t>(REQ_TOTAL)",
+            ],
+            f"{function_name} stack-backed request envelope",
+        )
+        if re.search(r"\bnew\b|delete\s*\[\s*\]", body):
+            fail(f"{function_name} retained heap-backed request-envelope storage")
+        if re.search(
+            r"std::array<uint8_t,\s*WKI_ETH_MAX_PAYLOAD>\s+req_buf\s*(?:\{\}|=\s*\{\})",
+            body,
+        ):
+            fail(f"{function_name} zero-initializes its full request envelope")
+
+    rdma_body = function_body(source, "vfs_proxy_write_rdma_and_wait")
+    require_order(
+        rdma_body,
+        [
+            "std::array<uint8_t, 16> ctrl{}",
+            "std::array<uint8_t, sizeof(DevOpReqPayload) + 16> req_buf = {}",
+            "reinterpret_cast<DevOpReqPayload*>(req_buf.data())",
+            "memcpy(req_buf.data() + sizeof(DevOpReqPayload), ctrl.data(), ctrl.size())",
+            "wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data()",
+            "static_cast<uint16_t>(req_buf.size())",
+        ],
+        "RDMA write exact stack-backed request envelope",
+    )
+    if re.search(r"\bnew\b|delete\s*\[\s*\]", rdma_body):
+        fail("RDMA write retained heap-backed request-envelope storage")
+
+    open_body = function_body(source, "wki_remote_vfs_open_path")
+    require_order(
+        open_body,
+        [
+            "size_t const REQ_FIXED_LEN = OPEN_REQ_BASE_LEN + (send_open_prefetch ? OPEN_PREFETCH_REQ_LEN : 0)",
+            "REQ_FIXED_LEN > WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload)",
+            "PATH_LEN > WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload) - REQ_FIXED_LEN",
+            "return nullptr",
+            "auto path_len = static_cast<uint16_t>(PATH_LEN)",
+            "size_t const REQ_DATA_LEN = REQ_FIXED_LEN + PATH_LEN",
+            "vfs_proxy_send_and_wait(state, OP_VFS_OPEN, req_data, REQ_DATA_LEN",
+        ],
+        "open request validates its wire size before narrowing",
     )
 
 
@@ -1810,6 +1881,7 @@ def test_export_rebuild_is_revisioned_and_backing_mount_exact() -> None:
 def main() -> None:
     test_proxy_op_slot_waits_are_bounded()
     test_proxy_operations_fail_before_setup_when_slot_wait_times_out()
+    test_proxy_request_envelopes_use_stack_storage()
     test_proxy_slot_release_paths_handoff_after_unlock()
     test_shared_io_slot_waits_are_bounded()
     test_shared_io_callers_timeout_or_fallback()

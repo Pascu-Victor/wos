@@ -106,6 +106,8 @@ constexpr uint64_t VFS_PROXY_CONTENTION_SLEEP_US = 1000;
 // smaller interactive timeout schedule below.
 constexpr uint64_t VFS_PROXY_OP_TIMEOUT_US = 60'000'000;
 constexpr uint64_t VFS_PROXY_SLOT_WAIT_TIMEOUT_US = VFS_PROXY_OP_TIMEOUT_US;
+static_assert(sizeof(DevOpReqPayload) <= WKI_ETH_MAX_PAYLOAD);
+static_assert(WKI_ETH_MAX_PAYLOAD <= UINT16_MAX);
 
 auto remote_vfs_strip_mount_prefix(const ker::vfs::MountPoint* mount, const char* path) -> const char* {
     if (mount == nullptr || path == nullptr) {
@@ -2191,7 +2193,7 @@ void deactivate_vfs_proxy_locked(ProxyVfsState* state, PendingProxyTeardown& tea
 }
 
 // Helper: send DEV_OP_REQ and wait for response
-auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, uint16_t req_data_len, void* resp_buf,
+auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, size_t req_data_len, void* resp_buf,
                              uint16_t resp_buf_max, uint16_t* resp_len_out = nullptr, uint64_t wait_timeout_us = VFS_PROXY_OP_TIMEOUT_US,
                              RoceTaggedReceive* tagged_receive = nullptr) -> int {
     uint64_t const CALLSITE = WOS_PERF_CALLSITE();
@@ -2201,18 +2203,23 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
         *resp_len_out = 0;
     }
 
-    auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + req_data_len);
-    auto* req_buf = new (std::nothrow) uint8_t[req_total];
-    if (req_buf == nullptr) {
-        return -ENOMEM;
+    if (req_data_len > WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload)) {
+        return -EMSGSIZE;
     }
+    if (req_data_len > 0 && req_data == nullptr) {
+        return -EINVAL;
+    }
+    auto const REQ_DATA_LEN = static_cast<uint16_t>(req_data_len);
+    size_t const REQ_TOTAL = sizeof(DevOpReqPayload) + req_data_len;
 
-    auto* req = reinterpret_cast<DevOpReqPayload*>(req_buf);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): every transmitted byte is initialized below.
+    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> req_buf;
+    auto* req = reinterpret_cast<DevOpReqPayload*>(req_buf.data());
     req->op_id = op_id;
-    req->data_len = req_data_len;
+    req->data_len = REQ_DATA_LEN;
 
-    if (req_data_len > 0 && req_data != nullptr) {
-        memcpy(req_buf + sizeof(DevOpReqPayload), req_data, req_data_len);
+    if (req_data_len > 0) {
+        memcpy(req_buf.data() + sizeof(DevOpReqPayload), req_data, req_data_len);
     }
 
     // Serialize until we can claim the proxy for this operation.
@@ -2224,7 +2231,6 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
                               PROXY_WAIT_US, CALLSITE);
     }
     if (SLOT_RET != WKI_OK) {
-        delete[] req_buf;
         return encode_proxy_wki_status(SLOT_RET);
     }
 
@@ -2232,7 +2238,6 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
     uint16_t expected_seq = 0;
     if (!peek_channel_tx_seq16(CHANNEL_IDENTITY, &expected_seq)) {
         unlock_proxy_slot_and_wake_next(state);
-        delete[] req_buf;
         return -EIO;
     }
     uint32_t const CORRELATION = expected_seq;
@@ -2240,7 +2245,6 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
     if (tagged_receive != nullptr) {
         if (tagged_receive->rkey == 0 || !wki_roce_region_prepare_tagged_write(tagged_receive->rkey, expected_seq)) {
             unlock_proxy_slot_and_wake_next(state);
-            delete[] req_buf;
             return -EIO;
         }
         tagged_receive->cookie = expected_seq;
@@ -2264,10 +2268,10 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
     uint64_t const STARTED_US = wki_now_us();
     ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id),
                                      ker::mod::perf::WkiPerfPhase::BEGIN, state->owner_node, state->assigned_channel, CORRELATION, 0,
-                                     req_data_len, CALLSITE);
+                                     REQ_DATA_LEN, CALLSITE);
 
-    int const SEND_RET = wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf, req_total);
-    delete[] req_buf;
+    int const SEND_RET =
+        wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(REQ_TOTAL));
 
     if (SEND_RET != WKI_OK) {
         cancel_proxy_op_wait(state, wait, OP_GENERATION, SEND_RET);
@@ -2276,7 +2280,7 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
                                          perf_vfs_op(op_id), ker::mod::perf::WkiPerfPhase::END, state->owner_node, state->assigned_channel,
                                          CORRELATION, SEND_RET, ELAPSED_US, CALLSITE);
         ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id), state->owner_node,
-                                           state->assigned_channel, SEND_RET, ELAPSED_US, true, 0, req_data_len);
+                                           state->assigned_channel, SEND_RET, ELAPSED_US, true, 0, REQ_DATA_LEN);
         ker::mod::dbg::log("[WKI] vfs_proxy_send_and_wait send failed: node=0x%04x ch=%u op=%u rc=%d", state->owner_node,
                            state->assigned_channel, op_id, SEND_RET);
         return encode_proxy_wki_status(SEND_RET);
@@ -2290,7 +2294,7 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
                                          perf_vfs_op(op_id), ker::mod::perf::WkiPerfPhase::END, state->owner_node, state->assigned_channel,
                                          CORRELATION, WAIT_RC, ELAPSED_US, CALLSITE);
         ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id), state->owner_node,
-                                           state->assigned_channel, WAIT_RC, ELAPSED_US, true, 0, req_data_len);
+                                           state->assigned_channel, WAIT_RC, ELAPSED_US, true, 0, REQ_DATA_LEN);
         if (WAIT_RC == WKI_ERR_TIMEOUT) {
             ker::mod::dbg::log("[WKI] vfs_proxy_send_and_wait timeout: node=0x%04x ch=%u op=%u wait_us=%llu", state->owner_node,
                                state->assigned_channel, op_id, static_cast<unsigned long long>(wait_timeout_us));
@@ -2317,7 +2321,7 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
                                      ker::mod::perf::WkiPerfPhase::END, state->owner_node, state->assigned_channel, CORRELATION, STATUS,
                                      ELAPSED_US, CALLSITE);
     ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id), state->owner_node,
-                                       state->assigned_channel, STATUS, ELAPSED_US, true, 0, perf_vfs_bytes(op_id, req_data_len, RESP_LEN));
+                                       state->assigned_channel, STATUS, ELAPSED_US, true, 0, perf_vfs_bytes(op_id, REQ_DATA_LEN, RESP_LEN));
 
     if (resp_len_out != nullptr) {
         *resp_len_out = RESP_LEN;
@@ -2335,7 +2339,7 @@ void remote_vfs_close_remote_fd_best_effort(ProxyVfsState* state, int32_t remote
         vfs_proxy_send_and_wait(state, OP_VFS_CLOSE, reinterpret_cast<const uint8_t*>(&remote_fd), sizeof(remote_fd), nullptr, 0));
 }
 
-auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, uint16_t req_data_len) -> int {
+auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, size_t req_data_len) -> int {
     if (state == nullptr) {
         return -EINVAL;
     }
@@ -2343,18 +2347,23 @@ auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_
     uint64_t const CALLSITE = WOS_PERF_CALLSITE();
     uint64_t const PROXY_WAIT_START = wki_now_us();
 
-    auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + req_data_len);
-    auto* req_buf = new (std::nothrow) uint8_t[req_total];
-    if (req_buf == nullptr) {
-        return -ENOMEM;
+    if (req_data_len > WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload)) {
+        return -EMSGSIZE;
     }
+    if (req_data_len > 0 && req_data == nullptr) {
+        return -EINVAL;
+    }
+    auto const REQ_DATA_LEN = static_cast<uint16_t>(req_data_len);
+    size_t const REQ_TOTAL = sizeof(DevOpReqPayload) + req_data_len;
 
-    auto* req = reinterpret_cast<DevOpReqPayload*>(req_buf);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): every transmitted byte is initialized below.
+    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> req_buf;
+    auto* req = reinterpret_cast<DevOpReqPayload*>(req_buf.data());
     req->op_id = op_id;
-    req->data_len = req_data_len;
+    req->data_len = REQ_DATA_LEN;
 
-    if (req_data_len > 0 && req_data != nullptr) {
-        memcpy(req_buf + sizeof(DevOpReqPayload), req_data, req_data_len);
+    if (req_data_len > 0) {
+        memcpy(req_buf.data() + sizeof(DevOpReqPayload), req_data, req_data_len);
     }
 
     int const SLOT_RET = acquire_proxy_untracked_send_slot_locked(state, PROXY_WAIT_START);
@@ -2364,7 +2373,6 @@ auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_
                               PROXY_WAIT_US, CALLSITE);
     }
     if (SLOT_RET != WKI_OK) {
-        delete[] req_buf;
         return normalize_proxy_status_for_errno(encode_proxy_wki_status(SLOT_RET));
     }
 
@@ -2373,7 +2381,6 @@ auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_
     if (!peek_channel_tx_seq16(CHANNEL_IDENTITY, &expected_seq)) {
         state->op_untracked_send_pending.store(false, std::memory_order_release);
         unlock_proxy_slot_and_wake_next(state);
-        delete[] req_buf;
         return -EIO;
     }
     uint32_t const CORRELATION = expected_seq;
@@ -2382,10 +2389,10 @@ auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_
     uint64_t const STARTED_US = wki_now_us();
     ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id),
                                      ker::mod::perf::WkiPerfPhase::BEGIN, state->owner_node, state->assigned_channel, CORRELATION, 0,
-                                     req_data_len, CALLSITE);
+                                     REQ_DATA_LEN, CALLSITE);
 
-    int const SEND_RET = wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf, req_total);
-    delete[] req_buf;
+    int const SEND_RET =
+        wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(REQ_TOTAL));
 
     state->lock.lock();
     state->op_untracked_send_pending.store(false, std::memory_order_release);
@@ -2396,7 +2403,7 @@ auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_
                                      ker::mod::perf::WkiPerfPhase::END, state->owner_node, state->assigned_channel, CORRELATION, SEND_RET,
                                      ELAPSED_US, CALLSITE);
     ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(op_id), state->owner_node,
-                                       state->assigned_channel, SEND_RET, ELAPSED_US, true, 0, req_data_len);
+                                       state->assigned_channel, SEND_RET, ELAPSED_US, true, 0, REQ_DATA_LEN);
 
     return normalize_proxy_status_for_errno(encode_proxy_wki_status(SEND_RET));
 }
@@ -2460,31 +2467,17 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
     memcpy(ctrl.data() + 4, &offset, sizeof(int64_t));
     memcpy(ctrl.data() + 12, &chunk, sizeof(uint32_t));
 
-    auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + ctrl.size());
-    auto* req_buf = new (std::nothrow) uint8_t[req_total];
-    if (req_buf == nullptr) {
-        cancel_proxy_op_wait(state, wait, OP_GENERATION, -ENOMEM);
-
-        auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
-        ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS,
-                                         perf_vfs_op(OP_VFS_WRITE_RDMA), ker::mod::perf::WkiPerfPhase::END, state->owner_node,
-                                         state->assigned_channel, CORRELATION, -ENOMEM, ELAPSED_US, CALLSITE);
-        ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, perf_vfs_op(OP_VFS_WRITE_RDMA), state->owner_node,
-                                           state->assigned_channel, -ENOMEM, ELAPSED_US, true, 0, 0);
-        return -ENOMEM;
-    }
-
-    auto* req = reinterpret_cast<DevOpReqPayload*>(req_buf);
+    std::array<uint8_t, sizeof(DevOpReqPayload) + 16> req_buf = {};
+    auto* req = reinterpret_cast<DevOpReqPayload*>(req_buf.data());
     req->op_id = OP_VFS_WRITE_RDMA;
     req->data_len = static_cast<uint16_t>(ctrl.size());
-    memcpy(req_buf + sizeof(DevOpReqPayload), ctrl.data(), ctrl.size());
+    memcpy(req_buf.data() + sizeof(DevOpReqPayload), ctrl.data(), ctrl.size());
 
     bool const CONTROL_FIRST = transport_is_roce(state->rdma_transport);
     if (!CONTROL_FIRST) {
         int const RDMA_RET =
             state->rdma_transport->rdma_write(state->rdma_transport, state->owner_node, state->rdma_server_write_rkey, 0, src, chunk);
         if (RDMA_RET != 0) {
-            delete[] req_buf;
             cancel_proxy_op_wait(state, wait, OP_GENERATION, RDMA_RET);
 
             auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
@@ -2497,8 +2490,8 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
         }
     }
 
-    int const SEND_RET = wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf, req_total);
-    delete[] req_buf;
+    int const SEND_RET =
+        wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(req_buf.size()));
     if (SEND_RET != WKI_OK) {
         cancel_proxy_op_wait(state, wait, OP_GENERATION, SEND_RET);
 
@@ -6252,12 +6245,13 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
     // Build request: {flags:u32, mode:u32, path_len:u16, path[N], optional prefetch_rkey:u32, prefetch_len:u32}
     size_t const PATH_LEN = strlen(fs_relative_path);
     size_t const REQ_FIXED_LEN = OPEN_REQ_BASE_LEN + (send_open_prefetch ? OPEN_PREFETCH_REQ_LEN : 0);
-    if (PATH_LEN > UINT16_MAX - REQ_FIXED_LEN) {
+    if (REQ_FIXED_LEN > WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload) ||
+        PATH_LEN > WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload) - REQ_FIXED_LEN) {
         return nullptr;
     }
     auto path_len = static_cast<uint16_t>(PATH_LEN);
-    auto req_data_len = static_cast<uint16_t>(OPEN_REQ_BASE_LEN + path_len + (send_open_prefetch ? OPEN_PREFETCH_REQ_LEN : 0));
-    auto* req_data = new (std::nothrow) uint8_t[req_data_len];
+    size_t const REQ_DATA_LEN = REQ_FIXED_LEN + PATH_LEN;
+    auto* req_data = new (std::nothrow) uint8_t[REQ_DATA_LEN];
     if (req_data == nullptr) {
         return nullptr;
     }
@@ -6286,7 +6280,7 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
         tagged_receive_ptr = &tagged_receive;
     }
 
-    int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_OPEN, req_data, req_data_len, &open_resp, sizeof(open_resp), &open_resp_len,
+    int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_OPEN, req_data, REQ_DATA_LEN, &open_resp, sizeof(open_resp), &open_resp_len,
                                                VFS_PROXY_OP_TIMEOUT_US, tagged_receive_ptr);
     delete[] req_data;
 
