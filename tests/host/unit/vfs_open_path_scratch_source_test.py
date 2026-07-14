@@ -268,6 +268,190 @@ def test_absolute_visible_scratch_is_initialized_by_dot_clean_producer() -> None
         fail("canonicalize-to-root destination poison must immediately precede the producer call")
 
 
+def test_prefix_symlink_scratch_is_initialized_by_its_producers() -> None:
+    core = VFS_CORE_CPP.read_text()
+    resolve_prefix = function_body(core, "resolve_prefix_symlink_once")
+    splice = function_body(core, "splice_symlink_target")
+    canonicalize = function_body(core, "canonicalize_path")
+    copy_path = function_body(core, "copy_path_string")
+    path_helper_selftest = function_body(core, "vfs_selftest_path_text_scan_matches_helpers")
+    access_selftest = function_body(core, "vfs_selftest_faccessat_flags")
+
+    linkbuf_declaration = "std::array<char, MAX_PATH_LEN> linkbuf __attribute__((uninitialized));"
+    substituted_declaration = "std::array<char, MAX_PATH_LEN> substituted __attribute__((uninitialized));"
+    require_only_uninitialized_array(resolve_prefix, "linkbuf", linkbuf_declaration, "prefix readlink scratch")
+    require_only_uninitialized_array(resolve_prefix, "substituted", substituted_declaration, "prefix substitution scratch")
+
+    require_order(
+        resolve_prefix,
+        [
+            linkbuf_declaration,
+            "path[end] = '\\0'",
+            "readlink_resolved_on_mount(path, linkbuf.data(), linkbuf.size() - 1, current_path_mount, end)",
+            "readlink_resolved(path, linkbuf.data(), linkbuf.size() - 1, end)",
+            "path[end] = CH",
+            "if (LINK_LEN > 0)",
+            "if (static_cast<size_t>(LINK_LEN) >= linkbuf.size())",
+            "return -ENAMETOOLONG",
+            "linkbuf[LINK_LEN] = '\\0'",
+            substituted_declaration,
+            "int const SPLICE_RESULT = splice_symlink_target(path, end, linkbuf.data(), substituted.data(), substituted.size())",
+            "if (SPLICE_RESULT < 0)",
+            "return SPLICE_RESULT",
+            "int const COPY_RESULT = copy_path_string(substituted.data(), path, bufsize)",
+            "if (COPY_RESULT < 0)",
+            "return COPY_RESULT",
+            "if (linkbuf[0] == '/')",
+        ],
+        "prefix symlink scratch producer and consumer ordering",
+    )
+    positive = block_body_after(resolve_prefix, "if (LINK_LEN > 0)")
+    length_failure = block_body_after(positive, "if (static_cast<size_t>(LINK_LEN) >= linkbuf.size())")
+    splice_failure = block_body_after(positive[positive.find("if (SPLICE_RESULT < 0)") :], "if (SPLICE_RESULT < 0)")
+    copy_failure = block_body_after(positive[positive.find("if (COPY_RESULT < 0)") :], "if (COPY_RESULT < 0)")
+    if (
+        length_failure.strip() != "return -ENAMETOOLONG;"
+        or splice_failure.strip() != "return SPLICE_RESULT;"
+        or copy_failure.strip() != "return COPY_RESULT;"
+    ):
+        fail("prefix symlink partial output must not be consumed after a producer failure")
+    if (
+        resolve_prefix.count("linkbuf.data()") != 3
+        or resolve_prefix.count("linkbuf.size() - 1") != 2
+        or resolve_prefix.count("linkbuf[") != 2
+        or len(re.findall(r"\blinkbuf\b", resolve_prefix)) != 9
+        or len(re.findall(r"\blinkbuf\b", positive)) != 4
+    ):
+        fail("prefix readlink scratch has an unexpected producer or consumer")
+    if (
+        resolve_prefix.count("substituted.data()") != 2
+        or resolve_prefix.count("substituted.size()") != 1
+        or "substituted[" in resolve_prefix
+        or len(re.findall(r"\bsubstituted\b", resolve_prefix)) != 4
+    ):
+        fail("prefix substitution scratch has an unexpected producer or consumer")
+
+    require_order(
+        splice,
+        [
+            "size_t const REMAINDER_LEN = std::strlen(remainder)",
+            "size_t const TARGET_LEN = std::strlen(target)",
+            "if (target[0] == '/')",
+            "std::memcpy(out, target, TARGET_LEN)",
+            "std::memcpy(out, original_path, parent_len)",
+            "std::memcpy(out + pos, target, TARGET_LEN)",
+            "if (REMAINDER_LEN > 0)",
+            "return canonicalize_path(out, out_size)",
+        ],
+        "symlink target splice construction",
+    )
+    if len(re.findall(r"\bout\b", splice)) != 11:
+        fail("symlink target splice has an unexpected output-buffer producer or consumer")
+    forbid(
+        splice,
+        ["memset", "bzero", "std::fill", "std::ranges::fill", "fill_n"],
+        "symlink target splice output must not be bulk-cleared",
+    )
+    remainder_tail = splice[splice.find("if (REMAINDER_LEN > 0)") :]
+    remainder_body = block_body_after(remainder_tail, "if (REMAINDER_LEN > 0)")
+    else_pos = remainder_tail.find("} else {")
+    if else_pos < 0:
+        fail("symlink target splice is missing its empty-remainder branch")
+    empty_remainder_body = block_body_after(remainder_tail[else_pos + 2 :], "else")
+    require_order(
+        remainder_body,
+        [
+            "if (pos == 0 || out[pos - 1] != '/')",
+            "if (pos + REMAINDER_LEN + 1 > out_size)",
+            "std::memcpy(out + pos, remainder, REMAINDER_LEN + 1)",
+        ],
+        "symlink splice remainder termination",
+    )
+    forbid(remainder_body, ["out[pos] = '\\0'"], "nonempty symlink remainder termination")
+    require_order(
+        empty_remainder_body,
+        ["if (pos >= out_size)", "return -ENAMETOOLONG", "out[pos] = '\\0'"],
+        "empty symlink remainder termination",
+    )
+    forbid(empty_remainder_body, ["REMAINDER_LEN + 1"], "empty symlink remainder production")
+    returns = re.findall(r"\breturn\s+([^;]+);", splice)
+    if (
+        returns[-1:] != ["canonicalize_path(out, out_size)"]
+        or returns.count("canonicalize_path(out, out_size)") != 1
+        or any(result not in {"-EINVAL", "-ENAMETOOLONG", "canonicalize_path(out, out_size)"} for result in returns)
+    ):
+        fail("symlink target splice must not report success before producing and canonicalizing a complete string")
+    require_order(
+        canonicalize,
+        [
+            "for (; path_len < bufsize && path[path_len] != '\\0'; ++path_len)",
+            "if (path_len == bufsize)",
+            "if (!needs_rewrite)",
+            "result[pos] = '\\0'",
+            "std::memcpy(path, static_cast<const char*>(result), pos + 1)",
+            "return 0",
+        ],
+        "canonicalized splice preserves a complete terminated string",
+    )
+    require_order(
+        copy_path,
+        [
+            "size_t const LEN = known_src_len != UNKNOWN_PATH_LEN ? known_src_len : std::strlen(src)",
+            "if (LEN + 1 > dst_size)",
+            "std::memcpy(dst, src, LEN + 1)",
+            "return 0",
+        ],
+        "successful substitution copy",
+    )
+
+    require_order(
+        path_helper_selftest,
+        [
+            "spliced.fill('x')",
+            'splice_symlink_target("/base/link/tail", sizeof("/base/link") - 1, "../target/./dir"',
+            'RELATIVE_EXPECTED = "/target/dir/tail"',
+            "spliced.at(std::strlen(RELATIVE_EXPECTED)) != '\\0'",
+            "spliced.fill('x')",
+            'splice_symlink_target("/base/link", sizeof("/base/link") - 1, "/"',
+            "spliced.at(1) != '\\0'",
+            "spliced.fill('x')",
+            'splice_symlink_target("/base/link", sizeof("/base/link") - 1, "child/../leaf"',
+            'RELATIVE_FINAL_EXPECTED = "/base/leaf"',
+            "spliced.at(std::strlen(RELATIVE_FINAL_EXPECTED)) != '\\0'",
+            "spliced.fill('x')",
+            'splice_symlink_target("/base/link/tail", sizeof("/base/link") - 1, "/absolute/./dir"',
+            'ABSOLUTE_REMAINDER_EXPECTED = "/absolute/dir/tail"',
+            "spliced.at(std::strlen(ABSOLUTE_REMAINDER_EXPECTED)) != '\\0'",
+        ],
+        "poisoned symlink splice KTEST coverage",
+    )
+    poison = "spliced.fill('x');"
+    splice_calls = [
+        'int splice_ret = splice_symlink_target("/base/link/tail", sizeof("/base/link") - 1, "../target/./dir", spliced.data(), spliced.size());',
+        'splice_ret = splice_symlink_target("/base/link", sizeof("/base/link") - 1, "/", spliced.data(), spliced.size());',
+        'splice_ret = splice_symlink_target("/base/link", sizeof("/base/link") - 1, "child/../leaf", spliced.data(), spliced.size());',
+        'splice_ret = splice_symlink_target("/base/link/tail", sizeof("/base/link") - 1, "/absolute/./dir", spliced.data(), spliced.size());',
+    ]
+    if path_helper_selftest.count("spliced.fill(") != len(splice_calls) or path_helper_selftest.count(poison) != len(splice_calls):
+        fail("every symlink splice coverage case must preserve its poisoned destination")
+    cursor = 0
+    for splice_call in splice_calls:
+        poison_pos = path_helper_selftest.find(poison, cursor)
+        splice_pos = path_helper_selftest.find(splice_call, poison_pos + len(poison))
+        if poison_pos < 0 or splice_pos < 0 or path_helper_selftest[poison_pos + len(poison) : splice_pos].strip():
+            fail("symlink splice destination poison must immediately precede each producer call")
+        cursor = splice_pos + len(splice_call)
+    require_order(
+        access_selftest,
+        [
+            "vfs_symlink(MISSING_TARGET, LINK_PATH)",
+            "vfs_cache_notify_path_changed(LINK_PATH, nullptr)",
+            "vfs_faccessat(&task, AT_FDCWD, LINK_PATH, 0, 0) == -ENOENT",
+        ],
+        "uncached positive tmpfs prefix-symlink KTEST coverage",
+    )
+
+
 def test_open_path_scratch_is_initialized_by_its_producers() -> None:
     core = VFS_CORE_CPP.read_text()
 
@@ -380,5 +564,6 @@ def test_open_path_scratch_is_initialized_by_its_producers() -> None:
 if __name__ == "__main__":
     test_dirfd_visible_scratch_is_initialized_by_root_strip()
     test_absolute_visible_scratch_is_initialized_by_dot_clean_producer()
+    test_prefix_symlink_scratch_is_initialized_by_its_producers()
     test_open_path_scratch_is_initialized_by_its_producers()
     print("VFS open path scratch invariants hold")

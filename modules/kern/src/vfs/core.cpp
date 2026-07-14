@@ -6320,7 +6320,9 @@ auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_pol
         scan_start = CACHED_PREFIX_LEN + 1;
     }
 
-    std::array<char, MAX_PATH_LEN> linkbuf{};
+    // A positive readlink result initializes every returned byte; the caller appends the terminator below.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> linkbuf __attribute__((uninitialized));
     for (size_t end = scan_start;; ++end) {
         char const CH = path[end];
         if (CH != '/' && CH != '\0') {
@@ -6346,10 +6348,15 @@ auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_pol
                                      : readlink_resolved(path, linkbuf.data(), linkbuf.size() - 1, end);
         path[end] = CH;
         if (LINK_LEN > 0) {
+            if (static_cast<size_t>(LINK_LEN) >= linkbuf.size()) {
+                return -ENAMETOOLONG;
+            }
             symlink_prefix_cache_store(path, clean_prefix_len, current_path_mount);
             linkbuf[LINK_LEN] = '\0';
 
-            std::array<char, MAX_PATH_LEN> substituted{};
+            // splice_symlink_target initializes the complete canonical NUL-terminated path on success.
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+            std::array<char, MAX_PATH_LEN> substituted __attribute__((uninitialized));
             int const SPLICE_RESULT = splice_symlink_target(path, end, linkbuf.data(), substituted.data(), substituted.size());
             if (SPLICE_RESULT < 0) {
                 return SPLICE_RESULT;
@@ -7298,6 +7305,36 @@ auto vfs_selftest_path_text_scan_matches_helpers() -> bool {
             SCAN.needs_canonicalize != path_text_needs_canonicalize(path, PATH_LEN)) {
             return false;
         }
+    }
+
+    std::array<char, MAX_PATH_LEN> spliced{};
+    spliced.fill('x');
+    int splice_ret = splice_symlink_target("/base/link/tail", sizeof("/base/link") - 1, "../target/./dir", spliced.data(), spliced.size());
+    constexpr const char* RELATIVE_EXPECTED = "/target/dir/tail";
+    if (splice_ret != 0 || std::strcmp(spliced.data(), RELATIVE_EXPECTED) != 0 || spliced.at(std::strlen(RELATIVE_EXPECTED)) != '\0') {
+        return false;
+    }
+
+    spliced.fill('x');
+    splice_ret = splice_symlink_target("/base/link", sizeof("/base/link") - 1, "/", spliced.data(), spliced.size());
+    if (splice_ret != 0 || std::strcmp(spliced.data(), "/") != 0 || spliced.at(1) != '\0') {
+        return false;
+    }
+
+    spliced.fill('x');
+    splice_ret = splice_symlink_target("/base/link", sizeof("/base/link") - 1, "child/../leaf", spliced.data(), spliced.size());
+    constexpr const char* RELATIVE_FINAL_EXPECTED = "/base/leaf";
+    if (splice_ret != 0 || std::strcmp(spliced.data(), RELATIVE_FINAL_EXPECTED) != 0 ||
+        spliced.at(std::strlen(RELATIVE_FINAL_EXPECTED)) != '\0') {
+        return false;
+    }
+
+    spliced.fill('x');
+    splice_ret = splice_symlink_target("/base/link/tail", sizeof("/base/link") - 1, "/absolute/./dir", spliced.data(), spliced.size());
+    constexpr const char* ABSOLUTE_REMAINDER_EXPECTED = "/absolute/dir/tail";
+    if (splice_ret != 0 || std::strcmp(spliced.data(), ABSOLUTE_REMAINDER_EXPECTED) != 0 ||
+        spliced.at(std::strlen(ABSOLUTE_REMAINDER_EXPECTED)) != '\0') {
+        return false;
     }
 
     PathTextScan const NULL_SCAN = scan_path_text(nullptr);
@@ -16998,6 +17035,7 @@ auto vfs_selftest_faccessat_flags() -> bool {
     vfs_put_file(created);
 
     ok = ok && vfs_symlink(MISSING_TARGET, LINK_PATH) == 0;
+    vfs_cache_notify_path_changed(LINK_PATH, nullptr);
     ok = ok && vfs_faccessat(&task, AT_FDCWD, LINK_PATH, 0, 0) == -ENOENT;
 
     VfsCachePerfSnapshot before_nofollow{};
