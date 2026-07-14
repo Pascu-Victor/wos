@@ -762,24 +762,24 @@ def test_stat_trailing_slash_scratch_is_initialized_by_trim_producer() -> None:
 
     declaration = "std::array<char, MAX_PATH_LEN> trimmed __attribute__((uninitialized));"
     require_only_uninitialized_array(fast_path, "trimmed", declaration, "trailing-slash stat scratch")
+    failure_gate = "if (!copy_trailing_slash_trimmed_path(path, SCAN, trimmed))"
     require_order(
         fast_path,
         [
             "task_absolute_local_trailing_slash_direct_allowed(task, path, SCAN)",
             declaration,
-            "if (!copy_trailing_slash_trimmed_path",
+            failure_gate,
             "*result_out = -ENAMETOOLONG",
             "return true",
             "vfs_stat_resolved_cache_or_impl(trimmed.data()",
         ],
         "trailing-slash stat scratch producer and consumer ordering",
     )
-    failure = block_body_after(
-        fast_path[fast_path.find("if (!copy_trailing_slash_trimmed_path") :],
-        "if (!copy_trailing_slash_trimmed_path",
-    )
+    failure = block_body_after(fast_path[fast_path.find(failure_gate) :], failure_gate)
     if failure.strip() != "*result_out = -ENAMETOOLONG;\n            return true;":
         fail("trailing-slash stat fast path must return before consuming failed scratch output")
+    if fast_path.count(failure_gate) != 1 or "goto" in fast_path:
+        fail("trailing-slash stat failure guard must not be weakened or bypassed")
     if len(re.findall(r"\btrimmed\b", fast_path)) != 3:
         fail("trailing-slash stat scratch has an unexpected producer or consumer")
 
@@ -806,6 +806,7 @@ def test_stat_trailing_slash_scratch_is_initialized_by_trim_producer() -> None:
             "memset(out.data()",
             "std::fill(out.",
             "std::ranges::fill(out.",
+            "goto",
         ],
         "trailing-slash path producer redundant destination clearing",
     )
@@ -826,6 +827,71 @@ def test_stat_trailing_slash_scratch_is_initialized_by_trim_producer() -> None:
         fail("trailing-slash stat poison must immediately precede exact content and terminator verification")
     if len(re.findall(r"\btrimmed\b", selftest)) != 5:
         fail("trailing-slash stat KTEST has unexpected scratch use")
+    if "goto" in selftest:
+        fail("trailing-slash stat KTEST verification must not be bypassed")
+
+
+def test_current_task_stat_scratch_is_initialized_by_dirfd_resolver() -> None:
+    core = VFS_CORE_CPP.read_text()
+    fast_path = function_body(core, "vfs_stat_current_task_fast_path")
+
+    declaration = "std::array<char, MAX_PATH_LEN> resolved __attribute__((uninitialized));"
+    require_only_uninitialized_array(fast_path, "resolved", declaration, "current-task stat resolved scratch")
+    failure_gate = (
+        "if (RESOLVE_RET < 0 || (!common_local_fast_path && "
+        "resolved_task_path_is_wki_entry(task, resolved.data())))"
+    )
+    producer_call = (
+        "int const RESOLVE_RET = resolve_dirfd_task_path_raw(task, AT_FDCWD, path, resolved.data(), resolved.size(), true, "
+        "&require_directory,\n"
+        "                                                        &resolved_len, &common_local_fast_path, &resolved_hash);"
+    )
+    producer_setup = (
+        "bool require_directory = false;\n"
+        "    size_t resolved_len = UNKNOWN_PATH_LEN;\n"
+        "    uint64_t resolved_hash = UNKNOWN_PATH_HASH;\n"
+        "    bool common_local_fast_path = false;\n"
+        f"    {producer_call}"
+    )
+    require_order(
+        fast_path,
+        [
+            "vfs_stat_absolute_local_fast_path(task, path, follow_final_symlink, statbuf, result_out)",
+            "return true",
+            declaration,
+            producer_setup,
+            failure_gate,
+            "return false",
+            "maybe_ensure_wki_host_root_mount_for_task(task, resolved.data())",
+            "vfs_stat_resolved_cache_or_impl(resolved.data()",
+        ],
+        "current-task stat resolved scratch producer and consumer ordering",
+    )
+    failure = block_body_after(fast_path[fast_path.find(failure_gate) :], failure_gate)
+    if failure.strip() != "return false;":
+        fail("current-task stat fast path must return before consuming failed resolved output")
+    declaration_pos = fast_path.find(declaration)
+    setup_pos = fast_path.find(producer_setup, declaration_pos + len(declaration))
+    if declaration_pos < 0 or setup_pos < 0 or fast_path[declaration_pos + len(declaration) : setup_pos].strip():
+        fail("current-task stat resolver setup must immediately follow the scratch declaration")
+    if fast_path.count(failure_gate) != 1:
+        fail("current-task stat resolver failure must short-circuit before WKI classification")
+    call_pos = fast_path.find(producer_call)
+    gate_pos = fast_path.find(failure_gate, call_pos + len(producer_call))
+    if call_pos < 0 or gate_pos < 0 or fast_path[call_pos + len(producer_call) : gate_pos].strip():
+        fail("current-task stat resolver failure gate must immediately follow the exact producer call")
+    if fast_path.count("resolve_dirfd_task_path_raw") != 2:
+        fail("current-task stat fast path must call the namespace resolver without local shadowing")
+    if "goto" in fast_path:
+        fail("current-task stat resolver and failure gate must not be bypassed")
+    expected_uses = {
+        "resolved": 6,
+        "RESOLVE_RET": 2,
+        "common_local_fast_path": 4,
+    }
+    for name, count in expected_uses.items():
+        if len(re.findall(rf"\b{re.escape(name)}\b", fast_path)) != count:
+            fail(f"current-task stat fast path has unexpected {name} use")
 
 
 def test_statat_scratch_is_initialized_by_dirfd_resolver() -> None:
@@ -1060,6 +1126,7 @@ if __name__ == "__main__":
     test_readdir_child_path_scratch_is_initialized_by_its_producer()
     test_synthetic_readdir_visible_paths_are_initialized_by_root_strip()
     test_stat_trailing_slash_scratch_is_initialized_by_trim_producer()
+    test_current_task_stat_scratch_is_initialized_by_dirfd_resolver()
     test_statat_scratch_is_initialized_by_dirfd_resolver()
     test_open_path_scratch_is_initialized_by_its_producers()
     print("VFS open path scratch invariants hold")

@@ -10848,7 +10848,9 @@ auto vfs_stat_current_task_fast_path(const char* path, bool follow_final_symlink
         return true;
     }
 
-    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // resolve_dirfd_task_path_raw initializes the complete NUL-terminated string on success.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> resolved __attribute__((uninitialized));
     bool require_directory = false;
     size_t resolved_len = UNKNOWN_PATH_LEN;
     uint64_t resolved_hash = UNKNOWN_PATH_HASH;
