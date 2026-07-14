@@ -79,6 +79,35 @@ def test_pipe_pump_read_waiter_uses_event_block_fast_path() -> None:
         fail("pipe pump read fast path must not use timer polling after registering a poll waiter")
 
 
+def test_pipe_pump_reuses_worker_stack_frame() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    body = function_body(remote_ipc, "pipe_pump_thread_fn")
+    required = [
+        "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> msg __attribute__((uninitialized))",
+        "file->fops->vfs_read(file, msg.data() + HEADER_SIZE, BUF_SIZE, 0)",
+        "reinterpret_cast<DevOpReqPayload*>(msg.data())",
+        "std::memcpy(msg.data() + sizeof(DevOpReqPayload), &resource_id, sizeof(uint32_t))",
+        "wki_send(target, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg.data()",
+        "static_cast<uint16_t>(HEADER_SIZE + n)",
+        "static_cast<uint16_t>(HEADER_SIZE)",
+    ]
+    missing = [token for token in required if token not in body]
+    if missing:
+        fail("pipe pump must reuse one worker-private stack frame: " + ", ".join(missing))
+    require_order(body, required[0], "for (;;)", "pipe pump frame lifetime")
+    if body.count("wki_send(target, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg.data()") != 2:
+        fail("pipe pump must send exact DATA and EOF prefixes from its stack frame")
+    for forbidden in ["new (std::nothrow) uint8_t[HEADER_SIZE + BUF_SIZE]", "delete[] msg", "IPC pump: malloc failed"]:
+        if forbidden in body:
+            fail(f"pipe pump must not allocate its reusable wire frame: {forbidden}")
+    for assertion in [
+        "WKI_IPC_PIPE_DATA_HEADER_SIZE + WKI_IPC_PIPE_DATA_MAX_CHUNK == WKI_ETH_MAX_PAYLOAD",
+        "WKI_ETH_MAX_PAYLOAD <= ker::mod::mm::KERNEL_STACK_SIZE / 16",
+    ]:
+        if assertion not in remote_ipc:
+            fail(f"pipe pump stack frame bound is missing {assertion!r}")
+
+
 def test_inactive_proxy_poll_reports_terminal_readiness() -> None:
     pipe_body = function_body(REMOTE_IPC_CPP.read_text(), "proxy_pipe_poll_check")
     socket_body = function_body(REMOTE_IPC_SOCKET_CPP.read_text(), "proxy_socket_poll_check")
@@ -837,6 +866,7 @@ def main() -> None:
     test_poll_wake_drains_all_batches()
     test_proxy_poll_wake_cancels_deferred_switch_without_losing_wake_token()
     test_pipe_pump_read_waiter_uses_event_block_fast_path()
+    test_pipe_pump_reuses_worker_stack_frame()
     test_inactive_proxy_poll_reports_terminal_readiness()
     test_epoll_close_releases_lookup_ref_after_detach()
     test_proxy_lookup_is_peer_scoped()

@@ -2594,6 +2594,10 @@ auto register_poll_write_waiter(ker::vfs::File* file, bool* ready_now) -> bool {
 template <int SLOT>
 [[noreturn]] void pipe_pump_thread_fn() {
     auto* arg = &std::get<SLOT>(g_pump_args);
+    // Each DATA/EOF send initializes its exact transmitted prefix. Keep the
+    // unused bounded tail untouched while this worker reuses the frame.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> msg __attribute__((uninitialized));
 
     for (;;) {
         auto* exp = arg->exp.load(std::memory_order_acquire);
@@ -2625,16 +2629,6 @@ template <int SLOT>
 
         constexpr size_t HEADER_SIZE = WKI_IPC_PIPE_DATA_HEADER_SIZE;
         constexpr size_t BUF_SIZE = WKI_IPC_PIPE_DATA_MAX_CHUNK;
-        auto* msg = new (std::nothrow) uint8_t[HEADER_SIZE + BUF_SIZE];
-        if (msg == nullptr) {
-            delete[] msg;
-            ipc_release_file_ref(file);
-            uint64_t const IRQF = s_ipc_lock.lock_irqsave();
-            release_pipe_pump_slot_locked(*arg, exp);
-            s_ipc_lock.unlock_irqrestore(IRQF);
-            ker::mod::dbg::log("[WKI] IPC pump: malloc failed for resource_id=%u", resource_id);
-            continue;
-        }
 #ifdef DEBUG_WKI_IPC
         ker::mod::dbg::log("[WKI] IPC pipe pump started: resource_id=%u target=0x%04x", resource_id, target);
 #endif
@@ -2649,17 +2643,17 @@ template <int SLOT>
             IpcPerfTrace read_trace(ker::mod::perf::WkiPerfIpcOp::PIPE_PUMP_READ, target, WKI_CHAN_RESOURCE, WOS_PERF_CALLSITE());
             ssize_t n = 0;
             if (file != nullptr && file->fops != nullptr && file->fops->vfs_read != nullptr) {
-                n = clamp_io_count(file->fops->vfs_read(file, msg + HEADER_SIZE, BUF_SIZE, 0), BUF_SIZE);
+                n = clamp_io_count(file->fops->vfs_read(file, msg.data() + HEADER_SIZE, BUF_SIZE, 0), BUF_SIZE);
             } else {
                 break;
             }
             read_trace.finish(n >= 0 ? 0 : static_cast<int32_t>(n), n > 0 ? static_cast<uint64_t>(n) : 0);
 
             if (n > 0) {
-                auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
+                auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
                 req->op_id = OP_PIPE_DATA;
                 req->data_len = static_cast<uint16_t>(sizeof(uint32_t) + n);
-                std::memcpy(msg + sizeof(DevOpReqPayload), &resource_id, sizeof(uint32_t));
+                std::memcpy(msg.data() + sizeof(DevOpReqPayload), &resource_id, sizeof(uint32_t));
 
                 IpcPerfTrace send_trace(ker::mod::perf::WkiPerfIpcOp::PIPE_PUMP_SEND, target, WKI_CHAN_IPC_DATA, WOS_PERF_CALLSITE(),
                                         static_cast<uint32_t>(n));
@@ -2668,7 +2662,7 @@ template <int SLOT>
                 uint64_t const SEND_STARTED_US = wki_now_us();
                 uint64_t last_send_diag_us = 0;
                 while (exp->active && exp->pump_running.load(std::memory_order_acquire)) {
-                    ret = wki_send(target, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(HEADER_SIZE + n));
+                    ret = wki_send(target, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(HEADER_SIZE + n));
                     if (ret == WKI_OK) {
                         break;
                     }
@@ -2686,10 +2680,10 @@ template <int SLOT>
                     break;
                 }
             } else if (n == 0) {
-                auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
+                auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
                 req->op_id = OP_PIPE_CLOSE_WRITE;
                 req->data_len = sizeof(uint32_t);
-                std::memcpy(msg + sizeof(DevOpReqPayload), &resource_id, sizeof(uint32_t));
+                std::memcpy(msg.data() + sizeof(DevOpReqPayload), &resource_id, sizeof(uint32_t));
                 int ret = WKI_ERR_TX_FAILED;
                 uint32_t retries = 0;
                 uint32_t attempts = 0;
@@ -2698,7 +2692,7 @@ template <int SLOT>
                 while (exp->active && (exp->pump_running.load(std::memory_order_acquire) || attempts == 0) &&
                        attempts < WKI_IPC_PIPE_EOF_MAX_SEND_ATTEMPTS) {
                     attempts++;
-                    ret = wki_send(target, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(HEADER_SIZE));
+                    ret = wki_send(target, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(HEADER_SIZE));
                     if (ret == WKI_OK) {
                         break;
                     }
@@ -2736,7 +2730,6 @@ template <int SLOT>
             }
         }
 
-        delete[] msg;
         ipc_release_file_ref(file);
         WkiIpcExport* retired_exports = nullptr;
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
