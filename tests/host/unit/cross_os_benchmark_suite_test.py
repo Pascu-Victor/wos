@@ -626,6 +626,7 @@ def test_wos_showcase_metrics_plumbing(runner) -> None:
         {"benchmark": "wos_git_checkout", "sequence": 2},
         {"benchmark": "wos_python_sha256", "sequence": 3},
         {"benchmark": "wos_python_json", "sequence": 4},
+        {"benchmark": "wos_file_move", "sequence": 5},
     ]
     fetches: list[tuple[str, Path]] = []
     optional_fetches: list[tuple[str, Path]] = []

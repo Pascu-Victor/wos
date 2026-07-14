@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixed-total, all-node Git and Python showcase workloads for WOS."""
+"""Fixed-total, all-node file-move, Git, and Python showcase workloads for WOS."""
 
 from __future__ import annotations
 
@@ -17,11 +17,40 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, BinaryIO, Iterable, Sequence
 
 TOTAL_JOBS = 32
 MAX_HOSTS = 4
 EVIDENCE_CONTRACT = "wos-showcase-job-map-v1"
+FILE_MOVE_WORKLOAD_ID = "wos-showcase-file-move-v1"
+FILE_MOVE_OPERATION = "stream-copy-read-write-close"
+FILE_MOVE_SOURCE_RELATIVE_PATH = "file-move/source.bin"
+FILE_MOVE_DESTINATION_RELATIVE_PATH = "file-move/destinations"
+FILE_MOVE_CACHE_POLICY = "warm-shared-source-cold-host-destinations"
+FILE_MOVE_CHUNK_BYTES = 2 * 1024 * 1024
+FILE_MOVE_BYTES = {
+    "quick": 2 * 1024 * 1024,
+    "full": 8 * 1024 * 1024,
+    "stress": 32 * 1024 * 1024,
+}
+FILE_MOVE_SOURCE_DIGESTS = {
+    "quick": "e398a6f80b342307308bc77329f62acc97a545a5afe14d80c993c0efa4c51de8",
+    "full": "53df6f06f71f8333e3d0e600d829ec72b41496a0fd9b3867a3f393e1ffa19d16",
+    "stress": "d2c6271705a2c566312efbe0add1d25200dbdf154f05db15cd2d44ac1b87d954",
+}
+FILE_MOVE_ARTIFACT_DIGESTS = {
+    "quick": "a94df57463998313e3f775ca221f82a369bf53dc2e9f5475cd730e967c5852bc",
+    "full": "301cf0142cb1ed3d74c0d9b919423bc48fc07a8a78932f5dba3b3bd7a95c4ca6",
+    "stress": "b61d8aa171a243272b8f00769dce5bb1712e382b0404e187de7a6a18eaa9b6f9",
+}
+WORKLOAD_PHASES = (
+    "file-move",
+    "git-clone",
+    "git-checkout",
+    "python-sha256",
+    "python-json",
+)
+HOST_WORKSPACE_PHASES = frozenset(("file-move", "git-clone", "git-checkout"))
 FIXTURE_ID = "wos-showcase-git-fixture-v1"
 FIXTURE_FILES = 100
 FIXTURE_FILE_BYTES = 16 * 1024
@@ -471,8 +500,12 @@ def verify_routes(work_root: str | None, timeout_seconds: float) -> dict[str, An
     }
 
 
+def phase_uses_host_workspace(phase: str) -> bool:
+    return phase in HOST_WORKSPACE_PHASES
+
+
 def inherited_route_evidence(phase: str, work_root: str) -> dict[str, Any]:
-    workspace_is_host = phase in ("git-clone", "git-checkout")
+    workspace_is_host = phase_uses_host_workspace(phase)
     return {
         "runtime_route": "local",
         "runtime_paths": list(LOCAL_ROUTE_PATHS),
@@ -511,6 +544,114 @@ def deterministic_file_bytes(file_index: int, size: int) -> bytes:
         output.extend(hashlib.sha256(seed + counter.to_bytes(8, "big")).digest())
         counter += 1
     return bytes(output[:size])
+
+
+def deterministic_file_move_chunks(size: int) -> Iterable[bytes]:
+    if size <= 0:
+        raise WorkloadError("file-move source size must be positive")
+    seed = hashlib.sha256(FILE_MOVE_WORKLOAD_ID.encode("ascii")).digest()
+    remaining = size
+    counter = 0
+    carry = b""
+    while remaining > 0:
+        wanted = min(remaining, FILE_MOVE_CHUNK_BYTES)
+        output = bytearray()
+        if carry:
+            take = min(wanted, len(carry))
+            output.extend(carry[:take])
+            carry = carry[take:]
+        while len(output) < wanted:
+            block = hashlib.sha256(seed + counter.to_bytes(8, "big")).digest()
+            counter += 1
+            take = min(wanted - len(output), len(block))
+            output.extend(block[:take])
+            carry = block[take:]
+        remaining -= len(output)
+        yield bytes(output)
+
+
+def write_all(destination: BinaryIO, data: bytes) -> None:
+    remaining = memoryview(data)
+    while remaining:
+        written = destination.write(remaining)
+        if (
+            isinstance(written, bool)
+            or not isinstance(written, int)
+            or written <= 0
+            or written > len(remaining)
+        ):
+            raise WorkloadError("file-move destination returned an invalid write count")
+        remaining = remaining[written:]
+
+
+def copy_file(source_path: Path, destination_path: Path, expected_bytes: int) -> int:
+    copied = 0
+    try:
+        with source_path.open("rb", buffering=0) as source, destination_path.open(
+            "xb", buffering=0
+        ) as destination:
+            while chunk := source.read(FILE_MOVE_CHUNK_BYTES):
+                copied += len(chunk)
+                if copied > expected_bytes:
+                    raise WorkloadError("file-move source is larger than expected")
+                write_all(destination, chunk)
+    except WorkloadError:
+        raise
+    except OSError as exc:
+        raise WorkloadError(
+            f"cannot copy file-move source to {destination_path}: {exc}"
+        ) from exc
+    if copied != expected_bytes:
+        raise WorkloadError(
+            f"file-move copied {copied} bytes; expected {expected_bytes}"
+        )
+    return copied
+
+
+def create_file_move_fixture(root: Path, scale: str) -> dict[str, Any]:
+    try:
+        bytes_per_file = FILE_MOVE_BYTES[scale]
+        expected_digest = FILE_MOVE_SOURCE_DIGESTS[scale]
+    except KeyError as exc:
+        raise WorkloadError(f"unknown file-move scale: {scale}") from exc
+
+    source_path = root / FILE_MOVE_SOURCE_RELATIVE_PATH
+    destination_path = root / FILE_MOVE_DESTINATION_RELATIVE_PATH
+    digest = hashlib.sha256()
+    try:
+        source_path.parent.mkdir()
+        destination_path.mkdir()
+        with source_path.open("xb", buffering=0) as source:
+            for chunk in deterministic_file_move_chunks(bytes_per_file):
+                write_all(source, chunk)
+                digest.update(chunk)
+    except WorkloadError:
+        raise
+    except OSError as exc:
+        raise WorkloadError(f"cannot create deterministic file-move fixture: {exc}") from exc
+
+    created_digest = digest.hexdigest()
+    try:
+        created_size = source_path.stat().st_size
+    except OSError as exc:
+        raise WorkloadError(f"cannot stat file-move source: {exc}") from exc
+    # Re-read before timing both to validate the fixture and to make the source
+    # cache policy explicit. Remote file contexts are still cold when jobs open it.
+    warmed_digest = sha256_file(source_path)
+    if (
+        created_size != bytes_per_file
+        or created_digest != expected_digest
+        or warmed_digest != expected_digest
+    ):
+        raise WorkloadError("deterministic file-move fixture identity changed")
+    return {
+        "source_path": source_path,
+        "destination_path": destination_path,
+        "source_relative_path": FILE_MOVE_SOURCE_RELATIVE_PATH,
+        "destination_relative_path": FILE_MOVE_DESTINATION_RELATIVE_PATH,
+        "bytes_per_file": bytes_per_file,
+        "source_digest": expected_digest,
+    }
 
 
 def tree_manifest(root: Path) -> tuple[int, int, str]:
@@ -735,6 +876,10 @@ def job_destination(work_root: Path, job_id: int) -> Path:
     return work_root / "clones" / f"clone-{job_id:03d}"
 
 
+def file_move_destination(work_root: Path, job_id: int) -> Path:
+    return work_root / FILE_MOVE_DESTINATION_RELATIVE_PATH / f"file-{job_id:03d}.bin"
+
+
 def run_job(args: argparse.Namespace) -> dict[str, Any]:
     os.chdir(args.work_root)
     identity = read_proc_identity()
@@ -746,7 +891,21 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
         **inherited_route_evidence(args.phase, args.work_root),
     }
     env = deterministic_environment()
-    if args.phase == "git-clone":
+    if args.phase == "file-move":
+        source_path = Path(args.work_root) / FILE_MOVE_SOURCE_RELATIVE_PATH
+        destination_path = file_move_destination(Path(args.work_root), args.job_id)
+        copied = copy_file(source_path, destination_path, args.file_bytes)
+        result.update(
+            {
+                "bytes_moved": copied,
+                "chunk_bytes": FILE_MOVE_CHUNK_BYTES,
+                "source_relative_path": FILE_MOVE_SOURCE_RELATIVE_PATH,
+                "destination_relative_path": (
+                    f"{FILE_MOVE_DESTINATION_RELATIVE_PATH}/file-{args.job_id:03d}.bin"
+                ),
+            }
+        )
+    elif args.phase == "git-clone":
         destination = job_destination(Path(args.work_root), args.job_id)
         run_checked(
             (
@@ -815,6 +974,8 @@ def inner_job_command(args: argparse.Namespace, job_id: int) -> list[str]:
         str(child_timeout_seconds(args.timeout_seconds)),
     ]
     command += ["--work-root", args.work_root]
+    if args.phase == "file-move":
+        command += ["--file-bytes", str(args.file_bytes)]
     if args.phase == "git-clone":
         command += ["--repository-uri", args.repository_uri]
     if args.phase == "git-checkout":
@@ -867,9 +1028,10 @@ def controller_command(
     fixture: dict[str, Any],
     rounds: int,
     timeout_seconds: float,
+    file_bytes: int = 0,
 ) -> list[str]:
     command = [WOS_ON, host, WOS_FORWARD]
-    if phase in ("git-clone", "git-checkout"):
+    if phase_uses_host_workspace(phase):
         command.append(f"+{work_root}")
     command += [*local_route_operands(), "--", WOS_PYTHON, WOS_HELPER, "host-worker"]
     command += [
@@ -887,6 +1049,8 @@ def controller_command(
         str(child_timeout_seconds(timeout_seconds)),
     ]
     command += ["--work-root", str(work_root)]
+    if phase == "file-move":
+        command += ["--file-bytes", str(file_bytes)]
     if phase == "git-clone":
         command += ["--repository-uri", str(fixture["repository_uri"])]
     if phase == "git-checkout":
@@ -1000,6 +1164,7 @@ def run_timed_phase(
     fixture: dict[str, Any],
     rounds: int,
     timeout_seconds: float,
+    file_bytes: int = 0,
 ) -> tuple[float, list[dict[str, Any]]]:
     processes: list[tuple[str, subprocess.Popen[str]]] = []
     started_ns = time.monotonic_ns()
@@ -1014,6 +1179,7 @@ def run_timed_phase(
             fixture,
             rounds,
             timeout_seconds,
+            file_bytes,
         )
         processes.append(
             (
@@ -1055,9 +1221,7 @@ def validate_controller_results(
             raise WorkloadError(
                 f"{phase} controller on {host} lacks LOCAL runtime evidence"
             )
-        expected_workspace_route = (
-            "host" if phase in ("git-clone", "git-checkout") else None
-        )
+        expected_workspace_route = "host" if phase_uses_host_workspace(phase) else None
         if controller.get("workspace_route") != expected_workspace_route:
             raise WorkloadError(
                 f"{phase} controller on {host} has invalid workspace route evidence"
@@ -1125,24 +1289,33 @@ def validate_controller_results(
             or controller_remote_pid in job_remote_pids
         ):
             raise WorkloadError(f"{phase} remote PID evidence is inconsistent")
-        participants.append(
-            {
-                "host": host,
-                "runner_host": controller["runner_host"],
-                "launcher_host": controller["launcher_host"],
-                "remote_pid": controller_remote_pid,
-                "job_remote_pids": job_remote_pids,
-                "strict_target": True,
-                "transport": transport,
-                "work_units": count,
-                "completed_work_units": count,
-                "job_ids": expected_ids,
-                "runtime_route": "local",
-                "runtime_paths": list(LOCAL_ROUTE_PATHS),
-                "workspace_route": expected_workspace_route,
-                "workspace_path": expected_workspace_path,
-            }
-        )
+        participant = {
+            "host": host,
+            "runner_host": controller["runner_host"],
+            "launcher_host": controller["launcher_host"],
+            "remote_pid": controller_remote_pid,
+            "job_remote_pids": job_remote_pids,
+            "strict_target": True,
+            "transport": transport,
+            "work_units": count,
+            "completed_work_units": count,
+            "job_ids": expected_ids,
+            "runtime_route": "local",
+            "runtime_paths": list(LOCAL_ROUTE_PATHS),
+            "workspace_route": expected_workspace_route,
+            "workspace_path": expected_workspace_path,
+        }
+        if phase == "file-move":
+            byte_counts = [job.get("bytes_moved") for job in raw_jobs]
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in byte_counts
+            ):
+                raise WorkloadError(
+                    f"{phase} controller on {host} returned invalid byte evidence"
+                )
+            participant["bytes_moved"] = sum(byte_counts)
+        participants.append(participant)
     if sorted(jobs_by_id) != list(range(TOTAL_JOBS)):
         raise WorkloadError(f"{phase} did not cover exactly 32 unique jobs")
     return participants, jobs_by_id
@@ -1221,6 +1394,50 @@ def validate_checkout_outputs(
                 f"checkout job {job_id} failed commit/content validation"
             )
         digests[job_id] = manifest_digest
+    return digests
+
+
+def validate_file_move_outputs(
+    fixture: dict[str, Any], total_jobs: int = TOTAL_JOBS
+) -> dict[int, str]:
+    source_path = Path(fixture["source_path"])
+    destination_path = Path(fixture["destination_path"])
+    bytes_per_file = int(fixture["bytes_per_file"])
+    source_digest = str(fixture["source_digest"])
+    expected_names = {f"file-{job_id:03d}.bin" for job_id in range(total_jobs)}
+    try:
+        if (
+            source_path.is_symlink()
+            or not source_path.is_file()
+            or source_path.stat().st_size != bytes_per_file
+            or sha256_file(source_path) != source_digest
+        ):
+            raise WorkloadError("file-move source changed during the timed phase")
+        observed_names = {path.name for path in destination_path.iterdir()}
+    except WorkloadError:
+        raise
+    except OSError as exc:
+        raise WorkloadError(f"cannot inspect file-move outputs: {exc}") from exc
+    if observed_names != expected_names:
+        raise WorkloadError("file-move destination set is incomplete or contains extras")
+
+    digests: dict[int, str] = {}
+    for job_id in range(total_jobs):
+        path = destination_path / f"file-{job_id:03d}.bin"
+        try:
+            invalid = (
+                path.is_symlink()
+                or not path.is_file()
+                or path.stat().st_size != bytes_per_file
+            )
+        except OSError as exc:
+            raise WorkloadError(f"cannot stat file-move output {job_id}: {exc}") from exc
+        if invalid:
+            raise WorkloadError(f"file-move output {job_id} has the wrong shape")
+        digest = sha256_file(path)
+        if digest != source_digest:
+            raise WorkloadError(f"file-move output {job_id} failed content validation")
+        digests[job_id] = digest
     return digests
 
 
@@ -1456,6 +1673,7 @@ def run_coordinator(args: argparse.Namespace) -> list[dict[str, Any]]:
         log(
             f"hosts={','.join(hosts)} partition={expected_counts} total_jobs={TOTAL_JOBS}"
         )
+
         log("preparing deterministic offline Git fixture outside the timed phases")
         fixture = create_git_fixture(work_root, WOS_GIT, args.timeout_seconds)
 
@@ -1596,6 +1814,82 @@ def run_coordinator(args: argparse.Namespace) -> list[dict[str, Any]]:
                 }
             )
             measurements.append(measurement)
+
+        # Keep this last: the stress profile leaves 1 GiB of destination data
+        # and should not perturb the established Git/Python cache conditions.
+        log("preparing deterministic warm file-move source outside the timed phase")
+        file_move_fixture = create_file_move_fixture(work_root, args.scale)
+        file_bytes = int(file_move_fixture["bytes_per_file"])
+        source_digest = str(file_move_fixture["source_digest"])
+        log(
+            f"running {TOTAL_JOBS} concurrent HOST-workspace file copies "
+            f"bytes_per_file={file_bytes}"
+        )
+        elapsed, controllers = run_timed_phase(
+            "file-move",
+            partitions,
+            launcher,
+            work_root,
+            file_move_fixture,
+            rounds,
+            args.timeout_seconds,
+            file_bytes,
+        )
+        file_move_participants, file_move_jobs = validate_controller_results(
+            "file-move", controllers, partitions, launcher, work_root
+        )
+        for job_id, job in file_move_jobs.items():
+            expected_destination = (
+                f"{FILE_MOVE_DESTINATION_RELATIVE_PATH}/file-{job_id:03d}.bin"
+            )
+            if (
+                job.get("bytes_moved") != file_bytes
+                or job.get("chunk_bytes") != FILE_MOVE_CHUNK_BYTES
+                or job.get("source_relative_path")
+                != FILE_MOVE_SOURCE_RELATIVE_PATH
+                or job.get("destination_relative_path") != expected_destination
+            ):
+                raise WorkloadError(
+                    f"file-move job {job_id} returned invalid copy evidence"
+                )
+        if any(
+            participant.get("bytes_moved")
+            != participant["work_units"] * file_bytes
+            for participant in file_move_participants
+        ):
+            raise WorkloadError("file-move participant byte evidence is inconsistent")
+        file_move_digests = validate_file_move_outputs(file_move_fixture)
+        attach_participant_digests(file_move_participants, file_move_digests)
+        file_move_artifact_digest = aggregate_digests(file_move_digests)
+        if file_move_artifact_digest != FILE_MOVE_ARTIFACT_DIGESTS[args.scale]:
+            raise WorkloadError("file-move artifact identity changed")
+        file_move_measurement = common_measurement(
+            "wos_file_move",
+            elapsed,
+            args.scale,
+            hosts,
+            launcher,
+            "host-workspace",
+            str(work_root),
+            file_move_participants,
+            provenance,
+        )
+        file_move_measurement.update(
+            {
+                "workload_id": FILE_MOVE_WORKLOAD_ID,
+                "operation": FILE_MOVE_OPERATION,
+                "files": TOTAL_JOBS,
+                "bytes_per_file": file_bytes,
+                "total_bytes": TOTAL_JOBS * file_bytes,
+                "chunk_bytes": FILE_MOVE_CHUNK_BYTES,
+                "source_relative_path": FILE_MOVE_SOURCE_RELATIVE_PATH,
+                "destination_relative_path": FILE_MOVE_DESTINATION_RELATIVE_PATH,
+                "source_digest": source_digest,
+                "artifact_digest": file_move_artifact_digest,
+                "cache_policy": FILE_MOVE_CACHE_POLICY,
+            }
+        )
+        measurements.append(file_move_measurement)
     finally:
         if not terminate_processes():
             os.chdir(original_cwd)
@@ -1678,6 +1972,19 @@ def self_test(args: argparse.Namespace) -> None:
         if aggregate_digests(quick_jobs) != EXPECTED_PYTHON_DIGESTS[phase]["quick"]:
             raise WorkloadError(f"{phase} quick-scale workload identity changed")
 
+    for scale, file_bytes in FILE_MOVE_BYTES.items():
+        digest = hashlib.sha256()
+        generated = 0
+        for chunk in deterministic_file_move_chunks(file_bytes):
+            digest.update(chunk)
+            generated += len(chunk)
+        source_digest = digest.hexdigest()
+        if generated != file_bytes or source_digest != FILE_MOVE_SOURCE_DIGESTS[scale]:
+            raise WorkloadError(f"file-move {scale} source identity changed")
+        job_digests = {job_id: source_digest for job_id in range(TOTAL_JOBS)}
+        if aggregate_digests(job_digests) != FILE_MOVE_ARTIFACT_DIGESTS[scale]:
+            raise WorkloadError(f"file-move {scale} artifact identity changed")
+
     git = args.git or shutil.which("git")
     if not git:
         raise WorkloadError("self-test requires Git")
@@ -1685,6 +1992,47 @@ def self_test(args: argparse.Namespace) -> None:
         prefix="wos-fixed-selftest-", dir="/tmp"
     ) as temporary:
         root = Path(temporary)
+
+        small_source = root / FILE_MOVE_SOURCE_RELATIVE_PATH
+        small_destinations = root / FILE_MOVE_DESTINATION_RELATIVE_PATH
+        small_source.parent.mkdir()
+        small_destinations.mkdir()
+        small_payload = bytes(range(256)) * 17
+        small_source.write_bytes(small_payload)
+        small_digest = hashlib.sha256(small_payload).hexdigest()
+        small_fixture = {
+            "source_path": small_source,
+            "destination_path": small_destinations,
+            "bytes_per_file": len(small_payload),
+            "source_digest": small_digest,
+        }
+        for job_id in range(TOTAL_JOBS):
+            copied = copy_file(
+                small_source, file_move_destination(root, job_id), len(small_payload)
+            )
+            if copied != len(small_payload):
+                raise WorkloadError("small file-move copy self-test failed")
+        small_digests = validate_file_move_outputs(small_fixture)
+        if any(digest != small_digest for digest in small_digests.values()):
+            raise WorkloadError("small file-move validation self-test failed")
+        try:
+            copy_file(
+                small_source,
+                file_move_destination(root, 0),
+                len(small_payload),
+            )
+        except WorkloadError:
+            pass
+        else:
+            raise WorkloadError("file-move exclusive destination check failed")
+        file_move_destination(root, 0).write_bytes(small_payload + b"corrupt")
+        try:
+            validate_file_move_outputs(small_fixture)
+        except WorkloadError:
+            pass
+        else:
+            raise WorkloadError("file-move corruption self-test was not detected")
+
         first_root = root / "first"
         second_root = root / "second"
         first_root.mkdir()
@@ -1787,7 +2135,7 @@ def build_parser() -> argparse.ArgumentParser:
     host_worker = subparsers.add_parser("host-worker")
     host_worker.add_argument(
         "--phase",
-        choices=("git-clone", "git-checkout", "python-sha256", "python-json"),
+        choices=WORKLOAD_PHASES,
         required=True,
     )
     host_worker.add_argument("--target-host", required=True)
@@ -1798,12 +2146,13 @@ def build_parser() -> argparse.ArgumentParser:
     host_worker.add_argument("--repository-uri", default="")
     host_worker.add_argument("--commit", default="")
     host_worker.add_argument("--rounds", type=positive_int, default=1)
+    host_worker.add_argument("--file-bytes", type=positive_int, default=0)
     host_worker.add_argument("--timeout-seconds", type=positive_timeout, default=1800.0)
 
     job = subparsers.add_parser("job")
     job.add_argument(
         "--phase",
-        choices=("git-clone", "git-checkout", "python-sha256", "python-json"),
+        choices=WORKLOAD_PHASES,
         required=True,
     )
     job.add_argument("--target-host", required=True)
@@ -1813,6 +2162,7 @@ def build_parser() -> argparse.ArgumentParser:
     job.add_argument("--repository-uri", default="")
     job.add_argument("--commit", default="")
     job.add_argument("--rounds", type=positive_int, default=1)
+    job.add_argument("--file-bytes", type=positive_int, default=0)
     job.add_argument("--timeout-seconds", type=positive_timeout, default=1800.0)
 
     preflight_host = subparsers.add_parser("preflight-host")
@@ -1856,6 +2206,8 @@ def validate_worker_arguments(args: argparse.Namespace) -> None:
         if not args.work_root:
             raise WorkloadError(f"{args.phase} requires --work-root")
         require_safe_work_root(Path(args.work_root))
+        if args.phase == "file-move" and args.file_bytes not in FILE_MOVE_BYTES.values():
+            raise WorkloadError("file-move requires a scale-fixed --file-bytes value")
         if args.phase == "git-clone" and not args.repository_uri.startswith("file://"):
             raise WorkloadError("Git clone requires an offline file:// repository URI")
         if args.phase == "git-checkout" and OID_RE.fullmatch(args.commit) is None:

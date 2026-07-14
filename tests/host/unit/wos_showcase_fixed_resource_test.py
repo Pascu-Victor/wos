@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import copy
+import hashlib
 import importlib.util
 import os
 import subprocess
@@ -52,7 +53,7 @@ def controller_fixture(module, phase: str, hosts: list[str]):
     launcher = hosts[0]
     partitions = module.partition_jobs(hosts)
     workspace = Path("/tmp/wos-showcase-fixed-test")
-    workspace_route = "host" if phase.startswith("git-") else None
+    workspace_route = "host" if module.phase_uses_host_workspace(phase) else None
     workspace_path = str(workspace) if workspace_route == "host" else None
     controllers = []
     for host_index, (host, start, count) in enumerate(partitions):
@@ -61,15 +62,16 @@ def controller_fixture(module, phase: str, hosts: list[str]):
         jobs = []
         for job_id in range(start, start + count):
             job_pid = 1000 + job_id if remote else 0
-            jobs.append(
-                {
-                    "phase": phase,
-                    "job_id": job_id,
-                    **identity(module, host, launcher, job_pid),
-                    "workspace_route": workspace_route,
-                    "workspace_path": workspace_path,
-                }
-            )
+            job = {
+                "phase": phase,
+                "job_id": job_id,
+                **identity(module, host, launcher, job_pid),
+                "workspace_route": workspace_route,
+                "workspace_path": workspace_path,
+            }
+            if phase == "file-move":
+                job["bytes_moved"] = module.FILE_MOVE_BYTES["quick"]
+            jobs.append(job)
         controllers.append(
             {
                 "phase": phase,
@@ -118,6 +120,26 @@ def test_partition_and_commands(module) -> None:
     timeout_index = command.index("--timeout-seconds")
     if float(command[timeout_index + 1]) != 25.0:
         fail(f"controller timeout does not reserve cleanup grace: {command}")
+
+    file_move_command = module.controller_command(
+        "file-move",
+        hosts[1],
+        hosts[0],
+        11,
+        11,
+        Path("/tmp/work"),
+        {},
+        20_000,
+        30.0,
+        module.FILE_MOVE_BYTES["quick"],
+    )
+    if file_move_command[:4] != expected_prefix:
+        fail(f"file-move controller is not strict/HOST-routed: {file_move_command}")
+    if any(f"-{path}" not in file_move_command for path in module.LOCAL_ROUTE_PATHS):
+        fail("file-move controller lacks explicit LOCAL runtime routes")
+    file_bytes_index = file_move_command.index("--file-bytes")
+    if int(file_move_command[file_bytes_index + 1]) != module.FILE_MOVE_BYTES["quick"]:
+        fail("file-move controller did not preserve its scale-fixed byte count")
 
     python_command = module.controller_command(
         "python-sha256",
@@ -212,6 +234,37 @@ def test_job_map_validation(module) -> None:
     ):
         fail("participant evidence omits per-job content digests")
 
+    move_launcher, move_partitions, move_workspace, move_controllers = (
+        controller_fixture(module, "file-move", hosts)
+    )
+    move_participants, move_jobs = module.validate_controller_results(
+        "file-move",
+        move_controllers,
+        move_partitions,
+        move_launcher,
+        move_workspace,
+    )
+    if sorted(move_jobs) != list(range(module.TOTAL_JOBS)) or any(
+        participant["bytes_moved"]
+        != participant["work_units"] * module.FILE_MOVE_BYTES["quick"]
+        for participant in move_participants
+    ):
+        fail("file-move job map lost fixed byte evidence")
+    invalid_move_bytes = copy.deepcopy(move_controllers)
+    invalid_move_bytes[1]["jobs"][0]["bytes_moved"] = 0
+    try:
+        module.validate_controller_results(
+            "file-move",
+            invalid_move_bytes,
+            move_partitions,
+            move_launcher,
+            move_workspace,
+        )
+    except module.WorkloadError:
+        pass
+    else:
+        fail("file-move job map accepted invalid byte evidence")
+
     mutations = []
     duplicate = copy.deepcopy(controllers)
     duplicate[1]["jobs"][0]["job_id"] = 0
@@ -231,6 +284,82 @@ def test_job_map_validation(module) -> None:
             pass
         else:
             fail("invalid job-map evidence was accepted")
+
+
+def test_file_move_copy_and_validation(module) -> None:
+    if module.FILE_MOVE_BYTES != {
+        "quick": 2 * 1024 * 1024,
+        "full": 8 * 1024 * 1024,
+        "stress": 32 * 1024 * 1024,
+    } or module.FILE_MOVE_CHUNK_BYTES != 2 * 1024 * 1024:
+        fail("file-move scale or chunk contract changed")
+
+    class ShortWriter:
+        def __init__(self) -> None:
+            self.data = bytearray()
+
+        def write(self, data) -> int:
+            count = min(3, len(data))
+            self.data.extend(data[:count])
+            return count
+
+    short_writer = ShortWriter()
+    module.write_all(short_writer, b"explicit-short-write-check")
+    if bytes(short_writer.data) != b"explicit-short-write-check":
+        fail("file-move full-write loop dropped a short-write tail")
+
+    with tempfile.TemporaryDirectory(prefix="wos-file-move-test-") as temporary:
+        root = Path(temporary)
+        source = root / module.FILE_MOVE_SOURCE_RELATIVE_PATH
+        destinations = root / module.FILE_MOVE_DESTINATION_RELATIVE_PATH
+        source.parent.mkdir()
+        destinations.mkdir()
+        payload = bytes(range(251)) * 19
+        source.write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        fixture = {
+            "source_path": source,
+            "destination_path": destinations,
+            "bytes_per_file": len(payload),
+            "source_digest": digest,
+        }
+        for job_id in range(module.TOTAL_JOBS):
+            copied = module.copy_file(
+                source, module.file_move_destination(root, job_id), len(payload)
+            )
+            if copied != len(payload):
+                fail("small local file-move copy returned invalid evidence")
+        digests = module.validate_file_move_outputs(fixture)
+        if set(digests) != set(range(module.TOTAL_JOBS)) or any(
+            value != digest for value in digests.values()
+        ):
+            fail("launcher file-move validation lost exact output evidence")
+
+        try:
+            module.copy_file(
+                source, module.file_move_destination(root, 0), len(payload)
+            )
+        except module.WorkloadError:
+            pass
+        else:
+            fail("file-move destination creation was not exclusive")
+
+        module.file_move_destination(root, 0).write_bytes(payload + b"corrupt")
+        try:
+            module.validate_file_move_outputs(fixture)
+        except module.WorkloadError:
+            pass
+        else:
+            fail("launcher validation accepted a corrupt file-move output")
+
+        module.file_move_destination(root, 0).write_bytes(payload)
+        source.write_bytes(payload + b"changed")
+        try:
+            module.validate_file_move_outputs(fixture)
+        except module.WorkloadError:
+            pass
+        else:
+            fail("launcher validation accepted a changed file-move source")
 
 
 def test_entrypoint_and_self_test(module) -> None:
@@ -342,10 +471,11 @@ def main() -> None:
     module = load_helper()
     test_partition_and_commands(module)
     test_job_map_validation(module)
+    test_file_move_copy_and_validation(module)
     test_entrypoint_and_self_test(module)
     test_timeout_cleanup(module)
     test_timed_job_uses_preflight_evidence(module)
-    print("5 WOS fixed-resource showcase tests passed")
+    print("6 WOS fixed-resource showcase tests passed")
 
 
 if __name__ == "__main__":

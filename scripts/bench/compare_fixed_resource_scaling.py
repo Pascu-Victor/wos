@@ -103,6 +103,7 @@ ALL_WORKLOADS = (
     "mandelbrot",
     "file-create",
     "file-rename",
+    "file-movement",
     "git-clone",
     "git-checkout",
     "python",
@@ -161,6 +162,28 @@ JOB_MAP_PYTHON_DIGESTS = {
         "full": "79332e7c99c2097d7ec9a0603433a159925abbd8c44cec38c258ae7600926672",
         "stress": "1586dfe1209b9d4266e21b333e22eb56d2420c1e246b99b5901ac99bd2f3fb33",
     },
+}
+FILE_MOVE_WORKLOAD_ID = "wos-showcase-file-move-v1"
+FILE_MOVE_OPERATION = "stream-copy-read-write-close"
+FILE_MOVE_FILES = 32
+FILE_MOVE_BYTES_PER_FILE = {
+    "quick": 2 * 1024 * 1024,
+    "full": 8 * 1024 * 1024,
+    "stress": 32 * 1024 * 1024,
+}
+FILE_MOVE_CHUNK_BYTES = 2 * 1024 * 1024
+FILE_MOVE_CACHE_POLICY = "warm-shared-source-cold-host-destinations"
+FILE_MOVE_SOURCE_RELATIVE_PATH = "file-move/source.bin"
+FILE_MOVE_DESTINATION_RELATIVE_PATH = "file-move/destinations"
+FILE_MOVE_SOURCE_DIGESTS = {
+    "quick": "e398a6f80b342307308bc77329f62acc97a545a5afe14d80c993c0efa4c51de8",
+    "full": "53df6f06f71f8333e3d0e600d829ec72b41496a0fd9b3867a3f393e1ffa19d16",
+    "stress": "d2c6271705a2c566312efbe0add1d25200dbdf154f05db15cd2d44ac1b87d954",
+}
+FILE_MOVE_ARTIFACT_DIGESTS = {
+    "quick": "a94df57463998313e3f775ca221f82a369bf53dc2e9f5475cd730e967c5852bc",
+    "full": "301cf0142cb1ed3d74c0d9b919423bc48fc07a8a78932f5dba3b3bd7a95c4ca6",
+    "stress": "b61d8aa171a243272b8f00769dce5bb1712e382b0404e187de7a6a18eaa9b6f9",
 }
 SHOWCASE_METADATA_COUNTS = {
     "quick": 32,
@@ -254,6 +277,33 @@ SHOWCASE_METRICS = {
         count_field="iterations",
         process_identity=True,
     ),
+    "wos_file_move": ShowcaseMetricSpec(
+        "file-movement",
+        "file-movement",
+        "elapsed_seconds",
+        (
+            "scale",
+            "workload_id",
+            "operation",
+            "source_relative_path",
+            "destination_relative_path",
+            "files",
+            "bytes_per_file",
+            "total_bytes",
+            "chunk_bytes",
+            "cache_policy",
+            "source_digest",
+            "artifact_digest",
+            "runtime_provenance",
+            "total_work_units",
+        ),
+        "host-workspace",
+        JOB_MAP_EVIDENCE_CONTRACT,
+        count_field="files",
+        workspace_route="host",
+        participant_digest=True,
+        expected_work_units=FILE_MOVE_FILES,
+    ),
     "wos_git_clone": ShowcaseMetricSpec(
         "git-clone",
         "git-clone",
@@ -346,6 +396,7 @@ REQUIRED_MEASUREMENTS_BY_FAMILY = {
     "mandelbrot": {"mandelbrot"},
     "file-create": {"file-create"},
     "file-rename": {"file-rename"},
+    "file-movement": {"file-movement"},
     "git-clone": {"git-clone"},
     "git-checkout": {"git-checkout"},
     "python": {"python:sha256", "python:json"},
@@ -1482,7 +1533,61 @@ def validate_showcase_job_map(
                 or payload.get("repository_uri") != expected_uri
             ):
                 raise ComparisonError(f"{context} has invalid Git repository evidence")
-    else:
+    elif benchmark == "wos_file_move":
+        expected_bytes_per_file = FILE_MOVE_BYTES_PER_FILE[scale]
+        expected_total_bytes = FILE_MOVE_FILES * expected_bytes_per_file
+        expected_source_digest = FILE_MOVE_SOURCE_DIGESTS[scale]
+        expected_artifact_digest = FILE_MOVE_ARTIFACT_DIGESTS[scale]
+        moved_bytes = 0
+        for index, participant in enumerate(participants):
+            participant_bytes = participant.get("bytes_moved")
+            expected_participant_bytes = (
+                participant["work_units"] * expected_bytes_per_file
+            )
+            if (
+                isinstance(participant_bytes, bool)
+                or not isinstance(participant_bytes, int)
+                or participant_bytes != expected_participant_bytes
+            ):
+                raise ComparisonError(
+                    f"{context} participant {index} has invalid byte-movement evidence"
+                )
+            moved_bytes += participant_bytes
+        if (
+            payload.get("workload_id") != FILE_MOVE_WORKLOAD_ID
+            or payload.get("operation") != FILE_MOVE_OPERATION
+            or payload.get("source_relative_path")
+            != FILE_MOVE_SOURCE_RELATIVE_PATH
+            or payload.get("destination_relative_path")
+            != FILE_MOVE_DESTINATION_RELATIVE_PATH
+            or isinstance(payload.get("files"), bool)
+            or not isinstance(payload.get("files"), int)
+            or payload.get("files") != FILE_MOVE_FILES
+            or isinstance(payload.get("bytes_per_file"), bool)
+            or not isinstance(payload.get("bytes_per_file"), int)
+            or payload.get("bytes_per_file") != expected_bytes_per_file
+            or isinstance(payload.get("total_bytes"), bool)
+            or not isinstance(payload.get("total_bytes"), int)
+            or payload.get("total_bytes") != expected_total_bytes
+            or payload.get("total_bytes")
+            != payload.get("files") * payload.get("bytes_per_file")
+            or isinstance(payload.get("chunk_bytes"), bool)
+            or not isinstance(payload.get("chunk_bytes"), int)
+            or payload.get("chunk_bytes") != FILE_MOVE_CHUNK_BYTES
+            or payload.get("cache_policy") != FILE_MOVE_CACHE_POLICY
+            or payload.get("source_digest") != expected_source_digest
+            or any(
+                job_digest != expected_source_digest
+                for job_digest in all_job_digests.values()
+            )
+            or payload.get("artifact_digest") != aggregate
+            or payload.get("artifact_digest") != expected_artifact_digest
+            or moved_bytes != expected_total_bytes
+        ):
+            raise ComparisonError(
+                f"{context} has invalid fixed file-movement workload evidence"
+            )
+    elif benchmark in ("wos_python_sha256", "wos_python_json"):
         rounds = payload.get("rounds")
         expected_digest = JOB_MAP_PYTHON_DIGESTS[benchmark][scale]
         if (
@@ -1494,6 +1599,8 @@ def validate_showcase_job_map(
             or payload.get("digest") != expected_digest
         ):
             raise ComparisonError(f"{context} has invalid fixed Python work evidence")
+    else:
+        raise ComparisonError(f"{context} has no benchmark-specific evidence contract")
 
 
 def validate_git_phase_coherence(

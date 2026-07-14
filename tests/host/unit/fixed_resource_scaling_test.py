@@ -104,6 +104,24 @@ def read_json(path: Path) -> dict[str, object]:
     return payload
 
 
+def measurement_for(
+    payload: dict[str, object], benchmark: str
+) -> dict[str, object]:
+    measurements = payload.get("measurements")
+    if not isinstance(measurements, list):
+        fail("showcase fixture has no measurement list")
+    matches = [
+        measurement
+        for measurement in measurements
+        if isinstance(measurement, dict) and measurement.get("benchmark") == benchmark
+    ]
+    if len(matches) != 1:
+        fail(
+            f"showcase fixture has {len(matches)} records for benchmark {benchmark!r}"
+        )
+    return matches[0]
+
+
 def render_result(elapsed: float, node_count: int, step_name: str) -> dict[str, object]:
     scene, scene_path, placement, width, height, spp = RENDER_CASES[step_name]
     layout = TOPOLOGY_LAYOUTS[node_count]
@@ -230,6 +248,16 @@ JOB_MAP_RUNTIME_PROVENANCE = {
     "git_upload_pack_sha256": "a" * 64,
     "wkictl_sha256": "d" * 64,
 }
+FILE_MOVE_SOURCE_DIGESTS = {
+    "quick": "e398a6f80b342307308bc77329f62acc97a545a5afe14d80c993c0efa4c51de8",
+    "full": "53df6f06f71f8333e3d0e600d829ec72b41496a0fd9b3867a3f393e1ffa19d16",
+    "stress": "d2c6271705a2c566312efbe0add1d25200dbdf154f05db15cd2d44ac1b87d954",
+}
+FILE_MOVE_ARTIFACT_DIGESTS = {
+    "quick": "a94df57463998313e3f775ca221f82a369bf53dc2e9f5475cd730e967c5852bc",
+    "full": "301cf0142cb1ed3d74c0d9b919423bc48fc07a8a78932f5dba3b3bd7a95c4ca6",
+    "stress": "b61d8aa171a243272b8f00769dce5bb1712e382b0404e187de7a6a18eaa9b6f9",
+}
 JOB_MAP_QUICK_DIGESTS = {
     "wos_python_sha256": [
         "468bc27e4ee67c2ebf24615181a7e6a0ca41a406f12d467249e34d28fbaee57b",
@@ -300,6 +328,9 @@ JOB_MAP_QUICK_DIGESTS = {
         "cb96f87f06da25d19d8722627d707e1ec8a0b352c2e3ef1c5052ff52f6aa365d",
     ],
 }
+JOB_MAP_QUICK_DIGESTS["wos_file_move"] = [
+    FILE_MOVE_SOURCE_DIGESTS["quick"]
+] * 32
 
 
 def job_map_participants(
@@ -331,30 +362,31 @@ def job_map_participants(
             participant_digest.update(job_id.to_bytes(4, "big"))
             participant_digest.update(bytes.fromhex(job_digest))
         remote = index != 0
-        result.append(
-            {
-                "host": f"wos-{index}.wos",
-                "runner_host": f"wos-{index}.wos",
-                "launcher_host": "wos-0.wos",
-                "remote_pid": 100 + index if remote else 0,
-                "job_remote_pids": (
-                    [1000 + job_id for job_id in job_ids]
-                    if remote
-                    else [0] * work_units
-                ),
-                "strict_target": True,
-                "transport": "wki" if remote else "local",
-                "work_units": work_units,
-                "completed_work_units": work_units,
-                "job_ids": job_ids,
-                "job_digests": job_digests,
-                "runtime_route": "local",
-                "runtime_paths": JOB_MAP_RUNTIME_PATHS,
-                "workspace_route": "host" if route_path is not None else None,
-                "workspace_path": route_path,
-                "digest": participant_digest.hexdigest(),
-            }
-        )
+        participant = {
+            "host": f"wos-{index}.wos",
+            "runner_host": f"wos-{index}.wos",
+            "launcher_host": "wos-0.wos",
+            "remote_pid": 100 + index if remote else 0,
+            "job_remote_pids": (
+                [1000 + job_id for job_id in job_ids]
+                if remote
+                else [0] * work_units
+            ),
+            "strict_target": True,
+            "transport": "wki" if remote else "local",
+            "work_units": work_units,
+            "completed_work_units": work_units,
+            "job_ids": job_ids,
+            "job_digests": job_digests,
+            "runtime_route": "local",
+            "runtime_paths": JOB_MAP_RUNTIME_PATHS,
+            "workspace_route": "host" if route_path is not None else None,
+            "workspace_path": route_path,
+            "digest": participant_digest.hexdigest(),
+        }
+        if benchmark == "wos_file_move":
+            participant["bytes_moved"] = work_units * 2 * 1024 * 1024
+        result.append(participant)
         first_job += work_units
     return result
 
@@ -402,7 +434,7 @@ def showcase_measurement(
                 "scale": "quick",
             }
         )
-        if benchmark in ("wos_git_clone", "wos_git_checkout"):
+        if benchmark in ("wos_file_move", "wos_git_clone", "wos_git_checkout"):
             result["artifact_digest"] = aggregate
         else:
             result["digest"] = aggregate
@@ -480,6 +512,27 @@ def showcase_measurements(scale: float, node_count: int) -> list[dict[str, objec
             node_count,
             32,
             "host-path",
+        ),
+        showcase_measurement(
+            {
+                "benchmark": "wos_file_move",
+                "workload_id": "wos-showcase-file-move-v1",
+                "operation": "stream-copy-read-write-close",
+                "source_relative_path": "file-move/source.bin",
+                "destination_relative_path": "file-move/destinations",
+                "files": 32,
+                "bytes_per_file": 2 * 1024 * 1024,
+                "total_bytes": 32 * 2 * 1024 * 1024,
+                "chunk_bytes": 2 * 1024 * 1024,
+                "cache_policy": "warm-shared-source-cold-host-destinations",
+                "source_digest": FILE_MOVE_SOURCE_DIGESTS["quick"],
+                "artifact_digest": FILE_MOVE_ARTIFACT_DIGESTS["quick"],
+                "elapsed_seconds": 3.5 * scale,
+            },
+            node_count,
+            32,
+            "host-workspace",
+            job_map=True,
         ),
         showcase_measurement(
             {
@@ -774,6 +827,7 @@ def test_missing_workload_topology_and_repeat_are_reported(comparator) -> None:
         "missing topology: 4 node(s)",
         "need 3 repeats, found 2",
         "one-node baseline missing workload: distributed-compilation",
+        "one-node baseline missing workload: file-movement",
         "one-node baseline missing workload: python",
     ]:
         if token not in messages:
@@ -1056,7 +1110,9 @@ def test_showcase_routing_participant_coverage_and_python_rows(comparator) -> No
         bad_routing = complete_matrix(root / "bad-routing")
         candidate = result_path_for(bad_routing[-1], "wos-showcase")
         payload = read_json(candidate)
-        payload["measurements"][0]["placement"] = "local-baseline"
+        measurement_for(payload, "wos_distributed_compile")[
+            "placement"
+        ] = "local-baseline"
         write_json(candidate, payload)
         expect_error(
             comparator,
@@ -1068,7 +1124,9 @@ def test_showcase_routing_participant_coverage_and_python_rows(comparator) -> No
         bad_runner = complete_matrix(root / "bad-runner")
         candidate = result_path_for(bad_runner[-1], "wos-showcase")
         payload = read_json(candidate)
-        payload["measurements"][0]["participants"][-1]["runner_host"] = "wos-0.wos"
+        measurement_for(payload, "wos_distributed_compile")["participants"][-1][
+            "runner_host"
+        ] = "wos-0.wos"
         write_json(candidate, payload)
         expect_error(
             comparator,
@@ -1080,7 +1138,7 @@ def test_showcase_routing_participant_coverage_and_python_rows(comparator) -> No
         incomplete_coverage = complete_matrix(root / "incomplete-coverage")
         candidate = result_path_for(incomplete_coverage[-1], "wos-showcase")
         payload = read_json(candidate)
-        payload["measurements"][0]["participants"].pop()
+        measurement_for(payload, "wos_distributed_compile")["participants"].pop()
         write_json(candidate, payload)
         expect_error(
             comparator,
@@ -1092,7 +1150,9 @@ def test_showcase_routing_participant_coverage_and_python_rows(comparator) -> No
         changed_compile_source = complete_matrix(root / "changed-compile-source")
         candidate = result_path_for(changed_compile_source[0], "wos-showcase")
         payload = read_json(candidate)
-        payload["measurements"][0]["source_sha256"] = "0" * 64
+        measurement_for(payload, "wos_distributed_compile")["source_sha256"] = (
+            "0" * 64
+        )
         write_json(candidate, payload)
         expect_error(
             comparator,
@@ -1104,7 +1164,9 @@ def test_showcase_routing_participant_coverage_and_python_rows(comparator) -> No
         bad_compile_cache_policy = complete_matrix(root / "bad-compile-cache-policy")
         candidate = result_path_for(bad_compile_cache_policy[-1], "wos-showcase")
         payload = read_json(candidate)
-        payload["measurements"][0]["cache_policy"] = "launcher-only-warm-cache"
+        measurement_for(payload, "wos_distributed_compile")[
+            "cache_policy"
+        ] = "launcher-only-warm-cache"
         write_json(candidate, payload)
         expect_error(
             comparator,
@@ -1116,7 +1178,9 @@ def test_showcase_routing_participant_coverage_and_python_rows(comparator) -> No
         bad_compile_launch_policy = complete_matrix(root / "bad-compile-launch-policy")
         candidate = result_path_for(bad_compile_launch_policy[-1], "wos-showcase")
         payload = read_json(candidate)
-        payload["measurements"][0]["launch_policy"] = "one-wki-launch-per-tu"
+        measurement_for(payload, "wos_distributed_compile")[
+            "launch_policy"
+        ] = "one-wki-launch-per-tu"
         write_json(candidate, payload)
         expect_error(
             comparator,
@@ -1128,7 +1192,7 @@ def test_showcase_routing_participant_coverage_and_python_rows(comparator) -> No
         bad_compile_controller_count = complete_matrix(root / "bad-compile-controller-count")
         candidate = result_path_for(bad_compile_controller_count[-1], "wos-showcase")
         payload = read_json(candidate)
-        payload["measurements"][0]["controller_count"] = 32
+        measurement_for(payload, "wos_distributed_compile")["controller_count"] = 32
         write_json(candidate, payload)
         expect_error(
             comparator,
@@ -1140,7 +1204,9 @@ def test_showcase_routing_participant_coverage_and_python_rows(comparator) -> No
         changed_compile_binary = complete_matrix(root / "changed-compile-binary")
         candidate = result_path_for(changed_compile_binary[0], "wos-showcase")
         payload = read_json(candidate)
-        payload["measurements"][0]["compiler_sha256"] = "7" * 64
+        measurement_for(payload, "wos_distributed_compile")["compiler_sha256"] = (
+            "7" * 64
+        )
         write_json(candidate, payload)
         expect_error(
             comparator,
@@ -1152,7 +1218,9 @@ def test_showcase_routing_participant_coverage_and_python_rows(comparator) -> No
         changed_wkictl_binary = complete_matrix(root / "changed-wkictl-binary")
         candidate = result_path_for(changed_wkictl_binary[0], "wos-showcase")
         payload = read_json(candidate)
-        payload["measurements"][0]["wkictl_sha256"] = "4" * 64
+        measurement_for(payload, "wos_distributed_compile")["wkictl_sha256"] = (
+            "4" * 64
+        )
         write_json(candidate, payload)
         expect_error(
             comparator,
@@ -1164,7 +1232,7 @@ def test_showcase_routing_participant_coverage_and_python_rows(comparator) -> No
         bad_compile_routes = complete_matrix(root / "bad-compile-routes")
         candidate = result_path_for(bad_compile_routes[-1], "wos-showcase")
         payload = read_json(candidate)
-        payload["measurements"][0]["runtime_route"] = "host"
+        measurement_for(payload, "wos_distributed_compile")["runtime_route"] = "host"
         write_json(candidate, payload)
         expect_error(
             comparator,
@@ -1176,7 +1244,7 @@ def test_showcase_routing_participant_coverage_and_python_rows(comparator) -> No
         bad_compile_workspace = complete_matrix(root / "bad-compile-workspace")
         candidate = result_path_for(bad_compile_workspace[-1], "wos-showcase")
         payload = read_json(candidate)
-        payload["measurements"][0][
+        measurement_for(payload, "wos_distributed_compile")[
             "workspace_path"
         ] = "/tmp/wos-showcase-fixed-0123456789abcdef/distributed-compile-extra"
         write_json(candidate, payload)
@@ -1364,6 +1432,175 @@ def test_showcase_job_map_evidence_contract_is_strict(comparator) -> None:
     )
 
 
+def test_file_movement_is_required_fingerprinted_and_strict(comparator) -> None:
+    expected_hosts = {"wos-0", "wos-1", "wos-2"}
+    launcher = "wos-0"
+    manifest = Path("file-movement-fixture.json")
+    valid_payload = next(
+        measurement
+        for measurement in showcase_measurements(1.0, 3)
+        if measurement["benchmark"] == "wos_file_move"
+    )
+    spec = comparator.SHOWCASE_METRICS["wos_file_move"]
+
+    def validate(payload: dict[str, object]) -> None:
+        comparator.validate_showcase_participants(
+            manifest,
+            "wos_file_move",
+            payload,
+            spec,
+            expected_hosts,
+            launcher,
+        )
+
+    def reject(label: str, mutate) -> None:
+        candidate = copy.deepcopy(valid_payload)
+        mutate(candidate)
+        try:
+            validate(candidate)
+        except comparator.ComparisonError:
+            return
+        fail(f"file-movement validator accepted {label}")
+
+    validate(valid_payload)
+    for showcase_scale, bytes_per_file in (
+        ("quick", 2 * 1024 * 1024),
+        ("full", 8 * 1024 * 1024),
+        ("stress", 32 * 1024 * 1024),
+    ):
+        scaled = copy.deepcopy(valid_payload)
+        scaled["scale"] = showcase_scale
+        scaled["bytes_per_file"] = bytes_per_file
+        scaled["total_bytes"] = 32 * bytes_per_file
+        scaled["source_digest"] = FILE_MOVE_SOURCE_DIGESTS[showcase_scale]
+        for participant in scaled["participants"]:
+            participant["bytes_moved"] = participant["work_units"] * bytes_per_file
+        rebind_job_map_digests(
+            scaled,
+            [FILE_MOVE_SOURCE_DIGESTS[showcase_scale]] * 32,
+            "artifact_digest",
+        )
+        assert_equal(
+            scaled["artifact_digest"],
+            FILE_MOVE_ARTIFACT_DIGESTS[showcase_scale],
+            f"{showcase_scale} file-movement aggregate identity",
+        )
+        validate(scaled)
+
+    mutations = {
+        "wrong workload identity": lambda payload: payload.__setitem__(
+            "workload_id", "substituted-file-move"
+        ),
+        "wrong operation": lambda payload: payload.__setitem__(
+            "operation", "copy-file-range"
+        ),
+        "wrong source relative path": lambda payload: payload.__setitem__(
+            "source_relative_path", "file-move/other.bin"
+        ),
+        "wrong destination relative path": lambda payload: payload.__setitem__(
+            "destination_relative_path", "file-move/other-destinations"
+        ),
+        "reduced file count": lambda payload: payload.__setitem__("files", 31),
+        "non-integral file count": lambda payload: payload.__setitem__(
+            "files", 32.0
+        ),
+        "wrong bytes per file": lambda payload: payload.__setitem__(
+            "bytes_per_file", 1024 * 1024
+        ),
+        "wrong total bytes": lambda payload: payload.__setitem__(
+            "total_bytes", 1
+        ),
+        "boolean chunk size": lambda payload: payload.__setitem__(
+            "chunk_bytes", True
+        ),
+        "wrong cache policy": lambda payload: payload.__setitem__(
+            "cache_policy", "cold-source-cold-destinations"
+        ),
+        "wrong artifact digest": lambda payload: payload.__setitem__(
+            "artifact_digest", "0" * 64
+        ),
+        "missing participant byte evidence": lambda payload: payload[
+            "participants"
+        ][1].pop("bytes_moved"),
+        "wrong participant byte evidence": lambda payload: payload[
+            "participants"
+        ][1].__setitem__("bytes_moved", 1),
+    }
+    for label, mutate in mutations.items():
+        reject(label, mutate)
+
+    def substitute_content(payload: dict[str, object]) -> None:
+        payload["source_digest"] = "0" * 64
+        rebind_job_map_digests(payload, ["0" * 64] * 32, "artifact_digest")
+
+    reject("coherent substituted source and destination content", substitute_content)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        valid = complete_matrix(root / "valid")
+        result = comparator.compare_runs(
+            valid, required_workloads=("file-movement",)
+        )
+        assert_equal(result["pass"], True, "file-movement-only acceptance")
+        assert_equal(len(result["rows"]), 4, "file-movement topology rows")
+        assert_equal(
+            {row["workload"] for row in result["rows"]},
+            {"file-movement"},
+            "file-movement row name",
+        )
+
+        distinct_routes = complete_matrix(root / "distinct-routes")
+        for index, manifest_path in enumerate(distinct_routes, start=1):
+            result_path = result_path_for(manifest_path, "wos-showcase")
+            payload = read_json(result_path)
+            measurement = measurement_for(payload, "wos_file_move")
+            route_path = f"/tmp/wos-showcase-fixed-{index:016x}"
+            measurement["route_path"] = route_path
+            for participant in measurement["participants"]:
+                participant["workspace_path"] = route_path
+            write_json(result_path, payload)
+        result = comparator.compare_runs(
+            distinct_routes, required_workloads=("file-movement",)
+        )
+        assert_equal(
+            result["pass"],
+            True,
+            "ephemeral file-movement route paths are not fingerprinted",
+        )
+
+        missing = complete_matrix(root / "missing")
+        result_path = result_path_for(missing[0], "wos-showcase")
+        payload = read_json(result_path)
+        payload["measurements"] = [
+            measurement
+            for measurement in payload["measurements"]
+            if measurement.get("benchmark") != "wos_file_move"
+        ]
+        write_json(result_path, payload)
+        result = comparator.compare_runs(
+            missing, required_workloads=("file-movement",)
+        )
+        if not any(
+            "one-node baseline missing workload: file-movement" in message
+            for message in result["missing"]
+        ):
+            fail(f"missing file-movement diagnostic is absent: {result['missing']}")
+
+        changed_runtime = complete_matrix(root / "changed-runtime")
+        result_path = result_path_for(changed_runtime[-1], "wos-showcase")
+        payload = read_json(result_path)
+        for measurement in payload["measurements"]:
+            if measurement.get("evidence_contract") == "wos-showcase-job-map-v1":
+                measurement["runtime_provenance"]["python_sha256"] = "e" * 64
+        write_json(result_path, payload)
+        expect_error(
+            comparator,
+            changed_runtime,
+            "workload parameters differ for file-movement",
+            required_workloads=("file-movement",),
+        )
+
+
 def test_showcase_cross_phase_and_outer_evidence_is_coherent(comparator) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -1427,7 +1664,9 @@ def test_showcase_cross_phase_and_outer_evidence_is_coherent(comparator) -> None
         null_launcher = complete_matrix(root / "null-launcher")
         candidate = result_path_for(null_launcher[1], "wos-showcase")
         payload = read_json(candidate)
-        payload["measurements"][3]["participants"][0]["launcher_host"] = None
+        measurement_for(payload, "wos_git_clone")["participants"][0][
+            "launcher_host"
+        ] = None
         write_json(candidate, payload)
         expect_error(
             comparator,
@@ -1511,6 +1750,7 @@ def main() -> None:
         test_render_matrix_and_per_host_work_are_enforced,
         test_showcase_routing_participant_coverage_and_python_rows,
         test_showcase_job_map_evidence_contract_is_strict,
+        test_file_movement_is_required_fingerprinted_and_strict,
         test_showcase_cross_phase_and_outer_evidence_is_coherent,
         test_cli_return_codes_and_machine_readable_result,
     ]
