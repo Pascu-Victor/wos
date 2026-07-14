@@ -632,6 +632,68 @@ def test_server_open_reuses_the_open_file_stat_snapshot() -> None:
         fail("remote VFS server open must not dereference a file after publishing it to peer cleanup")
 
 
+def test_server_roce_push_reads_reuse_registered_staging() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    handler = function_body(source, "handle_vfs_op")
+    rdma_start = handler.find("case OP_VFS_READ_RDMA:")
+    bulk_start = handler.find("case OP_VFS_READ_BULK:", rdma_start)
+    write_start = handler.find("case OP_VFS_WRITE_RDMA:", bulk_start)
+    if min(rdma_start, bulk_start, write_start) < 0:
+        fail("missing server RDMA/bulk read cases")
+
+    cases = [
+        (
+            handler[rdma_start:bulk_start],
+            "read_staging",
+            "wki_dev_server_get_vfs_read_staging_buf(channel_identity)",
+            "VFS_RDMA_BOUNCE_SIZE",
+        ),
+        (
+            handler[bulk_start:write_start],
+            "bulk_staging",
+            "wki_dev_server_get_vfs_bulk_staging_buf(channel_identity)",
+            "VFS_RDMA_ROCE_BULK_SIZE",
+        ),
+    ]
+    for case, staging_name, getter, size_token in cases:
+        require_tokens(
+            case,
+            [
+                size_token,
+                f"uint8_t* {staging_name} = {getter}",
+                f"PULL_MODE && {staging_name} == nullptr",
+                "uint8_t* allocated_read_buf = nullptr",
+                f"uint8_t* read_buf = {staging_name}",
+                "if (read_buf == nullptr)",
+                "allocated_read_buf = new (std::nothrow) uint8_t[len]",
+                "read_buf = allocated_read_buf",
+                "read_local_file_windowed(local_file, read_buf, len",
+                "if (!PULL_MODE && bytes_read > 0)",
+                "wki_roce_rdma_write_tagged(hdr->src_node, consumer_rkey, 0, read_buf",
+                "rdma_write(",
+                "read_buf,",
+                "delete[] allocated_read_buf",
+            ],
+            "server push read staging reuse",
+        )
+        if f"PULL_MODE ? {getter}" in case:
+            fail("server push reads must fetch registered staging in both modes")
+        if "delete[] read_buf" in case:
+            fail("server push reads must never delete registered staging")
+        require_order(
+            case,
+            [
+                f"uint8_t* {staging_name} = {getter}",
+                f"uint8_t* read_buf = {staging_name}",
+                "read_local_file_windowed(local_file, read_buf, len",
+                "if (!PULL_MODE && bytes_read > 0)",
+                "wki_roce_rdma_write_tagged(hdr->src_node, consumer_rkey, 0, read_buf",
+                "delete[] allocated_read_buf",
+            ],
+            "server push read staging lifetime",
+        )
+
+
 def test_write_behind_storage_grows_in_allocator_shaped_classes() -> None:
     header = REMOTE_VFS_HPP.read_text()
     source = REMOTE_VFS_CPP.read_text()
@@ -2054,6 +2116,7 @@ def main() -> None:
     test_shared_io_callers_timeout_or_fallback()
     test_message_fallback_readahead_targets_small_sequential_reads()
     test_server_open_reuses_the_open_file_stat_snapshot()
+    test_server_roce_push_reads_reuse_registered_staging()
     test_write_behind_storage_grows_in_allocator_shaped_classes()
     test_message_write_flush_retains_tail_on_request_allocation_failure()
     test_remote_open_closes_server_fd_on_local_allocation_failure()

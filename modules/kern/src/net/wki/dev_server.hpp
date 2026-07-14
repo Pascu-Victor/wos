@@ -300,12 +300,14 @@ void wki_dev_server_complete_vfs_write(const WkiChannelIdentity& identity, uint1
 
 void wki_dev_server_send_vfs_notify(uint32_t resource_id, uint16_t op_id, const uint8_t* data, uint16_t data_len);
 
-// Look up the server-side VFS read staging buffer (RoCE pull mode).
-// Returns nullptr if pull mode is not active for this binding.
+// Look up the server-side registered VFS read staging buffer. RoCE pull uses
+// it as the exposed source region; RoCE push can reuse it as local scratch.
+// Returns nullptr when this binding has no registered staging region.
 auto wki_dev_server_get_vfs_read_staging_buf(const WkiChannelIdentity& identity) -> uint8_t*;
 
-// Look up the server-side VFS bulk staging buffer (RoCE bulk pull mode).
-// Returns nullptr if bulk pull mode is not active for this binding.
+// Look up the server-side registered VFS bulk staging buffer. RoCE pull uses
+// it as the exposed source region; RoCE push can reuse it as local scratch.
+// Returns nullptr when this binding has no registered staging region.
 auto wki_dev_server_get_vfs_bulk_staging_buf(const WkiChannelIdentity& identity) -> uint8_t*;
 
 // Process deferred zone creations. Called from wki_timer_tick().

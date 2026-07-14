@@ -5375,8 +5375,8 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
         case OP_VFS_READ_RDMA: {
             // Request: {fd:i32, len:u32, off:i64, consumer_rkey:u32} = 20 bytes
             // Two modes depending on transport:
-            //   Push (ivshmem): rdma_write data to consumer's bounce buf (consumer_rkey), send tiny resp.
-            //   Pull (RoCE):    stage data in server's read staging buf; consumer rdma_reads after resp.
+            //   Push: rdma_write data to the consumer's bounce buf (consumer_rkey), then send a tiny response.
+            //   Pull: stage data in the server's read buf; the consumer rdma_reads after the response.
             auto send_rdma_read_err = [&](int16_t status = -EIO) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_READ_RDMA;
@@ -5406,7 +5406,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             // pull path where the server stages data and the client rdma_reads
             // it; nonzero asks the server to push into the consumer region.
             bool const PULL_MODE = consumer_rkey == 0;
-            uint8_t* read_staging = PULL_MODE ? wki_dev_server_get_vfs_read_staging_buf(channel_identity) : nullptr;
+            uint8_t* read_staging = wki_dev_server_get_vfs_read_staging_buf(channel_identity);
             WkiPeer const* rdma_peer = nullptr;
             if (PULL_MODE && read_staging == nullptr) {
                 send_rdma_read_err(-EIO);
@@ -5432,33 +5432,32 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             ker::vfs::File* local_file = rfd->file;
             s_vfs_lock.unlock();
 
-            ssize_t bytes_read = 0;
-            if (read_staging != nullptr) {
-                // Pull mode: read directly into server staging; client will rdma_read from it.
-                bytes_read = read_local_file_windowed(local_file, read_staging, len, static_cast<size_t>(offset));
-            } else {
-                auto* read_buf = new (std::nothrow) uint8_t[len];
-                if (read_buf == nullptr) {
+            uint8_t* allocated_read_buf = nullptr;
+            uint8_t* read_buf = read_staging;
+            if (read_buf == nullptr) {
+                allocated_read_buf = new (std::nothrow) uint8_t[len];
+                if (allocated_read_buf == nullptr) {
                     send_rdma_read_err(-ENOMEM);
                     break;
                 }
-
-                bytes_read = read_local_file_windowed(local_file, read_buf, len, static_cast<size_t>(offset));
-                if (bytes_read > 0) {
-                    int write_ret = 0;
-                    if (transport_is_roce(rdma_peer->rdma_transport)) {
-                        write_ret = wki_roce_rdma_write_tagged(hdr->src_node, consumer_rkey, 0, read_buf, static_cast<uint32_t>(bytes_read),
-                                                               REQ_COOKIE);
-                    } else {
-                        write_ret = rdma_peer->rdma_transport->rdma_write(rdma_peer->rdma_transport, hdr->src_node, consumer_rkey, 0,
-                                                                          read_buf, static_cast<uint32_t>(bytes_read));
-                    }
-                    if (write_ret != 0) {
-                        bytes_read = -EIO;
-                    }
-                }
-                delete[] read_buf;
+                read_buf = allocated_read_buf;
             }
+
+            ssize_t bytes_read = read_local_file_windowed(local_file, read_buf, len, static_cast<size_t>(offset));
+            if (!PULL_MODE && bytes_read > 0) {
+                int write_ret = 0;
+                if (transport_is_roce(rdma_peer->rdma_transport)) {
+                    write_ret = wki_roce_rdma_write_tagged(hdr->src_node, consumer_rkey, 0, read_buf, static_cast<uint32_t>(bytes_read),
+                                                           REQ_COOKIE);
+                } else {
+                    write_ret = rdma_peer->rdma_transport->rdma_write(rdma_peer->rdma_transport, hdr->src_node, consumer_rkey, 0, read_buf,
+                                                                      static_cast<uint32_t>(bytes_read));
+                }
+                if (write_ret != 0) {
+                    bytes_read = -EIO;
+                }
+            }
+            delete[] allocated_read_buf;
 
             // Response: {bytes_read:u32} = 4 bytes (data is now in consumer bounce buf)
             uint32_t br = (bytes_read > 0) ? static_cast<uint32_t>(bytes_read) : 0;
@@ -5478,8 +5477,8 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             // Bulk RDMA read - identical request layout to OP_VFS_READ_RDMA but len
             // is not capped to 64 KB.
             // Two modes:
-            //   Push (ivshmem): rdma_write up to 2 MB into consumer's bulk buf (consumer_rkey).
-            //   Pull (RoCE):    stage data in server's bulk staging buf; client rdma_reads after resp.
+            //   Push: rdma_write into the consumer's bulk buf (consumer_rkey).
+            //   Pull: stage data in the server's bulk buf; the consumer rdma_reads after the response.
             auto send_bulk_read_err = [&](int16_t status = -EIO) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_READ_BULK;
@@ -5503,15 +5502,15 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             memcpy(&offset, data + 8, sizeof(int64_t));
             memcpy(&consumer_rkey, data + 16, sizeof(uint32_t));
 
-            // Cap to the consumer's registered bulk size. RoCE pull mode uses
-            // a smaller server staging window than the ivshmem push path.
+            // Cap to the consumer's registered bulk size. A server staging
+            // window can impose a smaller cap in either transfer mode.
             len = std::min<uint32_t>(len, VFS_RDMA_BULK_SIZE);
 
             // Determine mode from the request rkey. rkey=0 keeps the legacy
             // pull path where the server stages data and the client rdma_reads
             // it; nonzero asks the server to push into the consumer region.
             bool const PULL_MODE = consumer_rkey == 0;
-            uint8_t* bulk_staging = PULL_MODE ? wki_dev_server_get_vfs_bulk_staging_buf(channel_identity) : nullptr;
+            uint8_t* bulk_staging = wki_dev_server_get_vfs_bulk_staging_buf(channel_identity);
             WkiPeer const* bulk_peer = nullptr;
             if (bulk_staging != nullptr) {
                 len = std::min<uint32_t>(len, VFS_RDMA_ROCE_BULK_SIZE);
@@ -5539,33 +5538,32 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             ker::vfs::File* local_file = rfd->file;
             s_vfs_lock.unlock();
 
-            ssize_t bytes_read = 0;
-            if (bulk_staging != nullptr) {
-                // Pull mode: read directly into server staging; client will rdma_read from it.
-                bytes_read = read_local_file_windowed(local_file, bulk_staging, len, static_cast<size_t>(offset));
-            } else {
-                auto* read_buf = new (std::nothrow) uint8_t[len];
-                if (read_buf == nullptr) {
+            uint8_t* allocated_read_buf = nullptr;
+            uint8_t* read_buf = bulk_staging;
+            if (read_buf == nullptr) {
+                allocated_read_buf = new (std::nothrow) uint8_t[len];
+                if (allocated_read_buf == nullptr) {
                     send_bulk_read_err(-ENOMEM);
                     break;
                 }
-
-                bytes_read = read_local_file_windowed(local_file, read_buf, len, static_cast<size_t>(offset));
-                if (bytes_read > 0) {
-                    int write_ret = 0;
-                    if (transport_is_roce(bulk_peer->rdma_transport)) {
-                        write_ret = wki_roce_rdma_write_tagged(hdr->src_node, consumer_rkey, 0, read_buf, static_cast<uint32_t>(bytes_read),
-                                                               REQ_COOKIE);
-                    } else {
-                        write_ret = bulk_peer->rdma_transport->rdma_write(bulk_peer->rdma_transport, hdr->src_node, consumer_rkey, 0,
-                                                                          read_buf, static_cast<uint32_t>(bytes_read));
-                    }
-                    if (write_ret != 0) {
-                        bytes_read = -EIO;
-                    }
-                }
-                delete[] read_buf;
+                read_buf = allocated_read_buf;
             }
+
+            ssize_t bytes_read = read_local_file_windowed(local_file, read_buf, len, static_cast<size_t>(offset));
+            if (!PULL_MODE && bytes_read > 0) {
+                int write_ret = 0;
+                if (transport_is_roce(bulk_peer->rdma_transport)) {
+                    write_ret = wki_roce_rdma_write_tagged(hdr->src_node, consumer_rkey, 0, read_buf, static_cast<uint32_t>(bytes_read),
+                                                           REQ_COOKIE);
+                } else {
+                    write_ret = bulk_peer->rdma_transport->rdma_write(bulk_peer->rdma_transport, hdr->src_node, consumer_rkey, 0, read_buf,
+                                                                      static_cast<uint32_t>(bytes_read));
+                }
+                if (write_ret != 0) {
+                    bytes_read = -EIO;
+                }
+            }
+            delete[] allocated_read_buf;
 
             uint32_t br = (bytes_read > 0) ? static_cast<uint32_t>(bytes_read) : 0;
             std::array<uint8_t, sizeof(DevOpRespPayload) + 4> bulk_resp_buf{};
