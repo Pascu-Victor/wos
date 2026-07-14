@@ -25,6 +25,7 @@ COMPILE_EXPECTED_SOURCE_SHA256=aa52bc6a7f7f5b58904b6c1d06fb7f813c8567c97470fbe41
 COMPILE_FLAGS='-std=c++23 -O2 -fno-ident'
 COMPILE_LINK_FLAGS='-std=c++23 -O2 -Wl,--build-id=none'
 COMPILE_CACHE_POLICY=prewarmed-compiler-source-headers-all-hosts
+COMPILE_LAUNCH_POLICY=one-controller-per-host-local-tu-workers
 COMPILE_LOCAL_ROUTE_OPERANDS='-/root/wos-showcase -/usr -/bin -/lib -/lib64 -/libexec -/share -/tmp'
 COMPILE_RUNTIME_PATHS_JSON='["/root/wos-showcase","/usr","/bin","/lib","/lib64","/libexec","/share","/tmp"]'
 # shellcheck disable=SC2016  # The targeted shell expands the compiler probe.
@@ -336,10 +337,12 @@ compile_cancel_jobs() {
         return 0
     fi
 
-    while read -r compile_pid _compile_tag _compile_host; do
-        kill "$compile_pid" 2>/dev/null || true
+    while read -r compile_pid compile_controller_tag _compile_host; do
+        if [ ! -f "$compile_workspace/controller-$compile_controller_tag.status" ]; then
+            kill "$compile_pid" 2>/dev/null || true
+        fi
     done < "$compile_pids"
-    while read -r compile_pid _compile_tag _compile_host; do
+    while read -r compile_pid _compile_controller_tag _compile_host; do
         wait "$compile_pid" 2>/dev/null || true
     done < "$compile_pids"
 }
@@ -467,47 +470,227 @@ run_distributed_compile() {
 
     : > "$compile_pids"
     compile_jobs_active=1
+    compile_controller_index=0
     while read -r compile_host compile_host_units compile_first_unit; do
-        compile_offset=0
-        while [ "$compile_offset" -lt "$compile_host_units" ]; do
-            compile_unit=$((compile_first_unit + compile_offset))
-            compile_tag="$(printf '%02d' "$compile_unit")"
-            compile_marker="$compile_workspace/runner-$compile_tag.txt"
-            compile_object="$compile_workspace/unit-$compile_tag.o"
-            compile_log="$compile_workspace/compile-$compile_tag.log"
-            compile_symbol="wos_compile_unit_$compile_tag"
-            # shellcheck disable=SC2016  # The targeted shell expands the submitted script.
-            # shellcheck disable=SC2086  # Fixed, whitespace-separated route operands.
-            on "$compile_host" forward "+$compile_workspace" $COMPILE_LOCAL_ROUTE_OPERANDS -- sh -c '
+        compile_controller_tag="$(printf '%02d' "$compile_controller_index")"
+        compile_controller_units="$compile_workspace/controller-$compile_controller_tag.units"
+        compile_controller_log="$compile_workspace/controller-$compile_controller_tag.log"
+        # One strict WKI launch owns this host's fixed range. The controller
+        # creates the same compiler-process count locally, avoiding a complete
+        # WKI submit/proxy/ELF lifecycle for every translation unit.
+        # shellcheck disable=SC2016  # The targeted shell expands the submitted script.
+        # shellcheck disable=SC2086  # Fixed, whitespace-separated route operands.
+        on "$compile_host" forward "+$compile_workspace" $COMPILE_LOCAL_ROUTE_OPERANDS -- sh -c '
 set -eu
-marker=$1
+workspace=$1
 cxx=$2
 source_file=$3
-object_file=$4
-symbol=$5
-workspace=$6
+unit_count=$4
+first_unit=$5
 cd "$workspace"
-wosid > "$marker"
-exec "$cxx" -std=c++23 -O2 -fno-ident -c "$source_file" "-Dmain=$symbol" -o "$object_file"
-' sh "$compile_marker" "$CXX" "$compile_source" "$compile_object" "$compile_symbol" "$compile_workspace" > "$compile_log" 2>&1 &
-            compile_pid=$!
-            printf '%s %s %s\n' "$compile_pid" "$compile_tag" "$compile_host" >> "$compile_pids"
-            compile_offset=$((compile_offset + 1))
-        done
+
+cancel_children() {
+    if [ "${children_active:-0}" -ne 1 ]; then
+        return 0
+    fi
+    children_active=0
+    # shellcheck disable=SC2086  # Intentional split of numeric pid:tag records.
+    for child_record in $child_records; do
+        child_pid=${child_record%%:*}
+        child_tag=${child_record#*:}
+        case "$completed_tags" in
+            *" $child_tag "*) ;;
+            *) kill "$child_pid" 2>/dev/null || true ;;
+        esac
+    done
+    # shellcheck disable=SC2086  # Intentional split of numeric pid:tag records.
+    for child_record in $child_records; do
+        child_pid=${child_record%%:*}
+        child_tag=${child_record#*:}
+        case "$completed_tags" in
+            *" $child_tag "*) ;;
+            *) wait "$child_pid" 2>/dev/null || true ;;
+        esac
+    done
+}
+
+run_compile_unit() {
+    marker=$1
+    object_file=$2
+    symbol=$3
+    wosid > "$marker"
+    exec "$cxx" -std=c++23 -O2 -fno-ident -c "$source_file" "-Dmain=$symbol" -o "$object_file"
+}
+
+child_records=
+completed_tags=" "
+children_active=1
+trap "cancel_children" 0
+trap "cancel_children; exit 129" HUP
+trap "cancel_children; exit 130" INT
+trap "cancel_children; exit 143" TERM
+
+offset=0
+while [ "$offset" -lt "$unit_count" ]; do
+    unit=$((first_unit + offset))
+    tag=$(printf "%02d" "$unit")
+    marker="$workspace/runner-$tag.txt"
+    object_file="$workspace/unit-$tag.o"
+    compile_log="$workspace/compile-$tag.log"
+    symbol="wos_compile_unit_$tag"
+    run_compile_unit "$marker" "$object_file" "$symbol" > "$compile_log" 2>&1 &
+    child_pid=$!
+    child_records="$child_records $child_pid:$tag"
+    offset=$((offset + 1))
+done
+
+failed=0
+status_records=
+# shellcheck disable=SC2086  # Intentional split of numeric pid:tag records.
+for child_record in $child_records; do
+    child_pid=${child_record%%:*}
+    tag=${child_record#*:}
+    if wait "$child_pid"; then
+        child_rc=0
+    else
+        child_rc=$?
+        failed=1
+    fi
+    completed_tags="$completed_tags$tag "
+    status_records="$status_records $tag:$child_rc"
+done
+children_active=0
+
+# Return the compact per-unit status table over the controller stdout pipe.
+# The launcher captures it into a local file, so teardown diagnostics do not
+# depend on the forwarded workspace remaining reachable.
+# shellcheck disable=SC2086  # Intentional split of numeric tag:status records.
+for status_record in $status_records; do
+    status_tag=${status_record%%:*}
+    status_rc=${status_record#*:}
+    printf "%s %s\n" "$status_tag" "$status_rc"
+done
+
+if [ "$failed" -ne 0 ]; then
+    exit 1
+fi
+' wos-compile-controller "$compile_workspace" "$CXX" "$compile_source" "$compile_host_units" "$compile_first_unit" \
+            > "$compile_controller_units" 2> "$compile_controller_log" &
+        compile_pid=$!
+        printf '%s %s %s\n' "$compile_pid" "$compile_controller_tag" "$compile_host" >> "$compile_pids"
+        compile_controller_index=$((compile_controller_index + 1))
     done < "$compile_host_plan"
 
-    compile_failed=0
-    while read -r compile_pid compile_tag compile_host; do
+    while read -r compile_pid compile_controller_tag compile_host; do
         if wait "$compile_pid"; then
-            :
+            compile_controller_rc=0
         else
-            compile_rc=$?
-            printf 'distributed compile: unit %s on %s failed with rc=%s\n' "$compile_tag" "$compile_host" "$compile_rc" >&2
-            cat "$compile_workspace/compile-$compile_tag.log" >&2 || true
-            compile_failed=1
+            compile_controller_rc=$?
         fi
+        printf '%s\n' "$compile_controller_rc" > "$compile_workspace/controller-$compile_controller_tag.status"
     done < "$compile_pids"
     compile_jobs_active=0
+
+    compile_failed=0
+    compile_controller_index=0
+    while read -r compile_host compile_host_units compile_first_unit; do
+        compile_controller_tag="$(printf '%02d' "$compile_controller_index")"
+        compile_controller_units="$compile_workspace/controller-$compile_controller_tag.units"
+        compile_controller_status_file="$compile_workspace/controller-$compile_controller_tag.status"
+        compile_controller_log="$compile_workspace/controller-$compile_controller_tag.log"
+        compile_controller_status=
+        compile_controller_status_invalid=0
+        if ! read -r compile_controller_status < "$compile_controller_status_file"; then
+            printf 'distributed compile: controller on %s produced no status\n' "$compile_host" >&2
+            compile_controller_status_invalid=1
+            compile_failed=1
+        else
+            case "$compile_controller_status" in
+                ''|*[!0-9]*)
+                    printf 'distributed compile: controller on %s produced invalid status %s\n' \
+                        "$compile_host" "$compile_controller_status" >&2
+                    compile_controller_status_invalid=1
+                    compile_failed=1
+                    ;;
+            esac
+        fi
+
+        compile_unit_status_invalid=0
+        compile_unit_failure_seen=0
+        compile_status_count=0
+        if [ ! -f "$compile_controller_units" ]; then
+            printf 'distributed compile: controller on %s produced no unit statuses\n' "$compile_host" >&2
+            compile_unit_status_invalid=1
+            compile_failed=1
+        else
+            while read -r compile_status_tag compile_rc compile_status_extra; do
+                if [ "$compile_status_count" -ge "$compile_host_units" ]; then
+                    printf 'distributed compile: controller on %s produced extra unit status %s\n' \
+                        "$compile_host" "$compile_status_tag" >&2
+                    compile_unit_status_invalid=1
+                    compile_failed=1
+                    continue
+                fi
+                compile_unit=$((compile_first_unit + compile_status_count))
+                compile_tag="$(printf '%02d' "$compile_unit")"
+                if [ "$compile_status_tag" != "$compile_tag" ] || [ -n "$compile_status_extra" ]; then
+                    printf 'distributed compile: controller on %s produced invalid unit status for %s\n' \
+                        "$compile_host" "$compile_status_tag" >&2
+                    compile_unit_status_invalid=1
+                    compile_failed=1
+                fi
+                case "$compile_rc" in
+                    0) ;;
+                    ''|*[!0-9]*)
+                        printf 'distributed compile: unit %s on %s produced invalid status %s\n' \
+                            "$compile_tag" "$compile_host" "$compile_rc" >&2
+                        compile_unit_status_invalid=1
+                        compile_failed=1
+                        ;;
+                    *)
+                        printf 'distributed compile: unit %s on %s failed with rc=%s\n' \
+                            "$compile_tag" "$compile_host" "$compile_rc" >&2
+                        cat "$compile_workspace/compile-$compile_tag.log" >&2 || true
+                        compile_unit_failure_seen=1
+                        compile_failed=1
+                        ;;
+                esac
+                compile_status_count=$((compile_status_count + 1))
+            done < "$compile_controller_units"
+        fi
+        if [ "$compile_status_count" -ne "$compile_host_units" ]; then
+            printf 'distributed compile: controller on %s reported %s of %s unit statuses\n' \
+                "$compile_host" "$compile_status_count" "$compile_host_units" >&2
+            compile_unit_status_invalid=1
+            compile_failed=1
+        fi
+
+        compile_report_controller=0
+        if [ "$compile_controller_status_invalid" -ne 0 ] || [ "$compile_unit_status_invalid" -ne 0 ]; then
+            compile_report_controller=1
+        elif [ "$compile_controller_status" -eq 0 ]; then
+            if [ "$compile_unit_failure_seen" -ne 0 ]; then
+                printf 'distributed compile: controller on %s succeeded despite unit failures\n' "$compile_host" >&2
+                compile_report_controller=1
+                compile_failed=1
+            fi
+        elif [ "$compile_controller_status" -ne 1 ] || [ "$compile_unit_failure_seen" -eq 0 ]; then
+            compile_report_controller=1
+            compile_failed=1
+        fi
+        if [ "$compile_report_controller" -ne 0 ]; then
+            printf 'distributed compile: controller on %s failed with rc=%s\n' \
+                "$compile_host" "${compile_controller_status:-unknown}" >&2
+            cat "$compile_controller_log" >&2 || true
+        fi
+
+        compile_controller_index=$((compile_controller_index + 1))
+    done < "$compile_host_plan"
+
+    if [ "$compile_controller_index" -ne "$COMPILE_HOST_COUNT" ]; then
+        compile_error "controller status coverage does not match host count"
+        compile_failed=1
+    fi
     if [ "$compile_failed" -ne 0 ]; then
         return 1
     fi
@@ -624,7 +807,8 @@ exec "$cxx" -std=c++23 -O2 -fno-ident -c "$source_file" "-Dmain=$symbol" -o "$ob
         "$COMPILE_COMPILER_PATH" "$COMPILE_COMPILER_VERSION_SHA256" "$COMPILE_COMPILER_SHA256"
     printf '"wkictl_sha256":"%s",' "$COMPILE_WKICTL_SHA256"
     printf '"compile_flags":"%s","link_flags":"%s",' "$COMPILE_FLAGS" "$COMPILE_LINK_FLAGS"
-    printf '"cache_policy":"%s",' "$COMPILE_CACHE_POLICY"
+    printf '"cache_policy":"%s","launch_policy":"%s","controller_count":%s,' \
+        "$COMPILE_CACHE_POLICY" "$COMPILE_LAUNCH_POLICY" "$COMPILE_HOST_COUNT"
     printf '"artifact_digest":"%s","elapsed_seconds":%s,' "$compile_digest" "$compile_elapsed_seconds"
     printf '"placement":"%s","wki_route":"host-workspace","launcher_host":"%s",' \
         "$compile_placement" "$COMPILE_LAUNCHER_HOST"

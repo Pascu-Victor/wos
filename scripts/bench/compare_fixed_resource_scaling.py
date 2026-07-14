@@ -205,6 +205,7 @@ COMPILE_COMPILER_PATH = "/usr/bin/clang++"
 COMPILE_FLAGS = "-std=c++23 -O2 -fno-ident"
 COMPILE_LINK_FLAGS = "-std=c++23 -O2 -Wl,--build-id=none"
 COMPILE_CACHE_POLICY = "prewarmed-compiler-source-headers-all-hosts"
+COMPILE_LAUNCH_POLICY = "one-controller-per-host-local-tu-workers"
 
 
 SHOWCASE_METRICS = {
@@ -222,6 +223,7 @@ SHOWCASE_METRICS = {
             "compile_flags",
             "link_flags",
             "cache_policy",
+            "launch_policy",
             "runtime_route",
             "runtime_paths",
             "workspace_route",
@@ -1100,6 +1102,7 @@ def validate_showcase_participants(
             )
     if benchmark == "wos_distributed_compile":
         total_workers = payload.get("total_workers")
+        controller_count = payload.get("controller_count")
         runtime_paths = payload.get("runtime_paths")
         workspace_path = payload.get("workspace_path")
         workspace_suffix = (
@@ -1124,6 +1127,10 @@ def validate_showcase_participants(
             or payload.get("compile_flags") != COMPILE_FLAGS
             or payload.get("link_flags") != COMPILE_LINK_FLAGS
             or payload.get("cache_policy") != COMPILE_CACHE_POLICY
+            or payload.get("launch_policy") != COMPILE_LAUNCH_POLICY
+            or isinstance(controller_count, bool)
+            or not isinstance(controller_count, int)
+            or controller_count != len(expected_hosts)
             or not valid_lowercase_hex(payload.get("artifact_digest"), 64)
         ):
             raise ComparisonError(

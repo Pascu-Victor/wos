@@ -45,11 +45,23 @@ if [ "${MOCK_MISMATCH_HOST:-}" = "$host" ]; then
 fi
 if [ "${1:-}" = forward ]; then
     route_record=$host
+    launch_kind=probe
     for operand in "$@"; do
         route_record="$route_record|$operand"
         [ "$operand" != -- ] || break
     done
+    for operand in "$@"; do
+        case "$operand" in
+            wos-compile-controller) launch_kind=controller ;;
+            wos_compile_prewarm_*) launch_kind=prewarm ;;
+        esac
+    done
+    route_record="$route_record|kind=$launch_kind"
     printf '%s\n' "$route_record" >> "$MOCK_ON_LOG"
+    if [ "$launch_kind" = controller ] && [ "${MOCK_FAIL_CONTROLLER_HOST:-}" = "$host" ]; then
+        printf 'mock controller launch failure on %s\n' "$host" >&2
+        exit 42
+    fi
 fi
 MOCK_RUNNER=$runner
 export MOCK_RUNNER
@@ -190,6 +202,7 @@ if [ -n "$symbol" ]; then
             printf 'timed %s %s\n' "$runner" "$symbol" >> "$MOCK_EVENT_LOG"
             printf '%s %s\n' "$runner" "$symbol" >> "$MOCK_COMPILE_LOG"
             if [ "${MOCK_FAIL_SYMBOL:-}" = "$symbol" ]; then
+                printf 'fake-cxx forced failure for %s\n' "$symbol" >&2
                 exit 23
             fi
             ;;
@@ -315,6 +328,12 @@ def test_fixed_layouts() -> None:
                 != "prewarmed-compiler-source-headers-all-hosts"
             ):
                 fail(f"invalid cache policy: {metric}")
+            if (
+                metric.get("launch_policy")
+                != "one-controller-per-host-local-tu-workers"
+                or metric.get("controller_count") != node_count
+            ):
+                fail(f"invalid compile launch policy: {metric}")
             if metric.get("placement") != expected_placement:
                 fail(f"invalid placement evidence: {metric}")
             if metric.get("wki_route") != "host-workspace":
@@ -382,6 +401,12 @@ def test_fixed_layouts() -> None:
             )
             if len(compile_rows) != 32:
                 fail(f"expected 32 compiler jobs, got {compile_rows}")
+            compile_symbols = [row.split()[1] for row in compile_rows]
+            expected_symbols = {
+                f"wos_compile_unit_{unit:02d}" for unit in range(32)
+            }
+            if set(compile_symbols) != expected_symbols:
+                fail(f"compiler jobs have missing or duplicate units: {compile_rows}")
             on_rows = (root / "on.log").read_text(encoding="utf-8").splitlines()
             profile = [
                 "forward",
@@ -390,12 +415,16 @@ def test_fixed_layouts() -> None:
                 "--",
             ]
             expected_on_rows = (
-                ["|".join([host, *profile]) for host in [hosts[0], *hosts]]
-                + ["|".join([host, *profile]) for host in hosts]
+                [
+                    "|".join([host, *profile, "kind=probe"])
+                    for host in [hosts[0], *hosts]
+                ]
                 + [
-                    "|".join([host, *profile])
-                    for host, count in zip(hosts, expected_work, strict=True)
-                    for _index in range(count)
+                    "|".join([host, *profile, "kind=prewarm"]) for host in hosts
+                ]
+                + [
+                    "|".join([host, *profile, "kind=controller"])
+                    for host in hosts
                 ]
             )
             if on_rows != expected_on_rows:
@@ -443,11 +472,42 @@ def test_compile_failure_waits_for_all_jobs() -> None:
             fail(f"compiler failure was accepted:\n{result.stdout}")
         if "unit 07 on wos-0.wos failed with rc=23" not in result.stderr:
             fail(f"compiler failure diagnostic is missing:\n{result.stderr}")
+        if "fake-cxx forced failure for wos_compile_unit_07" not in result.stderr:
+            fail(f"per-unit compiler log was not recovered:\n{result.stderr}")
         compile_rows = (root / "compile.log").read_text(encoding="utf-8").splitlines()
         if len(compile_rows) != 32:
             fail(f"script did not launch/wait the full compile set: {compile_rows}")
+        on_rows = (root / "on.log").read_text(encoding="utf-8").splitlines()
+        if len(on_rows) != 7 or any(
+            not row.endswith("|kind=controller") for row in on_rows[-2:]
+        ):
+            fail(f"two-host compile did not use one timed controller per host: {on_rows}")
         if '"benchmark":"wos_distributed_compile"' in result.stdout:
             fail("failed compile emitted an acceptance metric")
+
+
+def test_controller_failure_preserves_infrastructure_diagnostic() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        result = run_showcase(
+            root,
+            ["wos-0.wos", "wos-1.wos"],
+            MOCK_FAIL_CONTROLLER_HOST="wos-1.wos",
+        )
+        if result.returncode == 0:
+            fail(f"controller failure was accepted:\n{result.stdout}")
+        required = [
+            "controller on wos-1.wos reported 0 of 16 unit statuses",
+            "controller on wos-1.wos failed with rc=42",
+            "mock controller launch failure on wos-1.wos",
+        ]
+        if any(token not in result.stderr for token in required):
+            fail(f"controller failure diagnostic is incomplete:\n{result.stderr}")
+        compile_rows = (root / "compile.log").read_text(encoding="utf-8").splitlines()
+        if len(compile_rows) != 16:
+            fail(f"healthy controller did not finish its assigned range: {compile_rows}")
+        if '"benchmark":"wos_distributed_compile"' in result.stdout:
+            fail("failed controller emitted an acceptance metric")
 
 
 def test_runner_mismatch_is_rejected() -> None:
@@ -626,6 +686,7 @@ def test_invalid_host_sets_are_rejected() -> None:
 def main() -> int:
     test_fixed_layouts()
     test_compile_failure_waits_for_all_jobs()
+    test_controller_failure_preserves_infrastructure_diagnostic()
     test_runner_mismatch_is_rejected()
     test_compiler_mismatch_is_rejected_before_timing()
     test_wkictl_mismatch_is_rejected_before_timing()
@@ -634,7 +695,7 @@ def main() -> int:
     test_prewarm_failure_is_rejected_before_timing()
     test_rotated_launcher_uses_canonical_three_node_partition()
     test_invalid_host_sets_are_rejected()
-    print("10 WOS showcase distributed compile tests passed")
+    print("11 WOS showcase distributed compile tests passed")
     return 0
 
 

@@ -444,6 +444,8 @@ def showcase_measurements(scale: float, node_count: int) -> list[dict[str, objec
                 "compile_flags": "-std=c++23 -O2 -fno-ident",
                 "link_flags": "-std=c++23 -O2 -Wl,--build-id=none",
                 "cache_policy": "prewarmed-compiler-source-headers-all-hosts",
+                "launch_policy": "one-controller-per-host-local-tu-workers",
+                "controller_count": node_count,
                 "runtime_route": "local",
                 "runtime_paths": JOB_MAP_RUNTIME_PATHS,
                 "workspace_route": "host",
@@ -1107,6 +1109,30 @@ def test_showcase_routing_participant_coverage_and_python_rows(comparator) -> No
         expect_error(
             comparator,
             bad_compile_cache_policy,
+            "invalid fixed compile evidence",
+            required_workloads=("distributed-compilation",),
+        )
+
+        bad_compile_launch_policy = complete_matrix(root / "bad-compile-launch-policy")
+        candidate = result_path_for(bad_compile_launch_policy[-1], "wos-showcase")
+        payload = read_json(candidate)
+        payload["measurements"][0]["launch_policy"] = "one-wki-launch-per-tu"
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            bad_compile_launch_policy,
+            "invalid fixed compile evidence",
+            required_workloads=("distributed-compilation",),
+        )
+
+        bad_compile_controller_count = complete_matrix(root / "bad-compile-controller-count")
+        candidate = result_path_for(bad_compile_controller_count[-1], "wos-showcase")
+        payload = read_json(candidate)
+        payload["measurements"][0]["controller_count"] = 32
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            bad_compile_controller_count,
             "invalid fixed compile evidence",
             required_workloads=("distributed-compilation",),
         )
