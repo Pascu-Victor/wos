@@ -754,6 +754,122 @@ def test_synthetic_readdir_visible_paths_are_initialized_by_root_strip() -> None
         cursor = verification_pos + len(verification)
 
 
+def test_statat_scratch_is_initialized_by_dirfd_resolver() -> None:
+    core = VFS_CORE_CPP.read_text()
+    statat = function_body(core, "vfs_statat")
+    resolver = function_body(core, "resolve_dirfd_task_path_raw")
+    fast_resolver = function_body(core, "resolve_dirfd_task_path_raw_common_local_fast_path")
+    selftest = function_body(core, "vfs_selftest_statat_root_cwd_relative_paths")
+
+    declaration = "std::array<char, MAX_PATH_LEN> resolved __attribute__((uninitialized));"
+    require_only_uninitialized_array(statat, "resolved", declaration, "statat resolved-path scratch")
+    require_order(
+        statat,
+        [
+            "vfs_stat_absolute_local_fast_path(task, pathname, FOLLOW_FINAL_SYMLINK, statbuf, &fast_result)",
+            "return fast_result",
+            declaration,
+            "int const RESOLVE_RET = resolve_dirfd_task_path_raw(task, dirfd, pathname, resolved.data(), resolved.size(), true,",
+            "if (RESOLVE_RET < 0)",
+            "return RESOLVE_RET",
+            "resolved_task_path_is_wki_entry(task, resolved.data())",
+            "maybe_ensure_wki_host_root_mount_for_task(task, resolved.data())",
+            "vfs_stat_resolved_cache_or_impl(resolved.data()",
+        ],
+        "statat resolved-path producer and consumer ordering",
+    )
+    failure = block_body_after(statat[statat.find("if (RESOLVE_RET < 0)") :], "if (RESOLVE_RET < 0)")
+    if failure.strip() != "return RESOLVE_RET;":
+        fail("statat must return before consuming failed resolved-path output")
+    if len(re.findall(r"\bresolved\b", statat)) != 6:
+        fail("statat resolved-path scratch has an unexpected producer or consumer")
+
+    if len(re.findall(r"\bout\b", resolver)) != 16 or len(re.findall(r"\boutsize\b", resolver)) != 7:
+        fail("dirfd resolver destination flow changed; re-audit for redundant whole-buffer clearing")
+    resolver_clear_patterns = [
+        r"\b(?:std::)?memset\s*\(\s*out\b",
+        r"\bstd::(?:ranges::)?fill(?:_n)?\s*\(\s*out\b",
+        r"\bout\s*\[[^]]+\]\s*=\s*(?:0|'\\0')",
+    ]
+    if any(re.search(pattern, resolver) for pattern in resolver_clear_patterns):
+        fail("dirfd resolver must not clear its complete destination before bounded production")
+    if len(re.findall(r"\bout\b", fast_resolver)) != 9 or len(re.findall(r"\boutsize\b", fast_resolver)) != 4:
+        fail("fast dirfd resolver destination flow changed; re-audit for redundant whole-buffer clearing")
+    if any(re.search(pattern, fast_resolver) for pattern in resolver_clear_patterns):
+        fail("fast dirfd resolver must not clear its complete destination before bounded production")
+
+    fast_producer_flows = {
+        "copy_common_local_dirfd_relative_path": (4, 4),
+        "copy_common_local_visible_absolute_path_fast_path": (5, 3),
+        "copy_task_visible_absolute_path_with_root": (5, 3),
+        "copy_simple_relative_path_from_base": (9, 4),
+        "copy_dot_clean_visible_absolute_path": (4, 2),
+        "append_dot_clean_path_components": (5, 4),
+    }
+    bulk_clear_patterns = resolver_clear_patterns[:2]
+    for producer, (out_count, outsize_count) in fast_producer_flows.items():
+        body = function_body(core, producer)
+        if len(re.findall(r"\bout\b", body)) != out_count or len(re.findall(r"\boutsize\b", body)) != outsize_count:
+            fail(f"{producer} destination flow changed; re-audit for redundant whole-buffer clearing")
+        if any(re.search(pattern, body) for pattern in bulk_clear_patterns):
+            fail(f"{producer} must not bulk-clear its destination before bounded production")
+
+    require_order(
+        selftest,
+        [
+            "resolved.fill('x')",
+            "RESOLVE_RET = resolve_dirfd_task_path_raw(&task, AT_FDCWD, CANONICALIZED_RELATIVE, resolved.data(), resolved.size(), true,",
+            "RESOLVE_RET == 0",
+            "resolved_len == std::strlen(FILE_PATH)",
+            "std::strcmp(resolved.data(), FILE_PATH) == 0",
+            "resolved.at(resolved_len) == '\\0'",
+            "vfs_statat(&task, AT_FDCWD, CANONICALIZED_RELATIVE",
+        ],
+        "poisoned statat resolver KTEST coverage",
+    )
+    poison = "resolved.fill('x');"
+    if selftest.count("\n    resolved.fill('x');\n") != 1:
+        fail("statat resolver destination poison must be one unconditional complete statement")
+    call = "int const RESOLVE_RET = resolve_dirfd_task_path_raw(&task, AT_FDCWD, CANONICALIZED_RELATIVE, resolved.data(), resolved.size(), true,\n" \
+        "                                                        &requires_directory, &resolved_len);"
+    poison_pos = selftest.find(poison)
+    call_pos = selftest.find(call, poison_pos + len(poison))
+    if poison_pos < 0 or call_pos < 0 or selftest[poison_pos + len(poison) : call_pos].strip():
+        fail("statat resolver destination poison must immediately precede the producer call")
+    verification = (
+        "bool ok = RESOLVE_RET == 0 && !requires_directory && resolved_len == std::strlen(FILE_PATH) &&\n"
+        "              std::strcmp(resolved.data(), FILE_PATH) == 0 && resolved.at(resolved_len) == '\\0';"
+    )
+    call_end = call_pos + len(call)
+    verification_pos = selftest.find(verification, call_end)
+    if verification_pos < 0 or selftest[call_end:verification_pos].strip():
+        fail("statat resolver output must be verified before any destination mutation")
+    expected_selftest_uses = {
+        "resolved": 6,
+        "resolved_len": 4,
+        "RESOLVE_RET": 2,
+        "requires_directory": 3,
+    }
+    for name, count in expected_selftest_uses.items():
+        if len(re.findall(rf"\b{re.escape(name)}\b", selftest)) != count:
+            fail(f"statat resolver KTEST has unexpected {name} use")
+
+    functional_checks = [
+        "ok = ok && vfs_statat(&task, AT_FDCWD, SIMPLE_RELATIVE, 0, &st) == 0 && "
+        "(st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;",
+        "ok = ok && vfs_statat(&task, AT_FDCWD, CANONICALIZED_RELATIVE, 0, &st) == 0 && "
+        "(st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;",
+        "ok = ok && vfs_statat(&task, AT_FDCWD, SIMPLE_RELATIVE_TRAILING_SLASH, 0, &st) == -ENOTDIR;",
+        "ok = ok && vfs_statat(&task, AT_FDCWD, \"tmp/\", 0, &st) == 0 && "
+        "(st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFDIR;",
+        "ok = (vfs_unlink(FILE_PATH) == 0) && ok;",
+        "return ok;",
+    ]
+    require_order(selftest, [verification, *functional_checks], "sticky statat resolver KTEST result propagation")
+    if len(re.findall(r"\bok\s*=", selftest)) != 6 or selftest.count("return ok;") != 1:
+        fail("statat resolver KTEST result must remain sticky through cleanup and return")
+
+
 def test_open_path_scratch_is_initialized_by_its_producers() -> None:
     core = VFS_CORE_CPP.read_text()
 
@@ -869,5 +985,6 @@ if __name__ == "__main__":
     test_prefix_symlink_scratch_is_initialized_by_its_producers()
     test_readdir_child_path_scratch_is_initialized_by_its_producer()
     test_synthetic_readdir_visible_paths_are_initialized_by_root_strip()
+    test_statat_scratch_is_initialized_by_dirfd_resolver()
     test_open_path_scratch_is_initialized_by_its_producers()
     print("VFS open path scratch invariants hold")

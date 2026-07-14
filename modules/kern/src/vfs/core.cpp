@@ -10961,7 +10961,9 @@ auto vfs_statat(ker::mod::sched::task::Task* task, int dirfd, const char* pathna
         return fast_result;
     }
 
-    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // resolve_dirfd_task_path_raw initializes the complete NUL-terminated string on success.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> resolved __attribute__((uninitialized));
     bool require_directory = false;
     size_t resolved_len = UNKNOWN_PATH_LEN;
     uint64_t resolved_hash = UNKNOWN_PATH_HASH;
@@ -16805,8 +16807,17 @@ auto vfs_selftest_statat_root_cwd_relative_paths() -> bool {
     ker::mod::sched::task::Task task{};
     std::memcpy(task.cwd.data(), "/", 2);
 
+    std::array<char, MAX_PATH_LEN> resolved{};
+    bool requires_directory = false;
+    size_t resolved_len = UNKNOWN_PATH_LEN;
+    resolved.fill('x');
+    int const RESOLVE_RET = resolve_dirfd_task_path_raw(&task, AT_FDCWD, CANONICALIZED_RELATIVE, resolved.data(), resolved.size(), true,
+                                                        &requires_directory, &resolved_len);
+    bool ok = RESOLVE_RET == 0 && !requires_directory && resolved_len == std::strlen(FILE_PATH) &&
+              std::strcmp(resolved.data(), FILE_PATH) == 0 && resolved.at(resolved_len) == '\0';
+
     Stat st{};
-    bool ok = vfs_statat(&task, AT_FDCWD, SIMPLE_RELATIVE, 0, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
+    ok = ok && vfs_statat(&task, AT_FDCWD, SIMPLE_RELATIVE, 0, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
     ok = ok && vfs_statat(&task, AT_FDCWD, CANONICALIZED_RELATIVE, 0, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
     ok = ok && vfs_statat(&task, AT_FDCWD, SIMPLE_RELATIVE_TRAILING_SLASH, 0, &st) == -ENOTDIR;
     ok = ok && vfs_statat(&task, AT_FDCWD, "tmp/", 0, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFDIR;
