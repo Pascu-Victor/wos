@@ -4863,24 +4863,14 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 resp.data_len = 0;
                 send_simple_resp(resp);
             } else {
-                auto resp_total = static_cast<uint16_t>(sizeof(DevOpRespPayload) + sizeof(ker::vfs::Stat));
-                auto* resp_buf = new (std::nothrow) uint8_t[resp_total];
-                if (resp_buf == nullptr) {
-                    DevOpRespPayload resp = {};
-                    resp.op_id = OP_VFS_STAT;
-                    resp.status = -1;
-                    resp.data_len = 0;
-                    send_simple_resp(resp);
-                    break;
-                }
-
-                auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf);
+                // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): Every transmitted byte is populated below.
+                std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(ker::vfs::Stat)> resp_buf;
+                auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf.data());
                 resp->op_id = OP_VFS_STAT;
                 resp->status = 0;
                 resp->data_len = sizeof(ker::vfs::Stat);
-                memcpy(resp_buf + sizeof(DevOpRespPayload), &statbuf, sizeof(ker::vfs::Stat));
-                send_buffered_resp(resp_buf, resp_total);
-                delete[] resp_buf;
+                memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &statbuf, sizeof(ker::vfs::Stat));
+                send_buffered_resp(resp_buf.data(), static_cast<uint16_t>(resp_buf.size()));
             }
             break;
         }
@@ -4996,31 +4986,21 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 // Response: {target_len:u16, target[]}
                 auto resp_data_len = static_cast<uint16_t>(2 + TARGET_LEN);
                 auto resp_total = static_cast<uint16_t>(sizeof(DevOpRespPayload) + resp_data_len);
-                auto* resp_buf = new (std::nothrow) uint8_t[resp_total];
-                if (resp_buf == nullptr) {
-                    DevOpRespPayload resp = {};
-                    resp.op_id = OP_VFS_READLINK;
-                    resp.status = -1;
-                    resp.data_len = 0;
-                    resp.reserved = REQ_COOKIE;
-                    static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
-                    break;
-                }
-
-                auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf);
+                // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): Only resp_total populated bytes are transmitted.
+                std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(uint16_t) + 512> resp_buf;
+                auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf.data());
                 resp->op_id = OP_VFS_READLINK;
                 resp->status = 0;
                 resp->data_len = resp_data_len;
                 resp->reserved = REQ_COOKIE;
 
                 auto tlen = static_cast<uint16_t>(TARGET_LEN);
-                memcpy(resp_buf + sizeof(DevOpRespPayload), &tlen, sizeof(uint16_t));
-                memcpy(resp_buf + sizeof(DevOpRespPayload) + 2, target_buf.data(), TARGET_LEN);
+                memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &tlen, sizeof(uint16_t));
+                memcpy(resp_buf.data() + sizeof(DevOpRespPayload) + 2, target_buf.data(), TARGET_LEN);
 
                 perf_record_vfs_server_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::REPLY_SEND), hdr->src_node,
                                              channel_id, CORRELATION, 0, resp_total, CALLSITE);
-                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf, resp_total));
-                delete[] resp_buf;
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf.data(), resp_total));
             }
             break;
         }

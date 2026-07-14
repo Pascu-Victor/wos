@@ -1557,6 +1557,51 @@ def test_remote_vfs_channel_identity_survives_pool_slot_reuse() -> None:
         fail("server VFS worker must not reply on an ID-only replacement channel")
 
 
+def test_server_bounded_metadata_responses_use_stack_storage() -> None:
+    handler_body = function_body(REMOTE_VFS_CPP.read_text(), "handle_vfs_op")
+    stat_start = handler_body.find("case OP_VFS_STAT:")
+    mkdir_start = handler_body.find("case OP_VFS_MKDIR:", stat_start)
+    readlink_start = handler_body.find("case OP_VFS_READLINK:", mkdir_start)
+    symlink_start = handler_body.find("case OP_VFS_SYMLINK:", readlink_start)
+    if min(stat_start, mkdir_start, readlink_start, symlink_start) < 0:
+        fail("remote VFS bounded metadata opcode cases must remain present")
+
+    stat_case = handler_body[stat_start:mkdir_start]
+    require_order(
+        stat_case,
+        [
+            "ker::vfs::Stat statbuf = {}",
+            "int const RET = ker::vfs::vfs_stat_resolved(full_path.data(), &statbuf)",
+            "std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(ker::vfs::Stat)> resp_buf",
+            "reinterpret_cast<DevOpRespPayload*>(resp_buf.data())",
+            "memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &statbuf, sizeof(ker::vfs::Stat))",
+            "send_buffered_resp(resp_buf.data(), static_cast<uint16_t>(resp_buf.size()))",
+        ],
+        "fixed-size stat response storage",
+    )
+
+    readlink_case = handler_body[readlink_start:symlink_start]
+    require_order(
+        readlink_case,
+        [
+            "std::array<char, 512> target_buf{}",
+            "vfs_readlink_resolved(full_path.data(), target_buf.data(), target_buf.size() - 1)",
+            "std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(uint16_t) + 512> resp_buf",
+            "reinterpret_cast<DevOpRespPayload*>(resp_buf.data())",
+            "memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &tlen, sizeof(uint16_t))",
+            "memcpy(resp_buf.data() + sizeof(DevOpRespPayload) + 2, target_buf.data(), TARGET_LEN)",
+            "wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf.data(), resp_total)",
+        ],
+        "bounded readlink response storage",
+    )
+
+    for name, case in [("stat", stat_case), ("readlink", readlink_case)]:
+        if "new (std::nothrow)" in case or "delete[]" in case:
+            fail(f"server {name} response retained heap storage")
+        if re.search(r"resp_buf\s*(?:\{\}|=\s*\{\})", case):
+            fail(f"server {name} response zero-initializes its full stack buffer")
+
+
 def test_stale_fd_gc_drains_binding_users_before_file_close() -> None:
     body = function_body(REMOTE_VFS_CPP.read_text(), "wki_remote_vfs_gc_stale_fds")
     require_tokens(
@@ -1920,6 +1965,7 @@ def main() -> None:
     test_remote_vfs_teardown_releases_rdma_state_when_idle()
     test_remote_open_refs_delay_proxy_destroy_until_close()
     test_remote_vfs_channel_identity_survives_pool_slot_reuse()
+    test_server_bounded_metadata_responses_use_stack_storage()
     test_stale_fd_gc_drains_binding_users_before_file_close()
     test_server_fd_and_consumer_rx_use_exact_channel_identity()
     test_export_rebuild_is_revisioned_and_backing_mount_exact()
