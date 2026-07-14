@@ -211,7 +211,24 @@ auto try_acquire_backlog_consumer(BacklogQueue& q) -> bool {
     return ACQUIRED;
 }
 
-void wake_backlog_handler(BacklogQueue& q) {
+// Publish one packet into the lock-free MPSC stack. The predecessor returned
+// by the successful CAS is the exact empty-to-nonempty transition: failed CAS
+// attempts refresh old_head, including when a consumer drains between load
+// and publication.
+auto push_backlog_packet(BacklogQueue& q, PacketBuffer* pkt) -> bool {
+    q.depth.fetch_add(1, std::memory_order_relaxed);
+    PacketBuffer* old_head = q.head.load(std::memory_order_relaxed);
+    do {  // NOLINT
+        pkt->next = old_head;
+    } while (!q.head.compare_exchange_weak(old_head, pkt, std::memory_order_release, std::memory_order_relaxed));
+    return old_head == nullptr;
+}
+
+auto backlog_wake_mode_for_enqueue(bool queue_was_empty) -> ker::mod::sched::WakeCpuMode {
+    return queue_was_empty ? ker::mod::sched::WakeCpuMode::FORCE : ker::mod::sched::WakeCpuMode::COALESCE;
+}
+
+void wake_backlog_handler(BacklogQueue& q, ker::mod::sched::WakeCpuMode cpu_wake_mode) {
     if (q.handler == nullptr) {
         return;
     }
@@ -220,7 +237,7 @@ void wake_backlog_handler(BacklogQueue& q) {
     if (q.handler->cpu == ker::mod::cpu::current_cpu()) {
         ker::mod::sys::context_switch::request_reschedule();
     } else {
-        ker::mod::sched::wake_cpu(q.handler->cpu, ker::mod::sched::WakeCpuMode::FORCE);
+        ker::mod::sched::wake_cpu(q.handler->cpu, cpu_wake_mode);
     }
 }
 
@@ -229,7 +246,7 @@ void release_backlog_consumer(BacklogQueue& q) {
     q.consumer_active.store(false, std::memory_order_release);
     clear_consumer_owner(q);
     if (q.head.load(std::memory_order_acquire) != nullptr) {
-        wake_backlog_handler(q);
+        wake_backlog_handler(q, ker::mod::sched::WakeCpuMode::FORCE);
     }
 }
 
@@ -316,6 +333,29 @@ auto mix_hash(uint32_t h, uint32_t value) -> uint32_t {
 
 }  // namespace
 
+#ifdef WOS_SELFTEST
+auto backlog_selftest_enqueue_wake_mode_classification() -> bool {
+    static PacketBuffer first{};
+    static PacketBuffer second{};
+    first.next = nullptr;
+    second.next = nullptr;
+
+    BacklogQueue queue{};
+    auto const FIRST_WAKE_MODE = backlog_wake_mode_for_enqueue(push_backlog_packet(queue, &first));
+    auto const SECOND_WAKE_MODE = backlog_wake_mode_for_enqueue(push_backlog_packet(queue, &second));
+    PacketBuffer* const BATCH = queue.head.exchange(nullptr, std::memory_order_acquire);
+    uint64_t const BATCH_DEPTH = queue.depth.load(std::memory_order_relaxed);
+    bool const BATCH_VALID = BATCH == &second && second.next == &first && first.next == nullptr && BATCH_DEPTH == 2;
+
+    queue.depth.store(0, std::memory_order_relaxed);
+    first.next = nullptr;
+    auto const POST_DRAIN_WAKE_MODE = backlog_wake_mode_for_enqueue(push_backlog_packet(queue, &first));
+    return FIRST_WAKE_MODE == ker::mod::sched::WakeCpuMode::FORCE && SECOND_WAKE_MODE == ker::mod::sched::WakeCpuMode::COALESCE &&
+           BATCH_VALID && POST_DRAIN_WAKE_MODE == ker::mod::sched::WakeCpuMode::FORCE &&
+           queue.head.load(std::memory_order_relaxed) == &first && queue.depth.load(std::memory_order_relaxed) == 1;
+}
+#endif
+
 void backlog_init() {
     num_cpus = ker::mod::smt::get_core_count();
     if (num_cpus <= 1) {
@@ -351,14 +391,11 @@ void backlog_enqueue(uint64_t target_cpu, PacketBuffer* pkt) {
     }
     auto& q = queues[target_cpu];
 
-    // Lock-free MPSC push: CAS on head.
-    q.depth.fetch_add(1, std::memory_order_relaxed);
-    PacketBuffer* old_head = q.head.load(std::memory_order_relaxed);
-    do {  // NOLINT
-        pkt->next = old_head;
-    } while (!q.head.compare_exchange_weak(old_head, pkt, std::memory_order_release, std::memory_order_relaxed));
-
-    wake_backlog_handler(q);
+    bool const QUEUE_WAS_EMPTY = push_backlog_packet(q, pkt);
+    // Every producer still helps a blocked handler make progress. Appenders
+    // only downgrade the remote CPU poke to the scheduler's COALESCE mode,
+    // which deliberately still sends an IPI when the target is halted.
+    wake_backlog_handler(q, backlog_wake_mode_for_enqueue(QUEUE_WAS_EMPTY));
 }
 
 auto backlog_flow_hash(PacketBuffer* pkt, uint64_t num_cpus) -> uint64_t {

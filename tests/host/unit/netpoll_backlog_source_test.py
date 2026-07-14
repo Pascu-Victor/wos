@@ -53,12 +53,22 @@ def require_order(source: str, tokens: list[str], context: str) -> None:
 def test_napi_worker_and_scheduler_lost_wake_guards() -> None:
     source = NETPOLL_CPP.read_text()
 
+    has_work_body = function_body(source, "napi_worker_has_work")
+    require_order(
+        has_work_body,
+        [
+            "napi->has_work.load(std::memory_order_acquire)",
+            "napi->state.load(std::memory_order_acquire) != NapiState::SCHEDULED",
+            "napi->has_work.store(true, std::memory_order_release)",
+        ],
+        "NAPI worker state/work reconciliation",
+    )
     worker_body = function_body(source, "napi_worker_loop")
     require_order(
         worker_body,
         [
-            "!napi->has_work.load(std::memory_order_acquire)",
-            "ker::mod::sched::kern_block()",
+            "!napi_worker_has_work(napi)",
+            "ker::mod::sched::kern_sleep_us(NAPI_WORKER_IDLE_SLEEP_US)",
             "napi->has_work.store(false, std::memory_order_release)",
             "napi->state.load(std::memory_order_acquire) == NapiState::SCHEDULED",
             "napi->has_work.store(true, std::memory_order_release)",
@@ -81,7 +91,7 @@ def test_napi_worker_and_scheduler_lost_wake_guards() -> None:
             "worker->cpu",
             "ker::mod::cpu::current_cpu()",
             "ker::mod::sys::context_switch::request_reschedule()",
-            "ker::mod::sched::wake_cpu(WORKER_CPU)",
+            "ker::mod::sched::wake_cpu(WORKER_CPU,",
         ],
         "NAPI same-CPU worker reschedule poke",
     )
@@ -156,7 +166,7 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
             "release_backlog_consumer",
             "q.consumer_active.store(false, std::memory_order_release)",
             "q.head.load(std::memory_order_acquire) != nullptr",
-            "wake_backlog_handler(q)",
+            "wake_backlog_handler(q, ker::mod::sched::WakeCpuMode::FORCE)",
         ],
         "backlog consumer guard and batch preparation helpers",
     )
@@ -167,7 +177,8 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
             "ker::mod::sched::kern_wake(q.handler)",
             "q.handler->cpu == ker::mod::cpu::current_cpu()",
             "ker::mod::sys::context_switch::request_reschedule()",
-            "ker::mod::sched::wake_cpu(q.handler->cpu)",
+            "ker::mod::sched::wake_cpu(q.handler->cpu,",
+            "cpu_wake_mode",
         ],
         "backlog handler wake helper",
     )
@@ -177,7 +188,7 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
         handler_body,
         [
             "if (!try_acquire_backlog_consumer(q))",
-            "ker::mod::sched::kern_yield()",
+            "ker::mod::sched::kern_sleep_us(BACKLOG_CONSUMER_CONTENTION_SLEEP_US)",
             "continue;",
             "q.head.exchange(nullptr, std::memory_order_acquire)",
             "release_backlog_consumer(q)",
@@ -193,35 +204,54 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
     require_order(
         handler_body,
         [
-            "static_cast<void>(prepare_backlog_batch(batch, q, normal_head, wki_head))",
-            "process_packet_list(normal_head)",
+            "int const QUEUE_DRAINED = prepare_backlog_batch(batch, q, normal_head, wki_head)",
+            "process_packet_list(normal_head, true)",
             "release_backlog_consumer(q)",
-            "process_packet_list(wki_head)",
+            "process_packet_list(wki_head, true)",
         ],
         "backlog handler releases consumer before WKI post-processing",
     )
 
+    push_body = function_body(source, "push_backlog_packet")
+    require_order(
+        push_body,
+        [
+            "q.depth.fetch_add(1, std::memory_order_relaxed)",
+            "q.head.compare_exchange_weak(old_head, pkt, std::memory_order_release, std::memory_order_relaxed)",
+            "return old_head == nullptr",
+        ],
+        "backlog MPSC publish returns the successful-CAS empty transition",
+    )
+    wake_mode_body = function_body(source, "backlog_wake_mode_for_enqueue")
+    require_order(
+        wake_mode_body,
+        [
+            "queue_was_empty",
+            "ker::mod::sched::WakeCpuMode::FORCE",
+            "ker::mod::sched::WakeCpuMode::COALESCE",
+        ],
+        "backlog enqueue wake mode follows the successful-CAS transition",
+    )
     enqueue_body = function_body(source, "backlog_enqueue")
-    require_tokens(
+    require_order(
         enqueue_body,
         [
-            "q.head.compare_exchange_weak(old_head, pkt, std::memory_order_release, std::memory_order_relaxed)",
-            "wake_backlog_handler(q)",
+            "bool const QUEUE_WAS_EMPTY = push_backlog_packet(q, pkt)",
+            "wake_backlog_handler(q, backlog_wake_mode_for_enqueue(QUEUE_WAS_EMPTY))",
         ],
-        "backlog enqueue wake/reschedule guard",
+        "backlog enqueue coalesces only the remote CPU poke for an existing batch",
     )
 
-    inline_body = function_body(source, "backlog_drain_all_pending_inline")
+    inline_body = function_body(source, "drain_backlog_queue_inline")
     require_tokens(
         inline_body,
         [
-            "ready.load(std::memory_order_acquire)",
             "if (!try_acquire_backlog_consumer(q))",
             "q.head.exchange(nullptr, std::memory_order_acquire)",
             "release_backlog_consumer(q)",
             "prepare_backlog_batch(batch, q, normal_head, wki_head)",
-            "process_packet_list(normal_head)",
-            "process_packet_list(wki_head)",
+            "process_packet_list(normal_head, cooperative)",
+            "process_packet_list(wki_head, cooperative)",
         ],
         "backlog inline drain acquire ownership guard",
     )
@@ -229,11 +259,21 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
         inline_body,
         [
             "int const QUEUE_DRAINED = prepare_backlog_batch(batch, q, normal_head, wki_head)",
-            "process_packet_list(normal_head)",
+            "process_packet_list(normal_head, cooperative)",
             "release_backlog_consumer(q)",
-            "process_packet_list(wki_head)",
+            "process_packet_list(wki_head, cooperative)",
         ],
         "backlog inline drain releases consumer before WKI post-processing",
+    )
+
+    drain_all_body = function_body(source, "backlog_drain_all_pending_inline")
+    require_order(
+        drain_all_body,
+        [
+            "ready.load(std::memory_order_acquire)",
+            "drained += drain_backlog_queue_inline(queues[cpu_idx], false)",
+        ],
+        "backlog rescue drains each queue through the guarded inline consumer",
     )
 
 

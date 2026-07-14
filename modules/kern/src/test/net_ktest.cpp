@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <net/backlog.hpp>
 #include <net/checksum.hpp>
 #include <net/packet.hpp>
 #include <net/proto/udp.hpp>
@@ -174,6 +175,8 @@ KTEST(Net, PacketBufferLifetimeReleaseRunsOnceAndClearsBeforeReuse) {
     KEXPECT_EQ(release_count, 1U);
     KEXPECT_EQ(ker::net::pkt_pool_free_count(), BASELINE_FREE);
 }
+
+KTEST(NetBacklog, EnqueueWakeModeClassifiesEmptyTransition) { KEXPECT_TRUE(ker::net::backlog_selftest_enqueue_wake_mode_classification()); }
 
 KTEST(Net, UdpSendRejectsOversizeBeforePacketCopy) {
     auto* ops = ker::net::proto::get_udp_proto_ops();

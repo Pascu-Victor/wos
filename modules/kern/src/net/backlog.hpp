@@ -68,5 +68,8 @@ auto backlog_ready() -> bool;
 void backlog_get_snapshot(BacklogSnapshot& out);
 auto backlog_drain_all_pending_inline() -> int;
 auto backlog_rescue_needed(uint64_t min_queue_depth) -> bool;
+#ifdef WOS_SELFTEST
+auto backlog_selftest_enqueue_wake_mode_classification() -> bool;
+#endif
 
 }  // namespace ker::net
