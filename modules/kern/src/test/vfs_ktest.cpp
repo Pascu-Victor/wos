@@ -85,6 +85,8 @@ KTEST(VFS, ResolvedStatCacheRejectsMountGenerationChange) {
 
 KTEST(VFS, PathTextScanMatchesHelpers) { KEXPECT_TRUE(ker::vfs::vfs_selftest_path_text_scan_matches_helpers()); }
 
+KTEST(VFS, WkiHostAliasOverlap) { KEXPECT_TRUE(ker::vfs::vfs_selftest_wki_host_alias_overlap()); }
+
 KTEST(VFS, WkiHostRootMountGateMatchesTaskRoot) { KEXPECT_TRUE(ker::vfs::vfs_selftest_wki_host_root_mount_gate_matches_task_root()); }
 
 KTEST(VFS, ResolvedWkiEntryUsesTaskRootView) { KEXPECT_TRUE(ker::vfs::vfs_selftest_resolved_wki_entry_uses_task_root_view()); }

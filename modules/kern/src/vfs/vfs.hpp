@@ -303,6 +303,7 @@ auto vfs_selftest_rename_seeds_metadata_cache() -> bool;
 auto vfs_selftest_metadata_cache_rejects_stale_negative_store() -> bool;
 auto vfs_selftest_resolved_stat_cache_rejects_mount_generation_change() -> bool;
 auto vfs_selftest_path_text_scan_matches_helpers() -> bool;
+auto vfs_selftest_wki_host_alias_overlap() -> bool;
 auto vfs_selftest_wki_host_root_mount_gate_matches_task_root() -> bool;
 auto vfs_selftest_resolved_wki_entry_uses_task_root_view() -> bool;
 auto vfs_selftest_absolute_local_stat_fast_path_gate() -> bool;

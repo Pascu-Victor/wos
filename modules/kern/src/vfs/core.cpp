@@ -5766,17 +5766,19 @@ auto build_wki_host_path(const char* hostname, const char* suffix, char* out, si
         return -ENAMETOOLONG;
     }
 
-    size_t pos = 0;
-    std::memcpy(out + pos, "/wki/", WKI_PATH_PREFIX_LEN);
-    pos += WKI_PATH_PREFIX_LEN;
-    std::memcpy(out + pos, hostname, HOST_LEN);
-    pos += HOST_LEN;
+    size_t const HOST_END = WKI_PATH_PREFIX_LEN + HOST_LEN;
     if (SUFFIX_LEN > 0) {
-        out[pos++] = '/';
-        std::memcpy(out + pos, trimmed_suffix, SUFFIX_LEN);
-        pos += SUFFIX_LEN;
+        // The host-alias rewrite can build in place. Preserve an aliased suffix
+        // before writing the replacement prefix over its original bytes.
+        std::memmove(out + HOST_END + 1, trimmed_suffix, SUFFIX_LEN + 1);
     }
-    out[pos] = '\0';
+
+    std::memcpy(out, "/wki/", WKI_PATH_PREFIX_LEN);
+    std::memcpy(out + WKI_PATH_PREFIX_LEN, hostname, HOST_LEN);
+    if (SUFFIX_LEN > 0) {
+        out[HOST_END] = '/';
+    }
+    out[TOTAL - 1] = '\0';
     return 0;
 }
 
@@ -5979,8 +5981,8 @@ auto rewrite_wki_host_alias(const ker::mod::sched::task::Task* task, const char*
                 return -ENAMETOOLONG;
             }
 
+            std::memmove(current.data() + 1, suffix, SUFFIX_LEN + 1);
             current[0] = '/';
-            std::memcpy(current.data() + 1, suffix, SUFFIX_LEN + 1);
             copy_result = 0;
         }
 
@@ -7278,6 +7280,47 @@ auto vfs_selftest_path_text_scan_matches_helpers() -> bool {
 
     PathTextScan const NULL_SCAN = scan_path_text(nullptr);
     return NULL_SCAN.path_len == 0 && !NULL_SCAN.requires_directory && NULL_SCAN.needs_canonicalize;
+}
+
+auto vfs_selftest_wki_host_alias_overlap() -> bool {
+    constexpr const char* PRIMARY_SUBMITTER = "ktest-submit";
+    constexpr const char* ALTERNATE_SUBMITTER = "ktest-submit-alt";
+    bool const USE_PRIMARY = std::strcmp(ker::net::wki::g_wki.local_hostname.data(), PRIMARY_SUBMITTER) != 0;
+    const char* submitter = USE_PRIMARY ? PRIMARY_SUBMITTER : ALTERNATE_SUBMITTER;
+
+    ker::mod::sched::task::Task remote_task{};
+    if (copy_path_string(submitter, remote_task.wki_submitter_hostname.data(), remote_task.wki_submitter_hostname.size()) < 0) {
+        return false;
+    }
+
+    ker::mod::sched::task::Task local_task{};
+    std::array<char, MAX_PATH_LEN> out{};
+    auto rewrites_to = [&](const ker::mod::sched::task::Task* task, const char* input, const char* expected) -> bool {
+        out.fill('\0');
+        return rewrite_wki_host_alias(task, input, out.data(), out.size()) == 0 && std::strcmp(out.data(), expected) == 0;
+    };
+
+    const char* expected_remote =
+        USE_PRIMARY ? "/wki/ktest-submit/project/sources/overlap.cpp" : "/wki/ktest-submit-alt/project/sources/overlap.cpp";
+    const char* expected_remote_root = USE_PRIMARY ? "/wki/ktest-submit" : "/wki/ktest-submit-alt";
+    bool ok = rewrites_to(&remote_task, "/wki/host/project/sources/overlap.cpp", expected_remote);
+    ok = ok && rewrites_to(&remote_task, "/wki/host", expected_remote_root);
+    ok = ok && rewrites_to(&remote_task, "/wki/hostname/project", "/wki/hostname/project");
+
+    ok = ok && rewrites_to(&local_task, "/wki/host/project/sources/overlap.cpp", "/project/sources/overlap.cpp");
+    ok = ok && rewrites_to(&local_task, "/wki/host", "/");
+    ok = ok && rewrites_to(&local_task, "/wki/host/wki/host/file", "/file");
+    ok = ok && rewrites_to(&local_task, "/wki/hostname/project", "/wki/hostname/project");
+
+    if (ker::net::wki::g_wki.local_hostname[0] != '\0') {
+        std::array<char, MAX_PATH_LEN> self_path{};
+        if (build_wki_host_path(ker::net::wki::g_wki.local_hostname.data(), "project/sources/overlap.cpp", self_path.data(),
+                                self_path.size()) < 0) {
+            return false;
+        }
+        ok = ok && rewrites_to(&local_task, self_path.data(), "/project/sources/overlap.cpp");
+    }
+    return ok;
 }
 
 auto vfs_selftest_wki_host_root_mount_gate_matches_task_root() -> bool {

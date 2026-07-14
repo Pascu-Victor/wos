@@ -12,6 +12,8 @@ WKI_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.hpp"
 WIRE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wire.hpp"
 DEV_SERVER_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "dev_server.cpp"
 VFS_CORE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "core.cpp"
+VFS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "vfs.hpp"
+VFS_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "vfs_ktest.cpp"
 WKI_DEV_PROXY_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_dev_proxy_ktest.cpp"
 
 
@@ -50,6 +52,53 @@ def require_order(source: str, tokens: list[str], context: str) -> None:
         if found < 0:
             fail(f"{context}: missing ordered token {token}")
         cursor = found + len(token)
+
+
+def test_vfs_host_alias_rewrite_is_overlap_safe() -> None:
+    core = VFS_CORE_CPP.read_text()
+    build = function_body(core, "build_wki_host_path")
+    require_order(
+        build,
+        [
+            "if (TOTAL > out_size)",
+            "size_t const HOST_END = WKI_PATH_PREFIX_LEN + HOST_LEN",
+            "std::memmove(out + HOST_END + 1, trimmed_suffix, SUFFIX_LEN + 1)",
+            'std::memcpy(out, "/wki/", WKI_PATH_PREFIX_LEN)',
+            "std::memcpy(out + WKI_PATH_PREFIX_LEN, hostname, HOST_LEN)",
+            "out[HOST_END] = '/'",
+            "out[TOTAL - 1] = '\\0'",
+        ],
+        "overlap-safe WKI host path construction",
+    )
+    if "std::memcpy(out + pos, trimmed_suffix" in build:
+        fail("WKI host path construction must relocate an aliased suffix before prefix writes")
+
+    rewrite = function_body(core, "rewrite_wki_host_alias")
+    require_order(
+        rewrite,
+        [
+            "size_t const SUFFIX_LEN = std::strlen(suffix)",
+            "std::memmove(current.data() + 1, suffix, SUFFIX_LEN + 1)",
+            "current[0] = '/'",
+        ],
+        "overlap-safe local WKI host alias stripping",
+    )
+    if "std::memcpy(current.data() + 1, suffix" in rewrite:
+        fail("WKI host alias stripping must not use memcpy on overlapping ranges")
+
+    require_tokens(
+        VFS_HPP.read_text(),
+        ["auto vfs_selftest_wki_host_alias_overlap() -> bool;"],
+        "WKI host alias overlap selftest declaration",
+    )
+    require_tokens(
+        VFS_KTEST.read_text(),
+        [
+            "KTEST(VFS, WkiHostAliasOverlap)",
+            "vfs_selftest_wki_host_alias_overlap()",
+        ],
+        "WKI host alias overlap KTEST",
+    )
 
 
 def test_proxy_op_slot_waits_are_bounded() -> None:
@@ -2498,6 +2547,7 @@ def test_export_rebuild_is_revisioned_and_backing_mount_exact() -> None:
 
 
 def main() -> None:
+    test_vfs_host_alias_rewrite_is_overlap_safe()
     test_proxy_op_slot_waits_are_bounded()
     test_proxy_operations_fail_before_setup_when_slot_wait_times_out()
     test_proxy_request_envelopes_use_stack_storage()
