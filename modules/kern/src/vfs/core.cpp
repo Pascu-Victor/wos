@@ -12778,8 +12778,11 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
         return -EINVAL;
     }
 
-    std::array<char, MAX_PATH_LEN> old_buf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-    std::array<char, MAX_PATH_LEN> new_buf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // Each fast or fallback resolver initializes a complete NUL-terminated path before use.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> old_buf __attribute__((uninitialized));
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> new_buf __attribute__((uninitialized));
     auto* task = ker::mod::sched::get_current_task();
     PathTextScan old_scan{};
     size_t old_buf_len = UNKNOWN_PATH_LEN;
@@ -12818,8 +12821,11 @@ auto vfs_renameat(ker::mod::sched::task::Task* task, int olddirfd, const char* o
         return -EINVAL;
     }
 
-    std::array<char, MAX_PATH_LEN> old_resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-    std::array<char, MAX_PATH_LEN> new_resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // Each path resolver initializes a complete NUL-terminated path before successful return.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> old_resolved __attribute__((uninitialized));
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> new_resolved __attribute__((uninitialized));
     bool old_path_requires_directory = false;
     bool new_path_requires_directory = false;
     size_t old_resolved_len = UNKNOWN_PATH_LEN;

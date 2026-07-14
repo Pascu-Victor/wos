@@ -316,6 +316,141 @@ def test_wki_host_mount_scratch_is_initialized_by_its_producers() -> None:
             fail(f"WKI host mount scratch must not retain a redundant clear: {legacy}")
 
 
+def test_vfs_rename_scratch_is_initialized_by_its_producers() -> None:
+    core = VFS_CORE_CPP.read_text()
+    rename = function_body(core, "vfs_rename")
+
+    require_tokens(
+        rename,
+        [
+            "std::array<char, MAX_PATH_LEN> old_buf __attribute__((uninitialized));",
+            "std::array<char, MAX_PATH_LEN> new_buf __attribute__((uninitialized));",
+        ],
+        "vfs_rename producer-owned scratch",
+    )
+    old_fast = block_body_after(rename, "if (task_absolute_local_path_fast_path_allowed(task, oldpath, &old_scan))")
+    require_order(
+        old_fast,
+        [
+            "copy_path_string(oldpath, old_buf.data(), old_buf.size(), old_scan.path_len, &old_buf_len)",
+            "if (COPY_RET < 0)",
+            "return COPY_RET",
+            "old_buf_hash = old_scan.path_hash",
+        ],
+        "vfs_rename old fast producer",
+    )
+    old_slow = block_body_after(
+        rename,
+        "else if (resolve_task_path_raw_impl(oldpath, old_buf.data(), old_buf.size(), true, &old_buf_len, &old_buf_hash) < 0)",
+    )
+    if old_slow.strip() != "return -ENAMETOOLONG;":
+        fail("vfs_rename must return when the old fallback producer fails")
+
+    new_fast = block_body_after(rename, "if (task_absolute_local_path_fast_path_allowed(task, newpath, &new_scan))")
+    require_order(
+        new_fast,
+        [
+            "copy_path_string(newpath, new_buf.data(), new_buf.size(), new_scan.path_len, &new_buf_len)",
+            "if (COPY_RET < 0)",
+            "return COPY_RET",
+            "new_buf_hash = new_scan.path_hash",
+        ],
+        "vfs_rename new fast producer",
+    )
+    new_slow = block_body_after(
+        rename,
+        "else if (resolve_task_path_raw_impl(newpath, new_buf.data(), new_buf.size(), true, &new_buf_len, &new_buf_hash) < 0)",
+    )
+    if new_slow.strip() != "return -ENAMETOOLONG;":
+        fail("vfs_rename must return when the new fallback producer fails")
+    require_order(
+        rename,
+        [
+            "if (task_absolute_local_path_fast_path_allowed(task, oldpath, &old_scan))",
+            "else if (resolve_task_path_raw_impl(oldpath, old_buf.data(), old_buf.size(), true, &old_buf_len, &old_buf_hash) < 0)",
+            "if (task_absolute_local_path_fast_path_allowed(task, newpath, &new_scan))",
+            "else if (resolve_task_path_raw_impl(newpath, new_buf.data(), new_buf.size(), true, &new_buf_len, &new_buf_hash) < 0)",
+            "vfs_rename_resolved_paths(old_buf.data(), new_buf.data(), path_requires_directory(oldpath), path_requires_directory(newpath),",
+            "old_buf_len, new_buf_len, old_buf_hash, new_buf_hash)",
+        ],
+        "vfs_rename producer-before-consumer ordering",
+    )
+
+    renameat = function_body(core, "vfs_renameat")
+    require_tokens(
+        renameat,
+        [
+            "std::array<char, MAX_PATH_LEN> old_resolved __attribute__((uninitialized));",
+            "std::array<char, MAX_PATH_LEN> new_resolved __attribute__((uninitialized));",
+        ],
+        "vfs_renameat producer-owned scratch",
+    )
+    old_resolver = (
+        "resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, olddirfd, oldpath, old_resolved.data(), old_resolved.size(), true,"
+    )
+    new_resolver = (
+        "resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, newdirfd, newpath, new_resolved.data(), new_resolved.size(), true,"
+    )
+    old_start = renameat.find(old_resolver)
+    new_start = renameat.find(new_resolver)
+    if old_start < 0 or new_start <= old_start:
+        fail("vfs_renameat must resolve old path before new path")
+    require_order(
+        renameat[old_start:new_start],
+        [
+            old_resolver,
+            "&old_path_requires_directory, &old_resolved_len, &old_resolved_hash)",
+            "if (result < 0)",
+            "return result",
+        ],
+        "vfs_renameat old producer failure gate",
+    )
+    require_order(
+        renameat[new_start:],
+        [
+            new_resolver,
+            "&new_path_requires_directory, &new_resolved_len, &new_resolved_hash)",
+            "if (result < 0)",
+            "return result",
+            "vfs_rename_resolved_paths(old_resolved.data(), new_resolved.data(), old_path_requires_directory, new_path_requires_directory,",
+            "old_resolved_len, new_resolved_len, old_resolved_hash, new_resolved_hash)",
+        ],
+        "vfs_renameat new producer and consumer ordering",
+    )
+
+    for body, name, data_uses, total_uses in [
+        (rename, "old_buf", 3, 6),
+        (rename, "new_buf", 3, 6),
+        (renameat, "old_resolved", 2, 4),
+        (renameat, "new_resolved", 2, 4),
+    ]:
+        if body.count(f"{name}.data()") != data_uses:
+            fail(f"{name} must have exactly {data_uses} producer/consumer data uses")
+        if len(re.findall(rf"\b{re.escape(name)}\b", body)) != total_uses:
+            fail(f"{name} has an unexpected use outside its producers and final consumer")
+
+    for legacy in [
+        "std::array<char, MAX_PATH_LEN> old_buf;",
+        "std::array<char, MAX_PATH_LEN> new_buf;",
+        "std::array<char, MAX_PATH_LEN> old_resolved;",
+        "std::array<char, MAX_PATH_LEN> new_resolved;",
+        "old_buf = {};",
+        "new_buf = {};",
+        "old_resolved = {};",
+        "new_resolved = {};",
+        "old_buf.fill(",
+        "new_buf.fill(",
+        "old_resolved.fill(",
+        "new_resolved.fill(",
+        "std::memset(old_buf.data()",
+        "std::memset(new_buf.data()",
+        "std::memset(old_resolved.data()",
+        "std::memset(new_resolved.data()",
+    ]:
+        if legacy in rename or legacy in renameat:
+            fail(f"VFS rename scratch must not retain a redundant clear: {legacy}")
+
+
 def test_proxy_op_slot_waits_are_bounded() -> None:
     header = REMOTE_VFS_HPP.read_text()
     source = REMOTE_VFS_CPP.read_text()
@@ -2819,6 +2954,7 @@ def main() -> None:
     test_vfs_host_alias_rewrite_is_overlap_safe()
     test_vfs_route_scratch_is_initialized_by_its_producer()
     test_wki_host_mount_scratch_is_initialized_by_its_producers()
+    test_vfs_rename_scratch_is_initialized_by_its_producers()
     test_proxy_op_slot_waits_are_bounded()
     test_proxy_operations_fail_before_setup_when_slot_wait_times_out()
     test_proxy_request_envelopes_use_stack_storage()
