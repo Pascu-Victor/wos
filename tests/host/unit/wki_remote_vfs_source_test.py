@@ -694,6 +694,173 @@ def test_server_roce_push_reads_reuse_registered_staging() -> None:
         )
 
 
+def test_remote_metadata_scratch_initializes_only_consumed_prefix() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+
+    build_calls = list(re.finditer(r"build_full_path\((\w+)\.data\(\)", source))
+    if len(build_calls) != 16:
+        fail(f"expected 16 bounded build_full_path outputs, found {len(build_calls)}")
+    for call in build_calls:
+        name = call.group(1)
+        declaration = f"std::array<char, 512> {name} __attribute__((uninitialized));"
+        declaration_pos = source.rfind(declaration, 0, call.start())
+        if declaration_pos < 0 or call.start() - declaration_pos > 768:
+            fail(f"build_full_path output {name} must be a nearby explicitly uninitialized local")
+    declaration_counts = {
+        "std::array<char, 512> resolved_path __attribute__((uninitialized));": 1,
+        "std::array<char, 512> full_path __attribute__((uninitialized));": 7,
+        "std::array<char, 512> full_visible_path __attribute__((uninitialized));": 6,
+        "std::array<char, 512> full_link __attribute__((uninitialized));": 1,
+        "std::array<char, 512> old_full __attribute__((uninitialized));": 1,
+        "std::array<char, 512> new_full __attribute__((uninitialized));": 1,
+        "std::array<uint8_t, 514> req_stack __attribute__((uninitialized));": 4,
+        "std::array<uint8_t, 518> req_stack __attribute__((uninitialized));": 1,
+        "std::array<uint8_t, 1028> req_stack __attribute__((uninitialized));": 2,
+        "std::array<uint8_t, 514> resp_buf __attribute__((uninitialized));": 1,
+    }
+    for declaration, expected_count in declaration_counts.items():
+        actual_count = source.count(declaration)
+        if actual_count != expected_count:
+            fail(f"metadata scratch declaration count changed for {declaration}: expected {expected_count}, found {actual_count}")
+
+    build = function_body(source, "build_full_path")
+    require_order(build, ["size_t pos = 0", "out[pos] = '\\0'"], "full-path output is terminated after construction")
+    require_tokens(
+        build,
+        [
+            "if (EXPORT_LEN > 0 && EXPORT_LEN < out_size - 1)",
+            "memcpy(out, export_path, EXPORT_LEN)",
+            "if (pos + copy_len >= out_size)",
+            "memcpy(out + pos, relative_path, copy_len)",
+        ],
+        "bounded full-path construction",
+    )
+
+    boundary_start = source.find("bool path_crosses_remote_mount(")
+    boundary_end = source.find("bool path_crosses_remote_mount_direct(", boundary_start)
+    if boundary_start < 0 or boundary_end < 0:
+        fail("missing recursive-mount boundary helpers")
+    boundary = source[boundary_start:boundary_end]
+    require_tokens(
+        boundary,
+        [
+            "std::array<char, 512> resolved_path __attribute__((uninitialized));",
+            "const char* mount_path = path",
+            "resolve_mount_path(path, resolved_path.data(), resolved_path.size()) == 0",
+            "mount_path = resolved_path.data()",
+        ],
+        "recursive-mount path scratch",
+    )
+    require_order(boundary, ["resolve_mount_path(", "mount_path = resolved_path.data()"], "resolved path used only on success")
+    require_order(boundary, ["mount_path = resolved_path.data()", "find_mount_point(mount_path)"], "resolved path built before lookup")
+
+    path_request = [
+        "memcpy(req_data, &path_len, sizeof(uint16_t))",
+        "if (path_len > 0)",
+        "memcpy(req_data + 2, fs_relative_path, path_len)",
+    ]
+    request_specs = {
+        "wki_remote_vfs_stat": (
+            "std::array<uint8_t, 514> req_stack __attribute__((uninitialized));",
+            "auto req_data_len = static_cast<uint16_t>(2 + path_len)",
+            path_request + ["vfs_proxy_send_and_wait(state, OP_VFS_STAT, req_data, req_data_len"],
+        ),
+        "wki_remote_vfs_mkdir": (
+            "std::array<uint8_t, 518> req_stack __attribute__((uninitialized));",
+            "auto req_data_len = static_cast<uint16_t>(6 + path_len)",
+            [
+                "memcpy(req_data, &u_mode, sizeof(uint32_t))",
+                "memcpy(req_data + 4, &path_len, sizeof(uint16_t))",
+                "if (path_len > 0)",
+                "memcpy(req_data + 6, fs_relative_path, path_len)",
+                "vfs_proxy_send_and_wait(state, OP_VFS_MKDIR, req_data, req_data_len",
+            ],
+        ),
+        "wki_remote_vfs_symlink": (
+            "std::array<uint8_t, 1028> req_stack __attribute__((uninitialized));",
+            "auto req_data_len = static_cast<uint16_t>(4 + target_len + link_len)",
+            [
+                "memcpy(req_data, &target_len, sizeof(uint16_t))",
+                "if (target_len > 0)",
+                "memcpy(req_data + 2, target, target_len)",
+                "memcpy(req_data + 2 + target_len, &link_len, sizeof(uint16_t))",
+                "if (link_len > 0)",
+                "memcpy(req_data + 4 + target_len, fs_relative_path, link_len)",
+                "vfs_proxy_send_and_wait(state, OP_VFS_SYMLINK, req_data, req_data_len",
+            ],
+        ),
+        "wki_remote_vfs_unlink": (
+            "std::array<uint8_t, 514> req_stack __attribute__((uninitialized));",
+            "auto req_data_len = static_cast<uint16_t>(2 + path_len)",
+            path_request + ["vfs_proxy_send_and_wait(state, OP_VFS_UNLINK, req_data, req_data_len"],
+        ),
+        "wki_remote_vfs_rmdir": (
+            "std::array<uint8_t, 514> req_stack __attribute__((uninitialized));",
+            "auto req_data_len = static_cast<uint16_t>(2 + path_len)",
+            path_request + ["vfs_proxy_send_and_wait(state, OP_VFS_RMDIR, req_data, req_data_len"],
+        ),
+        "wki_remote_vfs_rename": (
+            "std::array<uint8_t, 1028> req_stack __attribute__((uninitialized));",
+            "auto req_data_len = static_cast<uint16_t>(4 + old_len + new_len)",
+            [
+                "memcpy(req_data, &old_len, sizeof(uint16_t))",
+                "if (old_len > 0)",
+                "memcpy(req_data + 2, old_fs_path, old_len)",
+                "memcpy(req_data + 2 + old_len, &new_len, sizeof(uint16_t))",
+                "if (new_len > 0)",
+                "memcpy(req_data + 4 + old_len, new_fs_path, new_len)",
+                "vfs_proxy_send_and_wait(state, OP_VFS_RENAME, req_data, req_data_len",
+            ],
+        ),
+        "wki_remote_vfs_readlink_path": (
+            "std::array<uint8_t, 514> req_stack __attribute__((uninitialized));",
+            "auto req_data_len = static_cast<uint16_t>(2 + path_len)",
+            path_request + ["vfs_proxy_read_with_retry(state, OP_VFS_READLINK, req_data, req_data_len"],
+        ),
+    }
+    for function_name, (declaration, length_assignment, encoding) in request_specs.items():
+        body = function_body(source, function_name)
+        require_tokens(
+            body,
+            [declaration, "req_data_len", "uint8_t* req_data = req_stack.data()", "memcpy(req_data"],
+            f"{function_name} exact-prefix request scratch",
+        )
+        require_order(
+            body,
+            [declaration, length_assignment, "uint8_t* req_data = req_stack.data()"] + encoding,
+            f"{function_name} exact-prefix request encoding",
+        )
+        if re.search(r"std::array<uint8_t,\s*(?:514|518|1028)>\s+req_stack\s*(?:\{\}|=\s*\{\})", body):
+            fail(f"{function_name} must not initialize an unused request tail")
+
+    readlink = function_body(source, "wki_remote_vfs_readlink_path")
+    require_tokens(
+        readlink,
+        [
+            "std::array<uint8_t, 514> resp_buf __attribute__((uninitialized));",
+            "uint16_t resp_len = 0",
+            "if (resp_len < 2)",
+            "if (target_len == 0 || target_len + 2 > resp_len)",
+        ],
+        "readlink exact-response scratch",
+    )
+    require_order(readlink, ["vfs_proxy_read_with_retry", "if (resp_len < 2)"], "readlink response fill before header read")
+    require_order(
+        readlink,
+        ["if (target_len == 0 || target_len + 2 > resp_len)", "memcpy(buf, resp_buf.data() + 2"],
+        "readlink bounds before payload read",
+    )
+
+    require_tokens(
+        source,
+        [
+            "std::array<char, 512> target_str{};",
+            "ker::vfs::Stat kernel_buf{};",
+        ],
+        "metadata buffers whose initialized tails remain observable",
+    )
+
+
 def test_write_behind_storage_grows_in_allocator_shaped_classes() -> None:
     header = REMOTE_VFS_HPP.read_text()
     source = REMOTE_VFS_CPP.read_text()
@@ -2117,6 +2284,7 @@ def main() -> None:
     test_message_fallback_readahead_targets_small_sequential_reads()
     test_server_open_reuses_the_open_file_stat_snapshot()
     test_server_roce_push_reads_reuse_registered_staging()
+    test_remote_metadata_scratch_initializes_only_consumed_prefix()
     test_write_behind_storage_grows_in_allocator_shaped_classes()
     test_message_write_flush_retains_tail_on_request_allocation_failure()
     test_remote_open_closes_server_fd_on_local_allocation_failure()

@@ -657,7 +657,7 @@ bool path_crosses_remote_mount(const char* path) {
         return false;
     }
 
-    std::array<char, 512> resolved_path{};
+    std::array<char, 512> resolved_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
     const char* mount_path = path;
     if (ker::vfs::resolve_mount_path(path, resolved_path.data(), resolved_path.size()) == 0) {
         mount_path = resolved_path.data();
@@ -4324,8 +4324,8 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             }
 
             // Build full path: export_path + "/" + relative_path
-            std::array<char, 512> full_path{};
-            std::array<char, 512> full_visible_path{};
+            std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
+            std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 10), path_len);
             build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(data + 10),
                             path_len);
@@ -4837,8 +4837,8 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 break;
             }
 
-            std::array<char, 512> full_path{};
-            std::array<char, 512> full_visible_path{};
+            std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
+            std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
             build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(data + 2),
                             path_len);
@@ -4904,8 +4904,8 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 break;
             }
 
-            std::array<char, 512> full_path{};
-            std::array<char, 512> full_visible_path{};
+            std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
+            std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 6), path_len);
             build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(data + 6),
                             path_len);
@@ -4954,8 +4954,8 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 break;
             }
 
-            std::array<char, 512> full_path{};
-            std::array<char, 512> full_visible_path{};
+            std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
+            std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
             build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(data + 2),
                             path_len);
@@ -5050,7 +5050,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             memcpy(target_str.data(), data + 2, COPY_TLEN);
 
             // Build full link path
-            std::array<char, 512> full_link{};
+            std::array<char, 512> full_link __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
             build_full_path(full_link.data(), full_link.size(), export_path, reinterpret_cast<const char*>(data + 4 + target_len),
                             link_len);
 
@@ -5099,8 +5099,8 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 break;
             }
 
-            std::array<char, 512> full_path{};
-            std::array<char, 512> full_visible_path{};
+            std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
+            std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
             build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(data + 2),
                             path_len);
@@ -5146,8 +5146,8 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 break;
             }
 
-            std::array<char, 512> full_path{};
-            std::array<char, 512> full_visible_path{};
+            std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
+            std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
             build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
             build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(data + 2),
                             path_len);
@@ -5204,10 +5204,10 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 break;
             }
 
-            std::array<char, 512> old_full{};
+            std::array<char, 512> old_full __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
             build_full_path(old_full.data(), old_full.size(), export_path, reinterpret_cast<const char*>(data + 2), old_len);
 
-            std::array<char, 512> new_full{};
+            std::array<char, 512> new_full __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
             build_full_path(new_full.data(), new_full.size(), export_path, reinterpret_cast<const char*>(data + 4 + old_len), new_len);
 
             if (path_crosses_recursive_wki_boundary(old_full.data()) || path_crosses_recursive_wki_boundary(new_full.data())) {
@@ -6365,7 +6365,7 @@ auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path,
     }
 
     // Build request: {path_len:u16, path[N]}
-    std::array<uint8_t, 514> req_stack{};  // NOLINT(modernize-avoid-c-arrays)
+    std::array<uint8_t, 514> req_stack __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
     size_t const PATH_LEN = strlen(fs_relative_path);
     if (PATH_LEN > req_stack.size() - 2U) {
         return -ENAMETOOLONG;
@@ -6438,7 +6438,7 @@ auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path
     }
 
     // Build request: {mode:u32, path_len:u16, path[N]}
-    std::array<uint8_t, 518> req_stack{};  // NOLINT(modernize-avoid-c-arrays)
+    std::array<uint8_t, 518> req_stack __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
     size_t const PATH_LEN = strlen(fs_relative_path);
     if (PATH_LEN > req_stack.size() - 6U) {
         return -ENAMETOOLONG;
@@ -6469,7 +6469,7 @@ auto wki_remote_vfs_symlink(void* mount_private_data, const char* target, const 
     }
 
     // Server expects: {target_len:u16, target[], link_len:u16, link[]}
-    std::array<uint8_t, 1028> req_stack{};
+    std::array<uint8_t, 1028> req_stack __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
     constexpr size_t SERVER_TARGET_MAX = 511;
     size_t const TARGET_LEN = strlen(target);
     size_t const LINK_LEN = strlen(fs_relative_path);
@@ -6505,7 +6505,7 @@ auto wki_remote_vfs_unlink(void* mount_private_data, const char* fs_relative_pat
         return -EINVAL;
     }
 
-    std::array<uint8_t, 514> req_stack{};
+    std::array<uint8_t, 514> req_stack __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
     size_t const PATH_LEN = strlen(fs_relative_path);
     if (PATH_LEN > req_stack.size() - 2U) {
         return -ENAMETOOLONG;
@@ -6533,7 +6533,7 @@ auto wki_remote_vfs_rmdir(void* mount_private_data, const char* fs_relative_path
         return -EINVAL;
     }
 
-    std::array<uint8_t, 514> req_stack{};
+    std::array<uint8_t, 514> req_stack __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
     size_t const PATH_LEN = strlen(fs_relative_path);
     if (PATH_LEN > req_stack.size() - 2U) {
         return -ENAMETOOLONG;
@@ -6561,7 +6561,7 @@ auto wki_remote_vfs_rename(void* mount_private_data, const char* old_fs_path, co
         return -EINVAL;
     }
 
-    std::array<uint8_t, 1028> req_stack{};
+    std::array<uint8_t, 1028> req_stack __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
     size_t const OLD_LEN = strlen(old_fs_path);
     size_t const NEW_LEN = strlen(new_fs_path);
     if (OLD_LEN > UINT16_MAX || NEW_LEN > UINT16_MAX || OLD_LEN + NEW_LEN > req_stack.size() - 4U) {
@@ -6611,7 +6611,7 @@ auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relat
     }
 
     // Build request: {path_len:u16, path[N]}
-    std::array<uint8_t, 514> req_stack{};
+    std::array<uint8_t, 514> req_stack __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
     size_t const PATH_LEN = strlen(fs_relative_path);
     if (PATH_LEN > req_stack.size() - 2U) {
         return -ENAMETOOLONG;
@@ -6626,7 +6626,7 @@ auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relat
     }
 
     // Response: {target_len:u16, target[]}
-    std::array<uint8_t, 514> resp_buf{};
+    std::array<uint8_t, 514> resp_buf __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
     uint16_t resp_len = 0;
     int const STATUS = vfs_proxy_read_with_retry(state, OP_VFS_READLINK, req_data, req_data_len, resp_buf.data(),
                                                  static_cast<uint16_t>(resp_buf.size()), &resp_len, fs_relative_path);
@@ -6770,7 +6770,7 @@ void handle_vfs_invalidate_notify(const WkiHeader* hdr, const uint8_t* payload, 
     }
 
     auto invalidate_path = [&](const char* rel_path, uint16_t rel_len) {
-        std::array<char, 512> full_path{};
+        std::array<char, 512> full_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
         build_full_path(full_path.data(), full_path.size(), state->local_mount_path.data(), rel_path, rel_len);
         ker::vfs::vfs_cache_notify_invalidate_path(full_path.data());
     };
