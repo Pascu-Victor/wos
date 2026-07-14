@@ -984,6 +984,368 @@ def test_current_task_stat_scratch_is_initialized_by_dirfd_resolver() -> None:
             fail(f"current-task stat fast path has unexpected {name} use")
 
 
+def test_stat_impl_path_buffer_is_initialized_by_its_producers() -> None:
+    core = VFS_CORE_CPP.read_text()
+    stat_impl = function_body(core, "vfs_stat_impl")
+    make_absolute = function_body(core, "make_absolute")
+    canonicalize = function_body(core, "canonicalize_path")
+    finish_path = function_body(core, "finish_canonical_task_path_raw")
+    copy_path = function_body(core, "copy_path_string")
+    route_path = function_body(core, "apply_task_vfs_route")
+    selftest = function_body(core, "vfs_selftest_path_text_scan_matches_helpers")
+
+    declaration = "char pathBuffer[MAX_PATH_LEN] __attribute__((uninitialized));"
+    declarations = re.findall(r"\bchar\s+pathBuffer\s*\[\s*MAX_PATH_LEN\s*\][^;\n]*;", stat_impl)
+    if declarations != [declaration]:
+        fail(f"stat path buffer has unexpected declarations: {declarations!r}")
+    declaration_pos = stat_impl.find(declaration)
+    resolve_branch_header = "if (resolve_task_path) {"
+    resolve_branch_pos = stat_impl.find(resolve_branch_header, declaration_pos + len(declaration))
+    if (
+        declaration_pos < 0
+        or brace_depth_at(stat_impl, declaration_pos) != 0
+        or resolve_branch_pos < 0
+        or brace_depth_at(stat_impl, resolve_branch_pos) != 0
+    ):
+        fail("stat path buffer and task-resolution branch must remain on the unconditional function path")
+    if len(re.findall(r"\bUNKNOWN_PATH_LEN\b", stat_impl)) != 5 or re.search(
+        r"\b(?:constexpr\s+)?(?:size_t|auto)\s+(?:const\s+)?UNKNOWN_PATH_LEN\s*=", stat_impl
+    ):
+        fail("stat path-buffer length sentinel must remain the shared unknown-length value")
+
+    resolve_branch = block_body_after(stat_impl, "if (resolve_task_path)")
+    make_failure = (
+        "if (make_absolute(path, pathBuffer, MAX_PATH_LEN, &path_buffer_len) < 0) {\n"
+        '            log_loader_path_event("stat-resolve-failed", path, nullptr, nullptr, -ENOENT);\n'
+        "            return -ENOENT;\n"
+        "        }"
+    )
+    canonical_pipeline = (
+        "if (path_text_needs_canonicalize(pathBuffer, path_buffer_len)) {\n"
+        "            if (canonicalize_path(pathBuffer, MAX_PATH_LEN) < 0) {\n"
+        '                log_loader_path_event("stat-resolve-failed", path, nullptr, nullptr, -ENOENT);\n'
+        "                return -ENOENT;\n"
+        "            }\n"
+        "            path_buffer_len = UNKNOWN_PATH_LEN;\n"
+        "        }"
+    )
+    finish_failure = (
+        "if (finish_canonical_task_path_raw(pathBuffer, MAX_PATH_LEN, true, path_buffer_len, &path_buffer_len) < 0) {\n"
+        '            log_loader_path_event("stat-resolve-failed", path, nullptr, nullptr, -ENOENT);\n'
+        "            return -ENOENT;\n"
+        "        }"
+    )
+    require_order(
+        resolve_branch,
+        [
+            "size_t path_buffer_len = UNKNOWN_PATH_LEN",
+            make_failure,
+            canonical_pipeline,
+            "is_wki_entry = is_wki_entry_path(pathBuffer)",
+            finish_failure,
+            "if (!is_wki_entry)",
+            "ensure_wki_host_root_mount(pathBuffer)",
+            "current_path = pathBuffer",
+            "current_path_len = path_buffer_len",
+        ],
+        "stat task-path buffer production and adoption",
+    )
+    setup = "size_t path_buffer_len = UNKNOWN_PATH_LEN;"
+    setup_pos = resolve_branch.find(setup)
+    make_pos = resolve_branch.find(make_failure, setup_pos + len(setup))
+    canonical_pos = resolve_branch.find(canonical_pipeline, make_pos + len(make_failure))
+    classify = "is_wki_entry = is_wki_entry_path(pathBuffer);"
+    classify_pos = resolve_branch.find(classify, canonical_pos + len(canonical_pipeline))
+    finish_pos = resolve_branch.find(finish_failure, classify_pos + len(classify))
+    if (
+        setup_pos < 0
+        or make_pos < 0
+        or resolve_branch[setup_pos + len(setup) : make_pos].strip()
+        or canonical_pos < 0
+        or resolve_branch[make_pos + len(make_failure) : canonical_pos].strip()
+        or classify_pos < 0
+        or resolve_branch[canonical_pos + len(canonical_pipeline) : classify_pos].strip()
+        or finish_pos < 0
+        or resolve_branch[classify_pos + len(classify) : finish_pos].strip()
+        or any(brace_depth_at(resolve_branch, pos) != 0 for pos in [setup_pos, make_pos, canonical_pos, classify_pos, finish_pos])
+    ):
+        fail("stat path buffer producers and failure gates must remain adjacent before every read or adoption")
+
+    resolve_tail = stat_impl[resolve_branch_pos:]
+    else_pos = resolve_tail.find("} else {")
+    if else_pos < 0:
+        fail("stat implementation lost its already-resolved path branch")
+    resolved_input_branch = block_body_after(resolve_tail[else_pos + 2 :], "else")
+    require_order(
+        resolved_input_branch,
+        [
+            "size_t const PATH_LEN = known_path_len != UNKNOWN_PATH_LEN ? known_path_len : std::strlen(path)",
+            "if (PATH_LEN >= sizeof(pathBuffer))",
+            "return -ENOENT",
+            "current_path = path",
+            "current_path_len = PATH_LEN",
+        ],
+        "stat already-resolved input must not consume dormant path buffer storage",
+    )
+    if len(re.findall(r"\bpathBuffer\b", resolved_input_branch)) != 1 or "current_path = pathBuffer" in resolved_input_branch:
+        fail("stat already-resolved input may use pathBuffer only as a compile-time capacity")
+
+    expected_caller_uses = {
+        "pathBuffer": 12,
+        "path_buffer_len": 7,
+        "make_absolute": 1,
+        "canonicalize_path": 1,
+        "finish_canonical_task_path_raw": 1,
+        "copy_path_string": 1,
+    }
+    for name, count in expected_caller_uses.items():
+        if len(re.findall(rf"\b{re.escape(name)}\b", stat_impl)) != count:
+            fail(f"stat implementation has unexpected {name} use; re-audit path-buffer production")
+    forbidden_caller_patterns = [
+        r"\bpathBuffer\s*\[\s*MAX_PATH_LEN\s*\]\s*(?:=\s*)?\{",
+        r"\bpathBuffer\s*\[[^]]+\]\s*=",
+        r"\b(?:std::)?memset\s*\(\s*pathBuffer\b",
+        r"\bbzero\s*\(\s*pathBuffer\b",
+        r"\bstd::(?:ranges::)?fill(?:_n)?\s*\([^;]*\bpathBuffer\b",
+    ]
+    if any(re.search(pattern, stat_impl) for pattern in forbidden_caller_patterns) or "goto" in stat_impl:
+        fail("stat path buffer must not be cleared, prewritten, or consumed through a control-flow bypass")
+
+    return_types = re.findall(
+        r"\bauto\s+make_absolute\([^;{]*\)\s*->\s*([A-Za-z0-9_:<>*]+)\s*\{",
+        core,
+        flags=re.DOTALL,
+    )
+    if return_types != ["int"]:
+        fail("make_absolute must preserve its signed integer result domain")
+    make_returns = [" ".join(value.split()) for value in re.findall(r"\breturn\s+([^;]+);", make_absolute)]
+    if make_returns != ["-EINVAL", "-EINVAL", "-ENAMETOOLONG", "0", "-ESRCH", "-ENAMETOOLONG", "0"]:
+        fail("make_absolute return topology changed; re-audit complete-production success semantics")
+    if make_absolute.count("size_t const PLEN = std::strlen(path);") != 1:
+        fail("make_absolute must derive its complete input length exactly once")
+    absolute_success = block_body_after(make_absolute, "if (path[0] == '/')")
+    require_order(
+        absolute_success,
+        [
+            "if (PLEN + 1 > outsize)",
+            "return -ENAMETOOLONG",
+            "std::memcpy(out, path, PLEN + 1)",
+            "if (out_len != nullptr)",
+            "*out_len = PLEN;",
+            "return 0",
+        ],
+        "absolute path complete production",
+    )
+    relative_setup = """size_t const CWDLEN = task_cached_cwd_len(task);
+    // Need: cwd + "/" + path + '\\0'
+    bool const NEED_SEP = (CWDLEN > 1);  // Root "/" doesn't need extra /
+    size_t const TOTAL = CWDLEN + (NEED_SEP ? 1 : 0) + PLEN + 1;
+    if (TOTAL > outsize) {
+        return -ENAMETOOLONG;
+    }"""
+    relative_setup_pos = make_absolute.find(relative_setup)
+    relative_copy = "std::memcpy(out, task->cwd.data(), CWDLEN);"
+    relative_copy_pos = make_absolute.find(relative_copy, relative_setup_pos + len(relative_setup))
+    relative_success = make_absolute[relative_copy_pos:].strip()
+    expected_relative_success = """std::memcpy(out, task->cwd.data(), CWDLEN);
+    if (NEED_SEP) {
+        out[CWDLEN] = '/';
+        std::memcpy(out + CWDLEN + 1, path, PLEN + 1);
+    } else {
+        std::memcpy(out + CWDLEN, path, PLEN + 1);
+    }
+    if (out_len != nullptr) {
+        *out_len = TOTAL - 1;
+    }
+    return 0;"""
+    if (
+        relative_setup_pos < 0
+        or relative_copy_pos < 0
+        or make_absolute[relative_setup_pos + len(relative_setup) : relative_copy_pos].strip()
+        or relative_success != expected_relative_success
+    ):
+        fail("relative make_absolute capacity check and success must remain one bounded complete-string production")
+    if (
+        len(re.findall(r"\bout\b", make_absolute)) != 6
+        or len(re.findall(r"\boutsize\b", make_absolute)) != 3
+        or len(re.findall(r"\bout_len\b", make_absolute)) != 4
+    ):
+        fail("make_absolute destination flow changed; re-audit complete initialization")
+    forbid(
+        make_absolute,
+        [
+            "memset(out",
+            "std::memset(out",
+            "bzero(out",
+            "std::fill(out",
+            "std::ranges::fill(out",
+            "return {};",
+            "return false;",
+            "return true;",
+            "goto",
+        ],
+        "make_absolute bounded destination production",
+    )
+
+    helper_returns = {
+        "canonicalize_path": [
+            "-EINVAL",
+            "-ENAMETOOLONG",
+            "component_count > MAX_COMPONENTS ? -ENAMETOOLONG : 0",
+            "-ENAMETOOLONG",
+            "-ENAMETOOLONG",
+            "-ENAMETOOLONG",
+            "-ENAMETOOLONG",
+            "0",
+        ],
+        "finish_canonical_task_path_raw": ["-EINVAL", "-ENAMETOOLONG", "0", "0", "ROUTE_RESULT", "COPY_RESULT"],
+        "copy_path_string": ["-EINVAL", "-ENAMETOOLONG", "0"],
+        "apply_task_vfs_route": [
+            "-EINVAL",
+            "copy_path_string(path, out, out_size)",
+            "LOGICAL_RESULT",
+            "alias_result",
+            "alias_result",
+            "copy_path_string(routed.data(), out, out_size)",
+            "copy_path_string(routed.data(), out, out_size)",
+            "-ENAMETOOLONG",
+            "0",
+        ],
+    }
+    helper_bodies = {
+        "canonicalize_path": canonicalize,
+        "finish_canonical_task_path_raw": finish_path,
+        "copy_path_string": copy_path,
+        "apply_task_vfs_route": route_path,
+    }
+    for helper, expected_returns in helper_returns.items():
+        helper_return_types = re.findall(
+            rf"\bauto\s+{re.escape(helper)}\([^;{{]*\)\s*->\s*([A-Za-z0-9_:<>*]+)\s*\{{",
+            core,
+            flags=re.DOTALL,
+        )
+        if helper_return_types != ["int"]:
+            fail(f"{helper} must preserve its signed integer result domain")
+        actual_returns = [" ".join(value.split()) for value in re.findall(r"\breturn\s+([^;]+);", helper_bodies[helper])]
+        if actual_returns != expected_returns:
+            fail(f"{helper} return topology changed; re-audit complete path production")
+
+    require_order(
+        canonicalize,
+        [
+            "for (; path_len < bufsize && path[path_len] != '\\0'; ++path_len)",
+            "if (path_len == bufsize)",
+            "if (!needs_rewrite)",
+            "return component_count > MAX_COMPONENTS ? -ENAMETOOLONG : 0",
+            "result[pos] = '\\0'",
+            "std::memcpy(path, static_cast<const char*>(result), pos + 1)",
+            "return 0",
+        ],
+        "canonicalization preserves a bounded complete string on every success",
+    )
+    finish_len_and_hash = """if (path_len == UNKNOWN_PATH_LEN) {
+            path_len = std::strlen(out);
+        }
+        if (out_len != nullptr) {
+            *out_len = path_len;
+        }
+        if (out_hash != nullptr) {
+            *out_hash = metadata_path_hash_known_len(out, path_len);
+        }"""
+    if block_body_after(finish_path, "auto finish_len_and_hash = [&]()").strip() != finish_len_and_hash:
+        fail("finished canonical task path must publish its exact produced length and hash")
+    root_branch = block_body_after(finish_path, "if (ROOT_LEN > 1)")
+    root_overflow_header = "if (ROOT_LEN + path_len + 1 > outsize) {"
+    root_overflow = block_body_after(root_branch, "if (ROOT_LEN + path_len + 1 > outsize)")
+    if root_branch.count(root_overflow_header) != 1 or root_overflow.strip() != "return -ENAMETOOLONG;":
+        fail("root-prefix growth must reject overflow before moving the terminated path")
+    require_order(
+        finish_path,
+        [
+            "if (ROOT_LEN + path_len + 1 > outsize)",
+            "std::memmove(out + ROOT_LEN, out, path_len + 1)",
+            "std::memcpy(out, task->root.data(), ROOT_LEN)",
+            "path_len += ROOT_LEN;",
+            "if (!apply_task_route)",
+            "finish_len_and_hash()",
+            "return 0",
+            "if (task_vfs_route_is_common_local_noop(current_task, out))",
+            "finish_len_and_hash()",
+            "return 0",
+            "int const ROUTE_RESULT = apply_task_vfs_route(current_task, out, routed.data(), routed.size())",
+            "if (ROUTE_RESULT < 0)",
+            "return ROUTE_RESULT",
+            "int const COPY_RESULT = copy_path_string(routed.data(), out, outsize, UNKNOWN_PATH_LEN, &routed_len)",
+            "if (COPY_RESULT == 0)",
+            "path_len = routed_len;",
+            "finish_len_and_hash()",
+            "return COPY_RESULT",
+        ],
+        "finished canonical task path preserves complete production before publication",
+    )
+
+    poison = "absolute.fill('x');"
+    producer_call = "int const ABSOLUTE_RET = make_absolute(UNCLEAN_ABSOLUTE, absolute.data(), absolute.size(), &absolute_len);"
+    producer_verification = (
+        "if (ABSOLUTE_RET != 0 || absolute_len != UNCLEAN_ABSOLUTE_LEN ||\n"
+        "        std::memcmp(absolute.data(), UNCLEAN_ABSOLUTE, UNCLEAN_ABSOLUTE_LEN) != 0 || "
+        "absolute.at(UNCLEAN_ABSOLUTE_LEN) != '\\0') {\n"
+        "        return false;\n"
+        "    }"
+    )
+    canonical_call = "int const CANONICAL_RET = canonicalize_path(absolute.data(), absolute.size());"
+    canonical_verification = (
+        "if (CANONICAL_RET != 0 || std::memcmp(absolute.data(), CLEAN_ABSOLUTE, CLEAN_ABSOLUTE_LEN) != 0 ||\n"
+        "        absolute.at(CLEAN_ABSOLUTE_LEN) != '\\0') {\n"
+        "        return false;\n"
+        "    }"
+    )
+    poison_pos = selftest.find(poison)
+    producer_pos = selftest.find(producer_call, poison_pos + len(poison))
+    verification_pos = selftest.find(producer_verification, producer_pos + len(producer_call))
+    canonical_call_pos = selftest.find(canonical_call, verification_pos + len(producer_verification))
+    canonical_verification_pos = selftest.find(canonical_verification, canonical_call_pos + len(canonical_call))
+    if (
+        selftest.count("\n    absolute.fill('x');\n") != 1
+        or poison_pos < 0
+        or brace_depth_at(selftest, poison_pos) != 0
+        or producer_pos < 0
+        or selftest[poison_pos + len(poison) : producer_pos].strip()
+        or verification_pos < 0
+        or selftest[producer_pos + len(producer_call) : verification_pos].strip()
+        or canonical_call_pos < 0
+        or selftest[verification_pos + len(producer_verification) : canonical_call_pos].strip()
+        or canonical_verification_pos < 0
+        or selftest[canonical_call_pos + len(canonical_call) : canonical_verification_pos].strip()
+    ):
+        fail("poisoned make-absolute and canonicalization KTEST pipeline must remain exact and adjacent")
+    expected_selftest_uses = {
+        "absolute": 12,
+        "absolute_len": 3,
+        "ABSOLUTE_RET": 2,
+        "CANONICAL_RET": 2,
+        "UNCLEAN_ABSOLUTE": 3,
+        "CLEAN_ABSOLUTE": 2,
+    }
+    for name, count in expected_selftest_uses.items():
+        if len(re.findall(rf"\b{re.escape(name)}\b", selftest)) != count:
+            fail(f"make-absolute KTEST has unexpected {name} use")
+    selftest_returns = [" ".join(value.split()) for value in re.findall(r"\breturn\s+([^;]+);", selftest)]
+    if selftest_returns != [
+        "false",
+        "false",
+        "false",
+        "false",
+        "false",
+        "false",
+        "false",
+        "NULL_SCAN.path_len == 0 && !NULL_SCAN.requires_directory && NULL_SCAN.needs_canonicalize",
+    ]:
+        fail("make-absolute poison KTEST must execute before the path-helper success return")
+    if "goto" in selftest:
+        fail("make-absolute poison KTEST must not be bypassed")
+
+
 def test_stat_impl_symlink_scratch_is_initialized_by_resolver() -> None:
     core = VFS_CORE_CPP.read_text()
     stat_impl = function_body(core, "vfs_stat_impl")
@@ -1608,6 +1970,7 @@ if __name__ == "__main__":
     test_stat_trailing_slash_scratch_is_initialized_by_trim_producer()
     test_absolute_stat_scratch_is_initialized_by_visible_path_producer()
     test_current_task_stat_scratch_is_initialized_by_dirfd_resolver()
+    test_stat_impl_path_buffer_is_initialized_by_its_producers()
     test_stat_impl_symlink_scratch_is_initialized_by_resolver()
     test_statat_scratch_is_initialized_by_dirfd_resolver()
     test_open_path_scratch_is_initialized_by_its_producers()

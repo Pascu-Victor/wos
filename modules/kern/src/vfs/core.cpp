@@ -7309,6 +7309,24 @@ auto vfs_selftest_path_text_scan_matches_helpers() -> bool {
         }
     }
 
+    constexpr const char* UNCLEAN_ABSOLUTE = "/tmp/../ktest_make_absolute";
+    constexpr const char* CLEAN_ABSOLUTE = "/ktest_make_absolute";
+    constexpr size_t UNCLEAN_ABSOLUTE_LEN = sizeof("/tmp/../ktest_make_absolute") - 1;
+    constexpr size_t CLEAN_ABSOLUTE_LEN = sizeof("/ktest_make_absolute") - 1;
+    std::array<char, MAX_PATH_LEN> absolute{};
+    size_t absolute_len = UNKNOWN_PATH_LEN;
+    absolute.fill('x');
+    int const ABSOLUTE_RET = make_absolute(UNCLEAN_ABSOLUTE, absolute.data(), absolute.size(), &absolute_len);
+    if (ABSOLUTE_RET != 0 || absolute_len != UNCLEAN_ABSOLUTE_LEN ||
+        std::memcmp(absolute.data(), UNCLEAN_ABSOLUTE, UNCLEAN_ABSOLUTE_LEN) != 0 || absolute.at(UNCLEAN_ABSOLUTE_LEN) != '\0') {
+        return false;
+    }
+    int const CANONICAL_RET = canonicalize_path(absolute.data(), absolute.size());
+    if (CANONICAL_RET != 0 || std::memcmp(absolute.data(), CLEAN_ABSOLUTE, CLEAN_ABSOLUTE_LEN) != 0 ||
+        absolute.at(CLEAN_ABSOLUTE_LEN) != '\0') {
+        return false;
+    }
+
     std::array<char, MAX_PATH_LEN> spliced{};
     spliced.fill('x');
     int splice_ret = splice_symlink_target("/base/link/tail", sizeof("/base/link") - 1, "../target/./dir", spliced.data(), spliced.size());
@@ -10446,7 +10464,9 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     bool const REQUIRE_DIRECTORY = force_require_directory || (resolve_task_path && path_requires_directory(path));
     bool const EFFECTIVE_FOLLOW_FINAL_SYMLINK = follow_final_symlink || REQUIRE_DIRECTORY;
     bool is_wki_entry = false;
-    char pathBuffer[MAX_PATH_LEN];  // NOLINT
+    // Both path producers initialize the complete NUL-terminated string before every adoption.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-pro-type-member-init)
+    char pathBuffer[MAX_PATH_LEN] __attribute__((uninitialized));
     const char* current_path = nullptr;
     size_t current_path_len = UNKNOWN_PATH_LEN;
     uint64_t current_path_hash = UNKNOWN_PATH_HASH;
